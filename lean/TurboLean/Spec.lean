@@ -73,6 +73,9 @@ export TurboLean.PolicyGates (
   verifyIdentBloomMatch
   verifyConLecheOleanShard
   verifyElabHeaderPinGate
+  verifyAuditMaterializeGate
+  verifyPackTrustAdmission
+  verifyHygieneItemAdmitted
   matryoshkaTierRouterSpec
   isClosedSectionNeededC
   cAbiIsClosedSectionNeeded
@@ -116,6 +119,9 @@ export TurboLean.PolicyGates (
   verifyIdentBloomMatchC
   verifyConLecheOleanShardC
   verifyElabHeaderPinGateC
+  verifyAuditMaterializeGateC
+  verifyPackTrustAdmissionC
+  verifyHygieneItemAdmittedC
   combinedStepC
 )
 
@@ -346,6 +352,87 @@ theorem affine_step_budget_monotone (b : AffineStepBudget) {s1 s2 : Nat} (h : s1
 theorem evalLoopStepBudget_monotone (init fuel : Nat) (b : AffineStepBudget) {s1 s2 : Nat} (h : s1 ≤ s2) :
     evalLoopStepBudget init fuel b s1 ≤ evalLoopStepBudget init fuel b s2 :=
   Nat.add_le_add_left (Nat.mul_le_mul_left fuel (affine_step_budget_monotone b h)) init
+
+/-! ### Universal Combinator G: `BoundedCountGate` (Bounded `UInt64` Filter & Coverage Lifting) -/
+
+theorem filter_len_eq_implies_all {α : Type} (p : α → Bool) (xs : List α)
+    (h_len : (xs.filter p).length = xs.length) : xs.all p = true := by
+  induction xs with
+  | nil => rfl
+  | cons x rest ih =>
+    cases hx : p x <;> simp only [List.filter_cons, hx, Bool.false_eq_true, ↓reduceIte, List.length_cons] at h_len
+    · exact absurd h_len (by have := List.length_filter_le p rest; omega)
+    · simp [List.all_cons, hx, ih (by omega)]
+
+theorem filter_u64_len_eq_implies_all {α : Type} (p : α → Bool) (xs : List α)
+    (h_bound : xs.length < UInt64.size)
+    (h_eq : UInt64.ofNat (xs.filter p).length = UInt64.ofNat xs.length) :
+    xs.all p = true := by
+  have h_flt : (xs.filter p).length < UInt64.size := Nat.lt_of_le_of_lt (List.length_filter_le p xs) h_bound
+  have h_nat : (UInt64.ofNat (xs.filter p).length).toNat = (UInt64.ofNat xs.length).toNat := congrArg UInt64.toNat h_eq
+  rw [UInt64.toNat_ofNat_of_lt' h_flt, UInt64.toNat_ofNat_of_lt' h_bound] at h_nat
+  exact filter_len_eq_implies_all p xs h_nat
+
+theorem MetaGateSpec.lift_certified_count {Input α : Type} {Safe : Input → Prop}
+    (M : MetaGateSpec Input Safe) (x : Input) (p : α → Bool) (xs : List α)
+    (certCnt totCnt : Input → UInt64)
+    (h_extract : Safe x → certCnt x = totCnt x)
+    (h_cert : certCnt x = UInt64.ofNat (xs.filter p).length)
+    (h_tot : totCnt x = UInt64.ofNat xs.length)
+    (h_bound : xs.length < UInt64.size)
+    (h_gate : M.gate x = true) :
+    xs.all p = true ∧ Safe x :=
+  have hs := M.sound x h_gate
+  ⟨filter_u64_len_eq_implies_all p xs h_bound (h_cert ▸ h_tot ▸ h_extract hs), hs⟩
+
+def allDistinctBy {α : Type} (eq : α → α → Bool) : List α → Bool
+  | [] => true
+  | x :: xs => (!xs.any (fun y => eq x y)) && allDistinctBy eq xs
+
+def coversAllBy {Id Item : Type} (eq : Id → Id → Bool) (idOf : Item → Id) (clean : Item → Bool)
+    (ids : List Id) (items : List Item) : Bool :=
+  allDistinctBy eq ids && ids.all (fun i => items.any (fun s => eq (idOf s) i && clean s))
+
+def zeroStubGuard (skelClean : Bool) (nItems nIds expectedCount : Nat) (covered : Bool) : UInt64 :=
+  if skelClean && Nat.beq nItems expectedCount && Nat.beq nIds expectedCount && covered then 0 else 1
+
+theorem zeroStubGuard_sound {Id Item : Type} [BEq Id] [LawfulBEq Id]
+    (idOf : Item → Id) (clean : Item → Bool)
+    (skelClean : Bool) (items : List Item) (ids : List Id) (expectedCount : Nat)
+    (h : zeroStubGuard skelClean items.length ids.length expectedCount
+           (coversAllBy (· == ·) idOf clean ids items) = 0) :
+    items.length = expectedCount ∧
+    ids.length = expectedCount ∧
+    allDistinctBy (· == ·) ids = true ∧
+    (∀ i ∈ ids, ∃ s ∈ items, idOf s = i ∧ clean s = true) := by
+  dsimp only [zeroStubGuard] at h; split at h
+  · rename_i hc; simp only [coversAllBy, Bool.and_eq_true, List.all_eq_true, List.any_eq_true, beq_iff_eq] at hc
+    exact ⟨Nat.eq_of_beq_eq_true hc.1.1.2, Nat.eq_of_beq_eq_true hc.1.2, hc.2.1,
+      fun i hi => let ⟨s, hs, hprop⟩ := hc.2.2 i hi; ⟨s, hs, hprop.1, hprop.2⟩⟩
+  · contradiction
+
+theorem MetaGateSpec.lift_certified_cover {Input Id Item : Type} [BEq Id] [LawfulBEq Id]
+    {Safe : Input → Prop}
+    (M : MetaGateSpec Input Safe) (x : Input)
+    (idOf : Item → Id) (clean : Item → Bool)
+    (skelClean : Bool) (items : List Item) (ids : List Id) (expectedCount : Nat)
+    (certCnt totCnt stubCnt : Input → UInt64)
+    (h_extract_cert : Safe x → certCnt x = totCnt x)
+    (h_extract_stub : Safe x → stubCnt x = 0)
+    (h_cert : certCnt x = UInt64.ofNat (items.filter clean).length)
+    (h_tot : totCnt x = UInt64.ofNat items.length)
+    (h_stub : stubCnt x = zeroStubGuard skelClean items.length ids.length expectedCount
+                            (coversAllBy (· == ·) idOf clean ids items))
+    (h_bound : items.length < UInt64.size)
+    (h_gate : M.gate x = true) :
+    items.all clean = true ∧
+    (items.length = expectedCount ∧
+     ids.length = expectedCount ∧
+     allDistinctBy (· == ·) ids = true ∧
+     (∀ i ∈ ids, ∃ s ∈ items, idOf s = i ∧ clean s = true)) ∧
+    Safe x :=
+  have ⟨h_all, hs⟩ := MetaGateSpec.lift_certified_count M x clean items certCnt totCnt h_extract_cert h_cert h_tot h_bound h_gate
+  ⟨h_all, zeroStubGuard_sound idOf clean skelClean items ids expectedCount (h_stub ▸ h_extract_stub hs), hs⟩
 
 /-! ============================================================================
     LAYER II: DECLARATIVE COROLLARIES (≤ 3 LINES) & C-ABI EXPORTS
@@ -1149,5 +1236,152 @@ theorem elab_header_pin_spoof_or_shadow_rejected (s : ElabHeaderPinGateState)
       s.astMatchesPin s.casBlobMagicOk s.casOffEndMatches = false :=
   elabHeaderPinMetaSpec.rejects_unsafe s (by
     rcases h_bad with h | h | h | h | h <;> simp [h])
+
+/-! ## 15. Audit Materialize, Pack Trust & Hygiene Admission C-ABI Gates -/
+
+structure AuditMaterializeState where
+  skeletonClean             : Bool
+  stubbedPlaceholderCount   : UInt64
+  certifiedShardCount       : UInt64
+  distinctCoveredShardCount : UInt64
+  totalShardCount           : UInt64
+  expectedInterfaceDigest   : UInt64
+  actualInterfaceDigest     : UInt64
+  expectedOleanDigest       : UInt64
+  actualOleanDigest         : UInt64
+  expectedIleanDigest       : UInt64
+  actualIleanDigest         : UInt64
+  needsC                    : Bool
+  expectedCDigest           : UInt64
+  actualCDigest             : UInt64
+  depTraceDigest            : UInt64
+  auditedArtifactDigest     : UInt64
+  kernelAuditClean          : Bool
+  deriving Repr, DecidableEq, BEq
+
+def auditMaterializeGateMetaSpec : MetaGateSpec AuditMaterializeState
+    (fun s =>
+      s.skeletonClean = true ∧
+      s.stubbedPlaceholderCount = 0 ∧
+      s.certifiedShardCount = s.totalShardCount ∧
+      s.distinctCoveredShardCount = s.totalShardCount ∧
+      s.expectedInterfaceDigest = s.actualInterfaceDigest ∧
+      s.actualInterfaceDigest ≠ 0 ∧
+      s.expectedOleanDigest = s.actualOleanDigest ∧
+      s.actualOleanDigest ≠ 0 ∧
+      s.expectedIleanDigest = s.actualIleanDigest ∧
+      s.actualIleanDigest ≠ 0 ∧
+      (s.needsC = false ∨ (s.expectedCDigest = s.actualCDigest ∧ s.actualCDigest ≠ 0)) ∧
+      s.depTraceDigest ≠ 0 ∧
+      s.auditedArtifactDigest = s.actualOleanDigest ∧
+      s.kernelAuditClean = true) where
+  gate := fun s =>
+    verifyAuditMaterializeGate
+      s.skeletonClean
+      s.stubbedPlaceholderCount s.certifiedShardCount
+      s.distinctCoveredShardCount s.totalShardCount
+      s.expectedInterfaceDigest s.actualInterfaceDigest
+      s.expectedOleanDigest s.actualOleanDigest
+      s.expectedIleanDigest s.actualIleanDigest
+      s.needsC s.expectedCDigest s.actualCDigest
+      s.depTraceDigest s.auditedArtifactDigest s.kernelAuditClean
+  sound := fun s h => by
+    simpa [verifyAuditMaterializeGate, Bool.and_eq_true, Bool.or_eq_true,
+           beq_iff_eq, bne_iff_ne, and_assoc] using h
+  complete := fun s h => by
+    simpa [verifyAuditMaterializeGate, Bool.and_eq_true, Bool.or_eq_true,
+           beq_iff_eq, bne_iff_ne, and_assoc] using h
+  posWitness := ⟨true, 0, 4, 4, 4, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, true, 0x44, 0x44, 0x55, 0x22, true⟩
+  negWitness := ⟨true, 1, 4, 4, 4, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, true, 0x44, 0x44, 0x55, 0x22, true⟩
+  nonVacuous := rfl
+  tight := rfl
+
+theorem audit_materialize_blocks_stubbed_or_unverified (s : AuditMaterializeState)
+    (h_bad :
+      s.skeletonClean = false ∨
+      s.stubbedPlaceholderCount ≠ 0 ∨
+      s.certifiedShardCount ≠ s.totalShardCount ∨
+      s.distinctCoveredShardCount ≠ s.totalShardCount ∨
+      s.expectedInterfaceDigest ≠ s.actualInterfaceDigest ∨
+      s.actualInterfaceDigest = 0 ∨
+      s.expectedOleanDigest ≠ s.actualOleanDigest ∨
+      s.actualOleanDigest = 0 ∨
+      s.expectedIleanDigest ≠ s.actualIleanDigest ∨
+      s.actualIleanDigest = 0 ∨
+      (s.needsC = true ∧ (s.expectedCDigest ≠ s.actualCDigest ∨ s.actualCDigest = 0)) ∨
+      s.depTraceDigest = 0 ∨
+      s.auditedArtifactDigest ≠ s.actualOleanDigest ∨
+      s.kernelAuditClean = false) :
+    verifyAuditMaterializeGate
+      s.skeletonClean
+      s.stubbedPlaceholderCount s.certifiedShardCount
+      s.distinctCoveredShardCount s.totalShardCount
+      s.expectedInterfaceDigest s.actualInterfaceDigest
+      s.expectedOleanDigest s.actualOleanDigest
+      s.expectedIleanDigest s.actualIleanDigest
+      s.needsC s.expectedCDigest s.actualCDigest
+      s.depTraceDigest s.auditedArtifactDigest s.kernelAuditClean = false :=
+  auditMaterializeGateMetaSpec.rejects_unsafe s (by
+    rcases h_bad with h | h | h | h | h | h | h | h | h | h | ⟨hc, h | h⟩ | h | h | h <;> simp_all)
+
+structure PackTrustAdmissionState where
+  requestedUntrusted     : Bool
+  hasTrustedPubkey       : Bool
+  hasAttestationFields   : Bool
+  sigValid               : Bool
+  allowUnattestedTrusted : Bool
+  deriving Repr, DecidableEq, BEq
+
+def packTrustAdmissionMetaSpec : MetaGateSpec PackTrustAdmissionState
+    (fun s => s.requestedUntrusted = false ∧
+      ((s.hasTrustedPubkey = true ∧ s.hasAttestationFields = true ∧ s.sigValid = true) ∨
+        (s.hasTrustedPubkey = false ∧ s.allowUnattestedTrusted = true))) where
+  gate := fun s =>
+    verifyPackTrustAdmission s.requestedUntrusted s.hasTrustedPubkey
+      s.hasAttestationFields s.sigValid s.allowUnattestedTrusted
+  sound := fun s h => by
+    by_cases hpk : s.hasTrustedPubkey = true <;>
+      simpa [verifyPackTrustAdmission, hpk, Bool.and_eq_true, Bool.not_eq_true'] using h
+  complete := fun s h => by
+    by_cases hpk : s.hasTrustedPubkey = true <;>
+      simpa [verifyPackTrustAdmission, hpk, Bool.and_eq_true, Bool.not_eq_true'] using h
+  posWitness := ⟨false, true, true, true, false⟩
+  negWitness := ⟨false, true, false, false, true⟩
+  nonVacuous := rfl
+  tight := rfl
+
+theorem pack_trust_admission_configured_pubkey_blocks_unattested_override
+    (s : PackTrustAdmissionState)
+    (h_pk : s.hasTrustedPubkey = true)
+    (h_unattested : s.hasAttestationFields = false ∨ s.sigValid = false) :
+    verifyPackTrustAdmission s.requestedUntrusted s.hasTrustedPubkey
+      s.hasAttestationFields s.sigValid s.allowUnattestedTrusted = false :=
+  packTrustAdmissionMetaSpec.rejects_unsafe s (by
+    rcases h_unattested with h | h <;> simp [h_pk, h])
+
+structure HygieneItemAdmissionState where
+  itemKind           : UInt8
+  admitsNativeDecide : Bool
+  admitsBvDecide     : Bool
+  deriving Repr, DecidableEq, BEq
+
+def hygieneItemAdmissionMetaSpec : MetaGateSpec HygieneItemAdmissionState
+    (fun s => (s.itemKind = 1 ∧ s.admitsNativeDecide = true) ∨
+      (s.itemKind = 2 ∧ s.admitsBvDecide = true)) where
+  gate := fun s => verifyHygieneItemAdmitted s.itemKind s.admitsNativeDecide s.admitsBvDecide
+  sound := fun s h => by
+    simpa [verifyHygieneItemAdmitted, Bool.or_eq_true, Bool.and_eq_true, beq_iff_eq] using h
+  complete := fun s h => by
+    simpa [verifyHygieneItemAdmitted, Bool.or_eq_true, Bool.and_eq_true, beq_iff_eq] using h
+  posWitness := ⟨2, false, true⟩
+  negWitness := ⟨3, true, true⟩
+  nonVacuous := rfl
+  tight := rfl
+
+theorem hygiene_item_admission_rejects_sorry_and_trust_compiler
+    (s : HygieneItemAdmissionState)
+    (h_non_native : s.itemKind ≠ 1 ∧ s.itemKind ≠ 2) :
+    verifyHygieneItemAdmitted s.itemKind s.admitsNativeDecide s.admitsBvDecide = false :=
+  hygieneItemAdmissionMetaSpec.rejects_unsafe s (by simp [h_non_native.1, h_non_native.2])
 
 end TurboLean.Spec

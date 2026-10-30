@@ -72,7 +72,13 @@ def verifiedTheoremRegistry : List String :=
     "unboxedLoopStep_sound", "unboxedLoopAccumulator_sim", "normSymExpr_constU64",
     "normSymExpr_constBool", "normSymExpr_const_sound", "checkSingleSample_of_codeRefines",
     "checkConcreteSamples_of_codeRefines", "sound_of_checkSingleSample_eq_true",
-    "symbolicTV_refl_sound"
+    "symbolicTV_refl_sound", "applyExprRules_sound", "applyRewriteTable_sound",
+    "scheduleStructuredLoop_sound", "applyLoopScheduleAux_refines",
+    "elideAndMutateRC_sound", "rewriteCodeVerified_refines", "rewriteLNIRExprVerified_sound"
+  ]
+  let xform := [
+    "optimizeEqSatCode_sound", "applyLoopScheduleAux_refines",
+    "scheduleStructuredLoop_sound", "elideAndMutateRC_sound"
   ]
   let sem := [
     "ScalarExprEquiv.refl", "ScalarExprEquiv.symm", "ScalarExprEquiv.trans",
@@ -113,6 +119,7 @@ def verifiedTheoremRegistry : List String :=
   (proofs.map ("LeanNative.Proofs.PeepholeProofs." ++ ·)) ++
   (proofs.map ("LeanNative.Proofs.LoopOptProofs." ++ ·)) ++
   (proofs.map ("LeanNative.Proofs.SymbolicTV." ++ ·)) ++
+  (xform.map ("LeanNative.Transform." ++ ·)) ++
   (sem.map ("LeanNative.Semantics." ++ ·)) ++
   (spec.map ("LeanNative.Spec." ++ ·)) ++
   (ir.map ("LeanNative.IR.UInt256." ++ ·)) ++
@@ -144,8 +151,12 @@ def verifySingleCert (c : OptimizationCert) : Bool × List String :=
       if c.theoremRef.isEmpty then
         errs1 ++ [s!"[{c.declName}:{c.passName}] TranslationValidated certificate missing rule/obligation reference"]
       else errs1
-    | .unverifiedFallback =>
-      errs1
+    | .tested | .unverifiedFallback =>
+      if c.theoremRef.isEmpty then
+        errs1 ++ [s!"[{c.declName}:{c.passName}] {c.assurance} certificate missing reference"]
+      else errs1
+    | .unsupported =>
+      errs1 ++ [s!"[{c.declName}:{c.passName}] certificate has Unsupported assurance level"]
   (errs2.isEmpty, errs2)
 
 /-- Verify hash-chain continuity (`prev.outputHash == next.inputHash`) for a single declaration's pass steps. -/

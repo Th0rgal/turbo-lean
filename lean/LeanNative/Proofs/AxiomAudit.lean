@@ -140,6 +140,9 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Spec.no_runtime_slice_out_gate_sound, ``LeanNative.Spec.runtime_sym_rejects_slice_out
   , ``LeanNative.Spec.lazy_reduction_slice_gate_sound, ``LeanNative.Spec.non_linear_rejects_lazy_reduction_slice
   , ``LeanNative.Spec.radix4_ntt_fusion_gate_sound, ``LeanNative.Spec.misaligned_stride_rejects_radix4_ntt
+  , ``LeanNative.Spec.gf128Elem_xor_comm
+  , ``LeanNative.Spec.gf128_fused_2layer_butterfly_eq_sequential
+  , ``LeanNative.Spec.ntt_butterfly_fused_2layer_slice_word0_eq
   , ``LeanNative.Spec.turbo_slice_scanner_sroa_gate_sound, ``LeanNative.Spec.escaping_tuple_or_oob_rejects_slice_scanner_sroa
   , ``LeanNative.Spec.parFor_chunk_partition_gate_sound, ``LeanNative.Spec.parFor_chunk_partition_rejects_invalid_or_overflow
   , ``LeanNative.Spec.rc_mode_safe_gate_sound, ``LeanNative.Spec.rc_mode_safe_rejects_invalid

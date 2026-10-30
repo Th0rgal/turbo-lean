@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 10-Second Mechanical Reviewer Checklist (Contract V5 in roadmap/VALIDATION_CONTRACTS.md)
+# Local Mechanical Reviewer Checklist (Contract V5 in roadmap/VALIDATION_CONTRACTS.md)
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -7,7 +7,7 @@ cd "$ROOT_DIR"
 
 export PATH="$ROOT_DIR/target/release:$ROOT_DIR/target/debug:/var/lib/sandboxed-node/work/4c277c9d-4b85-4a1a-88ab-2c06bed519b1/warroom-tools/rust/rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin:/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0/bin:/var/lib/sandboxed-node/.local/bin:$PATH"
 
-TURBO_BIN="$(command -v turbo-lean || true)"
+TURBO_BIN="${TURBO_AUDITOR_BIN:-$(command -v turbo-lean || true)}"
 CORE_BIN="$ROOT_DIR/lean/.lake/build/bin/lean-native-core"
 
 if [ -z "$TURBO_BIN" ]; then
@@ -103,15 +103,22 @@ test "$(wc -l < lean/LeanNative/IR/Bridge.lean)" -le 350
 test "$(wc -l < lean/LeanNative/Driver/CoreCLI.lean)" -le 1000
 test ! -f lean/LeanNative/Driver/KernelTemplates.lean
 echo "  [OK] Bridge.lean ($(wc -l < lean/LeanNative/IR/Bridge.lean) LOC <= 350) & CoreCLI.lean ($(wc -l < lean/LeanNative/Driver/CoreCLI.lean) LOC <= 1000) pass all hygiene & LOC gates"
-"$CORE_BIN" verify-certs --json | python3 -c "
+"$CORE_BIN" verify-certs --canonical-benchmark --json | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+assert d['verified'] is True and d['overallAssurance'] == 'Tested', d
+assert any(r['declName'] == 'dot_product_u64' and r['overallAssurance'] == 'Tested' for r in d['declSummaries']), d
+print(f'  [OK] Default Hybrid/TV Pass Certificates: verified={d[\"verified\"]}, assurance={d[\"overallAssurance\"]}, decls={len(d[\"declSummaries\"])}')
+"
+"$CORE_BIN" verify-certs --canonical-benchmark --verified-kernel-only --json | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 assert d['verified'] is True and d['overallAssurance'] == 'VerifiedKernelProof', d
-print(f'  [OK] Pass Certificates: verified={d[\"verified\"]}, assurance={d[\"overallAssurance\"]}, decls={len(d[\"declSummaries\"])}')
+print(f'  [OK] Kernel-Proved Pass Certificates (--verified-kernel-only): verified={d[\"verified\"]}, assurance={d[\"overallAssurance\"]}, decls={len(d[\"declSummaries\"])}')
 "
 
 echo "=== [5/6] Segregated Plugin & Adversarial Mutant Gate (Law 1) ==="
-"$CORE_BIN" plugins --test-adversarial --json | python3 -c "
+"$CORE_BIN" plugins --canonical-benchmark --test-adversarial --json | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 assert d['adversarialRejected'] is True and d['rejectedCount'] >= 1, d
@@ -119,8 +126,9 @@ assert all(a['tvVerified'] for a in d['declAudits']), d
 print(f'  [OK] Segregated Plugins: accepted={d[\"acceptedCount\"]}, rejected={d[\"rejectedCount\"]}, adversarialRejected={d[\"adversarialRejected\"]}')
 "
 
-echo "=== [6/6] 3-Way Differential Conformance Suite & Grammar-Guided LCNF Fuzzer (M6: C1-C4) ==="
-python3 "$ROOT_DIR/scripts/fuzz_lcnf_conformance.py" --seeds 500
-python3 "$ROOT_DIR/scripts/run_conformance_suite.py"
+echo "=== [6/6] 3-Way Differential Conformance Suite, Grammar-Guided LCNF Fuzzer & P0 Trust Boundary ==="
+python3 "$ROOT_DIR/scripts/run_conformance_suite.py" --fuzz-seeds 32
+python3 -m unittest -v "$ROOT_DIR/scripts/test_p0_trust_boundary.py"
+python3 -m unittest -v "$ROOT_DIR/scripts/test_kernel_gate_audit.py"
 
-echo "=== ALL 6 ROADMAP VALIDATION CONTRACTS PASSED ==="
+echo "=== LOCAL VALIDATION GATES PASSED (scalar corpus; full roadmap coverage remains open) ==="

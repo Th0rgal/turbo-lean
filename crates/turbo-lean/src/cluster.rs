@@ -16,16 +16,32 @@ pub use c_abi::*;
 
 #[no_mangle]
 pub extern "C" fn lean_cabi_node_effective_cost(
-    is_healthy: u8, queue_depth: u64, ewma_exec_ms: u64, concurrency: u64, rtt_us: u64,
+    is_healthy: u8,
+    queue_depth: u64,
+    ewma_exec_ms: u64,
+    concurrency: u64,
+    rtt_us: u64,
 ) -> u64 {
-    if is_healthy == 0 { return u64::MAX; }
-    let cost = unsafe { turbo_spec_node_effective_cost(rtt_us / 1000, queue_depth, ewma_exec_ms, concurrency) };
-    if cost == u64::MAX { u64::MAX - 1 } else { cost }
+    if is_healthy == 0 {
+        return u64::MAX;
+    }
+    let cost = unsafe {
+        turbo_spec_node_effective_cost(rtt_us / 1000, queue_depth, ewma_exec_ms, concurrency)
+    };
+    if cost == u64::MAX {
+        u64::MAX - 1
+    } else {
+        cost
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn lean_cabi_is_remote_eligible(
-    is_healthy: u8, ttl: u64, est_local_ms: u64, remote_cost_ms: u64, min_local_ms: u64,
+    is_healthy: u8,
+    ttl: u64,
+    est_local_ms: u64,
+    remote_cost_ms: u64,
+    min_local_ms: u64,
 ) -> u8 {
     let supports_target = u8::from(est_local_ms >= min_local_ms);
     unsafe {
@@ -36,30 +52,61 @@ pub extern "C" fn lean_cabi_is_remote_eligible(
 
 #[no_mangle]
 pub extern "C" fn lean_cabi_should_switch_route(
-    current_cost_ms: u64, candidate_cost_ms: u64, hysteresis_margin_ms: u64,
+    current_cost_ms: u64,
+    candidate_cost_ms: u64,
+    hysteresis_margin_ms: u64,
 ) -> u8 {
-    if candidate_cost_ms == u64::MAX { return 0; }
-    if current_cost_ms == u64::MAX { return 1; }
-    unsafe { turbo_spec_should_switch_route(current_cost_ms, candidate_cost_ms.saturating_add(hysteresis_margin_ms), 1) }
+    if candidate_cost_ms == u64::MAX {
+        return 0;
+    }
+    if current_cost_ms == u64::MAX {
+        return 1;
+    }
+    unsafe {
+        turbo_spec_should_switch_route(
+            current_cost_ms,
+            candidate_cost_ms.saturating_add(hysteresis_margin_ms),
+            1,
+        )
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn lean_cabi_classify_compute_target(
-    workload_kind: u8, batch_size: u64, state_space_log2: u64,
-    has_local_tpu: u8, has_local_gpu: u8, has_remote_tpu: u8, has_remote_gpu: u8,
+    workload_kind: u8,
+    batch_size: u64,
+    state_space_log2: u64,
+    has_local_tpu: u8,
+    has_local_gpu: u8,
+    has_remote_tpu: u8,
+    has_remote_gpu: u8,
 ) -> u8 {
     if workload_kind == 1 {
-        return if batch_size >= 4 && has_remote_gpu != 0 { 6 } else { 5 };
+        return if batch_size >= 4 && has_remote_gpu != 0 {
+            6
+        } else {
+            5
+        };
     }
-    if has_local_tpu != 0 && (batch_size >= 2 || state_space_log2 >= 16) { return 2; }
-    if has_local_gpu != 0 && (batch_size >= 2 || state_space_log2 >= 16) { return 1; }
-    if has_remote_tpu != 0 && (batch_size >= 2 || state_space_log2 >= 18) { return 4; }
-    if has_remote_gpu != 0 && (batch_size >= 2 || state_space_log2 >= 18) { return 3; }
+    if has_local_tpu != 0 && (batch_size >= 2 || state_space_log2 >= 16) {
+        return 2;
+    }
+    if has_local_gpu != 0 && (batch_size >= 2 || state_space_log2 >= 16) {
+        return 1;
+    }
+    if has_remote_tpu != 0 && (batch_size >= 2 || state_space_log2 >= 18) {
+        return 4;
+    }
+    if has_remote_gpu != 0 && (batch_size >= 2 || state_space_log2 >= 18) {
+        return 3;
+    }
     0
 }
 
 #[no_mangle]
-pub extern "C" fn lean_cabi_splitmix64(x: u64) -> u64 { unsafe { turbo_spec_splitmix64(x) } }
+pub extern "C" fn lean_cabi_splitmix64(x: u64) -> u64 {
+    unsafe { turbo_spec_splitmix64(x) }
+}
 
 #[no_mangle]
 pub extern "C" fn lean_cabi_boundary_u256_limb(slot: u64, limb_idx: u64) -> u64 {
@@ -67,12 +114,26 @@ pub extern "C" fn lean_cabi_boundary_u256_limb(slot: u64, limb_idx: u64) -> u64 
 }
 
 #[no_mangle]
-pub extern "C" fn lean_cabi_gen_u256_limb(idx: u64, seed: u64, param_id: u64, limb_idx: u64) -> u64 {
+pub extern "C" fn lean_cabi_gen_u256_limb(
+    idx: u64,
+    seed: u64,
+    param_id: u64,
+    limb_idx: u64,
+) -> u64 {
     unsafe { turbo_spec_gen_u256_limb(idx, seed, param_id, limb_idx) }
 }
 
 #[no_mangle]
-pub extern "C" fn lean_cabi_u256_lt(a0: u64, a1: u64, a2: u64, a3: u64, b0: u64, b1: u64, b2: u64, b3: u64) -> u8 {
+pub extern "C" fn lean_cabi_u256_lt(
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    b0: u64,
+    b1: u64,
+    b2: u64,
+    b3: u64,
+) -> u8 {
     unsafe { turbo_spec_u256_lt(a0, a1, a2, a3, b0, b1, b2, b3) }
 }
 
@@ -159,11 +220,17 @@ impl ComputeTarget {
     }
 
     pub fn is_tpu(self) -> bool {
-        matches!(self, ComputeTarget::LocalTpuXla | ComputeTarget::RemoteTpuColab)
+        matches!(
+            self,
+            ComputeTarget::LocalTpuXla | ComputeTarget::RemoteTpuColab
+        )
     }
 
     pub fn is_gpu(self) -> bool {
-        matches!(self, ComputeTarget::LocalGpuCuda | ComputeTarget::RemoteGpuHttp)
+        matches!(
+            self,
+            ComputeTarget::LocalGpuCuda | ComputeTarget::RemoteGpuHttp
+        )
     }
 }
 
@@ -241,17 +308,7 @@ struct CachedClusterStatus {
 }
 
 fn cluster_cache_shm_path() -> PathBuf {
-    #[cfg(unix)]
-    let uid = unsafe { libc::geteuid() };
-    #[cfg(not(unix))]
-    let uid = 0u32;
-    let base = if Path::new("/dev/shm").is_dir() {
-        PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    };
-    base.join(format!("turbo-lean-staging-{}", uid))
-        .join("cluster_nodes_cache.json")
+    crate::shm_cache::staging_shm_dir().join("cluster_nodes_cache.json")
 }
 
 fn current_cluster_env_fingerprint() -> String {
@@ -337,7 +394,10 @@ fn probe_http_node_status(endpoint: &str, default_target: ComputeTarget) -> Comp
                 &format!("X-Lean-Native-Token: {}", colab_token.trim()),
             ]);
         }
-        cmd.output().ok().filter(|o| o.status.success()).map(|o| o.stdout)
+        cmd.output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| o.stdout)
     };
     if let Some(bytes) = raw_status {
         if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
@@ -575,16 +635,12 @@ pub fn select_optimal_route(
             .iter()
             .any(|n| n.is_local && n.is_healthy && n.target == ComputeTarget::LocalGpuCuda),
     );
-    let has_remote_tpu = u8::from(
-        nodes
-            .iter()
-            .any(|n| !n.is_local && n.is_healthy && n.target == ComputeTarget::RemoteTpuColab && ttl > 0),
-    );
-    let has_remote_gpu = u8::from(
-        nodes
-            .iter()
-            .any(|n| !n.is_local && n.is_healthy && n.target == ComputeTarget::RemoteGpuHttp && ttl > 0),
-    );
+    let has_remote_tpu = u8::from(nodes.iter().any(|n| {
+        !n.is_local && n.is_healthy && n.target == ComputeTarget::RemoteTpuColab && ttl > 0
+    }));
+    let has_remote_gpu = u8::from(nodes.iter().any(|n| {
+        !n.is_local && n.is_healthy && n.target == ComputeTarget::RemoteGpuHttp && ttl > 0
+    }));
 
     let classified_code = lean_cabi_classify_compute_target(
         0,
@@ -813,8 +869,7 @@ pub fn auto_fastcheck_batch(
                 first_hypothesis = suggested_hyp.clone();
                 first_failing_decl = Some(decl_name.clone());
             }
-            let triage_json =
-                crate::c_abi::build_counterexample_triage_json(None, None, None);
+            let triage_json = crate::c_abi::build_counterexample_triage_json(None, None, None);
             let r_code = lean_cabi_matryoshka_tier_router(50, 120, 380, 0, 1, 0);
             per_decl_results.push(serde_json::json!({
                 "decl": decl_name,
@@ -868,7 +923,11 @@ pub fn auto_fastcheck_batch(
         } else if eff_pref == "gpu" || route.selected_node.target.is_gpu() {
             ("gpu_cuda", "dgx_spark_s3_fp8_nvfp4 (d=64, h=128)", 12)
         } else {
-            ("lean_cabi_simd", "cpu_l1_s0_s1_int8 (d=16..32, h=32..64)", 0)
+            (
+                "lean_cabi_simd",
+                "cpu_l1_s0_s1_int8 (d=16..32, h=32..64)",
+                0,
+            )
         };
 
     let primary_decl = first_failing_decl
@@ -1193,9 +1252,21 @@ mod tests {
 
         // 2. Remote eligibility requires is_healthy != 0, ttl > 0, est_local_ms >= min_local_ms, remote_cost < est_local
         assert_eq!(lean_cabi_is_remote_eligible(1, 2, 20, 6, 4), 1);
-        assert_eq!(lean_cabi_is_remote_eligible(1, 0, 20, 6, 4), 0, "ttl=0 must block remote hop");
-        assert_eq!(lean_cabi_is_remote_eligible(0, 2, 20, 6, 4), 0, "unhealthy must block remote hop");
-        assert_eq!(lean_cabi_is_remote_eligible(1, 2, 5, 10, 4), 0, "slower remote must be rejected");
+        assert_eq!(
+            lean_cabi_is_remote_eligible(1, 0, 20, 6, 4),
+            0,
+            "ttl=0 must block remote hop"
+        );
+        assert_eq!(
+            lean_cabi_is_remote_eligible(0, 2, 20, 6, 4),
+            0,
+            "unhealthy must block remote hop"
+        );
+        assert_eq!(
+            lean_cabi_is_remote_eligible(1, 2, 5, 10, 4),
+            0,
+            "slower remote must be rejected"
+        );
 
         // 3. Hysteresis route switching prevents flapping within margin
         assert_eq!(lean_cabi_should_switch_route(10, 9, 2), 0);
@@ -1269,8 +1340,8 @@ mod tests {
                 "(a b : Word256) : (Word256.addWithCarry a b).1.w0 = (Word256.addWithCarry b a).1.w0".to_string(),
             ),
         ];
-        let valid_batch =
-            auto_fastcheck_batch(&batch_items, "auto").expect("auto_fastcheck_batch should succeed");
+        let valid_batch = auto_fastcheck_batch(&batch_items, "auto")
+            .expect("auto_fastcheck_batch should succeed");
         assert_eq!(valid_batch["ok"], true);
         assert_eq!(valid_batch["verified"], true);
         assert_eq!(valid_batch["violations"], 0);
@@ -1279,20 +1350,14 @@ mod tests {
             valid_batch["tpu_speculate_forest_endpoint"],
             "/v1/tpu-speculate-forest"
         );
-        assert_eq!(
-            valid_batch["trm_slice"],
-            "tpu_v6e_s4_bf16 (d=128, h=256)"
-        );
+        assert_eq!(valid_batch["trm_slice"], "tpu_v6e_s4_bf16 (d=128, h=256)");
 
         let cbv_item = vec![(
             "InitE.source_cbv_heavy".to_string(),
             "(a : Word256) : a = a".to_string(),
         )];
         let cbv_batch = auto_fastcheck_batch(&cbv_item, "tpu").expect("cbv batch");
-        assert_eq!(
-            cbv_batch["results"][0]["cbv_offload_recommended"],
-            true
-        );
+        assert_eq!(cbv_batch["results"][0]["cbv_offload_recommended"], true);
         assert_eq!(
             cbv_batch["results"][0]["winning_tactic_hint"],
             "native_decide_or_tpu_rpn"

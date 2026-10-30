@@ -24,6 +24,9 @@ export TurboLean.PolicyGates (
   verifyIdentBloomMatch
   verifyConLecheOleanShard
   verifyElabHeaderPinGate
+  verifyAuditMaterializeGate
+  verifyPackTrustAdmission
+  verifyHygieneItemAdmitted
   matryoshkaTierRouterSpec
   isClosedSectionNeededC
   cAbiIsClosedSectionNeeded
@@ -67,6 +70,9 @@ export TurboLean.PolicyGates (
   verifyIdentBloomMatchC
   verifyConLecheOleanShardC
   verifyElabHeaderPinGateC
+  verifyAuditMaterializeGateC
+  verifyPackTrustAdmissionC
+  verifyHygieneItemAdmittedC
   combinedStepC
 )
 

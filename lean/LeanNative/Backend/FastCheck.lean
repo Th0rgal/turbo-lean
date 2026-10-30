@@ -1238,6 +1238,8 @@ structure TelemetryConfig where
   projectId : String := ""
   sessionId : String := ""
   batchOnly : Bool := true
+  isCi      : Bool := false
+  allowCi   : Bool := false
   deriving Repr, DecidableEq, Inhabited, BEq
 
 namespace TelemetryConfig
@@ -1245,7 +1247,28 @@ namespace TelemetryConfig
 def probe (cliArgs : List String := []) : IO TelemetryConfig := do
   let envMode ← IO.getEnv "LEAN_NATIVE_TELEMETRY"
   let dirEnv ← IO.getEnv "LEAN_NATIVE_TELEMETRY_DIR"
+  let ciEnv ← IO.getEnv "CI"
+  let ghaEnv ← IO.getEnv "GITHUB_ACTIONS"
+  let tokEnv ← IO.getEnv "SANDBOXED_TELEMETRY_TOKEN"
+  let apiEnv ← IO.getEnv "TELEMETRY_API_KEY"
+  let nsEnv ← IO.getEnv "SANDBOXED_TELEMETRY_NAMESPACE"
+  let allowCiEnv ← IO.getEnv "SANDBOXED_TELEMETRY_ALLOW_CI_COMMUNITY"
   let trimStr (s : String) : String := s.trimAscii.toString
+  let isTruthy (opt : Option String) : Bool :=
+    match opt with
+    | some v =>
+      let s := (trimStr v).toLower
+      s == "1" || s == "true" || s == "yes"
+    | none => false
+  let isCi := isTruthy ciEnv || isTruthy ghaEnv
+  let allowCi := isTruthy allowCiEnv
+  let tok :=
+    match tokEnv.map trimStr |>.filter (!·.isEmpty) with
+    | some t => t
+    | none => (apiEnv.map trimStr |>.filter (!·.isEmpty)).getD ""
+  let ns :=
+    if tok.isEmpty then "community"
+    else (nsEnv.map trimStr |>.filter (!·.isEmpty)).getD "th0rgal"
   let rawMode :=
     if cliArgs.contains "--no-telemetry" || cliArgs.contains "--telemetry=off" || cliArgs.contains "--telemetry=0" then "off"
     else if cliArgs.contains "--telemetry=metrics" then "metrics"
@@ -1256,13 +1279,18 @@ def probe (cliArgs : List String := []) : IO TelemetryConfig := do
         let s := (trimStr v).toLower
         if s == "0" || s == "off" || s == "false" || s == "no" then "off" else "full"
       | none => "full"
+  let effectiveMode :=
+    if rawMode != "off" && rawMode != "metrics" && isCi && ns == "community" && !allowCi then "local"
+    else rawMode
   let spoolDir := (dirEnv.map trimStr).filter (!·.isEmpty) |>.getD ".lean-native/telemetry"
   let cwd ← IO.currentDir
   let projectId := ((blake3Hex s!"telemetry-project-v1:{cwd}").take 16).toString
   let machineId := ((blake3Hex s!"telemetry-machine-v1:{cwd}").take 16).toString
   return {
-    enabled := rawMode != "off", mode := rawMode, spoolDir, tmpSpool := "/tmp/sandboxed-telemetry"
-    machineId, projectId, sessionId := s!"sess-{((blake3Hex s!"{cwd}:{machineId}").take 12).toString}"
+    enabled := effectiveMode != "off", mode := effectiveMode, spoolDir, tmpSpool := "/tmp/sandboxed-telemetry"
+    token := tok, ns, machineId, projectId
+    sessionId := s!"sess-{((blake3Hex s!"{cwd}:{machineId}").take 12).toString}"
+    batchOnly := true, isCi, allowCi
   }
 
 end TelemetryConfig
@@ -1285,7 +1313,10 @@ def storeTelemetryBlob (cfg : TelemetryConfig) (payload : String) : IO String :=
 def appendTelemetryEventJsonl (cfg : TelemetryConfig) (jsonLine : String) (_blobs : List (String × String) := []) : IO Unit := do
   if !cfg.enabled then return ()
   let evDigest := ((blake3Hex jsonLine).take 16).toString
-  for baseDir in [cfg.spoolDir, cfg.tmpSpool] do
+  let spoolTargets :=
+    if cfg.isCi && cfg.ns == "community" && cfg.token.isEmpty && !cfg.allowCi then [cfg.spoolDir]
+    else [cfg.spoolDir, cfg.tmpSpool]
+  for baseDir in spoolTargets do
     try
       let dirPath : System.FilePath := baseDir
       IO.FS.createDirAll dirPath

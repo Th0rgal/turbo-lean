@@ -135,26 +135,58 @@ runs:
 
     - name: Import .tlpack CAS bundle & optional remote sync
       shell: bash
+      env:
+        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_REMOTE_SYNC_URL: ${{ inputs.remote-sync-url }}
+        GH_EVENT_NAME: ${{ github.event_name }}
       run: |
         set -euo pipefail
         PACK_DIR="${RUNNER_TEMP}/.turbo-pack"
         mkdir -p "$PACK_DIR"
-        if [ -f "$PACK_DIR/cache.tlpack" ]; then
-          turbo-lean --json import "$PACK_DIR/cache.tlpack"
+        IMPORT_MODE="$INPUT_MODE"
+        if [ "$IMPORT_MODE" = "auto" ]; then
+          if [ "$GH_EVENT_NAME" = "pull_request" ]; then
+            IMPORT_MODE="untrusted"
+          else
+            IMPORT_MODE="trusted"
+          fi
         fi
-        if [ -n "${{ inputs.remote-sync-url }}" ]; then
-          turbo-lean sync "${{ inputs.remote-sync-url }}" || true
+        if [ -f "$PACK_DIR/cache.tlpack" ]; then
+          if [ "$IMPORT_MODE" = "trusted" ]; then
+            turbo-lean --json import "$PACK_DIR/cache.tlpack" --allow-unattested-trusted
+          else
+            turbo-lean --json import "$PACK_DIR/cache.tlpack" --trust-domain untrusted
+          fi
+        fi
+        if [ -n "$INPUT_REMOTE_SYNC_URL" ]; then
+          if [ "$IMPORT_MODE" = "trusted" ]; then
+            turbo-lean sync "$INPUT_REMOTE_SYNC_URL" --allow-unattested-trusted
+          else
+            turbo-lean sync "$INPUT_REMOTE_SYNC_URL" --trust-domain untrusted
+          fi
         fi
 
-    - name: Execute turbo-lean (${{ inputs.command }})
+    - name: Execute turbo-lean
       id: run-turbo
       if: ${{ inputs.command != 'cache-only' }}
       shell: bash
+      env:
+        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_COMMAND: ${{ inputs.command }}
+        INPUT_PROJECT_DIR: ${{ inputs.project-dir }}
+        INPUT_BASE_REF: ${{ inputs.base-ref }}
+        INPUT_DISALLOW_STMT_CHANGES: ${{ inputs.disallow-statement-changes }}
+        INPUT_RECEIPT_PATH: ${{ inputs.receipt-path }}
+        INPUT_SEED_SHARDS: ${{ inputs.seed-shards }}
+        INPUT_TARGETS: ${{ inputs.targets }}
+        INPUT_CHECK_FILE: ${{ inputs.check-file }}
+        INPUT_CHECK_DECL: ${{ inputs.check-decl }}
+        GH_EVENT_NAME: ${{ github.event_name }}
       run: |
         set -euo pipefail
-        MODE="${{ inputs.mode }}"
+        MODE="$INPUT_MODE"
         if [ "$MODE" = "auto" ]; then
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
+          if [ "$GH_EVENT_NAME" = "pull_request" ]; then
             MODE="untrusted"
           else
             MODE="trusted"
@@ -162,57 +194,57 @@ runs:
         fi
 
         RECEIPT_ARGS=()
-        if [ -n "${{ inputs.receipt-path }}" ]; then
-          RECEIPT_ARGS=(--receipt "${{ inputs.receipt-path }}")
+        if [ -n "$INPUT_RECEIPT_PATH" ]; then
+          RECEIPT_ARGS=(--receipt "$INPUT_RECEIPT_PATH")
         fi
 
         SEED_ARGS=()
-        if [ "${{ inputs.seed-shards }}" = "true" ]; then
+        if [ "$INPUT_SEED_SHARDS" = "true" ]; then
           SEED_ARGS=(--seed-shards)
         fi
 
         OUT_JSON="${RUNNER_TEMP}/turbo-lean-result.json"
-        case "${{ inputs.command }}" in
+        case "$INPUT_COMMAND" in
           ci-verify)
-            turbo-lean --json ci-verify --project-dir "${{ inputs.project-dir }}" --mode "$MODE" "${SEED_ARGS[@]}" "${RECEIPT_ARGS[@]}" | tee "$OUT_JSON"
+            turbo-lean --json ci-verify --project-dir "$INPUT_PROJECT_DIR" --mode "$MODE" "${SEED_ARGS[@]}" "${RECEIPT_ARGS[@]}" | tee "$OUT_JSON"
             ;;
           pr-verify)
-            PR_ARGS=(--project-dir "${{ inputs.project-dir }}" --base "${{ inputs.base-ref }}" --mode "$MODE" "${RECEIPT_ARGS[@]}")
-            if [ "${{ inputs.disallow-statement-changes }}" = "true" ]; then
+            PR_ARGS=(--project-dir "$INPUT_PROJECT_DIR" --base "$INPUT_BASE_REF" --mode "$MODE" "${RECEIPT_ARGS[@]}")
+            if [ "$INPUT_DISALLOW_STMT_CHANGES" = "true" ]; then
               PR_ARGS+=(--disallow-statement-changes)
             fi
             turbo-lean --json pr-verify "${PR_ARGS[@]}" | tee "$OUT_JSON"
             ;;
           build)
-            # shellcheck disable=SC2086
-            turbo-lean --json build ${{ inputs.targets }} --project-dir "${{ inputs.project-dir }}" --trust-domain "$MODE" "${SEED_ARGS[@]}" | tee "$OUT_JSON"
+            read -r -a TARGET_ARR <<< "$INPUT_TARGETS"
+            turbo-lean --json build "${TARGET_ARR[@]}" --project-dir "$INPUT_PROJECT_DIR" --trust-domain "$MODE" "${SEED_ARGS[@]}" | tee "$OUT_JSON"
             ;;
           seed-shards)
-            turbo-lean --json seed-shards --project-dir "${{ inputs.project-dir }}" --trust-domain "$MODE" | tee "$OUT_JSON"
+            turbo-lean --json seed-shards --project-dir "$INPUT_PROJECT_DIR" --trust-domain "$MODE" | tee "$OUT_JSON"
             ;;
           check)
-            if [ -n "${{ inputs.check-decl }}" ]; then
-              turbo-lean --json check "${{ inputs.check-file }}" --decl "${{ inputs.check-decl }}" --project-dir "${{ inputs.project-dir }}" | tee "$OUT_JSON"
+            if [ -n "$INPUT_CHECK_DECL" ]; then
+              turbo-lean --json check "$INPUT_CHECK_FILE" --decl "$INPUT_CHECK_DECL" --project-dir "$INPUT_PROJECT_DIR" | tee "$OUT_JSON"
             else
-              turbo-lean --json check "${{ inputs.check-file }}" --project-dir "${{ inputs.project-dir }}" | tee "$OUT_JSON"
+              turbo-lean --json check "$INPUT_CHECK_FILE" --project-dir "$INPUT_PROJECT_DIR" | tee "$OUT_JSON"
             fi
             ;;
           agent-step)
-            if [ -n "${{ inputs.check-decl }}" ]; then
-              turbo-lean --json agent-step "${{ inputs.check-file }}" --decl "${{ inputs.check-decl }}" --project-dir "${{ inputs.project-dir }}" | tee "$OUT_JSON"
+            if [ -n "$INPUT_CHECK_DECL" ]; then
+              turbo-lean --json agent-step "$INPUT_CHECK_FILE" --decl "$INPUT_CHECK_DECL" --project-dir "$INPUT_PROJECT_DIR" | tee "$OUT_JSON"
             else
-              turbo-lean --json agent-step "${{ inputs.check-file }}" --project-dir "${{ inputs.project-dir }}" | tee "$OUT_JSON"
+              turbo-lean --json agent-step "$INPUT_CHECK_FILE" --project-dir "$INPUT_PROJECT_DIR" | tee "$OUT_JSON"
             fi
             ;;
           audit-spec)
-            if [ -n "${{ inputs.check-decl }}" ]; then
-              turbo-lean --json audit-spec "${{ inputs.check-file }}" --decl "${{ inputs.check-decl }}" | tee "$OUT_JSON"
+            if [ -n "$INPUT_CHECK_DECL" ]; then
+              turbo-lean --json audit-spec "$INPUT_CHECK_FILE" --decl "$INPUT_CHECK_DECL" | tee "$OUT_JSON"
             else
-              turbo-lean --json audit-spec "${{ inputs.check-file }}" | tee "$OUT_JSON"
+              turbo-lean --json audit-spec "$INPUT_CHECK_FILE" | tee "$OUT_JSON"
             fi
             ;;
           *)
-            echo "Unknown turbo-lean command: ${{ inputs.command }}" >&2
+            echo "Unknown turbo-lean command: $INPUT_COMMAND" >&2
             exit 1
             ;;
         esac
@@ -238,11 +270,13 @@ runs:
     - name: Run Cost-Aware GDSF GC & Export .tlpack CAS bundle
       if: always()
       shell: bash
+      env:
+        INPUT_MAX_RECLAIMABLE_BYTES: ${{ inputs.max-reclaimable-bytes }}
       run: |
         set -euo pipefail
         PACK_DIR="${RUNNER_TEMP}/.turbo-pack"
         mkdir -p "$PACK_DIR"
-        turbo-lean --json gc --max-reclaimable-bytes "${{ inputs.max-reclaimable-bytes }}"
+        turbo-lean --json gc --max-reclaimable-bytes "$INPUT_MAX_RECLAIMABLE_BYTES"
         turbo-lean --json export -o "$PACK_DIR/cache.tlpack"
         turbo-lean --json status
 

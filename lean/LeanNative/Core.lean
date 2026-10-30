@@ -29,6 +29,7 @@ import LeanNative.Backend.MLIRGPU
 import LeanNative.Backend.Metal
 import LeanNative.Backend.Hybrid
 import LeanNative.Backend.FastCheck
+import LeanNative.Driver.EvalBatch
 import LeanNative.Driver.CoreCLI
 
 namespace LeanNative.Core

@@ -18,7 +18,9 @@ theorem olean_mmap_bridge_sound_bridge (bytes : ByteArray) (env : ConLeche.Env)
     (h_parse : ConLeche.parseOleanShard bytes = .ok env) :
     bytes.size ≥ 5 ∧
     env.headerMagic = 0x4F4C454E ∧
-    (∀ d ∈ env.decls, ConLeche.CICValid env d) :=
+    ConLeche.verifyDeclsPrefix [] env.decls = true ∧
+    (∀ d ∈ env.decls, ConLeche.CICValid env d) ∧
+    (∀ r ∈ env.recRules, ConLeche.RecRuleWF env r) :=
   ConLeche.olean_mmap_bridge_sound bytes env h_parse
 
 theorem header_pin_prevents_statement_spoofing_bridge (spec : TurboLean.ElabAudit.PinnedHeaderSpec)

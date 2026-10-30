@@ -1326,54 +1326,6 @@ theorem verifyRecRule_sound (env : Env) (rule : RecRule)
     RecRuleWF env rule :=
   verifyRecRuleInst_sound env [] rule (rule.levelParams.map Level.param) h_ver
 
-/-- Milestone M2 (Item 1): Machine-checked soundness of the `.olean` binary shard parser
-    (`olean_mmap_bridge_sound`, `0 sorryAx`). -/
-theorem olean_mmap_bridge_sound (bytes : ByteArray) (env : Env)
-    (h_parse : parseOleanShard bytes = .ok env) :
-    bytes.size ≥ 5 ∧
-    env.headerMagic = 0x4F4C454E ∧
-    (∀ d ∈ env.decls, CICValid env d) := by
-  unfold parseOleanShard at h_parse
-  split at h_parse
-  · contradiction
-  · rename_i hlt
-    have hsize : bytes.size ≥ 5 := Nat.le_of_not_lt hlt
-    split at h_parse
-    · rename_i m0 m1 m2 m3 payload _
-      split at h_parse
-      · contradiction
-      · cases hcnt : decodeNat payload with
-        | none => simp [hcnt] at h_parse
-        | some cntPair =>
-          rcases cntPair with ⟨declCount, rest1⟩
-          simp only [hcnt] at h_parse
-          split at h_parse
-          · contradiction
-          · cases hdec : decodeOleanDeclsStream declCount rest1 with
-            | none => simp [hdec] at h_parse
-            | some declPair =>
-              rcases declPair with ⟨decls, rest2⟩
-              simp only [hdec] at h_parse
-              cases hrul : decodeOleanRecRulesStream rest2 with
-              | none => simp [hrul] at h_parse
-              | some rulePair =>
-                rcases rulePair with ⟨recRules, rest3⟩
-                simp only [hrul] at h_parse
-                split at h_parse
-                · contradiction
-                · split at h_parse
-                  · rename_i hall
-                    injection h_parse with henv
-                    subst henv
-                    simp only [Bool.and_eq_true] at hall
-                    refine ⟨hsize, rfl, ?_⟩
-                    intro d hd
-                    have hver : verifyDecl { decls := decls, recRules := recRules, headerMagic := 0x4F4C454E } d = true :=
-                      List.all_eq_true.mp hall.1 d hd
-                    exact con_leche_verify_decl_sound { decls := decls, recRules := recRules, headerMagic := 0x4F4C454E } d hver
-                  · contradiction
-    · contradiction
-
 /-- Environment well-formedness theorem for parsed `.olean` shards (`parseOleanShard_envWF`, `0 sorryAx`):
     any shard accepted by `parseOleanShard` satisfies `EnvWF env` (acyclic incremental prefix typing,
     semantic `CICValid` for all declarations, and well-formed `recRules`). -/
@@ -1417,13 +1369,66 @@ theorem parseOleanShard_envWF (bytes : ByteArray) (env : Env)
                       cases verifyDeclsPrefix [] decls <;> simp
                     refine ⟨hpref, ?_, ?_⟩
                     · intro d hd
-                      have hver : verifyDecl { decls := decls, recRules := recRules, headerMagic := 0x4F4C454E } d = true :=
+                      have hver :
+                          verifyDecl { decls := decls, recRules := recRules, headerMagic := 0x4F4C454E } d =
+                            true :=
                         List.all_eq_true.mp hall.1 d hd
-                      exact con_leche_verify_decl_sound { decls := decls, recRules := recRules, headerMagic := 0x4F4C454E } d hver
+                      exact
+                        con_leche_verify_decl_sound
+                          { decls := decls, recRules := recRules, headerMagic := 0x4F4C454E } d hver
                     · intro r hr
-                      have hrv : verifyRecRule { decls := decls, recRules := recRules, headerMagic := 0x4F4C454E } r = true :=
+                      have hrv :
+                          verifyRecRule { decls := decls, recRules := recRules, headerMagic := 0x4F4C454E } r =
+                            true :=
                         List.all_eq_true.mp hall.2 r hr
-                      exact verifyRecRule_sound { decls := decls, recRules := recRules, headerMagic := 0x4F4C454E } r hrv
+                      exact
+                        verifyRecRule_sound
+                          { decls := decls, recRules := recRules, headerMagic := 0x4F4C454E } r hrv
+                  · contradiction
+    · contradiction
+
+/-- Milestone M2 (Item 1): Machine-checked soundness of the `.olean` binary shard parser
+    (`olean_mmap_bridge_sound`, `0 sorryAx`). -/
+theorem olean_mmap_bridge_sound (bytes : ByteArray) (env : Env)
+    (h_parse : parseOleanShard bytes = .ok env) :
+    bytes.size ≥ 5 ∧
+    env.headerMagic = 0x4F4C454E ∧
+    verifyDeclsPrefix [] env.decls = true ∧
+    (∀ d ∈ env.decls, CICValid env d) ∧
+    (∀ r ∈ env.recRules, RecRuleWF env r) := by
+  have ⟨hpref, hd, hr⟩ := parseOleanShard_envWF bytes env h_parse
+  unfold parseOleanShard at h_parse
+  split at h_parse
+  · contradiction
+  · rename_i hlt
+    have hsize : bytes.size ≥ 5 := Nat.le_of_not_lt hlt
+    split at h_parse
+    · rename_i m0 m1 m2 m3 payload _
+      split at h_parse
+      · contradiction
+      · cases hcnt : decodeNat payload with
+        | none => simp [hcnt] at h_parse
+        | some cntPair =>
+          rcases cntPair with ⟨declCount, rest1⟩
+          simp only [hcnt] at h_parse
+          split at h_parse
+          · contradiction
+          · cases hdec : decodeOleanDeclsStream declCount rest1 with
+            | none => simp [hdec] at h_parse
+            | some declPair =>
+              rcases declPair with ⟨decls, rest2⟩
+              simp only [hdec] at h_parse
+              cases hrul : decodeOleanRecRulesStream rest2 with
+              | none => simp [hrul] at h_parse
+              | some rulePair =>
+                rcases rulePair with ⟨recRules, rest3⟩
+                simp only [hrul] at h_parse
+                split at h_parse
+                · contradiction
+                · split at h_parse
+                  · injection h_parse with henv
+                    subst henv
+                    exact ⟨hsize, rfl, hpref, hd, hr⟩
                   · contradiction
     · contradiction
 

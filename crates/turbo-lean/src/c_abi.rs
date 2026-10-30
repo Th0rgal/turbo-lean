@@ -151,6 +151,37 @@ extern "C" {
         cas_blob_magic_ok: u8,
         cas_off_end_matches: u8,
     ) -> u8;
+    pub fn turbo_spec_verify_audit_materialize_gate(
+        skeleton_clean: u8,
+        stubbed_placeholder_count: u64,
+        certified_shard_count: u64,
+        distinct_covered_shard_count: u64,
+        total_shard_count: u64,
+        expected_interface_digest: u64,
+        actual_interface_digest: u64,
+        expected_olean_digest: u64,
+        actual_olean_digest: u64,
+        expected_ilean_digest: u64,
+        actual_ilean_digest: u64,
+        needs_c: u8,
+        expected_c_digest: u64,
+        actual_c_digest: u64,
+        dep_trace_digest: u64,
+        audited_artifact_digest: u64,
+        kernel_audit_clean: u8,
+    ) -> u8;
+    pub fn turbo_spec_verify_pack_trust_admission(
+        requested_untrusted: u8,
+        has_trusted_pubkey: u8,
+        has_attestation_fields: u8,
+        sig_valid: u8,
+        allow_unattested_trusted: u8,
+    ) -> u8;
+    pub fn turbo_spec_verify_hygiene_item_admitted(
+        item_kind: u8,
+        admits_native_decide: u8,
+        admits_bv_decide: u8,
+    ) -> u8;
     pub fn leansys_verify_slice_bounds(off: u64, len: u64, cap: u64) -> u8;
     pub fn leansys_verify_wal_frame(
         magic: u32,
@@ -338,6 +369,23 @@ extern "C" {
         is_page_aligned: u8,
         chosen_backend: u8,
     ) -> u8;
+    pub fn lean_native_ntt_butterfly_fused_2layer_slice(
+        a_lo: u64,
+        a_hi: u64,
+        b_lo: u64,
+        b_hi: u64,
+        c_lo: u64,
+        c_hi: u64,
+        d_lo: u64,
+        d_hi: u64,
+        to_lo: u64,
+        to_hi: u64,
+        tia_lo: u64,
+        tia_hi: u64,
+        tib_lo: u64,
+        tib_hi: u64,
+        out_word: u64,
+    ) -> u64;
     pub fn turbo_spec_combined_step(i: u64) -> u64;
 }
 
@@ -1710,12 +1758,7 @@ pub fn verify_slice_pass_gate(
 }
 
 #[inline(always)]
-pub fn verify_par_chunk(
-    chunk_start: u64,
-    chunk_end: u64,
-    total_len: u64,
-    min_grain: u64,
-) -> bool {
+pub fn verify_par_chunk(chunk_start: u64, chunk_end: u64, total_len: u64, min_grain: u64) -> bool {
     unsafe { leansys_verify_par_chunk(chunk_start, chunk_end, total_len, min_grain) == 1 }
 }
 
@@ -1739,13 +1782,8 @@ pub fn verify_tlz1_token(
     uncompressed_cap: u64,
 ) -> bool {
     unsafe {
-        turbo_spec_verify_tlz1_token(
-            is_match as u8,
-            offset,
-            token_len,
-            out_len,
-            uncompressed_cap,
-        ) != 0
+        turbo_spec_verify_tlz1_token(is_match as u8, offset, token_len, out_len, uncompressed_cap)
+            != 0
     }
 }
 
@@ -1776,14 +1814,31 @@ pub fn verify_farkas_step(
     weight_cost: u64,
     bound: u64,
 ) -> bool {
-    unsafe {
-        turbo_spec_verify_farkas_step(obj_coeff, col_sum, acc_cost, weight_cost, bound) != 0
-    }
+    unsafe { turbo_spec_verify_farkas_step(obj_coeff, col_sum, acc_cost, weight_cost, bound) != 0 }
 }
 
 #[inline(always)]
 pub fn verify_ident_bloom(is_excluded_core: bool, cand_mask: u64, context_mask: u64) -> bool {
     unsafe { turbo_spec_verify_ident_bloom(is_excluded_core as u8, cand_mask, context_mask) != 0 }
+}
+
+#[inline(always)]
+pub fn verify_pack_trust_admission(
+    requested_untrusted: bool,
+    has_trusted_pubkey: bool,
+    has_attestation_fields: bool,
+    sig_valid: bool,
+    allow_unattested_trusted: bool,
+) -> bool {
+    unsafe {
+        turbo_spec_verify_pack_trust_admission(
+            requested_untrusted as u8,
+            has_trusted_pubkey as u8,
+            has_attestation_fields as u8,
+            sig_valid as u8,
+            allow_unattested_trusted as u8,
+        ) != 0
+    }
 }
 
 #[inline(always)]
@@ -2027,17 +2082,9 @@ pub fn verify_isa_selection(
 }
 
 #[inline(always)]
-pub fn verify_rc_mode_safe(
-    rc_mode: u8,
-    has_heap_allocs: bool,
-    is_multi_threaded: bool,
-) -> bool {
+pub fn verify_rc_mode_safe(rc_mode: u8, has_heap_allocs: bool, is_multi_threaded: bool) -> bool {
     unsafe {
-        leannative_verify_rc_mode_safe(
-            rc_mode,
-            has_heap_allocs as u8,
-            is_multi_threaded as u8,
-        ) == 1
+        leannative_verify_rc_mode_safe(rc_mode, has_heap_allocs as u8, is_multi_threaded as u8) == 1
     }
 }
 
@@ -2060,6 +2107,97 @@ pub fn verify_backend_choice(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub fn verify_audit_materialize_gate(
+    skeleton_clean: bool,
+    stubbed_placeholder_count: u64,
+    certified_shard_count: u64,
+    distinct_covered_shard_count: u64,
+    total_shard_count: u64,
+    expected_interface_digest: u64,
+    actual_interface_digest: u64,
+    expected_olean_digest: u64,
+    actual_olean_digest: u64,
+    expected_ilean_digest: u64,
+    actual_ilean_digest: u64,
+    needs_c: bool,
+    expected_c_digest: u64,
+    actual_c_digest: u64,
+    dep_trace_digest: u64,
+    audited_artifact_digest: u64,
+    kernel_audit_clean: bool,
+) -> bool {
+    unsafe {
+        turbo_spec_verify_audit_materialize_gate(
+            skeleton_clean as u8,
+            stubbed_placeholder_count,
+            certified_shard_count,
+            distinct_covered_shard_count,
+            total_shard_count,
+            expected_interface_digest,
+            actual_interface_digest,
+            expected_olean_digest,
+            actual_olean_digest,
+            expected_ilean_digest,
+            actual_ilean_digest,
+            needs_c as u8,
+            expected_c_digest,
+            actual_c_digest,
+            dep_trace_digest,
+            audited_artifact_digest,
+            kernel_audit_clean as u8,
+        ) != 0
+    }
+}
+
+/// Evaluate one fused 2-layer Radix-4 $\mathbb{F}_{2^{128}}$ butterfly quad via the compiled
+/// `LeanNative.Spec` C-ABI export `lean_native_ntt_butterfly_fused_2layer_slice`.
+#[inline]
+pub fn ntt_butterfly_fused_2layer_lane(
+    a: (u64, u64),
+    b: (u64, u64),
+    c: (u64, u64),
+    d: (u64, u64),
+    to: (u64, u64),
+    tia: (u64, u64),
+    tib: (u64, u64),
+) -> [(u64, u64); 4] {
+    let word = |w: u64| unsafe {
+        lean_native_ntt_butterfly_fused_2layer_slice(
+            a.0, a.1, b.0, b.1, c.0, c.1, d.0, d.1, to.0, to.1, tia.0, tia.1, tib.0, tib.1, w,
+        )
+    };
+    [
+        (word(0), word(1)),
+        (word(2), word(3)),
+        (word(4), word(5)),
+        (word(6), word(7)),
+    ]
+}
+
+/// In-place slice driver over 128-bit $\mathbb{F}_{2^{128}}$ lanes (`[u64; 2]` per lane) delegating
+/// each lane exclusively to the verified `lean_native_ntt_butterfly_fused_2layer_slice` C-ABI symbol.
+pub fn ntt_butterfly_fused_2layer_slice_in_place(
+    a: &mut [(u64, u64)],
+    b: &mut [(u64, u64)],
+    c: &mut [(u64, u64)],
+    d: &mut [(u64, u64)],
+    to: (u64, u64),
+    tia: (u64, u64),
+    tib: (u64, u64),
+) {
+    let n = a.len().min(b.len()).min(c.len()).min(d.len());
+    for i in 0..n {
+        let [fa, fb, fc, fd] =
+            ntt_butterfly_fused_2layer_lane(a[i], b[i], c[i], d[i], to, tia, tib);
+        a[i] = fa;
+        b[i] = fb;
+        c[i] = fc;
+        d[i] = fd;
+    }
+}
+
 /// Extract semantic `(has_missing_hyp, ref_disagrees)` booleans emitted by `lean-native-core`
 /// inside a `counterexample_triage` JSON object.
 pub fn extract_lean_native_triage_booleans(val: &serde_json::Value) -> Option<(bool, bool)> {
@@ -2078,9 +2216,7 @@ pub fn build_counterexample_triage_json(
     semantic_triage: Option<(bool, bool)>,
 ) -> serde_json::Value {
     let vals_differ = match (lhs_val, rhs_val) {
-        (Some(l), Some(r)) => {
-            !l.trim().is_empty() && !r.trim().is_empty() && l.trim() != r.trim()
-        }
+        (Some(l), Some(r)) => !l.trim().is_empty() && !r.trim().is_empty() && l.trim() != r.trim(),
         _ => false,
     };
     let (has_missing_hyp, ref_disagrees, code, label) = match semantic_triage {
@@ -2517,10 +2653,30 @@ mod tests {
         assert!(verify_parfor_chunk_partition(0, 64, 256, 64, 4, 8));
         assert!(!verify_parfor_chunk_partition(64, 64, 256, 64, 4, 8));
         assert!(!verify_parfor_chunk_partition(0, 32, 256, 64, 4, 8));
-        assert!(verify_ios_jetsam_budget(33_554_432, 33_554_432, 268_435_456, 16383, false));
-        assert!(!verify_ios_jetsam_budget(200_000_000, 100_000_000, 268_435_456, 16383, false));
-        assert!(!verify_ios_jetsam_budget(8_388_608, 8_388_608, 268_435_456, 16383, true));
-        assert!(verify_ios_jetsam_budget(8_388_608, 8_388_608, 25_165_824, 16383, true));
+        assert!(verify_ios_jetsam_budget(
+            33_554_432,
+            33_554_432,
+            268_435_456,
+            16383,
+            false
+        ));
+        assert!(!verify_ios_jetsam_budget(
+            200_000_000,
+            100_000_000,
+            268_435_456,
+            16383,
+            false
+        ));
+        assert!(!verify_ios_jetsam_budget(
+            8_388_608,
+            8_388_608,
+            268_435_456,
+            16383,
+            true
+        ));
+        assert!(verify_ios_jetsam_budget(
+            8_388_608, 8_388_608, 25_165_824, 16383, true
+        ));
         assert!(verify_rc_mode_safe(0, false, true));
         assert!(!verify_rc_mode_safe(0, true, false));
         assert!(!verify_rc_mode_safe(1, true, true));
@@ -2530,10 +2686,38 @@ mod tests {
         assert!(!verify_worker_budget(0, 6, 24, 1024, true));
         assert!(verify_worker_budget_topology(6, 9, 54, 4096, 2));
         assert!(!verify_worker_budget_topology(6, 10, 54, 4096, 2));
-        assert!(verify_page_aligned_buffer(0x10000, 4096, 16384, 1_048_576, 134_217_728, 16383));
-        assert!(verify_page_aligned_buffer(0x11000, 4096, 4096, 1_048_576, 134_217_728, 4095));
-        assert!(!verify_page_aligned_buffer(0x11000, 4096, 16384, 1_048_576, 134_217_728, 16383));
-        assert!(!verify_page_aligned_buffer(0x10000, 4096, 16384, 1_048_576, 134_217_728, 8191));
+        assert!(verify_page_aligned_buffer(
+            0x10000,
+            4096,
+            16384,
+            1_048_576,
+            134_217_728,
+            16383
+        ));
+        assert!(verify_page_aligned_buffer(
+            0x11000,
+            4096,
+            4096,
+            1_048_576,
+            134_217_728,
+            4095
+        ));
+        assert!(!verify_page_aligned_buffer(
+            0x11000,
+            4096,
+            16384,
+            1_048_576,
+            134_217_728,
+            16383
+        ));
+        assert!(!verify_page_aligned_buffer(
+            0x10000,
+            4096,
+            16384,
+            1_048_576,
+            134_217_728,
+            8191
+        ));
         assert_eq!(select_isa(0x37F, 0x37F, 3, 3), 3);
         assert_eq!(select_isa(0x307, 0x37F, 3, 3), 0);
         assert_eq!(select_isa(0x37F, 0, 3, 3), 0);
@@ -2577,6 +2761,33 @@ mod tests {
         assert!(verify_elab_header_pin(true, true, true, true, true));
         assert!(!verify_elab_header_pin(true, false, true, true, true));
         assert!(!verify_elab_header_pin(false, true, true, true, true));
+        assert!(verify_audit_materialize_gate(
+            true, 0, 4, 4, 4, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, true, 0x44, 0x44, 0x55, 0x22,
+            true
+        ));
+        assert!(!verify_audit_materialize_gate(
+            true, 1, 4, 4, 4, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, true, 0x44, 0x44, 0x55, 0x22,
+            true
+        ));
+        assert!(!verify_audit_materialize_gate(
+            true, 0, 3, 4, 4, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, true, 0x44, 0x44, 0x55, 0x22,
+            true
+        ));
+        assert!(!verify_audit_materialize_gate(
+            true, 0, 4, 4, 4, 0x11, 0x11, 0x22, 0x99, 0x33, 0x33, true, 0x44, 0x44, 0x55, 0x99,
+            true
+        ));
+        assert!(!verify_audit_materialize_gate(
+            true, 0, 4, 4, 4, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, true, 0x44, 0x44, 0, 0x22, true
+        ));
+        assert!(!verify_audit_materialize_gate(
+            true, 0, 4, 4, 4, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, true, 0x44, 0x44, 0x55, 0x77,
+            true
+        ));
+        assert!(!verify_audit_materialize_gate(
+            true, 0, 4, 4, 4, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, true, 0x44, 0x44, 0x55, 0x22,
+            false
+        ));
         let t1 = build_counterexample_triage_json(Some("0"), Some("1"), Some((true, false)));
         assert_eq!(t1["classification"], "SpecTooStrong");
         assert_eq!(t1["classification_consistent"], true);
@@ -2630,5 +2841,105 @@ mod tests {
         let w3 = synthesize_farkas_nat_weights(&m3, &r3, &o3, 16).expect("3-row farkas");
         assert_eq!(w3, vec![1, 1, 1]);
         assert!(check_farkas_nat(&w3, &m3, &r3, &o3, 16));
+    }
+
+    #[test]
+    fn test_ntt_butterfly_fused_2layer_slice_c_abi_matches_sequential_radix2() {
+        fn gf128_mul_ref(a: (u64, u64), b: (u64, u64)) -> (u64, u64) {
+            let x = (a.0 as u128) | ((a.1 as u128) << 64);
+            let y = (b.0 as u128) | ((b.1 as u128) << 64);
+            let mut cur = x;
+            let mut res: u128 = 0;
+            for bit in 0..128 {
+                if ((y >> bit) & 1) != 0 {
+                    res ^= cur;
+                }
+                let carry = (cur >> 127) & 1;
+                cur <<= 1;
+                if carry != 0 {
+                    cur ^= 0x87;
+                }
+            }
+            (res as u64, (res >> 64) as u64)
+        }
+        fn gf128_xor(a: (u64, u64), b: (u64, u64)) -> (u64, u64) {
+            (a.0 ^ b.0, a.1 ^ b.1)
+        }
+        fn radix2_ref(u: (u64, u64), v: (u64, u64), tw: (u64, u64)) -> ((u64, u64), (u64, u64)) {
+            let p = gf128_mul_ref(v, tw);
+            let u1 = gf128_xor(u, p);
+            let v1 = gf128_xor(u1, v);
+            (u1, v1)
+        }
+        fn seq_2layer_ref(
+            a: (u64, u64),
+            b: (u64, u64),
+            c: (u64, u64),
+            d: (u64, u64),
+            to: (u64, u64),
+            tia: (u64, u64),
+            tib: (u64, u64),
+        ) -> [(u64, u64); 4] {
+            let (na, nc) = radix2_ref(a, c, to);
+            let (nb, nd) = radix2_ref(b, d, to);
+            let (fa, fb) = radix2_ref(na, nb, tia);
+            let (fc, fd) = radix2_ref(nc, nd, tib);
+            [fa, fb, fc, fd]
+        }
+
+        let a = (0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210);
+        let b = (0xdead_beef_cafe_babe, 0x1357_9bdf_2468_ace0);
+        let c = (0x8000_0000_0000_0001, 0xc000_0000_0000_0087);
+        let d = (0xffff_ffff_ffff_ffff, 0x9999_5555_aaaa_3333);
+
+        // 1. Zero twiddles (`to = tia = tib = 0`)
+        let zero_tw = ntt_butterfly_fused_2layer_lane(a, b, c, d, (0, 0), (0, 0), (0, 0));
+        assert_eq!(zero_tw, seq_2layer_ref(a, b, c, d, (0, 0), (0, 0), (0, 0)));
+        assert_eq!(zero_tw[0], a);
+        assert_eq!(zero_tw[1], gf128_xor(a, b));
+
+        // 2. Multiplicative identity twiddles (`to = tia = tib = 1`)
+        let one_tw = ntt_butterfly_fused_2layer_lane(a, b, c, d, (1, 0), (1, 0), (1, 0));
+        assert_eq!(one_tw, seq_2layer_ref(a, b, c, d, (1, 0), (1, 0), (1, 0)));
+
+        // 3. Non-trivial full 128-bit GF(2^128) twiddles exercising high-bit 0x87 reduction
+        let to = (0x9e37_79b9_7f4a_7c15, 0xd1b5_4a32_d192_ed03);
+        let tia = (0xbf58_476d_1ce4_e5b9, 0x94d0_49bb_1331_11eb);
+        let tib = (0x8000_0000_0000_0087, 0x8000_0000_0000_0001);
+        let full_tw = ntt_butterfly_fused_2layer_lane(a, b, c, d, to, tia, tib);
+        assert_eq!(full_tw, seq_2layer_ref(a, b, c, d, to, tia, tib));
+
+        // 4. Multi-lane in-place slice helper
+        let mut sa = [a, d];
+        let mut sb = [b, c];
+        let mut sc = [c, b];
+        let mut sd = [d, a];
+        ntt_butterfly_fused_2layer_slice_in_place(&mut sa, &mut sb, &mut sc, &mut sd, to, tia, tib);
+        let exp0 = seq_2layer_ref(a, b, c, d, to, tia, tib);
+        let exp1 = seq_2layer_ref(d, c, b, a, to, tia, tib);
+        assert_eq!([sa[0], sb[0], sc[0], sd[0]], exp0);
+        assert_eq!([sa[1], sb[1], sc[1], sd[1]], exp1);
+    }
+
+    #[test]
+    fn test_verify_pack_trust_admission_c_abi_gate() {
+        // Valid signed pack with configured pubkey -> admitted to trusted
+        assert!(verify_pack_trust_admission(false, true, true, true, false));
+        // Unsigned pack with configured pubkey + allow_unattested_trusted -> rejected from trusted
+        assert!(!verify_pack_trust_admission(
+            false, true, false, false, true
+        ));
+        // Signed pack with invalid signature + configured pubkey -> rejected from trusted
+        assert!(!verify_pack_trust_admission(false, true, true, false, true));
+        // Explicit untrusted domain -> never admitted to trusted even with valid signature
+        assert!(!verify_pack_trust_admission(true, true, true, true, true));
+        // No configured pubkey + allow_unattested_trusted -> admitted to trusted
+        assert!(verify_pack_trust_admission(
+            false, false, false, false, true
+        ));
+        // No configured pubkey + no override -> rejected from trusted
+        assert!(!verify_pack_trust_admission(
+            false, false, true, true, false
+        ));
     }
 }

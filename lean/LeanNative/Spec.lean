@@ -1060,6 +1060,177 @@ theorem misaligned_stride_rejects_radix4_ntt (inp : Radix4NttFusionInput)
 def verifyRadix4NttFusionC (half0 half1 blockLen : UInt64) (inPlaceDisjoint : UInt8) : UInt64 :=
   if canFuseRadix4NttLayers ⟨half0.toNat, half1.toNat, blockLen.toNat, inPlaceDisjoint == 1⟩ then 1 else 0
 
+@[inline] private def clmulLoStep (a b acc i : UInt64) : UInt64 :=
+  acc ^^^ ((a <<< i) * ((b >>> i) &&& 1))
+
+@[inline] private def clmulLoStep4 (a b acc base : UInt64) : UInt64 :=
+  clmulLoStep a b (clmulLoStep a b (clmulLoStep a b (clmulLoStep a b acc base) (base + 1)) (base + 2)) (base + 3)
+
+@[inline] private def clmulLoStep16 (a b acc base : UInt64) : UInt64 :=
+  clmulLoStep4 a b (clmulLoStep4 a b (clmulLoStep4 a b (clmulLoStep4 a b acc base) (base + 4)) (base + 8)) (base + 12)
+
+/-- Zero-runtime scalar 64-bit carryless product, low 64 bits (`UInt64`-only helper for `libturbo_spec_cabi.a`). -/
+def clmul64Scalar (a b : UInt64) : UInt64 :=
+  clmulLoStep16 a b (clmulLoStep16 a b (clmulLoStep16 a b (clmulLoStep16 a b 0 0) 16) 32) 48
+
+@[inline] private def clmulHiStep (a b acc i : UInt64) : UInt64 :=
+  acc ^^^ ((a >>> (64 - i)) * ((b >>> i) &&& 1))
+
+@[inline] private def clmulHiStep4 (a b acc base : UInt64) : UInt64 :=
+  clmulHiStep a b (clmulHiStep a b (clmulHiStep a b (clmulHiStep a b acc base) (base + 1)) (base + 2)) (base + 3)
+
+@[inline] private def clmulHiStep16 (a b acc base : UInt64) : UInt64 :=
+  clmulHiStep4 a b (clmulHiStep4 a b (clmulHiStep4 a b (clmulHiStep4 a b acc base) (base + 4)) (base + 8)) (base + 12)
+
+/-- Zero-runtime scalar 64-bit carryless product, high 64 bits (`UInt64`-only helper for `libturbo_spec_cabi.a`). -/
+def clmul64HiScalar (a b : UInt64) : UInt64 :=
+  let acc3 := clmulHiStep a b (clmulHiStep a b (clmulHiStep a b 0 1) 2) 3
+  let acc15 := clmulHiStep4 a b (clmulHiStep4 a b (clmulHiStep4 a b acc3 4) 8) 12
+  clmulHiStep16 a b (clmulHiStep16 a b (clmulHiStep16 a b acc15 16) 32) 48
+
+/-- Zero-runtime scalar $\mathbb{F}_{2^{128}}$ polynomial product low limb (`x^128 + x^7 + x^2 + x + 1`). -/
+def gf128MulLoScalar (aLo aHi bLo bHi : UInt64) : UInt64 :=
+  let r0 := clmul64Scalar aLo bLo
+  let r2 := clmul64Scalar aHi bHi ^^^ clmul64HiScalar aLo bHi ^^^ clmul64HiScalar aHi bLo
+  let r3 := clmul64HiScalar aHi bHi
+  let red2Lo := clmul64Scalar r2 0x87
+  let red3Hi := clmul64HiScalar r3 0x87
+  let foldLo := clmul64Scalar red3Hi 0x87
+  r0 ^^^ red2Lo ^^^ foldLo
+
+/-- Zero-runtime scalar $\mathbb{F}_{2^{128}}$ polynomial product high limb (`x^128 + x^7 + x^2 + x + 1`). -/
+def gf128MulHiScalar (aLo aHi bLo bHi : UInt64) : UInt64 :=
+  let r1 := clmul64HiScalar aLo bLo ^^^ clmul64Scalar aLo bHi ^^^ clmul64Scalar aHi bLo
+  let r2 := clmul64Scalar aHi bHi ^^^ clmul64HiScalar aLo bHi ^^^ clmul64HiScalar aHi bLo
+  let r3 := clmul64HiScalar aHi bHi
+  let red2Hi := clmul64HiScalar r2 0x87
+  let red3Lo := clmul64Scalar r3 0x87
+  let red3Hi := clmul64HiScalar r3 0x87
+  let foldHi := clmul64HiScalar red3Hi 0x87
+  r1 ^^^ red2Hi ^^^ red3Lo ^^^ foldHi
+
+/-- 128-bit binary extension field element in $\mathbb{F}_{2^{128}} = \mathbb{F}_2[x]/(x^{128} + x^7 + x^2 + x + 1)$. -/
+structure GF128Elem where
+  (lo hi : UInt64)
+  deriving Repr, DecidableEq, Inhabited, BEq
+
+namespace GF128Elem
+
+def zero : GF128Elem := ⟨0, 0⟩
+
+def xor (a b : GF128Elem) : GF128Elem :=
+  ⟨a.lo ^^^ b.lo, a.hi ^^^ b.hi⟩
+
+/-- $\mathbb{F}_{2^{128}}$ polynomial multiplication modulo $x^{128} + x^7 + x^2 + x + 1$ (`0x87`). -/
+def mul (a b : GF128Elem) : GF128Elem :=
+  ⟨gf128MulLoScalar a.lo a.hi b.lo b.hi, gf128MulHiScalar a.lo a.hi b.lo b.hi⟩
+
+end GF128Elem
+
+/-- Single Radix-2 LCH additive NTT butterfly step over $\mathbb{F}_{2^{128}}$:
+    `(u, v) ↦ (u ⊕ v * tw, (u ⊕ v * tw) ⊕ v)`. -/
+def gf128Radix2Butterfly (u v tw : GF128Elem) : GF128Elem × GF128Elem :=
+  let p := GF128Elem.mul v tw
+  let u' := GF128Elem.xor u p
+  let v' := GF128Elem.xor u' v
+  (u', v')
+
+/-- Fused 2-layer Radix-4 LCH additive NTT butterfly over $\mathbb{F}_{2^{128}}$
+    with outer twiddle `to` and inner twiddles `tia`, `tib`. -/
+def gf128Fused2LayerButterfly (a b c d to tia tib : GF128Elem) :
+    GF128Elem × GF128Elem × GF128Elem × GF128Elem :=
+  let pc := GF128Elem.mul c to
+  let pd := GF128Elem.mul d to
+  let na := GF128Elem.xor a pc
+  let nc := GF128Elem.xor c na
+  let nb := GF128Elem.xor b pd
+  let nd := GF128Elem.xor d nb
+  let pb2 := GF128Elem.mul nb tia
+  let pd2 := GF128Elem.mul nd tib
+  let fa := GF128Elem.xor na pb2
+  let fb := GF128Elem.xor nb fa
+  let fc := GF128Elem.xor nc pd2
+  let fd := GF128Elem.xor nd fc
+  (fa, fb, fc, fd)
+
+/-- Two sequential Radix-2 LCH additive NTT butterfly layers over $\mathbb{F}_{2^{128}}$. -/
+def gf128Sequential2LayerButterfly (a b c d to tia tib : GF128Elem) :
+    GF128Elem × GF128Elem × GF128Elem × GF128Elem :=
+  let (na, nc) := gf128Radix2Butterfly a c to
+  let (nb, nd) := gf128Radix2Butterfly b d to
+  let (fa, fb) := gf128Radix2Butterfly na nb tia
+  let (fc, fd) := gf128Radix2Butterfly nc nd tib
+  (fa, fb, fc, fd)
+
+/-- Zero-runtime C-ABI scalar projection of the fused 2-layer Radix-4 $\mathbb{F}_{2^{128}}$ butterfly (`outWord` in `0..7`). -/
+@[inline, export lean_native_ntt_butterfly_fused_2layer_slice]
+def nttButterflyFused2LayerSliceC (aLo aHi bLo bHi cLo cHi dLo dHi : UInt64)
+    (toLo toHi tiaLo tiaHi tibLo tibHi outWord : UInt64) : UInt64 :=
+  let pcLo := gf128MulLoScalar cLo cHi toLo toHi
+  let pcHi := gf128MulHiScalar cLo cHi toLo toHi
+  let pdLo := gf128MulLoScalar dLo dHi toLo toHi
+  let pdHi := gf128MulHiScalar dLo dHi toLo toHi
+  let naLo := aLo ^^^ pcLo
+  let naHi := aHi ^^^ pcHi
+  let ncLo := cLo ^^^ naLo
+  let ncHi := cHi ^^^ naHi
+  let nbLo := bLo ^^^ pdLo
+  let nbHi := bHi ^^^ pdHi
+  let ndLo := dLo ^^^ nbLo
+  let ndHi := dHi ^^^ nbHi
+  let pb2Lo := gf128MulLoScalar nbLo nbHi tiaLo tiaHi
+  let pb2Hi := gf128MulHiScalar nbLo nbHi tiaLo tiaHi
+  let pd2Lo := gf128MulLoScalar ndLo ndHi tibLo tibHi
+  let pd2Hi := gf128MulHiScalar ndLo ndHi tibLo tibHi
+  let faLo := naLo ^^^ pb2Lo
+  let faHi := naHi ^^^ pb2Hi
+  let fbLo := nbLo ^^^ faLo
+  let fbHi := nbHi ^^^ faHi
+  let fcLo := ncLo ^^^ pd2Lo
+  let fcHi := ncHi ^^^ pd2Hi
+  let fdLo := ndLo ^^^ fcLo
+  let fdHi := ndHi ^^^ fcHi
+  if outWord == 0 then faLo
+  else if outWord == 1 then faHi
+  else if outWord == 2 then fbLo
+  else if outWord == 3 then fbHi
+  else if outWord == 4 then fcLo
+  else if outWord == 5 then fcHi
+  else if outWord == 6 then fdLo
+  else fdHi
+
+private theorem uint64_bitXor_comm (x y : UInt64) : x ^^^ y = y ^^^ x := by
+  cases x; cases y; exact congrArg UInt64.ofBitVec (BitVec.xor_comm ..)
+
+theorem gf128Elem_xor_comm (x y : GF128Elem) : GF128Elem.xor x y = GF128Elem.xor y x := by
+  cases x; cases y; simp [GF128Elem.xor, uint64_bitXor_comm]
+
+/-- Soundness of the fused 2-layer Radix-4 $\mathbb{F}_{2^{128}}$ butterfly:
+    matches two sequential Radix-2 LCH butterfly layers on all inputs and twiddles. -/
+theorem gf128_fused_2layer_butterfly_eq_sequential (a b c d to tia tib : GF128Elem) :
+    gf128Fused2LayerButterfly a b c d to tia tib =
+      gf128Sequential2LayerButterfly a b c d to tia tib := by
+  simp only [gf128Fused2LayerButterfly, gf128Sequential2LayerButterfly, gf128Radix2Butterfly]
+  simp only [gf128Elem_xor_comm]
+
+/-- Exact C-ABI limb projection correspondence for `lean_native_ntt_butterfly_fused_2layer_slice` (`outWord = 0`). -/
+theorem ntt_butterfly_fused_2layer_slice_word0_eq (aLo aHi bLo bHi cLo cHi dLo dHi : UInt64)
+    (toLo toHi tiaLo tiaHi tibLo tibHi : UInt64) :
+    nttButterflyFused2LayerSliceC aLo aHi bLo bHi cLo cHi dLo dHi toLo toHi tiaLo tiaHi tibLo tibHi 0 =
+      (gf128Sequential2LayerButterfly
+        ⟨aLo, aHi⟩ ⟨bLo, bHi⟩ ⟨cLo, cHi⟩ ⟨dLo, dHi⟩
+        ⟨toLo, toHi⟩ ⟨tiaLo, tiaHi⟩ ⟨tibLo, tibHi⟩).1.lo := by
+  rw [← gf128_fused_2layer_butterfly_eq_sequential]
+  rfl
+
+#guard clmul64Scalar 0x9e3779b97f4a7c15 0xbf58476d1ce4e5b9 == clmul64 0x9e3779b97f4a7c15 0xbf58476d1ce4e5b9
+#guard clmul64HiScalar 0x9e3779b97f4a7c15 0xbf58476d1ce4e5b9 == clmul64Hi 0x9e3779b97f4a7c15 0xbf58476d1ce4e5b9
+#guard nttButterflyFused2LayerSliceC 5 7 9 11 13 15 17 19 0 0 0 0 0 0 0 == 5
+#guard nttButterflyFused2LayerSliceC 5 7 9 11 13 15 17 19 0 0 0 0 0 0 2 == (9 ^^^ 5)
+#guard nttButterflyFused2LayerSliceC 5 7 9 11 13 15 17 19 1 0 1 0 1 0 0 == ((5 ^^^ 13) ^^^ (9 ^^^ 17))
+#guard nttButterflyFused2LayerSliceC 5 7 9 11 13 15 17 19 3 2 5 4 7 6 7 ==
+  (gf128Sequential2LayerButterfly ⟨5, 7⟩ ⟨9, 11⟩ ⟨13, 15⟩ ⟨17, 19⟩ ⟨3, 2⟩ ⟨5, 4⟩ ⟨7, 6⟩).2.2.2.hi
+
 /-- Pure-Lean `turbo-lean` migration gate: zero-copy `ByteSlice` scanner + tuple SROA + `SliceOut` zero-runtime gate. -/
 structure TurboSliceScannerSROAInput where
   (sliceInBounds tupleAliasEscapes : Bool) (undefRuntimeSyms outLen outCap : Nat)

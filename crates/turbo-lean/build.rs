@@ -43,6 +43,9 @@ const TURBO_EXPORTS: &[&str] = &[
     "turbo_spec_verify_ident_bloom",
     "turbo_spec_verify_con_leche_shard",
     "turbo_spec_verify_elab_header_pin",
+    "turbo_spec_verify_audit_materialize_gate",
+    "turbo_spec_verify_pack_trust_admission",
+    "turbo_spec_verify_hygiene_item_admitted",
     "turbo_spec_combined_step",
     "leansys_verify_slice_bounds",
     "leansys_verify_wal_frame",
@@ -78,6 +81,7 @@ const TURBO_EXPORTS: &[&str] = &[
     "leannative_verify_parfor_chunk_partition",
     "leannative_verify_rc_mode_safe",
     "leannative_verify_backend_choice",
+    "lean_native_ntt_butterfly_fused_2layer_slice",
 ];
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -199,6 +203,7 @@ fn main() {
         || !lean_sys_lib.join("LeanSys/Gate.olean").is_file()
         || c_missing_expected_exports(&lean_sys_spec_c, "leansys_")
         || c_missing_expected_exports(&leannative_spec_c, "leannative_")
+        || c_missing_expected_exports(&leannative_spec_c, "lean_native_")
     {
         if let Some(lake_bin) = find_elan_tool("lake") {
             let _ = Command::new(&lake_bin)
@@ -285,10 +290,13 @@ fn main() {
     let leannative_c_text = fs::read_to_string(&leannative_spec_c)
         .unwrap_or_else(|e| panic!("failed to read LeanNative/Spec.c: {e}"));
     assert!(
-        !c_text
-            .lines()
-            .any(|l| l.starts_with("LEAN_EXPORT ") && (l.contains("leansys_") || l.contains("leannative_"))),
-        "TurboLean/Kernel.lean must not redefine canonical `leansys_*` or `leannative_*` C-ABI exports"
+        !c_text.lines().any(|l| {
+            l.starts_with("LEAN_EXPORT ")
+                && (l.contains("leansys_")
+                    || l.contains("leannative_")
+                    || l.contains("lean_native_"))
+        }),
+        "TurboLean/Kernel.lean must not redefine canonical `leansys_*`, `leannative_*`, or `lean_native_*` C-ABI exports"
     );
     for sym in TURBO_EXPORTS {
         let in_kernel = c_text.contains(sym);
@@ -321,8 +329,11 @@ fn main() {
     fs::write(&leansys_c_filtered_path, filter_exports(&leansys_c_text))
         .unwrap_or_else(|e| panic!("failed to write filtered LeanSys/Spec.c: {e}"));
     let leannative_c_filtered_path = out_dir.join("LeanNative_Spec_generated.c");
-    fs::write(&leannative_c_filtered_path, filter_exports(&leannative_c_text))
-        .unwrap_or_else(|e| panic!("failed to write filtered LeanNative/Spec.c: {e}"));
+    fs::write(
+        &leannative_c_filtered_path,
+        filter_exports(&leannative_c_text),
+    )
+    .unwrap_or_else(|e| panic!("failed to write filtered LeanNative/Spec.c: {e}"));
 
     let lean_prefix = Command::new(&lean_bin)
         .current_dir(&lean_dir)

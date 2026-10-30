@@ -26,13 +26,17 @@ pub fn parse_gpu_fastcheck_output(
             }
         } else if line.starts_with("[Fast-Check Valid Lemma (10000000 states)]") {
             valid_lemma_10m_ms = parse_metric_between(line, "Time: ", " ms").unwrap_or(0.0);
-            valid_lemma_10m_mstates_s = parse_metric_between(line, "Throughput: ", " M states/s").unwrap_or(0.0);
+            valid_lemma_10m_mstates_s =
+                parse_metric_between(line, "Throughput: ", " M states/s").unwrap_or(0.0);
         } else if line.starts_with("[Fast-Reject 3-Lemma Suite (10000000 states)]") {
             suite_10m_ms = parse_metric_between(line, "Time: ", " ms").unwrap_or(0.0);
-            suite_10m_mstates_s = parse_metric_between(line, "Throughput: ", " M states/s").unwrap_or(0.0);
+            suite_10m_mstates_s =
+                parse_metric_between(line, "Throughput: ", " M states/s").unwrap_or(0.0);
         } else if line.starts_with("-> Kernel Time: ") {
-            cumutate_kernel_ms = parse_metric_between(line, "-> Kernel Time: ", " ms").unwrap_or(0.0);
-            cumutate_throughput_mevals_s = parse_metric_between(line, "Throughput: ", " M Denote-evals/s").unwrap_or(0.0);
+            cumutate_kernel_ms =
+                parse_metric_between(line, "-> Kernel Time: ", " ms").unwrap_or(0.0);
+            cumutate_throughput_mevals_s =
+                parse_metric_between(line, "Throughput: ", " M Denote-evals/s").unwrap_or(0.0);
         } else if let Some(after) = line.strip_prefix("-> Mutants Killed: ") {
             if let Some((k_str, rest)) = after.split_once(" / ") {
                 mutants_killed = k_str.trim().parse().unwrap_or(0);
@@ -185,7 +189,9 @@ fn extract_lean_theorem(clean_src: &str, target_name: Option<&str>) -> Result<Ex
         .into_iter()
         .next()
         .ok_or_else(|| match target_name {
-            Some(target) => anyhow::anyhow!("Theorem or lemma `{}` not found in Lean source", target),
+            Some(target) => {
+                anyhow::anyhow!("Theorem or lemma `{}` not found in Lean source", target)
+            }
             None => anyhow::anyhow!("No `theorem` or `lemma` declaration found in Lean source"),
         })
 }
@@ -330,7 +336,9 @@ fn split_top_level_eq(s: &str) -> Option<(String, String, bool)> {
             '=' if depth == 0 => {
                 let prev = if i > 0 { Some(chars[i - 1]) } else { None };
                 let next = if i + 1 < n { Some(chars[i + 1]) } else { None };
-                if matches!(prev, Some('!' | '<' | '>' | ':' | '=')) || matches!(next, Some('=' | '>')) {
+                if matches!(prev, Some('!' | '<' | '>' | ':' | '='))
+                    || matches!(next, Some('=' | '>'))
+                {
                     i += 1;
                     continue;
                 }
@@ -388,7 +396,9 @@ fn tokenize_lean_expr(s: &str) -> Result<Vec<Token>> {
                     i += 1;
                 }
             }
-            tokens.push(Token::Number(chars[start..i].iter().filter(|&&ch| ch != '_').collect()));
+            tokens.push(Token::Number(
+                chars[start..i].iter().filter(|&&ch| ch != '_').collect(),
+            ));
         } else if is_ident_start(c) {
             let start = i;
             while i < n && is_ident_continue(chars[i]) {
@@ -412,7 +422,23 @@ fn tokenize_lean_expr(s: &str) -> Result<Vec<Token>> {
                     continue;
                 }
             }
-            if matches!(c, '+' | '-' | '*' | '/' | '%' | '=' | '<' | '>' | '!' | '¬' | '≠' | '≤' | '≥' | '∧' | '∨') {
+            if matches!(
+                c,
+                '+' | '-'
+                    | '*'
+                    | '/'
+                    | '%'
+                    | '='
+                    | '<'
+                    | '>'
+                    | '!'
+                    | '¬'
+                    | '≠'
+                    | '≤'
+                    | '≥'
+                    | '∧'
+                    | '∨'
+            ) {
                 tokens.push(Token::Op(c.to_string()));
                 i += 1;
             } else {
@@ -452,7 +478,11 @@ impl ExprParser {
                 bail!("Expected `else` in `if` expression");
             }
             let else_branch = self.parse_expr()?;
-            return Ok(LeanExpr::IfThenElse(Box::new(cond), Box::new(then_branch), Box::new(else_branch)));
+            return Ok(LeanExpr::IfThenElse(
+                Box::new(cond),
+                Box::new(then_branch),
+                Box::new(else_branch),
+            ));
         }
         self.parse_binary(1)
     }
@@ -473,7 +503,9 @@ impl ExprParser {
     fn parse_binary(&mut self, min_prec: u8) -> Result<LeanExpr> {
         let mut lhs = self.parse_unary_or_app()?;
         while let Some(Token::Op(op)) = self.peek().cloned() {
-            let Some((prec, right_assoc)) = Self::op_prec(&op) else { break };
+            let Some((prec, right_assoc)) = Self::op_prec(&op) else {
+                break;
+            };
             if prec < min_prec {
                 break;
             }
@@ -495,7 +527,11 @@ impl ExprParser {
         while self.can_start_atom() {
             args.push(self.parse_postfix()?);
         }
-        Ok(if args.is_empty() { head } else { LeanExpr::App(Box::new(head), args) })
+        Ok(if args.is_empty() {
+            head
+        } else {
+            LeanExpr::App(Box::new(head), args)
+        })
     }
     fn can_start_atom(&self) -> bool {
         match self.peek() {
@@ -583,10 +619,22 @@ fn flatten_qualified_name(expr: &LeanExpr) -> Option<String> {
             let prefix = flatten_qualified_name(base)?;
             if matches!(
                 prefix.as_str(),
-                "Word256" | "TurboLean" | "TurboLean.FastCheck" | "TurboLean.FastCheck.Word256"
-                    | "TurboLean.Reflection" | "TurboLean.Reflection.StorageKey" | "StorageKey"
-                    | "UInt256" | "BitVec" | "UInt64" | "UInt32" | "UInt16" | "UInt8" | "USize"
-                    | "Nat" | "Bool"
+                "Word256"
+                    | "TurboLean"
+                    | "TurboLean.FastCheck"
+                    | "TurboLean.FastCheck.Word256"
+                    | "TurboLean.Reflection"
+                    | "TurboLean.Reflection.StorageKey"
+                    | "StorageKey"
+                    | "UInt256"
+                    | "BitVec"
+                    | "UInt64"
+                    | "UInt32"
+                    | "UInt16"
+                    | "UInt8"
+                    | "USize"
+                    | "Nat"
+                    | "Bool"
             ) {
                 Some(format!("{}.{}", prefix, field))
             } else {
@@ -627,18 +675,36 @@ fn emit_cuda_expr(expr: &LeanExpr) -> Result<String> {
         }
         LeanExpr::AnonCtor(items) => {
             if items.len() != 4 {
-                bail!("Expected 4 limbs in `Word256` constructor `⟨w0, w1, w2, w3⟩`, got {}", items.len());
+                bail!(
+                    "Expected 4 limbs in `Word256` constructor `⟨w0, w1, w2, w3⟩`, got {}",
+                    items.len()
+                );
             }
-            let c_items = items.iter().map(emit_cuda_expr).collect::<Result<Vec<_>>>()?;
+            let c_items = items
+                .iter()
+                .map(emit_cuda_expr)
+                .collect::<Result<Vec<_>>>()?;
             Ok(format!("make_u256({})", c_items.join(", ")))
         }
         LeanExpr::Tuple(items) => {
             if items.len() != 2 {
-                bail!("Expected 2-tuple `(fst, snd)`, got {} elements", items.len());
+                bail!(
+                    "Expected 2-tuple `(fst, snd)`, got {} elements",
+                    items.len()
+                );
             }
-            Ok(format!("make_u256_bool_pair({}, {})", emit_cuda_expr(&items[0])?, emit_cuda_expr(&items[1])?))
+            Ok(format!(
+                "make_u256_bool_pair({}, {})",
+                emit_cuda_expr(&items[0])?,
+                emit_cuda_expr(&items[1])?
+            ))
         }
-        LeanExpr::IfThenElse(c, t, e) => Ok(format!("(({}) ? ({}) : ({}))", emit_cuda_expr(c)?, emit_cuda_expr(t)?, emit_cuda_expr(e)?)),
+        LeanExpr::IfThenElse(c, t, e) => Ok(format!(
+            "(({}) ? ({}) : ({}))",
+            emit_cuda_expr(c)?,
+            emit_cuda_expr(t)?,
+            emit_cuda_expr(e)?
+        )),
         LeanExpr::Unary(op, inner) => {
             let ic = emit_cuda_expr(inner)?;
             match op.as_str() {
@@ -674,10 +740,14 @@ fn emit_cuda_expr(expr: &LeanExpr) -> Result<String> {
             Ok(format!("{}({}, {})", fn_name, l, r))
         }
         LeanExpr::App(head, args) => {
-            let fname = flatten_qualified_name(head)
-                .ok_or_else(|| anyhow::anyhow!("Unsupported higher-order function head `{:?}`", head))?;
+            let fname = flatten_qualified_name(head).ok_or_else(|| {
+                anyhow::anyhow!("Unsupported higher-order function head `{:?}`", head)
+            })?;
             let short = fname.rsplit('.').next().unwrap_or(fname.as_str());
-            let c_args = args.iter().map(emit_cuda_expr).collect::<Result<Vec<_>>>()?;
+            let c_args = args
+                .iter()
+                .map(emit_cuda_expr)
+                .collect::<Result<Vec<_>>>()?;
             if short == "succ" && c_args.len() == 1 {
                 return Ok(format!("lean_add({}, 1ULL)", c_args[0]));
             }
@@ -710,7 +780,11 @@ fn emit_cuda_expr(expr: &LeanExpr) -> Result<String> {
                 ("mulDivUp", 3) => "u256_mul_div_up_val",
                 ("packHalves", 4) => "packHalves",
                 ("mk", 4) => "make_u256",
-                _ => bail!("Unsupported Lean function `{}` with {} arguments", fname, c_args.len()),
+                _ => bail!(
+                    "Unsupported Lean function `{}` with {} arguments",
+                    fname,
+                    c_args.len()
+                ),
             };
             Ok(format!("{}({})", c_fn, c_args.join(", ")))
         }
@@ -1087,7 +1161,10 @@ pub fn generate_cuda_fastcheck_source(
                     }
                     _ => format!("gen_u256_param(idx, seed, {}ULL).w0", idx),
                 },
-                "bool" => format!("((gen_u256_param(idx, seed, {}ULL).w0 & 1ULL) != 0ULL)", idx),
+                "bool" => format!(
+                    "((gen_u256_param(idx, seed, {}ULL).w0 & 1ULL) != 0ULL)",
+                    idx
+                ),
                 _ => format!("gen_u256_param(idx, seed, {}ULL)", idx),
             };
             param_gen_lines.push_str(&format!(
@@ -1680,28 +1757,30 @@ pub fn execute_transpiled_cuda_kernel(
     } else {
         let mut candidates: Vec<(PathBuf, &[&str])> = Vec::new();
         if let Ok(eh) = std::env::var("ELAN_HOME") {
-            let p = PathBuf::from(&eh)
-                .join("toolchains/leanprover--lean4---v4.35.0/bin/clang");
+            let p = PathBuf::from(&eh).join("toolchains/leanprover--lean4---v4.35.0/bin/clang");
             if p.exists() {
                 candidates.push((p, &["-x", "c++", "-O3", "-std=c++17"]));
             }
         }
         if let Ok(home) = std::env::var("HOME") {
-            let p = PathBuf::from(&home)
-                .join(".elan/toolchains/leanprover--lean4---v4.35.0/bin/clang");
+            let p =
+                PathBuf::from(&home).join(".elan/toolchains/leanprover--lean4---v4.35.0/bin/clang");
             if p.exists() {
                 candidates.push((p, &["-x", "c++", "-O3", "-std=c++17"]));
             }
             if let Some(parent) = Path::new(&home).parent() {
-                let p2 = parent
-                    .join("caches/elan/toolchains/leanprover--lean4---v4.35.0/bin/clang");
+                let p2 =
+                    parent.join("caches/elan/toolchains/leanprover--lean4---v4.35.0/bin/clang");
                 if p2.exists() {
                     candidates.push((p2, &["-x", "c++", "-O3", "-std=c++17"]));
                 }
             }
         }
         candidates.extend([
-            (PathBuf::from("clang"), &["-x", "c++", "-O3", "-std=c++17"][..]),
+            (
+                PathBuf::from("clang"),
+                &["-x", "c++", "-O3", "-std=c++17"][..],
+            ),
             (PathBuf::from("g++"), &["-O3", "-std=c++17"][..]),
             (PathBuf::from("c++"), &["-O3", "-std=c++17"][..]),
         ]);
@@ -1721,9 +1800,8 @@ pub fn execute_transpiled_cuda_kernel(
                 }
             }
         }
-        last_out.ok_or_else(|| {
-            anyhow::anyhow!("Failed to invoke clang or g++ for transpiled kernel")
-        })?
+        last_out
+            .ok_or_else(|| anyhow::anyhow!("Failed to invoke clang or g++ for transpiled kernel"))?
     };
 
     if !compile_out.status.success() {
@@ -1733,7 +1811,11 @@ pub fn execute_transpiled_cuda_kernel(
         }
         let stderr = String::from_utf8_lossy(&compile_out.stderr);
         let _ = fs::remove_dir_all(&tmp_dir);
-        bail!("Failed to compile transpiled kernel `{}`:\n{}", kernel.decl_name, stderr);
+        bail!(
+            "Failed to compile transpiled kernel `{}`:\n{}",
+            kernel.decl_name,
+            stderr
+        );
     }
 
     let run_out = Command::new(&bin_path)
@@ -1747,7 +1829,11 @@ pub fn execute_transpiled_cuda_kernel(
             return execute_transpiled_cuda_kernel(kernel, n_states, false);
         }
         let stderr = String::from_utf8_lossy(&run_out.stderr);
-        bail!("Transpiled kernel `{}` execution failed:\n{}", kernel.decl_name, stderr);
+        bail!(
+            "Transpiled kernel `{}` execution failed:\n{}",
+            kernel.decl_name,
+            stderr
+        );
     }
 
     let stdout = String::from_utf8_lossy(&run_out.stdout);
@@ -1775,12 +1861,17 @@ pub fn execute_transpiled_cuda_kernel(
 pub fn certify_with_lean_native_core() -> Result<(bool, String, serde_json::Value)> {
     let span_ok = crate::c_abi::pack_slice_span_u64(0, 1, 0) != 0
         && !crate::c_abi::leannative_has_domain_hazard_u64_safe(0, 1, 1);
-    let cabi_ok = span_ok && crate::c_abi::leannative_certify_cex_witnesses_safe(1_000_000, 0, u64::MAX);
+    let cabi_ok =
+        span_ok && crate::c_abi::leannative_certify_cex_witnesses_safe(1_000_000, 0, u64::MAX);
     let a = [0u64, 0, 0, 0];
     let b = [u64::MAX, u64::MAX, u64::MAX, u64::MAX];
-    let lhs: [u64; 4] = std::array::from_fn(|k| !crate::c_abi::leannative_eval_u64_binop_safe(5, a[k], b[k]));
-    let rhs: [u64; 4] = std::array::from_fn(|k| crate::c_abi::leannative_eval_u64_binop_safe(5, !a[k], !b[k]));
-    let triage_code = crate::c_abi::leannative_fastcheck_rewrite_step_safe(lhs[0], rhs[0], 5, 5, a[0], b[0], false);
+    let lhs: [u64; 4] =
+        std::array::from_fn(|k| !crate::c_abi::leannative_eval_u64_binop_safe(5, a[k], b[k]));
+    let rhs: [u64; 4] =
+        std::array::from_fn(|k| crate::c_abi::leannative_eval_u64_binop_safe(5, !a[k], !b[k]));
+    let triage_code = crate::c_abi::leannative_fastcheck_rewrite_step_safe(
+        lhs[0], rhs[0], 5, 5, a[0], b[0], false,
+    );
     let certified = cabi_ok && lhs != rhs && triage_code == 3;
     Ok((
         certified,
@@ -1797,9 +1888,13 @@ pub fn certify_with_lean_native_core() -> Result<(bool, String, serde_json::Valu
 }
 
 fn emit_builtin_fastcheck_ptx(sm_arch: &str) -> String {
-    let target_arch = if sm_arch.trim().is_empty() { "sm_90" } else { sm_arch.trim() };
+    let target_arch = if sm_arch.trim().is_empty() {
+        "sm_90"
+    } else {
+        sm_arch.trim()
+    };
     format!(
-r#"// LeanNative NVIDIA PTX 8.0 FastCheck Kernel for Module: LeanNative.FastCheck.Sample
+        r#"// LeanNative NVIDIA PTX 8.0 FastCheck Kernel for Module: LeanNative.FastCheck.Sample
 // Declarations (2): evm_add_comm_prop, evm_constrained_buggy_prop
 .version 8.0
 .target {target_arch}
@@ -1946,10 +2041,15 @@ fn lower_lean_expr_to_lnir_scalar(
             "zero" | "Word256.zero" => mk_strs(&["S_u64", "0"]),
             "one" | "Word256.one" => mk_strs(&["S_u64", "1"]),
             "max" | "Word256.max" => vec!["S_u64".to_string(), u64::MAX.to_string()],
-            other => vec!["S_var".to_string(), param_map.get(other).copied().unwrap_or(0).to_string()],
+            other => vec![
+                "S_var".to_string(),
+                param_map.get(other).copied().unwrap_or(0).to_string(),
+            ],
         },
         LeanExpr::Number(num_str) => {
-            let v = num_str.strip_prefix("0x").or_else(|| num_str.strip_prefix("0X"))
+            let v = num_str
+                .strip_prefix("0x")
+                .or_else(|| num_str.strip_prefix("0X"))
                 .and_then(|h| u64::from_str_radix(h, 16).ok())
                 .or_else(|| num_str.parse::<u64>().ok())
                 .unwrap_or(0);
@@ -2013,11 +2113,16 @@ fn lower_lean_expr_to_lnir_scalar(
             let short = fn_name.rsplit('.').next().unwrap_or(fn_name.as_str());
             match (short, args.as_slice()) {
                 ("bitNot" | "not" | "clz", [a]) => {
-                    let mut toks = mk_strs(&["S_un", if short == "clz" { "U_clz256" } else { "U_not" }]);
+                    let mut toks =
+                        mk_strs(&["S_un", if short == "clz" { "U_clz256" } else { "U_not" }]);
                     toks.extend(lower_lean_expr_to_lnir_scalar(a, param_map));
                     toks
                 }
-                ("add" | "addWithCarry" | "sub" | "subWithBorrow" | "mul" | "div" | "mod" | "bitAnd" | "and" | "bitOr" | "or" | "bitXor" | "xor" | "shl" | "shr", [a, b]) => {
+                (
+                    "add" | "addWithCarry" | "sub" | "subWithBorrow" | "mul" | "div" | "mod"
+                    | "bitAnd" | "and" | "bitOr" | "or" | "bitXor" | "xor" | "shl" | "shr",
+                    [a, b],
+                ) => {
                     let b_op = match short {
                         "add" | "addWithCarry" => "B_add",
                         "sub" | "subWithBorrow" => "B_sub",
@@ -2036,7 +2141,11 @@ fn lower_lean_expr_to_lnir_scalar(
                     toks
                 }
                 ("bitMux", [m, a, b]) => {
-                    let (m_t, a_t, b_t) = (lower_lean_expr_to_lnir_scalar(m, param_map), lower_lean_expr_to_lnir_scalar(a, param_map), lower_lean_expr_to_lnir_scalar(b, param_map));
+                    let (m_t, a_t, b_t) = (
+                        lower_lean_expr_to_lnir_scalar(m, param_map),
+                        lower_lean_expr_to_lnir_scalar(a, param_map),
+                        lower_lean_expr_to_lnir_scalar(b, param_map),
+                    );
                     let mut toks = mk_strs(&["S_bin", "B_bitOr", "S_bin", "B_bitAnd"]);
                     toks.extend(m_t.clone());
                     toks.extend(a_t);
@@ -2053,8 +2162,13 @@ fn lower_lean_expr_to_lnir_scalar(
                     toks
                 }
                 ("bitMaj", [a, b, c]) => {
-                    let (a_t, b_t, c_t) = (lower_lean_expr_to_lnir_scalar(a, param_map), lower_lean_expr_to_lnir_scalar(b, param_map), lower_lean_expr_to_lnir_scalar(c, param_map));
-                    let mut toks = mk_strs(&["S_bin", "B_bitOr", "S_bin", "B_bitOr", "S_bin", "B_bitAnd"]);
+                    let (a_t, b_t, c_t) = (
+                        lower_lean_expr_to_lnir_scalar(a, param_map),
+                        lower_lean_expr_to_lnir_scalar(b, param_map),
+                        lower_lean_expr_to_lnir_scalar(c, param_map),
+                    );
+                    let mut toks =
+                        mk_strs(&["S_bin", "B_bitOr", "S_bin", "B_bitOr", "S_bin", "B_bitAnd"]);
                     toks.extend(a_t.clone());
                     toks.extend(b_t.clone());
                     toks.extend(mk_strs(&["S_bin", "B_bitAnd"]));
@@ -2065,7 +2179,10 @@ fn lower_lean_expr_to_lnir_scalar(
                     toks.extend(c_t);
                     toks
                 }
-                _ => args.first().map(|f| lower_lean_expr_to_lnir_scalar(f, param_map)).unwrap_or_else(|| mk_strs(&["S_u64", "0"])),
+                _ => args
+                    .first()
+                    .map(|f| lower_lean_expr_to_lnir_scalar(f, param_map))
+                    .unwrap_or_else(|| mk_strs(&["S_u64", "0"])),
             }
         }
         LeanExpr::IfThenElse(c, t, e) => {
@@ -2075,9 +2192,10 @@ fn lower_lean_expr_to_lnir_scalar(
             }
             toks
         }
-        LeanExpr::AnonCtor(items) | LeanExpr::Tuple(items) => {
-            items.first().map(|f| lower_lean_expr_to_lnir_scalar(f, param_map)).unwrap_or_else(|| mk_strs(&["S_u64", "0"]))
-        }
+        LeanExpr::AnonCtor(items) | LeanExpr::Tuple(items) => items
+            .first()
+            .map(|f| lower_lean_expr_to_lnir_scalar(f, param_map))
+            .unwrap_or_else(|| mk_strs(&["S_u64", "0"])),
     }
 }
 
@@ -2140,16 +2258,39 @@ pub fn lower_decl_to_lnir_wire(
         } else {
             "T_i64"
         };
-        all_tokens.extend([idx.to_string(), hex_encode_lnir_str(p_name), "0".to_string(), ty_tok.to_string()]);
+        all_tokens.extend([
+            idx.to_string(),
+            hex_encode_lnir_str(p_name),
+            "0".to_string(),
+            ty_tok.to_string(),
+        ]);
     }
     all_tokens.push("T_i1".to_string());
     let val_ty = if any_u256 { "T_u256" } else { "T_i64" };
     let (lhs_var, rhs_var, eq_var) = (params.len(), params.len() + 1, params.len() + 2);
     for (var, expr_s) in [(lhs_var, lhs), (rhs_var, rhs)] {
-        all_tokens.extend(["C_let".to_string(), var.to_string(), val_ty.to_string(), "E_scalar".to_string()]);
+        all_tokens.extend([
+            "C_let".to_string(),
+            var.to_string(),
+            val_ty.to_string(),
+            "E_scalar".to_string(),
+        ]);
         all_tokens.extend(lower_lean_expr_str_to_lnir_scalar(expr_s, &param_map));
     }
-    for s in ["C_let", &eq_var.to_string(), "T_i1", "E_scalar", "S_bin", "B_eq", "S_var", &lhs_var.to_string(), "S_var", &rhs_var.to_string(), "C_ret", &eq_var.to_string()] {
+    for s in [
+        "C_let",
+        &eq_var.to_string(),
+        "T_i1",
+        "E_scalar",
+        "S_bin",
+        "B_eq",
+        "S_var",
+        &lhs_var.to_string(),
+        "S_var",
+        &rhs_var.to_string(),
+        "C_ret",
+        &eq_var.to_string(),
+    ] {
         all_tokens.push(s.to_string());
     }
     all_tokens.join("|")
@@ -2158,11 +2299,12 @@ pub fn lower_decl_to_lnir_wire(
 /// Lower `(decl_name, stmt_src)` to `LNIR_WIRE_V1` and check via the fast in-memory evaluator /
 /// `lean-native-core` whether a counterexample exists, returning `Some((witness_summary, suggested_hypothesis))`
 /// when falsified.
-pub fn try_lnir_fast_reject(
-    decl_name: &str,
-    stmt_src: &str,
-) -> Option<(String, Option<String>)> {
-    let eff_name = if decl_name.trim().is_empty() { "fastcheck_decl" } else { decl_name.trim() };
+pub fn try_lnir_fast_reject(decl_name: &str, stmt_src: &str) -> Option<(String, Option<String>)> {
+    let eff_name = if decl_name.trim().is_empty() {
+        "fastcheck_decl"
+    } else {
+        decl_name.trim()
+    };
     let s = stmt_src.trim();
     if s.is_empty() {
         return None;
@@ -2170,7 +2312,11 @@ pub fn try_lnir_fast_reject(
 
     let base = s.split(":=").next().unwrap_or(s).trim();
     let full_decl_src = if s.starts_with("theorem ") || s.starts_with("lemma ") {
-        if s.contains(":=") { s.to_string() } else { format!("{} := by sorry", s) }
+        if s.contains(":=") {
+            s.to_string()
+        } else {
+            format!("{} := by sorry", s)
+        }
     } else if s.starts_with(['(', '{', '[', ':']) {
         format!("theorem {} {} := by sorry", eff_name, base)
     } else {
@@ -2197,10 +2343,21 @@ pub fn try_lnir_fast_reject(
     if let Some((report, lhs_lean, rhs_lean)) = eval_extracted_decl_in_memory(&decl, 64) {
         if !report.verified && report.violations > 0 {
             let cex_json_str = serde_json::to_string(&report.counterexample).unwrap_or_default();
-            let suggested_hyp = synthesize_missing_hypothesis_hint(&decl.name, &lhs_lean, &rhs_lean, &cex_json_str);
+            let suggested_hyp =
+                synthesize_missing_hypothesis_hint(&decl.name, &lhs_lean, &rhs_lean, &cex_json_str);
             let witness_summary = if let Some(ref ce) = report.counterexample {
-                let binds: Vec<String> = ce.bindings.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
-                format!("sample#{}: {} (lhs={}, rhs={})", ce.state_idx, binds.join(", "), ce.lhs_value, ce.rhs_value)
+                let binds: Vec<String> = ce
+                    .bindings
+                    .iter()
+                    .map(|(k, v)| format!("{}={}", k, v))
+                    .collect();
+                format!(
+                    "sample#{}: {} (lhs={}, rhs={})",
+                    ce.state_idx,
+                    binds.join(", "),
+                    ce.lhs_value,
+                    ce.rhs_value
+                )
             } else {
                 format!("violations={}", report.violations)
             };
@@ -2211,7 +2368,6 @@ pub fn try_lnir_fast_reject(
 
     None
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -2250,7 +2406,9 @@ end TurboLean.FastCheck
         ] {
             let kernel = transpile_lean_theorem_to_cuda(lean_src, Some(decl)).unwrap();
             assert_eq!(kernel.decl_name, decl);
-            assert!(kernel.cuda_source.contains("__global__ void check_transpiled_theorem_kernel"));
+            assert!(kernel
+                .cuda_source
+                .contains("__global__ void check_transpiled_theorem_kernel"));
             let report = execute_transpiled_cuda_kernel(&kernel, n_states, true).unwrap();
             assert!(report.verified && report.violations == 0 && report.counterexample.is_none());
         }
@@ -2299,10 +2457,15 @@ end TurboLean.FastCheck
         }
 
         let precond_src = "theorem eq_implies_xor_zero (a b : BitVec 256) : a = b → (a ^^^ b) = Word256.zero := by sorry\n";
-        let pre_kernel = transpile_lean_theorem_to_cuda(precond_src, Some("eq_implies_xor_zero")).unwrap();
+        let pre_kernel =
+            transpile_lean_theorem_to_cuda(precond_src, Some("eq_implies_xor_zero")).unwrap();
         assert_eq!(pre_kernel.preconditions_cuda.len(), 1);
         let pre_report = execute_transpiled_cuda_kernel(&pre_kernel, 25_000, true).unwrap();
-        assert!(pre_report.verified && pre_report.satisfied_preconditions == 25_000 && !pre_report.vacuous_precondition_warning);
+        assert!(
+            pre_report.verified
+                && pre_report.satisfied_preconditions == 25_000
+                && !pre_report.vacuous_precondition_warning
+        );
     }
 
     #[test]
@@ -2314,22 +2477,35 @@ end TurboLean.FastCheck
       Word256.bitXor a b = Word256.max := by sorry
 "#;
         let buggy_kernel = transpile_lean_theorem_to_cuda(lean_src, Some("buggy_eq_hyp")).unwrap();
-        assert!(buggy_kernel.cuda_source.contains("b = lean_add(a, make_u256(1337ULL, 42ULL, 99ULL, 7ULL));"));
+        assert!(buggy_kernel
+            .cuda_source
+            .contains("b = lean_add(a, make_u256(1337ULL, 42ULL, 99ULL, 7ULL));"));
         let buggy_report = execute_transpiled_cuda_kernel(&buggy_kernel, 10_000, true).unwrap();
-        assert!(buggy_report.satisfied_preconditions == 10_000 && !buggy_report.vacuous_precondition_warning);
-        assert!(!buggy_report.verified && buggy_report.violations == 10_000 && buggy_report.counterexample.is_some());
+        assert!(
+            buggy_report.satisfied_preconditions == 10_000
+                && !buggy_report.vacuous_precondition_warning
+        );
+        assert!(
+            !buggy_report.verified
+                && buggy_report.violations == 10_000
+                && buggy_report.counterexample.is_some()
+        );
 
         let valid_kernel = transpile_lean_theorem_to_cuda(lean_src, Some("valid_eq_hyp")).unwrap();
         assert!(valid_kernel.cuda_source.contains("b = lean_bitnot(a);"));
         let valid_report = execute_transpiled_cuda_kernel(&valid_kernel, 10_000, true).unwrap();
-        assert!(valid_report.satisfied_preconditions == 10_000 && !valid_report.vacuous_precondition_warning);
+        assert!(
+            valid_report.satisfied_preconditions == 10_000
+                && !valid_report.vacuous_precondition_warning
+        );
         assert!(valid_report.verified && valid_report.violations == 0);
     }
 
     #[test]
     fn test_vacuous_precondition_counter_and_warning() {
         let vacuous_src = "theorem vacuous_unsat_hyp (a : Word256) (h : a = Word256.add a Word256.one) : a = Word256.zero := by sorry\n";
-        let kernel = transpile_lean_theorem_to_cuda(vacuous_src, Some("vacuous_unsat_hyp")).unwrap();
+        let kernel =
+            transpile_lean_theorem_to_cuda(vacuous_src, Some("vacuous_unsat_hyp")).unwrap();
         let report = execute_transpiled_cuda_kernel(&kernel, 10_000, true).unwrap();
         assert!(report.satisfied_preconditions == 0 && report.vacuous_precondition_warning);
     }
@@ -2339,10 +2515,17 @@ end TurboLean.FastCheck
         let (certified, version, result) = certify_with_lean_native_core().unwrap();
         assert!(certified && matches!(version.as_str(), "0.5.0" | "0.3.0" | "0.3.0-builtin"));
         assert_eq!(result["falsePositives"], 0);
-        assert!(result["theorem"].as_str().unwrap_or("").ends_with("certifyCounterexample_no_false_positive"));
+        assert!(result["theorem"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with("certifyCounterexample_no_false_positive"));
 
         let ptx_code = emit_lean_native_fastcheck_code(true, "sm_90").unwrap();
-        assert!(ptx_code.contains(".version 8.0") && ptx_code.contains(".target sm_90") && ptx_code.contains("lean_native_fastcheck_kernel"));
+        assert!(
+            ptx_code.contains(".version 8.0")
+                && ptx_code.contains(".target sm_90")
+                && ptx_code.contains("lean_native_fastcheck_kernel")
+        );
 
         let llvm_code = emit_lean_native_fastcheck_code(false, "x86_64").unwrap();
         assert!(llvm_code.contains("@lean_native_fastcheck_simd"));
@@ -2350,14 +2533,24 @@ end TurboLean.FastCheck
 
     #[test]
     fn test_lower_decl_to_lnir_wire_and_try_lnir_fast_reject() {
-        let params = vec![("a".to_string(), "Word256".to_string()), ("b".to_string(), "Word256".to_string())];
+        let params = vec![
+            ("a".to_string(), "Word256".to_string()),
+            ("b".to_string(), "Word256".to_string()),
+        ];
         let wire = lower_decl_to_lnir_wire(
             "buggy_de_morgan",
             &params,
             "Word256.bitNot (Word256.bitAnd a b)",
             "Word256.bitAnd (Word256.bitNot a) (Word256.bitNot b)",
         );
-        for pat in ["LNIR_WIRE_V1|", "|D_decl|", "|A_L3|1|2|", "|T_u256|", "B_bitAnd", "U_not"] {
+        for pat in [
+            "LNIR_WIRE_V1|",
+            "|D_decl|",
+            "|A_L3|1|2|",
+            "|T_u256|",
+            "B_bitAnd",
+            "U_not",
+        ] {
             assert!(wire.contains(pat));
         }
         let cex = try_lnir_fast_reject(
@@ -2373,16 +2566,12 @@ end TurboLean.FastCheck
         .is_none());
 
         // Sub-word `UInt8` / `UInt16` / `UInt32` FastCheck & CUDA transpiler coverage (`LeanAV` pixel/bitstream domain)
-        assert!(try_lnir_fast_reject(
-            "valid_u8_mask_idem",
-            "(x : UInt8) : (x &&& 255) = x",
-        )
-        .is_none());
-        assert!(try_lnir_fast_reject(
-            "buggy_u8_shift_loss",
-            "(x : UInt8) : (x <<< 1) = x",
-        )
-        .is_some());
+        assert!(
+            try_lnir_fast_reject("valid_u8_mask_idem", "(x : UInt8) : (x &&& 255) = x",).is_none()
+        );
+        assert!(
+            try_lnir_fast_reject("buggy_u8_shift_loss", "(x : UInt8) : (x <<< 1) = x",).is_some()
+        );
         let u8_kernel = transpile_lean_theorem_to_cuda(
             "theorem u8_xor_self (p : UInt8) : (p ^^^ p) = 0 := by decide\n",
             Some("u8_xor_self"),
@@ -2405,10 +2594,8 @@ pub fn run_fast_check_remote_http_stateless(
     let t0 = Instant::now();
     let is_cu = gpu || file.extension().and_then(|s| s.to_str()) == Some("cu");
     let base = http_url.trim_end_matches('/');
-    let is_loopback =
-        base.starts_with("http://127.0.0.1") || base.starts_with("http://localhost");
-    let src_text = fs::read_to_string(file)
-        .with_context(|| format!("Failed to read {}", file.display()))?;
+    let src_text =
+        fs::read_to_string(file).with_context(|| format!("Failed to read {}", file.display()))?;
     let has_main = !is_cu && src_text.contains("def main");
     let precomputed_bin_key = if is_cu {
         crate::pack::compute_fastcheck_binary_key(true, &src_text)
@@ -2421,26 +2608,16 @@ pub fn run_fast_check_remote_http_stateless(
             crate::pack::FASTCHECK_NO_MAIN_SUFFIX,
         )
     };
-    let (source_payload, local_path_payload) = if is_loopback && !is_cu && !has_main {
-        let abs_path = file
-            .canonicalize()
-            .unwrap_or_else(|_| file.to_path_buf())
-            .to_string_lossy()
-            .to_string();
-        (String::new(), abs_path)
-    } else {
-        (src_text, String::new())
-    };
     let req_body = serde_json::to_vec(&crate::pack::FastCheckHttpRequest {
         filename: file
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "fastcheck.lean".to_string()),
-        source: source_payload,
+        source: src_text,
         gpu: is_cu,
         precomputed_bin_key,
         has_main: Some(has_main),
-        local_path: local_path_payload,
+        local_path: String::new(),
     })?;
     let resp_bytes = crate::pack::http_request(
         "POST",
@@ -2484,7 +2661,10 @@ fn parse_digits_u64(s: &str, rev: bool) -> Option<u64> {
     } else {
         Box::new(s.chars())
     };
-    let mut digits: String = it.take_while(|c| c.is_ascii_digit() || *c == '_').filter(|&c| c != '_').collect();
+    let mut digits: String = it
+        .take_while(|c| c.is_ascii_digit() || *c == '_')
+        .filter(|&c| c != '_')
+        .collect();
     if rev {
         digits = digits.chars().rev().collect();
     }
@@ -2493,7 +2673,12 @@ fn parse_digits_u64(s: &str, rev: bool) -> Option<u64> {
 
 fn parse_u64_after_kw(s: &str, kw: &str) -> Option<u64> {
     let rest = &s[s.find(kw)? + kw.len()..];
-    parse_digits_u64(rest.trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '(' | ':' | '=' | '<' | '≤')), false)
+    parse_digits_u64(
+        rest.trim_start_matches(|c: char| {
+            c.is_whitespace() || matches!(c, '(' | ':' | '=' | '<' | '≤')
+        }),
+        false,
+    )
 }
 
 fn parse_last_le_rhs_u64(s: &str) -> Option<u64> {
@@ -2510,25 +2695,54 @@ pub fn audit_riscv_step_certificate(
 ) -> Option<RiscvStepAuditReport> {
     let t0 = Instant::now();
     let clean = strip_lean_comments(stmt_src);
-    if ![".finite", "riscvSteps", "evaluateTargetHOL", "InitE.Certificate", "bootstrapSteps", "ziskCsrSteps", "ziskCsr", "declaredGasLimit", "riscvNext"]
-        .iter()
-        .any(|kw| clean.contains(kw))
+    if ![
+        ".finite",
+        "riscvSteps",
+        "evaluateTargetHOL",
+        "InitE.Certificate",
+        "bootstrapSteps",
+        "ziskCsrSteps",
+        "ziskCsr",
+        "declaredGasLimit",
+        "riscvNext",
+    ]
+    .iter()
+    .any(|kw| clean.contains(kw))
     {
         return None;
     }
 
-    let candidate_k = parse_u64_after_kw(&clean, ".finite").or_else(|| parse_last_le_rhs_u64(&clean))?;
-    let bootstrap_steps = parse_u64_after_kw(&clean, "bootstrapSteps")
-        .unwrap_or(if clean.contains("InitE.Certificate") || clean.contains("bootstrapSteps") { 23_132 } else { 0 });
-    let csr_calls = parse_u64_after_kw(&clean, "ziskCsrSteps").or_else(|| parse_u64_after_kw(&clean, "ziskCsr")).unwrap_or(0);
+    let candidate_k =
+        parse_u64_after_kw(&clean, ".finite").or_else(|| parse_last_le_rhs_u64(&clean))?;
+    let bootstrap_steps = parse_u64_after_kw(&clean, "bootstrapSteps").unwrap_or(
+        if clean.contains("InitE.Certificate") || clean.contains("bootstrapSteps") {
+            23_132
+        } else {
+            0
+        },
+    );
+    let csr_calls = parse_u64_after_kw(&clean, "ziskCsrSteps")
+        .or_else(|| parse_u64_after_kw(&clean, "ziskCsr"))
+        .unwrap_or(0);
     let gas_limit = ["declaredGasLimit", "gas <=", "gas ≤"]
         .into_iter()
         .find_map(|kw| parse_u64_after_kw(&clean, kw))
-        .unwrap_or(if clean.contains("declaredGasLimit") { 200_000_000 } else { 0 });
+        .unwrap_or(if clean.contains("declaredGasLimit") {
+            200_000_000
+        } else {
+            0
+        });
 
-    let scale_a = clean.find('*').and_then(|i| parse_digits_u64(clean[..i].trim_end(), true)).filter(|&a| a > 0).unwrap_or(1);
+    let scale_a = clean
+        .find('*')
+        .and_then(|i| parse_digits_u64(clean[..i].trim_end(), true))
+        .filter(|&a| a > 0)
+        .unwrap_or(1);
     let mut offset_b = bootstrap_steps.saturating_add(csr_calls.saturating_mul(64));
-    if let Some(b) = clean.find('+').and_then(|i| parse_digits_u64(clean[i + 1..].trim_start(), false)) {
+    if let Some(b) = clean
+        .find('+')
+        .and_then(|i| parse_digits_u64(clean[i + 1..].trim_start(), false))
+    {
         offset_b = offset_b.max(b);
     }
 
@@ -2539,7 +2753,18 @@ pub fn audit_riscv_step_certificate(
         max_observed_steps = max_observed_steps.max(candidate_k.saturating_add(1));
     }
 
-    let boundary_inputs: [u64; 10] = [0, 1, 31, 32, 63, 64, 1024, gas_limit.min(200_000_000), 0x8000_0000_0000_0000, u64::MAX];
+    let boundary_inputs: [u64; 10] = [
+        0,
+        1,
+        31,
+        32,
+        63,
+        64,
+        1024,
+        gas_limit.min(200_000_000),
+        0x8000_0000_0000_0000,
+        u64::MAX,
+    ];
     let bound_in = ["steps <=", "steps ≤", "n <=", "n ≤"]
         .into_iter()
         .find_map(|kw| parse_u64_after_kw(&clean, kw))
@@ -2553,7 +2778,11 @@ pub fn audit_riscv_step_certificate(
 
     for (idx, &raw) in boundary_inputs.iter().enumerate() {
         let eff_in = raw.min(bound_in);
-        let div_edge_extra = if idx == 0 || raw == 0x8000_0000_0000_0000 { 16 } else { 0 };
+        let div_edge_extra = if idx == 0 || raw == 0x8000_0000_0000_0000 {
+            16
+        } else {
+            0
+        };
         let obs = crate::c_abi::affine_step_budget(scale_a, offset_b, eff_in)
             .saturating_add(div_edge_extra)
             .saturating_add((raw & 63).min(31));
@@ -2568,7 +2797,11 @@ pub fn audit_riscv_step_certificate(
 
     for lane in 0..32u64 {
         let mixed = splitmix64_rust(lane.wrapping_add(0x9e37_79b9_7f4a_7c15));
-        let eff_in = if bound_in > 0 { mixed % (bound_in + 1) } else { 0 };
+        let eff_in = if bound_in > 0 {
+            mixed % (bound_in + 1)
+        } else {
+            0
+        };
         let obs = crate::c_abi::affine_step_budget(scale_a, offset_b, eff_in);
         max_observed_steps = max_observed_steps.max(obs);
         if !crate::c_abi::check_step_budget_le(obs, candidate_k) && violating_witness.is_none() {
@@ -2579,7 +2812,8 @@ pub fn audit_riscv_step_certificate(
         }
     }
 
-    let refuted = !crate::c_abi::check_step_budget_le(max_observed_steps, candidate_k) || violating_witness.is_some();
+    let refuted = !crate::c_abi::check_step_budget_le(max_observed_steps, candidate_k)
+        || violating_witness.is_some();
     Some(RiscvStepAuditReport {
         decl_name: decl_name.to_string(),
         candidate_k,
@@ -2588,7 +2822,9 @@ pub fn audit_riscv_step_certificate(
         refuted,
         violating_witness,
         recommended_min_k: max_observed_steps.max(bootstrap_steps),
-        yukon_score: candidate_k.saturating_mul(10_000).saturating_add(verify_minutes),
+        yukon_score: candidate_k
+            .saturating_mul(10_000)
+            .saturating_add(verify_minutes),
         elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
     })
 }
@@ -2624,8 +2860,11 @@ pub fn try_tpu_xla_fast_reject(
         return Some((format!("[TPU-v5e-XLA certified] {}", w), Some(h)));
     }
     let (witness_summary, suggested_hypothesis) = try_lnir_fast_reject(decl_name, stmt_src)?;
-    let (certified, _, _) =
-        certify_with_lean_native_core().unwrap_or((true, "0.5.0".to_string(), serde_json::json!({})));
+    let (certified, _, _) = certify_with_lean_native_core().unwrap_or((
+        true,
+        "0.5.0".to_string(),
+        serde_json::json!({}),
+    ));
     if !certified {
         return None;
     }
@@ -2637,14 +2876,10 @@ pub fn try_tpu_xla_fast_reject(
 
 /// Execute `turbo-lean fast-check <file> --tpu` on Google Cloud TPU v5e (via `$LEAN_NATIVE_COLAB_API_URL`
 /// or local MLIR/XLA vector lowering) with mandatory `lean-native-core` witness re-certification.
-pub fn run_tpu_fast_check(
-    json: bool,
-    file: &Path,
-    decl_filter: Option<&str>,
-) -> Result<()> {
+pub fn run_tpu_fast_check(json: bool, file: &Path, decl_filter: Option<&str>) -> Result<()> {
     let t0 = Instant::now();
-    let src_text = fs::read_to_string(file)
-        .with_context(|| format!("Failed to read {}", file.display()))?;
+    let src_text =
+        fs::read_to_string(file).with_context(|| format!("Failed to read {}", file.display()))?;
     let eff_filter = match decl_filter {
         Some(s) if !s.is_empty() && s != "auto" => Some(s),
         _ => None,
@@ -2681,7 +2916,10 @@ pub fn run_tpu_fast_check(
                     if val.get("ok").and_then(|v| v.as_bool()) == Some(true) {
                         remote_tpu_contacted = true;
                         let hw = val.get("hardware").unwrap_or(&val);
-                        let tpu_nm = hw.get("tpu_name").and_then(|v| v.as_str()).unwrap_or("Google Cloud TPU v6e");
+                        let tpu_nm = hw
+                            .get("tpu_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Google Cloud TPU v6e");
                         tpu_device = hw
                             .get("cpu_model")
                             .and_then(|v| v.as_str())
@@ -2787,8 +3025,8 @@ pub fn run_fast_check_command(
     remote_ssh: Option<String>,
     via_jump: Option<String>,
 ) -> Result<()> {
-    let backend_pref = std::env::var("TURBO_LEAN_FASTCHECK_BACKEND")
-        .unwrap_or_else(|_| "auto".to_string());
+    let backend_pref =
+        std::env::var("TURBO_LEAN_FASTCHECK_BACKEND").unwrap_or_else(|_| "auto".to_string());
     if backend_pref.eq_ignore_ascii_case("tpu") {
         return run_tpu_fast_check(json, &file, transpile_lean.as_deref());
     }
@@ -2950,11 +3188,18 @@ pub fn run_fast_check_command(
                 .arg("-o")
                 .arg(&tmp_bin)
                 .output()
-                .with_context(|| format!("Failed to execute `{}` on {}", nvcc_bin, file.display()))?;
+                .with_context(|| {
+                    format!("Failed to execute `{}` on {}", nvcc_bin, file.display())
+                })?;
             if !compile_out.status.success() {
                 let stderr = String::from_utf8_lossy(&compile_out.stderr);
                 let stdout = String::from_utf8_lossy(&compile_out.stdout);
-                anyhow::bail!("`nvcc -O3` failed on {}:\n{}\n{}", file.display(), stdout, stderr);
+                anyhow::bail!(
+                    "`nvcc -O3` failed on {}:\n{}\n{}",
+                    file.display(),
+                    stdout,
+                    stderr
+                );
             }
             if fs::rename(&tmp_bin, &cached_bin).is_err() {
                 fs::copy(&tmp_bin, &cached_bin)?;
@@ -2970,7 +3215,11 @@ pub fn run_fast_check_command(
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         if !out.status.success() {
-            anyhow::bail!("Local GPU fast-check binary failed:\n{}\n{}", stdout, stderr);
+            anyhow::bail!(
+                "Local GPU fast-check binary failed:\n{}\n{}",
+                stdout,
+                stderr
+            );
         }
         if json {
             let mut metrics =
@@ -3006,7 +3255,10 @@ pub fn run_fast_check_command(
                         .iter()
                         .map(|(ns, ty)| format!("({} : {}) ", ns.join(" "), ty))
                         .collect();
-                    (d.name.clone(), format!("{}: {}", binders_prefix, d.prop_str))
+                    (
+                        d.name.clone(),
+                        format!("{}: {}", binders_prefix, d.prop_str),
+                    )
                 })
                 .collect();
             if !batch_items.is_empty() {
@@ -3235,10 +3487,16 @@ pub fn synthesize_missing_hypothesis_hint(
     let lhs_lower = lhs_expr.to_ascii_lowercase();
     let rhs_lower = rhs_expr.to_ascii_lowercase();
     let cex_lower = cex_details.to_ascii_lowercase();
-    let any_raw = |kws: &[&str]| kws.iter().any(|k| lhs_expr.contains(k) || rhs_expr.contains(k));
+    let any_raw = |kws: &[&str]| {
+        kws.iter()
+            .any(|k| lhs_expr.contains(k) || rhs_expr.contains(k))
+    };
     let any_low = |kws: &[&str]| {
         kws.iter().any(|k| {
-            thm_lower.contains(k) || lhs_lower.contains(k) || rhs_lower.contains(k) || cex_lower.contains(k)
+            thm_lower.contains(k)
+                || lhs_lower.contains(k)
+                || rhs_lower.contains(k)
+                || cex_lower.contains(k)
         })
     };
 
@@ -4057,10 +4315,9 @@ enum FastVal {
 impl FastVal {
     fn format_witness(&self) -> String {
         match self {
-            FastVal::U256(w) => format!(
-                "0x{:016x}_{:016x}_{:016x}_{:016x}",
-                w[3], w[2], w[1], w[0]
-            ),
+            FastVal::U256(w) => {
+                format!("0x{:016x}_{:016x}_{:016x}_{:016x}", w[3], w[2], w[1], w[0])
+            }
             FastVal::U64(v) => format!("0x{:016x}", v),
             FastVal::Bool(b) => if *b { "true" } else { "false" }.to_string(),
             FastVal::U256BoolPair(w, b) => format!(
@@ -4114,7 +4371,10 @@ pub fn boundary_u256_rust(slot: u64) -> [u64; 4] {
 #[inline]
 pub fn gen_u256_param_rust(idx: u64, seed: u64, param_id: u64) -> [u64; 4] {
     if param_id >= 2 && idx < 4096 {
-        let slot = (idx.wrapping_add(idx >> 4).wrapping_add(param_id.wrapping_mul(5))) & 15;
+        let slot = (idx
+            .wrapping_add(idx >> 4)
+            .wrapping_add(param_id.wrapping_mul(5)))
+            & 15;
         return boundary_u256_rust(slot);
     }
     std::array::from_fn(|k| crate::cluster::lean_cabi_gen_u256_limb(idx, seed, param_id, k as u64))
@@ -4124,8 +4384,16 @@ fn u256_add_or_sub_rust(a: [u64; 4], b: [u64; 4], is_sub: bool) -> ([u64; 4], bo
     let mut out = [0u64; 4];
     let mut flag = false;
     for i in 0..4 {
-        let (r1, f1) = if is_sub { a[i].overflowing_sub(b[i]) } else { a[i].overflowing_add(b[i]) };
-        let (r2, f2) = if is_sub { r1.overflowing_sub(u64::from(flag)) } else { r1.overflowing_add(u64::from(flag)) };
+        let (r1, f1) = if is_sub {
+            a[i].overflowing_sub(b[i])
+        } else {
+            a[i].overflowing_add(b[i])
+        };
+        let (r2, f2) = if is_sub {
+            r1.overflowing_sub(u64::from(flag))
+        } else {
+            r1.overflowing_add(u64::from(flag))
+        };
         out[i] = r2;
         flag = f1 || f2;
     }
@@ -4152,7 +4420,11 @@ fn u256_shl_rust(a: [u64; 4], shift_u256: [u64; 4]) -> [u64; 4] {
     let mut out = [0u64; 4];
     for i in ws..4 {
         let lo = a[i - ws] << bs;
-        let hi = if bs > 0 && i > ws { a[i - ws - 1] >> (64 - bs) } else { 0 };
+        let hi = if bs > 0 && i > ws {
+            a[i - ws - 1] >> (64 - bs)
+        } else {
+            0
+        };
         out[i] = lo | hi;
     }
     out
@@ -4168,7 +4440,11 @@ fn u256_shr_rust(a: [u64; 4], shift_u256: [u64; 4]) -> [u64; 4] {
     let mut out = [0u64; 4];
     for i in 0..(4 - ws) {
         let lo = a[i + ws] >> bs;
-        let hi = if bs > 0 && i + ws + 1 < 4 { a[i + ws + 1] << (64 - bs) } else { 0 };
+        let hi = if bs > 0 && i + ws + 1 < 4 {
+            a[i + ws + 1] << (64 - bs)
+        } else {
+            0
+        };
         out[i] = lo | hi;
     }
     out
@@ -4321,10 +4597,15 @@ fn eval_lean_expr_fast_with_domain(
                 "=" | "==" | "!=" | "≠" => {
                     let eq = match (&l, &r) {
                         (FastVal::U256(a), FastVal::U256(b)) => a == b,
-                        (FastVal::U256(a), FastVal::U64(b)) | (FastVal::U64(b), FastVal::U256(a)) => *a == [*b, 0, 0, 0],
+                        (FastVal::U256(a), FastVal::U64(b))
+                        | (FastVal::U64(b), FastVal::U256(a)) => *a == [*b, 0, 0, 0],
                         _ => l == r,
                     };
-                    Some(FastVal::Bool(if matches!(op.as_str(), "=" | "==") { eq } else { !eq }))
+                    Some(FastVal::Bool(if matches!(op.as_str(), "=" | "==") {
+                        eq
+                    } else {
+                        !eq
+                    }))
                 }
                 "<" | "<=" | "≤" | ">" | ">=" | "≥" => {
                     let res = match (&l, &r) {
@@ -4355,9 +4636,9 @@ fn eval_lean_expr_fast_with_domain(
                         _ => 7,
                     };
                     match (&l, &r) {
-                        (FastVal::U64(a), FastVal::U64(b)) => Some(FastVal::U64(dom.mask(
-                            crate::cluster::lean_cabi_eval_u64_binop(op_code, *a, *b),
-                        ))),
+                        (FastVal::U64(a), FastVal::U64(b)) => Some(FastVal::U64(
+                            dom.mask(crate::cluster::lean_cabi_eval_u64_binop(op_code, *a, *b)),
+                        )),
                         _ => {
                             let (a, b) = (l.as_u256()?, r.as_u256()?);
                             Some(FastVal::U256(std::array::from_fn(|k| {
@@ -4402,9 +4683,9 @@ fn eval_lean_expr_fast_with_domain(
                         if dom.is_nat {
                             Some(FastVal::U64(a.checked_mul(*b)?))
                         } else {
-                            Some(FastVal::U64(dom.mask(
-                                crate::cluster::lean_cabi_eval_u64_binop(2, *a, *b),
-                            )))
+                            Some(FastVal::U64(
+                                dom.mask(crate::cluster::lean_cabi_eval_u64_binop(2, *a, *b)),
+                            ))
                         }
                     }
                     _ => {
@@ -4522,7 +4803,10 @@ fn eval_lean_expr_fast_with_domain(
                     let a = v_args[0].as_u256()?;
                     Some(FastVal::U256(std::array::from_fn(|k| !a[k])))
                 }
-                ("bitAnd" | "bitOr" | "bitSetMask" | "bitXor" | "bitFlipMask" | "bitClearMask", 2) => {
+                (
+                    "bitAnd" | "bitOr" | "bitSetMask" | "bitXor" | "bitFlipMask" | "bitClearMask",
+                    2,
+                ) => {
                     let (a, b) = (v_args[0].as_u256()?, v_args[1].as_u256()?);
                     Some(FastVal::U256(std::array::from_fn(|k| match short {
                         "bitAnd" => a[k] & b[k],
@@ -4532,7 +4816,11 @@ fn eval_lean_expr_fast_with_domain(
                     })))
                 }
                 ("bitMux" | "bitMaj" | "bitParity", 3) => {
-                    let (x, y, z) = (v_args[0].as_u256()?, v_args[1].as_u256()?, v_args[2].as_u256()?);
+                    let (x, y, z) = (
+                        v_args[0].as_u256()?,
+                        v_args[1].as_u256()?,
+                        v_args[2].as_u256()?,
+                    );
                     Some(FastVal::U256(std::array::from_fn(|k| match short {
                         "bitMux" => (y[k] & x[k]) | (z[k] & !x[k]),
                         "bitMaj" => (x[k] & y[k]) | (y[k] & z[k]) | (x[k] & z[k]),
@@ -4587,23 +4875,50 @@ fn eval_lean_expr_fast_with_domain(
                     }))
                 }
                 ("mulDivDown" | "mulDiv" | "mulDivUp", 3) => {
-                    let (x, y, d) = (v_args[0].as_u256()?, v_args[1].as_u256()?, v_args[2].as_u256()?);
-                    Some(FastVal::U256(u256_mul_div_512(x, y, d, short == "mulDivUp")))
+                    let (x, y, d) = (
+                        v_args[0].as_u256()?,
+                        v_args[1].as_u256()?,
+                        v_args[2].as_u256()?,
+                    );
+                    Some(FastVal::U256(u256_mul_div_512(
+                        x,
+                        y,
+                        d,
+                        short == "mulDivUp",
+                    )))
                 }
                 ("clz" | "clz256", 1) => {
                     let x = v_args[0].as_u256()?;
-                    let lz = (0..4).rev().find_map(|k| (x[k] != 0).then(|| (3 - k) as u64 * 64 + x[k].leading_zeros() as u64)).unwrap_or(256);
+                    let lz = (0..4)
+                        .rev()
+                        .find_map(|k| {
+                            (x[k] != 0).then(|| (3 - k) as u64 * 64 + x[k].leading_zeros() as u64)
+                        })
+                        .unwrap_or(256);
                     Some(FastVal::U256([lz, 0, 0, 0]))
                 }
                 ("mostSignificantBit" | "msb", 1) => {
                     let x = v_args[0].as_u256()?;
-                    let msb = (0..4).rev().find_map(|k| (x[k] != 0).then(|| k as u64 * 64 + 63 - x[k].leading_zeros() as u64)).unwrap_or(0);
+                    let msb = (0..4)
+                        .rev()
+                        .find_map(|k| {
+                            (x[k] != 0).then(|| k as u64 * 64 + 63 - x[k].leading_zeros() as u64)
+                        })
+                        .unwrap_or(0);
                     Some(FastVal::U256([msb, 0, 0, 0]))
                 }
                 ("ctz" | "ctz256" | "leastSignificantBit" | "lsb", 1) => {
                     let x = v_args[0].as_u256()?;
-                    let default_val = if matches!(short, "ctz" | "ctz256") { 256 } else { 0 };
-                    let tz = (0..4).find_map(|k| (x[k] != 0).then(|| k as u64 * 64 + x[k].trailing_zeros() as u64)).unwrap_or(default_val);
+                    let default_val = if matches!(short, "ctz" | "ctz256") {
+                        256
+                    } else {
+                        0
+                    };
+                    let tz = (0..4)
+                        .find_map(|k| {
+                            (x[k] != 0).then(|| k as u64 * 64 + x[k].trailing_zeros() as u64)
+                        })
+                        .unwrap_or(default_val);
                     Some(FastVal::U256([tz, 0, 0, 0]))
                 }
                 ("succ", 1) => {
@@ -4871,9 +5186,9 @@ fn eval_extracted_decl_in_memory(
             let val = match p_kind {
                 Stage1ParamKind::U256 => FastVal::U256(u),
                 Stage1ParamKind::U64 | Stage1ParamKind::BitVec64 => FastVal::U64(u[0]),
-                Stage1ParamKind::Nat
-                | Stage1ParamKind::U32
-                | Stage1ParamKind::BitVec32 => FastVal::U64(u[0] & 0xFFFF_FFFF),
+                Stage1ParamKind::Nat | Stage1ParamKind::U32 | Stage1ParamKind::BitVec32 => {
+                    FastVal::U64(u[0] & 0xFFFF_FFFF)
+                }
                 Stage1ParamKind::U16 | Stage1ParamKind::BitVec16 => FastVal::U64(u[0] & 0xFFFF),
                 Stage1ParamKind::U8 | Stage1ParamKind::BitVec8 => FastVal::U64(u[0] & 0xFF),
                 Stage1ParamKind::Bool => FastVal::Bool((u[0] & 1) != 0),
@@ -4984,11 +5299,43 @@ fn is_known_binder_value_type(ty: &str) -> bool {
     let first_word = t.split_whitespace().next().unwrap_or("");
     matches!(
         first_word,
-        "Nat" | "Int" | "Bool" | "String" | "Char" | "UInt8" | "UInt16" | "UInt32" | "UInt64"
-            | "USize" | "BitVec" | "Word256" | "UInt256" | "Int256" | "List" | "Array" | "Option"
-            | "Prod" | "Sigma" | "Fin" | "Type" | "Sort" | "Prop" | "ContractState"
-            | "StorageKey" | "Env" | "Decl" | "Expr" | "ByteArray" | "VarEnv" | "HeapState"
-            | "LNIRCode" | "LNIRExpr" | "LNIRType" | "VarId" | "Val" | "SurfaceSig"
+        "Nat"
+            | "Int"
+            | "Bool"
+            | "String"
+            | "Char"
+            | "UInt8"
+            | "UInt16"
+            | "UInt32"
+            | "UInt64"
+            | "USize"
+            | "BitVec"
+            | "Word256"
+            | "UInt256"
+            | "Int256"
+            | "List"
+            | "Array"
+            | "Option"
+            | "Prod"
+            | "Sigma"
+            | "Fin"
+            | "Type"
+            | "Sort"
+            | "Prop"
+            | "ContractState"
+            | "StorageKey"
+            | "Env"
+            | "Decl"
+            | "Expr"
+            | "ByteArray"
+            | "VarEnv"
+            | "HeapState"
+            | "LNIRCode"
+            | "LNIRExpr"
+            | "LNIRType"
+            | "VarId"
+            | "Val"
+            | "SurfaceSig"
             | "LoopScheduleSpec"
     ) || (first_word.contains('.')
         && first_word
@@ -5024,7 +5371,9 @@ fn resolve_agent_step_env_and_paths(
         let start_dir = if file.is_dir() {
             file.to_path_buf()
         } else {
-            file.parent().unwrap_or_else(|| Path::new(".")).to_path_buf()
+            file.parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
         };
         let canon_start = start_dir.canonicalize().unwrap_or(start_dir);
         canon_start
@@ -5043,7 +5392,12 @@ fn resolve_agent_step_env_and_paths(
     } else {
         file.to_path_buf()
     };
-    (max_memory_mb, effective_low_memory, canon_dir, resolved_file)
+    (
+        max_memory_mb,
+        effective_low_memory,
+        canon_dir,
+        resolved_file,
+    )
 }
 
 fn try_eval_decl_stage1_cex_json(
@@ -5064,7 +5418,8 @@ fn try_eval_decl_stage1_cex_json(
     }
     let mut accelerator_certificates: Vec<crate::accelerators::AcceleratorCertificate> = Vec::new();
     let cex_json_str = serde_json::to_string(&report.counterexample).unwrap_or_default();
-    let suggested_hyp = synthesize_missing_hypothesis_hint(&d.name, &lhs_lean, &rhs_lean, &cex_json_str);
+    let suggested_hyp =
+        synthesize_missing_hypothesis_hint(&d.name, &lhs_lean, &rhs_lean, &cex_json_str);
     if has_ext_plugins {
         let binders_prefix: String = d
             .binders
@@ -5211,6 +5566,9 @@ pub fn evaluate_agent_step_value(
     let mut total_specs_audited = 0usize;
     let mut vacuous_specs = 0usize;
     let mut tight_specs = 0usize;
+    let mut primary_stmt_src = String::new();
+    let mut primary_body_src = String::new();
+    let mut primary_decl_name = String::new();
 
     if resolved_file.is_file() {
         let src_text = fs::read_to_string(&resolved_file)
@@ -5301,38 +5659,34 @@ pub fn evaluate_agent_step_value(
 
         for ts in &target_shards {
             let (stmt_src, body_src) =
-                if !ts.signature_text.is_empty() && !ts.proof_text.is_empty() {
-                    (ts.signature_text.clone(), ts.proof_text.clone())
-                } else {
-                    let decl_lines: String = src_text
-                        .lines()
-                        .skip(ts.start_line.saturating_sub(1))
-                        .take(ts.end_line.saturating_sub(ts.start_line) + 1)
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if let Some((sig, prf)) = decl_lines.split_once(":=") {
-                        (
-                            if !ts.signature_text.is_empty() {
-                                ts.signature_text.clone()
-                            } else {
-                                sig.trim().to_string()
-                            },
-                            if !ts.proof_text.is_empty() {
-                                ts.proof_text.clone()
-                            } else {
-                                prf.trim().to_string()
-                            },
-                        )
-                    } else {
-                        (ts.signature_text.clone(), ts.proof_text.clone())
-                    }
-                };
+                crate::splitter::extract_shard_stmt_and_proof(&src_text, ts);
+            if primary_stmt_src.is_empty() {
+                primary_stmt_src = stmt_src.clone();
+                primary_body_src = body_src.clone();
+                primary_decl_name = ts.name.clone();
+            }
+            if !accelerators_active {
+                continue;
+            }
+            let mut avail_consts = crate::accelerators::lookup_distilled_constants(&ts.name, &stmt_src);
+            let mut avail_const_set: std::collections::HashSet<String> =
+                avail_consts.iter().cloned().collect();
+            for s in &split.shards {
+                if s.start_line < ts.start_line && avail_const_set.insert(s.name.clone()) {
+                    avail_consts.push(s.name.clone());
+                }
+            }
+            for sc in crate::matryoshka::parse_lean_stmt_features(&ts.name, &stmt_src).stmt_consts {
+                if avail_const_set.insert(sc.clone()) {
+                    avail_consts.push(sc);
+                }
+            }
             let mut certs = accel_registry.run_all(&crate::accelerators::AcceleratorInput {
                 decl_name: ts.name.clone(),
                 stmt_src: stmt_src.clone(),
                 body_src: body_src.clone(),
                 imports_csv: split.imports_header.clone(),
-                available_constants: Vec::new(),
+                available_constants: avail_consts,
                 budget_ms: 25,
             });
             if !certs.iter().any(|c| {
@@ -5445,9 +5799,33 @@ pub fn evaluate_agent_step_value(
                 .collect();
             if let Ok(cached_map) = store.batch_get_theorem_shards(&shard_keys, "trusted") {
                 if cached_map.len() == shard_keys.len() {
+                    crate::lake_build::recheck_dependents_if_nonlocal(&canon_dir, &resolved_file)?;
                     let elapsed_ms =
                         (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
                     let first_shard = target_shards[0];
+                    let cached_stmt_src = if !first_shard.signature_text.is_empty() {
+                        first_shard.signature_text.as_str()
+                    } else if first_shard.name == primary_decl_name {
+                        primary_stmt_src.as_str()
+                    } else {
+                        ""
+                    };
+                    let cached_body_src = if !first_shard.proof_text.is_empty() {
+                        first_shard.proof_text.as_str()
+                    } else if first_shard.name == primary_decl_name {
+                        primary_body_src.as_str()
+                    } else {
+                        ""
+                    };
+                    let cached_feats = crate::matryoshka::parse_lean_stmt_features(
+                        &first_shard.name,
+                        cached_stmt_src,
+                    );
+                    let cached_skel = crate::matryoshka::extract_tactic_skeleton(cached_body_src);
+                    let cached_used = crate::accelerators::lookup_distilled_constants(
+                        &first_shard.name,
+                        cached_stmt_src,
+                    );
                     let status_str = if decl_filter.is_some() {
                         "theorem_cache_hit"
                     } else {
@@ -5476,6 +5854,14 @@ pub fn evaluate_agent_step_value(
                         "total_specs_audited": total_specs_audited,
                         "vacuous_specs": vacuous_specs,
                         "tight_specs": tight_specs,
+                        "used_constants": cached_used,
+                        "stmt_nodes": cached_feats.stmt_nodes,
+                        "stmt_depth": cached_feats.stmt_depth,
+                        "num_binders": cached_feats.num_binders,
+                        "goal_head": cached_feats.goal_head,
+                        "stmt_consts": cached_feats.stmt_consts,
+                        "tactic_skeleton": cached_skel,
+                        "proof_term_nodes": 0,
                         "shard_hits": shard_keys.len(),
                         "shard_misses": 0,
                         "shard_key": shard_keys[0],
@@ -5494,13 +5880,9 @@ pub fn evaluate_agent_step_value(
     let eff_decl = decl_filter
         .filter(|df| !df.is_empty() && *df != "auto")
         .map(String::from);
-    let mut check_json = crate::check::evaluate_check_command_value(
-        store,
-        resolved_file,
-        eff_decl,
-        canon_dir,
-    )
-    .context("Stage 2 `turbo-lean check` failed")?;
+    let mut check_json =
+        crate::check::evaluate_check_command_value(store, resolved_file, eff_decl, canon_dir)
+            .context("Stage 2 `turbo-lean check` failed")?;
 
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
     if let Some(obj) = check_json.as_object_mut() {
@@ -5530,20 +5912,59 @@ pub fn evaluate_agent_step_value(
                 );
             }
         }
-        obj.insert("file".to_string(), serde_json::json!(file.display().to_string()));
-        obj.insert("stage".to_string(), serde_json::json!("stage2_kernel_verified"));
-        obj.insert("accelerators_active".to_string(), serde_json::json!(accelerators_active));
-        obj.insert("registered_accelerators_count".to_string(), serde_json::json!(registered_accelerators_count));
-        obj.insert("accelerator_certificates".to_string(), serde_json::json!(accelerator_certificates));
-        obj.insert("stage1_fastcheck_certified".to_string(), serde_json::json!(lean_native_certified));
-        obj.insert("lean_native_certified".to_string(), serde_json::json!(lean_native_certified));
-        obj.insert("lean_native_engine_version".to_string(), serde_json::json!(lean_native_version));
-        obj.insert("low_memory_mode".to_string(), serde_json::json!(effective_low_memory));
-        obj.insert("max_memory_mb".to_string(), serde_json::json!(max_memory_mb));
-        obj.insert("total_specs_audited".to_string(), serde_json::json!(total_specs_audited));
-        obj.insert("vacuous_specs".to_string(), serde_json::json!(vacuous_specs));
+        obj.insert(
+            "file".to_string(),
+            serde_json::json!(file.display().to_string()),
+        );
+        obj.insert(
+            "stage".to_string(),
+            serde_json::json!("stage2_kernel_verified"),
+        );
+        obj.insert(
+            "accelerators_active".to_string(),
+            serde_json::json!(accelerators_active),
+        );
+        obj.insert(
+            "registered_accelerators_count".to_string(),
+            serde_json::json!(registered_accelerators_count),
+        );
+        obj.insert(
+            "accelerator_certificates".to_string(),
+            serde_json::json!(accelerator_certificates),
+        );
+        obj.insert(
+            "stage1_fastcheck_certified".to_string(),
+            serde_json::json!(lean_native_certified),
+        );
+        obj.insert(
+            "lean_native_certified".to_string(),
+            serde_json::json!(lean_native_certified),
+        );
+        obj.insert(
+            "lean_native_engine_version".to_string(),
+            serde_json::json!(lean_native_version),
+        );
+        obj.insert(
+            "low_memory_mode".to_string(),
+            serde_json::json!(effective_low_memory),
+        );
+        obj.insert(
+            "max_memory_mb".to_string(),
+            serde_json::json!(max_memory_mb),
+        );
+        obj.insert(
+            "total_specs_audited".to_string(),
+            serde_json::json!(total_specs_audited),
+        );
+        obj.insert(
+            "vacuous_specs".to_string(),
+            serde_json::json!(vacuous_specs),
+        );
         obj.insert("tight_specs".to_string(), serde_json::json!(tight_specs));
-        obj.insert("verification_status".to_string(), serde_json::json!("verified"));
+        obj.insert(
+            "verification_status".to_string(),
+            serde_json::json!("verified"),
+        );
         obj.insert("verified".to_string(), serde_json::json!(true));
         let decl_label = obj
             .get("decl")
@@ -5556,19 +5977,57 @@ pub fn evaluate_agent_step_value(
             .map(String::from)
             .unwrap_or_else(|| format!("OK stage2 decl={} ms={:.1}", decl_label, elapsed_ms));
         compact_summary.truncate(120);
-        obj.insert("compact_summary".to_string(), serde_json::json!(compact_summary));
+        obj.insert(
+            "compact_summary".to_string(),
+            serde_json::json!(compact_summary),
+        );
         obj.insert("estimated_tokens_saved".to_string(), serde_json::json!(360));
         obj.insert("elapsed_ms".to_string(), serde_json::json!(elapsed_ms));
 
-        let hbs_val = obj.get("heartbeats").or_else(|| obj.get("heartbeats_used")).and_then(|v| v.as_u64()).unwrap_or(0);
+        let hbs_val = obj
+            .get("heartbeats")
+            .or_else(|| obj.get("heartbeats_used"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         let cbv_offload_recommended = hbs_val > 50_000 || decl_label.starts_with("InitE.source");
-        obj.insert("cbv_offload_recommended".to_string(), serde_json::json!(cbv_offload_recommended));
+        obj.insert(
+            "cbv_offload_recommended".to_string(),
+            serde_json::json!(cbv_offload_recommended),
+        );
         if cbv_offload_recommended && obj.get("winning_tactic_hint").is_none() {
             obj.insert(
                 "winning_tactic_hint".to_string(),
                 serde_json::json!("by native_decide -- [turbo-lean: >50k heartbeats cbv/decide detected; offload to TPU RPN or ComputationCache.boxedValue]"),
             );
         }
+
+        let fallback_decl = if primary_decl_name.is_empty() {
+            decl_label.as_str()
+        } else {
+            primary_decl_name.as_str()
+        };
+        let feats = crate::matryoshka::parse_lean_stmt_features(fallback_decl, &primary_stmt_src);
+        let skel = crate::matryoshka::extract_tactic_skeleton(&primary_body_src);
+        let proof_nodes_val = obj.get("proof_term_nodes").and_then(|v| v.as_u64()).unwrap_or(0);
+        obj.entry("proof_term_nodes".to_string())
+            .or_insert_with(|| serde_json::json!(proof_nodes_val));
+        if obj.get("used_constants").is_none() {
+            let dist = crate::accelerators::lookup_distilled_constants(fallback_decl, &primary_stmt_src);
+            let uc = if !dist.is_empty() { dist } else { feats.stmt_consts.clone() };
+            obj.insert("used_constants".to_string(), serde_json::json!(uc));
+        }
+        obj.entry("stmt_nodes".to_string())
+            .or_insert_with(|| serde_json::json!(feats.stmt_nodes));
+        obj.entry("stmt_depth".to_string())
+            .or_insert_with(|| serde_json::json!(feats.stmt_depth));
+        obj.entry("num_binders".to_string())
+            .or_insert_with(|| serde_json::json!(feats.num_binders));
+        obj.entry("goal_head".to_string())
+            .or_insert_with(|| serde_json::json!(feats.goal_head));
+        obj.entry("stmt_consts".to_string())
+            .or_insert_with(|| serde_json::json!(feats.stmt_consts));
+        obj.entry("tactic_skeleton".to_string())
+            .or_insert_with(|| serde_json::json!(skel));
 
         let trace_entry = serde_json::json!({
             "schema": "turbo-lean.telemetry.v1",
@@ -5581,10 +6040,21 @@ pub fn evaluate_agent_step_value(
             "proof_term_nodes": obj.get("proof_term_nodes").and_then(|v| v.as_u64()).unwrap_or(0),
             "distilled_simp_hint": obj.get("distilled_simp_hint"),
             "used_constants": obj.get("used_constants"),
+            "stmt_nodes": obj.get("stmt_nodes"),
+            "stmt_depth": obj.get("stmt_depth"),
+            "num_binders": obj.get("num_binders"),
+            "goal_head": obj.get("goal_head"),
+            "stmt_consts": obj.get("stmt_consts"),
+            "tactic_skeleton": obj.get("tactic_skeleton"),
             "vacuous_specs": vacuous_specs,
             "tight_specs": tight_specs,
         });
-        crate::mcp::emit_sandboxed_telemetry_event(trace_entry, "traces.jsonl");
+        crate::mcp::emit_sandboxed_telemetry_event_with_trust(
+            project_dir.or_else(|| file.parent()),
+            true,
+            trace_entry,
+            "traces.jsonl",
+        );
     }
     Ok(check_json)
 }
@@ -5599,34 +6069,52 @@ pub fn run_agent_step_command(
     low_memory: bool,
     json_mode: bool,
 ) -> Result<()> {
-    let out_json = evaluate_agent_step_value(
-        store,
-        file,
-        decl_filter,
-        project_dir,
-        low_memory,
-        false,
-    )?;
+    let out_json =
+        evaluate_agent_step_value(store, file, decl_filter, project_dir, low_memory, false)?;
     if json_mode {
         println!("{}", serde_json::to_string_pretty(&out_json)?);
         return Ok(());
     }
-    let status = out_json.get("status").and_then(|v| v.as_str()).unwrap_or("ok");
+    let status = out_json
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("ok");
     let stage = out_json.get("stage").and_then(|v| v.as_str()).unwrap_or("");
-    let decl = out_json.get("decl").and_then(|v| v.as_str()).unwrap_or("decl");
-    let elapsed_ms = out_json.get("elapsed_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let low_mem = out_json.get("low_memory_mode").and_then(|v| v.as_bool()).unwrap_or(low_memory);
+    let decl = out_json
+        .get("decl")
+        .and_then(|v| v.as_str())
+        .unwrap_or("decl");
+    let elapsed_ms = out_json
+        .get("elapsed_ms")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let low_mem = out_json
+        .get("low_memory_mode")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(low_memory);
     if status == "counterexample_rejected" {
         if stage == "stage1_accelerator_fastreject" {
-            let acc = out_json.get("accelerator_name").and_then(|v| v.as_str()).unwrap_or("accel");
-            let ws = out_json.get("witness_summary").and_then(|v| v.as_str()).unwrap_or("");
+            let acc = out_json
+                .get("accelerator_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("accel");
+            let ws = out_json
+                .get("witness_summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             println!(
                 "[turbo-lean] AGENT-STEP ACCELERATOR COUNTEREXAMPLE REJECTED `{}` via {} ({:.3} ms): {}",
                 decl, acc, elapsed_ms, ws
             );
         } else {
-            let violations = out_json.get("violations").and_then(|v| v.as_u64()).unwrap_or(1);
-            let hyp = out_json.get("suggested_hypothesis").and_then(|v| v.as_str()).unwrap_or("none");
+            let violations = out_json
+                .get("violations")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1);
+            let hyp = out_json
+                .get("suggested_hypothesis")
+                .and_then(|v| v.as_str())
+                .unwrap_or("none");
             println!(
                 "[turbo-lean] AGENT-STEP STAGE 1 COUNTEREXAMPLE REJECTED `{}` ({} violations in {:.3} ms) -> suggested hypothesis: `{}`",
                 decl, violations, elapsed_ms, hyp
@@ -5789,7 +6277,10 @@ mod s6_agent_ux_tests {
                 "h_slot_ne : k1 != k2",
             ),
         ] {
-            assert_eq!(synthesize_missing_hypothesis_hint(decl, lhs, rhs, ce_json).as_deref(), Some(expected));
+            assert_eq!(
+                synthesize_missing_hypothesis_hint(decl, lhs, rhs, ce_json).as_deref(),
+                Some(expected)
+            );
         }
     }
 
@@ -5803,16 +6294,36 @@ mod s6_agent_ux_tests {
 ";
         let decls = extract_all_lean_theorems(&strip_lean_comments(src), None);
         assert_eq!(decls.len(), 3);
-        let ((v0, t0, _), (v1, t1, _), (v2, t2, _)) = (audit_single_decl_spec(&decls[0]), audit_single_decl_spec(&decls[1]), audit_single_decl_spec(&decls[2]));
+        let ((v0, t0, _), (v1, t1, _), (v2, t2, _)) = (
+            audit_single_decl_spec(&decls[0]),
+            audit_single_decl_spec(&decls[1]),
+            audit_single_decl_spec(&decls[2]),
+        );
         assert!(!v0 && t0 && v1 && !t1 && !v2 && !t2);
 
         let tier2_src = "private def unused_helper : Nat := 7\ntheorem clean_thm (a b : Word256) : Word256.bitAnd a b = Word256.bitAnd b a := by simp; rfl; trivial; done\n";
         let rep_t2 = audit_spec_file_or_source(Path::new("Tier2.lean"), Some(tier2_src), None);
-        assert_eq!((rep_t2["ok"].as_bool(), rep_t2["unused_private_decls"].as_array().unwrap().len(), rep_t2["horizontal_packing_warnings"].as_array().unwrap().len()), (Some(true), 1, 1));
+        assert_eq!(
+            (
+                rep_t2["ok"].as_bool(),
+                rep_t2["unused_private_decls"].as_array().unwrap().len(),
+                rep_t2["horizontal_packing_warnings"]
+                    .as_array()
+                    .unwrap()
+                    .len()
+            ),
+            (Some(true), 1, 1)
+        );
 
         let shadow_src = "def myConst : Word256 := Word256.zero\ntheorem bad_shadow (myConst b : Word256) : Word256.bitAnd myConst b = Word256.bitAnd b myConst := by rfl\ntheorem clean_dep_binder (h : ∀ x : Word256, myConst = x) : True := by sorry\n";
         let rep_sh = audit_spec_file_or_source(Path::new("Shadow.lean"), Some(shadow_src), None);
-        assert_eq!((rep_sh["ok"].as_bool(), rep_sh["shadowed_constants"].as_array().unwrap().len()), (Some(false), 1));
+        assert_eq!(
+            (
+                rep_sh["ok"].as_bool(),
+                rep_sh["shadowed_constants"].as_array().unwrap().len()
+            ),
+            (Some(false), 1)
+        );
 
         // 1-level local `def`/`abbrev` delta-unfolding and `turbo_spec_audit_witness_gate`
         let unfold_src = "\
@@ -5826,7 +6337,10 @@ theorem masked_trivial (x : Nat) : AlwaysTrue x := by trivial
         assert_eq!(rep_unf["vacuous_specs"].as_u64(), Some(1));
         assert_eq!(rep_unf["trivial_specs"].as_u64(), Some(1));
         assert_eq!(rep_unf["specs"][0]["pos_witness"].as_str().is_some(), true);
-        assert_eq!(rep_unf["specs"][1]["neg_witness"].as_str(), Some("none(tautological_postcondition)"));
+        assert_eq!(
+            rep_unf["specs"][1]["neg_witness"].as_str(),
+            Some("none(tautological_postcondition)")
+        );
 
         // Hypothesis-drop mutation probe: `h_unused : b = Word256.zero` is droppable when conclusion only depends on `a`
         let drop_src = "\
@@ -5834,7 +6348,10 @@ theorem overconstrained_comm (a b : Word256) (h_unused : b = Word256.zero) : Wor
 ";
         let rep_drop = audit_spec_file_or_source(Path::new("DropHyp.lean"), Some(drop_src), None);
         assert_eq!(rep_drop["ok"].as_bool(), Some(true));
-        assert_eq!(rep_drop["droppable_hypotheses"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            rep_drop["droppable_hypotheses"].as_array().unwrap().len(),
+            1
+        );
 
         // Inline `let` binding inside theorem signature must not prematurely split on `:=` or flag `vacuous_precondition`
         let let_src = "\
@@ -5842,20 +6359,30 @@ theorem swar_scale_let_conclusion (a b : UInt64) (h : a < 100) :
     let sum64 : UInt64 := a + b
     sum64 = b + a := by sorry
 ";
-        let rep_let = audit_spec_file_or_source(Path::new("LetConclusion.lean"), Some(let_src), None);
+        let rep_let =
+            audit_spec_file_or_source(Path::new("LetConclusion.lean"), Some(let_src), None);
         assert_eq!(rep_let["ok"].as_bool(), Some(true));
         assert_eq!(rep_let["vacuous_specs"].as_u64(), Some(0));
         assert_eq!(rep_let["trivial_specs"].as_u64(), Some(0));
         assert_eq!(rep_let["tight_specs"].as_u64(), Some(1));
 
         // Multi-file parallel batch audit via `audit_spec_files`
-        let tmp_dir = std::env::temp_dir().join(format!("turbo_audit_batch_{}", std::process::id()));
+        let tmp_dir =
+            std::env::temp_dir().join(format!("turbo_audit_batch_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp_dir);
         fs::create_dir_all(&tmp_dir).unwrap();
         let f1 = tmp_dir.join("File1.lean");
         let f2 = tmp_dir.join("File2.lean");
-        fs::write(&f1, "theorem t1 (a b : Word256) : Word256.bitAnd a b = Word256.bitAnd b a := by rfl\n").unwrap();
-        fs::write(&f2, "theorem t2 (a b : UInt64) : a + b = b + a := by omega\n").unwrap();
+        fs::write(
+            &f1,
+            "theorem t1 (a b : Word256) : Word256.bitAnd a b = Word256.bitAnd b a := by rfl\n",
+        )
+        .unwrap();
+        fs::write(
+            &f2,
+            "theorem t2 (a b : UInt64) : a + b = b + a := by omega\n",
+        )
+        .unwrap();
         let batch_rep = audit_spec_files(&[f1, f2], None);
         let _ = fs::remove_dir_all(&tmp_dir);
         assert_eq!(batch_rep["ok"].as_bool(), Some(true));
@@ -5867,13 +6394,28 @@ theorem swar_scale_let_conclusion (a b : UInt64) (h : a < 100) :
 
     #[test]
     fn test_u256_mul_div_512_and_clz_ctz_intrinsics() {
-        assert_eq!(u256_mul_div_512([0, 0, 0, 1], [0, 0, 1, 0], [0, 0, 1u64 << 32, 0], false), [0, 0, 1u64 << 32, 0]);
-        assert_eq!(u256_mul_div_512([7, 0, 0, 0], [3, 0, 0, 0], [5, 0, 0, 0], false), [4, 0, 0, 0]);
-        assert_eq!(u256_mul_div_512([7, 0, 0, 0], [3, 0, 0, 0], [5, 0, 0, 0], true), [5, 0, 0, 0]);
+        assert_eq!(
+            u256_mul_div_512([0, 0, 0, 1], [0, 0, 1, 0], [0, 0, 1u64 << 32, 0], false),
+            [0, 0, 1u64 << 32, 0]
+        );
+        assert_eq!(
+            u256_mul_div_512([7, 0, 0, 0], [3, 0, 0, 0], [5, 0, 0, 0], false),
+            [4, 0, 0, 0]
+        );
+        assert_eq!(
+            u256_mul_div_512([7, 0, 0, 0], [3, 0, 0, 0], [5, 0, 0, 0], true),
+            [5, 0, 0, 0]
+        );
 
         let env = std::collections::HashMap::new();
-        assert_eq!(eval_lean_expr_fast(&parse_lean_expr_str("clz256 1").unwrap(), &env), Some(FastVal::U256([255, 0, 0, 0])));
-        assert_eq!(eval_lean_expr_fast(&parse_lean_expr_str("ctz256 8").unwrap(), &env), Some(FastVal::U256([3, 0, 0, 0])));
+        assert_eq!(
+            eval_lean_expr_fast(&parse_lean_expr_str("clz256 1").unwrap(), &env),
+            Some(FastVal::U256([255, 0, 0, 0]))
+        );
+        assert_eq!(
+            eval_lean_expr_fast(&parse_lean_expr_str("ctz256 8").unwrap(), &env),
+            Some(FastVal::U256([3, 0, 0, 0]))
+        );
     }
 
     #[test]
@@ -5884,10 +6426,18 @@ theorem swar_scale_let_conclusion (a b : UInt64) (h : a < 100) :
 ";
         let decls = extract_all_lean_theorems(&strip_lean_comments(buggy_src), None);
         assert_eq!(decls.len(), 2);
-        for (decl, exp_hint) in [(&decls[0], "h_no_overflow : a.val + b.val < 2^256"), (&decls[1], "h_slot_ne : k1 != k2")] {
+        for (decl, exp_hint) in [
+            (&decls[0], "h_no_overflow : a.val + b.val < 2^256"),
+            (&decls[1], "h_slot_ne : k1 != k2"),
+        ] {
             let (rep, lhs, rhs) = eval_extracted_decl_in_memory(decl, 4096).unwrap();
             assert!(!rep.verified && rep.violations > 0);
-            let hint = synthesize_missing_hypothesis_hint(&decl.name, &lhs, &rhs, &serde_json::to_string(&rep.counterexample).unwrap());
+            let hint = synthesize_missing_hypothesis_hint(
+                &decl.name,
+                &lhs,
+                &rhs,
+                &serde_json::to_string(&rep.counterexample).unwrap(),
+            );
             assert_eq!(hint.as_deref(), Some(exp_hint));
         }
     }
@@ -5904,18 +6454,54 @@ theorem swar_scale_let_conclusion (a b : UInt64) (h : a < 100) :
     #[test]
     fn test_subword_and_nat_fastcheck_soundness() {
         let valid_theorems = [
-            ("u8_shl_mod8", "theorem u8_shl_mod8 (x : UInt8) : x <<< 8 = x := by sorry"),
-            ("u8_shr_mod8", "theorem u8_shr_mod8 (x : UInt8) : x >>> 8 = x := by sorry"),
-            ("u8_add_wrap", "theorem u8_add_wrap (x : UInt8) : x + 255 = x - 1 := by sorry"),
-            ("u8_mul_wrap", "theorem u8_mul_wrap (x : UInt8) : x * 256 = 0 := by sorry"),
-            ("u8_not_mask", "theorem u8_not_mask (x : UInt8) : ~~~x = 255 - x := by sorry"),
-            ("u16_shl_mod16", "theorem u16_shl_mod16 (x : UInt16) : x <<< 16 = x := by sorry"),
-            ("u32_add_wrap", "theorem u32_add_wrap (x : UInt32) : x + 4294967295 = x - 1 := by sorry"),
-            ("bv8_shl_trunc", "theorem bv8_shl_trunc (x : BitVec 8) : x <<< 8 = 0 := by sorry"),
-            ("bv8_shr_trunc", "theorem bv8_shr_trunc (x : BitVec 8) : x >>> 8 = 0 := by sorry"),
-            ("bv64_shl_trunc", "theorem bv64_shl_trunc (x : BitVec 64) : x <<< 64 = 0 := by sorry"),
-            ("nat_lt_succ", "theorem nat_lt_succ (n : Nat) : (n < n + 1) = true := by sorry"),
-            ("nat_sub_le", "theorem nat_sub_le (a b : Nat) : (a - b <= a) = true := by sorry"),
+            (
+                "u8_shl_mod8",
+                "theorem u8_shl_mod8 (x : UInt8) : x <<< 8 = x := by sorry",
+            ),
+            (
+                "u8_shr_mod8",
+                "theorem u8_shr_mod8 (x : UInt8) : x >>> 8 = x := by sorry",
+            ),
+            (
+                "u8_add_wrap",
+                "theorem u8_add_wrap (x : UInt8) : x + 255 = x - 1 := by sorry",
+            ),
+            (
+                "u8_mul_wrap",
+                "theorem u8_mul_wrap (x : UInt8) : x * 256 = 0 := by sorry",
+            ),
+            (
+                "u8_not_mask",
+                "theorem u8_not_mask (x : UInt8) : ~~~x = 255 - x := by sorry",
+            ),
+            (
+                "u16_shl_mod16",
+                "theorem u16_shl_mod16 (x : UInt16) : x <<< 16 = x := by sorry",
+            ),
+            (
+                "u32_add_wrap",
+                "theorem u32_add_wrap (x : UInt32) : x + 4294967295 = x - 1 := by sorry",
+            ),
+            (
+                "bv8_shl_trunc",
+                "theorem bv8_shl_trunc (x : BitVec 8) : x <<< 8 = 0 := by sorry",
+            ),
+            (
+                "bv8_shr_trunc",
+                "theorem bv8_shr_trunc (x : BitVec 8) : x >>> 8 = 0 := by sorry",
+            ),
+            (
+                "bv64_shl_trunc",
+                "theorem bv64_shl_trunc (x : BitVec 64) : x <<< 64 = 0 := by sorry",
+            ),
+            (
+                "nat_lt_succ",
+                "theorem nat_lt_succ (n : Nat) : (n < n + 1) = true := by sorry",
+            ),
+            (
+                "nat_sub_le",
+                "theorem nat_sub_le (a b : Nat) : (a - b <= a) = true := by sorry",
+            ),
         ];
         for (name, stmt) in valid_theorems {
             assert_eq!(
@@ -5960,7 +6546,8 @@ theorem swar_scale_let_conclusion (a b : UInt64) (h : a < 100) :
             .unwrap_or_default()
             .as_nanos();
         let pid = std::process::id();
-        let tmp_dir = std::env::temp_dir().join(format!("turbo_audit_cache_test_{}_{}", pid, nonce));
+        let tmp_dir =
+            std::env::temp_dir().join(format!("turbo_audit_cache_test_{}_{}", pid, nonce));
         let _ = fs::remove_dir_all(&tmp_dir);
         fs::create_dir_all(&tmp_dir).unwrap();
         let f1 = tmp_dir.join("Cached1.lean");
@@ -6021,7 +6608,11 @@ def h2 (x : Nat) : Prop := h1 x
 def h3 (x : Nat) : Prop := h2 x
 theorem sneaky_vacuous (x : Nat) (h : h3 x) : x = 42 := by sorry
 ";
-        let rep_vac = audit_spec_file_or_source(Path::new("multi_hop_vac.lean"), Some(multi_hop_vacuous), None);
+        let rep_vac = audit_spec_file_or_source(
+            Path::new("multi_hop_vac.lean"),
+            Some(multi_hop_vacuous),
+            None,
+        );
         assert_eq!(rep_vac["ok"].as_bool(), Some(false));
         assert_eq!(rep_vac["vacuous_specs"].as_u64(), Some(1));
         assert_eq!(rep_vac["tight_specs"].as_u64(), Some(0));
@@ -6033,7 +6624,8 @@ def h2 (x : Nat) : Prop := h1 x
 def h3 (x : Nat) : Prop := h2 x
 theorem sneaky_conj_vacuous (x : Nat) (h : x > 0 ∧ h3 x) : x = 99 := by sorry
 ";
-        let rep_conj = audit_spec_file_or_source(Path::new("conj_vac.lean"), Some(conj_vacuous), None);
+        let rep_conj =
+            audit_spec_file_or_source(Path::new("conj_vac.lean"), Some(conj_vacuous), None);
         assert_eq!(rep_conj["ok"].as_bool(), Some(false));
         assert_eq!(rep_conj["vacuous_specs"].as_u64(), Some(1));
 
@@ -6044,7 +6636,11 @@ def c2 (x : Nat) : Prop := c1 x
 def c3 (x : Nat) : Prop := c2 x
 theorem sneaky_trivial (x : Nat) : c3 x := by rfl
 ";
-        let rep_triv = audit_spec_file_or_source(Path::new("multi_hop_triv.lean"), Some(multi_hop_trivial), None);
+        let rep_triv = audit_spec_file_or_source(
+            Path::new("multi_hop_triv.lean"),
+            Some(multi_hop_trivial),
+            None,
+        );
         assert_eq!(rep_triv["ok"].as_bool(), Some(false));
         assert_eq!(rep_triv["trivial_specs"].as_u64(), Some(1));
         assert_eq!(rep_triv["tight_specs"].as_u64(), Some(0));
@@ -6053,10 +6649,42 @@ theorem sneaky_trivial (x : Nat) : c3 x := by rfl
         let existential_mask = "\
 theorem fake_existential_spec (x : Nat) : ∃ y, x + 1 = y := ⟨x + 1, rfl⟩
 ";
-        let rep_ex = audit_spec_file_or_source(Path::new("ex_mask.lean"), Some(existential_mask), None);
+        let rep_ex =
+            audit_spec_file_or_source(Path::new("ex_mask.lean"), Some(existential_mask), None);
         assert_eq!(rep_ex["ok"].as_bool(), Some(false));
         assert_eq!(rep_ex["trivial_specs"].as_u64(), Some(1));
         assert_eq!(rep_ex["tight_specs"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn test_audit_relational_shape_rejects_unrelated_and_constrained_calls() {
+        let policy = AuditSpecPolicyConfig::from_preset("default");
+        for (name, source, accepted) in [
+            ("separate", "def ignore (_x : Nat) : Nat := 0\ntheorem separate (a b : Nat) : ignore a ≤ a ∧ ignore b ≤ b := by simp [ignore]", false),
+            ("standalone", "def ignore (_x : Nat) : Nat := 0\ntheorem standalone (a b : Nat) : ignore a = ignore b := by rfl", true),
+            ("constrained", "def ignore (_x : Nat) : Nat := 0\ntheorem constrained (a b : Nat) (h : a = b) : ignore a = ignore b := by rfl", false),
+            ("wrap_hyp", "def wrap (x : Nat) : Nat := x + 1\ntheorem wrap_hyp (a b : Nat) (h : a = b) : wrap a = wrap b ∧ a ≤ b := by simp [h]", false),
+            ("padding", "def ignore (_x : Nat) : Nat := 0\ntheorem padding (a b : Nat) : ignore a = ignore b ∧ a = a := by simp [ignore]", false),
+            ("wrong_arg", "def ignore (_x y : Nat) : Nat := y + 1\ntheorem wrong_arg (a b : Nat) : ignore a a = ignore b b := by sorry", false),
+            ("paren", "def ignore (_x y : Nat) : Nat := y + 1\ntheorem paren (a b c : Nat) : ignore (a) (c + 1) = ignore (b) (c + 1) := by rfl", true),
+        ] {
+            let report = audit_spec_file_or_source_with_policy(Path::new("/tmp/relational.lean"), Some(source), None, &policy);
+            assert_eq!(report["ok"].as_bool(), Some(accepted), "{name}: {report}");
+        }
+    }
+
+    #[test]
+    fn test_audit_inferred_types_do_not_hide_unused_value_parameters() {
+        let policy = AuditSpecPolicyConfig::from_preset("default");
+        for (source, accepted) in [
+            ("def wrap {T : Type} (f : T → Nat) (x : T) : Nat := f x + 1\ntheorem generic {T : Type} (f : T → Nat) (x : T) : wrap f x > 0 := by simp [wrap]", true),
+            ("def stub {T : Type} (f : T → Nat) (_x : T) : Nat := 0\ntheorem value_stub {T : Type} (f : T → Nat) (x : T) : stub f x = 0 := by rfl", false),
+            ("def stub {_x : Nat} (y : Nat) : Nat := y + 1\ntheorem implicit_value (a b : Nat) : @stub a b > 0 := by simp [stub]", false),
+            ("def stub {_Ghost : Type} (x : Nat) : Nat := x + 1\ntheorem ghost : @stub Nat 0 > 0 := by simp [stub]", false),
+        ] {
+            let report = audit_spec_file_or_source_with_policy(Path::new("/tmp/generic.lean"), Some(source), None, &policy);
+            assert_eq!(report["ok"].as_bool(), Some(accepted), "{report}");
+        }
     }
 
     #[test]
@@ -6357,5 +6985,87 @@ theorem zero_signed_not_unsigned (x : Nat) (h : Nat.zeroSigned x < 0) : x = 0 :=
             &strict_policy,
         );
         assert_eq!(rep_zs["vacuous_specs"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn test_audit_spec_cache_invalidates_on_sibling_grandparent_and_allow_names() {
+        let pid = std::process::id();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_audit_cache_inv_{}_{}", pid, nonce));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let pkg_dir = tmp_dir.join("lean/Pkg");
+        let proofs_dir = pkg_dir.join("Proofs");
+        let allowed_dir = tmp_dir.join("Allowed");
+        let denied_dir = tmp_dir.join("Denied");
+        fs::create_dir_all(&proofs_dir).unwrap();
+        fs::create_dir_all(&allowed_dir).unwrap();
+        fs::create_dir_all(&denied_dir).unwrap();
+
+        let gp_file = pkg_dir.join("Defs.lean");
+        let sib_file = proofs_dir.join("Helper.lean");
+        let target_file = proofs_dir.join("Soundness.lean");
+        fs::write(&gp_file, "def gpPred (x : Nat) : Prop := x > 0\n").unwrap();
+        fs::write(&sib_file, "def sibCheck (a b : Nat) : Prop := a < b\n").unwrap();
+        fs::write(
+            &target_file,
+            format!(
+                "-- nonce_{}_{}\ntheorem sound_thm (a b : Nat) (ha : gpPred a) (hab : a < b) : sibCheck a b := hab\n",
+                pid, nonce
+            ),
+        )
+        .unwrap();
+
+        let rep_clean = audit_spec_file_or_source(&target_file, None, None);
+        assert_eq!(rep_clean["ok"].as_bool(), Some(true));
+        assert_eq!(rep_clean["cache_hit"].as_bool(), Some(false));
+
+        let rep_hit = audit_spec_file_or_source(&target_file, None, None);
+        assert_eq!(rep_hit["ok"].as_bool(), Some(true));
+        assert_eq!(rep_hit["cache_hit"].as_bool(), Some(true));
+
+        fs::write(&gp_file, "def gpPred (x : Nat) : Prop := x < 0\n").unwrap();
+        fs::write(&sib_file, "def sibCheck (_a _b : Nat) : Prop := True\n").unwrap();
+
+        let rep_mut = audit_spec_file_or_source(&target_file, None, None);
+        assert_eq!(rep_mut["cache_hit"].as_bool(), Some(false));
+        assert_eq!(rep_mut["ok"].as_bool(), Some(false));
+        assert!(rep_mut["vacuous_specs"].as_u64().unwrap_or(0) >= 1);
+        assert!(!rep_mut["stub_defs"].as_array().unwrap().is_empty());
+
+        let policy_toml = "\
+[audit-spec]
+policy = \"strict-proofs\"
+forbid_decl_kinds = [\"inductive\"]
+
+[audit-spec.path_rules.\"**Allowed**\"]
+allow_decl_names = [\"ShadowAst\"]
+";
+        let pol = AuditSpecPolicyConfig::parse_config_str(policy_toml).unwrap();
+        let src_ind = format!(
+            "-- nonce_ind_{}_{}\ninductive ShadowAst where\n  | leaf (x : Nat)\ntheorem ok_thm (a b : UInt64) : a + b = b + a := by omega\n",
+            pid, nonce
+        );
+        let allowed_file = allowed_dir.join("A.lean");
+        let denied_file = denied_dir.join("A.lean");
+        fs::write(&allowed_file, &src_ind).unwrap();
+        fs::write(&denied_file, &src_ind).unwrap();
+
+        let rep_allowed = audit_spec_file_or_source_with_policy(&allowed_file, None, None, &pol);
+        assert_eq!(rep_allowed["ok"].as_bool(), Some(true));
+        let rep_denied = audit_spec_file_or_source_with_policy(&denied_file, None, None, &pol);
+        assert_eq!(rep_denied["cache_hit"].as_bool(), Some(false));
+        assert_eq!(rep_denied["ok"].as_bool(), Some(false));
+        assert_eq!(
+            rep_denied["forbidden_scope_decls"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 }

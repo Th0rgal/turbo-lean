@@ -96,10 +96,8 @@ def normSymBinOpStep (op : BinOp) (lhs rhs : SymExpr) : SymExpr :=
   | .clmul64, .constU64 a, .constU64 b => .constU64 (clmul64 a b)
   | .clmul64Hi, .constU64 a, .constU64 b => .constU64 (clmul64Hi a b)
   | .gf2Affine, .constU64 a, .constU64 b => .constU64 (gf2Affine a b) | .eor3, .constU64 a, .constU64 b => .constU64 (eor3 a b)
-  | .div, .constU64 a, .constU64 b =>
-    if b == 0 then .binOp .div l r else .constU64 (a / b)
-  | .mod, .constU64 a, .constU64 b =>
-    if b == 0 then .binOp .mod l r else .constU64 (a % b)
+  | .div, .constU64 a, .constU64 b => .constU64 (a / b)
+  | .mod, .constU64 a, .constU64 b => .constU64 (a % b)
   | .bitAnd, .constU64 a, .constU64 b => .constU64 (a &&& b)
   | .bitOr,  .constU64 a, .constU64 b => .constU64 (a ||| b)
   | .bitXor, .constU64 a, .constU64 b => .constU64 (a ^^^ b)
@@ -126,12 +124,14 @@ def normSymBinOpStep (op : BinOp) (lhs rhs : SymExpr) : SymExpr :=
     | some k => .binOp .shl x (.constU64 k)
     | none => .binOp .mul (.constU64 c) x
 
-  -- Division & modulo strength reduction (/ 2^k -> >>> k, % 2^k -> &&& (2^k - 1))
+  -- Division & modulo identities & strength reduction (/ 2^k -> >>> k, % 2^k -> &&& (2^k - 1))
+  | .div, _, .constU64 0 => .constU64 0
   | .div, x, .constU64 1 => x
   | .div, x, .constU64 c =>
     match pow2ShiftLog2 c with
     | some k => .binOp .shr x (.constU64 k)
     | none => .binOp .div x (.constU64 c)
+  | .mod, x, .constU64 0 => x
   | .mod, _, .constU64 1 => .constU64 0
   | .mod, x, .constU64 c =>
     match pow2ShiftLog2 c with
@@ -261,14 +261,9 @@ def symEvalScalar (st : SymExecState) : ScalarExpr → SymStateVal
   | .binOp op lhs rhs =>
     let sl := symEvalScalar st lhs
     let sr := symEvalScalar st rhs
-    let divZero :=
-      match op, sr.expr with
-      | .div, .constU64 0 => true
-      | .mod, .constU64 0 => true
-      | _, _ => false
     { expr := normSymBinOpStep op sl.expr sr.expr
       nonPoison := sl.nonPoison && sr.nonPoison
-      noUB := sl.noUB && sr.noUB && !divZero }
+      noUB := sl.noUB && sr.noUB }
   | .unaryOp op arg =>
     let sa := symEvalScalar st arg
     { expr := normSymUnaryOpStep op sa.expr
@@ -298,6 +293,11 @@ def symEvalScalar (st : SymExecState) : ScalarExpr → SymStateVal
     { expr := addExpr
       nonPoison := sa.nonPoison && sb.nonPoison && sc.nonPoison
       noUB := sa.noUB && sb.noUB && sc.noUB }
+
+def callSlotKind : LNIRType → Option Bool
+  | .objPtr | .taggedPtr | .sarray _ | .rawPtr _ | .storageMap => some true
+  | .u256 | .i256 | .tuple _ => none
+  | _ => some false
 
 /-- Symbolically evaluate an `LNIRExpr` and update `SymExecState`. -/
 def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState :=
@@ -383,9 +383,21 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
     st3.bindVar dst { expr := .symVar root, nonPoison := idxSv.nonPoison && valSv.nonPoison, noUB := idxSv.noUB && valSv.noUB }
   | .boxScalar valVar _ | .unboxScalar valVar _ =>
     st.bindVar dst (st.lookupVar valVar)
-  | .call _ args _ _ =>
-    let svs := args.map st.lookupVar
-    st.bindVar dst { expr := .symVar dst, nonPoison := svs.all (·.nonPoison), noUB := svs.all (·.noUB) }
+  | .call fnName args retTy isExt =>
+    let ptrRet := callSlotKind retTy == some true
+    let i64Ret := callSlotKind retTy == some false
+    match isExt, args with
+    | false, [a] =>
+      if (fnName == "lean_native_box_u64" && ptrRet) || (fnName == "lean_native_unbox_u64" && i64Ret) then
+        st.bindVar dst (st.lookupVar a)
+      else if fnName == "lean_native_ensure_exclusive" && ptrRet then
+        let root := st.resolveBuf a
+        ((st.markExclusive root).aliasBuf dst root).bindVar dst (st.lookupVar a)
+      else if fnName == "lean_native_sarray_len" && i64Ret then
+        let sa := st.lookupVar a
+        st.bindVar dst { expr := .symVar (9000 + st.resolveBuf a), nonPoison := sa.nonPoison, noUB := sa.noUB }
+      else st.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+    | _, _ => st.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
 
 /-- Summary produced by symbolic execution of an `LNIRDecl`. -/
 structure SymExecSummary where
@@ -512,22 +524,51 @@ def mkSampleParamVal (seed : UInt64) (paramIdx : Nat) (ty : LNIRType) (st : Heap
   let smallU64 : UInt64 := (r % 8) + 1
   match ty with
   | .i1 => (.bool (r % 2 == 1), st)
+  | .i8 =>
+    let v : UInt64 :=
+      match paramIdx + (r % 5).toNat with
+      | 0 => 0 | 1 => 255 | _ => r &&& 0xFF
+    (.u64 v, st)
+  | .i16 =>
+    let v : UInt64 :=
+      match paramIdx + (r % 5).toNat with
+      | 0 => 0 | 1 => 65535 | _ => r &&& 0xFFFF
+    (.u64 v, st)
+  | .i32 =>
+    let v : UInt64 :=
+      match paramIdx + (r % 5).toNat with
+      | 0 => 0 | 1 => 0xFFFFFFFF | _ => r &&& 0xFFFFFFFF
+    (.u64 v, st)
   | .u256 | .i256 =>
     let (r1, _) := splitMix64Next (r + 1)
     let (r2, _) := splitMix64Next (r + 2)
     let (r3, _) := splitMix64Next (r + 3)
     let w256 : UInt256 :=
       match r % 8 with
-      | 0 => UInt256.ofUInt64 smallU64
-      | 1 => ⟨0xffffffffffffffff, 0, 0, 0⟩
-      | 2 => ⟨0xffffffffffffffff, 0xffffffffffffffff, 0, 0⟩
-      | 3 => ⟨0, 0, 0, 0x8000000000000000⟩
-      | 4 => UInt256.max
+      | 0 => UInt256.zero
+      | 1 => UInt256.ofUInt64 smallU64
+      | 2 => ⟨0xffffffffffffffff, 0, 0, 0⟩
+      | 3 => ⟨0xffffffffffffffff, 0xffffffffffffffff, 0, 0⟩
+      | 4 => ⟨0, 0, 0, 0x8000000000000000⟩
+      | 5 => UInt256.max
       | _ => ⟨r, r1, r2, r3 &&& 0x7fffffffffffffff⟩
     (.u256 w256, st)
   | .storageMap =>
     let mapId := st.nextId + 1
-    let mapBuf : StorageMapBuffer := { id := mapId, entries := [] }
+    let initEntries : List (UInt256 × UInt256) :=
+      if r % 2 == 0 then
+        let seededVal : UInt256 := ⟨0xffffffffffffffff, 0xffffffffffffffff, 0xffffffffffffffff, 0x7fffffffffffffff⟩
+        [ (UInt256.zero, seededVal)
+        , (UInt256.ofUInt64 1, seededVal)
+        , (UInt256.ofUInt64 2, seededVal)
+        , (UInt256.ofUInt64 3, seededVal)
+        , (UInt256.ofUInt64 4, seededVal)
+        , (UInt256.ofUInt64 5, seededVal)
+        , (UInt256.ofUInt64 6, seededVal)
+        , (UInt256.ofUInt64 7, seededVal)
+        , (UInt256.ofUInt64 8, seededVal) ]
+      else []
+    let mapBuf : StorageMapBuffer := { id := mapId, entries := initEntries }
     (.storageMapId mapId, { st with nextId := mapId, storageMaps := mapBuf :: st.storageMaps })
   | .sarray _ =>
     let bufId := st.nextId + 1
@@ -573,9 +614,11 @@ def checkConcreteSamples (fuel : Nat) (samples : List (VarEnv × HeapState)) (sr
 def checkDeclConcreteRefinement (src tgt : LNIRDecl) (numSamples : Nat := 64) (fuel : Nat := 128) :
     Bool × Nat :=
   let samples := (List.range numSamples).map (buildDeclSample src)
-  let passedCount := samples.foldl (fun acc (env, st) =>
-    if checkSingleSample fuel env st src.body tgt.body then acc + 1 else acc) 0
-  (passedCount == numSamples, passedCount)
+  let (passedCount, nonVacuousCount) := samples.foldl (fun (acc, okSrc) (env, st) =>
+    let srcOk := match evalCode fuel env st src.body with | .ok _ => true | .error _ => false
+    let stepOk := checkSingleSample fuel env st src.body tgt.body
+    (if stepOk then acc + 1 else acc, if srcOk && stepOk then okSrc + 1 else okSrc)) (0, 0)
+  (passedCount == numSamples && (numSamples == 0 || nonVacuousCount > 0), nonVacuousCount)
 
 /-! ## Alive2 6-Part Translation Validation Result & Module Report -/
 
@@ -619,7 +662,7 @@ def validateTranslationDecl (src tgt : LNIRDecl) (numSamples : Nat := 64) : TVDe
   let poisonRefines := !sSrc.nonPoison || sTgt.nonPoison
   -- 4. Symbolic return expression equivalence (after canonical normalization)
   let symRetEquiv := normSymExpr sSrc.retVal == normSymExpr sTgt.retVal
-  -- 5. Multi-point concrete refinement across 64 deterministic input states
+  -- 5. Multi-point concrete refinement across 64 deterministic input states (fail closed when all samples are UB)
   let (concreteOk, passedSamples) := checkDeclConcreteRefinement src tgt numSamples 128
   -- 6. Memory / buffer write log equivalence
   let memWritesEquiv := sSrc.memWrites == sTgt.memWrites
@@ -726,6 +769,20 @@ namespace SymbolicTV
   abbrev sound_of_checkSingleSample_eq_true := @LeanNative.Proofs.sound_of_checkSingleSample_eq_true
   abbrev symbolicTV_refl_sound := @LeanNative.Proofs.symbolicTV_refl_sound
 end SymbolicTV
+
+#guard (symEvalExpr {} 9 (.call "lean_native_box_u64" [1] .objPtr)).noUB
+#guard !(symEvalExpr {} 9 (.call "lean_native_box_u64" [1] .i64)).noUB
+#guard !(symEvalExpr {} 9 (.call "lean_native_box_u64" [1, 2] .objPtr)).noUB
+#guard !(symEvalExpr {} 9 (.call "lean_native_unbox_u64" [] .i64)).noUB
+#guard !(symEvalExpr {} 9 (.call "lean_native_unbox_u64" [1] .u256)).noUB
+#guard !(symEvalExpr {} 9 (.call "lean_native_ensure_exclusive" [1] .i64)).noUB
+#guard !(symEvalExpr {} 9 (.call "lean_native_sarray_len" [1] .objPtr)).noUB
+#guard !(symEvalExpr {} 9 (.call "lean_native_sarray_len" [1] .i64 true)).noUB
+#guard !(symEvalExpr {} 9 (.call "lean_native_unknown" [1] .i64)).noUB
+#guard (symEvalExpr {} 9 (.call "lean_native_unbox_u64" [1] .i64)).lookupVar 9 == (({} : SymExecState).lookupVar 1)
+#guard ((symEvalExpr {} 9 (.call "lean_native_ensure_exclusive" [1] (.sarray .i64))).isBufExclusive 9)
+#guard (symEvalExpr {} 9 (.call "lean_native_sarray_len" [1] .i64)).lookupVar 9 ==
+  (symEvalExpr {} 9 (.sarrayLen 1)).lookupVar 9
 
 /-! ## JSON & Human-Readable Formatting for `TVModuleReport` -/
 

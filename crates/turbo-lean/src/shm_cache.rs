@@ -25,6 +25,359 @@ pub fn debug_log_cache_err(context: &str, err: &dyn std::fmt::Display) {
     }
 }
 
+/// Resolve the per-user RAM staging directory (`/dev/shm/turbo-lean-staging-<uid>`, falling back
+/// to `$TMPDIR/turbo-lean-staging-<uid>`), honoring `TURBO_LEAN_STAGING_DIR` when set.
+pub fn staging_shm_dir() -> PathBuf {
+    if let Ok(override_dir) = std::env::var("TURBO_LEAN_STAGING_DIR") {
+        let t = override_dir.trim();
+        if !t.is_empty() {
+            return PathBuf::from(t);
+        }
+    }
+    #[cfg(unix)]
+    let uid = unsafe { libc::geteuid() };
+    #[cfg(not(unix))]
+    let uid = 0u32;
+    let base = if Path::new("/dev/shm").is_dir() {
+        PathBuf::from("/dev/shm")
+    } else {
+        std::env::temp_dir()
+    };
+    base.join(format!("turbo-lean-staging-{}", uid))
+}
+
+/// RAII advisory `flock` guard that releases `LOCK_UN` on drop.
+pub struct FlockGuard(pub fs::File);
+
+impl Drop for FlockGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            use std::os::unix::io::AsRawFd;
+            let _ = libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+/// Acquire an advisory `flock` (`exclusive` => `LOCK_EX`, else `LOCK_SH`; `nonblocking` => `| LOCK_NB`).
+/// Returns `Ok(None)` when `nonblocking` is true and another holder currently owns a conflicting lock.
+pub fn acquire_flock(lock_path: &Path, exclusive: bool, nonblocking: bool) -> std::io::Result<Option<FlockGuard>> {
+    if let Some(parent) = lock_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let f = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let mut op = if exclusive { libc::LOCK_EX } else { libc::LOCK_SH };
+        if nonblocking {
+            op |= libc::LOCK_NB;
+        }
+        if unsafe { libc::flock(f.as_raw_fd(), op) } != 0 {
+            if nonblocking {
+                return Ok(None);
+            }
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (exclusive, nonblocking);
+    Ok(Some(FlockGuard(f)))
+}
+
+/// Execute `f` while holding an advisory `flock` (`LOCK_EX` or `LOCK_EX | LOCK_NB`) on `lock_path`.
+/// Returns `None` only when `nonblocking` is true and the lock is currently held by another process.
+pub fn with_shm_flock<F, R>(lock_path: &Path, nonblocking: bool, f: F) -> Option<R>
+where
+    F: FnOnce() -> R,
+{
+    let _guard = match acquire_flock(lock_path, true, nonblocking) {
+        Ok(Some(g)) => Some(g),
+        Ok(None) => return None,
+        Err(_) => None,
+    };
+    Some(f())
+}
+
+/// Atomically load, mutate, and persist a JSON state file guarded by `lock_path` + `atomic_write_shm`.
+pub fn update_locked_shm_json<T, F, R>(json_path: &Path, lock_path: &Path, pretty: bool, f: F) -> R
+where
+    T: serde::de::DeserializeOwned + serde::Serialize + Default,
+    F: FnOnce(&mut T) -> R,
+{
+    with_shm_flock(lock_path, false, || {
+        let mut state: T = fs::read(json_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        let out = f(&mut state);
+        let encoded = if pretty {
+            serde_json::to_vec_pretty(&state)
+        } else {
+            serde_json::to_vec(&state)
+        };
+        if let Ok(bytes) = encoded {
+            let _ = atomic_write_shm(json_path, &bytes);
+        }
+        out
+    })
+    .expect("blocking with_shm_flock always returns Some")
+}
+
+/// Strip `# ...` comments from a TOML line while respecting single- and double-quoted literals.
+pub fn strip_toml_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let (mut in_double, mut in_single, mut i) = (false, false, 0);
+    while i < bytes.len() {
+        if in_double {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == b'"' {
+                in_double = false;
+            }
+        } else if in_single {
+            if bytes[i] == b'\'' {
+                in_single = false;
+            }
+        } else if bytes[i] == b'"' {
+            in_double = true;
+        } else if bytes[i] == b'\'' {
+            in_single = true;
+        } else if bytes[i] == b'#' {
+            return &line[..i];
+        }
+        i += 1;
+    }
+    line
+}
+
+/// Unquote a TOML/JSON scalar (`"..."` or `'...'`), falling back to trimmed text.
+pub fn unquote_toml_scalar(s: &str) -> String {
+    let t = s.trim();
+    if (t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\'')) {
+        t[1..t.len().saturating_sub(1)].to_string()
+    } else {
+        t.to_string()
+    }
+}
+
+/// Parse a boolean-like scalar (`1`/`true`/`yes`/`on` vs `0`/`off`/`false`/`no`/`none`/`disable`/`disabled`).
+pub fn parse_relaxed_bool(s: &str) -> Option<bool> {
+    match unquote_toml_scalar(s).to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "off" | "false" | "no" | "none" | "disable" | "disabled" => Some(false),
+        _ => None,
+    }
+}
+
+/// Parse a relaxed TOML/JSON string array (`["a", "b"]`).
+pub fn parse_relaxed_toml_string_array(s: &str) -> Vec<String> {
+    let t = s.trim();
+    if let Ok(v) = serde_json::from_str::<Vec<String>>(t) {
+        return v;
+    }
+    t.strip_prefix('[')
+        .and_then(|x| x.strip_suffix(']'))
+        .unwrap_or(t)
+        .split(',')
+        .map(unquote_toml_scalar)
+        .filter(|x| !x.is_empty())
+        .collect()
+}
+
+/// Visit `(section_header, key, raw_value)` entries across a relaxed TOML document, joining
+/// multi-line `[...]` array assignments and stripping `#` comments outside quotes.
+pub fn for_each_toml_entry<F>(text: &str, mut visit: F)
+where
+    F: FnMut(&str, &str, &str),
+{
+    let mut joined: Vec<String> = Vec::new();
+    let mut pending: Option<String> = None;
+    for raw_line in text.lines() {
+        let clean = strip_toml_comment(raw_line).trim();
+        if clean.is_empty() {
+            continue;
+        }
+        if let Some(mut acc) = pending.take() {
+            acc.push(' ');
+            acc.push_str(clean);
+            if clean.ends_with(']') {
+                joined.push(acc);
+            } else {
+                pending = Some(acc);
+            }
+        } else if clean.contains('=') && clean.contains('[') && !clean.ends_with(']') {
+            pending = Some(clean.to_string());
+        } else {
+            joined.push(clean.to_string());
+        }
+    }
+    if let Some(acc) = pending {
+        joined.push(acc);
+    }
+    let mut section = String::new();
+    for line in joined {
+        let l = line.trim();
+        if l.starts_with('[') && l.ends_with(']') {
+            section = l.to_string();
+            visit(&section, "", "");
+        } else if let Some((k, v)) = l.split_once('=') {
+            visit(&section, k.trim(), v.trim());
+        }
+    }
+}
+
+/// Upsert `[section_name]` in a TOML document with `kv_lines`, preserving all unrelated sections/comments.
+pub fn upsert_toml_section(existing: &str, section_name: &str, kv_lines: &[(&str, String)]) -> String {
+    let header = format!("[{}]", section_name);
+    let (mut out, mut in_sec, mut replaced) = (Vec::new(), false, false);
+    let emit = |dst: &mut Vec<String>| {
+        dst.push(header.clone());
+        for (k, v) in kv_lines {
+            dst.push(format!("{} = {}", k, v));
+        }
+    };
+    for raw_line in existing.lines() {
+        let stripped = strip_toml_comment(raw_line).trim();
+        if stripped.starts_with('[') && stripped.ends_with(']') {
+            in_sec = false;
+            if stripped == header {
+                if !replaced {
+                    emit(&mut out);
+                    replaced = true;
+                }
+                in_sec = true;
+                continue;
+            }
+        }
+        if !in_sec {
+            out.push(raw_line.to_string());
+        }
+    }
+    if !replaced {
+        if out.last().map(|s| !s.is_empty()).unwrap_or(false) {
+            out.push(String::new());
+        }
+        emit(&mut out);
+    }
+    let mut res = out.join("\n");
+    if !res.ends_with('\n') {
+        res.push('\n');
+    }
+    res
+}
+
+/// Resolve the user-level `turbo-lean` TOML config path (`TURBO_LEAN_USER_CONFIG`, `XDG_CONFIG_HOME`, or `~/.config/turbo-lean/config.toml`).
+pub fn user_config_toml_path() -> PathBuf {
+    for (k, suffix) in [
+        ("TURBO_LEAN_USER_CONFIG", ""),
+        ("XDG_CONFIG_HOME", "turbo-lean/config.toml"),
+    ] {
+        if let Ok(v) = std::env::var(k) {
+            let t = v.trim();
+            if !t.is_empty() {
+                let p = PathBuf::from(t);
+                return if suffix.is_empty() { p } else { p.join(suffix) };
+            }
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home).join(".config/turbo-lean/config.toml")
+}
+
+/// Locate the nearest `turbo-lean.toml` or `.turbo-lean.toml` walking upward from `start_dir` (or CWD).
+pub fn find_nearest_project_toml(start_dir: Option<&Path>) -> Option<PathBuf> {
+    let dir = start_dir
+        .map(|p| {
+            if p.is_dir() {
+                p.to_path_buf()
+            } else {
+                p.parent().unwrap_or_else(|| Path::new(".")).to_path_buf()
+            }
+        })
+        .or_else(|| std::env::current_dir().ok())?;
+    let canon = dir.canonicalize().unwrap_or(dir);
+    for anc in canon.ancestors() {
+        for name in ["turbo-lean.toml", ".turbo-lean.toml"] {
+            let cand = anc.join(name);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+/// Shared config loader checking an explicit path override, an inline-or-path env var, and
+/// ancestor/project relative files (`turbo-lean.toml`, `.turbo-lean.toml`, etc.).
+pub fn load_project_or_env_config<T, F>(
+    explicit_path: Option<&Path>,
+    env_key: &str,
+    start_dir: Option<&Path>,
+    extra_project_rels: &[&str],
+    walk_ancestors: bool,
+    parse: F,
+) -> Option<T>
+where
+    F: Fn(&str) -> Option<T>,
+{
+    if let Some(p) = explicit_path {
+        if let Ok(txt) = fs::read_to_string(p) {
+            if let Some(cfg) = parse(&txt) {
+                return Some(cfg);
+            }
+        }
+    }
+    if let Ok(ev) = std::env::var(env_key) {
+        let t = ev.trim();
+        if !t.is_empty() {
+            if let Some(cfg) =
+                parse(t).or_else(|| fs::read_to_string(t).ok().and_then(|s| parse(&s)))
+            {
+                return Some(cfg);
+            }
+        }
+    }
+    let dir = start_dir.map(|p| {
+        if p.is_dir() {
+            p.to_path_buf()
+        } else {
+            p.parent().unwrap_or_else(|| Path::new(".")).to_path_buf()
+        }
+    })?;
+    for rel in extra_project_rels {
+        if let Some(cfg) = fs::read_to_string(dir.join(rel))
+            .ok()
+            .and_then(|s| parse(&s))
+        {
+            return Some(cfg);
+        }
+    }
+    if walk_ancestors {
+        let canon = dir.canonicalize().unwrap_or(dir);
+        for anc in canon.ancestors() {
+            for rel in ["turbo-lean.toml", ".turbo-lean.toml"] {
+                if let Some(cfg) = fs::read_to_string(anc.join(rel))
+                    .ok()
+                    .and_then(|s| parse(&s))
+                {
+                    return Some(cfg);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Resolve the configured maximum `/dev/shm` cache size in bytes from `TURBO_LEAN_MAX_SHM_MB`
 /// (defaults to `512` MiB).
 pub fn default_max_shm_bytes() -> u64 {
@@ -36,9 +389,7 @@ pub fn default_max_shm_bytes() -> u64 {
         .saturating_mul(1024 * 1024)
 }
 
-/// Atomically write `bytes` to `target` by staging into a process+sequence-unique temporary file
-/// in `target.parent()` and invoking `fs::rename` over `target`.
-pub fn atomic_write_shm(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn stage_unique_tmp_path(target: &Path) -> std::io::Result<PathBuf> {
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
     if !parent.as_os_str().is_empty() && !parent.exists() {
         fs::create_dir_all(parent)?;
@@ -52,45 +403,80 @@ pub fn atomic_write_shm(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let tmp_path = parent.join(format!(
+    Ok(parent.join(format!(
         ".{}.{}.{}.{}.tmp",
         file_name,
         std::process::id(),
         seq,
         nanos
-    ));
+    )))
+}
 
-    let write_res = (|| -> std::io::Result<()> {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)?;
-        f.write_all(bytes)?;
-        Ok(())
-    })();
-
+/// Atomically write `bytes` to `target` by staging into a process+sequence-unique temporary file
+/// in `target.parent()` and invoking `fs::rename` over `target`.
+pub fn atomic_write_shm(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp_path = stage_unique_tmp_path(target)?;
+    let write_res = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp_path)
+        .and_then(|mut f| f.write_all(bytes));
     if let Err(e) = write_res {
         let _ = fs::remove_file(&tmp_path);
         debug_log_cache_err("atomic_write_shm(write)", &e);
         return Err(e);
     }
-
     if let Err(e) = fs::rename(&tmp_path, target) {
         let _ = fs::remove_file(&tmp_path);
         debug_log_cache_err("atomic_write_shm(rename)", &e);
         return Err(e);
     }
-
     Ok(())
 }
 
+fn scan_evictable_shm_files(
+    shm_dir: &Path,
+    reap_stale_locks: bool,
+) -> (u64, Vec<(SystemTime, PathBuf, u64)>) {
+    let mut files = Vec::new();
+    let mut total_size = 0u64;
+    for entry in walkdir::WalkDir::new(shm_dir).into_iter().flatten() {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("lock") {
+            if reap_stale_locks
+                && entry
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|m| SystemTime::now().duration_since(m).ok())
+                    .is_some_and(|d| d.as_secs() > 600)
+            {
+                let _ = fs::remove_file(path);
+            }
+            continue;
+        }
+        let fname = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+        if (fname.starts_with('.') && fname.ends_with(".tmp"))
+            || fname == "zygote_daemon.json"
+            || fname == "zygote_lru_registry.json"
+            || path.to_string_lossy().contains("zygote_daemon_cas_")
+        {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            let sz = meta.len();
+            total_size = total_size.saturating_add(sz);
+            files.push((meta.modified().unwrap_or(UNIX_EPOCH), path.to_path_buf(), sz));
+        }
+    }
+    (total_size, files)
+}
+
 /// Enforce an upper bound on total regular file bytes inside `shm_dir`.
-///
-/// If `max_bytes == 0`, uses [`default_max_shm_bytes`] (`TURBO_LEAN_MAX_SHM_MB`, default `512` MiB).
-/// When `total_size > max_bytes`, regular cache files (excluding active `.lock` files) are sorted
-/// by modification time ascending (oldest first) and removed until `total_size <= max_bytes * 8 / 10`.
-/// Returns `(evicted_files, freed_bytes)`.
 pub fn enforce_shm_quota_lru(shm_dir: &Path, max_bytes: u64) -> std::io::Result<(usize, u64)> {
     if !shm_dir.exists() {
         return Ok((0, 0));
@@ -100,58 +486,14 @@ pub fn enforce_shm_quota_lru(shm_dir: &Path, max_bytes: u64) -> std::io::Result<
     } else {
         max_bytes
     };
-
-    let mut files: Vec<(SystemTime, PathBuf, u64)> = Vec::new();
-    let mut total_size: u64 = 0;
-
-    for entry in walkdir::WalkDir::new(shm_dir).into_iter().flatten() {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) == Some("lock") {
-            if let Ok(meta) = entry.metadata() {
-                if meta
-                    .modified()
-                    .ok()
-                    .and_then(|m| SystemTime::now().duration_since(m).ok())
-                    .map(|d| d.as_secs() > 600)
-                    .unwrap_or(false)
-                {
-                    let _ = fs::remove_file(path);
-                }
-            }
-            continue;
-        }
-        let fname_lossy = path
-            .file_name()
-            .map(|n| n.to_string_lossy())
-            .unwrap_or_default();
-        if fname_lossy == "zygote_daemon.json"
-            || fname_lossy == "zygote_lru_registry.json"
-            || path.to_string_lossy().contains("zygote_daemon_cas_")
-        {
-            continue;
-        }
-        if let Ok(meta) = entry.metadata() {
-            let sz = meta.len();
-            let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
-            total_size = total_size.saturating_add(sz);
-            files.push((mtime, path.to_path_buf(), sz));
-        }
-    }
-
+    let (mut total_size, mut files) = scan_evictable_shm_files(shm_dir, true);
     if total_size <= effective_max {
         return Ok((0, 0));
     }
-
     let target_bytes = effective_max.saturating_mul(8) / 10;
     files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-
-    let mut evicted_files = 0usize;
-    let mut freed_bytes = 0u64;
-
-    for (_mtime, path, sz) in files {
+    let (mut evicted_files, mut freed_bytes) = (0usize, 0u64);
+    for (_, path, sz) in files {
         if total_size <= target_bytes {
             break;
         }
@@ -161,12 +503,9 @@ pub fn enforce_shm_quota_lru(shm_dir: &Path, max_bytes: u64) -> std::io::Result<
                 evicted_files += 1;
                 freed_bytes = freed_bytes.saturating_add(sz);
             }
-            Err(e) => {
-                debug_log_cache_err("enforce_shm_quota_lru(remove_file)", &e);
-            }
+            Err(e) => debug_log_cache_err("enforce_shm_quota_lru(remove_file)", &e),
         }
     }
-
     Ok((evicted_files, freed_bytes))
 }
 
@@ -286,12 +625,7 @@ pub(crate) fn parse_macos_vm_stat_budget_mb(vm_stat_out: &str) -> Option<u64> {
         }
         for key in ["Pages free:", "Pages inactive:", "Pages speculative:"] {
             if let Some(rest) = line.trim().strip_prefix(key) {
-                if let Some(pages) = rest
-                    .trim()
-                    .trim_end_matches('.')
-                    .parse::<u64>()
-                    .ok()
-                {
+                if let Some(pages) = rest.trim().trim_end_matches('.').parse::<u64>().ok() {
                     free_pages = free_pages.saturating_add(pages);
                     found_any = true;
                 }
@@ -342,51 +676,23 @@ fn probe_system_budget_mb() -> u64 {
         return cg;
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(out) = std::process::Command::new("vm_stat").output() {
-            if out.status.success() {
-                let text = String::from_utf8_lossy(&out.stdout);
-                if let Some(budget_mb) = parse_macos_vm_stat_budget_mb(&text) {
-                    return budget_mb;
-                }
-            }
-        }
-        if let Ok(out) = std::process::Command::new("sysctl")
-            .args(["-n", "hw.memsize"])
-            .output()
-        {
-            if out.status.success() {
-                if let Ok(bytes) = String::from_utf8_lossy(&out.stdout).trim().parse::<u64>() {
-                    let total_mb = bytes / (1024 * 1024);
-                    if total_mb > 0 {
-                        return (total_mb.saturating_mul(7) / 10).max(1);
-                    }
-                }
+    if let Ok(out) = std::process::Command::new("vm_stat").output() {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Some(budget_mb) = parse_macos_vm_stat_budget_mb(&text) {
+                return budget_mb;
             }
         }
     }
-
-    #[cfg(not(target_os = "macos"))]
+    if let Ok(out) = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
     {
-        if let Ok(out) = std::process::Command::new("vm_stat").output() {
-            if out.status.success() {
-                let text = String::from_utf8_lossy(&out.stdout);
-                if let Some(budget_mb) = parse_macos_vm_stat_budget_mb(&text) {
-                    return budget_mb;
-                }
-            }
-        }
-        if let Ok(out) = std::process::Command::new("sysctl")
-            .args(["-n", "hw.memsize"])
-            .output()
-        {
-            if out.status.success() {
-                if let Ok(bytes) = String::from_utf8_lossy(&out.stdout).trim().parse::<u64>() {
-                    let total_mb = bytes / (1024 * 1024);
-                    if total_mb > 0 {
-                        return (total_mb.saturating_mul(7) / 10).max(1);
-                    }
+        if out.status.success() {
+            if let Ok(bytes) = String::from_utf8_lossy(&out.stdout).trim().parse::<u64>() {
+                let total_mb = bytes / (1024 * 1024);
+                if total_mb > 0 {
+                    return (total_mb.saturating_mul(7) / 10).max(1);
                 }
             }
         }
@@ -395,13 +701,8 @@ fn probe_system_budget_mb() -> u64 {
     8192
 }
 
-/// Out-of-Core Disk Spill: when `shm_dir` total regular file bytes exceed `max_shm_bytes`,
-/// instead of deleting the oldest `/dev/shm` files and losing warm cache entries, moves
-/// (copies + atomically renames + unlinks from `/dev/shm`) the oldest cache files into
-/// `disk_spill_dir` on disk until `shm_dir` usage is at or below `max_shm_bytes * 8 / 10`
-/// (or `0` when `max_shm_bytes == 0`).
-///
-/// Returns `(spilled_files, spilled_bytes)`.
+/// Out-of-Core Disk Spill: moves oldest `/dev/shm` cache entries into `disk_spill_dir` until
+/// `shm_dir` usage is at or below `max_shm_bytes * 8 / 10` (or `0` when `max_shm_bytes == 0`).
 pub fn spill_shm_to_disk_dir(
     shm_dir: &Path,
     disk_spill_dir: &Path,
@@ -410,51 +711,15 @@ pub fn spill_shm_to_disk_dir(
     if !shm_dir.exists() {
         return Ok((0, 0));
     }
-
-    let mut files: Vec<(SystemTime, PathBuf, u64)> = Vec::new();
-    let mut total_size: u64 = 0;
-
-    for entry in walkdir::WalkDir::new(shm_dir).into_iter().flatten() {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) == Some("lock") {
-            continue;
-        }
-        let fname_lossy = path
-            .file_name()
-            .map(|n| n.to_string_lossy())
-            .unwrap_or_default();
-        if fname_lossy.starts_with('.') && fname_lossy.ends_with(".tmp") {
-            continue;
-        }
-        if fname_lossy == "zygote_daemon.json"
-            || fname_lossy == "zygote_lru_registry.json"
-            || path.to_string_lossy().contains("zygote_daemon_cas_")
-        {
-            continue;
-        }
-        if let Ok(meta) = entry.metadata() {
-            let sz = meta.len();
-            let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
-            total_size = total_size.saturating_add(sz);
-            files.push((mtime, path.to_path_buf(), sz));
-        }
-    }
-
+    let (mut total_size, mut files) = scan_evictable_shm_files(shm_dir, false);
     if total_size <= max_shm_bytes {
         return Ok((0, 0));
     }
-
     fs::create_dir_all(disk_spill_dir)?;
     let target_bytes = max_shm_bytes.saturating_mul(8) / 10;
     files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-
-    let mut spilled_files = 0usize;
-    let mut spilled_bytes = 0u64;
-
-    for (_mtime, path, sz) in files {
+    let (mut spilled_files, mut spilled_bytes) = (0usize, 0u64);
+    for (_, path, sz) in files {
         if max_shm_bytes > 0 && total_size <= target_bytes {
             break;
         }
@@ -462,26 +727,10 @@ pub fn spill_shm_to_disk_dir(
             continue;
         };
         let dest_path = disk_spill_dir.join(file_name);
-        let seq = SHM_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let tmp_dest = disk_spill_dir.join(format!(
-            ".{}.{}.{}.{}.tmp",
-            file_name.to_string_lossy(),
-            std::process::id(),
-            seq,
-            nanos
-        ));
-
-        let move_res = (|| -> std::io::Result<()> {
-            fs::copy(&path, &tmp_dest)?;
-            fs::rename(&tmp_dest, &dest_path)?;
-            fs::remove_file(&path)?;
-            Ok(())
-        })();
-
+        let tmp_dest = stage_unique_tmp_path(&dest_path)?;
+        let move_res = fs::copy(&path, &tmp_dest)
+            .and_then(|_| fs::rename(&tmp_dest, &dest_path))
+            .and_then(|_| fs::remove_file(&path));
         match move_res {
             Ok(()) => {
                 total_size = total_size.saturating_sub(sz);
@@ -494,7 +743,6 @@ pub fn spill_shm_to_disk_dir(
             }
         }
     }
-
     Ok((spilled_files, spilled_bytes))
 }
 
@@ -517,10 +765,8 @@ mod tests {
 
     #[test]
     fn test_atomic_write_shm_creates_and_overwrites_cleanly() -> std::io::Result<()> {
-        let dir = std::env::temp_dir().join(format!(
-            "turbo_lean_shm_atomic_test_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("turbo_lean_shm_atomic_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let target = dir.join("nested").join("entry_v1.json");
 
@@ -543,10 +789,8 @@ mod tests {
 
     #[test]
     fn test_enforce_shm_quota_lru_evicts_oldest_first() -> std::io::Result<()> {
-        let dir = std::env::temp_dir().join(format!(
-            "turbo_lean_shm_lru_test_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("turbo_lean_shm_lru_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir)?;
 
@@ -569,7 +813,10 @@ mod tests {
         assert_eq!(evicted, 1);
         assert_eq!(freed, 400);
         assert!(!f_old.exists(), "Oldest file must be evicted first");
-        assert!(f_mid.exists(), "Middle file should remain when <= 80% quota");
+        assert!(
+            f_mid.exists(),
+            "Middle file should remain when <= 80% quota"
+        );
         assert!(f_new.exists(), "Newest file must remain");
         assert!(f_lock.exists(), "Lock files must never be evicted");
 
@@ -605,10 +852,7 @@ mod tests {
         let gov_2048 = MemoryBudgetGovernor::new(2048);
         assert_eq!(gov_2048.budget_mb, 2048);
         assert!(gov_2048.is_low_memory_mode());
-        assert_eq!(
-            gov_2048.recommended_parallel_workers(512),
-            4.min(max_cpus)
-        );
+        assert_eq!(gov_2048.recommended_parallel_workers(512), 4.min(max_cpus));
         assert_eq!(
             gov_2048.recommended_shm_quota_bytes(),
             (2048 / 16) * 1024 * 1024
@@ -631,10 +875,8 @@ mod tests {
         assert_eq!(parse_macos_vm_stat_budget_mb(sample_vm_stat), Some(358));
 
         // 2. Out-of-Core Disk Spill + read_shm_or_disk_spill roundtrip
-        let base_dir = std::env::temp_dir().join(format!(
-            "turbo_lean_shm_spill_test_{}",
-            std::process::id()
-        ));
+        let base_dir =
+            std::env::temp_dir().join(format!("turbo_lean_shm_spill_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&base_dir);
         let shm_dir = base_dir.join("shm");
         let spill_dir = base_dir.join("disk_spill");
@@ -654,7 +896,10 @@ mod tests {
         let (spilled_count, spilled_bytes) = spill_shm_to_disk_dir(&shm_dir, &spill_dir, 1000)?;
         assert_eq!(spilled_count, 1);
         assert_eq!(spilled_bytes, 400);
-        assert!(!f_old.exists(), "evicted file must be unlinked from shm_dir");
+        assert!(
+            !f_old.exists(),
+            "evicted file must be unlinked from shm_dir"
+        );
         assert!(
             spill_dir.join("entry_old.json").exists(),
             "evicted file must exist in disk_spill_dir"

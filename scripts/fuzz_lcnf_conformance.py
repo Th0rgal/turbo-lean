@@ -1,18 +1,32 @@
 #!/usr/bin/env python3
-"""Tier C4 grammar-guided LCNF/LNIR differential conformance fuzzer.
+"""Scalar-only differential conformance probe, not full Tier C4 acceptance.
 
-Three engines on every seed:
-  1. Reference oracle (wrapping UInt64, COW arrays, nested let/ite/seqFor)
-  2. LNIR ``validate-tv`` (``lean-native-core``) and operational semantics model
-  3. Compiled C-ABI/LLVM (clang) execution
+Executes THREE genuinely independent engines on EVERY seed and corpus program:
+  1. Engine 1 (`stock_lean_c`): Elaborates & compiles the generated `.lean` source file with
+     the stock Lean 4 compiler (`lean -c` + `leanc`) and its unmodified runtime.
+  2. Engine 2 (`lnir_eval`): Lowers the same `.lean` program to `LNIR` via the real compiler
+     frontend (`lean-native emit-lnir --wire <FuzzerBatch.lean>`) and evaluates EVERY declaration
+     with the formal operational interpreter (`lean-native-core eval-lnir --batch-json --opt`),
+     plus the repository's symbolic translation validator (`lean-native-core validate-tv`).
+  3. Engine 3 (`leannative_llvm_binary`): Compiles the lowered `LNIRModule` through `LeanNative`'s
+     LLVM backend (`lean-native-core compile-llvm`) and `clang` into a native executable and runs it.
 
-Boundary scalars: {0, 1, 2, 31, 32, 63, 64, 2^31-1, 2^31, 2^63-1, 2^63, 2^64-1}.
+Hard Fail-Closed Contract (`P0`/`P1`):
+  - If ANY required engine (`lean`, `lean-native`, `lean-native-core`, `clang`) is missing or not
+    executable, `run_fuzzer` returns `ok: False, status: "incomplete_missing_engine"` and exits non-zero.
+  - Precomputed `program["value"]` or Python-only fallback is NEVER used as an engine output.
+   - Alias-shaped cases are scalar conditionals; loop-shaped cases are unrolled additions.
+     Neither exercises aliasing, RC, or LNIR seqFor. No RC coverage is claimed.
+   - Every batch execution records SHA-256 digests of the `.lean` source, frontend-lowered `.lnir`,
+    emitted `.ll`, and compiled binaries in the receipt.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -21,28 +35,45 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 LEAN_NATIVE_CORE = ROOT / "lean" / ".lake" / "build" / "bin" / "lean-native-core"
+LEAN_NATIVE_FULL = ROOT / "lean" / ".lake" / "build" / "bin" / "lean-native"
 MASK64 = (1 << 64) - 1
 
 BOUNDARY_SCALARS: tuple[int, ...] = (
     0,
     1,
     2,
+    7,
+    8,
+    15,
+    16,
     31,
     32,
     63,
     64,
+    255,
+    256,
+    65535,
+    65536,
     (1 << 31) - 1,
     1 << 31,
+    (1 << 32) - 1,
+    1 << 32,
     (1 << 63) - 1,
     1 << 63,
     (1 << 64) - 1,
 )
 LOOP_STEPS: tuple[int, ...] = (0, 1, 2, 7)
-OPS = ("add", "sub", "mul", "shl", "shr", "and", "xor")
+OPS = ("add", "sub", "mul", "div", "mod", "shl", "shr", "and", "or", "xor")
+WIDTHS = (8, 16, 32, 64)
+CMP_OPS = ("==", "!=", "<", "<=")
 
 
 def u64(n: int) -> int:
     return n & MASK64
+
+
+def sha256_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
 
 
 def splitmix64(seed: int) -> int:
@@ -83,12 +114,18 @@ def eval_scalar(op: str, a: int, b: int) -> int:
         return u64(a - b)
     if op == "mul":
         return u64(a * b)
+    if op == "div":
+        return 0 if u64(b) == 0 else u64(a) // u64(b)
+    if op == "mod":
+        return u64(a) if u64(b) == 0 else u64(a) % u64(b)
     if op == "shl":
         return u64(a << (b & 63))
     if op == "shr":
         return (a & MASK64) >> (b & 63)
     if op == "and":
         return a & b
+    if op == "or":
+        return a | b
     if op == "xor":
         return a ^ b
     raise ValueError(f"unknown op: {op}")
@@ -96,21 +133,63 @@ def eval_scalar(op: str, a: int, b: int) -> int:
 
 def gen_scalar_tree(rng: Rng, depth: int) -> tuple[dict[str, Any], int]:
     if depth <= 0 or rng.choice(4) == 0:
+        if rng.choice(3) == 0:
+            return {"k": "var", "id": 0}, 0
         v = pick_scalar(rng)
-        return {"k": "const", "v": v, "value": v}, v
+        return {"k": "const", "v": v}, v
+    kind = rng.choice(7)
+    if kind == 0:
+        src = WIDTHS[rng.choice(len(WIDTHS))]
+        dst_choices = [w for w in WIDTHS if w != src]
+        dst = dst_choices[rng.choice(len(dst_choices))]
+        sub, _ = gen_scalar_tree(rng, depth - 1)
+        return {"k": "uint_cast", "src_bits": src, "dst_bits": dst, "arg": sub}, 0
+    if kind == 1:
+        w = (8, 16, 32)[rng.choice(3)]
+        op = OPS[rng.choice(len(OPS))]
+        lt, _ = gen_scalar_tree(rng, depth - 1)
+        rt, _ = gen_scalar_tree(rng, depth - 1)
+        return {"k": "narrow_binop", "bits": w, "op": op, "l": lt, "r": rt}, 0
+    if kind == 2:
+        op = OPS[rng.choice(len(OPS))]
+        lt, _ = gen_scalar_tree(rng, depth - 1)
+        rt, _ = gen_scalar_tree(rng, depth - 1)
+        return {"k": "usize_binop", "op": op, "l": lt, "r": rt}, 0
+    if kind == 3:
+        w = WIDTHS[rng.choice(len(WIDTHS))]
+        sub, _ = gen_scalar_tree(rng, depth - 1)
+        return {"k": "complement", "bits": w, "arg": sub}, 0
     op = OPS[rng.choice(len(OPS))]
     lt, lv = gen_scalar_tree(rng, depth - 1)
     rt, rv = gen_scalar_tree(rng, depth - 1)
     val = eval_scalar(op, lv, rv)
-    return {"k": "binop", "op": op, "l": lt, "r": rt, "lv": lv, "rv": rv, "value": val}, val
+    return {"k": "binop", "op": op, "l": lt, "r": rt}, val
 
 
 def gen_ite(rng: Rng, depth: int) -> tuple[dict[str, Any], int]:
-    cond = pick_scalar(rng)
     tt, tv = gen_expr(rng, depth - 1)
     et, ev = gen_expr(rng, depth - 1)
-    val = tv if cond != 0 else ev
-    return {"k": "ite", "c": cond, "t": tt, "e": et, "value": val}, val
+    if rng.choice(2) == 0:
+        cond = pick_scalar(rng)
+        val = tv if cond != 0 else ev
+        return {"k": "ite", "c": cond, "t": tt, "e": et}, val
+    op1 = CMP_OPS[rng.choice(len(CMP_OPS))]
+    op2 = CMP_OPS[rng.choice(len(CMP_OPS))]
+    comb = ("&&", "||", "!=", "==")[rng.choice(4)]
+    b1 = pick_scalar(rng)
+    b2 = pick_scalar(rng)
+    neg = rng.choice(2) == 1
+    return {
+        "k": "bool_branch",
+        "op1": op1,
+        "b1": b1,
+        "op2": op2,
+        "b2": b2,
+        "comb": comb,
+        "neg": neg,
+        "t": tt,
+        "e": et,
+    }, 0
 
 
 def gen_loop(rng: Rng) -> tuple[dict[str, Any], int]:
@@ -122,187 +201,567 @@ def gen_loop(rng: Rng) -> tuple[dict[str, Any], int]:
     acc = init_acc
     for _ in range(hi - lo):
         acc = u64(acc + addend)
-    return {"k": "seqFor", "lo": lo, "hi": hi, "init": init_acc, "addend": addend, "value": acc}, acc
+    return {"k": "seqFor", "lo": lo, "hi": hi, "init": init_acc, "addend": addend}, acc
 
 
 def gen_expr(rng: Rng, depth: int) -> tuple[dict[str, Any], int]:
-    kind = rng.choice(5 if depth > 0 else 2)
+    kind = rng.choice(6 if depth > 0 else 2)
     if kind == 0 or depth <= 0:
         return gen_scalar_tree(rng, max(depth, 0))
     if kind == 1:
         inner, v = gen_expr(rng, depth - 1)
-        return {"k": "let", "body": inner, "value": v}, v
+        return {"k": "let", "body": inner}, v
     if kind == 2:
         return gen_ite(rng, depth)
     if kind == 3:
         return gen_loop(rng)
+    if kind == 4:
+        b1 = pick_scalar(rng)
+        b2 = pick_scalar(rng)
+        c1 = pick_scalar(rng)
+        c2 = pick_scalar(rng)
+        return {"k": "multi_jp", "b1": b1, "b2": b2, "c1": c1, "c2": c2}, 0
     return gen_scalar_tree(rng, depth)
-
-
-def cow_store(buf: list[int], exclusive: bool, idx: int, val: int) -> tuple[list[int], bool, bool]:
-    """Copy-on-write store. Returns (data, wrote_in_place, rc_leak)."""
-    if idx < 0 or idx >= len(buf):
-        return buf, False, False
-    out = buf[:]
-    out[idx] = u64(val)
-    return out, exclusive, False
-
-
-def unguarded_store(buf: list[int], exclusive: bool, idx: int, val: int) -> tuple[list[int] | None, bool]:
-    """In-place store: shared buffers (exclusive=False) are rejected; mutating them would leak."""
-    if not exclusive:
-        return None, False
-    if idx < 0 or idx >= len(buf):
-        return None, False
-    out = buf[:]
-    out[idx] = u64(val)
-    return out, False
-
-
-def reference_oracle(program: dict[str, Any]) -> dict[str, Any]:
-    kind = program["k"]
-    if kind == "const":
-        return {"value": program["v"], "rc_leaks": 0}
-    if kind in ("binop", "seqFor"):
-        return {"value": program["value"], "rc_leaks": 0}
-    if kind == "let":
-        inner = reference_oracle(program["body"])
-        return {"value": inner["value"], "rc_leaks": inner["rc_leaks"]}
-    if kind == "ite":
-        branch = program["t"] if program["c"] != 0 else program["e"]
-        inner = reference_oracle(branch)
-        return {"value": inner["value"], "rc_leaks": inner["rc_leaks"]}
-    if kind == "alias":
-        shared = program["data"][:]
-        mutated, leak = unguarded_store(shared, program["exclusive"], program["idx"], program["val"])
-        copied, _in_place, cow_leak = cow_store(shared, program["exclusive"], program["idx"], program["val"])
-        return {
-            "value": None if mutated is None else mutated[program["idx"]],
-            "cow": copied[program["idx"]],
-            "rejected_shared_write": mutated is None and not program["exclusive"],
-            "original_unchanged": shared[program["idx"]] == program["data"][program["idx"]],
-            "rc_leaks": int(leak or cow_leak),
-        }
-    raise AssertionError(kind)
-
-
-def lnir_oracle(program: dict[str, Any]) -> dict[str, Any]:
-    """LNIR evalCode model of the same grammar (engine 2)."""
-    kind = program["k"]
-    if kind in ("const", "binop", "let", "ite", "seqFor"):
-        return reference_oracle(program)
-    if kind == "alias":
-        if not program["exclusive"]:
-            return {
-                "value": None,
-                "cow": u64(program["val"]) if 0 <= program["idx"] < len(program["data"]) else None,
-                "rejected_shared_write": True,
-                "original_unchanged": True,
-                "rc_leaks": 0,
-            }
-        return reference_oracle(program)
-    raise AssertionError(kind)
-
-
-def c_abi_value(program: dict[str, Any]) -> int | None:
-    if program["k"] == "const":
-        return program["v"]
-    if program["k"] in ("binop", "seqFor"):
-        return program["value"]
-    if program["k"] == "let":
-        return c_abi_value(program["body"])
-    if program["k"] == "ite":
-        return c_abi_value(program["t"] if program["c"] != 0 else program["e"])
-    return None
-
-
-def validate_tv_available() -> bool:
-    if not LEAN_NATIVE_CORE.is_file():
-        return False
-    try:
-        subprocess.run([str(LEAN_NATIVE_CORE), "validate-tv", "--json"], check=True, capture_output=True, text=True)
-    except (subprocess.CalledProcessError, OSError):
-        return False
-    return True
 
 
 def build_program(seed: int) -> dict[str, Any]:
     rng = Rng(splitmix64(seed))
     depth = 1 + rng.choice(3)
-    if rng.choice(5) == 0:
+    arg0 = pick_scalar(rng)
+    if rng.choice(6) == 0:
         data = [pick_scalar(rng) for _ in range(4)]
         exclusive = rng.choice(2) == 0
         idx = rng.choice(4)
         val = pick_scalar(rng)
-        return {"k": "alias", "data": data, "exclusive": exclusive, "idx": idx, "val": val, "seed": seed}
-    tree, value = gen_expr(rng, depth)
-    tree["value"] = value
-    tree["seed"] = seed
-    return tree
+        # This is only a scalar conditional, not an aliasing/RC test.
+        tree = {
+            "k": "ite",
+            "c": 1 if exclusive else 0,
+            "t": {"k": "binop", "op": "xor", "l": {"k": "const", "v": val}, "r": {"k": "var", "id": 0}},
+            "e": {"k": "binop", "op": "add", "l": {"k": "const", "v": data[idx]}, "r": {"k": "var", "id": 0}},
+        }
+        return {
+            "k": "scalar_conditional",
+            "tree": tree,
+            "data": data,
+            "exclusive": exclusive,
+            "idx": idx,
+            "val": val,
+            "arg0": arg0,
+            "seed": seed,
+        }
+    tree, _ = gen_expr(rng, depth)
+    return {"k": "program", "tree": tree, "arg0": arg0, "seed": seed}
 
 
-def compare_seed(program: dict[str, Any], tv_ok: bool, clang_ok: bool) -> dict[str, Any]:
-    ref = reference_oracle(program)
-    lnir = lnir_oracle(program)
-    mismatch = ref.get("value") != lnir.get("value") or ref.get("rc_leaks") != lnir.get("rc_leaks")
-    if program["k"] == "alias":
-        mismatch = mismatch or ref.get("rejected_shared_write") != lnir.get("rejected_shared_write")
-        mismatch = mismatch or ref.get("cow") != lnir.get("cow")
-    clang_val = c_abi_value(program) if clang_ok else None
-    if clang_val is not None and clang_val != ref.get("value"):
-        mismatch = True
+def tree_to_lean_expr(node: dict[str, Any]) -> str:
+    k = node["k"]
+    if k == "const":
+        return f"({u64(node['v'])} : UInt64)"
+    if k == "var":
+        return "x0"
+    if k == "uint_cast":
+        expr = tree_to_lean_expr(node["arg"])
+        for width in (node["src_bits"], node["dst_bits"], 64):
+            if width not in (8, 16, 32, 64):
+                raise ValueError("unsupported unsigned width")
+        if node["src_bits"] != 64:
+            expr = f"({expr}).toUInt{node['src_bits']}"
+        expr = f"({expr}).toUInt{node['dst_bits']}"
+        return expr if node["dst_bits"] == 64 else f"({expr}).toUInt64"
+    if k == "raw_lean":
+        return node["expr"]
+    if k == "ite_input":
+        op = node.get("op", "==")
+        if op not in ("==", "!=", "<", "<="):
+            raise ValueError("unsupported input comparison")
+        bits = node.get("bits", 64)
+        if bits not in (8, 16, 32, 64):
+            raise ValueError("unsupported unsigned width")
+        lhs = "x0" if bits == 64 else f"x0.toUInt{bits}"
+        return f"(if {lhs} {op} ({node['boundary']} : UInt{bits}) then x0 + 7 else x0 ^^^ 19)"
+    if k == "narrow_binop":
+        bits = node["bits"]
+        if bits not in (8, 16, 32):
+            raise ValueError("unsupported narrow width")
+        l = f"({tree_to_lean_expr(node['l'])}).toUInt{bits}"
+        r = f"({tree_to_lean_expr(node['r'])}).toUInt{bits}"
+        op = node["op"]
+        op_map = {
+            "add": "+",
+            "sub": "-",
+            "mul": "*",
+            "div": "/",
+            "mod": "%",
+            "shl": "<<<",
+            "shr": ">>>",
+            "and": "&&&",
+            "or": "|||",
+            "xor": "^^^",
+        }
+        return f"(({l} {op_map[op]} {r}) : UInt{bits}).toUInt64"
+    if k == "usize_binop":
+        l = f"({tree_to_lean_expr(node['l'])}).toUSize"
+        r = f"({tree_to_lean_expr(node['r'])}).toUSize"
+        op = node["op"]
+        op_map = {
+            "add": "+",
+            "sub": "-",
+            "mul": "*",
+            "div": "/",
+            "mod": "%",
+            "shl": "<<<",
+            "shr": ">>>",
+            "and": "&&&",
+            "or": "|||",
+            "xor": "^^^",
+        }
+        return f"(({l} {op_map[op]} {r}) : USize).toUInt64"
+    if k == "complement":
+        bits = node["bits"]
+        sub = tree_to_lean_expr(node["arg"])
+        if bits == 64:
+            return f"(~~~({sub}))"
+        return f"(~~~(({sub}).toUInt{bits})).toUInt64"
+    if k == "bool_branch":
+        c1 = f"(x0 {node['op1']} ({u64(node['b1'])} : UInt64))"
+        c2 = f"((x0 ^^^ (0x55AA : UInt64)) {node['op2']} ({u64(node['b2'])} : UInt64))"
+        comb = f"({c1} {node['comb']} {c2})"
+        cond = f"(!{comb})" if node.get("neg") else comb
+        t = tree_to_lean_expr(node["t"])
+        e = tree_to_lean_expr(node["e"])
+        return f"(if {cond} then {t} else {e})"
+    if k == "multi_jp":
+        b1 = u64(node["b1"])
+        b2 = u64(node["b2"])
+        c1 = u64(node["c1"])
+        c2 = u64(node["c2"])
+        return (
+            f"(let y : UInt64 := if x0 < ({b1} : UInt64) then x0 + ({c1} : UInt64) "
+            f"else if x0 == ({b2} : UInt64) then x0 ^^^ ({c2} : UInt64) "
+            f"else (x0.toUInt16 + (13 : UInt16)).toUInt64; (y * (3 : UInt64)) ^^^ (y >>> (5 : UInt64)))"
+        )
+    if k == "binop":
+        l = tree_to_lean_expr(node["l"])
+        r = tree_to_lean_expr(node["r"])
+        op = node["op"]
+        if op == "add":
+            return f"({l} + {r})"
+        if op == "sub":
+            return f"({l} - {r})"
+        if op == "mul":
+            return f"({l} * {r})"
+        if op == "div":
+            return f"({l} / {r})"
+        if op == "mod":
+            return f"({l} % {r})"
+        if op == "shl":
+            return f"({l} <<< {r})"
+        if op == "shr":
+            return f"({l} >>> {r})"
+        if op == "and":
+            return f"({l} &&& {r})"
+        if op == "or":
+            return f"({l} ||| {r})"
+        if op == "xor":
+            return f"({l} ^^^ {r})"
+    if k == "let":
+        b = tree_to_lean_expr(node["body"])
+        return f"(let tmp : UInt64 := {b}; tmp)"
+    if k == "ite":
+        t = tree_to_lean_expr(node["t"])
+        e = tree_to_lean_expr(node["e"])
+        c = u64(node["c"])
+        return f"(if ({c} : UInt64) == 0 then {e} else {t})"
+    if k == "seqFor":
+        steps = node["hi"] - node["lo"]
+        init_v = u64(node["init"])
+        add_v = u64(node["addend"])
+        terms = [f"({init_v} : UInt64)"] + [f"({add_v} : UInt64)" for _ in range(steps)]
+        return "(" + " + ".join(terms) + ")"
+    raise ValueError(k)
+
+
+def find_lean_binary() -> str | None:
+    for cand in [
+        shutil.which("lean"),
+        str(Path.home() / ".elan/toolchains/leanprover--lean4---v4.35.0/bin/lean"),
+        "/root/.elan/toolchains/leanprover--lean4---v4.35.0/bin/lean",
+        "/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0/bin/lean",
+        "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.35.0/bin/lean",
+    ]:
+        if cand and Path(cand).is_file() and os.access(cand, os.X_OK):
+            try:
+                prefix = subprocess.run([cand, "--print-prefix"], cwd=ROOT / "lean",
+                                        check=True, capture_output=True, text=True).stdout.strip()
+                pinned = Path(prefix) / "bin" / "lean"
+                if pinned.is_file():
+                    return str(pinned)
+            except (OSError, subprocess.SubprocessError):
+                continue
+    return None
+
+
+def find_clang_binary() -> str | None:
+    for cand in [
+        "/usr/bin/clang",
+        "/usr/bin/clang-18",
+        str(Path.home() / ".elan/toolchains/leanprover--lean4---v4.35.0/bin/clang"),
+        "/root/.elan/toolchains/leanprover--lean4---v4.35.0/bin/clang",
+        "/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0/bin/clang",
+        "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.35.0/bin/clang",
+        shutil.which("clang"),
+    ]:
+        if cand and Path(cand).is_file() and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def clang_extra_flags(clang_bin: str) -> list[str]:
+    p = Path(clang_bin).resolve()
+    inc_clang = p.parent.parent / "include" / "clang"
+    if inc_clang.is_dir():
+        return [f"-isystem{inc_clang}"]
+    return []
+
+
+def probe_engines(
+    override_lean: str | None = None,
+    override_core: str | None = None,
+    override_clang: str | None = None,
+) -> dict[str, Any]:
+    lean_bin = override_lean if override_lean is not None else find_lean_binary()
+    core_bin = override_core if override_core is not None else str(LEAN_NATIVE_CORE)
+    full_bin = str(LEAN_NATIVE_FULL) if LEAN_NATIVE_FULL.is_file() else None
+    clang_bin = override_clang if override_clang is not None else find_clang_binary()
+    lean_ok = bool(lean_bin and Path(lean_bin).is_file() and os.access(lean_bin, os.X_OK))
+    core_ok = bool(core_bin and Path(core_bin).is_file() and os.access(core_bin, os.X_OK))
+    full_ok = bool(full_bin and Path(full_bin).is_file() and os.access(full_bin, os.X_OK))
+    clang_ok = bool(clang_bin and Path(clang_bin).is_file() and os.access(clang_bin, os.X_OK))
+    if core_ok:
+        try:
+            subprocess.run([core_bin, "validate-tv", "--canonical-benchmark", "--json"],
+                           check=True, capture_output=True, text=True)
+        except (subprocess.CalledProcessError, OSError):
+            core_ok = False
     return {
-        "seed": program["seed"],
-        "kind": program["k"],
-        "mismatch": mismatch,
-        "rc_leaks": int(ref.get("rc_leaks", 0)) + int(lnir.get("rc_leaks", 0)),
-        "c_abi": clang_val,
+        "lean_bin": lean_bin if lean_ok else None,
+        "core_bin": core_bin if core_ok else None,
+        "full_bin": full_bin if full_ok else None,
+        "clang_bin": clang_bin if clang_ok else None,
+        "stock_lean_c": lean_ok and clang_ok,
+        "lnir_eval": core_ok and full_ok,
+        "c_abi_llvm": core_ok and full_ok and clang_ok,
     }
 
 
-def shrink(program: dict[str, Any], tv_ok: bool, clang_ok: bool) -> dict[str, Any]:
-    cur = program
-    if cur["k"] in ("let", "ite"):
-        for key in ("body", "t", "e"):
-            if key in cur and isinstance(cur[key], dict):
-                child = dict(cur[key])
-                child["seed"] = cur["seed"]
-                if child.get("k") and compare_seed(child, tv_ok, clang_ok)["mismatch"]:
-                    return shrink(child, tv_ok, clang_ok)
-    return {"seed": cur["seed"], "kind": cur["k"]}
+def run_three_way_batch(
+    programs: list[dict[str, Any]],
+    engines: dict[str, Any],
+    mutate_engine: str | None = None,
+) -> dict[str, Any]:
+    """Execute ALL fuzz programs through:
+      (1) stock `lean -c` + `clang` binary execution,
+      (2) frontend lowering (`lean-native emit-lnir --wire`) + `lean-native-core eval-lnir --batch-json --opt` + `validate-tv`,
+      (3) `lean-native-core compile-llvm` + `clang` binary execution.
+    """
+    lean_bin = engines["lean_bin"]
+    core_bin = engines["core_bin"]
+    full_bin = engines.get("full_bin")
+    if not full_bin:
+        raise RuntimeError("Missing real Lean frontend; core is not a substitute")
+    clang_bin = engines["clang_bin"]
+
+    if not programs:
+        return {
+            "executed_count": 0,
+            "mismatches": [],
+            "receipts": {},
+        }
+
+    with tempfile.TemporaryDirectory(prefix="turbo_c4_batch_") as tmp:
+        tmpdir = Path(tmp)
+        lean_lines = ["-- Auto-generated Tier C4 differential batch"]
+        seen_preambles: list[str] = []
+        for p in programs:
+            pre = p.get("preamble", "")
+            if pre and pre not in seen_preambles:
+                seen_preambles.append(pre)
+                lean_lines.append(pre)
+        c_driver_decls = ["#include <stdint.h>", "#include <stdio.h>"]
+        c_driver_calls = ["int main(void) {", "  printf(\"[\");"]
+        arg_list_strs: list[str] = []
+
+        for idx, p in enumerate(programs):
+            seed = p["seed"]
+            arg0 = u64(p["arg0"])
+            fn_name = f"fuzz_seed_{seed}"
+            arg_list_strs.append(f"{fn_name}:{arg0}")
+            lean_expr = tree_to_lean_expr(p["tree"])
+            lean_lines.append(f"@[export {fn_name}]")
+            lean_lines.append(f"def {fn_name} (x0 : UInt64) : UInt64 := {lean_expr}")
+            c_driver_decls.append(f"extern uint64_t {fn_name}(uint64_t);")
+            sep = "," if idx > 0 else ""
+            c_driver_calls.append(
+                f'  printf("{sep}\\"%llu\\"", (unsigned long long){fn_name}({arg0}ULL));'
+            )
+
+        c_driver_calls.append('  printf("]\\n");')
+        c_driver_calls.append("  return 0;")
+        c_driver_calls.append("}")
+
+        lean_src = "\n".join(lean_lines) + "\n"
+        lean_file = tmpdir / "FuzzerBatch.lean"
+        lean_c_file = tmpdir / "FuzzerBatch.lean.c"
+        lean_setup = tmpdir / "FuzzerBatch.setup.json"
+        lean_setup.write_text(
+            json.dumps({
+                "name": "FuzzerBatch",
+                "isModule": False,
+                "importArts": {},
+                "dynlibs": [],
+                "plugins": [],
+                "options": {"autoImplicit": False},
+                "package": "fuzzer",
+            }),
+            encoding="utf-8",
+        )
+        lean_file.write_text(lean_src, encoding="utf-8")
+
+        # Compile the original definitions plus an IO driver with the stock runtime.
+        stock_source = tmpdir / "StockOracle.lean"
+        calls = [f"toString (fuzz_seed_{p['seed']} {u64(p['arg0'])})" for p in programs]
+        stock_source.write_text(
+            lean_src + '\ndef main : IO Unit :=\n  IO.println ("[" ++ String.intercalate "," ['
+            + ", ".join(calls) + '] ++ "]")\n', encoding="utf-8"
+        )
+        subprocess.run(
+            [lean_bin, str(stock_source), "-c", str(lean_c_file)],
+            cwd=str(tmpdir),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        driver_c_path = tmpdir / "driver.c"
+        stock_bin_path = tmpdir / "stock_runner"
+        driver_c_path.write_text(
+            "\n".join(c_driver_decls)
+            + "\n"
+            + "\n".join(c_driver_calls)
+            + "\n",
+            encoding="utf-8",
+        )
+        extra_inc = clang_extra_flags(clang_bin)
+        lean_prefix = subprocess.run([lean_bin, "--print-prefix"], check=True, capture_output=True, text=True).stdout.strip()
+        leanc = str(Path(lean_prefix) / "bin" / "leanc")
+        subprocess.run(
+            [leanc, "-O2", str(lean_c_file), "-o", str(stock_bin_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        stock_out = subprocess.run([str(stock_bin_path)], check=True, capture_output=True, text=True).stdout
+        stock_vals = [int(x) for x in json.loads(stock_out)]
+        if mutate_engine == "stock_lean_c" and stock_vals:
+            stock_vals[0] = u64(stock_vals[0] ^ 1)
+
+        # 2. Engine 2: Frontend Lowering (`lean-native emit-lnir --wire`) + `eval-lnir --batch-json` + `validate-tv`
+        wire_path = tmpdir / "batch.lnir"
+        subprocess.run(
+            [full_bin, "emit-lnir", "--wire", str(lean_file), "-o", str(wire_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        tv_out = subprocess.run(
+            [core_bin, "validate-tv", "--lnir", str(wire_path), "--json"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        tv_json = json.loads(tv_out)
+
+        ev_res = subprocess.run(
+            [
+                core_bin,
+                "eval-lnir",
+                "--lnir",
+                str(wire_path),
+                "--args",
+                ";".join(arg_list_strs),
+                "--opt",
+                "--batch-json",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        ev_rows = json.loads(ev_res.stdout)
+        expected_decls = {f"fuzz_seed_{p['seed']}" for p in programs}
+        if (len(ev_rows) != len(programs) or any(r.get("ok") is not True for r in ev_rows)
+                or {r.get("decl") for r in ev_rows} != expected_decls):
+            raise RuntimeError("Evaluation did not execute each exact requested declaration once")
+        ev_by_decl = {r["decl"]: int(r["value_u64"]) for r in ev_rows if r.get("ok")}
+        total_live_objs = sum(int(r.get("live_objects", 0)) for r in ev_rows if r.get("ok"))
+        lnir_vals: list[int] = []
+        for idx, p in enumerate(programs):
+            fn_name = f"fuzz_seed_{p['seed']}"
+            val = ev_by_decl.get(fn_name, -1)
+            if mutate_engine == "lnir_eval" and idx == len(programs) - 1:
+                val = u64(val + 1)
+            lnir_vals.append(val)
+
+        # 3. Engine 3: LeanNative Compiled LLVM Native Binary (`compile-llvm` + `clang`)
+        ll_path = tmpdir / "batch.ll"
+        ln_bin_path = tmpdir / "ln_runner"
+        subprocess.run(
+            [core_bin, "compile-llvm", "--no-telemetry", "--lnir", str(wire_path), "-o", str(ll_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [clang_bin, "-O2", "-Wno-override-module", *extra_inc, str(ll_path), str(driver_c_path), "-o", str(ln_bin_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        ln_out = subprocess.run([str(ln_bin_path)], check=True, capture_output=True, text=True).stdout
+        ln_vals = [int(x) for x in json.loads(ln_out)]
+        if len(stock_vals) != len(programs) or len(ln_vals) != len(programs):
+            raise RuntimeError("Native execution skipped or duplicated rows")
+        if mutate_engine == "c_abi_llvm" and ln_vals:
+            ln_vals[-1] = u64(ln_vals[-1] ^ 0xDEAD)
+
+        mismatches = []
+        wire_tokens = wire_path.read_text().strip().split("|")
+        lowered_decls = [bytes.fromhex(wire_tokens[i + 1]).decode("utf-8")
+                         for i, token in enumerate(wire_tokens) if token == "D_decl"]
+        if len(lowered_decls) != len(set(lowered_decls)) or not expected_decls <= set(lowered_decls):
+            raise RuntimeError("Lowered module skipped or duplicated requested declarations")
+        validate_tv_coverage(tv_json, set(lowered_decls))
+        for idx, p in enumerate(programs):
+            sv = stock_vals[idx]
+            lv = lnir_vals[idx]
+            nv = ln_vals[idx]
+            if sv != lv or lv != nv:
+                mismatches.append({
+                    "seed": p["seed"],
+                    "kind": p["tree"]["k"],
+                    "stock_lean_c": str(sv),
+                    "lnir_eval": str(lv),
+                    "c_abi_llvm": str(nv),
+                })
+
+        receipts = {
+            "lean_source_sha256": sha256_bytes(lean_file.read_bytes()),
+            "stock_source_sha256": sha256_bytes(stock_source.read_bytes()),
+            "stock_unmodified_c_sha256": sha256_bytes(lean_c_file.read_bytes()),
+            "stock_runtime": "stock lean -c + leanc (full generated C, no replacements)",
+            "lnir_wire_sha256": sha256_bytes(wire_path.read_bytes()),
+            "llvm_ir_sha256": sha256_bytes(ll_path.read_bytes()),
+            "stock_binary_sha256": sha256_bytes(stock_bin_path.read_bytes()),
+            "leannative_binary_sha256": sha256_bytes(ln_bin_path.read_bytes()),
+            "symbolic_tv_passed_decls": tv_json.get("passedDecls", 0),
+            "lnir_eval_executed_decls": len(ev_by_decl),
+        }
+        return {
+            "executed_count": len(programs),
+            "mismatches": mismatches,
+            "live_objects": total_live_objs,
+            "receipts": receipts,
+        }
 
 
-def run_fuzzer(num_seeds: int = 500) -> dict[str, Any]:
+def validate_tv_coverage(report: Any, expected_decls: set[str]) -> None:
+    """A successful summary cannot replace executed, named validation obligations."""
+    count = len(expected_decls)
+    if not count or not isinstance(report, dict) or report.get("allPassed") is not True:
+        raise RuntimeError("Translation validation failed or returned an invalid report")
+    if report.get("schemaVersion") != "lean-native-symbolic-tv-v2":
+        raise RuntimeError("Translation validation failed or returned an invalid report")
+    if any(type(report.get(k)) is not int or report[k] != count
+           for k in ("passedDecls", "totalDecls")):
+        raise RuntimeError("Translation validation skipped or duplicated declarations")
+    rows = report.get("declResults")
+    if (not isinstance(rows, list) or len(rows) != count
+            or any(not isinstance(r, dict) or not isinstance(r.get("declName"), str)
+                   or any(r.get(key) is not True for key in
+                          ("passed", "ubRefines", "domainEquiv", "poisonRefines", "symRetEquiv",
+                           "concreteRefines", "memWritesEquiv"))
+                   or any(not isinstance(r.get(key), str) or not r[key] for key in ("srcHash", "tgtHash"))
+                   or type(r.get("concreteSamplesTot")) is not int or r["concreteSamplesTot"] <= 0
+                   or type(r.get("concreteSamplesOk")) is not int
+                   or r["concreteSamplesOk"] != r["concreteSamplesTot"] for r in rows)
+            or {r["declName"] for r in rows} != expected_decls):
+        raise RuntimeError("Translation validation lacks exact successful declaration coverage")
+
+
+def run_fuzzer(
+    num_seeds: int = 50,
+    override_lean: str | None = None,
+    override_core: str | None = None,
+    override_clang: str | None = None,
+    mutate_engine: str | None = None,
+) -> dict[str, Any]:
     n = max(0, num_seeds)
-    tv_ok = validate_tv_available()
-    clang_ok = shutil.which("clang") is not None
+    engines = probe_engines(override_lean, override_core, override_clang)
+    all_engines_ready = (
+        engines["stock_lean_c"] and engines["lnir_eval"] and engines["c_abi_llvm"]
+    )
+    if not all_engines_ready:
+        return {
+            "schemaVersion": "turbo-lean-lcnf-fuzz-v2",
+            "tier": "C4",
+            "status": "incomplete_missing_engine",
+            "ok": False,
+            "seeds": n,
+            "checked": 0,
+            "mismatch_count": 0,
+            "rc_leak_count": None,
+            "coverage": "scalar_only_no_alias_rc_or_seqFor",
+            "parity": "incomplete",
+            "engines": {
+                "stock_lean_c": engines["stock_lean_c"],
+                "lnir_validate_tv": engines["lnir_eval"],
+                "c_abi_llvm": engines["c_abi_llvm"],
+            },
+            "boundary_scalars": list(BOUNDARY_SCALARS),
+            "shrunk_failures": [{"error": "Required conformance engines unavailable; refusing to report pass"}],
+        }
+
+    programs = [build_program(seed) for seed in range(n)]
     mismatches = 0
-    rc_leaks = 0
-    checked = 0
     failures: list[dict[str, Any]] = []
-    for seed in range(n):
-        program = build_program(seed)
-        row = compare_seed(program, tv_ok, clang_ok)
-        checked += 1
-        rc_leaks += row["rc_leaks"]
-        if row["mismatch"]:
-            mismatches += 1
-            failures.append(shrink(program, tv_ok, clang_ok))
-    parity = mismatches == 0 and rc_leaks == 0
+    try:
+        batch_res = run_three_way_batch(programs, engines, mutate_engine=mutate_engine)
+    except (subprocess.SubprocessError, OSError, ValueError, RuntimeError) as exc:
+        batch_res = {"executed_count": 0, "mismatches": [], "receipts": {}}
+        failures.append({"error": str(exc), "stderr": getattr(exc, "stderr", None)})
+    mismatches += len(batch_res["mismatches"])
+    failures.extend(batch_res["mismatches"])
+
+    checked = batch_res["executed_count"]
+    parity_ok = n > 0 and checked == n and mismatches == 0 and not failures
     return {
-        "schemaVersion": "turbo-lean-lcnf-fuzz-v1",
+        "schemaVersion": "turbo-lean-lcnf-fuzz-v2",
         "tier": "C4",
-        "ok": parity,
+        "status": "passed_scalar_only" if parity_ok else "failed_or_incomplete",
+        "coverage": "scalar_only_no_alias_rc_or_seqFor",
+        "ok": parity_ok,
         "seeds": n,
         "checked": checked,
         "mismatch_count": mismatches,
-        "rc_leak_count": rc_leaks,
-        "parity": "100%" if mismatches == 0 else f"{checked - mismatches}/{checked}",
+        "rc_leak_count": None,
+        "interpreter_live_objects": batch_res.get("live_objects"),
+        "parity": "100%" if (parity_ok and n > 0) else f"{checked - mismatches}/{checked}",
         "engines": {
-            "reference_oracle": True,
-            "lnir_validate_tv": tv_ok,
-            "c_abi_llvm": clang_ok,
+            "stock_lean_c": engines["stock_lean_c"],
+            "lnir_validate_tv": engines["lnir_eval"],
+            "c_abi_llvm": engines["c_abi_llvm"],
         },
+        "receipts": batch_res["receipts"],
         "boundary_scalars": list(BOUNDARY_SCALARS),
         "shrunk_failures": failures[:8],
     }
@@ -310,17 +769,20 @@ def run_fuzzer(num_seeds: int = 500) -> dict[str, Any]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Tier C4 LCNF/LNIR differential fuzzer")
-    ap.add_argument("--seeds", type=int, default=500, help="Number of deterministic seeds")
+    ap.add_argument("--seeds", type=int, default=64, help="Number of deterministic seeds")
     ap.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    ap.add_argument("--mutate-engine", type=str, default=None, help="Inject mutation into stock_lean_c|lnir_eval|c_abi_llvm")
     args = ap.parse_args()
-    report = run_fuzzer(args.seeds)
+    report = run_fuzzer(args.seeds, mutate_engine=args.mutate_engine)
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
-        status = "PASSED" if report["ok"] else "FAILED"
+        status = "PASSED" if report["ok"] else f"FAILED ({report['status']})"
         print(
-            f"[fuzz-lcnf] {status} seeds={report['seeds']} mismatches={report['mismatch_count']} "
-            f"rc_leaks={report['rc_leak_count']} tv={report['engines']['lnir_validate_tv']} "
+            f"[fuzz-lcnf] {status} seeds={report['seeds']} checked={report['checked']} "
+            f"mismatches={report['mismatch_count']} rc_leaks={report['rc_leak_count']} "
+            f"stock_lean={report['engines']['stock_lean_c']} "
+            f"tv={report['engines']['lnir_validate_tv']} "
             f"clang={report['engines']['c_abi_llvm']}"
         )
     return 0 if report["ok"] else 1

@@ -383,9 +383,18 @@ pub(super) fn extract_local_def_unfoldings_with_vis(
                                 };
                                 explicit_only_params.push(encoded_explicit);
                                 value_params.push(v.to_string());
-                            } else if !is_type_sort {
-                                implicit_val_params.push(v.to_string());
-                                value_params.push(v.to_string());
+                            } else {
+                                let later_signature: String = chars[i..].iter().collect();
+                                let used_inferred_type = is_type_sort
+                                    && (replace_ident_boundary(&later_signature, v, "__TYPE__")
+                                        != later_signature
+                                        || replace_ident_boundary(body, v, "__TYPE__") != body);
+                                if !used_inferred_type {
+                                    if !is_type_sort {
+                                        implicit_val_params.push(v.to_string());
+                                    }
+                                    value_params.push(v.to_string());
+                                }
                             }
                         }
                     }
@@ -4048,6 +4057,90 @@ pub(super) fn substitute_equational_hypotheses(
     cur
 }
 
+/// Recognize the conservative application/equality shape `f ... x ... = f ... y ...`.
+/// Only universally bound, same-type, unconstrained variables may differ, and
+/// every differing position must be absent from the resolved local definition.
+pub(super) fn relational_ignored_parameters(
+    decl: &ExtractedDecl,
+    conjunct: &str,
+    local_defs: &[(String, Vec<String>, String)],
+) -> Option<(String, Vec<usize>)> {
+    let (lhs, rhs, false) = split_top_level_eq(strip_balanced_outer_parens(conjunct))? else {
+        return None;
+    };
+    let lhs = split_lean_app_args(strip_balanced_outer_parens(&lhs));
+    let rhs = split_lean_app_args(strip_balanced_outer_parens(&rhs));
+    let head = lhs.first()?;
+    if lhs.len() != rhs.len()
+        || rhs.first()? != head
+        || lhs == rhs
+        || decl.binders.iter().any(|(names, _)| names.contains(head))
+    {
+        return None;
+    }
+    let mut matching_names = std::collections::HashSet::new();
+    let mut chosen: Option<&(String, Vec<String>, String)> = None;
+    for entry in local_defs {
+        let (name, params, _) = entry;
+        if name.starts_with("__binder_ty:") {
+            continue;
+        }
+        if name == head || name.rsplit('.').next() == Some(head.as_str()) {
+            matching_names.insert(name.as_str());
+            if chosen.is_none() && params.len() + 1 == lhs.len() {
+                chosen = Some(entry);
+            }
+        }
+    }
+    if matching_names.len() != 1 {
+        return None;
+    }
+    let (name, params, body) = chosen?;
+    let binder_type = |arg: &str| {
+        let clean_arg = strip_balanced_outer_parens(arg.trim());
+        let mut matches = decl
+            .binders
+            .iter()
+            .filter(|(names, _)| names.iter().any(|n| n == clean_arg));
+        let (_, ty) = matches.next()?;
+        (matches.next().is_none() && is_known_binder_value_type(ty)).then_some(ty)
+    };
+    let segments = split_top_level_implications(&decl.prop_str);
+    let constraints: Vec<&str> = decl
+        .binders
+        .iter()
+        .filter(|(_, ty)| !is_known_binder_value_type(ty))
+        .map(|(_, ty)| ty.as_str())
+        .chain(
+            segments
+                .iter()
+                .take(segments.len().saturating_sub(1))
+                .map(String::as_str),
+        )
+        .collect();
+    let mut varied = Vec::new();
+    for (i, ((a, b), param)) in lhs[1..].iter().zip(&rhs[1..]).zip(params).enumerate() {
+        let ca = strip_balanced_outer_parens(a.trim());
+        let cb = strip_balanced_outer_parens(b.trim());
+        if ca == cb {
+            continue;
+        }
+        let param_ident = param.split('@').next().unwrap_or(param).trim();
+        if binder_type(ca)? != binder_type(cb)?
+            || replace_ident_boundary(body, param_ident, "__USED__") != *body
+            || constraints.iter().any(|h| {
+                [ca, cb]
+                    .iter()
+                    .any(|v| replace_ident_boundary(h, v, "__BOUND__") != *h)
+            })
+        {
+            return None;
+        }
+        varied.push(i);
+    }
+    (!varied.is_empty()).then(|| (name.clone(), varied))
+}
+
 pub(super) fn audit_referenced_local_defs_for_stubs(
     decl: &ExtractedDecl,
     unfolded_binder_types: &[(Vec<String>, String)],
@@ -4124,11 +4217,28 @@ pub(super) fn audit_referenced_local_defs_for_stubs(
         // 2. Unused parameter in a referenced function/predicate:
         //    - Reject any non-underscore parameter that never occurs in `body`.
         //    - Reject any function where zero parameters are referenced in `body`.
-        //    - Reject underscore-prefixed parameters under `strict-proofs` or when `params.len() <= 3`.
+        //    - Reject underscore-prefixed parameters under `strict-proofs` or when `params.len() <= 3`,
+        //      UNLESS the theorem is a 2-call relational hyperproperty (`f ... a ... = f ... b ...`).
         if policy.reject_unused_param_defs && !params.is_empty() {
+            let conclusions = split_top_level_implications(&decl.prop_str);
+            let relations: Vec<_> = if policy.policy == "strict-proofs" {
+                Vec::new()
+            } else {
+                split_top_level_conjuncts(conclusions.last().map(String::as_str).unwrap_or(""))
+                    .iter()
+                    .filter_map(|c| relational_ignored_parameters(decl, c, local_defs))
+                    .collect()
+            };
             let mut used_count = 0usize;
-            for p in params {
-                let pt = p.trim();
+            for (p_idx, p) in params.iter().enumerate() {
+                let pt = p.split('@').next().unwrap_or(p).trim();
+                if relations
+                    .iter()
+                    .any(|(name, positions)| name == def_name && positions.contains(&p_idx))
+                {
+                    used_count += 1;
+                    continue;
+                }
                 if pt.starts_with('_') {
                     if params.len() <= 3 || policy.policy == "strict-proofs" {
                         stub_findings.push(format!(
@@ -6740,11 +6850,27 @@ pub(super) fn audit_single_decl_spec_full_with_policy(
         .map(|s| s.trim())
         .unwrap_or(conclusion_str.as_str());
     let concl_conjuncts = flatten_top_level_conjuncts(inner_concl);
+    let raw_concl_imp_segments = split_top_level_implications(&decl.prop_str);
+    let raw_inner_concl = raw_concl_imp_segments
+        .last()
+        .map(|s| s.trim())
+        .unwrap_or(decl.prop_str.as_str());
+    let raw_concl_conjuncts = flatten_top_level_conjuncts(raw_inner_concl);
+    let relational = |c: &str| {
+        policy.policy != "strict-proofs"
+            && relational_ignored_parameters(decl, c, local_defs).is_some()
+    };
     let has_conjunct_tautology = policy.reject_conjunct_tautologies
         && concl_conjuncts.len() > 1
-        && concl_conjuncts.iter().any(|c| is_single_conjunct_trivial(c));
-    let is_whole_trivial =
-        is_single_conjunct_trivial(inner_concl) || is_single_conjunct_trivial(&conclusion_str);
+        && concl_conjuncts.iter().enumerate().any(|(idx, c)| {
+            is_single_conjunct_trivial(c)
+                && !raw_concl_conjuncts
+                    .get(idx)
+                    .is_some_and(|raw| relational(raw))
+        });
+    let is_whole_trivial = (is_single_conjunct_trivial(inner_concl)
+        || is_single_conjunct_trivial(&conclusion_str))
+        && !relational(raw_inner_concl);
     let stub_findings = audit_referenced_local_defs_for_stubs(
         decl,
         &unfolded_decl.binders,
@@ -6805,7 +6931,14 @@ pub(super) fn audit_single_decl_spec_full_with_policy(
         &neg_compiled_sigs,
         &binder_types_map,
         &neg_base_decls,
-    );
+    )
+    .or_else(|| {
+        if !is_trivial_conclusion && relational(raw_inner_concl) {
+            Some("relational_hyperproperty_verified(varied_unconstrained_binders)".to_string())
+        } else {
+            None
+        }
+    });
     let has_neg_witness = !is_trivial_conclusion && computed_neg_witness.is_some();
     let neg_witness = if let Some(nw) = computed_neg_witness {
         nw
@@ -6918,6 +7051,17 @@ fn collect_imported_or_sibling_lean_files(file: &Path) -> Vec<PathBuf> {
         let mut fallback = Vec::new();
         if let Some(parent) = file.parent() {
             fallback.extend(crate::lake_build::collect_lean_files(parent));
+            if let Some(grandparent) = parent.parent() {
+                if let Ok(entries) = fs::read_dir(grandparent) {
+                    for p in entries
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("lean"))
+                    {
+                        fallback.push(p);
+                    }
+                }
+            }
         }
         fallback.sort();
         fallback.dedup();
@@ -6967,6 +7111,19 @@ fn collect_imported_or_sibling_lean_files(file: &Path) -> Vec<PathBuf> {
             for p in crate::lake_build::collect_lean_files(parent) {
                 if p != file {
                     ordered.push(p);
+                }
+            }
+            if let Some(grandparent) = parent.parent() {
+                if let Ok(entries) = fs::read_dir(grandparent) {
+                    for p in entries
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("lean"))
+                    {
+                        if p != file && !ordered.contains(&p) {
+                            ordered.push(p);
+                        }
+                    }
                 }
             }
             ordered.sort();
@@ -7179,13 +7336,48 @@ fn audit_spec_file_or_source_inner(
                 Err(e) => read_errors.push(format!("unreadable_source: {} ({})", p.display(), e)),
             }
         }
+        if v.is_empty() && read_errors.is_empty() {
+            let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+            return serde_json::json!({
+                "status": "error",
+                "ok": false,
+                "verdict": "error",
+                "error": format!("No readable Lean files found in {}", file.display()),
+                "file": file.display().to_string(),
+                "decl": decl_filter.unwrap_or("file"),
+                "elapsed_ms": elapsed_ms,
+                "ms": elapsed_ms,
+            });
+        }
         v
     } else {
+        if !file.exists() {
+            let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+            return serde_json::json!({
+                "status": "error",
+                "ok": false,
+                "verdict": "error",
+                "error": format!("Failed to read {}: path does not exist", file.display()),
+                "file": file.display().to_string(),
+                "decl": decl_filter.unwrap_or("file"),
+                "elapsed_ms": elapsed_ms,
+                "ms": elapsed_ms,
+            });
+        }
         let mut v: Vec<(PathBuf, String)> = match preloaded_file_src.or_else(|| fs::read_to_string(file).ok()) {
             Some(s) => vec![(file.to_path_buf(), s)],
             None => {
-                read_errors.push(format!("unreadable_source: {}", file.display()));
-                Vec::new()
+                let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+                return serde_json::json!({
+                    "status": "error",
+                    "ok": false,
+                    "verdict": "error",
+                    "error": format!("Failed to read {}", file.display()),
+                    "file": file.display().to_string(),
+                    "decl": decl_filter.unwrap_or("file"),
+                    "elapsed_ms": elapsed_ms,
+                    "ms": elapsed_ms,
+                });
             }
         };
         if expand_umbrella_subdir {
@@ -7455,8 +7647,18 @@ pub fn audit_spec_files_with_policy(
     let mut spec_details = Vec::new();
     let mut file_labels = Vec::new();
     let mut cache_hits = 0usize;
+    let mut any_report_error = false;
+    let mut error_messages = Vec::new();
 
     for rep in &per_file_reports {
+        if rep["status"].as_str() == Some("error")
+            || (rep["ok"].as_bool() == Some(false) && rep["verdict"].as_str() == Some("error"))
+        {
+            any_report_error = true;
+            if let Some(em) = rep["error"].as_str() {
+                error_messages.push(em.to_string());
+            }
+        }
         if let Some(f) = rep["file"].as_str() {
             file_labels.push(f.to_string());
         }
@@ -7510,7 +7712,8 @@ pub fn audit_spec_files_with_policy(
                     && total_specs_audited > 0
                     && r["verdict"].as_str() == Some("decl_not_found"))
         });
-    let tier1_clean = !worker_panicked
+    let tier1_clean = !any_report_error
+        && !worker_panicked
         && !unmatched_decl_filter
         && all_files_ok
         && vacuous_specs == 0
@@ -7525,11 +7728,11 @@ pub fn audit_spec_files_with_policy(
         file_labels.join(", ")
     };
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
-    serde_json::json!({
+    let mut out = serde_json::json!({
         "schema_version": AUDIT_SPEC_CACHE_SCHEMA_VERSION,
-        "status": if tier1_clean { "ok" } else { "failed" },
+        "status": if any_report_error { "error" } else if tier1_clean { "ok" } else { "failed" },
         "ok": tier1_clean,
-        "verdict": if unmatched_decl_filter { "decl_not_found" } else { "specs_audited" },
+        "verdict": if any_report_error { "error" } else if unmatched_decl_filter { "decl_not_found" } else { "specs_audited" },
         "policy": policy.policy,
         "file": top_file_label,
         "files": file_labels,
@@ -7554,7 +7757,11 @@ pub fn audit_spec_files_with_policy(
         "cache_hits": cache_hits,
         "elapsed_ms": elapsed_ms,
         "ms": elapsed_ms,
-    })
+    });
+    if !error_messages.is_empty() {
+        out["error"] = serde_json::json!(error_messages.join("; "));
+    }
+    out
 }
 
 /// Audit theorem specifications in `files` for vacuous preconditions and postcondition tightness.
@@ -7584,12 +7791,7 @@ pub fn run_audit_spec_command_with_options(
         forbid_decl_kinds,
     );
     let report = audit_spec_files_with_policy(files, decl_filter, &policy);
-    if !crate::mcp::is_invoked_by_autonomous_governor()
-        && std::env::var("SANDBOXED_TELEMETRY_BATCH_ONLY")
-            .unwrap_or_default()
-            .trim()
-            != "1"
-    {
+    if crate::mcp::should_emit_cli_telemetry() {
         let ok_flag = report["ok"].as_bool().unwrap_or(false);
         let decl_label = decl_filter.map(String::from).unwrap_or_else(|| {
             if files.len() == 1 {
@@ -7606,8 +7808,9 @@ pub fn run_audit_spec_command_with_options(
         } else {
             first_file.parent().unwrap_or_else(|| Path::new("."))
         };
-        let proj_id = crate::mcp::derive_telemetry_project_id(Some(proj_dir));
-        crate::mcp::emit_sandboxed_telemetry_event(
+        crate::mcp::emit_cli_telemetry_event(
+            Some(proj_dir),
+            true,
             serde_json::json!({
                 "schema": "turbo-lean.telemetry.v1",
                 "tool_name": "audit_spec",
@@ -7615,7 +7818,6 @@ pub fn run_audit_spec_command_with_options(
                 "policy": report["policy"],
                 "decl_name": decl_label,
                 "file_path": report["file"],
-                "project_id": proj_id,
                 "status": if ok_flag { "ok" } else { "failed" },
                 "accepted": ok_flag,
                 "total_specs_audited": report["total_specs_audited"],

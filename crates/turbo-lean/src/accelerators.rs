@@ -26,9 +26,15 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-fn default_true() -> bool { true }
-fn default_budget_ms() -> u64 { 25 }
-fn default_timeout_ms() -> u64 { 25 }
+fn default_true() -> bool {
+    true
+}
+fn default_budget_ms() -> u64 {
+    25
+}
+fn default_timeout_ms() -> u64 {
+    25
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcceleratorInput {
@@ -100,25 +106,15 @@ impl AcceleratorConfig {
     /// 3. `<project_dir>/turbo-lean.toml`,
     /// falling back to the zero-config defaults (`enabled: true, default_budget_ms: 25`).
     pub fn load(project_dir: Option<&Path>) -> Self {
-        let mut cfg = None;
-        if let Ok(env_val) = std::env::var("TURBO_LEAN_ACCELERATORS_CONFIG") {
-            let trimmed = env_val.trim();
-            if !trimmed.is_empty() {
-                cfg = Self::parse_config_str(trimmed)
-                    .or_else(|| fs::read_to_string(trimmed).ok().and_then(|t| Self::parse_config_str(&t)));
-            }
-        }
-        if cfg.is_none() {
-            if let Some(dir) = project_dir {
-                for rel in [".turbo-lean/accelerators.json", "turbo-lean.toml"] {
-                    if let Some(c) = fs::read_to_string(dir.join(rel)).ok().and_then(|t| Self::parse_config_str(&t)) {
-                        cfg = Some(c);
-                        break;
-                    }
-                }
-            }
-        }
-        let mut resolved = cfg.unwrap_or_default();
+        let mut resolved = crate::shm_cache::load_project_or_env_config(
+            None,
+            "TURBO_LEAN_ACCELERATORS_CONFIG",
+            project_dir,
+            &[".turbo-lean/accelerators.json", "turbo-lean.toml"],
+            false,
+            Self::parse_config_str,
+        )
+        .unwrap_or_default();
         if let Ok(dis) = std::env::var("TURBO_LEAN_DISABLE_ACCEL") {
             for item in dis.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                 if item == "all" {
@@ -144,83 +140,67 @@ impl AcceleratorConfig {
 
     /// Lightweight zero-dependency parser for `turbo-lean.toml` accelerator sections.
     fn parse_simple_toml(text: &str) -> Option<Self> {
-        let mut cfg = Self::default();
-        let mut current_ext: Option<ExternalAcceleratorSpec> = None;
-        let mut parsed_any = false;
-        let flush_ext = |cfg: &mut Self, cur: &mut Option<ExternalAcceleratorSpec>| {
-            if let Some(ext) = cur.take() {
-                if !ext.name.is_empty() && !ext.command.is_empty() {
-                    cfg.external.push(ext);
-                }
+        use crate::shm_cache::{
+            for_each_toml_entry, parse_relaxed_bool, parse_relaxed_toml_string_array,
+            unquote_toml_scalar,
+        };
+        let (mut cfg, mut cur, mut parsed_any) = (Self::default(), None::<ExternalAcceleratorSpec>, false);
+        let flush = |cfg: &mut Self, cur: &mut Option<ExternalAcceleratorSpec>| {
+            if let Some(ext) = cur.take().filter(|e| !e.name.is_empty() && !e.command.is_empty()) {
+                cfg.external.push(ext);
             }
         };
-
-        for raw_line in text.lines() {
-            let line = raw_line.split('#').next().unwrap_or("").trim();
-            if line.is_empty() {
-                continue;
+        for_each_toml_entry(text, |sec, key, val| {
+            if key.is_empty() {
+                flush(&mut cfg, &mut cur);
+                if sec == "[[accelerators.external]]" || sec == "[[external]]" {
+                    cur = Some(ExternalAcceleratorSpec {
+                        name: String::new(),
+                        command: Vec::new(),
+                        timeout_ms: default_timeout_ms(),
+                        trigger_tactics: Vec::new(),
+                    });
+                }
+                parsed_any = true;
+                return;
             }
-            if line == "[[accelerators.external]]" || line == "[[external]]" {
-                flush_ext(&mut cfg, &mut current_ext);
-                current_ext = Some(ExternalAcceleratorSpec {
-                    name: String::new(),
-                    command: Vec::new(),
-                    timeout_ms: default_timeout_ms(),
-                    trigger_tactics: Vec::new(),
-                });
-                parsed_any = true;
-            } else if line.starts_with('[') && line.ends_with(']') {
-                flush_ext(&mut cfg, &mut current_ext);
-                parsed_any = true;
-            } else if let Some((k, v)) = line.split_once('=') {
-                let (key, val) = (k.trim(), v.trim());
-                parsed_any = true;
-                if let Some(ref mut ext) = current_ext {
-                    match key {
-                        "name" => ext.name = unquote_str(val),
-                        "command" => ext.command = parse_string_array(val),
-                        "timeout_ms" => if let Ok(ms) = val.parse() { ext.timeout_ms = ms; },
-                        "trigger_tactics" => ext.trigger_tactics = parse_string_array(val),
-                        _ => {}
-                    }
-                } else {
-                    match key {
-                        "enabled" => if let Ok(b) = val.parse() { cfg.enabled = b; },
-                        "default_budget_ms" => if let Ok(ms) = val.parse() { cfg.default_budget_ms = ms; },
-                        "disabled_builtins" => cfg.disabled_builtins = parse_string_array(val),
-                        _ => {}
-                    }
+            parsed_any = true;
+            if let Some(ref mut ext) = cur {
+                match key {
+                    "name" => ext.name = unquote_toml_scalar(val),
+                    "command" => ext.command = parse_relaxed_toml_string_array(val),
+                    "timeout_ms" => ext.timeout_ms = val.parse().unwrap_or(ext.timeout_ms),
+                    "trigger_tactics" => ext.trigger_tactics = parse_relaxed_toml_string_array(val),
+                    _ => {}
+                }
+            } else if sec.is_empty() || sec == "[accelerators]" {
+                match key {
+                    "enabled" => cfg.enabled = parse_relaxed_bool(val).unwrap_or(cfg.enabled),
+                    "default_budget_ms" => cfg.default_budget_ms = val.parse().unwrap_or(cfg.default_budget_ms),
+                    "disabled_builtins" => cfg.disabled_builtins = parse_relaxed_toml_string_array(val),
+                    _ => {}
                 }
             }
-        }
-        flush_ext(&mut cfg, &mut current_ext);
+        });
+        flush(&mut cfg, &mut cur);
         parsed_any.then_some(cfg)
     }
 }
 
-fn unquote_str(s: &str) -> String {
-    let t = s.trim();
-    if (t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\'')) {
-        t[1..t.len() - 1].to_string()
-    } else {
-        t.to_string()
-    }
+/// Raw value of `key` (an array may span lines) in the `[section]` table of a simple TOML file.
+pub(crate) fn toml_value(text: &str, section: &str, key: &str) -> Option<String> {
+    let header = format!("[{}]", section);
+    let mut found = None;
+    crate::shm_cache::for_each_toml_entry(text, |sec, k, v| {
+        if found.is_none() && sec == header && k == key {
+            found = Some(v.to_string());
+        }
+    });
+    found
 }
 
-fn parse_string_array(s: &str) -> Vec<String> {
-    let t = s.trim();
-    if let Ok(arr) = serde_json::from_str::<Vec<String>>(t) {
-        return arr;
-    }
-    let inner = t
-        .strip_prefix('[')
-        .and_then(|x| x.strip_suffix(']'))
-        .unwrap_or(t);
-    inner
-        .split(',')
-        .map(unquote_str)
-        .filter(|x| !x.is_empty())
-        .collect()
+pub(crate) fn toml_string_array(text: &str, section: &str, key: &str) -> Option<Vec<String>> {
+    toml_value(text, section, key).map(|v| crate::shm_cache::parse_relaxed_toml_string_array(&v))
 }
 
 /// Pluggable tactic/proof/counterexample accelerator trait.
@@ -257,19 +237,59 @@ pub fn is_excluded_core_constant(c: &str) -> bool {
     }
     if matches!(
         t,
-        "Eq" | "Eq.refl" | "Eq.ndrec" | "Eq.rec" | "Eq.symm" | "Eq.trans" | "True" | "True.intro"
-            | "False" | "False.elim" | "Nat" | "Bool" | "Bool.true" | "Bool.false" | "And" | "Or"
-            | "Not" | "Iff" | "propext" | "Quot.sound" | "Quot.lift" | "Quot.mk"
-            | "Classical.choice" | "congrArg" | "congrFun" | "congrFun'" | "congr" | " rfl"
-            | "rfl" | "id" | "Function.comp" | "HAdd.hAdd" | "instHAdd" | "instAddNat"
-            | "HMul.hMul" | "instHMul" | "instMulNat" | "OfNat.ofNat" | "instOfNatNat"
-            | "of_eq_true" | "eq_self"
+        "Eq" | "Eq.refl"
+            | "Eq.ndrec"
+            | "Eq.rec"
+            | "Eq.symm"
+            | "Eq.trans"
+            | "True"
+            | "True.intro"
+            | "False"
+            | "False.elim"
+            | "Nat"
+            | "Bool"
+            | "Bool.true"
+            | "Bool.false"
+            | "And"
+            | "Or"
+            | "Not"
+            | "Iff"
+            | "propext"
+            | "Quot.sound"
+            | "Quot.lift"
+            | "Quot.mk"
+            | "Classical.choice"
+            | "congrArg"
+            | "congrFun"
+            | "congrFun'"
+            | "congr"
+            | " rfl"
+            | "rfl"
+            | "id"
+            | "Function.comp"
+            | "HAdd.hAdd"
+            | "instHAdd"
+            | "instAddNat"
+            | "HMul.hMul"
+            | "instHMul"
+            | "instMulNat"
+            | "OfNat.ofNat"
+            | "instOfNatNat"
+            | "of_eq_true"
+            | "eq_self"
     ) {
         return true;
     }
-    [".rec", ".recOn", ".casesOn", ".ndrec", ".noConfusion", ".noConfusionType"]
-        .iter()
-        .any(|sfx| t.ends_with(sfx))
+    [
+        ".rec",
+        ".recOn",
+        ".casesOn",
+        ".ndrec",
+        ".noConfusion",
+        ".noConfusionType",
+    ]
+    .iter()
+    .any(|sfx| t.ends_with(sfx))
 }
 
 fn contains_undistilled_simp_or_grind(body_src: &str) -> Option<&'static str> {
@@ -339,17 +359,7 @@ fn distilled_hint_keys(decl_name: &str, stmt_src: &str) -> Vec<String> {
 }
 
 fn distilled_hints_shm_path() -> std::path::PathBuf {
-    #[cfg(unix)]
-    let uid = unsafe { libc::geteuid() };
-    #[cfg(not(unix))]
-    let uid = 0u32;
-    let base = if Path::new("/dev/shm").is_dir() {
-        std::path::PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    };
-    base.join(format!("turbo-lean-staging-{}", uid))
-        .join("distilled_hints.json")
+    crate::shm_cache::staging_shm_dir().join("distilled_hints.json")
 }
 
 fn distilled_hints_disk_path() -> Option<std::path::PathBuf> {
@@ -404,11 +414,16 @@ pub fn lookup_distilled_constants(decl_name: &str, stmt_src: &str) -> Vec<String
         return Vec::new();
     }
     let keys = distilled_hint_keys(decl_name, stmt_src);
-    for path in [Some(distilled_hints_shm_path()), distilled_hints_disk_path()].into_iter().flatten() {
-        if let Some(map) = fs::read(&path)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<std::collections::BTreeMap<String, Vec<String>>>(&b).ok())
-        {
+    for path in [
+        Some(distilled_hints_shm_path()),
+        distilled_hints_disk_path(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(map) = fs::read(&path).ok().and_then(|b| {
+            serde_json::from_slice::<std::collections::BTreeMap<String, Vec<String>>>(&b).ok()
+        }) {
             for k in &keys {
                 if let Some(v) = map.get(k).filter(|v| !v.is_empty()) {
                     return v.clone();
@@ -444,7 +459,11 @@ impl TacticAccelerator for SimdSimpDistiller {
                 std::borrow::Cow::Borrowed(&input.available_constants)
             };
 
-        let selected = distill_constants_for_simp_chain(&input.stmt_src, &input.body_src, &candidate_constants);
+        let selected = distill_constants_for_simp_chain(
+            &input.stmt_src,
+            &input.body_src,
+            &candidate_constants,
+        );
         if selected.is_empty() {
             return None;
         }
@@ -563,16 +582,17 @@ impl TacticAccelerator for CutFissionAccelerator {
         }
 
         let candidate1 = format!("theorem {} {} := {}", decl_name, stmt_trimmed, body_trimmed);
-        let mut sub_shards =
-            crate::splitter::fission_theorem_have_blocks(&candidate1, decl_name);
+        let mut sub_shards = crate::splitter::fission_theorem_have_blocks(&candidate1, decl_name);
         if sub_shards.len() < 2
             && !stmt_trimmed.starts_with(':')
             && !stmt_trimmed.starts_with('(')
             && !stmt_trimmed.starts_with('{')
             && !stmt_trimmed.starts_with('[')
         {
-            let candidate2 =
-                format!("theorem {} : {} := {}", decl_name, stmt_trimmed, body_trimmed);
+            let candidate2 = format!(
+                "theorem {} : {} := {}",
+                decl_name, stmt_trimmed, body_trimmed
+            );
             sub_shards = crate::splitter::fission_theorem_have_blocks(&candidate2, decl_name);
         }
 
@@ -588,7 +608,24 @@ impl TacticAccelerator for CutFissionAccelerator {
 }
 
 const SIMD_OMEGA_BOUNDARY_U64: [u64; 18] = [
-    0, 1, 2, 3, 7, 8, 15, 16, 31, 32, 63, 64, 100, 255, 256, 1024, u32::MAX as u64, u64::MAX,
+    0,
+    1,
+    2,
+    3,
+    7,
+    8,
+    15,
+    16,
+    31,
+    32,
+    63,
+    64,
+    100,
+    255,
+    256,
+    1024,
+    u32::MAX as u64,
+    u64::MAX,
 ];
 
 #[inline]
@@ -769,9 +806,7 @@ fn scan_stmt_binders(s: &str) -> (Vec<(char, String)>, bool, String, bool) {
     (binders, found_colon, tail, hit_unexpected)
 }
 
-fn parse_omega_stmt(
-    raw_stmt: &str,
-) -> Option<(Vec<(String, OmegaParamDom)>, Vec<String>, String)> {
+fn parse_omega_stmt(raw_stmt: &str) -> Option<(Vec<(String, OmegaParamDom)>, Vec<String>, String)> {
     let s = strip_decl_header_and_assign(raw_stmt);
     let (binders, found_colon, tail, _) = scan_stmt_binders(&s);
     let mut params: Vec<(String, OmegaParamDom)> = Vec::new();
@@ -779,7 +814,8 @@ fn parse_omega_stmt(
 
     for (open, inner) in binders {
         if open == '(' || open == '{' {
-            if let Some((vars_part, ty_part)) = crate::gpu_fastcheck::split_top_level_colon(&inner) {
+            if let Some((vars_part, ty_part)) = crate::gpu_fastcheck::split_top_level_colon(&inner)
+            {
                 if let Some(dom) = classify_omega_binder_dom(ty_part) {
                     for v in vars_part.split_whitespace() {
                         let vt = v.trim();
@@ -811,11 +847,7 @@ fn parse_omega_stmt(
         let Some((lhs_part, rhs_part)) = binding.split_once(":=") else {
             break;
         };
-        let var_name = lhs_part
-            .split(':')
-            .next()
-            .unwrap_or("")
-            .trim();
+        let var_name = lhs_part.split(':').next().unwrap_or("").trim();
         let rhs_trim = rhs_part.trim();
         let next_prop = after_semi.trim();
         if var_name.is_empty()
@@ -849,11 +881,7 @@ fn parse_omega_stmt(
         let Some((lhs_part, rhs_part)) = binding.split_once(":=") else {
             break;
         };
-        let var_name = lhs_part
-            .split(':')
-            .next()
-            .unwrap_or("")
-            .trim();
+        let var_name = lhs_part.split(':').next().unwrap_or("").trim();
         let rhs_trim = rhs_part.trim();
         let next_concl = after_semi.trim();
         if var_name.is_empty()
@@ -1048,9 +1076,10 @@ impl OmegaParser {
                         Box::new(OmegaAst::Lit(1)),
                     ))
                 }
-                "BitVec.not" | "bitNot" => {
-                    Some(OmegaAst::Unary("~".to_string(), Box::new(self.parse_unary()?)))
-                }
+                "BitVec.not" | "bitNot" => Some(OmegaAst::Unary(
+                    "~".to_string(),
+                    Box::new(self.parse_unary()?),
+                )),
                 _ if id.starts_with("Word256.")
                     || id.starts_with("Uint256.")
                     || id.starts_with("UInt256.") =>
@@ -1178,7 +1207,9 @@ fn eval_omega_ast(
                 if l == short {
                     return Some(OmegaVal::Bool(short));
                 }
-                return Some(OmegaVal::Bool(eval_omega_ast(rhs, env, default_dom)?.as_bool()?));
+                return Some(OmegaVal::Bool(
+                    eval_omega_ast(rhs, env, default_dom)?.as_bool()?,
+                ));
             }
             let lv = eval_omega_ast(lhs, env, default_dom)?;
             let rv = eval_omega_ast(rhs, env, default_dom)?;
@@ -1194,25 +1225,45 @@ fn eval_omega_ast(
                 "<=" | "≤" => Some(OmegaVal::Bool(a <= b)),
                 ">" => Some(OmegaVal::Bool(a > b)),
                 ">=" | "≥" => Some(OmegaVal::Bool(a >= b)),
-                "+" => (if is_int { a.checked_add(b) } else { mask_dom(a.wrapping_add(b)) }).map(OmegaVal::Int),
+                "+" => (if is_int {
+                    a.checked_add(b)
+                } else {
+                    mask_dom(a.wrapping_add(b))
+                })
+                .map(OmegaVal::Int),
                 "-" => match default_dom {
                     OmegaParamDom::Nat => Some(OmegaVal::Int((a - b).max(0))),
                     OmegaParamDom::Int => a.checked_sub(b).map(OmegaVal::Int),
                     _ => mask_dom(a.wrapping_sub(b)).map(OmegaVal::Int),
                 },
-                "*" => (if is_int { a.checked_mul(b) } else { mask_dom(a.wrapping_mul(b)) }).map(OmegaVal::Int),
+                "*" => (if is_int {
+                    a.checked_mul(b)
+                } else {
+                    mask_dom(a.wrapping_mul(b))
+                })
+                .map(OmegaVal::Int),
                 "/" => {
                     if matches!(default_dom, OmegaParamDom::Int) && (a < 0 || b < 0) {
                         None
                     } else {
-                        (if b == 0 { Some(0) } else { a.checked_div(b).and_then(mask_dom) }).map(OmegaVal::Int)
+                        (if b == 0 {
+                            Some(0)
+                        } else {
+                            a.checked_div(b).and_then(mask_dom)
+                        })
+                        .map(OmegaVal::Int)
                     }
                 }
                 "%" => {
                     if matches!(default_dom, OmegaParamDom::Int) && (a < 0 || b < 0) {
                         None
                     } else {
-                        (if b == 0 { mask_dom(a) } else { a.checked_rem(b).and_then(mask_dom) }).map(OmegaVal::Int)
+                        (if b == 0 {
+                            mask_dom(a)
+                        } else {
+                            a.checked_rem(b).and_then(mask_dom)
+                        })
+                        .map(OmegaVal::Int)
                     }
                 }
                 "&&&" => {
@@ -1259,7 +1310,11 @@ fn eval_omega_ast(
                     }
                     OmegaParamDom::Int => None,
                     OmegaParamDom::BitVec(_) => {
-                        let w_mask = if dom_width >= 64 { u64::MAX } else { (1u64 << dom_width) - 1 };
+                        let w_mask = if dom_width >= 64 {
+                            u64::MAX
+                        } else {
+                            (1u64 << dom_width) - 1
+                        };
                         let (au, bu) = ((a as u64) & w_mask, b.max(0) as u64);
                         let s = if bu >= dom_width as u64 {
                             0
@@ -1271,7 +1326,11 @@ fn eval_omega_ast(
                         mask_dom(s as i128).map(OmegaVal::Int)
                     }
                     OmegaParamDom::UInt(_) => {
-                        let w_mask = if dom_width >= 64 { u64::MAX } else { (1u64 << dom_width) - 1 };
+                        let w_mask = if dom_width >= 64 {
+                            u64::MAX
+                        } else {
+                            (1u64 << dom_width) - 1
+                        };
                         let (au, bu) = ((a as u64) & w_mask, b.max(0) as u64);
                         let sh = (bu % (dom_width as u64)) as u32;
                         let s = if op == "<<<" {
@@ -1302,9 +1361,7 @@ fn omega_ast_occurs(ast: &OmegaAst, var_name: &str) -> bool {
         OmegaAst::Var(v) => v == var_name,
         OmegaAst::Lit(_) | OmegaAst::BoolLit(_) => false,
         OmegaAst::Unary(_, inner) => omega_ast_occurs(inner, var_name),
-        OmegaAst::Binary(_, l, r) => {
-            omega_ast_occurs(l, var_name) || omega_ast_occurs(r, var_name)
-        }
+        OmegaAst::Binary(_, l, r) => omega_ast_occurs(l, var_name) || omega_ast_occurs(r, var_name),
     }
 }
 
@@ -1336,13 +1393,14 @@ impl ParsedOmegaGoal {
 
         for _pass in 0..8 {
             let mut found: Option<(usize, String, OmegaAst)> = None;
-            let occurs_elsewhere = |hyps_slice: &[OmegaAst], skip_idx: usize, v: &str, concl_ast: &OmegaAst| -> bool {
-                omega_ast_occurs(concl_ast, v)
-                    || hyps_slice
-                        .iter()
-                        .enumerate()
-                        .any(|(j, hj)| j != skip_idx && omega_ast_occurs(hj, v))
-            };
+            let occurs_elsewhere =
+                |hyps_slice: &[OmegaAst], skip_idx: usize, v: &str, concl_ast: &OmegaAst| -> bool {
+                    omega_ast_occurs(concl_ast, v)
+                        || hyps_slice
+                            .iter()
+                            .enumerate()
+                            .any(|(j, hj)| j != skip_idx && omega_ast_occurs(hj, v))
+                };
             for (idx, h) in hyps.iter().enumerate() {
                 if let OmegaAst::Binary(op, l, r) = h {
                     if op == "=" || op == "==" {
@@ -1443,7 +1501,11 @@ impl ParsedOmegaGoal {
         }
     }
 
-    fn extract_linear_le_row(&self, ast: &OmegaAst, is_hypothesis: bool) -> Option<(Vec<u64>, u64)> {
+    fn extract_linear_le_row(
+        &self,
+        ast: &OmegaAst,
+        is_hypothesis: bool,
+    ) -> Option<(Vec<u64>, u64)> {
         if !self
             .params
             .iter()
@@ -1496,10 +1558,8 @@ impl ParsedOmegaGoal {
                     let mut r_const = 0u64;
                     collect_lin_terms(r, scale, params, &mut r_coeffs, &mut r_const)?;
                     let rem_const = l_const.checked_sub(r_const)?;
-                    for ((dst, &lc), &rc) in coeffs
-                        .iter_mut()
-                        .zip(l_coeffs.iter())
-                        .zip(r_coeffs.iter())
+                    for ((dst, &lc), &rc) in
+                        coeffs.iter_mut().zip(l_coeffs.iter()).zip(r_coeffs.iter())
                     {
                         let rem_c = lc.checked_sub(rc)?;
                         *dst = dst.checked_add(rem_c)?;
@@ -1576,9 +1636,7 @@ impl ParsedOmegaGoal {
                 normalize_le(rhs, lhs, false)
             }
             OmegaAst::Binary(op, lhs, rhs) if op == ">" => normalize_le(rhs, lhs, true),
-            OmegaAst::Binary(op, lhs, rhs)
-                if is_hypothesis && (op == "=" || op == "==") =>
-            {
+            OmegaAst::Binary(op, lhs, rhs) if is_hypothesis && (op == "=" || op == "==") => {
                 normalize_le(lhs, rhs, false).or_else(|| normalize_le(rhs, lhs, false))
             }
             _ => None,
@@ -1593,27 +1651,24 @@ impl ParsedOmegaGoal {
         for ha in &self.hyp_asts {
             Self::flatten_conj_hypotheses(ha, &mut leaves);
         }
-        let try_on_system =
-            |hyps: &[&OmegaAst], concl: &OmegaAst| -> Option<(Vec<u64>, String)> {
-                let mut matrix = Vec::with_capacity(hyps.len());
-                let mut rhs = Vec::with_capacity(hyps.len());
-                for &ha in hyps {
-                    if let Some((row, b)) = self.extract_linear_le_row(ha, true) {
-                        matrix.push(row);
-                        rhs.push(b);
-                    }
+        let try_on_system = |hyps: &[&OmegaAst], concl: &OmegaAst| -> Option<(Vec<u64>, String)> {
+            let mut matrix = Vec::with_capacity(hyps.len());
+            let mut rhs = Vec::with_capacity(hyps.len());
+            for &ha in hyps {
+                if let Some((row, b)) = self.extract_linear_le_row(ha, true) {
+                    matrix.push(row);
+                    rhs.push(b);
                 }
-                if matrix.is_empty() {
-                    return None;
-                }
-                let (obj, bound) = self.extract_linear_le_row(concl, false)?;
-                let weights =
-                    crate::c_abi::synthesize_farkas_nat_weights(&matrix, &rhs, &obj, bound)?;
-                let cert_str = crate::c_abi::format_farkas_lean4_certificate(
-                    &weights, &matrix, &rhs, &obj, bound,
-                );
-                Some((weights, cert_str))
-            };
+            }
+            if matrix.is_empty() {
+                return None;
+            }
+            let (obj, bound) = self.extract_linear_le_row(concl, false)?;
+            let weights = crate::c_abi::synthesize_farkas_nat_weights(&matrix, &rhs, &obj, bound)?;
+            let cert_str =
+                crate::c_abi::format_farkas_lean4_certificate(&weights, &matrix, &rhs, &obj, bound);
+            Some((weights, cert_str))
+        };
         if let Some(res) = try_on_system(&leaves, &self.concl_ast) {
             return Some(res);
         }
@@ -1835,7 +1890,9 @@ fn rewrite_explicit_tactic_list_to_only(raw_body: &str, target_kw: &str) -> Opti
 fn rewrite_explicit_simp_list_to_simp_only(raw_body: &str) -> Option<String> {
     let mut cur: Option<String> = None;
     for kw in ["simp", "simpa", "simp_all"] {
-        if let Some(next) = rewrite_explicit_tactic_list_to_only(cur.as_deref().unwrap_or(raw_body), kw) {
+        if let Some(next) =
+            rewrite_explicit_tactic_list_to_only(cur.as_deref().unwrap_or(raw_body), kw)
+        {
             cur = Some(next);
         }
     }
@@ -1872,21 +1929,41 @@ impl TacticAccelerator for SimdDiscrTreePrunerAccel {
 }
 
 fn is_pure_rewrite_lemma_list(s: &str) -> bool {
-    !s.trim().is_empty() && s.split(',').all(|item| { let t = item.trim().trim_start_matches("←").trim_start_matches("<-").trim(); !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '\'')) })
+    !s.trim().is_empty()
+        && s.split(',').all(|item| {
+            let t = item
+                .trim()
+                .trim_start_matches("←")
+                .trim_start_matches("<-")
+                .trim();
+            !t.is_empty()
+                && t.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '\''))
+        })
 }
 
 fn try_collapse_rw_rfl_chain(stmt_src: &str, stripped_body: &str) -> Option<String> {
-    if !stmt_src.contains('=') { return None; }
+    if !stmt_src.contains('=') {
+        return None;
+    }
     let after_by = stripped_body.strip_prefix("by")?.trim();
-    let (head, sep_rel) = after_by.find([';', '\n']).map(|i| (&after_by[..i], i)).unwrap_or((after_by, after_by.len()));
+    let (head, sep_rel) = after_by
+        .find([';', '\n'])
+        .map(|i| (&after_by[..i], i))
+        .unwrap_or((after_by, after_by.len()));
     let (kind, rules) = match parse_rw_kind_bracket_and_loc(head.trim()) {
         Some((kw, rules, None)) if matches!(kw, "rw" | "erw" | "simp_rw") => (kw, rules),
-        _ => parse_simp_kind_only_bracket_and_loc(head.trim()).and_then(|(kw, rules, loc)| (matches!(kw, "simp" | "dsimp") && loc.is_none()).then_some((kw, rules)))?,
+        _ => parse_simp_kind_only_bracket_and_loc(head.trim()).and_then(|(kw, rules, loc)| {
+            (matches!(kw, "simp" | "dsimp") && loc.is_none()).then_some((kw, rules))
+        })?,
     };
-    if !is_pure_rewrite_lemma_list(rules) { return None; }
+    if !is_pure_rewrite_lemma_list(rules) {
+        return None;
+    }
     let tail = after_by.get(sep_rel + 1..).unwrap_or("").trim();
     let empty_ok = sep_rel == after_by.len() && matches!(kind, "rw" | "simp_rw");
-    ((empty_ok || !tail.contains([';', '\n'])) && (empty_ok || matches!(tail, "rfl" | "done"))).then(|| format!("by simp only [{}]", rules))
+    ((empty_ok || !tail.contains([';', '\n'])) && (empty_ok || matches!(tail, "rfl" | "done")))
+        .then(|| format!("by simp only [{}]", rules))
 }
 
 fn split_top_level_semicolons(s: &str) -> Vec<&str> {
@@ -1932,28 +2009,68 @@ fn split_line_indent_and_by_prefix(line: &str) -> (&str, &str) {
 }
 
 fn is_valid_at_loc(loc: &str) -> bool {
-    !loc.is_empty() && loc.split_whitespace().all(|tok| tok == "*" || tok == "⊢" || tok.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '\'')))
+    !loc.is_empty()
+        && loc.split_whitespace().all(|tok| {
+            tok == "*"
+                || tok == "⊢"
+                || tok
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '\''))
+        })
 }
 
 fn parse_rw_kind_bracket_and_loc(seg: &str) -> Option<(&'static str, &str, Option<String>)> {
     let trimmed = seg.trim();
-    let (kw, rest) = ["simp_rw", "erw", "rw"].into_iter().find_map(|k| trimmed.strip_prefix(k).map(|r| (k, r)))?;
+    let (kw, rest) = ["simp_rw", "erw", "rw"]
+        .into_iter()
+        .find_map(|k| trimmed.strip_prefix(k).map(|r| (k, r)))?;
     let bracket_str = rest.trim_start();
-    if !bracket_str.starts_with('[') { return None; }
+    if !bracket_str.starts_with('[') {
+        return None;
+    }
     let (mut depth, mut close_idx) = (0usize, None);
-    for (idx, b) in bracket_str.bytes().enumerate() { match b { b'[' => depth += 1, b']' => { depth = depth.saturating_sub(1); if depth == 0 { close_idx = Some(idx); break; } } _ => {} } }
+    for (idx, b) in bracket_str.bytes().enumerate() {
+        match b {
+            b'[' => depth += 1,
+            b']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    close_idx = Some(idx);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
     let c_idx = close_idx?;
     let inner = bracket_str[1..c_idx].trim();
-    if inner.is_empty() { return None; }
+    if inner.is_empty() {
+        return None;
+    }
     let tail = bracket_str[c_idx + 1..].trim();
-    if tail.is_empty() { return Some((kw, inner, None)); }
+    if tail.is_empty() {
+        return Some((kw, inner, None));
+    }
     let loc = tail.strip_prefix("at")?.trim();
-    is_valid_at_loc(loc).then(|| (kw, inner, Some(loc.split_whitespace().collect::<Vec<_>>().join(" "))))
+    is_valid_at_loc(loc).then(|| {
+        (
+            kw,
+            inner,
+            Some(loc.split_whitespace().collect::<Vec<_>>().join(" ")),
+        )
+    })
 }
 
 fn format_rw_with_loc(kw: &str, rules: &[impl AsRef<str>], loc: Option<&str>) -> String {
-    let joined = rules.iter().map(|s| s.as_ref()).collect::<Vec<_>>().join(", ");
-    loc.map_or_else(|| format!("{} [{}]", kw, joined), |l| format!("{} [{}] at {}", kw, joined, l))
+    let joined = rules
+        .iter()
+        .map(|s| s.as_ref())
+        .collect::<Vec<_>>()
+        .join(", ");
+    loc.map_or_else(
+        || format!("{} [{}]", kw, joined),
+        |l| format!("{} [{}] at {}", kw, joined, l),
+    )
 }
 
 fn fuse_consecutive_rw_chains(body: &str) -> Option<String> {
@@ -1972,7 +2089,9 @@ fn fuse_consecutive_rw_chains(body: &str) -> Option<String> {
                     let mut rules_group = vec![first_rules];
                     let mut next_idx = idx + 1;
                     while next_idx < segs.len() {
-                        if let Some((n_kw, more_rules, next_loc)) = parse_rw_kind_bracket_and_loc(segs[next_idx]) {
+                        if let Some((n_kw, more_rules, next_loc)) =
+                            parse_rw_kind_bracket_and_loc(segs[next_idx])
+                        {
                             if n_kw == kw && next_loc == loc {
                                 rules_group.push(more_rules);
                                 next_idx += 1;
@@ -2018,12 +2137,25 @@ fn fuse_consecutive_rw_chains(body: &str) -> Option<String> {
                 let nxt_indent = &nxt[..nxt_indent_len];
                 let nxt_after = &nxt[nxt_indent_len..];
                 let indent_ok = if is_leading_by {
-                    expected_child_indent.map(|e| nxt_indent == e).unwrap_or_else(|| { if nxt_indent.is_empty() { false } else { expected_child_indent = Some(nxt_indent); true } })
+                    expected_child_indent
+                        .map(|e| nxt_indent == e)
+                        .unwrap_or_else(|| {
+                            if nxt_indent.is_empty() {
+                                false
+                            } else {
+                                expected_child_indent = Some(nxt_indent);
+                                true
+                            }
+                        })
                 } else {
-                    nxt_indent == indent || (prefix.trim_start().starts_with('·') && nxt_indent.chars().count() == prefix.chars().count())
+                    nxt_indent == indent
+                        || (prefix.trim_start().starts_with('·')
+                            && nxt_indent.chars().count() == prefix.chars().count())
                 };
                 if indent_ok {
-                    if let Some((n_kw, more_rules, next_loc)) = parse_rw_kind_bracket_and_loc(nxt_after) {
+                    if let Some((n_kw, more_rules, next_loc)) =
+                        parse_rw_kind_bracket_and_loc(nxt_after)
+                    {
                         if n_kw == kw && next_loc == loc {
                             rules_group.push(more_rules.to_string());
                             next_idx += 1;
@@ -2034,7 +2166,11 @@ fn fuse_consecutive_rw_chains(body: &str) -> Option<String> {
                 break;
             }
             if rules_group.len() >= 2 {
-                final_lines.push(format!("{}{}", prefix, format_rw_with_loc(kw, &rules_group, loc.as_deref())));
+                final_lines.push(format!(
+                    "{}{}",
+                    prefix,
+                    format_rw_with_loc(kw, &rules_group, loc.as_deref())
+                ));
                 changed = true;
                 line_idx = next_idx;
                 continue;
@@ -2066,9 +2202,10 @@ fn parse_pure_unfold_ids_and_loc(seg: &str) -> Option<(Vec<&str>, Option<String>
         (&toks[..], None)
     };
     (!ids_slice.is_empty()
-        && ids_slice
-            .iter()
-            .all(|tok| tok.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '\''))))
+        && ids_slice.iter().all(|tok| {
+            tok.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '\''))
+        }))
     .then(|| (ids_slice.to_vec(), loc))
 }
 
@@ -2079,10 +2216,12 @@ fn format_dsimp_only_with_loc(ids: &[&str], loc: Option<&str>) -> String {
     }
 }
 
-/// Compute ANVIL2/TRM Matryoshka token-stem affinity score between a theorem statement `stmt_src`
-/// and a candidate constant `constant` (combining 64-bit bloom overlap with stem token matching).
-pub fn score_constant_trm_affinity(stmt_src: &str, constant: &str) -> i64 {
-    let stmt_mask = simd_ident_bloom_mask_u64(stmt_src);
+fn score_constant_affinity_with_optional_logit(
+    stmt_src: &str,
+    stmt_mask: u64,
+    constant: &str,
+    neural_logit: Option<f32>,
+) -> i64 {
     let cand_mask = simd_ident_bloom_mask_u64(constant);
     let mut score = ((stmt_mask & cand_mask).count_ones() as i64) * 10;
     for part in constant.split(['.', '_']).filter(|p| p.len() >= 3) {
@@ -2090,13 +2229,41 @@ pub fn score_constant_trm_affinity(stmt_src: &str, constant: &str) -> i64 {
             score += 250 + (part.len() as i64) * 8;
         }
     }
+    if let Some(logit) = neural_logit {
+        score += (logit * 120.0).round() as i64;
+    }
     score
 }
 
-fn distill_constants_for_simp_chain(
+/// Compute ANVIL2 / MUDD-TRM Matryoshka premise affinity score between a theorem statement
+/// `stmt_src` and a candidate constant `constant` (combining 64-bit bloom overlap, stem token
+/// matching, and opt-in `TURBO_LEAN_MATRYOSHKA_RANKING=1` Matryoshka S0/S1 neural logit).
+pub fn score_constant_trm_affinity(stmt_src: &str, constant: &str) -> i64 {
+    let stmt_mask = simd_ident_bloom_mask_u64(stmt_src);
+    let neural_logit = if crate::matryoshka::matryoshka_ranking_enabled() {
+        crate::matryoshka::global_matryoshka_runtime()
+            .and_then(|rt| rt.score_constant_affinity(stmt_src, constant))
+    } else {
+        None
+    };
+    score_constant_affinity_with_optional_logit(stmt_src, stmt_mask, constant, neural_logit)
+}
+
+/// Evaluate quantized `int8` Matryoshka MUDD-TRM vacuity hazard in permille `[0, 1000]`.
+pub fn score_stmt_trm_vacuity_permille(decl_name: &str, stmt_src: &str) -> i64 {
+    if let Some(rt) = crate::matryoshka::global_matryoshka_runtime() {
+        if let Some(permille) = rt.vacuity_hazard_permille(decl_name, stmt_src) {
+            return permille;
+        }
+    }
+    0
+}
+
+fn distill_constants_for_simp_chain_inner(
     stmt_src: &str,
     body_src: &str,
     available_constants: &[String],
+    use_neural_ranking: bool,
 ) -> Vec<String> {
     let context_mask = simd_ident_bloom_mask_u64(stmt_src) | simd_ident_bloom_mask_u64(body_src);
     let mut non_core: Vec<String> = Vec::new();
@@ -2122,19 +2289,72 @@ fn distill_constants_for_simp_chain(
         non_core
     };
     if selected.len() > 16 {
-        selected.sort_by_key(|c| std::cmp::Reverse(score_constant_trm_affinity(stmt_src, c)));
+        let stmt_mask = simd_ident_bloom_mask_u64(stmt_src);
+        let neural_eval = if use_neural_ranking {
+            crate::matryoshka::global_matryoshka_runtime()
+                .map(|rt| rt.evaluate_lean_goal("anon", stmt_src, Some(&selected), None, "s0"))
+        } else {
+            None
+        };
+        let logit_map: HashMap<&str, f32> = neural_eval
+            .as_ref()
+            .map(|ev| {
+                ev.ranked_available_scores
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), *v))
+                    .collect()
+            })
+            .unwrap_or_default();
+        selected.sort_by_key(|c| {
+            std::cmp::Reverse(score_constant_affinity_with_optional_logit(
+                stmt_src,
+                stmt_mask,
+                c,
+                logit_map.get(c.as_str()).copied(),
+            ))
+        });
         selected.truncate(16);
     }
     selected
+}
+
+fn distill_constants_for_simp_chain(
+    stmt_src: &str,
+    body_src: &str,
+    available_constants: &[String],
+) -> Vec<String> {
+    distill_constants_for_simp_chain_inner(
+        stmt_src,
+        body_src,
+        available_constants,
+        crate::matryoshka::matryoshka_ranking_enabled(),
+    )
 }
 
 fn is_unfold_followup(seg: &str) -> bool {
     let kw = seg.trim().split([' ', '\t', '[']).next().unwrap_or("");
     matches!(
         kw,
-        "simp" | "simpa" | "simp_all" | "simp_rw" | "rw" | "erw" | "split" | "cases"
-            | "rcases" | "omega" | "decide" | "rfl" | "exact" | "intro" | "rintro" | "intros"
-            | "ring" | "linarith" | "contradiction" | "trivial"
+        "simp"
+            | "simpa"
+            | "simp_all"
+            | "simp_rw"
+            | "rw"
+            | "erw"
+            | "split"
+            | "cases"
+            | "rcases"
+            | "omega"
+            | "decide"
+            | "rfl"
+            | "exact"
+            | "intro"
+            | "rintro"
+            | "intros"
+            | "ring"
+            | "linarith"
+            | "contradiction"
+            | "trivial"
     )
 }
 
@@ -2168,7 +2388,9 @@ fn rewrite_unfold_dsimp_simp(
                     let mut all_ids = first_ids;
                     let mut next_idx = idx + 1;
                     while next_idx < segs.len() {
-                        if let Some((more_ids, n_loc)) = parse_pure_unfold_ids_and_loc(segs[next_idx]) {
+                        if let Some((more_ids, n_loc)) =
+                            parse_pure_unfold_ids_and_loc(segs[next_idx])
+                        {
                             if n_loc == loc {
                                 all_ids.extend(more_ids);
                                 next_idx += 1;
@@ -2216,7 +2438,9 @@ fn rewrite_unfold_dsimp_simp(
                 let ln_ind = &ln[..ln.len() - ln.trim_start_matches([' ', '\t']).len()];
                 let ind_ok = ln_ind == cur_indent
                     || (next_l == 1 && l_idx == 0 && prefix.trim() == "by" && !ln_ind.is_empty())
-                    || (next_l == l_idx + 1 && prefix.trim_start().starts_with('·') && ln_ind.chars().count() == prefix.chars().count());
+                    || (next_l == l_idx + 1
+                        && prefix.trim_start().starts_with('·')
+                        && ln_ind.chars().count() == prefix.chars().count());
                 if ind_ok {
                     if let Some((more_ids, n_loc)) = parse_pure_unfold_ids_and_loc(ln.trim()) {
                         if n_loc == loc {
@@ -2234,21 +2458,44 @@ fn rewrite_unfold_dsimp_simp(
                 let l1_ind = &l1[..l1.len() - l1.trim_start_matches([' ', '\t']).len()];
                 let ind_ok = l1_ind == cur_indent
                     || (next_l == 1 && l_idx == 0 && prefix.trim() == "by" && !l1_ind.is_empty())
-                    || (next_l == l_idx + 1 && prefix.trim_start().starts_with('·') && l1_ind.chars().count() == prefix.chars().count());
+                    || (next_l == l_idx + 1
+                        && prefix.trim_start().starts_with('·')
+                        && l1_ind.chars().count() == prefix.chars().count());
                 if ind_ok {
-                    let (is_dsimp, f_idx) = if l1.trim() == "dsimp" && next_l + 1 < out_lines.len() {
+                    let (is_dsimp, f_idx) = if l1.trim() == "dsimp" && next_l + 1 < out_lines.len()
+                    {
                         let l2 = &out_lines[next_l + 1];
                         let l2_ind = &l2[..l2.len() - l2.trim_start_matches([' ', '\t']).len()];
-                        if l2_ind == l1_ind && is_unfold_followup(l2) { (true, next_l + 1) } else { (false, next_l) }
-                    } else { (false, next_l) };
+                        if l2_ind == l1_ind && is_unfold_followup(l2) {
+                            (true, next_l + 1)
+                        } else {
+                            (false, next_l)
+                        }
+                    } else {
+                        (false, next_l)
+                    };
                     if is_unfold_followup(&out_lines[f_idx]) {
                         let f_line = &out_lines[f_idx];
-                        let f_ind = &f_line[..f_line.len() - f_line.trim_start_matches([' ', '\t']).len()];
+                        let f_ind =
+                            &f_line[..f_line.len() - f_line.trim_start_matches([' ', '\t']).len()];
                         if is_dsimp {
-                            final_lines.push(format!("{}{}; {}", prefix, format_dsimp_only_with_loc(&unfold_ids, loc.as_deref()), format_simp_or_rw_followup(f_line, &distilled_simp)));
+                            final_lines.push(format!(
+                                "{}{}; {}",
+                                prefix,
+                                format_dsimp_only_with_loc(&unfold_ids, loc.as_deref()),
+                                format_simp_or_rw_followup(f_line, &distilled_simp)
+                            ));
                         } else {
-                            final_lines.push(format!("{}{}", prefix, format_dsimp_only_with_loc(&unfold_ids, loc.as_deref())));
-                            final_lines.push(format!("{}{}", f_ind, format_simp_or_rw_followup(f_line, &distilled_simp)));
+                            final_lines.push(format!(
+                                "{}{}",
+                                prefix,
+                                format_dsimp_only_with_loc(&unfold_ids, loc.as_deref())
+                            ));
+                            final_lines.push(format!(
+                                "{}{}",
+                                f_ind,
+                                format_simp_or_rw_followup(f_line, &distilled_simp)
+                            ));
                         }
                         changed = true;
                         l_idx = f_idx + 1;
@@ -2272,7 +2519,10 @@ fn ends_with_pure_rw_bracket(head: &str) -> bool {
         .copied()
         .unwrap_or(tactic_part)
         .trim();
-    matches!(parse_rw_kind_bracket_and_loc(last_seg), Some(("rw" | "simp_rw", _, None)))
+    matches!(
+        parse_rw_kind_bracket_and_loc(last_seg),
+        Some(("rw" | "simp_rw", _, None))
+    )
 }
 
 fn try_collapse_intro_exact_eta(stripped_body: &str) -> Option<String> {
@@ -2290,14 +2540,18 @@ fn try_collapse_intro_exact_eta(stripped_body: &str) -> Option<String> {
         .trim_start();
     let vars: Vec<&str> = intro_vars_str.split_whitespace().collect();
     if vars.is_empty()
-        || !vars
-            .iter()
-            .all(|v| v.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '\'')))
+        || !vars.iter().all(|v| {
+            v.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '\''))
+        })
     {
         return None;
     }
 
-    let exact_tokens: Vec<&str> = exact_part.strip_prefix("exact")?.split_whitespace().collect();
+    let exact_tokens: Vec<&str> = exact_part
+        .strip_prefix("exact")?
+        .split_whitespace()
+        .collect();
     let fn_tok = *exact_tokens.first()?;
     (exact_tokens.len() == vars.len() + 1
         && fn_tok
@@ -2309,23 +2563,48 @@ fn try_collapse_intro_exact_eta(stripped_body: &str) -> Option<String> {
 }
 
 fn try_collapse_bare_exact(stripped_body: &str) -> Option<String> {
-    let term = stripped_body.strip_prefix("by")?.trim().strip_prefix("exact")?.trim();
-    (!term.is_empty() && !term.contains([' ', '\n', ';']) && term.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '\''))).then(|| term.to_string())
+    let term = stripped_body
+        .strip_prefix("by")?
+        .trim()
+        .strip_prefix("exact")?
+        .trim();
+    (!term.is_empty()
+        && !term.contains([' ', '\n', ';'])
+        && term
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '\'')))
+    .then(|| term.to_string())
 }
 
 fn parse_simp_kind_only_bracket_and_loc(seg: &str) -> Option<(&'static str, &str, Option<String>)> {
     let trimmed = seg.trim();
-    let (kw, rest) = ["simp_all", "simpa", "dsimp", "simp"].into_iter().find_map(|k| trimmed.strip_prefix(k).map(|r| (k, r)))?;
+    let (kw, rest) = ["simp_all", "simpa", "dsimp", "simp"]
+        .into_iter()
+        .find_map(|k| trimmed.strip_prefix(k).map(|r| (k, r)))?;
     let after_only = rest.trim_start().strip_prefix("only")?.trim_start();
-    if !after_only.starts_with('[') { return None; }
+    if !after_only.starts_with('[') {
+        return None;
+    }
     let close_idx = after_only.find(']')?;
     let inner = after_only[1..close_idx].trim();
-    if inner.is_empty() { return None; }
+    if inner.is_empty() {
+        return None;
+    }
     let tail = after_only[close_idx + 1..].trim();
-    if tail.is_empty() { return Some((kw, inner, None)); }
-    if kw == "simpa" && tail.starts_with("using ") && !tail.contains(" at ") { return Some((kw, inner, Some(tail.to_string()))); }
+    if tail.is_empty() {
+        return Some((kw, inner, None));
+    }
+    if kw == "simpa" && tail.starts_with("using ") && !tail.contains(" at ") {
+        return Some((kw, inner, Some(tail.to_string())));
+    }
     let loc = tail.strip_prefix("at")?.trim();
-    is_valid_at_loc(loc).then(|| (kw, inner, Some(loc.split_whitespace().collect::<Vec<_>>().join(" "))))
+    is_valid_at_loc(loc).then(|| {
+        (
+            kw,
+            inner,
+            Some(loc.split_whitespace().collect::<Vec<_>>().join(" ")),
+        )
+    })
 }
 
 fn format_simp_with_tail(kw: &str, items: String, tail: Option<&str>) -> String {
@@ -2336,39 +2615,90 @@ fn format_simp_with_tail(kw: &str, items: String, tail: Option<&str>) -> String 
     }
 }
 
-fn pure_ident(s: &str) -> bool { !s.is_empty() && !s.contains(' ') && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '\'')) }
+fn pure_ident(s: &str) -> bool {
+    !s.is_empty()
+        && !s.contains(' ')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '\''))
+}
 fn try_collapse_rw_exact_lemma(b: &str) -> Option<String> {
-    let a = b.strip_prefix("by")?.trim(); let i = a.find([';', '\n'])?; let (h, t) = (a[..i].trim(), a[i + 1..].trim());
-    if t.contains([';', '\n']) { return None; }
-    let rules = match parse_rw_kind_bracket_and_loc(h) { Some(("rw", r, None)) => r, _ => parse_simp_kind_only_bracket_and_loc(h).and_then(|(k, r, l)| (k == "simp" && l.is_none()).then_some(r))? };
+    let a = b.strip_prefix("by")?.trim();
+    let i = a.find([';', '\n'])?;
+    let (h, t) = (a[..i].trim(), a[i + 1..].trim());
+    if t.contains([';', '\n']) {
+        return None;
+    }
+    let rules = match parse_rw_kind_bracket_and_loc(h) {
+        Some(("rw", r, None)) => r,
+        _ => parse_simp_kind_only_bracket_and_loc(h)
+            .and_then(|(k, r, l)| (k == "simp" && l.is_none()).then_some(r))?,
+    };
     let lemma = t.strip_prefix("exact")?.trim();
-    (is_pure_rewrite_lemma_list(rules) && pure_ident(lemma)).then(|| format!("by simpa only [{}] using {}", rules, lemma))
+    (is_pure_rewrite_lemma_list(rules) && pure_ident(lemma))
+        .then(|| format!("by simpa only [{}] using {}", rules, lemma))
 }
 fn try_collapse_simpa_using(b: &str) -> Option<String> {
-    let a = b.strip_prefix("by")?.trim(); if a.contains([';', '\n']) { return None; }
-    let (kw, rules, tail) = parse_simp_kind_only_bracket_and_loc(a)?; let lemma = tail.as_deref()?.strip_prefix("using ")?.trim();
-    (kw == "simpa" && is_pure_rewrite_lemma_list(rules) && pure_ident(lemma)).then(|| format!("by simpa only [{}] using {}", rules, lemma))
+    let a = b.strip_prefix("by")?.trim();
+    if a.contains([';', '\n']) {
+        return None;
+    }
+    let (kw, rules, tail) = parse_simp_kind_only_bracket_and_loc(a)?;
+    let lemma = tail.as_deref()?.strip_prefix("using ")?.trim();
+    (kw == "simpa" && is_pure_rewrite_lemma_list(rules) && pure_ident(lemma))
+        .then(|| format!("by simpa only [{}] using {}", rules, lemma))
 }
 
 fn try_fuse_simp_pair(first: &str, second: &str) -> Option<String> {
-    if let (Some(("simp_rw", r1, loc1)), Some(("simp", s2, loc2))) = (parse_rw_kind_bracket_and_loc(first), parse_simp_kind_only_bracket_and_loc(second)) {
-        if loc1 == loc2 && is_pure_rewrite_lemma_list(r1) { return Some(format_simp_with_tail("simp", format!("{}, {}", r1, s2), loc2.as_deref())); }
+    if let (Some(("simp_rw", r1, loc1)), Some(("simp", s2, loc2))) = (
+        parse_rw_kind_bracket_and_loc(first),
+        parse_simp_kind_only_bracket_and_loc(second),
+    ) {
+        if loc1 == loc2 && is_pure_rewrite_lemma_list(r1) {
+            return Some(format_simp_with_tail(
+                "simp",
+                format!("{}, {}", r1, s2),
+                loc2.as_deref(),
+            ));
+        }
     }
     if let Some((kw2, s2, loc2)) = parse_simp_kind_only_bracket_and_loc(second) {
         let u2 = loc2.as_deref().is_some_and(|t| t.starts_with("using "));
         if let Some((kw1, s1, loc1)) = parse_simp_kind_only_bracket_and_loc(first) {
-            if (loc1 == loc2 && kw1 == kw2 && kw1 != "simpa") || (kw1 == "simp" && kw2 == "simpa" && loc1.is_none() && (loc2.is_none() || u2)) {
-                return Some(format_simp_with_tail(kw2, format!("{}, {}", s1, s2), loc2.as_deref()));
+            if (loc1 == loc2 && kw1 == kw2 && kw1 != "simpa")
+                || (kw1 == "simp" && kw2 == "simpa" && loc1.is_none() && (loc2.is_none() || u2))
+            {
+                return Some(format_simp_with_tail(
+                    kw2,
+                    format!("{}, {}", s1, s2),
+                    loc2.as_deref(),
+                ));
             }
         } else if matches!(kw2, "simp" | "simpa") {
             if let Some((rk, r1, loc1)) = parse_rw_kind_bracket_and_loc(first) {
-                if matches!(rk, "rw" | "simp_rw") && is_pure_rewrite_lemma_list(r1) && ((kw2 == "simp" && loc1 == loc2) || (kw2 == "simpa" && loc1.is_none() && (loc2.is_none() || u2))) {
-                    return Some(format_simp_with_tail(kw2, format!("{}, {}", r1, s2), loc2.as_deref()));
+                if matches!(rk, "rw" | "simp_rw")
+                    && is_pure_rewrite_lemma_list(r1)
+                    && ((kw2 == "simp" && loc1 == loc2)
+                        || (kw2 == "simpa" && loc1.is_none() && (loc2.is_none() || u2)))
+                {
+                    return Some(format_simp_with_tail(
+                        kw2,
+                        format!("{}, {}", r1, s2),
+                        loc2.as_deref(),
+                    ));
                 }
             }
         }
-    } else if let (Some(("simp", s1, loc1)), Some((rk, r2, loc2))) = (parse_simp_kind_only_bracket_and_loc(first), parse_rw_kind_bracket_and_loc(second)) {
-        if matches!(rk, "rw" | "simp_rw") && loc1 == loc2 && is_pure_rewrite_lemma_list(r2) { return Some(format_simp_with_tail("simp", format!("{}, {}", s1, r2), loc1.as_deref())); }
+    } else if let (Some(("simp", s1, loc1)), Some((rk, r2, loc2))) = (
+        parse_simp_kind_only_bracket_and_loc(first),
+        parse_rw_kind_bracket_and_loc(second),
+    ) {
+        if matches!(rk, "rw" | "simp_rw") && loc1 == loc2 && is_pure_rewrite_lemma_list(r2) {
+            return Some(format_simp_with_tail(
+                "simp",
+                format!("{}, {}", s1, r2),
+                loc1.as_deref(),
+            ));
+        }
     }
     None
 }
@@ -2412,7 +2742,8 @@ fn fuse_rw_or_simp_only_with_simp_only(body: &str) -> Option<String> {
             let p_indent = &prev[..prev.len() - prev.trim_start_matches([' ', '\t']).len()];
             let indent_ok = cur_indent == p_indent
                 || (is_first && p_prefix.trim() == "by" && !cur_indent.is_empty())
-                || (p_prefix.trim_start().starts_with('·') && cur_indent.chars().count() == p_prefix.chars().count());
+                || (p_prefix.trim_start().starts_with('·')
+                    && cur_indent.chars().count() == p_prefix.chars().count());
             if indent_ok {
                 if let Some(fused) = try_fuse_simp_pair(p_after, &cur[cur_indent.len()..]) {
                     *prev = format!("{}{}", p_prefix, fused);
@@ -2446,7 +2777,11 @@ fn strip_redundant_trailing_tactic_suffix(body: &str) -> Option<String> {
             line.to_string()
         })
         .collect();
-    let working = if line_changed { lines.join("\n") } else { body.to_string() };
+    let working = if line_changed {
+        lines.join("\n")
+    } else {
+        body.to_string()
+    };
 
     if let Some(idx) = working.rfind('\n') {
         let (head, tail) = (working[..idx].trim_end(), working[idx + 1..].trim());
@@ -2608,16 +2943,32 @@ const SIMD_BV_BOUNDARY_U64: [u64; 6] = [
 
 fn mentions_bv_or_word256(s: &str) -> bool {
     const KEYWORDS: [&str; 21] = [
-        "Word256", "Uint256", "UInt256", "BitVec", "UInt64", "UInt32", "UInt16", "UInt8",
-        "StorageKey", "<<<", ">>>", "&&&", "|||", "^^^", "shl", "shr", "bitAnd", "bitOr",
-        "bitXor", "bitNot", "bv_decide",
+        "Word256",
+        "Uint256",
+        "UInt256",
+        "BitVec",
+        "UInt64",
+        "UInt32",
+        "UInt16",
+        "UInt8",
+        "StorageKey",
+        "<<<",
+        ">>>",
+        "&&&",
+        "|||",
+        "^^^",
+        "shl",
+        "shr",
+        "bitAnd",
+        "bitOr",
+        "bitXor",
+        "bitNot",
+        "bv_decide",
     ];
     KEYWORDS.iter().any(|kw| s.contains(kw))
 }
 
-fn check_bv_shift_or_mask_truncation_pattern(
-    stmt_src: &str,
-) -> Option<(String, Option<String>)> {
+fn check_bv_shift_or_mask_truncation_pattern(stmt_src: &str) -> Option<(String, Option<String>)> {
     let goal = ParsedOmegaGoal::parse(stmt_src, OmegaParamDom::UInt(64))?;
     if goal.free_vars.is_empty() || !goal.all_free_vars_bound() {
         return None;
@@ -2882,9 +3233,14 @@ fn extract_ac_equality_conclusion(stmt_src: &str) -> Option<(String, String)> {
             b'(' | b'{' | b'[' => c_depth += 1,
             b')' | b'}' | b']' => c_depth = c_depth.saturating_sub(1),
             b'=' if c_depth == 0 => {
-                let prev = idx.checked_sub(1).and_then(|i| c_bytes.get(i)).copied().unwrap_or(b' ');
+                let prev = idx
+                    .checked_sub(1)
+                    .and_then(|i| c_bytes.get(i))
+                    .copied()
+                    .unwrap_or(b' ');
                 let next = c_bytes.get(idx + 1).copied().unwrap_or(b' ');
-                if !matches!(prev, b'=' | b'!' | b'<' | b'>' | b':') && !matches!(next, b'=' | b'>') {
+                if !matches!(prev, b'=' | b'!' | b'<' | b'>' | b':') && !matches!(next, b'=' | b'>')
+                {
                     if eq_idx.replace(idx).is_some() {
                         return None;
                     }
@@ -3071,7 +3427,10 @@ impl TpuGuidedTacticSynthAccel {
                     });
                 }
                 let new_body_src = if bool_params.len() == 2 && has_multiline_cases {
-                    format!("by cases {} <;> cases {} <;> rfl", bool_params[0], bool_params[1])
+                    format!(
+                        "by cases {} <;> cases {} <;> rfl",
+                        bool_params[0], bool_params[1]
+                    )
                 } else {
                     "by decide".to_string()
                 };
@@ -3205,9 +3564,22 @@ fn mentions_riscv_or_spt(s: &str) -> bool {
 
 fn is_riscv_spt_proj_lemma(c: &str) -> bool {
     const PROJ_KWS: [&str; 16] = [
-        "spt", "Spt", "riscv", "Riscv", "readReg", "writeReg", "RegisterFile", "Machine",
-        "ComputationCache", "boxedValue", "evaluateTargetHOL", "InitE", "ziskCsr",
-        "declaredGasLimit", "bootstrapSteps", "Flapjack",
+        "spt",
+        "Spt",
+        "riscv",
+        "Riscv",
+        "readReg",
+        "writeReg",
+        "RegisterFile",
+        "Machine",
+        "ComputationCache",
+        "boxedValue",
+        "evaluateTargetHOL",
+        "InitE",
+        "ziskCsr",
+        "declaredGasLimit",
+        "bootstrapSteps",
+        "Flapjack",
     ];
     PROJ_KWS.iter().any(|kw| c.contains(kw))
 }
@@ -3234,9 +3606,15 @@ impl TacticAccelerator for SimdRiscvStepCertAccel {
         let clean_body = crate::splitter::strip_lean_comments(&input.body_src);
 
         // B. Step-Budget Counterexample Rejection (`WitnessRefuter`)
-        if ["<=", "≤", ".finite", "evaluateTargetHOL", "InitE.Certificate"]
-            .iter()
-            .any(|kw| clean_stmt.contains(kw))
+        if [
+            "<=",
+            "≤",
+            ".finite",
+            "evaluateTargetHOL",
+            "InitE.Certificate",
+        ]
+        .iter()
+        .any(|kw| clean_stmt.contains(kw))
         {
             if let Some((witness_summary, suggested_hyp)) =
                 crate::gpu_fastcheck::try_riscv_step_budget_fast_reject(
@@ -3413,12 +3791,24 @@ const SNARK_MICRO_MODEL_SPECS: [(&str, f64, &[&str]); 14] = [
     (
         "vectored_gather_writev",
         1.41,
-        &["GatherBundle", "write_vectored", "IoSlice", "late_close", "proof_io"],
+        &[
+            "GatherBundle",
+            "write_vectored",
+            "IoSlice",
+            "late_close",
+            "proof_io",
+        ],
     ),
     (
         "in_pool_yield_spin",
         1.33,
-        &["pool_spin", "yield_now", "spawn_broadcast", "seed_pipe", "epool"],
+        &[
+            "pool_spin",
+            "yield_now",
+            "spawn_broadcast",
+            "seed_pipe",
+            "epool",
+        ],
     ),
     (
         "nontemporal_stream_store",
@@ -3440,7 +3830,15 @@ const SNARK_MICRO_MODEL_SPECS: [(&str, f64, &[&str]); 14] = [
     (
         "gf128_poly_reduce",
         1.52,
-        &["F128", "GF128", "gf2_128", "pmull", "clmul", "0x87", "SnarkFast"],
+        &[
+            "F128",
+            "GF128",
+            "gf2_128",
+            "pmull",
+            "clmul",
+            "0x87",
+            "SnarkFast",
+        ],
     ),
     (
         "finite_bitvec_word",
@@ -3529,7 +3927,8 @@ impl TacticAccelerator for SimdSnarkKernelCertAccel {
             });
         }
 
-        let (pred_mult, domain_hits) = SnarkLlvmMicroModel::predict_speedup(&clean_stmt, &clean_body);
+        let (pred_mult, domain_hits) =
+            SnarkLlvmMicroModel::predict_speedup(&clean_stmt, &clean_body);
         if domain_hits == 0 {
             return None;
         }
@@ -3657,7 +4056,11 @@ impl TacticAccelerator for ExternalProcessAccelerator {
         }
         serde_json::from_str::<AcceleratorCertificate>(trimmed)
             .ok()
-            .or_else(|| serde_json::from_str::<Option<AcceleratorCertificate>>(trimmed).ok().flatten())
+            .or_else(|| {
+                serde_json::from_str::<Option<AcceleratorCertificate>>(trimmed)
+                    .ok()
+                    .flatten()
+            })
     }
 }
 
@@ -3755,11 +4158,12 @@ impl AcceleratorRegistry {
                     } => {
                         let base =
                             (parse_speedup_hint_multiplier(estimated_speedup_hint) * 1000.0) as i64;
-                        let bonus = if has_distilled && accelerator_name == "builtin:simd-simp-distiller" {
-                            100_000
-                        } else {
-                            0
-                        };
+                        let bonus =
+                            if has_distilled && accelerator_name == "builtin:simd-simp-distiller" {
+                                100_000
+                            } else {
+                                0
+                            };
                         (1, base + bonus)
                     }
                     _ => (2, 0),
@@ -3859,11 +4263,24 @@ mod tests {
         let distiller = SimdSimpDistiller;
         let input = AcceleratorInput {
             decl_name: "word_nat_comm".into(),
-            stmt_src: "(a b : Nat) (w : Word256) : a + b = b + a ∧ Word256.add Word256.zero w = w".into(),
+            stmt_src: "(a b : Nat) (w : Word256) : a + b = b + a ∧ Word256.add Word256.zero w = w"
+                .into(),
             body_src: "by simp".into(),
             imports_csv: "Init,TurboLean.FastCheck".into(),
-            available_constants: ["Eq", "True", "Nat", "Bool", "propext", "Quot.sound", "Classical.choice", "Nat.add_comm", "Word256.zero_add"]
-                .into_iter().map(String::from).collect(),
+            available_constants: [
+                "Eq",
+                "True",
+                "Nat",
+                "Bool",
+                "propext",
+                "Quot.sound",
+                "Classical.choice",
+                "Nat.add_comm",
+                "Word256.zero_add",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
             budget_ms: 25,
         };
         assert_eq!(
@@ -3874,7 +4291,12 @@ mod tests {
                 estimated_speedup_hint: "9.1x".into(),
             })
         );
-        assert!(distiller.try_accelerate(&AcceleratorInput { body_src: "by simp only [Nat.add_comm]".into(), ..input }).is_none());
+        assert!(distiller
+            .try_accelerate(&AcceleratorInput {
+                body_src: "by simp only [Nat.add_comm]".into(),
+                ..input
+            })
+            .is_none());
     }
 
     #[test]
@@ -3913,7 +4335,11 @@ mod tests {
             trigger_tactics: vec![],
         };
         let t0 = std::time::Instant::now();
-        let hang_res = ExternalProcessAccelerator::new(hang_spec).try_accelerate(&AcceleratorInput { budget_ms: 30, ..input });
+        let hang_res =
+            ExternalProcessAccelerator::new(hang_spec).try_accelerate(&AcceleratorInput {
+                budget_ms: 30,
+                ..input
+            });
         assert!(hang_res.is_none() && t0.elapsed() < Duration::from_millis(1500));
     }
 
@@ -3959,8 +4385,19 @@ mod tests {
             budget_ms: 25,
         };
 
-        match omega_accel.try_accelerate(&mk_in("buggy_nat_lt", "(a b : Nat) : a + b < a", "by omega")).unwrap() {
-            AcceleratorCertificate::CounterexampleFound { witness_summary, suggested_hypothesis, accelerator_name } => {
+        match omega_accel
+            .try_accelerate(&mk_in(
+                "buggy_nat_lt",
+                "(a b : Nat) : a + b < a",
+                "by omega",
+            ))
+            .unwrap()
+        {
+            AcceleratorCertificate::CounterexampleFound {
+                witness_summary,
+                suggested_hypothesis,
+                accelerator_name,
+            } => {
                 assert_eq!(accelerator_name, "builtin:simd-omega-fastcheck");
                 assert!(witness_summary.contains("a = 0") && suggested_hypothesis.is_some());
             }
@@ -3968,14 +4405,24 @@ mod tests {
         }
 
         assert_eq!(
-            omega_accel.try_accelerate(&mk_in("ground_omega_bound", ": 1024 + 2048 < 4096", "by omega")),
+            omega_accel.try_accelerate(&mk_in(
+                "ground_omega_bound",
+                ": 1024 + 2048 < 4096",
+                "by omega"
+            )),
             Some(AcceleratorCertificate::RewrittenProof {
                 new_body_src: "by decide".into(),
                 accelerator_name: "builtin:simd-omega-fastcheck".into(),
                 estimated_speedup_hint: "4.5x".into(),
             })
         );
-        assert!(omega_accel.try_accelerate(&mk_in("valid_nat_le_add", "(a b : Nat) : a <= a + b", "by omega")).is_none());
+        assert!(omega_accel
+            .try_accelerate(&mk_in(
+                "valid_nat_le_add",
+                "(a b : Nat) : a <= a + b",
+                "by omega"
+            ))
+            .is_none());
 
         let (weights, cert_str) = try_synthesize_farkas_for_stmt(
             "(x y : Nat) (h1 : x + 2 * y <= 10) (h2 : 3 * x + y <= 15) : 5 * x + 5 * y <= 35",
@@ -3988,10 +4435,20 @@ mod tests {
 
     #[test]
     fn test_persistent_distilled_constants_cache_roundtrip() {
-        let (decl_name, stmt_src) = ("test_closed_loop_distill_thm", "(a b : Nat) : a + b = b + a");
-        let used = vec!["Eq".to_string(), "Nat.add_comm".to_string(), "Nat.add_zero".to_string()];
+        let (decl_name, stmt_src) = (
+            "test_closed_loop_distill_thm",
+            "(a b : Nat) : a + b = b + a",
+        );
+        let used = vec![
+            "Eq".to_string(),
+            "Nat.add_comm".to_string(),
+            "Nat.add_zero".to_string(),
+        ];
         record_distilled_constants(decl_name, stmt_src, &used);
-        assert_eq!(lookup_distilled_constants(decl_name, "  (a   b : Nat) :\n  a + b = b + a "), used);
+        assert_eq!(
+            lookup_distilled_constants(decl_name, "  (a   b : Nat) :\n  a + b = b + a "),
+            used
+        );
 
         let input = AcceleratorInput {
             decl_name: decl_name.into(),
@@ -4013,31 +4470,67 @@ mod tests {
 
     #[test]
     fn test_simd_discr_tree_pruner_rewrites_explicit_simp_list_to_simp_only() {
-        assert_eq!(AcceleratorRegistry::from_config(AcceleratorConfig::default()).plugin_count(), 12);
+        assert_eq!(
+            AcceleratorRegistry::from_config(AcceleratorConfig::default()).plugin_count(),
+            12
+        );
         let mut cfg_with_ext = AcceleratorConfig::default();
-        cfg_with_ext.external.push(ExternalAcceleratorSpec { name: "ext-dummy".into(), command: vec!["true".into()], timeout_ms: 25, trigger_tactics: vec![] });
-        assert_eq!(AcceleratorRegistry::from_config(cfg_with_ext).plugin_count(), 13);
+        cfg_with_ext.external.push(ExternalAcceleratorSpec {
+            name: "ext-dummy".into(),
+            command: vec!["true".into()],
+            timeout_ms: 25,
+            trigger_tactics: vec![],
+        });
+        assert_eq!(
+            AcceleratorRegistry::from_config(cfg_with_ext).plugin_count(),
+            13
+        );
 
         let pruner = SimdDiscrTreePrunerAccel;
         let input = AcceleratorInput {
             decl_name: "verity_storage_roundtrip".into(),
-            stmt_src: "(s : Storage) (k : StorageKey) (v : Word256) : getStorage (setStorage s k v) k = v".into(),
+            stmt_src:
+                "(s : Storage) (k : StorageKey) (v : Word256) : getStorage (setStorage s k v) k = v"
+                    .into(),
             body_src: "by simp [getStorage, setStorage, StorageKey.fastBeq_refl]".into(),
             imports_csv: "TurboLean.Reflection".into(),
             available_constants: vec![],
             budget_ms: 25,
         };
         for (b_src, exp) in [
-            ("by simp [getStorage, setStorage, StorageKey.fastBeq_refl]", "by simp only [getStorage, setStorage, StorageKey.fastBeq_refl]"),
-            (":= by simp [Nat.add_comm, Nat.add_left_comm]", "by simp only [Nat.add_comm, Nat.add_left_comm]"),
+            (
+                "by simp [getStorage, setStorage, StorageKey.fastBeq_refl]",
+                "by simp only [getStorage, setStorage, StorageKey.fastBeq_refl]",
+            ),
+            (
+                ":= by simp [Nat.add_comm, Nat.add_left_comm]",
+                "by simp only [Nat.add_comm, Nat.add_left_comm]",
+            ),
         ] {
             assert_eq!(
-                pruner.try_accelerate(&AcceleratorInput { body_src: b_src.into(), ..input.clone() }),
-                Some(AcceleratorCertificate::RewrittenProof { new_body_src: exp.into(), accelerator_name: "builtin:simd-discr-tree-pruner".into(), estimated_speedup_hint: "4.8x".into() })
+                pruner.try_accelerate(&AcceleratorInput {
+                    body_src: b_src.into(),
+                    ..input.clone()
+                }),
+                Some(AcceleratorCertificate::RewrittenProof {
+                    new_body_src: exp.into(),
+                    accelerator_name: "builtin:simd-discr-tree-pruner".into(),
+                    estimated_speedup_hint: "4.8x".into()
+                })
             );
         }
-        for skip_body in ["by simp only [getStorage]", "by simp [*]", "by simp [getStorage, *]", "by simp"] {
-            assert!(pruner.try_accelerate(&AcceleratorInput { body_src: skip_body.into(), ..input.clone() }).is_none());
+        for skip_body in [
+            "by simp only [getStorage]",
+            "by simp [*]",
+            "by simp [getStorage, *]",
+            "by simp",
+        ] {
+            assert!(pruner
+                .try_accelerate(&AcceleratorInput {
+                    body_src: skip_body.into(),
+                    ..input.clone()
+                })
+                .is_none());
         }
     }
 
@@ -4053,9 +4546,17 @@ mod tests {
             budget_ms: 25,
         };
         match bv_accel.try_accelerate(&buggy_shift_input).unwrap() {
-            AcceleratorCertificate::CounterexampleFound { witness_summary, suggested_hypothesis, accelerator_name } => {
+            AcceleratorCertificate::CounterexampleFound {
+                witness_summary,
+                suggested_hypothesis,
+                accelerator_name,
+            } => {
                 assert_eq!(accelerator_name, "builtin:simd-bv-decide-fastcheck");
-                assert!(witness_summary.contains("0x8000000000000000") || witness_summary.contains("0xffffffffffffffff") || witness_summary.contains("sample#"));
+                assert!(
+                    witness_summary.contains("0x8000000000000000")
+                        || witness_summary.contains("0xffffffffffffffff")
+                        || witness_summary.contains("sample#")
+                );
                 assert!(suggested_hypothesis.is_some());
             }
             other => panic!("Expected CounterexampleFound, got {:?}", other),
@@ -4194,9 +4695,15 @@ mod tests {
             available_constants: vec![],
             budget_ms: 25,
         };
-        for body in ["by\n  simp [a, b]\n  simp [c, d]", "by\n  simp only [a, b]\n  simp [c, d]"] {
+        for body in [
+            "by\n  simp [a, b]\n  simp [c, d]",
+            "by\n  simp only [a, b]\n  simp [c, d]",
+        ] {
             assert_eq!(
-                pruner.try_accelerate(&AcceleratorInput { body_src: body.into(), ..multi_input.clone() }),
+                pruner.try_accelerate(&AcceleratorInput {
+                    body_src: body.into(),
+                    ..multi_input.clone()
+                }),
                 Some(AcceleratorCertificate::RewrittenProof {
                     new_body_src: "by\n  simp only [a, b]\n  simp only [c, d]".into(),
                     accelerator_name: "builtin:simd-discr-tree-pruner".into(),
@@ -4211,10 +4718,16 @@ mod tests {
             ("by rw [h]; rfl", "by simp only [h]"),
             ("by simp [a, b]; omega", "by simp only [a, b]; omega"),
             ("by rw [h1]; simp [a, b]", "by simp only [h1, a, b]"),
-            ("by\n  simp only [a]; rfl\n  exact h", "by\n  simp only [a]\n  exact h"),
+            (
+                "by\n  simp only [a]; rfl\n  exact h",
+                "by\n  simp only [a]\n  exact h",
+            ),
         ] {
             assert_eq!(
-                chain_accel.try_accelerate(&AcceleratorInput { body_src: body.into(), ..multi_input.clone() }),
+                chain_accel.try_accelerate(&AcceleratorInput {
+                    body_src: body.into(),
+                    ..multi_input.clone()
+                }),
                 Some(AcceleratorCertificate::RewrittenProof {
                     new_body_src: expected.into(),
                     accelerator_name: "builtin:simd-tactic-chain-optimizer".into(),
@@ -4227,7 +4740,12 @@ mod tests {
         assert_eq!(reg.plugin_count(), 12);
         let json = reg.list_plugins_json();
         assert_eq!(json["active_plugin_count"], 12);
-        let names: Vec<&str> = json["plugins"].as_array().unwrap().iter().filter_map(|p| p["name"].as_str()).collect();
+        let names: Vec<&str> = json["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["name"].as_str())
+            .collect();
         for n in [
             "builtin:simd-tactic-chain-optimizer",
             "builtin:simd-ac-ring-normalizer",
@@ -4253,12 +4771,24 @@ mod tests {
         };
         for (body, expected) in [
             ("by rw [h1]; rw [h2]; rw [h3]", "by rw [h1, h2, h3]"),
-            ("by\n  rw [Nat.add_comm]\n  rw [Nat.add_left_comm]\n  exact h", "by\n  rw [Nat.add_comm, Nat.add_left_comm]\n  exact h"),
-            ("by unfold Word256.addWithCarry Word256.zero; dsimp; simp", "by dsimp only [Word256.addWithCarry, Word256.zero]; simp"),
-            ("by dsimp [stepA, stepB]; omega", "by dsimp only [stepA, stepB]; omega"),
+            (
+                "by\n  rw [Nat.add_comm]\n  rw [Nat.add_left_comm]\n  exact h",
+                "by\n  rw [Nat.add_comm, Nat.add_left_comm]\n  exact h",
+            ),
+            (
+                "by unfold Word256.addWithCarry Word256.zero; dsimp; simp",
+                "by dsimp only [Word256.addWithCarry, Word256.zero]; simp",
+            ),
+            (
+                "by dsimp [stepA, stepB]; omega",
+                "by dsimp only [stepA, stepB]; omega",
+            ),
         ] {
             assert_eq!(
-                chain_accel.try_accelerate(&AcceleratorInput { body_src: body.into(), ..base_input.clone() }),
+                chain_accel.try_accelerate(&AcceleratorInput {
+                    body_src: body.into(),
+                    ..base_input.clone()
+                }),
                 Some(AcceleratorCertificate::RewrittenProof {
                     new_body_src: expected.into(),
                     accelerator_name: "builtin:simd-tactic-chain-optimizer".into(),
@@ -4266,11 +4796,20 @@ mod tests {
                 })
             );
         }
-        assert!(chain_accel.try_accelerate(&AcceleratorInput { body_src: "by\n  rw [h1] at h\n  rw [h2]".into(), ..base_input.clone() }).is_none());
+        assert!(chain_accel
+            .try_accelerate(&AcceleratorInput {
+                body_src: "by\n  rw [h1] at h\n  rw [h2]".into(),
+                ..base_input.clone()
+            })
+            .is_none());
 
         let unfold_with_consts = AcceleratorInput {
             body_src: "by unfold Word256.addWithCarry Word256.zero; dsimp; simp".into(),
-            available_constants: vec!["Eq".into(), "UInt64.add_zero".into(), "Bool.false_eq_true".into()],
+            available_constants: vec![
+                "Eq".into(),
+                "UInt64.add_zero".into(),
+                "Bool.false_eq_true".into(),
+            ],
             ..base_input
         };
         assert_eq!(
@@ -4295,9 +4834,24 @@ mod tests {
             budget_ms: 25,
         };
         for (decl, stmt, body, expected) in [
-            ("nat_add_ac_perm", "(a b c : Nat) : a + (b + c) = (c + a) + b", "by simp [Nat.add_assoc, Nat.add_comm, Nat.add_left_comm]", "by ac_rfl"),
-            ("word_bitand_ac_perm", "(x y z : UInt64) : (x &&& y) &&& z = (z &&& x) &&& y", "by rw [UInt64.and_assoc, UInt64.and_comm]", "by ac_rfl"),
-            ("nat_add_zero_ac_perm", "(a b : Nat) : (a + 0) + b = b + a", "by simp [Nat.add_zero, Nat.add_comm]", "by omega"),
+            (
+                "nat_add_ac_perm",
+                "(a b c : Nat) : a + (b + c) = (c + a) + b",
+                "by simp [Nat.add_assoc, Nat.add_comm, Nat.add_left_comm]",
+                "by ac_rfl",
+            ),
+            (
+                "word_bitand_ac_perm",
+                "(x y z : UInt64) : (x &&& y) &&& z = (z &&& x) &&& y",
+                "by rw [UInt64.and_assoc, UInt64.and_comm]",
+                "by ac_rfl",
+            ),
+            (
+                "nat_add_zero_ac_perm",
+                "(a b : Nat) : (a + 0) + b = b + a",
+                "by simp [Nat.add_zero, Nat.add_comm]",
+                "by omega",
+            ),
         ] {
             assert_eq!(
                 ac_accel.try_accelerate(&mk_ac(decl, stmt, body)),
@@ -4308,8 +4862,20 @@ mod tests {
                 })
             );
         }
-        assert!(ac_accel.try_accelerate(&mk_ac("non_equiv", "(a b c : Nat) : a + b = a + c", "by simp")).is_none());
-        assert!(ac_accel.try_accelerate(&mk_ac("already_ac", "(a b c : Nat) : a + (b + c) = (c + a) + b", "by ac_rfl")).is_none());
+        assert!(ac_accel
+            .try_accelerate(&mk_ac(
+                "non_equiv",
+                "(a b c : Nat) : a + b = a + c",
+                "by simp"
+            ))
+            .is_none());
+        assert!(ac_accel
+            .try_accelerate(&mk_ac(
+                "already_ac",
+                "(a b c : Nat) : a + (b + c) = (c + a) + b",
+                "by ac_rfl"
+            ))
+            .is_none());
     }
 
     #[test]
@@ -4324,9 +4890,24 @@ mod tests {
             budget_ms: 25,
         };
         for (decl, stmt, new_body, hint) in [
-            ("bool_de_morgan", "(a b : Bool) : (!(a && b)) = (!a || !b)", "by decide", "12.4x"),
-            ("ground_mod_arith", ": (1024 + 2048) % 7 = 6", "by decide", "18.0x"),
-            ("linear_nat_bound", "(a b : Nat) (h : a < b) : a + 1 <= b", "by omega", "11.2x"),
+            (
+                "bool_de_morgan",
+                "(a b : Bool) : (!(a && b)) = (!a || !b)",
+                "by decide",
+                "12.4x",
+            ),
+            (
+                "ground_mod_arith",
+                ": (1024 + 2048) % 7 = 6",
+                "by decide",
+                "18.0x",
+            ),
+            (
+                "linear_nat_bound",
+                "(a b : Nat) (h : a < b) : a + 1 <= b",
+                "by omega",
+                "11.2x",
+            ),
         ] {
             assert_eq!(
                 synth.try_accelerate(&mk_in(decl, stmt)),
@@ -4355,45 +4936,119 @@ mod tests {
             budget_ms: 25,
         };
 
-        for erasure_body in ["by simp [-not_and, not_and_or]", "by simp [not_and_or, -not_and]", "by simp [-not_and]"] {
-            assert!(pruner.try_accelerate(&AcceleratorInput { body_src: erasure_body.into(), ..base_input.clone() }).is_none());
+        for erasure_body in [
+            "by simp [-not_and, not_and_or]",
+            "by simp [not_and_or, -not_and]",
+            "by simp [-not_and]",
+        ] {
+            assert!(pruner
+                .try_accelerate(&AcceleratorInput {
+                    body_src: erasure_body.into(),
+                    ..base_input.clone()
+                })
+                .is_none());
         }
-        assert!(rewrite_explicit_dsimp_list_to_dsimp_only("by dsimp [liftLinear, -LinearMap.lsum_apply]").is_none());
+        assert!(rewrite_explicit_dsimp_list_to_dsimp_only(
+            "by dsimp [liftLinear, -LinearMap.lsum_apply]"
+        )
+        .is_none());
         for (b_src, exp) in [
-            ("by simpa [← Nat.add_assoc, <- Nat.add_comm] using h", "by simpa only [← Nat.add_assoc, <- Nat.add_comm] using h"),
-            ("by simp [← Nat.add_assoc, <- Nat.add_comm]", "by simp only [← Nat.add_assoc, <- Nat.add_comm]"),
-            ("by simp_all [Nat.add_comm, Nat.add_assoc]", "by simp_all only [Nat.add_comm, Nat.add_assoc]"),
+            (
+                "by simpa [← Nat.add_assoc, <- Nat.add_comm] using h",
+                "by simpa only [← Nat.add_assoc, <- Nat.add_comm] using h",
+            ),
+            (
+                "by simp [← Nat.add_assoc, <- Nat.add_comm]",
+                "by simp only [← Nat.add_assoc, <- Nat.add_comm]",
+            ),
+            (
+                "by simp_all [Nat.add_comm, Nat.add_assoc]",
+                "by simp_all only [Nat.add_comm, Nat.add_assoc]",
+            ),
         ] {
             assert_eq!(
-                pruner.try_accelerate(&AcceleratorInput { body_src: b_src.into(), ..base_input.clone() }),
-                Some(AcceleratorCertificate::RewrittenProof { new_body_src: exp.into(), accelerator_name: "builtin:simd-discr-tree-pruner".into(), estimated_speedup_hint: "4.8x".into() })
+                pruner.try_accelerate(&AcceleratorInput {
+                    body_src: b_src.into(),
+                    ..base_input.clone()
+                }),
+                Some(AcceleratorCertificate::RewrittenProof {
+                    new_body_src: exp.into(),
+                    accelerator_name: "builtin:simd-discr-tree-pruner".into(),
+                    estimated_speedup_hint: "4.8x".into()
+                })
             );
         }
         for (b_src, exp) in [
-            ("by rw [← Nat.add_assoc, Nat.add_comm]; rfl", "by simp only [← Nat.add_assoc, Nat.add_comm]"),
+            (
+                "by rw [← Nat.add_assoc, Nat.add_comm]; rfl",
+                "by simp only [← Nat.add_assoc, Nat.add_comm]",
+            ),
             ("by rw [h1] at h; rw [h2] at h", "by rw [h1, h2] at h"),
             ("by\n  · rw [h1]\n    rw [h2]", "by\n  · rw [h1, h2]"),
-            ("by\n  unfold foo\n  rw [h1]", "by\n  dsimp only [foo]\n  rw [h1]"),
-            ("by unfold foo at h; split", "by dsimp only [foo] at h; split"),
+            (
+                "by\n  unfold foo\n  rw [h1]",
+                "by\n  dsimp only [foo]\n  rw [h1]",
+            ),
+            (
+                "by unfold foo at h; split",
+                "by dsimp only [foo] at h; split",
+            ),
             ("by simp_rw [h1]; simp_rw [h2]", "by simp_rw [h1, h2]"),
-            ("by\n  | zero => rw [h1]; rw [h2]; rfl", "by\n  | zero => rw [h1, h2]"),
+            (
+                "by\n  | zero => rw [h1]; rw [h2]; rfl",
+                "by\n  | zero => rw [h1, h2]",
+            ),
             ("by\n  rw [h1,\n    h2]\n  rw [h3]", "by\n  rw [h1, h2, h3]"),
-            ("by simp only [h1] at h; simp only [h2] at h; simp only [h3] at h", "by simp only [h1, h2, h3] at h"),
+            (
+                "by simp only [h1] at h; simp only [h2] at h; simp only [h3] at h",
+                "by simp only [h1, h2, h3] at h",
+            ),
             ("by simp only [foo]; rw [bar]", "by simp only [foo, bar]"),
-            ("by dsimp only [foo]; dsimp only [bar]", "by dsimp only [foo, bar]"),
-            ("by\n  unfold foo\n  unfold bar\n  rw [h1]", "by\n  dsimp only [foo, bar]\n  rw [h1]"),
-            ("by rw [foo]; simpa only [bar] using h", "by simpa only [foo, bar] using h"),
-            ("by simp only [foo]; simpa only [bar] using h", "by simpa only [foo, bar] using h"),
-            ("by rw [h1] at hx hy; rw [h2] at hx hy", "by rw [h1, h2] at hx hy"),
-            ("by\n  · unfold foo\n    rw [h1]", "by\n  · dsimp only [foo]\n    rw [h1]"),
+            (
+                "by dsimp only [foo]; dsimp only [bar]",
+                "by dsimp only [foo, bar]",
+            ),
+            (
+                "by\n  unfold foo\n  unfold bar\n  rw [h1]",
+                "by\n  dsimp only [foo, bar]\n  rw [h1]",
+            ),
+            (
+                "by rw [foo]; simpa only [bar] using h",
+                "by simpa only [foo, bar] using h",
+            ),
+            (
+                "by simp only [foo]; simpa only [bar] using h",
+                "by simpa only [foo, bar] using h",
+            ),
+            (
+                "by rw [h1] at hx hy; rw [h2] at hx hy",
+                "by rw [h1, h2] at hx hy",
+            ),
+            (
+                "by\n  · unfold foo\n    rw [h1]",
+                "by\n  · dsimp only [foo]\n    rw [h1]",
+            ),
             ("by erw [h1]; erw [h2]; erw [h3]", "by erw [h1, h2, h3]"),
-            ("by rw [h1, h2]; exact h3", "by simpa only [h1, h2] using h3"),
-            ("by simp only [h1, h2]; exact h3", "by simpa only [h1, h2] using h3"),
+            (
+                "by rw [h1, h2]; exact h3",
+                "by simpa only [h1, h2] using h3",
+            ),
+            (
+                "by simp only [h1, h2]; exact h3",
+                "by simpa only [h1, h2] using h3",
+            ),
             ("by simp_rw [a]; simp only [b]", "by simp only [a, b]"),
         ] {
             assert_eq!(
-                chain_accel.try_accelerate(&AcceleratorInput { body_src: b_src.into(), ..base_input.clone() }),
-                Some(AcceleratorCertificate::RewrittenProof { new_body_src: exp.into(), accelerator_name: "builtin:simd-tactic-chain-optimizer".into(), estimated_speedup_hint: "5.4x".into() })
+                chain_accel.try_accelerate(&AcceleratorInput {
+                    body_src: b_src.into(),
+                    ..base_input.clone()
+                }),
+                Some(AcceleratorCertificate::RewrittenProof {
+                    new_body_src: exp.into(),
+                    accelerator_name: "builtin:simd-tactic-chain-optimizer".into(),
+                    estimated_speedup_hint: "5.4x".into()
+                })
             );
         }
 
@@ -4403,7 +5058,10 @@ mod tests {
             "by rw [Nat.add_comm]\n  rw [Nat.add_left_comm]\n  done",
         ] {
             assert_eq!(
-                chain_accel.try_accelerate(&AcceleratorInput { body_src: rw_rfl_chain.into(), ..base_input.clone() }),
+                chain_accel.try_accelerate(&AcceleratorInput {
+                    body_src: rw_rfl_chain.into(),
+                    ..base_input.clone()
+                }),
                 Some(AcceleratorCertificate::RewrittenProof {
                     new_body_src: "by rw [Nat.add_comm, Nat.add_left_comm]".into(),
                     accelerator_name: "builtin:simd-tactic-chain-optimizer".into(),
@@ -4411,9 +5069,15 @@ mod tests {
                 })
             );
         }
-        for eta_body in ["by intro x y; exact Nat.add_comm x y", "by\n  rintro x y\n  exact Nat.add_comm x y"] {
+        for eta_body in [
+            "by intro x y; exact Nat.add_comm x y",
+            "by\n  rintro x y\n  exact Nat.add_comm x y",
+        ] {
             assert_eq!(
-                chain_accel.try_accelerate(&AcceleratorInput { body_src: eta_body.into(), ..base_input.clone() }),
+                chain_accel.try_accelerate(&AcceleratorInput {
+                    body_src: eta_body.into(),
+                    ..base_input.clone()
+                }),
                 Some(AcceleratorCertificate::RewrittenProof {
                     new_body_src: "by exact Nat.add_comm".into(),
                     accelerator_name: "builtin:simd-tactic-chain-optimizer".into(),
@@ -4427,8 +5091,18 @@ mod tests {
     fn test_simd_riscv_step_cert_accel_distills_spt_and_rejects_tight_k_bound() {
         let rv_accel = SimdRiscvStepCertAccel;
         for (decl, stmt, body, expected) in [
-            ("flapjack_spt_lookup_insert", "(t : Spt) (k v : UInt64) : sptLookup (sptInsert t k v) k = some v", "by simp", "by simp only [sptLookup_sptInsert_self, ComputationCache.boxedValue_eq]"),
-            ("ground_riscv_eval", ": evaluateTargetHOL (riscvNext initMachine) = true", "by simp", "by decide"),
+            (
+                "flapjack_spt_lookup_insert",
+                "(t : Spt) (k v : UInt64) : sptLookup (sptInsert t k v) k = some v",
+                "by simp",
+                "by simp only [sptLookup_sptInsert_self, ComputationCache.boxedValue_eq]",
+            ),
+            (
+                "ground_riscv_eval",
+                ": evaluateTargetHOL (riscvNext initMachine) = true",
+                "by simp",
+                "by decide",
+            ),
         ] {
             assert_eq!(
                 rv_accel.try_accelerate(&AcceleratorInput {
@@ -4436,13 +5110,22 @@ mod tests {
                     stmt_src: stmt.into(),
                     body_src: body.into(),
                     imports_csv: "Flapjack.Spt".into(),
-                    available_constants: vec!["Eq".into(), "True".into(), "sptLookup_sptInsert_self".into(), "ComputationCache.boxedValue_eq".into()],
+                    available_constants: vec![
+                        "Eq".into(),
+                        "True".into(),
+                        "sptLookup_sptInsert_self".into(),
+                        "ComputationCache.boxedValue_eq".into()
+                    ],
                     budget_ms: 25,
                 }),
                 Some(AcceleratorCertificate::RewrittenProof {
                     new_body_src: expected.into(),
                     accelerator_name: "builtin:simd-riscv-step-cert".into(),
-                    estimated_speedup_hint: if expected == "by decide" { "16.8x".into() } else { "11.6x".into() },
+                    estimated_speedup_hint: if expected == "by decide" {
+                        "16.8x".into()
+                    } else {
+                        "11.6x".into()
+                    },
                 })
             );
         }
@@ -4463,35 +5146,63 @@ mod tests {
             budget_ms: 500,
         };
         match rv_accel.try_accelerate(&tight_k_input) {
-            Some(AcceleratorCertificate::CounterexampleFound { witness_summary, suggested_hypothesis, accelerator_name }) => {
+            Some(AcceleratorCertificate::CounterexampleFound {
+                witness_summary,
+                suggested_hypothesis,
+                accelerator_name,
+            }) => {
                 assert_eq!(accelerator_name, "builtin:simd-riscv-step-cert");
                 assert!(witness_summary.contains("23132") || witness_summary.contains("K=10000"));
                 assert!(suggested_hypothesis.unwrap_or_default().contains("K >= "));
             }
-            other => panic!("Expected CounterexampleFound for tight K bound, got {:?}", other),
+            other => panic!(
+                "Expected CounterexampleFound for tight K bound, got {:?}",
+                other
+            ),
         }
 
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
         for (p_name, script, inp) in [
-            ("plugin:riscv-yukon", "plugins/riscv_yukon_plugin.py", &spt_input),
-            ("plugin:verity-yul", "plugins/verity_yul_plugin.py", &AcceleratorInput {
-                decl_name: "mul_div_256".into(),
-                stmt_src: "(x y d : Uint256) : mulDivDown x y d = mulDivDown y x d".into(),
-                body_src: "by simp".into(),
-                imports_csv: "Verity.Math".into(),
-                available_constants: vec!["mulDivDown_comm".into()],
-                budget_ms: 500,
-            }),
+            (
+                "plugin:riscv-yukon",
+                "plugins/riscv_yukon_plugin.py",
+                &spt_input,
+            ),
+            (
+                "plugin:verity-yul",
+                "plugins/verity_yul_plugin.py",
+                &AcceleratorInput {
+                    decl_name: "mul_div_256".into(),
+                    stmt_src: "(x y d : Uint256) : mulDivDown x y d = mulDivDown y x d".into(),
+                    body_src: "by simp".into(),
+                    imports_csv: "Verity.Math".into(),
+                    available_constants: vec!["mulDivDown_comm".into()],
+                    budget_ms: 500,
+                },
+            ),
         ] {
             let plug = ExternalProcessAccelerator::new(ExternalAcceleratorSpec {
                 name: p_name.into(),
-                command: vec!["python3".into(), repo_root.join(script).display().to_string()],
-                timeout_ms: 2500,
+                command: vec![
+                    "python3".into(),
+                    repo_root.join(script).display().to_string(),
+                ],
+                timeout_ms: 5000,
                 trigger_tactics: vec![],
             });
-            assert!(matches!(plug.try_accelerate(inp), Some(AcceleratorCertificate::RewrittenProof { .. })));
+            assert!(matches!(
+                plug.try_accelerate(inp),
+                Some(AcceleratorCertificate::RewrittenProof { .. })
+            ));
             if p_name == "plugin:riscv-yukon" {
-                assert!(matches!(plug.try_accelerate(&tight_k_input), Some(AcceleratorCertificate::CounterexampleFound { .. })));
+                assert!(matches!(
+                    plug.try_accelerate(&tight_k_input),
+                    Some(AcceleratorCertificate::CounterexampleFound { .. })
+                ));
             }
         }
     }
@@ -4512,14 +5223,40 @@ mod tests {
             let (w, cert) = try_synthesize_farkas_for_stmt(stmt).expect(stmt);
             assert!(crate::c_abi::check_farkas_nat(&w, &mat, &rhs, &obj, bnd) && cert.contains("checkFarkasNat"));
         }
-        assert!(try_synthesize_farkas_for_stmt("(x y : Nat) (h_trunc : x - y <= 0) : x <= y").is_none());
-        assert!(try_synthesize_farkas_for_stmt("(x : Nat) (h_inexact : (2 * x + 1) / 2 <= 0) : x <= 0").is_none());
+        assert!(
+            try_synthesize_farkas_for_stmt("(x y : Nat) (h_trunc : x - y <= 0) : x <= y").is_none()
+        );
+        assert!(try_synthesize_farkas_for_stmt(
+            "(x : Nat) (h_inexact : (2 * x + 1) / 2 <= 0) : x <= 0"
+        )
+        .is_none());
 
-        let big_matrix = vec![vec![1u64, 0u64], vec![0u64, 1u64], vec![1u64, 0u64], vec![0u64, 1u64], vec![1u64, 1u64], vec![1u64, 2u64], vec![2u64, 1u64], vec![0u64, 0u64], vec![1u64, 2u64], vec![2u64, 1u64]];
-        let big_rhs = vec![9u64, 9u64, 12u64, 12u64, 15u64, 10u64, 10u64, 3u64, 25u64, 14u64];
+        let big_matrix = vec![
+            vec![1u64, 0u64],
+            vec![0u64, 1u64],
+            vec![1u64, 0u64],
+            vec![0u64, 1u64],
+            vec![1u64, 1u64],
+            vec![1u64, 2u64],
+            vec![2u64, 1u64],
+            vec![0u64, 0u64],
+            vec![1u64, 2u64],
+            vec![2u64, 1u64],
+        ];
+        let big_rhs = vec![
+            9u64, 9u64, 12u64, 12u64, 15u64, 10u64, 10u64, 3u64, 25u64, 14u64,
+        ];
         let big_obj = vec![3u64, 3u64];
-        let w_big = crate::c_abi::synthesize_farkas_nat_weights(&big_matrix, &big_rhs, &big_obj, 20).expect("10-row dominated system should synthesize weights after pre-filtering");
-        assert!(crate::c_abi::check_farkas_nat(&w_big, &big_matrix, &big_rhs, &big_obj, 20));
+        let w_big =
+            crate::c_abi::synthesize_farkas_nat_weights(&big_matrix, &big_rhs, &big_obj, 20)
+                .expect("10-row dominated system should synthesize weights after pre-filtering");
+        assert!(crate::c_abi::check_farkas_nat(
+            &w_big,
+            &big_matrix,
+            &big_rhs,
+            &big_obj,
+            20
+        ));
     }
 
     #[test]
@@ -4533,7 +5270,9 @@ mod tests {
 
         let distill_in = AcceleratorInput {
             decl_name: "tri_neon_karatsuba_equiv".into(),
-            stmt_src: "(a b : F128) : TriNeon.reduce_tri (clmul_products a b) = karatsuba_mul_const a b".into(),
+            stmt_src:
+                "(a b : F128) : TriNeon.reduce_tri (clmul_products a b) = karatsuba_mul_const a b"
+                    .into(),
             body_src: "by simp".into(),
             imports_csv: "SnarkFast.Kernels.Field".into(),
             available_constants: vec![
@@ -4546,7 +5285,9 @@ mod tests {
         assert_eq!(
             snark_accel.try_accelerate(&distill_in),
             Some(AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by simp only [SnarkFast.tri_accum_reduce_eq, SnarkFast.karatsuba_mul_const_eq]".into(),
+                new_body_src:
+                    "by simp only [SnarkFast.tri_accum_reduce_eq, SnarkFast.karatsuba_mul_const_eq]"
+                        .into(),
                 accelerator_name: "builtin:simd-snark-kernel-cert".into(),
                 estimated_speedup_hint: format!("{:.1}x", mult.max(12.8)),
             })
@@ -4566,14 +5307,21 @@ mod tests {
                 if accelerator_name == "builtin:simd-snark-kernel-cert"
         ));
 
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
         let plug = ExternalProcessAccelerator::new(ExternalAcceleratorSpec {
             name: "plugin:snark-llvm-superopt".into(),
             command: vec![
                 "python3".into(),
-                repo_root.join("plugins/snark_llvm_superopt_plugin.py").display().to_string(),
+                repo_root
+                    .join("plugins/snark_llvm_superopt_plugin.py")
+                    .display()
+                    .to_string(),
             ],
-            timeout_ms: 2500,
+            timeout_ms: 5000,
             trigger_tactics: vec![],
         });
         assert!(matches!(
@@ -4584,5 +5332,68 @@ mod tests {
             plug.try_accelerate(&mutant_in),
             Some(AcceleratorCertificate::CounterexampleFound { .. })
         ));
+    }
+
+    #[test]
+    fn test_distill_constants_for_simp_chain_ablation_gate_and_full_negative_logit_ranking() {
+        let rt = crate::matryoshka::global_matryoshka_runtime()
+            .expect("embedded Matryoshka runtime must load");
+        let stmt = "(x : UnknownDomain) : P x = Q x";
+        let stmt_mask = simd_ident_bloom_mask_u64(stmt);
+        let cands: Vec<String> = rt
+            .vocab
+            .iter()
+            .filter(|c| !is_excluded_core_constant(c))
+            .take(24)
+            .cloned()
+            .collect();
+        assert!(cands.len() > 16);
+
+        let ev = rt.evaluate_lean_goal("anon", stmt, Some(&cands), None, "s0");
+        assert_eq!(ev.ranked_available_scores.len(), cands.len());
+        assert!(
+            ev.ranked_available_scores.iter().any(|(_, s)| *s < 0.0),
+            "expected negative logits in embedded vocabulary scores"
+        );
+
+        let default_distilled = distill_constants_for_simp_chain_inner(stmt, "by simp", &cands, false);
+        assert_eq!(default_distilled.len(), 16);
+        for w in default_distilled.windows(2) {
+            let s0 = score_constant_affinity_with_optional_logit(stmt, stmt_mask, &w[0], None);
+            let s1 = score_constant_affinity_with_optional_logit(stmt, stmt_mask, &w[1], None);
+            assert!(s0 >= s1);
+        }
+
+        let neural_distilled = distill_constants_for_simp_chain_inner(stmt, "by simp", &cands, true);
+        assert_eq!(neural_distilled.len(), 16);
+        for w in neural_distilled.windows(2) {
+            let l0 = rt.score_constant_affinity(stmt, &w[0]);
+            let l1 = rt.score_constant_affinity(stmt, &w[1]);
+            let s0 = score_constant_affinity_with_optional_logit(stmt, stmt_mask, &w[0], l0);
+            let s1 = score_constant_affinity_with_optional_logit(stmt, stmt_mask, &w[1], l1);
+            assert!(
+                s0 >= s1,
+                "expected full-candidate neural rank order: {} ({}) >= {} ({})",
+                w[0],
+                s0,
+                w[1],
+                s1
+            );
+        }
+        for dropped in cands.iter().filter(|c| !neural_distilled.contains(c)) {
+            let ld = rt.score_constant_affinity(stmt, dropped);
+            let sd = score_constant_affinity_with_optional_logit(stmt, stmt_mask, dropped, ld);
+            let last_kept = neural_distilled.last().unwrap();
+            let lk = rt.score_constant_affinity(stmt, last_kept);
+            let sk = score_constant_affinity_with_optional_logit(stmt, stmt_mask, last_kept, lk);
+            assert!(
+                sk >= sd,
+                "kept candidate {} ({}) must outrank dropped candidate {} ({})",
+                last_kept,
+                sk,
+                dropped,
+                sd
+            );
+        }
     }
 }

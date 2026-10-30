@@ -76,8 +76,48 @@ def verifyConLecheOleanShard (magic : UInt32) (declCount offEnd byteLen : UInt64
     (non-empty declaration name, zero binder-shadowed constants, exact AST match against `specpin.lock`,
     valid `"LNE1"` CAS magic, and exact byte length consumption). -/
 @[inline]
-def verifyElabHeaderPinGate (declNameNonEmpty noShadowedConsts astMatchesPin casBlobMagicOk casOffEndMatches : Bool) : Bool :=
+def verifyElabHeaderPinGate
+    (declNameNonEmpty noShadowedConsts astMatchesPin casBlobMagicOk casOffEndMatches : Bool) : Bool :=
   declNameNonEmpty && noShadowedConsts && astMatchesPin && casBlobMagicOk && casOffEndMatches
+
+@[inline]
+def verifyAuditMaterializeGate
+    (skeletonClean : Bool)
+    (stubbedPlaceholderCount certifiedShardCount distinctCoveredShardCount totalShardCount : UInt64)
+    (expectedInterfaceDigest actualInterfaceDigest : UInt64)
+    (expectedOleanDigest actualOleanDigest : UInt64)
+    (expectedIleanDigest actualIleanDigest : UInt64)
+    (needsC : Bool)
+    (expectedCDigest actualCDigest : UInt64)
+    (depTraceDigest : UInt64)
+    (auditedArtifactDigest : UInt64)
+    (kernelAuditClean : Bool) : Bool :=
+  skeletonClean &&
+  stubbedPlaceholderCount == 0 &&
+  certifiedShardCount == totalShardCount &&
+  distinctCoveredShardCount == totalShardCount &&
+  expectedInterfaceDigest == actualInterfaceDigest &&
+  actualInterfaceDigest != 0 &&
+  expectedOleanDigest == actualOleanDigest &&
+  actualOleanDigest != 0 &&
+  expectedIleanDigest == actualIleanDigest &&
+  actualIleanDigest != 0 &&
+  (!needsC || (expectedCDigest == actualCDigest && actualCDigest != 0)) &&
+  depTraceDigest != 0 &&
+  auditedArtifactDigest == actualOleanDigest &&
+  kernelAuditClean
+
+@[inline]
+def verifyPackTrustAdmission
+    (requestedUntrusted hasTrustedPubkey hasAttestationFields sigValid allowUnattestedTrusted : Bool) :
+    Bool :=
+  !requestedUntrusted &&
+    (if hasTrustedPubkey then hasAttestationFields && sigValid else allowUnattestedTrusted)
+
+@[inline]
+def verifyHygieneItemAdmitted
+    (itemKind : UInt8) (admitsNativeDecide admitsBvDecide : Bool) : Bool :=
+  (itemKind == 1 && admitsNativeDecide) || (itemKind == 2 && admitsBvDecide)
 
 /-- Tier-aware Matryoshka cascade router (`0 = pass`, `1 = prune_stop`, `2 = abstain_escalate`). -/
 @[inline]
@@ -278,8 +318,42 @@ def verifyConLecheOleanShardC (magic : UInt32) (declCount offEnd byteLen : UInt6
   verifyConLecheOleanShard magic declCount offEnd byteLen allDeclsTyped
 
 @[inline, export turbo_spec_verify_elab_header_pin]
-def verifyElabHeaderPinGateC (declNameNonEmpty noShadowedConsts astMatchesPin casBlobMagicOk casOffEndMatches : Bool) : Bool :=
+def verifyElabHeaderPinGateC
+    (declNameNonEmpty noShadowedConsts astMatchesPin casBlobMagicOk casOffEndMatches : Bool) : Bool :=
   verifyElabHeaderPinGate declNameNonEmpty noShadowedConsts astMatchesPin casBlobMagicOk casOffEndMatches
+
+@[inline, export turbo_spec_verify_audit_materialize_gate]
+def verifyAuditMaterializeGateC
+    (skeletonClean : Bool)
+    (stubbedPlaceholderCount certifiedShardCount distinctCoveredShardCount totalShardCount : UInt64)
+    (expectedInterfaceDigest actualInterfaceDigest : UInt64)
+    (expectedOleanDigest actualOleanDigest : UInt64)
+    (expectedIleanDigest actualIleanDigest : UInt64)
+    (needsC : Bool)
+    (expectedCDigest actualCDigest : UInt64)
+    (depTraceDigest : UInt64)
+    (auditedArtifactDigest : UInt64)
+    (kernelAuditClean : Bool) : Bool :=
+  verifyAuditMaterializeGate
+    skeletonClean
+    stubbedPlaceholderCount certifiedShardCount distinctCoveredShardCount totalShardCount
+    expectedInterfaceDigest actualInterfaceDigest
+    expectedOleanDigest actualOleanDigest
+    expectedIleanDigest actualIleanDigest
+    needsC expectedCDigest actualCDigest
+    depTraceDigest auditedArtifactDigest kernelAuditClean
+
+@[inline, export turbo_spec_verify_pack_trust_admission]
+def verifyPackTrustAdmissionC
+    (requestedUntrusted hasTrustedPubkey hasAttestationFields sigValid allowUnattestedTrusted : Bool) :
+    Bool :=
+  verifyPackTrustAdmission
+    requestedUntrusted hasTrustedPubkey hasAttestationFields sigValid allowUnattestedTrusted
+
+@[inline, export turbo_spec_verify_hygiene_item_admitted]
+def verifyHygieneItemAdmittedC
+    (itemKind : UInt8) (admitsNativeDecide admitsBvDecide : Bool) : Bool :=
+  verifyHygieneItemAdmitted itemKind admitsNativeDecide admitsBvDecide
 
 @[export turbo_spec_combined_step]
 def combinedStepC (i : UInt64) : UInt64 :=
