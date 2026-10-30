@@ -750,7 +750,11 @@ fn stop_pidfile_daemons(staging: &Path, store_root: Option<&Path>) -> Result<Lif
             PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into()))
                 .join(".cache/turbo-lean")
         });
-    paths.insert(root.join("zygote_daemon.json"));
+    // A legacy root entry may describe a different namespace. With an explicit
+    // scope, discover PID files only inside that namespace.
+    if std::env::var_os("TURBO_LEAN_STAGING_DIR").is_none() || root.starts_with(staging) {
+        paths.insert(root.join("zygote_daemon.json"));
+    }
     let mut cleanup = LifecycleCleanup::default();
     for path in paths {
         if stop_pidfile_daemon(&path)? {
