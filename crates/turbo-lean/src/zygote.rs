@@ -326,6 +326,20 @@ impl Drop for OneShotGuard {
     }
 }
 
+fn is_serve_command(cmdline: &[u8]) -> bool {
+    let mut args = cmdline.split(|b| *b == 0).filter(|a| !a.is_empty()).skip(1);
+    while let Some(arg) = args.next() {
+        match arg {
+            b"--cache-dir" | b"--max-memory-mb" | b"--telemetry" => {
+                args.next();
+            }
+            flag if flag.starts_with(b"-") => {}
+            command => return command == b"serve",
+        }
+    }
+    false
+}
+
 #[cfg(target_os = "linux")]
 fn owned_lifecycle_process(pid: u32, staging: Option<&Path>, parent: Option<u32>) -> bool {
     use std::os::unix::fs::MetadataExt;
@@ -340,8 +354,7 @@ fn owned_lifecycle_process(pid: u32, staging: Option<&Path>, parent: Option<u32>
     let name = exe.file_name().and_then(|s| s.to_str()).unwrap_or("");
     let args = fs::read(proc.join("cmdline")).unwrap_or_default();
     let worker = name.starts_with("turbo_zygote_") || name == "turbo-zygote";
-    let server = name.trim_end_matches(" (deleted)") == "turbo-lean"
-        && args.split(|b| *b == 0).any(|a| a == b"serve");
+    let server = name.trim_end_matches(" (deleted)") == "turbo-lean" && is_serve_command(&args);
     if !worker && !server {
         return false;
     }
@@ -3723,6 +3736,23 @@ pub fn try_local_zygote_eval_with_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_daemon_stop_recognizes_the_serve_subcommand_only() {
+        for args in [
+            b"turbo-lean\0serve\0".as_slice(),
+            b"turbo-lean\0--cache-dir\0/tmp/cas\0--json\0serve\0--listen\0127.0.0.1:9400\0"
+                .as_slice(),
+        ] {
+            assert!(is_serve_command(args));
+        }
+        for args in [
+            b"turbo-lean\0check\0File.lean\0--decl\0serve\0".as_slice(),
+            b"turbo-lean\0--cache-dir\0serve\0check\0File.lean\0".as_slice(),
+        ] {
+            assert!(!is_serve_command(args));
+        }
+    }
 
     fn repo_lean_cfg() -> Option<crate::module_builder::ProjectConfig> {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lean");
