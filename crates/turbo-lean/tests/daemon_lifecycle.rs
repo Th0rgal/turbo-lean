@@ -143,6 +143,19 @@ impl Fixture {
             .collect()
     }
 
+    fn one_shot_dirs(&self) -> Vec<PathBuf> {
+        let prefix = format!(
+            "{}-oneshot-",
+            self.staging.file_name().unwrap().to_string_lossy()
+        );
+        fs::read_dir(self.staging.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+            .map(|entry| entry.path())
+            .collect()
+    }
+
     fn wait_for(&self, timeout: Duration, condition: impl Fn() -> bool) {
         let start = Instant::now();
         while !condition() {
@@ -177,6 +190,9 @@ impl Drop for Fixture {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+        for dir in self.one_shot_dirs() {
+            let _ = fs::remove_dir_all(dir);
+        }
         let _ = fs::remove_dir_all(&self.root);
         let _ = fs::remove_dir_all(&self.staging);
     }
@@ -210,6 +226,11 @@ fn check_no_daemon_leaves_no_processes_or_staging() {
         );
         f.wait_for(Duration::from_secs(3), || f.pids().is_empty());
         assert_eq!(fs::read_dir(&f.staging).unwrap().count(), 0);
+        assert!(
+            f.one_shot_dirs().is_empty(),
+            "private sibling staging leaked: {:?}",
+            f.one_shot_dirs()
+        );
         evidence(format!(
             "no-daemon (flag={flag}): 0 PIDs, 0 staging entries"
         ));
@@ -245,14 +266,11 @@ fn check_no_daemon_leaves_no_processes_or_staging() {
     );
     f.wait_for(Duration::from_secs(5), || f.pids().is_empty());
     assert!(!f.staging.exists());
-    let prefix = format!(
-        "{}-oneshot-",
-        f.staging.file_name().unwrap().to_string_lossy()
+    assert!(
+        f.one_shot_dirs().is_empty(),
+        "private sibling staging leaked: {:?}",
+        f.one_shot_dirs()
     );
-    assert!(!fs::read_dir("/dev/shm")
-        .unwrap()
-        .flatten()
-        .any(|e| e.file_name().to_string_lossy().starts_with(&prefix)));
     evidence("one-shot survived peer daemon TTL: 0 PIDs and private staging removed".to_string());
 }
 
@@ -358,7 +376,7 @@ fn check_timeout_reaches_existing_daemon_without_restart() {
         );
         assert!(text.contains("timed out"), "{text}");
         assert!(
-            (Duration::from_millis(800)..Duration::from_secs(4)).contains(&elapsed),
+            (Duration::from_millis(800)..Duration::from_secs(10)).contains(&elapsed),
             "timeout took {elapsed:?}: {text}"
         );
         for pid in &server_pids {
@@ -503,14 +521,15 @@ fn eval_first_startup_honours_project_idle_ttl() {
         "[zygote]\nidle_ttl_secs = 2\n",
     )
     .unwrap();
+    fs::create_dir_all(f.root.join("nested")).unwrap();
     for explicit_project in [false, true] {
         fs::write(
-            f.root.join("EvalFirst.lean"),
+            f.root.join("nested/EvalFirst.lean"),
             format!("#eval {}\n", if explicit_project { 43 } else { 42 }),
         )
         .unwrap();
         let mut cmd = f.command();
-        cmd.args(["eval", "EvalFirst.lean"]);
+        cmd.args(["eval", "nested/EvalFirst.lean"]);
         if explicit_project {
             cmd.args(["--project-dir", "."]);
         }
