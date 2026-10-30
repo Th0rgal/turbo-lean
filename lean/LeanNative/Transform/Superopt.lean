@@ -833,11 +833,24 @@ def superoptModuleWithProfile (p : HardwareCostProfile) (m : LNIRModule) : LNIRM
 private abbrev escapeJsonSO := LeanNative.IR.jsonEscape
 
 def SuperoptRewriteRecord.toJson (r : SuperoptRewriteRecord) : String :=
-  s!"\{\"declName\":\"{escapeJsonSO r.declName}\",\"target\":\"{escapeJsonSO r.target}\",\"originalExpr\":\"{escapeJsonSO r.originalExpr}\",\"synthesizedExpr\":\"{escapeJsonSO r.synthesizedExpr}\",\"costBefore\":{r.costBefore},\"costAfter\":{r.costAfter},\"fastCheckPassed\":{r.fastCheckPassed},\"symbolicTVPassed\":{r.symbolicTVPassed},\"kernelProofVerified\":{r.kernelProofVerified},\"theoremRef\":\"{escapeJsonSO r.theoremRef}\"}"
+  s!"\{\"declName\":\"{escapeJsonSO r.declName}\"," ++
+  s!"\"target\":\"{escapeJsonSO r.target}\"," ++
+  s!"\"originalExpr\":\"{escapeJsonSO r.originalExpr}\"," ++
+  s!"\"synthesizedExpr\":\"{escapeJsonSO r.synthesizedExpr}\"," ++
+  s!"\"costBefore\":{r.costBefore},\"costAfter\":{r.costAfter}," ++
+  s!"\"fastCheckPassed\":{r.fastCheckPassed}," ++
+  s!"\"symbolicTVPassed\":{r.symbolicTVPassed}," ++
+  s!"\"kernelProofVerified\":{r.kernelProofVerified}," ++
+  s!"\"theoremRef\":\"{escapeJsonSO r.theoremRef}\"}"
 
 def SuperoptReport.toJson (r : SuperoptReport) : String :=
   let recsJson := String.intercalate "," (r.records.map SuperoptRewriteRecord.toJson)
-  s!"\{\"schemaVersion\":\"{escapeJsonSO r.schemaVersion}\",\"moduleName\":\"{escapeJsonSO r.moduleName}\",\"target\":\"{escapeJsonSO r.target}\",\"totalDecls\":{r.totalDecls},\"rewritesApplied\":{r.rewritesApplied},\"totalCostBefore\":{r.totalCostBefore},\"totalCostAfter\":{r.totalCostAfter},\"records\":[{recsJson}]}"
+  s!"\{\"schemaVersion\":\"{escapeJsonSO r.schemaVersion}\"," ++
+  s!"\"moduleName\":\"{escapeJsonSO r.moduleName}\"," ++
+  s!"\"target\":\"{escapeJsonSO r.target}\"," ++
+  s!"\"totalDecls\":{r.totalDecls},\"rewritesApplied\":{r.rewritesApplied}," ++
+  s!"\"totalCostBefore\":{r.totalCostBefore},\"totalCostAfter\":{r.totalCostAfter}," ++
+  s!"\"records\":[{recsJson}]}"
 
 def SuperoptReport.formatSummary (r : SuperoptReport) : String :=
   let header :=
@@ -848,7 +861,8 @@ def SuperoptReport.formatSummary (r : SuperoptReport) : String :=
     s!"Total Latency   : {r.totalCostBefore} -> {r.totalCostAfter} cycles\n"
   let lines := r.records.map (fun recEntry =>
     s!"  [{recEntry.declName}] cost {recEntry.costBefore} -> {recEntry.costAfter} " ++
-    s!"(FastCheck={recEntry.fastCheckPassed}, SymbolicTV={recEntry.symbolicTVPassed}, KernelProof={recEntry.kernelProofVerified} [{recEntry.theoremRef}]): " ++
+    s!"(FastCheck={recEntry.fastCheckPassed}, SymbolicTV={recEntry.symbolicTVPassed}, " ++
+    s!"KernelProof={recEntry.kernelProofVerified} [{recEntry.theoremRef}]): " ++
     s!"{recEntry.originalExpr} ==> {recEntry.synthesizedExpr}")
   header ++ String.intercalate "\n" lines
 

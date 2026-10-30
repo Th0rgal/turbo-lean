@@ -98,14 +98,16 @@ def isAsciiDelimByteMatch : ScalarExpr → Bool
   | .binOp .bitOr l r | .select l r (.constBool false) => isAsciiDelimByteMatch l && isAsciiDelimByteMatch r
   | _ => false
 
-/-- Check whether `code` contains an unboxed byte load + ASCII delimiter comparison eligible for 64-bit SWAR / ARM64 NEON (`vceqq_u8` + `vmaxvq_u8`) lowering. -/
+/-- Check whether `code` contains an unboxed byte load + ASCII delimiter comparison
+    eligible for 64-bit SWAR / ARM64 NEON (`vceqq_u8` + `vmaxvq_u8`) lowering. -/
 def isSwarNeonByteScanBody : LNIRCode → Bool
   | .letBind _ _ (.rawLoad _ _ .i8) k => isSwarNeonByteScanBody k
   | .letBind _ _ (.scalar e) k => isAsciiDelimByteMatch e || isSwarNeonByteScanBody k
   | .ite _ t e => isSwarNeonByteScanBody t || isSwarNeonByteScanBody e
   | _ => false
 
-/-- Verify that an `LNIRCode` block has zero Lean runtime allocations, reference-counting ops, or boxed scalar conversions (`NoRuntimeCheck`, `nm -u == 0`). -/
+/-- Verify that an `LNIRCode` block has zero Lean runtime allocations, reference-counting ops,
+    or boxed scalar conversions (`NoRuntimeCheck`, `nm -u == 0`). -/
 def checkNoRuntimeCode : LNIRCode → Bool
   | .letBind _ _ (.allocCtor _ _ _) _ | .letBind _ _ (.boxScalar _ _) _
   | .letBind _ _ (.unboxScalar _ _) _ | .letBind _ _ (.sarrayEnsureExclusive _ _) _ => false

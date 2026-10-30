@@ -4437,3 +4437,4 @@ pub fn run_sync_command(
         pushed.0 == 0 && pushed.1 == 0,
     )
 }
+

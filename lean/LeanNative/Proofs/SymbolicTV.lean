@@ -891,8 +891,11 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
         | .symVar rId => .symVar (st.resolveBuf rId)
         | e => e
     let scalarExprs := scalarFields.map fun v => (st.lookupVar v).expr
-    (st.markAllocated dst).bindVar dst
-      { expr := .tuple (.constU64 tag.toUInt64 :: objectExprs ++ scalarExprs), nonPoison := svs.all (·.nonPoison), noUB := svs.all (·.noUB) }
+    (st.markAllocated dst).bindVar dst {
+      expr := .tuple (.constU64 tag.toUInt64 :: objectExprs ++ scalarExprs)
+      nonPoison := svs.all (·.nonPoison)
+      noUB := svs.all (·.noUB)
+    }
   | .ctorGetObj ctorVar idx | .ctorGetScalar ctorVar idx _ =>
     let isScalarProj :=
       match e with

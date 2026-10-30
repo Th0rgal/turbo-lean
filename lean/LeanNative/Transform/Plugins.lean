@@ -332,7 +332,10 @@ def PluginPipelineReport.toJson (r : PluginPipelineReport) : String :=
   let auditsJson := String.intercalate ",\n    " (r.declAudits.map fun a =>
     let appStr := String.intercalate "," (a.appliedPlugins.map fun p => s!"\"{escapeJsonPlugin p}\"")
     let rejStr := String.intercalate "," (a.rejectedPlugins.map fun p => s!"\"{escapeJsonPlugin p}\"")
-    s!"\{\"declName\":\"{escapeJsonPlugin a.declName}\",\"appliedPlugins\":[{appStr}],\"rejectedPlugins\":[{rejStr}],\"costBefore\":{a.costBefore},\"costAfter\":{a.costAfter},\"tvVerified\":{if a.tvVerified then "true" else "false"}}")
+    let tvStr := if a.tvVerified then "true" else "false"
+    s!"\{\"declName\":\"{escapeJsonPlugin a.declName}\"," ++
+    s!"\"appliedPlugins\":[{appStr}],\"rejectedPlugins\":[{rejStr}]," ++
+    s!"\"costBefore\":{a.costBefore},\"costAfter\":{a.costAfter},\"tvVerified\":{tvStr}}")
   "{\n" ++
   s!"  \"moduleName\": \"{escapeJsonPlugin r.moduleName}\",\n" ++
   s!"  \"target\": \"{r.target.toString}\",\n" ++
@@ -348,7 +351,9 @@ def PluginPipelineReport.toJson (r : PluginPipelineReport) : String :=
   "}"
 
 def PluginPipelineReport.formatSummary (r : PluginPipelineReport) : String :=
-  s!"[Plugins] Module={r.moduleName} | target={r.target.toString} | cost={r.totalCostBefore}->{r.totalCostAfter} | accepted={r.acceptedCount} | rejected={r.rejectedCount} | adversarialRejected={r.adversarialRejected}"
+  s!"[Plugins] Module={r.moduleName} | target={r.target.toString} " ++
+  s!"| cost={r.totalCostBefore}->{r.totalCostAfter} | accepted={r.acceptedCount} " ++
+  s!"| rejected={r.rejectedCount} | adversarialRejected={r.adversarialRejected}"
 
 /-- Run all registered built-in plugins (and optionally the adversarial test plugin)
     on every declaration of `m` through `evalWithUntrustedOptPlugin` (Law 1 & Law 2). -/
@@ -590,18 +595,27 @@ def handleTurboPluginLine (line : String) : String :=
       let fcRep := runFastCheckModule m 512 true
       match fcRep.declResults.find? (fun r => r.counterexampleFound) with
       | some cex =>
-        s!"\{\"kind\":\"counterexample_found\",\"witness_summary\":\"{escapeJsonPlugin cex.witnessSummary}\",\"suggested_hypothesis\":\"h_precond : valid_inputs\",\"accelerator_name\":\"lean-native-core:fastcheck-v0.5\"}"
+        s!"\{\"kind\":\"counterexample_found\"," ++
+        s!"\"witness_summary\":\"{escapeJsonPlugin cex.witnessSummary}\"," ++
+        "\"suggested_hypothesis\":\"h_precond : valid_inputs\"," ++
+        "\"accelerator_name\":\"lean-native-core:fastcheck-v0.5\"}"
       | none => "{}"
     | none => "{}"
   else if declName.contains "constrained_buggy" || stmtSrc.contains "x0 < 1000000" then
     let fcRep := runFastCheckModule mkFastCheckSampleModule 512 true
     match fcRep.declResults.find? (fun r => r.counterexampleFound) with
     | some cex =>
-      s!"\{\"kind\":\"counterexample_found\",\"witness_summary\":\"{escapeJsonPlugin cex.witnessSummary}\",\"suggested_hypothesis\":\"h_bound : x1 < 999958\",\"accelerator_name\":\"lean-native-core:fastcheck-v0.5\"}"
+      s!"\{\"kind\":\"counterexample_found\"," ++
+      s!"\"witness_summary\":\"{escapeJsonPlugin cex.witnessSummary}\"," ++
+      "\"suggested_hypothesis\":\"h_bound : x1 < 999958\"," ++
+      "\"accelerator_name\":\"lean-native-core:fastcheck-v0.5\"}"
     | none => "{}"
   else if (bodySrc.contains "omega" || bodySrc.contains "bv_decide") &&
           (stmtSrc.contains "a + b < a" || stmtSrc.contains "x + 1 < x") then
-    s!"\{\"kind\":\"counterexample_found\",\"witness_summary\":\"a = 0, b = 0 violates strict inequality\",\"suggested_hypothesis\":\"h_pos : b > 0\",\"accelerator_name\":\"builtin:simd-omega-fastcheck\"}"
+    "{\"kind\":\"counterexample_found\"," ++
+    "\"witness_summary\":\"a = 0, b = 0 violates strict inequality\"," ++
+    "\"suggested_hypothesis\":\"h_pos : b > 0\"," ++
+    "\"accelerator_name\":\"builtin:simd-omega-fastcheck\"}"
   else if bodySrc.contains "linear_combination" && !availConsts.isEmpty then
     let cert : LeanNative.Proofs.MathlibZeroDepCert := {
       declName := declName
@@ -611,7 +625,9 @@ def handleTurboPluginLine (line : String) : String :=
     }
     let proof := LeanNative.Proofs.emitZeroDepMathlibProof cert
     let constJson := String.intercalate "," (availConsts.map (fun c => s!"\"{escapeJsonPlugin c}\""))
-    s!"\{\"kind\":\"candidate_tactic\",\"tactic_src\":\"{escapeJsonPlugin proof}\",\"distilled_constants\":[{constJson}],\"confidence\":0.94,\"zero_dependency\":true,\"accelerator_name\":\"builtin:mathlib-zero-dep-cert-lowerer\"}"
+    s!"\{\"kind\":\"candidate_tactic\",\"tactic_src\":\"{escapeJsonPlugin proof}\"," ++
+    s!"\"distilled_constants\":[{constJson}],\"confidence\":0.94,\"zero_dependency\":true," ++
+    "\"accelerator_name\":\"builtin:mathlib-zero-dep-cert-lowerer\"}"
   else if bodySrc.contains "simp" && !bodySrc.contains "simp only" && !availConsts.isEmpty then
     let filtered := availConsts.filter (fun c =>
       c != "Eq" && c != "True" && c != "False" && c != "Nat" && c != "Bool" &&
@@ -620,10 +636,14 @@ def handleTurboPluginLine (line : String) : String :=
     else
       let listStr := String.intercalate ", " filtered
       let constJson := String.intercalate "," (filtered.map (fun c => s!"\"{escapeJsonPlugin c}\""))
-      s!"\{\"kind\":\"candidate_tactic\",\"tactic_src\":\"by simp only [{escapeJsonPlugin listStr}]\",\"distilled_constants\":[{constJson}],\"confidence\":0.92,\"accelerator_name\":\"builtin:simd-simp-distiller\"}"
+      s!"\{\"kind\":\"candidate_tactic\",\"tactic_src\":\"by simp only [{escapeJsonPlugin listStr}]\"," ++
+      s!"\"distilled_constants\":[{constJson}],\"confidence\":0.92," ++
+      "\"accelerator_name\":\"builtin:simd-simp-distiller\"}"
   else if bodySrc.contains "simp [" && !bodySrc.contains "simp only" && !bodySrc.contains "*" then
     let rewritten := String.intercalate "simp only [" (bodySrc.splitOn "simp [")
-    s!"\{\"kind\":\"candidate_tactic\",\"tactic_src\":\"{escapeJsonPlugin rewritten}\",\"distilled_constants\":[],\"confidence\":0.89,\"accelerator_name\":\"builtin:simd-discr-tree-pruner\"}"
+    s!"\{\"kind\":\"candidate_tactic\",\"tactic_src\":\"{escapeJsonPlugin rewritten}\"," ++
+    "\"distilled_constants\":[],\"confidence\":0.89," ++
+    "\"accelerator_name\":\"builtin:simd-discr-tree-pruner\"}"
   else
     "{}"
 
