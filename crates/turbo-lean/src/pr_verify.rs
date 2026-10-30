@@ -3600,26 +3600,40 @@ fn built_kernel_statement_report(
     if modules.is_empty() {
         return Ok(KernelStatementReport::default());
     }
-    let mut command = statement_lake_command(project, is_untrusted)?;
-    command
-        .args(["env", "lean", "--run"])
-        .arg(&helper)
-        .args(modules.keys());
-    let out = crate::module_builder::run_command_with_timeout(
-        command,
-        std::time::Duration::from_secs(600),
-        is_untrusted,
-    )?;
-    anyhow::ensure!(
-        out.status.success(),
-        "Cannot dump kernel statements:\n{}\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
+    // Distinct executables may define the same constant (`main`). Compatible
+    // modules share one import, while incompatible groups split into fresh OS
+    // processes. Never re-import oleans into a process with old mapped regions.
+    let mut batches = vec![modules.keys().cloned().collect::<Vec<_>>()];
+    let mut dump = Vec::new();
+    while let Some(mut batch) = batches.pop() {
+        let mut command = statement_lake_command(project, is_untrusted)?;
+        command
+            .args(["env", "lean", "--run"])
+            .arg(&helper)
+            .args(&batch);
+        let out = crate::module_builder::run_command_with_timeout(
+            command,
+            std::time::Duration::from_secs(600),
+            is_untrusted,
+        )?;
+        if !out.status.success() && batch.len() > 1 {
+            let right = batch.split_off(batch.len() / 2);
+            batches.push(right);
+            batches.push(batch);
+            continue;
+        }
+        anyhow::ensure!(
+            out.status.success(),
+            "Cannot dump kernel statements for {batch:?}:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        dump.extend(out.stdout);
+    }
     let mut report = KernelStatementReport::default();
     let mut chunk = Vec::new();
     let mut remaining = modules.clone();
-    for line in out.stdout.split_inclusive(|&c| c == b'\n') {
+    for line in dump.split_inclusive(|&c| c == b'\n') {
         chunk.extend_from_slice(line);
         let row: serde_json::Value =
             serde_json::from_slice(line).context("Invalid kernel statement JSONL")?;
@@ -5000,6 +5014,21 @@ globs = ["Demo.+"]
             "an old standalone artifact must never bypass stock checking"
         );
         println!("kernel statement fixture excluded modules: import order, stale-artifact refresh, and broken-proof rejection pass");
+        fs::write(
+            dir.join("Outside.lean"),
+            "theorem outside : True := trivial\n",
+        )?;
+        for (module, theorem) in [("ToolA", "first"), ("ToolB", "second")] {
+            fs::write(
+                dir.join(format!("{module}.lean")),
+                format!("theorem {theorem} : True := trivial\ndef main : IO Unit := pure ()\n"),
+            )?;
+        }
+        stock_statement_build(&dir)?;
+        let executable_statements = built_kernel_statements(&dir, None)?;
+        assert!(executable_statements.contains_key("ToolA.lean::first"));
+        assert!(executable_statements.contains_key("ToolB.lean::second"));
+        println!("kernel statement fixture executable roots: duplicate main declarations isolated successfully");
         fs::remove_dir_all(dir)?;
         Ok(())
     }
