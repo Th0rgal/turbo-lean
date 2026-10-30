@@ -2980,6 +2980,269 @@ fn finalize_batch_publish_entries(
     Ok(shards.len())
 }
 
+/// Statement digests are deliberately separate from source shard/cache keys. They
+/// classify reports only: none of these hashes grant a kernel-check cache hit.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct KernelConstant {
+    interface: serde_json::Value,
+    deps: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct KernelTheorem {
+    statement: serde_json::Value,
+    deps: Vec<String>,
+}
+
+fn parse_kernel_statement_dump(raw: &[u8], module: &str) -> Result<BTreeMap<String, String>> {
+    let mut constants = BTreeMap::<String, KernelConstant>::new();
+    let mut theorems = BTreeMap::<String, KernelTheorem>::new();
+    let mut complete = false;
+    for line in String::from_utf8_lossy(raw)
+        .lines()
+        .filter(|l| !l.is_empty())
+    {
+        let row: serde_json::Value =
+            serde_json::from_str(line).context("Invalid kernel statement dump (expected JSONL)")?;
+        if let Some(name) = row.get("constant").and_then(|v| v.as_str()) {
+            anyhow::ensure!(
+                constants
+                    .insert(name.to_string(), serde_json::from_value(row.clone())?)
+                    .is_none(),
+                "Duplicate constant in kernel statement dump: {name}"
+            );
+        } else if let Some(name) = row.get("theorem").and_then(|v| v.as_str()) {
+            anyhow::ensure!(
+                theorems
+                    .insert(name.to_string(), serde_json::from_value(row.clone())?)
+                    .is_none(),
+                "Duplicate theorem in kernel statement dump: {name}"
+            );
+        } else {
+            anyhow::ensure!(
+                row.get("module").and_then(|v| v.as_str()) == Some(module)
+                    && row.get("complete").and_then(|v| v.as_bool()) == Some(true)
+                    && !complete,
+                "Incomplete or unexpected kernel statement dump for {module}"
+            );
+            complete = true;
+        }
+    }
+    anyhow::ensure!(complete, "Missing kernel statement dump for {module}");
+    let mut result = BTreeMap::new();
+    for (name, theorem) in theorems {
+        let mut pending = theorem.deps;
+        let mut closure = std::collections::BTreeSet::new();
+        while let Some(dep) = pending.pop() {
+            if !closure.insert(dep.clone()) {
+                continue;
+            }
+            let constant = constants
+                .get(&dep)
+                .with_context(|| format!("Missing IF-closure constant {dep} for {name}"))?;
+            pending.extend(constant.deps.iter().cloned());
+        }
+        // Flat, name-sorted closure records handle mutual recursion without an
+        // order-sensitive DFS hash or a cycle sentinel that could hide a change.
+        let mut closure_hash = blake3::Hasher::new();
+        closure_hash.update(b"turbo-lean:statement-if-closure:v1\0");
+        for dep in closure {
+            let bytes = serde_json::to_vec(&(&dep, &constants[&dep].interface))?;
+            closure_hash.update(&(bytes.len() as u64).to_le_bytes());
+            closure_hash.update(&bytes);
+        }
+        let type_hash = blake3::hash(&serde_json::to_vec(&theorem.statement)?);
+        let mut digest = blake3::Hasher::new();
+        digest.update(b"turbo-lean:kernel-statement:v1\0");
+        digest.update(type_hash.as_bytes());
+        digest.update(closure_hash.finalize().as_bytes());
+        result.insert(name, digest.finalize().to_hex().to_string());
+    }
+    Ok(result)
+}
+
+struct StatementWorktree {
+    repo: PathBuf,
+    path: PathBuf,
+}
+
+impl StatementWorktree {
+    fn at(repo: &Path, rev: &str) -> Result<Self> {
+        let path = std::env::temp_dir().join(format!(
+            "turbo-statements-{}-{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["worktree", "add", "--detach", "--force"])
+            .arg(&path)
+            .arg(rev)
+            .output()?;
+        anyhow::ensure!(
+            out.status.success(),
+            "Cannot create statement baseline worktree: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(Self {
+            repo: repo.to_path_buf(),
+            path,
+        })
+    }
+}
+
+impl Drop for StatementWorktree {
+    fn drop(&mut self) {
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo)
+            .args(["worktree", "remove", "--force"])
+            .arg(&self.path)
+            .output();
+    }
+}
+
+fn stock_statement_build(project: &Path) -> Result<()> {
+    let (lean, _, _, _) =
+        crate::module_builder::resolve_toolchain_compiler(project, &detect_toolchain(project))?;
+    let lake = lean.with_file_name("lake");
+    let out = Command::new(&lake)
+        .arg("build")
+        .current_dir(project)
+        .env_remove("LEAN_PATH")
+        .env_remove("LEAN_SRC_PATH")
+        .output()
+        .context("Failed to run stock lake build for kernel statement digests")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "Stock lake build for kernel statement digests failed in {}:\n{}\n{}",
+        project.display(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(())
+}
+
+fn built_kernel_statements(
+    project: &Path,
+    scope: Option<&Path>,
+) -> Result<BTreeMap<String, String>> {
+    let helper = project.join(format!(
+        ".turbo_statement_dump_{}.lean",
+        pack::next_tmp_id()
+    ));
+    fs::write(
+        &helper,
+        include_str!("../../../lean/TurboLean/StatementHash.lean"),
+    )?;
+    struct HelperGuard(PathBuf);
+    impl Drop for HelperGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+    let _guard = HelperGuard(helper.clone());
+    let (lean, _, _, _) =
+        crate::module_builder::resolve_toolchain_compiler(project, &detect_toolchain(project))?;
+    let lake = lean.with_file_name("lake");
+    let pkg = crate::module_builder::resolve_package_config(project, true)?;
+    let lib_dir = project.join(&pkg.build_dir).join(&pkg.lean_lib_dir);
+    let mut roots = vec![pkg.src_dir.clone()];
+    roots.extend(pkg.libs.iter().filter_map(|l| l.src_dir.clone()));
+    roots.extend(pkg.exes.iter().filter_map(|e| e.src_dir.clone()));
+    let mut modules = BTreeMap::new();
+    for file in crate::lake_build::collect_project_lean_files(project, false, scope) {
+        let rel = file.strip_prefix(project)?;
+        let module_rel = roots.iter().find_map(|root| {
+            let stripped = file.strip_prefix(project.join(root)).ok()?;
+            lib_dir.join(stripped).with_extension("olean").is_file().then(|| stripped.to_path_buf())
+        }).with_context(|| format!("No built .olean for {} after stock lake build (statement pinning fails closed)", file.display()))?;
+        let module = module_rel
+            .with_extension("")
+            .to_string_lossy()
+            .replace('/', ".");
+        modules.insert(module, rel.to_string_lossy().to_string());
+    }
+    if modules.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let out = Command::new(&lake)
+        .args(["env", "lean", "--run"])
+        .arg(&helper)
+        .args(modules.keys())
+        .current_dir(project)
+        .env_remove("LEAN_PATH")
+        .env_remove("LEAN_SRC_PATH")
+        .output()?;
+    anyhow::ensure!(
+        out.status.success(),
+        "Cannot dump kernel statements:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut statements = BTreeMap::new();
+    let mut chunk = Vec::new();
+    let mut remaining = modules.clone();
+    for line in out.stdout.split_inclusive(|&c| c == b'\n') {
+        chunk.extend_from_slice(line);
+        let row: serde_json::Value =
+            serde_json::from_slice(line).context("Invalid kernel statement JSONL")?;
+        if let Some(module) = row.get("module").and_then(|v| v.as_str()) {
+            let rel = remaining
+                .remove(module)
+                .with_context(|| format!("Unexpected kernel statement module {module}"))?;
+            for (name, digest) in parse_kernel_statement_dump(&chunk, module)? {
+                statements.insert(format!("{rel}::{name}"), digest);
+            }
+            chunk.clear();
+        }
+    }
+    anyhow::ensure!(
+        remaining.is_empty() && chunk.is_empty(),
+        "Incomplete kernel statement dump"
+    );
+    Ok(statements)
+}
+
+fn kernel_statement_changes(
+    project: &Path,
+    base: &str,
+    scope: Option<&Path>,
+) -> Result<Vec<String>> {
+    let repo = resolve_git_toplevel(project)?;
+    let baseline = StatementWorktree::at(&repo, base)?;
+    let base_project = baseline.path.join(project.strip_prefix(&repo)?);
+    let relative_scope = scope
+        .map(|p| {
+            if p.is_absolute() {
+                p.strip_prefix(project).map(Path::to_path_buf)
+            } else {
+                Ok(p.to_path_buf())
+            }
+        })
+        .transpose()?;
+    stock_statement_build(&base_project)?;
+    let before = built_kernel_statements(&base_project, relative_scope.as_deref())?;
+    stock_statement_build(project)?;
+    let after = built_kernel_statements(project, relative_scope.as_deref())?;
+    Ok(compare_kernel_statements(&before, &after))
+}
+
+fn compare_kernel_statements(
+    before: &BTreeMap<String, String>,
+    after: &BTreeMap<String, String>,
+) -> Vec<String> {
+    before
+        .iter()
+        .filter_map(|(name, digest)| match after.get(name) {
+            None => Some(format!("{name} (deleted)")),
+            Some(current) if current != digest => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Execute `turbo-lean pr-verify`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_pr_verify_command(
@@ -3024,7 +3287,7 @@ pub fn run_pr_verify_command(
         untrusted_cfg: untrusted_pr_cfg.as_ref(),
     };
 
-    let (classification, shards_by_file, current_files, current_splits) =
+    let (mut classification, shards_by_file, current_files, current_splits) =
         load_and_classify_pr_from_git_scoped(
             store,
             &canon_dir,
@@ -3035,9 +3298,18 @@ pub fn run_pr_verify_command(
             untrusted_pr_cfg.as_ref(),
         )?;
 
-    if disallow_statement_changes
-        && (classification.interface_drift || !classification.statement_edited_theorems.is_empty())
-    {
+    // Keep source interfaces and verification jobs intact. Only the report/gate uses
+    // built kernel statements, so an equal digest can never bypass stock checking.
+    if !is_untrusted {
+        classification.statement_edited_theorems =
+            kernel_statement_changes(&canon_dir, &base, scope.as_deref())?;
+    } else if disallow_statement_changes {
+        anyhow::bail!(
+            "Kernel statement pinning requires sandboxed stock base/head builds in untrusted mode"
+        );
+    }
+
+    if disallow_statement_changes && !classification.statement_edited_theorems.is_empty() {
         anyhow::bail!(
             "PR statement/interface change gate FAILED (--disallow-statement-changes, mode={}): interface_drift={}, altered_files={:?}, statement_edited_theorems={:?}",
             mode,
@@ -4095,6 +4367,73 @@ mod pr_verify_tests {
     use crate::lake_build::{
         compute_imported_olean_interface_hashes, compute_shard_key, is_file_verified_in_lake_build,
     };
+
+    #[test]
+    fn kernel_statement_fixtures() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo-kernel-statements-{}-{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        fs::create_dir_all(dir.join("Demo"))?;
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            dir.join("lakefile.toml"),
+            r#"name = "statement-fixture"
+defaultTargets = ["Demo"]
+[[lean_lib]]
+name = "Demo"
+globs = ["Demo.+"]
+"#,
+        )?;
+        let source = "namespace Demo\ndef value : Nat := 1\ntheorem pinned : value = value := rfl\ntheorem independent : True := trivial\nend Demo\n";
+        let file = dir.join("Demo/Main.lean");
+        fs::write(&file, source)?;
+        git_init_and_commit(&dir, "baseline")?;
+        stock_statement_build(&dir)?;
+        let before = built_kernel_statements(&dir, None)?;
+        assert!(before.contains_key("Demo/Main.lean::Demo.pinned"));
+        for (label, current) in [
+            ("import-only", format!("import Lean\n{source}")),
+            (
+                "whitespace",
+                source.replace("value = value", "value  =  value"),
+            ),
+            ("comment", format!("-- a harmless comment\n{source}")),
+        ] {
+            fs::write(&file, current)?;
+            stock_statement_build(&dir)?;
+            let changed = compare_kernel_statements(&before, &built_kernel_statements(&dir, None)?);
+            assert!(changed.is_empty(), "{label}: {changed:?}");
+            println!("kernel statement fixture {label}: 0 reports");
+        }
+        fs::write(&file, source.replace("Nat := 1", "Nat := 2"))?;
+        stock_statement_build(&dir)?;
+        assert_eq!(
+            compare_kernel_statements(&before, &built_kernel_statements(&dir, None)?),
+            vec!["Demo/Main.lean::Demo.pinned"]
+        );
+        println!("kernel statement fixture referenced-def: Demo.pinned reported");
+        fs::write(&file, source.replace("value = value", "value + 0 = value"))?;
+        stock_statement_build(&dir)?;
+        assert_eq!(
+            compare_kernel_statements(&before, &built_kernel_statements(&dir, None)?),
+            vec!["Demo/Main.lean::Demo.pinned"]
+        );
+        println!("kernel statement fixture theorem-type: Demo.pinned reported");
+        fs::write(&file, source.replace("pinned", "renamed"))?;
+        stock_statement_build(&dir)?;
+        assert_eq!(
+            compare_kernel_statements(&before, &built_kernel_statements(&dir, None)?),
+            vec!["Demo/Main.lean::Demo.pinned (deleted)"]
+        );
+        println!("kernel statement fixture rename: old theorem reported deleted");
+        fs::create_dir_all(dir.join("Other"))?;
+        assert!(kernel_statement_changes(&dir, "HEAD", Some(Path::new("Other")))?.is_empty());
+        println!("kernel statement fixture scope: 0 out-of-scope reports");
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
 
     #[test]
     fn test_pr_verify_classification_proof_vs_statement_and_hygiene() {
