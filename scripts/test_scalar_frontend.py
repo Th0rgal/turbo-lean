@@ -1032,6 +1032,46 @@ def probe_boxed_prod_and_erased (x : UInt64) : UInt64 :=
   let ec := bumpCarrier (ErasedCarrier.mk x trivial (x + 8)) 15
   let ecSum := match ec with | .mk u _ v => u + v
   scoreNode q.1 + q.2 + ecSum
+
+@[inline] def bumpObjProd (p : MixedNode × UInt64) (d : UInt64) : MixedNode × UInt64 :=
+  match p with
+  | (n, k) => (flipNode n d, k + d)
+
+@[inline] def bumpObjMProd (p : MProd MixedNode UInt64) (d : UInt64) : MProd MixedNode UInt64 :=
+  match p with
+  | ⟨n, k⟩ => ⟨flipNode n d, k + d⟩
+
+@[export probe_obj_prod_shared_and_excl]
+def probe_obj_prod_shared_and_excl (x : UInt64) : UInt64 :=
+  let base : MixedNode × UInt64 := (MixedNode.alpha (LeafBox.mkA (x + 3)) (x.toUSize + 1) (x * 2) x.toUInt8 true, x + 5)
+  let ex1 := bumpObjProd base 7
+  let ex2 := bumpObjProd ex1 11
+  let sh : MixedNode × UInt64 := (MixedNode.leaf (x + 9), x + 13)
+  let sa := bumpObjProd sh 17
+  let sb := bumpObjProd sh 23
+  scoreNode ex2.1 + ex2.2 + scoreNode sa.1 + sa.2 + scoreNode sb.1 + sb.2
+
+@[export probe_mprod_and_nested_prod]
+def probe_mprod_and_nested_prod (x : UInt64) : UInt64 :=
+  let mp0 : MProd MixedNode UInt64 := ⟨MixedNode.leaf (x + 4), x + 6⟩
+  let mp1 := bumpObjMProd mp0 9
+  let mps : MProd MixedNode UInt64 := ⟨MixedNode.alpha (LeafBox.mkB (x + 2)) 5 (x + 8) 3 false, x + 10⟩
+  let mpa := bumpObjMProd mps 13
+  let mpb := bumpObjMProd mps 19
+  let nested : (MixedNode × UInt64) × (UInt64 × UInt64) :=
+    ((MixedNode.leaf (x + 21), x + 22), (x + 23, x + 24))
+  let nestedExcl : (MixedNode × UInt64) × (UInt64 × UInt64) :=
+    match nested with
+    | ((n, a), (b, c)) => ((flipNode n 5, a + b), (b + 1, c + 2))
+  let nestedSharedA := bumpObjProd nestedExcl.1 3
+  let nestedSharedB := bumpObjProd nestedExcl.1 7
+  let pp : PProd MixedNode UInt64 := ⟨MixedNode.leaf (x + 31), x + 32⟩
+  let ppNext : PProd MixedNode UInt64 := match pp with | ⟨n, k⟩ => ⟨flipNode n 11, k + 13⟩
+  let ppSharedA := flipNode ppNext.1 2
+  let ppSharedB := flipNode ppNext.1 6
+  scoreNode mp1.1 + mp1.2 + scoreNode mpa.1 + mpa.2 + scoreNode mpb.1 + mpb.2 +
+    scoreNode nestedSharedA.1 + nestedSharedA.2 + scoreNode nestedSharedB.1 + nestedSharedB.2 +
+    nestedExcl.2.1 + nestedExcl.2.2 + scoreNode ppSharedA + scoreNode ppSharedB + ppNext.2
 """
         rec_source = """inductive NatList where
   | nil : NatList
@@ -1079,7 +1119,7 @@ def probe_rec (x : UInt64) : UInt64 :=
             oracle.write_text(
                 "import MixedLayoutProbe\n"
                 "def main : IO Unit := do\n"
-                "  IO.println s!\"{(probe_mixed_reuse 37).toNat},{(probe_mixed_shared_and_closed 37).toNat},{(probe_boxed_prod_and_erased 37).toNat}\"\n",
+                "  IO.println s!\"{(probe_mixed_reuse 37).toNat},{(probe_mixed_shared_and_closed 37).toNat},{(probe_boxed_prod_and_erased 37).toNat},{(probe_obj_prod_shared_and_excl 37).toNat},{(probe_mprod_and_nested_prod 37).toNat}\"\n",
                 encoding="utf-8",
             )
             env = {**dict(__import__("os").environ), "LEAN_PATH": str(tmp)}
@@ -1087,7 +1127,7 @@ def probe_rec (x : UInt64) : UInt64 :=
             stock_vals = [int(x) for x in subprocess.check_output(
                 [lean_bin, "--run", "Oracle.lean"], cwd=tmp, env=env, text=True
             ).strip().split(",")]
-            bindings = "probe_mixed_reuse:37;probe_mixed_shared_and_closed:37;probe_boxed_prod_and_erased:37"
+            bindings = "probe_mixed_reuse:37;probe_mixed_shared_and_closed:37;probe_boxed_prod_and_erased:37;probe_obj_prod_shared_and_excl:37;probe_mprod_and_nested_prod:37"
             for extra in ([], ["--opt"]):
                 rows = json.loads(subprocess.check_output(
                     [core_bin, "eval-lnir", "--lnir", str(wire), "--args", bindings, "--batch-json", *extra],
@@ -1096,6 +1136,8 @@ def probe_rec (x : UInt64) : UInt64 :=
                 self.assertEqual([int(r["value_u64"]) for r in rows], stock_vals)
                 self.assertEqual(rows[0]["live_objects"], 0)
                 self.assertEqual(rows[2]["live_objects"], 0)
+                self.assertEqual(rows[3]["live_objects"], 0)
+                self.assertEqual(rows[4]["live_objects"], 0)
                 self.assertLessEqual(rows[1]["live_objects"], 2)
             rec_file = tmp / "RecProbe.lean"
             rec_file.write_text(rec_source, encoding="utf-8")

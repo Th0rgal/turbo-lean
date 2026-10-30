@@ -278,7 +278,7 @@ partial def isSupportedRcAdtExpr (env : Lean.Environment) (arch : TargetArch) (e
   match fuel with
   | 0 => false
   | fuel + 1 =>
-    let ty := lowerImpureType e (some env)
+    let ty := lowerImpureType e (some env) true
     if e == Lean.mkConst ``True || isSupportedStage1BScalarOrTuple ty arch then true
     else
       let fn := e.getAppFn
@@ -294,87 +294,93 @@ partial def isSupportedRcAdtExpr (env : Lean.Environment) (arch : TargetArch) (e
             ival.ctors.all fun cName =>
               match env.find? cName with
               | some (.ctorInfo cval) =>
-                let rec dropParams (k : Nat) (t : Lean.Expr) : Lean.Expr :=
+                let rec instParams (k : Nat) (idx : Nat) (t : Lean.Expr) : Lean.Expr :=
                   match k, t with
                   | 0, rest => rest
-                  | k + 1, .forallE _ _ body _ => dropParams k body
+                  | k + 1, .forallE _ _ body _ =>
+                    let body' := match args[idx]? with | some argE => body.instantiate1 argE | none => body
+                    instParams k (idx + 1) body'
                   | _, rest => rest
                 let rec checkFields (k : Nat) (t : Lean.Expr) : Bool :=
                   match k, t with
                   | 0, _ => true
                   | k + 1, .forallE _ dom body _ =>
-                    !dom.hasLooseBVars && isSupportedRcAdtExpr env arch dom fuel && checkFields k body
+                    !dom.hasLooseBVars && isSupportedRcAdtExpr env arch dom fuel &&
+                      checkFields k (body.instantiate1 (Lean.mkConst ``Unit.unit))
                   | _, _ => false
-                cval.numFields <= 8 && checkFields cval.numFields (dropParams cval.numParams cval.type)
+                cval.numFields <= 8 && checkFields cval.numFields (instParams cval.numParams 0 cval.type)
               | _ => false
           | _ => false
       | _ => false
 
-def extractEnvParamAdtInfo (env : Lean.Environment) (declName : Lean.Name) (allowRcAdt : Bool := false) :
-    Array (Option Lean.Name × LNIRType) × (Option Lean.Name × LNIRType) := Id.run do
-  let some cinfo := env.find? declName | return (#[], (none, .objPtr))
-  let classifyExpr (e : Lean.Expr) : Option Lean.Name × LNIRType :=
-    let ty := lowerImpureType e (some env) allowRcAdt
-    let adt? := match e.getAppFn with
-      | .const n _ =>
-        match env.find? n with
-        | some (.inductInfo ival) =>
-          if n != ``Prod && n != ``MProd && n != ``PProd && n != ``Bool &&
-              n != ``Unit && n != ``PUnit && (nullaryEnumScalarType? env e).isNone &&
-              !ival.isRec && ival.numIndices == 0 then some n
-          else none
-        | _ => none
-      | _ => none
-    (adt?, ty)
-  let rec go (acc : Array (Option Lean.Name × LNIRType)) (t : Lean.Expr) :
-      Array (Option Lean.Name × LNIRType) × (Option Lean.Name × LNIRType) :=
-    match t with
-    | .forallE _ dom body bi =>
-      if dom.isSort || bi == .instImplicit || bi == .implicit then go acc body
-      else go (acc.push (classifyExpr dom)) body
-    | retExpr => (acc, if retExpr.hasLooseBVars then (none, .objPtr) else classifyExpr retExpr)
-  go #[] cinfo.type
+structure RcFieldMeta where
+  adtName? : Option Lean.Name := none
+  expr?    : Option Lean.Expr := none
+  ty       : LNIRType := .objPtr
+  deriving Inhabited
 
-def lookupCtorFieldInfo (env : Lean.Environment) (ctorName : Lean.Name) (idx : Nat) (allowRcAdt : Bool := false) : Option (Option Lean.Name × LNIRType) := do
-  let .ctorInfo cval ← env.find? ctorName | none
-  let rec dropParams (k : Nat) (t : Lean.Expr) : Lean.Expr :=
-    match k, t with
-    | 0, rest => rest
-    | k + 1, .forallE _ _ body _ => dropParams k body
-    | _, rest => rest
-  let rec nthField (k : Nat) (t : Lean.Expr) : Option Lean.Expr :=
-    match k, t with
-    | 0, .forallE _ dom _ _ => some dom
-    | k + 1, .forallE _ _ body _ => nthField k body
-    | _, _ => none
-  let dom ← nthField idx (dropParams cval.numParams cval.type)
-  guard (!dom.hasLooseBVars)
-  let ty := lowerImpureType dom (some env) allowRcAdt
-  let adt? := match dom.getAppFn with
+def classifyRcAdtExpr (env : Lean.Environment) (e : Lean.Expr) (allowRcAdt : Bool := false) : RcFieldMeta :=
+  let ty := lowerImpureType e (some env) allowRcAdt
+  let adt? := match e.getAppFn with
     | .const n _ =>
       match env.find? n with
       | some (.inductInfo ival) =>
-        if n != ``Prod && n != ``MProd && n != ``PProd && n != ``Bool &&
-            n != ``Unit && n != ``PUnit && (nullaryEnumScalarType? env dom).isNone &&
+        if (n == ``Prod || n == ``MProd || n == ``PProd) then
+          if allowRcAdt && (ty == .objPtr || ty == .taggedPtr) then some n else none
+        else if n != ``Bool && n != ``Unit && n != ``PUnit && (nullaryEnumScalarType? env e).isNone &&
             !ival.isRec && ival.numIndices == 0 then some n
         else none
       | _ => none
     | _ => none
-  return (adt?, ty)
+  { adtName? := adt?, expr? := if e.hasLooseBVars then none else some e, ty := ty }
 
-def lookupCtorObjSlotInfoM (ctorName : Lean.Name) (objIdx : Nat) (allowRcAdt : Bool := false) : Lean.CoreM (Option (Option Lean.Name × LNIRType)) := do
+def extractEnvParamAdtInfo (env : Lean.Environment) (declName : Lean.Name) (allowRcAdt : Bool := false) :
+    Array RcFieldMeta × RcFieldMeta := Id.run do
+  let some cinfo := env.find? declName | return (#[], {})
+  let rec go (acc : Array RcFieldMeta) (t : Lean.Expr) : Array RcFieldMeta × RcFieldMeta :=
+    match t with
+    | .forallE _ dom body bi =>
+      if dom.isSort || bi == .instImplicit || bi == .implicit then go acc body
+      else go (acc.push (classifyRcAdtExpr env dom allowRcAdt)) body
+    | retExpr => (acc, if retExpr.hasLooseBVars then {} else classifyRcAdtExpr env retExpr allowRcAdt)
+  go #[] cinfo.type
+
+def lookupCtorFieldInfo (env : Lean.Environment) (ctorName : Lean.Name) (idx : Nat) (allowRcAdt : Bool := false)
+    (parentExpr? : Option Lean.Expr := none) : Option RcFieldMeta := do
+  let .ctorInfo cval ← env.find? ctorName | none
+  let typeArgs := match parentExpr? with
+    | some pe => pe.getAppArgs
+    | none => #[]
+  let rec instParams (k : Nat) (pIdx : Nat) (t : Lean.Expr) : Lean.Expr :=
+    match k, t with
+    | 0, rest => rest
+    | k + 1, .forallE _ _ body _ =>
+      let body' := match typeArgs[pIdx]? with | some argE => body.instantiate1 argE | none => body
+      instParams k (pIdx + 1) body'
+    | _, rest => rest
+  let rec nthField (k : Nat) (t : Lean.Expr) : Option Lean.Expr :=
+    match k, t with
+    | 0, .forallE _ dom _ _ => some dom
+    | k + 1, .forallE _ _ body _ => nthField k (body.instantiate1 (Lean.mkConst ``Unit.unit))
+    | _, _ => none
+  let dom ← nthField idx (instParams cval.numParams 0 cval.type)
+  guard (!dom.hasLooseBVars)
+  return classifyRcAdtExpr env dom allowRcAdt
+
+def lookupCtorObjSlotInfoM (ctorName : Lean.Name) (objIdx : Nat) (allowRcAdt : Bool := false)
+    (parentExpr? : Option Lean.Expr := none) : Lean.CoreM (Option RcFieldMeta) := do
   let env ← getEnv
   try
     let lay ← Lean.Compiler.LCNF.getCtorLayout ctorName
-    let rec findSlot (j : Nat) : Option (Option Lean.Name × LNIRType) :=
+    let rec findSlot (j : Nat) : Option RcFieldMeta :=
       if j >= lay.fieldInfo.size then none
       else match lay.fieldInfo[j]! with
         | .object i _ =>
-          if i == objIdx then lookupCtorFieldInfo env ctorName j allowRcAdt else findSlot (j + 1)
+          if i == objIdx then lookupCtorFieldInfo env ctorName j allowRcAdt parentExpr? else findSlot (j + 1)
         | _ => findSlot (j + 1)
     return findSlot 0
   catch _ =>
-    return lookupCtorFieldInfo env ctorName objIdx allowRcAdt
+    return lookupCtorFieldInfo env ctorName objIdx allowRcAdt parentExpr?
 
 structure RcCtorLayoutSpec where
   ctorName    : Lean.Name := .anonymous
@@ -466,8 +472,10 @@ structure BridgeState where
   fvarToVar      : Std.HashMap Lean.FVarId VarId := {}
   varTypes       : Std.HashMap VarId LNIRType := {}
   adtVarMap      : Std.HashMap VarId Lean.Name := {}
+  adtExprMap     : Std.HashMap VarId Lean.Expr := {}
   activeCtorMap  : Std.HashMap VarId Lean.Name := {}
   ctorSizeMap    : Std.HashMap VarId (Nat × Nat) := {}
+  ctorSlotMap    : Std.HashMap VarId (Array RcFieldMeta) := {}
   jpRawMap       : Std.HashMap Lean.FVarId (Array (Lean.Compiler.LCNF.Param .impure) × Lean.Compiler.LCNF.Code .impure × Std.HashMap Nat Lean.FVarId) := {}
   jpMap          : Std.HashMap Lean.FVarId (Array (Lean.Compiler.LCNF.Param .impure) × LNIRCode) := {}
   jpIndexMap     : Std.HashMap Lean.FVarId Nat := {}
@@ -772,35 +780,68 @@ def tryLowerGfSimdIntrinsic (env : Lean.Environment) (fnName : Lean.Name) (argVa
     else none
   | _ => none
 
+def recordSingleCtorAdtMetaM (vid : VarId) (metaInfo : RcFieldMeta) : BridgeM Unit := do
+  let env ← getEnv
+  if let some e := metaInfo.expr? then
+    modify fun s => { s with adtExprMap := s.adtExprMap.insert vid e }
+  if let some adtName := metaInfo.adtName? then
+    modify fun s => { s with adtVarMap := s.adtVarMap.insert vid adtName }
+    if let some (.inductInfo ival) := env.find? adtName then
+      if ival.ctors.length == 1 then
+        if let some ctorName := ival.ctors[0]? then
+          let spec ← getRcCtorLayoutSpecM ctorName
+          let allowRc := (← get).allowRcAdt
+          let mut slots : Array RcFieldMeta := #[]
+          for j in List.range spec.objSlots do
+            let sm := (← lookupCtorObjSlotInfoM ctorName j allowRc metaInfo.expr?).getD {}
+            slots := slots.push sm
+          modify fun s => { s with
+            activeCtorMap := s.activeCtorMap.insert vid ctorName
+            ctorSizeMap := s.ctorSizeMap.insert vid (spec.cidx, spec.objSlots)
+            ctorSlotMap := if slots.isEmpty then s.ctorSlotMap else s.ctorSlotMap.insert vid slots }
+
+def resolveObjSlotMetaM (cv : VarId) (idx : Nat) (ctorHint? : Option Lean.Name := none) : BridgeM (Option RcFieldMeta) := do
+  let st ← get
+  if let some slots := st.ctorSlotMap[cv]? then
+    if let some sm := slots[idx]? then
+      if sm.adtName?.isSome || sm.expr?.isSome || sm.ty != .objPtr then
+        return some sm
+  let cNameOpt ← match ctorHint?.orElse (fun _ => st.activeCtorMap[cv]?) with
+    | some cName => pure (some cName)
+    | none =>
+      match ← lookupCompatibleCtorSpecM st.adtVarMap[cv]? (fun cs => idx < cs.objSlots) with
+      | some cs => pure (some cs.ctorName)
+      | none => pure none
+  match cNameOpt with
+  | some cName => lookupCtorObjSlotInfoM cName idx st.allowRcAdt st.adtExprMap[cv]?
+  | none =>
+    if let some slots := st.ctorSlotMap[cv]? then return slots[idx]? else return none
+
+def varRcFieldMetaM (vid : VarId) : BridgeM RcFieldMeta := do
+  let st ← get
+  let ty ← getVarType vid
+  return { adtName? := st.adtVarMap[vid]?, expr? := st.adtExprMap[vid]?, ty := ty }
+
 def internSignatureParams {pu} (declName : Lean.Name) (params : Array (Lean.Compiler.LCNF.Param pu))
     (allowInternalObj : Bool) (isExported : Bool) : BridgeM (List LNIRParam × (LNIRType → BridgeM LNIRType)) := do
   let st ← get
   let env ← getEnv
   let (envParams, envRet) :=
-    if st.allowRcAdt && !isExported then extractEnvParamAdtInfo env declName st.allowRcAdt else (#[], (none, .objPtr))
+    if st.allowRcAdt && !isExported then extractEnvParamAdtInfo env declName st.allowRcAdt else (#[], {})
   let mut lnirParams : List LNIRParam := []
   for i in List.range params.size do
     let p := params[i]!
     let rawPTy ← lowerBridgeType p.type
-    let (adt?, refinedPTy) := envParams[i]?.getD (none, rawPTy)
+    let metaInfo := envParams[i]?.getD { ty := rawPTy }
     let pTy :=
-      if (rawPTy == .objPtr || rawPTy == .taggedPtr) && adt?.isNone && isUnboxedScalarOrTuple refinedPTy then refinedPTy
+      if (rawPTy == .objPtr || rawPTy == .taggedPtr) && metaInfo.adtName?.isNone && isUnboxedScalarOrTuple metaInfo.ty then metaInfo.ty
       else rawPTy
     checkBridgeType s!"parameter `{p.binderName}` of `{declName}`" p.type pTy (allowInternalObj || st.allowRcAdt)
     let vid ← internFVar p.fvarId pTy true
-    if let some adtName := adt? then
-      modify fun s => { s with adtVarMap := s.adtVarMap.insert vid adtName }
-      if let some (.inductInfo ival) := env.find? adtName then
-        if ival.ctors.length == 1 then
-          if let some ctorName := ival.ctors[0]? then
-            let spec ← getRcCtorLayoutSpecM ctorName
-            modify fun s => { s with
-              activeCtorMap := s.activeCtorMap.insert vid ctorName
-              ctorSizeMap := s.ctorSizeMap.insert vid (spec.cidx, spec.objSlots) }
+    recordSingleCtorAdtMetaM vid metaInfo
     lnirParams := lnirParams ++ [{ id := vid, name := p.binderName.toString, ty := pTy, borrow := p.borrow }]
   let refineRet (rawRetTy : LNIRType) : BridgeM LNIRType := do
-    let (retAdt?, refinedRet) := envRet
-    return if (rawRetTy == .objPtr || rawRetTy == .taggedPtr) && retAdt?.isNone && isUnboxedScalarOrTuple refinedRet then refinedRet
+    return if (rawRetTy == .objPtr || rawRetTy == .taggedPtr) && envRet.adtName?.isNone && isUnboxedScalarOrTuple envRet.ty then envRet.ty
       else rawRetTy
   return (lnirParams, refineRet)
 
@@ -845,24 +886,15 @@ def inferImpureRhsType (rhs : LNIRExpr) (declTy : LNIRType) (isBox : Bool) : Bri
       else if isUnboxedScalarOrTuple sty then sty else declTy
   | .scalar _ => return if isUnboxedScalarOrTuple declTy then declTy else .i64
   | .mkTuple argVars => return .tuple (← argVars.mapM getVarType)
+  | .allocCtor .. => return if declTy == .taggedPtr then .taggedPtr else .objPtr
   | .projTuple tv idx =>
     match (← getVarType tv) with
     | .tuple fs => return if isUnboxedScalarOrTuple declTy then declTy else fs[idx]?.getD .i64
     | _ => return declTy
   | .ctorGetObj cv idx =>
-    let st ← get
-    if st.allowRcAdt then
-      let cNameOpt ← match st.activeCtorMap[cv]? with
-        | some cName => pure (some cName)
-        | none =>
-          match ← lookupCompatibleCtorSpecM st.adtVarMap[cv]? (fun cs => idx < cs.objSlots) with
-          | some cs => pure (some cs.ctorName)
-          | none => pure none
-      match cNameOpt with
-      | some cName =>
-        match ← lookupCtorObjSlotInfoM cName idx st.allowRcAdt with
-        | some (_, fty) => return if isUnboxedScalarOrTuple declTy then declTy else fty
-        | none => return declTy
+    if (← get).allowRcAdt then
+      match ← resolveObjSlotMetaM cv idx with
+      | some sm => return if isUnboxedScalarOrTuple declTy then declTy else sm.ty
       | none => return declTy
     else return declTy
   | .ctorGetScalar _ _ sTy =>
@@ -873,63 +905,69 @@ def recordImpureLetAdtInfo (dst : VarId) (lv : Lean.Compiler.LCNF.LetValue .impu
   if !(← get).allowRcAdt then return ()
   let env ← getEnv
   match lv with
-  | .ctor ctorInfo _ _ | .reuse _ ctorInfo _ _ _ =>
+  | .ctor ctorInfo args _ | .reuse _ ctorInfo _ args _ =>
     if let some (.ctorInfo cval) := env.find? ctorInfo.name then
       if let some (.inductInfo _) := env.find? cval.induct then
         let dstTy ← getVarType dst
         if cval.induct != ``Bool && cval.induct != ``Unit && cval.induct != ``PUnit &&
             (dstTy == .objPtr || dstTy == .taggedPtr) then
           let spec ← getRcCtorLayoutSpecM ctorInfo.name
+          let dropCnt := if args.size > spec.objSlots && spec.objSlots > 0 then args.size - spec.objSlots
+            else if args.size > cval.numFields then args.size - cval.numFields else 0
+          let fieldArgs := args.toList.drop dropCnt
+          let mut slots : Array RcFieldMeta := #[]
+          for j in List.range fieldArgs.length do
+            let argMeta ← match fieldArgs[j]! with
+              | .fvar fv => varRcFieldMetaM (← internFVar fv)
+              | _ => pure {}
+            let fallbackMeta := (← lookupCtorObjSlotInfoM ctorInfo.name j true).getD {}
+            let merged : RcFieldMeta := {
+              adtName? := argMeta.adtName?.orElse (fun _ => fallbackMeta.adtName?)
+              expr? := argMeta.expr?.orElse (fun _ => fallbackMeta.expr?)
+              ty := if argMeta.ty != .objPtr && argMeta.ty != .taggedPtr then argMeta.ty else fallbackMeta.ty
+            }
+            slots := slots.push merged
           modify fun s => { s with
             adtVarMap := s.adtVarMap.insert dst cval.induct
             activeCtorMap := s.activeCtorMap.insert dst ctorInfo.name
-            ctorSizeMap := s.ctorSizeMap.insert dst (spec.cidx, spec.objSlots) }
+            ctorSizeMap := s.ctorSizeMap.insert dst (spec.cidx, Nat.max spec.objSlots slots.size)
+            ctorSlotMap := if slots.isEmpty then s.ctorSlotMap else s.ctorSlotMap.insert dst slots }
   | .reset n fvarId _ =>
     let sv ← internFVar fvarId
     let st ← get
     let (cidx, prevFields) := st.ctorSizeMap.getD sv (0, n)
     modify fun s => { s with
       adtVarMap := match st.adtVarMap[sv]? with | some a => s.adtVarMap.insert dst a | none => s.adtVarMap
+      adtExprMap := match st.adtExprMap[sv]? with | some e => s.adtExprMap.insert dst e | none => s.adtExprMap
       activeCtorMap := match st.activeCtorMap[sv]? with | some c => s.activeCtorMap.insert dst c | none => s.activeCtorMap
-      ctorSizeMap := s.ctorSizeMap.insert dst (cidx, Nat.max n prevFields) }
+      ctorSizeMap := s.ctorSizeMap.insert dst (cidx, Nat.max n prevFields)
+      ctorSlotMap := match st.ctorSlotMap[sv]? with | some sl => s.ctorSlotMap.insert dst sl | none => s.ctorSlotMap }
   | .oproj idx fvarId _ =>
     let cv ← internFVar fvarId
-    let st ← get
-    let cNameOpt ← match st.activeCtorMap[cv]? with
-      | some cName => pure (some cName)
-      | none =>
-        match ← lookupCompatibleCtorSpecM st.adtVarMap[cv]? (fun cs => idx < cs.objSlots) with
-        | some cs => pure (some cs.ctorName)
-        | none => pure none
-    if let some cName := cNameOpt then
-      if let some (some fAdt, _) ← lookupCtorObjSlotInfoM cName idx st.allowRcAdt then
-        modify fun s => { s with adtVarMap := s.adtVarMap.insert dst fAdt }
-        if let some (.inductInfo ival) := env.find? fAdt then
-          if ival.ctors.length == 1 then
-            if let some fCtor := ival.ctors[0]? then
-              let fSpec ← getRcCtorLayoutSpecM fCtor
-              modify fun s => { s with
-                activeCtorMap := s.activeCtorMap.insert dst fCtor
-                ctorSizeMap := s.ctorSizeMap.insert dst (fSpec.cidx, fSpec.objSlots) }
+    if let some sm ← resolveObjSlotMetaM cv idx then
+      recordSingleCtorAdtMetaM dst sm
   | .fvar fvarId args =>
     if args.isEmpty then
       let sv ← internFVar fvarId
       let st ← get
       modify fun s => { s with
         adtVarMap := match st.adtVarMap[sv]? with | some a => s.adtVarMap.insert dst a | none => s.adtVarMap
+        adtExprMap := match st.adtExprMap[sv]? with | some e => s.adtExprMap.insert dst e | none => s.adtExprMap
         activeCtorMap := match st.activeCtorMap[sv]? with | some c => s.activeCtorMap.insert dst c | none => s.activeCtorMap
-        ctorSizeMap := match st.ctorSizeMap[sv]? with | some sz => s.ctorSizeMap.insert dst sz | none => s.ctorSizeMap }
+        ctorSizeMap := match st.ctorSizeMap[sv]? with | some sz => s.ctorSizeMap.insert dst sz | none => s.ctorSizeMap
+        ctorSlotMap := match st.ctorSlotMap[sv]? with | some sl => s.ctorSlotMap.insert dst sl | none => s.ctorSlotMap }
+  | .box _ fvarId _ | .unbox fvarId _ =>
+    let sv ← internFVar fvarId
+    let st ← get
+    modify fun s => { s with
+      adtVarMap := match st.adtVarMap[sv]? with | some a => s.adtVarMap.insert dst a | none => s.adtVarMap
+      adtExprMap := match st.adtExprMap[sv]? with | some e => s.adtExprMap.insert dst e | none => s.adtExprMap
+      activeCtorMap := match st.activeCtorMap[sv]? with | some c => s.activeCtorMap.insert dst c | none => s.activeCtorMap
+      ctorSizeMap := match st.ctorSizeMap[sv]? with | some sz => s.ctorSizeMap.insert dst sz | none => s.ctorSizeMap
+      ctorSlotMap := match st.ctorSlotMap[sv]? with | some sl => s.ctorSlotMap.insert dst sl | none => s.ctorSlotMap }
   | .fap fnName _ _ =>
-    let (_, (retAdt?, _)) := extractEnvParamAdtInfo env fnName (← get).allowRcAdt
-    if let some rAdt := retAdt? then
-      modify fun s => { s with adtVarMap := s.adtVarMap.insert dst rAdt }
-      if let some (.inductInfo ival) := env.find? rAdt then
-        if ival.ctors.length == 1 then
-          if let some rCtor := ival.ctors[0]? then
-            let rSpec ← getRcCtorLayoutSpecM rCtor
-            modify fun s => { s with
-              activeCtorMap := s.activeCtorMap.insert dst rCtor
-              ctorSizeMap := s.ctorSizeMap.insert dst (rSpec.cidx, rSpec.objSlots) }
+    let (_, retMeta) := extractEnvParamAdtInfo env fnName (← get).allowRcAdt
+    recordSingleCtorAdtMetaM dst retMeta
   | _ => return ()
 
 def lookupCtorIdx (ctorName : Lean.Name) (fallbackIdx : Nat) : BridgeM Nat := do
@@ -1382,11 +1420,15 @@ partial def synthDummyLikeVar (exVid : VarId) : BridgeM (List (VarId × LNIRType
     let (cidx, nFields) := st.ctorSizeMap.getD exVid (0, 0)
     let ctorOpt := st.activeCtorMap[exVid]?
     let adtOpt := st.adtVarMap[exVid]?
+    let exprOpt := st.adtExprMap[exVid]?
+    let slotOpt := st.ctorSlotMap[exVid]?
     let dv ← freshBridgeVar exTy
     modify fun s => { s with
       adtVarMap := match adtOpt with | some a => s.adtVarMap.insert dv a | none => s.adtVarMap
+      adtExprMap := match exprOpt with | some e => s.adtExprMap.insert dv e | none => s.adtExprMap
       activeCtorMap := match ctorOpt with | some c => s.activeCtorMap.insert dv c | none => s.activeCtorMap
-      ctorSizeMap := s.ctorSizeMap.insert dv (cidx, nFields) }
+      ctorSizeMap := s.ctorSizeMap.insert dv (cidx, nFields)
+      ctorSlotMap := match slotOpt with | some sl => s.ctorSlotMap.insert dv sl | none => s.ctorSlotMap }
     return ([(dv, .i64, .scalar (.constU64 0))], dv)
   | _ =>
     let dv ← freshBridgeVar exTy
@@ -1417,10 +1459,14 @@ def spliceRawJoinPoint (fvarId : Lean.FVarId) (args : Array (Lean.Compiler.LCNF.
           modify fun s => { s with
             adtVarMap := if s.adtVarMap.contains argVid then s.adtVarMap
               else match st.adtVarMap[exVid]? with | some a => s.adtVarMap.insert argVid a | none => s.adtVarMap
+            adtExprMap := if s.adtExprMap.contains argVid then s.adtExprMap
+              else match st.adtExprMap[exVid]? with | some e => s.adtExprMap.insert argVid e | none => s.adtExprMap
             activeCtorMap := if s.activeCtorMap.contains argVid then s.activeCtorMap
               else match st.activeCtorMap[exVid]? with | some c => s.activeCtorMap.insert argVid c | none => s.activeCtorMap
             ctorSizeMap := if s.ctorSizeMap.contains argVid then s.ctorSizeMap
-              else match st.ctorSizeMap[exVid]? with | some sz => s.ctorSizeMap.insert argVid sz | none => s.ctorSizeMap }
+              else match st.ctorSizeMap[exVid]? with | some sz => s.ctorSizeMap.insert argVid sz | none => s.ctorSizeMap
+            ctorSlotMap := if s.ctorSlotMap.contains argVid then s.ctorSlotMap
+              else match st.ctorSlotMap[exVid]? with | some sl => s.ctorSlotMap.insert argVid sl | none => s.ctorSlotMap }
         modify fun st => { st with fvarToVar := st.fvarToVar.insert p.fvarId argVid }
       | .erased | .type .. =>
         match exFVars[i]?.bind (fun fv => savedFVars[fv]?) with
@@ -1457,11 +1503,17 @@ def emitHeapRebuildAndContM (fvarId : Lean.FVarId) (curVid : VarId) (curTy : LNI
     (lowerImpFn : Lean.Compiler.LCNF.Code .impure → BridgeM LNIRCode) : BridgeM LNIRCode := do
   let delDummy ← freshBridgeVar .unit
   let newVid ← freshBridgeVar curTy
+  let mut newSlots : Array RcFieldMeta := #[]
+  for ov in newObjVars do
+    newSlots := newSlots.push (← varRcFieldMetaM ov)
+  let exprOpt := (← get).adtExprMap[curVid]?
   modify fun s => { s with
     fvarToVar := s.fvarToVar.insert fvarId newVid
     adtVarMap := match adtOpt with | some a => s.adtVarMap.insert newVid a | none => s.adtVarMap
+    adtExprMap := match exprOpt with | some e => s.adtExprMap.insert newVid e | none => s.adtExprMap
     activeCtorMap := match newCtorOpt with | some c => s.activeCtorMap.insert newVid c | none => s.activeCtorMap
-    ctorSizeMap := s.ctorSizeMap.insert newVid (newCidx, newObjVars.length) }
+    ctorSizeMap := s.ctorSizeMap.insert newVid (newCidx, newObjVars.length)
+    ctorSlotMap := if newSlots.isEmpty then s.ctorSlotMap else s.ctorSlotMap.insert newVid newSlots }
   let kCode ← lowerImpFn k
   modify fun s => { s with fvarToVar := savedFVars }
   let allBinds := preBinds ++ [
@@ -1499,7 +1551,6 @@ def lowerOsetInstr (fvarId : Lean.FVarId) (idx : Nat) (arg : Lean.Compiler.LCNF.
     modify fun st => { st with fvarToVar := savedFVars }
     return (binds ++ [(newVid, newTy, LNIRExpr.mkTuple newFields)]).foldr (fun (d, t, r) acc => .letBind d t r acc) kCode
   | .objPtr | .taggedPtr =>
-    let allowRc := (← get).allowRcAdt
     let (adtOpt, ctorOpt, spec) ← resolveCurCtorSpecM curVid
     if idx >= spec.objSlots then
       Lean.throwError s!"[lean-native] Out-of-bounds constructor oset index {idx} (size {spec.objSlots})"
@@ -1509,11 +1560,10 @@ def lowerOsetInstr (fvarId : Lean.FVarId) (idx : Nat) (arg : Lean.Compiler.LCNF.
       if j == idx then
         newObjVars := newObjVars ++ [valVid]
       else
-        let fTy ← match ctorOpt with
-          | some cName => pure ((← lookupCtorObjSlotInfoM cName j allowRc).map (·.2) |>.getD .objPtr)
-          | none => pure .objPtr
-        let pv ← freshBridgeVar fTy
-        binds := binds ++ [(pv, fTy, .ctorGetObj curVid j)]
+        let sm := (← resolveObjSlotMetaM curVid j ctorOpt).getD {}
+        let pv ← freshBridgeVar sm.ty
+        recordSingleCtorAdtMetaM pv sm
+        binds := binds ++ [(pv, sm.ty, .ctorGetObj curVid j)]
         newObjVars := newObjVars ++ [pv]
     let mut newScalarVars : List VarId := []
     for sIdx in List.range spec.scalarSlots.length do
@@ -1535,7 +1585,6 @@ def lowerScalarSlotMutM (fvarId : Lean.FVarId) (valFVar : Lean.FVarId)
   let curTy ← getVarType curVid
   if curTy != .objPtr && curTy != .taggedPtr then
     Lean.throwError s!"[lean-native] Unsupported {errCtx} target type `{reprStr curTy}`"
-  let allowRc := (← get).allowRcAdt
   let savedFVars := (← get).fvarToVar
   let (adtOpt, rawCtorOpt, rawSpec) ← resolveCurCtorSpecM curVid
   let (ctorOpt, spec) ← match findSlotFn rawSpec with
@@ -1549,11 +1598,10 @@ def lowerScalarSlotMutM (fvarId : Lean.FVarId) (valFVar : Lean.FVarId)
   let mut binds : List (VarId × LNIRType × LNIRExpr) := []
   let mut newObjVars : List VarId := []
   for j in List.range spec.objSlots do
-    let fTy ← match ctorOpt with
-      | some cName => pure ((← lookupCtorObjSlotInfoM cName j allowRc).map (·.2) |>.getD .objPtr)
-      | none => pure .objPtr
-    let pv ← freshBridgeVar fTy
-    binds := binds ++ [(pv, fTy, .ctorGetObj curVid j)]
+    let sm := (← resolveObjSlotMetaM curVid j ctorOpt).getD {}
+    let pv ← freshBridgeVar sm.ty
+    recordSingleCtorAdtMetaM pv sm
+    binds := binds ++ [(pv, sm.ty, .ctorGetObj curVid j)]
     newObjVars := newObjVars ++ [pv]
   let mut newScalarVars : List VarId := []
   for sIdx in List.range spec.scalarSlots.length do
@@ -1596,13 +1644,15 @@ def lowerSetTagInstr (fvarId : Lean.FVarId) (newCidx : Nat)
   let targetObjSlots := Nat.max oldSpec.objSlots newSpec.objSlots
   let mut binds : List (VarId × LNIRType × LNIRExpr) := []
   let mut newObjVars : List VarId := []
+  let curExpr? := (← get).adtExprMap[curVid]?
   for j in List.range targetObjSlots do
-    let fTy ← match newCtorOpt.orElse (fun _ => oldCtorOpt) with
-      | some cName => pure ((← lookupCtorObjSlotInfoM cName j allowRc).map (·.2) |>.getD .objPtr)
-      | none => pure .objPtr
-    let pv ← freshBridgeVar fTy
+    let sm ← match newCtorOpt with
+      | some cName => pure ((← lookupCtorObjSlotInfoM cName j allowRc curExpr?).getD {})
+      | none => pure ((← resolveObjSlotMetaM curVid j oldCtorOpt).getD {})
+    let pv ← freshBridgeVar sm.ty
+    recordSingleCtorAdtMetaM pv sm
     if j < oldSpec.objSlots then
-      binds := binds ++ [(pv, fTy, .ctorGetObj curVid j)]
+      binds := binds ++ [(pv, sm.ty, .ctorGetObj curVid j)]
     else
       binds := binds ++ [(pv, .i64, .scalar (.constU64 0))]
     newObjVars := newObjVars ++ [pv]
@@ -1658,7 +1708,8 @@ def prepareCasesDiscr (discr : Lean.FVarId) (rawTypeName : Lean.Name)
         return (tagVar, false, some condVar, typeName)
   Lean.throwError s!"[lean-native] Unsupported cases scrutinee type `{rawTypeName}`"
 
-def recordActiveCtorForDiscr (discr : Lean.FVarId) (typeName : Lean.Name) (cidx : Nat) : BridgeM (Option (VarId × Option Lean.Name × Option (Nat × Nat))) := do
+def recordActiveCtorForDiscr (discr : Lean.FVarId) (typeName : Lean.Name) (cidx : Nat) :
+    BridgeM (Option (VarId × Option Lean.Name × Option (Nat × Nat) × Option (Array RcFieldMeta))) := do
   let st ← get
   if !st.allowRcAdt then return none
   let condVar ← internFVar discr
@@ -1670,18 +1721,25 @@ def recordActiveCtorForDiscr (discr : Lean.FVarId) (typeName : Lean.Name) (cidx 
   let spec ← getRcCtorLayoutSpecM ctorName
   let prevCtor := st.activeCtorMap[condVar]?
   let prevSize := st.ctorSizeMap[condVar]?
+  let prevSlots := st.ctorSlotMap[condVar]?
+  let mut nextSlots : Array RcFieldMeta := #[]
+  for j in List.range spec.objSlots do
+    let sm := (← lookupCtorObjSlotInfoM ctorName j st.allowRcAdt st.adtExprMap[condVar]?).getD {}
+    nextSlots := nextSlots.push sm
   modify fun s => { s with
     adtVarMap := s.adtVarMap.insert condVar typeName
     activeCtorMap := s.activeCtorMap.insert condVar ctorName
-    ctorSizeMap := s.ctorSizeMap.insert condVar (cidx, spec.objSlots) }
-  return some (condVar, prevCtor, prevSize)
+    ctorSizeMap := s.ctorSizeMap.insert condVar (cidx, spec.objSlots)
+    ctorSlotMap := if nextSlots.isEmpty then s.ctorSlotMap.erase condVar else s.ctorSlotMap.insert condVar nextSlots }
+  return some (condVar, prevCtor, prevSize, prevSlots)
 
-def restoreActiveCtorForDiscr : Option (VarId × Option Lean.Name × Option (Nat × Nat)) → BridgeM Unit
+def restoreActiveCtorForDiscr : Option (VarId × Option Lean.Name × Option (Nat × Nat) × Option (Array RcFieldMeta)) → BridgeM Unit
   | none => return ()
-  | some (condVar, prevCtor, prevSize) =>
+  | some (condVar, prevCtor, prevSize, prevSlots) =>
     modify fun s => { s with
       activeCtorMap := match prevCtor with | some c => s.activeCtorMap.insert condVar c | none => s.activeCtorMap.erase condVar
-      ctorSizeMap := match prevSize with | some sz => s.ctorSizeMap.insert condVar sz | none => s.ctorSizeMap.erase condVar }
+      ctorSizeMap := match prevSize with | some sz => s.ctorSizeMap.insert condVar sz | none => s.ctorSizeMap.erase condVar
+      ctorSlotMap := match prevSlots with | some sl => s.ctorSlotMap.insert condVar sl | none => s.ctorSlotMap.erase condVar }
 
 def lowerJmpInstr {pu} (fvarId : Lean.FVarId) (args : Array (Lean.Compiler.LCNF.Arg pu)) : BridgeM LNIRCode := do
   match (← get).jpMap[fvarId]? with
@@ -1883,7 +1941,11 @@ def lowerTupleOrEnumCtorM (ctorName : Lean.Name) (cidx : Nat) (args : Array (Lea
     let argVars ← fieldArgs.mapM (lowerArg · true)
     let argTys ← argVars.mapM getVarType
     let arch := st.arch
-    if argVars.isEmpty || !(argTys.all fun t => isSupportedStage1BScalarType t arch || t == .objPtr || t == .taggedPtr || (st.allowRcAdt && isSupportedStage1BScalarOrTuple t arch)) then
+    if isProd && st.allowRcAdt && !(argTys.all (isSupportedStage1BScalarType · arch)) then
+      if argVars.isEmpty || !(argTys.all fun t => isSupportedStage1BScalarOrTuple t arch || t == .objPtr || t == .taggedPtr) then
+        Lean.throwError s!"[lean-native] Unsupported non-scalar or nested tuple/constructor fields in `{ctorName}`"
+      return ([], .allocCtor cidx argVars [])
+    if argVars.isEmpty || !(argTys.all fun t => isSupportedStage1BScalarType t arch || (!st.allowRcAdt && (t == .objPtr || t == .taggedPtr)) || (st.allowRcAdt && isSupportedStage1BScalarOrTuple t arch)) then
       Lean.throwError s!"[lean-native] Unsupported non-scalar or nested tuple/constructor fields in `{ctorName}`"
     return ([], .mkTuple argVars)
   | none =>
