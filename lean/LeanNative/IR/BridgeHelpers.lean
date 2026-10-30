@@ -270,6 +270,15 @@ def instantiateInductExprParams (paramArgs : List Lean.Expr) : Nat → Lean.Expr
     instantiateInductExprParams (paramArgs.drop 1) k (body.instantiate1 arg)
   | _, rest => rest
 
+def isStage1DHeapObjectFieldExpr (env : Lean.Environment) (arch : TargetArch) (e : Lean.Expr) : Bool :=
+  if isClosureOrRuntimeNatExpr e || isSignedScalarTypeExpr e then false
+  else
+    let ty := lowerImpureType e (some env)
+    if tyContainsUSize ty && !archSupportsUSize arch then false
+    else match ty with
+      | .tuple fs => !fs.isEmpty && fs.length ≤ 8 && fs.all (isSupportedStage1BScalarType · arch)
+      | _ => false
+
 def isStage1DHeapFieldExpr (env : Lean.Environment) (arch : TargetArch) (e : Lean.Expr) : Bool :=
   if isClosureOrRuntimeNatExpr e || isSignedScalarTypeExpr e then false
   else
@@ -300,7 +309,7 @@ def isSupportedStage1DHeapAdtExpr (env : Lean.Environment) (arch : TargetArch) (
               match k, t with
               | 0, _ => true
               | k + 1, .forallE _ dom body _ =>
-                !dom.hasLooseBVars && isStage1DHeapFieldExpr env arch dom && checkCtorFields k body
+                !dom.hasLooseBVars && isStage1DHeapObjectFieldExpr env arch dom && checkCtorFields k body
               | _, _ => false
             let hasPayload := ival.ctors.any fun cName =>
               match env.find? cName with

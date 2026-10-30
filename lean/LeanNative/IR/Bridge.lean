@@ -97,8 +97,15 @@ def lowerImpureLetValue (lv : Lean.Compiler.LCNF.LetValue .impure) (retTy : LNIR
   | .lit litVal => lowerLitValueM litVal retTy true
   | .erased => return .scalar (.constU64 0)
   | .fvar fvarId args => lowerFVarCall fvarId args retTy
-  | .ctor ctorInfo args _ | .reuse _ ctorInfo _ args _ =>
+  | .ctor ctorInfo args _ =>
     lowerTupleOrEnumCtor ctorInfo.name ctorInfo.cidx args retTy
+  | .reuse slotFVar ctorInfo _ args _ =>
+    let slotVid ← internFVar slotFVar
+    let slotTy ← getVarType slotVid
+    if isUnboxedScalarOrTuple slotTy then
+      lowerTupleOrEnumCtor ctorInfo.name ctorInfo.cidx args retTy
+    else
+      Lean.throwError "[lean-native] Unsupported legacy heap reuse instruction in Stage 1B"
   | .oproj idx fvarId _ => lowerTupleProj fvarId idx retTy true
   | .uproj idx fvarId _ => lowerTupleProj fvarId idx .usize false
   | .sproj offset _ fvarId _ => lowerTupleProj fvarId offset retTy false
@@ -121,7 +128,7 @@ def lowerImpureLetValue (lv : Lean.Compiler.LCNF.LetValue .impure) (retTy : LNIR
   | .reset _ fvarId _ =>
     let v ← internFVar fvarId
     let vt ← getVarType v
-    if isUnboxedScalarOrTuple vt || ((← get).allowStage1DHeap && (vt == .objPtr || vt == .taggedPtr)) then
+    if isUnboxedScalarOrTuple vt then
       return .scalar (.var v)
     else
       Lean.throwError "[lean-native] Unsupported heap reset instruction in Stage 1B"

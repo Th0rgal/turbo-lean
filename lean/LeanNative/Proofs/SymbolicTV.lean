@@ -658,9 +658,9 @@ def mkSampleParamVal (seed : UInt64) (paramIdx : Nat) (ty : LNIRType) (st : Heap
     | 0 => (.u64 1, st)
     | _ =>
       let mkLeaf (s : HeapState) (salt : UInt64) (sharedLeaf : Bool) : Val × HeapState :=
-        let f0 := Val.u64 (((splitMix64Next (r + salt)).1 % 16) + 1)
-        let f1 := Val.u64 (((splitMix64Next (r + salt + 7)).1 % 16) + 1)
-        let (cid, s1) := s.allocHeapCtor 0 [f0, f1]
+        let leafFields := (List.range 8).map fun k =>
+          Val.u64 (((splitMix64Next (r + salt + (k.toUInt64 * 7))).1 % 16) + 1)
+        let (cid, s1) := s.allocHeapCtor 0 leafFields
         if sharedLeaf then
           match s1.incRefObj cid 1 with
           | .ok s2 => (.objPtr cid, s2)
@@ -668,9 +668,10 @@ def mkSampleParamVal (seed : UInt64) (paramIdx : Nat) (ty : LNIRType) (st : Heap
         else (.objPtr cid, s1)
       let sharedRoot := (r % 2 == 0)
       let sharedKids := (r % 3 == 0)
-      let (c0, st1) := mkLeaf st 101 sharedKids
-      let (c1, st2) := mkLeaf st1 203 sharedKids
-      let (oid, st3) := st2.allocHeapCtor 0 [c0, c1]
+      let (kids, stAfterKids) := (List.range 8).foldl (fun (acc, curSt) idx =>
+        let (cVal, nextSt) := mkLeaf curSt (101 + idx.toUInt64 * 97) sharedKids
+        (acc ++ [cVal], nextSt)) ([], st)
+      let (oid, st3) := stAfterKids.allocHeapCtor 0 kids
       if sharedRoot then
         match st3.incRefObj oid 1 with
         | .ok st4 => (.objPtr oid, st4)

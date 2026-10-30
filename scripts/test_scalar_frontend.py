@@ -782,9 +782,10 @@ run_meta do
      ("arity mismatch", lowerImpureCode (.jp (.mk j `join #[] ty (.return x)) (.jmp j #[.fvar x]))),
      ("constructor tag mutation", lowerImpureCode (.setTag x 1 (.return x))),
      ("recursive local function", lowerPureCode (.fun recLocalFn (.return x))),
-     ("higher-order fvar call", lowerPureLetValue (.fvar x #[.fvar x]) .i64 >>= fun _ => pure (.ret 0)),
-     ("constructor payload pattern", lowerPureAlts 0 false 0 [.alt `Boxed.mk #[p0] (.return x)]),
-     ("unsupported string literal", lowerLitValue (.str "abc") >>= fun _ => pure (.ret 0))]
+             ("higher-order fvar call", lowerPureLetValue (.fvar x #[.fvar x]) .i64 >>= fun _ => pure (.ret 0)),
+             ("constructor payload pattern", lowerPureAlts 0 false 0 [.alt `Boxed.mk #[p0] (.return x)]),
+             ("unsupported string literal", lowerLitValue (.str "abc") >>= fun _ => pure (.ret 0)),
+             ("Unsupported heap reset", lowerImpureLetValue (.reset 2 x rfl) .objPtr >>= fun _ => pure (.ret 0))]
   for (expected, action) in actions do
     let rejected ← try
       let _ ← action.run' {}
@@ -988,6 +989,57 @@ def probe_rc_drop (sel seed delta : UInt64) : UInt64 :=
                     self.assertEqual(row.get("live_objects"), 0, row)
                     got.append(int(row["value_u64"]))
                 self.assertEqual(got, expected)
+
+            # 3-field tuple-carrying heap ADT validates cleanly under SymbolicTV (`nonVacuousCount > 0`)
+            tri_src = tmp / "TriPacket.lean"
+            tri_src.write_text('''inductive TriPacket where
+  | tri : (UInt64 × UInt64) → (UInt64 × UInt64) → (UInt64 × UInt64) → TriPacket
+  | empty : TriPacket
+
+@[inline] def stepTriField (p : TriPacket) (d : UInt64) : TriPacket :=
+  match p with
+  | .tri a b c => .tri (a.1 + d, a.2) b (c.1 ^^^ d, c.2 + 1)
+  | .empty => .empty
+
+@[inline] def readThirdField (p : TriPacket) : UInt64 :=
+  match p with
+  | .tri a b c => a.1 + b.2 + c.1 + c.2
+  | .empty => 99
+
+@[export probe_tri]
+def probe_tri (x : UInt64) : UInt64 :=
+  let init := if x == 0 then TriPacket.empty else TriPacket.tri (x, x + 1) (x + 3, x + 4) (x + 5, x + 6)
+  readThirdField (stepTriField init 7)
+''', encoding="utf-8")
+            tri_wire = tmp / "tri.lnir"
+            subprocess.run([engines["full_bin"], "emit-lnir", "--wire", str(tri_src), "-o", str(tri_wire)],
+                           check=True, capture_output=True, text=True)
+            tri_tv = json.loads(subprocess.check_output(
+                [engines["core_bin"], "validate-tv", "--lnir", str(tri_wire), "--json"], text=True,
+            ))
+            self.assertTrue(tri_tv.get("allPassed"), tri_tv)
+
+            # Direct scalar-payload heap ADT (`sproj`/`sset`) fails closed instead of accepting without projection lowering
+            bad_scalar_adt = tmp / "BadScalarAdt.lean"
+            bad_scalar_adt.write_text('''inductive DirectScalarPkt where
+  | data : UInt64 → DirectScalarPkt
+  | empty : DirectScalarPkt
+
+def readDirect (p : DirectScalarPkt) : UInt64 :=
+  match p with
+  | .data x => x + 1
+  | .empty => 0
+
+@[export probe_bad_direct]
+def probe_bad_direct (x : UInt64) : UInt64 := readDirect (.data x)
+''', encoding="utf-8")
+            bad_wire = tmp / "bad_scalar_adt.lnir"
+            bad_res = subprocess.run(
+                [engines["full_bin"], "emit-lnir", "--wire", str(bad_scalar_adt), "-o", str(bad_wire)],
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(bad_res.returncode, 0, "direct scalar-payload heap ADT must fail closed")
+            self.assertFalse(bad_wire.exists())
 
 
 if __name__ == "__main__":
