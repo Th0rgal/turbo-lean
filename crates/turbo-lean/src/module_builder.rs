@@ -2066,6 +2066,12 @@ fn is_single_string_literal(v: &str) -> bool {
     false
 }
 
+/// A decimal literal exactly as Lean prints a `Nat` (no sign, no leading zero), so `-D` and
+/// `setup.json` carry the value Lake would.
+fn is_canonical_nat(v: &str) -> bool {
+    !v.is_empty() && v.bytes().all(|c| c.is_ascii_digit()) && (v == "0" || !v.starts_with('0'))
+}
+
 /// Normalise a `LeanOptionValue` literal: a bool, a natural number or a quoted string, optionally
 /// wrapped in `LeanOptionValue.of*` / `.of*`. Anything else (e.g. a bare identifier, which would
 /// otherwise reach Lean verbatim as `-Dkey=ident`) fails closed.
@@ -2084,9 +2090,7 @@ fn lean_option_literal(raw: &str, key: &str) -> Result<String> {
     }) {
         return Ok(b.to_string());
     }
-    if let Some(n) = lit("LeanOptionValue.ofNat ", ".ofNat ", |v| {
-        !v.is_empty() && v.chars().all(|c| c.is_ascii_digit())
-    }) {
+    if let Some(n) = lit("LeanOptionValue.ofNat ", ".ofNat ", |v| is_canonical_nat(v)) {
         return Ok(n.to_string());
     }
     if let Some(q) = lit(
@@ -2106,6 +2110,7 @@ fn lean_option_literal(raw: &str, key: &str) -> Result<String> {
         let v = parse_toml_string(q)?;
         if plain_escapes
             && !matches!(v.as_str(), "true" | "false")
+            && v.parse::<u64>().is_err()
             && !v.chars().all(|c| c.is_ascii_digit())
         {
             return Ok(v);
@@ -2336,6 +2341,193 @@ const BINDING_COMMANDS: [&str; 61] = [
     "in",
     ";",
 ];
+
+/// Keep every lakefile.lean inside a lexical subset of Lean on which the line-based scanners
+/// (`strip_lean_comments`, `lean_tokens_by_line`, `lean_scan`) agree with Lean. Rejects raw
+/// strings, char literals, `«»` anywhere but a target name, string braces (interpolation) that
+/// hold anything but a dotted name, `;`, non-ASCII letters in code (Lean's identifier
+/// boundaries differ from Rust's), and the elaboration-time `run_*` terms and `buildType`.
+/// Returns `src` with comments blanked byte for byte, as `strip_lean_comments` does, so the
+/// caller can check that both lexers agree.
+fn lakefile_lexical_guard(src: &str) -> std::result::Result<String, String> {
+    const FORBIDDEN_IDENTS: [&str; 6] = [
+        "run_io",
+        "run_cmd",
+        "run_elab",
+        "run_meta",
+        "run_tac",
+        "buildType",
+    ];
+    let mut out = String::with_capacity(src.len());
+    let blank = |out: &mut String, c: char| {
+        if c == '\n' {
+            out.push('\n');
+        } else {
+            out.extend(std::iter::repeat_n(' ', c.len_utf8()));
+        }
+    };
+    let mut chars = src.char_indices().peekable();
+    let mut line_start = 0usize;
+    let mut prev: Option<char> = None;
+    while let Some((i, c)) = chars.next() {
+        let next = chars.peek().map(|&(_, d)| d);
+        if c == '-' && next == Some('-') {
+            blank(&mut out, c);
+            while let Some(&(_, d)) = chars.peek() {
+                if d == '\n' {
+                    break;
+                }
+                blank(&mut out, d);
+                chars.next();
+            }
+            prev = None;
+            continue;
+        }
+        if c == '/' && next == Some('-') {
+            chars.next();
+            out.push_str("  ");
+            let mut depth = 1usize;
+            while depth > 0 {
+                let Some((_, d)) = chars.next() else {
+                    return Err("unterminated block comment".into());
+                };
+                let e = chars.peek().map(|&(_, e)| e);
+                if (d == '/' && e == Some('-')) || (d == '-' && e == Some('/')) {
+                    chars.next();
+                    out.push_str("  ");
+                    depth = if d == '/' { depth + 1 } else { depth - 1 };
+                } else {
+                    if d == '\n' {
+                        line_start = out.len() + 1;
+                    }
+                    blank(&mut out, d);
+                }
+            }
+            prev = None;
+            continue;
+        }
+        if c == '"' {
+            out.push('"');
+            loop {
+                let Some((_, d)) = chars.next() else {
+                    return Err("unterminated string literal".into());
+                };
+                out.push(d);
+                match d {
+                    '"' => break,
+                    '\\' => {
+                        let Some((_, e)) = chars.next() else {
+                            return Err("unterminated string literal".into());
+                        };
+                        out.push(e);
+                        if e == '\n' {
+                            line_start = out.len();
+                        }
+                    }
+                    '\n' => line_start = out.len(),
+                    '{' => loop {
+                        let Some((_, e)) = chars.next() else {
+                            return Err("unterminated string literal".into());
+                        };
+                        out.push(e);
+                        if e == '}' {
+                            break;
+                        }
+                        if !(e.is_ascii_alphanumeric() || matches!(e, '_' | '.' | ' ')) {
+                            return Err(format!(
+                                "unsupported `{e}` inside braces of a string literal"
+                            ));
+                        }
+                    },
+                    '}' => return Err("unmatched `}` in a string literal".into()),
+                    _ => {}
+                }
+            }
+            prev = Some('"');
+            continue;
+        }
+        if c == '\'' && !prev.is_some_and(is_lean_id_rest) {
+            return Err("char literal".into());
+        }
+        if c == ';' {
+            return Err("`;`".into());
+        }
+        if c == 'r'
+            && matches!(next, Some('"' | '#'))
+            && !prev.is_some_and(|p| is_lean_id_rest(p) || p == '.')
+        {
+            return Err("raw string literal".into());
+        }
+        if c == '«' {
+            let head = src[line_start..i].trim_end();
+            let head = head
+                .strip_prefix("@[default_target]")
+                .map_or(head, str::trim_start);
+            if !matches!(head, "package" | "lean_lib" | "lean_exe")
+                || head.len() == src[line_start..i].len()
+            {
+                return Err("`«»` outside a target name".into());
+            }
+            out.push(c);
+            let mut name = String::new();
+            loop {
+                let Some((_, d)) = chars.next() else {
+                    return Err("unterminated `«`".into());
+                };
+                out.push(d);
+                if d == '»' {
+                    break;
+                }
+                if !(d.is_ascii_alphanumeric() || matches!(d, '_' | '-')) {
+                    return Err(format!("unsupported `{d}` inside `«»`"));
+                }
+                name.push(d);
+            }
+            if name.is_empty() || name.contains("--") {
+                return Err("unsupported `«»` name".into());
+            }
+            prev = Some('»');
+            continue;
+        }
+        if c == '»' {
+            return Err("unmatched `»`".into());
+        }
+        if !c.is_ascii() && c.is_alphabetic() {
+            return Err(format!(
+                "non-ASCII letter `{c}` outside strings and comments"
+            ));
+        }
+        // A digit ends a number literal, so a word may start right after it (`1run_io`).
+        if is_lean_id_first(c) && !prev.is_some_and(|p| is_lean_id_rest(p) && !p.is_ascii_digit()) {
+            let mut end = i + c.len_utf8();
+            while let Some(&(j, d)) = chars.peek() {
+                if !(is_lean_id_rest(d) || d == '.') {
+                    break;
+                }
+                if !d.is_ascii() && d.is_alphabetic() {
+                    return Err(format!(
+                        "non-ASCII letter `{d}` outside strings and comments"
+                    ));
+                }
+                end = j + d.len_utf8();
+                chars.next();
+            }
+            let word = &src[i..end];
+            if let Some(bad) = word.split('.').find(|s| FORBIDDEN_IDENTS.contains(s)) {
+                return Err(format!("`{bad}`"));
+            }
+            out.push_str(word);
+            prev = word.chars().last();
+            continue;
+        }
+        out.push(c);
+        if c == '\n' {
+            line_start = out.len();
+        }
+        prev = Some(c);
+    }
+    Ok(out)
+}
 
 /// Identifier-like tokens (plus `#command`s and `;`) of each line of `src`, skipping string
 /// literals, char literals and backtick name literals. The scan runs over the whole file, so a
@@ -2687,7 +2879,20 @@ pub fn parse_lakefile_lean(
     let raw = fs::read_to_string(lean_path)
         .with_context(|| format!("Failed to read {}", lean_path.display()))?;
     let raw_hash = blake3::hash(raw.as_bytes()).to_hex().to_string();
+    let guarded = lakefile_lexical_guard(&raw).map_err(|e| {
+        anyhow::anyhow!(
+            "Unsupported Lean syntax in {}: {}: fail-closed static Lake config gate",
+            lean_path.display(),
+            e
+        )
+    })?;
     let clean = splitter::strip_lean_comments(&raw);
+    if guarded != clean {
+        anyhow::bail!(
+            "Unsupported Lean syntax in {}: comment/string scanners disagree: fail-closed static Lake config gate",
+            lean_path.display()
+        );
+    }
     let lean_option_bindings = collect_lakefile_abbrevs(&clean);
     // In a non-plain lakefile a `leanOptions` field can hide behind `;`, `where` or notation,
     // so its mere presence fails closed (rather than parsing to fewer options than Lake sets).
@@ -2795,6 +3000,8 @@ pub fn parse_lakefile_lean(
     }
     let mut current_block = DeclBlock::None;
     let mut pending_default_target = false;
+    // Lake keeps only the last assignment of a repeated field; fail closed instead.
+    let mut block_keys: BTreeSet<String> = BTreeSet::new();
     let lines: Vec<&str> = clean.lines().collect();
     let mut i = 0usize;
     while i < lines.len() {
@@ -2807,6 +3014,7 @@ pub fn parse_lakefile_lean(
             continue;
         }
         if indent == 0 {
+            block_keys.clear();
             if trimmed == "@[default_target]" || trimmed.starts_with("@[default_target]") {
                 pending_default_target = true;
                 let after = trimmed
@@ -2858,6 +3066,14 @@ pub fn parse_lakefile_lean(
                     continue;
                 };
                 let key = k_raw.trim();
+                if !block_keys.insert(key.to_string()) {
+                    anyhow::bail!(
+                        "Duplicate field `{}` in {} at line {}: fail-closed static Lake config gate",
+                        key,
+                        lean_path.display(),
+                        line_no
+                    );
+                }
                 let mut val_accum = v_start.trim().to_string();
                 // A field's expression continues while it is empty or has open brackets, on
                 // deeper-indented lines (fields of a `where` block share one column), and on
@@ -3077,6 +3293,22 @@ where
         *current_block = T::none();
         return Ok(());
     }
+    // Lake also accepts `{ field := ... }` and `:=` after a target name; only `where` blocks are
+    // parsed here, so anything else after the name fails closed.
+    for kw in ["package ", "lean_lib ", "lean_exe "] {
+        if let Some(rest) = trimmed.strip_prefix(kw) {
+            let mut words = rest.split_whitespace().skip(1);
+            if !matches!((words.next(), words.next()), (None | Some("where"), None)) {
+                anyhow::bail!(
+                    "Unsupported `{}` header `{}` in {} at line {}: fail-closed static Lake config gate",
+                    kw.trim(),
+                    trimmed,
+                    lean_path.display(),
+                    line_no
+                );
+            }
+        }
+    }
     if let Some(rest) = trimmed.strip_prefix("package ") {
         let name_part = rest.split_whitespace().next().unwrap_or("");
         pkg.name = clean_lake_ident(name_part);
@@ -3182,6 +3414,8 @@ pub fn is_allowed_lean_arg(arg: &str) -> bool {
             || v.is_empty()
             // `weak.warn.sorry=false` also disables the sorry warning.
             || (k.trim_start_matches("weak.") == "warn.sorry" && v != "true")
+            // Skipping the kernel check would accept unchecked proofs.
+            || (k.trim_start_matches("weak.") == "debug.skipKernelTC" && v != "false")
             || !k
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
@@ -6744,7 +6978,10 @@ fn compile_single_module_direct(
                     serde_json::Value::Bool(true)
                 } else if v == "false" {
                     serde_json::Value::Bool(false)
-                } else if let Ok(n) = v.parse::<u64>() {
+                } else if let Some(n) = Some(v)
+                    .filter(|v| is_canonical_nat(v))
+                    .and_then(|v| v.parse::<u64>().ok())
+                {
                     serde_json::Value::Number(n.into())
                 } else {
                     serde_json::Value::String(v.to_string())
@@ -7823,6 +8060,58 @@ lean_exe «demo-exe» where
     }
 
     #[test]
+    fn test_lakefile_lexical_guard_rejects_desync_syntax() {
+        let dir = make_temp_test_dir("lakefile_lexical_guard");
+        let lf = dir.join("lakefile.lean");
+        let parse = |src: &str, root: bool| {
+            fs::write(&lf, src).unwrap();
+            parse_lakefile_lean(&dir, &lf, root)
+        };
+        let lib = "@[default_target]\nlean_lib Demo where\n  leanOptions := opts\n";
+        let opts = "abbrev opts : Array LeanOption := #[⟨`autoImplicit, false⟩]\n";
+        // Gemini r5, each verified against real Lake: guillemets that open a fake comment or
+        // string, raw strings, interpolation braces holding comments, brace configs, `;`,
+        // guillemet field names, `buildType`, duplicate fields, `run_io`.
+        let cases = [
+            "import Lake\nopen Lake DSL\n\npackage «demo/-»\n\n#eval IO.println \"PWNED\"\nmacro_rules | `(#[⟨`autoImplicit, false⟩]) => `(#[⟨`warn.sorry, false⟩])\n\n-- -/\n@[default_target]\nlean_lib Demo where\n  leanOptions := #[⟨`autoImplicit, false⟩]\n".to_string(),
+            format!("import Lake\nopen Lake DSL\n{opts}def n1 : Lean.Name := `«\"» #eval IO.println \"EXEC\" def n2 : Lean.Name := `«\"»\npackage demo\n{lib}"),
+            format!("import Lake\nopen Lake DSL\n{opts}def s1 : String := r#\"\\\"# #eval IO.println r#\"RAW\"# def s2 : String := r#\"\"\"#\npackage demo\n{lib}"),
+            format!("import Lake\nopen Lake DSL\n{opts}def s1 : String := s!\"{{ /- \"{{ -/ 0 }}\" #eval IO.println \"INTERP\" def s2 : String := s!\"{{ /- \" -/ 0 }}\"\npackage demo\n{lib}"),
+            "import Lake\nopen Lake DSL\n\npackage demo { leanOptions := #[⟨`autoImplicit, false⟩] }\n\n@[default_target]\nlean_lib Demo { leanOptions := #[⟨`warn.sorry, false⟩] }\n".to_string(),
+            "import Lake\nopen Lake DSL\n\npackage demo\n\n@[default_target]\nlean_lib Demo where\n  libName := \"a\"; moreLeanArgs := #[\"-Dwarn.sorry=false\"]\n".to_string(),
+            "import Lake\nopen Lake DSL\npackage demo\nlean_lib Demo where\n  «leanOptions» := #[⟨`warn.sorry, false⟩]\n".to_string(),
+            "import Lake\nopen Lake DSL\npackage demo\nlean_lib Demo where\n  buildType := .debug\n".to_string(),
+            "import Lake\nopen Lake DSL\n\npackage demo\n\n@[default_target]\nlean_lib Demo where\n  leanOptions := #[⟨`autoImplicit, false⟩]\n  leanOptions := #[]\n".to_string(),
+            "import Lake\nopen Lake DSL\n\npackage demo where\n  description := run_io do\n    IO.println \"RUN_IO\"\n    return \"desc\"\n  leanOptions := #[⟨`autoImplicit, false⟩]\n\n@[default_target]\nlean_lib Demo\n".to_string(),
+            format!("import Lake\nopen Lake DSL\n{opts}def c : Char := '\"' #eval IO.println \"CHAR\"\npackage demo\n{lib}"),
+            format!("import Lake\nopen Lake DSL\n{opts}def inλ : Nat := 1\npackage demo\n{lib}"),
+        ];
+        for src in &cases {
+            for root in [false, true] {
+                assert!(parse(src, root).is_err(), "root={root}: {src}");
+            }
+        }
+        // Signed or zero-padded digit strings and Nats would be re-read as other numbers.
+        for v in ["\"+0\"", "\"+42\"", "007", ".ofNat 01"] {
+            let src = format!(
+                "import Lake\nopen Lake DSL\npackage demo\nlean_lib Demo where\n  leanOptions := #[⟨`maxHeartbeats, {v}⟩]\n"
+            );
+            assert!(parse(&src, false).is_err(), "{v}");
+        }
+        assert!(!is_allowed_lean_arg("-Ddebug.skipKernelTC=true"));
+        assert!(!is_allowed_lean_arg("-Dweak.debug.skipKernelTC=true"));
+        // What Mathlib needs still passes: `«»` target names, `s!` with a dotted name in
+        // braces, structure-instance braces in code.
+        let ok = "import Lake\nopen Lake DSL\nabbrev xs : Array LeanOption := #[⟨`a, true⟩].map fun s ↦ { s with name := `weak ++ s.name }\npackage demo where\n  leanOptions := #[⟨`autoImplicit, false⟩]\nlean_exe «cache-test» where\n  root := `Main\npost_update pkg do\n  IO.println s!\"x ({pkg.baseName}) \\\n    y\"\n";
+        assert_eq!(
+            lakefile_lexical_guard(ok).unwrap(),
+            splitter::strip_lean_comments(ok)
+        );
+        assert!(parse(ok, false).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_computed_lean_options_scopes_continuations_and_lexing() {
         let dir = make_temp_test_dir("lean_opts_regress");
         let lf = dir.join("lakefile.lean");
@@ -7966,12 +8255,12 @@ lean_exe «demo-exe» where
             opts(&parse(&lib("zs", body)).unwrap()),
             BTreeMap::from([("a".to_string(), "false".to_string())])
         );
-        // Char literals such as '[' or '"' do not disturb nesting of later declarations.
+        // Char literals such as '[' or '"' are outside the lexical subset: fail closed.
         let chars = "def openBr : Char := '['\ndef dq : Char := '\"'\nabbrev xs : Array LeanOption := #[⟨`a, true⟩]\n";
-        assert_eq!(
-            opts(&parse(&lib("xs", chars)).unwrap()),
-            BTreeMap::from([("a".to_string(), "true".to_string())])
-        );
+        assert!(parse(&lib("xs", chars))
+            .unwrap_err()
+            .to_string()
+            .contains("char literal"));
         // Root packages keep rejecting top-level declarations (stricter root gate).
         fs::write(&lf, lib("xs", xs)).unwrap();
         assert!(parse_lakefile_lean(&dir, &lf, true).is_err());
