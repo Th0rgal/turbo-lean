@@ -2026,6 +2026,24 @@ fn parse_lean_globs_expr(expr: &str) -> Result<Vec<GlobSpec>> {
     }
     Ok(out)
 }
+/// An option name must be a name literal: one leading backtick, then a non-empty name without
+/// whitespace or further backticks. A bare identifier is a `Name` value Lake would evaluate.
+fn lean_option_name_literal(raw: &str) -> Result<String> {
+    let raw = raw.trim();
+    let name = raw
+        .strip_prefix('`')
+        .filter(|r| !r.starts_with(['`', ' ', '\t']))
+        .map(clean_lake_ident)
+        .unwrap_or_default();
+    if name.is_empty() || name.contains(|c: char| c.is_whitespace() || c == '`') {
+        anyhow::bail!(
+            "Unsupported non-literal `leanOptions` name `{}` in lakefile.lean",
+            raw
+        );
+    }
+    Ok(name)
+}
+
 /// `v` is exactly one `"..."` token: its first unescaped closing quote is its last character
 /// (so `"a" ++ "b"` is rejected).
 fn is_single_string_literal(v: &str) -> bool {
@@ -2113,21 +2131,22 @@ fn parse_lean_options_expr(expr: &str) -> Result<BTreeMap<String, String>> {
             let Some((k_raw, v_raw)) = inner_pair.split_once(',') else {
                 anyhow::bail!("Invalid `leanOptions` tuple `{}` in lakefile.lean", p);
             };
-            let k = clean_lake_ident(k_raw);
-            if k.is_empty() {
-                anyhow::bail!("Invalid `leanOptions` tuple `{}` in lakefile.lean", p);
-            }
+            let k = lean_option_name_literal(k_raw)?;
             let v = lean_option_literal(v_raw, &k)?;
             map.insert(k, v);
         } else if let Some(rest) = p.trim().strip_prefix("LeanOption.mk ") {
-            let parts: Vec<&str> = rest.split_whitespace().collect();
-            if parts.len() == 2 {
-                let k = clean_lake_ident(parts[0]);
-                let v = lean_option_literal(parts[1], &k)?;
-                map.insert(k, v);
-            } else {
+            let Some((k_raw, v_raw)) = rest.trim().split_once(char::is_whitespace) else {
                 anyhow::bail!("Unsupported `leanOptions` entry `{}` in lakefile.lean", p);
-            }
+            };
+            let v_raw = v_raw.trim();
+            let v_raw = v_raw
+                .strip_prefix('(')
+                .and_then(|r| r.strip_suffix(')'))
+                .filter(|inner| lean_scan(inner, "").is_ok_and(|(_, d)| d == 0))
+                .unwrap_or(v_raw);
+            let k = lean_option_name_literal(k_raw)?;
+            let v = lean_option_literal(v_raw, &k)?;
+            map.insert(k, v);
         } else {
             anyhow::bail!("Unsupported `leanOptions` entry `{}` in lakefile.lean", p);
         }
@@ -2138,16 +2157,33 @@ fn parse_lean_options_expr(expr: &str) -> Result<BTreeMap<String, String>> {
 /// Maximum identifier indirection depth when resolving `leanOptions` expressions.
 const LEAN_OPTIONS_MAX_DEPTH: usize = 16;
 
-/// Lean-aware lexical scan of `s`: `"..."` strings (with `\` escapes) are opaque, `'` is an
-/// ordinary identifier character, and `()[]{}⟨⟩` must nest correctly. Splits on `sep` at depth 0
-/// (`sep` empty: no splitting) and returns the trimmed pieces plus the final open-bracket depth.
+/// Lean-aware lexical scan of `s`: `"..."` strings (with `\` escapes) and char literals are
+/// opaque, a `'` after an identifier character is a prime, and `()[]{}⟨⟩` must nest correctly.
+/// Splits on `sep` at depth 0 (`sep` empty: no splitting) and returns the trimmed pieces plus
+/// the final open-bracket depth.
 fn lean_scan(s: &str, sep: &str) -> Result<(Vec<String>, usize)> {
     let mut parts = Vec::new();
     let mut cur = String::new();
     let mut stack = Vec::new();
     let mut in_str = false;
+    let mut prev_ident = false;
     let mut chars = s.char_indices().peekable();
     while let Some((i, c)) = chars.next() {
+        let after_ident = std::mem::replace(
+            &mut prev_ident,
+            c.is_alphanumeric() || matches!(c, '_' | '\'' | '»' | '.'),
+        );
+        if !in_str && c == '\'' && !after_ident {
+            // A char literal such as '[' or '"' is opaque; a prime after a name is not one.
+            if let Some(end) = splitter::scan_lean_char_lit_end(s, i) {
+                cur.push_str(&s[i..end]);
+                while chars.peek().is_some_and(|(j, _)| *j < end) {
+                    chars.next();
+                }
+                prev_ident = false;
+                continue;
+            }
+        }
         if in_str {
             cur.push(c);
             if c == '\\' {
@@ -2191,16 +2227,6 @@ fn lean_scan(s: &str, sep: &str) -> Result<(Vec<String>, usize)> {
     Ok((parts, stack.len()))
 }
 
-const DECL_MODIFIERS: [&str; 7] = [
-    "private ",
-    "protected ",
-    "noncomputable ",
-    "partial ",
-    "unsafe ",
-    "scoped ",
-    "local ",
-];
-
 /// Column-0 parameterless `abbrev`/`def` bindings of a comment-stripped `lakefile.lean`, and the
 /// names that must not be resolved statically (indented, declared more than once, with binders,
 /// attributes or modifiers). Any `namespace`/`section` disables resolution entirely.
@@ -2213,7 +2239,8 @@ struct LakefileBindings {
     scoped: bool,
 }
 
-/// A body runs from `:=` until the next column-0 line once all brackets are closed.
+/// A body runs from `:=` until the next column-0 line once all brackets are closed; column-0
+/// lines that close a bracket or continue with `++` still belong to it.
 fn collect_lakefile_abbrevs(clean: &str) -> LakefileBindings {
     let mut out = LakefileBindings::default();
     let lines: Vec<&str> = clean.lines().collect();
@@ -2227,25 +2254,14 @@ fn collect_lakefile_abbrevs(clean: &str) -> LakefileBindings {
         if t.is_empty() {
             continue;
         }
-        if t.starts_with("namespace ") || t == "section" || t.starts_with("section ") {
+        // Attributes, `set_option ... in` and modifiers (same or previous line) make a
+        // declaration unbindable; they are recognised by the splitter's command grammar.
+        let decl = splitter::strip_decl_prefixes(t);
+        let modified = std::mem::take(&mut attr_pending) || decl.len() != t.len();
+        if splitter::is_section_header_line(t) || decl.starts_with("namespace ") || decl == "mutual"
+        {
             out.scoped = true;
             continue;
-        }
-        // Attributes (same or previous line) and modifiers make a declaration unbindable.
-        let mut decl = t;
-        let mut modified = std::mem::take(&mut attr_pending);
-        loop {
-            if let Some(end) = decl
-                .strip_prefix("@[")
-                .and_then(|r| r.find(']').map(|e| e + 3))
-            {
-                decl = decl[end..].trim_start();
-            } else if let Some(r) = DECL_MODIFIERS.iter().find_map(|m| decl.strip_prefix(m)) {
-                decl = r;
-            } else {
-                break;
-            }
-            modified = true;
         }
         if decl.is_empty() {
             attr_pending = modified;
@@ -2257,34 +2273,48 @@ fn collect_lakefile_abbrevs(clean: &str) -> LakefileBindings {
         else {
             continue;
         };
-        let name: String = rest
+        let raw_name: String = rest
             .chars()
-            .take_while(|c| !c.is_whitespace() && *c != ':')
+            .take_while(|c| !c.is_whitespace() && !matches!(c, ':' | '(' | '{' | '['))
             .collect();
+        let name = clean_lake_ident(raw_name.trim_end_matches('.'));
         if name.is_empty() {
             continue;
         }
-        let header = rest[name.len()..].trim_start();
+        let header = rest[raw_name.len()..].trim_start();
         let body_start = match header.split_once(":=") {
             Some((ty, body)) if ty.trim().is_empty() || ty.starts_with(':') => Some(body),
             _ => None,
         };
         let mut body = body_start.unwrap_or_default().to_string();
-        let mut depth = lean_scan(&body, "").map_or(usize::MAX, |(_, d)| d);
+        let mut lexed = lean_scan(&body, "");
         while i < lines.len() {
             let next = lines[i];
             let col0 = next.chars().next().is_some_and(|c| !c.is_whitespace());
-            let closes = next.trim_start().starts_with([']', ')', '}', '⟩']);
-            if depth == 0 && col0 && !closes {
+            let nt = next.trim_start();
+            let continues = nt.starts_with([']', ')', '}', '⟩']) || nt.starts_with("++");
+            let open = lexed.as_ref().is_ok_and(|(_, d)| *d > 0);
+            if col0 && !continues && !open {
                 break;
             }
             body.push('\n');
             body.push_str(next);
-            depth = lean_scan(&body, "").map_or(usize::MAX, |(_, d)| d);
+            lexed = lean_scan(&body, "");
             i += 1;
         }
-        if modified || indented || body_start.is_none() || out.defs.contains_key(&name) {
+        let dotted = name.contains('.');
+        if modified
+            || indented
+            || dotted
+            || body_start.is_none()
+            || lexed.is_err()
+            || out.defs.contains_key(&name)
+        {
             out.defs.remove(&name);
+            if let Some(last) = name.rsplit('.').next().filter(|_| dotted) {
+                out.defs.remove(last);
+                out.rejected.insert(last.to_string());
+            }
             out.rejected.insert(name);
         } else if !out.rejected.contains(&name) {
             out.defs.insert(name, body.trim().to_string());
@@ -2322,6 +2352,23 @@ fn resolve_lean_options_expr(
     bindings: &LakefileBindings,
     depth: usize,
 ) -> Result<BTreeMap<String, String>> {
+    resolve_lean_options_in(expr, bindings, depth, &mut BindingCache::default())
+}
+
+/// Each binding is resolved once (memoised), and a binding reached again while it is being
+/// resolved is a cycle, so resolution is linear in the lakefile size.
+#[derive(Default)]
+struct BindingCache {
+    done: BTreeMap<String, BTreeMap<String, String>>,
+    visiting: std::collections::BTreeSet<String>,
+}
+
+fn resolve_lean_options_in(
+    expr: &str,
+    bindings: &LakefileBindings,
+    depth: usize,
+    cache: &mut BindingCache,
+) -> Result<BTreeMap<String, String>> {
     if depth > LEAN_OPTIONS_MAX_DEPTH {
         anyhow::bail!(
             "`leanOptions` expression `{}` nests deeper than {} in lakefile.lean",
@@ -2333,7 +2380,8 @@ fn resolve_lean_options_expr(
     if parts.len() > 1 {
         let mut map = BTreeMap::new();
         for part in &parts {
-            map.extend(resolve_lean_options_expr(part, bindings, depth + 1)?);
+            // Pieces are strictly smaller, so `++` does not count towards the depth bound.
+            map.extend(resolve_lean_options_in(part, bindings, depth, cache)?);
         }
         return Ok(map);
     }
@@ -2343,7 +2391,7 @@ fn resolve_lean_options_expr(
     }
     if let Some(inner) = s.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
         if lean_scan(inner, "").is_ok_and(|(_, d)| d == 0) {
-            return resolve_lean_options_expr(inner, bindings, depth + 1);
+            return resolve_lean_options_in(inner, bindings, depth + 1, cache);
         }
     }
     let ident = if is_lake_ident(s) {
@@ -2359,7 +2407,18 @@ fn resolve_lean_options_expr(
             );
         }
         if let Some(body) = bindings.defs.get(&ident) {
-            let map = resolve_lean_options_expr(body, bindings, depth + 1)?;
+            let map = match cache.done.get(&ident) {
+                Some(map) => map.clone(),
+                None => {
+                    if !cache.visiting.insert(ident.clone()) {
+                        anyhow::bail!("Cyclic `leanOptions` binding `{}` in lakefile.lean", ident);
+                    }
+                    let map = resolve_lean_options_in(body, bindings, depth + 1, cache)?;
+                    cache.visiting.remove(&ident);
+                    cache.done.insert(ident.clone(), map.clone());
+                    map
+                }
+            };
             return Ok(if weak {
                 map.into_iter()
                     .map(|(k, v)| (format!("weak.{k}"), v))
@@ -2557,32 +2616,36 @@ pub fn parse_lakefile_lean(
                 };
                 let key = k_raw.trim();
                 let mut val_accum = v_start.trim().to_string();
+                // A field's expression continues while it is empty or has open brackets, on
+                // deeper-indented lines (fields of a `where` block share one column), and on
+                // same-column lines that start with `++` or a closing bracket.
                 let open_depth = |v: &str| lean_scan(v, "").map_or(1, |(_, d)| d);
-                while open_depth(&val_accum) > 0 || val_accum.is_empty() {
-                    if i >= lines.len() {
-                        anyhow::bail!(
-                            "Unclosed array expression for `{}` in {} starting at line {}",
-                            key,
-                            lean_path.display(),
-                            line_no
-                        );
-                    }
-                    let next_t = lines[i].trim();
-                    i += 1;
-                    if !next_t.is_empty() {
-                        val_accum.push(' ');
-                        val_accum.push_str(next_t);
-                    }
-                }
-                // Fields of a `where` block share one column; deeper-indented lines (possibly
-                // after blank lines) continue this field's expression, e.g. `xs\n    ++ ys`.
-                while let Some(off) = lines[i..].iter().position(|l| !l.trim().is_empty()) {
+                loop {
+                    let needs_more = val_accum.is_empty() || open_depth(&val_accum) > 0;
+                    let next = lines[i..].iter().position(|l| !l.trim().is_empty());
+                    let Some(off) = next else {
+                        if needs_more {
+                            anyhow::bail!(
+                                "Unclosed array expression for `{}` in {} starting at line {}",
+                                key,
+                                lean_path.display(),
+                                line_no
+                            );
+                        }
+                        break;
+                    };
                     let next = lines[i + off];
-                    if next.len() - next.trim_start().len() <= indent {
+                    let next_indent = next.len() - next.trim_start().len();
+                    let next_t = next.trim();
+                    let continues = next_indent > indent
+                        || (next_indent == indent
+                            && (next_t.starts_with("++")
+                                || next_t.starts_with([']', ')', '}', '⟩'])));
+                    if !needs_more && !continues {
                         break;
                     }
                     val_accum.push(' ');
-                    val_accum.push_str(next.trim());
+                    val_accum.push_str(next_t);
                     i += off + 1;
                 }
                 match current_block {
@@ -2874,7 +2937,8 @@ pub fn is_allowed_lean_arg(arg: &str) -> bool {
         };
         if k.is_empty()
             || v.is_empty()
-            || (k == "warn.sorry" && v == "false")
+            // `weak.warn.sorry=false` also disables the sorry warning.
+            || (k.trim_start_matches("weak.") == "warn.sorry" && v != "true")
             || !k
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
@@ -7441,11 +7505,40 @@ lean_exe «demo-exe» where
         let defs = collect_lakefile_abbrevs(
             "abbrev a := b\nabbrev b := a\nabbrev xs : Array LeanOption := #[⟨`x, true⟩]\n",
         );
-        // Cyclic identifiers stop at the depth bound instead of looping.
+        // Cyclic identifiers are detected instead of looping.
         let err = resolve_lean_options_expr("a", &defs, 0)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("deeper than"), "{err}");
+        assert!(err.contains("Cyclic"), "{err}");
+        // Self-referential appends and wide diamonds resolve in linear time (memoised).
+        let selfref = collect_lakefile_abbrevs(
+            "abbrev a := a ++ a ++ a ++ a
+",
+        );
+        assert!(resolve_lean_options_expr("a", &selfref, 0).is_err());
+        let wide = |n: usize| {
+            (0..32)
+                .map(|_| format!("a{n}"))
+                .collect::<Vec<_>>()
+                .join(" ++ ")
+        };
+        let mut src = "abbrev a0 : Array LeanOption := #[⟨`x, true⟩]
+"
+        .to_string();
+        for n in 1..=8 {
+            src.push_str(&format!(
+                "abbrev a{n} : Array LeanOption := {}
+",
+                wide(n - 1)
+            ));
+        }
+        let diamond = collect_lakefile_abbrevs(&src);
+        let start = std::time::Instant::now();
+        assert_eq!(
+            resolve_lean_options_expr("a8", &diamond, 0).unwrap(),
+            BTreeMap::from([("x".to_string(), "true".to_string())])
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
         // Unknown identifiers and other computations are still rejected.
         for expr in [
             "missing",
@@ -7571,6 +7664,70 @@ lean_exe «demo-exe» where
         // Mismatched delimiters fail.
         assert!(lean_scan("#[⟨`a, true)]", ",").is_err());
         assert!(lean_scan("#[\"unclosed]", ",").is_err());
+        let lib = |opts_expr: &str, prelude: &str| {
+            format!("import Lake\nopen Lake DSL\n{prelude}package demo\nlean_lib Demo where\n  leanOptions := {opts_expr}\n")
+        };
+        // `weak.warn.sorry=false` disables the sorry warning too, directly or via the weak map.
+        assert!(parse(&lib("#[⟨`weak.warn.sorry, false⟩]", "")).is_err());
+        let ws = "abbrev ws : Array LeanOption := #[⟨`warn.sorry, false⟩]\n";
+        assert!(parse(&lib(
+            "ws.map fun s ↦ { s with name := `weak ++ s.name }",
+            ws
+        ))
+        .is_err());
+        // Option names must be name literals; LeanOption.mk validates key and value.
+        for e in [
+            "#[⟨optKey, false⟩]",
+            "#[⟨``x, false⟩]",
+            "#[LeanOption.mk optKey false]",
+            "#[LeanOption.mk ` true]",
+        ] {
+            assert!(parse(&lib(e, "")).is_err(), "{e}");
+        }
+        assert_eq!(
+            opts(
+                &parse(&lib(
+                    "#[LeanOption.mk `n (.ofNat 1500), LeanOption.mk `s \"a b\"]",
+                    ""
+                ))
+                .unwrap()
+            ),
+            BTreeMap::from([
+                ("n".to_string(), "1500".to_string()),
+                ("s".to_string(), "a b".to_string()),
+            ])
+        );
+        // Every scope form disables resolution; binders, dotted and universe names are rejected.
+        for prelude in [
+            "abbrev opts : Array LeanOption := #[⟨`a, true⟩]\nnoncomputable section\nend\n",
+            "abbrev opts : Array LeanOption := #[⟨`a, true⟩]\nmutual\nend\n",
+            "abbrev opts(b : Bool) : Array LeanOption := #[⟨`a, true⟩]\n",
+            "abbrev opts.{u} : Array LeanOption := #[⟨`a, true⟩]\n",
+            "abbrev opts : Array LeanOption := #[⟨`a, true⟩]\nabbrev Foo.opts : Array LeanOption := #[⟨`a, false⟩]\n",
+            "set_option autoImplicit true in\nabbrev opts : Array LeanOption := #[⟨`a, true⟩]\n",
+        ] {
+            assert!(parse(&lib("opts", prelude)).is_err(), "{prelude}");
+        }
+        // Same-column `++` continues a field, and a column-0 `++` continues a binding body.
+        let xs = "abbrev xs : Array LeanOption := #[⟨`a, true⟩]\nabbrev ys : Array LeanOption := #[⟨`a, false⟩]\n";
+        assert_eq!(
+            opts(&parse(&lib("xs\n  ++ ys", xs)).unwrap()),
+            BTreeMap::from([("a".to_string(), "false".to_string())])
+        );
+        let body = "abbrev zs : Array LeanOption := #[⟨`a, true⟩]\n++ #[⟨`a, false⟩]\n";
+        assert_eq!(
+            opts(&parse(&lib("zs", body)).unwrap()),
+            BTreeMap::from([("a".to_string(), "false".to_string())])
+        );
+        // Char literals such as '[' or '"' do not disturb nesting of later declarations.
+        let chars = "def openBr : Char := '['\ndef dq : Char := '\"'\nabbrev xs : Array LeanOption := #[⟨`a, true⟩]\n";
+        assert_eq!(
+            opts(&parse(&lib("xs", chars)).unwrap()),
+            BTreeMap::from([("a".to_string(), "true".to_string())])
+        );
+        // Root packages keep rejecting top-level declarations (stricter root gate).
+        fs::write(&lf, lib("xs", xs)).unwrap();
+        assert!(parse_lakefile_lean(&dir, &lf, true).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 
