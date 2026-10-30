@@ -598,7 +598,7 @@ fn run(cli: Cli) -> Result<()> {
         | Commands::SeedShards { project_dir, .. } => (Some(project_dir.as_path()), None),
         Commands::AgentStep {
             project_dir, file, ..
-        } => {
+        } | Commands::Eval { project_dir, file, .. } => {
             let file_dir = file.parent().filter(|p| !p.as_os_str().is_empty());
             (
                 Some(project_dir.as_deref().or(file_dir).unwrap_or(here)),

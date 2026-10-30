@@ -483,3 +483,39 @@ done
         "unavailable-import worker was not exercised"
     );
 }
+
+#[test]
+fn eval_first_startup_honours_project_idle_ttl() {
+    let _serial = LIFECYCLE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new();
+    fs::write(
+        f.root.join("turbo-lean.toml"),
+        "[zygote]\nidle_ttl_secs = 2\n",
+    )
+    .unwrap();
+    for explicit_project in [false, true] {
+        fs::write(
+            f.root.join("EvalFirst.lean"),
+            format!("#eval {}\n", if explicit_project { 43 } else { 42 }),
+        )
+        .unwrap();
+        let mut cmd = f.command();
+        cmd.args(["eval", "EvalFirst.lean"]);
+        if explicit_project {
+            cmd.args(["--project-dir", "."]);
+        }
+        let out = f.run(cmd);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(!f.pids().is_empty(), "eval did not start a daemon");
+        f.wait_for(Duration::from_secs(10), || {
+            f.pids().is_empty() && !f.staging.exists()
+        });
+        evidence(format!("eval-first idle_ttl_secs=2 (explicit_project={explicit_project}): 0 PIDs and staging removed"));
+    }
+}
