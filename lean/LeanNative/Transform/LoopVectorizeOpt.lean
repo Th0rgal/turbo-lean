@@ -57,6 +57,14 @@ def isBorrowedReadOnlyIn (objVar : VarId) : LNIRCode → Bool
     m != objVar && v != objVar && isBorrowedReadOnlyIn objVar k
   | .letBind _ _ (.allocCtor _ os ss) k =>
     !(os.contains objVar) && !(ss.contains objVar) && isBorrowedReadOnlyIn objVar k
+  | .letBind _ _ (.ctorGetObj v _) k =>
+    v != objVar && isBorrowedReadOnlyIn objVar k
+  | .letBind _ _ (.isExclusive v) k =>
+    v != objVar && isBorrowedReadOnlyIn objVar k
+  | .letBind _ _ (.mkTuple fs) k =>
+    !(fs.contains objVar) && isBorrowedReadOnlyIn objVar k
+  | .letBind _ _ (.scalar (.var v)) k =>
+    v != objVar && isBorrowedReadOnlyIn objVar k
   | .letBind _ _ (.call _ args _ _) k =>
     !(args.contains objVar) && isBorrowedReadOnlyIn objVar k
   | .letBind _ _ _ k => isBorrowedReadOnlyIn objVar k

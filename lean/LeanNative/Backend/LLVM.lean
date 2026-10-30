@@ -1949,6 +1949,9 @@ partial def findUnsupportedLLVMCallInCode (localSigs : List (String × List LNIR
       (callee == "lean_native_sarray_len" && args.length == 1 && slotLLVMType ty == "i64") ||
       (slotLLVMType ty == "i64" && localSigs.any (fun (nm, pTys, _) => nm == callee && pTys.length == args.length)))
     if !ok then some callee else findUnsupportedLLVMCallInCode localSigs k
+  | .letBind _ _ (.allocCtor _ _ _) _ => some "allocCtor"
+  | .letBind _ _ (.ctorGetObj _ _) _ => some "ctorGetObj"
+  | .letBind _ _ (.ctorGetScalar _ _ _) _ => some "ctorGetScalar"
   | .letBind _ _ _ k | .rawStore _ _ _ _ k | .incRef _ _ k | .decRef _ _ k | .parFor _ _ _ _ _ k =>
     findUnsupportedLLVMCallInCode localSigs k
   | .ite _ t e => findUnsupportedLLVMCallInCode localSigs t <|> findUnsupportedLLVMCallInCode localSigs e

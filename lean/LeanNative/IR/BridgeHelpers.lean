@@ -263,6 +263,84 @@ partial def tyContainsUSize : LNIRType → Bool
   | .tuple fs => fs.any tyContainsUSize
   | _ => false
 
+def instantiateInductExprParams (paramArgs : List Lean.Expr) : Nat → Lean.Expr → Lean.Expr
+  | 0, rest => rest
+  | k + 1, .forallE _ _ body _ =>
+    let arg := paramArgs[0]?.getD (Lean.mkConst ``Unit)
+    instantiateInductExprParams (paramArgs.drop 1) k (body.instantiate1 arg)
+  | _, rest => rest
+
+def isStage1DHeapFieldExpr (env : Lean.Environment) (arch : TargetArch) (e : Lean.Expr) : Bool :=
+  if isClosureOrRuntimeNatExpr e || isSignedScalarTypeExpr e then false
+  else
+    let ty := lowerImpureType e (some env)
+    if tyContainsUSize ty && !archSupportsUSize arch then false
+    else isSupportedStage1BScalarOrTuple ty arch
+
+def isSupportedStage1DHeapAdtExpr (env : Lean.Environment) (arch : TargetArch) (e : Lean.Expr) : Bool :=
+  if isClosureOrRuntimeNatExpr e || isSignedScalarTypeExpr e then false
+  else
+    let fn := e.getAppFn
+    let args := e.getAppArgs.toList
+    match fn with
+    | .const declName _ =>
+      if (nullaryEnumScalarType? env e).isSome ||
+         declName == ``Prod || declName == ``MProd || declName == ``PProd ||
+         declName == ``Bool || declName == ``Unit || declName == ``PUnit || declName == ``Nat ||
+         declName == ``String || declName == ``ByteArray || declName == ``FloatArray || declName == ``Array then
+        false
+      else
+        match env.find? declName with
+        | some (.inductInfo ival) =>
+          if ival.isRec || ival.numIndices != 0 || ival.ctors.length < 2 || ival.ctors.length > 255 ||
+             args.length != ival.numParams then
+            false
+          else
+            let rec checkCtorFields (k : Nat) (t : Lean.Expr) : Bool :=
+              match k, t with
+              | 0, _ => true
+              | k + 1, .forallE _ dom body _ =>
+                !dom.hasLooseBVars && isStage1DHeapFieldExpr env arch dom && checkCtorFields k body
+              | _, _ => false
+            let hasPayload := ival.ctors.any fun cName =>
+              match env.find? cName with
+              | some (.ctorInfo cval) => cval.numFields ≥ 1
+              | _ => false
+            hasPayload && ival.ctors.all fun cName =>
+              match env.find? cName with
+              | some (.ctorInfo cval) =>
+                cval.numFields ≤ 8 &&
+                checkCtorFields cval.numFields (instantiateInductExprParams args cval.numParams cval.type)
+              | _ => false
+        | _ => false
+    | _ => false
+
+def declQualifiesForStage1DHeap (env : Lean.Environment) (declName : Lean.Name) (arch : TargetArch) : Bool :=
+  if (Lean.getExportNameFor? env declName).isSome || Lean.isExtern env declName then false
+  else
+    match env.find? declName with
+    | none => false
+    | some cinfo =>
+      let rec go (hasAdt : Bool) (t : Lean.Expr) : Bool :=
+        match t with
+        | .forallE _ dom body bi =>
+          if dom.isSort || bi == .instImplicit || bi == .implicit then
+            go hasAdt body
+          else if dom.hasLooseBVars then
+            false
+          else if isSupportedStage1DHeapAdtExpr env arch dom then
+            go true body
+          else if isStage1DHeapFieldExpr env arch dom then
+            go hasAdt body
+          else
+            false
+        | retExpr =>
+          if retExpr.hasLooseBVars then false
+          else if isSupportedStage1DHeapAdtExpr env arch retExpr then true
+          else if isStage1DHeapFieldExpr env arch retExpr then hasAdt
+          else false
+      go false cinfo.type
+
 def validateSupportedTypeM (ctx : String) (rawTy : Lean.Expr) (ty : LNIRType) (arch : TargetArch)
     (allowInternalObj : Bool := false) : Lean.CoreM Unit := do
   if isClosureOrRuntimeNatExpr rawTy && !(allowInternalObj && (rawTy == ImpureType.tobject || rawTy == ImpureType.tagged)) then
@@ -275,6 +353,7 @@ def validateSupportedTypeM (ctx : String) (rawTy : Lean.Expr) (ty : LNIRType) (a
 def checkEnvConstSignatureM (env : Lean.Environment) (declName : Lean.Name) (arch : TargetArch)
     (isExported : Bool) : Lean.CoreM Unit := do
   let some cinfo := env.find? declName | return ()
+  let isStage1D := !isExported && declQualifiesForStage1DHeap env declName arch
   let rec go (idx : Nat) (t : Lean.Expr) : Lean.CoreM Unit := do
     match t with
     | .forallE pName dom body bi =>
@@ -286,7 +365,7 @@ def checkEnvConstSignatureM (env : Lean.Environment) (declName : Lean.Name) (arc
           validateSupportedTypeM s!"exported parameter `{pName}` of `{declName}`" dom dTy arch false
           if dTy matches (.tuple _) then
             Lean.throwError s!"[lean-native] Unsupported exported tuple parameter `{pName}` in `{declName}`"
-        else
+        else if !(isStage1D && isSupportedStage1DHeapAdtExpr env arch dom) then
           validateSupportedTypeM s!"parameter `{pName}` of `{declName}`" dom dTy arch false
         go (idx + 1) body
     | retExpr =>
@@ -296,23 +375,37 @@ def checkEnvConstSignatureM (env : Lean.Environment) (declName : Lean.Name) (arc
           validateSupportedTypeM s!"exported return type of `{declName}`" retExpr rTy arch false
           if rTy matches (.tuple _) then
             Lean.throwError s!"[lean-native] Unsupported exported tuple return type in `{declName}`"
-        else
+        else if !(isStage1D && isSupportedStage1DHeapAdtExpr env arch retExpr) then
           validateSupportedTypeM s!"return type of `{declName}`" retExpr rTy arch false
   go 0 cinfo.type
 
+def collectEnvExplicitParamTypes (env : Lean.Environment) (declName : Lean.Name) : List LNIRType :=
+  match env.find? declName with
+  | none => []
+  | some cinfo =>
+    let rec go (acc : List LNIRType) (t : Lean.Expr) : List LNIRType :=
+      match t with
+      | .forallE _ dom body bi =>
+        if dom.isSort || bi == .instImplicit || bi == .implicit then go acc body
+        else go (acc ++ [lowerImpureType dom (some env)]) body
+      | _ => acc
+    go [] cinfo.type
+
 structure BridgeState where
-  fvarToVar      : Std.HashMap Lean.FVarId VarId := {}
-  varTypes       : Std.HashMap VarId LNIRType := {}
-  jpMap          : Std.HashMap Lean.FVarId (Array (Lean.Compiler.LCNF.Param .impure) × LNIRCode) := {}
-  jpIndexMap     : Std.HashMap Lean.FVarId Nat := {}
-  localFunMap    : Std.HashMap Lean.FVarId (List VarId × LNIRCode) := {}
-  nextVarId      : VarId := 0
-  hasExtern      : Bool := false
-  mangledSymbol  : String := ""
-  isSimpleGround : Bool := false
-  selfDeclName   : Lean.Name := .anonymous
-  localDeclNames : Array Lean.Name := #[]
-  arch           : TargetArch := .x86_64
+  fvarToVar        : Std.HashMap Lean.FVarId VarId := {}
+  varTypes         : Std.HashMap VarId LNIRType := {}
+  jpMap            : Std.HashMap Lean.FVarId (Array (Lean.Compiler.LCNF.Param .impure) × LNIRCode) := {}
+  jpIndexMap       : Std.HashMap Lean.FVarId Nat := {}
+  localFunMap      : Std.HashMap Lean.FVarId (List VarId × LNIRCode) := {}
+  nextVarId        : VarId := 0
+  hasExtern        : Bool := false
+  mangledSymbol    : String := ""
+  isSimpleGround   : Bool := false
+  selfDeclName     : Lean.Name := .anonymous
+  localDeclNames   : Array Lean.Name := #[]
+  arch             : TargetArch := .x86_64
+  allowStage1DHeap : Bool := false
+  inJoinPointBody  : Bool := false
   deriving Inhabited
 
 abbrev BridgeM := StateRefT BridgeState Lean.CoreM
@@ -465,7 +558,15 @@ partial def freshenJoinPointCode (subst : Std.HashMap VarId VarId) (code : LNIRC
   match code with
   | .letBind dst ty val k =>
     let val' := substLNIRExprVars subst (← get).varTypes val
+    match val' with
+    | .call "lean_native_ctor_set" (objVid :: _) _ false =>
+      if !(← get).allowStage1DHeap && isUnboxedScalarOrTuple (← getVarType objVid) then
+        return ← freshenJoinPointCode subst k
+    | _ => pure ()
     let ty' ← match val' with
+      | .scalar (.var sv) =>
+        let sTy ← getVarType sv
+        pure (if isUnboxedScalarOrTuple sTy && (ty == .objPtr || ty == .taggedPtr) then sTy else ty)
       | .mkTuple fs => pure (.tuple (← fs.mapM getVarType))
       | .projTuple tv idx =>
         match (← getVarType tv) with
@@ -511,13 +612,21 @@ def spliceJoinPointJmp {pu} (jpParams : Array (Lean.Compiler.LCNF.Param .impure)
     (args : Array (Lean.Compiler.LCNF.Arg pu)) : BridgeM LNIRCode := do
   if jpParams.size != args.size then
     Lean.throwError s!"[lean-native] join point arity mismatch: expected {jpParams.size}, got {args.size}"
-  let argVars ← args.toList.mapM (lowerArg · true)
+  let mut preBinds : List (VarId × LNIRType × LNIRExpr) := []
   let mut subst : Std.HashMap VarId VarId := {}
-  for (p, argVar) in jpParams.toList.zip argVars do
+  for (p, arg) in jpParams.toList.zip args.toList do
     let pTy ← lowerBridgeType p.type
     let origParamVid ← internFVar p.fvarId pTy
+    let argVar ← match arg with
+      | .erased | .type .. =>
+        let zTy := if pTy == .unit then .i64 else pTy
+        let zv ← freshBridgeVar zTy
+        preBinds := preBinds ++ [(zv, zTy, .scalar (.constU64 0))]
+        pure zv
+      | _ => lowerArg arg true
     subst := subst.insert origParamVid argVar
-  freshenJoinPointCode subst jpBody
+  let body' ← freshenJoinPointCode subst jpBody
+  return preBinds.foldr (fun (dst, ty, val) acc => .letBind dst ty val acc) body'
 
 def orderAlts (alts : List (Lean.Compiler.LCNF.Alt pu)) : List (Lean.Compiler.LCNF.Alt pu) :=
   alts.filter (fun | .default _ => false | _ => true) ++ alts.filter (fun | .default _ => true | _ => false)
@@ -625,6 +734,8 @@ def inferImpureRhsType (rhs : LNIRExpr) (declTy : LNIRType) (isBox : Bool) : Bri
       return if isUnboxedScalarOrTuple sty then sty else .i64
     | _ => return .i64
   match rhs with
+  | .allocCtor .. => return .objPtr
+  | .isExclusive .. => return .i1
   | .scalar (.var sv) =>
     let sty ← getVarType sv
     return if isUnboxedScalarOrTuple declTy then declTy
@@ -904,7 +1015,16 @@ partial def collectTupleCodeRev (accBinds : Array (VarId × LNIRType × ScalarEx
     return some (outTys, curBinds, curSeen, selExprs)
   | _ => return none
 
+partial def codeContainsTupleOp : LNIRCode → Bool
+  | .letBind _ _ (.mkTuple _) _ | .letBind _ _ (.projTuple _ _) _ => true
+  | .letBind _ _ _ k | .rawStore _ _ _ _ k | .incRef _ _ k | .decRef _ _ k | .parFor _ _ _ _ _ k =>
+    codeContainsTupleOp k
+  | .ite _ t e | .seqFor _ _ _ _ _ _ t e => codeContainsTupleOp t || codeContainsTupleOp e
+  | .ret _ | .unreachable => false
+
 def compressScalarCode (code : LNIRCode) : BridgeM LNIRCode := do
+  if codeContainsTupleOp code then
+    return code
   match ← collectScalarCodeRev #[] {} code with
   | some (outTy, binds, _, resExpr) =>
     match resExpr with
@@ -1047,8 +1167,10 @@ def lowerJoinPoint {pu} (decl : Lean.Compiler.LCNF.FunDecl pu) (k : Lean.Compile
       set savedSt
     else
       set savedSt
+  let prevInJp := (← get).inJoinPointBody
+  modify fun st => { st with inJoinPointBody := true }
   let jpBody ← compressScalarCode (← lowerCodeFn decl.value)
-  modify fun st => { st with jpMap := st.jpMap.insert decl.fvarId (impParams, jpBody) }
+  modify fun st => { st with inJoinPointBody := prevInJp, jpMap := st.jpMap.insert decl.fvarId (impParams, jpBody) }
   compressScalarCode (← lowerCodeFn k)
 
 def lowerJmpInstr {pu} (fvarId : Lean.FVarId) (args : Array (Lean.Compiler.LCNF.Arg pu)) : BridgeM LNIRCode := do
@@ -1203,6 +1325,7 @@ def lowerUnaryScalarIntrinsic? (fnName : Lean.Name) (arg : VarId) (argTys : List
 def lowerTupleOrEnumCtor (ctorName : Lean.Name) (cidx : Nat) (args : Array (Lean.Compiler.LCNF.Arg pu))
     (retTy : LNIRType) : BridgeM LNIRExpr := do
   let env ← getEnv
+  let st ← get
   if args.isEmpty then
     if ctorName == ``Bool.false then
       return .scalar (if retTy == .i1 then .constBool false else .constU64 0)
@@ -1212,10 +1335,23 @@ def lowerTupleOrEnumCtor (ctorName : Lean.Name) (cidx : Nat) (args : Array (Lean
       return .scalar (.constU64 0)
     match env.find? ctorName with
     | some (.ctorInfo cval) =>
-      if cval.numFields == 0 && (retTy == .i8 || retTy == .i16 || retTy == .i1) then
+      if cval.numFields == 0 &&
+         (retTy == .i8 || retTy == .i16 || retTy == .i1 ||
+          (st.allowStage1DHeap && (retTy == .objPtr || retTy == .taggedPtr))) then
         return .scalar (if retTy == .i1 then .constBool (cidx != 0) else .constU64 cidx.toUInt64)
       Lean.throwError s!"[lean-native] Unsupported constructor `{ctorName}`"
     | _ => Lean.throwError s!"[lean-native] Unknown constructor `{ctorName}`"
+  if st.allowStage1DHeap then
+    match env.find? ctorName with
+    | some (.ctorInfo cval) =>
+      if cval.numFields ≥ 1 && cval.numFields ≤ 8 then
+        let dropCnt := if args.size > cval.numFields then args.size - cval.numFields else 0
+        let fieldArgs := args.toList.drop dropCnt
+        let argVars ← fieldArgs.mapM (lowerArg · true)
+        let argTys ← argVars.mapM getVarType
+        if !argVars.isEmpty && argTys.all (fun t => isSupportedStage1BScalarOrTuple t st.arch || t == .objPtr || t == .taggedPtr) then
+          return .allocCtor cidx argVars []
+    | _ => pure ()
   let isProd := ctorName == ``Prod.mk || ctorName == ``MProd.mk || ctorName == ``PProd.mk
   let fieldStartIdx? : Option Nat :=
     if isProd then some (if args.size > 2 then args.size - 2 else 0)
@@ -1298,9 +1434,14 @@ def isCompilerGeneratedAuxDecl (env : Lean.Environment) (name : Lean.Name) : Boo
   if isClosedConstHelperName name then false
   else Lean.isAuxRecursor env name || Lean.isNoConfusion env name || nameHasCompilerAuxComponent name
 
+private def isBuiltinLNIRRuntimeCall (fn : String) : Bool :=
+  fn == "lean_native_ctor_tag" || fn == "lean_native_ctor_set" ||
+  fn == "lean_native_box_u64" || fn == "lean_native_unbox_u64" ||
+  fn == "lean_native_ensure_exclusive" || fn == "lean_native_sarray_len"
+
 private partial def collectDirectCallees : LNIRCode → List String
   | .letBind _ _ (.call fn _ _ isExt) k =>
-    if isExt then collectDirectCallees k else fn :: collectDirectCallees k
+    if isExt || isBuiltinLNIRRuntimeCall fn then collectDirectCallees k else fn :: collectDirectCallees k
   | .letBind _ _ _ k | .rawStore _ _ _ _ k | .incRef _ _ k | .decRef _ _ k | .parFor _ _ _ _ _ k =>
     collectDirectCallees k
   | .ite _ t e | .seqFor _ _ _ _ _ _ t e => collectDirectCallees t ++ collectDirectCallees e
@@ -1335,6 +1476,7 @@ partial def codeHasResidualHeapOrTupleAbiOp : LNIRCode → Bool
     (ty == .objPtr || ty == .taggedPtr) ||
     (match val with
       | .allocCtor .. | .ctorGetObj .. | .ctorGetScalar .. | .boxScalar .. | .unboxScalar .. | .isExclusive .. => true
+      | .call "lean_native_ctor_set" .. | .call "lean_native_ctor_tag" .. => true
       | _ => false) ||
     codeHasResidualHeapOrTupleAbiOp k
   | .incRef .. | .decRef .. => true
@@ -1344,6 +1486,10 @@ partial def codeHasResidualHeapOrTupleAbiOp : LNIRCode → Bool
 
 def filterNonInternalHelperDecls (env : Lean.Environment) (rawPairs : List (Lean.Name × String))
     (arch : TargetArch) (mod : LNIRModule) : Lean.CoreM LNIRModule := do
+  let stage1DMangled : List String := rawPairs.filterMap fun (origName, mangled) =>
+    if declQualifiesForStage1DHeap env origName arch then some mangled else none
+  let isStage1DParamOrRet (ty : LNIRType) : Bool :=
+    isSupportedStage1BScalarOrTuple ty arch || ty == .objPtr || ty == .taggedPtr
   let keepNames : List String ← rawPairs.filterMapM fun (origName, mangled) => do
     let isExported := (Lean.getExportNameFor? env origName).isSome
     let isUserConst := (env.find? origName).isSome && !origName.isInternalDetail && !isClosedConstHelperName origName
@@ -1359,6 +1505,10 @@ def filterNonInternalHelperDecls (env : Lean.Environment) (rawPairs : List (Lean
       if isExported then
         if hasObjOrTupleSig || codeHasResidualHeapOrTupleAbiOp d.body then
           Lean.throwError s!"[lean-native] Exported function `{origName}` has unsupported non-scalar signature or unlowered tuple/heap operations"
+        return some mangled
+      else if stage1DMangled.contains mangled then
+        if d.params.any (fun p => !isStage1DParamOrRet p.ty) || !isStage1DParamOrRet d.retTy then
+          Lean.throwError s!"[lean-native] Stage 1D helper `{origName}` has unsupported signature"
         return some mangled
       else if hasObjOrTupleSig then
         return none
@@ -1378,10 +1528,57 @@ def filterNonInternalHelperDecls (env : Lean.Environment) (rawPairs : List (Lean
     Lean.throwError "[lean-native] Module contains no Stage 1B scalar functions after filtering non-scalar helpers"
   let filteredDecls := mod.decls.filter (fun d => liveNames.contains d.name)
   for d in filteredDecls do
-    if d.params.any (fun p => !isSupportedStage1BScalarType p.ty arch) ||
+    if stage1DMangled.contains d.name then
+      if d.params.any (fun p => !isStage1DParamOrRet p.ty) || !isStage1DParamOrRet d.retTy then
+        Lean.throwError s!"[lean-native] Live Stage 1D declaration `{d.name}` has unsupported signature"
+    else if d.params.any (fun p => !isSupportedStage1BScalarType p.ty arch) ||
        !isSupportedStage1BScalarType d.retTy arch ||
        codeHasResidualHeapOrTupleAbiOp d.body then
       Lean.throwError s!"[lean-native] Live declaration `{d.name}` retains non-scalar signature or unlowered object operations"
   return { mod with decls := filteredDecls }
+
+def lowerOsetInstr (fvarId : Lean.FVarId) (idx : Nat) (y : Lean.Compiler.LCNF.Arg .impure)
+    (k : Lean.Compiler.LCNF.Code .impure) (lowerK : Lean.Compiler.LCNF.Code .impure → BridgeM LNIRCode) : BridgeM LNIRCode := do
+  let st ← get
+  let objVid ← internFVar fvarId
+  let objTy ← getVarType objVid
+  if (st.allowStage1DHeap || st.inJoinPointBody) && (objTy == .objPtr || objTy == .taggedPtr) then
+    let valVid ← lowerArg y true
+    let idxVid ← freshBridgeVar .i64
+    let unitVid ← freshBridgeVar .unit
+    let kCode ← lowerK k
+    return .letBind idxVid .i64 (.scalar (.constU64 idx.toUInt64))
+      (.letBind unitVid .unit (.call "lean_native_ctor_set" [objVid, idxVid, valVid] .unit false) kCode)
+  else if isUnboxedScalarOrTuple objTy then
+    lowerK k
+  else
+    Lean.throwError "[lean-native] Unsupported heap field mutation in Stage 1B"
+
+def ingestModuleDeclsWith (ingestImpure : Lean.Compiler.LCNF.Decl .impure → Array Lean.Name → TargetArch → Lean.CoreM LNIRDecl)
+    (ingestMono : Lean.Compiler.LCNF.Decl .pure → Array Lean.Name → TargetArch → Lean.CoreM LNIRDecl)
+    (declNames : Array Lean.Name) (moduleName : String := "LeanNative.Ingested")
+    (arch : TargetArch := .x86_64) : Lean.CoreM LNIRModule := do
+  let env ← getEnv
+  let mut callGraph : Std.HashMap Lean.Name (List Lean.Name) := {}
+  let mut decls : List LNIRDecl := []
+  let mut rawPairs : List (Lean.Name × String) := []
+  for name in declNames do
+    if let some impureDecl ← Lean.Compiler.LCNF.getLocalImpureDecl? name then
+      if let .code c := impureDecl.value then
+        callGraph := callGraph.insert name (collectCodeLocalCallees declNames c)
+      let d ← ingestImpure impureDecl declNames arch
+      decls := decls ++ [d]
+      rawPairs := rawPairs ++ [(name, d.name)]
+    else if let some monoDecl ← Lean.Compiler.LCNF.getMonoDecl? name then
+      if let .code c := monoDecl.value then
+        callGraph := callGraph.insert name (collectCodeLocalCallees declNames c)
+      let d ← ingestMono monoDecl declNames arch
+      decls := decls ++ [d]
+      rawPairs := rawPairs ++ [(name, d.name)]
+  if declsHaveMutualCycle callGraph then
+    Lean.throwError s!"[lean-native] unsupported self-tail recursion / mutual recursion in {moduleName}: no qualified loop lowering"
+  let rawMod : LNIRModule := { moduleName := moduleName, decls := decls }
+  validateIngestedModule rawMod
+  filterNonInternalHelperDecls env rawPairs arch (normalizeAndInlineLocalDefs rawMod)
 
 end LeanNative.IR

@@ -56,7 +56,7 @@ theorem incRefObj_zero_ok (st st1 : HeapState) (objId : Nat)
 
 theorem decRefObj_zero_ok (st st1 : HeapState) (objId : Nat)
     (h : st.decRefObj objId 0 = .ok st1) : st1 = st := by
-  unfold HeapState.decRefObj at h
+  unfold HeapState.decRefObj HeapState.decRefObjFuel at h
   dsimp only at h
   split at h
   · contradiction

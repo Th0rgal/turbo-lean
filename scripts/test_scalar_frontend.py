@@ -904,6 +904,91 @@ def dupEdgeEntry (mask : UInt8) (x : UInt64) : UInt64 :=
             )
             self.assertEqual([int(r["value_u64"]) for r in ev_rows], json.loads(stock_out))
 
+    def test_stage1d_heap_adt_perceus_reuse_alias_drop_tv_and_fail_closed_llvm(self):
+        engines = fuzzer.probe_engines()
+        lean_src = """inductive RcPacket where
+  | pair : (UInt64 × UInt64) → (UInt64 × UInt64) → RcPacket
+  | empty : RcPacket
+
+@[inline] def foldPacket (pkt : RcPacket) : UInt64 :=
+  match pkt with
+  | .pair p q => ((p.1 * 1315423911) + p.2) ^^^ ((q.1 * 2654435761) + q.2)
+  | .empty => 0x9E3779B97F4A7C15
+
+@[inline] def stepPacket (pkt : RcPacket) (delta : UInt64) : RcPacket :=
+  match pkt with
+  | .pair p q => .pair (p.1 + delta, p.2 ^^^ delta) (q.1 + (delta <<< 1), q.2 + 17)
+  | .empty => .empty
+
+@[export probe_rc_reuse]
+def probe_rc_reuse (seed delta : UInt64) : UInt64 :=
+  let p0 := if seed == 0 then RcPacket.empty else RcPacket.pair (seed, seed + 5) (delta, delta + 11)
+  foldPacket (stepPacket (stepPacket p0 (delta + 1)) (delta ^^^ 7))
+
+@[export probe_rc_alias]
+def probe_rc_alias (seed delta : UInt64) : UInt64 :=
+  let base := RcPacket.pair (seed, seed ^^^ 0x9E3779B97F4A7C15) (delta + 3, seed + delta)
+  foldPacket base + (foldPacket (stepPacket base (delta + 5)) ^^^ foldPacket (stepPacket base (delta + 19)))
+
+@[inline] def swapPairIf (flag : UInt64) (p : UInt64 × UInt64) : UInt64 × UInt64 :=
+  if (flag &&& 1) == 0 then (p.1 + 3, p.2 ^^^ 5) else (p.2 + 7, p.1 ^^^ 11)
+
+@[export probe_rc_drop]
+def probe_rc_drop (sel seed delta : UInt64) : UInt64 :=
+  let live := RcPacket.pair (seed + 1, delta + 2) (seed ^^^ delta, seed + 29)
+  let dead := RcPacket.pair (seed * 7, delta * 11) (seed + 41, delta + 43)
+  let base :=
+    if (sel &&& 1) == 0 then (foldPacket (stepPacket live delta), delta)
+    else (foldPacket (stepPacket dead (delta + 9)), delta + 9)
+  let chosen := swapPairIf seed base
+  chosen.1 ^^^ chosen.2
+"""
+        with tempfile.TemporaryDirectory(prefix="stage1d_heap_rc_") as directory:
+            tmp = Path(directory)
+            src = tmp / "Stage1DHeap.lean"
+            src.write_text(lean_src, encoding="utf-8")
+            wire = tmp / "stage1d.lnir"
+            res = subprocess.run(
+                [engines["full_bin"], "emit-lnir", "--wire", str(src), "-o", str(wire)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            wire_text = wire.read_text(encoding="utf-8")
+            for op in ("C_inc", "C_dec", "E_ctor", "E_cgeto", "E_isexcl", "E_mktup", "E_projtup", "C_ite"):
+                self.assertGreater(wire_text.count(op), 0, f"missing expected opcode {op} in Stage 1D wire")
+            tv = json.loads(subprocess.check_output(
+                [engines["core_bin"], "validate-tv", "--lnir", str(wire), "--json"], text=True,
+            ))
+            self.assertTrue(tv.get("allPassed"), tv)
+            llvm_out = tmp / "bad.ll"
+            llvm_res = subprocess.run(
+                [engines["core_bin"], "compile-llvm", "--lnir", str(wire), "-o", str(llvm_out)],
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(llvm_res.returncode, 0, "compile-llvm must fail closed on Stage 1D heap ops")
+            self.assertFalse(llvm_out.exists())
+            stock_src = tmp / "StockStage1D.lean"
+            stock_src.write_text(
+                lean_src + '\ndef main : IO Unit := IO.println s!"[{probe_rc_reuse 0 7},{probe_rc_reuse 42 7},{probe_rc_alias 42 7},{probe_rc_drop 0 42 7},{probe_rc_drop 1 42 7}]"\n',
+                encoding="utf-8",
+            )
+            expected = json.loads(subprocess.check_output(
+                ["lake", "env", "lean", "--run", str(stock_src)], cwd=fuzzer.ROOT / "lean", text=True,
+            ))
+            probes = [("probe_rc_reuse", [0, 7]), ("probe_rc_reuse", [42, 7]), ("probe_rc_alias", [42, 7]),
+                      ("probe_rc_drop", [0, 42, 7]), ("probe_rc_drop", [1, 42, 7])]
+            for extra in ([], ["--opt"]):
+                got = []
+                for sym, args in probes:
+                    row = json.loads(subprocess.check_output(
+                        [engines["core_bin"], "eval-lnir", "--lnir", str(wire), "--args",
+                         f"{sym}:" + ",".join(map(str, args)), "--batch-json", *extra], text=True,
+                    ))[0]
+                    self.assertTrue(row.get("ok"), row)
+                    self.assertEqual(row.get("live_objects"), 0, row)
+                    got.append(int(row["value_u64"]))
+                self.assertEqual(got, expected)
+
 
 if __name__ == "__main__":
     unittest.main()

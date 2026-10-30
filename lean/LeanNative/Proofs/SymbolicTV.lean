@@ -304,7 +304,11 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
   match e with
   | .scalar se =>
     let sv := symEvalScalar st se
-    st.bindVar dst sv
+    let st' :=
+      match se with
+      | .var src => if src != dst then st.aliasBuf dst src else st
+      | _ => st
+    st'.bindVar dst sv
   | .constU256 val =>
     let symVal : SymExpr :=
       if val.lo1 == 0 && val.hi0 == 0 && val.hi1 == 0 then
@@ -350,7 +354,8 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
     | _ => st.bindVar dst { expr := .symVar dst, nonPoison := tv.nonPoison, noUB := tv.noUB }
   | .allocCtor tag objFields scalarFields =>
     let svs := (objFields ++ scalarFields).map st.lookupVar
-    st.bindVar dst { expr := .tuple (.constU64 tag.toUInt64 :: svs.map (·.expr)), nonPoison := svs.all (·.nonPoison), noUB := svs.all (·.noUB) }
+    (st.markExclusive dst).bindVar dst
+      { expr := .tuple (.constU64 tag.toUInt64 :: svs.map (·.expr)), nonPoison := svs.all (·.nonPoison), noUB := svs.all (·.noUB) }
   | .ctorGetObj ctorVar idx | .ctorGetScalar ctorVar idx _ =>
     let cv := st.lookupVar ctorVar
     match cv.expr with
@@ -358,9 +363,19 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
       match fs[idx]? with
       | some fExpr => st.bindVar dst { expr := fExpr, nonPoison := cv.nonPoison, noUB := cv.noUB }
       | none => st.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+    | .symVar rootId =>
+      let fieldRoot := 30000 + rootId * 16 + idx
+      st.bindVar dst { expr := .symVar fieldRoot, nonPoison := cv.nonPoison, noUB := cv.noUB }
     | _ => st.bindVar dst { expr := .symVar dst, nonPoison := cv.nonPoison, noUB := cv.noUB }
   | .isExclusive objVar =>
-    st.bindVar dst { expr := .constBool (st.isBufExclusive objVar), nonPoison := true, noUB := true }
+    let cv := st.lookupVar objVar
+    let exclExpr : SymExpr :=
+      match cv.expr with
+      | .symVar rootId =>
+        if st.isBufExclusive objVar then .constBool true
+        else .binOp .eq (.symVar (25000 + st.resolveBuf rootId)) (.constU64 1)
+      | _ => .constBool (st.isBufExclusive objVar)
+    st.bindVar dst { expr := exclExpr, nonPoison := cv.nonPoison, noUB := cv.noUB }
   | .sarrayLen arrVar =>
     let root := st.resolveBuf arrVar
     st.bindVar dst { expr := .symVar (9000 + root), nonPoison := true, noUB := true }
@@ -392,6 +407,48 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
       else if fnName == "lean_native_sarray_len" && i64Ret then
         let sa := st.lookupVar a
         st.bindVar dst { expr := .symVar (9000 + st.resolveBuf a), nonPoison := sa.nonPoison, noUB := sa.noUB }
+      else if fnName == "lean_native_ctor_tag" && i64Ret then
+        let sa := st.lookupVar a
+        let tagExpr : SymExpr :=
+          match sa.expr with
+          | .tuple (tag :: _) => tag
+          | .constU64 tag => .constU64 tag
+          | .symVar rootId => .symVar (24000 + st.resolveBuf rootId)
+          | _ => .symVar dst
+        st.bindVar dst { expr := tagExpr, nonPoison := sa.nonPoison, noUB := sa.noUB }
+      else st.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+    | false, [objVar, idxVar, valVar] =>
+      if fnName == "lean_native_ctor_set" && retTy == .unit then
+        let root := st.resolveBuf objVar
+        let objSv := st.lookupVar root
+        let idxSv := st.lookupVar idxVar
+        let valSv := st.lookupVar valVar
+        let exclOk := st.isBufExclusive root
+        let updatedState : SymExecState :=
+          match objSv.expr, idxSv.expr with
+          | .tuple (tag :: fs), .constU64 idxU64 =>
+            let idx := idxU64.toNat
+            if idx < fs.length then
+              st.bindVar root {
+                expr := .tuple (tag :: fs.set idx valSv.expr)
+                nonPoison := objSv.nonPoison && idxSv.nonPoison && valSv.nonPoison
+                noUB := objSv.noUB && idxSv.noUB && valSv.noUB && exclOk }
+            else
+              { st with noUB := false, nonPoison := false }
+          | .symVar rootId, .constU64 idxU64 =>
+            let idx := idxU64.toNat
+            let prevFields := (List.range 8).map fun i =>
+              if i == idx then valSv.expr else .symVar (30000 + rootId * 16 + i)
+            st.bindVar root {
+              expr := .tuple (.symVar (24000 + rootId) :: prevFields)
+              nonPoison := objSv.nonPoison && idxSv.nonPoison && valSv.nonPoison
+              noUB := objSv.noUB && idxSv.noUB && valSv.noUB && exclOk }
+          | _, _ =>
+            { st with noUB := false, nonPoison := false }
+        updatedState.bindVar dst {
+          expr := .unit
+          nonPoison := objSv.nonPoison && idxSv.nonPoison && valSv.nonPoison
+          noUB := objSv.noUB && idxSv.noUB && valSv.noUB && exclOk }
       else st.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
     | _, _ => st.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
 
@@ -455,8 +512,25 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
         if v != 0 then symExecCode fuel' unrollBound st thenBranch
         else symExecCode fuel' unrollBound st elseBranch
       | cExpr =>
-        let (stT, retT) := symExecCode fuel' unrollBound st thenBranch
-        let (stE, retE) := symExecCode fuel' unrollBound st elseBranch
+        let (stForT, stForE) : SymExecState × SymExecState :=
+          match cExpr with
+          | .unaryOp .not (.binOp .eq (.symVar rcSym) (.constU64 1)) =>
+            if rcSym ≥ 25000 then (st, st.markExclusive (rcSym - 25000)) else (st, st)
+          | .binOp .eq (.symVar rcSym) (.constU64 1) =>
+            if rcSym ≥ 25000 then (st.markExclusive (rcSym - 25000), st) else (st, st)
+          | .binOp .eq (.symVar tagSym) (.constU64 tagVal) =>
+            if tagSym ≥ 24000 && tagSym < 25000 then
+              let rootId := tagSym - 24000
+              let curSv := st.lookupVar rootId
+              match curSv.expr with
+              | .symVar _ =>
+                let symFields := (List.range 8).map (fun i => SymExpr.symVar (30000 + rootId * 16 + i))
+                (st.bindVar rootId { curSv with expr := .tuple (.constU64 tagVal :: symFields) }, st)
+              | _ => (st, st)
+            else (st, st)
+          | _ => (st, st)
+        let (stT, retT) := symExecCode fuel' unrollBound stForT thenBranch
+        let (stE, retE) := symExecCode fuel' unrollBound stForE elseBranch
         let mergedState : SymExecState := {
           st with
           noUB := st.noUB && condSv.noUB && stT.noUB && stE.noUB
@@ -579,6 +653,29 @@ def mkSampleParamVal (seed : UInt64) (paramIdx : Nat) (ty : LNIRType) (st : Heap
   | .tuple fs =>
     let vals := fs.mapIdx (fun idx _ => Val.u64 (((splitMix64Next (r + idx.toUInt64 * 17)).1 % 16) + 1))
     (.tuple vals, st)
+  | .objPtr | .taggedPtr =>
+    match r % 5 with
+    | 0 => (.u64 1, st)
+    | _ =>
+      let mkLeaf (s : HeapState) (salt : UInt64) (sharedLeaf : Bool) : Val × HeapState :=
+        let f0 := Val.u64 (((splitMix64Next (r + salt)).1 % 16) + 1)
+        let f1 := Val.u64 (((splitMix64Next (r + salt + 7)).1 % 16) + 1)
+        let (cid, s1) := s.allocHeapCtor 0 [f0, f1]
+        if sharedLeaf then
+          match s1.incRefObj cid 1 with
+          | .ok s2 => (.objPtr cid, s2)
+          | .error _ => (.objPtr cid, s1)
+        else (.objPtr cid, s1)
+      let sharedRoot := (r % 2 == 0)
+      let sharedKids := (r % 3 == 0)
+      let (c0, st1) := mkLeaf st 101 sharedKids
+      let (c1, st2) := mkLeaf st1 203 sharedKids
+      let (oid, st3) := st2.allocHeapCtor 0 [c0, c1]
+      if sharedRoot then
+        match st3.incRefObj oid 1 with
+        | .ok st4 => (.objPtr oid, st4)
+        | .error _ => (.objPtr oid, st3)
+      else (.objPtr oid, st3)
   | .unit => (.unit, st)
   | _ => (.u64 smallU64, st)
 
@@ -609,10 +706,11 @@ def checkConcreteSamples (fuel : Nat) (samples : List (VarEnv × HeapState)) (sr
 /-- Evaluate `src` and `tgt` declarations across `numSamples` (default 64) concrete input states. -/
 def checkDeclConcreteRefinement (src tgt : LNIRDecl) (numSamples : Nat := 64) (fuel : Nat := 128) :
     Bool × Nat :=
+  let effFuel := Nat.max fuel 256
   let samples := (List.range numSamples).map (buildDeclSample src)
   let (passedCount, nonVacuousCount) := samples.foldl (fun (acc, okSrc) (env, st) =>
-    let srcOk := match evalCode fuel env st src.body with | .ok _ => true | .error _ => false
-    let stepOk := checkSingleSample fuel env st src.body tgt.body
+    let srcOk := match evalCode effFuel env st src.body with | .ok _ => true | .error _ => false
+    let stepOk := checkSingleSample effFuel env st src.body tgt.body
     (if stepOk then acc + 1 else acc, if srcOk && stepOk then okSrc + 1 else okSrc)) (0, 0)
   (passedCount == numSamples && (numSamples == 0 || nonVacuousCount > 0), nonVacuousCount)
 
