@@ -1162,6 +1162,74 @@ open LeanNative.IR LeanNative.Proofs
   let childRes := validateTranslationDecl (childDecl true) (childDecl false) 8
   unless childRes.passed && childRes.symRetEquiv do
     throw <| IO.userError s!"projected child lost identity: {reprStr childRes}"
+  -- 6. Newly allocated child escaping into an input object must compare full reachable child contents in memWritesEquiv
+  let mkEscapingChildDecl (corruptField : Bool) : LNIRDecl := {
+    name := "escaping_child_write"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 2 .i64 (.call "lean_native_ctor_tag" [0] .i64 false)
+        (.letBind 3 .i1 (.scalar (.binOp .eq (.var 2) (.constU64 0)))
+          (.ite 3
+            (.letBind 4 .i1 (.isExclusive 0)
+              (.ite 4
+                (.letBind 5 .i64 (if corruptField then
+                    .scalar (.select (.binOp .eq (.var 1) (.constU64 999)) (.constU64 3) (.constU64 2))
+                  else
+                    .scalar (.constU64 2))
+                  (.letBind 6 .objPtr (.allocCtor 0 [] [5])
+                    (.letBind 7 .i64 (.scalar (.constU64 0))
+                      (.letBind 8 .unit (.call "lean_native_ctor_set" [0, 7, 6] .unit false)
+                        (.ret 7)))))
+                (.letBind 9 .i64 (.scalar (.constU64 0)) (.ret 9))))
+            (.letBind 10 .i64 (.scalar (.constU64 0)) (.ret 10))))
+  }
+  let escBad := validateTranslationDecl (mkEscapingChildDecl false) (mkEscapingChildDecl true) 8
+  unless !escBad.memWritesEquiv && !escBad.passed do
+    throw <| IO.userError s!"escaping child field corruption accepted: {reprStr escBad}"
+  -- 6b. Even without a prior ctor_tag branch, storing an allocated child into an input object must reject corrupted child fields
+  let mkDirectEscapingChildDecl (corruptField : Bool) : LNIRDecl := {
+    name := "direct_escaping_child_write"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 2 .i1 (.isExclusive 0)
+        (.ite 2
+          (.letBind 3 .i64 (if corruptField then
+              .scalar (.select (.binOp .eq (.var 1) (.constU64 999)) (.constU64 3) (.constU64 2))
+            else
+              .scalar (.constU64 2))
+            (.letBind 4 .objPtr (.allocCtor 0 [] [3])
+              (.letBind 5 .i64 (.scalar (.constU64 0))
+                (.letBind 6 .unit (.call "lean_native_ctor_set" [0, 5, 4] .unit false)
+                  (.ret 5)))))
+          (.letBind 7 .i64 (.scalar (.constU64 0)) (.ret 7)))
+  }
+  let escDirectBad := validateTranslationDecl (mkDirectEscapingChildDecl false) (mkDirectEscapingChildDecl true) 8
+  unless !escDirectBad.memWritesEquiv && !escDirectBad.passed do
+    throw <| IO.userError s!"direct escaping child field corruption accepted: {reprStr escDirectBad}"
+  -- 7. Freeing a parent constructor recursively decrements its child references, restoring child exclusivity
+  let mkParentDropDecl (foldTrue : Bool) : LNIRDecl := {
+    name := "parent_drop_child_excl"
+    params := []
+    retTy := .i1
+    body :=
+      .letBind 0 .objPtr (.allocCtor 0 [] [])
+        (.incRef 0 1
+          (.letBind 1 .objPtr (.allocCtor 0 [0] [])
+            (.decRef 1 1
+              (.letBind 2 .i1 (if foldTrue then .scalar (.constBool true) else .isExclusive 0)
+                (.decRef 0 1 (.ret 2))))))
+  }
+  let dropRes := validateTranslationDecl (mkParentDropDecl false) (mkParentDropDecl true) 8
+  unless dropRes.passed && dropRes.symRetEquiv do
+    throw <| IO.userError s!"parent drop failed to restore child exclusivity: {reprStr dropRes}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)
