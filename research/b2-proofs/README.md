@@ -46,3 +46,15 @@ lake build lean-native-core
 Only F64 declarations are accepted; compiling an entire module that also
 contains heap/call/parallel kernels fails closed. This command emits
 CLIF; it does not by itself certify or emit an AArch64 binary.
+
+Export the exact kernel-certified backend artifacts after the proof build:
+
+```sh
+lake env lean --run Emit.lean /tmp/b2-collatz
+```
+
+This writes `/tmp/b2-collatz.s` and `/tmp/b2-collatz.bin` (352 bytes).
+The exporter imports the active proof root and axiom audit and reads
+`B2.Artifacts.fa`/`fb` directly. Locally, Clang's AArch64 assembler produced
+identical `.text` bytes from the exported assembly. The bytes currently have
+certified pipeline equations; the LNIR-to-x0 composition is still open.

@@ -35,6 +35,7 @@ jobs:
           lake build
           lake env lean B2/Lowering.lean
           lake env lean B2/Division.lean
+          lake env lean --run Emit.lean "$RUNNER_TEMP/b2-collatz"
       - name: Check compiler integration on compiler toolchain
         working-directory: lean
         run: |
