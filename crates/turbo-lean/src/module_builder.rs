@@ -1708,22 +1708,14 @@ fn classify_lake_field(scope: LakeScope, key: &str, val: &str) -> LakeField {
             LakeField::Unsupported
         }
     };
-    // Only a plain enum literal (`.release`, `BuildType.release`, TOML `"release"`): any other
+    // Only a plain enum literal (`.release`, TOML `"release"`): any other
     // expression (e.g. `if c then .llvm else .c`) stays unknown and so unsupported.
     let enum_tag = v
         .strip_prefix('"')
         .and_then(|t| t.strip_suffix('"'))
-        .or_else(|| {
-            [
-                "Lake.BuildType.",
-                "BuildType.",
-                "Lake.Backend.",
-                "Backend.",
-                ".",
-            ]
-            .iter()
-            .find_map(|p| v.strip_prefix(p))
-        })
+        // `.llvm` resolves in the expected enum type; a qualified `Backend.default` can name
+        // one of the lakefile's own helpers.
+        .or_else(|| v.strip_prefix('.'))
         .filter(|t| t.chars().all(|c| c.is_ascii_alphanumeric()))
         .unwrap_or("");
     let empty_array = matches!(v, "[]" | "#[]");
@@ -6932,7 +6924,7 @@ pub fn write_lake_module_hashes_and_trace(
         let tmp_p = parent.join(format!(".turbo_stage_sidecar_{}_{}_{}", pid, seq, fname));
         let write_res: Result<()> = (|| {
             use std::io::Write;
-            let mut f = fs::File::create(&tmp_p)?;
+            let mut f = create_fresh_file(&tmp_p)?;
             f.write_all(&content)?;
             #[cfg(unix)]
             {
@@ -6997,6 +6989,14 @@ struct BackupRecord {
     backup_file: Option<(PathBuf, blake3::Hash, u64)>,
 }
 
+/// Create a staging/backup file at a predictable path without following anything already
+/// there: a planted symlink is removed (not its target), then the file is created exclusively.
+fn create_fresh_file(p: &Path) -> std::io::Result<fs::File> {
+    if fs::symlink_metadata(p).is_ok() {
+        fs::remove_file(p)?;
+    }
+    fs::OpenOptions::new().write(true).create_new(true).open(p)
+}
 fn sync_parent_dir(p: &Path) -> Result<()> {
     #[cfg(unix)]
     if let Some(parent) = p.parent() {
@@ -7036,7 +7036,7 @@ fn write_verified_copy_or_link(
         || (try_hard_link && fs::hard_link(src_p, target_p).is_ok());
     if !linked_or_renamed {
         use std::io::Write;
-        let mut f = fs::File::create(target_p)
+        let mut f = create_fresh_file(target_p)
             .with_context(|| format!("Failed to create `{}`", target_p.display()))?;
         f.write_all(&src_bytes)
             .with_context(|| format!("Failed to write `{}`", target_p.display()))?;
@@ -8140,7 +8140,7 @@ pub(crate) fn record_verified_dep_source(
         ));
         let write_ok = (|| -> std::io::Result<()> {
             use std::io::Write;
-            let mut f = fs::File::create(&tmp_path)?;
+            let mut f = create_fresh_file(&tmp_path)?;
             f.write_all(&json_bytes)?;
             f.sync_all()?;
             Ok(())
@@ -11497,6 +11497,8 @@ roots = ["Fast"]
             "match x with | _ => .c",
             "(.c)",
             "\"llvm\"",
+            "Backend.default",
+            "Lake.Backend.c",
         ] {
             assert!(
                 matches!(
@@ -11506,12 +11508,21 @@ roots = ["Fast"]
                 "{v}"
             );
         }
-        for v in [".c", "Backend.default", "\"c\""] {
+        for v in [".c", ".default", "\"c\""] {
             assert!(matches!(
                 classify_lake_field(LakeScope::Lib, "backend", v),
                 LakeField::Passive
             ));
         }
+        // A dependency's own helper can shadow a qualified enum name.
+        let lf = dir.join("lakefile.lean");
+        fs::write(
+            &lf,
+            "import Lake\nopen Lake DSL\ndef Backend.default : Lake.Backend := .llvm\npackage t where\n  backend := Backend.default\nlean_lib A\n",
+        )
+        .unwrap();
+        let pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
+        assert!(pkg.unsupported.is_some());
         // A dependency's `needs` only marks the target that sets it.
         let lf = dir.join("lakefile.lean");
         fs::write(
@@ -11540,6 +11551,20 @@ roots = ["Fast"]
         assert!(crate::shm_cache::acquire_flock(&lock, true, false).is_err());
         assert!(acquire_publish_flock_mode(&proj, true, false).is_err());
         assert!(!outside.join("created").exists());
+        // Predictable staging names (`.turbo_stage_sidecar_*`, backups, manifest tmp files)
+        // replace a planted symlink instead of writing through it.
+        let stage = proj.join(".lake/build/.turbo_stage_sidecar_1_1_P.olean.hash");
+        std::os::unix::fs::symlink(outside.join("staged"), &stage).unwrap();
+        fs::write(outside.join("victim"), b"keep").unwrap();
+        let stage2 = proj.join(".lake/build/.turbo_backup_1_1_P.olean");
+        std::os::unix::fs::symlink(outside.join("victim"), &stage2).unwrap();
+        for p in [&stage, &stage2] {
+            use std::io::Write;
+            create_fresh_file(p).unwrap().write_all(b"x").unwrap();
+            assert!(!fs::symlink_metadata(p).unwrap().file_type().is_symlink());
+        }
+        assert!(!outside.join("staged").exists());
+        assert_eq!(fs::read(outside.join("victim")).unwrap(), b"keep");
 
         // A cache entry restores only onto the node's own artifact paths.
         fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
