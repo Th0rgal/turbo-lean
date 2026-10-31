@@ -1602,6 +1602,7 @@ pub fn eval_with_zygote_pool_with_args(
         None,
         None,
         lean_args,
+        &[],
     )
 }
 
@@ -1659,6 +1660,7 @@ pub fn eval_with_zygote_pool_opts_with_args(
         timeout_ms,
         None,
         lean_args,
+        &[],
     )
 }
 
@@ -1669,6 +1671,49 @@ fn encode_lean_args_hex(lean_args: &[String]) -> String {
     } else {
         hex_encode_bytes(filtered.join("\n").as_bytes())
     }
+}
+
+/// Worker mode flag for a stubbed (`allow_stub`) or strict check. Named `stub_targets` (the declarations
+/// under check) travel as `allow_stub:<hex>`; the worker never exempts their `sorryAx`, and a final run
+/// without them exempts nothing.
+fn stub_mode_flag(allow_stub: bool, stub_targets: &[String]) -> String {
+    match (allow_stub, stub_targets.is_empty()) {
+        (false, _) => "strict".to_string(),
+        (true, true) => "allow_stub".to_string(),
+        (true, false) => format!(
+            "allow_stub:{}",
+            hex_encode_bytes(stub_targets.join("\n").as_bytes())
+        ),
+    }
+}
+
+/// Check `shard_source` with its prefix `sorry` stubs admitted, but never the `sorryAx` of `stub_targets`.
+#[allow(clippy::too_many_arguments)]
+pub fn eval_with_zygote_pool_for_targets(
+    store: &TurboStore,
+    toolchain: &str,
+    req_lean_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    lean_bin: &Path,
+    shard_source: &str,
+    stub_targets: &[String],
+    lean_args: &[String],
+) -> Result<ZygoteEvalReply> {
+    eval_with_zygote_pool_inner(
+        store,
+        toolchain,
+        req_lean_path,
+        env_vars,
+        lean_bin,
+        shard_source,
+        true,
+        false,
+        None,
+        None,
+        None,
+        lean_args,
+        stub_targets,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1685,7 +1730,9 @@ fn eval_with_zygote_pool_inner(
     timeout_ms: Option<u64>,
     batch_fission_override: Option<(String, String, String)>,
     lean_args: &[String],
+    stub_targets: &[String],
 ) -> Result<ZygoteEvalReply> {
+    let stub_mode = stub_mode_flag(allow_stub, stub_targets);
     let default_timeout_ms = if eval_mode { 900_000 } else { 30_000 };
     let effective_timeout_ms = timeout_ms.filter(|&ms| ms > 0).unwrap_or_else(|| {
         std::env::var("TURBO_LEAN_TIMEOUT_MS")
@@ -1816,14 +1863,14 @@ fn eval_with_zygote_pool_inner(
 
     static ZYGOTE_VERIFIED_SHARD_CACHE: std::sync::OnceLock<
         std::sync::Mutex<
-            std::collections::HashMap<(String, String, bool, String), ZygoteEvalReply>,
+            std::collections::HashMap<(String, String, String, String), ZygoteEvalReply>,
         >,
     > = std::sync::OnceLock::new();
     let verified_cache_key = if !eval_mode && batch_fission_override.is_none() {
         Some((
             verified_cache_policy,
             olean_digest.clone(),
-            allow_stub,
+            stub_mode.clone(),
             shard_source.to_string(),
         ))
     } else {
@@ -2185,12 +2232,12 @@ fn eval_with_zygote_pool_inner(
                     let hb = hex_encode_bytes(blk.as_bytes());
                     if hex_opts.is_empty() {
                         if allow_stub {
-                            format!("{}\t{}\tallow_stub\n", imports_csv, hb)
+                            format!("{}\t{}\t{}\n", imports_csv, hb, stub_mode)
                         } else {
                             format!("{}\t{}\n", imports_csv, hb)
                         }
                     } else {
-                        let mode_flag = if allow_stub { "allow_stub" } else { "strict" };
+                        let mode_flag = stub_mode.as_str();
                         format!("{}\t{}\t{}\t\t\t{}\n", imports_csv, hb, mode_flag, hex_opts)
                     }
                 })
@@ -2332,7 +2379,7 @@ fn eval_with_zygote_pool_inner(
             {
                 let hex_decl = hex_encode_bytes(decl_code.as_bytes());
                 let hex_prefix = hex_encode_bytes(prefix_code.as_bytes());
-                let mode_flag = if allow_stub { "allow_stub" } else { "strict" };
+                let mode_flag = stub_mode.as_str();
                 let rl = if hex_opts.is_empty() {
                     format!(
                         "{}\t{}\t{}\t{}\t{}\n",
@@ -2353,12 +2400,12 @@ fn eval_with_zygote_pool_inner(
                 let hex_body = hex_encode_bytes(body_code.as_bytes());
                 let rl = if hex_opts.is_empty() {
                     if allow_stub {
-                        format!("{}\t{}\tallow_stub\n", imports_csv, hex_body)
+                        format!("{}\t{}\t{}\n", imports_csv, hex_body, stub_mode)
                     } else {
                         format!("{}\t{}\n", imports_csv, hex_body)
                     }
                 } else {
-                    let mode_flag = if allow_stub { "allow_stub" } else { "strict" };
+                    let mode_flag = stub_mode.as_str();
                     format!(
                         "{}\t{}\t{}\t\t\t{}\n",
                         imports_csv, hex_body, mode_flag, hex_opts
@@ -2724,6 +2771,7 @@ pub fn eval_subshards_batch_via_zygote(
         None,
         Some(req_tuple),
         lean_args,
+        &[],
     )
 }
 
@@ -2788,6 +2836,7 @@ pub fn eval_candidates_race_via_zygote(
         None,
         Some(req_tuple),
         lean_args,
+        &[],
     )
 }
 

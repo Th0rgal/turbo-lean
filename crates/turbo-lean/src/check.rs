@@ -969,6 +969,16 @@ fn check_directory(
     }
 
     let dir_interface_hash = dir_hasher.finalize().to_hex().to_string();
+    let dirty: Vec<String> = parsed_files
+        .iter()
+        .filter(|(_, _, _, split, _, _)| !split.hygiene.is_clean_for_certification())
+        .map(|(lf, _, _, split, _, _)| {
+            format!("{}: {}", lf.display(), split.hygiene.disallowed_items().join(", "))
+        })
+        .collect();
+    if !dirty.is_empty() {
+        anyhow::bail!("Soundness hygiene violation in {}", dirty.join("; "));
+    }
     let cached_map = store.batch_get_theorem_shards(&all_shard_keys, "trusted")?;
 
     let mut total_hits = 0usize;
@@ -1481,6 +1491,30 @@ fn extract_decl_source_from_file(active_src: &str, shard: &splitter::TheoremShar
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Hygiene items (`sorry`/`admit`/`sorryAx`, forbidden axioms, ...) that block certifying `shard` alone:
+/// the file report's items on its lines, plus a fresh audit of its statement and proof text.
+fn target_hygiene_violations(
+    split: &splitter::SplitResult,
+    shard: &splitter::TheoremShard,
+) -> Vec<String> {
+    let on_shard_lines = |item: &String| {
+        item.strip_prefix('L')
+            .and_then(|r| r.split_once(": "))
+            .and_then(|(ln, _)| ln.parse::<usize>().ok())
+            .is_some_and(|ln| shard.start_line <= ln && ln <= shard.end_line)
+    };
+    let text = format!("{}\n{}", shard.signature_text, shard.proof_text);
+    let mut items: Vec<String> = split.hygiene.disallowed_items();
+    items.retain(on_shard_lines);
+    items.extend(
+        splitter::audit_hygiene(&splitter::strip_lean_comments(&text))
+            .disallowed_items()
+            .into_iter()
+            .map(|i| format!("`{}` {}", shard.name, i)),
+    );
+    items
+}
+
 fn check_single_decl(
     store: &mut TurboStore,
     db_warm_on_open: bool,
@@ -1624,6 +1658,15 @@ fn check_single_decl(
         }
     }
     let shard = &split.shards[shard_idx];
+    let target_violations = target_hygiene_violations(split, shard);
+    if !target_violations.is_empty() {
+        anyhow::bail!(
+            "Soundness hygiene violation in `{}` ({}): {}",
+            target_decl,
+            file.display(),
+            target_violations.join(", ")
+        );
+    }
     let file_lean_args =
         crate::module_builder::try_resolve_lean_args_for_path(canon_dir, Some(&active_file));
 
@@ -2617,14 +2660,15 @@ fn check_single_decl(
                             env_vars = ev;
                             env_cache_hit = ech;
                         }
-                        if let Ok(reply) = crate::zygote::eval_with_zygote_pool_with_args(
+                        let stub_targets: Vec<String> = single_set.iter().cloned().collect();
+                        if let Ok(reply) = crate::zygote::eval_with_zygote_pool_for_targets(
                             store,
                             toolchain,
                             &local_lean_path,
                             &env_vars,
                             Path::new(&lean_bin),
                             &full_shard_src,
-                            true,
+                            &stub_targets,
                             &file_lean_args,
                         ) {
                             let c_abi_sound = unsafe {
@@ -2679,6 +2723,20 @@ fn check_single_decl(
                         .context("Failed to execute `lean` on theorem shard")?;
                     let _ = fs::remove_file(&tmp_shard);
 
+                    let lean_output = format!(
+                        "{}\n{}",
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    if out.status.success()
+                        && splitter::sorry_warning_in_decls(&full_shard_src, &lean_output, &single_set)
+                    {
+                        anyhow::bail!(
+                            "Soundness hygiene violation in `{}` ({}): declaration uses `sorry`",
+                            target_decl,
+                            file.display()
+                        );
+                    }
                     if !out.status.success() {
                         let tmp_display = tmp_shard.display().to_string();
                         let orig_display = file.display().to_string();

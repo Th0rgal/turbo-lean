@@ -1270,6 +1270,12 @@ fn run_lean_temp_file(
                 reports.len(),
                 audit.len()
             );
+        } else if crate::splitter::sorry_warning_in_decls(&audited_src, &stdout, audit) {
+            code = 1;
+            stderr = format!(
+                "{}\n[TurboLean.KernelGate] audited declaration uses `sorry`",
+                stderr
+            );
         } else {
             let bad: Vec<String> = reports
                 .iter()
@@ -1365,6 +1371,9 @@ fn execute_check_shard_payload_deferred_with_domain(
 
     let (req_allowed, req_allowed_csv) =
         resolve_request_axiom_policy(req.allowed_axioms.as_deref(), trust_domain);
+    // A named target is gated (and checked with its name) on every path, the local daemon's
+    // `skip_cas_lock` requests included; batches name no single target.
+    let named_target = !matches!(req.decl.as_str(), "" | "__batch__" | "__coalesced_batch__");
 
     if source_may_have_hygiene_issue(&req.shard_source) {
         let clean_source = crate::splitter::strip_lean_comments(&req.shard_source);
@@ -1381,7 +1390,7 @@ fn execute_check_shard_payload_deferred_with_domain(
             );
         }
 
-        if !req.skip_cas_lock && source_violations.has_sorry {
+        if source_violations.has_sorry && (named_target || !req.skip_cas_lock) {
             let dep_hashes = crate::lake_build::compute_imported_olean_interface_hashes(
                 &req.shard_source,
                 Path::new("."),
@@ -1463,14 +1472,19 @@ fn execute_check_shard_payload_deferred_with_domain(
     let filtered_req_args = crate::module_builder::filter_allowed_lean_args(&req.lean_args);
     let req_args_digest_opt = crate::module_builder::compute_lean_args_digest(&filtered_req_args);
 
-    match crate::zygote::eval_with_zygote_pool_with_args(
+    let stub_targets: Vec<String> = if named_target {
+        vec![req.decl.clone()]
+    } else {
+        Vec::new()
+    };
+    match crate::zygote::eval_with_zygote_pool_for_targets(
         store,
         toolchain,
         &req.lean_path,
         &env_vars,
         &lean_bin,
         &req.shard_source,
-        true,
+        &stub_targets,
         &filtered_req_args,
     ) {
         Ok(zreply) if zreply.import_ok => {
@@ -1500,7 +1514,7 @@ fn execute_check_shard_payload_deferred_with_domain(
 
     if !zygote_used {
         let audit_set: std::collections::HashSet<String> =
-            if matches!(req.decl.as_str(), "" | "__batch__" | "__coalesced_batch__") {
+            if !named_target {
                 crate::splitter::split_lean_source(&req.shard_source, &[])
                     .shards
                     .into_iter()

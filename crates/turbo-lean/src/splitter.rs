@@ -3140,6 +3140,33 @@ pub fn with_axiom_audit(src: &str, names: &std::collections::HashSet<String>) ->
     (out, after_line.values().map(Vec::len).sum())
 }
 
+/// Whether Lean's `output` for `src` warns `declaration uses 'sorry'` inside one of the `names`
+/// declarations (anywhere, when none of them is found or a warning has no position). Unlike the
+/// transitive `#print axioms`, the warning is per declaration, so prefix stubs a target uses do not count.
+pub fn sorry_warning_in_decls(
+    src: &str,
+    output: &str,
+    names: &std::collections::HashSet<String>,
+) -> bool {
+    let ranges: Vec<(usize, usize)> = split_lean_source(src, &[])
+        .shards
+        .iter()
+        .filter(|sh| matches_uncached_or_fast_verify_name(&sh.name, names))
+        .map(|sh| (sh.start_line, sh.end_line))
+        .collect();
+    output
+        .lines()
+        .filter(|l| l.contains("declaration uses 'sorry'") || l.contains("declaration uses `sorry`"))
+        .any(|l| {
+            let line_no = l
+                .split(": warning:")
+                .next()
+                .and_then(|head| head.rsplitn(3, ':').nth(1))
+                .and_then(|n| n.trim().parse::<usize>().ok());
+            line_no.is_none_or(|ln| ranges.is_empty() || ranges.iter().any(|&(a, b)| a <= ln && ln <= b))
+        })
+}
+
 /// Parse Lean's `#print axioms` replies (`'N' depends on axioms: [a, b]`, possibly wrapped over
 /// several lines, or `'N' does not depend on any axioms`) into `(N, axioms)` pairs.
 pub fn parse_print_axioms(out: &str) -> Vec<(String, Vec<String>)> {
