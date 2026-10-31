@@ -54,6 +54,8 @@ randomized. Use an idle machine and inspect the recorded loads for order bias.
 The runner creates two independent Git clones with no hard-linked objects or
 artifacts. No outputs are copied from A to B. `LEAN_NUM_THREADS` is inherited
 unchanged by both arms and recorded (null means unset).
+`ELAN_TOOLCHAIN` is set to the pinned checkout's toolchain for both arms;
+inherited Lean search paths are removed and turbo's toolchain fallback is disabled.
 
 For non-cold scenarios the runner first performs an untimed stock build in each
 arm, then an untimed B invocation to prime B's own persistent caches. Failure of

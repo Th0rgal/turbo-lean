@@ -83,6 +83,22 @@ def pair_record(index, stock, turbo):
             "parity": ("PASS" if stock["exit_code"] == 0 else "FAIL") if valid else "INVALID"}
 
 
+def parse_timing(timing, rc):
+    lines = timing.splitlines()
+    numbers = lines[-1].split() if lines else []
+    ok = rc not in (124, 126, 127) and 0 <= rc < 128
+    try:
+        wall, user, system, rss = map(float, numbers)
+        if not all(math.isfinite(v) and v >= 0 for v in (wall, user, system, rss)):
+            raise ValueError("invalid GNU time measurements")
+        ok = ok and wall > 0
+    except ValueError:
+        wall = user = system = rss = 0
+        ok = False
+    return {"wall_s": wall, "user_s": user, "system_s": system, "cpu_s": user + system,
+            "peak_rss_kib": int(rss), "exit_code": rc, "measurement_ok": ok}
+
+
 def write_report(report, output):
     invalid = any(p["parity"] == "INVALID" for s in report["scenarios"] for p in s["pairs"])
     for scenario in report["scenarios"]:
@@ -141,8 +157,10 @@ class Runner:
         self.token = uuid.uuid4().hex
         self.env = dict(os.environ, TURBO_LEAN_TELEMETRY="off", TURBO_LEAN_NO_WORKTREE_LINK="1",
                         TURBO_LEAN_NO_DAEMON="1", BENCH_CLIFV_RUN=self.token)
-        # Always override inherited cache locations and remote worker routing.
-        self.env.pop("TURBO_LEAN_REMOTE_HTTP", None)
+        # Override inherited search paths/cache locations and disable toolchain fallback.
+        for key in ("TURBO_LEAN_REMOTE_HTTP", "LEAN_PATH", "LEAN_SRC_PATH", "LEAN_SYSROOT"):
+            self.env.pop(key, None)
+        self.env["TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK"] = "0"
         self.cache = work / "turbo-cache"
         self.env["TURBO_LEAN_HOME"] = str(self.cache)
         self.turbo = str(Path(shutil.which(args.turbo) or args.turbo).resolve())
@@ -154,7 +172,7 @@ class Runner:
         self.temp.mkdir()
         self.env.update(TURBO_LEAN_STAGING_DIR=str(self.staging), TMPDIR=str(self.temp))
         help_result = subprocess.run([self.turbo, "daemon", "stop", "--help"], env=self.env,
-                                     capture_output=True, text=True)
+                                     capture_output=True, text=True, timeout=30)
         self.has_stop = help_result.returncode == 0 and "stop" in help_result.stdout.lower()
 
     def own_daemons(self):
@@ -224,22 +242,14 @@ class Runner:
                 raise
             finally:
                 self.stop_daemons()
-        numbers = timing.read_text().splitlines()[-1].split() if timing.exists() else []
-        ok = len(numbers) == 4 and rc not in (124, 126, 127) and 0 <= rc < 128
-        try:
-            wall, user, system, rss = map(float, numbers)
-            ok = ok and all(math.isfinite(v) and v >= 0 for v in (wall, user, system, rss)) and wall > 0
-        except ValueError:
-            wall = user = system = rss = 0
-            ok = False
-        return {"wall_s": wall, "user_s": user, "system_s": system, "cpu_s": user + system,
-                "peak_rss_kib": int(rss), "exit_code": rc, "measurement_ok": ok,
+        return {**parse_timing(timing.read_text() if timing.exists() else "", rc),
                 "command": command, "log": str(log.relative_to(self.output)),
                 "load_before": before, "load_after": list(os.getloadavg())}
 
     def prepare(self):
         source = self.work / "source"
-        subprocess.run(["git", "clone", "--no-checkout", self.args.repo, str(source)], check=True, env=self.env)
+        subprocess.run(["git", "clone", "--filter=blob:none", "--no-checkout", self.args.repo, str(source)],
+                       check=True, env=self.env)
         sha = capture(["git", "rev-parse", "--verify", self.args.sha + "^{commit}"], source, self.env)
         subprocess.run(["git", "checkout", "--detach", sha], cwd=source, check=True, env=self.env)
         self.original = (source / EDIT_FILE).read_text()
@@ -252,7 +262,9 @@ class Runner:
             subprocess.run(["git", "checkout", "--detach", sha], cwd=target, check=True, env=self.env)
             stat = (target / EDIT_FILE).stat()
             self.source_times[arm] = (stat.st_atime_ns, stat.st_mtime_ns)
-        return sha, (source / "lean-toolchain").read_text().strip()
+        toolchain = (source / "lean-toolchain").read_text().strip()
+        self.env["ELAN_TOOLCHAIN"] = toolchain
+        return sha, toolchain
 
     def baseline(self):
         # Prime Lake in BOTH arms. Prime turbo's persistent CAS separately, untimed.
@@ -353,7 +365,8 @@ def main(argv=None):
             "turbo_version": capture([runner.turbo, "--version"], work, turbo_env),
             "lean_version": capture([runner.lake, "env", "lean", "--version"], work / "stock", turbo_env),
             "environment_overrides": {k: runner.env[k] for k in ("TURBO_LEAN_TELEMETRY", "TURBO_LEAN_HOME",
-                "TURBO_LEAN_STAGING_DIR", "TURBO_LEAN_NO_DAEMON", "TURBO_LEAN_NO_WORKTREE_LINK", "TMPDIR")},
+                "TURBO_LEAN_STAGING_DIR", "TURBO_LEAN_NO_DAEMON", "TURBO_LEAN_NO_WORKTREE_LINK",
+                "TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK", "TMPDIR", "ELAN_TOOLCHAIN")},
             "daemon_stop": "command + owned-worker cleanup" if runner.has_stop else "owned-process cleanup"})
         if any(s != "cold" for s in args.scenarios):
             runner.baseline()
@@ -366,26 +379,38 @@ def main(argv=None):
                     runner.reset(arm, scenario)
                     results[arm] = runner.run(arm, f"{scenario}-{index}")
                 entry["pairs"].append(pair_record(index, **results))
-                entry["summary"] = summarize(entry["pairs"])
                 report["machine"]["load_after"] = list(os.getloadavg())
                 write_report(report, output)
         report["status"] = "complete"
     finally:
-        runner.stop_daemons()
-        shutil.rmtree(runner.staging)
-        report["machine"]["load_after"] = list(os.getloadavg())
-        if report["status"] != "complete":
+        try:
+            runner.stop_daemons()
+        except BaseException:
             report["status"] = "aborted"
-        # An interrupted pair never enters the report as a valid pair.
-        report["scenarios"] = [s for s in report["scenarios"] if s["pairs"]]
-        write_report(report, output)
+            raise
+        finally:
+            shutil.rmtree(runner.staging, ignore_errors=True)
+            report["machine"]["load_after"] = list(os.getloadavg())
+            if report["status"] != "complete":
+                report["status"] = "aborted"
+            # An interrupted pair never enters the report as a valid pair.
+            report["scenarios"] = [s for s in report["scenarios"] if s["pairs"]]
+            write_report(report, output)
     print(f"Reports: {output / 'results.json'} and {output / 'results.md'}")
     return 2 if any(p["parity"] == "INVALID" for s in report["scenarios"] for p in s["pairs"]) else 0
 
 
 if __name__ == "__main__":
+    def interrupt(signum, _frame):
+        raise KeyboardInterrupt(f"signal {signum}")
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, interrupt)
     try:
         sys.exit(main())
-    except (ValueError, RuntimeError, subprocess.SubprocessError) as error:
+    except KeyboardInterrupt:
+        print("bench_clifv: interrupted", file=sys.stderr)
+        sys.exit(130)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         print(f"bench_clifv: {error}", file=sys.stderr)
         sys.exit(1)
