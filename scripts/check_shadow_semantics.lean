@@ -64,7 +64,7 @@ def checkerPath : String := "scripts/check_shadow_semantics.lean"
 /-- Self-test fixture namespaces (compiled only in the `ShadowFixtures` lib). -/
 def fixtureNamespaces : List Name :=
   [`ShadowFixtureDirect, `ShadowFixtureClone, `ShadowFixtureBitVec, `ShadowFixtureAllowlisted,
-   `ShadowFixtureHelperClone]
+   `ShadowFixtureHelperClone, `ShadowFixtureTraversal]
 
 structure Inventory where
   modules : List Name
@@ -565,6 +565,100 @@ def checkRatchet (repo : System.FilePath) (base : String) (inv : Inventory)
 
 /-! ## Self-test -/
 
+def allowJson (vs : List Violation) : String :=
+  (Json.mkObj [("schema", (1 : Nat)), ("entries", Json.arr (vs.toArray.map fun v =>
+    Json.mkObj [("target", toString v.target), ("forbidden", toString v.forbidden),
+                ("kind", v.kind)]))]).pretty ++ "\n"
+
+def invJson (nss : List String) : String :=
+  (Json.mkObj [("modules", Json.arr #[]), ("namespaces", Json.arr (nss.toArray.map Json.str)),
+               ("source_roots", Json.arr #[])]).pretty ++ "\n"
+
+/-- Fresh git repository whose single commit contains `baseFiles`, with
+    `scripts/shadow_allowlist.json` then overwritten in the working tree by `curAllow`.
+    Returns the repository and the base commit SHA. -/
+def mkRatchetRepo (baseFiles : List (String × String)) (curAllow : String) :
+    IO (System.FilePath × String) := do
+  let dir ← IO.FS.createTempDir
+  let run (args : Array String) : IO String := do
+    -- hermetic: ignore global / system / injected (`GIT_CONFIG_COUNT`) config (signing, hooks)
+    let env : Array (String × Option String) :=
+      #[("GIT_CONFIG_GLOBAL", some "/dev/null"), ("GIT_CONFIG_NOSYSTEM", some "1"),
+        ("GIT_CONFIG_COUNT", some "0")]
+    let out ← IO.Process.output { cmd := "git", args := args, cwd := some dir, env := env }
+    unless out.exitCode == 0 do
+      throw <| IO.userError s!"ratchet test: git {args} failed: {out.stderr}"
+    return out.stdout.trimAscii.toString
+  discard <| run #["init", "-q"]
+  IO.FS.createDirAll (dir / "scripts")
+  IO.FS.writeFile (dir / "README") "ratchet fixture\n"
+  for (p, c) in baseFiles do IO.FS.writeFile (dir / p) c
+  discard <| run #["add", "-A"]
+  discard <| run #["-c", "user.name=shadow", "-c", "user.email=shadow@localhost",
+    "-c", "commit.gpgsign=false", "commit", "-q", "-m", "base"]
+  let sha ← run #["rev-parse", "HEAD"]
+  IO.FS.writeFile (dir / allowlistPath) curAllow
+  return (dir, sha)
+
+/-- Ratchet fixtures: every case calls the real `checkRatchet` against a real base revision. -/
+def ratchetTests (fixtureVs : Array Violation) : IO (Array String) := do
+  let pick (t : Name) : List Violation :=
+    (fixtureVs.filter (·.target == t)).toList
+  let first := pick `ShadowFixtureAllowlisted.first
+  let helper := pick `ShadowFixtureAllowlisted.helper
+  let second := pick `ShadowFixtureAllowlisted.second
+  if first.isEmpty || helper.isEmpty || second.isEmpty then
+    return #["ratchet tests: ShadowFixtureAllowlisted fixtures not detected (vacuous)"]
+  let inv : Inventory := { modules := [], namespaces := [`ShadowFixtureAllowlisted], sourceRoots := [] }
+  let checker := (checkerPath, "-- checker present at base\n")
+  let fakeV : Violation := { target := `X.y, forbidden := `LeanNative.Semantics.evalExpr, kind := "call∞" }
+  -- (name, base files, working-tree allowlist, violations, inventory, substrings that must ALL
+  --  occur in ONE reported error — empty list = must pass with no error)
+  let cases : List (String × List (String × String) × String × List Violation × Inventory × List String) := [
+    ("clean: allowlist == base == violations → pass",
+      [checker, (allowlistPath, allowJson (first ++ helper)), (inventoryPath, invJson ["ShadowFixtureAllowlisted"])],
+      allowJson (first ++ helper), first ++ helper, inv, []),
+    ("allowlisted-second: new violation in an allowlisted namespace → fail",
+      [checker, (allowlistPath, allowJson (first ++ helper))],
+      allowJson (first ++ helper), first ++ helper ++ second, inv,
+      [s!"NEW violation not in base allowlist: {(second.head!).key}"]),
+    ("allowlist addition (even of a real violation) → fail",
+      [checker, (allowlistPath, allowJson first)],
+      allowJson (first ++ helper), first ++ helper, inv,
+      ["allowlist ADDS entry not in base", s!": {(helper.head!).key}"]),
+    ("allowlist addition of a fake entry → fail",
+      [checker, (allowlistPath, allowJson first)],
+      allowJson (first ++ [fakeV]), first, inv,
+      ["allowlist ADDS entry not in base", s!": {fakeV.key}"]),
+    ("stale entry (violation fixed, entry kept) → fail",
+      [checker, (allowlistPath, allowJson (first ++ helper))],
+      allowJson (first ++ helper), first, inv,
+      [s!"stale allowlist entry (violation gone; remove it): {(helper.head!).key}"]),
+    ("entry removed together with its violation → pass",
+      [checker, (allowlistPath, allowJson (first ++ helper))],
+      allowJson first, first, inv, []),
+    ("inventory drops a base namespace → fail",
+      [checker, (allowlistPath, allowJson first), (inventoryPath, invJson ["ShadowFixtureAllowlisted", "Dropped"])],
+      allowJson first, first, inv, ["inventory drops base namespace Dropped"]),
+    ("base has the checker but no allowlist → fail",
+      [checker], allowJson first, first, inv, ["has the checker but no"]),
+    ("bootstrap: allowlist == violations → pass",
+      [], allowJson (first ++ helper), first ++ helper, inv, []),
+    ("bootstrap: extra allowlist entry → fail",
+      [], allowJson (first ++ [fakeV]), first, inv, ["allowlist ADDS entry not in base", s!": {fakeV.key}"])]
+  let mut errs := #[]
+  for (label, baseFiles, cur, vs, inv', expected) in cases do
+    let (dir, sha) ← mkRatchetRepo baseFiles cur
+    let got ← try checkRatchet dir sha inv' vs.toArray
+      catch e => pure #[s!"exception: {e}"]
+    IO.FS.removeDirAll dir
+    let ok := if expected.isEmpty then got.isEmpty
+      else got.any fun g => expected.all fun x => (g.splitOn x).length > 1
+    IO.println s!"[self-test] ratchet {if ok then "ok  " else "FAIL"} {label}{if got.isEmpty then "" else s!" — {got.toList}"}"
+    unless ok do
+      errs := errs.push s!"ratchet case `{label}`: expected {if expected.isEmpty then "pass" else s!"{expected}"}, got {got.toList}"
+  return errs
+
 def selfTest (env : Environment) (leanDir : System.FilePath) : IO (Array String) := do
   let inv : Inventory := { modules := [], namespaces := fixtureNamespaces, sourceRoots := [] }
   let r ← analyze env leanDir inv
@@ -589,27 +683,45 @@ def selfTest (env : Environment) (leanDir : System.FilePath) : IO (Array String)
     errs := errs.push "fixture bitvec-only: expected no violation in ShadowFixtureBitVec"
   unless r.targets.any (fun t => (`ShadowFixtureBitVec).isPrefixOf (userName t)) do
     errs := errs.push "fixture bitvec-only: namespace not inventoried (vacuous pass)"
-  -- (4) second violation in an allowlisted namespace → ratchet fails
-  let allow : Std.HashSet String :=
-    ({} : Std.HashSet String).insert
-      s!"ShadowFixtureAllowlisted.first|LeanNative.Semantics.evalBinOp|call≤3"
-  let fixtureVs := r.violations.filter fun v => (`ShadowFixtureAllowlisted).isPrefixOf v.target
-  let newVs := fixtureVs.filter fun v => !allow.contains v.key
-  unless fixtureVs.any (·.key == s!"ShadowFixtureAllowlisted.first|LeanNative.Semantics.evalBinOp|call≤3") do
-    errs := errs.push "fixture allowlisted-second: allowlisted `first` violation not detected"
-  unless newVs.any (fun v => v.target == `ShadowFixtureAllowlisted.second &&
-      v.forbidden == `LeanNative.Semantics.evalUnaryOp && v.kind == "call≤3") do
-    errs := errs.push "fixture allowlisted-second: ratchet did not flag `second` (2 hops) as new"
-  -- ratchet subset logic on synthetic allowlists
-  let fakeBase : List AllowEntry := [{ target := "A", forbidden := "B", kind := "clone" }]
-  let fakeCur : List AllowEntry := fakeBase ++ [{ target := "C", forbidden := "D", kind := "call∞" }]
-  let baseKeys : Std.HashSet String := fakeBase.foldl (·.insert ·.key) {}
-  unless fakeCur.any (fun a => !baseKeys.contains a.key) do
-    errs := errs.push "ratchet: allowlist addition not detected"
+  -- (5) traversal classes: each fixture asserts (target, forbidden evaluator, kind) and, where the
+  --     class is isolated, that the witness path goes through the expected intermediate constant.
+  let travel : List (Name × Name × String × Option Name × String) := [
+    (`ShadowFixtureTraversal.deep, `LeanNative.Semantics.evalBinOp, "call∞",
+      some `UnrelatedTraversal.h4, "call∞ through 5 hops"),
+    (`ShadowFixtureTraversal.viaInstance, `LeanNative.Semantics.evalBinOp, "call≤3",
+      some `UnrelatedTraversal.instDenoteBinOp, "synthesized instance"),
+    (`ShadowFixtureTraversal.viaImplementedBy, `LeanNative.Semantics.evalUnaryOp, "call≤3",
+      some `UnrelatedTraversal.unaryImpl, "implemented_by"),
+    (`ShadowFixtureTraversal.viaMacro, `LeanNative.Semantics.evalBinOp, "call≤3",
+      none, "macro-expanded call"),
+    (`ShadowFixtureTraversal.viaUnsafeRec, `LeanNative.Semantics.evalUnaryOp, "call≤3",
+      some `ShadowFixtureTraversal.viaUnsafeRec._unsafe_rec, "_unsafe_rec auxiliary only"),
+    (`ShadowFixtureTraversal.viaProofAux, `LeanNative.Semantics.evalBinOp, "call≤3",
+      none, "proof auxiliary only (_proof_n)"),
+    (`ShadowFixtureTraversal.viaMatcher, `LeanNative.Semantics.evalBinOp, "call≤3",
+      none, "matcher auxiliary"),
+    (`ShadowFixtureTraversal.viaInductive, `LeanNative.Semantics.evalBinOp, "call≤3",
+      some `UnrelatedTraversal.AddsTo, "inductive → ctor/recursor types")]
+  for (t, f, k, via?, label) in travel do
+    match r.violations.find? fun v => v.target == t && v.forbidden == f && v.kind == k with
+    | none => errs := errs.push s!"fixture traversal [{label}]: expected {t} → {f} ({k})"
+    | some v =>
+      if let some via := via? then
+        unless v.path.contains via do
+          errs := errs.push s!"fixture traversal [{label}]: witness {v.path} does not pass through {via}"
+  -- `viaProofAux`'s only forbidden mention lives in an abstracted `_proof_n` auxiliary
+  if let some v := r.violations.find? (·.target == `ShadowFixtureTraversal.viaProofAux) then
+    unless v.path.any (fun n => match n with | .str _ s => s.startsWith "_proof_" | _ => false) do
+      errs := errs.push s!"fixture traversal [proof aux]: witness {v.path} skips the `_proof_n` auxiliary"
+  -- untargeted helpers in `UnrelatedTraversal` must not be reported themselves
+  if r.violations.any (fun v => (`UnrelatedTraversal).isPrefixOf v.target) then
+    errs := errs.push "fixture traversal: un-inventoried helper namespace reported as a target"
+  -- (4) + ratchet: the REAL `checkRatchet` against a temporary git repository
+  errs := errs ++ (← ratchetTests r.violations)
   -- forbidden set sanity: auxiliaries are forbidden
   unless isForbidden `LeanNative.Semantics.evalBinOp.match_1 && !isForbidden `LeanNative.Semantics.Val.toU256? do
     errs := errs.push "forbidden-set predicate wrong"
-  IO.println s!"[self-test] {if errs.isEmpty then "PASS" else "FAIL"}: direct-call→fail, verbatim-clone→fail, bitvec-only→pass, allowlisted-second→fail"
+  IO.println s!"[self-test] {if errs.isEmpty then "PASS" else "FAIL"}: direct-call, verbatim-clone, helper-clone, bitvec-only, {travel.length} traversal classes, ratchet cases"
   return errs
 
 /-! ## Driver -/
