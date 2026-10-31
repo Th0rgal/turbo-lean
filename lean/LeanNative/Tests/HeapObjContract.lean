@@ -351,13 +351,21 @@ def Fn.storesTo (f : Fn) (slot : String) : List String :=
       if a == slot && !(match toks prev with | d :: "=" :: "alloca" :: _ => d == slot | _ => false) then some v else none
     | _ => none
 
+/-- Rejecting origin of a reload of a slot that has no store besides its initialising one: it is not an SSA
+    name, so it is never a parameter, a box, or a guarded load. -/
+def uninitOrigin : String := "<uninit>"
+
 /-- Origins of SSA value `x`: follow slot reloads, `phi`, and value-preserving casts
-    (`zext`/`sext`/`bitcast`, plus `and _, 1` when `bool1` holds, i.e. `Bool` normalisation). -/
+    (`zext`/`sext`/`bitcast`, plus `and _, 1` when `bool1` holds, i.e. `Bool` normalisation). A reload of a slot
+    with only its initialising store contributes `uninitOrigin`, so it never yields an empty origin list. -/
 def Fn.origins (f : Fn) (bool1 : Bool) : Nat → String → List String
   | 0, x => [x]
   | n + 1, x => match f.defOf x with
     | some (["load", _, "ptr", a, "align", _], _) | some (["load", _, "ptr", a], _) =>
-      if f.isSlot a then ((f.storesTo a).flatMap (f.origins bool1 n)).eraseDups else [x]
+      if f.isSlot a then match f.storesTo a with
+        | [] => [uninitOrigin]
+        | vs => (vs.flatMap (f.origins bool1 n)).eraseDups
+      else [x]
     | some ("phi" :: _ :: ins, _) =>
       ((ins.zipIdx.filterMap fun (v, i) => if i % 2 == 0 then some v else none).flatMap (f.origins bool1 n)).eraseDups
     | some ([c, _, v, "to", _], _) =>
@@ -369,9 +377,12 @@ def Fn.origins (f : Fn) (bool1 : Bool) : Nat → String → List String
 def Fn.retOrigins (f : Fn) : List String :=
   (f.insts.filterMap fun l => match toks l with | ["ret", _, v] => some v | _ => none).flatMap (f.origins false 64)
 
-/-- `v` carries the value of parameter `arg`: **every** origin of `v` (through slot reloads, `phi` and
-    value-preserving casts) is `arg`. A `phi` joining `arg` with a constant or another value is rejected. -/
-def Fn.carries (f : Fn) (arg v : String) : Bool := (f.origins true 64 v).all (· == arg)
+/-- `v` carries the value of parameter `arg`: `v` has at least one origin and **every** origin of `v` (through
+    slot reloads, `phi` and value-preserving casts) is `arg`. A `phi` joining `arg` with a constant, another value,
+    or a reload of an initialisation-only slot is rejected. -/
+def Fn.carries (f : Fn) (arg v : String) : Bool :=
+  let os := f.origins true 64 v
+  !os.isEmpty && os.all (· == arg)
 
 /-- `call … @name(args)` ⇒ `(name, args)`. -/
 def callOf (ts : List String) : Option (String × List String) :=
@@ -527,6 +538,16 @@ def heapOK (body : String) : Bool := IRCheck.heapBoxCarries (bxIR body) "bx" "%a
   "  store i64 %arg_v0, ptr %f, align 8\n  ret ptr %o\n")
 #guard !heapOK ("  %o = call ptr @lean_alloc_ctor(i32 0, i32 1, i32 8)\n" ++
   "  call void @lean_ctor_set_uint64(ptr %o, i32 0, i64 %arg_v0)\n  ret ptr %o\n")
+-- self-test (quorum r4): provenance must be non-empty — a reload of a slot whose only store is its initialising
+-- one (boxes `0`) is rejected, and so is a `phi` joining the parameter with such a reload.
+#guard !heapOK ("  %slot = alloca i64, align 8\n  store i64 0, ptr %slot, align 8\n" ++
+  "  %v = load i64, ptr %slot, align 8\n  %b = call ptr @lean_box_uint64(i64 %v)\n  ret ptr %b\n")
+#guard !heapOK ("  %slot = alloca i64, align 8\n  store i64 0, ptr %slot, align 8\n  br label %j\nb:\n" ++
+  "  %u = load i64, ptr %slot, align 8\n  br label %j\nj:\n  %v = phi i64 [ %arg_v0, %entry ], [ %u, %b ]\n" ++
+  "  %r = call ptr @lean_box_uint64(i64 %v)\n  ret ptr %r\n")
+-- while a reload of a slot that is (re)stored with the parameter after initialisation is still accepted.
+#guard heapOK ("  %slot = alloca i64, align 8\n  store i64 0, ptr %slot, align 8\n  store i64 %arg_v0, ptr %slot, align 8\n" ++
+  "  %v = load i64, ptr %slot, align 8\n  %b = call ptr @lean_box_uint64(i64 %v)\n  ret ptr %b\n")
 -- and the layout offset is honoured: with one object field the payload at 16 / field-area offset 8 is accepted;
 -- a `phi` whose every incoming value is the parameter (through a cast) is accepted.
 #guard heapOK ("  %o = call ptr @lean_alloc_ctor(i32 0, i32 1, i32 8)\n  %f = getelementptr i8, ptr %o, i64 16\n" ++
