@@ -13,8 +13,6 @@ use crate::pack::{
     CheckShardsBatchResponse, DeltaManifest, ExportDeltaRequest, FastCheckHttpRequest,
     FASTCHECK_NO_MAIN_SUFFIX, FASTCHECK_PRELUDE_HARNESS,
 };
-#[cfg(not(test))]
-use crate::zygote::eval_with_zygote_pool;
 use crate::zygote::LocalZygoteDaemonInfo;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
@@ -23,6 +21,67 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::Command;
+
+struct ServerActivity {
+    last_completed: std::time::Instant,
+    active: usize,
+}
+
+impl ServerActivity {
+    fn admit(&mut self) -> bool {
+        if self.active >= 64 {
+            return false;
+        }
+        self.active += 1;
+        true
+    }
+
+    fn complete(&mut self, now: std::time::Instant) {
+        self.last_completed = now;
+        self.active -= 1;
+    }
+
+    fn expired(&self, now: std::time::Instant, ttl: Option<std::time::Duration>) -> bool {
+        self.active == 0 && ttl.is_some_and(|ttl| now.duration_since(self.last_completed) >= ttl)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServerActivity;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn admission_and_expiry_share_one_state_machine() {
+        let start = Instant::now();
+        let ttl = Duration::from_secs(1);
+        let boundary = start + ttl;
+        let mut state = ServerActivity {
+            last_completed: start,
+            active: 0,
+        };
+        assert!(!state.expired(boundary - Duration::from_nanos(1), Some(ttl)));
+        assert!(state.expired(boundary, Some(ttl)));
+        // accept runs before the expiry check under the same lock. A connection
+        // admitted exactly at the boundary must prevent shutdown, however long it runs.
+        assert!(state.admit());
+        assert!(!state.expired(boundary, Some(ttl)));
+        assert!(!state.expired(boundary + ttl * 10, Some(ttl)));
+        assert!(state.admit());
+        state.complete(boundary + ttl * 10);
+        assert!(!state.expired(boundary + ttl * 20, Some(ttl)));
+        let completed = boundary + ttl * 20;
+        state.complete(completed);
+        assert!(!state.expired(completed + ttl - Duration::from_nanos(1), Some(ttl)));
+        assert!(state.expired(completed + ttl, Some(ttl)));
+        assert!(!state.expired(completed + ttl, None));
+        for _ in 0..64 {
+            assert!(state.admit());
+        }
+        assert!(!state.admit());
+        assert_eq!(state.active, 64);
+    }
+}
 
 fn is_loopback_listen_addr(addr: &str) -> bool {
     let trimmed = addr.trim();
@@ -160,6 +219,7 @@ pub fn serve_cas_http_with_auth(
             let _ = libc::syscall(libc::SYS_close_range, 3usize, !0u32 as usize, 0usize);
         }
     }
+    let startup_lifecycle = crate::zygote::lifecycle_lock(false)?;
     let listener = TcpListener::bind(listen_addr)
         .with_context(|| format!("Failed to bind turbo-lean server on {}", listen_addr))?;
     if let Ok(state_path) = std::env::var("TURBO_LEAN_DAEMON_STATE_FILE") {
@@ -200,8 +260,10 @@ pub fn serve_cas_http_with_auth(
             .map(|(_, _, _, b)| ((init_dv, local_mutation_seq), b));
     let cached_export: Option<((i64, u64), Vec<u8>)> = None;
 
+    // Automatic daemons warm workers on demand. A detached prewarm could still spawn
+    // children and recreate staging while the idle watchdog was shutting them down.
     #[cfg(not(test))]
-    {
+    if !is_daemon {
         let store_root_owned = store_root.map(|p| p.to_path_buf());
         let prewarm = std::thread::spawn(move || {
             if let Ok(bg_store) = TurboStore::open(store_root_owned.as_deref()) {
@@ -237,7 +299,7 @@ pub fn serve_cas_http_with_auth(
                         let bin_ref = &lean_bin;
                         let h1 = s.spawn(move || {
                             if let Ok(st1) = TurboStore::open(root_ref) {
-                                let _ = eval_with_zygote_pool(
+                                let _ = crate::zygote::eval_with_zygote_pool(
                                     &st1,
                                     "leanprover/lean4:v4.35.0",
                                     lp_ref,
@@ -250,7 +312,7 @@ pub fn serve_cas_http_with_auth(
                         });
                         let h2 = s.spawn(move || {
                             if let Ok(st2) = TurboStore::open(root_ref) {
-                                let _ = eval_with_zygote_pool(
+                                let _ = crate::zygote::eval_with_zygote_pool(
                                     &st2,
                                     "leanprover/lean4:v4.35.0",
                                     lp_ref,
@@ -269,9 +331,7 @@ pub fn serve_cas_http_with_auth(
                     crate::pack::prewarm_shared_fastcheck_harness(&bg_store, &lean_bin, &env_vars);
             }
         });
-        if std::env::var("TURBO_LEAN_DAEMON").is_err() {
-            let _ = prewarm.join();
-        }
+        let _ = prewarm.join();
     }
     println!(
         "{{\"status\":\"listening\",\"addr\":\"{}\",\"arch\":\"{}\",\"gpu_enabled\":{}}}",
@@ -297,46 +357,64 @@ pub fn serve_cas_http_with_auth(
     }));
     let store_root_buf = store_root.map(|p| p.to_path_buf());
     let expected_token = resolved_token;
-    let active_conns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let last_activity_secs =
-        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(now_unix().max(0) as u64));
+    // Count requests and update a monotonic idle clock under one lock: a long request
+    // receives a full idle period after completion, and expiry cannot race request entry.
+    let activity = std::sync::Arc::new(std::sync::Mutex::new(ServerActivity {
+        last_completed: std::time::Instant::now(),
+        active: 0,
+    }));
 
-    if std::env::var("TURBO_LEAN_DAEMON").is_ok() {
-        let idle_timeout_secs = std::env::var("TURBO_LEAN_DAEMON_IDLE_SECS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(300);
-        if idle_timeout_secs > 0 {
-            let active_watch = active_conns.clone();
-            let last_watch = last_activity_secs.clone();
-            let root_watch = store_root_buf.clone();
-            std::thread::spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_secs(15));
-                let now_s = now_unix().max(0) as u64;
-                let last_s = last_watch.load(std::sync::atomic::Ordering::Relaxed);
-                let active = active_watch.load(std::sync::atomic::Ordering::Relaxed);
-                if active == 0 && now_s.saturating_sub(last_s) >= idle_timeout_secs {
-                    let _ = crate::zygote::reap_zygote_workers_and_daemons(root_watch.as_deref());
-                    std::process::exit(0);
+    let idle_timeout = is_daemon
+        .then(|| {
+            std::env::var("TURBO_LEAN_DAEMON_IDLE_SECS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(900)
+        })
+        .filter(|secs| *secs > 0)
+        .map(std::time::Duration::from_secs);
+    drop(startup_lifecycle);
+    listener.set_nonblocking(true)?;
+    let mut listener = Some(listener);
+    loop {
+        // Admission and expiry have one owner and one lock. No accepted connection can
+        // be waiting for this lock when we decide to close the listening socket.
+        let mut state = activity.lock().unwrap();
+        let mut stream = match listener.as_ref().unwrap().accept() {
+            Ok((stream, _)) => stream,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if state.expired(std::time::Instant::now(), idle_timeout) {
+                    // Closing refuses any connections queued after accept returned WouldBlock.
+                    // Withdraw every discovery file before committing to shutdown.
+                    drop(listener.take());
+                    let lifecycle = crate::zygote::lifecycle_exclusive_lock()?;
+                    for key in [
+                        "TURBO_LEAN_DAEMON_STATE_FILE",
+                        "TURBO_LEAN_DAEMON_PARENT_STATE_FILE",
+                    ] {
+                        if let Some(path) = std::env::var_os(key) {
+                            let _ = fs::remove_file(path);
+                        }
+                    }
+                    let _ = fs::remove_file(
+                        shared.lock().unwrap().store.root.join("zygote_daemon.json"),
+                    );
+                    drop(state);
+                    crate::zygote::shutdown_local_daemon(&lifecycle);
+                    break;
                 }
-            });
-        }
-    }
-
-    for stream in listener.incoming() {
-        let mut stream = match stream {
-            Ok(s) => s,
-            Err(_) => continue,
+                drop(state);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
+            Err(e) => return Err(e.into()),
         };
-        last_activity_secs.store(
-            now_unix().max(0) as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        let _ = stream.set_nonblocking(false);
         let _ = stream.set_nodelay(true);
         let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
         let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
-
-        if active_conns.load(std::sync::atomic::Ordering::Relaxed) >= 64 {
+        if !state.admit() {
+            drop(state);
             let _ = write_http_response(
                 &mut stream,
                 503,
@@ -345,20 +423,25 @@ pub fn serve_cas_http_with_auth(
             );
             continue;
         }
-        active_conns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let active_guard = active_conns.clone();
+        drop(state);
+        let activity_guard = activity.clone();
         let shared_ref = shared.clone();
         let store_root_clone = store_root_buf.clone();
         let expected_token_clone = expected_token.clone();
 
         std::thread::spawn(move || {
-            struct ConnDropGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+            struct ConnDropGuard(std::sync::Arc<std::sync::Mutex<ServerActivity>>);
             impl Drop for ConnDropGuard {
                 fn drop(&mut self) {
-                    self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    let mut state = self.0.lock().unwrap();
+                    state.complete(std::time::Instant::now());
                 }
             }
-            let _conn_guard = ConnDropGuard(active_guard);
+            let _conn_guard = ConnDropGuard(activity_guard);
+            let request_started = std::time::Instant::now();
+            let Ok(_lifecycle) = crate::zygote::lifecycle_lock(false) else {
+                return;
+            };
 
             let mut req_line = String::new();
             let mut content_len = 0usize;
@@ -405,6 +488,9 @@ pub fn serve_cas_http_with_auth(
                     return;
                 }
             }
+            let request_timeout_ms = serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("timeout_ms").and_then(|v| v.as_u64()));
             let parts: Vec<&str> = req_line.split_whitespace().collect();
             if parts.len() < 2 {
                 return;
@@ -743,6 +829,7 @@ pub fn serve_cas_http_with_auth(
                         &mut req_store,
                         &req,
                         shard_domain,
+                        request_timeout_ms,
                     ) {
                         Ok((val, deferred_pub, deferred_hit)) => {
                             if let Some((tc, items)) = deferred_pub {
@@ -779,7 +866,11 @@ pub fn serve_cas_http_with_auth(
                     let Ok(mut req_store) = TurboStore::open(store_root_clone.as_deref()) else {
                         return;
                     };
-                    match execute_check_shards_batch_payload_deferred(&mut req_store, &req) {
+                    match execute_check_shards_batch_payload_deferred(
+                        &mut req_store,
+                        &req,
+                        request_timeout_ms,
+                    ) {
                         Ok((resp, deferred_pub, deferred_hits)) => {
                             if let Some((tc, td, items)) = deferred_pub {
                                 let _ = req_store.batch_publish_theorem_shards(&tc, &td, &items);
@@ -913,7 +1004,13 @@ pub fn serve_cas_http_with_auth(
                         false,
                         true,
                         req.file_name.as_deref(),
-                        req.timeout_ms,
+                        Some(crate::zygote::remaining_timeout_ms(
+                            req.timeout_ms
+                                .filter(|ms| *ms > 0)
+                                .or_else(crate::zygote::invocation_timeout_ms)
+                                .or(Some(900_000)),
+                            request_started,
+                        )),
                         &filtered_eval_args,
                     ) {
                         Ok(zreply) => {
@@ -933,9 +1030,20 @@ pub fn serve_cas_http_with_auth(
                                     } else {
                                         cmd.env_remove("LEAN_PATH");
                                     }
-                                    if let Ok(out) = cmd.output() {
-                                        deterministic = out.status.success() == zreply.ok;
-                                    }
+                                    let budget = req
+                                        .timeout_ms
+                                        .filter(|ms| *ms > 0)
+                                        .or_else(crate::zygote::invocation_timeout_ms)
+                                        .or(Some(900_000));
+                                    deterministic = crate::zygote::run_lean_command(
+                                        &mut cmd,
+                                        Some(crate::zygote::remaining_timeout_ms(
+                                            budget,
+                                            request_started,
+                                        )),
+                                    )
+                                    .map(|out| out.status.success() == zreply.ok)
+                                    .unwrap_or(false);
                                     let _ = fs::remove_file(&tmp_eval);
                                 }
                             }
@@ -1235,6 +1343,7 @@ fn run_lean_temp_file(
     audit: &std::collections::HashSet<String>,
     allowed: &[String],
     lean_args: &[String],
+    timeout_ms: Option<u64>,
 ) -> Result<(i32, String, String)> {
     let staging = store.fast_staging_dir();
     let tmp = staging.join(format!("{}_{}.lean", prefix, next_tmp_id()));
@@ -1252,10 +1361,9 @@ fn run_lean_temp_file(
     if !toolchain.is_empty() && toolchain != "unknown" && !env_vars.contains_key("ELAN_TOOLCHAIN") {
         cmd.env("ELAN_TOOLCHAIN", toolchain.trim());
     }
-    let out = cmd
-        .output()
-        .context("Failed to execute `lean` on remote shard payload")?;
+    let out = crate::zygote::run_lean_command(&mut cmd, timeout_ms);
     let _ = fs::remove_file(&tmp);
+    let out = out.context("Failed to execute `lean` on remote shard payload")?;
     let mut code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -1336,6 +1444,7 @@ fn execute_check_shard_payload_deferred_with_domain(
     store: &mut TurboStore,
     req: &CheckShardHttpRequest,
     trust_domain: &str,
+    timeout_ms: Option<u64>,
 ) -> Result<(
     serde_json::Value,
     Option<(String, Vec<(String, String, Vec<u8>, i64)>)>,
@@ -1463,7 +1572,7 @@ fn execute_check_shard_payload_deferred_with_domain(
     let filtered_req_args = crate::module_builder::filter_allowed_lean_args(&req.lean_args);
     let req_args_digest_opt = crate::module_builder::compute_lean_args_digest(&filtered_req_args);
 
-    match crate::zygote::eval_with_zygote_pool_with_args(
+    match crate::zygote::eval_with_zygote_pool_opts_with_args(
         store,
         toolchain,
         &req.lean_path,
@@ -1471,6 +1580,9 @@ fn execute_check_shard_payload_deferred_with_domain(
         &lean_bin,
         &req.shard_source,
         true,
+        false,
+        None,
+        Some(crate::zygote::remaining_timeout_ms(timeout_ms, t0)),
         &filtered_req_args,
     ) {
         Ok(zreply) if zreply.import_ok => {
@@ -1525,6 +1637,7 @@ fn execute_check_shard_payload_deferred_with_domain(
             &audit_set,
             &req_allowed,
             &filtered_req_args,
+            Some(crate::zygote::remaining_timeout_ms(timeout_ms, t0)),
         )?;
         if code != 0 {
             anyhow::bail!(
@@ -1594,7 +1707,7 @@ pub(crate) fn execute_check_shard_payload(
     req: &CheckShardHttpRequest,
 ) -> Result<serde_json::Value> {
     let (val, deferred, deferred_hit) =
-        execute_check_shard_payload_deferred_with_domain(store, req, "trusted")?;
+        execute_check_shard_payload_deferred_with_domain(store, req, "trusted", None)?;
     if let Some((tc, items)) = deferred {
         store.batch_publish_theorem_shards(&tc, "trusted", &items)?;
     }
@@ -1607,6 +1720,7 @@ pub(crate) fn execute_check_shard_payload(
 fn execute_check_shards_batch_payload_deferred(
     store: &mut TurboStore,
     req: &CheckShardsBatchRequest,
+    timeout_ms: Option<u64>,
 ) -> Result<(
     CheckShardsBatchResponse,
     Option<(String, String, Vec<(String, String, Vec<u8>, i64)>)>,
@@ -1732,7 +1846,7 @@ fn execute_check_shards_batch_payload_deferred(
     let batch_args_digest_opt =
         crate::module_builder::compute_lean_args_digest(&filtered_batch_args);
 
-    if let Ok(zreply) = crate::zygote::eval_with_zygote_pool_with_args(
+    if let Ok(zreply) = crate::zygote::eval_with_zygote_pool_opts_with_args(
         store,
         toolchain,
         &req.lean_path,
@@ -1740,6 +1854,9 @@ fn execute_check_shards_batch_payload_deferred(
         &lean_bin,
         &effective_batch_source,
         true,
+        false,
+        None,
+        Some(crate::zygote::remaining_timeout_ms(timeout_ms, t0)),
         &filtered_batch_args,
     ) {
         if zreply.import_ok {
@@ -1784,6 +1901,7 @@ fn execute_check_shards_batch_payload_deferred(
             &batch_audit,
             &req_allowed,
             &filtered_batch_args,
+            Some(crate::zygote::remaining_timeout_ms(timeout_ms, t0)),
         )?;
         exit_code = code;
         stdout = out;

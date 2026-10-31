@@ -256,9 +256,9 @@ pub fn govern_machine_wide_zygote_rss(current_pid: u32, current_rss_mb: u64) {
                     && entry.pid != self_pid
                     && now_ms.saturating_sub(entry.last_used_ms) >= 15_000
                 {
-                    #[cfg(unix)]
-                    unsafe {
-                        libc::kill(entry.pid as i32, libc::SIGTERM);
+                    #[cfg(target_os = "linux")]
+                    if let Some(process) = LifecycleProcess::open(entry.pid, None, None) {
+                        process.signal(libc::SIGTERM);
                     }
                     continue;
                 }
@@ -273,87 +273,670 @@ pub fn govern_machine_wide_zygote_rss(current_pid: u32, current_rss_mb: u64) {
     );
 }
 
-/// Reap all tracked `ZygoteWorker` processes and local `turbo-lean serve` daemons, returning
-/// the number of terminated processes. Also clears the in-process `ZYGOTE_POOL`.
-pub fn reap_zygote_workers_and_daemons(store_root: Option<&Path>) -> usize {
-    let mut reaped = 0usize;
-    let self_pid = std::process::id();
-
-    if let Some(pool_mutex) = ZYGOTE_POOL.get() {
-        if let Ok(mut pool) = pool_mutex.lock() {
-            for (_, workers) in pool.drain() {
-                reaped += workers.len();
-                drop(workers);
-            }
+/// Drop pooled children before returning from a CLI invocation or shutting down a server.
+pub(crate) fn clear_zygote_pool() {
+    if let Some(pool) = ZYGOTE_POOL.get() {
+        if let Ok(mut pool) = pool.lock() {
+            pool.clear();
         }
     }
+}
 
-    let shm_dir = crate::shm_cache::staging_shm_dir();
+/// One-shot staging is private even when another invocation uses the same CAS.
+pub(crate) struct OneShotGuard;
+static ONE_SHOT_DIR: std::sync::OnceLock<(PathBuf, PathBuf)> = std::sync::OnceLock::new();
 
-    let reg_path = shm_dir.join("zygote_lru_registry.json");
-    if let Ok(bytes) = fs::read(&reg_path) {
-        if let Ok(entries) = serde_json::from_slice::<Vec<ZygoteLruEntry>>(&bytes) {
-            for entry in entries {
-                if entry.pid > 1 && entry.pid != self_pid {
-                    #[cfg(unix)]
-                    unsafe {
-                        if libc::kill(entry.pid as i32, libc::SIGTERM) == 0 {
-                            reaped += 1;
-                        }
-                    }
-                }
-            }
+extern "C" fn cleanup_one_shot() {
+    clear_zygote_pool();
+    if let Some((dir, _)) = ONE_SHOT_DIR.get() {
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
+pub(crate) fn daemon_disabled() -> bool {
+    std::env::var("TURBO_LEAN_NO_DAEMON")
+        .ok()
+        .and_then(|value| crate::shm_cache::parse_relaxed_bool(&value))
+        .unwrap_or(false)
+}
+
+impl OneShotGuard {
+    /// Persistent metrics retain their namespace while workers use disposable sibling staging.
+    pub(crate) fn persistent_staging_dir() -> PathBuf {
+        ONE_SHOT_DIR
+            .get()
+            .map(|(_, base)| base.clone())
+            .unwrap_or_else(crate::shm_cache::staging_shm_dir)
+    }
+
+    pub(crate) fn new(flag: bool) -> Result<Self> {
+        let enabled = flag || daemon_disabled();
+        if !enabled {
+            return Ok(Self);
         }
-        let _ = fs::remove_file(&reg_path);
+        std::env::set_var("TURBO_LEAN_NO_DAEMON", "1");
+        let base = crate::shm_cache::staging_shm_dir();
+        // A sibling survives cleanup of an idle daemon's shared staging directory.
+        let dir = base.with_file_name(format!(
+            "{}-oneshot-{}-{}",
+            base.file_name()
+                .context("Staging directory needs a name")?
+                .to_string_lossy(),
+            std::process::id(),
+            next_tmp_id()
+        ));
+        fs::create_dir_all(&dir)?;
+        std::env::set_var("TURBO_LEAN_STAGING_DIR", &dir);
+        let _ = ONE_SHOT_DIR.set((dir, base));
+        // `eval` also exits with explicit status codes, bypassing Rust Drop.
+        #[cfg(unix)]
+        unsafe {
+            libc::atexit(cleanup_one_shot);
+        }
+        Ok(Self)
     }
+}
 
-    let mut daemon_files = vec![shm_dir.join("zygote_daemon.json")];
-    if let Some(root) = store_root {
-        daemon_files.push(root.join("zygote_daemon.json"));
+impl Drop for OneShotGuard {
+    fn drop(&mut self) {
+        cleanup_one_shot();
     }
-    for df in daemon_files {
-        if let Ok(bytes) = fs::read(&df) {
-            if let Ok(info) = serde_json::from_slice::<LocalZygoteDaemonInfo>(&bytes) {
-                if info.pid > 1 && info.pid != self_pid {
-                    #[cfg(unix)]
-                    unsafe {
-                        if libc::kill(info.pid as i32, libc::SIGTERM) == 0 {
-                            reaped += 1;
-                        }
-                    }
-                }
+}
+
+fn is_serve_command(cmdline: &[u8]) -> bool {
+    let mut args = cmdline.split(|b| *b == 0).filter(|a| !a.is_empty()).skip(1);
+    while let Some(arg) = args.next() {
+        match arg {
+            b"--cache-dir" | b"--max-memory-mb" | b"--telemetry" => {
+                args.next();
             }
-            let _ = fs::remove_file(&df);
+            flag if flag.starts_with(b"-") => {}
+            command => return command == b"serve",
         }
     }
+    false
+}
 
+#[cfg(target_os = "linux")]
+fn owned_lifecycle_process(pid: u32, staging: Option<&Path>, parent: Option<u32>) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if pid <= 1 || pid == std::process::id() {
+        return false;
+    }
+    let proc = PathBuf::from(format!("/proc/{pid}"));
+    if fs::metadata(&proc).map(|m| m.uid()).ok() != Some(unsafe { libc::geteuid() }) {
+        return false;
+    }
+    let exe = fs::read_link(proc.join("exe")).unwrap_or_default();
+    let name = exe.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let args = fs::read(proc.join("cmdline")).unwrap_or_default();
+    let env = fs::read(proc.join("environ")).unwrap_or_default();
+    let worker = (name.starts_with("turbo_zygote_") || name == "turbo-zygote")
+        && !args.split(|b| *b == 0).any(|arg| arg == b"--audit-modules");
+    let server = name.trim_end_matches(" (deleted)") == "turbo-lean"
+        && is_serve_command(&args)
+        && env.split(|b| *b == 0).any(|v| v == b"TURBO_LEAN_DAEMON=1");
+    if !worker && !server {
+        return false;
+    }
+    if let Some(parent) = parent {
+        let status = fs::read_to_string(proc.join("status")).unwrap_or_default();
+        return status.lines().any(|l| {
+            l.strip_prefix("PPid:")
+                .and_then(|p| p.trim().parse::<u32>().ok())
+                == Some(parent)
+        });
+    }
+    if let Some(staging) = staging {
+        let expected = format!("TURBO_LEAN_STAGING_DIR={}", staging.display());
+        return env.split(|b| *b == 0).any(|v| v == expected.as_bytes());
+    }
+    true
+}
+
+/// Only the effective user's processes are eligible. An explicit staging directory limits
+/// shutdown to that namespace, so integration tests and isolated callers cannot kill peers.
+#[cfg(target_os = "linux")]
+fn lifecycle_pids(staging: Option<&Path>, parent: Option<u32>) -> Vec<u32> {
+    fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| owned_lifecycle_process(*pid, staging, parent))
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn lifecycle_pids(_: Option<&Path>, _: Option<u32>) -> Vec<u32> {
+    Vec::new()
+}
+
+/// One user-wide lock coordinates every staging namespace, including user-wide stop.
+/// Keep the inode outside staging: deleting staging must never replace the lock itself.
+pub(crate) fn lifecycle_lock(exclusive: bool) -> Result<crate::shm_cache::FlockGuard> {
+    #[cfg(unix)]
+    let uid = unsafe { libc::geteuid() };
+    #[cfg(not(unix))]
+    let uid = 0u32;
+    let path = PathBuf::from(format!("/tmp/turbo-lean-lifecycle-{uid}.lock"));
+    crate::shm_cache::acquire_flock(&path, exclusive, false)?
+        .context("Could not acquire daemon lifecycle lock")
+}
+
+/// Possession proves that staging teardown holds the user-wide flock exclusively.
+pub(crate) struct ExclusiveLifecycleLock {
+    _guard: crate::shm_cache::FlockGuard,
+}
+
+pub(crate) fn lifecycle_exclusive_lock() -> Result<ExclusiveLifecycleLock> {
+    Ok(ExclusiveLifecycleLock {
+        _guard: lifecycle_lock(true)?,
+    })
+}
+
+fn remove_owned_staging(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = match fs::symlink_metadata(path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        anyhow::ensure!(
+            meta.is_dir() && meta.uid() == unsafe { libc::geteuid() },
+            "Refusing to remove staging not owned by this user: {}",
+            path.display()
+        );
+        let canonical = path.canonicalize()?;
+        anyhow::ensure!(
+            canonical.parent().is_some()
+                && canonical != Path::new("/dev/shm")
+                && canonical != std::env::temp_dir().canonicalize()?
+                && std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .and_then(|p| p.canonicalize().ok())
+                    .as_ref()
+                    != Some(&canonical),
+            "Refusing unsafe staging directory: {}",
+            path.display()
+        );
+    }
+    fs::remove_dir_all(path).with_context(|| format!("Removing staging {}", path.display()))
+}
+
+/// Hold the kernel process identity across /proc validation and both shutdown signals.
+#[cfg(target_os = "linux")]
+struct LifecycleProcess {
+    pid: u32,
+    pidfd: std::os::fd::OwnedFd,
+    start_time: u64,
+    identity: (PathBuf, Vec<u8>, Vec<u8>),
+    staging: Option<PathBuf>,
+    parent: Option<u32>,
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_time(pid: u32) -> Option<u64> {
+    // comm (field 2) can contain spaces and parentheses; field 22 is index 19 after it.
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()?
+        .rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+#[cfg(target_os = "linux")]
+impl LifecycleProcess {
+    fn open(pid: u32, staging: Option<&Path>, parent: Option<u32>) -> Option<Self> {
+        use std::os::fd::FromRawFd;
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if fd < 0 {
+            return None; // Fail closed if pidfds are unavailable.
+        }
+        let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) };
+        let start_time = process_start_time(pid)?;
+        if !owned_lifecycle_process(pid, staging, parent) {
+            return None;
+        }
+        let proc = PathBuf::from(format!("/proc/{pid}"));
+        let process = Self {
+            pid,
+            pidfd,
+            start_time,
+            identity: (
+                fs::read_link(proc.join("exe")).ok()?,
+                fs::read(proc.join("cmdline")).ok()?,
+                fs::read(proc.join("environ")).ok()?,
+            ),
+            staging: staging.map(Path::to_path_buf),
+            parent,
+        };
+        process.valid_identity().then_some(process)
+    }
+
+    fn alive(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        let mut fd = libc::pollfd {
+            fd: self.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        unsafe { libc::poll(&mut fd, 1, 0) == 0 }
+    }
+
+    fn valid_identity(&self) -> bool {
+        let proc = PathBuf::from(format!("/proc/{}", self.pid));
+        self.alive()
+            && process_start_time(self.pid) == Some(self.start_time)
+            && owned_lifecycle_process(self.pid, self.staging.as_deref(), self.parent)
+            && fs::read_link(proc.join("exe")).ok().as_ref() == Some(&self.identity.0)
+            && fs::read(proc.join("cmdline")).ok().as_ref() == Some(&self.identity.1)
+            && fs::read(proc.join("environ")).ok().as_ref() == Some(&self.identity.2)
+            && process_start_time(self.pid) == Some(self.start_time)
+    }
+
+    fn signal(&self, signal: i32) -> bool {
+        use std::os::fd::AsRawFd;
+        if !self.valid_identity() {
+            return false;
+        }
+        // Even reuse after the last /proc read cannot redirect this signal to a new PID.
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.pidfd.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            ) == 0
+        }
+    }
+}
+
+#[derive(Default)]
+struct LifecycleCleanup {
+    count: usize,
+    staging: std::collections::HashSet<PathBuf>,
+    state_files: std::collections::HashSet<PathBuf>,
+}
+
+#[cfg(target_os = "linux")]
+fn env_path(env: &[u8], key: &str) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    env.split(|b| *b == 0)
+        .find_map(|entry| entry.strip_prefix(key.as_bytes()))
+        .map(|value| PathBuf::from(std::ffi::OsStr::from_bytes(value)))
+}
+
+fn terminate_lifecycle_processes(staging: Option<&Path>, parent: Option<u32>) -> LifecycleCleanup {
     #[cfg(target_os = "linux")]
-    if let Ok(proc_dir) = fs::read_dir("/proc") {
-        for entry in proc_dir.flatten() {
-            let fname = entry.file_name();
-            let Some(pid_str) = fname.to_str() else {
-                continue;
-            };
-            let Ok(pid) = pid_str.parse::<u32>() else {
-                continue;
-            };
-            if pid <= 1 || pid == self_pid {
-                continue;
+    {
+        let processes: Vec<_> = lifecycle_pids(staging, parent)
+            .into_iter()
+            .filter_map(|pid| LifecycleProcess::open(pid, staging, parent))
+            .collect();
+        terminate_linux_processes(processes)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (staging, parent);
+        LifecycleCleanup::default()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_linux_processes(processes: Vec<LifecycleProcess>) -> LifecycleCleanup {
+    let mut cleanup = LifecycleCleanup::default();
+    for process in &processes {
+        if process.signal(libc::SIGTERM) {
+            cleanup.count += 1;
+            if let Some(path) = env_path(&process.identity.2, "TURBO_LEAN_STAGING_DIR=") {
+                cleanup.staging.insert(path);
             }
-            let comm_path = entry.path().join("comm");
-            if let Ok(comm) = fs::read_to_string(&comm_path) {
-                if comm.trim().starts_with("turbo_zygote_") {
-                    unsafe {
-                        if libc::kill(pid as i32, libc::SIGTERM) == 0 {
-                            reaped += 1;
-                        }
-                    }
+            for key in [
+                "TURBO_LEAN_DAEMON_STATE_FILE=",
+                "TURBO_LEAN_DAEMON_PARENT_STATE_FILE=",
+            ] {
+                if let Some(path) = env_path(&process.identity.2, key) {
+                    cleanup.state_files.insert(path);
                 }
             }
         }
     }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while processes.iter().any(LifecycleProcess::alive) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    for process in &processes {
+        process.signal(libc::SIGKILL);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while processes.iter().any(LifecycleProcess::alive) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    cleanup
+}
 
-    reaped
+fn owned_process_alive(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // Liveness is only a postcondition, never authority to signal. If pidfd_open
+        // fails, stop must report a live process rather than silently claim success.
+        return fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(") ")
+                    .map(|(_, rest)| !rest.starts_with('Z'))
+            })
+            .unwrap_or(false);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        portable_process_alive(pid)
+    }
+}
+
+fn staging_namespace_in_use(staging: &Path, _store_root: Option<&Path>) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let expected = format!("TURBO_LEAN_STAGING_DIR={}", staging.display());
+        return fs::read_dir("/proc")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|entry| {
+                let Some(pid) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|s| s.parse::<u32>().ok())
+                else {
+                    return false;
+                };
+                pid != std::process::id()
+                    && fs::metadata(entry.path()).map(|m| m.uid()).ok()
+                        == Some(unsafe { libc::geteuid() })
+                    && fs::read(entry.path().join("environ"))
+                        .unwrap_or_default()
+                        .split(|b| *b == 0)
+                        .any(|v| v == expected.as_bytes())
+            });
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Without /proc, only the PID files and the caller's exclusive flock can
+        // establish quiescence. Unknown/corrupt state conservatively retains staging.
+        portable_staging_namespace_in_use(staging, _store_root)
+    }
+}
+
+#[cfg(any(all(unix, not(target_os = "linux")), test))]
+fn portable_staging_namespace_in_use(staging: &Path, store_root: Option<&Path>) -> bool {
+    portable_pidfile_paths(staging, store_root, true)
+        .map(|paths| paths.iter().any(|path| portable_pidfile_alive(path)))
+        .unwrap_or(true)
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+fn portable_process_alive(pid: u32) -> bool {
+    if pid <= 1 {
+        return true;
+    }
+    // kill(0) is a liveness check only, never authority to send a terminating signal.
+    if unsafe { libc::kill(pid as i32, 0) } != 0
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    {
+        return false;
+    }
+    // A zombie cannot use staging. On any ps failure retain it conservatively.
+    Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "stat="])
+        .output()
+        .map(|out| {
+            !out.status.success()
+                || out.stdout.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'Z')
+        })
+        .unwrap_or(true)
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+fn portable_pidfile_alive(path: &Path) -> bool {
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice::<LocalZygoteDaemonInfo>(&bytes)
+            .map(|info| portable_process_alive(info.pid))
+            .unwrap_or(true),
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+#[derive(Debug, PartialEq, Eq)]
+struct PortableProcessIdentity {
+    start_time: String,
+    command: String,
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+fn portable_process_identity(pid: u32) -> Result<Option<PortableProcessIdentity>> {
+    let output = Command::new("ps")
+        .args([
+            "eww",
+            "-p",
+            &pid.to_string(),
+            "-o",
+            "uid=",
+            "-o",
+            "lstart=",
+            "-o",
+            "command=",
+        ])
+        .env("LC_ALL", "C")
+        .output()?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut fields = text.split_whitespace();
+    if fields.next().and_then(|s| s.parse::<u32>().ok()) != Some(unsafe { libc::geteuid() }) {
+        return Ok(None);
+    }
+    let start_time = fields.by_ref().take(5).collect::<Vec<_>>().join(" ");
+    let args: Vec<_> = fields.collect();
+    let exe = args
+        .first()
+        .and_then(|s| Path::new(s).file_name())
+        .and_then(|s| s.to_str());
+    let command = args.join("\0");
+    if start_time.split_whitespace().count() != 5
+        || exe != Some("turbo-lean")
+        || !is_serve_command(command.as_bytes())
+        || !args.contains(&"TURBO_LEAN_DAEMON=1")
+    {
+        return Ok(None);
+    }
+    Ok(Some(PortableProcessIdentity {
+        start_time,
+        command,
+    }))
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+fn signal_portable_process(
+    pid: u32,
+    identity: &PortableProcessIdentity,
+    signal: i32,
+) -> Result<bool> {
+    let pid_i32 = pid as i32;
+    let target = if unsafe { libc::getpgid(pid_i32) } == pid_i32 {
+        -pid_i32
+    } else {
+        pid_i32
+    };
+    // Re-read UID, start time, and full command immediately before EVERY signal.
+    // Portable Unix lacks pidfd_send_signal: exit/PID (or process-group) reuse can
+    // still occur between this final ps snapshot and kill, and ps lstart has only
+    // second resolution. This narrows, but cannot eliminate, that residual window.
+    if portable_process_identity(pid)?.as_ref() != Some(identity) {
+        return Ok(false);
+    }
+    Ok(unsafe { libc::kill(target, signal) } == 0)
+}
+
+// Compile the portable Unix fallback in Linux tests as well as on macOS.
+#[cfg(any(all(unix, not(target_os = "linux")), test))]
+fn stop_pidfile_daemon(state_file: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = fs::symlink_metadata(state_file) else {
+        return Ok(false);
+    };
+    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } {
+        return Ok(false);
+    }
+    let Ok(info) = serde_json::from_slice::<LocalZygoteDaemonInfo>(&fs::read(state_file)?) else {
+        return Ok(false);
+    };
+    if info.pid <= 1 || info.pid == std::process::id() {
+        return Ok(false);
+    }
+    let Some(identity) = portable_process_identity(info.pid)? else {
+        return Ok(false);
+    };
+    if !signal_portable_process(info.pid, &identity, libc::SIGTERM)? {
+        return Ok(false);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while portable_process_alive(info.pid) {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "PID-file daemon {} is still shutting down",
+            info.pid
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Ok(true)
+}
+
+#[cfg(any(all(unix, not(target_os = "linux")), test))]
+fn portable_pidfile_paths(
+    staging: &Path,
+    store_root: Option<&Path>,
+    include_legacy_root: bool,
+) -> Result<std::collections::HashSet<PathBuf>> {
+    let mut paths: std::collections::HashSet<PathBuf> = walkdir::WalkDir::new(staging)
+        .max_depth(2)
+        .into_iter()
+        .filter(|e| {
+            !e.as_ref().err().is_some_and(|e| {
+                e.io_error()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|e| e.file_name() == "zygote_daemon.json")
+        .map(|e| e.into_path())
+        .collect();
+    let root = store_root
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("TURBO_LEAN_HOME").map(PathBuf::from))
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into()))
+                .join(".cache/turbo-lean")
+        });
+    // A legacy root entry may describe a different namespace. Explicitly scoped
+    // signalling excludes it, but liveness must conservatively veto deletion
+    // even when only that legacy PID file remains.
+    if include_legacy_root
+        || std::env::var_os("TURBO_LEAN_STAGING_DIR").is_none()
+        || root.starts_with(staging)
+    {
+        paths.insert(root.join("zygote_daemon.json"));
+    }
+    Ok(paths)
+}
+
+#[cfg(any(all(unix, not(target_os = "linux")), test))]
+fn stop_pidfile_daemons(staging: &Path, store_root: Option<&Path>) -> Result<LifecycleCleanup> {
+    let paths = portable_pidfile_paths(staging, store_root, false)?;
+    let mut cleanup = LifecycleCleanup::default();
+    for path in paths {
+        if stop_pidfile_daemon(&path)? {
+            cleanup.count += 1;
+        }
+        if !portable_pidfile_alive(&path) {
+            cleanup.state_files.insert(path);
+        }
+    }
+    cleanup.staging.insert(staging.to_path_buf());
+    Ok(cleanup)
+}
+
+pub(crate) fn stop_daemons(store_root: Option<&Path>) -> Result<usize> {
+    let lifecycle = lifecycle_exclusive_lock()?;
+    clear_zygote_pool();
+    let dir = crate::shm_cache::staging_shm_dir();
+    let scope = std::env::var_os("TURBO_LEAN_STAGING_DIR").map(|_| dir.as_path());
+    #[cfg(target_os = "linux")]
+    let mut cleanup = terminate_lifecycle_processes(scope, None);
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let mut cleanup = stop_pidfile_daemons(&dir, store_root)?;
+    #[cfg(not(unix))]
+    let mut cleanup = LifecycleCleanup::default();
+    anyhow::ensure!(
+        lifecycle_pids(scope, None)
+            .iter()
+            .all(|p| !owned_process_alive(*p)),
+        "Daemon processes are still shutting down"
+    );
+    cleanup.staging.insert(dir);
+    cleanup_lifecycle_staging(cleanup, store_root, &lifecycle)
+}
+
+fn cleanup_lifecycle_staging(
+    mut cleanup: LifecycleCleanup,
+    store_root: Option<&Path>,
+    _lifecycle: &ExclusiveLifecycleLock,
+) -> Result<usize> {
+    for path in cleanup.staging {
+        if staging_namespace_in_use(&path, store_root) {
+            eprintln!(
+                "Retained staging {}: still used by a foreground server or another process",
+                path.display()
+            );
+        } else {
+            remove_owned_staging(&path)?;
+        }
+    }
+    if let Some(root) = store_root {
+        cleanup.state_files.insert(root.join("zygote_daemon.json"));
+    }
+    for path in cleanup.state_files {
+        #[cfg(not(target_os = "linux"))]
+        if portable_pidfile_alive(&path) {
+            continue;
+        }
+        let _ = fs::remove_file(path);
+    }
+    Ok(cleanup.count)
+}
+
+pub fn reap_zygote_workers_and_daemons(store_root: Option<&Path>) -> usize {
+    stop_daemons(store_root).unwrap_or(0)
+}
+
+/// Idle exit is local to this server, never a machine-wide reap.
+pub(crate) fn shutdown_local_daemon(_lifecycle: &ExclusiveLifecycleLock) {
+    clear_zygote_pool();
+    terminate_lifecycle_processes(None, Some(std::process::id()));
+    let staging = crate::shm_cache::staging_shm_dir();
+    if !staging_namespace_in_use(&staging, None) {
+        let _ = remove_owned_staging(&staging);
+    }
 }
 
 const ZYGOTE_STDERR_TAIL_CAP: usize = 8192;
@@ -370,6 +953,8 @@ struct WorkerCrashDiagnostics {
 
 pub struct ZygoteWorkerProcess {
     pub child: std::process::Child,
+    // Linux parent-death signals follow the spawning thread, so keep it alive with the worker.
+    _owner: std::sync::mpsc::Sender<()>,
     stdin: std::process::ChildStdin,
     stdout: BufReader<std::process::ChildStdout>,
     stderr_tail: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
@@ -1028,6 +1613,7 @@ pub(crate) fn ensure_zygote_binary(
     lean_bin: &Path,
     env_vars: &std::collections::HashMap<String, String>,
 ) -> Result<std::path::PathBuf> {
+    let _lifecycle = lifecycle_lock(false)?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"turbo-zygote:v3:shared:");
     hasher.update(std::env::consts::ARCH.as_bytes());
@@ -1435,7 +2021,7 @@ fn audit_compiled_module_batch(
     }
 
     let out = crate::module_builder::run_command_with_timeout(
-        cmd,
+        &mut cmd,
         std::time::Duration::from_secs(timeout_secs),
         is_untrusted,
     )
@@ -1496,9 +2082,8 @@ static ZYGOTE_LEAN_PATH_CACHE: std::sync::OnceLock<
 fn read_line_with_timeout(
     reader: &mut BufReader<std::process::ChildStdout>,
     line: &mut String,
-    timeout_ms: u64,
+    deadline: std::time::Instant,
 ) -> std::io::Result<Option<usize>> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let mut raw_bytes: Vec<u8> = Vec::new();
     loop {
         if reader.buffer().is_empty() {
@@ -1686,14 +2271,17 @@ fn eval_with_zygote_pool_inner(
     batch_fission_override: Option<(String, String, String)>,
     lean_args: &[String],
 ) -> Result<ZygoteEvalReply> {
+    let request_started = std::time::Instant::now();
     let default_timeout_ms = if eval_mode { 900_000 } else { 30_000 };
-    let effective_timeout_ms = timeout_ms.filter(|&ms| ms > 0).unwrap_or_else(|| {
+    let effective_timeout_ms = timeout_ms.unwrap_or_else(|| {
         std::env::var("TURBO_LEAN_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .filter(|&ms| ms > 0)
             .unwrap_or(default_timeout_ms)
     });
+    let deadline = request_started + std::time::Duration::from_millis(effective_timeout_ms);
+    let _lifecycle = lifecycle_lock(false)?;
 
     let env_lp = env_vars.get("LEAN_PATH").cloned().unwrap_or_default();
     let lp_cache_key = (
@@ -1877,8 +2465,32 @@ fn eval_with_zygote_pool_inner(
         if !toolchain.is_empty() && toolchain != "unknown" {
             cmd.env("ELAN_TOOLCHAIN", toolchain.trim());
         }
-        let mut child = cmd
-            .spawn()
+        #[cfg(target_os = "linux")]
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            let parent = libc::getpid();
+            cmd.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    libc::_exit(1);
+                }
+                Ok(())
+            });
+        }
+        cmd.env(
+            "TURBO_LEAN_STAGING_DIR",
+            crate::shm_cache::staging_shm_dir(),
+        );
+        let (owner, lifetime) = std::sync::mpsc::channel();
+        let (send_child, receive_child) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = send_child.send(cmd.spawn());
+            let _ = lifetime.recv();
+        });
+        let mut child = receive_child
+            .recv()?
             .with_context(|| format!("Failed to spawn Zygote worker {:?}", zygote_bin))?;
         let stdin = child
             .stdin
@@ -1912,6 +2524,7 @@ fn eval_with_zygote_pool_inner(
         }
         Ok(ZygoteWorkerProcess {
             child,
+            _owner: owner,
             stdin,
             stdout,
             stderr_tail,
@@ -1952,6 +2565,13 @@ fn eval_with_zygote_pool_inner(
         Crashed(WorkerCrashDiagnostics),
     }
 
+    let worker_timeout = |worker: &ZygoteChild, req_id: &str| WorkerReqOutcome::TimedOut {
+        elapsed_us: request_started.elapsed().as_micros() as u64,
+        peak_rss_mb: measure_process_rss_mb(worker.child.id()),
+        stderr_tail: snapshot_worker_stderr_tail(&worker.stderr_tail),
+        last_request: req_id.to_string(),
+    };
+
     let request_identity = format!(
         "imports={} file={} mode={} bytes={}",
         if imports_csv.is_empty() {
@@ -1972,7 +2592,9 @@ fn eval_with_zygote_pool_inner(
 
     let run_worker_req =
         |worker: &mut ZygoteChild, req_line: &str, req_id: &str| -> WorkerReqOutcome {
-            let req_t0 = std::time::Instant::now();
+            if std::time::Instant::now() >= deadline {
+                return worker_timeout(worker, req_id);
+            }
             let pid = worker.child.id();
             let rss_before = measure_process_rss_mb(pid);
             if let Err(e) = worker
@@ -1989,12 +2611,12 @@ fn eval_with_zygote_pool_inner(
                 ));
             }
             let mut resp_line = String::new();
-            match read_line_with_timeout(&mut worker.stdout, &mut resp_line, effective_timeout_ms) {
+            match read_line_with_timeout(&mut worker.stdout, &mut resp_line, deadline) {
                 Ok(None) => {
                     let rss_now = measure_process_rss_mb(pid).max(rss_before);
                     let stderr_tail = snapshot_worker_stderr_tail(&worker.stderr_tail);
                     WorkerReqOutcome::TimedOut {
-                        elapsed_us: req_t0.elapsed().as_micros() as u64,
+                        elapsed_us: request_started.elapsed().as_micros() as u64,
                         peak_rss_mb: rss_now,
                         stderr_tail,
                         last_request: req_id.to_string(),
@@ -2048,6 +2670,10 @@ fn eval_with_zygote_pool_inner(
     >,
                                  key: (String, String, String),
                                  mut w: ZygoteChild| {
+        if daemon_disabled() {
+            drop(w);
+            return;
+        }
         w.request_count += 1;
         if w.request_count >= 256 {
             drop(w);
@@ -2425,7 +3051,7 @@ fn eval_with_zygote_pool_inner(
             }
         };
 
-    let (mut worker, mut was_warm_worker) = {
+    let mut worker = {
         let mut pool = pool_mutex
             .lock()
             .map_err(|_| anyhow::anyhow!("ZygotePool mutex poisoned"))?;
@@ -2511,34 +3137,50 @@ fn eval_with_zygote_pool_inner(
                 }
             }
         }
-        match selected {
-            Some(w) => (Some(w), true),
-            None => (None, false),
-        }
+        selected
     };
+    if std::time::Instant::now() >= deadline {
+        return Ok(ZygoteEvalReply::timed_out_reply(
+            eval_mode,
+            request_started.elapsed().as_micros() as u64,
+            effective_timeout_ms,
+            0,
+            String::new(),
+            Some(request_identity.clone()),
+        ));
+    }
     if worker.is_none() {
         worker = Some(spawn_zygote_worker()?);
-        was_warm_worker = false;
     }
 
     let mut w = worker.unwrap();
     let mut outcome = run_worker_req(&mut w, &req_line, &request_identity);
     if let WorkerReqOutcome::Crashed(first_diag) = outcome {
         drop(w);
-        if was_warm_worker {
-            w = spawn_zygote_worker()?;
-            outcome = run_worker_req(&mut w, &req_line, &request_identity);
-        } else {
-            // Fresh worker crashed on first try; retry once on a new worker before returning crashed: true
-            if let Ok(mut retry_w) = spawn_zygote_worker() {
-                outcome = run_worker_req(&mut retry_w, &req_line, &request_identity);
-                w = retry_w;
-            } else {
+        // Respawn and replay share the original request deadline, including on a cold worker.
+        if std::time::Instant::now() >= deadline {
+            return Ok(ZygoteEvalReply::timed_out_reply(
+                eval_mode,
+                request_started.elapsed().as_micros() as u64,
+                effective_timeout_ms,
+                first_diag.peak_rss_mb,
+                first_diag.stderr_tail,
+                first_diag.last_request,
+            ));
+        }
+        match spawn_zygote_worker() {
+            Ok(retry_w) => w = retry_w,
+            Err(_) => {
                 let mut diag = first_diag;
                 diag.message = format!("{} (respawn failed)", diag.message);
                 return Ok(ZygoteEvalReply::crashed_reply_with_diag(eval_mode, diag));
             }
         }
+        outcome = run_worker_req(&mut w, &req_line, &request_identity);
+    }
+
+    if std::time::Instant::now() >= deadline {
+        outcome = worker_timeout(&w, &request_identity);
     }
 
     match outcome {
@@ -2799,19 +3441,58 @@ pub(crate) struct LocalZygoteDaemonInfo {
     pub(crate) exe_mtime_nsec: i64,
     #[serde(default)]
     pub(crate) auth_token: String,
-    /// Axiom policy and per-theorem timeout the daemon (and its zygote workers) enforce;
+    /// Axiom policy the daemon (and its zygote workers) enforce;
     /// reused only under the same `daemon_policy()`.
     #[serde(default)]
     pub(crate) policy: Vec<String>,
 }
 
-/// Settings a daemon fixes at spawn (it inherits them from the environment): the axiom
-/// allowlist and the per-theorem timeout (`TURBO_LEAN_TIMEOUT_MS`).
+/// Timeouts belong to requests; only axiom policy determines daemon identity.
 pub(crate) fn daemon_policy() -> Vec<String> {
-    let timeout = std::env::var("TURBO_LEAN_TIMEOUT_MS").unwrap_or_default();
-    let mut policy = crate::splitter::allowed_axioms();
-    policy.push(format!("timeout_ms={}", timeout));
-    policy
+    crate::splitter::allowed_axioms()
+}
+
+pub(crate) fn invocation_timeout_ms() -> Option<u64> {
+    std::env::var("TURBO_LEAN_TIMEOUT_MS")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Share the request budget across worker attempts and a stock-Lean fallback.
+pub(crate) fn remaining_timeout_ms(timeout_ms: Option<u64>, started: std::time::Instant) -> u64 {
+    timeout_ms
+        .or_else(invocation_timeout_ms)
+        .filter(|ms| *ms > 0)
+        .unwrap_or(30_000)
+        .saturating_sub(started.elapsed().as_millis().min(u64::MAX as u128) as u64)
+}
+
+pub(crate) fn run_lean_command(
+    cmd: &mut Command,
+    timeout_ms: Option<u64>,
+) -> Result<std::process::Output> {
+    anyhow::ensure!(
+        timeout_ms != Some(0),
+        "Lean request timed out before fallback"
+    );
+    crate::module_builder::run_command_with_timeout(
+        cmd,
+        std::time::Duration::from_millis(
+            timeout_ms
+                .or_else(invocation_timeout_ms)
+                .filter(|ms| *ms > 0)
+                .unwrap_or(30_000),
+        ),
+        false,
+    )
+}
+
+fn check_request_body(req: &CheckShardHttpRequest) -> Result<Vec<u8>> {
+    let mut value = serde_json::to_value(req)?;
+    value["timeout_ms"] = serde_json::to_value(invocation_timeout_ms())?;
+    Ok(serde_json::to_vec(&value)?)
 }
 
 fn generate_daemon_auth_token(pid: u32, port: u16) -> String {
@@ -2844,13 +3525,17 @@ fn write_daemon_state_file_private(path: &Path, json_bytes: &[u8]) {
 fn terminate_and_remove_daemon_state_file(state_file: &Path) {
     if let Ok(content) = fs::read_to_string(state_file) {
         if let Ok(info) = serde_json::from_str::<LocalZygoteDaemonInfo>(&content) {
-            #[cfg(unix)]
-            if info.pid > 0 {
-                unsafe {
-                    libc::kill(info.pid as i32, libc::SIGTERM);
-                }
+            #[cfg(target_os = "linux")]
+            if let Some(process) =
+                LifecycleProcess::open(info.pid, Some(&crate::shm_cache::staging_shm_dir()), None)
+            {
+                process.signal(libc::SIGTERM);
             }
         }
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    if stop_pidfile_daemon(state_file).is_err() || portable_pidfile_alive(state_file) {
+        return;
     }
     let _ = fs::remove_file(state_file);
 }
@@ -2892,11 +3577,8 @@ fn check_existing_daemon_state(
         return None;
     }
     if info.exe_mtime_sec != exe_mtime_sec || info.exe_mtime_nsec != exe_mtime_nsec {
-        #[cfg(unix)]
-        if kill_stale && info.pid > 0 {
-            unsafe {
-                libc::kill(info.pid as i32, libc::SIGTERM);
-            }
+        if kill_stale {
+            terminate_and_remove_daemon_state_file(path);
         }
         return None;
     }
@@ -2921,6 +3603,9 @@ fn check_existing_daemon_state(
 }
 
 pub(crate) fn has_active_local_zygote_daemon(store: &TurboStore) -> bool {
+    if daemon_disabled() {
+        return false;
+    }
     let Some((_, exe_mtime_sec, exe_mtime_nsec, _, state_file)) = current_exe_daemon_paths(store)
     else {
         return false;
@@ -2941,9 +3626,10 @@ pub(crate) fn ensure_local_zygote_daemon_with_token(
     store: &TurboStore,
     env_vars: &std::collections::HashMap<String, String>,
 ) -> Option<(String, String)> {
-    if std::env::var("TURBO_LEAN_NO_DAEMON").is_ok() {
+    if daemon_disabled() {
         return None;
     }
+    let _lifecycle = lifecycle_lock(false).ok()?;
     let (current_exe, exe_mtime_sec, exe_mtime_nsec, daemon_cache_dir, state_file) =
         current_exe_daemon_paths(store)?;
 
@@ -2991,7 +3677,16 @@ pub(crate) fn ensure_local_zygote_daemon_with_token(
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
         }
-        let pid = cmd.spawn().ok()?.id();
+        cmd.env(
+            "TURBO_LEAN_DAEMON_PARENT_STATE_FILE",
+            store.root.join("zygote_daemon.json"),
+        );
+        cmd.env("TURBO_LEAN_DAEMON_STATE_FILE", &state_file).env(
+            "TURBO_LEAN_STAGING_DIR",
+            crate::shm_cache::staging_shm_dir(),
+        );
+        let mut child = cmd.spawn().ok()?;
+        let pid = child.id();
         let connected = (0..75).any(|_| {
             std::net::TcpStream::connect_timeout(&sock_addr, std::time::Duration::from_millis(5))
                 .is_ok()
@@ -3001,6 +3696,8 @@ pub(crate) fn ensure_local_zygote_daemon_with_token(
                 }
         });
         if !connected {
+            let _ = child.kill();
+            let _ = child.wait();
             return None;
         }
         let info = LocalZygoteDaemonInfo {
@@ -3042,58 +3739,14 @@ pub fn warm_local_zygote_daemon_nonblocking(
     store: &TurboStore,
     env_vars: &std::collections::HashMap<String, String>,
 ) {
-    if std::env::var("TURBO_LEAN_NO_DAEMON").is_ok() {
+    if daemon_disabled() {
         return;
     }
-    let Some((current_exe, exe_mtime_sec, exe_mtime_nsec, daemon_cache_dir, state_file)) =
-        current_exe_daemon_paths(store)
-    else {
-        return;
-    };
-    let lock_path = daemon_cache_dir.join("zygote_daemon.lock");
-    let _ = crate::shm_cache::with_shm_flock(&lock_path, true, || {
-        if check_existing_daemon_state(&state_file, exe_mtime_sec, exe_mtime_nsec, true).is_some() {
-            return;
-        }
-        let Ok(port) =
-            TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr().map(|a| a.port()))
-        else {
-            return;
-        };
-        let addr = format!("127.0.0.1:{}", port);
-        let auth_token = generate_daemon_auth_token(std::process::id(), port);
-        let mut cmd = Command::new(&current_exe);
-        cmd.arg("--cache-dir")
-            .arg(&daemon_cache_dir)
-            .args(["serve", "--listen", &addr])
-            .envs(env_vars)
-            .env("TURBO_LEAN_DAEMON", "1")
-            .env("TURBO_LEAN_DAEMON_TOKEN", &auth_token)
-            .env("TURBO_LEAN_DAEMON_STATE_FILE", &state_file)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        #[cfg(unix)]
-        if std::env::var("TURBO_LEAN_KEEP_PROCESS_GROUP").is_err() {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
-        if let Ok(child) = cmd.spawn() {
-            let info = LocalZygoteDaemonInfo {
-                addr,
-                pid: child.id(),
-                exe_mtime_sec,
-                exe_mtime_nsec,
-                auth_token,
-                policy: daemon_policy(),
-            };
-            if let Ok(json_bytes) = serde_json::to_vec(&info) {
-                write_daemon_state_file_private(&state_file, &json_bytes);
-                write_daemon_state_file_private(
-                    &store.root.join("zygote_daemon.json"),
-                    &json_bytes,
-                );
-            }
+    let root = store.root.clone();
+    let env_vars = env_vars.clone();
+    std::thread::spawn(move || {
+        if let Ok(store) = TurboStore::open(Some(&root)) {
+            let _ = ensure_local_zygote_daemon_with_token(&store, &env_vars);
         }
     });
 }
@@ -3111,6 +3764,22 @@ fn parse_check_shard_resp(resp_bytes: &[u8]) -> Result<Option<serde_json::Value>
     }
 }
 
+fn is_expired_daemon_transport_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|e| {
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::NotConnected
+            )
+        })
+    })
+}
+
 fn extract_http_error_detail(err: anyhow::Error) -> anyhow::Error {
     let s = err.to_string();
     if let Some((_, json_part)) = s.split_once("): {") {
@@ -3124,19 +3793,37 @@ fn extract_http_error_detail(err: anyhow::Error) -> anyhow::Error {
     err
 }
 
+fn finish_check_shard_request(response: Result<Vec<u8>>) -> Result<Option<serde_json::Value>> {
+    match response {
+        Ok(bytes) => parse_check_shard_resp(&bytes),
+        Err(err) if is_expired_daemon_transport_error(&err) => Ok(None),
+        Err(err) => {
+            let err = extract_http_error_detail(err);
+            if err.to_string().contains("Zygote import unavailable") {
+                Ok(None)
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
 pub(crate) fn try_zygote_url_check_shard_inner_with_inflight_detailed(
     base_url: &str,
     req: &CheckShardHttpRequest,
     on_inflight: impl FnOnce(),
 ) -> Result<Option<serde_json::Value>> {
+    if daemon_disabled() {
+        return Ok(None);
+    }
     let endpoint = format!("{}/check-shard", base_url.trim_end_matches('/'));
     let mut local_req = req.clone();
     local_req.skip_cas_lock = true;
-    let body = serde_json::to_vec(&local_req)?;
+    let body = check_request_body(&local_req)?;
     let cached_tok = LAST_LOCAL_DAEMON_TOKEN
         .get()
         .and_then(|m| m.lock().ok().and_then(|g| g.clone()));
-    let resp_bytes = match http_request_with_timeout_and_token(
+    finish_check_shard_request(http_request_with_timeout_and_token(
         "POST",
         &endpoint,
         "application/json",
@@ -3144,20 +3831,7 @@ pub(crate) fn try_zygote_url_check_shard_inner_with_inflight_detailed(
         None,
         cached_tok.as_deref(),
         on_inflight,
-    ) {
-        Ok(b) => b,
-        Err(e) => {
-            let err = extract_http_error_detail(e);
-            if err.to_string().contains("Zygote import unavailable") {
-                return Ok(None);
-            }
-            return Err(err);
-        }
-    };
-    match parse_check_shard_resp(&resp_bytes) {
-        Err(e) if e.to_string().contains("Zygote import unavailable") => Ok(None),
-        other => other,
-    }
+    ))
 }
 
 pub fn try_zygote_url_check_shard_with_inflight(
@@ -3191,7 +3865,7 @@ pub fn try_local_zygote_check_shard_detailed(
     let endpoint = format!("{}/check-shard", base_url.trim_end_matches('/'));
     let mut local_req = req.clone();
     local_req.skip_cas_lock = true;
-    let body = serde_json::to_vec(&local_req)?;
+    let body = check_request_body(&local_req)?;
     match http_request_with_timeout_and_token(
         "POST",
         &endpoint,
@@ -3201,18 +3875,7 @@ pub fn try_local_zygote_check_shard_detailed(
         Some(&auth_token),
         || {},
     ) {
-        Ok(resp_bytes) => match parse_check_shard_resp(&resp_bytes) {
-            Err(e) if e.to_string().contains("Zygote import unavailable") => Ok(None),
-            other => other,
-        },
-        Err(e) => {
-            if e.to_string().contains("HTTP ") {
-                let err = extract_http_error_detail(e);
-                if err.to_string().contains("Zygote import unavailable") {
-                    return Ok(None);
-                }
-                return Err(err);
-            }
+        Err(e) if is_expired_daemon_transport_error(&e) => {
             if let Some((_, _, _, _, state_file)) = current_exe_daemon_paths(store) {
                 terminate_and_remove_daemon_state_file(&state_file);
             }
@@ -3222,7 +3885,7 @@ pub fn try_local_zygote_check_shard_detailed(
                 return Ok(None);
             };
             let retry_endpoint = format!("{}/check-shard", retry_url.trim_end_matches('/'));
-            let resp_bytes = http_request_with_timeout_and_token(
+            finish_check_shard_request(http_request_with_timeout_and_token(
                 "POST",
                 &retry_endpoint,
                 "application/json",
@@ -3230,10 +3893,9 @@ pub fn try_local_zygote_check_shard_detailed(
                 None,
                 Some(&retry_token),
                 || {},
-            )
-            .map_err(extract_http_error_detail)?;
-            parse_check_shard_resp(&resp_bytes)
+            ))
         }
+        response => finish_check_shard_request(response),
     }
 }
 
@@ -3420,6 +4082,11 @@ pub fn try_local_zygote_eval_with_args(
     lean_args: &[String],
 ) -> Option<ZygoteEvalReply> {
     let filtered_args = crate::module_builder::filter_allowed_lean_args(lean_args);
+    let timeout_ms = if timeout_ms > 0 {
+        timeout_ms
+    } else {
+        invocation_timeout_ms().unwrap_or(0)
+    };
     let t0 = std::time::Instant::now();
     let caller_cwd = std::env::current_dir()
         .ok()
@@ -3444,20 +4111,23 @@ pub fn try_local_zygote_eval_with_args(
         None
     };
 
-    let existing_daemon = current_exe_daemon_paths(store)
-        .and_then(|(_, exe_mtime_sec, exe_mtime_nsec, _, state_file)| {
-            check_existing_daemon_state(&state_file, exe_mtime_sec, exe_mtime_nsec, false).or_else(
-                || {
-                    check_existing_daemon_state(
-                        &store.root.join("zygote_daemon.json"),
-                        exe_mtime_sec,
-                        exe_mtime_nsec,
-                        false,
-                    )
-                },
-            )
-        })
-        .or_else(|| ensure_local_zygote_daemon_with_token(store, env_vars));
+    let existing_daemon = if daemon_disabled() {
+        None
+    } else {
+        current_exe_daemon_paths(store)
+            .and_then(|(_, exe_mtime_sec, exe_mtime_nsec, _, state_file)| {
+                check_existing_daemon_state(&state_file, exe_mtime_sec, exe_mtime_nsec, false)
+                    .or_else(|| {
+                        check_existing_daemon_state(
+                            &store.root.join("zygote_daemon.json"),
+                            exe_mtime_sec,
+                            exe_mtime_nsec,
+                            false,
+                        )
+                    })
+            })
+            .or_else(|| ensure_local_zygote_daemon_with_token(store, env_vars))
+    };
 
     let Some((base_url, auth_token)) = existing_daemon else {
         let rep = eval_with_zygote_pool_opts_with_args(
@@ -3577,6 +4247,237 @@ pub fn try_local_zygote_eval_with_args(
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    fn open_test_lifecycle_process(
+        child: &mut std::process::Child,
+        staging: Option<&Path>,
+    ) -> LifecycleProcess {
+        // spawn's exec handshake can precede the final /proc identity becoming readable.
+        // Establish a stable baseline before testing deliberate identity changes.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Some(process) = LifecycleProcess::open(child.id(), staging, None) {
+                return process;
+            }
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "test child exited before identity validation"
+            );
+            if std::time::Instant::now() >= deadline {
+                let pid = child.id();
+                let exe = fs::read_link(format!("/proc/{pid}/exe"));
+                let start = process_start_time(pid);
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("test child identity not ready: pid={pid}, exe={exe:?}, start={start:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_pidfd_revalidates_start_time_and_identity_before_signaling() {
+        let dir = std::env::temp_dir().join(format!("turbo-pidfd-{}", next_tmp_id()));
+        fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("turbo_zygote_pidfd_test");
+        fs::copy("/bin/sleep", &exe).unwrap();
+        let mut child = std::process::Command::new(&exe)
+            .arg("30")
+            .env("TURBO_LEAN_STAGING_DIR", &dir)
+            .spawn()
+            .unwrap();
+        let mut process = open_test_lifecycle_process(&mut child, Some(&dir));
+        process.start_time += 1;
+        assert!(
+            !process.signal(libc::SIGTERM),
+            "changed start time must refuse SIGTERM"
+        );
+        assert!(
+            !process.signal(libc::SIGKILL),
+            "changed start time must refuse SIGKILL"
+        );
+        assert!(child.try_wait().unwrap().is_none());
+        process.start_time -= 1;
+        process.identity.1.push(b'x');
+        assert!(
+            !process.signal(libc::SIGKILL),
+            "changed cmdline must refuse SIGKILL"
+        );
+        process.identity.1.pop();
+        assert!(process.signal(libc::SIGTERM));
+        child.wait().unwrap();
+        assert!(!process.alive());
+        assert!(
+            !process.signal(libc::SIGKILL),
+            "held pidfd must reject an exited process"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_multi_namespace_teardown_cleans_every_killed_namespace() {
+        let lifecycle = lifecycle_exclusive_lock().unwrap();
+        let mut children = Vec::new();
+        let mut processes = Vec::new();
+        let mut dirs = Vec::new();
+        for _ in 0..2 {
+            let dir = std::env::temp_dir().join(format!("turbo-stop-namespace-{}", next_tmp_id()));
+            fs::create_dir_all(&dir).unwrap();
+            let exe = dir.join("turbo_zygote_stop_test");
+            fs::copy("/bin/sleep", &exe).unwrap();
+            let mut child = Command::new(exe)
+                .arg("30")
+                .env("TURBO_LEAN_STAGING_DIR", &dir)
+                .spawn()
+                .unwrap();
+            // Same user-wide (staging=None) identity path, with an explicit candidate set
+            // so this test cannot affect any developer's live daemons.
+            processes.push(open_test_lifecycle_process(&mut child, None));
+            children.push(child);
+            dirs.push(dir);
+        }
+        let cleanup = terminate_linux_processes(processes);
+        for child in &mut children {
+            child.wait().unwrap();
+        }
+        assert_eq!(cleanup.count, 2);
+        assert_eq!(cleanup.staging.len(), 2);
+        assert_eq!(
+            cleanup_lifecycle_staging(cleanup, None, &lifecycle).unwrap(),
+            2
+        );
+        assert!(dirs.iter().all(|dir| !dir.exists()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_portable_pidfile_sigterm_fallback() {
+        use std::os::unix::process::CommandExt;
+        let dir = std::env::temp_dir().join(format!("turbo-pidfile-{}", next_tmp_id()));
+        fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("turbo-lean");
+        fs::copy("/bin/bash", &exe).unwrap();
+        fs::write(dir.join("serve"), "read -t 30\n").unwrap();
+        let mut child = Command::new(&exe)
+            .arg("serve")
+            .current_dir(&dir)
+            .env("TURBO_LEAN_DAEMON", "1")
+            .stdin(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let state = dir.join("zygote_daemon.json");
+        let info = LocalZygoteDaemonInfo {
+            addr: String::new(),
+            pid: child.id(),
+            exe_mtime_sec: 0,
+            exe_mtime_nsec: 0,
+            auth_token: String::new(),
+            policy: vec![],
+        };
+        fs::write(&state, serde_json::to_vec(&info).unwrap()).unwrap();
+        let mut identity = portable_process_identity(child.id())
+            .unwrap()
+            .expect("portable identity");
+        identity.start_time.push_str(" changed");
+        assert!(!signal_portable_process(child.id(), &identity, libc::SIGTERM).unwrap());
+        identity = portable_process_identity(child.id()).unwrap().unwrap();
+        identity.command.push_str(" changed");
+        assert!(!signal_portable_process(child.id(), &identity, libc::SIGKILL).unwrap());
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(portable_staging_namespace_in_use(&dir, Some(&dir)));
+        assert_eq!(stop_pidfile_daemons(&dir, Some(&dir)).unwrap().count, 1);
+        assert!(!child.wait().unwrap().success());
+        assert!(!stop_pidfile_daemon(&state).unwrap());
+        assert!(!portable_staging_namespace_in_use(&dir, Some(&dir)));
+        // A live PID without the daemon identity must not be killed, nor may its
+        // state file or staging be deleted. Malformed state is conservative too.
+        let mut foreign = Command::new("sleep").arg("30").spawn().unwrap();
+        let foreign_info = LocalZygoteDaemonInfo {
+            pid: foreign.id(),
+            ..info
+        };
+        fs::write(&state, serde_json::to_vec(&foreign_info).unwrap()).unwrap();
+        let cleanup = stop_pidfile_daemons(&dir, Some(&dir)).unwrap();
+        assert_eq!(cleanup.count, 0);
+        assert!(!cleanup.state_files.contains(&state));
+        assert!(portable_staging_namespace_in_use(&dir, Some(&dir)));
+        // A legacy PID file outside an otherwise empty staging namespace still
+        // vetoes deletion, even though scoped signalling must spare that PID.
+        let empty_staging = dir.join("empty-staging");
+        fs::create_dir_all(&empty_staging).unwrap();
+        assert!(portable_staging_namespace_in_use(
+            &empty_staging,
+            Some(&dir)
+        ));
+        assert!(foreign.try_wait().unwrap().is_none());
+        foreign.kill().unwrap();
+        foreign.wait().unwrap();
+        assert!(!portable_staging_namespace_in_use(&dir, Some(&dir)));
+        fs::write(&state, "invalid state").unwrap();
+        assert!(portable_staging_namespace_in_use(&dir, Some(&dir)));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn test_closed_daemon_transport_is_recoverable() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/check-shard", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut byte = [0];
+            let _ = std::io::Read::read(&mut stream, &mut byte);
+            // Expiry can close admission before a response is written.
+        });
+        let err = http_request_with_timeout_and_token(
+            "POST",
+            &url,
+            "application/json",
+            b"{}",
+            Some(1000),
+            None,
+            || {},
+        )
+        .unwrap_err();
+        assert!(is_expired_daemon_transport_error(&err), "{err:#}");
+        assert!(finish_check_shard_request(Err(err)).unwrap().is_none());
+        server.join().unwrap();
+        let err = http_request_with_timeout_and_token(
+            "POST",
+            &url,
+            "application/json",
+            b"{}",
+            Some(1000),
+            None,
+            || {},
+        )
+        .unwrap_err();
+        assert!(is_expired_daemon_transport_error(&err), "{err:#}");
+        assert!(finish_check_shard_request(Err(err)).unwrap().is_none());
+        assert!(!is_expired_daemon_transport_error(&anyhow::anyhow!(
+            "HTTP 500: proof failed"
+        )));
+    }
+
+    #[test]
+    fn test_daemon_stop_recognizes_the_serve_subcommand_only() {
+        for args in [
+            b"turbo-lean\0serve\0".as_slice(),
+            b"turbo-lean\0--cache-dir\0/tmp/cas\0--json\0serve\0--listen\0127.0.0.1:9400\0"
+                .as_slice(),
+        ] {
+            assert!(is_serve_command(args));
+        }
+        for args in [
+            b"turbo-lean\0check\0File.lean\0--decl\0serve\0".as_slice(),
+            b"turbo-lean\0--cache-dir\0serve\0check\0File.lean\0".as_slice(),
+        ] {
+            assert!(!is_serve_command(args));
+        }
+    }
+
     fn repo_lean_cfg() -> Option<crate::module_builder::ProjectConfig> {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lean");
         dir.join(".lake/packages/lean-sys/LeanSys/Posix.lean")
@@ -3656,6 +4557,8 @@ mod tests {
             let _ = fs::remove_dir_all(&tmp_dir);
             return None;
         }
+        // Fixture setup compiles the worker before any request's deadline begins.
+        ensure_zygote_binary(&store, &lean_bin, &env_vars).expect("prepare test worker");
         Some((tmp_dir, store, env_vars, lean_bin))
     }
 
@@ -3963,6 +4866,16 @@ mod tests {
                 && joined_msgs.contains("42")
         );
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_exhausted_budget_does_not_spawn_fallback() {
+        let started = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let remaining = remaining_timeout_ms(Some(100), started);
+        assert_eq!(remaining, 0);
+        let err = run_lean_command(&mut Command::new("must-not-be-spawned"), Some(remaining))
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
     }
 
     #[test]
@@ -4769,6 +5682,7 @@ mod tests {
             let _ = child.wait();
             ZygoteWorkerProcess {
                 child,
+                _owner: std::sync::mpsc::channel().0,
                 stdin,
                 stdout,
                 stderr_tail,

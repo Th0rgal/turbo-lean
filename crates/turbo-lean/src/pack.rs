@@ -2569,7 +2569,9 @@ pub fn http_request_full(
 
     let mut reader = BufReader::new(stream);
     let mut status_line = String::with_capacity(64);
-    reader.read_line(&mut status_line)?;
+    if reader.read_line(&mut status_line)? == 0 {
+        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "EOF before HTTP response").into());
+    }
     let mut content_len: Option<usize> = None;
     let mut header_sha256: Option<String> = None;
     let mut hline = String::with_capacity(128);
