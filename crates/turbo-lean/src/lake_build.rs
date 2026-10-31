@@ -2241,7 +2241,11 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
             }
             adj.insert(mod_name.clone(), sub_imps);
             ordered_imports.push((mod_name, imp_slash, dep_src));
-        } else {
+        } else if !matches!(
+            mod_name.split('.').next(),
+            Some("Init" | "Std" | "Lean" | "Lake")
+        ) {
+            // Toolchain modules carry no dependency-package evidence; skip config resolution.
             non_root_imports.push(mod_name);
         }
     }
@@ -2339,7 +2343,7 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
                 continue;
             }
             let dep_olean = &olean_of[mod_name];
-            let self_om = fs::metadata(&dep_olean).and_then(|m| m.modified()).ok();
+            let self_om = fs::metadata(dep_olean).and_then(|m| m.modified()).ok();
             if let Some(children) = adj.get(mod_name) {
                 for ch in children {
                     if stale_mods.contains(ch) {
@@ -2352,8 +2356,8 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
                         .find(|(m, _, _)| m == ch)
                         .map(|(_, _, src)| (src, &olean_of[ch]))
                     {
-                        let ch_om = fs::metadata(&ch_olean).and_then(|m| m.modified()).ok();
-                        let ch_sm = fs::metadata(&ch_src).and_then(|m| m.modified()).ok();
+                        let ch_om = fs::metadata(ch_olean).and_then(|m| m.modified()).ok();
+                        let ch_sm = fs::metadata(ch_src).and_then(|m| m.modified()).ok();
                         if let (Some(som), Some(com)) = (self_om, ch_om) {
                             if som < com {
                                 stale_mods.insert(mod_name.clone());
