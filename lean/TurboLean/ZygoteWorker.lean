@@ -555,7 +555,8 @@ def runCommandsFromState
     (stubTargets : List String := [])
     (stubs : List String := [])
     (finalRun : Bool := true)
-    (strictPrefix : Bool := false) : IO (Bool × Nat × Nat × Nat × List String × List String × String × List String × Command.State) := do
+    (strictPrefix : Bool := false)
+    (requiredTargets : Option (List String) := none) : IO (Bool × Nat × Nat × Nat × List String × List String × String × List String × Command.State) := do
   let t0 ← IO.monoNanosNow
   let hb0 ← IO.getNumHeartbeats
   let effectiveCode := if allowStub && !evalMode then sanitizeStubbedPrefixCode code else code
@@ -604,7 +605,7 @@ def runCommandsFromState
         unexemptPrefixStub baseState.env (if allowStub then stubs else []) stubTargets then
       errs := errs ++ ["[TurboLean.KernelGate] stubbed prefix holds a `sorry` theorem this check does not exempt"]
     -- An elaborator could drop a checked declaration, leaving nothing for the gate to audit.
-    if allowStub && finalRun && !stubTargets.all (declaresHostName s.commandState.env) then
+    if allowStub && finalRun && !(requiredTargets.getD stubTargets).all (declaresHostName s.commandState.env) then
       errs := errs ++ ["[TurboLean.KernelGate] a checked declaration is missing from the elaborated environment"]
     usedConstants := (collectNewDeclUsedConstants baseState.env s.commandState.env).toList
     proofTermNodes := countNewDeclExprNodes baseState.env s.commandState.env
@@ -809,7 +810,8 @@ def checkShardWithEnv
     (emitOlean? : Option (Name × System.FilePath) := none)
     (encodedLeanArgs : String := "")
     (stubTargets : List String := [])
-    (stubs : List String := []) : IO (Bool × Nat × Nat × Nat × List String × List String × String × List String) := do
+    (stubs : List String := [])
+    (requiredTargets : Option (List String) := none) : IO (Bool × Nat × Nat × Nat × List String × List String × String × List String) := do
   -- Eval mode elaborates with the options `Lean.Elab.runFrontend` forces on the command
   -- line (snapshot reporting and asynchronous elaboration); check mode keeps `{}`.
   let initOpts : Options := if evalMode then
@@ -826,6 +828,7 @@ def checkShardWithEnv
   let baseState := Command.mkState env {} (← withToolchainSatSolver opts)
   let (ok, elapsedUs, heartbeats, proofTermNodes, errs, allMessages, capturedStdout, usedConstants, finalSt) ←
     runCommandsFromState baseState bodyCode fileName allowStub evalMode stubTargets stubs
+      (requiredTargets := requiredTargets)
   let mut finalOk := ok
   let mut finalErrs := errs
   if finalOk then
@@ -1398,13 +1401,15 @@ def main (args : List String) : IO Unit := do
     let isRaceCandidates := modeFlag == "race_candidates" || modeFlag.startsWith "race_candidates"
     let allowStub := modeFlag == "allow_stub" || modeFlag.startsWith "allow_stub:"
     -- `allow_stub:<hex>`: newline-separated names of the declarations under check (never stub-exempt).
-    -- `allow_stub:<hex targets>:<hex stubs>`: newline-separated names of the declarations under check
-    -- (never stub-exempt) and of the prefix declarations the host stubbed (the only exemptable ones).
+    -- `allow_stub:<hex targets>:<hex stubs>[:<hex required>]`: newline-separated names of the declarations
+    -- under check (never stub-exempt), of the prefix declarations the host stubbed (the only exemptable
+    -- ones), and of the targets this request must declare (default: all targets).
     let stubLists := ((modeFlag.drop 11).toString.splitOn ":").map fun h =>
       ((TurboLean.ZygoteWorker.decodeHexToString h).splitOn "\n").filter (!·.isEmpty)
-    let (stubTargets, stubs) := if modeFlag.startsWith "allow_stub:" then
-        (stubLists.headD [], (stubLists.drop 1).headD [])
-      else ([], [])
+    let (stubTargets, stubs, requiredTargets) := if modeFlag.startsWith "allow_stub:" then
+        (stubLists.headD [], (stubLists.drop 1).headD [],
+          if stubLists.length > 2 then (stubLists.drop 2).headD [] else stubLists.headD [])
+      else ([], [], [])
     let evalMode := modeFlag == "eval" || modeFlag.startsWith "eval:"
     -- `strict_all`: no `sorry` stub is exempt anywhere, prefix checkpoints included (whole-file audits).
     let strictAll := modeFlag == "strict_all"
@@ -1525,6 +1530,7 @@ def main (args : List String) : IO Unit := do
         else
           let (ok, elabUs, hbs, ptNodes, errs, msgs, capOut, usedConsts) ←
             TurboLean.ZygoteWorker.checkShardWithEnv baseEnv bodyCode allowStub evalMode fn emitOlean? encodedLeanArgs stubTargets stubs
+              (requiredTargets := some requiredTargets)
           if !ok && errs.contains TurboLean.ZygoteWorker.runtimePanicErr then poisoned := true
           TurboLean.ZygoteWorker.emitZygoteReply stdout ok none kgActive true envCacheHit false importUs 0 elabUs hbs ptNodes (if ok then 1 else 0) capOut msgs errs usedConsts
       else
@@ -1665,7 +1671,7 @@ def main (args : List String) : IO Unit := do
           else
             let (ok, elabUs, dHbs, ptNodes, errs, dMsgs, dOut, usedConsts, finalSt) ←
               TurboLean.ZygoteWorker.runCommandsFromState ckptState bodyCode fn allowStub evalMode stubTargets stubs
-                (strictPrefix := strictAll)
+                (strictPrefix := strictAll) (requiredTargets := some requiredTargets)
             let mut finalOk := ok
             let mut finalErrs := errs
             if finalOk then
@@ -1713,6 +1719,7 @@ def main (args : List String) : IO Unit := do
             let combined := if prefixCode.endsWith "\n" then prefixCode ++ rest else prefixCode ++ "\n" ++ rest
             let (ok, elabUs, hbs, ptNodes, errs, msgs, capOut, usedConsts) ←
               TurboLean.ZygoteWorker.checkShardWithEnv baseEnv combined allowStub evalMode fn emitOlean? encodedLeanArgs stubTargets stubs
+                (requiredTargets := some requiredTargets)
             if !ok && errs.contains TurboLean.ZygoteWorker.runtimePanicErr then poisoned := true
             TurboLean.ZygoteWorker.emitZygoteReply stdout ok none kgActive true envCacheHit false importUs prefixUs elabUs hbs ptNodes (if ok then 1 else 0) capOut msgs errs usedConsts
     | none =>

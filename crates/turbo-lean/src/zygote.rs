@@ -1705,6 +1705,30 @@ fn stub_mode_flag(allow_stub: bool, stub_targets: &[String], shard_source: &str)
     }
 }
 
+/// `stub_mode` for one cross-file block of a request: every target still counts for ownership (never
+/// exempt), but the block must declare only the targets its own text declares.
+fn block_stub_mode(stub_mode: &str, stub_targets: &[String], blk: &str) -> String {
+    if !stub_mode.starts_with("allow_stub:") {
+        return stub_mode.to_string();
+    }
+    let shards = crate::splitter::split_lean_source(blk, &[]).shards;
+    let required: Vec<&str> = stub_targets
+        .iter()
+        .filter(|t| {
+            let one = std::collections::HashSet::from([(*t).clone()]);
+            shards
+                .iter()
+                .any(|sh| crate::splitter::matches_uncached_or_fast_verify_name(&sh.name, &one))
+        })
+        .map(String::as_str)
+        .collect();
+    format!(
+        "{}:{}",
+        stub_mode,
+        hex_encode_bytes(required.join("\n").as_bytes())
+    )
+}
+
 /// Check `shard_source` with its prefix `sorry` stubs admitted, but never the `sorryAx` of `stub_targets`.
 #[allow(clippy::too_many_arguments)]
 pub fn eval_with_zygote_pool_for_targets(
@@ -2283,14 +2307,14 @@ fn eval_with_zygote_pool_inner(
                 .iter()
                 .map(|blk| {
                     let hb = hex_encode_bytes(blk.as_bytes());
+                    let mode_flag = block_stub_mode(&stub_mode, stub_targets, blk);
                     if hex_opts.is_empty() {
-                        if stub_mode != "strict" {
-                            format!("{}\t{}\t{}\n", imports_csv, hb, stub_mode)
+                        if mode_flag != "strict" {
+                            format!("{}\t{}\t{}\n", imports_csv, hb, mode_flag)
                         } else {
                             format!("{}\t{}\n", imports_csv, hb)
                         }
                     } else {
-                        let mode_flag = stub_mode.as_str();
                         format!("{}\t{}\t{}\t\t\t{}\n", imports_csv, hb, mode_flag, hex_opts)
                     }
                 })
