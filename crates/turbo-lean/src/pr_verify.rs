@@ -1363,8 +1363,17 @@ fn base_revision_package_config(
     canon_dir: &Path,
     base_ref: &str,
 ) -> Result<Option<crate::module_builder::PackageConfig>> {
-    let sha = resolve_git_head_sha(repo_root, base_ref)
-        .with_context(|| format!("Invalid git base ref `{base_ref}`"))?;
+    let sha = match resolve_git_head_sha(repo_root, base_ref) {
+        Some(sha) => sha,
+        None => {
+            let out = Command::new("git").arg("-C").arg(repo_root)
+                .args(["rev-parse", "--verify", "--end-of-options"])
+                .arg(format!("{base_ref}^{{commit}}"))
+                .output().context("Failed to resolve Git base revision")?;
+            anyhow::ensure!(out.status.success(), "Invalid git base ref `{base_ref}`: {}", String::from_utf8_lossy(&out.stderr).trim());
+            String::from_utf8(out.stdout)?.trim().to_string()
+        }
+    };
     let prefix = rel_path_from_dir(canon_dir, repo_root);
     let paths: Vec<_> = ["lakefile.toml", "lakefile.lean"]
         .iter()
@@ -1441,7 +1450,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
     let option_changed_paths: std::collections::HashSet<String> = lean_paths
         .iter()
         .map(|p| rel_path_from_dir(p, canon_dir))
-        .filter(|rel| resolve_rel_lean_args(rel) != resolve_base_lean_args(rel))
+        .filter(|rel| rel != "lakefile.lean" && resolve_rel_lean_args(rel) != resolve_base_lean_args(rel))
         .collect();
 
     enum PrFileEntry {
@@ -5817,12 +5826,13 @@ end Fixture
             assert!(!changed["Demo/A.lean"][0].2);
         }
         git_init_and_commit(&repo, "head options")?;
-        assert_eq!(
-            load_and_classify_pr_from_git(&store, &repo, &base, tc)?
-                .0
-                .proof_edited_theorems,
-            vec!["Demo/A.lean::affected"]
-        );
+        for base_ref in [base.as_str(), "HEAD~1", "HEAD^", &base[..12]] {
+            assert_eq!(
+                load_and_classify_pr_from_git(&store, &repo, base_ref, tc)?.0.statement_edited_theorems,
+                vec!["Demo/A.lean::affected"]
+            );
+        }
+        assert!(load_and_classify_pr_from_git(&store, &repo, "invalid-base-ref", tc).is_err());
         fs::write(
             repo.join("lakefile.toml"),
             "name = \"bad\"\nmoreLeanArgs = [\"--plugin=bad.so\"]\n",

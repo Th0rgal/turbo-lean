@@ -3883,7 +3883,7 @@ where
 pub fn validate_effective_lean_args(args: &[String]) -> Result<Vec<String>> {
     args.iter()
         .map(|arg| {
-            let arg = arg.trim();
+            let arg = arg.as_str();
             anyhow::ensure!(
                 is_allowed_lean_arg(arg) && !matches!(arg, "--json" | "-q" | "--quiet"),
                 "Unsupported effective Lean compiler flag `{arg}`"
@@ -10699,6 +10699,7 @@ lean_exe «demo-exe» where
             vec!["-DautoImplicit=false".to_string()]
         );
         assert!(compute_lean_args_digest(&["--json".to_string()]).is_err());
+        assert!(compute_lean_args_digest(&[" -DautoImplicit=false ".to_string()]).is_err());
         assert_eq!(compute_lean_args_digest(&[]).unwrap(), None);
         assert!(compute_lean_args_digest(&[
             "--plugin=evil.so".to_string(),
@@ -10735,6 +10736,9 @@ roots = ["Fast"]
         )
         .unwrap();
         assert!(try_resolve_lean_args_for_path(&dir, None).is_err());
+        fs::write(dir.join("lakefile.toml"), "name = \"padded\"\nmoreLeanArgs = [\" -DautoImplicit=false "]\n").unwrap();
+        assert!(try_resolve_lean_args_for_path(&dir, None).is_err());
+
 
         fs::write(
             dir.join("lakefile.toml"),
