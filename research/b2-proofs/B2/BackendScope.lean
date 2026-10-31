@@ -14,39 +14,34 @@ set_option maxHeartbeats 2000000
 set_option cbv.maxSteps 1000000
 set_option Elab.async false
 
-/-- Boolean conditions avoid repeatedly transporting the lookup's decidable instance. -/
+/-- Keep lookup conditions Boolean while preserving the actual HashMap operation. -/
 theorem lookup_insertIfNew {α β : Type} [BEq α] [Hashable α] [EquivBEq α]
     [LawfulHashable α] (m : Std.HashMap α β) (k a : α) (v : β) :
-    (m.insertIfNew k v)[a]? =
-      if k == a && !m.contains k then some v else m[a]? := by
+    (m.insertIfNew k v).get? a =
+      if k == a && !m.contains k then some v else m.get? a := by
+  change (m.insertIfNew k v)[a]? = _
   rw [Std.HashMap.getElem?_insertIfNew]
   simp [Bool.and_eq_true]
 
-@[cbv_eval] theorem lookup_method_insertIfNew {α β : Type} [BEq α] [Hashable α] [EquivBEq α]
-    [LawfulHashable α] (m : Std.HashMap α β) (k a : α) (v : β) :
-    (m.insertIfNew k v).get? a =
-      if k == a && !m.contains k then some v else m.get? a := lookup_insertIfNew m k a v
-
-@[cbv_eval] theorem lookup_method_empty {α β : Type} [BEq α] [Hashable α]
+theorem lookup_method_empty {α β : Type} [BEq α] [Hashable α]
     (a : α) (capacity : Nat) :
     (Std.HashMap.emptyWithCapacity capacity : Std.HashMap α β).get? a = none := by
   exact Std.HashMap.getElem?_emptyWithCapacity
 
-attribute [cbv_opaque] Std.HashMap.get?
+attribute [local cbv_opaque] Std.HashMap.get?
 attribute [-cbv_eval] Std.HashSet.ofList_eq_insertMany_empty
 attribute [local cbv_opaque] Std.HashMap.insertIfNew Std.HashSet.ofList
-attribute [local cbv_eval] lookup_insertIfNew Std.HashMap.contains_insertIfNew
+attribute [local cbv_eval] lookup_insertIfNew lookup_method_empty Std.HashMap.contains_insertIfNew
   Std.HashSet.contains_ofList
 
 
-/-- Normalize folded containers before their observation is unfolded to raw hashing. -/
+/-- Normalize folded containers before observing them. -/
 open Lean Meta Sym.Simp in
 cbv_simproc ↓ normalizeLookup (_) := fun e => do
   let some n := e.getAppFn.constName? | return .rfl
-  unless n == ``GetElem?.getElem? || n == ``Std.HashMap.contains ||
+  unless n == ``Std.HashMap.get? || n == ``Std.HashMap.contains ||
       n == ``Std.HashSet.contains do return .rfl
   return ← simpAppArgRange e 0 e.getAppNumArgs
-
 
 theorem subset (p : Clif.Program) : InSubset p B2.Smoke.collatz := by
   refine ⟨B2.Lowering.lower_in_subsetE _ _ B2.Smoke.collatz_lowered, ?_, ?_, ?_, ?_⟩
@@ -68,7 +63,10 @@ theorem scope : lowerScopeB B2.Smoke.collatz = true := by
   rw [← B2.Artifacts.input_eq]
   decide +kernel
 
+attribute [cbv_eval] Std.HashSet.ofList_eq_insertMany_empty
+
 #print axioms lookup_insertIfNew
+#print axioms lookup_method_empty
 #print axioms subset
 #print axioms dominated
 #print axioms scope

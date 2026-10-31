@@ -51,4 +51,11 @@ theorem indirect_contract (env : Clif.Env) (MR : MemRelT) (X : ExtSem) :
   rw [B2.CallFree.no_indirect_sigs]
   exact xCallsIndOk_nil env MR X
 
+#print axioms prepared_call_free
+#print axioms no_call_site
+#print axioms callee_ok
+#print axioms try_contract
+#print axioms tls_contract
+#print axioms extern_contract
+#print axioms indirect_contract
 end B2.BackendContracts

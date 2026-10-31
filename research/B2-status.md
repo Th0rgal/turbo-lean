@@ -1,7 +1,7 @@
 # B2 status
 
 Baseline: `5508b9f`; clifv `5018b9509dc124154dbe08a5bd85862595d8eab7`.
-Checkpoint: 2026-10-31 16:53 UTC. The executable lowering lives in
+Checkpoint: 2026-10-31 17:14 UTC. The executable lowering lives in
 `lean/LeanNative/Backend/Clif.lean`; `compile-clif` calls that definition.
 The default proof build and transitive axiom audit pass on Lean 4.34.1.
 
@@ -32,8 +32,8 @@ Six compiler/proof source pairs are committed byte-identical (Types,
 AST, Codec, Value, Eval, Clif). `scripts/check_b2_source_identity.py`
 verifies them and a clean pinned clifv. `.github/workflows/b2.yml` enforces
 source identity, the proof build, and compiler-toolchain integration.
-Remote CI for checkpoint `02dfbed` passed:
-https://github.com/Th0rgal/turbo-lean/actions/runs/41207047569 .
+Remote CI for checkpoint `3384b43` passed:
+https://github.com/Th0rgal/turbo-lean/actions/runs/41222068418 .
 The local Lean 4.35 CoreCLI integration build passed; the actual compiler
 dispatcher emitted collatz_steps CLIF. `research/b2-compiler-smoke.lean`
 records that check and CI runs it too.
@@ -89,8 +89,17 @@ Durable job `d6c09d26-5bfe-53a1-851b-650addbeee3f` builds the active B2 root
 and then FinalDirect sequentially, with native `TURBO_LEAN_JOBS=1` and
 `TURBO_LEAN_MODULE_TIMEOUT_SECS=7200`. Logs are `.b2-work/root-v2.log` and
 `.b2-work/final-v2.log`; no compiler pausing is used. `LEAN_NUM_THREADS=4`
-and telemetry off apply throughout. These builds are pending, not passing
-evidence for the restored checkout.
+and telemetry off apply throughout. The active-root rebuild finished successfully
+at 17:12 UTC, including the strict transitive axiom audit. FinalDirect is now
+the active build step. The new export produced 352 bytes with SHA-256
+`ccc8f0891484b6692e2be2315f2e729c2fc4e75831561fb07a7c76884991557b`;
+Clang 18's AArch64 assembler produced byte-identical `.text`.
+
+Durable follow-up job `8a4a171c-8b2e-54c2-b067-6c1d0b087c9e` waits for those
+existing dependency artifacts before checking the excluded scope, contracts,
+and end-to-end drafts in sequence. Its outputs are in `.b2-work/scope.log`,
+`contracts.log`, and `end-to-end.log`; pending checks do not establish any
+of O5/O6/O7.
 
 `B2.BackendScope` is an excluded, unverified draft split from BackendContracts
 to isolate the dominance check. Its Boolean `insertIfNew` lookup lemma passed
