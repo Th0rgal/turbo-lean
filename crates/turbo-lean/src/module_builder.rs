@@ -9615,6 +9615,68 @@ lean_exe «demo-exe» where
         Ok(())
     }
 
+    /// P0-4: rebuilding only an imported module (`build App.A`) must invalidate the manifest
+    /// entry of its reverse dependent `App.B`, whose `.olean` was elaborated against the old `A`.
+    #[test]
+    fn test_dependent_manifest_entry_stale_after_import_only_rebuild() {
+        let dir = make_temp_test_dir("stale_dependent");
+        let proj_dir = dir.join("proj");
+        fs::create_dir_all(proj_dir.join("App")).unwrap();
+        fs::write(
+            proj_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )
+        .unwrap();
+        fs::write(
+            proj_dir.join("lakefile.toml"),
+            "name = \"app_pkg\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\nglobs = [\"App.+\"]\n",
+        )
+        .unwrap();
+        let a_src = |v: u32| format!("namespace App\ndef g : Nat := {v}\nend App\n");
+        fs::write(proj_dir.join("App/A.lean"), a_src(3)).unwrap();
+        let b_file = proj_dir.join("App/B.lean");
+        let b_src = "import App.A\nnamespace App\ntheorem g_eq : g = 3 := rfl\nend App\n";
+        fs::write(&b_file, b_src).unwrap();
+        let mut store = TurboStore::open(Some(&dir.join(".turbo_store"))).unwrap();
+        let mut build = |targets: &[String]| {
+            build_project_modules_native(
+                &mut store,
+                &proj_dir,
+                targets,
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap()
+        };
+        assert_eq!(build(&[]).modules_compiled, 2);
+        let canon = proj_dir.canonicalize().unwrap();
+        let canon_b = b_file.canonicalize().unwrap();
+        assert!(crate::lake_build::is_file_verified_in_lake_build(
+            &canon, &canon_b, b_src
+        ));
+        assert!(crate::lake_build::resolve_prebuilt_module_import(&canon, &canon_b).is_some());
+        // Edit `A` so `B`'s theorem no longer holds, then rebuild only `App.A`.
+        fs::write(proj_dir.join("App/A.lean"), a_src(4)).unwrap();
+        let rep = build(&["App.A".to_string()]);
+        assert_eq!(rep.compiled_modules, vec!["App.A".to_string()]);
+        assert!(
+            !crate::lake_build::is_file_verified_in_lake_build(&canon, &canon_b, b_src),
+            "`App.B` reported verified from an `.olean` built against the old `App.A`"
+        );
+        assert!(crate::lake_build::resolve_prebuilt_module_import(&canon, &canon_b).is_none());
+        // Restoring the original `A` (CAS hit) makes `B`'s recorded inputs current again.
+        fs::write(proj_dir.join("App/A.lean"), a_src(3)).unwrap();
+        let rep = build(&["App.A".to_string()]);
+        assert_eq!(rep.cached_modules, vec!["App.A".to_string()]);
+        assert!(crate::lake_build::is_file_verified_in_lake_build(
+            &canon, &canon_b, b_src
+        ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_native_module_builder_cas_partial_invalidation_lazy_c_and_lake_differential() {
         let dir = make_temp_test_dir("native_e2e");
