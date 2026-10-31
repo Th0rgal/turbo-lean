@@ -3175,7 +3175,9 @@ pub fn plain_lean_audit(
         let keyword = ["theorem ", "lemma "].iter().find_map(|kw| {
             head.match_indices(kw)
                 .map(|(i, _)| (i, kw.len()))
-                .find(|&(i, _)| i == 0 || head[..i].ends_with(|c: char| c.is_whitespace() || c == ']'))
+                .find(|&(i, _)| {
+                    i == 0 || head[..i].ends_with(|c: char| c.is_whitespace() || c == ']')
+                })
         });
         if let Some((i, len)) = keyword {
             *line = format!("{}axiom {}\n", &head[..i], head[i + len..].trim_end());
@@ -3206,15 +3208,23 @@ impl PlainLeanAudit {
             )];
         }
         let is_stub = |ax: &str| {
-            self.stubs
-                .iter()
-                .any(|s| ax == s || ax.strip_suffix(s.as_str()).is_some_and(|p| p.ends_with('.')))
+            self.stubs.iter().any(|s| {
+                ax == s
+                    || ax
+                        .strip_suffix(s.as_str())
+                        .is_some_and(|p| p.ends_with('.'))
+            })
         };
         reports
             .iter()
             .flat_map(|(n, axs)| axs.iter().map(move |a| (n, a)))
             .filter(|(_, a)| !axiom_allowed_under(a, allowed) && !is_stub(a))
-            .map(|(n, a)| format!("[TurboLean.KernelGate] `{}` depends on disallowed axiom `{}`", n, a))
+            .map(|(n, a)| {
+                format!(
+                    "[TurboLean.KernelGate] `{}` depends on disallowed axiom `{}`",
+                    n, a
+                )
+            })
             .collect()
     }
 }

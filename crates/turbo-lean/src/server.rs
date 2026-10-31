@@ -1238,8 +1238,8 @@ fn run_lean_temp_file(
 ) -> Result<(i32, String, String)> {
     let staging = store.fast_staging_dir();
     let tmp = staging.join(format!("{}_{}.lean", prefix, next_tmp_id()));
-    let plan = (!audit.is_empty())
-        .then(|| crate::splitter::plain_lean_audit(source, audit, audit.len()));
+    let plan =
+        (!audit.is_empty()).then(|| crate::splitter::plain_lean_audit(source, audit, audit.len()));
     let audited_src = plan.as_ref().map_or(source, |p| p.source.as_str());
     fs::write(&tmp, &audited_src)?;
     let mut cmd = Command::new(lean_bin);
