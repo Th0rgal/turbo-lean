@@ -2,6 +2,8 @@ import B2.CollatzClif
 import FV.Backend.Regalloc
 import FV.Backend.Encode
 import FV.Backend.InputScope
+import Std.Data.HashMap.Lemmas
+import Std.Data.HashSet.Lemmas
 
 /-! O5 artifacts from clifv's real executable pipeline, including its checked spill allocation.
 These definitions are not a model of compilation; each successful equation is kernel-checked. -/
@@ -36,6 +38,8 @@ def af : AFunc := (lowerRFunc vcp rf).toOption.getD default
 def fa : FnAsm := (emitFunc 0 af).toOption.getD default
 def fb : FnBin := fa.layout.toOption.getD default
 
+-- `cbv` produces kernel-checked equality proofs and uses Std's map lemmas;
+-- direct decision reduction gets stuck on the emitter's opaque `mixHash`.
 private theorem success {α : Type} [Inhabited α] (e : Except String α)
     (h : e.isOk = true) : e = .ok (e.toOption.getD default) := by
   cases e with
@@ -48,31 +52,31 @@ theorem verifiable : Backend.verifiable B2.Smoke.collatz = true := by decide +ke
 
 theorem lower : lowerFunction B2.Smoke.collatz = .ok vc := by
   rw [← input_eq]
-  exact success _ (by decide +kernel)
+  exact success _ (by cbv)
 
 #print axioms lower
 
-theorem prepared : prepare vc = .ok vcp := success _ (by decide +kernel)
+theorem prepared : prepare vc = .ok vcp := success _ (by cbv)
 
 #print axioms prepared
 
 theorem allocation_checked : checkAlloc vcp rf = .ok () := by
-  have h : (checkAlloc vcp rf).isOk = true := by decide +kernel
+  have h : (checkAlloc vcp rf).isOk = true := by cbv
   cases hc : checkAlloc vcp rf with
   | error _ => rw [hc] at h; cases h
   | ok u => cases u; rfl
 
 #print axioms allocation_checked
 
-theorem allocated : lowerRFunc vcp rf = .ok af := success _ (by decide +kernel)
+theorem allocated : lowerRFunc vcp rf = .ok af := success _ (by cbv)
 
 #print axioms allocated
 
-theorem emitted : emitFunc 0 af = .ok fa := success _ (by decide +kernel)
+theorem emitted : emitFunc 0 af = .ok fa := success _ (by cbv)
 
 #print axioms emitted
 
-theorem laid_out : fa.layout = .ok fb := success _ (by decide +kernel)
+theorem laid_out : fa.layout = .ok fb := success _ (by cbv)
 
 #print axioms laid_out
 

@@ -57,12 +57,28 @@ reclaim/I/O stalls. Artifact checks are stopped: finish the existing backend
 build first, then run one heavyweight check at a time. The live backend build
 is PID 1926474, from `research/b2-proofs`, logging to `/tmp/b2-final-cone.log`.
 RefinesInsts has finished; RegallocInstsInt/ZR and dependent modules remain.
-Do not duplicate or restart this live build. The inspected executable pipeline
+The Lake scheduler was temporarily stopped to let the two largest existing
+proofs finish; `/tmp/b2-resume-lake.py` resumes it when they exit.
+`/tmp/b2-limit-lean-jobs.py 1926474` now limits its compiler subprocesses to one
+at a time (each still has four Lean threads), logging to
+`/tmp/b2-limit-lean-jobs.log`. Two smaller jobs were intentionally deferred to
+free memory: `FV.Backend.Proof.CSemRename` and
+`FV.Backend.Proof.LogicImmComplete`. The original build will report these
+failures; after it drains, retry the same FinalDirect target with the same
+one-compiler controller so the completed large proofs are reused.
+Do not duplicate or restart a still-working compiler on a polling timeout. The inspected executable pipeline
 reports success through allocation check, emission, and layout; kernel
 certification is still open. `Artifacts.input` is a snapshot tied to the actual
 lowering by an equality, to prevent repeated lowering during backend checks.
 The temporary `/tmp/b2-artifacts-instrumented.lean` reports its stage in
 `/tmp/b2-artifact-stage`; its last attempted stage was `lowerFunction`.
+Emission uses `Std.HashMap Lbl` and Lean's opaque `mixHash`, so plain
+`decide +kernel` gets stuck. `Artifacts` now uses proof-producing `cbv` with
+Std's certified map rewrite lemmas. `/tmp/b2-cbv-hashmap.lean` verified an
+opaque pair-hash lookup with axioms `[propext, Classical.choice, Quot.sound]`;
+the actual pipeline equations still need to be run, separately from the
+backend dependency build. The old instrumented temporary copy predates this
+`cbv` change: regenerate it before use.
 
 `CalleeOk.pc` and `.ext` are unconditional even for no call sites. The composition
 code retains precisely these hook/program-preservation contracts and discharges
