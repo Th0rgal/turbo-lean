@@ -2896,8 +2896,11 @@ pub(crate) fn stage_lake_build_outputs(
         let mut sync_shared = |dest_p: &Path| {
             let shared_stop = shared_blobs.parent().unwrap_or(&shared_blobs);
             let shared_created = if !seen_shared_prefix[p_idx] {
+                let Ok(dirs) = crate::db::ensure_dir_tracking(&shared_dir, shared_stop) else {
+                    return;
+                };
                 seen_shared_prefix[p_idx] = true;
-                crate::db::ensure_dir_tracking(&shared_dir, shared_stop).unwrap_or_default()
+                dirs
             } else {
                 Vec::new()
             };
@@ -2912,7 +2915,15 @@ pub(crate) fn stage_lake_build_outputs(
         let ino = if matches!(
             crate::db::probe_blob_file(&dest, entry.size_bytes),
             crate::db::BlobDisk::Intact(_)
-        ) || (matches!(
+        ) {
+            let f = fs::File::open(&dest)?;
+            crate::db::durability_barrier(&f)?;
+            if let Some(parent) = dest.parent() {
+                crate::db::sync_dir(parent)?;
+            }
+            sync_shared(&dest);
+            dest_ino(&dest)
+        } else if (matches!(
             crate::db::probe_blob_file(&shared_p, entry.size_bytes),
             crate::db::BlobDisk::Intact(_)
         ) && crate::db::publish_durable_link(&shared_p, &dest, &[]).is_ok())
@@ -3096,8 +3107,10 @@ pub fn dedup_worktree_packages(
                     };
 
                     let shard_dir = pkg_cas_dir.join(&hash_hex[0..2]);
-                    let created =
-                        crate::db::ensure_dir_tracking(&shard_dir, &store.root).unwrap_or_default();
+                    let Ok(created) = crate::db::ensure_dir_tracking(&shard_dir, &store.root)
+                    else {
+                        continue;
+                    };
                     let cas_file = shard_dir.join(&hash_hex);
 
                     if let Ok(cas_meta) = fs::metadata(&cas_file)
@@ -3105,16 +3118,19 @@ pub fn dedup_worktree_packages(
                         .filter(|m| m.len() == sz)
                         .ok_or(())
                     {
-                        for dir in &created {
-                            let _ = crate::db::sync_dir(dir);
-                        }
+                        let cas_durable = fs::File::open(&cas_file)
+                            .and_then(|f| crate::db::durability_barrier(&f))
+                            .is_ok()
+                            && crate::db::sync_dir(&shard_dir).is_ok()
+                            && created.iter().all(|dir| crate::db::sync_dir(dir).is_ok());
                         #[cfg(unix)]
                         let same_inode =
                             cas_meta.dev() == meta.dev() && cas_meta.ino() == meta.ino();
                         #[cfg(not(unix))]
                         let same_inode = false;
 
-                        if !same_inode
+                        if cas_durable
+                            && !same_inode
                             && crate::db::try_reflink_or_hardlink(&cas_file, &path, Some(sz))
                                 .is_ok()
                         {
@@ -3134,11 +3150,11 @@ pub fn dedup_worktree_packages(
                             .and_then(|f| crate::db::durability_barrier(&f))
                             .is_ok();
                         if synced && fs::hard_link(&path, &cas_file).is_ok() {
-                            let _ = crate::db::sync_dir(&shard_dir);
-                            for dir in &created {
-                                let _ = crate::db::sync_dir(dir);
+                            if crate::db::sync_dir(&shard_dir).is_ok()
+                                && created.iter().all(|dir| crate::db::sync_dir(dir).is_ok())
+                            {
+                                hardlinked_files += 1;
                             }
-                            hardlinked_files += 1;
                         } else if let Ok(bytes) = fs::read(&path) {
                             if crate::db::write_blob_atomic(
                                 &store.root,
@@ -3148,15 +3164,11 @@ pub fn dedup_worktree_packages(
                                 true,
                             )
                             .is_ok()
-                            {
-                                for dir in &created {
-                                    let _ = crate::db::sync_dir(dir);
-                                }
-                                if crate::db::try_reflink_or_hardlink(&cas_file, &path, Some(sz))
+                                && created.iter().all(|dir| crate::db::sync_dir(dir).is_ok())
+                                && crate::db::try_reflink_or_hardlink(&cas_file, &path, Some(sz))
                                     .is_ok()
-                                {
-                                    hardlinked_files += 1;
-                                }
+                            {
+                                hardlinked_files += 1;
                             }
                         }
                     }
