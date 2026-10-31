@@ -835,19 +835,7 @@ pub fn auto_fastcheck_batch(
     let mut first_certified = false;
 
     for (decl_name, stmt_src) in items {
-        let formatted_src = if stmt_src.trim_start().starts_with("theorem ")
-            || stmt_src.trim_start().starts_with("lemma ")
-            || stmt_src.contains("\ntheorem ")
-        {
-            stmt_src.clone()
-        } else if stmt_src.trim_start().starts_with('(')
-            || stmt_src.trim_start().starts_with('{')
-            || stmt_src.trim_start().starts_with(':')
-        {
-            format!("theorem {} {} := by sorry", decl_name, stmt_src.trim())
-        } else {
-            format!("theorem {} : {} := by sorry", decl_name, stmt_src.trim())
-        };
+        let formatted_src = stmt_src.clone();
 
         let combined_lower = format!("{} {}", decl_name, stmt_src).to_ascii_lowercase();
         let cbv_offload_recommended = combined_lower.contains("cbv")

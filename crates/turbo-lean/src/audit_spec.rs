@@ -197,6 +197,7 @@ pub(super) fn extract_all_lean_theorems(
                 };
 
                 let mut binders = Vec::new();
+                let mut instance_binders = Vec::new();
                 let mut found_colon = false;
                 while i < n {
                     while i < n && chars[i].is_whitespace() {
@@ -252,6 +253,11 @@ pub(super) fn extract_all_lean_theorems(
                                     binders.push((var_names, ty_part.trim().to_string()));
                                 }
                             }
+                        } else {
+                            let inst_ty = split_top_level_colon(&inner)
+                                .map(|(_, ty)| ty.trim())
+                                .unwrap_or_else(|| inner.trim());
+                            instance_binders.push(inst_ty.to_string());
                         }
                     } else {
                         i += 1;
@@ -323,6 +329,7 @@ pub(super) fn extract_all_lean_theorems(
                         out.push(ExtractedDecl {
                             name: decl_name,
                             binders,
+                            instance_binders,
                             prop_str: trimmed,
                         });
                         if matches!(target_name, Some(t) if !t.is_empty() && t != "auto") {
