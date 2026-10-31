@@ -4096,11 +4096,36 @@ fn checked_input_path(path: &Path) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+/// Process-local memo for [`hash_input_target`], keyed by the input declaration plus the
+/// `(len, mtime)` of every file it selects. One command resolves the project config several times
+/// (`load_verified_project_manifest`, `update_with_lake_input_digests`, the DAG builder), and each
+/// resolve would otherwise re-read every byte of every declared input. The directory walk still
+/// runs, so the file set and its stats are always observed fresh; only the content hashing is
+/// reused.
+///
+/// `(len, mtime)` alone is not a safe content key in a process that outlives an edit (`serve`, the
+/// zygote daemon): a write that keeps the length and lands in the same filesystem mtime tick would
+/// be served the old hash. [`INPUT_MEMO_SETTLE`] closes that window.
+static INPUT_HASH_MEMO: OnceLock<Mutex<HashMap<String, (String, String)>>> = OnceLock::new();
+
+/// How far in the past every selected file's mtime must sit before its hash may be memoized.
+///
+/// A file touched more recently than this is hashed fresh on every resolve and never cached, so no
+/// `(len, mtime)` collision can hide an in-flight edit. Coarse-granularity filesystems (HFS+ and
+/// some network mounts tick once per second) are covered with room to spare, and the inputs a build
+/// actually re-reads are almost always older than this, so the memo still elides the repeat work.
+const INPUT_MEMO_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// BLAKE3 and Lake file hash of the files an `input_file` / `input_dir` selects, read exactly like
 /// Lake's `inputFile` / `inputDir`: a recursive walk (following symlinks) of regular files kept by
 /// the extension filter, ordered by full path like Lake's `qsort (toString · < toString ·)`.
 /// `text := true` normalizes `\r\n` as Lake's `computeTextFileHash` does. The Lake hash of an
 /// `input_dir` folds its files left-to-right from `Hash.nil`, matching `Job.collectArray`.
+///
+/// A symlink under an `input_dir` is followed like Lake follows it, so its target's bytes land in
+/// both hashes even when that target lives outside the repository. The pr-verify path classifier
+/// only sees git-tracked paths and would not report such a file as changed, but the digests here --
+/// and so [`compute_module_cas_key`] -- still move when its contents do.
 fn hash_input_target(pkg_root: &Path, input: &InputTargetConfig) -> Result<(String, String)> {
     let root = pkg_root.join(checked_input_path(&input.path)?);
     let mut files = vec![root.clone()];
@@ -4120,6 +4145,54 @@ fn hash_input_target(pkg_root: &Path, input: &InputTargetConfig) -> Result<(Stri
             }
         }
         files.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
+    }
+    let mut memo_key = format!(
+        "{}\u{0}{}\u{0}{}{}\u{0}{}",
+        pkg_root.display(),
+        input.path.display(),
+        u8::from(input.is_dir),
+        u8::from(input.text),
+        input.extension.as_deref().unwrap_or("")
+    );
+    // Only files that have been still for `INPUT_MEMO_SETTLE` may be keyed by `(len, mtime)`; one
+    // recently written file makes this whole target hash fresh every time.
+    let mut memoizable = true;
+    let settled_before = std::time::SystemTime::now()
+        .checked_sub(INPUT_MEMO_SETTLE)
+        .unwrap_or(std::time::UNIX_EPOCH);
+    for f in &files {
+        let Ok(m) = fs::metadata(f) else {
+            // Unreadable here means the read below will fail too, or the walk raced a deletion;
+            // either way do not record a hash for a file set we could not fully stat.
+            memoizable = false;
+            continue;
+        };
+        let Ok(mtime) = m.modified() else {
+            memoizable = false;
+            continue;
+        };
+        if mtime > settled_before {
+            memoizable = false;
+        }
+        let nanos = mtime
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        memo_key.push_str(&format!(
+            "\u{0}{}\u{0}{}\u{0}{}",
+            f.display(),
+            m.len(),
+            nanos
+        ));
+    }
+    let memo = INPUT_HASH_MEMO.get_or_init(Default::default);
+    if memoizable {
+        if let Some(hit) = memo
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&memo_key).cloned())
+        {
+            return Ok(hit);
+        }
     }
     let mut h = blake3::Hasher::new();
     h.update(b"turbo-lean-lake-input-v1\n");
@@ -4149,7 +4222,13 @@ fn hash_input_target(pkg_root: &Path, input: &InputTargetConfig) -> Result<(Stri
         );
         update_hasher_lp(&mut h, &bytes);
     }
-    Ok((h.finalize().to_hex().to_string(), format!("{lake:016x}")))
+    let out = (h.finalize().to_hex().to_string(), format!("{lake:016x}"));
+    if memoizable {
+        if let Ok(mut cache) = memo.lock() {
+            cache.insert(memo_key, out.clone());
+        }
+    }
+    Ok(out)
 }
 
 fn finalize_package_config(
@@ -4774,6 +4853,11 @@ pub(crate) struct VerifiedDepManifest {
     pub toolchain: String,
     pub lean_githash: String,
     pub pkg_config_digest: String,
+    /// [`package_lake_inputs_digest`] at the time the entries were recorded. `pkg_config_digest`
+    /// deliberately excludes input *contents*, so without this every consumer of the manifest
+    /// would accept `.olean` files elaborated against stale `input_dir` / `input_file` bytes.
+    #[serde(default)]
+    pub lake_inputs_digest: String,
     #[serde(default)]
     pub allowed_axioms: Vec<String>,
     pub modules: BTreeMap<String, VerifiedDepModuleEntry>,
@@ -4922,6 +5006,10 @@ fn is_dep_olean_fresh(
         || manifest.toolchain != cfg.toolchain
         || manifest.lean_githash != cfg.lean_githash
         || manifest.pkg_config_digest != spec.pkg_config_digest
+        // A `needs`-ed `input_dir` is read during elaboration but is invisible to
+        // `pkg_config_digest`, the source hash and the mtimes checked above.
+        || manifest.lake_inputs_digest
+            != package_lake_inputs_digest(package_by_name(cfg, &spec.pkg_name)?)
         || manifest.allowed_axioms != crate::splitter::allowed_axioms()
     {
         return None;
@@ -5772,6 +5860,13 @@ fn package_by_name<'a>(cfg: &'a ProjectConfig, pkg_name: &str) -> Option<&'a Pac
 /// library, so a module selected by two libraries is built under either attribution depending on
 /// the target asked for. The digest therefore folds the union over **every** library that can
 /// build the module: the conservative choice, which can only over-invalidate, never miss a change.
+///
+/// Note the converse, which mirrors Lake rather than guarding against it: a module that no library
+/// with a `needs` can build gets the empty digest, so an input edit does not invalidate it. That is
+/// correct for Lake, where `needs` feeds the `extraDep` job of the declaring library only and a
+/// module outside every such library never has the input on its build path. It does mean a file
+/// that reads an input at elaboration time while sitting outside the `needs`-ing library's globs is
+/// not tracked -- the same blind spot a plain `lake build` has, not one introduced here.
 pub(crate) fn module_lake_input_digest(cfg: &ProjectConfig, node: &ModuleNode) -> String {
     let Some(pkg) = package_by_name(cfg, &node.pkg_name).filter(|p| !p.inputs.is_empty()) else {
         return String::new();
@@ -5785,6 +5880,27 @@ pub(crate) fn module_lake_input_digest(cfg: &ProjectConfig, node: &ModuleNode) -
     pkg.inputs
         .iter()
         .filter(|i| needed.contains(i.name.as_str()))
+        .map(|i| format!("{}:{}\n", i.name, i.blake3))
+        .collect()
+}
+
+/// Content digest of **every** declarative Lake file input of the package, in declaration order.
+///
+/// [`module_lake_input_digest`] is the precise, per-module answer, but it can only be computed from
+/// a resolved [`ModuleNode`]. The warm-build-directory fast paths accept an existing `.olean` out of
+/// `.lake/build/.turbo_verified_sources.json` *without* ever computing a module key — they only
+/// have a source path — so they guard the whole manifest with this package-wide digest and fail
+/// closed on any difference. Over-invalidating there is cheap: discarding the manifest only gives
+/// up the "the whole project is already up to date, skip the DAG" shortcut, after which
+/// `build_project_modules_native` re-elaborates exactly the modules whose
+/// [`compute_module_cas_key`] moved. Under-invalidating is not: it serves `.olean` files elaborated
+/// against input bytes that no longer exist, under a fresh action key.
+///
+/// Empty for a package that declares no inputs, so a manifest written before this field existed
+/// stays valid for every input-free project (its recorded digest defaults to the empty string).
+pub(crate) fn package_lake_inputs_digest(pkg: &PackageConfig) -> String {
+    pkg.inputs
+        .iter()
         .map(|i| format!("{}:{}\n", i.name, i.blake3))
         .collect()
 }
@@ -8035,6 +8151,10 @@ pub(crate) fn record_verified_dep_source(
     let _ = fs::create_dir_all(&build_dir);
     let manifest_path = build_dir.join(".turbo_verified_sources.json");
     let allowed_axioms = crate::splitter::allowed_axioms();
+    // Recorded alongside the entries so every reader can tell whether these `.olean` files were
+    // elaborated against the Lake file inputs currently on disk.
+    let lake_inputs_digest =
+        package_by_name(cfg, &node.pkg_name).map_or_else(String::new, package_lake_inputs_digest);
     let mut manifest: VerifiedDepManifest = fs::read(&manifest_path)
         .ok()
         .and_then(|b| serde_json::from_slice::<VerifiedDepManifest>(&b).ok())
@@ -8043,6 +8163,7 @@ pub(crate) fn record_verified_dep_source(
                 && m.toolchain == cfg.toolchain
                 && m.lean_githash == cfg.lean_githash
                 && m.pkg_config_digest == node.pkg_config_digest
+                && m.lake_inputs_digest == lake_inputs_digest
                 && m.allowed_axioms == allowed_axioms
         })
         .unwrap_or_else(|| VerifiedDepManifest {
@@ -8050,6 +8171,7 @@ pub(crate) fn record_verified_dep_source(
             toolchain: cfg.toolchain.clone(),
             lean_githash: cfg.lean_githash.clone(),
             pkg_config_digest: node.pkg_config_digest.clone(),
+            lake_inputs_digest,
             allowed_axioms,
             modules: BTreeMap::new(),
         });

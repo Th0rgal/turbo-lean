@@ -1369,8 +1369,21 @@ pub(crate) fn load_and_classify_pr_from_git(
 /// without being `.lean` files, so a change must re-verify the project like a lakefile edit would.
 /// A package without file inputs costs nothing here, and a git failure counts as changed.
 ///
-/// The git query is scoped to the declared `path`, not to the `filter`, so an edit to a file the
-/// filter excludes also re-verifies: an over-approximation, in the fail-closed direction.
+/// Two deliberate over-approximations, both fail-closed:
+///
+/// - The git query is scoped to the declared `path`, not to the `filter`, so an edit to a file the
+///   filter excludes also counts as changed.
+/// - A `true` here marks *every* `.lean` file of the project as `reconfigured`, not just the
+///   modules of the libraries that actually `needs` the changed input. Narrowing it would mean
+///   mapping each source back to its library and that library's `needs` set; the digests in
+///   [`crate::module_builder::module_lake_input_digest`] already do that precisely for the cache
+///   keys, so the only cost of being coarse here is re-splitting some unaffected files.
+///
+/// One thing it cannot see: a symlink under `path` whose target lives outside the repository. Git
+/// reports nothing for such a path, so this returns `false` even when the target's bytes changed.
+/// The content hashes behind [`crate::module_builder::compute_module_cas_key`] do follow the link
+/// (as Lake does) and still invalidate the affected modules, so the consequence is a missed
+/// *re-split*, not a stale `.olean`.
 fn lake_input_files_changed_since_base(
     repo_root: &Path,
     proj_prefix: &str,
@@ -5983,6 +5996,9 @@ end Fixture
                 toolchain: cfg.toolchain.clone(),
                 lean_githash: cfg.lean_githash.clone(),
                 pkg_config_digest: cfg.root_pkg.config_digest.clone(),
+                lake_inputs_digest: crate::module_builder::package_lake_inputs_digest(
+                    &cfg.root_pkg,
+                ),
                 allowed_axioms: crate::splitter::allowed_axioms(),
                 modules: BTreeMap::new(),
             });
@@ -7035,6 +7051,239 @@ end Fixture
         )?;
         assert_eq!(d_local.len(), 1);
         assert!(d_local[0].starts_with("Lean.Local:pkg="));
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    /// A warm `.lake/build` must not vouch for `.olean` files elaborated against Lake file inputs
+    /// that have since changed.
+    ///
+    /// `build`, `ci-verify` and `check` all have a fast path that accepts the `.olean` files listed
+    /// in `.lake/build/.turbo_verified_sources.json` without ever computing a module cache key:
+    /// `are_all_project_oleans_up_to_date` and `ensure_project_imports_fresh_for_check` compare
+    /// `pkg_config_digest`, `.lean` source hashes and mtimes, none of which move when an
+    /// `input_dir` file is edited. A `.sol` edit *does* miss the action key, so the build is the
+    /// leader and reaches exactly that fast path, with the stale artifacts still on disk.
+    ///
+    /// The module here pins the input's length with `include_str` and a kernel `rfl`, so reusing
+    /// the previous `.olean` is observable as a **passing** build of a now-false theorem rather
+    /// than as a mere performance artifact. Every step below keeps `.lake/build` in place; the
+    /// existing differential test in `module_builder` deletes it and so cannot see this.
+    #[test]
+    fn test_warm_build_dir_rejects_oleans_stale_against_edited_lake_input() -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_warm_lake_input_test_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let repo_dir = tmp_dir.join("repo");
+        fs::create_dir_all(repo_dir.join("Smoke"))?;
+        fs::create_dir_all(repo_dir.join("Data"))?;
+        fs::write(
+            repo_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )?;
+        fs::write(
+            repo_dir.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage demo\ninput_dir smokeSources where\n  path := \"Data\"\n  filter := .extension \"sol\"\n  text := true\n@[default_target]\nlean_lib Smoke where\n  globs := #[.one `Smoke.A, .one `Smoke.B]\n  needs := #[smokeSources]\n",
+        )?;
+        let v1 = "contract A {}\n";
+        let v2 = "contract AMuchLongerName {}\n";
+        assert_ne!(v1.len(), v2.len(), "the pinned length must actually move");
+        // `include_str` resolves relative to the importing file's directory, and `rfl` forces the
+        // kernel to evaluate the literal that elaboration baked in.
+        fs::write(
+            repo_dir.join("Smoke/A.lean"),
+            format!(
+                "def solText : String := include_str \"../Data/a.sol\"\ntheorem solLen : solText.length = {} := by rfl\n",
+                v1.len()
+            ),
+        )?;
+        // `B` only reaches the input through its import of `A`, which is what exercises the
+        // `check` path's `ensure_project_imports_fresh_for_check`.
+        fs::write(
+            repo_dir.join("Smoke/B.lean"),
+            format!(
+                "import Smoke.A\ntheorem useLen : solText.length = {} := solLen\n",
+                v1.len()
+            ),
+        )?;
+        fs::write(repo_dir.join("Data/a.sol"), v1)?;
+
+        // Needs a real toolchain, like the other end-to-end tests in this module.
+        if crate::module_builder::resolve_project_config(&repo_dir).is_err() {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return Ok(());
+        }
+        git_init_and_commit(&repo_dir, "base")?;
+        let canon_repo = fs::canonicalize(&repo_dir)?;
+        let mut store = TurboStore::open(Some(&tmp_dir.join("store")))?;
+
+        let olean_a = canon_repo.join(".lake/build/lib/lean/Smoke/A.olean");
+        let inputs_digest = || -> String {
+            crate::module_builder::resolve_project_config(&canon_repo)
+                .map(|cfg| crate::module_builder::package_lake_inputs_digest(&cfg.root_pkg))
+                .unwrap_or_default()
+        };
+        let manifest_inputs_digest = || -> Option<String> {
+            let path = crate::lake_build::verified_sources_manifest_path(&canon_repo);
+            fs::read(path)
+                .ok()
+                .and_then(|b| {
+                    serde_json::from_slice::<crate::module_builder::VerifiedDepManifest>(&b).ok()
+                })
+                .map(|m| m.lake_inputs_digest)
+        };
+        // Empty `targets` is what makes `build` consult the warm-directory fast path at all.
+        let build = |st: &mut TurboStore| {
+            crate::lake_build::run_build_command(
+                st,
+                true,
+                Vec::new(),
+                canon_repo.clone(),
+                "trusted".to_string(),
+                0,
+                false,
+            )
+        };
+        let ci_verify = |st: &mut TurboStore| {
+            run_ci_verify_command(
+                st,
+                true,
+                "trusted".to_string(),
+                canon_repo.clone(),
+                None,
+                None,
+                false,
+                None,
+            )
+        };
+        let check_b = |st: &mut TurboStore| {
+            crate::check::run_check_command(
+                st,
+                false,
+                true,
+                canon_repo.join("Smoke/B.lean"),
+                None,
+                canon_repo.clone(),
+                None,
+                false,
+                None,
+            )
+        };
+
+        // 1. Cold build of the consistent tree, then record what the warm directory vouches for.
+        build(&mut store).expect("initial build of a consistent tree must succeed");
+        assert!(
+            olean_a.is_file(),
+            "initial build must produce Smoke/A.olean"
+        );
+        let v1_olean = fs::read(&olean_a)?;
+        let v1_digest = inputs_digest();
+        assert!(
+            !v1_digest.is_empty(),
+            "a package with inputs must digest them"
+        );
+        assert_eq!(
+            manifest_inputs_digest().as_deref(),
+            Some(v1_digest.as_str()),
+            "the recorded manifest must pin the input contents it was built against"
+        );
+        // Warm no-op: the fast path is genuinely reached and still accepts a consistent tree.
+        build(&mut store).expect("warm rebuild of an unchanged tree must stay green");
+        ci_verify(&mut store).expect("warm ci-verify of an unchanged tree must stay green");
+        check_b(&mut store).expect("warm check of an unchanged tree must stay green");
+        assert_eq!(
+            fs::read(&olean_a)?,
+            v1_olean,
+            "an unchanged tree must not re-elaborate"
+        );
+
+        // 2. Edit a matched `.sol` and leave `.lake/build` fully populated.
+        fs::write(canon_repo.join("Data/a.sol"), v2)?;
+        assert_ne!(
+            inputs_digest(),
+            v1_digest,
+            "editing a matched input must move the package input digest"
+        );
+        assert!(
+            crate::lake_build::lake_inputs_changed_since_manifest(&canon_repo),
+            "the on-disk manifest must now read as stale"
+        );
+
+        // 3. Each entry point must re-elaborate against the new bytes, which makes the pinned
+        // length false. Before the fix the warm `.olean` was accepted and all three passed, so
+        // collect all three outcomes rather than short-circuiting: a regression in any one of them
+        // should name itself.
+        let mut false_greens: Vec<&str> = Vec::new();
+        for (label, outcome) in [
+            ("build", build(&mut store)),
+            // A failed run may have cleared artifacts, so re-assert the edited input before each
+            // entry point and let it rebuild whatever it needs from the same starting state.
+            ("ci-verify", {
+                fs::write(canon_repo.join("Data/a.sol"), v2)?;
+                ci_verify(&mut store)
+            }),
+            ("check", {
+                fs::write(canon_repo.join("Data/a.sol"), v2)?;
+                check_b(&mut store)
+            }),
+        ] {
+            if outcome.is_ok() {
+                false_greens.push(label);
+            }
+        }
+        assert!(
+            false_greens.is_empty(),
+            "{:?} accepted .oleans elaborated against the old `input_dir` contents, so a false \
+             theorem passed: the warm-build-directory fast path is input-blind",
+            false_greens
+        );
+
+        // 4. The failure is content-driven, not a blanket "inputs declared => always fail":
+        // restoring the original bytes makes the same warm directory green again.
+        fs::write(canon_repo.join("Data/a.sol"), v1)?;
+        assert_eq!(inputs_digest(), v1_digest);
+        build(&mut store).expect("restoring the original input bytes must rebuild green");
+        ci_verify(&mut store).expect("restoring the original input bytes must re-attest green");
+        check_b(&mut store).expect("restoring the original input bytes must re-check green");
+
+        // 5. And the new bytes are really what elaboration saw: re-pin the length to `v2` and the
+        // same edit that failed in step 3 now passes, with a different `.olean`.
+        for (rel, src) in [
+            (
+                "Smoke/A.lean",
+                format!(
+                    "def solText : String := include_str \"../Data/a.sol\"\ntheorem solLen : solText.length = {} := by rfl\n",
+                    v2.len()
+                ),
+            ),
+            (
+                "Smoke/B.lean",
+                format!(
+                    "import Smoke.A\ntheorem useLen : solText.length = {} := solLen\n",
+                    v2.len()
+                ),
+            ),
+        ] {
+            fs::write(canon_repo.join(rel), src)?;
+        }
+        fs::write(canon_repo.join("Data/a.sol"), v2)?;
+        build(&mut store).expect("a tree consistent with the new input bytes must build");
+        ci_verify(&mut store).expect("a tree consistent with the new input bytes must attest");
+        check_b(&mut store).expect("a tree consistent with the new input bytes must check");
+        assert_ne!(
+            fs::read(&olean_a)?,
+            v1_olean,
+            "the rebuilt .olean must differ from the one elaborated against the old input"
+        );
+        assert_eq!(
+            manifest_inputs_digest(),
+            Some(inputs_digest()),
+            "the manifest must now pin the new input contents"
+        );
 
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
