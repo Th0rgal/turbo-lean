@@ -2527,7 +2527,7 @@ const BINDING_COMMANDS: [&str; 61] = [
 /// (`strip_lean_comments`, `lean_tokens_by_line`, `lean_scan`) agree with Lean. This is for
 /// fidelity: soundness does not rest on it, because `is_allowed_lean_arg` admits only harmless
 /// option keys and every compile forces `warn.sorry=true` and `debug.skipKernelTC=false`.
-/// Rejects raw strings, char literals, `«»` anywhere but a target name, string braces
+/// Rejects raw strings, char literals, `«»` anywhere but a target or `require` name, string braces
 /// (interpolation) holding anything but one dotted name, `;`, `--` glued to an operator (Lean
 /// lexes `<--` as `<-` `-`), non-ASCII letters in code (Lean's identifier boundaries differ from
 /// Rust's), `#command`s, attributes other than Lake's target attributes, and every word in
@@ -2725,7 +2725,7 @@ fn lakefile_lexical_guard(
             let head = head
                 .strip_prefix("@[default_target]")
                 .map_or(head, str::trim_start);
-            if !matches!(head, "package" | "lean_lib" | "lean_exe")
+            if !matches!(head, "package" | "lean_lib" | "lean_exe" | "require")
                 || !pre.ends_with(char::is_whitespace)
             {
                 return Err("`«»` outside a target name".into());
@@ -8422,6 +8422,12 @@ lean_exe «demo-exe» where
             lib("MathlibTest"),
             BTreeMap::from([("pp.mvars.anonymous".to_string(), "false".to_string())])
         );
+        // turbo-lean's own proofs package (CI builds it) uses `«»` names, including on
+        // `require`; it must keep parsing.
+        let own = dir.join("own-lakefile.lean");
+        fs::write(&own, include_str!("../../../lean/lakefile.lean")).unwrap();
+        let own_pkg = parse_lakefile_lean(&dir, &own, true).unwrap();
+        assert_eq!((own_pkg.libs.len(), own_pkg.exes.len()), (3, 4));
         // `Cache.+` / `MathlibTest.+` are submodule globs, not modules named `+`.
         let globs = |name: &str| {
             pkg.libs
