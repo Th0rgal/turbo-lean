@@ -669,7 +669,7 @@ fn staging_namespace_in_use(staging: &Path, _store_root: Option<&Path>) -> bool 
 
 #[cfg(any(all(unix, not(target_os = "linux")), test))]
 fn portable_staging_namespace_in_use(staging: &Path, store_root: Option<&Path>) -> bool {
-    portable_pidfile_paths(staging, store_root)
+    portable_pidfile_paths(staging, store_root, true)
         .map(|paths| paths.iter().any(|path| portable_pidfile_alive(path)))
         .unwrap_or(true)
 }
@@ -817,6 +817,7 @@ fn stop_pidfile_daemon(state_file: &Path) -> Result<bool> {
 fn portable_pidfile_paths(
     staging: &Path,
     store_root: Option<&Path>,
+    include_legacy_root: bool,
 ) -> Result<std::collections::HashSet<PathBuf>> {
     let mut paths: std::collections::HashSet<PathBuf> = walkdir::WalkDir::new(staging)
         .max_depth(2)
@@ -839,9 +840,13 @@ fn portable_pidfile_paths(
             PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into()))
                 .join(".cache/turbo-lean")
         });
-    // A legacy root entry may describe a different namespace. With an explicit
-    // scope, discover PID files only inside that namespace.
-    if std::env::var_os("TURBO_LEAN_STAGING_DIR").is_none() || root.starts_with(staging) {
+    // A legacy root entry may describe a different namespace. Explicitly scoped
+    // signalling excludes it, but liveness must conservatively veto deletion
+    // even when only that legacy PID file remains.
+    if include_legacy_root
+        || std::env::var_os("TURBO_LEAN_STAGING_DIR").is_none()
+        || root.starts_with(staging)
+    {
         paths.insert(root.join("zygote_daemon.json"));
     }
     Ok(paths)
@@ -849,7 +854,7 @@ fn portable_pidfile_paths(
 
 #[cfg(any(all(unix, not(target_os = "linux")), test))]
 fn stop_pidfile_daemons(staging: &Path, store_root: Option<&Path>) -> Result<LifecycleCleanup> {
-    let paths = portable_pidfile_paths(staging, store_root)?;
+    let paths = portable_pidfile_paths(staging, store_root, false)?;
     let mut cleanup = LifecycleCleanup::default();
     for path in paths {
         if stop_pidfile_daemon(&path)? {
@@ -4391,6 +4396,14 @@ mod tests {
         assert_eq!(cleanup.count, 0);
         assert!(!cleanup.state_files.contains(&state));
         assert!(portable_staging_namespace_in_use(&dir, Some(&dir)));
+        // A legacy PID file outside an otherwise empty staging namespace still
+        // vetoes deletion, even though scoped signalling must spare that PID.
+        let empty_staging = dir.join("empty-staging");
+        fs::create_dir_all(&empty_staging).unwrap();
+        assert!(portable_staging_namespace_in_use(
+            &empty_staging,
+            Some(&dir)
+        ));
         assert!(foreign.try_wait().unwrap().is_none());
         foreign.kill().unwrap();
         foreign.wait().unwrap();
