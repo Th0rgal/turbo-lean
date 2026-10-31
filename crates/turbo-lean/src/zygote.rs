@@ -3734,10 +3734,11 @@ mod tests {
             let audit = std::collections::HashSet::from(["tgt".to_string()]);
             run_audited_lean_shard(&store, Path::new("lean"), &env, Some(&dir), src, &audit, &[])
         };
-        let stubs = "namespace N\ntheorem s1 (n : Nat) {m : Nat} : n + m = m + n := sorry\ntheorem s2 : 1 = 1 := sorry\nend N\n";
-        // Host-named prefix stubs (binders, namespaces) are exempt; the target is audited.
+        let stubs = "namespace N\ntheorem s1 (n : Nat) {m : Nat} : n + m = m + n := sorry\ntheorem s2 : 1 = 1 := sorry\nend N\nnamespace M\ntheorem s2 : 2 = 2 := sorry\nend M\n";
+        // Host-named prefix stubs (binders, namespaces, a short name used twice) are exempt; the
+        // target is audited.
         let ok = run(&format!(
-            "{}theorem N.tgt (a b : Nat) : a + b = b + a := N.s1 a\n",
+            "{}theorem N.tgt (a b : Nat) : a + b = b + a := N.s1 a\ntheorem other : 2 = 2 := M.s2\n",
             stubs
         ))?;
         assert!(ok.status.success(), "{:?}", ok);
