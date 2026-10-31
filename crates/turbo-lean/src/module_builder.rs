@@ -11430,10 +11430,13 @@ roots = ["Fast"]
         )
         .unwrap();
         fs::write(proj.join("P/A.lean"), "def a : Nat := 1\n").unwrap();
-        if resolve_project_config_with_trust(&proj, true).is_err() {
+        // Skip only when the host lacks the toolchain; any other resolution error is a failure.
+        let tc = "leanprover/lean4:v4.35.0";
+        if resolve_toolchain_compiler_with_trust(&proj, tc, true).is_err() {
             eprintln!("skipping: no Lean v4.35.0 toolchain on this host");
             return;
         }
+        resolve_project_config_with_trust(&proj, true).unwrap();
         std::os::unix::fs::symlink(&outside, proj.join(".lake")).unwrap();
         let mut store = TurboStore::open(Some(&root.join("store"))).unwrap();
         let err = build_project_modules_native(
