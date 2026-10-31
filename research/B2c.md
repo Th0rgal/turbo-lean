@@ -1,6 +1,6 @@
 # B2c measurement — in progress
 
-No avoidance percentages are available yet. Completed and preserved 10 of 20 commits.
+No avoidance percentages are available yet. Completed and preserved 11 of 20 commits.
 
 Scope: the import cone of `FV.Backend.Proof.{DefGenTab,IselSzTab,IselCtlTry}` and `FV.Opt.Proof.RuleArith`, not all FV. Commits are the 20 first-parent commits ending at `5018b95`, in oldest-first order.
 

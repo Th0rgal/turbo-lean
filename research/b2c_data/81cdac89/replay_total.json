@@ -1,0 +1,16 @@
+{
+  "calls": 303040,
+  "cpu_clock": "CLOCK_PROCESS_CPUTIME_ID",
+  "cpu_ns": 3768505673024,
+  "cpu_scope": "process startup through end of replay main",
+  "event": "total",
+  "import_cpu_ns": 1437237072,
+  "kernel_cpu_ns": 3747980363088,
+  "overhead_cpu_ns": 20525309936,
+  "replay_main_cpu_ns": 3767666129488,
+  "replay_main_overhead_cpu_ns": 19685766400,
+  "startup_cpu_ns": 839543536,
+  "sum_le_total_cpu": true,
+  "wall_ns": 3770270487099,
+  "wall_scope": "replay main; excludes startup"
+}
