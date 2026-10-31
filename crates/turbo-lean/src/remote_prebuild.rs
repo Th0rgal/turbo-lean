@@ -191,7 +191,7 @@ fn working_tree_dirty_paths(project_dir: &Path, selected_sha: &str) -> Result<Ve
         .map_err(|e| anyhow::anyhow!("cannot run `git` to inspect the working tree: {e}"))?;
     if !probe.status.success() {
         let stderr = String::from_utf8_lossy(&probe.stderr);
-        if stderr.contains("not a git repository") {
+        if stderr.contains("not a git repository (or any of the parent directories)") {
             return Ok(Vec::new());
         }
         anyhow::bail!("`git rev-parse` failed: {}", stderr.trim());
@@ -417,6 +417,12 @@ pub fn run_remote_prebuild_command(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             println!("[turbo-lean remote-prebuild] status={} {}", status, detail);
+            if let Some(warning) = payload.get("warning").and_then(|v| v.as_str()) {
+                println!(
+                    "[turbo-lean remote-prebuild] warning: {} (differs: {})",
+                    warning, payload["dirty_paths"]
+                );
+            }
         }
         Ok(())
     };
@@ -962,6 +968,9 @@ mod tests {
         fs::create_dir_all(&tmp)?;
         assert!(working_tree_dirty_paths(&tmp, &"a".repeat(40))?.is_empty());
         fs::write(tmp.join(".git"), "not a gitfile\n")?;
+        assert!(working_tree_dirty_paths(&tmp, &"a".repeat(40)).is_err());
+        // A gitfile pointing at a missing gitdir is not "no repository": fail closed.
+        fs::write(tmp.join(".git"), "gitdir: /nonexistent/turbo_lean_gitdir\n")?;
         assert!(working_tree_dirty_paths(&tmp, &"a".repeat(40)).is_err());
         // Unborn repository: the worktree probe succeeds but HEAD cannot be resolved.
         fs::remove_file(tmp.join(".git"))?;
