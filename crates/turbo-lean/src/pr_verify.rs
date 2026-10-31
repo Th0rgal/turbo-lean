@@ -5938,6 +5938,7 @@ end Fixture
                 toolchain: cfg.toolchain.clone(),
                 lean_githash: cfg.lean_githash.clone(),
                 pkg_config_digest: cfg.root_pkg.config_digest.clone(),
+                workspace_config_digest: cfg.canonical_config_digest.clone(),
                 allowed_axioms: crate::splitter::allowed_axioms(),
                 modules: BTreeMap::new(),
             });
@@ -6199,12 +6200,30 @@ end Fixture
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let source = "theorem ident (x : α) : x = x := rfl\n";
-        for kind in ["toml", "lean"] {
+        for (kind, dependency) in [("toml", false), ("lean", false), ("toml", true)] {
             let tree = LakeTree::new("ci_config", &[("P/A.lean", source)])?;
-            fs::remove_file(tree.project.join("lakefile.toml"))?;
-            let lakefile = tree.project.join(format!("lakefile.{kind}"));
+            let pkg_root = if dependency {
+                let dep = tree.project.join(".lake/packages/Dep");
+                fs::create_dir_all(&dep)?;
+                fs::write(dep.join("Dep.lean"), source)?;
+                fs::write(tree.project.join("P/A.lean"), "import Dep\n")?;
+                fs::write(
+                    tree.project.join("lake-manifest.json"),
+                    serde_json::to_vec(&serde_json::json!({
+                        "version": "1.2.0", "packagesDir": ".lake/packages", "name": "fixture",
+                        "packages": [{ "type": "path", "name": "dep", "dir": ".lake/packages/Dep", "configFile": "lakefile.toml", "inherited": false }]
+                    }))?,
+                )?;
+                dep
+            } else {
+                fs::remove_file(tree.project.join("lakefile.toml"))?;
+                tree.project.clone()
+            };
+            let lakefile = pkg_root.join(format!("lakefile.{kind}"));
             let config = |implicit: bool| {
-                if kind == "toml" {
+                if dependency {
+                    format!("name = \"dep\"\nmoreLeanArgs = [\"-DautoImplicit={implicit}\"]\n[[lean_lib]]\nname = \"Dep\"\n")
+                } else if kind == "toml" {
                     format!("name = \"fixture\"\nmoreLeanArgs = [\"-DautoImplicit={implicit}\"]\n[[lean_lib]]\nname = \"P\"\nglobs = [\"P.+\"]\n")
                 } else {
                     format!("import Lake\nopen Lake DSL\npackage fixture where\n  moreLeanArgs := #[\"-DautoImplicit={implicit}\"]\nlean_lib P where\n  globs := #[.submodules `P]\n")
@@ -6255,9 +6274,43 @@ end Fixture
                 "lakefile content digest must bind module_full"
             );
 
+            let config_mtime = fs::metadata(&lakefile)?.modified()?;
+            if dependency {
+                let hashes = BTreeMap::from([(
+                    "P/A.lean".into(),
+                    blake3::hash(b"import Dep\n").to_hex().to_string(),
+                )]);
+                assert!(
+                    crate::lake_build::are_all_project_oleans_up_to_date(&tree.project, &hashes),
+                    "fixture must exercise the fresh-build shortcut"
+                );
+                // Even identical dependency config contents must obey freshness ordering.
+                fs::File::options()
+                    .write(true)
+                    .open(&lakefile)?
+                    .set_modified(
+                        std::time::SystemTime::now() + std::time::Duration::from_secs(2),
+                    )?;
+                assert!(!crate::lake_build::are_all_project_oleans_up_to_date(
+                    &tree.project,
+                    &hashes
+                ));
+                fs::File::options()
+                    .write(true)
+                    .open(&lakefile)?
+                    .set_modified(config_mtime)?;
+            }
+
             // Only the lakefile changes. A cache hit would falsely certify the theorem,
             // and --seed-shards would publish it into the new option namespace.
             fs::write(&lakefile, config(false))?;
+            if dependency {
+                // Backdate the edit: the workspace digest must catch it independently of mtime.
+                fs::File::options()
+                    .write(true)
+                    .open(&lakefile)?
+                    .set_modified(config_mtime)?;
+            }
             for seed in [false, true] {
                 let err = run(&mut store, seed).unwrap_err();
                 let diagnostic = format!("{err:#}");
@@ -6278,7 +6331,14 @@ end Fixture
                     |row| row.get(0),
                 )?;
                 assert_eq!(shards, 0, "failed CI must not seed stale shards");
-                assert_eq!(fs::read_to_string(tree.project.join("P/A.lean"))?, source);
+                assert_eq!(
+                    fs::read_to_string(pkg_root.join(if dependency {
+                        "Dep.lean"
+                    } else {
+                        "P/A.lean"
+                    }))?,
+                    source
+                );
             }
 
             // Validation must precede cache lookup in trusted mode, too.
@@ -6288,7 +6348,6 @@ end Fixture
         }
         Ok(())
     }
-
     #[test]
     fn test_lakefile_option_edit_reverifies_reconfigured_files() -> Result<()> {
         let tmp_dir = std::env::temp_dir().join(format!(

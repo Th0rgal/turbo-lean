@@ -1756,6 +1756,7 @@ pub(crate) fn load_verified_project_manifest(
         || manifest.toolchain != cfg.toolchain
         || manifest.lean_githash != cfg.lean_githash
         || manifest.pkg_config_digest != cfg.root_pkg.config_digest
+        || manifest.workspace_config_digest != cfg.canonical_config_digest
         || manifest.allowed_axioms != crate::splitter::allowed_axioms()
     {
         return None;
@@ -1829,19 +1830,26 @@ pub(crate) fn are_all_project_oleans_up_to_date(
         return false;
     };
 
-    let lakefile_mtime = [
-        "lakefile.lean",
-        "lakefile.toml",
-        "lake-manifest.json",
-        "lean-toolchain",
-    ]
-    .into_iter()
-    .filter_map(|name| {
-        fs::metadata(canon_dir.join(name))
-            .and_then(|m| m.modified())
-            .ok()
-    })
-    .max();
+    let Ok(cfg) = crate::module_builder::resolve_project_config(canon_dir) else {
+        return false;
+    };
+    let lakefile_mtime = std::iter::once(&cfg.root_pkg)
+        .chain(cfg.dep_pkgs.iter())
+        .flat_map(|pkg| {
+            [
+                "lakefile.lean",
+                "lakefile.toml",
+                "lake-manifest.json",
+                "lean-toolchain",
+            ]
+            .into_iter()
+            .filter_map(|name| {
+                fs::metadata(pkg.pkg_root.join(name))
+                    .and_then(|m| m.modified())
+                    .ok()
+            })
+        })
+        .max();
     let mut checked_oleans = 0usize;
 
     for (rel_path, cur_b3) in file_hashes {
@@ -3603,6 +3611,7 @@ mod tests {
                 toolchain: cfg.toolchain.clone(),
                 lean_githash: cfg.lean_githash.clone(),
                 pkg_config_digest: cfg.root_pkg.config_digest.clone(),
+                workspace_config_digest: cfg.canonical_config_digest.clone(),
                 allowed_axioms: crate::splitter::allowed_axioms(),
                 modules: std::collections::BTreeMap::from([(
                     "P/A.lean".into(),

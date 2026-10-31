@@ -2141,10 +2141,6 @@ fn audit_compiled_module_batch(
     }
 }
 
-static ZYGOTE_LEAN_PATH_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<(String, String, std::path::PathBuf), String>>,
-> = std::sync::OnceLock::new();
-
 fn read_line_with_timeout(
     reader: &mut BufReader<std::process::ChildStdout>,
     line: &mut String,
@@ -2322,6 +2318,117 @@ fn encode_lean_args_hex(lean_args: &[String]) -> String {
     }
 }
 
+/// The cache and executor must agree on the final import search order and artifacts.
+pub(crate) struct ResolvedZygoteContext {
+    lean_path: String,
+    imports_csv: String,
+    olean_digest: String,
+    search_path_digest: String,
+    toolchain_policy: String,
+    pub(crate) identity: String,
+}
+
+pub(crate) fn resolve_zygote_context(
+    toolchain: &str,
+    req_lean_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    lean_bin: &Path,
+    raw_imports_csv: &str,
+) -> ResolvedZygoteContext {
+    let env_lp = env_vars.get("LEAN_PATH").cloned().unwrap_or_default();
+    let mut path_parts: Vec<String> = Vec::new();
+    let is_sysroot_lib_lean = |norm: &str| -> bool {
+        let p = Path::new(norm);
+        p.ends_with("lib/lean")
+            && p.parent()
+                .and_then(|lib| lib.parent())
+                .map(|tc| tc.join("bin/lean").exists())
+                .unwrap_or(false)
+    };
+    let mut add_part = |p: &str| {
+        for seg in p.split(':') {
+            let s = seg.trim();
+            if !s.is_empty() {
+                let norm = fs::canonicalize(s)
+                    .map(|c| c.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| s.to_string());
+                if is_sysroot_lib_lean(&norm) {
+                    continue;
+                }
+                if !path_parts.iter().any(|x| x == &norm) {
+                    path_parts.push(norm);
+                }
+            }
+        }
+    };
+    if !req_lean_path.is_empty() {
+        add_part(req_lean_path);
+    }
+    if !env_lp.is_empty() {
+        add_part(&env_lp);
+    }
+    if req_lean_path.is_empty() && env_lp.is_empty() {
+        if let Some(repo_lean_dir) = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|r| r.join("lean"))
+            .filter(|p| p.join(".lake/build/lib/lean").exists())
+        {
+            add_part(&crate::lake_build::resolve_remote_lean_path(
+                &repo_lean_dir,
+                None,
+            ));
+        }
+    }
+    if let Some(tc_lib_lean) = lean_bin
+        .parent()
+        .and_then(|b| b.parent())
+        .map(|tc| tc.join("lib").join("lean"))
+        .filter(|p| p.exists())
+    {
+        let norm = fs::canonicalize(&tc_lib_lean)
+            .map(|c| c.to_string_lossy().to_string())
+            .unwrap_or_else(|_| tc_lib_lean.to_string_lossy().to_string());
+        if !path_parts.iter().any(|x| x == &norm) {
+            path_parts.push(norm);
+        }
+    }
+    let lean_path = path_parts.join(":");
+    let imports_csv = coalesce_proofkit_imports(raw_imports_csv, &lean_path);
+    let search_path_digest = compute_search_path_oleans_digest(&lean_path);
+    let imported_digest = compute_imported_oleans_digest(&imports_csv, &lean_path);
+    let olean_digest = format!("{}:{}", search_path_digest, imported_digest);
+    let compiler_path = fs::canonicalize(lean_bin).unwrap_or_else(|_| lean_bin.to_path_buf());
+    let compiler_digest = fs::read(&compiler_path)
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+        .unwrap_or_default();
+    let policy = env_vars
+        .get(crate::splitter::ALLOWED_AXIOMS_ENV)
+        .cloned()
+        .unwrap_or_else(|| crate::splitter::allowed_axioms().join(","));
+    let compiler_identity = blake3::hash(
+        &serde_json::to_vec(&(toolchain, &compiler_path, compiler_digest, &policy))
+            .expect("compiler identity serializes"),
+    )
+    .to_hex()
+    .to_string();
+    let identity = blake3::hash(
+        &serde_json::to_vec(&(&compiler_identity, &lean_path, &imports_csv, &olean_digest))
+            .expect("execution identity serializes"),
+    )
+    .to_hex()
+    .to_string();
+    let toolchain_policy = format!("{}#{}#{}", toolchain, policy, compiler_identity);
+    ResolvedZygoteContext {
+        lean_path,
+        imports_csv,
+        olean_digest,
+        search_path_digest,
+        toolchain_policy,
+        identity,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn eval_with_zygote_pool_inner(
     store: &TurboStore,
@@ -2349,116 +2456,31 @@ fn eval_with_zygote_pool_inner(
     let deadline = request_started + std::time::Duration::from_millis(effective_timeout_ms);
     let _lifecycle = lifecycle_lock(false)?;
 
-    let env_lp = env_vars.get("LEAN_PATH").cloned().unwrap_or_default();
-    let lp_cache_key = (
-        req_lean_path.to_string(),
-        env_lp.clone(),
-        lean_bin.to_path_buf(),
-    );
-    let lp_cache_mutex = ZYGOTE_LEAN_PATH_CACHE
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let cached_lp = lp_cache_mutex
-        .lock()
-        .ok()
-        .and_then(|g| g.get(&lp_cache_key).cloned());
-
-    let effective_lean_path = if let Some(eff) = cached_lp {
-        eff
-    } else {
-        let mut path_parts: Vec<String> = Vec::new();
-        let is_sysroot_lib_lean = |norm: &str| -> bool {
-            let p = Path::new(norm);
-            p.ends_with("lib/lean")
-                && p.parent()
-                    .and_then(|lib| lib.parent())
-                    .map(|tc| tc.join("bin/lean").exists())
-                    .unwrap_or(false)
-        };
-        let mut add_part = |p: &str| {
-            for seg in p.split(':') {
-                let s = seg.trim();
-                if !s.is_empty() {
-                    let norm = fs::canonicalize(s)
-                        .map(|c| c.to_string_lossy().to_string())
-                        .unwrap_or_else(|_| s.to_string());
-                    if is_sysroot_lib_lean(&norm) {
-                        continue;
-                    }
-                    if !path_parts.iter().any(|x| x == &norm) {
-                        path_parts.push(norm);
-                    }
-                }
-            }
-        };
-        if !req_lean_path.is_empty() {
-            add_part(req_lean_path);
-        }
-        if !env_lp.is_empty() {
-            add_part(&env_lp);
-        }
-        if req_lean_path.is_empty() && env_lp.is_empty() {
-            if let Some(repo_lean_dir) = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .and_then(|p| p.parent())
-                .map(|r| r.join("lean"))
-                .filter(|p| p.join(".lake/build/lib/lean").exists())
-            {
-                add_part(&crate::lake_build::resolve_remote_lean_path(
-                    &repo_lean_dir,
-                    None,
-                ));
-            }
-        }
-        if let Some(tc_lib_lean) = lean_bin
-            .parent()
-            .and_then(|b| b.parent())
-            .map(|tc| tc.join("lib").join("lean"))
-            .filter(|p| p.exists())
-        {
-            let norm = fs::canonicalize(&tc_lib_lean)
-                .map(|c| c.to_string_lossy().to_string())
-                .unwrap_or_else(|_| tc_lib_lean.to_string_lossy().to_string());
-            if !path_parts.iter().any(|x| x == &norm) {
-                path_parts.push(norm);
-            }
-        }
-        let eff = path_parts.join(":");
-        if let Ok(mut g) = lp_cache_mutex.lock() {
-            if g.len() >= 512 {
-                g.clear();
-            }
-            g.insert(lp_cache_key, eff.clone());
-        }
-        eff
-    };
-
+    // Validate the original arguments before encoding can discard unsupported flags.
+    let args_digest_opt = crate::module_builder::compute_lean_args_digest(lean_args)?;
+    let hex_opts = encode_lean_args_hex(lean_args);
     let (raw_imports_csv, body_code) = if let Some((ref imp, _, _)) = batch_fission_override {
         (imp.clone(), String::new())
     } else {
         split_shard_for_zygote(shard_source)
     };
-    let imports_csv = coalesce_proofkit_imports(&raw_imports_csv, &effective_lean_path);
-    let search_path_digest = compute_search_path_oleans_digest(&effective_lean_path);
-    let imported_digest = compute_imported_oleans_digest(&imports_csv, &effective_lean_path);
-    let pool_digest_tag = search_path_digest.clone();
-    // Workers enforce the axiom policy they were spawned with: key them (and their replies) by it.
-    let toolchain_policy = format!(
-        "{}#{}",
+    let context = resolve_zygote_context(
         toolchain,
-        env_vars
-            .get(crate::splitter::ALLOWED_AXIOMS_ENV)
-            .cloned()
-            .unwrap_or_else(|| crate::splitter::allowed_axioms().join(","))
+        req_lean_path,
+        env_vars,
+        lean_bin,
+        &raw_imports_csv,
     );
+    let effective_lean_path = context.lean_path;
+    let imports_csv = context.imports_csv;
+    let pool_digest_tag = context.search_path_digest;
+    let toolchain_policy = context.toolchain_policy;
+    let olean_digest = context.olean_digest;
     let pool_key = (
         toolchain_policy.clone(),
         effective_lean_path.clone(),
         format!("{}#{}", pool_digest_tag, imports_csv),
     );
-    let olean_digest = format!("{}:{}", search_path_digest, imported_digest);
-
-    let hex_opts = encode_lean_args_hex(lean_args);
-    let args_digest_opt = crate::module_builder::compute_lean_args_digest(lean_args)?;
     let verified_cache_policy = match &args_digest_opt {
         Some(ad) => format!("{}#opts:{}", toolchain_policy, ad),
         None => toolchain_policy.clone(),
@@ -4014,34 +4036,23 @@ pub(crate) fn coalesce_proofkit_imports(imports_csv: &str, lean_path: &str) -> S
 }
 
 fn compute_eval_shm_cache_filename(
-    toolchain: &str,
-    lean_path: &str,
+    context: &ResolvedZygoteContext,
     file_name: &str,
     caller_cwd: Option<&str>,
     source: &str,
     lean_args: &[String],
-) -> String {
-    let (imports_csv, _) = split_shard_for_zygote(source);
-    let imp_dig = compute_imported_oleans_digest(&imports_csv, lean_path);
-    let mut h = blake3::Hasher::new();
-    h.update(b"eval-shm:v3:");
-    h.update(toolchain.as_bytes());
-    h.update(b":");
-    h.update(lean_path.as_bytes());
-    h.update(b":");
-    h.update(imp_dig.as_bytes());
-    h.update(b":");
-    h.update(file_name.as_bytes());
-    h.update(b":");
-    h.update(caller_cwd.unwrap_or("").as_bytes());
-    h.update(b":");
-    h.update(source.as_bytes());
-    if let Some(ad) = crate::module_builder::effective_lean_args_digest(lean_args) {
-        h.update(b":opts:");
-        h.update(ad.as_bytes());
-    }
-    let key_hex = h.finalize().to_hex();
-    format!("ev_{}.json", &key_hex[..24])
+) -> Result<String> {
+    let args_digest = crate::module_builder::compute_lean_args_digest(lean_args)?;
+    let bytes = serde_json::to_vec(&(
+        "eval-shm:v4",
+        &context.identity,
+        file_name,
+        caller_cwd,
+        source,
+        args_digest,
+    ))?;
+    let key_hex = blake3::hash(&bytes).to_hex().to_string();
+    Ok(format!("ev_{}.json", &key_hex[..24]))
 }
 
 /// Only successful, import-clean replies may be cached: failures (missing toolchain, import
@@ -4124,14 +4135,19 @@ pub fn try_stateless_eval_shm_cache(
         .ok()
         .map(|p| p.to_string_lossy().to_string());
     let file_display = file.to_string_lossy();
+    let (lean_bin, _, _, _) =
+        crate::module_builder::resolve_toolchain_compiler(&proj_dir, &toolchain).ok()?;
+    let env_vars = std::env::vars().collect();
+    let (imports_csv, _) = split_shard_for_zygote(&source);
+    let context = resolve_zygote_context(&toolchain, &req_lp, &env_vars, &lean_bin, &imports_csv);
     let filename = compute_eval_shm_cache_filename(
-        &toolchain,
-        &req_lp,
+        &context,
         &file_display,
         caller_cwd.as_deref(),
         &source,
         &resolved_lean_args,
-    );
+    )
+    .ok()?;
     let base_staging =
         if Path::new("/dev/shm").is_dir() || std::env::var("TURBO_LEAN_STAGING_DIR").is_ok() {
             crate::shm_cache::staging_shm_dir()
@@ -4180,24 +4196,28 @@ pub fn try_local_zygote_eval_with_args(
     lean_args: &[String],
 ) -> Option<ZygoteEvalReply> {
     let filtered_args = crate::module_builder::validate_effective_lean_args(lean_args).ok()?;
+    let (imports_csv, _) = split_shard_for_zygote(source);
+    let context = resolve_zygote_context(toolchain, lean_path, env_vars, lean_bin, &imports_csv);
     let timeout_ms = if timeout_ms > 0 {
         timeout_ms
     } else {
         invocation_timeout_ms().unwrap_or(0)
     };
     let t0 = std::time::Instant::now();
-    let caller_cwd = std::env::current_dir()
-        .ok()
-        .map(|p| p.to_string_lossy().to_string());
+    let caller_cwd = env_vars.get("TURBO_LEAN_CALLER_CWD").cloned().or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string())
+    });
     let eval_shm_file = if is_pure_eval_source(source) {
         let filename = compute_eval_shm_cache_filename(
-            toolchain,
-            lean_path,
+            &context,
             file_name.unwrap_or(""),
             caller_cwd.as_deref(),
             source,
             &filtered_args,
-        );
+        )
+        .ok()?;
         let dir = store.fast_staging_dir().join("eval_shm_cache");
         let _ = fs::create_dir_all(&dir);
         let path = dir.join(filename);
@@ -4272,7 +4292,8 @@ pub fn try_local_zygote_eval_with_args(
     };
     let body = serde_json::to_vec(&serde_json::json!({
         "toolchain": toolchain,
-        "lean_path": lean_path,
+        "lean_path": context.lean_path,
+        "execution_identity": context.identity,
         "source": source,
         "file_name": file_name,
         "cwd": caller_cwd,
@@ -4584,6 +4605,89 @@ mod tests {
             .flatten()
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn local_eval_cache_tracks_environment_lean_path() -> Result<()> {
+        use crate::worktree_test_support::LakeTree;
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tree = LakeTree::new("eval_env_path", &[("P/A.lean", "def value : Nat := 0\n")])?;
+        let cfg = crate::module_builder::resolve_project_config(&tree.project)?;
+        for (name, value) in [("A", 17), ("B", 29)] {
+            let dir = tree.root.join(name);
+            fs::create_dir_all(&dir)?;
+            fs::write(
+                dir.join("Dep.lean"),
+                format!("def Dep.value : Nat := {value}\n"),
+            )?;
+            let out = Command::new(&cfg.lean_bin)
+                .current_dir(&dir)
+                .args(["-o", "Dep.olean", "Dep.lean"])
+                .output()?;
+            anyhow::ensure!(
+                out.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let store = TurboStore::open(Some(&tree.root.join("cache")))?;
+        let previous = std::env::var_os("TURBO_LEAN_NO_DAEMON");
+        std::env::set_var("TURBO_LEAN_NO_DAEMON", "1");
+        let result = (|| -> Result<()> {
+            let source = "import Dep\n#eval Dep.value\n";
+            let file = tree.project.join("Eval.lean").to_string_lossy().to_string();
+            for (name, expected) in [("A", "17"), ("A", "17"), ("B", "29"), ("B", "29")] {
+                let env = std::collections::HashMap::from([(
+                    "LEAN_PATH".into(),
+                    tree.root.join(name).to_string_lossy().to_string(),
+                )]);
+                let reply = try_local_zygote_eval_with_args(
+                    &store,
+                    &env,
+                    &cfg.lean_bin,
+                    &cfg.toolchain,
+                    "",
+                    source,
+                    Some(&file),
+                    60_000,
+                    &[],
+                )
+                .context("local eval must produce a reply")?;
+                assert!(reply.ok && reply.import_ok, "{reply:?}");
+                assert_eq!(reply.messages.concat().trim(), expected, "LEAN_PATH={name}: {reply:?}");
+            }
+            // Replacing an artifact at the same resolved path must also invalidate the reply.
+            fs::copy(tree.root.join("A/Dep.olean"), tree.root.join("B/Dep.olean"))?;
+            let env = std::collections::HashMap::from([(
+                "LEAN_PATH".into(),
+                tree.root.join("B").to_string_lossy().to_string(),
+            )]);
+            let reply = try_local_zygote_eval_with_args(
+                &store,
+                &env,
+                &cfg.lean_bin,
+                &cfg.toolchain,
+                "",
+                source,
+                Some(&file),
+                60_000,
+                &[],
+            )
+            .context("replaced import eval")?;
+            assert!(reply.ok && reply.import_ok, "{reply:?}");
+            assert_eq!(reply.messages.concat().trim(), "17", "{reply:?}");
+            Ok(())
+        })();
+        if let Some(value) = previous {
+            std::env::set_var("TURBO_LEAN_NO_DAEMON", value);
+        } else {
+            std::env::remove_var("TURBO_LEAN_NO_DAEMON");
+        }
+        result
+    }
+
     #[test]
     fn local_eval_rejects_invalid_args_before_empty_option_cache_hit() -> Result<()> {
         let _guard = crate::pack::tests::env_test_lock()
@@ -4595,8 +4699,15 @@ mod tests {
         let source = "#eval 17305\n";
         let file_name = dir.join("Cached.lean").to_string_lossy().to_string();
         let cwd = std::env::current_dir()?.to_string_lossy().to_string();
+        let context = resolve_zygote_context(
+            "test",
+            "",
+            &std::collections::HashMap::new(),
+            Path::new("/no-lean-needed"),
+            "",
+        );
         let filename =
-            compute_eval_shm_cache_filename("test", "", &file_name, Some(&cwd), source, &[]);
+            compute_eval_shm_cache_filename(&context, &file_name, Some(&cwd), source, &[])?;
         let cache_dir = store.fast_staging_dir().join("eval_shm_cache");
         fs::create_dir_all(&cache_dir)?;
         let path = cache_dir.join(filename);

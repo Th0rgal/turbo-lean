@@ -912,6 +912,8 @@ pub fn serve_cas_http_with_auth(
                         #[serde(default)]
                         source: String,
                         #[serde(default)]
+                        execution_identity: Option<String>,
+                        #[serde(default)]
                         code: String,
                         #[serde(default)]
                         file_name: Option<String>,
@@ -1007,6 +1009,18 @@ pub fn serve_cas_http_with_auth(
                         env_vars.insert("LEAN_PATH".to_string(), req.lean_path.clone());
                     } else {
                         env_vars.remove("LEAN_PATH");
+                    }
+                    if let Some(expected) = req.execution_identity.as_deref() {
+                        let (imports, _) = crate::zygote::split_shard_for_zygote(src);
+                        let actual = crate::zygote::resolve_zygote_context(
+                            tc, &req.lean_path, &env_vars, &lean_bin, &imports,
+                        );
+                        if expected != actual.identity {
+                            let _ = write_json_response(&mut stream, 409, &serde_json::json!({
+                                "ok": false, "error": "eval execution identity changed"
+                            }));
+                            return;
+                        }
                     }
                     match crate::zygote::eval_with_zygote_pool_opts_with_args(
                         &req_store,

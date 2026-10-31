@@ -4585,6 +4585,8 @@ pub(crate) struct VerifiedDepManifest {
     pub lean_githash: String,
     pub pkg_config_digest: String,
     #[serde(default)]
+    pub workspace_config_digest: String,
+    #[serde(default)]
     pub allowed_axioms: Vec<String>,
     pub modules: BTreeMap<String, VerifiedDepModuleEntry>,
 }
@@ -4732,6 +4734,7 @@ fn is_dep_olean_fresh(
         || manifest.toolchain != cfg.toolchain
         || manifest.lean_githash != cfg.lean_githash
         || manifest.pkg_config_digest != spec.pkg_config_digest
+        || manifest.workspace_config_digest != cfg.canonical_config_digest
         || manifest.allowed_axioms != crate::splitter::allowed_axioms()
     {
         return None;
@@ -7774,6 +7777,7 @@ pub(crate) fn record_verified_dep_source(
                 && m.toolchain == cfg.toolchain
                 && m.lean_githash == cfg.lean_githash
                 && m.pkg_config_digest == node.pkg_config_digest
+                && m.workspace_config_digest == cfg.canonical_config_digest
                 && m.allowed_axioms == allowed_axioms
         })
         .unwrap_or_else(|| VerifiedDepManifest {
@@ -7781,6 +7785,7 @@ pub(crate) fn record_verified_dep_source(
             toolchain: cfg.toolchain.clone(),
             lean_githash: cfg.lean_githash.clone(),
             pkg_config_digest: node.pkg_config_digest.clone(),
+            workspace_config_digest: cfg.canonical_config_digest.clone(),
             allowed_axioms,
             modules: BTreeMap::new(),
         });
