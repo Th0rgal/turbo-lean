@@ -16,12 +16,12 @@
 pub mod accel_fastcheck;
 pub mod accelerators;
 pub mod cas;
-pub mod matryoshka;
 mod check;
 pub mod cluster;
 mod db;
 mod gpu_fastcheck;
 mod lake_build;
+pub mod matryoshka;
 pub mod mcp;
 pub mod module_builder;
 mod pack;
@@ -361,6 +361,9 @@ enum Commands {
         /// Additional forbidden declaration kind(s) (e.g. `inductive`, `structure`, `def`)
         #[arg(long = "forbid-decl-kinds", value_delimiter = ',')]
         forbid_decl_kinds: Vec<String>,
+        /// Fail (`ok: false`, non-zero exit) when zero theorem/lemma specifications are recognized
+        #[arg(long)]
+        require_nonempty: bool,
     },
     /// Deterministic fast evaluation of a Lean file (preserving all info/warning/error messages and stdout, drop-in for `lean <file.lean>`)
     Eval {
@@ -455,7 +458,6 @@ fn main() -> Result<()> {
 }
 
 fn run(cli: Cli) -> Result<()> {
-
     if let Some(mb) = cli.max_memory_mb {
         std::env::set_var("TURBO_LEAN_MAX_MEMORY_MB", mb.to_string());
     }
@@ -608,6 +610,7 @@ fn run(cli: Cli) -> Result<()> {
         ref config,
         ref forbid_namespaces,
         ref forbid_decl_kinds,
+        require_nonempty,
     } = cli.command
     {
         return gpu_fastcheck::run_audit_spec_command_with_options(
@@ -618,6 +621,7 @@ fn run(cli: Cli) -> Result<()> {
             config.as_deref(),
             forbid_namespaces,
             forbid_decl_kinds,
+            require_nonempty,
         );
     }
     if let Commands::RemotePrebuild {
@@ -1421,6 +1425,7 @@ fn run(cli: Cli) -> Result<()> {
             config,
             forbid_namespaces,
             forbid_decl_kinds,
+            require_nonempty,
         } => gpu_fastcheck::run_audit_spec_command_with_options(
             &files,
             decl.as_deref(),
@@ -1429,6 +1434,7 @@ fn run(cli: Cli) -> Result<()> {
             config.as_deref(),
             &forbid_namespaces,
             &forbid_decl_kinds,
+            require_nonempty,
         ),
 
         Commands::Eval {
@@ -1504,9 +1510,16 @@ fn run(cli: Cli) -> Result<()> {
                         || t.starts_with("meta import ")
                 });
 
+            let file_lean_args =
+                module_builder::try_resolve_lean_args_for_path(&proj_dir, Some(&file));
+            let filtered_file_lean_args = module_builder::filter_allowed_lean_args(&file_lean_args);
+
             let run_direct_lean = || -> Result<()> {
                 use std::io::Write;
                 let mut cmd = std::process::Command::new(&lean_bin);
+                for arg in &filtered_file_lean_args {
+                    cmd.arg(arg);
+                }
                 cmd.arg(&file).envs(&env_vars);
                 if !req_lp.is_empty() {
                     cmd.env("LEAN_PATH", &req_lp);
@@ -1535,7 +1548,7 @@ fn run(cli: Cli) -> Result<()> {
             }
 
             let file_display = file.to_string_lossy().to_string();
-            let reply = if let Some(daemon_rep) = zygote::try_local_zygote_eval(
+            let reply = if let Some(daemon_rep) = zygote::try_local_zygote_eval_with_args(
                 &store,
                 &env_vars,
                 &lean_bin,
@@ -1544,10 +1557,11 @@ fn run(cli: Cli) -> Result<()> {
                 &source,
                 Some(&file_display),
                 timeout_ms,
+                &filtered_file_lean_args,
             ) {
                 daemon_rep
             } else {
-                zygote::eval_with_zygote_pool_opts(
+                zygote::eval_with_zygote_pool_opts_with_args(
                     &store,
                     &toolchain,
                     &req_lp,
@@ -1562,6 +1576,7 @@ fn run(cli: Cli) -> Result<()> {
                     } else {
                         None
                     },
+                    &filtered_file_lean_args,
                 )?
             };
 
@@ -1604,6 +1619,9 @@ fn run(cli: Cli) -> Result<()> {
                 || std::env::var("TURBO_LEAN_VERIFY_DETERMINISM").as_deref() == Ok("1");
             if check_det {
                 let mut cmd = std::process::Command::new(&lean_bin);
+                for arg in &filtered_file_lean_args {
+                    cmd.arg(arg);
+                }
                 cmd.arg(&file).envs(&env_vars);
                 if !req_lp.is_empty() {
                     cmd.env("LEAN_PATH", &req_lp);
