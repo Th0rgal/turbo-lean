@@ -3195,18 +3195,34 @@ impl Drop for StatementWorktree {
     }
 }
 
-// Stock Lake is run inside bwrap for untrusted inputs. Both the Lake configuration
+// Stock toolchain commands run inside bwrap for untrusted inputs. The Lake configuration
 // and any build scripts are untrusted executable code; no host environment or
 // network is inherited. The writable root is a disposable source snapshot.
 fn statement_lake_command(project: &Path, is_untrusted: bool) -> Result<Command> {
+    statement_toolchain_command(project, is_untrusted, "lake", None)
+}
+
+fn statement_lean_command(project: &Path, is_untrusted: bool) -> Result<Command> {
+    // Static package paths only: never ask project code to supply PATH/LEAN_PATH.
+    let cfg = crate::module_builder::resolve_project_config_with_trust(project, true)?;
+    let (lean_path, _) = crate::module_builder::build_lean_search_path(&cfg, true);
+    statement_toolchain_command(project, is_untrusted, "lean", Some(&lean_path))
+}
+
+fn statement_toolchain_command(
+    project: &Path,
+    is_untrusted: bool,
+    tool: &str,
+    lean_path: Option<&str>,
+) -> Result<Command> {
     let (lean, _, _, lib) = crate::module_builder::resolve_toolchain_compiler_with_trust(
         project,
         &detect_toolchain(project),
-        is_untrusted,
+        true, // Resolve installed toolchains only, even for trusted statement builds.
     )?;
-    let lake = lean.with_file_name("lake");
+    let executable = lean.with_file_name(tool);
     if !is_untrusted {
-        let mut command = Command::new(lake);
+        let mut command = Command::new(&executable);
         command
             .current_dir(project)
             .env_remove("LEAN_PATH")
@@ -3215,6 +3231,9 @@ fn statement_lake_command(project: &Path, is_untrusted: bool) -> Result<Command>
                 "LEAN_STACK_SIZE_KB",
                 std::env::var("LEAN_STACK_SIZE_KB").unwrap_or_else(|_| "262144".into()),
             );
+        if let Some(path) = lean_path {
+            command.env("LEAN_PATH", path);
+        }
         return Ok(command);
     }
     let bwrap = crate::module_builder::probe_bwrap_sandbox()
@@ -3255,6 +3274,9 @@ fn statement_lake_command(project: &Path, is_untrusted: bool) -> Result<Command>
     ] {
         command.args(["--ro-bind-try", path, path]);
     }
+    if let Some(path) = lean_path {
+        command.args(["--setenv", "LEAN_PATH", path]);
+    }
     command
         .arg("--ro-bind")
         .arg(prefix)
@@ -3264,7 +3286,7 @@ fn statement_lake_command(project: &Path, is_untrusted: bool) -> Result<Command>
         .arg(project)
         .arg("--chdir")
         .arg(project)
-        .arg(lake);
+        .arg(executable);
     Ok(command)
 }
 
@@ -3493,7 +3515,7 @@ fn stock_statement_build_with_trust(project: &Path, is_untrusted: bool) -> Resul
         );
     }
     // Lake cannot address sources excluded by its globs (e.g. `TurboLean.lean`
-    // with a `TurboLean.+` glob). Compile these with stock Lean in Lake's env,
+    // with a `TurboLean.+` glob). Compile these with absolute stock Lean,
     // even when an older artifact exists, in import order.
     while !standalone.is_empty() {
         let mut ready = Vec::new();
@@ -3525,9 +3547,8 @@ fn stock_statement_build_with_trust(project: &Path, is_untrusted: bool) -> Resul
                     .parent()
                     .context("Missing statement output directory")?,
             )?;
-            let mut command = statement_lake_command(project, is_untrusted)?;
+            let mut command = statement_lean_command(project, is_untrusted)?;
             command
-                .args(["env", "lean"])
                 .args(&pkg.more_lean_args)
                 .args(&pkg.weak_lean_args);
             for (key, value) in &pkg.lean_options {
@@ -3615,9 +3636,9 @@ fn built_kernel_statement_report(
     let mut batches = vec![modules.keys().cloned().collect::<Vec<_>>()];
     let mut dump = Vec::new();
     while let Some(mut batch) = batches.pop() {
-        let mut command = statement_lake_command(project, is_untrusted)?;
+        let mut command = statement_lean_command(project, is_untrusted)?;
         command
-            .args(["env", "lean", "--run"])
+            .arg("--run")
             .arg(&helper)
             .args(&batch);
         let out = crate::module_builder::run_command_with_timeout(
@@ -5080,6 +5101,55 @@ globs = ["Demo.+"]
         assert!(executable_statements.contains_key("ToolA.lean::first"));
         assert!(executable_statements.contains_key("ToolB.lean::second"));
         println!("kernel statement fixture executable roots: duplicate main declarations isolated successfully");
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn project_lean_executable_cannot_replay_statement_dumps() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo-statement-spoof-{}-{}", std::process::id(), pack::next_tmp_id()
+        ));
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(dir.join("lakefile.toml"), r#"name = "spoof-fixture"
+defaultTargets = ["Demo", "lean"]
+[[lean_lib]]
+name = "Demo"
+[[lean_exe]]
+name = "lean"
+root = "Spoof"
+"#)?;
+        let theorem = "theorem pinned : (1 : Nat) = 1 := rfl\n";
+        fs::write(dir.join("Demo.lean"), theorem)?;
+        fs::write(dir.join("Outside.lean"), theorem.replace("pinned", "outside"))?;
+        fs::write(dir.join("Spoof.lean"), "def main : IO Unit := pure ()\n")?;
+        stock_statement_build(&dir)?;
+        let before = built_kernel_statements(&dir, None)?;
+        // Capture an actual old dump, then make the default project `lean` replay it.
+        let helper = dir.join("Dump.lean");
+        fs::write(&helper, include_str!("../../../lean/TurboLean/StatementHash.lean"))?;
+        let stale = statement_lean_command(&dir, false)?
+            .arg("--run").arg(&helper).args(["Demo", "Outside", "Spoof"]).output()?;
+        assert!(stale.status.success());
+        fs::remove_file(helper)?;
+        fs::write(dir.join("Spoof.lean"), format!(
+            "def main : IO Unit := IO.print {}\n",
+            serde_json::to_string(std::str::from_utf8(&stale.stdout)?)?
+        ))?;
+        fs::write(dir.join("Demo.lean"), theorem.replace("1", "2"))?;
+        fs::write(dir.join("Outside.lean"), theorem.replace("pinned", "outside").replace("1", "2"))?;
+        stock_statement_build(&dir)?;
+        // Confirm that the vulnerable invocation really does replay the old JSONL.
+        let replay = statement_lake_command(&dir, false)?
+            .args(["env", "lean", "--run", "unused.lean", "Demo"]).output()?;
+        assert!(replay.status.success());
+        assert_eq!(replay.stdout, stale.stdout);
+        assert_eq!(compare_kernel_statements(&before, &built_kernel_statements(&dir, None)?),
+            vec!["Demo.lean::pinned", "Outside.lean::outside"]);
+        fs::write(dir.join("Outside.lean"), "theorem outside : False := by trivial\n")?;
+        assert!(stock_statement_build(&dir).is_err(),
+            "the project lean executable must not bypass standalone stock compilation");
         fs::remove_dir_all(dir)?;
         Ok(())
     }
