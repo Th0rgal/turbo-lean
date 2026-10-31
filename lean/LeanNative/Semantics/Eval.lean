@@ -200,6 +200,21 @@ def evalVarList (env : VarEnv) : List VarId → Except UBError (List Val)
     | none, _ => .error (.unboundVar x)
     | some _, .error err => .error err
 
+/-- `ctorGetObj` (`isObj`) / `ctorGetScalar` (C1.1): separate index spaces on a live heap object; legacy
+    constructor tuples `.tuple (tag :: vals)` index `vals`. -/
+def evalCtorGet (env : VarEnv) (st : HeapState) (ctorVar : VarId) (idx : Nat) (isObj : Bool) :
+    Except UBError (Val × HeapState) :=
+  let get (fs : List Val) : Except UBError (Val × HeapState) :=
+    match fs[idx]? with
+    | some v => .ok (v, st)
+    | none => .error (.outOfBounds idx fs.length)
+  match env ctorVar with
+  | some (.objPtr objId) => (st.liveHeapObj objId).bind fun o => get (if isObj then o.objFields else o.scalarFields)
+  | some (.tuple (_tag :: vals)) => get vals
+  | some (.tuple []) => .error (.outOfBounds idx 0)
+  | some _ => .error (.typeError "ctorGet expects heap constructor or constructor tuple")
+  | none => .error (.unboundVar ctorVar)
+
 /-- Total evaluator for right-hand side LNIR expressions (`LNIRExpr`). -/
 def evalExpr (env : VarEnv) (st : HeapState) (e : LNIRExpr) : Except UBError (Val × HeapState) :=
   match e with
@@ -271,45 +286,16 @@ def evalExpr (env : VarEnv) (st : HeapState) (e : LNIRExpr) : Except UBError (Va
     | some _ => .error (.typeError "projTuple expects tuple value")
     | none => .error (.unboundVar tupleVar)
   | .allocCtor tag objFields scalarFields =>
-    match evalVarList env (objFields ++ scalarFields) with
-    | .ok vals =>
-      let (objId, st') := st.allocHeapCtor tag vals
-      .ok (.objPtr objId, st')
-    | .error err => .error err
-  | .ctorGetObj ctorVar idx =>
-    match env ctorVar with
-    | some (.objPtr objId) =>
-      if st.getObjRefCount objId == 0 then .error (.useAfterFree objId)
-      else match st.findHeapObj objId with
-        | some obj =>
-          match obj.fields[idx]? with
-          | some v => .ok (v, st)
-          | none => .error (.outOfBounds idx obj.fields.length)
-        | none => .error (.useAfterFree objId)
-    | some (.tuple (_tag :: vals)) =>
-      match vals[idx]? with
-      | some v => .ok (v, st)
-      | none => .error (.outOfBounds idx vals.length)
-    | some (.tuple []) => .error (.outOfBounds idx 0)
-    | some _ => .error (.typeError "ctorGetObj expects heap constructor or constructor tuple")
-    | none => .error (.unboundVar ctorVar)
-  | .ctorGetScalar ctorVar idx _ty =>
-    match env ctorVar with
-    | some (.objPtr objId) =>
-      if st.getObjRefCount objId == 0 then .error (.useAfterFree objId)
-      else match st.findHeapObj objId with
-        | some obj =>
-          match obj.fields[idx]? with
-          | some v => .ok (v, st)
-          | none => .error (.outOfBounds idx obj.fields.length)
-        | none => .error (.useAfterFree objId)
-    | some (.tuple (_tag :: vals)) =>
-      match vals[idx]? with
-      | some v => .ok (v, st)
-      | none => .error (.outOfBounds idx vals.length)
-    | some (.tuple []) => .error (.outOfBounds idx 0)
-    | some _ => .error (.typeError "ctorGetScalar expects heap constructor or constructor tuple")
-    | none => .error (.unboundVar ctorVar)
+    match evalVarList env objFields, evalVarList env scalarFields with
+    | .ok objs, .ok scalars =>
+      if objs.isEmpty && scalars.isEmpty then .ok (.tuple [.u64 tag.toUInt64], st)  -- C1.1 fieldless ctor
+      else if !objs.all Val.wfField then .error (.typeError "allocCtor: object field is a tuple owning an edge")
+      else
+        let (objId, st') := st.allocHeapCtor tag objs scalars
+        .ok (.objPtr objId, st')
+    | .error err, _ | _, .error err => .error err
+  | .ctorGetObj ctorVar idx => evalCtorGet env st ctorVar idx true
+  | .ctorGetScalar ctorVar idx _ty => evalCtorGet env st ctorVar idx false
   | .isExclusive objVar =>
     match env objVar with
     | some (.sarrayId bufId) =>
@@ -416,20 +402,25 @@ def evalExpr (env : VarEnv) (st : HeapState) (e : LNIRExpr) : Except UBError (Va
           | some buf => .ok (.u64 buf.data.size.toUInt64, st)
           | none => .error (.typeError s!"unknown sarray buffer {bufId}")
         | _ => .error (.typeError "lean_native_sarray_len expects 1 sarrayId argument")
-      else if fnName == "lean_native_ctor_set" then
+      else if fnName == "lean_native_ctor_set" || fnName == "lean_native_ctor_set_scalar" then
+        -- C4.2: `Code.oset` (object slot) / `Code.uset`·`Code.sset` (scalar slot, `scalarFields` index)
         match vals with
         | [.objPtr objId, .u64 idx, val] =>
-          match st.writeHeapObjFieldExclusive objId idx.toNat val with
-          | .ok st' => .ok (.unit, st')
-          | .error err => .error err
-        | _ => .error (.typeError "lean_native_ctor_set expects (objPtr, u64, val)")
+          (st.writeHeapObjFieldExclusive objId idx.toNat val (fnName == "lean_native_ctor_set")).map (.unit, ·)
+        | _ => .error (.typeError s!"{fnName} expects (objPtr, u64, val)")
+      else if fnName == "lean_native_ctor_set_tag" then
+        -- C4.2: `Code.setTag` / `lean_ctor_set_tag`
+        match vals with
+        | [.objPtr objId, .u64 tag] => (st.setHeapObjTagExclusive objId tag.toNat).map (.unit, ·)
+        | _ => .error (.typeError "lean_native_ctor_set_tag expects (objPtr, u64)")
+      else if fnName == "lean_native_del_obj" then
+        -- C4.2: `Code.del` / `lean_del_object` frees the shell without releasing its fields
+        match vals with
+        | [.objPtr objId] => (st.delObjShell objId).map (.unit, ·)
+        | _ => .error (.typeError "lean_native_del_obj expects (objPtr)")
       else if fnName == "lean_native_ctor_tag" then
         match vals with
-        | [.objPtr objId] =>
-          if st.getObjRefCount objId == 0 then .error (.useAfterFree objId)
-          else match st.findHeapObj objId with
-            | some obj => .ok (.u64 obj.tag.toUInt64, st)
-            | none => .error (.useAfterFree objId)
+        | [.objPtr objId] => (st.liveHeapObj objId).map fun o => (.u64 o.tag.toUInt64, st)
         | [.u64 tag] => .ok (.u64 tag, st)
         | [.bool b] => .ok (.u64 (if b then 1 else 0), st)
         | [.tuple (.u64 tag :: _)] => .ok (.u64 tag, st)
@@ -518,7 +509,7 @@ def evalParFor (fuel : Nat) (env : VarEnv) (st : HeapState) (lenVar : VarId) (in
   | none => .error (.unboundVar lenVar)
   | some (.u64 n) =>
     let len := n.toNat
-    if len > fuel then .error (.outOfBounds len fuel)
+    if len > fuel then .error .fuelExhausted  -- evaluator budget, never source UB (HEAPOBJ_CONTRACT C6.3)
     else
       match evalVarList env inputs with
       | .error err => .error err

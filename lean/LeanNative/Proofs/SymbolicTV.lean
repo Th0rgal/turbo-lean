@@ -296,6 +296,8 @@ structure SymExecState where
   bufAliases    : List (VarId × VarId) := []
   exclusiveBufs : List VarId := []
   allocRoots    : List VarId := []
+  /-- C1.1: `|objFields|` of each `allocCtor` root, so `ctorGetScalar i` reads `scalarFields[i]` (never a flat index). -/
+  ctorObjCounts : List (VarId × Nat) := []
   typedTuples   : List VarId := []
   boolVars      : List VarId := []
   u64Vars       : List VarId := []
@@ -319,6 +321,8 @@ structure SymExecState where
   nonPoison     : Bool := true
   reachable     : Bool := true
   symUnsupported : Bool := false
+  /-- Symbolic-execution or RC-tracking fuel ran out (HEAPOBJ_CONTRACT C6.1/C6.2): never bypassed by identity. -/
+  symExhausted  : Bool := false
   deriving Repr, Inhabited, BEq
 
 namespace SymExecState
@@ -360,6 +364,10 @@ def lookupExtRcDeltaBound (st : SymExecState) (root : VarId) : Nat :=
 
 def markUnsupported (st : SymExecState) : SymExecState :=
   { st with symUnsupported := true, noUB := false, nonPoison := false }
+
+/-- Incomplete analysis (fuel / RC-tracking exhaustion): unsupported **and** exhausted (C6). -/
+def markExhausted (st : SymExecState) : SymExecState :=
+  { st.markUnsupported with symExhausted := true }
 
 def addExtRcDelta (st : SymExecState) (bufVar : VarId) (count : Nat) (inc : Bool) : SymExecState :=
   let root := st.resolveBuf bufVar
@@ -596,7 +604,7 @@ def isImmediateScalarObj (st : SymExecState) (bufVar : VarId) : Bool :=
     | _ => false
 
 def updateRefCountFuel : Nat → SymExecState → Nat → Nat → Bool → SymExecState
-  | 0, st, _, _, _ => st.markUnsupported
+  | 0, st, _, _, _ => st.markExhausted
   | fuel + 1, st, v, count, inc =>
     let root := st.resolveBuf v
     if st.isImmediateScalarObj root || st.typedTuples.contains root ||
@@ -1512,6 +1520,12 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
       -- fail closed (`symUnsupported`) rather than truncating `tag.toUInt64`!
       (((st.clearAlias dst).unmarkTypedTuple dst).markUnsupported).bindVar dst
         { expr := .unit, nonPoison := false, noUB := false }
+    else if objFields.isEmpty && scalarFields.isEmpty then
+      -- C1.1: a fieldless ctor is the immediate `.tuple [tag]` (`Eval.lean` `allocCtor tag [] []`), never an
+      -- RC-managed root: RC ops are no-ops and `isExclusive` is `true` (typed-tuple paths of
+      -- `updateRefCountFuel` / `.isExclusive`), exactly as `evalIncRef`/`evalDecRef` treat a non-heap value.
+      ((st.clearVarSortTags dst).clearAlias dst |>.markTypedTuple dst).bindVar dst
+        { expr := .tuple [.constU64 tag.toUInt64], nonPoison := true, noUB := true }
     else
       let svs := (objFields ++ scalarFields).map st.lookupVar
       let encodeCtorField (v : VarId) : SymExpr :=
@@ -1525,7 +1539,10 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
       let scalarExprs := scalarFields.map encodeCtorField
       let allocId := SymExecState.dynAllocRootId st.synVarBase st.nextDynAllocIdx
       let st0 := { st with nextDynAllocIdx := st.nextDynAllocIdx + 1 }
-      let st1 := (st0.markAllocated allocId).markObjPtrVar allocId
+      let st1a := (st0.markAllocated allocId).markObjPtrVar allocId
+      -- C1.1: record `|objFields|` so `ctorGetScalar i` / `ctor_set_scalar i` index `scalarFields[i]`
+      let st1 : SymExecState :=
+        { st1a with ctorObjCounts := (allocId, objFields.length) :: st1a.ctorObjCounts.filter (·.1 != allocId) }
       let st2 := st1.bindVar allocId {
         expr := .tuple (.constU64 tag.toUInt64 :: objectExprs ++ scalarExprs)
         nonPoison := svs.all (·.nonPoison)
@@ -1592,12 +1609,21 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
     let liveOk := st.isBufLive rootVar
     let stLive := (st.requireUbCond (st.liveRcCond rootVar)).noteExtLiveRoot rootVar
     let cv := stLive.lookupVar rootVar
+    -- C1.1 separate index spaces: a scalar read is at `|objFields| + idx` of the `tag :: objs ++ scalars`
+    -- snapshot; an unknown split fails closed (`none`).
+    let flatIdx? : Option Nat :=
+      match e with
+      | .ctorGetScalar _ _ _ => (stLive.ctorObjCounts.lookup rootVar).map (· + idx)
+      -- an object read past `|objFields|` must never land in the scalar space (OOB / out of window)
+      | _ => match stLive.ctorObjCounts.lookup rootVar with
+        | some n => if idx < n then some idx else some (2 ^ 64)
+        | none => some idx
     match cv.expr with
     | .tuple (_tag :: fs) =>
       let stBounds :=
         if stLive.allocRoots.contains rootVar then stLive
         else stLive.requireUbCond (.binOp .lt (.constU64 idx.toUInt64) (.ctorLen stLive.heapStepEpoch rootVar))
-      match fs[idx]? with
+      match flatIdx?.bind (fs[·]?) with
       | some fExpr =>
         let stClear := stBounds.clearAlias dst
         let st' :=
@@ -1630,7 +1656,10 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
         { stBound with noUB := stBound.noUB && st.liveRcCond rootVar == .constBool true &&
             (stLive.allocRoots.contains rootVar || stBounds.ubCond == .constBool true) }
       | none =>
-        if stLive.allocRoots.contains rootVar then
+        if flatIdx?.isNone then
+          -- C1.1: unknown object/scalar split for a scalar read fails closed
+          (stBounds.markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+        else if stLive.allocRoots.contains rootVar then
           stBounds.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
         else
           -- External input/projected constructor cached at the 8-field modeling window may have >= 9 concrete fields!
@@ -1649,7 +1678,9 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
       else
         let effRoot := stLive.resolveBuf rootId
         let stBounds := stLive.requireUbCond (.binOp .lt (.constU64 idx.toUInt64) (.ctorLen stLive.heapStepEpoch effRoot))
-        let fieldRoot := SymExecState.projFieldRootId stBounds.synVarBase stBounds.heapStepEpoch effRoot idx
+        -- C1.1: scalar slot `i` of an external root is a distinct synthetic root (`8 + i`), never object slot `i`
+        let spaceIdx := match e with | .ctorGetScalar _ _ _ => 8 + idx | _ => idx
+        let fieldRoot := SymExecState.projFieldRootId stBounds.synVarBase stBounds.heapStepEpoch effRoot spaceIdx
         let stBase := (stBounds.noteExtLiveRoot effRoot).noteExtRoot fieldRoot
         let stBound := (stBase.aliasBuf dst fieldRoot).bindVar dst { expr := .symVar fieldRoot, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
         { stBound with noUB := false }
@@ -1893,7 +1924,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
             (stOut.markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
       else (st.markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
     | false, [objVar, idxVar, valVar] =>
-      if fnName == "lean_native_ctor_set" && retTy == .unit then
+      if (fnName == "lean_native_ctor_set" || fnName == "lean_native_ctor_set_scalar") && retTy == .unit then
         let root := st.resolveBuf objVar
         let idxRoot := st.resolveBuf idxVar
         if st.typedTuples.contains root || st.sarrayVars.contains root ||
@@ -1902,6 +1933,9 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
            st.boolVars.contains idxRoot || st.u256Vars.contains idxRoot then
           ((st.clearAlias dst).unmarkTypedTuple dst).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
         else
+        -- C1.1/C4.2: `ctor_set_scalar i` writes `scalarFields[i]` = flat slot `|objFields| + i`; unknown split fails closed
+        let isScalarSet := fnName == "lean_native_ctor_set_scalar"
+        let shift? : Option Nat := if isScalarSet then st.ctorObjCounts.lookup root else some 0
         let objSv := st.lookupVar root
         let idxSv := st.lookupVar idxVar
         let valRoot := st.resolveBuf valVar
@@ -1918,8 +1952,11 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
         let (updatedState, inBoundsOk) : SymExecState × Bool :=
           match objSv.expr, idxSv.expr with
           | .tuple (tag :: fs), .constU64 idxU64 =>
-            let idx := idxU64.toNat
-            if idx < fs.length then
+            let idx := (shift?.getD 0) + idxU64.toNat
+            -- an object write past `|objFields|` must never land in the scalar space
+            let objLimit := if isScalarSet then fs.length else (st.ctorObjCounts.lookup root).getD fs.length
+            if shift?.isNone then (stExcl.markUnsupported, false)
+            else if idx < fs.length && idx < objLimit then
               let stBnd :=
                 if stExcl.allocRoots.contains root then stExcl
                 else stExcl.requireUbCond (.binOp .lt (.constU64 idxU64) (.ctorLen stExcl.heapStepEpoch root))
@@ -1937,9 +1974,14 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
             if idx < 8 then
               let effRoot := stExcl.resolveBuf rootId
               let stBnd := stExcl.requireUbCond (.binOp .lt (.constU64 idxU64) (.ctorLen stExcl.heapStepEpoch effRoot))
-              let prevFields := (List.range 8).map fun i =>
-                if i == idx then valSv.expr
+              -- external-root snapshot: object slots 0..7, then scalar slots at 8..15 (same synthetic roots as
+              -- `ctorGetScalar` on a `.symVar` root), recorded via `ctorObjCounts root = 8` (C1.1 separate spaces)
+              let target := if isScalarSet then 8 + idx else idx
+              let prevFields := (List.range 16).map fun i =>
+                if i == target then valSv.expr
                 else .symVar (SymExecState.projFieldRootId stBnd.synVarBase stBnd.heapStepEpoch effRoot i)
+              let stBnd : SymExecState :=
+                { stBnd with ctorObjCounts := (root, 8) :: stBnd.ctorObjCounts.filter (·.1 != root) }
               let sb := stBnd.bindVar root {
                 expr := .tuple (.ctorTag stBnd.heapStepEpoch effRoot :: prevFields)
                 nonPoison := objSv.nonPoison && idxSv.nonPoison && valSv.nonPoison
@@ -1986,6 +2028,7 @@ structure SymExecSummary where
   noUB           : Bool
   nonPoison      : Bool
   symUnsupported : Bool
+  symExhausted   : Bool
   retVal         : SymExpr
   jointHeap      : SymExpr
   rcDeltas       : List (VarId × SymExpr)
@@ -2070,7 +2113,7 @@ def symExecLoopUnroll (unrollCount : Nat) (curIdx : Nat) (idxVar accVar : VarId)
 def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNIRCode)
     (expandRetHeap : Bool := true) : SymExecState × SymExpr :=
   match fuel with
-  | 0 => (st.markUnsupported, .unit)
+  | 0 => (st.markExhausted, .unit)
   | fuel' + 1 =>
     match code with
     | .letBind dst ty val k =>
@@ -2301,9 +2344,11 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
               if tagEpoch == st.heapStepEpoch then
                 match curSv.expr with
                 | .symVar _ =>
-                  let symFields := (List.range 8).map fun i =>
+                  -- C1.1: object slots 0..7 then scalar slots (synthetic roots 8..15), split recorded in `ctorObjCounts`
+                  let symFields := (List.range 16).map fun i =>
                     SymExpr.symVar (SymExecState.projFieldRootId st.synVarBase st.heapStepEpoch rootId i)
-                  (st.bindVar rootId { curSv with expr := .tuple (.constU64 tagVal :: symFields) }, st)
+                  let stK : SymExecState := { st with ctorObjCounts := (rootId, 8) :: st.ctorObjCounts.filter (·.1 != rootId) }
+                  (stK.bindVar rootId { curSv with expr := .tuple (.constU64 tagVal :: symFields) }, st)
                 | _ => (st, st)
               else (st, st)
             | _ => (st, st)
@@ -2446,6 +2491,12 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
             bufAliases := mergedAliases
             exclusiveBufs := mergedExcl
             allocRoots := mergedAlloc
+            ctorObjCounts :=
+              if !stT.reachable then stE.ctorObjCounts
+              else if !stE.reachable then stT.ctorObjCounts
+              else (stT.ctorObjCounts ++ stE.ctorObjCounts.filter fun (r, n) =>
+                (stT.ctorObjCounts.lookup r).isNone || stT.ctorObjCounts.lookup r == some n).filter fun (r, n) =>
+                  (stE.ctorObjCounts.lookup r).isNone || stE.ctorObjCounts.lookup r == some n
             typedTuples := mergedTypedTuples
             boolVars := mergedBoolVars
             u64Vars := mergedU64Vars
@@ -2468,6 +2519,7 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
             nonPoison := st.nonPoison && condSv.nonPoison && (!stT.reachable || stT.nonPoison) && (!stE.reachable || stE.nonPoison)
             reachable := stT.reachable || stE.reachable
             symUnsupported := st.symUnsupported || (stT.reachable && stT.symUnsupported) || (stE.reachable && stE.symUnsupported)
+            symExhausted := st.symExhausted || stT.symExhausted || stE.symExhausted
             memWrites := mergedWrites
           }
           let mergedRet :=
@@ -2663,6 +2715,7 @@ def symExecDecl (loopUnrollBound : Nat := 4) (d : LNIRDecl) (synBaseOverride? : 
     noUB := finalSt.noUB
     nonPoison := finalSt.nonPoison
     symUnsupported := finalSt.symUnsupported
+    symExhausted := finalSt.symExhausted
     retVal := canonRet
     jointHeap := jointHeapSummary
     rcDeltas := nonAllocRcDeltas
@@ -2760,7 +2813,7 @@ def mkSampleParamVal (seed : UInt64) (paramIdx : Nat) (ty : LNIRType) (st : Heap
       let mkLeaf (s : HeapState) (salt : UInt64) (sharedLeaf : Bool) : Val × HeapState :=
         let leafFields := (List.range 8).map fun k =>
           Val.u64 (((splitMix64Next (r + salt + (k.toUInt64 * 7))).1 % 16) + 1)
-        let (cid, s1) := s.allocHeapCtor 0 leafFields
+        let (cid, s1) := s.allocHeapCtor 0 [] leafFields
         if sharedLeaf then
           match s1.incRefObj cid 1 with
           | .ok s2 => (.objPtr cid, s2)
@@ -2787,7 +2840,7 @@ def mkSampleParamVal (seed : UInt64) (paramIdx : Nat) (ty : LNIRType) (st : Heap
           (List.range 8).foldl (fun (acc, curSt) idx =>
             let (cVal, nextSt) := mkLeaf curSt (101 + idx.toUInt64 * 97) sharedKids
             (acc ++ [cVal], nextSt)) ([], st)
-      let (oid, st3) := stAfterKids.allocHeapCtor 0 kids
+      let (oid, st3) := stAfterKids.allocHeapCtor 0 kids []
       if sharedRoot then
         match st3.incRefObj oid 1 with
         | .ok st4 => (.objPtr oid, st4)
@@ -2826,8 +2879,11 @@ def checkDeclConcreteRefinement (src tgt : LNIRDecl) (numSamples : Nat := 64) (f
   let effFuel := Nat.max fuel 256
   let samples := (List.range numSamples).map (buildDeclSample src)
   let (passedCount, nonVacuousCount) := samples.foldl (fun (acc, okSrc) (env, st) =>
-    let srcOk := match evalCode effFuel env st src.body with | .ok _ => true | .error _ => false
-    let stepOk := checkSingleSample effFuel env st src.body tgt.body
+    let srcRes := evalCode effFuel env st src.body
+    let srcOk := match srcRes with | .ok _ => true | .error _ => false
+    -- C6.3: evaluator fuel / RC-release exhaustion on the source is an incomplete analysis, never "source UB"
+    let srcExhausted := match srcRes with | .error .fuelExhausted => true | _ => false
+    let stepOk := !srcExhausted && checkSingleSample effFuel env st src.body tgt.body
     (if stepOk then acc + 1 else acc, if srcOk && stepOk then okSrc + 1 else okSrc)) (0, 0)
   (passedCount == numSamples && (numSamples == 0 || nonVacuousCount > 0), nonVacuousCount)
 
@@ -2877,7 +2933,9 @@ def validateTranslationDecl (src tgt : LNIRDecl) (numSamples : Nat := 64) : TVDe
   let symUbImplies : Bool :=
     tcUb == .constBool true || scUb == .constBool false || scUb == tcUb ||
       normSymExpr (SymExecState.hoistIteTupleFuel 16 (normSymIteStep scUb tcUb (.constBool true))) == .constBool true
-  let symSupportedOk := isIdenticalDecl || (!sSrc.symUnsupported && !sTgt.symUnsupported)
+  -- C6.1/C6.2: exhaustion is an incomplete analysis on either side, never excused by syntactic identity
+  let symSupportedOk := !sSrc.symExhausted && !sTgt.symExhausted &&
+    (isIdenticalDecl || (!sSrc.symUnsupported && !sTgt.symUnsupported))
   let ubRefines := symSupportedOk && (!sSrc.noUB || sTgt.noUB) && symUbImplies
   -- 2. Return domain / reachability equivalence on defined source paths (`scUb → (sSrc.reachCond == sTgt.reachCond)`)
   let domainEquiv :=

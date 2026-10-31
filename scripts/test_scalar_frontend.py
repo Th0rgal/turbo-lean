@@ -1001,11 +1001,23 @@ def probe_rc_drop (sel seed delta : UInt64) : UInt64 :=
             src = tmp / "Stage1DHeap.lean"
             src.write_text(lean_src, encoding="utf-8")
             wire = tmp / "stage1d.lnir"
+            # P-cert C4: without `--allow-rc-adt`, emit-lnir and emit-cabi-bindings hard-fail on a Stage 1D decl
+            # and write nothing (no helper prototypes leak into bindings).
+            for cmd, out in (["emit-lnir", "--wire"], wire), (["emit-cabi-bindings", "--emit-header"], tmp / "h.h"):
+                rej = subprocess.run([engines["full_bin"], *cmd, str(out), str(src)] if cmd[0] != "emit-lnir"
+                                     else [engines["full_bin"], *cmd, str(src), "-o", str(out)], capture_output=True, text=True)
+                self.assertNotEqual(rej.returncode, 0, f"{cmd[0]} must fail closed without --allow-rc-adt")
+                self.assertFalse(out.exists())
             res = subprocess.run(
-                [engines["full_bin"], "emit-lnir", "--wire", str(src), "-o", str(wire)],
+                [engines["full_bin"], "emit-lnir", "--wire", "--allow-rc-adt", str(src), "-o", str(wire)],
                 capture_output=True, text=True,
             )
             self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            # a module loaded from the opted-in wire is still rejected by default emit-lnir/emit-cabi-bindings
+            for cmd in (["emit-lnir", "--wire", "--lnir", str(wire)], ["emit-cabi-bindings", "--lnir", str(wire)]):
+                rej = subprocess.run([engines["core_bin"], *cmd], capture_output=True, text=True)
+                self.assertNotEqual(rej.returncode, 0, f"{cmd[0]} must reject an RC-ADT wire without --allow-rc-adt")
+                self.assertIn("RC-ADT", rej.stderr)
             wire_text = wire.read_text(encoding="utf-8")
             for op in ("C_inc", "C_dec", "E_ctor", "E_cgeto", "E_isexcl", "E_mktup", "E_projtup", "C_ite"):
                 self.assertGreater(wire_text.count(op), 0, f"missing expected opcode {op} in Stage 1D wire")
@@ -1064,7 +1076,7 @@ def probe_tri (x : UInt64) : UInt64 :=
   readThirdField (stepTriField init 7)
 ''', encoding="utf-8")
             tri_wire = tmp / "tri.lnir"
-            subprocess.run([engines["full_bin"], "emit-lnir", "--wire", str(tri_src), "-o", str(tri_wire)],
+            subprocess.run([engines["full_bin"], "emit-lnir", "--wire", "--allow-rc-adt", str(tri_src), "-o", str(tri_wire)],
                            check=True, capture_output=True, text=True)
             tri_tv = json.loads(subprocess.check_output(
                 [engines["core_bin"], "validate-tv", "--lnir", str(tri_wire), "--json"], text=True,
@@ -1087,7 +1099,7 @@ def probe_bad_direct (x : UInt64) : UInt64 := readDirect (.data x)
 ''', encoding="utf-8")
             bad_wire = tmp / "bad_scalar_adt.lnir"
             bad_res = subprocess.run(
-                [engines["full_bin"], "emit-lnir", "--wire", str(bad_scalar_adt), "-o", str(bad_wire)],
+                [engines["full_bin"], "emit-lnir", "--wire", "--allow-rc-adt", str(bad_scalar_adt), "-o", str(bad_wire)],
                 capture_output=True, text=True,
             )
             self.assertNotEqual(bad_res.returncode, 0, "direct scalar-payload heap ADT must fail closed")
@@ -1616,7 +1628,7 @@ open LeanNative.IR LeanNative.Proofs
               (.letBind 5 .i64 (.scalar (.constU64 0))
                 (.letBind 6 .i64 (.scalar (.constU64 2))
                   (.letBind 7 .unit (.call "lean_native_ctor_set" [0, 5, 6] .unit false)
-                    (.letBind 8 .i64 (.ctorGetScalar 0 0 .i64)
+                    (.letBind 8 .i64 (.ctorGetObj 0 0)
                       (.letBind 9 .i64 (.scalar (.constU64 3))
                         (.letBind 10 .i1 (.isExclusive 1)
                           (.ite 10
@@ -1626,7 +1638,7 @@ open LeanNative.IR LeanNative.Proofs
                                   (if rereadAfterWrite then
                                      .letBind 13 .i1 (.scalar (.binOp .eq (.var 2) (.constU64 999)))
                                        (.ite 13
-                                         (.letBind 14 .i64 (.ctorGetScalar 0 0 .i64) (.ret 14))
+                                         (.letBind 14 .i64 (.ctorGetObj 0 0) (.ret 14))
                                          (.ret 8))
                                    else
                                      .ret 8)
@@ -1687,7 +1699,7 @@ open LeanNative.IR LeanNative.Proofs
           (.letBind 3 .objPtr (.scalar (.select (.constBool true) (.var 2) (.var 2)))
             (.letBind 4 .i64 (.scalar (.constU64 0))
               (.letBind 5 .i64 (.scalar (.select (.binOp .eq (.var 0) (.constU64 999)) (.constU64 2) (.constU64 1)))
-                (.letBind 6 .unit (.call "lean_native_ctor_set" [2, 4, 5] .unit false)
+                (.letBind 6 .unit (.call "lean_native_ctor_set_scalar" [2, 4, 5] .unit false)
                   (if constOneTarget then
                      .decRef 2 1 (.ret 1)
                    else
@@ -1708,7 +1720,7 @@ open LeanNative.IR LeanNative.Proofs
             (.letBind 4 .objPtr (.scalar (.select (.binOp .eq (.var 0) (.constU64 999)) (.var 2) (.var 3)))
               (.letBind 5 .i64 (.scalar (.constU64 0))
                 (.letBind 6 .i64 (.scalar (.constU64 2))
-                  (.letBind 7 .unit (.call "lean_native_ctor_set" [2, 5, 6] .unit false)
+                  (.letBind 7 .unit (.call "lean_native_ctor_set_scalar" [2, 5, 6] .unit false)
                     (if constOneTarget then
                        .decRef 2 1 (.decRef 3 1 (.ret 1))
                      else
@@ -1730,7 +1742,7 @@ open LeanNative.IR LeanNative.Proofs
             (.letBind 4 .objPtr (.projTuple 3 0)
               (.letBind 5 .i64 (.scalar (.constU64 0))
                 (.letBind 6 .i64 (.scalar (.select (.binOp .eq (.var 0) (.constU64 999)) (.constU64 2) (.constU64 1)))
-                  (.letBind 7 .unit (.call "lean_native_ctor_set" [2, 5, 6] .unit false)
+                  (.letBind 7 .unit (.call "lean_native_ctor_set_scalar" [2, 5, 6] .unit false)
                     (if constOneTarget then
                        .decRef 2 1 (.ret 1)
                      else
@@ -1754,7 +1766,7 @@ open LeanNative.IR LeanNative.Proofs
                 (.letBind 6 (.tuple [.objPtr]) (.mkTuple [3])
                   (.letBind 7 .i64 (.scalar (.constU64 0))
                     (.letBind 8 .i64 (.scalar (.constU64 2))
-                      (.letBind 9 .unit (.call "lean_native_ctor_set" [2, 7, 8] .unit false)
+                      (.letBind 9 .unit (.call "lean_native_ctor_set_scalar" [2, 7, 8] .unit false)
                         (.ite 4
                           (.letBind 10 .objPtr (.projTuple 5 0)
                             (if constOneTarget then
@@ -1868,7 +1880,7 @@ open LeanNative.IR LeanNative.Proofs
                       (.letBind 7 .i64 (.ctorGetScalar 0 0 .i64)
                         (.letBind 8 .i64 (.scalar (.constU64 0))
                           (.letBind 9 .i64 (.scalar (.binOp .add (.var 7) (.constU64 1)))
-                            (.letBind 10 .unit (.call "lean_native_ctor_set" [0, 8, 9] .unit false)
+                            (.letBind 10 .unit (.call "lean_native_ctor_set_scalar" [0, 8, 9] .unit false)
                               (.letBind 11 .objPtr (.ctorGetObj 5 0)
                                 (.letBind 12 .i64 (.ctorGetScalar 11 0 .i64)
                                   (.incRef 0 1
@@ -2373,8 +2385,10 @@ open LeanNative.IR LeanNative.Proofs
     params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
     retTy := .i1
     body :=
-      .letBind 1 .objPtr (.allocCtor 0 [] [])
-        (.letBind 2 .objPtr (.allocCtor 0 [] [1])
+      -- the child must be a genuinely heap-allocated (non-nullary) ctor: a fieldless `allocCtor 0 [] []` is the
+      -- immediate `.tuple [0]` (always exclusive), which would make this aliasing check vacuous
+      .letBind 1 .objPtr (.allocCtor 0 [] [0])
+        (.letBind 2 .objPtr (.allocCtor 0 [1] [])
           (.letBind 3 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
             (.ite 3
               (.incRef 1 1
