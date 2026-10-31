@@ -3703,7 +3703,10 @@ pub(crate) fn try_reflink_or_hardlink(
     // If hardlinking failed (e.g. EXDEV across bind mounts) and `dst` already exists as a
     // read-only 0o444 file with identical size and bytes, preserve `dst`'s existing inode & mtime!
     if let (Ok(src_meta), Ok(dst_meta)) = (fs::metadata(src), fs::metadata(dst)) {
-        if src_meta.len() == dst_meta.len() && (dst_meta.permissions().mode() & 0o222) == 0 {
+        if src_meta.len() == dst_meta.len()
+            && expected_len.is_none_or(|n| src_meta.len() == n)
+            && (dst_meta.permissions().mode() & 0o222) == 0
+        {
             if let (Ok(sb), Ok(db)) = (fs::read(src), fs::read(dst)) {
                 if sb == db {
                     return Ok("hardlink");
@@ -3724,6 +3727,7 @@ pub(crate) fn try_reflink_or_hardlink(
                 perms.set_mode(0o444);
                 let _ = dst_file.set_permissions(perms);
                 drop(dst_file);
+                check_len(&tmp_dst)?;
                 fs::rename(&tmp_dst, dst)?;
                 return Ok("reflink");
             } else {
@@ -3738,6 +3742,7 @@ pub(crate) fn try_reflink_or_hardlink(
     let mut perms = fs::metadata(&tmp_dst)?.permissions();
     perms.set_mode(0o444);
     let _ = fs::set_permissions(&tmp_dst, perms);
+    check_len(&tmp_dst)?;
     fs::rename(&tmp_dst, dst)?;
     Ok("copy")
 }
