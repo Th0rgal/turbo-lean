@@ -1141,11 +1141,12 @@ fn split_mutual_block_subspans<'a>(
         return None;
     }
 
-    // Determine minimum indentation of non-empty lines inside the mutual block
+    // Determine declaration indentation, not proof indentation: Lean also accepts
+    // an unindented `:=` continuation inside a mutual block.
     let mut min_indent = usize::MAX;
     for l in body_clean.lines() {
         let t = l.trim();
-        if !t.is_empty() {
+        if is_top_level_command_start(t) {
             let ind = l.len() - l.trim_start().len();
             if ind < min_indent {
                 min_indent = ind;
