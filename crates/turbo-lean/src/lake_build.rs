@@ -3073,7 +3073,7 @@ pub fn dedup_worktree_packages(
                         let same_inode = false;
 
                         if !same_inode
-                            && crate::db::try_reflink_or_hardlink(&cas_file, &path).is_ok()
+                            && crate::db::try_reflink_or_hardlink(&cas_file, &path, None).is_ok()
                         {
                             hardlinked_files += 1;
                             deduped_bytes += sz;
@@ -3100,7 +3100,8 @@ pub fn dedup_worktree_packages(
                                     let _ = fs::set_permissions(&tmp_cas, perms);
                                 }
                                 if fs::rename(&tmp_cas, &cas_file).is_ok() {
-                                    if crate::db::try_reflink_or_hardlink(&cas_file, &path).is_ok()
+                                    if crate::db::try_reflink_or_hardlink(&cas_file, &path, None)
+                                        .is_ok()
                                     {
                                         hardlinked_files += 1;
                                     }
