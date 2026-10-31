@@ -3378,7 +3378,10 @@ fn write_eval_shm_cache(path: &Path, bytes: &[u8]) {
     if crate::shm_cache::atomic_write_shm(path, bytes).is_err() {
         return;
     }
-    if WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 32 == 0 {
+    if WRITES
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .is_multiple_of(32)
+    {
         if let Some(dir) = path.parent() {
             let _ = crate::shm_cache::enforce_shm_quota_lru(dir, 0);
         }
