@@ -311,6 +311,7 @@ structure SymExecState where
   memWrites     : List (VarId × SymExpr × SymExpr) := []
   heapStepEpoch : Nat := 0
   extFreeEpoch  : Nat := 0
+  nextDynAllocIdx : Nat := 0
   synVarBase    : VarId := 30000
   reachCond     : SymExpr := .constBool true
   ubCond        : SymExpr := .constBool true
@@ -404,7 +405,7 @@ def lookupRcExpr (st : SymExecState) (bufVar : VarId) : SymExpr :=
     match st.rcExprs.lookup root with
     | some e => e
     | none =>
-      if st.allocRoots.contains root then .rcSym 0 root
+      if st.allocRoots.contains root then .constU64 0
       else .rcSym st.heapStepEpoch root
 
 def markAllocated (st : SymExecState) (bufVar : VarId) : SymExecState :=
@@ -464,7 +465,11 @@ def cantorPairNat (a b : Nat) : Nat :=
     depths and arbitrary `heapStepEpoch` values! -/
 def projFieldRootId (synVarBase epoch parentRoot idx : Nat) : VarId :=
   let maxTmp := synVarBase + 16 + 2048
-  maxTmp + cantorPairNat epoch (parentRoot * 16 + idx + 1)
+  maxTmp + cantorPairNat epoch (parentRoot * 16 + idx + 2)
+
+def dynAllocRootId (synVarBase allocIdx : Nat) : VarId :=
+  let maxTmp := synVarBase + 16 + 2048
+  maxTmp + cantorPairNat allocIdx 1
 
 def desugarTmpBase (synVarBase fuel' : Nat) : VarId :=
   synVarBase + 16 + fuel' * 4
@@ -762,6 +767,15 @@ def expandHeapExpr (st : SymExecState) : Nat → SymExpr → SymExpr
       | .tuple fs =>
         let fs' := fs.map (expandHeapExpr st d)
         .tuple (rootMarker :: rcExpr :: fs')
+      | .ite c t f =>
+        if st.allocRoots.contains root then
+          let mkArm (arm : SymExpr) : SymExpr :=
+            match arm with
+            | .tuple fs => .tuple (rootMarker :: rcExpr :: fs.map (expandHeapExpr st d))
+            | _ => .tuple [rootMarker, rcExpr]
+          normSymIteStep c (mkArm t) (mkArm f)
+        else
+          rootExpr
       | .symVar rId =>
         let eff := st.resolveBuf rId
         if st.allocRoots.contains eff then
@@ -903,6 +917,16 @@ def hoistIteTupleFuel : Nat → SymExpr → SymExpr
         (hoistIteTupleFuel d (substCondInSymExpr hc true t))
         (hoistIteTupleFuel d (substCondInSymExpr hc false f))
   | _ + 1, e => e
+
+def pruneDeadLiveAllocEntries : SymExpr → SymExpr
+  | .ite c t f => normSymIteStep c (pruneDeadLiveAllocEntries t) (pruneDeadLiveAllocEntries f)
+  | .tuple [retE, writesE, .tuple allocEs] =>
+    let kept := allocEs.filter fun entry =>
+      match entry with
+      | .tuple (_ :: .constU64 0 :: _) => false
+      | _ => true
+    .tuple [retE, writesE, .tuple kept]
+  | other => other
 
 def summarizeHeapExpr (st : SymExecState) (expr : SymExpr) : SymExpr :=
   normSymExpr (st.alphaRenameAllocTags (hoistIteTupleFuel 16 (normSymExpr (st.expandHeapExpr 16 expr))))
@@ -1499,8 +1523,16 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
           | e => e
       let objectExprs := objFields.map encodeCtorField
       let scalarExprs := scalarFields.map encodeCtorField
-      (st.markAllocated dst).bindVar dst {
+      let allocId := SymExecState.dynAllocRootId st.synVarBase st.nextDynAllocIdx
+      let st0 := { st with nextDynAllocIdx := st.nextDynAllocIdx + 1 }
+      let st1 := (st0.markAllocated allocId).markObjPtrVar allocId
+      let st2 := st1.bindVar allocId {
         expr := .tuple (.constU64 tag.toUInt64 :: objectExprs ++ scalarExprs)
+        nonPoison := svs.all (·.nonPoison)
+        noUB := svs.all (·.noUB)
+      }
+      (((st2.clearVarSortTags dst).aliasBuf dst allocId).markObjPtrVar dst).bindVar dst {
+        expr := .symVar allocId
         nonPoison := svs.all (·.nonPoison)
         noUB := svs.all (·.noUB)
       }
@@ -2185,7 +2217,8 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
               else (st, st)
             | _ => (st, st)
           let (stT, retT) := symExecCode fuel' unrollBound stForT thenBranch expandRetHeap
-          let (stE, retE) := symExecCode fuel' unrollBound stForE elseBranch expandRetHeap
+          let stEIn := { stForE with nextDynAllocIdx := Nat.max stForE.nextDynAllocIdx stT.nextDynAllocIdx }
+          let (stE, retE) := symExecCode fuel' unrollBound stEIn elseBranch expandRetHeap
           let mergedVars : List (VarId × SymStateVal) :=
             ((stT.vars ++ stE.vars).map Prod.fst).eraseDups.map fun vid =>
               let svT := stT.lookupVar vid
@@ -2309,6 +2342,10 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
             if !stT.reachable then stE.extFreeEpoch
             else if !stE.reachable then stT.extFreeEpoch
             else Nat.max stT.extFreeEpoch stE.extFreeEpoch
+          let mergedDynAllocIdx :=
+            if !stT.reachable then stE.nextDynAllocIdx
+            else if !stE.reachable then stT.nextDynAllocIdx
+            else Nat.max stT.nextDynAllocIdx stE.nextDynAllocIdx
           let mergedExtLive :=
             if !stT.reachable then stE.extLivenessRoots
             else if !stE.reachable then stT.extLivenessRoots
@@ -2332,6 +2369,7 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
             rcExprs := mergedRcExprs
             heapStepEpoch := mergedEpoch
             extFreeEpoch := mergedFreeEpoch
+            nextDynAllocIdx := mergedDynAllocIdx
             synVarBase := st.synVarBase
             reachCond := mergedReachCond
             ubCond := mergedUbCond
@@ -2376,8 +2414,11 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
       let stInputs := inputs.foldl (fun cur iv =>
         let r := cur.resolveBuf iv
         ((cur.noteExtRoot r).requireUbCond (cur.liveRcCond r)).noteExtLiveRoot r) st
-      let st1 := ((stInputs.clearAlias outVar).clearVarSortTags outVar).markAllocated outVar
-      let st2 := (st1.markSarrayVar outVar).bindVar outVar { expr := .symVar outVar, nonPoison := true, noUB := true }
+      let allocId := SymExecState.dynAllocRootId stInputs.synVarBase stInputs.nextDynAllocIdx
+      let st0 := { stInputs with nextDynAllocIdx := stInputs.nextDynAllocIdx + 1 }
+      let st1 := (st0.markAllocated allocId).markSarrayVar allocId
+      let st2 := (((st1.clearVarSortTags outVar).aliasBuf outVar allocId).markSarrayVar outVar).bindVar outVar
+        { expr := .symVar allocId, nonPoison := true, noUB := true }
       symExecCode fuel' unrollBound st2 k expandRetHeap
     | .ret v =>
       let rRoot := st.resolveBuf v
@@ -2515,7 +2556,8 @@ def symExecDecl (loopUnrollBound : Nat := 4) (d : LNIRDecl) (synBaseOverride? : 
   -- feasible path (`hoistIteTupleFuel`) so cross-alias relationships between returns and escaping heap writes
   -- as well as leaked/live reference counts are preserved across every branch!
   let combinedRaw := SymExpr.tuple [normSymExpr retExpr, SymExpr.tuple expandedWriteExprs, SymExpr.tuple liveAllocRc]
-  let jointHeapSummary := normSymExpr (finalSt.alphaRenameAllocTags (SymExecState.hoistIteTupleFuel 24 combinedRaw))
+  let jointHeapSummary := normSymExpr (finalSt.alphaRenameAllocTags
+    (SymExecState.pruneDeadLiveAllocEntries (SymExecState.hoistIteTupleFuel 64 combinedRaw)))
   let expandedWrites := (rawWrites.zip expandedWriteExprs).map fun ((r, idx, _), wVal) =>
     (r, normSymExpr idx, normSymExpr (finalSt.alphaRenameAllocTags (SymExecState.hoistIteTupleFuel 16 wVal)))
   let canonRet := normSymExpr (finalSt.alphaRenameAllocTags (SymExecState.hoistIteTupleFuel 16 (normSymExpr retExpr)))
