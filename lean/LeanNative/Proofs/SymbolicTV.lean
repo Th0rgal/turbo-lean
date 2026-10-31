@@ -336,10 +336,12 @@ def isFreshRuntimeAllocRoot (st : SymExecState) (r : VarId) : Bool :=
   st.freshCtorRoots.contains r || (st.heapAllocSeq.lookup r).isSome
 
 def hasKnownRootTracking (st : SymExecState) (root : VarId) : Bool :=
-  (match (st.lookupVar root).expr with
-   | .symVar base => base == root
-   | _ => false) ||
+  match (st.lookupVar root).expr with
+  | .symVar base =>
+    base == root && ((st.rootRc.lookup root).isSome || st.exclusiveBufs.contains root || !(st.vars.lookup root).isSome)
+  | .ctorObj .. | .tuple _ =>
     (st.rootRc.lookup root).isSome || st.exclusiveBufs.contains root
+  | _ => false
 
 def dropAliasedRootBounds (st : SymExecState) (keepRoot : VarId) : SymExecState :=
   let isMayAlias (id : VarId) := id != keepRoot && !st.isFreshRuntimeAllocRoot id
@@ -1084,12 +1086,12 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
       else if fnName == "lean_native_ensure_exclusive" && ptrRet then
         let root := st.resolveBuf a
         let av := st.lookupVar root
-        if !st0.hasKnownRootTracking root then
+        if !st.hasKnownRootTracking root then
           let st1 := st0.bindVar dst { expr := av.expr, nonPoison := av.nonPoison, noUB := false }
           { st1 with supported := false }
         else
-          let stBase := if st.isFreshRuntimeAllocRoot root then st0 else st0.dropAliasedRootBounds root
-          let st1 := (((stBase.markExclusive root).recordRootRcOp root 9 (.constU64 1)).aliasBuf dst root).bindVar dst (st.lookupVar a)
+          let stBase := if st.isFreshRuntimeAllocRoot root then st else st.dropAliasedRootBounds root
+          let st1 := ((((stBase.clearDstTracking dst).markExclusive root).recordRootRcOp root 9 (.constU64 1)).aliasBuf dst root).bindVar dst (st.lookupVar a)
           st1.recordGlobalRcOp root 9 (.constU64 1)
       else if fnName == "lean_native_sarray_len" && i64Ret then
         let root := st.resolveBuf a
@@ -1256,30 +1258,44 @@ def declAllocBase (d : LNIRDecl) : Nat :=
 
 def initDeclSymState (allocBase : Nat) (d : LNIRDecl) : SymExecState :=
   d.params.foldl (fun acc p =>
-    let st1 := acc.bindVar p.id { expr := .symVar p.id, nonPoison := true, noUB := true }
+    let bindParamRoot (stR : SymExecState) (r : VarId) (sv : SymStateVal := { expr := .symVar r, nonPoison := true, noUB := true }) :=
+      ((stR.bindVar r sv).aliasBuf p.id r).bindVar p.id sv
     match p.ty with
-    | .rawPtr _ => st1.markExclusive p.id
-    | .taggedPtr => (st1.setRootRc p.id 1 none).markMaybeScalar p.id
-    | .objPtr | .sarray _ | .storageMap => st1.setRootRc p.id 1 none
-    | .tuple fs =>
-      let (childRoots, st2) := fs.foldl (fun (rs, curSt) fty =>
-        let (cr?, nextSt) := SymExecState.trackedTupleParamRoots (SymExecState.lnirTypeWalkDepth fty + 2) fty curSt
-        (rs ++ [cr?], nextSt)) ([], st1)
-      st2.bindTupleRoots p.id childRoots
-    | .u256 | .i256 => (st1.bindTupleRoots p.id [none, none, none, none]).markImmRoot p.id
-    | .unit => st1.markImmRoot p.id
-    | _ => if p.ty.isUnboxedScalar then st1.markImmRoot p.id else st1
+    | .rawPtr _ =>
+      let (r, st0) := acc.allocParamRoot
+      bindParamRoot (st0.markExclusive r) r
+    | .taggedPtr =>
+      let (r, st0) := acc.allocParamRoot
+      bindParamRoot ((st0.setRootRc r 1 none).markMaybeScalar r) r
+    | .objPtr | .sarray _ | .storageMap =>
+      let (r, st0) := acc.allocParamRoot
+      bindParamRoot (st0.setRootRc r 1 none) r
+    | .tuple _ | .u256 | .i256 =>
+      let (r?, st0) := SymExecState.trackedTupleParamRoots (SymExecState.lnirTypeWalkDepth p.ty + 2) p.ty acc
+      match r? with
+      | some r =>
+        let st1 := if p.ty matches .u256 | .i256 then st0.markImmRoot r else st0
+        bindParamRoot st1 r (st1.lookupVar r)
+      | none => st0
+    | _ =>
+      let (r, st0) := acc.allocParamRoot
+      let st1 := if p.ty == .unit || p.ty.isUnboxedScalar then st0.markImmRoot r else st0
+      bindParamRoot st1 r
   ) { allocBase := allocBase }
 
 /-- Run symbolic execution on an `LNIRDecl` with initial symbolic parameters. -/
 def symExecDeclFromInit (initState : SymExecState) (loopUnrollBound : Nat := 4) (d : LNIRDecl) : SymExecSummary :=
   let (finalSt, retExpr) := symExecCode 4096 loopUnrollBound initState d.body
-  let paramIds := d.params.map (·.id)
+  let paramRootPairs := d.params.map fun p => (p.id, initState.resolveBuf p.id)
+  let paramRootIds := paramRootPairs.map (·.2)
   let rawLive := finalSt.rootRc.filterMap fun (rid, m, ex?) =>
     let isFreshAlloc := finalSt.isFreshRuntimeAllocRoot rid
     let defaultUnknown := rid >= initState.allocBase && !isFreshAlloc && (m, ex?) == (1, none)
-    if paramIds.contains rid || ex? == some 0 || defaultUnknown then none else some (rid, m, ex?)
-  let mapHeapId := SymExecState.canonicalHeapRootId initState.allocBase finalSt.heapAllocSeq
+    if paramRootIds.contains rid || ex? == some 0 || defaultUnknown then none else some (rid, m, ex?)
+  let mapHeapId (r : VarId) : VarId :=
+    match paramRootPairs.find? (fun (_, pr) => pr == r) with
+    | some (pid, _) => pid
+    | none => SymExecState.canonicalHeapRootId initState.allocBase finalSt.heapAllocSeq r
   let idSym (rid : VarId) : SymExpr :=
     normSymExpr (substSymHeapIds mapHeapId (finalSt.rootIdentitySym rid))
   let payloadSym (rid : VarId) : SymExpr :=
@@ -1296,10 +1312,10 @@ def symExecDeclFromInit (initState : SymExecState) (loopUnrollBound : Nat := 4) 
     (fun (s1, _, _, _) (s2, _, _, _) => reprStr s1 <= reprStr s2)
   let liveOther := rawLive.filterMap fun (rid, m, ex?) =>
     if finalSt.isFreshRuntimeAllocRoot rid then none else some (idSym rid, m, ex?, epSym rid)
-  let canonLiveRc := paramIds.filterMap (fun pid =>
-    let (m, ex?) := finalSt.getRootRc pid
-    let initDefault := (initState.rootRc.lookup pid).getD (1, none)
-    let pEp := epSym pid
+  let canonLiveRc := paramRootPairs.filterMap (fun (pid, pr) =>
+    let (m, ex?) := finalSt.getRootRc pr
+    let initDefault := (initState.rootRc.lookup pr).getD (1, none)
+    let pEp := epSym pr
     if (m, ex?) == initDefault && pEp == .constU64 0 then none else some (.symVar pid, m, ex?, pEp)) ++
     liveOther ++ liveFresh
   let canonWrites := finalSt.memWrites.map fun (b, i, v) =>
@@ -3349,6 +3365,190 @@ private def liveCtorBranchPredSwapTgt : LNIRDecl :=
   liveCtorBranchPredSwapSrc.body liveCtorBranchPredSwapTgt.body
 #guard !(validateTranslationDecl liveCtorBranchPredSwapSrc liveCtorBranchPredSwapTgt).memWritesEquiv
 #guard !(validateTranslationDecl liveCtorBranchPredSwapSrc liveCtorBranchPredSwapTgt).passed
+
+private def reboundObjParamImmExclSrc : LNIRDecl :=
+  { name := "rebound_obj_param_imm_excl"
+    params := [{ id := 0, name := "n", ty := .i64, borrow := false },
+               { id := 1, name := "p", ty := .objPtr, borrow := true }]
+    retTy := .i1
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .incRef 1 1 <|
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 100))) <|
+      .ite 2
+        (.letBind 1 .objPtr (.scalar (.constU64 0)) <|
+         .letBind 3 .i1 (.isExclusive 1) <|
+         .ret 3)
+        (.letBind 3 .i1 (.scalar (.constBool false)) <|
+         .ret 3) }
+
+private def reboundObjParamImmExclFalseTgt : LNIRDecl :=
+  { reboundObjParamImmExclSrc with
+    body :=
+      .incRef 1 1 <|
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 100))) <|
+      .ite 2
+        (.letBind 1 .objPtr (.scalar (.constU64 0)) <|
+         .letBind 3 .i1 (.scalar (.constBool false)) <|
+         .ret 3)
+        (.letBind 3 .i1 (.scalar (.constBool false)) <|
+         .ret 3) }
+
+#guard !(let (p, st0) := HeapState.empty.allocCtor 0 [] [];
+  checkSingleSample 1024 ((VarEnv.empty.bind 0 (.u64 100)).bind 1 p) st0
+    reboundObjParamImmExclSrc.body reboundObjParamImmExclFalseTgt.body)
+#guard !(validateTranslationDecl reboundObjParamImmExclSrc reboundObjParamImmExclFalseTgt).symRetEquiv
+#guard !(validateTranslationDecl reboundObjParamImmExclSrc reboundObjParamImmExclFalseTgt).passed
+
+private def reboundObjParamSelectPtrExclSrc : LNIRDecl :=
+  { name := "rebound_obj_param_select_ptr_excl"
+    params := [{ id := 0, name := "n", ty := .i64, borrow := false },
+               { id := 1, name := "p", ty := .objPtr, borrow := true },
+               { id := 2, name := "c", ty := .i1, borrow := false }]
+    retTy := .i1
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .incRef 1 1 <|
+      .letBind 3 .objPtr (.allocCtor 0 [] []) <|
+      .letBind 4 .objPtr (.allocCtor 0 [] []) <|
+      .letBind 1 .objPtr (.scalar (.select (.var 2) (.var 3) (.var 4))) <|
+      .letBind 5 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 100))) <|
+      .ite 5
+        (.letBind 6 .i1 (.isExclusive 1) <| .decRef 3 1 <| .decRef 4 1 <| .ret 6)
+        (.decRef 3 1 <| .decRef 4 1 <| .letBind 6 .i1 (.scalar (.constBool false)) <| .ret 6) }
+
+private def reboundObjParamSelectPtrExclFalseTgt : LNIRDecl :=
+  { reboundObjParamSelectPtrExclSrc with
+    body :=
+      .incRef 1 1 <|
+      .letBind 3 .objPtr (.allocCtor 0 [] []) <|
+      .letBind 4 .objPtr (.allocCtor 0 [] []) <|
+      .letBind 1 .objPtr (.scalar (.select (.var 2) (.var 3) (.var 4))) <|
+      .letBind 5 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 100))) <|
+      .ite 5
+        (.letBind 6 .i1 (.scalar (.constBool false)) <| .decRef 3 1 <| .decRef 4 1 <| .ret 6)
+        (.decRef 3 1 <| .decRef 4 1 <| .letBind 6 .i1 (.scalar (.constBool false)) <| .ret 6) }
+
+#guard !(let (p, st0) := HeapState.empty.allocCtor 0 [] [];
+  checkSingleSample 1024 (((VarEnv.empty.bind 0 (.u64 100)).bind 1 p).bind 2 (.bool true)) st0
+    reboundObjParamSelectPtrExclSrc.body reboundObjParamSelectPtrExclFalseTgt.body)
+#guard !(validateTranslationDecl reboundObjParamSelectPtrExclSrc reboundObjParamSelectPtrExclFalseTgt).ubRefines
+#guard !(validateTranslationDecl reboundObjParamSelectPtrExclSrc reboundObjParamSelectPtrExclFalseTgt).passed
+
+private def reboundSArrayParamLenSrc : LNIRDecl :=
+  { name := "rebound_sarray_param_len"
+    params := [{ id := 0, name := "n", ty := .i64, borrow := false },
+               { id := 1, name := "arr", ty := .sarray .i64, borrow := true }]
+    retTy := .i64
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 2 .i64 (.sarrayLen 1) <|
+      .letBind 1 .i64 (.scalar (.constU64 0)) <|
+      .letBind 3 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 100))) <|
+      .ite 3 (.ret 2) (.letBind 4 .i64 (.scalar (.constU64 0)) <| .ret 4) }
+
+private def reboundSArrayParamLenBadTgt : LNIRDecl :=
+  { reboundSArrayParamLenSrc with
+    body :=
+      .letBind 1 .i64 (.scalar (.constU64 0)) <|
+      .letBind 3 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 100))) <|
+      .ite 3
+        (.letBind 2 .i64 (.sarrayLen 1) <| .ret 2)
+        (.letBind 4 .i64 (.scalar (.constU64 0)) <| .ret 4) }
+
+#guard !(let buf : ArrayBuffer := { id := 1, exclusive := true, data := #[42] };
+  let st0 : HeapState := { HeapState.empty with buffers := [buf], nextId := 1 };
+  checkSingleSample 1024 ((VarEnv.empty.bind 0 (.u64 100)).bind 1 (.sarrayId 1)) st0
+    reboundSArrayParamLenSrc.body reboundSArrayParamLenBadTgt.body)
+#guard !(validateTranslationDecl reboundSArrayParamLenSrc reboundSArrayParamLenBadTgt).ubRefines
+#guard !(validateTranslationDecl reboundSArrayParamLenSrc reboundSArrayParamLenBadTgt).passed
+
+private def reboundRawPtrParamStoreSrc : LNIRDecl :=
+  { name := "rebound_rawptr_param_store"
+    params := [{ id := 0, name := "n", ty := .i64, borrow := false },
+               { id := 1, name := "ptr", ty := .rawPtr .i64, borrow := true }]
+    retTy := .i64
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 1 .i64 (.scalar (.constU64 0)) <|
+      .ret 1 }
+
+private def reboundRawPtrParamStoreBadTgt : LNIRDecl :=
+  { reboundRawPtrParamStoreSrc with
+    body :=
+      .letBind 1 .i64 (.scalar (.constU64 0)) <|
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 100))) <|
+      .ite 2
+        (.rawStore 1 1 1 .i64 (.ret 1))
+        (.ret 1) }
+
+#guard !(let buf : ArrayBuffer := { id := 1, exclusive := true, data := #[42] };
+  let st0 : HeapState := { HeapState.empty with buffers := [buf], nextId := 1 };
+  checkSingleSample 1024 ((VarEnv.empty.bind 0 (.u64 100)).bind 1 (.rawPtrId 1)) st0
+    reboundRawPtrParamStoreSrc.body reboundRawPtrParamStoreBadTgt.body)
+#guard !(validateTranslationDecl reboundRawPtrParamStoreSrc reboundRawPtrParamStoreBadTgt).ubRefines
+#guard !(validateTranslationDecl reboundRawPtrParamStoreSrc reboundRawPtrParamStoreBadTgt).passed
+
+private def reboundObjParamCtorGetObjSrc : LNIRDecl :=
+  { name := "rebound_obj_param_ctor_get_obj"
+    params := [{ id := 0, name := "n", ty := .i64, borrow := false },
+               { id := 1, name := "p", ty := .objPtr, borrow := true }]
+    retTy := .objPtr
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 2 .objPtr (.ctorGetObj 1 0) <|
+      .letBind 1 .i64 (.scalar (.constU64 0)) <|
+      .letBind 3 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 100))) <|
+      .ite 3 (.ret 2) (.letBind 4 .objPtr (.scalar (.constU64 0)) <| .ret 4) }
+
+private def reboundObjParamCtorGetObjBadTgt : LNIRDecl :=
+  { reboundObjParamCtorGetObjSrc with
+    body :=
+      .letBind 1 .i64 (.scalar (.constU64 0)) <|
+      .letBind 3 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 100))) <|
+      .ite 3
+        (.letBind 2 .objPtr (.ctorGetObj 1 0) <| .ret 2)
+        (.letBind 4 .objPtr (.scalar (.constU64 0)) <| .ret 4) }
+
+#guard !(let (c0, stA) := HeapState.empty.allocCtor 0 [] [];
+  let (p, st0) := stA.allocCtor 0 [c0] [];
+  checkSingleSample 1024 ((VarEnv.empty.bind 0 (.u64 100)).bind 1 p) st0
+    reboundObjParamCtorGetObjSrc.body reboundObjParamCtorGetObjBadTgt.body)
+#guard !(validateTranslationDecl reboundObjParamCtorGetObjSrc reboundObjParamCtorGetObjBadTgt).ubRefines
+#guard !(validateTranslationDecl reboundObjParamCtorGetObjSrc reboundObjParamCtorGetObjBadTgt).passed
+
+private def reboundSArrayParamDataPtrSrc : LNIRDecl :=
+  { name := "rebound_sarray_param_data_ptr"
+    params := [{ id := 0, name := "n", ty := .i64, borrow := false },
+               { id := 1, name := "arr", ty := .sarray .i64, borrow := false }]
+    retTy := .i64
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 1 .i64 (.scalar (.constU64 0)) <|
+      .ret 1 }
+
+private def reboundSArrayParamDataPtrBadTgt : LNIRDecl :=
+  { reboundSArrayParamDataPtrSrc with
+    body :=
+      .letBind 2 (.sarray .i64) (.sarrayEnsureExclusive 1 .i64) <|
+      .letBind 1 .i64 (.scalar (.constU64 0)) <|
+      .letBind 3 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 100))) <|
+      .ite 3
+        (.letBind 4 (.rawPtr .i64) (.sarrayDataPtr 1 .i64) <| .ret 1)
+        (.ret 1) }
+
+#guard !(let buf : ArrayBuffer := { id := 1, exclusive := true, data := #[42] };
+  let st0 : HeapState := { HeapState.empty with buffers := [buf], nextId := 1 };
+  checkSingleSample 1024 ((VarEnv.empty.bind 0 (.u64 100)).bind 1 (.sarrayId 1)) st0
+    reboundSArrayParamDataPtrSrc.body reboundSArrayParamDataPtrBadTgt.body)
+#guard !(validateTranslationDecl reboundSArrayParamDataPtrSrc reboundSArrayParamDataPtrBadTgt).ubRefines
+#guard !(validateTranslationDecl reboundSArrayParamDataPtrSrc reboundSArrayParamDataPtrBadTgt).passed
 
 /-! ## JSON & Human-Readable Formatting for `TVModuleReport` -/
 
