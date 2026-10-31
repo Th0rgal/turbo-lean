@@ -1,0 +1,14 @@
+{
+  "constants_scanned": 310275,
+  "duplicate_occurrences": 3137,
+  "event": "duplicate_name_coverage",
+  "modules_scanned": 2719,
+  "duplicate_names": 1309,
+  "different_IF_input_names": {
+    "Backend.Proof.add_ofNat_add": "FV.Backend.Proof.IselCtlCallRules",
+    "Backend.Proof.add_ofNat_ne": "FV.Backend.Proof.IselCtlCallRules",
+    "Backend.Proof.Driver.pre.eq_1": "FV.Backend.Proof.LowerLoopSim"
+  },
+  "imported_bindings_verified": 1309,
+  "interface_graph": "IF-v2-canonical-lookups"
+}
