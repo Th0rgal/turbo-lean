@@ -2568,7 +2568,7 @@ fn run_lean_temp_file(
             .arg(&sandbox_olean);
 
         let out = crate::module_builder::run_command_with_timeout(
-            cmd,
+            &mut cmd,
             std::time::Duration::from_secs(120),
             true,
         )?;
@@ -2618,6 +2618,7 @@ fn run_lean_temp_file(
         src,
         audit,
         lean_args,
+        None,
     )
 }
 
@@ -2868,7 +2869,7 @@ pub fn run_ci_verify_command(
             &ci_axioms,
             None,
         )?;
-        let resolved_env = if !is_untrusted && std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+        let resolved_env = if !is_untrusted && !crate::zygote::daemon_disabled() {
             resolve_lake_env(store, &canon_dir).ok()
         } else {
             None
@@ -2925,7 +2926,7 @@ pub fn run_ci_verify_command(
             let env_key = TurboStore::compute_lake_env_key(&canon_dir);
             let resolved_env = if is_untrusted {
                 None
-            } else if std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+            } else if !crate::zygote::daemon_disabled() {
                 resolve_or_share_lake_env(store, &canon_dir, &env_key)?
             } else {
                 store.get_lake_env(&env_key)?.map(|m| (m, false))
@@ -3066,7 +3067,7 @@ pub fn run_ci_verify_command(
             mode, is_untrusted, build_status, total_files, total_shards, &ver_receipt.receipt_blake3[..12], elapsed_ms
         );
     }
-    if !is_untrusted && std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+    if !is_untrusted && !crate::zygote::daemon_disabled() {
         let ev = _resolved_env_opt
             .map(|(m, _)| m)
             .or_else(|| resolve_lake_env(store, &canon_dir).ok().map(|(m, _)| m))
@@ -3611,7 +3612,7 @@ fn stock_statement_build_with_trust(project: &Path, is_untrusted: bool) -> Resul
     let mut command = statement_lake_command(project, is_untrusted)?;
     command.arg("build");
     let out = crate::module_builder::run_command_with_timeout(
-        command,
+        &mut command,
         std::time::Duration::from_secs(1800),
         is_untrusted,
     )?;
@@ -3655,7 +3656,7 @@ fn stock_statement_build_with_trust(project: &Path, is_untrusted: bool) -> Resul
         let mut command = statement_lake_command(project, is_untrusted)?;
         command.arg("build").args(&lake_targets);
         let out = crate::module_builder::run_command_with_timeout(
-            command,
+            &mut command,
             std::time::Duration::from_secs(1800),
             is_untrusted,
         )?;
@@ -3713,7 +3714,7 @@ fn stock_statement_build_with_trust(project: &Path, is_untrusted: bool) -> Resul
                 .arg("-o")
                 .arg(&output);
             let out = crate::module_builder::run_command_with_timeout(
-                command,
+                &mut command,
                 std::time::Duration::from_secs(1800),
                 is_untrusted,
             )?;
@@ -3794,7 +3795,7 @@ fn built_kernel_statement_report(
             .arg(&helper)
             .args(&batch);
         let out = crate::module_builder::run_command_with_timeout(
-            command,
+            &mut command,
             std::time::Duration::from_secs(600),
             is_untrusted,
         )?;
@@ -4955,7 +4956,7 @@ pub fn run_pr_verify_command(
         }
     } else if !is_untrusted
         && remote_http.is_none()
-        && std::env::var("TURBO_LEAN_NO_DAEMON").is_err()
+        && !crate::zygote::daemon_disabled()
     {
         let mut fast_ev = std::collections::HashMap::new();
         if canon_dir.join(".lake/build/lib/lean").exists() {
@@ -5543,7 +5544,7 @@ end Fixture
             let mut command = statement_lake_command(&dir, true)?;
             command.args(["env", "cc", "-c", "fixture.c", "-o", "fixture.o"]);
             let out = crate::module_builder::run_command_with_timeout(
-                command,
+                &mut command,
                 std::time::Duration::from_secs(30),
                 true,
             )?;

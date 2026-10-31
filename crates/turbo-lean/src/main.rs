@@ -57,6 +57,10 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     cache_dir: Option<PathBuf>,
 
+    /// Run once without starting or using a persistent local daemon
+    #[arg(long, global = true)]
+    no_daemon: bool,
+
     /// Output JSON results for agent/CI consumption
     #[arg(long, global = true)]
     json: bool,
@@ -83,6 +87,11 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Manage this user's local coordinator and workers
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommands,
+    },
     /// Incremental two-level CAS build with automatic multi-agent Singleflight coalescing
     Build {
         /// Optional Lake targets to build
@@ -459,11 +468,28 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum DaemonCommands {
+    /// Stop local servers and workers and remove their owned staging files
+    Stop,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     // `check` and `agent-step` vouch for declarations, not for the modules that use them: when the
-    run(cli)?;
-    Ok(())
+    if matches!(&cli.command, Commands::Daemon { .. }) {
+        return run(cli);
+    }
+    let _lifecycle = if matches!(
+        &cli.command,
+        Commands::Serve { .. } | Commands::Mcp { .. } | Commands::Gc { .. }
+    ) {
+        None
+    } else {
+        Some(zygote::lifecycle_lock(false)?)
+    };
+    let _one_shot = zygote::OneShotGuard::new(cli.no_daemon)?;
+    run(cli)
 }
 
 pub(crate) fn apply_global_cli_env(cli: &Cli) {
@@ -477,6 +503,18 @@ pub(crate) fn apply_global_cli_env(cli: &Cli) {
 
 fn run(cli: Cli) -> Result<()> {
     apply_global_cli_env(&cli);
+    if let Commands::Daemon {
+        command: DaemonCommands::Stop,
+    } = &cli.command
+    {
+        let stopped = zygote::stop_daemons(cli.cache_dir.as_deref())?;
+        println!(
+            "{}",
+            serde_json::json!({"status": "stopped", "processes": stopped})
+        );
+        return Ok(());
+    }
+
     let (tel_dir, trust_proj_toml) = match &cli.command {
         Commands::PrVerify {
             mode, project_dir, ..
@@ -551,6 +589,14 @@ fn run(cli: Cli) -> Result<()> {
     // the axiom allowlist and the per-theorem
     // zygote timeout (`check --timeout` wins over `[zygote] timeout_secs`).
     let here = std::path::Path::new(".");
+    let eval_project_root = match &cli.command {
+        Commands::Eval {
+            project_dir, file, ..
+        } => Some(lake_build::find_project_root(
+            project_dir.as_deref().unwrap_or(file),
+        )),
+        _ => None,
+    };
     let (dir, rev) = match &cli.command {
         Commands::PrVerify {
             project_dir, base, ..
@@ -575,6 +621,7 @@ fn run(cli: Cli) -> Result<()> {
                 None,
             )
         }
+        Commands::Eval { .. } => (eval_project_root.as_deref(), None),
         Commands::Mcp { project_dir } => (Some(project_dir.as_deref().unwrap_or(here)), None),
         _ => (None, None),
     };
@@ -626,8 +673,21 @@ fn run(cli: Cli) -> Result<()> {
             _ => accelerators::toml_value(&config, "zygote", "timeout_secs")
                 .and_then(|v| v.parse::<u64>().ok()),
         };
-        if let (Some(secs), None) = (timeout_secs, std::env::var_os("TURBO_LEAN_TIMEOUT_MS")) {
-            std::env::set_var("TURBO_LEAN_TIMEOUT_MS", (secs * 1000).to_string());
+        if let Some(secs) = timeout_secs {
+            if matches!(&cli.command, Commands::Check { timeout, .. } if *timeout > 0)
+                || std::env::var_os("TURBO_LEAN_TIMEOUT_MS").is_none()
+            {
+                std::env::set_var(
+                    "TURBO_LEAN_TIMEOUT_MS",
+                    secs.saturating_mul(1000).to_string(),
+                );
+            }
+        }
+        if std::env::var_os("TURBO_LEAN_DAEMON_IDLE_SECS").is_none() {
+            if let Some(secs) = accelerators::toml_value(&config, "zygote", "idle_ttl_secs") {
+                let secs: u64 = secs.parse()?;
+                std::env::set_var("TURBO_LEAN_DAEMON_IDLE_SECS", secs.to_string());
+            }
         }
     }
 
@@ -1157,7 +1217,10 @@ fn run(cli: Cli) -> Result<()> {
                 let file_disp = file.display().to_string();
                 let decl_disp = decl.clone();
                 std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_secs(timeout));
+                    std::thread::sleep(
+                        std::time::Duration::from_secs(timeout)
+                            .saturating_add(std::time::Duration::from_millis(500)),
+                    );
                     match decl_disp {
                         Some(d) => eprintln!(
                             "[turbo-lean] ERROR: check timed out after {}s for `{}` in {}",
@@ -1723,6 +1786,7 @@ fn run(cli: Cli) -> Result<()> {
             project_dir,
         } => mcp::run_telemetry_command(&action, project_dir.as_deref(), cli.json),
 
+        Commands::Daemon { .. } => unreachable!("handled before opening SQLite store"),
         Commands::RemotePrebuild { .. } => unreachable!("handled before opening SQLite store"),
     }
 }

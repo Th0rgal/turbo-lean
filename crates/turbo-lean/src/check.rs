@@ -660,6 +660,7 @@ fn run_check_command_inner(
     parallel_shards: bool,
     remote_http: Option<String>,
 ) -> Result<serde_json::Value> {
+    let _lifecycle = crate::zygote::lifecycle_lock(false)?;
     let t0 = Instant::now();
     let canon_dir = project_dir
         .canonicalize()
@@ -1019,7 +1020,7 @@ fn check_directory(
                 );
             }
         }
-        if remote_http.is_none() && std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+        if remote_http.is_none() && !crate::zygote::daemon_disabled() {
             let mut fast_ev = HashMap::new();
             fast_ev.insert(
                 "LEAN_PATH".to_string(),
@@ -1184,11 +1185,10 @@ fn check_directory(
                 for arg in crate::module_builder::filter_allowed_lean_args(&cross_args) {
                     cmd.arg(arg);
                 }
-                let cross_out = cmd
-                    .arg(&tmp_cross)
-                    .current_dir(canon_dir)
-                    .envs(&env_vars)
-                    .output()?;
+                let cross_out = crate::zygote::run_lean_command(
+                    cmd.arg(&tmp_cross).current_dir(canon_dir).envs(&env_vars),
+                    Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+                )?;
                 let _ = fs::remove_file(&tmp_cross);
                 cross_ok = cross_out.status.success();
             }
@@ -1295,11 +1295,14 @@ fn check_directory(
                                             {
                                                 cmd.arg(arg);
                                             }
-                                            let out = cmd
-                                                .arg(&tmp_batch)
-                                                .current_dir(canon_ref)
-                                                .envs(env_ref)
-                                                .output()?;
+                                            let out = crate::zygote::run_lean_command(
+                                                cmd.arg(&tmp_batch)
+                                                    .current_dir(canon_ref)
+                                                    .envs(env_ref),
+                                                Some(crate::zygote::remaining_timeout_ms(
+                                                    None, *t0,
+                                                )),
+                                            )?;
                                             let _ = fs::remove_file(&tmp_batch);
                                             if out.status.success() {
                                                 batch_ok = true;
@@ -1320,11 +1323,10 @@ fn check_directory(
                                     ) {
                                         cmd.arg(arg);
                                     }
-                                    let out = cmd
-                                        .arg(&tmp_batch)
-                                        .current_dir(canon_ref)
-                                        .envs(env_ref)
-                                        .output()?;
+                                    let out = crate::zygote::run_lean_command(
+                                        cmd.arg(&tmp_batch).current_dir(canon_ref).envs(env_ref),
+                                        Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+                                    )?;
                                     let _ = fs::remove_file(&tmp_batch);
                                     if !out.status.success() {
                                         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1402,7 +1404,7 @@ fn check_directory(
             );
         }
     }
-    if remote_http.is_none() && std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+    if remote_http.is_none() && !crate::zygote::daemon_disabled() {
         let ev = if !env_vars.is_empty() {
             env_vars
         } else if canon_dir.join(".lake/build/lib/lean").exists()
@@ -2670,13 +2672,14 @@ fn check_single_decl(
                     for arg in crate::module_builder::filter_allowed_lean_args(&file_lean_args) {
                         cmd.arg(arg);
                     }
-                    let out = cmd
-                        .arg(&tmp_shard)
-                        .current_dir(canon_dir)
-                        .envs(&env_vars)
-                        .env("LEAN_STACK_SIZE_KB", default_stack)
-                        .output()
-                        .context("Failed to execute `lean` on theorem shard")?;
+                    let out = crate::zygote::run_lean_command(
+                        cmd.arg(&tmp_shard)
+                            .current_dir(canon_dir)
+                            .envs(&env_vars)
+                            .env("LEAN_STACK_SIZE_KB", default_stack),
+                        Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+                    )
+                    .context("Failed to execute `lean` on theorem shard")?;
                     let _ = fs::remove_file(&tmp_shard);
 
                     if !out.status.success() {
@@ -2893,7 +2896,7 @@ fn check_single_decl(
             }
             if remote_http.is_none()
                 && fast_local_zygote_url.is_none()
-                && std::env::var("TURBO_LEAN_NO_DAEMON").is_err()
+                && !crate::zygote::daemon_disabled()
             {
                 let ev = if !env_vars.is_empty() {
                     env_vars
@@ -2964,7 +2967,7 @@ fn check_single_file(
     let misses = uncached_shards.len();
 
     if !split.hygiene.is_clean_for_certification() {
-        if std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+        if !crate::zygote::daemon_disabled() {
             if src.is_empty() {
                 *src = fs::read_to_string(resolved_file).unwrap_or_default();
             }
@@ -3286,12 +3289,13 @@ fn check_single_file(
                     for arg in crate::module_builder::filter_allowed_lean_args(&file_lean_args) {
                         cmd.arg(arg);
                     }
-                    let batch_out = cmd
-                        .arg(&tmp_coalesced)
-                        .current_dir(canon_dir)
-                        .envs(&env_vars)
-                        .output()
-                        .context("Failed to execute `lean` on coalesced shard batch")?;
+                    let batch_out = crate::zygote::run_lean_command(
+                        cmd.arg(&tmp_coalesced)
+                            .current_dir(canon_dir)
+                            .envs(&env_vars),
+                        Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+                    )
+                    .context("Failed to execute `lean` on coalesced shard batch")?;
                     let _ = fs::remove_file(&tmp_coalesced);
                     if batch_out.status.success() {
                         batch_succeeded = true;
@@ -3445,11 +3449,10 @@ fn check_single_file(
                                 {
                                     cmd.arg(arg);
                                 }
-                                let out = cmd
+                                let out = crate::zygote::run_lean_command(cmd
                                     .arg(&tmp_shard)
                                     .current_dir(canon_ref)
-                                    .envs(env_ref)
-                                    .output()
+                                    .envs(env_ref), Some(crate::zygote::remaining_timeout_ms(None, *t0)))
                                     .with_context(|| {
                                         format!("Failed to execute `lean` on shard `{}`", shard.name)
                                     })?;
@@ -3569,10 +3572,7 @@ fn check_single_file(
                 );
             }
         }
-        if !fast_verified_batch
-            && remote_http.is_none()
-            && std::env::var("TURBO_LEAN_NO_DAEMON").is_err()
-        {
+        if !fast_verified_batch && remote_http.is_none() && !crate::zygote::daemon_disabled() {
             let ev = if env_vars.is_empty() {
                 resolve_lake_env(store, canon_dir)
                     .map(|(m, _)| m)
@@ -3592,7 +3592,7 @@ fn check_single_file(
         let mut verified_via_zygote_eval = false;
         let mut eval_stdout_text = String::new();
         let mut eval_messages: Vec<String> = Vec::new();
-        let can_use_zygote_eval = std::env::var("TURBO_LEAN_NO_DAEMON").is_err()
+        let can_use_zygote_eval = !crate::zygote::daemon_disabled()
             && !src.contains("IO.Process.exit")
             && !src.lines().take(20).any(|l| {
                 let t = l.split("--").next().unwrap_or(l).trim();
@@ -3637,12 +3637,13 @@ fn check_single_file(
             for arg in crate::module_builder::filter_allowed_lean_args(&file_lean_args) {
                 cmd.arg(arg);
             }
-            let out = cmd
-                .arg(canon_resolved_initial)
-                .current_dir(canon_dir)
-                .envs(&env_vars)
-                .output()
-                .context("Failed to execute `lean`")?;
+            let out = crate::zygote::run_lean_command(
+                cmd.arg(canon_resolved_initial)
+                    .current_dir(canon_dir)
+                    .envs(&env_vars),
+                Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+            )
+            .context("Failed to execute `lean`")?;
             if !out.status.success() {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 let stdout = String::from_utf8_lossy(&out.stdout);
@@ -3722,10 +3723,7 @@ fn check_single_file(
                 );
             }
         }
-        if remote_http.is_none()
-            && !verified_via_zygote_eval
-            && std::env::var("TURBO_LEAN_NO_DAEMON").is_err()
-        {
+        if remote_http.is_none() && !verified_via_zygote_eval && !crate::zygote::daemon_disabled() {
             pack::warm_local_zygote_daemon_nonblocking(store, &env_vars);
         }
         Ok(out_json)
@@ -4005,6 +4003,8 @@ but is expected to have type
             let _ = fs::remove_dir_all(&tmp_dir);
             return;
         }
+        // Worker compilation is fixture setup, before any request deadline starts.
+        crate::zygote::ensure_zygote_binary(&store, &lean_bin, &env_vars).unwrap();
 
         let prefix_src = "namespace OutOfCoreFission\ndef doubleNat (n : Nat) : Nat := n + n\n";
         let step0 = (
@@ -4070,12 +4070,14 @@ but is expected to have type
         let toolchain = "leanprover/lean4:v4.35.0";
         fs::write(proj_dir.join("lean-toolchain"), format!("{}\n", toolchain)).unwrap();
         let mut store = TurboStore::open(Some(&store_dir)).unwrap();
-        let (_env_vars, lean_bin) =
+        let (env_vars, lean_bin) =
             crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
         if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
             let _ = fs::remove_dir_all(&tmp_dir);
             return;
         }
+        // Worker compilation is fixture setup, before any request deadline starts.
+        crate::zygote::ensure_zygote_binary(&store, &lean_bin, &env_vars).unwrap();
 
         let lean_file = proj_dir.join("FissionLoopTest.lean");
         let canon_proj = proj_dir.canonicalize().unwrap_or_else(|_| proj_dir.clone());
@@ -4175,6 +4177,8 @@ but is expected to have type
             let _ = fs::remove_dir_all(&tmp_dir);
             return;
         }
+        // Worker compilation is fixture setup, before any request deadline starts.
+        crate::zygote::ensure_zygote_binary(&store, &lean_bin, &env_vars).unwrap();
 
         let prefix_src = "def incNat (n : Nat) : Nat := n + 1\n";
         let thm_decl = "theorem batch_cut_thm (a b : Nat) : incNat a + incNat b = a + b + 2 := by\n  have h1 : incNat a = a + 1 := by\n    rfl\n  have h2 : incNat b = b + 1 := by\n    rfl\n  omega\n";
@@ -4232,6 +4236,8 @@ but is expected to have type
             let _ = fs::remove_dir_all(&tmp_dir);
             return;
         }
+        // Worker compilation is fixture setup, before any request deadline starts.
+        crate::zygote::ensure_zygote_binary(&store, &lean_bin, &env_vars).unwrap();
 
         let candidates: Vec<String> = [
             "theorem race_thm (a b : Nat) : a + b = b + a := rfl\n",
