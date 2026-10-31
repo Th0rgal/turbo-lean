@@ -1,0 +1,310 @@
+{
+  "wall_seconds": 1257.3386840709718,
+  "tree_cpu_seconds": 1343.745288000002,
+  "exit_code": 0,
+  "max_active_builds": 1,
+  "module_elapsed_seconds": 1256.2501829545945,
+  "module_cpu_seconds": 1332.551864,
+  "modules": [
+    {
+      "source": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/clifv/FV/Backend/Proof/IselCtlRuleIds.lean",
+      "module": "FV.Backend.Proof.IselCtlRuleIds",
+      "seconds": 22.690669947071,
+      "cpu_seconds": 22.784059,
+      "exit_code": 0,
+      "pid": 2332116,
+      "start_unix": 1793483240.234535,
+      "slot": 0
+    },
+    {
+      "source": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/clifv/FV/Backend/Proof/LowerLoopCtx.lean",
+      "module": "FV.Backend.Proof.LowerLoopCtx",
+      "seconds": 1.915446954080835,
+      "cpu_seconds": 3.565879,
+      "exit_code": 0,
+      "pid": 2332118,
+      "start_unix": 1793483262.9389954,
+      "slot": 0
+    },
+    {
+      "source": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/clifv/FV/Backend/Proof/KillTermIds.lean",
+      "module": "FV.Backend.Proof.KillTermIds",
+      "seconds": 207.2775623589987,
+      "cpu_seconds": 207.178587,
+      "exit_code": 0,
+      "pid": 2332123,
+      "start_unix": 1793483264.8583367,
+      "slot": 0
+    },
+    {
+      "source": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/clifv/FV/Backend/Proof/IselTermFactsRules.lean",
+      "module": "FV.Backend.Proof.IselTermFactsRules",
+      "seconds": 125.40482141589746,
+      "cpu_seconds": 155.054682,
+      "exit_code": 0,
+      "pid": 2332367,
+      "start_unix": 1793483472.1834095,
+      "slot": 0
+    },
+    {
+      "source": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/clifv/FV/Backend/Proof/LowerCertBase.lean",
+      "module": "FV.Backend.Proof.LowerCertBase",
+      "seconds": 1.0069012140156701,
+      "cpu_seconds": 1.5487119999999999,
+      "exit_code": 0,
+      "pid": 2335361,
+      "start_unix": 1793483597.6149046,
+      "slot": 0
+    },
+    {
+      "source": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/clifv/FV/Backend/Proof/IselTermFactsCall.lean",
+      "module": "FV.Backend.Proof.IselTermFactsCall",
+      "seconds": 17.967114718980156,
+      "cpu_seconds": 32.66853699999999,
+      "exit_code": 0,
+      "pid": 2332341,
+      "start_unix": 1793483598.6292188,
+      "slot": 0
+    },
+    {
+      "source": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/clifv/FV/Backend/Proof/LowerLoopRun.lean",
+      "module": "FV.Backend.Proof.LowerLoopRun",
+      "seconds": 59.284829449956305,
+      "cpu_seconds": 61.338437,
+      "exit_code": 0,
+      "pid": 2335379,
+      "start_unix": 1793483616.6041176,
+      "slot": 0
+    },
+    {
+      "source": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/clifv/FV/Backend/Proof/IselTermFacts.lean",
+      "module": "FV.Backend.Proof.IselTermFacts",
+      "seconds": 0.6753676439402625,
+      "cpu_seconds": 0.764021,
+      "exit_code": 0,
+      "pid": 2335520,
+      "start_unix": 1793483675.921522,
+      "slot": 0
+    },
+    {
+      "source": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/clifv/FV/Backend/Proof/LowerLoopSim.lean",
+      "module": "FV.Backend.Proof.LowerLoopSim",
+      "seconds": 1.267540890024975,
+      "cpu_seconds": 2.095885,
+      "exit_code": 0,
+      "pid": 2335934,
+      "start_unix": 1793483676.628993,
+      "slot": 0
+    },
+    {
+      "source": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/clifv/FV/Backend/Proof/LowerLoopPrep.lean",
+      "module": "FV.Backend.Proof.LowerLoopPrep",
+      "seconds": 1.0102595860371366,
+      "cpu_seconds": 1.5885799999999999,
+      "exit_code": 0,
+      "pid": 2335982,
+      "start_unix": 1793483677.9341643,
+      "slot": 0
+    },
+    {
+      "source": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/clifv/FV/Backend/Proof/IselCovClean.lean",
+      "module": "FV.Backend.Proof.IselCovClean",
+      "seconds": 0.697079925914295,
+      "cpu_seconds": 0.723349,
+      "exit_code": 0,
+      "pid": 2334415,
+      "start_unix": 1793483678.9520695,
+      "slot": 0
+    },
+    {
+      "source": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/clifv/FV/Backend/Proof/SpillLocalForms.lean",
+      "module": "FV.Backend.Proof.SpillLocalForms",
+      "seconds": 11.065093245008029,
+      "cpu_seconds": 16.25221,
+      "exit_code": 0,
+      "pid": 2332125,
+      "start_unix": 1793483679.6589816,
+      "slot": 0
+    },
+    {
+      "source": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/clifv/FV/Backend/Proof/LowerLoop.lean",
+      "module": "FV.Backend.Proof.LowerLoop",
+      "seconds": 0.7039965179283172,
+      "cpu_seconds": 0.7272289999999999,
+      "exit_code": 0,
+      "pid": 2335997,
+      "start_unix": 1793483690.7417033,
+      "slot": 0
+    },
+    {
+      "source": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/clifv/FV/Backend/Proof/SpillCtlForms.lean",
+      "module": "FV.Backend.Proof.SpillCtlForms",
+      "seconds": 1.2662828549509868,
+      "cpu_seconds": 1.987269,
+      "exit_code": 0,
+      "pid": 2336084,
+      "start_unix": 1793483691.464271,
+      "slot": 0
+    },
+    {
+      "source": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/clifv/FV/Backend/Proof/LowerShapeOk.lean",
+      "module": "FV.Backend.Proof.LowerShapeOk",
+      "seconds": 1.2842519159894437,
+      "cpu_seconds": 1.411756,
+      "exit_code": 0,
+      "pid": 2336114,
+      "start_unix": 1793483692.7797842,
+      "slot": 0
+    },
+    {
+      "source": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/clifv/FV/Backend/Proof/LowerCert.lean",
+      "module": "FV.Backend.Proof.LowerCert",
+      "seconds": 1.2720597219886258,
+      "cpu_seconds": 1.8736709999999999,
+      "exit_code": 0,
+      "pid": 2336116,
+      "start_unix": 1793483694.0881832,
+      "slot": 0
+    },
+    {
+      "source": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/clifv/FV/Backend/Proof/LowerComplete.lean",
+      "module": "FV.Backend.Proof.LowerComplete",
+      "seconds": 1.1517543450463563,
+      "cpu_seconds": 2.0575859999999997,
+      "exit_code": 0,
+      "pid": 2336153,
+      "start_unix": 1793483695.396698,
+      "slot": 0
+    },
+    {
+      "source": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/clifv/FV/Backend/Proof/LowerCover.lean",
+      "module": "FV.Backend.Proof.LowerCover",
+      "seconds": 0.8576648730086163,
+      "cpu_seconds": 1.0989959999999999,
+      "exit_code": 0,
+      "pid": 2336184,
+      "start_unix": 1793483696.57692,
+      "slot": 0
+    },
+    {
+      "source": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/clifv/FV/Backend/Proof/SpillCtlPipe.lean",
+      "module": "FV.Backend.Proof.SpillCtlPipe",
+      "seconds": 1.0514363280963153,
+      "cpu_seconds": 1.547822,
+      "exit_code": 0,
+      "pid": 2336199,
+      "start_unix": 1793483697.4693363,
+      "slot": 0
+    },
+    {
+      "source": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/clifv/FV/Backend/Proof/KillBase.lean",
+      "module": "FV.Backend.Proof.KillBase",
+      "seconds": 0.7380531689850613,
+      "cpu_seconds": 0.778467,
+      "exit_code": 0,
+      "pid": 2336209,
+      "start_unix": 1793483698.5579932,
+      "slot": 0
+    },
+    {
+      "source": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/clifv/FV/Backend/Proof/DefGenDom.lean",
+      "module": "FV.Backend.Proof.DefGenDom",
+      "seconds": 1.4059653870062903,
+      "cpu_seconds": 1.798493,
+      "exit_code": 0,
+      "pid": 2336219,
+      "start_unix": 1793483699.322379,
+      "slot": 0
+    },
+    {
+      "source": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/clifv/FV/Backend/Proof/KillOfV.lean",
+      "module": "FV.Backend.Proof.KillOfV",
+      "seconds": 5.101977926911786,
+      "cpu_seconds": 11.364248,
+      "exit_code": 0,
+      "pid": 2336223,
+      "start_unix": 1793483700.7352958,
+      "slot": 0
+    },
+    {
+      "source": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/clifv/FV/Backend/Proof/KillCtor.lean",
+      "module": "FV.Backend.Proof.KillCtor",
+      "seconds": 6.80867868498899,
+      "cpu_seconds": 8.573586,
+      "exit_code": 0,
+      "pid": 2336281,
+      "start_unix": 1793483705.8739514,
+      "slot": 0
+    },
+    {
+      "source": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/clifv/FV/Backend/Proof/DefRuns.lean",
+      "module": "FV.Backend.Proof.DefRuns",
+      "seconds": 0.6944938839878887,
+      "cpu_seconds": 0.704336,
+      "exit_code": 0,
+      "pid": 2336221,
+      "start_unix": 1793483712.685348,
+      "slot": 0
+    },
+    {
+      "source": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/clifv/FV/Backend/Proof/DefGenOfV.lean",
+      "module": "FV.Backend.Proof.DefGenOfV",
+      "seconds": 10.769912999938242,
+      "cpu_seconds": 17.254168,
+      "exit_code": 0,
+      "pid": 2336385,
+      "start_unix": 1793483713.4181638,
+      "slot": 0
+    },
+    {
+      "source": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/clifv/FV/Backend/Proof/DefGenSem.lean",
+      "module": "FV.Backend.Proof.DefGenSem",
+      "seconds": 2.2055703699588776,
+      "cpu_seconds": 4.177434,
+      "exit_code": 0,
+      "pid": 2336464,
+      "start_unix": 1793483724.2188537,
+      "slot": 0
+    },
+    {
+      "source": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/clifv/FV/Backend/Proof/DefGenPat.lean",
+      "module": "FV.Backend.Proof.DefGenPat",
+      "seconds": 1.2814577430253848,
+      "cpu_seconds": 2.411532,
+      "exit_code": 0,
+      "pid": 2336483,
+      "start_unix": 1793483726.4708376,
+      "slot": 0
+    },
+    {
+      "source": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/clifv/FV/Backend/Proof/DefGenSound.lean",
+      "module": "FV.Backend.Proof.DefGenSound",
+      "seconds": 0.9923552519176155,
+      "cpu_seconds": 1.2122579999999998,
+      "exit_code": 0,
+      "pid": 2336521,
+      "start_unix": 1793483727.7921062,
+      "slot": 0
+    },
+    {
+      "source": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/clifv/FV/Backend/Proof/DefGenTab.lean",
+      "module": "FV.Backend.Proof.DefGenTab",
+      "seconds": 768.4015836309409,
+      "cpu_seconds": 768.010075,
+      "exit_code": 0,
+      "pid": 2336533,
+      "start_unix": 1793483728.8122694,
+      "slot": 0
+    }
+  ],
+  "command": [
+    "scripts/memcap.sh",
+    "lake",
+    "-j4",
+    "build",
+    "FV.Backend.Proof.DefGenTab",
+    "FV.Backend.Proof.IselSzTab",
+    "FV.Backend.Proof.IselCtlTry",
+    "FV.Opt.Proof.RuleArith"
+  ]
+}
