@@ -305,6 +305,7 @@ structure SymExecState where
   extSeenRoots  : List VarId := []
   extLivenessRoots : List VarId := []
   extRcDeltas   : List (VarId × SymExpr) := []
+  extRcDeltaBounds : List (VarId × Nat) := []
   refCounts     : List (VarId × Nat) := []
   rcExprs       : List (VarId × SymExpr) := []
   memWrites     : List (VarId × SymExpr × SymExpr) := []
@@ -353,14 +354,28 @@ def markExclusive (st : SymExecState) (bufVar : VarId) : SymExecState :=
 def lookupExtRcDeltaExpr (st : SymExecState) (root : VarId) : SymExpr :=
   (st.extRcDeltas.lookup root).getD (.constU64 0)
 
+def lookupExtRcDeltaBound (st : SymExecState) (root : VarId) : Nat :=
+  (st.extRcDeltaBounds.lookup root).getD 0
+
+def markUnsupported (st : SymExecState) : SymExecState :=
+  { st with symUnsupported := true, noUB := false, nonPoison := false }
+
 def addExtRcDelta (st : SymExecState) (bufVar : VarId) (count : Nat) (inc : Bool) : SymExecState :=
   let root := st.resolveBuf bufVar
   if st.allocRoots.contains root || count == 0 then st
   else
-    let prev := st.lookupExtRcDeltaExpr root
-    let next := normSymExpr (normSymBinOpStep (if inc then .add else .sub) prev (.constU64 count.toUInt64))
-    let rest := st.extRcDeltas.filter (fun (id, _) => id != root)
-    { st with extRcDeltas := if next == .constU64 0 then rest else (root, next) :: rest }
+    let prevBound := st.lookupExtRcDeltaBound root
+    let nextBound := prevBound + count
+    if nextBound > 0x7FFFFFFFFFFFFFFF then
+      st.markUnsupported
+    else
+      let prev := st.lookupExtRcDeltaExpr root
+      let next := normSymExpr (normSymBinOpStep (if inc then .add else .sub) prev (.constU64 count.toUInt64))
+      let rest := st.extRcDeltas.filter (fun (id, _) => id != root)
+      let restBounds := st.extRcDeltaBounds.filter (fun (id, _) => id != root)
+      { st with
+        extRcDeltas := if next == .constU64 0 then rest else (root, next) :: rest
+        extRcDeltaBounds := (root, nextBound) :: restBounds }
 
 def noteExtRoot (st : SymExecState) (bufVar : VarId) : SymExecState :=
   let root := st.resolveBuf bufVar
@@ -468,9 +483,6 @@ def isHeapObjectRoot (st : SymExecState) (bufVar : VarId) : Bool :=
   let root := st.resolveBuf bufVar
   st.isDefinitelyHeapRoot root || st.extSeenRoots.contains root
 
-def markUnsupported (st : SymExecState) : SymExecState :=
-  { st with symUnsupported := true, noUB := false, nonPoison := false }
-
 def clearAlias (st : SymExecState) (v : VarId) : SymExecState :=
   { st with bufAliases := st.bufAliases.filter (fun (id, _) => id != v) }
 
@@ -530,9 +542,9 @@ def updateRefCountFuel : Nat → SymExecState → Nat → Nat → Bool → SymEx
     if st.isImmediateScalarObj root || st.typedTuples.contains root ||
        st.boolVars.contains root || st.u64Vars.contains root || st.u256Vars.contains root then
       st
-    else if count > 0xFFFFFFFFFFFFFFFF ||
+    else if count > 0x7FFFFFFFFFFFFFFF ||
         (match st.refCounts.lookup root with
-         | some rc => rc > 0xFFFFFFFFFFFFFFFF || (inc && rc + count > 0xFFFFFFFFFFFFFFFF)
+         | some rc => rc > 0x7FFFFFFFFFFFFFFF || (inc && rc + count > 0x7FFFFFFFFFFFFFFF)
          | none => false) then
       st.markUnsupported
     else if count == 0 then
@@ -600,19 +612,16 @@ def updateRefCountFuel : Nat → SymExecState → Nat → Nat → Bool → SymEx
         let baseExpr := st.lookupRcExpr root
         let deltaExpr := .constU64 count.toUInt64
         if inc then
-          -- `baseExpr > 0` AND no 64-bit unsigned wraparound (`baseExpr <= UInt64.max - count`)
+          -- Concrete `HeapState.incRefObj` / `incRefBuf` check only `rc > 0` (storing unbounded `Nat`).
+          -- Never narrow source `ubCond` with a synthetic 64-bit `noWrapC`; instead `addExtRcDelta`
+          -- tracks cumulative external RC delta magnitude and marks `symUnsupported` if it exceeds `2^63 - 1`.
           let liveC := st.liveRcCond root
-          let noWrapC :=
-            if count ≤ 0xFFFFFFFFFFFFFFFF then
-              normSymBinOpStep .le baseExpr (.constU64 (0xFFFFFFFFFFFFFFFF - count.toUInt64))
-            else .constBool false
-          let stepSafeCond := conjoinUbCond liveC noWrapC
           let nextExpr := normSymBinOpStep .add baseExpr deltaExpr
           -- Snapshot `baseExpr` before bumping `heapStepEpoch` so balanced `incRef`/`decRef` on the
           -- SAME `root` still cancels in `rcExprs`, while other external roots advance to the new epoch!
-          let st1 := (((st.requireUbCond stepSafeCond).noteExtLiveRoot root).bumpExternalHeapEpoch root false).addExtRcDelta root count true
+          let st1 := (((st.requireUbCond liveC).noteExtLiveRoot root).bumpExternalHeapEpoch root false).addExtRcDelta root count true
           { st1 with
-            noUB := st1.noUB && stepSafeCond == .constBool true
+            noUB := st1.noUB && liveC == .constBool true
             rcExprs := (root, nextExpr) :: st1.rcExprs.filter (fun (id, _) => id != root)
             exclusiveBufs := st1.exclusiveBufs.filter (· != root) }
         else
@@ -1978,6 +1987,13 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
               allDeltaRoots.filterMap fun r =>
                 let m := normSymExpr (normSymIteStep cExpr (stT.lookupExtRcDeltaExpr r) (stE.lookupExtRcDeltaExpr r))
                 if m == .constU64 0 then none else some (r, m)
+          let mergedExtDeltaBounds : List (VarId × Nat) :=
+            if !stT.reachable then stE.extRcDeltaBounds
+            else if !stE.reachable then stT.extRcDeltaBounds
+            else
+              let allBoundRoots := ((stT.extRcDeltaBounds.map Prod.fst) ++ (stE.extRcDeltaBounds.map Prod.fst)).eraseDups
+              allBoundRoots.map fun r =>
+                (r, Nat.max (stT.lookupExtRcDeltaBound r) (stE.lookupExtRcDeltaBound r))
           let mergedWrites :=
             if !stT.reachable then stE.memWrites
             else if !stE.reachable then stT.memWrites
@@ -2032,6 +2048,7 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
             extSeenRoots := mergedExtSeen
             extLivenessRoots := mergedExtLive
             extRcDeltas := mergedExtDeltas
+            extRcDeltaBounds := mergedExtDeltaBounds
             refCounts := mergedRefs
             rcExprs := mergedRcExprs
             heapStepEpoch := mergedEpoch

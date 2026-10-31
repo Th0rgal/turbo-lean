@@ -2203,6 +2203,26 @@ open LeanNative.IR LeanNative.Proofs
   let namespaceBad := validateTranslationDecl (mkTupleHeapNamespaceDecl false) (mkTupleHeapNamespaceDecl true) 0
   unless !namespaceBad.symRetEquiv && !namespaceBad.passed do
     throw <| IO.userError s!"tuple leaf collided with heap projection namespace: {reprStr namespaceBad}"
+  let mkUnknownExtRcWrapDecl (incWrap : Bool) (c1 c2 : Nat) : LNIRDecl := {
+    name := "unknown_ext_rc_wrap"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      if incWrap then
+        .letBind 2 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+          (.ite 2
+            (.incRef 0 c1 (.incRef 0 c2 (.letBind 3 .i64 (.scalar (.constU64 0)) (.ret 3))))
+            (.letBind 3 .i64 (.scalar (.constU64 0)) (.ret 3)))
+      else
+        .letBind 3 .i64 (.scalar (.constU64 0)) (.ret 3)
+  }
+  for (c1, c2) in [(18446744073709551615, 1), (4611686018427387904, 4611686018427387904)] do
+    let extWrapBad := validateTranslationDecl (mkUnknownExtRcWrapDecl true c1 c2) (mkUnknownExtRcWrapDecl false 0 0) 8
+    unless !extWrapBad.ubRefines && !extWrapBad.passed do
+      throw <| IO.userError s!"unknown external RC overflow accepted for ({c1}, {c2}): {reprStr extWrapBad}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)
