@@ -3877,16 +3877,38 @@ where
         .collect()
 }
 
-/// Canonical digest of filtered effective Lean compiler flags. Returns `None` when empty
-/// so cache/CAS keys remain byte-identical for projects with no configured options.
-pub fn compute_lean_args_digest(args: &[String]) -> Option<String> {
-    let filtered = filter_allowed_lean_args(args);
-    if filtered.is_empty() {
+/// Validate effective compiler options before any cache lookup or verification.
+/// Output-format flags are not effective options: silently dropping them would alias an
+/// invalid request with the legacy empty-option namespace.
+pub fn validate_effective_lean_args(args: &[String]) -> Result<Vec<String>> {
+    args.iter()
+        .map(|arg| {
+            let arg = arg.as_str();
+            anyhow::ensure!(
+                is_allowed_lean_arg(arg) && !matches!(arg, "--json" | "-q" | "--quiet"),
+                "Unsupported effective Lean compiler flag `{arg}`"
+            );
+            Ok(arg.to_string())
+        })
+        .collect()
+}
+
+/// Validate and digest effective options; only truly empty input has the legacy identity.
+pub fn compute_lean_args_digest(args: &[String]) -> Result<Option<String>> {
+    Ok(effective_lean_args_digest(&validate_effective_lean_args(
+        args,
+    )?))
+}
+
+/// Hash an already validated effective option list without filtering. Infallible key
+/// constructors use this after boundary validation; no nonempty list aliases empty options.
+pub(crate) fn effective_lean_args_digest(args: &[String]) -> Option<String> {
+    if args.is_empty() {
         return None;
     }
     let mut h = blake3::Hasher::new();
     h.update(b"lean-args-v1:");
-    for (idx, a) in filtered.iter().enumerate() {
+    for (idx, a) in args.iter().enumerate() {
         if idx > 0 {
             h.update(b"\n");
         }
@@ -3939,20 +3961,36 @@ pub fn resolve_file_lean_args_in_package(pkg: &PackageConfig, file_path: &Path) 
     package_default_lean_args(pkg)
 }
 
-/// Best-effort static lookup of filtered Lake compiler flags for `project_dir` (and optional `file_path`).
-/// Returns an empty `Vec` if `project_dir` has no Lake config or fails static parsing.
-pub fn try_resolve_lean_args_for_path(project_dir: &Path, file_path: Option<&Path>) -> Vec<String> {
-    if !project_dir.join("lakefile.toml").is_file() && !project_dir.join("lakefile.lean").is_file()
+/// Absence of a Lake config is allowed for standalone files; invalid configs are errors.
+pub(crate) fn optional_package_config(project_dir: &Path) -> Result<Option<PackageConfig>> {
+    if !project_dir.join("lakefile.toml").try_exists()?
+        && !project_dir.join("lakefile.lean").try_exists()?
     {
-        return Vec::new();
+        return Ok(None);
     }
-    let Ok(pkg) = resolve_package_config(project_dir, false) else {
-        return Vec::new();
+    resolve_package_config(project_dir, false)
+        .with_context(|| {
+            format!(
+                "Failed to resolve Lean options in {}",
+                project_dir.display()
+            )
+        })
+        .map(Some)
+}
+
+/// Resolve effective Lake options, propagating configuration errors before cache lookup.
+/// A directory without Lake configuration has genuinely empty options.
+pub fn try_resolve_lean_args_for_path(
+    project_dir: &Path,
+    file_path: Option<&Path>,
+) -> Result<Vec<String>> {
+    let Some(pkg) = optional_package_config(project_dir)? else {
+        return Ok(Vec::new());
     };
-    match file_path {
+    Ok(match file_path {
         Some(fp) => resolve_file_lean_args_in_package(&pkg, fp),
         None => package_default_lean_args(&pkg),
-    }
+    })
 }
 
 /// An explicit empty `globs` selects no modules in Lake, but an empty list here means "use the
@@ -4014,7 +4052,7 @@ fn finalize_package_config(
     }
     let check_allowed_args = |args: &[String], scope: &str| -> Result<()> {
         for a in args {
-            let allowed = is_allowed_lean_arg(a);
+            let allowed = validate_effective_lean_args(std::slice::from_ref(a)).is_ok();
             if !c_abi::verify_static_lake_config(true, !allowed, false, false) {
                 anyhow::bail!(
                     "Unsupported or unsafe Lean compiler flag `{}` in {} of {} ({}): fail-closed static Lake config gate",
@@ -4553,6 +4591,8 @@ pub(crate) struct VerifiedDepManifest {
     pub lean_githash: String,
     pub pkg_config_digest: String,
     #[serde(default)]
+    pub workspace_config_digest: String,
+    #[serde(default)]
     pub allowed_axioms: Vec<String>,
     pub modules: BTreeMap<String, VerifiedDepModuleEntry>,
     /// Workspace configuration the manifest was validated against on load (never serialized).
@@ -4573,8 +4613,8 @@ impl Clone for DepImportMemo {
     }
 }
 
-/// Load `pkg_root`'s verified-sources manifest if it was written for this package, toolchain,
-/// configuration, and axiom policy.
+/// Load `pkg_root`'s verified-sources manifest if it was written for this package, workspace,
+/// toolchain, configuration, and axiom policy.
 fn read_pkg_verified_manifest(
     cfg: &ProjectConfig,
     pkg_root: &Path,
@@ -4587,6 +4627,7 @@ fn read_pkg_verified_manifest(
         && manifest.toolchain == cfg.toolchain
         && manifest.lean_githash == cfg.lean_githash
         && manifest.pkg_config_digest == pkg_config_digest
+        && manifest.workspace_config_digest == cfg.canonical_config_digest
         && manifest.allowed_axioms == crate::splitter::allowed_axioms())
     .then_some(manifest)
 }
@@ -8113,6 +8154,7 @@ pub(crate) fn record_verified_dep_source(
                 && m.toolchain == cfg.toolchain
                 && m.lean_githash == cfg.lean_githash
                 && m.pkg_config_digest == node.pkg_config_digest
+                && m.workspace_config_digest == cfg.canonical_config_digest
                 && m.allowed_axioms == allowed_axioms
         })
         .unwrap_or_else(|| VerifiedDepManifest {
@@ -8120,6 +8162,7 @@ pub(crate) fn record_verified_dep_source(
             toolchain: cfg.toolchain.clone(),
             lean_githash: cfg.lean_githash.clone(),
             pkg_config_digest: node.pkg_config_digest.clone(),
+            workspace_config_digest: cfg.canonical_config_digest.clone(),
             allowed_axioms,
             modules: BTreeMap::new(),
             cfg: None,
@@ -11658,12 +11701,14 @@ lean_exe «demo-exe» where
             filter_allowed_lean_args(["--json", " -q ", "--quiet", "-DautoImplicit=false"]),
             vec!["-DautoImplicit=false".to_string()]
         );
-        assert_eq!(compute_lean_args_digest(&["--json".to_string()]), None);
-        assert_eq!(compute_lean_args_digest(&[]), None);
-        assert_eq!(
-            compute_lean_args_digest(&["--plugin=evil.so".to_string(), "pos.lean".to_string()]),
-            None
-        );
+        assert!(compute_lean_args_digest(&["--json".to_string()]).is_err());
+        assert!(compute_lean_args_digest(&[" -DautoImplicit=false ".to_string()]).is_err());
+        assert_eq!(compute_lean_args_digest(&[]).unwrap(), None);
+        assert!(compute_lean_args_digest(&[
+            "--plugin=evil.so".to_string(),
+            "pos.lean".to_string()
+        ])
+        .is_err());
         let d_hb_4m = compute_lean_args_digest(&["-DmaxHeartbeats=4000000".to_string()]).unwrap();
         let d_hb_200k = compute_lean_args_digest(&["-DmaxHeartbeats=200000".to_string()]).unwrap();
         assert_ne!(d_hb_4m, d_hb_200k);
@@ -11687,7 +11732,21 @@ roots = ["Fast"]
         )
         .unwrap();
         assert!(resolve_package_config(&dir, false).is_err());
-        assert!(try_resolve_lean_args_for_path(&dir, Some(&fast_file)).is_empty());
+        assert!(try_resolve_lean_args_for_path(&dir, Some(&fast_file)).is_err());
+        fs::write(
+            dir.join("lakefile.toml"),
+            "name = \"dropped\"\nmoreLeanArgs = [\"--json\", \"-q\"]\n",
+        )
+        .unwrap();
+        assert!(try_resolve_lean_args_for_path(&dir, None).is_err());
+        fs::write(
+            dir.join("lakefile.toml"),
+            r#"name = "padded"
+moreLeanArgs = [" -DautoImplicit=false "]
+"#,
+        )
+        .unwrap();
+        assert!(try_resolve_lean_args_for_path(&dir, None).is_err());
 
         fs::write(
             dir.join("lakefile.toml"),
@@ -11709,7 +11768,7 @@ roots = ["Fast"]
         )
         .unwrap();
 
-        let fast_args = try_resolve_lean_args_for_path(&dir, Some(&fast_file));
+        let fast_args = try_resolve_lean_args_for_path(&dir, Some(&fast_file)).unwrap();
         assert_eq!(
             fast_args,
             vec![
@@ -11717,7 +11776,7 @@ roots = ["Fast"]
                 "-DautoImplicit=false".to_string()
             ]
         );
-        let heavy_args = try_resolve_lean_args_for_path(&dir, Some(&heavy_file));
+        let heavy_args = try_resolve_lean_args_for_path(&dir, Some(&heavy_file)).unwrap();
         assert_eq!(
             heavy_args,
             vec![
@@ -11734,14 +11793,17 @@ roots = ["Fast"]
         fs::write(&extra_file, "def z : Nat := 3\n").unwrap();
         fs::write(&scratch_file, "def w : Nat := 4\n").unwrap();
         assert_eq!(
-            try_resolve_lean_args_for_path(&dir, Some(&extra_file)),
+            try_resolve_lean_args_for_path(&dir, Some(&extra_file)).unwrap(),
             heavy_args
         );
         assert_eq!(
-            try_resolve_lean_args_for_path(&dir, Some(&scratch_file)),
-            try_resolve_lean_args_for_path(&dir, None)
+            try_resolve_lean_args_for_path(&dir, Some(&scratch_file)).unwrap(),
+            try_resolve_lean_args_for_path(&dir, None).unwrap()
         );
-        assert_eq!(try_resolve_lean_args_for_path(&dir, None), fast_args);
+        assert_eq!(
+            try_resolve_lean_args_for_path(&dir, None).unwrap(),
+            fast_args
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 }

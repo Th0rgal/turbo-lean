@@ -2671,6 +2671,17 @@ pub fn eval_with_zygote_pool_opts_with_args(
     )
 }
 
+/// The cache and executor must agree on the final import search order and artifacts.
+pub(crate) struct ResolvedZygoteContext {
+    lean_path: String,
+    imports_csv: String,
+    olean_digest: String,
+    search_path_digest: String,
+    host_closure_digest: String,
+    toolchain_policy: String,
+    pub(crate) identity: String,
+}
+
 fn encode_lean_args_hex(lean_args: &[String]) -> String {
     let filtered = crate::module_builder::filter_allowed_lean_args(lean_args);
     if filtered.is_empty() {
@@ -2698,32 +2709,13 @@ fn attach_host_closure_digest(req_line: &str, host_closure_digest: &str) -> Stri
 }
 
 #[allow(clippy::too_many_arguments)]
-fn eval_with_zygote_pool_inner(
-    store: &TurboStore,
+pub(crate) fn resolve_zygote_context(
     toolchain: &str,
     req_lean_path: &str,
     env_vars: &std::collections::HashMap<String, String>,
     lean_bin: &Path,
-    shard_source: &str,
-    allow_stub: bool,
-    eval_mode: bool,
-    file_name: Option<&str>,
-    timeout_ms: Option<u64>,
-    batch_fission_override: Option<(String, String, String)>,
-    lean_args: &[String],
-) -> Result<ZygoteEvalReply> {
-    let request_started = std::time::Instant::now();
-    let default_timeout_ms = if eval_mode { 900_000 } else { 30_000 };
-    let effective_timeout_ms = timeout_ms.unwrap_or_else(|| {
-        std::env::var("TURBO_LEAN_TIMEOUT_MS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|&ms| ms > 0)
-            .unwrap_or(default_timeout_ms)
-    });
-    let deadline = request_started + std::time::Duration::from_millis(effective_timeout_ms);
-    let _lifecycle = lifecycle_lock(false)?;
-
+    raw_imports_csv: &str,
+) -> ResolvedZygoteContext {
     let env_lp = env_vars.get("LEAN_PATH").cloned().unwrap_or_default();
     let lp_cache_key = (
         req_lean_path.to_string(),
@@ -2807,12 +2799,7 @@ fn eval_with_zygote_pool_inner(
         eff
     };
 
-    let (raw_imports_csv, body_code) = if let Some((ref imp, _, _)) = batch_fission_override {
-        (imp.clone(), String::new())
-    } else {
-        split_shard_for_zygote(shard_source)
-    };
-    let imports_csv = coalesce_proofkit_imports(&raw_imports_csv, &effective_lean_path);
+    let imports_csv = coalesce_proofkit_imports(raw_imports_csv, &effective_lean_path);
     let search_path_digest = compute_search_path_oleans_digest(&effective_lean_path);
     let (imported_digest, closure_complete) =
         compute_imported_oleans_digest_inner(&imports_csv, &effective_lean_path);
@@ -2831,15 +2818,89 @@ fn eval_with_zygote_pool_inner(
             .cloned()
             .unwrap_or_else(|| crate::splitter::allowed_axioms().join(","))
     );
+    let olean_digest = format!("{}:{}", search_path_digest, imported_digest);
+    let compiler_path = fs::canonicalize(lean_bin).unwrap_or_else(|_| lean_bin.to_path_buf());
+    let compiler_digest = fs::read(&compiler_path)
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+        .unwrap_or_default();
+    let compiler_identity = blake3::hash(
+        &serde_json::to_vec(&(&toolchain_policy, &compiler_path, compiler_digest))
+            .expect("compiler identity serializes"),
+    )
+    .to_hex()
+    .to_string();
+    let identity = blake3::hash(
+        &serde_json::to_vec(&(&compiler_identity, &effective_lean_path, &imports_csv, &olean_digest))
+            .expect("execution identity serializes"),
+    )
+    .to_hex()
+    .to_string();
+    let toolchain_policy = format!("{}#{}", toolchain_policy, compiler_identity);
+    ResolvedZygoteContext {
+        lean_path: effective_lean_path,
+        imports_csv,
+        olean_digest,
+        search_path_digest: pool_digest_tag,
+        host_closure_digest: host_closure_digest.to_string(),
+        toolchain_policy,
+        identity,
+    }
+}
+
+
+#[allow(clippy::too_many_arguments)]
+fn eval_with_zygote_pool_inner(
+    store: &TurboStore,
+    toolchain: &str,
+    req_lean_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    lean_bin: &Path,
+    shard_source: &str,
+    allow_stub: bool,
+    eval_mode: bool,
+    file_name: Option<&str>,
+    timeout_ms: Option<u64>,
+    batch_fission_override: Option<(String, String, String)>,
+    lean_args: &[String],
+) -> Result<ZygoteEvalReply> {
+    let request_started = std::time::Instant::now();
+    let default_timeout_ms = if eval_mode { 900_000 } else { 30_000 };
+    let effective_timeout_ms = timeout_ms.unwrap_or_else(|| {
+        std::env::var("TURBO_LEAN_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .unwrap_or(default_timeout_ms)
+    });
+    let deadline = request_started + std::time::Duration::from_millis(effective_timeout_ms);
+    let _lifecycle = lifecycle_lock(false)?;
+
+    // Validate the original arguments before encoding can discard unsupported flags.
+    let args_digest_opt = crate::module_builder::compute_lean_args_digest(lean_args)?;
+    let hex_opts = encode_lean_args_hex(lean_args);
+    let (raw_imports_csv, body_code) = if let Some((ref imp, _, _)) = batch_fission_override {
+        (imp.clone(), String::new())
+    } else {
+        split_shard_for_zygote(shard_source)
+    };
+    let context = resolve_zygote_context(
+        toolchain,
+        req_lean_path,
+        env_vars,
+        lean_bin,
+        &raw_imports_csv,
+    );
+    let effective_lean_path = context.lean_path;
+    let imports_csv = context.imports_csv;
+    let pool_digest_tag = context.search_path_digest;
+    let toolchain_policy = context.toolchain_policy;
+    let olean_digest = context.olean_digest;
+    let host_closure_digest = context.host_closure_digest.as_str();
     let pool_key = (
         toolchain_policy.clone(),
         effective_lean_path.clone(),
         format!("{}#{}", pool_digest_tag, imports_csv),
     );
-    let olean_digest = format!("{}:{}", search_path_digest, imported_digest);
-
-    let hex_opts = encode_lean_args_hex(lean_args);
-    let args_digest_opt = crate::module_builder::compute_lean_args_digest(lean_args);
     let verified_cache_policy = match &args_digest_opt {
         Some(ad) => format!("{}#opts:{}", toolchain_policy, ad),
         None => toolchain_policy.clone(),
@@ -4424,34 +4485,23 @@ pub(crate) fn coalesce_proofkit_imports(imports_csv: &str, lean_path: &str) -> S
 }
 
 fn compute_eval_shm_cache_filename(
-    toolchain: &str,
-    lean_path: &str,
+    context: &ResolvedZygoteContext,
     file_name: &str,
     caller_cwd: Option<&str>,
     source: &str,
     lean_args: &[String],
-) -> String {
-    let (imports_csv, _) = split_shard_for_zygote(source);
-    let imp_dig = compute_imported_oleans_digest(&imports_csv, lean_path);
-    let mut h = blake3::Hasher::new();
-    h.update(b"eval-shm:v3:");
-    h.update(toolchain.as_bytes());
-    h.update(b":");
-    h.update(lean_path.as_bytes());
-    h.update(b":");
-    h.update(imp_dig.as_bytes());
-    h.update(b":");
-    h.update(file_name.as_bytes());
-    h.update(b":");
-    h.update(caller_cwd.unwrap_or("").as_bytes());
-    h.update(b":");
-    h.update(source.as_bytes());
-    if let Some(ad) = crate::module_builder::compute_lean_args_digest(lean_args) {
-        h.update(b":opts:");
-        h.update(ad.as_bytes());
-    }
-    let key_hex = h.finalize().to_hex();
-    format!("ev_{}.json", &key_hex[..24])
+) -> Result<String> {
+    let args_digest = crate::module_builder::compute_lean_args_digest(lean_args)?;
+    let bytes = serde_json::to_vec(&(
+        "eval-shm:v4",
+        &context.identity,
+        file_name,
+        caller_cwd,
+        source,
+        args_digest,
+    ))?;
+    let key_hex = blake3::hash(&bytes).to_hex().to_string();
+    Ok(format!("ev_{}.json", &key_hex[..24]))
 }
 
 /// Only successful, import-clean replies may be cached: failures (missing toolchain, import
@@ -4528,21 +4578,25 @@ pub fn try_stateless_eval_shm_cache(
         None => return None,
     };
     let toolchain = crate::lake_build::detect_toolchain(&proj_dir);
-    let resolved_lean_args = crate::module_builder::filter_allowed_lean_args(
-        crate::module_builder::try_resolve_lean_args_for_path(&proj_dir, Some(file)),
-    );
+    let resolved_lean_args =
+        crate::module_builder::try_resolve_lean_args_for_path(&proj_dir, Some(file)).ok()?;
     let caller_cwd = std::env::current_dir()
         .ok()
         .map(|p| p.to_string_lossy().to_string());
     let file_display = file.to_string_lossy();
+    let (lean_bin, _, _, _) =
+        crate::module_builder::resolve_toolchain_compiler(&proj_dir, &toolchain).ok()?;
+    let env_vars = std::env::vars().collect();
+    let (imports_csv, _) = split_shard_for_zygote(&source);
+    let context = resolve_zygote_context(&toolchain, &req_lp, &env_vars, &lean_bin, &imports_csv);
     let filename = compute_eval_shm_cache_filename(
-        &toolchain,
-        &req_lp,
+        &context,
         &file_display,
         caller_cwd.as_deref(),
         &source,
         &resolved_lean_args,
-    );
+    )
+    .ok()?;
     let base_staging =
         if Path::new("/dev/shm").is_dir() || std::env::var("TURBO_LEAN_STAGING_DIR").is_ok() {
             crate::shm_cache::staging_shm_dir()
@@ -4590,25 +4644,29 @@ pub fn try_local_zygote_eval_with_args(
     timeout_ms: u64,
     lean_args: &[String],
 ) -> Option<ZygoteEvalReply> {
-    let filtered_args = crate::module_builder::filter_allowed_lean_args(lean_args);
+    let filtered_args = crate::module_builder::validate_effective_lean_args(lean_args).ok()?;
+    let (imports_csv, _) = split_shard_for_zygote(source);
+    let context = resolve_zygote_context(toolchain, lean_path, env_vars, lean_bin, &imports_csv);
     let timeout_ms = if timeout_ms > 0 {
         timeout_ms
     } else {
         invocation_timeout_ms().unwrap_or(0)
     };
     let t0 = std::time::Instant::now();
-    let caller_cwd = std::env::current_dir()
-        .ok()
-        .map(|p| p.to_string_lossy().to_string());
+    let caller_cwd = env_vars.get("TURBO_LEAN_CALLER_CWD").cloned().or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string())
+    });
     let eval_shm_file = if is_pure_eval_source(source) {
         let filename = compute_eval_shm_cache_filename(
-            toolchain,
-            lean_path,
+            &context,
             file_name.unwrap_or(""),
             caller_cwd.as_deref(),
             source,
             &filtered_args,
-        );
+        )
+        .ok()?;
         let dir = store.fast_staging_dir().join("eval_shm_cache");
         let _ = fs::create_dir_all(&dir);
         let path = dir.join(filename);
@@ -4683,7 +4741,8 @@ pub fn try_local_zygote_eval_with_args(
     };
     let body = serde_json::to_vec(&serde_json::json!({
         "toolchain": toolchain,
-        "lean_path": lean_path,
+        "lean_path": context.lean_path,
+        "execution_identity": context.identity,
         "source": source,
         "file_name": file_name,
         "cwd": caller_cwd,
@@ -5139,6 +5198,148 @@ mod tests {
             .is_file()
             .then(|| crate::module_builder::resolve_project_config(&dir).ok())
             .flatten()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_eval_cache_tracks_environment_lean_path() -> Result<()> {
+        use crate::worktree_test_support::LakeTree;
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tree = LakeTree::new("eval_env_path", &[("P/A.lean", "def value : Nat := 0\n")])?;
+        let cfg = crate::module_builder::resolve_project_config(&tree.project)?;
+        for (name, value) in [("A", 17), ("B", 29)] {
+            let dir = tree.root.join(name);
+            fs::create_dir_all(&dir)?;
+            fs::write(
+                dir.join("Dep.lean"),
+                format!("def Dep.value : Nat := {value}\n"),
+            )?;
+            let out = Command::new(&cfg.lean_bin)
+                .current_dir(&dir)
+                .args(["-o", "Dep.olean", "Dep.lean"])
+                .output()?;
+            anyhow::ensure!(
+                out.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let store = TurboStore::open(Some(&tree.root.join("cache")))?;
+        let previous = std::env::var_os("TURBO_LEAN_NO_DAEMON");
+        std::env::set_var("TURBO_LEAN_NO_DAEMON", "1");
+        let result = (|| -> Result<()> {
+            let source = "import Dep\n#eval Dep.value\n";
+            let file = tree.project.join("Eval.lean").to_string_lossy().to_string();
+            for (name, expected) in [("A", "17"), ("A", "17"), ("B", "29"), ("B", "29")] {
+                let env = std::collections::HashMap::from([(
+                    "LEAN_PATH".into(),
+                    tree.root.join(name).to_string_lossy().to_string(),
+                )]);
+                let reply = try_local_zygote_eval_with_args(
+                    &store,
+                    &env,
+                    &cfg.lean_bin,
+                    &cfg.toolchain,
+                    "",
+                    source,
+                    Some(&file),
+                    60_000,
+                    &[],
+                )
+                .context("local eval must produce a reply")?;
+                assert!(reply.ok && reply.import_ok, "{reply:?}");
+                assert_eq!(reply.messages.concat().trim(), expected, "LEAN_PATH={name}: {reply:?}");
+            }
+            // Replacing an artifact at the same resolved path must also invalidate the reply.
+            fs::copy(tree.root.join("A/Dep.olean"), tree.root.join("B/Dep.olean"))?;
+            let env = std::collections::HashMap::from([(
+                "LEAN_PATH".into(),
+                tree.root.join("B").to_string_lossy().to_string(),
+            )]);
+            let reply = try_local_zygote_eval_with_args(
+                &store,
+                &env,
+                &cfg.lean_bin,
+                &cfg.toolchain,
+                "",
+                source,
+                Some(&file),
+                60_000,
+                &[],
+            )
+            .context("replaced import eval")?;
+            assert!(reply.ok && reply.import_ok, "{reply:?}");
+            assert_eq!(reply.messages.concat().trim(), "17", "{reply:?}");
+            Ok(())
+        })();
+        if let Some(value) = previous {
+            std::env::set_var("TURBO_LEAN_NO_DAEMON", value);
+        } else {
+            std::env::remove_var("TURBO_LEAN_NO_DAEMON");
+        }
+        result
+    }
+
+    #[test]
+    fn local_eval_rejects_invalid_args_before_empty_option_cache_hit() -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("turbo_eval_options_{}", crate::pack::next_tmp_id()));
+        let store = TurboStore::open(Some(&dir))?;
+        let source = "#eval 17305\n";
+        let file_name = dir.join("Cached.lean").to_string_lossy().to_string();
+        let cwd = std::env::current_dir()?.to_string_lossy().to_string();
+        let (imports_csv, _) = split_shard_for_zygote(source);
+        let context = resolve_zygote_context(
+            "test",
+            "",
+            &std::collections::HashMap::new(),
+            Path::new("/no-lean-needed"),
+            &imports_csv,
+        );
+        let filename =
+            compute_eval_shm_cache_filename(&context, &file_name, Some(&cwd), source, &[])?;
+        let cache_dir = store.fast_staging_dir().join("eval_shm_cache");
+        fs::create_dir_all(&cache_dir)?;
+        let path = cache_dir.join(filename);
+        let reply = ZygoteEvalReply {
+            ok: true,
+            stdout: "empty-option-cached-reply".into(),
+            ..Default::default()
+        };
+        let bytes = serde_json::to_vec(&reply)?;
+        fs::write(&path, &bytes)?;
+        let eval = |args: &[String]| {
+            try_local_zygote_eval_with_args(
+                &store,
+                &std::collections::HashMap::new(),
+                Path::new("/no-lean-needed"),
+                "test",
+                "",
+                source,
+                Some(&file_name),
+                1000,
+                args,
+            )
+        };
+        let cached = eval(&[]).expect("fixture must hit the empty-option cache");
+        assert!(cached.ok && cached.env_cache_hit && cached.prefix_cache_hit);
+        assert_eq!(cached.stdout, reply.stdout);
+        for invalid in ["--plugin=bad.so", "--json", "-q", " -DautoImplicit=false "] {
+            assert!(
+                eval(&[invalid.to_string()]).is_none(),
+                "invalid argument must not reuse cached reply: {invalid}"
+            );
+        }
+        assert_eq!(fs::read(&path)?, bytes);
+        fs::remove_file(path)?;
+        fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[test]
