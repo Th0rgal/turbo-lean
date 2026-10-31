@@ -86,6 +86,16 @@ fn heavy_check_decl_corpus_stock_lean_verdict_parity() {
                 corpus::diagnostic(&turbo)
             );
             if !valid {
+                let stock_errors = corpus::diagnostic(lean).to_lowercase();
+                assert_eq!(
+                    lean.status.code(),
+                    Some(1),
+                    "stock mutant must be rejected normally: {stock_errors}"
+                );
+                assert!(
+                    stock_errors.contains("type mismatch"),
+                    "stock mutant failed without a proof-type diagnostic: {stock_errors}"
+                );
                 let errors = corpus::diagnostic(&turbo).to_lowercase();
                 assert_eq!(
                     turbo.status.code(),

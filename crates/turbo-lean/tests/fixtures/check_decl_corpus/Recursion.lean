@@ -11,24 +11,24 @@ mutual
     | 0 => false
     | n + 1 => even n
 end
-@[simp] theorem even_zero : even 0 = true 
+@[simp] theorem even_zero : even 0 = true
 -- CORPUS-PROOF Corpus.Recursion.even_zero
 := rfl
 -- CORPUS-END
 
-@[simp] theorem odd_zero : odd 0 = false 
+@[simp] theorem odd_zero : odd 0 = false
 -- CORPUS-PROOF Corpus.Recursion.odd_zero
 := rfl
 -- CORPUS-END
 
-theorem even_step (n : Nat) : even (n + 1) = odd n 
+theorem even_step (n : Nat) : even (n + 1) = odd n
 -- CORPUS-PROOF Corpus.Recursion.even_step
 := rfl
 -- CORPUS-END
 
 -- FV/Backend/Proof/DefGenDom.lean: mutually recursive proof declarations.
 mutual
-  theorem even_self (n : Nat) : even n = even n 
+  theorem even_self (n : Nat) : even n = even n
 -- CORPUS-PROOF Corpus.Recursion.even_self
 := by
     cases n with
@@ -36,7 +36,7 @@ mutual
     | succ n => exact odd_self n
 -- CORPUS-END
 
-  theorem odd_self (n : Nat) : odd n = odd n 
+  theorem odd_self (n : Nat) : odd n = odd n
 -- CORPUS-PROOF Corpus.Recursion.odd_self
 := by
     cases n with
