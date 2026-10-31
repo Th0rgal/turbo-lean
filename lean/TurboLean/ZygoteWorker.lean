@@ -1020,10 +1020,10 @@ def isPinnedFfiOpaque (env : Environment) (ffiAllow : Array (Name × Name × Str
   | _ => false
 
 /-- Validated prefix stubs of a compiled shard module (`consts`): the host names each stub by its
-    source name (`stubOk`, once per stub; matched as a dotted suffix of the full name), and an
-    entry named `k` times exempts the module theorems it matches whose kernel value is an explicit
-    `sorry` (`isExplicitSorryStub`) only if there are at most `k` of them; more (e.g. one injected
-    by a metaprogram) is a violation. -/
+    source name (`stubOk`, once per stub; matched as a dotted suffix of the full name). An entry
+    named `k` times must match at most `k` module theorems, whatever their values (more, e.g. one
+    injected by a metaprogram next to a stub a macro turned into a proof, is a violation); of
+    those, the ones whose kernel value is an explicit `sorry` (`isExplicitSorryStub`) are exempt. -/
 def collectStubDecls (consts : Array ConstantInfo) (stubOk : Array String) :
     Std.HashSet Name × List String := Id.run do
   let mut out : Std.HashSet Name := {}
@@ -1031,9 +1031,9 @@ def collectStubDecls (consts : Array ConstantInfo) (stubOk : Array String) :
   for e in stubOk.toList.eraseDups do
     let hits := consts.filter fun c =>
       let s := c.name.toString (escape := false)
-      (s == e || s.endsWith ("." ++ e)) && isExplicitSorryStub c
+      c.isTheorem && (s == e || s.endsWith ("." ++ e))
     if hits.size ≤ stubOk.count e then
-      out := hits.foldl (·.insert ·.name) out
+      out := (hits.filter isExplicitSorryStub).foldl (·.insert ·.name) out
     else
       violations := violations ++
         [s!"[TurboLean.KernelGate] prefix stub `{e}` is ambiguous: {hits.map (·.name)}"]

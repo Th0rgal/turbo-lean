@@ -3297,18 +3297,40 @@ pub(crate) fn try_zygote_url_check_shard_inner_with_inflight_detailed(
     parse_check_shard_resp(&resp_bytes)
 }
 
+/// `/check-shard` error `code` for a shard the zygote could not import: unavailable, not rejected.
+pub(crate) const IMPORT_UNAVAILABLE_CODE: &str = "zygote_import_unavailable";
+
+/// The `/check-shard` error the daemon reports with `IMPORT_UNAVAILABLE_CODE`.
+#[derive(Debug)]
+pub(crate) struct ZygoteImportUnavailable(pub String);
+
+impl std::fmt::Display for ZygoteImportUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Zygote import unavailable for `{}`", self.0)
+    }
+}
+
+impl std::error::Error for ZygoteImportUnavailable {}
+
 /// `/check-shard` outcome for a failed request: a daemon that answered with an error rejected the
-/// shard, which is final; no answer (transport failure) or `Zygote import unavailable` means the
-/// zygote is unavailable (`Ok(None)`), so only then may an audited fallback run.
+/// shard, which is final; no answer (transport failure) or the structured
+/// `IMPORT_UNAVAILABLE_CODE` (never message text, which the shard's diagnostics can contain)
+/// means the zygote is unavailable (`Ok(None)`), so only then may an audited fallback run.
 fn check_shard_http_error(e: anyhow::Error) -> Result<Option<serde_json::Value>> {
-    if !e.to_string().contains("HTTP ") {
+    let s = e.to_string();
+    if !s.contains("HTTP ") {
         return Ok(None);
     }
-    let err = extract_http_error_detail(e);
-    if err.to_string().contains("Zygote import unavailable") {
+    let unavailable = s
+        .split_once("): {")
+        .and_then(|(_, body)| {
+            serde_json::from_str::<serde_json::Value>(&format!("{{{}", body)).ok()
+        })
+        .is_some_and(|v| v.get("code").and_then(|c| c.as_str()) == Some(IMPORT_UNAVAILABLE_CODE));
+    if unavailable {
         Ok(None)
     } else {
-        Err(err)
+        Err(extract_http_error_detail(e))
     }
 }
 
@@ -3735,8 +3757,13 @@ mod tests {
         assert!(err
             .to_string()
             .starts_with("Remote `lean` shard verification failed"));
+        // Only the structured code means unavailable, never text the shard can put in a message.
+        assert!(http("Zygote import unavailable for `«Zygote import unavailable»`").is_err());
         assert!(matches!(
-            http("Zygote import unavailable for `t`"),
+            check_shard_http_error(anyhow::anyhow!(
+                "HTTP request POST http://127.0.0.1:1/check-shard failed (HTTP 500): {{\"status\":\"error\",\"error\":\"x\",\"code\":\"{}\"}}",
+                IMPORT_UNAVAILABLE_CODE
+            )),
             Ok(None)
         ));
         assert!(matches!(
@@ -3797,6 +3824,11 @@ mod tests {
                 stubs
             ),
             "a second explicit sorry matching a stub name is ambiguous",
+            "prefix stub `s1` is ambiguous",
+        );
+        reject(
+            "import Lean\nmacro_rules | `(term| sorry) => `(term| trivial)\ntheorem s1 : True := sorry\ntheorem Evil.s1 : False := by\n  run_tac do\n    let g ← Lean.Elab.Tactic.getMainGoal\n    g.assign (← Lean.Meta.mkSorry (← g.getType) false)\ntheorem tgt : False := Evil.s1\n".into(),
+            "a stub turned into a proof cannot lend its name to an injected sorry",
             "prefix stub `s1` is ambiguous",
         );
         reject(

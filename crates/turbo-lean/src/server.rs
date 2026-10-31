@@ -762,11 +762,12 @@ pub fn serve_cas_http_with_auth(
                             }
                         }
                         Err(e) => {
-                            let _ = write_json_response(
-                                &mut stream,
-                                500,
-                                &serde_json::json!({"status": "error", "error": e.to_string()}),
-                            );
+                            let mut body =
+                                serde_json::json!({"status": "error", "error": e.to_string()});
+                            if e.is::<crate::zygote::ZygoteImportUnavailable>() {
+                                body["code"] = crate::zygote::IMPORT_UNAVAILABLE_CODE.into();
+                            }
+                            let _ = write_json_response(&mut stream, 500, &body);
                         }
                     }
                 }
@@ -1431,7 +1432,7 @@ fn execute_check_shard_payload_deferred_with_domain(
             zygote_used_constants = zreply.used_constants;
         }
         Ok(_) if req.skip_cas_lock => {
-            anyhow::bail!("Zygote import unavailable for `{}`", req.decl);
+            return Err(crate::zygote::ZygoteImportUnavailable(req.decl.clone()).into());
         }
         Err(e) if req.skip_cas_lock => return Err(e),
         _ => {}
