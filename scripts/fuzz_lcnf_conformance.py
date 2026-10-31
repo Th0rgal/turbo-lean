@@ -437,43 +437,74 @@ def sanitizer_flag_list(asan: bool, ubsan: bool) -> list[str]:
     return [f"-fsanitize={','.join(sanitizers)}", "-fno-sanitize-recover=all", "-fno-omit-frame-pointer"]
 
 
+def _strip_ir_quotes_and_parens(text: str) -> str:
+    no_quotes = re.sub(r'"(?:\\.|[^"\\])*"', '""', text)
+    prev = None
+    cur = no_quotes
+    while prev != cur:
+        prev = cur
+        cur = re.sub(r"\([^()]*\)", "()", cur)
+    return cur
+
+
+def _extract_define_attr_groups_and_inline(define_line: str) -> tuple[list[str], bool]:
+    m = re.match(r"^define\b(.*)\{\s*$", define_line)
+    if not m:
+        raise RuntimeError(f"ASan instrumentation refused: malformed LLVM define header: {define_line}")
+    scrubbed = _strip_ir_quotes_and_parens(m.group(1))
+    groups = re.findall(r"#(\d+)\b", scrubbed)
+    has_inline = bool(re.search(r"\bsanitize_address\b", scrubbed))
+    return groups, has_inline
+
+
 def instrument_llvm_ir_for_asan(ir_text: str) -> str:
-    define_headers = re.findall(r"^define\b[^\n{]*\{", ir_text, flags=re.M)
-    if not define_headers:
+    raw_lines = ir_text.splitlines()
+    define_indices: list[int] = []
+    needed_groups: set[str] = set()
+    bare_define_indices: set[int] = set()
+
+    for idx, line in enumerate(raw_lines):
+        if re.match(r"^define\b", line):
+            define_indices.append(idx)
+            groups, has_inline = _extract_define_attr_groups_and_inline(line)
+            if groups:
+                needed_groups.update(groups)
+            elif not has_inline:
+                bare_define_indices.add(idx)
+
+    if not define_indices:
         raise RuntimeError("ASan instrumentation refused: LLVM IR module contains zero function definitions")
 
-    needed_groups: set[str] = set()
-    bare_defines = 0
-    for idx, hdr in enumerate(define_headers):
-        m = re.search(r"#(\d+)\s*\{$", hdr)
-        if m:
-            needed_groups.add(m.group(1))
-        elif not re.search(r"\bsanitize_address\b", hdr):
-            bare_defines += 1
-
     out_lines: list[str] = []
-    seen_groups: set[str] = set()
-    for line in ir_text.splitlines():
+    seen_groups: dict[str, str] = {}
+    for idx, line in enumerate(raw_lines):
         gm = re.match(r"^(attributes #(\d+)\s*=\s*\{)(.*)(\}\s*)$", line)
         if gm:
             gid = gm.group(2)
-            seen_groups.add(gid)
+            if gid in seen_groups:
+                raise RuntimeError(f"ASan instrumentation refused: duplicate LLVM attribute group #{gid}")
             body = gm.group(3)
-            if gid in needed_groups and not re.search(r"\bsanitize_address\b", body):
+            if gid in needed_groups and not re.search(r"\bsanitize_address\b", _strip_ir_quotes_and_parens(body)):
                 stripped = body.strip()
                 body = f" sanitize_address {stripped} " if stripped else " sanitize_address "
                 line = f"{gm.group(1)}{body}{gm.group(4)}"
-        elif re.match(r"^define\b", line) and not re.search(r"#\d+\s*\{", line) and not re.search(r"\bsanitize_address\b", line):
+            seen_groups[gid] = body
+        elif idx in bare_define_indices:
             line = re.sub(r"\{\s*$", "sanitize_address {", line, count=1)
         out_lines.append(line)
 
-    missing_groups = sorted(needed_groups - seen_groups)
+    missing_groups = sorted(needed_groups - set(seen_groups.keys()))
     if missing_groups:
         raise RuntimeError(f"ASan instrumentation refused: missing LLVM attribute groups #{', #'.join(missing_groups)}")
-    instrumented = "\n".join(out_lines) + ("\n" if ir_text.endswith("\n") else "")
-    if (needed_groups or bare_defines) and "sanitize_address" not in instrumented:
-        raise RuntimeError("ASan instrumentation failed to inject sanitize_address into LLVM IR")
-    return instrumented
+
+    for idx in define_indices:
+        groups, has_inline = _extract_define_attr_groups_and_inline(out_lines[idx])
+        if not has_inline and not (groups and all(
+            re.search(r"\bsanitize_address\b", _strip_ir_quotes_and_parens(seen_groups[g])) for g in groups
+        )):
+            raise RuntimeError(f"ASan instrumentation failed to cover LLVM define header: {out_lines[idx]}")
+
+    return "\n".join(out_lines) + ("\n" if ir_text.endswith("\n") else "")
 
 
 def find_sanitizer_linker(clang_bin: str | None, extra_inc: list[str], asan: bool, ubsan: bool) -> str | None:
@@ -876,13 +907,19 @@ def run_three_way_batch(
                     "c_abi_llvm": str(nv),
                 })
 
+        raw_ir_sha = sha256_bytes(ll_path.read_bytes())
+        if san_meta.get("asan") is not bool(asan) or san_meta.get("ubsan") is not bool(ubsan):
+            raise RuntimeError("Sanitizer execution receipt did not match requested sanitizer flags")
+        if asan and san_meta.get("compiled_llvm_ir_sha256") == raw_ir_sha:
+            if "sanitize_address" not in ll_path.read_text(encoding="utf-8"):
+                raise RuntimeError("ASan requested but compiled LLVM IR hash matched uninstrumented IR")
         receipts = {
             "lean_source_sha256": sha256_bytes(lean_file.read_bytes()),
             "stock_source_sha256": sha256_bytes(stock_source.read_bytes()),
             "stock_unmodified_c_sha256": sha256_bytes(lean_c_file.read_bytes()),
             "stock_runtime": "stock lean -c + leanc (full generated C, no replacements)",
             "lnir_wire_sha256": sha256_bytes(wire_path.read_bytes()),
-            "llvm_ir_sha256": sha256_bytes(ll_path.read_bytes()),
+            "llvm_ir_sha256": raw_ir_sha,
             "compiled_llvm_ir_sha256": san_meta["compiled_llvm_ir_sha256"],
             "stock_binary_sha256": sha256_bytes(stock_bin_path.read_bytes()),
             "leannative_binary_sha256": sha256_bytes(ln_bin_path.read_bytes()),

@@ -689,6 +689,19 @@ class TestP0TrustBoundary(unittest.TestCase):
         self.assertIn("attributes #3 = { sanitize_address nounwind }", inst_custom)
         self.assertIn("define dso_local i64 @bare() sanitize_address {", inst_custom)
         self.assertEqual(fuzzer.instrument_llvm_ir_for_asan(inst_custom).count("sanitize_address"), 2)
+        multi = fuzzer.instrument_llvm_ir_for_asan(
+            'define i64 @multi(i64 %x) #0 #1 section ".text" {\n  ret i64 %x\n}\n'
+            'define i64 @quoted(i64 %x) "section" "#9" #4 {\n  ret i64 %x\n}\n'
+            "attributes #0 = { nounwind }\n"
+            "attributes #1 = { uwtable }\n"
+            "attributes #4 = { nounwind }\n"
+            'attributes #9 = { "not-an-attribute" }\n'
+        )
+        self.assertIn("attributes #0 = { sanitize_address nounwind }", multi)
+        self.assertIn("attributes #1 = { sanitize_address uwtable }", multi)
+        self.assertIn("attributes #4 = { sanitize_address nounwind }", multi)
+        self.assertNotIn("sanitize_address", multi.split("attributes #9", 1)[1])
+        self.assertEqual(fuzzer.instrument_llvm_ir_for_asan(multi).count("sanitize_address"), 3)
 
         with tempfile.TemporaryDirectory(prefix="p0_san_kill_") as tmp:
             p = Path(tmp)
@@ -809,6 +822,16 @@ class TestP0TrustBoundary(unittest.TestCase):
             self.assertFalse(failed_fuzz["ok"], failed_fuzz)
             self.assertEqual(failed_fuzz["checked"], 0)
             self.assertTrue(failed_fuzz["shrunk_failures"])
+
+        contract_sh = ROOT / "scripts" / "verify_roadmap_contract.sh"
+        bad_auditor = subprocess.run(
+            ["bash", str(contract_sh)],
+            env={**os.environ, "TURBO_AUDITOR_BIN": "/nonexistent/turbo-lean"},
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(bad_auditor.returncode, 0)
+        self.assertIn("TURBO_AUDITOR_BIN", bad_auditor.stderr)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 """Actual stock-Lean/LNIR/LLVM execution; no Python result oracle."""
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -9,7 +10,43 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fuzz_lcnf_conformance as fuzzer
 
 
+def _requested_sanitizers() -> tuple[bool, bool]:
+    return (
+        os.environ.get("TURBO_CONFORMANCE_ASAN") == "1",
+        os.environ.get("TURBO_CONFORMANCE_UBSAN") == "1",
+    )
+
+
+def _record_sanitizer_receipt(meta: dict[str, object]) -> None:
+    receipt_path = os.environ.get("TURBO_C1_RECEIPT_FILE")
+    if receipt_path:
+        with open(receipt_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(meta, sort_keys=True) + "\n")
+
+
 class ScalarFrontend(unittest.TestCase):
+    def _assert_batch_sanitizer_receipts(self, result: dict[str, object]) -> None:
+        asan, ubsan = _requested_sanitizers()
+        receipts = result["receipts"]
+        san_meta = receipts["sanitizers"]
+        self.assertIs(san_meta["asan"], asan)
+        self.assertIs(san_meta["ubsan"], ubsan)
+        self.assertEqual(
+            san_meta["ubsan_scope"],
+            "c_driver_and_link_runtime_only_not_llvm_ir" if ubsan else "disabled",
+        )
+        if asan:
+            self.assertNotEqual(receipts["compiled_llvm_ir_sha256"], receipts["llvm_ir_sha256"])
+        else:
+            self.assertEqual(receipts["compiled_llvm_ir_sha256"], receipts["llvm_ir_sha256"])
+        _record_sanitizer_receipt({
+            "asan": san_meta["asan"],
+            "ubsan": san_meta["ubsan"],
+            "ubsan_scope": san_meta["ubsan_scope"],
+            "llvm_ir_sha256": receipts["llvm_ir_sha256"],
+            "compiled_llvm_ir_sha256": receipts["compiled_llvm_ir_sha256"],
+        })
+
     def test_small_width_comparisons(self):
         engines = fuzzer.probe_engines()
         self.assertTrue(all(engines[k] for k in ("stock_lean_c", "lnir_eval", "c_abi_llvm")), engines)
@@ -26,6 +63,7 @@ class ScalarFrontend(unittest.TestCase):
         print(json.dumps(result, sort_keys=True))
         self.assertEqual(result["executed_count"], len(programs))
         self.assertEqual(result["mismatches"], [])
+        self._assert_batch_sanitizer_receipts(result)
 
     def test_narrow_wrapping_arithmetic_shifts_and_div_zero(self):
         engines = fuzzer.probe_engines()
@@ -48,6 +86,7 @@ class ScalarFrontend(unittest.TestCase):
         result = fuzzer.run_three_way_batch(programs, engines)
         self.assertEqual(result["executed_count"], len(programs))
         self.assertEqual(result["mismatches"], [])
+        self._assert_batch_sanitizer_receipts(result)
 
     def test_join_point_param_swap_and_nested_helper_inlining(self):
         engines = fuzzer.probe_engines()
@@ -76,6 +115,7 @@ def outerHelper (u v : UInt64) : UInt64 :=
         result = fuzzer.run_three_way_batch(programs, engines)
         self.assertEqual(result["executed_count"], len(programs))
         self.assertEqual(result["mismatches"], [])
+        self._assert_batch_sanitizer_receipts(result)
 
     def test_chained_boolean_join_points_and_tuple_helpers(self):
         engines = fuzzer.probe_engines()
@@ -162,6 +202,7 @@ def streamFenceStep
         result = fuzzer.run_three_way_batch(programs, engines)
         self.assertEqual(result["executed_count"], len(programs))
         self.assertEqual(result["mismatches"], [])
+        self._assert_batch_sanitizer_receipts(result)
 
     def test_primitive_boundaries(self):
         # Run the actual Lean bridge: same leaf names, mismatched types/arity
@@ -245,6 +286,7 @@ def unsignedOuter (x : UInt64) : UInt64 := unsignedInner x + 1
         print(json.dumps(result, sort_keys=True))
         self.assertEqual(result["executed_count"], len(programs))
         self.assertEqual(result["mismatches"], [])
+        self._assert_batch_sanitizer_receipts(result)
 
     def test_stage1b_narrow_abi_usize_bool_enums_joinpoints_and_divmod_zero(self):
         engines = fuzzer.probe_engines()
@@ -478,13 +520,37 @@ def s1b_enum_branch (tag : UInt8) (x : UInt64) (y : UInt64) : UInt64 :=
             c_driver = tmpdir / "driver.c"
             c_runner = tmpdir / "c_runner"
             c_driver.write_text("\n".join(c_lines) + "\n", encoding="utf-8")
-            subprocess.run(
-                [clang_bin, "-O2", "-Wno-override-module", *fuzzer.clang_extra_flags(clang_bin), str(ll_x64), str(c_driver), "-o", str(c_runner)],
-                check=True,
-                capture_output=True,
-                text=True,
+            asan, ubsan = _requested_sanitizers()
+            raw_ir_sha = fuzzer.sha256_bytes(ll_x64.read_bytes())
+            san_meta = fuzzer.compile_and_link_llvm_driver(
+                clang_bin=clang_bin,
+                extra_inc=fuzzer.clang_extra_flags(clang_bin),
+                ll_path=ll_x64,
+                driver_c_path=c_driver,
+                out_bin_path=c_runner,
+                asan=asan,
+                ubsan=ubsan,
+                sanitizer_linker=engines.get("sanitizer_linker"),
             )
-            llvm_vals = [int(v) for v in json.loads(subprocess.check_output([str(c_runner)], text=True))]
+            self.assertIs(san_meta["asan"], asan)
+            self.assertIs(san_meta["ubsan"], ubsan)
+            if asan:
+                self.assertNotEqual(san_meta["compiled_llvm_ir_sha256"], raw_ir_sha)
+            else:
+                self.assertEqual(san_meta["compiled_llvm_ir_sha256"], raw_ir_sha)
+            _record_sanitizer_receipt({
+                "asan": san_meta["asan"],
+                "ubsan": san_meta["ubsan"],
+                "ubsan_scope": san_meta["ubsan_scope"],
+                "llvm_ir_sha256": raw_ir_sha,
+                "compiled_llvm_ir_sha256": san_meta["compiled_llvm_ir_sha256"],
+            })
+            run_env = dict(os.environ)
+            if asan:
+                run_env["ASAN_OPTIONS"] = "detect_leaks=0:abort_on_error=1:halt_on_error=1"
+            if ubsan:
+                run_env["UBSAN_OPTIONS"] = "print_stacktrace=1:halt_on_error=1"
+            llvm_vals = [int(v) for v in json.loads(subprocess.check_output([str(c_runner)], env=run_env, text=True))]
 
             self.assertEqual(lnir_vals, stock_vals)
             self.assertEqual(llvm_vals, stock_vals)

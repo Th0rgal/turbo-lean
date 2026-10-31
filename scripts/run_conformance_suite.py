@@ -14,6 +14,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,8 @@ C1_CORPUS_TESTS = (
     "ScalarFrontend.test_narrow_wrapping_arithmetic_shifts_and_div_zero",
     "ScalarFrontend.test_join_point_param_swap_and_nested_helper_inlining",
     "ScalarFrontend.test_chained_boolean_join_points_and_tuple_helpers",
+    "ScalarFrontend.test_unsigned_casts_and_input_dependent_boolean_branches",
+    "ScalarFrontend.test_stage1b_narrow_abi_usize_bool_enums_joinpoints_and_divmod_zero",
 )
 
 
@@ -75,31 +78,53 @@ def run_c1_corpus(asan: bool, ubsan: bool) -> dict[str, Any]:
                 "c_abi_llvm": engines["c_abi_llvm"],
             },
         }
-    cmd = [
-        sys.executable,
-        "-m",
-        "unittest",
-        "-v",
-        *(f"scripts.test_scalar_frontend.{name}" for name in C1_CORPUS_TESTS),
-    ]
-    sub_env = dict(os.environ)
-    sub_env["TURBO_CONFORMANCE_ASAN"] = "1" if asan else "0"
-    sub_env["TURBO_CONFORMANCE_UBSAN"] = "1" if ubsan else "0"
-    res = subprocess.run(cmd, cwd=ROOT, env=sub_env, capture_output=True, text=True)
-    ok = res.returncode == 0
-    return {
-        "tier": "C1",
-        "ok": ok,
-        "status": "passed_scalar_tuple_subset" if ok else "failed_or_incomplete",
-        "coverage": "scalar_narrow_unsigned_joinpoint_and_flat_tuple_subset",
-        "tests": list(C1_CORPUS_TESTS),
-        "testCount": len(C1_CORPUS_TESTS),
-        "asan": asan,
-        "ubsan": ubsan,
-        "ubsanScope": "c_driver_and_link_runtime_only_not_llvm_ir" if ubsan else "disabled",
-        "returncode": res.returncode,
-        "stderrTail": (res.stderr or "")[-1200:],
-    }
+    with tempfile.TemporaryDirectory(prefix="turbo_c1_receipts_") as tmp:
+        receipt_path = Path(tmp) / "sanitizer-receipts.jsonl"
+        cmd = [
+            sys.executable,
+            "-m",
+            "unittest",
+            "-v",
+            *(f"scripts.test_scalar_frontend.{name}" for name in C1_CORPUS_TESTS),
+        ]
+        sub_env = dict(os.environ)
+        sub_env["TURBO_CONFORMANCE_ASAN"] = "1" if asan else "0"
+        sub_env["TURBO_CONFORMANCE_UBSAN"] = "1" if ubsan else "0"
+        sub_env["TURBO_C1_RECEIPT_FILE"] = str(receipt_path)
+        res = subprocess.run(cmd, cwd=ROOT, env=sub_env, capture_output=True, text=True)
+        rows = []
+        if receipt_path.is_file():
+            rows = [json.loads(line) for line in receipt_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        sanitizers_verified = (
+            len(rows) == len(C1_CORPUS_TESTS)
+            and all(
+                r.get("asan") is asan
+                and r.get("ubsan") is ubsan
+                and r.get("ubsan_scope") == ("c_driver_and_link_runtime_only_not_llvm_ir" if ubsan else "disabled")
+                and (
+                    r.get("compiled_llvm_ir_sha256") != r.get("llvm_ir_sha256")
+                    if asan
+                    else r.get("compiled_llvm_ir_sha256") == r.get("llvm_ir_sha256")
+                )
+                for r in rows
+            )
+        )
+        ok = res.returncode == 0 and sanitizers_verified
+        return {
+            "tier": "C1",
+            "ok": ok,
+            "status": "passed_scalar_tuple_subset" if ok else "failed_or_incomplete",
+            "coverage": "scalar_narrow_unsigned_joinpoint_flat_tuple_and_stage1b_subset",
+            "tests": list(C1_CORPUS_TESTS),
+            "testCount": len(C1_CORPUS_TESTS),
+            "asan": asan,
+            "ubsan": ubsan,
+            "ubsanScope": "c_driver_and_link_runtime_only_not_llvm_ir" if ubsan else "disabled",
+            "sanitizerReceiptsVerified": sanitizers_verified,
+            "sanitizerReceiptCount": len(rows),
+            "returncode": res.returncode,
+            "stderrTail": (res.stderr or "")[-1200:],
+        }
 
 
 def main() -> int:

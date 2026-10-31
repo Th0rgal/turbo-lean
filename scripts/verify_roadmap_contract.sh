@@ -23,16 +23,24 @@ for cand in \
 done
 export PATH
 
-TURBO_BIN="${TURBO_AUDITOR_BIN:-$ROOT_DIR/target/release/turbo-lean}"
-if [ ! -x "$TURBO_BIN" ]; then
-  TURBO_BIN="$(command -v turbo-lean || true)"
+if [ -n "${TURBO_AUDITOR_BIN+x}" ]; then
+  TURBO_BIN="$TURBO_AUDITOR_BIN"
+  if [ -z "$TURBO_BIN" ] || [ ! -x "$TURBO_BIN" ]; then
+    echo "[FAIL] TURBO_AUDITOR_BIN=${TURBO_BIN:-<empty>} is missing or not executable" >&2
+    exit 1
+  fi
+else
+  TURBO_BIN="$ROOT_DIR/target/release/turbo-lean"
+  if [ ! -x "$TURBO_BIN" ]; then
+    TURBO_BIN="$(command -v turbo-lean || true)"
+  fi
 fi
 FULL_BIN="$ROOT_DIR/lean/.lake/build/bin/lean-native"
 CORE_BIN="$ROOT_DIR/lean/.lake/build/bin/lean-native-core"
 ZYGOTE_BIN="$ROOT_DIR/lean/.lake/build/bin/turbo-zygote"
 
-if [ -z "$TURBO_BIN" ]; then
-  echo "[FAIL] turbo-lean binary not found on PATH" >&2
+if [ -z "$TURBO_BIN" ] || [ ! -x "$TURBO_BIN" ]; then
+  echo "[FAIL] turbo-lean binary not found or not executable" >&2
   exit 1
 fi
 if [ ! -x "$FULL_BIN" ]; then
