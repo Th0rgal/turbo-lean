@@ -928,7 +928,21 @@ pub fn serve_cas_http_with_auth(
                     }
                     let req: EvalHttpRequest = serde_json::from_slice(&body).unwrap_or_default();
                     let filtered_eval_args =
-                        crate::module_builder::filter_allowed_lean_args(&req.lean_args);
+                        match crate::module_builder::validate_effective_lean_args(&req.lean_args) {
+                            Ok(args) => args,
+                            Err(error) => {
+                                let _ = write_json_response(
+                                    &mut stream,
+                                    400,
+                                    &serde_json::json!({
+                                        "ok": false,
+                                        "status": "error",
+                                        "error": error.to_string()
+                                    }),
+                                );
+                                return;
+                            }
+                        };
                     let Ok(req_store) = TurboStore::open(store_root_clone.as_deref()) else {
                         return;
                     };

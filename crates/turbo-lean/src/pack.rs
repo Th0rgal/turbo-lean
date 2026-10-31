@@ -3833,6 +3833,40 @@ pub(crate) mod tests {
             eval_env_err
         );
 
+        // Warm the empty-option eval path before trying arguments that filtering used to erase.
+        let eval_body = serde_json::json!({"source": "#eval 17305\n"});
+        for _ in 0..2 {
+            let reply: serde_json::Value =
+                serde_json::from_slice(&http_request_with_timeout_and_token(
+                    "POST",
+                    &format!("{}/eval", base),
+                    "application/json",
+                    &serde_json::to_vec(&eval_body)?,
+                    Some(30_000),
+                    Some(tok),
+                    || {},
+                )?)?;
+            assert_eq!(reply["ok"], true, "{reply}");
+        }
+        for invalid in ["--plugin=bad.so", "--json", "-q", " -DautoImplicit=false "] {
+            let body = serde_json::json!({"source": "#eval 17305\n", "lean_args": [invalid]});
+            let err = http_request_with_timeout_and_token(
+                "POST",
+                &format!("{}/eval", base),
+                "application/json",
+                &serde_json::to_vec(&body)?,
+                Some(2_000),
+                Some(tok),
+                || {},
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("400") && err.contains("Unsupported effective Lean compiler flag"),
+                "expected rejection before eval cache access: {err}"
+            );
+        }
+
         // 5. SHA-256 verification fails closed on mismatch
         let sha_err = http_request_full(
             "GET",

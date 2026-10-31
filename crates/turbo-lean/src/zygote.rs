@@ -4179,7 +4179,7 @@ pub fn try_local_zygote_eval_with_args(
     timeout_ms: u64,
     lean_args: &[String],
 ) -> Option<ZygoteEvalReply> {
-    let filtered_args = crate::module_builder::filter_allowed_lean_args(lean_args);
+    let filtered_args = crate::module_builder::validate_effective_lean_args(lean_args).ok()?;
     let timeout_ms = if timeout_ms > 0 {
         timeout_ms
     } else {
@@ -4582,6 +4582,57 @@ mod tests {
             .is_file()
             .then(|| crate::module_builder::resolve_project_config(&dir).ok())
             .flatten()
+    }
+
+    #[test]
+    fn local_eval_rejects_invalid_args_before_empty_option_cache_hit() -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("turbo_eval_options_{}", crate::pack::next_tmp_id()));
+        let store = TurboStore::open(Some(&dir))?;
+        let source = "#eval 17305\n";
+        let file_name = dir.join("Cached.lean").to_string_lossy().to_string();
+        let cwd = std::env::current_dir()?.to_string_lossy().to_string();
+        let filename =
+            compute_eval_shm_cache_filename("test", "", &file_name, Some(&cwd), source, &[]);
+        let cache_dir = store.fast_staging_dir().join("eval_shm_cache");
+        fs::create_dir_all(&cache_dir)?;
+        let path = cache_dir.join(filename);
+        let reply = ZygoteEvalReply {
+            ok: true,
+            stdout: "empty-option-cached-reply".into(),
+            ..Default::default()
+        };
+        let bytes = serde_json::to_vec(&reply)?;
+        fs::write(&path, &bytes)?;
+        let eval = |args: &[String]| {
+            try_local_zygote_eval_with_args(
+                &store,
+                &std::collections::HashMap::new(),
+                Path::new("/no-lean-needed"),
+                "test",
+                "",
+                source,
+                Some(&file_name),
+                1000,
+                args,
+            )
+        };
+        let cached = eval(&[]).expect("fixture must hit the empty-option cache");
+        assert!(cached.ok && cached.env_cache_hit && cached.prefix_cache_hit);
+        assert_eq!(cached.stdout, reply.stdout);
+        for invalid in ["--plugin=bad.so", "--json", "-q", " -DautoImplicit=false "] {
+            assert!(
+                eval(&[invalid.to_string()]).is_none(),
+                "invalid argument must not reuse cached reply: {invalid}"
+            );
+        }
+        assert_eq!(fs::read(&path)?, bytes);
+        fs::remove_file(path)?;
+        fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[test]
