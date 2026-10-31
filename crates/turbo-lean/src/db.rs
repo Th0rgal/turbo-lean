@@ -2236,13 +2236,7 @@ impl TurboStore {
                 }
             }
 
-            let mode = try_reflink_or_hardlink(&src, &dst)?;
-            // A concurrent GC may have re-compressed the blob after the probe above; the linked
-            // inode is what was installed, so re-check it.
-            if fs::metadata(&dst).map_or(true, |m| m.len() != out.size_bytes) {
-                let _ = fs::remove_file(&dst);
-                anyhow::bail!("CAS blob {} changed while linking", out.blob_hash);
-            }
+            let mode = try_reflink_or_hardlink(&src, &dst, Some(out.size_bytes))?;
             if existing_map.get(&out.rel_path) != Some(&out.blob_hash) {
                 db_updates.push((&out.rel_path, &out.blob_hash, mode));
             }
@@ -2307,7 +2301,7 @@ impl TurboStore {
     /// Refuse to link a CAS blob whose bytes are not the recorded blob: size check against the
     /// `blobs` row (cheap), falling back to a full BLAKE3 check only for blobs with no row.
     /// A torn blob is unlinked so the next producer rewrites it.
-    fn verify_blob_before_link(&self, blob_hash: &str, src: &Path) -> Result<()> {
+    fn verify_blob_before_link(&self, blob_hash: &str, src: &Path) -> Result<u64> {
         let recorded: Option<i64> = self
             .conn
             .query_row(
@@ -2316,31 +2310,34 @@ impl TurboStore {
                 |r| r.get(0),
             )
             .optional()?;
-        let ok = match recorded {
-            Some(sz) => matches!(probe_blob_file(src, sz as u64), BlobDisk::Intact(_)),
+        let len = match recorded {
+            Some(sz) => {
+                matches!(probe_blob_file(src, sz as u64), BlobDisk::Intact(_)).then_some(sz as u64)
+            }
             None => fs::read(src)
-                .map(|b| blake3::hash(&b).to_hex().as_str() == blob_hash)
-                .unwrap_or(false),
+                .ok()
+                .filter(|b| blake3::hash(b).to_hex().as_str() == blob_hash)
+                .map(|b| b.len() as u64),
         };
-        if !ok {
+        let Some(len) = len else {
             let _ = fs::remove_file(src);
             anyhow::bail!(
                 "CAS blob {} is missing or torn; refusing to link",
                 blob_hash
             );
-        }
-        Ok(())
+        };
+        Ok(len)
     }
 
     /// Restore a CAS blob to `dest_path`, transparently re-promoting cold `TLZ1`-compressed
     /// blobs back to raw `0o444` Hot-tier bytes before hardlinking/copying.
     pub fn restore_blob_to_path(&self, blob_hash: &str, dest_path: &Path) -> Result<&'static str> {
         let src = self.ensure_blob_uncompressed(blob_hash)?;
-        self.verify_blob_before_link(blob_hash, &src)?;
+        let len = self.verify_blob_before_link(blob_hash, &src)?;
         if let Some(parent) = dest_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        try_reflink_or_hardlink(&src, dest_path)
+        try_reflink_or_hardlink(&src, dest_path, Some(len))
     }
 
     /// Record an active worktree lease and its active file->blob mappings.
@@ -3628,7 +3625,14 @@ pub(crate) fn is_non_package_lake_build_path(p: &Path) -> bool {
     false
 }
 
-pub(crate) fn try_reflink_or_hardlink(src: &Path, dst: &Path) -> Result<&'static str> {
+/// Install `src` at `dst` (reflink/hardlink/copy via a private temp + atomic rename). With
+/// `expected_len`, the temp file must have exactly that length before it is renamed into place, so a
+/// blob that GC re-compressed after the caller's probe is never published.
+pub(crate) fn try_reflink_or_hardlink(
+    src: &Path,
+    dst: &Path,
+    expected_len: Option<u64>,
+) -> Result<&'static str> {
     let pid = std::process::id();
     let tid = format!("{:?}", std::thread::current().id())
         .chars()
@@ -3640,6 +3644,13 @@ pub(crate) fn try_reflink_or_hardlink(src: &Path, dst: &Path) -> Result<&'static
         .unwrap_or_else(|| "artifact".to_string());
     let tmp_dst = dst.with_file_name(format!(".{}.tl_tmp.{}.{}", fname, pid, tid));
     let _ = fs::remove_file(&tmp_dst);
+    let check_len = |tmp: &Path| -> Result<()> {
+        if expected_len.is_some_and(|n| fs::metadata(tmp).map_or(true, |m| m.len() != n)) {
+            let _ = fs::remove_file(tmp);
+            anyhow::bail!("CAS blob changed while linking into {}", dst.display());
+        }
+        Ok(())
+    };
     let is_mutable_sidecar = fname == ".turbo_verified_sources.json"
         || fname.ends_with(".trace")
         || fname.ends_with(".hash")
@@ -3658,6 +3669,7 @@ pub(crate) fn try_reflink_or_hardlink(src: &Path, dst: &Path) -> Result<&'static
                     perms.set_mode(0o644);
                     let _ = dst_file.set_permissions(perms);
                     drop(dst_file);
+                    check_len(&tmp_dst)?;
                     fs::rename(&tmp_dst, dst)?;
                     return Ok("reflink");
                 } else {
@@ -3673,6 +3685,7 @@ pub(crate) fn try_reflink_or_hardlink(src: &Path, dst: &Path) -> Result<&'static
             perms.set_mode(0o644);
             let _ = fs::set_permissions(&tmp_dst, perms);
         }
+        check_len(&tmp_dst)?;
         fs::rename(&tmp_dst, dst)?;
         return Ok("copy");
     }
@@ -3680,6 +3693,7 @@ pub(crate) fn try_reflink_or_hardlink(src: &Path, dst: &Path) -> Result<&'static
     // 1. Try immutable hardlink to process-private temp path + atomic rename
     // (shares OS page-cache mmap Shared_Clean across all worktrees and never races on dst)
     if fs::hard_link(src, &tmp_dst).is_ok() {
+        check_len(&tmp_dst)?;
         if fs::rename(&tmp_dst, dst).is_ok() {
             return Ok("hardlink");
         }
@@ -3937,6 +3951,18 @@ mod tests {
         tear_blob(&path, 4)?;
         write_blob_atomic(&dir, &path, &bh, &payload, false)?;
         assert_eq!(fs::read(&path)?, payload);
+
+        // A blob whose length differs from the expected one (e.g. re-compressed by GC after the
+        // probe) is never published into a worktree, not even transiently.
+        let guarded = dir.join("wt3").join("D.olean");
+        fs::create_dir_all(guarded.parent().unwrap())?;
+        assert!(try_reflink_or_hardlink(&path, &guarded, Some(payload.len() as u64 + 1)).is_err());
+        assert!(!guarded.exists());
+        assert_eq!(fs::read_dir(guarded.parent().unwrap())?.count(), 0);
+        assert_eq!(
+            try_reflink_or_hardlink(&path, &guarded, Some(payload.len() as u64))?,
+            "hardlink"
+        );
 
         // GC keeps the `.lock` of a live holder; an unlinked lock makes a peer start over.
         let locks = dir.join("locks");
