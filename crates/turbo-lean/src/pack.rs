@@ -2822,8 +2822,8 @@ pub fn offload_check_shards_batch_http(
     } else {
         format!("{}/check-shards-batch", endpoint.trim_end_matches('/'))
     };
-    let filtered_args = crate::module_builder::filter_allowed_lean_args(lean_args);
-    let args_digest_opt = crate::module_builder::compute_lean_args_digest(&filtered_args);
+    let filtered_args = crate::module_builder::validate_effective_lean_args(lean_args)?;
+    let args_digest_opt = crate::module_builder::compute_lean_args_digest(&filtered_args)?;
     let req = CheckShardsBatchRequest {
         items: items.to_vec(),
         coalesced_shard_source: coalesced_shard_source.to_string(),

@@ -2458,7 +2458,7 @@ fn eval_with_zygote_pool_inner(
     let olean_digest = format!("{}:{}", search_path_digest, imported_digest);
 
     let hex_opts = encode_lean_args_hex(lean_args);
-    let args_digest_opt = crate::module_builder::compute_lean_args_digest(lean_args);
+    let args_digest_opt = crate::module_builder::compute_lean_args_digest(lean_args)?;
     let verified_cache_policy = match &args_digest_opt {
         Some(ad) => format!("{}#opts:{}", toolchain_policy, ad),
         None => toolchain_policy.clone(),
@@ -4036,7 +4036,7 @@ fn compute_eval_shm_cache_filename(
     h.update(caller_cwd.unwrap_or("").as_bytes());
     h.update(b":");
     h.update(source.as_bytes());
-    if let Some(ad) = crate::module_builder::compute_lean_args_digest(lean_args) {
+    if let Some(ad) = crate::module_builder::effective_lean_args_digest(lean_args) {
         h.update(b":opts:");
         h.update(ad.as_bytes());
     }
@@ -4118,9 +4118,8 @@ pub fn try_stateless_eval_shm_cache(
         None => return None,
     };
     let toolchain = crate::lake_build::detect_toolchain(&proj_dir);
-    let resolved_lean_args = crate::module_builder::filter_allowed_lean_args(
-        crate::module_builder::try_resolve_lean_args_for_path(&proj_dir, Some(file)),
-    );
+    let resolved_lean_args =
+        crate::module_builder::try_resolve_lean_args_for_path(&proj_dir, Some(file)).ok()?;
     let caller_cwd = std::env::current_dir()
         .ok()
         .map(|p| p.to_string_lossy().to_string());

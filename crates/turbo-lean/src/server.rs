@@ -1440,6 +1440,29 @@ fn source_may_have_hygiene_issue(s: &str) -> bool {
         || s.contains("axiom")
 }
 
+// Caller keys are opaque; the server adds its own effective-option namespace.
+// Empty options retain the legacy identity.
+fn option_bound_http_key(key: &str, digest: Option<&str>) -> String {
+    match digest {
+        None => key.to_string(),
+        Some(digest) => {
+            let mut h = blake3::Hasher::new();
+            h.update(b"http-shard-options-v1:");
+            h.update(&(key.len() as u64).to_le_bytes());
+            h.update(key.as_bytes());
+            h.update(digest.as_bytes());
+            h.finalize().to_hex().to_string()
+        }
+    }
+}
+
+fn option_bound_receipt(mut receipt: serde_json::Value, digest: Option<&str>) -> Result<Vec<u8>> {
+    if let Some(digest) = digest {
+        receipt["lean_args_digest"] = serde_json::Value::String(digest.to_string());
+    }
+    Ok(serde_json::to_vec(&receipt)?)
+}
+
 fn execute_check_shard_payload_deferred_with_domain(
     store: &mut TurboStore,
     req: &CheckShardHttpRequest,
@@ -1455,7 +1478,10 @@ fn execute_check_shard_payload_deferred_with_domain(
         anyhow::bail!("Missing shard_key or shard_source in /check-shard request");
     }
 
-    if !req.skip_cas_lock && store.has_cached_action_readonly(&req.shard_key, trust_domain)? {
+    let filtered_req_args = crate::module_builder::validate_effective_lean_args(&req.lean_args)?;
+    let req_args_digest_opt = crate::module_builder::compute_lean_args_digest(&filtered_req_args)?;
+    let cache_key = option_bound_http_key(&req.shard_key, req_args_digest_opt.as_deref());
+    if !req.skip_cas_lock && store.has_cached_action_readonly(&cache_key, trust_domain)? {
         return Ok((
             serde_json::json!({
                 "status": "remote_theorem_cache_hit",
@@ -1468,7 +1494,7 @@ fn execute_check_shard_payload_deferred_with_domain(
                 "server_elapsed_ms": t0.elapsed().as_millis()
             }),
             None,
-            Some(req.shard_key.clone()),
+            Some(cache_key.clone()),
         ));
     }
 
@@ -1569,9 +1595,6 @@ fn execute_check_shard_payload_deferred_with_domain(
     let mut zygote_peak_rss = 0u64;
     let mut zygote_used_constants: Vec<String> = Vec::new();
 
-    let filtered_req_args = crate::module_builder::filter_allowed_lean_args(&req.lean_args);
-    let req_args_digest_opt = crate::module_builder::compute_lean_args_digest(&filtered_req_args);
-
     match crate::zygote::eval_with_zygote_pool_opts_with_args(
         store,
         toolchain,
@@ -1654,25 +1677,17 @@ fn execute_check_shard_payload_deferred_with_domain(
     let deferred = if req.skip_cas_lock {
         None
     } else {
-        let mut receipt_obj = serde_json::json!({
+        let receipt_obj = serde_json::json!({
             "decl": req.decl,
             "prefix_env_hash": req.prefix_env_hash,
             "stmt_hash": req.stmt_hash,
             "proof_hash": req.proof_hash,
             "verified_at": now_unix()
         });
-        if let Some(ref ad) = req_args_digest_opt {
-            if let Some(map) = receipt_obj.as_object_mut() {
-                map.insert(
-                    "lean_args_digest".to_string(),
-                    serde_json::Value::String(ad.clone()),
-                );
-            }
-        }
-        let receipt = serde_json::to_vec(&receipt_obj)?;
+        let receipt = option_bound_receipt(receipt_obj, req_args_digest_opt.as_deref())?;
         Some((
             toolchain.to_string(),
-            vec![(req.shard_key.clone(), req.decl.clone(), receipt, dur_ms)],
+            vec![(cache_key, req.decl.clone(), receipt, dur_ms)],
         ))
     };
 
@@ -1742,13 +1757,27 @@ fn execute_check_shards_batch_payload_deferred(
         req.toolchain.as_str()
     };
 
-    let keys: Vec<String> = req.items.iter().map(|i| i.shard_key.clone()).collect();
-    let cached_map = store.batch_get_theorem_shards_readonly(&keys, trust_domain)?;
+    let filtered_batch_args = crate::module_builder::validate_effective_lean_args(&req.lean_args)?;
+    let batch_args_digest_opt =
+        crate::module_builder::compute_lean_args_digest(&filtered_batch_args)?;
+    let bound_key = |key: &str| option_bound_http_key(key, batch_args_digest_opt.as_deref());
+    let keys: Vec<String> = req.items.iter().map(|i| bound_key(&i.shard_key)).collect();
+    let mut bound_hits = store.batch_get_theorem_shards_readonly(&keys, trust_domain)?;
+    let cached_map: std::collections::HashMap<_, _> = req
+        .items
+        .iter()
+        .zip(&keys)
+        .filter_map(|(item, key)| {
+            bound_hits
+                .remove(key)
+                .map(|receipt| (item.shard_key.clone(), receipt))
+        })
+        .collect();
     let hit_keys: Vec<String> = req
         .items
         .iter()
         .filter(|i| cached_map.contains_key(&i.shard_key))
-        .map(|i| i.shard_key.clone())
+        .map(|i| bound_key(&i.shard_key))
         .collect();
     let cache_hits = hit_keys.len();
 
@@ -1842,10 +1871,6 @@ fn execute_check_shards_batch_payload_deferred(
     let mut stderr = String::new();
     let mut exit_code = 0i32;
 
-    let filtered_batch_args = crate::module_builder::filter_allowed_lean_args(&req.lean_args);
-    let batch_args_digest_opt =
-        crate::module_builder::compute_lean_args_digest(&filtered_batch_args);
-
     if let Ok(zreply) = crate::zygote::eval_with_zygote_pool_opts_with_args(
         store,
         toolchain,
@@ -1938,24 +1963,16 @@ fn execute_check_shards_batch_payload_deferred(
         if cached_map.contains_key(&item.shard_key) {
             continue;
         }
-        let mut receipt_obj = serde_json::json!({
+        let receipt_obj = serde_json::json!({
             "decl": item.decl_name,
             "prefix_env_hash": item.prefix_env_hash,
             "stmt_hash": item.stmt_hash,
             "proof_hash": item.proof_hash,
             "verified_at": now
         });
-        if let Some(ref ad) = batch_args_digest_opt {
-            if let Some(map) = receipt_obj.as_object_mut() {
-                map.insert(
-                    "lean_args_digest".to_string(),
-                    serde_json::Value::String(ad.clone()),
-                );
-            }
-        }
-        let receipt = serde_json::to_vec(&receipt_obj)?;
+        let receipt = option_bound_receipt(receipt_obj, batch_args_digest_opt.as_deref())?;
         publish_items.push((
-            item.shard_key.clone(),
+            bound_key(&item.shard_key),
             item.decl_name.clone(),
             receipt,
             per_shard_ms,
@@ -2338,6 +2355,81 @@ fn write_http_response_with_headers(
 #[cfg(test)]
 mod bind_auth_tests {
     use super::*;
+
+    #[test]
+    fn http_cache_identity_tracks_effective_options_single_and_batch() -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("turbo_http_options_{}", crate::pack::next_tmp_id()));
+        let mut store = TurboStore::open(Some(&dir))?;
+        let source = "import Init\ntheorem http_options : 1 + 1 = 2 := by decide\n";
+        let high = vec!["-DmaxHeartbeats=4000000".to_string()];
+        let low = vec!["-DmaxHeartbeats=1".to_string()];
+        let mut single = CheckShardHttpRequest {
+            decl: "http_options".into(),
+            shard_key: "same-single-key".into(),
+            shard_source: source.into(),
+            lean_args: high.clone(),
+            ..Default::default()
+        };
+        let first = execute_check_shard_payload(&mut store, &single)?;
+        assert_eq!(first["status"], "remote_theorem_verified");
+        assert_eq!(
+            execute_check_shard_payload(&mut store, &single)?["status"],
+            "remote_theorem_cache_hit"
+        );
+        single.lean_args = low.clone();
+        if let Ok(result) = execute_check_shard_payload(&mut store, &single) {
+            assert_eq!(result["status"], "remote_theorem_verified");
+        }
+        single.lean_args = vec!["--json".into()];
+        assert!(execute_check_shard_payload(&mut store, &single).is_err());
+
+        let mut batch = CheckShardsBatchRequest {
+            items: vec![crate::pack::CheckShardBatchItem {
+                shard_key: "same-batch-key".into(),
+                decl_name: "http_options".into(),
+                ..Default::default()
+            }],
+            coalesced_shard_source: source.into(),
+            lean_args: high.clone(),
+            ..Default::default()
+        };
+        let (first, publication, hits) =
+            execute_check_shards_batch_payload_deferred(&mut store, &batch)?;
+        assert!(first.ok && first.verified_count == 1 && hits.is_empty());
+        let (tc, domain, entries) = publication.expect("verified batch must publish");
+        store.batch_publish_theorem_shards(&tc, &domain, &entries)?;
+        let (warm, _, _) = execute_check_shards_batch_payload_deferred(&mut store, &batch)?;
+        assert_eq!(warm.cache_hits, 1);
+        batch.lean_args = low;
+        let (second, _, hits) = execute_check_shards_batch_payload_deferred(&mut store, &batch)?;
+        assert_eq!(second.cache_hits, 0);
+        assert!(hits.is_empty());
+        // Partial hit: only the entry verified under the requested options may be pruned.
+        batch.lean_args = high;
+        batch.items.push(crate::pack::CheckShardBatchItem {
+            shard_key: "batch-missing-key".into(),
+            decl_name: "http_options_second".into(),
+            ..Default::default()
+        });
+        batch
+            .coalesced_shard_source
+            .push_str("theorem http_options_second : True := by trivial\n");
+        let (partial, publication, hits) =
+            execute_check_shards_batch_payload_deferred(&mut store, &batch)?;
+        assert!(partial.ok && partial.cache_hits == 1 && partial.verified_count == 1);
+        assert_eq!(hits.len(), 1);
+        let (_, _, entries) = publication.unwrap();
+        assert_eq!(entries.len(), 1);
+        batch.lean_args = vec!["--plugin=unsafe.so".into()];
+        assert!(execute_check_shards_batch_payload_deferred(&mut store, &batch).is_err());
+        assert_eq!(option_bound_http_key("legacy-key", None), "legacy-key");
+        let _ = std::fs::remove_dir_all(dir);
+        Ok(())
+    }
 
     #[test]
     fn loopback_listen_addr_detection_is_exact() {

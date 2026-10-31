@@ -752,7 +752,7 @@ pub(crate) fn compute_shard_key_with_args(
         key_hasher.update(b":axioms:");
         key_hasher.update(allowed.join(",").as_bytes());
     }
-    if let Some(ad) = crate::module_builder::compute_lean_args_digest(lean_args) {
+    if let Some(ad) = crate::module_builder::effective_lean_args_digest(lean_args) {
         key_hasher.update(b":opts:");
         key_hasher.update(ad.as_bytes());
     }
