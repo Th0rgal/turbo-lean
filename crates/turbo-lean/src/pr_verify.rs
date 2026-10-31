@@ -1364,6 +1364,40 @@ pub(crate) fn load_and_classify_pr_from_git(
     load_and_classify_pr_from_git_scoped(store, canon_dir, base_ref, toolchain, None, false, None)
 }
 
+/// Whether any file one of the package's `input_file` / `input_dir` targets selects differs from
+/// `base_ref`, or is new and untracked. Those files reach elaboration through a library's `needs`
+/// without being `.lean` files, so a change must re-verify the project like a lakefile edit would.
+/// A package without file inputs costs nothing here, and a git failure counts as changed.
+///
+/// The git query is scoped to the declared `path`, not to the `filter`, so an edit to a file the
+/// filter excludes also re-verifies: an over-approximation, in the fail-closed direction.
+fn lake_input_files_changed_since_base(
+    repo_root: &Path,
+    proj_prefix: &str,
+    pkg: &crate::module_builder::PackageConfig,
+    base_ref: &str,
+) -> bool {
+    if pkg.inputs.is_empty() {
+        return false;
+    }
+    let paths: Vec<String> = pkg
+        .inputs
+        .iter()
+        .map(|i| join_proj_prefix(proj_prefix, &i.path.to_string_lossy().replace('\\', "/")))
+        .collect();
+    let unchanged = |args: &[&str]| -> bool {
+        Command::new("git")
+            .args(["--no-optional-locks", "-C", &repo_root.to_string_lossy()])
+            .args(args)
+            .arg("--")
+            .args(&paths)
+            .output()
+            .is_ok_and(|out| out.status.success() && out.stdout.trim_ascii().is_empty())
+    };
+    !unchanged(&["diff", "--name-only", base_ref])
+        || !unchanged(&["ls-files", "--others", "--exclude-standard"])
+}
+
 pub(crate) fn load_and_classify_pr_from_git_scoped(
     store: &TurboStore,
     canon_dir: &Path,
@@ -1425,33 +1459,44 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
     let head_cfg_unknown = untrusted_cfg.is_none()
         && owned_pkg_cfg.is_none()
         && (canon_dir.join("lakefile.toml").is_file() || canon_dir.join("lakefile.lean").is_file());
+    // A changed declarative Lake file input (`input_file` / `input_dir` reached through a
+    // library's `needs`) is read during elaboration just like a source file, but it is not a
+    // `.lean` file, so the diff below would ignore it. Treat it like a lakefile edit instead.
+    let lake_inputs_changed = untrusted_cfg
+        .map(|c| &c.root_pkg)
+        .or(owned_pkg_cfg.as_ref())
+        .is_some_and(|pkg| {
+            lake_input_files_changed_since_base(&repo_root, &proj_prefix, pkg, base_ref)
+        });
     let reconfigured = |rel: &str| -> bool {
         rel != "lakefile.lean"
-            && match &base_lake_cfg {
-                BaseLakeConfig::Same => false,
-                _ if head_cfg_unknown => true,
-                BaseLakeConfig::Unknown => true,
-                BaseLakeConfig::Changed(base_pkg) => {
-                    let base_args = base_pkg.as_ref().map_or_else(Vec::new, |pkg| {
-                        crate::module_builder::resolve_file_lean_args_in_package(
-                            pkg,
-                            &canon_dir.join(rel),
-                        )
-                    });
-                    base_args != resolve_rel_lean_args(rel)
-                }
-            }
+            && (lake_inputs_changed
+                || match &base_lake_cfg {
+                    BaseLakeConfig::Same => false,
+                    _ if head_cfg_unknown => true,
+                    BaseLakeConfig::Unknown => true,
+                    BaseLakeConfig::Changed(base_pkg) => {
+                        let base_args = base_pkg.as_ref().map_or_else(Vec::new, |pkg| {
+                            crate::module_builder::resolve_file_lean_args_in_package(
+                                pkg,
+                                &canon_dir.join(rel),
+                            )
+                        });
+                        base_args != resolve_rel_lean_args(rel)
+                    }
+                })
     };
 
     // The head-tree fast path only re-splits stat-changed files, so it is skipped when the
-    // lakefile changed.
-    let head_tree_cache_file = if is_untrusted || !matches!(base_lake_cfg, BaseLakeConfig::Same) {
-        None
-    } else {
-        head_sha_opt
-            .as_ref()
-            .map(|sha| git_head_tree_cache_paths(store, &repo_root, canon_dir, sha, toolchain).0)
-    };
+    // lakefile or one of its file inputs changed.
+    let head_tree_cache_file =
+        if is_untrusted || lake_inputs_changed || !matches!(base_lake_cfg, BaseLakeConfig::Same) {
+            None
+        } else {
+            head_sha_opt.as_ref().map(|sha| {
+                git_head_tree_cache_paths(store, &repo_root, canon_dir, sha, toolchain).0
+            })
+        };
 
     let mut entries_by_rel_path: std::collections::HashMap<String, PrFileEntry> =
         std::collections::HashMap::with_capacity(lean_paths.len());
@@ -2423,6 +2468,7 @@ fn resolve_untrusted_pr_project_config(
         exes: Vec::new(),
         extern_libs: Vec::new(),
         custom_targets: Vec::new(),
+        inputs: Vec::new(),
         config_digest: String::new(),
     };
     Ok(crate::module_builder::ProjectConfig {
@@ -2749,6 +2795,7 @@ pub fn run_ci_verify_command(
         hasher.update(ci_axioms.join(",").as_bytes());
         hasher.update(b"\n");
     }
+    crate::lake_build::update_with_lake_input_digests(&mut hasher, &canon_dir)?;
 
     let mut interface_hasher = blake3::Hasher::new();
     interface_hasher.update(toolchain.as_bytes());
@@ -5900,7 +5947,7 @@ end Fixture
         let dep_h = crate::module_builder::lake_mix_hash(
             crate::module_builder::lake_mix_hash(
                 crate::module_builder::lake_mix_hash(
-                    crate::module_builder::lake_mix_hash(1723, z),
+                    crate::module_builder::lake_mix_hash(crate::module_builder::LAKE_NIL_HASH, z),
                     z,
                 ),
                 z,
@@ -6185,6 +6232,48 @@ end Fixture
                 && changed_files.len() == 1
                 && changed_files["Demo/A.lean"].len() < 512
         );
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_lake_input_dir_edit_reverifies_sources() -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_lake_input_edit_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let repo_dir = tmp_dir.join("repo");
+        fs::create_dir_all(repo_dir.join("Smoke"))?;
+        fs::create_dir_all(repo_dir.join("Data"))?;
+        fs::write(
+            repo_dir.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage demo\ninput_dir smokeSources where\n  path := \"Data\"\n  filter := .extension \"sol\"\n  text := true\nlean_lib Smoke where\n  globs := #[.one `Smoke.A]\n  needs := #[smokeSources]\n",
+        )?;
+        fs::write(
+            repo_dir.join("Smoke/A.lean"),
+            "theorem t_a : 1 + 1 = 2 := by\n  rfl\n",
+        )?;
+        fs::write(repo_dir.join("Data/a.sol"), "contract A {}\n")?;
+        git_init_and_commit(&repo_dir, "init")?;
+
+        let canon_dir = fs::canonicalize(&repo_dir)?;
+        let store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
+        let tc = "leanprover/lean4:v4.35.0";
+        let classify =
+            || load_and_classify_pr_from_git(&store, &canon_dir, "HEAD", tc).map(|(c, _, _, _)| c);
+
+        // Nothing changed: the `.sol` input does not re-verify anything on its own.
+        assert!(classify()?.modified_files.is_empty());
+        // A matched input edit is read by `solidity_import` during elaboration, so the sources of
+        // the library that `needs` it are re-verified even though no `.lean` file changed.
+        fs::write(canon_dir.join("Data/a.sol"), "contract A2 {}\n")?;
+        assert_eq!(classify()?.modified_files, vec!["Smoke/A.lean"]);
+        fs::write(canon_dir.join("Data/a.sol"), "contract A {}\n")?;
+        assert!(classify()?.modified_files.is_empty());
+        // A new, still untracked input file counts too.
+        fs::write(canon_dir.join("Data/b.sol"), "contract B {}\n")?;
+        assert_eq!(classify()?.modified_files, vec!["Smoke/A.lean"]);
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }

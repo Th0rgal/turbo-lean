@@ -1277,6 +1277,37 @@ pub(crate) fn load_project_stat_summary_cached(
     Ok(summary)
 }
 
+/// Folds the root package's `input_file` / `input_dir` digests into a whole-project action key
+/// (`build`, `ci-verify`): those files are read during elaboration, so a changed input must never
+/// reuse a cached whole-project verdict. Unlike the per-module key this ignores `needs`, because a
+/// project-wide action covers every library.
+///
+/// Projects whose Lake config declares no file inputs are not touched at all (their keys stay
+/// byte-identical); a config that does declare them but cannot be resolved statically fails
+/// closed rather than yielding a key that silently drops the inputs.
+pub(crate) fn update_with_lake_input_digests(
+    hasher: &mut blake3::Hasher,
+    project_dir: &Path,
+) -> Result<()> {
+    let declares_inputs = ["lakefile.lean", "lakefile.toml"].iter().any(|f| {
+        std::fs::read_to_string(project_dir.join(f))
+            .is_ok_and(|s| s.contains("input_file") || s.contains("input_dir"))
+    });
+    if !declares_inputs {
+        return Ok(());
+    }
+    let pkg = crate::module_builder::resolve_package_config(project_dir, true).with_context(|| {
+        format!(
+            "Lake config of {} declares file inputs but does not resolve statically: fail-closed static Lake config gate",
+            project_dir.display()
+        )
+    })?;
+    for i in &pkg.inputs {
+        hasher.update(format!("input:{}:{}\n", i.name, i.blake3).as_bytes());
+    }
+    Ok(())
+}
+
 /// Fast-path project interface key computation using the `/dev/shm` project stat summary
 /// so `build` and `ci-verify` cache hits never need to deserialize full `SplitResult` shard arrays.
 pub(crate) fn compute_project_interface_key_fast_summary(
@@ -1312,6 +1343,7 @@ pub(crate) fn compute_project_interface_key_fast_summary(
     hasher.update(b"-");
     hasher.update(std::env::consts::ARCH.as_bytes());
     hasher.update(b"\n");
+    update_with_lake_input_digests(&mut hasher, project_dir)?;
 
     let lean_files = collect_project_lean_files(project_dir, true, None);
     let summary = load_project_stat_summary_cached(store, project_dir, &lean_files)?;
