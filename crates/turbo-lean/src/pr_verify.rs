@@ -2644,18 +2644,19 @@ pub fn run_ci_verify_command(
         "trusted".to_string()
     };
 
-    let untrusted_ci_cfg_and_mods = if is_untrusted {
-        if crate::module_builder::probe_bwrap_sandbox().is_none() {
-            anyhow::bail!(
-                "Untrusted CI verification requires a working bubblewrap (`bwrap`) sandbox: fail-closed sandbox gate"
-            );
-        }
-        let cfg = crate::module_builder::resolve_project_config_with_trust(&canon_dir, true)
-            .context("Untrusted CI static Lake config validation failed")?;
+    if is_untrusted && crate::module_builder::probe_bwrap_sandbox().is_none() {
+        anyhow::bail!(
+            "Untrusted CI verification requires a working bubblewrap (`bwrap`) sandbox: fail-closed sandbox gate"
+        );
+    }
+    // Validate every package before any action lookup. The canonical digest binds
+    // effective options and lakefile contents, including dependency configuration.
+    let cfg = crate::module_builder::resolve_project_config_with_trust(&canon_dir, is_untrusted)
+        .context("CI static Lake config validation failed")?;
+    let untrusted_ci_mods = if is_untrusted {
         let dag = crate::module_builder::build_module_dag_with_trust(&cfg, &[], true)
             .context("Untrusted CI static module DAG validation failed")?;
-        let mod_names: Vec<String> = dag.nodes.keys().cloned().collect();
-        Some((cfg, mod_names))
+        Some(dag.nodes.keys().cloned().collect::<Vec<String>>())
     } else {
         None
     };
@@ -2669,7 +2670,13 @@ pub fn run_ci_verify_command(
     let toolchain = detect_toolchain(&canon_dir);
     let ci_axioms = splitter::allowed_axioms();
     let mut hasher = blake3::Hasher::new();
-    hasher.update(format!("turbo-lean-build-v1\n{}\n{}\n\n", toolchain, trust_domain).as_bytes());
+    hasher.update(
+        format!(
+            "turbo-lean-ci-build-v2\n{}\n{}\n{}\n",
+            toolchain, trust_domain, cfg.canonical_config_digest
+        )
+        .as_bytes(),
+    );
     if ci_axioms.len() > splitter::STANDARD_AXIOMS.len() {
         hasher.update(b":axioms:");
         hasher.update(ci_axioms.join(",").as_bytes());
@@ -2725,9 +2732,8 @@ pub fn run_ci_verify_command(
                     }
                     let src = fs::read_to_string(p)?;
                     let src_blake3 = blake3::hash(src.as_bytes()).to_hex().to_string();
-                    let ci_cfg = untrusted_ci_cfg_and_mods.as_ref().map(|(c, _)| c);
                     let dep_hashes =
-                        compute_source_only_import_digests(&src, &canon_dir, ci_cfg, true)?;
+                        compute_source_only_import_digests(&src, &canon_dir, Some(&cfg), true)?;
                     let split = split_lean_source(&src, &dep_hashes);
                     rows.push((p.clone(), src_blake3, src, split));
                 }
@@ -2794,12 +2800,12 @@ pub fn run_ci_verify_command(
     let mut bwrap_used: Option<bool> = None;
 
     let audit_untrusted_materialized = |store_ref: &TurboStore| -> Result<()> {
-        if let Some((ref cfg, ref mod_names)) = untrusted_ci_cfg_and_mods {
+        if let Some(ref mod_names) = untrusted_ci_mods {
             if !mod_names.is_empty() {
-                let (lp, _ldp) = crate::module_builder::build_lean_search_path(cfg, true);
+                let (lp, _ldp) = crate::module_builder::build_lean_search_path(&cfg, true);
                 if let Err(err) = crate::zygote::audit_compiled_modules_with_zygote(
                     store_ref,
-                    cfg,
+                    &cfg,
                     mod_names,
                     &lp,
                     &[],
@@ -5134,7 +5140,14 @@ mod pr_verify_tests {
         let split = split_lean_source(source, &[]);
         assert!(split.hygiene.is_clean_for_certification());
         let mut hasher = blake3::Hasher::new();
-        hasher.update(format!("turbo-lean-build-v1\n{toolchain}\nuntrusted:ci\n\n").as_bytes());
+        let cfg = crate::module_builder::resolve_project_config(&tree.project)?;
+        hasher.update(
+            format!(
+                "turbo-lean-ci-build-v2\n{toolchain}\nuntrusted:ci\n{}\n",
+                cfg.canonical_config_digest
+            )
+            .as_bytes(),
+        );
         if axioms.len() > splitter::STANDARD_AXIOMS.len() {
             hasher.update(b":axioms:");
             hasher.update(axioms.join(",").as_bytes());
@@ -6175,6 +6188,104 @@ end Fixture
                 && changed_files["Demo/A.lean"].len() < 512
         );
         let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_ci_lakefile_only_edit_rejects_stale_build_and_shard_seeding() -> Result<()> {
+        use crate::worktree_test_support::LakeTree;
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let source = "theorem ident (x : α) : x = x := rfl\n";
+        for kind in ["toml", "lean"] {
+            let tree = LakeTree::new("ci_config", &[("P/A.lean", source)])?;
+            fs::remove_file(tree.project.join("lakefile.toml"))?;
+            let lakefile = tree.project.join(format!("lakefile.{kind}"));
+            let config = |implicit: bool| {
+                if kind == "toml" {
+                    format!("name = \"fixture\"\nmoreLeanArgs = [\"-DautoImplicit={implicit}\"]\n[[lean_lib]]\nname = \"P\"\nglobs = [\"P.+\"]\n")
+                } else {
+                    format!("import Lake\nopen Lake DSL\npackage fixture where\n  moreLeanArgs := #[\"-DautoImplicit={implicit}\"]\nlean_lib P where\n  globs := #[.submodules `P]\n")
+                }
+            };
+            fs::write(&lakefile, config(true))?;
+            let mut store = TurboStore::open(Some(&tree.root.join("cache")))?;
+            let run = |store: &mut TurboStore, seed| {
+                run_ci_verify_command(
+                    store,
+                    true,
+                    "trusted".into(),
+                    tree.project.clone(),
+                    None,
+                    None,
+                    seed,
+                    None,
+                )
+            };
+            let module_keys = |store: &TurboStore| -> Result<Vec<String>> {
+                let mut stmt = store.conn.prepare(
+                    "SELECT action_key FROM actions WHERE kind = 'module_full' AND status = 'completed' ORDER BY action_key")?;
+                let rows = stmt.query_map([], |row| row.get(0))?;
+                Ok(rows.collect::<std::result::Result<_, _>>()?)
+            };
+            run(&mut store, false)?;
+            let warm_keys = module_keys(&store)?;
+            assert_eq!(warm_keys.len(), 1);
+            run(&mut store, false)?;
+            assert_eq!(
+                module_keys(&store)?,
+                warm_keys,
+                "unchanged config must reuse its identity"
+            );
+
+            // Raw lakefile contents also bind the key, even when effective options agree.
+            let comment = if kind == "toml" {
+                "# comment\n"
+            } else {
+                "-- comment\n"
+            };
+            fs::write(&lakefile, format!("{comment}{}", config(true)))?;
+            run(&mut store, false)?;
+            let valid_keys = module_keys(&store)?;
+            assert_eq!(
+                valid_keys.len(),
+                2,
+                "lakefile content digest must bind module_full"
+            );
+
+            // Only the lakefile changes. A cache hit would falsely certify the theorem,
+            // and --seed-shards would publish it into the new option namespace.
+            fs::write(&lakefile, config(false))?;
+            for seed in [false, true] {
+                let err = run(&mut store, seed).unwrap_err();
+                let diagnostic = format!("{err:#}");
+                assert!(
+                    diagnostic.contains("CI native module build failed")
+                        && diagnostic.to_lowercase().contains("unknown identifier")
+                        && diagnostic.contains('α'),
+                    "{kind}, seed={seed}: {diagnostic}"
+                );
+                assert_eq!(
+                    module_keys(&store)?,
+                    valid_keys,
+                    "failed verification published module_full"
+                );
+                let shards: i64 = store.conn.query_row(
+                    "SELECT COUNT(*) FROM actions WHERE kind = 'theorem_shard'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(shards, 0, "failed CI must not seed stale shards");
+                assert_eq!(fs::read_to_string(tree.project.join("P/A.lean"))?, source);
+            }
+
+            // Validation must precede cache lookup in trusted mode, too.
+            fs::write(&lakefile, "invalid [")?;
+            assert!(format!("{:#}", run(&mut store, false).unwrap_err())
+                .contains("CI static Lake config validation failed"));
+        }
         Ok(())
     }
 
