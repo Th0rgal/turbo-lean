@@ -13,7 +13,8 @@ elab "#dump_corpus_theorems" : command => do
     if info matches .thmInfo _ then
       let rec hasTheoremParent : Name → Bool
         | .anonymous => false
-        | n => (env.find? n).any (fun ci => ci matches .thmInfo _) || hasTheoremParent n.getPrefix
+        | .str p s => (env.find? (.str p s)).any (fun ci => ci matches .thmInfo _) || hasTheoremParent p
+        | .num p i => (env.find? (.num p i)).any (fun ci => ci matches .thmInfo _) || hasTheoremParent p
       if (env.getModuleIdxFor? name).isNone && !userName.isInternal &&
           !(env.isProjectionFn name) && !hasTheoremParent name.getPrefix then
         names := names.push userName.toString

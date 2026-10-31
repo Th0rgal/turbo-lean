@@ -71,6 +71,18 @@ fn heavy_check_decl_corpus_stock_lean_verdict_parity() {
                 corpus::diagnostic(&lean),
                 corpus::diagnostic(&turbo)
             );
+            if !valid {
+                let errors = corpus::diagnostic(&turbo).to_lowercase();
+                assert_eq!(
+                    turbo.status.code(),
+                    Some(1),
+                    "mutant must be rejected normally: {errors}"
+                );
+                assert!(
+                    errors.contains("type mismatch"),
+                    "mutant failed without a proof-type diagnostic: {errors}"
+                );
+            }
             if valid {
                 let value: serde_json::Value = serde_json::from_slice(&turbo.stdout)
                     .unwrap_or_else(|_| {

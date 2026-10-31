@@ -53,6 +53,12 @@ section Locals
 
 end Locals
 namespace Nested
+  -- Scoped simp registration persists only while this namespace's scope is open.
+  @[scoped simp] theorem scoped_zero (n : Nat) : n + 0 = n
+-- CORPUS-PROOF Corpus.Commands.Nested.scoped_zero
+:= rfl
+-- CORPUS-END
+
   section
     variable {α : Type} (x : α)
     theorem identity : id x = x 
