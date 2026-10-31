@@ -1,0 +1,43 @@
+Cloning into '/var/lib/sandboxed-node/work/88fd3dc8-2d05-4816-9c09-40950a5c391a/bench/work/source'...
+HEAD is now at 5018b950 Shorten deep import chains: move shared lemmas to lower modules (item 2 of #726) (#770)
+Cloning into '/var/lib/sandboxed-node/work/88fd3dc8-2d05-4816-9c09-40950a5c391a/bench/work/stock'...
+done.
+Note: switching to '5018b9509dc124154dbe08a5bd85862595d8eab7'.
+
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+
+  git switch -c <new-branch-name>
+
+Or undo this operation with:
+
+  git switch -
+
+Turn off this advice by setting config variable advice.detachedHead to false
+
+HEAD is now at 5018b950 Shorten deep import chains: move shared lemmas to lower modules (item 2 of #726) (#770)
+Cloning into '/var/lib/sandboxed-node/work/88fd3dc8-2d05-4816-9c09-40950a5c391a/bench/work/turbo'...
+done.
+Note: switching to '5018b9509dc124154dbe08a5bd85862595d8eab7'.
+
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+
+  git switch -c <new-branch-name>
+
+Or undo this operation with:
+
+  git switch -
+
+Turn off this advice by setting config variable advice.detachedHead to false
+
+HEAD is now at 5018b950 Shorten deep import chains: move shared lemmas to lower modules (item 2 of #726) (#770)
+prime-lake: stock
