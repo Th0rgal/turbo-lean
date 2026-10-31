@@ -3644,7 +3644,7 @@ fn stock_statement_build_with_trust(project: &Path, is_untrusted: bool) -> Resul
     let mut command = statement_lake_command(project, is_untrusted)?;
     command.arg("build");
     let out = crate::module_builder::run_command_with_timeout(
-        command,
+        &mut command,
         std::time::Duration::from_secs(1800),
         is_untrusted,
     )?;
@@ -3688,7 +3688,7 @@ fn stock_statement_build_with_trust(project: &Path, is_untrusted: bool) -> Resul
         let mut command = statement_lake_command(project, is_untrusted)?;
         command.arg("build").args(&lake_targets);
         let out = crate::module_builder::run_command_with_timeout(
-            command,
+            &mut command,
             std::time::Duration::from_secs(1800),
             is_untrusted,
         )?;
@@ -3746,7 +3746,7 @@ fn stock_statement_build_with_trust(project: &Path, is_untrusted: bool) -> Resul
                 .arg("-o")
                 .arg(&output);
             let out = crate::module_builder::run_command_with_timeout(
-                command,
+                &mut command,
                 std::time::Duration::from_secs(1800),
                 is_untrusted,
             )?;
@@ -3827,7 +3827,7 @@ fn built_kernel_statement_report(
             .arg(&helper)
             .args(&batch);
         let out = crate::module_builder::run_command_with_timeout(
-            command,
+            &mut command,
             std::time::Duration::from_secs(600),
             is_untrusted,
         )?;
@@ -5556,7 +5556,7 @@ end Fixture
             let mut command = statement_lake_command(&dir, true)?;
             command.args(["env", "cc", "-c", "fixture.c", "-o", "fixture.o"]);
             let out = crate::module_builder::run_command_with_timeout(
-                command,
+                &mut command,
                 std::time::Duration::from_secs(30),
                 true,
             )?;
