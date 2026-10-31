@@ -315,6 +315,7 @@ fn git_head_tree_cache_paths(
     toolchain: &str,
 ) -> (PathBuf, PathBuf) {
     let mut h = blake3::Hasher::new();
+    // v10: cached entries embed `theorem-shard-v1` keys.
     h.update(b"git-head-tree:v10:");
     h.update(repo_root.to_string_lossy().as_bytes());
     h.update(b":");
@@ -345,8 +346,8 @@ fn git_head_tree_cache_paths(
     let short_key = &key_hex[..24];
     let staging = store.fast_staging_dir();
     (
-        staging.join(format!("git_head_tree_v9_{}.json", short_key)),
-        staging.join(format!("git_head_tree_stats_v9_{}.json", short_key)),
+        staging.join(format!("git_head_tree_v10_{}.json", short_key)),
+        staging.join(format!("git_head_tree_stats_v10_{}.json", short_key)),
     )
 }
 

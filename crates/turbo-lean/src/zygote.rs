@@ -55,7 +55,15 @@ pub struct ZygoteEvalReply {
     pub stderr_tail: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_request: Option<String>,
+    /// `ZYGOTE_SCANNER_VERSION` when the host stderr panic scan vetted this reply; `0` for
+    /// replies from older hosts. Persisted eval replies without the current version are rejected.
+    #[serde(default)]
+    pub scanner_version: u32,
 }
+
+/// Version of the host-side reply vetting (`StderrScan` + `mark_runtime_panic`). Bump whenever
+/// a reply that an older host accepted could now be rejected, so persisted replies are not replayed.
+pub(crate) const ZYGOTE_SCANNER_VERSION: u32 = 1;
 
 /// In-process C-ABI dispatcher for `LeanNative` methods (`"ping"`, `"validate-tv"`,
 /// `"verify-certs"`, `"compile-fastcheck"`, `"eval-cex"`, `"compile-llvm"`, `"compile-ptx"`),
@@ -293,7 +301,17 @@ extern "C" fn cleanup_one_shot() {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Per-test-thread `TURBO_LEAN_NO_DAEMON` (the env var is process-global).
+    static TEST_NO_DAEMON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub(crate) fn daemon_disabled() -> bool {
+    #[cfg(test)]
+    if TEST_NO_DAEMON.with(|c| c.get()) {
+        return true;
+    }
     std::env::var("TURBO_LEAN_NO_DAEMON")
         .ok()
         .and_then(|value| crate::shm_cache::parse_relaxed_bool(&value))
@@ -3233,6 +3251,7 @@ fn eval_with_zygote_pool_inner(
                             .stderr_scan
                             .panicked_since(scan_before, ZYGOTE_STDERR_MARK_WAIT);
                         mark_runtime_panic(&mut parsed, stderr_panic);
+                        parsed.scanner_version = ZYGOTE_SCANNER_VERSION;
                         WorkerReqOutcome::Reply(parsed)
                     }
                     Err(e) => {
@@ -3489,6 +3508,7 @@ fn eval_with_zygote_pool_inner(
             let rss_delta_mb: i64 = replies.iter().map(|r| r.rss_delta_mb).max().unwrap_or(0);
             let peak_rss_mb: u64 = replies.iter().map(|r| r.peak_rss_mb).max().unwrap_or(0);
             let subshards_verified: usize = replies.iter().map(|r| r.subshards_verified).sum();
+            let scanner_version = replies.iter().map(|r| r.scanner_version).min().unwrap_or(0);
             let mut stdout = String::new();
             let mut messages = Vec::new();
             let mut errors = Vec::new();
@@ -3522,6 +3542,7 @@ fn eval_with_zygote_pool_inner(
                 messages,
                 errors,
                 used_constants,
+                scanner_version,
                 timed_out: false,
                 crashed: false,
                 ..Default::default()
@@ -4580,8 +4601,11 @@ fn compute_eval_shm_cache_filename(
     lean_args: &[String],
 ) -> Result<String> {
     let args_digest = crate::module_builder::compute_lean_args_digest(lean_args)?;
+    // v5: v4 (and older) entries were vetted without the stderr panic scan and carry no
+    // `scanner_version`; the scanner version also separates namespaces across scanner bumps.
     let bytes = serde_json::to_vec(&(
-        "eval-shm:v4",
+        "eval-shm:v5",
+        ZYGOTE_SCANNER_VERSION,
         &context.identity,
         file_name,
         caller_cwd,
@@ -4594,8 +4618,13 @@ fn compute_eval_shm_cache_filename(
 
 /// Only successful, import-clean replies may be cached: failures (missing toolchain, import
 /// errors, ...) are environmental and must be re-evaluated rather than replayed forever.
+/// Only replies vetted by the current host scanner are cacheable.
 fn eval_reply_cacheable(rep: &ZygoteEvalReply) -> bool {
-    rep.ok && rep.import_ok && !rep.crashed && !rep.timed_out
+    rep.ok
+        && rep.import_ok
+        && !rep.crashed
+        && !rep.timed_out
+        && rep.scanner_version == ZYGOTE_SCANNER_VERSION
 }
 
 /// Write an eval reply into `eval_shm_cache/` and periodically enforce the `/dev/shm` quota.
@@ -4627,6 +4656,11 @@ fn write_eval_shm_cache(path: &Path, bytes: &[u8]) {
 fn read_cached_eval_shm_reply(path: &Path) -> Option<ZygoteEvalReply> {
     let bytes = fs::read(path).ok()?;
     let mut cached_rep: ZygoteEvalReply = serde_json::from_slice(&bytes).ok()?;
+    // Fail closed on entries without current provenance (older hosts, foreign writers).
+    if !eval_reply_cacheable(&cached_rep) {
+        let _ = fs::remove_file(path);
+        return None;
+    }
     cached_rep.env_cache_hit = true;
     cached_rep.prefix_cache_hit = true;
     cached_rep.import_us = 0;
@@ -4892,7 +4926,9 @@ pub fn try_local_zygote_eval_with_args(
     if let Some(ref rep) = parsed {
         if eval_reply_cacheable(rep) {
             if let Some(ref path) = eval_shm_file {
-                write_eval_shm_cache(path, &resp_bytes);
+                if let Ok(bytes) = serde_json::to_vec(rep) {
+                    write_eval_shm_cache(path, &bytes);
+                }
             }
         }
     }
@@ -5397,6 +5433,8 @@ mod tests {
         let path = cache_dir.join(filename);
         let reply = ZygoteEvalReply {
             ok: true,
+            import_ok: true,
+            scanner_version: ZYGOTE_SCANNER_VERSION,
             stdout: "empty-option-cached-reply".into(),
             ..Default::default()
         };
@@ -6146,9 +6184,15 @@ mod tests {
         let ok = ZygoteEvalReply {
             ok: true,
             import_ok: true,
+            scanner_version: ZYGOTE_SCANNER_VERSION,
             ..Default::default()
         };
         assert!(eval_reply_cacheable(&ok));
+        // Not vetted by the current stderr scanner (pre-upgrade host): never cached or replayed.
+        assert!(!eval_reply_cacheable(&ZygoteEvalReply {
+            scanner_version: 0,
+            ..ok.clone()
+        }));
         // e.g. "toolchain not installed": ok=false and import_ok=false
         assert!(!eval_reply_cacheable(&ZygoteEvalReply {
             ok: false,
@@ -6795,6 +6839,116 @@ mod tests {
             "fresh/healthy worker must succeed after panic shard: {:?}",
             follow
         );
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// Upgrade path: replies cached by hosts without the stderr panic scan — main before #310
+    /// (`eval-shm:v3:`) and main with #305 (`eval-shm:v4`, resolved identity) — for a
+    /// stderr-only tactic panic followed by a successful theorem (`ok=true`) are never replayed.
+    #[test]
+    fn test_pre_scanner_eval_cache_entry_is_never_replayed() {
+        TEST_NO_DAEMON.with(|c| c.set(true));
+        let (tmp_dir, store, env_vars, lean_bin) =
+            open_test_zygote_env("eval_cache_upgrade").expect("Lean v4.35.0 toolchain required");
+        let tc = "leanprover/lean4:v4.35.0";
+        let lp = tmp_dir.to_string_lossy().to_string();
+        let src = format!(
+            "import Lean\nopen Lean Elab Tactic\n-- {}\nelab \"boom\" : tactic => do\n  let n : Nat := panic! \"tacp\"\n  logInfo m!\"{{n}}\"\ntheorem c : True := by boom; trivial\n",
+            next_tmp_id()
+        );
+        let file_name = "UpgradePanic.lean";
+        let caller_cwd = std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string());
+        let (imports_csv, _) = split_shard_for_zygote(&src);
+        // The exact v3 key of main before #310.
+        let v3_name = {
+            let mut h = blake3::Hasher::new();
+            h.update(b"eval-shm:v3:");
+            for part in [
+                tc,
+                &lp,
+                &compute_imported_oleans_digest(&imports_csv, &lp),
+                file_name,
+                caller_cwd.as_deref().unwrap_or(""),
+            ] {
+                h.update(part.as_bytes());
+                h.update(b":");
+            }
+            h.update(src.as_bytes());
+            format!("ev_{}.json", &h.finalize().to_hex()[..24])
+        };
+        let context = resolve_zygote_context(tc, &lp, &env_vars, &lean_bin, &imports_csv);
+        // The exact v4 key of main with #305 (resolved identity, no scanner version).
+        let v4_name = {
+            let args_digest = crate::module_builder::compute_lean_args_digest(&[]).unwrap();
+            let bytes = serde_json::to_vec(&(
+                "eval-shm:v4",
+                &context.identity,
+                file_name,
+                caller_cwd.as_deref(),
+                &src,
+                args_digest,
+            ))
+            .unwrap();
+            format!("ev_{}.json", &blake3::hash(&bytes).to_hex()[..24])
+        };
+        let new_name =
+            compute_eval_shm_cache_filename(&context, file_name, caller_cwd.as_deref(), &src, &[])
+                .unwrap();
+        assert_ne!(v3_name, new_name, "the namespace bump must change the key");
+        assert_ne!(v4_name, new_name, "scanner namespace must change the #305 key");
+        let dir = store.fast_staging_dir().join("eval_shm_cache");
+        fs::create_dir_all(&dir).unwrap();
+        // A pre-scanner (no `scanner_version`) false success, planted at the v3 and v4 keys
+        // and, as a foreign/unversioned writer would, at the new key.
+        let stale = br#"{"ok":true,"kernel_gate_active":false,"import_ok":true,"env_cache_hit":false,"prefix_cache_hit":false,"import_us":1,"prefix_us":0,"elab_us":1,"heartbeats":0,"proof_term_nodes":0,"rss_delta_mb":0,"peak_rss_mb":0,"subshards_verified":1,"stdout":"","messages":[],"errors":[],"used_constants":[],"timed_out":false,"crashed":false}"#;
+        for name in [&v3_name, &v4_name, &new_name] {
+            fs::write(dir.join(name), stale).unwrap();
+        }
+        assert!(read_cached_eval_shm_reply(&dir.join(&v3_name)).is_none());
+        assert!(read_cached_eval_shm_reply(&dir.join(&v4_name)).is_none());
+        fs::write(dir.join(&v4_name), stale).unwrap();
+        fs::write(dir.join(&new_name), stale).unwrap();
+
+        let rep = try_local_zygote_eval_with_args(
+            &store,
+            &env_vars,
+            &lean_bin,
+            tc,
+            &lp,
+            &src,
+            Some(file_name),
+            60_000,
+            &[],
+        )
+        .expect("worker must execute");
+        assert!(
+            !rep.ok && rep.errors.iter().any(|e| e == RUNTIME_PANIC_ERR),
+            "stale cached ok replayed: {rep:?}"
+        );
+        assert_eq!(rep.scanner_version, ZYGOTE_SCANNER_VERSION);
+        assert!(
+            !dir.join(&new_name).exists(),
+            "unversioned entry must be dropped"
+        );
+        // And a scanner-vetted failure is not cached either: the next call executes again.
+        let again = try_local_zygote_eval_with_args(
+            &store,
+            &env_vars,
+            &lean_bin,
+            tc,
+            &lp,
+            &src,
+            Some(file_name),
+            60_000,
+            &[],
+        )
+        .unwrap();
+        assert!(!again.ok && again.errors.iter().any(|e| e == RUNTIME_PANIC_ERR));
+        for name in [&v3_name, &v4_name] {
+            let _ = fs::remove_file(dir.join(name));
+        }
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 
