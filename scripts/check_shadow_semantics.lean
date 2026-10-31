@@ -18,11 +18,12 @@
     declaration's matcher / equation / `_unsafe_rec` / `match_n` auxiliaries. The graph search is
     a 0-1 BFS (auxiliary edges cost 0 hops), hence cycle safe; hop count ≤ 3 → `call≤3`.
   * `clone`: some constant in the target's dependency closure (the target itself, a helper in ANY
-    module / namespace, an `implemented_by` target, an instance, an auxiliary, … — the same graph
-    as above, restricted to non-forbidden definitions) has a canonical body equal to that of a
-    forbidden evaluator; the hit is attributed to the target, with the path as witness.
+    module / namespace, an `opaque` / `partial` / `_unsafe_rec` / theorem body, an `implemented_by`
+    target, an instance, an auxiliary, … — the same graph as above, restricted to non-forbidden
+    constants) has a canonical body equal to that of a forbidden evaluator (or its `_unsafe_rec`);
+    the hit is attributed to the target, with the path as witness.
     Canonicalization (spec [Q3]): delta-unfold ALL matchers (`Lean.Meta.isMatcher`) and the
-    definition's own auxiliaries (`_f`, `_unary`, `_mutual`, `_unsafe_rec`, `match_n`, ...)
+    declaration's own auxiliaries (`_f`, `_unary`, `_mutual`, `_unsafe_rec`, `match_n`, ...)
     regardless of namespace prefix, beta-reduce, instantiate level params positionally, replace
     self references by a placeholder, erase mdata / binder names / binder infos. Scope:
     verbatim / alpha-equivalent copies only; eta-, let- and arm-reordering evasions are out of
@@ -81,7 +82,7 @@ def checkerPath : String := "scripts/check_shadow_semantics.lean"
 /-- Self-test fixture namespaces (compiled only in the `ShadowFixtures` lib). -/
 def fixtureNamespaces : List Name :=
   [`ShadowFixtureDirect, `ShadowFixtureClone, `ShadowFixtureBitVec, `ShadowFixtureAllowlisted,
-   `ShadowFixtureHelperClone, `ShadowFixtureTraversal]
+   `ShadowFixtureHelperClone, `ShadowFixtureOpaqueClone, `ShadowFixtureTraversal]
 
 def fixtureProofPrefix : Name := `ShadowFixtureOrigin
 
@@ -214,7 +215,9 @@ partial def ownerDecl (env : Environment) (n : Name) : Name :=
 /-- Auxiliary constants attached to `c` that must be traversed with `c` (cost 0). -/
 def auxiliariesOf (env : Environment) (c : Name) : List Name := Id.run do
   let mut out := []
-  for s in ["_unsafe_rec", "eq_def", "_unary", "_binary", "_mutual"] do
+  let u := Compiler.mkUnsafeRecName c
+  if u != c && env.contains u then out := u :: out
+  for s in ["eq_def", "_unary", "_binary", "_mutual"] do
     let n := c ++ strName s
     if env.contains n then out := n :: out
   let mut i := 1
@@ -223,6 +226,19 @@ def auxiliariesOf (env : Environment) (c : Name) : List Name := Id.run do
     if env.contains n then out := n :: out; i := i + 1 else i := 65
   if let some impl := Compiler.getImplementedBy? env c then out := impl :: out
   return out
+
+/-- Single body accessor shared by dependency traversal, auxiliary unfolding, and clone
+    canonicalization / enumeration so `.defnInfo`, `.opaqueInfo`, `.thmInfo` (and `_unsafe_rec` /
+    `implemented_by` targets stored under those kinds) cannot drift apart. -/
+def bodyOf? (ci : ConstantInfo) : Option Expr :=
+  match ci with
+  | .defnInfo v => some v.value
+  | .opaqueInfo v => some v.value
+  | .thmInfo v => some v.value
+  | _ => none
+
+def instantiateBodyLevelParams? (ci : ConstantInfo) (us : List Level) : Option Expr :=
+  (bodyOf? ci).map (·.instantiateLevelParams ci.levelParams us)
 
 /-! ## Dependency edges -/
 
@@ -242,10 +258,9 @@ def exprRefs (env : Environment) (e : Expr) : IO (Array Name) := do
 def constRefs (env : Environment) (c : Name) : IO (Array Name) := do
   let some ci := env.find? c | return #[]
   let mut out ← exprRefs env ci.type
+  if let some b := bodyOf? ci then
+    out := out ++ (← exprRefs env b)
   match ci with
-  | .defnInfo v => out := out ++ (← exprRefs env v.value)
-  | .thmInfo v => out := out ++ (← exprRefs env v.value)
-  | .opaqueInfo v => out := out ++ (← exprRefs env v.value)
   | .inductInfo v => out := out ++ v.ctors.toArray ++ v.all.toArray
   | .ctorInfo v => out := out.push v.induct
   | .recInfo v =>
@@ -330,16 +345,24 @@ def reverseSearch (rev : Std.HashMap Name (Array (Name × Nat)))
 
 def selfPlaceholder : Name := `_shadow_self
 
-/-- Unfold matchers and local auxiliaries of `root`, replace self references. -/
+/-- Unfold matchers and local auxiliaries of `root` (and of its owning declaration when `root` is
+    itself `foo._unsafe_rec`), replacing self / owner references by `selfPlaceholder`. -/
 partial def unfoldAux (env : Environment) (root : Name) (fuel : Nat) (e : Expr) : Expr :=
+  let rootUser := userName root
+  let rootOwner := userName (ownerDecl env root)
   e.replace fun sub =>
     match sub with
     | .const n us =>
       let un := userName n
-      if un == userName root then some (.const selfPlaceholder [])
+      if un == rootUser || un == rootOwner then some (.const selfPlaceholder [])
       else if fuel == 0 then none
       else
-        let isLocal := (userName root).isPrefixOf un && isAuxName n
+        -- Do not unfold nested `_unsafe_rec` (e.g. a local `let rec` compiled to a partial
+        -- `foo.bar._unsafe_rec`): unlike `_f`/`_unary`/`_mutual`/matchers, `_unsafe_rec` is
+        -- self-recursive without a structural recursor, so delta-unfolding it loops for `fuel`
+        -- steps and blows up `Core.betaReduce` while never helping non-nested `eval*` matching.
+        let isUnsafeRec := match un with | .str _ "_unsafe_rec" => true | _ => false
+        let isLocal := rootOwner.isPrefixOf un && isAuxName n && !isUnsafeRec
         -- `_sparseCasesOn_k` are matcher-like casesOn wrappers that Lean SHARES across
         -- declarations (e.g. `evalUnaryOp` reuses `evalBinOp._sparseCasesOn_1`), so unfold them
         -- regardless of owner, like matchers.
@@ -347,28 +370,34 @@ partial def unfoldAux (env : Environment) (root : Name) (fuel : Nat) (e : Expr) 
           | .str _ s => s.startsWith "_sparseCasesOn"
           | _ => false
         if isMatcherCore env n || isLocal || isSparse then
-          match env.find? n with
-          | some ci@(.defnInfo _) =>
-            some (unfoldAux env root (fuel - 1) (ci.instantiateValueLevelParams! us))
-          | _ => none
+          match env.find? n >>= (instantiateBodyLevelParams? · us) with
+          | some b => some (unfoldAux env root (fuel - 1) b)
+          | none => none
         else none
     | _ => none
 
-/-- Erase mdata, binder names and binder infos. -/
+/-- Erase mdata, binder names, binder infos, and `letE` `nondep` flags while preserving DAG sharing
+    (beta-reduced unfolded matcher trees share deep continuation subterms). -/
 partial def eraseNames (e : Expr) : Expr :=
-  e.replace fun sub =>
-    match sub with
-    | .mdata _ b => some (eraseNames b)
-    | .lam _ t b _ => some (.lam .anonymous (eraseNames t) (eraseNames b) .default)
-    | .forallE _ t b _ => some (.forallE .anonymous (eraseNames t) (eraseNames b) .default)
-    | .letE _ t v b _ => some (.letE .anonymous (eraseNames t) (eraseNames v) (eraseNames b) false)
-    | _ => none
+  let rec go (x : Expr) : StateM (Std.HashMap Expr Expr) Expr := do
+    if let some r := (← get)[x]? then return r
+    let r ← match x with
+      | .mdata _ b => go b
+      | .lam _ t b _ => pure <| .lam .anonymous (← go t) (← go b) .default
+      | .forallE _ t b _ => pure <| .forallE .anonymous (← go t) (← go b) .default
+      | .letE _ t v b _ => pure <| .letE .anonymous (← go t) (← go v) (← go b) false
+      | .app f a => pure <| x.updateApp! (← go f) (← go a)
+      | .proj _ _ b => pure <| x.updateProj! (← go b)
+      | _ => pure x
+    modify (·.insert x r)
+    return r
+  (go e).run' {}
 
 def canonical (env : Environment) (c : Name) : CoreM (Option Expr) := do
   let some ci := env.find? c | return none
-  let .defnInfo v := ci | return none
-  let lvls := (List.range v.levelParams.length).map fun i => Level.param (strName s!"u_{i}")
-  let body := v.value.instantiateLevelParams v.levelParams lvls
+  let some raw := bodyOf? ci | return none
+  let lvls := (List.range ci.levelParams.length).map fun i => Level.param (strName s!"u_{i}")
+  let body := raw.instantiateLevelParams ci.levelParams lvls
   let body := unfoldAux env c 64 body
   let body ← Core.betaReduce body
   return some (eraseNames body)
@@ -539,22 +568,35 @@ def analyze (env : Environment) (leanDir : System.FilePath) (inv : Inventory) : 
   let mut evalCanon : Array (Name × Expr) := #[]
   let mut anchors : Std.HashSet Name := ({} : Std.HashSet Name).insert `LeanNative.Semantics.Eval
   for f in forbiddenEvals do
-    if let some e ← canonOf f then
-      evalCanon := evalCanon.push (f, e)
-      if let some a := cloneAnchor env e then anchors := anchors.insert a
+    -- Record `f`'s public body (unless `f` is a `partial` declaration whose public `.opaqueInfo`
+    -- holds only Lean's dummy inhabitant proof while the real body is in `f._unsafe_rec`) and
+    -- `f._unsafe_rec` when present (so `partial` / `_unsafe_rec` clones match `f._unsafe_rec`).
+    let fu := Compiler.mkUnsafeRecName f
+    let hasUnsafeRec := fu != f && env.contains fu
+    let isPartialWrapper := (env.find? f matches some (.opaqueInfo _)) && hasUnsafeRec &&
+      !["eq_def", "_sunfold", "_f", "_unary", "_mutual"].any fun s => env.contains (f ++ strName s)
+    let mut reps : Array Name := if isPartialWrapper then #[] else #[f]
+    if hasUnsafeRec then reps := reps.push fu
+    for rep in reps do
+      if let some e ← canonOf rep then
+        unless evalCanon.any (fun (g, ge) => g == f && ge == e) do
+          evalCanon := evalCanon.push (f, e)
+        if let some a := cloneAnchor env e then anchors := anchors.insert a
   let relIdx := importersOf env anchors
-  -- Clone sources: EVERY non-forbidden definition of the relevant modules (not only targets)
-  -- whose canonical body equals a forbidden evaluator's. They are then searched for like the
-  -- evaluator itself, so a clone hidden in a helper outside the pinned modules / namespaces, an
-  -- `implemented_by` target, an instance or an auxiliary is attributed to every target reaching it.
+  -- Clone sources: EVERY non-forbidden body-bearing constant (`bodyOf?`) of the relevant modules
+  -- (plus in-memory constants with `getModuleIdxFor? == none`, such as synthesized `implemented_by`
+  -- fixtures) whose canonical body equals a forbidden evaluator's (or its `_unsafe_rec`). They are
+  -- then searched for like the evaluator itself, so a clone hidden in a helper (`def`, `opaque`,
+  -- `partial` / `_unsafe_rec`, theorem, `implemented_by` target, instance, or auxiliary) outside
+  -- the pinned modules / namespaces is attributed to every target reaching it.
   stage s!"clone canonicalization over {relIdx.size} relevant modules"
   let evalHashes : Std.HashSet UInt64 := evalCanon.foldl (·.insert ·.2.hash) {}
   let mut cloneSrcs : Std.HashMap Name (Array Name) := {}
   for (c, ci) in env.constants.toList do
-    let .defnInfo _ := ci | continue
+    if (bodyOf? ci).isNone then continue
     if isForbidden c then continue
-    let some i := env.getModuleIdxFor? c | continue
-    unless relIdx.contains i.toNat do continue
+    if let some i := env.getModuleIdxFor? c then
+      unless relIdx.contains i.toNat do continue
     let some e ← canonOf c | continue
     unless evalHashes.contains e.hash do continue
     for (f, fe) in evalCanon do
@@ -817,22 +859,26 @@ def ratchetTests (fixtureVs : Array Violation) : IO (Array String) := do
       errs := errs.push s!"ratchet case `{label}`: expected {if expected.isEmpty then "pass" else s!"{expected}"}, got {got.toList}"
   return errs
 
-/-- The `implemented_by` fixture cannot be a source file (the repository hygiene gate rejects
-    the implemented-by attribute everywhere), so it is added to the imported environment here: a real
-    kernel-checked definition whose logical body is `unaryLogical`'s (no forbidden constant) and
-    whose `implemented_by` attribute names `unaryImpl` (which calls `evalUnaryOp`). -/
+/-- The `implemented_by` fixtures cannot be source files (the repository hygiene gate rejects
+    the implemented-by attribute everywhere), so they are added to the imported environment here:
+    1. `ShadowFixtureTraversal.viaImplementedBy`: logical body `unaryLogical`, `implemented_by`
+       `UnrelatedTraversal.unaryImpl` (which calls `evalUnaryOp`).
+    2. `ShadowFixtureOpaqueClone.denoteImplByOpaqueClone`: logical body `unaryLogical`,
+       `implemented_by` `UnrelatedOpaqueUtil.unaryOpaqueCopy` (an `opaque` verbatim clone of
+       `evalUnaryOp` in a module importing only `LeanNative.Semantics.Value`). -/
 def withImplementedByFixture (env : Environment) : IO Environment := do
   let ctx : Core.Context := { fileName := "<shadow-self-test>", fileMap := default,
                               maxHeartbeats := 0, maxRecDepth := 100000 }
   let act : CoreM Environment := do
     let some (.defnInfo v) := (← getEnv).find? `UnrelatedTraversal.unaryLogical
       | throwError "fixture UnrelatedTraversal.unaryLogical missing"
-    let n := `ShadowFixtureTraversal.viaImplementedBy
-    addDecl (.defnDecl { name := n, levelParams := [], type := v.type, value := v.value,
-                         hints := .abbrev, safety := .safe })
-    setImplementedBy n `UnrelatedTraversal.unaryImpl
-    unless Compiler.getImplementedBy? (← getEnv) n == some `UnrelatedTraversal.unaryImpl do
-      throwError "implemented_by not recorded on {n}"
+    for (n, impl) in [(`ShadowFixtureTraversal.viaImplementedBy, `UnrelatedTraversal.unaryImpl),
+                      (`ShadowFixtureOpaqueClone.denoteImplByOpaqueClone, `UnrelatedOpaqueUtil.unaryOpaqueCopy)] do
+      addDecl (.defnDecl { name := n, levelParams := [], type := v.type, value := v.value,
+                           hints := .abbrev, safety := .safe })
+      setImplementedBy n impl
+      unless Compiler.getImplementedBy? (← getEnv) n == some impl do
+        throwError "implemented_by not recorded on {n}"
     getEnv
   let (env', _) ← act.toIO ctx { env }
   return env'
@@ -864,6 +910,35 @@ def selfTest (env : Environment) (leanDir : System.FilePath) : IO (Array String)
     errs := errs.push "fixture helper-clone: expected ShadowFixtureHelperClone.denote → UnrelatedUtil.unaryCopy ≅ evalUnaryOp (clone)"
   if r.violations.any (fun v => (`UnrelatedUtil).isPrefixOf v.target) then
     errs := errs.push "fixture helper-clone: un-inventoried helper must not itself be a target"
+  -- (2c) opaque / partial (`_unsafe_rec`) / implemented_by clones in a helper module importing ONLY
+  --      `LeanNative.Semantics.Value` (never `LeanNative.Semantics.Eval`) → fail with `clone`
+  let opaqueCloneCases : List (Name × Name × Name × String) := [
+    (`ShadowFixtureOpaqueClone.denoteOpaque, `LeanNative.Semantics.evalUnaryOp,
+      `UnrelatedOpaqueUtil.unaryOpaqueCopy, "opaque helper clone"),
+    (`ShadowFixtureOpaqueClone.denotePartialRec, `LeanNative.Semantics.evalVarList,
+      `UnrelatedOpaqueUtil.varListPartialCopy._unsafe_rec, "partial/_unsafe_rec helper clone"),
+    (`ShadowFixtureOpaqueClone.denoteOpaqueRec, `LeanNative.Semantics.evalSeqLoop,
+      `UnrelatedOpaqueUtil.seqLoopOpaqueCopy, "computable recursive opaque helper clone"),
+    (`ShadowFixtureOpaqueClone.denoteNoncompOpaqueRec, `LeanNative.Semantics.evalSeqLoop,
+      `UnrelatedOpaqueUtil.seqLoopNoncompOpaqueCopy, "recursive noncomputable opaque helper clone"),
+    (`ShadowFixtureOpaqueClone.denoteImplByOpaqueClone, `LeanNative.Semantics.evalUnaryOp,
+      `UnrelatedOpaqueUtil.unaryOpaqueCopy, "implemented_by → opaque helper clone")]
+  for (t, f, via, label) in opaqueCloneCases do
+    match r.violations.find? fun v => v.target == t && v.forbidden == f && v.kind == "clone" with
+    | none => errs := errs.push s!"fixture opaque-clone [{label}]: expected {t} → {f} (clone)"
+    | some v =>
+      unless v.path.contains via do
+        errs := errs.push s!"fixture opaque-clone [{label}]: witness {v.path} does not pass through {via}"
+    if r.violations.any (fun v => v.target == t && v.kind != "clone") then
+      errs := errs.push s!"fixture opaque-clone [{label}]: unexpected non-clone violation on {t}"
+  if r.violations.any (fun v => (`UnrelatedOpaqueUtil).isPrefixOf v.target) then
+    errs := errs.push "fixture opaque-clone: un-inventoried helper namespace must not itself be a target"
+  match env.getModuleIdx? `ShadowFixtures.OpaqueCloneLib with
+  | none => errs := errs.push "fixture opaque-clone: ShadowFixtures.OpaqueCloneLib not imported"
+  | some modIdx =>
+    let evalImporters := importersOf env (({} : Std.HashSet Name).insert `LeanNative.Semantics.Eval)
+    if evalImporters.contains modIdx.toNat then
+      errs := errs.push "fixture opaque-clone: OpaqueCloneLib transitively imports LeanNative.Semantics.Eval"
   -- (3) BitVec-only namespace → pass
   if r.violations.any (fun v => (`ShadowFixtureBitVec).isPrefixOf v.target) then
     errs := errs.push "fixture bitvec-only: expected no violation in ShadowFixtureBitVec"
@@ -928,7 +1003,7 @@ def selfTest (env : Environment) (leanDir : System.FilePath) : IO (Array String)
   -- forbidden set sanity: auxiliaries are forbidden
   unless isForbidden `LeanNative.Semantics.evalBinOp.match_1 && !isForbidden `LeanNative.Semantics.Val.toU256? do
     errs := errs.push "forbidden-set predicate wrong"
-  IO.println s!"[self-test] {if errs.isEmpty then "PASS" else "FAIL"}: direct-call, verbatim-clone, helper-clone, bitvec-only, {travel.length} traversal classes, {originExpected.length} shadow-origin stubs, ratchet cases"
+  IO.println s!"[self-test] {if errs.isEmpty then "PASS" else "FAIL"}: direct-call, verbatim-clone, helper-clone, {opaqueCloneCases.length} opaque/partial/impl-by clone cases, bitvec-only, {travel.length} traversal classes, {originExpected.length} shadow-origin stubs, ratchet cases"
   (← IO.getStdout).flush
   return errs
 
@@ -1225,7 +1300,7 @@ unsafe def runWorkerBatch (args : Args) (modsFile outFile : String) : IO UInt32 
   enableInitializersExecution
   let imports := mods.map fun m => ({ module := m } : Import)
   stage s!"worker import #{mods.size} (last: {mods.back?})"
-  let env ← importModules imports {} (loadExts := false)
+  let env ← importModules imports {} (loadExts := true)
   let mut seenMods := #[]
   for m in inv.modules do
     if (env.getModuleIdx? m).isSome then seenMods := seenMods.push m

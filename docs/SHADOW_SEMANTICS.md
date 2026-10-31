@@ -11,10 +11,11 @@ origins for `shadow-origin`).
 - **call≤3 / call∞**: a forbidden constant is reachable from the target in the dependency graph.
   The graph includes types, values, `.proj`, constructors, recursor rules, matcher, equation,
   `_unsafe_rec` and `_proof_n` auxiliaries, `implemented_by` targets and instances.
-- **clone**: some definition in the target's dependency closure, in any module or namespace, has a
-  canonical body equal to a forbidden evaluator's. Detection covers verbatim and alpha-equivalent
-  copies only. Copies that differ by eta-expansion, `let` changes or reordered match arms are out of
-  scope.
+- **clone**: some body-bearing constant in the target's dependency closure, in any module or
+  namespace (`def`, `opaque`, `partial` / `_unsafe_rec`, theorem, `implemented_by` target, instance,
+  or auxiliary — all read through one `bodyOf?` helper), has a canonical body equal to a forbidden
+  evaluator's (or its `_unsafe_rec`). Detection covers verbatim and alpha-equivalent copies only.
+  Copies that differ by eta-expansion, `let` changes or reordered match arms are out of scope.
 - **shadow-origin**: a declaration under a pinned shadow namespace (`ConLeche`, `LCNF`, `LeanMLIR`,
   `LNSym`) is defined outside its pinned grandfather module (`TurboLean.ConLeche`,
   `LeanNative.IR.LCNF`, `LeanNative.Backend.Semantics`), or a declaration inside

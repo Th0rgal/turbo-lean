@@ -3,5 +3,6 @@ import ShadowFixtures.VerbatimClone
 import ShadowFixtures.BitVecOnly
 import ShadowFixtures.AllowlistedSecond
 import ShadowFixtures.HelperClone
+import ShadowFixtures.OpaqueClone
 import ShadowFixtures.Traversal
 import ShadowFixtures.ShadowNamespaceStubs
