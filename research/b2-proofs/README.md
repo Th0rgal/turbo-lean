@@ -31,8 +31,9 @@ lake build +FV.E2E.FinalDirect > /tmp/b2-final-cone.log 2>&1 &
 `decide +kernel` runs decision reduction in Lean's kernel; it is not
 `native_decide`. The smoke tests are examples. `B2.CollatzClif.source_simulation` proves
 all-input simulation for collatz_steps through the real CLIF entry/run;
-`B2.RunSafety.collatz_prefix` excludes trapped/stuck outcomes at every fuel.
-Backend composition is still open. See `../B2-status.md`.
+`B2.BackendEntry.traps_explicit` proves the exact upstream reachable-safety
+contract. `B2.BackendLower`, `B2.BackendAlloc`, and `B2.Artifacts` certify
+the concrete pipeline through binary layout. Backend composition is still open. See `../B2-status.md`.
 
 Compiler integration (Lean 4.35.0) uses the same lowerDecl definition:
 

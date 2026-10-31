@@ -8,6 +8,8 @@ import B2.CollatzClif
 import B2.RunSafety
 import B2.CallFree
 import B2.BackendLower
+import B2.BackendAlloc
+import B2.Artifacts
 import B2.BackendEntry
 
 /-! A build-failing transitive axiom audit of the results claimed by B2-status.md.
@@ -41,6 +43,9 @@ run_cmd do
         ``B2.RunSafety.of_returned, ``B2.Artifacts.input_eq,
         ``B2.Artifacts.verifiable, ``B2.Artifacts.lower,
         ``B2.BackendEval.runTerm_of_apply,
+        ``B2.Artifacts.prepared, ``B2.Artifacts.spill_alloc,
+        ``B2.Artifacts.allocation_checked, ``B2.Artifacts.allocated,
+        ``B2.Artifacts.emitted, ``B2.Artifacts.laid_out,
         ``B2.BackendEntry.entry_eq, ``B2.BackendEntry.returns,
         ``B2.BackendEntry.reachable_step_safe, ``B2.BackendEntry.traps_explicit] do
       let axs ← Lean.collectAxioms name
