@@ -2500,6 +2500,48 @@ open LeanNative.IR LeanNative.Proofs
   let loopDropBad := validateTranslationDecl (mkLoopLinearChainDecl true) (mkLoopLinearChainDecl false) 8
   unless !loopDropBad.memWritesEquiv && !loopDropBad.passed do
     throw <| IO.userError s!"seqFor loop missing decRef on prior iteration allocation accepted: {reprStr loopDropBad}"
+  let mkLoopConditionalSafetyDecl (corruptAt999 : Bool) : LNIRDecl := {
+    name := "loop_conditional_safety"
+    params := [
+      { id := 0, name := "y", ty := .u256, borrow := false },
+      { id := 1, name := "z", ty := .u256, borrow := false },
+      { id := 2, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 3 .i64 (.scalar (.constU64 0))
+        (.letBind 4 .i64 (.scalar (.constU64 4))
+          (.seqFor 5 3 4 6 3 .i64
+            (.letBind 7 .u256 (.scalar (.binOp .div (.var 0) (.var 1)))
+              (.letBind 8 .i64 (.scalar (.constU64 0)) (.ret 8)))
+            (.letBind 9 .i64 (.scalar
+              (if corruptAt999 then .select (.binOp .eq (.var 2) (.constU64 999)) (.constU64 1) (.constU64 0)
+               else .constU64 0)) (.ret 9))))
+  }
+  let loopCondBad := validateTranslationDecl (mkLoopConditionalSafetyDecl false) (mkLoopConditionalSafetyDecl true) 8
+  unless !loopCondBad.symRetEquiv && !loopCondBad.passed do
+    throw <| IO.userError s!"seqFor accumulator binding collapsed conditional loop safety ubCond: {reprStr loopCondBad}"
+  unless (validateTranslationDecl (mkLoopConditionalSafetyDecl false) (mkLoopConditionalSafetyDecl false) 8).passed do
+    throw <| IO.userError "equivalent seqFor conditional-safety declaration rejected"
+  let mkUncondAfterUnprovenLiveDecl (addTargetDivZero : Bool) : LNIRDecl := {
+    name := "uncond_after_unproven_live"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "y", ty := .u256, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      if addTargetDivZero then
+        .letBind 2 .i1 (.isExclusive 0)
+          (.letBind 3 .u256 (.constU256 UInt256.zero)
+            (.letBind 4 .u256 (.scalar (.binOp .div (.var 1) (.var 3)))
+              (.letBind 5 .i64 (.scalar (.constU64 0)) (.ret 5))))
+      else
+        .letBind 5 .i64 (.scalar (.constU64 0)) (.ret 5)
+  }
+  let uncondLiveBad := validateTranslationDecl (mkUncondAfterUnprovenLiveDecl false) (mkUncondAfterUnprovenLiveDecl true) 8
+  unless !uncondLiveBad.ubRefines && !uncondLiveBad.passed do
+    throw <| IO.userError s!"unproven liveness failed to clear unconditional noUB: {reprStr uncondLiveBad}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)

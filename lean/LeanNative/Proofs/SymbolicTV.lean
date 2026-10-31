@@ -1626,7 +1626,9 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
             | some 1 => stClear.markU64Var dst
             | some 2 => stClear.markU256Var dst
             | _ => stClear
-        st'.bindVar dst { expr := fExpr, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
+        let stBound := st'.bindVar dst { expr := fExpr, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
+        { stBound with noUB := stBound.noUB && st.liveRcCond rootVar == .constBool true &&
+            (stLive.allocRoots.contains rootVar || stBounds.ubCond == .constBool true) }
       | none => stBounds.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
     | .symVar rootId =>
       if !(st.objPtrVars.contains rootVar || st.allocRoots.contains rootVar ||
@@ -1642,7 +1644,8 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
         let stBounds := stLive.requireUbCond (.binOp .lt (.constU64 idx.toUInt64) (.ctorLen stLive.heapStepEpoch effRoot))
         let fieldRoot := SymExecState.projFieldRootId stBounds.synVarBase stBounds.heapStepEpoch effRoot idx
         let stBase := (stBounds.noteExtLiveRoot effRoot).noteExtRoot fieldRoot
-        (stBase.aliasBuf dst fieldRoot).bindVar dst { expr := .symVar fieldRoot, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
+        let stBound := (stBase.aliasBuf dst fieldRoot).bindVar dst { expr := .symVar fieldRoot, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
+        { stBound with noUB := false }
     | .constU64 _ | .constU256 _ | .constBool _ | .unit =>
       -- Projecting a constructor field from an immediate scalar is concrete UB (`typeError`)!
       stLive.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
@@ -1658,12 +1661,14 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
     else if st.isNeverScalarRef rootVar then
       let stNoted := st.noteExtRoot rootVar
       let liveOk := stNoted.isBufLive rootVar
-      let stLive := ((stNoted.requireUbCond (stNoted.liveRcCond rootVar)).noteExtLiveRoot rootVar).markBoolVar dst
+      let liveC := stNoted.liveRcCond rootVar
+      let stLive := ((stNoted.requireUbCond liveC).noteExtLiveRoot rootVar).markBoolVar dst
       let exclExpr : SymExpr :=
         if stLive.isBufExclusive rootVar then .constBool true
         else normSymBinOpStep .eq (stLive.lookupRcExpr rootVar) (.constU64 1)
       let cv := stLive.lookupVar rootVar
-      stLive.bindVar dst { expr := exclExpr, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
+      let stBound := stLive.bindVar dst { expr := exclExpr, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
+      { stBound with noUB := stBound.noUB && liveC == .constBool true }
     else
       (stOut.markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
   | .sarrayLen arrVar =>
@@ -1675,8 +1680,10 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
        st.objPtrVars.contains root || st.allocRoots.contains root then
       stOut.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
     else
-      let stLive := (((st.noteExtRoot root).requireUbCond (st.liveRcCond root)).noteExtLiveRoot root).markU64Var dst
-      stLive.bindVar dst { expr := .sarrayLen root, nonPoison := sa.nonPoison, noUB := sa.noUB }
+      let liveC := st.liveRcCond root
+      let stLive := (((st.noteExtRoot root).requireUbCond liveC).noteExtLiveRoot root).markU64Var dst
+      let stBound := stLive.bindVar dst { expr := .sarrayLen root, nonPoison := sa.nonPoison, noUB := sa.noUB }
+      { stBound with noUB := stBound.noUB && liveC == .constBool true }
   | .sarrayDataPtr arrVar _elemTy =>
     let root := st.resolveBuf arrVar
     let arrSv := st.lookupVar arrVar
@@ -1752,8 +1759,10 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
            st.objPtrVars.contains root || st.allocRoots.contains root then
           stOut.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
         else
-          let stLive := (((st.noteExtRoot root).requireUbCond (st.liveRcCond root)).noteExtLiveRoot root).markU64Var dst
-          stLive.bindVar dst { expr := .sarrayLen root, nonPoison := sa.nonPoison, noUB := sa.noUB }
+          let liveC := st.liveRcCond root
+          let stLive := (((st.noteExtRoot root).requireUbCond liveC).noteExtLiveRoot root).markU64Var dst
+          let stBound := stLive.bindVar dst { expr := .sarrayLen root, nonPoison := sa.nonPoison, noUB := sa.noUB }
+          { stBound with noUB := stBound.noUB && liveC == .constBool true }
       else if fnName == "lean_native_ctor_tag" && i64Ret then
         let root := st.resolveBuf a
         let sa0 := st.lookupVar root
@@ -1791,18 +1800,22 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
                 (stOut.markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
             else
               let liveOk := st.isBufLive root
-              let stLive := ((st.requireUbCond (st.liveRcCond root)).noteExtLiveRoot root).markU64Var dst
+              let liveC := st.liveRcCond root
+              let stLive := ((st.requireUbCond liveC).noteExtLiveRoot root).markU64Var dst
               let sa := stLive.lookupVar root
-              stLive.bindVar dst { expr := tag, nonPoison := sa.nonPoison && liveOk, noUB := sa.noUB && liveOk }
+              let stBound := stLive.bindVar dst { expr := tag, nonPoison := sa.nonPoison && liveOk, noUB := sa.noUB && liveOk }
+              { stBound with noUB := stBound.noUB && liveC == .constBool true }
           | .symVar rootId =>
             if st.objPtrVars.contains root || st.allocRoots.contains root ||
                (st.refCounts.lookup root).isSome || (st.rcExprs.lookup root).isSome ||
                st.exclusiveBufs.contains root then
               let liveOk := st.isBufLive root
-              let stLive := ((st.requireUbCond (st.liveRcCond root)).noteExtLiveRoot root).markU64Var dst
+              let liveC := st.liveRcCond root
+              let stLive := ((st.requireUbCond liveC).noteExtLiveRoot root).markU64Var dst
               let sa := stLive.lookupVar root
               let eff := stLive.resolveBuf rootId
-              stLive.bindVar dst { expr := .ctorTag stLive.heapStepEpoch eff, nonPoison := sa.nonPoison && liveOk, noUB := sa.noUB && liveOk }
+              let stBound := stLive.bindVar dst { expr := .ctorTag stLive.heapStepEpoch eff, nonPoison := sa.nonPoison && liveOk, noUB := sa.noUB && liveOk }
+              { stBound with noUB := stBound.noUB && liveC == .constBool true }
             else
               -- `.taggedPtr` or untyped projected child may hold an immediate scalar tag or a heap `.objPtr`!
               (stOut.markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
@@ -1921,6 +1934,8 @@ def symExecLoopUnroll (unrollCount : Nat) (curIdx : Nat) (idxVar accVar : VarId)
     let stIdx := st.bindVar idxVar { expr := .constU64 curIdx.toUInt64, nonPoison := true, noUB := true }
     let (stAfter, retExpr) := execBody stIdx
     let normRet := normSymExpr retExpr
+    let stepDefinitelyUB := normSymExpr stAfter.ubCond == .constBool false
+    let accValNoUB := !stepDefinitelyUB
     let stCleared := stAfter.clearVarSortTags accVar
     let stNext :=
       match normRet with
@@ -1939,20 +1954,23 @@ def symExecLoopUnroll (unrollCount : Nat) (curIdx : Nat) (idxVar accVar : VarId)
             | _ => stAlias
         if accVar == eff then
           { stSort with
-              noUB := stSort.noUB && stAfter.noUB
+              ubCond := if stepDefinitelyUB then .constBool false else stSort.ubCond
+              noUB := stSort.noUB && stAfter.noUB && accValNoUB
               nonPoison := stSort.nonPoison && stAfter.nonPoison }
         else
-          stSort.bindVar accVar {
+          let stB := stSort.bindVar accVar {
             expr := normRet
             nonPoison := stAfter.nonPoison
-            noUB := stAfter.noUB
+            noUB := accValNoUB
           }
+          { stB with ubCond := stAfter.ubCond, noUB := stB.noUB && stAfter.noUB }
       | .tuple _ =>
-        ((stCleared.clearAlias accVar).markTypedTuple accVar).bindVar accVar {
+        let stB := ((stCleared.clearAlias accVar).markTypedTuple accVar).bindVar accVar {
           expr := normRet
           nonPoison := stAfter.nonPoison
-          noUB := stAfter.noUB
+          noUB := accValNoUB
         }
+        { stB with ubCond := stAfter.ubCond, noUB := stB.noUB && stAfter.noUB }
       | _ =>
         if symExprMentionsHeapRoot stCleared normRet then
           ((stCleared.clearAlias accVar).markUnsupported).bindVar accVar {
@@ -1967,11 +1985,12 @@ def symExecLoopUnroll (unrollCount : Nat) (curIdx : Nat) (idxVar accVar : VarId)
             | some 1 => (stCleared.clearAlias accVar).markU64Var accVar
             | some 2 => (stCleared.clearAlias accVar).markU256Var accVar
             | _ => stCleared.clearAlias accVar
-          stSort.bindVar accVar {
+          let stB := stSort.bindVar accVar {
             expr := normRet
             nonPoison := stAfter.nonPoison
-            noUB := stAfter.noUB
+            noUB := accValNoUB
           }
+          { stB with ubCond := stAfter.ubCond, noUB := stB.noUB && stAfter.noUB }
     symExecLoopUnroll n (curIdx + 1) idxVar accVar stNext execBody
 
 /-- Fuel-bounded symbolic execution of `LNIRCode` (`expandRetHeap = true` at declaration exit,
@@ -2413,7 +2432,9 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
     | .parFor outVar _lenVar inputs _elemTy _kernel k =>
       let stInputs := inputs.foldl (fun cur iv =>
         let r := cur.resolveBuf iv
-        ((cur.noteExtRoot r).requireUbCond (cur.liveRcCond r)).noteExtLiveRoot r) st
+        let liveC := cur.liveRcCond r
+        let c1 := ((cur.noteExtRoot r).requireUbCond liveC).noteExtLiveRoot r
+        { c1 with noUB := c1.noUB && liveC == .constBool true }) st
       let allocId := SymExecState.dynAllocRootId stInputs.synVarBase stInputs.nextDynAllocIdx
       let st0 := { stInputs with nextDynAllocIdx := stInputs.nextDynAllocIdx + 1 }
       let st1 := (st0.markAllocated allocId).markSarrayVar allocId
