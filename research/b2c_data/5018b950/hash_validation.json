@@ -1,0 +1,68 @@
+{
+  "commit": "5018b9509dc124154dbe08a5bd85862595d8eab7",
+  "previous_commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+  "hash_validation": "passed",
+  "checkpoint_scope": "C20 closed extraction and logical constant hashes only; kernel coverage/timings not yet certified",
+  "rows": 300874,
+  "modules": 2705,
+  "FV_modules": 349,
+  "FV_rows": 92664,
+  "all_requested_targets_present": true,
+  "FV_import_cone_complete": true,
+  "module_row_counts_match": true,
+  "repeated_name_imported_bindings_verified": 1295,
+  "different_IF_input_names": {
+    "Backend.Proof.Driver.pre.eq_1": "FV.Backend.Proof.LowerSim",
+    "Backend.Proof.add_ofNat_add": "FV.E2E.RegLevelPush",
+    "Backend.Proof.add_ofNat_ne": "FV.E2E.RegLevelPush"
+  },
+  "common_non_FV_rows_checked": 208210,
+  "common_non_FV_IF_and_constant_K_unchanged": true,
+  "common_rows": 300810,
+  "new_rows": 64,
+  "removed_rows": 9465,
+  "common_rows_with_changed_IF": 4,
+  "common_rows_with_changed_constant_K": 15,
+  "common_rows_with_changed_kind": 0,
+  "changed_module_interfaces": [
+    "FV.Backend.Proof.IselCtlCallRules",
+    "FV.Backend.Proof.IselTermFactsRules",
+    "FV.Backend.Proof.LowerLoop",
+    "FV.Backend.Proof.LowerLoopCtx",
+    "FV.Backend.Proof.SpillCtlForms",
+    "FV.Backend.Proof.SpillLocalForms",
+    "FV.E2E.RegLevelPush"
+  ],
+  "new_cone_modules": [
+    "FV.Backend.Proof.IselCtlRuleIds",
+    "FV.Backend.Proof.KillTermIds"
+  ],
+  "removed_cone_modules": [
+    "FV.Backend.Proof.FormsCoverComplete",
+    "FV.Backend.Proof.IselCovCall",
+    "FV.Backend.Proof.IselCovDriver",
+    "FV.Backend.Proof.IselCovModel",
+    "FV.Backend.Proof.IselCtl",
+    "FV.Backend.Proof.IselCtlCallInd",
+    "FV.Backend.Proof.IselShpBase",
+    "FV.Backend.Proof.IselShpFns",
+    "FV.Backend.Proof.IselShpOracle",
+    "FV.Backend.Proof.KillGen",
+    "FV.Backend.Proof.KillTab",
+    "FV.Backend.Proof.LogicImmComplete",
+    "FV.Backend.Proof.LowerDecide",
+    "FV.Backend.Proof.PrepareSound",
+    "FV.Backend.Proof.SpillLocalPipe",
+    "FV.Backend.Proof.TermSetRoots"
+  ],
+  "changed_direct_import_lists": [
+    "FV.Backend.Proof.DefGenTab",
+    "FV.Backend.Proof.IselTermFactsCall",
+    "FV.Backend.Proof.IselTermFactsRules",
+    "FV.Backend.Proof.KillCtor",
+    "FV.Backend.Proof.LowerCertBase",
+    "FV.Backend.Proof.SpillCtlForms",
+    "FV.Backend.Proof.SpillCtlPipe"
+  ],
+  "constant_rows_digest": "d543688c7b1d83d7c2b3bf78cd62c1c2eb144dc56a2725fd503c68c0ae51cf8b"
+}

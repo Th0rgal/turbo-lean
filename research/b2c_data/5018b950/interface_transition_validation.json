@@ -1,0 +1,116 @@
+{
+  "commit": "5018b9509dc124154dbe08a5bd85862595d8eab7",
+  "previous_commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+  "interface_transition_validation": "passed",
+  "scope": "C20 closed build and elaborated-interface cutoff only; current kernel timings and final aggregate excluded",
+  "direct_import_and_propagated_cutoff_agree": true,
+  "dependency_first_module_order_verified": true,
+  "build_config_paths_changed": [],
+  "actually_rebuilt_modules": 29,
+  "dependent_rebuilt_modules": [
+    "FV.Backend.Proof.DefGenDom",
+    "FV.Backend.Proof.DefGenOfV",
+    "FV.Backend.Proof.DefGenPat",
+    "FV.Backend.Proof.DefGenSem",
+    "FV.Backend.Proof.DefGenSound",
+    "FV.Backend.Proof.DefRuns",
+    "FV.Backend.Proof.IselCovClean",
+    "FV.Backend.Proof.IselTermFacts",
+    "FV.Backend.Proof.KillBase",
+    "FV.Backend.Proof.KillOfV",
+    "FV.Backend.Proof.LowerCert",
+    "FV.Backend.Proof.LowerComplete",
+    "FV.Backend.Proof.LowerCover",
+    "FV.Backend.Proof.LowerLoopPrep",
+    "FV.Backend.Proof.LowerLoopRun",
+    "FV.Backend.Proof.LowerLoopSim",
+    "FV.Backend.Proof.LowerShapeOk"
+  ],
+  "cutoff_avoidable_modules": [
+    "FV.Backend.Proof.DefGenDom",
+    "FV.Backend.Proof.DefGenOfV",
+    "FV.Backend.Proof.DefGenPat",
+    "FV.Backend.Proof.DefGenSem",
+    "FV.Backend.Proof.DefGenSound",
+    "FV.Backend.Proof.DefRuns",
+    "FV.Backend.Proof.KillBase",
+    "FV.Backend.Proof.KillOfV",
+    "FV.Backend.Proof.LowerComplete",
+    "FV.Backend.Proof.LowerCover",
+    "FV.Backend.Proof.LowerLoopPrep",
+    "FV.Backend.Proof.LowerLoopSim"
+  ],
+  "cutoff_avoidable_module_count": 12,
+  "dependent_rebuild_elapsed_seconds": 90.69059508363716,
+  "cutoff_avoidable_elapsed_seconds": 27.47700642584823,
+  "cutoff_avoidable_build_cpu_seconds": 46.541983,
+  "share_of_dependent_rebuild_elapsed": 0.30297525780383555,
+  "share_of_total_build_cpu": 0.03463601578039538,
+  "unmodeled_interface_invalidations": [
+    "FV.Backend.Proof.IselCtlCallRules",
+    "FV.E2E.RegLevelPush"
+  ],
+  "top_20_by_eligible_elapsed": [
+    {
+      "module": "FV.Backend.Proof.DefGenOfV",
+      "elapsed_seconds": 10.769912999938242,
+      "cpu_seconds": 17.254168
+    },
+    {
+      "module": "FV.Backend.Proof.KillOfV",
+      "elapsed_seconds": 5.101977926911786,
+      "cpu_seconds": 11.364248
+    },
+    {
+      "module": "FV.Backend.Proof.DefGenSem",
+      "elapsed_seconds": 2.2055703699588776,
+      "cpu_seconds": 4.177434
+    },
+    {
+      "module": "FV.Backend.Proof.DefGenDom",
+      "elapsed_seconds": 1.4059653870062903,
+      "cpu_seconds": 1.798493
+    },
+    {
+      "module": "FV.Backend.Proof.DefGenPat",
+      "elapsed_seconds": 1.2814577430253848,
+      "cpu_seconds": 2.411532
+    },
+    {
+      "module": "FV.Backend.Proof.LowerLoopSim",
+      "elapsed_seconds": 1.267540890024975,
+      "cpu_seconds": 2.095885
+    },
+    {
+      "module": "FV.Backend.Proof.LowerComplete",
+      "elapsed_seconds": 1.1517543450463563,
+      "cpu_seconds": 2.0575859999999997
+    },
+    {
+      "module": "FV.Backend.Proof.LowerLoopPrep",
+      "elapsed_seconds": 1.0102595860371366,
+      "cpu_seconds": 1.5885799999999999
+    },
+    {
+      "module": "FV.Backend.Proof.DefGenSound",
+      "elapsed_seconds": 0.9923552519176155,
+      "cpu_seconds": 1.2122579999999998
+    },
+    {
+      "module": "FV.Backend.Proof.LowerCover",
+      "elapsed_seconds": 0.8576648730086163,
+      "cpu_seconds": 1.0989959999999999
+    },
+    {
+      "module": "FV.Backend.Proof.KillBase",
+      "elapsed_seconds": 0.7380531689850613,
+      "cpu_seconds": 0.778467
+    },
+    {
+      "module": "FV.Backend.Proof.DefRuns",
+      "elapsed_seconds": 0.6944938839878887,
+      "cpu_seconds": 0.704336
+    }
+  ],
+  "interpretation": "Diagnostic direct-import/own-constant IF counterfactual; nonconstant elaborator state and transitive visibility require further modeling."
+}

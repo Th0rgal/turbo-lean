@@ -1,0 +1,14 @@
+{
+  "constants_scanned": 300874,
+  "duplicate_occurrences": 3123,
+  "event": "duplicate_name_coverage",
+  "modules_scanned": 2705,
+  "duplicate_names": 1295,
+  "different_IF_input_names": {
+    "Backend.Proof.Driver.pre.eq_1": "FV.Backend.Proof.LowerSim",
+    "Backend.Proof.add_ofNat_add": "FV.E2E.RegLevelPush",
+    "Backend.Proof.add_ofNat_ne": "FV.E2E.RegLevelPush"
+  },
+  "imported_bindings_verified": 1295,
+  "interface_graph": "IF-v2-canonical-lookups"
+}
