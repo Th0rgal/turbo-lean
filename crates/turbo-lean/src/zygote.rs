@@ -1056,26 +1056,34 @@ fn private_shared_zygote_dir_in(base: &Path) -> Option<PathBuf> {
     let uid = unsafe { libc::geteuid() };
     #[cfg(not(unix))]
     let uid = 0u32;
-    let dir = base.join(format!("turbo_lean_shared_zygote_bins_{uid}"));
     #[cfg(unix)]
-    {
+    let dir = {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-        // Another user must not be able to rename/replace our dir: the parent may only be
+        // Another user must not be able to rename/replace our dir anywhere up the resolved
+        // hierarchy: every ancestor must be owned by root or us and may only be
         // group/other-writable when sticky (like the default /tmp).
-        let Ok(pm) = fs::metadata(base) else {
-            return None;
-        };
-        if pm.mode() & 0o022 != 0 && pm.mode() & 0o1000 == 0 {
-            return None;
+        let base = fs::canonicalize(base).ok()?;
+        for anc in base.ancestors() {
+            let pm = fs::metadata(anc).ok()?;
+            let writable_by_others = pm.mode() & 0o022 != 0 && pm.mode() & 0o1000 == 0;
+            if writable_by_others || (pm.uid() != 0 && pm.uid() != uid) {
+                return None;
+            }
         }
+        let dir = base.join(format!("turbo_lean_shared_zygote_bins_{uid}"));
         match fs::DirBuilder::new().mode(0o700).create(&dir) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(_) => return None,
         }
-    }
+        dir
+    };
     #[cfg(not(unix))]
-    let _ = fs::create_dir_all(&dir);
+    let dir = {
+        let dir = base.join(format!("turbo_lean_shared_zygote_bins_{uid}"));
+        let _ = fs::create_dir_all(&dir);
+        dir
+    };
     owned_private_entry(&dir, true).then_some(dir)
 }
 
