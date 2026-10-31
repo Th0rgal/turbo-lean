@@ -1,0 +1,23 @@
+{
+  "commit": "f889e936b807d151b9625bdeb44872f578d89f99",
+  "previous_commit": "719f226f5b401c150a8dfe764c7579f14af5e9b2",
+  "build_validation": "passed",
+  "scope": "C9 measured incremental build and source snapshot only; extraction/hash/replay not certified",
+  "actually_rebuilt_modules": 0,
+  "module_cpu_seconds": 0,
+  "module_elapsed_seconds": 0,
+  "tree_cpu_seconds": 0.29663900000048216,
+  "wall_seconds": 0.4290115999756381,
+  "current_FV_source_files": 4486,
+  "current_source_snapshot_verified": true,
+  "unchanged_preceding_cone_source_modules": 386,
+  "changed_FV_sources_outside_preceding_cone": [],
+  "added_FV_sources_outside_preceding_cone": [],
+  "removed_FV_sources_outside_preceding_cone": [],
+  "build_config_paths_changed": [],
+  "raw_module_timings_empty": true,
+  "build_log_success_verified": true,
+  "sampled_peak_tree_RSS_bytes": 65929216,
+  "oom_kill": 0,
+  "note": "The measured build is a successful no-op. Changed and new FV files lie outside the preceding measured cone. Full-cone replay is not incremental savings."
+}
