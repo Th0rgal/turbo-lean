@@ -1,7 +1,7 @@
 # B2 status
 
 Baseline: `5508b9f`; clifv `5018b9509dc124154dbe08a5bd85862595d8eab7`.
-Checkpoint: 2026-10-31 21:03 UTC. The executable lowering lives in
+Checkpoint: 2026-10-31 21:20 UTC. The executable lowering lives in
 `lean/LeanNative/Backend/Clif.lean`; `compile-clif` calls that definition.
 The active root and strict transitive axiom audit pass kernel checks on Lean 4.34.1.
 
@@ -12,8 +12,8 @@ The active root and strict transitive axiom audit pass kernel checks on Lean 4.3
 | O3 simulation | PROVED (collatz_steps) | `B2.CollatzClif.source_simulation` connects the actual LNIR evaluator to `Clif.runWith` on the actual lowered function for every UInt64 argument pair and arbitrary source heap/CLIF memory. Fuel is `15 * steps.toNat + 5`; the entire initial memory, including the slot-placement oracle, is preserved. Generic F64 simulation remains open. |
 | O4 safety | PROVED (collatz_steps) | `B2.BackendEntry.entry_eq` and `returns` establish the exact upstream `ClifEntry` contract. `reachable_step_safe` excludes trapped/stuck steps at every reachable state; `traps_explicit` proves the exact upstream `E2E.TrapsExplicit` premise. `B2.RunSafety.collatz_run_prefix` also excludes trapped/stuck public runs at every fuel. |
 | O5 backend artifacts | PROVED (collatz_steps) | `B2.Artifacts.input_eq`, `verifiable`, and `lower` certify the exact instruction-selection artifact from `Backend.lowerFunction`. `B2.Artifacts.prepared`, `spill_alloc`, and `allocation_checked` certify the actual block permutation 0,1,3,2, exact spill allocation, and acceptance by upstream `checkAlloc`. `B2.Artifacts.allocated`, `emitted`, and `laid_out` certify actual AArch64 lowering, emission, and binary layout. `B2.BackendContracts.subset`, `dominated`, and `scope` discharge the exact upstream input predicates; all are active and pass the strict transitive audit. |
-| O6 contracts | SORRY | `B2.Lowering.lower_declarations` proves empty extern/signature/global/slot declarations generically. `B2.CallFree` proves absence of try calls, indirect statements/signatures, and TLS for the actual Collatz function. Complete contract composition remains unchecked. |
-| O7 AArch64 x0 | SORRY | The active, audited `B2.BackendEntry.xholds_cv_iff` identifies upstream `XHolds` for a UInt64 value with equality of its 64 bits (closure `[propext, Quot.sound]`). Needs O6, backend composition, and its transitive axiom audit. No AArch64-success claim yet. |
+| O6 contracts | PROVED (collatz_steps) | `B2.BackendContracts.prepared_call_free` and `no_call_site` certify absence of calls in the actual prepared VCode. `callee_ok`, `try_contract`, `tls_contract`, `extern_contract`, and `indirect_contract` discharge the exact backend contracts from the real absence facts. The unconditional `CalleeOk.pc`/`.ext` hook clauses remain explicit. The compiled-module audit, updated strict audit, and default root passed at 21:20 UTC; closures contain only the allowed axioms. `B2.Lowering.lower_declarations` also proves empty declarations generically. |
+| O7 AArch64 x0 | SORRY | The active, audited `B2.BackendEntry.xholds_cv_iff` identifies upstream `XHolds` for a UInt64 value with equality of its 64 bits (closure `[propext, Quot.sound]`). O6 is discharged; `B2.EndToEnd.collatz_to_arm` still needs the backend composition check and its transitive axiom audit. No AArch64-success claim yet. |
 
 Every PROVED result is in the default root and `B2.AxiomAudit`, which calls
 `Lean.collectAxioms` and rejects closures outside `propext`, `Quot.sound`,
@@ -36,7 +36,7 @@ Remote CI for the audited return bridge `fb3c3ef` and checkpoint `4fedc28` passe
 https://github.com/Th0rgal/turbo-lean/actions/runs/41229563046 and
 https://github.com/Th0rgal/turbo-lean/actions/runs/41231617710 .
 This verifies the active scope proofs, return bridge, and strict audit in a
-fresh default-root build, plus source identity and compiler integration.
+fresh pre-O6 default-root build, plus source identity and compiler integration.
 The local Lean 4.35 CoreCLI integration build passed; the actual compiler
 dispatcher emitted collatz_steps CLIF. `research/b2-compiler-smoke.lean`
 records that check and CI runs it too.
@@ -44,12 +44,12 @@ CI now also assembles the actual exported AArch64 text with Clang, extracts
 `.text` using LLVM objcopy, and compares it byte-for-byte with the exported
 binary. The same commands passed locally on the 352-byte artifact with the
 SHA-256 `ccc8f0891484b6692e2be2315f2e729c2fc4e75831561fb07a7c76884991557b`.
-Current implementation commit `15673df` passed the entire
+Pre-O6 implementation commit `15673df` passed the entire
 remote workflow, including this new byte comparison, source identity, active
 proof audit, and compiler integration:
 https://github.com/Th0rgal/turbo-lean/actions/runs/41233670162 .
 The workflow now also checks the excluded end-to-end draft as a separate step;
-this pending check does not promote either O6 or O7.
+this pending check does not establish O7.
 
 Instruction selection is certified in `B2.BackendLower`, now active in
 the root and audit. `B2.IsleFuel.runTerm_of_apply` lifts a successful
@@ -66,8 +66,9 @@ unfolds existing spill definitions before Lean's failing singleton-array
 equation generation, and registers a certified hash-map size rewrite.
 The allocation acceptance proof also passes with closure `[propext, Quot.sound]`.
 `B2.Artifacts` is now kernel checked through binary layout and active in the
-root and audit. `B2.BackendContracts` and `B2.EndToEnd` remain WIP and
-excluded until their checks pass. Emission uses opaque `mixHash`; certified
+root and audit. `B2.BackendContracts` is now checked, audited, and active.
+`B2.EndToEnd` remains WIP and excluded until its check passes.
+Emission uses opaque `mixHash`; certified
 Std HashMap/HashSet rewrite lemmas are available. Executable pipeline
 inspection reports success through allocation check, emission and layout;
 the corresponding kernel certificates now pass.
@@ -77,48 +78,31 @@ composition retains these hook/program-preservation premises and uses
 site absence only for `.os`. Real ABI, machine-entry, stack, memory,
 and symbol premises remain explicit.
 
-Next: check the remaining contracts and compose the LNIR-to-x0 theorem against
-`E2E.backend_correct_final_of_lower`, then activate and audit those results.
+Next: kernel-check the LNIR-to-x0 composition against the genuine
+`E2E.backend_correct_final_of_lower`, then activate it and audit its full closure.
 
-Build state at 21:03 UTC: a single local native scheduler targets `B2.EndToEnd`
-from `research/b2-proofs`, with telemetry off, four Lean threads, two compiler
+O6 acceptance at 21:20 UTC: the exact contract source first passed an independent
+read-only kernel check and strict closure audit. Its actual native-built module
+then passed an import-based strict audit. `B2.BackendContracts` was added to
+`B2.lean` and `B2.AxiomAudit`; both the expanded audit and default root passed
+kernel checking. Source identity was rechecked: all six byte pairs match and
+clifv remains clean at the exact pin. The O6 activation still needs fresh CI.
+
+A single local native scheduler continues to target `B2.EndToEnd`, from
+`research/b2-proofs`, with telemetry off, four Lean threads, two compiler
 workers, and a 7200-second per-module timeout. Logs/status are
-`.b2-work/e2e-build.{log,pid,exit}`. The upstream `RegallocAtomic` proof finished
-at about 20:25 UTC; the instruction-coverage table proof `IselCovTab` also
-finished, at about 20:52 UTC. Both checked module artifacts are published.
-The build has advanced through register-level operations and branches, and is
-now checking allocation coverage. No local compiler was restarted.
+`.b2-work/e2e-build.{log,pid,exit}`. Completed dependency waves are cached;
+the scheduler remains live on the remaining backend dependency cone. No
+concurrent native scheduler or compiler restart was used for O6 acceptance.
+The root/audit checks wrote only outputs outside that target's dependency graph.
 
-The actual `FV.E2E.RegLevelCall` import is still missing, so the contract module
-cannot yet be checked. A read-only checker of its exact source and strict axiom
-closure is prepared for when that import becomes available. It produces no
-module output and does not overwrite outputs owned by the native build.
-
-The proof sources are unchanged from `fae880c`. Its CI run has passed source
-identity, the active-root kernel/axiom audit, and the AArch64 byte comparison;
-the new draft backend-composition step is running:
+The earlier CI run at `fae880c` passed source identity, the pre-O6 active-root
+kernel/axiom audit, and the AArch64 byte comparison. Its draft backend-composition
+step is still running:
 https://github.com/Th0rgal/turbo-lean/actions/runs/41235235900 .
-The entire run is still pending. Neither the local build nor CI has yet
-established O6 or O7. Separate strict contract and composition audits are
-prepared for the actual completed modules; activation will follow successful
-checks, not a live job status. Shared-host CPU contention was observed at
-20:25 UTC, with about 36 GiB memory available and no swap use.
+It has not established O7, and does not verify this new O6 root activation.
+The contract and end-to-end proof source files themselves are unchanged.
 
-The active root passed locally at 17:12 UTC. Scope/dominance and their strict
-transitive audit passed at 17:54 UTC; the return bridge, active audit and root
-passed at 18:27 UTC. The isolated exact `prepared_call_free` statement passed
-with closure `[propext]`; complete O6 still requires its actual imported
-contract definitions and the full module check.
-
-Completed dependency waves were audited and cached before the old clifv-root
-scheduler was deliberately stopped while idle at 18:54 UTC. That target's exit
-`-15` is a checkpoint cancellation, not FinalDirect success. The current
-B2-root scheduler started at 18:56:54 UTC and reused the completed cache.
 Unrelated native-decided witnesses in the pinned clifv imports are outside
-the claimed B2 result closures; the strict B2 axiom policy is unchanged.
-
-The environment was replaced around 16:09 UTC. The checkout and exact clifv pin
-were restored from pushed work; source identity and all active-root CI checks
-pass. Earlier durable replacement jobs that reported heartbeat without starting
-processes were cancelled before the real local build started. Execution is
-verified from actual compiler processes and outputs, not job heartbeat alone.
+the claimed B2 result closures. The B2 axiom policy is unchanged; each newly
+claimed result is checked transitively against the same allowed list.

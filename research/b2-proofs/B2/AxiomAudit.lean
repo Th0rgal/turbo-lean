@@ -12,6 +12,7 @@ import B2.BackendAlloc
 import B2.Artifacts
 import B2.BackendEntry
 import B2.BackendScope
+import B2.BackendContracts
 
 /-! A build-failing transitive axiom audit of the results claimed by B2-status.md.
 Historical draft statements are intentionally outside the active root. -/
@@ -51,7 +52,10 @@ run_cmd do
         ``B2.BackendEntry.reachable_step_safe, ``B2.BackendEntry.traps_explicit,
         ``B2.BackendContracts.lookup_insertIfNew, ``B2.BackendContracts.lookup_method_empty,
         ``B2.BackendContracts.subset, ``B2.BackendContracts.dominated,
-        ``B2.BackendContracts.scope] do
+        ``B2.BackendContracts.scope, ``B2.BackendContracts.prepared_call_free,
+        ``B2.BackendContracts.no_call_site, ``B2.BackendContracts.callee_ok,
+        ``B2.BackendContracts.try_contract, ``B2.BackendContracts.tls_contract,
+        ``B2.BackendContracts.extern_contract, ``B2.BackendContracts.indirect_contract] do
       let axs ← Lean.collectAxioms name
       let rejected := axs.filter fun a => !allowed.contains a
       unless rejected.isEmpty do
