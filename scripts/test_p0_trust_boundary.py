@@ -646,6 +646,74 @@ class TestP0TrustBoundary(unittest.TestCase):
         with patch.object(fuzzer, "LEAN_NATIVE_FULL", Path("/nonexistent/frontend")):
             self.assertEqual(fuzzer.run_fuzzer(3)["status"], "incomplete_missing_engine")
 
+    def test_13_tiered_conformance_and_sanitizer_gates_fail_closed(self) -> None:
+        suite = ROOT / "scripts" / "run_conformance_suite.py"
+        for bad_tier in ("C2", "C3"):
+            res = subprocess.run(
+                [sys.executable, str(suite), "--tier", bad_tier, "--json"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(res.returncode, 0, bad_tier)
+            rep = json.loads(res.stdout)
+            self.assertFalse(rep["ok"])
+            self.assertEqual(rep["tierResults"][bad_tier]["status"], "BLOCKED_MISSING_DEPENDENCY")
+
+        bad_arg = subprocess.run(
+            [sys.executable, str(suite), "--tier", "C99"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(bad_arg.returncode, 2)
+
+        with patch.object(fuzzer, "find_sanitizer_linker", return_value=None):
+            missing_san = fuzzer.run_fuzzer(4, asan=True, ubsan=True)
+            self.assertFalse(missing_san["ok"])
+            self.assertEqual(missing_san["status"], "incomplete_missing_engine")
+
+        engines = fuzzer.probe_engines(asan=True, ubsan=True)
+        self.assertTrue(engines["c_abi_llvm"], engines)
+        with tempfile.TemporaryDirectory(prefix="p0_san_kill_") as tmp:
+            p = Path(tmp)
+            ll = p / "oob.ll"
+            c = p / "driver.c"
+            b = p / "oob_runner"
+            ll.write_text(
+                "define dso_local i64 @oob_read(i64 %idx) #0 {\n"
+                "entry:\n"
+                "  %arr = alloca [2 x i64], align 8\n"
+                "  %ptr = getelementptr [2 x i64], ptr %arr, i64 0, i64 %idx\n"
+                "  %v = load volatile i64, ptr %ptr, align 8\n"
+                "  ret i64 %v\n"
+                "}\n"
+                "attributes #0 = { nounwind uwtable }\n",
+                encoding="utf-8",
+            )
+            c.write_text(
+                "#include <stdint.h>\n#include <stdio.h>\n"
+                "extern uint64_t oob_read(uint64_t);\n"
+                "int main(void) { printf(\"%llu\\n\", (unsigned long long)oob_read(2)); return 0; }\n",
+                encoding="utf-8",
+            )
+            fuzzer.compile_and_link_llvm_driver(
+                clang_bin=engines["clang_bin"],
+                extra_inc=fuzzer.clang_extra_flags(engines["clang_bin"]),
+                ll_path=ll,
+                driver_c_path=c,
+                out_bin_path=b,
+                asan=True,
+                ubsan=True,
+                sanitizer_linker=engines["sanitizer_linker"],
+            )
+            crash = subprocess.run(
+                [str(b)],
+                env={**os.environ, "ASAN_OPTIONS": "detect_leaks=0:abort_on_error=1:halt_on_error=1"},
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(crash.returncode, 0, "ASan must abort on out-of-bounds LLVM alloca read")
+            self.assertIn("AddressSanitizer", crash.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

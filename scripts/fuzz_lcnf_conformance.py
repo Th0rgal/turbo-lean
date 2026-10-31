@@ -27,6 +27,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -425,11 +426,128 @@ def clang_extra_flags(clang_bin: str) -> list[str]:
     return []
 
 
+def sanitizer_flag_list(asan: bool, ubsan: bool) -> list[str]:
+    sanitizers = []
+    if asan:
+        sanitizers.append("address")
+    if ubsan:
+        sanitizers.append("undefined")
+    if not sanitizers:
+        return []
+    return [f"-fsanitize={','.join(sanitizers)}", "-fno-sanitize-recover=all", "-fno-omit-frame-pointer"]
+
+
+def instrument_llvm_ir_for_asan(ir_text: str) -> str:
+    return re.sub(r"^(attributes #[01] = \{ )", r"\1sanitize_address ", ir_text, flags=re.M)
+
+
+def find_sanitizer_linker(clang_bin: str | None, extra_inc: list[str], asan: bool, ubsan: bool) -> str | None:
+    san_flags = sanitizer_flag_list(asan, ubsan)
+    if not san_flags or not clang_bin:
+        return clang_bin
+    with tempfile.TemporaryDirectory(prefix="turbo_san_probe_") as tmp:
+        probe_dir = Path(tmp)
+        probe_c = probe_dir / "probe.c"
+        probe_bin = probe_dir / "probe"
+        probe_c.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+        cands = [
+            clang_bin,
+            "/usr/bin/clang",
+            "/usr/bin/clang-19",
+            "/usr/bin/clang-18",
+            shutil.which("gcc"),
+            "/usr/bin/gcc",
+        ]
+        seen: set[str] = set()
+        for cand in cands:
+            if not cand or cand in seen:
+                continue
+            seen.add(cand)
+            if not (Path(cand).is_file() and os.access(cand, os.X_OK)):
+                continue
+            inc = extra_inc if cand == clang_bin else []
+            res = subprocess.run(
+                [cand, "-O1", *inc, *san_flags, str(probe_c), "-o", str(probe_bin)],
+                capture_output=True,
+                text=True,
+            )
+            if res.returncode == 0 and probe_bin.is_file():
+                run = subprocess.run(
+                    [str(probe_bin)],
+                    env={**os.environ, "ASAN_OPTIONS": "detect_leaks=0:abort_on_error=1:halt_on_error=1"},
+                    capture_output=True,
+                    text=True,
+                )
+                if run.returncode == 0:
+                    return cand
+    return None
+
+
+def compile_and_link_llvm_driver(
+    clang_bin: str,
+    extra_inc: list[str],
+    ll_path: Path,
+    driver_c_path: Path,
+    out_bin_path: Path,
+    asan: bool = False,
+    ubsan: bool = False,
+    sanitizer_linker: str | None = None,
+) -> dict[str, Any]:
+    san_flags = sanitizer_flag_list(asan, ubsan)
+    if not san_flags:
+        subprocess.run(
+            [clang_bin, "-O2", "-Wno-override-module", *extra_inc, str(ll_path), str(driver_c_path), "-o", str(out_bin_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return {"asan": False, "ubsan": False, "compiler": clang_bin, "linker": clang_bin}
+
+    linker = sanitizer_linker or find_sanitizer_linker(clang_bin, extra_inc, asan, ubsan)
+    if not linker:
+        raise RuntimeError("Requested ASan/UBSan runtime unavailable; refusing to report sanitizer pass")
+
+    compile_ll_path = ll_path
+    if asan:
+        san_ll_path = ll_path.with_name(ll_path.stem + ".asan.ll")
+        san_ll_path.write_text(instrument_llvm_ir_for_asan(ll_path.read_text(encoding="utf-8")), encoding="utf-8")
+        compile_ll_path = san_ll_path
+
+    if linker == clang_bin:
+        subprocess.run(
+            [clang_bin, "-O1", "-g", "-Wno-override-module", *extra_inc, *san_flags, str(compile_ll_path), str(driver_c_path), "-o", str(out_bin_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    else:
+        obj_path = ll_path.with_suffix(".san.o")
+        subprocess.run(
+            [clang_bin, "-O1", "-g", "-Wno-override-module", *extra_inc, *san_flags, "-c", str(compile_ll_path), "-o", str(obj_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [linker, "-O1", "-g", *san_flags, str(obj_path), str(driver_c_path), "-o", str(out_bin_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    return {"asan": asan, "ubsan": ubsan, "compiler": clang_bin, "linker": linker}
+
+
 def probe_engines(
     override_lean: str | None = None,
     override_core: str | None = None,
     override_clang: str | None = None,
+    asan: bool | None = None,
+    ubsan: bool | None = None,
 ) -> dict[str, Any]:
+    if asan is None:
+        asan = os.environ.get("TURBO_CONFORMANCE_ASAN") == "1"
+    if ubsan is None:
+        ubsan = os.environ.get("TURBO_CONFORMANCE_UBSAN") == "1"
     lean_bin = override_lean if override_lean is not None else find_lean_binary()
     core_bin = override_core if override_core is not None else str(LEAN_NATIVE_CORE)
     full_bin = str(LEAN_NATIVE_FULL) if LEAN_NATIVE_FULL.is_file() else None
@@ -438,6 +556,13 @@ def probe_engines(
     core_ok = bool(core_bin and Path(core_bin).is_file() and os.access(core_bin, os.X_OK))
     full_ok = bool(full_bin and Path(full_bin).is_file() and os.access(full_bin, os.X_OK))
     clang_ok = bool(clang_bin and Path(clang_bin).is_file() and os.access(clang_bin, os.X_OK))
+    extra_inc = clang_extra_flags(clang_bin) if clang_ok and clang_bin else []
+    sanitizer_linker = (
+        find_sanitizer_linker(clang_bin, extra_inc, asan, ubsan)
+        if (asan or ubsan) and clang_ok
+        else (clang_bin if clang_ok else None)
+    )
+    san_ok = bool(sanitizer_linker) if (asan or ubsan) else True
     if core_ok:
         try:
             subprocess.run([core_bin, "validate-tv", "--canonical-benchmark", "--json"],
@@ -449,9 +574,11 @@ def probe_engines(
         "core_bin": core_bin if core_ok else None,
         "full_bin": full_bin if full_ok else None,
         "clang_bin": clang_bin if clang_ok else None,
+        "sanitizer_linker": sanitizer_linker,
+        "sanitizers_ready": san_ok,
         "stock_lean_c": lean_ok and clang_ok,
         "lnir_eval": core_ok and full_ok,
-        "c_abi_llvm": core_ok and full_ok and clang_ok,
+        "c_abi_llvm": core_ok and full_ok and clang_ok and san_ok,
     }
 
 
@@ -459,12 +586,18 @@ def run_three_way_batch(
     programs: list[dict[str, Any]],
     engines: dict[str, Any],
     mutate_engine: str | None = None,
+    asan: bool | None = None,
+    ubsan: bool | None = None,
 ) -> dict[str, Any]:
     """Execute ALL fuzz programs through:
       (1) stock `lean -c` + `clang` binary execution,
       (2) frontend lowering (`lean-native emit-lnir --wire`) + `lean-native-core eval-lnir --batch-json --opt` + `validate-tv`,
       (3) `lean-native-core compile-llvm` + `clang` binary execution.
     """
+    if asan is None:
+        asan = os.environ.get("TURBO_CONFORMANCE_ASAN") == "1"
+    if ubsan is None:
+        ubsan = os.environ.get("TURBO_CONFORMANCE_UBSAN") == "1"
     lean_bin = engines["lean_bin"]
     core_bin = engines["core_bin"]
     full_bin = engines.get("full_bin")
@@ -621,13 +754,22 @@ def run_three_way_batch(
             capture_output=True,
             text=True,
         )
-        subprocess.run(
-            [clang_bin, "-O2", "-Wno-override-module", *extra_inc, str(ll_path), str(driver_c_path), "-o", str(ln_bin_path)],
-            check=True,
-            capture_output=True,
-            text=True,
+        san_meta = compile_and_link_llvm_driver(
+            clang_bin=clang_bin,
+            extra_inc=extra_inc,
+            ll_path=ll_path,
+            driver_c_path=driver_c_path,
+            out_bin_path=ln_bin_path,
+            asan=asan,
+            ubsan=ubsan,
+            sanitizer_linker=engines.get("sanitizer_linker"),
         )
-        ln_out = subprocess.run([str(ln_bin_path)], check=True, capture_output=True, text=True).stdout
+        run_env = dict(os.environ)
+        if asan:
+            run_env["ASAN_OPTIONS"] = "detect_leaks=0:abort_on_error=1:halt_on_error=1"
+        if ubsan:
+            run_env["UBSAN_OPTIONS"] = "print_stacktrace=1:halt_on_error=1"
+        ln_out = subprocess.run([str(ln_bin_path)], env=run_env, check=True, capture_output=True, text=True).stdout
         ln_vals = [int(x) for x in json.loads(ln_out)]
         if len(stock_vals) != len(programs) or len(ln_vals) != len(programs):
             raise RuntimeError("Native execution skipped or duplicated rows")
@@ -663,6 +805,7 @@ def run_three_way_batch(
             "llvm_ir_sha256": sha256_bytes(ll_path.read_bytes()),
             "stock_binary_sha256": sha256_bytes(stock_bin_path.read_bytes()),
             "leannative_binary_sha256": sha256_bytes(ln_bin_path.read_bytes()),
+            "sanitizers": san_meta,
             "symbolic_tv_passed_decls": tv_json.get("passedDecls", 0),
             "lnir_eval_executed_decls": len(ev_by_decl),
         }
@@ -704,9 +847,11 @@ def run_fuzzer(
     override_core: str | None = None,
     override_clang: str | None = None,
     mutate_engine: str | None = None,
+    asan: bool = False,
+    ubsan: bool = False,
 ) -> dict[str, Any]:
     n = max(0, num_seeds)
-    engines = probe_engines(override_lean, override_core, override_clang)
+    engines = probe_engines(override_lean, override_core, override_clang, asan=asan, ubsan=ubsan)
     all_engines_ready = (
         engines["stock_lean_c"] and engines["lnir_eval"] and engines["c_abi_llvm"]
     )
@@ -720,6 +865,8 @@ def run_fuzzer(
             "checked": 0,
             "mismatch_count": 0,
             "rc_leak_count": None,
+            "asan": asan,
+            "ubsan": ubsan,
             "coverage": "scalar_only_no_alias_rc_or_seqFor",
             "parity": "incomplete",
             "engines": {
@@ -735,7 +882,9 @@ def run_fuzzer(
     mismatches = 0
     failures: list[dict[str, Any]] = []
     try:
-        batch_res = run_three_way_batch(programs, engines, mutate_engine=mutate_engine)
+        batch_res = run_three_way_batch(
+            programs, engines, mutate_engine=mutate_engine, asan=asan, ubsan=ubsan
+        )
     except (subprocess.SubprocessError, OSError, ValueError, RuntimeError) as exc:
         batch_res = {"executed_count": 0, "mismatches": [], "receipts": {}}
         failures.append({"error": str(exc), "stderr": getattr(exc, "stderr", None)})
@@ -754,6 +903,8 @@ def run_fuzzer(
         "checked": checked,
         "mismatch_count": mismatches,
         "rc_leak_count": None,
+        "asan": asan,
+        "ubsan": ubsan,
         "interpreter_live_objects": batch_res.get("live_objects"),
         "parity": "100%" if (parity_ok and n > 0) else f"{checked - mismatches}/{checked}",
         "engines": {
@@ -772,8 +923,10 @@ def main() -> int:
     ap.add_argument("--seeds", type=int, default=64, help="Number of deterministic seeds")
     ap.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     ap.add_argument("--mutate-engine", type=str, default=None, help="Inject mutation into stock_lean_c|lnir_eval|c_abi_llvm")
+    ap.add_argument("--asan", action="store_true", help="Instrument compiled LLVM binaries with AddressSanitizer")
+    ap.add_argument("--ubsan", action="store_true", help="Instrument compiled LLVM binaries with UndefinedBehaviorSanitizer")
     args = ap.parse_args()
-    report = run_fuzzer(args.seeds, mutate_engine=args.mutate_engine)
+    report = run_fuzzer(args.seeds, mutate_engine=args.mutate_engine, asan=args.asan, ubsan=args.ubsan)
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:

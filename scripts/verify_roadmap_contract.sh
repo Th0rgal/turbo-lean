@@ -5,9 +5,28 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-export PATH="$ROOT_DIR/target/release:$ROOT_DIR/target/debug:/var/lib/sandboxed-node/work/4c277c9d-4b85-4a1a-88ab-2c06bed519b1/warroom-tools/rust/rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin:/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0/bin:/var/lib/sandboxed-node/.local/bin:$PATH"
+TOOLCHAIN="$(tr -d '[:space:]' < "$ROOT_DIR/lean/lean-toolchain")"
+TOOLCHAIN_DIR="leanprover--lean4---${TOOLCHAIN#leanprover/lean4:}"
+for cand in \
+  "$ROOT_DIR/target/release" \
+  "$ROOT_DIR/target/debug" \
+  "${ELAN_HOME:-$HOME/.elan}/toolchains/$TOOLCHAIN_DIR/bin" \
+  "${ELAN_HOME:-$HOME/.elan}/bin" \
+  "${CARGO_HOME:-$HOME/.cargo}/bin" \
+  "$HOME/.local/bin" \
+  "/var/lib/sandboxed-node/caches/elan/toolchains/$TOOLCHAIN_DIR/bin" \
+  "/var/lib/sandboxed-node/.elan/toolchains/$TOOLCHAIN_DIR/bin" \
+  "/var/lib/sandboxed-node/.elan/bin"; do
+  if [ -d "$cand" ]; then
+    PATH="$cand:$PATH"
+  fi
+done
+export PATH
 
-TURBO_BIN="${TURBO_AUDITOR_BIN:-$(command -v turbo-lean || true)}"
+TURBO_BIN="${TURBO_AUDITOR_BIN:-$ROOT_DIR/target/release/turbo-lean}"
+if [ ! -x "$TURBO_BIN" ]; then
+  TURBO_BIN="$(command -v turbo-lean || true)"
+fi
 CORE_BIN="$ROOT_DIR/lean/.lake/build/bin/lean-native-core"
 
 if [ -z "$TURBO_BIN" ]; then
@@ -127,7 +146,7 @@ print(f'  [OK] Segregated Plugins: accepted={d[\"acceptedCount\"]}, rejected={d[
 "
 
 echo "=== [6/6] 3-Way Differential Conformance Suite, Grammar-Guided LCNF Fuzzer & P0 Trust Boundary ==="
-python3 "$ROOT_DIR/scripts/run_conformance_suite.py" --fuzz-seeds 32
+python3 "$ROOT_DIR/scripts/run_conformance_suite.py" --tier C1,C4 --fuzz-seeds 32 --asan --ubsan
 python3 -m unittest -v "$ROOT_DIR/scripts/test_p0_trust_boundary.py"
 python3 -m unittest -v "$ROOT_DIR/scripts/test_kernel_gate_audit.py"
 

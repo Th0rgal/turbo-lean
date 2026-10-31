@@ -77,20 +77,20 @@ Pinned by `(repo_url, commit_sha, lean_toolchain)` so builds are 100% determinis
 ## 3. Execution & Gate Integration
 
 ```bash
-# Fast pre-commit conformance check (Tier C1 + C2 hot kernels + 500 fuzz seeds, < 10s)
-./lean/.lake/build/bin/lean-native-core conformance-check --tiers C1,C2 --fuzz-seeds 500
+# Fast pre-commit & blocking CI conformance check (Tier C1 scalar subset + Tier C4 fuzzer + ASan/UBSan)
+python3 scripts/run_conformance_suite.py --tier C1,C4 --fuzz-seeds 32 --asan --ubsan
 
-# Full nightly / milestone conformance & sanitizer soak (Tiers C1..C4, 10,000 fuzz seeds)
-./lean/.lake/build/bin/lean-native-core conformance-check --tiers C1,C2,C3,C4 --fuzz-seeds 10000 --asan --ubsan
+# Planned full nightly / milestone conformance & sanitizer soak (Tiers C2 and C3 fail closed until wired)
+python3 scripts/run_conformance_suite.py --tier C1,C2,C3,C4 --fuzz-seeds 10000 --asan --ubsan
 ```
 
-**Hard Gate**: A single mismatch (`mismatch_count > 0`) or RC leak (`rc_leak_count > 0`) on any tier blocks `checkBranchAcceptanceGate` (`artifactCertified = false`) and immediately records the candidate pass as a falsified **Burned Path**.
+**Hard Gate**: A single mismatch (`mismatch_count > 0`), RC leak (`rc_leak_count > 0`), or requested unimplemented tier (`C2`, `C3`) fails closed with a non-zero exit code.
 
 ---
 
-## 4. Current Coverage Status (`main` @ `cac14f1`, `2026-10-30`)
+## 4. Current Coverage Status (`main` @ `6d53683`, `2026-10-31`)
 
-- **Tier C1 (`lean4/tests/lean/run`)**: Scalar + narrow-unsigned (`UInt8/16/32/64`, `USize`, `Bool`, constructor enums, O(N) join-point DAGs, flat-scalar tuple helpers) 3-way fixture (`scripts/test_scalar_frontend.py` across `lean -c`, `eval-lnir --cases-file` / `validate-tv`, and `LeanNative` LLVM) is merged (`#264`, `#265`, `#269`, `#270`) and passes locally, **but is not yet wired into `.github/workflows/ci.yml` or `scripts/ci_verify.sh`**. Wiring `scripts/test_scalar_frontend.py` into every CI check and expanding to 250+ upstream `lean4/tests/lean/run` files (closures, `pap`, `letrec`, `Array`/`ByteArray` sharing, signed `Int*`) remain open.
-- **Tier C2 (Ecosystem Lake Packages)**: First external large-scale incremental-verification validation on **`eth-act/clifv`** (4,624 modules, Lean 4.34.1; PR `#273`, integrated via `#275`) is merged on `main`, landing the plain-`lean` fallback `#print axioms` gate, `[axioms] allow` policy resolved at `--base`, Lake reverse-dependency escalation (including `lean_exe` roots) on non-local edits, non-destructive `.olean` refresh, `--timeout` propagation, and `bv_decide` `cadical` lookup. Full 3-way `LeanNative` codegen conformance on `Batteries`, `LeanSys`, `SciLean`, and `ArkLib` remains open.
-- **Tier C3 (`R1`–`R6` Holdouts)**: Pending official `leanprover/con-leche` vendoring and real `.olean` / `Expr` CAS replay (`M2`–`M3`).
-- **Tier C4 (Grammar-Guided `LCNF` Fuzzer)**: `scripts/fuzz_lcnf_conformance.py` + `scripts/run_conformance_suite.py --fuzz-seeds 32` are invoked by `scripts/verify_roadmap_contract.sh` (`#264`, `#265`), **which is currently a local verification script and is not yet invoked by `.github/workflows/ci.yml` (`scripts/ci_verify.sh`)**. Wiring `scripts/verify_roadmap_contract.sh` / `scripts/run_conformance_suite.py` into CI and scaling to 10,000 nightly seeds with `--asan --ubsan` and shared-array alias fuzzing remain open.
+- **Tier C1 (`lean4/tests/lean/run`)**: Scalar + narrow-unsigned (`UInt8/16/32/64`, `USize`, `Bool`, constructor enums, O(N) join-point DAGs, flat-scalar tuple helpers) 3-way fixture (`scripts/test_scalar_frontend.py` across `lean -c`, `eval-lnir --cases-file` / `validate-tv`, and `LeanNative` LLVM) plus Stage 1D heap ADT / Perceus RC probes (`#280`, `e585ba9`) are merged and run on every push and PR via `.github/workflows/roadmap-conformance.yml` (`scripts/verify_roadmap_contract.sh` + `python3 -m unittest -v scripts/test_scalar_frontend.py`). Direct scalar-payload heap ADTs and `compile-llvm` of heap ops fail closed. Expanding Tier C1 to 250+ upstream `lean4/tests/lean/run` files (closures, `pap`, `letrec`, `Array`/`ByteArray` sharing, signed `Int*`) remains open.
+- **Tier C2 (Ecosystem Lake Packages)**: First external large-scale incremental-verification validation on **`eth-act/clifv`** (4,624 modules, Lean 4.34.1; PR `#273`, integrated via `#275` and `#309`) is merged on `main`, landing the plain-`lean` fallback `#print axioms` gate, `[axioms] allow` policy resolved at `--base`, Lake reverse-dependency escalation (including `lean_exe` roots) on non-local edits, non-destructive `.olean` refresh, `--timeout` propagation, `bv_decide` `cadical` lookup, and `check --decl` declaration-discovery parity. `python3 scripts/run_conformance_suite.py --tier C2` currently fails closed (`BLOCKED_MISSING_DEPENDENCY`) until 3-way `LeanNative` codegen conformance on `Batteries`, `LeanSys`, `SciLean`, and `ArkLib` is wired. (Separately in `Th0rgal/orb`, `orb#1399` recorded local 6-engine conformance across all 128 public `Orb.Kernel` + `LeanSys.Spec` exports at Orb `3c70e5ada` / Turbo `e585ba9` / LeanSys `c089f3e3`.)
+- **Tier C3 (`R1`–`R6` Holdouts)**: Pending official `leanprover/con-leche` vendoring and real `.olean` / `Expr` CAS replay (`M2`–`M3`). `python3 scripts/run_conformance_suite.py --tier C3` fails closed (`BLOCKED_MISSING_DEPENDENCY`).
+- **Tier C4 (Grammar-Guided `LCNF` Fuzzer)**: `scripts/fuzz_lcnf_conformance.py` and `scripts/run_conformance_suite.py --tier C1,C4 --fuzz-seeds 32 --asan --ubsan` run inside `scripts/verify_roadmap_contract.sh` and the blocking `.github/workflows/roadmap-conformance.yml` workflow. ASan/UBSan instrument compiled scalar LLVM binaries (`sanitize_address` on emitted LLVM function attributes, compiled with Lean's `clang -c` and linked with a probed sanitizer-capable driver such as `/usr/bin/gcc` when Lean's bundled toolchain lacks `libclang_rt.asan`, failing closed if no sanitizer runtime is available); this does **not** claim LLVM-IR UBSan shift-overflow coverage or full heap/loop/alias fuzzer coverage. Scaling to 10,000 nightly seeds and shared-array alias / `seqFor` fuzzing remain open.
