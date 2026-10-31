@@ -22,6 +22,110 @@ use crate::pack;
 use crate::pr_verify::{try_fast_split_single_file, try_fast_split_single_file_from_path};
 use crate::splitter::{self, split_lean_source};
 
+/// Confirm the selected source declaration in Lean's environment, independently of
+/// textual scope tracking. This probe replaces only the proof: false statements
+/// must still have an identity before Stage-1 can attribute a counterexample.
+/// No result or identity is cached; unavailable elaboration fails closed.
+pub(crate) fn confirm_decl_identity(
+    src: &str,
+    shard: &splitter::TheoremShard,
+    project_dir: &Path,
+    file: &Path,
+) -> Result<()> {
+    confirm_decl_identity_with_trust(src, shard, project_dir, file, false)
+}
+
+pub(crate) fn confirm_decl_identity_with_trust(
+    src: &str,
+    shard: &splitter::TheoremShard,
+    project_dir: &Path,
+    file: &Path,
+    is_untrusted: bool,
+) -> Result<()> {
+    let expected = shard.decl_name();
+    let prefix = splitter::declaration_identity_prefix(src, shard.start_line);
+    let header_info = crate::module_builder::parse_header_info(&prefix);
+    let (header, prefix) = prefix.split_at(header_info.body_byte_offset);
+    let (signature, _) = splitter::extract_shard_stmt_and_proof(src, shard);
+    anyhow::ensure!(
+        !signature.is_empty(),
+        "Declaration identity unavailable for `{expected}`: missing signature"
+    );
+    let nonce = format!(
+        "{}{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    );
+    let command = format!("turbo_identity_{nonce}");
+    let marker = format!("TURBO_IDENTITY_{nonce} ");
+    let probe = format!(
+        r#"{header}
+import Lean
+{prefix}
+open Lean Elab Command in
+elab "{command}" cmd:command : command => do
+  let before ← getEnv
+  elabCommand cmd
+  let after ← getEnv
+  for (name, info) in after.constants.toList do
+    if !before.contains name then
+      if info matches .thmInfo _ then
+        logInfo m!"{marker}{{privateToUserName name}}"
+set_option warningAsError false
+set_option warn.sorry false
+{command}
+{signature} := by sorry
+"#
+    );
+    let path = project_dir.join(format!("_turbo_identity_{nonce}.lean"));
+    fs::write(&path, probe)?;
+    let result = (|| -> Result<()> {
+        let mut command = if is_untrusted {
+            crate::pr_verify::statement_lean_command(project_dir, true)?
+        } else {
+            let env = crate::lake_build::spawn_lake_env(project_dir)?;
+            let mut command = Command::new(lean_bin_from_env(&env));
+            command.current_dir(project_dir).envs(&env);
+            command
+        };
+        command
+            .args(crate::module_builder::try_resolve_lean_args_for_path(
+                project_dir,
+                Some(file),
+            ))
+            .arg(&path);
+        let out = crate::zygote::run_lean_command(&mut command, None)?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let names: Vec<_> = stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix(&marker))
+            .collect();
+        anyhow::ensure!(out.status.success() && names == [expected],
+            "Declaration identity confirmation failed for `{expected}`: Lean reported {names:?}; {}{}",
+            stdout, String::from_utf8_lossy(&out.stderr));
+        Ok(())
+    })();
+    let _ = fs::remove_file(path);
+    result.with_context(|| {
+        format!("Cannot report a verdict: declaration identity unconfirmed for `{expected}`")
+    })
+}
+
+/// Resolve a fresh source split before any single-declaration verdict (including Stage-1).
+pub(crate) fn confirm_selected_decl(
+    src: &str,
+    target: &str,
+    project_dir: &Path,
+    file: &Path,
+) -> Result<()> {
+    let split = splitter::split_lean_source(src, &[]);
+    let idx = splitter::find_decl_shard_index(&split.shards, target)?
+        .with_context(|| format!("Declaration `{target}` not found in {}", file.display()))?;
+    confirm_decl_identity(src, &split.shards[idx], project_dir, file)
+}
+
 pub(crate) fn make_shard_receipt_bytes(
     decl: &str,
     prefix_env_hash: &str,
@@ -465,6 +569,7 @@ pub fn try_stateless_remote_single_decl_check(
         return Ok(false);
     };
     let shard = &split.shards[shard_idx];
+    confirm_decl_identity(&active_src, shard, &canon_dir, &canon_file)?;
     let file_lean_args =
         crate::module_builder::try_resolve_lean_args_for_path(&canon_dir, Some(&canon_file));
     let shard_key = compute_shard_key_with_args(&toolchain, shard, &file_lean_args);
@@ -1607,6 +1712,11 @@ fn check_single_decl(
         }
     }
     let shard = &split.shards[shard_idx];
+    // Stat/split caches are not evidence of the identity in the current source.
+    if active_src.is_empty() {
+        active_src = fs::read_to_string(&active_file)?;
+    }
+    confirm_decl_identity(&active_src, shard, canon_dir, &active_file)?;
     let file_lean_args =
         crate::module_builder::try_resolve_lean_args_for_path(canon_dir, Some(&active_file));
 
@@ -3949,6 +4059,32 @@ mod tests {
     use crate::lake_build::compute_shard_key;
 
     #[test]
+    fn declaration_identity_rejects_mislabeled_shards_and_unavailable_elaboration() {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_identity_guard_{}",
+            crate::pack::next_tmp_id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        let file = dir.join("Identity.lean");
+        let src = "namespace A\ntheorem same : True := True.intro\nend A\nnamespace B\ntheorem same (n : Nat) : n = n + 1 := by rfl\nend B\n";
+        let split = split_lean_source(src, &[]);
+        let mut shard = split.shards[1].clone();
+        confirm_decl_identity(src, &shard, &dir, &file).unwrap();
+        shard.qualified_name = "A.same".into();
+        let error = format!(
+            "{:#}",
+            confirm_decl_identity(src, &shard, &dir, &file).unwrap_err()
+        );
+        assert!(error.contains("identity unconfirmed"), "{error}");
+        assert!(error.contains("B.same"), "{error}");
+        let invalid = "namespace B\ndef broken : Nat := noSuchConstant\ntheorem same : True := True.intro\nend B\n";
+        let split = split_lean_source(invalid, &[]);
+        assert!(confirm_decl_identity(invalid, &split.shards[0], &dir, &file).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn test_extract_mismatch_diagnostics_parses_rhs_and_numeric_delta() {
         let sample_err = "\
 <zygote-decl>:42:4: error: type mismatch
@@ -4311,6 +4447,7 @@ but is expected to have type
             format!("{bad}{good}"),
             indented,
             quoted,
+            "namespace B\ndef message : String := \"\nend B\nnamespace A\n\"\ntheorem same (n : Nat) : n = n + 1 := by rfl\nend B\n".to_string() + good,
         ]
         .iter()
         .enumerate()

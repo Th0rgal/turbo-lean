@@ -2792,6 +2792,14 @@ pub fn run_tpu_fast_check(json: bool, file: &Path, decl_filter: Option<&str>) ->
         Some(s) if !s.is_empty() && s != "auto" => Some(s),
         _ => None,
     };
+    if let Some(target) = eff_filter {
+        crate::check::confirm_selected_decl(
+            &src_text,
+            target,
+            file.parent().unwrap_or(Path::new(".")),
+            file,
+        )?;
+    }
     let kernel = transpile_lean_theorem_to_cuda(&src_text, eff_filter)?;
     let n_states = 262_144u64;
     let mut report = execute_transpiled_cuda_kernel(&kernel, n_states, false)?;
@@ -2950,6 +2958,14 @@ pub fn run_fast_check_command(
         } else {
             Some(decl_arg.as_str())
         };
+        if let Some(target) = decl_filter {
+            crate::check::confirm_selected_decl(
+                &src_text,
+                target,
+                file.parent().unwrap_or(Path::new(".")),
+                &file,
+            )?;
+        }
         let kernel = transpile_lean_theorem_to_cuda(&src_text, decl_filter)?;
         let n_states = if Path::new("/usr/local/cuda/bin/nvcc").exists() {
             10_000_000
@@ -4608,16 +4624,20 @@ fn try_eval_decl_stage1_cex_json(
 
 /// Resolve against qualified shard identities before extracting any statement for evaluation.
 fn extract_selected_decls(src: &str, target: Option<&str>) -> Result<Vec<ExtractedDecl>> {
-    let Some(target) = target.filter(|t| !t.is_empty() && *t != "auto") else {
-        return Ok(extract_decls_fast(src, None));
-    };
     let split = crate::splitter::split_lean_source(src, &[]);
-    Ok(
-        crate::splitter::find_decl_shard_index(&split.shards, target)?
-            .and_then(|idx| extract_shard_decl(src, &split.shards[idx]))
-            .into_iter()
-            .collect(),
-    )
+    match target.filter(|t| !t.is_empty() && *t != "auto") {
+        Some(target) => Ok(
+            crate::splitter::find_decl_shard_index(&split.shards, target)?
+                .and_then(|idx| extract_shard_decl(src, &split.shards[idx]))
+                .into_iter()
+                .collect(),
+        ),
+        None => Ok(split
+            .shards
+            .iter()
+            .filter_map(|shard| extract_shard_decl(src, shard))
+            .collect()),
+    }
 }
 
 fn extract_shard_decl(src: &str, shard: &crate::splitter::TheoremShard) -> Option<ExtractedDecl> {
@@ -4645,6 +4665,9 @@ pub fn try_stateless_agent_step_cex(
     let Ok(src_text) = fs::read_to_string(&resolved_file) else {
         return Ok(None);
     };
+    if let Some(target) = decl_filter.filter(|t| !t.is_empty() && *t != "auto") {
+        crate::check::confirm_selected_decl(&src_text, target, &canon_dir, &resolved_file)?;
+    }
     let decls = extract_selected_decls(&src_text, decl_filter)?;
     let accel_cfg = crate::accelerators::AcceleratorConfig::load(Some(&canon_dir));
     let accelerators_active = accel_cfg.enabled;
@@ -4652,6 +4675,9 @@ pub fn try_stateless_agent_step_cex(
     let accel_registry = crate::accelerators::AcceleratorRegistry::from_config(accel_cfg);
     let registered_accelerators_count = accel_registry.plugin_count();
     for d in &decls {
+        if decl_filter.is_none_or(|t| t.is_empty() || t == "auto") {
+            crate::check::confirm_selected_decl(&src_text, &d.name, &canon_dir, &resolved_file)?;
+        }
         if let Some(val) = try_eval_decl_stage1_cex_json(
             d,
             file,
@@ -4835,14 +4861,13 @@ pub fn evaluate_agent_step_value(
             _ => split.shards.iter().collect(),
         };
 
-        let decls = if decl_filter.is_some_and(|df| !df.is_empty() && df != "auto") {
-            target_shards
-                .iter()
-                .filter_map(|ts| extract_shard_decl(&src_text, ts))
-                .collect()
-        } else {
-            extract_decls_fast(&src_text, None)
-        };
+        for shard in &target_shards {
+            crate::check::confirm_decl_identity(&src_text, shard, &canon_dir, &resolved_file)?;
+        }
+        let decls: Vec<_> = target_shards
+            .iter()
+            .filter_map(|ts| extract_shard_decl(&src_text, ts))
+            .collect();
 
         for d in &decls {
             total_specs_audited += 1;

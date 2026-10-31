@@ -3355,7 +3355,7 @@ fn statement_lake_command(project: &Path, is_untrusted: bool) -> Result<Command>
     statement_toolchain_command(project, is_untrusted, "lake", None)
 }
 
-fn statement_lean_command(project: &Path, is_untrusted: bool) -> Result<Command> {
+pub(crate) fn statement_lean_command(project: &Path, is_untrusted: bool) -> Result<Command> {
     // Static package paths only: never ask project code to supply PATH/LEAN_PATH.
     let cfg = crate::module_builder::resolve_project_config_with_trust(project, true)?;
     let (lean_path, _) = crate::module_builder::build_lean_search_path(&cfg, true);
@@ -4054,6 +4054,23 @@ pub fn run_pr_verify_command(
     for (_rel_path, file_shards) in &shards_by_file {
         for (k, _sh, _fast_ok) in file_shards {
             all_edited_keys.push(k.clone());
+        }
+    }
+
+    // Per-shard names must be attested by Lean before cache hits or verification
+    // can be attributed to them, including the single-theorem PR case.
+    for (rel_path, file_shards) in &shards_by_file {
+        let src = current_files
+            .get(rel_path)
+            .context("Missing source for declaration identity confirmation")?;
+        for (_, shard, _) in file_shards {
+            crate::check::confirm_decl_identity_with_trust(
+                src,
+                shard,
+                &canon_dir,
+                &canon_dir.join(rel_path),
+                is_untrusted,
+            )?;
         }
     }
 
