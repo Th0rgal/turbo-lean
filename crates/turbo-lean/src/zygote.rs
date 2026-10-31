@@ -2972,6 +2972,9 @@ fn eval_with_zygote_pool_inner(
     batch_fission_override: Option<(String, String, String)>,
     lean_args: &[String],
 ) -> Result<ZygoteEvalReply> {
+    if !eval_mode {
+        crate::splitter::reject_checking_weakening(shard_source)?;
+    }
     let request_started = std::time::Instant::now();
     crate::module_builder::validate_lean_args(lean_args)?;
     let default_timeout_ms = if eval_mode { 900_000 } else { 30_000 };
@@ -3960,6 +3963,10 @@ pub fn eval_subshards_batch_via_zygote(
     sub_decl_sources: &[String],
     lean_args: &[String],
 ) -> Result<ZygoteEvalReply> {
+    crate::splitter::reject_checking_weakening(prefix_source)?;
+    for source in sub_decl_sources {
+        crate::splitter::reject_checking_weakening(source)?;
+    }
     crate::module_builder::validate_lean_args(lean_args)?;
     if sub_decl_sources.is_empty() {
         return Ok(ZygoteEvalReply {
@@ -4017,6 +4024,10 @@ pub fn eval_candidates_race_via_zygote(
     candidate_decl_sources: &[String],
     lean_args: &[String],
 ) -> Result<ZygoteEvalReply> {
+    crate::splitter::reject_checking_weakening(prefix_source)?;
+    for source in candidate_decl_sources {
+        crate::splitter::reject_checking_weakening(source)?;
+    }
     crate::module_builder::validate_lean_args(lean_args)?;
     if candidate_decl_sources.is_empty() {
         return Ok(ZygoteEvalReply {
@@ -4518,6 +4529,8 @@ pub fn try_local_zygote_check_shard_detailed(
     env_vars: &std::collections::HashMap<String, String>,
     req: &CheckShardHttpRequest,
 ) -> Result<Option<serde_json::Value>> {
+    crate::module_builder::validate_lean_args(&req.lean_args)?;
+    crate::splitter::reject_checking_weakening(&req.shard_source)?;
     let Some((base_url, auth_token)) = ensure_local_zygote_daemon_with_token(store, env_vars)
     else {
         return Ok(None);
@@ -4991,6 +5004,34 @@ mod tests {
 
     /// A user `macro_rules` that makes Lean 4.35's `#print axioms` report no axioms.
     pub(crate) const PRINT_AXIOMS_SPOOF: &str = "macro_rules\n  | `(#print axioms $i:ident) => `(#eval IO.println s!\"'{$(Lean.quote i.getId.toString)}' does not depend on any axioms\")\n";
+
+    #[test]
+    fn test_certification_admission_checks_worker_prefixes_and_candidates() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("turbo_source_admission_{}", next_tmp_id()));
+        let store = TurboStore::open(Some(&dir))?;
+        let env = std::collections::HashMap::new();
+        for source in ["set_option debug.skipKernelTC true", "run_cmd pure ()", "run_meta pure ()"] {
+            let error = eval_with_zygote_pool_with_args(
+                &store, "test", "", &env, Path::new("lean"), source, false, &[],
+            ).unwrap_err();
+            assert!(format!("{error:#}").contains("checking-weakening"));
+            for as_prefix in [false, true] {
+                let prefix = if as_prefix { source } else { "" };
+                let decls = vec![if as_prefix { "theorem good : True := True.intro" } else { source }.to_string(); 2];
+                for race in [false, true] {
+                    let result = if race {
+                        eval_candidates_race_via_zygote(&store, "test", "", &env, Path::new("lean"), prefix, &decls, &[])
+                    } else {
+                        eval_subshards_batch_via_zygote(&store, "test", "", &env, Path::new("lean"), prefix, &decls, &[])
+                    };
+                    let error = result.unwrap_err();
+                    assert!(format!("{error:#}").contains("checking-weakening"), "prefix={as_prefix}, race={race}: {error:#}");
+                }
+            }
+        }
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
 
     #[test]
     fn test_compiled_module_audit_replays_kernel_types() -> Result<()> {

@@ -1468,6 +1468,7 @@ fn execute_check_shard_payload_deferred_with_domain(
     Option<String>,
 )> {
     crate::module_builder::validate_lean_args(&req.lean_args)?;
+    crate::splitter::reject_checking_weakening(&req.shard_source)?;
     let t0 = std::time::Instant::now();
     if req.shard_key.is_empty() || req.shard_source.is_empty() {
         anyhow::bail!("Missing shard_key or shard_source in /check-shard request");
@@ -1744,6 +1745,7 @@ fn execute_check_shards_batch_payload_deferred(
     Vec<String>,
 )> {
     crate::module_builder::validate_lean_args(&req.lean_args)?;
+    crate::splitter::reject_checking_weakening(&req.coalesced_shard_source)?;
     let t0 = std::time::Instant::now();
     if req.items.is_empty() || req.coalesced_shard_source.is_empty() {
         anyhow::bail!("Missing items or coalesced_shard_source in /check-shards-batch request");

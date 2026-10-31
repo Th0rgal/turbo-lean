@@ -142,3 +142,8 @@ The raw Lean worker forces these two safety settings after decoding options, as
 the native compiler subprocesses do. Other `debug.*`, `internal.*`, diagnostic
 redirection, arbitrary `pp.*`, program/file options, and plugin/trust flags remain
 restricted by the allowlist; repeated `weak.` prefixes cannot bypass it.
+Source certification also rejects all `set_option debug.*` and `weak.*` settings,
+`warn.sorry` values other than `true`, and `run_elab`/`run_cmd`/`run_meta`, including
+scoped commands and worker prefixes. Benign options such as `maxHeartbeats` remain
+allowed. Every worker declaration and compiled artifact must independently replay
+through the kernel before it can produce a verified result or cache entry.

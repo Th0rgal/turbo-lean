@@ -951,6 +951,8 @@ fn check_directory(
     let mut all_shard_keys = Vec::new();
 
     for (lf, src_blake3, src, split) in split_entries {
+        anyhow::ensure!(!split.hygiene.has_checking_weakening,
+            "Soundness hygiene violation in {}: {:?}", lf.display(), split.hygiene.disallowed_items());
         let rel = lf.strip_prefix(canon_dir).unwrap_or(&lf);
         dir_hasher.update(rel.to_string_lossy().as_bytes());
         dir_hasher.update(b":");
@@ -1619,6 +1621,8 @@ fn check_single_decl(
             split.shards[shard_idx].proof_text = prf;
         }
     }
+    anyhow::ensure!(!split.hygiene.has_checking_weakening,
+        "Soundness hygiene violation in {}: {:?}", active_file.display(), split.hygiene.disallowed_items());
     let shard = &split.shards[shard_idx];
     let file_lean_args =
         crate::module_builder::try_resolve_lean_args_for_path(canon_dir, Some(&active_file))?;

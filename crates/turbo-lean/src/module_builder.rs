@@ -5552,6 +5552,8 @@ pub fn build_module_dag_with_trust(
                 spec.src_path.display()
             )
         })?;
+        splitter::reject_checking_weakening(&src)
+            .with_context(|| format!("Module {} ({})", spec.module_name, spec.src_path.display()))?;
         let src_blake3 = blake3::hash(src.as_bytes()).to_hex().to_string();
         let header = parse_header_info(&src);
         if let Some(ref herr) = header.header_error {
@@ -6716,7 +6718,8 @@ pub fn write_lake_module_hashes_and_trace(
     let no_forbidden_proof_tokens = !hygiene.has_sorry
         && !hygiene.has_axiom
         && !hygiene.native_violation()
-        && !hygiene.has_trust_compiler;
+        && !hygiene.has_trust_compiler
+        && !hygiene.has_checking_weakening;
     let skeleton_clean = src_blake3_matches && no_forbidden_proof_tokens;
     let is_stubbed_skeleton =
         hygiene.has_sorry || !no_forbidden_proof_tokens || !src_blake3_matches;

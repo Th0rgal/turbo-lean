@@ -315,8 +315,8 @@ fn git_head_tree_cache_paths(
     toolchain: &str,
 ) -> (PathBuf, PathBuf) {
     let mut h = blake3::Hasher::new();
-    // v11: cached entries embed `theorem-shard-v3` keys.
-    h.update(b"git-head-tree:v11:");
+    // v12: hygiene-checked entries embed `theorem-shard-v3` keys.
+    h.update(b"git-head-tree:v12:");
     h.update(repo_root.to_string_lossy().as_bytes());
     h.update(b":");
     h.update(canon_dir.to_string_lossy().as_bytes());
@@ -3949,6 +3949,8 @@ pub fn run_pr_verify_command(
         )?;
 
     for (file, split) in &current_splits {
+        anyhow::ensure!(!split.hygiene.has_checking_weakening,
+            "Soundness hygiene violation in {file}: {:?}", split.hygiene.disallowed_items());
         anyhow::ensure!(!split.hygiene.native_violation(),
             "[TurboLean.KernelGate] native_decide/bv_decide in {file} requires the base project's axiom allowlist");
     }
