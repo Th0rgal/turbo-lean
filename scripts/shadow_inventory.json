@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "comment": "Pinned target-side inventory for scripts/check_shadow_semantics.lean (Track B0 spec v4, deliverable 3). Code-owner review is requested via .github/CODEOWNERS but NOT enforced until a ruleset requires it (docs/SHADOW_SEMANTICS.md, Enforcement); the checker itself refuses any inventory that drops an entry present in the base revision or in its hard-coded minimum.",
+  "modules": [
+    "LeanNative.Backend.Semantics",
+    "LeanNative.IR.LCNF",
+    "TurboLean.ConLeche"
+  ],
+  "namespaces": [
+    "LeanMLIR",
+    "LNSym",
+    "ConLeche",
+    "LCNF"
+  ],
+  "namespace_owners": {
+    "LeanMLIR": ["LeanNative.Backend.Semantics"],
+    "LNSym": ["LeanNative.Backend.Semantics"],
+    "ConLeche": ["TurboLean.ConLeche"],
+    "LCNF": ["LeanNative.IR.LCNF"]
+  },
+  "proof_module_prefixes": [
+    "LeanNative.Proofs"
+  ],
+  "source_roots": [
+    "LeanNative",
+    "TurboLean"
+  ],
+  "forbidden": {
+    "namespace": "LeanNative.Semantics",
+    "component_prefix": "eval",
+    "private_helper_module": "LeanNative.Semantics.Eval",
+    "required": [
+      "LeanNative.Semantics.evalCode",
+      "LeanNative.Semantics.evalExpr",
+      "LeanNative.Semantics.evalBinOp",
+      "LeanNative.Semantics.evalUnaryOp",
+      "LeanNative.Semantics.evalScalarExpr"
+    ]
+  }
+}
