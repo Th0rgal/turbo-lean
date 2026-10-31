@@ -1280,15 +1280,16 @@ def main (args : List String) : IO Unit := do
     let line ← stdin.getLine
     if line.isEmpty then
       break
-    let trimmed := line.trimAscii.toString
+    let rawLine := line.dropRightWhile (fun c => c == '\n' || c == '\r')
+    let trimmed := rawLine.trimAscii.toString
     if trimmed.isEmpty then
       continue
     if trimmed == "ping" || ((trimmed.splitOn "\"cmd\"").length > 1 && (trimmed.splitOn "\"ping\"").length > 1) then
       stdout.putStrLn "{\"ok\":true,\"status\":\"pong\",\"kernel_gate_active\":true,\"import_ok\":true,\"env_cache_hit\":true,\"prefix_cache_hit\":false,\"import_us\":0,\"prefix_us\":0,\"elab_us\":0,\"heartbeats\":0,\"stdout\":\"\",\"messages\":[],\"errors\":[],\"used_constants\":[]}"
       stdout.flush
       continue
-    let parts := trimmed.splitOn "\t"
-    let rawImportsCsv := parts.headD "Init"
+    let parts := rawLine.splitOn "\t"
+    let rawImportsCsv := (parts.headD "Init").trimAscii.toString
     let importsCsv ← TurboLean.ZygoteWorker.coalesceImportsCsv rawImportsCsv
     let raw1 := parts.drop 1 |>.headD ""
     let raw2 := parts.drop 2 |>.headD ""
@@ -1299,6 +1300,7 @@ def main (args : List String) : IO Unit := do
       else
         (raw1, raw2, parts.drop 3 |>.headD "", parts.drop 4 |>.headD "")
     let hexOpts := parts.drop 5 |>.headD ""
+    let hostClosureDigest := (parts.drop 6 |>.headD "").trimAscii.toString
     let encodedLeanArgs := if hexOpts.isEmpty then "" else TurboLean.ZygoteWorker.decodeHexToString hexOpts
     let isBatchFission := modeFlag == "batch_fission" || modeFlag.startsWith "batch_fission"
     let isRaceCandidates := modeFlag == "race_candidates" || modeFlag.startsWith "race_candidates"
@@ -1361,10 +1363,16 @@ def main (args : List String) : IO Unit := do
       continue
     let cachedHit? ← match envCache[importsCsv]? with
       | some (cachedDiskKey, trackedMods, cachedEnv) => do
-        match ← TurboLean.ZygoteWorker.computeImportsClosureDiskKey importsCsv sysroot trackedMods with
-        | some curKey =>
-          if curKey == cachedDiskKey then pure (some (curKey, trackedMods, cachedEnv)) else pure none
-        | none => pure none
+        if !hostClosureDigest.isEmpty then
+          let hostKey := s!"host:{hostClosureDigest}"
+          pure (if cachedDiskKey == hostKey then some (hostKey, trackedMods, cachedEnv) else none)
+        else if cachedDiskKey.startsWith "host:" then
+          pure none
+        else
+          match ← TurboLean.ZygoteWorker.computeImportsClosureDiskKey importsCsv sysroot trackedMods with
+          | some curKey =>
+            pure (if curKey == cachedDiskKey then some (curKey, trackedMods, cachedEnv) else none)
+          | none => pure none
       | none => pure none
     let (envCacheHit, importUs, baseEnv?, envErr?, envDiskKey?, trackedMods) ← match cachedHit? with
       | some (curKey, tMods, env) => pure (true, 0, some env, none, some curKey, tMods)
@@ -1374,8 +1382,12 @@ def main (args : List String) : IO Unit := do
         try
           unsafe enableInitializersExecution
           let env ← Lean.importModules imports {} 1025 #[] false true level
-          let tMods ← TurboLean.ZygoteWorker.extractTrackedClosureMods importsCsv sysroot env
-          let freshKey? ← TurboLean.ZygoteWorker.computeImportsClosureDiskKey importsCsv sysroot tMods
+          let (freshKey?, tMods) ← if !hostClosureDigest.isEmpty then
+              pure (some s!"host:{hostClosureDigest}", #[])
+            else do
+              let tm ← TurboLean.ZygoteWorker.extractTrackedClosureMods importsCsv sysroot env
+              let fk? ← TurboLean.ZygoteWorker.computeImportsClosureDiskKey importsCsv sysroot tm
+              pure (fk?, tm)
           let tImp1 ← IO.monoNanosNow
           pure (false, (tImp1 - tImp0) / 1000, some env, none, freshKey?, tMods)
         catch e =>
