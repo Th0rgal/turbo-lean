@@ -109,6 +109,9 @@ bucket, `audit.py --diagnostic-accounting` independently checks all datasets,
 aggregate accounting, rankings, and supplied example membership. It reports the
 shortfalls and explicitly never certifies completion. The default audit retains
 the requirement of three distinct non-auxiliary names per positive bucket.
+`example_inventory.py <report.json> <inventory.json>` exhaustively inventories
+actual measured groups in the reported shortfall buckets, recording every
+eligible non-auxiliary name and the generated names excluded by the filter.
 
 Total build CPU denominators use `tree_cpu_seconds`, measured around the whole
 memcap/Lake subprocess tree with child resource usage. The Lean module CPU
