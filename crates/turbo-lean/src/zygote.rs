@@ -3699,6 +3699,75 @@ pub fn try_local_zygote_eval_with_args(
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_check_shard_http_error_rejection_is_final() {
+        let http = |e: &str| {
+            check_shard_http_error(anyhow::anyhow!(
+                "HTTP request POST http://127.0.0.1:1/check-shard failed (HTTP 500): {{\"status\":\"error\",\"error\":\"{}\"}}",
+                e
+            ))
+        };
+        let err = http("Remote `lean` shard verification failed for `t`").unwrap_err();
+        assert!(err.to_string().starts_with("Remote `lean` shard verification failed"));
+        assert!(matches!(http("Zygote import unavailable for `t`"), Ok(None)));
+        assert!(matches!(
+            check_shard_http_error(anyhow::anyhow!("Connection refused (os error 111)")),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn test_audited_lean_shard_exempts_only_named_explicit_stubs() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_audited_shard_{}_{}",
+            std::process::id(),
+            next_tmp_id()
+        ));
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        let store = TurboStore::open(Some(&dir.join("store")))?;
+        let env = std::collections::HashMap::from([(
+            "ELAN_TOOLCHAIN".to_string(),
+            "leanprover/lean4:v4.35.0".to_string(),
+        )]);
+        let run = |src: &str| {
+            let audit = std::collections::HashSet::from(["tgt".to_string()]);
+            run_audited_lean_shard(&store, Path::new("lean"), &env, Some(&dir), src, &audit, &[])
+        };
+        let stubs = "namespace N\ntheorem s1 (n : Nat) {m : Nat} : n + m = m + n := sorry\ntheorem s2 : 1 = 1 := sorry\nend N\n";
+        // Host-named prefix stubs (binders, namespaces) are exempt; the target is audited.
+        let ok = run(&format!(
+            "{}theorem N.tgt (a b : Nat) : a + b = b + a := N.s1 a\n",
+            stubs
+        ))?;
+        assert!(ok.status.success(), "{:?}", ok);
+        let reject = |src: String, why: &str, needle: &str| {
+            let err = run(&src).expect_err(why);
+            assert!(format!("{:#}", err).contains(needle), "{}: {:#}", why, err);
+        };
+        reject(
+            "theorem tgt : 1 = 1 := sorry\n".into(),
+            "an audited theorem is never a stub",
+            "disallowed axiom `sorryAx`",
+        );
+        reject(
+            format!(
+                "import Lean\n{}theorem Evil.s1 : False := by\n  run_tac do\n    let g ← Lean.Elab.Tactic.getMainGoal\n    g.assign (← Lean.Meta.mkSorry (← g.getType) false)\ntheorem tgt : False := Evil.s1\n",
+                stubs
+            ),
+            "a second explicit sorry matching a stub name is ambiguous",
+            "prefix stub `s1` is ambiguous",
+        );
+        reject(
+            "theorem other : 1 = 1 := rfl\n".into(),
+            "the audited theorem must be declared",
+            "missing from the compiled shard",
+        );
+        assert!(!run("theorem tgt : 1 = 2 := rfl\n")?.status.success());
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     fn repo_lean_cfg() -> Option<crate::module_builder::ProjectConfig> {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lean");
         dir.join(".lake/packages/lean-sys/LeanSys/Posix.lean")

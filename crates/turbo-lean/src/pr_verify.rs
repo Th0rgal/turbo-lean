@@ -6611,6 +6611,59 @@ end Fixture
     }
 
     #[test]
+    fn test_trusted_pr_verify_rejects_metaprogram_sorry_proof_edits() -> Result<()> {
+        // Proof-only edits that close the goal with `sorryAx` without any `sorry`/`admit` token,
+        // and one that also spoofs `#print axioms`: neither a zygote rejection nor the plain-`lean`
+        // fallback may accept them (the fallback is judged by the kernel-level module audit).
+        let repo_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_pr_meta_sorry_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&repo_dir);
+        fs::create_dir_all(&repo_dir)?;
+        fs::write(repo_dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        let base = "import Lean\ntheorem t : 2 + 2 = 4 := rfl\n";
+        fs::write(repo_dir.join("A.lean"), base)?;
+        git_init_and_commit(&repo_dir, "base")?;
+        let admit = "run_tac Lean.Elab.admitGoal (← Lean.Elab.Tactic.getMainGoal)";
+        let spoof = "macro_rules\n  | `(#print axioms $i:ident) => `(#eval IO.println s!\"'{$(Lean.quote i.getId.toString)}' does not depend on any axioms\")\n";
+        let proofs = [
+            ("", admit),
+            ("", "run_tac do\n    let g ← Lean.Elab.Tactic.getMainGoal\n    g.assign (← Lean.Meta.mkSorry (← g.getType) false)"),
+            ("", "run_tac do\n    let g ← Lean.Elab.Tactic.getMainGoal\n    g.assign (Lean.mkApp2 (Lean.mkConst (Lean.Name.mkSimple (\"sor\" ++ \"ryAx\")) [Lean.levelZero]) (← g.getType) (Lean.mkConst ``Bool.false))"),
+            (spoof, admit),
+        ];
+        for (i, (prelude, proof)) in proofs.iter().enumerate() {
+            let src = format!(
+                "import Lean\n{}theorem t : 2 + 2 = 4 := by\n  {}\n",
+                prelude, proof
+            );
+            fs::write(repo_dir.join("A.lean"), src)?;
+            let mut store = TurboStore::open(Some(&repo_dir.join(format!(".cache-{}", i))))?;
+            let res = run_pr_verify_command(
+                &mut store,
+                true,
+                repo_dir.clone(),
+                "HEAD".into(),
+                "trusted".into(),
+                false,
+                None,
+                None,
+                None,
+                None,
+                false,
+                0,
+                None,
+            );
+            let err = res.expect_err(&format!("metaprogram sorry #{} was accepted", i));
+            assert!(format!("{:#}", err).contains("sorryAx"), "#{}: {:#}", i, err);
+        }
+        let _ = fs::remove_dir_all(&repo_dir);
+        Ok(())
+    }
+
+    #[test]
     fn test_pr_verify_rechecks_dependents_of_nonlocal_edits_with_lake() -> Result<()> {
         let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
             .lock()
