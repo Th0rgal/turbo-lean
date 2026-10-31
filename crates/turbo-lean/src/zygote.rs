@@ -4310,7 +4310,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_multi_namespace_teardown_cleans_every_killed_namespace() {
-        let _lifecycle = lifecycle_lock(true).unwrap();
+        let lifecycle = lifecycle_exclusive_lock().unwrap();
         let mut children = Vec::new();
         let mut processes = Vec::new();
         let mut dirs = Vec::new();
@@ -4337,7 +4337,7 @@ mod tests {
         assert_eq!(cleanup.count, 2);
         assert_eq!(cleanup.staging.len(), 2);
         assert_eq!(
-            cleanup_lifecycle_staging(cleanup, None, &lifecycle_exclusive_lock().unwrap()).unwrap(),
+            cleanup_lifecycle_staging(cleanup, None, &lifecycle).unwrap(),
             2
         );
         assert!(dirs.iter().all(|dir| !dir.exists()));
