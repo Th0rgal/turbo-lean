@@ -1241,7 +1241,7 @@ fn run_lean_temp_file(
     let plan =
         (!audit.is_empty()).then(|| crate::splitter::plain_lean_audit(source, audit, audit.len()));
     let audited_src = plan.as_ref().map_or(source, |p| p.source.as_str());
-    fs::write(&tmp, &audited_src)?;
+    fs::write(&tmp, audited_src)?;
     let mut cmd = Command::new(lean_bin);
     for arg in crate::module_builder::filter_allowed_lean_args(lean_args) {
         cmd.arg(arg);
