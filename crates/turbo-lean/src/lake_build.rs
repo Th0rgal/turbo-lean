@@ -1764,6 +1764,44 @@ pub(crate) fn load_verified_project_manifest(
     Some(manifest)
 }
 
+/// P0-4: whether `entry` (a root-package module importing `imports`) was elaborated against the
+/// current artifacts of its direct imports: project-local pins compare against their manifest
+/// entries, other imports via `external_import_pin_current`.
+fn entry_import_pins_current(
+    canon_dir: &Path,
+    manifest: &crate::module_builder::VerifiedDepManifest,
+    entry: &crate::module_builder::VerifiedDepModuleEntry,
+    imports: &[String],
+) -> bool {
+    let Some(cfg) = manifest.cfg.as_ref() else {
+        return false;
+    };
+    crate::module_builder::verified_entry_imports_current(entry, imports, |imp, pin| {
+        let rel_slash = crate::module_builder::module_name_to_rel_slash(imp);
+        match resolve_project_lean_source(canon_dir, &rel_slash) {
+            Some(dep_src) => {
+                let dep_rel = dep_src
+                    .strip_prefix(canon_dir)
+                    .unwrap_or(&dep_src)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                pin.is_some_and(|pin| {
+                    manifest
+                        .modules
+                        .get(&dep_rel)
+                        .is_some_and(|e| e.olean_artifact_digest == pin)
+                })
+            }
+            None => crate::module_builder::external_import_pin_current(
+                cfg,
+                &manifest.dep_import_memo,
+                imp,
+                pin,
+            ),
+        }
+    })
+}
+
 fn verify_project_module_entry_and_sidecars(
     canon_dir: &Path,
     rel_src: &str,
@@ -1800,33 +1838,7 @@ fn verify_project_module_entry_and_sidecars(
         return false;
     }
     // P0-4: reject `.olean`s elaborated against an older artifact of one of their imports.
-    let Some(cfg) = manifest.cfg.as_ref() else {
-        return false;
-    };
-    if !crate::module_builder::verified_entry_imports_current(entry, &hdr.imports, |imp, pin| {
-        let rel_slash = crate::module_builder::module_name_to_rel_slash(imp);
-        match resolve_project_lean_source(canon_dir, &rel_slash) {
-            Some(dep_src) => {
-                let dep_rel = dep_src
-                    .strip_prefix(canon_dir)
-                    .unwrap_or(&dep_src)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                pin.is_some_and(|pin| {
-                    manifest
-                        .modules
-                        .get(&dep_rel)
-                        .is_some_and(|e| e.olean_artifact_digest == pin)
-                })
-            }
-            None => crate::module_builder::external_import_pin_current(
-                cfg,
-                &manifest.dep_import_memo,
-                imp,
-                pin,
-            ),
-        }
-    }) {
+    if !entry_import_pins_current(canon_dir, manifest, entry, &hdr.imports) {
         return false;
     }
     let lib_lean_dir = canon_dir.join(".lake/build/lib/lean");
@@ -2240,11 +2252,20 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
             .replace('\\', "/");
         let cur_hash = compute_cached_source_blake3(dep_src);
 
+        // An entry whose import pins moved on (e.g. an import rebuilt or CAS-restored without
+        // a newer mtime) marks its `.olean` stale even when timestamps look ordered.
         let manifest_stale = match (&manifest_opt, &cur_hash) {
-            (Some(m), Some(ch)) => m
-                .modules
-                .get(&dep_rel)
-                .is_some_and(|e| !e.kernel_audited || e.src_blake3 != *ch),
+            (Some(m), Some(ch)) => m.modules.get(&dep_rel).is_some_and(|e| {
+                !e.kernel_audited
+                    || e.src_blake3 != *ch
+                    || (olean_meta.is_some()
+                        && !entry_import_pins_current(
+                            canon_dir,
+                            m,
+                            e,
+                            adj.get(mod_name).map_or(&[][..], Vec::as_slice),
+                        ))
+            }),
             _ => false,
         };
         let mtime_stale = match (&olean_meta, &src_meta) {

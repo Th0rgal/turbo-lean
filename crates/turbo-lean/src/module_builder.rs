@@ -4589,7 +4589,7 @@ fn read_pkg_verified_manifest(
 
 /// Where a non-root-package import resolves, in `build_module_dag_with_trust` (trusted) order.
 pub(crate) enum ImportSite {
-    DepPkg(DiscoveredModuleSpec),
+    DepPkg(Box<DiscoveredModuleSpec>),
     Toolchain,
     Prebuilt(PathBuf),
     Unresolved,
@@ -4612,7 +4612,7 @@ pub(crate) fn resolve_import_site(cfg: &ProjectConfig, imp: &str) -> ImportSite 
         .iter()
         .filter_map(|dp| resolve_module_in_package(dp, false, imp));
     match (deps.next(), deps.next()) {
-        (Some(spec), None) => return ImportSite::DepPkg(spec),
+        (Some(spec), None) => return ImportSite::DepPkg(Box::new(spec)),
         (Some(_), Some(_)) => return ImportSite::Unresolved,
         _ => {}
     }
@@ -4683,7 +4683,7 @@ pub(crate) fn external_import_pin_current(
                 return true;
             }
             let ok = digest_is(&spec_olean_path(&spec), pin)
-                && dep_pkg_import_pins_consistent(cfg, spec, pin);
+                && dep_pkg_import_pins_consistent(cfg, *spec, pin);
             if ok {
                 if let Ok(mut m) = memo.0.lock() {
                     m.insert(key);
@@ -4738,7 +4738,7 @@ fn dep_pkg_import_pins_consistent(
             let ImportSite::DepPkg(sub) = resolve_import_site(cfg, imp) else {
                 return false;
             };
-            stack.push((sub, sub_pin.clone(), Some(mtime)));
+            stack.push((*sub, sub_pin.clone(), Some(mtime)));
         }
         seen.insert(key, pin);
     }
@@ -9999,6 +9999,65 @@ lean_exe «demo-exe» where
             "`App.C` reported verified against a dependency closure rebuilt underneath it"
         );
         assert!(crate::lake_build::resolve_prebuilt_module_import(&canon, &canon_c).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// P0-4 on the elaboration path: a CAS restore of an import (old blob mtime) must still make
+    /// `ensure_project_imports_fresh_for_check` treat dependents built against the newer import
+    /// as stale, so `check` never elaborates against a stale intermediate `.olean`.
+    #[test]
+    fn test_check_refreshes_dependent_after_import_cas_restore() {
+        let dir = make_temp_test_dir("stale_dependent_restore");
+        let proj_dir = dir.join("proj");
+        fs::create_dir_all(proj_dir.join("App")).unwrap();
+        fs::write(
+            proj_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )
+        .unwrap();
+        fs::write(
+            proj_dir.join("lakefile.toml"),
+            "name = \"app_pkg\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\nglobs = [\"App.+\"]\n",
+        )
+        .unwrap();
+        let a_src = |v: u32| format!("namespace App\ndef g : Nat := {v}\nend App\n");
+        let b_src = |v: u32| {
+            format!("import App.A\nnamespace App\ntheorem g_eq : g = {v} := rfl\nend App\n")
+        };
+        let mut store = TurboStore::open(Some(&dir.join(".turbo_store"))).unwrap();
+        let mut build = |targets: &[String]| {
+            build_project_modules_native(
+                &mut store,
+                &proj_dir,
+                targets,
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap()
+        };
+        fs::write(proj_dir.join("App/A.lean"), a_src(3)).unwrap();
+        fs::write(proj_dir.join("App/B.lean"), b_src(3)).unwrap();
+        build(&[]);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(proj_dir.join("App/A.lean"), a_src(4)).unwrap();
+        fs::write(proj_dir.join("App/B.lean"), b_src(4)).unwrap();
+        build(&[]);
+        // Restore `A` v3 from CAS; `B` (built against `A` v4) is now stale.
+        fs::write(proj_dir.join("App/A.lean"), a_src(3)).unwrap();
+        let rep = build(&["App.A".to_string()]);
+        assert_eq!(rep.cached_modules, vec!["App.A".to_string()]);
+        let canon = proj_dir.canonicalize().unwrap();
+        let c_file = canon.join("App/C.lean");
+        fs::write(&c_file, "import App.B\n").unwrap();
+        // Lake must be asked to refresh `App.B` (which then fails: `g = 4` no longer holds).
+        let res = crate::lake_build::ensure_project_imports_fresh_for_check(&canon, &[c_file]);
+        assert!(
+            !matches!(res, Ok(0)),
+            "stale `App.B` left in place for elaboration"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
