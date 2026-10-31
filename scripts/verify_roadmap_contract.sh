@@ -106,8 +106,8 @@ echo "  [OK] Bridge.lean ($(wc -l < lean/LeanNative/IR/Bridge.lean) LOC <= 350) 
 "$CORE_BIN" verify-certs --canonical-benchmark --json | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-assert d['verified'] is True and d['overallAssurance'] == 'Tested', d
-assert any(r['declName'] == 'dot_product_u64' and r['overallAssurance'] == 'Tested' for r in d['declSummaries']), d
+assert d['verified'] is True and d['overallAssurance'] in ('Tested', 'TranslationValidated'), d
+assert any(r['declName'] == 'sarray_scale_bias' and r['overallAssurance'] == 'TranslationValidated' for r in d['declSummaries']), d
 print(f'  [OK] Default Hybrid/TV Pass Certificates: verified={d[\"verified\"]}, assurance={d[\"overallAssurance\"]}, decls={len(d[\"declSummaries\"])}')
 "
 "$CORE_BIN" verify-certs --canonical-benchmark --verified-kernel-only --json | python3 -c "

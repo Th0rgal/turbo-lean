@@ -13,7 +13,9 @@ use crate::pack::{
     CheckShardsBatchResponse, DeltaManifest, ExportDeltaRequest, FastCheckHttpRequest,
     FASTCHECK_NO_MAIN_SUFFIX, FASTCHECK_PRELUDE_HARNESS,
 };
-use crate::zygote::{eval_with_zygote_pool, LocalZygoteDaemonInfo};
+#[cfg(not(test))]
+use crate::zygote::eval_with_zygote_pool;
+use crate::zygote::LocalZygoteDaemonInfo;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::fs;
@@ -830,8 +832,12 @@ pub fn serve_cas_http_with_auth(
                         timeout_ms: Option<u64>,
                         #[serde(default)]
                         verify_determinism: bool,
+                        #[serde(default)]
+                        lean_args: Vec<String>,
                     }
                     let req: EvalHttpRequest = serde_json::from_slice(&body).unwrap_or_default();
+                    let filtered_eval_args =
+                        crate::module_builder::filter_allowed_lean_args(&req.lean_args);
                     let Ok(req_store) = TurboStore::open(store_root_clone.as_deref()) else {
                         return;
                     };
@@ -897,7 +903,7 @@ pub fn serve_cas_http_with_auth(
                     } else {
                         env_vars.remove("LEAN_PATH");
                     }
-                    match crate::zygote::eval_with_zygote_pool_opts(
+                    match crate::zygote::eval_with_zygote_pool_opts_with_args(
                         &req_store,
                         tc,
                         &req.lean_path,
@@ -908,6 +914,7 @@ pub fn serve_cas_http_with_auth(
                         true,
                         req.file_name.as_deref(),
                         req.timeout_ms,
+                        &filtered_eval_args,
                     ) {
                         Ok(zreply) => {
                             let mut deterministic = true;
@@ -917,6 +924,9 @@ pub fn serve_cas_http_with_auth(
                                     staging.join(format!("http_eval_det_{}.lean", next_tmp_id()));
                                 if fs::write(&tmp_eval, src).is_ok() {
                                     let mut cmd = Command::new(&lean_bin);
+                                    for arg in &filtered_eval_args {
+                                        cmd.arg(arg);
+                                    }
                                     cmd.arg(&tmp_eval).envs(&env_vars);
                                     if !req.lean_path.is_empty() {
                                         cmd.env("LEAN_PATH", &req.lean_path);
@@ -1214,6 +1224,7 @@ fn toolchain_dir_candidates(toolchain: &str) -> (String, String, String) {
 
 /// Run `lean` on a temporary source file, applying `#print axioms` auditing under `allowed` when
 /// `audit` is non-empty. Returns `(exit_code, stdout, stderr)`.
+#[allow(clippy::too_many_arguments)]
 fn run_lean_temp_file(
     store: &TurboStore,
     lean_bin: &Path,
@@ -1223,6 +1234,7 @@ fn run_lean_temp_file(
     prefix: &str,
     audit: &std::collections::HashSet<String>,
     allowed: &[String],
+    lean_args: &[String],
 ) -> Result<(i32, String, String)> {
     let staging = store.fast_staging_dir();
     let tmp = staging.join(format!("{}_{}.lean", prefix, next_tmp_id()));
@@ -1233,6 +1245,9 @@ fn run_lean_temp_file(
     };
     fs::write(&tmp, &audited_src)?;
     let mut cmd = Command::new(lean_bin);
+    for arg in crate::module_builder::filter_allowed_lean_args(lean_args) {
+        cmd.arg(arg);
+    }
     cmd.arg(&tmp).envs(env_vars);
     if !toolchain.is_empty() && toolchain != "unknown" && !env_vars.contains_key("ELAN_TOOLCHAIN") {
         cmd.env("ELAN_TOOLCHAIN", toolchain.trim());
@@ -1445,7 +1460,10 @@ fn execute_check_shard_payload_deferred_with_domain(
     let mut zygote_peak_rss = 0u64;
     let mut zygote_used_constants: Vec<String> = Vec::new();
 
-    match eval_with_zygote_pool(
+    let filtered_req_args = crate::module_builder::filter_allowed_lean_args(&req.lean_args);
+    let req_args_digest_opt = crate::module_builder::compute_lean_args_digest(&filtered_req_args);
+
+    match crate::zygote::eval_with_zygote_pool_with_args(
         store,
         toolchain,
         &req.lean_path,
@@ -1453,6 +1471,7 @@ fn execute_check_shard_payload_deferred_with_domain(
         &lean_bin,
         &req.shard_source,
         true,
+        &filtered_req_args,
     ) {
         Ok(zreply) if zreply.import_ok => {
             if !zreply.ok {
@@ -1505,6 +1524,7 @@ fn execute_check_shard_payload_deferred_with_domain(
             "http_shard",
             &audit_set,
             &req_allowed,
+            &filtered_req_args,
         )?;
         if code != 0 {
             anyhow::bail!(
@@ -1521,13 +1541,22 @@ fn execute_check_shard_payload_deferred_with_domain(
     let deferred = if req.skip_cas_lock {
         None
     } else {
-        let receipt = serde_json::to_vec(&serde_json::json!({
+        let mut receipt_obj = serde_json::json!({
             "decl": req.decl,
             "prefix_env_hash": req.prefix_env_hash,
             "stmt_hash": req.stmt_hash,
             "proof_hash": req.proof_hash,
             "verified_at": now_unix()
-        }))?;
+        });
+        if let Some(ref ad) = req_args_digest_opt {
+            if let Some(map) = receipt_obj.as_object_mut() {
+                map.insert(
+                    "lean_args_digest".to_string(),
+                    serde_json::Value::String(ad.clone()),
+                );
+            }
+        }
+        let receipt = serde_json::to_vec(&receipt_obj)?;
         Some((
             toolchain.to_string(),
             vec![(req.shard_key.clone(), req.decl.clone(), receipt, dur_ms)],
@@ -1699,7 +1728,11 @@ fn execute_check_shards_batch_payload_deferred(
     let mut stderr = String::new();
     let mut exit_code = 0i32;
 
-    if let Ok(zreply) = eval_with_zygote_pool(
+    let filtered_batch_args = crate::module_builder::filter_allowed_lean_args(&req.lean_args);
+    let batch_args_digest_opt =
+        crate::module_builder::compute_lean_args_digest(&filtered_batch_args);
+
+    if let Ok(zreply) = crate::zygote::eval_with_zygote_pool_with_args(
         store,
         toolchain,
         &req.lean_path,
@@ -1707,6 +1740,7 @@ fn execute_check_shards_batch_payload_deferred(
         &lean_bin,
         &effective_batch_source,
         true,
+        &filtered_batch_args,
     ) {
         if zreply.import_ok {
             zygote_handled = true;
@@ -1749,6 +1783,7 @@ fn execute_check_shards_batch_payload_deferred(
             "http_batch_shards",
             &batch_audit,
             &req_allowed,
+            &filtered_batch_args,
         )?;
         exit_code = code;
         stdout = out;
@@ -1785,13 +1820,22 @@ fn execute_check_shards_batch_payload_deferred(
         if cached_map.contains_key(&item.shard_key) {
             continue;
         }
-        let receipt = serde_json::to_vec(&serde_json::json!({
+        let mut receipt_obj = serde_json::json!({
             "decl": item.decl_name,
             "prefix_env_hash": item.prefix_env_hash,
             "stmt_hash": item.stmt_hash,
             "proof_hash": item.proof_hash,
             "verified_at": now
-        }))?;
+        });
+        if let Some(ref ad) = batch_args_digest_opt {
+            if let Some(map) = receipt_obj.as_object_mut() {
+                map.insert(
+                    "lean_args_digest".to_string(),
+                    serde_json::Value::String(ad.clone()),
+                );
+            }
+        }
+        let receipt = serde_json::to_vec(&receipt_obj)?;
         publish_items.push((
             item.shard_key.clone(),
             item.decl_name.clone(),

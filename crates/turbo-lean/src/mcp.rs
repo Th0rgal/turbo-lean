@@ -86,6 +86,7 @@ pub struct AgentAnalyticsLedger {
 #[derive(Debug, Clone, Default)]
 pub struct AgentCallTelemetry {
     pub tool_name: String,
+    pub project_dir: Option<PathBuf>,
     pub decl_name: Option<String>,
     pub cache_hit: bool,
     pub stage1_tpu_reject: bool,
@@ -333,8 +334,9 @@ pub fn resolve_telemetry_policy_with_trust(
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let cfg_val = load_sandboxed_telemetry_json(&home);
     let user_cfg_path = user_turbo_lean_config_path();
-    let proj_cfg_path =
-        effective_trust.then(|| crate::shm_cache::find_nearest_project_toml(project_dir)).flatten();
+    let proj_cfg_path = effective_trust
+        .then(|| crate::shm_cache::find_nearest_project_toml(project_dir))
+        .flatten();
 
     let (mut enabled, mut remote, mut mode) = (true, false, "metrics".to_string());
     if let Some(m) = cfg_val.get("mode").and_then(|v| v.as_str()) {
@@ -350,7 +352,6 @@ pub fn resolve_telemetry_policy_with_trust(
         (enabled, remote, mode) = (false, false, "off".to_string());
     }
 
-    let mut explicit_remote_toml: Option<bool> = None;
     for toml_path in [Some(user_cfg_path.as_path()), proj_cfg_path.as_deref()]
         .into_iter()
         .flatten()
@@ -359,13 +360,9 @@ pub fn resolve_telemetry_policy_with_trust(
             let sec = parse_telemetry_toml_section(&txt);
             if let Some(ref m) = sec.mode {
                 apply_telemetry_mode_str(m, &mut enabled, &mut remote, &mut mode);
-                if m == "local" {
-                    explicit_remote_toml = Some(false);
-                }
             }
             if let Some(r) = sec.remote {
                 remote = r;
-                explicit_remote_toml = Some(r);
                 if r && mode == "local" {
                     mode = "metrics".to_string();
                 }
@@ -382,9 +379,6 @@ pub fn resolve_telemetry_policy_with_trust(
     }
 
     let token = resolve_telemetry_token(&cfg_val);
-    if !token.is_empty() && enabled && mode != "local" && explicit_remote_toml != Some(false) {
-        remote = true;
-    }
 
     for k in [
         "SANDBOXED_TELEMETRY_MODE",
@@ -436,7 +430,12 @@ pub fn resolve_telemetry_policy_with_trust(
         remote_url: env_or_json("SANDBOXED_TELEMETRY_URL", "url")
             .unwrap_or_else(|| "https://telemetry.thomas.md".to_string()),
         namespace: env_or_json("SANDBOXED_TELEMETRY_NAMESPACE", "namespace").unwrap_or_else(|| {
-            if token.is_empty() { "community" } else { "th0rgal" }.to_string()
+            if token.is_empty() {
+                "community"
+            } else {
+                "th0rgal"
+            }
+            .to_string()
         }),
         has_token: !token.is_empty(),
         user_config_path: user_cfg_path,
@@ -485,8 +484,11 @@ pub fn run_telemetry_command(
             fs::create_dir_all(parent)?;
         }
         let existing = fs::read_to_string(&cfg_path).unwrap_or_default();
-        fs::write(&cfg_path, upsert_telemetry_toml_section(&existing, enabled, remote, mode))
-            .with_context(|| format!("Failed to write {}", cfg_path.display()))?;
+        fs::write(
+            &cfg_path,
+            upsert_telemetry_toml_section(&existing, enabled, remote, mode),
+        )
+        .with_context(|| format!("Failed to write {}", cfg_path.display()))?;
     }
 
     let policy = resolve_telemetry_policy(project_dir);
@@ -509,7 +511,10 @@ pub fn run_telemetry_command(
     } else {
         println!(
             "[turbo-lean] telemetry: enabled={} remote={} mode={} (config: {})",
-            policy.enabled, policy.remote, policy.mode, policy.user_config_path.display()
+            policy.enabled,
+            policy.remote,
+            policy.mode,
+            policy.user_config_path.display()
         );
     }
     Ok(())
@@ -578,9 +583,9 @@ pub fn emit_sandboxed_telemetry_event_with_trust(
     .find_map(|k| std::env::var(k).ok().filter(|s| !s.is_empty()))
     .unwrap_or_else(|| format!("sess-{}", std::process::id()));
 
-    let is_ci = ["CI", "GITHUB_ACTIONS"]
-        .into_iter()
-        .any(|k| crate::shm_cache::parse_relaxed_bool(&std::env::var(k).unwrap_or_default()) == Some(true));
+    let is_ci = ["CI", "GITHUB_ACTIONS"].into_iter().any(|k| {
+        crate::shm_cache::parse_relaxed_bool(&std::env::var(k).unwrap_or_default()) == Some(true)
+    });
     let allow_ci_community = crate::shm_cache::parse_relaxed_bool(
         &std::env::var("SANDBOXED_TELEMETRY_ALLOW_CI_COMMUNITY").unwrap_or_default(),
     ) == Some(true);
@@ -596,7 +601,10 @@ pub fn emit_sandboxed_telemetry_event_with_trust(
         }
         if is_ci {
             obj.insert("ci".to_string(), serde_json::json!(true));
-            if let Some(sf) = obj.get_mut("static_features").and_then(|v| v.as_object_mut()) {
+            if let Some(sf) = obj
+                .get_mut("static_features")
+                .and_then(|v| v.as_object_mut())
+            {
                 sf.insert("ci".to_string(), serde_json::json!(true));
             }
         }
@@ -623,7 +631,11 @@ pub fn emit_sandboxed_telemetry_event_with_trust(
         let _ = fs::create_dir_all(&tmp_spool_dir);
         let tmp_events = tmp_spool_dir.join("events.jsonl");
         if tmp_events.metadata().map(|m| m.len()).unwrap_or(0) < 50 * 1024 * 1024 {
-            if let Ok(mut fh) = OpenOptions::new().create(true).append(true).open(&tmp_events) {
+            if let Ok(mut fh) = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&tmp_events)
+            {
                 let _ = writeln!(fh, "{}", event_str);
             }
         }
@@ -641,7 +653,6 @@ pub fn emit_sandboxed_telemetry_event_with_trust(
         let _ = writeln!(fh, "{}", event_str);
     }
 
-    #[cfg(not(test))]
     if policy.remote
         && !_suppress_ci_unauth
         && std::env::var("TURBO_LEAN_NO_REMOTE_TELEMETRY").is_err()
@@ -689,7 +700,7 @@ where
 
 /// Record telemetry from an agent tool call into `/dev/shm/turbo-lean-staging-<uid>/mcp_agent_analytics.json`.
 pub fn record_agent_call_telemetry(ev: AgentCallTelemetry) -> AgentAnalyticsLedger {
-    if !resolve_telemetry_policy(None).enabled {
+    if !resolve_telemetry_policy(ev.project_dir.as_deref()).enabled {
         return AgentAnalyticsLedger::default();
     }
     with_locked_ledger(|ledger| {
@@ -844,7 +855,12 @@ pub fn record_agent_call_telemetry(ev: AgentCallTelemetry) -> AgentAnalyticsLedg
             "winning_tactic_hint": ev.winning_tactic_hint,
             "accelerator_name": ev.accelerator_name,
         });
-        emit_sandboxed_telemetry_event(event_json, "turbo_lean_events.jsonl");
+        emit_sandboxed_telemetry_event_with_trust(
+            ev.project_dir.as_deref(),
+            true,
+            event_json,
+            "turbo_lean_events.jsonl",
+        );
         ledger.clone()
     })
 }
@@ -967,6 +983,22 @@ fn extract_fast_tactic_from_verbose(verbose: &serde_json::Value) -> Option<Strin
                     .get("new_body_src")
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
+                {
+                    return Some(nb.to_string());
+                }
+            }
+        }
+    }
+    if let Some(suggs) = verbose
+        .get("rewrite_suggestions")
+        .and_then(|v| v.as_array())
+    {
+        for s in suggs {
+            if s.get("kind").and_then(|v| v.as_str()) == Some("rewritten_proof") {
+                if let Some(nb) = s
+                    .get("new_body_src")
+                    .and_then(|v| v.as_str())
+                    .filter(|x| !x.is_empty())
                 {
                     return Some(nb.to_string());
                 }
@@ -1235,6 +1267,7 @@ pub fn execute_fast_check(
     items: Option<&[serde_json::Value]>,
     backend: Option<&str>,
     compact: bool,
+    project_dir: Option<&Path>,
 ) -> serde_json::Value {
     let t0 = Instant::now();
     let backend_pref = backend.unwrap_or("auto");
@@ -1300,6 +1333,9 @@ pub fn execute_fast_check(
 
     record_agent_call_telemetry(AgentCallTelemetry {
         tool_name: "turbo_fast_check".to_string(),
+        project_dir: project_dir
+            .or_else(|| file.map(Path::new).and_then(Path::parent))
+            .map(Path::to_path_buf),
         decl_name: Some(decl_name.to_string()),
         stage1_tpu_reject: verdict.is_cex,
         elapsed_ms,
@@ -1443,7 +1479,12 @@ pub fn execute_mcp_agent_step(
     let compact_out = if compact {
         let mut out = verdict.to_compact_json();
         if let Some(obj) = out.as_object_mut() {
-            for k in ["proof_term_nodes", "used_constants", "tactic_skeleton", "goal_head"] {
+            for k in [
+                "proof_term_nodes",
+                "used_constants",
+                "tactic_skeleton",
+                "goal_head",
+            ] {
                 if let Some(v) = verdict.full.get(k) {
                     obj.insert(k.to_string(), v.clone());
                 }
@@ -1482,7 +1523,10 @@ pub fn execute_mcp_agent_step(
         }
     });
 
-    let proof_term_nodes = verbose.get("proof_term_nodes").and_then(|v| v.as_u64()).unwrap_or(0);
+    let proof_term_nodes = verbose
+        .get("proof_term_nodes")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let used_constants = verbose
         .get("used_constants")
         .and_then(|v| v.as_array())
@@ -1504,11 +1548,18 @@ pub fn execute_mcp_agent_step(
     let stmt_nodes = verbose.get("stmt_nodes").and_then(|v| v.as_u64());
     let stmt_depth = verbose.get("stmt_depth").and_then(|v| v.as_u64());
     let num_binders = verbose.get("num_binders").and_then(|v| v.as_u64());
-    let goal_head = verbose.get("goal_head").and_then(|v| v.as_str()).map(String::from);
-    let tactic_skeleton = verbose.get("tactic_skeleton").and_then(|v| v.as_str()).map(String::from);
+    let goal_head = verbose
+        .get("goal_head")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let tactic_skeleton = verbose
+        .get("tactic_skeleton")
+        .and_then(|v| v.as_str())
+        .map(String::from);
 
     record_agent_call_telemetry(AgentCallTelemetry {
         tool_name: "turbo_agent_step".to_string(),
+        project_dir: project_dir.or_else(|| file.parent()).map(Path::to_path_buf),
         decl_name: decl.map(|s| s.to_string()).or_else(|| {
             verbose
                 .get("decl")
@@ -1548,7 +1599,11 @@ pub fn execute_mcp_agent_step(
 }
 
 /// Execute `turbo_audit_spec` MCP tool in `< 1 ms` in-process via unified `gpu_fastcheck::audit_spec_file_or_source`.
-pub fn execute_mcp_audit_spec(file: &Path, decl: Option<&str>) -> serde_json::Value {
+pub fn execute_mcp_audit_spec(
+    file: &Path,
+    decl: Option<&str>,
+    project_dir: Option<&Path>,
+) -> serde_json::Value {
     let t0 = Instant::now();
     if file.as_os_str().is_empty() || !file.exists() {
         let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
@@ -1567,6 +1622,7 @@ pub fn execute_mcp_audit_spec(file: &Path, decl: Option<&str>) -> serde_json::Va
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
     record_agent_call_telemetry(AgentCallTelemetry {
         tool_name: "turbo_audit_spec".to_string(),
+        project_dir: project_dir.or_else(|| file.parent()).map(Path::to_path_buf),
         decl_name: decl.map(|s| s.to_string()),
         elapsed_ms,
         stage1_tpu_ms: elapsed_ms,
@@ -1585,6 +1641,8 @@ fn mcp_tool_schema(
     req: &[&str],
 ) -> serde_json::Value {
     let mut schema = serde_json::json!({ "type": "object", "properties": props });
+    schema["properties"].as_object_mut().unwrap().entry("project_dir")
+        .or_insert_with(|| serde_json::json!({"type": "string", "description": "Request workspace (overrides the server default)"}));
     if !req.is_empty() {
         schema["required"] = serde_json::json!(req);
     }
@@ -1599,7 +1657,7 @@ pub fn mcp_tools_list_value() -> serde_json::Value {
             mcp_tool_schema("turbo_agent_step", "Stage 0 (CAS/hygiene) -> Stage 1 (TPU/LNIR Fast-Check + Vacuity Gate) -> Stage 2 (Zygote + Accelerators) surgical verification funnel with 4x-10x token compaction.", json!({"file":{"type":"string"},"decl":{"type":"string"},"compact":{"type":"boolean","default":true},"tpu":{"type":"boolean","default":true}}), &["file"]),
             mcp_tool_schema("turbo_check_decl", "Check a single declaration or file in isolation with PrefixEnv sharding and compact diagnostics.", json!({"file":{"type":"string"},"decl":{"type":"string"},"project_dir":{"type":"string"},"compact":{"type":"boolean","default":true}}), &["file"]),
             mcp_tool_schema("turbo_fast_check", "Unified multi-backend (`auto` | `cpu` | `gpu` | `tpu`) single-theorem or batch counterexample search with local witness re-certification (0 false positives).", json!({"file":{"type":"string"},"decl":{"type":"string"},"stmt_src":{"type":"string"},"items":{"type":"array"},"backend":{"type":"string","default":"auto"},"compact":{"type":"boolean","default":true}}), &[]),
-            mcp_tool_schema("turbo_audit_spec", "Run Tier 1 (vacuity, tautology, constant shadowing) & Tier 2 (unused private decls, horizontal packing) specification audit on a Lean file or declaration in < 1 ms.", json!({"file":{"type":"string"},"decl":{"type":"string"}}), &["file"]),
+            mcp_tool_schema("turbo_audit_spec", "Run Tier 1 (vacuity, tautology, constant shadowing) & Tier 2 (unused private decls, horizontal packing) specification audit on a Lean file or declaration in < 1 ms.", json!({"file":{"type":"string"},"decl":{"type":"string"},"require_nonempty":{"type":"boolean","default":false}}), &["file"]),
             mcp_tool_schema("turbo_pr_verify", "Git-aware incremental PR verifier: diffs against `--base` and verifies modified theorem proofs in isolation.", json!({"project_dir":{"type":"string","default":"."},"base":{"type":"string","default":"HEAD"},"mode":{"type":"string","default":"trusted"},"disallow_statement_changes":{"type":"boolean","default":false}}), &[]),
             mcp_tool_schema("turbo_cluster_status", "Return live multi-backend & federated cluster health, Law 15 optimal route selection, and the Lean C-ABI vs Rust speed audit.", json!({"bench_cabi":{"type":"boolean","default":true}}), &[]),
         ]
@@ -1645,6 +1703,13 @@ pub fn handle_mcp_jsonrpc_request(
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({}));
 
+            // Per-request workspace wins over the server default; file-based tools fall
+            // back to the file's parent, then policy discovery falls back to CWD.
+            let project_dir = args
+                .get("project_dir")
+                .and_then(|v| v.as_str())
+                .map(Path::new)
+                .or(default_project_dir);
             let (payload, is_error) = match tool_name {
                 "turbo_agent_step" | "turbo_check_decl" => {
                     let file_str = args.get("file").and_then(|v| v.as_str()).unwrap_or("");
@@ -1687,7 +1752,15 @@ pub fn handle_mcp_jsonrpc_request(
                         .get("compact")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(true);
-                    let res = execute_fast_check(file, decl, stmt_src, items, backend, compact);
+                    let res = execute_fast_check(
+                        file,
+                        decl,
+                        stmt_src,
+                        items,
+                        backend,
+                        compact,
+                        project_dir,
+                    );
                     let err = res.get("ok").and_then(|v| v.as_bool()) == Some(false)
                         && (res.get("kind").and_then(|v| v.as_str()) == Some("error")
                             || res.get("status").and_then(|v| v.as_str()) == Some("error"));
@@ -1703,9 +1776,19 @@ pub fn handle_mcp_jsonrpc_request(
                 "turbo_audit_spec" => {
                     let file_str = args.get("file").and_then(|v| v.as_str()).unwrap_or("");
                     let decl = args.get("decl").and_then(|v| v.as_str());
-                    let res = execute_mcp_audit_spec(Path::new(file_str), decl);
+                    let require_nonempty = args
+                        .get("require_nonempty")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let mut res = execute_mcp_audit_spec(Path::new(file_str), decl, project_dir);
+                    crate::gpu_fastcheck::apply_require_nonempty_to_audit_report(
+                        &mut res,
+                        require_nonempty,
+                    );
                     let err = res.get("status").and_then(|v| v.as_str()) == Some("error")
-                        || res.get("verdict").and_then(|v| v.as_str()) == Some("error");
+                        || res.get("verdict").and_then(|v| v.as_str()) == Some("error")
+                        || (require_nonempty
+                            && res.get("ok").and_then(|v| v.as_bool()) == Some(false));
                     (res, err)
                 }
                 "turbo_pr_verify" => {
@@ -1949,6 +2032,11 @@ mod tests {
                 "SANDBOXED_TELEMETRY_CONFIG",
                 "SANDBOXED_TELEMETRY_TOKEN",
                 "SANDBOXED_TELEMETRY_TMP_DIR",
+                "SANDBOXED_TELEMETRY_BATCH_ONLY",
+                "SANDBOXED_TELEMETRY_URL",
+                "SANDBOXED_MISSION_ID",
+                "TURBO_LEAN_AUTONOMOUS_AGENT",
+                "TURBO_LEAN_GOVERNOR_TOKEN",
                 "TELEMETRY_API_KEY",
                 "CI",
                 "GITHUB_ACTIONS",
@@ -2169,8 +2257,8 @@ mod tests {
             "turbo_lean_ci_test.jsonl",
         );
         std::env::remove_var("CI");
-        let ci_spooled =
-            fs::read_to_string(tmp_dir.join("turbo_lean_ci_test.jsonl")).expect("ci telemetry spooled");
+        let ci_spooled = fs::read_to_string(tmp_dir.join("turbo_lean_ci_test.jsonl"))
+            .expect("ci telemetry spooled");
         let ci_json: serde_json::Value =
             serde_json::from_str(ci_spooled.lines().next().unwrap()).unwrap();
         assert_eq!(ci_json["ci"], true);
@@ -2185,7 +2273,7 @@ mod tests {
         let _env_scope = ScopedTelemetryTestEnv::new("fail_closed");
         let missing_path = "/tmp/nonexistent_turbo_lean_sec_file_20261029.lean";
 
-        let fc_empty = execute_fast_check(None, Some("d"), None, None, Some("cpu"), true);
+        let fc_empty = execute_fast_check(None, Some("d"), None, None, Some("cpu"), true, None);
         assert_eq!(fc_empty["ok"], false);
         assert_eq!(fc_empty["kind"], "error");
 
@@ -2196,11 +2284,12 @@ mod tests {
             None,
             Some("cpu"),
             false,
+            None,
         );
         assert_eq!(fc_missing["ok"], false);
         assert_eq!(fc_missing["status"], "error");
 
-        let audit_missing = execute_mcp_audit_spec(Path::new(missing_path), None);
+        let audit_missing = execute_mcp_audit_spec(Path::new(missing_path), None, None);
         assert_eq!(audit_missing["ok"], false);
         assert_eq!(audit_missing["status"], "error");
 
@@ -2268,7 +2357,11 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&repo_dir);
         fs::create_dir_all(&repo_dir).unwrap();
-        fs::write(repo_dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            repo_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )
+        .unwrap();
         fs::write(
             repo_dir.join("A.lean"),
             "theorem t : 2 ^ 3 = 8 := by decide\n",
@@ -2295,7 +2388,11 @@ mod tests {
                 .success());
         }
         // Working tree modifies `turbo-lean.toml` to `allow = ["*"]` and switches proof to `bv_decide` / `native_decide`.
-        fs::write(repo_dir.join("turbo-lean.toml"), "[axioms]\nallow = [\"*\"]\n").unwrap();
+        fs::write(
+            repo_dir.join("turbo-lean.toml"),
+            "[axioms]\nallow = [\"*\"]\n",
+        )
+        .unwrap();
         fs::write(
             repo_dir.join("A.lean"),
             "theorem t : 2 ^ 3 = 8 := by native_decide\n",
@@ -2400,19 +2497,14 @@ mod tests {
         assert!(env_scope.root.join("spool/untrusted_cwd.jsonl").exists());
         assert!(!env_scope.root.join("remote_batch/events.jsonl").exists());
 
-        // 2c. Project `[telemetry] remote = false` overrides token-implied remote opt-in.
-        fs::write(
-            proj_dir.join("turbo-lean.toml"),
-            "[telemetry]\nenabled = true\nremote = false\n",
-        )
-        .unwrap();
+        // 2c. A telemetry token alone is not a remote opt-in.
+        fs::remove_file(proj_dir.join("turbo-lean.toml")).unwrap();
         std::env::set_var("SANDBOXED_TELEMETRY_TOKEN", "test-token-123");
-        let token_overridden = resolve_telemetry_policy(Some(&proj_dir));
+        let token_alone = resolve_telemetry_policy(Some(&proj_dir));
+        assert!(token_alone.enabled && !token_alone.remote && token_alone.has_token);
         std::env::remove_var("SANDBOXED_TELEMETRY_TOKEN");
-        assert!(token_overridden.enabled && !token_overridden.remote && token_overridden.has_token);
 
         // 3. `turbo-lean telemetry disable` / `enable` / `local` roundtrip in user config TOML
-        fs::remove_file(proj_dir.join("turbo-lean.toml")).unwrap();
         run_telemetry_command("enable", Some(&proj_dir), true).unwrap();
         let after_enable = resolve_telemetry_policy(Some(&proj_dir));
         assert!(after_enable.enabled);
@@ -2444,10 +2536,7 @@ mod tests {
             serde_json::json!({"schema": "turbo-lean.telemetry.v1", "tool_name": "disabled_check"}),
             "disabled_events.jsonl",
         );
-        assert!(!env_scope
-            .root
-            .join("spool/disabled_events.jsonl")
-            .exists());
+        assert!(!env_scope.root.join("spool/disabled_events.jsonl").exists());
 
         // 5. Explicit env override (`TURBO_LEAN_TELEMETRY=opt-in` vs `TURBO_LEAN_TELEMETRY=0`)
         std::env::set_var("TURBO_LEAN_TELEMETRY", "opt-in");
@@ -2460,5 +2549,30 @@ mod tests {
         let env_off = resolve_telemetry_policy(Some(&proj_dir));
         assert!(!env_off.enabled);
         assert!(!env_off.remote);
+    }
+
+    #[test]
+    fn test_compact_for_llm_preserves_fast_tactic_from_rewrite_suggestions() {
+        let verbose = serde_json::json!({
+            "status": "theorem_verified",
+            "verification_status": "verified",
+            "verified": true,
+            "decl": "eligible_thm",
+            "accelerator_assisted": false,
+            "winning_accelerator": null,
+            "accelerator_certificates": [],
+            "rewrite_suggestions": [{
+                "kind": "rewritten_proof",
+                "accelerator_name": "builtin:simd-simp-distiller",
+                "new_body_src": "by simp only [eligible, Eligible]",
+                "estimated_speedup_hint": "9.1x",
+                "applied": false
+            }],
+            "elapsed_ms": 1.2
+        });
+        let verdict = StepVerdict::from_verbose(verbose);
+        let compact = verdict.to_compact_json();
+        assert_eq!(compact["ok"], true);
+        assert_eq!(compact["fast_tactic"], "by simp only [eligible, Eligible]");
     }
 }

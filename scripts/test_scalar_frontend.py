@@ -782,9 +782,10 @@ run_meta do
      ("arity mismatch", lowerImpureCode (.jp (.mk j `join #[] ty (.return x)) (.jmp j #[.fvar x]))),
      ("constructor tag mutation", lowerImpureCode (.setTag x 1 (.return x))),
      ("recursive local function", lowerPureCode (.fun recLocalFn (.return x))),
-     ("higher-order fvar call", lowerPureLetValue (.fvar x #[.fvar x]) .i64 >>= fun _ => pure (.ret 0)),
-     ("constructor payload pattern", lowerPureAlts 0 false 0 [.alt `Boxed.mk #[p0] (.return x)]),
-     ("unsupported string literal", lowerLitValue (.str "abc") >>= fun _ => pure (.ret 0))]
+             ("higher-order fvar call", lowerPureLetValue (.fvar x #[.fvar x]) .i64 >>= fun _ => pure (.ret 0)),
+             ("constructor payload pattern", lowerPureAlts 0 false 0 [.alt `Boxed.mk #[p0] (.return x)]),
+             ("unsupported string literal", lowerLitValue (.str "abc") >>= fun _ => pure (.ret 0)),
+             ("Unsupported heap reset", lowerImpureLetValue (.reset 2 x rfl) .objPtr >>= fun _ => pure (.ret 0))]
   for (expected, action) in actions do
     let rejected ← try
       let _ ← action.run' {}
@@ -889,6 +890,1707 @@ def f (x : UInt64) : UInt64 :=
                 text=True,
             )
             self.assertEqual([int(r["value_u64"]) for r in ev_rows], json.loads(stock_out))
+
+    def test_stage1d_heap_adt_perceus_reuse_alias_drop_tv_and_fail_closed_llvm(self):
+        engines = fuzzer.probe_engines()
+        lean_src = """inductive RcPacket where
+  | pair : (UInt64 × UInt64) → (UInt64 × UInt64) → RcPacket
+  | empty : RcPacket
+
+@[inline] def foldPacket (pkt : RcPacket) : UInt64 :=
+  match pkt with
+  | .pair p q => ((p.1 * 1315423911) + p.2) ^^^ ((q.1 * 2654435761) + q.2)
+  | .empty => 0x9E3779B97F4A7C15
+
+@[inline] def stepPacket (pkt : RcPacket) (delta : UInt64) : RcPacket :=
+  match pkt with
+  | .pair p q => .pair (p.1 + delta, p.2 ^^^ delta) (q.1 + (delta <<< 1), q.2 + 17)
+  | .empty => .empty
+
+@[export probe_rc_reuse]
+def probe_rc_reuse (seed delta : UInt64) : UInt64 :=
+  let p0 := if seed == 0 then RcPacket.empty else RcPacket.pair (seed, seed + 5) (delta, delta + 11)
+  foldPacket (stepPacket (stepPacket p0 (delta + 1)) (delta ^^^ 7))
+
+@[export probe_rc_alias]
+def probe_rc_alias (seed delta : UInt64) : UInt64 :=
+  let base := RcPacket.pair (seed, seed ^^^ 0x9E3779B97F4A7C15) (delta + 3, seed + delta)
+  foldPacket base + (foldPacket (stepPacket base (delta + 5)) ^^^ foldPacket (stepPacket base (delta + 19)))
+
+@[inline] def swapPairIf (flag : UInt64) (p : UInt64 × UInt64) : UInt64 × UInt64 :=
+  if (flag &&& 1) == 0 then (p.1 + 3, p.2 ^^^ 5) else (p.2 + 7, p.1 ^^^ 11)
+
+@[export probe_rc_drop]
+def probe_rc_drop (sel seed delta : UInt64) : UInt64 :=
+  let live := RcPacket.pair (seed + 1, delta + 2) (seed ^^^ delta, seed + 29)
+  let dead := RcPacket.pair (seed * 7, delta * 11) (seed + 41, delta + 43)
+  let base :=
+    if (sel &&& 1) == 0 then (foldPacket (stepPacket live delta), delta)
+    else (foldPacket (stepPacket dead (delta + 9)), delta + 9)
+  let chosen := swapPairIf seed base
+  chosen.1 ^^^ chosen.2
+"""
+        with tempfile.TemporaryDirectory(prefix="stage1d_heap_rc_") as directory:
+            tmp = Path(directory)
+            src = tmp / "Stage1DHeap.lean"
+            src.write_text(lean_src, encoding="utf-8")
+            wire = tmp / "stage1d.lnir"
+            res = subprocess.run(
+                [engines["full_bin"], "emit-lnir", "--wire", str(src), "-o", str(wire)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            wire_text = wire.read_text(encoding="utf-8")
+            for op in ("C_inc", "C_dec", "E_ctor", "E_cgeto", "E_isexcl", "E_mktup", "E_projtup", "C_ite"):
+                self.assertGreater(wire_text.count(op), 0, f"missing expected opcode {op} in Stage 1D wire")
+            tv = json.loads(subprocess.check_output(
+                [engines["core_bin"], "validate-tv", "--lnir", str(wire), "--json"], text=True,
+            ))
+            self.assertTrue(tv.get("allPassed"), tv)
+            llvm_out = tmp / "bad.ll"
+            llvm_res = subprocess.run(
+                [engines["core_bin"], "compile-llvm", "--lnir", str(wire), "-o", str(llvm_out)],
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(llvm_res.returncode, 0, "compile-llvm must fail closed on Stage 1D heap ops")
+            self.assertFalse(llvm_out.exists())
+            stock_src = tmp / "StockStage1D.lean"
+            stock_src.write_text(
+                lean_src + '\ndef main : IO Unit := IO.println s!"[{probe_rc_reuse 0 7},{probe_rc_reuse 42 7},{probe_rc_alias 42 7},{probe_rc_drop 0 42 7},{probe_rc_drop 1 42 7}]"\n',
+                encoding="utf-8",
+            )
+            expected = json.loads(subprocess.check_output(
+                ["lake", "env", "lean", "--run", str(stock_src)], cwd=fuzzer.ROOT / "lean", text=True,
+            ))
+            probes = [("probe_rc_reuse", [0, 7]), ("probe_rc_reuse", [42, 7]), ("probe_rc_alias", [42, 7]),
+                      ("probe_rc_drop", [0, 42, 7]), ("probe_rc_drop", [1, 42, 7])]
+            for extra in ([], ["--opt"]):
+                got = []
+                for sym, args in probes:
+                    row = json.loads(subprocess.check_output(
+                        [engines["core_bin"], "eval-lnir", "--lnir", str(wire), "--args",
+                         f"{sym}:" + ",".join(map(str, args)), "--batch-json", *extra], text=True,
+                    ))[0]
+                    self.assertTrue(row.get("ok"), row)
+                    self.assertEqual(row.get("live_objects"), 0, row)
+                    got.append(int(row["value_u64"]))
+                self.assertEqual(got, expected)
+
+            # 3-field tuple-carrying heap ADT validates cleanly under SymbolicTV (`nonVacuousCount > 0`)
+            tri_src = tmp / "TriPacket.lean"
+            tri_src.write_text('''inductive TriPacket where
+  | tri : (UInt64 × UInt64) → (UInt64 × UInt64) → (UInt64 × UInt64) → TriPacket
+  | empty : TriPacket
+
+@[inline] def stepTriField (p : TriPacket) (d : UInt64) : TriPacket :=
+  match p with
+  | .tri a b c => .tri (a.1 + d, a.2) b (c.1 ^^^ d, c.2 + 1)
+  | .empty => .empty
+
+@[inline] def readThirdField (p : TriPacket) : UInt64 :=
+  match p with
+  | .tri a b c => a.1 + b.2 + c.1 + c.2
+  | .empty => 99
+
+@[export probe_tri]
+def probe_tri (x : UInt64) : UInt64 :=
+  let init := if x == 0 then TriPacket.empty else TriPacket.tri (x, x + 1) (x + 3, x + 4) (x + 5, x + 6)
+  readThirdField (stepTriField init 7)
+''', encoding="utf-8")
+            tri_wire = tmp / "tri.lnir"
+            subprocess.run([engines["full_bin"], "emit-lnir", "--wire", str(tri_src), "-o", str(tri_wire)],
+                           check=True, capture_output=True, text=True)
+            tri_tv = json.loads(subprocess.check_output(
+                [engines["core_bin"], "validate-tv", "--lnir", str(tri_wire), "--json"], text=True,
+            ))
+            self.assertTrue(tri_tv.get("allPassed"), tri_tv)
+
+            # Direct scalar-payload heap ADT (`sproj`/`sset`) fails closed instead of accepting without projection lowering
+            bad_scalar_adt = tmp / "BadScalarAdt.lean"
+            bad_scalar_adt.write_text('''inductive DirectScalarPkt where
+  | data : UInt64 → DirectScalarPkt
+  | empty : DirectScalarPkt
+
+def readDirect (p : DirectScalarPkt) : UInt64 :=
+  match p with
+  | .data x => x + 1
+  | .empty => 0
+
+@[export probe_bad_direct]
+def probe_bad_direct (x : UInt64) : UInt64 := readDirect (.data x)
+''', encoding="utf-8")
+            bad_wire = tmp / "bad_scalar_adt.lnir"
+            bad_res = subprocess.run(
+                [engines["full_bin"], "emit-lnir", "--wire", str(bad_scalar_adt), "-o", str(bad_wire)],
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(bad_res.returncode, 0, "direct scalar-payload heap ADT must fail closed")
+            self.assertFalse(bad_wire.exists())
+
+            # SymbolicTV sees `lean_native_ctor_set` writes through `.scalar (.var a)` object aliases
+            alias_tv = tmp / "AliasTv.lean"
+            alias_tv.write_text('''import LeanNative.Proofs.SymbolicTV
+open LeanNative.IR LeanNative.Proofs
+#eval show IO Unit from do
+  let mkDecl (readVar : VarId) : LNIRDecl := {
+    name := "alias_write_test"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 1 .i64 (.scalar (.constU64 1))
+        (.letBind 2 .objPtr (.allocCtor 0 [1] [])
+          (.letBind 3 .objPtr (.scalar (.var 2))
+            (.letBind 4 .i64 (.scalar (.constU64 0))
+              (.letBind 5 .i64 (.scalar (.constU64 2))
+                (.letBind 6 .unit (.call "lean_native_ctor_set" [2, 4, 5] .unit false)
+                  (.letBind 7 .i64 (.ctorGetObj readVar 0)
+                    (.decRef 2 1 (.ret 7))))))))
+  }
+  let res := validateTranslationDecl (mkDecl 3) (mkDecl 2) 8
+  unless res.passed && res.symRetEquiv do
+    throw <| IO.userError s!"alias TV failed: {reprStr res}"
+  -- 1. Constructor mutation on input object with x == 999 guard (outside concrete 1..8 samples) must be rejected by memWritesEquiv
+  let mkGuardedMutation (badBranch : Bool) : LNIRDecl := {
+    name := "ctor_set_mem_summary"
+    params := [{ id := 0, name := "p", ty := .objPtr, borrow := false }, { id := 1, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 2 .i1 (.isExclusive 0)
+        (.ite 2
+          (.letBind 3 .i64 (.scalar (.constU64 0))
+            (.letBind 4 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+              (.letBind 5 .i64 (.scalar (if badBranch then .select (.var 4) (.constU64 3) (.constU64 2) else .constU64 2))
+                (.letBind 6 .unit (.call "lean_native_ctor_set" [0, 3, 5] .unit false)
+                  (.letBind 7 .i64 (.scalar (.constU64 0)) (.ret 7))))))
+          (.letBind 7 .i64 (.scalar (.constU64 0)) (.ret 7)))
+  }
+  let mutRes := validateTranslationDecl (mkGuardedMutation false) (mkGuardedMutation true) 8
+  unless !mutRes.memWritesEquiv && !mutRes.passed do
+    throw <| IO.userError s!"expected inequivalent constructor write to be rejected: {reprStr mutRes}"
+  -- 2. Allocating, incRef'ing to rc=2, and querying isExclusive must match constant false (and restore true after decRef)
+  let mkRcDecl (useConst : Bool) : LNIRDecl := {
+    name := "rc_excl_query"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i1
+    body :=
+      .letBind 1 .objPtr (.allocCtor 0 [0] [])
+        (.incRef 1 1
+          ((if useConst then fun k => .letBind 2 .i1 (.scalar (.constBool false)) k
+            else fun k => .letBind 2 .i1 (.isExclusive 1) k)
+            (.decRef 1 1
+              (.letBind 3 .i1 (.isExclusive 1)
+                (.decRef 1 1
+                  (if useConst then
+                     .letBind 4 .i1 (.scalar (.constBool false)) (.ret 4)
+                   else
+                     .letBind 4 .i1 (.scalar (.binOp .eq (.var 2) (.var 3))) (.ret 4)))))))
+  }
+  let rcRes := validateTranslationDecl (mkRcDecl false) (mkRcDecl true) 8
+  unless rcRes.passed && rcRes.symRetEquiv do
+    throw <| IO.userError s!"expected incRef/decRef exclusivity queries to fold to false/true: {reprStr rcRes}"
+  -- 3. Scalar seqFor accumulator returned directly vs `acc + 0` must pass symRetEquiv
+  let mkLoopDecl (addZero : Bool) : LNIRDecl := {
+    name := "loop_acc_alias"
+    params := [{ id := 0, name := "init", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 1 .i64 (.scalar (.constU64 0))
+        (.letBind 2 .i64 (.scalar (.constU64 4))
+          (.seqFor 3 1 2 4 0 .i64
+            (.letBind 5 .i64 (.scalar (.binOp .add (.var 4) (.constU64 1))) (.ret 5))
+            (if addZero then .letBind 6 .i64 (.scalar (.binOp .add (.var 4) (.constU64 0))) (.ret 6)
+             else .ret 4)))
+  }
+  let loopRes := validateTranslationDecl (mkLoopDecl false) (mkLoopDecl true) 8
+  unless loopRes.passed && loopRes.symRetEquiv do
+    throw <| IO.userError s!"expected scalar loop accumulator TV equivalence: {reprStr loopRes}"
+  -- 4. Guarded `.unreachable` on `x == 999` (outside concrete 1..8 samples) must fail domainEquiv, while shared guarded `.unreachable` refines
+  let baseline : LNIRDecl := {
+    name := "guarded_unreachable"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body := .letBind 1 .i64 (.scalar (.constU64 0)) (.ret 1)
+  }
+  let corrupt : LNIRDecl := {
+    name := "guarded_unreachable"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+        (.ite 2 .unreachable (.letBind 1 .i64 (.scalar (.constU64 0)) (.ret 1)))
+  }
+  let corruptSame : LNIRDecl := {
+    name := "guarded_unreachable"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+        (.ite 2 .unreachable (.letBind 1 .i64 (.scalar (.binOp .add (.constU64 0) (.constU64 0))) (.ret 1)))
+  }
+  let guBad := validateTranslationDecl baseline corrupt 8
+  unless !guBad.domainEquiv && !guBad.passed do
+    throw <| IO.userError s!"guarded unreachable corruption accepted: {reprStr guBad}"
+  let guGood := validateTranslationDecl corrupt corruptSame 8
+  unless guGood.domainEquiv && guGood.passed do
+    throw <| IO.userError s!"matching guarded unreachable rejected: {reprStr guGood}"
+  -- 5. Projecting an allocated child object preserves its heap-root identity for `isExclusive` and `ctor_set`
+  let childDecl (project : Bool) : LNIRDecl := {
+    name := "projected_child"
+    params := []
+    retTy := .i1
+    body :=
+      .letBind 0 .objPtr (.allocCtor 0 [] [])
+        (.letBind 1 .objPtr (.allocCtor 0 [0] [])
+          (.letBind 2 .objPtr (.ctorGetObj 1 0)
+            (.letBind 3 .i1 (.isExclusive (if project then 2 else 0))
+              (.decRef 1 1 (.ret 3)))))
+  }
+  let childRes := validateTranslationDecl (childDecl true) (childDecl false) 8
+  unless childRes.passed && childRes.symRetEquiv do
+    throw <| IO.userError s!"projected child lost identity: {reprStr childRes}"
+  -- 6. Newly allocated child escaping into an input object must compare full reachable child contents in memWritesEquiv
+  let mkEscapingChildDecl (corruptField : Bool) : LNIRDecl := {
+    name := "escaping_child_write"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 2 .i64 (.call "lean_native_ctor_tag" [0] .i64 false)
+        (.letBind 3 .i1 (.scalar (.binOp .eq (.var 2) (.constU64 0)))
+          (.ite 3
+            (.letBind 4 .i1 (.isExclusive 0)
+              (.ite 4
+                (.letBind 5 .i64 (if corruptField then
+                    .scalar (.select (.binOp .eq (.var 1) (.constU64 999)) (.constU64 3) (.constU64 2))
+                  else
+                    .scalar (.constU64 2))
+                  (.letBind 6 .objPtr (.allocCtor 0 [] [5])
+                    (.letBind 7 .i64 (.scalar (.constU64 0))
+                      (.letBind 8 .unit (.call "lean_native_ctor_set" [0, 7, 6] .unit false)
+                        (.ret 7)))))
+                (.letBind 9 .i64 (.scalar (.constU64 0)) (.ret 9))))
+            (.letBind 10 .i64 (.scalar (.constU64 0)) (.ret 10))))
+  }
+  let escBad := validateTranslationDecl (mkEscapingChildDecl false) (mkEscapingChildDecl true) 8
+  unless !escBad.memWritesEquiv && !escBad.passed do
+    throw <| IO.userError s!"escaping child field corruption accepted: {reprStr escBad}"
+  -- 6b. Even without a prior ctor_tag branch, storing an allocated child into an input object must reject corrupted child fields
+  let mkDirectEscapingChildDecl (corruptField : Bool) : LNIRDecl := {
+    name := "direct_escaping_child_write"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 2 .i1 (.isExclusive 0)
+        (.ite 2
+          (.letBind 3 .i64 (if corruptField then
+              .scalar (.select (.binOp .eq (.var 1) (.constU64 999)) (.constU64 3) (.constU64 2))
+            else
+              .scalar (.constU64 2))
+            (.letBind 4 .objPtr (.allocCtor 0 [] [3])
+              (.letBind 5 .i64 (.scalar (.constU64 0))
+                (.letBind 6 .unit (.call "lean_native_ctor_set" [0, 5, 4] .unit false)
+                  (.ret 5)))))
+          (.letBind 7 .i64 (.scalar (.constU64 0)) (.ret 7)))
+  }
+  let escDirectBad := validateTranslationDecl (mkDirectEscapingChildDecl false) (mkDirectEscapingChildDecl true) 8
+  unless !escDirectBad.memWritesEquiv && !escDirectBad.passed do
+    throw <| IO.userError s!"direct escaping child field corruption accepted: {reprStr escDirectBad}"
+  -- 7. Freeing a parent constructor recursively decrements its child references, restoring child exclusivity
+  let mkParentDropDecl (foldTrue : Bool) : LNIRDecl := {
+    name := "parent_drop_child_excl"
+    params := []
+    retTy := .i1
+    body :=
+      .letBind 0 .objPtr (.allocCtor 0 [] [])
+        (.incRef 0 1
+          (.letBind 1 .objPtr (.allocCtor 0 [0] [])
+            (.decRef 1 1
+              (.letBind 2 .i1 (if foldTrue then .scalar (.constBool true) else .isExclusive 0)
+                (.decRef 0 1 (.ret 2))))))
+  }
+  let dropRes := validateTranslationDecl (mkParentDropDecl false) (mkParentDropDecl true) 8
+  unless dropRes.passed && dropRes.symRetEquiv do
+    throw <| IO.userError s!"parent drop failed to restore child exclusivity: {reprStr dropRes}"
+  -- 8. Returned heap graphs must preserve sharing identities (`[a, a]` vs `[a, b]` on `x == 999`) while accepting alpha-equivalent fresh SSA IDs
+  let mkSharedReturnSrc (baseId : VarId) : LNIRDecl := {
+    name := "shared_return_graph"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .objPtr
+    body :=
+      .letBind baseId .i64 (.scalar (.constU64 7))
+        (.letBind (baseId + 1) .objPtr (.allocCtor 0 [] [baseId])
+          (.incRef (baseId + 1) 1
+            (.letBind (baseId + 2) .objPtr (.allocCtor 0 [baseId + 1, baseId + 1] [])
+              (.ret (baseId + 2)))))
+  }
+  let mkUnsharedReturnTgt : LNIRDecl := {
+    name := "shared_return_graph"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .objPtr
+    body :=
+      .letBind 1 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+        (.ite 1
+          (.letBind 2 .i64 (.scalar (.constU64 7))
+            (.letBind 3 .objPtr (.allocCtor 0 [] [2])
+              (.letBind 4 .objPtr (.allocCtor 0 [] [2])
+                (.letBind 5 .objPtr (.allocCtor 0 [3, 4] [])
+                  (.ret 5)))))
+          (.letBind 6 .i64 (.scalar (.constU64 7))
+            (.letBind 7 .objPtr (.allocCtor 0 [] [6])
+              (.incRef 7 1
+                (.letBind 8 .objPtr (.allocCtor 0 [7, 7] [])
+                  (.ret 8))))))
+  }
+  let shareBad := validateTranslationDecl (mkSharedReturnSrc 10) mkUnsharedReturnTgt 8
+  unless !shareBad.symRetEquiv && !shareBad.passed do
+    throw <| IO.userError s!"returned heap sharing loss accepted: {reprStr shareBad}"
+  let shareAlphaOk := validateTranslationDecl (mkSharedReturnSrc 10) (mkSharedReturnSrc 20) 8
+  unless shareAlphaOk.symRetEquiv && shareAlphaOk.passed do
+    throw <| IO.userError s!"alpha-equivalent returned heap sharing rejected: {reprStr shareAlphaOk}"
+  -- 9. Returned top-level root must include its own root identity and terminal RC (rejecting extra incRef on `x == 999`)
+  let mkRootRcDecl (extraIncOn999 : Bool) : LNIRDecl := {
+    name := "returned_root_rc"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .objPtr
+    body :=
+      .letBind 1 .i64 (.scalar (.constU64 42))
+        (.letBind 2 .objPtr (.allocCtor 0 [] [1])
+          (if extraIncOn999 then
+             .letBind 3 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+               (.ite 3 (.incRef 2 1 (.ret 2)) (.ret 2))
+           else
+             .ret 2))
+  }
+  let rootRcBad := validateTranslationDecl (mkRootRcDecl false) (mkRootRcDecl true) 8
+  unless !rootRcBad.symRetEquiv && !rootRcBad.passed do
+    throw <| IO.userError s!"returned root RC corruption accepted: {reprStr rootRcBad}"
+  -- 10. Non-escaping leaked allocation or parameter RC mismatch on `x == 999` must fail memWritesEquiv (`rcDeltas`)
+  let mkParamRcLeakDecl (leakOn999 : Bool) : LNIRDecl := {
+    name := "param_rc_leak"
+    params := [{ id := 0, name := "p", ty := .objPtr, borrow := false }, { id := 1, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      if leakOn999 then
+        .letBind 2 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+          (.ite 2
+            (.incRef 0 1 (.letBind 3 .i64 (.scalar (.constU64 0)) (.ret 3)))
+            (.letBind 3 .i64 (.scalar (.constU64 0)) (.ret 3)))
+      else
+        .letBind 3 .i64 (.scalar (.constU64 0)) (.ret 3)
+  }
+  let paramRcBad := validateTranslationDecl (mkParamRcLeakDecl false) (mkParamRcLeakDecl true) 8
+  unless !paramRcBad.memWritesEquiv && !paramRcBad.passed do
+    throw <| IO.userError s!"parameter RC leak accepted: {reprStr paramRcBad}"
+  -- 11. Projected input child RC leak (`c := p[0]`, `incRef c` on `x == 999`) must fail memWritesEquiv (`nonAllocRcDeltas`)
+  let mkProjChildRcLeakDecl (leakChildOn999 : Bool) : LNIRDecl := {
+    name := "proj_child_rc_leak"
+    params := [{ id := 0, name := "p", ty := .objPtr, borrow := false }, { id := 1, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 2 .i64 (.call "lean_native_ctor_tag" [0] .i64 false)
+        (.letBind 3 .i1 (.scalar (.binOp .eq (.var 2) (.constU64 0)))
+          (.ite 3
+            (.letBind 4 .objPtr (.ctorGetObj 0 0)
+              (if leakChildOn999 then
+                 .letBind 5 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+                   (.ite 5
+                     (.incRef 4 1 (.letBind 6 .i64 (.scalar (.constU64 0)) (.ret 6)))
+                     (.letBind 6 .i64 (.scalar (.constU64 0)) (.ret 6)))
+               else
+                 .letBind 6 .i64 (.scalar (.constU64 0)) (.ret 6)))
+            (.letBind 7 .i64 (.scalar (.constU64 0)) (.ret 7))))
+  }
+  let projChildLeakBad := validateTranslationDecl (mkProjChildRcLeakDecl false) (mkProjChildRcLeakDecl true) 8
+  unless !projChildLeakBad.ubRefines && !projChildLeakBad.passed do
+    throw <| IO.userError s!"projected input child RC leak accepted: {reprStr projChildLeakBad}"
+  -- 12. Sharing between returned root and escaping heap write (`p[0] := a; ret a` vs `p[0] := a; ret b` on `x == 999`) must be preserved
+  let mkCrossAliasRetWriteDecl (returnDifferentRootOn999 : Bool) : LNIRDecl := {
+    name := "cross_alias_ret_write"
+    params := [{ id := 0, name := "p", ty := .objPtr, borrow := false }, { id := 1, name := "x", ty := .i64, borrow := false }]
+    retTy := .objPtr
+    body :=
+      .letBind 2 .i64 (.call "lean_native_ctor_tag" [0] .i64 false)
+        (.letBind 3 .i1 (.scalar (.binOp .eq (.var 2) (.constU64 0)))
+          (.ite 3
+            (.letBind 4 .i1 (.isExclusive 0)
+              (.ite 4
+                (.letBind 5 .i64 (.scalar (.constU64 7))
+                  (.letBind 6 .objPtr (.allocCtor 0 [] [5])
+                    (.incRef 6 1
+                      (.letBind 7 .objPtr (.allocCtor 0 [] [5])
+                        (.incRef 7 1
+                          (.letBind 8 .i64 (.scalar (.constU64 0))
+                            (.letBind 9 .unit (.call "lean_native_ctor_set" [0, 8, 6] .unit false)
+                              (if returnDifferentRootOn999 then
+                                 .letBind 10 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+                                   (.ite 10 (.ret 7) (.ret 6))
+                               else
+                                 .ret 6))))))))
+                (.ret 0)))
+            (.ret 0)))
+  }
+  let crossAliasBad := validateTranslationDecl (mkCrossAliasRetWriteDecl false) (mkCrossAliasRetWriteDecl true) 8
+  unless !crossAliasBad.memWritesEquiv && !crossAliasBad.passed do
+    throw <| IO.userError s!"cross-alias loss between return and write accepted: {reprStr crossAliasBad}"
+  -- 13. `decRef p 1; incRef p 1` on an unknown-RC input object (`x == 999`) must fail ubRefines (`ubCond` requires `rc > 1`)
+  let mkDecIncUnknownRcDecl (decThenInc : Bool) : LNIRDecl := {
+    name := "dec_inc_unknown_rc"
+    params := [{ id := 0, name := "p", ty := .objPtr, borrow := false }, { id := 1, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      if decThenInc then
+        .letBind 2 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+          (.ite 2
+            (.decRef 0 1 (.incRef 0 1 (.letBind 3 .i64 (.scalar (.constU64 0)) (.ret 3))))
+            (.letBind 3 .i64 (.scalar (.constU64 0)) (.ret 3)))
+      else
+        .letBind 3 .i64 (.scalar (.constU64 0)) (.ret 3)
+  }
+  let decIncBad := validateTranslationDecl (mkDecIncUnknownRcDecl false) (mkDecIncUnknownRcDecl true) 8
+  unless !decIncBad.ubRefines && !decIncBad.passed do
+    throw <| IO.userError s!"decRef-then-incRef use-after-free on unknown RC accepted: {reprStr decIncBad}"
+  -- 13b. Conversely, eliding a redundant `incRef p 1; decRef p 1` pair when `p` is already accessed (`ctor_tag p`) refines (`ubCond` implied)
+  let mkIncDecRedundantDecl (withPair : Bool) : LNIRDecl := {
+    name := "inc_dec_redundant_live"
+    params := [{ id := 0, name := "p", ty := .objPtr, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 1 .i64 (.call "lean_native_ctor_tag" [0] .i64 false)
+        (if withPair then .incRef 0 1 (.decRef 0 1 (.ret 1)) else .ret 1)
+  }
+  let incDecGood := validateTranslationDecl (mkIncDecRedundantDecl true) (mkIncDecRedundantDecl false) 8
+  unless incDecGood.ubRefines && incDecGood.passed do
+    throw <| IO.userError s!"eliding redundant incRef/decRef on live object rejected: {reprStr incDecGood}"
+  -- 13c. Adding an unproved `incRef p 1; decRef p 1` on `x == 999` without prior liveness must also fail ubRefines (`p` could have RC == 0 or wrap)
+  let mkIncDecDeadBad := validateTranslationDecl (mkDecIncUnknownRcDecl false) {
+    name := "inc_dec_unknown_rc"
+    params := [{ id := 0, name := "p", ty := .objPtr, borrow := false }, { id := 1, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+        (.ite 2
+          (.incRef 0 1 (.decRef 0 1 (.letBind 3 .i64 (.scalar (.constU64 0)) (.ret 3))))
+          (.letBind 3 .i64 (.scalar (.constU64 0)) (.ret 3)))
+  } 8
+  unless !mkIncDecDeadBad.ubRefines && !mkIncDecDeadBad.passed do
+    throw <| IO.userError s!"unproved incRef/decRef on potentially dead unknown RC accepted: {reprStr mkIncDecDeadBad}"
+  -- 14. Path-conditional UB on one source branch (`unguarded ctor_set p[0]` on `x == 888`) must NOT collapse `sSrc.ubCond`
+  --     to `false` on other defined paths (`decRef q 1; incRef q 1` on `x == 999` must still fail `ubRefines`)
+  let mkBranchConditionalUbDecl (corruptOtherBranch : Bool) : LNIRDecl := {
+    name := "branch_conditional_ub"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "q", ty := .objPtr, borrow := false },
+      { id := 2, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 3 .i1 (.scalar (.binOp .eq (.var 2) (.constU64 888)))
+        (.ite 3
+          (.letBind 4 .i64 (.scalar (.constU64 0))
+            (.letBind 5 .i64 (.scalar (.constU64 42))
+              (.letBind 6 .unit (.call "lean_native_ctor_set" [0, 4, 5] .unit false)
+                (.ret 4))))
+          (if corruptOtherBranch then
+             .letBind 7 .i1 (.scalar (.binOp .eq (.var 2) (.constU64 999)))
+               (.ite 7
+                 (.decRef 1 1 (.incRef 1 1 (.letBind 8 .i64 (.scalar (.constU64 0)) (.ret 8))))
+                 (.letBind 8 .i64 (.scalar (.constU64 0)) (.ret 8)))
+           else
+             .letBind 8 .i64 (.scalar (.constU64 0)) (.ret 8)))
+  }
+  let branchUbBad := validateTranslationDecl (mkBranchConditionalUbDecl false) (mkBranchConditionalUbDecl true) 8
+  unless !branchUbBad.ubRefines && !branchUbBad.passed do
+    throw <| IO.userError s!"branch-conditional UB masked target UB on defined path: {reprStr branchUbBad}"
+  -- 15. Possible aliasing between projected input children (`a := p[0]`, `b := p[1]`):
+  --     `before := isExclusive b; decRef a 1; after := isExclusive b` must NOT treat `before` and `after` as equivalent!
+  let mkProjSiblingAliasDecl (returnAfter : Bool) : LNIRDecl := {
+    name := "proj_sibling_alias_excl"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i1
+    body :=
+      .letBind 2 .i64 (.call "lean_native_ctor_tag" [0] .i64 false)
+        (.letBind 3 .i1 (.scalar (.binOp .eq (.var 2) (.constU64 0)))
+          (.ite 3
+            (.letBind 4 .objPtr (.ctorGetObj 0 0)
+              (.letBind 5 .objPtr (.ctorGetObj 0 1)
+                (.letBind 6 .i1 (.isExclusive 5)
+                  (.decRef 4 1
+                    (.letBind 7 .i1 (.isExclusive 5)
+                      (if returnAfter then
+                         .letBind 8 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+                           (.ite 8 (.ret 7) (.ret 6))
+                       else
+                         .ret 6))))))
+            (.letBind 9 .i1 (.scalar (.constBool false)) (.ret 9))))
+  }
+  let sibAliasBad := validateTranslationDecl (mkProjSiblingAliasDecl false) (mkProjSiblingAliasDecl true) 64
+  unless !sibAliasBad.ubRefines && !sibAliasBad.passed do
+    throw <| IO.userError s!"projected sibling child may-alias exclusivity drift accepted: {reprStr sibAliasBad}"
+  -- 15a2. Also test `incRef a 1; decRef a 1` (supported non-freeing path) invalidating sibling `isExclusive b`:
+  let mkProjSiblingIncAliasDecl (returnDuringInc : Bool) : LNIRDecl := {
+    name := "proj_sibling_inc_alias_excl"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i1
+    body :=
+      .letBind 2 .i64 (.call "lean_native_ctor_tag" [0] .i64 false)
+        (.letBind 3 .i1 (.scalar (.binOp .eq (.var 2) (.constU64 0)))
+          (.ite 3
+            (.letBind 4 .objPtr (.ctorGetObj 0 0)
+              (.letBind 5 .objPtr (.ctorGetObj 0 1)
+                (.letBind 6 .i1 (.isExclusive 5)
+                  (.incRef 4 1
+                    (.letBind 7 .i1 (.isExclusive 5)
+                      (.decRef 4 1
+                        (if returnDuringInc then
+                           .letBind 8 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+                             (.ite 8 (.ret 7) (.ret 6))
+                         else
+                           .ret 6)))))))
+            (.letBind 9 .i1 (.scalar (.constBool false)) (.ret 9))))
+  }
+  let sibIncAliasBad := validateTranslationDecl (mkProjSiblingIncAliasDecl false) (mkProjSiblingIncAliasDecl true) 64
+  unless !sibIncAliasBad.ubRefines && !sibIncAliasBad.passed do
+    throw <| IO.userError s!"projected sibling child incRef may-alias exclusivity drift accepted: {reprStr sibIncAliasBad}"
+  -- 15b. Even when `p` and `q` are distinct input parameters (`p` and `q` may alias the same heap object),
+  --      `incRef p 1; decRef p 1` must NOT allow folding `isExclusive q` across `incRef p 1` (`incRef p 1; x := isExclusive q; decRef p 1; ret x` vs `x := isExclusive q; incRef p 1; decRef p 1; ret x`)
+  let mkParamAliasExclDecl (queryDuringInc : Bool) : LNIRDecl := {
+    name := "param_alias_excl"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "q", ty := .objPtr, borrow := false }
+    ]
+    retTy := .i1
+    body :=
+      if queryDuringInc then
+        .incRef 0 1
+          (.letBind 2 .i1 (.isExclusive 1)
+            (.decRef 0 1 (.ret 2)))
+      else
+        .letBind 2 .i1 (.isExclusive 1)
+          (.incRef 0 1
+            (.decRef 0 1 (.ret 2)))
+  }
+  let paramAliasExclBad := validateTranslationDecl (mkParamAliasExclDecl true) (mkParamAliasExclDecl false) 64
+  unless !paramAliasExclBad.passed do
+    throw <| IO.userError s!"cross-parameter may-alias exclusivity reordering accepted: {reprStr paramAliasExclBad}"
+  -- 16. Moving `lean_native_ctor_tag q` past `decRef p 1` inside an `isExclusive p` branch must fail `ubRefines`
+  --     (borrowed `q` may alias RC-1 `p`, so `q` may be freed by `decRef p 1`)
+  let mkPostFreeAliasReadDecl (readAfterFree : Bool) : LNIRDecl := {
+    name := "post_free_alias_read"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "q", ty := .objPtr, borrow := true }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 2 .i1 (.isExclusive 0)
+        (.ite 2
+          (if readAfterFree then
+             .decRef 0 1
+               (.letBind 3 .i64 (.call "lean_native_ctor_tag" [1] .i64 false)
+                 (.ret 3))
+           else
+             .letBind 3 .i64 (.call "lean_native_ctor_tag" [1] .i64 false)
+               (.decRef 0 1 (.ret 3)))
+          (.letBind 4 .i64 (.scalar (.constU64 0)) (.ret 4)))
+  }
+  let postFreeBad := validateTranslationDecl (mkPostFreeAliasReadDecl false) (mkPostFreeAliasReadDecl true) 64
+  unless !postFreeBad.ubRefines && !postFreeBad.passed do
+    throw <| IO.userError s!"post-free may-alias read accepted: {reprStr postFreeBad}"
+  -- 17. Epoch-generated projected field roots (`400000 + epoch * 100000 + ...` = `500016` for param 1 field 0 at epoch 1)
+  --     must never collide with `.allocTag` or parameter ID 16!
+  let mkEpochFieldVsParam16Decl (returnParam16On999 : Bool) : LNIRDecl := {
+    name := "epoch_field_vs_param16"
+    params :=
+      ((List.range 17).map fun i => { id := i, name := s!"p{i}", ty := .objPtr, borrow := false }) ++
+      [{ id := 17, name := "x", ty := .i64, borrow := false }]
+    retTy := .objPtr
+    body :=
+      .incRef 0 1
+        (.letBind 20 .i64 (.call "lean_native_ctor_tag" [1] .i64 false)
+          (.letBind 21 .i1 (.scalar (.binOp .eq (.var 20) (.constU64 0)))
+            (.ite 21
+              (.letBind 22 .objPtr (.ctorGetObj 1 0)
+                (if returnParam16On999 then
+                   .letBind 23 .i1 (.scalar (.binOp .eq (.var 17) (.constU64 999)))
+                     (.ite 23 (.ret 16) (.ret 22))
+                 else
+                   .ret 22))
+              (.ret 16))))
+  }
+  let epochCollBad := validateTranslationDecl (mkEpochFieldVsParam16Decl false) (mkEpochFieldVsParam16Decl true) 8
+  unless !epochCollBad.symRetEquiv && !epochCollBad.passed do
+    throw <| IO.userError s!"epoch-projected field root collided with param 16: {reprStr epochCollBad}"
+  -- 18. Mutating `q[0]` after caching `p[0]` (`p` and borrowed `q` may alias) must invalidate cached `.tuple` fields on `p`
+  let mkCrossParamWriteStaleReadDecl (rereadAfterWrite : Bool) : LNIRDecl := {
+    name := "cross_param_write_stale_read"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "q", ty := .objPtr, borrow := true },
+      { id := 2, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 3 .i1 (.isExclusive 0)
+        (.ite 3
+          (.letBind 4 .i1 (.isExclusive 1)
+            (.ite 4
+              (.letBind 5 .i64 (.scalar (.constU64 0))
+                (.letBind 6 .i64 (.scalar (.constU64 2))
+                  (.letBind 7 .unit (.call "lean_native_ctor_set" [0, 5, 6] .unit false)
+                    (.letBind 8 .i64 (.ctorGetScalar 0 0 .i64)
+                      (.letBind 9 .i64 (.scalar (.constU64 3))
+                        (.letBind 10 .i1 (.isExclusive 1)
+                          (.ite 10
+                            (.letBind 11 .unit (.call "lean_native_ctor_set" [1, 5, 9] .unit false)
+                              (.letBind 12 .i1 (.isExclusive 0)
+                                (.ite 12
+                                  (if rereadAfterWrite then
+                                     .letBind 13 .i1 (.scalar (.binOp .eq (.var 2) (.constU64 999)))
+                                       (.ite 13
+                                         (.letBind 14 .i64 (.ctorGetScalar 0 0 .i64) (.ret 14))
+                                         (.ret 8))
+                                   else
+                                     .ret 8)
+                                  (.ret 5))))
+                            (.ret 5))))))))
+              (.letBind 15 .i64 (.scalar (.constU64 0)) (.ret 15))))
+          (.letBind 16 .i64 (.scalar (.constU64 0)) (.ret 16)))
+  }
+  let staleReadBad := validateTranslationDecl (mkCrossParamWriteStaleReadDecl false) (mkCrossParamWriteStaleReadDecl true) 8
+  unless !staleReadBad.symRetEquiv && !staleReadBad.passed do
+    throw <| IO.userError s!"cached input constructor fields survived may-alias write: {reprStr staleReadBad}"
+  -- 19. Nullary immediate constructor (`.scalar (.constU64 1)`) must fold `isExclusive` to `true` without heap-liveness requirement
+  let mkImmediateExclDecl (foldTrue : Bool) : LNIRDecl := {
+    name := "immediate_ctor_is_excl"
+    params := []
+    retTy := .i1
+    body :=
+      .letBind 0 .taggedPtr (.scalar (.constU64 1))
+        (.letBind 1 .i1 (if foldTrue then .scalar (.constBool true) else .isExclusive 0)
+          (.ret 1))
+  }
+  let immExclRes := validateTranslationDecl (mkImmediateExclDecl false) (mkImmediateExclDecl true) 8
+  unless immExclRes.symRetEquiv && immExclRes.ubRefines && immExclRes.passed do
+    throw <| IO.userError s!"immediate constructor isExclusive failed to fold to true: {reprStr immExclRes}"
+  -- 20. Stale `b := isExclusive p` saved across `incRef p 1` must NOT mark `p` exclusive when branching on `b`
+  let mkStaleExclBranchDecl (foldTrue : Bool) : LNIRDecl := {
+    name := "stale_excl_branch"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i1
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+        (.ite 2
+          (.letBind 3 .i1 (.isExclusive 0)
+            (.incRef 0 1
+              (.ite 3
+                (if foldTrue then
+                   .letBind 4 .i1 (.scalar (.constBool true)) (.ret 4)
+                 else
+                   .letBind 4 .i1 (.isExclusive 0) (.ret 4))
+                (.letBind 5 .i1 (.scalar (.constBool false)) (.ret 5)))))
+          (.letBind 6 .i1 (.scalar (.constBool false)) (.ret 6)))
+  }
+  let staleExclBad := validateTranslationDecl (mkStaleExclBranchDecl false) (mkStaleExclBranchDecl true) 8
+  unless !staleExclBad.symRetEquiv && !staleExclBad.passed do
+    throw <| IO.userError s!"stale isExclusive predicate marked incremented root exclusive: {reprStr staleExclBad}"
+  -- 21. Pointer-valued `ScalarExpr.select` (`r := select true a a` and symbolic `r := select (x == 500) a b`)
+  --     must preserve heap-root alias identity across subsequent `ctor_set` writes!
+  let mkSelectAliasDecl (constOneTarget : Bool) : LNIRDecl := {
+    name := "select_alias_write"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 1 .i64 (.scalar (.constU64 1))
+        (.letBind 2 .objPtr (.allocCtor 0 [] [1])
+          (.letBind 3 .objPtr (.scalar (.select (.constBool true) (.var 2) (.var 2)))
+            (.letBind 4 .i64 (.scalar (.constU64 0))
+              (.letBind 5 .i64 (.scalar (.select (.binOp .eq (.var 0) (.constU64 999)) (.constU64 2) (.constU64 1)))
+                (.letBind 6 .unit (.call "lean_native_ctor_set" [2, 4, 5] .unit false)
+                  (if constOneTarget then
+                     .decRef 2 1 (.ret 1)
+                   else
+                     .letBind 7 .i64 (.ctorGetScalar 3 0 .i64)
+                       (.decRef 2 1 (.ret 7))))))))
+  }
+  let selAliasBad := validateTranslationDecl (mkSelectAliasDecl false) (mkSelectAliasDecl true) 8
+  unless !selAliasBad.symRetEquiv && !selAliasBad.passed do
+    throw <| IO.userError s!"select pointer alias lost subsequent ctor_set write: {reprStr selAliasBad}"
+  let mkSymSelectAliasDecl (constOneTarget : Bool) : LNIRDecl := {
+    name := "sym_select_alias_write"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 1 .i64 (.scalar (.constU64 1))
+        (.letBind 2 .objPtr (.allocCtor 0 [] [1])
+          (.letBind 3 .objPtr (.allocCtor 0 [] [1])
+            (.letBind 4 .objPtr (.scalar (.select (.binOp .eq (.var 0) (.constU64 999)) (.var 2) (.var 3)))
+              (.letBind 5 .i64 (.scalar (.constU64 0))
+                (.letBind 6 .i64 (.scalar (.constU64 2))
+                  (.letBind 7 .unit (.call "lean_native_ctor_set" [2, 5, 6] .unit false)
+                    (if constOneTarget then
+                       .decRef 2 1 (.decRef 3 1 (.ret 1))
+                     else
+                       .letBind 8 .i64 (.ctorGetScalar 4 0 .i64)
+                         (.decRef 2 1 (.decRef 3 1 (.ret 8))))))))))
+  }
+  let symSelAliasBad := validateTranslationDecl (mkSymSelectAliasDecl false) (mkSymSelectAliasDecl true) 8
+  unless !symSelAliasBad.symRetEquiv && !symSelAliasBad.passed do
+    throw <| IO.userError s!"symbolic select pointer alias lost subsequent ctor_set write: {reprStr symSelAliasBad}"
+  -- 22. `mkTuple` / `projTuple` containing heap pointers must preserve heap-root alias identity across `ctor_set` writes
+  let mkTuplePtrAliasDecl (constOneTarget : Bool) : LNIRDecl := {
+    name := "tuple_ptr_alias_write"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 1 .i64 (.scalar (.constU64 1))
+        (.letBind 2 .objPtr (.allocCtor 0 [] [1])
+          (.letBind 3 (.tuple [.objPtr]) (.mkTuple [2])
+            (.letBind 4 .objPtr (.projTuple 3 0)
+              (.letBind 5 .i64 (.scalar (.constU64 0))
+                (.letBind 6 .i64 (.scalar (.select (.binOp .eq (.var 0) (.constU64 999)) (.constU64 2) (.constU64 1)))
+                  (.letBind 7 .unit (.call "lean_native_ctor_set" [2, 5, 6] .unit false)
+                    (if constOneTarget then
+                       .decRef 2 1 (.ret 1)
+                     else
+                       .letBind 8 .i64 (.ctorGetScalar 4 0 .i64)
+                         (.decRef 2 1 (.ret 8)))))))))
+  }
+  let tupAliasBad := validateTranslationDecl (mkTuplePtrAliasDecl false) (mkTuplePtrAliasDecl true) 8
+  unless !tupAliasBad.symRetEquiv && !tupAliasBad.passed do
+    throw <| IO.userError s!"mkTuple/projTuple pointer alias lost subsequent ctor_set write: {reprStr tupAliasBad}"
+  -- 22b. Conditional `.ite` producing `mkTuple [a]` vs `mkTuple [b]` followed by `projTuple` also preserves branch heap-root aliases
+  let mkIteTuplePtrAliasDecl (constOneTarget : Bool) : LNIRDecl := {
+    name := "ite_tuple_ptr_alias_write"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 1 .i64 (.scalar (.constU64 1))
+        (.letBind 2 .objPtr (.allocCtor 0 [] [1])
+          (.letBind 3 .objPtr (.allocCtor 0 [] [1])
+            (.letBind 4 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+              (.letBind 5 (.tuple [.objPtr]) (.mkTuple [2])
+                (.letBind 6 (.tuple [.objPtr]) (.mkTuple [3])
+                  (.letBind 7 .i64 (.scalar (.constU64 0))
+                    (.letBind 8 .i64 (.scalar (.constU64 2))
+                      (.letBind 9 .unit (.call "lean_native_ctor_set" [2, 7, 8] .unit false)
+                        (.ite 4
+                          (.letBind 10 .objPtr (.projTuple 5 0)
+                            (if constOneTarget then
+                               .decRef 2 1 (.decRef 3 1 (.ret 1))
+                             else
+                               .letBind 11 .i64 (.ctorGetScalar 10 0 .i64)
+                                 (.decRef 2 1 (.decRef 3 1 (.ret 11)))))
+                          (.decRef 2 1 (.decRef 3 1 (.ret 1))))))))))))
+  }
+  let iteTupAliasBad := validateTranslationDecl (mkIteTuplePtrAliasDecl false) (mkIteTuplePtrAliasDecl true) 8
+  unless !iteTupAliasBad.symRetEquiv && !iteTupAliasBad.passed do
+    throw <| IO.userError s!"ite mkTuple/projTuple pointer alias lost subsequent ctor_set write: {reprStr iteTupAliasBad}"
+  -- 23. Unproved `ctorGetObj p 8` (and even `ctorGetObj p 1` when source only projected `p[0]`) on `x == 999`
+  --     must fail `ubRefines` (`SymExpr.ctorLen` bounds predicate)
+  let mkInputOobProjDecl (oobIdx : Option Nat) : LNIRDecl := {
+    name := "input_ctor_oob_proj"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 2 .i64 (.call "lean_native_ctor_tag" [0] .i64 false)
+        (.letBind 3 .objPtr (.ctorGetObj 0 0)
+          (match oobIdx with
+           | some idx =>
+             .letBind 4 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+               (.ite 4
+                 (.letBind 5 .objPtr (.ctorGetObj 0 idx)
+                   (.letBind 6 .i64 (.scalar (.constU64 0)) (.ret 6)))
+                 (.letBind 6 .i64 (.scalar (.constU64 0)) (.ret 6)))
+           | none =>
+             .letBind 6 .i64 (.scalar (.constU64 0)) (.ret 6)))
+  }
+  let oob8Bad := validateTranslationDecl (mkInputOobProjDecl none) (mkInputOobProjDecl (some 8)) 8
+  unless !oob8Bad.ubRefines && !oob8Bad.passed do
+    throw <| IO.userError s!"out-of-bounds ctorGetObj p 8 accepted: {reprStr oob8Bad}"
+  let oob1Bad := validateTranslationDecl (mkInputOobProjDecl none) (mkInputOobProjDecl (some 1)) 8
+  unless !oob1Bad.ubRefines && !oob1Bad.passed do
+    throw <| IO.userError s!"unproved ctorGetObj p 1 beyond source p[0] accepted: {reprStr oob1Bad}"
+  let inb0Good := validateTranslationDecl (mkInputOobProjDecl (some 0)) (mkInputOobProjDecl none) 8
+  unless inb0Good.ubRefines && inb0Good.passed do
+    throw <| IO.userError s!"eliding redundant in-bounds ctorGetObj p 0 rejected: {reprStr inb0Good}"
+  -- 24. Scalar parameter IDs (e.g. `100000`, `24000`, `30000`, `9000`, `90000`) must never collide with
+  --     `SymExpr.rcSym`, `SymExpr.ctorTag`, `SymExpr.sarrayLen`, synthetic projected fields, or `jointHeap`!
+  let mkHighVarIdNoRcSpoofDecl (foldTrue : Bool) : LNIRDecl := {
+    name := "high_var_id_no_rc_spoof"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 100000, name := "a", ty := .i64, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i1
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+        (.ite 2
+          (.letBind 3 .i1 (.scalar (.binOp .eq (.var 100000) (.constU64 1)))
+            (.ite 3
+              (if foldTrue then
+                 .letBind 4 .i1 (.scalar (.constBool true)) (.ret 4)
+               else
+                 .letBind 4 .i1 (.isExclusive 0) (.ret 4))
+              (.letBind 5 .i1 (.scalar (.constBool true)) (.ret 5))))
+          (.letBind 6 .i1 (.scalar (.constBool true)) (.ret 6)))
+  }
+  let rcSpoofBad := validateTranslationDecl (mkHighVarIdNoRcSpoofDecl false) (mkHighVarIdNoRcSpoofDecl true) 8
+  unless !rcSpoofBad.symRetEquiv && !rcSpoofBad.passed do
+    throw <| IO.userError s!"ordinary parameter ID 100000 spoofed SymExpr.rcSym exclusivity: {reprStr rcSpoofBad}"
+  -- 25. Nested projected field `p1[0][0]` at epoch 0 must NOT collide with `p0[0]` at epoch 1 (`cantorPairNat` bijection)
+  let mkNestedVsEpochProjDecl (retSecond : Bool) : LNIRDecl := {
+    name := "nested_vs_epoch_proj"
+    params := [
+      { id := 0, name := "p0", ty := .objPtr, borrow := false },
+      { id := 1, name := "p1", ty := .objPtr, borrow := false },
+      { id := 2, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i1
+    body :=
+      .letBind 3 .i1 (.scalar (.binOp .eq (.var 2) (.constU64 999)))
+        (.ite 3
+          (.letBind 4 .objPtr (.ctorGetObj 1 0)
+            (.letBind 5 .objPtr (.ctorGetObj 4 0)
+              (.incRef 1 1
+                (.letBind 6 .objPtr (.ctorGetObj 0 0)
+                  (.letBind 7 .i1 (.isExclusive 5)
+                    (.letBind 8 .i1 (.isExclusive 6)
+                      (if retSecond then .ret 8 else .ret 7)))))))
+          (.letBind 9 .i1 (.scalar (.constBool true)) (.ret 9)))
+  }
+  let nestedCollBad := validateTranslationDecl (mkNestedVsEpochProjDecl false) (mkNestedVsEpochProjDecl true) 8
+  unless !nestedCollBad.ubRefines && !nestedCollBad.passed do
+    throw <| IO.userError s!"nested p1[0][0] at epoch 0 collided with p0[0] at epoch 1: {reprStr nestedCollBad}"
+  -- 26. `allocCtor` containing a tag-refined external root `p` (whose RC is still unknown) must preserve `.symVar p`
+  --     reference identity rather than copying `p`'s cached `.tuple` fields!
+  let mkExtRootInAllocCtorDecl (returnOldSnapshot : Bool) : LNIRDecl := {
+    name := "ext_root_in_alloc_ctor"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+        (.ite 2
+          (.letBind 3 .i64 (.call "lean_native_ctor_tag" [0] .i64 false)
+            (.letBind 4 .i1 (.scalar (.binOp .eq (.var 3) (.constU64 0)))
+              (.ite 4
+                (.letBind 5 .objPtr (.allocCtor 0 [0] [])
+                  (.letBind 6 .i1 (.isExclusive 0)
+                    (.ite 6
+                      (.letBind 7 .i64 (.ctorGetScalar 0 0 .i64)
+                        (.letBind 8 .i64 (.scalar (.constU64 0))
+                          (.letBind 9 .i64 (.scalar (.binOp .add (.var 7) (.constU64 1)))
+                            (.letBind 10 .unit (.call "lean_native_ctor_set" [0, 8, 9] .unit false)
+                              (.letBind 11 .objPtr (.ctorGetObj 5 0)
+                                (.letBind 12 .i64 (.ctorGetScalar 11 0 .i64)
+                                  (.incRef 0 1
+                                    (.decRef 5 1
+                                      (if returnOldSnapshot then .ret 7 else .ret 12)))))))))
+                      (.incRef 0 1 (.decRef 5 1 (.letBind 13 .i64 (.scalar (.constU64 0)) (.ret 13)))))))
+                (.letBind 14 .i64 (.scalar (.constU64 0)) (.ret 14)))))
+          (.letBind 15 .i64 (.scalar (.constU64 0)) (.ret 15)))
+  }
+  let extInAllocBad := validateTranslationDecl (mkExtRootInAllocCtorDecl false) (mkExtRootInAllocCtorDecl true) 8
+  unless !extInAllocBad.ubRefines && !extInAllocBad.passed do
+    throw <| IO.userError s!"allocCtor copied cached external root fields instead of preserving root identity: {reprStr extInAllocBad}"
+  -- 27. Arithmetic on a scalar field projected from an input heap object (`p[0][0] + 1`, via `.ctorGetObj` with `.i64`
+  --     or `.ctorGetScalar`) must fail closed (`symUnsupported`) on non-identity rewrites because the uncached field's
+  --     runtime sort in `HeapState` could be `.objPtr` or `.u64`, while reflexive (`src == tgt`) still passes!
+  let mkNestedScalarProjArithDecl (retConstVal : UInt64) : LNIRDecl := {
+    name := "nested_scalar_proj_arith"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+        (.ite 2
+          (.letBind 3 .objPtr (.ctorGetObj 0 0)
+            (.letBind 4 .i64 (.ctorGetObj 3 0)
+              (.letBind 5 .i64 (.scalar (.binOp .add (.var 4) (.constU64 1)))
+                (.letBind 6 .i64 (.scalar (.constU64 retConstVal))
+                  (.ret 6)))))
+          (.letBind 7 .i64 (.scalar (.constU64 0)) (.ret 7)))
+  }
+  let nestedScalarArithBad := validateTranslationDecl (mkNestedScalarProjArithDecl 0) (mkNestedScalarProjArithDecl 1) 8
+  unless !nestedScalarArithBad.ubRefines && !nestedScalarArithBad.passed do
+    throw <| IO.userError s!"uncached scalar projection arithmetic accepted non-identity target: {reprStr nestedScalarArithBad}"
+  let nestedScalarArithGood := validateTranslationDecl (mkNestedScalarProjArithDecl 0) (mkNestedScalarProjArithDecl 0) 8
+  unless nestedScalarArithGood.passed do
+    throw <| IO.userError s!"equivalent scalar projection arithmetic rejected: {reprStr nestedScalarArithGood}"
+  -- 27b. Also test `.taggedPtr` intermediate projection (`let 4 : taggedPtr := ctorGetObj 3 0; let 9 : i64 := var 4; let 10 := 9 + 1`),
+  --      ensuring non-identity rewrites fail closed (`symUnsupported`) when runtime sort of `p[0][0]` is unknown!
+  let mkTaggedScalarProjArithDecl (retConstVal : UInt64) : LNIRDecl := {
+    name := "tagged_scalar_proj_arith"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+        (.ite 2
+          (.letBind 3 .objPtr (.ctorGetObj 0 0)
+            (.letBind 4 .taggedPtr (.ctorGetObj 3 0)
+              (.letBind 8 .i64 (.scalar (.var 4))
+                (.letBind 5 .i64 (.scalar (.binOp .add (.var 8) (.constU64 1)))
+                  (.letBind 6 .i64 (.scalar (.constU64 retConstVal))
+                    (.ret 6))))))
+          (.letBind 7 .i64 (.scalar (.constU64 0)) (.ret 7)))
+  }
+  let taggedScalarBad := validateTranslationDecl (mkTaggedScalarProjArithDecl 0) (mkTaggedScalarProjArithDecl 1) 8
+  unless !taggedScalarBad.ubRefines && !taggedScalarBad.passed do
+    throw <| IO.userError s!"taggedPtr uncached projection arithmetic accepted non-identity target: {reprStr taggedScalarBad}"
+  -- 28. Unsupported symbolic execution in `src` (e.g. pointer arithmetic `p + 1` or unknown extern call) must
+  --     fail closed (`symUnsupported == true` -> `passed == false`), never vacuously accepting `tgt`!
+  let mkUnsupportedSrcDecl (retVal : UInt64) : LNIRDecl := {
+    name := "unsupported_src_fail_closed"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+        (.ite 2
+          (.letBind 3 .i64 (.call "lean_native_unknown_extern" [0] .i64 true)
+            (.letBind 4 .i64 (.scalar (.constU64 retVal)) (.ret 4)))
+          (.letBind 5 .i64 (.scalar (.constU64 0)) (.ret 5)))
+  }
+  let unsuppBad := validateTranslationDecl (mkUnsupportedSrcDecl 0) (mkUnsupportedSrcDecl 1) 8
+  unless !unsuppBad.ubRefines && !unsuppBad.passed do
+    throw <| IO.userError s!"unsupported symbolic execution in source vacuously accepted target: {reprStr unsuppBad}"
+  -- 29. `lean_native_ctor_set` without a statically proven exclusive root must keep the exclusivity requirement in
+  --     `ubCond` WITHOUT poisoning the cached root binding's `noUB`, so a later `lean_native_ctor_tag` read still
+  --     compares symbolically on the defined exclusive path (`x == 999`)!
+  let mkUnprovenExclStoreDecl (retConstVal : UInt64) : LNIRDecl := {
+    name := "unproven_excl_store"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+        (.ite 2
+          (.letBind 3 .objPtr (.ctorGetObj 0 0)
+            (.letBind 8 .i64 (.scalar (.constU64 0))
+              (.letBind 4 .unit (.call "lean_native_ctor_set" [0, 8, 3] .unit false)
+                (.letBind 5 .i64 (.call "lean_native_ctor_tag" [0] .i64 false)
+                  (.letBind 6 .i64 (.scalar (.constU64 retConstVal))
+                    (.ret 6))))))
+          (.letBind 7 .i64 (.scalar (.constU64 0)) (.ret 7)))
+  }
+  let unprovenExclBad := validateTranslationDecl (mkUnprovenExclStoreDecl 0) (mkUnprovenExclStoreDecl 1) 8
+  unless !unprovenExclBad.symRetEquiv && !unprovenExclBad.passed do
+    throw <| IO.userError s!"unproven-exclusive ctor_set poisoned cached root noUB and masked return difference: {reprStr unprovenExclBad}"
+  let unprovenExclGood := validateTranslationDecl (mkUnprovenExclStoreDecl 0) (mkUnprovenExclStoreDecl 0) 8
+  unless unprovenExclGood.passed do
+    throw <| IO.userError s!"equivalent unproven-exclusive ctor_set rejected: {reprStr unprovenExclGood}"
+  -- 30. Boolean `.i1` parameter `b == true` must preserve sort `some true` (never manufacturing source UB),
+  --     and untyped `.taggedPtr` comparison `obj == true` must mark `symUnsupported` (failing closed)!
+  let mkBoolParamEqDecl (retAt999 : UInt64) : LNIRDecl := {
+    name := "bool_param_eq"
+    params := [
+      { id := 0, name := "b", ty := .i1, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constBool true)))
+        (.letBind 3 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+          (.ite 3
+            (.letBind 4 .i64 (.scalar (.constU64 retAt999)) (.ret 4))
+            (.letBind 5 .i64 (.scalar (.constU64 0)) (.ret 5))))
+  }
+  let boolParamBad := validateTranslationDecl (mkBoolParamEqDecl 0) (mkBoolParamEqDecl 1) 8
+  unless !boolParamBad.symRetEquiv && !boolParamBad.passed do
+    throw <| IO.userError s!"i1 parameter equality `b == true` erroneously collapsed ubCond: {reprStr boolParamBad}"
+  let boolParamGood := validateTranslationDecl (mkBoolParamEqDecl 0) (mkBoolParamEqDecl 0) 8
+  unless boolParamGood.passed do
+    throw <| IO.userError s!"equivalent i1 parameter equality `b == true` rejected: {reprStr boolParamGood}"
+  -- 30b. Untyped `.taggedPtr` comparison `obj == true` must mark `symUnsupported` and fail closed on any non-identity rewrite
+  let mkUntypedBoolCmpDecl (retVal : Bool) : LNIRDecl := {
+    name := "untyped_bool_cmp"
+    params := [{ id := 0, name := "obj", ty := .taggedPtr, borrow := false }]
+    retTy := .i1
+    body :=
+      .letBind 1 .i1 (.scalar (.binOp .eq (.var 0) (.constBool true)))
+        (.letBind 2 .i1 (.scalar (.constBool retVal)) (.ret 2))
+  }
+  let untypedBoolRes := validateTranslationDecl (mkUntypedBoolCmpDecl false) (mkUntypedBoolCmpDecl true) 8
+  unless !untypedBoolRes.ubRefines && !untypedBoolRes.passed do
+    throw <| IO.userError s!"untyped taggedPtr boolean comparison accepted without symUnsupported: {reprStr untypedBoolRes}"
+  -- 30c. `.tuple [.i1, .i64]` parameter projection `p.0 == true` must also preserve `.i1` sort and concrete `.bool` sampling
+  let mkTupleBoolParamDecl (retAt999 : UInt64) : LNIRDecl := {
+    name := "tuple_bool_param"
+    params := [
+      { id := 0, name := "pair", ty := .tuple [.i1, .i64], borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 2 .i1 (.projTuple 0 0)
+        (.letBind 3 .i1 (.scalar (.binOp .eq (.var 2) (.constBool true)))
+          (.letBind 4 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+            (.ite 4
+              (.letBind 5 .i64 (.scalar (.constU64 retAt999)) (.ret 5))
+              (.letBind 6 .i64 (.scalar (.constU64 0)) (.ret 6)))))
+  }
+  let tupleBoolBad := validateTranslationDecl (mkTupleBoolParamDecl 0) (mkTupleBoolParamDecl 1) 8
+  unless !tupleBoolBad.symRetEquiv && !tupleBoolBad.passed do
+    throw <| IO.userError s!"tuple .i1 projection `pair.0 == true` collapsed ubCond: {reprStr tupleBoolBad}"
+  let tupleBoolGood := validateTranslationDecl (mkTupleBoolParamDecl 0) (mkTupleBoolParamDecl 0) 8
+  unless tupleBoolGood.passed do
+    throw <| IO.userError s!"equivalent tuple .i1 projection `pair.0 == true` rejected: {reprStr tupleBoolGood}"
+  -- 31. Copying an unboxed tuple via `.scalar (.var a)` must propagate `typedTuples` provenance so nesting `b`
+  --     inside `mkTuple [b]` preserves its field expressions rather than collapsing to an opaque `.symVar`!
+  let mkCopiedTypedTupleDecl (srcMode : Bool) : LNIRDecl := {
+    name := "copied_typed_tuple"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .tuple [.tuple [.i64]]
+    body :=
+      .letBind 1 .i64
+        (if srcMode then
+          .scalar (.select (.binOp .eq (.var 0) (.constU64 999)) (.constU64 2) (.constU64 1))
+        else
+          .scalar (.constU64 1))
+        (.letBind 2 (.tuple [.i64]) (.mkTuple [1])
+          (.letBind 3 (.tuple [.i64]) (.scalar (.var 2))
+            (.letBind 4 (.tuple [.tuple [.i64]]) (.mkTuple [3])
+              (.ret 4))))
+  }
+  let copiedTupleBad := validateTranslationDecl (mkCopiedTypedTupleDecl true) (mkCopiedTypedTupleDecl false) 8
+  unless !copiedTupleBad.symRetEquiv && !copiedTupleBad.passed do
+    throw <| IO.userError s!"scalar copy of typed tuple lost provenance in nested mkTuple: {reprStr copiedTupleBad}"
+  let copiedTupleGood := validateTranslationDecl (mkCopiedTypedTupleDecl true) (mkCopiedTypedTupleDecl true) 8
+  unless copiedTupleGood.passed do
+    throw <| IO.userError s!"equivalent scalar copy of typed tuple rejected: {reprStr copiedTupleGood}"
+  -- 32. Branch-conditional UB inside an unused `ScalarExpr.select b 0 (true + 1)` must keep definedness
+  --     conditional on `b` (never collapsing `ubCond` to constant false for `b = true, x = 999`)!
+  let mkConditionalSelectUbDecl (retAt999 : UInt64) : LNIRDecl := {
+    name := "conditional_select_ub"
+    params := [
+      { id := 0, name := "b", ty := .i1, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 2 .i64 (.scalar (.select (.var 0) (.constU64 0) (.binOp .add (.constBool true) (.constU64 1))))
+        (.letBind 3 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+          (.ite 3
+            (.letBind 4 .i64 (.scalar (.constU64 retAt999)) (.ret 4))
+            (.letBind 5 .i64 (.scalar (.constU64 0)) (.ret 5))))
+  }
+  let condSelectUbBad := validateTranslationDecl (mkConditionalSelectUbDecl 0) (mkConditionalSelectUbDecl 1) 8
+  unless !condSelectUbBad.symRetEquiv && !condSelectUbBad.passed do
+    throw <| IO.userError s!"branch-conditional UB in ScalarExpr.select collapsed ubCond globally: {reprStr condSelectUbBad}"
+  let condSelectUbGood := validateTranslationDecl (mkConditionalSelectUbDecl 0) (mkConditionalSelectUbDecl 0) 8
+  unless condSelectUbGood.passed do
+    throw <| IO.userError s!"equivalent branch-conditional UB in ScalarExpr.select rejected: {reprStr condSelectUbGood}"
+  -- 33. Concrete `evalBinOp` identity/idempotence cases on Boolean operands (`b &&& b`, `b + 0`, `b * 1`, `b ||| 0`)
+  --     are concretely defined and must NOT collapse `ubCond` to false; and runtime-dependent `b + y` or `b1 &&& b2`
+  --     must fail closed (`symUnsupported`) rather than assuming source UB!
+  let mkBoolBitAndIdemDecl (retAt999 : UInt64) : LNIRDecl := {
+    name := "bool_bitand_idem"
+    params := [
+      { id := 0, name := "b", ty := .i1, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .bitAnd (.var 0) (.var 0)))
+        (.letBind 3 .i1 (.scalar (.binOp .add (.var 2) (.constU64 0)))
+          (.letBind 4 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+            (.ite 4
+              (.letBind 5 .i64 (.scalar (.constU64 retAt999)) (.ret 5))
+              (.letBind 6 .i64 (.scalar (.constU64 0)) (.ret 6)))))
+  }
+  let boolIdemBad := validateTranslationDecl (mkBoolBitAndIdemDecl 0) (mkBoolBitAndIdemDecl 1) 8
+  unless !boolIdemBad.symRetEquiv && !boolIdemBad.passed do
+    throw <| IO.userError s!"Boolean identity/idempotence ops collapsed ubCond to false: {reprStr boolIdemBad}"
+  let boolIdemGood := validateTranslationDecl (mkBoolBitAndIdemDecl 0) (mkBoolBitAndIdemDecl 0) 8
+  unless boolIdemGood.passed do
+    throw <| IO.userError s!"equivalent Boolean identity/idempotence ops rejected: {reprStr boolIdemGood}"
+  let mkBoolRuntimeAddDecl (retAt999 : UInt64) : LNIRDecl := {
+    name := "bool_runtime_add"
+    params := [
+      { id := 0, name := "b", ty := .i1, borrow := false },
+      { id := 1, name := "y", ty := .i64, borrow := false },
+      { id := 2, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 3 .i1 (.scalar (.binOp .add (.var 0) (.var 1)))
+        (.letBind 4 .i1 (.scalar (.binOp .eq (.var 2) (.constU64 999)))
+          (.ite 4
+            (.letBind 5 .i64 (.scalar (.constU64 retAt999)) (.ret 5))
+            (.letBind 6 .i64 (.scalar (.constU64 0)) (.ret 6))))
+  }
+  let boolRuntimeBad := validateTranslationDecl (mkBoolRuntimeAddDecl 0) (mkBoolRuntimeAddDecl 1) 8
+  unless !boolRuntimeBad.ubRefines && !boolRuntimeBad.passed do
+    throw <| IO.userError s!"runtime-conditional `b + y` treated as definite source UB instead of unsupported: {reprStr boolRuntimeBad}"
+  -- 34. `.fma` must route through the checked symbolic `mul`/`add` handlers so `fma true 1 0` stays defined
+  --     (concrete `evalBinOp` identity cases) instead of collapsing `ubCond` to false!
+  let mkFmaIdentityDecl (retAt999 : UInt64) : LNIRDecl := {
+    name := "fma_identity"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 1 .i1 (.scalar (.fma (.constBool true) (.constU64 1) (.constU64 0)))
+        (.letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+          (.ite 2
+            (.letBind 3 .i64 (.scalar (.constU64 retAt999)) (.ret 3))
+            (.letBind 4 .i64 (.scalar (.constU64 0)) (.ret 4))))
+  }
+  let fmaIdBad := validateTranslationDecl (mkFmaIdentityDecl 0) (mkFmaIdentityDecl 1) 8
+  unless !fmaIdBad.symRetEquiv && !fmaIdBad.passed do
+    throw <| IO.userError s!"fma identity `true * 1 + 0` collapsed ubCond to false: {reprStr fmaIdBad}"
+  let fmaIdGood := validateTranslationDecl (mkFmaIdentityDecl 0) (mkFmaIdentityDecl 0) 8
+  unless fmaIdGood.passed do
+    throw <| IO.userError s!"equivalent fma identity `true * 1 + 0` rejected: {reprStr fmaIdGood}"
+  let mkFmaZeroBoolDecl (retAt999 : UInt64) : LNIRDecl := {
+    name := "fma_zero_bool"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 1 .i1 (.scalar (.fma (.constU64 0) (.constU64 5) (.constBool true)))
+        (.letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+          (.ite 2
+            (.letBind 3 .i64 (.scalar (.constU64 retAt999)) (.ret 3))
+            (.letBind 4 .i64 (.scalar (.constU64 0)) (.ret 4))))
+  }
+  let fmaZeroBoolBad := validateTranslationDecl (mkFmaZeroBoolDecl 0) (mkFmaZeroBoolDecl 1) 8
+  unless !fmaZeroBoolBad.symRetEquiv && !fmaZeroBoolBad.passed do
+    throw <| IO.userError s!"fma `0 * 5 + true` collapsed ubCond to false: {reprStr fmaZeroBoolBad}"
+  -- 35. `.u256` arithmetic `(y + constU256(2^64 - 1)) + constU256(1)` must preserve 256-bit carry (`y + 2^64` mod `2^256`)
+  --     and NEVER fold via 64-bit wraparound to `y`, and mixed-width `y + constU64(1)` must be treated as UB!
+  let mkU256CarryDecl (collapseCarry : Bool) : LNIRDecl := {
+    name := "u256_low_limb_carry"
+    params := [
+      { id := 0, name := "y", ty := .u256, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .u256
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+        (.ite 2
+          (if collapseCarry then
+             .ret 0
+           else
+             .letBind 3 .u256 (.constU256 ⟨0xffffffffffffffff, 0, 0, 0⟩)
+               (.letBind 4 .u256 (.constU256 ⟨1, 0, 0, 0⟩)
+                 (.letBind 5 .u256 (.scalar (.binOp .add (.binOp .add (.var 0) (.var 3)) (.var 4)))
+                   (.ret 5))))
+          (.ret 0))
+  }
+  let u256CarryBad := validateTranslationDecl (mkU256CarryDecl false) (mkU256CarryDecl true) 8
+  unless !u256CarryBad.symRetEquiv && !u256CarryBad.passed do
+    throw <| IO.userError s!"u256 low-limb carry `(y + (2^64 - 1)) + 1` erroneously folded to `y`: {reprStr u256CarryBad}"
+  let u256CarryGood := validateTranslationDecl (mkU256CarryDecl false) (mkU256CarryDecl false) 8
+  unless u256CarryGood.passed do
+    throw <| IO.userError s!"equivalent u256 low-limb carry rejected: {reprStr u256CarryGood}"
+  -- 36. Unknown-RC `decRef p 1` on an `.objPtr` input (which may free `p` when `rc == 1`, invalidating borrowed alias `q`)
+  --     must mark symbolic execution unsupported (`symUnsupported`) and fail closed instead of assuming `rc > 1`!
+  let mkUnknownRcFreeAliasDecl (readAfterDec : Bool) : LNIRDecl := {
+    name := "unknown_rc_free_alias"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "q", ty := .objPtr, borrow := true }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 2 .i64 (.call "lean_native_ctor_tag" [1] .i64 false)
+        (.decRef 0 1
+          (if readAfterDec then
+             .letBind 3 .i64 (.call "lean_native_ctor_tag" [1] .i64 false)
+               (.letBind 4 .i64 (.scalar (.constU64 0)) (.ret 4))
+           else
+             .letBind 4 .i64 (.scalar (.constU64 0)) (.ret 4)))
+  }
+  let unkFreeBad := validateTranslationDecl (mkUnknownRcFreeAliasDecl false) (mkUnknownRcFreeAliasDecl true) 8
+  unless !unkFreeBad.ubRefines && !unkFreeBad.passed do
+    throw <| IO.userError s!"unknown-RC decRef on objPtr masked post-free alias read: {reprStr unkFreeBad}"
+  -- 37. Zero-count `incRef a 0` / `decRef a 0` on a freed heap object must check liveness (never skipping `rc == 0` UB)!
+  let mkFreedZeroCountRcDecl (incZeroAt999 : Bool) : LNIRDecl := {
+    name := "freed_zero_count_rc"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 1 .objPtr (.allocCtor 0 [] [])
+        (.decRef 1 1
+          (if incZeroAt999 then
+             .letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+               (.ite 2
+                 (.incRef 1 0 (.letBind 3 .i64 (.scalar (.constU64 0)) (.ret 3)))
+                 (.letBind 3 .i64 (.scalar (.constU64 0)) (.ret 3)))
+           else
+             .letBind 3 .i64 (.scalar (.constU64 0)) (.ret 3)))
+  }
+  let freedZeroBad := validateTranslationDecl (mkFreedZeroCountRcDecl false) (mkFreedZeroCountRcDecl true) 8
+  unless !freedZeroBad.ubRefines && !freedZeroBad.passed do
+    throw <| IO.userError s!"zero-count incRef on freed heap object bypassed liveness check: {reprStr freedZeroBad}"
+  let mkRcWidthDecl (count : Nat) : LNIRDecl := {
+    name := "known_rc_width"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .objPtr
+    body :=
+      .letBind 1 .objPtr (.allocCtor 0 [] [])
+        (.letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+          (.ite 2 (.incRef 1 count (.ret 1)) (.ret 1)))
+  }
+  for count in [18446744073709551616, 18446744073709551615] do
+    let rcWidthBad := validateTranslationDecl (mkRcWidthDecl 0) (mkRcWidthDecl count) 8
+    unless !rcWidthBad.ubRefines && !rcWidthBad.passed do
+      throw <| IO.userError s!"known RC width overflow accepted for {count}: {reprStr rcWidthBad}"
+  unless (validateTranslationDecl (mkRcWidthDecl 0) (mkRcWidthDecl 0) 8).passed do
+    throw <| IO.userError "equivalent in-range known RC rejected"
+  let mkSelectRootSafetyDecl (corrupt : Bool) : LNIRDecl := {
+    name := "select_root_conditional_safety"
+    params := [
+      { id := 0, name := "y", ty := .u256, borrow := false },
+      { id := 1, name := "z", ty := .u256, borrow := false },
+      { id := 2, name := "a", ty := .i64, borrow := false },
+      { id := 3, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 4 .i64 (.scalar (.select (.binOp .div (.var 0) (.var 1)) (.var 2) (.var 2)))
+        (.letBind 5 .i64 (.scalar
+          (if corrupt then .select (.binOp .eq (.var 3) (.constU64 999)) (.constU64 1) (.constU64 0)
+           else .constU64 0)) (.ret 5))
+  }
+  let selectRootSafetyBad := validateTranslationDecl (mkSelectRootSafetyDecl false) (mkSelectRootSafetyDecl true) 8
+  unless !selectRootSafetyBad.ubRefines && !selectRootSafetyBad.passed do
+    throw <| IO.userError s!"matching select roots discarded conditional safety: {reprStr selectRootSafetyBad}"
+  let mkTupleHeapNamespaceDecl (returnLeaf : Bool) : LNIRDecl := {
+    name := "tuple_heap_namespace"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "t", ty := .tuple (List.replicate 5907 .i64), borrow := false },
+      { id := 2, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 3 .i1 (.scalar (.binOp .eq (.var 2) (.constU64 999)))
+        (.ite 3
+          (.letBind 4 .i64 (.ctorGetScalar 0 0 .i64)
+            (.letBind 5 .i64 (.projTuple 1 5906) (.ret (if returnLeaf then 5 else 4))))
+          (.letBind 6 .i64 (.scalar (.constU64 0)) (.ret 6)))
+  }
+  let namespaceBad := validateTranslationDecl (mkTupleHeapNamespaceDecl false) (mkTupleHeapNamespaceDecl true) 0
+  unless !namespaceBad.symRetEquiv && !namespaceBad.passed do
+    throw <| IO.userError s!"tuple leaf collided with heap projection namespace: {reprStr namespaceBad}"
+  let mkUnknownExtRcWrapDecl (incWrap : Bool) (c1 c2 : Nat) : LNIRDecl := {
+    name := "unknown_ext_rc_wrap"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      if incWrap then
+        .letBind 2 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+          (.ite 2
+            (.incRef 0 c1 (.incRef 0 c2 (.letBind 3 .i64 (.scalar (.constU64 0)) (.ret 3))))
+            (.letBind 3 .i64 (.scalar (.constU64 0)) (.ret 3)))
+      else
+        .letBind 3 .i64 (.scalar (.constU64 0)) (.ret 3)
+  }
+  for (c1, c2) in [(18446744073709551615, 1), (4611686018427387904, 4611686018427387904)] do
+    let extWrapBad := validateTranslationDecl (mkUnknownExtRcWrapDecl true c1 c2) (mkUnknownExtRcWrapDecl false 0 0) 8
+    unless !extWrapBad.ubRefines && !extWrapBad.passed do
+      throw <| IO.userError s!"unknown external RC overflow accepted for ({c1}, {c2}): {reprStr extWrapBad}"
+  let mkBadCtorTagImmediateDecl (useU256 : Bool) (callTag : Bool) : LNIRDecl := {
+    name := "ctor_tag_bad_immediate"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 1 (if useU256 then .u256 else .tuple [])
+        (if useU256 then .constU256 UInt256.zero else .mkTuple [])
+        (if callTag then
+           .letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+             (.ite 2
+               (.letBind 3 .i64 (.call "lean_native_ctor_tag" [1] .i64 false)
+                 (.letBind 4 .i64 (.scalar (.constU64 0)) (.ret 4)))
+               (.letBind 4 .i64 (.scalar (.constU64 0)) (.ret 4)))
+         else
+           .letBind 4 .i64 (.scalar (.constU64 0)) (.ret 4))
+  }
+  for useU256 in [true, false] do
+    let tagImmBad := validateTranslationDecl (mkBadCtorTagImmediateDecl useU256 false) (mkBadCtorTagImmediateDecl useU256 true) 8
+    unless !tagImmBad.ubRefines && !tagImmBad.passed do
+      throw <| IO.userError s!"lean_native_ctor_tag on unsupported immediate accepted (u256={useU256}): {reprStr tagImmBad}"
+  let mkUnboxHeapTypeDecl (checkExcl : Bool) (useRootInExcl : Bool) : LNIRDecl := {
+    name := "unbox_heap_type"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i1
+    body :=
+      .letBind 2 .i64 (.unboxScalar 0 .i64)
+        (if checkExcl then
+           .letBind 3 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+             (.ite 3
+               (.letBind 4 .i1 (.isExclusive (if useRootInExcl then 0 else 2)) (.ret 4))
+               (.letBind 4 .i1 (.scalar (.constBool true)) (.ret 4)))
+         else
+           .letBind 4 .i1 (.scalar (.constBool true)) (.ret 4))
+  }
+  for useRoot in [true, false] do
+    let unboxBad := validateTranslationDecl (mkUnboxHeapTypeDecl true useRoot) (mkUnboxHeapTypeDecl false useRoot) 8
+    unless !unboxBad.symRetEquiv && !unboxBad.passed do
+      throw <| IO.userError s!"unboxScalar erased heap type of objPtr (useRoot={useRoot}): {reprStr unboxBad}"
+  let mkProjCachedSortDecl (corruptAt999 : Bool) (cmpProjected : Bool) : LNIRDecl := {
+    name := "proj_cached_sort"
+    params := [
+      { id := 0, name := "b", ty := .i1, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 2 .objPtr (.allocCtor 0 [] [0])
+        (.letBind 3 .i64 (.ctorGetScalar 2 0 .i64)
+          (.letBind 4 .i1 (.scalar (.binOp .eq (.var (if cmpProjected then 3 else 0)) (.constBool true)))
+            (.decRef 2 1
+              (.letBind 5 .i64 (.scalar
+                (if corruptAt999 then .select (.binOp .eq (.var 1) (.constU64 999)) (.constU64 1) (.constU64 0)
+                 else .constU64 0)) (.ret 5)))))
+  }
+  for cmpProjected in [false, true] do
+    let projSortBad := validateTranslationDecl (mkProjCachedSortDecl false cmpProjected) (mkProjCachedSortDecl true cmpProjected) 8
+    unless !projSortBad.symRetEquiv && !projSortBad.passed do
+      throw <| IO.userError s!"ctorGetScalar overwrote cached field runtime sort (cmpProjected={cmpProjected}): {reprStr projSortBad}"
+  let mkProjTupleOnHeapCtorDecl (projHeap : Bool) : LNIRDecl := {
+    name := "proj_tuple_on_heap_ctor"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 1 .objPtr (.allocCtor 0 [] [0])
+        (if projHeap then
+           .letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+             (.ite 2
+               (.letBind 3 .i64 (.projTuple 1 0) (.decRef 1 1 (.letBind 4 .i64 (.scalar (.constU64 0)) (.ret 4))))
+               (.decRef 1 1 (.letBind 4 .i64 (.scalar (.constU64 0)) (.ret 4))))
+         else
+           .decRef 1 1 (.letBind 4 .i64 (.scalar (.constU64 0)) (.ret 4)))
+  }
+  let projHeapBad := validateTranslationDecl (mkProjTupleOnHeapCtorDecl false) (mkProjTupleOnHeapCtorDecl true) 8
+  unless !projHeapBad.ubRefines && !projHeapBad.passed do
+    throw <| IO.userError s!"projTuple on heap constructor root accepted: {reprStr projHeapBad}"
+  let mkScalarFieldsHeapPtrDecl (constTrue : Bool) : LNIRDecl := {
+    name := "scalar_fields_heap_ptr"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i1
+    body :=
+      .letBind 1 .objPtr (.allocCtor 0 [] [])
+        (.letBind 2 .objPtr (.allocCtor 0 [] [1])
+          (.letBind 3 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+            (.ite 3
+              (.incRef 1 1
+                (.letBind 4 .objPtr (.ctorGetObj 2 0)
+                  (.letBind 5 .i1 (if constTrue then .scalar (.constBool true) else .isExclusive 4)
+                    (.decRef 1 1 (.decRef 2 1 (.ret 5))))))
+              (.letBind 4 .objPtr (.ctorGetObj 2 0)
+                (.letBind 5 .i1 (if constTrue then .scalar (.constBool true) else .isExclusive 4)
+                  (.decRef 2 1 (.ret 5)))))))
+  }
+  let scalarFieldsHeapBad := validateTranslationDecl (mkScalarFieldsHeapPtrDecl false) (mkScalarFieldsHeapPtrDecl true) 8
+  unless !scalarFieldsHeapBad.symRetEquiv && !scalarFieldsHeapBad.passed do
+    throw <| IO.userError s!"allocCtor scalarFields copied heap snapshot instead of root identity: {reprStr scalarFieldsHeapBad}"
+  let mkUncachedCtorFieldExclDecl (constTrue : Bool) : LNIRDecl := {
+    name := "uncached_ctor_field_excl"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i1
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+        (.ite 2
+          (.letBind 3 .i64 (.ctorGetScalar 0 0 .i64)
+            (if constTrue then
+               .letBind 4 .i1 (.scalar (.constBool true)) (.ret 4)
+             else
+               .letBind 4 .i1 (.isExclusive 3) (.ret 4)))
+          (.letBind 4 .i1 (.scalar (.constBool true)) (.ret 4)))
+  }
+  let uncachedFieldBad := validateTranslationDecl (mkUncachedCtorFieldExclDecl false) (mkUncachedCtorFieldExclDecl true) 8
+  unless !uncachedFieldBad.ubRefines && !uncachedFieldBad.passed do
+    throw <| IO.userError s!"ctorGetScalar assumed runtime scalar sort on uncached field: {reprStr uncachedFieldBad}"
+  let mkTupleParamObjPtrProjDecl (constTrue : Bool) : LNIRDecl := {
+    name := "tuple_param_objptr_proj"
+    params := [
+      { id := 0, name := "t", ty := .tuple [.objPtr], borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i1
+    body :=
+      .letBind 2 .i64 (.projTuple 0 0)
+        (.letBind 3 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+          (.ite 3
+            (if constTrue then
+               .letBind 4 .i1 (.scalar (.constBool true)) (.ret 4)
+             else
+               .letBind 4 .i1 (.isExclusive 2) (.ret 4))
+            (.letBind 4 .i1 (.scalar (.constBool true)) (.ret 4))))
+  }
+  let tupleParamObjBad := validateTranslationDecl (mkTupleParamObjPtrProjDecl false) (mkTupleParamObjPtrProjDecl true) 8
+  unless !tupleParamObjBad.ubRefines && !tupleParamObjBad.passed do
+    throw <| IO.userError s!"projTuple manufactured scalar sort for tuple [objPtr] parameter field: {reprStr tupleParamObjBad}"
+  let mkCtorGetOnUnboxedTupleDecl (corruptAt999 : Bool) (returnProjected : Bool) : LNIRDecl := {
+    name := "ctor_get_on_unboxed_tuple"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 1 .i64 (.scalar (.constU64 0))
+        (.letBind 2 (.tuple [.i64, .i64]) (.mkTuple [1, 0])
+          (.letBind 3 .i64 (.ctorGetScalar 2 0 .i64)
+            (if returnProjected then
+               .letBind 4 .i64 (.scalar (if corruptAt999 then .select (.binOp .eq (.var 0) (.constU64 999)) (.constU64 1) (.var 0) else .var 3))
+                 (.ret 4)
+             else
+               .letBind 4 .i64 (.scalar (if corruptAt999 then .select (.binOp .eq (.var 0) (.constU64 999)) (.constU64 1) (.constU64 0) else .constU64 0))
+                 (.ret 4))))
+  }
+  for retProj in [false, true] do
+    let ctorTupleBad := validateTranslationDecl (mkCtorGetOnUnboxedTupleDecl false retProj) (mkCtorGetOnUnboxedTupleDecl true retProj) 8
+    unless !ctorTupleBad.symRetEquiv && !ctorTupleBad.passed do
+      throw <| IO.userError s!"ctorGetScalar on unboxed tuple collapsed ubCond or returned wrong field (retProj={retProj}): {reprStr ctorTupleBad}"
+  unless (validateTranslationDecl (mkCtorGetOnUnboxedTupleDecl false true) (mkCtorGetOnUnboxedTupleDecl false true) 8).passed do
+    throw <| IO.userError "equivalent ctorGetScalar on unboxed tuple rejected"
+  let mkTagRefinedReturnDecl (returnTupleAt999 : Bool) : LNIRDecl := {
+    name := "tag_refined_return_heap_provenance"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .objPtr
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+        (.ite 2
+          (.letBind 3 .i64 (.call "lean_native_ctor_tag" [0] .i64 false)
+            (.letBind 4 .i1 (.scalar (.binOp .eq (.var 3) (.constU64 0)))
+              (.ite 4
+                (.letBind 10 .i64 (.scalar (.constU64 0))
+                  (.letBind 11 .objPtr (.ctorGetObj 0 0)
+                    (.letBind 12 .objPtr (.ctorGetObj 0 1)
+                      (.letBind 13 .objPtr (.ctorGetObj 0 2)
+                        (.letBind 14 .objPtr (.ctorGetObj 0 3)
+                          (.letBind 15 .objPtr (.ctorGetObj 0 4)
+                            (.letBind 16 .objPtr (.ctorGetObj 0 5)
+                              (.letBind 17 .objPtr (.ctorGetObj 0 6)
+                                (.letBind 18 .objPtr (.ctorGetObj 0 7)
+                                  (.letBind 19 (.tuple (List.replicate 9 .i64)) (.mkTuple [10, 11, 12, 13, 14, 15, 16, 17, 18])
+                                    (.ret (if returnTupleAt999 then 19 else 0))))))))))))
+                (.ret 0))))
+          (.ret 0))
+  }
+  let tagRetBad := validateTranslationDecl (mkTagRefinedReturnDecl false) (mkTagRefinedReturnDecl true) 8
+  unless !tagRetBad.symRetEquiv && !tagRetBad.passed do
+    throw <| IO.userError s!"tag-refined input objPtr return collapsed to unboxed tuple: {reprStr tagRetBad}"
+  let mkOverflowTagDecl (tagAt999 : Nat) : LNIRDecl := {
+    name := "alloc_ctor_tag_overflow"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .objPtr
+    body :=
+      .letBind 1 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+        (.ite 1
+          (.letBind 2 .objPtr (.allocCtor tagAt999 [] []) (.ret 2))
+          (.letBind 2 .objPtr (.allocCtor 0 [] []) (.ret 2)))
+  }
+  let ovfTagBad := validateTranslationDecl (mkOverflowTagDecl 0) (mkOverflowTagDecl 18446744073709551616) 8
+  unless !ovfTagBad.ubRefines && !ovfTagBad.passed do
+    throw <| IO.userError s!"allocCtor tag > UInt64.max truncated without failing closed: {reprStr ovfTagBad}"
+  let ovfTagSrcBad := validateTranslationDecl (mkOverflowTagDecl 18446744073709551616) (mkOverflowTagDecl 0) 8
+  unless !ovfTagSrcBad.ubRefines && !ovfTagSrcBad.passed do
+    throw <| IO.userError s!"source allocCtor tag > UInt64.max accepted non-identity target: {reprStr ovfTagSrcBad}"
+  let mkLoopHeapAccDecl (constOneAt999 : Bool) : LNIRDecl := {
+    name := "loop_heap_acc_proj"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 1 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+        (.ite 1
+          (.letBind 2 .i64 (.scalar (.constU64 7))
+            (.letBind 3 .objPtr (.allocCtor 0 [] [2])
+              (.letBind 4 .i64 (.scalar (.constU64 0))
+                (.letBind 5 .i64 (.scalar (.constU64 4))
+                  (.seqFor 6 4 5 7 3 .objPtr
+                    (.ret 7)
+                    (.letBind 8 .i64 (.ctorGetScalar 7 0 .i64)
+                      (.decRef 7 1
+                        (if constOneAt999 then
+                           .letBind 9 .i64 (.scalar (.constU64 1)) (.ret 9)
+                         else
+                           .ret 8))))))))
+          (.letBind 9 .i64 (.scalar (.constU64 0)) (.ret 9)))
+  }
+  let loopHeapBad := validateTranslationDecl (mkLoopHeapAccDecl false) (mkLoopHeapAccDecl true) 8
+  unless !loopHeapBad.symRetEquiv && !loopHeapBad.passed do
+    throw <| IO.userError s!"seqFor loop body return expanded heap summary into accumulator: {reprStr loopHeapBad}"
+  unless (validateTranslationDecl (mkLoopHeapAccDecl false) (mkLoopHeapAccDecl false) 8).passed do
+    throw <| IO.userError "equivalent seqFor heap-accumulator declaration rejected"
+  let mkLoopRepeatAllocDecl (allocInsideLoop : Bool) : LNIRDecl := {
+    name := "loop_repeat_alloc_roots"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .objPtr
+    body :=
+      .letBind 1 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+        (.ite 1
+          (.letBind 2 .i64 (.scalar (.constU64 0))
+            (.letBind 3 .i64 (.scalar (.constU64 4))
+              (.letBind 4 .objPtr (.allocCtor 0 [] [])
+                (if allocInsideLoop then
+                   .seqFor 5 2 3 6 4 .objPtr
+                     (.letBind 7 .objPtr (.allocCtor 0 [] []) (.ret 7))
+                     (.ret 6)
+                 else
+                   .letBind 7 .objPtr (.allocCtor 0 [] [])
+                     (.seqFor 5 2 3 6 4 .objPtr
+                       (.ret 7)
+                       (.ret 6))))))
+          (.letBind 8 .objPtr (.allocCtor 0 [] []) (.ret 8)))
+  }
+  let loopRepeatAllocBad := validateTranslationDecl (mkLoopRepeatAllocDecl true) (mkLoopRepeatAllocDecl false) 8
+  unless !loopRepeatAllocBad.memWritesEquiv && !loopRepeatAllocBad.passed do
+    throw <| IO.userError s!"repeated seqFor allocCtor collapsed live heap allocations: {reprStr loopRepeatAllocBad}"
+  let mkLoopLinearChainDecl (dropPrev : Bool) : LNIRDecl := {
+    name := "loop_linear_alloc_drop"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .objPtr
+    body :=
+      .letBind 1 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+        (.ite 1
+          (.letBind 2 .i64 (.scalar (.constU64 0))
+            (.letBind 3 .i64 (.scalar (.constU64 4))
+              (.letBind 4 .objPtr (.allocCtor 0 [] [])
+                (.seqFor 5 2 3 6 4 .objPtr
+                  (if dropPrev then
+                     .decRef 6 1 (.letBind 7 .objPtr (.allocCtor 0 [] []) (.ret 7))
+                   else
+                     .letBind 7 .objPtr (.allocCtor 0 [] []) (.ret 7))
+                  (.ret 6)))))
+          (.letBind 8 .objPtr (.allocCtor 0 [] []) (.ret 8)))
+  }
+  let loopDropBad := validateTranslationDecl (mkLoopLinearChainDecl true) (mkLoopLinearChainDecl false) 8
+  unless !loopDropBad.memWritesEquiv && !loopDropBad.passed do
+    throw <| IO.userError s!"seqFor loop missing decRef on prior iteration allocation accepted: {reprStr loopDropBad}"
+  let mkLoopConditionalSafetyDecl (corruptAt999 : Bool) : LNIRDecl := {
+    name := "loop_conditional_safety"
+    params := [
+      { id := 0, name := "y", ty := .u256, borrow := false },
+      { id := 1, name := "z", ty := .u256, borrow := false },
+      { id := 2, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 3 .i64 (.scalar (.constU64 0))
+        (.letBind 4 .i64 (.scalar (.constU64 4))
+          (.seqFor 5 3 4 6 3 .i64
+            (.letBind 7 .u256 (.scalar (.binOp .div (.var 0) (.var 1)))
+              (.letBind 8 .i64 (.scalar (.constU64 0)) (.ret 8)))
+            (.letBind 9 .i64 (.scalar
+              (if corruptAt999 then .select (.binOp .eq (.var 2) (.constU64 999)) (.constU64 1) (.constU64 0)
+               else .constU64 0)) (.ret 9))))
+  }
+  let loopCondBad := validateTranslationDecl (mkLoopConditionalSafetyDecl false) (mkLoopConditionalSafetyDecl true) 8
+  unless !loopCondBad.symRetEquiv && !loopCondBad.passed do
+    throw <| IO.userError s!"seqFor accumulator binding collapsed conditional loop safety ubCond: {reprStr loopCondBad}"
+  unless (validateTranslationDecl (mkLoopConditionalSafetyDecl false) (mkLoopConditionalSafetyDecl false) 8).passed do
+    throw <| IO.userError "equivalent seqFor conditional-safety declaration rejected"
+  let mkUncondAfterUnprovenLiveDecl (addTargetDivZero : Bool) : LNIRDecl := {
+    name := "uncond_after_unproven_live"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "y", ty := .u256, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      if addTargetDivZero then
+        .letBind 2 .i1 (.isExclusive 0)
+          (.letBind 3 .u256 (.constU256 UInt256.zero)
+            (.letBind 4 .u256 (.scalar (.binOp .div (.var 1) (.var 3)))
+              (.letBind 5 .i64 (.scalar (.constU64 0)) (.ret 5))))
+      else
+        .letBind 5 .i64 (.scalar (.constU64 0)) (.ret 5)
+  }
+  let uncondLiveBad := validateTranslationDecl (mkUncondAfterUnprovenLiveDecl false) (mkUncondAfterUnprovenLiveDecl true) 8
+  unless !uncondLiveBad.ubRefines && !uncondLiveBad.passed do
+    throw <| IO.userError s!"unproven liveness failed to clear unconditional noUB: {reprStr uncondLiveBad}"
+  let mkWideFieldProjDecl (retAt999 : UInt64) (tagRefineFirst : Bool) : LNIRDecl := {
+    name := "wide_field_proj_fail_closed"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+        (.ite 2
+          (if tagRefineFirst then
+             .letBind 3 .i64 (.call "lean_native_ctor_tag" [0] .i64 false)
+               (.letBind 4 .i1 (.scalar (.binOp .eq (.var 3) (.constU64 0)))
+                 (.ite 4
+                   (.letBind 5 .i64 (.ctorGetScalar 0 8 .i64)
+                     (.letBind 6 .i64 (.scalar (.constU64 retAt999)) (.ret 6)))
+                   (.letBind 6 .i64 (.scalar (.constU64 0)) (.ret 6))))
+           else
+             .letBind 5 .i64 (.ctorGetScalar 0 8 .i64)
+               (.letBind 6 .i64 (.scalar (.constU64 retAt999)) (.ret 6)))
+          (.letBind 6 .i64 (.scalar (.constU64 0)) (.ret 6)))
+  }
+  for tagRefine in [false, true] do
+    let wideProjBad := validateTranslationDecl (mkWideFieldProjDecl 0 tagRefine) (mkWideFieldProjDecl 1 tagRefine) 8
+    unless !wideProjBad.ubRefines && !wideProjBad.passed do
+      throw <| IO.userError s!"ctorGetScalar p 8 treated modeling limit as definite source UB (tagRefine={tagRefine}): {reprStr wideProjBad}"
+  let mkEnsureExclCtorDecl (constTrueAt999 : Bool) : LNIRDecl := {
+    name := "ensure_excl_preserves_ctor_rc"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i1
+    body :=
+      .letBind 1 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+        (.ite 1
+          (.letBind 2 .objPtr (.allocCtor 0 [] [])
+            (.incRef 2 1
+              (.letBind 3 .objPtr (.call "lean_native_ensure_exclusive" [2] .objPtr false)
+                (.letBind 4 .i1 (if constTrueAt999 then .scalar (.constBool true) else .isExclusive 2)
+                  (.decRef 2 2 (.ret 4))))))
+          (.letBind 4 .i1 (.scalar (.constBool true)) (.ret 4)))
+  }
+  let ensureCtorBad := validateTranslationDecl (mkEnsureExclCtorDecl false) (mkEnsureExclCtorDecl true) 8
+  unless !ensureCtorBad.symRetEquiv && !ensureCtorBad.passed do
+    throw <| IO.userError s!"lean_native_ensure_exclusive reset constructor RC to 1: {reprStr ensureCtorBad}"
+  unless (validateTranslationDecl (mkEnsureExclCtorDecl false) (mkEnsureExclCtorDecl false) 8).passed do
+    throw <| IO.userError "equivalent lean_native_ensure_exclusive constructor declaration rejected"
+''', encoding="utf-8")
+            alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
+                                       capture_output=True, text=True)
+            self.assertEqual(alias_res.returncode, 0, alias_res.stdout + alias_res.stderr)
 
 
 if __name__ == "__main__":

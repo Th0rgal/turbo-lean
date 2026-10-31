@@ -1,0 +1,202 @@
+{
+  "schema": "emitter-mutants-b3-v1",
+  "spec": "specs/trackB0-v4.md",
+  "comparison_universe": ["M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "M11"],
+  "conclusive_minimum": 9,
+  "infra_signatures": [
+    "out of memory",
+    "oom-kill",
+    "killed process",
+    "cannot allocate memory",
+    "signal: 9",
+    "sigkill",
+    "no space left on device",
+    "network is unreachable",
+    "temporary failure in name resolution",
+    "could not resolve host",
+    "connection timed out",
+    "connection refused",
+    "failed to download",
+    "error downloading",
+    "curl: (",
+    "elan toolchain install",
+    "toolchain download"
+  ],
+  "c5_flag_note": "The mission text says `python3 scripts/run_conformance_suite.py --tier C1`. The suite's argparse accepts only --json and --fuzz-seeds; --tier exits 2. C5 therefore runs the suite with no --tier (default --fuzz-seeds 50). A --tier invocation is recorded as a flag check, not as the check itself.",
+  "checks": {
+    "C1": {
+      "argv": ["bash", "-c", "cd lean && lake build"],
+      "depends_on": [
+        "lean/.lake/build/lib/lean/LeanNative.olean",
+        "lean/.lake/build/lib/lean/LeanNative/Core.olean",
+        "lean/.lake/build/lib/lean/LeanNative/Backend/LLVM.olean",
+        "lean/.lake/build/lib/lean/LeanNative/Backend/MLIRGPU.olean",
+        "lean/.lake/build/lib/lean/LeanNative/Backend/Metal.olean",
+        "lean/.lake/build/lib/lean/TurboLean/Spec.olean",
+        "lean/.lake/build/lib/lean/TurboLean/Orchestrator.olean",
+        "lean/.lake/build/lib/lean/TurboLean/ZygoteWorker.olean",
+        "lean/.lake/build/bin/lean-native",
+        "lean/.lake/build/bin/lean-native-core",
+        "lean/.lake/build/bin/turbo-lean-native",
+        "lean/.lake/build/bin/turbo-zygote"
+      ]
+    },
+    "C2": {
+      "argv": ["cargo", "build", "--release", "-j4", "-p", "turbo-lean"],
+      "depends_on": [
+        "target/release/turbo-lean"
+      ]
+    },
+    "C3": {
+      "argv": ["cargo", "test", "--release", "-j4", "-p", "turbo-lean", "--", "--test-threads=1"],
+      "depends_on": [
+        "lean/.lake/build/bin/lean-native",
+        "lean/.lake/build/bin/lean-native-core",
+        "lean/.lake/build/bin/turbo-lean-native",
+        "lean/.lake/build/bin/turbo-zygote",
+        "target/release/turbo-lean"
+      ]
+    },
+    "C4": {
+      "argv": ["./scripts/ci_verify.sh"],
+      "depends_on": [
+        "lean/.lake/build/bin/lean-native",
+        "lean/.lake/build/bin/lean-native-core",
+        "lean/.lake/build/bin/turbo-lean-native",
+        "lean/.lake/build/bin/turbo-zygote",
+        "target/release/turbo-lean"
+      ]
+    },
+    "C5": {
+      "argv": ["python3", "scripts/run_conformance_suite.py"],
+      "depends_on": [
+        "lean/.lake/build/bin/lean-native",
+        "lean/.lake/build/bin/lean-native-core"
+      ]
+    },
+    "C6": {
+      "argv": ["bash", "-c", "cd lean && lake exe lean-native-core self-test"],
+      "depends_on": [
+        "lean/.lake/build/bin/lean-native-core"
+      ]
+    },
+    "C7": {
+      "argv": ["bash", "-c", "cd lean && lake exe turbo-lean-native self-test"],
+      "depends_on": [
+        "lean/.lake/build/bin/turbo-lean-native"
+      ]
+    }
+  },
+  "hash_paths": [
+    "lean/.lake/build/lib/lean/LeanNative.olean",
+    "lean/.lake/build/lib/lean/LeanNative/Core.olean",
+    "lean/.lake/build/lib/lean/LeanNative/Backend/LLVM.olean",
+    "lean/.lake/build/lib/lean/LeanNative/Backend/MLIRGPU.olean",
+    "lean/.lake/build/lib/lean/LeanNative/Backend/Metal.olean",
+    "lean/.lake/build/lib/lean/TurboLean/Spec.olean",
+    "lean/.lake/build/lib/lean/TurboLean/Orchestrator.olean",
+    "lean/.lake/build/lib/lean/TurboLean/ZygoteWorker.olean",
+    "lean/.lake/build/bin/lean-native",
+    "lean/.lake/build/bin/lean-native-core",
+    "lean/.lake/build/bin/turbo-lean-native",
+    "lean/.lake/build/bin/turbo-zygote",
+    "target/release/turbo-lean"
+  ],
+  "mutations": [
+    {
+      "id": "M1",
+      "backend": "llvm",
+      "file": "lean/LeanNative/Backend/LLVM.lean",
+      "search": "| .sub    => emitLine s!\"  {res} = sub {tyStr} {lVal}, {rVal}\"; return res",
+      "replace": "| .sub    => emitLine s!\"  {res} = sub {tyStr} {rVal}, {lVal}\"; return res",
+      "expected_match_count": 1
+    },
+    {
+      "id": "M2",
+      "backend": "llvm",
+      "file": "lean/LeanNative/Backend/LLVM.lean",
+      "search": "| .shl    => emitShift \"shl\" \"sh\"\n    | .shr    => emitShift \"lshr\" \"sh\"",
+      "replace": "| .shl    => emitShift \"lshr\" \"sh\"\n    | .shr    => emitShift \"shl\" \"sh\"",
+      "expected_match_count": 1
+    },
+    {
+      "id": "M3",
+      "backend": "llvm",
+      "file": "lean/LeanNative/Backend/LLVM.lean",
+      "search": "| .lt     => emitCmp \"ult\" \"lt\"",
+      "replace": "| .lt     => emitCmp \"ule\" \"lt\"",
+      "expected_match_count": 1
+    },
+    {
+      "id": "M4",
+      "backend": "llvm",
+      "file": "lean/LeanNative/Backend/LLVM.lean",
+      "search": "emitLine s!\"  {cmpVal} = icmp ult i64 {ivVal}, {nVal}\"",
+      "replace": "emitLine s!\"  {cmpVal} = icmp ule i64 {ivVal}, {nVal}\"",
+      "expected_match_count": 1
+    },
+    {
+      "id": "M5",
+      "backend": "llvm",
+      "file": "lean/LeanNative/Backend/LLVM.lean",
+      "search": "let emitDivRem (llvmOp pfx : String) (isMod : Bool) : EmitM String := do\n      match is256, rhs with\n      | false, .constU64 d =>\n        if d != 0 then emitLine s!\"  {res} = {llvmOp} i64 {lVal}, {rVal}\"\n        else if isMod then emitLine s!\"  {res} = add i64 {lVal}, 0\"\n        else emitLine s!\"  {res} = add i64 0, 0\"\n        return res\n      | _, _ =>\n        let safeR \u2190 freshTmp (pfx ++ sfx ++ \"_rhs\")\n        let isZero \u2190 freshTmp (pfx ++ sfx ++ \"_z\")\n        let rawRes \u2190 freshTmp (pfx ++ sfx ++ \"_raw\")\n        let zeroVal := if isMod then lVal else \"0\"\n        emitLine s!\"  {isZero} = icmp eq {tyStr} {rVal}, 0\"\n        emitLine s!\"  {safeR} = select i1 {isZero}, {tyStr} 1, {tyStr} {rVal}\"\n        emitLine s!\"  {rawRes} = {llvmOp} {tyStr} {lVal}, {safeR}\"\n        emitLine s!\"  {res} = select i1 {isZero}, {tyStr} {zeroVal}, {tyStr} {rawRes}\"\n        return res",
+      "replace": "let emitDivRem (llvmOp _pfx : String) (_isMod : Bool) : EmitM String := do\n      emitLine s!\"  {res} = {llvmOp} {tyStr} {lVal}, {rVal}\"\n      return res",
+      "expected_match_count": 1
+    },
+    {
+      "id": "M6",
+      "backend": "mlir",
+      "file": "lean/LeanNative/Backend/MLIRGPU.lean",
+      "search": "| .shl           => s!\"{dst} = arith.shli {lVal}, {rVal} : i64\"\n      | .shr           => s!\"{dst} = arith.shrui {lVal}, {rVal} : i64\"",
+      "replace": "| .shl           => s!\"{dst} = arith.shrui {lVal}, {rVal} : i64\"\n      | .shr           => s!\"{dst} = arith.shli {lVal}, {rVal} : i64\"",
+      "expected_match_count": 1
+    },
+    {
+      "id": "M7",
+      "backend": "ptx",
+      "file": "lean/LeanNative/Backend/MLIRGPU.lean",
+      "search": "| .sub | .subChecked256 => ([s!\"    sub.u64      {dst}, {lReg}, {rReg};\"], r2 + 1, p2)",
+      "replace": "| .sub | .subChecked256 => ([s!\"    sub.u64      {dst}, {rReg}, {lReg};\"], r2 + 1, p2)",
+      "expected_match_count": 1
+    },
+    {
+      "id": "M8",
+      "backend": "ptx",
+      "file": "lean/LeanNative/Backend/MLIRGPU.lean",
+      "search": "| .lt => ([s!\"    setp.lt.u64  %p{p2}, {lReg}, {rReg};\\n    selp.u64     {dst}, 1, 0, %p{p2};\"], r2 + 1, p2 + 1)",
+      "replace": "| .lt => ([s!\"    setp.le.u64  %p{p2}, {lReg}, {rReg};\\n    selp.u64     {dst}, 1, 0, %p{p2};\"], r2 + 1, p2 + 1)",
+      "expected_match_count": 1
+    },
+    {
+      "id": "M9",
+      "backend": "metal",
+      "file": "lean/LeanNative/Backend/Metal.lean",
+      "search": "| .div => s!\"(({rs} == 0UL) ? 0UL : ({ls} / {rs}))\"",
+      "replace": "| .div => s!\"({ls} / {rs})\"",
+      "expected_match_count": 1
+    },
+    {
+      "id": "M10",
+      "backend": "metal",
+      "file": "lean/LeanNative/Backend/Metal.lean",
+      "search": "| .shl => s!\"({ls} << ({rs} & 63UL))\"",
+      "replace": "| .shl => s!\"({ls} << ({rs} & 31UL))\"",
+      "expected_match_count": 1
+    },
+    {
+      "id": "M11",
+      "backend": "c-abi",
+      "file": "lean/LeanNative/Driver/CAbiEmit.lean",
+      "search": "emitRustScalarExpr",
+      "replace": "emitRustScalarExpr",
+      "expected_match_count": 1,
+      "not_applicable": {
+        "reason": "Commit bf8ae24 (#264) removed the C-ABI scalar emitter. emitRustScalarExpr, emitCScalarExpr, wrapping_sub, and emitCAbiBody no longer exist under lean/, so an operand swap cannot be applied.",
+        "evidence_command": "git grep -n -E 'emitRustScalarExpr|emitCScalarExpr|wrapping_sub|emitCAbiBody' lean/",
+        "evidence": "ZERO_MATCHES",
+        "removed_in": "bf8ae24d61ade88b4614f44280c9ed1643eeb500",
+        "removed_definition": "partial def emitRustScalarExpr (e : ScalarExpr) : String :="
+      }
+    }
+  ]
+}

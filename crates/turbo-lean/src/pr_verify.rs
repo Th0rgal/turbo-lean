@@ -3,8 +3,8 @@
 
 use crate::db::{SingleflightOutcome, TurboStore};
 use crate::lake_build::{
-    are_all_project_oleans_up_to_date, compute_shard_key, detect_toolchain, lean_bin_from_env,
-    load_and_split_files_cached, load_and_split_files_with_hashes_cached,
+    are_all_project_oleans_up_to_date, compute_shard_key_with_args, detect_toolchain,
+    lean_bin_from_env, load_and_split_files_cached, load_and_split_files_with_hashes_cached,
     load_project_stat_summary_cached, resolve_lake_env, resolve_or_share_lake_env,
     resolve_prebuilt_module_import, resolve_remote_lean_path, seed_project_theorem_shards,
     seed_project_theorem_shards_from_splits, stage_lake_build_outputs, FileSplitsWithCacheHits,
@@ -224,6 +224,96 @@ pub(crate) fn fetch_git_blobs_batch(
     Ok(out_map)
 }
 
+/// Lake configuration at `base_ref`, compared with the working tree's.
+enum BaseLakeConfig {
+    /// Neither `lakefile.toml` nor `lakefile.lean` changed: per-file Lean args are unchanged.
+    Same,
+    /// The lakefile changed; the base package (`None`: no lakefile at `base_ref`, so no args).
+    Changed(Option<Box<crate::module_builder::PackageConfig>>),
+    /// The lakefile changed and the base version cannot be read or statically parsed.
+    Unknown,
+}
+
+/// Statically parses `base_ref`'s lakefile against the current package root (fail-closed parsers
+/// only; nothing is executed), so per-file Lean args can be compared across the PR. `strict`
+/// must match how the working-tree config is parsed, so both sides see the same declarations.
+/// Lakefile blobs are cached per resolved `base_sha` (commit contents are immutable), keeping
+/// warm runs free of `git` spawns.
+fn load_base_lake_config(
+    store: &TurboStore,
+    repo_root: &Path,
+    proj_prefix: &str,
+    canon_dir: &Path,
+    base_ref: &str,
+    base_sha: Option<&str>,
+    strict: bool,
+) -> BaseLakeConfig {
+    const NAMES: [&str; 2] = ["lakefile.toml", "lakefile.lean"];
+    let repo_rels: Vec<String> = NAMES
+        .iter()
+        .map(|n| join_proj_prefix(proj_prefix, n))
+        .collect();
+    let cache_file = base_sha.map(|sha| {
+        let key =
+            blake3::hash(format!("base-lakefiles:v1:{}:{}", sha, repo_rels.join(":")).as_bytes());
+        store
+            .fast_staging_dir()
+            .join(format!("git_base_lakefiles_{}.json", &key.to_hex()[..24]))
+    });
+    let cached = cache_file
+        .as_ref()
+        .and_then(|f| fs::read(f).ok())
+        .and_then(|b| serde_json::from_slice::<std::collections::HashMap<String, String>>(&b).ok());
+    let base = match cached {
+        Some(base) => base,
+        None => match fetch_git_blobs_batch(repo_root, base_ref, &repo_rels) {
+            Ok(base) => {
+                if let (Some(f), Ok(bytes)) = (&cache_file, serde_json::to_vec(&base)) {
+                    let _ = crate::shm_cache::atomic_write_shm(f, &bytes);
+                }
+                base
+            }
+            Err(_) => return BaseLakeConfig::Unknown,
+        },
+    };
+    if NAMES
+        .iter()
+        .zip(&repo_rels)
+        .all(|(n, r)| base.get(r) == fs::read_to_string(canon_dir.join(n)).ok().as_ref())
+    {
+        return BaseLakeConfig::Same;
+    }
+    // Same precedence as `resolve_package_config`: `lakefile.toml` first.
+    let Some((name, text)) = NAMES
+        .iter()
+        .zip(&repo_rels)
+        .find_map(|(n, r)| base.get(r).map(|t| (*n, t)))
+    else {
+        return BaseLakeConfig::Changed(None);
+    };
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "turbo_lean_base_lakefile_{}_{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let tmp_file = tmp_dir.join(name);
+    let parsed = fs::create_dir_all(&tmp_dir)
+        .and_then(|_| fs::write(&tmp_file, text))
+        .map_err(anyhow::Error::from)
+        .and_then(|_| {
+            if name == "lakefile.toml" {
+                crate::module_builder::parse_lakefile_toml(canon_dir, &tmp_file, strict)
+            } else {
+                crate::module_builder::parse_lakefile_lean(canon_dir, &tmp_file, strict)
+            }
+        });
+    let _ = fs::remove_dir_all(&tmp_dir);
+    parsed.map_or(BaseLakeConfig::Unknown, |pkg| {
+        BaseLakeConfig::Changed(Some(Box::new(pkg)))
+    })
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub(crate) struct CachedBaseShard {
     name: String,
@@ -323,6 +413,24 @@ fn git_head_tree_cache_paths(
     h.update(sha.as_bytes());
     h.update(b":");
     h.update(toolchain.as_bytes());
+    if let Ok(pkg) = crate::module_builder::resolve_package_config(canon_dir, false) {
+        if !pkg.config_digest.is_empty() {
+            let pkg_args = crate::module_builder::package_default_lean_args(&pkg);
+            let any_target_args = pkg.libs.iter().any(|l| {
+                !l.lean_options.is_empty()
+                    || !l.more_lean_args.is_empty()
+                    || !l.weak_lean_args.is_empty()
+            }) || pkg.exes.iter().any(|e| {
+                !e.lean_options.is_empty()
+                    || !e.more_lean_args.is_empty()
+                    || !e.weak_lean_args.is_empty()
+            });
+            if !pkg_args.is_empty() || any_target_args {
+                h.update(b":cfg:");
+                h.update(pkg.config_digest.as_bytes());
+            }
+        }
+    }
     let key_hex = h.finalize().to_hex();
     let short_key = &key_hex[..24];
     let staging = store.fast_staging_dir();
@@ -337,7 +445,7 @@ trait BaseShardRef {
     fn stmt_hash(&self) -> &str;
     fn prefix_env_hash(&self) -> &str;
     fn proof_hash(&self) -> &str;
-    fn shard_key(&self, toolchain: &str) -> std::borrow::Cow<'_, str>;
+    fn shard_key(&self, toolchain: &str, file_lean_args: &[String]) -> std::borrow::Cow<'_, str>;
 }
 
 impl BaseShardRef for CachedBaseShard {
@@ -353,7 +461,7 @@ impl BaseShardRef for CachedBaseShard {
     fn proof_hash(&self) -> &str {
         &self.proof_hash
     }
-    fn shard_key(&self, _toolchain: &str) -> std::borrow::Cow<'_, str> {
+    fn shard_key(&self, _toolchain: &str, _file_lean_args: &[String]) -> std::borrow::Cow<'_, str> {
         std::borrow::Cow::Borrowed(&self.shard_key)
     }
 }
@@ -371,8 +479,8 @@ impl BaseShardRef for splitter::TheoremShard {
     fn proof_hash(&self) -> &str {
         &self.proof_hash
     }
-    fn shard_key(&self, toolchain: &str) -> std::borrow::Cow<'_, str> {
-        std::borrow::Cow::Owned(compute_shard_key(toolchain, self))
+    fn shard_key(&self, toolchain: &str, file_lean_args: &[String]) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Owned(compute_shard_key_with_args(toolchain, self, file_lean_args))
     }
 }
 
@@ -447,6 +555,7 @@ impl PrClassificationAccum {
         base_hygiene: &splitter::HygieneReport,
         base_shards: &[S],
         cur_split: splitter::SplitResult,
+        file_lean_args: &[String],
     ) {
         self.modified_files.push(rel_path.clone());
         let (reg, admitted) = cur_split.hygiene.regression_items_against(base_hygiene);
@@ -504,8 +613,8 @@ impl PrClassificationAccum {
                     self.unchanged_theorems.push(qualified);
                     continue;
                 }
-                let k = compute_shard_key(&self.toolchain, &s);
-                if k == bs.shard_key(&self.toolchain).as_ref() {
+                let k = compute_shard_key_with_args(&self.toolchain, &s, file_lean_args);
+                if k == bs.shard_key(&self.toolchain, file_lean_args).as_ref() {
                     self.unchanged_theorems.push(qualified);
                 } else if s.stmt_hash == bs.stmt_hash()
                     && s.prefix_env_hash == bs.prefix_env_hash()
@@ -519,7 +628,7 @@ impl PrClassificationAccum {
                     file_verify_list.push((k, s, false));
                 }
             } else {
-                let k = compute_shard_key(&self.toolchain, &s);
+                let k = compute_shard_key_with_args(&self.toolchain, &s, file_lean_args);
                 file_has_stmt_change = true;
                 self.statement_edited_theorems.push(qualified);
                 file_verify_list.push((k, s, false));
@@ -535,7 +644,12 @@ impl PrClassificationAccum {
         }
     }
 
-    fn record_added(&mut self, rel_path: String, cur_split: splitter::SplitResult) {
+    fn record_added(
+        &mut self,
+        rel_path: String,
+        cur_split: splitter::SplitResult,
+        file_lean_args: &[String],
+    ) {
         self.modified_files.push(rel_path.clone());
         self.altered_interface_files.push(rel_path.clone());
         if !cur_split.hygiene.is_clean_for_certification() {
@@ -552,7 +666,7 @@ impl PrClassificationAccum {
             .insert(rel_path.clone(), cur_split.interface_hash);
         let mut file_verify_list = Vec::new();
         for s in cur_split.shards {
-            let k = compute_shard_key(&self.toolchain, &s);
+            let k = compute_shard_key_with_args(&self.toolchain, &s, file_lean_args);
             self.statement_edited_theorems
                 .push(format!("{}::{}", rel_path, s.name));
             file_verify_list.push((k, s, false));
@@ -581,6 +695,28 @@ impl PrClassificationAccum {
             self.statement_edited_theorems
                 .push(format!("{}::{} (deleted)", rel_path, bs.name()));
         }
+    }
+
+    // Source text cannot identify macro/scoped csimp replacements reliably. If
+    // base config contains a csimp policy, defer these items to the mandatory
+    // ConstantInfo/environment audit, which checks the actual theorem names.
+    fn defer_csimp_to_kernel_gate(&mut self, project: &Path, base: &str) {
+        if StatementPolicy::at(project, base).csimp.is_empty() {
+            return;
+        }
+        for (file, items) in &mut self.flagged_files {
+            items.retain(|item| {
+                if item.rsplit(": ").next() == Some("csimp") {
+                    self.axiom_flags.push(format!(
+                        "{file}: {item} (requires compiled csimp policy audit)"
+                    ));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        self.flagged_files.retain(|(_, items)| !items.is_empty());
     }
 
     fn finish(
@@ -627,6 +763,7 @@ pub(crate) fn build_cached_head_file_entry(
     toolchain: &str,
     head_stat: Option<(i64, i64, i64)>,
     dep_hashes: Vec<String>,
+    file_lean_args: &[String],
 ) -> CachedHeadFileEntry {
     let (head_mtime_sec, head_mtime_nsec, head_size_bytes) = head_stat.unwrap_or((0, 0, 0));
     let src_len = base_src.len();
@@ -638,7 +775,7 @@ pub(crate) fn build_cached_head_file_entry(
             stmt_hash: sh.stmt_hash.clone(),
             prefix_env_hash: sh.prefix_env_hash.clone(),
             proof_hash: sh.proof_hash.clone(),
-            shard_key: compute_shard_key(toolchain, sh),
+            shard_key: compute_shard_key_with_args(toolchain, sh, file_lean_args),
         })
         .collect();
 
@@ -958,6 +1095,7 @@ pub(crate) fn warm_git_head_tree_cache(
                     split_by_path.insert(p.as_path(), (s.as_str(), sp));
                 }
             }
+            let pkg_cfg_opt = crate::module_builder::resolve_package_config(canon_dir, false).ok();
             let entries: Vec<(String, CachedHeadFileEntry)> = std::thread::scope(|s| {
                 let handles: Vec<_> = lean_paths
                     .iter()
@@ -965,6 +1103,7 @@ pub(crate) fn warm_git_head_tree_cache(
                         let split_by_path_ref = &split_by_path;
                         let fetched_ref = &fetched_blobs;
                         let proj_prefix_ref = &proj_prefix;
+                        let pkg_ref = pkg_cfg_opt.as_ref();
                         s.spawn(move || -> Option<(String, CachedHeadFileEntry)> {
                             let rel = rel_path_from_dir(p, canon_dir);
                             let repo_rel = join_proj_prefix(proj_prefix_ref, &rel);
@@ -1002,10 +1141,20 @@ pub(crate) fn warm_git_head_tree_cache(
                             } else {
                                 None
                             };
+                            let file_lean_args = pkg_ref
+                                .map(|pkg| {
+                                    crate::module_builder::resolve_file_lean_args_in_package(pkg, p)
+                                })
+                                .unwrap_or_default();
                             Some((
                                 rel,
                                 build_cached_head_file_entry(
-                                    bs, &sp, toolchain, head_stat, dep_hashes,
+                                    bs,
+                                    &sp,
+                                    toolchain,
+                                    head_stat,
+                                    dep_hashes,
+                                    &file_lean_args,
                                 ),
                             ))
                         })
@@ -1233,6 +1382,21 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
     let proj_prefix = rel_path_from_dir(canon_dir, &repo_root);
 
     let lean_paths = crate::lake_build::collect_project_lean_files(canon_dir, true, scope);
+    let owned_pkg_cfg = if is_untrusted {
+        None
+    } else {
+        crate::module_builder::resolve_package_config(canon_dir, false).ok()
+    };
+    let resolve_rel_lean_args = |rel: &str| -> Vec<String> {
+        let abs = canon_dir.join(rel);
+        if let Some(cfg) = untrusted_cfg {
+            crate::module_builder::resolve_file_lean_args_in_package(&cfg.root_pkg, &abs)
+        } else if let Some(ref pkg) = owned_pkg_cfg {
+            crate::module_builder::resolve_file_lean_args_in_package(pkg, &abs)
+        } else {
+            Vec::new()
+        }
+    };
 
     enum PrFileEntry {
         Unchanged(splitter::SplitResult),
@@ -1244,7 +1408,44 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
     }
 
     let head_sha_opt = resolve_git_head_sha(&repo_root, base_ref);
-    let head_tree_cache_file = if is_untrusted {
+    // A lakefile edit can change a file's effective Lean args (and so what its source elaborates
+    // to); such files are re-verified like added ones, dependents included. Untrusted configs are
+    // parsed strictly (`resolve_project_config`), trusted ones leniently (`owned_pkg_cfg`).
+    let base_lake_cfg = load_base_lake_config(
+        store,
+        &repo_root,
+        &proj_prefix,
+        canon_dir,
+        base_ref,
+        head_sha_opt.as_deref(),
+        is_untrusted,
+    );
+    // Without a parsed working-tree config the current args are unknown, so a changed lakefile
+    // re-verifies everything rather than comparing against an empty arg list.
+    let head_cfg_unknown = untrusted_cfg.is_none()
+        && owned_pkg_cfg.is_none()
+        && (canon_dir.join("lakefile.toml").is_file() || canon_dir.join("lakefile.lean").is_file());
+    let reconfigured = |rel: &str| -> bool {
+        rel != "lakefile.lean"
+            && match &base_lake_cfg {
+                BaseLakeConfig::Same => false,
+                _ if head_cfg_unknown => true,
+                BaseLakeConfig::Unknown => true,
+                BaseLakeConfig::Changed(base_pkg) => {
+                    let base_args = base_pkg.as_ref().map_or_else(Vec::new, |pkg| {
+                        crate::module_builder::resolve_file_lean_args_in_package(
+                            pkg,
+                            &canon_dir.join(rel),
+                        )
+                    });
+                    base_args != resolve_rel_lean_args(rel)
+                }
+            }
+    };
+
+    // The head-tree fast path only re-splits stat-changed files, so it is skipped when the
+    // lakefile changed.
+    let head_tree_cache_file = if is_untrusted || !matches!(base_lake_cfg, BaseLakeConfig::Same) {
         None
     } else {
         head_sha_opt
@@ -1501,6 +1702,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                                 base_entry,
                                 cur_split,
                             } => {
+                                let file_lean_args = resolve_rel_lean_args(&rel_path);
                                 changed_current_splits.insert(rel_path.clone(), cur_split.clone());
                                 accum.record_modified(
                                     rel_path,
@@ -1508,11 +1710,13 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                                     &base_entry.hygiene,
                                     &base_entry.shards,
                                     cur_split,
+                                    &file_lean_args,
                                 );
                             }
                         }
                     }
 
+                    accum.defer_csimp_to_kernel_gate(canon_dir, base_ref);
                     let (cls, shards_to_verify_by_file) = accum.finish()?;
                     return Ok((
                         cls,
@@ -1765,9 +1969,17 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                     } else {
                         None
                     };
+                    let file_lean_args = resolve_rel_lean_args(&rel);
                     rel_blob_map.insert(
                         rel,
-                        build_cached_head_file_entry(bs, &sp, toolchain, head_stat, dep_hashes),
+                        build_cached_head_file_entry(
+                            bs,
+                            &sp,
+                            toolchain,
+                            head_stat,
+                            dep_hashes,
+                            &file_lean_args,
+                        ),
                     );
                 }
             }
@@ -1866,6 +2078,28 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
         let Some(entry) = entries_by_rel_path.remove(&rel_path) else {
             continue;
         };
+        let entry = match entry {
+            PrFileEntry::Unchanged(split) if reconfigured(&rel_path) => {
+                let cur_src = fs::read_to_string(canon_dir.join(&rel_path)).unwrap_or_default();
+                changed_current_files.insert(rel_path.clone(), cur_src.clone());
+                PrFileEntry::Changed {
+                    base_src: None,
+                    cur_src: Some(cur_src),
+                    cur_split: Some(split),
+                }
+            }
+            // Source edits do not narrow this: every shard needs the new args, not just edited ones.
+            PrFileEntry::Changed {
+                base_src: Some(_),
+                cur_src: Some(cur_src),
+                cur_split,
+            } if reconfigured(&rel_path) => PrFileEntry::Changed {
+                base_src: None,
+                cur_src: Some(cur_src),
+                cur_split,
+            },
+            entry => entry,
+        };
         match entry {
             PrFileEntry::Unchanged(split) => {
                 accum.record_unchanged(rel_path, split.interface_hash, &split.shards);
@@ -1886,6 +2120,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                 cur_src: Some(cur_src),
                 cur_split,
             } => {
+                let file_lean_args = resolve_rel_lean_args(&rel_path);
                 let cur_split = match cur_split {
                     Some(sp) => sp,
                     None => resolve_cached_or_split(&cur_src, true)?,
@@ -1898,6 +2133,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                     &base_split.hygiene,
                     &base_split.shards,
                     cur_split,
+                    &file_lean_args,
                 );
             }
             PrFileEntry::Changed {
@@ -1905,12 +2141,13 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                 cur_src: Some(cur_src),
                 cur_split,
             } => {
+                let file_lean_args = resolve_rel_lean_args(&rel_path);
                 let cur_split = match cur_split {
                     Some(sp) => sp,
                     None => resolve_cached_or_split(&cur_src, true)?,
                 };
                 changed_current_splits.insert(rel_path.clone(), cur_split.clone());
-                accum.record_added(rel_path, cur_split);
+                accum.record_added(rel_path, cur_split, &file_lean_args);
             }
             PrFileEntry::Changed {
                 base_src: Some(base_src),
@@ -1928,6 +2165,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
         }
     }
 
+    accum.defer_csimp_to_kernel_gate(canon_dir, base_ref);
     let (cls, shards_to_verify_by_file) = accum.finish()?;
     Ok((
         cls,
@@ -2075,9 +2313,12 @@ pub fn classify_pr_changes_with_store(
                     &base_split.hygiene,
                     &base_split.shards,
                     cur_split,
+                    &[],
                 );
             }
-            (None, Some(cur_src)) => accum.record_added(rel_path, split_lean_source(cur_src, &[])),
+            (None, Some(cur_src)) => {
+                accum.record_added(rel_path, split_lean_source(cur_src, &[]), &[])
+            }
             (Some(base_src), None) => {
                 let base_split = split_lean_source(base_src, &[]);
                 accum.record_deleted(rel_path, &base_split.interface_hash, &base_split.shards);
@@ -2133,6 +2374,7 @@ fn make_batch_zreq(
     shard_source: String,
     toolchain: &str,
     lean_path: &str,
+    lean_args: Vec<String>,
 ) -> pack::CheckShardHttpRequest {
     pack::CheckShardHttpRequest {
         decl: "__batch__".to_string(),
@@ -2146,6 +2388,7 @@ fn make_batch_zreq(
         lean_path: lean_path.to_string(),
         skip_cas_lock: true,
         allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
+        lean_args,
     }
 }
 
@@ -2213,6 +2456,7 @@ fn run_lean_temp_file(
     env_vars: &std::collections::HashMap<String, String>,
     trust: &PrVerificationTrust<'_>,
     audit: &std::collections::HashSet<String>,
+    lean_args: &[String],
 ) -> Result<std::process::Output> {
     if trust.is_untrusted {
         let cfg = trust.untrusted_cfg.ok_or_else(|| {
@@ -2312,16 +2556,13 @@ fn run_lean_temp_file(
         cmd.arg(&cfg.lean_bin);
         crate::module_builder::scrub_untrusted_env(&mut cmd);
         cmd.args(["-M", "4096"]);
-        for arg in &cfg.root_pkg.more_lean_args {
+        // The owning target's flags (the same ones the shard key digests), already in Lake's
+        // weakLeanArgs < moreLeanArgs < leanOptions order; the hardening flags come last to win.
+        for arg in crate::module_builder::filter_allowed_lean_args(lean_args) {
             cmd.arg(arg);
-        }
-        for arg in &cfg.root_pkg.weak_lean_args {
-            cmd.arg(arg);
-        }
-        for (k, v) in &cfg.root_pkg.lean_options {
-            cmd.arg(format!("-D{}={}", k, v));
         }
         cmd.arg("-Dwarn.sorry=true")
+            .arg("-Ddebug.skipKernelTC=false")
             .arg(&sandbox_lean)
             .arg("-R")
             .arg(&tmp_dir)
@@ -2338,11 +2579,8 @@ fn run_lean_temp_file(
         }
         let stdout_str = String::from_utf8_lossy(&out.stdout);
         let stderr_str = String::from_utf8_lossy(&out.stderr);
-        if stdout_str.contains("declaration uses 'sorry'")
-            || stdout_str.contains("declaration uses `sorry`")
-            || stderr_str.contains("declaration uses 'sorry'")
-            || stderr_str.contains("declaration uses `sorry`")
-        {
+        // Match the prefix: `pp.*` options change how the `sorry` term itself prints.
+        if stdout_str.contains("declaration uses ") || stderr_str.contains("declaration uses ") {
             anyhow::bail!(
                 "Untrusted PR shard verification rejected `{}` due to `sorry` axiom usage",
                 mod_name
@@ -2382,6 +2620,9 @@ fn run_lean_temp_file(
     let (audited_src, audited) = splitter::with_axiom_audit(src, audit);
     fs::write(tmp_path, audited_src.as_bytes())?;
     let mut cmd = Command::new(lean_bin);
+    for arg in crate::module_builder::filter_allowed_lean_args(lean_args) {
+        cmd.arg(arg);
+    }
     cmd.arg(tmp_path).current_dir(canon_dir).envs(env_vars);
     let out = cmd.output()?;
     let _ = fs::remove_file(tmp_path);
@@ -2597,6 +2838,15 @@ pub fn run_ci_verify_command(
         full_splits_opt = Some(splits);
     }
 
+    // Untrusted CI always audits compiled modules, including restored artifacts.
+    // Only an explicit caller policy can defer source csimp flags to that gate.
+    if is_untrusted && std::env::var("TURBO_LEAN_ALLOWED_CSIMP").is_ok_and(|s| !s.trim().is_empty())
+    {
+        for (_, items) in &mut flagged_files {
+            items.retain(|item| item.rsplit(": ").next() != Some("csimp"));
+        }
+        flagged_files.retain(|(_, items)| !items.is_empty());
+    }
     if !flagged_files.is_empty() {
         anyhow::bail!(
             "CI Hygiene & Axiom Gate FAILED on {} files: {:?}",
@@ -2629,7 +2879,9 @@ pub fn run_ci_verify_command(
                     &[],
                     true,
                 ) {
-                    let _ = fs::remove_dir_all(canon_dir.join(".lake/build"));
+                    if !crate::lake_build::worktree_auto_link_disabled(&canon_dir) {
+                        let _ = fs::remove_dir_all(canon_dir.join(".lake/build"));
+                    }
                     return Err(err);
                 }
             }
@@ -2912,6 +3164,826 @@ fn finalize_batch_publish_entries(
     Ok(shards.len())
 }
 
+/// Statement digests are deliberately separate from source shard/cache keys. They
+/// classify reports only: none of these hashes grant a kernel-check cache hit.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct KernelConstant {
+    #[serde(skip)]
+    interface: String,
+    deps: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct KernelTheorem {
+    #[serde(skip)]
+    statement: String,
+    deps: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct KernelAudit {
+    audit: String,
+    axioms: Vec<String>,
+}
+
+#[derive(Default)]
+struct KernelStatementReport {
+    statements: BTreeMap<String, String>,
+    audits: Vec<KernelAudit>,
+    csimp: Vec<String>,
+}
+
+struct StatementPolicy {
+    axioms: Vec<String>,
+    csimp: Vec<String>,
+}
+
+impl StatementPolicy {
+    fn at(project: &Path, base: &str) -> Self {
+        let config = splitter::read_project_config(project, Some(base)).unwrap_or_default();
+        Self {
+            axioms: splitter::allowed_axioms_with_extra(
+                &crate::accelerators::toml_string_array(&config, "axioms", "allow")
+                    .unwrap_or_default(),
+            ),
+            csimp: crate::accelerators::toml_string_array(&config, "csimp", "allow")
+                .unwrap_or_default(),
+        }
+    }
+
+    fn audit(&self, report: &KernelStatementReport) -> Result<()> {
+        for row in &report.audits {
+            for axiom in &row.axioms {
+                anyhow::ensure!(splitter::axiom_allowed_under(axiom, &self.axioms),
+                    "[TurboLean.KernelGate] declaration `{}` depends on disallowed axiom `{axiom}` (policy resolved at --base)", row.audit);
+            }
+        }
+        for theorem in &report.csimp {
+            anyhow::ensure!(splitter::axiom_allowed_under(theorem, &self.csimp),
+                "[TurboLean.KernelGate] csimp replacement `{theorem}` requires [csimp] allow in turbo-lean.toml at --base");
+        }
+        Ok(())
+    }
+}
+
+// Deserialize only routing metadata. Payload numbers may exceed even f64's range.
+#[derive(serde::Deserialize)]
+struct KernelDumpRow {
+    constant: Option<String>,
+    theorem: Option<String>,
+    audit: Option<String>,
+    module: Option<String>,
+    complete: Option<bool>,
+    csimp: Option<Vec<String>>,
+}
+
+// Borrow the exact JSON value emitted by Lean. IgnoredAny scans the value without
+// converting numeric tokens to f64 (or imposing any machine-integer bound).
+fn raw_statement_payload<'a>(line: &'a str, field: &str) -> Result<&'a str> {
+    let mut rest = line.trim_start().strip_prefix('{').context("Expected JSON object")?;
+    loop {
+        rest = rest.trim_start();
+        let mut keys = serde_json::Deserializer::from_str(rest).into_iter::<String>();
+        let key = keys.next().context("Missing JSON key")??;
+        rest = rest[keys.byte_offset()..].trim_start()
+            .strip_prefix(':').context("Missing JSON colon")?.trim_start();
+        let mut values = serde_json::Deserializer::from_str(rest)
+            .into_iter::<serde::de::IgnoredAny>();
+        values.next().context("Missing JSON value")??;
+        let end = values.byte_offset();
+        if key == field {
+            return Ok(&rest[..end]);
+        }
+        rest = rest[end..].trim_start().strip_prefix(',')
+            .with_context(|| format!("Missing kernel statement payload {field}"))?;
+    }
+}
+
+fn parse_kernel_statement_dump(raw: &[u8], module: &str) -> Result<BTreeMap<String, String>> {
+    let mut constants = BTreeMap::<String, KernelConstant>::new();
+    let mut theorems = BTreeMap::<String, KernelTheorem>::new();
+    let mut complete = false;
+    for line in std::str::from_utf8(raw)
+        .context("Non-UTF8 kernel statement dump")?
+        .lines()
+        .filter(|l| !l.is_empty())
+    {
+        anyhow::ensure!(!complete, "Kernel statement rows after module completion");
+        let row: KernelDumpRow =
+            serde_json::from_str(line).context("Invalid kernel statement dump (expected JSONL)")?;
+        if let Some(name) = row.constant.as_deref() {
+            let mut constant: KernelConstant = serde_json::from_str(line)?;
+            constant.interface = raw_statement_payload(line, "interface")?.to_owned();
+            anyhow::ensure!(
+                constants
+                    .insert(name.to_string(), constant)
+                    .is_none(),
+                "Duplicate constant in kernel statement dump: {name}"
+            );
+        } else if let Some(name) = row.theorem.as_deref() {
+            let mut theorem: KernelTheorem = serde_json::from_str(line)?;
+            theorem.statement = raw_statement_payload(line, "statement")?.to_owned();
+            anyhow::ensure!(
+                theorems
+                    .insert(name.to_string(), theorem)
+                    .is_none(),
+                "Duplicate theorem in kernel statement dump: {name}"
+            );
+        } else if row.audit.is_some() {
+            let _: KernelAudit = serde_json::from_str(line)?;
+        } else {
+            anyhow::ensure!(
+                row.module.as_deref() == Some(module)
+                    && row.complete == Some(true)
+                    && !complete,
+                "Incomplete or unexpected kernel statement dump for {module}"
+            );
+            complete = true;
+        }
+    }
+    anyhow::ensure!(complete, "Missing kernel statement dump for {module}");
+    let constant_hashes: BTreeMap<_, _> = constants
+        .iter()
+        .map(|(name, constant)| (name.clone(), blake3::hash(constant.interface.as_bytes())))
+        .collect();
+    let mut result = BTreeMap::new();
+    for (name, theorem) in theorems {
+        let mut pending = theorem.deps;
+        let mut closure = std::collections::BTreeSet::new();
+        while let Some(dep) = pending.pop() {
+            if !closure.insert(dep.clone()) {
+                continue;
+            }
+            let constant = constants
+                .get(&dep)
+                .with_context(|| format!("Missing IF-closure constant {dep} for {name}"))?;
+            pending.extend(constant.deps.iter().cloned());
+        }
+        // Flat, name-sorted closure records handle mutual recursion without an
+        // order-sensitive DFS hash or a cycle sentinel that could hide a change.
+        let mut closure_hash = blake3::Hasher::new();
+        closure_hash.update(b"turbo-lean:statement-if-closure:v1\0");
+        for dep in closure {
+            closure_hash.update(&(dep.len() as u64).to_le_bytes());
+            closure_hash.update(dep.as_bytes());
+            closure_hash.update(constant_hashes[&dep].as_bytes());
+        }
+        let type_hash = blake3::hash(theorem.statement.as_bytes());
+        let mut digest = blake3::Hasher::new();
+        digest.update(b"turbo-lean:kernel-statement:v1\0");
+        digest.update(type_hash.as_bytes());
+        digest.update(closure_hash.finalize().as_bytes());
+        result.insert(name, digest.finalize().to_hex().to_string());
+    }
+    Ok(result)
+}
+
+struct StatementWorktree {
+    repo: PathBuf,
+    path: PathBuf,
+}
+
+impl StatementWorktree {
+    fn at(repo: &Path, rev: &str) -> Result<Self> {
+        let path = std::env::temp_dir().join(format!(
+            "turbo-statements-{}-{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["worktree", "add", "--detach", "--force"])
+            .arg(&path)
+            .arg(rev)
+            .output()?;
+        anyhow::ensure!(
+            out.status.success(),
+            "Cannot create statement baseline worktree: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(Self {
+            repo: repo.to_path_buf(),
+            path,
+        })
+    }
+}
+
+impl Drop for StatementWorktree {
+    fn drop(&mut self) {
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo)
+            .args(["worktree", "remove", "--force"])
+            .arg(&self.path)
+            .output();
+    }
+}
+
+// Stock toolchain commands run inside bwrap for untrusted inputs. The Lake configuration
+// and any build scripts are untrusted executable code; no host environment or
+// network is inherited. The writable root is a disposable source snapshot.
+fn statement_lake_command(project: &Path, is_untrusted: bool) -> Result<Command> {
+    statement_toolchain_command(project, is_untrusted, "lake", None)
+}
+
+fn statement_lean_command(project: &Path, is_untrusted: bool) -> Result<Command> {
+    // Static package paths only: never ask project code to supply PATH/LEAN_PATH.
+    let cfg = crate::module_builder::resolve_project_config_with_trust(project, true)?;
+    let (lean_path, _) = crate::module_builder::build_lean_search_path(&cfg, true);
+    statement_toolchain_command(project, is_untrusted, "lean", Some(&lean_path))
+}
+
+fn statement_toolchain_command(
+    project: &Path,
+    is_untrusted: bool,
+    tool: &str,
+    lean_path: Option<&str>,
+) -> Result<Command> {
+    let (lean, _, _, lib) = crate::module_builder::resolve_toolchain_compiler_with_trust(
+        project,
+        &detect_toolchain(project),
+        true, // Resolve installed toolchains only, even for trusted statement builds.
+    )?;
+    let executable = lean.with_file_name(tool);
+    if !is_untrusted {
+        let mut command = Command::new(&executable);
+        command
+            .current_dir(project)
+            .env_remove("LEAN_PATH")
+            .env_remove("LEAN_SRC_PATH")
+            .env(
+                "LEAN_STACK_SIZE_KB",
+                std::env::var("LEAN_STACK_SIZE_KB").unwrap_or_else(|_| "262144".into()),
+            );
+        if let Some(path) = lean_path {
+            command.env("LEAN_PATH", path);
+        }
+        return Ok(command);
+    }
+    let bwrap = crate::module_builder::probe_bwrap_sandbox()
+        .context("Kernel statement builds require a working bubblewrap sandbox")?;
+    let prefix = lib.parent().context("Missing stock toolchain prefix")?;
+    let mut command = Command::new(bwrap);
+    command
+        .args([
+            "--unshare-all",
+            "--new-session",
+            "--die-with-parent",
+            "--clearenv",
+            "--setenv",
+            "HOME",
+            "/tmp",
+            "--setenv",
+            "LEAN_NUM_THREADS",
+            "4",
+            "--setenv",
+            "LEAN_STACK_SIZE_KB",
+            "262144",
+            "--setenv",
+            "PATH",
+        ])
+        .arg(format!(
+            "{}:/usr/bin:/bin",
+            lean.parent().context("Missing toolchain bin")?.display()
+        ))
+        .args(["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]);
+    for path in [
+        "/usr",
+        "/bin",
+        "/lib",
+        "/lib64",
+        "/etc/alternatives",
+        "/etc/ld.so.cache",
+        "/etc/localtime",
+    ] {
+        command.args(["--ro-bind-try", path, path]);
+    }
+    if let Some(path) = lean_path {
+        command.args(["--setenv", "LEAN_PATH", path]);
+    }
+    command
+        .arg("--ro-bind")
+        .arg(prefix)
+        .arg(prefix)
+        .arg("--bind")
+        .arg(project)
+        .arg(project)
+        .arg("--chdir")
+        .arg(project)
+        .arg(executable);
+    Ok(command)
+}
+
+fn ensure_statement_snapshot_path(root: &Path, target: &Path) -> Result<()> {
+    let mut path = root.to_path_buf();
+    for part in target.strip_prefix(root)?.components() {
+        anyhow::ensure!(
+            matches!(part, std::path::Component::Normal(_)),
+            "Invalid statement snapshot path"
+        );
+        path.push(part);
+        anyhow::ensure!(
+            !path.is_symlink(),
+            "Symlink in statement snapshot output path: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+// Overlay only Git's tracked/unignored source files on a clean HEAD snapshot.
+// Never bring across .olean files, traces, or native build products from head.
+fn overlay_statement_sources(repo: &Path, snapshot: &Path) -> Result<()> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
+        .output()?;
+    anyhow::ensure!(
+        out.status.success(),
+        "Cannot enumerate head statement sources"
+    );
+    for entry in out.stdout.split(|&b| b == 0).filter(|e| !e.is_empty()) {
+        let rel = Path::new(std::str::from_utf8(entry)?);
+        if rel.components().any(|c| c.as_os_str() == ".lake") {
+            continue;
+        }
+        anyhow::ensure!(
+            !rel.is_absolute()
+                && !rel
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir)),
+            "Invalid Git source path in statement snapshot"
+        );
+        let source = repo.join(rel);
+        let target = snapshot.join(rel);
+        ensure_statement_snapshot_path(snapshot, &target)?;
+        if !source.exists() {
+            if target.is_file() {
+                fs::remove_file(target)?;
+            }
+            continue;
+        }
+        let meta = fs::symlink_metadata(&source)?;
+        anyhow::ensure!(
+            meta.is_file() && !meta.file_type().is_symlink(),
+            "Statement snapshots require regular source files: {}",
+            source.display()
+        );
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(source, target)?;
+    }
+    Ok(())
+}
+
+fn clear_untrusted_statement_build_products(project: &Path) -> Result<()> {
+    let pkg = crate::module_builder::resolve_package_config(project, true)?;
+    for output in [project.join(".lake"), project.join(&pkg.build_dir)] {
+        anyhow::ensure!(
+            output != project && output.starts_with(project),
+            "Statement build directory must be inside its snapshot"
+        );
+        ensure_statement_snapshot_path(project, &output)?;
+        if output.is_dir() {
+            fs::remove_dir_all(output)?;
+        }
+    }
+    Ok(())
+}
+
+// Seed an offline sandbox with independent Git clones of already resolved
+// dependencies, never with shared/hard-linked worktree build outputs.
+fn seed_statement_dependencies(
+    project: &Path,
+    cfg: &crate::module_builder::ProjectConfig,
+) -> Result<()> {
+    for dep in &cfg.dep_pkgs {
+        let rel = dep.pkg_root.strip_prefix(&cfg.root_pkg.pkg_root).context(
+            "External path dependencies are unavailable to sandboxed stock statement builds",
+        )?;
+        let target = project.join(rel);
+        ensure_statement_snapshot_path(project, &target)?;
+        if target.exists() {
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let out = Command::new("git")
+            .args(["clone", "--quiet", "--no-hardlinks"])
+            .arg(&dep.pkg_root)
+            .arg(&target)
+            .output()?;
+        anyhow::ensure!(
+            out.status.success(),
+            "Cannot seed offline statement dependency {}: {}",
+            dep.name,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
+// Share source-root resolution between stock compilation and digest reporting.
+fn statement_source_modules(
+    project: &Path,
+    pkg: &crate::module_builder::PackageConfig,
+) -> Result<BTreeMap<String, (PathBuf, PathBuf)>> {
+    let base = project.join(&pkg.src_dir);
+    let mut roots = vec![base.clone()];
+    roots.extend(
+        pkg.libs
+            .iter()
+            .filter_map(|lib| lib.src_dir.as_ref())
+            .map(|dir| base.join(dir)),
+    );
+    roots.extend(
+        pkg.exes
+            .iter()
+            .filter_map(|exe| exe.src_dir.as_ref())
+            .map(|dir| base.join(dir)),
+    );
+    roots.sort_by_key(|root| std::cmp::Reverse(root.components().count()));
+    roots.dedup();
+    let mut modules = BTreeMap::new();
+    for source in crate::lake_build::collect_project_lean_files(project, false, None) {
+        let root = roots
+            .iter()
+            .find(|root| source.starts_with(root))
+            .with_context(|| format!("No source root for {}", source.display()))?;
+        let name = source
+            .strip_prefix(root)?
+            .with_extension("")
+            .to_string_lossy()
+            .replace('/', ".");
+        anyhow::ensure!(
+            modules
+                .insert(name.clone(), (source, root.clone()))
+                .is_none(),
+            "Ambiguous statement module {name}"
+        );
+    }
+    Ok(modules)
+}
+
+#[cfg(test)]
+fn stock_statement_build(project: &Path) -> Result<()> {
+    stock_statement_build_with_trust(project, false)
+}
+
+fn stock_statement_build_with_trust(project: &Path, is_untrusted: bool) -> Result<()> {
+    let mut command = statement_lake_command(project, is_untrusted)?;
+    command.arg("build");
+    let out = crate::module_builder::run_command_with_timeout(
+        command,
+        std::time::Duration::from_secs(1800),
+        is_untrusted,
+    )?;
+    anyhow::ensure!(
+        out.status.success(),
+        "Stock lake build for kernel statement digests failed in {}:\n{}\n{}",
+        project.display(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let pkg = crate::module_builder::resolve_package_config(project, true)?;
+    let lib_dir = project.join(&pkg.build_dir).join(&pkg.lean_lib_dir);
+    let modules = statement_source_modules(project, &pkg)?;
+    let mut lake_targets = Vec::new();
+    let mut standalone = BTreeMap::new();
+    for (name, (source, root)) in modules {
+        let owned = pkg.libs.iter().any(|lib| {
+            let lib_root = project
+                .join(&pkg.src_dir)
+                .join(lib.src_dir.as_deref().unwrap_or(Path::new("")));
+            lib_root == root
+                && lib.globs.iter().any(|glob| {
+                    use crate::module_builder::GlobSpec;
+                    match glob {
+                        GlobSpec::One(n) => name == *n,
+                        GlobSpec::Submodules(n) => name.starts_with(&format!("{n}.")),
+                        GlobSpec::AndSubmodules(n) => {
+                            name == *n || name.starts_with(&format!("{n}."))
+                        }
+                    }
+                })
+        }) || pkg.exes.iter().any(|exe| exe.root == name);
+        if owned {
+            lake_targets.push(format!("+{name}"));
+        } else {
+            standalone.insert(name, (source, root));
+        }
+    }
+    // Ask Lake to refresh every registered module, including non-default targets.
+    if !lake_targets.is_empty() {
+        let mut command = statement_lake_command(project, is_untrusted)?;
+        command.arg("build").args(&lake_targets);
+        let out = crate::module_builder::run_command_with_timeout(
+            command,
+            std::time::Duration::from_secs(1800),
+            is_untrusted,
+        )?;
+        anyhow::ensure!(
+            out.status.success(),
+            "Stock lake build of statement modules failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    // Lake cannot address sources excluded by its globs (e.g. `TurboLean.lean`
+    // with a `TurboLean.+` glob). Compile these with absolute stock Lean,
+    // even when an older artifact exists, in import order.
+    while !standalone.is_empty() {
+        let mut ready = Vec::new();
+        for (name, (source, _)) in &standalone {
+            let header = crate::module_builder::parse_header_info(&fs::read_to_string(source)?);
+            anyhow::ensure!(
+                header.header_error.is_none(),
+                "Invalid statement module header: {name}"
+            );
+            if !header
+                .imports
+                .iter()
+                .any(|dep| standalone.contains_key(dep))
+            {
+                ready.push(name.clone());
+            }
+        }
+        anyhow::ensure!(
+            !ready.is_empty(),
+            "Import cycle in standalone statement modules"
+        );
+        for name in ready {
+            let (source, root) = standalone.remove(&name).unwrap();
+            let output = lib_dir
+                .join(source.strip_prefix(&root)?)
+                .with_extension("olean");
+            fs::create_dir_all(
+                output
+                    .parent()
+                    .context("Missing statement output directory")?,
+            )?;
+            let mut command = statement_lean_command(project, is_untrusted)?;
+            command
+                .args(&pkg.more_lean_args)
+                .args(&pkg.weak_lean_args);
+            for (key, value) in &pkg.lean_options {
+                command.arg(format!("-D{key}={value}"));
+            }
+            command
+                .arg(&source)
+                .arg("-R")
+                .arg(&root)
+                .arg("-o")
+                .arg(&output);
+            let out = crate::module_builder::run_command_with_timeout(
+                command,
+                std::time::Duration::from_secs(1800),
+                is_untrusted,
+            )?;
+            anyhow::ensure!(
+                out.status.success(),
+                "Stock Lean statement module {name} failed:\n{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn built_kernel_statements(
+    project: &Path,
+    scope: Option<&Path>,
+) -> Result<BTreeMap<String, String>> {
+    built_kernel_statements_with_trust(project, scope, false)
+}
+
+fn built_kernel_statements_with_trust(
+    project: &Path,
+    scope: Option<&Path>,
+    is_untrusted: bool,
+) -> Result<BTreeMap<String, String>> {
+    Ok(built_kernel_statement_report(project, scope, is_untrusted)?.statements)
+}
+
+fn built_kernel_statement_report(
+    project: &Path,
+    scope: Option<&Path>,
+    is_untrusted: bool,
+) -> Result<KernelStatementReport> {
+    let helper = project.join(format!(
+        ".turbo_statement_dump_{}.lean",
+        pack::next_tmp_id()
+    ));
+    fs::write(
+        &helper,
+        include_str!("../../../lean/TurboLean/StatementHash.lean"),
+    )?;
+    struct HelperGuard(PathBuf);
+    impl Drop for HelperGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+    let _guard = HelperGuard(helper.clone());
+    let pkg = crate::module_builder::resolve_package_config(project, true)?;
+    let lib_dir = project.join(&pkg.build_dir).join(&pkg.lean_lib_dir);
+    let mut modules = BTreeMap::new();
+    for (module, (source, root)) in statement_source_modules(project, &pkg)? {
+        let relative = source.strip_prefix(&root)?;
+        anyhow::ensure!(
+            lib_dir.join(relative).with_extension("olean").is_file(),
+            "No built .olean for {} after stock checking (statement pinning fails closed)",
+            source.display()
+        );
+        modules.insert(
+            module,
+            source.strip_prefix(project)?.to_string_lossy().to_string(),
+        );
+    }
+    if modules.is_empty() {
+        return Ok(KernelStatementReport::default());
+    }
+    // Distinct executables may define the same constant (`main`). Compatible
+    // modules share one import, while incompatible groups split into fresh OS
+    // processes. Never re-import oleans into a process with old mapped regions.
+    let mut batches = vec![modules.keys().cloned().collect::<Vec<_>>()];
+    let mut dump = Vec::new();
+    while let Some(mut batch) = batches.pop() {
+        let mut command = statement_lean_command(project, is_untrusted)?;
+        command
+            .arg("--run")
+            .arg(&helper)
+            .args(&batch);
+        let out = crate::module_builder::run_command_with_timeout(
+            command,
+            std::time::Duration::from_secs(600),
+            is_untrusted,
+        )?;
+        if !out.status.success() && batch.len() > 1 {
+            let right = batch.split_off(batch.len() / 2);
+            batches.push(right);
+            batches.push(batch);
+            continue;
+        }
+        anyhow::ensure!(
+            out.status.success(),
+            "Cannot dump kernel statements for {batch:?}:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        dump.extend(out.stdout);
+    }
+    let mut report = KernelStatementReport::default();
+    let mut chunk = Vec::new();
+    let mut remaining = modules.clone();
+    for line in dump.split_inclusive(|&c| c == b'\n') {
+        chunk.extend_from_slice(line);
+        let row: KernelDumpRow =
+            serde_json::from_slice(line).context("Invalid kernel statement JSONL")?;
+        if row.audit.is_some() {
+            report.audits.push(serde_json::from_slice(line)?);
+        }
+        if let Some(module) = row.module.as_deref() {
+            let rel = remaining
+                .remove(module)
+                .with_context(|| format!("Unexpected kernel statement module {module}"))?;
+            report.csimp.extend(row.csimp.context("Missing csimp audit")?);
+            let in_scope = scope.is_none_or(|p| Path::new(&rel).starts_with(p));
+            for (name, digest) in parse_kernel_statement_dump(&chunk, module)? {
+                if in_scope {
+                    report.statements.insert(format!("{rel}::{name}"), digest);
+                }
+            }
+            chunk.clear();
+        }
+    }
+    anyhow::ensure!(
+        remaining.is_empty() && chunk.is_empty(),
+        "Incomplete kernel statement dump"
+    );
+    Ok(report)
+}
+
+#[cfg(test)]
+fn kernel_statement_changes(
+    project: &Path,
+    base: &str,
+    scope: Option<&Path>,
+) -> Result<Vec<String>> {
+    kernel_statement_changes_with_trust(project, base, scope, None)
+}
+
+fn ensure_statement_lake_project(project: &Path) -> Result<()> {
+    if crate::lake_build::has_lake_config(project) {
+        return Ok(());
+    }
+    let roots: Vec<_> = crate::lake_build::collect_project_lean_files(project, false, None)
+        .iter()
+        .map(|file| {
+            file.strip_prefix(project)
+                .map(|rel| rel.with_extension("").to_string_lossy().replace('/', "."))
+        })
+        .collect::<std::result::Result<_, _>>()?;
+    let mut config = "name = \"turbo-statement-snapshot\"\n".to_string();
+    if !roots.is_empty() {
+        let modules = serde_json::to_string(&roots)?;
+        config.push_str(&format!("defaultTargets = [\"TurboStatementSnapshot\"]\n[[lean_lib]]\nname = \"TurboStatementSnapshot\"\nroots = {modules}\nglobs = {modules}\n"));
+    }
+    fs::write(project.join("lakefile.toml"), config)?;
+    Ok(())
+}
+
+fn kernel_statement_changes_with_trust(
+    project: &Path,
+    base: &str,
+    scope: Option<&Path>,
+    untrusted_cfg: Option<&crate::module_builder::ProjectConfig>,
+) -> Result<Vec<String>> {
+    let repo = resolve_git_toplevel(project)?;
+    let baseline = StatementWorktree::at(&repo, base)?;
+    let base_project = baseline.path.join(project.strip_prefix(&repo)?);
+    let relative_scope = scope
+        .map(|p| -> Result<PathBuf> {
+            let joined = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                project.join(p)
+            };
+            let joined = joined.canonicalize().unwrap_or(joined);
+            let relative = joined
+                .strip_prefix(project)
+                .context("Statement scope must be inside the project")?;
+            anyhow::ensure!(
+                !relative
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir)),
+                "Statement scope must be inside the project"
+            );
+            Ok(relative
+                .components()
+                .filter(|c| !matches!(c, std::path::Component::CurDir))
+                .collect())
+        })
+        .transpose()?;
+    let is_untrusted = untrusted_cfg.is_some();
+    ensure_statement_lake_project(&base_project)?;
+    if let Some(cfg) = untrusted_cfg {
+        clear_untrusted_statement_build_products(&base_project)?;
+        seed_statement_dependencies(&base_project, cfg)?;
+    }
+    let head_snapshot = if is_untrusted || !crate::lake_build::has_lake_config(project) {
+        let snapshot = StatementWorktree::at(&repo, "HEAD")?;
+        overlay_statement_sources(&repo, &snapshot.path)?;
+        let snapshot_project = snapshot.path.join(project.strip_prefix(&repo)?);
+        ensure_statement_lake_project(&snapshot_project)?;
+        if let Some(cfg) = untrusted_cfg {
+            clear_untrusted_statement_build_products(&snapshot_project)?;
+            seed_statement_dependencies(&snapshot_project, cfg)?;
+        }
+        Some(snapshot)
+    } else {
+        None
+    };
+    let head_project = head_snapshot
+        .as_ref()
+        .map(|s| s.path.join(project.strip_prefix(&repo).unwrap()))
+        .unwrap_or_else(|| project.to_path_buf());
+    stock_statement_build_with_trust(&base_project, is_untrusted)?;
+    let before =
+        built_kernel_statements_with_trust(&base_project, relative_scope.as_deref(), is_untrusted)?;
+    stock_statement_build_with_trust(&head_project, is_untrusted)?;
+    let after =
+        built_kernel_statement_report(&head_project, relative_scope.as_deref(), is_untrusted)?;
+    StatementPolicy::at(project, base).audit(&after)?;
+    Ok(compare_kernel_statements(&before, &after.statements))
+}
+
+fn compare_kernel_statements(
+    before: &BTreeMap<String, String>,
+    after: &BTreeMap<String, String>,
+) -> Vec<String> {
+    before
+        .iter()
+        .filter_map(|(name, digest)| match after.get(name) {
+            None => Some(format!("{name} (deleted)")),
+            Some(current) if current != digest => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Execute `turbo-lean pr-verify`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_pr_verify_command(
@@ -2956,7 +4028,7 @@ pub fn run_pr_verify_command(
         untrusted_cfg: untrusted_pr_cfg.as_ref(),
     };
 
-    let (classification, shards_by_file, current_files, current_splits) =
+    let (mut classification, shards_by_file, current_files, current_splits) =
         load_and_classify_pr_from_git_scoped(
             store,
             &canon_dir,
@@ -2967,16 +4039,9 @@ pub fn run_pr_verify_command(
             untrusted_pr_cfg.as_ref(),
         )?;
 
-    if disallow_statement_changes
-        && (classification.interface_drift || !classification.statement_edited_theorems.is_empty())
-    {
-        anyhow::bail!(
-            "PR statement/interface change gate FAILED (--disallow-statement-changes, mode={}): interface_drift={}, altered_files={:?}, statement_edited_theorems={:?}",
-            mode,
-            classification.interface_drift,
-            classification.altered_interface_files,
-            classification.statement_edited_theorems
-        );
+    for (file, split) in &current_splits {
+        anyhow::ensure!(!split.hygiene.native_violation(),
+            "[TurboLean.KernelGate] native_decide/bv_decide in {file} requires the base project's axiom allowlist");
     }
 
     // Only a theorem whose proof body alone changed is a local edit (proof irrelevance). Anything
@@ -3004,11 +4069,15 @@ pub fn run_pr_verify_command(
                 Some(&base),
             )?;
         }
-    } else if !is_untrusted && crate::lake_build::has_lake_config(&canon_dir) {
+    } else if !is_untrusted {
         let edited: Vec<PathBuf> = shards_by_file.keys().map(|f| canon_dir.join(f)).collect();
-        let imports = crate::lake_build::project_imports_of(&canon_dir, &edited);
-        if !imports.is_empty() {
-            crate::lake_build::lake_build_modules(&canon_dir, &imports, Some(&base))?;
+        if crate::lake_build::worktree_auto_link_disabled(&canon_dir) {
+            crate::lake_build::ensure_project_imports_fresh_for_check(&canon_dir, &edited)?;
+        } else if crate::lake_build::has_lake_config(&canon_dir) {
+            let imports = crate::lake_build::project_imports_of(&canon_dir, &edited);
+            if !imports.is_empty() {
+                crate::lake_build::lake_build_modules(&canon_dir, &imports, Some(&base))?;
+            }
         }
     }
     let lake_recheck_ms = lake_t0.elapsed().as_millis();
@@ -3061,6 +4130,53 @@ pub fn run_pr_verify_command(
             "PR verification cone budget exceeded (fail-closed): {} uncached theorem shards exceed --max-cone-jobs {} (refusing to truncate unverified shards)",
             raw_uncached_jobs,
             effective_job_cap
+        );
+    }
+
+    // Keep source interfaces and verification jobs intact. Only the report/gate uses
+    // built kernel statements, so an equal digest can never bypass stock checking.
+    let statement_digest_t0 = Instant::now();
+    let source_statement_edit = !classification.statement_edited_theorems.is_empty();
+    classification.statement_edited_theorems = kernel_statement_changes_with_trust(
+        &canon_dir,
+        &base,
+        scope.as_deref(),
+        untrusted_pr_cfg.as_ref(),
+    )?;
+    let statement_digest_ms = statement_digest_t0.elapsed().as_millis();
+    let is_statement_edit = |source_name: &String| {
+        classification
+            .statement_edited_theorems
+            .iter()
+            .any(|kernel_name| {
+                let (Some((file, name)), Some((kernel_file, kernel_decl))) =
+                    (source_name.split_once("::"), kernel_name.split_once("::"))
+                else {
+                    return false;
+                };
+                file == kernel_file
+                    && (kernel_decl == name || kernel_decl.ends_with(&format!(".{name}")))
+            })
+    };
+    classification
+        .unchanged_theorems
+        .retain(|n| !is_statement_edit(n));
+    classification
+        .proof_edited_theorems
+        .retain(|n| !is_statement_edit(n));
+
+    // Preserve every source-based restriction enforced before kernel reporting.
+    if disallow_statement_changes
+        && (classification.interface_drift || source_statement_edit
+            || !classification.statement_edited_theorems.is_empty())
+    {
+        anyhow::bail!(
+            "PR statement/interface change gate FAILED (--disallow-statement-changes, mode={}): interface_drift={}, source_statement_edit={}, altered_files={:?}, statement_edited_theorems={:?}",
+            mode,
+            classification.interface_drift,
+            source_statement_edit,
+            classification.altered_interface_files,
+            classification.statement_edited_theorems
         );
     }
 
@@ -3154,8 +4270,23 @@ pub fn run_pr_verify_command(
 
         let staging_dir = store.fast_staging_dir();
         let pid = std::process::id();
+        let trusted_pkg_cfg = if is_untrusted {
+            None
+        } else {
+            crate::module_builder::resolve_package_config(&canon_dir, false).ok()
+        };
+        let resolve_file_args = |abs_file: &Path| -> Vec<String> {
+            if let Some(ref cfg) = untrusted_pr_cfg {
+                crate::module_builder::resolve_file_lean_args_in_package(&cfg.root_pkg, abs_file)
+            } else if let Some(ref pkg) = trusted_pkg_cfg {
+                crate::module_builder::resolve_file_lean_args_in_package(pkg, abs_file)
+            } else {
+                Vec::new()
+            }
+        };
 
         let mut cross_eligible = Vec::new();
+        let mut cross_shared_args: Option<Vec<String>> = None;
         if uncached_by_file.len() > 1 {
             for (rel_path, file_uncached, can_fast_olean) in &uncached_by_file {
                 if !*can_fast_olean {
@@ -3166,6 +4297,12 @@ pub fn run_pr_verify_command(
                     .map(|s| s.as_str())
                     .unwrap_or("");
                 let abs_file = canon_dir.join(rel_path);
+                let file_args = resolve_file_args(&abs_file);
+                match &cross_shared_args {
+                    None => cross_shared_args = Some(file_args),
+                    Some(prev) if *prev != file_args => break,
+                    Some(_) => {}
+                }
                 let uncached_names: std::collections::HashSet<String> = file_uncached
                     .iter()
                     .map(|(_, sh)| sh.name.clone())
@@ -3185,6 +4322,7 @@ pub fn run_pr_verify_command(
 
         let mut cross_batch_done = false;
         if uncached_by_file.len() > 1 && cross_eligible.len() == uncached_by_file.len() {
+            let cross_args = cross_shared_args.unwrap_or_default();
             let total_uncached: usize = uncached_by_file.iter().map(|(_, u, _)| u.len()).sum();
             let shard_ref_vecs: Vec<Vec<&splitter::TheoremShard>> = cross_eligible
                 .iter()
@@ -3209,6 +4347,7 @@ pub fn run_pr_verify_command(
                     &trust_domain,
                     &toolchain,
                     &lean_path_str,
+                    &cross_args,
                 ) {
                     if resp.ok {
                         cross_batch_done = true;
@@ -3227,6 +4366,7 @@ pub fn run_pr_verify_command(
                     cross_src.clone(),
                     &toolchain,
                     &lean_path_str,
+                    cross_args.clone(),
                 );
                 let mut cross_ok = if let Some(ref z_url) = fast_local_zygote_url {
                     pack::try_zygote_url_check_shard_with_inflight(z_url, &zreq, || {
@@ -3292,6 +4432,7 @@ pub fn run_pr_verify_command(
                         &env_vars,
                         &verification_trust,
                         &cross_names,
+                        &cross_args,
                     )?
                     .status
                     .success();
@@ -3322,6 +4463,7 @@ pub fn run_pr_verify_command(
                     let src = current_files.get(&rel_path).cloned().unwrap_or_default();
                     let abs_file = canon_dir.join(&rel_path);
                     let canon_lf = abs_file.canonicalize().unwrap_or(abs_file);
+                    let file_lean_args = resolve_file_args(&canon_lf);
                     let uncached_names: std::collections::HashSet<String> = file_uncached
                         .iter()
                         .map(|(_, sh)| sh.name.clone())
@@ -3356,6 +4498,7 @@ pub fn run_pr_verify_command(
                                     &trust_domain,
                                     &toolchain,
                                     &lean_path_str,
+                                    &file_lean_args,
                                 ) {
                                     if resp.ok {
                                         remote_ok = true;
@@ -3381,6 +4524,7 @@ pub fn run_pr_verify_command(
                             &trust_domain,
                             &toolchain,
                             &lean_path_str,
+                            &file_lean_args,
                         )?;
                         if !resp.ok {
                             anyhow::bail!(
@@ -3432,6 +4576,7 @@ pub fn run_pr_verify_command(
                     let mut local_publish = Vec::new();
                     let (ref rel_path, ref file_uncached, can_fast_olean) = uncached_by_file[f_idx];
                     let abs_file = canon_dir.join(rel_path);
+                    let file_lean_args = resolve_file_args(&abs_file);
                     let src: std::borrow::Cow<'_, str> = if let Some(s) =
                         current_files.get(rel_path)
                     {
@@ -3471,6 +4616,7 @@ pub fn run_pr_verify_command(
                                         fast_src.clone(),
                                         &toolchain,
                                         &lean_path_str,
+                                        file_lean_args.clone(),
                                     );
                                     if pack::try_zygote_url_check_shard_with_inflight(
                                         z_url,
@@ -3532,6 +4678,7 @@ pub fn run_pr_verify_command(
                                         &env_vars,
                                         &verification_trust,
                                         &uncached_names,
+                                        &file_lean_args,
                                     )?
                                     .status
                                     .success()
@@ -3552,6 +4699,7 @@ pub fn run_pr_verify_command(
                                     src_to_check.to_string(),
                                     &toolchain,
                                     &lean_path_str,
+                                    file_lean_args.clone(),
                                 );
                                 if pack::try_zygote_url_check_shard(z_url, &zreq).is_some() {
                                     return Ok(true);
@@ -3566,6 +4714,7 @@ pub fn run_pr_verify_command(
                                 &env_vars,
                                 &verification_trust,
                                 &uncached_names,
+                                &file_lean_args,
                             )?
                             .status
                             .success())
@@ -3581,6 +4730,7 @@ pub fn run_pr_verify_command(
                             &env_vars,
                             &verification_trust,
                             &uncached_names,
+                            &file_lean_args,
                         )?;
                         if !out.status.success() {
                             anyhow::bail!(
@@ -3664,6 +4814,7 @@ pub fn run_pr_verify_command(
                                     lean_path: lean_path_str.clone(),
                                     skip_cas_lock: true,
                                     allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
+                                    lean_args: file_lean_args.clone(),
                                 };
                                 if pack::try_zygote_url_check_shard_with_inflight(
                                     z_url,
@@ -3720,6 +4871,7 @@ pub fn run_pr_verify_command(
                                     &env_vars,
                                     &verification_trust,
                                     &std::iter::once(sh.name.clone()).collect(),
+                                    &file_lean_args,
                                 )?;
                                 if !out.status.success() {
                                     anyhow::bail!(
@@ -3944,6 +5096,8 @@ pub fn run_pr_verify_command(
             "zero_native_decide": !splitter::native_decide_allowed(),
             "allowed_axioms": splitter::allowed_axioms(),
             "lake_recheck_ms": lake_recheck_ms,
+            "statement_digest_ms": statement_digest_ms,
+            "statement_digest_kind": "constant-info+if-closure:v1",
             "lake_rechecked_modules": lake_rechecked_modules,
             "axiom_flags": classification.axiom_flags,
             "elapsed_ms": elapsed_ms
@@ -3989,8 +5143,616 @@ pub fn run_pr_verify_command(
 mod pr_verify_tests {
     use super::*;
     use crate::lake_build::{
-        compute_imported_olean_interface_hashes, is_file_verified_in_lake_build,
+        compute_imported_olean_interface_hashes, compute_shard_key, is_file_verified_in_lake_build,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn test_optout_trusted_pr_stale_imports_preserve_lake_tree() -> Result<()> {
+        use crate::worktree_test_support::{assert_stale_error, snapshot, LakeTree};
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tree = LakeTree::imports("stale_pr")?;
+        tree.opt_out()?;
+        git_init_and_commit(&tree.project, "base")?;
+        tree.stale_import()?;
+        fs::write(
+            tree.project.join("P/Target.lean"),
+            "import P.Middle\ntheorem target : a = 1 := by\n  rfl\n",
+        )?;
+        tree.prepare_snapshot(".lake/build/lib/lean/P/A.olean")?;
+        let before = snapshot(&tree.project)?;
+        let mut store = TurboStore::open(Some(&tree.root.join("cache")))?;
+        let err = run_pr_verify_command(
+            &mut store,
+            true,
+            tree.project.clone(),
+            "HEAD".into(),
+            "trusted".into(),
+            false,
+            None,
+            None,
+            None,
+            None,
+            false,
+            0,
+            None,
+        )
+        .unwrap_err();
+        assert_stale_error(&err);
+        assert_eq!(snapshot(&tree.project)?, before);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_optout_untrusted_ci_cached_audit_failure_preserves_lake_tree() -> Result<()> {
+        use crate::worktree_test_support::{snapshot, LakeTree};
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Lake compiles this macro-expanded axiom; source hygiene cannot see the generated name.
+        let source = concat!(
+            "import Lean\nopen Lean Elab Tactic in\n",
+            "elab \"concealed\" : tactic => do\n  let g ← getMainGoal\n  let t ← g.getType\n",
+            "  let s := String.mk ['s', 'o', 'r', 'r', 'y', 'A', 'x']\n",
+            "  let e ← Meta.mkAppM (Name.mkSimple s) #[t, mkConst ``false]\n  g.assign e\n",
+            "theorem hidden : 1 + 1 = 2 := by concealed\n"
+        );
+        let tree = LakeTree::new("ci_audit", &[("P/A.lean", source)])?;
+        tree.opt_out()?;
+        let mut store = TurboStore::open(Some(&tree.root.join("cache")))?;
+        let toolchain = detect_toolchain(&tree.project);
+        let axioms = splitter::allowed_axioms();
+        let split = split_lean_source(source, &[]);
+        assert!(split.hygiene.is_clean_for_certification());
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(format!("turbo-lean-build-v1\n{toolchain}\nuntrusted:ci\n\n").as_bytes());
+        if axioms.len() > splitter::STANDARD_AXIOMS.len() {
+            hasher.update(b":axioms:");
+            hasher.update(axioms.join(",").as_bytes());
+            hasher.update(b"\n");
+        }
+        hasher.update(b"P/A.lean:");
+        hasher.update(blake3::hash(source.as_bytes()).as_bytes());
+        hasher.update(b"\n");
+        let key = hasher.finalize().to_hex().to_string();
+        let (outputs, blobs) = crate::lake_build::stage_lake_build_outputs(&store, &tree.project)?;
+        store.batch_register_linked_blobs(&blobs, "untrusted:ci", 1)?;
+        let lease =
+            match store.acquire_singleflight(&key, &toolchain, "lake_build", "untrusted:ci")? {
+                crate::db::SingleflightOutcome::Leader(lease) => lease,
+                _ => anyhow::bail!("expected empty test cache"),
+            };
+        store.publish_action(&lease, &outputs, 0, 0, 0, "untrusted:ci")?;
+        drop(lease);
+        assert!(store.get_cached_action(&key, "untrusted:ci")?.is_some());
+        tree.prepare_snapshot(".lake/build/lib/lean/P/A.olean")?;
+        let before = snapshot(&tree.project)?;
+        let fake_bwrap =
+            crate::module_builder::ScopedTestBwrapOverride::write_fake_bwrap_script(&tree.root)?;
+        let _bwrap =
+            crate::module_builder::ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy());
+        let err = run_ci_verify_command(
+            &mut store,
+            true,
+            "untrusted".into(),
+            tree.project.clone(),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("soundness audit rejected compiled artifact(s)")
+                && err.contains("sorryAx"),
+            "{err}"
+        );
+        assert_eq!(
+            snapshot(&tree.project)?,
+            before,
+            "CI rejection wiped the pre-existing build tree"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_statement_fixtures() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo-kernel-statements-{}-{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        fs::create_dir_all(dir.join("Demo"))?;
+        fs::create_dir_all(dir.join("Other"))?;
+        fs::write(
+            dir.join("Other/Keep.lean"),
+            "theorem keep : True := trivial\n",
+        )?;
+        fs::write(dir.join(".gitignore"), ".lake/\n")?;
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            dir.join("lakefile.toml"),
+            r#"name = "statement-fixture"
+defaultTargets = ["Demo"]
+[[lean_lib]]
+name = "Demo"
+globs = ["Demo.+"]
+"#,
+        )?;
+        let source = "namespace Demo\ndef value : Nat := 1\ntheorem pinned : value = value := rfl\ntheorem independent : True := trivial\nend Demo\n";
+        let file = dir.join("Demo/Main.lean");
+        fs::write(&file, source)?;
+        git_init_and_commit(&dir, "baseline")?;
+        stock_statement_build(&dir)?;
+        let before = built_kernel_statements(&dir, None)?;
+        assert!(before.contains_key("Demo/Main.lean::Demo.pinned"));
+        // A source interface restriction still applies when no old theorem type changes.
+        fs::write(&file, format!("{source}\ndef unrelated : Nat := 42\n"))?;
+        stock_statement_build(&dir)?;
+        assert_eq!(before, built_kernel_statements(&dir, None)?);
+        let mut store = TurboStore::open(Some(&dir.join(".lake/gate-cache")))?;
+        let error = run_pr_verify_command(
+            &mut store, true, dir.clone(), "HEAD".into(), "trusted".into(),
+            true, None, None, None, None, false, 0, None,
+        ).unwrap_err().to_string();
+        assert!(error.contains("statement/interface change gate FAILED")
+            && error.contains("interface_drift=true"), "{error}");
+        for (label, current) in [
+            ("import-only", format!("import Lean\n{source}")),
+            (
+                "whitespace",
+                source.replace("value = value", "value  =  value"),
+            ),
+            ("comment", format!("-- a harmless comment\n{source}")),
+        ] {
+            fs::write(&file, current)?;
+            stock_statement_build(&dir)?;
+            let changed = compare_kernel_statements(&before, &built_kernel_statements(&dir, None)?);
+            assert!(changed.is_empty(), "{label}: {changed:?}");
+            println!("kernel statement fixture {label}: 0 reports");
+        }
+        fs::write(&file, source.replace("Nat := 1", "Nat := 2"))?;
+        stock_statement_build(&dir)?;
+        assert_eq!(
+            compare_kernel_statements(&before, &built_kernel_statements(&dir, None)?),
+            vec!["Demo/Main.lean::Demo.pinned"]
+        );
+        println!("kernel statement fixture referenced-def: Demo.pinned reported");
+        fs::write(&file, source.replace("value = value", "value + 0 = value"))?;
+        stock_statement_build(&dir)?;
+        assert_eq!(
+            compare_kernel_statements(&before, &built_kernel_statements(&dir, None)?),
+            vec!["Demo/Main.lean::Demo.pinned"]
+        );
+        println!("kernel statement fixture theorem-type: Demo.pinned reported");
+        fs::write(&file, source.replace("pinned", "renamed"))?;
+        stock_statement_build(&dir)?;
+        assert_eq!(
+            compare_kernel_statements(&before, &built_kernel_statements(&dir, None)?),
+            vec!["Demo/Main.lean::Demo.pinned (deleted)"]
+        );
+        println!("kernel statement fixture rename: old theorem reported deleted");
+        fs::write(
+            &file,
+            source.replace("theorem pinned : value = value := rfl\n", ""),
+        )?;
+        stock_statement_build(&dir)?;
+        assert_eq!(
+            compare_kernel_statements(&before, &built_kernel_statements(&dir, None)?),
+            vec!["Demo/Main.lean::Demo.pinned (deleted)"]
+        );
+        println!("kernel statement fixture deletion: old theorem reported deleted");
+        assert!(kernel_statement_changes(&dir, "HEAD", Some(Path::new("Other")))?.is_empty());
+        println!("kernel statement fixture scope: 0 out-of-scope reports");
+
+        // A definition's value may reach other definitions across module boundaries.
+        fs::write(dir.join("Demo/Value.lean"), "def underlying : Nat := 1\n")?;
+        let indirect = format!(
+            "import Demo.Value\n{}",
+            source.replace("Nat := 1", "Nat := underlying")
+        );
+        fs::write(&file, &indirect)?;
+        stock_statement_build(&dir)?;
+        let indirect_before = built_kernel_statements(&dir, None)?;
+        fs::write(dir.join("Demo/Value.lean"), "def underlying : Nat := 2\n")?;
+        stock_statement_build(&dir)?;
+        assert_eq!(
+            compare_kernel_statements(&indirect_before, &built_kernel_statements(&dir, None)?),
+            vec!["Demo/Main.lean::Demo.pinned"]
+        );
+        fs::write(&file, indirect.replace(":= rfl", ":= by rfl"))?;
+        stock_statement_build(&dir)?;
+        let proof_before = built_kernel_statements(&dir, None)?;
+        fs::write(&file, &indirect)?;
+        stock_statement_build(&dir)?;
+        assert_eq!(proof_before, built_kernel_statements(&dir, None)?);
+        println!("kernel statement fixture transitive imported definition: reported; proof-only edit: 0 reports");
+        // `Demo.+` excludes the root and unrelated source modules. These still
+        // need fresh stock artifacts, with imports compiled before importers.
+        fs::write(
+            dir.join("Outside.lean"),
+            "theorem outside : True := trivial\n",
+        )?;
+        let root = dir.join("Demo.lean");
+        fs::write(
+            &root,
+            "import Outside\nimport Demo.Main\ntheorem outer : Demo.value = Demo.value := rfl\n",
+        )?;
+        stock_statement_build(&dir)?;
+        let standalone_before = built_kernel_statements(&dir, None)?;
+        assert!(standalone_before.contains_key("Demo.lean::outer"));
+        fs::write(
+            &root,
+            "import Outside\nimport Demo.Main\ntheorem outer : True := trivial\n",
+        )?;
+        stock_statement_build(&dir)?;
+        assert_eq!(
+            compare_kernel_statements(&standalone_before, &built_kernel_statements(&dir, None)?),
+            vec!["Demo.lean::outer"]
+        );
+        fs::write(
+            dir.join("Outside.lean"),
+            "theorem outside : True := by exact (0 : Nat)\n",
+        )?;
+        assert!(
+            stock_statement_build(&dir).is_err(),
+            "an old standalone artifact must never bypass stock checking"
+        );
+        println!("kernel statement fixture excluded modules: import order, stale-artifact refresh, and broken-proof rejection pass");
+        fs::write(
+            dir.join("Outside.lean"),
+            "theorem outside : True := trivial\n",
+        )?;
+        for (module, theorem) in [("ToolA", "first"), ("ToolB", "second")] {
+            fs::write(
+                dir.join(format!("{module}.lean")),
+                format!("theorem {theorem} : True := trivial\ndef main : IO Unit := pure ()\n"),
+            )?;
+        }
+        stock_statement_build(&dir)?;
+        let executable_statements = built_kernel_statements(&dir, None)?;
+        assert!(executable_statements.contains_key("ToolA.lean::first"));
+        assert!(executable_statements.contains_key("ToolB.lean::second"));
+        println!("kernel statement fixture executable roots: duplicate main declarations isolated successfully");
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_statement_large_literals_remain_exact() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo-statement-naturals-{}-{}", std::process::id(), pack::next_tmp_id()
+        ));
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(dir.join("lakefile.toml"),
+            "name = \"natural-fixture\"\ndefaultTargets = [\"Demo\"]\n[[lean_lib]]\nname = \"Demo\"\n")?;
+        for (old, new) in [
+            ("1180591620717411303424", "1180591620717411303425"),
+            ("10000000000000000000000000000000000000000000000000000000000000000000000000000",
+             "10000000000000000000000000000000000000000000000000000000000000000000000000001"),
+        ] {
+            let source = |n: &str| format!(
+                "def large : Nat := {n}\ntheorem pinned : ({n} : Nat) = {n} := rfl\ntheorem indirect : large = large := rfl\n");
+            fs::write(dir.join("Demo.lean"), source(old))?;
+            stock_statement_build(&dir)?;
+            let before = built_kernel_statements(&dir, None)?;
+            fs::write(dir.join("Demo.lean"), source(new))?;
+            stock_statement_build(&dir)?;
+            assert_eq!(compare_kernel_statements(&before, &built_kernel_statements(&dir, None)?),
+                vec!["Demo.lean::indirect", "Demo.lean::pinned"]);
+        }
+        // The parser must also preserve payloads larger than f64's maximum.
+        let huge = "9".repeat(400);
+        let row = format!("{{\"statement\":[\"nat\",{huge}],\"theorem\":\"t\",\"deps\":[]}}\n{{\"module\":\"Demo\",\"complete\":true}}\n");
+        assert_ne!(parse_kernel_statement_dump(row.as_bytes(), "Demo")?,
+            parse_kernel_statement_dump(row.replace(&huge, &(huge.clone() + "1")).as_bytes(), "Demo")?);
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn project_lean_executable_cannot_replay_statement_dumps() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo-statement-spoof-{}-{}", std::process::id(), pack::next_tmp_id()
+        ));
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(dir.join("lakefile.toml"), r#"name = "spoof-fixture"
+defaultTargets = ["Demo", "lean"]
+[[lean_lib]]
+name = "Demo"
+[[lean_exe]]
+name = "lean"
+root = "Spoof"
+"#)?;
+        let theorem = "theorem pinned : (1 : Nat) = 1 := rfl\n";
+        fs::write(dir.join("Demo.lean"), theorem)?;
+        fs::write(dir.join("Outside.lean"), theorem.replace("pinned", "outside"))?;
+        fs::write(dir.join("Spoof.lean"), "def main : IO Unit := pure ()\n")?;
+        stock_statement_build(&dir)?;
+        let before = built_kernel_statements(&dir, None)?;
+        // Capture an actual old dump, then make the default project `lean` replay it.
+        let helper = dir.join("Dump.lean");
+        fs::write(&helper, include_str!("../../../lean/TurboLean/StatementHash.lean"))?;
+        let stale = statement_lean_command(&dir, false)?
+            .arg("--run").arg(&helper).args(["Demo", "Outside", "Spoof"]).output()?;
+        assert!(stale.status.success());
+        fs::remove_file(helper)?;
+        fs::write(dir.join("Spoof.lean"), format!(
+            "def main : IO Unit := IO.print {}\n",
+            serde_json::to_string(std::str::from_utf8(&stale.stdout)?)?
+        ))?;
+        fs::write(dir.join("Demo.lean"), theorem.replace("1", "2"))?;
+        fs::write(dir.join("Outside.lean"), theorem.replace("pinned", "outside").replace("1", "2"))?;
+        stock_statement_build(&dir)?;
+        // Confirm that the vulnerable invocation really does replay the old JSONL.
+        let replay = statement_lake_command(&dir, false)?
+            .args(["env", "lean", "--run", "unused.lean", "Demo"]).output()?;
+        assert!(replay.status.success());
+        assert_eq!(replay.stdout, stale.stdout);
+        assert_eq!(compare_kernel_statements(&before, &built_kernel_statements(&dir, None)?),
+            vec!["Demo.lean::pinned", "Outside.lean::outside"]);
+        fs::write(dir.join("Outside.lean"), "theorem outside : False := by trivial\n")?;
+        assert!(stock_statement_build(&dir).is_err(),
+            "the project lean executable must not bypass standalone stock compilation");
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_policy_is_resolved_at_base_and_never_admits_forbidden_axioms() -> Result<()> {
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "turbo-kernel-policy-{}-{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        fs::create_dir_all(&dir)?;
+        let config = "[axioms]\nallow = [\"*._native.native_decide.ax_*\"]\n[csimp]\nallow = [\"Fixture.fast_eq\"]\n";
+        fs::write(
+            dir.join("turbo-lean.toml"),
+            config.replace("*._native.native_decide.ax_*", ""),
+        )?;
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(dir.join(".gitignore"), ".lake/\n")?;
+        fs::write(dir.join("lakefile.toml"), "name = \"policy-fixture\"\ndefaultTargets = [\"Fixture\"]\n[[lean_lib]]\nname = \"Fixture\"\n")?;
+        fs::write(
+            dir.join("Fixture.lean"),
+            r#"import Lean
+namespace Fixture
+@[noinline] def slow (n : Nat) : Nat := n + 0
+@[noinline] def fast (n : Nat) : Nat := n
+@[csimp] theorem fast_eq : @slow = @fast := by
+  funext n
+  simp [slow, fast]
+def callSlow (n : Nat) : Nat := slow n
+theorem witness : (1 + 1 : Nat) = 2 := by native_decide
+end Fixture
+"#,
+        )?;
+        git_init_and_commit(&dir, "deny native, allow csimp")?;
+        // The remaining bases keep native permission; isolate csimp rejection from axiom rejection.
+        for (permission, label) in [
+            ("", "deny"),
+            ("Fixture.other_eq", "wrong name"),
+            ("Fixture.fast_eq", "allow"),
+        ] {
+            fs::write(
+                dir.join("turbo-lean.toml"),
+                config.replace("Fixture.fast_eq", permission),
+            )?;
+            git_init_and_commit(&dir, label)?;
+        }
+        stock_statement_build(&dir)?;
+        if crate::module_builder::probe_bwrap_sandbox().is_some() {
+            fs::write(dir.join("fixture.c"), "int fixture(void) { return 0; }\n")?;
+            let mut command = statement_lake_command(&dir, true)?;
+            command.args(["env", "cc", "-c", "fixture.c", "-o", "fixture.o"]);
+            let out = crate::module_builder::run_command_with_timeout(
+                command,
+                std::time::Duration::from_secs(30),
+                true,
+            )?;
+            assert!(
+                out.status.success(),
+                "sandboxed stock Lake must resolve the system C compiler: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            fs::remove_file(dir.join("fixture.c"))?;
+            fs::remove_file(dir.join("fixture.o"))?;
+        }
+        let mut report = built_kernel_statement_report(&dir, None, false)?;
+        assert_eq!(report.csimp, vec!["Fixture.fast_eq"]);
+        assert!(report
+            .audits
+            .iter()
+            .flat_map(|row| &row.axioms)
+            .any(|axiom| axiom.starts_with("Fixture.witness._native.native_decide.ax_")));
+        let allowed = StatementPolicy::at(&dir, "HEAD");
+        allowed.audit(&report)?;
+        let cfg = crate::module_builder::resolve_project_config_with_trust(&dir, true)?;
+        let store = TurboStore::open(Some(&dir.join(".lake/auditor-cache")))?;
+        let env = std::collections::HashMap::from([
+            (
+                "LEAN_PATH".into(),
+                cfg.toolchain_lib_lean.to_string_lossy().into_owned(),
+            ),
+            (
+                "LD_LIBRARY_PATH".into(),
+                cfg.toolchain_lib.to_string_lossy().into_owned(),
+            ),
+        ]);
+        let auditor = crate::zygote::ensure_zygote_binary(&store, &cfg.lean_bin, &env)?;
+        let (lp, _) = crate::module_builder::build_lean_search_path(&cfg, true);
+        for (permission, expected) in [
+            ("Fixture.fast_eq", true),
+            ("Fixture.other_eq", false),
+            ("", false),
+        ] {
+            let out = Command::new(&auditor)
+                .args(["--audit-modules", "Fixture"])
+                .envs(&env)
+                .env("LEAN_PATH", &lp)
+                .env(splitter::ALLOWED_AXIOMS_ENV, "*._native.native_decide.ax_*")
+                .env("TURBO_LEAN_ALLOWED_CSIMP", permission)
+                .output()?;
+            assert_eq!(
+                out.status.success(),
+                expected,
+                "compiled auditor csimp policy {permission:?}: {}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        println!("kernel policy compiled auditor: exact csimp permission admitted; wrong/absent permission rejected");
+        let cli = std::env::current_exe()?
+            .parent()
+            .and_then(Path::parent)
+            .map(|path| path.join("turbo-lean"))
+            .filter(|path| path.is_file());
+        let verify = |command: &str, mode: &str, base: &str| -> Result<std::process::Output> {
+            let mut cmd = Command::new(
+                cli.as_ref()
+                    .context("Build the release CLI before the policy fixture")?,
+            );
+            cmd.args(["--no-telemetry", "--json", command, "--project-dir"])
+                .arg(&dir)
+                // A policy inherited from another checkout must not override --base.
+                .env("TURBO_LEAN_ALLOWED_CSIMP", "*")
+                .env("TURBO_LEAN_ALLOWED_CSIMP_FROM_CONFIG", "1")
+                .env(splitter::ALLOWED_AXIOMS_ENV, "*")
+                .env(splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV, "1")
+                .env("TURBO_LEAN_HOME", dir.join(".lake/turbo-policy-cache"))
+                .env("TURBO_LEAN_NO_DAEMON", "1");
+            // Exercise ci-verify's default trusted mode, too.
+            if mode != "trusted" {
+                cmd.args(["--mode", mode]);
+            }
+            if !base.is_empty() {
+                cmd.args(["--base", base]);
+            }
+            if command == "pr-verify" {
+                cmd.arg("--disallow-statement-changes");
+            }
+            Ok(cmd.output()?)
+        };
+        let verify_default_policy = |mode: &str| -> Result<()> {
+            let out = verify("ci-verify", mode, "")?;
+            let diagnostic = format!("{}{}",
+                String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            assert!(!out.status.success()
+                && diagnostic.contains("restrictive default policy")
+                && diagnostic.contains("native_decide"),
+                "{mode} ci-verify without --base must reject checkout/inherited allowlists and explain defaults: {diagnostic}");
+            println!("kernel policy {mode} ci-verify: checkout/inherited config ignored without --base");
+            Ok(())
+        };
+        if cli.is_some() {
+            verify_default_policy("trusted")?;
+            let sandbox = crate::module_builder::probe_bwrap_sandbox().is_some();
+            for (command, mode) in [
+                ("pr-verify", "trusted"),
+                ("pr-verify", "untrusted"),
+                ("ci-verify", "untrusted"),
+            ] {
+                if mode == "untrusted" && !sandbox {
+                    println!(
+                        "kernel policy {mode} {command} fixtures skipped: no working bubblewrap"
+                    );
+                    continue;
+                }
+                let out = verify(command, mode, "HEAD")?;
+                assert!(
+                    out.status.success(),
+                    "base-allowlisted csimp/native must pass {mode} {command}: {}\n{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                println!(
+                    "kernel policy {mode} {command}: base-allowlisted csimp/native_decide admitted"
+                );
+                let out = verify(command, mode, "HEAD^^^")?;
+                let diagnostic = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                assert!(!out.status.success() && diagnostic.contains("native_decide"),
+                    "{mode} {command} must reject native_decide without base axiom permission: {diagnostic}");
+                println!("kernel policy {mode} {command}: unallowed native_decide rejected");
+                // Reuse the cache: a pass under one policy must not authorize another.
+                for base in ["HEAD^", "HEAD^^"] {
+                    let out = verify(command, mode, base)?;
+                    let diagnostic = format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    assert!(!out.status.success() && diagnostic.contains("csimp"),
+                        "{mode} {command} must reject non-allowlisted/head-only csimp under {base}: {diagnostic}");
+                    println!("kernel policy {mode} {command}: non-allowlisted/head-only csimp rejected ({base})");
+                }
+                if command == "ci-verify" {
+                    verify_default_policy(mode)?;
+                }
+            }
+        }
+        fs::write(
+            dir.join("turbo-lean.toml"),
+            "[axioms]\nallow = []\n[csimp]\nallow = []\n",
+        )?;
+        StatementPolicy::at(&dir, "HEAD").audit(&report)?;
+        git_init_and_commit(&dir, "remove audited policy")?;
+        fs::write(dir.join("turbo-lean.toml"), config)?;
+        if cli.is_some() {
+            assert!(
+                !verify("pr-verify", "trusted", "HEAD")?.status.success(),
+                "head-only policy must fail pr-verify"
+            );
+        }
+        assert!(
+            StatementPolicy::at(&dir, "HEAD").audit(&report).is_err(),
+            "head policy must not authorize native_decide"
+        );
+        report.audits.clear();
+        assert!(
+            StatementPolicy::at(&dir, "HEAD").audit(&report).is_err(),
+            "head policy must not authorize csimp"
+        );
+        let wildcard = StatementPolicy {
+            axioms: vec!["*".into()],
+            csimp: vec!["*".into()],
+        };
+        report.csimp.clear();
+        for forbidden in ["sorryAx", "Lean.trustCompiler"] {
+            report.audits = vec![KernelAudit {
+                audit: "Fixture.bad".into(),
+                axioms: vec![forbidden.into()],
+            }];
+            assert!(
+                wildcard.audit(&report).is_err(),
+                "{forbidden} must fail even under wildcard policy"
+            );
+        }
+        report.audits = vec![KernelAudit {
+            audit: "Fixture.bad".into(),
+            axioms: vec!["Fixture.unreviewed".into()],
+        }];
+        assert!(
+            allowed.audit(&report).is_err(),
+            "unallowed custom axioms must fail"
+        );
+        println!("kernel policy fixtures: base-only csimp/native_decide allow and deny pass; sorryAx/trustCompiler/unallowed axioms rejected");
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
 
     #[test]
     fn test_pr_verify_classification_proof_vs_statement_and_hygiene() {
@@ -4428,6 +6190,109 @@ mod pr_verify_tests {
     }
 
     #[test]
+    fn test_lakefile_option_edit_reverifies_reconfigured_files() -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_lakefile_option_edit_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let repo_dir = tmp_dir.join("repo");
+        fs::create_dir_all(repo_dir.join("Fast"))?;
+        fs::create_dir_all(repo_dir.join("Heavy"))?;
+        let lakefile = |heavy_extra: &str| {
+            format!(
+                "name = \"demo\"\n\n[[lean_lib]]\nname = \"Fast\"\nroots = [\"Fast\"]\n\n[[lean_lib]]\nname = \"Heavy\"\nroots = [\"Heavy\"]\n{}",
+                heavy_extra
+            )
+        };
+        fs::write(repo_dir.join("lakefile.toml"), lakefile(""))?;
+        fs::write(
+            repo_dir.join("Fast/A.lean"),
+            "theorem t_a : 1 + 1 = 2 := by\n  rfl\n",
+        )?;
+        fs::write(
+            repo_dir.join("Heavy/B.lean"),
+            "theorem t_b : 2 + 2 = 4 := by\n  rfl\n",
+        )?;
+        git_init_and_commit(&repo_dir, "init")?;
+
+        let canon_dir = fs::canonicalize(&repo_dir)?;
+        let store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
+        let tc = "leanprover/lean4:v4.35.0";
+        let lean_paths = vec![
+            canon_dir.join("Fast/A.lean"),
+            canon_dir.join("Heavy/B.lean"),
+        ];
+        let (splits, _) = load_and_split_files_cached(&store, &lean_paths)?;
+        warm_git_head_tree_cache(&store, &canon_dir, &lean_paths, tc, Some(&splits));
+
+        // Formatting-only lakefile edit: same effective args, nothing to re-verify.
+        fs::write(
+            canon_dir.join("lakefile.toml"),
+            format!("# comment\n{}", lakefile("")),
+        )?;
+        let (cls, to_verify, _, _) = load_and_classify_pr_from_git(&store, &canon_dir, "HEAD", tc)?;
+        assert!(cls.modified_files.is_empty() && to_verify.is_empty());
+
+        // Only `Heavy`'s args change: its unchanged source is re-verified (dependents too).
+        fs::write(
+            canon_dir.join("lakefile.toml"),
+            lakefile("moreLeanArgs = [\"-DmaxHeartbeats=4000000\"]\n"),
+        )?;
+        let (cls, to_verify, changed_files, _) =
+            load_and_classify_pr_from_git(&store, &canon_dir, "HEAD", tc)?;
+        assert_eq!(cls.modified_files, vec!["Heavy/B.lean"]);
+        assert_eq!(cls.altered_interface_files, vec!["Heavy/B.lean"]);
+        assert_eq!(cls.unchanged_theorems, vec!["Fast/A.lean::t_a"]);
+        assert_eq!(to_verify.keys().collect::<Vec<_>>(), ["Heavy/B.lean"]);
+        assert!(changed_files["Heavy/B.lean"].contains("theorem t_b"));
+        let heavy_key = &to_verify["Heavy/B.lean"][0].0;
+        let plain_key = compute_shard_key(
+            tc,
+            &split_lean_source(&changed_files["Heavy/B.lean"], &[]).shards[0],
+        );
+        assert_ne!(heavy_key, &plain_key);
+
+        // A source edit in a reconfigured file still re-verifies every shard, not just edited ones.
+        fs::write(
+            canon_dir.join("Heavy/B.lean"),
+            "theorem t_b : 2 + 2 = 4 := by\n  rfl\ntheorem t_c : 3 = 3 := rfl\n",
+        )?;
+        let (cls, to_verify, _, _) = load_and_classify_pr_from_git(&store, &canon_dir, "HEAD", tc)?;
+        assert_eq!(cls.altered_interface_files, vec!["Heavy/B.lean"]);
+        assert_eq!(to_verify["Heavy/B.lean"].len(), 2);
+        assert!(!cls
+            .unchanged_theorems
+            .iter()
+            .any(|t| t.starts_with("Heavy/")));
+
+        // An unparsable working-tree lakefile (trusted mode) cannot be compared: re-verify all.
+        fs::write(
+            canon_dir.join("lakefile.toml"),
+            "name = \"demo\"\nmoreLeanArgs = [\"--plugin=evil.so\"]\n",
+        )?;
+        let (cls, _, _, _) = load_and_classify_pr_from_git(&store, &canon_dir, "HEAD", tc)?;
+        assert_eq!(cls.modified_files, vec!["Fast/A.lean", "Heavy/B.lean"]);
+        fs::write(
+            canon_dir.join("Heavy/B.lean"),
+            "theorem t_b : 2 + 2 = 4 := by\n  rfl\n",
+        )?;
+
+        // An unparsable base lakefile fails closed: every file is re-verified.
+        fs::write(
+            canon_dir.join("lakefile.toml"),
+            "name = \"demo\"\nmoreLeanArgs = [\"--plugin=evil.so\"]\n",
+        )?;
+        git_init_and_commit(&repo_dir, "unparsable base")?;
+        fs::write(canon_dir.join("lakefile.toml"), lakefile(""))?;
+        let (cls, to_verify, _, _) = load_and_classify_pr_from_git(&store, &canon_dir, "HEAD", tc)?;
+        assert_eq!(cls.modified_files, vec!["Fast/A.lean", "Heavy/B.lean"]);
+        assert_eq!(to_verify.len(), 2);
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[test]
     fn test_constant_length_mid_suffix_mutation_detected() -> Result<()> {
         let tmp_dir = std::env::temp_dir().join(format!(
             "turbo_lean_mid_suffix_mutant_test_{}",
@@ -4447,6 +6312,7 @@ mod pr_verify_tests {
             "leanprover/lean4:v4.35.0",
             None,
             Vec::new(),
+            &[],
         );
         let suffix_len = base_entry.src_len - base_entry.prefix_byte_len;
         assert!(

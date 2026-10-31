@@ -97,8 +97,15 @@ def lowerImpureLetValue (lv : Lean.Compiler.LCNF.LetValue .impure) (retTy : LNIR
   | .lit litVal => lowerLitValueM litVal retTy true
   | .erased => return .scalar (.constU64 0)
   | .fvar fvarId args => lowerFVarCall fvarId args retTy
-  | .ctor ctorInfo args _ | .reuse _ ctorInfo _ args _ =>
+  | .ctor ctorInfo args _ =>
     lowerTupleOrEnumCtor ctorInfo.name ctorInfo.cidx args retTy
+  | .reuse slotFVar ctorInfo _ args _ =>
+    let slotVid ← internFVar slotFVar
+    let slotTy ← getVarType slotVid
+    if isUnboxedScalarOrTuple slotTy then
+      lowerTupleOrEnumCtor ctorInfo.name ctorInfo.cidx args retTy
+    else
+      Lean.throwError "[lean-native] Unsupported legacy heap reuse instruction in Stage 1B"
   | .oproj idx fvarId _ => lowerTupleProj fvarId idx retTy true
   | .uproj idx fvarId _ => lowerTupleProj fvarId idx .usize false
   | .sproj offset _ fvarId _ => lowerTupleProj fvarId offset retTy false
@@ -109,8 +116,22 @@ def lowerImpureLetValue (lv : Lean.Compiler.LCNF.LetValue .impure) (retTy : LNIR
     let vt ← getVarType v
     if isUnboxedScalarOrTuple vt || vt == .objPtr || vt == .taggedPtr then return .scalar (.var v)
     else Lean.throwError s!"[lean-native] Unsupported boxing/unboxing of `{reprStr vt}` in Stage 1B"
-  | .isShared _ _ => Lean.throwError "[lean-native] internal bridge error: unintercepted isShared"
-  | .reset .. => Lean.throwError "[lean-native] Unsupported heap reset instruction in Stage 1B"
+  | .isShared fvarId _ =>
+    let v ← internFVar fvarId
+    let vt ← getVarType v
+    if isUnboxedScalarOrTuple vt then
+      return .scalar (.constBool true)
+    else if (← get).allowStage1DHeap && (vt == .objPtr || vt == .taggedPtr) then
+      return .isExclusive v
+    else
+      Lean.throwError "[lean-native] internal bridge error: unintercepted isShared"
+  | .reset _ fvarId _ =>
+    let v ← internFVar fvarId
+    let vt ← getVarType v
+    if isUnboxedScalarOrTuple vt then
+      return .scalar (.var v)
+    else
+      Lean.throwError "[lean-native] Unsupported heap reset instruction in Stage 1B"
 
 def lowerTagBranch (condVar : VarId) (cidx : Nat) (isBool : Bool) (yes no : LNIRCode) : BridgeM LNIRCode := do
   let condTy ← getVarType condVar
@@ -147,20 +168,35 @@ partial def lowerImpureCode (code : Lean.Compiler.LCNF.Code .impure) : BridgeM L
     let rhs ← lowerImpureLetValue decl.value rawDeclTy
     let isBox := match decl.value with | .box _ _ _ => true | _ => false
     let ty ← inferImpureRhsType rhs rawDeclTy isBox
-    return .letBind (← internFVar decl.fvarId ty true) ty rhs (← lowerImpureCode k)
+    let dst ← internFVar decl.fvarId ty true
+    match rhs with
+    | .isExclusive _ =>
+      let exclVar ← freshBridgeVar .i1
+      let kCode ← lowerImpureCode k
+      return .letBind exclVar .i1 rhs (.letBind dst .i1 (.scalar (.unaryOp .not (.var exclVar))) kCode)
+    | _ =>
+      return .letBind dst ty rhs (← lowerImpureCode k)
   | .jp decl k => lowerJoinPoint decl k lowerImpureCode
   | .jmp fvarId args => lowerJmpInstr fvarId args
   | .inc fvarId n _ _ k _ => lowerRefOp true fvarId n (← lowerImpureCode k)
   | .dec fvarId n _ _ _ k _ => lowerRefOp false fvarId n (← lowerImpureCode k)
   | .del fvarId k _ => lowerRefOp false fvarId 1 (← lowerImpureCode k)
   | .setTag _ _ _ _ => Lean.throwError "[lean-native] unsupported constructor tag mutation"
-  | .oset .. | .uset .. | .sset .. => Lean.throwError "[lean-native] Unsupported heap field mutation in Stage 1B"
+  | .oset fvarId idx y k _ => lowerOsetInstr fvarId idx y k lowerImpureCode
+  | .uset .. | .sset .. => Lean.throwError "[lean-native] Unsupported heap field mutation in Stage 1B"
   | .cases c =>
     let condVar ← internFVar c.discr
     let condTy ← getVarType condVar
-    if !isSupportedStage1BScalarType condTy (← get).arch then
+    let st ← get
+    if st.allowStage1DHeap && c.typeName != ``Bool && (condTy == .objPtr || condTy == .taggedPtr) then
+      let tagVar ← freshBridgeVar .i64
+      let altsCode ← lowerImpureAlts tagVar false 0 (orderAlts c.alts.toList)
+      return .letBind tagVar .i64 (.call "lean_native_ctor_tag" [condVar] .i64 false) altsCode
+    else if !isSupportedStage1BScalarType condTy st.arch &&
+        !(c.typeName == ``Bool && st.inJoinPointBody && (condTy == .objPtr || condTy == .taggedPtr)) then
       Lean.throwError s!"[lean-native] Unsupported cases scrutinee type `{c.typeName}`"
-    lowerImpureAlts condVar (c.typeName == ``Bool) 0 (orderAlts c.alts.toList)
+    else
+      lowerImpureAlts condVar (c.typeName == ``Bool) 0 (orderAlts c.alts.toList)
   | .return fvarId =>
     if (← get).localFunMap.contains fvarId then
       Lean.throwError "[lean-native] Unsupported returning local closure"
@@ -245,16 +281,27 @@ def ingestLCNFDeclGeneric {pu} (decl : Lean.Compiler.LCNF.Decl pu)
     Lean.throwError s!"[lean-native] Unsupported `@[extern]` declaration `{decl.name}` in Stage 1B"
   let isExported := (Lean.getExportNameFor? env decl.name).isSome
   checkEnvConstSignatureM env decl.name arch isExported
+  let isStage1DHeap := allowInternalObj && !isExported && declQualifiesForStage1DHeap env decl.name arch
   let initSt : BridgeState := {
     mangledSymbol := metaInfo.mangledSymbol, isSimpleGround := metaInfo.isSimpleGround,
-    selfDeclName := decl.name, localDeclNames := localDeclNames, arch := arch }
+    selfDeclName := decl.name, localDeclNames := localDeclNames, arch := arch,
+    allowStage1DHeap := isStage1DHeap }
   let action : BridgeM LNIRDecl := do
+    let envParamTys := collectEnvExplicitParamTypes env decl.name
     let mut lnirParams : List LNIRParam := []
+    let mut pIdx : Nat := 0
     for p in decl.params do
-      let pTy ← lowerBridgeType p.type
+      let rawPTy ← lowerBridgeType p.type
+      let pTy :=
+        if !isStage1DHeap && (rawPTy == .objPtr || rawPTy == .taggedPtr) then
+          match envParamTys[pIdx]? with
+          | some (.tuple fs) => .tuple fs
+          | _ => rawPTy
+        else rawPTy
       checkBridgeType s!"parameter `{p.binderName}` of `{decl.name}`" p.type pTy allowInternalObj
       let vid ← internFVar p.fvarId pTy true
       lnirParams := lnirParams ++ [{ id := vid, name := p.binderName.toString, ty := pTy, borrow := p.borrow }]
+      pIdx := pIdx + 1
     let retTy ← lowerBridgeType decl.type
     checkBridgeType s!"return type of `{decl.name}`" decl.type retTy allowInternalObj
     match decl.value with
@@ -286,30 +333,8 @@ def ingestLCNFMonoDecl (decl : Lean.Compiler.LCNF.Decl .pure)
   ingestLCNFDeclGeneric decl lowerPureCode localDeclNames arch false
 
 def ingestModuleDecls (declNames : Array Lean.Name) (moduleName : String := "LeanNative.Ingested")
-    (arch : TargetArch := .x86_64) : Lean.CoreM LNIRModule := do
-  let env ← getEnv
-  let mut callGraph : Std.HashMap Lean.Name (List Lean.Name) := {}
-  let mut decls : List LNIRDecl := []
-  let mut rawPairs : List (Lean.Name × String) := []
-  for name in declNames do
-    if let some impureDecl ← Lean.Compiler.LCNF.getLocalImpureDecl? name then
-      if let .code c := impureDecl.value then
-        callGraph := callGraph.insert name (collectCodeLocalCallees declNames c)
-      let d ← ingestLCNFImpureDecl impureDecl declNames arch
-      decls := decls ++ [d]
-      rawPairs := rawPairs ++ [(name, d.name)]
-    else if let some monoDecl ← Lean.Compiler.LCNF.getMonoDecl? name then
-      if let .code c := monoDecl.value then
-        callGraph := callGraph.insert name (collectCodeLocalCallees declNames c)
-      let d ← ingestLCNFMonoDecl monoDecl declNames arch
-      decls := decls ++ [d]
-      rawPairs := rawPairs ++ [(name, d.name)]
-  if declsHaveMutualCycle callGraph then
-    Lean.throwError s!"[lean-native] unsupported self-tail recursion / mutual recursion in {moduleName}: no qualified loop lowering"
-  let rawMod : LNIRModule := { moduleName := moduleName, decls := decls }
-  validateIngestedModule rawMod
-  let inlined := normalizeAndInlineLocalDefs rawMod
-  filterNonInternalHelperDecls env rawPairs arch inlined
+    (arch : TargetArch := .x86_64) : Lean.CoreM LNIRModule :=
+  ingestModuleDeclsWith (fun d ns a => ingestLCNFImpureDecl d ns a) (fun d ns a => ingestLCNFMonoDecl d ns a) declNames moduleName arch
 
 def ingestAllLocalDecls (moduleName : String := "LeanNative.Ingested")
     (arch : TargetArch := .x86_64) : Lean.CoreM LNIRModule := do

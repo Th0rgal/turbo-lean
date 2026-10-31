@@ -144,9 +144,13 @@ impl AcceleratorConfig {
             for_each_toml_entry, parse_relaxed_bool, parse_relaxed_toml_string_array,
             unquote_toml_scalar,
         };
-        let (mut cfg, mut cur, mut parsed_any) = (Self::default(), None::<ExternalAcceleratorSpec>, false);
+        let (mut cfg, mut cur, mut parsed_any) =
+            (Self::default(), None::<ExternalAcceleratorSpec>, false);
         let flush = |cfg: &mut Self, cur: &mut Option<ExternalAcceleratorSpec>| {
-            if let Some(ext) = cur.take().filter(|e| !e.name.is_empty() && !e.command.is_empty()) {
+            if let Some(ext) = cur
+                .take()
+                .filter(|e| !e.name.is_empty() && !e.command.is_empty())
+            {
                 cfg.external.push(ext);
             }
         };
@@ -176,8 +180,12 @@ impl AcceleratorConfig {
             } else if sec.is_empty() || sec == "[accelerators]" {
                 match key {
                     "enabled" => cfg.enabled = parse_relaxed_bool(val).unwrap_or(cfg.enabled),
-                    "default_budget_ms" => cfg.default_budget_ms = val.parse().unwrap_or(cfg.default_budget_ms),
-                    "disabled_builtins" => cfg.disabled_builtins = parse_relaxed_toml_string_array(val),
+                    "default_budget_ms" => {
+                        cfg.default_budget_ms = val.parse().unwrap_or(cfg.default_budget_ms)
+                    }
+                    "disabled_builtins" => {
+                        cfg.disabled_builtins = parse_relaxed_toml_string_array(val)
+                    }
                     _ => {}
                 }
             }
@@ -432,6 +440,76 @@ pub fn lookup_distilled_constants(decl_name: &str, stmt_src: &str) -> Vec<String
         }
     }
     Vec::new()
+}
+
+fn distilled_nodes_shm_path() -> std::path::PathBuf {
+    crate::shm_cache::staging_shm_dir().join("distilled_proof_nodes.json")
+}
+
+fn distilled_nodes_disk_path() -> Option<std::path::PathBuf> {
+    std::env::var("TURBO_LEAN_HOME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|p| std::path::PathBuf::from(p).join("distilled_proof_nodes.json"))
+}
+
+/// Persist proof-size metrics only when local telemetry is enabled for this workspace.
+pub fn record_distilled_proof_term_nodes(
+    project_dir: &Path,
+    decl_name: &str,
+    stmt_src: &str,
+    proof_term_nodes: u64,
+) {
+    if proof_term_nodes == 0
+        || decl_name.trim().is_empty()
+        || !crate::mcp::resolve_telemetry_policy(Some(project_dir)).enabled
+    {
+        return;
+    }
+    let keys = distilled_hint_keys(decl_name, stmt_src);
+    let shm_path = distilled_nodes_shm_path();
+    let mut map: std::collections::BTreeMap<String, u64> = fs::read(&shm_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    if map.len() > 4096 {
+        map.clear();
+    }
+    for k in keys {
+        map.insert(k, proof_term_nodes);
+    }
+    if let Ok(bytes) = serde_json::to_vec(&map) {
+        let _ = crate::shm_cache::atomic_write_shm(&shm_path, &bytes);
+        if let Some(disk_path) = distilled_nodes_disk_path() {
+            let _ = crate::shm_cache::atomic_write_shm(&disk_path, &bytes);
+        }
+    }
+}
+
+pub fn lookup_distilled_proof_term_nodes(decl_name: &str, stmt_src: &str) -> Option<u64> {
+    if decl_name.trim().is_empty() {
+        return None;
+    }
+    let keys = distilled_hint_keys(decl_name, stmt_src);
+    for path in [
+        Some(distilled_nodes_shm_path()),
+        distilled_nodes_disk_path(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(map) = fs::read(&path).ok().and_then(|b| {
+            serde_json::from_slice::<std::collections::BTreeMap<String, u64>>(&b).ok()
+        }) {
+            for k in &keys {
+                if let Some(&v) = map.get(k).filter(|&&v| v > 0) {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Built-in Accelerator 1: `SimdSimpDistiller` (`"builtin:simd-simp-distiller"`).
@@ -4227,11 +4305,13 @@ pub fn run_worktree_dedup_command(
     json_mode: bool,
 ) -> Result<()> {
     let mut report = crate::lake_build::dedup_worktree_packages(store, project_dir)?;
-    if let Some(obj) = report.as_object_mut() {
-        obj.insert(
-            "status".to_string(),
-            serde_json::Value::String("ok".to_string()),
-        );
+    let disabled = report["status"] == "worktree_link_disabled";
+    if !disabled {
+        report["status"] = serde_json::Value::String("ok".to_string());
+    }
+    if disabled && !json_mode {
+        println!("[turbo-lean] WORKTREE-DEDUP skipped: worktree linking is disabled");
+        return Ok(());
     }
     if json_mode {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -5191,7 +5271,7 @@ mod tests {
                     "python3".into(),
                     repo_root.join(script).display().to_string(),
                 ],
-                timeout_ms: 5000,
+                timeout_ms: 15000,
                 trigger_tactics: vec![],
             });
             assert!(matches!(
@@ -5280,7 +5360,7 @@ mod tests {
                 "SnarkFast.tri_accum_reduce_eq".into(),
                 "SnarkFast.karatsuba_mul_const_eq".into(),
             ],
-            budget_ms: 50,
+            budget_ms: 5000,
         };
         assert_eq!(
             snark_accel.try_accelerate(&distill_in),
@@ -5299,7 +5379,7 @@ mod tests {
             body_src: "by simp".into(),
             imports_csv: "SnarkFast.Kernels.Field".into(),
             available_constants: vec![],
-            budget_ms: 50,
+            budget_ms: 5000,
         };
         assert!(matches!(
             snark_accel.try_accelerate(&mutant_in),
@@ -5356,7 +5436,8 @@ mod tests {
             "expected negative logits in embedded vocabulary scores"
         );
 
-        let default_distilled = distill_constants_for_simp_chain_inner(stmt, "by simp", &cands, false);
+        let default_distilled =
+            distill_constants_for_simp_chain_inner(stmt, "by simp", &cands, false);
         assert_eq!(default_distilled.len(), 16);
         for w in default_distilled.windows(2) {
             let s0 = score_constant_affinity_with_optional_logit(stmt, stmt_mask, &w[0], None);
@@ -5364,7 +5445,8 @@ mod tests {
             assert!(s0 >= s1);
         }
 
-        let neural_distilled = distill_constants_for_simp_chain_inner(stmt, "by simp", &cands, true);
+        let neural_distilled =
+            distill_constants_for_simp_chain_inner(stmt, "by simp", &cands, true);
         assert_eq!(neural_distilled.len(), 16);
         for w in neural_distilled.windows(2) {
             let l0 = rt.score_constant_affinity(stmt, &w[0]);

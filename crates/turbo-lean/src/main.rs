@@ -16,12 +16,12 @@
 pub mod accel_fastcheck;
 pub mod accelerators;
 pub mod cas;
-pub mod matryoshka;
 mod check;
 pub mod cluster;
 mod db;
 mod gpu_fastcheck;
 mod lake_build;
+pub mod matryoshka;
 pub mod mcp;
 pub mod module_builder;
 mod pack;
@@ -31,6 +31,8 @@ pub mod remote_prebuild;
 pub mod server;
 pub mod shm_cache;
 mod splitter;
+#[cfg(all(test, unix))]
+mod worktree_test_support;
 pub mod verify;
 pub mod zygote;
 
@@ -50,7 +52,7 @@ use std::path::PathBuf;
     version,
     about = "High-performance, distributed build, verification, and counterexample tooling for Lean 4"
 )]
-struct Cli {
+pub(crate) struct Cli {
     /// Optional custom CAS & SQLite directory (defaults to $TURBO_LEAN_HOME or ~/.cache/turbo-lean)
     #[arg(long, global = true)]
     cache_dir: Option<PathBuf>,
@@ -70,6 +72,10 @@ struct Cli {
     /// Telemetry mode (`on`/`metrics` [default: local metrics, remote off unless opted in], `full`/`opt-in` [remote opt-in], `local` [local spool only], `off`)
     #[arg(long, global = true, value_name = "MODE")]
     telemetry: Option<String>,
+
+    /// Preserve `.lake` inodes and permissions: disable automatic linking/copying and worktree-dedup
+    #[arg(long, global = true, default_value_t = false)]
+    no_auto_worktree_link: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -241,6 +247,9 @@ enum Commands {
         /// Verification mode: 'trusted' or 'untrusted'
         #[arg(long, default_value = "trusted")]
         mode: String,
+        /// Trusted git revision supplying allowlists (without --base, use restrictive defaults)
+        #[arg(long)]
+        base: Option<String>,
         /// Project root directory
         #[arg(long, default_value = ".")]
         project_dir: PathBuf,
@@ -361,6 +370,9 @@ enum Commands {
         /// Additional forbidden declaration kind(s) (e.g. `inductive`, `structure`, `def`)
         #[arg(long = "forbid-decl-kinds", value_delimiter = ',')]
         forbid_decl_kinds: Vec<String>,
+        /// Fail (`ok: false`, non-zero exit) when zero theorem/lemma specifications are recognized
+        #[arg(long)]
+        require_nonempty: bool,
     },
     /// Deterministic fast evaluation of a Lean file (preserving all info/warning/error messages and stdout, drop-in for `lean <file.lean>`)
     Eval {
@@ -454,11 +466,17 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run(cli: Cli) -> Result<()> {
-
+pub(crate) fn apply_global_cli_env(cli: &Cli) {
     if let Some(mb) = cli.max_memory_mb {
         std::env::set_var("TURBO_LEAN_MAX_MEMORY_MB", mb.to_string());
     }
+    if cli.no_auto_worktree_link {
+        std::env::set_var("TURBO_LEAN_NO_WORKTREE_LINK", "1");
+    }
+}
+
+fn run(cli: Cli) -> Result<()> {
+    apply_global_cli_env(&cli);
     let (tel_dir, trust_proj_toml) = match &cli.command {
         Commands::PrVerify {
             mode, project_dir, ..
@@ -485,6 +503,7 @@ fn run(cli: Cli) -> Result<()> {
         std::env::set_var("TURBO_LEAN_TRUST_PROJECT_TELEMETRY", "0");
     }
     let is_telemetry_cmd = matches!(cli.command, Commands::Telemetry { .. });
+    // MCP resolves consent per request; do not promote startup project policy into env.
     if cli.no_telemetry {
         std::env::set_var("TURBO_LEAN_TELEMETRY", "off");
         std::env::set_var("LEAN_NATIVE_TELEMETRY", "off");
@@ -497,7 +516,10 @@ fn run(cli: Cli) -> Result<()> {
         ) {
             std::env::set_var("LEAN_NATIVE_TELEMETRY", "off");
         }
-    } else if !is_telemetry_cmd && std::env::var("TURBO_LEAN_TELEMETRY").is_err() {
+    } else if !is_telemetry_cmd
+        && !matches!(cli.command, Commands::Mcp { .. })
+        && std::env::var("TURBO_LEAN_TELEMETRY").is_err()
+    {
         let pol = mcp::resolve_telemetry_policy_with_trust(tel_dir, trust_proj_toml);
         if !pol.enabled {
             std::env::set_var("TURBO_LEAN_TELEMETRY", "off");
@@ -524,9 +546,9 @@ fn run(cli: Cli) -> Result<()> {
         return mcp::run_telemetry_command(action, project_dir.as_deref(), cli.json);
     }
 
-    // Project settings from `turbo-lean.toml` (at `--base` for pr-verify; never from an
-    // untrusted ci-verify checkout), unless set explicitly in the environment, which zygote
-    // workers and daemons inherit from this process: the axiom allowlist, and the per-theorem
+    // Project settings from `turbo-lean.toml` (at `--base` for PR/CI verification),
+    // unless set explicitly in the environment inherited by workers and daemons:
+    // the axiom allowlist and the per-theorem
     // zygote timeout (`check --timeout` wins over `[zygote] timeout_secs`).
     let here = std::path::Path::new(".");
     let (dir, rev) = match &cli.command {
@@ -534,14 +556,13 @@ fn run(cli: Cli) -> Result<()> {
             project_dir, base, ..
         } => (Some(project_dir.as_path()), Some(base.as_str())),
         Commands::CiVerify {
-            project_dir, mode, ..
-        } => {
-            if mode == "untrusted" {
-                (None, None)
-            } else {
-                (Some(project_dir.as_path()), None)
-            }
-        }
+            project_dir,
+            base,
+            ..
+        } => match base {
+            Some(base) => (Some(project_dir.as_path()), Some(base.as_str())),
+            None => (None, None),
+        },
         Commands::Check { project_dir, .. }
         | Commands::Build { project_dir, .. }
         | Commands::SeedShards { project_dir, .. } => (Some(project_dir.as_path()), None),
@@ -557,20 +578,42 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Mcp { project_dir } => (Some(project_dir.as_deref().unwrap_or(here)), None),
         _ => (None, None),
     };
+    if matches!(&cli.command, Commands::CiVerify { base: None, .. }) {
+        // Neither checkout policy nor inherited allowlists can authorize CI
+        // without a trusted revision, in either execution mode.
+        for key in [
+            splitter::ALLOWED_AXIOMS_ENV,
+            splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV,
+            "TURBO_LEAN_ALLOWED_CSIMP",
+            "TURBO_LEAN_ALLOWED_CSIMP_FROM_CONFIG",
+        ] {
+            std::env::remove_var(key);
+        }
+        eprintln!("[turbo-lean] ci-verify without --base: using restrictive default policy (no project allowlists)");
+    }
     let from_cfg_env =
         std::env::var(splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV).as_deref() == Ok("1");
-    if from_cfg_env
-        && matches!(
-            &cli.command,
-            Commands::CiVerify { mode, .. } if mode == "untrusted"
-        )
-    {
-        std::env::remove_var(splitter::ALLOWED_AXIOMS_ENV);
-        std::env::remove_var(splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV);
+    let csimp_from_config =
+        std::env::var("TURBO_LEAN_ALLOWED_CSIMP_FROM_CONFIG").as_deref() == Ok("1");
+    if csimp_from_config && dir.is_none() {
+        std::env::remove_var("TURBO_LEAN_ALLOWED_CSIMP");
+        std::env::remove_var("TURBO_LEAN_ALLOWED_CSIMP_FROM_CONFIG");
     }
     if let Some(dir) = dir {
         let config = splitter::read_project_config(dir, rev).unwrap_or_default();
-        if std::env::var_os(splitter::ALLOWED_AXIOMS_ENV).is_none() || from_cfg_env {
+        if rev.is_some()
+            || std::env::var_os("TURBO_LEAN_ALLOWED_CSIMP").is_none()
+            || csimp_from_config
+        {
+            let allow = accelerators::toml_string_array(&config, "csimp", "allow");
+            std::env::set_var(
+                "TURBO_LEAN_ALLOWED_CSIMP",
+                allow.unwrap_or_default().join(","),
+            );
+            std::env::set_var("TURBO_LEAN_ALLOWED_CSIMP_FROM_CONFIG", "1");
+        }
+        if rev.is_some() || std::env::var_os(splitter::ALLOWED_AXIOMS_ENV).is_none() || from_cfg_env
+        {
             let allow = accelerators::toml_string_array(&config, "axioms", "allow");
             std::env::set_var(
                 splitter::ALLOWED_AXIOMS_ENV,
@@ -608,6 +651,7 @@ fn run(cli: Cli) -> Result<()> {
         ref config,
         ref forbid_namespaces,
         ref forbid_decl_kinds,
+        require_nonempty,
     } = cli.command
     {
         return gpu_fastcheck::run_audit_spec_command_with_options(
@@ -618,6 +662,7 @@ fn run(cli: Cli) -> Result<()> {
             config.as_deref(),
             forbid_namespaces,
             forbid_decl_kinds,
+            require_nonempty,
         );
     }
     if let Commands::RemotePrebuild {
@@ -1332,6 +1377,7 @@ fn run(cli: Cli) -> Result<()> {
             signing_key,
             seed_shards,
             scope,
+            ..
         } => pr_verify::run_ci_verify_command(
             &mut store,
             cli.json,
@@ -1421,6 +1467,7 @@ fn run(cli: Cli) -> Result<()> {
             config,
             forbid_namespaces,
             forbid_decl_kinds,
+            require_nonempty,
         } => gpu_fastcheck::run_audit_spec_command_with_options(
             &files,
             decl.as_deref(),
@@ -1429,6 +1476,7 @@ fn run(cli: Cli) -> Result<()> {
             config.as_deref(),
             &forbid_namespaces,
             &forbid_decl_kinds,
+            require_nonempty,
         ),
 
         Commands::Eval {
@@ -1504,9 +1552,16 @@ fn run(cli: Cli) -> Result<()> {
                         || t.starts_with("meta import ")
                 });
 
+            let file_lean_args =
+                module_builder::try_resolve_lean_args_for_path(&proj_dir, Some(&file));
+            let filtered_file_lean_args = module_builder::filter_allowed_lean_args(&file_lean_args);
+
             let run_direct_lean = || -> Result<()> {
                 use std::io::Write;
                 let mut cmd = std::process::Command::new(&lean_bin);
+                for arg in &filtered_file_lean_args {
+                    cmd.arg(arg);
+                }
                 cmd.arg(&file).envs(&env_vars);
                 if !req_lp.is_empty() {
                     cmd.env("LEAN_PATH", &req_lp);
@@ -1535,7 +1590,7 @@ fn run(cli: Cli) -> Result<()> {
             }
 
             let file_display = file.to_string_lossy().to_string();
-            let reply = if let Some(daemon_rep) = zygote::try_local_zygote_eval(
+            let reply = if let Some(daemon_rep) = zygote::try_local_zygote_eval_with_args(
                 &store,
                 &env_vars,
                 &lean_bin,
@@ -1544,10 +1599,11 @@ fn run(cli: Cli) -> Result<()> {
                 &source,
                 Some(&file_display),
                 timeout_ms,
+                &filtered_file_lean_args,
             ) {
                 daemon_rep
             } else {
-                zygote::eval_with_zygote_pool_opts(
+                zygote::eval_with_zygote_pool_opts_with_args(
                     &store,
                     &toolchain,
                     &req_lp,
@@ -1562,6 +1618,7 @@ fn run(cli: Cli) -> Result<()> {
                     } else {
                         None
                     },
+                    &filtered_file_lean_args,
                 )?
             };
 
@@ -1604,6 +1661,9 @@ fn run(cli: Cli) -> Result<()> {
                 || std::env::var("TURBO_LEAN_VERIFY_DETERMINISM").as_deref() == Ok("1");
             if check_det {
                 let mut cmd = std::process::Command::new(&lean_bin);
+                for arg in &filtered_file_lean_args {
+                    cmd.arg(arg);
+                }
                 cmd.arg(&file).envs(&env_vars);
                 if !req_lp.is_empty() {
                     cmd.env("LEAN_PATH", &req_lp);

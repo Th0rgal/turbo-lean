@@ -13,6 +13,8 @@ pub struct TheoremShard {
     pub prefix_env_hash: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cone_env_hash: String,
+    /// Source signature fingerprint for shard/cache identity. Semantic PR statement
+    /// pinning uses built ConstantInfo + IF-closure digests in pr_verify.rs instead.
     pub stmt_hash: String,
     pub proof_hash: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -755,7 +757,7 @@ fn strip_leading_set_option_in(s: &str) -> Option<&str> {
 /// Strip leading attributes (`@[...]`), `set_option ... in`, and declaration modifiers (`private`,
 /// `protected`, `noncomputable`, `scoped`, `local`, `unsafe`, `partial`, `nonrec`, `public`, `meta`)
 /// across whitespace and newlines.
-fn strip_decl_prefixes(cmd_text: &str) -> &str {
+pub(crate) fn strip_decl_prefixes(cmd_text: &str) -> &str {
     const MODS: &[&str] = &[
         "private",
         "protected",
@@ -827,7 +829,7 @@ fn is_end_line_start(trimmed_clean: &str) -> bool {
     trimmed_clean == "end" || trimmed_clean.starts_with("end ")
 }
 
-fn is_section_header_line(trimmed_clean: &str) -> bool {
+pub(crate) fn is_section_header_line(trimmed_clean: &str) -> bool {
     let mut after = trimmed_clean;
     while let Some(next) = strip_leading_attr_block(after) {
         after = next.trim_start();

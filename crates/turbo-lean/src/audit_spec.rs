@@ -98,9 +98,11 @@ fn skip_lean_lexeme(src: &str, start: usize) -> Option<LeanLexicalSpan> {
                 }
             }
         }
-        b'r' if !src[..start].chars().next_back().is_some_and(|c| {
-            c.is_alphanumeric() || c == '_' || c == '\''
-        }) => {
+        b'r' if !src[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '\'') =>
+        {
             i += 1;
             while bytes.get(i) == Some(&b'#') {
                 i += 1;
@@ -147,8 +149,10 @@ fn strip_audit_comments(src: &str) -> String {
     String::from_utf8(out).expect("masking comments preserves UTF-8")
 }
 
-
-pub(super) fn extract_all_lean_theorems(clean_src: &str, target_name: Option<&str>) -> Vec<ExtractedDecl> {
+pub(super) fn extract_all_lean_theorems(
+    clean_src: &str,
+    target_name: Option<&str>,
+) -> Vec<ExtractedDecl> {
     let clean_src = strip_audit_comments(clean_src);
     let chars: Vec<char> = clean_src.chars().collect();
     let byte_offsets: Vec<usize> = clean_src.char_indices().map(|(offset, _)| offset).collect();
@@ -333,7 +337,6 @@ pub(super) fn extract_all_lean_theorems(clean_src: &str, target_name: Option<&st
     }
     out
 }
-
 
 pub(super) fn split_at_first_top_level_assign(s: &str) -> Option<(&str, &str)> {
     // Case 2: multi-character ASCII Unicode-aware scan (needed when non-ASCII operators like `×`, `→`, `≈`, `≤` appear before `:=`)
@@ -1210,9 +1213,15 @@ impl AuditSpecPolicyConfig {
             }
             if let Some(ref mut rule) = current_rule {
                 match key {
-                    "forbid_decl_kinds" => rule.forbid_decl_kinds = parse_relaxed_toml_string_array(val),
-                    "allow_decl_names" => rule.allow_decl_names = parse_relaxed_toml_string_array(val),
-                    "forbid_namespaces" => rule.forbid_namespaces = parse_relaxed_toml_string_array(val),
+                    "forbid_decl_kinds" => {
+                        rule.forbid_decl_kinds = parse_relaxed_toml_string_array(val)
+                    }
+                    "allow_decl_names" => {
+                        rule.allow_decl_names = parse_relaxed_toml_string_array(val)
+                    }
+                    "forbid_namespaces" => {
+                        rule.forbid_namespaces = parse_relaxed_toml_string_array(val)
+                    }
                     _ => {}
                 }
             } else if in_audit_spec {
@@ -1227,7 +1236,11 @@ impl AuditSpecPolicyConfig {
                         cfg.reject_unused_param_defs = preset.reject_unused_param_defs;
                         cfg.reject_size_only_parsers = preset.reject_size_only_parsers;
                         for pr in preset.path_rules {
-                            if !cfg.path_rules.iter().any(|r| r.glob_pattern == pr.glob_pattern) {
+                            if !cfg
+                                .path_rules
+                                .iter()
+                                .any(|r| r.glob_pattern == pr.glob_pattern)
+                            {
                                 cfg.path_rules.push(pr);
                             }
                         }
@@ -1252,8 +1265,12 @@ impl AuditSpecPolicyConfig {
                         cfg.reject_size_only_parsers =
                             parse_relaxed_bool(val).unwrap_or(cfg.reject_size_only_parsers);
                     }
-                    "forbid_decl_kinds" => cfg.forbid_decl_kinds = parse_relaxed_toml_string_array(val),
-                    "forbid_namespaces" => cfg.forbid_namespaces = parse_relaxed_toml_string_array(val),
+                    "forbid_decl_kinds" => {
+                        cfg.forbid_decl_kinds = parse_relaxed_toml_string_array(val)
+                    }
+                    "forbid_namespaces" => {
+                        cfg.forbid_namespaces = parse_relaxed_toml_string_array(val)
+                    }
                     _ => {}
                 }
             }
@@ -1952,7 +1969,7 @@ pub(super) fn extract_decls_fast(src: &str, decl_filter: Option<&str>) -> Vec<Ex
 }
 
 /// Schema version for the Blake3 content-addressed `audit-spec` per-file JSON cache.
-pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 11;
+pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 12;
 
 static AUDIT_SPEC_CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
@@ -2096,8 +2113,9 @@ pub fn audit_spec_file_or_source_with_policy(
                 let mut local_defs = extract_local_def_unfoldings(&strip_audit_comments(&file_src));
                 for p in collect_external_local_def_lean_paths(file) {
                     if let Ok(sib_src) = fs::read_to_string(&p) {
-                        local_defs
-                            .extend(extract_local_def_unfoldings(&strip_audit_comments(&sib_src)));
+                        local_defs.extend(extract_local_def_unfoldings(&strip_audit_comments(
+                            &sib_src,
+                        )));
                     }
                 }
                 if let Some(cache_dir) = resolve_audit_spec_cache_dir() {
@@ -2255,7 +2273,9 @@ pub fn audit_spec_file_or_source_with_policy(
             if inline_src.is_none() && src_path.is_file() {
                 for p in collect_external_local_def_lean_paths(src_path) {
                     if let Ok(sib_src) = fs::read_to_string(&p) {
-                        defs.extend(extract_local_def_unfoldings(&strip_audit_comments(&sib_src)));
+                        defs.extend(extract_local_def_unfoldings(&strip_audit_comments(
+                            &sib_src,
+                        )));
                     }
                 }
             }
@@ -2310,16 +2330,27 @@ pub fn audit_spec_file_or_source_with_policy(
             .iter()
             .map(|dh| format!("droppable_hypothesis: {}", dh)),
     );
+    if total_specs_audited == 0 {
+        warnings.push(format!(
+            "no_specs_found: 0 theorem/lemma specifications recognized in {}",
+            file.display()
+        ));
+    }
     let tier1_clean = vacuous_specs == 0
         && trivial_specs == 0
         && shadowed_constants.is_empty()
         && forbidden_scope_decls.is_empty()
         && stub_defs.is_empty();
+    let verdict = if total_specs_audited == 0 {
+        "no_specs_found"
+    } else {
+        "specs_audited"
+    };
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
     let report = serde_json::json!({
         "status": "ok",
         "ok": tier1_clean,
-        "verdict": "specs_audited",
+        "verdict": verdict,
         "policy": policy.policy,
         "file": file.display().to_string(),
         "decl": decl_filter.unwrap_or("file"),
@@ -2481,11 +2512,24 @@ pub fn audit_spec_files_with_policy(
         && forbidden_scope_decls.is_empty()
         && stub_defs.is_empty();
     let all_cache_hit = !per_file_reports.is_empty() && cache_hits == per_file_reports.len();
+    let batch_verdict = if any_report_error {
+        "error"
+    } else if total_specs_audited == 0 {
+        "no_specs_found"
+    } else {
+        "specs_audited"
+    };
+    if !any_report_error && total_specs_audited == 0 && warnings.is_empty() {
+        warnings.push(serde_json::json!(format!(
+            "no_specs_found: 0 theorem/lemma specifications recognized in {}",
+            file_labels.join(", ")
+        )));
+    }
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
     let mut out = serde_json::json!({
         "status": if any_report_error { "error" } else { "ok" },
         "ok": tier1_clean,
-        "verdict": if any_report_error { "error" } else { "specs_audited" },
+        "verdict": batch_verdict,
         "policy": policy.policy,
         "file": file_labels.join(", "),
         "files": file_labels,
@@ -2523,9 +2567,47 @@ pub fn run_audit_spec_command(
     decl_filter: Option<&str>,
     json_mode: bool,
 ) -> Result<()> {
-    run_audit_spec_command_with_options(files, decl_filter, json_mode, None, None, &[], &[])
+    run_audit_spec_command_with_options(files, decl_filter, json_mode, None, None, &[], &[], false)
 }
 
+pub fn apply_require_nonempty_to_audit_report(
+    report: &mut serde_json::Value,
+    require_nonempty: bool,
+) {
+    if !require_nonempty {
+        return;
+    }
+    if let Some(reps) = report
+        .get_mut("file_reports")
+        .and_then(|v| v.as_array_mut())
+    {
+        for r in reps {
+            if r.get("total_specs_audited").and_then(|v| v.as_u64()) == Some(0) {
+                if let Some(ro) = r.as_object_mut() {
+                    ro.insert("ok".to_string(), serde_json::json!(false));
+                }
+            }
+        }
+    }
+    let zero_total = report.get("total_specs_audited").and_then(|v| v.as_u64()) == Some(0);
+    let any_sub_failed = report
+        .get("file_reports")
+        .and_then(|v| v.as_array())
+        .is_some_and(|arr| {
+            arr.iter()
+                .any(|r| r.get("ok").and_then(|v| v.as_bool()) == Some(false))
+        });
+    if zero_total || any_sub_failed {
+        if let Some(obj) = report.as_object_mut() {
+            obj.insert("ok".to_string(), serde_json::json!(false));
+            if zero_total && obj.get("verdict").and_then(|v| v.as_str()) != Some("error") {
+                obj.insert("verdict".to_string(), serde_json::json!("no_specs_found"));
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn run_audit_spec_command_with_options(
     files: &[PathBuf],
     decl_filter: Option<&str>,
@@ -2534,6 +2616,7 @@ pub fn run_audit_spec_command_with_options(
     config_override: Option<&Path>,
     forbid_namespaces: &[String],
     forbid_decl_kinds: &[String],
+    require_nonempty: bool,
 ) -> Result<()> {
     anyhow::ensure!(!files.is_empty(), "No files provided to audit-spec");
     for f in files {
@@ -2551,7 +2634,9 @@ pub fn run_audit_spec_command_with_options(
         forbid_namespaces,
         forbid_decl_kinds,
     );
-    let report = audit_spec_files_with_policy(files, decl_filter, &policy);
+    let mut report = audit_spec_files_with_policy(files, decl_filter, &policy);
+    apply_require_nonempty_to_audit_report(&mut report, require_nonempty);
+    let nonempty_failed = require_nonempty && report["ok"].as_bool() == Some(false);
     if crate::mcp::should_emit_cli_telemetry() {
         let ok_flag = report["ok"].as_bool().unwrap_or(false);
         let decl_label = decl_filter.map(String::from).unwrap_or_else(|| {
@@ -2595,12 +2680,16 @@ pub fn run_audit_spec_command_with_options(
     }
     if json_mode {
         println!("{}", serde_json::to_string_pretty(&report)?);
+        if nonempty_failed {
+            std::process::exit(1);
+        }
     } else {
         println!(
-            "[turbo-lean] AUDIT-SPEC ({}) on {}: ok={} audited={} tight={} vacuous={} trivial={} shadowed={} forbidden_scope={} stubs={} warnings={} ({:.3} ms)",
+            "[turbo-lean] AUDIT-SPEC ({}) on {}: ok={} verdict={} audited={} tight={} vacuous={} trivial={} shadowed={} forbidden_scope={} stubs={} warnings={} ({:.3} ms)",
             report["policy"].as_str().unwrap_or("default"),
             report["file"].as_str().unwrap_or_default(),
             report["ok"],
+            report["verdict"].as_str().unwrap_or("specs_audited"),
             report["total_specs_audited"],
             report["tight_specs"],
             report["vacuous_specs"],
@@ -2613,8 +2702,10 @@ pub fn run_audit_spec_command_with_options(
         );
         anyhow::ensure!(
             report["ok"].as_bool() == Some(true),
-            "Specification audit failed on {} (vacuous={}, trivial={}, shadowed={}, forbidden_scope={}, stubs={})",
+            "Specification audit failed on {} (verdict={}, audited={}, vacuous={}, trivial={}, shadowed={}, forbidden_scope={}, stubs={})",
             report["file"].as_str().unwrap_or_default(),
+            report["verdict"].as_str().unwrap_or("specs_audited"),
+            report["total_specs_audited"],
             report["vacuous_specs"],
             report["trivial_specs"],
             report["shadowed_constants"].as_array().map_or(0, Vec::len),
@@ -2624,7 +2715,6 @@ pub fn run_audit_spec_command_with_options(
     }
     Ok(())
 }
-
 
 #[cfg(test)]
 mod lexer_tests {
@@ -2650,12 +2740,17 @@ theorem actual (x : Nat) : x = x := by rfl
 lemma actualToo : True := by trivial
 "#;
         let decls = extract_all_lean_theorems(src, None);
-        assert_eq!(decls.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
-                   ["actual", "actualToo"]);
+        assert_eq!(
+            decls.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            ["actual", "actualToo"]
+        );
         assert!(extract_all_lean_theorems(src, Some("fake")).is_empty());
         let large_src = format!("{}{}", " ".repeat(9000), src);
         assert!(extract_decls_fast(&large_src, Some("fake")).is_empty());
-        assert_eq!(extract_decls_fast(&large_src, Some("actual"))[0].name, "actual");
+        assert_eq!(
+            extract_decls_fast(&large_src, Some("actual"))[0].name,
+            "actual"
+        );
     }
 
     fn assert_only_actual(prefix: &str) {
@@ -2665,8 +2760,11 @@ lemma actualToo : True := by trivial
         assert_eq!(clean.matches('\n').count(), src.matches('\n').count());
         for text in [&src, &clean] {
             let decls = extract_all_lean_theorems(text, None);
-            assert_eq!(decls.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["actual"],
-                       "source: {text}");
+            assert_eq!(
+                decls.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+                ["actual"],
+                "source: {text}"
+            );
             assert_eq!(decls[0].prop_str, "True");
         }
         let large = format!("{}{src}", " ".repeat(9000));
@@ -2676,7 +2774,9 @@ lemma actualToo : True := by trivial
 
     #[test]
     fn raw_embedded_quote_does_not_create_a_theorem() {
-        assert_only_actual(r##"def message := r#"quoted " theorem fake : False := by contradiction"#"##);
+        assert_only_actual(
+            r##"def message := r#"quoted " theorem fake : False := by contradiction"#"##,
+        );
     }
 
     #[test]
@@ -2686,7 +2786,9 @@ lemma actualToo : True := by trivial
 
     #[test]
     fn raw_two_hashes_require_the_full_closing_delimiter() {
-        assert_only_actual(r###"def message := r##"text"# "theorem fake : False := by contradiction"##"###);
+        assert_only_actual(
+            r###"def message := r##"text"# "theorem fake : False := by contradiction"##"###,
+        );
     }
 
     #[test]
@@ -2713,29 +2815,42 @@ lemma actualToo : True := by trivial
 
     #[test]
     fn audit_lexer_handles_regular_strings_and_character_literals() {
-        assert_only_actual(r##"
+        assert_only_actual(
+            r##"
 def quote : Char := '"'
 def apostrophe : Char := '\''
 def slash : Char := '\\'
 def unicode : Char := 'λ'
 def message := "escaped \" theorem fake : False := by contradiction -- /-"
 def diagnostic (x : String) := s!"theorem '{x}' is missing"
-"##);
+"##,
+        );
     }
 
     #[test]
     fn audit_lexer_skips_line_nested_block_and_doc_comments() {
-        assert_only_actual(r##"
+        assert_only_actual(
+            r##"
 -- r#" '"' theorem fake : False := by contradiction
 /- " r#" theorem fake : False := by contradiction
    /- lemma fake : False := by contradiction -/ -/
 /-- theorem fake : False := by contradiction /- nested -/ -/
 /-! lemma fake : False := by contradiction -/
-"##);
+"##,
+        );
         let src = "-- λ theorem fake\n/- α\n /- β -/ -/";
-        assert_eq!(strip_audit_comments(src), src.chars().map(|c| {
-            if c == '\n' { "\n".to_string() } else { " ".repeat(c.len_utf8()) }
-        }).collect::<String>());
+        assert_eq!(
+            strip_audit_comments(src),
+            src.chars()
+                .map(|c| {
+                    if c == '\n' {
+                        "\n".to_string()
+                    } else {
+                        " ".repeat(c.len_utf8())
+                    }
+                })
+                .collect::<String>()
+        );
     }
 
     #[test]
@@ -2746,10 +2861,14 @@ theorem actual (x : String := r#") theorem fake : False :="#) :
 theorem actualToo : True := by trivial
 "##;
         let decls = extract_all_lean_theorems(src, None);
-        assert_eq!(decls.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
-                   ["actual", "actualToo"]);
-        assert_eq!(decls[0].prop_str,
-                   r##"r#":= theorem fake : False :="# = r#":= theorem fake : False :="#"##);
+        assert_eq!(
+            decls.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            ["actual", "actualToo"]
+        );
+        assert_eq!(
+            decls[0].prop_str,
+            r##"r#":= theorem fake : False :="# = r#":= theorem fake : False :="#"##
+        );
     }
 
     #[test]
