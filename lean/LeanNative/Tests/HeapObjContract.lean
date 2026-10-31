@@ -251,7 +251,8 @@ edge on which `(ptrtoint P) & 1 == 0`). Both are checked by cutting those edges 
 dereference in the block that performs the test (before its branch) is therefore unguarded.
 
 The positive codegen predicates (`heapBoxCarries`, `inPtrBoxCarries`, `projectionLoadsField`) follow the
-*returned* value back through slot reloads (`load T, ptr %slot` ↦ every non-initialising `store … , ptr %slot`),
+*returned* value back through slot reloads (`load T, ptr %slot` ↦ the last non-initialising `store … , ptr %slot`
+preceding it in the same block, else the rejecting `uninitOrigin`),
 `phi` operands and value-preserving casts, to its **origins** (the defining instructions that produce it). Every
 origin must be of the required kind; an empty origin set (e.g. no `ret`) is a rejection. -/
 namespace IRCheck
@@ -344,27 +345,34 @@ def Fn.defOf (f : Fn) (x : String) : Option (List String × String) :=
 def Fn.isSlot (f : Fn) (x : String) : Bool :=
   match f.defOf x with | some ("alloca" :: _, _) => true | _ => false
 
-/-- Values stored to `slot`, skipping the zero-initialising store that directly follows its `alloca`. -/
-def Fn.storesTo (f : Fn) (slot : String) : List String :=
-  f.bs.flatMap fun (_, is) => (is.zip ("" :: is)).filterMap fun (l, prev) => match toks l with
-    | ["store", _, v, "ptr", a, "align", _] | ["store", _, v, "ptr", a] =>
-      if a == slot && !(match toks prev with | d :: "=" :: "alloca" :: _ => d == slot | _ => false) then some v else none
-    | _ => none
+/-- Order-aware, block-local reaching store of the reload `x` of `slot`: the value of the **last** `store … , ptr
+    slot` preceding `x`'s defining instruction **in `x`'s own basic block**. `none` (⇒ `uninitOrigin`) when no such
+    store exists in that block (stores in other blocks are ignored, conservatively) or when it is the
+    zero-initialising store that directly follows the slot's `alloca`. -/
+def Fn.reachingStore (f : Fn) (slot x : String) : Option String :=
+  (f.bs.findSome? fun (_, is) =>
+    let pre := is.takeWhile fun l => match toks l with | d :: "=" :: _ => d != x | _ => true
+    if pre.length == is.length then none else
+    some <| (pre.zip ("" :: pre)).foldl (fun acc (l, prev) => match toks l with
+      | ["store", _, v, "ptr", a, "align", _] | ["store", _, v, "ptr", a] =>
+        if a != slot then acc
+        else if (match toks prev with | d :: "=" :: "alloca" :: _ => d == slot | _ => false) then none else some v
+      | _ => acc) none).join
 
-/-- Rejecting origin of a reload of a slot that has no store besides its initialising one: it is not an SSA
-    name, so it is never a parameter, a box, or a guarded load. -/
+/-- Rejecting origin of a reload with no reaching store (`Fn.reachingStore`): it is not an SSA name, so it is
+    never a parameter, a box, or a guarded load. -/
 def uninitOrigin : String := "<uninit>"
 
-/-- Origins of SSA value `x`: follow slot reloads, `phi`, and value-preserving casts
-    (`zext`/`sext`/`bitcast`, plus `and _, 1` when `bool1` holds, i.e. `Bool` normalisation). A reload of a slot
-    with only its initialising store contributes `uninitOrigin`, so it never yields an empty origin list. -/
+/-- Origins of SSA value `x`: follow slot reloads (to their block-local reaching store only), `phi`, and
+    value-preserving casts (`zext`/`sext`/`bitcast`, plus `and _, 1` when `bool1` holds, i.e. `Bool`
+    normalisation). A reload without a reaching store contributes `uninitOrigin`, never an empty origin list. -/
 def Fn.origins (f : Fn) (bool1 : Bool) : Nat → String → List String
   | 0, x => [x]
   | n + 1, x => match f.defOf x with
     | some (["load", _, "ptr", a, "align", _], _) | some (["load", _, "ptr", a], _) =>
-      if f.isSlot a then match f.storesTo a with
-        | [] => [uninitOrigin]
-        | vs => (vs.flatMap (f.origins bool1 n)).eraseDups
+      if f.isSlot a then match f.reachingStore a x with
+        | none => [uninitOrigin]
+        | some v => f.origins bool1 n v
       else [x]
     | some ("phi" :: _ :: ins, _) =>
       ((ins.zipIdx.filterMap fun (v, i) => if i % 2 == 0 then some v else none).flatMap (f.origins bool1 n)).eraseDups
@@ -545,6 +553,12 @@ def heapOK (body : String) : Bool := IRCheck.heapBoxCarries (bxIR body) "bx" "%a
 #guard !heapOK ("  %slot = alloca i64, align 8\n  store i64 0, ptr %slot, align 8\n  br label %j\nb:\n" ++
   "  %u = load i64, ptr %slot, align 8\n  br label %j\nj:\n  %v = phi i64 [ %arg_v0, %entry ], [ %u, %b ]\n" ++
   "  %r = call ptr @lean_box_uint64(i64 %v)\n  ret ptr %r\n")
+-- self-test (quorum r5): slot reloads are order-aware — a store of the parameter AFTER the reload does not reach
+-- it (boxes `0`), nor does one in another block.
+#guard !heapOK ("  %slot = alloca i64, align 8\n  store i64 0, ptr %slot, align 8\n  %v = load i64, ptr %slot, align 8\n" ++
+  "  store i64 %arg_v0, ptr %slot, align 8\n  %b = call ptr @lean_box_uint64(i64 %v)\n  ret ptr %b\n")
+#guard !heapOK ("  %slot = alloca i64, align 8\n  store i64 0, ptr %slot, align 8\n  store i64 %arg_v0, ptr %slot, align 8\n" ++
+  "  br label %j\nj:\n  %v = load i64, ptr %slot, align 8\n  %b = call ptr @lean_box_uint64(i64 %v)\n  ret ptr %b\n")
 -- while a reload of a slot that is (re)stored with the parameter after initialisation is still accepted.
 #guard heapOK ("  %slot = alloca i64, align 8\n  store i64 0, ptr %slot, align 8\n  store i64 %arg_v0, ptr %slot, align 8\n" ++
   "  %v = load i64, ptr %slot, align 8\n  %b = call ptr @lean_box_uint64(i64 %v)\n  ret ptr %b\n")

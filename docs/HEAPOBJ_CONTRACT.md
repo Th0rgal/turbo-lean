@@ -125,9 +125,13 @@ The model's `rc` and exclusivity are abstractions of the Lean 4.35.0 runtime (`l
      stored **at the scalar payload** `8 + 8·objFields` (a `store` through a `getelementptr` at that byte offset,
      or `lean_ctor_set_*(o, 8·objFields, x)`). A store to the allocation pointer itself (the header) is rejected.
      A value *carries* the parameter only if it has **at least one** origin and **every** origin (through slot
-     reloads, `phi`, value-preserving casts) is the parameter, so `phi [x, …], [0, …]` is rejected. A reload of a
-     slot whose only store is the initialising one after its `alloca` yields the rejecting origin
-     `IRCheck.uninitOrigin`, never an empty origin list. `IRCheck.inPtrBoxCarries`: each origin is
+     reloads, `phi`, value-preserving casts) is the parameter, so `phi [x, …], [0, …]` is rejected. Slot reloads
+     are resolved by a conservative, order-aware, block-local rule (`IRCheck.Fn.reachingStore`; this is a test
+     predicate over our own emitter output, not a general analysis): the origin of `%v = load T, ptr %slot` is the
+     value of the **last** `store … , ptr %slot` preceding the load **in the same basic block**. If there is none
+     (the store is in another block, or only follows the load), or that last store is the initialising one right
+     after the `alloca`, the reload yields the rejecting origin `IRCheck.uninitOrigin`, never an empty origin
+     list. `IRCheck.inPtrBoxCarries`: each origin is
      `inttoptr ((x << 1) | 1)` of the parameter.
    * `IRCheck.projectionLoadsField`: each origin is a `load` from a `getelementptr` on the object pointer at the
      byte offset of the field (`8 + 8·i` for `lean_ctor_get(o, i)`), in a block behind the null/tag guard.
@@ -135,8 +139,9 @@ The model's `rc` and exclusivity are abstractions of the Lean 4.35.0 runtime (`l
    Both have negative self-tests on hand-written wrong IR, which they must reject: `ret ptr null`, the in-pointer
    form, a box of a constant, an allocation without a store of the value, a `phi` that may yield `null`, no `ret`,
    a box of `phi [x, …], [0, …]`, a store of the value to the allocation pointer / at offset 0 / at the wrong
-   payload offset for the declared `objFields`, a box of a reload of an initialisation-only slot, and a box of
-   `phi [x, …], [reload of such a slot, …]`;
+   payload offset for the declared `objFields`, a box of a reload of an initialisation-only slot, a box of
+   `phi [x, …], [reload of such a slot, …]`, a box of a reload that precedes the store of the parameter
+   (flow-sensitivity), and a box of a reload whose only store of the parameter is in another block;
    for projections, a pointer copy, a guarded GEP with no load, wrong offsets (`0`, `16`), an unreturned load,
    an unguarded load, `ret ptr null`, and a `phi` joining the field with the raw pointer.
 
