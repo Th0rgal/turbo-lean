@@ -272,25 +272,43 @@ def evalExpr (env : VarEnv) (st : HeapState) (e : LNIRExpr) : Except UBError (Va
     | none => .error (.unboundVar tupleVar)
   | .allocCtor tag objFields scalarFields =>
     match evalVarList env (objFields ++ scalarFields) with
-    | .ok vals => .ok (.tuple (.u64 tag.toUInt64 :: vals), st)
+    | .ok vals =>
+      let (objId, st') := st.allocHeapCtor tag vals
+      .ok (.objPtr objId, st')
     | .error err => .error err
   | .ctorGetObj ctorVar idx =>
     match env ctorVar with
+    | some (.objPtr objId) =>
+      if st.getObjRefCount objId == 0 then .error (.useAfterFree objId)
+      else match st.findHeapObj objId with
+        | some obj =>
+          match obj.fields[idx]? with
+          | some v => .ok (v, st)
+          | none => .error (.outOfBounds idx obj.fields.length)
+        | none => .error (.useAfterFree objId)
     | some (.tuple (_tag :: vals)) =>
       match vals[idx]? with
       | some v => .ok (v, st)
       | none => .error (.outOfBounds idx vals.length)
     | some (.tuple []) => .error (.outOfBounds idx 0)
-    | some _ => .error (.typeError "ctorGetObj expects constructor tuple")
+    | some _ => .error (.typeError "ctorGetObj expects heap constructor or constructor tuple")
     | none => .error (.unboundVar ctorVar)
   | .ctorGetScalar ctorVar idx _ty =>
     match env ctorVar with
+    | some (.objPtr objId) =>
+      if st.getObjRefCount objId == 0 then .error (.useAfterFree objId)
+      else match st.findHeapObj objId with
+        | some obj =>
+          match obj.fields[idx]? with
+          | some v => .ok (v, st)
+          | none => .error (.outOfBounds idx obj.fields.length)
+        | none => .error (.useAfterFree objId)
     | some (.tuple (_tag :: vals)) =>
       match vals[idx]? with
       | some v => .ok (v, st)
       | none => .error (.outOfBounds idx vals.length)
     | some (.tuple []) => .error (.outOfBounds idx 0)
-    | some _ => .error (.typeError "ctorGetScalar expects constructor tuple")
+    | some _ => .error (.typeError "ctorGetScalar expects heap constructor or constructor tuple")
     | none => .error (.unboundVar ctorVar)
   | .isExclusive objVar =>
     match env objVar with
@@ -298,6 +316,10 @@ def evalExpr (env : VarEnv) (st : HeapState) (e : LNIRExpr) : Except UBError (Va
       match st.findBuffer bufId with
       | some buf => .ok (.bool buf.exclusive, st)
       | none => .error (.typeError s!"unknown sarray buffer {bufId}")
+    | some (.objPtr objId) =>
+      let rc := st.getObjRefCount objId
+      if rc == 0 then .error (.useAfterFree objId)
+      else .ok (.bool (rc == 1), st)
     | some _ => .ok (.bool true, st)
     | none => .error (.unboundVar objVar)
   | .sarrayLen arrVar =>
@@ -394,6 +416,24 @@ def evalExpr (env : VarEnv) (st : HeapState) (e : LNIRExpr) : Except UBError (Va
           | some buf => .ok (.u64 buf.data.size.toUInt64, st)
           | none => .error (.typeError s!"unknown sarray buffer {bufId}")
         | _ => .error (.typeError "lean_native_sarray_len expects 1 sarrayId argument")
+      else if fnName == "lean_native_ctor_set" then
+        match vals with
+        | [.objPtr objId, .u64 idx, val] =>
+          match st.writeHeapObjFieldExclusive objId idx.toNat val with
+          | .ok st' => .ok (.unit, st')
+          | .error err => .error err
+        | _ => .error (.typeError "lean_native_ctor_set expects (objPtr, u64, val)")
+      else if fnName == "lean_native_ctor_tag" then
+        match vals with
+        | [.objPtr objId] =>
+          if st.getObjRefCount objId == 0 then .error (.useAfterFree objId)
+          else match st.findHeapObj objId with
+            | some obj => .ok (.u64 obj.tag.toUInt64, st)
+            | none => .error (.useAfterFree objId)
+        | [.u64 tag] => .ok (.u64 tag, st)
+        | [.bool b] => .ok (.u64 (if b then 1 else 0), st)
+        | [.tuple (.u64 tag :: _)] => .ok (.u64 tag, st)
+        | _ => .error (.typeError "lean_native_ctor_tag expects heap object or unboxed tag")
       else
         .error (.unsupportedCall fnName)
     | .error err => .error err
