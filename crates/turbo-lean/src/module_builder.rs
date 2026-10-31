@@ -4558,13 +4558,14 @@ pub(crate) struct VerifiedDepManifest {
     /// Workspace configuration the manifest was validated against on load (never serialized).
     #[serde(skip)]
     pub cfg: Option<ProjectConfig>,
-    /// Dependency-package imports `(module, pin)` already found consistent (never serialized).
+    /// Dependency-closure nodes `(package, module, pin)` already found consistent (never
+    /// serialized).
     #[serde(skip)]
     pub dep_import_memo: DepImportMemo,
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct DepImportMemo(Mutex<HashSet<(String, String)>>);
+pub(crate) struct DepImportMemo(Mutex<HashSet<(String, String, String)>>);
 
 impl Clone for DepImportMemo {
     fn clone(&self) -> Self {
@@ -4677,17 +4678,7 @@ pub(crate) fn external_import_pin_current(
         (ImportSite::Toolchain, None) => true,
         (ImportSite::Prebuilt(olean), Some(pin)) => olean_digest_is(cfg, &olean, pin),
         (ImportSite::Module(spec), Some(pin)) => {
-            let key = (imp.to_string(), pin.to_string());
-            if memo.0.lock().is_ok_and(|m| m.contains(&key)) {
-                return true;
-            }
-            let ok = dep_pkg_import_pins_consistent(cfg, *spec, pin);
-            if ok {
-                if let Ok(mut m) = memo.0.lock() {
-                    m.insert(key);
-                }
-            }
-            ok
+            dep_pkg_import_pins_consistent(cfg, memo, *spec, pin)
         }
         _ => false,
     }
@@ -4744,13 +4735,34 @@ pub(crate) fn entry_artifacts_current(
         || olean_digest_is(cfg, olean, &entry.olean_artifact_digest)
 }
 
+/// Whether dependency-package module `imp` has a verified-sources entry whose closure is no
+/// longer consistent. Without an entry there is no turbo-lean evidence (Lake-managed): `false`.
+pub(crate) fn dep_pkg_module_stale(cfg: &ProjectConfig, memo: &DepImportMemo, imp: &str) -> bool {
+    let ImportSite::Module(spec) = resolve_import_site(cfg, imp) else {
+        return false;
+    };
+    let Some(digest) =
+        read_pkg_verified_manifest(cfg, &spec.pkg_root, &spec.pkg_name, &spec.pkg_config_digest)
+            .and_then(|m| {
+                m.modules
+                    .get(&spec_rel_src(&spec))
+                    .map(|e| e.olean_artifact_digest.clone())
+            })
+    else {
+        return false;
+    };
+    !dep_pkg_import_pins_consistent(cfg, memo, *spec, &digest)
+}
+
 /// Check-time counterpart of `collect_fresh_dep_pkg_closure` for a dependency-package module
-/// pinned at `pin`: every visited module's artifacts must match its manifest entry (by stat
-/// fingerprint, else by re-hashing), its source must match the entry, and every import of that
-/// source must be pinned to the current artifacts (root- and dependency-package modules
-/// recursively, root ones kernel-audited; prebuilt imports re-digested).
+/// pinned at `pin` (memoizing verified nodes in `memo`): every visited module's artifacts must
+/// match its manifest entry (by stat fingerprint, else by re-hashing), its source must match the
+/// entry, and every import of that source must be pinned to the current artifacts (root- and
+/// dependency-package modules recursively, root ones kernel-audited; prebuilt imports
+/// re-digested).
 fn dep_pkg_import_pins_consistent(
     cfg: &ProjectConfig,
+    memo: &DepImportMemo,
     spec: DiscoveredModuleSpec,
     pin: &str,
 ) -> bool {
@@ -4759,6 +4771,10 @@ fn dep_pkg_import_pins_consistent(
     let mut stack = vec![(spec, pin.to_string())];
     while let Some((cur, pin)) = stack.pop() {
         let key = (cur.pkg_name.clone(), cur.module_name.clone());
+        let memo_key = (key.0.clone(), key.1.clone(), pin.clone());
+        if memo.0.lock().is_ok_and(|m| m.contains(&memo_key)) {
+            continue;
+        }
         if let Some(prev) = seen.get(&key) {
             if *prev != pin {
                 return false;
@@ -4807,6 +4823,12 @@ fn dep_pkg_import_pins_consistent(
             return false;
         }
         seen.insert(key, pin);
+    }
+    if let Ok(mut m) = memo.0.lock() {
+        m.extend(
+            seen.into_iter()
+                .map(|((pkg, module), pin)| (pkg, module, pin)),
+        );
     }
     true
 }
@@ -10122,6 +10144,13 @@ lean_exe «demo-exe» where
             "`App.C` reported verified against a dependency closure rebuilt underneath it"
         );
         assert!(crate::lake_build::resolve_prebuilt_module_import(&canon, &canon_c).is_none());
+        // `check` must not elaborate `App.C` against the stale `DepPkg.B` either.
+        let res =
+            crate::lake_build::ensure_project_imports_fresh_for_check(&canon, &[canon_c.clone()]);
+        assert!(
+            !matches!(res, Ok(0)),
+            "stale `DepPkg.B` left in place for elaboration"
+        );
         // Rebuilding the root must not reuse the stale `DepPkg.B` as a fresh external closure:
         // its pin for `DepPkg.A` no longer matches, so `B` is rebuilt and `App.C` (`h = 3`) fails.
         let rebuilt = build_project_modules_native(

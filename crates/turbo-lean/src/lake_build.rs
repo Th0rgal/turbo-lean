@@ -2227,6 +2227,12 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
     let mut visited = HashSet::new();
     let mut ordered_imports: Vec<(String, String, PathBuf)> = Vec::new();
     let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+    // Dependency-package imports whose recorded closure is no longer consistent (P0-4): Lean
+    // would otherwise load them next to their rebuilt imports without re-checking.
+    let dep_cfg = manifest_opt
+        .as_ref()
+        .and_then(|m| Some((m.cfg.as_ref()?, &m.dep_import_memo)));
+    let mut stale_dep_mods: HashSet<String> = HashSet::new();
     while let Some(mod_name) = worklist.pop() {
         if !visited.insert(mod_name.clone()) {
             continue;
@@ -2241,9 +2247,13 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
             }
             adj.insert(mod_name.clone(), sub_imps);
             ordered_imports.push((mod_name, imp_slash, dep_src));
+        } else if dep_cfg.is_some_and(|(cfg, memo)| {
+            crate::module_builder::dep_pkg_module_stale(cfg, memo, &mod_name)
+        }) {
+            stale_dep_mods.insert(mod_name);
         }
     }
-    if ordered_imports.is_empty() {
+    if ordered_imports.is_empty() && stale_dep_mods.is_empty() {
         return Ok(0);
     }
 
@@ -2301,6 +2311,7 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
         }
     }
 
+    stale_mods.extend(stale_dep_mods.iter().cloned());
     // Propagate staleness downstream across the imported project subgraph.
     let mut changed = !stale_mods.is_empty();
     while changed {
@@ -2380,6 +2391,14 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
             }
         }
         return Ok(targets.len());
+    }
+    if !stale_dep_mods.is_empty() {
+        let mut deps: Vec<_> = stale_dep_mods.into_iter().collect();
+        deps.sort();
+        anyhow::bail!(
+            "Stale dependency-package imports {} (built against older imports); rebuild them with `turbo-lean build`, then retry.",
+            deps.join(", ")
+        );
     }
 
     if let Some(mut manifest) = manifest_opt {
