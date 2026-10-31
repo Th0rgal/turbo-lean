@@ -241,7 +241,7 @@ enum Commands {
         /// Verification mode: 'trusted' or 'untrusted'
         #[arg(long, default_value = "trusted")]
         mode: String,
-        /// Trusted git revision supplying project allowlists (untrusted mode ignores checkout policy)
+        /// Trusted git revision supplying allowlists (without --base, use restrictive defaults)
         #[arg(long)]
         base: Option<String>,
         /// Project root directory
@@ -529,9 +529,9 @@ fn run(cli: Cli) -> Result<()> {
         return mcp::run_telemetry_command(action, project_dir.as_deref(), cli.json);
     }
 
-    // Project settings from `turbo-lean.toml` (at `--base` for pr-verify; never from an
-    // untrusted ci-verify checkout), unless set explicitly in the environment, which zygote
-    // workers and daemons inherit from this process: the axiom allowlist, and the per-theorem
+    // Project settings from `turbo-lean.toml` (at `--base` for PR/CI verification),
+    // unless set explicitly in the environment inherited by workers and daemons:
+    // the axiom allowlist and the per-theorem
     // zygote timeout (`check --timeout` wins over `[zygote] timeout_secs`).
     let here = std::path::Path::new(".");
     let (dir, rev) = match &cli.command {
@@ -540,13 +540,11 @@ fn run(cli: Cli) -> Result<()> {
         } => (Some(project_dir.as_path()), Some(base.as_str())),
         Commands::CiVerify {
             project_dir,
-            mode,
             base,
             ..
         } => match base {
             Some(base) => (Some(project_dir.as_path()), Some(base.as_str())),
-            None if mode == "untrusted" => (None, None),
-            None => (Some(project_dir.as_path()), None),
+            None => (None, None),
         },
         Commands::Check { project_dir, .. }
         | Commands::Build { project_dir, .. }
@@ -563,17 +561,21 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Mcp { project_dir } => (Some(project_dir.as_deref().unwrap_or(here)), None),
         _ => (None, None),
     };
+    if matches!(&cli.command, Commands::CiVerify { base: None, .. }) {
+        // Neither checkout policy nor inherited allowlists can authorize CI
+        // without a trusted revision, in either execution mode.
+        for key in [
+            splitter::ALLOWED_AXIOMS_ENV,
+            splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV,
+            "TURBO_LEAN_ALLOWED_CSIMP",
+            "TURBO_LEAN_ALLOWED_CSIMP_FROM_CONFIG",
+        ] {
+            std::env::remove_var(key);
+        }
+        eprintln!("[turbo-lean] ci-verify without --base: using restrictive default policy (no project allowlists)");
+    }
     let from_cfg_env =
         std::env::var(splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV).as_deref() == Ok("1");
-    if from_cfg_env
-        && matches!(
-            &cli.command,
-            Commands::CiVerify { mode, .. } if mode == "untrusted"
-        )
-    {
-        std::env::remove_var(splitter::ALLOWED_AXIOMS_ENV);
-        std::env::remove_var(splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV);
-    }
     let csimp_from_config =
         std::env::var("TURBO_LEAN_ALLOWED_CSIMP_FROM_CONFIG").as_deref() == Ok("1");
     if csimp_from_config && dir.is_none() {

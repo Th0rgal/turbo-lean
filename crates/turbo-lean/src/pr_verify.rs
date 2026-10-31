@@ -5356,13 +5356,17 @@ end Fixture
             );
             cmd.args(["--no-telemetry", "--json", command, "--project-dir"])
                 .arg(&dir)
-                .args(["--mode", mode])
                 // A policy inherited from another checkout must not override --base.
                 .env("TURBO_LEAN_ALLOWED_CSIMP", "*")
                 .env("TURBO_LEAN_ALLOWED_CSIMP_FROM_CONFIG", "1")
-                .env_remove(splitter::ALLOWED_AXIOMS_ENV)
+                .env(splitter::ALLOWED_AXIOMS_ENV, "*")
+                .env(splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV, "1")
                 .env("TURBO_LEAN_HOME", dir.join(".lake/turbo-policy-cache"))
                 .env("TURBO_LEAN_NO_DAEMON", "1");
+            // Exercise ci-verify's default trusted mode, too.
+            if mode != "trusted" {
+                cmd.args(["--mode", mode]);
+            }
             if !base.is_empty() {
                 cmd.args(["--base", base]);
             }
@@ -5371,7 +5375,19 @@ end Fixture
             }
             Ok(cmd.output()?)
         };
+        let verify_default_policy = |mode: &str| -> Result<()> {
+            let out = verify("ci-verify", mode, "")?;
+            let diagnostic = format!("{}{}",
+                String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            assert!(!out.status.success()
+                && diagnostic.contains("restrictive default policy")
+                && diagnostic.contains("native_decide"),
+                "{mode} ci-verify without --base must reject checkout/inherited allowlists and explain defaults: {diagnostic}");
+            println!("kernel policy {mode} ci-verify: checkout/inherited config ignored without --base");
+            Ok(())
+        };
         if cli.is_some() {
+            verify_default_policy("trusted")?;
             let sandbox = crate::module_builder::probe_bwrap_sandbox().is_some();
             for (command, mode) in [
                 ("pr-verify", "trusted"),
@@ -5416,9 +5432,7 @@ end Fixture
                     println!("kernel policy {mode} {command}: non-allowlisted/head-only csimp rejected ({base})");
                 }
                 if command == "ci-verify" {
-                    assert!(!verify(command, mode, "")?.status.success(),
-                        "untrusted ci-verify without --base must ignore checkout and inherited config policy");
-                    println!("kernel policy untrusted ci-verify: checkout/inherited config ignored without --base");
+                    verify_default_policy(mode)?;
                 }
             }
         }
