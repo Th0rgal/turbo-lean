@@ -2758,30 +2758,8 @@ pub fn sync_push_http_with_manifest(
 /// Offload a coalesced batch of uncached theorem shards to a remote `turbo-lean serve` coordinator
 /// via `POST /check-shards-batch`. On `ok == true`, atomically publishes all verified shard receipts
 /// into the local `store` `TheoremProofCAS` via `batch_publish_theorem_shards`.
-#[allow(dead_code)]
-pub fn offload_check_shards_batch_http(
-    store: &mut TurboStore,
-    endpoint: &str,
-    items: &[CheckShardBatchItem],
-    coalesced_shard_source: &str,
-    trust_domain: &str,
-    toolchain: &str,
-    lean_path: &str,
-) -> Result<CheckShardsBatchResponse> {
-    offload_check_shards_batch_http_with_args(
-        store,
-        endpoint,
-        items,
-        coalesced_shard_source,
-        trust_domain,
-        toolchain,
-        lean_path,
-        &[],
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
-pub fn offload_check_shards_batch_http_with_args(
+pub fn offload_check_shards_batch_http(
     store: &mut TurboStore,
     endpoint: &str,
     items: &[CheckShardBatchItem],
@@ -3439,6 +3417,7 @@ pub(crate) mod tests {
             "trusted",
             "leanprover/lean4:v4.35.0",
             "",
+            &[],
         )?;
         assert!(
             resp1.ok && resp1.verified_count == 2 && resp1.cache_hits == 0 && resp1.exit_code == 0
@@ -3478,6 +3457,7 @@ pub(crate) mod tests {
             "trusted",
             "leanprover/lean4:v4.35.0",
             "",
+            &[],
         )?;
         assert!(
             resp2.ok && resp2.verified_count == 0 && resp2.cache_hits == 2 && resp2.exit_code == 0
@@ -3506,6 +3486,7 @@ pub(crate) mod tests {
             "trusted",
             "leanprover/lean4:v4.35.0",
             "",
+            &[],
         )?;
         assert!(resp3.ok && resp3.cache_hits == 1 && resp3.verified_count == 1);
 

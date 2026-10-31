@@ -1142,7 +1142,7 @@ fn check_directory(
                     });
                 }
             }
-            if let Ok(resp) = pack::offload_check_shards_batch_http_with_args(
+            if let Ok(resp) = pack::offload_check_shards_batch_http(
                 store,
                 remote_url,
                 &req_items,
@@ -2132,7 +2132,7 @@ fn check_single_decl(
                             .iter()
                             .map(|(_, _, full_txt)| full_txt.clone())
                             .collect();
-                        if let Ok(reply) = crate::zygote::eval_subshards_batch_via_zygote_with_args(
+                        if let Ok(reply) = crate::zygote::eval_subshards_batch_via_zygote(
                             store,
                             toolchain,
                             &local_lean_path,
@@ -2559,18 +2559,16 @@ fn check_single_decl(
                                     cand_decls.push(orig_full);
                                     cand_accels.push("original".to_string());
                                 }
-                                if let Ok(reply) =
-                                    crate::zygote::eval_candidates_race_via_zygote_with_args(
-                                        store,
-                                        toolchain,
-                                        &local_lean_path,
-                                        &env_vars,
-                                        Path::new(&lean_bin),
-                                        &prefix_src,
-                                        &cand_decls,
-                                        &file_lean_args,
-                                    )
-                                {
+                                if let Ok(reply) = crate::zygote::eval_candidates_race_via_zygote(
+                                    store,
+                                    toolchain,
+                                    &local_lean_path,
+                                    &env_vars,
+                                    Path::new(&lean_bin),
+                                    &prefix_src,
+                                    &cand_decls,
+                                    &file_lean_args,
+                                ) {
                                     let c_abi_sound = unsafe {
                                         crate::splitter::turbo_spec_is_sound_decl_summary(
                                             0,
@@ -3084,7 +3082,7 @@ fn check_single_file(
                         )
                     })
                     .and_then(|fast_src| {
-                        pack::offload_check_shards_batch_http_with_args(
+                        pack::offload_check_shards_batch_http(
                             store,
                             remote_url,
                             &req_items,
@@ -3101,7 +3099,7 @@ fn check_single_file(
 
             if remote_resp.is_none() {
                 let coalesced_src = splitter::build_coalesced_shard_source(src, &uncached_names);
-                let r = pack::offload_check_shards_batch_http_with_args(
+                let r = pack::offload_check_shards_batch_http(
                     store,
                     remote_url,
                     &req_items,
@@ -3808,6 +3806,7 @@ pub fn verify_subshards_out_of_core(
             lean_bin,
             prefix_source,
             sub_decl_source,
+            &[],
         )?;
         if !reply.import_ok || !reply.ok {
             anyhow::bail!(
@@ -4198,6 +4197,7 @@ but is expected to have type
             &lean_bin,
             prefix_src,
             &sub_decl_sources,
+            &[],
         )
         .unwrap();
         assert!(reply.import_ok && reply.ok && reply.subshards_verified == 3);
@@ -4213,6 +4213,7 @@ but is expected to have type
             &lean_bin,
             prefix_src,
             &bad_sub_decl_sources,
+            &[],
         )
         .unwrap();
         assert!(!bad_reply.ok && bad_reply.subshards_verified == 1);
@@ -4254,6 +4255,7 @@ but is expected to have type
             &lean_bin,
             "def stepAdd (n : Nat) : Nat := n + 1\n",
             &candidates,
+            &[],
         )
         .unwrap();
         assert!(reply.import_ok && reply.ok && reply.winning_candidate_idx == Some(2));

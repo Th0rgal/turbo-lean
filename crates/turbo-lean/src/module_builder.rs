@@ -3912,91 +3912,35 @@ pub fn package_default_lean_args(pkg: &PackageConfig) -> Vec<String> {
     compose_flat_filtered_args(&weak, &strong)
 }
 
-/// Resolve filtered effective Lean compiler flags for a specific `.lean` file in `pkg`
-/// (matching its owning `lean_lib` / `lean_exe` target if any, else falling back to package-level).
+/// Resolve filtered effective Lean compiler flags for a specific `.lean` file in `pkg`: the
+/// target Lake would build it with (`resolve_module_in_package`, i.e. Lake's `findModule?`),
+/// falling back to package-level flags for files no target owns.
 pub fn resolve_file_lean_args_in_package(pkg: &PackageConfig, file_path: &Path) -> Vec<String> {
-    let canon_root = pkg
-        .pkg_root
-        .canonicalize()
-        .unwrap_or_else(|_| pkg.pkg_root.clone());
-    let abs_file = if file_path.is_absolute() {
-        file_path.to_path_buf()
-    } else {
-        canon_root.join(file_path)
-    };
-    let canon_file = abs_file.canonicalize().unwrap_or(abs_file);
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let canon_root = canon(&pkg.pkg_root);
+    let canon_file = canon(&canon_root.join(file_path));
     let pkg_src_base = canon_root.join(&pkg.src_dir);
-
-    for lib in &pkg.libs {
-        let lib_src = match &lib.src_dir {
-            Some(sd) => pkg_src_base.join(sd),
-            None => pkg_src_base.clone(),
+    let src_roots = pkg
+        .libs
+        .iter()
+        .map(|l| l.src_dir.as_ref())
+        .chain(pkg.exes.iter().map(|e| e.src_dir.as_ref()))
+        .map(|sd| canon(&sd.map_or_else(|| pkg_src_base.clone(), |sd| pkg_src_base.join(sd))));
+    for src_root in src_roots {
+        let Ok(rel) = canon_file.strip_prefix(&src_root) else {
+            continue;
         };
-        let canon_lib_src = lib_src.canonicalize().unwrap_or(lib_src);
-        if let Ok(rel) = canon_file.strip_prefix(&canon_lib_src) {
-            let mod_name = format_lean_module_name_from_parts(
-                rel.with_extension("")
-                    .components()
-                    .filter_map(|c| c.as_os_str().to_str()),
-            );
-            let matches_root = lib.roots.is_empty()
-                || lib
-                    .roots
-                    .iter()
-                    .any(|r| mod_name == *r || mod_name.starts_with(&format!("{}.", r)));
-            if matches_root {
-                let (strong, weak) = compose_effective_args(
-                    pkg,
-                    &lib.lean_options,
-                    &lib.more_lean_args,
-                    &lib.weak_lean_args,
-                );
-                return compose_flat_filtered_args(&weak, &strong);
+        let mod_name = format_lean_module_name_from_parts(
+            rel.with_extension("")
+                .components()
+                .filter_map(|c| c.as_os_str().to_str()),
+        );
+        if let Some(spec) = resolve_module_in_package(pkg, true, &mod_name) {
+            if canon(&spec.src_path) == canon_file {
+                return compose_flat_filtered_args(&spec.weak_args, &spec.strong_args);
             }
         }
     }
-
-    for lib in &pkg.libs {
-        let lib_src = match &lib.src_dir {
-            Some(sd) => pkg_src_base.join(sd),
-            None => pkg_src_base.clone(),
-        };
-        let canon_lib_src = lib_src.canonicalize().unwrap_or(lib_src);
-        if canon_file.starts_with(&canon_lib_src) {
-            let (strong, weak) = compose_effective_args(
-                pkg,
-                &lib.lean_options,
-                &lib.more_lean_args,
-                &lib.weak_lean_args,
-            );
-            return compose_flat_filtered_args(&weak, &strong);
-        }
-    }
-
-    for exe in &pkg.exes {
-        let exe_src = match &exe.src_dir {
-            Some(sd) => pkg_src_base.join(sd),
-            None => pkg_src_base.clone(),
-        };
-        let canon_exe_src = exe_src.canonicalize().unwrap_or(exe_src);
-        if let Ok(rel) = canon_file.strip_prefix(&canon_exe_src) {
-            let mod_name = format_lean_module_name_from_parts(
-                rel.with_extension("")
-                    .components()
-                    .filter_map(|c| c.as_os_str().to_str()),
-            );
-            if exe.root == mod_name || exe.name == mod_name {
-                let (strong, weak) = compose_effective_args(
-                    pkg,
-                    &exe.lean_options,
-                    &exe.more_lean_args,
-                    &exe.weak_lean_args,
-                );
-                return compose_flat_filtered_args(&weak, &strong);
-            }
-        }
-    }
-
     package_default_lean_args(pkg)
 }
 
@@ -10316,7 +10260,7 @@ lean_exe «demo-exe» where
     #[test]
     fn test_lean_args_allowlist_and_per_target_resolution() {
         assert!(is_allowed_lean_arg("-DmaxHeartbeats=4000000"));
-        assert!(is_allowed_lean_arg(" -DautoImplicit=false "));
+        assert!(!is_allowed_lean_arg(" -DautoImplicit=false "));
         assert!(is_allowed_lean_arg("-j8"));
         assert!(is_allowed_lean_arg("--threads=16"));
         assert!(is_allowed_lean_arg("--tstack=262144"));
@@ -10377,13 +10321,14 @@ weakLeanArgs = ["-DmaxHeartbeats=300000"]
 autoImplicit = false
 
 [[lean_lib]]
-name = "Fast"
-roots = ["Fast"]
-
-[[lean_lib]]
 name = "Heavy"
 roots = ["Heavy"]
+globs = ["Heavy.+", "Extra.+"]
 moreLeanArgs = ["-DmaxHeartbeats=4000000"]
+
+[[lean_lib]]
+name = "Fast"
+roots = ["Fast"]
 "#,
         )
         .unwrap();
@@ -10401,10 +10346,26 @@ moreLeanArgs = ["-DmaxHeartbeats=4000000"]
             heavy_args,
             vec![
                 "-DmaxHeartbeats=300000".to_string(),
-                "-DautoImplicit=false".to_string(),
                 "-DmaxHeartbeats=4000000".to_string(),
+                "-DautoImplicit=false".to_string(),
             ]
         );
+        // Lake ownership: globs select modules outside the roots, and a file no target owns
+        // gets package-level flags rather than those of the first lib sharing its src dir.
+        fs::create_dir_all(dir.join("Extra")).unwrap();
+        let extra_file = dir.join("Extra/Glob.lean");
+        let scratch_file = dir.join("Scratch.lean");
+        fs::write(&extra_file, "def z : Nat := 3\n").unwrap();
+        fs::write(&scratch_file, "def w : Nat := 4\n").unwrap();
+        assert_eq!(
+            try_resolve_lean_args_for_path(&dir, Some(&extra_file)),
+            heavy_args
+        );
+        assert_eq!(
+            try_resolve_lean_args_for_path(&dir, Some(&scratch_file)),
+            try_resolve_lean_args_for_path(&dir, None)
+        );
+        assert_eq!(try_resolve_lean_args_for_path(&dir, None), fast_args);
         fs::remove_dir_all(dir).unwrap();
     }
 }

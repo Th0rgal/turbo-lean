@@ -3297,7 +3297,7 @@ pub fn run_pr_verify_command(
                     .iter()
                     .flat_map(|(_, fu, _)| fu.iter().map(to_batch_req_item))
                     .collect();
-                if let Ok(resp) = pack::offload_check_shards_batch_http_with_args(
+                if let Ok(resp) = pack::offload_check_shards_batch_http(
                     store,
                     remote_url,
                     &req_items,
@@ -3448,7 +3448,7 @@ pub fn run_pr_verify_command(
                                 )
                             };
                             if let Some(fast_src) = fast_src_opt {
-                                if let Ok(resp) = pack::offload_check_shards_batch_http_with_args(
+                                if let Ok(resp) = pack::offload_check_shards_batch_http(
                                     store,
                                     remote_url,
                                     &req_items,
@@ -3474,7 +3474,7 @@ pub fn run_pr_verify_command(
                         } else {
                             splitter::build_coalesced_shard_source(&src, &uncached_names)
                         };
-                        let resp = pack::offload_check_shards_batch_http_with_args(
+                        let resp = pack::offload_check_shards_batch_http(
                             store,
                             remote_url,
                             &req_items,

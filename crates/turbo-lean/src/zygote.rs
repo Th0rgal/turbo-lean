@@ -793,16 +793,6 @@ impl ZygoteEvalReply {
         }
     }
 
-    #[allow(dead_code)]
-    fn crashed_reply(eval_mode: bool, err_msg: impl Into<String>) -> Self {
-        Self {
-            kernel_gate_active: !eval_mode,
-            errors: vec![err_msg.into()],
-            crashed: true,
-            ..Default::default()
-        }
-    }
-
     fn crashed_reply_with_diag(eval_mode: bool, diag: WorkerCrashDiagnostics) -> Self {
         Self {
             kernel_gate_active: !eval_mode,
@@ -818,13 +808,33 @@ impl ZygoteEvalReply {
     }
 }
 
-fn reply_has_runtime_panic(rep: &ZygoteEvalReply) -> bool {
-    let check = |s: &str| {
-        s.contains("PANIC")
-            || s.contains("invalid environment extension")
-            || s.contains("runtime panic")
-    };
-    rep.messages.iter().any(|m| check(m)) || rep.errors.iter().any(|e| check(e))
+/// Error a worker reports (and this host adds) once a Lean runtime panic made it unusable.
+const RUNTIME_PANIC_ERR: &str =
+    "[TurboLean.ZygoteWorker] runtime panic; worker environment is unusable";
+
+/// Mirrors `TurboLean.ZygoteWorker.isRuntimePanicText`: Lean panic output or `EnvExtension`
+/// corruption, not any mention of the word `PANIC`.
+fn is_runtime_panic_text(s: &str) -> bool {
+    [
+        "PANIC at ",
+        "INTERNAL PANIC",
+        "invalid environment extension",
+    ]
+    .iter()
+    .any(|m| s.contains(m))
+}
+
+/// Fails a reply whose worker hit a runtime panic; returns whether the worker must be discarded.
+fn mark_runtime_panic(rep: &mut ZygoteEvalReply) -> bool {
+    let reported = rep.errors.iter().any(|e| e == RUNTIME_PANIC_ERR);
+    if !reported && !rep.messages.iter().any(|m| is_runtime_panic_text(m)) {
+        return false;
+    }
+    rep.ok = false;
+    if !reported {
+        rep.errors.push(RUNTIME_PANIC_ERR.to_string());
+    }
+    true
 }
 
 fn collect_worker_exit_status(child: &mut std::process::Child) -> (Option<i32>, Option<i32>) {
@@ -1955,92 +1965,78 @@ fn eval_with_zygote_pool_inner(
         shard_source.len()
     );
 
-    let run_worker_req = |worker: &mut ZygoteChild,
-                          req_line: &str,
-                          req_id: &str|
-     -> WorkerReqOutcome {
-        let req_t0 = std::time::Instant::now();
-        let pid = worker.child.id();
-        let rss_before = measure_process_rss_mb(pid);
-        if let Err(e) = worker
-            .stdin
-            .write_all(req_line.as_bytes())
-            .and_then(|_| worker.stdin.flush())
-        {
-            let rss_now = measure_process_rss_mb(pid).max(rss_before);
-            return WorkerReqOutcome::Crashed(build_worker_crash_diagnostics(
-                worker,
-                &format!("Failed to write to Zygote stdin: {}", e),
-                rss_now,
-                req_id,
-            ));
-        }
-        let mut resp_line = String::new();
-        match read_line_with_timeout(&mut worker.stdout, &mut resp_line, effective_timeout_ms) {
-            Ok(None) => {
+    let run_worker_req =
+        |worker: &mut ZygoteChild, req_line: &str, req_id: &str| -> WorkerReqOutcome {
+            let req_t0 = std::time::Instant::now();
+            let pid = worker.child.id();
+            let rss_before = measure_process_rss_mb(pid);
+            if let Err(e) = worker
+                .stdin
+                .write_all(req_line.as_bytes())
+                .and_then(|_| worker.stdin.flush())
+            {
                 let rss_now = measure_process_rss_mb(pid).max(rss_before);
-                let stderr_tail = snapshot_worker_stderr_tail(&worker.stderr_tail);
-                WorkerReqOutcome::TimedOut {
-                    elapsed_us: req_t0.elapsed().as_micros() as u64,
-                    peak_rss_mb: rss_now,
-                    stderr_tail,
-                    last_request: req_id.to_string(),
-                }
-            }
-            Ok(Some(0)) => {
-                let rss_now = measure_process_rss_mb(pid).max(rss_before);
-                WorkerReqOutcome::Crashed(build_worker_crash_diagnostics(
+                return WorkerReqOutcome::Crashed(build_worker_crash_diagnostics(
                     worker,
-                    "Zygote worker closed stdout unexpectedly",
+                    &format!("Failed to write to Zygote stdin: {}", e),
                     rss_now,
                     req_id,
-                ))
+                ));
             }
-            Ok(Some(_)) => match serde_json::from_str::<ZygoteEvalReply>(resp_line.trim()) {
-                Ok(mut parsed) => {
-                    let rss_after = measure_process_rss_mb(pid);
-                    parsed.rss_delta_mb = (rss_after as i64) - (rss_before as i64);
-                    parsed.peak_rss_mb = rss_after.max(rss_before);
-                    if reply_has_runtime_panic(&parsed) {
-                        parsed.ok = false;
-                        if !parsed
-                            .errors
-                            .iter()
-                            .any(|e| e.contains("runtime panic") || e.contains("PANIC"))
-                        {
-                            parsed.errors.push(
-                                    "[TurboLean.ZygoteWorker] runtime panic; worker environment is unusable"
-                                        .to_string(),
-                                );
-                        }
+            let mut resp_line = String::new();
+            match read_line_with_timeout(&mut worker.stdout, &mut resp_line, effective_timeout_ms) {
+                Ok(None) => {
+                    let rss_now = measure_process_rss_mb(pid).max(rss_before);
+                    let stderr_tail = snapshot_worker_stderr_tail(&worker.stderr_tail);
+                    WorkerReqOutcome::TimedOut {
+                        elapsed_us: req_t0.elapsed().as_micros() as u64,
+                        peak_rss_mb: rss_now,
+                        stderr_tail,
+                        last_request: req_id.to_string(),
                     }
-                    WorkerReqOutcome::Reply(parsed)
                 }
-                Err(e) => {
+                Ok(Some(0)) => {
                     let rss_now = measure_process_rss_mb(pid).max(rss_before);
                     WorkerReqOutcome::Crashed(build_worker_crash_diagnostics(
                         worker,
-                        &format!(
-                            "Invalid JSON from Zygote worker ({}): {}",
-                            e,
-                            resp_line.trim()
-                        ),
+                        "Zygote worker closed stdout unexpectedly",
                         rss_now,
                         req_id,
                     ))
                 }
-            },
-            Err(e) => {
-                let rss_now = measure_process_rss_mb(pid).max(rss_before);
-                WorkerReqOutcome::Crashed(build_worker_crash_diagnostics(
-                    worker,
-                    &format!("Zygote stdout read error: {}", e),
-                    rss_now,
-                    req_id,
-                ))
+                Ok(Some(_)) => match serde_json::from_str::<ZygoteEvalReply>(resp_line.trim()) {
+                    Ok(mut parsed) => {
+                        let rss_after = measure_process_rss_mb(pid);
+                        parsed.rss_delta_mb = (rss_after as i64) - (rss_before as i64);
+                        parsed.peak_rss_mb = rss_after.max(rss_before);
+                        mark_runtime_panic(&mut parsed);
+                        WorkerReqOutcome::Reply(parsed)
+                    }
+                    Err(e) => {
+                        let rss_now = measure_process_rss_mb(pid).max(rss_before);
+                        WorkerReqOutcome::Crashed(build_worker_crash_diagnostics(
+                            worker,
+                            &format!(
+                                "Invalid JSON from Zygote worker ({}): {}",
+                                e,
+                                resp_line.trim()
+                            ),
+                            rss_now,
+                            req_id,
+                        ))
+                    }
+                },
+                Err(e) => {
+                    let rss_now = measure_process_rss_mb(pid).max(rss_before);
+                    WorkerReqOutcome::Crashed(build_worker_crash_diagnostics(
+                        worker,
+                        &format!("Zygote stdout read error: {}", e),
+                        rss_now,
+                        req_id,
+                    ))
+                }
             }
-        }
-    };
+        };
 
     let return_worker_to_pool = |pool_mutex: &std::sync::Mutex<
         std::collections::HashMap<(String, String, String), Vec<ZygoteWorkerProcess>>,
@@ -2218,14 +2214,10 @@ fn eval_with_zygote_pool_inner(
             for (mut w, res) in results {
                 match res {
                     WorkerReqOutcome::Reply(r) => {
-                        if reply_has_runtime_panic(&r) {
-                            drop(w);
-                        } else if r.import_ok {
+                        if r.import_ok && !r.errors.iter().any(|e| e == RUNTIME_PANIC_ERR) {
                             w.warm_imports
                                 .insert(imports_csv.clone(), olean_digest.clone());
                             return_worker_to_pool(pool_mutex, pool_key.clone(), w);
-                        } else {
-                            drop(w);
                         }
                         replies.push(r);
                     }
@@ -2546,9 +2538,11 @@ fn eval_with_zygote_pool_inner(
 
     match outcome {
         WorkerReqOutcome::Reply(rep) => {
-            let panicked = reply_has_runtime_panic(&rep);
-            let mismatch = rep.errors.iter().any(|e| e.contains("importsCsv changed"));
-            if rep.import_ok && !panicked && !mismatch {
+            let unusable = rep
+                .errors
+                .iter()
+                .any(|e| e == RUNTIME_PANIC_ERR || e.contains("importsCsv changed"));
+            if rep.import_ok && !unusable {
                 w.warm_imports
                     .insert(imports_csv.clone(), olean_digest.clone());
                 if let Some(pk) = active_prefix_key {
@@ -2606,30 +2600,8 @@ fn eval_with_zygote_pool_inner(
 
 /// Evaluate a single sub-shard (`prefix_source` + `sub_decl_source`) via the memory-governed
 /// `ZygotePool` with automatic `Command.State` prefix checkpoint reuse and RSS watermark recycling.
-#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub fn eval_shard_via_zygote(
-    store: &TurboStore,
-    toolchain: &str,
-    req_lean_path: &str,
-    env_vars: &std::collections::HashMap<String, String>,
-    lean_bin: &Path,
-    prefix_source: &str,
-    sub_decl_source: &str,
-) -> Result<ZygoteEvalReply> {
-    eval_shard_via_zygote_with_args(
-        store,
-        toolchain,
-        req_lean_path,
-        env_vars,
-        lean_bin,
-        prefix_source,
-        sub_decl_source,
-        &[],
-    )
-}
-
-#[allow(dead_code, clippy::too_many_arguments)]
-pub fn eval_shard_via_zygote_with_args(
     store: &TurboStore,
     toolchain: &str,
     req_lean_path: &str,
@@ -2699,30 +2671,8 @@ fn encode_multi_decl_zygote_req(
     (imports_csv, prefix_key, req_line)
 }
 
-#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub fn eval_subshards_batch_via_zygote(
-    store: &TurboStore,
-    toolchain: &str,
-    req_lean_path: &str,
-    env_vars: &std::collections::HashMap<String, String>,
-    lean_bin: &Path,
-    prefix_source: &str,
-    sub_decl_sources: &[String],
-) -> Result<ZygoteEvalReply> {
-    eval_subshards_batch_via_zygote_with_args(
-        store,
-        toolchain,
-        req_lean_path,
-        env_vars,
-        lean_bin,
-        prefix_source,
-        sub_decl_sources,
-        &[],
-    )
-}
-
-#[allow(dead_code, clippy::too_many_arguments)]
-pub fn eval_subshards_batch_via_zygote_with_args(
     store: &TurboStore,
     toolchain: &str,
     req_lean_path: &str,
@@ -2743,7 +2693,7 @@ pub fn eval_subshards_batch_via_zygote_with_args(
         });
     }
     if sub_decl_sources.len() == 1 {
-        return eval_shard_via_zygote_with_args(
+        return eval_shard_via_zygote(
             store,
             toolchain,
             req_lean_path,
@@ -2777,30 +2727,8 @@ pub fn eval_subshards_batch_via_zygote_with_args(
 /// The Zygote worker checkpoints `prefix_source` once and tests each candidate in order, stopping
 /// immediately at the first candidate that elaborates cleanly and passes `auditNewKernelDecls` (`0 sorryAx`),
 /// returning its index in `reply.winning_candidate_idx`.
-#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub fn eval_candidates_race_via_zygote(
-    store: &TurboStore,
-    toolchain: &str,
-    req_lean_path: &str,
-    env_vars: &std::collections::HashMap<String, String>,
-    lean_bin: &Path,
-    prefix_source: &str,
-    candidate_decl_sources: &[String],
-) -> Result<ZygoteEvalReply> {
-    eval_candidates_race_via_zygote_with_args(
-        store,
-        toolchain,
-        req_lean_path,
-        env_vars,
-        lean_bin,
-        prefix_source,
-        candidate_decl_sources,
-        &[],
-    )
-}
-
-#[allow(dead_code, clippy::too_many_arguments)]
-pub fn eval_candidates_race_via_zygote_with_args(
     store: &TurboStore,
     toolchain: &str,
     req_lean_path: &str,
@@ -2821,7 +2749,7 @@ pub fn eval_candidates_race_via_zygote_with_args(
         });
     }
     if candidate_decl_sources.len() == 1 {
-        let mut rep = eval_shard_via_zygote_with_args(
+        let mut rep = eval_shard_via_zygote(
             store,
             toolchain,
             req_lean_path,
@@ -4745,25 +4673,18 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert!(reply_has_runtime_panic(&rep));
-        if reply_has_runtime_panic(&rep) {
-            rep.ok = false;
-            if !rep
-                .errors
-                .iter()
-                .any(|e| e.contains("runtime panic") || e.contains("PANIC"))
-            {
-                rep.errors.push(
-                    "[TurboLean.ZygoteWorker] runtime panic; worker environment is unusable"
-                        .to_string(),
-                );
-            }
-        }
+        assert!(mark_runtime_panic(&mut rep));
         assert!(!rep.ok);
-        assert!(rep
-            .errors
-            .iter()
-            .any(|e| e.contains("runtime panic; worker environment is unusable")));
+        assert_eq!(rep.errors, vec![RUNTIME_PANIC_ERR.to_string()]);
+        // Idempotent, and ordinary output mentioning PANIC is not a runtime panic.
+        assert!(mark_runtime_panic(&mut rep) && rep.errors.len() == 1);
+        let mut benign = ZygoteEvalReply {
+            ok: true,
+            messages: vec!["info: \"PANIC button pressed\"".to_string()],
+            errors: vec!["unknown identifier 'runtime panic'".to_string()],
+            ..Default::default()
+        };
+        assert!(!mark_runtime_panic(&mut benign) && benign.ok);
 
         let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("panic_guard") else {
             return;
