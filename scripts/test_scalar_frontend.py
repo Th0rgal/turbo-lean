@@ -2264,6 +2264,26 @@ open LeanNative.IR LeanNative.Proofs
     let unboxBad := validateTranslationDecl (mkUnboxHeapTypeDecl true useRoot) (mkUnboxHeapTypeDecl false useRoot) 8
     unless !unboxBad.symRetEquiv && !unboxBad.passed do
       throw <| IO.userError s!"unboxScalar erased heap type of objPtr (useRoot={useRoot}): {reprStr unboxBad}"
+  let mkProjCachedSortDecl (corruptAt999 : Bool) (cmpProjected : Bool) : LNIRDecl := {
+    name := "proj_cached_sort"
+    params := [
+      { id := 0, name := "b", ty := .i1, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 2 .objPtr (.allocCtor 0 [] [0])
+        (.letBind 3 .i64 (.ctorGetScalar 2 0 .i64)
+          (.letBind 4 .i1 (.scalar (.binOp .eq (.var (if cmpProjected then 3 else 0)) (.constBool true)))
+            (.decRef 2 1
+              (.letBind 5 .i64 (.scalar
+                (if corruptAt999 then .select (.binOp .eq (.var 1) (.constU64 999)) (.constU64 1) (.constU64 0)
+                 else .constU64 0)) (.ret 5)))))
+  }
+  for cmpProjected in [false, true] do
+    let projSortBad := validateTranslationDecl (mkProjCachedSortDecl false cmpProjected) (mkProjCachedSortDecl true cmpProjected) 8
+    unless !projSortBad.symRetEquiv && !projSortBad.passed do
+      throw <| IO.userError s!"ctorGetScalar overwrote cached field runtime sort (cmpProjected={cmpProjected}): {reprStr projSortBad}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)
