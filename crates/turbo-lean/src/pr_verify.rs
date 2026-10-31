@@ -2322,6 +2322,7 @@ fn run_lean_temp_file(
             cmd.arg(format!("-D{}={}", k, v));
         }
         cmd.arg("-Dwarn.sorry=true")
+            .arg("-Ddebug.skipKernelTC=false")
             .arg(&sandbox_lean)
             .arg("-R")
             .arg(&tmp_dir)
@@ -2338,11 +2339,8 @@ fn run_lean_temp_file(
         }
         let stdout_str = String::from_utf8_lossy(&out.stdout);
         let stderr_str = String::from_utf8_lossy(&out.stderr);
-        if stdout_str.contains("declaration uses 'sorry'")
-            || stdout_str.contains("declaration uses `sorry`")
-            || stderr_str.contains("declaration uses 'sorry'")
-            || stderr_str.contains("declaration uses `sorry`")
-        {
+        // Match the prefix: `pp.*` options change how the `sorry` term itself prints.
+        if stdout_str.contains("declaration uses ") || stderr_str.contains("declaration uses ") {
             anyhow::bail!(
                 "Untrusted PR shard verification rejected `{}` due to `sorry` axiom usage",
                 mod_name
