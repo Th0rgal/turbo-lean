@@ -1988,12 +1988,18 @@ pub const FASTCHECK_PRELUDE_HARNESS: &str = "prelude\nimport Init.System.IO\n\n@
 /// `--start-group -lLean -lInit -lStd -lLake --gc-sections` scan) with automatic fallback to `leanc -O3`.
 pub fn compile_fastcheck_c_to_bin(
     lean_bin: &Path,
-    leanc_bin: &Path,
     tmp_c: &Path,
     tmp_bin: &Path,
     work_dir: &Path,
     env_vars: &std::collections::HashMap<String, String>,
 ) -> Result<std::process::Output> {
+    let tools = crate::module_builder::ToolchainExecutables::from_lean(lean_bin)?;
+    let lean_bin = tools.lean.as_path();
+    let leanc_bin = tools.leanc.as_path();
+    let mut env_vars = env_vars.clone();
+    tools.apply_env(&mut env_vars);
+    let env_vars = &env_vars;
+
     if let (Some(bin_dir), Some(tc_root)) = (
         lean_bin.parent(),
         lean_bin.parent().and_then(|b| b.parent()),
@@ -2075,7 +2081,7 @@ pub fn compute_fastcheck_binary_key(is_cu: bool, effective_source: &str) -> Stri
 
 pub fn compute_fastcheck_binary_key_parts(is_cu: bool, src_text: &str, suffix: &str) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"fastcheck-bin:v1:");
+    hasher.update(b"fastcheck-bin:v2:absolute-tools:");
     hasher.update(std::env::consts::ARCH.as_bytes());
     hasher.update(if is_cu { b":cuda:" } else { b":lean_c_o3:" });
     hasher.update(src_text.as_bytes());
@@ -2263,17 +2269,19 @@ pub fn prewarm_shared_fastcheck_harness(
     lean_bin: &Path,
     env_vars: &std::collections::HashMap<String, String>,
 ) -> Result<()> {
+    let tools = crate::module_builder::ToolchainExecutables::from_lean(lean_bin)?;
+    let lean_bin = tools.lean.as_path();
+    let mut env_vars = env_vars.clone();
+    tools.apply_env(&mut env_vars);
+    let env_vars = &env_vars;
+
     let staging = store.fast_staging_dir();
     let shared_bin = shared_fastcheck_cgen_path(&staging, FASTCHECK_PRELUDE_HARNESS);
     if shared_bin.exists() {
         ensure_shared_fastcheck_out(&shared_bin);
         return Ok(());
     }
-    let leanc_bin = lean_bin
-        .parent()
-        .map(|p| p.join("leanc"))
-        .filter(|cand| cand.exists())
-        .unwrap_or_else(|| std::path::PathBuf::from("leanc"));
+
     let pid = std::process::id();
     let ts = next_tmp_id();
     let tmp_lean = staging.join(format!("prewarm_fc_{}_{}.lean", pid, ts));
@@ -2290,8 +2298,7 @@ pub fn prewarm_shared_fastcheck_harness(
         .output()?;
     let _ = fs::remove_file(&tmp_lean);
     if out1.status.success() {
-        if let Ok(out2) =
-            compile_fastcheck_c_to_bin(lean_bin, &leanc_bin, &tmp_c, &tmp_bin, &staging, env_vars)
+        if let Ok(out2) = compile_fastcheck_c_to_bin(lean_bin, &tmp_c, &tmp_bin, &staging, env_vars)
         {
             let _ = fs::remove_file(&tmp_c);
             if out2.status.success() {
@@ -2925,6 +2932,70 @@ pub fn offload_check_shards_batch_http(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn verifier_helpers_fail_closed_when_toolchain_siblings_are_missing() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "turbo-missing-tools-{}-{}",
+            std::process::id(),
+            next_tmp_id()
+        ));
+        fs::create_dir_all(dir.join("bin"))?;
+        fs::create_dir_all(dir.join("path"))?;
+        let marker = dir.join("invoked");
+        let script = format!("#!/bin/sh\necho invoked > '{}'\n", marker.display());
+        for tool in ["lean", "lake", "leanc"] {
+            for bin in ["bin", "path"] {
+                let path = dir.join(bin).join(tool);
+                fs::write(&path, &script)?;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+            }
+        }
+        let lean = dir.join("bin/lean");
+        let store = TurboStore::open(Some(&dir.join("store")))?;
+        let env = std::collections::HashMap::from([(
+            "PATH".into(),
+            dir.join("path").to_string_lossy().into_owned(),
+        )]);
+        for missing in ["lake", "leanc"] {
+            let path = dir.join("bin").join(missing);
+            fs::rename(&path, path.with_extension("saved"))?;
+            for error in [
+                crate::zygote::ensure_zygote_binary(&store, &lean, &env).unwrap_err(),
+                prewarm_shared_fastcheck_harness(&store, &lean, &env).unwrap_err(),
+                compile_fastcheck_c_to_bin(
+                    &lean,
+                    &dir.join("input.c"),
+                    &dir.join("output"),
+                    &dir,
+                    &env,
+                )
+                .unwrap_err(),
+            ] {
+                let message = format!("{error:#}");
+                assert!(
+                    message.contains("Missing required toolchain sibling")
+                        && message.contains(missing),
+                    "{message}"
+                );
+            }
+            assert!(
+                !marker.exists(),
+                "helper resolved a missing sibling through PATH"
+            );
+            fs::rename(path.with_extension("saved"), path)?;
+        }
+        assert!(
+            crate::module_builder::ToolchainExecutables::from_lean(Path::new("lean"))
+                .unwrap_err()
+                .to_string()
+                .contains("must be absolute")
+        );
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
 
     #[test]
     fn test_is_loopback_http_url_rejects_lookalike_hosts() {

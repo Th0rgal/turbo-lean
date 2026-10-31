@@ -286,8 +286,17 @@ pub fn serve_cas_http_with_auth(
                     })
                     .map(|p| crate::lake_build::resolve_remote_lean_path(&p, None))
                     .unwrap_or_default();
-                let (env_vars, lean_bin) =
-                    resolve_server_lean_env_and_bin(&bg_store, "leanprover/lean4:v4.35.0", &lp);
+                let (env_vars, lean_bin) = match resolve_server_lean_env_and_bin(
+                    &bg_store,
+                    "leanprover/lean4:v4.35.0",
+                    &lp,
+                ) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        eprintln!("Verifier prewarm failed: {error:#}");
+                        return;
+                    }
+                };
                 let _ = crate::zygote::ensure_zygote_binary(&bg_store, &lean_bin, &env_vars);
                 if !lp.is_empty() {
                     // Ensure at least two idle workers in the server's Zygote pool have
@@ -967,8 +976,21 @@ pub fn serve_cas_http_with_auth(
                         );
                         return;
                     }
-                    let (mut env_vars, lean_bin) =
-                        resolve_server_lean_env_and_bin(&req_store, tc, &req.lean_path);
+                    let (mut env_vars, lean_bin) = match resolve_server_lean_env_and_bin(
+                        &req_store,
+                        tc,
+                        &req.lean_path,
+                    ) {
+                        Ok(resolved) => resolved,
+                        Err(error) => {
+                            let _ = write_json_response(
+                                &mut stream,
+                                400,
+                                &serde_json::json!({"ok": false, "error": format!("{error:#}")}),
+                            );
+                            return;
+                        }
+                    };
                     if let Some(caller_env) = req.env_vars {
                         for (k, v) in caller_env {
                             if !is_safe_lean_env_key(&k) {
@@ -1118,216 +1140,32 @@ pub fn run_server_with_auth(
     )
 }
 
-fn collect_elan_toolchain_roots() -> Vec<std::path::PathBuf> {
-    let mut elan_tc_roots = Vec::new();
-    if let Ok(eh) = std::env::var("ELAN_HOME") {
-        elan_tc_roots.push(Path::new(&eh).join("toolchains"));
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        let home_path = Path::new(&home);
-        elan_tc_roots.push(home_path.join(".elan/toolchains"));
-        let mut anc = home_path.parent();
-        for _ in 0..3 {
-            if let Some(p) = anc {
-                elan_tc_roots.push(p.join(".elan/toolchains"));
-                elan_tc_roots.push(p.join("caches/elan/toolchains"));
-                anc = p.parent();
-            }
-        }
-    }
-    if let Ok(path_var) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            if let Some(parent) = dir.parent() {
-                let cand = parent.join("toolchains");
-                if cand.is_dir() && !elan_tc_roots.contains(&cand) {
-                    elan_tc_roots.push(cand);
-                } else if let Some(gp) = parent.parent().and_then(|p| p.parent()) {
-                    let cand_gp = gp.join("toolchains");
-                    if cand_gp.is_dir() && !elan_tc_roots.contains(&cand_gp) {
-                        elan_tc_roots.push(cand_gp);
-                    }
-                }
-            }
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        for anc in exe.ancestors() {
-            for rel in [
-                ".elan/toolchains",
-                "../.elan/toolchains",
-                "../caches/elan/toolchains",
-            ] {
-                let cand = anc.join(rel);
-                if cand.is_dir() && !elan_tc_roots.contains(&cand) {
-                    elan_tc_roots.push(cand);
-                }
-            }
-        }
-    }
-    elan_tc_roots
-}
-
-/// Check whether an explicitly requested Lean toolchain (or a compatible fallback such as `v4.35.0`)
-/// is available when strict toolchain enforcement is active.
+/// Availability uses the same strict resolver as execution; no unrelated-toolchain fallback.
 pub fn is_toolchain_installed(toolchain: &str) -> bool {
-    let trimmed = toolchain.trim();
-    if trimmed.is_empty() || trimmed == "unknown" {
-        return true;
-    }
-    let strict_tc = trimmed.contains("99.99")
-        || trimmed.contains("nonexistent")
-        || std::env::var("TURBO_LEAN_STRICT_TOOLCHAIN")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-    let (tc_dir_name, alt_dir_1, alt_dir_2) = toolchain_dir_candidates(trimmed);
-    let elan_tc_roots = collect_elan_toolchain_roots();
-    let mut any_root_exists = false;
-    let mut any_tc_installed = false;
-    for tc_root in &elan_tc_roots {
-        if tc_root.is_dir() {
-            any_root_exists = true;
-            for cand_name in [&tc_dir_name, &alt_dir_1, &alt_dir_2] {
-                if tc_root.join(cand_name).join("bin").join("lean").exists() {
-                    return true;
-                }
-            }
-            if !strict_tc {
-                if tc_root
-                    .join("leanprover--lean4---v4.35.0")
-                    .join("bin")
-                    .join("lean")
-                    .exists()
-                {
-                    any_tc_installed = true;
-                } else if let Ok(entries) = fs::read_dir(tc_root) {
-                    if entries
-                        .flatten()
-                        .any(|e| e.path().join("bin").join("lean").exists())
-                    {
-                        any_tc_installed = true;
-                    }
-                }
-            }
-        }
-    }
-    if !strict_tc && any_tc_installed {
-        return true;
-    }
-    !any_root_exists
+    std::env::current_dir()
+        .ok()
+        .and_then(|project| {
+            crate::module_builder::ToolchainExecutables::resolve(&project, toolchain).ok()
+        })
+        .is_some()
 }
-
-static SERVER_LEAN_ENV_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<
-        std::collections::HashMap<
-            (std::path::PathBuf, String, String),
-            (
-                std::collections::HashMap<String, String>,
-                std::path::PathBuf,
-            ),
-        >,
-    >,
-> = std::sync::OnceLock::new();
 
 pub(crate) fn resolve_server_lean_env_and_bin(
-    store: &TurboStore,
+    _store: &TurboStore,
     toolchain: &str,
     lean_path: &str,
-) -> (
+) -> Result<(
     std::collections::HashMap<String, String>,
     std::path::PathBuf,
-) {
-    let cache_key = (
-        store.root.clone(),
-        toolchain.to_string(),
-        lean_path.to_string(),
-    );
-    if let Some(m) = SERVER_LEAN_ENV_CACHE.get() {
-        if let Ok(guard) = m.lock() {
-            if let Some(hit) = guard.get(&cache_key) {
-                return hit.clone();
-            }
-        }
-    }
-
+)> {
+    let tools =
+        crate::module_builder::ToolchainExecutables::resolve(&std::env::current_dir()?, toolchain)?;
     let mut env_vars = std::collections::HashMap::new();
     if !lean_path.is_empty() {
         env_vars.insert("LEAN_PATH".to_string(), lean_path.to_string());
     }
-
-    let elan_tc_roots = collect_elan_toolchain_roots();
-
-    let (tc_dir_name, alt_dir_1, alt_dir_2) = toolchain_dir_candidates(toolchain);
-    let lean_bin = {
-        let mut found = None;
-        if !tc_dir_name.is_empty() {
-            'outer: for tc_root in &elan_tc_roots {
-                for cand_name in [&tc_dir_name, &alt_dir_1, &alt_dir_2] {
-                    let cand = tc_root.join(cand_name).join("bin").join("lean");
-                    if cand.exists() {
-                        found = Some(cand);
-                        break 'outer;
-                    }
-                }
-            }
-        }
-        found
-    }
-    .or_else(|| {
-        for tc_root in &elan_tc_roots {
-            if let Ok(entries) = fs::read_dir(tc_root) {
-                let mut dirs: Vec<std::path::PathBuf> =
-                    entries.flatten().map(|e| e.path()).collect();
-                dirs.sort();
-                if let Some(cand) = dirs
-                    .into_iter()
-                    .rev()
-                    .map(|d| d.join("bin").join("lean"))
-                    .find(|cand| cand.exists())
-                {
-                    return Some(cand);
-                }
-            }
-        }
-        None
-    })
-    .or_else(|| {
-        std::env::var("PATH").ok().and_then(|p| {
-            p.split(':')
-                .map(|dir| Path::new(dir).join("lean"))
-                .find(|cand| cand.exists())
-        })
-    })
-    .or_else(|| {
-        std::env::var("ELAN_HOME")
-            .ok()
-            .map(|eh| Path::new(&eh).join("bin/lean"))
-            .filter(|cand| cand.exists())
-    })
-    .or_else(|| {
-        std::env::var("HOME")
-            .ok()
-            .map(|h| Path::new(&h).join(".elan/bin/lean"))
-            .filter(|cand| cand.exists())
-    })
-    .unwrap_or_else(|| std::path::PathBuf::from("lean"));
-
-    let cache_mutex = SERVER_LEAN_ENV_CACHE
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    if let Ok(mut guard) = cache_mutex.lock() {
-        guard.insert(cache_key, (env_vars.clone(), lean_bin.clone()));
-    }
-
-    (env_vars, lean_bin)
-}
-
-fn toolchain_dir_candidates(toolchain: &str) -> (String, String, String) {
-    let tc_dir_name = toolchain.trim().replace('/', "--").replace(':', "---");
-    let stripped_v = toolchain.trim().trim_start_matches('v');
-    (
-        tc_dir_name.clone(),
-        format!("leanprover--lean4---{}", tc_dir_name),
-        format!("leanprover--lean4---v{}", stripped_v),
-    )
+    tools.apply_env(&mut env_vars);
+    Ok((env_vars, tools.lean))
 }
 
 /// Run `lean` on a temporary source file, applying `#print axioms` auditing under `allowed` when
@@ -1353,11 +1191,11 @@ fn run_lean_temp_file(
         crate::splitter::with_axiom_audit(source, audit)
     };
     fs::write(&tmp, &audited_src)?;
-    let mut cmd = Command::new(lean_bin);
+    let mut cmd = crate::module_builder::verifier_command(lean_bin, env_vars)?;
     for arg in crate::module_builder::filter_allowed_lean_args(lean_args) {
         cmd.arg(arg);
     }
-    cmd.arg(&tmp).envs(env_vars);
+    cmd.arg(&tmp);
     if !toolchain.is_empty() && toolchain != "unknown" && !env_vars.contains_key("ELAN_TOOLCHAIN") {
         cmd.env("ELAN_TOOLCHAIN", toolchain.trim());
     }
@@ -1553,7 +1391,7 @@ fn execute_check_shard_payload_deferred_with_domain(
     };
 
     let (mut env_vars, lean_bin) =
-        resolve_server_lean_env_and_bin(store, toolchain, &req.lean_path);
+        resolve_server_lean_env_and_bin(store, toolchain, &req.lean_path)?;
     env_vars.insert(
         crate::splitter::ALLOWED_AXIOMS_ENV.to_string(),
         req_allowed_csv,
@@ -1831,7 +1669,7 @@ fn execute_check_shards_batch_payload_deferred(
     };
 
     let (mut env_vars, lean_bin) =
-        resolve_server_lean_env_and_bin(store, toolchain, &req.lean_path);
+        resolve_server_lean_env_and_bin(store, toolchain, &req.lean_path)?;
     env_vars.insert(
         crate::splitter::ALLOWED_AXIOMS_ENV.to_string(),
         req_allowed_csv,
@@ -2175,19 +2013,7 @@ fn execute_fastcheck_payload_deferred(
                 let tmp_bin = staging.join(format!("http_fc_{}_{}.bin", pid, ts));
 
                 let (env_vars, lean_bin) =
-                    resolve_server_lean_env_and_bin(store, "leanprover/lean4:v4.35.0", "");
-                let leanc_bin = lean_bin
-                    .parent()
-                    .map(|p| p.join("leanc"))
-                    .filter(|cand| cand.exists())
-                    .or_else(|| {
-                        env_vars.get("PATH").and_then(|p| {
-                            p.split(':')
-                                .map(|dir| Path::new(dir).join("leanc"))
-                                .find(|cand| cand.exists())
-                        })
-                    })
-                    .unwrap_or_else(|| std::path::PathBuf::from("leanc"));
+                    resolve_server_lean_env_and_bin(store, "leanprover/lean4:v4.35.0", "")?;
 
                 let mut out1_ok = false;
                 if let Some(ref fast_src) = cgen_fast_src {
@@ -2226,9 +2052,8 @@ fn execute_fastcheck_payload_deferred(
                 }
                 let _ = fs::remove_file(&tmp_lean);
 
-                let out2 = compile_fastcheck_c_to_bin(
-                    &lean_bin, &leanc_bin, &tmp_c, &tmp_bin, &staging, &env_vars,
-                )?;
+                let out2 =
+                    compile_fastcheck_c_to_bin(&lean_bin, &tmp_c, &tmp_bin, &staging, &env_vars)?;
                 let _ = fs::remove_file(&tmp_c);
                 if !out2.status.success() {
                     anyhow::bail!(

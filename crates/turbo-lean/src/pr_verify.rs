@@ -4,11 +4,11 @@
 use crate::db::{SingleflightOutcome, TurboStore};
 use crate::lake_build::{
     are_all_project_oleans_up_to_date, compute_shard_key_with_args, detect_toolchain,
-    lean_bin_from_env, load_and_split_files_cached, load_and_split_files_with_hashes_cached,
-    load_project_stat_summary_cached, resolve_lake_env, resolve_or_share_lake_env,
-    resolve_prebuilt_module_import, resolve_remote_lean_path, seed_project_theorem_shards,
-    seed_project_theorem_shards_from_splits, stage_lake_build_outputs, FileSplitsWithCacheHits,
-    SourceFileSplit,
+    load_and_split_files_cached, load_and_split_files_with_hashes_cached,
+    load_project_stat_summary_cached, resolve_lake_env, resolve_lean_bin,
+    resolve_or_share_lake_env, resolve_prebuilt_module_import, resolve_remote_lean_path,
+    seed_project_theorem_shards, seed_project_theorem_shards_from_splits, stage_lake_build_outputs,
+    FileSplitsWithCacheHits, SourceFileSplit,
 };
 use crate::pack;
 use crate::splitter::{self, split_lean_source, split_lean_source_fast_no_cone};
@@ -2619,11 +2619,11 @@ fn run_lean_temp_file(
     let tmp_path = &tmp_path.with_extension(format!("{}.lean", n));
     let (audited_src, audited) = splitter::with_axiom_audit(src, audit);
     fs::write(tmp_path, audited_src.as_bytes())?;
-    let mut cmd = Command::new(lean_bin);
+    let mut cmd = crate::module_builder::verifier_command(Path::new(lean_bin), env_vars)?;
     for arg in crate::module_builder::filter_allowed_lean_args(lean_args) {
         cmd.arg(arg);
     }
-    cmd.arg(tmp_path).current_dir(canon_dir).envs(env_vars);
+    cmd.arg(tmp_path).current_dir(canon_dir);
     let out = cmd.output()?;
     let _ = fs::remove_file(tmp_path);
     if out.status.success() {
@@ -3400,16 +3400,25 @@ fn statement_toolchain_command(
     tool: &str,
     lean_path: Option<&str>,
 ) -> Result<Command> {
-    let (lean, _, _, lib) = crate::module_builder::resolve_toolchain_compiler_with_trust(
-        project,
-        &detect_toolchain(project),
-        true, // Resolve installed toolchains only, even for trusted statement builds.
-    )?;
-    let executable = lean.with_file_name(tool);
+    let tools =
+        crate::module_builder::ToolchainExecutables::resolve(project, &detect_toolchain(project))?;
+    let executable = match tool {
+        "lean" => &tools.lean,
+        "lake" => &tools.lake,
+        "leanc" => &tools.leanc,
+        _ => anyhow::bail!("Unknown verifier tool `{tool}`"),
+    };
+    let lib = tools
+        .lean
+        .parent()
+        .and_then(Path::parent)
+        .context("Missing stock toolchain prefix")?
+        .join("lib");
     if !is_untrusted {
         let mut command = Command::new(&executable);
         command
             .current_dir(project)
+            .env("PATH", tools.path())
             .env_remove("LEAN_PATH")
             .env_remove("LEAN_SRC_PATH")
             .env(
@@ -3443,10 +3452,7 @@ fn statement_toolchain_command(
             "--setenv",
             "PATH",
         ])
-        .arg(format!(
-            "{}:/usr/bin:/bin",
-            lean.parent().context("Missing toolchain bin")?.display()
-        ))
+        .arg(tools.path())
         .args(["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]);
     for path in [
         "/usr",
@@ -4260,10 +4266,10 @@ pub fn run_pr_verify_command(
             let lp = resolve_remote_lean_path(&canon_dir, None);
             let mut fast_ev = std::collections::HashMap::new();
             fast_ev.insert("LEAN_PATH".to_string(), lp.clone());
-            (fast_ev, "lean".to_string(), lp)
+            (fast_ev, resolve_lean_bin(&canon_dir)?, lp)
         } else {
             let (ev, _) = resolve_lake_env(store, &canon_dir)?;
-            let lb = lean_bin_from_env(&ev);
+            let lb = resolve_lean_bin(&canon_dir)?;
             let lp = resolve_remote_lean_path(&canon_dir, Some(&ev));
             (ev, lb, lp)
         };
@@ -4416,7 +4422,7 @@ pub fn run_pr_verify_command(
                     let lb = if env_vars.is_empty() {
                         lean_bin.clone()
                     } else {
-                        lean_bin_from_env(&env_vars)
+                        resolve_lean_bin(&canon_dir)?
                     };
                     let tmp_cross = staging_dir.join(format!("pr_verify_cross_{}.lean", pid));
                     let cross_names: std::collections::HashSet<String> = uncached_by_file
@@ -6726,11 +6732,11 @@ end Fixture
             "{}",
             untrusted_err
         );
-        // Trusted mode uses `[lake] build_command` (read at `--base`) and catches `P.B` too.
+        // Trusted mode also uses stock Lake and catches P.B without executing the wrapper.
         let trusted_err = pr_verify_mode("trusted").unwrap_err().to_string();
         assert!(
-            rce_marker.exists(),
-            "trusted dependent recheck should honor [lake] build_command at --base"
+            !rce_marker.exists(),
+            "trusted dependent recheck must use stock Lake instead of [lake] build_command"
         );
         assert!(
             trusted_err.contains("P.B") || trusted_err.contains("P/B.lean"),
