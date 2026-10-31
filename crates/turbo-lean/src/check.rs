@@ -309,7 +309,7 @@ pub fn try_stateless_remote_check(
         return Ok(false);
     };
     let file_lean_args =
-        crate::module_builder::try_resolve_lean_args_for_path(&canon_dir, Some(&canon_file));
+        crate::module_builder::try_resolve_lean_args_for_path(&canon_dir, Some(&canon_file))?;
     let req_items: Vec<pack::CheckShardBatchItem> = split
         .shards
         .iter()
@@ -469,7 +469,7 @@ pub fn try_stateless_remote_single_decl_check(
         return Ok(false);
     };
     let file_lean_args =
-        crate::module_builder::try_resolve_lean_args_for_path(&canon_dir, Some(&canon_file));
+        crate::module_builder::try_resolve_lean_args_for_path(&canon_dir, Some(&canon_file))?;
     let shard_key = compute_shard_key_with_args(&toolchain, shard, &file_lean_args);
     let mut single_set = HashSet::new();
     single_set.insert(target_decl.to_string());
@@ -943,7 +943,7 @@ fn check_directory(
     let mut dir_hasher = blake3::Hasher::new();
     dir_hasher.update(toolchain.as_bytes());
 
-    let dir_pkg_cfg = crate::module_builder::resolve_package_config(canon_dir, false).ok();
+    let dir_pkg_cfg = crate::module_builder::optional_package_config(canon_dir)?;
     let (split_entries, split_cache_hits) =
         load_and_split_files_with_hashes_cached(store, &dir_files)?;
     let mut parsed_files = Vec::with_capacity(split_entries.len());
@@ -1458,7 +1458,7 @@ pub(crate) fn compute_fission_store_key_with_args(
             toolchain, prefix_env_hash, sub_shard_key
         )
     };
-    if let Some(opts_digest) = crate::module_builder::compute_lean_args_digest(lean_args) {
+    if let Some(opts_digest) = crate::module_builder::effective_lean_args_digest(lean_args) {
         base.push_str(":opts:");
         base.push_str(&opts_digest);
     }
@@ -1627,7 +1627,7 @@ fn check_single_decl(
     }
     let shard = &split.shards[shard_idx];
     let file_lean_args =
-        crate::module_builder::try_resolve_lean_args_for_path(canon_dir, Some(&active_file));
+        crate::module_builder::try_resolve_lean_args_for_path(canon_dir, Some(&active_file))?;
 
     let shard_key = compute_shard_key_with_args(toolchain, shard, &file_lean_args);
     let make_cache_hit_json = |coalesced: bool, elapsed_ms: u128| {
@@ -2942,7 +2942,7 @@ fn check_single_file(
     let file_lean_args = crate::module_builder::try_resolve_lean_args_for_path(
         canon_dir,
         Some(canon_resolved_initial),
-    );
+    )?;
     let file_shard_keys: Vec<String> = split
         .shards
         .iter()
@@ -4469,6 +4469,45 @@ but is expected to have type
         assert_eq!(mcp_out["ok"], false);
         assert_eq!(mcp_out["verified"], false);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_config_errors_before_empty_option_cache_lookup() -> Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("turbo_check_bad_options_{}", pack::next_tmp_id()));
+        let project = dir.join("project");
+        fs::create_dir_all(&project)?;
+        let file = project.join("Options.lean");
+        let source = "theorem option_error : True := by trivial\n";
+        fs::write(&file, source)?;
+        let tc = "leanprover/lean4:v4.35.0";
+        let split = split_lean_source(source, &[]);
+        let shard = &split.shards[0];
+        let key = compute_shard_key(tc, shard);
+        let receipt = make_shard_receipt_bytes(
+            &shard.name,
+            &shard.prefix_env_hash,
+            &shard.stmt_hash,
+            &shard.proof_hash,
+            db::now_unix(),
+        )?;
+        let mut store = TurboStore::open(Some(&dir.join("store")))?;
+        store.batch_publish_theorem_shards(
+            tc,
+            "trusted",
+            &[(key, shard.name.clone(), receipt, 1)],
+        )?;
+        fs::write(
+            project.join("lakefile.toml"),
+            "name = \"invalid\"\nmoreLeanArgs = [\"--plugin=bad.so\"]\n",
+        )?;
+        for decl in [Some("option_error".to_string()), None] {
+            let err = evaluate_check_command_value(&mut store, file.clone(), decl, project.clone())
+                .unwrap_err();
+            assert!(format!("{err:#}").contains("Failed to resolve Lean options"));
+        }
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
     }
 
     #[test]

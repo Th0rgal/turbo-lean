@@ -752,7 +752,7 @@ pub(crate) fn compute_shard_key_with_args(
         key_hasher.update(b":axioms:");
         key_hasher.update(allowed.join(",").as_bytes());
     }
-    if let Some(ad) = crate::module_builder::compute_lean_args_digest(lean_args) {
+    if let Some(ad) = crate::module_builder::effective_lean_args_digest(lean_args) {
         key_hasher.update(b":opts:");
         key_hasher.update(ad.as_bytes());
     }
@@ -1756,6 +1756,7 @@ pub(crate) fn load_verified_project_manifest(
         || manifest.toolchain != cfg.toolchain
         || manifest.lean_githash != cfg.lean_githash
         || manifest.pkg_config_digest != cfg.root_pkg.config_digest
+        || manifest.workspace_config_digest != cfg.canonical_config_digest
         || manifest.allowed_axioms != crate::splitter::allowed_axioms()
     {
         return None;
@@ -1829,19 +1830,26 @@ pub(crate) fn are_all_project_oleans_up_to_date(
         return false;
     };
 
-    let lakefile_mtime = [
-        "lakefile.lean",
-        "lakefile.toml",
-        "lake-manifest.json",
-        "lean-toolchain",
-    ]
-    .into_iter()
-    .filter_map(|name| {
-        fs::metadata(canon_dir.join(name))
-            .and_then(|m| m.modified())
-            .ok()
-    })
-    .max();
+    let Ok(cfg) = crate::module_builder::resolve_project_config(canon_dir) else {
+        return false;
+    };
+    let lakefile_mtime = std::iter::once(&cfg.root_pkg)
+        .chain(cfg.dep_pkgs.iter())
+        .flat_map(|pkg| {
+            [
+                "lakefile.lean",
+                "lakefile.toml",
+                "lake-manifest.json",
+                "lean-toolchain",
+            ]
+            .into_iter()
+            .filter_map(|name| {
+                fs::metadata(pkg.pkg_root.join(name))
+                    .and_then(|m| m.modified())
+                    .ok()
+            })
+        })
+        .max();
     let mut checked_oleans = 0usize;
 
     for (rel_path, cur_b3) in file_hashes {
@@ -2621,7 +2629,7 @@ pub(crate) fn seed_project_theorem_shards_from_splits(
     let mut files_seeded = 0usize;
     let mut batch_items: Vec<(String, String, Vec<u8>, i64)> = Vec::new();
 
-    let pkg_cfg_opt = crate::module_builder::resolve_package_config(canon_dir, false).ok();
+    let pkg_cfg_opt = crate::module_builder::optional_package_config(canon_dir)?;
     for (lf, _src, split) in split_entries {
         if require_olean && resolve_prebuilt_module_import(canon_dir, lf).is_none() {
             continue;
@@ -3449,6 +3457,51 @@ mod tests {
     }
 
     #[test]
+    fn seeding_rejects_invalid_config_before_publishing() -> Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("turbo_seed_options_{}", crate::pack::next_tmp_id()));
+        let project = dir.join("project");
+        fs::create_dir_all(&project)?;
+        let file = project.join("Demo.lean");
+        let source = "theorem seed_options : True := by trivial\n";
+        fs::write(&file, source)?;
+        let split = split_lean_source(source, &[]);
+        assert_eq!(split.shards.len(), 1);
+        let key = compute_shard_key("test", &split.shards[0]);
+        let splits = vec![(file, source.to_string(), split)];
+        let mut store = TurboStore::open(Some(&dir.join("store")))?;
+        for config in [
+            "name = [",
+            "name = \"bad\"\nmoreLeanArgs = [\"--plugin=bad.so\"]\n",
+        ] {
+            fs::write(project.join("lakefile.toml"), config)?;
+            let err = seed_project_theorem_shards_from_splits(
+                &mut store, &project, "test", "trusted", false, &splits,
+            )
+            .unwrap_err();
+            assert!(format!("{err:#}").contains("Failed to resolve Lean options"));
+            assert!(store
+                .batch_get_theorem_shards_readonly(std::slice::from_ref(&key), "trusted")?
+                .is_empty());
+            let count: i64 = store
+                .conn
+                .query_row("SELECT COUNT(*) FROM actions", [], |r| r.get(0))?;
+            assert_eq!(count, 0, "invalid configuration must publish no entries");
+        }
+        // Standalone projects with no Lake config still have known empty options.
+        fs::remove_file(project.join("lakefile.toml"))?;
+        assert_eq!(
+            seed_project_theorem_shards_from_splits(
+                &mut store, &project, "test", "trusted", false, &splits,
+            )?,
+            (1, 1)
+        );
+        assert!(store.has_cached_action_readonly(&key, "trusted")?);
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn test_imported_olean_modification_invalidates_shard_key() {
         let tmp_dir = std::env::temp_dir().join(format!(
             "turbo_lean_test_olean_inv_{}_{}",
@@ -3559,6 +3612,7 @@ mod tests {
                 toolchain: cfg.toolchain.clone(),
                 lean_githash: cfg.lean_githash.clone(),
                 pkg_config_digest: cfg.root_pkg.config_digest.clone(),
+                workspace_config_digest: cfg.canonical_config_digest.clone(),
                 allowed_axioms: crate::splitter::allowed_axioms(),
                 modules: std::collections::BTreeMap::from([(
                     "P/A.lean".into(),
