@@ -2841,6 +2841,7 @@ pub(crate) fn stage_lake_build_outputs(
     let fallback_shm_blobs = pack::shared_cas_blobs_dir();
     let has_distinct_fallback = fallback_shm_blobs != shared_blobs;
     let mut seen_prefix = [false; 256];
+    let mut created_parents: Vec<PathBuf> = Vec::new();
     let mut seen_shared_prefix = [false; 256];
     let mut seen_blobs = std::collections::HashSet::with_capacity(entries.len());
     let mut reg_blobs = Vec::with_capacity(entries.len());
@@ -2864,14 +2865,7 @@ pub(crate) fn stage_lake_build_outputs(
             let nlink = fs::metadata(path)?.nlink();
             if !preserve_lake && ((*mode & 0o200) == 0 || nlink > 1) {
                 let bytes = fs::read(path)?;
-                let tmp_detach = path.with_extension(format!(
-                    "detach_tmp.{}.{}",
-                    std::process::id(),
-                    pack::next_tmp_id()
-                ));
-                fs::write(&tmp_detach, &bytes)?;
-                fs::set_permissions(&tmp_detach, fs::Permissions::from_mode(0o644))?;
-                fs::rename(&tmp_detach, path)?;
+                crate::db::write_bytes_durable(path, &bytes, &[])?;
                 if fs::metadata(path)?.nlink() != 1 {
                     anyhow::bail!(
                         "Failed to detach `.lake/build` artifact `{}` from CAS hard-link",
@@ -2893,50 +2887,86 @@ pub(crate) fn stage_lake_build_outputs(
         if !seen_prefix[p_idx] {
             seen_prefix[p_idx] = true;
             if let Some(parent) = dest.parent() {
-                let _ = fs::create_dir(parent);
+                created_parents.extend(crate::db::ensure_dir_tracking(parent, &store.root)?);
             }
         }
         let shared_dir = shared_blobs.join(prefix);
         let shared_p = shared_dir.join(&entry.blob_hash);
         let fallback_p = fallback_shm_blobs.join(prefix).join(&entry.blob_hash);
         let mut sync_shared = |dest_p: &Path| {
-            if !seen_shared_prefix[p_idx] {
+            let shared_stop = shared_blobs.parent().unwrap_or(&shared_blobs);
+            let shared_created = if !seen_shared_prefix[p_idx] {
                 seen_shared_prefix[p_idx] = true;
-                let _ = fs::create_dir_all(&shared_dir);
-            }
+                crate::db::ensure_dir_tracking(&shared_dir, shared_stop).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             if !shared_p.exists() {
-                let _ = fs::hard_link(dest_p, &shared_p);
+                let _ = crate::db::publish_durable_link(dest_p, &shared_p, &shared_created);
+            } else {
+                for dir in &shared_created {
+                    let _ = crate::db::sync_dir(dir);
+                }
             }
         };
-        let ino = if fs::hard_link(&shared_p, &dest).is_ok()
-            || (has_distinct_fallback && fs::hard_link(&fallback_p, &dest).is_ok())
+        let ino = if matches!(
+            crate::db::probe_blob_file(&dest, entry.size_bytes),
+            crate::db::BlobDisk::Intact(_)
+        ) || (matches!(
+            crate::db::probe_blob_file(&shared_p, entry.size_bytes),
+            crate::db::BlobDisk::Intact(_)
+        ) && crate::db::publish_durable_link(&shared_p, &dest, &[]).is_ok())
+            || (has_distinct_fallback
+                && matches!(
+                    crate::db::probe_blob_file(&fallback_p, entry.size_bytes),
+                    crate::db::BlobDisk::Intact(_)
+                )
+                && crate::db::publish_durable_link(&fallback_p, &dest, &[]).is_ok())
         {
             sync_shared(&dest);
             dest_ino(&dest)
-        } else if dest.exists() {
-            dest_ino(&dest)
         } else {
-            let staging_dir = store.root.join("staging");
-            fs::create_dir_all(&staging_dir)?;
-            let tmp_dest = staging_dir.join(format!(
-                "{}.{}.{}.tmp",
-                entry.blob_hash,
-                std::process::id(),
-                pack::next_tmp_id()
-            ));
-            let bytes = fs::read(path)?;
+            let bytes = match fs::read(path) {
+                Ok(b) => b,
+                Err(e) => {
+                    created_parents.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+                    created_parents.dedup();
+                    for dir in &created_parents {
+                        let _ = crate::db::sync_dir(dir);
+                    }
+                    return Err(e.into());
+                }
+            };
             if blake3::hash(&bytes).to_hex().as_str() != entry.blob_hash {
+                created_parents.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+                created_parents.dedup();
+                for dir in &created_parents {
+                    let _ = crate::db::sync_dir(dir);
+                }
                 anyhow::bail!(
                     "Concurrent mutation detected while staging `{}` into CAS",
                     path.display()
                 );
             }
-            fs::write(&tmp_dest, &bytes)?;
-            #[cfg(unix)]
-            fs::set_permissions(&tmp_dest, fs::Permissions::from_mode(0o444))?;
-            fs::rename(&tmp_dest, &dest)?;
+            let (ino, _) = match crate::db::ensure_blob_file(
+                &store.root,
+                &dest,
+                &entry.blob_hash,
+                &bytes,
+                false,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    created_parents.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+                    created_parents.dedup();
+                    for dir in &created_parents {
+                        let _ = crate::db::sync_dir(dir);
+                    }
+                    return Err(e);
+                }
+            };
             sync_shared(&dest);
-            dest_ino(&dest)
+            ino
         };
         reg_blobs.push((
             entry.blob_hash.clone(),
@@ -2944,6 +2974,11 @@ pub(crate) fn stage_lake_build_outputs(
             entry.size_bytes as i64,
             ino,
         ));
+    }
+    created_parents.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    created_parents.dedup();
+    for dir in created_parents {
+        crate::db::sync_dir(&dir)?;
     }
 
     Ok((entries, reg_blobs))
@@ -2974,7 +3009,6 @@ pub fn dedup_worktree_packages(
     let lake_dir = project_dir.join(".lake");
     let packages_dir = lake_dir.join("packages");
     let pkg_cas_dir = store.root.join("pkg_cas");
-    let _ = fs::create_dir_all(&pkg_cas_dir);
 
     let mut purged_barrels = 0u64;
     let mut purged_git_packs = 0u64;
@@ -3062,10 +3096,18 @@ pub fn dedup_worktree_packages(
                     };
 
                     let shard_dir = pkg_cas_dir.join(&hash_hex[0..2]);
-                    let _ = fs::create_dir_all(&shard_dir);
+                    let created =
+                        crate::db::ensure_dir_tracking(&shard_dir, &store.root).unwrap_or_default();
                     let cas_file = shard_dir.join(&hash_hex);
 
-                    if let Ok(cas_meta) = fs::metadata(&cas_file) {
+                    if let Ok(cas_meta) = fs::metadata(&cas_file)
+                        .ok()
+                        .filter(|m| m.len() == sz)
+                        .ok_or(())
+                    {
+                        for dir in &created {
+                            let _ = crate::db::sync_dir(dir);
+                        }
                         #[cfg(unix)]
                         let same_inode =
                             cas_meta.dev() == meta.dev() && cas_meta.ino() == meta.ino();
@@ -3073,7 +3115,8 @@ pub fn dedup_worktree_packages(
                         let same_inode = false;
 
                         if !same_inode
-                            && crate::db::try_reflink_or_hardlink(&cas_file, &path, None).is_ok()
+                            && crate::db::try_reflink_or_hardlink(&cas_file, &path, Some(sz))
+                                .is_ok()
                         {
                             hardlinked_files += 1;
                             deduped_bytes += sz;
@@ -3087,26 +3130,32 @@ pub fn dedup_worktree_packages(
                                 let _ = fs::set_permissions(&path, perms);
                             }
                         }
-                        if fs::hard_link(&path, &cas_file).is_ok() {
+                        let synced = fs::File::open(&path)
+                            .and_then(|f| crate::db::durability_barrier(&f))
+                            .is_ok();
+                        if synced && fs::hard_link(&path, &cas_file).is_ok() {
+                            let _ = crate::db::sync_dir(&shard_dir);
+                            for dir in &created {
+                                let _ = crate::db::sync_dir(dir);
+                            }
                             hardlinked_files += 1;
-                        } else {
-                            let tmp_cas =
-                                shard_dir.join(format!("{}.{}.tmp", hash_hex, std::process::id()));
-                            if fs::copy(&path, &tmp_cas).is_ok() {
-                                #[cfg(unix)]
-                                if let Ok(tm) = fs::metadata(&tmp_cas) {
-                                    let mut perms = tm.permissions();
-                                    perms.set_mode(0o444);
-                                    let _ = fs::set_permissions(&tmp_cas, perms);
+                        } else if let Ok(bytes) = fs::read(&path) {
+                            if crate::db::write_blob_atomic(
+                                &store.root,
+                                &cas_file,
+                                &hash_hex,
+                                &bytes,
+                                true,
+                            )
+                            .is_ok()
+                            {
+                                for dir in &created {
+                                    let _ = crate::db::sync_dir(dir);
                                 }
-                                if fs::rename(&tmp_cas, &cas_file).is_ok() {
-                                    if crate::db::try_reflink_or_hardlink(&cas_file, &path, None)
-                                        .is_ok()
-                                    {
-                                        hardlinked_files += 1;
-                                    }
-                                } else {
-                                    let _ = fs::remove_file(&tmp_cas);
+                                if crate::db::try_reflink_or_hardlink(&cas_file, &path, Some(sz))
+                                    .is_ok()
+                                {
+                                    hardlinked_files += 1;
                                 }
                             }
                         }

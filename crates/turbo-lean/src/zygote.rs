@@ -504,15 +504,16 @@ impl LifecycleProcess {
             return None;
         }
         let proc = PathBuf::from(format!("/proc/{pid}"));
+        let cmdline = fs::read(proc.join("cmdline")).ok()?;
+        let environ = fs::read(proc.join("environ")).ok()?;
+        if cmdline.is_empty() || environ.is_empty() {
+            return None;
+        }
         let process = Self {
             pid,
             pidfd,
             start_time,
-            identity: (
-                fs::read_link(proc.join("exe")).ok()?,
-                fs::read(proc.join("cmdline")).ok()?,
-                fs::read(proc.join("environ")).ok()?,
-            ),
+            identity: (fs::read_link(proc.join("exe")).ok()?, cmdline, environ),
             staging: staging.map(Path::to_path_buf),
             parent,
         };
