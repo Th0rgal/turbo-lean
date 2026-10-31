@@ -2528,8 +2528,7 @@ fn split_lean_source_inner(
                         };
 
                         shards.push(TheoremShard {
-                            qualified_qualified_name: qualified_decl_name(&name, &scope_stack),
-                            name,
+                            qualified_name: qualified_decl_name(&name, &scope_stack),
                             name,
                             kind,
                             start_line: sub.start_line,
@@ -2706,7 +2705,8 @@ fn split_lean_source_inner(
                 }
 
                 shards.push(TheoremShard {
-                    name: qualified_decl_name(&name, &scope_stack),
+                    qualified_name: qualified_decl_name(&name, &scope_stack),
+                    name,
                     kind,
                     start_line: span.start_line,
                     end_line: span.end_line,
