@@ -332,6 +332,10 @@ pub(crate) fn skip_lean_lexeme(src: &str, start: usize) -> Option<LeanLexicalSpa
     let bytes = src.as_bytes();
     let mut i = start;
     let is_comment = src[start..].starts_with("--") || src[start..].starts_with("/-");
+    let at_token_start = !src[..start]
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '\'');
     match *bytes.get(start)? {
         b'-' if src[start..].starts_with("--") => {
             i += 2;
@@ -354,7 +358,7 @@ pub(crate) fn skip_lean_lexeme(src: &str, start: usize) -> Option<LeanLexicalSpa
                 }
             }
         }
-        b'\'' => i = crate::splitter::scan_lean_char_lit_end(src, start)?,
+        b'\'' if at_token_start => i = scan_lean_char_lit_end(src, start)?,
         b'"' => {
             i += 1;
             while i < bytes.len() {
@@ -368,11 +372,7 @@ pub(crate) fn skip_lean_lexeme(src: &str, start: usize) -> Option<LeanLexicalSpa
                 }
             }
         }
-        b'r' if !src[..start]
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '\'') =>
-        {
+        b'r' if at_token_start => {
             i += 1;
             while bytes.get(i) == Some(&b'#') {
                 i += 1;
@@ -4693,6 +4693,16 @@ mod tests {
         let split = split_lean_source(src, &[]);
         assert_eq!(split.shards.len(), 1);
         assert_eq!(split.shards[0].name, "wrapped");
+    }
+
+    #[test]
+    fn lexical_scope_preserves_apostrophes_in_identifiers() {
+        let src = "namespace B'x'y\ndef quote : Char := '\"'\ntheorem same : True := True.intro\nend B'x'y\n";
+        let split = split_lean_source(src, &[]);
+        assert_eq!(split.shards.len(), 1);
+        assert_eq!(split.shards[0].decl_name(), "B'x'y.same");
+        assert!(skip_lean_lexeme("B'x'y", 1).is_none());
+        assert!(skip_lean_lexeme("'x'", 0).is_some());
     }
 
     #[test]
