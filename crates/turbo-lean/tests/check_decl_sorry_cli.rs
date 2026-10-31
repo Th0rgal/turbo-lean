@@ -49,6 +49,14 @@ impl Project {
              theorem sneaky : False := cheat\n",
         )
         .unwrap();
+        // The same hidden `sorry`, with its warning swallowed (and the file made non-shardable).
+        fs::write(
+            root.join("I.lean"),
+            "macro \"cheat\" : term => return ⟨Lean.Syntax.node .none (Lean.Name.mkStr4 \"Lean\" \"Parser\" \"Term\" (\"sor\" ++ \"ry\")) #[Lean.Syntax.atom .none (\"sor\" ++ \"ry\")]⟩\n\
+             #guard_msgs (drop warning) in\n\
+             theorem sneaky : False := cheat\n",
+        )
+        .unwrap();
         Self(root)
     }
 
@@ -156,7 +164,7 @@ fn check_decl_rejects_sorry_target_and_keeps_prefix_stubs() {
         assert_rejected(&p, "G.lean", "sneaky", daemon);
         // Whole-file and directory checks reject too, even with the targets' shards attempted above;
         // the hidden `sorry` of `H.lean` first, so its whole-file check cannot seed `--decl` caches.
-        for target in ["H.lean", "F.lean", "G.lean", "."] {
+        for target in ["H.lean", "I.lean", "F.lean", "G.lean", "."] {
             let out = p.run(&["check", target], daemon);
             assert!(
                 !out.status.success(),

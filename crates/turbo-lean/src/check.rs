@@ -3732,14 +3732,17 @@ fn check_single_file(
             let audit_tmp = canon_resolved_initial
                 .parent()
                 .unwrap_or(canon_dir)
-                .join(format!(".turbo_audit_{}_{}.lean", std::process::id(), pack::next_tmp_id()));
+                .join(format!(
+                    ".turbo_audit_{}_{}.lean",
+                    std::process::id(),
+                    pack::next_tmp_id()
+                ));
             let mut cmd = Command::new(&lean_bin);
             for arg in crate::module_builder::filter_allowed_lean_args(&file_lean_args) {
                 cmd.arg(arg);
             }
             cmd.current_dir(canon_dir).envs(&env_vars);
-            let (ok, stdout, stderr) =
-                run_audited_lean(cmd, &audit_tmp, src, &names, names.len())?;
+            let (ok, stdout, stderr) = run_audited_lean(cmd, &audit_tmp, src, &names, names.len())?;
             if !ok {
                 anyhow::bail!(
                     "Soundness audit failed for {}:\n{}\n{}",
