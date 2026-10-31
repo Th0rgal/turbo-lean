@@ -4979,7 +4979,7 @@ pub fn evaluate_agent_step_value(
             let file_lean_args = crate::module_builder::try_resolve_lean_args_for_path(
                 &canon_dir,
                 Some(&resolved_file),
-            );
+            )?;
             let shard_keys: Vec<String> = target_shards
                 .iter()
                 .map(|s| {

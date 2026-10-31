@@ -22,7 +22,7 @@
     "elan toolchain install",
     "toolchain download"
   ],
-  "c5_flag_note": "The mission text says `python3 scripts/run_conformance_suite.py --tier C1`. The suite's argparse accepts only --json and --fuzz-seeds; --tier exits 2. C5 therefore runs the suite with no --tier (default --fuzz-seeds 50). A --tier invocation is recorded as a flag check, not as the check itself.",
+  "c5_flag_note": "scripts/run_conformance_suite.py supports --tier C1,C4 (and fails closed on C2/C3 or unknown tiers). C5 keeps its default 50-seed tier-C4 invocation for bounded per-mutant wall-clock time while blocking PR/push conformance runs --tier C1,C4 --asan --ubsan in roadmap-conformance.yml.",
   "checks": {
     "C1": {
       "argv": ["bash", "-c", "cd lean && lake build"],
