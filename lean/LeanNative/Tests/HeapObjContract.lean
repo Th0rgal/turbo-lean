@@ -119,14 +119,8 @@ def allocLiveRcOne : Bool :=
   | _ => false
 
 -- REGRESSION(layout_alloc_live_rc_one)
--- XFAIL(heapobj-contract): flips in 5b — `main`'s `allocCtor` is an immediate tuple with no heap cell.
-#guard !allocLiveRcOne
-/--
-info: ok LeanNative.Semantics.Val.tuple
-  [LeanNative.Semantics.Val.u64 5, LeanNative.Semantics.Val.objPtr 1, LeanNative.Semantics.Val.u64 42]
--/
-#guard_msgs in
-#eval IO.println (showRes allocOne)
+-- Holds since #280: `allocCtor` with fields allocates a live heap object (`allocHeapCtor`, `rc = 1`).
+#guard allocLiveRcOne
 
 /-- Contract (C1.1): `ctorGetScalar i` with `i ≥ |scalarFields|` is `outOfBounds i |scalarFields|`. -/
 def scalarOOBBounded : Bool :=
@@ -155,11 +149,8 @@ def freedReadsAreUAF : Bool :=
   isUseAfterFree (readAfterFree (.ctorGetObj 1 0)) && isUseAfterFree (readAfterFree (.ctorGetScalar 1 0 .i64))
 
 -- REGRESSION(layout_freed_read_is_error)
--- XFAIL(heapobj-contract): flips in 5b — the immediate tuple survives `decRef`, so both reads succeed.
-#guard !freedReadsAreUAF
-/-- info: ok LeanNative.Semantics.Val.objPtr 1 | ok LeanNative.Semantics.Val.objPtr 1 -/
-#guard_msgs in
-#eval IO.println s!"{showRes (readAfterFree (.ctorGetObj 1 0))} | {showRes (readAfterFree (.ctorGetScalar 1 0 .i64))}"
+-- Holds since #280: both reads through the freed heap object are `useAfterFree`.
+#guard freedReadsAreUAF
 
 /-- Lean runtime layout pin: object slots first, then `usize` slots, then the scalar fields, sorted
     by ascending byte offset `off_i` relative to the end of the `usize` area (Lean places wider scalars at
@@ -747,11 +738,8 @@ def ownEdgesContract (k : Nat) : Bool :=
 def repeatedEdgesReleased : Bool := ownEdgesContract 2 || ownEdgesContract 3
 
 -- REGRESSION(rc_repeated_owning_edges_released)
--- XFAIL(heapobj-contract): flips in 5b — dropping the parent releases none of its owning edges.
-#guard !repeatedEdgesReleased
-/-- info: ok childRc=2 | ok childRc=3 -/
-#guard_msgs in
-#eval IO.println s!"{showOwnEdges 2} | {showOwnEdges 3}"
+-- Holds since #280: dropping the parent releases every one of its 2 (resp. 3) owning edges.
+#guard repeatedEdgesReleased
 
 /-- `x1 := allocCtor 0 [x0] []; incRef x1 1; x2 := allocCtor 0 [x1, x1] []; decRef x2 1`: a grandparent
     with two edges to a parent that owns the child. -/
@@ -767,12 +755,8 @@ def recursiveReleaseBeyondParent : Bool :=
   | .error _ => true
 
 -- REGRESSION(rc_recursive_release_grandchild)
--- XFAIL(heapobj-contract): flips in 5b — no release recurses, so the grandchild stays live.
-#guard !recursiveReleaseBeyondParent
-/-- info: ok childRc=1 -/
-#guard_msgs in
-#eval IO.println (match run (heapWithChild 1) grandparentDrop with
-  | .ok (_, st) => s!"ok childRc={st.getObjRefCount childId}" | .error e => s!"error {reprStr e}")
+-- Holds since #280: the release recurses through the parent and frees the grandchild.
+#guard recursiveReleaseBeyondParent
 
 /-- Heap with one exclusive (`rc = 1`) sarray buffer `3`, bound to `x23`. -/
 def heapWithBuf : HeapState := { HeapState.empty with buffers := [{ id := 3, exclusive := true, data := #[1, 2] }] }
@@ -789,8 +773,8 @@ def sarrayEdgeReleased : Bool :=
   | .error _ => true
 
 -- REGRESSION(rc_sarray_edge_released)
--- XFAIL(heapobj-contract): flips in 5b — the buffer owned through a ctor field is never released.
-#guard !sarrayEdgeReleased
+-- Holds since #280: the buffer owned through a ctor field is released through `decRefBuf`.
+#guard sarrayEdgeReleased
 -- non-vacuity: a direct `decRef` of the same buffer does free it
 #guard match heapWithBuf.decRefBuf 3 1 with | .ok st => (st.findBuffer 3).isNone | .error _ => false
 
@@ -804,12 +788,8 @@ def sarrayEdgeReleased : Bool :=
 def pcertC3Released : Bool := ownEdgesContract 100
 
 -- REGRESSION(c3_100_owning_edges)
--- XFAIL(heapobj-contract): flips in 5b — P-cert C3: decRef returns `ok` with live child references
--- (`main`: childRc=100, nothing released; #277: childRc=65 after fuel truncation).
-#guard !pcertC3Released
-/-- info: ok childRc=100 -/
-#guard_msgs in
-#eval IO.println (showOwnEdges 100)
+-- Holds since #280: P-cert C3 frees the child (before #280 `main` left childRc=100; #277 left childRc=65).
+#guard pcertC3Released
 
 /-! ### C5.2/C5.3 fuel bound: executable reference for the counting rule
 
@@ -882,13 +862,10 @@ def nestedTupleOwnershipRejected : Bool :=
   | _ => false
 
 -- REGRESSION(wf_objFields_no_nested_tuple_ownership)
--- XFAIL(heapobj-contract): flips in 5b — `main`'s `allocCtor` accepts the owning tuple and embeds it inline.
+-- XFAIL(heapobj-contract): flips in 5b — `main`'s `allocCtor` accepts the owning tuple and stores it as a field
+-- of a fresh heap object instead of rejecting it.
 #guard !nestedTupleOwnershipRejected
-/--
-info: ok LeanNative.Semantics.Val.tuple
-  [LeanNative.Semantics.Val.u64 0,
-   LeanNative.Semantics.Val.tuple [LeanNative.Semantics.Val.u64 0, LeanNative.Semantics.Val.objPtr 1]]
--/
+/-- info: ok LeanNative.Semantics.Val.objPtr 2 -/
 #guard_msgs in
 #eval IO.println (showRes allocMalformedField)
 
@@ -916,18 +893,16 @@ def chainReleaseTotalOrError : Bool :=
     | .error _ => true
 
 -- REGRESSION(decref_chain_total_or_error)
--- XFAIL(heapobj-contract): flips in 5b — `main`'s `decRef` of a ctor value is a no-op `ok`, leaving
--- the transitively owned child live at every fuel (a partial release reported as success).
-#guard !chainReleaseTotalOrError
-/-- info: ok childRc=1 -/
-#guard_msgs in
-#eval IO.println (match evalCode 0 env0 (heapWithChild 1) chainDrop with
-  | .ok (_, st) => s!"ok childRc={st.getObjRefCount childId}" | .error e => s!"error {reprStr e}")
+-- Holds since #280 at every evaluator fuel in `0..64`: `.error`, or `.ok` with the child freed.
+#guard chainReleaseTotalOrError
 
--- UNCOVERED(C5.1-fuelExhausted-ctor): `main` has no recursive release and no fuel-bounded helper, so no
--- behaviour can reach a fuel-exhaustion error; the counting rule is pinned by `fuel_bound_boundary`.
--- UNCOVERED(C5.4-underfueled-helper): `decRefObjFuel`/`decRefValsFuel` do not exist on `main`; 5b adds the
--- helper and a regression "underfuelled call ⇒ `.error .fuelExhausted`, never partial `.ok`".
+-- UNCOVERED(C5.1-fuelExhausted-ctor): `main` (#280) releases recursively, but `UBError` has no `fuelExhausted`
+-- constructor and `decRefObjFuel 0 st _ _ = .ok st`, so there is no distinguished exhaustion error to assert; on
+-- well-formed heaps `decRefObj`'s fuel (`|heapObjs| + 1`) covers the release depth. The counting rule is pinned by
+-- `fuel_bound_boundary`; 5b adds `.fuelExhausted` and its regression.
+-- UNCOVERED(C5.4-underfueled-helper): `main`'s `decRefObjFuel` (#280) returns a partial `.ok st` at fuel 0 (no
+-- `fuelExhausted` constructor exists); `decRefValsFuel` does not exist. 5b adds the regression "underfuelled call
+-- ⇒ `.error .fuelExhausted`, never partial `.ok`".
 
 /-! ## C4 exclusivity: `ctor_set` / `del` only when `rc == 1`, else UB error -/
 
@@ -945,8 +920,8 @@ def withCtor (shareCount : Nat) (op : LNIRExpr) : Except UBError (Val × HeapSta
 def isExclusiveSharedFalse : Bool := retVal? (withCtor 1 (.isExclusive 1)) == some (.bool false)
 
 -- REGRESSION(isExclusive_shared_obj_false)
--- XFAIL(heapobj-contract): flips in 5b — `main` answers `true` for every non-sarray value.
-#guard !isExclusiveSharedFalse
+-- Holds since #280: `isExclusive` on a heap object with `rc == 2` is `false`.
+#guard isExclusiveSharedFalse
 
 /-- `x1 := allocCtor 0 [x0] [x20]; decRef x1 1; x3 := op; ret x3`: `op` on a freed object. -/
 def onFreedCtor (op : LNIRExpr) : Except UBError (Val × HeapState) :=
@@ -956,12 +931,8 @@ def onFreedCtor (op : LNIRExpr) : Except UBError (Val × HeapState) :=
 def isExclusiveFreedIsUAF : Bool := isUseAfterFree (onFreedCtor (.isExclusive 1))
 
 -- REGRESSION(isExclusive_freed_is_error)
--- XFAIL(heapobj-contract): flips in 5b — C4.1: `isExclusive` on a freed object must be `.useAfterFree`;
--- `main` answers `true`.
-#guard !isExclusiveFreedIsUAF
-/-- info: ok LeanNative.Semantics.Val.bool true -/
-#guard_msgs in
-#eval IO.println (showRes (onFreedCtor (.isExclusive 1)))
+-- Holds since #280: C4.1, `isExclusive` on a freed object is `.useAfterFree`.
+#guard isExclusiveFreedIsUAF
 
 def isNonExclusiveWrite : Except UBError (Val × HeapState) → Bool
   | .error (.nonExclusiveWrite _) => true
@@ -984,19 +955,12 @@ def ctorSetSharedIsUB : Bool := isNonExclusiveWrite (withCtor 1 ctorSet)
 def ctorSetExclusiveUpdates : Bool := retVal? (ctorSetThenRead 0) == some (.u64 43)
 
 -- REGRESSION(ctor_set_shared_is_ub)
--- XFAIL(heapobj-contract): flips in 5b — `lean_native_ctor_set` is not an LNIR operation on `main`;
--- today's failure reason is `unsupportedCall`, not the required `nonExclusiveWrite`.
-#guard !ctorSetSharedIsUB
-/-- info: error LeanNative.Semantics.UBError.unsupportedCall "lean_native_ctor_set" -/
-#guard_msgs in
-#eval IO.println (showRes (withCtor 1 ctorSet))
+-- Holds since #280 (`writeHeapObjFieldExclusive`): a shared `ctor_set` is exactly `nonExclusiveWrite`.
+#guard ctorSetSharedIsUB
 
 -- REGRESSION(ctor_set_exclusive_ok)
--- XFAIL(heapobj-contract): flips in 5b — an exclusive (`rc == 1`) `ctor_set` must succeed and update field 0.
-#guard !ctorSetExclusiveUpdates
-/-- info: error LeanNative.Semantics.UBError.unsupportedCall "lean_native_ctor_set" -/
-#guard_msgs in
-#eval IO.println (showRes (ctorSetThenRead 0))
+-- Holds since #280: an exclusive (`rc == 1`) `ctor_set` succeeds and updates field 0.
+#guard ctorSetExclusiveUpdates
 
 /-- Contract (C4.2 shared `del`): `rc == 2` ⇒ exactly `.nonExclusiveWrite`. -/
 def delSharedIsUB : Bool := isNonExclusiveWrite (withCtor 1 (.call "lean_native_del_obj" [1] .unit))
@@ -1037,9 +1001,10 @@ def ctorSetOOBIsError : Bool :=
   | _ => false
 
 -- REGRESSION(ctor_set_out_of_bounds_is_error)
--- XFAIL(heapobj-contract): flips in 5b — today's failure reason is `unsupportedCall`, not `outOfBounds`.
+-- XFAIL(heapobj-contract): flips in 5b — `main` bounds the index by the flat field list (`objFields ++
+-- scalarFields`, length 2), not by `objFields` (length 1).
 #guard !ctorSetOOBIsError
-/-- info: error LeanNative.Semantics.UBError.unsupportedCall "lean_native_ctor_set" -/
+/-- info: error LeanNative.Semantics.UBError.outOfBounds 5 2 -/
 #guard_msgs in
 #eval IO.println (showRes ctorSetOOB)
 
@@ -1054,9 +1019,9 @@ def ctorSetNestedTupleRejected : Bool :=
   | _ => false
 
 -- REGRESSION(ctor_set_nested_tuple_ownership_rejected)
--- XFAIL(heapobj-contract): flips in 5b — today's failure reason is `unsupportedCall`, not `typeError`.
+-- XFAIL(heapobj-contract): flips in 5b — `main`'s `ctor_set` accepts the owning tuple and writes it in place.
 #guard !ctorSetNestedTupleRejected
-/-- info: error LeanNative.Semantics.UBError.unsupportedCall "lean_native_ctor_set" -/
+/-- info: ok LeanNative.Semantics.Val.unit -/
 #guard_msgs in
 #eval IO.println (showRes ctorSetMalformed)
 
@@ -1071,9 +1036,10 @@ def freedMutationIsUAF : Bool :=
   isUseAfterFree (onFreedCtor ctorSet) && isUseAfterFree (onFreedCtor (.call "lean_native_del_obj" [1] .unit))
 
 -- REGRESSION(mutation_freed_is_error)
--- XFAIL(heapobj-contract): flips in 5b — neither operation exists on `main` (`unsupportedCall`).
+-- XFAIL(heapobj-contract): flips in 5b — `ctor_set` on a freed object is already `useAfterFree` (#280), but
+-- `lean_native_del_obj` does not exist on `main` (`unsupportedCall`).
 #guard !freedMutationIsUAF
-/-- info: error LeanNative.Semantics.UBError.unsupportedCall "lean_native_ctor_set" | error LeanNative.Semantics.UBError.unsupportedCall "lean_native_del_obj" -/
+/-- info: error LeanNative.Semantics.UBError.useAfterFree 2 | error LeanNative.Semantics.UBError.unsupportedCall "lean_native_del_obj" -/
 #guard_msgs in
 #eval IO.println s!"{showRes (onFreedCtor ctorSet)} | {showRes (onFreedCtor (.call "lean_native_del_obj" [1] .unit))}"
 
@@ -1107,32 +1073,44 @@ def symtvRcEffectsFailClosed : Bool :=
     { name := "drop", params := [objParam, { id := 1, name := "x", ty := .i64 }], retTy := .i64, body := .ret 1 }).passed
 
 -- REGRESSION(symtv_rc_effects_fail_closed)
--- XFAIL(heapobj-contract): flips in 5b — symbolic execution ignores `incRef`/`decRef`, so dropping an
--- owned `decRef` (a leak) validates; RC tracking that is absent or exhausted must give `passed = false`.
-#guard !symtvRcEffectsFailClosed
+-- Holds since #280: the validator tracks RC effects, so dropping an owned `decRef` (a leak) does not validate.
+#guard symtvRcEffectsFailClosed
 
-/-- `x1 := x0 * 32; x2 := parFor (len x1) [x0]; ret x0`. Concrete evaluation (fuel 128) exhausts its
-    `parFor` budget for every sample with `x0 ≥ 5` and succeeds otherwise. -/
+/-- `x1 := x0 * 64; x2 := parFor (len x1) [x0]; ret x0`. Calibrated against the validator's concrete fuel floor
+    (`checkDeclConcreteRefinement` evaluates at `Nat.max fuel 256`): at fuel 256 the `parFor` budget is exhausted
+    on the samples with `64 · x0 > 256` and evaluation succeeds otherwise. -/
 def fuelHungry : LNIRDecl :=
-  scalarDecl "fh" (.letBind 1 .i64 (.scalar (.binOp .mul (.var 0) (.constU64 32)))
+  scalarDecl "fh" (.letBind 1 .i64 (.scalar (.binOp .mul (.var 0) (.constU64 64)))
     (.parFor 2 1 [0] .i64 (.mapScaleAdd 1 0) (.ret 0)))
 
-/-- Number of the 64 concrete samples on which the *source* hits evaluator fuel exhaustion. -/
+/-- Concrete evaluation of the *source* at evaluator fuel `fuel` on sample `i`. -/
+def fuelHungrySample (fuel i : Nat) : Except UBError (Val × HeapState) :=
+  let (env, st) := buildDeclSample fuelHungry i
+  evalCode fuel env st fuelHungry.body
+
+/-- Number of the 64 concrete samples on which the source exhausts evaluator fuel at the validator's floor 256:
+    `.error` at fuel 256 but `.ok` at ample fuel, so the error is fuel exhaustion and not UB of the program.
+    Defined behaviourally, independent of the constructor that reports it (`main`: `.outOfBounds len 256`;
+    5b: `.fuelExhausted`, pinned below). -/
 def fuelHungryExhausted : Nat :=
   ((List.range 64).filter fun i =>
-    let (env, st) := buildDeclSample fuelHungry i
-    match evalCode 128 env st fuelHungry.body with | .error (.outOfBounds _ 128) => true | _ => false).length
+    (fuelHungrySample 256 i matches .error _) && (fuelHungrySample 65536 i matches .ok _)).length
 
 /-- Contract (C6.3): a decl whose source exhausts evaluator fuel on some sample does not validate. -/
 def symtvSourceFuelExhaustionFailsClosed : Bool := !(validateTranslationDecl fuelHungry fuelHungry).passed
 
 -- REGRESSION(symtv_source_fuel_exhaustion_fails_closed)
--- XFAIL(heapobj-contract): flips in 5b — C6.3: samples where the source exhausts evaluator fuel are
--- counted as "source UB" (vacuous), so the decl still passes. The contract requires `passed = false`.
+-- XFAIL(heapobj-contract): flips in 5b — C6.3: samples where the source exhausts evaluator fuel (at the
+-- validator's floor 256) are counted as "source UB" (vacuous), so the decl still passes. The contract requires
+-- `passed = false`. The pin shows that `main` reports the exhaustion as `.outOfBounds 320 256`; on flip it becomes
+-- the distinguished `.fuelExhausted` (5b).
 #guard !symtvSourceFuelExhaustionFailsClosed
 #guard fuelHungryExhausted > 0
+/-- info: error LeanNative.Semantics.UBError.outOfBounds 320 256 -/
+#guard_msgs in
+#eval IO.println (showRes (fuelHungrySample 256 0))
 
--- UNCOVERED(C6.3-rc-exhaustion-sample): `main`'s `evalCode` has no RC/heap-exhaustion error (there is no
--- recursive release), so no concrete sample can produce one; 5b adds it with `fuelExhausted`.
+-- UNCOVERED(C6.3-rc-exhaustion-sample): `main`'s `evalCode` has no RC/heap-exhaustion error (#280's release
+-- returns `.ok` when its fuel runs out), so no concrete sample can produce one; 5b adds it with `fuelExhausted`.
 
 end LeanNative.Tests.HeapObjContract

@@ -12,10 +12,14 @@ clause is covered: sub-clauses that no behaviour on `main` can exercise are list
 is built by `lake build` (it is part of the `LeanNative` library glob), and `scripts/ci_verify.sh` checks
 that it stays in sync with the table in §8.
 
-`main` (as of this PR) has no Stage 1D heap: `allocCtor` evaluates to the flat immediate tuple
-`.tuple (tag :: objFields ++ scalarFields)`, `decRefObj` never visits children, and there is no
-`ctor_set` or `del` operation. Clauses that `main` violates are recorded as explicit **expected failures**
-(§8, column "today"). 5b must flip every one of them.
+Status on `main` (2a8939e, which includes #280's Stage 1D heap ADTs / Perceus RC): `allocCtor` with fields
+allocates a live `HeapObj` with `rc = 1`, but with #280's single flat `fields = objFields ++ scalarFields` list;
+`decRefObj` releases every owning edge recursively (incl. `.sarrayId` edges), `isExclusive` is `rc == 1` and
+`useAfterFree` on a freed object, and `lean_native_ctor_set` exists with the C4 exclusivity check. There is no
+`del`/`setTag` operation, no `UBError.fuelExhausted`, and the LLVM emitter still boxes every scalar in-pointer and
+emits unguarded `isExclusive` / unloaded projections. §8 column "today" records which clauses hold on `main`
+(**pass**: 12 of them flipped when #280 landed) and which are explicit **expected failures** (**XFAIL**). The
+remaining XFAILs are fixed by the 5b PR (#300), which must flip every one of them.
 
 ## Terminology
 
@@ -105,7 +109,7 @@ The model's `rc` and exclusivity are abstractions of the Lean 4.35.0 runtime (`l
 3. Codegen obligations. Before any access to `m_rc`, `m_tag` or a field of a `tobject`, emitted code must test
    `ptr == null` and `(ptrtoint ptr) & 1`, and take the immediate path when either holds. This covers:
    * RC inc/dec. This is already done inline (`rc_tagged`) and in the `lean_native_inc`/`lean_native_dec` helpers.
-   * `isExclusive`. Today this is a direct `load i32` (P-cert C5, xfail).
+   * `isExclusive`. On `main` this is a direct `load i32` (P-cert C5, xfail).
    * tag reads (`lean_native_ctor_tag`) and field projections on `taggedPtr`.
 
    A backend that cannot emit the check must reject the declaration (`findUnsupportedLLVMCallInCode` returns `some`
@@ -172,8 +176,10 @@ The model's `rc` and exclusivity are abstractions of the Lean 4.35.0 runtime (`l
    If `rc o ≥ 2`, the operation is `.error (.nonExclusiveWrite o)`. If `rc o == 0`, it is `.error (.useAfterFree o)`.
    An index outside `objFields` (respectively `scalarFields`) is `.error (.outOfBounds …)`.
    Shared mutation is UB in the semantics and is never a silent copy.
-3. `main` lacks both operations: `lean_native_ctor_set` and `lean_native_del_obj` evaluate to `unsupportedCall`.
-   The xfail stubs in §8 name them, and 5b activates them.
+3. `main` has `lean_native_ctor_set` (#280: shared ⇒ `nonExclusiveWrite`, exclusive ⇒ in-place update, freed ⇒
+   `useAfterFree`; regressions `ctor_set_shared_is_ub` / `ctor_set_exclusive_ok` pass), but bounds its index by the
+   flat field list rather than `objFields` and accepts a nested owning tuple. `lean_native_del_obj` evaluates to
+   `unsupportedCall`. The xfails in §8 name these gaps, and 5b closes them.
 
 ## C5. `decRef` is total-or-error
 
@@ -188,7 +194,7 @@ The model's `rc` and exclusivity are abstractions of the Lean 4.35.0 runtime (`l
    reject it with `.error (.typeError …)`. A ctor that owns another ctor holds it as `.objPtr`, never inline.
    This rule is what makes the bound below exact, because the release never recurses into tuples.
    (`main` violates it: its `allocCtor` accepts a variable bound to the malformed `.tuple [.u64 0, .objPtr c]`
-   and embeds it inline. Xfail `wf_objFields_no_nested_tuple_ownership`. Valid ctor-to-ctor nesting stays accepted:
+   and stores it as a field of a fresh heap object. Xfail `wf_objFields_no_nested_tuple_ownership`. Valid ctor-to-ctor nesting stays accepted:
    `wf_objFields_ctor_nesting_accepted`.)
 3. Fuel bound. One fuel unit is charged per `objFields` entry popped from the release worklist (owning or not,
    including the root edge of the `decRef`), plus one unit per object freed. Tuples are not traversed (by 2).
@@ -208,12 +214,15 @@ The model's `rc` and exclusivity are abstractions of the Lean 4.35.0 runtime (`l
 
 `validateTranslationDecl src tgt` must report `passed = false` whenever its analysis was incomplete for either side:
 
-1. symbolic-execution fuel exhaustion (`symExecCode` at fuel `0`). Today this silently yields `.unit`;
+1. symbolic-execution fuel exhaustion (`symExecCode` at fuel `0`). On `main` this silently yields `.unit`;
 2. RC/heap tracking exhaustion, such as #280's `updateRefCountFuel 0 … = markUnsupported` or heap-expansion depth.
    The same applies to any RC effect the symbolic model does not track. For example, a dropped `decRef` must not
    validate as equivalent;
 3. any concrete sample whose `evalCode` returns a fuel or RC-exhaustion error on the source. That sample counts as
-   non-vacuous failure, not as "source UB".
+   non-vacuous failure, not as "source UB". The validator evaluates samples at `Nat.max fuel 256`
+   (`checkDeclConcreteRefinement`), so the regression's fixture (`x0 * 64` iterations) is calibrated to exhaust fuel
+   256 on some samples; on `main` the exhaustion surfaces as `.outOfBounds 320 256` and the decl still passes
+   (xfail). 5b reports `.fuelExhausted` and fails closed.
 
 Exhaustion is never a vacuous pass.
 
@@ -226,10 +235,21 @@ fail-closed gates (C4/C5 of P-cert), the `getCtorLayout` scalar-slot lowering, a
 ## 8. Clause → regression table
 
 All names refer to `-- REGRESSION(<name>)` markers in `lean/LeanNative/Tests/HeapObjContract.lean`.
-**pass** means the regression is a positive `#guard` that holds on `main`. **XFAIL** means it carries
-`-- XFAIL(heapobj-contract): flips in 5b` and asserts today's wrong behaviour: first `#guard !<pred>` (named in the
+**pass** means the regression is a positive `#guard` that holds on `main` (2a8939e). **XFAIL** means it carries
+`-- XFAIL(heapobj-contract): flips in 5b` and asserts `main`'s wrong behaviour: first `#guard !<pred>` (named in the
 last column) on a contract predicate over the evaluator/emitter/validator, then optionally `#guard_msgs` pinning
-today's output. When 5b fixes the defect, the xfail breaks the build until someone flips it.
+`main`'s output. When 5b (#300) fixes the defect, the xfail breaks the build until someone flips it.
+
+Flipped by #280 (now **pass** on `main`, 12): `layout_alloc_live_rc_one`, `layout_freed_read_is_error`,
+`rc_repeated_owning_edges_released`, `rc_recursive_release_grandchild`, `rc_sarray_edge_released`,
+`c3_100_owning_edges`, `decref_chain_total_or_error`, `isExclusive_shared_obj_false`, `isExclusive_freed_is_error`,
+`ctor_set_shared_is_ub`, `ctor_set_exclusive_ok`, `symtv_rc_effects_fail_closed`. The 19 remaining XFAILs await
+#300. Measured on `main` + #300 (adcd211) + this module, 18 of them flip, incl. the recalibrated
+`symtv_source_fuel_exhaustion_fails_closed`. The exception is `codegen_projection_guarded_field_load`: #300 emits
+the guarded load at `P + 8`, but returns it through a slot whose store is in another basic block (`proj_heap_7` →
+`proj_cont_10`), and the conservative block-local reload rule (`IRCheck.Fn.reachingStore`) resolves that reload
+to `uninitOrigin`. That regression flips only once the emitter returns the loaded value without a cross-block
+slot round-trip, or once the reload rule is made CFG-aware.
 
 | Clause | Regression | today | XFAIL expectation |
 |---|---|---|---|
@@ -237,9 +257,9 @@ today's output. When 5b fixes the defect, the xfail breaks the build until someo
 | C1.1 scalar index space | `layout_scalar_only_ctor_indexes_scalarFields` | pass | — |
 | C1.1 scalar-slot indexing (mixed ctor) | `layout_scalar_slot_indexing` | XFAIL | `#guard !scalarSlotIndexing` |
 | C1.1 obj index bounded by `objFields` | `layout_ctorGetObj_out_of_objFields_is_error` | XFAIL | `#guard !objIndexBounded` |
-| C1.1 ctor with fields allocates a live `HeapObj`, `rc = 1` | `layout_alloc_live_rc_one` | XFAIL | `#guard !allocLiveRcOne` |
+| C1.1 ctor with fields allocates a live `HeapObj`, `rc = 1` | `layout_alloc_live_rc_one` | pass | — |
 | C1.1 scalar index bounded by `scalarFields` | `layout_scalar_oob_is_error` | XFAIL | `#guard !scalarOOBBounded` |
-| C1.1 reads of a freed object are `useAfterFree` | `layout_freed_read_is_error` | XFAIL | `#guard !freedReadsAreUAF` |
+| C1.1 reads of a freed object are `useAfterFree` | `layout_freed_read_is_error` | pass | — |
 | C1.2 Lean runtime offsets | `layout_lean_runtime_offsets` | pass | — |
 | C2.1 abstract boxing is identity incl. `2^63`; in-pointer range `[0, 2^63)` | `box_abstract_high_bit_roundtrip` | pass | — |
 | C2.1 `i1/i8/i16/i32` boxed in-pointer (returns `lean_box(x)`) | `codegen_box_small_scalar_in_pointer` | pass | — |
@@ -258,20 +278,20 @@ today's output. When 5b fixes the defect, the xfail breaks the build until someo
 | C2.1 nullary ctor emitted as `lean_box(t)` | `codegen_nullary_ctor_boxed` | XFAIL | `#guard !nullaryCtorCodegenBoxed` |
 | C3.3 RC arithmetic over repeated decrements | `rc_repeated_edges_arith` | pass | — |
 | C3.3 freed / underflow is error | `decref_freed_or_underflow_is_error` | pass | — |
-| C3.2 repeated owning edges released | `rc_repeated_owning_edges_released` | XFAIL | `#guard !repeatedEdgesReleased` |
-| C3.2 release recurses beyond parent/leaf (grandchild) | `rc_recursive_release_grandchild` | XFAIL | `#guard !recursiveReleaseBeyondParent` |
-| C3.2 `.sarrayId` owning edge released via `decRefBuf` | `rc_sarray_edge_released` | XFAIL | `#guard !sarrayEdgeReleased` |
+| C3.2 repeated owning edges released | `rc_repeated_owning_edges_released` | pass | — |
+| C3.2 release recurses beyond parent/leaf (grandchild) | `rc_recursive_release_grandchild` | pass | — |
+| C3.2 `.sarrayId` owning edge released via `decRefBuf` | `rc_sarray_edge_released` | pass | — |
 | C3.3 `incRef` on a freed object is `useAfterFree` | `incref_freed_is_error` | pass | — |
-| C3.4 / C5.1 P-cert C3 reproducer (100 edges) | `c3_100_owning_edges` | XFAIL | `#guard !pcertC3Released` |
+| C3.4 / C5.1 P-cert C3 reproducer (100 edges) | `c3_100_owning_edges` | pass | — |
 | C5.3 fuel bound `B` exact (`B` ok, `B − 1` exhausts) on C3/chain/diamond/mixed | `fuel_bound_boundary` | pass | — |
 | C5.2 nested tuple ownership is ill-formed (`allocCtor` of a malformed `.tuple [.u64 0, .objPtr c]` field is `typeError`) | `wf_objFields_no_nested_tuple_ownership` | XFAIL | `#guard !nestedTupleOwnershipRejected` |
 | C5.2 ctor-to-ctor nesting is well-formed and accepted | `wf_objFields_ctor_nesting_accepted` | pass | — |
-| C5.1 release path total-or-error (chain, every evaluator fuel 0..64) | `decref_chain_total_or_error` | XFAIL | `#guard !chainReleaseTotalOrError` |
+| C5.1 release path total-or-error (chain, every evaluator fuel 0..64) | `decref_chain_total_or_error` | pass | — |
 | C4.2 shared write is UB (sarray precedent) | `exclusive_write_sarray_shared_is_ub` | pass | — |
-| C4.1 `isExclusive` of shared object is false | `isExclusive_shared_obj_false` | XFAIL | `#guard !isExclusiveSharedFalse` |
-| C4.1 `isExclusive` of a freed object is `useAfterFree` | `isExclusive_freed_is_error` | XFAIL | `#guard !isExclusiveFreedIsUAF` |
-| C4.2 shared `ctor_set` is UB | `ctor_set_shared_is_ub` | XFAIL | `#guard !ctorSetSharedIsUB` |
-| C4.2 exclusive `ctor_set` succeeds | `ctor_set_exclusive_ok` | XFAIL | `#guard !ctorSetExclusiveUpdates` |
+| C4.1 `isExclusive` of shared object is false | `isExclusive_shared_obj_false` | pass | — |
+| C4.1 `isExclusive` of a freed object is `useAfterFree` | `isExclusive_freed_is_error` | pass | — |
+| C4.2 shared `ctor_set` is UB | `ctor_set_shared_is_ub` | pass | — |
+| C4.2 exclusive `ctor_set` succeeds | `ctor_set_exclusive_ok` | pass | — |
 | C4.2 shared `del` is UB | `del_shared_is_ub` | XFAIL | `#guard !delSharedIsUB` |
 | C4.2 `ctor_set` / `del` on a freed object is `useAfterFree` | `mutation_freed_is_error` | XFAIL | `#guard !freedMutationIsUAF` |
 | C4.2 exclusive `del` frees the shell and preserves references owned by its fields | `del_exclusive_preserves_fields` | XFAIL | `#guard !delExclusivePreservesFields` |
@@ -279,7 +299,7 @@ today's output. When 5b fixes the defect, the xfail breaks the build until someo
 | C5.2 via C4.2 `ctor_set` of a nested owning tuple is `typeError` | `ctor_set_nested_tuple_ownership_rejected` | XFAIL | `#guard !ctorSetNestedTupleRejected` |
 | C6 rejects wrong result | `symtv_rejects_wrong_result` | pass | — |
 | C6.1 fuel exhaustion ⇒ `passed = false` | `symtv_fuel_exhaustion_fails_closed` | XFAIL | `#guard !symtvFuelExhaustionFailsClosed` |
-| C6.2 untracked RC effects ⇒ `passed = false` | `symtv_rc_effects_fail_closed` | XFAIL | `#guard !symtvRcEffectsFailClosed` |
+| C6.2 untracked RC effects ⇒ `passed = false` | `symtv_rc_effects_fail_closed` | pass | — |
 | C6.3 source evaluator-fuel exhaustion counts as failure, not source UB | `symtv_source_fuel_exhaustion_fails_closed` | XFAIL | `#guard !symtvSourceFuelExhaustionFailsClosed` |
 
 To flip an xfail in 5b:
@@ -324,9 +344,9 @@ the reason. Nothing here is counted as covered. 5b must replace each entry with 
 
 | UNCOVERED id | Why no regression on `main` |
 |---|---|
-| `C5.1-fuelExhausted-ctor` | `main` has no recursive release, so no input reaches fuel exhaustion; the counting rule is pinned by `fuel_bound_boundary`. |
-| `C5.4-underfueled-helper` | `decRefObjFuel` / `decRefValsFuel` do not exist on `main`. |
+| `C5.1-fuelExhausted-ctor` | `main` (#280) releases recursively but has no `UBError.fuelExhausted` (its `decRefObjFuel 0 st _ _ = .ok st`), so there is no distinguished exhaustion error to assert; the counting rule is pinned by `fuel_bound_boundary`. |
+| `C5.4-underfueled-helper` | `main`'s `decRefObjFuel` returns a partial `.ok` at fuel `0` and there is no `fuelExhausted` constructor to expect; `decRefValsFuel` does not exist. |
 | `C1.2-scalar-lowering` | `main`'s emitter has no `getCtorLayout`-driven `lean_ctor_get_usize`/`_uintN` lowering; only the Lean layout itself is pinned (`layout_lean_runtime_offsets`). |
 | `C4.2-uset-sset` | `main` has no scalar-slot `ctor_set` (`uset`/`sset`) call name, so scalar-slot bounds and exclusivity cannot be exercised. |
 | `C4.2-setTag` | `main` has no `setTag` / `lean_ctor_set_tag` operation or call name, so there is nothing to call. |
-| `C6.3-rc-exhaustion-sample` | `main`'s `evalCode` has no RC/heap-exhaustion error (no recursive release), so no concrete sample can produce one. |
+| `C6.3-rc-exhaustion-sample` | `main`'s `evalCode` has no RC/heap-exhaustion error (#280's release returns `.ok` when its fuel runs out), so no concrete sample can produce one. |
