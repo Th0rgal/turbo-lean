@@ -151,7 +151,11 @@ pub(crate) fn spawn_lake_env(project_dir: &Path) -> Result<HashMap<String, Strin
             "{diagnostic}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let prefix = PathBuf::from(String::from_utf8(output.stdout).with_context(|| diagnostic)?.trim());
+        let prefix = PathBuf::from(
+            String::from_utf8(output.stdout)
+                .with_context(|| diagnostic)?
+                .trim(),
+        );
         anyhow::ensure!(
             prefix.is_absolute()
                 && prefix.join("bin/lean").is_file()
@@ -2130,6 +2134,10 @@ fn remove_module_build_artifacts(canon_dir: &Path, rel_slash: &str) {
     for suffix in [
         ".c",
         ".c.hash",
+        ".ltar",
+        ".ltar.hash",
+        ".bc",
+        ".bc.hash",
         ".setup.json",
         ".ilean",
         ".ilean.hash",
@@ -3999,7 +4007,11 @@ mod tests {
             assert_eq!(fs::metadata(&wt_local)?.permissions().mode() & 0o777, 0o600);
         }
         for (path, bytes) in &main_lake_bytes {
-            assert_eq!(&fs::read(path)?, bytes, "opt-out must not copy or rewrite main `.lake`");
+            assert_eq!(
+                &fs::read(path)?,
+                bytes,
+                "opt-out must not copy or rewrite main `.lake`"
+            );
         }
         #[cfg(unix)]
         {

@@ -27,6 +27,73 @@ pub enum GlobSpec {
     Submodules(String),
     AndSubmodules(String),
 }
+/// One component of a Lean `Name` (`Name.str` or `Name.num`), preserving structural distinction.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LeanNamePart {
+    Str(String),
+    Num(u64),
+}
+/// Structural Lean `Name` ordered by `Lean.Name.quickCmp` (`hash` first, then `quickCmpAux`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct LeanName(pub Vec<LeanNamePart>);
+/// Typed `Lean.LeanOptionValue` (`ofBool` | `ofNat` | `ofString`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "k", content = "v")]
+pub enum LeanOptionValue {
+    Bool(bool),
+    Nat(u64),
+    Str(String),
+}
+pub type LeanOptionsMap = BTreeMap<LeanName, LeanOptionValue>;
+impl Serialize for LeanName {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for LeanName {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Parts(Vec<LeanNamePart>),
+            Legacy(String),
+        }
+        match Repr::deserialize(deserializer)? {
+            Repr::Parts(parts) => Ok(LeanName(parts)),
+            Repr::Legacy(s) => LeanName::from_str_to_name(&s).map_err(serde::de::Error::custom),
+        }
+    }
+}
+impl LeanOptionValue {
+    /// `LeanOptionValue.asCliFlagValue`: strings wrap in `"..."` with NO backslash escaping.
+    pub fn as_cli_flag_value(&self) -> String {
+        match self {
+            LeanOptionValue::Bool(b) => b.to_string(),
+            LeanOptionValue::Nat(n) => n.to_string(),
+            LeanOptionValue::Str(s) => format!("\"{s}\""),
+        }
+    }
+    /// Raw CLI value for flat `-D` invocation without `setup.json`.
+    pub fn raw_cli_value(&self) -> String {
+        match self {
+            LeanOptionValue::Bool(b) => b.to_string(),
+            LeanOptionValue::Nat(n) => n.to_string(),
+            LeanOptionValue::Str(s) => s.clone(),
+        }
+    }
+    pub fn to_json_value(&self) -> serde_json::Value {
+        match self {
+            LeanOptionValue::Bool(b) => serde_json::Value::Bool(*b),
+            LeanOptionValue::Nat(n) => serde_json::Value::Number((*n).into()),
+            LeanOptionValue::Str(s) => serde_json::Value::String(s.clone()),
+        }
+    }
+}
 /// Static configuration of a `lean_lib` target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeanLibConfig {
@@ -36,7 +103,7 @@ pub struct LeanLibConfig {
     pub globs: Vec<GlobSpec>,
     pub more_lean_args: Vec<String>,
     pub weak_lean_args: Vec<String>,
-    pub lean_options: BTreeMap<String, String>,
+    pub lean_options: LeanOptionsMap,
     pub precompile_modules: Option<bool>,
     pub default_facets: Vec<String>,
     pub is_default_target: bool,
@@ -50,7 +117,7 @@ pub struct LeanExeConfig {
     pub support_interpreter: bool,
     pub more_lean_args: Vec<String>,
     pub weak_lean_args: Vec<String>,
-    pub lean_options: BTreeMap<String, String>,
+    pub lean_options: LeanOptionsMap,
     pub is_default_target: bool,
 }
 /// Static representation of an `extern_lib` declaration.
@@ -85,7 +152,7 @@ pub struct PackageConfig {
     pub packages_dir: PathBuf,
     pub more_lean_args: Vec<String>,
     pub weak_lean_args: Vec<String>,
-    pub lean_options: BTreeMap<String, String>,
+    pub lean_options: LeanOptionsMap,
     pub precompile_modules: bool,
     pub default_targets: Vec<String>,
     pub libs: Vec<LeanLibConfig>,
@@ -146,6 +213,8 @@ pub struct ModuleNode {
     pub has_prelude: bool,
     pub needs_c: bool,
     pub precompile_modules: bool,
+    #[serde(default)]
+    pub lean_options: LeanOptionsMap,
     pub strong_args: Vec<String>,
     pub weak_args: Vec<String>,
     pub src_blake3: String,
@@ -220,21 +289,254 @@ fn is_lean_subscript_alnum(c: char) -> bool {
 
 #[inline]
 fn is_lean_id_first(c: char) -> bool {
-    c.is_alphabetic() || c == '_' || is_lean_letter_like(c)
+    c.is_ascii_alphabetic() || c == '_' || is_lean_letter_like(c)
 }
 
 #[inline]
 fn is_lean_id_rest(c: char) -> bool {
-    c.is_alphanumeric()
-        || (c != '.'
-            && c != '\n'
-            && c != ' '
-            && (c == '_'
-                || c == '\''
-                || c == '!'
-                || c == '?'
-                || is_lean_letter_like(c)
-                || is_lean_subscript_alnum(c)))
+    c.is_ascii_alphanumeric()
+        || c == '_'
+        || c == '\''
+        || c == '!'
+        || c == '?'
+        || is_lean_letter_like(c)
+        || is_lean_subscript_alnum(c)
+}
+
+impl LeanName {
+    pub fn from_strs<I, S>(parts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        LeanName(
+            parts
+                .into_iter()
+                .map(|s| LeanNamePart::Str(s.into()))
+                .collect(),
+        )
+    }
+
+    /// `Lean.Name.hash` (`Init/Prelude.lean:4887`).
+    pub fn lean_hash(&self) -> u64 {
+        let mut h = 1723u64;
+        for p in &self.0 {
+            let k = match p {
+                LeanNamePart::Str(s) => lake_murmur64a(s.as_bytes(), 11),
+                LeanNamePart::Num(v) => *v,
+            };
+            h = lake_mix_hash(h, k);
+        }
+        h
+    }
+
+    pub fn has_macro_scopes(&self) -> bool {
+        let mut idx = self.0.len();
+        while idx > 0 {
+            match &self.0[idx - 1] {
+                LeanNamePart::Str(s) => return s == "_hyg",
+                LeanNamePart::Num(_) => idx -= 1,
+            }
+        }
+        false
+    }
+
+    pub fn is_inaccessible_user_name(&self) -> bool {
+        self.0.iter().any(|p| match p {
+            LeanNamePart::Str(s) => s.contains('✝') || s == "_inaccessible",
+            LeanNamePart::Num(_) => false,
+        })
+    }
+
+    pub fn maybe_pseudo_syntax(&self) -> bool {
+        if self.0.len() == 1 && matches!(&self.0[0], LeanNamePart::Str(s) if s == "_") {
+            return true;
+        }
+        matches!(self.0.first(), Some(LeanNamePart::Str(s)) if s.starts_with('#') || s.starts_with('?'))
+    }
+
+    fn escape_part(s: &str, force: bool) -> String {
+        let mut chars = s.chars();
+        if let Some(first) = chars.next() {
+            if !force && is_lean_id_first(first) && chars.all(is_lean_id_rest) {
+                return s.to_string();
+            }
+            if s.contains('»') {
+                return s.to_string();
+            }
+        }
+        format!("«{s}»")
+    }
+
+    /// `Lean.Name.toString` (`escape = true`, `isToken = fun _ => false`).
+    pub fn to_lean_string(&self) -> String {
+        if self.0.is_empty() {
+            return "[anonymous]".to_string();
+        }
+        let escape = !self.is_inaccessible_user_name()
+            && !self.has_macro_scopes()
+            && !self.maybe_pseudo_syntax();
+        let mut out = String::new();
+        for (i, p) in self.0.iter().enumerate() {
+            if i > 0 {
+                out.push('.');
+            }
+            match p {
+                LeanNamePart::Str(s) => {
+                    if escape {
+                        out.push_str(&Self::escape_part(s, false));
+                    } else {
+                        out.push_str(s);
+                    }
+                }
+                LeanNamePart::Num(v) => out.push_str(&v.to_string()),
+            }
+        }
+        out
+    }
+
+    /// Parse `String.toName` (`Init/Meta/Defs.lean:1187-1239`).
+    pub fn from_str_to_name(s: &str) -> Result<Self> {
+        if s.is_empty() {
+            anyhow::bail!("Empty Lean option name");
+        }
+        let mut parts = Vec::new();
+        let mut rem = s;
+        loop {
+            let Some(curr) = rem.chars().next() else {
+                anyhow::bail!("Trailing `.` in Lean name `{s}`");
+            };
+            if curr == '«' {
+                let after_open = &rem['«'.len_utf8()..];
+                let Some(end_idx) = after_open.find('»') else {
+                    anyhow::bail!("Unterminated `«` in Lean name `{s}`");
+                };
+                let inner = &after_open[..end_idx];
+                parts.push(LeanNamePart::Str(inner.to_string()));
+                rem = &after_open[end_idx + '»'.len_utf8()..];
+            } else if is_lean_id_first(curr) {
+                let len: usize = rem
+                    .chars()
+                    .take_while(|&c| is_lean_id_rest(c))
+                    .map(char::len_utf8)
+                    .sum();
+                parts.push(LeanNamePart::Str(rem[..len].to_string()));
+                rem = &rem[len..];
+            } else if curr.is_ascii_digit() {
+                let len: usize = rem
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .map(char::len_utf8)
+                    .sum();
+                let digits = &rem[..len];
+                let val: u64 = digits.parse().map_err(|_| {
+                    anyhow::anyhow!("Numeric Lean name part `{digits}` overflows u64")
+                })?;
+                parts.push(LeanNamePart::Num(val));
+                rem = &rem[len..];
+            } else {
+                anyhow::bail!("Invalid Lean name `{s}`");
+            }
+            if rem.is_empty() {
+                break;
+            }
+            if let Some(after_dot) = rem.strip_prefix('.') {
+                rem = after_dot;
+            } else {
+                anyhow::bail!("Invalid Lean name `{s}`");
+            }
+        }
+        Ok(LeanName(parts))
+    }
+
+    /// Parse a backtick literal `` `... `` per `Lean.Parser.identFnAux` (`Lean/Parser/Basic.lean:975-1025`).
+    pub fn from_backtick_literal(raw: &str) -> Result<Self> {
+        let raw = raw.trim();
+        let Some(mut rem) = raw.strip_prefix('`') else {
+            anyhow::bail!("Unsupported non-literal `leanOptions` name `{raw}` in lakefile.lean");
+        };
+        if rem.is_empty() || rem.starts_with('`') {
+            anyhow::bail!("Unsupported non-literal `leanOptions` name `{raw}` in lakefile.lean");
+        }
+        let mut parts = Vec::new();
+        loop {
+            let Some(curr) = rem.chars().next() else {
+                anyhow::bail!(
+                    "Unsupported non-literal `leanOptions` name `{raw}` in lakefile.lean"
+                );
+            };
+            if curr == '«' {
+                let after_open = &rem['«'.len_utf8()..];
+                let Some(end_idx) = after_open.find('»') else {
+                    anyhow::bail!("Unterminated `«` in `{raw}` in lakefile.lean");
+                };
+                parts.push(LeanNamePart::Str(after_open[..end_idx].to_string()));
+                rem = &after_open[end_idx + '»'.len_utf8()..];
+            } else if is_lean_id_first(curr) {
+                let len: usize = rem
+                    .chars()
+                    .take_while(|&c| is_lean_id_rest(c))
+                    .map(char::len_utf8)
+                    .sum();
+                parts.push(LeanNamePart::Str(rem[..len].to_string()));
+                rem = &rem[len..];
+            } else {
+                anyhow::bail!(
+                    "Unsupported non-literal `leanOptions` name `{raw}` in lakefile.lean"
+                );
+            }
+            if rem.is_empty() {
+                break;
+            }
+            if let Some(after_dot) = rem.strip_prefix('.') {
+                rem = after_dot;
+            } else {
+                anyhow::bail!(
+                    "Unsupported non-literal `leanOptions` name `{raw}` in lakefile.lean"
+                );
+            }
+        }
+        Ok(LeanName(parts))
+    }
+
+    pub fn with_weak_prefix(&self) -> Self {
+        let mut out = Vec::with_capacity(self.0.len() + 1);
+        out.push(LeanNamePart::Str("weak".to_string()));
+        out.extend(self.0.iter().cloned());
+        LeanName(out)
+    }
+
+    fn quick_cmp_aux(a: &[LeanNamePart], b: &[LeanNamePart]) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (a.split_last(), b.split_last()) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Less,
+            (Some(_), None) => Ordering::Greater,
+            (Some((LeanNamePart::Num(_), _)), Some((LeanNamePart::Str(_), _))) => Ordering::Less,
+            (Some((LeanNamePart::Str(_), _)), Some((LeanNamePart::Num(_), _))) => Ordering::Greater,
+            (Some((LeanNamePart::Num(v1), p1)), Some((LeanNamePart::Num(v2), p2))) => {
+                v1.cmp(v2).then_with(|| Self::quick_cmp_aux(p1, p2))
+            }
+            (Some((LeanNamePart::Str(s1), p1)), Some((LeanNamePart::Str(s2), p2))) => s1
+                .as_bytes()
+                .cmp(s2.as_bytes())
+                .then_with(|| Self::quick_cmp_aux(p1, p2)),
+        }
+    }
+}
+
+impl Ord for LeanName {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.lean_hash()
+            .cmp(&other.lean_hash())
+            .then_with(|| Self::quick_cmp_aux(&self.0, &other.0))
+    }
+}
+
+impl PartialOrd for LeanName {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[inline]
@@ -1223,9 +1525,41 @@ fn update_hasher_lp(h: &mut blake3::Hasher, s: &[u8]) {
     h.update(s);
 }
 
+fn update_hasher_lean_options(h: &mut blake3::Hasher, opts: &LeanOptionsMap) {
+    h.update(&(opts.len() as u64).to_le_bytes());
+    for (k, v) in opts {
+        h.update(&(k.0.len() as u64).to_le_bytes());
+        for p in &k.0 {
+            match p {
+                LeanNamePart::Str(s) => {
+                    h.update(&[1]);
+                    update_hasher_lp(h, s.as_bytes());
+                }
+                LeanNamePart::Num(n) => {
+                    h.update(&[2]);
+                    h.update(&n.to_le_bytes());
+                }
+            }
+        }
+        match v {
+            LeanOptionValue::Bool(b) => {
+                h.update(&[1, u8::from(*b)]);
+            }
+            LeanOptionValue::Nat(n) => {
+                h.update(&[2]);
+                h.update(&n.to_le_bytes());
+            }
+            LeanOptionValue::Str(s) => {
+                h.update(&[3]);
+                update_hasher_lp(h, s.as_bytes());
+            }
+        }
+    }
+}
+
 fn compute_package_config_digest(pkg: &PackageConfig, raw_config_hash: &str) -> String {
     let mut h = blake3::Hasher::new();
-    h.update(b"turbo-lean-pkg-config-v2\n");
+    h.update(b"turbo-lean-pkg-config-v3\n");
     update_hasher_lp(&mut h, pkg.name.as_bytes());
     update_hasher_lp(&mut h, pkg.config_file_kind.as_bytes());
     update_hasher_lp(&mut h, raw_config_hash.as_bytes());
@@ -1247,11 +1581,7 @@ fn compute_package_config_digest(pkg: &PackageConfig, raw_config_hash: &str) -> 
     for a in &pkg.weak_lean_args {
         update_hasher_lp(&mut h, a.as_bytes());
     }
-    h.update(&(pkg.lean_options.len() as u64).to_le_bytes());
-    for (k, v) in &pkg.lean_options {
-        update_hasher_lp(&mut h, k.as_bytes());
-        update_hasher_lp(&mut h, v.as_bytes());
-    }
+    update_hasher_lean_options(&mut h, &pkg.lean_options);
     h.update(&(pkg.libs.len() as u64).to_le_bytes());
     for lib in &pkg.libs {
         update_hasher_lp(&mut h, lib.name.as_bytes());
@@ -1297,11 +1627,7 @@ fn compute_package_config_digest(pkg: &PackageConfig, raw_config_hash: &str) -> 
                 }
             }
         }
-        h.update(&(lib.lean_options.len() as u64).to_le_bytes());
-        for (k, v) in &lib.lean_options {
-            update_hasher_lp(&mut h, k.as_bytes());
-            update_hasher_lp(&mut h, v.as_bytes());
-        }
+        update_hasher_lean_options(&mut h, &lib.lean_options);
         h.update(&(lib.more_lean_args.len() as u64).to_le_bytes());
         for a in &lib.more_lean_args {
             update_hasher_lp(&mut h, a.as_bytes());
@@ -1328,11 +1654,7 @@ fn compute_package_config_digest(pkg: &PackageConfig, raw_config_hash: &str) -> 
             u8::from(exe.support_interpreter),
             u8::from(exe.is_default_target),
         ]);
-        h.update(&(exe.lean_options.len() as u64).to_le_bytes());
-        for (k, v) in &exe.lean_options {
-            update_hasher_lp(&mut h, k.as_bytes());
-            update_hasher_lp(&mut h, v.as_bytes());
-        }
+        update_hasher_lean_options(&mut h, &exe.lean_options);
         h.update(&(exe.more_lean_args.len() as u64).to_le_bytes());
         for a in &exe.more_lean_args {
             update_hasher_lp(&mut h, a.as_bytes());
@@ -1530,63 +1852,285 @@ fn parse_toml_inline_table(val: &str) -> Result<BTreeMap<String, String>> {
     }
     Ok(map)
 }
-/// One `leanOptions` entry of a lakefile.toml. Keys must be bare dotted names (TOML reads a
-/// quoted `"a.b"` as one component, Lake as `«a.b»`). A string value that `-D`/setup.json would
-/// re-read as a bool or a number fails closed (Lake keeps it a string); bare values must be a
-/// bool or a canonical natural number.
-fn toml_lean_option(k: &str, v: &str) -> Result<(String, String)> {
-    let k = k.trim();
-    // A quoted key without a dot is the same name as the bare key.
-    let k = k
-        .strip_prefix('"')
-        .and_then(|k| k.strip_suffix('"'))
-        .filter(|k| !k.contains('.'))
-        .unwrap_or(k);
-    if k.is_empty()
-        || !k
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.'))
-    {
-        anyhow::bail!("Unsupported `leanOptions` key `{}` in lakefile.toml", k);
+/// Split a TOML dotted key (`Lake/Toml/Grammar.lean:345-535`) into `simpleKey` string segments.
+/// Each segment is either an `unquotedKey` (`[A-Za-z0-9_-]+`), a `basicString` (`"..."`), or a
+/// `literalString` (`'...'`, no backslash escaping). Every TOML table key segment becomes `Name.str`.
+fn split_toml_dotted_key(raw: &str) -> Result<Vec<String>> {
+    let mut rem = raw.trim();
+    if rem.is_empty() {
+        anyhow::bail!("Empty TOML key in lakefile.toml");
     }
-    let v = v.trim();
-    let value = if v.starts_with('"') || v.starts_with('\'') {
+    let mut parts = Vec::new();
+    loop {
+        rem = rem.trim_start();
+        let Some(first) = rem.chars().next() else {
+            anyhow::bail!("Trailing `.` in TOML key `{raw}` in lakefile.toml");
+        };
+        let (seg, rest) = if first == '"' {
+            let mut idx = 1usize;
+            let bytes = rem.as_bytes();
+            let mut end_q = None;
+            while idx < bytes.len() {
+                if bytes[idx] == b'\\' {
+                    idx += 2;
+                    continue;
+                }
+                if bytes[idx] == b'"' {
+                    end_q = Some(idx);
+                    break;
+                }
+                idx += 1;
+            }
+            let Some(q) = end_q else {
+                anyhow::bail!("Unterminated quoted TOML key `{raw}` in lakefile.toml");
+            };
+            (parse_toml_string(&rem[..=q])?, &rem[q + 1..])
+        } else if first == '\'' {
+            let Some(q) = rem[1..].find('\'') else {
+                anyhow::bail!("Unterminated literal TOML key `{raw}` in lakefile.toml");
+            };
+            (rem[1..1 + q].to_string(), &rem[2 + q..])
+        } else {
+            let len: usize = rem
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+                .map(char::len_utf8)
+                .sum();
+            if len == 0 {
+                anyhow::bail!("Unsupported TOML key `{raw}` in lakefile.toml");
+            }
+            (rem[..len].to_string(), &rem[len..])
+        };
+        if seg.is_empty() || seg.contains('»') || seg.chars().any(char::is_control) {
+            anyhow::bail!("Unsupported TOML `leanOptions` key `{raw}` in lakefile.toml");
+        }
+        parts.push(seg);
+        let rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        if let Some(after_dot) = rest.strip_prefix('.') {
+            rem = after_dot;
+        } else {
+            anyhow::bail!("Unsupported TOML key `{raw}` in lakefile.toml");
+        }
+    }
+    Ok(parts)
+}
+
+/// Parse a TOML `Nat` literal (`Lake/Toml/Grammar.lean:445-485`, `Decode.lean:105-120`):
+/// decimal (`0` or `[+]?[1-9](_?[0-9])*`), hex (`0x`), octal (`0o`), or binary (`0b`), with single `_` between digits.
+fn parse_toml_nat(raw: &str) -> Option<u64> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let sep_digits = |body: &str, radix: u32| -> Option<u64> {
+        if body.is_empty() || body.starts_with('_') || body.ends_with('_') || body.contains("__") {
+            return None;
+        }
+        if !body.chars().all(|c| c == '_' || c.is_digit(radix)) {
+            return None;
+        }
+        let clean: String = body.chars().filter(|&c| c != '_').collect();
+        u64::from_str_radix(&clean, radix).ok()
+    };
+    if let Some(hex) = s.strip_prefix("0x") {
+        return sep_digits(hex, 16);
+    }
+    if let Some(oct) = s.strip_prefix("0o") {
+        return sep_digits(oct, 8);
+    }
+    if let Some(bin) = s.strip_prefix("0b") {
+        return sep_digits(bin, 2);
+    }
+    let dec = s.strip_prefix('+').unwrap_or(s);
+    if dec == "0" {
+        return Some(0);
+    }
+    if dec.starts_with('0') {
+        return None;
+    }
+    sep_digits(dec, 10)
+}
+
+fn parse_toml_lean_option_value(raw: &str, key_ctx: &str) -> Result<LeanOptionValue> {
+    let v = raw.trim();
+    if v.starts_with('"') || v.starts_with('\'') {
         let s = parse_toml_string(v)?;
-        if matches!(s.as_str(), "true" | "false") || s.parse::<u64>().is_ok() || s.is_empty() {
+        if matches!(s.as_str(), "true" | "false")
+            || s.parse::<u64>().is_ok()
+            || s.is_empty()
+            || s.chars().any(char::is_control)
+        {
             anyhow::bail!(
                 "Unsupported `leanOptions` string value `{}` for `{}` in lakefile.toml",
                 v,
-                k
+                key_ctx
             );
         }
-        s
-    } else if matches!(v, "true" | "false") || is_canonical_nat(v) {
-        v.to_string()
+        Ok(LeanOptionValue::Str(s))
+    } else if v == "true" {
+        Ok(LeanOptionValue::Bool(true))
+    } else if v == "false" {
+        Ok(LeanOptionValue::Bool(false))
+    } else if let Some(n) = parse_toml_nat(v) {
+        Ok(LeanOptionValue::Nat(n))
     } else {
         anyhow::bail!(
             "Unsupported `leanOptions` value `{}` for `{}` in lakefile.toml",
             v,
-            k
-        );
-    };
-    Ok((k.to_string(), value))
+            key_ctx
+        )
+    }
 }
 
-/// A `leanOptions = { ... }` inline table of a lakefile.toml.
-fn parse_toml_lean_options_table(val: &str) -> Result<BTreeMap<String, String>> {
+/// Insert one or more TOML `leanOptions` entries under `prefix` (handling nested inline tables `{...}`).
+fn insert_toml_lean_option_entry(
+    map: &mut LeanOptionsMap,
+    prefix: &[String],
+    raw_key: &str,
+    raw_val: &str,
+) -> Result<()> {
+    let key_segs = split_toml_dotted_key(raw_key)?;
+    let mut full_segs = Vec::with_capacity(prefix.len() + key_segs.len());
+    full_segs.extend(prefix.iter().cloned());
+    full_segs.extend(key_segs);
+    let v = raw_val.trim();
+    if v.starts_with('{') && v.ends_with('}') {
+        for entry in split_top_level_comma(&v[1..v.len() - 1])? {
+            let Some((k, sub_v)) = entry.split_once('=') else {
+                anyhow::bail!("Invalid inline table entry `{}`", entry);
+            };
+            insert_toml_lean_option_entry(map, &full_segs, k, sub_v)?;
+        }
+        return Ok(());
+    }
+    let name = LeanName(full_segs.into_iter().map(LeanNamePart::Str).collect());
+    let val = parse_toml_lean_option_value(v, &name.to_lean_string())?;
+    map.insert(name, val);
+    Ok(())
+}
+
+/// Parse `leanOptions = { ... }` or `leanOptions = [ ... ]` (`Lake/Load/Toml.lean:116-140`).
+fn parse_toml_lean_options_value(val: &str, prefix: &[String]) -> Result<LeanOptionsMap> {
     let s = val.trim();
-    if !s.starts_with('{') || !s.ends_with('}') {
-        anyhow::bail!("Expected TOML inline table `{{...}}`, found `{}`", val);
+    if s.starts_with('{') && s.ends_with('}') {
+        let mut map = LeanOptionsMap::new();
+        for entry in split_top_level_comma(&s[1..s.len() - 1])? {
+            let Some((k, v)) = entry.split_once('=') else {
+                anyhow::bail!("Invalid inline table entry `{}`", entry);
+            };
+            insert_toml_lean_option_entry(&mut map, prefix, k, v)?;
+        }
+        return Ok(map);
     }
-    let mut map = BTreeMap::new();
-    for entry in split_top_level_comma(&s[1..s.len() - 1])? {
-        let Some((k, v)) = entry.split_once('=') else {
-            anyhow::bail!("Invalid inline table entry `{}`", entry);
-        };
-        let (k, v) = toml_lean_option(k, v)?;
-        map.insert(k, v);
+    if s.starts_with('[') && s.ends_with(']') {
+        anyhow::ensure!(
+            prefix.is_empty(),
+            "TOML `leanOptions` array syntax is only valid on `leanOptions = [...]`, found `{}`",
+            val
+        );
+        let mut map = LeanOptionsMap::new();
+        for item in split_top_level_comma(&s[1..s.len() - 1])? {
+            let t = item.trim();
+            if t.starts_with('[') && t.ends_with(']') {
+                let elems = split_top_level_comma(&t[1..t.len() - 1])?;
+                if elems.len() != 2 {
+                    anyhow::bail!(
+                        "Expected 2-element `[name, value]` in TOML `leanOptions`, found `{}`",
+                        t
+                    );
+                }
+                let name_str = parse_toml_string(&elems[0])?;
+                let name = LeanName::from_str_to_name(&name_str)?;
+                let opt_v = parse_toml_lean_option_value(&elems[1], &name_str)?;
+                map.insert(name, opt_v);
+            } else if t.starts_with('{') && t.ends_with('}') {
+                let mut name_opt: Option<LeanName> = None;
+                let mut val_raw_opt: Option<String> = None;
+                for kv in split_top_level_comma(&t[1..t.len() - 1])? {
+                    let Some((fk, fv)) = kv.split_once('=') else {
+                        anyhow::bail!("Invalid TOML `leanOptions` record `{}`", t);
+                    };
+                    let fk_segs = split_toml_dotted_key(fk)?;
+                    if fk_segs.len() != 1 {
+                        anyhow::bail!(
+                            "Invalid field `{}` in TOML `leanOptions` record `{}`",
+                            fk,
+                            t
+                        );
+                    }
+                    match fk_segs[0].as_str() {
+                        "name" => {
+                            let ns = parse_toml_string(fv)?;
+                            name_opt = Some(LeanName::from_str_to_name(&ns)?);
+                        }
+                        "value" => {
+                            val_raw_opt = Some(fv.trim().to_string());
+                        }
+                        other => {
+                            anyhow::bail!(
+                                "Unknown field `{}` in TOML `leanOptions` record `{}`",
+                                other,
+                                t
+                            );
+                        }
+                    }
+                }
+                let (Some(name), Some(val_raw)) = (name_opt, val_raw_opt) else {
+                    anyhow::bail!(
+                        "TOML `leanOptions` record `{}` requires both `name` and `value`",
+                        t
+                    );
+                };
+                let opt_v = parse_toml_lean_option_value(&val_raw, &name.to_lean_string())?;
+                map.insert(name, opt_v);
+            } else {
+                anyhow::bail!("Unsupported TOML `leanOptions` array item `{}`", t);
+            }
+        }
+        return Ok(map);
     }
-    Ok(map)
+    anyhow::bail!(
+        "Expected TOML inline table `{{...}}` or array `[...]` for `leanOptions`, found `{}`",
+        val
+    )
+}
+
+fn toml_expr_is_unclosed(s: &str) -> bool {
+    let mut bracket_depth = 0i32;
+    let mut brace_depth = 0i32;
+    let mut in_double = false;
+    let mut in_single = false;
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_double {
+            if c == '\\' && i + 1 < chars.len() {
+                i += 1;
+            } else if c == '"' {
+                in_double = false;
+            }
+        } else if in_single {
+            if c == '\'' {
+                in_single = false;
+            }
+        } else {
+            match c {
+                '"' => in_double = true,
+                '\'' => in_single = true,
+                '[' => bracket_depth += 1,
+                ']' => bracket_depth -= 1,
+                '{' => brace_depth += 1,
+                '}' => brace_depth -= 1,
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    in_double || in_single || bracket_depth > 0 || brace_depth > 0
 }
 
 fn parse_toml_glob_item(item: &str) -> Result<GlobSpec> {
@@ -1676,15 +2220,15 @@ pub fn parse_lakefile_toml(
         custom_targets: Vec::new(),
         config_digest: String::new(),
     };
-    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[derive(Clone, PartialEq, Eq)]
     enum Section {
         Top,
-        LeanOptions,
+        LeanOptions(Vec<String>),
         Require,
         LeanLib(usize),
-        LeanLibOptions(usize),
+        LeanLibOptions(usize, Vec<String>),
         LeanExe(usize),
-        LeanExeOptions(usize),
+        LeanExeOptions(usize, Vec<String>),
         ExternLib(usize),
     }
     let mut section = Section::Top;
@@ -1754,19 +2298,26 @@ pub fn parse_lakefile_toml(
                 }
             } else {
                 let sec_name = stripped[1..stripped.len() - 1].trim();
-                match sec_name {
-                    "leanOptions" => section = Section::LeanOptions,
-                    "lean_lib.leanOptions" if !pkg.libs.is_empty() => {
-                        section = Section::LeanLibOptions(pkg.libs.len() - 1);
+                let sec_segs = split_toml_dotted_key(sec_name).unwrap_or_default();
+                match sec_segs.as_slice() {
+                    [head, rest @ ..] if head == "leanOptions" => {
+                        section = Section::LeanOptions(rest.to_vec());
                     }
-                    "lean_exe.leanOptions" if !pkg.exes.is_empty() => {
-                        section = Section::LeanExeOptions(pkg.exes.len() - 1);
+                    [t, head, rest @ ..]
+                        if t == "lean_lib" && head == "leanOptions" && !pkg.libs.is_empty() =>
+                    {
+                        section = Section::LeanLibOptions(pkg.libs.len() - 1, rest.to_vec());
                     }
-                    other => {
+                    [t, head, rest @ ..]
+                        if t == "lean_exe" && head == "leanOptions" && !pkg.exes.is_empty() =>
+                    {
+                        section = Section::LeanExeOptions(pkg.exes.len() - 1, rest.to_vec());
+                    }
+                    _ => {
                         let _ = c_abi::verify_static_lake_config(true, true, false, false);
                         anyhow::bail!(
                             "Unsupported table `[{}]` in {} at line {}: fail-closed static Lake config gate",
-                            other,
+                            sec_name,
                             toml_path.display(),
                             line_no
                         );
@@ -1786,8 +2337,8 @@ pub fn parse_lakefile_toml(
         let key = raw_key.trim();
         let mut val_accum = raw_val_start.trim().to_string();
         // Handle multi-line array `[...]` or inline table `{...}`
-        while (val_accum.starts_with('[') && !val_accum.ends_with(']'))
-            || (val_accum.starts_with('{') && !val_accum.ends_with('}'))
+        while (val_accum.starts_with('[') || val_accum.starts_with('{'))
+            && toml_expr_is_unclosed(&val_accum)
         {
             if idx >= lines.len() {
                 anyhow::bail!(
@@ -1804,16 +2355,34 @@ pub fn parse_lakefile_toml(
                 val_accum.push_str(next_part);
             }
         }
-        let insert_option_kv =
-            |map: &mut BTreeMap<String, String>, k: &str, v: &str| -> Result<()> {
-                let (k, v) = toml_lean_option(k, v)?;
-                map.insert(k, v);
-                Ok(())
+        let try_insert_dotted_lean_options =
+            |map: &mut LeanOptionsMap, raw_k: &str, raw_v: &str| -> Result<bool> {
+                if let Ok(segs) = split_toml_dotted_key(raw_k) {
+                    if segs.len() >= 2 && segs[0] == "leanOptions" {
+                        let last_idx = segs.len() - 1;
+                        let prefix = &segs[1..last_idx];
+                        let v_trim = raw_v.trim();
+                        if v_trim.starts_with('{') && v_trim.ends_with('}') {
+                            let mut sub_prefix = segs[1..].to_vec();
+                            let tbl = parse_toml_lean_options_value(v_trim, &sub_prefix)?;
+                            sub_prefix.clear();
+                            map.extend(tbl);
+                        } else {
+                            let name = LeanName(
+                                segs[1..].iter().cloned().map(LeanNamePart::Str).collect(),
+                            );
+                            let val = parse_toml_lean_option_value(v_trim, &name.to_lean_string())?;
+                            map.insert(name, val);
+                            let _ = prefix;
+                        }
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
             };
-        match section {
+        match &section {
             Section::Top => {
-                if let Some(opt_key) = key.strip_prefix("leanOptions.") {
-                    insert_option_kv(&mut pkg.lean_options, opt_key, &val_accum)?;
+                if try_insert_dotted_lean_options(&mut pkg.lean_options, key, &val_accum)? {
                     continue;
                 }
                 match key {
@@ -1841,7 +2410,7 @@ pub fn parse_lakefile_toml(
                     "weakLeanArgs" => pkg.weak_lean_args = parse_toml_string_array(&val_accum)?,
                     "precompileModules" => pkg.precompile_modules = parse_toml_bool(&val_accum)?,
                     "leanOptions" => {
-                        let tbl = parse_toml_lean_options_table(&val_accum)?;
+                        let tbl = parse_toml_lean_options_value(&val_accum, &[])?;
                         pkg.lean_options.extend(tbl);
                     }
                     "dynlibs" | "plugins" | "needs" => {
@@ -1870,16 +2439,16 @@ pub fn parse_lakefile_toml(
                     }
                 }
             }
-            Section::LeanOptions => {
-                insert_option_kv(&mut pkg.lean_options, key, &val_accum)?;
+            Section::LeanOptions(prefix) => {
+                insert_toml_lean_option_entry(&mut pkg.lean_options, prefix, key, &val_accum)?;
             }
             Section::Require => {
                 // Handled via lake-manifest.json and .lake/packages discovery
             }
             Section::LeanLib(i) => {
+                let i = *i;
                 let lib = &mut pkg.libs[i];
-                if let Some(opt_key) = key.strip_prefix("leanOptions.") {
-                    insert_option_kv(&mut lib.lean_options, opt_key, &val_accum)?;
+                if try_insert_dotted_lean_options(&mut lib.lean_options, key, &val_accum)? {
                     continue;
                 }
                 match key {
@@ -1901,7 +2470,7 @@ pub fn parse_lakefile_toml(
                         lib.precompile_modules = Some(parse_toml_bool(&val_accum)?)
                     }
                     "leanOptions" => {
-                        let tbl = parse_toml_lean_options_table(&val_accum)?;
+                        let tbl = parse_toml_lean_options_value(&val_accum, &[])?;
                         lib.lean_options.extend(tbl);
                     }
                     "defaultFacets" => {
@@ -1956,13 +2525,17 @@ pub fn parse_lakefile_toml(
                     }
                 }
             }
-            Section::LeanLibOptions(i) => {
-                insert_option_kv(&mut pkg.libs[i].lean_options, key, &val_accum)?;
+            Section::LeanLibOptions(i, prefix) => {
+                insert_toml_lean_option_entry(
+                    &mut pkg.libs[*i].lean_options,
+                    prefix,
+                    key,
+                    &val_accum,
+                )?;
             }
             Section::LeanExe(i) => {
-                let exe = &mut pkg.exes[i];
-                if let Some(opt_key) = key.strip_prefix("leanOptions.") {
-                    insert_option_kv(&mut exe.lean_options, opt_key, &val_accum)?;
+                let exe = &mut pkg.exes[*i];
+                if try_insert_dotted_lean_options(&mut exe.lean_options, key, &val_accum)? {
                     continue;
                 }
                 match key {
@@ -1973,7 +2546,7 @@ pub fn parse_lakefile_toml(
                     "moreLeanArgs" => exe.more_lean_args = parse_toml_string_array(&val_accum)?,
                     "weakLeanArgs" => exe.weak_lean_args = parse_toml_string_array(&val_accum)?,
                     "leanOptions" => {
-                        let tbl = parse_toml_lean_options_table(&val_accum)?;
+                        let tbl = parse_toml_lean_options_value(&val_accum, &[])?;
                         exe.lean_options.extend(tbl);
                     }
                     "exeName" | "moreLinkArgs" | "moreLinkObjs" | "moreLinkLibs" => {}
@@ -1990,11 +2563,16 @@ pub fn parse_lakefile_toml(
                     }
                 }
             }
-            Section::LeanExeOptions(i) => {
-                insert_option_kv(&mut pkg.exes[i].lean_options, key, &val_accum)?;
+            Section::LeanExeOptions(i, prefix) => {
+                insert_toml_lean_option_entry(
+                    &mut pkg.exes[*i].lean_options,
+                    prefix,
+                    key,
+                    &val_accum,
+                )?;
             }
             Section::ExternLib(i) => {
-                let ext = &mut pkg.extern_libs[i];
+                let ext = &mut pkg.extern_libs[*i];
                 match key {
                     "name" => ext.name = clean_lake_ident(&parse_toml_string(&val_accum)?),
                     "path" => {
@@ -2188,25 +2766,10 @@ fn parse_lean_globs_expr(expr: &str) -> Result<Vec<GlobSpec>> {
     }
     Ok(out)
 }
-/// An option name must be a name literal: one leading backtick, then `.`-separated plain
-/// identifiers. Bare identifiers (`Name` values Lake would evaluate), guillemet-escaped
-/// components (whose structure differs from the dotted reading) and operators are rejected.
-fn lean_option_name_literal(raw: &str) -> Result<String> {
-    let raw = raw.trim();
-    let ident = |c: &str| {
-        c.chars()
-            .next()
-            .is_some_and(|f| f.is_alphabetic() || f == '_')
-            && c.chars()
-                .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '\'' | '!' | '?'))
-    };
-    match raw.strip_prefix('`') {
-        Some(name) if name.split('.').all(ident) => Ok(name.to_string()),
-        _ => anyhow::bail!(
-            "Unsupported non-literal `leanOptions` name `{}` in lakefile.lean",
-            raw
-        ),
-    }
+/// An option name must be a backtick name literal (`Lean.Parser.identFnAux`). Bare identifiers
+/// (`Name` values Lake would evaluate) and operators are rejected.
+fn lean_option_name_literal(raw: &str) -> Result<LeanName> {
+    LeanName::from_backtick_literal(raw)
 }
 
 /// `v` is exactly one `"..."` token: its first unescaped closing quote is its last character
@@ -2256,7 +2819,7 @@ fn plain_string_literal(t: &str) -> Result<String> {
 /// Normalise a `LeanOptionValue` literal: a bool, a natural number or a quoted string, optionally
 /// wrapped in `LeanOptionValue.of*` / `.of*`. Anything else (e.g. a bare identifier, which would
 /// otherwise reach Lean verbatim as `-Dkey=ident`) fails closed.
-fn lean_option_literal(raw: &str, key: &str) -> Result<String> {
+fn lean_option_literal(raw: &str, key: &str) -> Result<LeanOptionValue> {
     let raw = raw.trim();
     let lit = |long: &str, short: &str, ok: fn(&str) -> bool| {
         Some(
@@ -2269,10 +2832,10 @@ fn lean_option_literal(raw: &str, key: &str) -> Result<String> {
     if let Some(b) = lit("LeanOptionValue.ofBool ", ".ofBool ", |v| {
         matches!(v, "true" | "false")
     }) {
-        return Ok(b.to_string());
+        return Ok(LeanOptionValue::Bool(b == "true"));
     }
-    if let Some(n) = lit("LeanOptionValue.ofNat ", ".ofNat ", |v| is_canonical_nat(v)) {
-        return Ok(n.to_string());
+    if let Some(n) = lit("LeanOptionValue.ofNat ", ".ofNat ", is_canonical_nat) {
+        return Ok(LeanOptionValue::Nat(n.parse::<u64>()?));
     }
     if let Some(q) = lit(
         "LeanOptionValue.ofString ",
@@ -2293,8 +2856,10 @@ fn lean_option_literal(raw: &str, key: &str) -> Result<String> {
             && !matches!(v.as_str(), "true" | "false")
             && v.parse::<u64>().is_err()
             && !v.chars().all(|c| c.is_ascii_digit())
+            && !v.is_empty()
+            && !v.chars().any(char::is_control)
         {
-            return Ok(v);
+            return Ok(LeanOptionValue::Str(v));
         }
     }
     anyhow::bail!(
@@ -2303,7 +2868,7 @@ fn lean_option_literal(raw: &str, key: &str) -> Result<String> {
         key
     )
 }
-fn parse_lean_options_expr(expr: &str) -> Result<BTreeMap<String, String>> {
+fn parse_lean_options_expr(expr: &str) -> Result<LeanOptionsMap> {
     let mut s = expr.trim();
     if let Some(rest) = s.strip_prefix('#') {
         s = rest.trim_start();
@@ -2316,9 +2881,9 @@ fn parse_lean_options_expr(expr: &str) -> Result<BTreeMap<String, String>> {
     }
     let inner = s[1..s.len() - 1].trim();
     if inner.is_empty() {
-        return Ok(BTreeMap::new());
+        return Ok(LeanOptionsMap::new());
     }
-    let mut map = BTreeMap::new();
+    let mut map = LeanOptionsMap::new();
     let (pairs, open) = lean_scan(inner, ",")?;
     if open != 0 {
         anyhow::bail!("Unclosed bracket in `leanOptions` expression `{}`", expr);
@@ -2336,7 +2901,7 @@ fn parse_lean_options_expr(expr: &str) -> Result<BTreeMap<String, String>> {
                 anyhow::bail!("Invalid `leanOptions` tuple `{}` in lakefile.lean", p);
             };
             let k = lean_option_name_literal(k_raw)?;
-            let v = lean_option_literal(v_raw, &k)?;
+            let v = lean_option_literal(v_raw, &k.to_lean_string())?;
             map.insert(k, v);
         } else if let Some(rest) = p.trim().strip_prefix("LeanOption.mk ") {
             let Some((k_raw, v_raw)) = rest.trim().split_once(char::is_whitespace) else {
@@ -2349,7 +2914,7 @@ fn parse_lean_options_expr(expr: &str) -> Result<BTreeMap<String, String>> {
                 .filter(|inner| lean_scan(inner, "").is_ok_and(|(_, d)| d == 0))
                 .unwrap_or(v_raw);
             let k = lean_option_name_literal(k_raw)?;
-            let v = lean_option_literal(v_raw, &k)?;
+            let v = lean_option_literal(v_raw, &k.to_lean_string())?;
             map.insert(k, v);
         } else {
             anyhow::bail!("Unsupported `leanOptions` entry `{}` in lakefile.lean", p);
@@ -2742,7 +3307,10 @@ fn lakefile_lexical_guard(
                 if d == '»' {
                     break;
                 }
-                if !(d.is_ascii_alphanumeric() || matches!(d, '_' | '-')) {
+                if !(d.is_ascii_alphanumeric()
+                    || matches!(d, '_' | '-')
+                    || (in_name_literal && d == '.'))
+                {
                     return Err(format!("unsupported `{d}` inside `«»`"));
                 }
                 name.push(d);
@@ -3062,7 +3630,7 @@ fn resolve_lean_options_expr(
     expr: &str,
     bindings: &LakefileBindings,
     line: usize,
-) -> Result<BTreeMap<String, String>> {
+) -> Result<LeanOptionsMap> {
     if bindings.scoped {
         anyhow::bail!(
             "Unsupported `leanOptions` expression `{}`: lakefile.lean is not plain (scopes, where, open, notation or metaprogramming)",
@@ -3076,7 +3644,7 @@ fn resolve_lean_options_expr(
 /// resolved is a cycle, so resolution is linear in the lakefile size.
 #[derive(Default)]
 struct BindingCache {
-    done: BTreeMap<String, BTreeMap<String, String>>,
+    done: BTreeMap<String, LeanOptionsMap>,
     visiting: std::collections::BTreeSet<String>,
 }
 
@@ -3086,7 +3654,7 @@ fn resolve_lean_options_in(
     line: usize,
     depth: usize,
     cache: &mut BindingCache,
-) -> Result<BTreeMap<String, String>> {
+) -> Result<LeanOptionsMap> {
     if depth > LEAN_OPTIONS_MAX_DEPTH {
         anyhow::bail!(
             "`leanOptions` expression `{}` nests deeper than {} in lakefile.lean",
@@ -3096,7 +3664,7 @@ fn resolve_lean_options_in(
     }
     let (parts, _) = lean_scan(expr, "++")?;
     if parts.len() > 1 {
-        let mut map = BTreeMap::new();
+        let mut map = LeanOptionsMap::new();
         for part in &parts {
             // Pieces are strictly smaller, so `++` does not count towards the depth bound.
             map.extend(resolve_lean_options_in(part, bindings, line, depth, cache)?);
@@ -3146,7 +3714,7 @@ fn resolve_lean_options_in(
             };
             return Ok(if weak {
                 map.into_iter()
-                    .map(|(k, v)| (format!("weak.{k}"), v))
+                    .map(|(k, v)| (k.with_weak_prefix(), v))
                     .collect()
             } else {
                 map
@@ -3796,28 +4364,61 @@ trait FromDeclBlock {
 /// checking (`debug.skipKernelTC`, `debug.*AsSorry`), run programs (`sat.solver`) or write
 /// files (`trace.profiler.output`). `warn.sorry` may only be `true` and `debug.skipKernelTC`
 /// only `false`; both are forced on every compile anyway.
-fn is_allowed_lean_option(key: &str, value: &str) -> bool {
-    // Not `pp.*` in general: `pp.all`, `pp.raw`, `pp.maxSteps`, ... change how the
-    // `declaration uses 'sorry'` warning prints.
-    const PREFIXES: [&str; 3] = ["linter.", "backward.", "experimental."];
-    const KEYS: [&str; 11] = [
-        "pp.unicode.fun",
-        "pp.mvars.anonymous",
-        "autoImplicit",
-        "relaxedAutoImplicit",
-        "maxHeartbeats",
-        "maxRecDepth",
-        "maxSynthPendingDepth",
-        "synthInstance.maxHeartbeats",
-        "synthInstance.maxSize",
-        "warningAsError",
-        "exponentiation.threshold",
-    ];
-    match key {
-        "warn.sorry" => value == "true",
-        "debug.skipKernelTC" => value == "false",
-        _ => KEYS.contains(&key) || PREFIXES.iter().any(|p| key.starts_with(p)),
+fn is_allowed_lean_option(key: &LeanName, value: &LeanOptionValue) -> bool {
+    if key.0.is_empty()
+        || key.is_inaccessible_user_name()
+        || key.has_macro_scopes()
+        || key.maybe_pseudo_syntax()
+        || key.0.iter().any(|p| match p {
+            LeanNamePart::Str(s) => {
+                s.is_empty() || s.contains('»') || s.chars().any(char::is_control)
+            }
+            LeanNamePart::Num(_) => false,
+        })
+    {
+        return false;
     }
+    if let LeanOptionValue::Str(s) = value {
+        if s.is_empty() || s.chars().any(char::is_control) {
+            return false;
+        }
+    }
+    let rem = match key.0.as_slice() {
+        [LeanNamePart::Str(w), rest @ ..] if w == "weak" && !rest.is_empty() => rest,
+        other => other,
+    };
+    let str_parts: Option<Vec<&str>> = rem
+        .iter()
+        .map(|p| match p {
+            LeanNamePart::Str(s) => Some(s.as_str()),
+            LeanNamePart::Num(_) => None,
+        })
+        .collect();
+    if let Some(sp) = str_parts.as_deref() {
+        match sp {
+            ["warn", "sorry"] => return matches!(value, LeanOptionValue::Bool(true)),
+            ["debug", "skipKernelTC"] => return matches!(value, LeanOptionValue::Bool(false)),
+            // Not `pp.*` in general: `pp.all`, `pp.raw`, `pp.maxSteps`, ... change how the
+            // `declaration uses 'sorry'` warning prints.
+            ["pp", "unicode", "fun"]
+            | ["pp", "mvars", "anonymous"]
+            | ["autoImplicit"]
+            | ["relaxedAutoImplicit"]
+            | ["maxHeartbeats"]
+            | ["maxRecDepth"]
+            | ["maxSynthPendingDepth"]
+            | ["synthInstance", "maxHeartbeats"]
+            | ["synthInstance", "maxSize"]
+            | ["warningAsError"]
+            | ["exponentiation", "threshold"] => return true,
+            _ => {}
+        }
+    }
+    matches!(
+        rem,
+        [LeanNamePart::Str(ns), _, ..]
+            if matches!(ns.as_str(), "linter" | "backward" | "experimental")
+    )
 }
 
 /// Strict allowlist check for Lean compiler flags configured in `moreLeanArgs` / `weakLeanArgs`.
@@ -3833,17 +4434,30 @@ pub fn is_allowed_lean_arg(arg: &str) -> bool {
         let Some((k, v)) = kv.split_once('=') else {
             return false;
         };
-        if k.is_empty()
-            || v.is_empty()
-            || !is_allowed_lean_option(k.strip_prefix("weak.").unwrap_or(k), v)
-            || !k
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
-            || v.chars().any(|c| c.is_control())
-        {
+        if k.is_empty() || v.is_empty() || v.chars().any(char::is_control) {
             return false;
         }
-        return true;
+        let Ok(name) = LeanName::from_str_to_name(k) else {
+            return false;
+        };
+        if name.to_lean_string() != k {
+            return false;
+        }
+        let val = if v == "true" {
+            LeanOptionValue::Bool(true)
+        } else if v == "false" {
+            LeanOptionValue::Bool(false)
+        } else if is_canonical_nat(v) {
+            let Ok(n) = v.parse::<u64>() else {
+                return false;
+            };
+            LeanOptionValue::Nat(n)
+        } else if v.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        } else {
+            LeanOptionValue::Str(v.to_string())
+        };
+        return is_allowed_lean_option(&name, &val);
     }
     if let Some(num) = t
         .strip_prefix("-j")
@@ -3923,10 +4537,22 @@ pub fn compose_flat_filtered_args(weak_args: &[String], strong_args: &[String]) 
     filter_allowed_lean_args(weak_args.iter().chain(strong_args))
 }
 
+fn compose_flat_filtered_args_with_options(
+    weak_args: &[String],
+    strong_args: &[String],
+    lean_options: &LeanOptionsMap,
+) -> Vec<String> {
+    let opt_flags: Vec<String> = lean_options
+        .iter()
+        .map(|(k, v)| format!("-D{}={}", k.to_lean_string(), v.raw_cli_value()))
+        .collect();
+    filter_allowed_lean_args(weak_args.iter().chain(strong_args).chain(&opt_flags))
+}
+
 /// Resolve filtered package-level Lean compiler flags from `pkg`.
 pub fn package_default_lean_args(pkg: &PackageConfig) -> Vec<String> {
-    let (strong, weak) = compose_effective_args(pkg, &BTreeMap::new(), &[], &[]);
-    compose_flat_filtered_args(&weak, &strong)
+    let (opts, strong, weak) = compose_effective_args(pkg, &LeanOptionsMap::new(), &[], &[]);
+    compose_flat_filtered_args_with_options(&weak, &strong, &opts)
 }
 
 /// Resolve filtered effective Lean compiler flags for a specific `.lean` file in `pkg`: the
@@ -3954,7 +4580,11 @@ pub fn resolve_file_lean_args_in_package(pkg: &PackageConfig, file_path: &Path) 
         );
         if let Some(spec) = resolve_module_in_package(pkg, true, &mod_name) {
             if canon(&spec.src_path) == canon_file {
-                return compose_flat_filtered_args(&spec.weak_args, &spec.strong_args);
+                return compose_flat_filtered_args_with_options(
+                    &spec.weak_args,
+                    &spec.strong_args,
+                    &spec.lean_options,
+                );
             }
         }
     }
@@ -4065,10 +4695,21 @@ fn finalize_package_config(
         }
         Ok(())
     };
-    // `leanOptions` reach Lean as `-Dk=v`, so they pass the same gate as explicit flags
-    // (e.g. `warn.sorry=false` and malformed keys are rejected).
-    let as_flags = |opts: &BTreeMap<String, String>| -> Vec<String> {
-        opts.iter().map(|(k, v)| format!("-D{k}={v}")).collect()
+    let check_allowed_opts = |opts: &LeanOptionsMap, scope: &str| -> Result<()> {
+        for (k, v) in opts {
+            let allowed = is_allowed_lean_option(k, v);
+            if !c_abi::verify_static_lake_config(true, !allowed, false, false) {
+                anyhow::bail!(
+                    "Unsupported or unsafe Lean option `{}={}` in {} of {} ({}): fail-closed static Lake config gate",
+                    k.to_lean_string(),
+                    v.raw_cli_value(),
+                    scope,
+                    pkg.name,
+                    config_path.display()
+                );
+            }
+        }
+        Ok(())
     };
     let scopes = std::iter::once((
         "package".to_string(),
@@ -4095,7 +4736,7 @@ fn finalize_package_config(
     for (scope, more, weak, opts) in scopes {
         check_allowed_args(more, &format!("{scope}.moreLeanArgs"))?;
         check_allowed_args(weak, &format!("{scope}.weakLeanArgs"))?;
-        check_allowed_args(&as_flags(opts), &format!("{scope}.leanOptions"))?;
+        check_allowed_opts(opts, &format!("{scope}.leanOptions"))?;
     }
     // Fail-closed check for unbuilt dynamic extern_lib or custom targets in root package
     let any_precompile = pkg.precompile_modules
@@ -4283,6 +4924,7 @@ pub(crate) struct DiscoveredModuleSpec {
     build_ir_dir: PathBuf,
     precompile_modules: bool,
     is_exe_target: bool,
+    lean_options: LeanOptionsMap,
     strong_args: Vec<String>,
     weak_args: Vec<String>,
     extern_lib_digests: Vec<String>,
@@ -4290,27 +4932,20 @@ pub(crate) struct DiscoveredModuleSpec {
 }
 fn compose_effective_args(
     pkg: &PackageConfig,
-    target_options: &BTreeMap<String, String>,
+    target_options: &LeanOptionsMap,
     target_more_args: &[String],
     target_weak_args: &[String],
-) -> (Vec<String>, Vec<String>) {
+) -> (LeanOptionsMap, Vec<String>, Vec<String>) {
     let mut merged_opts = pkg.lean_options.clone();
     for (k, v) in target_options {
         merged_opts.insert(k.clone(), v.clone());
     }
-    let mut strong =
-        Vec::with_capacity(merged_opts.len() + pkg.more_lean_args.len() + target_more_args.len());
+    let mut strong = Vec::with_capacity(pkg.more_lean_args.len() + target_more_args.len());
     for a in &pkg.more_lean_args {
         strong.push(a.clone());
     }
     for a in target_more_args {
         strong.push(a.clone());
-    }
-    // Lake passes `leanOptions` in setup.json, which overrides `-D` flags on the command line,
-    // so they come last: the setup built from these args keeps Lake's precedence
-    // (leanOptions > moreLeanArgs > weakLeanArgs).
-    for (k, v) in &merged_opts {
-        strong.push(format!("-D{}={}", k, v));
     }
     let mut weak = Vec::with_capacity(pkg.weak_lean_args.len() + target_weak_args.len());
     for a in &pkg.weak_lean_args {
@@ -4319,7 +4954,7 @@ fn compose_effective_args(
     for a in target_weak_args {
         weak.push(a.clone());
     }
-    (strong, weak)
+    (merged_opts, strong, weak)
 }
 fn expand_glob_in_dir(
     src_root: &Path,
@@ -4447,7 +5082,7 @@ pub(crate) fn resolve_module_in_package(
             let exe_rel = module_name_to_rel_slash(&exe.root);
             let cand = exe_src.join(format!("{}.lean", exe_rel));
             if cand.is_file() {
-                let (strong_args, weak_args) = compose_effective_args(
+                let (lean_options, strong_args, weak_args) = compose_effective_args(
                     pkg,
                     &exe.lean_options,
                     &exe.more_lean_args,
@@ -4465,6 +5100,7 @@ pub(crate) fn resolve_module_in_package(
                     build_ir_dir,
                     precompile_modules: pkg.precompile_modules,
                     is_exe_target: true,
+                    lean_options,
                     strong_args,
                     weak_args,
                     extern_lib_digests: extern_digests,
@@ -4498,13 +5134,14 @@ pub(crate) fn resolve_module_in_package(
         if buildable {
             let cand = lib_src.join(format!("{}.lean", rel_slash));
             if cand.is_file() {
-                let (strong_args, weak_args) = compose_effective_args(
+                let (lean_options, strong_args, weak_args) = compose_effective_args(
                     pkg,
                     &lib.lean_options,
                     &lib.more_lean_args,
                     &lib.weak_lean_args,
                 );
-                let precompile = lib.precompile_modules.unwrap_or(pkg.precompile_modules)
+                let precompile = (pkg.precompile_modules
+                    || lib.precompile_modules.unwrap_or(false))
                     || lib
                         .default_facets
                         .iter()
@@ -4521,6 +5158,7 @@ pub(crate) fn resolve_module_in_package(
                     build_ir_dir,
                     precompile_modules: precompile,
                     is_exe_target: false,
+                    lean_options,
                     strong_args,
                     weak_args,
                     extern_lib_digests: extern_digests,
@@ -4532,7 +5170,8 @@ pub(crate) fn resolve_module_in_package(
     // 3. A package without targets: its source directory (Lake has no target to ask).
     let cand = pkg_src_base.join(format!("{}.lean", rel_slash));
     if pkg.libs.is_empty() && pkg.exes.is_empty() && cand.is_file() {
-        let (strong_args, weak_args) = compose_effective_args(pkg, &BTreeMap::new(), &[], &[]);
+        let (lean_options, strong_args, weak_args) =
+            compose_effective_args(pkg, &LeanOptionsMap::new(), &[], &[]);
         return Some(DiscoveredModuleSpec {
             module_name: mod_name.to_string(),
             pkg_name: pkg.name.clone(),
@@ -4545,6 +5184,7 @@ pub(crate) fn resolve_module_in_package(
             build_ir_dir,
             precompile_modules: pkg.precompile_modules,
             is_exe_target: false,
+            lean_options,
             strong_args,
             weak_args,
             extern_lib_digests: extern_digests,
@@ -4640,9 +5280,6 @@ pub(crate) fn verify_module_lake_sidecars(
     let expected_i = format!("{:016x}.ilean", ilean_h);
     let expected_dep_h = format!("{:016x}", lake_input_hash(&tv["inputs"])?);
     if tv.get("schemaVersion").and_then(|v| v.as_str()) != Some("2025-09-10")
-        || tv.pointer("/outputs/m").and_then(|v| v.as_bool()) != Some(is_module)
-        || tv.pointer("/outputs/o/0").and_then(|v| v.as_str()) != Some(expected_o.as_str())
-        || tv.pointer("/outputs/i").and_then(|v| v.as_str()) != Some(expected_i.as_str())
         || tv.get("depHash").and_then(|v| v.as_str()) != Some(expected_dep_h.as_str())
     {
         anyhow::bail!(
@@ -4650,30 +5287,48 @@ pub(crate) fn verify_module_lake_sidecars(
             trace_path.display()
         );
     }
-    if let Some((srv_h, priv_h, ir_sig_h, ir_h)) = mod_comp_hashes {
-        if tv.pointer("/outputs/o/1").and_then(|v| v.as_str())
-            != Some(format!("{:016x}.olean.server", srv_h).as_str())
-            || tv.pointer("/outputs/o/2").and_then(|v| v.as_str())
-                != Some(format!("{:016x}.olean.private", priv_h).as_str())
-            || tv.pointer("/outputs/rs").and_then(|v| v.as_str())
-                != Some(format!("{:016x}.ir.sig", ir_sig_h).as_str())
-            || tv.pointer("/outputs/r").and_then(|v| v.as_str())
-                != Some(format!("{:016x}.ir", ir_h).as_str())
+    if let Some(c_h) = c_h_opt {
+        if tv.pointer("/outputs/m").and_then(|v| v.as_bool()) != Some(is_module)
+            || tv.pointer("/outputs/o/0").and_then(|v| v.as_str()) != Some(expected_o.as_str())
+            || tv.pointer("/outputs/i").and_then(|v| v.as_str()) != Some(expected_i.as_str())
+            || tv.pointer("/outputs/c").and_then(|v| v.as_str())
+                != Some(format!("{:016x}.c", c_h).as_str())
         {
             anyhow::bail!(
-                "Lake module trace `{}` module companion outputs do not match artifacts",
+                "Lake module trace `{}` failed integrity verification against artifacts",
                 trace_path.display()
             );
         }
-    }
-    if let Some(c_h) = c_h_opt {
-        if tv.pointer("/outputs/c").and_then(|v| v.as_str())
-            != Some(format!("{:016x}.c", c_h).as_str())
-        {
+        if let Some((srv_h, priv_h, ir_sig_h, ir_h)) = mod_comp_hashes {
+            if tv.pointer("/outputs/o/1").and_then(|v| v.as_str())
+                != Some(format!("{:016x}.olean.server", srv_h).as_str())
+                || tv.pointer("/outputs/o/2").and_then(|v| v.as_str())
+                    != Some(format!("{:016x}.olean.private", priv_h).as_str())
+                || tv.pointer("/outputs/rs").and_then(|v| v.as_str())
+                    != Some(format!("{:016x}.ir.sig", ir_sig_h).as_str())
+                || tv.pointer("/outputs/r").and_then(|v| v.as_str())
+                    != Some(format!("{:016x}.ir", ir_h).as_str())
+            {
+                anyhow::bail!(
+                    "Lake module trace `{}` module companion outputs do not match artifacts",
+                    trace_path.display()
+                );
+            }
+        }
+    } else {
+        if tv.get("outputs") != Some(&serde_json::Value::Null) {
             anyhow::bail!(
-                "Lake module trace `{}` `.c` output hash does not match artifact",
+                "Lake module trace `{}` must record `\"outputs\": null` when `.c` is absent",
                 trace_path.display()
             );
+        }
+        if let Some(ref cp) = c_path_opt {
+            if PathBuf::from(format!("{}.hash", cp.display())).exists() {
+                anyhow::bail!(
+                    "Stale `.c.hash` present without `.c` artifact alongside `{}`",
+                    trace_path.display()
+                );
+            }
         }
     }
     let expected_src_h = format!("{:016x}", lake_hash_text(src_raw));
@@ -4964,15 +5619,14 @@ pub fn build_module_dag_with_trust(
                 let build_base = target_pkg.pkg_root.join(&target_pkg.build_dir);
                 let build_lib_lean_dir = build_base.join(&target_pkg.lean_lib_dir);
                 let build_ir_dir = build_base.join(&target_pkg.ir_dir);
-                let (strong_args, weak_args) = compose_effective_args(
+                let (lean_options, strong_args, weak_args) = compose_effective_args(
                     target_pkg,
                     &lib.lean_options,
                     &lib.more_lean_args,
                     &lib.weak_lean_args,
                 );
-                let precompile = lib
-                    .precompile_modules
-                    .unwrap_or(target_pkg.precompile_modules)
+                let precompile = (target_pkg.precompile_modules
+                    || lib.precompile_modules.unwrap_or(false))
                     || lib
                         .default_facets
                         .iter()
@@ -5002,6 +5656,7 @@ pub fn build_module_dag_with_trust(
                                 build_ir_dir: build_ir_dir.clone(),
                                 precompile_modules: precompile,
                                 is_exe_target: false,
+                                lean_options: lean_options.clone(),
                                 strong_args: strong_args.clone(),
                                 weak_args: weak_args.clone(),
                                 extern_lib_digests: extern_digests.clone(),
@@ -5057,7 +5712,8 @@ pub fn build_module_dag_with_trust(
         let src_root = root_pkg.pkg_root.join(&root_pkg.src_dir);
         let files = lake_build::collect_lean_files(&src_root);
         let build_base = root_pkg.pkg_root.join(&root_pkg.build_dir);
-        let (strong_args, weak_args) = compose_effective_args(root_pkg, &BTreeMap::new(), &[], &[]);
+        let (lean_options, strong_args, weak_args) =
+            compose_effective_args(root_pkg, &LeanOptionsMap::new(), &[], &[]);
         for f in files {
             if let Ok(rel) = f.strip_prefix(&src_root) {
                 let mod_name = rel
@@ -5080,6 +5736,7 @@ pub fn build_module_dag_with_trust(
                             build_ir_dir: build_base.join(&root_pkg.ir_dir),
                             precompile_modules: root_pkg.precompile_modules,
                             is_exe_target: false,
+                            lean_options: lean_options.clone(),
                             strong_args: strong_args.clone(),
                             weak_args: weak_args.clone(),
                             extern_lib_digests: Vec::new(),
@@ -5260,6 +5917,7 @@ pub fn build_module_dag_with_trust(
                 has_prelude: header.has_prelude,
                 needs_c,
                 precompile_modules: spec.precompile_modules,
+                lean_options: spec.lean_options,
                 strong_args: spec.strong_args,
                 weak_args: spec.weak_args,
                 src_blake3,
@@ -5426,6 +6084,29 @@ pub fn build_module_dag_with_trust(
             total_nodes
         );
     }
+    for m in topological_order.iter().rev() {
+        let propagate = nodes
+            .get(m)
+            .is_some_and(|n| n.needs_c && n.precompile_modules);
+        if propagate {
+            let mut stack: Vec<String> = nodes
+                .get(m)
+                .map(|n| n.direct_dag_deps.clone())
+                .unwrap_or_default();
+            let mut visited: HashSet<String> = HashSet::new();
+            while let Some(d) = stack.pop() {
+                if !visited.insert(d.clone()) {
+                    continue;
+                }
+                if let Some(dn) = nodes.get_mut(&d) {
+                    if dn.is_root_pkg {
+                        dn.needs_c = true;
+                        stack.extend(dn.direct_dag_deps.iter().cloned());
+                    }
+                }
+            }
+        }
+    }
     let mut all_deps_by_mod: HashMap<String, BTreeSet<String>> =
         HashMap::with_capacity(topological_order.len());
     for m in &topological_order {
@@ -5589,7 +6270,11 @@ pub fn compute_module_cas_key(
         .strong_args
         .iter()
         .chain(node.weak_args.iter())
-        .all(|a| is_allowed_lean_arg(a));
+        .all(|a| is_allowed_lean_arg(a))
+        && node
+            .lean_options
+            .iter()
+            .all(|(k, v)| is_allowed_lean_option(k, v));
     let src_valid = node.src_blake3.len() == 64;
     let cfg_valid = node.pkg_config_digest.len() == 64;
     let deps_sorted_unique = dep_olean_digests.windows(2).all(|w| w[0].0 < w[1].0)
@@ -5651,7 +6336,7 @@ pub fn compute_module_cas_key(
         );
     }
     let mut h = blake3::Hasher::new();
-    h.update(b"turbo-lean-module-cas-v2\n");
+    h.update(b"turbo-lean-module-cas-v3\n");
     update_lp(&mut h, b"toolchain", cfg.toolchain.as_bytes());
     update_lp(&mut h, b"githash", cfg.lean_githash.as_bytes());
     update_lp(
@@ -5672,6 +6357,7 @@ pub fn compute_module_cas_key(
         if needs_c_override { b'E' } else { b'e' },
     ];
     update_lp(&mut h, b"flags", &flags_bytes);
+    update_hasher_lean_options(&mut h, &node.lean_options);
     h.update(&(node.strong_args.len() as u64).to_le_bytes());
     for a in &node.strong_args {
         update_lp(&mut h, b"sarg", a.as_bytes());
@@ -5815,16 +6501,21 @@ fn has_no_symlink_at(p: &Path) -> bool {
     }
 }
 
-fn validate_materialized_module_artifacts(node: &ModuleNode) -> bool {
+fn validate_materialized_module_artifacts(node: &ModuleNode, preserve_lake: bool) -> bool {
     let srv_path = PathBuf::from(format!("{}.server", node.olean_path.display()));
     let priv_path = PathBuf::from(format!("{}.private", node.olean_path.display()));
     let ir_path = node.olean_path.with_extension("ir");
     let ir_sig_path = PathBuf::from(format!("{}.sig", ir_path.display()));
+    let ltar_path = node.c_path.with_extension("ltar");
+    let bc_path = node.c_path.with_extension("bc");
     if !has_no_symlink_at(&srv_path)
         || !has_no_symlink_at(&priv_path)
         || !has_no_symlink_at(&ir_path)
         || !has_no_symlink_at(&ir_sig_path)
         || !has_no_symlink_at(&node.c_path)
+        || !has_no_symlink_at(&ltar_path)
+        || !has_no_symlink_at(&bc_path)
+        || (!preserve_lake && (ltar_path.exists() || bc_path.exists()))
     {
         return false;
     }
@@ -5849,6 +6540,8 @@ fn wipe_existing_module_artifacts(node: &ModuleNode) {
     let priv_path = PathBuf::from(format!("{}.private", node.olean_path.display()));
     let ir_path = node.olean_path.with_extension("ir");
     let ir_sig_path = PathBuf::from(format!("{}.sig", ir_path.display()));
+    let ltar_path = node.c_path.with_extension("ltar");
+    let bc_path = node.c_path.with_extension("bc");
     for p in [
         &node.olean_path,
         &node.ilean_path,
@@ -5857,6 +6550,8 @@ fn wipe_existing_module_artifacts(node: &ModuleNode) {
         &ir_path,
         &ir_sig_path,
         &node.c_path,
+        &ltar_path,
+        &bc_path,
     ] {
         let _ = fs::remove_file(p);
         let _ = fs::remove_file(format!("{}.hash", p.display()));
@@ -6119,9 +6814,6 @@ fn compute_lake_export_info(
         let expected_i = format!("{:016x}.ilean", ilean_h);
         let expected_dep_h = format!("{:016x}", lake_input_hash(&tv["inputs"])?);
         if tv.get("schemaVersion").and_then(|v| v.as_str()) != Some("2025-09-10")
-            || tv.pointer("/outputs/m").and_then(|v| v.as_bool()) != Some(is_mod)
-            || tv.pointer("/outputs/o/0").and_then(|v| v.as_str()) != Some(expected_o.as_str())
-            || tv.pointer("/outputs/i").and_then(|v| v.as_str()) != Some(expected_i.as_str())
             || tv.get("depHash").and_then(|v| v.as_str()) != Some(expected_dep_h.as_str())
         {
             anyhow::bail!(
@@ -6129,20 +6821,31 @@ fn compute_lake_export_info(
                 trace_path.display()
             );
         }
-        if let Some((srv_h, priv_h, ir_sig_h, ir_h)) = mod_comp_hashes {
-            if tv.pointer("/outputs/o/1").and_then(|v| v.as_str())
-                != Some(format!("{:016x}.olean.server", srv_h).as_str())
-                || tv.pointer("/outputs/o/2").and_then(|v| v.as_str())
-                    != Some(format!("{:016x}.olean.private", priv_h).as_str())
-                || tv.pointer("/outputs/rs").and_then(|v| v.as_str())
-                    != Some(format!("{:016x}.ir.sig", ir_sig_h).as_str())
-                || tv.pointer("/outputs/r").and_then(|v| v.as_str())
-                    != Some(format!("{:016x}.ir", ir_h).as_str())
+        if tv.get("outputs") != Some(&serde_json::Value::Null) {
+            if tv.pointer("/outputs/m").and_then(|v| v.as_bool()) != Some(is_mod)
+                || tv.pointer("/outputs/o/0").and_then(|v| v.as_str()) != Some(expected_o.as_str())
+                || tv.pointer("/outputs/i").and_then(|v| v.as_str()) != Some(expected_i.as_str())
             {
                 anyhow::bail!(
-                    "Dependency trace `{}` module companion outputs do not match artifacts",
+                    "Dependency trace `{}` failed integrity verification against artifacts",
                     trace_path.display()
                 );
+            }
+            if let Some((srv_h, priv_h, ir_sig_h, ir_h)) = mod_comp_hashes {
+                if tv.pointer("/outputs/o/1").and_then(|v| v.as_str())
+                    != Some(format!("{:016x}.olean.server", srv_h).as_str())
+                    || tv.pointer("/outputs/o/2").and_then(|v| v.as_str())
+                        != Some(format!("{:016x}.olean.private", priv_h).as_str())
+                    || tv.pointer("/outputs/rs").and_then(|v| v.as_str())
+                        != Some(format!("{:016x}.ir.sig", ir_sig_h).as_str())
+                    || tv.pointer("/outputs/r").and_then(|v| v.as_str())
+                        != Some(format!("{:016x}.ir", ir_h).as_str())
+                {
+                    anyhow::bail!(
+                        "Dependency trace `{}` module companion outputs do not match artifacts",
+                        trace_path.display()
+                    );
+                }
             }
         }
         if let Some((_, ref src_raw, _)) = dep_src_info {
@@ -6328,7 +7031,7 @@ pub fn write_lake_module_hashes_and_trace(
     let digest_matches = !expected_artifact_digest.is_empty()
         && actual_art_digest_opt.as_deref() == Some(expected_artifact_digest);
     let all_shards_certified =
-        validate_materialized_module_artifacts(node) && !hygiene.has_sorry && digest_matches;
+        validate_materialized_module_artifacts(node, false) && !hygiene.has_sorry && digest_matches;
     let artifact_hashes_match = digest_matches
         && olean_h_res.is_ok()
         && ilean_h_res.is_ok()
@@ -6415,18 +7118,15 @@ pub fn write_lake_module_hashes_and_trace(
         }
     }
     let src_h = lake_hash_text(&src_raw);
-    let mut opt_entries = Vec::new();
-    let mut lean_args = Vec::new();
-    for a in &node.strong_args {
-        if a.starts_with("-D") {
-            opt_entries.push(serde_json::json!([
-                a,
-                format!("{:016x}", lake_hash_text(a))
-            ]));
-        } else {
-            lean_args.push(a.as_str());
-        }
+    let mut opt_entries = Vec::with_capacity(node.lean_options.len());
+    for (k, v) in &node.lean_options {
+        let flag = format!("-D{}={}", k.to_lean_string(), v.as_cli_flag_value());
+        opt_entries.push(serde_json::json!([
+            flag,
+            format!("{:016x}", lake_hash_text(&flag))
+        ]));
     }
+    let lean_args: Vec<&str> = node.strong_args.iter().map(String::as_str).collect();
     let lean_args_h = lean_args.iter().fold(1723u64, |acc, a| {
         lake_mix_hash(acc, lake_hash_bytes(a.as_bytes()))
     });
@@ -6555,6 +7255,8 @@ pub fn write_lake_module_hashes_and_trace(
         audited_digest_u64,
         kernel_audit_clean,
     ) {
+        let ltar_path = node.c_path.with_extension("ltar");
+        let bc_path = node.c_path.with_extension("bc");
         for p in [
             &node.olean_path,
             &node.ilean_path,
@@ -6563,6 +7265,8 @@ pub fn write_lake_module_hashes_and_trace(
             &ir_path,
             &ir_sig_path,
             &node.c_path,
+            &ltar_path,
+            &bc_path,
         ] {
             let _ = fs::remove_file(format!("{}.hash", p.display()));
         }
@@ -6596,20 +7300,26 @@ pub fn write_lake_module_hashes_and_trace(
             format!("{:016x}", ilean_h).into_bytes(),
         ),
     ];
-    let c_h = match c_h_res {
+    for stale_ir in [
+        node.c_path.with_extension("ltar"),
+        node.c_path.with_extension("bc"),
+    ] {
+        let _ = fs::remove_file(format!("{}.hash", stale_ir.display()));
+    }
+    let c_h_opt = match c_h_res {
         Some(Ok(ch)) => {
             sidecar_writes.push((
                 PathBuf::from(format!("{}.hash", node.c_path.display())),
                 format!("{:016x}", ch).into_bytes(),
             ));
-            ch
+            Some(ch)
         }
         _ => {
             let _ = fs::remove_file(format!("{}.hash", node.c_path.display()));
-            1723
+            None
         }
     };
-    let outputs_json =
+    let mod_companion_hashes =
         if let Some((Ok(srv_h), Ok(priv_h), Ok(ir_sig_h), Ok(ir_h))) = mod_companions_res {
             for (p, h) in [
                 (&srv_path, srv_h),
@@ -6622,18 +7332,7 @@ pub fn write_lake_module_hashes_and_trace(
                     format!("{:016x}", h).into_bytes(),
                 ));
             }
-            serde_json::json!({
-                "o": [
-                    format!("{:016x}.olean", olean_h),
-                    format!("{:016x}.olean.server", srv_h),
-                    format!("{:016x}.olean.private", priv_h)
-                ],
-                "m": true,
-                "i": format!("{:016x}.ilean", ilean_h),
-                "rs": format!("{:016x}.ir.sig", ir_sig_h),
-                "r": format!("{:016x}.ir", ir_h),
-                "c": format!("{:016x}.c", c_h)
-            })
+            Some((srv_h, priv_h, ir_sig_h, ir_h))
         } else {
             for p in [&srv_path, &priv_path, &ir_sig_path, &ir_path] {
                 if is_regular_nonempty_file(p) {
@@ -6647,13 +7346,29 @@ pub fn write_lake_module_hashes_and_trace(
                     let _ = fs::remove_file(format!("{}.hash", p.display()));
                 }
             }
-            serde_json::json!({
-                "o": [format!("{:016x}.olean", olean_h)],
-                "m": false,
-                "i": format!("{:016x}.ilean", ilean_h),
-                "c": format!("{:016x}.c", c_h)
-            })
+            None
         };
+    let outputs_json = match (c_h_opt, mod_companion_hashes) {
+        (Some(c_h), Some((srv_h, priv_h, ir_sig_h, ir_h))) => serde_json::json!({
+            "o": [
+                format!("{:016x}.olean", olean_h),
+                format!("{:016x}.olean.server", srv_h),
+                format!("{:016x}.olean.private", priv_h)
+            ],
+            "m": true,
+            "i": format!("{:016x}.ilean", ilean_h),
+            "rs": format!("{:016x}.ir.sig", ir_sig_h),
+            "r": format!("{:016x}.ir", ir_h),
+            "c": format!("{:016x}.c", c_h)
+        }),
+        (Some(c_h), None) => serde_json::json!({
+            "o": [format!("{:016x}.olean", olean_h)],
+            "m": false,
+            "i": format!("{:016x}.ilean", ilean_h),
+            "c": format!("{:016x}.c", c_h)
+        }),
+        (None, _) => serde_json::Value::Null,
+    };
     let trace_json = serde_json::json!({
         "synthetic": false,
         "schemaVersion": "2025-09-10",
@@ -6906,7 +7621,9 @@ fn rollback_publish_state(
             },
         }
     }
-    if errs.is_empty() && had_valid_pre_publish_set && !validate_materialized_module_artifacts(node)
+    if errs.is_empty()
+        && had_valid_pre_publish_set
+        && !validate_materialized_module_artifacts(node, false)
     {
         errs.push(format!(
             "post-rollback artifact set validation failed for module `{}`",
@@ -6941,12 +7658,16 @@ fn publish_module_artifacts_atomic(
         .lock()
         .map_err(|_| anyhow::anyhow!("Module artifact publication mutex poisoned"))?;
     let _flock_guard = acquire_publish_flock(&node.pkg_root, false)?;
-    let had_valid_pre_publish_set = validate_materialized_module_artifacts(node);
+    let had_valid_pre_publish_set = validate_materialized_module_artifacts(node, false);
     let dst_srv = PathBuf::from(format!("{}.server", node.olean_path.display()));
     let dst_priv = PathBuf::from(format!("{}.private", node.olean_path.display()));
     let dst_ir = node.olean_path.with_extension("ir");
     let dst_ir_sig = PathBuf::from(format!("{}.sig", dst_ir.display()));
-    let pairs: [(&Path, &Path, bool); 7] = [
+    let dst_ltar = node.c_path.with_extension("ltar");
+    let dst_bc = node.c_path.with_extension("bc");
+    let tmp_ltar = tmp_c.with_extension("ltar");
+    let tmp_bc = tmp_c.with_extension("bc");
+    let pairs: [(&Path, &Path, bool); 9] = [
         (tmp_olean, &node.olean_path, true),
         (tmp_ilean, &node.ilean_path, true),
         (tmp_srv, &dst_srv, node.is_module),
@@ -6954,6 +7675,8 @@ fn publish_module_artifacts_atomic(
         (tmp_ir, &dst_ir, node.is_module),
         (tmp_ir_sig, &dst_ir_sig, node.is_module),
         (tmp_c, &node.c_path, node.needs_c),
+        (&tmp_ltar, &dst_ltar, false),
+        (&tmp_bc, &dst_bc, false),
     ];
     let pid = std::process::id();
     let seq = crate::pack::next_tmp_id();
@@ -7095,7 +7818,7 @@ fn publish_module_artifacts_atomic(
     }
 
     // Phase 3: Re-validate the published destination artifact set before removing backups
-    if !validate_materialized_module_artifacts(node) {
+    if !validate_materialized_module_artifacts(node, false) {
         let sfx = fmt_rb(&staged_renames, &backups);
         anyhow::bail!(
             "Post-publish artifact set validation failed for module `{}`{}",
@@ -7119,6 +7842,8 @@ fn publish_module_artifacts_atomic(
             }
         }
     }
+    let _ = fs::remove_file(format!("{}.hash", dst_ltar.display()));
+    let _ = fs::remove_file(format!("{}.hash", dst_bc.display()));
     Ok(())
 }
 
@@ -7567,24 +8292,8 @@ fn compile_single_module_direct(
         fs::create_dir_all(parent)?;
     }
     let mut setup_options = serde_json::Map::new();
-    for arg in node.weak_args.iter().chain(node.strong_args.iter()) {
-        if let Some(kv) = arg.strip_prefix("-D") {
-            if let Some((k, v)) = kv.split_once('=') {
-                let json_v = if v == "true" {
-                    serde_json::Value::Bool(true)
-                } else if v == "false" {
-                    serde_json::Value::Bool(false)
-                } else if let Some(n) = Some(v)
-                    .filter(|v| is_canonical_nat(v))
-                    .and_then(|v| v.parse::<u64>().ok())
-                {
-                    serde_json::Value::Number(n.into())
-                } else {
-                    serde_json::Value::String(v.to_string())
-                };
-                setup_options.insert(k.to_string(), json_v);
-            }
-        }
+    for (k, v) in &node.lean_options {
+        setup_options.insert(k.to_lean_string(), v.to_json_value());
     }
     setup_options.insert("warn.sorry".to_string(), serde_json::Value::Bool(true));
     setup_options.insert(
@@ -8012,7 +8721,7 @@ pub fn build_project_modules_native(
                         if preserve_lake {
                             crate::db::reuse_worktree_outputs(target_root, &outputs)?;
                         }
-                        let hashes_ok = validate_materialized_module_artifacts(node)
+                        let hashes_ok = validate_materialized_module_artifacts(node, preserve_lake)
                             && outputs
                                 .iter()
                                 .filter(|e| node.needs_c || e.kind != "c")
@@ -8666,9 +9375,8 @@ supportInterpreter = true
         assert_eq!(
             pkg_toml
                 .lean_options
-                .get("autoImplicit")
-                .map(String::as_str),
-            Some("false")
+                .get(&LeanName::from_str_to_name("autoImplicit").unwrap()),
+            Some(&LeanOptionValue::Bool(false))
         );
         assert_eq!(pkg_toml.libs.len(), 1);
         assert_eq!(
@@ -8708,9 +9416,8 @@ lean_exe «demo-exe» where
         assert_eq!(
             pkg_lean
                 .lean_options
-                .get("autoImplicit")
-                .map(String::as_str),
-            Some("false")
+                .get(&LeanName::from_str_to_name("autoImplicit").unwrap()),
+            Some(&LeanOptionValue::Bool(false))
         );
         assert_eq!(
             pkg_lean.libs[0].globs,
@@ -8741,26 +9448,35 @@ lean_exe «demo-exe» where
                 .lean_options
                 .clone()
         };
-        let expected: BTreeMap<String, String> = [
-            ("pp.unicode.fun", "true"),
-            ("autoImplicit", "false"),
-            ("maxSynthPendingDepth", "3"),
-            ("weak.linter.mathlibStandardSet", "true"),
-            ("weak.linter.style.header", "true"),
-            ("weak.linter.checkInitImports", "true"),
-            ("weak.linter.allScriptsDocumented", "true"),
-            ("weak.linter.pythonStyle", "true"),
-            ("weak.linter.style.longFile", "1500"),
+        let expected: LeanOptionsMap = [
+            ("pp.unicode.fun", LeanOptionValue::Bool(true)),
+            ("autoImplicit", LeanOptionValue::Bool(false)),
+            ("maxSynthPendingDepth", LeanOptionValue::Nat(3)),
+            (
+                "weak.linter.mathlibStandardSet",
+                LeanOptionValue::Bool(true),
+            ),
+            ("weak.linter.style.header", LeanOptionValue::Bool(true)),
+            ("weak.linter.checkInitImports", LeanOptionValue::Bool(true)),
+            (
+                "weak.linter.allScriptsDocumented",
+                LeanOptionValue::Bool(true),
+            ),
+            ("weak.linter.pythonStyle", LeanOptionValue::Bool(true)),
+            ("weak.linter.style.longFile", LeanOptionValue::Nat(1500)),
         ]
         .into_iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .map(|(k, v)| (LeanName::from_str_to_name(k).unwrap(), v))
         .collect();
         assert_eq!(lib("Mathlib"), expected);
         assert_eq!(lib("Archive"), expected);
         assert_eq!(lib("Counterexamples"), expected);
         assert_eq!(
             lib("MathlibTest"),
-            BTreeMap::from([("pp.mvars.anonymous".to_string(), "false".to_string())])
+            BTreeMap::from([(
+                LeanName::from_str_to_name("pp.mvars.anonymous").unwrap(),
+                LeanOptionValue::Bool(false)
+            )])
         );
         // turbo-lean's own proofs package (CI builds it) uses `«»` names, including on
         // `require`; it must keep parsing.
@@ -8828,7 +9544,10 @@ lean_exe «demo-exe» where
         let start = std::time::Instant::now();
         assert_eq!(
             resolve_lean_options_expr("a8", &diamond, usize::MAX).unwrap(),
-            BTreeMap::from([("x".to_string(), "true".to_string())])
+            BTreeMap::from([(
+                LeanName::from_str_to_name("x").unwrap(),
+                LeanOptionValue::Bool(true)
+            )])
         );
         assert!(start.elapsed() < std::time::Duration::from_secs(2));
         // Unknown identifiers and other computations are still rejected.
@@ -8859,18 +9578,30 @@ lean_exe «demo-exe» where
         assert_eq!(
             got,
             BTreeMap::from([
-                ("x".to_string(), "false".to_string()),
-                ("n".to_string(), "7".to_string()),
-                ("s".to_string(), "hi".to_string()),
-                ("weak.x".to_string(), "true".to_string()),
+                (
+                    LeanName::from_str_to_name("x").unwrap(),
+                    LeanOptionValue::Bool(false)
+                ),
+                (
+                    LeanName::from_str_to_name("n").unwrap(),
+                    LeanOptionValue::Nat(7)
+                ),
+                (
+                    LeanName::from_str_to_name("s").unwrap(),
+                    LeanOptionValue::Str("hi".to_string())
+                ),
+                (
+                    LeanName::from_str_to_name("weak.x").unwrap(),
+                    LeanOptionValue::Bool(true)
+                ),
             ])
         );
     }
 
     #[test]
     fn test_lakefile_toml_lean_options_fail_closed() {
-        // Gemini r7: multi-line TOML strings, string values that setup.json would re-read as a
-        // bool or a number, and quoted dotted keys.
+        // Multi-line TOML strings, string values that setup.json / CLI would re-read as a
+        // bool or a number, and quoted dotted keys (`"weak.linter.myStr"` -> single Str segment `«weak.linter.myStr»`).
         let dir = make_temp_test_dir("toml_opts");
         let tf = dir.join("lakefile.toml");
         let parse = |src: &str| {
@@ -8885,6 +9616,39 @@ lean_exe «demo-exe» where
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
+        let quoted_seg = parse(
+            "name = \"demo\"\n[leanOptions]\nweak.linter.\"unused-vars\" = false\nweak.linter.\"0\" = true\nweak.linter.\"has.dot\" = \"x\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            quoted_seg.lean_options,
+            BTreeMap::from([
+                (
+                    LeanName(vec![
+                        LeanNamePart::Str("weak".to_string()),
+                        LeanNamePart::Str("linter".to_string()),
+                        LeanNamePart::Str("unused-vars".to_string()),
+                    ]),
+                    LeanOptionValue::Bool(false),
+                ),
+                (
+                    LeanName(vec![
+                        LeanNamePart::Str("weak".to_string()),
+                        LeanNamePart::Str("linter".to_string()),
+                        LeanNamePart::Str("0".to_string()),
+                    ]),
+                    LeanOptionValue::Bool(true),
+                ),
+                (
+                    LeanName(vec![
+                        LeanNamePart::Str("weak".to_string()),
+                        LeanNamePart::Str("linter".to_string()),
+                        LeanNamePart::Str("has.dot".to_string()),
+                    ]),
+                    LeanOptionValue::Str("x".to_string()),
+                ),
+            ])
+        );
         let ok = parse("name = \"demo\"\n[leanOptions]\nweak.linter.style.longFile = 1500\n\"autoImplicit\" = false\n").unwrap();
         // Astra r10: TOML escapes decode (`α`) or fail; explicit empty selections fail.
         let esc = parse("name = \"demo\"\nsrcDir = \"src/\\u03b1\"\n").unwrap();
@@ -8903,8 +9667,14 @@ lean_exe «demo-exe» where
         assert_eq!(
             ok.lean_options,
             BTreeMap::from([
-                ("autoImplicit".to_string(), "false".to_string()),
-                ("weak.linter.style.longFile".to_string(), "1500".to_string()),
+                (
+                    LeanName::from_str_to_name("autoImplicit").unwrap(),
+                    LeanOptionValue::Bool(false)
+                ),
+                (
+                    LeanName::from_str_to_name("weak.linter.style.longFile").unwrap(),
+                    LeanOptionValue::Nat(1500)
+                ),
             ])
         );
         let _ = fs::remove_dir_all(&dir);
@@ -9132,7 +9902,10 @@ lean_exe «demo-exe» where
         assert_eq!(pkg.libs.len(), 1);
         assert_eq!(
             pkg.libs[0].lean_options,
-            BTreeMap::from([("autoImplicit".to_string(), "false".to_string())])
+            BTreeMap::from([(
+                LeanName::from_str_to_name("autoImplicit").unwrap(),
+                LeanOptionValue::Bool(false)
+            )])
         );
         // Astra r8: shadowing a constructor spelling the resolver reads, and a field value
         // written with a string gap, both fail closed.
@@ -9143,21 +9916,24 @@ lean_exe «demo-exe» where
             .unwrap_err()
             .to_string()
             .contains("multi-line string"));
-        // Astra r7: `leanOptions` reach Lean through setup.json, which beats `-D` flags, so
-        // they come after `moreLeanArgs` and win in the setup built from these args.
+        // Astra r7: `leanOptions` reach Lean through setup.json (or last in flat CLI helpers), which beats `-D` flags,
+        // while staying separate from `strong_args` (`Module.leanArgs`).
         let precedence = "import Lake\nopen Lake DSL\npackage demo\n@[default_target]\nlean_lib Demo where\n  leanOptions := #[⟨`autoImplicit, false⟩]\n  moreLeanArgs := #[\"-DautoImplicit=true\"]\n";
         let pkg = parse(precedence, false).unwrap();
         let lib = &pkg.libs[0];
-        let (strong, _) = compose_effective_args(
+        let (eff_opts, strong, weak) = compose_effective_args(
             &pkg,
             &lib.lean_options,
             &lib.more_lean_args,
             &lib.weak_lean_args,
         );
-        let last_auto = strong
-            .iter()
-            .filter(|a| a.starts_with("-DautoImplicit="))
-            .next_back();
+        assert_eq!(strong, vec!["-DautoImplicit=true".to_string()]);
+        assert_eq!(
+            eff_opts.get(&LeanName::from_str_to_name("autoImplicit").unwrap()),
+            Some(&LeanOptionValue::Bool(false))
+        );
+        let flat = compose_flat_filtered_args_with_options(&weak, &strong, &eff_opts);
+        let last_auto = flat.iter().rfind(|a| a.starts_with("-DautoImplicit="));
         assert_eq!(last_auto.map(String::as_str), Some("-DautoImplicit=false"));
         let _ = fs::remove_dir_all(&dir);
     }
@@ -9201,7 +9977,10 @@ lean_exe «demo-exe» where
         let cont = "import Lake\nopen Lake DSL\nabbrev xs : Array LeanOption := #[⟨`linter.a, true⟩]\nabbrev ys : Array LeanOption := #[⟨`linter.a, false⟩]\npackage demo\nlean_lib Demo where\n  leanOptions := xs\n\n    ++ ys\n  srcDir := \"src\"\n";
         assert_eq!(
             opts(&parse(cont).unwrap()),
-            BTreeMap::from([("linter.a".to_string(), "false".to_string())])
+            BTreeMap::from([(
+                LeanName::from_str_to_name("linter.a").unwrap(),
+                LeanOptionValue::Bool(false)
+            )])
         );
         let bad_cont = cont.replace("++ ys", "++ ys.filter fun _ => true");
         assert!(parse(&bad_cont).is_err());
@@ -9211,8 +9990,14 @@ lean_exe «demo-exe» where
         assert_eq!(
             opts(&parse(strs).unwrap()),
             BTreeMap::from([
-                ("linter.s".to_string(), "[".to_string()),
-                ("linter.t".to_string(), "a,b".to_string()),
+                (
+                    LeanName::from_str_to_name("linter.s").unwrap(),
+                    LeanOptionValue::Str("[".to_string())
+                ),
+                (
+                    LeanName::from_str_to_name("linter.t").unwrap(),
+                    LeanOptionValue::Str("a,b".to_string())
+                ),
             ])
         );
         // `'` is an identifier character in Lean names, not a string delimiter: lexing splits
@@ -9246,7 +10031,10 @@ lean_exe «demo-exe» where
         let spaced = "import Lake\nopen Lake DSL\npackage demo\nlean_lib Demo where\n  leanOptions := #[⟨`linter.s, .ofString \"a b\\\"c\"⟩]\n";
         assert_eq!(
             opts(&parse(spaced).unwrap()),
-            BTreeMap::from([("linter.s".to_string(), "a b\"c".to_string())])
+            BTreeMap::from([(
+                LeanName::from_str_to_name("linter.s").unwrap(),
+                LeanOptionValue::Str("a b\"c".to_string())
+            )])
         );
         // Mismatched delimiters fail.
         assert!(lean_scan("#[⟨`linter.a, true)]", ",").is_err());
@@ -9280,8 +10068,14 @@ lean_exe «demo-exe» where
                 .unwrap()
             ),
             BTreeMap::from([
-                ("linter.n".to_string(), "1500".to_string()),
-                ("linter.s".to_string(), "a b".to_string()),
+                (
+                    LeanName::from_str_to_name("linter.n").unwrap(),
+                    LeanOptionValue::Nat(1500)
+                ),
+                (
+                    LeanName::from_str_to_name("linter.s").unwrap(),
+                    LeanOptionValue::Str("a b".to_string())
+                ),
             ])
         );
         // Every scope form disables resolution; binders, dotted and universe names are rejected.
@@ -9299,13 +10093,19 @@ lean_exe «demo-exe» where
         let xs = "abbrev xs : Array LeanOption := #[⟨`linter.a, true⟩]\nabbrev ys : Array LeanOption := #[⟨`linter.a, false⟩]\n";
         assert_eq!(
             opts(&parse(&lib("xs\n  ++ ys", xs)).unwrap()),
-            BTreeMap::from([("linter.a".to_string(), "false".to_string())])
+            BTreeMap::from([(
+                LeanName::from_str_to_name("linter.a").unwrap(),
+                LeanOptionValue::Bool(false)
+            )])
         );
         let body =
             "abbrev zs : Array LeanOption := #[⟨`linter.a, true⟩]\n++ #[⟨`linter.a, false⟩]\n";
         assert_eq!(
             opts(&parse(&lib("zs", body)).unwrap()),
-            BTreeMap::from([("linter.a".to_string(), "false".to_string())])
+            BTreeMap::from([(
+                LeanName::from_str_to_name("linter.a").unwrap(),
+                LeanOptionValue::Bool(false)
+            )])
         );
         // Char literals such as '[' or '"' are outside the lexical subset: fail closed.
         let chars = "def openBr : Char := '['\ndef dq : Char := '\"'\nabbrev xs : Array LeanOption := #[⟨`linter.a, true⟩]\n";
@@ -9394,9 +10194,46 @@ lean_exe «demo-exe» where
             "#[⟨`\"warn.sorry\", true⟩]",
             "#[⟨`x++y, true⟩]",
             "#[⟨`a..b, true⟩]",
+            "#[⟨`«warn.sorry», false⟩]",
+            "#[⟨`weak.linter.0, true⟩]",
         ] {
             assert!(parse(&lib(e, "")).is_err(), "{e}");
         }
+        assert_eq!(
+            opts(
+                &parse(&lib(
+                    "#[⟨`weak.linter.«unused-vars», false⟩, ⟨`weak.linter.«0», true⟩, ⟨`weak.linter.«has.dot», \"x\"⟩]",
+                    ""
+                ))
+                .unwrap()
+            ),
+            BTreeMap::from([
+                (
+                    LeanName(vec![
+                        LeanNamePart::Str("weak".to_string()),
+                        LeanNamePart::Str("linter".to_string()),
+                        LeanNamePart::Str("unused-vars".to_string()),
+                    ]),
+                    LeanOptionValue::Bool(false),
+                ),
+                (
+                    LeanName(vec![
+                        LeanNamePart::Str("weak".to_string()),
+                        LeanNamePart::Str("linter".to_string()),
+                        LeanNamePart::Str("0".to_string()),
+                    ]),
+                    LeanOptionValue::Bool(true),
+                ),
+                (
+                    LeanName(vec![
+                        LeanNamePart::Str("weak".to_string()),
+                        LeanNamePart::Str("linter".to_string()),
+                        LeanNamePart::Str("has.dot".to_string()),
+                    ]),
+                    LeanOptionValue::Str("x".to_string()),
+                ),
+            ])
+        );
         // String values: only escapes Lean and the decoder agree on, no bool/number lookalikes.
         for e in [
             "#[⟨`linter.s, \"\\x41\"⟩]",
@@ -9409,8 +10246,237 @@ lean_exe «demo-exe» where
         }
         assert_eq!(
             opts(&parse(&lib("#[⟨`linter.s, \"a\\\\b \\\"c\\\"\"⟩]", "")).unwrap()),
-            BTreeMap::from([("linter.s".to_string(), "a\\b \"c\"".to_string())])
+            BTreeMap::from([(
+                LeanName::from_str_to_name("linter.s").unwrap(),
+                LeanOptionValue::Str("a\\b \"c\"".to_string())
+            )])
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_lake_trace_dep_hash_and_precompile_goldens() {
+        assert_eq!(
+            format!(
+                "{:016x}",
+                LeanName::from_str_to_name("weak.linter.«unused-vars»")
+                    .unwrap()
+                    .lean_hash()
+            ),
+            "002e710fcaedc2e4"
+        );
+        assert_eq!(
+            format!(
+                "{:016x}",
+                LeanName::from_str_to_name("weak.linter.«0»")
+                    .unwrap()
+                    .lean_hash()
+            ),
+            "603252224c2aeb40"
+        );
+        assert_eq!(
+            format!(
+                "{:016x}",
+                LeanName::from_str_to_name("weak.linter.0")
+                    .unwrap()
+                    .lean_hash()
+            ),
+            "61440faf51aadfb7"
+        );
+        assert_eq!(
+            format!(
+                "{:016x}",
+                LeanName::from_str_to_name("autoImplicit")
+                    .unwrap()
+                    .lean_hash()
+            ),
+            "dd5e5669cec58574"
+        );
+        assert_eq!(
+            format!(
+                "{:016x}",
+                LeanName::from_str_to_name("TurboLean.Assembler")
+                    .unwrap()
+                    .lean_hash()
+            ),
+            "f3ff02d4b89e0162"
+        );
+        assert_eq!(
+            format!(
+                "{:016x}",
+                LeanName(vec![LeanNamePart::Str("weak.linter.myStr".to_string())]).lean_hash()
+            ),
+            "2332246c88276666"
+        );
+        assert_eq!(
+            format!("{:016x}", lake_hash_name("TurboLean.Assembler")),
+            "6f4e7ca5f8ee9bd1"
+        );
+        assert!(
+            LeanName::from_str_to_name("weak.linter.«0»").unwrap()
+                < LeanName::from_str_to_name("weak.linter.0").unwrap()
+        );
+        assert!(LeanName::quick_cmp_aux(
+            &LeanName::from_str_to_name("weak.linter.0").unwrap().0,
+            &LeanName::from_str_to_name("weak.linter.«0»").unwrap().0
+        )
+        .is_lt());
+        assert_eq!(
+            format!(
+                "{:016x}",
+                lake_hash_text(&format!(
+                    "-Dweak.linter.«0»={}",
+                    LeanOptionValue::Bool(false).as_cli_flag_value()
+                ))
+            ),
+            "d567b2b483628b87"
+        );
+        assert_eq!(
+            format!(
+                "{:016x}",
+                lake_hash_text(&format!(
+                    "-Dweak.linter.0={}",
+                    LeanOptionValue::Bool(true).as_cli_flag_value()
+                ))
+            ),
+            "94bec158fd2f30c2"
+        );
+        assert_eq!(
+            format!(
+                "{:016x}",
+                lake_hash_text(&format!(
+                    "-Dweak.linter.«unused-vars»={}",
+                    LeanOptionValue::Bool(false).as_cli_flag_value()
+                ))
+            ),
+            "5abb2fa15f85b98a"
+        );
+        assert_eq!(
+            LeanOptionValue::Str("he\"l\\lo\n".to_string()).as_cli_flag_value(),
+            "\"he\"l\\lo\n\""
+        );
+        assert_eq!(
+            format!(
+                "{:016x}",
+                lake_hash_text(
+                    &LeanOptionValue::Str("he\"l\\lo\n".to_string()).as_cli_flag_value()
+                )
+            ),
+            "e3d65d0f38a3bdf3"
+        );
+        assert_eq!(
+            format!(
+                "{:016x}",
+                lake_hash_text(&format!(
+                    "-Dweak.linter.myStr={}",
+                    LeanOptionValue::Str("he\"l\\lo\n".to_string()).as_cli_flag_value()
+                ))
+            ),
+            "152abd8af517775f"
+        );
+        assert_eq!(
+            format!(
+                "{:016x}",
+                lake_mix_hash(
+                    1723,
+                    lake_hash_text(&format!(
+                        "-DmaxHeartbeats={}",
+                        LeanOptionValue::Nat(200000).as_cli_flag_value()
+                    ))
+                )
+            ),
+            "c9c9a05b5120f965"
+        );
+        let mut opts = LeanOptionsMap::new();
+        opts.insert(
+            LeanName::from_str_to_name("weak.linter.0").unwrap(),
+            LeanOptionValue::Bool(true),
+        );
+        opts.insert(
+            LeanName::from_str_to_name("weak.linter.«0»").unwrap(),
+            LeanOptionValue::Bool(false),
+        );
+        let mut hasher = blake3::Hasher::new();
+        update_hasher_lean_options(&mut hasher, &opts);
+        let ordered = hasher.finalize();
+        let mut reversed = LeanOptionsMap::new();
+        reversed.insert(
+            LeanName::from_str_to_name("weak.linter.«0»").unwrap(),
+            LeanOptionValue::Bool(false),
+        );
+        reversed.insert(
+            LeanName::from_str_to_name("weak.linter.0").unwrap(),
+            LeanOptionValue::Bool(true),
+        );
+        let mut hasher = blake3::Hasher::new();
+        update_hasher_lean_options(&mut hasher, &reversed);
+        assert_eq!(ordered, hasher.finalize());
+        let dir = make_temp_test_dir("precompile_or");
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            dir.join("lakefile.toml"),
+            "name = \"pre\"\nprecompileModules = true\n[[lean_lib]]\nname = \"Pre\"\nprecompileModules = false\nglobs = [\"Pre.+\"]\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.join("Pre")).unwrap();
+        fs::write(dir.join("Pre/A.lean"), "def a : Nat := 1\n").unwrap();
+        fs::write(dir.join("Pre/B.lean"), "import Pre.A\ndef b : Nat := a\n").unwrap();
+        fs::write(dir.join("Pre/C.lean"), "import Pre.A\ndef c : Nat := a\n").unwrap();
+        fs::write(
+            dir.join("Pre/D.lean"),
+            "import Pre.B\nimport Pre.C\ndef d : Nat := b + c\n",
+        )
+        .unwrap();
+        let cfg = resolve_project_config(&dir).unwrap();
+        assert!(cfg.root_pkg.precompile_modules);
+        assert!(!cfg.root_pkg.libs[0].precompile_modules.unwrap());
+        let dag = build_module_dag(&cfg, &[]).unwrap();
+        for name in ["Pre.A", "Pre.B", "Pre.C", "Pre.D"] {
+            assert!(
+                dag.nodes
+                    .values()
+                    .any(|n| n.module_name == name && n.needs_c),
+                "{name} must need .c"
+            );
+        }
+        // Also verify precompiled-lib -> non-precompiled-lib diamond propagation (`PreLib.D` -> `Plain.B`/`Plain.C` -> `Plain.A`).
+        let exe_dir = make_temp_test_dir("ws9_exe_prop");
+        fs::write(exe_dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            exe_dir.join("lakefile.toml"),
+            "name = \"exeprop\"\n[[lean_lib]]\nname = \"Plain\"\nglobs = [\"Plain.+\"]\n[[lean_lib]]\nname = \"PreLib\"\nprecompileModules = true\nglobs = [\"PreLib.+\"]\n",
+        )
+        .unwrap();
+        fs::create_dir_all(exe_dir.join("Plain")).unwrap();
+        fs::create_dir_all(exe_dir.join("PreLib")).unwrap();
+        fs::write(exe_dir.join("Plain/A.lean"), "def a : Nat := 1\n").unwrap();
+        fs::write(
+            exe_dir.join("Plain/B.lean"),
+            "import Plain.A\ndef b : Nat := a + 1\n",
+        )
+        .unwrap();
+        fs::write(
+            exe_dir.join("Plain/C.lean"),
+            "import Plain.A\ndef c : Nat := a + 2\n",
+        )
+        .unwrap();
+        fs::write(
+            exe_dir.join("PreLib/D.lean"),
+            "import Plain.B\nimport Plain.C\ndef d : Nat := b + c\n",
+        )
+        .unwrap();
+        let exe_cfg = resolve_project_config(&exe_dir).unwrap();
+        let exe_dag = build_module_dag(&exe_cfg, &["PreLib".to_string()]).unwrap();
+        for name in ["Plain.A", "Plain.B", "Plain.C", "PreLib.D"] {
+            assert!(
+                exe_dag
+                    .nodes
+                    .values()
+                    .any(|n| n.module_name == name && n.needs_c),
+                "precompiled transitive dependency {name} must need .c"
+            );
+        }
+        let _ = fs::remove_dir_all(&exe_dir);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -9961,6 +11027,273 @@ lean_exe «demo-exe» where
                 blake3::hash(&lake_use_olean),
                 "native vs lake Diff.Use.olean bytes must match"
             );
+
+            // 7. Differential parity for WS9 bugs:
+            //    (a) `leanOptions` (`Name.quickCmp`, `Str("0")` vs `Num(0)`, `asCliFlagValue`) vs `moreLeanArgs` (`-D`)
+            //    (b) missing `.c` emits `"outputs": null`, cleans stale `.ltar`/`.bc` (+ `.hash`), and `lake build --no-build` succeeds
+            //    (c) `pkg.precompileModules = true` + `lib.precompileModules = false` builds `.c` across diamond DAG so `lake build --no-build` succeeds
+            let lake_cache = dir.join("lake_cache_ws9");
+            fs::create_dir_all(&lake_cache).unwrap();
+
+            let opt_proj = dir.join("ws9_opts_proj");
+            fs::create_dir_all(opt_proj.join("Opt")).unwrap();
+            fs::write(
+                opt_proj.join("lean-toolchain"),
+                "leanprover/lean4:v4.35.0\n",
+            )
+            .unwrap();
+            fs::write(
+                opt_proj.join("lakefile.toml"),
+                r#"name = "ws9_opts"
+defaultTargets = ["Opt"]
+moreLeanArgs = ["-DmaxHeartbeats=200000"]
+leanOptions = [
+  { name = "weak.linter.0", value = true },
+  { name = "weak.linter.«0»", value = false },
+  { name = "weak.linter.«unused-vars»", value = false },
+  { name = "weak.linter.myStr", value = "hello \"world\"" },
+  { name = "autoImplicit", value = false }
+]
+[[lean_lib]]
+name = "Opt"
+globs = ["Opt.+"]
+"#,
+            )
+            .unwrap();
+            fs::write(
+                opt_proj.join("Opt/A.lean"),
+                "namespace Opt\ndef x : Nat := 42\nend Opt\n",
+            )
+            .unwrap();
+            fs::create_dir_all(opt_proj.join(".lake/build/ir/Opt")).unwrap();
+            fs::write(opt_proj.join(".lake/build/ir/Opt/A.ltar"), b"stale_ltar").unwrap();
+            fs::write(
+                opt_proj.join(".lake/build/ir/Opt/A.ltar.hash"),
+                b"0000000000000000",
+            )
+            .unwrap();
+            fs::write(opt_proj.join(".lake/build/ir/Opt/A.bc"), b"stale_bc").unwrap();
+            fs::write(
+                opt_proj.join(".lake/build/ir/Opt/A.bc.hash"),
+                b"0000000000000000",
+            )
+            .unwrap();
+
+            // Build without `:c`: `.c` is absent, `.trace` must have `"outputs": null`, stale `.ltar`/`.bc` removed.
+            build_project_modules_native(
+                &mut store,
+                &opt_proj,
+                &[],
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap();
+            assert!(!opt_proj.join(".lake/build/ir/Opt/A.c").exists());
+            assert!(!opt_proj.join(".lake/build/ir/Opt/A.ltar").exists());
+            assert!(!opt_proj.join(".lake/build/ir/Opt/A.ltar.hash").exists());
+            assert!(!opt_proj.join(".lake/build/ir/Opt/A.bc").exists());
+            assert!(!opt_proj.join(".lake/build/ir/Opt/A.bc.hash").exists());
+            let no_c_trace: serde_json::Value = serde_json::from_slice(
+                &fs::read(opt_proj.join(".lake/build/lib/lean/Opt/A.trace")).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                no_c_trace["outputs"].is_null(),
+                "expected null outputs when .c is absent, got: {}",
+                no_c_trace["outputs"]
+            );
+            let native_opt_dep_hash = no_c_trace["depHash"].clone();
+            // When `.c` is absent, `"outputs": null` forces Lake out of a corrupt cache lookup (`resolveModuleOutputs`
+            // does not see a bogus `"c": "0000000000000000.c"`), and `Module.checkExists` correctly observes `.c` is missing.
+            let no_build_missing_c = Command::new(&lake_bin)
+                .args(["build", "Opt.A:olean", "--no-build"])
+                .env("LAKE_CACHE_DIR", &lake_cache)
+                .current_dir(&opt_proj)
+                .output()
+                .unwrap();
+            assert!(
+                !no_build_missing_c.status.success()
+                    && !String::from_utf8_lossy(&no_build_missing_c.stderr).contains("ill-formed"),
+                "expected clean out-of-date exit when .c is absent and outputs is null"
+            );
+            // Also verify that if Lake's local artifact cache holds a valid `.olean`/`.ilean`/`.c` entry for `depHash`
+            // while `.lake/build` has no `.c` and `"outputs": null` (and stale `.ltar` was cleaned), `lake build --no-build`
+            // restores cleanly without unpack errors from stale `.ltar`.
+            fs::remove_file(opt_proj.join(".lake/build/lib/lean/Opt/A.trace.nobuild")).ok();
+
+            // Re-seed stale `.ltar`/`.bc` before CAS-hit / `:c` build to verify they are cleaned and `lake build --no-build` succeeds.
+            fs::create_dir_all(opt_proj.join(".lake/build/ir/Opt")).unwrap();
+            fs::write(opt_proj.join(".lake/build/ir/Opt/A.ltar"), b"stale_ltar2").unwrap();
+            fs::write(opt_proj.join(".lake/build/ir/Opt/A.bc"), b"stale_bc2").unwrap();
+            let rep_cas = build_project_modules_native(
+                &mut store,
+                &opt_proj,
+                &["Opt:c".to_string()],
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap();
+            let _ = rep_cas;
+            assert!(!opt_proj.join(".lake/build/ir/Opt/A.ltar").exists());
+            assert!(!opt_proj.join(".lake/build/ir/Opt/A.bc").exists());
+            let with_c_trace: serde_json::Value = serde_json::from_slice(
+                &fs::read(opt_proj.join(".lake/build/lib/lean/Opt/A.trace")).unwrap(),
+            )
+            .unwrap();
+            assert!(with_c_trace["outputs"].is_object());
+            assert_eq!(with_c_trace["depHash"], native_opt_dep_hash);
+            let no_build_full = Command::new(&lake_bin)
+                .args(["build", "--no-build"])
+                .env("LAKE_CACHE_DIR", &lake_cache)
+                .current_dir(&opt_proj)
+                .status()
+                .unwrap();
+            assert!(
+                no_build_full.success(),
+                "`lake build --no-build` must succeed with complex leanOptions + moreLeanArgs"
+            );
+            // Compare bit-for-bit against clean `lake build` (with `LAKE_ARTIFACT_CACHE=true` to also populate `LAKE_CACHE_DIR`).
+            fs::remove_dir_all(opt_proj.join(".lake/build")).unwrap();
+            let clean_lake = Command::new(&lake_bin)
+                .arg("build")
+                .env("LAKE_CACHE_DIR", &lake_cache)
+                .env("LAKE_ARTIFACT_CACHE", "true")
+                .current_dir(&opt_proj)
+                .status()
+                .unwrap();
+            assert!(clean_lake.success());
+            let lake_opt_trace: serde_json::Value = serde_json::from_slice(
+                &fs::read(opt_proj.join(".lake/build/lib/lean/Opt/A.trace")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(native_opt_dep_hash, lake_opt_trace["depHash"]);
+            assert_eq!(with_c_trace["outputs"], lake_opt_trace["outputs"]);
+
+            // Re-run without `:c` (hits `c_key` CAS fallback and removes `.c` while emitting `"outputs": null` and cleaning stale `.ltar`/`.bc`):
+            // with `LAKE_CACHE_DIR` populated by `lake build`, `lake build Opt.A:olean --no-build` restores from `LAKE_CACHE_DIR` with 0 rebuilds!
+            fs::write(opt_proj.join(".lake/build/ir/Opt/A.ltar"), b"corrupt_ltar").unwrap();
+            build_project_modules_native(
+                &mut store,
+                &opt_proj,
+                &[],
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap();
+            assert!(!opt_proj.join(".lake/build/ir/Opt/A.c").exists());
+            assert!(!opt_proj.join(".lake/build/ir/Opt/A.ltar").exists());
+            let no_c_trace2: serde_json::Value = serde_json::from_slice(
+                &fs::read(opt_proj.join(".lake/build/lib/lean/Opt/A.trace")).unwrap(),
+            )
+            .unwrap();
+            assert!(no_c_trace2["outputs"].is_null());
+            let no_build_from_lake_cache = Command::new(&lake_bin)
+                .args(["build", "Opt.A:olean", "--no-build"])
+                .env("LAKE_CACHE_DIR", &lake_cache)
+                .current_dir(&opt_proj)
+                .status()
+                .unwrap();
+            assert!(
+                no_build_from_lake_cache.success(),
+                "`lake build Opt.A:olean --no-build` must succeed from Lake cache when .c is absent, outputs is null, and stale .ltar is cleaned"
+            );
+
+            // (c) `pkg.precompileModules = true` + `lib.precompileModules = false` -> Lake's `LeanLib.precompileModules` is `self.pkg.precompileModules || self.config.precompileModules` (`true`),
+            // propagating `needs_c` upstream across a diamond DAG (`Pre.Base` <- `Pre.Left`/`Pre.Right` <- `Pre.Top`), and matching `lake build` bit-for-bit on `Pre.Base`.
+            let pre_proj = dir.join("ws9_pre_proj");
+            fs::create_dir_all(pre_proj.join("Pre")).unwrap();
+            fs::write(
+                pre_proj.join("lean-toolchain"),
+                "leanprover/lean4:v4.35.0\n",
+            )
+            .unwrap();
+            fs::write(
+                pre_proj.join("lakefile.toml"),
+                r#"name = "ws9_pre"
+precompileModules = true
+defaultTargets = ["Pre"]
+[leanOptions]
+autoImplicit = false
+weak.linter."unused-vars" = false
+weak.linter."0" = true
+[[lean_lib]]
+name = "Pre"
+precompileModules = false
+globs = ["Pre.+"]
+"#,
+            )
+            .unwrap();
+            fs::write(pre_proj.join("Pre/Base.lean"), "def base : Nat := 3\n").unwrap();
+            fs::write(
+                pre_proj.join("Pre/Left.lean"),
+                "import Pre.Base\ndef left : Nat := base + 1\n",
+            )
+            .unwrap();
+            fs::write(
+                pre_proj.join("Pre/Right.lean"),
+                "import Pre.Base\ndef right : Nat := base + 2\n",
+            )
+            .unwrap();
+            fs::write(
+                pre_proj.join("Pre/Top.lean"),
+                "import Pre.Left\nimport Pre.Right\ndef top : Nat := left + right\n",
+            )
+            .unwrap();
+            build_project_modules_native(
+                &mut store,
+                &pre_proj,
+                &[],
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap();
+            for m in ["Base", "Left", "Right", "Top"] {
+                assert!(
+                    pre_proj.join(format!(".lake/build/ir/Pre/{m}.c")).is_file(),
+                    "Pre/{m}.c must be materialized when pkg.precompileModules = true even if lib.precompileModules = false"
+                );
+            }
+            let pre_base_trace: serde_json::Value = serde_json::from_slice(
+                &fs::read(pre_proj.join(".lake/build/lib/lean/Pre/Base.trace")).unwrap(),
+            )
+            .unwrap();
+            // `Pre.Base` has no same-lib imports (`impLibs` is empty), so `Pre.Base:c` and `Pre.Base:olean` are 100% up-to-date!
+            let pre_base_only = Command::new(&lake_bin)
+                .args(["build", "Pre.Base:c", "Pre.Base:olean", "--no-build"])
+                .env("LAKE_CACHE_DIR", &lake_cache)
+                .current_dir(&pre_proj)
+                .status()
+                .unwrap();
+            assert!(
+                pre_base_only.success(),
+                "`lake build Pre.Base:c Pre.Base:olean --no-build` must succeed when pkg.precompileModules = true"
+            );
+            fs::remove_dir_all(pre_proj.join(".lake/build")).unwrap();
+            let clean_pre_lake = Command::new(&lake_bin)
+                .arg("build")
+                .env("LAKE_CACHE_DIR", &lake_cache)
+                .current_dir(&pre_proj)
+                .status()
+                .unwrap();
+            assert!(clean_pre_lake.success());
+            let lake_pre_base_trace: serde_json::Value = serde_json::from_slice(
+                &fs::read(pre_proj.join(".lake/build/lib/lean/Pre/Base.trace")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(pre_base_trace["depHash"], lake_pre_base_trace["depHash"]);
+            assert_eq!(pre_base_trace["outputs"], lake_pre_base_trace["outputs"]);
         }
         let _ = fs::remove_dir_all(&dir);
     }
