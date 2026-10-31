@@ -1,0 +1,272 @@
+{
+  "validated_at_utc": "2026-10-31T23:25:26.825780+00:00",
+  "audited_results_commit": "7386759607d9f27cc9e9e08cfe5da4ae708a34f7",
+  "scope": "All twenty fixed-corpus datasets and final measured report. Diagnostic numerical verification is separate from unmet example-count completion gates.",
+  "completion_status": "incomplete: three distinct-name example requirements remain unmet",
+  "completion_certified": false,
+  "requirement_waived": false,
+  "strict_completion_audit": {
+    "command": [
+      "python3",
+      "research/b2c_tool/audit.py"
+    ],
+    "exit_code": 1,
+    "stopped_at": "assert not report[example_shortfalls]",
+    "reason": [
+      {
+        "bucket": "reuse kind opaque",
+        "required_distinct_names": 3,
+        "available_distinct_nonauxiliary_names": 2,
+        "names": [
+          "Backend.Proof.FlowSplit.collectSparse",
+          "iselDestructGoal"
+        ]
+      },
+      {
+        "bucket": "cutoff kind opaque",
+        "required_distinct_names": 3,
+        "available_distinct_nonauxiliary_names": 1,
+        "names": [
+          "iselDestructGoal"
+        ]
+      },
+      {
+        "bucket": "reuse module FV.Backend.Proof.IselExcl",
+        "required_distinct_names": 3,
+        "available_distinct_nonauxiliary_names": 2,
+        "names": [
+          "Backend.Proof.exclOk_program",
+          "Backend.Proof.excludedUnmatchable"
+        ]
+      }
+    ]
+  },
+  "diagnostic_accounting_audit": {
+    "command": [
+      "python3",
+      "research/b2c_tool/audit.py",
+      "--diagnostic-accounting"
+    ],
+    "exit_code": 0,
+    "result": {
+      "artifact_audit": "not certified: diagnostic mode",
+      "scope": "all datasets, numerical accounting, and supplied example membership",
+      "commits": [
+        {
+          "commit": "62fa93f0f46804c97a02c0de8ac9332ea51f41aa",
+          "rows": 312583,
+          "calls": 302615,
+          "distinct_K": 299699,
+          "kernel_cpu_ns": 3559484282752,
+          "total_cpu_ns": 3579145017024
+        },
+        {
+          "commit": "22f3190e4c9ab85cfbdacbd07e93dc1312ee3535",
+          "rows": 312583,
+          "calls": 302615,
+          "distinct_K": 299699,
+          "kernel_cpu_ns": 3569463516160,
+          "total_cpu_ns": 3589184700576
+        },
+        {
+          "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+          "rows": 313008,
+          "calls": 303040,
+          "distinct_K": 300116,
+          "kernel_cpu_ns": 3745599842848,
+          "total_cpu_ns": 3766831913968
+        },
+        {
+          "commit": "08d4bf83f7a35786144bd07f83447f2cf6dced9a",
+          "rows": 313008,
+          "calls": 303040,
+          "distinct_K": 300116,
+          "kernel_cpu_ns": 3736006783968,
+          "total_cpu_ns": 3757281404432
+        },
+        {
+          "commit": "e87a5aa68f5d9e2d0a7a2d7e0c0ae36063b14552",
+          "rows": 313008,
+          "calls": 303040,
+          "distinct_K": 300116,
+          "kernel_cpu_ns": 3740818322688,
+          "total_cpu_ns": 3761522463056
+        },
+        {
+          "commit": "75ec10efe2f3a16c38fc5d846be69cc4c2e949b4",
+          "rows": 313008,
+          "calls": 303040,
+          "distinct_K": 300116,
+          "kernel_cpu_ns": 3739261935696,
+          "total_cpu_ns": 3760218731776
+        },
+        {
+          "commit": "1acfcfc314bcd8b96e16b3f48f0f7aa5bede8394",
+          "rows": 313008,
+          "calls": 303040,
+          "distinct_K": 300116,
+          "kernel_cpu_ns": 3798855994848,
+          "total_cpu_ns": 3819596496352
+        },
+        {
+          "commit": "719f226f5b401c150a8dfe764c7579f14af5e9b2",
+          "rows": 313008,
+          "calls": 303040,
+          "distinct_K": 300116,
+          "kernel_cpu_ns": 3846198375600,
+          "total_cpu_ns": 3868641675904
+        },
+        {
+          "commit": "f889e936b807d151b9625bdeb44872f578d89f99",
+          "rows": 313008,
+          "calls": 303040,
+          "distinct_K": 300116,
+          "kernel_cpu_ns": 3734013715504,
+          "total_cpu_ns": 3756861320544
+        },
+        {
+          "commit": "76964a874f961c7a5024e7f8329ba1ccf392cfdb",
+          "rows": 313008,
+          "calls": 303040,
+          "distinct_K": 300116,
+          "kernel_cpu_ns": 3747512498400,
+          "total_cpu_ns": 3768192927120
+        },
+        {
+          "commit": "81cdac89249c134f6a878ff817288ad75e5a0838",
+          "rows": 313008,
+          "calls": 303040,
+          "distinct_K": 300116,
+          "kernel_cpu_ns": 3747980363088,
+          "total_cpu_ns": 3768505673024
+        },
+        {
+          "commit": "c533c22a1ec1c20c7d8ca9315edb2ce7994b404e",
+          "rows": 313008,
+          "calls": 303040,
+          "distinct_K": 300116,
+          "kernel_cpu_ns": 3757945456240,
+          "total_cpu_ns": 3778425889072
+        },
+        {
+          "commit": "0ec56b32ecd0977e7436506da4951054483f197a",
+          "rows": 313008,
+          "calls": 303040,
+          "distinct_K": 300116,
+          "kernel_cpu_ns": 3740957025056,
+          "total_cpu_ns": 3761759256768
+        },
+        {
+          "commit": "6f9f8334a2fd26ac1ca31b241047ece4ee525f5e",
+          "rows": 313008,
+          "calls": 303040,
+          "distinct_K": 300116,
+          "kernel_cpu_ns": 3721356085808,
+          "total_cpu_ns": 3742092797536
+        },
+        {
+          "commit": "549e0c2f6ac19d7654c5dcc9c41f3abf3917d80f",
+          "rows": 313008,
+          "calls": 303040,
+          "distinct_K": 300116,
+          "kernel_cpu_ns": 3776224270064,
+          "total_cpu_ns": 3797144494208
+        },
+        {
+          "commit": "e14718a2b1d8e30cc73826a2faf6e056bca9bcf3",
+          "rows": 313008,
+          "calls": 303040,
+          "distinct_K": 300116,
+          "kernel_cpu_ns": 3758668378688,
+          "total_cpu_ns": 3779505691056
+        },
+        {
+          "commit": "e9a91e8a84861c34f3e3c67ca053f280d2f9c921",
+          "rows": 313008,
+          "calls": 303040,
+          "distinct_K": 300116,
+          "kernel_cpu_ns": 3665347803264,
+          "total_cpu_ns": 3687314533424
+        },
+        {
+          "commit": "73bbb15dbdeb25c9b6a1c5b2c0a25f2afa2a967f",
+          "rows": 313008,
+          "calls": 303040,
+          "distinct_K": 300116,
+          "kernel_cpu_ns": 3634431822832,
+          "total_cpu_ns": 3654568249984
+        },
+        {
+          "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+          "rows": 310275,
+          "calls": 300319,
+          "distinct_K": 297363,
+          "kernel_cpu_ns": 3595374795440,
+          "total_cpu_ns": 3614812607344
+        },
+        {
+          "commit": "5018b9509dc124154dbe08a5bd85862595d8eab7",
+          "rows": 300874,
+          "calls": 290930,
+          "distinct_K": 287987,
+          "kernel_cpu_ns": 3106828219696,
+          "total_cpu_ns": 3132750846752
+        }
+      ],
+      "manual_example_and_method_review_still_required": true,
+      "numerical_accounting_audit": "passed",
+      "completion_certified": false,
+      "example_shortfalls": [
+        "reuse kind opaque",
+        "cutoff kind opaque",
+        "reuse module FV.Backend.Proof.IselExcl"
+      ]
+    }
+  },
+  "manual_method_review": {
+    "reviewed": "ConstantInfo payloads, ordered universes, retained-node expression serialization, dependency-SCC hashing, canonical imported name bindings, kernel declaration reconstruction, duplicate theorem rechecks, process CPU clock, and group-to-row timing joins were inspected against the method described in B2c.md.",
+    "key_soundness_claim": false,
+    "known_missing_inputs": [
+      "LEAN_NAT_MAX_SIZE",
+      "module-mode Lean.reduceBool axiomInfo",
+      "unit-like eta via ctor nfields",
+      "implicit Bool/Nat dependencies"
+    ],
+    "module_cutoff_soundness_claim": false,
+    "module_cutoff_limits": "Nonconstant elaborator state and transitive visibility are not fully modeled; figures are diagnostic avoidable work, not measured wall speedups.",
+    "example_review": "Historical source linkage independently verified for every selected declaration-commit occurrence. C20 selected source theorem statements and surrounding source bodies inspected. Generated nested matchers, instances and hygienic names remain excluded.",
+    "source_linked_selected_occurrences": 106,
+    "exhaustive_fixed_corpus_shortfall_counts": {
+      "reuse kind opaque": 2,
+      "cutoff kind opaque": 1,
+      "reuse module FV.Backend.Proof.IselExcl": 2
+    }
+  },
+  "tooling_tests": {
+    "command": [
+      "python3",
+      "-m",
+      "unittest",
+      "test_hash_rows.py",
+      "test_merge_rows.py",
+      "test_report.py"
+    ],
+    "exit_code": 0,
+    "output": "..........\n----------------------------------------------------------------------\nRan 10 tests in 0.213s\n\nOK\n"
+  },
+  "SHA256": {
+    "B2c.json": "c5f0f9dabefcc44a200a2b1f73a5d6e99225485d8aa766be586682b06e288bed",
+    "B2c.md": "113f73b3388209ff7e2b6a6f43f419e1cee35a665e93d843bca3a9e51e92453b",
+    "B2c_source_review.json": "4f6f454c440749e4327ff4b011b10adef6458fbfef4f306d81fd73e53b1b7c7e",
+    "B2c_example_inventory.json": "381e925f5c807b10bcb4c006a0fcb563e0af2bbac51f31dabd41e5879707b18e",
+    "b2c_tool/Extract.lean": "ddb3a7cffe9610c27c89a5f121930eb12bb3a57721e6a112ca53a268309606db",
+    "b2c_tool/Replay.lean": "ca8cb1224c57e3aa5c70036cc8dc48034c4e28540c479c7b04ef093c72cf310a",
+    "b2c_tool/hash_rows.py": "4fce4b55b83886ff3217ba5c4705014927fa0e12b0a11bf53e3e326771c46ca0",
+    "b2c_tool/report.py": "6ce634e1297b17f9ea3553e6d37866d0c61a1093a4ea349d5749cbbd6bbeb8af",
+    "b2c_tool/audit.py": "17a63a94fd2983dd025ba03ac453d79cf08d366a819073ab2259ee33d45dd338",
+    "b2c_tool/review_sources.py": "65a4484beb722af13c0af54d0265dc831eec921234183384d270ccf1ec6c59fb",
+    "b2c_tool/example_inventory.py": "250ce67ea7933f337706cf035dd5e0f229a2f80da9ffa650056352cb7b978fdf",
+    "b2c_tool/clock.c": "1a82acfd142b9de4796df625938be33bd63588c168276c5eee587db969dc7458",
+    "b2c_tool/fixtures.json": "334d3a3119b6a7a3409ab609febb84721430d0d73d4911f0615ca48ffe727b6d"
+  }
+}
