@@ -1,0 +1,24 @@
+{
+  "commit": "e9a91e8a84861c34f3e3c67ca053f280d2f9c921",
+  "attempt": "interrupted replay 1",
+  "excluded_from_measurement": true,
+  "complete_replay": false,
+  "observed_runner_pid_missing": 2075700,
+  "observed_replay_pid_missing": 2083854,
+  "old_exec_session_missing": 17666,
+  "prior_tool_host_exit": "SIGTERM (15)",
+  "reason": "Runner, replay PID and exec session were authoritatively absent after the turn interruption; no total record was emitted.",
+  "recovery": "Reuse the already successful measured build. Preserve partial replay here, then run fresh extraction/hash and full replay. No --retry-build.",
+  "complete_json_records": 282444,
+  "partial_kernel_calls": 279747,
+  "excluded_partial_kernel_cpu_ns": 2758434120112,
+  "last_record_identity": {
+    "event": "kernel",
+    "module": "FV.Backend.Proof.DefGenTab",
+    "names": [
+      "Backend.Proof.DefGen.defTab_termOk._proof_1028"
+    ]
+  },
+  "partial_raw_sha256": "c156a6d98169b7bba7a6caa1382aef930f0357ec7098d46de350fd0ec3e6cb3a",
+  "preserved_at_utc": "2026-10-31T16:04:11.253304+00:00"
+}
