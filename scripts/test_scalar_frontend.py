@@ -1699,7 +1699,7 @@ open LeanNative.IR LeanNative.Proofs
           (.letBind 3 .objPtr (.scalar (.select (.constBool true) (.var 2) (.var 2)))
             (.letBind 4 .i64 (.scalar (.constU64 0))
               (.letBind 5 .i64 (.scalar (.select (.binOp .eq (.var 0) (.constU64 999)) (.constU64 2) (.constU64 1)))
-                (.letBind 6 .unit (.call "lean_native_ctor_set" [2, 4, 5] .unit false)
+                (.letBind 6 .unit (.call "lean_native_ctor_set_scalar" [2, 4, 5] .unit false)
                   (if constOneTarget then
                      .decRef 2 1 (.ret 1)
                    else
@@ -1720,7 +1720,7 @@ open LeanNative.IR LeanNative.Proofs
             (.letBind 4 .objPtr (.scalar (.select (.binOp .eq (.var 0) (.constU64 999)) (.var 2) (.var 3)))
               (.letBind 5 .i64 (.scalar (.constU64 0))
                 (.letBind 6 .i64 (.scalar (.constU64 2))
-                  (.letBind 7 .unit (.call "lean_native_ctor_set" [2, 5, 6] .unit false)
+                  (.letBind 7 .unit (.call "lean_native_ctor_set_scalar" [2, 5, 6] .unit false)
                     (if constOneTarget then
                        .decRef 2 1 (.decRef 3 1 (.ret 1))
                      else
@@ -1742,7 +1742,7 @@ open LeanNative.IR LeanNative.Proofs
             (.letBind 4 .objPtr (.projTuple 3 0)
               (.letBind 5 .i64 (.scalar (.constU64 0))
                 (.letBind 6 .i64 (.scalar (.select (.binOp .eq (.var 0) (.constU64 999)) (.constU64 2) (.constU64 1)))
-                  (.letBind 7 .unit (.call "lean_native_ctor_set" [2, 5, 6] .unit false)
+                  (.letBind 7 .unit (.call "lean_native_ctor_set_scalar" [2, 5, 6] .unit false)
                     (if constOneTarget then
                        .decRef 2 1 (.ret 1)
                      else
@@ -1766,7 +1766,7 @@ open LeanNative.IR LeanNative.Proofs
                 (.letBind 6 (.tuple [.objPtr]) (.mkTuple [3])
                   (.letBind 7 .i64 (.scalar (.constU64 0))
                     (.letBind 8 .i64 (.scalar (.constU64 2))
-                      (.letBind 9 .unit (.call "lean_native_ctor_set" [2, 7, 8] .unit false)
+                      (.letBind 9 .unit (.call "lean_native_ctor_set_scalar" [2, 7, 8] .unit false)
                         (.ite 4
                           (.letBind 10 .objPtr (.projTuple 5 0)
                             (if constOneTarget then
@@ -2386,7 +2386,7 @@ open LeanNative.IR LeanNative.Proofs
     retTy := .i1
     body :=
       .letBind 1 .objPtr (.allocCtor 0 [] [])
-        (.letBind 2 .objPtr (.allocCtor 0 [] [1])
+        (.letBind 2 .objPtr (.allocCtor 0 [1] [])
           (.letBind 3 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
             (.ite 3
               (.incRef 1 1
