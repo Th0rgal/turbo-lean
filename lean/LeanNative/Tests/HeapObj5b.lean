@@ -222,4 +222,29 @@ def rcExhaustionIsDistinguished : Bool :=
 -- REGRESSION(symtv_rc_exhaustion_sample_fails_closed)
 #guard rcExhaustionIsDistinguished
 
+/-! ## C1.1 SymbolicTV models a fieldless ctor as the evaluator's immediate `.tuple [tag]` -/
+
+/-- `x1 := allocCtor 3 [] []; incRef x1 1; if x0 == 999 then (isExclusive x1 | false) else true`, with balanced
+    `decRef x1 2` on both branches. The fieldless ctor is immediate, so `isExclusive` is `true` after `incRef`. -/
+def nullaryExclDecl (rareFalse : Bool) : LNIRDecl :=
+  { name := "nullary_ctor_excl", params := [{ id := 0, name := "x", ty := .i64 }], retTy := .i1, body :=
+    .letBind 1 .objPtr (.allocCtor 3 [] []) (.incRef 1 1
+      (.letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+        (.ite 2
+          (.letBind 3 .i1 (if rareFalse then .scalar (.constBool false) else .isExclusive 1) (.decRef 1 2 (.ret 3)))
+          (.letBind 3 .i1 (.scalar (.constBool true)) (.decRef 1 2 (.ret 3)))))) }
+
+def nullaryExclAt999 (rareFalse : Bool) : Option Val :=
+  retVal? (evalCode 4096 (VarEnv.empty.bind 0 (.u64 999)) .empty (nullaryExclDecl rareFalse).body)
+
+/-- Concrete source is `true` and target `false` on `x = 999`, so replacing the rare-branch `isExclusive` with
+    `false` must be rejected; the unchanged decl still validates (the check is not vacuous). -/
+def nullaryCtorTvContract : Bool :=
+  nullaryExclAt999 false == some (.bool true) && nullaryExclAt999 true == some (.bool false) &&
+  !(validateTranslationDecl (nullaryExclDecl false) (nullaryExclDecl true)).passed &&
+  (validateTranslationDecl (nullaryExclDecl false) (nullaryExclDecl false)).passed
+
+-- REGRESSION(symtv_nullary_ctor_immediate_exclusive)
+#guard nullaryCtorTvContract
+
 end LeanNative.Tests.HeapObj5b
