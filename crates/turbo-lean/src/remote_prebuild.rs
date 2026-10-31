@@ -173,7 +173,8 @@ fn dirty_paths_from_porcelain(porcelain_z: &[u8]) -> Vec<String> {
     dirty
 }
 
-/// Ways the local checkout under `project_dir` differs from the commit `selected_sha` that the
+/// Ways the local checkout containing `project_dir` (the whole work tree, since the remote clones
+/// the whole repository) differs from the commit `selected_sha` that the
 /// remote will build (uncommitted paths, or a `HEAD` on another commit); empty when it is not a git
 /// work tree.
 fn working_tree_dirty_paths(project_dir: &Path, selected_sha: &str) -> Result<Vec<String>> {
@@ -204,8 +205,6 @@ fn working_tree_dirty_paths(project_dir: &Path, selected_sha: &str) -> Result<Ve
         "-z",
         "--untracked-files=all",
         "--ignore-submodules=none",
-        "--",
-        ".",
     ])?;
     if !out.status.success() {
         anyhow::bail!(
@@ -214,15 +213,17 @@ fn working_tree_dirty_paths(project_dir: &Path, selected_sha: &str) -> Result<Ve
         );
     }
     let mut dirty = dirty_paths_from_porcelain(&out.stdout);
-    let head = git(&["rev-parse", "HEAD"])
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .to_ascii_lowercase()
-        });
-    if let Some(head) = head.filter(|h| !selected_sha.is_empty() && h != selected_sha) {
+    let head = git(&["rev-parse", "HEAD"])?;
+    if !head.status.success() {
+        anyhow::bail!(
+            "`git rev-parse HEAD` failed: {}",
+            String::from_utf8_lossy(&head.stderr).trim()
+        );
+    }
+    let head = String::from_utf8_lossy(&head.stdout)
+        .trim()
+        .to_ascii_lowercase();
+    if !selected_sha.is_empty() && head != selected_sha {
         dirty.push(format!(
             "HEAD is {head} but the selected commit is {selected_sha}"
         ));
@@ -902,12 +903,69 @@ mod tests {
     }
 
     #[test]
+    fn dirty_sibling_outside_project_dir_is_detected() -> Result<()> {
+        let tmp = std::env::temp_dir().join(format!("turbo_lean_rp_sib_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("proj"))?;
+        fs::create_dir_all(tmp.join("dep"))?;
+        git_ok(&tmp, &["init", "-q"]);
+        fs::write(tmp.join("proj/P.lean"), "def p := 1\n")?;
+        fs::write(tmp.join("dep/D.lean"), "def d := 1\n")?;
+        git_ok(&tmp, &["add", "."]);
+        git_ok(&tmp, &["commit", "-q", "-m", "init"]);
+        let head = git_out(&tmp, &["rev-parse", "HEAD"]);
+        assert!(working_tree_dirty_paths(&tmp.join("proj"), &head)?.is_empty());
+        fs::write(tmp.join("dep/D.lean"), "def d := 2\n")?;
+        assert_eq!(
+            working_tree_dirty_paths(&tmp.join("proj"), &head)?,
+            ["dep/D.lean"]
+        );
+        let _ = fs::remove_dir_all(&tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_download_sends_no_ambient_credentials() -> Result<()> {
+        let _env = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("TURBO_LEAN_API_TOKEN", "api-tok");
+        std::env::set_var("TURBO_LEAN_DAEMON_TOKEN", "daemon-tok");
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let url = format!("http://{}/artifact", listener.local_addr()?);
+        let srv = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).unwrap();
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase()
+        });
+        let out = std::env::temp_dir().join(format!("turbo_lean_rp_dl_{}", std::process::id()));
+        let res = stream_download_with_sha256(&url, &out, None, 5_000, 1024);
+        std::env::remove_var("TURBO_LEAN_API_TOKEN");
+        std::env::remove_var("TURBO_LEAN_DAEMON_TOKEN");
+        let _ = fs::remove_file(&out);
+        res?;
+        let req = srv.join().unwrap();
+        assert!(
+            !req.contains("authorization") && !req.contains("x-turbo-token"),
+            "{req}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn uninspectable_checkout_is_an_error_but_non_repo_is_not() -> Result<()> {
         let tmp = std::env::temp_dir().join(format!("turbo_lean_rp_bad_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp)?;
         assert!(working_tree_dirty_paths(&tmp, &"a".repeat(40))?.is_empty());
         fs::write(tmp.join(".git"), "not a gitfile\n")?;
+        assert!(working_tree_dirty_paths(&tmp, &"a".repeat(40)).is_err());
+        // Unborn repository: the worktree probe succeeds but HEAD cannot be resolved.
+        fs::remove_file(tmp.join(".git"))?;
+        git_ok(&tmp, &["init", "-q"]);
         assert!(working_tree_dirty_paths(&tmp, &"a".repeat(40)).is_err());
         let _ = fs::remove_dir_all(&tmp);
         Ok(())
