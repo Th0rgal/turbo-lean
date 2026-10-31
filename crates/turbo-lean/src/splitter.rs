@@ -13,6 +13,8 @@ pub struct TheoremShard {
     pub prefix_env_hash: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cone_env_hash: String,
+    /// Source signature fingerprint for shard/cache identity. Semantic PR statement
+    /// pinning uses built ConstantInfo + IF-closure digests in pr_verify.rs instead.
     pub stmt_hash: String,
     pub proof_hash: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]

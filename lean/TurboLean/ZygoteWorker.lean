@@ -995,7 +995,8 @@ def isPinnedFfiOpaque (env : Environment) (ffiAllow : Array (Name × Name × Str
 
 def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Name))
     (ffiAllow : Array (Name × Name × String) := #[])
-    (patterns : List String := []) : List String := Id.run do
+    (patterns : List String := []) (csimpPatterns : List String := []) : List String := Id.run do
+  let csimpAllowed := fun name : Name => csimpPatterns.any (globMatch ·.toList name.toString.toList)
   let unsfTag := "un" ++ "safe"
   let mut violations : List String := []
   let mut targetIdxs : Std.HashMap ModuleIdx String := {}
@@ -1028,7 +1029,8 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
               violations := violations ++ [s!"[TurboLean.KernelGate] nested inductive type `{declName}` (sea-monster risk) through a non-core container in `{rawStr}` is forbidden"]
           | _ => pure ()
           if let some (lhs, rhs) := csimpReplacementPair? env cinfo.type then
-            csimpCandidates := csimpCandidates.push (declName, lhs, rhs)
+            if !cinfo.isTheorem || !csimpAllowed declName then
+              csimpCandidates := csimpCandidates.push (declName, lhs, rhs)
           if cinfo.isUnsafe && !isWhitelistedInitExecUnsafe env modIdx cinfo then
             violations := violations ++ [s!"[TurboLean.KernelGate] {unsfTag} declaration `{declName}` in `{rawStr}` is forbidden"]
           if (cinfo.isPartial || (Lean.Compiler.isUnsafeRecName? declName).isSome) &&
@@ -1110,6 +1112,8 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
         violations := violations ++ [s!"[TurboLean.KernelGate] module `{rawStr}` index out of bounds"]
   let mut seenCSimp : Std.HashMap Name Bool := {}
   let checkCSimpEntry (e : Lean.Compiler.CSimp.Entry) : List String := Id.run do
+    if (env.find? e.thmName).any (·.isTheorem) && csimpAllowed e.thmName then
+      return []
     let mut out : List String := []
     let mut seenMod : Std.HashMap ModuleIdx Bool := {}
     for nm in [e.thmName, e.fromDeclName, e.toDeclName] do
@@ -1144,6 +1148,9 @@ partial def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array 
   let patterns := (((← IO.getEnv "TURBO_LEAN_ALLOWED_AXIOMS").getD "").splitOn ",").filterMap fun p =>
     let t := p.trimAscii.toString
     if t.isEmpty then none else some t
+  let csimpPatterns := (((← IO.getEnv "TURBO_LEAN_ALLOWED_CSIMP").getD "").splitOn ",").filterMap fun p =>
+    let t := p.trimAscii.toString
+    if t.isEmpty then none else some t
   let imports : Array Import := slice.map fun (_, nm) =>
     ({ module := nm, importAll := true } : Import)
   let batchRes ← try
@@ -1153,7 +1160,7 @@ partial def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array 
     pure (Except.error (toString e))
   match batchRes with
   | .ok env =>
-    return auditImportedModulesInEnv env slice ffiAllow patterns
+    return auditImportedModulesInEnv env slice ffiAllow patterns csimpPatterns
   | .error errMsg =>
     if slice.size == 1 then
       let (rawStr, _) := slice[0]!
