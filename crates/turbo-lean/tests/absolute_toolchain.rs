@@ -363,3 +363,158 @@ fn project_toolchain_names_cannot_substitute_verifiers_or_prewarm_helpers() {
     );
     f.clean();
 }
+
+// Conditional Git config is invisible in the original repository, but becomes
+// active in a linked worktree. Exercise both snapshot branches through the CLI.
+#[test]
+fn conditional_worktree_filters_cannot_run_during_pr_verification() {
+    let f = Fixture(std::env::temp_dir().join(format!(
+        "turbo-conditional-filter-{}-{}", std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+    )));
+    fs::create_dir_all(&f.0).unwrap();
+    fs::write(f.0.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+    fs::write(f.0.join(".gitignore"), ".lake/\ncache/\ncache-staging/\n").unwrap();
+    fs::write(f.0.join(".gitattributes"), "*.lean filter=attack\n").unwrap();
+    fs::write(f.0.join("Demo.lean"), "theorem pinned : 1 + 1 = 2 := rfl\n").unwrap();
+    checked(
+        Command::new("/usr/bin/git")
+            .current_dir(&f.0)
+            .args(["init", "-q"]),
+    );
+    checked(
+        Command::new("/usr/bin/git")
+            .current_dir(&f.0)
+            .args(["add", "."]),
+    );
+    checked(Command::new("/usr/bin/git").current_dir(&f.0).args([
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-qm",
+        "base",
+    ]));
+    let config = f.0.join(".git/attack-config");
+    let marker = f.0.join("shim-invoked");
+    for (key, command) in [
+        (
+            "smudge",
+            format!("echo attacked > '{}'; cat", marker.display()),
+        ),
+        (
+            "process",
+            format!("echo attacked > '{}'; exit 1", marker.display()),
+        ),
+    ] {
+        checked(
+            Command::new("/usr/bin/git")
+                .args(["config", "--file"])
+                .arg(&config)
+                .arg(format!("filter.attack.{key}"))
+                .arg(command),
+        );
+    }
+    checked(
+        Command::new("/usr/bin/git")
+            .current_dir(&f.0)
+            .args(["config", "includeIf.gitdir:**/worktrees/**.path"])
+            .arg(&config),
+    );
+    let invisible = Command::new("/usr/bin/git")
+        .current_dir(&f.0)
+        .args(["config", "--get", "filter.attack.process"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        invisible.status.code(),
+        Some(1),
+        "filter must be unseen in original repo"
+    );
+    // Positive control: ordinary checkout executes the conditional filter.
+    let control = f.0.join("control");
+    let checkout = Command::new("/usr/bin/git")
+        .current_dir(&f.0)
+        .args(["worktree", "add", "--detach"])
+        .arg(&control)
+        .arg("HEAD")
+        .output()
+        .unwrap();
+    assert!(
+        marker.exists(),
+        "conditional checkout attack fixture did not execute"
+    );
+    if checkout.status.success() {
+        checked(
+            Command::new("/usr/bin/git")
+                .current_dir(&f.0)
+                .args(["worktree", "remove", "--force"])
+                .arg(&control),
+        );
+    } else {
+        // A process filter that exits during the handshake can abort checkout;
+        // Git removes the failed worktree registration itself.
+        checked(
+            Command::new("/usr/bin/git")
+                .current_dir(&f.0)
+                .args(["worktree", "prune"]),
+        );
+    }
+    fs::remove_file(&marker).unwrap();
+
+    // With no Lake config, pr-verify materializes both the base and HEAD.
+    fs::write(
+        f.0.join("Demo.lean"),
+        "theorem pinned : 1 + 1 = 2 := by decide\n",
+    )
+    .unwrap();
+    let out = f.run(
+        "cache",
+        &[
+            "--json",
+            "pr-verify",
+            "--project-dir",
+            ".",
+            "--base",
+            "HEAD",
+        ],
+        true,
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["statement_edited_theorems_count"], 0);
+    // A changed type needs Lake to recheck dependents before the statement gate.
+    fs::write(
+        f.0.join("lakefile.toml"),
+        "name = \"filter_fixture\"\ndefaultTargets = [\"Demo\"]\n[[lean_lib]]\nname = \"Demo\"\n",
+    )
+    .unwrap();
+    // A changed type must still be compared with the real base statement.
+    fs::write(f.0.join("Demo.lean"), "theorem pinned : 2 + 2 = 4 := rfl\n").unwrap();
+    let rejected = f.run(
+        "cache",
+        &[
+            "pr-verify",
+            "--project-dir",
+            ".",
+            "--base",
+            "HEAD",
+            "--disallow-statement-changes",
+        ],
+        false,
+    );
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&rejected.stdout),
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(diagnostic.contains("Demo.lean::pinned"), "{diagnostic}");
+    f.clean();
+    assert!(
+        !f.0.join(".git/worktrees").exists()
+            || fs::read_dir(f.0.join(".git/worktrees"))
+                .unwrap()
+                .next()
+                .is_none()
+    );
+}

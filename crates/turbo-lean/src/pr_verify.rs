@@ -3339,49 +3339,172 @@ fn parse_kernel_statement_dump(raw: &[u8], module: &str) -> Result<BTreeMap<Stri
     Ok(result)
 }
 
-struct StatementWorktree {
-    repo: PathBuf,
+// A source snapshot has no Git worktree registration and never runs checkout
+// conversion (attributes, smudge/process filters, or EOL rewriting).
+struct StatementSnapshot {
     path: PathBuf,
 }
 
-impl StatementWorktree {
+impl StatementSnapshot {
     fn at(repo: &Path, rev: &str) -> Result<Self> {
-        let path = std::env::temp_dir().join(format!(
-            "turbo-statements-{}-{}",
-            std::process::id(),
-            pack::next_tmp_id()
-        ));
-        let out = crate::trusted_tools::git(repo)?
-            .arg("-C")
-            .arg(repo)
-            .args(["worktree", "add", "--detach", "--force"])
-            .arg(&path)
-            .arg(rev)
-            .output()?;
-        anyhow::ensure!(
-            out.status.success(),
-            "Cannot create statement baseline worktree: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        Ok(Self {
-            repo: repo.to_path_buf(),
-            path,
-        })
+        use std::os::unix::fs::DirBuilderExt;
+        let snapshot = loop {
+            let path = Path::new("/tmp").join(format!(
+                "turbo-statements-{}-{}",
+                std::process::id(),
+                pack::next_tmp_id()
+            ));
+            match fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => break Self { path },
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        };
+        materialize_statement_tree(repo, rev, &snapshot.path)?;
+        Ok(snapshot)
     }
 }
 
-impl Drop for StatementWorktree {
+impl Drop for StatementSnapshot {
     fn drop(&mut self) {
-        let Ok(mut git) = crate::trusted_tools::git(&self.repo) else {
-            return;
-        };
-        let _ = git
-            .arg("-C")
-            .arg(&self.repo)
-            .args(["worktree", "remove", "--force"])
-            .arg(&self.path)
-            .output();
+        let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+fn materialize_statement_tree(repo: &Path, rev: &str, root: &Path) -> Result<()> {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::{
+        ffi::OsStrExt,
+        fs::{symlink, PermissionsExt},
+    };
+    use std::process::Stdio;
+
+    anyhow::ensure!(!rev.starts_with('-'), "Invalid statement snapshot revision");
+    let tree = crate::trusted_tools::git(repo)?
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-tree", "-r", "-z", "--full-tree", rev, "--"])
+        .output()?;
+    anyhow::ensure!(
+        tree.status.success(),
+        "Cannot enumerate statement snapshot: {}",
+        String::from_utf8_lossy(&tree.stderr)
+    );
+    let mut entries = Vec::new();
+    for entry in tree.stdout.split(|&b| b == 0).filter(|e| !e.is_empty()) {
+        let (header, path) = entry.split_at(
+            entry
+                .iter()
+                .position(|&b| b == b'\t')
+                .context("Invalid Git tree entry")?,
+        );
+        let fields: Vec<_> = std::str::from_utf8(header)?.split(' ').collect();
+        anyhow::ensure!(fields.len() == 3, "Invalid Git tree header");
+        let rel = Path::new(std::ffi::OsStr::from_bytes(&path[1..]));
+        anyhow::ensure!(!rel.as_os_str().is_empty() && rel.components().all(|c|
+            matches!(c, std::path::Component::Normal(p) if !p.eq_ignore_ascii_case(".git"))),
+            "Invalid statement snapshot path: {}", rel.display());
+        anyhow::ensure!(
+            fields[0] != "160000",
+            "Statement snapshots do not support submodule gitlinks: {}",
+            rel.display()
+        );
+        anyhow::ensure!(
+            fields[1] == "blob"
+                && matches!(fields[0], "100644" | "100755" | "120000")
+                && matches!(fields[2].len(), 40 | 64)
+                && fields[2].bytes().all(|b| b.is_ascii_hexdigit()),
+            "Unsupported Git tree entry: {}",
+            rel.display()
+        );
+        entries.push((fields[0].to_owned(), fields[2].to_owned(), root.join(rel)));
+    }
+    let mut git = crate::trusted_tools::git(repo)?;
+    let mut child = git
+        .arg("-C")
+        .arg(repo)
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let result = (|| -> Result<()> {
+        let mut input = child.stdin.take().context("Missing Git batch stdin")?;
+        let mut output = BufReader::new(child.stdout.take().context("Missing Git batch stdout")?);
+        let mut links = Vec::new();
+        for (mode, oid, target) in entries {
+            ensure_statement_snapshot_path(root, &target)?;
+            fs::create_dir_all(target.parent().context("Missing snapshot parent")?)?;
+            writeln!(input, "{oid}")?;
+            input.flush()?;
+            let mut header = String::new();
+            output.read_line(&mut header)?;
+            let fields: Vec<_> = header.trim_end().split(' ').collect();
+            anyhow::ensure!(
+                fields.len() == 3 && fields[0] == oid && fields[1] == "blob",
+                "Invalid Git batch blob header: {header}"
+            );
+            let size: u64 = fields[2].parse()?;
+            let mut blob = output.by_ref().take(size);
+            if mode == "120000" {
+                let mut bytes = Vec::new();
+                blob.read_to_end(&mut bytes)?;
+                anyhow::ensure!(bytes.len() as u64 == size, "Truncated Git symlink blob");
+                let link = PathBuf::from(std::ffi::OsStr::from_bytes(&bytes));
+                anyhow::ensure!(
+                    !link.is_absolute(),
+                    "Absolute symlink in statement snapshot: {}",
+                    target.display()
+                );
+                links.push((target, link));
+            } else {
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&target)?;
+                anyhow::ensure!(
+                    std::io::copy(&mut blob, &mut file)? == size,
+                    "Truncated Git blob"
+                );
+                file.set_permissions(fs::Permissions::from_mode(if mode == "100755" {
+                    0o755
+                } else {
+                    0o644
+                }))?;
+            }
+            let mut newline = [0];
+            output.read_exact(&mut newline)?;
+            anyhow::ensure!(newline == [b'\n'], "Invalid Git batch blob terminator");
+        }
+        // Create links only after every regular file has been written, so even
+        // malformed trees cannot redirect writes. Validate actual resolution,
+        // including link chains and `..` traversing another symlink.
+        for (target, link) in &links {
+            ensure_statement_snapshot_path(root, target)?;
+            symlink(link, target)?;
+        }
+        let canonical_root = root.canonicalize()?;
+        for (target, _) in links {
+            let resolved = target.canonicalize().with_context(|| {
+                format!(
+                    "Unresolvable statement snapshot symlink: {}",
+                    target.display()
+                )
+            })?;
+            anyhow::ensure!(
+                resolved.starts_with(&canonical_root),
+                "Symlink escapes statement snapshot: {}",
+                target.display()
+            );
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    result?;
+    anyhow::ensure!(status.success(), "Git batch object read failed");
+    Ok(())
 }
 
 // Stock toolchain commands run inside bwrap for untrusted inputs. The Lake configuration
@@ -3570,8 +3693,8 @@ fn clear_untrusted_statement_build_products(project: &Path) -> Result<()> {
     Ok(())
 }
 
-// Seed an offline sandbox with independent Git clones of already resolved
-// dependencies, never with shared/hard-linked worktree build outputs.
+// Seed offline dependencies without checkout conversion or shared build outputs.
+// Keep independent Git metadata for Lake revision checks; write sources as raw blobs.
 fn seed_statement_dependencies(
     project: &Path,
     cfg: &crate::module_builder::ProjectConfig,
@@ -3589,7 +3712,7 @@ fn seed_statement_dependencies(
             fs::create_dir_all(parent)?;
         }
         let out = crate::trusted_tools::git(project)?
-            .args(["clone", "--quiet", "--no-hardlinks"])
+            .args(["clone", "--quiet", "--no-hardlinks", "--no-checkout"])
             .arg(&dep.pkg_root)
             .arg(&target)
             .output()?;
@@ -3599,6 +3722,7 @@ fn seed_statement_dependencies(
             dep.name,
             String::from_utf8_lossy(&out.stderr)
         );
+        materialize_statement_tree(&target, "HEAD", &target)?;
     }
     Ok(())
 }
@@ -3922,7 +4046,7 @@ fn kernel_statement_changes_with_trust(
     untrusted_cfg: Option<&crate::module_builder::ProjectConfig>,
 ) -> Result<Vec<String>> {
     let repo = resolve_git_toplevel(project)?;
-    let baseline = StatementWorktree::at(&repo, base)?;
+    let baseline = StatementSnapshot::at(&repo, base)?;
     let base_project = baseline.path.join(project.strip_prefix(&repo)?);
     let relative_scope = scope
         .map(|p| -> Result<PathBuf> {
@@ -3954,7 +4078,7 @@ fn kernel_statement_changes_with_trust(
         seed_statement_dependencies(&base_project, cfg)?;
     }
     let head_snapshot = if is_untrusted || !crate::lake_build::has_lake_config(project) {
-        let snapshot = StatementWorktree::at(&repo, "HEAD")?;
+        let snapshot = StatementSnapshot::at(&repo, "HEAD")?;
         overlay_statement_sources(&repo, &snapshot.path)?;
         let snapshot_project = snapshot.path.join(project.strip_prefix(&repo)?);
         ensure_statement_lake_project(&snapshot_project)?;
@@ -5272,6 +5396,83 @@ mod pr_verify_tests {
             before,
             "CI rejection wiped the pre-existing build tree"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn statement_snapshots_preserve_raw_blobs_and_reject_unsafe_entries() -> Result<()> {
+        use std::os::unix::{
+            ffi::OsStrExt,
+            fs::{symlink, PermissionsExt},
+        };
+        let dir = Path::new("/tmp").join(format!(
+            "turbo-raw-tree-{}-{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        fs::create_dir_all(dir.join("dir"))?;
+        let raw = b"raw\r\nbytes\0\xff\n";
+        let name = std::ffi::OsStr::from_bytes(b"dir/odd\t\n\xff");
+        fs::write(dir.join(name), raw)?;
+        fs::write(dir.join("script"), b"#!/bin/sh\nexit 0\n")?;
+        fs::set_permissions(dir.join("script"), fs::Permissions::from_mode(0o755))?;
+        symlink(name, dir.join("link"))?;
+        git_init_and_commit(&dir, "raw tree")?;
+        let snapshot = StatementSnapshot::at(&dir, "HEAD")?;
+        assert_eq!(fs::read(snapshot.path.join(name))?, raw);
+        assert_eq!(fs::read(snapshot.path.join("link"))?, raw);
+        assert_eq!(
+            fs::metadata(snapshot.path.join("script"))?
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(snapshot.path.join(name))?.permissions().mode() & 0o777,
+            0o644
+        );
+        assert!(!snapshot.path.join(".git").exists());
+        let path = snapshot.path.clone();
+        drop(snapshot);
+        assert!(!path.exists());
+        for target in ["../../etc/passwd", "/etc/passwd", "missing"] {
+            fs::remove_file(dir.join("link"))?;
+            symlink(target, dir.join("link"))?;
+            git_init_and_commit(&dir, "unsafe link")?;
+            assert!(StatementSnapshot::at(&dir, "HEAD").is_err(), "{target}");
+        }
+        let oid = crate::trusted_tools::git(&dir)?
+            .arg("-C")
+            .arg(&dir)
+            .args(["rev-parse", "HEAD"])
+            .output()?;
+        let oid = std::str::from_utf8(&oid.stdout)?.trim();
+        let out = Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(&dir)
+            .args([
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{oid},submodule"),
+            ])
+            .output()?;
+        assert!(out.status.success());
+        let tree = Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(&dir)
+            .arg("write-tree")
+            .output()?;
+        assert!(tree.status.success());
+        let error = StatementSnapshot::at(&dir, std::str::from_utf8(&tree.stdout)?.trim())
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("submodule gitlinks: submodule"),
+            "{error}"
+        );
+        fs::remove_dir_all(dir)?;
         Ok(())
     }
 
