@@ -1597,9 +1597,12 @@ def main (args : List String) : IO Unit := do
                 let deltaCode := padding ++ (prefixCode.drop (String.length prevCode)).toString
                 let (dOk, dUs, dHbs, _dNodes, dErrs, dMsgs, dOut, _dUsed, dNextSt) ←
                   TurboLean.ZygoteWorker.runCommandsFromState prevState deltaCode fnPref prefAllowStub evalMode
-                if dErrs.contains TurboLean.ZygoteWorker.runtimePanicErr then poisoned := true
                 if dOk then
                   pure (some (false, dUs, some dNextSt, ([] : List String), prevMsgs ++ dMsgs, prevOut ++ dOut, prevHbs + dHbs, some prefixCode))
+                else if dErrs.contains TurboLean.ZygoteWorker.runtimePanicErr then
+                  -- Never retry a panicked delta from scratch: the retry may not panic again.
+                  poisoned := true
+                  pure (some (false, dUs, none, dErrs, prevMsgs ++ dMsgs, prevOut ++ dOut, prevHbs + dHbs, some prefixCode))
                 else pure none
               | none => pure none
             match deltaRes? with
@@ -1622,8 +1625,13 @@ def main (args : List String) : IO Unit := do
               if pErrs.contains TurboLean.ZygoteWorker.runtimePanicErr then poisoned := true
               if pOk then pure (false, pUs, some nextSt, [], pMsgs, pOut, pHbs, some prefixCode)
               else pure (false, pUs, none, pErrs, pMsgs, pOut, pHbs, some prefixCode)
-        match ckptState? with
-        | some ckptState =>
+        -- `poisoned` was false on entry, so here it means the prefix/delta panicked (`ckptState? = none`).
+        -- That ends the request: no combined retry (a retry need not panic again), no checkpoint, no
+        -- artifact, and never a success reply.
+        match ckptState?, poisoned with
+        | _, true =>
+          TurboLean.ZygoteWorker.emitZygoteReply stdout false (if isRaceCandidates then some "null" else none) kgActive true envCacheHit false importUs prefixUs 0 prefHbs 0 0 prefOut prefMsgs prefErrs []
+        | some ckptState, false =>
           if !prefixCacheHit then
             if stateCache.size >= maxCheckpoints then
               match stateCacheOrder[0]? with
@@ -1699,7 +1707,7 @@ def main (args : List String) : IO Unit := do
             let finalHbs := if evalMode then prefHbs + dHbs else dHbs
             if !finalOk && finalErrs.contains TurboLean.ZygoteWorker.runtimePanicErr then poisoned := true
             TurboLean.ZygoteWorker.emitZygoteReply stdout finalOk none kgActive true envCacheHit prefixCacheHit importUs prefixUs elabUs finalHbs ptNodes (if finalOk then 1 else 0) finalOut finalMsgs finalErrs usedConsts
-        | none =>
+        | none, false =>
           -- Fallback: if prefix failed on its own (e.g. split mid-command or error in prefix), elaborate combined prefix + body from baseEnv
           let prefixCode := decodedPrefix?.getD (TurboLean.ZygoteWorker.decodeHexToString hexPrefix)
           let fn := customFileName?.getD "<zygote-shard>"

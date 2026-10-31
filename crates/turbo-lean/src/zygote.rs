@@ -6894,6 +6894,56 @@ mod tests {
                 rs[1]
             );
         }
+        // 3: a prefix (or prefix delta) that panics only on its first run ends the request: the
+        // combined fallback, which would not panic again, never turns it into ok=true.
+        let first_run_panic = |tag: &str| {
+            let marker = tmp_dir.join(format!("first_run_{tag}_{}", next_tmp_id()));
+            format!(
+                "#eval show IO Unit from do\n  if (← System.FilePath.pathExists {:?}) then return\n  IO.FS.writeFile {:?} \"\"\n  let n : Nat := panic! s!\"first run only {{(← IO.monoNanosNow) % 1}}\"\n  IO.println n\ntheorem pre_{tag} : True := trivial\n",
+                marker.to_string_lossy(),
+                marker.to_string_lossy()
+            )
+        };
+        let tgt = "theorem tgt : 1 + 1 = 2 := rfl\n";
+        let panicked = |r: &serde_json::Value| {
+            !ok(r)
+                && r["errors"]
+                    .as_array()
+                    .is_some_and(|e| e.iter().any(|e| e.as_str() == Some(RUNTIME_PANIC_ERR)))
+        };
+        for mode in ["strict", "race_candidates", "batch_fission", "delta"] {
+            let seed = "def seed_base : Nat := 1\n";
+            let pre = if mode == "delta" {
+                format!("{seed}{}", first_run_panic(mode))
+            } else {
+                first_run_panic(mode)
+            };
+            let pad = |p: &str| format!("{}{tgt}", "\n".repeat(p.lines().count()));
+            let req = |p: &str, key: &str| match mode {
+                "race_candidates" | "batch_fission" => {
+                    format!("Init\t{mode}\t{key}\t{}\t{}", hx(p), hx(tgt))
+                }
+                _ => format!("Init\t{}\tstrict\t{key}\t{}", hx(&pad(p)), hx(p)),
+            };
+            let mut lines = Vec::new();
+            if mode == "delta" {
+                // Seeds the prefix tree so the panicking request runs as a delta on top of it.
+                lines.push(req(seed, "k_seed"));
+            }
+            lines.push(req(&pre, "k_panic"));
+            lines.push(format!("Init\t{}\tstrict", hx(tgt)));
+            let rs = session(&lines);
+            let (r, next) = (&rs[lines.len() - 2], &rs[lines.len() - 1]);
+            if mode == "delta" {
+                assert!(ok(&rs[0]), "seed prefix must succeed: {}", rs[0]);
+            }
+            assert!(panicked(r), "{mode}: first-run prefix panic masked: {r}");
+            if mode == "race_candidates" {
+                assert!(r["winning_candidate_idx"].is_null(), "{r}");
+            }
+            assert!(panicked(next), "{mode}: worker must stay poisoned: {next}");
+        }
+
         // 3: the first request binds the worker even with an empty importsCsv.
         let rs = session(&[
             format!(",\t{}\tstrict", hx(triv)),
