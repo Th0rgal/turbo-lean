@@ -1,8 +1,11 @@
 # B2: LNIR → CLIF → AArch64
 
-Specification, not a completed correctness claim. Baseline: turbo-lean
+Specification and implemented proof boundary. O1–O2 are proved generically;
+O3–O7 are kernel checked for `collatz_steps` on every UInt64 argument pair.
+Generic F64 simulation and safety remain open. Baseline: turbo-lean
 `4966384`, clifv `5018b9509dc124154dbe08a5bd85862595d8eab7` (Lean
-4.34.1). The compiler tree uses Lean 4.35.0. The target theorem is
+4.34.1). The compiler tree uses Lean 4.35.0. The checked endpoint is
+`B2.EndToEnd.collatz_to_arm`, composing the genuine
 `FV/E2E/FinalDirect.lean:23`, `E2E.backend_correct_final_of_lower`.
 
 ## Fragment F64 and entry contract
@@ -135,6 +138,21 @@ Lean-version incompatibility remains an explicit incomplete requirement.
 a proof of semantic no-trap/no-stuck for arbitrary instructions or states.
 Use the actual reachable-state and try-free lemmas. Do not assume a
 stronger semantic theorem than clifv provides.
+
+## Checked Collatz endpoint
+
+`B2.EndToEnd.collatz_to_arm` certifies the actual artifacts exported by
+`Emit.lean`, with the same `lowerDecl` used by `compile-clif`. From the
+real backend entry, ABI, stack, memory, symbol, slot-layout and hook
+premises, and the existing LNIR evaluation, it concludes an `ArmRet`,
+the source value relation, and
+`xreg 0 = (Nat.repeat B2.CollatzSource.step steps.toNat n).toBitVec`.
+`B2.CollatzSource.collatz_eval` supplies that source evaluation for every
+input; it is not an assumed successful compilation or machine result.
+The pipeline equations, execution safety and absent-site contracts are
+proved, while unconditional `CalleeOk.pc`/`.ext` premises remain explicit.
+The theorem and every claimed closure pass `B2.AxiomAudit` in the default
+root. See `B2-status.md` for artifact and build evidence.
 
 ## Trusted base and reporting
 

@@ -42,9 +42,6 @@ jobs:
           b2_objcopy="$(command -v llvm-objcopy || command -v llvm-objcopy-18)"
           "$b2_objcopy" -O binary --only-section=.text "$RUNNER_TEMP/b2-collatz.o" "$RUNNER_TEMP/b2-collatz.asm.bin"
           cmp "$RUNNER_TEMP/b2-collatz.bin" "$RUNNER_TEMP/b2-collatz.asm.bin"
-      - name: Check draft backend composition
-        working-directory: research/b2-proofs
-        run: lake build B2.EndToEnd
       - name: Check compiler integration on compiler toolchain
         working-directory: lean
         run: |
