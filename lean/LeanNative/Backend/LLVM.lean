@@ -395,6 +395,28 @@ partial def scalarExprIsBoolValued : ScalarExpr → EmitM Bool
 
 abbrev LNIRScalarExpr := ScalarExpr
 
+/-- HEAPOBJ_CONTRACT C2.3: branch to a fresh block reached only through `p ≠ null` **and** `p & 1 = 0`
+    (a real `lean_object*`). The immediate/null path goes to `immLbl` (created by the caller). -/
+def emitHeapGuard (p pfx immLbl : String) : EmitM Unit := do
+  let isNull ← freshTmp (pfx ++ "_null")
+  let pInt ← freshTmp (pfx ++ "_pint")
+  let tagBit ← freshTmp (pfx ++ "_tbit")
+  let isTagged ← freshTmp (pfx ++ "_tagged")
+  let tagLbl ← freshLabel (pfx ++ "_tag")
+  let heapLbl ← freshLabel (pfx ++ "_heap")
+  emitLine s!"  {isNull} = icmp eq ptr {p}, null\n  br i1 {isNull}, label %{immLbl}, label %{tagLbl}"
+  emitLine s!"{tagLbl}:\n  {pInt} = ptrtoint ptr {p} to i64\n  {tagBit} = and i64 {pInt}, 1"
+  emitLine s!"  {isTagged} = icmp ne i64 {tagBit}, 0\n  br i1 {isTagged}, label %{immLbl}, label %{heapLbl}"
+  emitLine s!"{heapLbl}:"
+
+/-- C2.1: `UInt64`/`USize`/`Float`/`Float32` never fit the 63-bit in-pointer `lean_box` payload, so they are boxed
+    as heap scalar objects (`lean_box_uint64`/`_usize`/`_float`/`_float32` layout: a 0-object ctor whose scalar
+    area at byte `8` holds the bits). Returns the scalar byte width; narrower integers stay in-pointer. -/
+def heapBoxWidth? : LNIRType → Option Nat
+  | .i64 | .usize | .f64 => some 8
+  | .f32 => some 4
+  | _ => none
+
 private def emitChecked256Op (opName pfx lVal rVal res : String) : EmitM String := do
   let ov ← freshTmp (pfx ++ "_ov")
   let flag ← freshTmp (pfx ++ "_flag")
@@ -713,26 +735,48 @@ def emitLetExpr (dst : VarId) (ty : LNIRType) (expr : LNIRExpr) : EmitM Unit := 
     else
       let v ← loadVarAsI64 tupleVar
       storeI64ToVar dst v
-  | .allocCtor _ objFields scalarFields =>
-    let allFields := objFields ++ scalarFields
-    match allFields[0]? with
-    | some f0 =>
-      let v ← loadVarAsI64 f0
-      let boxed ← freshTmp "ctor"
-      emitLine s!"  {boxed} = call ptr @lean_native_box_u64(i64 {v})"
+  | .allocCtor tag objFields scalarFields =>
+    if objFields.isEmpty && scalarFields.isEmpty then
+      -- C2.1: a nullary ctor is the immediate `lean_box(tag)` = `inttoptr (2·tag + 1)`, never `null`
+      let boxed ← freshTmp "ctor_nullary"
+      emitLine s!"  {boxed} = inttoptr i64 {2 * tag + 1} to ptr"
       storePtrToVar dst boxed
-    | none =>
-      storePtrToVar dst "null"
-  | .ctorGetObj ctorVar _ =>
+    else
+      -- `lean_alloc_ctor(tag, numObjs, scalarBytes)`; object fields at `8 + 8·i`, scalars after them (C1.2)
+      let o ← freshTmp "ctor"
+      emitLine s!"  {o} = call ptr @lean_alloc_ctor(i32 {tag}, i32 {objFields.length}, i32 {8 * scalarFields.length})"
+      for (f, i) in (objFields ++ scalarFields).zipIdx do
+        let a ← freshTmp "ctor_fld"
+        emitLine s!"  {a} = getelementptr inbounds i8, ptr {o}, i64 {8 + 8 * i}"
+        if i < objFields.length then
+          emitLine s!"  store ptr {← loadVarAsPtr f}, ptr {a}, align 8"
+        else
+          emitLine s!"  store i64 {← loadVarAsI64 f}, ptr {a}, align 8"
+      storePtrToVar dst o
+  | .ctorGetScalar _ _ _ =>
+    -- C1.2: scalar slot `i` lives after the `numObjs` object words (`getCtorLayout`), which a projection site
+    -- does not know; `findUnsupportedLLVMCallInCode` rejects it, and a direct emission traps (fail closed).
+    emitLine "  call void @llvm.trap()"
+    storeI64ToVar dst "0"
+  | .ctorGetObj ctorVar idx =>
+    -- C2.3: guarded `lean_ctor_get(o, i)` = load from `o + 8 + 8·i`; projecting an immediate is UB (trap).
     let p ← loadVarAsPtr ctorVar
-    storePtrToVar dst p
-  | .ctorGetScalar ctorVar _ _ =>
-    let p ← loadVarAsPtr ctorVar
-    let u ← freshTmp "unbox_fld"
-    emitLine s!"  {u} = call i64 @lean_native_unbox_u64(ptr {p})"
-    storeI64ToVar dst u
+    let trapLbl ← freshLabel "proj_imm"
+    emitHeapGuard p "proj" trapLbl
+    let a ← freshTmp "proj_addr"
+    let v ← freshTmp "proj_val"
+    emitLine s!"  {a} = getelementptr inbounds i8, ptr {p}, i64 {8 + 8 * idx}"
+    emitLine s!"  {v} = load ptr, ptr {a}, align 8"
+    storePtrToVar dst v
+    let contLbl ← freshLabel "proj_cont"
+    emitLine s!"  br label %{contLbl}\n{trapLbl}:\n  call void @llvm.trap()\n  unreachable\n{contLbl}:"
   | .isExclusive objVar =>
+    -- C2.3 / P-cert C5: `lean_is_exclusive` tests null and the tag bit before reading `m_rc`;
+    -- an immediate is (trivially) exclusive, matching `Eval` on tagged scalars.
     let p ← loadVarAsPtr objVar
+    let immLbl ← freshLabel "isx_imm"
+    let joinLbl ← freshLabel "isx_join"
+    emitHeapGuard p "isx" immLbl
     let rc ← freshTmp "rc_val"
     let eq1 ← freshTmp "is_excl"
     let eq1_64 ← freshTmp "is_excl64"
@@ -740,6 +784,9 @@ def emitLetExpr (dst : VarId) (ty : LNIRType) (expr : LNIRExpr) : EmitM Unit := 
     emitLine s!"  {eq1} = icmp eq i32 {rc}, 1"
     emitLine s!"  {eq1_64} = zext i1 {eq1} to i64"
     storeI64ToVar dst eq1_64
+    emitLine s!"  br label %{joinLbl}\n{immLbl}:"
+    storeI64ToVar dst "1"
+    emitLine s!"  br label %{joinLbl}\n{joinLbl}:"
   | .sarrayLen arrVar =>
     let arrPtr ← loadVarAsPtr arrVar
     -- Offset 8 bytes (1 x i64) is `size_t m_size` in `lean_native_sarray_u64`
@@ -816,9 +863,18 @@ def emitLetExpr (dst : VarId) (ty : LNIRType) (expr : LNIRExpr) : EmitM Unit := 
     emitLine s!"  {elemPtr} = getelementptr inbounds i64, ptr {rawPtr}, i64 {idxVal}"
     emitLine s!"  {elemVal} = load i64, ptr {elemPtr}, align 8"
     storeI64ToVar dst elemVal
-  | .boxScalar valVar _ =>
+  | .boxScalar valVar bty =>
     let v ← loadVarAsI64 valVar
-    if opt then
+    if let some w := heapBoxWidth? bty then
+      -- slot bits are stored at the scalar offset `8`; a `Float32` occupies the low 4 bytes (little-endian targets)
+      let o ← freshTmp "box_heap"
+      let a ← freshTmp "box_fld"
+      emitLine s!"  {o} = call ptr @lean_alloc_ctor(i32 0, i32 0, i32 {Nat.max w 8})"
+      emitLine s!"  {a} = getelementptr inbounds i8, ptr {o}, i64 8"
+      -- the whole 8-byte slot is written (the payload is zero-extended), so the area is `max w 8` bytes
+      emitLine s!"  store i64 {v}, ptr {a}, align 8"
+      storePtrToVar dst o
+    else if opt then
       -- Inline tagged pointer scalar boxing: (v << 1) | 1
       let sh ← freshTmp "tag_shl"
       let tagged ← freshTmp "tag_or"
@@ -831,9 +887,20 @@ def emitLetExpr (dst : VarId) (ty : LNIRType) (expr : LNIRExpr) : EmitM Unit := 
       let boxed ← freshTmp "box_call"
       emitLine s!"  {boxed} = call ptr @lean_native_box_u64(i64 {v})"
       storePtrToVar dst boxed
-  | .unboxScalar boxVar _ =>
+  | .unboxScalar boxVar bty =>
     let p ← loadVarAsPtr boxVar
-    if opt then
+    if let some w := heapBoxWidth? bty then
+      let a ← freshTmp "unbox_fld"
+      let r ← freshTmp "unbox_heap"
+      emitLine s!"  {a} = getelementptr inbounds i8, ptr {p}, i64 8"
+      if w == 8 then
+        emitLine s!"  {r} = load i64, ptr {a}, align 8"
+        storeI64ToVar dst r
+      else
+        let z ← freshTmp "unbox_zx"
+        emitLine s!"  {r} = load i32, ptr {a}, align 4\n  {z} = zext i32 {r} to i64"
+        storeI64ToVar dst z
+    else if opt then
       let pInt ← freshTmp "untag_int"
       let uVal ← freshTmp "untag_shr"
       emitLine s!"  {pInt} = ptrtoint ptr {p} to i64"
@@ -1529,6 +1596,15 @@ def emitRuntimeAndCAbiHelpers (optimized : Bool) (target : TargetArch := .x86_64
     mkU256LimbOpFn "lean_native_u256_usub_limbs" "usub",
     mkRcFn "lean_native_inc" "do_inc" "add" false,
     mkRcFn "lean_native_dec" "do_dec" "sub" true,
+    -- `lean_alloc_ctor(tag, numObjs, scalarSz)` fallback (C1.1 header: `m_rc = 1`, `m_cs_sz`, `m_other = numObjs`,
+    -- `m_tag`); a strong definition from the Lean runtime takes precedence at link time.
+    s!"define weak_odr dso_local ptr @lean_alloc_ctor(i32 %tag, i32 %nobjs, i32 %ssz) {attr} \{\nentry:\n" ++
+      "  %w = shl i32 %nobjs, 3\n  %b0 = add i32 %w, %ssz\n  %b = add i32 %b0, 8\n  %b64 = zext i32 %b to i64\n" ++
+      "  %o = call noalias ptr @malloc(i64 %b64)\n  store i32 1, ptr %o, align 4\n" ++
+      "  %cs = getelementptr inbounds i8, ptr %o, i64 4\n  %b16 = trunc i32 %b to i16\n  store i16 %b16, ptr %cs, align 2\n" ++
+      "  %ot = getelementptr inbounds i8, ptr %o, i64 6\n  %n8 = trunc i32 %nobjs to i8\n  store i8 %n8, ptr %ot, align 1\n" ++
+      "  %tg = getelementptr inbounds i8, ptr %o, i64 7\n  %t8 = trunc i32 %tag to i8\n  store i8 %t8, ptr %tg, align 1\n" ++
+      "  ret ptr %o\n}",
     s!"define weak_odr dso_local ptr @lean_native_box_u64(i64 %val) {attr} \{\nentry:\n  %sh = shl i64 %val, 1\n  %tagged = or i64 %sh, 1\n  %p = inttoptr i64 %tagged to ptr\n  ret ptr %p\n}",
     s!"define weak_odr dso_local i64 @lean_native_unbox_u64(ptr %boxed) {attr} \{\nentry:\n  %i = ptrtoint ptr %boxed to i64\n  %v = lshr i64 %i, 1\n  ret i64 %v\n}",
     mkEnsureExclFn "lean_native_ensure_exclusive" true,
@@ -1949,8 +2025,6 @@ partial def findUnsupportedLLVMCallInCode (localSigs : List (String × List LNIR
       (callee == "lean_native_sarray_len" && args.length == 1 && slotLLVMType ty == "i64") ||
       (slotLLVMType ty == "i64" && localSigs.any (fun (nm, pTys, _) => nm == callee && pTys.length == args.length)))
     if !ok then some callee else findUnsupportedLLVMCallInCode localSigs k
-  | .letBind _ _ (.allocCtor _ _ _) _ => some "allocCtor"
-  | .letBind _ _ (.ctorGetObj _ _) _ => some "ctorGetObj"
   | .letBind _ _ (.ctorGetScalar _ _ _) _ => some "ctorGetScalar"
   | .letBind _ _ _ k | .rawStore _ _ _ _ k | .incRef _ _ k | .decRef _ _ k | .parFor _ _ _ _ _ k =>
     findUnsupportedLLVMCallInCode localSigs k
@@ -2014,18 +2088,22 @@ def slotTypeRegressionOk : Bool :=
     has s!"%slot_v4 = alloca {tup3}" && has "%slot_v5 = alloca ptr" && has "%slot_v6 = alloca ptr" && has "%slot_v2 = alloca i256" &&
     has s!"extractvalue {tup3}" && has s!"insertvalue {tup3}" && !has "{ i64, i64 }"
 
-private def ctorOpsLLVMRegDecls : List (LNIRDecl × String) := [
+/-- C2.3: `allocCtor`/`ctorGetObj` are lowered (the latter behind `emitHeapGuard`); `ctorGetScalar` (C1.2 layout)
+    and the heap-mutation / tag-read calls have no LLVM lowering yet and are rejected rather than emitted. -/
+private def ctorOpsLLVMRegDecls : List (LNIRDecl × Option String) := [
   ({ name := "reg_alloc_ctor", params := [{ id := 0, name := "x", ty := .i64 }], retTy := .objPtr,
-     body := .letBind 1 .objPtr (.allocCtor 0 [] [0]) (.ret 1) }, "allocCtor"),
+     body := .letBind 1 .objPtr (.allocCtor 0 [] [0]) (.ret 1) }, none),
   ({ name := "reg_ctor_get_obj", params := [{ id := 0, name := "p", ty := .objPtr }], retTy := .objPtr,
-     body := .letBind 1 .objPtr (.ctorGetObj 0 0) (.ret 1) }, "ctorGetObj"),
+     body := .letBind 1 .objPtr (.ctorGetObj 0 0) (.ret 1) }, none),
   ({ name := "reg_ctor_get_scalar", params := [{ id := 0, name := "p", ty := .objPtr }], retTy := .i64,
-     body := .letBind 1 .i64 (.ctorGetScalar 0 0 .i64) (.ret 1) }, "ctorGetScalar")
+     body := .letBind 1 .i64 (.ctorGetScalar 0 0 .i64) (.ret 1) }, some "ctorGetScalar"),
+  ({ name := "reg_ctor_set", params := [{ id := 0, name := "p", ty := .objPtr }], retTy := .unit,
+     body := .letBind 1 .unit (.call "lean_native_ctor_set" [0, 0, 0] .unit) (.ret 1) }, some "lean_native_ctor_set")
 ]
 
 #guard ctorOpsLLVMRegDecls.all fun (d, expected) =>
-  findUnsupportedLLVMCallInCode [] d.body == some expected &&
-  findUnsupportedLLVMCall? { moduleName := "ctor_reg", decls := [d] } == some (d.name, expected)
+  findUnsupportedLLVMCallInCode [] d.body == expected &&
+  findUnsupportedLLVMCall? { moduleName := "ctor_reg", decls := [d] } == expected.map (d.name, ·)
 
 end LeanNative.Backend.LLVM
 
