@@ -8,7 +8,8 @@ user-written declaration in a pinned target module or under a pinned namespace b
 inventory gap and fails (exit 1). Names the checker covers but this scanner misses (generated
 instances, structure projections, `deriving` output) are reported as informational only.
 
-Usage: scripts/shadow_inventory_grep.py COVERAGE.tsv
+Usage: scripts/shadow_inventory_grep.py [--self-test] COVERAGE.tsv
+       scripts/shadow_inventory_grep.py --self-test
 """
 import json
 import re
@@ -54,13 +55,13 @@ def strip_comments(text: str) -> str:
     return re.sub(r"--[^\n]*", "", "".join(out))
 
 
-def scan(path: Path):
-    """Yield (fully qualified name, line) for each declaration in `path`, plus the constructors
+def scan_text(text: str):
+    """Yield (fully qualified name, line) for each declaration in `text`, plus the constructors
     of `inductive` types and the fields of `structure`s (they are user-written target-side
     declarations too)."""
     stack = []  # entries: ("ns", parts) | ("sec", None) | ("mutual", None)
     owner = None  # (kind, fully qualified type name) while inside an inductive / structure body
-    for lineno, line in enumerate(strip_comments(path.read_text()).splitlines(), 1):
+    for lineno, line in enumerate(strip_comments(text).splitlines(), 1):
         if owner and line.strip() and not line[0].isspace() and not line.lstrip().startswith("|"):
             owner = None
         if owner:
@@ -85,23 +86,63 @@ def scan(path: Path):
                 stack.pop()
             continue
         if m := DECL.match(line):
-            kind, name = m.groups()
-            if kind == "instance" and (name.startswith(":") or name in ("where",)):
+            kind, raw_name = m.groups()
+            if kind == "instance" and (raw_name.startswith(":") or raw_name in ("where",)):
                 continue  # anonymous instance: no user-visible name to compare
-            name = name.lstrip("_root_.") if name.startswith("_root_.") else name
+            is_root = raw_name.startswith("_root_.")
+            name = raw_name.removeprefix("_root_.")
             prefix = [p for k, ps in stack if k == "ns" for p in ps]
-            full = ".".join(prefix + [name]) if not m.group(2).startswith("_root_.") else name
+            full = name if is_root else ".".join(prefix + [name])
             yield full, lineno
             if kind in ("inductive", "structure", "class"):
                 owner = (kind, full)
 
 
+def scan(path: Path):
+    yield from scan_text(path.read_text())
+
+
+def run_self_tests() -> None:
+    sample = """
+namespace Outer.Inner
+def plain : Nat := 0
+def _root_.route : Nat := 1
+theorem _root_.test : True := trivial
+abbrev _root_.orig : Nat := 2
+structure _root_.rootStruct where
+  route : Nat
+inductive _root_.RootInd where
+  | orig : _root_.RootInd
+def _root_.Outer.escaped : Nat := 3
+end Outer.Inner
+"""
+    got = [name for name, _ in scan_text(sample)]
+    expected = [
+        "Outer.Inner.plain",
+        "route",
+        "test",
+        "orig",
+        "rootStruct",
+        "rootStruct.route",
+        "RootInd",
+        "RootInd.orig",
+        "Outer.escaped",
+    ]
+    if got != expected:
+        raise AssertionError(f"shadow_inventory_grep self-test failed: got {got!r}, expected {expected!r}")
+
+
 def main() -> int:
-    if len(sys.argv) != 2:
+    run_self_tests()
+    args = [a for a in sys.argv[1:] if a != "--self-test"]
+    if "--self-test" in sys.argv[1:] and not args:
+        print("[inventory-grep] PASS: self-tests passed")
+        return 0
+    if len(args) != 1:
         print(__doc__, file=sys.stderr)
         return 2
     covered = {}
-    for row in Path(sys.argv[1]).read_text().splitlines():
+    for row in Path(args[0]).read_text().splitlines():
         if row.strip():
             n, loc = row.split("\t")
             covered[n] = loc
