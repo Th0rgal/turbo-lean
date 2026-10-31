@@ -48,7 +48,7 @@ fn lexical_scope_and_elaborated_identity_across_verdict_paths() {
                         .arg(mode)
                         .arg("Identity.lean")
                         .args(["--decl", target]);
-                    if mode != "fast-check" {
+                    if mode == "check" {
                         cmd.arg("--project-dir").arg(&tmp.0);
                     }
                     let out = corpus::run(&mut cmd);
