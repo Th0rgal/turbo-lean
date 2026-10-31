@@ -1102,6 +1102,7 @@ pub fn serve_cas_http_with_auth(
                                     "errors": zreply.errors,
                                     "timed_out": zreply.timed_out,
                                     "crashed": zreply.crashed,
+                                    "scanner_version": zreply.scanner_version,
                                     "deterministic": deterministic
                                 }),
                             );

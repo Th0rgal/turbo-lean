@@ -549,6 +549,7 @@ fn unavailable_zygote_fallback_obeys_check_timeout_and_reaps_lean() {
             fs::write(&tmp, format!(r#"#!/bin/sh
 while IFS= read -r request; do
   echo unavailable >> '{}'
+  printf '\n[TurboLean.ZygoteWorker] reply\n' >&2
   echo '{{"ok":false,"import_ok":false,"env_cache_hit":false,"import_us":0,"elab_us":0,"errors":["import unavailable"]}}'
 done
 "#, marker.display())).unwrap();
