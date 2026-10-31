@@ -2350,6 +2350,7 @@ fn resolve_untrusted_pr_project_config(
         extern_libs: Vec::new(),
         custom_targets: Vec::new(),
         config_digest: String::new(),
+        unsupported: None,
     };
     Ok(crate::module_builder::ProjectConfig {
         toolchain: toolchain.to_string(),
@@ -3289,7 +3290,19 @@ fn statement_lake_command(project: &Path, is_untrusted: bool) -> Result<Command>
 
 fn statement_lean_command(project: &Path, is_untrusted: bool) -> Result<Command> {
     // Static package paths only: never ask project code to supply PATH/LEAN_PATH.
-    let cfg = crate::module_builder::resolve_project_config_with_trust(project, true)?;
+    let mut cfg = crate::module_builder::resolve_project_config_with_trust(project, is_untrusted)?;
+    if !is_untrusted && cfg.lean_bin.as_os_str().is_empty() {
+        let (lean_bin, lean_githash, toolchain_lib_lean, toolchain_lib) =
+            crate::module_builder::resolve_toolchain_compiler_with_trust(
+                project,
+                &cfg.toolchain,
+                true,
+            )?;
+        cfg.lean_bin = lean_bin;
+        cfg.lean_githash = lean_githash;
+        cfg.toolchain_lib_lean = toolchain_lib_lean;
+        cfg.toolchain_lib = toolchain_lib;
+    }
     let (lean_path, _) = crate::module_builder::build_lean_search_path(&cfg, true);
     statement_toolchain_command(project, is_untrusted, "lean", Some(&lean_path))
 }

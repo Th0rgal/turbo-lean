@@ -191,7 +191,9 @@ pub(crate) fn spawn_lake_env(project_dir: &Path) -> Result<HashMap<String, Strin
                 }
             }
         }
-        if let Ok((_, manifest_pkgs, _)) = crate::module_builder::parse_lake_manifest(&canon_proj) {
+        if let Ok((_, manifest_pkgs, _)) =
+            crate::module_builder::parse_lake_manifest(&canon_proj, false)
+        {
             for mp in manifest_pkgs {
                 let pkg_dir = mp.dir.canonicalize().unwrap_or(mp.dir);
                 let pkg_lib_lean = pkg_dir.join(".lake/build/lib/lean");
@@ -704,7 +706,8 @@ pub(crate) fn resolve_remote_lean_path(
             }
         }
     }
-    if let Ok((_, manifest_pkgs, _)) = crate::module_builder::parse_lake_manifest(canon_dir) {
+    if let Ok((_, manifest_pkgs, _)) = crate::module_builder::parse_lake_manifest(canon_dir, false)
+    {
         for mp in manifest_pkgs {
             let pkg_lib = mp
                 .dir
