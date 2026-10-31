@@ -2198,7 +2198,7 @@ pub(crate) fn run_audited_lean_shard(
         .filter(|&v| v > 0)
         .unwrap_or(300);
     let audit_out = crate::module_builder::run_command_with_timeout(
-        auditor,
+        &mut auditor,
         std::time::Duration::from_secs(timeout_secs),
         false,
     )
