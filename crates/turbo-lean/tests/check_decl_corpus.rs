@@ -139,3 +139,66 @@ fn heavy_check_decl_corpus_stock_lean_verdict_parity() {
         "A0d verdict parity: {declarations} declarations, {comparisons} comparisons, 0 mismatches"
     );
 }
+
+#[test]
+fn check_decl_disambiguates_namespaces_and_checks_only_the_selected_proof() {
+    let tmp = corpus::Temp::new("decl-lookup");
+    fs::write(
+        tmp.0.join("lean-toolchain"),
+        include_str!("../../../lean/lean-toolchain"),
+    )
+    .unwrap();
+    fs::write(tmp.0.join("lakefile.toml"), "name = \"decl-lookup\"\n").unwrap();
+    let file = tmp.0.join("Names.lean");
+    let original = "namespace A\ntheorem same : 1 = 1 := rfl\nend A\nnamespace B\ntheorem same : 2 = 2 := rfl\nend B\n";
+    let check = |target: &str| {
+        corpus::run(
+            Command::new(env!("CARGO_BIN_EXE_turbo-lean"))
+                .env("TURBO_LEAN_NO_DAEMON", "1")
+                .args(["--cache-dir"])
+                .arg(tmp.0.join("cache"))
+                .args(["--json", "check"])
+                .arg(&file)
+                .args(["--decl", target, "--project-dir"])
+                .arg(&tmp.0)
+                .args(["--timeout", "120"])
+                .current_dir(&tmp.0),
+        )
+    };
+    for broken in [None, Some("A.same"), Some("B.same"), None] {
+        let src = match broken {
+            Some("A.same") => original.replace("1 = 1 := rfl", "1 = 1 := by exact (0 : Nat)"),
+            Some("B.same") => original.replace("2 = 2 := rfl", "2 = 2 := by exact (0 : Nat)"),
+            _ => original.to_string(),
+        };
+        fs::write(&file, src).unwrap();
+        let ambiguous = check("same");
+        let diagnostic = corpus::diagnostic(&ambiguous);
+        assert_eq!(ambiguous.status.code(), Some(1), "{diagnostic}");
+        for fragment in ["Ambiguous declaration", "A.same", "B.same"] {
+            assert!(diagnostic.contains(fragment), "{diagnostic}");
+        }
+        for target in ["A.same", "B.same"] {
+            let result = check(target);
+            let diagnostic = corpus::diagnostic(&result);
+            assert_eq!(
+                result.status.success(),
+                broken != Some(target),
+                "{target} broken={broken:?}: {diagnostic}"
+            );
+            if result.status.success() {
+                let json: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+                assert_eq!(json["decl"], target, "{json}");
+                assert!(
+                    matches!(
+                        json["status"].as_str(),
+                        Some("theorem_verified" | "theorem_cache_hit")
+                    ),
+                    "{json}"
+                );
+            } else {
+                assert!(diagnostic.contains("type mismatch"), "{diagnostic}");
+            }
+        }
+    }
+}

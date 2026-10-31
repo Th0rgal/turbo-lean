@@ -461,19 +461,15 @@ pub fn try_stateless_remote_single_decl_check(
     else {
         return Ok(false);
     };
-    let Some(shard) = split
-        .shards
-        .iter()
-        .find(|s| splitter::decl_name_matches_target(&s.name, target_decl))
-    else {
+    let Some(shard_idx) = splitter::find_decl_shard_index(&split.shards, target_decl)? else {
         return Ok(false);
     };
+    let shard = &split.shards[shard_idx];
     let file_lean_args =
         crate::module_builder::try_resolve_lean_args_for_path(&canon_dir, Some(&canon_file));
     let shard_key = compute_shard_key_with_args(&toolchain, shard, &file_lean_args);
     let mut single_set = HashSet::new();
-    single_set.insert(target_decl.to_string());
-    single_set.insert(shard.name.clone());
+    single_set.insert(shard.decl_name().to_string());
     let pruned_src = splitter::build_pruned_imports_shard_source(&active_src, &single_set);
     let fast_olean_src = if pruned_src.is_some() || split.shards.len() <= 1 {
         None
@@ -1505,11 +1501,7 @@ fn check_single_decl(
     let mut active_src = src;
     let mut active_file = resolved_file.to_path_buf();
 
-    if !split
-        .shards
-        .iter()
-        .any(|s| splitter::decl_name_matches_target(&s.name, target_decl))
-    {
+    if splitter::find_decl_shard_index(&split.shards, target_decl)?.is_none() {
         for mod_name in crate::module_builder::parse_header_imports(&split.imports_header) {
             if mod_name != "Init" {
                 let rel_mod = crate::module_builder::module_name_to_rel_slash(&mod_name) + ".lean";
@@ -1539,11 +1531,7 @@ fn check_single_decl(
                     })
                 });
                 if let Some((sub_src, sub_cb3, sub_split)) = sub_split_opt {
-                    if sub_split
-                        .shards
-                        .iter()
-                        .any(|s| splitter::decl_name_matches_target(&s.name, target_decl))
-                    {
+                    if splitter::find_decl_shard_index(&sub_split.shards, target_decl)?.is_some() {
                         *split = sub_split;
                         *cached_file_blake3 = sub_cb3;
                         active_src = sub_src;
@@ -1579,11 +1567,7 @@ fn check_single_decl(
                             let _ = crate::shm_cache::atomic_write_shm(&st_path, &bytes);
                         }
                     }
-                    if sub_split
-                        .shards
-                        .iter()
-                        .any(|s| splitter::decl_name_matches_target(&s.name, target_decl))
-                    {
+                    if splitter::find_decl_shard_index(&sub_split.shards, target_decl)?.is_some() {
                         *split = sub_split;
                         *cached_file_blake3 = Some(sub_b3);
                         active_src = sub_src;
@@ -1595,11 +1579,8 @@ fn check_single_decl(
         }
     }
 
-    let shard_idx = split
-        .shards
-        .iter()
-        .position(|s| splitter::decl_name_matches_target(&s.name, target_decl))
-        .with_context(|| {
+    let shard_idx =
+        splitter::find_decl_shard_index(&split.shards, target_decl)?.with_context(|| {
             format!(
                 "Declaration `{}` not found in {} (found {} theorem shards)",
                 target_decl,
@@ -1695,8 +1676,7 @@ fn check_single_decl(
                 .unwrap_or_else(|_| active_file.clone())
         };
         let mut single_set = HashSet::new();
-        single_set.insert(target_decl.to_string());
-        single_set.insert(shard.name.clone());
+        single_set.insert(shard.decl_name().to_string());
         let pruned_src = splitter::build_pruned_imports_shard_source(&active_src, &single_set);
         let fast_olean_src = if split.shards.len() <= 1 {
             None
@@ -1744,7 +1724,7 @@ fn check_single_decl(
             full_shard_src = if !shard.shard_source.is_empty() {
                 shard.shard_source.clone()
             } else {
-                splitter::reconstruct_single_shard_source(&active_src, &shard.name)
+                splitter::reconstruct_single_shard_source(&active_src, shard.decl_name())?
                     .unwrap_or_default()
             };
             candidates.push((full_shard_src.as_str(), false));
@@ -1828,7 +1808,7 @@ fn check_single_decl(
             let fallback_src = if !shard.shard_source.is_empty() {
                 shard.shard_source.clone()
             } else {
-                splitter::reconstruct_single_shard_source(&active_src, &shard.name)
+                splitter::reconstruct_single_shard_source(&active_src, shard.decl_name())?
                     .unwrap_or_default()
             };
             let req_body = serde_json::to_vec(&pack::CheckShardHttpRequest {
@@ -1957,8 +1937,7 @@ fn check_single_decl(
                 staging_dir.join(format!("shard_{}_{}.lean", safe_name, std::process::id()));
 
             let mut single_set = HashSet::new();
-            single_set.insert(target_decl.to_string());
-            single_set.insert(shard.name.clone());
+            single_set.insert(shard.decl_name().to_string());
 
             let proj_build_verified = !(known_modified_vs_head && same_as_initial)
                 && split.hygiene.is_clean_for_certification()
@@ -2087,7 +2066,7 @@ fn check_single_decl(
                     let full_shard_src = if !shard.shard_source.is_empty() {
                         shard.shard_source.clone()
                     } else {
-                        splitter::reconstruct_single_shard_source(&active_src, &shard.name)
+                        splitter::reconstruct_single_shard_source(&active_src, shard.decl_name())?
                             .unwrap_or_default()
                     };
                     let (prefix_src, closing_suffix) = if !decl_src.is_empty() {
@@ -2467,7 +2446,7 @@ fn check_single_decl(
                 let full_shard_src = if !shard.shard_source.is_empty() {
                     shard.shard_source.clone()
                 } else {
-                    splitter::reconstruct_single_shard_source(&active_src, &shard.name)
+                    splitter::reconstruct_single_shard_source(&active_src, shard.decl_name())?
                         .unwrap_or_default()
                 };
                 if !verified_via_zygote {

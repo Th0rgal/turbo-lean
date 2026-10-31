@@ -25,6 +25,16 @@ pub struct TheoremShard {
     pub shard_source: String,
 }
 
+impl TheoremShard {
+    pub(crate) fn decl_name(&self) -> &str {
+        if self.qualified_name.is_empty() {
+            &self.name
+        } else {
+            &self.qualified_name
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HygieneReport {
     pub has_sorry: bool,
@@ -2812,40 +2822,76 @@ fn split_lean_source_inner(
     }
 }
 
+/// Match the environment identity, allowing a namespace suffix at a component boundary.
 pub(crate) fn decl_name_matches_target(name: &str, target_decl: &str) -> bool {
     name == target_decl
         || name
             .strip_suffix(target_decl)
             .map(|p| p.ends_with('.'))
             .unwrap_or(false)
-        || target_decl
-            .strip_suffix(name)
-            .map(|p| p.ends_with('.'))
-            .unwrap_or(false)
+}
+
+fn resolve_decl_index<'a>(
+    names: impl Iterator<Item = &'a str>,
+    target_decl: &str,
+) -> anyhow::Result<Option<usize>> {
+    let matches: Vec<_> = names
+        .enumerate()
+        .filter(|(_, name)| decl_name_matches_target(name, target_decl))
+        .collect();
+    anyhow::ensure!(
+        matches.len() <= 1,
+        "Ambiguous declaration `{}`; candidates: {}",
+        target_decl,
+        matches
+            .iter()
+            .map(|(_, name)| *name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(matches.first().map(|(idx, _)| *idx))
+}
+
+pub(crate) fn find_decl_shard_index(
+    shards: &[TheoremShard],
+    target_decl: &str,
+) -> anyhow::Result<Option<usize>> {
+    resolve_decl_index(shards.iter().map(TheoremShard::decl_name), target_decl)
+}
+
+/// Collect each declaration's environment identity and enclosing command span, including mutuals.
+fn qualified_span_declarations(spans: &[CmdSpan<'_>]) -> Vec<(usize, String)> {
+    let mut scope_stack = Vec::new();
+    let mut declarations = Vec::new();
+    for (idx, span) in spans.iter().enumerate() {
+        let mut record = |text: &str| {
+            if let Some((_, name)) = classify_decl_header(text) {
+                if split_at_top_level_assign(text).is_some() {
+                    declarations.push((idx, qualified_decl_name(&name, &scope_stack)));
+                }
+            }
+        };
+        if let Some((_, inner, _)) = split_mutual_block_subspans(span) {
+            for sub in inner {
+                record(sub.clean_text);
+            }
+        } else {
+            record(span.clean_text);
+        }
+        update_scope_stack_with_idx(&mut scope_stack, span.clean_text, idx);
+    }
+    declarations
 }
 
 fn find_last_matching_span_idx<F>(spans: &[CmdSpan<'_>], mut pred: F) -> Option<usize>
 where
     F: FnMut(&str) -> bool,
 {
-    let mut last_idx = None;
-    for (s_idx, span) in spans.iter().enumerate() {
-        if let Some((_, inner_spans, _)) = split_mutual_block_subspans(span) {
-            if inner_spans.iter().any(|sub| {
-                classify_decl_header(sub.clean_text)
-                    .map(|(_, n)| pred(&n))
-                    .unwrap_or(false)
-            }) {
-                last_idx = Some(s_idx);
-            }
-        }
-        if let Some((_kind, name)) = classify_decl_header(span.clean_text) {
-            if split_at_top_level_assign(span.clean_text).is_some() && pred(&name) {
-                last_idx = Some(s_idx);
-            }
-        }
-    }
-    last_idx
+    qualified_span_declarations(spans)
+        .into_iter()
+        .rev()
+        .find(|(_, name)| pred(name))
+        .map(|(idx, _)| idx)
 }
 
 fn format_stubbed_decl_span(orig_text: &str, sig_clean: &str, proof_clean: &str) -> String {
@@ -2872,31 +2918,24 @@ fn sanitize_ident_for_fast_check(name: &str) -> String {
 
 /// Reconstruct the self-contained prefix-only `shard_source` (`prefix_skeleton_accum + span.orig_text + closing_scopes`)
 /// for a single theorem declaration `target_decl` on demand in $O(N)$ time and memory.
-pub fn reconstruct_single_shard_source(src: &str, target_decl: &str) -> Option<String> {
+/// Ambiguous namespace suffixes return an error listing every matching identity.
+pub fn reconstruct_single_shard_source(
+    src: &str,
+    target_decl: &str,
+) -> anyhow::Result<Option<String>> {
     let clean = strip_lean_comments(src);
     let spans = parse_command_spans(src, &clean);
     let closed_sections = compute_closed_section_ranges(&spans);
 
-    let mut target_scope = Vec::new();
-    let t_idx = spans.iter().enumerate().find_map(|(idx, span)| {
-        let matches = |text: &str| {
-            classify_decl_header(text)
-                .map(|(_, name)| {
-                    split_at_top_level_assign(text).is_some()
-                        && decl_name_matches_target(
-                            &qualified_decl_name(&name, &target_scope),
-                            target_decl,
-                        )
-                })
-                .unwrap_or(false)
-        };
-        let found = split_mutual_block_subspans(span)
-            .map(|(_, inner, _)| inner.iter().any(|sub| matches(sub.clean_text)))
-            .unwrap_or(false)
-            || matches(span.clean_text);
-        update_scope_stack_with_idx(&mut target_scope, span.clean_text, idx);
-        found.then_some(idx)
-    })?;
+    let declarations = qualified_span_declarations(&spans);
+    let Some(decl_idx) = resolve_decl_index(
+        declarations.iter().map(|(_, name)| name.as_str()),
+        target_decl,
+    )?
+    else {
+        return Ok(None);
+    };
+    let t_idx = declarations[decl_idx].0;
     let omit_mask = compute_omitted_closed_section_spans(&spans, &closed_sections, t_idx);
 
     let mut prefix_skeleton_accum = String::with_capacity(src.len());
@@ -2956,10 +2995,10 @@ pub fn reconstruct_single_shard_source(src: &str, target_decl: &str) -> Option<S
     }
 
     let closing_scopes = format_closing_scopes(&scope_stack);
-    Some(format!(
+    Ok(Some(format!(
         "{}{}\n{}",
         prefix_skeleton_accum, spans[t_idx].orig_text, closing_scopes
-    ))
+    )))
 }
 
 fn normalize_whitespace(s: &str) -> String {
@@ -3361,10 +3400,11 @@ fn section_contains_uncached_theorem(
     sec_close: usize,
     uncached_names: &std::collections::HashSet<String>,
 ) -> bool {
-    find_last_matching_span_idx(&spans[sec_open..=sec_close], |n| {
+    find_last_matching_span_idx(&spans[..=sec_close], |n| {
         matches_uncached_name(n, uncached_names)
     })
-    .is_some()
+    .map(|idx| idx >= sec_open)
+    .unwrap_or(false)
 }
 
 fn compute_uncached_omitted_closed_section_mask(
@@ -3414,7 +3454,7 @@ pub fn build_fast_olean_shard_source_with_split(
 
     let mut max_end_line = 0usize;
     for (idx, shard) in split.shards.iter().enumerate() {
-        if matches_uncached_name(&shard.name, uncached_names) {
+        if matches_uncached_name(shard.decl_name(), uncached_names) {
             if !shard_is_acyclic_for_fast_import(&split.shards, idx) {
                 return None;
             }
@@ -3517,7 +3557,12 @@ pub fn build_fast_olean_shard_source_with_split(
             if has_inner_thm {
                 let any_uncached = inner_spans.iter().any(|sub| {
                     classify_decl_header(sub.clean_text)
-                        .map(|(_, n)| matches_uncached_name(&n, uncached_names))
+                        .map(|(_, n)| {
+                            matches_uncached_name(
+                                &qualified_decl_name(&n, &scope_stack),
+                                uncached_names,
+                            )
+                        })
                         .unwrap_or(false)
                 });
                 if any_uncached {
@@ -3560,7 +3605,8 @@ pub fn build_fast_olean_shard_source_with_split(
             if split_at_top_level_assign(span.clean_text).is_some() {
                 let cur_idx = thm_idx;
                 thm_idx += 1;
-                if matches_uncached_name(&name, uncached_names) {
+                if matches_uncached_name(&qualified_decl_name(&name, &scope_stack), uncached_names)
+                {
                     let renamed = rename_decl_header_for_fast_check(
                         span.orig_text,
                         span.clean_text,
@@ -3693,7 +3739,8 @@ pub fn build_pruned_imports_shard_source(
 
         if let Some((_kind, name)) = classify_decl_header(span.clean_text) {
             if let Some((sig_clean, proof_clean)) = split_at_top_level_assign(span.clean_text) {
-                if matches_uncached_name(&name, uncached_names) {
+                if matches_uncached_name(&qualified_decl_name(&name, &scope_stack), uncached_names)
+                {
                     if contains_mathlib_tactic_or_namespace(span.clean_text) {
                         return None;
                     }
@@ -3763,7 +3810,7 @@ pub fn can_use_fast_olean_import_with_split(
         return false;
     }
     for (idx, shard) in split.shards.iter().enumerate() {
-        if matches_uncached_name(&shard.name, uncached_names)
+        if matches_uncached_name(shard.decl_name(), uncached_names)
             && !shard_is_acyclic_for_fast_import(&split.shards, idx)
         {
             return false;
@@ -4543,6 +4590,22 @@ pub fn audit_source_declarations(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn test_indented_set_option_in_is_stripped_as_declaration_prefix() {
+        let src = "  set_option foo bar in\n  theorem wrapped : True := by trivial";
+        assert_eq!(
+            strip_decl_prefixes(src),
+            "theorem wrapped : True := by trivial"
+        );
+        assert_eq!(
+            classify_decl_header(src),
+            Some(("theorem".to_string(), "wrapped".to_string()))
+        );
+        let split = split_lean_source(src, &[]);
+        assert_eq!(split.shards.len(), 1);
+        assert_eq!(split.shards[0].name, "wrapped");
+    }
 
     #[test]
     fn test_strip_lean_comments_preserves_lines_strings_and_char_literals() {
@@ -5487,7 +5550,7 @@ end MathlibEdgeCases
                 shard_lines.get(s.start_line - 1).map(|l| l.trim()),
                 orig_lines.get(s.start_line - 1).map(|l| l.trim())
             );
-            if let Some(rec) = reconstruct_single_shard_source(src, &s.name) {
+            if let Some(rec) = reconstruct_single_shard_source(src, s.decl_name()).unwrap() {
                 assert_eq!(
                     rec.lines().nth(s.start_line - 1).map(str::trim),
                     orig_lines.get(s.start_line - 1).map(|l| l.trim())

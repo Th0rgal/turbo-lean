@@ -4766,7 +4766,7 @@ pub fn run_pr_verify_command(
                             let single_src: std::borrow::Cow<'_, str> =
                                 if sh.shard_source.is_empty() {
                                     let reconstructed =
-                                        splitter::reconstruct_single_shard_source(&src, &sh.name)
+                                        splitter::reconstruct_single_shard_source(&src, sh.decl_name())?
                                             .unwrap_or_else(|| {
                                                 let mut single_set =
                                                     std::collections::HashSet::with_capacity(1);
