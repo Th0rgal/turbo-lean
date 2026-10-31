@@ -492,6 +492,15 @@ def markTypedTuple (st : SymExecState) (v : VarId) : SymExecState :=
 def unmarkTypedTuple (st : SymExecState) (v : VarId) : SymExecState :=
   { st with typedTuples := st.typedTuples.filter (· != v) }
 
+def clearVarSortTags (st : SymExecState) (v : VarId) : SymExecState :=
+  { st with
+    typedTuples := st.typedTuples.filter (· != v)
+    boolVars := st.boolVars.filter (· != v)
+    u64Vars := st.u64Vars.filter (· != v)
+    u256Vars := st.u256Vars.filter (· != v)
+    sarrayVars := st.sarrayVars.filter (· != v)
+    objPtrVars := st.objPtrVars.filter (· != v) }
+
 def markBoolVar (st : SymExecState) (v : VarId) : SymExecState :=
   let root := st.resolveBuf v
   let heapRoot := st.allocRoots.contains root || st.sarrayVars.contains root || st.objPtrVars.contains root ||
@@ -1866,6 +1875,11 @@ structure SymExecSummary where
   memWrites      : List (VarId × SymExpr × SymExpr)
   deriving Repr, Inhabited, BEq
 
+private def symExprMentionsHeapRoot (st : SymExecState) : SymExpr → Bool
+  | .symVar id => st.isHeapObjectRoot id
+  | .ite _ a b => symExprMentionsHeapRoot st a || symExprMentionsHeapRoot st b
+  | _ => false
+
 /-- Unroll a `seqFor` loop body `unrollCount` times symbolically. -/
 def symExecLoopUnroll (unrollCount : Nat) (curIdx : Nat) (idxVar accVar : VarId)
     (st : SymExecState) (execBody : SymExecState → SymExecState × SymExpr) : SymExecState :=
@@ -1874,25 +1888,64 @@ def symExecLoopUnroll (unrollCount : Nat) (curIdx : Nat) (idxVar accVar : VarId)
   | n + 1 =>
     let stIdx := st.bindVar idxVar { expr := .constU64 curIdx.toUInt64, nonPoison := true, noUB := true }
     let (stAfter, retExpr) := execBody stIdx
+    let normRet := normSymExpr retExpr
+    let stCleared := stAfter.clearVarSortTags accVar
     let stNext :=
-      match retExpr with
-      | .symVar r => stAfter.aliasBuf accVar r
-      | _ => stAfter.clearAlias accVar
-    let stNextBound := stNext.bindVar accVar {
-      expr := normSymExpr retExpr
-      nonPoison := stAfter.nonPoison
-      noUB := stAfter.noUB
-    }
-    symExecLoopUnroll n (curIdx + 1) idxVar accVar stNextBound execBody
+      match normRet with
+      | .symVar r =>
+        let eff := stCleared.resolveBuf r
+        let stAlias := if accVar != eff then stCleared.aliasBuf accVar eff else stCleared.clearAlias accVar
+        let stSort :=
+          if stAlias.typedTuples.contains eff then stAlias.markTypedTuple accVar
+          else if stAlias.allocRoots.contains eff || stAlias.objPtrVars.contains eff then stAlias.markObjPtrVar accVar
+          else if stAlias.sarrayVars.contains eff then stAlias.markSarrayVar accVar
+          else
+            match symExprScalarSort? stAlias normRet with
+            | some 0 => stAlias.markBoolVar accVar
+            | some 1 => stAlias.markU64Var accVar
+            | some 2 => stAlias.markU256Var accVar
+            | _ => stAlias
+        if accVar == eff then
+          { stSort with
+              noUB := stSort.noUB && stAfter.noUB
+              nonPoison := stSort.nonPoison && stAfter.nonPoison }
+        else
+          stSort.bindVar accVar {
+            expr := normRet
+            nonPoison := stAfter.nonPoison
+            noUB := stAfter.noUB
+          }
+      | .tuple _ =>
+        ((stCleared.clearAlias accVar).markTypedTuple accVar).bindVar accVar {
+          expr := normRet
+          nonPoison := stAfter.nonPoison
+          noUB := stAfter.noUB
+        }
+      | _ =>
+        if symExprMentionsHeapRoot stCleared normRet then
+          ((stCleared.clearAlias accVar).markUnsupported).bindVar accVar {
+            expr := .unit
+            nonPoison := false
+            noUB := false
+          }
+        else
+          let stSort :=
+            match symExprScalarSort? stCleared normRet with
+            | some 0 => (stCleared.clearAlias accVar).markBoolVar accVar
+            | some 1 => (stCleared.clearAlias accVar).markU64Var accVar
+            | some 2 => (stCleared.clearAlias accVar).markU256Var accVar
+            | _ => stCleared.clearAlias accVar
+          stSort.bindVar accVar {
+            expr := normRet
+            nonPoison := stAfter.nonPoison
+            noUB := stAfter.noUB
+          }
+    symExecLoopUnroll n (curIdx + 1) idxVar accVar stNext execBody
 
-private def symExprMentionsHeapRoot (st : SymExecState) : SymExpr → Bool
-  | .symVar id => st.isHeapObjectRoot id
-  | .ite _ a b => symExprMentionsHeapRoot st a || symExprMentionsHeapRoot st b
-  | _ => false
-
-/-- Fuel-bounded symbolic execution of `LNIRCode`. -/
-def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNIRCode) :
-    SymExecState × SymExpr :=
+/-- Fuel-bounded symbolic execution of `LNIRCode` (`expandRetHeap = true` at declaration exit,
+    `false` inside `seqFor` step bodies so returned heap roots stay as unexpanded `.symVar`s). -/
+def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNIRCode)
+    (expandRetHeap : Bool := true) : SymExecState × SymExpr :=
   match fuel with
   | 0 => (st.markUnsupported, .unit)
   | fuel' + 1 =>
@@ -1940,7 +1993,7 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
           let condBadSort := condSort.isNone && !condIsTypedTuple && !condIsHeapPtr
           if condIsTypedTuple || condIsHeapPtr || rcPre.ubCond == .constBool false then
             let stBad := ((st.clearAlias dst).unmarkTypedTuple dst).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
-            symExecCode fuel' unrollBound stBad k
+            symExecCode fuel' unrollBound stBad k expandRetHeap
           else
             let stBase0 := if rcPre.unsupported || condBadSort then st.markUnsupported else st
             let stBase := stBase0.requireUbCond rcPre.ubCond
@@ -1951,17 +2004,17 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
             let stCond := ((stBase.clearAlias condTmp).markBoolVar condTmp).bindVar condTmp { rcPre.val with expr := cExprNorm, noUB := true }
             let stCondFinal := { stCond with ubCond := stBase.ubCond, noUB := stBase.noUB && rcPre.val.noUB }
             symExecCode fuel' unrollBound stCondFinal
-              (.ite condTmp (.letBind dst ty (.scalar tExp) k) (.letBind dst ty (.scalar eExp) k))
+              (.ite condTmp (.letBind dst ty (.scalar tExp) k) (.letBind dst ty (.scalar eExp) k)) expandRetHeap
         else
           let st0 := if callSlotKind ty == some false && root?.isNone then st.clearAlias dst else st
           let st1 := symEvalExpr st0 dst ty val
-          symExecCode fuel' unrollBound st1 k
+          symExecCode fuel' unrollBound st1 k expandRetHeap
       | .projTuple tupleVar idx =>
         let tRoot := st.resolveBuf tupleVar
         let tv := st.lookupVar tRoot
         if !(st.typedTuples.contains tRoot) || st.isDefinitelyHeapRoot tRoot then
           let st1 := symEvalExpr st dst ty val
-          symExecCode fuel' unrollBound st1 k
+          symExecCode fuel' unrollBound st1 k expandRetHeap
         else
         match tv.expr with
         | .tuple fs =>
@@ -1983,16 +2036,16 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
               let stCond := ((st.clearAlias condTmp).markBoolVar condTmp).bindVar condTmp { expr := cond, nonPoison := tv.nonPoison, noUB := tv.noUB }
               let (stWithT, codeT) := mkBranchBind tTmp tBranch stCond
               let (stWithTE, codeE) := mkBranchBind eTmp eBranch stWithT
-              symExecCode fuel' unrollBound stWithTE (.ite condTmp codeT codeE)
+              symExecCode fuel' unrollBound stWithTE (.ite condTmp codeT codeE) expandRetHeap
             else
               let st1 := symEvalExpr st dst ty val
-              symExecCode fuel' unrollBound st1 k
+              symExecCode fuel' unrollBound st1 k expandRetHeap
           | _ =>
             let st1 := symEvalExpr st dst ty val
-            symExecCode fuel' unrollBound st1 k
+            symExecCode fuel' unrollBound st1 k expandRetHeap
         | _ =>
           let st1 := symEvalExpr st dst ty val
-          symExecCode fuel' unrollBound st1 k
+          symExecCode fuel' unrollBound st1 k expandRetHeap
       | .ctorGetObj ctorVar idx | .ctorGetScalar ctorVar idx _ =>
         let rootVar := st.resolveBuf ctorVar
         let cv := st.lookupVar rootVar
@@ -2017,20 +2070,20 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
                 let stCond := ((st.clearAlias condTmp).markBoolVar condTmp).bindVar condTmp { expr := cond, nonPoison := cv.nonPoison, noUB := cv.noUB }
                 let (stWithT, codeT) := mkBranchBind tTmp tBranch stCond
                 let (stWithTE, codeE) := mkBranchBind eTmp eBranch stWithT
-                symExecCode fuel' unrollBound stWithTE (.ite condTmp codeT codeE)
+                symExecCode fuel' unrollBound stWithTE (.ite condTmp codeT codeE) expandRetHeap
               else
                 let st1 := symEvalExpr st dst ty val
-                symExecCode fuel' unrollBound st1 k
+                symExecCode fuel' unrollBound st1 k expandRetHeap
             | _ =>
               let st1 := symEvalExpr st dst ty val
-              symExecCode fuel' unrollBound st1 k
+              symExecCode fuel' unrollBound st1 k expandRetHeap
           | _ =>
             let st1 := symEvalExpr st dst ty val
-            symExecCode fuel' unrollBound st1 k
+            symExecCode fuel' unrollBound st1 k expandRetHeap
         else if st.sarrayVars.contains rootVar ||
            st.boolVars.contains rootVar || st.u64Vars.contains rootVar || st.u256Vars.contains rootVar then
           let st1 := symEvalExpr st dst ty val
-          symExecCode fuel' unrollBound st1 k
+          symExecCode fuel' unrollBound st1 k expandRetHeap
         else
         match cv.expr with
         | .tuple (_tag :: fs) =>
@@ -2056,20 +2109,20 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
             let stCond := ((stLive.clearAlias condTmp).markBoolVar condTmp).bindVar condTmp { expr := cond, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
             let (stWithT, codeT) := mkBranchBind tTmp tBranch stCond
             let (stWithTE, codeE) := mkBranchBind eTmp eBranch stWithT
-            symExecCode fuel' unrollBound stWithTE (.ite condTmp codeT codeE)
+            symExecCode fuel' unrollBound stWithTE (.ite condTmp codeT codeE) expandRetHeap
           | _ =>
             let st1 := symEvalExpr st dst ty val
-            symExecCode fuel' unrollBound st1 k
+            symExecCode fuel' unrollBound st1 k expandRetHeap
         | _ =>
           let st1 := symEvalExpr st dst ty val
-          symExecCode fuel' unrollBound st1 k
+          symExecCode fuel' unrollBound st1 k expandRetHeap
       | _ =>
         let st0 :=
           match val with
           | .scalar (.var _) => st
           | _ => if callSlotKind ty == some false then st.clearAlias dst else st
         let st1 := symEvalExpr st0 dst ty val
-        symExecCode fuel' unrollBound st1 k
+        symExecCode fuel' unrollBound st1 k expandRetHeap
     | .rawStore ptrVar idxVar valVar _elemTy k =>
       let idxSv := st.lookupVar idxVar
       let valSv := st.lookupVar valVar
@@ -2078,22 +2131,22 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
         ubCond := if idxSv.noUB && valSv.noUB then st1.ubCond else .constBool false
         noUB := st1.noUB && idxSv.noUB && valSv.noUB
         nonPoison := st1.nonPoison && idxSv.nonPoison && valSv.nonPoison }
-      symExecCode fuel' unrollBound st2 k
+      symExecCode fuel' unrollBound st2 k expandRetHeap
     | .incRef v count k =>
-      symExecCode fuel' unrollBound (st.updateRefCount v count true) k
+      symExecCode fuel' unrollBound (st.updateRefCount v count true) k expandRetHeap
     | .decRef v count k =>
-      symExecCode fuel' unrollBound (st.updateRefCount v count false) k
+      symExecCode fuel' unrollBound (st.updateRefCount v count false) k expandRetHeap
     | .ite condVar thenBranch elseBranch =>
       let condSv := st.lookupVar condVar
       match condSv.expr with
-      | .constBool true => symExecCode fuel' unrollBound st thenBranch
-      | .constBool false => symExecCode fuel' unrollBound st elseBranch
+      | .constBool true => symExecCode fuel' unrollBound st thenBranch expandRetHeap
+      | .constBool false => symExecCode fuel' unrollBound st elseBranch expandRetHeap
       | .constU64 v =>
-        if v != 0 then symExecCode fuel' unrollBound st thenBranch
-        else symExecCode fuel' unrollBound st elseBranch
+        if v != 0 then symExecCode fuel' unrollBound st thenBranch expandRetHeap
+        else symExecCode fuel' unrollBound st elseBranch expandRetHeap
       | .constU256 w =>
-        if w != UInt256.zero then symExecCode fuel' unrollBound st thenBranch
-        else symExecCode fuel' unrollBound st elseBranch
+        if w != UInt256.zero then symExecCode fuel' unrollBound st thenBranch expandRetHeap
+        else symExecCode fuel' unrollBound st elseBranch expandRetHeap
       | cExprRaw =>
         let condSort := symExprScalarSort? st cExprRaw
         let condIsTypedTuple :=
@@ -2131,8 +2184,8 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
                 | _ => (st, st)
               else (st, st)
             | _ => (st, st)
-          let (stT, retT) := symExecCode fuel' unrollBound stForT thenBranch
-          let (stE, retE) := symExecCode fuel' unrollBound stForE elseBranch
+          let (stT, retT) := symExecCode fuel' unrollBound stForT thenBranch expandRetHeap
+          let (stE, retE) := symExecCode fuel' unrollBound stForE elseBranch expandRetHeap
           let mergedVars : List (VarId × SymStateVal) :=
             ((stT.vars ++ stE.vars).map Prod.fst).eraseDups.map fun vid =>
               let svT := stT.lookupVar vid
@@ -2296,9 +2349,18 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
     | .seqFor idxVar _loVar _hiVar accVar accInit _accTy stepBody k =>
       let initRoot := st.resolveBuf accInit
       let initSv := st.lookupVar initRoot
-      let stInit0 := (st.aliasBuf accVar initRoot).bindVar accVar initSv
+      let stClearAcc := st.clearVarSortTags accVar
+      let stInit0 :=
+        if accVar == initRoot then stClearAcc
+        else (stClearAcc.aliasBuf accVar initRoot).bindVar accVar {
+          expr := if stClearAcc.isHeapObjectRoot initRoot then .symVar initRoot else initSv.expr
+          nonPoison := initSv.nonPoison
+          noUB := initSv.noUB }
       let stInit :=
-        if stInit0.isNeverScalarRef initRoot then stInit0
+        if stInit0.isNeverScalarRef initRoot then
+          if stInit0.allocRoots.contains initRoot || stInit0.objPtrVars.contains initRoot then stInit0.markObjPtrVar accVar
+          else if stInit0.sarrayVars.contains initRoot then stInit0.markSarrayVar accVar
+          else stInit0
         else if stInit0.typedTuples.contains initRoot || (match initSv.expr with | .tuple _ => true | _ => false) then
           stInit0.markTypedTuple accVar
         else
@@ -2307,21 +2369,21 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
           | some 1 => stInit0.markU64Var accVar
           | some 2 => stInit0.markU256Var accVar
           | _ => stInit0
-      let stAfterLoop := symExecLoopUnroll unrollBound 0 idxVar accVar (stInit.markU64Var idxVar)
-        (fun s => symExecCode fuel' unrollBound s stepBody)
-      symExecCode fuel' unrollBound stAfterLoop k
+      let stAfterLoop := symExecLoopUnroll unrollBound 0 idxVar accVar ((stInit.clearVarSortTags idxVar).markU64Var idxVar)
+        (fun s => symExecCode fuel' unrollBound s stepBody false)
+      symExecCode fuel' unrollBound stAfterLoop k expandRetHeap
     | .parFor outVar _lenVar inputs _elemTy _kernel k =>
       let stInputs := inputs.foldl (fun cur iv =>
         let r := cur.resolveBuf iv
         ((cur.noteExtRoot r).requireUbCond (cur.liveRcCond r)).noteExtLiveRoot r) st
-      let st1 := (stInputs.clearAlias outVar).markAllocated outVar
-      let st2 := st1.bindVar outVar { expr := .symVar outVar, nonPoison := true, noUB := true }
-      symExecCode fuel' unrollBound st2 k
+      let st1 := ((stInputs.clearAlias outVar).clearVarSortTags outVar).markAllocated outVar
+      let st2 := (st1.markSarrayVar outVar).bindVar outVar { expr := .symVar outVar, nonPoison := true, noUB := true }
+      symExecCode fuel' unrollBound st2 k expandRetHeap
     | .ret v =>
       let rRoot := st.resolveBuf v
       let rSv := st.lookupVar rRoot
       let retSeed : SymExpr :=
-        if st.allocRoots.contains rRoot then
+        if st.allocRoots.contains rRoot || (!expandRetHeap && st.isHeapObjectRoot rRoot) then
           .symVar rRoot
         else match rSv.expr with
           | .tuple _ =>
@@ -2330,7 +2392,9 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
             else
               rSv.expr
           | _ => rSv.expr
-      let finalExpr := normSymExpr (st.expandHeapExpr 16 retSeed)
+      let finalExpr :=
+        if expandRetHeap then normSymExpr (st.expandHeapExpr 16 retSeed)
+        else normSymExpr retSeed
       ({ st with
           noUB := st.noUB && rSv.noUB
           nonPoison := st.nonPoison && rSv.nonPoison }, finalExpr)
@@ -2425,7 +2489,7 @@ def symExecDecl (loopUnrollBound : Nat := 4) (d : LNIRDecl) (synBaseOverride? : 
       (acc.bindVar p.id { expr := .symVar p.id, nonPoison := true, noUB := true }, curSubId)
   ) ({ synVarBase := synBase + 4096 }, initTupleBase)
   let initState := { paramState with synVarBase := Nat.max (synBase + 4096) tupleEnd }
-  let (finalSt, retExpr) := symExecCode 256 loopUnrollBound initState d.body
+  let (finalSt, retExpr) := symExecCode 256 loopUnrollBound initState d.body true
   let rawWrites :=
     (finalSt.memWrites.filter fun (r, _, _) => !(finalSt.allocRoots.contains r)).mergeSort
       (fun (r1, i1, _) (r2, i2, _) => r1 < r2 || (r1 == r2 && reprStr i1 ≤ reprStr i2))
