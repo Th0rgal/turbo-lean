@@ -67,6 +67,7 @@ def run_c1_corpus(asan: bool, ubsan: bool) -> dict[str, Any]:
             "status": "incomplete_missing_engine",
             "asan": asan,
             "ubsan": ubsan,
+            "ubsanScope": "c_driver_and_link_runtime_only_not_llvm_ir" if ubsan else "disabled",
             "tests": list(C1_CORPUS_TESTS),
             "engines": {
                 "stock_lean_c": engines["stock_lean_c"],
@@ -95,6 +96,7 @@ def run_c1_corpus(asan: bool, ubsan: bool) -> dict[str, Any]:
         "testCount": len(C1_CORPUS_TESTS),
         "asan": asan,
         "ubsan": ubsan,
+        "ubsanScope": "c_driver_and_link_runtime_only_not_llvm_ir" if ubsan else "disabled",
         "returncode": res.returncode,
         "stderrTail": (res.stderr or "")[-1200:],
     }
@@ -112,8 +114,12 @@ def main() -> int:
         default=None,
         help="Comma-separated conformance tiers (C1,C2,C3,C4). Default: C4; C2/C3 fail closed until wired.",
     )
-    parser.add_argument("--asan", action="store_true", help="Enable AddressSanitizer on compiled LLVM binaries")
-    parser.add_argument("--ubsan", action="store_true", help="Enable UndefinedBehaviorSanitizer on compiled LLVM binaries")
+    parser.add_argument("--asan", action="store_true", help="Instrument compiled LLVM IR + C driver with AddressSanitizer")
+    parser.add_argument(
+        "--ubsan",
+        action="store_true",
+        help="Instrument C driver and link runtime with UndefinedBehaviorSanitizer (pre-emitted LLVM IR is not UBSan-instrumented)",
+    )
     args = parser.parse_args()
 
     failures: list[dict[str, Any]] = []
@@ -178,6 +184,7 @@ def main() -> int:
         "tierResults": tier_results,
         "asan": args.asan,
         "ubsan": args.ubsan,
+        "ubsanScope": "c_driver_and_link_runtime_only_not_llvm_ir" if args.ubsan else "disabled",
         "scope": "scalar_three_engine_and_separate_certificate_plugin_gates",
         "fullRoadmapAccepted": False,
         "missingCoverage": ["alias_RC_seqFor_llvm", "upstream_lean4_run_250", "tier_C2_ecosystem_packages", "tier_C3_con_leche_holdouts", "target_qualification"],

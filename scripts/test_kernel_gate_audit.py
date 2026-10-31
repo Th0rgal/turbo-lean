@@ -63,10 +63,14 @@ def lean_env() -> dict[str, str]:
     return env
 
 
-@unittest.skipUnless(ZYGOTE.is_file(), "turbo-zygote not built")
 class KernelGateAudit(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        if not (ZYGOTE.is_file() and os.access(ZYGOTE, os.X_OK)):
+            raise RuntimeError(
+                f"Required kernel gate binary missing or not executable: {ZYGOTE} "
+                "(build with `(cd lean && lake build turbo-zygote)`)"
+            )
         cls.tmp = Path(tempfile.mkdtemp(prefix="kgate-"))
         out = cls.tmp / "out"
         out.mkdir()

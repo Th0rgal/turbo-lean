@@ -438,7 +438,42 @@ def sanitizer_flag_list(asan: bool, ubsan: bool) -> list[str]:
 
 
 def instrument_llvm_ir_for_asan(ir_text: str) -> str:
-    return re.sub(r"^(attributes #[01] = \{ )", r"\1sanitize_address ", ir_text, flags=re.M)
+    define_headers = re.findall(r"^define\b[^\n{]*\{", ir_text, flags=re.M)
+    if not define_headers:
+        raise RuntimeError("ASan instrumentation refused: LLVM IR module contains zero function definitions")
+
+    needed_groups: set[str] = set()
+    bare_defines = 0
+    for idx, hdr in enumerate(define_headers):
+        m = re.search(r"#(\d+)\s*\{$", hdr)
+        if m:
+            needed_groups.add(m.group(1))
+        elif not re.search(r"\bsanitize_address\b", hdr):
+            bare_defines += 1
+
+    out_lines: list[str] = []
+    seen_groups: set[str] = set()
+    for line in ir_text.splitlines():
+        gm = re.match(r"^(attributes #(\d+)\s*=\s*\{)(.*)(\}\s*)$", line)
+        if gm:
+            gid = gm.group(2)
+            seen_groups.add(gid)
+            body = gm.group(3)
+            if gid in needed_groups and not re.search(r"\bsanitize_address\b", body):
+                stripped = body.strip()
+                body = f" sanitize_address {stripped} " if stripped else " sanitize_address "
+                line = f"{gm.group(1)}{body}{gm.group(4)}"
+        elif re.match(r"^define\b", line) and not re.search(r"#\d+\s*\{", line) and not re.search(r"\bsanitize_address\b", line):
+            line = re.sub(r"\{\s*$", "sanitize_address {", line, count=1)
+        out_lines.append(line)
+
+    missing_groups = sorted(needed_groups - seen_groups)
+    if missing_groups:
+        raise RuntimeError(f"ASan instrumentation refused: missing LLVM attribute groups #{', #'.join(missing_groups)}")
+    instrumented = "\n".join(out_lines) + ("\n" if ir_text.endswith("\n") else "")
+    if (needed_groups or bare_defines) and "sanitize_address" not in instrumented:
+        raise RuntimeError("ASan instrumentation failed to inject sanitize_address into LLVM IR")
+    return instrumented
 
 
 def find_sanitizer_linker(clang_bin: str | None, extra_inc: list[str], asan: bool, ubsan: bool) -> str | None:
@@ -447,9 +482,27 @@ def find_sanitizer_linker(clang_bin: str | None, extra_inc: list[str], asan: boo
         return clang_bin
     with tempfile.TemporaryDirectory(prefix="turbo_san_probe_") as tmp:
         probe_dir = Path(tmp)
+        probe_ll = probe_dir / "probe.ll"
         probe_c = probe_dir / "probe.c"
+        probe_obj = probe_dir / "probe.san.o"
         probe_bin = probe_dir / "probe"
-        probe_c.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+        raw_ll = (
+            "define dso_local i64 @turbo_san_probe_fn(i64 %x) #0 {\n"
+            "entry:\n"
+            "  %slot = alloca [2 x i64], align 8\n"
+            "  store i64 %x, ptr %slot, align 8\n"
+            "  %v = load i64, ptr %slot, align 8\n"
+            "  ret i64 %v\n"
+            "}\n"
+            "attributes #0 = { nounwind uwtable }\n"
+        )
+        probe_ll.write_text(instrument_llvm_ir_for_asan(raw_ll) if asan else raw_ll, encoding="utf-8")
+        probe_c.write_text(
+            "#include <stdint.h>\n"
+            "extern uint64_t turbo_san_probe_fn(uint64_t);\n"
+            "int main(void) { return turbo_san_probe_fn(42ULL) == 42ULL ? 0 : 1; }\n",
+            encoding="utf-8",
+        )
         cands = [
             clang_bin,
             "/usr/bin/clang",
@@ -458,6 +511,11 @@ def find_sanitizer_linker(clang_bin: str | None, extra_inc: list[str], asan: boo
             shutil.which("gcc"),
             "/usr/bin/gcc",
         ]
+        probe_env = dict(os.environ)
+        if asan:
+            probe_env["ASAN_OPTIONS"] = "detect_leaks=0:abort_on_error=1:halt_on_error=1"
+        if ubsan:
+            probe_env["UBSAN_OPTIONS"] = "print_stacktrace=1:halt_on_error=1"
         seen: set[str] = set()
         for cand in cands:
             if not cand or cand in seen:
@@ -465,19 +523,27 @@ def find_sanitizer_linker(clang_bin: str | None, extra_inc: list[str], asan: boo
             seen.add(cand)
             if not (Path(cand).is_file() and os.access(cand, os.X_OK)):
                 continue
-            inc = extra_inc if cand == clang_bin else []
-            res = subprocess.run(
-                [cand, "-O1", *inc, *san_flags, str(probe_c), "-o", str(probe_bin)],
-                capture_output=True,
-                text=True,
-            )
-            if res.returncode == 0 and probe_bin.is_file():
-                run = subprocess.run(
-                    [str(probe_bin)],
-                    env={**os.environ, "ASAN_OPTIONS": "detect_leaks=0:abort_on_error=1:halt_on_error=1"},
+            if cand == clang_bin:
+                res = subprocess.run(
+                    [clang_bin, "-O1", "-g", "-Wno-override-module", *extra_inc, *san_flags, str(probe_ll), str(probe_c), "-o", str(probe_bin)],
                     capture_output=True,
                     text=True,
                 )
+            else:
+                comp = subprocess.run(
+                    [clang_bin, "-O1", "-g", "-Wno-override-module", *extra_inc, *san_flags, "-c", str(probe_ll), "-o", str(probe_obj)],
+                    capture_output=True,
+                    text=True,
+                )
+                if comp.returncode != 0 or not probe_obj.is_file():
+                    continue
+                res = subprocess.run(
+                    [cand, "-O1", "-g", *san_flags, str(probe_obj), str(probe_c), "-o", str(probe_bin)],
+                    capture_output=True,
+                    text=True,
+                )
+            if res.returncode == 0 and probe_bin.is_file():
+                run = subprocess.run([str(probe_bin)], env=probe_env, capture_output=True, text=True)
                 if run.returncode == 0:
                     return cand
     return None
@@ -501,7 +567,14 @@ def compile_and_link_llvm_driver(
             capture_output=True,
             text=True,
         )
-        return {"asan": False, "ubsan": False, "compiler": clang_bin, "linker": clang_bin}
+        return {
+            "asan": False,
+            "ubsan": False,
+            "ubsan_scope": "disabled",
+            "compiled_llvm_ir_sha256": sha256_bytes(ll_path.read_bytes()),
+            "compiler": clang_bin,
+            "linker": clang_bin,
+        }
 
     linker = sanitizer_linker or find_sanitizer_linker(clang_bin, extra_inc, asan, ubsan)
     if not linker:
@@ -534,7 +607,14 @@ def compile_and_link_llvm_driver(
             capture_output=True,
             text=True,
         )
-    return {"asan": asan, "ubsan": ubsan, "compiler": clang_bin, "linker": linker}
+    return {
+        "asan": asan,
+        "ubsan": ubsan,
+        "ubsan_scope": "c_driver_and_link_runtime_only_not_llvm_ir" if ubsan else "disabled",
+        "compiled_llvm_ir_sha256": sha256_bytes(compile_ll_path.read_bytes()),
+        "compiler": clang_bin,
+        "linker": linker,
+    }
 
 
 def probe_engines(
@@ -803,6 +883,7 @@ def run_three_way_batch(
             "stock_runtime": "stock lean -c + leanc (full generated C, no replacements)",
             "lnir_wire_sha256": sha256_bytes(wire_path.read_bytes()),
             "llvm_ir_sha256": sha256_bytes(ll_path.read_bytes()),
+            "compiled_llvm_ir_sha256": san_meta["compiled_llvm_ir_sha256"],
             "stock_binary_sha256": sha256_bytes(stock_bin_path.read_bytes()),
             "leannative_binary_sha256": sha256_bytes(ln_bin_path.read_bytes()),
             "sanitizers": san_meta,
@@ -864,10 +945,11 @@ def run_fuzzer(
             "seeds": n,
             "checked": 0,
             "mismatch_count": 0,
-            "rc_leak_count": None,
-            "asan": asan,
-            "ubsan": ubsan,
-            "coverage": "scalar_only_no_alias_rc_or_seqFor",
+                "rc_leak_count": None,
+                "asan": asan,
+                "ubsan": ubsan,
+                "ubsan_scope": "c_driver_and_link_runtime_only_not_llvm_ir" if ubsan else "disabled",
+                "coverage": "scalar_only_no_alias_rc_or_seqFor",
             "parity": "incomplete",
             "engines": {
                 "stock_lean_c": engines["stock_lean_c"],
@@ -905,6 +987,7 @@ def run_fuzzer(
         "rc_leak_count": None,
         "asan": asan,
         "ubsan": ubsan,
+        "ubsan_scope": "c_driver_and_link_runtime_only_not_llvm_ir" if ubsan else "disabled",
         "interpreter_live_objects": batch_res.get("live_objects"),
         "parity": "100%" if (parity_ok and n > 0) else f"{checked - mismatches}/{checked}",
         "engines": {
@@ -923,8 +1006,12 @@ def main() -> int:
     ap.add_argument("--seeds", type=int, default=64, help="Number of deterministic seeds")
     ap.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     ap.add_argument("--mutate-engine", type=str, default=None, help="Inject mutation into stock_lean_c|lnir_eval|c_abi_llvm")
-    ap.add_argument("--asan", action="store_true", help="Instrument compiled LLVM binaries with AddressSanitizer")
-    ap.add_argument("--ubsan", action="store_true", help="Instrument compiled LLVM binaries with UndefinedBehaviorSanitizer")
+    ap.add_argument("--asan", action="store_true", help="Instrument compiled LLVM IR + C driver with AddressSanitizer")
+    ap.add_argument(
+        "--ubsan",
+        action="store_true",
+        help="Instrument C driver and link runtime with UndefinedBehaviorSanitizer (pre-emitted LLVM IR is not UBSan-instrumented)",
+    )
     args = ap.parse_args()
     report = run_fuzzer(args.seeds, mutate_engine=args.mutate_engine, asan=args.asan, ubsan=args.ubsan)
     if args.json:

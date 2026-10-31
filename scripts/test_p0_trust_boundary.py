@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import time
@@ -673,23 +674,62 @@ class TestP0TrustBoundary(unittest.TestCase):
 
         engines = fuzzer.probe_engines(asan=True, ubsan=True)
         self.assertTrue(engines["c_abi_llvm"], engines)
+
+        # Fail closed when LLVM IR has zero definitions or references an undefined attribute group,
+        # handle non-#0/#1 attribute groups, and stay idempotent when sanitize_address is already present.
+        with self.assertRaises(RuntimeError):
+            fuzzer.instrument_llvm_ir_for_asan("; empty module\n")
+        with self.assertRaises(RuntimeError):
+            fuzzer.instrument_llvm_ir_for_asan("define i64 @f() #7 {\n  ret i64 0\n}\n")
+        inst_custom = fuzzer.instrument_llvm_ir_for_asan(
+            "define dso_local i64 @g() #3 {\n  ret i64 0\n}\n"
+            "define dso_local i64 @bare() {\n  ret i64 1\n}\n"
+            "attributes #3 = {nounwind}\n"
+        )
+        self.assertIn("attributes #3 = { sanitize_address nounwind }", inst_custom)
+        self.assertIn("define dso_local i64 @bare() sanitize_address {", inst_custom)
+        self.assertEqual(fuzzer.instrument_llvm_ir_for_asan(inst_custom).count("sanitize_address"), 2)
+
         with tempfile.TemporaryDirectory(prefix="p0_san_kill_") as tmp:
             p = Path(tmp)
             ll = p / "oob.ll"
             c = p / "driver.c"
             b = p / "oob_runner"
             ll.write_text(
-                "define dso_local i64 @oob_read(i64 %idx) #0 {\n"
+                "define dso_local i64 @oob_read(i64 %idx) #2 {\n"
                 "entry:\n"
                 "  %arr = alloca [2 x i64], align 8\n"
                 "  %ptr = getelementptr [2 x i64], ptr %arr, i64 0, i64 %idx\n"
                 "  %v = load volatile i64, ptr %ptr, align 8\n"
                 "  ret i64 %v\n"
                 "}\n"
-                "attributes #0 = { nounwind uwtable }\n",
+                "attributes #2 = {nounwind uwtable}\n",
                 encoding="utf-8",
             )
             c.write_text(
+                "#include <stdint.h>\n#include <stdio.h>\n"
+                "extern uint64_t oob_read(uint64_t);\n"
+                "int main(void) {\n"
+                "  volatile int shift = 70;\n"
+                "  int ub = 1 << shift;\n"
+                "  printf(\"%d %llu\\n\", ub, (unsigned long long)oob_read(2));\n"
+                "  return 0;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            san_meta = fuzzer.compile_and_link_llvm_driver(
+                clang_bin=engines["clang_bin"],
+                extra_inc=fuzzer.clang_extra_flags(engines["clang_bin"]),
+                ll_path=ll,
+                driver_c_path=c,
+                out_bin_path=b,
+                asan=True,
+                ubsan=False,
+                sanitizer_linker=engines["sanitizer_linker"],
+            )
+            self.assertEqual(san_meta["ubsan_scope"], "disabled")
+            c_no_ub = p / "driver_asan.c"
+            c_no_ub.write_text(
                 "#include <stdint.h>\n#include <stdio.h>\n"
                 "extern uint64_t oob_read(uint64_t);\n"
                 "int main(void) { printf(\"%llu\\n\", (unsigned long long)oob_read(2)); return 0; }\n",
@@ -699,10 +739,10 @@ class TestP0TrustBoundary(unittest.TestCase):
                 clang_bin=engines["clang_bin"],
                 extra_inc=fuzzer.clang_extra_flags(engines["clang_bin"]),
                 ll_path=ll,
-                driver_c_path=c,
+                driver_c_path=c_no_ub,
                 out_bin_path=b,
                 asan=True,
-                ubsan=True,
+                ubsan=False,
                 sanitizer_linker=engines["sanitizer_linker"],
             )
             crash = subprocess.run(
@@ -713,6 +753,62 @@ class TestP0TrustBoundary(unittest.TestCase):
             )
             self.assertNotEqual(crash.returncode, 0, "ASan must abort on out-of-bounds LLVM alloca read")
             self.assertIn("AddressSanitizer", crash.stderr)
+
+            ub_bin = p / "ub_runner"
+            ub_ll = p / "noop.ll"
+            ub_ll.write_text(
+                "define dso_local i64 @oob_read(i64 %idx) #0 {\n"
+                "entry:\n"
+                "  ret i64 %idx\n"
+                "}\n"
+                "attributes #0 = { nounwind uwtable }\n",
+                encoding="utf-8",
+            )
+            ub_meta = fuzzer.compile_and_link_llvm_driver(
+                clang_bin=engines["clang_bin"],
+                extra_inc=fuzzer.clang_extra_flags(engines["clang_bin"]),
+                ll_path=ub_ll,
+                driver_c_path=c,
+                out_bin_path=ub_bin,
+                asan=False,
+                ubsan=True,
+            )
+            self.assertEqual(ub_meta["ubsan_scope"], "c_driver_and_link_runtime_only_not_llvm_ir")
+            ub_crash = subprocess.run(
+                [str(ub_bin)],
+                env={**os.environ, "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=1"},
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(ub_crash.returncode, 0, "UBSan must abort on C driver shift UB")
+
+        # End-to-end propagation: an ASan abort in the compiled LLVM binary must fail run_fuzzer / run_conformance_suite.
+        orig_instrument_asan = fuzzer.instrument_llvm_ir_for_asan
+
+        def _inject_oob_ir(ir_text: str) -> str:
+            base = orig_instrument_asan(ir_text)
+            if "@fuzz_seed_0" not in base:
+                return base
+            patched, n_repl = re.subn(
+                r"(^define\b[^\n]*@fuzz_seed_0\([^\n{]*\{\nentry:\n)",
+                r"\1  %bad_arr = alloca [2 x i64], align 8\n"
+                r"  %bad_idx_slot = alloca i64, align 8\n"
+                r"  store volatile i64 2, ptr %bad_idx_slot, align 8\n"
+                r"  %bad_idx = load volatile i64, ptr %bad_idx_slot, align 8\n"
+                r"  %bad_ptr = getelementptr [2 x i64], ptr %bad_arr, i64 0, i64 %bad_idx\n"
+                r"  %bad_ld = load volatile i64, ptr %bad_ptr, align 8\n",
+                base,
+                count=1,
+                flags=re.M,
+            )
+            self.assertEqual(n_repl, 1, "Failed to inject OOB read into @fuzz_seed_0")
+            return patched
+
+        with patch.object(fuzzer, "instrument_llvm_ir_for_asan", side_effect=_inject_oob_ir):
+            failed_fuzz = fuzzer.run_fuzzer(1, asan=True, ubsan=False)
+            self.assertFalse(failed_fuzz["ok"], failed_fuzz)
+            self.assertEqual(failed_fuzz["checked"], 0)
+            self.assertTrue(failed_fuzz["shrunk_failures"])
 
 
 if __name__ == "__main__":

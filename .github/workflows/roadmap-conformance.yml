@@ -62,9 +62,9 @@ jobs:
           echo "${GITHUB_WORKSPACE}/lean/.lake/build/bin" >> "$GITHUB_PATH"
           (cd lean && "$HOME/.elan/bin/lean" --version)
 
-      - name: Build LeanNative binaries and turbo-lean CLI
+      - name: Build LeanNative binaries, turbo-zygote, and turbo-lean CLI
         run: |
-          (cd lean && lake build lean-native lean-native-core)
+          (cd lean && lake build lean-native lean-native-core turbo-zygote)
           cargo build --release -p turbo-lean
 
       - name: Run Contract V5 checklist & 3-way ASan/UBSan conformance gate

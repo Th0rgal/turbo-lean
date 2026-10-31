@@ -27,14 +27,24 @@ TURBO_BIN="${TURBO_AUDITOR_BIN:-$ROOT_DIR/target/release/turbo-lean}"
 if [ ! -x "$TURBO_BIN" ]; then
   TURBO_BIN="$(command -v turbo-lean || true)"
 fi
+FULL_BIN="$ROOT_DIR/lean/.lake/build/bin/lean-native"
 CORE_BIN="$ROOT_DIR/lean/.lake/build/bin/lean-native-core"
+ZYGOTE_BIN="$ROOT_DIR/lean/.lake/build/bin/turbo-zygote"
 
 if [ -z "$TURBO_BIN" ]; then
   echo "[FAIL] turbo-lean binary not found on PATH" >&2
   exit 1
 fi
+if [ ! -x "$FULL_BIN" ]; then
+  echo "[FAIL] $FULL_BIN not found; build with (cd lean && lake build lean-native)" >&2
+  exit 1
+fi
 if [ ! -x "$CORE_BIN" ]; then
   echo "[FAIL] $CORE_BIN not found; build with (cd lean && lake build lean-native-core)" >&2
+  exit 1
+fi
+if [ ! -x "$ZYGOTE_BIN" ]; then
+  echo "[FAIL] $ZYGOTE_BIN not found; build with (cd lean && lake build turbo-zygote)" >&2
   exit 1
 fi
 
