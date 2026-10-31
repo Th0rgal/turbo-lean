@@ -1613,6 +1613,14 @@ pub(crate) fn ensure_zygote_binary(
     lean_bin: &Path,
     env_vars: &std::collections::HashMap<String, String>,
 ) -> Result<std::path::PathBuf> {
+    ensure_zygote_binary_at(&store.root, lean_bin, env_vars)
+}
+
+fn ensure_zygote_binary_at(
+    store_root: &Path,
+    lean_bin: &Path,
+    env_vars: &std::collections::HashMap<String, String>,
+) -> Result<std::path::PathBuf> {
     let _lifecycle = lifecycle_lock(false)?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"turbo-zygote:v3:shared:");
@@ -1623,7 +1631,7 @@ pub(crate) fn ensure_zygote_binary(
     }
     hasher.update(ZYGOTE_WORKER_LEAN_SRC.as_bytes());
     let bin_name = format!("turbo_zygote_{}", &hasher.finalize().to_hex()[..16]);
-    let bin_dir = store.root.join("fastcheck_bins");
+    let bin_dir = store_root.join("fastcheck_bins");
     fs::create_dir_all(&bin_dir)?;
     let cached_bin = bin_dir.join(&bin_name);
     if cached_bin.exists() {
@@ -2147,7 +2155,31 @@ pub(crate) fn run_audited_lean_shard(
             || tmp_dir.display().to_string(),
             |lp| format!("{}:{}", tmp_dir.display(), lp),
         );
-    let mut auditor = Command::new(ensure_zygote_binary(store, lean_bin, env_vars)?);
+    // A request budget bounds the whole fallback: compile, auditor preparation and audit.
+    let budget_left = |stage: &str| -> Result<Option<std::time::Duration>> {
+        timeout_ms
+            .map(|ms| {
+                let left = std::time::Duration::from_millis(ms).saturating_sub(started.elapsed());
+                anyhow::ensure!(!left.is_zero(), "Lean request timed out before {}", stage);
+                Ok(left)
+            })
+            .transpose()
+    };
+    let zygote_bin = match budget_left("the shard auditor was ready")? {
+        None => ensure_zygote_binary(store, lean_bin, env_vars)?,
+        // A cold auditor build may outlive the request; it still warms the cache in the background.
+        Some(left) => {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (root, lean, env) = (store.root.clone(), lean_bin.to_path_buf(), env_vars.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(ensure_zygote_binary_at(&root, &lean, &env));
+            });
+            rx.recv_timeout(left).map_err(|_| {
+                anyhow::anyhow!("Lean request timed out before the shard auditor was ready")
+            })??
+        }
+    };
+    let mut auditor = Command::new(zygote_bin);
     auditor
         .envs(env_vars)
         .env("LEAN", lean_bin)
@@ -2160,7 +2192,11 @@ pub(crate) fn run_audited_lean_shard(
     if let Some(dir) = cwd {
         prefix_cmd.current_dir(dir);
     }
-    if let Some(p) = prefix_cmd.output().ok().filter(|p| p.status.success()) {
+    let prefix_out = match budget_left("the toolchain prefix query")? {
+        None => prefix_cmd.output().ok(),
+        Some(left) => run_lean_command(&mut prefix_cmd, Some(left.as_millis().max(1) as u64)).ok(),
+    };
+    if let Some(p) = prefix_out.filter(|p| p.status.success()) {
         let prefix = PathBuf::from(String::from_utf8_lossy(&p.stdout).trim());
         let mut ld = format!(
             "{}:{}",
@@ -2201,13 +2237,7 @@ pub(crate) fn run_audited_lean_shard(
             .filter(|&v| v > 0)
             .unwrap_or(300),
     );
-    // A request budget bounds the whole fallback (compile, auditor preparation and audit).
-    if let Some(ms) = timeout_ms {
-        let left = std::time::Duration::from_millis(ms).saturating_sub(started.elapsed());
-        anyhow::ensure!(
-            !left.is_zero(),
-            "Lean request timed out before the shard audit"
-        );
+    if let Some(left) = budget_left("the shard audit")? {
         audit_timeout = audit_timeout.min(left);
     }
     let audit_out =
@@ -4561,6 +4591,20 @@ mod tests {
             "{:?}",
             late
         );
+        // Auditor preparation (a cold auditor build in a fresh store) stays within the budget.
+        let cold = TurboStore::open(Some(&dir.join("cold-store")))?;
+        let t0 = std::time::Instant::now();
+        let _ = run_audited_lean_shard(
+            &cold,
+            Path::new("lean"),
+            &env,
+            Some(&dir),
+            "theorem tgt : 1 = 1 := rfl\n",
+            &audit,
+            &[],
+            Some(3_000),
+        );
+        assert!(t0.elapsed() < std::time::Duration::from_secs(15));
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
