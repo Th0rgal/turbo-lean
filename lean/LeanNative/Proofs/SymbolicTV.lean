@@ -319,6 +319,8 @@ structure SymExecState where
   nonPoison     : Bool := true
   reachable     : Bool := true
   symUnsupported : Bool := false
+  /-- Symbolic-execution or RC-tracking fuel ran out (HEAPOBJ_CONTRACT C6.1/C6.2): never bypassed by identity. -/
+  symExhausted  : Bool := false
   deriving Repr, Inhabited, BEq
 
 namespace SymExecState
@@ -360,6 +362,10 @@ def lookupExtRcDeltaBound (st : SymExecState) (root : VarId) : Nat :=
 
 def markUnsupported (st : SymExecState) : SymExecState :=
   { st with symUnsupported := true, noUB := false, nonPoison := false }
+
+/-- Incomplete analysis (fuel / RC-tracking exhaustion): unsupported **and** exhausted (C6). -/
+def markExhausted (st : SymExecState) : SymExecState :=
+  { st.markUnsupported with symExhausted := true }
 
 def addExtRcDelta (st : SymExecState) (bufVar : VarId) (count : Nat) (inc : Bool) : SymExecState :=
   let root := st.resolveBuf bufVar
@@ -596,7 +602,7 @@ def isImmediateScalarObj (st : SymExecState) (bufVar : VarId) : Bool :=
     | _ => false
 
 def updateRefCountFuel : Nat → SymExecState → Nat → Nat → Bool → SymExecState
-  | 0, st, _, _, _ => st.markUnsupported
+  | 0, st, _, _, _ => st.markExhausted
   | fuel + 1, st, v, count, inc =>
     let root := st.resolveBuf v
     if st.isImmediateScalarObj root || st.typedTuples.contains root ||
@@ -1986,6 +1992,7 @@ structure SymExecSummary where
   noUB           : Bool
   nonPoison      : Bool
   symUnsupported : Bool
+  symExhausted   : Bool
   retVal         : SymExpr
   jointHeap      : SymExpr
   rcDeltas       : List (VarId × SymExpr)
@@ -2070,7 +2077,7 @@ def symExecLoopUnroll (unrollCount : Nat) (curIdx : Nat) (idxVar accVar : VarId)
 def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNIRCode)
     (expandRetHeap : Bool := true) : SymExecState × SymExpr :=
   match fuel with
-  | 0 => (st.markUnsupported, .unit)
+  | 0 => (st.markExhausted, .unit)
   | fuel' + 1 =>
     match code with
     | .letBind dst ty val k =>
@@ -2468,6 +2475,7 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
             nonPoison := st.nonPoison && condSv.nonPoison && (!stT.reachable || stT.nonPoison) && (!stE.reachable || stE.nonPoison)
             reachable := stT.reachable || stE.reachable
             symUnsupported := st.symUnsupported || (stT.reachable && stT.symUnsupported) || (stE.reachable && stE.symUnsupported)
+            symExhausted := st.symExhausted || stT.symExhausted || stE.symExhausted
             memWrites := mergedWrites
           }
           let mergedRet :=
@@ -2663,6 +2671,7 @@ def symExecDecl (loopUnrollBound : Nat := 4) (d : LNIRDecl) (synBaseOverride? : 
     noUB := finalSt.noUB
     nonPoison := finalSt.nonPoison
     symUnsupported := finalSt.symUnsupported
+    symExhausted := finalSt.symExhausted
     retVal := canonRet
     jointHeap := jointHeapSummary
     rcDeltas := nonAllocRcDeltas
@@ -2880,7 +2889,9 @@ def validateTranslationDecl (src tgt : LNIRDecl) (numSamples : Nat := 64) : TVDe
   let symUbImplies : Bool :=
     tcUb == .constBool true || scUb == .constBool false || scUb == tcUb ||
       normSymExpr (SymExecState.hoistIteTupleFuel 16 (normSymIteStep scUb tcUb (.constBool true))) == .constBool true
-  let symSupportedOk := isIdenticalDecl || (!sSrc.symUnsupported && !sTgt.symUnsupported)
+  -- C6.1/C6.2: exhaustion is an incomplete analysis on either side, never excused by syntactic identity
+  let symSupportedOk := !sSrc.symExhausted && !sTgt.symExhausted &&
+    (isIdenticalDecl || (!sSrc.symUnsupported && !sTgt.symUnsupported))
   let ubRefines := symSupportedOk && (!sSrc.noUB || sTgt.noUB) && symUbImplies
   -- 2. Return domain / reachability equivalence on defined source paths (`scUb → (sSrc.reachCond == sTgt.reachCond)`)
   let domainEquiv :=
