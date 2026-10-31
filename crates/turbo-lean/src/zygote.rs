@@ -5661,6 +5661,7 @@ mod tests {
             let _ = child.wait();
             ZygoteWorkerProcess {
                 child,
+                _owner: std::sync::mpsc::channel().0,
                 stdin,
                 stdout,
                 stderr_tail,

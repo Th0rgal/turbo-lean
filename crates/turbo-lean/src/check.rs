@@ -1186,10 +1186,7 @@ fn check_directory(
                     cmd.arg(arg);
                 }
                 let cross_out = crate::zygote::run_lean_command(
-                    &mut cmd
-                        .arg(&tmp_cross)
-                        .current_dir(canon_dir)
-                        .envs(&env_vars),
+                    cmd.arg(&tmp_cross).current_dir(canon_dir).envs(&env_vars),
                     Some(crate::zygote::remaining_timeout_ms(None, *t0)),
                 )?;
                 let _ = fs::remove_file(&tmp_cross);
@@ -1299,8 +1296,7 @@ fn check_directory(
                                                 cmd.arg(arg);
                                             }
                                             let out = crate::zygote::run_lean_command(
-                                                &mut cmd
-                                                    .arg(&tmp_batch)
+                                                cmd.arg(&tmp_batch)
                                                     .current_dir(canon_ref)
                                                     .envs(env_ref),
                                                 Some(crate::zygote::remaining_timeout_ms(
@@ -1328,10 +1324,7 @@ fn check_directory(
                                         cmd.arg(arg);
                                     }
                                     let out = crate::zygote::run_lean_command(
-                                        &mut cmd
-                                            .arg(&tmp_batch)
-                                            .current_dir(canon_ref)
-                                            .envs(env_ref),
+                                        cmd.arg(&tmp_batch).current_dir(canon_ref).envs(env_ref),
                                         Some(crate::zygote::remaining_timeout_ms(None, *t0)),
                                     )?;
                                     let _ = fs::remove_file(&tmp_batch);
@@ -2680,8 +2673,7 @@ fn check_single_decl(
                         cmd.arg(arg);
                     }
                     let out = crate::zygote::run_lean_command(
-                        &mut cmd
-                            .arg(&tmp_shard)
+                        cmd.arg(&tmp_shard)
                             .current_dir(canon_dir)
                             .envs(&env_vars)
                             .env("LEAN_STACK_SIZE_KB", default_stack),
@@ -3298,8 +3290,7 @@ fn check_single_file(
                         cmd.arg(arg);
                     }
                     let batch_out = crate::zygote::run_lean_command(
-                        &mut cmd
-                            .arg(&tmp_coalesced)
+                        cmd.arg(&tmp_coalesced)
                             .current_dir(canon_dir)
                             .envs(&env_vars),
                         Some(crate::zygote::remaining_timeout_ms(None, *t0)),
@@ -3458,7 +3449,7 @@ fn check_single_file(
                                 {
                                     cmd.arg(arg);
                                 }
-                                let out = crate::zygote::run_lean_command(&mut cmd
+                                let out = crate::zygote::run_lean_command(cmd
                                     .arg(&tmp_shard)
                                     .current_dir(canon_ref)
                                     .envs(env_ref), Some(crate::zygote::remaining_timeout_ms(None, *t0)))
@@ -3581,10 +3572,7 @@ fn check_single_file(
                 );
             }
         }
-        if !fast_verified_batch
-            && remote_http.is_none()
-            && !crate::zygote::daemon_disabled()
-        {
+        if !fast_verified_batch && remote_http.is_none() && !crate::zygote::daemon_disabled() {
             let ev = if env_vars.is_empty() {
                 resolve_lake_env(store, canon_dir)
                     .map(|(m, _)| m)
@@ -3650,8 +3638,7 @@ fn check_single_file(
                 cmd.arg(arg);
             }
             let out = crate::zygote::run_lean_command(
-                &mut cmd
-                    .arg(canon_resolved_initial)
+                cmd.arg(canon_resolved_initial)
                     .current_dir(canon_dir)
                     .envs(&env_vars),
                 Some(crate::zygote::remaining_timeout_ms(None, *t0)),
@@ -3736,10 +3723,7 @@ fn check_single_file(
                 );
             }
         }
-        if remote_http.is_none()
-            && !verified_via_zygote_eval
-            && !crate::zygote::daemon_disabled()
-        {
+        if remote_http.is_none() && !verified_via_zygote_eval && !crate::zygote::daemon_disabled() {
             pack::warm_local_zygote_daemon_nonblocking(store, &env_vars);
         }
         Ok(out_json)
