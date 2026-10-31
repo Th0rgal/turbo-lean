@@ -2352,13 +2352,6 @@ fn check_single_decl(
                         .get("proof_term_nodes")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(proof_term_nodes);
-                    if proof_term_nodes > 0 {
-                        crate::accelerators::record_distilled_proof_term_nodes(
-                            target_decl,
-                            &shard.signature_text,
-                            proof_term_nodes,
-                        );
-                    }
                     if let Some(rd) = zj.get("rss_delta_mb").and_then(|v| v.as_i64()) {
                         rss_delta_mb = rd;
                     }
@@ -2376,12 +2369,14 @@ fn check_single_decl(
                         .unwrap_or_default();
                     if proof_term_nodes > 0 {
                         crate::accelerators::record_distilled_proof_term_nodes(
+                            canon_dir,
                             target_decl,
                             &shard.signature_text,
                             proof_term_nodes,
                         );
                         if shard.name != target_decl {
                             crate::accelerators::record_distilled_proof_term_nodes(
+                                canon_dir,
                                 &shard.name,
                                 &shard.signature_text,
                                 proof_term_nodes,
@@ -2431,6 +2426,7 @@ fn check_single_decl(
                     }
                     if rep.proof_term_nodes > 0 {
                         crate::accelerators::record_distilled_proof_term_nodes(
+                            canon_dir,
                             target_decl,
                             &shard.signature_text,
                             rep.proof_term_nodes,

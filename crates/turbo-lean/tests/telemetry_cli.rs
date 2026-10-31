@@ -156,6 +156,7 @@ impl Fixture {
             .env("SANDBOXED_TELEMETRY_TMP_DIR", self.root.join("batch"))
             .env("TURBO_LEAN_TELEMETRY_DIR", self.root.join("spool"))
             .env("TURBO_LEAN_STAGING_DIR", self.root.join("staging"))
+            .env("TURBO_LEAN_HOME", self.root.join("cache"))
             .env("TURBO_LEAN_NO_DAEMON", "1")
             .env("LEAN_NUM_THREADS", "4")
             .env("NO_PROXY", "127.0.0.1,localhost")
@@ -227,6 +228,71 @@ fn build_real_cli_remote_requires_opt_in() {
             assert_eq!(!events.is_empty(), opt_in);
             for ev in events {
                 assert_eq!(ev["tool_name"], "build");
+            }
+        }
+    }
+}
+
+#[test]
+fn agent_step_proof_nodes_obey_remote_consent_and_local_metrics_policy() {
+    for mcp in [false, true] {
+        for (policy, enabled, remote) in [
+            ("", true, false), // The fixture supplies a token, but no consent.
+            ("remote = true", true, true),
+            ("enabled = false\nremote = true", false, false),
+        ] {
+            let f = Fixture::new();
+            f.project_policy(policy);
+            let result = if mcp {
+                let response = f.command(
+                    &["mcp"],
+                    &[],
+                    Some(json!({"jsonrpc":"2.0", "id":1, "method":"tools/call",
+                    "params":{"name":"turbo_agent_step", "arguments":{
+                        "file":f.root.join("Fixture.lean"),
+                        "decl":"telemetry_fixture", "project_dir":f.root
+                    }}})),
+                );
+                assert_eq!(response["result"]["isError"], false, "{response}");
+                serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap()
+            } else {
+                let result = f.command(
+                    &["agent-step", "Fixture.lean", "--decl", "telemetry_fixture"],
+                    &[],
+                    None,
+                );
+                assert_eq!(result["stage"], "stage2_kernel_verified", "{result}");
+                result
+            };
+            let nodes = result["proof_term_nodes"].as_u64().unwrap();
+            assert!(nodes > 0, "{result}");
+            let events = f.endpoint.take();
+            assert_eq!(!events.is_empty(), remote, "{policy}: {events:?}");
+            for ev in &events {
+                assert!(matches!(
+                    ev["tool_name"].as_str(),
+                    Some("agent_step" | "turbo_agent_step")
+                ));
+                assert_eq!(ev["proof_term_nodes"], nodes);
+            }
+            for path in [
+                "spool/traces.jsonl",
+                "staging/distilled_proof_nodes.json",
+                "cache/distilled_proof_nodes.json",
+            ] {
+                assert_eq!(f.root.join(path).exists(), enabled, "{policy}: {path}");
+            }
+            if enabled {
+                let trace: Value = serde_json::from_str(
+                    fs::read_to_string(f.root.join("spool/traces.jsonl"))
+                        .unwrap()
+                        .lines()
+                        .last()
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(trace["proof_term_nodes"], nodes);
             }
         }
     }
@@ -386,6 +452,23 @@ fn mcp_real_tool_remote_consent_and_workspace_precedence() {
         f.endpoint.take().is_empty(),
         "untrusted project cannot opt in"
     );
+    // Keep #295's empty-audit dispatch behavior alongside request workspace policy.
+    fs::write(f.root.join("Empty.lean"), "def value : Nat := 1\n").unwrap();
+    for require_nonempty in [false, true] {
+        let response = f.command(
+            &["mcp"],
+            &[],
+            Some(json!({"jsonrpc":"2.0", "id":2, "method":"tools/call",
+            "params":{"name":"turbo_audit_spec", "arguments":{
+                "file":f.root.join("Empty.lean"), "project_dir":f.root,
+                "require_nonempty":require_nonempty
+            }}})),
+        );
+        assert_eq!(
+            response["result"]["isError"], require_nonempty,
+            "{response}"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -514,8 +597,16 @@ fn optout_build_and_ci_cache_hits_fail_when_restore_would_be_required() {
             vec!["ci-verify", "--mode", "trusted", "--no-auto-worktree-link"],
         ] {
             let out = f.output(&args, &[], None);
-            assert!(!out.status.success(), "{args:?}: opt-out must not accept missing/stale outputs");
-            assert!(String::from_utf8_lossy(&out.stderr).contains("Worktree opt-out prevents restoring"), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                !out.status.success(),
+                "{args:?}: opt-out must not accept missing/stale outputs"
+            );
+            assert!(
+                String::from_utf8_lossy(&out.stderr)
+                    .contains("Worktree opt-out prevents restoring"),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
         let after = fs::metadata(&artifact)
             .ok()

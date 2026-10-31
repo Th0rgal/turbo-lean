@@ -454,8 +454,17 @@ fn distilled_nodes_disk_path() -> Option<std::path::PathBuf> {
         .map(|p| std::path::PathBuf::from(p).join("distilled_proof_nodes.json"))
 }
 
-pub fn record_distilled_proof_term_nodes(decl_name: &str, stmt_src: &str, proof_term_nodes: u64) {
-    if proof_term_nodes == 0 || decl_name.trim().is_empty() {
+/// Persist proof-size metrics only when local telemetry is enabled for this workspace.
+pub fn record_distilled_proof_term_nodes(
+    project_dir: &Path,
+    decl_name: &str,
+    stmt_src: &str,
+    proof_term_nodes: u64,
+) {
+    if proof_term_nodes == 0
+        || decl_name.trim().is_empty()
+        || !crate::mcp::resolve_telemetry_policy(Some(project_dir)).enabled
+    {
         return;
     }
     let keys = distilled_hint_keys(decl_name, stmt_src);
