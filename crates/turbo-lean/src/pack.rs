@@ -1420,7 +1420,12 @@ pub fn prestage_blobs_from_shared_cas(
                     0i64
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    fs::metadata(&dest).map(|m| m.ino() as i64).unwrap_or(0)
+                    // Cold `TLZ1` blobs legitimately differ in length; a torn one is left for
+                    // the payload import to repair.
+                    match crate::db::probe_blob_file(&dest, b.size_bytes) {
+                        crate::db::BlobDisk::Intact(m) => m.ino() as i64,
+                        _ => return None,
+                    }
                 }
                 Err(_) => {
                     let src_p = if shared_p.exists() {
@@ -1813,11 +1818,12 @@ pub fn import_pack_bytes_with_policy(
 
     let process_chunk = |chunk: &[(&PackedBlob, &[u8])],
                          root_dir: &Path,
-                         staging_dir_ref: &Path,
+                         #[cfg_attr(unix, allow(unused_variables))] staging_dir_ref: &Path,
                          new_prefixes: &[bool; 256]|
      -> Result<(Vec<(String, String, i64, i64)>, usize)> {
         let mut local = Vec::with_capacity(chunk.len());
         let mut newly_written = 0usize;
+        #[cfg(not(unix))]
         let mut staging_ready = false;
         for &(b, blob_bytes) in chunk {
             // Re-verify BLAKE3 digest of every incoming blob (Zero-Trust transport rule!)
@@ -1837,53 +1843,23 @@ pub fn import_pack_bytes_with_policy(
             let p_idx = u8::from_str_radix(prefix, 16).unwrap_or(0) as usize;
             let dest = root_dir.join("blobs").join(prefix).join(&b.blob_hash);
 
-            // Zero-copy existing-blob skip + single-syscall create_new:
+            // Existing blobs are size-checked and torn ones rewritten; all writes are atomic.
             #[cfg(unix)]
             let inode = {
-                use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-                if !new_prefixes[p_idx] {
-                    if let Ok(m) = fs::metadata(&dest) {
-                        local.push((
-                            b.blob_hash.clone(),
-                            b.kind.clone(),
-                            blob_bytes.len() as i64,
-                            m.ino() as i64,
-                        ));
-                        continue;
-                    }
-                }
-                match fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o444)
-                    .open(&dest)
-                {
-                    Ok(mut f) => {
-                        f.write_all(blob_bytes)?;
+                use crate::db::{probe_blob_file, write_blob_atomic, BlobDisk};
+                use std::os::unix::fs::MetadataExt;
+                let len = blob_bytes.len() as u64;
+                let state = if new_prefixes[p_idx] {
+                    BlobDisk::Missing
+                } else {
+                    probe_blob_file(&dest, len)
+                };
+                match state {
+                    BlobDisk::Intact(m) => m.ino() as i64,
+                    missing_or_torn => {
+                        let replace = matches!(missing_or_torn, BlobDisk::Torn);
                         newly_written += 1;
-                        0i64
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                        fs::metadata(&dest).map(|m| m.ino() as i64).unwrap_or(0)
-                    }
-                    Err(_) => {
-                        if !staging_ready {
-                            fs::create_dir_all(staging_dir_ref)?;
-                            staging_ready = true;
-                        }
-                        let staging_path =
-                            staging_dir_ref.join(format!("{}.{}.tmp", b.blob_hash, next_tmp_id()));
-                        let mut f = fs::OpenOptions::new()
-                            .write(true)
-                            .create(true)
-                            .truncate(true)
-                            .mode(0o444)
-                            .open(&staging_path)?;
-                        f.write_all(blob_bytes)?;
-                        drop(f);
-                        fs::rename(&staging_path, &dest)?;
-                        newly_written += 1;
-                        0i64
+                        write_blob_atomic(root_dir, &dest, &b.blob_hash, blob_bytes, replace)?
                     }
                 }
             };
