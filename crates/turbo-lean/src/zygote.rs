@@ -284,11 +284,11 @@ pub(crate) fn clear_zygote_pool() {
 
 /// One-shot staging is private even when another invocation uses the same CAS.
 pub(crate) struct OneShotGuard;
-static ONE_SHOT_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+static ONE_SHOT_DIR: std::sync::OnceLock<(PathBuf, PathBuf)> = std::sync::OnceLock::new();
 
 extern "C" fn cleanup_one_shot() {
     clear_zygote_pool();
-    if let Some(dir) = ONE_SHOT_DIR.get() {
+    if let Some((dir, _)) = ONE_SHOT_DIR.get() {
         let _ = fs::remove_dir_all(dir);
     }
 }
@@ -301,6 +301,14 @@ pub(crate) fn daemon_disabled() -> bool {
 }
 
 impl OneShotGuard {
+    /// Persistent metrics retain their namespace while workers use disposable sibling staging.
+    pub(crate) fn persistent_staging_dir() -> PathBuf {
+        ONE_SHOT_DIR
+            .get()
+            .map(|(_, base)| base.clone())
+            .unwrap_or_else(crate::shm_cache::staging_shm_dir)
+    }
+
     pub(crate) fn new(flag: bool) -> Result<Self> {
         let enabled = flag || daemon_disabled();
         if !enabled {
@@ -319,7 +327,7 @@ impl OneShotGuard {
         ));
         fs::create_dir_all(&dir)?;
         std::env::set_var("TURBO_LEAN_STAGING_DIR", &dir);
-        let _ = ONE_SHOT_DIR.set(dir);
+        let _ = ONE_SHOT_DIR.set((dir, base));
         // `eval` also exits with explicit status codes, bypassing Rust Drop.
         #[cfg(unix)]
         unsafe {
