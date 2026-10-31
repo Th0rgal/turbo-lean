@@ -1306,7 +1306,7 @@ open LeanNative.IR LeanNative.Proofs
             (.letBind 7 .i64 (.scalar (.constU64 0)) (.ret 7))))
   }
   let projChildLeakBad := validateTranslationDecl (mkProjChildRcLeakDecl false) (mkProjChildRcLeakDecl true) 8
-  unless !projChildLeakBad.memWritesEquiv && !projChildLeakBad.passed do
+  unless !projChildLeakBad.ubRefines && !projChildLeakBad.passed do
     throw <| IO.userError s!"projected input child RC leak accepted: {reprStr projChildLeakBad}"
   -- 12. Sharing between returned root and escaping heap write (`p[0] := a; ret a` vs `p[0] := a; ret b` on `x == 999`) must be preserved
   let mkCrossAliasRetWriteDecl (returnDifferentRootOn999 : Bool) : LNIRDecl := {
@@ -1461,7 +1461,7 @@ open LeanNative.IR LeanNative.Proofs
             (.letBind 9 .i1 (.scalar (.constBool false)) (.ret 9))))
   }
   let sibIncAliasBad := validateTranslationDecl (mkProjSiblingIncAliasDecl false) (mkProjSiblingIncAliasDecl true) 64
-  unless !sibIncAliasBad.symRetEquiv && !sibIncAliasBad.passed do
+  unless !sibIncAliasBad.ubRefines && !sibIncAliasBad.passed do
     throw <| IO.userError s!"projected sibling child incRef may-alias exclusivity drift accepted: {reprStr sibIncAliasBad}"
   -- 15b. Even when `p` and `q` are distinct input parameters (`p` and `q` may alias the same heap object),
   --      `incRef p 1; decRef p 1` must NOT allow folding `isExclusive q` across `incRef p 1` (`incRef p 1; x := isExclusive q; decRef p 1; ret x` vs `x := isExclusive q; incRef p 1; decRef p 1; ret x`)
@@ -1779,7 +1779,7 @@ open LeanNative.IR LeanNative.Proofs
           (.letBind 9 .i1 (.scalar (.constBool true)) (.ret 9)))
   }
   let nestedCollBad := validateTranslationDecl (mkNestedVsEpochProjDecl false) (mkNestedVsEpochProjDecl true) 8
-  unless !nestedCollBad.symRetEquiv && !nestedCollBad.passed do
+  unless !nestedCollBad.ubRefines && !nestedCollBad.passed do
     throw <| IO.userError s!"nested p1[0][0] at epoch 0 collided with p0[0] at epoch 1: {reprStr nestedCollBad}"
   -- 26. `allocCtor` containing a tag-refined external root `p` (whose RC is still unknown) must preserve `.symVar p`
   --     reference identity rather than copying `p`'s cached `.tuple` fields!
@@ -1813,10 +1813,11 @@ open LeanNative.IR LeanNative.Proofs
           (.letBind 15 .i64 (.scalar (.constU64 0)) (.ret 15)))
   }
   let extInAllocBad := validateTranslationDecl (mkExtRootInAllocCtorDecl false) (mkExtRootInAllocCtorDecl true) 8
-  unless !extInAllocBad.symRetEquiv && !extInAllocBad.passed do
+  unless !extInAllocBad.ubRefines && !extInAllocBad.passed do
     throw <| IO.userError s!"allocCtor copied cached external root fields instead of preserving root identity: {reprStr extInAllocBad}"
   -- 27. Arithmetic on a scalar field projected from an input heap object (`p[0][0] + 1`, via `.ctorGetObj` with `.i64`
-  --     or `.ctorGetScalar`) must NOT be treated as source UB; differing returns on `x == 999` must be rejected!
+  --     or `.ctorGetScalar`) must fail closed (`symUnsupported`) on non-identity rewrites because the uncached field's
+  --     runtime sort in `HeapState` could be `.objPtr` or `.u64`, while reflexive (`src == tgt`) still passes!
   let mkNestedScalarProjArithDecl (retConstVal : UInt64) : LNIRDecl := {
     name := "nested_scalar_proj_arith"
     params := [
@@ -1835,13 +1836,13 @@ open LeanNative.IR LeanNative.Proofs
           (.letBind 7 .i64 (.scalar (.constU64 0)) (.ret 7)))
   }
   let nestedScalarArithBad := validateTranslationDecl (mkNestedScalarProjArithDecl 0) (mkNestedScalarProjArithDecl 1) 8
-  unless !nestedScalarArithBad.symRetEquiv && !nestedScalarArithBad.passed do
-    throw <| IO.userError s!"scalar projection arithmetic erroneously treated as source UB: {reprStr nestedScalarArithBad}"
+  unless !nestedScalarArithBad.ubRefines && !nestedScalarArithBad.passed do
+    throw <| IO.userError s!"uncached scalar projection arithmetic accepted non-identity target: {reprStr nestedScalarArithBad}"
   let nestedScalarArithGood := validateTranslationDecl (mkNestedScalarProjArithDecl 0) (mkNestedScalarProjArithDecl 0) 8
   unless nestedScalarArithGood.passed do
     throw <| IO.userError s!"equivalent scalar projection arithmetic rejected: {reprStr nestedScalarArithGood}"
   -- 27b. Also test `.taggedPtr` intermediate projection (`let 4 : taggedPtr := ctorGetObj 3 0; let 9 : i64 := var 4; let 10 := 9 + 1`),
-  --      matching LCNF's exact lowering of boxed tuple fields inside `foldPacket`!
+  --      ensuring non-identity rewrites fail closed (`symUnsupported`) when runtime sort of `p[0][0]` is unknown!
   let mkTaggedScalarProjArithDecl (retConstVal : UInt64) : LNIRDecl := {
     name := "tagged_scalar_proj_arith"
     params := [
@@ -1861,8 +1862,8 @@ open LeanNative.IR LeanNative.Proofs
           (.letBind 7 .i64 (.scalar (.constU64 0)) (.ret 7)))
   }
   let taggedScalarBad := validateTranslationDecl (mkTaggedScalarProjArithDecl 0) (mkTaggedScalarProjArithDecl 1) 8
-  unless !taggedScalarBad.symRetEquiv && !taggedScalarBad.passed do
-    throw <| IO.userError s!"taggedPtr scalar projection arithmetic treated as source UB: {reprStr taggedScalarBad}"
+  unless !taggedScalarBad.ubRefines && !taggedScalarBad.passed do
+    throw <| IO.userError s!"taggedPtr uncached projection arithmetic accepted non-identity target: {reprStr taggedScalarBad}"
   -- 28. Unsupported symbolic execution in `src` (e.g. pointer arithmetic `p + 1` or unknown extern call) must
   --     fail closed (`symUnsupported == true` -> `passed == false`), never vacuously accepting `tgt`!
   let mkUnsupportedSrcDecl (retVal : UInt64) : LNIRDecl := {
@@ -2301,6 +2302,46 @@ open LeanNative.IR LeanNative.Proofs
   let projHeapBad := validateTranslationDecl (mkProjTupleOnHeapCtorDecl false) (mkProjTupleOnHeapCtorDecl true) 8
   unless !projHeapBad.ubRefines && !projHeapBad.passed do
     throw <| IO.userError s!"projTuple on heap constructor root accepted: {reprStr projHeapBad}"
+  let mkScalarFieldsHeapPtrDecl (constTrue : Bool) : LNIRDecl := {
+    name := "scalar_fields_heap_ptr"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i1
+    body :=
+      .letBind 1 .objPtr (.allocCtor 0 [] [])
+        (.letBind 2 .objPtr (.allocCtor 0 [] [1])
+          (.letBind 3 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+            (.ite 3
+              (.incRef 1 1
+                (.letBind 4 .objPtr (.ctorGetObj 2 0)
+                  (.letBind 5 .i1 (if constTrue then .scalar (.constBool true) else .isExclusive 4)
+                    (.decRef 1 1 (.decRef 2 1 (.ret 5))))))
+              (.letBind 4 .objPtr (.ctorGetObj 2 0)
+                (.letBind 5 .i1 (if constTrue then .scalar (.constBool true) else .isExclusive 4)
+                  (.decRef 2 1 (.ret 5)))))))
+  }
+  let scalarFieldsHeapBad := validateTranslationDecl (mkScalarFieldsHeapPtrDecl false) (mkScalarFieldsHeapPtrDecl true) 8
+  unless !scalarFieldsHeapBad.symRetEquiv && !scalarFieldsHeapBad.passed do
+    throw <| IO.userError s!"allocCtor scalarFields copied heap snapshot instead of root identity: {reprStr scalarFieldsHeapBad}"
+  let mkUncachedCtorFieldExclDecl (constTrue : Bool) : LNIRDecl := {
+    name := "uncached_ctor_field_excl"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i1
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+        (.ite 2
+          (.letBind 3 .i64 (.ctorGetScalar 0 0 .i64)
+            (if constTrue then
+               .letBind 4 .i1 (.scalar (.constBool true)) (.ret 4)
+             else
+               .letBind 4 .i1 (.isExclusive 3) (.ret 4)))
+          (.letBind 4 .i1 (.scalar (.constBool true)) (.ret 4)))
+  }
+  let uncachedFieldBad := validateTranslationDecl (mkUncachedCtorFieldExclDecl false) (mkUncachedCtorFieldExclDecl true) 8
+  unless !uncachedFieldBad.ubRefines && !uncachedFieldBad.passed do
+    throw <| IO.userError s!"ctorGetScalar assumed runtime scalar sort on uncached field: {reprStr uncachedFieldBad}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)

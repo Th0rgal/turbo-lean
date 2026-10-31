@@ -1299,19 +1299,14 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
         let rootSort := symExprScalarSort? st rootSv.expr
         let stSort :=
           if !isPtrDest && !(st1.isDefinitelyHeapRoot root) then
-            let stD :=
-              match rootSort with
-              | some 0 => st1.markBoolVar dst
-              | some 1 => st1.markU64Var dst
-              | some 2 => st1.markU256Var dst
-              | _ => markDstSort st1
-            if rootSort.isNone && !(stD.hasKnownRuntimeSort root) && dstTy == .i1 then stD.markBoolVar root
-            else if rootSort.isNone && !(stD.hasKnownRuntimeSort root) && (dstTy == .u256 || dstTy == .i256) then stD.markU256Var root
-            else if rootSort.isNone && !(stD.hasKnownRuntimeSort root) && callSlotKind dstTy == some false && dstTy != .unit then stD.markU64Var root
-            else stD
+            match rootSort with
+            | some 0 => st1.markBoolVar dst
+            | some 1 => st1.markU64Var dst
+            | some 2 => st1.markU256Var dst
+            | _ => st1
           else st1
         let stTuple :=
-          if st.typedTuples.contains root || (match dstTy with | .tuple _ => true | _ => false) then
+          if st.typedTuples.contains root then
             stSort.markTypedTuple dst
           else
             stSort.unmarkTypedTuple dst
@@ -1484,14 +1479,15 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
         (((st.clearAlias dst).unmarkTypedTuple dst).markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
   | .allocCtor tag objFields scalarFields =>
     let svs := (objFields ++ scalarFields).map st.lookupVar
-    let objectExprs := objFields.map fun v =>
+    let encodeCtorField (v : VarId) : SymExpr :=
       let root := st.resolveBuf v
       let rv := st.lookupVar root
       if st.isHeapObjectRoot root then .symVar root
       else match rv.expr with
         | .symVar rId => .symVar (st.resolveBuf rId)
         | e => e
-    let scalarExprs := scalarFields.map fun v => (st.lookupVar v).expr
+    let objectExprs := objFields.map encodeCtorField
+    let scalarExprs := scalarFields.map encodeCtorField
     (st.markAllocated dst).bindVar dst {
       expr := .tuple (.constU64 tag.toUInt64 :: objectExprs ++ scalarExprs)
       nonPoison := svs.all (·.nonPoison)
@@ -1502,15 +1498,6 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
           match e with
           | .ctorGetScalar _ _ _ => true
           | _ => callSlotKind dstTy == some false
-        let projSortTy : LNIRType :=
-          match e with
-          | .ctorGetScalar _ _ sTy => sTy
-          | _ => dstTy
-        let markProjSort (cur : SymExecState) (vid : VarId) : SymExecState :=
-          if projSortTy == .i1 then cur.markBoolVar vid
-          else if projSortTy == .u256 || projSortTy == .i256 then cur.markU256Var vid
-          else if callSlotKind projSortTy == some false && projSortTy != .unit then cur.markU64Var vid
-          else cur
     let rootVar := st.resolveBuf ctorVar
     if st.typedTuples.contains rootVar || st.sarrayVars.contains rootVar ||
        st.boolVars.contains rootVar || st.u64Vars.contains rootVar || st.u256Vars.contains rootVar then
@@ -1544,25 +1531,15 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
                   if stBounds.objPtrVars.contains effFId || stBounds.allocRoots.contains effFId then stA.markObjPtrVar dst
                   else if stBounds.sarrayVars.contains effFId then stA.markSarrayVar dst
                   else stA
-                else if isScalarProj then
-                  let stDst := markProjSort stClear dst
-                  if stDst.hasKnownRuntimeSort effFId then stDst else markProjSort stDst effFId
                 else
-                  let stA := stBounds.aliasBuf dst effFId
-                  if projSortTy == LNIRType.objPtr then
-                    let stD := stA.markObjPtrVar dst
-                    if stD.hasKnownRuntimeSort effFId then stD else stD.markObjPtrVar effFId
-                  else if (match projSortTy with | LNIRType.sarray _ => true | _ => false) then
-                    let stD := stA.markSarrayVar dst
-                    if stD.hasKnownRuntimeSort effFId then stD else stD.markSarrayVar effFId
-                  else stA
+                  stBounds.aliasBuf dst effFId
           | .tuple _ => stClear.markTypedTuple dst
           | _ =>
             match symExprScalarSort? stBounds fExpr with
             | some 0 => stClear.markBoolVar dst
             | some 1 => stClear.markU64Var dst
             | some 2 => stClear.markU256Var dst
-            | _ => markProjSort stClear dst
+            | _ => stClear
         st'.bindVar dst { expr := fExpr, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
       | none => stBounds.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
     | .symVar rootId =>
@@ -1572,17 +1549,8 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
         let effRoot := stLive.resolveBuf rootId
         let stBounds := stLive.requireUbCond (.binOp .lt (.constU64 idx.toUInt64) (.ctorLen stLive.heapStepEpoch effRoot))
         let fieldRoot := SymExecState.projFieldRootId stBounds.synVarBase stBounds.heapStepEpoch effRoot idx
-        let stBase := stBounds.noteExtLiveRoot effRoot
-        if isScalarProj then
-          let stSorted := markProjSort (markProjSort (stBase.clearAlias dst) dst) fieldRoot
-          stSorted.bindVar dst { expr := .symVar fieldRoot, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
-        else
-          let stNoted0 := stBase.noteExtRoot fieldRoot
-          let stNoted :=
-            if projSortTy == LNIRType.objPtr then (stNoted0.markObjPtrVar fieldRoot).markObjPtrVar dst
-            else if (match projSortTy with | LNIRType.sarray _ => true | _ => false) then (stNoted0.markSarrayVar fieldRoot).markSarrayVar dst
-            else stNoted0
-          (stNoted.aliasBuf dst fieldRoot).bindVar dst { expr := .symVar fieldRoot, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
+        let stBase := (stBounds.noteExtLiveRoot effRoot).noteExtRoot fieldRoot
+        (stBase.aliasBuf dst fieldRoot).bindVar dst { expr := .symVar fieldRoot, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
     | .constU64 _ | .constU256 _ | .constBool _ | .unit =>
       -- Projecting a constructor field from an immediate scalar is concrete UB (`typeError`)!
       stLive.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
@@ -1633,10 +1601,10 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
     let valSv := st.lookupVar valVar
     let st3 := ((st.markExclusive root).writeBufSym root idxSv.expr valSv.expr true).aliasBuf dst root
     st3.bindVar dst { expr := .symVar root, nonPoison := idxSv.nonPoison && valSv.nonPoison, noUB := idxSv.noUB && valSv.noUB }
-  | .unboxScalar valVar sTy =>
+  | .unboxScalar valVar _ =>
     let r := st.resolveBuf valVar
     let rVal := st.lookupVar r
-    let st1 := if valVar != dst && st.isDefinitelyHeapRoot r then st.aliasBuf dst r else st.clearAlias dst
+    let st1 := if valVar != dst && st.isHeapObjectRoot r then st.aliasBuf dst r else st.clearAlias dst
     let st2 :=
       if st1.isNeverScalarRef r then st1
       else if st1.typedTuples.contains r || (match rVal.expr with | .tuple _ => true | _ => false) then st1.markTypedTuple dst
@@ -1645,24 +1613,12 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
         | some 0 => (st1.unmarkTypedTuple dst).markBoolVar dst
         | some 1 => (st1.unmarkTypedTuple dst).markU64Var dst
         | some 2 => (st1.unmarkTypedTuple dst).markU256Var dst
-        | _ =>
-          if (match sTy with | .tuple _ => true | _ => false) then
-            let stD := st1.markTypedTuple dst
-            if stD.hasKnownRuntimeSort r then stD else stD.markTypedTuple r
-          else if sTy == .i1 || dstTy == .i1 then
-            let stD := (st1.unmarkTypedTuple dst).markBoolVar dst
-            if stD.hasKnownRuntimeSort r then stD else stD.markBoolVar r
-          else if sTy == .u256 || sTy == .i256 || dstTy == .u256 || dstTy == .i256 then
-            let stD := (st1.unmarkTypedTuple dst).markU256Var dst
-            if stD.hasKnownRuntimeSort r then stD else stD.markU256Var r
-          else
-            let stD := (st1.unmarkTypedTuple dst).markU64Var dst
-            if stD.hasKnownRuntimeSort r then stD else stD.markU64Var r
+        | _ => st1.unmarkTypedTuple dst
     st2.bindVar dst rVal
   | .boxScalar valVar _ =>
     let r := st.resolveBuf valVar
     let rVal := st.lookupVar r
-    let st1 := if valVar != dst && st.isDefinitelyHeapRoot r then st.aliasBuf dst r else st.clearAlias dst
+    let st1 := if valVar != dst && st.isHeapObjectRoot r then st.aliasBuf dst r else st.clearAlias dst
     let st2 :=
       if st1.isNeverScalarRef r then st1
       else if st1.typedTuples.contains r || (match rVal.expr with | .tuple _ => true | _ => false) then st1.markTypedTuple dst
@@ -1681,7 +1637,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
       if (fnName == "lean_native_box_u64" && ptrRet) || (fnName == "lean_native_unbox_u64" && i64Ret) then
         let r := st.resolveBuf a
         let rVal := st.lookupVar r
-        let st1 := if a != dst && (ptrRet || st.isDefinitelyHeapRoot r) then st.aliasBuf dst r else if !ptrRet && !(st.isDefinitelyHeapRoot r) then st.clearAlias dst else st
+        let st1 := if a != dst && (ptrRet || st.isHeapObjectRoot r) then st.aliasBuf dst r else if !ptrRet && !(st.isHeapObjectRoot r) then st.clearAlias dst else st
         let st2 :=
           if st1.isNeverScalarRef r then st1
           else if st1.typedTuples.contains r || (match rVal.expr with | .tuple _ => true | _ => false) then st1.markTypedTuple dst
@@ -1690,11 +1646,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
             | some 0 => (st1.unmarkTypedTuple dst).markBoolVar dst
             | some 1 => (st1.unmarkTypedTuple dst).markU64Var dst
             | some 2 => (st1.unmarkTypedTuple dst).markU256Var dst
-            | _ =>
-              if fnName == "lean_native_unbox_u64" then
-                let stD := (st1.unmarkTypedTuple dst).markU64Var dst
-                if stD.hasKnownRuntimeSort r then stD else stD.markU64Var r
-              else st1.unmarkTypedTuple dst
+            | _ => st1.unmarkTypedTuple dst
         st2.bindVar dst rVal
       else if fnName == "lean_native_ensure_exclusive" && ptrRet then
         let root := st.resolveBuf a
@@ -2258,7 +2210,7 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
             else if !stE.reachable then normSymExpr retT
             else normSymIteStep cExpr (normSymExpr retT) (normSymExpr retE)
           (mergedState, mergedRet)
-    | .seqFor idxVar _loVar _hiVar accVar accInit accTy stepBody k =>
+    | .seqFor idxVar _loVar _hiVar accVar accInit _accTy stepBody k =>
       let initRoot := st.resolveBuf accInit
       let initSv := st.lookupVar initRoot
       let stInit0 := (st.aliasBuf accVar initRoot).bindVar accVar initSv
@@ -2271,12 +2223,7 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
           | some 0 => stInit0.markBoolVar accVar
           | some 1 => stInit0.markU64Var accVar
           | some 2 => stInit0.markU256Var accVar
-          | _ =>
-            if (match accTy with | .tuple _ => true | _ => false) then stInit0.markTypedTuple accVar
-            else if accTy == .i1 then stInit0.markBoolVar accVar
-            else if accTy == .u256 || accTy == .i256 then stInit0.markU256Var accVar
-            else if callSlotKind accTy == some false && accTy != .unit then stInit0.markU64Var accVar
-            else stInit0
+          | _ => stInit0
       let stAfterLoop := symExecLoopUnroll unrollBound 0 idxVar accVar (stInit.markU64Var idxVar)
         (fun s => symExecCode fuel' unrollBound s stepBody)
       symExecCode fuel' unrollBound stAfterLoop k
