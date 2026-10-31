@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import jsonschema
 import bench_clifv as bench
@@ -49,6 +50,7 @@ class Reports(unittest.TestCase):
             self.assertEqual(ratio["bootstrap_95_ci"], [2, 10.2 / 4.9])
             self.assertNotEqual(ratio["mean"], 10.1 / 4.95)  # not a ratio of unpaired means
             self.assertEqual(len(stored["scenarios"][0]["pairs"]), 2)
+            self.assertIn("turbo-lean --no-daemon build FV", (Path(directory) / "results.md").read_text())
             # The CI artifact is an actual two-pair JSON file, independently validated.
             artifact = os.environ.get("BENCH_SELF_TEST_OUTPUT")
             if artifact:
@@ -128,8 +130,42 @@ class Reports(unittest.TestCase):
             self.assertEqual(list(Path(directory).iterdir()), [])
 
 
+class WorkFilesystem(unittest.TestCase):
+    def test_shm_and_symlink_are_rejected_before_creating_directories(self):
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as shm, tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            alias = root / "alias"
+            alias.symlink_to(shm, target_is_directory=True)
+            for parent in (Path(shm), alias):
+                with self.subTest(parent=parent):
+                    work, output = parent / "new" / "work", root / "output"
+                    with self.assertRaisesRegex(ValueError, "UID-global shared CAS blobs"):
+                        bench.main(["--work-dir", str(work), "--output", str(output), "--turbo", "/missing"])
+                    self.assertFalse(work.parent.exists())
+                    self.assertFalse(output.exists())
+
+    def test_routing_uses_device_id_even_outside_shm_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work = root / "missing" / "work"
+            real_stat = Path.stat
+            device = root.stat().st_dev
+            for same_device in (True, False):
+                with self.subTest(same_device=same_device), mock.patch.object(Path, "stat", autospec=True) as stat:
+                    stat.side_effect = lambda path, *a, **kw: (
+                        mock.Mock(st_dev=device if same_device else device + 1)
+                        if path == Path("/dev/shm") else real_stat(path, *a, **kw))
+                    if same_device:
+                        with self.assertRaisesRegex(ValueError, "different filesystem device"):
+                            bench.validate_work_filesystem(work)
+                    else:
+                        bench.validate_work_filesystem(work)
+            self.assertFalse(work.parent.exists())
+
+
 FAKE_TOOL = '''#!/usr/bin/env python3
 import hashlib, json, os, pathlib, sys, time
+assert "TURBO_LEAN_NO_WORKTREE_LINK" not in os.environ
 args = sys.argv[1:]
 if "--help" in args:
     if os.environ.get("FAKE_STOP_SUPPORTED") == "1":
@@ -141,7 +177,7 @@ if "--version" in args:
     sys.exit(0)
 if "daemon" in args:
     assert os.environ["TURBO_LEAN_TELEMETRY"] == "off"
-    sys.exit(0)
+    sys.exit(int(os.environ.get("FAKE_STOP_EXIT", "0")))
 assert os.environ["TURBO_LEAN_TELEMETRY"] == "off"
 assert os.environ["TURBO_LEAN_NO_DAEMON"] == "1"
 p = pathlib.Path
@@ -186,7 +222,7 @@ class Integration(unittest.TestCase):
                      ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture"]):
             subprocess.run(["git", *args], cwd=self.repo, check=True)
         self.sha = bench.capture(["git", "rev-parse", "HEAD"], self.repo)
-        self.env = dict(os.environ, FAKE_TRACE=str(self.root / "trace"))
+        self.env = dict(os.environ, FAKE_TRACE=str(self.root / "trace"), TURBO_LEAN_NO_WORKTREE_LINK="1")
         for name in ("fake-lake", "fake-turbo"):
             tool = self.root / name
             tool.write_text(FAKE_TOOL)
@@ -206,6 +242,7 @@ class Integration(unittest.TestCase):
         jsonschema.validate(report, SCHEMA)
         self.assertEqual(report["machine"]["clifv_sha"], self.sha)
         self.assertEqual(report["status"], "complete")
+        self.assertNotIn("TURBO_LEAN_NO_WORKTREE_LINK", report["machine"]["environment_overrides"])
         self.assertFalse(Path(report["machine"]["environment_overrides"]["TURBO_LEAN_STAGING_DIR"]).exists())
         events = [json.loads(line) for line in (self.root / "trace").read_text().splitlines()]
         return report, events
@@ -213,6 +250,7 @@ class Integration(unittest.TestCase):
     def test_all_scenarios_restore_cache_and_source_in_any_order(self):
         report, events = self.run_fixture("cold,proof,warm,statement,import")
         self.assertEqual(len(events), 3 + 5 * 4)  # three untimed primes
+        self.assertTrue(all("build" in e["args"] and "FV" in e["args"] for e in events))
         timed = events[3:]
         self.assertEqual([e["arm"] for e in timed], ["stock", "turbo"] * 10)
         for index, scenario in enumerate(("cold", "proof", "warm", "statement", "import")):
@@ -245,10 +283,13 @@ class Integration(unittest.TestCase):
         self.assertTrue(all(p["parity"] == "INVALID" for p in report["scenarios"][0]["pairs"]))
 
     def test_cleanup_targets_only_marked_owned_workers(self):
+        self.env.update(FAKE_STOP_SUPPORTED="1", FAKE_STOP_EXIT="1")
         args = bench.parse_args(["--turbo", str(self.root / "fake-turbo"), "--lake", str(self.root / "fake-lake")])
         work = self.root / "cleanup-work"
         work.mkdir()
-        runner = bench.Runner(args, work, self.root)
+        with mock.patch.dict(os.environ, self.env):
+            runner = bench.Runner(args, work, self.root)
+        self.assertTrue(runner.has_stop)
         self.addCleanup(shutil.rmtree, runner.staging, True)
         worker = self.root / "turbo_zygote_fixture"
         shutil.copyfile("/bin/sleep", worker)

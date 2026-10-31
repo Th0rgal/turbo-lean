@@ -116,7 +116,7 @@ def write_report(report, output):
     tmp.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     tmp.replace(path)
     lines = ["# clifv paired benchmark", "", f"Status: {report['status']}. Telemetry: off.", "",
-             "A = stock `lake build`; B = `turbo-lean " + report["turbo_command"] + "`. Order: ABAB….",
+             "A = stock `lake build FV`; B = `turbo-lean --no-daemon " + report["turbo_command"] + " FV`. Order: ABAB….",
              "Ratio = arithmetic mean of paired stock/turbo wall times; values > 1 favor turbo.",
              "CPU and RSS cover the timed command and waited-for children; detached daemons may be excluded.",
              "", "## Provenance", "", "```json", json.dumps(report["machine"], indent=2), "```", ""]
@@ -151,14 +151,28 @@ def machine_info():
             "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat()}
 
 
+def validate_work_filesystem(work):
+    # Mirror pack::shared_cas_blobs_dir_for_store's device check, not a path prefix:
+    # aliases/bind mounts of /dev/shm also route to the UID-global blob cache.
+    existing = next(path for path in (work, *work.parents) if path.exists())
+    try:
+        shm_device = Path("/dev/shm").stat().st_dev
+    except FileNotFoundError:
+        return
+    if existing.stat().st_dev == shm_device:
+        raise ValueError("--work-dir must be on a different filesystem device from /dev/shm; "
+                         "turbo-lean would reuse the UID-global shared CAS blobs, invalidating cold runs")
+
+
 class Runner:
     def __init__(self, args, work, output):
         self.args, self.work, self.output = args, work, output
         self.token = uuid.uuid4().hex
-        self.env = dict(os.environ, TURBO_LEAN_TELEMETRY="off", TURBO_LEAN_NO_WORKTREE_LINK="1",
+        self.env = dict(os.environ, TURBO_LEAN_TELEMETRY="off",
                         TURBO_LEAN_NO_DAEMON="1", BENCH_CLIFV_RUN=self.token)
         # Override inherited search paths/cache locations and disable toolchain fallback.
-        for key in ("TURBO_LEAN_REMOTE_HTTP", "LEAN_PATH", "LEAN_SRC_PATH", "LEAN_SYSROOT"):
+        for key in ("TURBO_LEAN_REMOTE_HTTP", "TURBO_LEAN_NO_WORKTREE_LINK",
+                    "LEAN_PATH", "LEAN_SRC_PATH", "LEAN_SYSROOT"):
             self.env.pop(key, None)
         self.env["TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK"] = "0"
         self.cache = work / "turbo-cache"
@@ -196,10 +210,13 @@ class Runner:
 
     def stop_daemons(self):
         if self.has_stop:
-            subprocess.run([self.turbo, "--cache-dir", str(self.cache), "daemon", "stop"],
-                           cwd=self.work, env=self.env, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=30, check=True)
-        # Older releases lack `daemon stop`; also reap any marked orphan workers.
+            try:
+                subprocess.run([self.turbo, "--cache-dir", str(self.cache), "daemon", "stop"],
+                               cwd=self.work, env=self.env, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=30, check=False)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        # Always sweep marked workers, even when `daemon stop` fails or is unavailable.
         for sig in (signal.SIGTERM, signal.SIGKILL):
             for pid in self.own_daemons():
                 try:
@@ -214,9 +231,9 @@ class Runner:
 
     def command(self, arm):
         if arm == "stock":
-            return [self.lake, "build"]
+            return [self.lake, "build", "FV"]
         return [self.turbo, "--cache-dir", str(self.cache), self.args.turbo_command,
-                *(["FV"] if self.args.turbo_command == "check" else []), "--project-dir", "."]
+                "FV", "--project-dir", "."]
 
     def run(self, arm, label, command=None):
         self.stop_daemons()
@@ -269,7 +286,7 @@ class Runner:
     def baseline(self):
         # Prime Lake in BOTH arms. Prime turbo's persistent CAS separately, untimed.
         for arm in ("stock", "turbo"):
-            result = self.run(arm, "prime-lake", [self.lake, "build"])
+            result = self.run(arm, "prime-lake", self.command("stock"))
             if result["exit_code"] or not result["measurement_ok"]:
                 raise RuntimeError(f"baseline Lake build failed: {result['log']}")
         result = self.run("turbo", "prime-turbo")
@@ -348,6 +365,7 @@ def main(argv=None):
         raise ValueError("use new, separate --work-dir and --output directories")
     if sys.platform != "linux" or not Path("/usr/bin/time").is_file():
         raise ValueError("Linux /proc and GNU /usr/bin/time are required")
+    validate_work_filesystem(work)
     # Allocate only directories owned by this invocation; never delete a user's checkout.
     work.mkdir(parents=True)
     (output / "logs").mkdir(parents=True)
@@ -365,7 +383,7 @@ def main(argv=None):
             "turbo_version": capture([runner.turbo, "--version"], work, turbo_env),
             "lean_version": capture([runner.lake, "env", "lean", "--version"], work / "stock", turbo_env),
             "environment_overrides": {k: runner.env[k] for k in ("TURBO_LEAN_TELEMETRY", "TURBO_LEAN_HOME",
-                "TURBO_LEAN_STAGING_DIR", "TURBO_LEAN_NO_DAEMON", "TURBO_LEAN_NO_WORKTREE_LINK",
+                "TURBO_LEAN_STAGING_DIR", "TURBO_LEAN_NO_DAEMON",
                 "TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK", "TMPDIR", "ELAN_TOOLCHAIN")},
             "daemon_stop": "command + owned-worker cleanup" if runner.has_stop else "owned-process cleanup"})
         if any(s != "cold" for s in args.scenarios):

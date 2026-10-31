@@ -22,6 +22,12 @@ one pair is allowed for diagnostics but cannot produce a speedup claim.
 `--timeout SECONDS` limits each build/check (default unlimited); a timeout is an
 invalid measurement. Work and output directories must be new and separate.
 They are retained for inspection. The script never resets an existing checkout.
+The work directory must be on a different filesystem device from `/dev/shm`.
+The runner checks device IDs, including symlinks and alternate mount paths:
+turbo-lean routes stores on that device to UID-global shared CAS blobs that
+survive a cold reset. Such runs are rejected before creating directories;
+the runner never clears a user's shared cache. On other devices, the private
+`TMPDIR` receives shared blobs and is included in snapshots and cold resets.
 
 `--repo` can point to a local mirror of eth-act/clifv. `--sha` accepts a 7–40 digit
 hexadecimal commit ID, resolves it to a full SHA, and checks out that commit in
@@ -38,9 +44,10 @@ scripts/bench_clifv.sh --turbo "$PWD/target/release/turbo-lean" \
   --work-dir /scratch/clifv-check-work --output /scratch/clifv-check-results
 ```
 
-A is always `lake build` with the pinned project's default targets. B defaults to
-`turbo-lean build --project-dir .`; check mode uses `turbo-lean check FV
---project-dir .` over the whole default FV library. Check compares verification
+A is always `lake build FV`. B defaults to
+`turbo-lean --no-daemon build FV --project-dir .`; check mode uses
+`turbo-lean --no-daemon check FV --project-dir .` over the same FV library.
+The runner sets `TURBO_LEAN_NO_DAEMON=1` for these invocations. Check compares verification
 latency against build latency; it does not produce Lake's full build artifacts.
 Do not present a check ratio as a build acceleration. Exit-status parity is a
 coarse correctness check, not a proof of declaration-discovery/kernel parity;
@@ -66,6 +73,8 @@ and applies the selected edit. These copies, source resets, daemon shutdowns,
 and all warm-ups are outside the timer. Source timestamps are restored for the
 warm no-op; edited files receive a new timestamp. Restoring snapshots prevents
 pair 2 from accidentally measuring a no-op after pair 1 already built the edit.
+Python `copytree` snapshots preserve symlinks but do not preserve hardlinks;
+restored artifacts are independent copies, which can affect cache/link costs.
 
 | Scenario | State immediately before each arm |
 |---|---|
@@ -87,14 +96,17 @@ Both arms and all setup/cleanup subprocesses run with
 `TURBO_LEAN_TELEMETRY=off`. This is confined to the benchmark process environment;
 no tests, global shell settings, project settings, or existing CI telemetry
 configuration are modified. Private `TURBO_LEAN_HOME`,
-`TURBO_LEAN_STAGING_DIR` (under `/dev/shm`) and `TMPDIR` prevent reuse of a user's
-CAS or workers. `TURBO_LEAN_NO_WORKTREE_LINK=1` prevents automatic sharing on
-versions supporting that option. `TURBO_LEAN_NO_DAEMON=1` uses foreground work on
+`TURBO_LEAN_STAGING_DIR` (under `/dev/shm`), `TMPDIR`, and separate clones isolate
+the arms from a user's CAS and checkout. `TURBO_LEAN_NO_WORKTREE_LINK` is unset,
+including when inherited: on current main it forbids writing `.lake`, so it
+would refuse uncached modules in cold and edited workloads.
+`TURBO_LEAN_NO_DAEMON=1` uses foreground work on
 versions supporting it, so GNU time can account for that work.
 
 Before and after every timed/prime command the runner invokes `turbo-lean daemon
-stop` with the private cache if that subcommand is available. Older versions use
-SIGTERM, then SIGKILL if necessary. The fallback targets only this UID's
+stop` with the private cache if that subcommand is available. A nonzero exit or
+timeout does not abort cleanup: the runner always sweeps with SIGTERM, then
+SIGKILL if necessary. The sweep targets only this UID's
 `turbo-lean`/`turbo_zygote*` processes carrying this invocation's unique environment
 marker. It never uses broad `pkill`, kills another user's processes, or stops
 unrelated turbo-lean sessions. Cleanup failure aborts the experiment. Private
