@@ -4335,33 +4335,37 @@ pub fn run_pr_verify_command(
                     cross_args.clone(),
                 );
                 let cross_res = if let Some(ref z_url) = fast_local_zygote_url {
-                    pack::try_zygote_url_check_shard_inner_with_inflight_detailed(z_url, &zreq, || {
-                        let now = crate::db::now_unix();
-                        batch_to_publish.reserve(total_uncached);
-                        for (_rel_path, file_uncached, _) in &uncached_by_file {
-                            for (k, sh) in file_uncached {
-                                if let Ok(r_bytes) = serialize_shard_receipt_bytes(sh, now) {
-                                    batch_to_publish.push((
-                                        k.clone(),
-                                        sh.name.clone(),
-                                        r_bytes,
-                                        1i64,
-                                    ));
+                    pack::try_zygote_url_check_shard_inner_with_inflight_detailed(
+                        z_url,
+                        &zreq,
+                        || {
+                            let now = crate::db::now_unix();
+                            batch_to_publish.reserve(total_uncached);
+                            for (_rel_path, file_uncached, _) in &uncached_by_file {
+                                for (k, sh) in file_uncached {
+                                    if let Ok(r_bytes) = serialize_shard_receipt_bytes(sh, now) {
+                                        batch_to_publish.push((
+                                            k.clone(),
+                                            sh.name.clone(),
+                                            r_bytes,
+                                            1i64,
+                                        ));
+                                    }
                                 }
                             }
-                        }
-                        let _ = store.prestage_theorem_shard_blobs(&batch_to_publish);
-                        if store
-                            .begin_inflight_publish_theorem_shards(
-                                &toolchain,
-                                &trust_domain,
-                                &batch_to_publish,
-                            )
-                            .is_ok()
-                        {
-                            inflight_tx_open = true;
-                        }
-                    })
+                            let _ = store.prestage_theorem_shard_blobs(&batch_to_publish);
+                            if store
+                                .begin_inflight_publish_theorem_shards(
+                                    &toolchain,
+                                    &trust_domain,
+                                    &batch_to_publish,
+                                )
+                                .is_ok()
+                            {
+                                inflight_tx_open = true;
+                            }
+                        },
+                    )
                 } else if !is_untrusted {
                     pack::try_local_zygote_check_shard_detailed(store, &env_vars, &zreq)
                 } else {
@@ -4374,7 +4378,8 @@ pub fn run_pr_verify_command(
                         inflight_tx_open = false;
                     }
                     batch_to_publish.clear();
-                    cross_res.context("Zygote kernel gate rejected the cross-file PR shard batch")?;
+                    cross_res
+                        .context("Zygote kernel gate rejected the cross-file PR shard batch")?;
                     if !is_untrusted && env_vars.is_empty() {
                         if let Ok((ev, _)) = resolve_lake_env(store, &canon_dir) {
                             env_vars = ev;
@@ -4631,7 +4636,10 @@ pub fn run_pr_verify_command(
                                         }
                                         local_publish.clear();
                                         fast_res.with_context(|| {
-                                            format!("Zygote kernel gate rejected PR shards in {}", rel_path)
+                                            format!(
+                                                "Zygote kernel gate rejected PR shards in {}",
+                                                rel_path
+                                            )
                                         })?;
                                     }
                                 }
@@ -4789,39 +4797,40 @@ pub fn run_pr_verify_command(
                                 };
                                 let single_res =
                                     pack::try_zygote_url_check_shard_inner_with_inflight_detailed(
-                                    z_url,
-                                    &zreq,
-                                    || {
-                                        if file_uncached.len() == 1 {
-                                            if let Ok(r_bytes) =
-                                                serialize_shard_receipt_bytes(sh, now)
-                                            {
-                                                local_publish.push((
-                                                    k.clone(),
-                                                    sh.name.clone(),
-                                                    r_bytes,
-                                                    1i64,
-                                                ));
-                                                let _ = crate::db::prestage_theorem_shard_blobs_at(
-                                                    store_root,
-                                                    &local_publish,
-                                                );
-                                                if let Some(st) = inflight_store {
-                                                    if st
-                                                        .begin_inflight_publish_theorem_shards(
-                                                            &toolchain,
-                                                            &trust_domain,
+                                        z_url,
+                                        &zreq,
+                                        || {
+                                            if file_uncached.len() == 1 {
+                                                if let Ok(r_bytes) =
+                                                    serialize_shard_receipt_bytes(sh, now)
+                                                {
+                                                    local_publish.push((
+                                                        k.clone(),
+                                                        sh.name.clone(),
+                                                        r_bytes,
+                                                        1i64,
+                                                    ));
+                                                    let _ =
+                                                        crate::db::prestage_theorem_shard_blobs_at(
+                                                            store_root,
                                                             &local_publish,
-                                                        )
-                                                        .is_ok()
-                                                    {
-                                                        local_tx_open = true;
+                                                        );
+                                                    if let Some(st) = inflight_store {
+                                                        if st
+                                                            .begin_inflight_publish_theorem_shards(
+                                                                &toolchain,
+                                                                &trust_domain,
+                                                                &local_publish,
+                                                            )
+                                                            .is_ok()
+                                                        {
+                                                            local_tx_open = true;
+                                                        }
                                                     }
                                                 }
                                             }
-                                        }
-                                    },
-                                );
+                                        },
+                                    );
                                 if matches!(single_res, Ok(Some(_))) {
                                     single_ok = true;
                                 } else {
@@ -6622,7 +6631,10 @@ end Fixture
         ));
         let _ = fs::remove_dir_all(&repo_dir);
         fs::create_dir_all(&repo_dir)?;
-        fs::write(repo_dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            repo_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )?;
         let base = "import Lean\ntheorem t : 2 + 2 = 4 := rfl\n";
         fs::write(repo_dir.join("A.lean"), base)?;
         git_init_and_commit(&repo_dir, "base")?;
@@ -6657,7 +6669,12 @@ end Fixture
                 None,
             );
             let err = res.expect_err(&format!("metaprogram sorry #{} was accepted", i));
-            assert!(format!("{:#}", err).contains("sorryAx"), "#{}: {:#}", i, err);
+            assert!(
+                format!("{:#}", err).contains("sorryAx"),
+                "#{}: {:#}",
+                i,
+                err
+            );
         }
         let _ = fs::remove_dir_all(&repo_dir);
         Ok(())

@@ -3708,8 +3708,13 @@ mod tests {
             ))
         };
         let err = http("Remote `lean` shard verification failed for `t`").unwrap_err();
-        assert!(err.to_string().starts_with("Remote `lean` shard verification failed"));
-        assert!(matches!(http("Zygote import unavailable for `t`"), Ok(None)));
+        assert!(err
+            .to_string()
+            .starts_with("Remote `lean` shard verification failed"));
+        assert!(matches!(
+            http("Zygote import unavailable for `t`"),
+            Ok(None)
+        ));
         assert!(matches!(
             check_shard_http_error(anyhow::anyhow!("Connection refused (os error 111)")),
             Ok(None)
@@ -3732,7 +3737,15 @@ mod tests {
         )]);
         let run = |src: &str| {
             let audit = std::collections::HashSet::from(["tgt".to_string()]);
-            run_audited_lean_shard(&store, Path::new("lean"), &env, Some(&dir), src, &audit, &[])
+            run_audited_lean_shard(
+                &store,
+                Path::new("lean"),
+                &env,
+                Some(&dir),
+                src,
+                &audit,
+                &[],
+            )
         };
         let stubs = "namespace N\ntheorem s1 (n : Nat) {m : Nat} : n + m = m + n := sorry\ntheorem s2 : 1 = 1 := sorry\nend N\nnamespace M\ntheorem s2 : 2 = 2 := sorry\nend M\n";
         // Host-named prefix stubs (binders, namespaces, a short name used twice) are exempt; the

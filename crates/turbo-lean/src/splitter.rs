@@ -94,11 +94,6 @@ pub fn axiom_allowed_under(ax: &str, allowed: &[String]) -> bool {
         && allowed.iter().any(|p| glob_match(p, ax))
 }
 
-/// Whether the policy admits kernel axiom `ax` (patterns never admit `sorryAx` or `Lean.trustCompiler`).
-pub fn axiom_allowed(ax: &str) -> bool {
-    axiom_allowed_under(ax, &allowed_axioms())
-}
-
 /// Text of the nearest `turbo-lean.toml` at or above `dir`, read at git revision `rev` when given
 /// (pr-verify uses `--base`, so a PR cannot change the policy it is checked under).
 pub fn read_project_config(dir: &std::path::Path, rev: Option<&str>) -> Option<String> {
