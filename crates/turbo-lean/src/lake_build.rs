@@ -1760,11 +1760,7 @@ pub(crate) fn load_verified_project_manifest(
     {
         return None;
     }
-    manifest.dep_lib_lean_dirs = cfg
-        .dep_pkgs
-        .iter()
-        .map(|dp| dp.pkg_root.join(&dp.build_dir).join(&dp.lean_lib_dir))
-        .collect();
+    manifest.cfg = Some(cfg);
     Some(manifest)
 }
 
@@ -1804,32 +1800,33 @@ fn verify_project_module_entry_and_sidecars(
         return false;
     }
     // P0-4: reject `.olean`s elaborated against an older artifact of one of their imports.
-    if !crate::module_builder::verified_entry_imports_current(
-        entry,
-        &hdr.imports,
-        manifest,
-        |imp| {
-            let rel_slash = crate::module_builder::module_name_to_rel_slash(imp);
-            let dep_src = resolve_project_lean_source(canon_dir, &rel_slash)?;
-            Some(
-                dep_src
+    let Some(cfg) = manifest.cfg.as_ref() else {
+        return false;
+    };
+    if !crate::module_builder::verified_entry_imports_current(entry, &hdr.imports, |imp, pin| {
+        let rel_slash = crate::module_builder::module_name_to_rel_slash(imp);
+        match resolve_project_lean_source(canon_dir, &rel_slash) {
+            Some(dep_src) => {
+                let dep_rel = dep_src
                     .strip_prefix(canon_dir)
                     .unwrap_or(&dep_src)
                     .to_string_lossy()
-                    .replace('\\', "/"),
-            )
-        },
-        |imp| {
-            let rel_slash = crate::module_builder::module_name_to_rel_slash(imp);
-            let mut found = manifest
-                .dep_lib_lean_dirs
-                .iter()
-                .map(|d| d.join(format!("{rel_slash}.olean")))
-                .filter(|p| p.is_file());
-            let olean = found.next().filter(|_| found.next().is_none())?;
-            crate::module_builder::compute_olean_artifact_set_digest(&olean).ok()
-        },
-    ) {
+                    .replace('\\', "/");
+                pin.is_some_and(|pin| {
+                    manifest
+                        .modules
+                        .get(&dep_rel)
+                        .is_some_and(|e| e.olean_artifact_digest == pin)
+                })
+            }
+            None => crate::module_builder::external_import_pin_current(
+                cfg,
+                &manifest.dep_import_memo,
+                imp,
+                pin,
+            ),
+        }
+    }) {
         return false;
     }
     let lib_lean_dir = canon_dir.join(".lake/build/lib/lean");

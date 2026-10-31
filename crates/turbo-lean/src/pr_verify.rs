@@ -5938,7 +5938,7 @@ end Fixture
                 pkg_config_digest: cfg.root_pkg.config_digest.clone(),
                 allowed_axioms: crate::splitter::allowed_axioms(),
                 modules: BTreeMap::new(),
-                dep_lib_lean_dirs: Vec::new(),
+                ..Default::default()
             });
         // Pin project-local imports to their (already recorded) entries, like a real build.
         let import_olean_digests = crate::module_builder::parse_header_info(src_raw)
