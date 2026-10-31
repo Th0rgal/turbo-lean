@@ -1765,10 +1765,9 @@ pub(crate) fn load_verified_project_manifest(
 }
 
 /// P0-4: whether `entry` (a root-package module importing `imports`) was elaborated against the
-/// current artifacts of its direct imports: project-local pins compare against their manifest
-/// entries, other imports via `external_import_pin_current`.
+/// current artifacts of its direct imports, each resolved as at build time and verified with its
+/// whole closure (`module_builder::import_pin_current`).
 fn entry_import_pins_current(
-    canon_dir: &Path,
     manifest: &crate::module_builder::VerifiedDepManifest,
     entry: &crate::module_builder::VerifiedDepModuleEntry,
     imports: &[String],
@@ -1777,28 +1776,7 @@ fn entry_import_pins_current(
         return false;
     };
     crate::module_builder::verified_entry_imports_current(entry, imports, |imp, pin| {
-        let rel_slash = crate::module_builder::module_name_to_rel_slash(imp);
-        match resolve_project_lean_source(canon_dir, &rel_slash) {
-            Some(dep_src) => {
-                let dep_rel = dep_src
-                    .strip_prefix(canon_dir)
-                    .unwrap_or(&dep_src)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                pin.is_some_and(|pin| {
-                    manifest
-                        .modules
-                        .get(&dep_rel)
-                        .is_some_and(|e| e.olean_artifact_digest == pin)
-                })
-            }
-            None => crate::module_builder::external_import_pin_current(
-                cfg,
-                &manifest.dep_import_memo,
-                imp,
-                pin,
-            ),
-        }
+        crate::module_builder::import_pin_current(cfg, &manifest.dep_import_memo, imp, pin)
     })
 }
 
@@ -1843,7 +1821,7 @@ fn verify_project_module_entry_and_sidecars(
         true,
         true,
         true,
-        entry_import_pins_current(canon_dir, manifest, entry, &hdr.imports),
+        entry_import_pins_current(manifest, entry, &hdr.imports),
         true,
     ) {
         return false;
@@ -2306,7 +2284,6 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
                         && !(m.cfg.as_ref().is_some_and(|cfg| {
                             crate::module_builder::entry_artifacts_current(cfg, &dep_olean, e)
                         }) && entry_import_pins_current(
-                            canon_dir,
                             m,
                             e,
                             adj.get(mod_name).map_or(&[][..], Vec::as_slice),

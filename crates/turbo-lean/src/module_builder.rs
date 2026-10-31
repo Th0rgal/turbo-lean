@@ -4591,7 +4591,8 @@ fn read_pkg_verified_manifest(
     .then_some(manifest)
 }
 
-/// Where a non-root-package import resolves, in `build_module_dag_with_trust` (trusted) order.
+/// Where an import resolves after the root package, in `build_module_dag_with_trust` (trusted)
+/// order: dependency package, toolchain, prebuilt `.olean`.
 pub(crate) enum ImportSite {
     Module(Box<DiscoveredModuleSpec>),
     Toolchain,
@@ -4665,16 +4666,21 @@ pub(crate) fn verified_entry_imports_current(
             .all(|imp| pin_current(imp, entry.import_olean_digests.get(imp).map(String::as_str)))
 }
 
-/// Check-time judgement of a non-root-package import pinned at `pin` from the root package:
-/// prebuilt `.olean`s are re-digested; dependency-package imports must have a consistent
-/// closure (`dep_pkg_import_pins_consistent`), memoized per manifest load.
-pub(crate) fn external_import_pin_current(
+/// Check-time judgement of an import pinned at `pin` from the root package, resolved as at build
+/// time (root package first): prebuilt `.olean`s are re-digested; root- and dependency-package
+/// modules must have a consistent closure (`dep_pkg_import_pins_consistent`), memoized per
+/// manifest load.
+pub(crate) fn import_pin_current(
     cfg: &ProjectConfig,
     memo: &DepImportMemo,
     imp: &str,
     pin: Option<&str>,
 ) -> bool {
-    match (resolve_import_site(cfg, imp), pin) {
+    let site = match resolve_module_in_package(&cfg.root_pkg, true, imp) {
+        Some(spec) => ImportSite::Module(Box::new(spec)),
+        None => resolve_import_site(cfg, imp),
+    };
+    match (site, pin) {
         (ImportSite::Toolchain, None) => true,
         (ImportSite::Prebuilt(olean), Some(pin)) => olean_digest_is(cfg, &olean, pin),
         (ImportSite::Module(spec), Some(pin)) => {
