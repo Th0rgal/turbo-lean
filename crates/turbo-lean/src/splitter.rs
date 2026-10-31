@@ -5581,3 +5581,7 @@ end MathlibEdgeCases
         );
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/discovery.rs"]
+mod corpus_discovery;
