@@ -1267,27 +1267,37 @@ fn source_may_have_hygiene_issue(s: &str) -> bool {
         || s.contains("axiom")
 }
 
-// Caller keys are opaque; the server adds its own effective-option namespace.
-// Empty options retain the legacy identity.
+// Caller keys are opaque; the server adds its own effective-option and verifier namespace.
+// v2: every key (including empty options) is bound to the verifier provenance, so receipts
+// published before the kernel replay (v1 and legacy unbound keys) are never consulted.
 fn option_bound_http_key(key: &str, digest: Option<&str>) -> String {
-    match digest {
-        None => key.to_string(),
-        Some(digest) => {
-            let mut h = blake3::Hasher::new();
-            h.update(b"http-shard-options-v1:");
-            h.update(&(key.len() as u64).to_le_bytes());
-            h.update(key.as_bytes());
-            h.update(digest.as_bytes());
-            h.finalize().to_hex().to_string()
-        }
-    }
+    let mut h = blake3::Hasher::new();
+    h.update(b"http-shard-options-v2:");
+    h.update(&crate::zygote::ZYGOTE_SCANNER_VERSION.to_le_bytes());
+    h.update(&crate::zygote::ZYGOTE_REPLAY_VERSION.to_le_bytes());
+    h.update(&(key.len() as u64).to_le_bytes());
+    h.update(key.as_bytes());
+    h.update(digest.unwrap_or("").as_bytes());
+    h.finalize().to_hex().to_string()
 }
 
 fn option_bound_receipt(mut receipt: serde_json::Value, digest: Option<&str>) -> Result<Vec<u8>> {
     // Explicit empty provenance distinguishes new empty-option receipts from legacy
     // receipts whose publishing options are unknown.
     receipt["lean_args_digest"] = serde_json::Value::String(digest.unwrap_or("").to_string());
+    receipt["scanner_version"] = crate::zygote::ZYGOTE_SCANNER_VERSION.into();
+    receipt["replay_version"] = crate::zygote::ZYGOTE_REPLAY_VERSION.into();
     Ok(serde_json::to_vec(&receipt)?)
+}
+
+/// A receipt is reusable only with matching options and current verifier provenance.
+fn http_receipt_matches(receipt: &serde_json::Value, digest: Option<&str>) -> bool {
+    let version = |field: &str| receipt[field].as_u64().and_then(|v| u32::try_from(v).ok());
+    receipt["lean_args_digest"].as_str() == Some(digest.unwrap_or(""))
+        && crate::zygote::verifier_provenance_ok(
+            version("scanner_version").unwrap_or(0),
+            version("replay_version").unwrap_or(0),
+        )
 }
 
 fn option_matching_http_hits(
@@ -1298,13 +1308,10 @@ fn option_matching_http_hits(
 ) -> Result<std::collections::HashMap<String, String>> {
     let mut hits = store.batch_get_theorem_shards_readonly(keys, trust_domain)?;
     hits.retain(|_, blob_hash| {
-        let receipt = fs::read(store.blob_path(blob_hash))
+        fs::read(store.blob_path(blob_hash))
             .ok()
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
-        receipt
-            .as_ref()
-            .and_then(|r| r["lean_args_digest"].as_str())
-            == Some(digest.unwrap_or(""))
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|r| http_receipt_matches(&r, digest))
     });
     Ok(hits)
 }
@@ -2279,7 +2286,7 @@ mod bind_auth_tests {
             &tc,
             &domain,
             &[(
-                empty_key.clone(),
+                option_bound_http_key(&empty_key, None),
                 "http_options_second".into(),
                 option_bound_receipt(serde_json::json!({}), None)?,
                 1,
@@ -2301,7 +2308,10 @@ mod bind_auth_tests {
         assert_eq!(hits.len(), 1);
         let (_, _, entries) = publication.unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].0, batch.items[0].shard_key);
+        assert_eq!(
+            entries[0].0,
+            option_bound_http_key(&batch.items[0].shard_key, None)
+        );
         batch.items.pop();
         batch.coalesced_shard_source = source.into();
         batch.items[0].shard_key = batch_key;
@@ -2327,8 +2337,69 @@ mod bind_auth_tests {
         assert_eq!(entries.len(), 1);
         batch.lean_args = vec!["--plugin=unsafe.so".into()];
         assert!(execute_check_shards_batch_payload_deferred(&mut store, &batch, None).is_err());
-        assert_eq!(option_bound_http_key("legacy-key", None), "legacy-key");
+        assert_ne!(option_bound_http_key("legacy-key", None), "legacy-key");
         let _ = std::fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    /// Upgrade path: receipts a pre-replay host published for a `forge_bad` shard (an elaborator
+    /// that adds `bad : False` under `debug.skipKernelTC`, invisible to source hygiene) — at the
+    /// legacy unbound key and at the `http-shard-options-v1` key — are not cache hits; the shard
+    /// is re-verified, the kernel replay rejects it, and nothing is certified.
+    #[test]
+    fn pre_replay_http_receipts_are_rejected_after_upgrade() -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("turbo_http_replay_{}", crate::pack::next_tmp_id()));
+        let mut store = TurboStore::open(Some(&dir))?;
+        let source = "import Lean\nopen Lean Elab Command\nelab \"forge_bad\" : command => do\n  let k := Name.mkStr (Name.mkStr .anonymous \"debug\") (\"skip\" ++ \"KernelTC\")\n  withScope (fun sc => { sc with opts := sc.opts.setBool k true }) do\n    liftCoreM <| addDecl <| .thmDecl {\n      name := `bad, levelParams := [], type := mkConst ``False, value := mkConst ``True.intro }\nforge_bad\ntheorem uses_bad : False := bad\n";
+        crate::splitter::reject_checking_weakening(source)?;
+        let v1_key = |key: &str| {
+            let mut h = blake3::Hasher::new();
+            h.update(b"http-shard-options-v1:");
+            h.update(&(key.len() as u64).to_le_bytes());
+            h.update(key.as_bytes());
+            h.update(b"");
+            h.finalize().to_hex().to_string()
+        };
+        // Exactly what main before this PR published: options-bound, no replay provenance.
+        let stale = br#"{"decl":"uses_bad","prefix_env_hash":"","stmt_hash":"","proof_hash":"","verified_at":1,"lean_args_digest":""}"#;
+        let mut planted = Vec::new();
+        for key in ["forge-single", "forge-batch"] {
+            planted.push((key.to_string(), "uses_bad".to_string(), stale.to_vec(), 1));
+            planted.push((v1_key(key), "uses_bad".to_string(), stale.to_vec(), 1));
+        }
+        store.batch_publish_theorem_shards("leanprover/lean4:v4.35.0", "trusted", &planted)?;
+        let single = CheckShardHttpRequest {
+            decl: "uses_bad".into(),
+            shard_key: "forge-single".into(),
+            shard_source: source.into(),
+            toolchain: "leanprover/lean4:v4.35.0".into(),
+            ..Default::default()
+        };
+        match execute_check_shard_payload(&mut store, &single) {
+            Ok(reply) => panic!("pre-replay receipt certified forge_bad: {reply}"),
+            Err(e) => assert!(format!("{e:#}").contains("bad"), "{e:#}"),
+        }
+        let batch = CheckShardsBatchRequest {
+            items: vec![crate::pack::CheckShardBatchItem {
+                shard_key: "forge-batch".into(),
+                decl_name: "uses_bad".into(),
+                ..Default::default()
+            }],
+            coalesced_shard_source: source.into(),
+            toolchain: "leanprover/lean4:v4.35.0".into(),
+            ..Default::default()
+        };
+        let (reply, publication, hits) =
+            execute_check_shards_batch_payload_deferred(&mut store, &batch, None)?;
+        assert!(
+            !reply.ok && reply.cache_hits == 0 && publication.is_none() && hits.is_empty(),
+            "pre-replay batch receipt certified forge_bad: {reply:?}"
+        );
+        fs::remove_dir_all(dir)?;
         Ok(())
     }
 
@@ -2341,6 +2412,15 @@ mod bind_auth_tests {
         let mut store = TurboStore::open(Some(&dir))?;
         let entries = [
             ("legacy", br#"{"decl":"unknown-options"}"#.to_vec()),
+            // What a host before the kernel replay published: option-bound but no replay version.
+            (
+                "pre-replay",
+                br#"{"decl":"d","lean_args_digest":"","scanner_version":1}"#.to_vec(),
+            ),
+            (
+                "pre-replay-options",
+                br#"{"decl":"d","lean_args_digest":"digest"}"#.to_vec(),
+            ),
             ("empty", option_bound_receipt(serde_json::json!({}), None)?),
             (
                 "options",

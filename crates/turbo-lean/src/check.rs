@@ -35,7 +35,9 @@ pub(crate) fn make_shard_receipt_bytes(
         "prefix_env_hash": prefix_env_hash,
         "stmt_hash": stmt_hash,
         "proof_hash": proof_hash,
-        "verified_at": verified_at
+        "verified_at": verified_at,
+        "scanner_version": crate::zygote::ZYGOTE_SCANNER_VERSION,
+        "replay_version": crate::zygote::ZYGOTE_REPLAY_VERSION
     }))?)
 }
 

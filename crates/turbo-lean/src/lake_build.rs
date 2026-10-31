@@ -593,7 +593,11 @@ pub(crate) fn compute_shard_key_with_args(
 ) -> String {
     let mut key_hasher = blake3::Hasher::new();
     // v3: replay-audited verdicts. v2: v1 receipts may come from Zygote replies vetted without the stderr panic scan.
+    // The verifier provenance versions are bound too, so v2 (pre-replay) receipts never match
+    // and any later scanner/replay bump retires every older receipt.
     key_hasher.update(b"theorem-shard-v3:");
+    key_hasher.update(&crate::zygote::ZYGOTE_SCANNER_VERSION.to_le_bytes());
+    key_hasher.update(&crate::zygote::ZYGOTE_REPLAY_VERSION.to_le_bytes());
     key_hasher.update(toolchain.as_bytes());
     key_hasher.update(b":");
     key_hasher.update(shard.prefix_env_hash.as_bytes());
@@ -1142,7 +1146,11 @@ pub(crate) fn compute_project_interface_key_fast_summary(
     trust_domain: &str,
 ) -> Result<(String, String, BTreeMap<String, String>)> {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"turbo-lean-build-v2\n");
+    // v3: `module_full` outputs must come from kernel-replayed (non-toolchain) modules; v2
+    // outputs predate the replay. The provenance versions retire outputs across later bumps.
+    hasher.update(b"turbo-lean-build-v3\n");
+    hasher.update(&crate::zygote::ZYGOTE_SCANNER_VERSION.to_le_bytes());
+    hasher.update(&crate::zygote::ZYGOTE_REPLAY_VERSION.to_le_bytes());
     hasher.update(toolchain.as_bytes());
     hasher.update(b"\n");
     hasher.update(trust_domain.as_bytes());
