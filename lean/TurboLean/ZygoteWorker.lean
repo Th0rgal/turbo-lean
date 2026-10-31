@@ -574,6 +574,8 @@ def runCommandsFromState
 def writeVerifiedModuleOlean (baseEnv finalEnv : Environment) (modName : Name) (oleanPath : System.FilePath) : IO Bool := do
   if modName.isAnonymous || finalEnv.mainModule != modName then
     return false
+  if !(← kernelReplayNewDecls baseEnv finalEnv).isEmpty then
+    return false
   let (clean, kErrs) ← auditNewKernelDecls baseEnv finalEnv false
   if !clean || !kErrs.isEmpty then
     return false
