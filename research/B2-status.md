@@ -1,7 +1,7 @@
 # B2 status
 
 Baseline: `5508b9f`; clifv `5018b9509dc124154dbe08a5bd85862595d8eab7`.
-Checkpoint: 2026-10-31 18:28 UTC. The executable lowering lives in
+Checkpoint: 2026-10-31 18:53 UTC. The executable lowering lives in
 `lean/LeanNative/Backend/Clif.lean`; `compile-clif` calls that definition.
 The active root and strict transitive axiom audit pass kernel checks on Lean 4.34.1.
 
@@ -32,10 +32,10 @@ Six compiler/proof source pairs are committed byte-identical (Types,
 AST, Codec, Value, Eval, Clif). `scripts/check_b2_source_identity.py`
 verifies them and a clean pinned clifv. `.github/workflows/b2.yml` enforces
 source identity, the proof build, and compiler-toolchain integration.
-Remote CI for scope activation `4a5347d` and documentation checkpoint `403b858` passed:
-https://github.com/Th0rgal/turbo-lean/actions/runs/41226888299 and
-https://github.com/Th0rgal/turbo-lean/actions/runs/41228152932 .
-These verify the active scope proofs and audit in fresh default-root builds.
+Remote CI for the audited return bridge `fb3c3ef` passed:
+https://github.com/Th0rgal/turbo-lean/actions/runs/41229563046 .
+This verifies the active scope proofs, return bridge, and strict audit in a
+fresh default-root build, plus source identity and compiler integration.
 The local Lean 4.35 CoreCLI integration build passed; the actual compiler
 dispatcher emitted collatz_steps CLIF. `research/b2-compiler-smoke.lean`
 records that check and CI runs it too.
@@ -131,10 +131,23 @@ An isolated kernel check of the draft's exact `prepared_call_free` statement
 passed with closure `[propext]`. Complete O6 composition is still pending the
 genuine upstream contract dependencies; this isolated result does not upgrade O6.
 
-At 18:28 UTC the same FinalDirect scheduler is checking the upstream
+At 18:27 UTC the same FinalDirect scheduler was checking the upstream
 `FV.Backend.Proof.RefinesInsts` module; the follow-up checker is live and waiting
 for genuine contract dependencies. The UInt64 return bridge was promoted from
 its passing isolated check into BackendEntry and the strict audit, then used
 in the excluded end-to-end draft. BackendEntry, the full active audit, and the
 active root passed kernel checks at 18:27 UTC. Full O7 composition remains
 unchecked; this bridge does not establish an AArch64 execution by itself.
+
+At 18:53 UTC the original scheduler is checking `FV.Backend.Proof.RegallocInstsZR`
+with about 7.2 GiB RSS; `RegallocInstsInt` finished. No contract or end-to-end
+result is available. A local watcher waits for the complete current compilation
+wave to be audited and cached, as recorded by the verified-source manifest's
+`FV/E2E/RegLevelMachine.lean` entry. That checkpoint has not yet occurred.
+After that checkpoint, the planned single scheduler targets `B2.EndToEnd` from
+the proof package, with two compiler workers and four Lean threads each. The
+host has eight CPUs and roughly 43 GiB available memory. Completed per-module
+cache entries can be reused across the root/dependency boundary. This checks
+the B2 result closures while keeping the pinned clifv sources unchanged;
+unrelated native-decided witnesses in clifv are outside those claimed closures.
+The replacement build has not started and does not establish O6 or O7.
