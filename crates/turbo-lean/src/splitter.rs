@@ -1143,19 +1143,11 @@ fn split_mutual_block_subspans<'a>(
 
     // Determine declaration indentation, not proof indentation: Lean also accepts
     // an unindented `:=` continuation inside a mutual block.
-    let mut min_indent = usize::MAX;
-    for l in body_clean.lines() {
-        let t = l.trim();
-        if is_top_level_command_start(t) {
-            let ind = l.len() - l.trim_start().len();
-            if ind < min_indent {
-                min_indent = ind;
-            }
-        }
-    }
-    if min_indent == usize::MAX {
-        return None;
-    }
+    let min_indent = body_clean
+        .lines()
+        .filter(|l| is_top_level_command_start(l.trim_start()))
+        .map(|l| l.len() - l.trim_start().len())
+        .min()?;
 
     let bytes = body_orig.as_bytes();
     let total_len = bytes.len();
