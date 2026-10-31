@@ -1,4 +1,5 @@
 import B2.CollatzClif
+import B2.BackendEval
 import FV.Backend.Regalloc
 import FV.Backend.Encode
 import FV.Backend.InputScope
@@ -7,7 +8,7 @@ import Std.Data.HashSet.Lemmas
 
 /-! O5 artifacts from clifv's real executable pipeline, including its checked spill allocation.
 These definitions are not a model of compilation; each successful equation is kernel-checked. -/
-set_option maxRecDepth 40000
+set_option maxRecDepth 20000
 set_option maxHeartbeats 4000000
 namespace B2.Artifacts
 open Backend

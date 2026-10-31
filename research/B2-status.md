@@ -53,12 +53,12 @@ connection, absent-site contracts, and composition code. No O7 claim yet.
 
 The session cgroup has `memory.max = 16 GiB` and `memory.high = 14.4 GiB`.
 Running artifact checks alongside four upstream proof workers caused severe
-reclaim/I/O stalls. Artifact checks are stopped: finish the existing backend
-build first, then run one heavyweight check at a time. The live backend build
+reclaim/I/O stalls. The backend build now runs one compiler at a time. Diagnostic artifact checks
+are capped at 2–3 GiB; avoid overlapping unrestricted heavy checks. The live backend build
 is PID 1926474, from `research/b2-proofs`, logging to `/tmp/b2-final-cone.log`.
-RefinesInsts has finished; RegallocInstsInt/ZR and dependent modules remain.
-The Lake scheduler was temporarily stopped to let the two largest existing
-proofs finish; `/tmp/b2-resume-lake.py` resumes it when they exit.
+RefinesInsts, RefinesInsts2, RegallocInstsInt/ZR, IselTermsImm and
+IselCtlUnmatch have finished. The temporary Lake pause is over; the old
+`/tmp/b2-resume-lake.py` helper has finished.
 `/tmp/b2-limit-lean-jobs.py 1926474` now limits its compiler subprocesses to one
 at a time (each still has four Lean threads), logging to
 `/tmp/b2-limit-lean-jobs.log`. Two smaller jobs were intentionally deferred to
@@ -94,3 +94,12 @@ Resource note: Lake 5.0.0 / Lean 4.34.1 rejects `lake -j4` with
 cones; telemetry is off. Ordinary tactic reduction of the first smoke
 test grew past 12 GB, so it was stopped; `decide +kernel` completes the
 same real CLIF checks in seconds, with audited allowed axioms.
+
+Artifact reduction diagnosis (2026-10-31): raising `maxRecDepth` alone did not
+certify any pipeline equation. Equation generation for `Backend.mkVariant`
+recurses through the generated ISLE tables; equation generation on partially
+applied `externCtor` also exhausted its resource limit. The excluded WIP
+`B2.BackendEval` provides explicit unfolding equations and proof-producing
+lookup reduction, leaving upstream sources untouched. Its isolated actual
+`opcodeV "Iconst"` lookup checked with only the allowed axioms; full lowering remains open.
+The original ISLE interpreter and its default million-step fuel remain in use.
