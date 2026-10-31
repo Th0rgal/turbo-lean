@@ -6,7 +6,10 @@ class ExampleSelection(unittest.TestCase):
         for name in ('Clif.Ty.isInt.eq_7', 'Isle.Program.patText.eq_def',
                      'Isle.Expr.rec_1', 'Clif.Stmt.mk.injEq',
                      'A._proof_1.member', '_private.FV.File.0.foo',
-                     'Backend.instReprV.repr', 'A.match_1', 'A.foo_eq_2'):
+                     'Backend.instReprV.repr', 'A.match_1', 'A.foo_eq_2',
+                     'Backend.Proof.Flow.loadConstantFull_ok.match_1_1',
+                     'Backend.Proof.Driver.prep_sound.match_1_6',
+                     'Backend.Proof.Driver.prep_sound.match_1_8'):
             with self.subTest(name=name):self.assertFalse(nonaux(name))
 
     def test_named_declarations_remain_candidates(self):

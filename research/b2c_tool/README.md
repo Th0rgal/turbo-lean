@@ -95,6 +95,11 @@ and push the final research-only artifacts, then run `audit.py`. Its read-only
 gates inspect all 20 datasets, raw replay conservation, complete module cones,
 timing keys, referenced examples, push order, and the research-only Git diff.
 Manual review of examples and key construction remains part of completion.
+`review_sources.py <report.json> <review.json>` links selected examples to
+explicit declarations in their historical module sources, checks source hashes
+against the measured snapshots, and exits nonzero for unresolved source links.
+This source check preserves reported example-count shortfalls; it does not
+certify the required three distinct non-auxiliary names in each positive bucket.
 While later commits run, `audit.py --commit <prefix>` checks one completed,
 pushed dataset, including every distinct-K median/mean/min/max and total. This
 mode does not certify the unfinished report; the default still requires all 20

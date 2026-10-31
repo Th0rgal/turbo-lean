@@ -12,7 +12,7 @@ def nonaux(name):
     # Equation lemmas and generated recursors can lack a leading underscore.
     # Inspect every component so nested auxiliaries cannot escape the filter.
     return not any(re.fullmatch(
-        r'_.*|inst.*|match_\d+|eq_(?:\d+|def|unfold)|rec(?:_\d+)?|recOn|casesOn|'
+        r'_.*|inst.*|match_\d+(?:_\d+)*|eq_(?:\d+|def|unfold)|rec(?:_\d+)?|recOn|casesOn|'
         r'brecOn|below|noConfusion.*|ctorIdx|ctorElim|sizeOf_spec|.*_eq_\d+|inj|injEq|elim',
         part) for part in name.split('.'))
 def examples(groups,limit=3):
