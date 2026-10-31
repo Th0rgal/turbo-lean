@@ -6841,14 +6841,11 @@ mod tests {
     /// Raw worker IPC against stock `lean`: the worker must never accept what `lean` rejects.
     #[test]
     fn test_zygote_worker_ipc_matches_stock_lean_boundary() {
-        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("ipc_boundary")
-        else {
-            return;
-        };
-        let Ok(bin) = ensure_zygote_binary(&store, &lean_bin, &env_vars) else {
-            let _ = fs::remove_dir_all(&tmp_dir);
-            return;
-        };
+        // No silent skips: a missing toolchain or a worker that fails to compile fails the test.
+        let (tmp_dir, store, env_vars, lean_bin) =
+            open_test_zygote_env("ipc_boundary").expect("Lean v4.35.0 toolchain required");
+        let bin = ensure_zygote_binary(&store, &lean_bin, &env_vars)
+            .unwrap_or_else(|e| panic!("Zygote worker failed to compile: {e:#}"));
         let tc_lib = lean_bin
             .parent()
             .unwrap()
