@@ -283,12 +283,12 @@ class TestP0TrustBoundary(unittest.TestCase):
             subprocess.check_output([str(CORE_BIN), "verify-certs", "--canonical-benchmark", "--json"], text=True)
         )
         self.assertTrue(default_certs["verified"])
-        self.assertEqual(default_certs["overallAssurance"], "Tested")
+        self.assertEqual(default_certs["overallAssurance"], "TranslationValidated")
         by_name = {d["declName"]: d for d in default_certs["declSummaries"]}
         self.assertEqual(by_name["collatz_steps"]["overallAssurance"], "VerifiedKernelProof")
         self.assertEqual(by_name["tuple_accum_sum"]["overallAssurance"], "TranslationValidated")
         self.assertEqual(by_name["sarray_scale_bias"]["overallAssurance"], "TranslationValidated")
-        self.assertEqual(by_name["dot_product_u64"]["overallAssurance"], "Tested")
+        self.assertEqual(by_name["dot_product_u64"]["overallAssurance"], "VerifiedKernelProof")
         self.assertEqual(by_name["saxpy_kernel"]["overallAssurance"], "VerifiedKernelProof")
 
         kernel_only_certs = json.loads(
