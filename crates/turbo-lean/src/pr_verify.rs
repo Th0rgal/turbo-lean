@@ -2384,6 +2384,7 @@ fn run_lean_temp_file(
     audit: &std::collections::HashSet<String>,
     lean_args: &[String],
 ) -> Result<std::process::Output> {
+    crate::module_builder::validate_lean_args(lean_args).context("PR/CI shard Lean options")?;
     if trust.is_untrusted {
         let cfg = trust.untrusted_cfg.ok_or_else(|| {
             anyhow::anyhow!(
@@ -3908,6 +3909,12 @@ pub fn run_pr_verify_command(
         .canonicalize()
         .unwrap_or_else(|_| project_dir.clone());
     let is_untrusted = mode == "untrusted";
+    if !is_untrusted
+        && (canon_dir.join("lakefile.lean").is_file() || canon_dir.join("lakefile.toml").is_file())
+    {
+        crate::module_builder::resolve_project_config(&canon_dir)
+            .context("PR static Lean option validation failed")?;
+    }
     let trust_domain = if is_untrusted {
         "untrusted:ci".to_string()
     } else {
@@ -5743,6 +5750,86 @@ end Fixture
         let err = load_and_classify_pr_from_git(&store, &repo, &base, tc).unwrap_err();
         assert!(format!("{err:#}").contains("Failed to resolve Lean options"));
         let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_shard_subprocess_revalidates_options_before_execution() -> Result<()> {
+        use crate::module_builder::option_cases::*;
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_shard_options_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        let mut cfg = resolve_untrusted_pr_project_config(&dir, "leanprover/lean4:v4.35.0")?;
+        let store = TurboStore::open(Some(&dir.join("cache")))?;
+        let mut failures = Vec::new();
+        for &(name, value) in ORIGINAL_OPTIONS.iter().chain(RESTRICTED_OPTIONS) {
+            for prefix in PREFIXES {
+                if original_case_allowed(name, value, prefix) {
+                    continue;
+                }
+                let key = format!("{prefix}{name}");
+                for field in FIELDS {
+                    cfg.root_pkg.more_lean_args.clear();
+                    cfg.root_pkg.weak_lean_args.clear();
+                    cfg.root_pkg.lean_options.clear();
+                    match *field {
+                        "moreLeanArgs" => cfg.root_pkg.more_lean_args.push(format!("-D{key}={value}")),
+                        "weakLeanArgs" => cfg.root_pkg.weak_lean_args.push(format!("-D{key}={value}")),
+                        _ => {
+                            cfg.root_pkg
+                                .lean_options
+                                .insert(key.clone(), value.to_string());
+                        }
+                    }
+                    // Deliberately bypass config parsing: the process boundary must gate too.
+                    let args: Vec<_> = cfg
+                        .root_pkg
+                        .weak_lean_args
+                        .iter()
+                        .chain(&cfg.root_pkg.more_lean_args)
+                        .cloned()
+                        .chain(
+                            cfg.root_pkg
+                                .lean_options
+                                .iter()
+                                .map(|(k, v)| format!("-D{k}={v}")),
+                        )
+                        .collect();
+                    for is_untrusted in [false, true] {
+                        let result = run_lean_temp_file(
+                            &store,
+                            "must-not-execute",
+                            &dir.join("shard.lean"),
+                            "theorem good : True := True.intro",
+                            &dir,
+                            &Default::default(),
+                            &PrVerificationTrust {
+                                is_untrusted,
+                                untrusted_cfg: Some(&cfg),
+                            },
+                            &Default::default(),
+                            &args,
+                        );
+                        match result {
+                            Err(error) if format!("{error:#}").contains(&key) => {}
+                            result => {
+                                failures.push(format!("{field}/{is_untrusted}/{key}: {result:?}"))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        fs::remove_dir_all(dir)?;
+        assert!(
+            failures.is_empty(),
+            "shard options were not rejected: {}",
+            failures.join("\n")
+        );
         Ok(())
     }
 

@@ -4228,6 +4228,13 @@ pub fn is_allowed_lean_arg(arg: &str) -> bool {
     matches!(t, "--json" | "-q" | "--quiet")
 }
 
+/// Fail closed at request/process boundaries using the static Lake argument policy.
+/// Validate before filtering output-format flags or looking up cached verification results.
+pub fn validate_lean_args(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<()> {
+    let args: Vec<String> = args.into_iter().map(|arg| arg.as_ref().to_string()).collect();
+    validate_effective_lean_args(&args).map(drop)
+}
+
 /// Filter and normalize Lean compiler flags via `is_allowed_lean_arg`, dropping output-format
 /// flags (`--json`, `-q`, `--quiet`): they never change elaboration, and callers that parse
 /// plain-text `lean` output (`#print axioms`, determinism checks) must not receive them.
@@ -4416,19 +4423,9 @@ fn finalize_package_config(
         }
     }
     let check_allowed_args = |args: &[String], scope: &str| -> Result<()> {
-        for a in args {
-            let allowed = validate_effective_lean_args(std::slice::from_ref(a)).is_ok();
-            if !c_abi::verify_static_lake_config(true, !allowed, false, false) {
-                anyhow::bail!(
-                    "Unsupported or unsafe Lean compiler flag `{}` in {} of {} ({}): fail-closed static Lake config gate",
-                    a.trim(),
-                    scope,
-                    pkg.name,
-                    config_path.display()
-                );
-            }
-        }
-        Ok(())
+        validate_lean_args(args).map_err(|error| {
+            anyhow::anyhow!("{} of {} ({}): {error:#}", scope, pkg.name, config_path.display())
+        })
     };
     // `leanOptions` reach Lean as `-Dk=v`, so they pass the same gate as explicit flags
     // (e.g. `warn.sorry=false` and malformed keys are rejected).
@@ -8795,6 +8792,10 @@ pub fn build_project_modules_native(
 #[cfg(test)]
 pub(crate) static BWRAP_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
+#[path = "../tests/support/lean_options.rs"]
+pub(crate) mod option_cases;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     fn make_temp_test_dir(tag: &str) -> PathBuf {
@@ -8981,6 +8982,58 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn test_weakening_options_all_sources_fail_closed() {
+        use option_cases::*;
+        let dir = make_temp_test_dir("weakening_options");
+        for (cases, allowed) in [
+            (ORIGINAL_OPTIONS, false),
+            (RESTRICTED_OPTIONS, false),
+            (GOOD_OPTIONS, true),
+        ] {
+            for &(name, value) in cases {
+                for prefix in PREFIXES {
+                    let key = format!("{prefix}{name}");
+                    let arg = format!("-D{key}={value}");
+                    let allowed = if allowed {
+                        matches!(*prefix, "" | "weak.")
+                    } else {
+                        original_case_allowed(name, value, prefix)
+                    };
+                    assert_eq!(is_allowed_lean_arg(&arg), allowed, "{arg}");
+                    assert_eq!(validate_lean_args([&arg]).is_ok(), allowed, "{arg}");
+                    for format in ["lean", "toml"] {
+                        for scope in SCOPES {
+                            for field in FIELDS {
+                                let path = dir.join(format!("lakefile.{format}"));
+                                fs::write(&path, lakefile(format, scope, field, &key, value)).unwrap();
+                                for root in [false, true] {
+                                    let result = if format == "lean" {
+                                        parse_lakefile_lean(&dir, &path, root)
+                                    } else {
+                                        parse_lakefile_toml(&dir, &path, root)
+                                    };
+                                    if allowed {
+                                        result.unwrap_or_else(|e| {
+                                            panic!("{format}/{scope}/{field}/{arg}: {e:#}")
+                                        });
+                                    } else {
+                                        let error = format!("{:#}", result.unwrap_err());
+                                        assert!(
+                                            error.contains(&key),
+                                            "{format}/{scope}/{field}/{arg}: {error}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

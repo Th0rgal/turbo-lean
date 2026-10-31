@@ -930,6 +930,13 @@ pub fn serve_cas_http_with_auth(
                         lean_args: Vec<String>,
                     }
                     let req: EvalHttpRequest = serde_json::from_slice(&body).unwrap_or_default();
+                    if let Err(error) = crate::module_builder::validate_lean_args(&req.lean_args) {
+                        let _ = write_json_response(&mut stream, 400, &crate::zygote::ZygoteEvalReply {
+                            errors: vec![format!("{error:#}")],
+                            ..Default::default()
+                        });
+                        return;
+                    }
                     let filtered_eval_args =
                         match crate::module_builder::validate_effective_lean_args(&req.lean_args) {
                             Ok(args) => args,
@@ -1461,6 +1468,7 @@ fn execute_check_shard_payload_deferred_with_domain(
     Option<(String, Vec<(String, String, Vec<u8>, i64)>)>,
     Option<String>,
 )> {
+    crate::module_builder::validate_lean_args(&req.lean_args)?;
     let t0 = std::time::Instant::now();
     if req.shard_key.is_empty() || req.shard_source.is_empty() {
         anyhow::bail!("Missing shard_key or shard_source in /check-shard request");
@@ -1736,6 +1744,7 @@ fn execute_check_shards_batch_payload_deferred(
     Option<(String, String, Vec<(String, String, Vec<u8>, i64)>)>,
     Vec<String>,
 )> {
+    crate::module_builder::validate_lean_args(&req.lean_args)?;
     let t0 = std::time::Instant::now();
     if req.items.is_empty() || req.coalesced_shard_source.is_empty() {
         anyhow::bail!("Missing items or coalesced_shard_source in /check-shards-batch request");

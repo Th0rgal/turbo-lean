@@ -2962,6 +2962,7 @@ fn eval_with_zygote_pool_inner(
     lean_args: &[String],
 ) -> Result<ZygoteEvalReply> {
     let request_started = std::time::Instant::now();
+    crate::module_builder::validate_lean_args(lean_args)?;
     let default_timeout_ms = if eval_mode { 900_000 } else { 30_000 };
     let effective_timeout_ms = timeout_ms.unwrap_or_else(|| {
         std::env::var("TURBO_LEAN_TIMEOUT_MS")
@@ -3948,6 +3949,7 @@ pub fn eval_subshards_batch_via_zygote(
     sub_decl_sources: &[String],
     lean_args: &[String],
 ) -> Result<ZygoteEvalReply> {
+    crate::module_builder::validate_lean_args(lean_args)?;
     if sub_decl_sources.is_empty() {
         return Ok(ZygoteEvalReply {
             ok: true,
@@ -4004,6 +4006,7 @@ pub fn eval_candidates_race_via_zygote(
     candidate_decl_sources: &[String],
     lean_args: &[String],
 ) -> Result<ZygoteEvalReply> {
+    crate::module_builder::validate_lean_args(lean_args)?;
     if candidate_decl_sources.is_empty() {
         return Ok(ZygoteEvalReply {
             kernel_gate_active: true,
@@ -4766,7 +4769,13 @@ pub fn try_local_zygote_eval_with_args(
     timeout_ms: u64,
     lean_args: &[String],
 ) -> Option<ZygoteEvalReply> {
-    let filtered_args = crate::module_builder::validate_effective_lean_args(lean_args).ok()?;
+    let filtered_args = match crate::module_builder::validate_effective_lean_args(lean_args) {
+        Ok(args) => args,
+        Err(error) => return Some(ZygoteEvalReply {
+            errors: vec![format!("{error:#}")],
+            ..Default::default()
+        }),
+    };
     let (imports_csv, _) = split_shard_for_zygote(source);
     let context = resolve_zygote_context(toolchain, lean_path, env_vars, lean_bin, &imports_csv);
     let timeout_ms = if timeout_ms > 0 {
@@ -7295,6 +7304,148 @@ mod tests {
             assert_eq!(sig_rep.exit_signal, Some(9));
             assert!(sig_rep.errors[0].contains("signal=9"));
         }
+    }
+
+    #[test]
+    fn test_zygote_options_fail_closed_before_worker_execution() {
+        use crate::module_builder::option_cases::*;
+        let (dir, store, env_vars, _) =
+            open_test_zygote_env("rejected_options").expect("Lean toolchain");
+        let mut failures = Vec::new();
+        for &(name, value) in ORIGINAL_OPTIONS.iter().chain(RESTRICTED_OPTIONS) {
+            for prefix in PREFIXES {
+                if original_case_allowed(name, value, prefix) {
+                    continue;
+                }
+                let arg = format!("-D{prefix}{name}={value}");
+                let result = eval_with_zygote_pool_with_args(
+                    &store,
+                    "leanprover/lean4:v4.35.0",
+                    "",
+                    &env_vars,
+                    Path::new("must-not-execute"),
+                    "theorem good : True := True.intro",
+                    false,
+                    &[arg.clone()],
+                );
+                let batch = eval_subshards_batch_via_zygote(
+                    &store,
+                    "leanprover/lean4:v4.35.0",
+                    "",
+                    &env_vars,
+                    Path::new("must-not-execute"),
+                    "",
+                    &[],
+                    &[arg.clone()],
+                );
+                let race = eval_candidates_race_via_zygote(
+                    &store,
+                    "leanprover/lean4:v4.35.0",
+                    "",
+                    &env_vars,
+                    Path::new("must-not-execute"),
+                    "",
+                    &[],
+                    &[arg.clone()],
+                );
+                for (mode, result) in [
+                    ("pool", result),
+                    ("empty batch", batch),
+                    ("empty race", race),
+                ] {
+                    match result {
+                        Err(error) if format!("{error:#}").contains(&arg) => {}
+                        result => failures.push(format!("{mode}/{arg}: {result:?}")),
+                    }
+                }
+                let reply = try_local_zygote_eval_with_args(
+                    &store,
+                    &env_vars,
+                    Path::new("must-not-execute"),
+                    "leanprover/lean4:v4.35.0",
+                    "",
+                    "theorem good : True := True.intro",
+                    None,
+                    0,
+                    &[arg.clone()],
+                )
+                .expect("invalid options must fail closed, never trigger fallback");
+                assert!(
+                    !reply.ok && reply.errors.iter().any(|e| e.contains(&arg)),
+                    "{reply:?}"
+                );
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+        assert!(
+            failures.is_empty(),
+            "zygote options were not rejected: {}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn test_zygote_raw_options_cannot_bypass_kernel_checking() {
+        use crate::module_builder::option_cases::*;
+        let (dir, store, env_vars, lean_bin) =
+            open_test_zygote_env("raw_options").expect("Lean toolchain");
+        let bin = ensure_zygote_binary(&store, &lean_bin, &env_vars).unwrap();
+        let mut child = Command::new(bin)
+            .envs(&env_vars)
+            .env("LEAN", &lean_bin)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let src =
+            include_str!("../tests/fixtures/weakening-options/Bad.lean").replace("import Lean\n", "");
+        let mut accepted = Vec::new();
+        for arg in std::iter::once(String::new()).chain(
+            ORIGINAL_OPTIONS
+                .iter()
+                .chain(RESTRICTED_OPTIONS)
+                .flat_map(|(name, value)| {
+                    PREFIXES
+                        .iter()
+                        .map(move |prefix| format!("-D{prefix}{name}={value}"))
+                }),
+        ) {
+            writeln!(
+                stdin,
+                "Lean\t{}\tstrict\t\t\t{}",
+                hex_encode_bytes(src.as_bytes()),
+                hex_encode_bytes(arg.as_bytes())
+            )
+            .unwrap();
+            stdin.flush().unwrap();
+            let mut line = String::new();
+            stdout.read_line(&mut line).unwrap();
+            let reply: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if reply["ok"] == true {
+                accepted.push((arg, reply));
+            }
+        }
+        let control = "theorem raw_control : True := True.intro";
+        writeln!(
+            stdin,
+            "Lean\t{}\tstrict\t\t\t",
+            hex_encode_bytes(control.as_bytes())
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        let control: serde_json::Value = serde_json::from_str(&line).unwrap();
+        drop(stdin);
+        assert!(child.wait().unwrap().success());
+        assert_eq!(control["ok"], true, "{control}");
+        fs::remove_dir_all(dir).unwrap();
+        assert!(
+            accepted.is_empty(),
+            "raw worker accepted False with zero axioms: {accepted:?}"
+        );
     }
 
     #[test]
