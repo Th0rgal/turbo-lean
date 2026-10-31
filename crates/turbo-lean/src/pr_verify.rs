@@ -235,20 +235,46 @@ enum BaseLakeConfig {
 }
 
 /// Statically parses `base_ref`'s lakefile against the current package root (fail-closed parsers
-/// only; nothing is executed), so per-file Lean args can be compared across the PR.
+/// only; nothing is executed), so per-file Lean args can be compared across the PR. `strict`
+/// must match how the working-tree config is parsed, so both sides see the same declarations.
+/// Lakefile blobs are cached per resolved `base_sha` (commit contents are immutable), keeping
+/// warm runs free of `git` spawns.
 fn load_base_lake_config(
+    store: &TurboStore,
     repo_root: &Path,
     proj_prefix: &str,
     canon_dir: &Path,
     base_ref: &str,
+    base_sha: Option<&str>,
+    strict: bool,
 ) -> BaseLakeConfig {
     const NAMES: [&str; 2] = ["lakefile.toml", "lakefile.lean"];
     let repo_rels: Vec<String> = NAMES
         .iter()
         .map(|n| join_proj_prefix(proj_prefix, n))
         .collect();
-    let Ok(base) = fetch_git_blobs_batch(repo_root, base_ref, &repo_rels) else {
-        return BaseLakeConfig::Unknown;
+    let cache_file = base_sha.map(|sha| {
+        let key =
+            blake3::hash(format!("base-lakefiles:v1:{}:{}", sha, repo_rels.join(":")).as_bytes());
+        store
+            .fast_staging_dir()
+            .join(format!("git_base_lakefiles_{}.json", &key.to_hex()[..24]))
+    });
+    let cached = cache_file
+        .as_ref()
+        .and_then(|f| fs::read(f).ok())
+        .and_then(|b| serde_json::from_slice::<std::collections::HashMap<String, String>>(&b).ok());
+    let base = match cached {
+        Some(base) => base,
+        None => match fetch_git_blobs_batch(repo_root, base_ref, &repo_rels) {
+            Ok(base) => {
+                if let (Some(f), Ok(bytes)) = (&cache_file, serde_json::to_vec(&base)) {
+                    let _ = crate::shm_cache::atomic_write_shm(f, &bytes);
+                }
+                base
+            }
+            Err(_) => return BaseLakeConfig::Unknown,
+        },
     };
     if NAMES
         .iter()
@@ -277,9 +303,9 @@ fn load_base_lake_config(
         .map_err(anyhow::Error::from)
         .and_then(|_| {
             if name == "lakefile.toml" {
-                crate::module_builder::parse_lakefile_toml(canon_dir, &tmp_file, false)
+                crate::module_builder::parse_lakefile_toml(canon_dir, &tmp_file, strict)
             } else {
-                crate::module_builder::parse_lakefile_lean(canon_dir, &tmp_file, false)
+                crate::module_builder::parse_lakefile_lean(canon_dir, &tmp_file, strict)
             }
         });
     let _ = fs::remove_dir_all(&tmp_dir);
@@ -1359,26 +1385,42 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
         },
     }
 
-    // A lakefile edit can change a file's effective Lean args (and so what its unchanged source
-    // elaborates to); such files are re-verified like added ones, dependents included.
-    let base_lake_cfg = load_base_lake_config(&repo_root, &proj_prefix, canon_dir, base_ref);
+    let head_sha_opt = resolve_git_head_sha(&repo_root, base_ref);
+    // A lakefile edit can change a file's effective Lean args (and so what its source elaborates
+    // to); such files are re-verified like added ones, dependents included. Untrusted configs are
+    // parsed strictly (`resolve_project_config`), trusted ones leniently (`owned_pkg_cfg`).
+    let base_lake_cfg = load_base_lake_config(
+        store,
+        &repo_root,
+        &proj_prefix,
+        canon_dir,
+        base_ref,
+        head_sha_opt.as_deref(),
+        is_untrusted,
+    );
+    // Without a parsed working-tree config the current args are unknown, so a changed lakefile
+    // re-verifies everything rather than comparing against an empty arg list.
+    let head_cfg_unknown = untrusted_cfg.is_none()
+        && owned_pkg_cfg.is_none()
+        && (canon_dir.join("lakefile.toml").is_file() || canon_dir.join("lakefile.lean").is_file());
     let reconfigured = |rel: &str| -> bool {
-        match &base_lake_cfg {
-            BaseLakeConfig::Same => false,
-            BaseLakeConfig::Unknown => true,
-            BaseLakeConfig::Changed(base_pkg) => {
-                let base_args = base_pkg.as_ref().map_or_else(Vec::new, |pkg| {
-                    crate::module_builder::resolve_file_lean_args_in_package(
-                        pkg,
-                        &canon_dir.join(rel),
-                    )
-                });
-                base_args != resolve_rel_lean_args(rel)
+        rel != "lakefile.lean"
+            && match &base_lake_cfg {
+                BaseLakeConfig::Same => false,
+                _ if head_cfg_unknown => true,
+                BaseLakeConfig::Unknown => true,
+                BaseLakeConfig::Changed(base_pkg) => {
+                    let base_args = base_pkg.as_ref().map_or_else(Vec::new, |pkg| {
+                        crate::module_builder::resolve_file_lean_args_in_package(
+                            pkg,
+                            &canon_dir.join(rel),
+                        )
+                    });
+                    base_args != resolve_rel_lean_args(rel)
+                }
             }
-        }
     };
 
-    let head_sha_opt = resolve_git_head_sha(&repo_root, base_ref);
     // The head-tree fast path only re-splits stat-changed files, so it is skipped when the
     // lakefile changed.
     let head_tree_cache_file = if is_untrusted || !matches!(base_lake_cfg, BaseLakeConfig::Same) {
@@ -2023,11 +2065,12 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                     cur_split: Some(split),
                 }
             }
+            // Source edits do not narrow this: every shard needs the new args, not just edited ones.
             PrFileEntry::Changed {
-                base_src: Some(base_src),
+                base_src: Some(_),
                 cur_src: Some(cur_src),
                 cur_split,
-            } if base_src == cur_src && reconfigured(&rel_path) => PrFileEntry::Changed {
+            } if reconfigured(&rel_path) => PrFileEntry::Changed {
                 base_src: None,
                 cur_src: Some(cur_src),
                 cur_split,
@@ -4704,6 +4747,31 @@ mod pr_verify_tests {
             &split_lean_source(&changed_files["Heavy/B.lean"], &[]).shards[0],
         );
         assert_ne!(heavy_key, &plain_key);
+
+        // A source edit in a reconfigured file still re-verifies every shard, not just edited ones.
+        fs::write(
+            canon_dir.join("Heavy/B.lean"),
+            "theorem t_b : 2 + 2 = 4 := by\n  rfl\ntheorem t_c : 3 = 3 := rfl\n",
+        )?;
+        let (cls, to_verify, _, _) = load_and_classify_pr_from_git(&store, &canon_dir, "HEAD", tc)?;
+        assert_eq!(cls.altered_interface_files, vec!["Heavy/B.lean"]);
+        assert_eq!(to_verify["Heavy/B.lean"].len(), 2);
+        assert!(!cls
+            .unchanged_theorems
+            .iter()
+            .any(|t| t.starts_with("Heavy/")));
+
+        // An unparsable working-tree lakefile (trusted mode) cannot be compared: re-verify all.
+        fs::write(
+            canon_dir.join("lakefile.toml"),
+            "name = \"demo\"\nmoreLeanArgs = [\"--plugin=evil.so\"]\n",
+        )?;
+        let (cls, _, _, _) = load_and_classify_pr_from_git(&store, &canon_dir, "HEAD", tc)?;
+        assert_eq!(cls.modified_files, vec!["Fast/A.lean", "Heavy/B.lean"]);
+        fs::write(
+            canon_dir.join("Heavy/B.lean"),
+            "theorem t_b : 2 + 2 = 4 := by\n  rfl\n",
+        )?;
 
         // An unparsable base lakefile fails closed: every file is re-verified.
         fs::write(
