@@ -1,0 +1,5 @@
+{
+  "results_commit": "82929c272bf08c1db2af2ac6a7dd0b70bf4e1020",
+  "pushed_unix": 1793458978.1853669,
+  "note": "Ordinary push retry succeeded after transient remote index-pack/large-object rejection. Measurements were not repeated."
+}
