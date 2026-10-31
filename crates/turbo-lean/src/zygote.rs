@@ -7626,6 +7626,12 @@ mod tests {
         );
         let top = format!("{skip}{bad}");
         let weak = format!("set_option weak.debug.skipKernelTC true\n{bad}");
+        let rejected_artifacts: Vec<_> = ["RejectedBody", "RejectedPrefix"]
+            .into_iter().map(|name| (name, dir.join(format!("{name}.olean")))).collect();
+        let emit_modes: Vec<_> = rejected_artifacts.iter().map(|(name, path)| {
+            format!("emit_olean:{}:{}:", hex_encode_bytes(name.as_bytes()),
+                hex_encode_bytes(path.to_str().unwrap().as_bytes()))
+        }).collect();
         let mut accepted = Vec::new();
         let mut replay_missing = Vec::new();
         // (label, body, mode, prefix key, prefix): the prefix rows use the cached-checkpoint path.
@@ -7650,6 +7656,8 @@ mod tests {
                 "bad-prefix",
                 &top,
             ),
+            ("emit body", &top, &emit_modes[0], "", ""),
+            ("emit prefix", "", &emit_modes[1], "bad-emit-prefix", &top),
             ("eval", &top, "eval", "", ""),
         ];
         for (label, body, mode, key, prefix) in cases {
@@ -7661,6 +7669,9 @@ mod tests {
                 // `weak.` options are ignored by Lean, so the normal kernel check rejects that one.
                 replay_missing.push(format!("{label}: {reply}"));
             }
+        }
+        for (_, path) in &rejected_artifacts {
+            assert!(!path.exists(), "rejected declarations emitted {}", path.display());
         }
         // Legitimate resource options and normal declarations keep working, including via prefixes.
         let legit = "set_option maxHeartbeats 400000\nstructure P where\n  a : Nat\n  h : a = a\n\
