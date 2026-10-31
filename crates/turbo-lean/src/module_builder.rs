@@ -4306,8 +4306,9 @@ pub(crate) fn resolve_module_in_package(
                 .map(|h| format!("{}:{}", e.name, h))
         })
         .collect();
-    // 1. An executable whose root is the module (Lake checks executables first).
-    for exe in &pkg.exes {
+    // 1. An executable whose root is the module (Lake checks executables first, last one
+    //    first like `findSomeRev?`).
+    for exe in pkg.exes.iter().rev() {
         if exe.root == mod_name {
             let exe_src = match &exe.src_dir {
                 Some(sd) => pkg_src_base.join(sd),
@@ -4349,13 +4350,21 @@ pub(crate) fn resolve_module_in_package(
             Some(sd) => pkg_src_base.join(sd),
             None => pkg_src_base.clone(),
         };
-        let under = |p: &str| mod_name.starts_with(&format!("{}.", p));
-        let buildable = lib.roots.iter().any(|r| mod_name == r || under(r))
-            || lib.globs.iter().any(|g| match g {
-                GlobSpec::One(m) => mod_name == m,
-                GlobSpec::Submodules(p) => under(p),
-                GlobSpec::AndSubmodules(p) => mod_name == p || under(p),
-            });
+        // Lake's `isBuildableModule`: a glob matches the module, or the module lies under a
+        // root that one of the globs selects.
+        let under = |m: &str, p: &str| m.starts_with(&format!("{}.", p));
+        let matches = |m: &str| {
+            lib.globs.iter().any(|g| match g {
+                GlobSpec::One(x) => m == x,
+                GlobSpec::Submodules(p) => under(m, p),
+                GlobSpec::AndSubmodules(p) => m == p || under(m, p),
+            })
+        };
+        let buildable = matches(mod_name)
+            || lib
+                .roots
+                .iter()
+                .any(|r| (mod_name == r || under(mod_name, r)) && matches(r));
         if buildable {
             let cand = lib_src.join(format!("{}.lean", rel_slash));
             if cand.is_file() {
@@ -8609,6 +8618,15 @@ lean_exe «demo-exe» where
             Some("Parent.Child")
         );
         assert_eq!(target(nested, "Parent").as_deref(), Some("Parent"));
+        // Astra r12: a root claims its subtree only if a glob selects the root itself.
+        touch("Parent/Other.lean");
+        touch("Parent/Child.lean");
+        let selective = "name = \"P\"\n[[lean_lib]]\nname = \"Parent\"\n[[lean_lib]]\nname = \"Selected\"\nroots = [\"Parent\"]\nglobs = [\"Parent.Child\"]\n";
+        assert_eq!(target(selective, "Parent.Other").as_deref(), Some("Parent"));
+        assert_eq!(
+            target(selective, "Parent.Child").as_deref(),
+            Some("Selected")
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
