@@ -1444,11 +1444,30 @@ fn parse_toml_string(val: &str) -> Result<String> {
                     'n' => out.push('\n'),
                     'r' => out.push('\r'),
                     't' => out.push('\t'),
+                    'b' => out.push('\u{8}'),
+                    'f' => out.push('\u{c}'),
                     '\\' => out.push('\\'),
                     '"' => out.push('"'),
+                    // TOML's `\uXXXX` / `\UXXXXXXXX` (e.g. `"src/\u03b1"`).
+                    u @ ('u' | 'U') => {
+                        let len = if u == 'u' { 4 } else { 8 };
+                        let hex: String = chars
+                            .get(i + 1..i + 1 + len)
+                            .unwrap_or(&[])
+                            .iter()
+                            .collect();
+                        let decoded = (hex.len() == len)
+                            .then(|| u32::from_str_radix(&hex, 16).ok())
+                            .flatten()
+                            .and_then(char::from_u32);
+                        let Some(c) = decoded else {
+                            anyhow::bail!("Invalid `\\{}` escape in string `{}`", u, val);
+                        };
+                        out.push(c);
+                        i += len;
+                    }
                     other => {
-                        out.push('\\');
-                        out.push(other);
+                        anyhow::bail!("Unsupported escape `\\{}` in string `{}`", other, val);
                     }
                 }
             } else {
@@ -1633,6 +1652,7 @@ pub fn parse_lakefile_toml(
         );
     }
     let raw_hash = blake3::hash(raw.as_bytes()).to_hex().to_string();
+    let mut empty_roots: BTreeSet<usize> = BTreeSet::new();
     let mut pkg = PackageConfig {
         name: pkg_root
             .file_name()
@@ -1870,8 +1890,11 @@ pub fn parse_lakefile_toml(
                             .into_iter()
                             .map(|s| clean_lake_ident(&s))
                             .collect();
+                        if lib.roots.is_empty() {
+                            empty_roots.insert(i);
+                        }
                     }
-                    "globs" => lib.globs = parse_toml_globs(&val_accum)?,
+                    "globs" => lib.globs = nonempty(parse_toml_globs(&val_accum)?, "globs")?,
                     "moreLeanArgs" => lib.more_lean_args = parse_toml_string_array(&val_accum)?,
                     "weakLeanArgs" => lib.weak_lean_args = parse_toml_string_array(&val_accum)?,
                     "precompileModules" => {
@@ -1989,6 +2012,7 @@ pub fn parse_lakefile_toml(
             }
         }
     }
+    check_empty_roots(&pkg, &empty_roots)?;
     finalize_package_config(&mut pkg, is_root_pkg, toml_path, &raw_hash)?;
     Ok(pkg)
 }
@@ -3274,6 +3298,7 @@ pub fn parse_lakefile_lean(
     }
     let mut current_block = DeclBlock::None;
     let mut pending_default_target = false;
+    let mut empty_roots: BTreeSet<usize> = BTreeSet::new();
     // Lake keeps only the last assignment of a repeated field; fail closed instead.
     let mut block_keys: BTreeSet<String> = BTreeSet::new();
     let lines: Vec<&str> = clean.lines().collect();
@@ -3298,6 +3323,22 @@ pub fn parse_lakefile_lean(
         {
             anyhow::bail!(
                 "Unsupported indented declaration `{}` in {} at line {}: fail-closed static Lake config gate",
+                trimmed,
+                lean_path.display(),
+                line_no
+            );
+        }
+        // Lake continues a field's expression on a column-0 `++` or closing-bracket line; the
+        // field reader above stops at column 0, so such a line fails closed.
+        if indent == 0
+            && matches!(
+                current_block,
+                DeclBlock::Package | DeclBlock::LeanLib(_) | DeclBlock::LeanExe(_)
+            )
+            && (trimmed.starts_with("++") || trimmed.starts_with([']', ')', '}', '⟩']))
+        {
+            anyhow::bail!(
+                "Unsupported column-0 continuation `{}` in {} at line {}: fail-closed static Lake config gate",
                 trimmed,
                 lean_path.display(),
                 line_no
@@ -3488,8 +3529,15 @@ pub fn parse_lakefile_lean(
                         let lib = &mut pkg.libs[lib_idx];
                         match key {
                             "srcDir" => lib.src_dir = Some(parse_lean_path_literal(&val_accum)?),
-                            "roots" => lib.roots = parse_lean_ident_array_expr(&val_accum)?,
-                            "globs" => lib.globs = parse_lean_globs_expr(&val_accum)?,
+                            "roots" => {
+                                lib.roots = parse_lean_ident_array_expr(&val_accum)?;
+                                if lib.roots.is_empty() {
+                                    empty_roots.insert(lib_idx);
+                                }
+                            }
+                            "globs" => {
+                                lib.globs = nonempty(parse_lean_globs_expr(&val_accum)?, "globs")?
+                            }
                             "moreLeanArgs" => {
                                 lib.more_lean_args = parse_lean_string_array_expr(&val_accum)?;
                             }
@@ -3591,6 +3639,7 @@ pub fn parse_lakefile_lean(
             }
         }
     }
+    check_empty_roots(&pkg, &empty_roots)?;
     finalize_package_config(&mut pkg, is_root_pkg, lean_path, &raw_hash)?;
     Ok(pkg)
 }
@@ -3808,6 +3857,29 @@ pub fn is_allowed_lean_arg(arg: &str) -> bool {
             .unwrap_or(false);
     }
     matches!(t, "--json" | "-q" | "--quiet")
+}
+
+/// An explicit empty `globs` selects no modules in Lake, but an empty list here means "use the
+/// default", so it fails closed.
+fn nonempty<T>(v: Vec<T>, field: &str) -> Result<Vec<T>> {
+    if v.is_empty() {
+        anyhow::bail!("Unsupported empty `{}` (selects no modules in Lake)", field);
+    }
+    Ok(v)
+}
+
+/// `roots = []` is fine next to explicit `globs` (Lake builds the globs); without them Lake
+/// selects no modules while the defaults here would pick the library name, so it fails closed.
+fn check_empty_roots(pkg: &PackageConfig, empty_roots: &BTreeSet<usize>) -> Result<()> {
+    for &i in empty_roots {
+        if pkg.libs.get(i).is_some_and(|lib| lib.globs.is_empty()) {
+            anyhow::bail!(
+                "Unsupported empty `roots` without `globs` on `{}` (selects no modules in Lake)",
+                pkg.libs[i].name
+            );
+        }
+    }
+    Ok(())
 }
 
 fn finalize_package_config(
@@ -8468,6 +8540,20 @@ lean_exe «demo-exe» where
             assert!(parse(bad).is_err(), "{bad}");
         }
         let ok = parse("name = \"demo\"\n[leanOptions]\nweak.linter.style.longFile = 1500\n\"autoImplicit\" = false\n").unwrap();
+        // Astra r10: TOML escapes decode (`α`) or fail; explicit empty selections fail.
+        let esc = parse("name = \"demo\"\nsrcDir = \"src/\\u03b1\"\n").unwrap();
+        assert_eq!(esc.src_dir, PathBuf::from("src/α"));
+        assert!(parse("name = \"demo\"\nsrcDir = \"src/\\q\"\n").is_err());
+        assert!(parse("name = \"demo\"\n[[lean_lib]]\nname = \"Demo\"\nglobs = []\n").is_err());
+        assert!(parse("name = \"demo\"\n[[lean_lib]]\nname = \"Demo\"\nroots = []\n").is_err());
+        let tools = parse(
+            "name = \"demo\"\n[[lean_lib]]\nname = \"Tools\"\nroots = []\nglobs = [\"Tools.+\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            tools.libs[0].globs,
+            vec![GlobSpec::Submodules("Tools".to_string())]
+        );
         assert_eq!(
             ok.lean_options,
             BTreeMap::from([
@@ -8590,6 +8676,17 @@ lean_exe «demo-exe» where
             "-Dweak.weak.linter.x=true",
         ] {
             assert!(!is_allowed_lean_arg(bad), "{bad:?}");
+        }
+        // Fable r9: a column-0 `++` continuing a target field; Astra r10: explicit empty
+        // module selections.
+        for src in [
+            "import Lake\nopen Lake DSL\npackage demo\nlean_lib Demo where\n  leanOptions := #[⟨`autoImplicit, false⟩]\n++ #[⟨`linter.x, true⟩]\n",
+            "import Lake\nopen Lake DSL\npackage demo\n@[default_target]\nlean_lib Demo where\n  globs := #[]\n",
+            "import Lake\nopen Lake DSL\npackage demo\n@[default_target]\nlean_lib Demo where\n  roots := #[]\n",
+        ] {
+            for root in [false, true] {
+                assert!(parse(src, root).is_err(), "root={root}: {src}");
+            }
         }
         // Signed or zero-padded digit strings and Nats would be re-read as other numbers.
         for v in ["\"+0\"", "\"+42\"", "007", ".ofNat 01"] {

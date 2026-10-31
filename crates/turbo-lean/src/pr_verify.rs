@@ -2312,10 +2312,12 @@ fn run_lean_temp_file(
         cmd.arg(&cfg.lean_bin);
         crate::module_builder::scrub_untrusted_env(&mut cmd);
         cmd.args(["-M", "4096"]);
-        for arg in &cfg.root_pkg.more_lean_args {
+        // Lake's order: weakLeanArgs, then moreLeanArgs (later `-D` flags win); no setup.json
+        // here, so `leanOptions` come last.
+        for arg in &cfg.root_pkg.weak_lean_args {
             cmd.arg(arg);
         }
-        for arg in &cfg.root_pkg.weak_lean_args {
+        for arg in &cfg.root_pkg.more_lean_args {
             cmd.arg(arg);
         }
         for (k, v) in &cfg.root_pkg.lean_options {
