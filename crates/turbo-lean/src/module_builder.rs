@@ -8558,6 +8558,12 @@ pub(crate) static BWRAP_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Serialize native builds with tests that toggle `TURBO_LEAN_NO_WORKTREE_LINK`.
+    fn native_build_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
     fn make_temp_test_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "turbo_lean_mod_builder_{}_{}_{}",
@@ -9932,6 +9938,7 @@ lean_exe «demo-exe» where
     /// entry of its reverse dependent `App.B`, whose `.olean` was elaborated against the old `A`.
     #[test]
     fn test_dependent_manifest_entry_stale_after_import_only_rebuild() {
+        let _env_guard = native_build_env_guard();
         let dir = make_temp_test_dir("stale_dependent");
         let proj_dir = dir.join("proj");
         fs::create_dir_all(proj_dir.join("App")).unwrap();
@@ -10008,6 +10015,7 @@ lean_exe «demo-exe» where
     /// invalidate the root module, and an entry missing an external pin fails closed.
     #[test]
     fn test_root_entry_stale_after_transitive_dep_pkg_rebuild() {
+        let _env_guard = native_build_env_guard();
         let dir = make_temp_test_dir("stale_dep_pkg");
         let proj_dir = dir.join("proj");
         let dep_dir = proj_dir.join(".lake/packages/dep_pkg");
@@ -10136,6 +10144,7 @@ lean_exe «demo-exe» where
     /// as stale, so `check` never elaborates against a stale intermediate `.olean`.
     #[test]
     fn test_check_refreshes_dependent_after_import_cas_restore() {
+        let _env_guard = native_build_env_guard();
         let dir = make_temp_test_dir("stale_dependent_restore");
         let proj_dir = dir.join("proj");
         fs::create_dir_all(proj_dir.join("App")).unwrap();
@@ -10194,6 +10203,7 @@ lean_exe «demo-exe» where
     /// back (old mtimes, unchanged source and manifest) must be refreshed before elaboration.
     #[test]
     fn test_check_refreshes_after_foreign_import_artifact_restore() {
+        let _env_guard = native_build_env_guard();
         let dir = make_temp_test_dir("foreign_import_restore");
         let proj_dir = dir.join("proj");
         fs::create_dir_all(proj_dir.join("App")).unwrap();
@@ -10262,6 +10272,7 @@ lean_exe «demo-exe» where
     /// `App.X` must invalidate `App.C`.
     #[test]
     fn test_root_entry_stale_through_dep_to_root_import() {
+        let _env_guard = native_build_env_guard();
         let dir = make_temp_test_dir("stale_dep_to_root");
         let proj_dir = dir.join("proj");
         let dep_dir = proj_dir.join(".lake/packages/dep_pkg");
@@ -10334,6 +10345,7 @@ lean_exe «demo-exe» where
 
     #[test]
     fn test_native_module_builder_cas_partial_invalidation_lazy_c_and_lake_differential() {
+        let _env_guard = native_build_env_guard();
         let dir = make_temp_test_dir("native_e2e");
         let store_dir = dir.join(".turbo_store");
         let proj_dir = dir.join("proj");
@@ -10856,6 +10868,7 @@ lean_exe «demo-exe» where
 
     #[test]
     fn test_adversarial_cas_key_dep_digest_validation_and_ambiguous_or_same_mtime_deps() {
+        let _env_guard = native_build_env_guard();
         let _bwrap_guard = BWRAP_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
