@@ -1566,7 +1566,7 @@ fn run(cli: Cli) -> Result<()> {
             let explicit_lp: Option<String> = lean_path.or_else(|| std::env::var("LEAN_PATH").ok());
 
             let (mut env_vars, lean_bin, req_lp) = if let Some(lp) = explicit_lp {
-                let (mut ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, &lp);
+                let (mut ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, &lp)?;
                 if lp.is_empty() {
                     ev.remove("LEAN_PATH");
                 } else {
@@ -1581,21 +1581,25 @@ fn run(cli: Cli) -> Result<()> {
                 let lp = lake_build::resolve_remote_lean_path(&canon_proj, None);
                 let mut ev = std::collections::HashMap::new();
                 ev.insert("LEAN_PATH".to_string(), lp.clone());
-                (ev, PathBuf::from("lean"), lp)
+                (
+                    ev,
+                    pack::resolve_server_lean_env_and_bin(&store, &toolchain, &lp)?.1,
+                    lp,
+                )
             } else if proj_dir.join("lakefile.lean").exists()
                 || proj_dir.join("lakefile.toml").exists()
             {
                 if let Ok((ev, _)) = lake_build::resolve_lake_env(&store, &proj_dir) {
                     let lp = ev.get("LEAN_PATH").cloned().unwrap_or_default();
-                    let (_, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, &lp);
+                    let (_, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, &lp)?;
                     (ev, lb, lp)
                 } else {
-                    let (ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, "");
+                    let (ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, "")?;
                     let lp = ev.get("LEAN_PATH").cloned().unwrap_or_default();
                     (ev, lb, lp)
                 }
             } else {
-                let (ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, "");
+                let (ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, "")?;
                 (ev, lb, String::new())
             };
 
