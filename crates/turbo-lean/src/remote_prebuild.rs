@@ -5,7 +5,7 @@
 //! (computed automatically from `lake-manifest.json` or `lakefile.toml` / `lakefile.lean`), and
 //! returns structured `ready`, `compile_failed`, or `fallback` results.
 
-use crate::pack::{encode_hex_bytes, http_request_full};
+use crate::pack::{encode_hex_bytes, http_request_full, http_request_full_anonymous};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -154,9 +154,10 @@ fn same_origin(a: &str, b: &str) -> bool {
     matches!((url_origin(a), url_origin(b)), (Some(x), Some(y)) if x == y)
 }
 
-/// Paths from `git status --porcelain=v1 -z --untracked-files=all` that change what a remote
-/// build of `HEAD` would see: every tracked change, plus untracked Lean sources and build inputs.
-fn build_relevant_dirty_paths(porcelain_z: &[u8]) -> Vec<String> {
+/// Paths from `git status --porcelain=v1 -z --untracked-files=all`: every tracked change and every
+/// untracked file, since any of them can be a build input the remote commit lacks (ignored files
+/// are not reported by git and so are not covered).
+fn dirty_paths_from_porcelain(porcelain_z: &[u8]) -> Vec<String> {
     let mut entries = porcelain_z.split(|&b| b == 0).filter(|e| !e.is_empty());
     let mut dirty = Vec::new();
     while let Some(entry) = entries.next() {
@@ -167,21 +168,15 @@ fn build_relevant_dirty_paths(porcelain_z: &[u8]) -> Vec<String> {
         if xy.starts_with(['R', 'C']) || xy.ends_with(['R', 'C']) {
             entries.next();
         }
-        let file = path.rsplit('/').next().unwrap_or(path);
-        let untracked_input = path.ends_with(".lean")
-            || matches!(
-                file,
-                "lakefile.toml" | "lake-manifest.json" | "lean-toolchain"
-            );
-        if xy != "??" || untracked_input {
-            dirty.push(path.to_string());
-        }
+        dirty.push(path.to_string());
     }
     dirty
 }
 
-/// Build-relevant uncommitted paths under `project_dir`; empty when it is not a git work tree.
-fn working_tree_dirty_paths(project_dir: &Path) -> Result<Vec<String>> {
+/// Ways the local checkout under `project_dir` differs from the commit `selected_sha` that the
+/// remote will build (uncommitted paths, or a `HEAD` on another commit); empty when it is not a git
+/// work tree.
+fn working_tree_dirty_paths(project_dir: &Path, selected_sha: &str) -> Result<Vec<String>> {
     let git = |args: &[&str]| {
         Command::new("git")
             .args(args)
@@ -200,6 +195,7 @@ fn working_tree_dirty_paths(project_dir: &Path) -> Result<Vec<String>> {
         "--porcelain=v1",
         "-z",
         "--untracked-files=all",
+        "--ignore-submodules=none",
         "--",
         ".",
     ])?;
@@ -209,7 +205,21 @@ fn working_tree_dirty_paths(project_dir: &Path) -> Result<Vec<String>> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    Ok(build_relevant_dirty_paths(&out.stdout))
+    let mut dirty = dirty_paths_from_porcelain(&out.stdout);
+    let head = git(&["rev-parse", "HEAD"])
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .to_ascii_lowercase()
+        });
+    if let Some(head) = head.filter(|h| !selected_sha.is_empty() && h != selected_sha) {
+        dirty.push(format!(
+            "HEAD is {head} but the selected commit is {selected_sha}"
+        ));
+    }
+    Ok(dirty)
 }
 
 /// Refuses a dirty tree unless `allow_dirty`; returns the dirty paths to report when allowed.
@@ -218,8 +228,8 @@ fn dirty_tree_decision(dirty: Vec<String>, allow_dirty: bool) -> Result<Vec<Stri
         return Ok(dirty);
     }
     Err(format!(
-        "working tree has uncommitted build-relevant changes ({}); the remote builds the committed \
-         commit, not this tree. Commit them or pass --allow-dirty to accept the mismatch",
+        "local checkout differs from the commit the remote will build ({}); the result would not \
+         describe this tree. Commit/check out the commit or pass --allow-dirty to accept the mismatch",
         dirty.join(", ")
     ))
 }
@@ -274,13 +284,13 @@ fn stream_download_with_sha256(
                 out_file.write_all(&buf[..n])?;
             }
         } else if url.starts_with("http://") {
-            let body = http_request_full(
+            // `url` is server-supplied: never attach ambient credentials.
+            let body = http_request_full_anonymous(
                 "GET",
                 url,
                 "application/octet-stream",
                 &[],
                 Some(timeout_ms.max(5_000)),
-                None,
                 None,
                 || {},
             )?;
@@ -373,7 +383,7 @@ pub fn run_remote_prebuild_command(
 
     // The remote builds a commit, so uncommitted local changes are refused unless `--allow-dirty`;
     // `accepted_dirty` is non-empty only when they were knowingly accepted.
-    let dirty_decision = working_tree_dirty_paths(project_dir)
+    let dirty_decision = working_tree_dirty_paths(project_dir, &final_sha)
         .map_err(|e| e.to_string())
         .and_then(|dirty| dirty_tree_decision(dirty, allow_dirty));
     let accepted_dirty = dirty_decision.clone().unwrap_or_default();
@@ -381,9 +391,8 @@ pub fn run_remote_prebuild_command(
         if !accepted_dirty.is_empty() {
             payload["working_tree_dirty"] = serde_json::json!(true);
             payload["dirty_paths"] = serde_json::json!(accepted_dirty);
-            payload["warning"] = serde_json::json!(
-                "result describes the committed commit, not the uncommitted local working tree"
-            );
+            payload["warning"] =
+                serde_json::json!("result describes the remote commit, not the local checkout");
         }
         if json_mode {
             println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -787,20 +796,20 @@ mod tests {
     }
 
     #[test]
-    fn porcelain_dirty_paths_cover_tracked_and_build_input_changes_only() {
-        let z = b" M A.lean\0A  new.lean\0R  moved.lean\0old.lean\0?? Extra.lean\0?? sub/lakefile.toml\0?? notes.txt\0?? out/a.bin\0";
+    fn porcelain_dirty_paths_cover_every_tracked_and_untracked_change() {
+        let z = b" M A.lean\0A  new.lean\0R  moved.lean\0old.lean\0?? Extra.lean\0?? notes.txt\0?? out/a.bin\0";
         assert_eq!(
-            build_relevant_dirty_paths(z),
+            dirty_paths_from_porcelain(z),
             [
                 "A.lean",
                 "new.lean",
                 "moved.lean",
                 "Extra.lean",
-                "sub/lakefile.toml"
+                "notes.txt",
+                "out/a.bin"
             ]
         );
-        assert!(build_relevant_dirty_paths(b"?? notes.txt\0").is_empty());
-        assert!(build_relevant_dirty_paths(b"").is_empty());
+        assert!(dirty_paths_from_porcelain(b"").is_empty());
     }
 
     #[test]
@@ -822,6 +831,15 @@ mod tests {
         assert!(st.success(), "git {args:?}");
     }
 
+    fn git_out(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
     #[test]
     fn working_tree_dirty_paths_tracks_real_git_state() -> Result<()> {
         let tmp = std::env::temp_dir().join(format!("turbo_lean_rp_dirty_{}", std::process::id()));
@@ -831,12 +849,47 @@ mod tests {
         fs::write(tmp.join("A.lean"), "def a := 1\n")?;
         git_ok(&tmp, &["add", "."]);
         git_ok(&tmp, &["commit", "-q", "-m", "init"]);
-        assert!(working_tree_dirty_paths(&tmp)?.is_empty());
-        fs::write(tmp.join("notes.txt"), "x")?;
-        assert!(working_tree_dirty_paths(&tmp)?.is_empty());
+        let head = git_out(&tmp, &["rev-parse", "HEAD"]);
+        assert!(working_tree_dirty_paths(&tmp, &head)?.is_empty());
+        fs::write(tmp.join("native.c"), "x")?;
+        assert_eq!(working_tree_dirty_paths(&tmp, &head)?, ["native.c"]);
+        fs::remove_file(tmp.join("native.c"))?;
         fs::write(tmp.join("A.lean"), "def a := 2\n")?;
-        assert_eq!(working_tree_dirty_paths(&tmp)?, ["A.lean"]);
+        assert_eq!(working_tree_dirty_paths(&tmp, &head)?, ["A.lean"]);
+        git_ok(&tmp, &["checkout", "-q", "A.lean"]);
+        // A clean checkout on a commit other than the one the remote will build is a mismatch.
+        let other = "0".repeat(40);
+        let mismatch = working_tree_dirty_paths(&tmp, &other)?;
+        assert_eq!(mismatch.len(), 1);
+        assert!(mismatch[0].contains(&head) && mismatch[0].contains(&other));
+        // Dirty submodules stay visible even when the repo config hides them.
+        let sub = std::env::temp_dir().join(format!("turbo_lean_rp_sub_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&sub);
+        fs::create_dir_all(&sub)?;
+        git_ok(&sub, &["init", "-q"]);
+        fs::write(sub.join("S.lean"), "def s := 1\n")?;
+        git_ok(&sub, &["add", "."]);
+        git_ok(&sub, &["commit", "-q", "-m", "sub"]);
+        git_ok(
+            &tmp,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                sub.to_str().unwrap(),
+                "dep",
+            ],
+        );
+        git_ok(&tmp, &["commit", "-q", "-m", "add dep"]);
+        git_ok(&tmp, &["config", "submodule.dep.ignore", "all"]);
+        let head = git_out(&tmp, &["rev-parse", "HEAD"]);
+        assert!(working_tree_dirty_paths(&tmp, &head)?.is_empty());
+        fs::write(tmp.join("dep").join("S.lean"), "def s := 2\n")?;
+        assert_eq!(working_tree_dirty_paths(&tmp, &head)?, ["dep"]);
         let _ = fs::remove_dir_all(&tmp);
+        let _ = fs::remove_dir_all(&sub);
         Ok(())
     }
 

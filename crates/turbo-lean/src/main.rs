@@ -456,7 +456,7 @@ enum Commands {
         /// Poll interval in milliseconds while the remote job is queued/running
         #[arg(long, default_value_t = 1000)]
         poll_interval_ms: u64,
-        /// Proceed despite uncommitted build-relevant changes; the remote still builds the committed SHA, and the result is flagged `working_tree_dirty`
+        /// Proceed although the local checkout differs from the commit the remote builds (uncommitted/untracked files or another HEAD); the result is flagged `working_tree_dirty`
         #[arg(long)]
         allow_dirty: bool,
     },
