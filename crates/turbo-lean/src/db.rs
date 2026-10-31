@@ -1250,6 +1250,7 @@ impl TurboStore {
              VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7)
              ON CONFLICT(blob_hash) DO UPDATE SET
                 last_accessed = excluded.last_accessed,
+                size_bytes = CASE WHEN excluded.size_bytes > 0 THEN excluded.size_bytes ELSE blobs.size_bytes END,
                 pin_level = MAX(blobs.pin_level, excluded.pin_level),
                 trust_domain = CASE WHEN blobs.trust_domain = 'trusted' THEN 'trusted' ELSE excluded.trust_domain END",
             params![hash, kind, size, inode, now, pin_level, trust_domain],
@@ -1312,6 +1313,7 @@ impl TurboStore {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7)
                  ON CONFLICT(blob_hash) DO UPDATE SET
                     last_accessed = excluded.last_accessed,
+                    size_bytes = CASE WHEN excluded.size_bytes > 0 THEN excluded.size_bytes ELSE blobs.size_bytes END,
                     pin_level = MAX(blobs.pin_level, excluded.pin_level),
                     trust_domain = CASE WHEN blobs.trust_domain = 'trusted' THEN 'trusted' ELSE excluded.trust_domain END",
             )?;
@@ -1351,6 +1353,7 @@ impl TurboStore {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7)
                  ON CONFLICT(blob_hash) DO UPDATE SET
                     last_accessed = excluded.last_accessed,
+                    size_bytes = CASE WHEN excluded.size_bytes > 0 THEN excluded.size_bytes ELSE blobs.size_bytes END,
                     pin_level = MAX(blobs.pin_level, excluded.pin_level),
                     trust_domain = CASE WHEN blobs.trust_domain = 'trusted' THEN 'trusted' ELSE excluded.trust_domain END",
             )?;
@@ -1533,6 +1536,7 @@ impl TurboStore {
                  VALUES (?1, 'expr_shard', ?2, ?3, ?4, ?4, 0, ?5)
                  ON CONFLICT(blob_hash) DO UPDATE SET
                     last_accessed = excluded.last_accessed,
+                    size_bytes = CASE WHEN excluded.size_bytes > 0 THEN excluded.size_bytes ELSE blobs.size_bytes END,
                     trust_domain = CASE WHEN blobs.trust_domain = 'trusted' THEN 'trusted' ELSE excluded.trust_domain END",
             )?;
             let mut ins_act = self.conn.prepare_cached(
@@ -1829,6 +1833,7 @@ impl TurboStore {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?5, 0, ?6)
                  ON CONFLICT(blob_hash) DO UPDATE SET
                     last_accessed = excluded.last_accessed,
+                    size_bytes = CASE WHEN excluded.size_bytes > 0 THEN excluded.size_bytes ELSE blobs.size_bytes END,
                     trust_domain = CASE WHEN blobs.trust_domain = 'trusted' THEN 'trusted' ELSE excluded.trust_domain END",
             )?;
             ins_blob.execute(params![blob_hash, kind, size, inode, now, trust_domain])?;
@@ -1991,6 +1996,7 @@ impl TurboStore {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7)
                  ON CONFLICT(blob_hash) DO UPDATE SET
                     last_accessed = excluded.last_accessed,
+                    size_bytes = CASE WHEN excluded.size_bytes > 0 THEN excluded.size_bytes ELSE blobs.size_bytes END,
                     pin_level = MAX(blobs.pin_level, excluded.pin_level),
                     trust_domain = CASE WHEN blobs.trust_domain = 'trusted' THEN 'trusted' ELSE excluded.trust_domain END",
             )?;
@@ -2274,11 +2280,17 @@ impl TurboStore {
         };
         let mut magic = [0u8; 4];
         if f.read_exact(&mut magic).is_ok() && &magic == b"TLZ1" {
+            // Read the inode we sniffed (not the path again): a racing promotion swaps the path.
+            let opened_ino = f.metadata()?.ino();
+            let mut compressed = magic.to_vec();
+            f.read_to_end(&mut compressed)?;
             drop(f);
-            let compressed = fs::read(&src)?;
             let Some(raw) = decompress_tlz1(&compressed) else {
-                // A truncated cold body passes the header-only probe; drop it so it self-heals.
-                let _ = fs::remove_file(&src);
+                // A truncated cold body passes the header-only probe; drop it so it self-heals,
+                // unless a concurrent promotion already replaced it.
+                if fs::metadata(&src).is_ok_and(|m| m.ino() == opened_ino) {
+                    let _ = fs::remove_file(&src);
+                }
                 anyhow::bail!("Failed to decompress TLZ1 blob {}", blob_hash);
             };
             write_blob_atomic(&self.root, &src, blob_hash, &raw, true)?;
@@ -3211,6 +3223,7 @@ pub fn batch_import_pack_metadata_with_domain(
              VALUES (?1, ?2, ?3, ?4, ?5, ?5, 0, ?6)
              ON CONFLICT(blob_hash) DO UPDATE SET
                 last_accessed = excluded.last_accessed,
+                size_bytes = CASE WHEN excluded.size_bytes > 0 THEN excluded.size_bytes ELSE blobs.size_bytes END,
                 trust_domain = CASE WHEN blobs.trust_domain = 'trusted' THEN 'trusted' ELSE excluded.trust_domain END",
         )?;
         for (blob_hash, kind, size_bytes, inode) in blobs {
@@ -3508,7 +3521,15 @@ pub(crate) fn write_blob_atomic(
         match fs::hard_link(&staging_path, dest) {
             Ok(()) => Ok(ino),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                Ok(fs::metadata(dest)?.ino() as i64)
+                // Lost a race (or a pre-fix writer left a partial file): keep a complete
+                // blob, otherwise replace it with ours.
+                match probe_blob_file(dest, bytes.len() as u64) {
+                    BlobDisk::Intact(m) => Ok(m.ino() as i64),
+                    _ => {
+                        fs::rename(&staging_path, dest)?;
+                        Ok(ino)
+                    }
+                }
             }
             Err(e) => Err(e.into()),
         }
@@ -3898,6 +3919,23 @@ mod tests {
         assert!(store.ensure_blob_uncompressed(&bh).is_err());
         assert!(!path.exists());
         ensure_blob_file(&dir, &path, &bh, &payload, false)?;
+        assert_eq!(fs::read(&path)?, payload);
+
+        // A pre-fix row holding a torn size is refreshed by the next writer, and a torn file
+        // that wins the link race is replaced rather than accepted.
+        store.conn.execute(
+            "UPDATE blobs SET size_bytes = 7 WHERE blob_hash = ?1",
+            params![bh],
+        )?;
+        store.store_immutable_blob(&payload, "olean", "trusted", 1)?;
+        let row: i64 = store.conn.query_row(
+            "SELECT size_bytes FROM blobs WHERE blob_hash = ?1",
+            params![bh],
+            |r| r.get(0),
+        )?;
+        assert_eq!(row, payload.len() as i64);
+        tear_blob(&path, 4)?;
+        write_blob_atomic(&dir, &path, &bh, &payload, false)?;
         assert_eq!(fs::read(&path)?, payload);
 
         // GC keeps the `.lock` of a live holder; an unlinked lock makes a peer start over.
