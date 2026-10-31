@@ -10169,16 +10169,20 @@ lean_exe «demo-exe» where
         );
         assert!(crate::lake_build::resolve_prebuilt_module_import(&canon, &canon_c).is_none());
         // `check` must not elaborate `App.C` against the stale `DepPkg.B` either.
-        let res =
-            crate::lake_build::ensure_project_imports_fresh_for_check(&canon, &[canon_c.clone()]);
+        let res = crate::lake_build::ensure_project_imports_fresh_for_check(
+            &canon,
+            std::slice::from_ref(&canon_c),
+        );
         assert!(
             !matches!(res, Ok(0)),
             "stale `DepPkg.B` left in place for elaboration"
         );
         // The dependency's own manifest is the evidence: it counts without a root manifest too.
         let _ = fs::remove_file(&manifest_path);
-        let res =
-            crate::lake_build::ensure_project_imports_fresh_for_check(&canon, &[canon_c.clone()]);
+        let res = crate::lake_build::ensure_project_imports_fresh_for_check(
+            &canon,
+            std::slice::from_ref(&canon_c),
+        );
         assert!(
             !matches!(res, Ok(0)),
             "dependency evidence ignored without a root manifest"
@@ -10199,8 +10203,10 @@ lean_exe «demo-exe» where
         assert!(!verified());
         // An unreadable dependency manifest establishes nothing: refresh rather than trust it.
         fs::write(&dep_manifest_path, b"{").unwrap();
-        let res =
-            crate::lake_build::ensure_project_imports_fresh_for_check(&canon, &[canon_c.clone()]);
+        let res = crate::lake_build::ensure_project_imports_fresh_for_check(
+            &canon,
+            std::slice::from_ref(&canon_c),
+        );
         assert!(
             !matches!(res, Ok(0)),
             "corrupt dependency manifest treated as Lake-managed"
