@@ -40,3 +40,20 @@ fn check_decl_corpus_discovery_parity() {
         "missing={missing:?}; extra={extra:?}"
     );
 }
+
+#[test]
+fn qualified_shards_reconstruct_the_correct_namespace() {
+    let src = "namespace A\ntheorem same : 1 = 1 := rfl\nend A\nnamespace B\ntheorem same : 2 = 2 := rfl\nend B\n";
+    let split = split_lean_source(src, &[]);
+    assert_eq!(
+        split
+            .shards
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>(),
+        ["A.same", "B.same"]
+    );
+    let b = reconstruct_single_shard_source(src, "B.same").unwrap();
+    assert!(b.contains("theorem same : 1 = 1  := sorry"));
+    assert!(b.contains("theorem same : 2 = 2 := rfl"));
+}

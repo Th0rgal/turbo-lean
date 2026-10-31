@@ -89,9 +89,7 @@ fn glob_match(pat: &str, s: &str) -> bool {
 
 /// Whether the `allowed` pattern list admits kernel axiom `ax` (patterns never admit `sorryAx` or `Lean.trustCompiler`).
 pub fn axiom_allowed_under(ax: &str, allowed: &[String]) -> bool {
-    ax != "sorryAx"
-        && ax != "Lean.trustCompiler"
-        && allowed.iter().any(|p| glob_match(p, ax))
+    ax != "sorryAx" && ax != "Lean.trustCompiler" && allowed.iter().any(|p| glob_match(p, ax))
 }
 
 /// Whether the policy admits kernel axiom `ax` (patterns never admit `sorryAx` or `Lean.trustCompiler`).
@@ -127,10 +125,8 @@ fn item_kind(s: &str) -> &str {
 }
 
 /// Representative kernel axiom names emitted by Lean for `native_decide` and `bv_decide`.
-const NATIVE_DECIDE_PROBE_AXIOMS: [&str; 2] = [
-    "Lean.ofReduceBool",
-    "Pkg.thm._native.native_decide.ax_1_1",
-];
+const NATIVE_DECIDE_PROBE_AXIOMS: [&str; 2] =
+    ["Lean.ofReduceBool", "Pkg.thm._native.native_decide.ax_1_1"];
 const BV_DECIDE_PROBE_AXIOMS: [&str; 1] = ["Pkg.thm._native.bv_decide.ax_1_1"];
 
 /// Route hygiene item admission through the shared Lean C-ABI gate (`turbo_spec_verify_hygiene_item_admitted`)
@@ -734,9 +730,7 @@ fn strip_leading_set_option_in(s: &str) -> Option<&str> {
     let first_line = &s[..first_line_end];
     let trimmed_line = first_line.trim_end();
     if let Some(before_in) = trimmed_line.strip_suffix(" in") {
-        let after_nl = s[first_line_end..].strip_prefix('\n').unwrap_or("");
-        let is_indented_continuation = after_nl.starts_with(' ') || after_nl.starts_with('\t');
-        if before_in.len() > "set_option".len() && !is_indented_continuation {
+        if before_in.len() > "set_option".len() {
             return Some(&s[trimmed_line.len()..]);
         }
         return None;
@@ -862,7 +856,7 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
     let mut line_num = 1usize;
     let mut pos = 0usize;
     let mut mutual_depth = 0usize;
-    let mut section_depth = 0usize;
+    let mut scope_depth = 0usize;
 
     while pos < total_len {
         let line_start = pos;
@@ -887,10 +881,10 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
         let indent = line_orig.len() - line_orig.trim_start().len();
         let is_unindented = indent == 0;
         let starts_doc_comment = line_orig.trim_start().starts_with("/--")
-            && (is_unindented || (section_depth > 0 && indent <= cur_cmd_indent.unwrap_or(indent)));
+            && (is_unindented || (scope_depth > 0 && indent <= cur_cmd_indent.unwrap_or(indent)));
 
         if mutual_depth > 0 {
-            if is_unindented || (section_depth > 0 && indent <= cur_cmd_indent.unwrap_or(0)) {
+            if is_unindented || (scope_depth > 0 && indent <= cur_cmd_indent.unwrap_or(0)) {
                 if is_mutual_line_start(trimmed) {
                     mutual_depth += 1;
                 } else if is_end_line_start(trimmed) {
@@ -910,7 +904,7 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
             || is_end_line_start(prev_trimmed);
 
         let can_start_at_indent = is_unindented
-            || (section_depth > 0
+            || (scope_depth > 0
                 && (prev_is_section_or_ns_header || indent <= cur_cmd_indent.unwrap_or(indent)));
 
         if line_num > 1
@@ -935,10 +929,10 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
         }
 
         if can_start_at_indent {
-            if is_section_header_line(trimmed) {
-                section_depth += 1;
-            } else if is_end_line_start(trimmed) && section_depth > 0 {
-                section_depth -= 1;
+            if is_section_header_line(trimmed) || trimmed.starts_with("namespace ") {
+                scope_depth += 1;
+            } else if is_end_line_start(trimmed) && scope_depth > 0 {
+                scope_depth -= 1;
             } else if is_mutual_line_start(trimmed) {
                 mutual_depth = 1;
             }
@@ -1321,8 +1315,8 @@ pub(crate) fn extract_shard_stmt_and_proof(src: &str, shard: &TheoremShard) -> (
     } else {
         String::new()
     };
-    if let Some((sig, prf)) = split_at_top_level_assign(&decl_lines)
-        .or_else(|| decl_lines.split_once(":="))
+    if let Some((sig, prf)) =
+        split_at_top_level_assign(&decl_lines).or_else(|| decl_lines.split_once(":="))
     {
         (
             if !shard.signature_text.is_empty() {
@@ -1850,6 +1844,21 @@ fn update_scope_stack_with_idx(stack: &mut Vec<ScopeFrame>, clean_chunk: &str, s
             }
         }
     }
+}
+
+/// Environment-facing name, without Lean's private-name mangling. Section names do not
+/// contribute to namespaces; explicit `_root_` declarations bypass the current namespace.
+fn qualified_decl_name(name: &str, stack: &[ScopeFrame]) -> String {
+    if let Some(root_name) = name.strip_prefix("_root_.") {
+        return root_name.to_string();
+    }
+    stack
+        .iter()
+        .filter(|f| matches!(f.kind, ScopeKind::Namespace))
+        .map(|f| f.name.as_str())
+        .chain(std::iter::once(name))
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// Format closing `end` statements for all currently open frames on `stack`.
@@ -2522,7 +2531,7 @@ fn split_lean_source_inner(
                         };
 
                         shards.push(TheoremShard {
-                            name,
+                            name: qualified_decl_name(&name, &scope_stack),
                             kind,
                             start_line: sub.start_line,
                             end_line: sub.end_line,
@@ -2698,7 +2707,7 @@ fn split_lean_source_inner(
                 }
 
                 shards.push(TheoremShard {
-                    name,
+                    name: qualified_decl_name(&name, &scope_stack),
                     kind,
                     start_line: span.start_line,
                     end_line: span.end_line,
@@ -2874,22 +2883,25 @@ pub fn reconstruct_single_shard_source(src: &str, target_decl: &str) -> Option<S
     let spans = parse_command_spans(src, &clean);
     let closed_sections = compute_closed_section_ranges(&spans);
 
-    let t_idx = spans.iter().position(|span| {
-        split_mutual_block_subspans(span)
-            .map(|(_, inner_spans, _)| {
-                inner_spans.iter().any(|sub| {
-                    classify_decl_header(sub.clean_text)
-                        .map(|(_, n)| decl_name_matches_target(&n, target_decl))
-                        .unwrap_or(false)
-                })
-            })
-            .unwrap_or(false)
-            || classify_decl_header(span.clean_text)
+    let mut target_scope = Vec::new();
+    let t_idx = spans.iter().enumerate().find_map(|(idx, span)| {
+        let matches = |text: &str| {
+            classify_decl_header(text)
                 .map(|(_, name)| {
-                    split_at_top_level_assign(span.clean_text).is_some()
-                        && decl_name_matches_target(&name, target_decl)
+                    split_at_top_level_assign(text).is_some()
+                        && decl_name_matches_target(
+                            &qualified_decl_name(&name, &target_scope),
+                            target_decl,
+                        )
                 })
                 .unwrap_or(false)
+        };
+        let found = split_mutual_block_subspans(span)
+            .map(|(_, inner, _)| inner.iter().any(|sub| matches(sub.clean_text)))
+            .unwrap_or(false)
+            || matches(span.clean_text);
+        update_scope_stack_with_idx(&mut target_scope, span.clean_text, idx);
+        found.then_some(idx)
     })?;
     let omit_mask = compute_omitted_closed_section_spans(&spans, &closed_sections, t_idx);
 
@@ -4649,7 +4661,10 @@ mod tests {
         assert!(blocking_items_under(&rep.flagged_items, &wildcard).is_empty());
         assert!(blocking_items_under(&rep.flagged_items, &native_glob).is_empty());
         let sorry_rep = audit_hygiene("theorem bad : False := sorry\n");
-        assert_eq!(blocking_items_under(&sorry_rep.flagged_items, &wildcard).len(), 1);
+        assert_eq!(
+            blocking_items_under(&sorry_rep.flagged_items, &wildcard).len(),
+            1
+        );
 
         // The policy comes from the nearest `turbo-lean.toml`, at the given revision if any.
         let repo = std::env::temp_dir().join(format!("turbo_lean_axpol_{}", std::process::id()));
@@ -4840,7 +4855,7 @@ mod tests {
         let (s0, s1) = (&split.shards[0], &split.shards[1]);
         assert_eq!(
             (s0.name.as_str(), s1.name.as_str()),
-            ("thm_in_abc_inner", "thm_in_ab")
+            ("A.B.C.thm_in_abc_inner", "A.B.thm_in_ab")
         );
         for pat in [
             "namespace A.B.C",
@@ -4872,7 +4887,7 @@ mod tests {
         let (s_inside, s_outside) = (&split.shards[1], &split.shards[2]);
         assert_eq!(
             (s_inside.name.as_str(), s_outside.name.as_str()),
-            ("inside_local_sec", "outside_local_sec")
+            ("ScopeIso.inside_local_sec", "ScopeIso.outside_local_sec")
         );
         for pat in [
             "section LocalSetup",
@@ -4938,7 +4953,12 @@ mod tests {
                 .iter()
                 .map(|s| s.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["isEven_zero", "isOdd_one", "mut_thm_a", "mut_thm_b"]
+            vec![
+                "MutualDemo.isEven_zero",
+                "MutualDemo.isOdd_one",
+                "MutualDemo.mut_thm_a",
+                "MutualDemo.mut_thm_b"
+            ]
         );
         for shard in &split.shards {
             assert!(
@@ -4980,7 +5000,11 @@ mod tests {
                 .iter()
                 .map(|s| s.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["wad_pos", "mulDivDown_zero_left", "mulDivDown_zero_right"]
+            vec![
+                "Verity.Proofs.Stdlib.Math.wad_pos",
+                "Verity.Proofs.Stdlib.Math.mulDivDown_zero_left",
+                "Verity.Proofs.Stdlib.Math.mulDivDown_zero_right"
+            ]
         );
         let s2 = &split.shards[2];
         for pat in [
@@ -5008,7 +5032,7 @@ mod tests {
                 split1.shards[0].name.as_str(),
                 split1.shards[0].signature_text.as_str()
             ),
-            ("match_thm", "theorem match_thm : Nat → True")
+            ("PatMatch.match_thm", "theorem match_thm : Nat → True")
         );
         assert!(split1.shards[0].proof_text.starts_with("| 0 => trivial"));
         assert_eq!(
@@ -5049,7 +5073,7 @@ mod tests {
         let find_target = |sp: &SplitResult| {
             sp.shards
                 .iter()
-                .find(|s| s.name == "targetThm")
+                .find(|s| s.name == "ConeDemo.targetThm")
                 .unwrap()
                 .cone_env_hash
                 .clone()
@@ -5152,7 +5176,11 @@ mod tests {
                 .iter()
                 .map(|s| s.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["thm_with_where", "pat_thm_with_where", "downstream_thm"]
+            vec![
+                "WhereDemo.thm_with_where",
+                "WhereDemo.pat_thm_with_where",
+                "WhereDemo.downstream_thm"
+            ]
         );
         assert_eq!(split.skeleton_source.lines().count(), src.lines().count());
         assert!(
@@ -5344,7 +5372,7 @@ theorem big_thm (a b : Nat) : a + b = b + a := by
                 split1.shards[0].name.as_str(),
                 split1.shards[1].name.as_str()
             ),
-            (2, "candidate", "follow_up")
+            (2, "ProximityPrize.candidate", "ProximityPrize.follow_up")
         );
         assert_eq!(
             (&split1.interface_hash, &split1.shards[0].stmt_hash),
@@ -5490,9 +5518,9 @@ end MathlibEdgeCases
                 .map(|s| s.name.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                "mul_inv_cancel_left",
-                "deprecated_helper₁",
-                "abs_val_in_return_type"
+                "MathlibEdgeCases.mul_inv_cancel_left",
+                "MathlibEdgeCases.deprecated_helper₁",
+                "MathlibEdgeCases.abs_val_in_return_type"
             ]
         );
         assert!(

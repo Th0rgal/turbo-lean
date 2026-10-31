@@ -55,6 +55,9 @@ fn heavy_check_decl_corpus_stock_lean_verdict_parity() {
             );
             let turbo = corpus::run(
                 Command::new(env!("CARGO_BIN_EXE_turbo-lean"))
+                    .env("TURBO_LEAN_NO_DAEMON", "1")
+                    .env_remove("TURBO_LEAN_ALLOWED_AXIOMS")
+                    .env_remove("TURBO_LEAN_ALLOWED_AXIOMS_FROM_CONFIG")
                     .args(["--cache-dir"])
                     .arg(tmp.0.join("cache"))
                     .args(["--json", "check"])
