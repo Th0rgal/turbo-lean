@@ -1,0 +1,10 @@
+{
+  "pid": 2135616,
+  "detached_session": true,
+  "started_unix": 1793462714.2686446,
+  "command": "source env.sh and setup_build.sh; exec python3 -u run_experiment.py (no --retry-build)",
+  "preserved_C17_build_sha256": "5d94f87ef581debe6a4b5d4840f5735133d4307f1e9f3121d457fa07f0a40361",
+  "current_artifact_verification": "research/b2c_data/recovery/1793462714531445493",
+  "artifact_verification_is_excluded_from_measurement": true,
+  "original_measured_build_unchanged": true
+}

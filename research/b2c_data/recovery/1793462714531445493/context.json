@@ -1,0 +1,5 @@
+{
+  "warmup_commit": "e9a91e8a84861c34f3e3c67ca053f280d2f9c921",
+  "purpose": "verify current artifacts before resumed extraction",
+  "excluded_from_measurement": true
+}
