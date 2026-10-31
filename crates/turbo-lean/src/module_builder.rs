@@ -7324,7 +7324,7 @@ impl Drop for ScopedTestBwrapOverride {
     }
 }
 
-pub(crate) fn probe_bwrap_sandbox() -> Option<PathBuf> {
+pub(crate) fn probe_bwrap_sandbox(project: &Path) -> Option<PathBuf> {
     #[cfg(test)]
     if let Some(test_bwrap) = TEST_BWRAP_BIN_OVERRIDE
         .with(|cell| cell.borrow().clone())
@@ -7340,13 +7340,17 @@ pub(crate) fn probe_bwrap_sandbox() -> Option<PathBuf> {
         }
         return None;
     }
-    let candidates = [
-        PathBuf::from("/usr/bin/bwrap"),
-        PathBuf::from("/bin/bwrap"),
-        PathBuf::from("bwrap"),
-    ];
-    for cand in candidates {
+    probe_bwrap_candidates(project, &["/usr/bin/bwrap", "/bin/bwrap"])
+}
+
+fn probe_bwrap_candidates(project: &Path, candidates: &[&str]) -> Option<PathBuf> {
+    for candidate in candidates {
+        let Ok(cand) = crate::trusted_tools::system_executable(Path::new(candidate), project)
+        else {
+            continue;
+        };
         let mut probe = Command::new(&cand);
+        probe.env_clear().env("PATH", "/usr/bin:/bin");
         probe.args([
             "--unshare-all",
             "--new-session",
@@ -7369,7 +7373,7 @@ pub(crate) fn probe_bwrap_sandbox() -> Option<PathBuf> {
             }
         }
         if probe
-            .arg("true")
+            .arg("/usr/bin/true")
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
@@ -7378,6 +7382,36 @@ pub(crate) fn probe_bwrap_sandbox() -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+#[test]
+fn unusable_system_sandbox_never_falls_back_to_project_bwrap() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let root = std::env::temp_dir().join(format!(
+        "turbo-bwrap-shim-{}-{}",
+        std::process::id(),
+        crate::pack::next_tmp_id()
+    ));
+    fs::create_dir_all(&root)?;
+    let shim = root.join("bwrap");
+    let marker = root.join("executed");
+    fs::write(
+        &shim,
+        format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+    )?;
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755))?;
+    assert!(Command::new(&shim).status()?.success());
+    fs::remove_file(&marker)?;
+    // An absolute, executable system candidate fails its probe; neither a bare
+    // PATH fallback nor an absolute checkout shim may replace it.
+    assert!(
+        probe_bwrap_candidates(&root, &["/usr/bin/false", "bwrap", shim.to_str().unwrap()])
+            .is_none()
+    );
+    assert!(!marker.exists());
+    fs::remove_dir_all(root)?;
+    Ok(())
 }
 
 fn canonicalize_path_with_missing_tail(p: &Path) -> Result<PathBuf> {
@@ -7924,7 +7958,7 @@ pub fn build_project_modules_native(
     }
     let (lean_path_env, ld_library_path_env) = build_lean_search_path(&cfg, is_untrusted);
     let bwrap_bin = if is_untrusted {
-        probe_bwrap_sandbox()
+        probe_bwrap_sandbox(&canon_dir)
     } else {
         None
     };
@@ -10234,6 +10268,10 @@ lean_exe «demo-exe» where
 
     #[test]
     fn test_adversarial_cas_key_dep_digest_validation_and_ambiguous_or_same_mtime_deps() {
+        // Match the MCP tests' environment-before-sandbox lock order.
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _bwrap_guard = BWRAP_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());

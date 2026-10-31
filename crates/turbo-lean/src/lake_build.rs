@@ -2263,7 +2263,11 @@ pub(crate) fn nonlocal_edits(files: &[PathBuf], rev: &str) -> Vec<String> {
             return false;
         };
         let name = f.file_name().unwrap_or_default().to_string_lossy();
-        let base = Command::new("git")
+        let parent = f.parent().unwrap_or(Path::new("."));
+        let Ok(mut git) = crate::trusted_tools::git(parent) else {
+            return true; // A missing trusted Git must invalidate reuse.
+        };
+        let base = git
             .arg("-C")
             .arg(f.parent().unwrap_or(Path::new(".")))
             .args(["show", &format!("{}:./{}", rev, name)])
@@ -2273,12 +2277,15 @@ pub(crate) fn nonlocal_edits(files: &[PathBuf], rev: &str) -> Vec<String> {
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
         let Some(base) = base else {
             // New since `rev` (inside a repository); outside git there is no edit to classify.
-            return Command::new("git")
-                .arg("-C")
-                .arg(f.parent().unwrap_or(Path::new(".")))
-                .args(["rev-parse", "--is-inside-work-tree"])
-                .output()
-                .is_ok_and(|o| o.status.success());
+            return crate::trusted_tools::git(parent)
+                .map(|mut git| {
+                    git.arg("-C")
+                        .arg(parent)
+                        .args(["rev-parse", "--is-inside-work-tree"])
+                        .output()
+                        .is_ok_and(|o| o.status.success())
+                })
+                .unwrap_or(true);
         };
         if base == cur {
             return false;

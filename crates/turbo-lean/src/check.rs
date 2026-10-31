@@ -3459,10 +3459,10 @@ fn check_single_file(
                                 {
                                     cmd.arg(arg);
                                 }
-                                let out = crate::zygote::run_lean_command(cmd
-                                    .arg(&tmp_shard)
-                                    .current_dir(canon_ref)
-                                    , Some(crate::zygote::remaining_timeout_ms(None, *t0)))
+                                let out = crate::zygote::run_lean_command(
+                                    cmd.arg(&tmp_shard).current_dir(canon_ref),
+                                    Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+                                )
                                     .with_context(|| {
                                         format!("Failed to execute `lean` on shard `{}`", shard.name)
                                     })?;

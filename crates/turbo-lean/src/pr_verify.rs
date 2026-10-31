@@ -43,7 +43,7 @@ pub(crate) fn resolve_git_toplevel(dir: &Path) -> Result<PathBuf> {
             return Ok(anc.to_path_buf());
         }
     }
-    let out = Command::new("git")
+    let out = crate::trusted_tools::git(dir)?
         .args(["-C", &dir.to_string_lossy(), "rev-parse", "--show-toplevel"])
         .output()
         .context("Failed to execute `git rev-parse --show-toplevel`")?;
@@ -154,7 +154,7 @@ pub(crate) fn fetch_git_blobs_batch(
     }
     if repo_rels.len() == 1 {
         let repo_rel = &repo_rels[0];
-        let show_out = Command::new("git")
+        let show_out = crate::trusted_tools::git(repo_root)?
             .args([
                 "-C",
                 &repo_root.to_string_lossy(),
@@ -172,7 +172,8 @@ pub(crate) fn fetch_git_blobs_batch(
         return Ok(out_map);
     }
 
-    let mut child = Command::new("git")
+    let mut git = crate::trusted_tools::git(repo_root)?;
+    let mut child = git
         .args(["-C", &repo_root.to_string_lossy(), "cat-file", "--batch"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -1745,7 +1746,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
             let repo_ref = &repo_root;
             let all_rels_ref = &all_lean_repo_rels;
             let status_h = s.spawn(move || {
-                Command::new("git")
+                crate::trusted_tools::git(repo_ref)?
                     .args([
                         "--no-optional-locks",
                         "-C",
@@ -1814,7 +1815,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
         let (diff_res, untracked_res, preloaded) = std::thread::scope(|s| {
             let repo_ref = &repo_root;
             let diff_h = s.spawn(move || {
-                Command::new("git")
+                crate::trusted_tools::git(repo_ref)?
                     .args([
                         "--no-optional-locks",
                         "-C",
@@ -1829,7 +1830,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                     .context("Failed to execute `git diff --name-only`")
             });
             let untracked_h = s.spawn(move || {
-                Command::new("git")
+                crate::trusted_tools::git(repo_ref)?
                     .args([
                         "--no-optional-locks",
                         "-C",
@@ -2464,7 +2465,7 @@ fn run_lean_temp_file(
                 "Untrusted PR shard verification requires a resolved static ProjectConfig: fail-closed sandbox gate"
             )
         })?;
-        let bwrap_path = crate::module_builder::probe_bwrap_sandbox().ok_or_else(|| {
+        let bwrap_path = crate::module_builder::probe_bwrap_sandbox(canon_dir).ok_or_else(|| {
             anyhow::anyhow!(
                 "Untrusted PR shard verification requires a working bubblewrap (`bwrap`) sandbox: fail-closed sandbox gate"
             )
@@ -2719,7 +2720,7 @@ pub fn run_ci_verify_command(
     };
 
     let untrusted_ci_cfg_and_mods = if is_untrusted {
-        if crate::module_builder::probe_bwrap_sandbox().is_none() {
+        if crate::module_builder::probe_bwrap_sandbox(&canon_dir).is_none() {
             anyhow::bail!(
                 "Untrusted CI verification requires a working bubblewrap (`bwrap`) sandbox: fail-closed sandbox gate"
             );
@@ -3350,7 +3351,7 @@ impl StatementWorktree {
             std::process::id(),
             pack::next_tmp_id()
         ));
-        let out = Command::new("git")
+        let out = crate::trusted_tools::git(repo)?
             .arg("-C")
             .arg(repo)
             .args(["worktree", "add", "--detach", "--force"])
@@ -3371,7 +3372,10 @@ impl StatementWorktree {
 
 impl Drop for StatementWorktree {
     fn drop(&mut self) {
-        let _ = Command::new("git")
+        let Ok(mut git) = crate::trusted_tools::git(&self.repo) else {
+            return;
+        };
+        let _ = git
             .arg("-C")
             .arg(&self.repo)
             .args(["worktree", "remove", "--force"])
@@ -3430,7 +3434,7 @@ fn statement_toolchain_command(
         }
         return Ok(command);
     }
-    let bwrap = crate::module_builder::probe_bwrap_sandbox()
+    let bwrap = crate::module_builder::probe_bwrap_sandbox(project)
         .context("Kernel statement builds require a working bubblewrap sandbox")?;
     let prefix = lib.parent().context("Missing stock toolchain prefix")?;
     let mut command = Command::new(bwrap);
@@ -3501,7 +3505,7 @@ fn ensure_statement_snapshot_path(root: &Path, target: &Path) -> Result<()> {
 // Overlay only Git's tracked/unignored source files on a clean HEAD snapshot.
 // Never bring across .olean files, traces, or native build products from head.
 fn overlay_statement_sources(repo: &Path, snapshot: &Path) -> Result<()> {
-    let out = Command::new("git")
+    let out = crate::trusted_tools::git(repo)?
         .arg("-C")
         .arg(repo)
         .args([
@@ -3584,7 +3588,7 @@ fn seed_statement_dependencies(
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
-        let out = Command::new("git")
+        let out = crate::trusted_tools::git(project)?
             .args(["clone", "--quiet", "--no-hardlinks"])
             .arg(&dep.pkg_root)
             .arg(&target)
@@ -4020,7 +4024,7 @@ pub fn run_pr_verify_command(
     let toolchain = detect_toolchain(&canon_dir);
 
     let untrusted_pr_cfg = if is_untrusted {
-        if crate::module_builder::probe_bwrap_sandbox().is_none() {
+        if crate::module_builder::probe_bwrap_sandbox(&canon_dir).is_none() {
             anyhow::bail!(
                 "Untrusted PR verification requires a working bubblewrap (`bwrap`) sandbox: fail-closed sandbox gate"
             );
@@ -4994,8 +4998,14 @@ pub fn run_pr_verify_command(
                 nanoda_path.display()
             );
         }
-        let mut nanoda_cmd = Command::new(nanoda_path);
-        nanoda_cmd.arg(&canon_dir).current_dir(&canon_dir);
+        let nanoda_path = crate::trusted_tools::outside_checkout(nanoda_path, &canon_dir)
+            .context("--nanoda-bin must be an absolute executable outside the project/checkout")?;
+        let mut nanoda_cmd = Command::new(&nanoda_path);
+        nanoda_cmd
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .arg(&canon_dir)
+            .current_dir(&canon_dir);
         if is_untrusted {
             scrub_sensitive_env_cmd(&mut nanoda_cmd);
         }
@@ -5557,7 +5567,7 @@ end Fixture
             git_init_and_commit(&dir, label)?;
         }
         stock_statement_build(&dir)?;
-        if crate::module_builder::probe_bwrap_sandbox().is_some() {
+        if crate::module_builder::probe_bwrap_sandbox(std::path::Path::new(".")).is_some() {
             fs::write(dir.join("fixture.c"), "int fixture(void) { return 0; }\n")?;
             let mut command = statement_lake_command(&dir, true)?;
             command.args(["env", "cc", "-c", "fixture.c", "-o", "fixture.o"]);
@@ -5662,7 +5672,8 @@ end Fixture
         };
         if cli.is_some() {
             verify_default_policy("trusted")?;
-            let sandbox = crate::module_builder::probe_bwrap_sandbox().is_some();
+            let sandbox =
+                crate::module_builder::probe_bwrap_sandbox(std::path::Path::new(".")).is_some();
             for (command, mode) in [
                 ("pr-verify", "trusted"),
                 ("pr-verify", "untrusted"),

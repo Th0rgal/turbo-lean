@@ -168,10 +168,12 @@ pub fn measure_process_rss_mb(pid: u32) -> u64 {
         }
     }
 
-    if let Ok(out) = Command::new("ps")
-        .args(["-o", "rss=", "-p", &pid.to_string()])
-        .output()
-    {
+    if let Ok(out) = crate::trusted_tools::system_command("ps").and_then(|mut command| {
+        command
+            .args(["-o", "rss=", "-p", &pid.to_string()])
+            .output()
+            .map_err(Into::into)
+    }) {
         if out.status.success() {
             if let Ok(rss_kb) = String::from_utf8_lossy(&out.stdout).trim().parse::<u64>() {
                 return rss_kb / 1024;
@@ -694,9 +696,11 @@ fn portable_process_alive(pid: u32) -> bool {
         return false;
     }
     // A zombie cannot use staging. On any ps failure retain it conservatively.
-    Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "stat="])
-        .output()
+    crate::trusted_tools::system_command("ps")
+        .and_then(|mut command| {
+            command.args(["-p", &pid.to_string(), "-o", "stat="])
+                .output().map_err(Into::into)
+        })
         .map(|out| {
             !out.status.success()
                 || out.stdout.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'Z')
@@ -723,7 +727,7 @@ struct PortableProcessIdentity {
 
 #[cfg(any(not(target_os = "linux"), test))]
 fn portable_process_identity(pid: u32) -> Result<Option<PortableProcessIdentity>> {
-    let output = Command::new("ps")
+    let output = crate::trusted_tools::system_command("ps")?
         .args([
             "eww",
             "-p",
@@ -1990,7 +1994,7 @@ fn audit_compiled_module_batch(
         .unwrap_or(if is_untrusted { 120 } else { 300 });
 
     let mut cmd = if is_untrusted {
-        let bwrap_path = crate::module_builder::probe_bwrap_sandbox().ok_or_else(|| {
+        let bwrap_path = crate::module_builder::probe_bwrap_sandbox(&cfg.root_pkg.pkg_root).ok_or_else(|| {
             anyhow::anyhow!(
                 "Untrusted kernel `.olean` audit requires a working bubblewrap (`bwrap`) sandbox: fail-closed sandbox gate"
             )
@@ -5615,7 +5619,7 @@ mod tests {
             false,
         )
         .expect("trusted auditor must ignore poisoned .lake/build/lib/libleanshared.so");
-        if crate::module_builder::probe_bwrap_sandbox().is_some() {
+        if crate::module_builder::probe_bwrap_sandbox(std::path::Path::new(".")).is_some() {
             audit_compiled_modules_with_zygote(
                 &store,
                 &cfg,
@@ -5696,7 +5700,8 @@ mod tests {
         let store = TurboStore::open(Some(&tmp_dir.join("store"))).unwrap();
         let (lean_path_env, _) = crate::module_builder::build_lean_search_path(&cfg, true);
         let prev_allow = std::env::var(crate::splitter::ALLOWED_AXIOMS_ENV).ok();
-        let has_bwrap = crate::module_builder::probe_bwrap_sandbox().is_some();
+        let has_bwrap =
+            crate::module_builder::probe_bwrap_sandbox(std::path::Path::new(".")).is_some();
 
         // 1. Default policy rejects `native_decide` auxiliary axioms in both trusted and untrusted Stage 1C audits.
         std::env::remove_var(crate::splitter::ALLOWED_AXIOMS_ENV);

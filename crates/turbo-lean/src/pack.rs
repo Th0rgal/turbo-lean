@@ -1317,16 +1317,19 @@ pub fn export_pack_filtered_with_signing_key(
         .join(format!("export_{}.tlpack.raw", next_tmp_id()));
     fs::write(&tmp_raw, &pack_stream)?;
 
-    let zstd_status = Command::new("zstd")
-        .args([
-            "-q",
-            "-f",
-            "-1",
-            tmp_raw.to_str().unwrap_or(""),
-            "-o",
-            output_path.to_str().unwrap_or(""),
-        ])
-        .status();
+    let zstd_status = crate::trusted_tools::system_command("zstd").and_then(|mut command| {
+        command
+            .args([
+                "-q",
+                "-f",
+                "-1",
+                tmp_raw.to_str().unwrap_or(""),
+                "-o",
+                output_path.to_str().unwrap_or(""),
+            ])
+            .status()
+            .map_err(Into::into)
+    });
 
     let _ = fs::remove_file(&tmp_raw);
     if zstd_status.map(|s| !s.success()).unwrap_or(true) {
@@ -1710,9 +1713,12 @@ pub fn import_pack_bytes_with_policy(
             .fast_staging_dir()
             .join(format!("import_{}.tlpack.zst", next_tmp_id()));
         fs::write(&tmp_in, input_bytes)?;
-        let decomp = Command::new("zstd")
-            .args(["-q", "-d", "-c", tmp_in.to_str().unwrap_or("")])
-            .output();
+        let decomp = crate::trusted_tools::system_command("zstd").and_then(|mut command| {
+            command
+                .args(["-q", "-d", "-c", tmp_in.to_str().unwrap_or("")])
+                .output()
+                .map_err(Into::into)
+        });
         let _ = fs::remove_file(&tmp_in);
         match decomp {
             Ok(out) if out.status.success() && !out.stdout.is_empty() => Some(out.stdout),
