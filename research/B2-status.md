@@ -1,7 +1,7 @@
 # B2 status
 
 Baseline: `5508b9f`; clifv `5018b9509dc124154dbe08a5bd85862595d8eab7`.
-Checkpoint: 2026-10-31 10:48 UTC. The real executable lowering lives in
+Checkpoint: 2026-10-31 11:08 UTC. The real executable lowering lives in
 `lean/LeanNative/Backend/Clif.lean`; `compile-clif` calls that definition.
 The proof package's default `lake build` passes on Lean 4.34.1.
 
@@ -9,8 +9,8 @@ The proof package's default `lake build` passes on Lean 4.34.1.
 | --- | --- | --- |
 | O1 subset | PROVED | `B2.Lowering.lower_in_subsetE`, for every successful executable lowering; `#print axioms`: `[propext, Classical.choice]`. Lowering checks the real `Compile.functionE` and rejects on false. |
 | O2 signature | PROVED | `B2.Lowering.lower_sig`, for every successful lowering; `#print axioms`: `[propext]`. |
-| O3 simulation | SORRY | The source half is all-input: `B2.CollatzSource.collatz_eval` proves real LNIR evaluation equals `Nat.repeat step steps.toNat n`, preserving arbitrary heaps (`[propext, Quot.sound]`). `B2.CollatzClif.generated_blocks` ties inspected blocks to the actual lowering; `div_two` proves the shift optimization; `header_taken` proves the all-input two-step CLIF header transition (`[propext, Classical.choice, Quot.sound]`). Body/backedge, termination, initialization, and final simulation remain open. |
-| O4 safety | SORRY | Safe-denominator operation lemmas pass, but no reachable-state safety or TrapsExplicit proof yet. |
+| O3 simulation | PROVED (collatz_steps) | `B2.CollatzClif.source_simulation` connects the real LNIR evaluator to `Clif.runWith` on the real successfully lowered function, for every UInt64 argument pair and arbitrary source heap/CLIF memory; fuel `15 * steps.toNat + 5`. `loop_returns` proves bounded-loop termination, including non-overflow of the taken index increment. Axioms: `[propext, Classical.choice, Quot.sound]`. Generic F64 simulation remains open. |
+| O4 safety | SORRY | `B2.RunSafety.collatz_prefix` excludes both trapped and stuck outcomes at every fuel from the initialized entry state, using the all-input termination proof; allowed axioms only. Connecting this to reachable-state `TrapsExplicit` remains open. |
 | O5 backend artifacts | SORRY | `B2.Smoke.collatz_lowered` proves the real lowering succeeds (`[propext]`); no checked backend artifacts/allocation yet. FinalDirect dependency cone building in background. |
 | O6 contracts | SORRY | Generic empty extern/signature/global/slot declarations: `B2.Lowering.lower_declarations` (`[propext]`). Complete site/contract discharge remains open. |
 | O7 AArch64 x0 | SORRY | Needs O3–O6, backend composition, and transitive axiom audit. |
@@ -36,16 +36,16 @@ that check and CI now runs it too. No AArch64 emission claim.
 `Lean.collectAxioms` on every currently claimed result and rejects
 anything outside propext/Quot.sound/Classical.choice. The complete active
 root (including CollatzSource/CollatzClif and the audit) builds locally.
-The header proofs use the actual `Clif.step` and `Clif.runLoop`;
-inspected block constants are accompanied by a kernel equality to the
-real generated function, not a second lowering.
+The loop and entry proofs use the actual `Clif.step`, `Clif.runLoop`,
+`Clif.enterFunc`, and `Clif.runWith`; inspected blocks have kernel equalities
+to the real generated function. The default build and transitive audit pass,
+including the complete body/backedge, bounded-loop, entry, and source simulation.
 
-Next proof work: CLIF body/backedge transition matching the source step,
-then bounded-loop induction and actual-entry initialization (O3); derive
-reachable safety (O4), then discharge the backend contracts/artifacts
-(O5/O6) and compose (O7). The FinalDirect build is live as of this
-checkpoint, spending substantial CPU in upstream IselData.lean. Do not
-restart a live build on an observation timeout; poll its handle/process.
+Next proof work: connect the returning execution to `ClifEntry` and reachable
+safety / `TrapsExplicit` (O4); produce backend artifacts/allocation (O5),
+discharge contracts (O6), and compose (O7). The FinalDirect build is live;
+upstream IselData finished after 1853 seconds, with dependent proof modules
+still building. Do not restart a live build on an observation timeout.
 
 The active root `B2.lean` excludes the old sorry-bearing SpecCore/SpecE2E
 sketches. Their DivGuarded, untyped-argument, and empty-program statements

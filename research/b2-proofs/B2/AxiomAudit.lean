@@ -5,6 +5,7 @@ import B2.Kernel
 import B2.Smoke
 import B2.CollatzSource
 import B2.CollatzClif
+import B2.RunSafety
 
 /-! A build-failing transitive axiom audit of the results claimed by B2-status.md.
 Historical draft statements are intentionally outside the active root. -/
@@ -24,7 +25,14 @@ run_cmd do
         ``B2.CollatzSource.collatz_eval, ``B2.CollatzClif.generated_blocks,
         ``B2.CollatzClif.generated_sig, ``B2.CollatzClif.div_two,
         ``B2.CollatzClif.after_iteration_live, ``B2.CollatzClif.header_test,
-        ``B2.CollatzClif.header_branch, ``B2.CollatzClif.header_taken] do
+        ``B2.CollatzClif.header_branch, ``B2.CollatzClif.header_taken,
+        ``B2.CollatzClif.body_backedge, ``B2.CollatzClif.iteration,
+        ``B2.CollatzClif.header_finished, ``B2.CollatzClif.loop_returns,
+        ``B2.CollatzClif.entry_advance, ``B2.CollatzClif.from_entry,
+        ``B2.CollatzClif.generated_entry, ``B2.CollatzClif.generated_slots,
+        ``B2.CollatzClif.enter_function, ``B2.CollatzClif.run_with,
+        ``B2.CollatzClif.source_simulation, ``B2.RunSafety.collatz_prefix,
+        ``B2.RunSafety.of_returned] do
       let axs ← Lean.collectAxioms name
       let rejected := axs.filter fun a => !allowed.contains a
       unless rejected.isEmpty do
