@@ -19,8 +19,11 @@ fn check_decl_corpus_discovery_parity() {
             "{module}: {:?}",
             split.fallback_reason
         );
-        let actual: std::collections::BTreeSet<_> =
-            split.shards.iter().map(|s| s.name.clone()).collect();
+        let actual: std::collections::BTreeSet<_> = split
+            .shards
+            .iter()
+            .map(|s| s.qualified_name.clone())
+            .collect();
         assert_eq!(
             actual.len(),
             split.shards.len(),
@@ -49,7 +52,7 @@ fn qualified_shards_reconstruct_the_correct_namespace() {
         split
             .shards
             .iter()
-            .map(|s| s.name.as_str())
+            .map(|s| s.qualified_name.as_str())
             .collect::<Vec<_>>(),
         ["A.same", "B.same"]
     );

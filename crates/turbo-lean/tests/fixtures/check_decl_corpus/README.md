@@ -32,5 +32,6 @@ its symmetric set difference). Missing targets were `Commands.option_indented`,
 `Commands.Nested.scoped_zero`, `Commands.Nested.identity`, and `Recursion.odd_self`;
 all discovered targets also lacked their namespace prefix. The splitter now tracks
 namespace indentation, accepts indented option-wrapper continuations, derives
-mutual-block indentation from commands rather than proof continuations, and emits
-qualified names. Reconstruction uses the same qualification to disambiguate names.
+mutual-block indentation from commands rather than proof continuations, and records
+qualified names alongside the existing source spellings (which remain compatible
+with CLI output and stored cache records). Reconstruction uses the same qualification to disambiguate names.

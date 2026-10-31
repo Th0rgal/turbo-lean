@@ -2,7 +2,11 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TheoremShard {
+    /// Source spelling retained for CLI/report/cache compatibility.
     pub name: String,
+    /// User-facing environment identity (private names are not kernel-mangled).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub qualified_name: String,
     pub kind: String,
     pub start_line: usize,
     pub end_line: usize,
@@ -2524,7 +2528,9 @@ fn split_lean_source_inner(
                         };
 
                         shards.push(TheoremShard {
-                            name: qualified_decl_name(&name, &scope_stack),
+                            qualified_qualified_name: qualified_decl_name(&name, &scope_stack),
+                            name,
+                            name,
                             kind,
                             start_line: sub.start_line,
                             end_line: sub.end_line,
@@ -4848,7 +4854,7 @@ mod tests {
         let (s0, s1) = (&split.shards[0], &split.shards[1]);
         assert_eq!(
             (s0.name.as_str(), s1.name.as_str()),
-            ("A.B.C.thm_in_abc_inner", "A.B.thm_in_ab")
+            ("thm_in_abc_inner", "thm_in_ab")
         );
         for pat in [
             "namespace A.B.C",
@@ -4880,7 +4886,7 @@ mod tests {
         let (s_inside, s_outside) = (&split.shards[1], &split.shards[2]);
         assert_eq!(
             (s_inside.name.as_str(), s_outside.name.as_str()),
-            ("ScopeIso.inside_local_sec", "ScopeIso.outside_local_sec")
+            ("inside_local_sec", "outside_local_sec")
         );
         for pat in [
             "section LocalSetup",
@@ -4946,12 +4952,7 @@ mod tests {
                 .iter()
                 .map(|s| s.name.as_str())
                 .collect::<Vec<_>>(),
-            vec![
-                "MutualDemo.isEven_zero",
-                "MutualDemo.isOdd_one",
-                "MutualDemo.mut_thm_a",
-                "MutualDemo.mut_thm_b"
-            ]
+            vec!["isEven_zero", "isOdd_one", "mut_thm_a", "mut_thm_b"]
         );
         for shard in &split.shards {
             assert!(
@@ -4993,11 +4994,7 @@ mod tests {
                 .iter()
                 .map(|s| s.name.as_str())
                 .collect::<Vec<_>>(),
-            vec![
-                "Verity.Proofs.Stdlib.Math.wad_pos",
-                "Verity.Proofs.Stdlib.Math.mulDivDown_zero_left",
-                "Verity.Proofs.Stdlib.Math.mulDivDown_zero_right"
-            ]
+            vec!["wad_pos", "mulDivDown_zero_left", "mulDivDown_zero_right"]
         );
         let s2 = &split.shards[2];
         for pat in [
@@ -5025,7 +5022,7 @@ mod tests {
                 split1.shards[0].name.as_str(),
                 split1.shards[0].signature_text.as_str()
             ),
-            ("PatMatch.match_thm", "theorem match_thm : Nat → True")
+            ("match_thm", "theorem match_thm : Nat → True")
         );
         assert!(split1.shards[0].proof_text.starts_with("| 0 => trivial"));
         assert_eq!(
@@ -5066,7 +5063,7 @@ mod tests {
         let find_target = |sp: &SplitResult| {
             sp.shards
                 .iter()
-                .find(|s| s.name == "ConeDemo.targetThm")
+                .find(|s| s.name == "targetThm")
                 .unwrap()
                 .cone_env_hash
                 .clone()
@@ -5169,11 +5166,7 @@ mod tests {
                 .iter()
                 .map(|s| s.name.as_str())
                 .collect::<Vec<_>>(),
-            vec![
-                "WhereDemo.thm_with_where",
-                "WhereDemo.pat_thm_with_where",
-                "WhereDemo.downstream_thm"
-            ]
+            vec!["thm_with_where", "pat_thm_with_where", "downstream_thm"]
         );
         assert_eq!(split.skeleton_source.lines().count(), src.lines().count());
         assert!(
@@ -5365,7 +5358,7 @@ theorem big_thm (a b : Nat) : a + b = b + a := by
                 split1.shards[0].name.as_str(),
                 split1.shards[1].name.as_str()
             ),
-            (2, "ProximityPrize.candidate", "ProximityPrize.follow_up")
+            (2, "candidate", "follow_up")
         );
         assert_eq!(
             (&split1.interface_hash, &split1.shards[0].stmt_hash),
@@ -5511,9 +5504,9 @@ end MathlibEdgeCases
                 .map(|s| s.name.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                "MathlibEdgeCases.mul_inv_cancel_left",
-                "MathlibEdgeCases.deprecated_helper₁",
-                "MathlibEdgeCases.abs_val_in_return_type"
+                "mul_inv_cancel_left",
+                "deprecated_helper₁",
+                "abs_val_in_return_type"
             ]
         );
         assert!(
