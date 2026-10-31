@@ -3017,13 +3017,15 @@ fn finalize_batch_publish_entries(
 /// classify reports only: none of these hashes grant a kernel-check cache hit.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct KernelConstant {
-    interface: serde_json::Value,
+    #[serde(skip)]
+    interface: String,
     deps: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct KernelTheorem {
-    statement: serde_json::Value,
+    #[serde(skip)]
+    statement: String,
     deps: Vec<String>,
 }
 
@@ -3073,6 +3075,39 @@ impl StatementPolicy {
     }
 }
 
+// Deserialize only routing metadata. Payload numbers may exceed even f64's range.
+#[derive(serde::Deserialize)]
+struct KernelDumpRow {
+    constant: Option<String>,
+    theorem: Option<String>,
+    audit: Option<String>,
+    module: Option<String>,
+    complete: Option<bool>,
+    csimp: Option<Vec<String>>,
+}
+
+// Borrow the exact JSON value emitted by Lean. IgnoredAny scans the value without
+// converting numeric tokens to f64 (or imposing any machine-integer bound).
+fn raw_statement_payload<'a>(line: &'a str, field: &str) -> Result<&'a str> {
+    let mut rest = line.trim_start().strip_prefix('{').context("Expected JSON object")?;
+    loop {
+        rest = rest.trim_start();
+        let mut keys = serde_json::Deserializer::from_str(rest).into_iter::<String>();
+        let key = keys.next().context("Missing JSON key")??;
+        rest = rest[keys.byte_offset()..].trim_start()
+            .strip_prefix(':').context("Missing JSON colon")?.trim_start();
+        let mut values = serde_json::Deserializer::from_str(rest)
+            .into_iter::<serde::de::IgnoredAny>();
+        values.next().context("Missing JSON value")??;
+        let end = values.byte_offset();
+        if key == field {
+            return Ok(&rest[..end]);
+        }
+        rest = rest[end..].trim_start().strip_prefix(',')
+            .with_context(|| format!("Missing kernel statement payload {field}"))?;
+    }
+}
+
 fn parse_kernel_statement_dump(raw: &[u8], module: &str) -> Result<BTreeMap<String, String>> {
     let mut constants = BTreeMap::<String, KernelConstant>::new();
     let mut theorems = BTreeMap::<String, KernelTheorem>::new();
@@ -3083,28 +3118,32 @@ fn parse_kernel_statement_dump(raw: &[u8], module: &str) -> Result<BTreeMap<Stri
         .filter(|l| !l.is_empty())
     {
         anyhow::ensure!(!complete, "Kernel statement rows after module completion");
-        let row: serde_json::Value =
+        let row: KernelDumpRow =
             serde_json::from_str(line).context("Invalid kernel statement dump (expected JSONL)")?;
-        if let Some(name) = row.get("constant").and_then(|v| v.as_str()) {
+        if let Some(name) = row.constant.as_deref() {
+            let mut constant: KernelConstant = serde_json::from_str(line)?;
+            constant.interface = raw_statement_payload(line, "interface")?.to_owned();
             anyhow::ensure!(
                 constants
-                    .insert(name.to_string(), serde_json::from_value(row.clone())?)
+                    .insert(name.to_string(), constant)
                     .is_none(),
                 "Duplicate constant in kernel statement dump: {name}"
             );
-        } else if let Some(name) = row.get("theorem").and_then(|v| v.as_str()) {
+        } else if let Some(name) = row.theorem.as_deref() {
+            let mut theorem: KernelTheorem = serde_json::from_str(line)?;
+            theorem.statement = raw_statement_payload(line, "statement")?.to_owned();
             anyhow::ensure!(
                 theorems
-                    .insert(name.to_string(), serde_json::from_value(row.clone())?)
+                    .insert(name.to_string(), theorem)
                     .is_none(),
                 "Duplicate theorem in kernel statement dump: {name}"
             );
-        } else if row.get("audit").is_some() {
-            let _: KernelAudit = serde_json::from_value(row.clone())?;
+        } else if row.audit.is_some() {
+            let _: KernelAudit = serde_json::from_str(line)?;
         } else {
             anyhow::ensure!(
-                row.get("module").and_then(|v| v.as_str()) == Some(module)
-                    && row.get("complete").and_then(|v| v.as_bool()) == Some(true)
+                row.module.as_deref() == Some(module)
+                    && row.complete == Some(true)
                     && !complete,
                 "Incomplete or unexpected kernel statement dump for {module}"
             );
@@ -3114,13 +3153,8 @@ fn parse_kernel_statement_dump(raw: &[u8], module: &str) -> Result<BTreeMap<Stri
     anyhow::ensure!(complete, "Missing kernel statement dump for {module}");
     let constant_hashes: BTreeMap<_, _> = constants
         .iter()
-        .map(|(name, constant)| {
-            Ok((
-                name.clone(),
-                blake3::hash(&serde_json::to_vec(&constant.interface)?),
-            ))
-        })
-        .collect::<Result<_>>()?;
+        .map(|(name, constant)| (name.clone(), blake3::hash(constant.interface.as_bytes())))
+        .collect();
     let mut result = BTreeMap::new();
     for (name, theorem) in theorems {
         let mut pending = theorem.deps;
@@ -3143,7 +3177,7 @@ fn parse_kernel_statement_dump(raw: &[u8], module: &str) -> Result<BTreeMap<Stri
             closure_hash.update(dep.as_bytes());
             closure_hash.update(constant_hashes[&dep].as_bytes());
         }
-        let type_hash = blake3::hash(&serde_json::to_vec(&theorem.statement)?);
+        let type_hash = blake3::hash(theorem.statement.as_bytes());
         let mut digest = blake3::Hasher::new();
         digest.update(b"turbo-lean:kernel-statement:v1\0");
         digest.update(type_hash.as_bytes());
@@ -3665,18 +3699,16 @@ fn built_kernel_statement_report(
     let mut remaining = modules.clone();
     for line in dump.split_inclusive(|&c| c == b'\n') {
         chunk.extend_from_slice(line);
-        let row: serde_json::Value =
+        let row: KernelDumpRow =
             serde_json::from_slice(line).context("Invalid kernel statement JSONL")?;
-        if row.get("audit").is_some() {
-            report.audits.push(serde_json::from_value(row.clone())?);
+        if row.audit.is_some() {
+            report.audits.push(serde_json::from_slice(line)?);
         }
-        if let Some(module) = row.get("module").and_then(|v| v.as_str()) {
+        if let Some(module) = row.module.as_deref() {
             let rel = remaining
                 .remove(module)
                 .with_context(|| format!("Unexpected kernel statement module {module}"))?;
-            report.csimp.extend(serde_json::from_value::<Vec<String>>(
-                row.get("csimp").context("Missing csimp audit")?.clone(),
-            )?);
+            report.csimp.extend(row.csimp.context("Missing csimp audit")?);
             let in_scope = scope.is_none_or(|p| Path::new(&rel).starts_with(p));
             for (name, digest) in parse_kernel_statement_dump(&chunk, module)? {
                 if in_scope {
@@ -3949,6 +3981,7 @@ pub fn run_pr_verify_command(
     // Keep source interfaces and verification jobs intact. Only the report/gate uses
     // built kernel statements, so an equal digest can never bypass stock checking.
     let statement_digest_t0 = Instant::now();
+    let source_statement_edit = !classification.statement_edited_theorems.is_empty();
     classification.statement_edited_theorems = kernel_statement_changes_with_trust(
         &canon_dir,
         &base,
@@ -3977,11 +4010,16 @@ pub fn run_pr_verify_command(
         .proof_edited_theorems
         .retain(|n| !is_statement_edit(n));
 
-    if disallow_statement_changes && !classification.statement_edited_theorems.is_empty() {
+    // Preserve every source-based restriction enforced before kernel reporting.
+    if disallow_statement_changes
+        && (classification.interface_drift || source_statement_edit
+            || !classification.statement_edited_theorems.is_empty())
+    {
         anyhow::bail!(
-            "PR statement/interface change gate FAILED (--disallow-statement-changes, mode={}): interface_drift={}, altered_files={:?}, statement_edited_theorems={:?}",
+            "PR statement/interface change gate FAILED (--disallow-statement-changes, mode={}): interface_drift={}, source_statement_edit={}, altered_files={:?}, statement_edited_theorems={:?}",
             mode,
             classification.interface_drift,
+            source_statement_edit,
             classification.altered_interface_files,
             classification.statement_edited_theorems
         );
@@ -4984,6 +5022,17 @@ globs = ["Demo.+"]
         stock_statement_build(&dir)?;
         let before = built_kernel_statements(&dir, None)?;
         assert!(before.contains_key("Demo/Main.lean::Demo.pinned"));
+        // A source interface restriction still applies when no old theorem type changes.
+        fs::write(&file, format!("{source}\ndef unrelated : Nat := 42\n"))?;
+        stock_statement_build(&dir)?;
+        assert_eq!(before, built_kernel_statements(&dir, None)?);
+        let mut store = TurboStore::open(Some(&dir.join(".lake/gate-cache")))?;
+        let error = run_pr_verify_command(
+            &mut store, true, dir.clone(), "HEAD".into(), "trusted".into(),
+            true, None, None, None, None, false, 0, None,
+        ).unwrap_err().to_string();
+        assert!(error.contains("statement/interface change gate FAILED")
+            && error.contains("interface_drift=true"), "{error}");
         for (label, current) in [
             ("import-only", format!("import Lean\n{source}")),
             (
@@ -5106,6 +5155,39 @@ globs = ["Demo.+"]
     }
 
     #[test]
+    fn kernel_statement_large_literals_remain_exact() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo-statement-naturals-{}-{}", std::process::id(), pack::next_tmp_id()
+        ));
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(dir.join("lakefile.toml"),
+            "name = \"natural-fixture\"\ndefaultTargets = [\"Demo\"]\n[[lean_lib]]\nname = \"Demo\"\n")?;
+        for (old, new) in [
+            ("1180591620717411303424", "1180591620717411303425"),
+            ("10000000000000000000000000000000000000000000000000000000000000000000000000000",
+             "10000000000000000000000000000000000000000000000000000000000000000000000000001"),
+        ] {
+            let source = |n: &str| format!(
+                "def large : Nat := {n}\ntheorem pinned : ({n} : Nat) = {n} := rfl\ntheorem indirect : large = large := rfl\n");
+            fs::write(dir.join("Demo.lean"), source(old))?;
+            stock_statement_build(&dir)?;
+            let before = built_kernel_statements(&dir, None)?;
+            fs::write(dir.join("Demo.lean"), source(new))?;
+            stock_statement_build(&dir)?;
+            assert_eq!(compare_kernel_statements(&before, &built_kernel_statements(&dir, None)?),
+                vec!["Demo.lean::indirect", "Demo.lean::pinned"]);
+        }
+        // The parser must also preserve payloads larger than f64's maximum.
+        let huge = "9".repeat(400);
+        let row = format!("{{\"statement\":[\"nat\",{huge}],\"theorem\":\"t\",\"deps\":[]}}\n{{\"module\":\"Demo\",\"complete\":true}}\n");
+        assert_ne!(parse_kernel_statement_dump(row.as_bytes(), "Demo")?,
+            parse_kernel_statement_dump(row.replace(&huge, &(huge.clone() + "1")).as_bytes(), "Demo")?);
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn project_lean_executable_cannot_replay_statement_dumps() -> Result<()> {
         let dir = std::env::temp_dir().join(format!(
             "turbo-statement-spoof-{}-{}", std::process::id(), pack::next_tmp_id()
@@ -5170,19 +5252,6 @@ root = "Spoof"
             dir.join("turbo-lean.toml"),
             config.replace("*._native.native_decide.ax_*", ""),
         )?;
-        git_init_and_commit(&dir, "deny native, allow csimp")?;
-        // The remaining bases keep native permission; isolate csimp rejection from axiom rejection.
-        for (permission, label) in [
-            ("", "deny"),
-            ("Fixture.other_eq", "wrong name"),
-            ("Fixture.fast_eq", "allow"),
-        ] {
-            fs::write(
-                dir.join("turbo-lean.toml"),
-                config.replace("Fixture.fast_eq", permission),
-            )?;
-            git_init_and_commit(&dir, label)?;
-        }
         fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
         fs::write(dir.join(".gitignore"), ".lake/\n")?;
         fs::write(dir.join("lakefile.toml"), "name = \"policy-fixture\"\ndefaultTargets = [\"Fixture\"]\n[[lean_lib]]\nname = \"Fixture\"\n")?;
@@ -5200,7 +5269,19 @@ theorem witness : (1 + 1 : Nat) = 2 := by native_decide
 end Fixture
 "#,
         )?;
-        // Keep the compiled fixture out of the policy-only base commit above.
+        git_init_and_commit(&dir, "deny native, allow csimp")?;
+        // The remaining bases keep native permission; isolate csimp rejection from axiom rejection.
+        for (permission, label) in [
+            ("", "deny"),
+            ("Fixture.other_eq", "wrong name"),
+            ("Fixture.fast_eq", "allow"),
+        ] {
+            fs::write(
+                dir.join("turbo-lean.toml"),
+                config.replace("Fixture.fast_eq", permission),
+            )?;
+            git_init_and_commit(&dir, label)?;
+        }
         stock_statement_build(&dir)?;
         if crate::module_builder::probe_bwrap_sandbox().is_some() {
             fs::write(dir.join("fixture.c"), "int fixture(void) { return 0; }\n")?;
