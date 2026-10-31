@@ -2476,12 +2476,6 @@ impl TurboStore {
         })
     }
 
-    /// Smart multi-project Garbage Collector using Cost-Aware GDSF (Greedy-Dual-Size-Frequency):
-    /// `KeepScore(Action) = last_accessed + alpha * (duration_ms / max(total_size_bytes, 1))`
-    /// Also performs:
-    /// - Step A: Immediate Supersession Eviction (`pin_level < 0` and not in any active worktree lease),
-    /// - Step B: Standard GDSF Eviction to bring reclaimable bytes under `max_reclaimable_bytes`,
-    /// - Step C: Cold Unlinked Blob Compression (`TLZ1`) for `nlink == 1` `.olean`/`.ilean`/`.c` blobs.
     /// Drop the per-action `.done` / `.waiters` markers (and the `.lock` file when no peer holds
     /// it) of an action that GC evicted, so they neither leak nor short-circuit later lookups.
     fn remove_singleflight_markers(&self, action_key: &str) {
@@ -2514,6 +2508,12 @@ impl TurboStore {
         }
     }
 
+    /// Smart multi-project Garbage Collector using Cost-Aware GDSF (Greedy-Dual-Size-Frequency):
+    /// `KeepScore(Action) = last_accessed + alpha * (duration_ms / max(total_size_bytes, 1))`
+    /// Also performs:
+    /// - Step A: Immediate Supersession Eviction (`pin_level < 0` and not in any active worktree lease),
+    /// - Step B: Standard GDSF Eviction to bring reclaimable bytes under `max_reclaimable_bytes`,
+    /// - Step C: Cold Unlinked Blob Compression (`TLZ1`) for `nlink == 1` `.olean`/`.ilean`/`.c` blobs.
     pub fn run_gc(
         &mut self,
         max_reclaimable_bytes: u64,
