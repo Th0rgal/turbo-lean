@@ -403,7 +403,17 @@ def mergeBranches (base stT stE : SymExecState) (cExpr : SymExpr) (condNoUB cond
   let mergedVars := varKeys.map fun v =>
     let svT := stT.lookupVar v
     let svE := stE.lookupVar v
-    let expr := if svT.expr == svE.expr then svT.expr else normSymIteStep cExpr svT.expr svE.expr
+    let expr :=
+      if v >= base.allocBase &&
+         (stT.freshCtorRoots.contains v || stE.freshCtorRoots.contains v ||
+          (stT.heapAllocSeq.lookup v).isSome || (stE.heapAllocSeq.lookup v).isSome) &&
+         !(base.vars.lookup v).isSome then
+        let hasT := (stT.vars.lookup v).isSome
+        let hasE := (stE.vars.lookup v).isSome
+        if hasT && !hasE then .ite cExpr svT.expr .unit
+        else if !hasT && hasE then .ite cExpr .unit svE.expr
+        else if svT.expr == svE.expr then svT.expr else normSymIteStep cExpr svT.expr svE.expr
+      else if svT.expr == svE.expr then svT.expr else normSymIteStep cExpr svT.expr svE.expr
     (v, { expr := expr, nonPoison := svT.nonPoison && svE.nonPoison, noUB := svT.noUB && svE.noUB })
   let objKeys := dedupIds (base.objRoots.map (·.1) ++ stT.objRoots.map (·.1) ++ stE.objRoots.map (·.1))
   let mergedObjRoots := objKeys.filterMap fun r =>
@@ -1272,12 +1282,17 @@ def symExecDeclFromInit (initState : SymExecState) (loopUnrollBound : Nat := 4) 
   let mapHeapId := SymExecState.canonicalHeapRootId initState.allocBase finalSt.heapAllocSeq
   let idSym (rid : VarId) : SymExpr :=
     normSymExpr (substSymHeapIds mapHeapId (finalSt.rootIdentitySym rid))
+  let payloadSym (rid : VarId) : SymExpr :=
+    if finalSt.freshCtorRoots.contains rid then
+      normSymExpr (substSymHeapIds mapHeapId (finalSt.lookupVar rid).expr)
+    else
+      idSym rid
   let epSym (rid : VarId) : SymExpr :=
     match finalSt.getRootRc rid with
     | (_, some _) => .constU64 0
     | (_, none) => normSymExpr (substSymHeapIds mapHeapId (finalSt.getRootRcEpoch rid))
   let liveFresh := (rawLive.filterMap fun (rid, m, ex?) =>
-    if finalSt.isFreshRuntimeAllocRoot rid then some (idSym rid, m, ex?, epSym rid) else none).mergeSort
+    if finalSt.isFreshRuntimeAllocRoot rid then some (payloadSym rid, m, ex?, epSym rid) else none).mergeSort
     (fun (s1, _, _, _) (s2, _, _, _) => reprStr s1 <= reprStr s2)
   let liveOther := rawLive.filterMap fun (rid, m, ex?) =>
     if finalSt.isFreshRuntimeAllocRoot rid then none else some (idSym rid, m, ex?, epSym rid)
@@ -3184,6 +3199,156 @@ private def immReboundPtrExclTrueTgt : LNIRDecl :=
   immReboundPtrExclSrc.body immReboundPtrExclTrueTgt.body
 #guard !(validateTranslationDecl immReboundPtrExclSrc immReboundPtrExclTrueTgt).symRetEquiv
 #guard !(validateTranslationDecl immReboundPtrExclSrc immReboundPtrExclTrueTgt).passed
+
+private def liveCtorScalarSlotMismatchSrc : LNIRDecl :=
+  { name := "live_ctor_scalar_slot_mismatch"
+    params := [{ id := 0, name := "n", ty := .i64, borrow := false }]
+    retTy := .i64
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 1 .i64 (.scalar (.select (.binOp .eq (.var 0) (.constU64 100)) (.constU64 1) (.constU64 0))) <|
+      .letBind 2 .objPtr (.allocCtor 0 [] [1]) <|
+      .letBind 3 .i64 (.scalar (.constU64 0)) <|
+      .ret 3 }
+
+private def liveCtorScalarSlotMismatchZeroTgt : LNIRDecl :=
+  { liveCtorScalarSlotMismatchSrc with
+    body :=
+      .letBind 1 .i64 (.scalar (.select (.binOp .eq (.var 0) (.constU64 100)) (.constU64 1) (.constU64 0))) <|
+      .letBind 3 .i64 (.scalar (.constU64 0)) <|
+      .letBind 2 .objPtr (.allocCtor 0 [] [3]) <|
+      .ret 3 }
+
+#guard !checkSingleSample 1024 (VarEnv.empty.bind 0 (.u64 100)) HeapState.empty
+  liveCtorScalarSlotMismatchSrc.body liveCtorScalarSlotMismatchZeroTgt.body
+#guard !(validateTranslationDecl liveCtorScalarSlotMismatchSrc liveCtorScalarSlotMismatchZeroTgt).memWritesEquiv
+#guard !(validateTranslationDecl liveCtorScalarSlotMismatchSrc liveCtorScalarSlotMismatchZeroTgt).passed
+
+private def liveCtorTagMismatchSrc : LNIRDecl :=
+  { name := "live_ctor_tag_mismatch"
+    params := [{ id := 0, name := "n", ty := .i64, borrow := false }]
+    retTy := .i64
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 1 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 100))) <|
+      .letBind 2 .i64 (.scalar (.constU64 0)) <|
+      .ite 1
+        (.letBind 3 .objPtr (.allocCtor 1 [] []) <| .ret 2)
+        (.letBind 3 .objPtr (.allocCtor 0 [] []) <| .ret 2) }
+
+private def liveCtorTagMismatchZeroTgt : LNIRDecl :=
+  { liveCtorTagMismatchSrc with
+    body :=
+      .letBind 2 .i64 (.scalar (.constU64 0)) <|
+      .letBind 3 .objPtr (.allocCtor 0 [] []) <|
+      .ret 2 }
+
+#guard !checkSingleSample 1024 (VarEnv.empty.bind 0 (.u64 100)) HeapState.empty
+  liveCtorTagMismatchSrc.body liveCtorTagMismatchZeroTgt.body
+#guard !(validateTranslationDecl liveCtorTagMismatchSrc liveCtorTagMismatchZeroTgt).memWritesEquiv
+#guard !(validateTranslationDecl liveCtorTagMismatchSrc liveCtorTagMismatchZeroTgt).passed
+
+private def liveCtorObjFieldMismatchSrc : LNIRDecl :=
+  { name := "live_ctor_obj_field_mismatch"
+    params := [{ id := 0, name := "n", ty := .i64, borrow := false },
+               { id := 1, name := "p", ty := .objPtr, borrow := true },
+               { id := 2, name := "q", ty := .objPtr, borrow := true }]
+    retTy := .i64
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 3 .objPtr (.scalar (.select (.binOp .eq (.var 0) (.constU64 100)) (.var 1) (.var 2))) <|
+      .letBind 4 .objPtr (.allocCtor 0 [3] []) <|
+      .letBind 5 .i64 (.scalar (.constU64 0)) <|
+      .ret 5 }
+
+private def liveCtorObjFieldMismatchTgt : LNIRDecl :=
+  { liveCtorObjFieldMismatchSrc with
+    body :=
+      .letBind 4 .objPtr (.allocCtor 0 [2] []) <|
+      .letBind 5 .i64 (.scalar (.constU64 0)) <|
+      .ret 5 }
+
+#guard !(let (p, st0) := HeapState.empty.allocCtor 0 [] [];
+  let (q, st1) := st0.allocCtor 1 [] [];
+  checkSingleSample 1024 (((VarEnv.empty.bind 0 (.u64 100)).bind 1 p).bind 2 q) st1
+    liveCtorObjFieldMismatchSrc.body liveCtorObjFieldMismatchTgt.body)
+#guard !(validateTranslationDecl liveCtorObjFieldMismatchSrc liveCtorObjFieldMismatchTgt).memWritesEquiv
+#guard !(validateTranslationDecl liveCtorObjFieldMismatchSrc liveCtorObjFieldMismatchTgt).passed
+
+private def liveCtorMaybeFreedSlotMismatchSrc : LNIRDecl :=
+  { name := "live_ctor_maybe_freed_slot_mismatch"
+    params := [{ id := 0, name := "b", ty := .i1, borrow := false },
+               { id := 1, name := "n", ty := .i64, borrow := false }]
+    retTy := .i64
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 2 .i64 (.scalar (.select (.binOp .eq (.var 1) (.constU64 100)) (.constU64 1) (.constU64 0))) <|
+      .letBind 3 .objPtr (.allocCtor 0 [] [2]) <|
+      .letBind 4 .i64 (.scalar (.constU64 0)) <|
+      .letBind 5 .i64 (.scalar (.constU64 4)) <|
+      .seqFor 6 4 5 7 4 .i64
+        (.ite 0 (.incRef 3 1 (.ret 7)) (.ret 7)) <|
+      .decRef 3 1 <|
+      .ret 4 }
+
+private def liveCtorMaybeFreedSlotMismatchZeroTgt : LNIRDecl :=
+  { liveCtorMaybeFreedSlotMismatchSrc with
+    body :=
+      .letBind 4 .i64 (.scalar (.constU64 0)) <|
+      .letBind 3 .objPtr (.allocCtor 0 [] [4]) <|
+      .letBind 5 .i64 (.scalar (.constU64 4)) <|
+      .seqFor 6 4 5 7 4 .i64
+        (.ite 0 (.incRef 3 1 (.ret 7)) (.ret 7)) <|
+      .decRef 3 1 <|
+      .ret 4 }
+
+#guard !checkSingleSample 1024 ((VarEnv.empty.bind 0 (.bool true)).bind 1 (.u64 100)) HeapState.empty
+  liveCtorMaybeFreedSlotMismatchSrc.body liveCtorMaybeFreedSlotMismatchZeroTgt.body
+#guard !(validateTranslationDecl liveCtorMaybeFreedSlotMismatchSrc liveCtorMaybeFreedSlotMismatchZeroTgt).memWritesEquiv
+#guard !(validateTranslationDecl liveCtorMaybeFreedSlotMismatchSrc liveCtorMaybeFreedSlotMismatchZeroTgt).passed
+
+private def liveCtorBranchPredSwapSrc : LNIRDecl :=
+  { name := "live_ctor_branch_pred_swap"
+    params := [{ id := 0, name := "b", ty := .i1, borrow := false },
+               { id := 1, name := "n", ty := .i64, borrow := false }]
+    retTy := .i64
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 2 .i64 (.scalar (.constU64 0)) <|
+      .ite 0
+        (.letBind 3 .objPtr (.allocCtor 1 [] []) <|
+         .letBind 4 .objPtr (.allocCtor 0 [] []) <|
+         .decRef 4 1 <|
+         .ret 2)
+        (.letBind 3 .objPtr (.allocCtor 0 [] []) <|
+         .letBind 4 .objPtr (.allocCtor 1 [] []) <|
+         .decRef 3 1 <|
+         .ret 2) }
+
+private def liveCtorBranchPredSwapTgt : LNIRDecl :=
+  { liveCtorBranchPredSwapSrc with
+    body :=
+      .letBind 2 .i64 (.scalar (.constU64 0)) <|
+      .letBind 5 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 100))) <|
+      .ite 5
+        (.letBind 3 .objPtr (.allocCtor 1 [] []) <|
+         .letBind 4 .objPtr (.allocCtor 0 [] []) <|
+         .decRef 4 1 <|
+         .ret 2)
+        (.letBind 3 .objPtr (.allocCtor 0 [] []) <|
+         .letBind 4 .objPtr (.allocCtor 1 [] []) <|
+         .decRef 3 1 <|
+         .ret 2) }
+
+#guard !checkSingleSample 1024 ((VarEnv.empty.bind 0 (.bool false)).bind 1 (.u64 100)) HeapState.empty
+  liveCtorBranchPredSwapSrc.body liveCtorBranchPredSwapTgt.body
+#guard !(validateTranslationDecl liveCtorBranchPredSwapSrc liveCtorBranchPredSwapTgt).memWritesEquiv
+#guard !(validateTranslationDecl liveCtorBranchPredSwapSrc liveCtorBranchPredSwapTgt).passed
 
 /-! ## JSON & Human-Readable Formatting for `TVModuleReport` -/
 
