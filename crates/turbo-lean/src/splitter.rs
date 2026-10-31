@@ -3163,7 +3163,7 @@ pub fn sorry_warning_in_decls(
             let line_no = l
                 .split(": warning:")
                 .next()
-                .and_then(|head| head.rsplitn(3, ':').nth(1))
+                .and_then(|head| head.rsplit(':').nth(1))
                 .and_then(|n| n.trim().parse::<usize>().ok());
             line_no.is_none_or(|ln| {
                 ranges.is_empty() || ranges.iter().any(|&(a, b)| a <= ln && ln <= b)
