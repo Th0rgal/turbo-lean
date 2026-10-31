@@ -121,14 +121,19 @@ The model's `rc` and exclusivity are abstractions of the Lean 4.35.0 runtime (`l
    They follow every returned value back through slot reloads, `phi` operands and value-preserving casts to its
    origins, and require every origin to be of the right kind:
    * `IRCheck.heapBoxCarries`: each origin is `call @lean_box_{uint64,usize,float,float32}(…)` on an argument
-     carrying the boxed parameter, or a `lean_alloc_*` call into which the parameter is stored
-     (`store`/`getelementptr` on the result, or `lean_ctor_set_*`). `IRCheck.inPtrBoxCarries`: each origin is
+     carrying the boxed parameter, or a `lean_alloc_ctor(tag, objFields, ssz)` call into which the parameter is
+     stored **at the scalar payload** `8 + 8·objFields` (a `store` through a `getelementptr` at that byte offset,
+     or `lean_ctor_set_*(o, 8·objFields, x)`). A store to the allocation pointer itself (the header) is rejected.
+     A value *carries* the parameter only if **every** origin (through slot reloads, `phi`, value-preserving
+     casts) is the parameter, so `phi [x, …], [0, …]` is rejected. `IRCheck.inPtrBoxCarries`: each origin is
      `inttoptr ((x << 1) | 1)` of the parameter.
    * `IRCheck.projectionLoadsField`: each origin is a `load` from a `getelementptr` on the object pointer at the
      byte offset of the field (`8 + 8·i` for `lean_ctor_get(o, i)`), in a block behind the null/tag guard.
 
    Both have negative self-tests on hand-written wrong IR, which they must reject: `ret ptr null`, the in-pointer
-   form, a box of a constant, an allocation without a store of the value, a `phi` that may yield `null`, no `ret`;
+   form, a box of a constant, an allocation without a store of the value, a `phi` that may yield `null`, no `ret`,
+   a box of `phi [x, …], [0, …]`, a store of the value to the allocation pointer / at offset 0 / at the wrong
+   payload offset for the declared `objFields`;
    for projections, a pointer copy, a guarded GEP with no load, wrong offsets (`0`, `16`), an unreturned load,
    an unguarded load, `ret ptr null`, and a `phi` joining the field with the raw pointer.
 

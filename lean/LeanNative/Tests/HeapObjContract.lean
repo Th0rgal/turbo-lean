@@ -368,8 +368,9 @@ def Fn.origins (f : Fn) (bool1 : Bool) : Nat → String → List String
 def Fn.retOrigins (f : Fn) : List String :=
   (f.insts.filterMap fun l => match toks l with | ["ret", _, v] => some v | _ => none).flatMap (f.origins false 64)
 
-/-- `v` carries the value of parameter `arg` (some origin of `v` is `arg`). -/
-def Fn.carries (f : Fn) (arg v : String) : Bool := (f.origins true 64 v).contains arg
+/-- `v` carries the value of parameter `arg`: **every** origin of `v` (through slot reloads, `phi` and
+    value-preserving casts) is `arg`. A `phi` joining `arg` with a constant or another value is rejected. -/
+def Fn.carries (f : Fn) (arg v : String) : Bool := (f.origins true 64 v).all (· == arg)
 
 /-- `call … @name(args)` ⇒ `(name, args)`. -/
 def callOf (ts : List String) : Option (String × List String) :=
@@ -377,27 +378,45 @@ def callOf (ts : List String) : Option (String × List String) :=
   | fn :: args => if ts.contains "call" then some (String.ofList (fn.toList.drop 1), args) else none
   | [] => none
 
+/-- Byte offset of a `getelementptr` on base `p` (`i8`-indexed bytes, or `ptr`/`i64`-indexed words). -/
+def gepOffset (ts : List String) (p : String) : Option Nat :=
+  match ts.filter (· != "inbounds") with
+  | ["getelementptr", "i8", "ptr", b, "i64", k] => if b == p then k.toNat? else none
+  | ["getelementptr", ty, "ptr", b, "i64", k] =>
+    if b == p && (ty == "ptr" || ty == "i64") then k.toNat?.map (8 * ·) else none
+  | _ => none
+
 def heapBoxFns : List String := ["lean_box_uint64", "lean_box_usize", "lean_box_float", "lean_box_float32"]
-def allocFns : List String := ["lean_alloc_ctor", "lean_alloc_small_object", "lean_alloc_object", "lean_alloc_small"]
+
+/-- Byte offset of the scalar payload of a scalar box from the object pointer (C1 layout): the 8-byte header,
+    then `objFields · 8` object slots, then the scalar at scalar offset `0` (a box has one scalar field). -/
+def boxPayloadOffset (objFields : Nat) : Nat := 8 + 8 * objFields
 
 /-- Origin `o` is a heap scalar box of `arg`: either `o = call @lean_box_{uint64,usize,float,float32}(… arg …)`, or
-    `o = call @lean_alloc_*(…)` followed by a store of `arg` into `o` (directly or through a `getelementptr` on
-    `o`) or a `lean_ctor_set_*(o, …, arg)` call. -/
+    `o = call @lean_alloc_ctor(i32 tag, i32 objFields, i32 ssz)` followed by a store of `arg` **at the scalar
+    payload** `boxPayloadOffset objFields`: a `store` through a `getelementptr` on `o` at that byte offset, or
+    `lean_ctor_set_*(o, off, arg)` with `off = 8 · objFields` (`lean_ctor_set_*` offsets are relative to the
+    field area, after the header). A store to `o` itself (offset 0, the header) is rejected. -/
 def Fn.isHeapBoxOf (f : Fn) (arg o : String) : Bool :=
   match f.defOf o with
   | some (ts, _) => match callOf ts with
     | some (fn, args) =>
       if heapBoxFns.contains fn then args.any (f.carries arg)
-      else allocFns.contains fn && f.insts.any fun l =>
-        let ts := toks l
-        (match ts with
-         | ["store", _, v, "ptr", a, "align", _] | ["store", _, v, "ptr", a] =>
-           f.carries arg v && (a == o || match f.defOf a with
-             | some ("getelementptr" :: rest, _) => rest.contains o | _ => false)
-         | _ => false) ||
-        (match callOf ts with
-         | some (g, gargs) => g.startsWith "lean_ctor_set_" && gargs.contains o && gargs.any (f.carries arg)
-         | none => false)
+      else match fn, args with
+        | "lean_alloc_ctor", ["i32", _, "i32", k, "i32", _] => match k.toNat? with
+          | some nObj => f.insts.any fun l =>
+            let ts := toks l
+            (match ts with
+             | ["store", _, v, "ptr", a, "align", _] | ["store", _, v, "ptr", a] =>
+               f.carries arg v && match f.defOf a with
+                 | some (gts, _) => gepOffset gts o == some (boxPayloadOffset nObj) | none => false
+             | _ => false) ||
+            (match callOf ts with
+             | some (g, ["ptr", p, _, off, _, v]) =>
+               g.startsWith "lean_ctor_set_" && p == o && off.toNat? == some (8 * nObj) && f.carries arg v
+             | _ => false)
+          | none => false
+        | _, _ => false
     | none => false
   | none => false
 
@@ -423,14 +442,6 @@ def inPtrBoxCarries (ir fn arg : String) : Bool :=
   let f := parseFn ir fn [] []
   let os := f.retOrigins
   !os.isEmpty && os.all (f.isInPtrBoxOf arg)
-
-/-- Byte offset of a `getelementptr` on base `p` (`i8`-indexed bytes, or `ptr`/`i64`-indexed words). -/
-def gepOffset (ts : List String) (p : String) : Option Nat :=
-  match ts.filter (· != "inbounds") with
-  | ["getelementptr", "i8", "ptr", b, "i64", k] => if b == p then k.toNat? else none
-  | ["getelementptr", ty, "ptr", b, "i64", k] =>
-    if b == p && (ty == "ptr" || ty == "i64") then k.toNat?.map (8 * ·) else none
-  | _ => none
 
 /-- Origin `o` is a field load at byte offset `off` from the object pointer, in a guarded block:
     `%A = getelementptr … ptr P, … off` with `P` the object pointer, then `o = load T, ptr %A` behind the guard. -/
@@ -501,6 +512,28 @@ def heapOK (body : String) : Bool := IRCheck.heapBoxCarries (bxIR body) "bx" "%a
 #guard !heapOK ("  %b = call ptr @lean_box_uint64(i64 %arg_v0)\n  br label %j\nj:\n" ++
   "  %r = phi ptr [ %b, %entry ], [ null, %x ]\n  ret ptr %r\n")
 #guard !heapOK "  %b = call ptr @lean_box_uint64(i64 %arg_v0)\n  unreachable\n"
+-- self-test (quorum r3): a boxed value with SOME but not ALL origins equal to the parameter is rejected — the
+-- `phi` may box the constant `0`; an allocation that stores the parameter at offset 0 (over the header) instead of
+-- the scalar payload `boxPayloadOffset objFields` is rejected (direct store, GEP 0, `lean_ctor_set_*` at the
+-- wrong field-area offset, and GEP 8 when `objFields = 1` puts the payload at 16).
+#guard !heapOK ("  br label %j\nb:\n  br label %j\nj:\n  %v = phi i64 [ %arg_v0, %entry ], [ 0, %b ]\n" ++
+  "  %r = call ptr @lean_box_uint64(i64 %v)\n  ret ptr %r\n")
+#guard !heapOK ("  %o = call ptr @lean_alloc_ctor(i32 0, i32 0, i32 8)\n" ++
+  "  store i64 %arg_v0, ptr %o, align 8\n  ret ptr %o\n")
+#guard !heapOK ("  %o = call ptr @lean_alloc_ctor(i32 0, i32 0, i32 8)\n  %f = getelementptr i8, ptr %o, i64 0\n" ++
+  "  store i64 %arg_v0, ptr %f, align 8\n  ret ptr %o\n")
+#guard !heapOK ("  %o = call ptr @lean_alloc_ctor(i32 0, i32 1, i32 8)\n  %f = getelementptr i8, ptr %o, i64 8\n" ++
+  "  store i64 %arg_v0, ptr %f, align 8\n  ret ptr %o\n")
+#guard !heapOK ("  %o = call ptr @lean_alloc_ctor(i32 0, i32 1, i32 8)\n" ++
+  "  call void @lean_ctor_set_uint64(ptr %o, i32 0, i64 %arg_v0)\n  ret ptr %o\n")
+-- and the layout offset is honoured: with one object field the payload at 16 / field-area offset 8 is accepted;
+-- a `phi` whose every incoming value is the parameter (through a cast) is accepted.
+#guard heapOK ("  %o = call ptr @lean_alloc_ctor(i32 0, i32 1, i32 8)\n  %f = getelementptr i8, ptr %o, i64 16\n" ++
+  "  store i64 %arg_v0, ptr %f, align 8\n  ret ptr %o\n")
+#guard heapOK ("  %o = call ptr @lean_alloc_ctor(i32 0, i32 1, i32 8)\n" ++
+  "  call void @lean_ctor_set_uint64(ptr %o, i32 8, i64 %arg_v0)\n  ret ptr %o\n")
+#guard heapOK ("  %c = bitcast i64 %arg_v0 to i64\n  br label %j\nb:\n  br label %j\nj:\n" ++
+  "  %v = phi i64 [ %arg_v0, %entry ], [ %c, %b ]\n  %r = call ptr @lean_box_uint64(i64 %v)\n  ret ptr %r\n")
 -- self-test of the in-pointer predicate: accepts `lean_box(x)`, rejects `lean_box(0)` and `null`
 #guard IRCheck.inPtrBoxCarries (bxIR "  %s = shl i64 %arg_v0, 1\n  %t = or i64 %s, 1\n  %p = inttoptr i64 %t to ptr\n  ret ptr %p\n") "bx" "%arg_v0"
 #guard !IRCheck.inPtrBoxCarries (bxIR "  %s = shl i64 0, 1\n  %t = or i64 %s, 1\n  %p = inttoptr i64 %t to ptr\n  ret ptr %p\n") "bx" "%arg_v0"
