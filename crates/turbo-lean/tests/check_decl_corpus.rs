@@ -44,9 +44,20 @@ fn heavy_check_decl_corpus_stock_lean_verdict_parity() {
         );
         declarations += expected.len();
         let file = tmp.0.join(format!("{module}.lean"));
+        fs::write(&file, &original).unwrap();
+        let baseline = corpus::run(Command::new("lean").arg(&file).current_dir(&tmp.0));
+        assert!(
+            baseline.status.success(),
+            "stock baseline {module}: {}",
+            corpus::diagnostic(&baseline)
+        );
         let check = |name: &str, source: &str, valid: bool| {
             fs::write(&file, source).unwrap();
-            let lean = corpus::run(Command::new("lean").arg(&file).current_dir(&tmp.0));
+            // Original/restored bytes are identical: compile that stock baseline once per
+            // module, then compile every distinct mutant. Every CLI invocation still runs.
+            let mutant =
+                (!valid).then(|| corpus::run(Command::new("lean").arg(&file).current_dir(&tmp.0)));
+            let lean = mutant.as_ref().unwrap_or(&baseline);
             assert_eq!(
                 lean.status.success(),
                 valid,

@@ -21,7 +21,8 @@ The Rust discovery test compares the complete sets, including duplicate detectio
 The integration test separately requires its explicitly marked mutation inventory to
 match the oracle set, then compares stock `lean` and the actual `check --decl` CLI
 on the original, a wrong-term mutant, and the restored source, using the same file
-and cache. Both tests are unignored and run in the existing `cargo test --release`
+and cache. Stock Lean compiles each distinct mutant and one unmodified baseline
+per module; the CLI checks all three states for every theorem. Both tests are unignored and run in the existing `cargo test --release`
 CI step. They require Lean; missing tooling fails the tests. Children use
 `LEAN_NUM_THREADS=4`. The fixture's `turbo-lean.toml` explicitly admits only the
 native decision witnesses' axiom families, alongside the standard project axioms.
