@@ -941,6 +941,62 @@ pub(crate) fn shutdown_local_daemon(_lifecycle: &ExclusiveLifecycleLock) {
 
 const ZYGOTE_STDERR_TAIL_CAP: usize = 8192;
 
+/// Mirrors `TurboLean.ZygoteWorker.stderrReplyMark`: the worker writes it to stderr before each reply.
+const ZYGOTE_STDERR_REPLY_MARK: &str = "[TurboLean.ZygoteWorker] reply";
+
+/// Line-level scan of a worker's whole stderr stream (the tail alone loses panics behind long
+/// backtraces): counts runtime-panic lines and reply marks.
+#[derive(Default)]
+struct StderrScan {
+    state: std::sync::Mutex<(u64, u64)>,
+    cv: std::sync::Condvar,
+}
+
+impl StderrScan {
+    fn line(&self, line: &[u8]) {
+        let s = String::from_utf8_lossy(line);
+        let (panic, mark) = (
+            is_runtime_panic_text(&s),
+            s.trim() == ZYGOTE_STDERR_REPLY_MARK,
+        );
+        if let Ok(mut g) = self.state.lock() {
+            g.0 += panic as u64;
+            g.1 += mark as u64;
+        }
+        if mark {
+            self.cv.notify_all();
+        }
+    }
+
+    /// Feeds `chunk`, keeping an unterminated line (capped) in `carry`.
+    fn feed(&self, carry: &mut Vec<u8>, chunk: &[u8]) {
+        for &b in chunk {
+            if b == b'\n' {
+                self.line(carry);
+                carry.clear();
+            } else if carry.len() < 4096 {
+                carry.push(b);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> (u64, u64) {
+        self.state.lock().map(|g| *g).unwrap_or((u64::MAX, 0))
+    }
+
+    /// Whether a runtime panic hit stderr after `before`, waiting (bounded) for the reply mark.
+    fn panicked_since(&self, before: (u64, u64)) -> bool {
+        let Ok(g) = self.state.lock() else {
+            return true;
+        };
+        let wait = std::time::Duration::from_secs(2);
+        match self.cv.wait_timeout_while(g, wait, |s| s.1 <= before.1) {
+            Ok((g, _)) => g.0 > before.0,
+            Err(_) => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct WorkerCrashDiagnostics {
     message: String,
@@ -958,6 +1014,7 @@ pub struct ZygoteWorkerProcess {
     stdin: std::process::ChildStdin,
     stdout: BufReader<std::process::ChildStdout>,
     stderr_tail: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    stderr_scan: std::sync::Arc<StderrScan>,
     warm_prefixes: std::collections::HashSet<String>,
     warm_prefix_tree: Vec<(String, String)>,
     warm_imports: std::collections::HashMap<String, String>,
@@ -1578,10 +1635,11 @@ fn is_runtime_panic_text(s: &str) -> bool {
     .any(|m| s.contains(m))
 }
 
-/// Fails a reply whose worker hit a runtime panic; returns whether the worker must be discarded.
-fn mark_runtime_panic(rep: &mut ZygoteEvalReply) -> bool {
+/// Fails a reply whose worker hit a runtime panic (reported, in its messages, or seen on the
+/// worker's stderr during the request); returns whether the worker must be discarded.
+fn mark_runtime_panic(rep: &mut ZygoteEvalReply, stderr_panic: bool) -> bool {
     let reported = rep.errors.iter().any(|e| e == RUNTIME_PANIC_ERR);
-    if !reported && !rep.messages.iter().any(|m| is_runtime_panic_text(m)) {
+    if !reported && !stderr_panic && !rep.messages.iter().any(|m| is_runtime_panic_text(m)) {
         return false;
     }
     rep.ok = false;
@@ -3011,15 +3069,19 @@ fn eval_with_zygote_pool_inner(
                 .ok_or_else(|| anyhow::anyhow!("Missing Zygote stdout"))?,
         );
         let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stderr_scan = std::sync::Arc::new(StderrScan::default());
         if let Some(mut child_stderr) = child.stderr.take() {
             let tail_clone = stderr_tail.clone();
+            let scan_clone = stderr_scan.clone();
             std::thread::spawn(move || {
                 use std::io::Read;
                 let mut chunk = [0u8; 1024];
+                let mut carry = Vec::new();
                 while let Ok(n) = child_stderr.read(&mut chunk) {
                     if n == 0 {
                         break;
                     }
+                    scan_clone.feed(&mut carry, &chunk[..n]);
                     if let Ok(mut g) = tail_clone.lock() {
                         g.extend_from_slice(&chunk[..n]);
                         if g.len() > ZYGOTE_STDERR_TAIL_CAP {
@@ -3036,6 +3098,7 @@ fn eval_with_zygote_pool_inner(
             stdin,
             stdout,
             stderr_tail,
+            stderr_scan,
             warm_prefixes: std::collections::HashSet::new(),
             warm_prefix_tree: Vec::new(),
             warm_imports: std::collections::HashMap::new(),
@@ -3105,6 +3168,7 @@ fn eval_with_zygote_pool_inner(
             }
             let pid = worker.child.id();
             let rss_before = measure_process_rss_mb(pid);
+            let scan_before = worker.stderr_scan.snapshot();
             if let Err(e) = worker
                 .stdin
                 .write_all(req_line.as_bytes())
@@ -3144,7 +3208,8 @@ fn eval_with_zygote_pool_inner(
                         let rss_after = measure_process_rss_mb(pid);
                         parsed.rss_delta_mb = (rss_after as i64) - (rss_before as i64);
                         parsed.peak_rss_mb = rss_after.max(rss_before);
-                        mark_runtime_panic(&mut parsed);
+                        let stderr_panic = worker.stderr_scan.panicked_since(scan_before);
+                        mark_runtime_panic(&mut parsed, stderr_panic);
                         WorkerReqOutcome::Reply(parsed)
                     }
                     Err(e) => {
@@ -6630,53 +6695,69 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert!(mark_runtime_panic(&mut rep));
+        assert!(mark_runtime_panic(&mut rep, false));
         assert!(!rep.ok);
         assert_eq!(rep.errors, vec![RUNTIME_PANIC_ERR.to_string()]);
         // Idempotent, and ordinary output mentioning PANIC is not a runtime panic.
-        assert!(mark_runtime_panic(&mut rep) && rep.errors.len() == 1);
+        assert!(mark_runtime_panic(&mut rep, false) && rep.errors.len() == 1);
         let mut benign = ZygoteEvalReply {
             ok: true,
             messages: vec!["info: \"PANIC button pressed\"".to_string()],
             errors: vec!["unknown identifier 'runtime panic'".to_string()],
             ..Default::default()
         };
-        assert!(!mark_runtime_panic(&mut benign) && benign.ok);
+        assert!(!mark_runtime_panic(&mut benign, false) && benign.ok);
+        assert!(mark_runtime_panic(&mut benign, true) && !benign.ok);
 
         let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("panic_guard") else {
             return;
         };
         let lp = tmp_dir.to_string_lossy().to_string();
-        let panic_src = "import Lean\n#eval (panic! \"Lean.EnvExtension.modifyStateImpl\" : Nat)\n";
-        let live_rep = eval_with_zygote_pool_opts(
-            &store,
-            "leanprover/lean4:v4.35.0",
-            &lp,
-            &env_vars,
-            &lean_bin,
-            panic_src,
-            false,
-            true,
-            Some("PanicTest.lean"),
-            Some(30_000),
-        )
-        .unwrap();
-        if live_rep.messages.iter().any(|m| m.contains("PANIC"))
-            || live_rep.stdout.contains("PANIC")
-            || live_rep
-                .errors
-                .iter()
-                .any(|e| e.contains("PANIC") || e.contains("runtime panic"))
-        {
+        let tc = "leanprover/lean4:v4.35.0";
+        let idle_workers = || -> usize {
+            ZYGOTE_POOL
+                .get()
+                .and_then(|m| m.lock().ok())
+                .map(|g| {
+                    g.iter()
+                        .filter(|(k, _)| k.1.contains(&lp))
+                        .map(|(_, v)| v.len())
+                        .sum()
+                })
+                .unwrap_or(0)
+        };
+        // Panics reported as messages, printed only to stderr (`stderrAsMessages false`), and
+        // raised inside tactic elaboration (which `lean` itself only prints to stderr).
+        let tactic_boom = "import Lean\nopen Lean Elab Tactic\nelab \"boom\" : tactic => do\n  let n : Nat := panic! \"tacp\"\n  logInfo m!\"{n}\"\ntheorem c : True := by boom; trivial\n";
+        for (eval_mode, src) in [
+            (true, "import Lean\n#eval (panic! \"Lean.EnvExtension.modifyStateImpl\" : Nat)\n"),
+            (false, "#eval (panic! \"msg\" : Nat)\ntheorem p1 : True := trivial\n"),
+            (false, "set_option stderrAsMessages false\n#eval (panic! \"stderr only\" : Nat)\ntheorem p2 : True := trivial\n"),
+            (false, tactic_boom),
+            (true, tactic_boom),
+        ] {
+            let before = idle_workers();
+            let live_rep = eval_with_zygote_pool_opts(
+                &store, tc, &lp, &env_vars, &lean_bin, src, false, eval_mode,
+                Some("PanicTest.lean"), Some(60_000),
+            )
+            .unwrap();
             assert!(
-                !live_rep.ok,
-                "PANIC output must never return ok=true: {:?}",
-                live_rep
+                !live_rep.ok && live_rep.errors.iter().any(|e| e == RUNTIME_PANIC_ERR),
+                "panic must fail the request: {src:?} -> {live_rep:?}"
             );
+            assert!(idle_workers() <= before, "panicked worker returned to the pool: {src:?}");
+            // A panicked request is never cached: the same request panics again on a new worker.
+            let again = eval_with_zygote_pool_opts(
+                &store, tc, &lp, &env_vars, &lean_bin, src, false, eval_mode,
+                Some("PanicTest.lean"), Some(60_000),
+            )
+            .unwrap();
+            assert!(!again.ok, "panicked reply was cached: {src:?}");
         }
         let follow = eval_with_zygote_pool(
             &store,
-            "leanprover/lean4:v4.35.0",
+            tc,
             &lp,
             &env_vars,
             &lean_bin,
@@ -6689,6 +6770,178 @@ mod tests {
             "fresh/healthy worker must succeed after panic shard: {:?}",
             follow
         );
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// Raw worker IPC against stock `lean`: the worker must never accept what `lean` rejects.
+    #[test]
+    fn test_zygote_worker_ipc_matches_stock_lean_boundary() {
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("ipc_boundary")
+        else {
+            return;
+        };
+        let Ok(bin) = ensure_zygote_binary(&store, &lean_bin, &env_vars) else {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return;
+        };
+        let tc_lib = lean_bin
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("lib/lean");
+        let hx = |s: &str| hex_encode_bytes(s.as_bytes());
+        let opts = |o: &[&str]| {
+            if o.is_empty() {
+                String::new()
+            } else {
+                hx(&o.join("\n"))
+            }
+        };
+        let session = |lines: &[String]| -> Vec<serde_json::Value> {
+            let mut child = Command::new(&bin)
+                .env("LEAN", &lean_bin)
+                .env("LEAN_PATH", &tc_lib)
+                .env("LEAN_NUM_THREADS", "4")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn zygote worker");
+            let mut stdin = child.stdin.take().unwrap();
+            let mut out = BufReader::new(child.stdout.take().unwrap());
+            let replies = lines
+                .iter()
+                .map(|l| {
+                    stdin.write_all(format!("{l}\n").as_bytes()).unwrap();
+                    stdin.flush().unwrap();
+                    let mut r = String::new();
+                    out.read_line(&mut r).unwrap();
+                    serde_json::from_str(r.trim()).expect("worker JSON reply")
+                })
+                .collect();
+            let _ = child.kill();
+            let _ = child.wait();
+            replies
+        };
+        let stock_ok = |body: &str, o: &[&str]| -> bool {
+            let f = tmp_dir.join(format!("Stock{}.lean", next_tmp_id()));
+            fs::write(&f, body).unwrap();
+            let mut c = Command::new(&lean_bin);
+            c.env("LEAN_PATH", &tc_lib).args(o).arg(&f);
+            c.output().unwrap().status.success()
+        };
+        let ok = |r: &serde_json::Value| r["ok"].as_bool() == Some(true);
+
+        // 1 + 2: option allowlist (with any number of `weak.` prefixes) and Lean's own value parsing.
+        let triv = "theorem t : True := trivial\n";
+        let sorry_thm = "theorem s : 1 = 2 := sorry\n";
+        for (body, o) in [
+            (triv, "-Ddebug.skipKernelTC=true"),
+            (triv, "-Dweak.debug.skipKernelTC=true"),
+            (triv, "-DstderrAsMessages=false"),
+            (triv, "-Ddebug.byAsSorry=true"),
+            (sorry_thm, "-Dweak.warn.sorry=false"),
+            (sorry_thm, "-Dweak.weak.warn.sorry=false"),
+            (triv, "-DmaxHeartbeats=garbage"),
+            (triv, "-DautoImplicit=maybe"),
+            (triv, "-Dlinter.auditUnregistered=true"),
+            (triv, "-Dpp.all=true"),
+        ] {
+            let r = &session(&[format!("Init\t{}\tstrict\t\t\t{}", hx(body), opts(&[o]))])[0];
+            assert!(!ok(r), "{o} must be rejected: {r}");
+            assert!(
+                r["errors"][0].as_str().unwrap_or("").contains(o),
+                "{o}: {r}"
+            );
+        }
+        for o in [
+            "-Dweak.linter.auditUnregistered=true",
+            "-DmaxHeartbeats=1000",
+            "-DautoImplicit=false",
+        ] {
+            let r = &session(&[format!("Init\t{}\tstrict\t\t\t{}", hx(triv), opts(&[o]))])[0];
+            assert!(ok(r) && stock_ok(triv, &[o]), "{o} must be accepted: {r}");
+        }
+        for o in [
+            "-DmaxHeartbeats=garbage",
+            "-DautoImplicit=maybe",
+            "-Dlinter.auditUnregistered=true",
+        ] {
+            assert!(!stock_ok(triv, &[o]), "stock lean must reject {o}");
+        }
+
+        // 3: a panicking race candidate fails the whole request and poisons the worker.
+        let panic_cand = "#eval (panic! \"boom\" : Nat)\ntheorem pz : True := trivial\n";
+        let good = "theorem good : 1 + 1 = 2 := rfl\n";
+        // (`[good, panic]` never runs the panic: the race stops at a cheap winner.)
+        for cands in [[panic_cand, good]] {
+            let pre = hx("def pre : Nat := 1\n");
+            let race = format!(
+                "Init\trace_candidates\tk1\t{pre}\t{},{}",
+                hx(cands[0]),
+                hx(cands[1])
+            );
+            let rs = session(&[race.clone(), format!("Init\t{}\tstrict", hx(good))]);
+            assert!(
+                !ok(&rs[0]) && rs[0]["winning_candidate_idx"].is_null(),
+                "{}",
+                rs[0]
+            );
+            assert!(
+                !ok(&rs[1]),
+                "worker must stay poisoned after a race panic: {}",
+                rs[1]
+            );
+        }
+        // 3: the first request binds the worker even with an empty importsCsv.
+        let rs = session(&[
+            format!(",\t{}\tstrict", hx(triv)),
+            format!("Lean\t{}\tstrict", hx(triv)),
+        ]);
+        assert!(ok(&rs[0]) && !ok(&rs[1]), "{rs:?}");
+        assert!(rs[1]["errors"][0]
+            .as_str()
+            .unwrap()
+            .contains("importsCsv changed"));
+
+        // 4: a prefix checkpoint keeps the target's warningAsError policy (from -D or set_option).
+        let target = "def audit_unused (x : Nat) : Nat := 0\n";
+        assert!(!stock_ok(target, &["-DwarningAsError=true"]));
+        for (pre, o) in [
+            (
+                "theorem prior : True := sorry\n",
+                opts(&["-DwarningAsError=true"]),
+            ),
+            (
+                "set_option warningAsError true\ntheorem prior2 : True := trivial\n",
+                String::new(),
+            ),
+            (
+                "set_option warningAsError true\ntheorem prior3 : True := sorry\n",
+                String::new(),
+            ),
+        ] {
+            let body = format!("{}{}", "\n".repeat(pre.lines().count()), target);
+            let req = format!("Init\t{}\tstrict\tpk\t{}\t{}", hx(&body), hx(pre), o);
+            let rs = session(&[req.clone(), req]);
+            assert!(
+                !ok(&rs[0]) && !ok(&rs[1]),
+                "warningAsError lost through prefix {pre:?}: {rs:?}"
+            );
+            // Stubs in the prefix stay allowed for a clean target.
+            let clean = format!(
+                "{}theorem tgt : 1 + 1 = 2 := rfl\n",
+                "\n".repeat(pre.lines().count())
+            );
+            let r = &session(&[format!(
+                "Init\t{}\tstrict\tpk\t{}\t{}",
+                hx(&clean),
+                hx(pre),
+                o
+            )])[0];
+            assert!(ok(r), "stub prefix must not fail a clean target: {r}");
+        }
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 
@@ -6725,6 +6978,7 @@ mod tests {
                 stdin,
                 stdout,
                 stderr_tail,
+                stderr_scan: Default::default(),
                 warm_prefixes: std::collections::HashSet::new(),
                 warm_prefix_tree: Vec::new(),
                 warm_imports: std::collections::HashMap::new(),
