@@ -867,18 +867,25 @@ def isWhitelistedInitExecBridge (env : Environment) (modIdx : ModuleIdx) (declNa
       | _, _ => false
     | none => false
 
-/-- A prefix stub as the host's shard builder emits it: `theorem n : T := sorry`, elaborated to the
-    explicit (non-synthetic) `sorryAx (Name → T) false label` (or legacy `sorryAx T false`).
-    Elaboration errors and tactics such as `admitGoal` yield synthetic sorries and never qualify. -/
+/-- `value` is `fun xs => sorryAx (Name → body) false label` (or legacy `sorryAx body false`) for
+    `type = ∀ xs, body`, binder domains matching. -/
+partial def isExplicitSorryBody (value type : Expr) : Bool :=
+  match value, type with
+  | .lam _ d b _, .forallE _ d' b' _ => d == d' && isExplicitSorryBody b b'
+  | v, ty =>
+    let args := v.getAppArgs
+    v.getAppFn.isConstOf (Name.mkSimple ("sor" ++ "ryAx")) && args.size ≥ 2 &&
+      args[1]!.isConstOf ``Bool.false &&
+      ((args.size == 2 && args[0]! == ty) || (args.size == 3 && match args[0]! with
+        | .forallE _ d b _ => d.isConstOf ``Lean.Name && b == ty.liftLooseBVars 0 1
+        | _ => false))
+
+/-- A prefix stub as the host's shard builder emits it: `theorem n xs : T := sorry`, elaborated to
+    the explicit (non-synthetic) `sorry` term of `isExplicitSorryBody`. Elaboration errors and
+    tactics such as `admitGoal` yield synthetic sorries and never qualify. -/
 def isExplicitSorryStub (cinfo : ConstantInfo) : Bool :=
   match cinfo with
-  | .thmInfo v =>
-    let args := v.value.getAppArgs
-    let tyOk := fun (e : Expr) => e == v.type || match e with
-      | .forallE _ d b _ => d.isConstOf ``Lean.Name && b == v.type
-      | _ => false
-    v.value.getAppFn.isConstOf (Name.mkSimple ("sor" ++ "ryAx")) && args.size ≥ 2 &&
-      args[1]!.isConstOf ``Bool.false && tyOk args[0]!
+  | .thmInfo v => isExplicitSorryBody v.value v.type
   | _ => false
 
 /-- Forbidden axioms reachable from each root; the values of `opaqueStubs` (validated prefix stubs,
