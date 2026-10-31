@@ -1,7 +1,7 @@
 # B2 status
 
 Baseline: `5508b9f`; clifv `5018b9509dc124154dbe08a5bd85862595d8eab7`.
-Checkpoint: 2026-10-31 17:14 UTC. The executable lowering lives in
+Checkpoint: 2026-10-31 17:28 UTC. The executable lowering lives in
 `lean/LeanNative/Backend/Clif.lean`; `compile-clif` calls that definition.
 The default proof build and transitive axiom audit pass on Lean 4.34.1.
 
@@ -110,7 +110,10 @@ diagnostic identifies an unrewritten raw hash-map lookup reaching the opaque
 `System.Platform.getNumBits`; this is a reduction obstacle, not evidence of a
 false dominance predicate. Method-level lookup rewrites passed isolated kernel checks and concrete
 examples. The exact availability array also passed a diagnostic kernel check
-against the runtime-extracted context, with only the allowed axioms. The
-actual input/context tie and complete dominance statement are still pending. `B2.EndToEnd`
+against the runtime-extracted context, with only the allowed axioms. A second isolated check now computes directly through
+`buildCtx B2.Artifacts.input` and proves the same exact availability array,
+with only the allowed axioms; the complete `dominatedB` statement is still
+pending. The helper's documentation-comment parse error was fixed and that
+complete diagnostic file passed. `B2.EndToEnd`
 now drafts the explicit equality with x0, but composition is still unchecked.
 These draft changes do not upgrade O5, O6, or O7.

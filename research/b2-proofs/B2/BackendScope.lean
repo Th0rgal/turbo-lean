@@ -35,7 +35,7 @@ attribute [local cbv_eval] lookup_insertIfNew lookup_method_empty Std.HashMap.co
   Std.HashSet.contains_ofList
 
 
-/-- Normalize folded containers before observing them. -/
+/- Normalize folded containers before observing them. -/
 open Lean Meta Sym.Simp in
 cbv_simproc ↓ normalizeLookup (_) := fun e => do
   let some n := e.getAppFn.constName? | return .rfl
