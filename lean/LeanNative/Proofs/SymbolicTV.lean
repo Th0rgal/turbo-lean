@@ -1503,22 +1503,33 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
       (stLive.markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
   | .isExclusive objVar =>
     let rootVar := st.resolveBuf objVar
-    if st.isImmediateScalarObj rootVar then
+    let stOut := st.markBoolVar dst
+    if st.isImmediateScalarObj rootVar || st.typedTuples.contains rootVar ||
+       st.boolVars.contains rootVar || st.u64Vars.contains rootVar || st.u256Vars.contains rootVar then
       let cv := st.lookupVar rootVar
-      st.bindVar dst { expr := .constBool true, nonPoison := cv.nonPoison, noUB := cv.noUB }
-    else
+      stOut.bindVar dst { expr := .constBool true, nonPoison := cv.nonPoison, noUB := cv.noUB }
+    else if st.isNeverScalarRef rootVar then
       let stNoted := st.noteExtRoot rootVar
       let liveOk := stNoted.isBufLive rootVar
-      let stLive := (stNoted.requireUbCond (stNoted.liveRcCond rootVar)).noteExtLiveRoot rootVar
+      let stLive := ((stNoted.requireUbCond (stNoted.liveRcCond rootVar)).noteExtLiveRoot rootVar).markBoolVar dst
       let exclExpr : SymExpr :=
         if stLive.isBufExclusive rootVar then .constBool true
         else normSymBinOpStep .eq (stLive.lookupRcExpr rootVar) (.constU64 1)
       let cv := stLive.lookupVar rootVar
       stLive.bindVar dst { expr := exclExpr, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
+    else
+      (stOut.markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
   | .sarrayLen arrVar =>
     let root := st.resolveBuf arrVar
-    let stLive := ((st.noteExtRoot root).requireUbCond (st.liveRcCond root)).noteExtLiveRoot root
-    stLive.bindVar dst { expr := .sarrayLen root, nonPoison := true, noUB := true }
+    let sa := st.lookupVar arrVar
+    let stOut := st.markU64Var dst
+    if st.isImmediateScalarObj root || st.typedTuples.contains root ||
+       st.boolVars.contains root || st.u64Vars.contains root || st.u256Vars.contains root ||
+       st.objPtrVars.contains root || st.allocRoots.contains root then
+      stOut.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+    else
+      let stLive := (((st.noteExtRoot root).requireUbCond (st.liveRcCond root)).noteExtLiveRoot root).markU64Var dst
+      stLive.bindVar dst { expr := .sarrayLen root, nonPoison := sa.nonPoison, noUB := sa.noUB }
   | .sarrayDataPtr arrVar _elemTy =>
     let root := st.resolveBuf arrVar
     let arrSv := st.lookupVar arrVar
@@ -1565,31 +1576,68 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
       else if fnName == "lean_native_sarray_len" && i64Ret then
         let root := st.resolveBuf a
         let sa := st.lookupVar a
-        let stLive := ((st.noteExtRoot root).requireUbCond (st.liveRcCond root)).noteExtLiveRoot root
-        stLive.bindVar dst { expr := .sarrayLen root, nonPoison := sa.nonPoison, noUB := sa.noUB }
+        let stOut := st.markU64Var dst
+        if st.isImmediateScalarObj root || st.typedTuples.contains root ||
+           st.boolVars.contains root || st.u64Vars.contains root || st.u256Vars.contains root ||
+           st.objPtrVars.contains root || st.allocRoots.contains root then
+          stOut.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+        else
+          let stLive := (((st.noteExtRoot root).requireUbCond (st.liveRcCond root)).noteExtLiveRoot root).markU64Var dst
+          stLive.bindVar dst { expr := .sarrayLen root, nonPoison := sa.nonPoison, noUB := sa.noUB }
       else if fnName == "lean_native_ctor_tag" && i64Ret then
         let root := st.resolveBuf a
-        if st.isImmediateScalarObj root then
-          let sa := st.lookupVar root
-          let tagExpr : SymExpr :=
-            match sa.expr with
-            | .constU64 tag => .constU64 tag
-            | .constBool b => .constU64 (if b then 1 else 0)
-            | _ => .symVar dst
-          st.bindVar dst { expr := tagExpr, nonPoison := sa.nonPoison, noUB := sa.noUB }
+        let sa0 := st.lookupVar root
+        let stOut := st.markU64Var dst
+        if st.u256Vars.contains root || st.sarrayVars.contains root then
+          stOut.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+        else if st.u64Vars.contains root then
+          stOut.bindVar dst { expr := sa0.expr, nonPoison := sa0.nonPoison, noUB := sa0.noUB }
+        else if st.boolVars.contains root then
+          let bExpr := normSymIteStep sa0.expr (.constU64 1) (.constU64 0)
+          stOut.bindVar dst { expr := bExpr, nonPoison := sa0.nonPoison, noUB := sa0.noUB }
+        else if st.isImmediateScalarObj root then
+          match sa0.expr with
+          | .constU64 tag =>
+            stOut.bindVar dst { expr := .constU64 tag, nonPoison := sa0.nonPoison, noUB := sa0.noUB }
+          | .constBool b =>
+            stOut.bindVar dst { expr := .constU64 (if b then 1 else 0), nonPoison := sa0.nonPoison, noUB := sa0.noUB }
+          | .constU256 _ | .unit =>
+            -- Concrete `evalExpr` rejects `.u256` and `.unit` in `lean_native_ctor_tag` (`typeError`)!
+            stOut.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+          | _ =>
+            (stOut.markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
         else
-          let liveOk := st.isBufLive root
-          let stLive := (st.requireUbCond (st.liveRcCond root)).noteExtLiveRoot root
-          let sa := stLive.lookupVar root
-          let tagExpr : SymExpr :=
-            match sa.expr with
-            | .tuple (tag :: _) => tag
-            | .constU64 tag => .constU64 tag
-            | .symVar rootId =>
+          match sa0.expr with
+          | .tuple [] =>
+            stOut.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+          | .tuple (tag :: _) =>
+            if st.typedTuples.contains root then
+              match symExprScalarSort? st tag with
+              | some 1 =>
+                stOut.bindVar dst { expr := tag, nonPoison := sa0.nonPoison, noUB := sa0.noUB }
+              | some 0 | some 2 =>
+                stOut.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+              | _ =>
+                (stOut.markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+            else
+              let liveOk := st.isBufLive root
+              let stLive := ((st.requireUbCond (st.liveRcCond root)).noteExtLiveRoot root).markU64Var dst
+              let sa := stLive.lookupVar root
+              stLive.bindVar dst { expr := tag, nonPoison := sa.nonPoison && liveOk, noUB := sa.noUB && liveOk }
+          | .symVar rootId =>
+            if st.objPtrVars.contains root || st.allocRoots.contains root ||
+               (st.refCounts.lookup root).isSome || (st.rcExprs.lookup root).isSome ||
+               st.exclusiveBufs.contains root then
+              let liveOk := st.isBufLive root
+              let stLive := ((st.requireUbCond (st.liveRcCond root)).noteExtLiveRoot root).markU64Var dst
+              let sa := stLive.lookupVar root
               let eff := stLive.resolveBuf rootId
-              .ctorTag stLive.heapStepEpoch eff
-            | _ => .symVar dst
-          stLive.bindVar dst { expr := tagExpr, nonPoison := sa.nonPoison && liveOk, noUB := sa.noUB && liveOk }
+              stLive.bindVar dst { expr := .ctorTag stLive.heapStepEpoch eff, nonPoison := sa.nonPoison && liveOk, noUB := sa.noUB && liveOk }
+            else
+              -- `.taggedPtr` or untyped projected child may hold an immediate scalar tag or a heap `.objPtr`!
+              (stOut.markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+          | _ =>
+            (stOut.markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
       else (st.markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
     | false, [objVar, idxVar, valVar] =>
       if fnName == "lean_native_ctor_set" && retTy == .unit then
