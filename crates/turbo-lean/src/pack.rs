@@ -3627,6 +3627,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_local_daemon_request_rejects_named_sorry_target() -> Result<()> {
+        // The local daemon helpers send `skip_cas_lock: true`; a named target's own `sorry` is
+        // still rejected (P0-1), before any elaboration, and nothing is cached for it.
+        let _env_guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("turbo_lean_daemon_sorry_{}", next_tmp_id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = TurboStore::open(Some(&dir))?;
+        let req = CheckShardHttpRequest {
+            decl: "bad".into(),
+            shard_key: "shard_key_daemon_sorry".into(),
+            shard_source: "theorem good : 1 + 1 = 2 := sorry\ntheorem bad : False := sorry\n"
+                .into(),
+            interface_hash: String::new(),
+            prefix_env_hash: String::new(),
+            stmt_hash: String::new(),
+            proof_hash: String::new(),
+            toolchain: "leanprover/lean4:v4.35.0".into(),
+            lean_path: String::new(),
+            skip_cas_lock: true,
+            allowed_axioms: None,
+            lean_args: Vec::new(),
+        };
+        let err = execute_check_shard_payload(&mut store, &req).unwrap_err();
+        assert!(
+            err.to_string().contains("Soundness hygiene violation"),
+            "{err}"
+        );
+        assert!(!store.has_cached_action_readonly(&req.shard_key, "trusted")?);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
     fn test_zygote_parallel_cross_file_shard_eval() -> Result<()> {
         let _env_guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir =

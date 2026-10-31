@@ -1495,7 +1495,7 @@ fn extract_decl_source_from_file(active_src: &str, shard: &splitter::TheoremShar
 }
 
 /// Hygiene items (`sorry`/`admit`/`sorryAx`, forbidden axioms, ...) that block certifying `shard` alone:
-/// the file report's items on its lines, plus a fresh audit of its statement and proof text.
+/// the file report's items on its lines, else those of a fresh audit of its statement and proof text.
 fn target_hygiene_violations(
     split: &splitter::SplitResult,
     shard: &splitter::TheoremShard,
@@ -1506,15 +1506,12 @@ fn target_hygiene_violations(
             .and_then(|(ln, _)| ln.parse::<usize>().ok())
             .is_some_and(|ln| shard.start_line <= ln && ln <= shard.end_line)
     };
-    let text = format!("{}\n{}", shard.signature_text, shard.proof_text);
     let mut items: Vec<String> = split.hygiene.disallowed_items();
     items.retain(on_shard_lines);
-    items.extend(
-        splitter::audit_hygiene(&splitter::strip_lean_comments(&text))
-            .disallowed_items()
-            .into_iter()
-            .map(|i| format!("`{}` {}", shard.name, i)),
-    );
+    if items.is_empty() {
+        let text = format!("{}\n{}", shard.signature_text, shard.proof_text);
+        items = splitter::audit_hygiene(&splitter::strip_lean_comments(&text)).disallowed_items();
+    }
     items
 }
 

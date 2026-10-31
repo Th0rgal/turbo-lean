@@ -4639,6 +4639,19 @@ mod tests {
     }
 
     #[test]
+    fn test_sorry_warning_in_decls_is_per_declaration() {
+        let src = "theorem good : 1 + 1 = 2 := sorry\ntheorem uses_good : 1 + 1 = 2 := good\ntheorem sneaky : False := cheat\n";
+        let has = |out: &str, n: &str| sorry_warning_in_decls(src, out, &HashSet::from([n.into()]));
+        let stub_only = "/tmp/x.lean:1:8: warning: declaration uses 'sorry'\n";
+        assert!(!has(stub_only, "uses_good"));
+        let target_too = format!("{stub_only}/tmp/x.lean:3:8: warning: declaration uses `sorry`\n");
+        assert!(has(&target_too, "sneaky") && !has(&target_too, "uses_good"));
+        // Fail closed when the target is not found or a warning has no position.
+        assert!(has(stub_only, "missing"));
+        assert!(has("warning: declaration uses 'sorry'\n", "uses_good"));
+    }
+
+    #[test]
     fn test_audit_hygiene_detects_forbidden_tokens() {
         assert!(
             audit_hygiene(&strip_lean_comments("theorem ok : 1 + 1 = 2 := rfl\n"))
