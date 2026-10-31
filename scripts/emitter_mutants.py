@@ -878,6 +878,7 @@ def run_unit_tests() -> bool:
             git(["init", "-q"], self.root)
             git(["config", "user.name", "Runner Test"], self.root)
             git(["config", "user.email", "runner@example.invalid"], self.root)
+            git(["config", "commit.gpgsign", "false"], self.root)
             mutation = json.loads(json.dumps(self.spec["mutations"][-1]))
             path = self.root / mutation["file"]
             path.parent.mkdir(parents=True)
@@ -885,7 +886,7 @@ def run_unit_tests() -> bool:
 
             def commit(message: str) -> str:
                 git(["add", "."], self.root)
-                git(["commit", "-qm", message], self.root)
+                git(["-c", "commit.gpgsign=false", "commit", "--no-gpg-sign", "-qm", message], self.root)
                 return git(["rev-parse", "HEAD"], self.root).stdout.strip()
 
             commit("add emitter")

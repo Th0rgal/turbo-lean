@@ -167,5 +167,6 @@ echo "=== [6/6] 3-Way Differential Conformance Suite, Grammar-Guided LCNF Fuzzer
 python3 "$ROOT_DIR/scripts/run_conformance_suite.py" --tier C1,C4 --fuzz-seeds 32 --asan --ubsan
 python3 -m unittest -v "$ROOT_DIR/scripts/test_p0_trust_boundary.py"
 python3 -m unittest -v "$ROOT_DIR/scripts/test_kernel_gate_audit.py"
+python3 "$ROOT_DIR/scripts/emitter_mutants.py" --unit-tests
 
 echo "=== LOCAL VALIDATION GATES PASSED (scalar corpus; full roadmap coverage remains open) ==="

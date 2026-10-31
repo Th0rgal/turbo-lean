@@ -833,6 +833,56 @@ class TestP0TrustBoundary(unittest.TestCase):
         self.assertNotEqual(bad_auditor.returncode, 0)
         self.assertIn("TURBO_AUDITOR_BIN", bad_auditor.stderr)
 
+    def test_14_emitter_mutants_unit_and_negative_accounting(self):
+        import emitter_mutants as em
+
+        self.assertTrue(em.run_unit_tests())
+        spec = em.load_spec()
+        ids = [m["id"] for m in spec["mutations"]]
+        self.assertEqual(ids, [f"M{i}" for i in range(1, 12)])
+        base_rows = [
+            {
+                "id": m["id"],
+                "backend": m["backend"],
+                "outcome": "KILLED",
+                "killed_by": ["C1"],
+                "checks": {},
+            }
+            for m in spec["mutations"]
+        ]
+        self.assertTrue(em.summarize(base_rows, spec, ids)["conclusive"])
+        survived = [dict(r) for r in base_rows]
+        survived[0] = {**survived[0], "outcome": "SURVIVED", "killed_by": []}
+        s_sum = em.summarize(survived, spec, ids)
+        self.assertEqual(s_sum["counts"].get("SURVIVED"), 1)
+        infra = [dict(r) for r in base_rows]
+        infra[1] = {**infra[1], "outcome": "INFRA_FAILED", "killed_by": []}
+        i_sum = em.summarize(infra, spec, ids)
+        self.assertFalse(i_sum["conclusive"])
+        self.assertEqual(i_sum["infra_failed_ids"], ["M2"])
+        apply_fail = [dict(r) for r in base_rows]
+        apply_fail[2] = {**apply_fail[2], "outcome": "APPLY_FAILED", "killed_by": []}
+        a_sum = em.summarize(apply_fail, spec, ids)
+        self.assertFalse(a_sum["conclusive"])
+        self.assertEqual(a_sum["apply_failed_ids"], ["M3"])
+        missing_row = em.summarize(base_rows[:-1], spec, ids)
+        self.assertFalse(missing_row["conclusive"])
+        self.assertEqual(missing_row["missing_universe_ids"], ["M11"])
+        targeted_sum = em.summarize(base_rows[:2], spec, ids[:2], targeted=True)
+        self.assertFalse(targeted_sum["conclusive"])
+        self.assertEqual(targeted_sum["run_outcome"], "TARGETED")
+        with tempfile.TemporaryDirectory() as tmp:
+            bad_home = Path(tmp) / "home"
+            bad_home.mkdir()
+            (bad_home / ".gitconfig").write_text("[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = /nonexistent/gpg\n")
+            unit = subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "emitter_mutants.py"), "--unit-tests"],
+                env={**os.environ, "HOME": str(bad_home)},
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(unit.returncode, 0, unit.stderr + unit.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
