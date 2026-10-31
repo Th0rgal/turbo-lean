@@ -9779,7 +9779,10 @@ lean_exe «demo-exe» where
         let mut legacy: serde_json::Value =
             serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
         for entry in legacy["modules"].as_object_mut().unwrap().values_mut() {
-            entry.as_object_mut().unwrap().remove("import_olean_digests");
+            entry
+                .as_object_mut()
+                .unwrap()
+                .remove("import_olean_digests");
         }
         fs::write(&manifest_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
         assert!(!crate::lake_build::is_file_verified_in_lake_build(

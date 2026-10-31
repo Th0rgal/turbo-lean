@@ -5947,8 +5947,16 @@ end Fixture
             .filter_map(|imp| {
                 let rel_slash = crate::module_builder::module_name_to_rel_slash(&imp);
                 let dep_src = crate::lake_build::resolve_project_lean_source(proj_dir, &rel_slash)?;
-                let dep_rel = dep_src.strip_prefix(proj_dir).ok()?.to_string_lossy().into_owned();
-                let dig = manifest.modules.get(&dep_rel)?.olean_artifact_digest.clone();
+                let dep_rel = dep_src
+                    .strip_prefix(proj_dir)
+                    .ok()?
+                    .to_string_lossy()
+                    .into_owned();
+                let dig = manifest
+                    .modules
+                    .get(&dep_rel)?
+                    .olean_artifact_digest
+                    .clone();
                 Some((imp, dig))
             })
             .collect();
