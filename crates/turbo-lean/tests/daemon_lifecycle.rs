@@ -16,12 +16,53 @@ fn evidence(message: String) {
     writeln!(std::io::stdout().lock(), "{message}").unwrap();
 }
 
+fn wait_until(
+    child: &mut std::process::Child,
+    deadline: Instant,
+) -> std::io::Result<std::process::ExitStatus> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "child deadline exceeded",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_child(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> std::io::Result<std::process::ExitStatus> {
+    let result = wait_until(child, Instant::now() + timeout);
+    if result.is_err() {
+        let _ = child.kill();
+        // Reaping is bounded too: a broken kernel/child must not hang panic cleanup.
+        let _ = wait_until(child, Instant::now() + Duration::from_secs(2));
+    }
+    result
+}
+
 struct ChildGuard(std::process::Child);
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = wait_child(&mut self.0, Duration::from_secs(2));
     }
+}
+
+#[test]
+fn child_wait_deadline_kills_and_reaps() {
+    let mut child = ChildGuard(Command::new("sleep").arg("30").spawn().unwrap());
+    let start = Instant::now();
+    let err = wait_child(&mut child.0, Duration::from_millis(50)).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    assert!(child.0.try_wait().unwrap().is_some());
+    assert!(start.elapsed() < Duration::from_secs(1));
 }
 
 struct Fixture {
@@ -83,23 +124,13 @@ impl Fixture {
         let log = self.root.join("command.log");
         let file = fs::File::create(&log).unwrap();
         cmd.stdout(file.try_clone().unwrap()).stderr(file);
-        let mut child = cmd.spawn().unwrap();
-        let start = Instant::now();
-        loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                let stdout = fs::read(&log).unwrap();
-                return Output {
-                    status,
-                    stdout,
-                    stderr: Vec::new(),
-                };
-            }
-            if start.elapsed() > Duration::from_secs(120) {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("CLI exceeded 120s: {}", fs::read_to_string(&log).unwrap());
-            }
-            std::thread::sleep(Duration::from_millis(20));
+        let mut child = ChildGuard(cmd.spawn().unwrap());
+        let status = wait_child(&mut child.0, Duration::from_secs(120))
+            .unwrap_or_else(|e| panic!("CLI deadline: {e}: {}", fs::read_to_string(&log).unwrap()));
+        Output {
+            status,
+            stdout: fs::read(&log).unwrap(),
+            stderr: Vec::new(),
         }
     }
 
@@ -184,12 +215,16 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         // Scope is always explicit, including on assertion failure.
-        let _ = self
+        if let Ok(child) = self
             .command()
             .args(["daemon", "stop"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
+            .spawn()
+        {
+            let mut child = ChildGuard(child);
+            let _ = wait_child(&mut child.0, Duration::from_secs(10));
+        }
         for dir in self.one_shot_dirs() {
             let _ = fs::remove_dir_all(dir);
         }
@@ -442,7 +477,9 @@ fn warm_daemon_late_crash_retry_shares_eval_deadline() {
 }
 
 #[test]
-fn expiry_boundary_checks_succeed() {
+// Scheduler-dependent integration smoke test; exact admission/expiry transitions are
+// covered by server::tests::admission_and_expiry_share_one_state_machine.
+fn expiry_boundary_checks_succeed_smoke() {
     let _serial = LIFECYCLE_TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -606,15 +643,16 @@ fn lifecycle_lock_serializes_startup_and_staging_removal() {
         .unwrap();
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
     fs::remove_dir_all(&f.staging).unwrap();
-    let mut startup = f
-        .check("Quick.lean")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut startup = ChildGuard(
+        f.check("Quick.lean")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
     std::thread::sleep(Duration::from_millis(300));
     assert!(
-        startup.try_wait().unwrap().is_none(),
+        startup.0.try_wait().unwrap().is_none(),
         "startup did not wait for teardown lock"
     );
     assert!(
@@ -622,24 +660,29 @@ fn lifecycle_lock_serializes_startup_and_staging_removal() {
         "startup prepared staging without the lifecycle lock"
     );
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
-    assert!(startup.wait().unwrap().success());
+    assert!(wait_child(&mut startup.0, Duration::from_secs(120))
+        .unwrap()
+        .success());
     assert!(f.staging.exists());
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH) }, 0);
-    let mut stop = f
-        .command()
-        .args(["daemon", "stop"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut stop = ChildGuard(
+        f.command()
+            .args(["daemon", "stop"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
     std::thread::sleep(Duration::from_millis(300));
     assert!(
-        stop.try_wait().unwrap().is_none(),
+        stop.0.try_wait().unwrap().is_none(),
         "teardown did not wait for staging preparation"
     );
     assert!(f.staging.exists());
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
-    assert!(stop.wait().unwrap().success());
+    assert!(wait_child(&mut stop.0, Duration::from_secs(10))
+        .unwrap()
+        .success());
     assert!(!f.staging.exists());
     assert!(f.pids().is_empty());
     evidence("lifecycle flock: startup and staging removal waited for conflicting holders".into());

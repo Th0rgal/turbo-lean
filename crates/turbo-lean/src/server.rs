@@ -22,6 +22,67 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::process::Command;
 
+struct ServerActivity {
+    last_completed: std::time::Instant,
+    active: usize,
+}
+
+impl ServerActivity {
+    fn admit(&mut self) -> bool {
+        if self.active >= 64 {
+            return false;
+        }
+        self.active += 1;
+        true
+    }
+
+    fn complete(&mut self, now: std::time::Instant) {
+        self.last_completed = now;
+        self.active -= 1;
+    }
+
+    fn expired(&self, now: std::time::Instant, ttl: Option<std::time::Duration>) -> bool {
+        self.active == 0 && ttl.is_some_and(|ttl| now.duration_since(self.last_completed) >= ttl)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServerActivity;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn admission_and_expiry_share_one_state_machine() {
+        let start = Instant::now();
+        let ttl = Duration::from_secs(1);
+        let boundary = start + ttl;
+        let mut state = ServerActivity {
+            last_completed: start,
+            active: 0,
+        };
+        assert!(!state.expired(boundary - Duration::from_nanos(1), Some(ttl)));
+        assert!(state.expired(boundary, Some(ttl)));
+        // accept runs before the expiry check under the same lock. A connection
+        // admitted exactly at the boundary must prevent shutdown, however long it runs.
+        assert!(state.admit());
+        assert!(!state.expired(boundary, Some(ttl)));
+        assert!(!state.expired(boundary + ttl * 10, Some(ttl)));
+        assert!(state.admit());
+        state.complete(boundary + ttl * 10);
+        assert!(!state.expired(boundary + ttl * 20, Some(ttl)));
+        let completed = boundary + ttl * 20;
+        state.complete(completed);
+        assert!(!state.expired(completed + ttl - Duration::from_nanos(1), Some(ttl)));
+        assert!(state.expired(completed + ttl, Some(ttl)));
+        assert!(!state.expired(completed + ttl, None));
+        for _ in 0..64 {
+            assert!(state.admit());
+        }
+        assert!(!state.admit());
+        assert_eq!(state.active, 64);
+    }
+}
+
 fn is_loopback_listen_addr(addr: &str) -> bool {
     let trimmed = addr.trim();
     if let Ok(sa) = trimmed.parse::<std::net::SocketAddr>() {
@@ -298,7 +359,10 @@ pub fn serve_cas_http_with_auth(
     let expected_token = resolved_token;
     // Count requests and update a monotonic idle clock under one lock: a long request
     // receives a full idle period after completion, and expiry cannot race request entry.
-    let activity = std::sync::Arc::new(std::sync::Mutex::new((std::time::Instant::now(), 0usize)));
+    let activity = std::sync::Arc::new(std::sync::Mutex::new(ServerActivity {
+        last_completed: std::time::Instant::now(),
+        active: 0,
+    }));
 
     let idle_timeout = is_daemon
         .then(|| {
@@ -319,7 +383,7 @@ pub fn serve_cas_http_with_auth(
         let mut stream = match listener.as_ref().unwrap().accept() {
             Ok((stream, _)) => stream,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if state.1 == 0 && idle_timeout.is_some_and(|ttl| state.0.elapsed() >= ttl) {
+                if state.expired(std::time::Instant::now(), idle_timeout) {
                     // Closing refuses any connections queued after accept returned WouldBlock.
                     // Withdraw every discovery file before committing to shutdown.
                     drop(listener.take());
@@ -349,7 +413,7 @@ pub fn serve_cas_http_with_auth(
         let _ = stream.set_nodelay(true);
         let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
         let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
-        if state.1 >= 64 {
+        if !state.admit() {
             drop(state);
             let _ = write_http_response(
                 &mut stream,
@@ -359,7 +423,6 @@ pub fn serve_cas_http_with_auth(
             );
             continue;
         }
-        state.1 += 1;
         drop(state);
         let activity_guard = activity.clone();
         let shared_ref = shared.clone();
@@ -367,12 +430,11 @@ pub fn serve_cas_http_with_auth(
         let expected_token_clone = expected_token.clone();
 
         std::thread::spawn(move || {
-            struct ConnDropGuard(std::sync::Arc<std::sync::Mutex<(std::time::Instant, usize)>>);
+            struct ConnDropGuard(std::sync::Arc<std::sync::Mutex<ServerActivity>>);
             impl Drop for ConnDropGuard {
                 fn drop(&mut self) {
                     let mut state = self.0.lock().unwrap();
-                    state.0 = std::time::Instant::now();
-                    state.1 -= 1;
+                    state.complete(std::time::Instant::now());
                 }
             }
             let _conn_guard = ConnDropGuard(activity_guard);
