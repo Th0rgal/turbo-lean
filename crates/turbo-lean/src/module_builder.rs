@@ -2236,6 +2236,8 @@ pub fn parse_lakefile_toml(
                     "srcDir" => exe.src_dir = Some(toml_path_field()?),
                     "root" => exe.root = clean_lake_ident(&parse_toml_string(&val_accum)?),
                     "supportInterpreter" => exe.support_interpreter = parse_toml_bool(&val_accum)?,
+                    // Excluded by Lake's TOML decoder, as for `[[lean_lib]]`.
+                    "nativeFacets" => {}
                     "moreLeanArgs" => exe.more_lean_args = parse_toml_string_array(&val_accum)?,
                     "weakLeanArgs" => exe.weak_lean_args = parse_toml_string_array(&val_accum)?,
                     "leanOptions" => {
@@ -11719,9 +11721,11 @@ roots = ["Fast"]
         let tf = dir.join("lakefile.toml");
         fs::write(
             &tf,
-            "name = \"t\"\n[[lean_lib]]\nname = \"A\"\nnativeFacets = []\n",
+            "name = \"t\"\n[[lean_lib]]\nname = \"A\"\nnativeFacets = []\n[[lean_exe]]\nname = \"e\"\nnativeFacets = []\n",
         )
         .unwrap();
+        let pkg = parse_lakefile_toml(&dir, &tf, false).unwrap();
+        assert!(pkg.libs[0].unsupported.is_none() && pkg.exes[0].unsupported.is_none());
         assert!(parse_lakefile_toml(&dir, &tf, true).is_ok());
         fs::remove_file(&tf).unwrap();
         // Imports beyond `Lake` could change how the lakefile elaborates.
