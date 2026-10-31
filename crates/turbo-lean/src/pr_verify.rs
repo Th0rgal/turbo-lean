@@ -2870,6 +2870,7 @@ pub fn run_ci_verify_command(
                 .map(|(m, _)| (env_key.as_str(), m));
 
             let dur_ms = t0.elapsed().as_millis() as i64;
+            let _pub_guard = crate::db::acquire_cas_publication_guard(&store.root)?;
             let (outputs, reg_blobs) = stage_lake_build_outputs(store, &canon_dir)?;
             store.publish_ingested_worktree_action(
                 lease_opt.as_ref(),
@@ -2891,6 +2892,7 @@ pub fn run_ci_verify_command(
                     None,
                 )),
             )?;
+            drop(_pub_guard);
             ("built_and_verified".to_string(), resolved_env)
         }
     };
@@ -4220,6 +4222,7 @@ pub fn run_pr_verify_command(
             }
         }
 
+        let _shard_pub_guard = crate::db::acquire_cas_publication_guard(&store.root)?;
         let mut cross_batch_done = false;
         if uncached_by_file.len() > 1 && cross_eligible.len() == uncached_by_file.len() {
             let cross_args = cross_shared_args.unwrap_or_default();
@@ -4887,6 +4890,7 @@ pub fn run_pr_verify_command(
         } else {
             store.batch_publish_theorem_shards(&toolchain, &trust_domain, &batch_to_publish)?;
         }
+        drop(_shard_pub_guard);
     } else if !is_untrusted
         && remote_http.is_none()
         && !crate::zygote::daemon_disabled()

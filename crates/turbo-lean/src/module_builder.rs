@@ -8250,6 +8250,7 @@ fn store_module_artifacts_in_cas(
     };
     match store.acquire_singleflight(mod_action_key, toolchain, "module_unit", trust_domain)? {
         SingleflightOutcome::Leader(lease) => {
+            let _pub_guard = crate::db::acquire_cas_publication_guard(&store.root)?;
             let entries =
                 store.batch_store_immutable_blobs(&blob_items, trust_domain, pin_level)?;
             if let Err(e) = store.publish_action(&lease, &entries, dur_ms, 0, 0, trust_domain) {

@@ -3294,6 +3294,7 @@ pub fn run_build_command(
             let resolved_env = resolve_or_share_lake_env(store, &canon_dir, &env_key)?;
 
             let dur_ms = t0.elapsed().as_millis() as i64;
+            let _pub_guard = crate::db::acquire_cas_publication_guard(&store.root)?;
             let (outputs, reg_blobs) = stage_lake_build_outputs(store, &canon_dir)?;
             let lake_env_to_put = resolved_env
                 .as_ref()
@@ -3314,6 +3315,7 @@ pub fn run_build_command(
                 lake_env_to_put,
                 None,
             )?;
+            drop(_pub_guard);
             if !crate::zygote::daemon_disabled() {
                 if let Some((ref env_vars, _)) = resolved_env {
                     pack::warm_local_zygote_daemon_nonblocking(store, env_vars);

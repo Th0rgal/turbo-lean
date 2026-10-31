@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-use crate::db::{self, BlobEntry, SingleflightOutcome, TurboStore};
+use crate::db::{self, SingleflightOutcome, TurboStore};
 use crate::lake_build::{
     collect_lean_files, compact_split_for_shm_cache, compute_imported_olean_interface_hashes,
     compute_shard_key_with_args, compute_single_stat_hash, detect_toolchain,
@@ -360,18 +360,16 @@ pub fn try_stateless_remote_check(
                         ));
                     }
                 }
-                if publish_items.len() == req_items.len() {
-                    let _ = st.prestage_theorem_shard_blobs(&publish_items);
-                    if st
+                if publish_items.len() == req_items.len()
+                    && st
                         .begin_inflight_publish_theorem_shards(
                             &toolchain,
                             "trusted",
                             &publish_items,
                         )
                         .is_ok()
-                    {
-                        inflight_tx_open = true;
-                    }
+                {
+                    inflight_tx_open = true;
                 }
                 store_opt = Some(st);
             }
@@ -530,7 +528,6 @@ pub fn try_stateless_remote_single_decl_check(
                         r_bytes.clone(),
                         1,
                     )];
-                    let _ = st.prestage_theorem_shard_blobs(&items);
                     if st
                         .begin_inflight_publish_theorem_shards(&toolchain, "trusted", &items)
                         .is_ok()
@@ -1786,7 +1783,6 @@ fn check_single_decl(
                                 r_bytes.clone(),
                                 1,
                             )];
-                            let _ = store.prestage_theorem_shard_blobs(&items);
                             if store
                                 .begin_inflight_publish_theorem_shards(toolchain, "trusted", &items)
                                 .is_ok()
@@ -2276,7 +2272,6 @@ fn check_single_decl(
                                         r_bytes,
                                         1i64,
                                     )];
-                                    let _ = store.prestage_theorem_shard_blobs(&single_pub);
                                     if store
                                         .begin_inflight_publish_theorem_shards(
                                             toolchain,
@@ -3686,14 +3681,15 @@ fn check_single_file(
                         &shard.proof_hash,
                         now,
                     )?;
-                    let bh = store.store_immutable_blob(&receipt, "expr_shard", "trusted", 0)?;
-                    let entries = vec![BlobEntry {
-                        blob_hash: bh,
-                        kind: "expr_shard".to_string(),
-                        size_bytes: receipt.len() as u64,
-                        rel_path: format!("thm:{}", shard.name),
-                    }];
-                    store.publish_action(&lease, &entries, dur_ms, 0, 0, "trusted")?;
+                    let rel_path = format!("thm:{}", shard.name);
+                    store.publish_action_with_blob(
+                        &lease,
+                        &receipt,
+                        "expr_shard",
+                        &rel_path,
+                        dur_ms,
+                        "trusted",
+                    )?;
                 }
             }
         }

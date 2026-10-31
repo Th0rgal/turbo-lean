@@ -452,6 +452,145 @@ pub(crate) fn set_file_mode_unix(path: &Path, mode: u32) {
 }
 
 const DEFERRED_PACK_V4_MAGIC: &[u8; 8] = b"TLDP\x00\x00\x00\x04";
+const DEFERRED_PACK_SPOOL_PREFIX: &str = "deferred_pack_v4.";
+
+pub(crate) struct DeferredPackLockGuard {
+    file: fs::File,
+}
+
+#[cfg(unix)]
+impl Drop for DeferredPackLockGuard {
+    fn drop(&mut self) {
+        unsafe {
+            use std::os::unix::io::AsRawFd;
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+pub(crate) fn acquire_deferred_pack_lock(store_root: &Path) -> Result<DeferredPackLockGuard> {
+    let locks_dir = store_root.join("locks");
+    fs::create_dir_all(&locks_dir)?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(locks_dir.join("deferred_pack.lock"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("flock(LOCK_EX) deferred_pack.lock");
+        }
+    }
+    Ok(DeferredPackLockGuard { file })
+}
+
+pub(crate) fn list_pending_deferred_pack_files(locks_dir: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let entries = match fs::read_dir(locks_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut legacy_claims = Vec::new();
+    let mut legacy_v3 = Vec::new();
+    let mut spool_v4 = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let fname = entry.file_name();
+        let Some(name) = fname.to_str() else {
+            continue;
+        };
+        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            continue;
+        }
+        if name.starts_with("deferred_pack_v3.claim.") {
+            legacy_claims.push(entry.path());
+        } else if name == "deferred_pack_v3.bin" {
+            legacy_v3.push(entry.path());
+        } else if name.starts_with(DEFERRED_PACK_SPOOL_PREFIX) && name.ends_with(".bin") {
+            spool_v4.push(entry.path());
+        }
+    }
+    legacy_claims.sort();
+    legacy_v3.sort();
+    spool_v4.sort();
+    let mut out = Vec::with_capacity(legacy_claims.len() + legacy_v3.len() + spool_v4.len());
+    out.extend(legacy_claims);
+    out.extend(legacy_v3);
+    out.extend(spool_v4);
+    Ok(out)
+}
+
+pub(crate) fn replay_pending_deferred_packs_inner(
+    store: &mut TurboStore,
+    already_holds_gc_lock: bool,
+) -> Result<()> {
+    let locks_dir = store.root.join("locks");
+    let _ = fs::remove_file(locks_dir.join("deferred_pack_v3.domain"));
+    if list_pending_deferred_pack_files(&locks_dir)?.is_empty() {
+        return Ok(());
+    }
+    let _def_lock = acquire_deferred_pack_lock(&store.root)?;
+    let pending = list_pending_deferred_pack_files(&locks_dir)?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let mut removed_any = false;
+    let mut replay_err: Option<anyhow::Error> = None;
+    for spool_path in pending {
+        let pack_bytes = match fs::read(&spool_path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                replay_err = Some(e.into());
+                break;
+            }
+        };
+        let Some((deferred_td, manifest)) = decode_deferred_pack_record(&pack_bytes) else {
+            if fs::remove_file(&spool_path).is_ok() {
+                removed_any = true;
+            }
+            continue;
+        };
+        let staged_blobs: Vec<(String, String, i64, i64)> = manifest
+            .blobs
+            .iter()
+            .map(|b| (b.blob_hash.clone(), b.kind.clone(), b.size_bytes as i64, 0))
+            .collect();
+        let force_commit = staged_blobs.len().max(1);
+        match finish_import_from_prestaged_shared_cas_inner(
+            store,
+            &manifest,
+            &staged_blobs,
+            force_commit,
+            deferred_td,
+            already_holds_gc_lock,
+        ) {
+            Ok(_) => {
+                if fs::remove_file(&spool_path).is_ok() {
+                    removed_any = true;
+                }
+            }
+            Err(e) => {
+                replay_err = Some(e);
+                break;
+            }
+        }
+    }
+    if removed_any {
+        let _ = crate::db::sync_dir(&locks_dir);
+    }
+    if let Some(e) = replay_err {
+        return Err(e);
+    }
+    Ok(())
+}
+
+pub(crate) fn replay_pending_deferred_packs(store: &mut TurboStore) -> Result<()> {
+    replay_pending_deferred_packs_inner(store, false)
+}
 
 pub fn stage_deferred_pack_record(store_root: &Path, td: &str, v3_bytes: &[u8]) -> bool {
     let root_preexisted = store_root.exists();
@@ -467,14 +606,31 @@ pub fn stage_deferred_pack_record(store_root: &Path, td: &str, v3_bytes: &[u8]) 
             created.push(parent.to_path_buf());
         }
     }
+    let Ok(_def_lock) = acquire_deferred_pack_lock(store_root) else {
+        for dir in &created {
+            let _ = crate::db::sync_dir(dir);
+        }
+        return false;
+    };
+    static DEF_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let seq = DEF_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let spool_name = format!(
+        "{}{:020}.{:010}.{:010}.bin",
+        DEFERRED_PACK_SPOOL_PREFIX,
+        nanos,
+        std::process::id(),
+        seq
+    );
     let td_byte: u8 = if td == "trusted" { 1 } else { 0 };
     let mut rec = Vec::with_capacity(9 + v3_bytes.len());
     rec.extend_from_slice(DEFERRED_PACK_V4_MAGIC);
     rec.push(td_byte);
     rec.extend_from_slice(v3_bytes);
-    if crate::db::write_bytes_durable(&locks_dir.join("deferred_pack_v3.bin"), &rec, &created)
-        .is_err()
-    {
+    if crate::db::write_bytes_durable(&locks_dir.join(spool_name), &rec, &created).is_err() {
         return false;
     }
     let _ = fs::remove_file(locks_dir.join("deferred_pack_v3.domain"));
@@ -554,10 +710,12 @@ pub fn try_stateless_cold_pull_sync_with_domain(
         allow_unattested_trusted,
     )
     .ok()?;
+    let _pub_guard = crate::db::acquire_cas_publication_guard(store_root).ok()?;
     let (_, _) = prestage_blobs_from_shared_cas(store_root, &manifest)?;
     if !stage_deferred_pack_record(store_root, td, &pack_bytes) {
         return None;
     }
+    drop(_pub_guard);
     if td == "trusted" {
         save_cached_portable_manifest_from_pack(store_root, &manifest);
     }
@@ -571,9 +729,14 @@ pub fn try_stateless_cold_pull_sync_with_domain(
 }
 
 pub fn try_stateless_noop_pull_sync(store_root: &Path, base_url: &str) -> bool {
-    let man_path = store_root
-        .join("locks")
-        .join("cached_portable_manifest.json");
+    let locks_dir = store_root.join("locks");
+    if list_pending_deferred_pack_files(&locks_dir)
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let man_path = locks_dir.join("cached_portable_manifest.json");
     let Ok(dm_bytes) = fs::read(&man_path) else {
         return false;
     };
@@ -604,9 +767,14 @@ pub fn try_stateless_push_sync(
     store_root: &Path,
     base_url: &str,
 ) -> Option<((usize, usize, u64, u64, bool), Option<DeltaManifest>)> {
-    let man_path = store_root
-        .join("locks")
-        .join("cached_portable_manifest.json");
+    let locks_dir = store_root.join("locks");
+    if list_pending_deferred_pack_files(&locks_dir)
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let man_path = locks_dir.join("cached_portable_manifest.json");
     let Ok(dm_bytes) = fs::read(&man_path) else {
         return None;
     };
@@ -1624,6 +1792,7 @@ pub fn try_stateless_cold_import_with_domain(
     if !size_ok {
         return None;
     }
+    let _pub_guard = crate::db::acquire_cas_publication_guard(store_root).ok()?;
     let (staged_blobs, _) = prestage_blobs_from_shared_cas(store_root, &manifest)?;
     let header_hash = blake3::hash(&header_buf).to_hex().to_string();
     let stamp_val = format!(
@@ -1642,6 +1811,7 @@ pub fn try_stateless_cold_import_with_domain(
     if !stage_deferred_pack_record(store_root, td, &v3_bytes) {
         return None;
     }
+    drop(_pub_guard);
     crate::db::write_bytes_durable(
         &locks_dir.join("last_import_stamp"),
         stamp_val.as_bytes(),
@@ -1661,7 +1831,14 @@ pub fn try_stateless_warm_import_with_domain(
     trusted_pubkey: Option<&str>,
     allow_unattested_trusted: bool,
 ) -> Option<(usize, usize)> {
-    let stamp_file = store_root.join("locks").join("last_import_stamp");
+    let locks_dir = store_root.join("locks");
+    if list_pending_deferred_pack_files(&locks_dir)
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let stamp_file = locks_dir.join("last_import_stamp");
     let recorded = fs::read_to_string(&stamp_file).ok()?;
     let (saved_stamp, acts_s, blobs_s, saved_td) = {
         let mut parts = recorded.split(':');
@@ -1700,6 +1877,29 @@ pub fn finish_import_from_prestaged_shared_cas_with_domain(
     total_newly_written: usize,
     trust_domain: &str,
 ) -> Result<(usize, usize)> {
+    finish_import_from_prestaged_shared_cas_inner(
+        store,
+        manifest,
+        staged_blobs,
+        total_newly_written,
+        trust_domain,
+        false,
+    )
+}
+
+pub(crate) fn finish_import_from_prestaged_shared_cas_inner(
+    store: &mut TurboStore,
+    manifest: &PackManifest,
+    staged_blobs: &[(String, String, i64, i64)],
+    total_newly_written: usize,
+    trust_domain: &str,
+    already_holds_gc_lock: bool,
+) -> Result<(usize, usize)> {
+    let _pub_guard = if already_holds_gc_lock {
+        None
+    } else {
+        Some(crate::db::acquire_cas_publication_guard(&store.root)?)
+    };
     let td = if trust_domain == "trusted" {
         "trusted"
     } else {
@@ -1722,7 +1922,48 @@ pub fn finish_import_from_prestaged_shared_cas_with_domain(
         crate::db::write_bytes_durable(&stamp_file, stamp_val.as_bytes(), &created)?;
         Ok(())
     };
-    if total_newly_written == 0 && !manifest.actions.is_empty() {
+    let mut effective_blobs: std::borrow::Cow<'_, [(String, String, i64, i64)]> =
+        std::borrow::Cow::Borrowed(staged_blobs);
+    let mut effective_newly_written = total_newly_written;
+    let missing_on_disk = staged_blobs.iter().any(|(bh, _, sz, _)| {
+        !matches!(
+            crate::db::probe_blob_file(&store.blob_path(bh), (*sz).max(0) as u64),
+            crate::db::BlobDisk::Intact(_)
+        )
+    }) || manifest.actions.iter().any(|a| {
+        a.outputs.iter().any(|o| {
+            !matches!(
+                crate::db::probe_blob_file(&store.blob_path(&o.blob_hash), o.size_bytes),
+                crate::db::BlobDisk::Intact(_)
+            )
+        })
+    });
+    if missing_on_disk {
+        let Some((restaged, restaged_new)) = prestage_blobs_from_shared_cas(&store_root, manifest)
+        else {
+            anyhow::bail!("Refusing to publish prestaged pack import: one or more CAS blobs missing or torn on disk");
+        };
+        for a in &manifest.actions {
+            for o in &a.outputs {
+                if !matches!(
+                    crate::db::probe_blob_file(&store.blob_path(&o.blob_hash), o.size_bytes),
+                    crate::db::BlobDisk::Intact(_)
+                ) {
+                    anyhow::bail!(
+                        "Refusing to publish prestaged pack import: output blob {} missing or torn on disk",
+                        o.blob_hash
+                    );
+                }
+            }
+        }
+        effective_blobs = std::borrow::Cow::Owned(restaged);
+        effective_newly_written = effective_newly_written.max(restaged_new.max(1));
+    }
+
+    let has_pending_deferred = list_pending_deferred_pack_files(&locks_dir)
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    if effective_newly_written == 0 && !has_pending_deferred && !manifest.actions.is_empty() {
         if fs::read_to_string(&stamp_file)
             .map(|s| s == stamp_val)
             .unwrap_or(false)
@@ -1730,7 +1971,7 @@ pub fn finish_import_from_prestaged_shared_cas_with_domain(
             if td == "trusted" {
                 save_cached_portable_manifest_from_pack(&store.root, manifest);
             }
-            return Ok((manifest.actions.len(), staged_blobs.len()));
+            return Ok((manifest.actions.len(), effective_blobs.len()));
         }
         let existing_completed: i64 = store
             .conn
@@ -1751,11 +1992,12 @@ pub fn finish_import_from_prestaged_shared_cas_with_domain(
             if td == "trusted" {
                 save_cached_portable_manifest_from_pack(&store.root, manifest);
             }
-            return Ok((manifest.actions.len(), staged_blobs.len()));
+            return Ok((manifest.actions.len(), effective_blobs.len()));
         }
     }
 
-    let res = store.batch_import_pack_metadata_with_domain(staged_blobs, &manifest.actions, td)?;
+    let res =
+        store.batch_import_pack_metadata_with_domain(&effective_blobs, &manifest.actions, td)?;
     write_stamp()?;
     if td == "trusted" {
         save_cached_portable_manifest_from_pack(&store.root, manifest);
@@ -1783,10 +2025,17 @@ pub(crate) fn try_import_from_shared_cas_with_domain(
     Ok(Some(res))
 }
 
+pub type PrefetchedPackPrestage = (
+    PackManifest,
+    Vec<(String, String, i64, i64)>,
+    usize,
+    crate::db::CasPublicationGuard,
+);
+
 pub fn try_read_and_prestage_pack(
     store_root: &Path,
     input_path: &Path,
-) -> Option<(PackManifest, Vec<(String, String, i64, i64)>, usize)> {
+) -> Option<PrefetchedPackPrestage> {
     let (file_len, magic, header_buf) = read_pack_header_from_file(input_path)?;
     let header_len = header_buf.len();
     let manifest = serde_json::from_slice::<PackManifest>(&header_buf).ok()?;
@@ -1796,8 +2045,9 @@ pub fn try_read_and_prestage_pack(
     if !size_ok {
         return None;
     }
+    let pub_guard = crate::db::acquire_cas_publication_guard(store_root).ok()?;
     let (staged_blobs, newly_written) = prestage_blobs_from_shared_cas(store_root, &manifest)?;
-    Some((manifest, staged_blobs, newly_written))
+    Some((manifest, staged_blobs, newly_written, pub_guard))
 }
 
 pub fn import_pack_with_policy(
@@ -1807,7 +2057,7 @@ pub fn import_pack_with_policy(
     trusted_pubkey: Option<&str>,
     allow_unattested_trusted: bool,
 ) -> Result<(usize, usize)> {
-    if let Some((manifest, staged_blobs, newly_written)) =
+    if let Some((manifest, staged_blobs, newly_written, pub_guard)) =
         try_read_and_prestage_pack(&store.root, input_path)
     {
         let td = resolve_pack_import_trust_domain(
@@ -1816,13 +2066,15 @@ pub fn import_pack_with_policy(
             trusted_pubkey,
             allow_unattested_trusted,
         )?;
-        return finish_import_from_prestaged_shared_cas_with_domain(
+        let res = finish_import_from_prestaged_shared_cas_with_domain(
             store,
             &manifest,
             &staged_blobs,
             newly_written,
             td,
         );
+        drop(pub_guard);
+        return res;
     }
     let input_bytes = fs::read(input_path)?;
     import_pack_bytes_with_policy(
@@ -1889,6 +2141,7 @@ pub fn import_pack_bytes_with_policy(
         allow_unattested_trusted,
     )?;
 
+    let _pub_guard = crate::db::acquire_cas_publication_guard(&store.root)?;
     let expected_payload: usize = manifest.blobs.iter().map(|b| b.size_bytes as usize).sum();
     if is_v3_header_only || (!payload_region.is_empty() && payload_region.len() == expected_payload)
     {
@@ -4381,11 +4634,192 @@ pub(crate) mod tests {
         let _ = fs::remove_dir_all(&dir_wt);
         Ok(())
     }
+
+    #[test]
+    fn test_deferred_pack_spool_multi_pack_crash_claim_and_failed_replay_preservation() -> Result<()>
+    {
+        let _env_guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let root_a =
+            std::env::temp_dir().join(format!("turbo_lean_def_src_a_{}", next_tmp_id()));
+        let root_b =
+            std::env::temp_dir().join(format!("turbo_lean_def_src_b_{}", next_tmp_id()));
+        let root_dst =
+            std::env::temp_dir().join(format!("turbo_lean_def_spool_dst_{}", next_tmp_id()));
+        let _ = fs::remove_dir_all(&root_a);
+        let _ = fs::remove_dir_all(&root_b);
+        let _ = fs::remove_dir_all(&root_dst);
+        fs::create_dir_all(&root_dst)?;
+
+        let mut store_a = TurboStore::open(Some(&root_a))?;
+        let mut store_b = TurboStore::open(Some(&root_b))?;
+        let pay_a = b"deferred-pack-payload-alpha";
+        let pay_b = b"deferred-pack-payload-bravo";
+        let bh_a = store_a.store_immutable_blob(pay_a, "olean", "trusted", 0)?;
+        let bh_b = store_b.store_immutable_blob(pay_b, "olean", "trusted", 0)?;
+        if let SingleflightOutcome::Leader(l) =
+            store_a.acquire_singleflight("def-act-alpha", "v4.35.0", "module_unit", "trusted")?
+        {
+            store_a.publish_action(
+                &l,
+                &[BlobEntry {
+                    blob_hash: bh_a.clone(),
+                    kind: "olean".into(),
+                    size_bytes: pay_a.len() as u64,
+                    rel_path: "build/lib/lean/Alpha.olean".into(),
+                }],
+                1,
+                0,
+                0,
+                "trusted",
+            )?;
+        }
+        if let SingleflightOutcome::Leader(l) =
+            store_b.acquire_singleflight("def-act-bravo", "v4.35.0", "module_unit", "trusted")?
+        {
+            store_b.publish_action(
+                &l,
+                &[BlobEntry {
+                    blob_hash: bh_b.clone(),
+                    kind: "olean".into(),
+                    size_bytes: pay_b.len() as u64,
+                    rel_path: "build/lib/lean/Bravo.olean".into(),
+                }],
+                1,
+                0,
+                0,
+                "trusted",
+            )?;
+        }
+        let pack_a = root_a.join("alpha.tlpack");
+        let pack_b = root_b.join("bravo.tlpack");
+        export_pack_with_signing_key(&store_a, &pack_a, true, None)?;
+        export_pack_with_signing_key(&store_b, &pack_b, true, None)?;
+
+        // 1. Multiple sequential cold imports before any `TurboStore::open` must preserve BOTH
+        //    spooled records without overwriting the earlier record.
+        assert!(try_stateless_cold_import_with_domain(&root_dst, &pack_a, Some("trusted"), None, true).is_some());
+        assert!(try_stateless_cold_import_with_domain(&root_dst, &pack_b, Some("trusted"), None, true).is_some());
+        assert_eq!(
+            list_pending_deferred_pack_files(&root_dst.join("locks"))?.len(),
+            2
+        );
+
+        let opened = TurboStore::open(Some(&root_dst))?;
+        assert!(opened.get_cached_action("def-act-alpha", "trusted")?.is_some());
+        assert!(opened.get_cached_action("def-act-bravo", "trusted")?.is_some());
+        assert!(list_pending_deferred_pack_files(&root_dst.join("locks"))?.is_empty());
+        drop(opened);
+
+        // 2. Crash recovery + failed-import preservation:
+        //    - Simulate an orphaned `deferred_pack_v3.claim.<pid>.<id>` whose blob is missing on
+        //      disk AND absent from shared CAS (so replay fails), alongside a newer valid
+        //      `deferred_pack_v4.*.bin` record.
+        //    - Replay must return `Err`, keep BOTH the failed `.claim.` file and the newer `.v4.`
+        //      spool file intact (never clobbering the newer record), and once the missing blob is
+        //      restored on disk, a subsequent `TurboStore::open` must recover BOTH records cleanly.
+        let root_crash =
+            std::env::temp_dir().join(format!("turbo_lean_def_crash_{}", next_tmp_id()));
+        let _ = fs::remove_dir_all(&root_crash);
+        fs::create_dir_all(root_crash.join("locks"))?;
+
+        let missing_payload = b"transiently-missing-claim-blob-bytes";
+        let missing_bh = blake3::hash(missing_payload).to_hex().to_string();
+        let claim_manifest = PackManifest {
+            format_version: 2,
+            host_arch: std::env::consts::ARCH.into(),
+            created_at: 1,
+            ed25519_pubkey: None,
+            ed25519_signature: None,
+            blobs: vec![PackedBlob {
+                blob_hash: missing_bh.clone(),
+                kind: "olean".into(),
+                size_bytes: missing_payload.len() as u64,
+                portable: true,
+                data_hex_or_base64: Vec::new(),
+            }],
+            actions: vec![ActionRecord {
+                action_key: "def-act-crashed-claim".into(),
+                toolchain_githash: "v4.35.0".into(),
+                kind: "module_unit".into(),
+                status: "completed".into(),
+                fencing_token: 1,
+                output_manifest_hash: "mhash".into(),
+                duration_ms: 1,
+                peak_pss_bytes: 0,
+                heartbeats: 0,
+                trust_domain: "trusted".into(),
+                outputs: vec![BlobEntry {
+                    blob_hash: missing_bh.clone(),
+                    kind: "olean".into(),
+                    size_bytes: missing_payload.len() as u64,
+                    rel_path: "build/lib/lean/Claim.olean".into(),
+                }],
+            }],
+        };
+        let claim_hdr = serde_json::to_vec(&claim_manifest)?;
+        let mut claim_v4 = Vec::new();
+        claim_v4.extend_from_slice(DEFERRED_PACK_V4_MAGIC);
+        claim_v4.push(1u8);
+        claim_v4.extend_from_slice(b"TLPK\x00\x00\x00\x03");
+        claim_v4.extend_from_slice(&(claim_hdr.len() as u64).to_le_bytes());
+        claim_v4.extend_from_slice(&claim_hdr);
+        let orphan_claim_path = root_crash
+            .join("locks")
+            .join("deferred_pack_v3.claim.999999.1");
+        fs::write(&orphan_claim_path, &claim_v4)?;
+
+        // Stage a newer valid pack (`pack_b`) while the crashed `.claim.` file is present.
+        assert!(
+            try_stateless_cold_import_with_domain(&root_crash, &pack_b, Some("trusted"), None, true)
+                .is_some()
+        );
+        assert_eq!(
+            list_pending_deferred_pack_files(&root_crash.join("locks"))?.len(),
+            2
+        );
+
+        // Opening now fails because `missing_bh` is neither in local `blobs/` nor in shared CAS.
+        assert!(TurboStore::open(Some(&root_crash)).is_err());
+        // Crucially, NEITHER the `.claim.` record NOR the newer `deferred_pack_v4.*` record was lost!
+        assert!(orphan_claim_path.exists());
+        assert_eq!(
+            list_pending_deferred_pack_files(&root_crash.join("locks"))?.len(),
+            2
+        );
+
+        // Restore the missing blob in local `blobs/` and re-open: both records replay & clean up.
+        let restored_blob_path = root_crash
+            .join("blobs")
+            .join(&missing_bh[..2])
+            .join(&missing_bh);
+        crate::db::write_blob_atomic(
+            &root_crash,
+            &restored_blob_path,
+            &missing_bh,
+            missing_payload,
+            false,
+        )?;
+        let recovered = TurboStore::open(Some(&root_crash))?;
+        assert!(recovered
+            .get_cached_action("def-act-crashed-claim", "trusted")?
+            .is_some());
+        assert!(recovered
+            .get_cached_action("def-act-bravo", "trusted")?
+            .is_some());
+        assert!(list_pending_deferred_pack_files(&root_crash.join("locks"))?.is_empty());
+        drop(recovered);
+
+        let _ = fs::remove_dir_all(&root_crash);
+        let _ = fs::remove_dir_all(&root_a);
+        let _ = fs::remove_dir_all(&root_b);
+        let _ = fs::remove_dir_all(&root_dst);
+        Ok(())
+    }
 }
 
 pub type PrefetchedExportItem = (
     Vec<u8>,
-    Option<(PackManifest, Vec<(String, String, i64, i64)>, usize)>,
+    Option<PrefetchedPackPrestage>,
 );
 
 /// Execute `turbo-lean export`.
@@ -4427,9 +4861,7 @@ pub fn run_import_command(
     trusted_pubkey: Option<String>,
     allow_unattested_trusted: bool,
     expected_sha256: Option<String>,
-    prefetched: Option<
-        std::thread::JoinHandle<Option<(PackManifest, Vec<(String, String, i64, i64)>, usize)>>,
-    >,
+    prefetched: Option<std::thread::JoinHandle<Option<PrefetchedPackPrestage>>>,
 ) -> Result<()> {
     let req_td = trust_domain.as_deref();
     let pk_opt = trusted_pubkey.as_deref();
@@ -4450,18 +4882,20 @@ pub fn run_import_command(
             &input.display().to_string(),
         )?;
         import_pack_bytes_with_policy(store, &raw_bytes, req_td, pk_opt, allow_unattested_trusted)?
-    } else if let Some((manifest, staged_blobs, newly_written)) =
+    } else if let Some((manifest, staged_blobs, newly_written, pub_guard)) =
         prefetched.and_then(|h| h.join().ok().flatten())
     {
         let td =
             resolve_pack_import_trust_domain(&manifest, req_td, pk_opt, allow_unattested_trusted)?;
-        finish_import_from_prestaged_shared_cas_with_domain(
+        let res = finish_import_from_prestaged_shared_cas_with_domain(
             store,
             &manifest,
             &staged_blobs,
             newly_written,
             td,
-        )?
+        )?;
+        drop(pub_guard);
+        res
     } else {
         import_pack_with_policy(store, &input, req_td, pk_opt, allow_unattested_trusted)?
     };
@@ -4560,20 +4994,24 @@ pub fn run_sync_command(
                     verify_optional_sha256(&pack_bytes, None, sha_opt, &remote)?;
                     if !pack_bytes.is_empty() {
                         pulled =
-                            if let Some((manifest, staged_blobs, newly_written)) = prestaged_opt {
+                            if let Some((manifest, staged_blobs, newly_written, pub_guard)) =
+                                prestaged_opt
+                            {
                                 let td = resolve_pack_import_trust_domain(
                                     &manifest,
                                     req_td,
                                     pk_opt,
                                     allow_unattested_trusted,
                                 )?;
-                                finish_import_from_prestaged_shared_cas_with_domain(
+                                let res = finish_import_from_prestaged_shared_cas_with_domain(
                                     store,
                                     &manifest,
                                     &staged_blobs,
                                     newly_written,
                                     td,
-                                )?
+                                )?;
+                                drop(pub_guard);
+                                res
                             } else {
                                 import_pack_bytes_with_policy(
                                     store,

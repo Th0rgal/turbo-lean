@@ -98,6 +98,74 @@ pub struct GcReport {
     pub reaped_zygote_workers: usize,
 }
 
+/// Shared store-level publication guard (`LOCK_SH` on `<store>/locks/gc_publish.lock`) held
+/// across blob staging through action/pack metadata publication so concurrent `run_gc` (`LOCK_EX`)
+/// cannot orphan-reclaim, supersede, or `TLZ1`-compress in-flight blobs before their referencer
+/// rows commit.
+pub struct CasPublicationGuard {
+    file: File,
+}
+
+impl Drop for CasPublicationGuard {
+    fn drop(&mut self) {
+        unsafe {
+            use std::os::unix::io::AsRawFd;
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+pub(crate) struct CasExclusiveGcGuard {
+    file: File,
+}
+
+impl Drop for CasExclusiveGcGuard {
+    fn drop(&mut self) {
+        unsafe {
+            use std::os::unix::io::AsRawFd;
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn open_gc_publish_lock_file(store_root: &Path) -> Result<File> {
+    let locks_dir = store_root.join("locks");
+    fs::create_dir_all(&locks_dir)?;
+    Ok(OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(locks_dir.join("gc_publish.lock"))?)
+}
+
+pub fn acquire_cas_publication_guard(store_root: &Path) -> Result<CasPublicationGuard> {
+    use std::os::unix::io::AsRawFd;
+    let file = open_gc_publish_lock_file(store_root)?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("flock(LOCK_SH) gc_publish.lock");
+    }
+    Ok(CasPublicationGuard { file })
+}
+
+fn try_acquire_cas_gc_guard(store_root: &Path) -> Result<Option<CasExclusiveGcGuard>> {
+    use std::os::unix::io::AsRawFd;
+    let file = open_gc_publish_lock_file(store_root)?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        Ok(Some(CasExclusiveGcGuard { file }))
+    } else {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock
+            || err.raw_os_error() == Some(libc::EWOULDBLOCK)
+            || err.raw_os_error() == Some(libc::EAGAIN)
+        {
+            Ok(None)
+        } else {
+            Err(err).context("flock(LOCK_EX | LOCK_NB) gc_publish.lock")
+        }
+    }
+}
+
 pub struct SingleflightLease {
     pub action_key: String,
     pub toolchain: String,
@@ -205,6 +273,7 @@ struct StagedTheoremShards {
     now: i64,
     unique_blobs: usize,
     rows: Vec<StagedTheoremShard>,
+    _pub_guard: CasPublicationGuard,
 }
 
 pub struct TurboStore {
@@ -388,47 +457,7 @@ impl TurboStore {
             conn,
             inflight_staged_shards: std::cell::RefCell::new(None),
         };
-        let locks_dir = store.root.join("locks");
-        let deferred_v3 = locks_dir.join("deferred_pack_v3.bin");
-        let _ = fs::remove_file(locks_dir.join("deferred_pack_v3.domain"));
-        let claim_path = locks_dir.join(format!(
-            "deferred_pack_v3.claim.{}.{}",
-            std::process::id(),
-            crate::pack::next_tmp_id()
-        ));
-        if fs::rename(&deferred_v3, &claim_path).is_ok() {
-            let claimed_bytes = fs::read(&claim_path);
-            if let Ok(pack_bytes) = claimed_bytes {
-                if let Some((deferred_td, manifest)) =
-                    crate::pack::decode_deferred_pack_record(&pack_bytes)
-                {
-                    let staged_blobs: Vec<(String, String, i64, i64)> = manifest
-                        .blobs
-                        .iter()
-                        .map(|b| (b.blob_hash.clone(), b.kind.clone(), b.size_bytes as i64, 0))
-                        .collect();
-                    match crate::pack::finish_import_from_prestaged_shared_cas_with_domain(
-                        &mut store,
-                        &manifest,
-                        &staged_blobs,
-                        staged_blobs.len(),
-                        deferred_td,
-                    ) {
-                        Ok(_) => {
-                            let _ = fs::remove_file(&claim_path);
-                        }
-                        Err(e) => {
-                            let _ = fs::rename(&claim_path, &deferred_v3);
-                            return Err(e);
-                        }
-                    }
-                } else {
-                    let _ = fs::remove_file(&claim_path);
-                }
-            } else {
-                let _ = fs::rename(&claim_path, &deferred_v3);
-            }
-        }
+        crate::pack::replay_pending_deferred_packs(&mut store)?;
 
         Ok(store)
     }
@@ -1287,6 +1316,7 @@ impl TurboStore {
         trust_domain: &str,
         pin_level: i64,
     ) -> Result<String> {
+        let _pub_guard = acquire_cas_publication_guard(&self.root)?;
         let hash = blake3::hash(bytes).to_hex().to_string();
         let (inode, size) = self.ensure_immutable_blob_on_disk(&hash, bytes)?;
         let now = now_unix();
@@ -1317,6 +1347,7 @@ impl TurboStore {
         if items.is_empty() {
             return Ok(Vec::new());
         }
+        let _pub_guard = acquire_cas_publication_guard(&self.root)?;
         let now = now_unix();
         let mut entries = Vec::with_capacity(items.len());
         let mut seen_blobs: std::collections::HashMap<String, (i64, i64, String)> =
@@ -1384,6 +1415,18 @@ impl TurboStore {
     ) -> Result<()> {
         if blobs.is_empty() {
             return Ok(());
+        }
+        let _pub_guard = acquire_cas_publication_guard(&self.root)?;
+        for (hash, _, size, _) in blobs {
+            if !matches!(
+                probe_blob_file(&self.blob_path(hash), (*size).max(0) as u64),
+                BlobDisk::Intact(_)
+            ) {
+                anyhow::bail!(
+                    "Refusing to register CAS blob {}: missing or torn on disk",
+                    hash
+                );
+            }
         }
         let now = now_unix();
         let tx = self.conn.unchecked_transaction()?;
@@ -1516,6 +1559,7 @@ impl TurboStore {
         if items.is_empty() {
             return Ok(());
         }
+        let pub_guard = acquire_cas_publication_guard(&self.root)?;
         let now = now_unix();
         let mut staged = Vec::with_capacity(items.len());
         let mut seen_blobs: std::collections::HashMap<String, (i64, i64)> =
@@ -1576,6 +1620,7 @@ impl TurboStore {
             now,
             unique_blobs: seen_blobs.len(),
             rows: staged,
+            _pub_guard: pub_guard,
         });
         Ok(())
     }
@@ -1584,6 +1629,18 @@ impl TurboStore {
         let Some(staged) = self.inflight_staged_shards.borrow_mut().take() else {
             return Ok(());
         };
+        for row in &staged.rows {
+            if !matches!(
+                probe_blob_file(&self.blob_path(&row.blob_hash), row.size as u64),
+                BlobDisk::Intact(_)
+            ) {
+                anyhow::bail!(
+                    "Refusing to publish theorem shard {}: CAS blob {} missing or torn on disk",
+                    row.action_key,
+                    row.blob_hash
+                );
+            }
+        }
         let waiters = lease_action_key
             .map(|ak| self.seal_singleflight_waiters(ak))
             .unwrap_or(0);
@@ -1800,6 +1857,20 @@ impl TurboStore {
         heartbeats: i64,
         trust_domain: &str,
     ) -> Result<String> {
+        let _pub_guard = acquire_cas_publication_guard(&self.root)?;
+        for o in outputs {
+            if !matches!(
+                probe_blob_file(&self.blob_path(&o.blob_hash), o.size_bytes),
+                BlobDisk::Intact(_)
+            ) {
+                anyhow::bail!(
+                    "Refusing to publish action {}: CAS blob {} ({}) missing or torn on disk",
+                    lease.action_key,
+                    o.blob_hash,
+                    o.rel_path
+                );
+            }
+        }
         let mut manifest_hasher = blake3::Hasher::new();
         for o in outputs {
             manifest_hasher.update(o.rel_path.as_bytes());
@@ -1904,6 +1975,7 @@ impl TurboStore {
         duration_ms: i64,
         trust_domain: &str,
     ) -> Result<String> {
+        let _pub_guard = acquire_cas_publication_guard(&self.root)?;
         let blob_hash = blake3::hash(bytes).to_hex().to_string();
         let (inode, size) = self.ensure_immutable_blob_on_disk(&blob_hash, bytes)?;
 
@@ -2055,6 +2127,32 @@ impl TurboStore {
         lake_env: Option<(&str, &std::collections::HashMap<String, String>)>,
         attestation: Option<(&str, &str, &[String], Option<&str>)>,
     ) -> Result<(String, usize)> {
+        let _pub_guard = acquire_cas_publication_guard(&self.root)?;
+        for (hash, _, size, _) in reg_blobs {
+            if !matches!(
+                probe_blob_file(&self.blob_path(hash), (*size).max(0) as u64),
+                BlobDisk::Intact(_)
+            ) {
+                anyhow::bail!(
+                    "Refusing to publish ingested action {}: staged CAS blob {} missing or torn on disk",
+                    action_key,
+                    hash
+                );
+            }
+        }
+        for o in outputs {
+            if !matches!(
+                probe_blob_file(&self.blob_path(&o.blob_hash), o.size_bytes),
+                BlobDisk::Intact(_)
+            ) {
+                anyhow::bail!(
+                    "Refusing to publish ingested action {}: CAS blob {} ({}) missing or torn on disk",
+                    action_key,
+                    o.blob_hash,
+                    o.rel_path
+                );
+            }
+        }
         let mut manifest_hasher = blake3::Hasher::new();
         for o in outputs {
             manifest_hasher.update(o.rel_path.as_bytes());
@@ -2660,8 +2758,9 @@ impl TurboStore {
 
     /// Action keys currently referencing `blob_hash`, read and then re-read while every listed
     /// singleflight lock is held. A key that appears between the two reads (a publisher that
-    /// committed after the first scan) makes this return `None` so the caller skips the blob.
-    fn lock_blob_referencers(&self, blob_hash: &str) -> Option<(Vec<File>, Vec<String>)> {
+    /// committed after the first scan) makes this return `Ok(None)` so the caller skips the blob,
+    /// while SQLite errors propagate via `Err` so GC fails closed.
+    fn lock_blob_referencers(&self, blob_hash: &str) -> Result<Option<(Vec<File>, Vec<String>)>> {
         let referencing = |bh: &str| -> std::result::Result<Vec<String>, rusqlite::Error> {
             let mut stmt = self
                 .conn
@@ -2673,26 +2772,34 @@ impl TurboStore {
             keys.dedup();
             Ok(keys)
         };
-        let first = referencing(blob_hash).ok()?;
-        let guards = self.try_lock_all_singleflights(&first)?;
+        let first = referencing(blob_hash)?;
+        let Some(guards) = self.try_lock_all_singleflights(&first) else {
+            return Ok(None);
+        };
         let second = match referencing(blob_hash) {
             Ok(keys) => keys,
-            Err(_) => {
+            Err(e) => {
                 Self::unlock_singleflights(guards);
-                return None;
+                return Err(e.into());
             }
         };
         if first == second {
-            Some((guards, second))
+            Ok(Some((guards, second)))
         } else {
             Self::unlock_singleflights(guards);
-            None
+            Ok(None)
         }
     }
 
     /// `true` when `blob_hash` is pinned, still referenced by an action, or covered by a live
-    /// worktree lease. Called only while `lock_blob_referencers` holds every referencing lock.
-    fn blob_still_reachable(&self, blob_hash: &str, now: i64, ignore_actions: bool) -> bool {
+    /// worktree lease. Called only while `lock_blob_referencers` holds every referencing lock;
+    /// propagates SQLite errors so GC fails closed rather than misclassifying live blobs as orphans.
+    fn blob_still_reachable(
+        &self,
+        blob_hash: &str,
+        now: i64,
+        ignore_actions: bool,
+    ) -> Result<bool> {
         let sql = if ignore_actions {
             "SELECT 1 FROM blobs WHERE blob_hash = ?1 AND pin_level > 0
              UNION ALL
@@ -2710,12 +2817,11 @@ impl TurboStore {
              WHERE wfb.blob_hash = ?1 AND (?2 - wl.last_seen) <= 7200
              LIMIT 1"
         };
-        self.conn
+        Ok(self
+            .conn
             .query_row(sql, params![blob_hash, now], |_| Ok(true))
-            .optional()
-            .ok()
-            .flatten()
-            .unwrap_or(false)
+            .optional()?
+            .unwrap_or(false))
     }
 
     /// Smart multi-project Garbage Collector using Cost-Aware GDSF (Greedy-Dual-Size-Frequency):
@@ -2862,6 +2968,27 @@ impl TurboStore {
         // Always evict any blob in `blobs` with `pin_level < 0` that is not referenced in
         // `worktree_file_blobs` of any active lease (`now - last_seen <= 7200`), even before
         // checking `max_reclaimable_bytes`!
+        let Some(gc_guard) = try_acquire_cas_gc_guard(&self.root)? else {
+            let reaped_zygote_workers = if cfg!(test) || max_reclaimable_bytes > 0 {
+                0
+            } else {
+                crate::zygote::reap_zygote_workers_and_daemons(Some(&self.root))
+            };
+            let current_reclaimable = self.storage_status()?.reclaimable_bytes;
+            return Ok(GcReport {
+                pruned_worktrees,
+                evicted_actions,
+                unlinked_blobs,
+                cleaned_staging_files,
+                pruned_fastcheck_bins,
+                freed_reclaimable_bytes: freed_bytes,
+                remaining_reclaimable_bytes: current_reclaimable,
+                superseded_evicted,
+                compressed_blobs,
+                reaped_zygote_workers,
+            });
+        };
+        crate::pack::replay_pending_deferred_packs_inner(self, true)?;
         let superseded_blobs: Vec<(String, u64)> = {
             let mut stmt = self.conn.prepare(
                 "SELECT b.blob_hash, b.size_bytes
@@ -2890,80 +3017,77 @@ impl TurboStore {
                     params![bh],
                     |_| Ok(()),
                 )
-                .optional()
-                .ok()
-                .flatten()
+                .optional()?
                 .is_some()
             {
                 continue;
             }
             // Re-scan under the locks: a publisher that registered this blob on a different action
             // after the first read makes the set change, and this pass skips the blob entirely.
-            let Some((guards, live_keys)) = self.lock_blob_referencers(&bh) else {
+            let Some((guards, live_keys)) = self.lock_blob_referencers(&bh)? else {
                 continue;
             };
-            let pin_now: Option<i64> = self
-                .conn
-                .query_row(
-                    "SELECT pin_level FROM blobs WHERE blob_hash = ?1",
-                    params![bh],
-                    |r| r.get(0),
-                )
-                .optional()
-                .ok()
-                .flatten();
-            if pin_now.unwrap_or(0) >= 0 || self.blob_still_reachable(&bh, now, true) {
-                Self::unlock_singleflights(guards);
-                continue;
-            }
-            if !live_keys.is_empty()
-                && self
+            let guarded_res = (|| -> Result<bool> {
+                let pin_now: Option<i64> = self
                     .conn
                     .query_row(
-                        "SELECT 1 FROM action_outputs ao WHERE ao.blob_hash = ?1 AND EXISTS (
-                             SELECT 1 FROM action_outputs ao2
-                             WHERE ao2.action_key = ao.action_key AND ao2.blob_hash != ?1
-                         ) LIMIT 1",
+                        "SELECT pin_level FROM blobs WHERE blob_hash = ?1",
                         params![bh],
-                        |_| Ok(()),
+                        |r| r.get(0),
                     )
-                    .optional()
-                    .ok()
-                    .flatten()
-                    .is_some()
-            {
-                Self::unlock_singleflights(guards);
-                continue;
-            }
-            let p = self.blob_path(&bh);
-            for k in &live_keys {
-                self.remove_singleflight_markers(k);
-                self.conn
-                    .execute("DELETE FROM actions WHERE action_key = ?1", params![k])?;
+                    .optional()?;
+                if pin_now.unwrap_or(0) >= 0 || self.blob_still_reachable(&bh, now, true)? {
+                    return Ok(false);
+                }
+                if !live_keys.is_empty()
+                    && self
+                        .conn
+                        .query_row(
+                            "SELECT 1 FROM action_outputs ao WHERE ao.blob_hash = ?1 AND EXISTS (
+                                 SELECT 1 FROM action_outputs ao2
+                                 WHERE ao2.action_key = ao.action_key AND ao2.blob_hash != ?1
+                             ) LIMIT 1",
+                            params![bh],
+                            |_| Ok(()),
+                        )
+                        .optional()?
+                        .is_some()
+                {
+                    return Ok(false);
+                }
+                let p = self.blob_path(&bh);
+                for k in &live_keys {
+                    self.remove_singleflight_markers(k);
+                    self.conn
+                        .execute("DELETE FROM actions WHERE action_key = ?1", params![k])?;
+                    self.conn.execute(
+                        "DELETE FROM action_outputs WHERE action_key = ?1 AND blob_hash = ?2",
+                        params![k, bh],
+                    )?;
+                }
+                if live_keys.is_empty() {
+                    self.conn.execute(
+                        "DELETE FROM action_outputs WHERE blob_hash = ?1",
+                        params![bh],
+                    )?;
+                }
                 self.conn.execute(
-                    "DELETE FROM action_outputs WHERE action_key = ?1 AND blob_hash = ?2",
-                    params![k, bh],
-                )?;
-            }
-            if live_keys.is_empty() {
-                self.conn.execute(
-                    "DELETE FROM action_outputs WHERE blob_hash = ?1",
+                    "DELETE FROM worktree_installations WHERE blob_hash = ?1",
                     params![bh],
                 )?;
-            }
-            self.conn.execute(
-                "DELETE FROM worktree_installations WHERE blob_hash = ?1",
-                params![bh],
-            )?;
-            self.conn
-                .execute("DELETE FROM blobs WHERE blob_hash = ?1", params![bh])?;
-            if p.exists() {
-                let _ = fs::remove_file(&p);
-            }
+                self.conn
+                    .execute("DELETE FROM blobs WHERE blob_hash = ?1", params![bh])?;
+                if p.exists() {
+                    let _ = fs::remove_file(&p);
+                }
+                Ok(true)
+            })();
             Self::unlock_singleflights(guards);
-            superseded_evicted += 1;
-            unlinked_blobs += 1;
-            freed_bytes += sz;
+            if guarded_res? {
+                superseded_evicted += 1;
+                unlinked_blobs += 1;
+                freed_bytes += sz;
+            }
         }
 
         // Step B (Standard GDSF Eviction):
@@ -3002,70 +3126,74 @@ impl TurboStore {
                 let Some(guard) = self.try_lock_singleflight(&action_key) else {
                     continue;
                 };
-                let action_blobs: Vec<(String, u64, i64)> = {
-                    let mut stmt = self.conn.prepare(
-                        "SELECT DISTINCT b.blob_hash, b.size_bytes, b.pin_level
-                         FROM action_outputs ao JOIN blobs b ON b.blob_hash = ao.blob_hash
-                         WHERE ao.action_key = ?1",
-                    )?;
-                    let mapped = stmt.query_map(params![action_key], |r| {
-                        Ok((
-                            r.get::<_, String>(0)?,
-                            r.get::<_, i64>(1)? as u64,
-                            r.get::<_, i64>(2)?,
-                        ))
-                    })?;
-                    mapped.collect::<std::result::Result<Vec<_>, _>>()?
-                };
-                self.conn.execute(
-                    "DELETE FROM actions WHERE action_key = ?1",
-                    params![action_key],
-                )?;
-                self.remove_singleflight_markers(&action_key);
-                evicted_actions += 1;
-
-                for (bh, sz, pin) in action_blobs {
-                    if keep_pinned && pin > 0 {
-                        continue;
-                    }
-                    let still_used: bool = if keep_pinned {
-                        self.blob_still_reachable(&bh, now, false)
-                    } else {
-                        self.conn
-                            .query_row(
-                                "SELECT 1 FROM action_outputs WHERE blob_hash = ?1
-                                 UNION ALL
-                                 SELECT 1 FROM worktree_file_blobs wfb
-                                 JOIN worktree_leases wl ON wl.worktree_id = wfb.worktree_id
-                                 WHERE wfb.blob_hash = ?1 AND (?2 - wl.last_seen) <= 7200
-                                 LIMIT 1",
-                                params![bh, now],
-                                |_| Ok(true),
-                            )
-                            .optional()?
-                            .unwrap_or(false)
+                let evict_act_res = (|| -> Result<()> {
+                    let action_blobs: Vec<(String, u64, i64)> = {
+                        let mut stmt = self.conn.prepare(
+                            "SELECT DISTINCT b.blob_hash, b.size_bytes, b.pin_level
+                             FROM action_outputs ao JOIN blobs b ON b.blob_hash = ao.blob_hash
+                             WHERE ao.action_key = ?1",
+                        )?;
+                        let mapped = stmt.query_map(params![action_key], |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, i64>(1)? as u64,
+                                r.get::<_, i64>(2)?,
+                            ))
+                        })?;
+                        mapped.collect::<std::result::Result<Vec<_>, _>>()?
                     };
-                    if still_used {
-                        continue;
-                    }
-                    let p = self.blob_path(&bh);
-                    let nlink = fs::metadata(&p).map(|m| m.nlink()).unwrap_or(1);
-                    if p.exists() {
-                        let _ = fs::remove_file(&p);
-                    }
                     self.conn.execute(
-                        "DELETE FROM worktree_installations WHERE blob_hash = ?1",
-                        params![bh],
+                        "DELETE FROM actions WHERE action_key = ?1",
+                        params![action_key],
                     )?;
-                    self.conn
-                        .execute("DELETE FROM blobs WHERE blob_hash = ?1", params![bh])?;
-                    unlinked_blobs += 1;
-                    if nlink == 1 && pin <= 0 {
-                        freed_bytes += sz;
-                        current_reclaimable = current_reclaimable.saturating_sub(sz);
+                    self.remove_singleflight_markers(&action_key);
+                    evicted_actions += 1;
+
+                    for (bh, sz, pin) in action_blobs {
+                        if keep_pinned && pin > 0 {
+                            continue;
+                        }
+                        let still_used: bool = if keep_pinned {
+                            self.blob_still_reachable(&bh, now, false)?
+                        } else {
+                            self.conn
+                                .query_row(
+                                    "SELECT 1 FROM action_outputs WHERE blob_hash = ?1
+                                     UNION ALL
+                                     SELECT 1 FROM worktree_file_blobs wfb
+                                     JOIN worktree_leases wl ON wl.worktree_id = wfb.worktree_id
+                                     WHERE wfb.blob_hash = ?1 AND (?2 - wl.last_seen) <= 7200
+                                     LIMIT 1",
+                                    params![bh, now],
+                                    |_| Ok(true),
+                                )
+                                .optional()?
+                                .unwrap_or(false)
+                        };
+                        if still_used {
+                            continue;
+                        }
+                        let p = self.blob_path(&bh);
+                        let nlink = fs::metadata(&p).map(|m| m.nlink()).unwrap_or(1);
+                        if p.exists() {
+                            let _ = fs::remove_file(&p);
+                        }
+                        self.conn.execute(
+                            "DELETE FROM worktree_installations WHERE blob_hash = ?1",
+                            params![bh],
+                        )?;
+                        self.conn
+                            .execute("DELETE FROM blobs WHERE blob_hash = ?1", params![bh])?;
+                        unlinked_blobs += 1;
+                        if nlink == 1 && pin <= 0 {
+                            freed_bytes += sz;
+                            current_reclaimable = current_reclaimable.saturating_sub(sz);
+                        }
                     }
-                }
+                    Ok(())
+                })();
                 Self::unlock_singleflights(vec![guard]);
+                evict_act_res?;
 
                 // Find orphan blobs no longer referenced by any action_outputs or active worktree leases
                 let orphan_blobs: Vec<(String, u64, i64)> = {
@@ -3096,48 +3224,50 @@ impl TurboStore {
                     }
                     // The scan above is stale: lock whoever references it now and skip when a
                     // publisher registered it (or raised its pin) after the scan.
-                    let Some((blob_guards, _)) = self.lock_blob_referencers(&bh) else {
+                    let Some((blob_guards, _)) = self.lock_blob_referencers(&bh)? else {
                         continue;
                     };
-                    let reachable = if keep_pinned {
-                        self.blob_still_reachable(&bh, now, false)
-                    } else {
+                    let orphan_res = (|| -> Result<bool> {
+                        let reachable = if keep_pinned {
+                            self.blob_still_reachable(&bh, now, false)?
+                        } else {
+                            self.conn
+                                .query_row(
+                                    "SELECT 1 FROM action_outputs WHERE blob_hash = ?1
+                                     UNION ALL
+                                     SELECT 1 FROM worktree_file_blobs wfb
+                                     JOIN worktree_leases wl ON wl.worktree_id = wfb.worktree_id
+                                     WHERE wfb.blob_hash = ?1 AND (?2 - wl.last_seen) <= 7200
+                                     LIMIT 1",
+                                    params![bh, now],
+                                    |_| Ok(true),
+                                )
+                                .optional()?
+                                .unwrap_or(false)
+                        };
+                        if reachable {
+                            return Ok(false);
+                        }
+                        let p = self.blob_path(&bh);
+                        let nlink = fs::metadata(&p).map(|m| m.nlink()).unwrap_or(1);
+                        if p.exists() {
+                            let _ = fs::remove_file(&p);
+                        }
+                        self.conn.execute(
+                            "DELETE FROM worktree_installations WHERE blob_hash = ?1",
+                            params![bh],
+                        )?;
                         self.conn
-                            .query_row(
-                                "SELECT 1 FROM action_outputs WHERE blob_hash = ?1
-                                 UNION ALL
-                                 SELECT 1 FROM worktree_file_blobs wfb
-                                 JOIN worktree_leases wl ON wl.worktree_id = wfb.worktree_id
-                                 WHERE wfb.blob_hash = ?1 AND (?2 - wl.last_seen) <= 7200
-                                 LIMIT 1",
-                                params![bh, now],
-                                |_| Ok(true),
-                            )
-                            .optional()
-                            .ok()
-                            .flatten()
-                            .unwrap_or(false)
-                    };
-                    if reachable {
-                        Self::unlock_singleflights(blob_guards);
-                        continue;
-                    }
-                    let p = self.blob_path(&bh);
-                    let nlink = fs::metadata(&p).map(|m| m.nlink()).unwrap_or(1);
-                    if p.exists() {
-                        let _ = fs::remove_file(&p);
-                    }
-                    self.conn.execute(
-                        "DELETE FROM worktree_installations WHERE blob_hash = ?1",
-                        params![bh],
-                    )?;
-                    self.conn
-                        .execute("DELETE FROM blobs WHERE blob_hash = ?1", params![bh])?;
+                            .execute("DELETE FROM blobs WHERE blob_hash = ?1", params![bh])?;
+                        if nlink == 1 && pin <= 0 {
+                            freed_bytes += sz;
+                            current_reclaimable = current_reclaimable.saturating_sub(sz);
+                        }
+                        Ok(true)
+                    })();
                     Self::unlock_singleflights(blob_guards);
-                    unlinked_blobs += 1;
-                    if nlink == 1 && pin <= 0 {
-                        freed_bytes += sz;
-                        current_reclaimable = current_reclaimable.saturating_sub(sz);
+                    if orphan_res? {
+                        unlinked_blobs += 1;
                     }
                 }
             }
@@ -3173,7 +3303,7 @@ impl TurboStore {
             }
             // Hold every referencing action's lock across the swap, re-checking the set under the
             // locks so a publisher that registered the blob after the scan keeps it uncompressed.
-            let Some((guards, _)) = self.lock_blob_referencers(&bh) else {
+            let Some((guards, _)) = self.lock_blob_referencers(&bh)? else {
                 continue;
             };
             let Ok(raw_bytes) = fs::read(&p) else {
@@ -3195,6 +3325,7 @@ impl TurboStore {
             }
             Self::unlock_singleflights(guards);
         }
+        drop(gc_guard);
 
         let reaped_zygote_workers = if cfg!(test) || max_reclaimable_bytes > 0 {
             0
@@ -5282,7 +5413,7 @@ mod tests {
         let evs = take_log();
         assert!(
             evs.first()
-                .is_some_and(|s| s.starts_with("file:.deferred_pack_v3.bin.")),
+                .is_some_and(|s| s.starts_with("file:.deferred_pack_v4.")),
             "{evs:?}"
         );
         let locks_pos = evs
@@ -5663,6 +5794,105 @@ mod tests {
         assert_eq!(rep_dup.freed_reclaimable_bytes, 2048);
         assert!(!dup_store.blob_path(&bh_dup).exists());
         assert!(!dup_store.blob_path(&bh_tail).exists());
+
+        // 5. Unpublished staging + GC race: while a publisher holds `CasPublicationGuard`
+        //    (between staging blobs and committing `action_outputs`), `run_gc` must skip CAS
+        //    blob eviction/compression instead of unlinking staged blobs as unreferenced orphans,
+        //    AND `publish_action` must fail closed if an output blob is missing/torn on disk.
+        let stage_race_dir = dir.join("stage_race_store");
+        let mut pub_store = TurboStore::open(Some(&stage_race_dir))?;
+        let mut conc_gc = TurboStore::open(Some(&stage_race_dir))?;
+        let evict_seed = pub_store.store_immutable_blob(&vec![b'e'; 1024], "olean", "trusted", 0)?;
+        let l_seed = match pub_store.acquire_singleflight("seed_evict_act", tc, "olean", "trusted")? {
+            SingleflightOutcome::Leader(l) => l,
+            _ => panic!("expected leader"),
+        };
+        pub_store.publish_action(
+            &l_seed,
+            &[BlobEntry {
+                blob_hash: evict_seed.clone(),
+                kind: "olean".to_string(),
+                size_bytes: 1024,
+                rel_path: "Seed.olean".to_string(),
+            }],
+            1,
+            0,
+            0,
+            "trusted",
+        )?;
+        drop(l_seed);
+
+        let staged_bytes = vec![b'p'; 1024];
+        let pub_guard = acquire_cas_publication_guard(&pub_store.root)?;
+        let staged_entries = pub_store.batch_store_immutable_blobs(
+            &[(
+                String::new(),
+                staged_bytes.clone(),
+                "olean".to_string(),
+                "Staged.olean".to_string(),
+                1024u64,
+            )],
+            "trusted",
+            0,
+        )?;
+        let staged_entry = staged_entries[0].clone();
+        let staged_bh = staged_entry.blob_hash.clone();
+        // `staged_bh` is in `blobs` with zero `action_outputs` rows right now; without
+        // `CasPublicationGuard` vs `try_acquire_cas_gc_guard`, `conc_gc.run_gc(0, ...)` would
+        // evict `seed_evict_act` and then sweep `staged_bh` as an unreferenced orphan.
+        let rep_while_publishing = conc_gc.run_gc(0, 7 * 86400, true)?;
+        assert_eq!(rep_while_publishing.evicted_actions, 0);
+        assert_eq!(rep_while_publishing.unlinked_blobs, 0);
+        assert!(pub_store.blob_path(&staged_bh).exists());
+
+        let l_staged = match pub_store.acquire_singleflight("staged_pub_act", tc, "olean", "trusted")? {
+            SingleflightOutcome::Leader(l) => l,
+            _ => panic!("expected leader"),
+        };
+        pub_store.publish_action(&l_staged, std::slice::from_ref(&staged_entry), 10, 0, 0, "trusted")?;
+        drop(l_staged);
+        drop(pub_guard);
+        assert!(pub_store.blob_path(&staged_bh).exists());
+        assert!(pub_store.get_cached_action("staged_pub_act", "trusted")?.is_some());
+
+        // Fail-closed publish check: if a staged blob file is missing on disk before `publish_action`,
+        // `publish_action` must return `Err` and leave no completed action row in SQLite.
+        let missing_bh = blake3::hash(b"missing-on-disk-payload").to_hex().to_string();
+        let l_missing = match pub_store.acquire_singleflight("missing_blob_act", tc, "olean", "trusted")? {
+            SingleflightOutcome::Leader(l) => l,
+            _ => panic!("expected leader"),
+        };
+        let missing_res = pub_store.publish_action(
+            &l_missing,
+            &[BlobEntry {
+                blob_hash: missing_bh,
+                kind: "olean".to_string(),
+                size_bytes: 23,
+                rel_path: "Missing.olean".to_string(),
+            }],
+            1,
+            0,
+            0,
+            "trusted",
+        );
+        assert!(missing_res.is_err());
+        drop(l_missing);
+        assert!(pub_store.get_cached_action("missing_blob_act", "trusted")?.is_none());
+
+        // 6. Fail-closed GC on SQLite error: if a reachability query encounters a SQLite error
+        //    (e.g., corrupted/dropped `worktree_leases` table), `run_gc` must return `Err` and
+        //    preserve CAS blob files on disk instead of treating query failure as `unreachable`.
+        let err_gc_dir = dir.join("err_gc_store");
+        let mut err_store = TurboStore::open(Some(&err_gc_dir))?;
+        let live_bytes = vec![b'z'; 1024];
+        let live_bh = err_store.store_immutable_blob(&live_bytes, "olean", "trusted", -1)?;
+        assert!(err_store.blob_path(&live_bh).exists());
+        err_store.conn.execute_batch("DROP TABLE worktree_leases;")?;
+        assert!(err_store.run_gc(0, 7 * 86400, true).is_err());
+        assert!(
+            err_store.blob_path(&live_bh).exists(),
+            "GC must fail closed on SQLite reachability errors without unlinking CAS blobs"
+        );
 
         let _ = fs::remove_dir_all(&dir);
         Ok(())
