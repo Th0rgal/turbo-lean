@@ -2185,6 +2185,24 @@ open LeanNative.IR LeanNative.Proofs
   let selectRootSafetyBad := validateTranslationDecl (mkSelectRootSafetyDecl false) (mkSelectRootSafetyDecl true) 8
   unless !selectRootSafetyBad.ubRefines && !selectRootSafetyBad.passed do
     throw <| IO.userError s!"matching select roots discarded conditional safety: {reprStr selectRootSafetyBad}"
+  let mkTupleHeapNamespaceDecl (returnLeaf : Bool) : LNIRDecl := {
+    name := "tuple_heap_namespace"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "t", ty := .tuple (List.replicate 5907 .i64), borrow := false },
+      { id := 2, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 3 .i1 (.scalar (.binOp .eq (.var 2) (.constU64 999)))
+        (.ite 3
+          (.letBind 4 .i64 (.ctorGetScalar 0 0 .i64)
+            (.letBind 5 .i64 (.projTuple 1 5906) (.ret (if returnLeaf then 5 else 4))))
+          (.letBind 6 .i64 (.scalar (.constU64 0)) (.ret 6)))
+  }
+  let namespaceBad := validateTranslationDecl (mkTupleHeapNamespaceDecl false) (mkTupleHeapNamespaceDecl true) 0
+  unless !namespaceBad.symRetEquiv && !namespaceBad.passed do
+    throw <| IO.userError s!"tuple leaf collided with heap projection namespace: {reprStr namespaceBad}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)

@@ -2152,7 +2152,7 @@ def initTupleParamExpr (d : Nat) (nextSubId : VarId) :
 def symExecDecl (loopUnrollBound : Nat := 4) (d : LNIRDecl) (synBaseOverride? : Option VarId := none) : SymExecSummary :=
   let synBase := synBaseOverride?.getD (declSynVarBase d)
   let initTupleBase : VarId := synBase + 256
-  let (initState, _) : SymExecState × VarId := d.params.foldl (fun (acc, curSubId) p =>
+  let (paramState, tupleEnd) : SymExecState × VarId := d.params.foldl (fun (acc, curSubId) p =>
     match p.ty with
     | .rawPtr _ =>
       ((acc.bindVar p.id { expr := .symVar p.id, nonPoison := true, noUB := true }).markExclusive p.id, curSubId)
@@ -2178,6 +2178,7 @@ def symExecDecl (loopUnrollBound : Nat := 4) (d : LNIRDecl) (synBaseOverride? : 
     | _ =>
       (acc.bindVar p.id { expr := .symVar p.id, nonPoison := true, noUB := true }, curSubId)
   ) ({ synVarBase := synBase + 4096 }, initTupleBase)
+  let initState := { paramState with synVarBase := Nat.max (synBase + 4096) tupleEnd }
   let (finalSt, retExpr) := symExecCode 256 loopUnrollBound initState d.body
   let rawWrites :=
     (finalSt.memWrites.filter fun (r, _, _) => !(finalSt.allocRoots.contains r)).mergeSort
