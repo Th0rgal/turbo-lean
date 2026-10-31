@@ -1,35 +1,14 @@
 import B2.Artifacts
-import B2.CallFree
+import B2.BackendScope
 import FV.E2E.Statement
 import FV.E2E.RegLevelCall
 import FV.E2E.RegLevelDriverSem
-import FV.Backend.Proof.LowerDecide
 
 /-! O5 scope and O6 contracts for the actual backend pipeline. The backend's unconditional
 hook/program-preservation clauses remain explicit; absence of call sites discharges `os`. -/
 namespace B2.BackendContracts
 open Backend Backend.Proof Backend.Proof.Driver E2E
 attribute [local irreducible] B2.Smoke.collatz
-
-theorem subset (p : Clif.Program) : InSubset p B2.Smoke.collatz := by
-  refine ⟨B2.Lowering.lower_in_subsetE _ _ B2.Smoke.collatz_lowered, ?_, ?_, ?_, ?_⟩
-  · intro b hb st hst fn args hi e he
-    simp [Clif.Function.extern?, B2.CallFree.declarations.1] at he
-  · intro b hb fn args et hi e he
-    simp [Clif.Function.extern?, B2.CallFree.declarations.1] at he
-  · constructor
-    · rw [B2.CollatzClif.generated_sig]
-      decide
-    · simp [B2.CallFree.declarations.1]
-  · simp [B2.CallFree.no_indirect_sigs]
-
-theorem dominated : dominatedB B2.Smoke.collatz = true := by
-  rw [← B2.Artifacts.input_eq]
-  decide +kernel
-
-theorem scope : lowerScopeB B2.Smoke.collatz = true := by
-  rw [← B2.Artifacts.input_eq]
-  decide +kernel
 
 theorem prepared_call_free : B2.Artifacts.vcp.blocks.all (fun vb => vb.insts.all
     (fun i => match i with | .call .. | .tryCall .. => false | _ => true)) = true := by

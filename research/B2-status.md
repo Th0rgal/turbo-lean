@@ -1,7 +1,7 @@
 # B2 status
 
 Baseline: `5508b9f`; clifv `5018b9509dc124154dbe08a5bd85862595d8eab7`.
-Checkpoint: 2026-10-31 15:52 UTC. The executable lowering lives in
+Checkpoint: 2026-10-31 16:30 UTC. The executable lowering lives in
 `lean/LeanNative/Backend/Clif.lean`; `compile-clif` calls that definition.
 The default proof build and transitive axiom audit pass on Lean 4.34.1.
 
@@ -68,11 +68,25 @@ Next: discharge the remaining contracts and compose the LNIR-to-x0 theorem again
 The FinalDirect dependency cone is building in the background, one compiler
 at a time. Do not duplicate or restart a working compiler on a timeout.
 
-Resource notes: the session cgroup has a 16 GiB maximum and 14.4 GiB high
-watermark. `RegallocAtomic` finished successfully; dependent modules are building. The original Lake PID
-is 1926474, logging to `/tmp/b2-final-cone.log`, controlled by
-`/tmp/b2-limit-lean-jobs.py`. Two smaller modules (CSemRename and
-LogicImmComplete) were deferred to free memory, so an automatic retry of
-FinalDirect is queued after this build drains. Diagnostic checks use a
-3 GiB cap. `LEAN_NUM_THREADS=4` and telemetry off apply to all builds;
-this Lake version rejects `-j4`.
+Resource notes: the execution environment was replaced around 16:09 UTC;
+the former `/tmp/repos/turbo-b2` checkout, compiler processes, and logs vanished.
+The pushed checkpoint `e89f7dc` was restored to workspace `turbo-b2`, and clifv
+was fetched at the exact pin. Source identity passes. CI passed both the
+pipeline checkpoint `5425e2c` and exporter checkpoint `e89f7dc`:
+https://github.com/Th0rgal/turbo-lean/actions/runs/41216872036 and
+https://github.com/Th0rgal/turbo-lean/actions/runs/41218005244 .
+
+The replacement FinalDirect build runs as durable job
+`de3fb23e-6a97-5640-bbd2-fa37a78c1d5c`; its workspace logs are
+`.b2-work/final.log`. A root/scope dependency build was submitted separately as
+`75c53b8f-a8aa-5260-ac65-fb43142f70db`; neither job's heartbeat alone establishes
+successful compilation. All commands set `LEAN_NUM_THREADS=4` and telemetry off.
+A process limiter tracks compiler children across scheduler threads.
+
+`B2.BackendScope` is an excluded, unverified draft split from BackendContracts
+to isolate the dominance check. Its Boolean `insertIfNew` lookup lemma passed
+an isolated kernel check and two concrete lookup tests with only the allowed
+axioms. Actual `dominatedB` still awaits checking; earlier reductions repeated
+decidable-instance transport and exceeded recursion limits. `B2.EndToEnd`
+now drafts the explicit equality with x0, but composition is still unchecked.
+These draft changes do not upgrade O5, O6, or O7.

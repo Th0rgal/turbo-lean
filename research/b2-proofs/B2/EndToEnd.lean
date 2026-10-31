@@ -29,8 +29,10 @@ theorem collatz_to_arm {p : Clif.Program}
     (hev : evalCode fuel
       (B2.entryEnv LeanNative.IR.Codec.collatzStepsDecl [.u64 n, .u64 steps]) st₀
       LeanNative.IR.Codec.collatzStepsDecl.body = .ok (v, st₁)) :
-    ∃ count rv, ArmRet ra s (runX (ArmStepX X H fa) count s) ∧
-      B2.ValRel v rv ∧ XHolds rv (xreg 0 (runX (ArmStepX X H fa) count s)) := by
+    ∃ count, ArmRet ra s (runX (ArmStepX X H fa) count s) ∧
+      B2.ValRel v (B2.CollatzClif.cv (Nat.repeat B2.CollatzSource.step steps.toNat n)) ∧
+      xreg 0 (runX (ArmStepX X H fa) count s) =
+        (Nat.repeat B2.CollatzSource.step steps.toNat n).toBitVec := by
   have hr := backend_correct_final_of_lower (B2.BackendContracts.subset p)
     B2.BackendContracts.dominated B2.BackendContracts.scope
     B2.Artifacts.lower B2.Artifacts.prepared B2.Artifacts.allocation_checked
@@ -45,7 +47,9 @@ theorem collatz_to_arm {p : Clif.Program}
   obtain ⟨count, hret, hregs, _⟩ := hr
   rw [B2.CollatzSource.collatz_eval] at hev
   cases hev
-  exact ⟨count, _, hret, rfl, hregs 0 _ rfl⟩
+  refine ⟨count, hret, rfl, ?_⟩
+  simpa [B2.CollatzClif.cv, Clif.Ty.width] using
+    (XHolds_iff (Nat.le_refl 64)).mp (hregs 0 _ rfl)
 
 #print axioms collatz_to_arm
 end B2.EndToEnd
