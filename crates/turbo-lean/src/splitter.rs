@@ -25,6 +25,20 @@ pub struct TheoremShard {
     pub shard_source: String,
 }
 
+impl TheoremShard {
+    pub fn effective_name(&self) -> &str {
+        if self.qualified_name.is_empty() {
+            &self.name
+        } else {
+            &self.qualified_name
+        }
+    }
+
+    pub fn rooted_name(&self) -> String {
+        format!("_root_.{}", self.effective_name())
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HygieneReport {
     pub has_sorry: bool,
@@ -2831,34 +2845,114 @@ pub(crate) fn host_name_components(s: &str) -> Vec<String> {
     comps
 }
 
-pub(crate) fn decl_name_matches_target(name: &str, target_decl: &str) -> bool {
-    let nc = host_name_components(name);
-    let tc = host_name_components(target_decl);
-    !nc.is_empty() && !tc.is_empty() && (nc.ends_with(&tc) || tc.ends_with(&nc))
+pub(crate) fn parse_host_target(s: &str) -> (bool, Vec<String>) {
+    if let Some(rest) = s.strip_prefix("_root_.") {
+        (true, host_name_components(rest))
+    } else {
+        (false, host_name_components(s))
+    }
 }
 
-fn find_last_matching_span_idx<F>(spans: &[CmdSpan<'_>], mut pred: F) -> Option<usize>
+pub(crate) fn decl_name_matches_target(name: &str, target_decl: &str) -> bool {
+    let qname = name.strip_prefix("_root_.").unwrap_or(name);
+    let nc = host_name_components(qname);
+    let (exact_root, tc) = parse_host_target(target_decl);
+    !nc.is_empty()
+        && !tc.is_empty()
+        && if exact_root {
+            nc == tc
+        } else {
+            nc.ends_with(&tc)
+        }
+}
+
+pub(crate) fn resolve_target_shard_idx(
+    shards: &[TheoremShard],
+    target_decl: &str,
+) -> std::result::Result<Option<usize>, Vec<String>> {
+    let matches: Vec<usize> = shards
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| decl_name_matches_target(s.effective_name(), target_decl))
+        .map(|(i, _)| i)
+        .collect();
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(Some(matches[0])),
+        _ => Err(matches
+            .into_iter()
+            .map(|i| shards[i].effective_name().to_string())
+            .collect()),
+    }
+}
+
+pub(crate) fn open_namespace_prefix(src: &str) -> String {
+    let clean = strip_lean_comments(src);
+    let spans = parse_command_spans(src, &clean);
+    let mut stack = Vec::new();
+    for (idx, span) in spans.iter().enumerate() {
+        update_scope_stack_with_idx(&mut stack, span.clean_text, idx);
+    }
+    let ns: Vec<&str> = stack
+        .iter()
+        .filter(|f| matches!(f.kind, ScopeKind::Namespace))
+        .map(|f| f.name.as_str())
+        .collect();
+    if ns.is_empty() {
+        String::new()
+    } else {
+        format!("namespace {}\n", ns.join("."))
+    }
+}
+
+fn find_last_matching_span_idx_in_range<F>(
+    spans: &[CmdSpan<'_>],
+    range: std::ops::RangeInclusive<usize>,
+    mut pred: F,
+) -> Option<usize>
 where
     F: FnMut(&str) -> bool,
 {
+    if spans.is_empty() || range.is_empty() {
+        return None;
+    }
+    let end = (*range.end()).min(spans.len() - 1);
+    let start = *range.start();
+    let mut scope_stack = Vec::new();
     let mut last_idx = None;
-    for (s_idx, span) in spans.iter().enumerate() {
-        if let Some((_, inner_spans, _)) = split_mutual_block_subspans(span) {
-            if inner_spans.iter().any(|sub| {
-                classify_decl_header(sub.clean_text)
-                    .map(|(_, n)| pred(&n))
-                    .unwrap_or(false)
-            }) {
-                last_idx = Some(s_idx);
+    for (s_idx, span) in spans[..=end].iter().enumerate() {
+        if s_idx >= start {
+            if let Some((_, inner_spans, _)) = split_mutual_block_subspans(span) {
+                if inner_spans.iter().any(|sub| {
+                    classify_decl_header(sub.clean_text)
+                        .map(|(_, n)| pred(&qualified_decl_name(&n, &scope_stack)))
+                        .unwrap_or(false)
+                }) {
+                    last_idx = Some(s_idx);
+                }
+            }
+            if let Some((_kind, name)) = classify_decl_header(span.clean_text) {
+                if split_at_top_level_assign(span.clean_text).is_some()
+                    && pred(&qualified_decl_name(&name, &scope_stack))
+                {
+                    last_idx = Some(s_idx);
+                }
             }
         }
-        if let Some((_kind, name)) = classify_decl_header(span.clean_text) {
-            if split_at_top_level_assign(span.clean_text).is_some() && pred(&name) {
-                last_idx = Some(s_idx);
-            }
-        }
+        update_scope_stack_with_idx(&mut scope_stack, span.clean_text, s_idx);
     }
     last_idx
+}
+
+fn find_last_matching_span_idx<F>(spans: &[CmdSpan<'_>], pred: F) -> Option<usize>
+where
+    F: FnMut(&str) -> bool,
+{
+    if spans.is_empty() {
+        None
+    } else {
+        find_last_matching_span_idx_in_range(spans, 0..=spans.len() - 1, pred)
+    }
 }
 
 fn format_stubbed_decl_span(orig_text: &str, sig_clean: &str, proof_clean: &str) -> String {
@@ -3000,7 +3094,8 @@ pub fn build_coalesced_shard_source(
     let spans = parse_command_spans(src, &clean);
 
     let mut chunks = Vec::with_capacity(spans.len());
-    for span in &spans {
+    let mut scope_stack: Vec<ScopeFrame> = Vec::new();
+    for (s_idx, span) in spans.iter().enumerate() {
         if let Some((header_orig, inner_spans, footer_orig)) = split_mutual_block_subspans(span) {
             let has_inner_thm = inner_spans.iter().any(|sub| {
                 classify_decl_header(sub.clean_text).is_some()
@@ -3011,7 +3106,8 @@ pub fn build_coalesced_shard_source(
                 inner_chunks.push(header_orig.to_string());
                 for sub in &inner_spans {
                     if let Some((_kind, name)) = classify_decl_header(sub.clean_text) {
-                        if !matches_uncached_or_fast_verify_name(&name, uncached_names) {
+                        let qname = qualified_decl_name(&name, &scope_stack);
+                        if !matches_uncached_or_fast_verify_name(&qname, uncached_names) {
                             if let Some((sig_clean, proof_clean)) =
                                 split_at_top_level_assign(sub.clean_text)
                             {
@@ -3028,14 +3124,17 @@ pub fn build_coalesced_shard_source(
                 }
                 inner_chunks.push(footer_orig.to_string());
                 chunks.push(inner_chunks.join("\n"));
+                update_scope_stack_with_idx(&mut scope_stack, span.clean_text, s_idx);
                 continue;
             }
         }
 
         if let Some((_kind, name)) = classify_decl_header(span.clean_text) {
-            if !matches_uncached_or_fast_verify_name(&name, uncached_names) {
+            let qname = qualified_decl_name(&name, &scope_stack);
+            if !matches_uncached_or_fast_verify_name(&qname, uncached_names) {
                 let short = name.rsplit('.').next().unwrap_or(&name);
                 if short.starts_with("_turbo_verify_") {
+                    update_scope_stack_with_idx(&mut scope_stack, span.clean_text, s_idx);
                     continue;
                 }
                 if let Some((sig_clean, proof_clean)) = split_at_top_level_assign(span.clean_text) {
@@ -3044,11 +3143,13 @@ pub fn build_coalesced_shard_source(
                         sig_clean,
                         proof_clean,
                     ));
+                    update_scope_stack_with_idx(&mut scope_stack, span.clean_text, s_idx);
                     continue;
                 }
             }
         }
         chunks.push(sanitize_stubbed_prefix_options(span.orig_text));
+        update_scope_stack_with_idx(&mut scope_stack, span.clean_text, s_idx);
     }
 
     chunks.join("\n")
@@ -3118,23 +3219,35 @@ pub(crate) fn matches_uncached_or_fast_verify_name(
     if matches_uncached_name(name, uncached_names) {
         return true;
     }
-    let short = name.rsplit('.').next().unwrap_or(name);
-    if let Some(after_prefix) = short.strip_prefix("_turbo_verify_") {
+    let qname = name.strip_prefix("_root_.").unwrap_or(name);
+    let comps = host_name_components(qname);
+    let Some(last) = comps.last() else {
+        return false;
+    };
+    if let Some(after_prefix) = last.strip_prefix("_turbo_verify_") {
         if let Some(orig_safe) = after_prefix
             .trim_start_matches(|c: char| c.is_ascii_digit())
             .strip_prefix('_')
         {
+            let ns_pre = &comps[..comps.len() - 1];
             return uncached_names.iter().any(|u| {
-                let u_short = u.rsplit('.').next().unwrap_or(u.as_str());
-                let u_comps = host_name_components(u);
-                let joined = u_comps.join(".");
-                orig_safe == sanitize_ident_for_fast_check(u)
-                    || orig_safe == sanitize_ident_for_fast_check(u_short)
-                    || orig_safe == sanitize_ident_for_fast_check(&joined)
-                    || orig_safe
-                        == sanitize_ident_for_fast_check(
-                            u_comps.last().map(String::as_str).unwrap_or(u),
-                        )
+                let (exact_root, tc) = parse_host_target(u);
+                if tc.is_empty() {
+                    return false;
+                }
+                let starts_at = |k: usize| -> bool {
+                    let req_ns = &ns_pre[k..];
+                    tc.starts_with(req_ns) && {
+                        let rem = &tc[req_ns.len()..];
+                        !rem.is_empty()
+                            && orig_safe == sanitize_ident_for_fast_check(&rem.join("."))
+                    }
+                };
+                if exact_root {
+                    starts_at(0)
+                } else {
+                    (0..=ns_pre.len()).any(starts_at)
+                }
             });
         }
     }
@@ -3342,7 +3455,7 @@ fn section_contains_uncached_theorem(
     sec_close: usize,
     uncached_names: &std::collections::HashSet<String>,
 ) -> bool {
-    find_last_matching_span_idx(&spans[sec_open..=sec_close], |n| {
+    find_last_matching_span_idx_in_range(spans, sec_open..=sec_close, |n| {
         matches_uncached_name(n, uncached_names)
     })
     .is_some()
@@ -3395,7 +3508,7 @@ pub fn build_fast_olean_shard_source_with_split(
 
     let mut max_end_line = 0usize;
     for (idx, shard) in split.shards.iter().enumerate() {
-        if matches_uncached_name(&shard.name, uncached_names) {
+        if matches_uncached_name(shard.effective_name(), uncached_names) {
             if !shard_is_acyclic_for_fast_import(&split.shards, idx) {
                 return None;
             }
@@ -3498,7 +3611,12 @@ pub fn build_fast_olean_shard_source_with_split(
             if has_inner_thm {
                 let any_uncached = inner_spans.iter().any(|sub| {
                     classify_decl_header(sub.clean_text)
-                        .map(|(_, n)| matches_uncached_name(&n, uncached_names))
+                        .map(|(_, n)| {
+                            matches_uncached_name(
+                                &qualified_decl_name(&n, &scope_stack),
+                                uncached_names,
+                            )
+                        })
                         .unwrap_or(false)
                 });
                 if any_uncached {
@@ -3541,7 +3659,8 @@ pub fn build_fast_olean_shard_source_with_split(
             if split_at_top_level_assign(span.clean_text).is_some() {
                 let cur_idx = thm_idx;
                 thm_idx += 1;
-                if matches_uncached_name(&name, uncached_names) {
+                let qname = qualified_decl_name(&name, &scope_stack);
+                if matches_uncached_name(&qname, uncached_names) {
                     let renamed = rename_decl_header_for_fast_check(
                         span.orig_text,
                         span.clean_text,
@@ -3674,7 +3793,8 @@ pub fn build_pruned_imports_shard_source(
 
         if let Some((_kind, name)) = classify_decl_header(span.clean_text) {
             if let Some((sig_clean, proof_clean)) = split_at_top_level_assign(span.clean_text) {
-                if matches_uncached_name(&name, uncached_names) {
+                let qname = qualified_decl_name(&name, &scope_stack);
+                if matches_uncached_name(&qname, uncached_names) {
                     if contains_mathlib_tactic_or_namespace(span.clean_text) {
                         return None;
                     }
@@ -3744,7 +3864,7 @@ pub fn can_use_fast_olean_import_with_split(
         return false;
     }
     for (idx, shard) in split.shards.iter().enumerate() {
-        if matches_uncached_name(&shard.name, uncached_names)
+        if matches_uncached_name(shard.effective_name(), uncached_names)
             && !shard_is_acyclic_for_fast_import(&split.shards, idx)
         {
             return false;
@@ -3776,7 +3896,7 @@ pub fn build_cross_file_coalesced_shard(
             (b.trim(), *a)
         };
         let uncached_names: std::collections::HashSet<String> =
-            uncached_shards.iter().map(|s| s.name.clone()).collect();
+            uncached_shards.iter().map(|s| s.rooted_name()).collect();
         let max_end_line = uncached_shards
             .iter()
             .map(|s| s.end_line)
@@ -3841,7 +3961,8 @@ pub fn build_cross_file_coalesced_shard(
                 if split_at_top_level_assign(span.clean_text).is_some() {
                     let cur_idx = base_idx + thm_idx;
                     thm_idx += 1;
-                    if matches_uncached_name(&name, &uncached_names) {
+                    let qname = qualified_decl_name(&name, &scope_stack);
+                    if matches_uncached_name(&qname, &uncached_names) {
                         if let Some(renamed) = rename_decl_header_for_fast_check(
                             span.orig_text,
                             span.clean_text,
@@ -4431,6 +4552,7 @@ pub fn audit_source_declarations(
     .collect();
     let (mut shadowed, mut priv_decls) = (Vec::new(), Vec::new());
 
+    let mut scope_stack = Vec::new();
     for (idx, span) in spans.iter().enumerate() {
         let mut after_attrs = span.clean_text.trim_start();
         while let Some(next) = strip_leading_attr_block(after_attrs) {
@@ -4439,9 +4561,10 @@ pub fn audit_source_declarations(
         let is_priv = after_attrs.starts_with("private ");
         if let Some((kw, name)) = classify_any_decl_header(span.clean_text) {
             let short = name.rsplit('.').next().unwrap_or(&name).to_string();
+            let qname = qualified_decl_name(&name, &scope_stack);
             let matches_filter = decl_filter
                 .filter(|d| !d.is_empty() && *d != "auto")
-                .map(|df| decl_name_matches_target(&name, df))
+                .map(|df| decl_name_matches_target(&qname, df))
                 .unwrap_or(true);
             if matches_filter && matches!(kw, "theorem" | "lemma") {
                 let sig = split_at_top_level_assign(span.clean_text)
@@ -4491,6 +4614,7 @@ pub fn audit_source_declarations(
                 priv_decls.push((idx, short));
             }
         }
+        update_scope_stack_with_idx(&mut scope_stack, span.clean_text, idx);
     }
 
     let unused_private = priv_decls

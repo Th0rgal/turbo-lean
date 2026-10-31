@@ -2596,7 +2596,11 @@ fn http_request_with_resolved_token(
     let mut reader = BufReader::new(stream);
     let mut status_line = String::with_capacity(64);
     if reader.read_line(&mut status_line)? == 0 {
-        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "EOF before HTTP response").into());
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "EOF before HTTP response",
+        )
+        .into());
     }
     let mut content_len: Option<usize> = None;
     let mut header_sha256: Option<String> = None;
@@ -2829,8 +2833,12 @@ pub fn offload_check_shards_batch_http(
         items
             .iter()
             .filter_map(|item| {
+                let clean_decl = item
+                    .decl_name
+                    .strip_prefix("_root_.")
+                    .unwrap_or(&item.decl_name);
                 let mut receipt_obj = serde_json::json!({
-                    "decl": item.decl_name,
+                    "decl": clean_decl,
                     "prefix_env_hash": item.prefix_env_hash,
                     "stmt_hash": item.stmt_hash,
                     "proof_hash": item.proof_hash,
@@ -2847,7 +2855,7 @@ pub fn offload_check_shards_batch_http(
                 let receipt = serde_json::to_vec(&receipt_obj).ok()?;
                 Some((
                     item.shard_key.clone(),
-                    item.decl_name.clone(),
+                    clean_decl.to_string(),
                     receipt,
                     dur_ms,
                 ))

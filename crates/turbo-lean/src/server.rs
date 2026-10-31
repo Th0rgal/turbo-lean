@@ -1490,15 +1490,15 @@ fn execute_check_shard_payload_deferred_with_domain(
     // `skip_cas_lock` requests included. A batch names its targets in `targets`; one that names none
     // has every declaration of its source treated as a target (so no `sorry` stub is admitted).
     let named_target = !matches!(req.decl.as_str(), "" | "__batch__" | "__coalesced_batch__");
-    let stub_targets: Vec<String> = if named_target {
-        vec![req.decl.clone()]
-    } else if !req.targets.is_empty() {
+    let stub_targets: Vec<String> = if !req.targets.is_empty() {
         req.targets.clone()
+    } else if named_target {
+        vec![req.decl.clone()]
     } else {
         crate::splitter::split_lean_source(&req.shard_source, &[])
             .shards
             .into_iter()
-            .map(|sh| sh.name)
+            .map(|sh| sh.rooted_name())
             .collect()
     };
 
@@ -1517,7 +1517,9 @@ fn execute_check_shard_payload_deferred_with_domain(
             );
         }
 
-        if source_violations.has_sorry && (named_target || !req.skip_cas_lock) {
+        if source_violations.has_sorry
+            && (named_target || !req.targets.is_empty() || !req.skip_cas_lock)
+        {
             let dep_hashes = crate::lake_build::compute_imported_olean_interface_hashes(
                 &req.shard_source,
                 Path::new("."),
@@ -1532,16 +1534,23 @@ fn execute_check_shard_payload_deferred_with_domain(
                 let s = &parsed.shards[0];
                 format!("{}\n{}", s.signature_text, s.proof_text)
             } else {
-                let req_set = std::collections::HashSet::from([req.decl.clone()]);
-                parsed
+                let req_set: std::collections::HashSet<String> =
+                    stub_targets.iter().cloned().collect();
+                let matched: Vec<String> = parsed
                     .shards
                     .iter()
-                    .find(|s| {
-                        let base = s.name.split("__turbo_check_").next().unwrap_or(&s.name);
+                    .filter(|s| {
+                        let eff = s.effective_name();
+                        let base = eff.split("__turbo_check_").next().unwrap_or(eff);
                         crate::splitter::matches_uncached_or_fast_verify_name(base, &req_set)
                     })
                     .map(|s| format!("{}\n{}", s.signature_text, s.proof_text))
-                    .unwrap_or_else(|| clean_source.clone())
+                    .collect();
+                if matched.is_empty() {
+                    clean_source.clone()
+                } else {
+                    matched.join("\n")
+                }
             };
             let clean_target = crate::splitter::strip_lean_comments(&target_body);
             let violations = crate::splitter::audit_hygiene(&clean_target);
@@ -1614,7 +1623,7 @@ fn execute_check_shard_payload_deferred_with_domain(
         Some(crate::zygote::remaining_timeout_ms(timeout_ms, t0)),
         &filtered_req_args,
     ) {
-        Ok(zreply) if zreply.import_ok => {
+        Ok(zreply) if zreply.import_ok && !zreply.crashed && !zreply.timed_out => {
             if !zreply.ok {
                 anyhow::bail!(
                     "Remote `lean` shard verification failed for `{}`:\n{}",
@@ -1632,11 +1641,18 @@ fn execute_check_shard_payload_deferred_with_domain(
             zygote_peak_rss = zreply.peak_rss_mb;
             zygote_used_constants = zreply.used_constants;
         }
+        Ok(zreply) if zreply.crashed || zreply.timed_out => {
+            anyhow::bail!(
+                "Remote `lean` shard verification failed for `{}`:\n{}",
+                req.decl,
+                zreply.errors.join("\n")
+            );
+        }
         Ok(_) if req.skip_cas_lock => {
             return Err(crate::zygote::ZygoteImportUnavailable(req.decl.clone()).into());
         }
-        Err(e) if req.skip_cas_lock => return Err(e),
-        _ => {}
+        Ok(_) => {}
+        Err(e) => return Err(e),
     }
 
     if !zygote_used {
@@ -1872,7 +1888,7 @@ fn execute_check_shards_batch_payload_deferred(
         .collect();
     let mut batch_targets: Vec<String> = batch_audit.iter().cloned().collect();
     batch_targets.sort();
-    if let Ok(zreply) = crate::zygote::eval_with_zygote_pool_for_targets(
+    match crate::zygote::eval_with_zygote_pool_for_targets(
         store,
         toolchain,
         &req.lean_path,
@@ -1883,12 +1899,18 @@ fn execute_check_shards_batch_payload_deferred(
         Some(crate::zygote::remaining_timeout_ms(timeout_ms, t0)),
         &filtered_batch_args,
     ) {
-        if zreply.import_ok {
+        Ok(zreply) if zreply.import_ok || zreply.crashed || zreply.timed_out => {
             zygote_handled = true;
-            if !zreply.ok {
+            if !zreply.ok || zreply.crashed || zreply.timed_out {
                 exit_code = 1;
                 stderr = zreply.errors.join("\n");
             }
+        }
+        Ok(_) => {}
+        Err(e) => {
+            zygote_handled = true;
+            exit_code = 1;
+            stderr = format!("{:#}", e);
         }
     }
 
@@ -1962,8 +1984,12 @@ fn execute_check_shards_batch_payload_deferred(
         if is_hit(item) {
             continue;
         }
+        let clean_decl = item
+            .decl_name
+            .strip_prefix("_root_.")
+            .unwrap_or(&item.decl_name);
         let receipt_obj = serde_json::json!({
-            "decl": item.decl_name,
+            "decl": clean_decl,
             "prefix_env_hash": item.prefix_env_hash,
             "stmt_hash": item.stmt_hash,
             "proof_hash": item.proof_hash,
@@ -1972,7 +1998,7 @@ fn execute_check_shards_batch_payload_deferred(
         let receipt = option_bound_receipt(receipt_obj, batch_args_digest_opt.as_deref())?;
         publish_items.push((
             bound_key(&item.shard_key),
-            item.decl_name.clone(),
+            clean_decl.to_string(),
             receipt,
             per_shard_ms,
         ));

@@ -333,25 +333,45 @@ def hostNameComponents (s : String) : List String := Id.run do
 def userNameComponents (n : Name) : List String :=
   (privateToUserName n).components.map (·.toString (escape := false))
 
+/-- Parse a host target/stub string into `(exactRoot, components)`. `_root_.<qname>` anchors at root. -/
+def parseHostTarget (s : String) : Bool × List String :=
+  if s.startsWith "_root_." then (true, hostNameComponents (s.drop 7).toString)
+  else (false, hostNameComponents s)
+
+def fastVerifyMatchesTarget (comps : List String) (exactRoot : Bool) (tc : List String) : Bool :=
+  let sanitize (x : String) : String :=
+    String.ofList (x.toList.filterMap fun c =>
+      if c == '«' || c == '»' then none
+      else some (if c.isAlphanum && c.val < 128 || c == '_' then c else '_'))
+  let last := comps.getLast?.getD ""
+  if last.startsWith "_turbo_verify_" then
+    let suffix := (last.drop 14).dropWhile Char.isDigit |>.toString
+    let nsPre := comps.dropLast
+    let startsAt (k : Nat) : Bool :=
+      let reqNs := nsPre.drop k
+      reqNs.isPrefixOf tc &&
+        let rem := tc.drop reqNs.length
+        !rem.isEmpty && suffix == "_" ++ sanitize (String.intercalate "." rem)
+    if exactRoot then startsAt 0 else (List.range (nsPre.length + 1)).any startsAt
+  else false
+
 /-- Whether new declaration `n` belongs to one of the host-named check `targets`: the target itself,
-    its auxiliary declarations (`t.proof_1`, `t.match_1`), a `private` copy, or any fast-olean rename
-    `_turbo_verify_<i>_<sanitized t>` (the host generates those only for targets). Matching is by
-    name-component suffix in either direction, so an ambiguous name only makes the gate stricter. -/
+    its auxiliary declarations (`t.proof_1`, `t.match_1`), a `private` copy, or its fast-olean rename. -/
 def ownedByTarget (targets : List String) (n : Name) : Bool :=
   let comps := userNameComponents n
-  comps.any (·.startsWith "_turbo_verify_") || targets.any fun t =>
-    let tc := hostNameComponents t
-    (List.range comps.length).any fun i =>
-      let pre := comps.take (i + 1)
-      tc.isSuffixOf pre || pre.isSuffixOf tc
+  targets.any fun t =>
+    let (exactRoot, tc) := parseHostTarget t
+    !tc.isEmpty && (fastVerifyMatchesTarget comps exactRoot tc ||
+      (List.range comps.length).any fun i =>
+        let pre := comps.take (i + 1)
+        if exactRoot then pre == tc else tc.isSuffixOf pre)
 
-/-- Whether `n` is one of the host's prefix `stubs` (the declarations it replaced by `:= sorry`), up to
-    namespace qualification. -/
+/-- Whether `n` is one of the host's prefix `stubs` (the declarations it replaced by `:= sorry`). -/
 def isHostStub (stubs : List String) (n : Name) : Bool :=
   let comps := userNameComponents n
   stubs.any fun s =>
-    let sc := hostNameComponents s
-    sc.isSuffixOf comps || comps.isSuffixOf sc
+    let (exactRoot, sc) := parseHostTarget s
+    !sc.isEmpty && (if exactRoot then sc == comps else sc.isSuffixOf comps)
 
 /-- Per-declaration `sorryAx` exemption for stubbed elaboration (`allowStub`), never by source text: only a
     `sorry` stub theorem by kernel value is exempt (and its value opaque to the transitive audit). In a final
@@ -363,22 +383,13 @@ def stubSorryExemption (afterEnv : Environment) (allowStub finalRun : Bool)
   fun n => allowStub && isSorryStubDecl afterEnv n &&
     (!finalRun || (isHostStub stubs n && !ownedByTarget targets n))
 
-/-- Whether `env` declares host name `t` (up to namespace qualification), or its fast-olean rename
-    `_turbo_verify_<i>_<sanitized t>`. -/
+/-- Whether `env` declares host name `t` or its fast-olean rename `_turbo_verify_<i>_<sanitized t>`. -/
 def declaresHostName (env : Environment) (t : String) : Bool :=
-  let tc := hostNameComponents t
-  let sanitize (x : String) : String :=
-    String.ofList (x.toList.filterMap fun c =>
-      if c == '«' || c == '»' then none
-      else some (if c.isAlphanum && c.val < 128 || c == '_' then c else '_'))
-  let renamed := ["_" ++ sanitize (String.intercalate "." tc), "_" ++ sanitize (tc.getLast?.getD t)]
-  env.constants.map₂.foldl (fun acc n _ => acc ||
+  let (exactRoot, tc) := parseHostTarget t
+  !tc.isEmpty && env.constants.map₂.foldl (fun acc n _ => acc ||
     let comps := userNameComponents n
-    tc.isSuffixOf comps || comps.isSuffixOf tc ||
-      (comps.getLast?.getD "").startsWith "_turbo_verify_" &&
-        renamed.any (fun r =>
-          let last := comps.getLast?.getD ""
-          (last.drop 14).dropWhile Char.isDigit |>.toString == r)) false
+    (if exactRoot then comps == tc else tc.isSuffixOf comps) ||
+      fastVerifyMatchesTarget comps exactRoot tc) false
 
 /-- Whether the stubbed prefix checkpoint `prefixEnv` holds a `sorry` stub theorem that this final run
     does not exempt (a checkpoint is shared by requests with other stubs and targets). -/
@@ -1123,14 +1134,16 @@ def collectStubDecls (consts : Array ConstantInfo) (stubOk : Array String) :
     Std.HashSet Name × List String := Id.run do
   let mut out : Std.HashSet Name := {}
   let mut violations : List String := []
-  let mut normCounts : Std.HashMap (List String) (Nat × String) := {}
+  let mut normCounts : Std.HashMap (Bool × List String) (Nat × String) := {}
   for e in stubOk do
-    let ec := hostNameComponents e
-    let (k, repr) := normCounts[ec]?.getD (0, e)
-    normCounts := normCounts.insert ec (k + 1, repr)
-  for (ec, (k, repr)) in normCounts.toArray do
+    let key := parseHostTarget e
+    let (k, repr) := normCounts[key]?.getD (0, e)
+    normCounts := normCounts.insert key (k + 1, repr)
+  for ((exactRoot, ec), (k, repr)) in normCounts.toArray do
     let hits := consts.filter fun c =>
-      c.isTheorem && ec.isSuffixOf (userNameComponents c.name)
+      c.isTheorem &&
+        let comps := userNameComponents c.name
+        if exactRoot then comps == ec else ec.isSuffixOf comps
     if hits.size ≤ k then
       out := (hits.filter isExplicitSorryStub).foldl (·.insert ·.name) out
     else

@@ -2490,9 +2490,12 @@ pub(crate) fn run_audited_lean_shard_at(
     if allow_prefix_stubs {
         for sh in crate::splitter::split_lean_source(source, &[]).shards {
             if crate::splitter::strip_lean_comments(&sh.proof_text).trim() == "sorry"
-                && !crate::splitter::matches_uncached_or_fast_verify_name(&sh.name, audit)
+                && !crate::splitter::matches_uncached_or_fast_verify_name(
+                    sh.effective_name(),
+                    audit,
+                )
             {
-                auditor.arg(format!("--stub-ok={}", sh.name));
+                auditor.arg(format!("--stub-ok={}", sh.rooted_name()));
             }
         }
     }
@@ -2746,10 +2749,11 @@ fn stub_mode_flag(allow_stub: bool, stub_targets: &[String], shard_source: &str)
                 .filter(|sh| {
                     crate::splitter::strip_lean_comments(&sh.proof_text).trim() == "sorry"
                         && !crate::splitter::matches_uncached_or_fast_verify_name(
-                            &sh.name, &targets,
+                            sh.effective_name(),
+                            &targets,
                         )
                 })
-                .map(|sh| sh.name)
+                .map(|sh| sh.rooted_name())
                 .collect();
             format!(
                 "allow_stub:{}:{}",
@@ -2771,9 +2775,9 @@ fn block_stub_mode(stub_mode: &str, stub_targets: &[String], blk: &str) -> Strin
         .iter()
         .filter(|t| {
             let one = std::collections::HashSet::from([(*t).clone()]);
-            shards
-                .iter()
-                .any(|sh| crate::splitter::matches_uncached_or_fast_verify_name(&sh.name, &one))
+            shards.iter().any(|sh| {
+                crate::splitter::matches_uncached_or_fast_verify_name(sh.effective_name(), &one)
+            })
         })
         .map(String::as_str)
         .collect();
@@ -2817,6 +2821,7 @@ pub fn eval_with_zygote_pool_for_targets(
 
 /// Check `shard_source` with no `sorry` stub exempt anywhere, prefix checkpoints included (`strict_all`):
 /// the kernel-gate audit of a whole file.
+#[allow(clippy::too_many_arguments)]
 pub fn eval_with_zygote_pool_audit_all(
     store: &TurboStore,
     toolchain: &str,
@@ -2824,6 +2829,7 @@ pub fn eval_with_zygote_pool_audit_all(
     env_vars: &std::collections::HashMap<String, String>,
     lean_bin: &Path,
     shard_source: &str,
+    timeout_ms: Option<u64>,
     lean_args: &[String],
 ) -> Result<ZygoteEvalReply> {
     eval_with_zygote_pool_inner(
@@ -2836,7 +2842,7 @@ pub fn eval_with_zygote_pool_audit_all(
         false,
         false,
         None,
-        None,
+        timeout_ms,
         None,
         lean_args,
         &[],
@@ -3941,10 +3947,16 @@ pub fn eval_shard_via_zygote(
             sub_decl_source.trim_start()
         )
     };
-    let sub_targets: Vec<String> = crate::splitter::split_lean_source(sub_decl_source, &[])
+    let ns_prefix = crate::splitter::open_namespace_prefix(prefix_source);
+    let scoped_sub = if ns_prefix.is_empty() {
+        std::borrow::Cow::Borrowed(sub_decl_source)
+    } else {
+        std::borrow::Cow::Owned(format!("{}{}", ns_prefix, sub_decl_source))
+    };
+    let sub_targets: Vec<String> = crate::splitter::split_lean_source(&scoped_sub, &[])
         .shards
         .into_iter()
-        .map(|s| s.name)
+        .map(|s| s.rooted_name())
         .collect();
     if sub_targets.is_empty() {
         return eval_with_zygote_pool_with_args(
@@ -3986,11 +3998,18 @@ fn encode_multi_decl_zygote_req(
     let (imports_csv, prefix_body) = split_shard_for_zygote(prefix_source);
     let prefix_key = blake3::hash(prefix_body.as_bytes()).to_hex().to_string();
     let hex_prefix = hex_encode_bytes(prefix_body.as_bytes());
+    let ns_prefix = crate::splitter::open_namespace_prefix(prefix_source);
     let mut targets: Vec<String> = Vec::new();
     for s in decl_sources {
-        for sh in crate::splitter::split_lean_source(s, &[]).shards {
-            if !targets.contains(&sh.name) {
-                targets.push(sh.name);
+        let scoped = if ns_prefix.is_empty() {
+            std::borrow::Cow::Borrowed(s.as_str())
+        } else {
+            std::borrow::Cow::Owned(format!("{}{}", ns_prefix, s))
+        };
+        for sh in crate::splitter::split_lean_source(&scoped, &[]).shards {
+            let rooted = sh.rooted_name();
+            if !targets.contains(&rooted) {
+                targets.push(rooted);
             }
         }
     }
@@ -4000,9 +4019,12 @@ fn encode_multi_decl_zygote_req(
         .into_iter()
         .filter(|sh| {
             crate::splitter::strip_lean_comments(&sh.proof_text).trim() == "sorry"
-                && !crate::splitter::matches_uncached_or_fast_verify_name(&sh.name, &target_set)
+                && !crate::splitter::matches_uncached_or_fast_verify_name(
+                    sh.effective_name(),
+                    &target_set,
+                )
         })
-        .map(|sh| sh.name)
+        .map(|sh| sh.rooted_name())
         .collect();
     let mode_with_stubs = if stubs.is_empty() && targets.is_empty() {
         mode.to_string()
@@ -5049,18 +5071,26 @@ mod tests {
             "an audited theorem is never a stub",
             "disallowed axiom `sorryAx`",
         );
+        // Cross-namespace `Evil.s1` no longer collides with root-anchored `_root_.N.s1` / `_root_.s1`
+        // stubs and is rejected directly as an unexempt `sorryAx`; a macro-injected second `N.s1`
+        // inside the same namespace is rejected as an ambiguous `_root_.N.s1` stub.
         reject(
             format!(
                 "import Lean\n{}theorem Evil.s1 : False := by\n  run_tac do\n    let g ← Lean.Elab.Tactic.getMainGoal\n    g.assign (← Lean.Meta.mkSorry (← g.getType) false)\ntheorem tgt : False := Evil.s1\n",
                 stubs
             ),
-            "a second explicit sorry matching a stub name is ambiguous",
-            "prefix stub `s1` is ambiguous",
+            "cross-namespace sorry is not exempted by N.s1 stub",
+            "declaration `Evil.s1`",
         );
         reject(
             "import Lean\nmacro_rules | `(term| sorry) => `(term| trivial)\ntheorem s1 : True := sorry\ntheorem Evil.s1 : False := by\n  run_tac do\n    let g ← Lean.Elab.Tactic.getMainGoal\n    g.assign (← Lean.Meta.mkSorry (← g.getType) false)\ntheorem tgt : False := Evil.s1\n".into(),
-            "a stub turned into a proof cannot lend its name to an injected sorry",
-            "prefix stub `s1` is ambiguous",
+            "a root stub turned into a proof cannot lend its name to an injected sorry",
+            "declaration `Evil.s1`",
+        );
+        reject(
+            "import Lean\nnamespace N\nmacro_rules | `(term| sorry) => `(term| trivial)\ntheorem s1 : True := sorry\nend N\nopen Lean in\n#eval show Elab.Command.CommandElabM Unit from Elab.Command.liftCoreM do\n  let pn := mkPrivateNameCore `Other `N.s1\n  addDecl <| .thmDecl { name := pn, levelParams := [], type := mkConst ``False, value := mkApp2 (mkConst ``sorryAx [0]) (mkConst ``False) (mkConst ``false) }\n  addDecl <| .thmDecl { name := `tgt, levelParams := [], type := mkConst ``False, value := mkConst pn }\n".into(),
+            "an addDecl-injected private theorem with the same user name is ambiguous",
+            "prefix stub `_root_.N.s1` is ambiguous",
         );
         reject(
             "theorem other : 1 = 1 := rfl\n".into(),

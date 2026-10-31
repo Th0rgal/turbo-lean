@@ -2288,7 +2288,7 @@ fn scrub_sensitive_env_cmd(cmd: &mut Command) {
 fn to_batch_req_item((k, sh): &(String, splitter::TheoremShard)) -> pack::CheckShardBatchItem {
     pack::CheckShardBatchItem {
         shard_key: k.clone(),
-        decl_name: sh.name.clone(),
+        decl_name: sh.rooted_name(),
         prefix_env_hash: sh.prefix_env_hash.clone(),
         stmt_hash: sh.stmt_hash.clone(),
         proof_hash: sh.proof_hash.clone(),
@@ -4206,7 +4206,7 @@ pub fn run_pr_verify_command(
                 }
                 let uncached_names: std::collections::HashSet<String> = file_uncached
                     .iter()
-                    .map(|(_, sh)| sh.name.clone())
+                    .map(|(_, sh)| sh.rooted_name())
                     .collect();
                 if let Some(mod_imp) = resolve_prebuilt_module_import(&canon_dir, &abs_file) {
                     let fast_ok = if let Some(sp) = current_splits.get(rel_path) {
@@ -4270,7 +4270,7 @@ pub fn run_pr_verify_command(
                     cross_args.clone(),
                     uncached_by_file
                         .iter()
-                        .flat_map(|(_, fu, _)| fu.iter().map(|(_, sh)| sh.name.clone()))
+                        .flat_map(|(_, fu, _)| fu.iter().map(|(_, sh)| sh.rooted_name()))
                         .collect(),
                 );
                 let cross_res = if let Some(ref z_url) = fast_local_zygote_url {
@@ -4330,7 +4330,7 @@ pub fn run_pr_verify_command(
                         };
                         let cross_names: std::collections::HashSet<String> = uncached_by_file
                             .iter()
-                            .flat_map(|(_, fu, _)| fu.iter().map(|(_, sh)| sh.name.clone()))
+                            .flat_map(|(_, fu, _)| fu.iter().map(|(_, sh)| sh.rooted_name()))
                             .collect();
                         cross_ok = run_lean_temp_file(
                             store,
@@ -4375,7 +4375,7 @@ pub fn run_pr_verify_command(
                     let file_lean_args = resolve_file_args(&canon_lf);
                     let uncached_names: std::collections::HashSet<String> = file_uncached
                         .iter()
-                        .map(|(_, sh)| sh.name.clone())
+                        .map(|(_, sh)| sh.rooted_name())
                         .collect();
                     let req_items: Vec<pack::CheckShardBatchItem> =
                         file_uncached.iter().map(to_batch_req_item).collect();
@@ -4495,7 +4495,7 @@ pub fn run_pr_verify_command(
                     };
                     let uncached_names: std::collections::HashSet<String> = file_uncached
                         .iter()
-                        .map(|(_, sh)| sh.name.clone())
+                        .map(|(_, sh)| sh.rooted_name())
                         .collect();
                     let f_t0 = Instant::now();
 
@@ -4681,10 +4681,10 @@ pub fn run_pr_verify_command(
                     if !verified_ok && file_uncached.len() > 1 {
                         let coal_src =
                             splitter::build_coalesced_shard_source(&src, &uncached_names);
-                        if let Ok(true) = try_zygote_or_cli_batch(
+                        if try_zygote_or_cli_batch(
                             &coal_src,
                             format!("pr_verify_coal_{}_{}", pid, f_idx),
-                        ) {
+                        )? {
                             verified_ok = true;
                         }
                     }
@@ -4702,19 +4702,20 @@ pub fn run_pr_verify_command(
                         let now = crate::db::now_unix();
                         for (k, sh) in file_uncached.iter() {
                             let s_t0 = Instant::now();
+                            let rooted_target = sh.rooted_name();
                             let single_src: std::borrow::Cow<'_, str> =
                                 if sh.shard_source.is_empty() {
-                                    let reconstructed =
-                                        splitter::reconstruct_single_shard_source(&src, &sh.name)
-                                            .unwrap_or_else(|| {
-                                                let mut single_set =
-                                                    std::collections::HashSet::with_capacity(1);
-                                                single_set.insert(sh.name.clone());
-                                                splitter::build_coalesced_shard_source(
-                                                    &src,
-                                                    &single_set,
-                                                )
-                                            });
+                                    let reconstructed = splitter::reconstruct_single_shard_source(
+                                        &src,
+                                        &rooted_target,
+                                    )
+                                    .unwrap_or_else(|| {
+                                        let single_set =
+                                            std::collections::HashSet::from(
+                                                [rooted_target.clone()],
+                                            );
+                                        splitter::build_coalesced_shard_source(&src, &single_set)
+                                    });
                                     std::borrow::Cow::Owned(reconstructed)
                                 } else {
                                     std::borrow::Cow::Borrowed(sh.shard_source.as_str())
@@ -4734,7 +4735,7 @@ pub fn run_pr_verify_command(
                                     skip_cas_lock: true,
                                     allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
                                     lean_args: file_lean_args.clone(),
-                                    targets: vec![sh.name.clone()],
+                                    targets: vec![rooted_target.clone()],
                                 };
                                 let single_res =
                                     pack::try_zygote_url_check_shard_inner_with_inflight_detailed(
@@ -4798,7 +4799,7 @@ pub fn run_pr_verify_command(
                                     &canon_dir,
                                     &env_vars,
                                     &verification_trust,
-                                    &std::iter::once(sh.name.clone()).collect(),
+                                    &std::collections::HashSet::from([rooted_target]),
                                     &file_lean_args,
                                 )?;
                                 if !out.status.success() {

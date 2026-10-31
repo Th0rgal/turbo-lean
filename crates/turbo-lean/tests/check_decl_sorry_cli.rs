@@ -112,6 +112,19 @@ impl Project {
              end Other\n",
         )
         .unwrap();
+        // Same short name across root and sibling namespaces: prefix stubs must not collide across
+        // scopes, `_root_.same` anchors to root, and bare `same` is rejected as ambiguous.
+        fs::write(
+            root.join("R.lean"),
+            "theorem same : 1 + 1 = 2 := rfl\n\
+             namespace A\n\
+             theorem same : 2 + 2 = 4 := rfl\n\
+             end A\n\
+             namespace B\n\
+             theorem same : False := sorry\n\
+             end B\n",
+        )
+        .unwrap();
         Self(root)
     }
 
@@ -241,9 +254,36 @@ fn check_decl_rejects_sorry_target_and_keeps_prefix_stubs() {
         }
         assert_rejected(&p, "Q.lean", "«bad.thm»", daemon);
         assert_rejected(&p, "Q.lean", "Ns.«bad.thm»", daemon);
+        let other_ok = p.check("Q.lean", "Other.«bad.thm»", daemon);
+        assert!(
+            other_ok.status.success()
+                && matches!(
+                    status(&other_ok).as_str(),
+                    "theorem_verified" | "theorem_cache_hit"
+                ),
+            "Q.lean --decl Other.«bad.thm» (daemon={daemon}) must verify cleanly:\n{}{}",
+            String::from_utf8_lossy(&other_ok.stdout),
+            String::from_utf8_lossy(&other_ok.stderr)
+        );
+        for rgood in ["_root_.same", "A.same", "_root_.A.same"] {
+            let ok = p.check("R.lean", rgood, daemon);
+            assert!(
+                ok.status.success()
+                    && matches!(
+                        status(&ok).as_str(),
+                        "theorem_verified" | "theorem_cache_hit"
+                    ),
+                "R.lean --decl {rgood} (daemon={daemon}) must verify:\n{}{}",
+                String::from_utf8_lossy(&ok.stdout),
+                String::from_utf8_lossy(&ok.stderr)
+            );
+        }
+        assert_rejected(&p, "R.lean", "same", daemon);
+        assert_rejected(&p, "R.lean", "B.same", daemon);
+        assert_rejected(&p, "R.lean", "_root_.B.same", daemon);
         for target in [
             "H.lean", "I.lean", "L.lean", "M.lean", "K.lean", "J.lean", "N.lean", "Q.lean",
-            "F.lean", "G.lean", ".",
+            "R.lean", "F.lean", "G.lean", ".",
         ] {
             let out = p.run(&["check", target], daemon);
             assert!(
