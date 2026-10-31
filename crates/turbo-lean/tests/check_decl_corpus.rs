@@ -197,7 +197,10 @@ fn check_decl_disambiguates_namespaces_and_checks_only_the_selected_proof() {
                     "{json}"
                 );
             } else {
-                assert!(diagnostic.contains("type mismatch"), "{diagnostic}");
+                assert!(
+                    diagnostic.to_lowercase().contains("type mismatch"),
+                    "{diagnostic}"
+                );
             }
         }
     }
