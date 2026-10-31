@@ -559,9 +559,12 @@ done
     }
     assert!(replaced > 0, "seed did not cache a worker");
     for decl in [false, true] {
-        fs::write(f.root.join("Fallback.lean"), "import Lean\nset_option maxRecDepth 10000000\nset_option maxHeartbeats 0\ntheorem fallback_slow : (List.range 1000000).length = 1000000 := by decide\n").unwrap();
+        // Allow environment discovery and declaration identity elaboration to
+        // reach the injected worker, then deterministically outlast the budget
+        // inside the stock Lean fallback rather than relying on proof speed.
+        fs::write(f.root.join("Fallback.lean"), "import Lean\ntheorem fallback_slow : True := by\n  run_tac do IO.sleep 30000\n  trivial\n").unwrap();
         let mut cmd = f.check("Fallback.lean");
-        cmd.args(["--timeout", "1", "--no-daemon"]);
+        cmd.args(["--timeout", "5", "--no-daemon"]);
         if decl {
             cmd.args(["--decl", "fallback_slow"]);
         }
@@ -573,12 +576,12 @@ done
             "{text}"
         );
         assert!(
-            start.elapsed() < Duration::from_secs(10),
+            start.elapsed() < Duration::from_secs(15),
             "fallback exceeded bound: {text}"
         );
         f.wait_for(Duration::from_secs(3), || f.pids().is_empty());
         evidence(format!(
-            "import-unavailable fallback --timeout 1 (decl={decl}): {:?}, 0 Lean PIDs",
+            "import-unavailable fallback --timeout 5 (decl={decl}): {:?}, 0 Lean PIDs",
             start.elapsed()
         ));
     }
