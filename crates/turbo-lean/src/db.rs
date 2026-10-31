@@ -3879,7 +3879,11 @@ mod tests {
         let locks = dir.join("locks");
         fs::create_dir_all(&locks)?;
         let held = locks.join("live.lock");
-        let f = OpenOptions::new().create(true).write(true).open(&held)?;
+        let f = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&held)?;
         assert_eq!(
             unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&f), libc::LOCK_EX) },
             0
