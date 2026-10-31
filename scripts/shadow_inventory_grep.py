@@ -109,7 +109,9 @@ def main() -> int:
     namespaces = INV["namespaces"]
     found = {}
     for root in INV["source_roots"]:
-        for path in sorted((LEAN / root).rglob("*.lean")):
+        root_file = LEAN / f"{root}.lean"
+        paths = ([root_file] if root_file.is_file() else []) + sorted((LEAN / root).rglob("*.lean"))
+        for path in paths:
             mod = module_of(path)
             for full, line in scan(path):
                 in_ns = any(full == ns or full.startswith(ns + ".") for ns in namespaces)

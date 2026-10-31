@@ -1,10 +1,12 @@
 # Shadow-semantics checker (Track B0)
 
 `scripts/check_shadow_semantics.lean` reports every violation identity
-`(target declaration, forbidden evaluator, kind)` with `kind ∈ {call≤3, call∞, clone}`, where the
-targets are the declarations of the pinned modules and namespaces in
-`scripts/shadow_inventory.json`, and the forbidden set is `LeanNative.Semantics.eval*` together with
-all of their auxiliaries.
+`(target declaration, forbidden constant, kind)` with
+`kind ∈ {call≤3, call∞, clone, shadow-origin}`, where the targets are the declarations of the
+pinned modules and namespaces in `scripts/shadow_inventory.json` (plus any declaration inside
+`lean/LeanNative/Proofs/` opening a banned local shadow namespace), and the forbidden set is
+`LeanNative.Semantics.eval*` together with all of their auxiliaries (plus banned shadow namespace
+origins for `shadow-origin`).
 
 - **call≤3 / call∞**: a forbidden constant is reachable from the target in the dependency graph.
   The graph includes types, values, `.proj`, constructors, recursor rules, matcher, equation,
@@ -13,6 +15,18 @@ all of their auxiliaries.
   canonical body equal to a forbidden evaluator's. Detection covers verbatim and alpha-equivalent
   copies only. Copies that differ by eta-expansion, `let` changes or reordered match arms are out of
   scope.
+- **shadow-origin**: a declaration under a pinned shadow namespace (`ConLeche`, `LCNF`, `LeanMLIR`,
+  `LNSym`) is defined outside its pinned grandfather module (`TurboLean.ConLeche`,
+  `LeanNative.IR.LCNF`, `LeanNative.Backend.Semantics`), or a declaration inside
+  `LeanNative.Proofs.*` opens a local `ConLeche` / `LCNF` / `LeanMLIR` / `LNSym` shadow/stub
+  namespace anywhere in its name (catching self-contained toy stubs such as `d.ty = d.val` or
+  size-only `decls := []` parsers even when they reference zero `eval*` constants).
+
+Standalone `<root>.lean` files excluded by Lake globs (such as `lean/TurboLean.lean` under a
+`.submodules` glob) are compiled into a scratch `.olean` directory in topological import order so
+no source file under `source_roots` is skipped. Conflicting `main` definitions across executables
+and standalone tools are partitioned via `.olean` header `constNames` and transitive import cones,
+with each environment analyzed in an isolated worker subprocess.
 
 Run it from `lean/`:
 
@@ -21,8 +35,10 @@ lake build ShadowFixtures
 LEAN_NUM_THREADS=4 lake env lean --run ../scripts/check_shadow_semantics.lean --self-test --base <BASE_SHA>
 ```
 
-The `--self-test` flag runs the fixtures in `lean/ShadowFixtures/`. It also runs the ratchet cases,
-which call the real `checkRatchet` against a temporary git repository.
+The `--self-test` flag runs the fixtures in `lean/ShadowFixtures/` (direct calls, clones, BitVec-only
+clean declarations, traversal classes, local shadow-namespace stubs, standalone scratch compilation
+and `main`-cone partitioning). It also runs the ratchet cases, which call the real `checkRatchet`
+against a temporary git repository.
 
 ## Ratchet
 
@@ -32,7 +48,8 @@ The violation identities are compared with `scripts/shadow_allowlist.json`:
   added.
 - The working-tree allowlist must equal the current violation set: no violation may be missing and
   no entry may be stale.
-- The inventory must not drop any module, namespace or source root that exists at the base.
+- The inventory must not drop any module, namespace, source root, proof prefix, or
+  `namespace_owners` restriction that exists at the base (nor widen `namespace_owners`).
 
 Bootstrap applies only when the base commit has neither the checker nor an allowlist. In that case
 the base allowlist is taken to be the current violation set. Because of the equality rule, the

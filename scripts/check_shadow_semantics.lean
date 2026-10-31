@@ -5,10 +5,12 @@
     lake env lean --run ../scripts/check_shadow_semantics.lean [--base REV] [--json-out PATH]
         [--coverage-out PATH] [--self-test] [--bootstrap]
 
-  The checker imports every built module under the inventory `source_roots`, collects every
-  constant that belongs to a pinned target module or namespace (`scripts/shadow_inventory.json`),
-  and reports each violation identity `(target declaration, forbidden constant, kind)` with
-  `kind ∈ {call≤3, call∞, clone}`:
+  The checker imports every built module under the inventory `source_roots` (compiling any
+  standalone `<root>.lean` file excluded by Lake globs into a scratch `.olean`), collects every
+  constant that belongs to a pinned target module or namespace (`scripts/shadow_inventory.json`)
+  or opens a banned local shadow namespace inside `lean/LeanNative/Proofs/`, and reports each
+  violation identity `(target declaration, forbidden constant, kind)` with
+  `kind ∈ {call≤3, call∞, clone, shadow-origin}`:
 
   * `call≤3` / `call∞`: the forbidden constant is reachable from the target in the dependency
     graph whose edges are the constants of each declaration's type, value, `.proj` nodes (structure
@@ -25,6 +27,13 @@
     self references by a placeholder, erase mdata / binder names / binder infos. Scope:
     verbatim / alpha-equivalent copies only; eta-, let- and arm-reordering evasions are out of
     scope (documented in the PR).
+  * `shadow-origin`: any declaration under a pinned shadow namespace (`ConLeche`, `LCNF`,
+    `LeanMLIR`, `LNSym`) defined outside its pinned grandfather module (`TurboLean.ConLeche`,
+    `LeanNative.IR.LCNF`, `LeanNative.Backend.Semantics`), OR any declaration inside
+    `LeanNative.Proofs.*` that defines a local shadow/stub namespace (`ConLeche`, `LCNF`,
+    `LeanMLIR`, `LNSym`) anywhere in its name (even if it never mentions `LeanNative.Semantics.eval*`,
+    such as a toy `CICValid` equality stub or an empty-list `parseOleanShard`). Existing stand-in
+    declarations live in the pinned grandfather modules and are subject to the remove-only ratchet.
 
   Forbidden set: every constant `LeanNative.Semantics.eval*` and all its auxiliaries
   (`LeanNative.Semantics.eval*.*`), private or not.
@@ -52,6 +61,12 @@ namespace ShadowCheck
 def minModules : List Name :=
   [`LeanNative.Backend.Semantics, `LeanNative.IR.LCNF, `TurboLean.ConLeche]
 def minNamespaces : List Name := [`LeanMLIR, `LNSym, `ConLeche, `LCNF]
+def minNamespaceOwners : List (Name × List Name) :=
+  [(`LeanMLIR, [`LeanNative.Backend.Semantics]),
+   (`LNSym, [`LeanNative.Backend.Semantics]),
+   (`ConLeche, [`TurboLean.ConLeche]),
+   (`LCNF, [`LeanNative.IR.LCNF])]
+def minProofPrefixes : List Name := [`LeanNative.Proofs]
 def forbiddenNs : Name := `LeanNative.Semantics
 def forbiddenPrefix : String := "eval"
 def requiredForbidden : List Name :=
@@ -68,10 +83,15 @@ def fixtureNamespaces : List Name :=
   [`ShadowFixtureDirect, `ShadowFixtureClone, `ShadowFixtureBitVec, `ShadowFixtureAllowlisted,
    `ShadowFixtureHelperClone, `ShadowFixtureTraversal]
 
+def fixtureProofPrefix : Name := `ShadowFixtureOrigin
+
 structure Inventory where
   modules : List Name
   namespaces : List Name
   sourceRoots : List String
+  namespaceOwners : List (Name × List Name) := minNamespaceOwners
+  proofPrefixes : List Name := minProofPrefixes
+  bannedShadowNames : List Name := minNamespaces
   deriving Inhabited
 
 structure Violation where
@@ -109,7 +129,23 @@ def parseInventory (s : String) : Except String Inventory := do
   let mods ← jsonStrList j "modules"
   let nss ← jsonStrList j "namespaces"
   let roots ← jsonStrList j "source_roots"
-  return { modules := mods.map strName, namespaces := nss.map strName, sourceRoots := roots }
+  let owners ← match j.getObjValD "namespace_owners" with
+    | .null => pure minNamespaceOwners
+    | oj => do
+      let obj ← oj.getObj?
+      obj.toList.mapM fun (k, v) => do
+        let arr ← v.getArr?
+        let ms ← arr.toList.mapM (·.getStr?)
+        pure (strName k, ms.map strName)
+  let pfx ← match j.getObjValD "proof_module_prefixes" with
+    | .null => pure minProofPrefixes
+    | pj => do
+      let arr ← pj.getArr?
+      let ps ← arr.toList.mapM (·.getStr?)
+      pure (ps.map strName)
+  return { modules := mods.map strName, namespaces := nss.map strName, sourceRoots := roots,
+           namespaceOwners := owners, proofPrefixes := pfx,
+           bannedShadowNames := minNamespaces ++ (nss.map strName).filter (!minNamespaces.contains ·) }
 
 def parseAllowlist (s : String) : Except String (List AllowEntry) := do
   let j ← Json.parse s
@@ -150,21 +186,29 @@ def forbiddenOwner (n : Name) : Name :=
     | .anonymous => .anonymous
   go (userName n)
 
-/-- Is `n` an implementation detail of some declaration (matcher, equation lemma, `_unsafe_rec`, …)? -/
+/-- Is `n` an implementation detail of some declaration (matcher, splitter, equation lemma, `_unsafe_rec`, …)? -/
 def isAuxName (n : Name) : Bool :=
   let u := userName n
   u.isInternalDetail ||
     (match u with
-     | .str _ s => s == "eq_def" || s.startsWith "eq_" || s == "_unsafe_rec" || s.startsWith "match_"
+     | .str (.str _ pm) "splitter" => pm.startsWith "match_"
+     | .str _ s =>
+       s == "eq_def" || s.startsWith "eq_" || s == "_unsafe_rec" ||
+       s.startsWith "match_" || s == "congr_simp"
      | _ => false)
 
-/-- The user-facing declaration that owns an auxiliary (`LCNF.evalLetValue.match_3 ↦ LCNF.evalLetValue`). -/
+/-- The user-facing declaration that owns an auxiliary (`LCNF.evalLetValue.match_3 ↦ LCNF.evalLetValue`),
+    resolving `_private.<Mod>.0.<Decl>.match_k` back to public `<Decl>` when `<Decl>` is in `env`. -/
 partial def ownerDecl (env : Environment) (n : Name) : Name :=
-  if !isAuxName n then n
+  let resolve (c : Name) : Name :=
+    if env.contains c then c else if env.contains (userName c) then userName c else c
+  if !isAuxName n then resolve n
   else match n with
     | .str p _ | .num p _ =>
-      if p.isAnonymous then n
-      else if env.contains p && !isAuxName p then p else ownerDecl env p
+      if p.isAnonymous then resolve n
+      else
+        let rp := resolve p
+        if env.contains rp && !isAuxName rp then rp else ownerDecl env p
     | .anonymous => n
 
 /-- Auxiliary constants attached to `c` that must be traversed with `c` (cost 0). -/
@@ -349,6 +393,39 @@ def discoverModules (leanDir : System.FilePath) (roots : List String) : IO (Arra
 def inNamespace (nss : List Name) (n : Name) : Bool :=
   nss.any (·.isPrefixOf (userName n))
 
+/-- Namespace prefix of a user-facing constant (`A.B.foo ↦ A.B`, `foo ↦ anonymous`). -/
+def nameParent : Name → Name
+  | .str p _ | .num p _ => p
+  | .anonymous => .anonymous
+
+/-- String segments of a `Name`. -/
+def nameSegments : Name → List String
+  | .str p s => nameSegments p ++ [s]
+  | .num p k => nameSegments p ++ [toString k]
+  | .anonymous => []
+
+/-- True if `segs` occurs as a contiguous sub-list of `haystack`. -/
+partial def hasContiguousSublist (segs haystack : List String) : Bool :=
+  !segs.isEmpty && (segs.isPrefixOf haystack ||
+    match haystack with | [] => false | _ :: tl => hasContiguousSublist segs tl)
+
+/-- Check whether constant `n` defined in module `modName` opens a banned shadow/stub namespace:
+    1. `n` begins with a pinned shadow namespace `ns` whose `namespaceOwners` does not allow `modName`.
+    2. `modName` is under `inv.proofPrefixes` (e.g. `LeanNative.Proofs.*`) and `n`'s namespace
+       hierarchy contains any `inv.bannedShadowNames` segment (`ConLeche`, `LCNF`, `LeanMLIR`, `LNSym`).
+    Returns the banned namespace `Name` when violated. -/
+def shadowOriginForbidden? (inv : Inventory) (modName : Name) (n : Name) : Option Name := Id.run do
+  let u := userName n
+  for (ns, allowedMods) in inv.namespaceOwners do
+    if ns.isPrefixOf u && !allowedMods.contains modName then
+      return some ns
+  if inv.proofPrefixes.any (·.isPrefixOf modName) then
+    let parentSegs := nameSegments (nameParent u)
+    for ns in inv.bannedShadowNames do
+      if hasContiguousSublist (nameSegments ns) parentSegs then
+        return some ns
+  return none
+
 /-- Every non-auxiliary constant in a pinned module or under a pinned namespace (outside the
     forbidden evaluator itself). Auxiliaries are reached through their owner. -/
 def collectTargets (env : Environment) (inv : Inventory) : Array Name := Id.run do
@@ -394,7 +471,8 @@ def cloneAnchor (env : Environment) (canon : Expr) : Option Name := Id.run do
   return best.map (env.header.moduleNames[·]!)
 
 def declLoc (env : Environment) (leanDir : System.FilePath) (n : Name) : IO (String × Nat) := do
-  let owner := ownerDecl env n
+  let cand := ownerDecl env n
+  let owner := if (env.getModuleIdxFor? cand).isSome then cand else n
   let file := match env.getModuleIdxFor? owner with
     | some i => s!"lean/{(env.header.moduleNames[i.toNat]!).toString.replace "." "/"}.lean"
     | none => ""
@@ -402,6 +480,36 @@ def declLoc (env : Environment) (leanDir : System.FilePath) (n : Name) : IO (Str
   let ranges := declRangeExt.find? (level := .server) env owner <|>
     declRangeExt.find? (level := .exported) env owner
   return (file, ranges.map (·.selectionRange.pos.line) |>.getD 0)
+
+/-- Every declaration violating `shadowOriginForbidden?`. Unlike `collectTargets`, this pass also
+    inspects `private` and `_`-prefixed declarations so an underscore/private stub cannot evade the
+    shadow-namespace ban; it skips `n` only when `n` is a compiler/tactic auxiliary (`isAuxName n`)
+    attached to a distinct parent declaration `owner` (`owner != n`) whose own defining module
+    satisfies `shadowOriginForbidden?` (e.g. `LeanMLIR.denoteExpr.match_1.splitter` realized lazily
+    when a proof splits on grandfathered `LeanMLIR.denoteExpr`). -/
+def collectShadowOriginViolations (env : Environment) (leanDir : System.FilePath)
+    (inv : Inventory) : IO (Array Violation) := do
+  let mut vs := #[]
+  for (n, _) in env.constants.toList do
+    if isForbidden n then continue
+    let some i := env.getModuleIdxFor? n | continue
+    let modName := env.header.moduleNames[i.toNat]!
+    if isAuxName n &&
+       (declRangeExt.find? (level := .server) env n).isNone &&
+       (declRangeExt.find? (level := .exported) env n).isNone then
+      let owner := ownerDecl env n
+      if owner != n then
+        if let some oi := env.getModuleIdxFor? owner then
+          let ownerMod := env.header.moduleNames[oi.toNat]!
+          -- Skip compiler-synthesized auxes: either `owner` is in an allowed grandfather module
+          -- (e.g. `LeanMLIR.denoteExpr.match_1.splitter` realized in a proof), or `owner` lives in
+          -- the same violating module and will itself be reported.
+          if oi == i || (shadowOriginForbidden? inv ownerMod owner).isNone then continue
+    let some bannedNs := shadowOriginForbidden? inv modName n | continue
+    let (file, line) ← declLoc env leanDir n
+    vs := vs.push { target := userName n, forbidden := bannedNs, kind := "shadow-origin",
+                    hops := 0, path := [userName n], file, line }
+  return vs
 
 /-! ## Analysis -/
 
@@ -458,7 +566,7 @@ def analyze (env : Environment) (leanDir : System.FilePath) (inv : Inventory) : 
   let callHits := reverseSearch rev callGroups
   let cloneHits := reverseSearch rev (cloneSrcs.toArray)
   stage s!"search done ({callHits.size} call-reaching, {cloneHits.size} clone-reaching constants)"
-  let mut vs : Array Violation := #[]
+  let mut vs ← collectShadowOriginViolations env leanDir inv
   let mut targetLocs := #[]
   for t in targets do
     let (file, line) ← declLoc env leanDir t
@@ -521,8 +629,10 @@ def Violation.toJson (v : Violation) : Json :=
 
 def printTable (vs : Array Violation) : IO Unit := do
   for v in vs do
-    let witness := " → ".intercalate (v.path.map toString) ++
-      (if v.kind == "clone" then " ≅ (canonical body equal)" else "")
+    let witness :=
+      if v.kind == "shadow-origin" then "(banned shadow-namespace origin)"
+      else " → ".intercalate (v.path.map toString) ++
+        (if v.kind == "clone" then " ≅ (canonical body equal)" else "")
     IO.println s!"  {v.kind}\t{v.target}\t→ {v.forbidden}\t{v.file}:{v.line}\t{witness}"
 
 /-! ## Ratchet -/
@@ -577,6 +687,15 @@ def checkRatchet (repo : System.FilePath) (base : String) (inv : Inventory)
       unless inv.namespaces.contains n do errs := errs.push s!"inventory drops base namespace {n}"
     for r in bi.sourceRoots do
       unless inv.sourceRoots.contains r do errs := errs.push s!"inventory drops base source root {r}"
+    for p in bi.proofPrefixes do
+      unless inv.proofPrefixes.contains p do errs := errs.push s!"inventory drops base proof prefix {p}"
+    for (ns, allowedBase) in bi.namespaceOwners do
+      match inv.namespaceOwners.find? (·.1 == ns) with
+      | none => errs := errs.push s!"inventory drops namespace_owners restriction for {ns}"
+      | some (_, allowedCur) =>
+        for m in allowedCur do
+          unless allowedBase.contains m do
+            errs := errs.push s!"inventory widens namespace_owners for {ns} with {m}"
   return errs
 
 /-! ## Self-test -/
@@ -670,8 +789,21 @@ def ratchetTests (fixtureVs : Array Violation) : IO (Array String) := do
       [checker, (allowlistPath, allowJson (first ++ helper))],
       allowJson first, first ++ helper, inv,
       ["violation missing from", (helper.head!).key]),
-    ("bootstrap: extra allowlist entry → fail",
-      [], allowJson (first ++ [fakeV]), first, inv, ["allowlist ADDS entry not in base", s!": {fakeV.key}"])]
+        ("bootstrap: extra allowlist entry → fail",
+          [], allowJson (first ++ [fakeV]), first, inv, ["allowlist ADDS entry not in base", s!": {fakeV.key}"]),
+        ("inventory drops proof_module_prefixes entry → fail",
+          [checker, (allowlistPath, allowJson first),
+           (inventoryPath, (Json.mkObj [("modules", Json.arr #[]), ("namespaces", Json.arr #[Json.str "ShadowFixtureAllowlisted"]),
+             ("source_roots", Json.arr #[]), ("proof_module_prefixes", Json.arr #[Json.str "LeanNative.Proofs"])]).pretty ++ "\n")],
+          allowJson first, first, { inv with proofPrefixes := [] }, ["inventory drops base proof prefix LeanNative.Proofs"]),
+        ("inventory widens namespace_owners → fail",
+          [checker, (allowlistPath, allowJson first),
+           (inventoryPath, (Json.mkObj [("modules", Json.arr #[]), ("namespaces", Json.arr #[Json.str "ShadowFixtureAllowlisted"]),
+             ("source_roots", Json.arr #[]),
+             ("namespace_owners", Json.mkObj [("ConLeche", Json.arr #[Json.str "TurboLean.ConLeche"])])]).pretty ++ "\n")],
+          allowJson first, first,
+          { inv with namespaceOwners := [(`ConLeche, [`TurboLean.ConLeche, `LeanNative.Proofs.Fake])] },
+          ["inventory widens namespace_owners for ConLeche with LeanNative.Proofs.Fake"])]
   let mut errs := #[]
   for (label, baseFiles, cur, vs, inv', expected) in cases do
     let (dir, sha) ← mkRatchetRepo baseFiles cur
@@ -706,7 +838,14 @@ def withImplementedByFixture (env : Environment) : IO Environment := do
   return env'
 
 def selfTest (env : Environment) (leanDir : System.FilePath) : IO (Array String) := do
-  let inv : Inventory := { modules := [], namespaces := fixtureNamespaces, sourceRoots := [] }
+  let inv : Inventory := {
+    modules := [],
+    namespaces := fixtureNamespaces,
+    sourceRoots := [],
+    namespaceOwners := minNamespaceOwners,
+    proofPrefixes := [`ShadowFixtures.ShadowNamespaceStubs],
+    bannedShadowNames := minNamespaces
+  }
   let env ← withImplementedByFixture env
   let r ← analyze env leanDir inv
   IO.println s!"[self-test] {r.targets.size} fixture targets, {r.violations.size} violations:"
@@ -763,12 +902,293 @@ def selfTest (env : Environment) (leanDir : System.FilePath) : IO (Array String)
   -- untargeted helpers in `UnrelatedTraversal` must not be reported themselves
   if r.violations.any (fun v => (`UnrelatedTraversal).isPrefixOf v.target) then
     errs := errs.push "fixture traversal: un-inventoried helper namespace reported as a target"
+  -- (6) shadow-origin negative fixtures (local `ConLeche`/`LCNF`/`LeanMLIR`/`LNSym` stubs in proofs,
+  --     including toy equality `CICValid` and empty-list `parseOleanShard`, referencing zero `eval*`)
+  let originExpected : List (Name × Name × String) := [
+    (`ShadowFixtureOrigin.ConLeche.CICValid, `ConLeche, "toy equality CICValid stub"),
+    (`ShadowFixtureOrigin.ConLeche.parseOleanShard, `ConLeche, "size-only empty-decls parseOleanShard stub"),
+    (`ShadowFixtureOrigin.ConLeche.verify_toy_sound, `ConLeche, "theorem inside local ConLeche proof stub"),
+    (`ShadowFixtureOrigin.ConLeche.olean_toy_sound, `ConLeche, "theorem over fake parseOleanShard stub"),
+    (`ShadowFixtureOrigin.ConLeche._privateToyStub, `ConLeche, "private underscore stub in ConLeche"),
+    (`ShadowFixtureOrigin.LCNF.evalToy, `LCNF, "local LCNF shadow namespace in proofs"),
+    (`ShadowFixtureOrigin.LeanMLIR.denoteToy, `LeanMLIR, "local LeanMLIR shadow namespace in proofs"),
+    (`ShadowFixtureOrigin.LNSym.stepToy, `LNSym, "local LNSym shadow namespace in proofs")]
+  for (t, ns, label) in originExpected do
+    unless find t ns "shadow-origin" do
+      errs := errs.push s!"fixture shadow-origin [{label}]: expected {t} → {ns} (shadow-origin)"
+  -- also verify top-level namespace owner check directly on synthetic module names
+  unless shadowOriginForbidden? inv `LeanNative.Proofs.Fake `ConLeche.CICValid == some `ConLeche do
+    errs := errs.push "shadowOriginForbidden? failed to flag top-level ConLeche outside TurboLean.ConLeche"
+  unless shadowOriginForbidden? inv `TurboLean.ConLeche `ConLeche.CICValid == none do
+    errs := errs.push "shadowOriginForbidden? falsely flagged grandfathered TurboLean.ConLeche"
+  unless shadowOriginForbidden? inv `LeanNative.Proofs.LCNFBridgeProofs `LeanNative.Proofs.evalLCNF == none do
+    errs := errs.push "shadowOriginForbidden? falsely flagged non-shadow Proof declaration"
   -- (4) + ratchet: the REAL `checkRatchet` against a temporary git repository
   errs := errs ++ (← ratchetTests r.violations)
   -- forbidden set sanity: auxiliaries are forbidden
   unless isForbidden `LeanNative.Semantics.evalBinOp.match_1 && !isForbidden `LeanNative.Semantics.Val.toU256? do
     errs := errs.push "forbidden-set predicate wrong"
-  IO.println s!"[self-test] {if errs.isEmpty then "PASS" else "FAIL"}: direct-call, verbatim-clone, helper-clone, bitvec-only, {travel.length} traversal classes, ratchet cases"
+  IO.println s!"[self-test] {if errs.isEmpty then "PASS" else "FAIL"}: direct-call, verbatim-clone, helper-clone, bitvec-only, {travel.length} traversal classes, {originExpected.length} shadow-origin stubs, ratchet cases"
+  (← IO.getStdout).flush
+  return errs
+
+/-- Output emitted by a single `--worker-batch` subprocess. -/
+structure WorkerPayload where
+  report : Report
+  seenMods : Array Name
+  seenNs : Array Name
+  seenForbidden : Array Name
+  selfTestErrs : Array String
+  deriving Inhabited
+
+def Violation.fromJson (j : Json) : Except String Violation := do
+  return {
+    target := strName (← (j.getObjValD "target").getStr?),
+    forbidden := strName (← (j.getObjValD "forbidden").getStr?),
+    kind := ← (j.getObjValD "kind").getStr?,
+    hops := ← (j.getObjValD "hops").getNat?,
+    file := ← (j.getObjValD "file").getStr?,
+    line := ← (j.getObjValD "line").getNat?,
+    path := (← (j.getObjValD "path").getArr?).toList.filterMap fun x =>
+      match x.getStr? with | .ok s => some (strName s) | .error _ => none
+  }
+
+def WorkerPayload.toJson (w : WorkerPayload) : Json :=
+  Json.mkObj [
+    ("targetLocs", Json.arr (w.report.targetLocs.map fun (n, f, l) =>
+      Json.mkObj [("name", toString n), ("file", f), ("line", l)])),
+    ("violations", Json.arr (w.report.violations.map Violation.toJson)),
+    ("forbidden", Json.arr (w.report.forbidden.map (Json.str ∘ toString))),
+    ("seenMods", Json.arr (w.seenMods.map (Json.str ∘ toString))),
+    ("seenNs", Json.arr (w.seenNs.map (Json.str ∘ toString))),
+    ("seenForbidden", Json.arr (w.seenForbidden.map (Json.str ∘ toString))),
+    ("selfTestErrs", Json.arr (w.selfTestErrs.map Json.str))
+  ]
+
+def WorkerPayload.fromJson (s : String) : Except String WorkerPayload := do
+  let j ← Json.parse s
+  let locs ← (← (j.getObjValD "targetLocs").getArr?).mapM fun x => do
+    return (strName (← (x.getObjValD "name").getStr?),
+            ← (x.getObjValD "file").getStr?,
+            ← (x.getObjValD "line").getNat?)
+  let vs ← (← (j.getObjValD "violations").getArr?).mapM Violation.fromJson
+  let fs ← (jsonStrList j "forbidden")
+  let sm ← (jsonStrList j "seenMods")
+  let sn ← (jsonStrList j "seenNs")
+  let sf ← (jsonStrList j "seenForbidden")
+  let se ← (jsonStrList j "selfTestErrs")
+  return {
+    report := { targets := locs.map (·.1), targetLocs := locs, violations := vs,
+                forbidden := (fs.map strName).toArray },
+    seenMods := (sm.map strName).toArray,
+    seenNs := (sn.map strName).toArray,
+    seenForbidden := (sf.map strName).toArray,
+    selfTestErrs := se.toArray
+  }
+
+/-- Parse direct imports of a `.lean` source file using Lean's own header parser. -/
+def parseSourceImports (src : System.FilePath) : IO (Array Name) := do
+  let txt ← IO.FS.readFile src
+  let ictx := Parser.mkInputContext txt src.toString
+  let (hdr, _, msgs) ← Parser.parseHeader ictx
+  if msgs.hasErrors then
+    let mut es := #[]
+    for m in msgs.toList do es := es.push (← m.toString)
+    throw <| IO.userError s!"header parse errors in {src}: {"; ".intercalate es.toList}"
+  return (Elab.headerToImports hdr (includeInit := false)).map (·.module)
+
+/-- Locate an actually-existing `.olean` on `sp` (unlike `SearchPath.findWithExt`, which matches
+    by first package component even when the target `.olean` file itself is absent). -/
+def findExistingOLean? (sp : SearchPath) (m : Name) : IO (Option System.FilePath) := do
+  if let some p ← SearchPath.findWithExt sp "olean" m then
+    if ← p.pathExists then return some p
+  let rel := (m.toString.replace "." "/") ++ ".olean"
+  for d in sp do
+    let p := d / rel
+    if ← p.pathExists then return some p
+  return none
+
+partial def symlinkTree (src dst : System.FilePath) : IO Unit := do
+  if ← src.isDir then
+    IO.FS.createDirAll dst
+    for entry in ← src.readDir do
+      symlinkTree entry.path (dst / entry.fileName)
+  else if !(← dst.pathExists) then
+    let out ← IO.Process.output { cmd := "ln", args := #["-s", src.toString, dst.toString] }
+    unless out.exitCode == 0 do
+      throw <| IO.userError s!"ln -s {src} {dst} failed: {out.stderr}"
+
+/-- Because Lean's `SearchPath.findWithExt` resolves a root package prefix (`TurboLean`) to the
+    FIRST search-path directory containing either `TurboLean.olean` or `TurboLean/`, placing a
+    newly-compiled standalone `TurboLean.olean` in `scratchDir` would hide `TurboLean/*.olean` in
+    `.lake/build/lib/lean` unless `scratchDir` mirrors existing artifacts under that root prefix. -/
+def mirrorRootPackage (curSp : SearchPath) (scratchDir : System.FilePath) (pkg : String) :
+    IO Unit := do
+  for d in curSp do
+    if ← d.isDir then
+      let realD ← IO.FS.realPath d
+      let rootOlean := realD / s!"{pkg}.olean"
+      let dstOlean := scratchDir / s!"{pkg}.olean"
+      if (← rootOlean.pathExists) && !(← dstOlean.pathExists) then
+        let out ← IO.Process.output { cmd := "ln", args := #["-s", rootOlean.toString, dstOlean.toString] }
+        unless out.exitCode == 0 do
+          throw <| IO.userError s!"ln -s {rootOlean} {dstOlean} failed: {out.stderr}"
+      let subDir := realD / pkg
+      if ← subDir.isDir then
+        symlinkTree subDir (scratchDir / pkg)
+
+/-- Compile any discovered source module lacking a Lake `.olean` (such as a standalone
+    `<root>.lean` excluded by `.submodules` globs) into `scratchDir` in topological import order,
+    prepending `scratchDir` to `searchPathRef` and returning the updated `LEAN_PATH`. Fails closed
+    on missing sources, cyclic standalone imports, or compiler failure. -/
+def compileMissingModules (leanDir scratchDir : System.FilePath) (mods : Array Name) :
+    IO String := do
+  let leanBin ← IO.appPath
+  let baseLeanPath := (← IO.getEnv "LEAN_PATH").getD ""
+  let sep := System.SearchPath.separator.toString
+  let curSp ← searchPathRef.get
+  let mut pending : Array (Name × System.FilePath × Array Name) := #[]
+  for m in mods do
+    if (← findExistingOLean? curSp m).isNone then
+      let src := leanDir / s!"{m.toString.replace "." "/"}.lean"
+      unless ← src.pathExists do
+        throw <| IO.userError s!"discovered module {m} has neither .olean nor source at {src}"
+      let deps ← parseSourceImports src
+      pending := pending.push (m, src, deps)
+  if pending.isEmpty then
+    let spStrs := curSp.map (·.toString)
+    return sep.intercalate (if baseLeanPath.isEmpty then spStrs else spStrs ++ [baseLeanPath])
+  let mut mirrored : Std.HashSet String := {}
+  for (m, _, _) in pending do
+    let pkg := m.getRoot.toString
+    unless mirrored.contains pkg do
+      mirrored := mirrored.insert pkg
+      mirrorRootPackage curSp scratchDir pkg
+  let fullSp := scratchDir :: curSp
+  searchPathRef.set fullSp
+  let spStrs := fullSp.map (·.toString)
+  let newLeanPath := sep.intercalate (if baseLeanPath.isEmpty then spStrs else spStrs ++ [baseLeanPath])
+  while !pending.isEmpty do
+    let pendNames : Std.HashSet Name := pending.foldl (fun s (m, _, _) => s.insert m) {}
+    let (ready, rest) := pending.partition fun (_, _, deps) => !deps.any pendNames.contains
+    if ready.isEmpty then
+      throw <| IO.userError s!"import cycle among unbuilt standalone modules: {pending.map (·.1)}"
+    for (m, src, _) in ready do
+      let outOlean := scratchDir / s!"{m.toString.replace "." "/"}.olean"
+      if let some parent := outOlean.parent then IO.FS.createDirAll parent
+      stage s!"compiling standalone module {m} → {outOlean}"
+      let res ← IO.Process.output {
+        cmd := leanBin.toString,
+        args := #["-DautoImplicit=false", src.toString, "-R", leanDir.toString, "-o", outOlean.toString],
+        cwd := some leanDir,
+        env := #[("LEAN_PATH", some newLeanPath)]
+      }
+      unless res.exitCode == 0 do
+        throw <| IO.userError s!"compiling standalone module {m} failed:\n{res.stdout}\n{res.stderr}"
+    pending := rest
+  return newLeanPath
+
+/-- Partition `mods` into importable environments by inspecting `.olean` headers (`readModuleData`):
+    any module that defines `main` (or transitively imports one that defines `main`) is grouped by
+    the set of `main`-defining modules in its transitive closure. A pure library base (0 `main`s)
+    plus `k` distinct single-owner `main` cones yields `k` batches when `k ≥ 1` (each cone imports
+    the entire library base alongside its compatible `main`-cone modules), or 1 batch when `k = 0`.
+    Modules that transitively pull ≥ 2 distinct `main` owners cannot be imported by Lean at all and
+    fail closed immediately. -/
+partial def mainConeOwnersOf (sp : SearchPath)
+    (cache : IO.Ref (Std.HashMap Name (Std.HashSet Name))) (m : Name) :
+    IO (Std.HashSet Name) := do
+  if let some res := (← cache.get)[m]? then return res
+  let fm := freshName m
+  cache.modify (·.insert fm {})
+  let some olean ← findExistingOLean? sp fm
+    | return {}  -- core / external module outside local search path or Init
+  let (md, _reg) ← readModuleData olean
+  let hasMain := md.constNames.contains `main
+  let deps := md.imports.map fun imp => freshName imp.module
+  let mut s : Std.HashSet Name :=
+    if hasMain then ({} : Std.HashSet Name).insert fm else {}
+  for d in deps do
+    for o in (← mainConeOwnersOf sp cache d) do s := s.insert o
+  cache.modify (·.insert fm s)
+  return s
+
+def partitionByMainCones (mods : Array Name) : IO (Array (Array Name)) := do
+  let sp ← searchPathRef.get
+  let cache ← IO.mkRef ({} : Std.HashMap Name (Std.HashSet Name))
+  let mut pureLibs : Array Name := #[]
+  let mut byOwner : Std.HashMap Name (Array Name) := {}
+  let mut ownerOrder : Array Name := #[]
+  for m in mods do
+    let os := (← mainConeOwnersOf sp cache m).toArray
+    if os.isEmpty then
+      pureLibs := pureLibs.push m
+    else if os.size == 1 then
+      let o := os[0]!
+      unless byOwner.contains o do ownerOrder := ownerOrder.push o
+      byOwner := byOwner.insert o ((byOwner[o]?.getD #[]).push m)
+    else
+      throw <| IO.userError s!"module {m} transitively imports conflicting `main` definitions: {os}"
+  let sortedOwners := ownerOrder.qsort (·.toString < ·.toString)
+  if sortedOwners.isEmpty then
+    return #[pureLibs]
+  else
+    return sortedOwners.map fun o => pureLibs ++ (byOwner[o]?.getD #[])
+
+/-- Self-test for `compileMissingModules` + `partitionByMainCones`: builds an isolated directory
+    of synthetic `.lean` modules with two conflicting `def main` owners (`FakePkg.Sub`, `FakeExeB`),
+    an unbuilt standalone `<root>.lean` module `FakePkg` importing `FakePkg.Sub` while
+    `FakePkg/Sub.olean` already lives in a separate `built` search-path directory (exact replica of
+    `TurboLean.lean` + `.lake/build/lib/lean/TurboLean/ZygoteWorker.olean`), and a shared library
+    `FakeLib`, then verifies scratch compilation, symlink mirroring, and `main`-cone partitioning. -/
+def partitionAndStandaloneTests (leanDir : System.FilePath) : IO (Array String) := do
+  let tmp ← IO.FS.createTempDir
+  let mut errs := #[]
+  try
+    let srcDir := tmp / "src"
+    let builtDir := tmp / "built"
+    let scratch := tmp / "olean"
+    IO.FS.createDirAll (srcDir / "FakePkg")
+    IO.FS.createDirAll builtDir
+    IO.FS.createDirAll scratch
+    IO.FS.writeFile (srcDir / "FakeLib.lean") "namespace FakeLib\ndef x : Nat := 1\nend FakeLib\n"
+    IO.FS.writeFile (srcDir / "FakePkg" / "Sub.lean") "import FakeLib\ndef main : IO Unit := pure ()\n"
+    IO.FS.writeFile (srcDir / "FakeExeB.lean") "import FakeLib\ndef main : IO Unit := pure ()\n"
+    IO.FS.writeFile (srcDir / "FakePkg.lean") "import FakePkg.Sub\nnamespace FakePkg\ndef y : Nat := FakeLib.x\nend FakePkg\n"
+    IO.FS.writeFile (srcDir / "FakeDual.lean") "import FakePkg.Sub\nimport FakeExeB\ndef z : Nat := 0\n"
+    let savedSp ← searchPathRef.get
+    try
+      -- Pre-compile FakeLib, FakePkg.Sub, FakeExeB into `builtDir`, leaving standalone `FakePkg.lean` unbuilt
+      discard <| compileMissingModules srcDir builtDir #[`FakeLib, `FakePkg.Sub, `FakeExeB]
+      searchPathRef.set (builtDir :: savedSp)
+      discard <| compileMissingModules srcDir scratch #[`FakeLib, `FakePkg.Sub, `FakeExeB, `FakePkg]
+      unless ← (scratch / "FakePkg.olean").pathExists do
+        errs := errs.push "standalone-compile test: FakePkg.olean was not produced"
+      unless ← (scratch / "FakePkg" / "Sub.olean").pathExists do
+        errs := errs.push "standalone-compile test: FakePkg/Sub.olean was not mirrored into scratch"
+      let batches ← partitionByMainCones #[`FakeLib, `FakePkg.Sub, `FakeExeB, `FakePkg]
+      if batches.size != 2 then
+        errs := errs.push s!"partition test: expected 2 main-cone batches, got {batches.size}: {batches}"
+      else
+        let bA := batches.find? (·.contains `FakePkg.Sub) |>.getD #[]
+        let bB := batches.find? (·.contains `FakeExeB) |>.getD #[]
+        unless bA.contains `FakeLib && bA.contains `FakePkg && !bA.contains `FakeExeB do
+          errs := errs.push s!"partition test: FakePkg.Sub batch malformed: {bA}"
+        unless bB.contains `FakeLib && !bB.contains `FakePkg.Sub && !bB.contains `FakePkg do
+          errs := errs.push s!"partition test: FakeExeB batch malformed: {bB}"
+      -- Verify that a module importing two conflicting `main`s fails closed
+      let dualFailed ← try
+        discard <| compileMissingModules srcDir scratch #[`FakeDual]
+        pure false
+      catch _ => pure true
+      unless dualFailed do
+        errs := errs.push "partition test: FakeDual importing two `main`s should fail compilation"
+    finally
+      searchPathRef.set savedSp
+    let _ := leanDir
+  finally
+    try IO.FS.removeDirAll tmp catch _ => pure ()
+  IO.println s!"[self-test] {if errs.isEmpty then "ok  " else "FAIL"} standalone compile + main-cone partitioning"
   return errs
 
 /-! ## Driver -/
@@ -779,6 +1199,8 @@ structure Args where
   coverageOut : Option String := none
   selfTest : Bool := false
   bootstrap : Bool := false
+  workerBatch : Option String := none
+  workerOut : Option String := none
 
 def parseArgs : List String → Args → Except String Args
   | [], a => .ok a
@@ -787,9 +1209,43 @@ def parseArgs : List String → Args → Except String Args
   | "--coverage-out" :: p :: rest, a => parseArgs rest { a with coverageOut := some p }
   | "--self-test" :: rest, a => parseArgs rest { a with selfTest := true }
   | "--bootstrap" :: rest, a => parseArgs rest { a with bootstrap := true }
+  | "--worker-batch" :: m :: rest, a => parseArgs rest { a with workerBatch := some m }
+  | "--worker-out" :: o :: rest, a => parseArgs rest { a with workerOut := some o }
   | x :: _, _ => .error s!"unknown argument {x}"
 
+/-- Execute one isolated environment import + analysis in a fresh OS process so `.olean`
+    compacted regions are never re-mapped across environments. -/
+unsafe def runWorkerBatch (args : Args) (modsFile outFile : String) : IO UInt32 := do
+  let leanDir ← IO.currentDir
+  let repo := leanDir / ".."
+  let inv ← IO.ofExcept (parseInventory (← IO.FS.readFile (repo / inventoryPath)))
+  let modLines := (← IO.FS.readFile modsFile).splitOn "\n" |>.filter (!·.trimAscii.isEmpty)
+  let mods := (modLines.map fun l => strName l.trimAscii.toString).toArray
+  initSearchPath (← findSysroot)
+  enableInitializersExecution
+  let imports := mods.map fun m => ({ module := m } : Import)
+  stage s!"worker import #{mods.size} (last: {mods.back?})"
+  let env ← importModules imports {} (loadExts := false)
+  let mut seenMods := #[]
+  for m in inv.modules do
+    if (env.getModuleIdx? m).isSome then seenMods := seenMods.push m
+  let mut seenNs := #[]
+  for n in inv.namespaces do
+    if env.constants.toList.any (fun (c, _) => n.isPrefixOf (userName c)) then seenNs := seenNs.push n
+  let mut seenForbidden := #[]
+  for f in requiredForbidden do
+    if env.contains f then seenForbidden := seenForbidden.push f
+  let selfTestErrs ← if args.selfTest then selfTest env leanDir else pure #[]
+  let r ← analyze env leanDir inv
+  let payload : WorkerPayload := { report := r, seenMods, seenNs, seenForbidden, selfTestErrs }
+  IO.FS.writeFile outFile (payload.toJson.compress ++ "\n")
+  return 0
+
 unsafe def run (args : Args) : IO UInt32 := do
+  if let some modsFile := args.workerBatch then
+    let some outFile := args.workerOut
+      | throw <| IO.userError "--worker-batch requires --worker-out"
+    return ← runWorkerBatch args modsFile outFile
   let leanDir ← IO.currentDir
   let repo := leanDir / ".."
   unless ← (leanDir / "lakefile.lean").pathExists do
@@ -800,83 +1256,91 @@ unsafe def run (args : Args) : IO UInt32 := do
     unless inv.modules.contains m do errs := errs.push s!"inventory missing pinned module {m}"
   for n in minNamespaces do
     unless inv.namespaces.contains n do errs := errs.push s!"inventory missing pinned namespace {n}"
+  for p in minProofPrefixes do
+    unless inv.proofPrefixes.contains p do errs := errs.push s!"inventory missing pinned proof prefix {p}"
+  for (ns, reqMods) in minNamespaceOwners do
+    match inv.namespaceOwners.find? (·.1 == ns) with
+    | none => errs := errs.push s!"inventory missing namespace_owners entry for {ns}"
+    | some (_, curMods) =>
+      for m in curMods do
+        unless reqMods.contains m do
+          errs := errs.push s!"inventory namespace_owners widens {ns} beyond pinned {reqMods} with {m}"
   let mut modsArr ← discoverModules leanDir inv.sourceRoots
   for m in inv.modules do
     unless modsArr.contains m do errs := errs.push s!"pinned module {m} has no source file"
   if args.selfTest then modsArr := modsArr.push `ShadowFixtures
   initSearchPath (← findSysroot)
-  -- Source files that no Lake library builds (e.g. `TurboLean.lean` under a `.submodules` glob)
-  -- have no `.olean`; they are not part of any built artifact. Skip them loudly; a pinned module
-  -- without an `.olean` is a hard failure.
-  let mut built := #[]
-  for m in modsArr do
-    let ok ← try pure (← (← findOLean m).pathExists) catch _ => pure false
-    if ok then built := built.push m
-    else if inv.modules.contains m then errs := errs.push s!"pinned module {m} is not built"
-    else IO.println s!"[shadow-semantics] note: {m} has no .olean (not in any Lake library); skipped"
-  modsArr := built
-  enableInitializersExecution
-  -- Executable root modules each define a top-level `main`, so they cannot share one
-  -- environment. Analyze the library modules together, then each exe root on top of them.
-  let mut mainMods := #[]
-  for m in modsArr do
-    let src := leanDir / s!"{m.toString.replace "." "/"}.lean"
-    if ← src.pathExists then
-      let txt ← IO.FS.readFile src
-      if (txt.splitOn "\n").any (fun l => ["def main", "unsafe def main", "partial def main"].any (fun (pre : String) => l.startsWith pre)) then
-        mainMods := mainMods.push m
-  let libMods := modsArr.filter (!mainMods.contains ·)
-  let envSets : Array (Array Name) := #[libMods] ++ mainMods.map (libMods.push ·)
-  let mut report? : Option Report := none
-  let mut seenMods : Std.HashSet Name := {}
-  let mut seenNs : Std.HashSet Name := {}
-  let mut seenForbidden : Std.HashSet Name := {}
-  let mut first := true
-  for mods in envSets do
-    let imports := mods.map fun m => ({ module := m } : Import)
-    stage s!"import env #{mods.size} (last: {mods.back?})"
-    -- `loadExts := false`: do not run user `initialize` blocks of analyzed modules (some spawn
-    -- processes / block). Built-in extensions (decl ranges, matchers, `implemented_by`) still load.
-    let env ← importModules imports {} (loadExts := false)
+  if args.selfTest then
+    errs := errs ++ (← partitionAndStandaloneTests leanDir)
+  let scratchDir ← IO.FS.createTempDir
+  try
+    let workerLeanPath ← compileMissingModules leanDir scratchDir modsArr
+    let sp ← searchPathRef.get
+    for m in modsArr do
+      if (← findExistingOLean? sp m).isNone then
+        errs := errs.push s!"module {m} has no .olean after standalone compilation"
+    let envSets ← partitionByMainCones modsArr
+    let leanBin ← IO.appPath
+    let scriptPath := repo / checkerPath
+    let mut report? : Option Report := none
+    let mut seenMods : Std.HashSet Name := {}
+    let mut seenNs : Std.HashSet Name := {}
+    let mut seenForbidden : Std.HashSet Name := {}
+    for idx in [0:envSets.size] do
+      let mods := envSets[idx]!
+      let modsFile := scratchDir / s!"batch_{idx}.mods"
+      let outFile := scratchDir / s!"batch_{idx}.json"
+      IO.FS.writeFile modsFile ("\n".intercalate (mods.toList.map toString) ++ "\n")
+      let mut wArgs := #["--run", scriptPath.toString,
+                         "--worker-batch", modsFile.toString,
+                         "--worker-out", outFile.toString]
+      if idx == 0 && args.selfTest then wArgs := wArgs.push "--self-test"
+      stage s!"spawn worker #{idx + 1}/{envSets.size} ({mods.size} modules, last: {mods.back?})"
+      let child ← IO.Process.spawn {
+        cmd := leanBin.toString,
+        args := wArgs,
+        cwd := some leanDir,
+        env := #[("LEAN_PATH", some workerLeanPath)],
+        stdout := .inherit,
+        stderr := .inherit
+      }
+      let code ← child.wait
+      unless code == 0 do
+        throw <| IO.userError s!"worker batch #{idx + 1} failed with exit code {code}"
+      let payload ← IO.ofExcept (WorkerPayload.fromJson (← IO.FS.readFile outFile))
+      for m in payload.seenMods do seenMods := seenMods.insert m
+      for n in payload.seenNs do seenNs := seenNs.insert n
+      for f in payload.seenForbidden do seenForbidden := seenForbidden.insert f
+      errs := errs ++ payload.selfTestErrs
+      report? := some (match report? with | some a => a.merge payload.report | none => payload.report)
     for m in inv.modules do
-      if (env.getModuleIdx? m).isSome then seenMods := seenMods.insert m
+      unless seenMods.contains m do errs := errs.push s!"pinned module {m} not imported"
     for n in inv.namespaces do
-      if env.constants.toList.any (fun (c, _) => n.isPrefixOf (userName c)) then seenNs := seenNs.insert n
+      unless seenNs.contains n do errs := errs.push s!"pinned namespace {n} has no declarations (missing/unimported)"
     for f in requiredForbidden do
-      if env.contains f then seenForbidden := seenForbidden.insert f
-    if first && args.selfTest then
-      errs := errs ++ (← selfTest env leanDir).map freshStr
-    first := false
-    stage "imported; pinned checks"
-    let r := (← analyze env leanDir inv).fresh
-    report? := some (match report? with | some a => a.merge r | none => r)
-    -- Release the mmapped .olean regions before the next import: repeated imports in one process
-    -- otherwise stall (observed on the 4th environment). `r` holds only names/strings.
-    env.freeRegions
-  for m in inv.modules do
-    unless seenMods.contains m do errs := errs.push s!"pinned module {m} not imported"
-  for n in inv.namespaces do
-    unless seenNs.contains n do errs := errs.push s!"pinned namespace {n} has no declarations (missing/unimported)"
-  for f in requiredForbidden do
-    unless seenForbidden.contains f do errs := errs.push s!"forbidden evaluator {f} missing from environment"
-  stage "all environments analyzed"
-  let r := report?.get!
-  IO.println s!"[shadow-semantics] {modsArr.size} modules imported ({envSets.size} environments: libraries + {mainMods.size} exe roots), {r.targets.size} target declarations, {r.forbidden.size} forbidden evaluators"
-  IO.println s!"[shadow-semantics] {r.violations.size} violations:"
-  printTable r.violations
-  if let some p := args.jsonOut then
-    IO.FS.writeFile p ((Json.mkObj [("violations", Json.arr (r.violations.map Violation.toJson)),
-      ("forbidden_evaluators", Json.arr (r.forbidden.map (Json.str ∘ toString)))]).pretty ++ "\n")
-  if let some p := args.coverageOut then
-    let lines := r.targetLocs.map fun (t, f, l) => s!"{t}\t{f}:{l}"
-    IO.FS.writeFile p ("\n".intercalate lines.toList ++ "\n")
-  match args.base with
-  | some b => errs := errs ++ (← checkRatchet repo b inv r.violations)
-  | none =>
-    if !args.bootstrap then
-      -- without a base, compare against the working-tree allowlist (local developer mode)
-      let cur ← IO.ofExcept (parseAllowlist (← IO.FS.readFile (repo / allowlistPath)))
-      errs := errs ++ allowlistEqualsViolations cur r.violations
+      unless seenForbidden.contains f do errs := errs.push s!"forbidden evaluator {f} missing from environment"
+    stage "all environments analyzed"
+    let r := report?.get!
+    IO.println s!"[shadow-semantics] {modsArr.size} modules imported ({envSets.size} isolated worker environments), {r.targets.size} target declarations, {r.forbidden.size} forbidden evaluators"
+    IO.println s!"[shadow-semantics] {r.violations.size} violations:"
+    printTable r.violations
+    if let some p := args.jsonOut then
+      IO.FS.writeFile p ((Json.mkObj [("violations", Json.arr (r.violations.map Violation.toJson)),
+        ("forbidden_evaluators", Json.arr (r.forbidden.map (Json.str ∘ toString)))]).pretty ++ "\n")
+    if let some p := args.coverageOut then
+      let lines := r.targetLocs.map fun (t, f, l) => s!"{t}\t{f}:{l}"
+      IO.FS.writeFile p ("\n".intercalate lines.toList ++ "\n")
+    match args.base with
+    | some b => errs := errs ++ (← checkRatchet repo b inv r.violations)
+    | none =>
+      if !args.bootstrap then
+        -- without a base, compare against the working-tree allowlist (local developer mode)
+        let cur ← IO.ofExcept (parseAllowlist (← IO.FS.readFile (repo / allowlistPath)))
+        errs := errs ++ allowlistEqualsViolations cur r.violations
+    IO.FS.removeDirAll scratchDir
+  catch e =>
+    try IO.FS.removeDirAll scratchDir catch _ => pure ()
+    throw e
   if errs.isEmpty then
     IO.println "[shadow-semantics] PASS"
     return 0

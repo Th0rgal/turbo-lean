@@ -4,3 +4,4 @@ import ShadowFixtures.BitVecOnly
 import ShadowFixtures.AllowlistedSecond
 import ShadowFixtures.HelperClone
 import ShadowFixtures.Traversal
+import ShadowFixtures.ShadowNamespaceStubs

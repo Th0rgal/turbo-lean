@@ -12,6 +12,15 @@
     "ConLeche",
     "LCNF"
   ],
+  "namespace_owners": {
+    "LeanMLIR": ["LeanNative.Backend.Semantics"],
+    "LNSym": ["LeanNative.Backend.Semantics"],
+    "ConLeche": ["TurboLean.ConLeche"],
+    "LCNF": ["LeanNative.IR.LCNF"]
+  },
+  "proof_module_prefixes": [
+    "LeanNative.Proofs"
+  ],
   "source_roots": [
     "LeanNative",
     "TurboLean"
