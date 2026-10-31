@@ -9276,7 +9276,12 @@ lean_exe «demo-exe» where
         let own = dir.join("own-lakefile.lean");
         fs::write(&own, include_str!("../../../lean/lakefile.lean")).unwrap();
         let own_pkg = parse_lakefile_lean(&dir, &own, true).unwrap();
-        assert_eq!((own_pkg.libs.len(), own_pkg.exes.len()), (3, 4));
+        let own_src = include_str!("../../../lean/lakefile.lean");
+        let count = |kw: &str| own_src.lines().filter(|l| l.starts_with(kw)).count();
+        assert_eq!(
+            (own_pkg.libs.len(), own_pkg.exes.len()),
+            (count("lean_lib "), count("lean_exe "))
+        );
         // `Cache.+` / `MathlibTest.+` are submodule globs, not modules named `+`.
         let globs = |name: &str| {
             pkg.libs

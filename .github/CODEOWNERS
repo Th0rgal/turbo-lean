@@ -1,0 +1,14 @@
+# Track B0 shadow-semantics ratchet: review routing for the pinned inventory, the checker, its
+# allowlist, its fixtures and the CI wiring.
+# NOTE: this file only REQUESTS review. It enforces nothing unless a ruleset / branch protection
+# on `main` requires code-owner review and the CI check; neither is configured today. See
+# docs/SHADOW_SEMANTICS.md ("Enforcement") for the exact settings required.
+/scripts/shadow_inventory.json      @Th0rgal
+/scripts/check_shadow_semantics.lean @Th0rgal
+/scripts/shadow_allowlist.json      @Th0rgal
+/scripts/shadow_inventory_grep.py   @Th0rgal
+/lean/ShadowFixtures/               @Th0rgal
+/lean/ShadowFixtures.lean           @Th0rgal
+/docs/SHADOW_SEMANTICS.md           @Th0rgal
+/.github/CODEOWNERS                 @Th0rgal
+/.github/workflows/ci.yml           @Th0rgal
