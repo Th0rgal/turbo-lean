@@ -1222,8 +1222,8 @@ fn toolchain_dir_candidates(toolchain: &str) -> (String, String, String) {
     )
 }
 
-/// Run `lean` on a temporary source file, applying `#print axioms` auditing under `allowed` when
-/// `audit` is non-empty. Returns `(exit_code, stdout, stderr)`.
+/// Run `lean` on a temporary source file, applying the `splitter::plain_lean_audit` of the `audit`
+/// declarations under `allowed` when `audit` is non-empty. Returns `(exit_code, stdout, stderr)`.
 #[allow(clippy::too_many_arguments)]
 fn run_lean_temp_file(
     store: &TurboStore,
@@ -1238,11 +1238,9 @@ fn run_lean_temp_file(
 ) -> Result<(i32, String, String)> {
     let staging = store.fast_staging_dir();
     let tmp = staging.join(format!("{}_{}.lean", prefix, next_tmp_id()));
-    let (audited_src, audited) = if audit.is_empty() {
-        (source.to_string(), 0usize)
-    } else {
-        crate::splitter::with_axiom_audit(source, audit)
-    };
+    let plan = (!audit.is_empty())
+        .then(|| crate::splitter::plain_lean_audit(source, audit, audit.len()));
+    let audited_src = plan.as_ref().map_or(source, |p| p.source.as_str());
     fs::write(&tmp, &audited_src)?;
     let mut cmd = Command::new(lean_bin);
     for arg in crate::module_builder::filter_allowed_lean_args(lean_args) {
@@ -1259,40 +1257,11 @@ fn run_lean_temp_file(
     let mut code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    if code == 0 && !audit.is_empty() {
-        let mut reports = crate::splitter::parse_print_axioms(&stdout);
-        reports.retain(|(n, _)| crate::splitter::matches_uncached_or_fast_verify_name(n, audit));
-        if audited < audit.len() || reports.len() < audited {
+    if let Some(plan) = plan.filter(|_| code == 0) {
+        let bad = plan.violations(&stdout, allowed);
+        if !bad.is_empty() {
             code = 1;
-            stderr = format!(
-                "{}\n[TurboLean.KernelGate] axiom audit incomplete: {} of {} theorems reported",
-                stderr,
-                reports.len(),
-                audit.len()
-            );
-        } else if crate::splitter::sorry_warning_in_decls(&audited_src, &stdout, audit) {
-            code = 1;
-            stderr = format!(
-                "{}\n[TurboLean.KernelGate] audited declaration uses `sorry`",
-                stderr
-            );
-        } else {
-            let bad: Vec<String> = reports
-                .iter()
-                .flat_map(|(n, axs)| axs.iter().map(move |a| (n, a)))
-                .filter(|(_, a)| {
-                    !crate::splitter::axiom_allowed_under(a, allowed) && a.as_str() != "sorryAx"
-                })
-                .map(|(n, a)| format!("`{}` depends on `{}`", n, a))
-                .collect();
-            if !bad.is_empty() {
-                code = 1;
-                stderr = format!(
-                    "{}\n[TurboLean.KernelGate] disallowed axioms: {}",
-                    stderr,
-                    bad.join(", ")
-                );
-            }
+            stderr = format!("{}\n{}", stderr, bad.join("\n"));
         }
     }
     Ok((code, stdout, stderr))
@@ -1352,28 +1321,23 @@ fn execute_check_shard_payload_deferred_with_domain(
         anyhow::bail!("Missing shard_key or shard_source in /check-shard request");
     }
 
-    if !req.skip_cas_lock && store.has_cached_action_readonly(&req.shard_key, trust_domain)? {
-        return Ok((
-            serde_json::json!({
-                "status": "remote_theorem_cache_hit",
-                "decl": req.decl,
-                "shard_key": req.shard_key,
-                "coalesced": false,
-                "interface_hash": req.interface_hash,
-                "prefix_env_hash": req.prefix_env_hash,
-                "server_arch": std::env::consts::ARCH,
-                "server_elapsed_ms": t0.elapsed().as_millis()
-            }),
-            None,
-            Some(req.shard_key.clone()),
-        ));
-    }
-
     let (req_allowed, req_allowed_csv) =
         resolve_request_axiom_policy(req.allowed_axioms.as_deref(), trust_domain);
     // A named target is gated (and checked with its name) on every path, the local daemon's
-    // `skip_cas_lock` requests included; batches name no single target.
+    // `skip_cas_lock` requests included. A batch names its targets in `targets`; one that names none
+    // has every declaration of its source treated as a target (so no `sorry` stub is admitted).
     let named_target = !matches!(req.decl.as_str(), "" | "__batch__" | "__coalesced_batch__");
+    let stub_targets: Vec<String> = if named_target {
+        vec![req.decl.clone()]
+    } else if !req.targets.is_empty() {
+        req.targets.clone()
+    } else {
+        crate::splitter::split_lean_source(&req.shard_source, &[])
+            .shards
+            .into_iter()
+            .map(|sh| sh.name)
+            .collect()
+    };
 
     if source_may_have_hygiene_issue(&req.shard_source) {
         let clean_source = crate::splitter::strip_lean_comments(&req.shard_source);
@@ -1446,6 +1410,23 @@ fn execute_check_shard_payload_deferred_with_domain(
         }
     }
 
+    if !req.skip_cas_lock && store.has_cached_action_readonly(&req.shard_key, trust_domain)? {
+        return Ok((
+            serde_json::json!({
+                "status": "remote_theorem_cache_hit",
+                "decl": req.decl,
+                "shard_key": req.shard_key,
+                "coalesced": false,
+                "interface_hash": req.interface_hash,
+                "prefix_env_hash": req.prefix_env_hash,
+                "server_arch": std::env::consts::ARCH,
+                "server_elapsed_ms": t0.elapsed().as_millis()
+            }),
+            None,
+            Some(req.shard_key.clone()),
+        ));
+    }
+
     let toolchain = if req.toolchain.is_empty() || req.toolchain == "unknown" {
         "leanprover/lean4:v4.35.0"
     } else {
@@ -1472,11 +1453,6 @@ fn execute_check_shard_payload_deferred_with_domain(
     let filtered_req_args = crate::module_builder::filter_allowed_lean_args(&req.lean_args);
     let req_args_digest_opt = crate::module_builder::compute_lean_args_digest(&filtered_req_args);
 
-    let stub_targets: Vec<String> = if named_target {
-        vec![req.decl.clone()]
-    } else {
-        Vec::new()
-    };
     match crate::zygote::eval_with_zygote_pool_for_targets(
         store,
         toolchain,
@@ -1513,21 +1489,7 @@ fn execute_check_shard_payload_deferred_with_domain(
     }
 
     if !zygote_used {
-        let audit_set: std::collections::HashSet<String> = if !named_target {
-            crate::splitter::split_lean_source(&req.shard_source, &[])
-                .shards
-                .into_iter()
-                .filter(|sh| {
-                    !crate::splitter::audit_hygiene(&crate::splitter::strip_lean_comments(
-                        &sh.proof_text,
-                    ))
-                    .has_sorry
-                })
-                .map(|sh| sh.name)
-                .collect()
-        } else {
-            std::iter::once(req.decl.clone()).collect()
-        };
+        let audit_set: std::collections::HashSet<String> = stub_targets.iter().cloned().collect();
         let (code, stdout, stderr) = run_lean_temp_file(
             store,
             &lean_bin,
@@ -1745,14 +1707,22 @@ fn execute_check_shards_batch_payload_deferred(
     let batch_args_digest_opt =
         crate::module_builder::compute_lean_args_digest(&filtered_batch_args);
 
-    if let Ok(zreply) = crate::zygote::eval_with_zygote_pool_with_args(
+    let batch_audit: std::collections::HashSet<String> = req
+        .items
+        .iter()
+        .filter(|i| !cached_map.contains_key(&i.shard_key))
+        .map(|i| i.decl_name.clone())
+        .collect();
+    let mut batch_targets: Vec<String> = batch_audit.iter().cloned().collect();
+    batch_targets.sort();
+    if let Ok(zreply) = crate::zygote::eval_with_zygote_pool_for_targets(
         store,
         toolchain,
         &req.lean_path,
         &env_vars,
         &lean_bin,
         &effective_batch_source,
-        true,
+        &batch_targets,
         &filtered_batch_args,
     ) {
         if zreply.import_ok {
@@ -1781,12 +1751,6 @@ fn execute_check_shards_batch_payload_deferred(
             env_vars.insert("LEAN_PATH".to_string(), full_lean_path);
         }
 
-        let batch_audit: std::collections::HashSet<String> = req
-            .items
-            .iter()
-            .filter(|i| !cached_map.contains_key(&i.shard_key))
-            .map(|i| i.decl_name.clone())
-            .collect();
         let (code, out, err) = run_lean_temp_file(
             store,
             &lean_bin,

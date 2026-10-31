@@ -2375,6 +2375,7 @@ fn make_batch_zreq(
     toolchain: &str,
     lean_path: &str,
     lean_args: Vec<String>,
+    targets: Vec<String>,
 ) -> pack::CheckShardHttpRequest {
     pack::CheckShardHttpRequest {
         decl: "__batch__".to_string(),
@@ -2389,6 +2390,7 @@ fn make_batch_zreq(
         skip_cas_lock: true,
         allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
         lean_args,
+        targets,
     }
 }
 
@@ -4367,6 +4369,10 @@ pub fn run_pr_verify_command(
                     &toolchain,
                     &lean_path_str,
                     cross_args.clone(),
+                    uncached_by_file
+                        .iter()
+                        .flat_map(|(_, fu, _)| fu.iter().map(|(_, sh)| sh.name.clone()))
+                        .collect(),
                 );
                 let mut cross_ok = if let Some(ref z_url) = fast_local_zygote_url {
                     pack::try_zygote_url_check_shard_with_inflight(z_url, &zreq, || {
@@ -4617,6 +4623,7 @@ pub fn run_pr_verify_command(
                                         &toolchain,
                                         &lean_path_str,
                                         file_lean_args.clone(),
+                                        uncached_names.iter().cloned().collect(),
                                     );
                                     if pack::try_zygote_url_check_shard_with_inflight(
                                         z_url,
@@ -4700,6 +4707,7 @@ pub fn run_pr_verify_command(
                                     &toolchain,
                                     &lean_path_str,
                                     file_lean_args.clone(),
+                                    uncached_names.iter().cloned().collect(),
                                 );
                                 if pack::try_zygote_url_check_shard(z_url, &zreq).is_some() {
                                     return Ok(true);
@@ -4815,6 +4823,7 @@ pub fn run_pr_verify_command(
                                     skip_cas_lock: true,
                                     allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
                                     lean_args: file_lean_args.clone(),
+                                    targets: Vec::new(),
                                 };
                                 if pack::try_zygote_url_check_shard_with_inflight(
                                     z_url,

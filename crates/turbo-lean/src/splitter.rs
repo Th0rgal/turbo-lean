@@ -3140,35 +3140,83 @@ pub fn with_axiom_audit(src: &str, names: &std::collections::HashSet<String>) ->
     (out, after_line.values().map(Vec::len).sum())
 }
 
-/// Whether Lean's `output` for `src` warns `declaration uses 'sorry'` inside one of the `names`
-/// declarations (anywhere, when none of them is found or a warning has no position). Unlike the
-/// transitive `#print axioms`, the warning is per declaration, so prefix stubs a target uses do not count.
-pub fn sorry_warning_in_decls(
+/// A plain-`lean` axiom audit of the `names` declarations of a shard source (see `plain_lean_audit`).
+pub struct PlainLeanAudit {
+    /// The source to run: other theorems' one-line `… := sorry` stubs become `axiom`s, and every
+    /// audited theorem is followed by `#print axioms`.
+    pub source: String,
+    audited: usize,
+    expected: usize,
+    stubs: Vec<String>,
+    names: std::collections::HashSet<String>,
+}
+
+/// Prepare a plain-`lean` audit of the `expected` declarations named by `names` in `src`. Turning the
+/// host's `sorry` stubs into named axioms makes `#print axioms` exact: a `sorryAx` it reports for an
+/// audited theorem is the theorem's own (or a real dependency's), never a stub's, and no option or
+/// warning setting can hide it.
+pub fn plain_lean_audit(
     src: &str,
-    output: &str,
     names: &std::collections::HashSet<String>,
-) -> bool {
-    let ranges: Vec<(usize, usize)> = split_lean_source(src, &[])
-        .shards
-        .iter()
-        .filter(|sh| matches_uncached_or_fast_verify_name(&sh.name, names))
-        .map(|sh| (sh.start_line, sh.end_line))
-        .collect();
-    output
-        .lines()
-        .filter(|l| {
-            l.contains("declaration uses 'sorry'") || l.contains("declaration uses `sorry`")
-        })
-        .any(|l| {
-            let line_no = l
-                .split(": warning:")
-                .next()
-                .and_then(|head| head.rsplit(':').nth(1))
-                .and_then(|n| n.trim().parse::<usize>().ok());
-            line_no.is_none_or(|ln| {
-                ranges.is_empty() || ranges.iter().any(|&(a, b)| a <= ln && ln <= b)
-            })
-        })
+    expected: usize,
+) -> PlainLeanAudit {
+    let mut lines: Vec<String> = src.split_inclusive('\n').map(String::from).collect();
+    let mut stubs = Vec::new();
+    for sh in split_lean_source(src, &[]).shards {
+        if sh.start_line != sh.end_line || matches_uncached_or_fast_verify_name(&sh.name, names) {
+            continue;
+        }
+        let Some(line) = lines.get_mut(sh.start_line.wrapping_sub(1)) else {
+            continue;
+        };
+        let Some(head) = line.trim_end().strip_suffix(":= sorry") else {
+            continue;
+        };
+        let keyword = ["theorem ", "lemma "].iter().find_map(|kw| {
+            head.match_indices(kw)
+                .map(|(i, _)| (i, kw.len()))
+                .find(|&(i, _)| i == 0 || head[..i].ends_with(|c: char| c.is_whitespace() || c == ']'))
+        });
+        if let Some((i, len)) = keyword {
+            *line = format!("{}axiom {}\n", &head[..i], head[i + len..].trim_end());
+            stubs.push(sh.name);
+        }
+    }
+    let (source, audited) = with_axiom_audit(&lines.concat(), names);
+    PlainLeanAudit {
+        source,
+        audited,
+        expected,
+        stubs,
+        names: names.clone(),
+    }
+}
+
+impl PlainLeanAudit {
+    /// Audit failures in Lean's `stdout`: missing reports, and any axiom of an audited theorem that is
+    /// neither admitted by `allowed` nor a stub axiom (so always `sorryAx`).
+    pub fn violations(&self, stdout: &str, allowed: &[String]) -> Vec<String> {
+        let mut reports = parse_print_axioms(stdout);
+        reports.retain(|(n, _)| matches_uncached_or_fast_verify_name(n, &self.names));
+        if self.audited < self.expected.max(1) || reports.len() < self.audited {
+            return vec![format!(
+                "[TurboLean.KernelGate] axiom audit incomplete: {} of {} declarations reported",
+                reports.len(),
+                self.expected
+            )];
+        }
+        let is_stub = |ax: &str| {
+            self.stubs
+                .iter()
+                .any(|s| ax == s || ax.strip_suffix(s.as_str()).is_some_and(|p| p.ends_with('.')))
+        };
+        reports
+            .iter()
+            .flat_map(|(n, axs)| axs.iter().map(move |a| (n, a)))
+            .filter(|(_, a)| !axiom_allowed_under(a, allowed) && !is_stub(a))
+            .map(|(n, a)| format!("[TurboLean.KernelGate] `{}` depends on disallowed axiom `{}`", n, a))
+            .collect()
+    }
 }
 
 /// Parse Lean's `#print axioms` replies (`'N' depends on axioms: [a, b]`, possibly wrapped over
@@ -3313,49 +3361,9 @@ fn slice_up_to_line(src: &str, max_line: usize) -> &str {
 }
 
 fn optimize_fast_check_proof_body(proof_orig: &str) -> std::borrow::Cow<'_, str> {
-    let trimmed = proof_orig.trim();
-    if (proof_orig.contains("dsimp [Word256.addWithCarry, Word256.zero]; simp")
-        || proof_orig.contains("dsimp only [Word256.addWithCarry, Word256.zero]; simp")
-        || proof_orig.contains("unfold Word256.addWithCarry; unfold Word256.zero; simp")
-        || proof_orig.contains("unfold Word256.addWithCarry Word256.zero; simp")
-        || proof_orig.contains("unfold Word256.addWithCarry Word256.zero; dsimp; simp")
-        || proof_orig.contains("simp only [Word256.addWithCarry, Word256.zero, UInt64.add_zero")
-        || (proof_orig.contains("unfold Word256.addWithCarry")
-            && proof_orig.contains("Word256.zero")
-            && proof_orig.contains("dsimp")
-            && proof_orig.contains("simp"))
-        || proof_orig.contains("simp [Word256.addWithCarry, Word256.zero]"))
-        && !proof_orig.contains("simp only [Word256.addWithCarry, Word256.zero, UInt64.zero_add")
-    {
-        std::borrow::Cow::Borrowed(" addWithCarry_zero_right a\n")
-    } else if proof_orig.contains("dsimp [Word256.addWithCarry]; simp [UInt64.add_comm]")
-        || proof_orig.contains("unfold Word256.addWithCarry; simp [UInt64.add_comm]")
-        || proof_orig.contains("unfold Word256.addWithCarry; dsimp; simp [UInt64.add_comm]")
-        || proof_orig.contains("simp [Word256.addWithCarry, UInt64.add_comm]")
-    {
-        std::borrow::Cow::Borrowed(" addWithCarry_comm_low a b\n")
-    } else if proof_orig.contains("unfold getStorage setStorage; simp [StorageKey.fastBeq_refl]")
-        || proof_orig.contains("simp [getStorage, setStorage, StorageKey.fastBeq_refl]")
-    {
-        std::borrow::Cow::Borrowed(" getStorage_setStorage_same\n")
-    } else if proof_orig.contains("unfold getStorage setStorage")
-        && proof_orig.contains("cases hbeq : StorageKey.fastBeq k' k")
-        && proof_orig.contains("exact h ((StorageKey.fastBeq_eq_true_iff k' k).mp hbeq)")
-    {
-        std::borrow::Cow::Borrowed(" getStorage_setStorage_other h\n")
-    } else if proof_orig.contains("induction ups with")
-        && proof_orig.contains("simp only [evalLookupRev] at h")
-        && proof_orig.contains("Option.some.injEq")
-    {
-        std::borrow::Cow::Borrowed(" lookup_chain_sound s ups target val h\n")
-    } else if trimmed.starts_with("by")
-        && trimmed.contains("unfold Word256.")
-        && (trimmed.contains("dsimp; simp")
-            || trimmed.ends_with("; simp")
-            || trimmed.ends_with("\n  simp"))
-    {
-        std::borrow::Cow::Borrowed(" by rfl\n")
-    } else if proof_orig.contains("dsimp [") && proof_orig.contains("]; simp") {
+    // Only rewrites that keep every user tactic: substituting a whole proof body would certify a proof
+    // that was never checked (and drop any `sorry`-expanding tactic it contains).
+    if proof_orig.contains("dsimp [") && proof_orig.contains("]; simp") {
         std::borrow::Cow::Owned(proof_orig.replace("dsimp [", "dsimp only ["))
     } else if proof_orig.contains("unfold getStorage setStorage") && proof_orig.contains("dsimp") {
         std::borrow::Cow::Owned(
@@ -4639,16 +4647,19 @@ mod tests {
     }
 
     #[test]
-    fn test_sorry_warning_in_decls_is_per_declaration() {
-        let src = "theorem good : 1 + 1 = 2 := sorry\ntheorem uses_good : 1 + 1 = 2 := good\ntheorem sneaky : False := cheat\n";
-        let has = |out: &str, n: &str| sorry_warning_in_decls(src, out, &HashSet::from([n.into()]));
-        let stub_only = "/tmp/x.lean:1:8: warning: declaration uses 'sorry'\n";
-        assert!(!has(stub_only, "uses_good"));
-        let target_too = format!("{stub_only}/tmp/x.lean:3:8: warning: declaration uses `sorry`\n");
-        assert!(has(&target_too, "sneaky") && !has(&target_too, "uses_good"));
-        // Fail closed when the target is not found or a warning has no position.
-        assert!(has(stub_only, "missing"));
-        assert!(has("warning: declaration uses 'sorry'\n", "uses_good"));
+    fn test_plain_lean_audit_axiomatizes_other_stubs_only() {
+        let src = "theorem good : 1 + 1 = 2 := sorry\n@[simp] private theorem g2 : True := sorry\ntheorem bad : False := sorry\n";
+        let names = HashSet::from(["bad".to_string()]);
+        let audit = plain_lean_audit(src, &names, 1);
+        assert!(audit.source.starts_with("axiom good : 1 + 1 = 2\n@[simp] private axiom g2 : True\ntheorem bad : False := sorry\n"), "{}", audit.source);
+        assert!(audit.source.contains("#print axioms bad"));
+        let allowed = allowed_axioms();
+        let ok = "'bad' depends on axioms: [good, propext]\n";
+        assert!(audit.violations(ok, &allowed).is_empty());
+        let own = "'bad' depends on axioms: [good, sorryAx]\n";
+        assert_eq!(audit.violations(own, &allowed).len(), 1);
+        // A missing report fails closed.
+        assert_eq!(audit.violations("", &allowed).len(), 1);
     }
 
     #[test]

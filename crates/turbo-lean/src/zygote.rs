@@ -1674,8 +1674,8 @@ fn encode_lean_args_hex(lean_args: &[String]) -> String {
 }
 
 /// Worker mode flag for a stubbed (`allow_stub`) or strict check. Named `stub_targets` (the declarations
-/// under check) travel as `allow_stub:<hex>`; the worker never exempts their `sorryAx` (it exempts only
-/// kernel-value `sorry` stubs, never by source text).
+/// under check) travel as `allow_stub:<hex>`; the worker never exempts their `sorryAx`, exempts only
+/// kernel-value `sorry` stubs (never by source text), and exempts nothing in a final run without them.
 fn stub_mode_flag(allow_stub: bool, stub_targets: &[String]) -> String {
     match (allow_stub, stub_targets.is_empty()) {
         (false, _) => "strict".to_string(),

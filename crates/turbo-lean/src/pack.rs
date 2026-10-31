@@ -255,6 +255,10 @@ pub struct CheckShardHttpRequest {
     pub allowed_axioms: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lean_args: Vec<String>,
+    /// Batch requests: the declarations under check (never `sorry`-stub exempt). When empty, every
+    /// declaration of `shard_source` is treated as a target.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -3313,6 +3317,7 @@ pub(crate) mod tests {
             skip_cas_lock: false,
             allowed_axioms: None,
             lean_args: Vec::new(),
+            targets: Vec::new(),
         };
         let body = serde_json::to_vec(&req)?;
         let resp1: serde_json::Value =
@@ -3339,6 +3344,7 @@ pub(crate) mod tests {
             skip_cas_lock: false,
             allowed_axioms: Some(Vec::new()),
             lean_args: Vec::new(),
+            targets: Vec::new(),
         };
         let strict_res = http_request(
             "POST",
@@ -3522,6 +3528,7 @@ pub(crate) mod tests {
             skip_cas_lock: false,
             allowed_axioms: None,
             lean_args: Vec::new(),
+            targets: Vec::new(),
         };
         let post = |req: &CheckShardHttpRequest| -> Result<serde_json::Value> {
             Ok(serde_json::from_slice(&http_request(
@@ -3648,6 +3655,7 @@ pub(crate) mod tests {
             skip_cas_lock: true,
             allowed_axioms: None,
             lean_args: Vec::new(),
+            targets: Vec::new(),
         };
         let err = execute_check_shard_payload(&mut store, &req).unwrap_err();
         assert!(
@@ -3681,6 +3689,7 @@ pub(crate) mod tests {
             skip_cas_lock: true,
             allowed_axioms: None,
             lean_args: Vec::new(),
+            targets: Vec::new(),
         };
         let res1 = execute_check_shard_payload(&mut store, &req)?;
         assert_eq!(

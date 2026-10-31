@@ -41,10 +41,22 @@ impl Project {
              theorem sneaky : False := cheat\n",
         )
         .unwrap();
+        // A `sorry` no lexical scan sees: the macro builds the `sorry` syntax node from strings.
+        fs::write(
+            root.join("H.lean"),
+            "theorem good : 1 + 1 = 2 := rfl\n\
+             macro \"cheat\" : term => return ⟨Lean.Syntax.node .none (Lean.Name.mkStr4 \"Lean\" \"Parser\" \"Term\" (\"sor\" ++ \"ry\")) #[Lean.Syntax.atom .none (\"sor\" ++ \"ry\")]⟩\n\
+             theorem sneaky : False := cheat\n",
+        )
+        .unwrap();
         Self(root)
     }
 
     fn check(&self, file: &str, decl: &str, daemon: bool) -> Output {
+        self.run(&["check", file, "--decl", decl], daemon)
+    }
+
+    fn run(&self, args: &[&str], daemon: bool) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_turbo-lean"));
         for (key, _) in std::env::vars_os() {
             if key.to_string_lossy().starts_with("TURBO_LEAN_") {
@@ -54,7 +66,7 @@ impl Project {
         cmd.current_dir(&self.0)
             .args(["--json", "--cache-dir"])
             .arg(self.0.join("cache"))
-            .args(["check", file, "--decl", decl])
+            .args(args)
             .env("TURBO_LEAN_HOME", self.0.join("cache"))
             .env("TURBO_LEAN_STAGING_DIR", self.0.join("staging"))
             .env("TURBO_LEAN_TELEMETRY", "off")
@@ -142,26 +154,17 @@ fn check_decl_rejects_sorry_target_and_keeps_prefix_stubs() {
             String::from_utf8_lossy(&good.stderr)
         );
         assert_rejected(&p, "G.lean", "sneaky", daemon);
-        // Whole-file and directory checks reject too, even with the targets' shards attempted above.
-        for target in ["F.lean", "."] {
-            let mut cmd = Command::new(env!("CARGO_BIN_EXE_turbo-lean"));
-            let out = cmd
-                .current_dir(&p.0)
-                .args(["--json", "--cache-dir"])
-                .arg(p.0.join("cache"))
-                .args(["check", target])
-                .env("TURBO_LEAN_HOME", p.0.join("cache"))
-                .env("TURBO_LEAN_STAGING_DIR", p.0.join("staging"))
-                .env("TURBO_LEAN_TELEMETRY", "off")
-                .env("TURBO_LEAN_NO_DAEMON", "1")
-                .output()
-                .unwrap();
+        // Whole-file and directory checks reject too, even with the targets' shards attempted above;
+        // the hidden `sorry` of `H.lean` first, so its whole-file check cannot seed `--decl` caches.
+        for target in ["H.lean", "F.lean", "G.lean", "."] {
+            let out = p.run(&["check", target], daemon);
             assert!(
                 !out.status.success(),
-                "check {target} must be rejected:\n{}{}",
+                "check {target} (daemon={daemon}) must be rejected:\n{}{}",
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
             );
         }
+        assert_rejected(&p, "H.lean", "sneaky", daemon);
     }
 }

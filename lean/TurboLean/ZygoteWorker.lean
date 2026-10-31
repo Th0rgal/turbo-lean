@@ -343,16 +343,15 @@ def ownedByTarget (targets : List String) (n : Name) : Bool :=
 
 /-- Per-declaration `sorryAx` exemption for stubbed elaboration (`allowStub`), never by source text: only
     `sorry` stubs (by kernel value) that no host-named target owns are exempt (their values are also opaque to
-    the transitive audit), so a named target's own `sorry` is always rejected. When the host named targets, a
-    final run (the one elaborating them) exempts nothing unless one of them is among its new declarations; a
+    the transitive audit), so a named target's own `sorry` is always rejected. A final run (the one elaborating
+    the targets) exempts nothing unless the host named targets and one of them is among its new declarations; a
     prefix run gets no names, so the final run rejects a target stubbed there (`targetInStubbedPrefix`). -/
 def stubSorryExemption (beforeEnv afterEnv : Environment) (allowStub finalRun : Bool)
     (targets : List String) : Name → Bool :=
   let beforeMap := beforeEnv.constants.map₂
   let anyOwned := afterEnv.constants.map₂.foldl
     (fun acc n _ => acc || (!beforeMap.contains n && ownedByTarget targets n)) false
-  fun n => allowStub && (targets.isEmpty || !finalRun || anyOwned) && !ownedByTarget targets n &&
-    isSorryStubDecl afterEnv n
+  fun n => allowStub && (!finalRun || anyOwned) && !ownedByTarget targets n && isSorryStubDecl afterEnv n
 
 /-- Whether a `sorry` stub owned by one of `targets` was added in a stubbed prefix run (it is in `prefixEnv`'s
     local constants), where `sorry` stubs are exempt without regard to target names. -/
