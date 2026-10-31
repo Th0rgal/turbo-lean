@@ -1019,19 +1019,24 @@ def isPinnedFfiOpaque (env : Environment) (ffiAllow : Array (Name × Name × Str
         (Lean.getExternNameFor env `c cinfo.name).any fun sym => ffiAllow.contains (m, cinfo.name, sym)
   | _ => false
 
-/-- Validated prefix stubs of the audited modules: theorems named in `stubOk` (exact full name)
-    whose kernel value is an explicit `sorry` (`isExplicitSorryStub`). -/
-def collectStubDecls (env : Environment) (targets : Array (String × Name)) (stubOk : Array String) :
-    Std.HashSet Name := Id.run do
+/-- Validated prefix stubs of a compiled shard module (`consts`): each host-named `stubOk` entry
+    (the source name, matched as a dotted suffix of the full name) exempts the unique module
+    theorem it names whose kernel value is an explicit `sorry` (`isExplicitSorryStub`). An entry
+    matching several such theorems (e.g. one injected by a metaprogram) is a violation. -/
+def collectStubDecls (consts : Array ConstantInfo) (stubOk : Array String) :
+    Std.HashSet Name × List String := Id.run do
   let mut out : Std.HashSet Name := {}
-  if stubOk.isEmpty then return out
-  for (_, nm) in targets do
-    if let some modIdx := env.getModuleIdx? nm then
-      if h : modIdx.toNat < env.header.moduleData.size then
-        for cinfo in env.header.moduleData[modIdx.toNat].constants do
-          if stubOk.contains (cinfo.name.toString (escape := false)) && isExplicitSorryStub cinfo then
-            out := out.insert cinfo.name
-  return out
+  let mut violations : List String := []
+  for e in stubOk do
+    let hits := consts.filter fun c =>
+      let s := c.name.toString (escape := false)
+      (s == e || s.endsWith ("." ++ e)) && isExplicitSorryStub c
+    match hits with
+    | #[c] => out := out.insert c.name
+    | #[] => pure ()
+    | _ => violations := violations ++
+      [s!"[TurboLean.KernelGate] prefix stub `{e}` is ambiguous: {hits.map (·.name)}"]
+  return (out, violations)
 
 def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Name))
     (ffiAllow : Array (Name × Name × String) := #[])
@@ -1183,21 +1188,10 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
         violations := violations ++ checkCSimpEntry entry
   return violations
 
-/-- Non-stub theorems of the audited modules, read from the kernel environment (never from
-    elaboration output), so the host can confirm every audited target was actually declared. -/
-def collectModuleTheorems (env : Environment) (targets : Array (String × Name))
-    (stubs : Std.HashSet Name) : Array String := Id.run do
-  let mut out : Array String := #[]
-  for (_, nm) in targets do
-    if let some modIdx := env.getModuleIdx? nm then
-      if h : modIdx.toNat < env.header.moduleData.size then
-        for cinfo in env.header.moduleData[modIdx.toNat].constants do
-          if cinfo.isTheorem && !stubs.contains cinfo.name then
-            out := out.push (cinfo.name.toString (escape := false))
-  return out
-
 /-- Audit a single compiled shard module: like `auditModuleSlice`, but exempts validated prefix
-    stubs named in `stubOk` and also returns the module's non-stub theorems. -/
+    stubs named in `stubOk` and also returns the module's non-stub theorems, read from the kernel
+    environment (never from elaboration output) so the host can confirm every audited target
+    was actually declared. -/
 def auditShardModule (target : String × Name) (ffiAllow : Array (Name × Name × String))
     (stubOk : Array String) : IO (List String × Array String) := do
   let patterns := (((← IO.getEnv "TURBO_LEAN_ALLOWED_AXIOMS").getD "").splitOn ",").filterMap fun p =>
@@ -1208,9 +1202,14 @@ def auditShardModule (target : String × Name) (ffiAllow : Array (Name × Name �
     if t.isEmpty then none else some t
   try
     let env ← Lean.importModules #[{ module := target.2, importAll := true }] {} 0 #[] true false .private
-    let stubs := collectStubDecls env #[target] stubOk
-    return (auditImportedModulesInEnv env #[target] ffiAllow patterns csimpPatterns stubs,
-      collectModuleTheorems env #[target] stubs)
+    let consts := match env.getModuleIdx? target.2 with
+      | some modIdx => (env.header.moduleData[modIdx.toNat]?).map (·.constants) |>.getD #[]
+      | none => #[]
+    let (stubs, stubViolations) := collectStubDecls consts stubOk
+    let decls := consts.filterMap fun c =>
+      if c.isTheorem && !stubs.contains c.name then some (c.name.toString (escape := false)) else none
+    return (stubViolations ++ auditImportedModulesInEnv env #[target] ffiAllow patterns csimpPatterns stubs,
+      decls)
   catch e =>
     return ([s!"[TurboLean.KernelGate] failed to import `{target.1}` for audit: {e}"], #[])
 

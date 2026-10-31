@@ -1150,6 +1150,9 @@ struct ZygoteAuditModulesReply {
     pub audited: Option<Vec<String>>,
     #[serde(default)]
     pub violations: Vec<String>,
+    /// `--shard` mode: the module's non-stub theorems, read from the kernel environment.
+    #[serde(default)]
+    pub decls: Option<Vec<String>>,
 }
 
 pub(crate) struct PinnedFfiPackage {
@@ -1440,7 +1443,14 @@ fn audit_compiled_module_batch(
         is_untrusted,
     )
     .context("Failed to execute in-kernel `.olean` soundness auditor (`--audit-modules`)")?;
+    parse_audit_modules_reply(&out, mod_names).map(drop)
+}
 
+/// The auditor's verdict on `mod_names`: its JSON reply when every module passed, else an error.
+fn parse_audit_modules_reply(
+    out: &std::process::Output,
+    mod_names: &[String],
+) -> Result<ZygoteAuditModulesReply> {
     let stdout_str = String::from_utf8_lossy(&out.stdout);
     let stderr_str = String::from_utf8_lossy(&out.stderr);
     let json_line = stdout_str
@@ -1458,7 +1468,7 @@ fn audit_compiled_module_batch(
                 && reply.violations.is_empty()
                 && reply.audited.as_deref() == Some(mod_names) =>
         {
-            Ok(())
+            Ok(reply)
         }
         Some(reply) => {
             let details = if reply.violations.is_empty() {
@@ -1487,6 +1497,118 @@ fn audit_compiled_module_batch(
             );
         }
     }
+}
+
+/// Plain-`lean` fallback for a shard the zygote could not check (unavailable or import failure):
+/// compile `source` to a scratch `.olean`, then accept it only on the kernel-level
+/// `--audit-modules --shard` verdict over the compiled module (axioms incl. `sorryAx`,
+/// extern/implemented_by, csimp, `unsafe`), never on output the shard itself controls. Only the
+/// source's `:= sorry` prefix stubs outside `audit` are exempt, by name and kernel value, and every
+/// `audit` theorem must be declared. A failed compile returns its non-success output; an audit
+/// rejection is an error.
+pub(crate) fn run_audited_lean_shard(
+    store: &TurboStore,
+    lean_bin: &Path,
+    env_vars: &std::collections::HashMap<String, String>,
+    cwd: Option<&Path>,
+    source: &str,
+    audit: &std::collections::HashSet<String>,
+    lean_args: &[String],
+) -> Result<std::process::Output> {
+    let mod_name = format!("TurboAuditedShard_{}_{}", std::process::id(), next_tmp_id());
+    let tmp_dir = store.fast_staging_dir().join(&mod_name);
+    let _ = fs::remove_dir_all(&tmp_dir);
+    fs::create_dir_all(&tmp_dir)?;
+    struct TmpDirGuard(PathBuf);
+    impl Drop for TmpDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _guard = TmpDirGuard(tmp_dir.clone());
+    let lean_file = tmp_dir.join(format!("{}.lean", mod_name));
+    fs::write(&lean_file, source)?;
+    let mut cmd = Command::new(lean_bin);
+    cmd.args(crate::module_builder::filter_allowed_lean_args(lean_args))
+        .arg("-Ddebug.skipKernelTC=false")
+        .arg(&lean_file)
+        .arg("-R")
+        .arg(&tmp_dir)
+        .arg("-o")
+        .arg(tmp_dir.join(format!("{}.olean", mod_name)))
+        .envs(env_vars);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let out = cmd
+        .output()
+        .context("Failed to execute `lean` on shard fallback")?;
+    if !out.status.success() {
+        return Ok(out);
+    }
+
+    let lean_path = env_vars
+        .get("LEAN_PATH")
+        .cloned()
+        .or_else(|| std::env::var("LEAN_PATH").ok())
+        .filter(|lp| !lp.is_empty())
+        .map_or_else(
+            || tmp_dir.display().to_string(),
+            |lp| format!("{}:{}", tmp_dir.display(), lp),
+        );
+    let mut auditor = Command::new(ensure_zygote_binary(store, lean_bin, env_vars)?);
+    auditor
+        .envs(env_vars)
+        .env("LEAN", lean_bin)
+        .env("LEAN_PATH", lean_path)
+        .args(["--audit-modules", "--shard"]);
+    if !env_vars.contains_key(crate::splitter::ALLOWED_AXIOMS_ENV) {
+        auditor.env(
+            crate::splitter::ALLOWED_AXIOMS_ENV,
+            crate::splitter::extra_allowed_axiom_patterns().join(","),
+        );
+    }
+    for sh in crate::splitter::split_lean_source(source, &[]).shards {
+        if crate::splitter::strip_lean_comments(&sh.proof_text).trim() == "sorry"
+            && !crate::splitter::matches_uncached_or_fast_verify_name(&sh.name, audit)
+        {
+            auditor.arg(format!("--stub-ok={}", sh.name));
+        }
+    }
+    auditor.arg(&mod_name);
+    if let Some(dir) = cwd {
+        auditor.current_dir(dir);
+    }
+    let timeout_secs = std::env::var("TURBO_LEAN_AUDIT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(300);
+    let audit_out = crate::module_builder::run_command_with_timeout(
+        auditor,
+        std::time::Duration::from_secs(timeout_secs),
+        false,
+    )
+    .context("Failed to execute in-kernel shard auditor (`--audit-modules --shard`)")?;
+    let decls = parse_audit_modules_reply(&audit_out, std::slice::from_ref(&mod_name))?
+        .decls
+        .unwrap_or_default();
+    let missing: Vec<&String> = audit
+        .iter()
+        .filter(|name| {
+            let one = std::collections::HashSet::from([(*name).clone()]);
+            !decls
+                .iter()
+                .any(|d| crate::splitter::matches_uncached_or_fast_verify_name(d, &one))
+        })
+        .collect();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "[TurboLean.KernelGate] audited theorem(s) {:?} missing from the compiled shard",
+            missing
+        );
+    }
+    Ok(out)
 }
 
 static ZYGOTE_LEAN_PATH_CACHE: std::sync::OnceLock<
@@ -3146,17 +3268,23 @@ pub(crate) fn try_zygote_url_check_shard_inner_with_inflight_detailed(
         on_inflight,
     ) {
         Ok(b) => b,
-        Err(e) => {
-            let err = extract_http_error_detail(e);
-            if err.to_string().contains("Zygote import unavailable") {
-                return Ok(None);
-            }
-            return Err(err);
-        }
+        Err(e) => return check_shard_http_error(e),
     };
-    match parse_check_shard_resp(&resp_bytes) {
-        Err(e) if e.to_string().contains("Zygote import unavailable") => Ok(None),
-        other => other,
+    parse_check_shard_resp(&resp_bytes)
+}
+
+/// `/check-shard` outcome for a failed request: a daemon that answered with an error rejected the
+/// shard, which is final; no answer (transport failure) or `Zygote import unavailable` means the
+/// zygote is unavailable (`Ok(None)`), so only then may an audited fallback run.
+fn check_shard_http_error(e: anyhow::Error) -> Result<Option<serde_json::Value>> {
+    if !e.to_string().contains("HTTP ") {
+        return Ok(None);
+    }
+    let err = extract_http_error_detail(e);
+    if err.to_string().contains("Zygote import unavailable") {
+        Ok(None)
+    } else {
+        Err(err)
     }
 }
 
@@ -3201,17 +3329,10 @@ pub fn try_local_zygote_check_shard_detailed(
         Some(&auth_token),
         || {},
     ) {
-        Ok(resp_bytes) => match parse_check_shard_resp(&resp_bytes) {
-            Err(e) if e.to_string().contains("Zygote import unavailable") => Ok(None),
-            other => other,
-        },
+        Ok(resp_bytes) => parse_check_shard_resp(&resp_bytes),
         Err(e) => {
             if e.to_string().contains("HTTP ") {
-                let err = extract_http_error_detail(e);
-                if err.to_string().contains("Zygote import unavailable") {
-                    return Ok(None);
-                }
-                return Err(err);
+                return check_shard_http_error(e);
             }
             if let Some((_, _, _, _, state_file)) = current_exe_daemon_paths(store) {
                 terminate_and_remove_daemon_state_file(&state_file);
@@ -3222,7 +3343,7 @@ pub fn try_local_zygote_check_shard_detailed(
                 return Ok(None);
             };
             let retry_endpoint = format!("{}/check-shard", retry_url.trim_end_matches('/'));
-            let resp_bytes = http_request_with_timeout_and_token(
+            match http_request_with_timeout_and_token(
                 "POST",
                 &retry_endpoint,
                 "application/json",
@@ -3230,9 +3351,10 @@ pub fn try_local_zygote_check_shard_detailed(
                 None,
                 Some(&retry_token),
                 || {},
-            )
-            .map_err(extract_http_error_detail)?;
-            parse_check_shard_resp(&resp_bytes)
+            ) {
+                Ok(resp_bytes) => parse_check_shard_resp(&resp_bytes),
+                Err(e) => check_shard_http_error(e),
+            }
         }
     }
 }
