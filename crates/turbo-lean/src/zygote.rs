@@ -441,6 +441,7 @@ fn owned_lifecycle_process(pid: u32, staging: Option<&Path>, parent: Option<u32>
     let args = fs::read(proc.join("cmdline")).unwrap_or_default();
     let env = fs::read(proc.join("environ")).unwrap_or_default();
     let worker = (name.starts_with("turbo_zygote_") || name == "turbo-zygote")
+        && !args.is_empty()
         && !args.split(|b| *b == 0).any(|arg| arg == b"--audit-modules");
     let server = name.trim_end_matches(" (deleted)") == "turbo-lean"
         && is_serve_command(&args)
@@ -4424,7 +4425,9 @@ mod tests {
         // Establish a stable baseline before testing deliberate identity changes.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            if let Some(process) = LifecycleProcess::open(child.id(), staging, None) {
+            if let Some(process) = LifecycleProcess::open(child.id(), staging, None)
+                .filter(|p| !p.identity.2.is_empty())
+            {
                 return process;
             }
             assert!(
