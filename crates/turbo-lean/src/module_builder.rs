@@ -1794,7 +1794,6 @@ fn classify_lake_field(scope: LakeScope, key: &str, val: &str) -> LakeField {
         ) => LakeField::Passive,
         (Package, "bootstrap") => only_if(v == "false"),
         (Lib, "libName" | "libPrefixOnWindows" | "allowImportAll") => LakeField::Passive,
-        (Lib, "precompileLibrary") => only_if(v == "false"),
         (Exe, "exeName") => LakeField::Passive,
         _ => LakeField::Unknown,
     }
@@ -1837,14 +1836,15 @@ fn check_lake_field(
         format!("{} {} field `{}` in {}", what, scope_name, key, location()),
     )
 }
-/// `precompileModules`: Lake then loads the library's shared library into every module that
+/// `precompileModules` / `precompileLibrary` (Lake's `LeanLib.shouldPrecompile`): Lake then loads the library's shared library into every module that
 /// imports it (and into its own modules' elaboration), changing their traces; turbo-lean
 /// builds neither, so `true` fails closed for every package.
-fn lake_precompile_modules(val: &str, location: &dyn Fn() -> String) -> Result<bool> {
+fn lake_precompile(key: &str, val: &str, location: &dyn Fn() -> String) -> Result<bool> {
     let on = parse_toml_bool(val)?;
     if !c_abi::verify_static_lake_config(true, on, false, false) {
         anyhow::bail!(
-            "Unsupported `precompileModules = true` in {}: Lake loads precompiled shared libraries turbo-lean does not build: fail-closed static Lake config gate",
+            "Unsupported `{} = true` in {}: Lake loads precompiled shared libraries turbo-lean does not build: fail-closed static Lake config gate",
+            key,
             location()
         );
     }
@@ -2065,7 +2065,7 @@ pub fn parse_lakefile_toml(
                     "moreLeanArgs" => pkg.more_lean_args = parse_toml_string_array(&val_accum)?,
                     "weakLeanArgs" => pkg.weak_lean_args = parse_toml_string_array(&val_accum)?,
                     "precompileModules" => {
-                        pkg.precompile_modules = lake_precompile_modules(&val_accum, &location)?
+                        pkg.precompile_modules = lake_precompile(key, &val_accum, &location)?
                     }
                     "leanOptions" => {
                         let tbl = parse_toml_lean_options_table(&val_accum)?;
@@ -2109,8 +2109,10 @@ pub fn parse_lakefile_toml(
                     "moreLeanArgs" => lib.more_lean_args = parse_toml_string_array(&val_accum)?,
                     "weakLeanArgs" => lib.weak_lean_args = parse_toml_string_array(&val_accum)?,
                     "precompileModules" => {
-                        lib.precompile_modules =
-                            Some(lake_precompile_modules(&val_accum, &location)?)
+                        lib.precompile_modules = Some(lake_precompile(key, &val_accum, &location)?)
+                    }
+                    "precompileLibrary" => {
+                        lake_precompile(key, &val_accum, &location)?;
                     }
                     "leanOptions" => {
                         let tbl = parse_toml_lean_options_table(&val_accum)?;
@@ -3728,8 +3730,7 @@ pub fn parse_lakefile_lean(
                             pkg.weak_lean_args = parse_lean_string_array_expr(&val_accum)?;
                         }
                         "precompileModules" => {
-                            pkg.precompile_modules =
-                                lake_precompile_modules(&val_accum, &location)?;
+                            pkg.precompile_modules = lake_precompile(key, &val_accum, &location)?;
                         }
                         "leanOptions" => {
                             pkg.lean_options.extend(resolve_lean_options_expr(
@@ -3770,7 +3771,10 @@ pub fn parse_lakefile_lean(
                             }
                             "precompileModules" => {
                                 lib.precompile_modules =
-                                    Some(lake_precompile_modules(&val_accum, &location)?);
+                                    Some(lake_precompile(key, &val_accum, &location)?);
+                            }
+                            "precompileLibrary" => {
+                                lake_precompile(key, &val_accum, &location)?;
                             }
                             "leanOptions" => {
                                 lib.lean_options.extend(resolve_lean_options_expr(
@@ -8017,6 +8021,19 @@ fn compile_single_module_direct(
     Ok((dur_ms, stdout_str, expected_dig))
 }
 
+/// Whether every cached file output of a module lands on one of `node`'s artifact paths.
+fn cas_outputs_bound_to_node(outputs: &[BlobEntry], target_root: &Path, node: &ModuleNode) -> bool {
+    let expected: Vec<PathBuf> = olean_artifact_paths(&node.olean_path)
+        .into_iter()
+        .map(|(_, p)| p)
+        .chain([node.c_path.clone()])
+        .collect();
+    outputs
+        .iter()
+        .filter(|o| !o.rel_path.starts_with("thm:"))
+        .all(|o| expected.contains(&target_root.join(&o.rel_path)))
+}
+
 fn store_module_artifacts_in_cas(
     store: &mut TurboStore,
     canon_project_dir: &Path,
@@ -8293,12 +8310,16 @@ pub fn build_project_modules_native(
                     cas_hit_outputs = Some(outputs);
                 }
             }
+            let target_root = if node.pkg_root.starts_with(&canon_dir) {
+                &canon_dir
+            } else {
+                &node.pkg_root
+            };
+            // Recorded output paths come from whichever checkout stored the entry and are not
+            // part of the key: restore only onto this node's own (preflighted) artifact paths.
+            let cas_hit_outputs =
+                cas_hit_outputs.filter(|o| cas_outputs_bound_to_node(o, target_root, node));
             if let Some(outputs) = cas_hit_outputs {
-                let target_root = if node.pkg_root.starts_with(&canon_dir) {
-                    &canon_dir
-                } else {
-                    &node.pkg_root
-                };
                 // The invocation's project policy also covers external package roots.
                 // Keep cache-hit validation/auditing, but do not erase artifacts or
                 // regenerate Lake sidecars when automatic materialization is disabled.
@@ -11278,7 +11299,6 @@ roots = ["Fast"]
             ("\"buildType\" = \"debug\"\n", ""),
             ("", "needs = [\"gen\"]\n"),
             ("", "buildType = \"debug\"\n"),
-            ("", "precompileLibrary = true\n"),
             ("", "defaultFacets = [\"shared\"]\n"),
             ("", "extraDepTargets = [\"gen\"]\n"),
             ("", "someFutureKey = 1\n"),
@@ -11499,6 +11519,104 @@ roots = ["Fast"]
         assert!(pkg.unsupported.is_none() && pkg.libs[1].unsupported.is_none());
         assert!(pkg.libs[0].unsupported.is_some());
         assert!(parse_lakefile_lean(&dir, &lf, true).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_planted_lock_symlink_and_foreign_cas_paths_never_write_outside() {
+        let root = make_temp_test_dir("lock_cas_escape");
+        let proj = root.join("proj");
+        let outside = root.join("outside");
+        fs::create_dir_all(proj.join(".lake/build")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        // A checked-in `.turbo_publish.lock` symlink must not create a file elsewhere.
+        let lock = proj.join(".lake/build/.turbo_publish.lock");
+        std::os::unix::fs::symlink(outside.join("created"), &lock).unwrap();
+        assert!(crate::shm_cache::acquire_flock(&lock, true, false).is_err());
+        assert!(acquire_publish_flock_mode(&proj, true, false).is_err());
+        assert!(!outside.join("created").exists());
+
+        // A cache entry restores only onto the node's own artifact paths.
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"p\"\n[[lean_lib]]\nname = \"P\"\n",
+        )
+        .unwrap();
+        fs::write(proj.join("P.lean"), "def p : Nat := 1\n").unwrap();
+        fs::remove_file(&lock).unwrap();
+        let cfg = resolve_project_config(&proj).unwrap();
+        let dag = build_module_dag(&cfg, &[]).unwrap();
+        let node = &dag.nodes["P"];
+        let canon = proj.canonicalize().unwrap();
+        let entry = |rel: &str| BlobEntry {
+            blob_hash: "00".into(),
+            kind: "olean".into(),
+            size_bytes: 1,
+            rel_path: rel.into(),
+        };
+        let own = node
+            .olean_path
+            .strip_prefix(&canon)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let ilean = node
+            .ilean_path
+            .strip_prefix(&canon)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(cas_outputs_bound_to_node(
+            &[entry(&own), entry(&ilean), entry("thm:x")],
+            &canon,
+            node
+        ));
+        for foreign in [
+            "vendor/old/.lake/build/lib/lean/P.olean",
+            ".lake/build/lib/lean/../../../../outside/P.olean",
+            outside.join("P.olean").to_str().unwrap(),
+        ] {
+            assert!(
+                !cas_outputs_bound_to_node(&[entry(&own), entry(foreign)], &canon, node),
+                "{foreign}"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn test_precompile_library_fails_closed_everywhere() {
+        // Lake's `LeanLib.shouldPrecompile` also covers `precompileLibrary`: importers load it.
+        let dir = make_temp_test_dir("precompile_library");
+        let tf = dir.join("lakefile.toml");
+        let lf = dir.join("lakefile.lean");
+        fs::write(
+            &tf,
+            "name = \"t\"\n[[lean_lib]]\nname = \"A\"\nprecompileLibrary = true\n",
+        )
+        .unwrap();
+        fs::write(
+            &lf,
+            "import Lake\nopen Lake DSL\npackage t\nlean_lib A where\n  precompileLibrary := true\n",
+        )
+        .unwrap();
+        for is_root in [true, false] {
+            let e = parse_lakefile_toml(&dir, &tf, is_root)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("precompileLibrary"), "{e}");
+            let e = parse_lakefile_lean(&dir, &lf, is_root)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("precompileLibrary"), "{e}");
+        }
+        fs::write(
+            &tf,
+            "name = \"t\"\n[[lean_lib]]\nname = \"A\"\nprecompileLibrary = false\n",
+        )
+        .unwrap();
+        parse_lakefile_toml(&dir, &tf, false).unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 }
