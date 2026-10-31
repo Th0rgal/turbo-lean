@@ -1263,6 +1263,18 @@ fn run_lean_temp_file(
     let mut code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    // The audit reads Lean's `#print axioms` output, which a module the server cannot inspect could
+    // answer: only toolchain imports are trusted here.
+    let untrusted_import = crate::module_builder::parse_header_imports(source)
+        .iter()
+        .any(|m| !matches!(m.split('.').next(), Some("Init" | "Std" | "Lean" | "Lake")));
+    if plan.is_some() && code == 0 && untrusted_import {
+        code = 1;
+        stderr = format!(
+            "{}\n[TurboLean.KernelGate] plain `lean` audit refused: imports beyond the toolchain",
+            stderr
+        );
+    }
     if let Some(plan) = plan.filter(|_| code == 0) {
         let bad = plan.violations(&stdout, allowed);
         if !bad.is_empty() {

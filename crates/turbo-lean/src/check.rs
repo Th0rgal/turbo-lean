@@ -1208,9 +1208,15 @@ fn check_directory(
                     cmd.arg(arg);
                 }
                 cmd.current_dir(canon_dir).envs(&env_vars);
-                cross_ok =
-                    run_audited_lean(cmd, &tmp_cross, &cross_src, &cross_names, cross_names.len())?
-                        .0;
+                cross_ok = run_audited_lean(
+                    cmd,
+                    &tmp_cross,
+                    &cross_src,
+                    &cross_names,
+                    cross_names.len(),
+                    canon_dir,
+                )?
+                .0;
             }
             if cross_ok {
                 let dur_ms =
@@ -1322,6 +1328,7 @@ fn check_directory(
                                                 &fast_src,
                                                 &uncached_names,
                                                 uncached_names.len(),
+                                                canon_ref,
                                             )?
                                             .0;
                                         }
@@ -1346,6 +1353,7 @@ fn check_directory(
                                         &coal_src,
                                         &uncached_names,
                                         uncached_names.len(),
+                                        canon_ref,
                                     )?;
                                     if !ok {
                                         anyhow::bail!(
@@ -1499,16 +1507,54 @@ fn extract_decl_source_from_file(active_src: &str, shard: &splitter::TheoremShar
     String::new()
 }
 
+/// Whether a project module `src` imports (transitively; dependency packages and the toolchain are
+/// trusted) could answer `#print axioms` (`splitter::source_may_intercept_print`), or is unreadable.
+fn project_imports_may_intercept_print(src: &str, canon_dir: &Path) -> bool {
+    let mut todo = crate::module_builder::parse_header_imports(src);
+    let mut seen = HashSet::new();
+    while let Some(m) = todo.pop() {
+        if !seen.insert(m.clone()) {
+            continue;
+        }
+        let rel = crate::module_builder::module_name_to_rel_slash(&m) + ".lean";
+        if rel.starts_with(".lake/") {
+            continue;
+        }
+        let path = canon_dir.join(&rel);
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(dep_src) = fs::read_to_string(&path) else {
+            return true;
+        };
+        if splitter::source_may_intercept_print(&dep_src) {
+            return true;
+        }
+        todo.extend(crate::module_builder::parse_header_imports(&dep_src));
+    }
+    false
+}
+
 /// Run plain `lean` (`cmd`, without its file argument) on `src` written to `tmp`, under the
 /// `splitter::plain_lean_audit` of the `expected` declarations named by `targets`. Returns
-/// `(ok, stdout, stderr)`: `ok` needs a zero exit and a clean audit, whose failures join `stderr`.
+/// `(ok, stdout, stderr)`: `ok` needs a zero exit and a clean audit, whose failures join `stderr`. The
+/// audit reads Lean's `#print axioms` output, so it is refused when a project module `src` imports
+/// could answer it.
 fn run_audited_lean(
     mut cmd: Command,
     tmp: &Path,
     src: &str,
     targets: &HashSet<String>,
     expected: usize,
+    canon_dir: &Path,
 ) -> Result<(bool, String, String)> {
+    if project_imports_may_intercept_print(src, canon_dir) {
+        return Ok((
+            false,
+            String::new(),
+            "[TurboLean.KernelGate] plain `lean` audit refused: an imported project module could answer `#print axioms`".to_string(),
+        ));
+    }
     let audit = splitter::plain_lean_audit(src, targets, expected);
     fs::write(tmp, &audit.source)?;
     let out = cmd.arg(tmp).output();
@@ -2754,8 +2800,14 @@ fn check_single_decl(
                     cmd.current_dir(canon_dir)
                         .envs(&env_vars)
                         .env("LEAN_STACK_SIZE_KB", default_stack);
-                    let (ok, stdout, stderr) =
-                        run_audited_lean(cmd, &tmp_shard, &full_shard_src, &single_set, 1)?;
+                    let (ok, stdout, stderr) = run_audited_lean(
+                        cmd,
+                        &tmp_shard,
+                        &full_shard_src,
+                        &single_set,
+                        1,
+                        canon_dir,
+                    )?;
                     if !ok {
                         let tmp_display = tmp_shard.display().to_string();
                         let orig_display = file.display().to_string();
@@ -3368,6 +3420,7 @@ fn check_single_file(
                         &coalesced_src,
                         &uncached_names,
                         uncached_names.len(),
+                        canon_dir,
                     )?
                     .0;
                 }
@@ -3525,6 +3578,7 @@ fn check_single_file(
                                     &shard_src_owned,
                                     &HashSet::from([shard.name.clone()]),
                                     1,
+                                    canon_ref,
                                 )?;
                                 let tmp_display = tmp_shard.display().to_string();
 
@@ -3726,23 +3780,22 @@ fn check_single_file(
             eval_stdout_text = String::from_utf8_lossy(&out.stdout).to_string();
         }
         // Neither run above audits axioms (zygote eval has no kernel gate, and messages can be
-        // dropped by `#guard_msgs`): check the file under the zygote's strict kernel gate, which reads
-        // the environment, else audit every theorem with plain `lean` in a copy beside the file.
-        let kernel_audit = (!split.shards.is_empty()
-            && !src.contains("IO.Process.exit")
+        // dropped by `#guard_msgs`): check the whole file under the zygote's `strict_all` kernel gate,
+        // which reads the environment, else audit every theorem with plain `lean` in a copy beside
+        // the file (which fails closed for a file without textual theorems).
+        let kernel_audit = (!src.contains("IO.Process.exit")
             && !src.lines().take(20).any(|l| {
                 let t = l.split("--").next().unwrap_or(l).trim();
                 t == "module" || t.starts_with("module ")
             }))
         .then(|| {
-            crate::zygote::eval_with_zygote_pool_with_args(
+            crate::zygote::eval_with_zygote_pool_audit_all(
                 store,
                 toolchain,
                 &local_lean_path,
                 &env_vars,
                 Path::new(&lean_bin),
                 src,
-                false,
                 &file_lean_args,
             )
             .ok()
@@ -3758,7 +3811,7 @@ fn check_single_file(
                     .replace("<zygote-shard>", &orig_display)
             );
         }
-        if kernel_audit.is_none() && !split.shards.is_empty() {
+        if kernel_audit.is_none() {
             let names: HashSet<String> = split.shards.iter().map(|s| s.name.clone()).collect();
             let audit_tmp = canon_resolved_initial
                 .parent()
@@ -3773,7 +3826,8 @@ fn check_single_file(
                 cmd.arg(arg);
             }
             cmd.current_dir(canon_dir).envs(&env_vars);
-            let (ok, stdout, stderr) = run_audited_lean(cmd, &audit_tmp, src, &names, names.len())?;
+            let (ok, stdout, stderr) =
+                run_audited_lean(cmd, &audit_tmp, src, &names, names.len(), canon_dir)?;
             if !ok {
                 anyhow::bail!(
                     "Soundness audit failed for {}:\n{}\n{}",

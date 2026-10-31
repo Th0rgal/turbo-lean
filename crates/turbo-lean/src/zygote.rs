@@ -1603,6 +1603,7 @@ pub fn eval_with_zygote_pool_with_args(
         None,
         lean_args,
         &[],
+        false,
     )
 }
 
@@ -1661,6 +1662,7 @@ pub fn eval_with_zygote_pool_opts_with_args(
         None,
         lean_args,
         &[],
+        false,
     )
 }
 
@@ -1729,6 +1731,36 @@ pub fn eval_with_zygote_pool_for_targets(
         None,
         lean_args,
         stub_targets,
+        false,
+    )
+}
+
+/// Check `shard_source` with no `sorry` stub exempt anywhere, prefix checkpoints included (`strict_all`):
+/// the kernel-gate audit of a whole file.
+pub fn eval_with_zygote_pool_audit_all(
+    store: &TurboStore,
+    toolchain: &str,
+    req_lean_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    lean_bin: &Path,
+    shard_source: &str,
+    lean_args: &[String],
+) -> Result<ZygoteEvalReply> {
+    eval_with_zygote_pool_inner(
+        store,
+        toolchain,
+        req_lean_path,
+        env_vars,
+        lean_bin,
+        shard_source,
+        false,
+        false,
+        None,
+        None,
+        None,
+        lean_args,
+        &[],
+        true,
     )
 }
 
@@ -1747,8 +1779,13 @@ fn eval_with_zygote_pool_inner(
     batch_fission_override: Option<(String, String, String)>,
     lean_args: &[String],
     stub_targets: &[String],
+    audit_all: bool,
 ) -> Result<ZygoteEvalReply> {
-    let stub_mode = stub_mode_flag(allow_stub, stub_targets, shard_source);
+    let stub_mode = if audit_all {
+        "strict_all".to_string()
+    } else {
+        stub_mode_flag(allow_stub, stub_targets, shard_source)
+    };
     let default_timeout_ms = if eval_mode { 900_000 } else { 30_000 };
     let effective_timeout_ms = timeout_ms.filter(|&ms| ms > 0).unwrap_or_else(|| {
         std::env::var("TURBO_LEAN_TIMEOUT_MS")
@@ -2247,7 +2284,7 @@ fn eval_with_zygote_pool_inner(
                 .map(|blk| {
                     let hb = hex_encode_bytes(blk.as_bytes());
                     if hex_opts.is_empty() {
-                        if allow_stub {
+                        if stub_mode != "strict" {
                             format!("{}\t{}\t{}\n", imports_csv, hb, stub_mode)
                         } else {
                             format!("{}\t{}\n", imports_csv, hb)
@@ -2415,7 +2452,7 @@ fn eval_with_zygote_pool_inner(
             } else {
                 let hex_body = hex_encode_bytes(body_code.as_bytes());
                 let rl = if hex_opts.is_empty() {
-                    if allow_stub {
+                    if stub_mode != "strict" {
                         format!("{}\t{}\t{}\n", imports_csv, hex_body, stub_mode)
                     } else {
                         format!("{}\t{}\n", imports_csv, hex_body)
@@ -2788,6 +2825,7 @@ pub fn eval_subshards_batch_via_zygote(
         Some(req_tuple),
         lean_args,
         &[],
+        false,
     )
 }
 
@@ -2853,6 +2891,7 @@ pub fn eval_candidates_race_via_zygote(
         Some(req_tuple),
         lean_args,
         &[],
+        false,
     )
 }
 

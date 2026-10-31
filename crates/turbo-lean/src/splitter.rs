@@ -3140,6 +3140,28 @@ pub fn with_axiom_audit(src: &str, names: &std::collections::HashSet<String>) ->
     (out, after_line.values().map(Vec::len).sum())
 }
 
+/// Whether `src` could answer `#print axioms` itself: syntax or elaborators for `#print` (whose tokens are
+/// string literals, so they are kept here), or elaboration-time code with `Lean` imported.
+pub fn source_may_intercept_print(src: &str) -> bool {
+    let clean = strip_lean_comments(src);
+    let defines = |kws: &[&str]| {
+        kws.iter()
+            .any(|kw| contains_word(&clean, kw) || clean.contains(&format!("{kw}_rules")))
+    };
+    let imports_lean = clean.lines().any(|l| {
+        let l = l.trim();
+        l == "import Lean" || l.starts_with("import Lean.") || l.starts_with("import Lean ")
+    });
+    clean.contains("printAxioms")
+        || (clean.contains("#print")
+            && defines(&["macro", "syntax", "elab", "command_elab", "notation"]))
+        || (imports_lean
+            && (defines(&["elab", "run_cmd", "run_elab", "run_meta", "initialize"])
+                || clean.contains("#eval")
+                || clean.contains("command_elab")
+                || clean.contains("builtin_initialize")))
+}
+
 /// A plain-`lean` axiom audit of the `names` declarations of a shard source (see `plain_lean_audit`).
 pub struct PlainLeanAudit {
     /// The source to run: other theorems' one-line `… := sorry` stubs become `axiom`s (each followed by
@@ -3204,25 +3226,7 @@ pub fn plain_lean_audit(
             );
         }
     }
-    // Syntax or elaborators for `#print` (whose tokens are string literals, so they are kept here), or
-    // elaboration-time code with `Lean` imported, could answer the audit commands themselves.
-    let clean = strip_lean_comments(src);
-    let defines = |kws: &[&str]| {
-        kws.iter()
-            .any(|kw| contains_word(&clean, kw) || clean.contains(&format!("{kw}_rules")))
-    };
-    let imports_lean = clean.lines().any(|l| {
-        let l = l.trim();
-        l == "import Lean" || l.starts_with("import Lean.") || l.starts_with("import Lean ")
-    });
-    let intercepts_print = clean.contains("printAxioms")
-        || (clean.contains("#print")
-            && defines(&["macro", "syntax", "elab", "command_elab", "notation"]))
-        || (imports_lean
-            && (defines(&["elab", "run_cmd", "run_elab", "run_meta", "initialize"])
-                || clean.contains("#eval")
-                || clean.contains("command_elab")
-                || clean.contains("builtin_initialize")));
+    let intercepts_print = source_may_intercept_print(src);
     let (source, audited) = with_axiom_audit(&lines.concat(), names);
     PlainLeanAudit {
         source,

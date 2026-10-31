@@ -374,6 +374,18 @@ def stubSorryExemption (afterEnv : Environment) (allowStub finalRun : Bool)
   fun n => allowStub && isSorryStubDecl afterEnv n &&
     (!finalRun || (isHostStub stubs n && !ownedByTarget targets n))
 
+/-- Whether `env` declares host name `t` (up to namespace qualification), or its fast-olean rename
+    `_turbo_verify_<i>_<sanitized t>`. -/
+def declaresHostName (env : Environment) (t : String) : Bool :=
+  let tc := hostNameComponents t
+  let sanitize (x : String) : String := x.map fun c => if c.isAlphanum || c == '_' then c else '_'
+  let renamed := ["_" ++ sanitize t, "_" ++ sanitize (tc.getLast?.getD t)]
+  env.constants.map₂.foldl (fun acc n _ => acc ||
+    let comps := userNameComponents n
+    tc.isSuffixOf comps || comps.isSuffixOf tc ||
+      (comps.getLast?.getD "").startsWith "_turbo_verify_" &&
+        renamed.any ((comps.getLast?.getD "").endsWith ·)) false
+
 /-- Whether the stubbed prefix checkpoint `prefixEnv` holds a `sorry` stub theorem that this final run
     does not exempt (a checkpoint is shared by requests with other stubs and targets). -/
 def unexemptPrefixStub (prefixEnv : Environment) (stubs targets : List String) : Bool :=
@@ -542,7 +554,8 @@ def runCommandsFromState
     (evalMode : Bool := false)
     (stubTargets : List String := [])
     (stubs : List String := [])
-    (finalRun : Bool := true) : IO (Bool × Nat × Nat × Nat × List String × List String × String × List String × Command.State) := do
+    (finalRun : Bool := true)
+    (strictPrefix : Bool := false) : IO (Bool × Nat × Nat × Nat × List String × List String × String × List String × Command.State) := do
   let t0 ← IO.monoNanosNow
   let hb0 ← IO.getNumHeartbeats
   let effectiveCode := if allowStub && !evalMode then sanitizeStubbedPrefixCode code else code
@@ -587,8 +600,12 @@ def runCommandsFromState
     let stubExempt := stubSorryExemption s.commandState.env allowStub finalRun stubs stubTargets
     let (_, kernelErrs) ← auditNewKernelDecls baseState.env s.commandState.env stubExempt
     errs := errs ++ kernelErrs
-    if allowStub && finalRun && unexemptPrefixStub baseState.env stubs stubTargets then
+    if finalRun && (allowStub || strictPrefix) &&
+        unexemptPrefixStub baseState.env (if allowStub then stubs else []) stubTargets then
       errs := errs ++ ["[TurboLean.KernelGate] stubbed prefix holds a `sorry` theorem this check does not exempt"]
+    -- An elaborator could drop a checked declaration, leaving nothing for the gate to audit.
+    if allowStub && finalRun && !stubTargets.all (declaresHostName s.commandState.env) then
+      errs := errs ++ ["[TurboLean.KernelGate] a checked declaration is missing from the elaborated environment"]
     usedConstants := (collectNewDeclUsedConstants baseState.env s.commandState.env).toList
     proofTermNodes := countNewDeclExprNodes baseState.env s.commandState.env
   let t1 ← IO.monoNanosNow
@@ -1389,6 +1406,8 @@ def main (args : List String) : IO Unit := do
         (stubLists.headD [], (stubLists.drop 1).headD [])
       else ([], [])
     let evalMode := modeFlag == "eval" || modeFlag.startsWith "eval:"
+    -- `strict_all`: no `sorry` stub is exempt anywhere, prefix checkpoints included (whole-file audits).
+    let strictAll := modeFlag == "strict_all"
     let (customFileName?, customCwd?, emitOlean?) := if modeFlag.startsWith "eval:" then
       let metaParts := ((modeFlag.drop 5).toString).splitOn ":"
       let hexFn := metaParts.headD ""
@@ -1512,7 +1531,7 @@ def main (args : List String) : IO Unit := do
         let fnPref := customFileName?.getD "<zygote-prefix>"
         let cwdKey := targetCwd.toString
         let emitModKey := match emitOlean? with | some (m, _) => m.toString | none => ""
-        let prefAllowStub := !evalMode && emitOlean?.isNone
+        let prefAllowStub := !evalMode && emitOlean?.isNone && !strictAll
         let optsCacheSuffix := if hexOpts.isEmpty then "" else s!"\topts:{hexOpts}"
         let importStubKey := (if evalMode || emitOlean?.isSome then s!"{envDiskKey}\t{prefAllowStub}\t{evalMode}\t{fnPref}\t{cwdKey}\t{emitModKey}" else s!"{envDiskKey}\t{prefAllowStub}\t{evalMode}") ++ optsCacheSuffix
         let fullPrefixKey := (if evalMode || emitOlean?.isSome then s!"{envDiskKey}\t{prefAllowStub}\t{evalMode}\t{fnPref}\t{cwdKey}\t{emitModKey}\t{prefixKey}" else s!"{envDiskKey}\t{prefAllowStub}\t{evalMode}\t{prefixKey}") ++ optsCacheSuffix
@@ -1646,6 +1665,7 @@ def main (args : List String) : IO Unit := do
           else
             let (ok, elabUs, dHbs, ptNodes, errs, dMsgs, dOut, usedConsts, finalSt) ←
               TurboLean.ZygoteWorker.runCommandsFromState ckptState bodyCode fn allowStub evalMode stubTargets stubs
+                (strictPrefix := strictAll)
             let mut finalOk := ok
             let mut finalErrs := errs
             if finalOk then
