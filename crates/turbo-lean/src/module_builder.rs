@@ -1722,7 +1722,9 @@ fn classify_lake_field(scope: LakeScope, key: &str, val: &str) -> LakeField {
         _ => false,
     };
     const BUILD_TYPES: [&str; 3] = ["release", "relWithDebInfo", "minSizeRel"];
-    let empty_array = matches!(v, "[]" | "#[]");
+    // `[ ]` and multi-line empty arrays too (comments are already stripped).
+    let compact: String = v.chars().filter(|c| !c.is_whitespace()).collect();
+    let empty_array = matches!(compact.as_str(), "[]" | "#[]");
     match (scope, key) {
         (
             _,
@@ -11726,6 +11728,13 @@ roots = ["Fast"]
         .unwrap();
         let pkg = parse_lakefile_toml(&dir, &tf, false).unwrap();
         assert!(pkg.libs[0].unsupported.is_none() && pkg.exes[0].unsupported.is_none());
+        // Empty arrays pass however they are spelled.
+        fs::write(
+            &tf,
+            "name = \"t\"\n[[lean_lib]]\nname = \"A\"\nplugins = [ ]\ndynlibs = [\n]\n",
+        )
+        .unwrap();
+        assert!(parse_lakefile_toml(&dir, &tf, true).is_ok());
         assert!(parse_lakefile_toml(&dir, &tf, true).is_ok());
         fs::remove_file(&tf).unwrap();
         // Imports beyond `Lake` could change how the lakefile elaborates.
