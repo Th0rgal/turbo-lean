@@ -982,27 +982,91 @@ static ZYGOTE_POOL: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<(String, String, String), Vec<ZygoteWorkerProcess>>>,
 > = std::sync::OnceLock::new();
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct OleanFileStatSig {
+    dev: u64,
+    ino: u64,
+    mtime_sec: i64,
+    mtime_nsec: i64,
+    ctime_sec: i64,
+    ctime_nsec: i64,
+    size: u64,
+}
+
+impl OleanFileStatSig {
+    fn from_meta(meta: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Self {
+                dev: meta.dev(),
+                ino: meta.ino(),
+                mtime_sec: meta.mtime(),
+                mtime_nsec: meta.mtime_nsec(),
+                ctime_sec: meta.ctime(),
+                ctime_nsec: meta.ctime_nsec(),
+                size: meta.len(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let (ms, mn, sz) = TurboStore::extract_file_stat_tuple(meta);
+            Self {
+                dev: 0,
+                ino: 0,
+                mtime_sec: ms,
+                mtime_nsec: mn,
+                ctime_sec: 0,
+                ctime_nsec: 0,
+                size: sz as u64,
+            }
+        }
+    }
+
+    fn is_racily_clean(&self, now_ns: i128) -> bool {
+        #[cfg(unix)]
+        {
+            const GUARD_NS: i128 = 50_000_000;
+            let mtime_ns = (self.mtime_sec as i128) * 1_000_000_000 + (self.mtime_nsec as i128);
+            let ctime_ns = (self.ctime_sec as i128) * 1_000_000_000 + (self.ctime_nsec as i128);
+            mtime_ns <= now_ns - GUARD_NS && ctime_ns <= now_ns - GUARD_NS
+        }
+        #[cfg(not(unix))]
+        {
+            const GUARD_NS: i128 = 2_000_000_000;
+            let mtime_ns = (self.mtime_sec as i128) * 1_000_000_000 + (self.mtime_nsec as i128);
+            mtime_ns <= now_ns - GUARD_NS
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CachedOleanEntryDigest {
+    olean_stat: OleanFileStatSig,
+    companions_stat: [Option<OleanFileStatSig>; 5],
+    entry_bytes: Vec<u8>,
+    parsed_deps: Option<Vec<String>>,
+}
+
+static OLEAN_ENTRY_DIGEST_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, CachedOleanEntryDigest>>,
+> = std::sync::OnceLock::new();
+
+fn stat_companion_file(path: &Path) -> Result<Option<OleanFileStatSig>, ()> {
+    match fs::metadata(path) {
+        Ok(cm) if cm.is_file() => Ok(Some(OleanFileStatSig::from_meta(&cm))),
+        Ok(_) => Err(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
 fn digest_olean_path_entry(
     olean_path: &Path,
     meta: &fs::Metadata,
     hasher: &mut blake3::Hasher,
 ) -> Option<Vec<String>> {
-    let len = meta.len();
-    hasher.update(olean_path.to_string_lossy().as_bytes());
-    hasher.update(b":");
-    hasher.update(&len.to_le_bytes());
-
-    let olean_bytes = match fs::read(olean_path) {
-        Ok(b) => b,
-        Err(_) => {
-            hasher.update(b"unreadable;");
-            return None;
-        }
-    };
-    let parsed_deps = crate::module_builder::parse_olean_binary_imports(&olean_bytes)
-        .map(|(imps, _)| imps.into_iter().map(|i| i.module).collect::<Vec<String>>());
-    hasher.update(blake3::hash(&olean_bytes).to_hex().as_bytes());
-
+    let olean_stat = OleanFileStatSig::from_meta(meta);
     let companions = [
         (
             "srv",
@@ -1019,31 +1083,119 @@ fn digest_olean_path_entry(
             PathBuf::from(format!("{}.sig", olean_path.with_extension("ir").display())),
         ),
     ];
-    for (tag, comp_path) in companions {
-        hasher.update(b"|");
-        hasher.update(tag.as_bytes());
-        hasher.update(b":");
-        match fs::metadata(&comp_path) {
-            Ok(cm) if cm.is_file() => match fs::read(&comp_path) {
-                Ok(cb) => {
-                    hasher.update(blake3::hash(&cb).to_hex().as_bytes());
-                }
-                Err(_) => {
-                    hasher.update(b"err");
-                }
-            },
-            Ok(_) => {
-                hasher.update(b"nonfile");
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                hasher.update(b"0");
-            }
-            Err(_) => {
-                hasher.update(b"err");
+    let mut comp_stats: [Option<OleanFileStatSig>; 5] = Default::default();
+    let mut all_comp_stat_ok = true;
+    for (idx, (_, comp_path)) in companions.iter().enumerate() {
+        match stat_companion_file(comp_path) {
+            Ok(st) => comp_stats[idx] = st,
+            Err(()) => {
+                all_comp_stat_ok = false;
+                break;
             }
         }
     }
-    hasher.update(b";");
+
+    let cache_mutex = OLEAN_ENTRY_DIGEST_CACHE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if all_comp_stat_ok {
+        if let Ok(guard) = cache_mutex.lock() {
+            if let Some(hit) = guard.get(olean_path) {
+                if hit.olean_stat == olean_stat && hit.companions_stat == comp_stats {
+                    hasher.update(&hit.entry_bytes);
+                    return hit.parsed_deps.clone();
+                }
+            }
+        }
+    }
+
+    let pre_read_now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i128)
+        .unwrap_or(0);
+    let len = meta.len();
+    let mut entry_bytes = Vec::with_capacity(256);
+    entry_bytes.extend_from_slice(olean_path.to_string_lossy().as_bytes());
+    entry_bytes.push(b':');
+    entry_bytes.extend_from_slice(&len.to_le_bytes());
+
+    let olean_bytes = match fs::read(olean_path) {
+        Ok(b) => b,
+        Err(_) => {
+            entry_bytes.extend_from_slice(b"unreadable;");
+            hasher.update(&entry_bytes);
+            return None;
+        }
+    };
+    let parsed_deps = crate::module_builder::parse_olean_binary_imports(&olean_bytes)
+        .map(|(imps, _)| imps.into_iter().map(|i| i.module).collect::<Vec<String>>());
+    entry_bytes.extend_from_slice(blake3::hash(&olean_bytes).to_hex().as_bytes());
+
+    let mut cacheable = all_comp_stat_ok
+        && olean_stat.is_racily_clean(pre_read_now_ns)
+        && comp_stats
+            .iter()
+            .flatten()
+            .all(|s| s.is_racily_clean(pre_read_now_ns));
+    for (idx, (tag, comp_path)) in companions.iter().enumerate() {
+        entry_bytes.push(b'|');
+        entry_bytes.extend_from_slice(tag.as_bytes());
+        entry_bytes.push(b':');
+        match fs::metadata(comp_path) {
+            Ok(cm) if cm.is_file() => match fs::read(comp_path) {
+                Ok(cb) => {
+                    let pre_sig = OleanFileStatSig::from_meta(&cm);
+                    if comp_stats[idx] != Some(pre_sig) {
+                        cacheable = false;
+                    }
+                    match stat_companion_file(comp_path) {
+                        Ok(Some(post_sig)) if post_sig == pre_sig => {}
+                        _ => cacheable = false,
+                    }
+                    entry_bytes.extend_from_slice(blake3::hash(&cb).to_hex().as_bytes());
+                }
+                Err(_) => {
+                    cacheable = false;
+                    entry_bytes.extend_from_slice(b"err");
+                }
+            },
+            Ok(_) => {
+                cacheable = false;
+                entry_bytes.extend_from_slice(b"nonfile");
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if comp_stats[idx].is_some() {
+                    cacheable = false;
+                }
+                entry_bytes.extend_from_slice(b"0");
+            }
+            Err(_) => {
+                cacheable = false;
+                entry_bytes.extend_from_slice(b"err");
+            }
+        }
+    }
+    entry_bytes.push(b';');
+    hasher.update(&entry_bytes);
+
+    let post_olean_matches = fs::metadata(olean_path)
+        .map(|m| m.is_file() && OleanFileStatSig::from_meta(&m) == olean_stat)
+        .unwrap_or(false);
+    if cacheable && post_olean_matches {
+        if let Ok(mut guard) = cache_mutex.lock() {
+            if guard.len() >= 16384 {
+                guard.clear();
+            }
+            guard.insert(
+                olean_path.to_path_buf(),
+                CachedOleanEntryDigest {
+                    olean_stat,
+                    companions_stat: comp_stats,
+                    entry_bytes,
+                    parsed_deps: parsed_deps.clone(),
+                },
+            );
+        }
+    }
     parsed_deps
 }
 
@@ -1051,6 +1203,13 @@ fn digest_olean_path_entry(
 /// resolved `.olean` files and their companions (`.olean.server`, `.olean.private`, `.ilean`,
 /// `.ir`, `.ir.sig`) for `imports_csv` along `effective_lean_path`.
 pub fn compute_imported_oleans_digest(imports_csv: &str, effective_lean_path: &str) -> String {
+    compute_imported_oleans_digest_inner(imports_csv, effective_lean_path).0
+}
+
+fn compute_imported_oleans_digest_inner(
+    imports_csv: &str,
+    effective_lean_path: &str,
+) -> (String, bool) {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"turbo-zygote-olean-digest:v3:");
     hasher.update(effective_lean_path.as_bytes());
@@ -1076,17 +1235,18 @@ pub fn compute_imported_oleans_digest(imports_csv: &str, effective_lean_path: &s
     let mut ordered_mods: Vec<String> = Vec::new();
     let mut resolved_map: std::collections::HashMap<String, Option<PathBuf>> =
         std::collections::HashMap::new();
+    let mut closure_complete = true;
 
     while let Some(mod_name) = worklist.pop() {
         if !visited.insert(mod_name.clone()) {
             continue;
         }
         ordered_mods.push(mod_name.clone());
-        if mod_name == "Init"
+        let is_tc_builtin = mod_name == "Init"
             || mod_name.starts_with("Init.")
             || mod_name == "Lean"
-            || mod_name.starts_with("Lean.")
-        {
+            || mod_name.starts_with("Lean.");
+        if is_tc_builtin {
             let rel_olean = format!(
                 "{}.olean",
                 crate::module_builder::module_name_to_rel_slash(&mod_name)
@@ -1110,17 +1270,22 @@ pub fn compute_imported_oleans_digest(imports_csv: &str, effective_lean_path: &s
             .map(|d| d.join(&rel_olean))
             .find(|p| p.is_file());
         if let Some(ref olean_path) = found {
-            if let Ok(bytes) = fs::read(olean_path) {
-                if let Some((sub_imps, _)) =
-                    crate::module_builder::parse_olean_binary_imports(&bytes)
-                {
-                    for sub in sub_imps {
-                        if !visited.contains(&sub.module) {
-                            worklist.push(sub.module);
+            if let Ok(meta) = fs::metadata(olean_path) {
+                let mut sink = blake3::Hasher::new();
+                if let Some(sub_imps) = digest_olean_path_entry(olean_path, &meta, &mut sink) {
+                    for sub_mod in sub_imps {
+                        if !visited.contains(&sub_mod) {
+                            worklist.push(sub_mod);
                         }
                     }
+                } else {
+                    closure_complete = false;
                 }
+            } else {
+                closure_complete = false;
             }
+        } else if !is_tc_builtin {
+            closure_complete = false;
         }
         resolved_map.insert(mod_name, found);
     }
@@ -1133,8 +1298,11 @@ pub fn compute_imported_oleans_digest(imports_csv: &str, effective_lean_path: &s
         match resolved_map.get(&mod_name).and_then(|o| o.as_ref()) {
             Some(olean_path) => {
                 if let Ok(meta) = fs::metadata(olean_path) {
-                    let _ = digest_olean_path_entry(olean_path, &meta, &mut hasher);
+                    if digest_olean_path_entry(olean_path, &meta, &mut hasher).is_none() {
+                        closure_complete = false;
+                    }
                 } else {
+                    closure_complete = false;
                     hasher.update(b"unreadable;");
                 }
             }
@@ -1146,12 +1314,13 @@ pub fn compute_imported_oleans_digest(imports_csv: &str, effective_lean_path: &s
                 {
                     hasher.update(b"toolchain-builtin;");
                 } else {
+                    closure_complete = false;
                     hasher.update(b"missing;");
                 }
             }
         }
     }
-    hasher.finalize().to_hex().to_string()
+    (hasher.finalize().to_hex().to_string(), closure_complete)
 }
 
 /// Compute a deterministic BLAKE3 digest over all `.olean` files inside non-toolchain,
@@ -2322,6 +2491,23 @@ fn encode_lean_args_hex(lean_args: &[String]) -> String {
     }
 }
 
+fn attach_host_closure_digest(req_line: &str, host_closure_digest: &str) -> String {
+    if host_closure_digest.is_empty() {
+        return req_line.to_string();
+    }
+    let trimmed = req_line.trim_end_matches('\n');
+    let cols = trimmed.split('\t').count();
+    let mut out = String::with_capacity(trimmed.len() + host_closure_digest.len() + 8);
+    out.push_str(trimmed);
+    for _ in cols..6 {
+        out.push('\t');
+    }
+    out.push('\t');
+    out.push_str(host_closure_digest);
+    out.push('\n');
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn eval_with_zygote_pool_inner(
     store: &TurboStore,
@@ -2439,7 +2625,13 @@ fn eval_with_zygote_pool_inner(
     };
     let imports_csv = coalesce_proofkit_imports(&raw_imports_csv, &effective_lean_path);
     let search_path_digest = compute_search_path_oleans_digest(&effective_lean_path);
-    let imported_digest = compute_imported_oleans_digest(&imports_csv, &effective_lean_path);
+    let (imported_digest, closure_complete) =
+        compute_imported_oleans_digest_inner(&imports_csv, &effective_lean_path);
+    let host_closure_digest = if closure_complete {
+        imported_digest.as_str()
+    } else {
+        ""
+    };
     let pool_digest_tag = search_path_digest.clone();
     // Workers enforce the axiom policy they were spawned with: key them (and their replies) by it.
     let toolchain_policy = format!(
@@ -2875,7 +3067,7 @@ fn eval_with_zygote_pool_inner(
                 .iter()
                 .map(|blk| {
                     let hb = hex_encode_bytes(blk.as_bytes());
-                    if hex_opts.is_empty() {
+                    let base = if hex_opts.is_empty() {
                         if allow_stub {
                             format!("{}\t{}\tallow_stub\n", imports_csv, hb)
                         } else {
@@ -2884,7 +3076,8 @@ fn eval_with_zygote_pool_inner(
                     } else {
                         let mode_flag = if allow_stub { "allow_stub" } else { "strict" };
                         format!("{}\t{}\t{}\t\t\t{}\n", imports_csv, hb, mode_flag, hex_opts)
-                    }
+                    };
+                    attach_host_closure_digest(&base, host_closure_digest)
                 })
                 .collect();
 
@@ -3116,6 +3309,7 @@ fn eval_with_zygote_pool_inner(
                 (rl, None, None)
             }
         };
+    let req_line = attach_host_closure_digest(&req_line, host_closure_digest);
 
     let mut worker = {
         let mut pool = pool_mutex
@@ -5055,10 +5249,51 @@ mod tests {
         let lp = tmp_dir.to_string_lossy().to_string();
         let d1 = compute_imported_oleans_digest("Foo.Bar", &lp);
         assert_eq!(d1, compute_imported_oleans_digest("Foo.Bar", &lp));
+        let sp1 = compute_search_path_oleans_digest(&lp);
+        assert_eq!(sp1, compute_search_path_oleans_digest(&lp));
 
-        fs::write(&olean_path, b"olean-version-2-modified").unwrap();
-        assert_ne!(d1, compute_imported_oleans_digest("Foo.Bar", &lp));
+        // Same-size overwrite as well as companion creation/modification must invalidate memoized digests.
+        fs::write(&olean_path, b"olean-version-2").unwrap();
+        let d2 = compute_imported_oleans_digest("Foo.Bar", &lp);
+        let sp2 = compute_search_path_oleans_digest(&lp);
+        assert_ne!(d1, d2);
+        assert_ne!(sp1, sp2);
+
+        let srv_path = PathBuf::from(format!("{}.server", olean_path.display()));
+        fs::write(&srv_path, b"server-companion-v1").unwrap();
+        let d3 = compute_imported_oleans_digest("Foo.Bar", &lp);
+        assert_ne!(d2, d3);
+
+        fs::write(&srv_path, b"server-companion-v2").unwrap();
+        let d4 = compute_imported_oleans_digest("Foo.Bar", &lp);
+        assert_ne!(d3, d4);
+
+        std::thread::sleep(std::time::Duration::from_millis(65));
+        let d4_warm_populate = compute_imported_oleans_digest("Foo.Bar", &lp);
+        assert_eq!(d4, d4_warm_populate);
+        assert_eq!(d4, compute_imported_oleans_digest("Foo.Bar", &lp));
+
+        fs::write(&olean_path, b"olean-version-3").unwrap();
+        let d5 = compute_imported_oleans_digest("Foo.Bar", &lp);
+        assert_ne!(d4, d5);
+
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_attach_host_closure_digest_protocol_columns() {
+        let r2 = attach_host_closure_digest("Init\t6162\n", "dig123");
+        assert_eq!(r2, "Init\t6162\t\t\t\t\tdig123\n");
+        assert_eq!(r2.trim_end_matches('\n').split('\t').nth(6), Some("dig123"));
+
+        let r5 = attach_host_closure_digest("Init\t6162\tstrict\tpk\t7072\n", "dig456");
+        assert_eq!(r5, "Init\t6162\tstrict\tpk\t7072\t\tdig456\n");
+        assert_eq!(r5.trim_end_matches('\n').split('\t').nth(6), Some("dig456"));
+
+        let r6 = attach_host_closure_digest("Init\t6162\tstrict\t\t\t6f70\n", "dig789");
+        assert_eq!(r6, "Init\t6162\tstrict\t\t\t6f70\tdig789\n");
+        assert_eq!(r6.trim_end_matches('\n').split('\t').nth(5), Some("6f70"));
+        assert_eq!(r6.trim_end_matches('\n').split('\t').nth(6), Some("dig789"));
     }
 
     #[test]
@@ -5439,7 +5674,33 @@ mod tests {
         assert!(status_b.success());
 
         let lp_a = lib_a.to_string_lossy().to_string();
-        let dig1 = compute_imported_oleans_digest("DepB", &lp_a);
+        let (dig1, complete1) = compute_imported_oleans_digest_inner("DepB", &lp_a);
+        assert!(complete1);
+        let rep_warm_seed = eval_with_zygote_pool(
+            &store,
+            toolchain,
+            &lp_a,
+            &env_vars,
+            &lean_bin,
+            "import DepB\ntheorem t_warm_1 : midValue = 12 := rfl\n",
+            false,
+        )
+        .unwrap();
+        assert!(rep_warm_seed.ok && rep_warm_seed.import_ok);
+        let rep_warm_hit = eval_with_zygote_pool(
+            &store,
+            toolchain,
+            &lp_a,
+            &env_vars,
+            &lean_bin,
+            "import DepB\ntheorem t_warm_2 : midValue + 1 = 13 := rfl\n",
+            false,
+        )
+        .unwrap();
+        assert!(
+            rep_warm_hit.ok && rep_warm_hit.env_cache_hit,
+            "Zygote worker must hit env_cache via hostClosureDigest on second request"
+        );
 
         // Rebuild transitive leaf DepC with same-length source / different constant value without touching DepB.olean
         fs::write(&src_c1, "def depValue : Nat := 99\n").unwrap();
@@ -5457,6 +5718,20 @@ mod tests {
         assert_ne!(
             dig1, dig2,
             "compute_imported_oleans_digest must track transitive .olean dependencies (DepB -> DepC)"
+        );
+        let rep_after_dep_edit = eval_with_zygote_pool(
+            &store,
+            toolchain,
+            &lp_a,
+            &env_vars,
+            &lean_bin,
+            "import DepB\ntheorem t_after_edit : depValue = 99 := rfl\n",
+            false,
+        )
+        .unwrap();
+        assert!(
+            rep_after_dep_edit.ok && !rep_after_dep_edit.env_cache_hit,
+            "Zygote worker must miss env_cache and reload when transitive DepC.olean changes"
         );
 
         // Module visibility isolation: private import in `module` must be enforced, and `LEAN_PATH`

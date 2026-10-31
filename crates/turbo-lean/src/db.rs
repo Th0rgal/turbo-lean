@@ -190,9 +190,27 @@ fn par_filter_map<T: Sync, R: Send, F: Fn(&T) -> Option<R> + Sync>(items: &[T], 
     chunks.into_iter().flatten().collect()
 }
 
+struct StagedTheoremShard {
+    action_key: String,
+    decl_name: String,
+    blob_hash: String,
+    inode: i64,
+    size: i64,
+    dur_ms: i64,
+}
+
+struct StagedTheoremShards {
+    toolchain: String,
+    trust_domain: String,
+    now: i64,
+    unique_blobs: usize,
+    rows: Vec<StagedTheoremShard>,
+}
+
 pub struct TurboStore {
     pub root: PathBuf,
     pub conn: Connection,
+    inflight_staged_shards: std::cell::RefCell<Option<StagedTheoremShards>>,
 }
 
 impl TurboStore {
@@ -354,7 +372,11 @@ impl TurboStore {
             }
         }
 
-        let mut store = Self { root, conn };
+        let mut store = Self {
+            root,
+            conn,
+            inflight_staged_shards: std::cell::RefCell::new(None),
+        };
         let locks_dir = store.root.join("locks");
         let deferred_v3 = locks_dir.join("deferred_pack_v3.bin");
         let _ = fs::remove_file(locks_dir.join("deferred_pack_v3.domain"));
@@ -1472,6 +1494,7 @@ impl TurboStore {
         trust_domain: &str,
         items: &[(String, String, Vec<u8>, i64)],
     ) -> Result<()> {
+        let _ = self.inflight_staged_shards.borrow_mut().take();
         if items.is_empty() {
             return Ok(());
         }
@@ -1510,27 +1533,59 @@ impl TurboStore {
                 seen_blobs.insert(hash.clone(), (ino, sz));
                 (ino, sz)
             };
-            staged.push((
-                action_key.as_str(),
-                decl_name.as_str(),
-                hash,
+            staged.push(StagedTheoremShard {
+                action_key: action_key.clone(),
+                decl_name: decl_name.clone(),
+                blob_hash: hash,
                 inode,
                 size,
-                *dur_ms,
-            ));
+                dur_ms: *dur_ms,
+            });
         }
 
-        self.conn.execute_batch(
-            "PRAGMA foreign_keys = OFF; PRAGMA synchronous = OFF; BEGIN IMMEDIATE;",
-        )?;
+        *self.inflight_staged_shards.borrow_mut() = Some(StagedTheoremShards {
+            toolchain: toolchain.to_string(),
+            trust_domain: trust_domain.to_string(),
+            now,
+            unique_blobs: seen_blobs.len(),
+            rows: staged,
+        });
+        Ok(())
+    }
+
+    fn commit_inflight_publish_inner(&self, lease_action_key: Option<&str>) -> Result<()> {
+        let Some(staged) = self.inflight_staged_shards.borrow_mut().take() else {
+            return Ok(());
+        };
+        let waiters = lease_action_key
+            .map(|ak| self.seal_singleflight_waiters(ak))
+            .unwrap_or(0);
+        let mut lease_done_entry: Option<(String, BlobEntry)> = None;
+
+        let commit_now = now_unix().max(staged.now);
+        let restore_pragmas = || {
+            let _ = self.conn.execute_batch("PRAGMA synchronous = NORMAL;");
+            let _ = self.conn.execute_batch("PRAGMA foreign_keys = ON;");
+        };
+        if let Err(e) = self
+            .conn
+            .execute_batch("PRAGMA foreign_keys = OFF; PRAGMA synchronous = OFF;")
+        {
+            restore_pragmas();
+            return Err(e.into());
+        }
+        if let Err(e) = self.conn.execute_batch("BEGIN IMMEDIATE;") {
+            restore_pragmas();
+            return Err(e.into());
+        }
         let res = (|| -> Result<()> {
             let end_fencing_token: i64 = {
                 let mut upd_seq = self.conn.prepare_cached(
                     "UPDATE meta_counters SET val = val + ?1 WHERE name = 'fencing_seq' RETURNING val",
                 )?;
-                upd_seq.query_row(params![staged.len() as i64], |r| r.get(0))?
+                upd_seq.query_row(params![staged.rows.len() as i64], |r| r.get(0))?
             };
-            let base_fencing_token = end_fencing_token - (staged.len() as i64);
+            let base_fencing_token = end_fencing_token - (staged.rows.len() as i64);
             let mut ins_blob = self.conn.prepare_cached(
                 "INSERT INTO blobs (blob_hash, kind, size_bytes, inode, created_at, last_accessed, pin_level, trust_domain)
                  VALUES (?1, 'expr_shard', ?2, ?3, ?4, ?4, 0, ?5)
@@ -1541,15 +1596,16 @@ impl TurboStore {
             )?;
             let mut ins_act = self.conn.prepare_cached(
                 "INSERT INTO actions (action_key, toolchain_githash, kind, status, fencing_token,
-                                      output_manifest_hash, duration_ms, peak_pss_bytes, heartbeats, trust_domain, updated_at)
-                 VALUES (?1, ?2, 'theorem_shard', 'completed', ?3, ?4, ?5, 0, 0, ?6, ?7)
+                                      output_manifest_hash, duration_ms, peak_pss_bytes, heartbeats, trust_domain, updated_at, hit_count)
+                 VALUES (?1, ?2, 'theorem_shard', 'completed', ?3, ?4, ?5, 0, 0, ?6, ?7, ?8)
                  ON CONFLICT(action_key) DO UPDATE SET
                     status = 'completed',
                     fencing_token = excluded.fencing_token,
                     output_manifest_hash = excluded.output_manifest_hash,
                     duration_ms = excluded.duration_ms,
                     trust_domain = excluded.trust_domain,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    hit_count = actions.hit_count + excluded.hit_count
                  WHERE actions.trust_domain != 'trusted' OR excluded.trust_domain = 'trusted'",
             )?;
             let mut del_out = self
@@ -1560,79 +1616,94 @@ impl TurboStore {
                  VALUES (?1, ?2, ?3)",
             )?;
 
-            let mut inserted_blobs = std::collections::HashSet::with_capacity(seen_blobs.len());
-            for (idx, (action_key, decl_name, blob_hash, inode, size, dur_ms)) in
-                staged.into_iter().enumerate()
-            {
-                if inserted_blobs.insert(blob_hash.clone()) {
-                    ins_blob.execute(params![blob_hash, size, inode, now, trust_domain])?;
+            let mut inserted_blobs = std::collections::HashSet::with_capacity(staged.unique_blobs);
+            for (idx, row) in staged.rows.into_iter().enumerate() {
+                if inserted_blobs.insert(row.blob_hash.clone()) {
+                    ins_blob.execute(params![
+                        row.blob_hash,
+                        row.size,
+                        row.inode,
+                        commit_now,
+                        staged.trust_domain
+                    ])?;
                 }
                 let fencing_token = base_fencing_token + (idx as i64) + 1;
-                let rel_path = format!("thm:{}", decl_name);
+                let rel_path = format!("thm:{}", row.decl_name);
                 let mut mh = blake3::Hasher::new();
                 mh.update(rel_path.as_bytes());
                 mh.update(b":");
-                mh.update(blob_hash.as_bytes());
+                mh.update(row.blob_hash.as_bytes());
                 mh.update(b"\n");
                 let manifest_hash = mh.finalize().to_hex().to_string();
+                let hit_inc = if lease_action_key == Some(row.action_key.as_str()) {
+                    waiters
+                } else {
+                    0
+                };
 
                 let updated = ins_act.execute(params![
-                    action_key,
-                    toolchain,
+                    row.action_key,
+                    staged.toolchain,
                     fencing_token,
                     manifest_hash,
-                    dur_ms,
-                    trust_domain,
-                    now
+                    row.dur_ms,
+                    staged.trust_domain,
+                    commit_now,
+                    hit_inc
                 ])?;
                 if updated > 0 {
-                    del_out.execute(params![action_key])?;
-                    ins_out.execute(params![action_key, rel_path, blob_hash])?;
+                    del_out.execute(params![row.action_key])?;
+                    ins_out.execute(params![row.action_key, rel_path, row.blob_hash])?;
+                    if staged.trust_domain == "trusted"
+                        && lease_action_key == Some(row.action_key.as_str())
+                    {
+                        lease_done_entry = Some((
+                            row.action_key,
+                            BlobEntry {
+                                blob_hash: row.blob_hash,
+                                kind: "expr_shard".to_string(),
+                                size_bytes: row.size as u64,
+                                rel_path,
+                            },
+                        ));
+                    }
                 }
             }
+            if waiters > 0 {
+                let mut upd_waits = self.conn.prepare_cached(
+                    "UPDATE meta_counters SET val = val + ?1 WHERE name = 'coalesced_waits'",
+                )?;
+                upd_waits.execute(params![waiters])?;
+            }
+            self.conn.execute_batch("COMMIT;")?;
             Ok(())
         })();
         if res.is_err() {
-            let _ = self
-                .conn
-                .execute_batch("ROLLBACK; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
+            let _ = self.conn.execute_batch("ROLLBACK;");
         }
-        res
-    }
-
-    pub fn commit_inflight_publish(&self) -> Result<()> {
-        let res = self.conn.execute_batch("COMMIT;");
-        let _ = self
-            .conn
-            .execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
+        restore_pragmas();
         let _ = fs::remove_file(
             self.root
                 .join("locks")
                 .join("cached_portable_manifest.json"),
         );
         res?;
+        if let Some((ak, entry)) = lease_done_entry {
+            self.write_singleflight_done(&ak, &[entry]);
+        }
         Ok(())
     }
 
+    pub fn commit_inflight_publish(&self) -> Result<()> {
+        self.commit_inflight_publish_inner(None)
+    }
+
     pub fn commit_inflight_publish_for_lease(&self, action_key: &str) -> Result<()> {
-        let waiters = self.seal_singleflight_waiters(action_key);
-        if waiters > 0 {
-            let _ = self.conn.execute(
-                "UPDATE actions SET hit_count = hit_count + ?1 WHERE action_key = ?2",
-                params![waiters, action_key],
-            );
-            let _ = self.conn.execute(
-                "UPDATE meta_counters SET val = val + ?1 WHERE name = 'coalesced_waits'",
-                params![waiters],
-            );
-        }
-        self.commit_inflight_publish()
+        self.commit_inflight_publish_inner(Some(action_key))
     }
 
     pub fn rollback_inflight_publish(&self) {
-        let _ = self
-            .conn
-            .execute_batch("ROLLBACK; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
+        let _ = self.inflight_staged_shards.borrow_mut().take();
     }
 
     pub fn batch_publish_theorem_shards(
@@ -4437,6 +4508,114 @@ mod tests {
         assert!(store
             .leansys_sst_write_splits(&[("".to_string(), "{\"bad\":1}".to_string())])
             .is_err());
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_inflight_publish_does_not_hold_sqlite_write_lock_during_remote_call() -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_inflight_lock_scope_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let cache_dir = tmp_dir.join("cache");
+
+        let client_store = TurboStore::open(Some(&cache_dir))?;
+        let mut concurrent_writer = TurboStore::open(Some(&cache_dir))?;
+        concurrent_writer
+            .conn
+            .busy_timeout(std::time::Duration::from_millis(50))?;
+
+        let inflight_items = vec![(
+            "inflight_key_1".to_string(),
+            "thm_inflight_1".to_string(),
+            b"{\"decl\":\"thm_inflight_1\",\"ok\":true}".to_vec(),
+            7i64,
+        )];
+        client_store.prestage_theorem_shard_blobs(&inflight_items)?;
+        client_store.begin_inflight_publish_theorem_shards(
+            "leanprover/lean4:v4.35.0",
+            "trusted",
+            &inflight_items,
+        )?;
+
+        // Simulate a concurrent writer (e.g. local serve handler or sibling worker) writing while
+        // the HTTP request is still in flight; with a 50ms busy_timeout this would fail immediately
+        // if `begin_inflight_publish_theorem_shards` held `BEGIN IMMEDIATE`.
+        let writer_items = vec![(
+            "concurrent_key_1".to_string(),
+            "thm_concurrent_1".to_string(),
+            b"{\"decl\":\"thm_concurrent_1\",\"ok\":true}".to_vec(),
+            3i64,
+        )];
+        concurrent_writer.batch_publish_theorem_shards(
+            "leanprover/lean4:v4.35.0",
+            "trusted",
+            &writer_items,
+        )?;
+        assert!(concurrent_writer.has_cached_action_readonly("concurrent_key_1", "trusted")?);
+        assert!(!concurrent_writer.has_cached_action_readonly("inflight_key_1", "trusted")?);
+
+        // Verify rollback drops staged items without publishing them.
+        let rollback_store = TurboStore::open(Some(&cache_dir))?;
+        let rollback_items = vec![(
+            "rollback_key_1".to_string(),
+            "thm_rollback_1".to_string(),
+            b"{\"decl\":\"thm_rollback_1\",\"ok\":false}".to_vec(),
+            2i64,
+        )];
+        rollback_store.begin_inflight_publish_theorem_shards(
+            "leanprover/lean4:v4.35.0",
+            "trusted",
+            &rollback_items,
+        )?;
+        rollback_store.rollback_inflight_publish();
+        rollback_store.commit_inflight_publish()?;
+        assert!(!concurrent_writer.has_cached_action_readonly("rollback_key_1", "trusted")?);
+
+        // Now complete the inflight publish and verify atomic visibility + `.done` marker on lease commit.
+        client_store.commit_inflight_publish_for_lease("inflight_key_1")?;
+        assert!(concurrent_writer.has_cached_action_readonly("inflight_key_1", "trusted")?);
+        assert!(cache_dir.join("locks").join("inflight_key_1.done").exists());
+
+        // Verify commit failure after an automatic SQLite transaction rollback still restores pragmas.
+        client_store.conn.execute_batch(
+            "CREATE TEMP TRIGGER abort_inflight_test BEFORE INSERT ON actions \
+             WHEN NEW.action_key = 'auto_rollback_key_1' \
+             BEGIN SELECT RAISE(ROLLBACK, 'simulated_auto_rollback'); END;",
+        )?;
+        let auto_rollback_items = vec![(
+            "auto_rollback_key_1".to_string(),
+            "thm_auto_rollback_1".to_string(),
+            b"{\"decl\":\"thm_auto_rollback_1\",\"ok\":true}".to_vec(),
+            5i64,
+        )];
+        client_store.begin_inflight_publish_theorem_shards(
+            "leanprover/lean4:v4.35.0",
+            "trusted",
+            &auto_rollback_items,
+        )?;
+        assert!(client_store
+            .commit_inflight_publish_for_lease("auto_rollback_key_1")
+            .is_err());
+        let sync_mode: i64 = client_store
+            .conn
+            .query_row("PRAGMA synchronous;", [], |r| r.get(0))?;
+        let fk_mode: i64 = client_store
+            .conn
+            .query_row("PRAGMA foreign_keys;", [], |r| r.get(0))?;
+        assert_eq!(sync_mode, 1);
+        assert_eq!(fk_mode, 1);
+        assert!(!cache_dir
+            .join("locks")
+            .join("auto_rollback_key_1.done")
+            .exists());
+        client_store
+            .conn
+            .execute_batch("DROP TRIGGER temp.abort_inflight_test;")?;
+
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
