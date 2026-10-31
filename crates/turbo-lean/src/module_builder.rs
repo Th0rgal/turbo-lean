@@ -4774,13 +4774,21 @@ pub(crate) fn root_module_paths(cfg: &ProjectConfig, imp: &str) -> Option<(PathB
     Some((spec.src_path, olean))
 }
 
+/// Whether dependency-package module `imp` lacks a built `.olean` on disk.
+pub(crate) fn dep_pkg_module_missing_olean(cfg: &ProjectConfig, imp: &str) -> bool {
+    matches!(resolve_import_site(cfg, imp), ImportSite::Module(s) if !spec_olean_path(&s).is_file())
+}
+
 /// Whether dependency-package module `imp` may be stale before elaboration. A module without a
 /// verified-sources entry (no manifest, or never recorded) is Lake-managed: `false`. A manifest
 /// that cannot be read or parsed, or an entry that no longer proves the module's closure
 /// consistent, establishes nothing: `true` (refresh or fail closed).
 pub(crate) fn dep_pkg_module_stale(cfg: &ProjectConfig, memo: &DepImportMemo, imp: &str) -> bool {
-    let ImportSite::Module(spec) = resolve_import_site(cfg, imp) else {
-        return false;
+    let spec = match resolve_import_site(cfg, imp) {
+        ImportSite::Module(spec) => spec,
+        // Two dependency packages own the name: no single closure is safe to elaborate against.
+        ImportSite::Unresolved => return true,
+        _ => return false,
     };
     let bytes = match fs::read(
         spec.pkg_root
@@ -10369,6 +10377,162 @@ lean_exe «demo-exe» where
             !matches!(res, Ok(0)),
             "foreign `App.A` artifact left in place under `App.B`"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// P0-4: a dependency module named `Lean.*` is not a toolchain module. With no root manifest,
+    /// a stale pin still forces a refresh (or a fail-closed error) instead of `Ok(0)`.
+    #[test]
+    fn test_dep_owned_lean_namespace_stale_without_root_manifest() {
+        let _env_guard = native_build_env_guard();
+        let dir = make_temp_test_dir("stale_lean_ns");
+        let proj_dir = dir.join("proj");
+        let dep_dir = proj_dir.join(".lake/packages/dep_pkg");
+        fs::create_dir_all(dep_dir.join("Lean")).unwrap();
+        fs::create_dir_all(proj_dir.join("App")).unwrap();
+        for d in [&proj_dir, &dep_dir] {
+            fs::write(d.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        }
+        fs::write(
+            dep_dir.join("lakefile.toml"),
+            "name = \"dep_pkg\"\n[[lean_lib]]\nname = \"Lean\"\nglobs = [\"Lean.+\"]\n",
+        )
+        .unwrap();
+        fs::write(dep_dir.join("Lean/Base.lean"), "def base : Nat := 1\n").unwrap();
+        fs::write(
+            dep_dir.join("Lean/Extra.lean"),
+            "import Lean.Base\ndef extra : Nat := base\n",
+        )
+        .unwrap();
+        fs::write(
+            proj_dir.join("lake-manifest.json"),
+            r#"{"version": "1.2.0", "packagesDir": ".lake/packages", "packages": [{"type": "path", "name": "dep_pkg", "dir": ".lake/packages/dep_pkg", "configFile": "lakefile.toml", "inherited": false}], "name": "app_pkg", "lakeDir": ".lake", "fixedToolchain": false}"#,
+        )
+        .unwrap();
+        fs::write(
+            proj_dir.join("lakefile.toml"),
+            "name = \"app_pkg\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\nglobs = [\"App.+\"]\n",
+        )
+        .unwrap();
+        let c_file = proj_dir.join("App/C.lean");
+        fs::write(&c_file, "import Lean.Extra\n#check extra\n").unwrap();
+        let mut store = TurboStore::open(Some(&dir.join(".turbo_store"))).unwrap();
+        assert_eq!(
+            build_project_modules_native(
+                &mut store,
+                &proj_dir,
+                &[],
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap()
+            .modules_compiled,
+            3
+        );
+        let dep_manifest_path = dep_dir.join(".lake/build/.turbo_verified_sources.json");
+        let mut dep_partial: serde_json::Value =
+            serde_json::from_slice(&fs::read(&dep_manifest_path).unwrap()).unwrap();
+        dep_partial["modules"]["Lean/Extra.lean"]["import_olean_digests"]
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "Lean.Base".into(),
+                serde_json::json!("not-the-recorded-digest"),
+            );
+        fs::write(
+            &dep_manifest_path,
+            serde_json::to_vec(&dep_partial).unwrap(),
+        )
+        .unwrap();
+        let canon = proj_dir.canonicalize().unwrap();
+        let _ = fs::remove_file(crate::lake_build::verified_sources_manifest_path(&canon));
+        let res = crate::lake_build::ensure_project_imports_fresh_for_check(
+            &canon,
+            std::slice::from_ref(&c_file.canonicalize().unwrap()),
+        );
+        assert!(
+            !matches!(res, Ok(0)),
+            "`Lean.Extra` skipped as a toolchain name: {res:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// P0-4: a root entry recorded for a different toolchain or Lean githash is stale before
+    /// elaboration, even when its only imports are genuine toolchain modules (unpinned).
+    #[test]
+    fn test_root_entry_stale_on_toolchain_identity_mismatch() {
+        let _env_guard = native_build_env_guard();
+        let dir = make_temp_test_dir("stale_tc_identity");
+        let proj_dir = dir.join("proj");
+        fs::create_dir_all(proj_dir.join("App")).unwrap();
+        fs::write(
+            proj_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )
+        .unwrap();
+        fs::write(
+            proj_dir.join("lakefile.toml"),
+            "name = \"app_pkg\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\nglobs = [\"App.+\"]\n",
+        )
+        .unwrap();
+        let b_src = "import Init\ntheorem t : True := trivial\n";
+        fs::write(proj_dir.join("App/B.lean"), b_src).unwrap();
+        let mut store = TurboStore::open(Some(&dir.join(".turbo_store"))).unwrap();
+        build_project_modules_native(
+            &mut store,
+            &proj_dir,
+            &[],
+            "trusted-internal",
+            1,
+            false,
+            true,
+            None,
+        )
+        .unwrap();
+        let canon = proj_dir.canonicalize().unwrap();
+        let manifest_path = crate::lake_build::verified_sources_manifest_path(&canon);
+        let good = fs::read(&manifest_path).unwrap();
+        let c_file = canon.join("App/C.lean");
+        fs::write(&c_file, "import App.B\n").unwrap();
+        let fresh = |bytes: &[u8]| {
+            fs::write(&manifest_path, bytes).unwrap();
+            crate::lake_build::ensure_project_imports_fresh_for_check(
+                &canon,
+                std::slice::from_ref(&c_file),
+            )
+        };
+        assert!(
+            matches!(fresh(&good), Ok(0)),
+            "matching toolchain identity must stay fresh"
+        );
+        for (field, value) in [
+            ("toolchain", "leanprover/lean4:v4.24.0"),
+            ("lean_githash", "0000000000000000000000000000000000000000"),
+        ] {
+            let mut stale: serde_json::Value = serde_json::from_slice(&good).unwrap();
+            stale[field] = serde_json::json!(value);
+            let res = fresh(&serde_json::to_vec(&stale).unwrap());
+            assert!(
+                !matches!(res, Ok(0)),
+                "mismatched `{field}` left `App.B` in place: {res:?}"
+            );
+            fs::write(&manifest_path, &good).unwrap();
+        }
+        // Without a resolvable package config, `lean_githash` cannot be verified, so fail closed.
+        let lakefile = canon.join("lakefile.toml");
+        let saved_lakefile = fs::read(&lakefile).unwrap();
+        fs::remove_file(&lakefile).unwrap();
+        let mut stale: serde_json::Value = serde_json::from_slice(&good).unwrap();
+        stale["lean_githash"] = serde_json::json!("0000000000000000000000000000000000000000");
+        let res = fresh(&serde_json::to_vec(&stale).unwrap());
+        assert!(
+            !matches!(res, Ok(0)),
+            "missing lakefile bypassed `lean_githash` check: {res:?}"
+        );
+        fs::write(&lakefile, saved_lakefile).unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 
