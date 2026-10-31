@@ -1,7 +1,7 @@
 //! Lake environment resolution, `/dev/shm` file-split & project-summary stat caching,
 //! `.olean` freshness tracking, CAS artifact staging, and `turbo-lean build` execution.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -103,12 +103,12 @@ pub(crate) fn spawn_lake_env(project_dir: &Path) -> Result<HashMap<String, Strin
     if allow_tc_fallback {
         candidate_tcs.push("leanprover--lean4---v4.35.0".to_string());
     }
-    let mut matched_tc: Option<(PathBuf, PathBuf)> = None;
+    let mut matched_tc: Option<(Option<PathBuf>, PathBuf)> = None;
     for candidate_tc in &candidate_tcs {
         for elan_home in &elan_roots {
             let tc_root = elan_home.join("toolchains").join(candidate_tc);
             if tc_root.join("bin").join("lean").exists() {
-                matched_tc = Some((elan_home.clone(), tc_root));
+                matched_tc = Some((Some(elan_home.clone()), tc_root));
                 break;
             }
         }
@@ -124,7 +124,7 @@ pub(crate) fn spawn_lake_env(project_dir: &Path) -> Result<HashMap<String, Strin
                 dirs.reverse();
                 for d in dirs {
                     if d.join("bin").join("lean").exists() {
-                        matched_tc = Some((elan_home.clone(), d));
+                        matched_tc = Some((Some(elan_home.clone()), d));
                         break;
                     }
                 }
@@ -135,71 +135,96 @@ pub(crate) fn spawn_lake_env(project_dir: &Path) -> Result<HashMap<String, Strin
         }
     }
 
-    if let Some((elan_home, tc_root)) = matched_tc {
-        {
-            let canon_proj = project_dir
-                .canonicalize()
-                .unwrap_or_else(|_| project_dir.to_path_buf());
-            let proj_lib_lean = canon_proj.join(".lake/build/lib/lean");
-            let tc_lib_lean = tc_root.join("lib/lean");
-            let tc_lib = tc_root.join("lib");
-            let tc_bin = tc_root.join("bin");
-            let elan_bin = elan_home.join("bin");
+    // `lake env env` loads/compiles lakefile.lean and can write config artifacts even
+    // though no build was requested. Under opt-out, discover a PATH-only installation
+    // through Lean itself; never ask Lake to load the workspace, including on failure.
+    if matched_tc.is_none() && worktree_auto_link_disabled(project_dir) {
+        let diagnostic = "Worktree opt-out prevents loading Lake configuration with `lake env env`; \
+            install the project's Lean toolchain and set PATH or ELAN_HOME so `lean --print-prefix` succeeds";
+        let output = Command::new("lean")
+            .arg("--print-prefix")
+            .current_dir(project_dir)
+            .output()
+            .with_context(|| diagnostic)?;
+        anyhow::ensure!(
+            output.status.success(),
+            "{diagnostic}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let prefix = PathBuf::from(String::from_utf8(output.stdout).with_context(|| diagnostic)?.trim());
+        anyhow::ensure!(
+            prefix.is_absolute()
+                && prefix.join("bin/lean").is_file()
+                && prefix.join("lib/lean").is_dir(),
+            "{diagnostic}: invalid Lean prefix `{}`",
+            prefix.display()
+        );
+        matched_tc = Some((None, prefix));
+    }
 
-            let mut lean_path_parts = vec![proj_lib_lean.to_string_lossy().to_string()];
-            let mut ld_parts = vec![canon_proj
-                .join(".lake/build/lib")
-                .to_string_lossy()
-                .to_string()];
-            let pkgs_dir = canon_proj.join(".lake").join("packages");
-            if let Ok(entries) = fs::read_dir(&pkgs_dir) {
-                let mut pkg_dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-                pkg_dirs.sort();
-                for pkg_dir in pkg_dirs {
-                    let pkg_lib_lean = pkg_dir.join(".lake/build/lib/lean");
-                    if pkg_lib_lean.is_dir() {
-                        lean_path_parts.push(pkg_lib_lean.to_string_lossy().to_string());
-                    }
-                    let pkg_lib = pkg_dir.join(".lake/build/lib");
-                    if pkg_lib.is_dir() {
-                        ld_parts.push(pkg_lib.to_string_lossy().to_string());
-                    }
+    if let Some((elan_home, tc_root)) = matched_tc {
+        let canon_proj = project_dir
+            .canonicalize()
+            .unwrap_or_else(|_| project_dir.to_path_buf());
+        let proj_lib_lean = canon_proj.join(".lake/build/lib/lean");
+        let tc_lib_lean = tc_root.join("lib/lean");
+        let tc_lib = tc_root.join("lib");
+        let tc_bin = tc_root.join("bin");
+
+        let mut lean_path_parts = vec![proj_lib_lean.to_string_lossy().to_string()];
+        let mut ld_parts = vec![canon_proj
+            .join(".lake/build/lib")
+            .to_string_lossy()
+            .to_string()];
+        let pkgs_dir = canon_proj.join(".lake").join("packages");
+        if let Ok(entries) = fs::read_dir(&pkgs_dir) {
+            let mut pkg_dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+            pkg_dirs.sort();
+            for pkg_dir in pkg_dirs {
+                let pkg_lib_lean = pkg_dir.join(".lake/build/lib/lean");
+                if pkg_lib_lean.is_dir() {
+                    lean_path_parts.push(pkg_lib_lean.to_string_lossy().to_string());
+                }
+                let pkg_lib = pkg_dir.join(".lake/build/lib");
+                if pkg_lib.is_dir() {
+                    ld_parts.push(pkg_lib.to_string_lossy().to_string());
                 }
             }
-            lean_path_parts.push(tc_lib_lean.to_string_lossy().to_string());
-            ld_parts.push(tc_lib_lean.to_string_lossy().to_string());
-            ld_parts.push(tc_lib.to_string_lossy().to_string());
-            let orig_ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-            if !orig_ld.is_empty() {
-                ld_parts.push(orig_ld);
-            }
+        }
+        lean_path_parts.push(tc_lib_lean.to_string_lossy().to_string());
+        ld_parts.push(tc_lib_lean.to_string_lossy().to_string());
+        ld_parts.push(tc_lib.to_string_lossy().to_string());
+        let orig_ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+        if !orig_ld.is_empty() {
+            ld_parts.push(orig_ld);
+        }
 
-            let mut env_map = HashMap::new();
+        let mut env_map = HashMap::new();
+        let mut path_parts = vec![tc_bin.to_string_lossy().to_string()];
+        if let Some(elan_home) = elan_home {
+            path_parts.push(elan_home.join("bin").to_string_lossy().to_string());
             env_map.insert(
                 "ELAN_HOME".to_string(),
                 elan_home.to_string_lossy().to_string(),
             );
-            env_map.insert(
-                "LAKE".to_string(),
-                tc_bin.join("lake").to_string_lossy().to_string(),
-            );
-            env_map.insert("LEAN_PATH".to_string(), lean_path_parts.join(":"));
-            env_map.insert(
-                "LEAN_SRC_PATH".to_string(),
-                format!("{}:{}/src/lean", canon_proj.display(), tc_root.display()),
-            );
-            env_map.insert("LD_LIBRARY_PATH".to_string(), ld_parts.join(":"));
-            let orig_path = std::env::var("PATH").unwrap_or_default();
-            env_map.insert(
-                "PATH".to_string(),
-                format!("{}:{}:{}", tc_bin.display(), elan_bin.display(), orig_path),
-            );
-            env_map.insert(
-                "LEAN_STACK_SIZE_KB".to_string(),
-                std::env::var("LEAN_STACK_SIZE_KB").unwrap_or_else(|_| "262144".to_string()),
-            );
-            return Ok(env_map);
         }
+        env_map.insert(
+            "LAKE".to_string(),
+            tc_bin.join("lake").to_string_lossy().to_string(),
+        );
+        env_map.insert("LEAN_PATH".to_string(), lean_path_parts.join(":"));
+        env_map.insert(
+            "LEAN_SRC_PATH".to_string(),
+            format!("{}:{}/src/lean", canon_proj.display(), tc_root.display()),
+        );
+        env_map.insert("LD_LIBRARY_PATH".to_string(), ld_parts.join(":"));
+        path_parts.push(std::env::var("PATH").unwrap_or_default());
+        env_map.insert("PATH".to_string(), path_parts.join(":"));
+        env_map.insert(
+            "LEAN_STACK_SIZE_KB".to_string(),
+            std::env::var("LEAN_STACK_SIZE_KB").unwrap_or_else(|_| "262144".to_string()),
+        );
+        return Ok(env_map);
     }
 
     if let Ok(output) = Command::new("lake")
@@ -602,14 +627,13 @@ pub(crate) fn resolve_or_share_lake_env(
             }
         }
     }
-    if let Ok(mut env_map) = spawn_lake_env(canon_dir) {
-        if !env_map.is_empty() {
-            if let Ok(bytes) = serde_json::to_vec(&env_map) {
-                let _ = crate::shm_cache::atomic_write_shm(&shm_env_path, &bytes);
-            }
-            merge_caller_lean_path(&mut env_map);
-            return Ok(Some((env_map, true)));
+    let mut env_map = spawn_lake_env(canon_dir)?;
+    if !env_map.is_empty() {
+        if let Ok(bytes) = serde_json::to_vec(&env_map) {
+            let _ = crate::shm_cache::atomic_write_shm(&shm_env_path, &bytes);
         }
+        merge_caller_lean_path(&mut env_map);
+        return Ok(Some((env_map, true)));
     }
     Ok(None)
 }
@@ -3283,6 +3307,145 @@ pub fn run_build_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn test_optout_path_toolchain_env_child() -> Result<()> {
+        use crate::worktree_test_support::snapshot;
+        let Some(root) = std::env::var_os("TURBO_TEST_ENV_ROOT").map(PathBuf::from) else {
+            return Ok(());
+        };
+        let project = root.join("project");
+        let before = snapshot(&project)?;
+        let store = TurboStore::open(Some(&root.join("env-cache")))?;
+        if std::env::var_os("TURBO_TEST_MISSING_LEAN").is_some() {
+            for err in [
+                resolve_lake_env(&store, &project).unwrap_err(),
+                resolve_or_share_lake_env(&store, &project, "uncached-share").unwrap_err(),
+            ] {
+                assert!(
+                    err.to_string()
+                        .contains("Worktree opt-out prevents loading Lake configuration"),
+                    "{err:#}"
+                );
+                assert!(err.to_string().contains("PATH or ELAN_HOME"), "{err:#}");
+            }
+        } else {
+            let (env, cached) = resolve_lake_env(&store, &project)?;
+            assert!(!cached, "fixture must miss both environment caches");
+            let shared = resolve_or_share_lake_env(&store, &project, "uncached-share")?
+                .unwrap()
+                .0;
+            let prefix = fs::read_to_string(root.join("prefix"))?;
+            for env in [&env, &shared] {
+                assert_eq!(env["LAKE"], format!("{}/bin/lake", prefix.trim()));
+                let lean_paths: Vec<_> = std::env::split_paths(&env["LEAN_PATH"]).collect();
+                assert!(lean_paths.contains(&project.join(".lake/build/lib/lean")));
+                assert!(lean_paths.contains(&PathBuf::from(prefix.trim()).join("lib/lean")));
+            }
+            assert!(resolve_lake_env(&store, &project)?.1);
+        }
+        assert!(
+            !root.join("lake-invoked").exists(),
+            "environment resolution invoked Lake"
+        );
+        assert_eq!(
+            before,
+            snapshot(&project)?,
+            "environment resolution changed .lake"
+        );
+        fs::write(root.join("done"), b"")?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_optout_path_toolchain_preserves_missing_and_stale_lean_config() -> Result<()> {
+        use crate::worktree_test_support::{snapshot, LakeTree, TestChild};
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for state in ["missing", "stale", "missing-compiler"] {
+            let tree = LakeTree::new("path_toolchain", &[("P/A.lean", "def value : Nat := 1\n")])?;
+            fs::remove_file(tree.project.join("lakefile.toml"))?;
+            let config = tree.project.join("lakefile.lean");
+            fs::write(&config, "import Lake\nopen Lake DSL\npackage fixture where\nlean_lib P where\n  globs := #[.submodules `P]\n")?;
+            tree.lake(&["build", "P"])?;
+            let env = spawn_lake_env(&tree.project)?;
+            let lean = PathBuf::from(lean_bin_from_env(&env));
+            let prefix = Command::new(&lean).arg("--print-prefix").output()?;
+            anyhow::ensure!(prefix.status.success(), "fixture Lean prefix query failed");
+            fs::write(tree.root.join("prefix"), prefix.stdout)?;
+            let bin = tree.root.join("path/bin");
+            fs::create_dir_all(&bin)?;
+            if state != "missing-compiler" {
+                std::os::unix::fs::symlink(&lean, bin.join("lean"))?;
+            }
+            // Instrument the real Lake executable: a regression must also fail if loading
+            // a config happens to preserve identical artifact bytes.
+            let lake = bin.join("lake");
+            let quote =
+                |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "'\"'\"'"));
+            fs::write(
+                &lake,
+                format!(
+                    "#!/bin/sh\nprintf invoked > {}\nexec {} \"$@\"\n",
+                    quote(&tree.root.join("lake-invoked")),
+                    quote(Path::new(&env["LAKE"]))
+                ),
+            )?;
+            fs::set_permissions(&lake, fs::Permissions::from_mode(0o755))?;
+            if state == "stale" {
+                fs::write(
+                    &config,
+                    format!(
+                        "{}\n-- stale compiled Lake config\n",
+                        fs::read_to_string(&config)?
+                    ),
+                )?;
+                fs::File::options()
+                    .write(true)
+                    .open(&config)?
+                    .set_modified(
+                        std::time::SystemTime::now() + std::time::Duration::from_secs(2),
+                    )?;
+            } else {
+                let compiled = WalkDir::new(tree.project.join(".lake"))
+                    .into_iter()
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .find(|e| e.file_name() == "lakefile.olean")
+                    .expect("real compiled Lean Lake config");
+                fs::remove_file(compiled.path())?;
+            }
+            tree.opt_out()?;
+            tree.prepare_snapshot(".lake/build/lib/lean/P/A.olean")?;
+            let before = snapshot(&tree.project)?;
+            let mut command =
+                TestChild::command("lake_build::tests::test_optout_path_toolchain_env_child")?;
+            command
+                .env("TURBO_TEST_ENV_ROOT", &tree.root)
+                .env("PATH", &bin)
+                .env("HOME", tree.root.join("isolated/a/b/home"))
+                .env("ELAN_HOME", tree.root.join("empty-elan"))
+                .env("TURBO_LEAN_HOME", tree.root.join("cache"))
+                .env("TURBO_LEAN_STAGING_DIR", tree.root.join("staging"))
+                .env("TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK", "0")
+                .env_remove("LEAN_PATH");
+            if state == "missing-compiler" {
+                command.env("TURBO_TEST_MISSING_LEAN", "1");
+            }
+            let mut child = TestChild::spawn(&mut command)?;
+            child.finish(&tree.root.join("done"))?;
+            assert_eq!(
+                before,
+                snapshot(&tree.project)?,
+                "{state} config changed .lake"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_imported_olean_modification_invalidates_shard_key() {

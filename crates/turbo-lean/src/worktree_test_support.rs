@@ -110,9 +110,9 @@ impl Drop for LakeTree {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Entry(PathBuf, u64, u64, u32, u64, Vec<u8>);
+pub(crate) struct Entry(PathBuf, u64, u64, u32, u64, (i64, i64), (i64, i64), Vec<u8>);
 
-/// Includes every directory and entry, so new directories/lock files also fail equality.
+/// Includes every entry, contents, inode, mode, link count, and modification/change time.
 pub(crate) fn snapshot(project: &Path) -> Result<Vec<Entry>> {
     let mut rows = Vec::new();
     for entry in walkdir::WalkDir::new(project.join(".lake")) {
@@ -132,6 +132,8 @@ pub(crate) fn snapshot(project: &Path) -> Result<Vec<Entry>> {
             m.ino(),
             m.mode(),
             m.nlink(),
+            (m.mtime(), m.mtime_nsec()),
+            (m.ctime(), m.ctime_nsec()),
             bytes,
         ));
     }
