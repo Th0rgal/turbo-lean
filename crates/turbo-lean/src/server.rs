@@ -1457,10 +1457,29 @@ fn option_bound_http_key(key: &str, digest: Option<&str>) -> String {
 }
 
 fn option_bound_receipt(mut receipt: serde_json::Value, digest: Option<&str>) -> Result<Vec<u8>> {
-    if let Some(digest) = digest {
-        receipt["lean_args_digest"] = serde_json::Value::String(digest.to_string());
-    }
+    // Explicit empty provenance distinguishes new empty-option receipts from legacy
+    // receipts whose publishing options are unknown.
+    receipt["lean_args_digest"] = serde_json::Value::String(digest.unwrap_or("").to_string());
     Ok(serde_json::to_vec(&receipt)?)
+}
+
+fn option_matching_http_hits(
+    store: &TurboStore,
+    keys: &[String],
+    trust_domain: &str,
+    digest: Option<&str>,
+) -> Result<std::collections::HashMap<String, String>> {
+    let mut hits = store.batch_get_theorem_shards_readonly(keys, trust_domain)?;
+    hits.retain(|_, blob_hash| {
+        let receipt = fs::read(store.blob_path(blob_hash))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+        receipt
+            .as_ref()
+            .and_then(|r| r["lean_args_digest"].as_str())
+            == Some(digest.unwrap_or(""))
+    });
+    Ok(hits)
 }
 
 fn execute_check_shard_payload_deferred_with_domain(
@@ -1481,7 +1500,15 @@ fn execute_check_shard_payload_deferred_with_domain(
     let filtered_req_args = crate::module_builder::validate_effective_lean_args(&req.lean_args)?;
     let req_args_digest_opt = crate::module_builder::compute_lean_args_digest(&filtered_req_args)?;
     let cache_key = option_bound_http_key(&req.shard_key, req_args_digest_opt.as_deref());
-    if !req.skip_cas_lock && store.has_cached_action_readonly(&cache_key, trust_domain)? {
+    if !req.skip_cas_lock
+        && option_matching_http_hits(
+            store,
+            std::slice::from_ref(&cache_key),
+            trust_domain,
+            req_args_digest_opt.as_deref(),
+        )?
+        .contains_key(&cache_key)
+    {
         return Ok((
             serde_json::json!({
                 "status": "remote_theorem_cache_hit",
@@ -1762,7 +1789,8 @@ fn execute_check_shards_batch_payload_deferred(
         crate::module_builder::compute_lean_args_digest(&filtered_batch_args)?;
     let bound_key = |key: &str| option_bound_http_key(key, batch_args_digest_opt.as_deref());
     let keys: Vec<String> = req.items.iter().map(|i| bound_key(&i.shard_key)).collect();
-    let mut bound_hits = store.batch_get_theorem_shards_readonly(&keys, trust_domain)?;
+    let mut bound_hits =
+        option_matching_http_hits(store, &keys, trust_domain, batch_args_digest_opt.as_deref())?;
     let cached_map: std::collections::HashMap<_, _> = req
         .items
         .iter()
@@ -2380,6 +2408,16 @@ mod bind_auth_tests {
             execute_check_shard_payload(&mut store, &single)?["status"],
             "remote_theorem_cache_hit"
         );
+        // Reusing the public bound key as an empty-option caller key must miss.
+        let single_key = single.shard_key.clone();
+        let digest = crate::module_builder::compute_lean_args_digest(&high)?;
+        single.shard_key = option_bound_http_key(&single_key, digest.as_deref());
+        single.lean_args.clear();
+        assert_eq!(
+            execute_check_shard_payload(&mut store, &single)?["status"],
+            "remote_theorem_verified"
+        );
+        single.shard_key = single_key;
         single.lean_args = low.clone();
         if let Ok(result) = execute_check_shard_payload(&mut store, &single) {
             assert_eq!(result["status"], "remote_theorem_verified");
@@ -2398,14 +2436,54 @@ mod bind_auth_tests {
             ..Default::default()
         };
         let (first, publication, hits) =
-            execute_check_shards_batch_payload_deferred(&mut store, &batch)?;
+            execute_check_shards_batch_payload_deferred(&mut store, &batch, None)?;
         assert!(first.ok && first.verified_count == 1 && hits.is_empty());
         let (tc, domain, entries) = publication.expect("verified batch must publish");
         store.batch_publish_theorem_shards(&tc, &domain, &entries)?;
-        let (warm, _, _) = execute_check_shards_batch_payload_deferred(&mut store, &batch)?;
+        let (warm, _, _) = execute_check_shards_batch_payload_deferred(&mut store, &batch, None)?;
         assert_eq!(warm.cache_hits, 1);
+        let batch_key = batch.items[0].shard_key.clone();
+        batch.items[0].shard_key = option_bound_http_key(&batch_key, digest.as_deref());
+        batch.lean_args.clear();
+        let (alias, publication, hits) =
+            execute_check_shards_batch_payload_deferred(&mut store, &batch, None)?;
+        assert!(alias.ok && alias.cache_hits == 0 && alias.verified_count == 1);
+        assert!(publication.is_some() && hits.is_empty());
+
+        // A real empty-option hit must not cause an option-bound alias to be pruned.
+        let empty_key = "empty-option-hit".to_string();
+        store.batch_publish_theorem_shards(
+            &tc,
+            &domain,
+            &[(
+                empty_key.clone(),
+                "http_options_second".into(),
+                option_bound_receipt(serde_json::json!({}), None)?,
+                1,
+            )],
+        )?;
+        batch.items.push(crate::pack::CheckShardBatchItem {
+            shard_key: empty_key,
+            decl_name: "http_options_second".into(),
+            ..Default::default()
+        });
+        batch
+            .coalesced_shard_source
+            .push_str("theorem http_options_second : True := by trivial\n");
+        let (partial_alias, publication, hits) =
+            execute_check_shards_batch_payload_deferred(&mut store, &batch, None)?;
+        assert!(
+            partial_alias.ok && partial_alias.cache_hits == 1 && partial_alias.verified_count == 1
+        );
+        assert_eq!(hits.len(), 1);
+        let (_, _, entries) = publication.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, batch.items[0].shard_key);
+        batch.items.pop();
+        batch.coalesced_shard_source = source.into();
+        batch.items[0].shard_key = batch_key;
         batch.lean_args = low;
-        let (second, _, hits) = execute_check_shards_batch_payload_deferred(&mut store, &batch)?;
+        let (second, _, hits) = execute_check_shards_batch_payload_deferred(&mut store, &batch, None)?;
         assert_eq!(second.cache_hits, 0);
         assert!(hits.is_empty());
         // Partial hit: only the entry verified under the requested options may be pruned.
@@ -2419,15 +2497,44 @@ mod bind_auth_tests {
             .coalesced_shard_source
             .push_str("theorem http_options_second : True := by trivial\n");
         let (partial, publication, hits) =
-            execute_check_shards_batch_payload_deferred(&mut store, &batch)?;
+            execute_check_shards_batch_payload_deferred(&mut store, &batch, None)?;
         assert!(partial.ok && partial.cache_hits == 1 && partial.verified_count == 1);
         assert_eq!(hits.len(), 1);
         let (_, _, entries) = publication.unwrap();
         assert_eq!(entries.len(), 1);
         batch.lean_args = vec!["--plugin=unsafe.so".into()];
-        assert!(execute_check_shards_batch_payload_deferred(&mut store, &batch).is_err());
+        assert!(execute_check_shards_batch_payload_deferred(&mut store, &batch, None).is_err());
         assert_eq!(option_bound_http_key("legacy-key", None), "legacy-key");
         let _ = std::fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn http_receipts_require_known_option_provenance() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_http_receipts_{}",
+            crate::pack::next_tmp_id()
+        ));
+        let mut store = TurboStore::open(Some(&dir))?;
+        let entries = [
+            ("legacy", br#"{"decl":"unknown-options"}"#.to_vec()),
+            ("empty", option_bound_receipt(serde_json::json!({}), None)?),
+            (
+                "options",
+                option_bound_receipt(serde_json::json!({}), Some("digest"))?,
+            ),
+            ("malformed", b"not-json".to_vec()),
+        ]
+        .map(|(key, receipt)| (key.to_string(), key.to_string(), receipt, 1));
+        store.batch_publish_theorem_shards("test", "trusted", &entries)?;
+        let keys: Vec<_> = entries.iter().map(|e| e.0.clone()).collect();
+        let empty = option_matching_http_hits(&store, &keys, "trusted", None)?;
+        assert_eq!(empty.len(), 1);
+        assert!(empty.contains_key("empty"));
+        let options = option_matching_http_hits(&store, &keys, "trusted", Some("digest"))?;
+        assert_eq!(options.len(), 1);
+        assert!(options.contains_key("options"));
+        fs::remove_dir_all(dir)?;
         Ok(())
     }
 
