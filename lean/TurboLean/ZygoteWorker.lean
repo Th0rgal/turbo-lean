@@ -1132,7 +1132,15 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
   let mut allRoots : Array Name := #[]
   for (rawStr, nm) in targets do
     try
-      replayAuditedModule nm
+      -- Compacted import regions are not reclaimed automatically. Isolate each replay so
+      -- repeated dependency imports cannot exhaust the auditor's 8 GiB sandbox limit.
+      -- The child only reads module data and kernel-replays; it never runs initializers.
+      let replay ← IO.Process.output {
+        cmd := (← IO.appPath).toString
+        args := #["--kernel-replay-module", nm.toString]
+      }
+      unless replay.exitCode == 0 do
+        throw <| IO.userError s!"kernel replay child exited {replay.exitCode}: {replay.stderr}"
     catch e =>
       violations := violations ++ [s!"[TurboLean.KernelReplay] independent kernel re-check of `{rawStr}` failed: {e}"]
     if let some modIdx := env.getModuleIdx? nm then
@@ -1402,6 +1410,9 @@ def main (args : List String) : IO Unit := do
       dedupSp := dedupSp ++ [p]
   Lean.searchPathRef.set dedupSp
   match args with
+  | ["--kernel-replay-module", moduleName] =>
+    TurboLean.ZygoteWorker.replayAuditedModule (TurboLean.ZygoteWorker.parseModuleName moduleName)
+    return
   | "--audit-modules" :: modArgs =>
     let stdout ← IO.getStdout
     let (ffiArgs, rest) := modArgs.partition (·.startsWith "--ffi-allow=")

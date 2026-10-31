@@ -4993,6 +4993,116 @@ mod tests {
     pub(crate) const PRINT_AXIOMS_SPOOF: &str = "macro_rules\n  | `(#print axioms $i:ident) => `(#eval IO.println s!\"'{$(Lean.quote i.getId.toString)}' does not depend on any axioms\")\n";
 
     #[test]
+    fn test_compiled_module_audit_replays_kernel_types() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_raw_replay_{}_{}",
+            std::process::id(),
+            next_tmp_id()
+        ));
+        fs::create_dir_all(&dir)?;
+        let store = TurboStore::open(Some(&dir.join("store")))?;
+        let mut env = std::collections::HashMap::from([
+            (
+                "ELAN_TOOLCHAIN".to_string(),
+                "leanprover/lean4:v4.35.0".to_string(),
+            ),
+            ("LEAN_PATH".to_string(), dir.display().to_string()),
+        ]);
+        let prefix = Command::new("lean")
+            .arg("--print-prefix")
+            .envs(&env)
+            .output()?;
+        assert!(prefix.status.success());
+        let prefix = String::from_utf8_lossy(&prefix.stdout).trim().to_string();
+        env.insert(
+            "LD_LIBRARY_PATH".into(),
+            format!("{prefix}/lib/lean:{prefix}/lib"),
+        );
+        let auditor = ensure_zygote_binary(&store, Path::new("lean"), &env)?;
+        let bad = include_str!("../tests/fixtures/weakening-options/Bad.lean").replace(
+            "import Lean\n",
+            "import Lean\nset_option debug.skipKernelTC true\n",
+        );
+        for (module, source, accepted) in [
+            (
+                "BadArtifact",
+                format!("{bad}\ntheorem uses_bad : False := bad\n"),
+                false,
+            ),
+            (
+                "GoodArtifact",
+                "set_option maxHeartbeats 400000\ntheorem good : True := True.intro\n".to_string(),
+                true,
+            ),
+        ] {
+            let file = dir.join(format!("{module}.lean"));
+            let olean = file.with_extension("olean");
+            fs::write(&file, source)?;
+            let compiled = Command::new("lean")
+                .envs(&env)
+                .arg("-Ddebug.skipKernelTC=false")
+                .arg("-R")
+                .arg(&dir)
+                .arg(&file)
+                .arg("-o")
+                .arg(&olean)
+                .output()?;
+            assert!(compiled.status.success() && olean.is_file(), "{compiled:?}");
+            if !accepted {
+                assert!(String::from_utf8_lossy(&compiled.stdout)
+                    .contains("does not depend on any axioms"));
+            }
+            for shard in [false, true] {
+                let mut command = Command::new(&auditor);
+                command.envs(&env).arg("--audit-modules");
+                if shard {
+                    command.arg("--shard");
+                }
+                let audited = command.arg(module).output()?;
+                let verdict = parse_audit_modules_reply(&audited, &[module.to_string()]);
+                assert_eq!(
+                    verdict.is_ok(),
+                    accepted,
+                    "{module}/shard={shard}: {audited:?}"
+                );
+                if !accepted {
+                    assert!(format!("{:#}", verdict.unwrap_err())
+                        .contains("independent kernel re-check"));
+                }
+            }
+        }
+        // Repeated independent imports used to exhaust the untrusted auditor's 8 GiB
+        // limit, reported misleadingly as a missing .olean.private file (CI #301).
+        let modules: Vec<String> = (0..8).map(|i| format!("Replay{i}")).collect();
+        for module in &modules {
+            let file = dir.join(format!("{module}.lean"));
+            fs::write(
+                &file,
+                format!("import Lean\ntheorem good{module} : True := True.intro\n"),
+            )?;
+            let compiled = Command::new("lean")
+                .envs(&env)
+                .arg("-R")
+                .arg(&dir)
+                .arg(&file)
+                .arg("-o")
+                .arg(file.with_extension("olean"))
+                .output()?;
+            assert!(compiled.status.success(), "{compiled:?}");
+        }
+        let mut command = Command::new(&auditor);
+        command.envs(&env).arg("--audit-modules").args(&modules);
+        let audited = crate::module_builder::run_command_with_timeout(
+            &mut command,
+            std::time::Duration::from_secs(120),
+            true,
+        )?;
+        parse_audit_modules_reply(&audited, &modules)?;
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn test_audited_lean_shard_exempts_only_named_explicit_stubs() -> Result<()> {
         let dir = std::env::temp_dir().join(format!(
             "turbo_audited_shard_{}_{}",
