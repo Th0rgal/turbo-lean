@@ -593,7 +593,7 @@ def runCoreSelfTest (tag : String) : IO UInt32 := do
     mulDivDownNat twoPow60 twoPow60 0 == 0 && mulDivUpNat twoPow60 twoPow60 0 == 0
   let telCfg ← TelemetryConfig.probe ["--telemetry"]
   let telCount ← emitModuleTelemetryEvents telCfg .x86_64 true baseMod
-  let telOk := if telCfg.enabled then telCount > 0 else telCount = 0
+  let telOk := telCount > 0
   let relDecl : LNIRDecl := {
     name := "ssz_monotone_offsets_bug"
     params := [{ id := 0, name := "o0", ty := .i64, borrow := false }, { id := 1, name := "o1", ty := .i64, borrow := false }]

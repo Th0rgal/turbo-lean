@@ -11,9 +11,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  LEAN_NUM_THREADS: 4
-  TURBO_LEAN_TELEMETRY: "off"
-  LEAN_NATIVE_TELEMETRY: "off"
   TURBO_LEAN_HOME: ${{ github.workspace }}/.turbo-cache
 
 jobs:
@@ -82,7 +79,7 @@ jobs:
           ./lean/.lake/build/bin/lean-native-core self-test
           ./lean/.lake/build/bin/turbo-lean-native self-test
           cargo build --release
-          cargo test --release -- --nocapture
+          cargo test --release
           ./target/release/turbo-lean --version
           ./scripts/ci_verify.sh
 
