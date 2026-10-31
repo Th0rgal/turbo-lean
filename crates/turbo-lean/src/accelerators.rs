@@ -454,8 +454,17 @@ fn distilled_nodes_disk_path() -> Option<std::path::PathBuf> {
         .map(|p| std::path::PathBuf::from(p).join("distilled_proof_nodes.json"))
 }
 
-pub fn record_distilled_proof_term_nodes(decl_name: &str, stmt_src: &str, proof_term_nodes: u64) {
-    if proof_term_nodes == 0 || decl_name.trim().is_empty() {
+/// Persist proof-size metrics only when local telemetry is enabled for this workspace.
+pub fn record_distilled_proof_term_nodes(
+    project_dir: &Path,
+    decl_name: &str,
+    stmt_src: &str,
+    proof_term_nodes: u64,
+) {
+    if proof_term_nodes == 0
+        || decl_name.trim().is_empty()
+        || !crate::mcp::resolve_telemetry_policy(Some(project_dir)).enabled
+    {
         return;
     }
     let keys = distilled_hint_keys(decl_name, stmt_src);
@@ -4296,11 +4305,13 @@ pub fn run_worktree_dedup_command(
     json_mode: bool,
 ) -> Result<()> {
     let mut report = crate::lake_build::dedup_worktree_packages(store, project_dir)?;
-    if let Some(obj) = report.as_object_mut() {
-        obj.insert(
-            "status".to_string(),
-            serde_json::Value::String("ok".to_string()),
-        );
+    let disabled = report["status"] == "worktree_link_disabled";
+    if !disabled {
+        report["status"] = serde_json::Value::String("ok".to_string());
+    }
+    if disabled && !json_mode {
+        println!("[turbo-lean] WORKTREE-DEDUP skipped: worktree linking is disabled");
+        return Ok(());
     }
     if json_mode {
         println!("{}", serde_json::to_string_pretty(&report)?);

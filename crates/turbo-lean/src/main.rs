@@ -31,6 +31,8 @@ pub mod remote_prebuild;
 pub mod server;
 pub mod shm_cache;
 mod splitter;
+#[cfg(all(test, unix))]
+mod worktree_test_support;
 pub mod verify;
 pub mod zygote;
 
@@ -50,7 +52,7 @@ use std::path::PathBuf;
     version,
     about = "High-performance, distributed build, verification, and counterexample tooling for Lean 4"
 )]
-struct Cli {
+pub(crate) struct Cli {
     /// Optional custom CAS & SQLite directory (defaults to $TURBO_LEAN_HOME or ~/.cache/turbo-lean)
     #[arg(long, global = true)]
     cache_dir: Option<PathBuf>,
@@ -70,6 +72,10 @@ struct Cli {
     /// Telemetry mode (`on`/`metrics` [default: local metrics, remote off unless opted in], `full`/`opt-in` [remote opt-in], `local` [local spool only], `off`)
     #[arg(long, global = true, value_name = "MODE")]
     telemetry: Option<String>,
+
+    /// Preserve `.lake` inodes and permissions: disable automatic linking/copying and worktree-dedup
+    #[arg(long, global = true, default_value_t = false)]
+    no_auto_worktree_link: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -460,10 +466,17 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run(cli: Cli) -> Result<()> {
+pub(crate) fn apply_global_cli_env(cli: &Cli) {
     if let Some(mb) = cli.max_memory_mb {
         std::env::set_var("TURBO_LEAN_MAX_MEMORY_MB", mb.to_string());
     }
+    if cli.no_auto_worktree_link {
+        std::env::set_var("TURBO_LEAN_NO_WORKTREE_LINK", "1");
+    }
+}
+
+fn run(cli: Cli) -> Result<()> {
+    apply_global_cli_env(&cli);
     let (tel_dir, trust_proj_toml) = match &cli.command {
         Commands::PrVerify {
             mode, project_dir, ..
@@ -490,6 +503,7 @@ fn run(cli: Cli) -> Result<()> {
         std::env::set_var("TURBO_LEAN_TRUST_PROJECT_TELEMETRY", "0");
     }
     let is_telemetry_cmd = matches!(cli.command, Commands::Telemetry { .. });
+    // MCP resolves consent per request; do not promote startup project policy into env.
     if cli.no_telemetry {
         std::env::set_var("TURBO_LEAN_TELEMETRY", "off");
         std::env::set_var("LEAN_NATIVE_TELEMETRY", "off");
@@ -502,7 +516,10 @@ fn run(cli: Cli) -> Result<()> {
         ) {
             std::env::set_var("LEAN_NATIVE_TELEMETRY", "off");
         }
-    } else if !is_telemetry_cmd && std::env::var("TURBO_LEAN_TELEMETRY").is_err() {
+    } else if !is_telemetry_cmd
+        && !matches!(cli.command, Commands::Mcp { .. })
+        && std::env::var("TURBO_LEAN_TELEMETRY").is_err()
+    {
         let pol = mcp::resolve_telemetry_policy_with_trust(tel_dir, trust_proj_toml);
         if !pol.enabled {
             std::env::set_var("TURBO_LEAN_TELEMETRY", "off");

@@ -86,6 +86,7 @@ pub struct AgentAnalyticsLedger {
 #[derive(Debug, Clone, Default)]
 pub struct AgentCallTelemetry {
     pub tool_name: String,
+    pub project_dir: Option<PathBuf>,
     pub decl_name: Option<String>,
     pub cache_hit: bool,
     pub stage1_tpu_reject: bool,
@@ -351,7 +352,6 @@ pub fn resolve_telemetry_policy_with_trust(
         (enabled, remote, mode) = (false, false, "off".to_string());
     }
 
-    let mut explicit_remote_toml: Option<bool> = None;
     for toml_path in [Some(user_cfg_path.as_path()), proj_cfg_path.as_deref()]
         .into_iter()
         .flatten()
@@ -360,13 +360,9 @@ pub fn resolve_telemetry_policy_with_trust(
             let sec = parse_telemetry_toml_section(&txt);
             if let Some(ref m) = sec.mode {
                 apply_telemetry_mode_str(m, &mut enabled, &mut remote, &mut mode);
-                if m == "local" {
-                    explicit_remote_toml = Some(false);
-                }
             }
             if let Some(r) = sec.remote {
                 remote = r;
-                explicit_remote_toml = Some(r);
                 if r && mode == "local" {
                     mode = "metrics".to_string();
                 }
@@ -383,9 +379,6 @@ pub fn resolve_telemetry_policy_with_trust(
     }
 
     let token = resolve_telemetry_token(&cfg_val);
-    if !token.is_empty() && enabled && mode != "local" && explicit_remote_toml != Some(false) {
-        remote = true;
-    }
 
     for k in [
         "SANDBOXED_TELEMETRY_MODE",
@@ -660,7 +653,6 @@ pub fn emit_sandboxed_telemetry_event_with_trust(
         let _ = writeln!(fh, "{}", event_str);
     }
 
-    #[cfg(not(test))]
     if policy.remote
         && !_suppress_ci_unauth
         && std::env::var("TURBO_LEAN_NO_REMOTE_TELEMETRY").is_err()
@@ -708,7 +700,7 @@ where
 
 /// Record telemetry from an agent tool call into `/dev/shm/turbo-lean-staging-<uid>/mcp_agent_analytics.json`.
 pub fn record_agent_call_telemetry(ev: AgentCallTelemetry) -> AgentAnalyticsLedger {
-    if !resolve_telemetry_policy(None).enabled {
+    if !resolve_telemetry_policy(ev.project_dir.as_deref()).enabled {
         return AgentAnalyticsLedger::default();
     }
     with_locked_ledger(|ledger| {
@@ -863,7 +855,12 @@ pub fn record_agent_call_telemetry(ev: AgentCallTelemetry) -> AgentAnalyticsLedg
             "winning_tactic_hint": ev.winning_tactic_hint,
             "accelerator_name": ev.accelerator_name,
         });
-        emit_sandboxed_telemetry_event(event_json, "turbo_lean_events.jsonl");
+        emit_sandboxed_telemetry_event_with_trust(
+            ev.project_dir.as_deref(),
+            true,
+            event_json,
+            "turbo_lean_events.jsonl",
+        );
         ledger.clone()
     })
 }
@@ -1270,6 +1267,7 @@ pub fn execute_fast_check(
     items: Option<&[serde_json::Value]>,
     backend: Option<&str>,
     compact: bool,
+    project_dir: Option<&Path>,
 ) -> serde_json::Value {
     let t0 = Instant::now();
     let backend_pref = backend.unwrap_or("auto");
@@ -1335,6 +1333,9 @@ pub fn execute_fast_check(
 
     record_agent_call_telemetry(AgentCallTelemetry {
         tool_name: "turbo_fast_check".to_string(),
+        project_dir: project_dir
+            .or_else(|| file.map(Path::new).and_then(Path::parent))
+            .map(Path::to_path_buf),
         decl_name: Some(decl_name.to_string()),
         stage1_tpu_reject: verdict.is_cex,
         elapsed_ms,
@@ -1558,6 +1559,7 @@ pub fn execute_mcp_agent_step(
 
     record_agent_call_telemetry(AgentCallTelemetry {
         tool_name: "turbo_agent_step".to_string(),
+        project_dir: project_dir.or_else(|| file.parent()).map(Path::to_path_buf),
         decl_name: decl.map(|s| s.to_string()).or_else(|| {
             verbose
                 .get("decl")
@@ -1597,7 +1599,11 @@ pub fn execute_mcp_agent_step(
 }
 
 /// Execute `turbo_audit_spec` MCP tool in `< 1 ms` in-process via unified `gpu_fastcheck::audit_spec_file_or_source`.
-pub fn execute_mcp_audit_spec(file: &Path, decl: Option<&str>) -> serde_json::Value {
+pub fn execute_mcp_audit_spec(
+    file: &Path,
+    decl: Option<&str>,
+    project_dir: Option<&Path>,
+) -> serde_json::Value {
     let t0 = Instant::now();
     if file.as_os_str().is_empty() || !file.exists() {
         let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
@@ -1616,6 +1622,7 @@ pub fn execute_mcp_audit_spec(file: &Path, decl: Option<&str>) -> serde_json::Va
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
     record_agent_call_telemetry(AgentCallTelemetry {
         tool_name: "turbo_audit_spec".to_string(),
+        project_dir: project_dir.or_else(|| file.parent()).map(Path::to_path_buf),
         decl_name: decl.map(|s| s.to_string()),
         elapsed_ms,
         stage1_tpu_ms: elapsed_ms,
@@ -1634,6 +1641,8 @@ fn mcp_tool_schema(
     req: &[&str],
 ) -> serde_json::Value {
     let mut schema = serde_json::json!({ "type": "object", "properties": props });
+    schema["properties"].as_object_mut().unwrap().entry("project_dir")
+        .or_insert_with(|| serde_json::json!({"type": "string", "description": "Request workspace (overrides the server default)"}));
     if !req.is_empty() {
         schema["required"] = serde_json::json!(req);
     }
@@ -1694,6 +1703,13 @@ pub fn handle_mcp_jsonrpc_request(
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({}));
 
+            // Per-request workspace wins over the server default; file-based tools fall
+            // back to the file's parent, then policy discovery falls back to CWD.
+            let project_dir = args
+                .get("project_dir")
+                .and_then(|v| v.as_str())
+                .map(Path::new)
+                .or(default_project_dir);
             let (payload, is_error) = match tool_name {
                 "turbo_agent_step" | "turbo_check_decl" => {
                     let file_str = args.get("file").and_then(|v| v.as_str()).unwrap_or("");
@@ -1736,7 +1752,15 @@ pub fn handle_mcp_jsonrpc_request(
                         .get("compact")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(true);
-                    let res = execute_fast_check(file, decl, stmt_src, items, backend, compact);
+                    let res = execute_fast_check(
+                        file,
+                        decl,
+                        stmt_src,
+                        items,
+                        backend,
+                        compact,
+                        project_dir,
+                    );
                     let err = res.get("ok").and_then(|v| v.as_bool()) == Some(false)
                         && (res.get("kind").and_then(|v| v.as_str()) == Some("error")
                             || res.get("status").and_then(|v| v.as_str()) == Some("error"));
@@ -1756,7 +1780,7 @@ pub fn handle_mcp_jsonrpc_request(
                         .get("require_nonempty")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
-                    let mut res = execute_mcp_audit_spec(Path::new(file_str), decl);
+                    let mut res = execute_mcp_audit_spec(Path::new(file_str), decl, project_dir);
                     crate::gpu_fastcheck::apply_require_nonempty_to_audit_report(
                         &mut res,
                         require_nonempty,
@@ -2008,6 +2032,11 @@ mod tests {
                 "SANDBOXED_TELEMETRY_CONFIG",
                 "SANDBOXED_TELEMETRY_TOKEN",
                 "SANDBOXED_TELEMETRY_TMP_DIR",
+                "SANDBOXED_TELEMETRY_BATCH_ONLY",
+                "SANDBOXED_TELEMETRY_URL",
+                "SANDBOXED_MISSION_ID",
+                "TURBO_LEAN_AUTONOMOUS_AGENT",
+                "TURBO_LEAN_GOVERNOR_TOKEN",
                 "TELEMETRY_API_KEY",
                 "CI",
                 "GITHUB_ACTIONS",
@@ -2244,7 +2273,7 @@ mod tests {
         let _env_scope = ScopedTelemetryTestEnv::new("fail_closed");
         let missing_path = "/tmp/nonexistent_turbo_lean_sec_file_20261029.lean";
 
-        let fc_empty = execute_fast_check(None, Some("d"), None, None, Some("cpu"), true);
+        let fc_empty = execute_fast_check(None, Some("d"), None, None, Some("cpu"), true, None);
         assert_eq!(fc_empty["ok"], false);
         assert_eq!(fc_empty["kind"], "error");
 
@@ -2255,11 +2284,12 @@ mod tests {
             None,
             Some("cpu"),
             false,
+            None,
         );
         assert_eq!(fc_missing["ok"], false);
         assert_eq!(fc_missing["status"], "error");
 
-        let audit_missing = execute_mcp_audit_spec(Path::new(missing_path), None);
+        let audit_missing = execute_mcp_audit_spec(Path::new(missing_path), None, None);
         assert_eq!(audit_missing["ok"], false);
         assert_eq!(audit_missing["status"], "error");
 
@@ -2467,19 +2497,14 @@ mod tests {
         assert!(env_scope.root.join("spool/untrusted_cwd.jsonl").exists());
         assert!(!env_scope.root.join("remote_batch/events.jsonl").exists());
 
-        // 2c. Project `[telemetry] remote = false` overrides token-implied remote opt-in.
-        fs::write(
-            proj_dir.join("turbo-lean.toml"),
-            "[telemetry]\nenabled = true\nremote = false\n",
-        )
-        .unwrap();
+        // 2c. A telemetry token alone is not a remote opt-in.
+        fs::remove_file(proj_dir.join("turbo-lean.toml")).unwrap();
         std::env::set_var("SANDBOXED_TELEMETRY_TOKEN", "test-token-123");
-        let token_overridden = resolve_telemetry_policy(Some(&proj_dir));
+        let token_alone = resolve_telemetry_policy(Some(&proj_dir));
+        assert!(token_alone.enabled && !token_alone.remote && token_alone.has_token);
         std::env::remove_var("SANDBOXED_TELEMETRY_TOKEN");
-        assert!(token_overridden.enabled && !token_overridden.remote && token_overridden.has_token);
 
         // 3. `turbo-lean telemetry disable` / `enable` / `local` roundtrip in user config TOML
-        fs::remove_file(proj_dir.join("turbo-lean.toml")).unwrap();
         run_telemetry_command("enable", Some(&proj_dir), true).unwrap();
         let after_enable = resolve_telemetry_policy(Some(&proj_dir));
         assert!(after_enable.enabled);

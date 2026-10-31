@@ -76,7 +76,8 @@ turbo-lean --no-telemetry check <file.lean>
 ## Telemetry & Privacy
 
 - **Local-only by default**: Out of the box (`enabled = true`, `remote = false`, `mode = "metrics"`), `turbo-lean` records local timing, cache-hit, and token-compaction counters in `/dev/shm` (`turbo-lean analytics`) and `~/.cache/turbo-lean/telemetry/` without making any network requests or storing raw source blobs.
-- **Opt-in remote reporting**: Remote metrics upload is disabled unless explicitly enabled via `turbo-lean telemetry enable`, `--telemetry opt-in` / `--telemetry remote`, `TURBO_LEAN_TELEMETRY=remote`, `SANDBOXED_TELEMETRY_TOKEN`, or `remote = true` in `[telemetry]`.
+- **Opt-in remote reporting**: Remote metrics upload is disabled unless explicitly enabled via `turbo-lean telemetry enable`, `--telemetry opt-in` / `--telemetry remote`, `TURBO_LEAN_TELEMETRY=remote`, or `remote = true` in `[telemetry]`. A telemetry token alone does not enable it.
+- **Existing installations**: Remote reporting now defaults off even if a token was already configured; existing explicit opt-ins still apply. CLI `check` and `fast-check` emit no telemetry in either mode. Emitting MCP tools resolve project consent from request `project_dir`, then server `mcp --project-dir`, then the input file's parent, then CWD.
 - **Full disable**: Pass `--no-telemetry` (or `--telemetry off`), set `TURBO_LEAN_TELEMETRY=off` (`0`/`false`/`no`), run `turbo-lean telemetry disable` (persists to `~/.config/turbo-lean/config.toml`), or configure `<project_dir>/turbo-lean.toml`:
   ```toml
   [telemetry]
@@ -84,6 +85,14 @@ turbo-lean --no-telemetry check <file.lean>
   remote = false    # keep false unless opting into remote reporting
   mode = "off"      # "off" | "local" | "metrics" | "full"
   ```
+
+Telemetry consent precedence is defaults → hub JSON → user TOML → trusted project TOML → environment modes (`SANDBOXED_TELEMETRY_MODE`, `SANDBOXED_TELEMETRY`, `TURBO_LEAN_TELEMETRY`, in that order) → `TURBO_LEAN_TELEMETRY_REMOTE`. CLI `--telemetry` replaces `TURBO_LEAN_TELEMETRY`; `--no-telemetry` takes precedence and disables all emission. Presence of `TURBO_LEAN_NO_REMOTE_TELEMETRY` vetoes remote emission at every layer. `TURBO_LEAN_TRUST_PROJECT_TELEMETRY=0` and untrusted verification exclude project telemetry settings.
+
+## Worktree artifact preservation
+
+Pass the global `--no-auto-worktree-link` flag, set `TURBO_LEAN_NO_WORKTREE_LINK=1`, or set `[worktree] auto_link = false` in the nearest `turbo-lean.toml` (also accepts `.turbo-lean.toml`). Any opt-out wins; an environment false value cannot override the project opt-out. Without an opt-out, automatic artifact sharing remains enabled.
+
+These controls suppress main-clone build/package copying and linking, build-output permission/inode normalization during CAS ingestion, and the entire explicit `worktree-dedup` operation (including package chmod/link/copy and cleanup). Shared CAS cache hits in build, CI/PR verification and module builds validate existing bytes without replacing files or regenerating module sidecars. Missing or different cached outputs fail with instructions to build with Lake first; opted-out native module builds also refuse cache misses. Staging can still copy bytes into the external CAS. Module builds apply the caller's project opt-out to external dependencies too. Under opt-out, stale imports are an error and must be rebuilt explicitly with Lake; turbo-lean does not auto-rebuild them. GC can still prune previously installed CAS hardlinks by inode when expiring tracked worktrees; opting out does not undo those installations.
 
 ---
 

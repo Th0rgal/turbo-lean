@@ -2879,7 +2879,9 @@ pub fn run_ci_verify_command(
                     &[],
                     true,
                 ) {
-                    let _ = fs::remove_dir_all(canon_dir.join(".lake/build"));
+                    if !crate::lake_build::worktree_auto_link_disabled(&canon_dir) {
+                        let _ = fs::remove_dir_all(canon_dir.join(".lake/build"));
+                    }
                     return Err(err);
                 }
             }
@@ -4067,11 +4069,15 @@ pub fn run_pr_verify_command(
                 Some(&base),
             )?;
         }
-    } else if !is_untrusted && crate::lake_build::has_lake_config(&canon_dir) {
+    } else if !is_untrusted {
         let edited: Vec<PathBuf> = shards_by_file.keys().map(|f| canon_dir.join(f)).collect();
-        let imports = crate::lake_build::project_imports_of(&canon_dir, &edited);
-        if !imports.is_empty() {
-            crate::lake_build::lake_build_modules(&canon_dir, &imports, Some(&base))?;
+        if crate::lake_build::worktree_auto_link_disabled(&canon_dir) {
+            crate::lake_build::ensure_project_imports_fresh_for_check(&canon_dir, &edited)?;
+        } else if crate::lake_build::has_lake_config(&canon_dir) {
+            let imports = crate::lake_build::project_imports_of(&canon_dir, &edited);
+            if !imports.is_empty() {
+                crate::lake_build::lake_build_modules(&canon_dir, &imports, Some(&base))?;
+            }
         }
     }
     let lake_recheck_ms = lake_t0.elapsed().as_millis();
@@ -5139,6 +5145,119 @@ mod pr_verify_tests {
     use crate::lake_build::{
         compute_imported_olean_interface_hashes, compute_shard_key, is_file_verified_in_lake_build,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn test_optout_trusted_pr_stale_imports_preserve_lake_tree() -> Result<()> {
+        use crate::worktree_test_support::{assert_stale_error, snapshot, LakeTree};
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tree = LakeTree::imports("stale_pr")?;
+        tree.opt_out()?;
+        git_init_and_commit(&tree.project, "base")?;
+        tree.stale_import()?;
+        fs::write(
+            tree.project.join("P/Target.lean"),
+            "import P.Middle\ntheorem target : a = 1 := by\n  rfl\n",
+        )?;
+        tree.prepare_snapshot(".lake/build/lib/lean/P/A.olean")?;
+        let before = snapshot(&tree.project)?;
+        let mut store = TurboStore::open(Some(&tree.root.join("cache")))?;
+        let err = run_pr_verify_command(
+            &mut store,
+            true,
+            tree.project.clone(),
+            "HEAD".into(),
+            "trusted".into(),
+            false,
+            None,
+            None,
+            None,
+            None,
+            false,
+            0,
+            None,
+        )
+        .unwrap_err();
+        assert_stale_error(&err);
+        assert_eq!(snapshot(&tree.project)?, before);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_optout_untrusted_ci_cached_audit_failure_preserves_lake_tree() -> Result<()> {
+        use crate::worktree_test_support::{snapshot, LakeTree};
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Lake compiles this macro-expanded axiom; source hygiene cannot see the generated name.
+        let source = concat!(
+            "import Lean\nopen Lean Elab Tactic in\n",
+            "elab \"concealed\" : tactic => do\n  let g ← getMainGoal\n  let t ← g.getType\n",
+            "  let s := String.mk ['s', 'o', 'r', 'r', 'y', 'A', 'x']\n",
+            "  let e ← Meta.mkAppM (Name.mkSimple s) #[t, mkConst ``false]\n  g.assign e\n",
+            "theorem hidden : 1 + 1 = 2 := by concealed\n"
+        );
+        let tree = LakeTree::new("ci_audit", &[("P/A.lean", source)])?;
+        tree.opt_out()?;
+        let mut store = TurboStore::open(Some(&tree.root.join("cache")))?;
+        let toolchain = detect_toolchain(&tree.project);
+        let axioms = splitter::allowed_axioms();
+        let split = split_lean_source(source, &[]);
+        assert!(split.hygiene.is_clean_for_certification());
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(format!("turbo-lean-build-v1\n{toolchain}\nuntrusted:ci\n\n").as_bytes());
+        if axioms.len() > splitter::STANDARD_AXIOMS.len() {
+            hasher.update(b":axioms:");
+            hasher.update(axioms.join(",").as_bytes());
+            hasher.update(b"\n");
+        }
+        hasher.update(b"P/A.lean:");
+        hasher.update(blake3::hash(source.as_bytes()).as_bytes());
+        hasher.update(b"\n");
+        let key = hasher.finalize().to_hex().to_string();
+        let (outputs, blobs) = crate::lake_build::stage_lake_build_outputs(&store, &tree.project)?;
+        store.batch_register_linked_blobs(&blobs, "untrusted:ci", 1)?;
+        let lease =
+            match store.acquire_singleflight(&key, &toolchain, "lake_build", "untrusted:ci")? {
+                crate::db::SingleflightOutcome::Leader(lease) => lease,
+                _ => anyhow::bail!("expected empty test cache"),
+            };
+        store.publish_action(&lease, &outputs, 0, 0, 0, "untrusted:ci")?;
+        drop(lease);
+        assert!(store.get_cached_action(&key, "untrusted:ci")?.is_some());
+        tree.prepare_snapshot(".lake/build/lib/lean/P/A.olean")?;
+        let before = snapshot(&tree.project)?;
+        let fake_bwrap =
+            crate::module_builder::ScopedTestBwrapOverride::write_fake_bwrap_script(&tree.root)?;
+        let _bwrap =
+            crate::module_builder::ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy());
+        let err = run_ci_verify_command(
+            &mut store,
+            true,
+            "untrusted".into(),
+            tree.project.clone(),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("soundness audit rejected compiled artifact(s)")
+                && err.contains("sorryAx"),
+            "{err}"
+        );
+        assert_eq!(
+            snapshot(&tree.project)?,
+            before,
+            "CI rejection wiped the pre-existing build tree"
+        );
+        Ok(())
+    }
 
     #[test]
     fn kernel_statement_fixtures() -> Result<()> {
