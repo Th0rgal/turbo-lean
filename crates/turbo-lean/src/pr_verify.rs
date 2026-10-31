@@ -4057,6 +4057,22 @@ pub fn run_pr_verify_command(
         }
     }
 
+    let cached_set = store.batch_completed_action_keys(&all_edited_keys, &trust_domain)?;
+    let raw_uncached_jobs = all_edited_keys.iter().filter(|key| !cached_set.contains(*key)).count();
+    let effective_job_cap = unsafe {
+        crate::cluster::c_abi::turbo_spec_effective_cone_job_cap(
+            raw_uncached_jobs as u64,
+            max_cone_jobs as u64,
+        ) as usize
+    };
+    if max_cone_jobs > 0 && raw_uncached_jobs > effective_job_cap {
+        anyhow::bail!(
+            "PR verification cone budget exceeded (fail-closed): {} uncached theorem shards exceed --max-cone-jobs {} (refusing to truncate unverified shards)",
+            raw_uncached_jobs,
+            effective_job_cap
+        );
+    }
+
     // Identity elaboration needs the same compiled imports as shard checking,
     // including when the only verification results would otherwise be cache hits.
     if let Some(ref cfg) = untrusted_pr_cfg {
@@ -4129,7 +4145,6 @@ pub fn run_pr_verify_command(
         }
     }
 
-    let cached_set = store.batch_completed_action_keys(&all_edited_keys, &trust_domain)?;
 
     let mut shard_cache_hits = 0usize;
     let mut shards_verified = 0usize;
@@ -4139,7 +4154,6 @@ pub fn run_pr_verify_command(
     let mut inflight_tx_open = false;
 
     let mut uncached_by_file = Vec::new();
-    let mut raw_uncached_jobs = 0usize;
     for (rel_path, file_shards) in shards_by_file {
         let mut uncached = Vec::new();
         let mut can_fast_olean = !is_untrusted;
@@ -4150,27 +4164,12 @@ pub fn run_pr_verify_command(
                 if !fast_ok {
                     can_fast_olean = false;
                 }
-                raw_uncached_jobs += 1;
                 uncached.push((k, sh));
             }
         }
         if !uncached.is_empty() {
             uncached_by_file.push((rel_path, uncached, can_fast_olean));
         }
-    }
-
-    let effective_job_cap = unsafe {
-        crate::cluster::c_abi::turbo_spec_effective_cone_job_cap(
-            raw_uncached_jobs as u64,
-            max_cone_jobs as u64,
-        ) as usize
-    };
-    if max_cone_jobs > 0 && raw_uncached_jobs > effective_job_cap {
-        anyhow::bail!(
-            "PR verification cone budget exceeded (fail-closed): {} uncached theorem shards exceed --max-cone-jobs {} (refusing to truncate unverified shards)",
-            raw_uncached_jobs,
-            effective_job_cap
-        );
     }
 
     // Keep source interfaces and verification jobs intact. Only the report/gate uses
