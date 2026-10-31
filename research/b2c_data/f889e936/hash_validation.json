@@ -1,0 +1,17 @@
+{
+  "previous_commit": "719f226f5b401c150a8dfe764c7579f14af5e9b2",
+  "commit": "f889e936b807d151b9625bdeb44872f578d89f99",
+  "hash_validation": "passed",
+  "scope": "C9 independently re-extracted constant hashes; kernel coverage and timings not yet certified",
+  "current_FV_source_files": 4486,
+  "identical_cone_source_modules": 386,
+  "identical_module_metadata": true,
+  "identical_name_resolution_metadata": true,
+  "rows_compared": 313008,
+  "modules": 2742,
+  "FV_modules": 386,
+  "all_IF_and_constant_K_identical": true,
+  "actually_rebuilt_modules": 0,
+  "constant_rows_digest": "ac0e2dcbbb2d0af5fdaf1ba94dd1aac928db1977f7d1fadde9dc0553d888d08d",
+  "note": "Fresh Lean extraction/hash after changes outside the measured cone. The successful cone build was a no-op; full-cone replay is not incremental savings."
+}
