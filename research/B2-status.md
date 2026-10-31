@@ -1,7 +1,7 @@
 # B2 status
 
 Baseline: `5508b9f`; clifv `5018b9509dc124154dbe08a5bd85862595d8eab7`.
-Checkpoint: 2026-10-31 20:34 UTC. The executable lowering lives in
+Checkpoint: 2026-10-31 21:03 UTC. The executable lowering lives in
 `lean/LeanNative/Backend/Clif.lean`; `compile-clif` calls that definition.
 The active root and strict transitive axiom audit pass kernel checks on Lean 4.34.1.
 
@@ -80,13 +80,19 @@ and symbol premises remain explicit.
 Next: check the remaining contracts and compose the LNIR-to-x0 theorem against
 `E2E.backend_correct_final_of_lower`, then activate and audit those results.
 
-Build state at 20:34 UTC: a single local native scheduler targets `B2.EndToEnd`
+Build state at 21:03 UTC: a single local native scheduler targets `B2.EndToEnd`
 from `research/b2-proofs`, with telemetry off, four Lean threads, two compiler
-workers, and a 7200-second module timeout. Logs/status are
+workers, and a 7200-second per-module timeout. Logs/status are
 `.b2-work/e2e-build.{log,pid,exit}`. The upstream `RegallocAtomic` proof finished
-and its checked module artifact was published at about 20:25 UTC. The build
-advanced through `LowerContractT` and is now checking instruction-coverage
-and call-term helper proofs. No local compiler was restarted.
+at about 20:25 UTC; the instruction-coverage table proof `IselCovTab` also
+finished, at about 20:52 UTC. Both checked module artifacts are published.
+The build has advanced through register-level operations and branches, and is
+now checking allocation coverage. No local compiler was restarted.
+
+The actual `FV.E2E.RegLevelCall` import is still missing, so the contract module
+cannot yet be checked. A read-only checker of its exact source and strict axiom
+closure is prepared for when that import becomes available. It produces no
+module output and does not overwrite outputs owned by the native build.
 
 The proof sources are unchanged from `fae880c`. Its CI run has passed source
 identity, the active-root kernel/axiom audit, and the AArch64 byte comparison;
