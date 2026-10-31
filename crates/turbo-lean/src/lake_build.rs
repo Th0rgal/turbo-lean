@@ -3244,7 +3244,7 @@ pub fn run_build_command(
                 lake_env_to_put,
                 None,
             )?;
-            if std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+            if !crate::zygote::daemon_disabled() {
                 if let Some((ref env_vars, _)) = resolved_env {
                     pack::warm_local_zygote_daemon_nonblocking(store, env_vars);
                 }

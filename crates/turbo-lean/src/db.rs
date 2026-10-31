@@ -2556,6 +2556,15 @@ impl TurboStore {
             }
         }
 
+        // 0a. Bound the nested `/dev/shm` eval reply cache (the flat scan above skips subdirs)
+        if let Ok((n, b)) = crate::shm_cache::enforce_shm_quota_lru(
+            &self.fast_staging_dir().join("eval_shm_cache"),
+            0,
+        ) {
+            cleaned_staging_files += n;
+            freed_bytes += b;
+        }
+
         // 0b. Prune old binaries in `<store>/fastcheck_bins` when exceeding max_reclaimable_bytes
         let fc_dir = self.root.join("fastcheck_bins");
         if let Ok(entries) = fs::read_dir(&fc_dir) {
