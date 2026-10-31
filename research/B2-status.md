@@ -1,7 +1,7 @@
 # B2 status
 
 Baseline: `5508b9f`; clifv `5018b9509dc124154dbe08a5bd85862595d8eab7`.
-Checkpoint: 2026-10-31 19:39 UTC. The executable lowering lives in
+Checkpoint: 2026-10-31 20:34 UTC. The executable lowering lives in
 `lean/LeanNative/Backend/Clif.lean`; `compile-clif` calls that definition.
 The active root and strict transitive axiom audit pass kernel checks on Lean 4.34.1.
 
@@ -80,14 +80,23 @@ and symbol premises remain explicit.
 Next: check the remaining contracts and compose the LNIR-to-x0 theorem against
 `E2E.backend_correct_final_of_lower`, then activate and audit those results.
 
-Build state at 19:39 UTC: a single local native scheduler targets `B2.EndToEnd`
+Build state at 20:34 UTC: a single local native scheduler targets `B2.EndToEnd`
 from `research/b2-proofs`, with telemetry off, four Lean threads, two compiler
 workers, and a 7200-second module timeout. Logs/status are
-`.b2-work/e2e-build.{log,pid,exit}`. The upstream
-`FV.Backend.Proof.RegallocAtomic` compiler is live and using CPU; the dependency
-cone still has 91 missing module artifacts. Do not duplicate or restart a
-working local compiler. A fresh CI build now checks the draft composition too.
-Neither check has yet established O6 or O7.
+`.b2-work/e2e-build.{log,pid,exit}`. The upstream `RegallocAtomic` proof finished
+and its checked module artifact was published at about 20:25 UTC. The build
+advanced through `LowerContractT` and is now checking instruction-coverage
+and call-term helper proofs. No local compiler was restarted.
+
+The proof sources are unchanged from `fae880c`. Its CI run has passed source
+identity, the active-root kernel/axiom audit, and the AArch64 byte comparison;
+the new draft backend-composition step is running:
+https://github.com/Th0rgal/turbo-lean/actions/runs/41235235900 .
+The entire run is still pending. Neither the local build nor CI has yet
+established O6 or O7. Separate strict contract and composition audits are
+prepared for the actual completed modules; activation will follow successful
+checks, not a live job status. Shared-host CPU contention was observed at
+20:25 UTC, with about 36 GiB memory available and no swap use.
 
 The active root passed locally at 17:12 UTC. Scope/dominance and their strict
 transitive audit passed at 17:54 UTC; the return bridge, active audit and root
