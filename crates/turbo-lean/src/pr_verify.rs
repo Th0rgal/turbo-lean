@@ -224,96 +224,6 @@ pub(crate) fn fetch_git_blobs_batch(
     Ok(out_map)
 }
 
-/// Lake configuration at `base_ref`, compared with the working tree's.
-enum BaseLakeConfig {
-    /// Neither `lakefile.toml` nor `lakefile.lean` changed: per-file Lean args are unchanged.
-    Same,
-    /// The lakefile changed; the base package (`None`: no lakefile at `base_ref`, so no args).
-    Changed(Option<Box<crate::module_builder::PackageConfig>>),
-    /// The lakefile changed and the base version cannot be read or statically parsed.
-    Unknown,
-}
-
-/// Statically parses `base_ref`'s lakefile against the current package root (fail-closed parsers
-/// only; nothing is executed), so per-file Lean args can be compared across the PR. `strict`
-/// must match how the working-tree config is parsed, so both sides see the same declarations.
-/// Lakefile blobs are cached per resolved `base_sha` (commit contents are immutable), keeping
-/// warm runs free of `git` spawns.
-fn load_base_lake_config(
-    store: &TurboStore,
-    repo_root: &Path,
-    proj_prefix: &str,
-    canon_dir: &Path,
-    base_ref: &str,
-    base_sha: Option<&str>,
-    strict: bool,
-) -> BaseLakeConfig {
-    const NAMES: [&str; 2] = ["lakefile.toml", "lakefile.lean"];
-    let repo_rels: Vec<String> = NAMES
-        .iter()
-        .map(|n| join_proj_prefix(proj_prefix, n))
-        .collect();
-    let cache_file = base_sha.map(|sha| {
-        let key =
-            blake3::hash(format!("base-lakefiles:v1:{}:{}", sha, repo_rels.join(":")).as_bytes());
-        store
-            .fast_staging_dir()
-            .join(format!("git_base_lakefiles_{}.json", &key.to_hex()[..24]))
-    });
-    let cached = cache_file
-        .as_ref()
-        .and_then(|f| fs::read(f).ok())
-        .and_then(|b| serde_json::from_slice::<std::collections::HashMap<String, String>>(&b).ok());
-    let base = match cached {
-        Some(base) => base,
-        None => match fetch_git_blobs_batch(repo_root, base_ref, &repo_rels) {
-            Ok(base) => {
-                if let (Some(f), Ok(bytes)) = (&cache_file, serde_json::to_vec(&base)) {
-                    let _ = crate::shm_cache::atomic_write_shm(f, &bytes);
-                }
-                base
-            }
-            Err(_) => return BaseLakeConfig::Unknown,
-        },
-    };
-    if NAMES
-        .iter()
-        .zip(&repo_rels)
-        .all(|(n, r)| base.get(r) == fs::read_to_string(canon_dir.join(n)).ok().as_ref())
-    {
-        return BaseLakeConfig::Same;
-    }
-    // Same precedence as `resolve_package_config`: `lakefile.toml` first.
-    let Some((name, text)) = NAMES
-        .iter()
-        .zip(&repo_rels)
-        .find_map(|(n, r)| base.get(r).map(|t| (*n, t)))
-    else {
-        return BaseLakeConfig::Changed(None);
-    };
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let tmp_dir = std::env::temp_dir().join(format!(
-        "turbo_lean_base_lakefile_{}_{}",
-        std::process::id(),
-        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    let tmp_file = tmp_dir.join(name);
-    let parsed = fs::create_dir_all(&tmp_dir)
-        .and_then(|_| fs::write(&tmp_file, text))
-        .map_err(anyhow::Error::from)
-        .and_then(|_| {
-            if name == "lakefile.toml" {
-                crate::module_builder::parse_lakefile_toml(canon_dir, &tmp_file, strict)
-            } else {
-                crate::module_builder::parse_lakefile_lean(canon_dir, &tmp_file, strict)
-            }
-        });
-    let _ = fs::remove_dir_all(&tmp_dir);
-    parsed.map_or(BaseLakeConfig::Unknown, |pkg| {
-        BaseLakeConfig::Changed(Some(Box::new(pkg)))
-    })
-}
-
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub(crate) struct CachedBaseShard {
     name: String,
@@ -606,6 +516,7 @@ impl PrClassificationAccum {
                 } else if s.stmt_hash == bs.stmt_hash()
                     && s.prefix_env_hash == bs.prefix_env_hash()
                     && file_interface_same
+                    && options_same
                 {
                     self.proof_edited_theorems.push(qualified);
                     file_verify_list.push((k, s, options_same));
@@ -2111,28 +2022,6 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
     for rel_path in all_paths {
         let Some(entry) = entries_by_rel_path.remove(&rel_path) else {
             continue;
-        };
-        let entry = match entry {
-            PrFileEntry::Unchanged(split) if reconfigured(&rel_path) => {
-                let cur_src = fs::read_to_string(canon_dir.join(&rel_path)).unwrap_or_default();
-                changed_current_files.insert(rel_path.clone(), cur_src.clone());
-                PrFileEntry::Changed {
-                    base_src: None,
-                    cur_src: Some(cur_src),
-                    cur_split: Some(split),
-                }
-            }
-            // Source edits do not narrow this: every shard needs the new args, not just edited ones.
-            PrFileEntry::Changed {
-                base_src: Some(_),
-                cur_src: Some(cur_src),
-                cur_split,
-            } if reconfigured(&rel_path) => PrFileEntry::Changed {
-                base_src: None,
-                cur_src: Some(cur_src),
-                cur_split,
-            },
-            entry => entry,
         };
         match entry {
             PrFileEntry::Unchanged(split) => {
@@ -5829,7 +5718,7 @@ end Fixture
         for base_ref in ["HEAD", base.as_str()] {
             let (cls, changed, _, _) = load_and_classify_pr_from_git(&store, &repo, base_ref, tc)?;
             assert_eq!(cls.unchanged_theorems, vec!["Other/B.lean::unaffected"]);
-            assert_eq!(cls.proof_edited_theorems, vec!["Demo/A.lean::affected"]);
+            assert_eq!(cls.statement_edited_theorems, vec!["Demo/A.lean::affected"]);
             assert_eq!(cls.altered_interface_files, vec!["Demo/A.lean"]);
             assert_eq!(changed["Demo/A.lean"].len(), 1);
             assert!(!changed["Demo/A.lean"][0].2);
@@ -6366,28 +6255,26 @@ end Fixture
             .iter()
             .any(|t| t.starts_with("Heavy/")));
 
-        // An unparsable working-tree lakefile (trusted mode) cannot be compared: re-verify all.
+        // Invalid current or base configuration must stop classification with an error.
         fs::write(
             canon_dir.join("lakefile.toml"),
             "name = \"demo\"\nmoreLeanArgs = [\"--plugin=evil.so\"]\n",
         )?;
-        let (cls, _, _, _) = load_and_classify_pr_from_git(&store, &canon_dir, "HEAD", tc)?;
-        assert_eq!(cls.modified_files, vec!["Fast/A.lean", "Heavy/B.lean"]);
+        assert!(load_and_classify_pr_from_git(&store, &canon_dir, "HEAD", tc).is_err());
         fs::write(
             canon_dir.join("Heavy/B.lean"),
             "theorem t_b : 2 + 2 = 4 := by\n  rfl\n",
         )?;
 
-        // An unparsable base lakefile fails closed: every file is re-verified.
+        // Reject an unparsable base independently of the now-valid working tree.
         fs::write(
             canon_dir.join("lakefile.toml"),
             "name = \"demo\"\nmoreLeanArgs = [\"--plugin=evil.so\"]\n",
         )?;
         git_init_and_commit(&repo_dir, "unparsable base")?;
         fs::write(canon_dir.join("lakefile.toml"), lakefile(""))?;
-        let (cls, to_verify, _, _) = load_and_classify_pr_from_git(&store, &canon_dir, "HEAD", tc)?;
-        assert_eq!(cls.modified_files, vec!["Fast/A.lean", "Heavy/B.lean"]);
-        assert_eq!(to_verify.len(), 2);
+        let err = load_and_classify_pr_from_git(&store, &canon_dir, "HEAD", tc).unwrap_err();
+        assert!(format!("{err:#}").contains("Failed to resolve base Lean options"));
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
