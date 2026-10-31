@@ -55,7 +55,15 @@ pub struct ZygoteEvalReply {
     pub stderr_tail: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_request: Option<String>,
+    /// `ZYGOTE_SCANNER_VERSION` when the host stderr panic scan vetted this reply; `0` for
+    /// replies from older hosts. Persisted eval replies without the current version are rejected.
+    #[serde(default)]
+    pub scanner_version: u32,
 }
+
+/// Version of the host-side reply vetting (`StderrScan` + `mark_runtime_panic`). Bump whenever
+/// a reply that an older host accepted could now be rejected, so persisted replies are not replayed.
+pub(crate) const ZYGOTE_SCANNER_VERSION: u32 = 1;
 
 /// In-process C-ABI dispatcher for `LeanNative` methods (`"ping"`, `"validate-tv"`,
 /// `"verify-certs"`, `"compile-fastcheck"`, `"eval-cex"`, `"compile-llvm"`, `"compile-ptx"`),
@@ -293,7 +301,17 @@ extern "C" fn cleanup_one_shot() {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Per-test-thread `TURBO_LEAN_NO_DAEMON` (the env var is process-global).
+    static TEST_NO_DAEMON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub(crate) fn daemon_disabled() -> bool {
+    #[cfg(test)]
+    if TEST_NO_DAEMON.with(|c| c.get()) {
+        return true;
+    }
     std::env::var("TURBO_LEAN_NO_DAEMON")
         .ok()
         .and_then(|value| crate::shm_cache::parse_relaxed_bool(&value))
@@ -941,6 +959,84 @@ pub(crate) fn shutdown_local_daemon(_lifecycle: &ExclusiveLifecycleLock) {
 
 const ZYGOTE_STDERR_TAIL_CAP: usize = 8192;
 
+/// Mirrors `TurboLean.ZygoteWorker.stderrReplyMark`: the worker writes it to stderr before each reply.
+const ZYGOTE_STDERR_REPLY_MARK: &str = "[TurboLean.ZygoteWorker] reply";
+
+/// How long the host waits, after reading a reply, for that reply's stderr mark.
+const ZYGOTE_STDERR_MARK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Byte-stream scan of a worker's whole stderr (the tail alone loses panics behind long
+/// backtraces or long unterminated lines): counts runtime-panic signatures and reply marks.
+#[derive(Default)]
+struct StderrScan {
+    state: std::sync::Mutex<StderrScanState>,
+    cv: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct StderrScanState {
+    panics: u64,
+    marks: u64,
+    /// Last `longest signature - 1` bytes, so a signature split across chunks is still seen.
+    overlap: Vec<u8>,
+}
+
+impl StderrScan {
+    /// Scans every byte of `chunk`; only matches ending inside `chunk` are new.
+    fn feed(&self, chunk: &[u8]) {
+        let Ok(mut g) = self.state.lock() else {
+            return;
+        };
+        let keep = g.overlap.len();
+        let mut buf = std::mem::take(&mut g.overlap);
+        buf.extend_from_slice(chunk);
+        let count = |pat: &str| {
+            let pat = pat.as_bytes();
+            buf.windows(pat.len())
+                .enumerate()
+                .filter(|(i, w)| *w == pat && i + pat.len() > keep)
+                .count() as u64
+        };
+        let marks = count(ZYGOTE_STDERR_REPLY_MARK);
+        g.panics += RUNTIME_PANIC_SIGNATURES
+            .iter()
+            .map(|s| count(s))
+            .sum::<u64>();
+        g.marks += marks;
+        let longest = RUNTIME_PANIC_SIGNATURES
+            .iter()
+            .chain([&ZYGOTE_STDERR_REPLY_MARK])
+            .map(|s| s.len())
+            .max()
+            .unwrap_or(1);
+        g.overlap = buf[buf.len().saturating_sub(longest - 1)..].to_vec();
+        drop(g);
+        if marks > 0 {
+            self.cv.notify_all();
+        }
+    }
+
+    fn snapshot(&self) -> (u64, u64) {
+        self.state
+            .lock()
+            .map(|g| (g.panics, g.marks))
+            .unwrap_or((u64::MAX, u64::MAX))
+    }
+
+    /// Whether the request since `before` must be treated as panicked: a runtime panic hit stderr,
+    /// or its reply mark did not arrive within `wait` (fail closed: an unseen mark means unseen
+    /// stderr, which may hold a panic).
+    fn panicked_since(&self, before: (u64, u64), wait: std::time::Duration) -> bool {
+        let Ok(g) = self.state.lock() else {
+            return true;
+        };
+        match self.cv.wait_timeout_while(g, wait, |s| s.marks <= before.1) {
+            Ok((g, _)) => g.marks <= before.1 || g.panics > before.0,
+            Err(_) => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct WorkerCrashDiagnostics {
     message: String,
@@ -958,6 +1054,7 @@ pub struct ZygoteWorkerProcess {
     stdin: std::process::ChildStdin,
     stdout: BufReader<std::process::ChildStdout>,
     stderr_tail: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    stderr_scan: std::sync::Arc<StderrScan>,
     warm_prefixes: std::collections::HashSet<String>,
     warm_prefix_tree: Vec<(String, String)>,
     warm_imports: std::collections::HashMap<String, String>,
@@ -1569,19 +1666,20 @@ const RUNTIME_PANIC_ERR: &str =
 /// Mirrors `TurboLean.ZygoteWorker.isRuntimePanicText`: Lean panic output or `EnvExtension`
 /// corruption, not any mention of the word `PANIC`.
 fn is_runtime_panic_text(s: &str) -> bool {
-    [
-        "PANIC at ",
-        "INTERNAL PANIC",
-        "invalid environment extension",
-    ]
-    .iter()
-    .any(|m| s.contains(m))
+    RUNTIME_PANIC_SIGNATURES.iter().any(|m| s.contains(m))
 }
 
-/// Fails a reply whose worker hit a runtime panic; returns whether the worker must be discarded.
-fn mark_runtime_panic(rep: &mut ZygoteEvalReply) -> bool {
+const RUNTIME_PANIC_SIGNATURES: [&str; 3] = [
+    "PANIC at ",
+    "INTERNAL PANIC",
+    "invalid environment extension",
+];
+
+/// Fails a reply whose worker hit a runtime panic (reported, in its messages, or seen on the
+/// worker's stderr during the request); returns whether the worker must be discarded.
+fn mark_runtime_panic(rep: &mut ZygoteEvalReply, stderr_panic: bool) -> bool {
     let reported = rep.errors.iter().any(|e| e == RUNTIME_PANIC_ERR);
-    if !reported && !rep.messages.iter().any(|m| is_runtime_panic_text(m)) {
+    if !reported && !stderr_panic && !rep.messages.iter().any(|m| is_runtime_panic_text(m)) {
         return false;
     }
     rep.ok = false;
@@ -3011,8 +3109,10 @@ fn eval_with_zygote_pool_inner(
                 .ok_or_else(|| anyhow::anyhow!("Missing Zygote stdout"))?,
         );
         let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stderr_scan = std::sync::Arc::new(StderrScan::default());
         if let Some(mut child_stderr) = child.stderr.take() {
             let tail_clone = stderr_tail.clone();
+            let scan_clone = stderr_scan.clone();
             std::thread::spawn(move || {
                 use std::io::Read;
                 let mut chunk = [0u8; 1024];
@@ -3020,6 +3120,7 @@ fn eval_with_zygote_pool_inner(
                     if n == 0 {
                         break;
                     }
+                    scan_clone.feed(&chunk[..n]);
                     if let Ok(mut g) = tail_clone.lock() {
                         g.extend_from_slice(&chunk[..n]);
                         if g.len() > ZYGOTE_STDERR_TAIL_CAP {
@@ -3036,6 +3137,7 @@ fn eval_with_zygote_pool_inner(
             stdin,
             stdout,
             stderr_tail,
+            stderr_scan,
             warm_prefixes: std::collections::HashSet::new(),
             warm_prefix_tree: Vec::new(),
             warm_imports: std::collections::HashMap::new(),
@@ -3105,6 +3207,7 @@ fn eval_with_zygote_pool_inner(
             }
             let pid = worker.child.id();
             let rss_before = measure_process_rss_mb(pid);
+            let scan_before = worker.stderr_scan.snapshot();
             if let Err(e) = worker
                 .stdin
                 .write_all(req_line.as_bytes())
@@ -3144,7 +3247,11 @@ fn eval_with_zygote_pool_inner(
                         let rss_after = measure_process_rss_mb(pid);
                         parsed.rss_delta_mb = (rss_after as i64) - (rss_before as i64);
                         parsed.peak_rss_mb = rss_after.max(rss_before);
-                        mark_runtime_panic(&mut parsed);
+                        let stderr_panic = worker
+                            .stderr_scan
+                            .panicked_since(scan_before, ZYGOTE_STDERR_MARK_WAIT);
+                        mark_runtime_panic(&mut parsed, stderr_panic);
+                        parsed.scanner_version = ZYGOTE_SCANNER_VERSION;
                         WorkerReqOutcome::Reply(parsed)
                     }
                     Err(e) => {
@@ -3401,6 +3508,7 @@ fn eval_with_zygote_pool_inner(
             let rss_delta_mb: i64 = replies.iter().map(|r| r.rss_delta_mb).max().unwrap_or(0);
             let peak_rss_mb: u64 = replies.iter().map(|r| r.peak_rss_mb).max().unwrap_or(0);
             let subshards_verified: usize = replies.iter().map(|r| r.subshards_verified).sum();
+            let scanner_version = replies.iter().map(|r| r.scanner_version).min().unwrap_or(0);
             let mut stdout = String::new();
             let mut messages = Vec::new();
             let mut errors = Vec::new();
@@ -3434,6 +3542,7 @@ fn eval_with_zygote_pool_inner(
                 messages,
                 errors,
                 used_constants,
+                scanner_version,
                 timed_out: false,
                 crashed: false,
                 ..Default::default()
@@ -4492,8 +4601,11 @@ fn compute_eval_shm_cache_filename(
     lean_args: &[String],
 ) -> Result<String> {
     let args_digest = crate::module_builder::compute_lean_args_digest(lean_args)?;
+    // v5: v4 (and older) entries were vetted without the stderr panic scan and carry no
+    // `scanner_version`; the scanner version also separates namespaces across scanner bumps.
     let bytes = serde_json::to_vec(&(
-        "eval-shm:v4",
+        "eval-shm:v5",
+        ZYGOTE_SCANNER_VERSION,
         &context.identity,
         file_name,
         caller_cwd,
@@ -4506,8 +4618,13 @@ fn compute_eval_shm_cache_filename(
 
 /// Only successful, import-clean replies may be cached: failures (missing toolchain, import
 /// errors, ...) are environmental and must be re-evaluated rather than replayed forever.
+/// Only replies vetted by the current host scanner are cacheable.
 fn eval_reply_cacheable(rep: &ZygoteEvalReply) -> bool {
-    rep.ok && rep.import_ok && !rep.crashed && !rep.timed_out
+    rep.ok
+        && rep.import_ok
+        && !rep.crashed
+        && !rep.timed_out
+        && rep.scanner_version == ZYGOTE_SCANNER_VERSION
 }
 
 /// Write an eval reply into `eval_shm_cache/` and periodically enforce the `/dev/shm` quota.
@@ -4539,6 +4656,11 @@ fn write_eval_shm_cache(path: &Path, bytes: &[u8]) {
 fn read_cached_eval_shm_reply(path: &Path) -> Option<ZygoteEvalReply> {
     let bytes = fs::read(path).ok()?;
     let mut cached_rep: ZygoteEvalReply = serde_json::from_slice(&bytes).ok()?;
+    // Fail closed on entries without current provenance (older hosts, foreign writers).
+    if !eval_reply_cacheable(&cached_rep) {
+        let _ = fs::remove_file(path);
+        return None;
+    }
     cached_rep.env_cache_hit = true;
     cached_rep.prefix_cache_hit = true;
     cached_rep.import_us = 0;
@@ -4804,7 +4926,9 @@ pub fn try_local_zygote_eval_with_args(
     if let Some(ref rep) = parsed {
         if eval_reply_cacheable(rep) {
             if let Some(ref path) = eval_shm_file {
-                write_eval_shm_cache(path, &resp_bytes);
+                if let Ok(bytes) = serde_json::to_vec(rep) {
+                    write_eval_shm_cache(path, &bytes);
+                }
             }
         }
     }
@@ -5309,6 +5433,8 @@ mod tests {
         let path = cache_dir.join(filename);
         let reply = ZygoteEvalReply {
             ok: true,
+            import_ok: true,
+            scanner_version: ZYGOTE_SCANNER_VERSION,
             stdout: "empty-option-cached-reply".into(),
             ..Default::default()
         };
@@ -6058,9 +6184,15 @@ mod tests {
         let ok = ZygoteEvalReply {
             ok: true,
             import_ok: true,
+            scanner_version: ZYGOTE_SCANNER_VERSION,
             ..Default::default()
         };
         assert!(eval_reply_cacheable(&ok));
+        // Not vetted by the current stderr scanner (pre-upgrade host): never cached or replayed.
+        assert!(!eval_reply_cacheable(&ZygoteEvalReply {
+            scanner_version: 0,
+            ..ok.clone()
+        }));
         // e.g. "toolchain not installed": ok=false and import_ok=false
         assert!(!eval_reply_cacheable(&ZygoteEvalReply {
             ok: false,
@@ -6630,53 +6762,71 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert!(mark_runtime_panic(&mut rep));
+        assert!(mark_runtime_panic(&mut rep, false));
         assert!(!rep.ok);
         assert_eq!(rep.errors, vec![RUNTIME_PANIC_ERR.to_string()]);
         // Idempotent, and ordinary output mentioning PANIC is not a runtime panic.
-        assert!(mark_runtime_panic(&mut rep) && rep.errors.len() == 1);
+        assert!(mark_runtime_panic(&mut rep, false) && rep.errors.len() == 1);
         let mut benign = ZygoteEvalReply {
             ok: true,
             messages: vec!["info: \"PANIC button pressed\"".to_string()],
             errors: vec!["unknown identifier 'runtime panic'".to_string()],
             ..Default::default()
         };
-        assert!(!mark_runtime_panic(&mut benign) && benign.ok);
+        assert!(!mark_runtime_panic(&mut benign, false) && benign.ok);
+        assert!(mark_runtime_panic(&mut benign, true) && !benign.ok);
 
         let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("panic_guard") else {
             return;
         };
         let lp = tmp_dir.to_string_lossy().to_string();
-        let panic_src = "import Lean\n#eval (panic! \"Lean.EnvExtension.modifyStateImpl\" : Nat)\n";
-        let live_rep = eval_with_zygote_pool_opts(
-            &store,
-            "leanprover/lean4:v4.35.0",
-            &lp,
-            &env_vars,
-            &lean_bin,
-            panic_src,
-            false,
-            true,
-            Some("PanicTest.lean"),
-            Some(30_000),
-        )
-        .unwrap();
-        if live_rep.messages.iter().any(|m| m.contains("PANIC"))
-            || live_rep.stdout.contains("PANIC")
-            || live_rep
-                .errors
-                .iter()
-                .any(|e| e.contains("PANIC") || e.contains("runtime panic"))
-        {
+        let tc = "leanprover/lean4:v4.35.0";
+        let idle_workers = || -> usize {
+            ZYGOTE_POOL
+                .get()
+                .and_then(|m| m.lock().ok())
+                .map(|g| {
+                    g.iter()
+                        .filter(|(k, _)| k.1.contains(&lp))
+                        .map(|(_, v)| v.len())
+                        .sum()
+                })
+                .unwrap_or(0)
+        };
+        // Panics reported as messages, printed only to stderr (`stderrAsMessages false`), and
+        // raised inside tactic elaboration (which `lean` itself only prints to stderr).
+        let tactic_boom = "import Lean\nopen Lean Elab Tactic\nelab \"boom\" : tactic => do\n  let n : Nat := panic! \"tacp\"\n  logInfo m!\"{n}\"\ntheorem c : True := by boom; trivial\n";
+        for (eval_mode, src) in [
+            (true, "import Lean\n#eval (panic! \"Lean.EnvExtension.modifyStateImpl\" : Nat)\n"),
+            (false, "#eval (panic! \"msg\" : Nat)\ntheorem p1 : True := trivial\n"),
+            (false, "set_option stderrAsMessages false\n#eval (panic! \"stderr only\" : Nat)\ntheorem p2 : True := trivial\n"),
+            // Stderr-only panic behind a long unterminated stderr line (> any line buffer).
+            (false, "set_option stderrAsMessages false\n#eval show IO Unit from do\n  let e ← IO.getStderr\n  e.putStr (String.ofList (List.replicate 10000 'x'))\n  e.flush\n  let n : Nat := panic! s!\"after long line {(← IO.monoNanosNow) % 1}\"\n  IO.println n\ntheorem p3 : True := trivial\n"),
+            (false, tactic_boom),
+            (true, tactic_boom),
+        ] {
+            let before = idle_workers();
+            let live_rep = eval_with_zygote_pool_opts(
+                &store, tc, &lp, &env_vars, &lean_bin, src, false, eval_mode,
+                Some("PanicTest.lean"), Some(60_000),
+            )
+            .unwrap();
             assert!(
-                !live_rep.ok,
-                "PANIC output must never return ok=true: {:?}",
-                live_rep
+                !live_rep.ok && live_rep.errors.iter().any(|e| e == RUNTIME_PANIC_ERR),
+                "panic must fail the request: {src:?} -> {live_rep:?}"
             );
+            assert!(idle_workers() <= before, "panicked worker returned to the pool: {src:?}");
+            // A panicked request is never cached: the same request panics again on a new worker.
+            let again = eval_with_zygote_pool_opts(
+                &store, tc, &lp, &env_vars, &lean_bin, src, false, eval_mode,
+                Some("PanicTest.lean"), Some(60_000),
+            )
+            .unwrap();
+            assert!(!again.ok, "panicked reply was cached: {src:?}");
         }
         let follow = eval_with_zygote_pool(
             &store,
-            "leanprover/lean4:v4.35.0",
+            tc,
             &lp,
             &env_vars,
             &lean_bin,
@@ -6689,6 +6839,384 @@ mod tests {
             "fresh/healthy worker must succeed after panic shard: {:?}",
             follow
         );
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// Upgrade path: replies cached by hosts without the stderr panic scan — main before #310
+    /// (`eval-shm:v3:`) and main with #305 (`eval-shm:v4`, resolved identity) — for a
+    /// stderr-only tactic panic followed by a successful theorem (`ok=true`) are never replayed.
+    #[test]
+    fn test_pre_scanner_eval_cache_entry_is_never_replayed() {
+        TEST_NO_DAEMON.with(|c| c.set(true));
+        let (tmp_dir, store, env_vars, lean_bin) =
+            open_test_zygote_env("eval_cache_upgrade").expect("Lean v4.35.0 toolchain required");
+        let tc = "leanprover/lean4:v4.35.0";
+        let lp = tmp_dir.to_string_lossy().to_string();
+        let src = format!(
+            "import Lean\nopen Lean Elab Tactic\n-- {}\nelab \"boom\" : tactic => do\n  let n : Nat := panic! \"tacp\"\n  logInfo m!\"{{n}}\"\ntheorem c : True := by boom; trivial\n",
+            next_tmp_id()
+        );
+        let file_name = "UpgradePanic.lean";
+        let caller_cwd = std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string());
+        let (imports_csv, _) = split_shard_for_zygote(&src);
+        // The exact v3 key of main before #310.
+        let v3_name = {
+            let mut h = blake3::Hasher::new();
+            h.update(b"eval-shm:v3:");
+            for part in [
+                tc,
+                &lp,
+                &compute_imported_oleans_digest(&imports_csv, &lp),
+                file_name,
+                caller_cwd.as_deref().unwrap_or(""),
+            ] {
+                h.update(part.as_bytes());
+                h.update(b":");
+            }
+            h.update(src.as_bytes());
+            format!("ev_{}.json", &h.finalize().to_hex()[..24])
+        };
+        let context = resolve_zygote_context(tc, &lp, &env_vars, &lean_bin, &imports_csv);
+        // The exact v4 key of main with #305 (resolved identity, no scanner version).
+        let v4_name = {
+            let args_digest = crate::module_builder::compute_lean_args_digest(&[]).unwrap();
+            let bytes = serde_json::to_vec(&(
+                "eval-shm:v4",
+                &context.identity,
+                file_name,
+                caller_cwd.as_deref(),
+                &src,
+                args_digest,
+            ))
+            .unwrap();
+            format!("ev_{}.json", &blake3::hash(&bytes).to_hex()[..24])
+        };
+        let new_name =
+            compute_eval_shm_cache_filename(&context, file_name, caller_cwd.as_deref(), &src, &[])
+                .unwrap();
+        assert_ne!(v3_name, new_name, "the namespace bump must change the key");
+        assert_ne!(v4_name, new_name, "scanner namespace must change the #305 key");
+        let dir = store.fast_staging_dir().join("eval_shm_cache");
+        fs::create_dir_all(&dir).unwrap();
+        // A pre-scanner (no `scanner_version`) false success, planted at the v3 and v4 keys
+        // and, as a foreign/unversioned writer would, at the new key.
+        let stale = br#"{"ok":true,"kernel_gate_active":false,"import_ok":true,"env_cache_hit":false,"prefix_cache_hit":false,"import_us":1,"prefix_us":0,"elab_us":1,"heartbeats":0,"proof_term_nodes":0,"rss_delta_mb":0,"peak_rss_mb":0,"subshards_verified":1,"stdout":"","messages":[],"errors":[],"used_constants":[],"timed_out":false,"crashed":false}"#;
+        for name in [&v3_name, &v4_name, &new_name] {
+            fs::write(dir.join(name), stale).unwrap();
+        }
+        assert!(read_cached_eval_shm_reply(&dir.join(&v3_name)).is_none());
+        assert!(read_cached_eval_shm_reply(&dir.join(&v4_name)).is_none());
+        fs::write(dir.join(&v4_name), stale).unwrap();
+        fs::write(dir.join(&new_name), stale).unwrap();
+
+        let rep = try_local_zygote_eval_with_args(
+            &store,
+            &env_vars,
+            &lean_bin,
+            tc,
+            &lp,
+            &src,
+            Some(file_name),
+            60_000,
+            &[],
+        )
+        .expect("worker must execute");
+        assert!(
+            !rep.ok && rep.errors.iter().any(|e| e == RUNTIME_PANIC_ERR),
+            "stale cached ok replayed: {rep:?}"
+        );
+        assert_eq!(rep.scanner_version, ZYGOTE_SCANNER_VERSION);
+        assert!(
+            !dir.join(&new_name).exists(),
+            "unversioned entry must be dropped"
+        );
+        // And a scanner-vetted failure is not cached either: the next call executes again.
+        let again = try_local_zygote_eval_with_args(
+            &store,
+            &env_vars,
+            &lean_bin,
+            tc,
+            &lp,
+            &src,
+            Some(file_name),
+            60_000,
+            &[],
+        )
+        .unwrap();
+        assert!(!again.ok && again.errors.iter().any(|e| e == RUNTIME_PANIC_ERR));
+        for name in [&v3_name, &v4_name] {
+            let _ = fs::remove_file(dir.join(name));
+        }
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_stderr_scan_sees_every_byte_and_fails_closed_without_reply_mark() {
+        let wait = std::time::Duration::from_millis(200);
+        let mark = format!("\n{ZYGOTE_STDERR_REPLY_MARK}\n");
+        // A panic after a long unterminated line, and signatures/marks split across any chunk size.
+        let long = format!("{}PANIC at boom{mark}", "x".repeat(100_000));
+        for chunk in [1, 7, 1024, long.len()] {
+            let scan = StderrScan::default();
+            let before = scan.snapshot();
+            long.as_bytes().chunks(chunk).for_each(|c| scan.feed(c));
+            assert_eq!(scan.snapshot(), (1, 1), "chunk={chunk}");
+            assert!(scan.panicked_since(before, wait), "chunk={chunk}");
+            // A clean request after it, with its mark, is clean; no double counting of the overlap.
+            let before = scan.snapshot();
+            format!("{}{mark}", "y".repeat(5000))
+                .as_bytes()
+                .chunks(chunk)
+                .for_each(|c| scan.feed(c));
+            assert_eq!(scan.snapshot(), (1, 2), "chunk={chunk}");
+            assert!(!scan.panicked_since(before, wait), "chunk={chunk}");
+        }
+        // Missing mark: fail closed even though no panic was seen.
+        let scan = std::sync::Arc::new(StderrScan::default());
+        let before = scan.snapshot();
+        scan.feed(b"ordinary output\n");
+        assert!(scan.panicked_since(before, wait));
+        // Delayed mark (after the wait): fail closed; a mark within the wait: clean.
+        for (delay, expect) in [(wait * 3, true), (wait / 4, false)] {
+            let before = scan.snapshot();
+            let s = scan.clone();
+            let m = mark.clone();
+            let t = std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                s.feed(m.as_bytes());
+            });
+            assert_eq!(scan.panicked_since(before, wait), expect, "delay={delay:?}");
+            t.join().unwrap();
+        }
+    }
+
+    /// Raw worker IPC against stock `lean`: the worker must never accept what `lean` rejects.
+    #[test]
+    fn test_zygote_worker_ipc_matches_stock_lean_boundary() {
+        // No silent skips: a missing toolchain or a worker that fails to compile fails the test.
+        let (tmp_dir, store, env_vars, lean_bin) =
+            open_test_zygote_env("ipc_boundary").expect("Lean v4.35.0 toolchain required");
+        let bin = ensure_zygote_binary(&store, &lean_bin, &env_vars)
+            .unwrap_or_else(|e| panic!("Zygote worker failed to compile: {e:#}"));
+        let tc_lib = lean_bin
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("lib/lean");
+        let hx = |s: &str| hex_encode_bytes(s.as_bytes());
+        let opts = |o: &[&str]| {
+            if o.is_empty() {
+                String::new()
+            } else {
+                hx(&o.join("\n"))
+            }
+        };
+        let session = |lines: &[String]| -> Vec<serde_json::Value> {
+            let mut child = Command::new(&bin)
+                .env("LEAN", &lean_bin)
+                .env("LEAN_PATH", &tc_lib)
+                .env("LEAN_NUM_THREADS", "4")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn zygote worker");
+            let mut stdin = child.stdin.take().unwrap();
+            let mut out = BufReader::new(child.stdout.take().unwrap());
+            let replies = lines
+                .iter()
+                .map(|l| {
+                    stdin.write_all(format!("{l}\n").as_bytes()).unwrap();
+                    stdin.flush().unwrap();
+                    let mut r = String::new();
+                    out.read_line(&mut r).unwrap();
+                    serde_json::from_str(r.trim()).expect("worker JSON reply")
+                })
+                .collect();
+            let _ = child.kill();
+            let _ = child.wait();
+            replies
+        };
+        let stock_ok = |body: &str, o: &[&str]| -> bool {
+            let f = tmp_dir.join(format!("Stock{}.lean", next_tmp_id()));
+            fs::write(&f, body).unwrap();
+            let mut c = Command::new(&lean_bin);
+            c.env("LEAN_PATH", &tc_lib).args(o).arg(&f);
+            c.output().unwrap().status.success()
+        };
+        let ok = |r: &serde_json::Value| r["ok"].as_bool() == Some(true);
+
+        // 1 + 2: option allowlist (with any number of `weak.` prefixes) and Lean's own value parsing.
+        let triv = "theorem t : True := trivial\n";
+        let sorry_thm = "theorem s : 1 = 2 := sorry\n";
+        for (body, o) in [
+            (triv, "-Ddebug.skipKernelTC=true"),
+            (triv, "-Dweak.debug.skipKernelTC=true"),
+            (triv, "-DstderrAsMessages=false"),
+            (triv, "-Ddebug.byAsSorry=true"),
+            (sorry_thm, "-Dweak.warn.sorry=false"),
+            (sorry_thm, "-Dweak.weak.warn.sorry=false"),
+            (triv, "-DmaxHeartbeats=garbage"),
+            (triv, "-DautoImplicit=maybe"),
+            (triv, "-Dlinter.auditUnregistered=true"),
+            (triv, "-Dpp.all=true"),
+        ] {
+            let r = &session(&[format!("Init\t{}\tstrict\t\t\t{}", hx(body), opts(&[o]))])[0];
+            assert!(!ok(r), "{o} must be rejected: {r}");
+            assert!(
+                r["errors"][0].as_str().unwrap_or("").contains(o),
+                "{o}: {r}"
+            );
+        }
+        for o in [
+            "-Dweak.linter.auditUnregistered=true",
+            "-DmaxHeartbeats=1000",
+            "-DautoImplicit=false",
+            "-Ddebug.skipKernelTC=false",
+            "-Dweak.warn.sorry=true",
+        ] {
+            let r = &session(&[format!("Init\t{}\tstrict\t\t\t{}", hx(triv), opts(&[o]))])[0];
+            assert!(ok(r) && stock_ok(triv, &[o]), "{o} must be accepted: {r}");
+            // Hardening forced after parsing: `sorry` is still rejected under any accepted option.
+            let r = &session(&[format!(
+                "Init\t{}\tstrict\t\t\t{}",
+                hx(sorry_thm),
+                opts(&[o])
+            )])[0];
+            assert!(!ok(r), "sorry accepted under {o}: {r}");
+        }
+        for o in [
+            "-DmaxHeartbeats=garbage",
+            "-DautoImplicit=maybe",
+            "-Dlinter.auditUnregistered=true",
+        ] {
+            assert!(!stock_ok(triv, &[o]), "stock lean must reject {o}");
+        }
+
+        // 3: a panicking race candidate fails the whole request and poisons the worker.
+        let panic_cand = "#eval (panic! \"boom\" : Nat)\ntheorem pz : True := trivial\n";
+        let good = "theorem good : 1 + 1 = 2 := rfl\n";
+        // (`[good, panic]` never runs the panic: the race stops at a cheap winner.)
+        for cands in [[panic_cand, good]] {
+            let pre = hx("def pre : Nat := 1\n");
+            let race = format!(
+                "Init\trace_candidates\tk1\t{pre}\t{},{}",
+                hx(cands[0]),
+                hx(cands[1])
+            );
+            let rs = session(&[race.clone(), format!("Init\t{}\tstrict", hx(good))]);
+            assert!(
+                !ok(&rs[0]) && rs[0]["winning_candidate_idx"].is_null(),
+                "{}",
+                rs[0]
+            );
+            assert!(
+                !ok(&rs[1]),
+                "worker must stay poisoned after a race panic: {}",
+                rs[1]
+            );
+        }
+        // 3: a prefix (or prefix delta) that panics only on its first run ends the request: the
+        // combined fallback, which would not panic again, never turns it into ok=true.
+        let first_run_panic = |tag: &str| {
+            let marker = tmp_dir.join(format!("first_run_{tag}_{}", next_tmp_id()));
+            format!(
+                "#eval show IO Unit from do\n  if (← System.FilePath.pathExists {:?}) then return\n  IO.FS.writeFile {:?} \"\"\n  let n : Nat := panic! s!\"first run only {{(← IO.monoNanosNow) % 1}}\"\n  IO.println n\ntheorem pre_{tag} : True := trivial\n",
+                marker.to_string_lossy(),
+                marker.to_string_lossy()
+            )
+        };
+        let tgt = "theorem tgt : 1 + 1 = 2 := rfl\n";
+        let panicked = |r: &serde_json::Value| {
+            !ok(r)
+                && r["errors"]
+                    .as_array()
+                    .is_some_and(|e| e.iter().any(|e| e.as_str() == Some(RUNTIME_PANIC_ERR)))
+        };
+        for mode in ["strict", "race_candidates", "batch_fission", "delta"] {
+            let seed = "def seed_base : Nat := 1\n";
+            let pre = if mode == "delta" {
+                format!("{seed}{}", first_run_panic(mode))
+            } else {
+                first_run_panic(mode)
+            };
+            let pad = |p: &str| format!("{}{tgt}", "\n".repeat(p.lines().count()));
+            let req = |p: &str, key: &str| match mode {
+                "race_candidates" | "batch_fission" => {
+                    format!("Init\t{mode}\t{key}\t{}\t{}", hx(p), hx(tgt))
+                }
+                _ => format!("Init\t{}\tstrict\t{key}\t{}", hx(&pad(p)), hx(p)),
+            };
+            let mut lines = Vec::new();
+            if mode == "delta" {
+                // Seeds the prefix tree so the panicking request runs as a delta on top of it.
+                lines.push(req(seed, "k_seed"));
+            }
+            lines.push(req(&pre, "k_panic"));
+            lines.push(format!("Init\t{}\tstrict", hx(tgt)));
+            let rs = session(&lines);
+            let (r, next) = (&rs[lines.len() - 2], &rs[lines.len() - 1]);
+            if mode == "delta" {
+                assert!(ok(&rs[0]), "seed prefix must succeed: {}", rs[0]);
+            }
+            assert!(panicked(r), "{mode}: first-run prefix panic masked: {r}");
+            if mode == "race_candidates" {
+                assert!(r["winning_candidate_idx"].is_null(), "{r}");
+            }
+            assert!(panicked(next), "{mode}: worker must stay poisoned: {next}");
+        }
+
+        // 3: the first request binds the worker even with an empty importsCsv.
+        let rs = session(&[
+            format!(",\t{}\tstrict", hx(triv)),
+            format!("Lean\t{}\tstrict", hx(triv)),
+        ]);
+        assert!(ok(&rs[0]) && !ok(&rs[1]), "{rs:?}");
+        assert!(rs[1]["errors"][0]
+            .as_str()
+            .unwrap()
+            .contains("importsCsv changed"));
+
+        // 4: a prefix checkpoint keeps the target's warningAsError policy (from -D or set_option).
+        let target = "def audit_unused (x : Nat) : Nat := 0\n";
+        assert!(!stock_ok(target, &["-DwarningAsError=true"]));
+        for (pre, o) in [
+            (
+                "theorem prior : True := sorry\n",
+                opts(&["-DwarningAsError=true"]),
+            ),
+            (
+                "set_option warningAsError true\ntheorem prior2 : True := trivial\n",
+                String::new(),
+            ),
+            (
+                "set_option warningAsError true\ntheorem prior3 : True := sorry\n",
+                String::new(),
+            ),
+        ] {
+            let body = format!("{}{}", "\n".repeat(pre.lines().count()), target);
+            let req = format!("Init\t{}\tstrict\tpk\t{}\t{}", hx(&body), hx(pre), o);
+            let rs = session(&[req.clone(), req]);
+            assert!(
+                !ok(&rs[0]) && !ok(&rs[1]),
+                "warningAsError lost through prefix {pre:?}: {rs:?}"
+            );
+            // Stubs in the prefix stay allowed for a clean target.
+            let clean = format!(
+                "{}theorem tgt : 1 + 1 = 2 := rfl\n",
+                "\n".repeat(pre.lines().count())
+            );
+            let r = &session(&[format!(
+                "Init\t{}\tstrict\tpk\t{}\t{}",
+                hx(&clean),
+                hx(pre),
+                o
+            )])[0];
+            assert!(ok(r), "stub prefix must not fail a clean target: {r}");
+        }
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 
@@ -6725,6 +7253,7 @@ mod tests {
                 stdin,
                 stdout,
                 stderr_tail,
+                stderr_scan: Default::default(),
                 warm_prefixes: std::collections::HashSet::new(),
                 warm_prefix_tree: Vec::new(),
                 warm_imports: std::collections::HashMap::new(),

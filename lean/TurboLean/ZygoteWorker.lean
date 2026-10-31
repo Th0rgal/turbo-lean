@@ -147,9 +147,17 @@ def jsonEscape (s : String) : String := Id.run do
 def jsonStrList (xs : List String) : String :=
   String.intercalate "," (xs.map (fun x => s!"\"{jsonEscape x}\""))
 
+/-- Line written to the process stderr right before every reply. Panics printed straight to stderr
+    (`set_option stderrAsMessages false`, other threads) precede it, so the host
+    (`zygote.rs`, `ZYGOTE_STDERR_REPLY_MARK`) waits for it and then knows whether the request panicked. -/
+def stderrReplyMark : String := "[TurboLean.ZygoteWorker] reply"
+
 /-- Emit a single-line JSON Zygote reply and flush `stdout`. -/
 def emitZygoteReply (stdout : IO.FS.Stream) (ok : Bool) (winIdx? : Option String) (kgActive importOk envHit prefHit : Bool)
     (importUs prefixUs elabUs hbs nodes subVerified : Nat) (outStr : String) (msgs errs used : List String) : IO Unit := do
+  let stderr ← IO.getStderr
+  stderr.putStrLn s!"\n{stderrReplyMark}"
+  stderr.flush
   let winPart := match winIdx? with | some w => s!"\"winning_candidate_idx\":{w}," | none => ""
   let kgPart := if importOk then s!"\"kernel_gate_active\":{kgActive}," else ""
   stdout.putStrLn s!"\{\"ok\":{ok},{winPart}{kgPart}\"import_ok\":{importOk},\"env_cache_hit\":{envHit},\"prefix_cache_hit\":{prefHit},\"import_us\":{importUs},\"prefix_us\":{prefixUs},\"elab_us\":{elabUs},\"heartbeats\":{hbs},\"proof_term_nodes\":{nodes},\"subshards_verified\":{subVerified},\"stdout\":\"{jsonEscape outStr}\",\"messages\":[{jsonStrList msgs}],\"errors\":[{jsonStrList errs}],\"used_constants\":[{jsonStrList used}]}"
@@ -164,43 +172,65 @@ def withToolchainSatSolver (opts : Options) : IO Options := do
   let s ← satSolverRef.get
   return if s.isEmpty || opts.contains `sat.solver then opts else opts.set `sat.solver s
 
-/-- Apply filtered CLI-style `-Dkey=value` options (e.g. Lake `leanOptions` / `moreLeanArgs` / `weakLeanArgs`)
-    onto `opts` after imports are loaded, matching `Lean.Language.Lean.setOption` / `Lean.Shell.setConfigOption`. -/
+/-- Mirror of `is_allowed_lean_option` in `crates/turbo-lean/src/module_builder.rs`; keep the two
+    in sync. `key` has every leading `weak.` already stripped. -/
+def isAllowedLeanOption (key value : String) : Bool :=
+  if key == "warn.sorry" then value == "true"
+  else if key == "debug.skipKernelTC" then value == "false"
+  else
+    ["pp.unicode.fun", "pp.mvars.anonymous", "autoImplicit", "relaxedAutoImplicit", "maxHeartbeats",
+      "maxRecDepth", "maxSynthPendingDepth", "synthInstance.maxHeartbeats", "synthInstance.maxSize",
+      "warningAsError", "exponentiation.threshold"].contains key ||
+    ["linter.", "backward.", "experimental."].any (fun (p : String) => key.startsWith p)
+
+/-- `key` with every leading `weak.` removed (`weak.weak.warn.sorry` ↦ `warn.sorry`). -/
+partial def stripWeakPrefixes (key : String) : String :=
+  if key.startsWith "weak." then stripWeakPrefixes (key.drop 5).toString else key
+
+/-- Apply CLI-style `-Dkey=value` options (Lake `leanOptions` / `moreLeanArgs` / `weakLeanArgs`)
+    onto `opts` after imports are loaded. Every arg must pass the host allowlist
+    (`is_allowed_lean_arg` in `module_builder.rs`), checked on the key with all `weak.` prefixes
+    removed; values are then parsed exactly as `Lean.Language.Lean.setOption` / `reparseOptions`
+    do. Anything else throws, so the request fails instead of silently dropping an option.
+    After parsing, `debug.skipKernelTC := false` and `warn.sorry := true` are forced regardless. -/
 def applyEncodedLeanArgs (baseOpts : Options) (encodedArgs : String) : IO Options := do
-  if encodedArgs.trimAscii.isEmpty then
-    return baseOpts
   let decls ← getOptionDecls
   let mut opts := baseOpts
-  for rawLine in encodedArgs.splitOn "\n" do
-    let arg := rawLine.trimAscii.toString
-    if arg.startsWith "-D" then
-      let kv := (arg.drop 2).toString
-      let eqParts := kv.splitOn "="
-      match eqParts with
-      | [] | [_] => pure ()
-      | rawK :: rest =>
-        let k := rawK.trimAscii.toString
-        let v := String.intercalate "=" rest
-        if !k.isEmpty && !v.isEmpty && !(k == "warn.sorry" && v == "false") then
-          let rawName := k.toName
-          let isWeak := rawName.getRoot == `weak
-          let optName := if isWeak then rawName.replacePrefix `weak Name.anonymous else rawName
-          match decls.find? optName with
-          | some decl =>
-            match decl.defValue with
-            | .ofBool _ =>
-              if v == "true" then opts := opts.set optName true
-              else if v == "false" then opts := opts.set optName false
-            | .ofNat _ =>
-              if let some n := v.toNat? then
-                opts := opts.set optName n
-            | .ofString _ =>
-              opts := opts.set optName v
-            | _ => pure ()
-          | none =>
-            if !isWeak then
-              opts := opts.set optName v
-  return opts
+  for arg in encodedArgs.splitOn "\n" do
+    if arg.isEmpty || arg ∈ ["--json", "-q", "--quiet"] then continue
+    let bad := fun (why : String) => IO.userError s!"invalid Lean option {arg.quote}: {why}"
+    if arg.startsWith "-j" || arg.startsWith "--threads=" || arg.startsWith "--tstack=" then
+      let num := if arg.startsWith "-j" then (arg.drop 2).toString else ((arg.splitOn "=").drop 1).headD ""
+      match num.toNat? with
+      | some n => if n == 0 || n > (if arg.startsWith "--tstack=" then 1048576 else 64) then throw (bad "out of range")
+      | none => throw (bad "not a number")
+      continue
+    let some kv := arg.dropPrefix? "-D" | throw (bad "not allowed")
+    let k := (kv.toString.splitOn "=").headD ""
+    let v := (kv.toString.drop (k.length + 1)).toString
+    if !(kv.toString.contains '=') || k.isEmpty || v.isEmpty || v.any (fun (c : Char) => c.toNat < 32 || c.toNat == 127)
+        || !k.all (fun (c : Char) => c.isAlphanum || c == '.' || c == '_' || c == '-') then
+      throw (bad "malformed")
+    if !isAllowedLeanOption (stripWeakPrefixes k) v then
+      throw (bad "not on the allowlist (module_builder.rs is_allowed_lean_option)")
+    let rawName := k.toName
+    let isWeak := rawName.getRoot == `weak
+    let name := rawName.replacePrefix `weak Name.anonymous
+    match decls.find? name with
+    | none => if !isWeak then throw (bad "unknown configuration option")
+    | some decl =>
+      opts ← match decl.defValue, v with
+        | .ofBool _, "true" => pure (opts.set name true)
+        | .ofBool _, "false" => pure (opts.set name false)
+        | .ofBool _, _ => throw (bad "value must be true/false")
+        | .ofNat _, _ => match v.toNat? with
+          | some n => pure (opts.set name n)
+          | none => throw (bad "value must be a natural number")
+        | .ofString _, _ => pure (opts.set name v)
+        | _, _ => throw (bad "cannot be set in the command line")
+  -- Match the hardening flags forced last by the native module/PR subprocesses.
+  -- The host owns the allowlist; the raw worker protocol cannot disable these gates.
+  return (opts.setBool `debug.skipKernelTC false).setBool (Name.mkStr2 "warn" ("sor" ++ "ry")) true
 
 /-- Error reported (and checked for) when a Lean runtime panic leaves the worker unusable. -/
 def runtimePanicErr : String := "[TurboLean.ZygoteWorker] runtime panic; worker environment is unusable"
@@ -442,13 +472,6 @@ def collectNewDeclUsedConstants (beforeEnv afterEnv : Environment) : Array Strin
         out := out.push cs
   return out
 
-/-- When elaborating a stubbed prefix (`allowStub = true`), neutralize `set_option warningAsError true`
-    to `set_option warningAsError false` (preserving exact line count) so `:= sorry` stubs in prior
-    theorems never trigger a fatal `warningAsError` failure. -/
-def sanitizeStubbedPrefixCode (code : String) : String :=
-  let s1 := String.intercalate "set_option warningAsError false" (code.splitOn "set_option warningAsError true")
-  String.intercalate "warningAsError false" (s1.splitOn "warningAsError true")
-
 /-- Elaborate and kernel-typecheck `code` starting from an immutable `baseState : Command.State`
     without mutating `baseState`.
     Returns `(ok, elapsed_us, heartbeats, proof_term_nodes, error_messages, all_messages, captured_stdout, used_constants, next_clean_state)`. -/
@@ -460,13 +483,10 @@ def runCommandsFromState
     (evalMode : Bool := false) : IO (Bool × Nat × Nat × Nat × List String × List String × String × List String × Command.State) := do
   let t0 ← IO.monoNanosNow
   let hb0 ← IO.getNumHeartbeats
-  let effectiveCode := if allowStub && !evalMode then sanitizeStubbedPrefixCode code else code
-  let inputCtx := Parser.mkInputContext effectiveCode fileName
-  let sanitizedScopes := if allowStub && !evalMode then
-      baseState.scopes.map (fun sc => { sc with opts := sc.opts.setBool `warningAsError false })
-    else
-      baseState.scopes
-  let initState : Command.State := { baseState with messages := {}, scopes := sanitizedScopes }
+  -- `warningAsError` is never rewritten: a stubbed prefix only drops its `sorry` diagnostics (below),
+  -- so the checkpoint keeps the file's and the command line's warning policy for the target.
+  let inputCtx := Parser.mkInputContext code fileName
+  let initState : Command.State := { baseState with messages := {} }
   let (capturedStdout, s) ← IO.FS.withIsolatedStreams (IO.processCommands inputCtx {} initState) (isolateStderr := false)
   let hb1 ← IO.getNumHeartbeats
   let heartbeats := hb1 - hb0
@@ -782,6 +802,12 @@ def runRaceCandidatesSubs (hexSubs : List String)
     let (candOk, candElabUs, candHbs, candNodes, candErrs, candMsgs, candOut, candUsed) ← evalCand candCode
     totalElabUs := totalElabUs + candElabUs
     totalHbs := totalHbs + candHbs
+    -- A runtime panic poisons the whole process: abort the race and fail the request even if an
+    -- earlier candidate already won.
+    if candErrs.contains runtimePanicErr then
+      raceOk := false; winningIdx? := none; lastErrs := candErrs; winMsgs := candMsgs; winOut := candOut
+      winUsed := []; winNodes := 0
+      break
     if candOk then
       let isBetter := !raceOk || (candNodes > 0 && (winNodes == 0 || candNodes < winNodes))
       if isBetter then
@@ -1491,7 +1517,11 @@ def main (args : List String) : IO Unit := do
           let nonce ← IO.monoNanosNow
           pure s!"uncached:{importsCsv}:{nonce}"
       let kgActive := !evalMode
-      if prefixKey.isEmpty || hexPrefix.isEmpty then
+      -- Reject disallowed or malformed `-D` options before any elaboration (`lean` exits 1 on them).
+      if let .error e ← (TurboLean.ZygoteWorker.applyEncodedLeanArgs {} encodedLeanArgs).toBaseIO then
+        let optErr := s!"{customFileName?.getD "<zygote-shard>"}:1:0: error: {e}"
+        TurboLean.ZygoteWorker.emitZygoteReply stdout false none kgActive true envCacheHit false importUs 0 0 0 0 0 "" [optErr] [optErr] []
+      else if prefixKey.isEmpty || hexPrefix.isEmpty then
         let fn := customFileName?.getD "<zygote-shard>"
         let prefixCode := if hexPrefix.isEmpty then "" else TurboLean.ZygoteWorker.decodeHexToString hexPrefix
         let combineWithPref := fun (subCode : String) =>
@@ -1570,9 +1600,12 @@ def main (args : List String) : IO Unit := do
                 let deltaCode := padding ++ (prefixCode.drop (String.length prevCode)).toString
                 let (dOk, dUs, dHbs, _dNodes, dErrs, dMsgs, dOut, _dUsed, dNextSt) ←
                   TurboLean.ZygoteWorker.runCommandsFromState prevState deltaCode fnPref prefAllowStub evalMode
-                if dErrs.contains TurboLean.ZygoteWorker.runtimePanicErr then poisoned := true
                 if dOk then
                   pure (some (false, dUs, some dNextSt, ([] : List String), prevMsgs ++ dMsgs, prevOut ++ dOut, prevHbs + dHbs, some prefixCode))
+                else if dErrs.contains TurboLean.ZygoteWorker.runtimePanicErr then
+                  -- Never retry a panicked delta from scratch: the retry may not panic again.
+                  poisoned := true
+                  pure (some (false, dUs, none, dErrs, prevMsgs ++ dMsgs, prevOut ++ dOut, prevHbs + dHbs, some prefixCode))
                 else pure none
               | none => pure none
             match deltaRes? with
@@ -1595,8 +1628,13 @@ def main (args : List String) : IO Unit := do
               if pErrs.contains TurboLean.ZygoteWorker.runtimePanicErr then poisoned := true
               if pOk then pure (false, pUs, some nextSt, [], pMsgs, pOut, pHbs, some prefixCode)
               else pure (false, pUs, none, pErrs, pMsgs, pOut, pHbs, some prefixCode)
-        match ckptState? with
-        | some ckptState =>
+        -- `poisoned` was false on entry, so here it means the prefix/delta panicked (`ckptState? = none`).
+        -- That ends the request: no combined retry (a retry need not panic again), no checkpoint, no
+        -- artifact, and never a success reply.
+        match ckptState?, poisoned with
+        | _, true =>
+          TurboLean.ZygoteWorker.emitZygoteReply stdout false (if isRaceCandidates then some "null" else none) kgActive true envCacheHit false importUs prefixUs 0 prefHbs 0 0 prefOut prefMsgs prefErrs []
+        | some ckptState, false =>
           if !prefixCacheHit then
             if stateCache.size >= maxCheckpoints then
               match stateCacheOrder[0]? with
@@ -1672,7 +1710,7 @@ def main (args : List String) : IO Unit := do
             let finalHbs := if evalMode then prefHbs + dHbs else dHbs
             if !finalOk && finalErrs.contains TurboLean.ZygoteWorker.runtimePanicErr then poisoned := true
             TurboLean.ZygoteWorker.emitZygoteReply stdout finalOk none kgActive true envCacheHit prefixCacheHit importUs prefixUs elabUs finalHbs ptNodes (if finalOk then 1 else 0) finalOut finalMsgs finalErrs usedConsts
-        | none =>
+        | none, false =>
           -- Fallback: if prefix failed on its own (e.g. split mid-command or error in prefix), elaborate combined prefix + body from baseEnv
           let prefixCode := decodedPrefix?.getD (TurboLean.ZygoteWorker.decodeHexToString hexPrefix)
           let fn := customFileName?.getD "<zygote-shard>"
@@ -1710,6 +1748,7 @@ def main (args : List String) : IO Unit := do
         | some fn => if evalMode && !rawErr.startsWith fn then s!"{fn}:1:0: error: {rawErr}\n" else rawErr
         | none => rawErr
       TurboLean.ZygoteWorker.emitZygoteReply stdout false none false false false false importUs 0 0 0 0 0 "" [formattedErr] [formattedErr] []
-    if boundImports?.isNone && !importsCsv.isEmpty then
+    -- Bind even an empty `importsCsv` (implicit `Init`): its environment extensions are live too.
+    if boundImports?.isNone then
       boundImports? := some importsCsv
     try IO.Process.setCurrentDir initCwd catch _ => pure ()
