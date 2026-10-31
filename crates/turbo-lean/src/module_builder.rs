@@ -1740,7 +1740,7 @@ fn classify_lake_field(scope: LakeScope, key: &str, val: &str) -> LakeField {
         (_, "platformIndependent") => only_if(matches!(v, "true" | "some true")),
         (_, "precompileImports") => only_if(v == "false"),
         (_, "dynlibs" | "plugins") => only_if(empty_array),
-        (Package | Lib | Exe, "extraDepTargets") => only_if(empty_array),
+        (_, "extraDepTargets") => only_if(empty_array),
         (Lib | Exe, "needs") => only_if(empty_array),
         (
             Package,
