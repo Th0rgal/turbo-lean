@@ -4003,6 +4003,8 @@ but is expected to have type
             let _ = fs::remove_dir_all(&tmp_dir);
             return;
         }
+        // Worker compilation is fixture setup, before any request deadline starts.
+        crate::zygote::ensure_zygote_binary(&store, &lean_bin, &env_vars).unwrap();
 
         let prefix_src = "namespace OutOfCoreFission\ndef doubleNat (n : Nat) : Nat := n + n\n";
         let step0 = (
@@ -4068,12 +4070,14 @@ but is expected to have type
         let toolchain = "leanprover/lean4:v4.35.0";
         fs::write(proj_dir.join("lean-toolchain"), format!("{}\n", toolchain)).unwrap();
         let mut store = TurboStore::open(Some(&store_dir)).unwrap();
-        let (_env_vars, lean_bin) =
+        let (env_vars, lean_bin) =
             crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
         if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
             let _ = fs::remove_dir_all(&tmp_dir);
             return;
         }
+        // Worker compilation is fixture setup, before any request deadline starts.
+        crate::zygote::ensure_zygote_binary(&store, &lean_bin, &env_vars).unwrap();
 
         let lean_file = proj_dir.join("FissionLoopTest.lean");
         let canon_proj = proj_dir.canonicalize().unwrap_or_else(|_| proj_dir.clone());
@@ -4173,6 +4177,8 @@ but is expected to have type
             let _ = fs::remove_dir_all(&tmp_dir);
             return;
         }
+        // Worker compilation is fixture setup, before any request deadline starts.
+        crate::zygote::ensure_zygote_binary(&store, &lean_bin, &env_vars).unwrap();
 
         let prefix_src = "def incNat (n : Nat) : Nat := n + 1\n";
         let thm_decl = "theorem batch_cut_thm (a b : Nat) : incNat a + incNat b = a + b + 2 := by\n  have h1 : incNat a = a + 1 := by\n    rfl\n  have h2 : incNat b = b + 1 := by\n    rfl\n  omega\n";
@@ -4230,6 +4236,8 @@ but is expected to have type
             let _ = fs::remove_dir_all(&tmp_dir);
             return;
         }
+        // Worker compilation is fixture setup, before any request deadline starts.
+        crate::zygote::ensure_zygote_binary(&store, &lean_bin, &env_vars).unwrap();
 
         let candidates: Vec<String> = [
             "theorem race_thm (a b : Nat) : a + b = b + a := rfl\n",
