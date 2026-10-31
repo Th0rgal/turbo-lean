@@ -1,82 +1,13 @@
+import B2.Core
 import FV.Clif.Run
 import FV.Compile.Subset
-import LeanNative.Semantics.Eval
 
-/-!
-# DRAFT — B2 specification, LNIR → CLIF half (statements only)
-
-**DRAFT / CONJECTURE stage.** Every `theorem` here ends in `:= by sorry`. Nothing in this file is
-a result. It records the *shape* of the B2 obligations against the *real* semantics:
-LNIR = `LeanNative.Semantics.evalCode` (turbo-lean 4966384, vendored verbatim),
-CLIF = `Clif.runLoop` (eth-act/clifv 5018b950). No semantics are defined here.
-
-The lowering `lowerDecl` does not exist yet (there is no CLIF emitter in turbo-lean); it is a
-section `variable`, so every statement is about whatever lowering is eventually written.
--/
+/-! Historical DRAFT statements only. Superseded by research/B2-spec.md and
+B2.Lowering; excluded from the active proof package root. -/
 
 namespace B2
 
 open LeanNative.IR LeanNative.Semantics
-
-/-! ## Fragment F₆₄ (syntactic, decidable) -/
-
-/-- Binary operators admitted in F₆₄. `div`/`mod` are admitted only under `DivGuarded`
-(LNIR returns 0 on `x/0` and `x%0`; CLIF `udiv`/`urem` trap `int_divz`). The `*Checked256`,
-`clmul*`, `gf2Affine`, `eor3` operators are out of scope. -/
-def binOpF : BinOp → Bool
-  | .add | .sub | .mul | .div | .mod | .bitAnd | .bitOr | .bitXor
-  | .shl | .shr | .sar | .eq | .lt | .le => true
-  | _ => false
-
-def unOpF : UnaryOp → Bool
-  | .not | .neg => true
-  | .clz256 => false
-
-def scalarF : ScalarExpr → Bool
-  | .constU64 _ | .constBool _ | .var _ => true
-  | .binOp op a b => binOpF op && scalarF a && scalarF b
-  | .unaryOp op a => unOpF op && scalarF a
-  | .select c t e => scalarF c && scalarF t && scalarF e
-  | .fma a b c => scalarF a && scalarF b && scalarF c
-
-def tyF : LNIRType → Bool
-  | .i1 | .i64 => true
-  | _ => false
-
-/-- F₆₄ code: `letBind` of scalar expressions at `i1`/`i64`, `ite`, `seqFor`, `ret`. No heap,
-no RC, no `parFor`, no calls, no 256-bit. -/
-def codeF : LNIRCode → Bool
-  | .letBind _ ty (.scalar e) k => tyF ty && scalarF e && codeF k
-  | .ite _ t e => codeF t && codeF e
-  | .seqFor _ _ _ _ _ ty body k => tyF ty && codeF body && codeF k
-  | .ret _ => true
-  | _ => false
-
-def declF (d : LNIRDecl) : Bool :=
-  d.params.all (fun p => tyF p.ty) && tyF d.retTy && codeF d.body
-
-/-! ## Value correspondence (no new semantics: both sides are the repos' own `Val`s) -/
-
-/-- LNIR `u64` ↔ CLIF `i64`, LNIR `bool` ↔ CLIF `i8` 0/1 (CLIF `icmp` result). -/
-def ValRel : Val → Clif.Val → Prop
-  | .u64 n, v => v = ⟨.i64, n.toBitVec⟩
-  | .bool b, v => v = ⟨.i8, if b then 1#8 else 0#8⟩
-  | _, _ => False
-
-/-- Pointwise `ValRel` on argument lists (core has no `List.Forall₂`). -/
-def ArgsRel (vs : List Val) (cvs : List Clif.Val) : Prop :=
-  vs.length = cvs.length ∧ ∀ (i : Nat) v cv, vs[i]? = some v → cvs[i]? = some cv → ValRel v cv
-
-def clifTy : LNIRType → Clif.Ty
-  | .i1 => .i8
-  | _ => .i64
-
-/-- The LNIR entry state of `d` on argument values `vs`. -/
-def entryEnv (d : LNIRDecl) (vs : List Val) : VarEnv :=
-  (d.params.zip vs).foldl (fun env (p, v) => env.bind p.id v) VarEnv.empty
-
-/-- Empty LNIR heap (F₆₄ never touches it). -/
-def emptyHeap : HeapState := ⟨[], 0, [], []⟩
 
 /-! ## Obligations on the (future) lowering -/
 

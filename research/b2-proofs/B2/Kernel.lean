@@ -1,4 +1,4 @@
-import B2.SpecCore
+import B2.Core
 import LeanNative.IR.Codec
 
 /-! Q4 probe: the smallest UInt64 benchmark kernel, `collatz_steps`, against the F₆₄ spec. -/

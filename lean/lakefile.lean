@@ -9,6 +9,9 @@ package «turbo-lean-proofs» where
 require «lean-sys» from git
   "https://github.com/Th0rgal/lean-sys.git" @ "077775ba387f1eeb2976cb8763b4633b8d5ce313"
 
+require fv from git
+  "https://github.com/eth-act/clifv.git" @ "5018b9509dc124154dbe08a5bd85862595d8eab7"
+
 @[default_target]
 lean_lib «TurboLean» where
   globs := #[.submodules `TurboLean]

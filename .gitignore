@@ -11,4 +11,5 @@
 .DS_Store
 
 .lean-native/
+/research/clifv/
 __pycache__/

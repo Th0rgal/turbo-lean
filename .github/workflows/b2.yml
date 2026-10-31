@@ -1,0 +1,40 @@
+name: B2 source identity and kernel proofs
+on:
+  push:
+    branches: [research/b12-feasibility]
+  pull_request:
+    paths: ['lean/LeanNative/**', 'research/b2-proofs/**', 'scripts/check_b2_source_identity.py', '.github/workflows/b2.yml']
+permissions:
+  contents: read
+env:
+  TURBO_LEAN_TELEMETRY: 'off'
+  LEAN_NUM_THREADS: '4'
+jobs:
+  proofs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: eth-act/clifv
+          ref: 5018b9509dc124154dbe08a5bd85862595d8eab7
+          path: research/clifv
+          persist-credentials: false
+      - run: python3 scripts/check_b2_source_identity.py
+      - name: Install Lean toolchains
+        run: |
+          curl --retry 5 --retry-all-errors -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          "$HOME/.elan/bin/elan" toolchain install leanprover/lean4:v4.34.1
+          "$HOME/.elan/bin/elan" toolchain install leanprover/lean4:v4.35.0
+      - name: Kernel-check active B2 results
+        working-directory: research/b2-proofs
+        run: |
+          lake build
+          lake env lean B2/Lowering.lean
+          lake env lean B2/Division.lean
+      - name: Check compiler integration on compiler toolchain
+        working-directory: lean
+        run: lake build +LeanNative.Driver.CoreCLI
