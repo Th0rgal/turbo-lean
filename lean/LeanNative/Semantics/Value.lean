@@ -75,6 +75,8 @@ inductive UBError where
   | arithmeticOverflow : String → UBError
   | useAfterFree       : Nat → UBError
   | unsupportedCall    : String → UBError
+  /-- Fuel-bounded recursive release ran out of fuel (HEAPOBJ_CONTRACT C5.1): never a partial `.ok`. -/
+  | fuelExhausted      : UBError
   deriving Repr, DecidableEq, Inhabited, BEq
 
 /-- SSA/ANF variable environment mapping `VarId` to optional runtime values. -/
@@ -160,11 +162,13 @@ theorem lookupSlot_writeSlot_ne (m : StorageMapBuffer) (slot1 slot2 val : UInt25
 
 end StorageMapBuffer
 
-/-- Model of a heap-allocated constructor object (`lean_ctor_object`) in Stage 1D. -/
+/-- Model of a heap-allocated constructor object (`lean_ctor_object`, HEAPOBJ_CONTRACT C1): object slots
+    `objFields` (owning edges or non-owning immediates) and scalar slots `scalarFields` are separate index spaces. -/
 structure HeapObj where
-  id     : Nat
-  tag    : Nat
-  fields : List Val
+  id           : Nat
+  tag          : Nat
+  objFields    : List Val
+  scalarFields : List Val
   deriving Repr, Inhabited, BEq
 
 namespace HeapObj
@@ -208,6 +212,17 @@ end HeapObj
 
 instance : DecidableEq Val := HeapObj.decEqVal
 deriving instance DecidableEq for HeapObj
+
+/-- `true` iff `v` is or contains (at any tuple depth) an owning edge (`.objPtr` / `.sarrayId`). -/
+def Val.owns : Val → Bool
+  | .objPtr _ | .sarrayId _ => true
+  | .tuple vs => vs.attach.any fun ⟨v, _⟩ => v.owns
+  | _ => false
+
+/-- HEAPOBJ_CONTRACT C5.2 well-formedness of a field value: no tuple that owns an edge. -/
+def Val.wfField : Val → Bool
+  | .tuple vs => !(Val.tuple vs).owns
+  | _ => true
 
 /-- Abstract heap state tracking contiguous scalar array buffers, EVM storage maps, heap objects, allocation IDs, and reference counts.
     `refCounts` stores `(isObj, id, rc)` where `isObj = false` tracks `.sarrayId` buffers with `rc ≥ 3`
@@ -307,30 +322,53 @@ def allocObj (st : HeapState) (objId : Nat) : HeapState :=
 def findHeapObj (st : HeapState) (objId : Nat) : Option HeapObj :=
   st.heapObjs.find? (fun o => o.id == objId)
 
-/-- Allocate a fresh heap constructor object with tag `tag`, fields `fields`, and initial `rc = 1`. -/
-def allocHeapCtor (st : HeapState) (tag : Nat) (fields : List Val) : Nat × HeapState :=
+/-- Allocate a fresh heap constructor object (`rc = 1`) with separate object and scalar slots (C1.1). -/
+def allocHeapCtor (st : HeapState) (tag : Nat) (objFields scalarFields : List Val) : Nat × HeapState :=
   let objId := st.nextId + 1
   let refs' := st.refCounts.filter (fun (isObj, id, _) => !isObj || id != objId)
   let objs' := st.heapObjs.filter (fun o => o.id != objId)
   (objId, { st with
     nextId := objId
     refCounts := (true, objId, 1) :: refs'
-    heapObjs := { id := objId, tag := tag, fields := fields } :: objs' })
+    heapObjs := { id := objId, tag, objFields, scalarFields } :: objs' })
 
-/-- Overwrite field `idx` in-place on an exclusive (`rc == 1`) heap constructor object (`Code.oset`). -/
-def writeHeapObjFieldExclusive (st : HeapState) (objId idx : Nat) (val : Val) : Except UBError HeapState :=
-  let rc := st.getObjRefCount objId
-  if rc == 0 then .error (.useAfterFree objId)
-  else if rc != 1 then .error (.nonExclusiveWrite objId)
+/-- A live heap constructor object (`rc ≠ 0`), else `.useAfterFree` (C1.1 / C4.1). -/
+def liveHeapObj (st : HeapState) (objId : Nat) : Except UBError HeapObj :=
+  if st.getObjRefCount objId == 0 then .error (.useAfterFree objId)
   else match st.findHeapObj objId with
+    | some obj => .ok obj
     | none => .error (.useAfterFree objId)
-    | some obj =>
-      if idx < obj.fields.length then
-        .ok { st with
-          heapObjs := st.heapObjs.map (fun o =>
-            if o.id == objId then { o with fields := o.fields.set idx val } else o) }
-      else
-        .error (.outOfBounds idx obj.fields.length)
+
+/-- In-place mutation of a live, exclusive (`rc == 1`) heap object (C4.2): `useAfterFree` if freed,
+    `nonExclusiveWrite` if shared, otherwise `f obj` computes the new object (or its own error). -/
+def mutateHeapObjExclusive (st : HeapState) (objId : Nat) (f : HeapObj → Except UBError HeapObj) :
+    Except UBError HeapState := do
+  let obj ← st.liveHeapObj objId
+  if st.getObjRefCount objId != 1 then throw (.nonExclusiveWrite objId)
+  let obj' ← f obj
+  pure { st with heapObjs := st.heapObjs.map fun o => if o.id == objId then obj' else o }
+
+/-- Overwrite slot `idx` of an exclusive heap object: an object slot (`Code.oset`, `isObj = true`, value must be
+    well-formed per C5.2) or a scalar slot (`Code.uset`/`Code.sset`, `isObj = false`). -/
+def writeHeapObjFieldExclusive (st : HeapState) (objId idx : Nat) (val : Val) (isObj : Bool := true) :
+    Except UBError HeapState :=
+  st.mutateHeapObjExclusive objId fun o =>
+    let fs := if isObj then o.objFields else o.scalarFields
+    if isObj && !val.wfField then .error (.typeError "ctor_set: field value is a tuple owning an edge")
+    else if idx < fs.length then
+      .ok (if isObj then { o with objFields := fs.set idx val } else { o with scalarFields := fs.set idx val })
+    else .error (.outOfBounds idx fs.length)
+
+/-- `Code.setTag` / `lean_ctor_set_tag` on an exclusive heap object (C4.2). -/
+def setHeapObjTagExclusive (st : HeapState) (objId tag : Nat) : Except UBError HeapState :=
+  st.mutateHeapObjExclusive objId fun o => .ok { o with tag }
+
+/-- `Code.del` / `lean_del_object`: free the shell of an exclusive object **without** releasing its fields (C4.2). -/
+def delObjShell (st : HeapState) (objId : Nat) : Except UBError HeapState := do
+  let _ ← st.mutateHeapObjExclusive objId .ok
+  pure { st with
+    refCounts := st.refCounts.filter (fun (isObj, id, _) => !isObj || id != objId)
+    heapObjs := st.heapObjs.filter (fun o => o.id != objId) }
 
 /-- Increment the reference count of `.objPtr objId` by `count`, failing with `useAfterFree` if unknown or freed (`rc = 0`). -/
 def incRefObj (st : HeapState) (objId count : Nat) : Except UBError HeapState :=
@@ -342,38 +380,52 @@ def incRefObj (st : HeapState) (objId count : Nat) : Except UBError HeapState :=
     let refs' := st.refCounts.filter (fun (isObj, id, _) => !isObj || id != objId)
     .ok { st with refCounts := (true, objId, rc') :: refs' }
 
-/-- Fuel-bounded recursive decrement of `.objPtr objId` and its child references when `rc' == 0`. -/
-def decRefObjFuel : Nat → HeapState → Nat → Nat → Except UBError HeapState
-  | 0, st, _, _ => .ok st
-  | fuel + 1, st, objId, count =>
-    let rc := st.getObjRefCount objId
-    if rc == 0 || count > rc then .error (.useAfterFree objId)
-    else if count == 0 then .ok st
-    else
-      let rc' := rc - count
-      let refs' := st.refCounts.filter (fun (isObj, id, _) => !isObj || id != objId)
-      if rc' == 0 then
-        let children : List Val :=
-          match st.findHeapObj objId with
-          | some obj => obj.fields
-          | none => []
-        let st1 : HeapState := { st with
-          refCounts := refs'
-          heapObjs := st.heapObjs.filter (fun o => o.id != objId) }
-        children.foldl (fun acc v =>
-          match acc with
-          | .error err => .error err
-          | .ok cur =>
-            match v with
-            | .objPtr childId => decRefObjFuel fuel cur childId 1
-            | .sarrayId bufId => cur.decRefBuf bufId 1
-            | _ => .ok cur) (.ok st1)
-      else
-        .ok { st with refCounts := (true, objId, rc') :: refs' }
+/-- Set the reference count of live `.objPtr objId` to `rc` (`rc = 0` frees the object and its shell). -/
+def setObjRc (st : HeapState) (objId rc : Nat) : HeapState :=
+  let refs' := st.refCounts.filter (fun (isObj, id, _) => !isObj || id != objId)
+  if rc == 0 then { st with refCounts := refs', heapObjs := st.heapObjs.filter (fun o => o.id != objId) }
+  else { st with refCounts := (true, objId, rc) :: refs' }
 
-/-- Decrement the reference count of `.objPtr objId` by `count`, freeing the object and dropping children when `rc' = 0`. -/
+/-- Worklist release of owning edges (HEAPOBJ_CONTRACT C5): one fuel unit per popped entry plus one per object
+    freed. Total-or-error for **every** fuel: the result is the complete release or an explicit `.error`
+    (`fuelExhausted`, `useAfterFree`, or `typeError` for a nested owning tuple, C5.2), never a partial `.ok`. -/
+def decRefValsFuel : Nat → HeapState → List Val → Except UBError HeapState
+  | _, st, [] => .ok st
+  | 0, _, _ :: _ => .error .fuelExhausted
+  | fuel + 1, st, v :: rest =>
+    match v with
+    | .objPtr o =>
+      let rc := st.getObjRefCount o
+      if rc == 0 then .error (.useAfterFree o)
+      else if rc == 1 then
+        match fuel with
+        | 0 => .error .fuelExhausted
+        | f + 1 => decRefValsFuel f (st.setObjRc o 0) (((st.findHeapObj o).map (·.objFields)).getD [] ++ rest)
+      else decRefValsFuel fuel (st.setObjRc o (rc - 1)) rest
+    | .sarrayId b => (st.decRefBuf b 1).bind (decRefValsFuel fuel · rest)
+    | .tuple vs =>
+      if (Val.tuple vs).owns then .error (.typeError "release: nested tuple ownership")
+      else decRefValsFuel fuel st rest
+    | _ => decRefValsFuel fuel st rest
+
+/-- Decrement `.objPtr objId` by `count`; reaching `0` releases its owning edges recursively via
+    `decRefValsFuel` (total-or-error for any `fuel`). -/
+def decRefObjFuel (fuel : Nat) (st : HeapState) (objId count : Nat) : Except UBError HeapState :=
+  let rc := st.getObjRefCount objId
+  if rc == 0 || count > rc then .error (.useAfterFree objId)
+  else if count == 0 then .ok st
+  else if count < rc then .ok (st.setObjRc objId (rc - count))
+  else decRefValsFuel fuel (st.setObjRc objId 1) [.objPtr objId]
+
+/-- Fuel bound `B(heap)` of C5.3 (over-approximated: every live object, `HeapObj` shells and rc-only objects,
+    costs one unit, plus every `objFields` entry). Complete release of any acyclic well-formed heap fits in it. -/
+def releaseFuelBound (st : HeapState) : Nat :=
+  1 + st.refCounts.length + st.heapObjs.length + (st.heapObjs.map (·.objFields.length)).sum
+
+/-- Decrement the reference count of `.objPtr objId` by `count`, freeing the object and releasing its owning
+    edges recursively when it reaches `0` (C3.2 / C5). -/
 def decRefObj (st : HeapState) (objId count : Nat) : Except UBError HeapState :=
-  decRefObjFuel (st.heapObjs.length + 1) st objId count
+  decRefObjFuel st.releaseFuelBound st objId count
 
 /-- Evaluate an `incRef` instruction on variable `objVar` in `env`. -/
 def evalIncRef (st : HeapState) (env : VarEnv) (objVar : VarId) (count : Nat) : Except UBError HeapState :=
@@ -400,7 +452,7 @@ theorem incRefObj_decRefObj_cancel (bufs : List ArrayBuffer) (nid objId count : 
   cases count with
   | zero => simp [incRefObj, decRefObj, decRefObjFuel, getObjRefCount]
   | succ c =>
-    simp [incRefObj, decRefObj, decRefObjFuel, getObjRefCount, Nat.add_sub_cancel 1 (c + 1)]
+    simp [incRefObj, decRefObj, decRefObjFuel, getObjRefCount, setObjRc, Nat.add_sub_cancel 1 (c + 1)]
 
 @[simp]
 theorem decRefBuf_one_frees_buffer (bufId nextId : Nat) (data : Array UInt64) :

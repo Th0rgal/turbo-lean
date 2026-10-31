@@ -2760,7 +2760,7 @@ def mkSampleParamVal (seed : UInt64) (paramIdx : Nat) (ty : LNIRType) (st : Heap
       let mkLeaf (s : HeapState) (salt : UInt64) (sharedLeaf : Bool) : Val × HeapState :=
         let leafFields := (List.range 8).map fun k =>
           Val.u64 (((splitMix64Next (r + salt + (k.toUInt64 * 7))).1 % 16) + 1)
-        let (cid, s1) := s.allocHeapCtor 0 leafFields
+        let (cid, s1) := s.allocHeapCtor 0 [] leafFields
         if sharedLeaf then
           match s1.incRefObj cid 1 with
           | .ok s2 => (.objPtr cid, s2)
@@ -2787,7 +2787,7 @@ def mkSampleParamVal (seed : UInt64) (paramIdx : Nat) (ty : LNIRType) (st : Heap
           (List.range 8).foldl (fun (acc, curSt) idx =>
             let (cVal, nextSt) := mkLeaf curSt (101 + idx.toUInt64 * 97) sharedKids
             (acc ++ [cVal], nextSt)) ([], st)
-      let (oid, st3) := stAfterKids.allocHeapCtor 0 kids
+      let (oid, st3) := stAfterKids.allocHeapCtor 0 kids []
       if sharedRoot then
         match st3.incRefObj oid 1 with
         | .ok st4 => (.objPtr oid, st4)
@@ -2826,8 +2826,11 @@ def checkDeclConcreteRefinement (src tgt : LNIRDecl) (numSamples : Nat := 64) (f
   let effFuel := Nat.max fuel 256
   let samples := (List.range numSamples).map (buildDeclSample src)
   let (passedCount, nonVacuousCount) := samples.foldl (fun (acc, okSrc) (env, st) =>
-    let srcOk := match evalCode effFuel env st src.body with | .ok _ => true | .error _ => false
-    let stepOk := checkSingleSample effFuel env st src.body tgt.body
+    let srcRes := evalCode effFuel env st src.body
+    let srcOk := match srcRes with | .ok _ => true | .error _ => false
+    -- C6.3: evaluator fuel / RC-release exhaustion on the source is an incomplete analysis, never "source UB"
+    let srcExhausted := match srcRes with | .error .fuelExhausted => true | _ => false
+    let stepOk := !srcExhausted && checkSingleSample effFuel env st src.body tgt.body
     (if stepOk then acc + 1 else acc, if srcOk && stepOk then okSrc + 1 else okSrc)) (0, 0)
   (passedCount == numSamples && (numSamples == 0 || nonVacuousCount > 0), nonVacuousCount)
 
