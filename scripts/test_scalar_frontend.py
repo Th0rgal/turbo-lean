@@ -1628,7 +1628,7 @@ open LeanNative.IR LeanNative.Proofs
               (.letBind 5 .i64 (.scalar (.constU64 0))
                 (.letBind 6 .i64 (.scalar (.constU64 2))
                   (.letBind 7 .unit (.call "lean_native_ctor_set" [0, 5, 6] .unit false)
-                    (.letBind 8 .i64 (.ctorGetScalar 0 0 .i64)
+                    (.letBind 8 .i64 (.ctorGetObj 0 0)
                       (.letBind 9 .i64 (.scalar (.constU64 3))
                         (.letBind 10 .i1 (.isExclusive 1)
                           (.ite 10
@@ -1638,7 +1638,7 @@ open LeanNative.IR LeanNative.Proofs
                                   (if rereadAfterWrite then
                                      .letBind 13 .i1 (.scalar (.binOp .eq (.var 2) (.constU64 999)))
                                        (.ite 13
-                                         (.letBind 14 .i64 (.ctorGetScalar 0 0 .i64) (.ret 14))
+                                         (.letBind 14 .i64 (.ctorGetObj 0 0) (.ret 14))
                                          (.ret 8))
                                    else
                                      .ret 8)
@@ -1880,7 +1880,7 @@ open LeanNative.IR LeanNative.Proofs
                       (.letBind 7 .i64 (.ctorGetScalar 0 0 .i64)
                         (.letBind 8 .i64 (.scalar (.constU64 0))
                           (.letBind 9 .i64 (.scalar (.binOp .add (.var 7) (.constU64 1)))
-                            (.letBind 10 .unit (.call "lean_native_ctor_set" [0, 8, 9] .unit false)
+                            (.letBind 10 .unit (.call "lean_native_ctor_set_scalar" [0, 8, 9] .unit false)
                               (.letBind 11 .objPtr (.ctorGetObj 5 0)
                                 (.letBind 12 .i64 (.ctorGetScalar 11 0 .i64)
                                   (.incRef 0 1

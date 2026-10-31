@@ -309,7 +309,11 @@ def isSupportedStage1DHeapAdtExpr (env : Lean.Environment) (arch : TargetArch) (
               match k, t with
               | 0, _ => true
               | k + 1, .forallE _ dom body _ =>
-                !dom.hasLooseBVars && isStage1DHeapObjectFieldExpr env arch dom && checkCtorFields k body
+                !dom.hasLooseBVars && checkCtorFields k body &&
+                  (isStage1DHeapObjectFieldExpr env arch dom ||
+                   -- C1.2: direct `UIntN`/`USize` fields live in `scalarFields` (`getCtorLayout` usize/scalar slots)
+                   (isStage1DHeapFieldExpr env arch dom &&
+                    [LNIRType.i8, .i16, .i32, .i64, .usize].contains (lowerImpureType dom (some env))))
               | _, _ => false
             let hasPayload := ival.ctors.any fun cName =>
               match env.find? cName with
@@ -358,6 +362,36 @@ def validateSupportedTypeM (ctx : String) (rawTy : Lean.Expr) (ty : LNIRType) (a
     Lean.throwError s!"[lean-native] Unsupported USize in {ctx} on target `{reprStr arch}`"
   if !(isSupportedStage1BScalarOrTuple ty arch || (allowInternalObj && (ty == .objPtr || ty == .taggedPtr))) then
     Lean.throwError s!"[lean-native] Unsupported non-scalar {ctx} type `{rawTy}` (lowered as `{reprStr ty}`)"
+
+/-- HEAPOBJ_CONTRACT C1.2 constructor layout (ported from #277's `RcCtorLayoutSpec`), read from
+    `Lean.Compiler.LCNF.getCtorLayout`, never guessed from `numFields`. `scalarSlots` is the `scalarFields`
+    order: the `usize` slots first (`none`), then the scalar fields sorted by ascending byte offset `off_i`. -/
+structure RcCtorLayoutSpec where
+  ctorName    : Lean.Name := .anonymous
+  cidx        : Nat := 0
+  objSlots    : Nat := 0
+  usizeSlots  : Nat := 0
+  scalarSlots : List (Option Nat × LNIRType) := []
+  deriving Inhabited, BEq
+
+def getRcCtorLayoutSpecM (ctorName : Lean.Name) : Lean.CoreM RcCtorLayoutSpec := do
+  let env ← getEnv
+  let lay ← Lean.Compiler.LCNF.getCtorLayout ctorName
+  let scalars := lay.fieldInfo.filterMap fun
+    | .scalar _ off irTy => some (off, lowerImpureType irTy (some env))
+    | _ => none
+  return { ctorName, cidx := lay.ctorInfo.cidx, objSlots := lay.ctorInfo.size, usizeSlots := lay.ctorInfo.usize
+           scalarSlots := (List.replicate lay.ctorInfo.usize (none, .usize)) ++
+             (scalars.qsort (·.1 < ·.1)).toList.map fun (off, ty) => (some off, ty) }
+
+/-- `uproj i` / `uset i`: `usize` slot `i - objSlots` (C1.2: `lean_ctor_get_usize(o, n + k)`). -/
+def RcCtorLayoutSpec.usizeSlot? (spec : RcCtorLayoutSpec) (i : Nat) : Option (Nat × LNIRType) :=
+  if spec.objSlots ≤ i && i - spec.objSlots < spec.usizeSlots then some (i - spec.objSlots, .usize) else none
+
+/-- `sproj n off` / `sset n off`: the scalar slot at byte offset `off` (C1.2: requires `n = objSlots + usizeSlots`). -/
+def RcCtorLayoutSpec.scalarSlot? (spec : RcCtorLayoutSpec) (n off : Nat) : Option (Nat × LNIRType) :=
+  if n != spec.objSlots + spec.usizeSlots then none
+  else (spec.scalarSlots.zipIdx.find? (·.1.1 == some off)).map fun ((_, ty), i) => (i, ty)
 
 def checkEnvConstSignatureM (env : Lean.Environment) (declName : Lean.Name) (arch : TargetArch)
     (isExported : Bool) : Lean.CoreM Unit := do
@@ -415,6 +449,10 @@ structure BridgeState where
   arch             : TargetArch := .x86_64
   allowStage1DHeap : Bool := false
   inJoinPointBody  : Bool := false
+  /-- C1.2: constructor known for a heap var (fresh `allocCtor` or enclosing `cases` alt). -/
+  activeCtor       : Std.HashMap VarId Lean.Name := {}
+  /-- C1.2: statically known ctor of `let x := ctor …` binders and reset/reuse join-point params (`collectFVarCtors`). -/
+  fvarCtor         : Std.HashMap Lean.FVarId Lean.Name := {}
   deriving Inhabited
 
 abbrev BridgeM := StateRefT BridgeState Lean.CoreM
@@ -1360,6 +1398,10 @@ def lowerTupleOrEnumCtor (ctorName : Lean.Name) (cidx : Nat) (args : Array (Lean
     match env.find? ctorName with
     | some (.ctorInfo cval) =>
       if cval.numFields ≥ 1 && cval.numFields ≤ 8 then
+        let spec ← getRcCtorLayoutSpecM ctorName
+        if !spec.scalarSlots.isEmpty then
+          -- C1.2: scalar slots are only built by the layout-driven impure lowering (`lowerRcCtorWithScalarsM`)
+          Lean.throwError s!"[lean-native] Unsupported scalar-slot constructor `{ctorName}` outside the impure layout lowering"
         let dropCnt := if args.size > cval.numFields then args.size - cval.numFields else 0
         let fieldArgs := args.toList.drop dropCnt
         let argVars ← fieldArgs.mapM (lowerArg · true)
@@ -1451,6 +1493,7 @@ def isCompilerGeneratedAuxDecl (env : Lean.Environment) (name : Lean.Name) : Boo
 
 private def isBuiltinLNIRRuntimeCall (fn : String) : Bool :=
   fn == "lean_native_ctor_tag" || fn == "lean_native_ctor_set" ||
+  fn == "lean_native_ctor_set_scalar" || fn == "lean_native_ctor_set_tag" || fn == "lean_native_del_obj" ||
   fn == "lean_native_box_u64" || fn == "lean_native_unbox_u64" ||
   fn == "lean_native_ensure_exclusive" || fn == "lean_native_sarray_len"
 
@@ -1492,6 +1535,7 @@ partial def codeHasResidualHeapOrTupleAbiOp : LNIRCode → Bool
     (match val with
       | .allocCtor .. | .ctorGetObj .. | .ctorGetScalar .. | .boxScalar .. | .unboxScalar .. | .isExclusive .. => true
       | .call "lean_native_ctor_set" .. | .call "lean_native_ctor_tag" .. => true
+      | .call "lean_native_ctor_set_scalar" .. | .call "lean_native_ctor_set_tag" .. | .call "lean_native_del_obj" .. => true
       | _ => false) ||
     codeHasResidualHeapOrTupleAbiOp k
   | .incRef .. | .decRef .. => true
@@ -1568,6 +1612,164 @@ def lowerOsetInstr (fvarId : Lean.FVarId) (idx : Nat) (y : Lean.Compiler.LCNF.Ar
     lowerK k
   else
     Lean.throwError "[lean-native] Unsupported heap field mutation in Stage 1B"
+
+/-- One round of the C1.2 ctor pre-pass over impure LCNF. `ctx` holds the fvars whose ctor is known at this
+    point (`let x := ctor`, a `cases` alt's scrutinee, a known join-point param); each `jmp` records, per
+    join-point param, the ctor of every non-erased argument (`none` = unknown). -/
+partial def collectJmpArgCtors (known : Std.HashMap Lean.FVarId Lean.Name) (ctx : Std.HashMap Lean.FVarId Lean.Name)
+    (jpParams : Std.HashMap Lean.FVarId (Array Lean.FVarId))
+    (acc : Std.HashMap Lean.FVarId (List (Option Lean.Name))) :
+    Lean.Compiler.LCNF.Code .impure → Std.HashMap Lean.FVarId (List (Option Lean.Name))
+  | .let decl k =>
+    let ctx' := match decl.value with
+      | .ctor info _ _ => ctx.insert decl.fvarId info.name
+      | _ => ctx
+    collectJmpArgCtors known ctx' jpParams acc k
+  | .jp decl k =>
+    let jpParams' := jpParams.insert decl.fvarId (decl.params.map (·.fvarId))
+    let ctxJp := decl.params.foldl (fun c p => match known[p.fvarId]? with | some n => c.insert p.fvarId n | none => c) ctx
+    let acc' := collectJmpArgCtors known ctxJp jpParams' acc decl.value
+    collectJmpArgCtors known ctx jpParams' acc' k
+  | .jmp fvarId args =>
+    match jpParams[fvarId]? with
+    | some ps =>
+      (ps.toList.zip args.toList).foldl (fun a (p, arg) =>
+        match arg with
+        | .erased => a
+        | .fvar x => a.insert p (ctx[x]? :: a.getD p [])
+        | _ => a.insert p (none :: a.getD p [])) acc
+    | none => acc
+  | .cases c =>
+    c.alts.foldl (fun a alt =>
+      match alt with
+      | .ctorAlt info code _ => collectJmpArgCtors known (ctx.insert c.discr info.name) jpParams a code
+      | _ => collectJmpArgCtors known ctx jpParams a alt.getCode) acc
+  | .setTag x _ k _ => collectJmpArgCtors known (ctx.erase x) jpParams acc k
+  | .fun _ k _ | .inc _ _ _ _ k _ | .dec _ _ _ _ _ k _ | .del _ k _ | .oset _ _ _ k _ | .uset _ _ _ k _
+  | .sset _ _ _ _ _ k _ => collectJmpArgCtors known ctx jpParams acc k
+  | .return _ | .unreach _ => acc
+
+/-- `let x := ctor` binders anywhere in the body (fvars are unique, so this is scope-independent). -/
+partial def collectLetCtors (acc : Std.HashMap Lean.FVarId Lean.Name) : Lean.Compiler.LCNF.Code .impure → Std.HashMap Lean.FVarId Lean.Name
+  | .let decl k =>
+    collectLetCtors (match decl.value with | .ctor info _ _ => acc.insert decl.fvarId info.name | _ => acc) k
+  | .jp decl k => collectLetCtors (collectLetCtors acc decl.value) k
+  | .cases c => c.alts.foldl (fun a alt => collectLetCtors a alt.getCode) acc
+  | .fun _ k _ | .inc _ _ _ _ k _ | .dec _ _ _ _ _ k _ | .del _ k _ | .oset _ _ _ k _ | .uset _ _ _ k _
+  | .sset _ _ _ _ _ k _ | .setTag _ _ k _ => collectLetCtors acc k
+  | .jmp .. | .return _ | .unreach _ => acc
+
+/-- C1.2 ctor pre-pass: a join-point param's ctor is known iff every non-erased `jmp` argument has the same
+    known ctor (fixpoint over nested reset/reuse join points). Anything else stays unknown (fail closed). -/
+def collectFVarCtors (code : Lean.Compiler.LCNF.Code .impure) : Std.HashMap Lean.FVarId Lean.Name := Id.run do
+  let lets := collectLetCtors {} code
+  let mut known : Std.HashMap Lean.FVarId Lean.Name := {}
+  for _ in [0:8] do
+    let obs := collectJmpArgCtors known {} {} {} code
+    let next := obs.fold (fun m p vs =>
+      match vs with
+      | some n :: rest => if rest.all (· == some n) then m.insert p n else m
+      | _ => m) ({} : Std.HashMap Lean.FVarId Lean.Name)
+    if next.size == known.size then break
+    known := next
+  return lets.fold (fun m k v => m.insert k v) known
+
+/-- Run `act` with `v`'s constructor known to be `ctorName` (C1.2 slot resolution inside a `cases` alt). -/
+def withActiveCtor {α} (v : VarId) (ctorName : Lean.Name) (act : BridgeM α) : BridgeM α := do
+  let old := (← get).activeCtor
+  modify fun s => { s with activeCtor := s.activeCtor.insert v ctorName }
+  let r ← act
+  modify fun s => { s with activeCtor := old }
+  return r
+
+/-- C1.2 layout of the heap var `v` (= `fvarId`), from the enclosing `cases` alt / `setTag`, else the
+    `collectFVarCtors` pre-pass (`let x := ctor`, reset/reuse join-point params); fails closed. -/
+def heapCtorLayoutOfM (v : VarId) (fvarId : Lean.FVarId) (what : String) : BridgeM RcCtorLayoutSpec := do
+  let st ← get
+  let vt ← getVarType v
+  if !(st.allowStage1DHeap && (vt == .objPtr || vt == .taggedPtr)) then
+    Lean.throwError s!"[lean-native] Unsupported {what} on `{reprStr vt}` in Stage 1B"
+  let some ctorName := st.activeCtor[v]? <|> st.fvarCtor[fvarId]?
+    | Lean.throwError s!"[lean-native] Unsupported {what}: constructor of the heap object is not statically known (C1.2)"
+  getRcCtorLayoutSpecM ctorName
+
+/-- LCNF `uproj i x` / `sproj n off x` → `ctorGetScalar x slot ty` at the C1.2 `scalarFields` slot. -/
+def lowerScalarProjM (fvarId : Lean.FVarId) (isUsize : Bool) (i off : Nat) (retTy : LNIRType) : BridgeM LNIRExpr := do
+  let v ← internFVar fvarId
+  match ← getVarType v with
+  | .tuple _ => return .projTuple v (if isUsize then i else off)
+  | _ =>
+    let spec ← heapCtorLayoutOfM v fvarId "scalar projection"
+    let some (slot, ty) := if isUsize then spec.usizeSlot? i else spec.scalarSlot? i off
+      | Lean.throwError s!"[lean-native] Unsupported scalar projection [{i},{off}] of `{spec.ctorName}`: no C1.2 slot"
+    if !isUsize && retTy != ty then
+      Lean.throwError s!"[lean-native] Scalar projection type `{reprStr retTy}` ≠ slot type `{reprStr ty}` of `{spec.ctorName}` (C1.2)"
+    return .ctorGetScalar v slot ty
+
+/-- `let x := ctor info objArgs` for a ctor with `usize`/scalar slots: `allocCtor cidx objs zeros`; Lean fills
+    the scalar area afterwards with `uset`/`sset` (C1.2, `getCtorLayout`). -/
+def lowerRcCtorWithScalarsM (dstFVar : Lean.FVarId) (ctorName : Lean.Name) (args : Array (Lean.Compiler.LCNF.Arg .impure))
+    (k : Lean.Compiler.LCNF.Code .impure) (lowerK : Lean.Compiler.LCNF.Code .impure → BridgeM LNIRCode) : BridgeM LNIRCode := do
+  let spec ← getRcCtorLayoutSpecM ctorName
+  if args.size != spec.objSlots then
+    Lean.throwError s!"[lean-native] Unsupported constructor `{ctorName}`: {args.size} args for {spec.objSlots} object slots (C1.2)"
+  let objVars ← args.toList.mapM (lowerArg · true)
+  for ov in objVars do
+    let t ← getVarType ov
+    if !(isSupportedStage1BScalarOrTuple t (← get).arch || t == .objPtr || t == .taggedPtr) then
+      Lean.throwError s!"[lean-native] Unsupported object field of `{ctorName}` (`{reprStr t}`)"
+  let zeros ← spec.scalarSlots.mapM fun (_, ty) => do return (← freshBridgeVar ty, ty)
+  let dst ← internFVar dstFVar .objPtr true
+  modify fun s => { s with activeCtor := s.activeCtor.insert dst ctorName }
+  let kCode ← lowerK k
+  let body : LNIRCode := .letBind dst .objPtr (.allocCtor spec.cidx objVars (zeros.map (·.1))) kCode
+  return zeros.foldr (fun (z, ty) acc => .letBind z ty (.scalar (.constU64 0)) acc) body
+
+/-- LCNF `uset x i y` / `sset x n off y` → `lean_native_ctor_set_scalar x slot y` (C1.2 / C4.2). -/
+def lowerScalarSetM (fvarId : Lean.FVarId) (isUsize : Bool) (i off : Nat) (y : Lean.FVarId)
+    (k : Lean.Compiler.LCNF.Code .impure) (lowerK : Lean.Compiler.LCNF.Code .impure → BridgeM LNIRCode) : BridgeM LNIRCode := do
+  let objVid ← internFVar fvarId
+  if isUnboxedScalarOrTuple (← getVarType objVid) || !(← get).allowStage1DHeap then
+    Lean.throwError "[lean-native] Unsupported heap field mutation in Stage 1B"
+  let spec ← heapCtorLayoutOfM objVid fvarId "scalar field mutation"
+  let some (slot, _) := if isUsize then spec.usizeSlot? i else spec.scalarSlot? i off
+    | Lean.throwError s!"[lean-native] Unsupported scalar mutation [{i},{off}] of `{spec.ctorName}`: no C1.2 slot"
+  let valVid ← internFVar y
+  let idxVid ← freshBridgeVar .i64
+  let unitVid ← freshBridgeVar .unit
+  let kCode ← lowerK k
+  return .letBind idxVid .i64 (.scalar (.constU64 slot.toUInt64))
+    (.letBind unitVid .unit (.call "lean_native_ctor_set_scalar" [objVid, idxVid, valVid] .unit false) kCode)
+
+/-- LCNF `setTag x cidx` → `lean_native_ctor_set_tag x cidx`; `x`'s known ctor becomes the `cidx` sibling. -/
+def lowerSetTagM (fvarId : Lean.FVarId) (cidx : Nat)
+    (k : Lean.Compiler.LCNF.Code .impure) (lowerK : Lean.Compiler.LCNF.Code .impure → BridgeM LNIRCode) : BridgeM LNIRCode := do
+  let objVid ← internFVar fvarId
+  let vt ← getVarType objVid
+  if !((← get).allowStage1DHeap && (vt == .objPtr || vt == .taggedPtr)) then
+    Lean.throwError "[lean-native] unsupported constructor tag mutation"
+  let env ← getEnv
+  if let some cur := (← get).activeCtor[objVid]? <|> (← get).fvarCtor[fvarId]? then
+    if let some (.ctorInfo cval) := env.find? cur then
+      if let some (.inductInfo ival) := env.find? cval.induct then
+        match ival.ctors[cidx]? with
+        | some next => modify fun s => { s with activeCtor := s.activeCtor.insert objVid next }
+        | none => Lean.throwError s!"[lean-native] setTag {cidx} out of range for `{cval.induct}`"
+  let tagVid ← freshBridgeVar .i64
+  let unitVid ← freshBridgeVar .unit
+  let kCode ← lowerK k
+  return .letBind tagVid .i64 (.scalar (.constU64 cidx.toUInt64))
+    (.letBind unitVid .unit (.call "lean_native_ctor_set_tag" [objVid, tagVid] .unit false) kCode)
+
+/-- LCNF `del x` → `lean_native_del_obj x` (free the shell, fields untouched: C4.2); legacy `decRef` otherwise. -/
+def lowerDelM (fvarId : Lean.FVarId) (k : Lean.Compiler.LCNF.Code .impure)
+    (lowerK : Lean.Compiler.LCNF.Code .impure → BridgeM LNIRCode) : BridgeM LNIRCode := do
+  let objVid ← internFVar fvarId
+  let vt ← getVarType objVid
+  if (← get).allowStage1DHeap && (vt == .objPtr || vt == .taggedPtr) then
+    let unitVid ← freshBridgeVar .unit
+    return .letBind unitVid .unit (.call "lean_native_del_obj" [objVid] .unit false) (← lowerK k)
+  lowerRefOp false fvarId 1 (← lowerK k)
 
 def ingestModuleDeclsWith (ingestImpure : Lean.Compiler.LCNF.Decl .impure → Array Lean.Name → TargetArch → Lean.CoreM LNIRDecl)
     (ingestMono : Lean.Compiler.LCNF.Decl .pure → Array Lean.Name → TargetArch → Lean.CoreM LNIRDecl)
