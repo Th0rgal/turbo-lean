@@ -6621,8 +6621,8 @@ end Fixture
 
     #[test]
     fn test_trusted_pr_verify_rejects_metaprogram_sorry_proof_edits() -> Result<()> {
-        // Proof-only edits that close the goal with `sorryAx` without any `sorry`/`admit` token,
-        // and one that also spoofs `#print axioms`: neither a zygote rejection nor the plain-`lean`
+        // Proof-only edits that close the goal with `sorryAx` without any `sorry`/`admit` token, in
+        // a file that spoofs `#print axioms`: neither a zygote rejection nor the plain-`lean`
         // fallback may accept them (the fallback is judged by the kernel-level module audit).
         let repo_dir = std::env::temp_dir().join(format!(
             "turbo_lean_pr_meta_sorry_{}_{}",
@@ -6635,21 +6635,19 @@ end Fixture
             repo_dir.join("lean-toolchain"),
             "leanprover/lean4:v4.35.0\n",
         )?;
-        let base = "import Lean\ntheorem t : 2 + 2 = 4 := rfl\n";
-        fs::write(repo_dir.join("A.lean"), base)?;
-        git_init_and_commit(&repo_dir, "base")?;
-        let admit = "run_tac Lean.Elab.admitGoal (← Lean.Elab.Tactic.getMainGoal)";
         let spoof = "macro_rules\n  | `(#print axioms $i:ident) => `(#eval IO.println s!\"'{$(Lean.quote i.getId.toString)}' does not depend on any axioms\")\n";
+        let base = format!("import Lean\n{}theorem t : 2 + 2 = 4 := rfl\n", spoof);
+        fs::write(repo_dir.join("A.lean"), &base)?;
+        git_init_and_commit(&repo_dir, "base")?;
         let proofs = [
-            ("", admit),
-            ("", "run_tac do\n    let g ← Lean.Elab.Tactic.getMainGoal\n    g.assign (← Lean.Meta.mkSorry (← g.getType) false)"),
-            ("", "run_tac do\n    let g ← Lean.Elab.Tactic.getMainGoal\n    g.assign (Lean.mkApp2 (Lean.mkConst (Lean.Name.mkSimple (\"sor\" ++ \"ryAx\")) [Lean.levelZero]) (← g.getType) (Lean.mkConst ``Bool.false))"),
-            (spoof, admit),
+            "run_tac Lean.Elab.admitGoal (← Lean.Elab.Tactic.getMainGoal)",
+            "run_tac do\n    let g ← Lean.Elab.Tactic.getMainGoal\n    g.assign (← Lean.Meta.mkSorry (← g.getType) false)",
+            "run_tac do\n    let g ← Lean.Elab.Tactic.getMainGoal\n    g.assign (Lean.mkApp2 (Lean.mkConst (Lean.Name.mkSimple (\"sor\" ++ \"ryAx\")) [Lean.levelZero]) (← g.getType) (Lean.mkConst ``Bool.false))",
         ];
-        for (i, (prelude, proof)) in proofs.iter().enumerate() {
+        for (i, proof) in proofs.iter().enumerate() {
             let src = format!(
                 "import Lean\n{}theorem t : 2 + 2 = 4 := by\n  {}\n",
-                prelude, proof
+                spoof, proof
             );
             fs::write(repo_dir.join("A.lean"), src)?;
             let mut store = TurboStore::open(Some(&repo_dir.join(format!(".cache-{}", i))))?;

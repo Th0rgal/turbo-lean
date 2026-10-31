@@ -1562,6 +1562,30 @@ pub(crate) fn run_audited_lean_shard(
         .env("LEAN", lean_bin)
         .env("LEAN_PATH", lean_path)
         .args(["--audit-modules", "--shard"]);
+    // The auditor links `libleanshared` from the toolchain, which an elan-proxied `lean` does not
+    // put on the loader path.
+    let mut prefix_cmd = Command::new(lean_bin);
+    prefix_cmd.arg("--print-prefix").envs(env_vars);
+    if let Some(dir) = cwd {
+        prefix_cmd.current_dir(dir);
+    }
+    if let Some(p) = prefix_cmd.output().ok().filter(|p| p.status.success()) {
+        let prefix = PathBuf::from(String::from_utf8_lossy(&p.stdout).trim());
+        let mut ld = format!(
+            "{}:{}",
+            prefix.join("lib/lean").display(),
+            prefix.join("lib").display()
+        );
+        if let Some(prev) = env_vars
+            .get("LD_LIBRARY_PATH")
+            .cloned()
+            .or_else(|| std::env::var("LD_LIBRARY_PATH").ok())
+            .filter(|l| !l.is_empty())
+        {
+            ld = format!("{}:{}", ld, prev);
+        }
+        auditor.env("LD_LIBRARY_PATH", ld);
+    }
     if !env_vars.contains_key(crate::splitter::ALLOWED_AXIOMS_ENV) {
         auditor.env(
             crate::splitter::ALLOWED_AXIOMS_ENV,
