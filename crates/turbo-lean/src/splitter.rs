@@ -888,12 +888,11 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
         let line_clean = &clean[line_start..line_end_no_cr];
         let trimmed = line_clean.trim_start();
         let indent = line_orig.len() - line_orig.trim_start().len();
-        let is_unindented = indent == 0;
-        let starts_doc_comment = line_orig.trim_start().starts_with("/--")
-            && (is_unindented || (scope_depth > 0 && indent <= cur_cmd_indent.unwrap_or(indent)));
+        let at_command_indent = cur_cmd_indent.is_none_or(|base| indent <= base);
+        let starts_doc_comment = line_orig.trim_start().starts_with("/--") && at_command_indent;
 
         if mutual_depth > 0 {
-            if is_unindented || (scope_depth > 0 && indent <= cur_cmd_indent.unwrap_or(0)) {
+            if at_command_indent {
                 if is_mutual_line_start(trimmed) {
                     mutual_depth += 1;
                 } else if is_end_line_start(trimmed) {
@@ -912,9 +911,8 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
             || prev_trimmed.starts_with("namespace ")
             || is_end_line_start(prev_trimmed);
 
-        let can_start_at_indent = is_unindented
-            || (scope_depth > 0
-                && (prev_is_section_or_ns_header || indent <= cur_cmd_indent.unwrap_or(indent)));
+        let can_start_at_indent =
+            at_command_indent || (scope_depth > 0 && prev_is_section_or_ns_header);
 
         if line_num > 1
             && can_start_at_indent

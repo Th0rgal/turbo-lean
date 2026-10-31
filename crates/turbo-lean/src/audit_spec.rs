@@ -189,9 +189,7 @@ pub(super) fn extract_all_lean_theorems(
                 let decl_name: String = chars[name_start..i].iter().collect();
                 let matches_filter = match target_name {
                     Some(t) if !t.is_empty() && t != "auto" => {
-                        decl_name == t
-                            || decl_name.ends_with(&format!(".{}", t))
-                            || t.ends_with(&format!(".{}", decl_name))
+                        crate::splitter::decl_name_matches_target(&decl_name, t)
                     }
                     _ => true,
                 };
@@ -1969,7 +1967,7 @@ pub(super) fn extract_decls_fast(src: &str, decl_filter: Option<&str>) -> Vec<Ex
 }
 
 /// Schema version for the Blake3 content-addressed `audit-spec` per-file JSON cache.
-pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 12;
+pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 13;
 
 static AUDIT_SPEC_CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);

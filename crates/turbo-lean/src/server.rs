@@ -1441,39 +1441,28 @@ fn execute_check_shard_payload_deferred_with_domain(
                 },
             );
             let parsed = crate::splitter::split_lean_source(&req.shard_source, &dep_hashes);
-            let target_body = if parsed.shards.len() == 1 {
-                let s = &parsed.shards[0];
-                format!("{}\n{}", s.signature_text, s.proof_text)
-            } else {
-                let short_req: String = req
-                    .decl
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or(&req.decl)
-                    .chars()
-                    .map(|c| {
-                        if c.is_ascii_alphanumeric() || c == '_' {
-                            c
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect();
-                parsed
-                    .shards
-                    .iter()
-                    .find(|s| {
-                        let base = s.name.split("__turbo_check_").next().unwrap_or(&s.name);
-                        let short_s = base.rsplit('.').next().unwrap_or(base);
-                        base == req.decl
-                            || req.decl.ends_with(&format!(".{}", base))
-                            || base.ends_with(&format!(".{}", req.decl))
-                            || (short_s.starts_with("_turbo_verify_")
-                                && short_s.ends_with(&short_req))
-                    })
-                    .map(|s| format!("{}\n{}", s.signature_text, s.proof_text))
-                    .unwrap_or_else(|| clean_source.clone())
-            };
+            let requested = std::collections::HashSet::from([req.decl.clone()]);
+            let candidates: Vec<_> = parsed
+                .shards
+                .iter()
+                .filter(|s| {
+                    let base = s
+                        .decl_name()
+                        .split("__turbo_check_")
+                        .next()
+                        .unwrap_or(s.decl_name());
+                    crate::splitter::matches_uncached_or_fast_verify_name(base, &requested)
+                })
+                .collect();
+            anyhow::ensure!(
+                candidates.len() <= 1,
+                "Ambiguous declaration `{}` in remote shard",
+                req.decl
+            );
+            let target_body = candidates
+                .first()
+                .map(|s| format!("{}\n{}", s.signature_text, s.proof_text))
+                .unwrap_or_else(|| clean_source.clone());
             let clean_target = crate::splitter::strip_lean_comments(&target_body);
             let violations = crate::splitter::audit_hygiene(&clean_target);
             if !violations.disallowed_items_under(&req_allowed).is_empty() {

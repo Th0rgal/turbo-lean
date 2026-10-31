@@ -52,7 +52,7 @@ fn cache_shm_stat_split(
         let st_path = shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
         let src_b3 = blake3::hash(active_src.as_bytes()).to_hex().to_string();
         let entry = ShmCachedFileSplit {
-            split_key: format!("file-split:v4:{}", src_b3),
+            split_key: format!("file-split:v5:{}", src_b3),
             src_blake3: src_b3,
             split: compact_split_for_shm_cache(split),
             prefix_src: String::new(),
@@ -779,7 +779,7 @@ fn run_check_command_inner(
             let src_b3 = blake3::hash(loaded_src.as_bytes()).to_hex().to_string();
             if let Some((ref st_path, _)) = st_paths_opt {
                 let entry = ShmCachedFileSplit {
-                    split_key: format!("file-split:v4:{}", src_b3),
+                    split_key: format!("file-split:v5:{}", src_b3),
                     src_blake3: src_b3.clone(),
                     split: compact_split_for_shm_cache(&sp),
                     prefix_src: String::new(),
@@ -818,7 +818,7 @@ fn run_check_command_inner(
                     split_key: if src_b3.is_empty() {
                         String::new()
                     } else {
-                        format!("file-split:v4:{}", src_b3)
+                        format!("file-split:v5:{}", src_b3)
                     },
                     src_blake3: src_b3,
                     split: compact_split_for_shm_cache(&fast_res.0),
@@ -1552,7 +1552,7 @@ fn check_single_decl(
                         let st_path =
                             shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
                         let entry = ShmCachedFileSplit {
-                            split_key: format!("file-split:v4:{}", sub_b3),
+                            split_key: format!("file-split:v5:{}", sub_b3),
                             src_blake3: sub_b3.clone(),
                             split: compact_split_for_shm_cache(&sub_split),
                             prefix_src: if sub_src.len() <= 64 * 1024 {
@@ -4272,6 +4272,133 @@ but is expected to have type
             assert_eq!(turbo_spec_step_verdict_consistent(1, 1), 1);
             assert_eq!(turbo_spec_step_verdict_consistent(1, 0), 0);
         }
+    }
+
+    #[test]
+    fn test_stage1_qualified_decl_selection_cli_and_stateful() {
+        // Unit-test executables live in <profile>/deps; exercise the actual CLI too.
+        let mut build = Command::new(env!("CARGO"));
+        build
+            .arg("build")
+            .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
+        if !cfg!(debug_assertions) {
+            build.arg("--release");
+        }
+        assert!(build.status().unwrap().success());
+        let binary = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("turbo-lean");
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_stage1_selection_{}",
+            crate::pack::next_tmp_id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        let file = dir.join("Selection.lean");
+        let good = "namespace A\ntheorem same (n : Nat) : n = n := rfl\nend A\n";
+        let bad = "namespace B\ntheorem same (n : Nat) : n = n + 1 := by rfl\nend B\n";
+        let indented = format!("{good}{bad}")
+            .lines()
+            .map(|line| format!("  {line}\n"))
+            .collect::<String>();
+        for (order, src) in [format!("{good}{bad}"), format!("{bad}{good}"), indented]
+            .iter()
+            .enumerate()
+        {
+            fs::write(&file, src).unwrap();
+            let cache = dir.join(format!("cache{order}"));
+            let mut store = TurboStore::open(Some(&dir.join(format!("stateful{order}")))).unwrap();
+            for target in ["A.same", "same", "B.same", "Other.A.same"] {
+                let stateful = crate::gpu_fastcheck::evaluate_agent_step_value(
+                    &mut store,
+                    &file,
+                    Some(target),
+                    Some(&dir),
+                    false,
+                    false,
+                );
+                match target {
+                    "same" => assert!(stateful
+                        .unwrap_err()
+                        .to_string()
+                        .contains("Ambiguous declaration")),
+                    "Other.A.same" => assert!(stateful.is_err()),
+                    _ => {
+                        let value = stateful.unwrap();
+                        assert_eq!(value["decl"], target);
+                        assert_eq!(
+                            value["status"],
+                            if target == "A.same" {
+                                "theorem_verified"
+                            } else {
+                                "counterexample_rejected"
+                            }
+                        );
+                    }
+                }
+                for command in ["agent-step", "fast-check"] {
+                    let mut cli = Command::new(&binary);
+                    cli.current_dir(&dir)
+                        .arg("--cache-dir")
+                        .arg(&cache)
+                        .args(["--json", command])
+                        .arg(&file)
+                        .args(["--decl", target]);
+                    if command == "agent-step" {
+                        cli.arg("--project-dir").arg(&dir);
+                    }
+                    let output = cli.output().unwrap();
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    if matches!(target, "same" | "Other.A.same") {
+                        assert!(
+                            !output.status.success(),
+                            "{command} {target}: {stdout} {stderr}"
+                        );
+                        if target == "same" {
+                            assert!(
+                                stderr.contains("Ambiguous declaration")
+                                    && stderr.contains("A.same")
+                                    && stderr.contains("B.same"),
+                                "{stderr}"
+                            );
+                        }
+                        assert!(!stdout.contains("counterexample"), "{stdout}");
+                        continue;
+                    }
+                    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+                        .unwrap_or_else(|_| panic!("{command} {target}: {stdout} {stderr}"));
+                    if command == "agent-step" {
+                        assert!(output.status.success(), "{stderr}");
+                        assert_eq!(value["decl"], target);
+                        assert_eq!(
+                            value["status"],
+                            if target == "A.same" {
+                                "theorem_verified"
+                            } else {
+                                "counterexample_rejected"
+                            }
+                        );
+                    } else {
+                        assert_eq!(value["decl_name"], target);
+                        assert_eq!(value["verified"], target == "A.same");
+                        assert_eq!(
+                            value["status"],
+                            if target == "A.same" {
+                                "ok"
+                            } else {
+                                "counterexample_found"
+                            }
+                        );
+                    }
+                }
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

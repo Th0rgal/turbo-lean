@@ -826,7 +826,7 @@ fn run(cli: Cli) -> Result<()> {
             decl.as_deref(),
             project_dir.as_deref(),
             low_memory,
-        ) {
+        )? {
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&out_json)?);
             } else {
