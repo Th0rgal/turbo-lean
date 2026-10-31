@@ -1708,8 +1708,24 @@ fn classify_lake_field(scope: LakeScope, key: &str, val: &str) -> LakeField {
             LakeField::Unsupported
         }
     };
-    // Lean enum literals: `.release`, `BuildType.release`, TOML `"release"`.
-    let enum_tag = v.trim_matches('"').rsplit('.').next().unwrap_or("");
+    // Only a plain enum literal (`.release`, `BuildType.release`, TOML `"release"`): any other
+    // expression (e.g. `if c then .llvm else .c`) stays unknown and so unsupported.
+    let enum_tag = v
+        .strip_prefix('"')
+        .and_then(|t| t.strip_suffix('"'))
+        .or_else(|| {
+            [
+                "Lake.BuildType.",
+                "BuildType.",
+                "Lake.Backend.",
+                "Backend.",
+                ".",
+            ]
+            .iter()
+            .find_map(|p| v.strip_prefix(p))
+        })
+        .filter(|t| t.chars().all(|c| c.is_ascii_alphanumeric()))
+        .unwrap_or("");
     let empty_array = matches!(v, "[]" | "#[]");
     match (scope, key) {
         (
@@ -1786,8 +1802,7 @@ fn classify_lake_field(scope: LakeScope, key: &str, val: &str) -> LakeField {
 /// A field turbo-lean cannot build like Lake: the root package fails closed now; a dependency
 /// records `why` in `slot`, so only building one of its modules fails closed.
 fn unsupported_lake_field(slot: &mut Option<String>, is_root_pkg: bool, why: String) -> Result<()> {
-    if is_root_pkg {
-        let _ = c_abi::verify_static_lake_config(true, true, false, false);
+    if is_root_pkg && !c_abi::verify_static_lake_config(true, true, false, false) {
         anyhow::bail!("{}: fail-closed static Lake config gate", why);
     }
     slot.get_or_insert(why);
@@ -1803,11 +1818,14 @@ fn check_lake_field(
     val: &str,
     location: impl FnOnce() -> String,
 ) -> Result<()> {
-    let what = match classify_lake_field(scope, key, val) {
-        LakeField::Passive => return Ok(()),
-        LakeField::Unsupported => "Unsupported value for",
-        LakeField::Unknown => "Unsupported",
+    let (what, passive) = match classify_lake_field(scope, key, val) {
+        LakeField::Passive => ("", true),
+        LakeField::Unsupported => ("Unsupported value for", false),
+        LakeField::Unknown => ("Unsupported", false),
     };
+    if c_abi::verify_static_lake_config(true, !passive, false, false) {
+        return Ok(());
+    }
     let scope_name = match scope {
         LakeScope::Package => "package",
         LakeScope::Lib => "lean_lib",
@@ -1818,6 +1836,19 @@ fn check_lake_field(
         is_root_pkg,
         format!("{} {} field `{}` in {}", what, scope_name, key, location()),
     )
+}
+/// `precompileModules`: Lake then loads the library's shared library into every module that
+/// imports it (and into its own modules' elaboration), changing their traces; turbo-lean
+/// builds neither, so `true` fails closed for every package.
+fn lake_precompile_modules(val: &str, location: &dyn Fn() -> String) -> Result<bool> {
+    let on = parse_toml_bool(val)?;
+    if !c_abi::verify_static_lake_config(true, on, false, false) {
+        anyhow::bail!(
+            "Unsupported `precompileModules = true` in {}: Lake loads precompiled shared libraries turbo-lean does not build: fail-closed static Lake config gate",
+            location()
+        );
+    }
+    Ok(on)
 }
 /// TOML reads a quoted key without a dot (`"moreLeanArgs"`) as the bare key.
 fn toml_bare_key(raw: &str) -> String {
@@ -2033,7 +2064,9 @@ pub fn parse_lakefile_toml(
                     }
                     "moreLeanArgs" => pkg.more_lean_args = parse_toml_string_array(&val_accum)?,
                     "weakLeanArgs" => pkg.weak_lean_args = parse_toml_string_array(&val_accum)?,
-                    "precompileModules" => pkg.precompile_modules = parse_toml_bool(&val_accum)?,
+                    "precompileModules" => {
+                        pkg.precompile_modules = lake_precompile_modules(&val_accum, &location)?
+                    }
                     "leanOptions" => {
                         let tbl = parse_toml_lean_options_table(&val_accum)?;
                         pkg.lean_options.extend(tbl);
@@ -2076,7 +2109,8 @@ pub fn parse_lakefile_toml(
                     "moreLeanArgs" => lib.more_lean_args = parse_toml_string_array(&val_accum)?,
                     "weakLeanArgs" => lib.weak_lean_args = parse_toml_string_array(&val_accum)?,
                     "precompileModules" => {
-                        lib.precompile_modules = Some(parse_toml_bool(&val_accum)?)
+                        lib.precompile_modules =
+                            Some(lake_precompile_modules(&val_accum, &location)?)
                     }
                     "leanOptions" => {
                         let tbl = parse_toml_lean_options_table(&val_accum)?;
@@ -3409,7 +3443,9 @@ pub fn parse_lakefile_lean(
             "IO.Process",
             "System.Process",
         ] {
+            // A dependency's `needs` is classified per target below.
             let in_hook_ok = is_hook(forbidden)
+                || forbidden == "needs :="
                 || (in_hook_body && matches!(forbidden, "IO.Process" | "System.Process"));
             if !is_root_pkg && in_hook_ok {
                 continue;
@@ -3692,7 +3728,8 @@ pub fn parse_lakefile_lean(
                             pkg.weak_lean_args = parse_lean_string_array_expr(&val_accum)?;
                         }
                         "precompileModules" => {
-                            pkg.precompile_modules = parse_toml_bool(&val_accum)?;
+                            pkg.precompile_modules =
+                                lake_precompile_modules(&val_accum, &location)?;
                         }
                         "leanOptions" => {
                             pkg.lean_options.extend(resolve_lean_options_expr(
@@ -3732,7 +3769,8 @@ pub fn parse_lakefile_lean(
                                 lib.weak_lean_args = parse_lean_string_array_expr(&val_accum)?;
                             }
                             "precompileModules" => {
-                                lib.precompile_modules = Some(parse_toml_bool(&val_accum)?);
+                                lib.precompile_modules =
+                                    Some(lake_precompile_modules(&val_accum, &location)?);
                             }
                             "leanOptions" => {
                                 lib.lean_options.extend(resolve_lean_options_expr(
@@ -4298,17 +4336,39 @@ fn finalize_package_config(
 
 /// Resolve a single package's static configuration (`lakefile.toml` or `lakefile.lean`).
 pub fn resolve_package_config(pkg_root: &Path, is_root_pkg: bool) -> Result<PackageConfig> {
-    let toml_path = pkg_root.join("lakefile.toml");
-    let lean_path = pkg_root.join("lakefile.lean");
-    if toml_path.is_file() {
-        return parse_lakefile_toml(pkg_root, &toml_path, is_root_pkg);
+    resolve_package_config_file(pkg_root, is_root_pkg, None)
+}
+/// The configuration file Lake loads for a package: `config_file` (a manifest `configFile`,
+/// default `lakefile`) as given if it has an extension, else its `.lean` before its `.toml`.
+fn package_config_path(pkg_root: &Path, config_file: Option<&str>) -> Result<Option<PathBuf>> {
+    let rel = lake_rel_path("configFile", config_file.unwrap_or("lakefile"))?;
+    if rel.extension().is_some() {
+        return Ok(Some(pkg_root.join(rel)).filter(|p| p.is_file()));
     }
-    if lean_path.is_file() {
-        return parse_lakefile_lean(pkg_root, &lean_path, is_root_pkg);
+    Ok(["lean", "toml"]
+        .iter()
+        .map(|ext| pkg_root.join(&rel).with_extension(ext))
+        .find(|p| p.is_file()))
+}
+fn resolve_package_config_file(
+    pkg_root: &Path,
+    is_root_pkg: bool,
+    config_file: Option<&str>,
+) -> Result<PackageConfig> {
+    let path = package_config_path(pkg_root, config_file)?;
+    match path
+        .as_ref()
+        .and_then(|p| p.extension())
+        .and_then(|e| e.to_str())
+    {
+        Some("lean") => return parse_lakefile_lean(pkg_root, path.as_ref().unwrap(), is_root_pkg),
+        Some("toml") => return parse_lakefile_toml(pkg_root, path.as_ref().unwrap(), is_root_pkg),
+        _ => {}
     }
     let _ = c_abi::verify_static_lake_config(false, false, false, false);
     anyhow::bail!(
-        "No static Lake configuration (`lakefile.toml` or `lakefile.lean`) found in {}: fail-closed static Lake config gate",
+        "No static Lake configuration (`{}.lean` or `.toml`) found in {}: fail-closed static Lake config gate",
+        config_file.unwrap_or("lakefile"),
         pkg_root.display()
     )
 }
@@ -4351,12 +4411,12 @@ pub fn resolve_project_config_with_trust(
     let root_pkg = resolve_package_config(&canon_dir, true)?;
     let (manifest_pkgs_dir, manifest_packages, manifest_hash_opt) =
         parse_lake_manifest(&canon_dir, is_untrusted)?;
-    let mut dep_dirs: Vec<PathBuf> = Vec::new();
+    let mut dep_dirs: Vec<(PathBuf, Option<&str>)> = Vec::new();
     let mut seen_dep_dirs: HashSet<PathBuf> = HashSet::new();
     for mp in &manifest_packages {
         let d = mp.dir.canonicalize().unwrap_or_else(|_| mp.dir.clone());
         if d.is_dir() && seen_dep_dirs.insert(d.clone()) {
-            dep_dirs.push(d);
+            dep_dirs.push((d, mp.config_file.as_deref()));
         }
     }
     if manifest_hash_opt.is_none() {
@@ -4372,7 +4432,7 @@ pub fn resolve_project_config_with_trust(
                 for p in extra {
                     let d = p.canonicalize().unwrap_or(p);
                     if seen_dep_dirs.insert(d.clone()) {
-                        dep_dirs.push(d);
+                        dep_dirs.push((d, None));
                     }
                 }
             }
@@ -4382,7 +4442,7 @@ pub fn resolve_project_config_with_trust(
     // An untrusted workspace must not adopt (and later publish into) a package elsewhere on
     // the host, whether through the manifest or a symlink.
     let package_roots = untrusted_package_roots(&canon_dir);
-    for dep_dir in dep_dirs {
+    for (dep_dir, config_file) in dep_dirs {
         if is_untrusted && !package_roots.iter().any(|r| dep_dir.starts_with(r)) {
             anyhow::bail!(
                 "Dependency package `{}` resolves outside the workspace `{}`: fail-closed build path gate",
@@ -4390,8 +4450,8 @@ pub fn resolve_project_config_with_trust(
                 canon_dir.display()
             );
         }
-        if dep_dir.join("lakefile.toml").is_file() || dep_dir.join("lakefile.lean").is_file() {
-            let dep_cfg = resolve_package_config(&dep_dir, false)?;
+        if package_config_path(&dep_dir, config_file)?.is_some() {
+            let dep_cfg = resolve_package_config_file(&dep_dir, false, config_file)?;
             dep_pkgs.push(dep_cfg);
         }
     }
@@ -11355,5 +11415,90 @@ roots = ["Fast"]
         let cfg = resolve_project_config(&proj).unwrap();
         build_module_dag_with_trust(&cfg, &[], true).unwrap();
         let _ = fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn test_lake_config_file_choice_precompile_and_enum_literals_follow_lake() {
+        let dir = make_temp_test_dir("lake_config_choice");
+        let toml = "name = \"t\"\n[[lean_lib]]\nname = \"FromToml\"\n";
+        let lean = "import Lake\nopen Lake DSL\npackage t\nlean_lib FromLean\n";
+        // Lake loads `lakefile.lean` when both are present.
+        fs::write(dir.join("lakefile.toml"), toml).unwrap();
+        fs::write(dir.join("lakefile.lean"), lean).unwrap();
+        let pkg = resolve_package_config(&dir, false).unwrap();
+        assert_eq!(pkg.libs[0].name, "FromLean");
+        // ... and a manifest `configFile`, with or without an extension.
+        fs::create_dir_all(dir.join("cfg")).unwrap();
+        fs::write(dir.join("cfg/custom.toml"), toml).unwrap();
+        for cfg in ["cfg/custom", "cfg/custom.toml"] {
+            let pkg = resolve_package_config_file(&dir, false, Some(cfg)).unwrap();
+            assert_eq!(pkg.libs[0].name, "FromToml", "{cfg}");
+        }
+        assert!(resolve_package_config_file(&dir, false, Some("../x")).is_err());
+        assert!(resolve_package_config_file(&dir, false, Some("missing")).is_err());
+
+        // `precompileModules = true` makes Lake load shared libraries into the library's own
+        // modules and every importer; it fails closed in every package.
+        for (file, src) in [
+            ("lakefile.toml", "name = \"t\"\nprecompileModules = true\n"),
+            (
+                "lakefile.toml",
+                "name = \"t\"\n[[lean_lib]]\nname = \"A\"\nprecompileModules = true\n",
+            ),
+            (
+                "lakefile.lean",
+                "import Lake\nopen Lake DSL\npackage t where\n  precompileModules := true\n",
+            ),
+            (
+                "lakefile.lean",
+                "import Lake\nopen Lake DSL\npackage t\nlean_lib A where\n  precompileModules := true\n",
+            ),
+        ] {
+            let f = dir.join(file);
+            fs::write(&f, src).unwrap();
+            for is_root in [true, false] {
+                let err = if file.ends_with("toml") {
+                    parse_lakefile_toml(&dir, &f, is_root)
+                } else {
+                    parse_lakefile_lean(&dir, &f, is_root)
+                }
+                .unwrap_err()
+                .to_string();
+                assert!(err.contains("precompileModules"), "{src}: {err}");
+            }
+        }
+        // Only a plain enum literal can pass: Lake evaluates any other expression.
+        for v in [
+            "if true then .llvm else .default",
+            "match x with | _ => .c",
+            "(.c)",
+            "\"llvm\"",
+        ] {
+            assert!(
+                matches!(
+                    classify_lake_field(LakeScope::Package, "backend", v),
+                    LakeField::Unsupported
+                ),
+                "{v}"
+            );
+        }
+        for v in [".c", "Backend.default", "\"c\""] {
+            assert!(matches!(
+                classify_lake_field(LakeScope::Lib, "backend", v),
+                LakeField::Passive
+            ));
+        }
+        // A dependency's `needs` only marks the target that sets it.
+        let lf = dir.join("lakefile.lean");
+        fs::write(
+            &lf,
+            "import Lake\nopen Lake DSL\npackage t\nlean_lib A where\n  needs := #[gen]\nlean_lib B where\n  needs := #[]\n",
+        )
+        .unwrap();
+        let pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
+        assert!(pkg.unsupported.is_none() && pkg.libs[1].unsupported.is_none());
+        assert!(pkg.libs[0].unsupported.is_some());
+        assert!(parse_lakefile_lean(&dir, &lf, true).is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
