@@ -271,7 +271,7 @@ end
 def ingestLCNFDeclGeneric {pu} (decl : Lean.Compiler.LCNF.Decl pu)
     (lowerCodeFn : Lean.Compiler.LCNF.Code pu → BridgeM LNIRCode)
     (localDeclNames : Array Lean.Name := #[]) (arch : TargetArch := .x86_64)
-    (allowInternalObj : Bool := false) : Lean.CoreM LNIRDecl := do
+    (allowInternalObj : Bool := false) (allowRcAdt : Bool := false) : Lean.CoreM LNIRDecl := do
   let env ← getEnv
   if ← declUsesSignedScalarTransitively decl then
     Lean.throwError s!"[lean-native] Unsupported signed integer type (`Int*` / `ISize`) in `{decl.name}`"
@@ -281,7 +281,8 @@ def ingestLCNFDeclGeneric {pu} (decl : Lean.Compiler.LCNF.Decl pu)
     Lean.throwError s!"[lean-native] Unsupported `@[extern]` declaration `{decl.name}` in Stage 1B"
   let isExported := (Lean.getExportNameFor? env decl.name).isSome
   checkEnvConstSignatureM env decl.name arch isExported
-  let isStage1DHeap := allowInternalObj && !isExported && declQualifiesForStage1DHeap env decl.name arch
+  -- C4: Stage 1D heap lowering is opt-in (`--allow-rc-adt`); by default heap ADTs fail closed
+  let isStage1DHeap := allowRcAdt && allowInternalObj && !isExported && declQualifiesForStage1DHeap env decl.name arch
   let initSt : BridgeState := {
     mangledSymbol := metaInfo.mangledSymbol, isSimpleGround := metaInfo.isSimpleGround,
     selfDeclName := decl.name, localDeclNames := localDeclNames, arch := arch,
@@ -325,24 +326,24 @@ def ingestLCNFDeclGeneric {pu} (decl : Lean.Compiler.LCNF.Decl pu)
   Prod.fst <$> action.run initSt
 
 def ingestLCNFImpureDecl (decl : Lean.Compiler.LCNF.Decl .impure)
-    (localDeclNames : Array Lean.Name := #[]) (arch : TargetArch := .x86_64) : Lean.CoreM LNIRDecl :=
-  ingestLCNFDeclGeneric decl lowerImpureCode localDeclNames arch true
+    (localDeclNames : Array Lean.Name := #[]) (arch : TargetArch := .x86_64) (allowRcAdt : Bool := false) : Lean.CoreM LNIRDecl :=
+  ingestLCNFDeclGeneric decl lowerImpureCode localDeclNames arch true allowRcAdt
 
 def ingestLCNFMonoDecl (decl : Lean.Compiler.LCNF.Decl .pure)
     (localDeclNames : Array Lean.Name := #[]) (arch : TargetArch := .x86_64) : Lean.CoreM LNIRDecl :=
   ingestLCNFDeclGeneric decl lowerPureCode localDeclNames arch false
 
 def ingestModuleDecls (declNames : Array Lean.Name) (moduleName : String := "LeanNative.Ingested")
-    (arch : TargetArch := .x86_64) : Lean.CoreM LNIRModule :=
-  ingestModuleDeclsWith (fun d ns a => ingestLCNFImpureDecl d ns a) (fun d ns a => ingestLCNFMonoDecl d ns a) declNames moduleName arch
+    (arch : TargetArch := .x86_64) (allowRcAdt : Bool := false) : Lean.CoreM LNIRModule :=
+  ingestModuleDeclsWith (fun d ns a => ingestLCNFImpureDecl d ns a allowRcAdt) (fun d ns a => ingestLCNFMonoDecl d ns a) declNames moduleName arch
 
 def ingestAllLocalDecls (moduleName : String := "LeanNative.Ingested")
-    (arch : TargetArch := .x86_64) : Lean.CoreM LNIRModule := do
+    (arch : TargetArch := .x86_64) (allowRcAdt : Bool := false) : Lean.CoreM LNIRModule := do
   let impureNames ← Lean.Compiler.LCNF.getLocalImpureDecls
   let env ← getEnv
   let filteredImpure := impureNames.filter (fun n => !isCompilerGeneratedAuxDecl env n)
   let extraNames := env.constants.map₂.foldl (fun acc name _ =>
     if impureNames.contains name || isCompilerGeneratedAuxDecl env name then acc else acc.push name) #[]
-  ingestModuleDecls (filteredImpure ++ extraNames) moduleName arch
+  ingestModuleDecls (filteredImpure ++ extraNames) moduleName arch allowRcAdt
 
 end LeanNative.IR

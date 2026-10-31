@@ -176,7 +176,9 @@ def getOrInitWorkerCache (cacheRef : IO.Ref (Option WorkerCache)) : IO WorkerCac
 
 def handleFastWorkerRequest? (engineName line : String) : Option String :=
   let reqId := extractRpcId line
-  if invalidRpcWire line then
+  if hasRpcBoolField line "allow_rc_adt" true || hasRpcBoolField line "allowRcAdt" true then
+    some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"unsupported_flag:allow_rc_adt\"}"
+  else if invalidRpcWire line then
     some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"invalid_lnir_wire\"}"
   else
   let method := (extractRpcStringField line "method").getD "ping"
@@ -224,6 +226,8 @@ def handleFastWorkerRequest? (engineName line : String) : Option String :=
       | some m =>
         if m.decls.any (·.assurance == .unsupported) then
           some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"unsupported_assurance_level_decl\"}"
+        else if let some dName := m.findRcAdtDecl? then
+          some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"unsupported_rc_adt_decl:{escapeJsonWorker dName}\"}"
         else
           let rep := runFastCheckModule m numSamples (!noProp)
           some s!"\{\"id\":{reqId},\"ok\":true,\"recommended_target\":\"{recTarget}\",\"c_abi_ready\":true,\"result\":\{\"recommended_target\":\"{recTarget}\",\"c_abi_ready\":true,\"report\":{rep.toJson}}}"
@@ -250,6 +254,10 @@ def handleWorkerRequest (engineName : String) (cache : WorkerCache) (line : Stri
       s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"invalid_lnir_wire\"}"
     else if (customModOpt.map (fun m => m.decls.any (·.assurance == .unsupported))).getD false then
       s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"unsupported_assurance_level_decl\"}"
+    else if !["verify-certs", "validate-tv"].contains method &&
+        (customModOpt.bind LNIRModule.findRcAdtDecl?).isSome then
+      let dName := (customModOpt.bind LNIRModule.findRcAdtDecl?).getD ""
+      s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"unsupported_rc_adt_decl:{escapeJsonWorker dName}\"}"
     else if ["compile-llvm", "compile-ptx", "compile-metal", "compile-mlir", "compile-tpu",
              "compile-fastcheck", "superopt", "plugins", "verify-certs", "validate-tv"].contains method &&
         customModOpt.isNone && !hasRpcBoolField line "canonical_benchmark" true &&
