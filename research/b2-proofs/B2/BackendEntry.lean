@@ -9,6 +9,11 @@ attribute [local irreducible] B2.Smoke.collatz
 set_option maxRecDepth 20000
 set_option maxHeartbeats 2000000
 
+theorem xholds_cv_iff (n : UInt64) (x : BitVec 64) :
+    E2E.XHolds (cv n) x ↔ x = n.toBitVec := by
+  simpa [cv, Clif.Ty.width] using
+    (E2E.XHolds_iff (v := cv n) (x := x) (Nat.le_refl 64))
+
 theorem entry_eq (n steps : UInt64) (cs : State)
     (hcs : E2E.ClifEntry B2.Smoke.collatz [cv n, cv steps] cs) :
     cs = entryState (argumentRegs n steps) cs.mem := by
@@ -69,6 +74,7 @@ theorem traps_explicit (env : Clif.Env) (p : Program) (n steps : UInt64) (cs : S
   · intro s c st rest hr ht _
     exact ((reachable_step_safe hr (returns env p n steps cs hcs)).1 c ht).elim
 
+#print axioms xholds_cv_iff
 #print axioms entry_eq
 #print axioms returns
 #print axioms reachable_step_safe

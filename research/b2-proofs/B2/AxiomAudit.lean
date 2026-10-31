@@ -47,7 +47,7 @@ run_cmd do
         ``B2.Artifacts.prepared, ``B2.Artifacts.spill_alloc,
         ``B2.Artifacts.allocation_checked, ``B2.Artifacts.allocated,
         ``B2.Artifacts.emitted, ``B2.Artifacts.laid_out,
-        ``B2.BackendEntry.entry_eq, ``B2.BackendEntry.returns,
+        ``B2.BackendEntry.xholds_cv_iff, ``B2.BackendEntry.entry_eq, ``B2.BackendEntry.returns,
         ``B2.BackendEntry.reachable_step_safe, ``B2.BackendEntry.traps_explicit,
         ``B2.BackendContracts.lookup_insertIfNew, ``B2.BackendContracts.lookup_method_empty,
         ``B2.BackendContracts.subset, ``B2.BackendContracts.dominated,

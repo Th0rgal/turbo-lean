@@ -1,7 +1,7 @@
 # B2 status
 
 Baseline: `5508b9f`; clifv `5018b9509dc124154dbe08a5bd85862595d8eab7`.
-Checkpoint: 2026-10-31 18:11 UTC. The executable lowering lives in
+Checkpoint: 2026-10-31 18:28 UTC. The executable lowering lives in
 `lean/LeanNative/Backend/Clif.lean`; `compile-clif` calls that definition.
 The active root and strict transitive axiom audit pass kernel checks on Lean 4.34.1.
 
@@ -13,7 +13,7 @@ The active root and strict transitive axiom audit pass kernel checks on Lean 4.3
 | O4 safety | PROVED (collatz_steps) | `B2.BackendEntry.entry_eq` and `returns` establish the exact upstream `ClifEntry` contract. `reachable_step_safe` excludes trapped/stuck steps at every reachable state; `traps_explicit` proves the exact upstream `E2E.TrapsExplicit` premise. `B2.RunSafety.collatz_run_prefix` also excludes trapped/stuck public runs at every fuel. |
 | O5 backend artifacts | PROVED (collatz_steps) | `B2.Artifacts.input_eq`, `verifiable`, and `lower` certify the exact instruction-selection artifact from `Backend.lowerFunction`. `B2.Artifacts.prepared`, `spill_alloc`, and `allocation_checked` certify the actual block permutation 0,1,3,2, exact spill allocation, and acceptance by upstream `checkAlloc`. `B2.Artifacts.allocated`, `emitted`, and `laid_out` certify actual AArch64 lowering, emission, and binary layout. `B2.BackendContracts.subset`, `dominated`, and `scope` discharge the exact upstream input predicates; all are active and pass the strict transitive audit. |
 | O6 contracts | SORRY | `B2.Lowering.lower_declarations` proves empty extern/signature/global/slot declarations generically. `B2.CallFree` proves absence of try calls, indirect statements/signatures, and TLS for the actual Collatz function. Complete contract composition remains unchecked. |
-| O7 AArch64 x0 | SORRY | Needs O6, backend composition, and its transitive axiom audit. No AArch64-success claim yet. |
+| O7 AArch64 x0 | SORRY | The active, audited `B2.BackendEntry.xholds_cv_iff` identifies upstream `XHolds` for a UInt64 value with equality of its 64 bits (closure `[propext, Quot.sound]`). Needs O6, backend composition, and its transitive axiom audit. No AArch64-success claim yet. |
 
 Every PROVED result is in the default root and `B2.AxiomAudit`, which calls
 `Lean.collectAxioms` and rejects closures outside `propext`, `Quot.sound`,
@@ -32,9 +32,10 @@ Six compiler/proof source pairs are committed byte-identical (Types,
 AST, Codec, Value, Eval, Clif). `scripts/check_b2_source_identity.py`
 verifies them and a clean pinned clifv. `.github/workflows/b2.yml` enforces
 source identity, the proof build, and compiler-toolchain integration.
-Remote CI for scope activation `4a5347d` passed:
-https://github.com/Th0rgal/turbo-lean/actions/runs/41226888299 .
-This verifies the active scope proofs and audit in a fresh default-root build.
+Remote CI for scope activation `4a5347d` and documentation checkpoint `403b858` passed:
+https://github.com/Th0rgal/turbo-lean/actions/runs/41226888299 and
+https://github.com/Th0rgal/turbo-lean/actions/runs/41228152932 .
+These verify the active scope proofs and audit in fresh default-root builds.
 The local Lean 4.35 CoreCLI integration build passed; the actual compiler
 dispatcher emitted collatz_steps CLIF. `research/b2-compiler-smoke.lean`
 records that check and CI runs it too.
@@ -129,3 +130,11 @@ Use the existing build's results for the remaining B2 checks.
 An isolated kernel check of the draft's exact `prepared_call_free` statement
 passed with closure `[propext]`. Complete O6 composition is still pending the
 genuine upstream contract dependencies; this isolated result does not upgrade O6.
+
+At 18:28 UTC the same FinalDirect scheduler is checking the upstream
+`FV.Backend.Proof.RefinesInsts` module; the follow-up checker is live and waiting
+for genuine contract dependencies. The UInt64 return bridge was promoted from
+its passing isolated check into BackendEntry and the strict audit, then used
+in the excluded end-to-end draft. BackendEntry, the full active audit, and the
+active root passed kernel checks at 18:27 UTC. Full O7 composition remains
+unchecked; this bridge does not establish an AArch64 execution by itself.

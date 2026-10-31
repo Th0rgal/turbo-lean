@@ -98,9 +98,11 @@ Lean-version incompatibility remains an explicit incomplete requirement.
 `backend_correct_final_of_lower` takes the following exact groups:
 
 1. `hsub : InSubset p f`, `hd : dominatedB f = true`,
-   `hs : lowerScopeB f = true` (O1/O5). The program must actually contain
-   the entry function for O3; the old draft's empty-program hypothesis
-   cannot be used for an initialized executable entry.
+   `hs : lowerScopeB f = true` (O1/O5). The public `Clif.runWith` simulation
+   requires `p.func? f.name = some f`, because it looks up the entry by name.
+   The backend theorem instead starts from `ClifEntry f args cs`, which
+   already identifies the function in the active frame. For this call-free
+   function, its initialized `runLoop` needs no further program lookup.
 2. Pipeline equations `hl : lowerFunction f = .ok vc`,
    `hp : Backend.prepare vc = .ok vcp`,
    `hch : checkAlloc vcp rf = .ok ()`,

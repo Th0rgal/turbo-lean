@@ -48,8 +48,7 @@ theorem collatz_to_arm {p : Clif.Program}
   rw [B2.CollatzSource.collatz_eval] at hev
   cases hev
   refine ⟨count, hret, rfl, ?_⟩
-  simpa [B2.CollatzClif.cv, Clif.Ty.width] using
-    (XHolds_iff (Nat.le_refl 64)).mp (hregs 0 _ rfl)
+  exact (B2.BackendEntry.xholds_cv_iff _ _).mp (hregs 0 _ rfl)
 
 #print axioms collatz_to_arm
 end B2.EndToEnd
