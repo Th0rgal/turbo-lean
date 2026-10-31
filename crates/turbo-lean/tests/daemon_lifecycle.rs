@@ -783,3 +783,90 @@ fn no_daemon_env_uses_relaxed_booleans() {
         ));
     }
 }
+
+#[test]
+fn crashed_zygote_worker_fails_closed_without_stock_lean_fallback() {
+    use std::os::unix::fs::PermissionsExt;
+    let _serial = LIFECYCLE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new();
+    let mut seed = f.check("Quick.lean");
+    seed.args(["--decl", "quick", "--no-daemon"]);
+    assert!(f.run(seed).status.success());
+    let marker = f.root.join("worker-crashed");
+    let mut replaced = 0;
+    for entry in fs::read_dir(f.root.join("cas/fastcheck_bins"))
+        .unwrap()
+        .flatten()
+    {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("turbo_zygote_")
+        {
+            let tmp = entry.path().with_extension("crash_replacement");
+            fs::write(
+                &tmp,
+                format!("#!/bin/sh\necho crash >> '{}'\nexit 1\n", marker.display()),
+            )
+            .unwrap();
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::rename(tmp, entry.path()).unwrap();
+            replaced += 1;
+        }
+    }
+    assert!(replaced > 0, "seed did not cache a worker");
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let addr = format!("127.0.0.1:{port}");
+    let server = ChildGuard(
+        f.command()
+            .args([
+                "--cache-dir",
+                f.root.join("cas").to_str().unwrap(),
+                "serve",
+                "--listen",
+                &addr,
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    f.wait_for(Duration::from_secs(30), || {
+        std::net::TcpStream::connect(&addr).is_ok()
+    });
+    fs::write(
+        f.root.join("CrashValid.lean"),
+        "theorem valid_after_crash : 1 + 1 = 2 := rfl\n",
+    )
+    .unwrap();
+    for remote in [false, true] {
+        for decl in [true, false] {
+            let mut cmd = f.check("CrashValid.lean");
+            cmd.arg("--no-daemon");
+            if remote {
+                cmd.args(["--remote-http", &format!("http://{addr}")]);
+            }
+            if decl {
+                cmd.args(["--decl", "valid_after_crash"]);
+            }
+            let out = f.run(cmd);
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                !out.status.success(),
+                "worker crash fell back to stock lean (remote={remote}, decl={decl}): {text}"
+            );
+        }
+    }
+    drop(server);
+    f.stop();
+    assert!(marker.exists(), "crashing worker was not exercised");
+    evidence(
+        "worker crash failed closed across remote/daemon and --no-daemon without fallback".into(),
+    );
+}

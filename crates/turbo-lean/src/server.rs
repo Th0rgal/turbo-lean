@@ -1014,12 +1014,20 @@ pub fn serve_cas_http_with_auth(
                     if let Some(expected) = req.execution_identity.as_deref() {
                         let (imports, _) = crate::zygote::split_shard_for_zygote(src);
                         let actual = crate::zygote::resolve_zygote_context(
-                            tc, &req.lean_path, &env_vars, &lean_bin, &imports,
+                            tc,
+                            &req.lean_path,
+                            &env_vars,
+                            &lean_bin,
+                            &imports,
                         );
                         if expected != actual.identity {
-                            let _ = write_json_response(&mut stream, 409, &serde_json::json!({
-                                "ok": false, "error": "eval execution identity changed"
-                            }));
+                            let _ = write_json_response(
+                                &mut stream,
+                                409,
+                                &serde_json::json!({
+                                    "ok": false, "error": "eval execution identity changed"
+                                }),
+                            );
                             return;
                         }
                     }
@@ -1359,6 +1367,12 @@ fn toolchain_dir_candidates(toolchain: &str) -> (String, String, String) {
     )
 }
 
+/// Store key of a receipt this server publishes for a caller-supplied shard key. The epoch makes
+/// receipts written before the `sorry` target gates (P0-1) unreachable, whatever keys callers send.
+fn server_receipt_key(shard_key: &str) -> String {
+    format!("srv-v2:{}", shard_key)
+}
+
 /// Pin the request's toolchain for an elan-proxied `lean` unless the environment already does.
 fn set_elan_toolchain(env_vars: &mut std::collections::HashMap<String, String>, toolchain: &str) {
     if !toolchain.is_empty() && toolchain != "unknown" {
@@ -1411,13 +1425,14 @@ fn source_may_have_hygiene_issue(s: &str) -> bool {
 // Caller keys are opaque; the server adds its own effective-option namespace.
 // Empty options retain the legacy identity.
 fn option_bound_http_key(key: &str, digest: Option<&str>) -> String {
+    let base = server_receipt_key(key);
     match digest {
-        None => key.to_string(),
+        None => base,
         Some(digest) => {
             let mut h = blake3::Hasher::new();
             h.update(b"http-shard-options-v1:");
-            h.update(&(key.len() as u64).to_le_bytes());
-            h.update(key.as_bytes());
+            h.update(&(base.len() as u64).to_le_bytes());
+            h.update(base.as_bytes());
             h.update(digest.as_bytes());
             h.finalize().to_hex().to_string()
         }
@@ -1468,6 +1483,87 @@ fn execute_check_shard_payload_deferred_with_domain(
     let filtered_req_args = crate::module_builder::validate_effective_lean_args(&req.lean_args)?;
     let req_args_digest_opt = crate::module_builder::compute_lean_args_digest(&filtered_req_args)?;
     let cache_key = option_bound_http_key(&req.shard_key, req_args_digest_opt.as_deref());
+
+    let (req_allowed, req_allowed_csv) =
+        resolve_request_axiom_policy(req.allowed_axioms.as_deref(), trust_domain);
+    // A named target is gated (and checked with its name) on every path, the local daemon's
+    // `skip_cas_lock` requests included. A batch names its targets in `targets`; one that names none
+    // has every declaration of its source treated as a target (so no `sorry` stub is admitted).
+    let named_target = !matches!(req.decl.as_str(), "" | "__batch__" | "__coalesced_batch__");
+    let stub_targets: Vec<String> = if !req.targets.is_empty() {
+        req.targets.clone()
+    } else if named_target {
+        vec![req.decl.clone()]
+    } else {
+        crate::splitter::split_lean_source(&req.shard_source, &[])
+            .shards
+            .into_iter()
+            .map(|sh| sh.rooted_name())
+            .collect()
+    };
+
+    if source_may_have_hygiene_issue(&req.shard_source) {
+        let clean_source = crate::splitter::strip_lean_comments(&req.shard_source);
+        let source_violations = crate::splitter::audit_hygiene(&clean_source);
+        if source_violations.native_violation_under(&req_allowed)
+            || source_violations.has_trust_compiler
+            || source_violations.has_unsafe
+            || source_violations.has_extern_or_implemented_by
+        {
+            anyhow::bail!(
+                "Soundness hygiene violation in remote shard `{}`: {:?}",
+                req.decl,
+                source_violations.flagged_items
+            );
+        }
+
+        if source_violations.has_sorry
+            && (named_target || !req.targets.is_empty() || !req.skip_cas_lock)
+        {
+            let dep_hashes = crate::lake_build::compute_imported_olean_interface_hashes(
+                &req.shard_source,
+                Path::new("."),
+                if req.lean_path.is_empty() {
+                    None
+                } else {
+                    Some(req.lean_path.as_str())
+                },
+            );
+            let parsed = crate::splitter::split_lean_source(&req.shard_source, &dep_hashes);
+            let target_body = if parsed.shards.len() == 1 {
+                let s = &parsed.shards[0];
+                format!("{}\n{}", s.signature_text, s.proof_text)
+            } else {
+                let req_set: std::collections::HashSet<String> =
+                    stub_targets.iter().cloned().collect();
+                let matched: Vec<String> = parsed
+                    .shards
+                    .iter()
+                    .filter(|s| {
+                        let eff = s.effective_name();
+                        let base = eff.split("__turbo_check_").next().unwrap_or(eff);
+                        crate::splitter::matches_uncached_or_fast_verify_name(base, &req_set)
+                    })
+                    .map(|s| format!("{}\n{}", s.signature_text, s.proof_text))
+                    .collect();
+                if matched.is_empty() {
+                    clean_source.clone()
+                } else {
+                    matched.join("\n")
+                }
+            };
+            let clean_target = crate::splitter::strip_lean_comments(&target_body);
+            let violations = crate::splitter::audit_hygiene(&clean_target);
+            if !violations.disallowed_items_under(&req_allowed).is_empty() {
+                anyhow::bail!(
+                    "Soundness hygiene violation in remote shard `{}`: {:?}",
+                    req.decl,
+                    violations.flagged_items
+                );
+            }
+        }
+    }
+
     if !req.skip_cas_lock
         && option_matching_http_hits(
             store,
@@ -1493,80 +1589,6 @@ fn execute_check_shard_payload_deferred_with_domain(
         ));
     }
 
-    let (req_allowed, req_allowed_csv) =
-        resolve_request_axiom_policy(req.allowed_axioms.as_deref(), trust_domain);
-
-    if source_may_have_hygiene_issue(&req.shard_source) {
-        let clean_source = crate::splitter::strip_lean_comments(&req.shard_source);
-        let source_violations = crate::splitter::audit_hygiene(&clean_source);
-        if source_violations.native_violation_under(&req_allowed)
-            || source_violations.has_trust_compiler
-            || source_violations.has_unsafe
-            || source_violations.has_extern_or_implemented_by
-        {
-            anyhow::bail!(
-                "Soundness hygiene violation in remote shard `{}`: {:?}",
-                req.decl,
-                source_violations.flagged_items
-            );
-        }
-
-        if !req.skip_cas_lock && source_violations.has_sorry {
-            let dep_hashes = crate::lake_build::compute_imported_olean_interface_hashes(
-                &req.shard_source,
-                Path::new("."),
-                if req.lean_path.is_empty() {
-                    None
-                } else {
-                    Some(req.lean_path.as_str())
-                },
-            );
-            let parsed = crate::splitter::split_lean_source(&req.shard_source, &dep_hashes);
-            let target_body = if parsed.shards.len() == 1 {
-                let s = &parsed.shards[0];
-                format!("{}\n{}", s.signature_text, s.proof_text)
-            } else {
-                let short_req: String = req
-                    .decl
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or(&req.decl)
-                    .chars()
-                    .map(|c| {
-                        if c.is_ascii_alphanumeric() || c == '_' {
-                            c
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect();
-                parsed
-                    .shards
-                    .iter()
-                    .find(|s| {
-                        let base = s.name.split("__turbo_check_").next().unwrap_or(&s.name);
-                        let short_s = base.rsplit('.').next().unwrap_or(base);
-                        base == req.decl
-                            || req.decl.ends_with(&format!(".{}", base))
-                            || base.ends_with(&format!(".{}", req.decl))
-                            || (short_s.starts_with("_turbo_verify_")
-                                && short_s.ends_with(&short_req))
-                    })
-                    .map(|s| format!("{}\n{}", s.signature_text, s.proof_text))
-                    .unwrap_or_else(|| clean_source.clone())
-            };
-            let clean_target = crate::splitter::strip_lean_comments(&target_body);
-            let violations = crate::splitter::audit_hygiene(&clean_target);
-            if !violations.disallowed_items_under(&req_allowed).is_empty() {
-                anyhow::bail!(
-                    "Soundness hygiene violation in remote shard `{}`: {:?}",
-                    req.decl,
-                    violations.flagged_items
-                );
-            }
-        }
-    }
-
     let toolchain = if req.toolchain.is_empty() || req.toolchain == "unknown" {
         "leanprover/lean4:v4.35.0"
     } else {
@@ -1590,20 +1612,18 @@ fn execute_check_shard_payload_deferred_with_domain(
     let mut zygote_peak_rss = 0u64;
     let mut zygote_used_constants: Vec<String> = Vec::new();
 
-    match crate::zygote::eval_with_zygote_pool_opts_with_args(
+    match crate::zygote::eval_with_zygote_pool_for_targets(
         store,
         toolchain,
         &req.lean_path,
         &env_vars,
         &lean_bin,
         &req.shard_source,
-        true,
-        false,
-        None,
+        &stub_targets,
         Some(crate::zygote::remaining_timeout_ms(timeout_ms, t0)),
         &filtered_req_args,
     ) {
-        Ok(zreply) if zreply.import_ok => {
+        Ok(zreply) if zreply.import_ok && !zreply.crashed && !zreply.timed_out => {
             if !zreply.ok {
                 anyhow::bail!(
                     "Remote `lean` shard verification failed for `{}`:\n{}",
@@ -1621,30 +1641,22 @@ fn execute_check_shard_payload_deferred_with_domain(
             zygote_peak_rss = zreply.peak_rss_mb;
             zygote_used_constants = zreply.used_constants;
         }
+        Ok(zreply) if zreply.crashed || zreply.timed_out => {
+            anyhow::bail!(
+                "Remote `lean` shard verification failed for `{}`:\n{}",
+                req.decl,
+                zreply.errors.join("\n")
+            );
+        }
         Ok(_) if req.skip_cas_lock => {
             return Err(crate::zygote::ZygoteImportUnavailable(req.decl.clone()).into());
         }
-        Err(e) if req.skip_cas_lock => return Err(e),
-        _ => {}
+        Ok(_) => {}
+        Err(e) => return Err(e),
     }
 
     if !zygote_used {
-        let audit_set: std::collections::HashSet<String> =
-            if matches!(req.decl.as_str(), "" | "__batch__" | "__coalesced_batch__") {
-                crate::splitter::split_lean_source(&req.shard_source, &[])
-                    .shards
-                    .into_iter()
-                    .filter(|sh| {
-                        !crate::splitter::audit_hygiene(&crate::splitter::strip_lean_comments(
-                            &sh.proof_text,
-                        ))
-                        .has_sorry
-                    })
-                    .map(|sh| sh.name)
-                    .collect()
-            } else {
-                std::iter::once(req.decl.clone()).collect()
-            };
+        let audit_set: std::collections::HashSet<String> = stub_targets.iter().cloned().collect();
         set_elan_toolchain(&mut env_vars, &req.toolchain);
         let out = crate::zygote::run_audited_lean_shard(
             store,
@@ -1768,30 +1780,14 @@ fn execute_check_shards_batch_payload_deferred(
                 .map(|receipt| (item.shard_key.clone(), receipt))
         })
         .collect();
+    let is_hit = |i: &crate::pack::CheckShardBatchItem| cached_map.contains_key(&i.shard_key);
     let hit_keys: Vec<String> = req
         .items
         .iter()
-        .filter(|i| cached_map.contains_key(&i.shard_key))
+        .filter(|i| is_hit(i))
         .map(|i| bound_key(&i.shard_key))
         .collect();
     let cache_hits = hit_keys.len();
-
-    if cache_hits == req.items.len() {
-        return Ok((
-            CheckShardsBatchResponse {
-                ok: true,
-                verified_count: 0,
-                cache_hits,
-                elapsed_ms: (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0,
-                exit_code: 0,
-                stdout: String::new(),
-                stderr: String::new(),
-                error: None,
-            },
-            None,
-            hit_keys,
-        ));
-    }
 
     let (req_allowed, req_allowed_csv) =
         resolve_request_axiom_policy(req.allowed_axioms.as_deref(), trust_domain);
@@ -1839,11 +1835,29 @@ fn execute_check_shards_batch_payload_deferred(
         }
     }
 
+    // Cached results are served only after the payload passed the hygiene gates above.
+    if cache_hits == req.items.len() {
+        return Ok((
+            CheckShardsBatchResponse {
+                ok: true,
+                verified_count: 0,
+                cache_hits,
+                elapsed_ms: (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0,
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                error: None,
+            },
+            None,
+            hit_keys,
+        ));
+    }
+
     let effective_batch_source = if cache_hits > 0 {
         let server_uncached_decls: HashSet<String> = req
             .items
             .iter()
-            .filter(|i| !cached_map.contains_key(&i.shard_key))
+            .filter(|i| !is_hit(i))
             .map(|i| i.decl_name.clone())
             .collect();
         crate::splitter::build_coalesced_shard_source(
@@ -1866,25 +1880,37 @@ fn execute_check_shards_batch_payload_deferred(
     let mut stderr = String::new();
     let mut exit_code = 0i32;
 
-    if let Ok(zreply) = crate::zygote::eval_with_zygote_pool_opts_with_args(
+    let batch_audit: std::collections::HashSet<String> = req
+        .items
+        .iter()
+        .filter(|i| !is_hit(i))
+        .map(|i| i.decl_name.clone())
+        .collect();
+    let mut batch_targets: Vec<String> = batch_audit.iter().cloned().collect();
+    batch_targets.sort();
+    match crate::zygote::eval_with_zygote_pool_for_targets(
         store,
         toolchain,
         &req.lean_path,
         &env_vars,
         &lean_bin,
         &effective_batch_source,
-        true,
-        false,
-        None,
+        &batch_targets,
         Some(crate::zygote::remaining_timeout_ms(timeout_ms, t0)),
         &filtered_batch_args,
     ) {
-        if zreply.import_ok {
+        Ok(zreply) if zreply.import_ok || zreply.crashed || zreply.timed_out => {
             zygote_handled = true;
-            if !zreply.ok {
+            if !zreply.ok || zreply.crashed || zreply.timed_out {
                 exit_code = 1;
                 stderr = zreply.errors.join("\n");
             }
+        }
+        Ok(_) => {}
+        Err(e) => {
+            zygote_handled = true;
+            exit_code = 1;
+            stderr = format!("{:#}", e);
         }
     }
 
@@ -1905,12 +1931,6 @@ fn execute_check_shards_batch_payload_deferred(
             env_vars.insert("LEAN_PATH".to_string(), full_lean_path);
         }
 
-        let batch_audit: std::collections::HashSet<String> = req
-            .items
-            .iter()
-            .filter(|i| !cached_map.contains_key(&i.shard_key))
-            .map(|i| i.decl_name.clone())
-            .collect();
         set_elan_toolchain(&mut env_vars, &req.toolchain);
         match crate::zygote::run_audited_lean_shard(
             store,
@@ -1961,11 +1981,15 @@ fn execute_check_shards_batch_payload_deferred(
     let now = now_unix();
     let mut publish_items = Vec::with_capacity(uncached_count);
     for item in &req.items {
-        if cached_map.contains_key(&item.shard_key) {
+        if is_hit(item) {
             continue;
         }
+        let clean_decl = item
+            .decl_name
+            .strip_prefix("_root_.")
+            .unwrap_or(&item.decl_name);
         let receipt_obj = serde_json::json!({
-            "decl": item.decl_name,
+            "decl": clean_decl,
             "prefix_env_hash": item.prefix_env_hash,
             "stmt_hash": item.stmt_hash,
             "proof_hash": item.proof_hash,
@@ -1974,7 +1998,7 @@ fn execute_check_shards_batch_payload_deferred(
         let receipt = option_bound_receipt(receipt_obj, batch_args_digest_opt.as_deref())?;
         publish_items.push((
             bound_key(&item.shard_key),
-            item.decl_name.clone(),
+            clean_decl.to_string(),
             receipt,
             per_shard_ms,
         ));
@@ -2429,7 +2453,7 @@ mod bind_auth_tests {
             &tc,
             &domain,
             &[(
-                empty_key.clone(),
+                option_bound_http_key(&empty_key, None),
                 "http_options_second".into(),
                 option_bound_receipt(serde_json::json!({}), None)?,
                 1,
@@ -2451,12 +2475,16 @@ mod bind_auth_tests {
         assert_eq!(hits.len(), 1);
         let (_, _, entries) = publication.unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].0, batch.items[0].shard_key);
+        assert_eq!(
+            entries[0].0,
+            option_bound_http_key(&batch.items[0].shard_key, None)
+        );
         batch.items.pop();
         batch.coalesced_shard_source = source.into();
         batch.items[0].shard_key = batch_key;
         batch.lean_args = low;
-        let (second, _, hits) = execute_check_shards_batch_payload_deferred(&mut store, &batch, None)?;
+        let (second, _, hits) =
+            execute_check_shards_batch_payload_deferred(&mut store, &batch, None)?;
         assert_eq!(second.cache_hits, 0);
         assert!(hits.is_empty());
         // Partial hit: only the entry verified under the requested options may be pruned.
@@ -2477,7 +2505,10 @@ mod bind_auth_tests {
         assert_eq!(entries.len(), 1);
         batch.lean_args = vec!["--plugin=unsafe.so".into()];
         assert!(execute_check_shards_batch_payload_deferred(&mut store, &batch, None).is_err());
-        assert_eq!(option_bound_http_key("legacy-key", None), "legacy-key");
+        assert_eq!(
+            option_bound_http_key("legacy-key", None),
+            "srv-v2:legacy-key"
+        );
         let _ = std::fs::remove_dir_all(dir);
         Ok(())
     }
