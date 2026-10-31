@@ -257,6 +257,7 @@ structure SymExecState where
   nextHeapId    : SymExpr := .constU64 0
   rcEpoch       : SymExpr := .constU64 0
   memWrites     : List (VarId × SymExpr × SymExpr) := []
+  ubReqs        : List (SymExpr × SymExpr) := []
   noUB          : Bool := true
   supported     : Bool := true
   nonPoison     : Bool := true
@@ -363,12 +364,23 @@ def hasKnownRootTracking (st : SymExecState) (root : VarId) : Bool :=
   match (st.lookupVar root).expr with
   | .symVar base =>
     base == root && ((st.rootKinds.lookup root).isSome || (st.rootRc.lookup root).isSome ||
-      st.exclusiveBufs.contains root || !(st.vars.lookup root).isSome)
+      st.exclusiveBufs.contains root)
   | .ctorObj .. | .tuple _ =>
     (st.rootKinds.lookup root).isSome || (st.rootRc.lookup root).isSome || st.exclusiveBufs.contains root
   | .projSym 5 base 0 =>
     st.rootKinds.lookup root == some (.rawPtr base)
   | _ => false
+
+def canProjectCtor (st : SymExecState) (root : VarId) : Bool :=
+  st.hasKnownRootTracking root && !st.immRoots.contains root &&
+    match st.rootKinds.lookup root with
+    | some .objPtr | some .taggedPtr => true
+    | none => st.maybeScalarRoots.contains root
+    | _ => false
+
+def requireUbCap (st : SymExecState) (cap : SymExpr) : SymExecState :=
+  let rest := st.ubReqs.filter (fun (k, _) => k != cap)
+  { st with ubReqs := (cap, .constBool true) :: rest }
 
 def dropAliasedRootBounds (st : SymExecState) (keepRoot : VarId) : SymExecState :=
   let isMayAlias (id : VarId) := id != keepRoot && !st.isFreshRuntimeAllocRoot id
@@ -405,6 +417,14 @@ def incRootRc (st : SymExecState) (objVar : VarId) (count : Nat) : SymExecState 
 
 private def dedupIds (xs : List VarId) : List VarId :=
   xs.foldl (fun acc x => if acc.contains x then acc else acc ++ [x]) []
+
+private def dedupSymExprs (xs : List SymExpr) : List SymExpr :=
+  xs.foldl (fun acc x => if acc.contains x then acc else acc ++ [x]) []
+
+private def mergeUbCond (cExpr rT rE : SymExpr) : SymExpr :=
+  match normSymExpr cExpr with
+  | .unaryOp .not inner => normSymIteStep inner rE rT
+  | c => normSymIteStep c rT rE
 
 private def cantPair (a b : Nat) : Nat :=
   (a + b) * (a + b + 1) / 2 + b
@@ -501,6 +521,13 @@ def mergeBranches (base stT stE : SymExecState) (cExpr : SymExpr) (condNoUB cond
       if stT.rcEpoch == stE.rcEpoch then stT.rcEpoch
       else normSymIteStep cExpr stT.rcEpoch stE.rcEpoch
     memWrites := if stT.memWrites == stE.memWrites then stT.memWrites else base.memWrites
+    ubReqs :=
+      let ubKeys := dedupSymExprs (base.ubReqs.map (·.1) ++ stT.ubReqs.map (·.1) ++ stE.ubReqs.map (·.1))
+      ubKeys.filterMap fun cap =>
+        let rT := (stT.ubReqs.lookup cap).getD (.constBool false)
+        let rE := (stE.ubReqs.lookup cap).getD (.constBool false)
+        let nextReq := if rT == rE then rT else mergeUbCond cExpr rT rE
+        if nextReq == .constBool false then none else some (cap, nextReq)
     noUB := base.noUB && condNoUB && stT.noUB && stE.noUB
     supported := base.supported && stT.supported && stE.supported
     nonPoison := base.nonPoison && condNonPoison && stT.nonPoison && stE.nonPoison
@@ -868,7 +895,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
     let root := st.resolveBuf mapVar
     let mv := st.lookupVar root
     let kindOk := match st.rootKinds.lookup root with
-      | none | some .storageMap => st.hasKnownRootTracking root
+      | some .storageMap => st.hasKnownRootTracking root
       | _ => false
     let st0 := st.clearDstTracking dst
     let slotSv := st.lookupVar slotVar
@@ -879,7 +906,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
     let root := st.resolveBuf arrVar
     let mv := st.lookupVar root
     let kindOk := match st.rootKinds.lookup root with
-      | none | some .sarray => st.hasKnownRootTracking root && st.isRootLive root
+      | some .sarray => st.hasKnownRootTracking root && st.isRootLive root
       | _ => false
     let st0 := st.clearDstTracking dst
     let idxSv := st.lookupVar idxVar
@@ -891,7 +918,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
     let mv := st.lookupVar root
     let (bufRoot, kindOk) := match st.rootKinds.lookup root with
       | some (.rawPtr br) => (br, st.hasKnownRootTracking root && st.isRootLive br)
-      | none | some .sarray => (root, st.hasKnownRootTracking root && st.isRootLive root)
+      | some .sarray => (root, st.hasKnownRootTracking root && st.isRootLive root)
       | _ => (root, false)
     let st0 := st.clearDstTracking dst
     let idxSv := st.lookupVar idxVar
@@ -904,7 +931,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
     let slotSv := st.lookupVar slotVar
     let valSv := st.lookupVar valVar
     let kindOk := match st.rootKinds.lookup root with
-      | none | some .storageMap => st.hasKnownRootTracking root
+      | some .storageMap => st.hasKnownRootTracking root
       | _ => false
     if !kindOk then
       let st1 := (st.clearDstTracking dst).bindVar dst { expr := .symVar root, nonPoison := false, noUB := false }
@@ -943,7 +970,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
       | none => st0.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
     | .ctorObj _ tag _ _ =>
       let root := st.resolveBuf tupleVar
-      let knownOk := st.hasKnownRootTracking root
+      let knownOk := st.hasKnownRootTracking root && st.rootKinds.lookup root == some .objPtr
       let (minRc, exactRc?) := st.getRootRc root
       let liveOk := minRc > 0 && exactRc? != some 0
       if idx == 0 then
@@ -951,11 +978,12 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
         { st1 with supported := st1.supported && knownOk }
       else st0.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
     | .symVar base =>
-      let knownOk := st.hasKnownRootTracking (st.resolveBuf tupleVar)
+      let root := st.resolveBuf tupleVar
+      let knownOk := st.hasKnownRootTracking root
       let r := match fieldRoot? with
         | some known => known
         | none => st0.projSyntheticRoot 0 base idx
-      let curFs := st.tupleRoots.lookup (st.resolveBuf tupleVar)
+      let curFs := st.tupleRoots.lookup root
       let inBounds : Bool := match curFs with | some fs => decide (idx < fs.length) | none => true
       let st1 := match fieldRoot?, curFs with
         | none, none =>
@@ -971,14 +999,30 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
           else .projSym 2 base idx
         | none, none => .symVar r
         | none, some fs => if idx < fs.length then .projSym 0 base idx else .projSym 2 base idx
-      let st2 := st1.bindVar dst { expr := outExpr, nonPoison := tv.nonPoison, noUB := tv.noUB && knownOk && inBounds }
-      { st2 with supported := st2.supported && knownOk && inBounds }
+      let kind := st.rootKinds.lookup root
+      let heapish := match kind with
+        | some .objPtr | some .taggedPtr => true
+        | none => st.maybeScalarRoots.contains root && !st.immRoots.contains root
+        | _ => false
+      let staticTup := match curFs with | some fs => decide (idx < fs.length) | none => false
+      let tagOk := knownOk && heapish && idx == 0 && !staticTup
+      let badHeap := knownOk && heapish && idx > 0 && !staticTup
+      let badKind := knownOk && !heapish && !staticTup
+      let stCap := if tagOk && kind != some .objPtr then st1.requireUbCap (.projSym 12 root 0) else st1
+      let st2 := stCap.bindVar dst { expr := outExpr, nonPoison := tv.nonPoison, noUB := tv.noUB && knownOk && inBounds && !badHeap && !badKind }
+      { st2 with supported := st2.supported && knownOk && inBounds && !badKind }
     | _ =>
       let root := st.resolveBuf tupleVar
       let (minRc, exactRc?) := st.getRootRc root
       let liveOk := minRc > 0 && exactRc? != some 0
-      if idx == 0 && fieldRoot?.isNone && st.hasKnownRootTracking root && (st.tupleRoots.lookup root).isNone then
-        stA.bindVar dst { expr := .projSym 0 root 0, nonPoison := tv.nonPoison, noUB := tv.noUB && liveOk }
+      let kind := st.rootKinds.lookup root
+      let heapish := match kind with
+        | some .objPtr | some .taggedPtr => true
+        | none => st.maybeScalarRoots.contains root && !st.immRoots.contains root
+        | _ => false
+      if idx == 0 && fieldRoot?.isNone && st.hasKnownRootTracking root && (st.tupleRoots.lookup root).isNone && heapish then
+        let stCap := if kind == some .objPtr then stA else stA.requireUbCap (.projSym 12 root 0)
+        stCap.bindVar dst { expr := .projSym 0 root 0, nonPoison := tv.nonPoison, noUB := tv.noUB && liveOk }
       else
         let outExpr := match fieldRoot? with | some r => .symVar r | none => .projSym 2 root idx
         let knownOk := fieldRoot?.isSome
@@ -1006,7 +1050,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
     let stBase := st.clearDstTracking dst
     match cv.expr with
     | .ctorObj _ _ os _ =>
-      let knownOk := st.hasKnownRootTracking ctorRoot
+      let knownOk := st.hasKnownRootTracking ctorRoot && st.rootKinds.lookup ctorRoot == some .objPtr
       let stA := match st.lookupObjRootField ctorRoot idx with
         | some r => stBase.aliasBuf dst r
         | none => stBase
@@ -1015,8 +1059,16 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
         let st1 := stA.bindVar dst { expr := fExpr, nonPoison := cv.nonPoison, noUB := cv.noUB && liveOk && knownOk }
         { st1 with supported := st1.supported && knownOk }
       | none => stBase.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+    | .tuple (_ :: vals) =>
+      match vals[idx]? with
+      | some fExpr =>
+        let fieldRoot? := st.lookupTupleRootField ctorVar (idx + 1)
+        let stA := match fieldRoot? with | some r => stBase.aliasBuf dst r | none => stBase
+        stA.bindVar dst { expr := fExpr, nonPoison := cv.nonPoison, noUB := cv.noUB }
+      | none => stBase.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+    | .tuple [] => stBase.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
     | .symVar base =>
-      let knownOk := st.hasKnownRootTracking ctorRoot
+      let knownOk := st.canProjectCtor ctorRoot
       let r := match st.lookupObjRootField ctorRoot idx with
         | some known => known
         | none => stBase.projSyntheticRoot 1 base idx
@@ -1026,19 +1078,20 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
         else (stBase.setRootRc r 1 none).markMaybeScalar r
       let padded := curFs ++ List.replicate (idx - curFs.length) none
       let nextFs := if idx < padded.length then padded.set idx (some r) else padded ++ [some r]
-      let st1 := st0.bindObjRoots ctorRoot nextFs
+      let st1 := (st0.bindObjRoots ctorRoot nextFs).requireUbCap (.projSym 10 ctorRoot idx)
       let st2 := (st1.aliasBuf dst r).bindVar dst
         { expr := .symVar r, nonPoison := cv.nonPoison, noUB := cv.noUB && liveOk && knownOk }
       { st2 with supported := st2.supported && knownOk }
     | _ =>
-      let knownOk := st.hasKnownRootTracking ctorRoot
+      let knownOk := st.canProjectCtor ctorRoot
       let r := match st.lookupObjRootField ctorRoot idx with
         | some known => known
         | none => stBase.projSyntheticRoot 2 ctorRoot idx
       let stA :=
         if (stBase.rootRc.lookup r).isSome then stBase
         else (stBase.setRootRc r 1 none).markMaybeScalar r
-      let st1 := (stA.aliasBuf dst r).bindVar dst { expr := .symVar r, nonPoison := cv.nonPoison, noUB := cv.noUB && liveOk && knownOk }
+      let stCap := stA.requireUbCap (.projSym 10 ctorRoot idx)
+      let st1 := (stCap.aliasBuf dst r).bindVar dst { expr := .symVar r, nonPoison := cv.nonPoison, noUB := cv.noUB && liveOk && knownOk }
       { st1 with supported := st1.supported && knownOk }
   | .ctorGetScalar ctorVar idx _ =>
     let cv := st.lookupVar ctorVar
@@ -1048,7 +1101,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
     let stBase := st.clearDstTracking dst
     match cv.expr with
     | .ctorObj _ _ _ ss =>
-      let knownOk := st.hasKnownRootTracking ctorRoot
+      let knownOk := st.hasKnownRootTracking ctorRoot && st.rootKinds.lookup ctorRoot == some .objPtr
       match ss[idx]? with
       | some fExpr =>
         let stA :=
@@ -1061,22 +1114,32 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
         let st1 := stA.bindVar dst { expr := fExpr, nonPoison := cv.nonPoison, noUB := cv.noUB && liveOk && knownOk }
         { st1 with supported := st1.supported && knownOk }
       | none => stBase.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+    | .tuple (_ :: vals) =>
+      match vals[idx]? with
+      | some fExpr =>
+        let fieldRoot? := st.lookupTupleRootField ctorVar (idx + 1)
+        let stA := match fieldRoot? with | some r => stBase.aliasBuf dst r | none => stBase
+        stA.bindVar dst { expr := fExpr, nonPoison := cv.nonPoison, noUB := cv.noUB }
+      | none => stBase.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+    | .tuple [] => stBase.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
     | .symVar base =>
-      let knownOk := st.hasKnownRootTracking ctorRoot
+      let knownOk := st.canProjectCtor ctorRoot
       let r := stBase.projSyntheticRoot 3 base idx
       let st0 :=
         if (stBase.rootRc.lookup r).isSome then stBase
         else (stBase.setRootRc r 1 none).markMaybeScalar r
-      let st1 := (st0.aliasBuf dst r).bindVar dst
+      let stCap := st0.requireUbCap (.projSym 11 ctorRoot idx)
+      let st1 := (stCap.aliasBuf dst r).bindVar dst
         { expr := .symVar r, nonPoison := cv.nonPoison, noUB := cv.noUB && liveOk && knownOk }
       { st1 with supported := st1.supported && knownOk }
     | _ =>
-      let knownOk := st.hasKnownRootTracking ctorRoot
+      let knownOk := st.canProjectCtor ctorRoot
       let r := stBase.projSyntheticRoot 4 ctorRoot idx
       let st0 :=
         if (stBase.rootRc.lookup r).isSome then stBase
         else (stBase.setRootRc r 1 none).markMaybeScalar r
-      let st1 := (st0.aliasBuf dst r).bindVar dst
+      let stCap := st0.requireUbCap (.projSym 11 ctorRoot idx)
+      let st1 := (stCap.aliasBuf dst r).bindVar dst
         { expr := .symVar r, nonPoison := cv.nonPoison, noUB := cv.noUB && liveOk && knownOk }
       { st1 with supported := st1.supported && knownOk }
   | .isExclusive objVar =>
@@ -1107,12 +1170,12 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
     let root := st.resolveBuf arrVar
     let av := st.lookupVar root
     let kindOk := match st.rootKinds.lookup root with
-      | none | some .sarray => st.hasKnownRootTracking root && st.isRootLive root
+      | some .sarray => st.hasKnownRootTracking root && st.isRootLive root
       | _ => false
     let st0 := st.clearDstTracking dst
     let st1 := st0.bindVar dst { expr := .arrLen root, nonPoison := av.nonPoison, noUB := av.noUB && kindOk }
     { st1 with supported := st1.supported && kindOk }
-    | .sarrayDataPtr arrVar _elemTy =>
+  | .sarrayDataPtr arrVar _elemTy =>
     let root := st.resolveBuf arrVar
     let av := st.lookupVar root
     match st.rootKinds.lookup root with
@@ -1121,7 +1184,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
       let st1 := ((st.clearDstTracking dst).aliasBuf dst root).bindVar dst
         { expr := av.expr, nonPoison := av.nonPoison, noUB := av.noUB && knownOk }
       { st1 with supported := st1.supported && knownOk }
-    | none | some .sarray =>
+    | some .sarray =>
       let rawR := st.projSyntheticRoot 5 root 0
       let knownOk := st.hasKnownRootTracking root && st.isRootLive root
       let exclOk := knownOk && st.isBufExclusive root
@@ -1136,7 +1199,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
     let root := st.resolveBuf arrVar
     let av := st.lookupVar root
     let kindOk := match st.rootKinds.lookup root with
-      | none | some .sarray => st.hasKnownRootTracking root
+      | some .sarray => st.hasKnownRootTracking root
       | _ => false
     if !kindOk then
       let st1 := (st.clearDstTracking dst).bindVar dst { expr := .symVar root, nonPoison := av.nonPoison, noUB := false }
@@ -1154,7 +1217,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
     let idxSv := st.lookupVar idxVar
     let valSv := st.lookupVar valVar
     let kindOk := match st.rootKinds.lookup root with
-      | none | some .sarray => st.hasKnownRootTracking root
+      | some .sarray => st.hasKnownRootTracking root
       | _ => false
     if !kindOk then
       let st1 := (st.clearDstTracking dst).bindVar dst { expr := .symVar root, nonPoison := false, noUB := false }
@@ -1196,7 +1259,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
           match st.hasKnownRootTracking root, st.rootKinds.lookup root with
           | true, some (.rawPtr _) | true, some .storageMap | true, some .objPtr =>
             (st0.aliasBuf dst root).bindVar dst av
-          | true, none | true, some .sarray =>
+          | true, some .sarray =>
             if !st.isRootLive root then
               st0.bindVar dst { expr := av.expr, nonPoison := av.nonPoison, noUB := false }
             else
@@ -1210,7 +1273,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
         let root := st.resolveBuf a
         let sa := st.lookupVar a
         let kindOk := match st.rootKinds.lookup root with
-          | none | some .sarray => st.hasKnownRootTracking root && st.isRootLive root
+          | some .sarray => st.hasKnownRootTracking root && st.isRootLive root
           | _ => false
         let st1 := st0.bindVar dst { expr := .arrLen root, nonPoison := sa.nonPoison, noUB := sa.noUB && kindOk }
         { st1 with supported := st1.supported && kindOk }
@@ -1234,6 +1297,7 @@ structure SymExecSummary where
   nonPoison  : Bool
   retVal     : SymExpr
   memWrites  : List (SymExpr × SymExpr × SymExpr)
+  ubReqs     : List (SymExpr × SymExpr) := []
   liveRc     : List (SymExpr × Nat × Option Nat × SymExpr) := []
   nextHeapId : SymExpr := .constU64 0
   deriving Repr, Inhabited, BEq
@@ -1274,7 +1338,7 @@ private def symExecCodeAux (fuel : Nat) (unrollBound : Nat) (st : SymExecState) 
       let valSv := st.lookupVar valVar
       let (bufRoot, kindOk) := match st.rootKinds.lookup root with
         | some (.rawPtr br) => (br, st.hasKnownRootTracking root && st.isRootLive br)
-        | none | some .sarray => (root, st.hasKnownRootTracking root && st.isRootLive root)
+        | some .sarray => (root, st.hasKnownRootTracking root && st.isRootLive root)
         | _ => (root, false)
       let st1 := st.writeBufSym bufRoot idxSv.expr valSv.expr true
       let st2 := { st1 with
@@ -1301,16 +1365,21 @@ private def symExecCodeAux (fuel : Nat) (unrollBound : Nat) (st : SymExecState) 
         let mergedState := SymExecState.mergeBranches st stT stE cExpr condSv.noUB condSv.nonPoison
         let mergedRoot? := if rootT? == rootE? then rootT? else none
         (mergedState, normSymIteStep cExpr (normSymExpr retT) (normSymExpr retE), mergedRoot?)
-    | .seqFor idxVar _loVar _hiVar accVar accInit _accTy stepBody k =>
+    | .seqFor idxVar loVar hiVar accVar accInit _accTy stepBody k =>
       let initSv := st.lookupVar accInit
       let stCleared := st.clearDstTracking accVar
       let stAliased := match st.trackedRoot? accInit with
         | some r => stCleared.aliasBuf accVar r
         | none => stCleared
       let stInit := stAliased.bindVar accVar initSv
-      let stAfterLoop := symExecLoopUnroll unrollBound 0 idxVar accVar stInit
+      let stAfterLoop0 := symExecLoopUnroll unrollBound 0 idxVar accVar stInit
         (fun s => symExecCodeAux fuel' unrollBound s stepBody)
-      symExecCodeAux fuel' unrollBound stAfterLoop k
+      let tripCond := normSymBinOpStep .lt (normSymExpr (st.lookupVar loVar).expr) (normSymExpr (st.lookupVar hiVar).expr)
+      let loopUbReqs := stAfterLoop0.ubReqs.filterMap fun (cap, rLoop) =>
+        let rPre := (st.ubReqs.lookup cap).getD (.constBool false)
+        let nextReq := if rPre == rLoop then rPre else SymExecState.mergeUbCond tripCond rLoop rPre
+        if nextReq == .constBool false then none else some (cap, nextReq)
+      symExecCodeAux fuel' unrollBound { stAfterLoop0 with ubReqs := loopUbReqs } k
     | .parFor outVar _lenVar _inputs _elemTy _kernel k =>
       let (freshOut, _, stSeq) := st.allocFreshHeapRoot false
       let st0 := stSeq.clearDstTracking outVar
@@ -1324,7 +1393,7 @@ private def symExecCodeAux (fuel : Nat) (unrollBound : Nat) (st : SymExecState) 
           noUB := st.noUB && rSv.noUB
           nonPoison := st.nonPoison && rSv.nonPoison }, finalExpr, st.trackedRoot? v)
     | .unreachable =>
-      ({ st with reachable := false }, .unit, none)
+      ({ (st.requireUbCap (.constU64 0)) with reachable := false }, .unit, none)
 
 def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNIRCode) :
     SymExecState × SymExpr :=
@@ -1444,6 +1513,8 @@ def symExecDeclFromInit (initState : SymExecState) (loopUnrollBound : Nat := 4) 
     liveOther ++ liveFresh
   let canonWrites := finalSt.memWrites.map fun (b, i, v) =>
     (idSym b, normSymExpr (substSymHeapIds mapHeapId i), normSymExpr (substSymHeapIds mapHeapId v))
+  let canonUbReqs := finalSt.ubReqs.map fun (cap, req) =>
+    (normSymExpr (substSymHeapIds mapHeapId cap), normSymExpr (substSymHeapIds mapHeapId req))
   { declName := d.name
     reachable := finalSt.reachable
     noUB := finalSt.noUB
@@ -1451,6 +1522,7 @@ def symExecDeclFromInit (initState : SymExecState) (loopUnrollBound : Nat := 4) 
     nonPoison := finalSt.nonPoison
     retVal := normSymExpr (substSymHeapIds mapHeapId retExpr)
     memWrites := canonWrites
+    ubReqs := canonUbReqs
     liveRc := canonLiveRc
     nextHeapId := normSymExpr (substSymHeapIds mapHeapId finalSt.nextHeapId) }
 
@@ -1643,6 +1715,24 @@ structure TVModuleReport where
   declResults   : List TVDeclResult
   deriving Repr, DecidableEq, Inhabited, BEq
 
+/-- Syntactic implication on normalized ITE-of-Bool path conditions (`reqTgt → reqSrc`). -/
+def symCondImplies : SymExpr → SymExpr → Bool
+  | .constBool false, _ => true
+  | _, .constBool true => true
+  | a, b =>
+    if a == b then true
+    else match a, b with
+    | .ite c1 t1 e1, .ite c2 t2 e2 =>
+      if c1 == c2 then symCondImplies t1 t2 && symCondImplies e1 e2
+      else symCondImplies t1 b && symCondImplies e1 b
+    | .ite _ t1 e1, _ => symCondImplies t1 b && symCondImplies e1 b
+    | _, _ => false
+
+/-- Every dynamic layout/projection UB capability required by `tgt` must be required by `src` under an implied condition. -/
+def ubReqsRefine (srcReqs tgtReqs : List (SymExpr × SymExpr)) : Bool :=
+  tgtReqs.all fun (cap, reqTgt) =>
+    symCondImplies reqTgt ((srcReqs.lookup cap).getD (.constBool false))
+
 /-- Validate translation refinement `(src ⊑ tgt)` for a single declaration using Alive2's 6 obligations. -/
 def validateTranslationDecl (src tgt : LNIRDecl) (numSamples : Nat := 64) : TVDeclResult :=
   let sharedAllocBase := Nat.max (declAllocBase src) (declAllocBase tgt)
@@ -1653,8 +1743,8 @@ def validateTranslationDecl (src tgt : LNIRDecl) (numSamples : Nat := 64) : TVDe
   let initTgt := if paramsMatch then initSrc else initDeclSymState sharedAllocBase tgt
   let sSrc := symExecDeclFromInit initSrc 4 src
   let sTgt := symExecDeclFromInit initTgt 4 tgt
-  -- 1. UB refinement: fail closed if symbolic modeling is unsupported, else src.noUB -> tgt.noUB
-  let ubRefines := sSrc.supported && sTgt.supported && (!sSrc.noUB || sTgt.noUB)
+  -- 1. UB refinement: fail closed if symbolic modeling is unsupported, else src.noUB -> tgt.noUB and ubReqsRefine
+  let ubRefines := sSrc.supported && sTgt.supported && (!sSrc.noUB || sTgt.noUB) && ubReqsRefine sSrc.ubReqs sTgt.ubReqs
   -- 2. Return domain / reachability equivalence
   let domainEquiv := sSrc.reachable == sTgt.reachable
   -- 3. Poison refinement: src.nonPoison -> tgt.nonPoison
@@ -1779,9 +1869,12 @@ end SymbolicTV
 #guard !(symEvalExpr {} 9 (.call "lean_native_sarray_len" [1] .i64 true)).noUB
 #guard !(symEvalExpr {} 9 (.call "lean_native_unknown" [1] .i64)).noUB
 #guard (symEvalExpr {} 9 (.call "lean_native_unbox_u64" [1] .i64)).lookupVar 9 == (({} : SymExecState).lookupVar 1)
-#guard ((symEvalExpr {} 9 (.call "lean_native_ensure_exclusive" [1] (.sarray .i64))).isBufExclusive 9)
-#guard (symEvalExpr {} 9 (.call "lean_native_sarray_len" [1] .i64)).lookupVar 9 ==
-  (symEvalExpr {} 9 (.sarrayLen 1)).lookupVar 9
+#guard !(symEvalExpr {} 9 (.call "lean_native_ensure_exclusive" [1] (.sarray .i64))).noUB
+#guard (let sArr := (({} : SymExecState).setRootRc 1 1 none).setRootKind 1 .sarray
+  (symEvalExpr sArr 9 (.call "lean_native_ensure_exclusive" [1] (.sarray .i64))).isBufExclusive 9)
+#guard (let sArr := (({} : SymExecState).setRootRc 1 1 none).setRootKind 1 .sarray
+  (symEvalExpr sArr 9 (.call "lean_native_sarray_len" [1] .i64)).lookupVar 9 ==
+    (symEvalExpr sArr 9 (.sarrayLen 1)).lookupVar 9)
 
 private def mkExclTestDecl (name : String) (body : LNIRCode) : LNIRDecl :=
   { name := name
@@ -3844,6 +3937,159 @@ private def ctorDelOnSArrayBadTgt : LNIRDecl :=
     ctorDelOnSArraySrc.body ctorDelOnSArrayBadTgt.body)
 #guard !(validateTranslationDecl ctorDelOnSArraySrc ctorDelOnSArrayBadTgt).symRetEquiv
 #guard !(validateTranslationDecl ctorDelOnSArraySrc ctorDelOnSArrayBadTgt).passed
+
+-- Codex P1 regression (4430134590): projecting a child object slot `c := ctorGetObj p 0` yields a
+-- maybe-scalar root (`c` may hold an immediate `.u64` at runtime), so a speculative second projection
+-- `d := ctorGetObj c 0` or `s := ctorGetScalar c 0 .i64` or `t := projTuple c 0` in `tgt` must fail `ubRefines`.
+private def maybeScalarChildProjSrc : LNIRDecl :=
+  { name := "maybe_scalar_child_proj"
+    params := [{ id := 0, name := "p", ty := .objPtr, borrow := true }]
+    retTy := .i64
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 1 .objPtr (.ctorGetObj 0 0) <|
+      .letBind 2 .i64 (.scalar (.constU64 7)) <|
+      .ret 2 }
+
+private def maybeScalarChildCtorGetObjBadTgt : LNIRDecl :=
+  { maybeScalarChildProjSrc with
+    body :=
+      .letBind 1 .objPtr (.ctorGetObj 0 0) <|
+      .letBind 3 .objPtr (.ctorGetObj 1 0) <|
+      .letBind 2 .i64 (.scalar (.constU64 7)) <|
+      .ret 2 }
+
+private def maybeScalarChildCtorGetScalarBadTgt : LNIRDecl :=
+  { maybeScalarChildProjSrc with
+    body :=
+      .letBind 1 .objPtr (.ctorGetObj 0 0) <|
+      .letBind 3 .i64 (.ctorGetScalar 1 0 .i64) <|
+      .letBind 2 .i64 (.scalar (.constU64 7)) <|
+      .ret 2 }
+
+private def maybeScalarChildProjTupleBadTgt : LNIRDecl :=
+  { maybeScalarChildProjSrc with
+    body :=
+      .letBind 1 .objPtr (.ctorGetObj 0 0) <|
+      .letBind 3 .i64 (.projTuple 1 0) <|
+      .letBind 2 .i64 (.scalar (.constU64 7)) <|
+      .ret 2 }
+
+private def maybeScalarChildSArrayLenBadTgt : LNIRDecl :=
+  { maybeScalarChildProjSrc with
+    body :=
+      .letBind 1 .objPtr (.ctorGetObj 0 0) <|
+      .letBind 3 .i64 (.sarrayLen 1) <|
+      .letBind 2 .i64 (.scalar (.constU64 7)) <|
+      .ret 2 }
+
+#guard !(let (pVal, st0) := HeapState.empty.allocCtor 0 [.u64 42] []
+  checkSingleSample 1024 (VarEnv.empty.bind 0 pVal) st0
+    maybeScalarChildProjSrc.body maybeScalarChildCtorGetObjBadTgt.body)
+#guard !(let (pVal, st0) := HeapState.empty.allocCtor 0 [.u64 42] []
+  checkSingleSample 1024 (VarEnv.empty.bind 0 pVal) st0
+    maybeScalarChildProjSrc.body maybeScalarChildCtorGetScalarBadTgt.body)
+#guard !(let (pVal, st0) := HeapState.empty.allocCtor 0 [.bool true] []
+  checkSingleSample 1024 (VarEnv.empty.bind 0 pVal) st0
+    maybeScalarChildProjSrc.body maybeScalarChildProjTupleBadTgt.body)
+#guard !(validateTranslationDecl maybeScalarChildProjSrc maybeScalarChildCtorGetObjBadTgt).ubRefines
+#guard !(validateTranslationDecl maybeScalarChildProjSrc maybeScalarChildCtorGetObjBadTgt).passed
+#guard !(validateTranslationDecl maybeScalarChildProjSrc maybeScalarChildCtorGetScalarBadTgt).ubRefines
+#guard !(validateTranslationDecl maybeScalarChildProjSrc maybeScalarChildCtorGetScalarBadTgt).passed
+#guard !(validateTranslationDecl maybeScalarChildProjSrc maybeScalarChildProjTupleBadTgt).ubRefines
+#guard !(validateTranslationDecl maybeScalarChildProjSrc maybeScalarChildProjTupleBadTgt).passed
+#guard !(validateTranslationDecl maybeScalarChildProjSrc maybeScalarChildSArrayLenBadTgt).ubRefines
+#guard !(validateTranslationDecl maybeScalarChildProjSrc maybeScalarChildSArrayLenBadTgt).passed
+
+-- Hoisting a branch-guarded `ctorGetObj` out of its tag guard introduces out-of-bounds UB on 0-field constructors.
+private def hoistedBranchProjSrc : LNIRDecl :=
+  { name := "hoisted_branch_proj"
+    params := [{ id := 0, name := "p", ty := .objPtr, borrow := true }]
+    retTy := .i64
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 1 .i64 (.projTuple 0 0) <|
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 1))) <|
+      .ite 2
+        (.letBind 3 .objPtr (.ctorGetObj 0 0) <|
+         .letBind 4 .i64 (.scalar (.constU64 9)) <|
+         .ret 4)
+        (.letBind 4 .i64 (.scalar (.constU64 9)) <|
+         .ret 4) }
+
+private def hoistedBranchProjBadTgt : LNIRDecl :=
+  { hoistedBranchProjSrc with
+    body :=
+      .letBind 3 .objPtr (.ctorGetObj 0 0) <|
+      .letBind 1 .i64 (.projTuple 0 0) <|
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 1))) <|
+      .ite 2
+        (.letBind 4 .i64 (.scalar (.constU64 9)) <|
+         .ret 4)
+        (.letBind 4 .i64 (.scalar (.constU64 9)) <|
+         .ret 4) }
+
+#guard !(let (pVal, st0) := HeapState.empty.allocCtor 0 [] []
+  checkSingleSample 1024 (VarEnv.empty.bind 0 pVal) st0
+    hoistedBranchProjSrc.body hoistedBranchProjBadTgt.body)
+#guard !(validateTranslationDecl hoistedBranchProjSrc hoistedBranchProjBadTgt).ubRefines
+#guard !(validateTranslationDecl hoistedBranchProjSrc hoistedBranchProjBadTgt).passed
+
+-- Speculative `ctorGetObj` on a `.taggedPtr` parameter introduces typeError UB when the parameter is an immediate `.u64`.
+private def taggedParamSpecProjSrc : LNIRDecl :=
+  { name := "tagged_param_spec_proj"
+    params := [{ id := 0, name := "p", ty := .taggedPtr, borrow := true }]
+    retTy := .i64
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body := .letBind 1 .i64 (.scalar (.constU64 5)) (.ret 1) }
+
+private def taggedParamSpecProjBadTgt : LNIRDecl :=
+  { taggedParamSpecProjSrc with
+    body :=
+      .letBind 2 .objPtr (.ctorGetObj 0 0) <|
+      .letBind 1 .i64 (.scalar (.constU64 5)) <|
+      .ret 1 }
+
+#guard !(checkSingleSample 1024 (VarEnv.empty.bind 0 (.u64 17)) HeapState.empty
+  taggedParamSpecProjSrc.body taggedParamSpecProjBadTgt.body)
+#guard !(validateTranslationDecl taggedParamSpecProjSrc taggedParamSpecProjBadTgt).ubRefines
+#guard !(validateTranslationDecl taggedParamSpecProjSrc taggedParamSpecProjBadTgt).passed
+
+-- Hoisting a `ctorGetObj` out of a possibly-zero-trip `seqFor` loop introduces UB when `lo >= hi` and `p` has 0 fields.
+private def loopZeroTripProjSrc : LNIRDecl :=
+  { name := "loop_zero_trip_proj"
+    params := [{ id := 0, name := "p", ty := .objPtr, borrow := true },
+               { id := 1, name := "lo", ty := .i64, borrow := false },
+               { id := 2, name := "hi", ty := .i64, borrow := false }]
+    retTy := .i64
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 3 .i64 (.scalar (.constU64 0)) <|
+      .seqFor 4 1 2 5 3 .i64
+        (.letBind 6 .objPtr (.ctorGetObj 0 0) <|
+         .letBind 7 .i64 (.scalar (.binOp .add (.var 5) (.constU64 1))) <|
+         .ret 7)
+        (.ret 5) }
+
+private def loopZeroTripProjHoistedBadTgt : LNIRDecl :=
+  { loopZeroTripProjSrc with
+    body :=
+      .letBind 6 .objPtr (.ctorGetObj 0 0) <|
+      .letBind 3 .i64 (.scalar (.constU64 0)) <|
+      .seqFor 4 1 2 5 3 .i64
+        (.letBind 7 .i64 (.scalar (.binOp .add (.var 5) (.constU64 1))) <|
+         .ret 7)
+        (.ret 5) }
+
+#guard !(let (pVal, st0) := HeapState.empty.allocCtor 0 [] []
+  let env0 := ((VarEnv.empty.bind 0 pVal).bind 1 (.u64 5)).bind 2 (.u64 5)
+  checkSingleSample 1024 env0 st0 loopZeroTripProjSrc.body loopZeroTripProjHoistedBadTgt.body)
+#guard !(validateTranslationDecl loopZeroTripProjSrc loopZeroTripProjHoistedBadTgt).ubRefines
+#guard !(validateTranslationDecl loopZeroTripProjSrc loopZeroTripProjHoistedBadTgt).passed
 
 /-! ## JSON & Human-Readable Formatting for `TVModuleReport` -/
 
