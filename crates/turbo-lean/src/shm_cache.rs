@@ -66,10 +66,11 @@ pub fn cache_root() -> PathBuf {
 pub fn acquire_publish_flock(
     pkg_root: &Path,
     exclusive: bool,
+    preserve_lake: bool,
 ) -> std::io::Result<PublishFlockGuard> {
     let directory = flock_file(fs::File::open(pkg_root)?, exclusive, false)?;
     let lock_path = pkg_root.join(".lake/build/.turbo_publish.lock");
-    let legacy = if crate::lake_build::worktree_auto_link_disabled(pkg_root) {
+    let legacy = if preserve_lake {
         match fs::File::open(&lock_path) {
             Ok(file) => flock_file(file, exclusive, false)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -917,7 +918,7 @@ mod tests {
             "[worktree]\nauto_link = false\n",
         )?;
         let paths = [root.join("artifact"), root.join("missing")];
-        let guard = super::acquire_publish_flock(&root, false)?;
+        let guard = super::acquire_publish_flock(&root, false, true)?;
         for change in ["inode", "mtime", "size", "presence", "lock"] {
             fs::write(&paths[0], b"old")?;
             let old_time = fs::metadata(&paths[0])?.modified()?;
@@ -976,8 +977,8 @@ mod tests {
         )?;
         std::os::unix::fs::symlink(&project, root.join("alias"))?;
         for legacy in [false, true] {
-            let reader = super::acquire_publish_flock(&project, false)?;
-            let alias_reader = super::acquire_publish_flock(&root.join("alias"), false)?;
+            let reader = super::acquire_publish_flock(&project, false, true)?;
+            let alias_reader = super::acquire_publish_flock(&root.join("alias"), false, true)?;
             assert_eq!(
                 reader._directory.as_ref().unwrap().0.metadata()?.ino(),
                 alias_reader
@@ -996,7 +997,7 @@ mod tests {
                 std::fs::create_dir_all(project.join(".lake/build"))?;
                 // Opt-out must also preserve a populated build directory without a legacy lock.
                 let before = snapshot(&project)?;
-                drop(super::acquire_publish_flock(&project, true)?);
+                drop(super::acquire_publish_flock(&project, true, true)?);
                 assert_eq!(before, snapshot(&project)?);
                 let lock = project.join(".lake/build/.turbo_publish.lock");
                 std::fs::write(&lock, b"legacy")?;
@@ -1004,7 +1005,7 @@ mod tests {
                 std::fs::set_permissions(lock, std::fs::Permissions::from_mode(0o444))?;
             } else {
                 let before = snapshot(&project)?;
-                drop(super::acquire_publish_flock(&project, true)?);
+                drop(super::acquire_publish_flock(&project, true, true)?);
                 assert_eq!(before, snapshot(&project)?);
             }
         }

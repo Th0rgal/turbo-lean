@@ -4711,7 +4711,11 @@ fn is_dep_olean_fresh(
     if entry.src_blake3 != actual_src_hash {
         return None;
     }
-    let actual_olean_digest = compute_olean_artifact_set_digest(olean_path).ok()?;
+    let actual_olean_digest = compute_olean_artifact_set_digest_with_policy(
+        olean_path,
+        crate::lake_build::worktree_auto_link_disabled(&cfg.root_pkg.pkg_root),
+    )
+    .ok()?;
     if entry.olean_artifact_digest != actual_olean_digest {
         return None;
     }
@@ -5437,12 +5441,23 @@ fn infer_pkg_root_from_artifact_path(artifact_path: &Path) -> Option<PathBuf> {
 /// acquiring the shared package publication flock (`LOCK_SH`) so readers never observe a mid-commit
 /// state, and propagating I/O errors if an existing companion file cannot be read.
 pub fn compute_olean_artifact_set_digest(olean_path: &Path) -> Result<String> {
+    compute_olean_artifact_set_digest_with_policy(olean_path, false)
+}
+
+fn compute_olean_artifact_set_digest_with_policy(
+    olean_path: &Path,
+    preserve_caller: bool,
+) -> Result<String> {
     let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
     let _guard = lock
         .lock()
         .map_err(|_| anyhow::anyhow!("Module artifact publication mutex poisoned"))?;
     let _flock_guard = if let Some(pkg_root) = infer_pkg_root_from_artifact_path(olean_path) {
-        Some(acquire_publish_flock_mode(&pkg_root, false)?)
+        Some(acquire_publish_flock_mode(
+            &pkg_root,
+            false,
+            preserve_caller || crate::lake_build::worktree_auto_link_disabled(&pkg_root),
+        )?)
     } else {
         None
     };
@@ -6229,7 +6244,7 @@ pub fn write_lake_module_hashes_and_trace(
     let _guard = lock
         .lock()
         .map_err(|_| anyhow::anyhow!("Module artifact publication mutex poisoned"))?;
-    let _flock_guard = acquire_publish_flock(&node.pkg_root)?;
+    let _flock_guard = acquire_publish_flock(&node.pkg_root, false)?;
     let srv_path = PathBuf::from(format!("{}.server", node.olean_path.display()));
     let priv_path = PathBuf::from(format!("{}.private", node.olean_path.display()));
     let ir_path = node.olean_path.with_extension("ir");
@@ -6666,8 +6681,9 @@ static PUBLISH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 fn acquire_publish_flock_mode(
     pkg_root: &Path,
     exclusive: bool,
+    preserve_lake: bool,
 ) -> Result<crate::shm_cache::PublishFlockGuard> {
-    crate::shm_cache::acquire_publish_flock(pkg_root, exclusive).with_context(|| {
+    crate::shm_cache::acquire_publish_flock(pkg_root, exclusive, preserve_lake).with_context(|| {
         format!(
             "Failed to acquire publication flock for `{}`",
             pkg_root.display()
@@ -6675,8 +6691,11 @@ fn acquire_publish_flock_mode(
     })
 }
 
-fn acquire_publish_flock(pkg_root: &Path) -> Result<crate::shm_cache::PublishFlockGuard> {
-    acquire_publish_flock_mode(pkg_root, true)
+fn acquire_publish_flock(
+    pkg_root: &Path,
+    preserve_lake: bool,
+) -> Result<crate::shm_cache::PublishFlockGuard> {
+    acquire_publish_flock_mode(pkg_root, true, preserve_lake)
 }
 
 #[derive(Clone, Debug)]
@@ -6880,7 +6899,7 @@ fn publish_module_artifacts_atomic(
     let _guard = lock
         .lock()
         .map_err(|_| anyhow::anyhow!("Module artifact publication mutex poisoned"))?;
-    let _flock_guard = acquire_publish_flock(&node.pkg_root)?;
+    let _flock_guard = acquire_publish_flock(&node.pkg_root, false)?;
     let had_valid_pre_publish_set = validate_materialized_module_artifacts(node);
     let dst_srv = PathBuf::from(format!("{}.server", node.olean_path.display()));
     let dst_priv = PathBuf::from(format!("{}.private", node.olean_path.display()));
@@ -7664,7 +7683,9 @@ fn store_module_artifacts_in_cas(
         let _guard = lock
             .lock()
             .map_err(|_| anyhow::anyhow!("Module artifact publication mutex poisoned"))?;
-        let _flock_guard = acquire_publish_flock_mode(&node.pkg_root, false)?;
+        let preserve_lake = crate::lake_build::worktree_auto_link_disabled(canon_project_dir)
+            || crate::lake_build::worktree_auto_link_disabled(&node.pkg_root);
+        let _flock_guard = acquire_publish_flock_mode(&node.pkg_root, false, preserve_lake)?;
         let artifact_files = collect_module_artifact_paths(node);
         let paths: Vec<_> = artifact_files.iter().map(|(_, p)| p.clone()).collect();
         _flock_guard.read_consistent(&paths, || {
@@ -7843,7 +7864,7 @@ pub fn build_project_modules_native(
     for node in dag.nodes.values() {
         for (ext_mod, ext_path) in &node.external_olean_deps {
             if !olean_digests.contains_key(ext_mod) {
-                let d = compute_olean_artifact_set_digest(ext_path)?;
+                let d = compute_olean_artifact_set_digest_with_policy(ext_path, preserve_project)?;
                 olean_digests.insert(ext_mod.clone(), d);
             }
         }
@@ -7861,7 +7882,7 @@ pub fn build_project_modules_native(
                     let _guard = lock.lock().map_err(|_| {
                         anyhow::anyhow!("Module artifact publication mutex poisoned")
                     })?;
-                    let _flock_guard = acquire_publish_flock(&node.pkg_root)?;
+                    let _flock_guard = acquire_publish_flock(&node.pkg_root, false)?;
                     wipe_existing_module_artifacts(node);
                 }
                 Ok(())
@@ -7931,7 +7952,8 @@ pub fn build_project_modules_native(
                     let _guard = lock.lock().map_err(|_| {
                         anyhow::anyhow!("Module artifact publication mutex poisoned")
                     })?;
-                    let _flock_guard = acquire_publish_flock(&node.pkg_root)?;
+                    let _flock_guard =
+                        acquire_publish_flock_mode(&node.pkg_root, !preserve_lake, preserve_lake)?;
                     if !preserve_lake {
                         wipe_existing_module_artifacts(node);
                         store.materialize_into_worktree(target_root, &project_name, &outputs)?;
@@ -7992,7 +8014,10 @@ pub fn build_project_modules_native(
                             )));
                         }
                     }
-                    let post_audit_dig = compute_olean_artifact_set_digest(&node.olean_path)?;
+                    let post_audit_dig = compute_olean_artifact_set_digest_with_policy(
+                        &node.olean_path,
+                        preserve_project,
+                    )?;
                     if post_audit_dig != dig {
                         invalidate()?;
                         anyhow::bail!(
@@ -8127,7 +8152,7 @@ pub fn build_project_modules_native(
                 for (i, _, _, _) in &compiled_wave_ok {
                     let (ref mod_name, _) = misses_to_compile[*i];
                     if let Some(node) = dag.nodes.get(mod_name) {
-                        if let Ok(_flock) = acquire_publish_flock(&node.pkg_root) {
+                        if let Ok(_flock) = acquire_publish_flock(&node.pkg_root, false) {
                             wipe_existing_module_artifacts(node);
                         }
                     }
@@ -8160,7 +8185,7 @@ pub fn build_project_modules_native(
                 for (i, _, _, _) in &compiled_wave_ok {
                     let (ref mod_name, _) = misses_to_compile[*i];
                     if let Some(node) = dag.nodes.get(mod_name) {
-                        if let Ok(_flock) = acquire_publish_flock(&node.pkg_root) {
+                        if let Ok(_flock) = acquire_publish_flock(&node.pkg_root, false) {
                             wipe_existing_module_artifacts(node);
                         }
                     }
@@ -8174,11 +8199,12 @@ pub fn build_project_modules_native(
                 print!("{}", stdout_str);
             }
             let node = dag.nodes.get(mod_name).expect("node in dag");
-            let post_audit_dig = compute_olean_artifact_set_digest(&node.olean_path)?;
+            let post_audit_dig =
+                compute_olean_artifact_set_digest_with_policy(&node.olean_path, preserve_project)?;
             if post_audit_dig != dig {
                 let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
                 if let Ok(_guard) = lock.lock() {
-                    if let Ok(_flock) = acquire_publish_flock(&node.pkg_root) {
+                    if let Ok(_flock) = acquire_publish_flock(&node.pkg_root, false) {
                         wipe_existing_module_artifacts(node);
                     }
                 }
@@ -8285,7 +8311,7 @@ mod tests {
         fs::write(tree.root.join("node.json"), serde_json::to_vec(node)?)?;
         // Reader starts first and consumes the old .olean. An old binary then
         // creates only the legacy lock and replaces both outputs before .ilean.
-        let guard = acquire_publish_flock_mode(&tree.project, false)?;
+        let guard = acquire_publish_flock_mode(&tree.project, false, true)?;
         let err = read_olean_artifact_set_digest(&node.olean_path, Some(&guard), |path| {
             let bytes = fs::read(path)?;
             if path == node.olean_path {
@@ -8361,7 +8387,11 @@ mod tests {
             let current = if legacy_holder {
                 None
             } else {
-                Some(acquire_publish_flock_mode(&tree.project, mode == "reader")?)
+                Some(acquire_publish_flock_mode(
+                    &tree.project,
+                    mode == "reader",
+                    optout,
+                )?)
             };
             let mut command =
                 TestChild::command("module_builder::tests::test_publication_process_child")?;
@@ -9485,6 +9515,104 @@ lean_exe «demo-exe» where
         assert!(err.contains("Worktree opt-out prevents restoring"), "{err}");
         assert_eq!(snapshot(project)?, before);
         drop(store);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_caller_optout_preserves_external_path_dependency() -> Result<()> {
+        use crate::worktree_test_support::{snapshot, LakeTree};
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for prebuilt in [false, true] {
+            let tree = LakeTree::new("external_dep", &[("P/A.lean", "def depValue : Nat := 7\n")])?;
+            let caller = tree.root.join("caller");
+            fs::create_dir_all(&caller)?;
+            fs::write(
+                caller.join("lean-toolchain"),
+                include_str!("../../../lean/lean-toolchain"),
+            )?;
+            fs::write(caller.join("lakefile.toml"),
+                "name = \"app\"\ndefaultTargets = [\"App\"]\n[[require]]\nname = \"fixture\"\npath = \"../project\"\n[[lean_lib]]\nname = \"App\"\n")?;
+            fs::write(
+                caller.join("App.lean"),
+                "import P.A\ntheorem app : depValue = 7 := rfl\n",
+            )?;
+            let out = Command::new("lake")
+                .args(["build", "App"])
+                .current_dir(&caller)
+                .output()?;
+            anyhow::ensure!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let mut store = TurboStore::open(Some(&tree.root.join("cache")))?;
+            let targets = vec!["App".to_string()];
+            // Seed both module actions before opting out. Keep the dependency's
+            // manifest only in the case exercising external-prebuilt digest reads.
+            let seed = build_project_modules_native(
+                &mut store,
+                &caller,
+                &targets,
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )?;
+            assert_eq!(seed.modules_compiled, 2);
+            if !prebuilt {
+                fs::remove_file(
+                    tree.project
+                        .join(".lake/build/.turbo_verified_sources.json"),
+                )?;
+            }
+            fs::write(
+                caller.join("turbo-lean.toml"),
+                "[worktree]\nauto_link = false\n",
+            )?;
+            assert!(!tree.project.join("turbo-lean.toml").exists());
+            tree.prepare_snapshot(".lake/build/lib/lean/P/A.olean")?;
+            fs::remove_file(caller.join(".lake/build/.turbo_publish.lock"))?;
+            let dep_before = snapshot(&tree.project)?;
+            let caller_before = snapshot(&caller)?;
+            let cfg = resolve_project_config(&caller)?;
+            let dag = build_module_dag(&cfg, &targets)?;
+            assert_eq!(dag.nodes.contains_key("P.A"), !prebuilt);
+            let report = build_project_modules_native(
+                &mut store,
+                &caller,
+                &targets,
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )?;
+            assert_eq!(report.modules_compiled, 0);
+            assert_eq!(report.modules_cached, if prebuilt { 1 } else { 2 });
+            crate::lake_build::run_build_command(
+                &mut store,
+                true,
+                targets,
+                caller.clone(),
+                "trusted-internal".to_string(),
+                1,
+                false,
+            )?;
+            assert_eq!(
+                snapshot(&tree.project)?,
+                dep_before,
+                "external dependency changed (prebuilt={prebuilt})"
+            );
+            assert_eq!(
+                snapshot(&caller)?,
+                caller_before,
+                "caller changed (prebuilt={prebuilt})"
+            );
+        }
         Ok(())
     }
 
