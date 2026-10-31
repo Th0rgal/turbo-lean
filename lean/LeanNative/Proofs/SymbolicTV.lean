@@ -1490,9 +1490,52 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
           | .ctorGetScalar _ _ _ => true
           | _ => callSlotKind dstTy == some false
     let rootVar := st.resolveBuf ctorVar
-    if st.typedTuples.contains rootVar || st.sarrayVars.contains rootVar ||
+    if st.sarrayVars.contains rootVar ||
        st.boolVars.contains rootVar || st.u64Vars.contains rootVar || st.u256Vars.contains rootVar then
       ((st.clearAlias dst).unmarkTypedTuple dst).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+    else if st.typedTuples.contains rootVar then
+      let tv := st.lookupVar rootVar
+      match tv.expr with
+      | .tuple (_tag :: fs) =>
+        -- Concrete `evalExpr` (`Semantics/Eval.lean:289-293,306-310`) treats `.tuple (_tag :: vals)` as
+        -- a constructor tuple (skipping element 0 and projecting `vals[idx]?` without heap RC checks).
+        match fs[idx]? with
+        | some fExpr =>
+          let st' :=
+            match fExpr with
+            | .symVar fId =>
+              let eff := st.resolveBuf fId
+              let isScalarLeaf := st.boolVars.contains eff || st.u64Vars.contains eff || st.u256Vars.contains eff
+              if !isScalarLeaf then st.aliasBuf dst eff
+              else st.clearAlias dst
+            | _ => st.clearAlias dst
+          let isTypedSubTuple :=
+            match fExpr with
+            | .tuple _ => true
+            | .symVar fId => st.typedTuples.contains (st.resolveBuf fId)
+            | _ => false
+          let stSort :=
+            if isTypedSubTuple then st'.markTypedTuple dst
+            else
+              let stU := st'.unmarkTypedTuple dst
+              match symExprScalarSort? stU fExpr with
+              | some 0 => stU.markBoolVar dst
+              | some 1 => stU.markU64Var dst
+              | some 2 => stU.markU256Var dst
+              | _ =>
+                match fExpr with
+                | .symVar fId =>
+                  let eff := stU.resolveBuf fId
+                  if stU.objPtrVars.contains eff || stU.allocRoots.contains eff then stU.markObjPtrVar dst
+                  else if stU.sarrayVars.contains eff then stU.markSarrayVar dst
+                  else stU
+                | _ => stU
+          stSort.bindVar dst { expr := fExpr, nonPoison := tv.nonPoison, noUB := tv.noUB }
+        | none => ((st.clearAlias dst).unmarkTypedTuple dst).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+      | .tuple [] =>
+        ((st.clearAlias dst).unmarkTypedTuple dst).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+      | _ =>
+        (((st.clearAlias dst).unmarkTypedTuple dst).markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
     else
     let liveOk := st.isBufLive rootVar
     let stLive := (st.requireUbCond (st.liveRcCond rootVar)).noteExtLiveRoot rootVar
@@ -1534,7 +1577,13 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
         st'.bindVar dst { expr := fExpr, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
       | none => stBounds.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
     | .symVar rootId =>
-      if idx ≥ 8 then
+      if !(st.objPtrVars.contains rootVar || st.allocRoots.contains rootVar ||
+           (st.refCounts.lookup rootVar).isSome || (st.rcExprs.lookup rootVar).isSome ||
+           st.exclusiveBufs.contains rootVar) then
+        -- `.taggedPtr` or untyped projected child may hold an immediate scalar (`typeError`),
+        -- an unboxed tuple (`.tuple (_ :: _)`), or a heap `.objPtr`!
+        (stLive.markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+      else if idx ≥ 8 then
         stLive.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
       else
         let effRoot := stLive.resolveBuf rootId
@@ -1825,6 +1874,11 @@ def symExecLoopUnroll (unrollCount : Nat) (curIdx : Nat) (idxVar accVar : VarId)
     }
     symExecLoopUnroll n (curIdx + 1) idxVar accVar stNextBound execBody
 
+private def symExprMentionsHeapRoot (st : SymExecState) : SymExpr → Bool
+  | .symVar id => st.isHeapObjectRoot id
+  | .ite _ a b => symExprMentionsHeapRoot st a || symExprMentionsHeapRoot st b
+  | _ => false
+
 /-- Fuel-bounded symbolic execution of `LNIRCode`. -/
 def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNIRCode) :
     SymExecState × SymExpr :=
@@ -1902,11 +1956,7 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
         | .tuple fs =>
           match fs[idx]? with
           | some (.ite cond tBranch eBranch) =>
-            let rec hasSymRoot : SymExpr → Bool
-              | .symVar id => st.isHeapObjectRoot id
-              | .ite _ a b => hasSymRoot a || hasSymRoot b
-              | _ => false
-            if callSlotKind ty == some true || hasSymRoot tBranch || hasSymRoot eBranch then
+            if callSlotKind ty == some true || symExprMentionsHeapRoot st tBranch || symExprMentionsHeapRoot st eBranch then
               let condTmp : VarId := SymExecState.desugarTmpBase st.synVarBase fuel'
               let tTmp : VarId := condTmp + 1
               let eTmp : VarId := condTmp + 2
@@ -1932,10 +1982,41 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
         | _ =>
           let st1 := symEvalExpr st dst ty val
           symExecCode fuel' unrollBound st1 k
-      | .ctorGetObj ctorVar idx =>
+      | .ctorGetObj ctorVar idx | .ctorGetScalar ctorVar idx _ =>
         let rootVar := st.resolveBuf ctorVar
         let cv := st.lookupVar rootVar
-        if st.typedTuples.contains rootVar || st.sarrayVars.contains rootVar ||
+        if st.typedTuples.contains rootVar then
+          match cv.expr with
+          | .tuple (_ :: fs) =>
+            match fs[idx]? with
+            | some (.ite cond tBranch eBranch) =>
+              if callSlotKind ty == some true || symExprMentionsHeapRoot st tBranch || symExprMentionsHeapRoot st eBranch then
+                let condTmp : VarId := SymExecState.desugarTmpBase st.synVarBase fuel'
+                let tTmp : VarId := condTmp + 1
+                let eTmp : VarId := condTmp + 2
+                let mkBranchBind (tmpId : VarId) (bExpr : SymExpr) (curSt : SymExecState) : SymExecState × LNIRCode :=
+                  match bExpr with
+                  | .symVar rId =>
+                    let eff := curSt.resolveBuf rId
+                    (curSt, .letBind dst ty (.scalar (.var eff)) k)
+                  | _ =>
+                    let s1 := (curSt.clearAlias tmpId).bindVar tmpId { expr := .tuple [bExpr], nonPoison := cv.nonPoison, noUB := cv.noUB }
+                    let s2 := s1.markTypedTuple tmpId
+                    (s2, .letBind dst ty (.projTuple tmpId 0) k)
+                let stCond := ((st.clearAlias condTmp).markBoolVar condTmp).bindVar condTmp { expr := cond, nonPoison := cv.nonPoison, noUB := cv.noUB }
+                let (stWithT, codeT) := mkBranchBind tTmp tBranch stCond
+                let (stWithTE, codeE) := mkBranchBind eTmp eBranch stWithT
+                symExecCode fuel' unrollBound stWithTE (.ite condTmp codeT codeE)
+              else
+                let st1 := symEvalExpr st dst ty val
+                symExecCode fuel' unrollBound st1 k
+            | _ =>
+              let st1 := symEvalExpr st dst ty val
+              symExecCode fuel' unrollBound st1 k
+          | _ =>
+            let st1 := symEvalExpr st dst ty val
+            symExecCode fuel' unrollBound st1 k
+        else if st.sarrayVars.contains rootVar ||
            st.boolVars.contains rootVar || st.u64Vars.contains rootVar || st.u256Vars.contains rootVar then
           let st1 := symEvalExpr st dst ty val
           symExecCode fuel' unrollBound st1 k

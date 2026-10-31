@@ -2362,6 +2362,27 @@ open LeanNative.IR LeanNative.Proofs
   let tupleParamObjBad := validateTranslationDecl (mkTupleParamObjPtrProjDecl false) (mkTupleParamObjPtrProjDecl true) 8
   unless !tupleParamObjBad.ubRefines && !tupleParamObjBad.passed do
     throw <| IO.userError s!"projTuple manufactured scalar sort for tuple [objPtr] parameter field: {reprStr tupleParamObjBad}"
+  let mkCtorGetOnUnboxedTupleDecl (corruptAt999 : Bool) (returnProjected : Bool) : LNIRDecl := {
+    name := "ctor_get_on_unboxed_tuple"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 1 .i64 (.scalar (.constU64 0))
+        (.letBind 2 (.tuple [.i64, .i64]) (.mkTuple [1, 0])
+          (.letBind 3 .i64 (.ctorGetScalar 2 0 .i64)
+            (if returnProjected then
+               .letBind 4 .i64 (.scalar (if corruptAt999 then .select (.binOp .eq (.var 0) (.constU64 999)) (.constU64 1) (.var 0) else .var 3))
+                 (.ret 4)
+             else
+               .letBind 4 .i64 (.scalar (if corruptAt999 then .select (.binOp .eq (.var 0) (.constU64 999)) (.constU64 1) (.constU64 0) else .constU64 0))
+                 (.ret 4))))
+  }
+  for retProj in [false, true] do
+    let ctorTupleBad := validateTranslationDecl (mkCtorGetOnUnboxedTupleDecl false retProj) (mkCtorGetOnUnboxedTupleDecl true retProj) 8
+    unless !ctorTupleBad.symRetEquiv && !ctorTupleBad.passed do
+      throw <| IO.userError s!"ctorGetScalar on unboxed tuple collapsed ubCond or returned wrong field (retProj={retProj}): {reprStr ctorTupleBad}"
+  unless (validateTranslationDecl (mkCtorGetOnUnboxedTupleDecl false true) (mkCtorGetOnUnboxedTupleDecl false true) 8).passed do
+    throw <| IO.userError "equivalent ctorGetScalar on unboxed tuple rejected"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)
