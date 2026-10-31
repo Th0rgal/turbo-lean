@@ -1,0 +1,147 @@
+name: clifv benchmark measured run
+
+# Measured run of scripts/bench_clifv.sh (docs/BENCH_CLIFV.md) on a GitHub-hosted runner.
+# Runner setup only: the benchmark script and its logic are used unmodified.
+on:
+  push:
+    branches: [bench/b1-gha]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # eth-act/clifv main HEAD at setup time (2026-10-31), pinned for reproducibility.
+  CLIFV_SHA: ff90b88aa69bfb7b8fb9ccffc2fe9d02b012b0ed
+  PAIRS: '3'
+  JOB_TIMEOUT_MIN: '350'
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Record job start
+        run: |
+          echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+          echo "META=$RUNNER_TEMP/bench-meta" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/bench-meta"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Record machine facts (as provisioned)
+        run: |
+          {
+            echo "## as provisioned $(date -u +%FT%TZ)"
+            echo "### nproc"; nproc
+            echo "### free -g"; free -g
+            echo "### df -h"; df -h
+            echo "### uname -a"; uname -a
+            echo "### lscpu model"; lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Core|Socket'
+            echo "### os-release"; cat /etc/os-release
+            echo "### runner"; echo "${RUNNER_NAME:-} ${ImageOS:-} ${ImageVersion:-}"
+          } | tee "$META/machine-facts.txt"
+
+      - name: Free disk space, add swap, install GNU time
+        run: |
+          # Preinstalled SDKs not used by this job; clifv's FV build needs tens of GB.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          # clifv modules peak at ~13 GB RSS (clifv scripts/lake-module-peaks.tsv) on a 16 GB
+          # runner; clifv's own CI adds 24 GB swap the same way.
+          # Work dir on the volume with the most free space (never /dev/shm's device);
+          # the swap file goes on the other volume when there is one.
+          avail() { df --output=avail -B1G "$1" | tail -n 1 | tr -d ' '; }
+          best="$RUNNER_TEMP"; dir=/
+          if [ -d /mnt ] && [ "$(stat -c %d /mnt)" != "$(stat -c %d "$RUNNER_TEMP")" ]; then
+            if (( $(avail /mnt) > $(avail "$RUNNER_TEMP") )); then best=/mnt; dir=/; else dir=/mnt; fi
+          fi
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile /swapfile || true
+          sudo fallocate -l 24G "$dir/bench-swapfile"
+          sudo chmod 600 "$dir/bench-swapfile"
+          sudo mkswap "$dir/bench-swapfile" > /dev/null
+          sudo swapon "$dir/bench-swapfile"
+          command -v /usr/bin/time > /dev/null || { sudo apt-get update -q && sudo apt-get install -yq time; }
+          sudo mkdir -p "$best/bench"
+          sudo chown "$(id -u):$(id -g)" "$best/bench"
+          echo "BENCH_ROOT=$best/bench" >> "$GITHUB_ENV"
+          {
+            echo "## after setup $(date -u +%FT%TZ)"
+            echo "swapfile: $dir/bench-swapfile (24G); bench work root: $best/bench"
+            echo "### free -g"; free -g
+            echo "### df -h"; df -h
+          } | tee -a "$META/machine-facts.txt"
+
+      - name: Install elan, Lean toolchains and Rust stable
+        run: |
+          TURBO_TC="$(tr -d '[:space:]' < lean/lean-toolchain)"
+          curl --retry 5 --retry-all-errors -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            | sh -s -- -y --default-toolchain "$TURBO_TC"
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.elan/bin:$PATH"
+          # clifv's pinned toolchain (lean-toolchain at CLIFV_SHA), installed outside any timing.
+          CLIFV_TC="$(curl --retry 5 -sSfL "https://raw.githubusercontent.com/eth-act/clifv/$CLIFV_SHA/lean-toolchain" | tr -d '[:space:]')"
+          elan toolchain install "$CLIFV_TC"
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          {
+            echo "## toolchains"
+            echo "turbo-lean lean-toolchain: $TURBO_TC"
+            echo "clifv lean-toolchain: $CLIFV_TC"
+            elan --version; elan toolchain list
+            rustc --version; cargo --version
+          } | tee -a "$META/machine-facts.txt"
+
+      - name: Build turbo-lean (release)
+        run: |
+          (cd lean && lake build LeanSys LeanNative.Spec)
+          cargo build --release
+          ./target/release/turbo-lean --version | tee -a "$META/machine-facts.txt"
+          git status --porcelain --untracked-files=no
+          test -z "$(git status --porcelain --untracked-files=no)"
+
+      - name: Clone eth-act/clifv and pin SHA
+        run: |
+          git clone --bare https://github.com/eth-act/clifv.git "$BENCH_ROOT/clifv.git"
+          git -C "$BENCH_ROOT/clifv.git" cat-file -e "$CLIFV_SHA^{commit}"
+          {
+            echo "## clifv"
+            echo "clifv main HEAD at clone time: $(git -C "$BENCH_ROOT/clifv.git" rev-parse refs/heads/main)"
+            echo "clifv pinned SHA: $CLIFV_SHA"
+            echo "turbo-lean SHA: $(git rev-parse HEAD)"
+          } | tee -a "$META/machine-facts.txt"
+          scripts/bench_clifv.sh --dry-run --pairs "$PAIRS" --sha "$CLIFV_SHA" | tee "$META/dry-run.json"
+
+      - name: Run paired benchmark
+        run: |
+          # Leave time for the report write and artifact upload before the job limit:
+          # SIGTERM makes the runner abort cleanly and checkpoint an `aborted` report.
+          remaining=$(( JOB_START_EPOCH + JOB_TIMEOUT_MIN * 60 - $(date +%s) - 900 ))
+          echo "bench deadline: ${remaining}s" | tee -a "$META/machine-facts.txt"
+          set +e
+          timeout --signal=TERM --kill-after=120 "$remaining" \
+            scripts/bench_clifv.sh --turbo "$PWD/target/release/turbo-lean" \
+              --pairs "$PAIRS" --sha "$CLIFV_SHA" --repo "$BENCH_ROOT/clifv.git" \
+              --work-dir "$BENCH_ROOT/work" --output "$RUNNER_TEMP/bench-clifv-results" \
+            2>&1 | tee "$META/bench-stdout.log"
+          rc=${PIPESTATUS[0]}
+          echo "bench exit: $rc" | tee -a "$META/machine-facts.txt"
+          {
+            echo "## at end $(date -u +%FT%TZ)"
+            echo "### free -g"; free -g
+            echo "### df -h"; df -h
+          } >> "$META/machine-facts.txt"
+          exit "$rc"
+
+      - name: Upload results and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-clifv-results
+          path: |
+            ${{ runner.temp }}/bench-clifv-results/
+            ${{ runner.temp }}/bench-meta/
+          if-no-files-found: warn
