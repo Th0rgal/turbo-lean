@@ -1,0 +1,48 @@
+name: clifv benchmark self-test
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/bench_clifv*'
+      - 'scripts/test_bench_clifv.py'
+      - 'docs/BENCH_CLIFV.md'
+      - '.github/workflows/bench-clifv.yml'
+  push:
+    branches: [main, a0/bench-clifv]
+    paths:
+      - 'scripts/bench_clifv*'
+      - 'scripts/test_bench_clifv.py'
+      - 'docs/BENCH_CLIFV.md'
+      - '.github/workflows/bench-clifv.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  self-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Install report schema validator
+        run: python3 -m pip install 'jsonschema==4.23.0'
+      - name: Shellcheck and offline dry-run
+        run: |
+          shellcheck scripts/bench_clifv.sh
+          scripts/bench_clifv.sh --dry-run --pairs 2
+      - name: Validate fake two-pair report and exercise runner without Lean
+        env:
+          BENCH_SELF_TEST_OUTPUT: ${{ runner.temp }}/bench-clifv-fake
+        run: python3 scripts/test_bench_clifv.py
+      - name: Upload synthetic report
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-clifv-fake-two-pairs
+          path: ${{ runner.temp }}/bench-clifv-fake/
+          if-no-files-found: error

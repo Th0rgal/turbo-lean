@@ -2,7 +2,11 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TheoremShard {
+    /// Source spelling retained for CLI/report/cache compatibility.
     pub name: String,
+    /// User-facing environment identity (private names are not kernel-mangled).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub qualified_name: String,
     pub kind: String,
     pub start_line: usize,
     pub end_line: usize,
@@ -89,14 +93,7 @@ fn glob_match(pat: &str, s: &str) -> bool {
 
 /// Whether the `allowed` pattern list admits kernel axiom `ax` (patterns never admit `sorryAx` or `Lean.trustCompiler`).
 pub fn axiom_allowed_under(ax: &str, allowed: &[String]) -> bool {
-    ax != "sorryAx"
-        && ax != "Lean.trustCompiler"
-        && allowed.iter().any(|p| glob_match(p, ax))
-}
-
-/// Whether the policy admits kernel axiom `ax` (patterns never admit `sorryAx` or `Lean.trustCompiler`).
-pub fn axiom_allowed(ax: &str) -> bool {
-    axiom_allowed_under(ax, &allowed_axioms())
+    ax != "sorryAx" && ax != "Lean.trustCompiler" && allowed.iter().any(|p| glob_match(p, ax))
 }
 
 /// Text of the nearest `turbo-lean.toml` at or above `dir`, read at git revision `rev` when given
@@ -127,10 +124,8 @@ fn item_kind(s: &str) -> &str {
 }
 
 /// Representative kernel axiom names emitted by Lean for `native_decide` and `bv_decide`.
-const NATIVE_DECIDE_PROBE_AXIOMS: [&str; 2] = [
-    "Lean.ofReduceBool",
-    "Pkg.thm._native.native_decide.ax_1_1",
-];
+const NATIVE_DECIDE_PROBE_AXIOMS: [&str; 2] =
+    ["Lean.ofReduceBool", "Pkg.thm._native.native_decide.ax_1_1"];
 const BV_DECIDE_PROBE_AXIOMS: [&str; 1] = ["Pkg.thm._native.bv_decide.ax_1_1"];
 
 /// Route hygiene item admission through the shared Lean C-ABI gate (`turbo_spec_verify_hygiene_item_admitted`)
@@ -734,9 +729,7 @@ fn strip_leading_set_option_in(s: &str) -> Option<&str> {
     let first_line = &s[..first_line_end];
     let trimmed_line = first_line.trim_end();
     if let Some(before_in) = trimmed_line.strip_suffix(" in") {
-        let after_nl = s[first_line_end..].strip_prefix('\n').unwrap_or("");
-        let is_indented_continuation = after_nl.starts_with(' ') || after_nl.starts_with('\t');
-        if before_in.len() > "set_option".len() && !is_indented_continuation {
+        if before_in.len() > "set_option".len() {
             return Some(&s[trimmed_line.len()..]);
         }
         return None;
@@ -862,7 +855,7 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
     let mut line_num = 1usize;
     let mut pos = 0usize;
     let mut mutual_depth = 0usize;
-    let mut section_depth = 0usize;
+    let mut scope_depth = 0usize;
 
     while pos < total_len {
         let line_start = pos;
@@ -887,10 +880,10 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
         let indent = line_orig.len() - line_orig.trim_start().len();
         let is_unindented = indent == 0;
         let starts_doc_comment = line_orig.trim_start().starts_with("/--")
-            && (is_unindented || (section_depth > 0 && indent <= cur_cmd_indent.unwrap_or(indent)));
+            && (is_unindented || (scope_depth > 0 && indent <= cur_cmd_indent.unwrap_or(indent)));
 
         if mutual_depth > 0 {
-            if is_unindented || (section_depth > 0 && indent <= cur_cmd_indent.unwrap_or(0)) {
+            if is_unindented || (scope_depth > 0 && indent <= cur_cmd_indent.unwrap_or(0)) {
                 if is_mutual_line_start(trimmed) {
                     mutual_depth += 1;
                 } else if is_end_line_start(trimmed) {
@@ -910,7 +903,7 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
             || is_end_line_start(prev_trimmed);
 
         let can_start_at_indent = is_unindented
-            || (section_depth > 0
+            || (scope_depth > 0
                 && (prev_is_section_or_ns_header || indent <= cur_cmd_indent.unwrap_or(indent)));
 
         if line_num > 1
@@ -935,10 +928,10 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
         }
 
         if can_start_at_indent {
-            if is_section_header_line(trimmed) {
-                section_depth += 1;
-            } else if is_end_line_start(trimmed) && section_depth > 0 {
-                section_depth -= 1;
+            if is_section_header_line(trimmed) || trimmed.starts_with("namespace ") {
+                scope_depth += 1;
+            } else if is_end_line_start(trimmed) && scope_depth > 0 {
+                scope_depth -= 1;
             } else if is_mutual_line_start(trimmed) {
                 mutual_depth = 1;
             }
@@ -1147,20 +1140,13 @@ fn split_mutual_block_subspans<'a>(
         return None;
     }
 
-    // Determine minimum indentation of non-empty lines inside the mutual block
-    let mut min_indent = usize::MAX;
-    for l in body_clean.lines() {
-        let t = l.trim();
-        if !t.is_empty() {
-            let ind = l.len() - l.trim_start().len();
-            if ind < min_indent {
-                min_indent = ind;
-            }
-        }
-    }
-    if min_indent == usize::MAX {
-        return None;
-    }
+    // Determine declaration indentation, not proof indentation: Lean also accepts
+    // an unindented `:=` continuation inside a mutual block.
+    let min_indent = body_clean
+        .lines()
+        .filter(|l| is_top_level_command_start(l.trim_start()))
+        .map(|l| l.len() - l.trim_start().len())
+        .min()?;
 
     let bytes = body_orig.as_bytes();
     let total_len = bytes.len();
@@ -1321,8 +1307,8 @@ pub(crate) fn extract_shard_stmt_and_proof(src: &str, shard: &TheoremShard) -> (
     } else {
         String::new()
     };
-    if let Some((sig, prf)) = split_at_top_level_assign(&decl_lines)
-        .or_else(|| decl_lines.split_once(":="))
+    if let Some((sig, prf)) =
+        split_at_top_level_assign(&decl_lines).or_else(|| decl_lines.split_once(":="))
     {
         (
             if !shard.signature_text.is_empty() {
@@ -1850,6 +1836,21 @@ fn update_scope_stack_with_idx(stack: &mut Vec<ScopeFrame>, clean_chunk: &str, s
             }
         }
     }
+}
+
+/// Environment-facing name, without Lean's private-name mangling. Section names do not
+/// contribute to namespaces; explicit `_root_` declarations bypass the current namespace.
+fn qualified_decl_name(name: &str, stack: &[ScopeFrame]) -> String {
+    if let Some(root_name) = name.strip_prefix("_root_.") {
+        return root_name.to_string();
+    }
+    stack
+        .iter()
+        .filter(|f| matches!(f.kind, ScopeKind::Namespace))
+        .map(|f| f.name.as_str())
+        .chain(std::iter::once(name))
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// Format closing `end` statements for all currently open frames on `stack`.
@@ -2522,6 +2523,7 @@ fn split_lean_source_inner(
                         };
 
                         shards.push(TheoremShard {
+                            qualified_name: qualified_decl_name(&name, &scope_stack),
                             name,
                             kind,
                             start_line: sub.start_line,
@@ -2698,6 +2700,7 @@ fn split_lean_source_inner(
                 }
 
                 shards.push(TheoremShard {
+                    qualified_name: qualified_decl_name(&name, &scope_stack),
                     name,
                     kind,
                     start_line: span.start_line,
@@ -2874,22 +2877,25 @@ pub fn reconstruct_single_shard_source(src: &str, target_decl: &str) -> Option<S
     let spans = parse_command_spans(src, &clean);
     let closed_sections = compute_closed_section_ranges(&spans);
 
-    let t_idx = spans.iter().position(|span| {
-        split_mutual_block_subspans(span)
-            .map(|(_, inner_spans, _)| {
-                inner_spans.iter().any(|sub| {
-                    classify_decl_header(sub.clean_text)
-                        .map(|(_, n)| decl_name_matches_target(&n, target_decl))
-                        .unwrap_or(false)
-                })
-            })
-            .unwrap_or(false)
-            || classify_decl_header(span.clean_text)
+    let mut target_scope = Vec::new();
+    let t_idx = spans.iter().enumerate().find_map(|(idx, span)| {
+        let matches = |text: &str| {
+            classify_decl_header(text)
                 .map(|(_, name)| {
-                    split_at_top_level_assign(span.clean_text).is_some()
-                        && decl_name_matches_target(&name, target_decl)
+                    split_at_top_level_assign(text).is_some()
+                        && decl_name_matches_target(
+                            &qualified_decl_name(&name, &target_scope),
+                            target_decl,
+                        )
                 })
                 .unwrap_or(false)
+        };
+        let found = split_mutual_block_subspans(span)
+            .map(|(_, inner, _)| inner.iter().any(|sub| matches(sub.clean_text)))
+            .unwrap_or(false)
+            || matches(span.clean_text);
+        update_scope_stack_with_idx(&mut target_scope, span.clean_text, idx);
+        found.then_some(idx)
     })?;
     let omit_mask = compute_omitted_closed_section_spans(&spans, &closed_sections, t_idx);
 
@@ -3112,59 +3118,6 @@ pub(crate) fn matches_uncached_or_fast_verify_name(
         }
     }
     false
-}
-
-/// Insert `#print axioms <name>` right after each theorem of `src` named in `names` (or its
-/// fast-check alias), in the theorem's own scope, so a plain `lean` run reports the axioms the
-/// zygote kernel gate checks. Returns the instrumented source and the number of audited theorems.
-pub fn with_axiom_audit(src: &str, names: &std::collections::HashSet<String>) -> (String, usize) {
-    let mut after_line: std::collections::BTreeMap<usize, Vec<String>> = Default::default();
-    for sh in split_lean_source(src, &[]).shards {
-        if matches_uncached_or_fast_verify_name(&sh.name, names) {
-            after_line.entry(sh.end_line).or_default().push(sh.name);
-        }
-    }
-    let mut out = String::with_capacity(src.len() + 64 * after_line.len());
-    for (idx, line) in src.split_inclusive('\n').enumerate() {
-        out.push_str(line);
-        for name in after_line.get(&(idx + 1)).into_iter().flatten() {
-            if !out.ends_with('\n') {
-                out.push('\n');
-            }
-            out.push_str(&format!(
-                "set_option pp.fullNames true in #print axioms {}\n",
-                name
-            ));
-        }
-    }
-    (out, after_line.values().map(Vec::len).sum())
-}
-
-/// Parse Lean's `#print axioms` replies (`'N' depends on axioms: [a, b]`, possibly wrapped over
-/// several lines, or `'N' does not depend on any axioms`) into `(N, axioms)` pairs.
-pub fn parse_print_axioms(out: &str) -> Vec<(String, Vec<String>)> {
-    let mut found = Vec::new();
-    for (marker, has_list) in [
-        ("' depends on axioms: [", true),
-        ("' does not depend on any axioms", false),
-    ] {
-        for (pos, _) in out.match_indices(marker) {
-            let line = &out[out[..pos].rfind('\n').map_or(0, |i| i + 1)..pos];
-            let Some(q) = line.find('\'') else { continue };
-            let axioms = if has_list {
-                let rest = &out[pos + marker.len()..];
-                rest[..rest.find(']').unwrap_or(rest.len())]
-                    .split(',')
-                    .map(|a| a.trim().to_string())
-                    .filter(|a| !a.is_empty())
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            found.push((line[q + 1..].to_string(), axioms));
-        }
-    }
-    found
 }
 
 /// Returns true if `clean_text` is a scope or scoped-modifier command (`namespace`, `section`,
@@ -4649,7 +4602,10 @@ mod tests {
         assert!(blocking_items_under(&rep.flagged_items, &wildcard).is_empty());
         assert!(blocking_items_under(&rep.flagged_items, &native_glob).is_empty());
         let sorry_rep = audit_hygiene("theorem bad : False := sorry\n");
-        assert_eq!(blocking_items_under(&sorry_rep.flagged_items, &wildcard).len(), 1);
+        assert_eq!(
+            blocking_items_under(&sorry_rep.flagged_items, &wildcard).len(),
+            1
+        );
 
         // The policy comes from the nearest `turbo-lean.toml`, at the given revision if any.
         let repo = std::env::temp_dir().join(format!("turbo_lean_axpol_{}", std::process::id()));
@@ -4692,32 +4648,6 @@ mod tests {
             "900"
         );
         let _ = std::fs::remove_dir_all(&repo);
-    }
-
-    #[test]
-    fn test_axiom_audit_instrumentation_and_report_parsing() {
-        let src =
-            "namespace N\ntheorem a : True := by\n  trivial\ntheorem b : 1 = 1 := rfl\nend N\n";
-        let (out, n) = with_axiom_audit(src, &HashSet::from(["a".to_string()]));
-        assert_eq!(n, 1);
-        assert_eq!(
-            out,
-            src.replace(
-                "trivial\n",
-                "trivial\nset_option pp.fullNames true in #print axioms a\n"
-            )
-        );
-        let lean_out = "f.lean:1:0: warning: x\n'N.a' depends on axioms: [propext,\n Classical.choice]\n'N.b'' does not depend on any axioms\n";
-        assert_eq!(
-            parse_print_axioms(lean_out),
-            vec![
-                (
-                    "N.a".to_string(),
-                    vec!["propext".to_string(), "Classical.choice".to_string()]
-                ),
-                ("N.b'".to_string(), vec![]),
-            ]
-        );
     }
 
     #[test]
@@ -5581,3 +5511,7 @@ end MathlibEdgeCases
         );
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/discovery.rs"]
+mod corpus_discovery;
