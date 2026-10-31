@@ -5058,6 +5058,15 @@ mod tests {
             "an `addDecl` axiom",
             "`hidden`",
         );
+        // The stock compiler can emit an axiom-free, ill-typed theorem when source options
+        // disable checking. The artifact auditor must replay it, rather than trust imports.
+        let bad = include_str!("../tests/fixtures/weakening-options/Bad.lean")
+            .replace("import Lean\n", "import Lean\nset_option debug.skipKernelTC true\n");
+        reject(
+            format!("{bad}\ntheorem tgt : False := bad\n"),
+            "source-level options cannot weaken the artifact audit",
+            "independent kernel re-check",
+        );
         assert!(!run("theorem tgt : 1 = 2 := rfl\n")?.status.success());
         // A request budget bounds the whole fallback; it never yields a late verdict.
         let audit = std::collections::HashSet::from(["tgt".to_string()]);
