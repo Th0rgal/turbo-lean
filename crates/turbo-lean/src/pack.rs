@@ -379,13 +379,14 @@ pub fn get_store_manifest(store: &TurboStore, only_portable: bool) -> Result<Del
     };
     if only_portable {
         if let Ok(dm_bytes) = serde_json::to_vec(&dm) {
-            let _ = fs::write(
-                store
-                    .root
-                    .join("locks")
-                    .join("cached_portable_manifest.json"),
-                &dm_bytes,
-            );
+            let locks_dir = store.root.join("locks");
+            if let Ok(created) = crate::db::ensure_dir_tracking(&locks_dir, &store.root) {
+                let _ = crate::db::write_bytes_durable(
+                    &locks_dir.join("cached_portable_manifest.json"),
+                    &dm_bytes,
+                    &created,
+                );
+            }
         }
     }
     Ok(dm)
@@ -452,25 +453,32 @@ pub(crate) fn set_file_mode_unix(path: &Path, mode: u32) {
 
 const DEFERRED_PACK_V4_MAGIC: &[u8; 8] = b"TLDP\x00\x00\x00\x04";
 
-pub fn stage_deferred_pack_record(store_root: &Path, td: &str, v3_bytes: &[u8]) {
+pub fn stage_deferred_pack_record(store_root: &Path, td: &str, v3_bytes: &[u8]) -> bool {
+    let root_preexisted = store_root.exists();
+    if fs::create_dir_all(store_root).is_err() {
+        return false;
+    }
     let locks_dir = store_root.join("locks");
-    let _ = fs::create_dir_all(&locks_dir);
+    let Ok(mut created) = crate::db::ensure_dir_tracking(&locks_dir, store_root) else {
+        return false;
+    };
+    if !root_preexisted {
+        if let Some(parent) = store_root.parent().filter(|p| !p.as_os_str().is_empty()) {
+            created.push(parent.to_path_buf());
+        }
+    }
     let td_byte: u8 = if td == "trusted" { 1 } else { 0 };
     let mut rec = Vec::with_capacity(9 + v3_bytes.len());
     rec.extend_from_slice(DEFERRED_PACK_V4_MAGIC);
     rec.push(td_byte);
     rec.extend_from_slice(v3_bytes);
-    let tmp_path = locks_dir.join(format!(
-        "deferred_pack_v3.bin.tmp.{}.{}",
-        std::process::id(),
-        next_tmp_id()
-    ));
-    if fs::write(&tmp_path, &rec).is_ok() {
-        let _ = fs::rename(&tmp_path, locks_dir.join("deferred_pack_v3.bin"));
-    } else {
-        let _ = fs::remove_file(&tmp_path);
+    if crate::db::write_bytes_durable(&locks_dir.join("deferred_pack_v3.bin"), &rec, &created)
+        .is_err()
+    {
+        return false;
     }
     let _ = fs::remove_file(locks_dir.join("deferred_pack_v3.domain"));
+    true
 }
 
 pub fn decode_deferred_pack_record(buf: &[u8]) -> Option<(&'static str, PackManifest)> {
@@ -512,12 +520,14 @@ pub fn save_cached_portable_manifest_from_pack(store_root: &Path, manifest: &Pac
         blob_hashes,
     };
     if let Ok(dm_bytes) = serde_json::to_vec(&dm) {
-        let _ = fs::write(
-            store_root
-                .join("locks")
-                .join("cached_portable_manifest.json"),
-            &dm_bytes,
-        );
+        let locks_dir = store_root.join("locks");
+        if let Ok(created) = crate::db::ensure_dir_tracking(&locks_dir, store_root) {
+            let _ = crate::db::write_bytes_durable(
+                &locks_dir.join("cached_portable_manifest.json"),
+                &dm_bytes,
+                &created,
+            );
+        }
     }
 }
 
@@ -544,13 +554,13 @@ pub fn try_stateless_cold_pull_sync_with_domain(
         allow_unattested_trusted,
     )
     .ok()?;
-    let _ = fs::create_dir_all(store_root.join("locks"));
-    let _ = fs::create_dir_all(store_root.join("staging"));
     let (_, _) = prestage_blobs_from_shared_cas(store_root, &manifest)?;
+    if !stage_deferred_pack_record(store_root, td, &pack_bytes) {
+        return None;
+    }
     if td == "trusted" {
         save_cached_portable_manifest_from_pack(store_root, &manifest);
     }
-    stage_deferred_pack_record(store_root, td, &pack_bytes);
     let pulled = (manifest.actions.len(), manifest.blobs.len());
     let pulled_bytes = if pulled.0 > 0 || pulled.1 > 0 {
         pack_bytes.len() as u64
@@ -730,7 +740,22 @@ pub(crate) fn shared_cas_blobs_dir_for_store(store_root: &Path) -> std::path::Pa
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if let Ok(store_meta) = fs::metadata(store_root) {
+        let probe_meta = fs::metadata(store_root).or_else(|_| {
+            let mut cur = store_root.parent();
+            while let Some(p) = cur {
+                if !p.as_os_str().is_empty() {
+                    if let Ok(m) = fs::metadata(p) {
+                        return Ok(m);
+                    }
+                }
+                cur = p.parent();
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no existing store_root ancestor",
+            ))
+        });
+        if let Ok(store_meta) = probe_meta {
             let store_dev = store_meta.dev();
             let shm_path = std::path::Path::new("/dev/shm");
             if let Ok(shm_meta) = fs::metadata(shm_path) {
@@ -762,31 +787,33 @@ fn ensure_blob_in_shared_cas(
     let prefix = if bh.len() >= 2 { &bh[0..2] } else { "00" };
     let p_idx = u8::from_str_radix(prefix, 16).unwrap_or(0) as usize;
     let shared_dir = shared_blobs.join(prefix);
-    if !seen_prefix[p_idx] {
+    let stop_at = shared_blobs.parent().unwrap_or(shared_blobs);
+    let created = if !seen_prefix[p_idx] {
+        let Ok(dirs) = crate::db::ensure_dir_tracking(&shared_dir, stop_at) else {
+            return false;
+        };
         seen_prefix[p_idx] = true;
-        let _ = fs::create_dir_all(&shared_dir);
-    }
+        dirs
+    } else {
+        Vec::new()
+    };
     let shared_dest = shared_dir.join(bh);
     if shared_dest.exists() {
-        return true;
+        let ok = fs::File::open(&shared_dest)
+            .and_then(|f| crate::db::durability_barrier(&f))
+            .is_ok()
+            && crate::db::sync_dir(&shared_dir).is_ok();
+        for dir in &created {
+            if crate::db::sync_dir(dir).is_err() {
+                return false;
+            }
+        }
+        return ok;
     }
     let src = store
         .ensure_blob_uncompressed(bh)
         .unwrap_or_else(|_| store.blob_path(bh));
-    if fs::hard_link(&src, &shared_dest).is_ok() {
-        return true;
-    }
-    if shared_dest.exists() {
-        return true;
-    }
-    let tmp_dest = shared_dir.join(format!(".{}.{}.tmp", bh, next_tmp_id()));
-    if fs::copy(&src, &tmp_dest).is_ok() {
-        set_file_mode_unix(&tmp_dest, 0o444);
-        let ok = fs::rename(&tmp_dest, &shared_dest).is_ok() || shared_dest.exists();
-        let _ = fs::remove_file(&tmp_dest);
-        return ok;
-    }
-    false
+    crate::db::publish_durable_link(&src, &shared_dest, &created).is_ok()
 }
 
 pub fn export_pack_filtered_bytes(
@@ -864,12 +891,25 @@ pub fn export_pack_filtered_with_mode_and_signing_key(
                             let raw_bytes = read_u64_le_at(&cached_bytes, 16);
                             let stream = cached_bytes.split_off(24);
                             if only_portable {
-                                let last_file = store.root.join("locks").join(format!(
-                                    "last_full_export_{}.bin",
-                                    if header_only_shared_cas { 1 } else { 0 }
-                                ));
-                                if !last_file.exists() {
-                                    let _ = fs::copy(&cache_file, &last_file);
+                                let locks_dir = store.root.join("locks");
+                                if let Ok(created) =
+                                    crate::db::ensure_dir_tracking(&locks_dir, &store.root)
+                                {
+                                    let last_file = locks_dir.join(format!(
+                                        "last_full_export_{}.bin",
+                                        if header_only_shared_cas { 1 } else { 0 }
+                                    ));
+                                    if !last_file.exists() {
+                                        let _ = crate::db::publish_durable_link(
+                                            &cache_file,
+                                            &last_file,
+                                            &created,
+                                        );
+                                    } else {
+                                        for dir in &created {
+                                            let _ = crate::db::sync_dir(dir);
+                                        }
+                                    }
                                 }
                             }
                             if !store
@@ -960,19 +1000,23 @@ pub fn export_pack_filtered_with_mode_and_signing_key(
                                             .extend_from_slice(&(n_blobs as u64).to_le_bytes());
                                         cache_buf.extend_from_slice(&raw_bytes.to_le_bytes());
                                         cache_buf.extend_from_slice(&stream);
-                                        let _ = fs::write(cf, &cache_buf);
+                                        let _ = crate::shm_cache::atomic_write_shm(cf, &cache_buf);
                                         if only_portable {
-                                            let last_0 = store
-                                                .root
-                                                .join("locks")
-                                                .join("last_full_export_0.bin");
-                                            let _ = fs::write(&last_0, &cache_buf);
-                                            let last_1 = store
-                                                .root
-                                                .join("locks")
-                                                .join("last_full_export_1.bin");
-                                            if !last_1.exists() {
-                                                let _ = fs::copy(&v3_file, &last_1);
+                                            let locks_dir = store.root.join("locks");
+                                            if let Ok(created) = crate::db::ensure_dir_tracking(
+                                                &locks_dir,
+                                                &store.root,
+                                            ) {
+                                                let last_0 = locks_dir.join("last_full_export_0.bin");
+                                                let _ = crate::db::write_bytes_durable(
+                                                    &last_0, &cache_buf, &created,
+                                                );
+                                                let last_1 = locks_dir.join("last_full_export_1.bin");
+                                                if !last_1.exists() {
+                                                    let _ = crate::db::publish_durable_link(
+                                                        &v3_file, &last_1, &created,
+                                                    );
+                                                }
                                             }
                                         }
                                         if !store
@@ -1238,13 +1282,16 @@ pub fn export_pack_filtered_with_mode_and_signing_key(
             cache_buf.extend_from_slice(&(n_blobs as u64).to_le_bytes());
             cache_buf.extend_from_slice(&total_raw_bytes.to_le_bytes());
             cache_buf.extend_from_slice(&pack_stream);
-            let _ = fs::write(&cache_file, &cache_buf);
+            let _ = crate::shm_cache::atomic_write_shm(&cache_file, &cache_buf);
             if only_portable {
-                let last_file = store.root.join("locks").join(format!(
-                    "last_full_export_{}.bin",
-                    if header_only_shared_cas { 1 } else { 0 }
-                ));
-                let _ = fs::write(&last_file, &cache_buf);
+                let locks_dir = store.root.join("locks");
+                if let Ok(created) = crate::db::ensure_dir_tracking(&locks_dir, &store.root) {
+                    let last_file = locks_dir.join(format!(
+                        "last_full_export_{}.bin",
+                        if header_only_shared_cas { 1 } else { 0 }
+                    ));
+                    let _ = crate::db::write_bytes_durable(&last_file, &cache_buf, &created);
+                }
             }
             if !header_only_shared_cas {
                 if let Some(s) = cache_file.to_str() {
@@ -1257,10 +1304,16 @@ pub fn export_pack_filtered_with_mode_and_signing_key(
                         v3_buf.extend_from_slice(b"TLPK\x00\x00\x00\x03");
                         v3_buf.extend_from_slice(&(header_json.len() as u64).to_le_bytes());
                         v3_buf.extend_from_slice(&header_json);
-                        let _ = fs::write(&v3_file, &v3_buf);
+                        let _ = crate::shm_cache::atomic_write_shm(&v3_file, &v3_buf);
                         if only_portable {
-                            let last_v3 = store.root.join("locks").join("last_full_export_1.bin");
-                            let _ = fs::write(&last_v3, &v3_buf);
+                            let locks_dir = store.root.join("locks");
+                            if let Ok(created) =
+                                crate::db::ensure_dir_tracking(&locks_dir, &store.root)
+                            {
+                                let last_v3 = locks_dir.join("last_full_export_1.bin");
+                                let _ =
+                                    crate::db::write_bytes_durable(&last_v3, &v3_buf, &created);
+                            }
                         }
                     }
                 }
@@ -1364,12 +1417,20 @@ pub fn prestage_blobs_from_shared_cas(
             return None;
         }
     }
+    let mut created_parents: Vec<std::path::PathBuf> = Vec::new();
+    let root_preexisted = store_root.exists();
+    if fs::create_dir_all(store_root).is_err() {
+        return None;
+    }
+    if !root_preexisted {
+        if let Some(parent) = store_root.parent().filter(|p| !p.as_os_str().is_empty()) {
+            created_parents.push(parent.to_path_buf());
+        }
+    }
     let shared_blobs = shared_cas_blobs_dir_for_store(store_root);
     let shared_blobs_shm = shared_cas_blobs_dir();
     let store_blobs = store_root.join("blobs");
-    let _ = fs::create_dir_all(&store_blobs);
 
-    let mut newly_created_prefix = [false; 256];
     let mut seen_prefix = [false; 256];
     for b in &manifest.blobs {
         let prefix = if b.blob_hash.len() >= 2 {
@@ -1380,8 +1441,16 @@ pub fn prestage_blobs_from_shared_cas(
         let p_idx = u8::from_str_radix(prefix, 16).unwrap_or(0) as usize;
         if !seen_prefix[p_idx] {
             seen_prefix[p_idx] = true;
-            if fs::create_dir(store_blobs.join(prefix)).is_ok() {
-                newly_created_prefix[p_idx] = true;
+            match crate::db::ensure_dir_tracking(&store_blobs.join(prefix), store_root) {
+                Ok(parents) => created_parents.extend(parents),
+                Err(_) => {
+                    created_parents.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+                    created_parents.dedup();
+                    for dir in &created_parents {
+                        let _ = crate::db::sync_dir(dir);
+                    }
+                    return None;
+                }
             }
         }
     }
@@ -1394,62 +1463,111 @@ pub fn prestage_blobs_from_shared_cas(
         } else {
             "00"
         };
-        let p_idx = u8::from_str_radix(prefix, 16).unwrap_or(0) as usize;
         let dest = store_blobs.join(prefix).join(&b.blob_hash);
         #[cfg(unix)]
         let inode = {
             use std::os::unix::fs::MetadataExt;
-            if !newly_created_prefix[p_idx] {
-                if let Ok(m) = fs::metadata(&dest) {
-                    if m.len() == b.size_bytes {
-                        staged_blobs.push((
-                            b.blob_hash.clone(),
-                            b.kind.clone(),
-                            b.size_bytes as i64,
-                            m.ino() as i64,
-                        ));
-                        continue;
-                    }
+            let sync_created_parents = |dirs: &mut Vec<std::path::PathBuf>| {
+                dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+                dirs.dedup();
+                for dir in dirs.iter() {
+                    let _ = crate::db::sync_dir(dir);
                 }
+            };
+            if let crate::db::BlobDisk::Intact(m) = crate::db::probe_blob_file(&dest, b.size_bytes)
+            {
+                let durable = fs::File::open(&dest)
+                    .and_then(|f| crate::db::durability_barrier(&f))
+                    .is_ok()
+                    && crate::db::sync_dir(dest.parent().unwrap_or(&store_blobs)).is_ok();
+                if !durable {
+                    sync_created_parents(&mut created_parents);
+                    return None;
+                }
+                staged_blobs.push((
+                    b.blob_hash.clone(),
+                    b.kind.clone(),
+                    b.size_bytes as i64,
+                    m.ino() as i64,
+                ));
+                continue;
             }
             let shared_p = shared_blobs.join(prefix).join(&b.blob_hash);
             let shared_p_alt = shared_blobs_shm.join(prefix).join(&b.blob_hash);
-            match fs::hard_link(&shared_p, &dest).or_else(|_| fs::hard_link(&shared_p_alt, &dest)) {
+            let shared_ok = matches!(
+                crate::db::probe_blob_file(&shared_p, b.size_bytes),
+                crate::db::BlobDisk::Intact(_)
+            );
+            let shared_alt_ok = matches!(
+                crate::db::probe_blob_file(&shared_p_alt, b.size_bytes),
+                crate::db::BlobDisk::Intact(_)
+            );
+            let link_res = if shared_ok {
+                fs::File::open(&shared_p)
+                    .and_then(|f| crate::db::durability_barrier(&f))
+                    .and_then(|()| fs::hard_link(&shared_p, &dest))
+                    .or_else(|e| {
+                        if shared_alt_ok {
+                            fs::File::open(&shared_p_alt)
+                                .and_then(|f| crate::db::durability_barrier(&f))
+                                .and_then(|()| fs::hard_link(&shared_p_alt, &dest))
+                        } else {
+                            Err(e)
+                        }
+                    })
+            } else if shared_alt_ok {
+                fs::File::open(&shared_p_alt)
+                    .and_then(|f| crate::db::durability_barrier(&f))
+                    .and_then(|()| fs::hard_link(&shared_p_alt, &dest))
+            } else {
+                sync_created_parents(&mut created_parents);
+                return None;
+            };
+            match link_res {
                 Ok(()) => {
+                    if crate::db::sync_dir(dest.parent().unwrap_or(&store_blobs)).is_err() {
+                        sync_created_parents(&mut created_parents);
+                        return None;
+                    }
                     total_newly_written += 1;
                     0i64
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Cold `TLZ1` blobs legitimately differ in length; a torn one is left for
-                    // the payload import to repair.
                     match crate::db::probe_blob_file(&dest, b.size_bytes) {
-                        crate::db::BlobDisk::Intact(m) => m.ino() as i64,
-                        _ => return None,
+                        crate::db::BlobDisk::Intact(m) => {
+                            let durable = fs::File::open(&dest)
+                                .and_then(|f| crate::db::durability_barrier(&f))
+                                .is_ok()
+                                && crate::db::sync_dir(dest.parent().unwrap_or(&store_blobs))
+                                    .is_ok();
+                            if !durable {
+                                sync_created_parents(&mut created_parents);
+                                return None;
+                            }
+                            m.ino() as i64
+                        }
+                        _ => {
+                            sync_created_parents(&mut created_parents);
+                            return None;
+                        }
                     }
                 }
                 Err(_) => {
-                    let src_p = if shared_p.exists() {
-                        &shared_p
-                    } else if shared_p_alt.exists() {
-                        &shared_p_alt
-                    } else {
-                        return None;
-                    };
-                    let tmp_dest = store_blobs.join(prefix).join(format!(
-                        ".{}.{}.tmp",
-                        b.blob_hash,
-                        next_tmp_id()
-                    ));
-                    if fs::copy(src_p, &tmp_dest).is_err() {
+                    let src_p = if shared_ok { &shared_p } else { &shared_p_alt };
+                    if crate::db::publish_durable_link(src_p, &dest, &[]).is_err() {
+                        sync_created_parents(&mut created_parents);
                         return None;
                     }
-                    set_file_mode_unix(&tmp_dest, 0o444);
-                    let _ = fs::hard_link(&tmp_dest, &shared_p);
-                    if fs::rename(&tmp_dest, &dest).is_err() && !dest.exists() {
-                        let _ = fs::remove_file(&tmp_dest);
-                        return None;
+                    if !shared_ok {
+                        let shared_parent = shared_p.parent().unwrap_or(&shared_blobs);
+                        let shared_stop = shared_blobs.parent().unwrap_or(&shared_blobs);
+                        if let Ok(shared_created) =
+                            crate::db::ensure_dir_tracking(shared_parent, shared_stop)
+                        {
+                            let _ =
+                                crate::db::publish_durable_link(&dest, &shared_p, &shared_created);
+                        }
                     }
-                    let _ = fs::remove_file(&tmp_dest);
                     total_newly_written += 1;
                     0i64
                 }
@@ -1458,7 +1576,7 @@ pub fn prestage_blobs_from_shared_cas(
         #[cfg(not(unix))]
         let inode = {
             let shared_p = shared_blobs.join(prefix).join(&b.blob_hash);
-            if newly_created_prefix[p_idx] || !dest.exists() {
+            if !dest.exists() {
                 if fs::hard_link(&shared_p, &dest).is_err() {
                     return None;
                 }
@@ -1472,6 +1590,13 @@ pub fn prestage_blobs_from_shared_cas(
             b.size_bytes as i64,
             inode,
         ));
+    }
+    created_parents.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    created_parents.dedup();
+    for dir in created_parents {
+        if crate::db::sync_dir(&dir).is_err() {
+            return None;
+        }
     }
     Some((staged_blobs, total_newly_written))
 }
@@ -1499,8 +1624,6 @@ pub fn try_stateless_cold_import_with_domain(
     if !size_ok {
         return None;
     }
-    let _ = fs::create_dir_all(store_root.join("locks"));
-    let _ = fs::create_dir_all(store_root.join("staging"));
     let (staged_blobs, _) = prestage_blobs_from_shared_cas(store_root, &manifest)?;
     let header_hash = blake3::hash(&header_buf).to_hex().to_string();
     let stamp_val = format!(
@@ -1510,18 +1633,24 @@ pub fn try_stateless_cold_import_with_domain(
         staged_blobs.len(),
         td
     );
-    let _ = fs::write(
-        store_root.join("locks").join("last_import_stamp"),
-        &stamp_val,
-    );
-    if td == "trusted" {
-        save_cached_portable_manifest_from_pack(store_root, &manifest);
-    }
+    let locks_dir = store_root.join("locks");
+    let created = crate::db::ensure_dir_tracking(&locks_dir, store_root).ok()?;
     let mut v3_bytes = Vec::with_capacity(16 + header_len);
     v3_bytes.extend_from_slice(b"TLPK\x00\x00\x00\x03");
     v3_bytes.extend_from_slice(&(header_len as u64).to_le_bytes());
     v3_bytes.extend_from_slice(&header_buf);
-    stage_deferred_pack_record(store_root, td, &v3_bytes);
+    if !stage_deferred_pack_record(store_root, td, &v3_bytes) {
+        return None;
+    }
+    crate::db::write_bytes_durable(
+        &locks_dir.join("last_import_stamp"),
+        stamp_val.as_bytes(),
+        &created,
+    )
+    .ok()?;
+    if td == "trusted" {
+        save_cached_portable_manifest_from_pack(store_root, &manifest);
+    }
     Some((manifest.actions.len(), staged_blobs.len()))
 }
 
@@ -1585,7 +1714,14 @@ pub fn finish_import_from_prestaged_shared_cas_with_domain(
         staged_blobs.len(),
         td
     );
-    let stamp_file = store.root.join("locks").join("last_import_stamp");
+    let store_root = store.root.clone();
+    let locks_dir = store_root.join("locks");
+    let stamp_file = locks_dir.join("last_import_stamp");
+    let write_stamp = || -> Result<()> {
+        let created = crate::db::ensure_dir_tracking(&locks_dir, &store_root)?;
+        crate::db::write_bytes_durable(&stamp_file, stamp_val.as_bytes(), &created)?;
+        Ok(())
+    };
     if total_newly_written == 0 && !manifest.actions.is_empty() {
         if fs::read_to_string(&stamp_file)
             .map(|s| s == stamp_val)
@@ -1611,7 +1747,7 @@ pub fn finish_import_from_prestaged_shared_cas_with_domain(
                         && store.has_completed_action_in_domain(&a.action_key, "trusted"))
             })
         {
-            let _ = fs::write(&stamp_file, &stamp_val);
+            write_stamp()?;
             if td == "trusted" {
                 save_cached_portable_manifest_from_pack(&store.root, manifest);
             }
@@ -1620,7 +1756,7 @@ pub fn finish_import_from_prestaged_shared_cas_with_domain(
     }
 
     let res = store.batch_import_pack_metadata_with_domain(staged_blobs, &manifest.actions, td)?;
-    let _ = fs::write(&stamp_file, &stamp_val);
+    write_stamp()?;
     if td == "trusted" {
         save_cached_portable_manifest_from_pack(&store.root, manifest);
     }
@@ -1796,7 +1932,7 @@ pub fn import_pack_bytes_with_policy(
             );
         }
     }
-    let mut newly_created_prefix = [false; 256];
+    let mut created_parents: Vec<std::path::PathBuf> = Vec::new();
     if !slices.is_empty() {
         let blobs_dir = store.root.join("blobs");
         let mut seen_prefix = [false; 256];
@@ -1809,17 +1945,15 @@ pub fn import_pack_bytes_with_policy(
             let p_idx = u8::from_str_radix(prefix, 16).unwrap_or(0) as usize;
             if !seen_prefix[p_idx] {
                 seen_prefix[p_idx] = true;
-                if fs::create_dir(blobs_dir.join(prefix)).is_ok() {
-                    newly_created_prefix[p_idx] = true;
-                }
+                let parents = crate::db::ensure_dir_tracking(&blobs_dir.join(prefix), &store.root)?;
+                created_parents.extend(parents);
             }
         }
     }
 
     let process_chunk = |chunk: &[(&PackedBlob, &[u8])],
                          root_dir: &Path,
-                         #[cfg_attr(unix, allow(unused_variables))] staging_dir_ref: &Path,
-                         new_prefixes: &[bool; 256]|
+                         #[cfg_attr(unix, allow(unused_variables))] staging_dir_ref: &Path|
      -> Result<(Vec<(String, String, i64, i64)>, usize)> {
         let mut local = Vec::with_capacity(chunk.len());
         let mut newly_written = 0usize;
@@ -1840,22 +1974,25 @@ pub fn import_pack_bytes_with_policy(
             } else {
                 "00"
             };
-            let p_idx = u8::from_str_radix(prefix, 16).unwrap_or(0) as usize;
             let dest = root_dir.join("blobs").join(prefix).join(&b.blob_hash);
 
             // Existing blobs are size-checked and torn ones rewritten; all writes are atomic.
             #[cfg(unix)]
             let inode = {
-                use crate::db::{probe_blob_file, write_blob_atomic, BlobDisk};
+                use crate::db::{
+                    durability_barrier, probe_blob_file, sync_dir, write_blob_atomic, BlobDisk,
+                };
                 use std::os::unix::fs::MetadataExt;
                 let len = blob_bytes.len() as u64;
-                let state = if new_prefixes[p_idx] {
-                    BlobDisk::Missing
-                } else {
-                    probe_blob_file(&dest, len)
-                };
-                match state {
-                    BlobDisk::Intact(m) => m.ino() as i64,
+                match probe_blob_file(&dest, len) {
+                    BlobDisk::Intact(m) => {
+                        let f = fs::File::open(&dest)?;
+                        durability_barrier(&f)?;
+                        if let Some(parent) = dest.parent() {
+                            sync_dir(parent)?;
+                        }
+                        m.ino() as i64
+                    }
                     missing_or_torn => {
                         let replace = matches!(missing_or_torn, BlobDisk::Torn);
                         newly_written += 1;
@@ -1865,7 +2002,7 @@ pub fn import_pack_bytes_with_policy(
             };
             #[cfg(not(unix))]
             let inode = {
-                if new_prefixes[p_idx] || !dest.exists() {
+                if !dest.exists() {
                     if let Some(parent) = dest.parent() {
                         fs::create_dir_all(parent)?;
                     }
@@ -1892,14 +2029,28 @@ pub fn import_pack_bytes_with_policy(
         Ok((local, newly_written))
     };
 
+    let sync_created_parents = |dirs: &mut Vec<std::path::PathBuf>| -> Result<()> {
+        dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+        dirs.dedup();
+        for dir in dirs.drain(..) {
+            crate::db::sync_dir(&dir)?;
+        }
+        Ok(())
+    };
     let mut staged_blobs = Vec::with_capacity(manifest.blobs.len());
     let mut total_newly_written = 0usize;
-    if slices.len() <= 64 && payload_region.len() <= 4 * 1024 * 1024 {
+    let import_res: Result<()> = if slices.len() <= 64 && payload_region.len() <= 4 * 1024 * 1024 {
         if !slices.is_empty() {
-            let (sb, nw) =
-                process_chunk(&slices, &store.root, &staging_dir, &newly_created_prefix)?;
-            staged_blobs = sb;
-            total_newly_written = nw;
+            match process_chunk(&slices, &store.root, &staging_dir) {
+                Ok((sb, nw)) => {
+                    staged_blobs = sb;
+                    total_newly_written = nw;
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        } else {
+            Ok(())
         }
     } else {
         let n_threads = std::thread::available_parallelism()
@@ -1907,18 +2058,15 @@ pub fn import_pack_bytes_with_policy(
             .unwrap_or(4)
             .min(slices.len().max(1))
             .max(1);
-        let chunk_size = (slices.len() + n_threads - 1) / n_threads;
+        let chunk_size = slices.len().div_ceil(n_threads);
         let store_root = store.root.clone();
         let staging_dir_ref = &staging_dir;
-        let new_prefixes_ref = &newly_created_prefix;
 
         std::thread::scope(|s| -> Result<()> {
             let mut handles = Vec::with_capacity(n_threads);
             for chunk in slices.chunks(chunk_size) {
                 let root_clone = store_root.clone();
-                handles.push(s.spawn(move || {
-                    process_chunk(chunk, &root_clone, staging_dir_ref, new_prefixes_ref)
-                }));
+                handles.push(s.spawn(move || process_chunk(chunk, &root_clone, staging_dir_ref)));
             }
             for h in handles {
                 let (res, nw) = h
@@ -1928,8 +2076,13 @@ pub fn import_pack_bytes_with_policy(
                 total_newly_written += nw;
             }
             Ok(())
-        })?;
+        })
+    };
+    if let Err(e) = import_res {
+        let _ = sync_created_parents(&mut created_parents);
+        return Err(e);
     }
+    sync_created_parents(&mut created_parents)?;
 
     if total_newly_written == 0 && !manifest.actions.is_empty() {
         let existing_completed: i64 = store
