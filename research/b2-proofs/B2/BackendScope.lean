@@ -22,9 +22,31 @@ theorem lookup_insertIfNew {α β : Type} [BEq α] [Hashable α] [EquivBEq α]
   rw [Std.HashMap.getElem?_insertIfNew]
   simp [Bool.and_eq_true]
 
+@[cbv_eval] theorem lookup_method_insertIfNew {α β : Type} [BEq α] [Hashable α] [EquivBEq α]
+    [LawfulHashable α] (m : Std.HashMap α β) (k a : α) (v : β) :
+    (m.insertIfNew k v).get? a =
+      if k == a && !m.contains k then some v else m.get? a := lookup_insertIfNew m k a v
+
+@[cbv_eval] theorem lookup_method_empty {α β : Type} [BEq α] [Hashable α]
+    (a : α) (capacity : Nat) :
+    (Std.HashMap.emptyWithCapacity capacity : Std.HashMap α β).get? a = none := by
+  exact Std.HashMap.getElem?_emptyWithCapacity
+
+attribute [cbv_opaque] Std.HashMap.get?
+attribute [-cbv_eval] Std.HashSet.ofList_eq_insertMany_empty
 attribute [local cbv_opaque] Std.HashMap.insertIfNew Std.HashSet.ofList
 attribute [local cbv_eval] lookup_insertIfNew Std.HashMap.contains_insertIfNew
   Std.HashSet.contains_ofList
+
+
+/-- Normalize folded containers before their observation is unfolded to raw hashing. -/
+open Lean Meta Sym.Simp in
+cbv_simproc ↓ normalizeLookup (_) := fun e => do
+  let some n := e.getAppFn.constName? | return .rfl
+  unless n == ``GetElem?.getElem? || n == ``Std.HashMap.contains ||
+      n == ``Std.HashSet.contains do return .rfl
+  return ← simpAppArgRange e 0 e.getAppNumArgs
+
 
 theorem subset (p : Clif.Program) : InSubset p B2.Smoke.collatz := by
   refine ⟨B2.Lowering.lower_in_subsetE _ _ B2.Smoke.collatz_lowered, ?_, ?_, ?_, ?_⟩
