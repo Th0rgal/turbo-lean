@@ -944,54 +944,76 @@ const ZYGOTE_STDERR_TAIL_CAP: usize = 8192;
 /// Mirrors `TurboLean.ZygoteWorker.stderrReplyMark`: the worker writes it to stderr before each reply.
 const ZYGOTE_STDERR_REPLY_MARK: &str = "[TurboLean.ZygoteWorker] reply";
 
-/// Line-level scan of a worker's whole stderr stream (the tail alone loses panics behind long
-/// backtraces): counts runtime-panic lines and reply marks.
+/// How long the host waits, after reading a reply, for that reply's stderr mark.
+const ZYGOTE_STDERR_MARK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Byte-stream scan of a worker's whole stderr (the tail alone loses panics behind long
+/// backtraces or long unterminated lines): counts runtime-panic signatures and reply marks.
 #[derive(Default)]
 struct StderrScan {
-    state: std::sync::Mutex<(u64, u64)>,
+    state: std::sync::Mutex<StderrScanState>,
     cv: std::sync::Condvar,
 }
 
+#[derive(Default)]
+struct StderrScanState {
+    panics: u64,
+    marks: u64,
+    /// Last `longest signature - 1` bytes, so a signature split across chunks is still seen.
+    overlap: Vec<u8>,
+}
+
 impl StderrScan {
-    fn line(&self, line: &[u8]) {
-        let s = String::from_utf8_lossy(line);
-        let (panic, mark) = (
-            is_runtime_panic_text(&s),
-            s.trim() == ZYGOTE_STDERR_REPLY_MARK,
-        );
-        if let Ok(mut g) = self.state.lock() {
-            g.0 += panic as u64;
-            g.1 += mark as u64;
-        }
-        if mark {
+    /// Scans every byte of `chunk`; only matches ending inside `chunk` are new.
+    fn feed(&self, chunk: &[u8]) {
+        let Ok(mut g) = self.state.lock() else {
+            return;
+        };
+        let keep = g.overlap.len();
+        let mut buf = std::mem::take(&mut g.overlap);
+        buf.extend_from_slice(chunk);
+        let count = |pat: &str| {
+            let pat = pat.as_bytes();
+            buf.windows(pat.len())
+                .enumerate()
+                .filter(|(i, w)| *w == pat && i + pat.len() > keep)
+                .count() as u64
+        };
+        let marks = count(ZYGOTE_STDERR_REPLY_MARK);
+        g.panics += RUNTIME_PANIC_SIGNATURES
+            .iter()
+            .map(|s| count(s))
+            .sum::<u64>();
+        g.marks += marks;
+        let longest = RUNTIME_PANIC_SIGNATURES
+            .iter()
+            .chain([&ZYGOTE_STDERR_REPLY_MARK])
+            .map(|s| s.len())
+            .max()
+            .unwrap_or(1);
+        g.overlap = buf[buf.len().saturating_sub(longest - 1)..].to_vec();
+        drop(g);
+        if marks > 0 {
             self.cv.notify_all();
         }
     }
 
-    /// Feeds `chunk`, keeping an unterminated line (capped) in `carry`.
-    fn feed(&self, carry: &mut Vec<u8>, chunk: &[u8]) {
-        for &b in chunk {
-            if b == b'\n' {
-                self.line(carry);
-                carry.clear();
-            } else if carry.len() < 4096 {
-                carry.push(b);
-            }
-        }
-    }
-
     fn snapshot(&self) -> (u64, u64) {
-        self.state.lock().map(|g| *g).unwrap_or((u64::MAX, 0))
+        self.state
+            .lock()
+            .map(|g| (g.panics, g.marks))
+            .unwrap_or((u64::MAX, u64::MAX))
     }
 
-    /// Whether a runtime panic hit stderr after `before`, waiting (bounded) for the reply mark.
-    fn panicked_since(&self, before: (u64, u64)) -> bool {
+    /// Whether the request since `before` must be treated as panicked: a runtime panic hit stderr,
+    /// or its reply mark did not arrive within `wait` (fail closed: an unseen mark means unseen
+    /// stderr, which may hold a panic).
+    fn panicked_since(&self, before: (u64, u64), wait: std::time::Duration) -> bool {
         let Ok(g) = self.state.lock() else {
             return true;
         };
-        let wait = std::time::Duration::from_secs(2);
-        match self.cv.wait_timeout_while(g, wait, |s| s.1 <= before.1) {
-            Ok((g, _)) => g.0 > before.0,
+        match self.cv.wait_timeout_while(g, wait, |s| s.marks <= before.1) {
+            Ok((g, _)) => g.marks <= before.1 || g.panics > before.0,
             Err(_) => true,
         }
     }
@@ -1626,14 +1648,14 @@ const RUNTIME_PANIC_ERR: &str =
 /// Mirrors `TurboLean.ZygoteWorker.isRuntimePanicText`: Lean panic output or `EnvExtension`
 /// corruption, not any mention of the word `PANIC`.
 fn is_runtime_panic_text(s: &str) -> bool {
-    [
-        "PANIC at ",
-        "INTERNAL PANIC",
-        "invalid environment extension",
-    ]
-    .iter()
-    .any(|m| s.contains(m))
+    RUNTIME_PANIC_SIGNATURES.iter().any(|m| s.contains(m))
 }
+
+const RUNTIME_PANIC_SIGNATURES: [&str; 3] = [
+    "PANIC at ",
+    "INTERNAL PANIC",
+    "invalid environment extension",
+];
 
 /// Fails a reply whose worker hit a runtime panic (reported, in its messages, or seen on the
 /// worker's stderr during the request); returns whether the worker must be discarded.
@@ -3076,12 +3098,11 @@ fn eval_with_zygote_pool_inner(
             std::thread::spawn(move || {
                 use std::io::Read;
                 let mut chunk = [0u8; 1024];
-                let mut carry = Vec::new();
                 while let Ok(n) = child_stderr.read(&mut chunk) {
                     if n == 0 {
                         break;
                     }
-                    scan_clone.feed(&mut carry, &chunk[..n]);
+                    scan_clone.feed(&chunk[..n]);
                     if let Ok(mut g) = tail_clone.lock() {
                         g.extend_from_slice(&chunk[..n]);
                         if g.len() > ZYGOTE_STDERR_TAIL_CAP {
@@ -3208,7 +3229,9 @@ fn eval_with_zygote_pool_inner(
                         let rss_after = measure_process_rss_mb(pid);
                         parsed.rss_delta_mb = (rss_after as i64) - (rss_before as i64);
                         parsed.peak_rss_mb = rss_after.max(rss_before);
-                        let stderr_panic = worker.stderr_scan.panicked_since(scan_before);
+                        let stderr_panic = worker
+                            .stderr_scan
+                            .panicked_since(scan_before, ZYGOTE_STDERR_MARK_WAIT);
                         mark_runtime_panic(&mut parsed, stderr_panic);
                         WorkerReqOutcome::Reply(parsed)
                     }
@@ -6733,6 +6756,8 @@ mod tests {
             (true, "import Lean\n#eval (panic! \"Lean.EnvExtension.modifyStateImpl\" : Nat)\n"),
             (false, "#eval (panic! \"msg\" : Nat)\ntheorem p1 : True := trivial\n"),
             (false, "set_option stderrAsMessages false\n#eval (panic! \"stderr only\" : Nat)\ntheorem p2 : True := trivial\n"),
+            // Stderr-only panic behind a long unterminated stderr line (> any line buffer).
+            (false, "set_option stderrAsMessages false\n#eval show IO Unit from do\n  let e ← IO.getStderr\n  e.putStr (String.ofList (List.replicate 10000 'x'))\n  e.flush\n  let n : Nat := panic! s!\"after long line {(← IO.monoNanosNow) % 1}\"\n  IO.println n\ntheorem p3 : True := trivial\n"),
             (false, tactic_boom),
             (true, tactic_boom),
         ] {
@@ -6771,6 +6796,46 @@ mod tests {
             follow
         );
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_stderr_scan_sees_every_byte_and_fails_closed_without_reply_mark() {
+        let wait = std::time::Duration::from_millis(200);
+        let mark = format!("\n{ZYGOTE_STDERR_REPLY_MARK}\n");
+        // A panic after a long unterminated line, and signatures/marks split across any chunk size.
+        let long = format!("{}PANIC at boom{mark}", "x".repeat(100_000));
+        for chunk in [1, 7, 1024, long.len()] {
+            let scan = StderrScan::default();
+            let before = scan.snapshot();
+            long.as_bytes().chunks(chunk).for_each(|c| scan.feed(c));
+            assert_eq!(scan.snapshot(), (1, 1), "chunk={chunk}");
+            assert!(scan.panicked_since(before, wait), "chunk={chunk}");
+            // A clean request after it, with its mark, is clean; no double counting of the overlap.
+            let before = scan.snapshot();
+            format!("{}{mark}", "y".repeat(5000))
+                .as_bytes()
+                .chunks(chunk)
+                .for_each(|c| scan.feed(c));
+            assert_eq!(scan.snapshot(), (1, 2), "chunk={chunk}");
+            assert!(!scan.panicked_since(before, wait), "chunk={chunk}");
+        }
+        // Missing mark: fail closed even though no panic was seen.
+        let scan = std::sync::Arc::new(StderrScan::default());
+        let before = scan.snapshot();
+        scan.feed(b"ordinary output\n");
+        assert!(scan.panicked_since(before, wait));
+        // Delayed mark (after the wait): fail closed; a mark within the wait: clean.
+        for (delay, expect) in [(wait * 3, true), (wait / 4, false)] {
+            let before = scan.snapshot();
+            let s = scan.clone();
+            let m = mark.clone();
+            let t = std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                s.feed(m.as_bytes());
+            });
+            assert_eq!(scan.panicked_since(before, wait), expect, "delay={delay:?}");
+            t.join().unwrap();
+        }
     }
 
     /// Raw worker IPC against stock `lean`: the worker must never accept what `lean` rejects.
