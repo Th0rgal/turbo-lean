@@ -387,7 +387,7 @@ pub fn serve_cas_http_with_auth(
                     // Closing refuses any connections queued after accept returned WouldBlock.
                     // Withdraw every discovery file before committing to shutdown.
                     drop(listener.take());
-                    let lifecycle = crate::zygote::lifecycle_lock(true)?;
+                    let lifecycle = crate::zygote::lifecycle_exclusive_lock()?;
                     for key in [
                         "TURBO_LEAN_DAEMON_STATE_FILE",
                         "TURBO_LEAN_DAEMON_PARENT_STATE_FILE",

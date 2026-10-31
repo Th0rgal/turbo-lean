@@ -416,6 +416,17 @@ pub(crate) fn lifecycle_lock(exclusive: bool) -> Result<crate::shm_cache::FlockG
         .context("Could not acquire daemon lifecycle lock")
 }
 
+/// Possession proves that staging teardown holds the user-wide flock exclusively.
+pub(crate) struct ExclusiveLifecycleLock {
+    _guard: crate::shm_cache::FlockGuard,
+}
+
+pub(crate) fn lifecycle_exclusive_lock() -> Result<ExclusiveLifecycleLock> {
+    Ok(ExclusiveLifecycleLock {
+        _guard: lifecycle_lock(true)?,
+    })
+}
+
 fn remove_owned_staging(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -618,12 +629,11 @@ fn owned_process_alive(pid: u32) -> bool {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = pid;
-        false
+        portable_process_alive(pid)
     }
 }
 
-fn staging_namespace_in_use(staging: &Path) -> bool {
+fn staging_namespace_in_use(staging: &Path, _store_root: Option<&Path>) -> bool {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::MetadataExt;
@@ -651,9 +661,122 @@ fn staging_namespace_in_use(staging: &Path) -> bool {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = staging;
-        false
+        // Without /proc, only the PID files and the caller's exclusive flock can
+        // establish quiescence. Unknown/corrupt state conservatively retains staging.
+        portable_staging_namespace_in_use(staging, _store_root)
     }
+}
+
+#[cfg(any(all(unix, not(target_os = "linux")), test))]
+fn portable_staging_namespace_in_use(staging: &Path, store_root: Option<&Path>) -> bool {
+    portable_pidfile_paths(staging, store_root)
+        .map(|paths| paths.iter().any(|path| portable_pidfile_alive(path)))
+        .unwrap_or(true)
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+fn portable_process_alive(pid: u32) -> bool {
+    if pid <= 1 {
+        return true;
+    }
+    // kill(0) is a liveness check only, never authority to send a terminating signal.
+    if unsafe { libc::kill(pid as i32, 0) } != 0
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    {
+        return false;
+    }
+    // A zombie cannot use staging. On any ps failure retain it conservatively.
+    Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "stat="])
+        .output()
+        .map(|out| {
+            !out.status.success()
+                || out.stdout.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'Z')
+        })
+        .unwrap_or(true)
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+fn portable_pidfile_alive(path: &Path) -> bool {
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice::<LocalZygoteDaemonInfo>(&bytes)
+            .map(|info| portable_process_alive(info.pid))
+            .unwrap_or(true),
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+#[derive(Debug, PartialEq, Eq)]
+struct PortableProcessIdentity {
+    start_time: String,
+    command: String,
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+fn portable_process_identity(pid: u32) -> Result<Option<PortableProcessIdentity>> {
+    let output = Command::new("ps")
+        .args([
+            "eww",
+            "-p",
+            &pid.to_string(),
+            "-o",
+            "uid=",
+            "-o",
+            "lstart=",
+            "-o",
+            "command=",
+        ])
+        .env("LC_ALL", "C")
+        .output()?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut fields = text.split_whitespace();
+    if fields.next().and_then(|s| s.parse::<u32>().ok()) != Some(unsafe { libc::geteuid() }) {
+        return Ok(None);
+    }
+    let start_time = fields.by_ref().take(5).collect::<Vec<_>>().join(" ");
+    let args: Vec<_> = fields.collect();
+    let exe = args
+        .first()
+        .and_then(|s| Path::new(s).file_name())
+        .and_then(|s| s.to_str());
+    let command = args.join("\0");
+    if start_time.split_whitespace().count() != 5
+        || exe != Some("turbo-lean")
+        || !is_serve_command(command.as_bytes())
+        || !args.contains(&"TURBO_LEAN_DAEMON=1")
+    {
+        return Ok(None);
+    }
+    Ok(Some(PortableProcessIdentity {
+        start_time,
+        command,
+    }))
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+fn signal_portable_process(
+    pid: u32,
+    identity: &PortableProcessIdentity,
+    signal: i32,
+) -> Result<bool> {
+    let pid_i32 = pid as i32;
+    let target = if unsafe { libc::getpgid(pid_i32) } == pid_i32 {
+        -pid_i32
+    } else {
+        pid_i32
+    };
+    // Re-read UID, start time, and full command immediately before EVERY signal.
+    // Portable Unix lacks pidfd_send_signal: exit/PID (or process-group) reuse can
+    // still occur between this final ps snapshot and kill, and ps lstart has only
+    // second resolution. This narrows, but cannot eliminate, that residual window.
+    if portable_process_identity(pid)?.as_ref() != Some(identity) {
+        return Ok(false);
+    }
+    Ok(unsafe { libc::kill(target, signal) } == 0)
 }
 
 // Compile the portable Unix fallback in Linux tests as well as on macOS.
@@ -672,59 +795,14 @@ fn stop_pidfile_daemon(state_file: &Path) -> Result<bool> {
     if info.pid <= 1 || info.pid == std::process::id() {
         return Ok(false);
     }
-    // PID files alone can be stale. Verify UID, executable, serve subcommand, and
-    // automatic-daemon marker before the portable SIGTERM fallback.
-    let output = Command::new("ps")
-        .args([
-            "eww",
-            "-p",
-            &info.pid.to_string(),
-            "-o",
-            "uid=",
-            "-o",
-            "command=",
-        ])
-        .output()?;
-    if !output.status.success() {
+    let Some(identity) = portable_process_identity(info.pid)? else {
         return Ok(false);
-    }
-    let command = String::from_utf8_lossy(&output.stdout);
-    let mut fields = command.split_whitespace();
-    if fields.next().and_then(|s| s.parse::<u32>().ok()) != Some(unsafe { libc::geteuid() }) {
-        return Ok(false);
-    }
-    let args: Vec<_> = fields.collect();
-    let exe = args
-        .first()
-        .and_then(|s| Path::new(s).file_name())
-        .and_then(|s| s.to_str());
-    let cmdline = args.join("\0");
-    if exe != Some("turbo-lean")
-        || !is_serve_command(cmdline.as_bytes())
-        || !args.contains(&"TURBO_LEAN_DAEMON=1")
-    {
-        return Ok(false);
-    }
-    let pid = info.pid as i32;
-    let target = if unsafe { libc::getpgid(pid) } == pid {
-        -pid
-    } else {
-        pid
     };
-    if unsafe { libc::kill(target, libc::SIGTERM) } != 0 {
+    if !signal_portable_process(info.pid, &identity, libc::SIGTERM)? {
         return Ok(false);
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        let status = Command::new("ps")
-            .args(["-p", &info.pid.to_string(), "-o", "stat="])
-            .output()?;
-        if !status.status.success()
-            || status.stdout.iter().all(u8::is_ascii_whitespace)
-            || status.stdout.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'Z')
-        {
-            return Ok(true);
-        }
+    while portable_process_alive(info.pid) {
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
             "PID-file daemon {} is still shutting down",
@@ -732,14 +810,25 @@ fn stop_pidfile_daemon(state_file: &Path) -> Result<bool> {
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    Ok(true)
 }
 
 #[cfg(any(all(unix, not(target_os = "linux")), test))]
-fn stop_pidfile_daemons(staging: &Path, store_root: Option<&Path>) -> Result<LifecycleCleanup> {
+fn portable_pidfile_paths(
+    staging: &Path,
+    store_root: Option<&Path>,
+) -> Result<std::collections::HashSet<PathBuf>> {
     let mut paths: std::collections::HashSet<PathBuf> = walkdir::WalkDir::new(staging)
         .max_depth(2)
         .into_iter()
-        .filter_map(Result::ok)
+        .filter(|e| {
+            !e.as_ref().err().is_some_and(|e| {
+                e.io_error()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
         .filter(|e| e.file_name() == "zygote_daemon.json")
         .map(|e| e.into_path())
         .collect();
@@ -755,19 +844,27 @@ fn stop_pidfile_daemons(staging: &Path, store_root: Option<&Path>) -> Result<Lif
     if std::env::var_os("TURBO_LEAN_STAGING_DIR").is_none() || root.starts_with(staging) {
         paths.insert(root.join("zygote_daemon.json"));
     }
+    Ok(paths)
+}
+
+#[cfg(any(all(unix, not(target_os = "linux")), test))]
+fn stop_pidfile_daemons(staging: &Path, store_root: Option<&Path>) -> Result<LifecycleCleanup> {
+    let paths = portable_pidfile_paths(staging, store_root)?;
     let mut cleanup = LifecycleCleanup::default();
     for path in paths {
         if stop_pidfile_daemon(&path)? {
             cleanup.count += 1;
         }
-        cleanup.state_files.insert(path);
+        if !portable_pidfile_alive(&path) {
+            cleanup.state_files.insert(path);
+        }
     }
     cleanup.staging.insert(staging.to_path_buf());
     Ok(cleanup)
 }
 
 pub(crate) fn stop_daemons(store_root: Option<&Path>) -> Result<usize> {
-    let _lifecycle = lifecycle_lock(true)?;
+    let lifecycle = lifecycle_exclusive_lock()?;
     clear_zygote_pool();
     let dir = crate::shm_cache::staging_shm_dir();
     let scope = std::env::var_os("TURBO_LEAN_STAGING_DIR").map(|_| dir.as_path());
@@ -784,15 +881,16 @@ pub(crate) fn stop_daemons(store_root: Option<&Path>) -> Result<usize> {
         "Daemon processes are still shutting down"
     );
     cleanup.staging.insert(dir);
-    cleanup_lifecycle_staging(cleanup, store_root)
+    cleanup_lifecycle_staging(cleanup, store_root, &lifecycle)
 }
 
 fn cleanup_lifecycle_staging(
     mut cleanup: LifecycleCleanup,
     store_root: Option<&Path>,
+    _lifecycle: &ExclusiveLifecycleLock,
 ) -> Result<usize> {
     for path in cleanup.staging {
-        if staging_namespace_in_use(&path) {
+        if staging_namespace_in_use(&path, store_root) {
             eprintln!(
                 "Retained staging {}: still used by a foreground server or another process",
                 path.display()
@@ -805,6 +903,10 @@ fn cleanup_lifecycle_staging(
         cleanup.state_files.insert(root.join("zygote_daemon.json"));
     }
     for path in cleanup.state_files {
+        #[cfg(not(target_os = "linux"))]
+        if portable_pidfile_alive(&path) {
+            continue;
+        }
         let _ = fs::remove_file(path);
     }
     Ok(cleanup.count)
@@ -815,11 +917,11 @@ pub fn reap_zygote_workers_and_daemons(store_root: Option<&Path>) -> usize {
 }
 
 /// Idle exit is local to this server, never a machine-wide reap.
-pub(crate) fn shutdown_local_daemon(_lifecycle: &crate::shm_cache::FlockGuard) {
+pub(crate) fn shutdown_local_daemon(_lifecycle: &ExclusiveLifecycleLock) {
     clear_zygote_pool();
     terminate_lifecycle_processes(None, Some(std::process::id()));
     let staging = crate::shm_cache::staging_shm_dir();
-    if !staging_namespace_in_use(&staging) {
+    if !staging_namespace_in_use(&staging, None) {
         let _ = remove_owned_staging(&staging);
     }
 }
@@ -3419,7 +3521,7 @@ fn terminate_and_remove_daemon_state_file(state_file: &Path) {
         }
     }
     #[cfg(all(unix, not(target_os = "linux")))]
-    if stop_pidfile_daemon(state_file).is_err() {
+    if stop_pidfile_daemon(state_file).is_err() || portable_pidfile_alive(state_file) {
         return;
     }
     let _ = fs::remove_file(state_file);
@@ -4229,7 +4331,10 @@ mod tests {
         }
         assert_eq!(cleanup.count, 2);
         assert_eq!(cleanup.staging.len(), 2);
-        assert_eq!(cleanup_lifecycle_staging(cleanup, None).unwrap(), 2);
+        assert_eq!(
+            cleanup_lifecycle_staging(cleanup, None, &lifecycle_exclusive_lock().unwrap()).unwrap(),
+            2
+        );
         assert!(dirs.iter().all(|dir| !dir.exists()));
     }
 
@@ -4260,9 +4365,38 @@ mod tests {
             policy: vec![],
         };
         fs::write(&state, serde_json::to_vec(&info).unwrap()).unwrap();
+        let mut identity = portable_process_identity(child.id())
+            .unwrap()
+            .expect("portable identity");
+        identity.start_time.push_str(" changed");
+        assert!(!signal_portable_process(child.id(), &identity, libc::SIGTERM).unwrap());
+        identity = portable_process_identity(child.id()).unwrap().unwrap();
+        identity.command.push_str(" changed");
+        assert!(!signal_portable_process(child.id(), &identity, libc::SIGKILL).unwrap());
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(portable_staging_namespace_in_use(&dir, Some(&dir)));
         assert_eq!(stop_pidfile_daemons(&dir, Some(&dir)).unwrap().count, 1);
         assert!(!child.wait().unwrap().success());
         assert!(!stop_pidfile_daemon(&state).unwrap());
+        assert!(!portable_staging_namespace_in_use(&dir, Some(&dir)));
+        // A live PID without the daemon identity must not be killed, nor may its
+        // state file or staging be deleted. Malformed state is conservative too.
+        let mut foreign = Command::new("sleep").arg("30").spawn().unwrap();
+        let foreign_info = LocalZygoteDaemonInfo {
+            pid: foreign.id(),
+            ..info
+        };
+        fs::write(&state, serde_json::to_vec(&foreign_info).unwrap()).unwrap();
+        let cleanup = stop_pidfile_daemons(&dir, Some(&dir)).unwrap();
+        assert_eq!(cleanup.count, 0);
+        assert!(!cleanup.state_files.contains(&state));
+        assert!(portable_staging_namespace_in_use(&dir, Some(&dir)));
+        assert!(foreign.try_wait().unwrap().is_none());
+        foreign.kill().unwrap();
+        foreign.wait().unwrap();
+        assert!(!portable_staging_namespace_in_use(&dir, Some(&dir)));
+        fs::write(&state, "invalid state").unwrap();
+        assert!(portable_staging_namespace_in_use(&dir, Some(&dir)));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -4718,8 +4852,8 @@ mod tests {
         let started = std::time::Instant::now() - std::time::Duration::from_secs(1);
         let remaining = remaining_timeout_ms(Some(100), started);
         assert_eq!(remaining, 0);
-        let err =
-            run_lean_command(&mut Command::new("must-not-be-spawned"), Some(remaining)).unwrap_err();
+        let err = run_lean_command(&mut Command::new("must-not-be-spawned"), Some(remaining))
+            .unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
     }
 
