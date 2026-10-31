@@ -2385,7 +2385,9 @@ open LeanNative.IR LeanNative.Proofs
     params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
     retTy := .i1
     body :=
-      .letBind 1 .objPtr (.allocCtor 0 [] [])
+      -- the child must be a genuinely heap-allocated (non-nullary) ctor: a fieldless `allocCtor 0 [] []` is the
+      -- immediate `.tuple [0]` (always exclusive), which would make this aliasing check vacuous
+      .letBind 1 .objPtr (.allocCtor 0 [] [0])
         (.letBind 2 .objPtr (.allocCtor 0 [1] [])
           (.letBind 3 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
             (.ite 3

@@ -1520,6 +1520,12 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
       -- fail closed (`symUnsupported`) rather than truncating `tag.toUInt64`!
       (((st.clearAlias dst).unmarkTypedTuple dst).markUnsupported).bindVar dst
         { expr := .unit, nonPoison := false, noUB := false }
+    else if objFields.isEmpty && scalarFields.isEmpty then
+      -- C1.1: a fieldless ctor is the immediate `.tuple [tag]` (`Eval.lean` `allocCtor tag [] []`), never an
+      -- RC-managed root: RC ops are no-ops and `isExclusive` is `true` (typed-tuple paths of
+      -- `updateRefCountFuel` / `.isExclusive`), exactly as `evalIncRef`/`evalDecRef` treat a non-heap value.
+      ((st.clearVarSortTags dst).clearAlias dst |>.markTypedTuple dst).bindVar dst
+        { expr := .tuple [.constU64 tag.toUInt64], nonPoison := true, noUB := true }
     else
       let svs := (objFields ++ scalarFields).map st.lookupVar
       let encodeCtorField (v : VarId) : SymExpr :=
