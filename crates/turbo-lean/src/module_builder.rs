@@ -1854,6 +1854,65 @@ fn lake_precompile(key: &str, val: &str, location: &dyn Fn() -> String) -> Resul
     }
     Ok(on)
 }
+/// A token that starts a Lean or Lake command (`#eval`, `def`, `package`, ...).
+fn is_lean_command_token(t: &str) -> bool {
+    (t.starts_with('#') && t.len() > 1)
+        || matches!(
+            t,
+            "package"
+                | "lean_lib"
+                | "lean_exe"
+                | "target"
+                | "extern_lib"
+                | "require"
+                | "input_file"
+                | "input_dir"
+                | "post_update"
+                | "script"
+                | "lean_script"
+                | "import"
+                | "open"
+                | "def"
+                | "abbrev"
+                | "theorem"
+                | "instance"
+                | "structure"
+                | "inductive"
+                | "class"
+                | "axiom"
+                | "opaque"
+                | "example"
+                | "mutual"
+                | "deriving"
+                | "attribute"
+                | "set_option"
+                | "namespace"
+                | "section"
+                | "end"
+                | "universe"
+                | "variable"
+                | "include"
+                | "omit"
+                | "export"
+                | "notation"
+                | "infix"
+                | "infixl"
+                | "infixr"
+                | "prefix"
+                | "postfix"
+                | "syntax"
+                | "macro"
+                | "macro_rules"
+                | "elab"
+                | "elab_rules"
+                | "initialize"
+                | "builtin_initialize"
+                | "meta"
+                | "run_cmd"
+                | "run_elab"
+                | "run_meta"
+        )
+}
 /// TOML reads a quoted key without a dot (`"moreLeanArgs"`) as the bare key.
 fn toml_bare_key(raw: &str) -> String {
     let k = raw.trim();
@@ -3468,6 +3527,26 @@ pub fn parse_lakefile_lean(
                     ),
                 )?;
             }
+        }
+    }
+    // 2. Lean commands may share a line or start at any column, so a command hidden after a
+    //    declaration's keyword or inside a body the reader skips (helpers, hooks, `require`,
+    //    field values) would configure Lake behind the parser's back.
+    for (idx, (line, toks)) in clean.lines().zip(lean_tokens_by_line(&clean)).enumerate() {
+        let indented = line.starts_with(char::is_whitespace);
+        let mut cmds = toks.iter().filter(|t| is_lean_command_token(t));
+        let hidden = if indented { cmds.next() } else { cmds.nth(1) };
+        if let Some(cmd) = hidden {
+            unsupported_lake_field(
+                &mut pkg_unsupported,
+                is_root_pkg,
+                format!(
+                    "Unsupported embedded command `{}` in {} at line {}",
+                    cmd,
+                    lean_path.display(),
+                    idx + 1
+                ),
+            )?;
         }
     }
     let mut pkg = PackageConfig {
@@ -11566,6 +11645,22 @@ roots = ["Fast"]
         .unwrap();
         let pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
         assert!(pkg.unsupported.is_some());
+        // A command hidden after a helper on the same line, or indented inside a body the reader
+        // skips, still configures Lake.
+        for body in [
+            "def helper := 0 package t where\n  precompileModules := true\nlean_lib A\n",
+            "package t\ndef helper := 0\n  lean_lib Hidden where\n    moreLeanArgs := #[\"-DautoImplicit=false\"]\nlean_lib A\n",
+            "package t\npost_update pkg do\n  pure ()\n  set_option maxHeartbeats 1\nlean_lib A\n",
+            "package t\nrequire foo from git\n  \"https://x\" @ \"main\" lean_lib Hidden\nlean_lib A\n",
+            "package t where\n  moreLinkArgs := #[]\n    lean_exe Hidden\nlean_lib A\n",
+        ] {
+            fs::write(&lf, format!("import Lake\nopen Lake DSL\n{body}")).unwrap();
+            assert!(parse_lakefile_lean(&dir, &lf, true).is_err(), "{body}");
+            // Otherwise rejected outright by another guard.
+            if let Ok(pkg) = parse_lakefile_lean(&dir, &lf, false) {
+                assert!(pkg.unsupported.is_some(), "{body}");
+            }
+        }
         // A dependency's `needs` only marks the target that sets it.
         let lf = dir.join("lakefile.lean");
         fs::write(
