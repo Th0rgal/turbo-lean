@@ -5,6 +5,7 @@ import FV.E2E.Statement
 /-! O3/O4 in the exact entry/reachability contracts consumed by clifv's backend theorem. -/
 namespace B2.BackendEntry
 open Clif B2.CollatzClif Backend.Proof.Driver
+attribute [local irreducible] B2.Smoke.collatz
 set_option maxRecDepth 20000
 set_option maxHeartbeats 2000000
 

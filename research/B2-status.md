@@ -1,7 +1,7 @@
 # B2 status
 
 Baseline: `5508b9f`; clifv `5018b9509dc124154dbe08a5bd85862595d8eab7`.
-Checkpoint: 2026-10-31 13:46 UTC. The real executable lowering lives in
+Checkpoint: 2026-10-31 14:03 UTC. The real executable lowering lives in
 `lean/LeanNative/Backend/Clif.lean`; `compile-clif` calls that definition.
 The proof package's default `lake build` passes on Lean 4.34.1.
 
@@ -25,8 +25,8 @@ Six compiler/proof source pairs are committed byte-identical (Types,
 AST, Codec, Value, Eval, Clif). `scripts/check_b2_source_identity.py`
 passes and verifies a clean pinned dependency. `.github/workflows/b2.yml`
 enforces the check, proof build, and compiler-toolchain integration build.
-Remote CI for the all-input simulation checkpoint `b7ed108` passed:
-https://github.com/Th0rgal/turbo-lean/actions/runs/41195446775 .
+Remote CI for the memory-preservation/call-free checkpoint `02dfbed` passed:
+https://github.com/Th0rgal/turbo-lean/actions/runs/41207047569 .
 Local Lean 4.35 CoreCLI integration build passed. The actual compiler
 dispatcher emitted collatz_steps CLIF successfully (same lowering;
 division by two is a shift). `research/b2-compiler-smoke.lean` records
@@ -46,9 +46,28 @@ safety / `TrapsExplicit` (O4); produce backend artifacts/allocation (O5),
 discharge contracts (O6), and compose (O7). The FinalDirect build is live;
 upstream IselData and IselContract have finished, with dependent proof modules
 still building. The shared host suffered a prolonged disk-I/O stall.
-`B2.Artifacts` and `B2.BackendEntry` are WIP and excluded from the active root
-and claims until their checks pass; concrete backend equations and the
-exact upstream entry/reachability connection are being checked. Do not restart a live build on an observation timeout.
+`B2.Artifacts`, `B2.BackendEntry`, `B2.BackendContracts`, and `B2.EndToEnd`
+are WIP and excluded from the active root and claims until their checks pass.
+They contain the concrete pipeline equations, exact upstream entry/reachability
+connection, absent-site contracts, and composition code. No O7 claim yet.
+
+The session cgroup has `memory.max = 16 GiB` and `memory.high = 14.4 GiB`.
+Running artifact checks alongside four upstream proof workers caused severe
+reclaim/I/O stalls. Artifact checks are stopped: finish the existing backend
+build first, then run one heavyweight check at a time. The live backend build
+is PID 1926474, from `research/b2-proofs`, logging to `/tmp/b2-final-cone.log`.
+RefinesInsts has finished; RegallocInstsInt/ZR and dependent modules remain.
+Do not duplicate or restart this live build. The inspected executable pipeline
+reports success through allocation check, emission, and layout; kernel
+certification is still open. `Artifacts.input` is a snapshot tied to the actual
+lowering by an equality, to prevent repeated lowering during backend checks.
+The temporary `/tmp/b2-artifacts-instrumented.lean` reports its stage in
+`/tmp/b2-artifact-stage`; its last attempted stage was `lowerFunction`.
+
+`CalleeOk.pc` and `.ext` are unconditional even for no call sites. The composition
+code retains precisely these hook/program-preservation contracts and discharges
+`.os` from absence of call sites. Treating the entire `CalleeOk` structure as
+vacuous would be incorrect. Do not restart a live build on an observation timeout.
 
 The active root `B2.lean` excludes the old sorry-bearing SpecCore/SpecE2E
 sketches. Their DivGuarded, untyped-argument, and empty-program statements
