@@ -15,7 +15,10 @@
     and its constructor), inductive constructors, recursor rules (`RecursorRule.rhs`) and the
     declaration's matcher / equation / `_unsafe_rec` / `match_n` auxiliaries. The graph search is
     a 0-1 BFS (auxiliary edges cost 0 hops), hence cycle safe; hop count ≤ 3 → `call≤3`.
-  * `clone`: the target's canonical body equals the canonical body of a forbidden evaluator.
+  * `clone`: some constant in the target's dependency closure (the target itself, a helper in ANY
+    module / namespace, an `implemented_by` target, an instance, an auxiliary, … — the same graph
+    as above, restricted to non-forbidden definitions) has a canonical body equal to that of a
+    forbidden evaluator; the hit is attributed to the target, with the path as witness.
     Canonicalization (spec [Q3]): delta-unfold ALL matchers (`Lean.Meta.isMatcher`) and the
     definition's own auxiliaries (`_f`, `_unary`, `_mutual`, `_unsafe_rec`, `match_n`, ...)
     regardless of namespace prefix, beta-reduce, instantiate level params positionally, replace
@@ -60,7 +63,8 @@ def checkerPath : String := "scripts/check_shadow_semantics.lean"
 
 /-- Self-test fixture namespaces (compiled only in the `ShadowFixtures` lib). -/
 def fixtureNamespaces : List Name :=
-  [`ShadowFixtureDirect, `ShadowFixtureClone, `ShadowFixtureBitVec, `ShadowFixtureAllowlisted]
+  [`ShadowFixtureDirect, `ShadowFixtureClone, `ShadowFixtureBitVec, `ShadowFixtureAllowlisted,
+   `ShadowFixtureHelperClone]
 
 structure Inventory where
   modules : List Name
@@ -230,13 +234,16 @@ structure Hit where
   hops : Nat
   path : List Name
 
-/-- For each forbidden owner `F`, minimal hops from every constant to `F`'s constants, never
-    passing through another forbidden constant. Returns `target ↦ hits`. -/
-def reverseSearch (env : Environment) (rev : Std.HashMap Name (Array (Name × Nat)))
-    (owners : Array Name) (allForbidden : Array Name) : Std.HashMap Name (Array Hit) := Id.run do
+/-- For each group `(F, sources)`, minimal hops from every constant to one of `sources`, never
+    passing through a forbidden constant (forbidden constants are sinks). Call groups use `F`'s
+    own constants as sources; clone groups use the constants whose canonical body equals `F`'s, so
+    a clone ANYWHERE in a target's dependency closure (helper in an unpinned module / namespace,
+    `implemented_by` target, instance, auxiliary, …) is attributed to the target.
+    Returns `constant ↦ hits` (a source itself is a hit at distance 0). -/
+def reverseSearch (rev : Std.HashMap Name (Array (Name × Nat)))
+    (groups : Array (Name × Array Name)) : Std.HashMap Name (Array Hit) := Id.run do
   let mut out : Std.HashMap Name (Array Hit) := {}
-  for f in owners do
-    let srcs := allForbidden.filter (forbiddenOwner · == userName f)
+  for (f, srcs) in groups do
     let mut dist : Std.HashMap Name Nat := {}
     let mut next : Std.HashMap Name Name := {}   -- successor toward `f`
     for s in srcs do dist := dist.insert s 0
@@ -264,12 +271,12 @@ def reverseSearch (env : Environment) (rev : Std.HashMap Name (Array (Name × Na
       let mut path := [u]
       let mut cur := u
       let mut guard := 0
-      while !isForbidden cur && guard < 10000 do
-        cur := next[cur]?.getD f
-        path := path ++ [cur]
+      while guard < 10000 do
+        let some n := next[cur]? | break
+        path := path ++ [n]
+        cur := n
         guard := guard + 1
       out := out.insert u ((out[u]?.getD #[]).push { forbidden := userName f, hops := h, path })
-  let _ := env
   return out
 
 /-! ## Clone canonicalization -/
@@ -286,7 +293,13 @@ partial def unfoldAux (env : Environment) (root : Name) (fuel : Nat) (e : Expr) 
       else if fuel == 0 then none
       else
         let isLocal := (userName root).isPrefixOf un && isAuxName n
-        if isMatcherCore env n || isLocal then
+        -- `_sparseCasesOn_k` are matcher-like casesOn wrappers that Lean SHARES across
+        -- declarations (e.g. `evalUnaryOp` reuses `evalBinOp._sparseCasesOn_1`), so unfold them
+        -- regardless of owner, like matchers.
+        let isSparse := match un with
+          | .str _ s => s.startsWith "_sparseCasesOn"
+          | _ => false
+        if isMatcherCore env n || isLocal || isSparse then
           match env.find? n with
           | some ci@(.defnInfo _) =>
             some (unfoldAux env root (fuel - 1) (ci.instantiateValueLevelParams! us))
@@ -347,17 +360,35 @@ def collectTargets (env : Environment) (inv : Inventory) : Array Name := Id.run 
     if inMod || inNamespace inv.namespaces n then out := out.push n
   return out.qsort (·.toString < ·.toString)
 
-/-- Modules whose transitive imports include the forbidden evaluator module. -/
-def relevantModules (env : Environment) : Std.HashSet Name := Id.run do
+/-- Module indices whose transitive imports include one of `anchors` (or that are an anchor).
+    Every constant that can reach a source constant lives in a module importing the source's
+    module, so restricting the graph to these modules loses no path. -/
+def importersOf (env : Environment) (anchors : Std.HashSet Name) : Std.HashSet Nat := Id.run do
   let names := env.header.moduleNames
   let data := env.header.moduleData
   let mut rel : Std.HashSet Name := {}
+  let mut idx : Std.HashSet Nat := {}
   -- moduleNames is topologically ordered (dependencies first)
   for i in [0:names.size] do
     let m := names[i]!
     let deps := data[i]!.imports.map (·.module)
-    if m == `LeanNative.Semantics.Eval || deps.any rel.contains then rel := rel.insert m
-  return rel
+    if anchors.contains m || deps.any rel.contains then
+      rel := rel.insert m
+      idx := idx.insert i
+  return idx
+
+def constsOf (e : Expr) : Std.HashSet Name :=
+  e.foldConsts {} fun c s => s.insert c
+
+/-- Clone anchor of a forbidden evaluator: the topologically LAST module defining a constant of
+    its canonical body. A verbatim / alpha-equivalent copy has the same canonical body, so it
+    mentions that constant and its module transitively imports the anchor. -/
+def cloneAnchor (env : Environment) (canon : Expr) : Option Name := Id.run do
+  let mut best : Option Nat := none
+  for c in constsOf canon do
+    if let some i := env.getModuleIdxFor? c then
+      if best.all (· < i.toNat) then best := some i.toNat
+  return best.map (env.header.moduleNames[·]!)
 
 def declLoc (env : Environment) (leanDir : System.FilePath) (n : Name) : IO (String × Nat) := do
   let owner := ownerDecl env n
@@ -386,41 +417,58 @@ def analyze (env : Environment) (leanDir : System.FilePath) (inv : Inventory) : 
   stage "collect targets"
   let targets := collectTargets env inv
   stage s!"{targets.size} targets"
-  let rel := relevantModules env
-  let relIdx : Std.HashSet Nat := (List.range env.header.moduleNames.size).foldl (init := {})
-    fun s i => if rel.contains env.header.moduleNames[i]! then s.insert i else s
   let forbidden := (env.constants.toList.filterMap fun (n, _) =>
     if isForbidden n then some n else none).toArray
   let forbiddenEvals := forbidden.filter fun n => !isAuxName n && forbiddenOwner n == userName n
-  stage s!"build graph over {relIdx.size} relevant modules"
-  let rev ← buildGraph env relIdx
-  stage s!"graph: {rev.size} referenced nodes; reverse search"
-  let hits := reverseSearch env rev forbiddenEvals forbidden
-  stage s!"search done ({hits.size} reaching constants); clone canonicalization"
   -- canonical forms of forbidden evaluator bodies (NOT of shared utilities)
   let ctx : Core.Context := { fileName := "<shadow-check>", fileMap := default,
                               maxHeartbeats := 0, maxRecDepth := 100000 }
   let st : Core.State := { env }
   let canonOf (c : Name) : IO (Option Expr) := (canonical env c).toIO' ctx st
   let mut evalCanon : Array (Name × Expr) := #[]
+  let mut anchors : Std.HashSet Name := ({} : Std.HashSet Name).insert `LeanNative.Semantics.Eval
   for f in forbiddenEvals do
-    if let some e ← canonOf f then evalCanon := evalCanon.push (f, e)
+    if let some e ← canonOf f then
+      evalCanon := evalCanon.push (f, e)
+      if let some a := cloneAnchor env e then anchors := anchors.insert a
+  let relIdx := importersOf env anchors
+  -- Clone sources: EVERY non-forbidden definition of the relevant modules (not only targets)
+  -- whose canonical body equals a forbidden evaluator's. They are then searched for like the
+  -- evaluator itself, so a clone hidden in a helper outside the pinned modules / namespaces, an
+  -- `implemented_by` target, an instance or an auxiliary is attributed to every target reaching it.
+  stage s!"clone canonicalization over {relIdx.size} relevant modules"
+  let evalHashes : Std.HashSet UInt64 := evalCanon.foldl (·.insert ·.2.hash) {}
+  let mut cloneSrcs : Std.HashMap Name (Array Name) := {}
+  for (c, ci) in env.constants.toList do
+    let .defnInfo _ := ci | continue
+    if isForbidden c then continue
+    let some i := env.getModuleIdxFor? c | continue
+    unless relIdx.contains i.toNat do continue
+    let some e ← canonOf c | continue
+    unless evalHashes.contains e.hash do continue
+    for (f, fe) in evalCanon do
+      if e == fe then cloneSrcs := cloneSrcs.insert f ((cloneSrcs[f]?.getD #[]).push c)
+  stage s!"build graph; clone sources: {cloneSrcs.toList.map fun (f, cs) => (f, cs.size)}"
+  let rev ← buildGraph env relIdx
+  stage s!"graph: {rev.size} referenced nodes; reverse search"
+  let callGroups := forbiddenEvals.map fun f => (f, forbidden.filter (forbiddenOwner · == userName f))
+  let callHits := reverseSearch rev callGroups
+  let cloneHits := reverseSearch rev (cloneSrcs.toArray)
+  stage s!"search done ({callHits.size} call-reaching, {cloneHits.size} clone-reaching constants)"
   let mut vs : Array Violation := #[]
   let mut targetLocs := #[]
   for t in targets do
     let (file, line) ← declLoc env leanDir t
     targetLocs := targetLocs.push (userName t, file, line)
     -- a target's own auxiliaries are part of it (0-cost edges), so fold their hits in too
-    for h in hits[t]?.getD #[] do
+    for h in callHits[t]?.getD #[] do
       let kind := if h.hops ≤ 3 then "call≤3" else "call∞"
       vs := vs.push { target := userName t, forbidden := h.forbidden, kind,
                       hops := h.hops, path := h.path.map userName, file, line }
-    if let some e ← canonOf t then
-      for (f, fe) in evalCanon do
-        if e == fe then
-          vs := vs.push { target := userName t, forbidden := userName f, kind := "clone",
-                          file, line }
-  stage "clone pass done"
+    for h in cloneHits[t]?.getD #[] do
+      vs := vs.push { target := userName t, forbidden := h.forbidden, kind := "clone",
+                      hops := h.hops, path := h.path.map userName, file, line }
+  stage "attribution done"
   -- dedupe by identity, keep the shortest witness
   let mut best : Std.HashMap String Violation := {}
   for v in vs do
@@ -470,8 +518,8 @@ def Violation.toJson (v : Violation) : Json :=
 
 def printTable (vs : Array Violation) : IO Unit := do
   for v in vs do
-    let witness := if v.kind == "clone" then "(canonical body equal)"
-      else " → ".intercalate (v.path.map toString)
+    let witness := " → ".intercalate (v.path.map toString) ++
+      (if v.kind == "clone" then " ≅ (canonical body equal)" else "")
     IO.println s!"  {v.kind}\t{v.target}\t→ {v.forbidden}\t{v.file}:{v.line}\t{witness}"
 
 /-! ## Ratchet -/
@@ -531,6 +579,11 @@ def selfTest (env : Environment) (leanDir : System.FilePath) : IO (Array String)
   -- (2) verbatim clone in a file importing LeanNative.Semantics.Eval → fail
   unless find `ShadowFixtureClone.evalBinOp `LeanNative.Semantics.evalBinOp "clone" do
     errs := errs.push "fixture verbatim-clone: expected ShadowFixtureClone.evalBinOp ≅ evalBinOp (clone)"
+  -- (2b) clone in an un-inventoried helper module / namespace, reached from a target → fail
+  unless find `ShadowFixtureHelperClone.denote `LeanNative.Semantics.evalUnaryOp "clone" do
+    errs := errs.push "fixture helper-clone: expected ShadowFixtureHelperClone.denote → UnrelatedUtil.unaryCopy ≅ evalUnaryOp (clone)"
+  if r.violations.any (fun v => (`UnrelatedUtil).isPrefixOf v.target) then
+    errs := errs.push "fixture helper-clone: un-inventoried helper must not itself be a target"
   -- (3) BitVec-only namespace → pass
   if r.violations.any (fun v => (`ShadowFixtureBitVec).isPrefixOf v.target) then
     errs := errs.push "fixture bitvec-only: expected no violation in ShadowFixtureBitVec"
