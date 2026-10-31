@@ -942,7 +942,13 @@ pub fn serve_cas_http_with_auth(
                         false,
                         true,
                         req.file_name.as_deref(),
-                        req.timeout_ms,
+                        Some(crate::zygote::remaining_timeout_ms(
+                            req.timeout_ms
+                                .filter(|ms| *ms > 0)
+                                .or_else(crate::zygote::invocation_timeout_ms)
+                                .or(Some(900_000)),
+                            request_started,
+                        )),
                         &filtered_eval_args,
                     ) {
                         Ok(zreply) => {
@@ -1514,7 +1520,7 @@ fn execute_check_shard_payload_deferred_with_domain(
         true,
         false,
         None,
-        timeout_ms,
+        Some(crate::zygote::remaining_timeout_ms(timeout_ms, t0)),
         &filtered_req_args,
     ) {
         Ok(zreply) if zreply.import_ok => {
@@ -1788,7 +1794,7 @@ fn execute_check_shards_batch_payload_deferred(
         true,
         false,
         None,
-        timeout_ms,
+        Some(crate::zygote::remaining_timeout_ms(timeout_ms, t0)),
         &filtered_batch_args,
     ) {
         if zreply.import_ok {

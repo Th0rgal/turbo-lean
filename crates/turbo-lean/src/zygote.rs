@@ -1967,9 +1967,8 @@ static ZYGOTE_LEAN_PATH_CACHE: std::sync::OnceLock<
 fn read_line_with_timeout(
     reader: &mut BufReader<std::process::ChildStdout>,
     line: &mut String,
-    timeout_ms: u64,
+    deadline: std::time::Instant,
 ) -> std::io::Result<Option<usize>> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let mut raw_bytes: Vec<u8> = Vec::new();
     loop {
         if reader.buffer().is_empty() {
@@ -2157,15 +2156,17 @@ fn eval_with_zygote_pool_inner(
     batch_fission_override: Option<(String, String, String)>,
     lean_args: &[String],
 ) -> Result<ZygoteEvalReply> {
-    let _lifecycle = lifecycle_lock(false)?;
+    let request_started = std::time::Instant::now();
     let default_timeout_ms = if eval_mode { 900_000 } else { 30_000 };
-    let effective_timeout_ms = timeout_ms.filter(|&ms| ms > 0).unwrap_or_else(|| {
+    let effective_timeout_ms = timeout_ms.unwrap_or_else(|| {
         std::env::var("TURBO_LEAN_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .filter(|&ms| ms > 0)
             .unwrap_or(default_timeout_ms)
     });
+    let deadline = request_started + std::time::Duration::from_millis(effective_timeout_ms);
+    let _lifecycle = lifecycle_lock(false)?;
 
     let env_lp = env_vars.get("LEAN_PATH").cloned().unwrap_or_default();
     let lp_cache_key = (
@@ -2449,6 +2450,13 @@ fn eval_with_zygote_pool_inner(
         Crashed(WorkerCrashDiagnostics),
     }
 
+    let worker_timeout = |worker: &ZygoteChild, req_id: &str| WorkerReqOutcome::TimedOut {
+        elapsed_us: request_started.elapsed().as_micros() as u64,
+        peak_rss_mb: measure_process_rss_mb(worker.child.id()),
+        stderr_tail: snapshot_worker_stderr_tail(&worker.stderr_tail),
+        last_request: req_id.to_string(),
+    };
+
     let request_identity = format!(
         "imports={} file={} mode={} bytes={}",
         if imports_csv.is_empty() {
@@ -2469,7 +2477,9 @@ fn eval_with_zygote_pool_inner(
 
     let run_worker_req =
         |worker: &mut ZygoteChild, req_line: &str, req_id: &str| -> WorkerReqOutcome {
-            let req_t0 = std::time::Instant::now();
+            if std::time::Instant::now() >= deadline {
+                return worker_timeout(worker, req_id);
+            }
             let pid = worker.child.id();
             let rss_before = measure_process_rss_mb(pid);
             if let Err(e) = worker
@@ -2486,12 +2496,12 @@ fn eval_with_zygote_pool_inner(
                 ));
             }
             let mut resp_line = String::new();
-            match read_line_with_timeout(&mut worker.stdout, &mut resp_line, effective_timeout_ms) {
+            match read_line_with_timeout(&mut worker.stdout, &mut resp_line, deadline) {
                 Ok(None) => {
                     let rss_now = measure_process_rss_mb(pid).max(rss_before);
                     let stderr_tail = snapshot_worker_stderr_tail(&worker.stderr_tail);
                     WorkerReqOutcome::TimedOut {
-                        elapsed_us: req_t0.elapsed().as_micros() as u64,
+                        elapsed_us: request_started.elapsed().as_micros() as u64,
                         peak_rss_mb: rss_now,
                         stderr_tail,
                         last_request: req_id.to_string(),
@@ -2926,7 +2936,7 @@ fn eval_with_zygote_pool_inner(
             }
         };
 
-    let (mut worker, mut was_warm_worker) = {
+    let mut worker = {
         let mut pool = pool_mutex
             .lock()
             .map_err(|_| anyhow::anyhow!("ZygotePool mutex poisoned"))?;
@@ -3012,34 +3022,50 @@ fn eval_with_zygote_pool_inner(
                 }
             }
         }
-        match selected {
-            Some(w) => (Some(w), true),
-            None => (None, false),
-        }
+        selected
     };
+    if std::time::Instant::now() >= deadline {
+        return Ok(ZygoteEvalReply::timed_out_reply(
+            eval_mode,
+            request_started.elapsed().as_micros() as u64,
+            effective_timeout_ms,
+            0,
+            String::new(),
+            Some(request_identity.clone()),
+        ));
+    }
     if worker.is_none() {
         worker = Some(spawn_zygote_worker()?);
-        was_warm_worker = false;
     }
 
     let mut w = worker.unwrap();
     let mut outcome = run_worker_req(&mut w, &req_line, &request_identity);
     if let WorkerReqOutcome::Crashed(first_diag) = outcome {
         drop(w);
-        if was_warm_worker {
-            w = spawn_zygote_worker()?;
-            outcome = run_worker_req(&mut w, &req_line, &request_identity);
-        } else {
-            // Fresh worker crashed on first try; retry once on a new worker before returning crashed: true
-            if let Ok(mut retry_w) = spawn_zygote_worker() {
-                outcome = run_worker_req(&mut retry_w, &req_line, &request_identity);
-                w = retry_w;
-            } else {
+        // Respawn and replay share the original request deadline, including on a cold worker.
+        if std::time::Instant::now() >= deadline {
+            return Ok(ZygoteEvalReply::timed_out_reply(
+                eval_mode,
+                request_started.elapsed().as_micros() as u64,
+                effective_timeout_ms,
+                first_diag.peak_rss_mb,
+                first_diag.stderr_tail,
+                first_diag.last_request,
+            ));
+        }
+        match spawn_zygote_worker() {
+            Ok(retry_w) => w = retry_w,
+            Err(_) => {
                 let mut diag = first_diag;
                 diag.message = format!("{} (respawn failed)", diag.message);
                 return Ok(ZygoteEvalReply::crashed_reply_with_diag(eval_mode, diag));
             }
         }
+        outcome = run_worker_req(&mut w, &req_line, &request_identity);
+    }
+
+    if std::time::Instant::now() >= deadline {
+        outcome = worker_timeout(&w, &request_identity);
     }
 
     match outcome {
@@ -3326,13 +3352,16 @@ pub(crate) fn remaining_timeout_ms(timeout_ms: Option<u64>, started: std::time::
         .filter(|ms| *ms > 0)
         .unwrap_or(30_000)
         .saturating_sub(started.elapsed().as_millis().min(u64::MAX as u128) as u64)
-        .max(1)
 }
 
 pub(crate) fn run_lean_command(
     cmd: &mut Command,
     timeout_ms: Option<u64>,
 ) -> Result<std::process::Output> {
+    anyhow::ensure!(
+        timeout_ms != Some(0),
+        "Lean request timed out before fallback"
+    );
     crate::module_builder::run_command_with_timeout(
         cmd,
         std::time::Duration::from_millis(
@@ -4373,6 +4402,8 @@ mod tests {
             let _ = fs::remove_dir_all(&tmp_dir);
             return None;
         }
+        // Fixture setup compiles the worker before any request's deadline begins.
+        ensure_zygote_binary(&store, &lean_bin, &env_vars).expect("prepare test worker");
         Some((tmp_dir, store, env_vars, lean_bin))
     }
 
@@ -4680,6 +4711,16 @@ mod tests {
                 && joined_msgs.contains("42")
         );
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_exhausted_budget_does_not_spawn_fallback() {
+        let started = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let remaining = remaining_timeout_ms(Some(100), started);
+        assert_eq!(remaining, 0);
+        let err =
+            run_lean_command(Command::new("must-not-be-spawned"), Some(remaining)).unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
     }
 
     #[test]

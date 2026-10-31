@@ -401,6 +401,47 @@ fn check_timeout_reaches_existing_daemon_without_restart() {
 }
 
 #[test]
+fn warm_daemon_late_crash_retry_shares_eval_deadline() {
+    use std::io::Read;
+    let _serial = LIFECYCLE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new();
+    f.warm();
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(f.root.join("cas/zygote_daemon.json")).unwrap()).unwrap();
+    let eval = |source: &str, timeout_ms: u64| {
+        let mut stream = std::net::TcpStream::connect(state["addr"].as_str().unwrap()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let body = serde_json::json!({"source": source, "timeout_ms": timeout_ms}).to_string();
+        write!(stream, "POST /eval HTTP/1.1\r\nHost: localhost\r\nX-Turbo-Token: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            state["auth_token"].as_str().unwrap(), body.len(), body).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        serde_json::from_str::<serde_json::Value>(response.split_once("\r\n\r\n").unwrap().1)
+            .unwrap()
+    };
+    assert_eq!(eval("#eval (0 : Nat)", 10_000)["ok"], true);
+    let start = Instant::now();
+    let reply = eval("#eval (do IO.sleep 800; IO.Process.exit 1 : IO Unit)", 1000);
+    let elapsed = start.elapsed();
+    assert_eq!(reply["timed_out"], true, "{reply}");
+    assert_eq!(reply["crashed"], false, "{reply}");
+    assert!(
+        elapsed < Duration::from_millis(1250),
+        "late crash replay exceeded shared deadline: {elapsed:?}: {reply}"
+    );
+    evidence(format!(
+        "late crash + replay: timeout_ms=1000, timed_out=true in {elapsed:?}"
+    ));
+}
+
+#[test]
 fn expiry_boundary_checks_succeed() {
     let _serial = LIFECYCLE_TEST_LOCK
         .lock()
