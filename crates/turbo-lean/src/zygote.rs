@@ -6921,9 +6921,18 @@ mod tests {
             "-Dweak.linter.auditUnregistered=true",
             "-DmaxHeartbeats=1000",
             "-DautoImplicit=false",
+            "-Ddebug.skipKernelTC=false",
+            "-Dweak.warn.sorry=true",
         ] {
             let r = &session(&[format!("Init\t{}\tstrict\t\t\t{}", hx(triv), opts(&[o]))])[0];
             assert!(ok(r) && stock_ok(triv, &[o]), "{o} must be accepted: {r}");
+            // Hardening forced after parsing: `sorry` is still rejected under any accepted option.
+            let r = &session(&[format!(
+                "Init\t{}\tstrict\t\t\t{}",
+                hx(sorry_thm),
+                opts(&[o])
+            )])[0];
+            assert!(!ok(r), "sorry accepted under {o}: {r}");
         }
         for o in [
             "-DmaxHeartbeats=garbage",

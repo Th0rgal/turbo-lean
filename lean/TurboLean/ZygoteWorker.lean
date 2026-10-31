@@ -191,7 +191,8 @@ partial def stripWeakPrefixes (key : String) : String :=
     onto `opts` after imports are loaded. Every arg must pass the host allowlist
     (`is_allowed_lean_arg` in `module_builder.rs`), checked on the key with all `weak.` prefixes
     removed; values are then parsed exactly as `Lean.Language.Lean.setOption` / `reparseOptions`
-    do. Anything else throws, so the request fails instead of silently dropping an option. -/
+    do. Anything else throws, so the request fails instead of silently dropping an option.
+    After parsing, `debug.skipKernelTC := false` and `warn.sorry := true` are forced regardless. -/
 def applyEncodedLeanArgs (baseOpts : Options) (encodedArgs : String) : IO Options := do
   let decls ← getOptionDecls
   let mut opts := baseOpts
@@ -227,7 +228,9 @@ def applyEncodedLeanArgs (baseOpts : Options) (encodedArgs : String) : IO Option
           | none => throw (bad "value must be a natural number")
         | .ofString _, _ => pure (opts.set name v)
         | _, _ => throw (bad "cannot be set in the command line")
-  return opts
+  -- Match the hardening flags forced last by the native module/PR subprocesses.
+  -- The host owns the allowlist; the raw worker protocol cannot disable these gates.
+  return (opts.setBool `debug.skipKernelTC false).setBool (Name.mkStr2 "warn" ("sor" ++ "ry")) true
 
 /-- Error reported (and checked for) when a Lean runtime panic leaves the worker unusable. -/
 def runtimePanicErr : String := "[TurboLean.ZygoteWorker] runtime panic; worker environment is unusable"
