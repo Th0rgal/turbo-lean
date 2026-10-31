@@ -1494,7 +1494,6 @@ fn extract_decl_source_from_file(active_src: &str, shard: &splitter::TheoremShar
     String::new()
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Hygiene items (`sorry`/`admit`/`sorryAx`, forbidden axioms, ...) that block certifying `shard` alone:
 /// the file report's items on its lines, plus a fresh audit of its statement and proof text.
 fn target_hygiene_violations(
@@ -1519,6 +1518,7 @@ fn target_hygiene_violations(
     items
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_single_decl(
     store: &mut TurboStore,
     db_warm_on_open: bool,
@@ -2664,7 +2664,8 @@ fn check_single_decl(
                             env_vars = ev;
                             env_cache_hit = ech;
                         }
-                        let stub_targets: Vec<String> = single_set.iter().cloned().collect();
+                        let mut stub_targets: Vec<String> = single_set.iter().cloned().collect();
+                        stub_targets.sort();
                         if let Ok(reply) = crate::zygote::eval_with_zygote_pool_for_targets(
                             store,
                             toolchain,
