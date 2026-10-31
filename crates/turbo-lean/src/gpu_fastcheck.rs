@@ -4808,7 +4808,7 @@ pub fn evaluate_agent_step_value(
                 if let Some(ref st_path) = st_path_opt {
                     let src_b3 = blake3::hash(src_text.as_bytes()).to_hex().to_string();
                     let entry = crate::lake_build::ShmCachedFileSplit {
-                        split_key: format!("file-split:v2:{}", src_b3),
+                        split_key: format!("file-split:v4:{}", src_b3),
                         src_blake3: src_b3,
                         split: crate::lake_build::compact_split_for_shm_cache(&sp),
                         prefix_src: if src_text.len() <= 64 * 1024 {
@@ -4827,18 +4827,14 @@ pub fn evaluate_agent_step_value(
             }
         };
 
-        let target_shards: Vec<&crate::splitter::TheoremShard> = split
-            .shards
-            .iter()
-            .filter(|s| match decl_filter {
-                Some(df) if !df.is_empty() && df != "auto" => {
-                    s.name == df
-                        || s.name.ends_with(&format!(".{}", df))
-                        || df.ends_with(&format!(".{}", s.name))
-                }
-                _ => true,
-            })
-            .collect();
+        let target_shards: Vec<&crate::splitter::TheoremShard> = match decl_filter {
+            Some(df) if !df.is_empty() && df != "auto" => {
+                crate::splitter::find_decl_shard_index(&split.shards, df)?
+                    .map(|idx| vec![&split.shards[idx]])
+                    .unwrap_or_default()
+            }
+            _ => split.shards.iter().collect(),
+        };
 
         for ts in &target_shards {
             let (stmt_src, body_src) = crate::splitter::extract_shard_stmt_and_proof(&src_text, ts);

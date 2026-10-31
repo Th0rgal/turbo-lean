@@ -52,7 +52,7 @@ fn cache_shm_stat_split(
         let st_path = shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
         let src_b3 = blake3::hash(active_src.as_bytes()).to_hex().to_string();
         let entry = ShmCachedFileSplit {
-            split_key: format!("file-split:v3:{}", src_b3),
+            split_key: format!("file-split:v4:{}", src_b3),
             src_blake3: src_b3,
             split: compact_split_for_shm_cache(split),
             prefix_src: String::new(),
@@ -779,7 +779,7 @@ fn run_check_command_inner(
             let src_b3 = blake3::hash(loaded_src.as_bytes()).to_hex().to_string();
             if let Some((ref st_path, _)) = st_paths_opt {
                 let entry = ShmCachedFileSplit {
-                    split_key: format!("file-split:v3:{}", src_b3),
+                    split_key: format!("file-split:v4:{}", src_b3),
                     src_blake3: src_b3.clone(),
                     split: compact_split_for_shm_cache(&sp),
                     prefix_src: String::new(),
@@ -818,7 +818,7 @@ fn run_check_command_inner(
                     split_key: if src_b3.is_empty() {
                         String::new()
                     } else {
-                        format!("file-split:v3:{}", src_b3)
+                        format!("file-split:v4:{}", src_b3)
                     },
                     src_blake3: src_b3,
                     split: compact_split_for_shm_cache(&fast_res.0),
@@ -1552,7 +1552,7 @@ fn check_single_decl(
                         let st_path =
                             shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
                         let entry = ShmCachedFileSplit {
-                            split_key: format!("file-split:v3:{}", sub_b3),
+                            split_key: format!("file-split:v4:{}", sub_b3),
                             src_blake3: sub_b3.clone(),
                             split: compact_split_for_shm_cache(&sub_split),
                             prefix_src: if sub_src.len() <= 64 * 1024 {
@@ -3357,7 +3357,7 @@ fn check_single_file(
                                 let shard_t0 = Instant::now();
                                 let shard_src_owned = if shard.shard_source.is_empty() {
                                     let mut single_set = HashSet::with_capacity(1);
-                                    single_set.insert(shard.name.clone());
+                                    single_set.insert(shard.decl_name().to_string());
                                     splitter::build_coalesced_shard_source(src_ref, &single_set)
                                 } else {
                                     shard.shard_source.clone()
@@ -4272,6 +4272,104 @@ but is expected to have type
             assert_eq!(turbo_spec_step_verdict_consistent(1, 1), 1);
             assert_eq!(turbo_spec_step_verdict_consistent(1, 0), 0);
         }
+    }
+
+    #[test]
+    fn test_check_qualified_decl_rebuilds_legacy_stat_split() {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_legacy_qualified_split_{}",
+            crate::pack::next_tmp_id()
+        ));
+        let proj = dir.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        let file = proj.join("Legacy.lean");
+        // Checking A must succeed even though the later, same-spelled B theorem is invalid.
+        let src = "namespace A\ntheorem same : True := True.intro\nend A\nnamespace B\ntheorem same : False := True.intro\nend B\n";
+        fs::write(&file, src).unwrap();
+        let mut store = TurboStore::open(Some(&dir.join("store"))).unwrap();
+        let src_b3 = blake3::hash(src.as_bytes()).to_hex().to_string();
+        let split = split_lean_source(src, &[]);
+        let mut legacy = serde_json::to_value(ShmCachedFileSplit {
+            src_blake3: src_b3.clone(),
+            split_key: format!("file-split:v3:{}", src_b3),
+            split: compact_split_for_shm_cache(&split),
+            prefix_src: String::new(),
+            known_modified: false,
+            dep_hashes: Vec::new(),
+        })
+        .unwrap();
+        for shard in legacy["split"]["shards"].as_array_mut().unwrap() {
+            shard["name"] = serde_json::json!("same");
+            shard.as_object_mut().unwrap().remove("qualified_name");
+        }
+        let canon_file = file.canonicalize().unwrap();
+        let (ms, mn, sz) = TurboStore::extract_file_stat_tuple(&fs::metadata(&file).unwrap());
+        let pk = canon_file.to_string_lossy();
+        let mut old_hash = blake3::Hasher::new();
+        old_hash.update(b"single-stat-split:v3\n");
+        old_hash.update(pk.as_bytes());
+        old_hash.update(b":");
+        old_hash.update(&ms.to_le_bytes());
+        old_hash.update(&mn.to_le_bytes());
+        old_hash.update(&sz.to_le_bytes());
+        let old_hash = old_hash.finalize().to_hex().to_string();
+        let splits_dir = shm_file_splits_dir(&store);
+        let old_path = splits_dir.join(format!("st_{}.json", &old_hash[..24]));
+        fs::write(&old_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let new_hash = compute_single_stat_hash(&pk, ms, mn, sz);
+        assert_ne!(new_hash, old_hash);
+
+        let result = evaluate_check_command_value(
+            &mut store,
+            file.clone(),
+            Some("A.same".into()),
+            proj.clone(),
+        )
+        .unwrap();
+        assert_eq!(result["status"], "theorem_verified");
+        assert_eq!(result["decl"], "A.same");
+        let rebuilt: ShmCachedFileSplit = serde_json::from_slice(
+            &fs::read(splits_dir.join(format!("st_{}.json", &new_hash[..24]))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rebuilt.split.shards[0].decl_name(), "A.same");
+        assert_eq!(rebuilt.split.shards[1].decl_name(), "B.same");
+        let warm = evaluate_check_command_value(
+            &mut store,
+            file.clone(),
+            Some("A.same".into()),
+            proj.clone(),
+        )
+        .unwrap();
+        assert_eq!(warm["status"], "theorem_cache_hit");
+        let agent = crate::gpu_fastcheck::evaluate_agent_step_value(
+            &mut store,
+            &file,
+            Some("A.same"),
+            Some(&proj),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(agent["status"], "theorem_cache_hit");
+        assert_eq!(agent["shard_hits"], 1);
+        let ambiguous = crate::gpu_fastcheck::evaluate_agent_step_value(
+            &mut store,
+            &file,
+            Some("same"),
+            Some(&proj),
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(ambiguous.to_string().contains("Ambiguous declaration"));
+        assert!(
+            evaluate_check_command_value(&mut store, file, Some("B.same".into()), proj).is_err()
+        );
+        let _ = fs::remove_file(old_path);
+        let _ = fs::remove_file(splits_dir.join(format!("st_{}.json", &new_hash[..24])));
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

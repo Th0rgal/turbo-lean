@@ -4770,7 +4770,7 @@ pub fn run_pr_verify_command(
                                             .unwrap_or_else(|| {
                                                 let mut single_set =
                                                     std::collections::HashSet::with_capacity(1);
-                                                single_set.insert(sh.name.clone());
+                                                single_set.insert(sh.decl_name().to_string());
                                                 splitter::build_coalesced_shard_source(
                                                     &src,
                                                     &single_set,

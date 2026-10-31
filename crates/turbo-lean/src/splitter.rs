@@ -3849,8 +3849,10 @@ pub fn build_cross_file_coalesced_shard(
         } else {
             (b.trim(), *a)
         };
-        let uncached_names: std::collections::HashSet<String> =
-            uncached_shards.iter().map(|s| s.name.clone()).collect();
+        let uncached_names: std::collections::HashSet<String> = uncached_shards
+            .iter()
+            .map(|s| s.decl_name().to_string())
+            .collect();
         let max_end_line = uncached_shards
             .iter()
             .map(|s| s.end_line)
@@ -3915,7 +3917,10 @@ pub fn build_cross_file_coalesced_shard(
                 if split_at_top_level_assign(span.clean_text).is_some() {
                     let cur_idx = base_idx + thm_idx;
                     thm_idx += 1;
-                    if matches_uncached_name(&name, &uncached_names) {
+                    if matches_uncached_name(
+                        &qualified_decl_name(&name, &scope_stack),
+                        &uncached_names,
+                    ) {
                         if let Some(renamed) = rename_decl_header_for_fast_check(
                             span.orig_text,
                             span.clean_text,
@@ -4789,6 +4794,25 @@ mod tests {
             &bad_set
         )
         .is_none());
+    }
+
+    #[test]
+    fn test_cross_file_coalescing_selects_qualified_identity() {
+        let src = "namespace A\ntheorem same : True := True.intro\nend A\nnamespace B\ntheorem same : 1 = 1 := rfl\nend B\n";
+        let split = split_lean_source(src, &[]);
+        for (target, proof, other) in [
+            ("A.same", "True.intro", ":= rfl"),
+            ("B.same", ":= rfl", "True.intro"),
+        ] {
+            let idx = find_decl_shard_index(&split.shards, target)
+                .unwrap()
+                .unwrap();
+            let cross =
+                build_cross_file_coalesced_shard(&[("Pkg.Duplicate", src, &[&split.shards[idx]])]);
+            assert!(cross.contains(proof), "{}", cross);
+            assert!(!cross.contains(other), "{}", cross);
+            assert_eq!(cross.matches("theorem _turbo_verify_").count(), 1);
+        }
     }
 
     #[test]
