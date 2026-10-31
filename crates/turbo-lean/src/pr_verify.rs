@@ -322,8 +322,11 @@ fn git_head_tree_cache_paths(
     toolchain: &str,
 ) -> (PathBuf, PathBuf) {
     let mut h = blake3::Hasher::new();
-    // v12: hygiene-checked entries embed `theorem-shard-v3` keys.
+    // v12: hygiene-checked entries embed `theorem-shard-v3` keys. The verifier provenance
+    // versions retire entries whose verdicts predate the current scanner/kernel replay.
     h.update(b"git-head-tree:v12:");
+    h.update(&crate::zygote::ZYGOTE_SCANNER_VERSION.to_le_bytes());
+    h.update(&crate::zygote::ZYGOTE_REPLAY_VERSION.to_le_bytes());
     h.update(repo_root.to_string_lossy().as_bytes());
     h.update(b":");
     h.update(canon_dir.to_string_lossy().as_bytes());
@@ -2660,10 +2663,16 @@ pub fn run_ci_verify_command(
     let toolchain = detect_toolchain(&canon_dir);
     let ci_axioms = splitter::allowed_axioms();
     let mut hasher = blake3::Hasher::new();
+    // v4: outputs must come from kernel-replayed modules (incl. dependencies); the verifier
+    // provenance versions retire outputs recorded before the replay or across later bumps.
     hasher.update(
         format!(
-            "turbo-lean-ci-build-v3\n{}\n{}\n{}\n",
-            toolchain, trust_domain, cfg.canonical_config_digest
+            "turbo-lean-ci-build-v4\n{}\n{}\n{}\n{}:{}\n",
+            toolchain,
+            trust_domain,
+            cfg.canonical_config_digest,
+            crate::zygote::ZYGOTE_SCANNER_VERSION,
+            crate::zygote::ZYGOTE_REPLAY_VERSION
         )
         .as_bytes(),
     );
@@ -5433,8 +5442,10 @@ mod pr_verify_tests {
         let cfg = crate::module_builder::resolve_project_config(&tree.project)?;
         hasher.update(
             format!(
-                "turbo-lean-ci-build-v3\n{toolchain}\nuntrusted:ci\n{}\n",
-                cfg.canonical_config_digest
+                "turbo-lean-ci-build-v4\n{toolchain}\nuntrusted:ci\n{}\n{}:{}\n",
+                cfg.canonical_config_digest,
+                crate::zygote::ZYGOTE_SCANNER_VERSION,
+                crate::zygote::ZYGOTE_REPLAY_VERSION
             )
             .as_bytes(),
         );

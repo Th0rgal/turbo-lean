@@ -59,11 +59,28 @@ pub struct ZygoteEvalReply {
     /// replies from older hosts. Persisted eval replies without the current version are rejected.
     #[serde(default)]
     pub scanner_version: u32,
+    /// `ZYGOTE_REPLAY_VERSION` when this reply came from a worker that kernel-replays every new
+    /// declaration (`kernelReplayNewDecls`); `0` for replies from older hosts/workers. Persisted
+    /// verdicts without the current version are rejected (see `verifier_provenance_ok`).
+    #[serde(default)]
+    pub replay_version: u32,
 }
 
 /// Version of the host-side reply vetting (`StderrScan` + `mark_runtime_panic`). Bump whenever
 /// a reply that an older host accepted could now be rejected, so persisted replies are not replayed.
 pub(crate) const ZYGOTE_SCANNER_VERSION: u32 = 1;
+
+/// Version of the independent kernel replay of newly added declarations (worker
+/// `kernelReplayNewDecls`, dependency/module audits via `--kernel-replay-module`). Verdicts
+/// cached before the replay existed may have been produced with `debug.skipKernelTC` in effect,
+/// so every persisted verdict must carry this version. Bump when the replay is strengthened.
+pub(crate) const ZYGOTE_REPLAY_VERSION: u32 = 1;
+
+/// Fail-closed provenance gate for every persisted verifier verdict: it must have been vetted
+/// by the current stderr scanner *and* produced under the current kernel replay.
+pub(crate) fn verifier_provenance_ok(scanner_version: u32, replay_version: u32) -> bool {
+    scanner_version == ZYGOTE_SCANNER_VERSION && replay_version == ZYGOTE_REPLAY_VERSION
+}
 
 /// In-process C-ABI dispatcher for `LeanNative` methods (`"ping"`, `"validate-tv"`,
 /// `"verify-certs"`, `"compile-fastcheck"`, `"eval-cex"`, `"compile-llvm"`, `"compile-ptx"`),
@@ -3285,17 +3302,14 @@ fn build_auditor_bootstrap_env(
     bootstrap_env
 }
 
-fn audit_compiled_module_batch(
+/// The (sandboxed, for untrusted input) auditor process and its timeout, without arguments.
+fn auditor_command(
     store: &TurboStore,
     cfg: &crate::module_builder::ProjectConfig,
-    mod_names: &[String],
     lean_path_env: &str,
     extra_ro_binds: &[PathBuf],
     is_untrusted: bool,
-) -> Result<()> {
-    if mod_names.is_empty() || mod_names.iter().any(|m| m.trim().is_empty()) {
-        anyhow::bail!("In-kernel `.olean` audit received an empty module name: fail-closed");
-    }
+) -> Result<(Command, u64)> {
     let bootstrap_env = build_auditor_bootstrap_env(cfg);
     let auditor_ld_library_path = bootstrap_env
         .get("LD_LIBRARY_PATH")
@@ -3315,7 +3329,7 @@ fn audit_compiled_module_batch(
         .filter(|&v| v > 0)
         .unwrap_or(if is_untrusted { 120 } else { 300 });
 
-    let mut cmd = if is_untrusted {
+    let cmd = if is_untrusted {
         let bwrap_path = crate::module_builder::probe_bwrap_sandbox(&cfg.root_pkg.pkg_root).ok_or_else(|| {
             anyhow::anyhow!(
                 "Untrusted kernel `.olean` audit requires a working bubblewrap (`bwrap`) sandbox: fail-closed sandbox gate"
@@ -3411,7 +3425,22 @@ fn audit_compiled_module_batch(
             .env("LEAN_STACK_SIZE_KB", &stack_kb);
         c
     };
+    Ok((cmd, timeout_secs))
+}
 
+fn audit_compiled_module_batch(
+    store: &TurboStore,
+    cfg: &crate::module_builder::ProjectConfig,
+    mod_names: &[String],
+    lean_path_env: &str,
+    extra_ro_binds: &[PathBuf],
+    is_untrusted: bool,
+) -> Result<()> {
+    if mod_names.is_empty() || mod_names.iter().any(|m| m.trim().is_empty()) {
+        anyhow::bail!("In-kernel `.olean` audit received an empty module name: fail-closed");
+    }
+    let (mut cmd, timeout_secs) =
+        auditor_command(store, cfg, lean_path_env, extra_ro_binds, is_untrusted)?;
     cmd.arg("--audit-modules");
     for a in pinned_ffi_allow_args(cfg, mod_names) {
         cmd.arg(a);
@@ -4528,6 +4557,7 @@ fn eval_with_zygote_pool_attempt(
                             .panicked_since(scan_before, ZYGOTE_STDERR_MARK_WAIT);
                         mark_runtime_panic(&mut parsed, stderr_panic);
                         parsed.scanner_version = ZYGOTE_SCANNER_VERSION;
+                        parsed.replay_version = ZYGOTE_REPLAY_VERSION;
                         WorkerReqOutcome::Reply(parsed)
                     }
                     Err(e) => {
@@ -4803,6 +4833,7 @@ fn eval_with_zygote_pool_attempt(
             let peak_rss_mb: u64 = replies.iter().map(|r| r.peak_rss_mb).max().unwrap_or(0);
             let subshards_verified: usize = replies.iter().map(|r| r.subshards_verified).sum();
             let scanner_version = replies.iter().map(|r| r.scanner_version).min().unwrap_or(0);
+            let replay_version = replies.iter().map(|r| r.replay_version).min().unwrap_or(0);
             let mut stdout = String::new();
             let mut messages = Vec::new();
             let mut errors = Vec::new();
@@ -4837,6 +4868,7 @@ fn eval_with_zygote_pool_attempt(
                 errors,
                 used_constants,
                 scanner_version,
+                replay_version,
                 timed_out: false,
                 crashed: false,
                 ..Default::default()
@@ -5941,11 +5973,13 @@ fn compute_eval_shm_cache_filename(
     lean_args: &[String],
 ) -> Result<String> {
     let args_digest = crate::module_builder::compute_lean_args_digest(lean_args)?;
-    // v5: v4 (and older) entries were vetted without the stderr panic scan and carry no
-    // `scanner_version`; the scanner version also separates namespaces across scanner bumps.
+    // v6: v5 entries predate the kernel replay and carry no `replay_version`. v5: v4 (and
+    // older) entries were vetted without the stderr panic scan and carry no `scanner_version`;
+    // both versions also separate namespaces across bumps.
     let bytes = serde_json::to_vec(&(
-        "eval-shm:v5",
+        "eval-shm:v6",
         ZYGOTE_SCANNER_VERSION,
+        ZYGOTE_REPLAY_VERSION,
         &context.identity,
         file_name,
         caller_cwd,
@@ -5964,7 +5998,7 @@ fn eval_reply_cacheable(rep: &ZygoteEvalReply) -> bool {
         && rep.import_ok
         && !rep.crashed
         && !rep.timed_out
-        && rep.scanner_version == ZYGOTE_SCANNER_VERSION
+        && verifier_provenance_ok(rep.scanner_version, rep.replay_version)
 }
 
 /// Write an eval reply into `eval_shm_cache/` and periodically enforce the `/dev/shm` quota.
@@ -6957,6 +6991,7 @@ mod tests {
             ok: true,
             import_ok: true,
             scanner_version: ZYGOTE_SCANNER_VERSION,
+            replay_version: ZYGOTE_REPLAY_VERSION,
             stdout: "empty-option-cached-reply".into(),
             ..Default::default()
         };
@@ -8086,9 +8121,15 @@ mod tests {
             ok: true,
             import_ok: true,
             scanner_version: ZYGOTE_SCANNER_VERSION,
+            replay_version: ZYGOTE_REPLAY_VERSION,
             ..Default::default()
         };
         assert!(eval_reply_cacheable(&ok));
+        // Scanner-vetted but produced before the kernel replay existed: never replayed.
+        assert!(!eval_reply_cacheable(&ZygoteEvalReply {
+            replay_version: 0,
+            ..ok.clone()
+        }));
         // Not vetted by the current stderr scanner (pre-upgrade host): never cached or replayed.
         assert!(!eval_reply_cacheable(&ZygoteEvalReply {
             scanner_version: 0,
@@ -8849,6 +8890,100 @@ mod tests {
         .unwrap();
         assert!(!again.ok && again.errors.iter().any(|e| e == RUNTIME_PANIC_ERR));
         for name in [&v3_name, &v4_name] {
+            let _ = fs::remove_file(dir.join(name));
+        }
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// Upgrade path for the kernel replay: a `forge_bad` false success (a theorem of `False`
+    /// added by an elaborator with `debug.skipKernelTC`) cached by a host before this PR — at
+    /// the #305 `eval-shm:v4` key and at the #306 `eval-shm:v5` key, where it even carries the
+    /// current `scanner_version` — is never replayed: the worker re-runs and rejects it.
+    #[test]
+    fn test_pre_replay_eval_cache_entry_is_never_replayed() {
+        TEST_NO_DAEMON.with(|c| c.set(true));
+        let (tmp_dir, store, env_vars, lean_bin) =
+            open_test_zygote_env("eval_cache_replay_upgrade")
+                .expect("Lean v4.35.0 toolchain required");
+        let tc = "leanprover/lean4:v4.35.0";
+        let lp = tmp_dir.to_string_lossy().to_string();
+        let src = format!(
+            "import Lean\nopen Lean Elab Command\n-- {}\nelab \"forge_bad\" : command => do\n  let k := Name.mkStr (Name.mkStr .anonymous \"debug\") (\"skip\" ++ \"KernelTC\")\n  withScope (fun sc => {{ sc with opts := sc.opts.setBool k true }}) do\n    liftCoreM <| addDecl <| .thmDecl {{\n      name := `bad, levelParams := [], type := mkConst ``False, value := mkConst ``True.intro }}\nforge_bad\ntheorem uses_bad : False := bad\n",
+            next_tmp_id()
+        );
+        crate::splitter::reject_checking_weakening(&src)
+            .expect("forge_bad must reach the worker, not the source hygiene gate");
+        let file_name = "Bad.lean";
+        let caller_cwd = std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string());
+        let (imports_csv, _) = split_shard_for_zygote(&src);
+        let context = resolve_zygote_context(tc, &lp, &env_vars, &lean_bin, &imports_csv);
+        let args_digest = crate::module_builder::compute_lean_args_digest(&[]).unwrap();
+        let key = |bytes: Vec<u8>| format!("ev_{}.json", &blake3::hash(&bytes).to_hex()[..24]);
+        let v4_name = key(serde_json::to_vec(&(
+            "eval-shm:v4",
+            &context.identity,
+            file_name,
+            caller_cwd.as_deref(),
+            &src,
+            &args_digest,
+        ))
+        .unwrap());
+        // The exact key of main with #306 (scanner version, no replay version).
+        let v5_name = key(serde_json::to_vec(&(
+            "eval-shm:v5",
+            ZYGOTE_SCANNER_VERSION,
+            &context.identity,
+            file_name,
+            caller_cwd.as_deref(),
+            &src,
+            &args_digest,
+        ))
+        .unwrap());
+        let new_name =
+            compute_eval_shm_cache_filename(&context, file_name, caller_cwd.as_deref(), &src, &[])
+                .unwrap();
+        assert_ne!(
+            v5_name, new_name,
+            "the replay namespace must change the #306 key"
+        );
+        assert_ne!(v4_name, new_name);
+        let dir = store.fast_staging_dir().join("eval_shm_cache");
+        fs::create_dir_all(&dir).unwrap();
+        // What a #306 host cached: scanner-vetted, ok, but never kernel-replayed.
+        let stale = br#"{"ok":true,"kernel_gate_active":true,"import_ok":true,"env_cache_hit":false,"prefix_cache_hit":false,"import_us":1,"prefix_us":0,"elab_us":1,"heartbeats":0,"proof_term_nodes":0,"rss_delta_mb":0,"peak_rss_mb":0,"subshards_verified":2,"stdout":"","messages":[],"errors":[],"used_constants":["bad"],"timed_out":false,"crashed":false,"scanner_version":1}"#;
+        for name in [&v4_name, &v5_name, &new_name] {
+            fs::write(dir.join(name), stale).unwrap();
+            assert!(
+                read_cached_eval_shm_reply(&dir.join(name)).is_none(),
+                "pre-replay entry {name} was accepted"
+            );
+            fs::write(dir.join(name), stale).unwrap();
+        }
+        let rep = try_local_zygote_eval_with_args(
+            &store,
+            &env_vars,
+            &lean_bin,
+            tc,
+            &lp,
+            &src,
+            Some(file_name),
+            60_000,
+            &[],
+        )
+        .expect("worker must execute");
+        assert!(!rep.ok, "pre-replay cached ok replayed: {rep:?}");
+        assert!(
+            rep.errors.iter().any(|e| e.contains("KernelReplay")),
+            "the worker kernel replay must reject forge_bad: {rep:?}"
+        );
+        assert_eq!(rep.replay_version, ZYGOTE_REPLAY_VERSION);
+        assert!(
+            !dir.join(&new_name).exists(),
+            "pre-replay entry must be dropped"
+        );
+        for name in [&v4_name, &v5_name] {
             let _ = fs::remove_file(dir.join(name));
         }
         let _ = fs::remove_dir_all(&tmp_dir);
