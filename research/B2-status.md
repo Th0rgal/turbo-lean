@@ -1,7 +1,7 @@
 # B2 status
 
 Baseline: `5508b9f`; clifv `5018b9509dc124154dbe08a5bd85862595d8eab7`.
-Checkpoint: 2026-10-31 19:18 UTC. The executable lowering lives in
+Checkpoint: 2026-10-31 19:39 UTC. The executable lowering lives in
 `lean/LeanNative/Backend/Clif.lean`; `compile-clif` calls that definition.
 The active root and strict transitive axiom audit pass kernel checks on Lean 4.34.1.
 
@@ -43,7 +43,13 @@ records that check and CI runs it too.
 CI now also assembles the actual exported AArch64 text with Clang, extracts
 `.text` using LLVM objcopy, and compares it byte-for-byte with the exported
 binary. The same commands passed locally on the 352-byte artifact with the
-recorded SHA-256; the new CI step awaits its first remote result.
+SHA-256 `ccc8f0891484b6692e2be2315f2e729c2fc4e75831561fb07a7c76884991557b`.
+Current implementation commit `15673df` passed the entire
+remote workflow, including this new byte comparison, source identity, active
+proof audit, and compiler integration:
+https://github.com/Th0rgal/turbo-lean/actions/runs/41233670162 .
+The workflow now also checks the excluded end-to-end draft as a separate step;
+this pending check does not promote either O6 or O7.
 
 Instruction selection is certified in `B2.BackendLower`, now active in
 the root and audit. `B2.IsleFuel.runTerm_of_apply` lifts a successful
@@ -71,97 +77,33 @@ composition retains these hook/program-preservation premises and uses
 site absence only for `.os`. Real ABI, machine-entry, stack, memory,
 and symbol premises remain explicit.
 
-Next: discharge the remaining contracts and compose the LNIR-to-x0 theorem against `E2E.backend_correct_final_of_lower`.
-The FinalDirect dependency cone is building in the background, one compiler
-at a time. Do not duplicate or restart a working compiler on a timeout.
+Next: check the remaining contracts and compose the LNIR-to-x0 theorem against
+`E2E.backend_correct_final_of_lower`, then activate and audit those results.
 
-Resource notes: the execution environment was replaced around 16:09 UTC;
-the former `/tmp/repos/turbo-b2` checkout, compiler processes, and logs vanished.
-The pushed checkpoint `e89f7dc` was restored to workspace `turbo-b2`, and clifv
-was fetched at the exact pin. Source identity passes. CI passed both the
-pipeline checkpoint `5425e2c` and exporter checkpoint `e89f7dc`:
-https://github.com/Th0rgal/turbo-lean/actions/runs/41216872036 and
-https://github.com/Th0rgal/turbo-lean/actions/runs/41218005244 .
-CI also passed the excluded-draft checkpoint `d23535b`:
-https://github.com/Th0rgal/turbo-lean/actions/runs/41220002990 .
+Build state at 19:39 UTC: a single local native scheduler targets `B2.EndToEnd`
+from `research/b2-proofs`, with telemetry off, four Lean threads, two compiler
+workers, and a 7200-second module timeout. Logs/status are
+`.b2-work/e2e-build.{log,pid,exit}`. The upstream
+`FV.Backend.Proof.RegallocAtomic` compiler is live and using CPU; the dependency
+cone still has 91 missing module artifacts. Do not duplicate or restart a
+working local compiler. A fresh CI build now checks the draft composition too.
+Neither check has yet established O6 or O7.
 
-The initial replacement builds failed: FinalDirect job
-`de3fb23e-6a97-5640-bbd2-fa37a78c1d5c` reported a missing file; the concurrent
-root attempt hit turbo-lean's default 300-second per-module timeout after
-compiler pausing. A separate earlier root job failed because the restored
-checkout lacked the pinned `lean-sys` dependency; its sources are now restored.
-The proof package remains on Lean 4.34.1.
+The active root passed locally at 17:12 UTC. Scope/dominance and their strict
+transitive audit passed at 17:54 UTC; the return bridge, active audit and root
+passed at 18:27 UTC. The isolated exact `prepared_call_free` statement passed
+with closure `[propext]`; complete O6 still requires its actual imported
+contract definitions and the full module check.
 
-Durable job `d6c09d26-5bfe-53a1-851b-650addbeee3f` builds the active B2 root
-and then FinalDirect sequentially, with native `TURBO_LEAN_JOBS=1` and
-`TURBO_LEAN_MODULE_TIMEOUT_SECS=7200`. Logs are `.b2-work/root-v2.log` and
-`.b2-work/final-v2.log`; no compiler pausing is used. `LEAN_NUM_THREADS=4`
-and telemetry off apply throughout. The active-root rebuild finished successfully
-at 17:12 UTC, including the strict transitive axiom audit. FinalDirect is now
-the active build step. The new export produced 352 bytes with SHA-256
-`ccc8f0891484b6692e2be2315f2e729c2fc4e75831561fb07a7c76884991557b`;
-Clang 18's AArch64 assembler produced byte-identical `.text`.
+Completed dependency waves were audited and cached before the old clifv-root
+scheduler was deliberately stopped while idle at 18:54 UTC. That target's exit
+`-15` is a checkpoint cancellation, not FinalDirect success. The current
+B2-root scheduler started at 18:56:54 UTC and reused the completed cache.
+Unrelated native-decided witnesses in the pinned clifv imports are outside
+the claimed B2 result closures; the strict B2 axiom policy is unchanged.
 
-The priority build of `FV.Backend.Proof.LowerDecide` passed at 17:47 UTC.
-The old follow-up failed before checking any proof because an empty scratch
-namespace directory hid the real B2 library. The corrected checker writes only
-B2 outputs into the existing library and uses the provisioned compiler. Durable
-replacement job `2b881e4f-a6e2-5984-8304-5e41574f486b` never launched a process;
-it was cancelled and acknowledged before starting the local replacement.
-
-`B2.BackendScope` passed at 17:53 UTC and is now active in the root and audit.
-Its certified method-level HashMap rewrites avoid reduction through opaque
-`System.Platform.getNumBits`; no container implementation or upstream source
-changed. Actual `dominatedB` computes through `buildCtx` on the exact input,
-without a context snapshot. The active-root and strict transitive audit checks
-passed at 17:54 UTC, including subset, dominance, scope, and lookup helpers;
-their closures contain only the allowed axioms.
-
-The local `.b2-work/proof_followups.py` process now waits for existing contract
-dependencies before checking BackendContracts, then waits for FinalDirect
-before checking EndToEnd. Logs are `.b2-work/{scope,contracts,end-to-end}.log`.
-The end-to-end draft states explicit x0 equality but remains unchecked.
-Pending checks do not establish O6 or O7.
-
-At 18:11 UTC the original FinalDirect scheduler is still checking the upstream
-`FV.Backend.Proof.CSemRename` module, with steady CPU use and about 4.6 GiB RSS.
-Do not restart that working compiler. Broad priority contract builds began
-duplicating this module and were stopped; a narrower auxiliary build was also
-stopped before launching a compiler. There is now one native scheduler. Its
-implementation probes an entire wave before compiling it, so concurrent native
-targets can duplicate work and refresh shared outputs even within one project.
-Use the existing build's results for the remaining B2 checks.
-
-An isolated kernel check of the draft's exact `prepared_call_free` statement
-passed with closure `[propext]`. Complete O6 composition is still pending the
-genuine upstream contract dependencies; this isolated result does not upgrade O6.
-
-At 18:27 UTC the same FinalDirect scheduler was checking the upstream
-`FV.Backend.Proof.RefinesInsts` module; the follow-up checker is live and waiting
-for genuine contract dependencies. The UInt64 return bridge was promoted from
-its passing isolated check into BackendEntry and the strict audit, then used
-in the excluded end-to-end draft. BackendEntry, the full active audit, and the
-active root passed kernel checks at 18:27 UTC. Full O7 composition remains
-unchecked; this bridge does not establish an AArch64 execution by itself.
-
-At 18:54 UTC the complete compilation wave was audited and cached, including
-the manifest entry `FV/E2E/RegLevelMachine.lean`. The watcher then stopped the
-old scheduler while idle, with no compiler child. Its target exit `-15` records
-that deliberate checkpoint, not a completed FinalDirect build; the old wrapper's
-exit zero does not change that. The waiting direct follow-up checker was stopped
-before transferring ownership of B2 outputs.
-
-Replacement durable job `2a132782-c5ed-5e13-a22e-a9ff65c6af8e` was accepted but
-launched no process or output. Cancellation was acknowledged before starting the
-local replacement at 18:56:54 UTC. The actual scheduler targets `B2.EndToEnd`
-from the proof package, with two compiler workers and four Lean threads each;
-logs/status are `.b2-work/e2e-build.{log,pid,exit}`. The completed cache was reused
-and distinct compiler children were verified live. No concurrent native scheduler
-or direct checker owns the same modules. The host has eight CPUs and 64 GiB RAM;
-the resource check reported roughly 43 GiB available memory.
-
-The B2 target checks the claimed result closures while keeping the pinned clifv
-sources unchanged. Unrelated native-decided witnesses in clifv are outside those
-closures; the B2 axiom policy is unchanged. At 19:13 UTC the workers are checking
-`FV.Backend.Proof.LogicImmComplete` and `FV.Backend.Proof.RefinesInsts2`.
-No B2 contract or end-to-end check result is available yet, so O6/O7 stay SORRY.
+The environment was replaced around 16:09 UTC. The checkout and exact clifv pin
+were restored from pushed work; source identity and all active-root CI checks
+pass. Earlier durable replacement jobs that reported heartbeat without starting
+processes were cancelled before the real local build started. Execution is
+verified from actual compiler processes and outputs, not job heartbeat alone.
