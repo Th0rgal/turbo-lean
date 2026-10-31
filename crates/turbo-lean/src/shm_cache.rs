@@ -60,10 +60,9 @@ pub fn cache_root() -> PathBuf {
 /// and publisher first locks the existing package directory, then the legacy
 /// `.lake/build/.turbo_publish.lock`. Default users create that legacy lock as before,
 /// preserving exclusion with old binaries. Opted-out users open it read-only WITHOUT
-/// O_CREAT; if absent, only the directory lock is needed because they never publish
-/// into the tree. New publishers also take the directory lock before creating the
-/// legacy file, so its first creation cannot race an opted-out reader. Old binaries
-/// participate through the legacy file when present; lock files must never be unlinked.
+/// O_CREAT. When absent, readers must validate artifact and legacy-lock snapshots:
+/// old publishers can create the legacy file without taking the directory lock.
+/// Lock files must never be unlinked.
 pub fn acquire_publish_flock(
     pkg_root: &Path,
     exclusive: bool,
@@ -82,6 +81,7 @@ pub fn acquire_publish_flock(
     Ok(PublishFlockGuard {
         _legacy: legacy,
         _directory: directory,
+        lock_path,
     })
 }
 
@@ -89,6 +89,76 @@ pub fn acquire_publish_flock(
 pub struct PublishFlockGuard {
     _legacy: Option<FlockGuard>,
     _directory: Option<FlockGuard>,
+    lock_path: PathBuf,
+}
+
+#[derive(PartialEq, Eq)]
+struct ArtifactStamp {
+    size: u64,
+    modified: SystemTime,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64),
+}
+
+impl ArtifactStamp {
+    fn from_metadata(meta: fs::Metadata) -> std::io::Result<Self> {
+        Ok(Self {
+            size: meta.len(),
+            modified: meta.modified()?,
+            #[cfg(unix)]
+            identity: {
+                use std::os::unix::fs::MetadataExt;
+                (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec())
+            },
+        })
+    }
+
+    fn at(path: &Path) -> std::io::Result<Option<Self>> {
+        match fs::metadata(path) {
+            Ok(meta) => Self::from_metadata(meta).map(Some),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+impl PublishFlockGuard {
+    /// Snapshot all candidates (including missing companions) before any read, then
+    /// discard the entire result if an old publisher changed the set or lock inode.
+    pub fn read_consistent<T>(
+        &self,
+        paths: &[PathBuf],
+        read: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let legacy = self
+            ._legacy
+            .as_ref()
+            .map(|g| ArtifactStamp::from_metadata(g.0.metadata()?))
+            .transpose()?;
+        let stable_lock = || -> anyhow::Result<()> {
+            anyhow::ensure!(
+                ArtifactStamp::at(&self.lock_path)? == legacy,
+                "Publication lock appeared or changed during artifact read: {}; retry the build",
+                self.lock_path.display()
+            );
+            Ok(())
+        };
+        stable_lock()?;
+        let before = paths
+            .iter()
+            .map(|p| ArtifactStamp::at(p))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let result = read();
+        for (path, stamp) in paths.iter().zip(before) {
+            anyhow::ensure!(
+                ArtifactStamp::at(path)? == stamp,
+                "Artifact changed during publication read: {}; retry the build",
+                path.display()
+            );
+        }
+        stable_lock()?;
+        result
+    }
 }
 
 /// RAII advisory `flock` guard that releases `LOCK_UN` on drop.
@@ -299,7 +369,11 @@ where
 }
 
 /// Upsert `[section_name]` in a TOML document with `kv_lines`, preserving all unrelated sections/comments.
-pub fn upsert_toml_section(existing: &str, section_name: &str, kv_lines: &[(&str, String)]) -> String {
+pub fn upsert_toml_section(
+    existing: &str,
+    section_name: &str,
+    kv_lines: &[(&str, String)],
+) -> String {
     let header = format!("[{}]", section_name);
     let (mut out, mut in_sec, mut replaced) = (Vec::new(), false, false);
     let emit = |dst: &mut Vec<String>| {
@@ -521,7 +595,10 @@ fn scan_evictable_shm_files(
             }
             continue;
         }
-        let fname = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+        let fname = path
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default();
         if (fname.starts_with('.') && fname.ends_with(".tmp"))
             || fname == "zygote_daemon.json"
             || fname == "zygote_lru_registry.json"
@@ -532,7 +609,11 @@ fn scan_evictable_shm_files(
         if let Ok(meta) = entry.metadata() {
             let sz = meta.len();
             total_size = total_size.saturating_add(sz);
-            files.push((meta.modified().unwrap_or(UNIX_EPOCH), path.to_path_buf(), sz));
+            files.push((
+                meta.modified().unwrap_or(UNIX_EPOCH),
+                path.to_path_buf(),
+                sz,
+            ));
         }
     }
     (total_size, files)
@@ -823,6 +904,61 @@ pub fn read_shm_or_disk_spill(shm_path: &Path, disk_spill_dir: Option<&Path>) ->
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
+    #[test]
+    fn test_publication_snapshot_rejects_changed_and_new_artifacts() -> anyhow::Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "turbo_snapshot_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        fs::create_dir_all(&root)?;
+        fs::write(
+            root.join("turbo-lean.toml"),
+            "[worktree]\nauto_link = false\n",
+        )?;
+        let paths = [root.join("artifact"), root.join("missing")];
+        let guard = super::acquire_publish_flock(&root, false)?;
+        for change in ["inode", "mtime", "size", "presence", "lock"] {
+            fs::write(&paths[0], b"old")?;
+            let old_time = fs::metadata(&paths[0])?.modified()?;
+            let err = guard
+                .read_consistent(&paths, || {
+                    match change {
+                        "inode" => {
+                            let tmp = root.join("replacement");
+                            fs::write(&tmp, b"new")?;
+                            fs::File::options()
+                                .write(true)
+                                .open(&tmp)?
+                                .set_modified(old_time)?;
+                            fs::rename(tmp, &paths[0])?;
+                        }
+                        "mtime" => fs::File::options()
+                            .write(true)
+                            .open(&paths[0])?
+                            .set_modified(old_time + std::time::Duration::from_secs(2))?,
+                        "size" => fs::write(&paths[0], b"longer")?,
+                        "presence" => fs::write(&paths[1], b"appeared")?,
+                        _ => {
+                            fs::create_dir_all(root.join(".lake/build"))?;
+                            fs::write(root.join(".lake/build/.turbo_publish.lock"), b"")?;
+                        }
+                    }
+                    Ok("discard me")
+                })
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("changed during") || err.contains("appeared or changed"),
+                "{change}: {err}"
+            );
+            let _ = fs::remove_file(&paths[1]);
+        }
+        drop(guard);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     #[test]
     fn test_publication_lock_preserves_opted_out_tree_and_locks_aliases() -> anyhow::Result<()> {
         use crate::worktree_test_support::snapshot;

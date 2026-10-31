@@ -5446,58 +5446,70 @@ pub fn compute_olean_artifact_set_digest(olean_path: &Path) -> Result<String> {
     } else {
         None
     };
-    compute_olean_artifact_set_digest_locked(olean_path)
+    compute_olean_artifact_set_digest_locked(olean_path, _flock_guard.as_ref())
 }
 
-fn compute_olean_artifact_set_digest_locked(olean_path: &Path) -> Result<String> {
-    let bytes =
-        fs::read(olean_path).with_context(|| format!("Failed to read {}", olean_path.display()))?;
-    let mut h = blake3::Hasher::new();
-    h.update(b"olean-art-v2\n");
-    update_lp(&mut h, b"olean", blake3::hash(&bytes).as_bytes());
-    let companions = [
-        (
-            "srv",
-            PathBuf::from(format!("{}.server", olean_path.display())),
-        ),
-        (
-            "priv",
-            PathBuf::from(format!("{}.private", olean_path.display())),
-        ),
+fn olean_artifact_paths(olean_path: &Path) -> [(&'static str, PathBuf); 6] {
+    [
+        ("olean", olean_path.to_path_buf()),
+        ("srv", olean_path.with_extension("olean.server")),
+        ("priv", olean_path.with_extension("olean.private")),
         ("ilean", olean_path.with_extension("ilean")),
         ("ir", olean_path.with_extension("ir")),
-        (
-            "ir_sig",
-            PathBuf::from(format!("{}.sig", olean_path.with_extension("ir").display())),
-        ),
-    ];
-    for (tag, comp_path) in companions {
-        match fs::metadata(&comp_path) {
-            Ok(meta) if meta.is_file() => {
-                let comp_bytes = fs::read(&comp_path).with_context(|| {
-                    format!("Failed to read companion artifact {}", comp_path.display())
-                })?;
-                h.update(&[1u8]);
-                update_lp(&mut h, tag.as_bytes(), blake3::hash(&comp_bytes).as_bytes());
+        ("ir_sig", olean_path.with_extension("ir.sig")),
+    ]
+}
+
+fn compute_olean_artifact_set_digest_locked(
+    olean_path: &Path,
+    guard: Option<&crate::shm_cache::PublishFlockGuard>,
+) -> Result<String> {
+    read_olean_artifact_set_digest(olean_path, guard, |p| Ok(fs::read(p)?))
+}
+
+fn read_olean_artifact_set_digest(
+    olean_path: &Path,
+    guard: Option<&crate::shm_cache::PublishFlockGuard>,
+    mut read: impl FnMut(&Path) -> Result<Vec<u8>>,
+) -> Result<String> {
+    let artifacts = olean_artifact_paths(olean_path);
+    let paths: Vec<_> = artifacts.iter().map(|(_, p)| p.clone()).collect();
+    let mut digest = || {
+        let mut h = blake3::Hasher::new();
+        h.update(b"olean-art-v2\n");
+        for (tag, path) in &artifacts {
+            let present = match fs::metadata(path) {
+                Ok(meta) => {
+                    anyhow::ensure!(
+                        meta.is_file(),
+                        "Artifact path `{}` is not a regular file",
+                        path.display()
+                    );
+                    true
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && *tag != "olean" => false,
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("Failed to stat artifact {}", path.display()))
+                }
+            };
+            if *tag != "olean" {
+                h.update(&[u8::from(present)]);
             }
-            Ok(_) => {
-                anyhow::bail!(
-                    "Companion artifact path `{}` is not a regular file",
-                    comp_path.display()
-                );
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                h.update(&[0u8]);
+            if present {
+                let bytes = read(path)
+                    .with_context(|| format!("Failed to read artifact {}", path.display()))?;
+                update_lp(&mut h, tag.as_bytes(), blake3::hash(&bytes).as_bytes());
+            } else {
                 update_lp(&mut h, tag.as_bytes(), b"");
             }
-            Err(e) => {
-                return Err(e).with_context(|| {
-                    format!("Failed to stat companion artifact {}", comp_path.display())
-                });
-            }
         }
+        Ok(h.finalize().to_hex().to_string())
+    };
+    match guard {
+        Some(guard) => guard.read_consistent(&paths, digest),
+        None => digest(),
     }
-    Ok(h.finalize().to_hex().to_string())
 }
 
 /// Compute the per-module CAS action key (`module_unit`), incorporating:
@@ -6255,7 +6267,8 @@ pub fn write_lake_module_hashes_and_trace(
     } else {
         None
     };
-    let actual_art_digest_opt = compute_olean_artifact_set_digest_locked(&node.olean_path).ok();
+    let actual_art_digest_opt =
+        compute_olean_artifact_set_digest_locked(&node.olean_path, Some(&_flock_guard)).ok();
     let digest_matches = !expected_artifact_digest.is_empty()
         && actual_art_digest_opt.as_deref() == Some(expected_artifact_digest);
     let all_shards_certified =
@@ -6654,8 +6667,12 @@ fn acquire_publish_flock_mode(
     pkg_root: &Path,
     exclusive: bool,
 ) -> Result<crate::shm_cache::PublishFlockGuard> {
-    crate::shm_cache::acquire_publish_flock(pkg_root, exclusive)
-        .with_context(|| format!("Failed to acquire publication flock for `{}`", pkg_root.display()))
+    crate::shm_cache::acquire_publish_flock(pkg_root, exclusive).with_context(|| {
+        format!(
+            "Failed to acquire publication flock for `{}`",
+            pkg_root.display()
+        )
+    })
 }
 
 fn acquire_publish_flock(pkg_root: &Path) -> Result<crate::shm_cache::PublishFlockGuard> {
@@ -7649,20 +7666,22 @@ fn store_module_artifacts_in_cas(
             .map_err(|_| anyhow::anyhow!("Module artifact publication mutex poisoned"))?;
         let _flock_guard = acquire_publish_flock_mode(&node.pkg_root, false)?;
         let artifact_files = collect_module_artifact_paths(node);
-        let mut items: Vec<(String, Vec<u8>, String, String, u64)> =
-            Vec::with_capacity(artifact_files.len());
-        for (kind, abs_path) in artifact_files {
-            let bytes = fs::read(&abs_path)?;
-            let hash = blake3::hash(&bytes).to_hex().to_string();
-            let sz = bytes.len() as u64;
-            let rel_path = abs_path
-                .strip_prefix(base_dir)
-                .unwrap_or(&abs_path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            items.push((hash, bytes, kind.to_string(), rel_path, sz));
-        }
-        items
+        let paths: Vec<_> = artifact_files.iter().map(|(_, p)| p.clone()).collect();
+        _flock_guard.read_consistent(&paths, || {
+            let mut items = Vec::with_capacity(artifact_files.len());
+            for (kind, abs_path) in artifact_files {
+                let bytes = fs::read(&abs_path)?;
+                let hash = blake3::hash(&bytes).to_hex().to_string();
+                let sz = bytes.len() as u64;
+                let rel_path = abs_path
+                    .strip_prefix(base_dir)
+                    .unwrap_or(&abs_path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                items.push((hash, bytes, kind.to_string(), rel_path, sz));
+            }
+            Ok(items)
+        })?
     };
     let entries = store.batch_store_immutable_blobs(&blob_items, trust_domain, pin_level)?;
     match store.acquire_singleflight(mod_action_key, toolchain, "module_unit", trust_domain)? {
@@ -7839,7 +7858,9 @@ pub fn build_project_modules_native(
             let invalidate = || -> Result<()> {
                 if !preserve_lake {
                     let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
-                    let _guard = lock.lock().map_err(|_| anyhow::anyhow!("Module artifact publication mutex poisoned"))?;
+                    let _guard = lock.lock().map_err(|_| {
+                        anyhow::anyhow!("Module artifact publication mutex poisoned")
+                    })?;
                     let _flock_guard = acquire_publish_flock(&node.pkg_root)?;
                     wipe_existing_module_artifacts(node);
                 }
@@ -7911,47 +7932,47 @@ pub fn build_project_modules_native(
                         anyhow::anyhow!("Module artifact publication mutex poisoned")
                     })?;
                     let _flock_guard = acquire_publish_flock(&node.pkg_root)?;
-                    if preserve_lake {
-                        crate::db::reuse_worktree_outputs(target_root, &outputs)?;
-                    } else {
+                    if !preserve_lake {
                         wipe_existing_module_artifacts(node);
                         store.materialize_into_worktree(target_root, &project_name, &outputs)?;
-                    }
-                    if !preserve_lake && !node.needs_c {
-                        let _ = fs::remove_file(&node.c_path);
-                    }
-                    let mut hashes_ok = validate_materialized_module_artifacts(node);
-                    if hashes_ok {
-                        for entry in &outputs {
-                            if !node.needs_c && entry.kind == "c" {
-                                continue;
-                            }
-                            let mat_path = target_root.join(&entry.rel_path);
-                            match fs::read(&mat_path) {
-                                Ok(bytes) => {
-                                    let actual = blake3::hash(&bytes).to_hex().to_string();
-                                    if actual != entry.blob_hash
-                                        || bytes.len() as u64 != entry.size_bytes
-                                    {
-                                        hashes_ok = false;
-                                        break;
-                                    }
-                                }
-                                Err(_) => {
-                                    hashes_ok = false;
-                                    break;
-                                }
-                            }
+                        if !node.needs_c {
+                            let _ = fs::remove_file(&node.c_path);
                         }
                     }
-                    if hashes_ok {
-                        compute_olean_artifact_set_digest_locked(&node.olean_path).ok()
-                    } else {
-                        if !preserve_lake {
-                            wipe_existing_module_artifacts(node);
+                    let mut paths: Vec<_> = olean_artifact_paths(&node.olean_path)
+                        .into_iter()
+                        .map(|(_, p)| p)
+                        .collect();
+                    paths.extend(outputs.iter().map(|e| target_root.join(&e.rel_path)));
+                    let restored = _flock_guard.read_consistent(&paths, || {
+                        if preserve_lake {
+                            crate::db::reuse_worktree_outputs(target_root, &outputs)?;
                         }
-                        None
+                        let hashes_ok = validate_materialized_module_artifacts(node)
+                            && outputs
+                                .iter()
+                                .filter(|e| node.needs_c || e.kind != "c")
+                                .all(|entry| {
+                                    fs::read(target_root.join(&entry.rel_path)).is_ok_and(|bytes| {
+                                        bytes.len() as u64 == entry.size_bytes
+                                            && blake3::hash(&bytes).to_hex().as_str()
+                                                == entry.blob_hash
+                                    })
+                                });
+                        if hashes_ok {
+                            compute_olean_artifact_set_digest_locked(
+                                &node.olean_path,
+                                Some(&_flock_guard),
+                            )
+                            .map(Some)
+                        } else {
+                            Ok(None)
+                        }
+                    })?;
+                    if restored.is_none() && !preserve_lake {
+                        wipe_existing_module_artifacts(node);
                     }
+                    restored
                 };
                 if let Some(dig) = cas_restored_dig_opt {
                     if is_untrusted || node.is_root_pkg {
@@ -8219,7 +8240,15 @@ mod tests {
         let mode = std::env::var("TURBO_TEST_PUBLISH_MODE")?;
         let node: ModuleNode = serde_json::from_slice(&fs::read(root.join("node.json"))?)?;
         fs::write(root.join("starting"), b"")?;
-        if mode == "reader" {
+        if mode == "legacy" {
+            let _legacy = crate::shm_cache::acquire_flock(
+                &node.pkg_root.join(".lake/build/.turbo_publish.lock"),
+                true,
+                false,
+            )?;
+            fs::write(&node.olean_path, b"new olean")?;
+            fs::write(&node.ilean_path, b"new ilean")?;
+        } else if mode == "reader" {
             let digest = compute_olean_artifact_set_digest(&node.olean_path)?;
             assert_eq!(digest, fs::read_to_string(root.join("expected"))?);
         } else {
@@ -8237,6 +8266,49 @@ mod tests {
             )?;
         }
         fs::write(root.join("done"), b"")?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_reader_rejects_legacy_first_publication_mid_digest() -> Result<()> {
+        use crate::worktree_test_support::{LakeTree, TestChild};
+        let tree = LakeTree::new("legacy_race", &[("P/A.lean", "def value : Nat := 1\n")])?;
+        let cfg = resolve_project_config(&tree.project)?;
+        let dag = build_module_dag(&cfg, &[])?;
+        let node = &dag.nodes["P.A"];
+        tree.opt_out()?;
+        let legacy = tree.project.join(".lake/build/.turbo_publish.lock");
+        if legacy.exists() {
+            fs::remove_file(&legacy)?;
+        }
+        fs::write(tree.root.join("node.json"), serde_json::to_vec(node)?)?;
+        // Reader starts first and consumes the old .olean. An old binary then
+        // creates only the legacy lock and replaces both outputs before .ilean.
+        let guard = acquire_publish_flock_mode(&tree.project, false)?;
+        let err = read_olean_artifact_set_digest(&node.olean_path, Some(&guard), |path| {
+            let bytes = fs::read(path)?;
+            if path == node.olean_path {
+                let mut command =
+                    TestChild::command("module_builder::tests::test_publication_process_child")?;
+                command
+                    .env("TURBO_TEST_PUBLISH_ROOT", &tree.root)
+                    .env("TURBO_TEST_PUBLISH_MODE", "legacy");
+                let mut child = TestChild::spawn(&mut command)?;
+                child.finish(&tree.root.join("done"))?;
+            }
+            Ok(bytes)
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("changed during") || err.contains("appeared or changed"),
+            "{err}"
+        );
+        assert_eq!(fs::read(&node.olean_path)?, b"new olean");
+        drop(guard);
+        // A fresh reader locks the now-existing legacy inode and succeeds.
+        compute_olean_artifact_set_digest(&node.olean_path)?;
         Ok(())
     }
 
@@ -8317,7 +8389,7 @@ mod tests {
                 fs::write(&node.ilean_path, b"committed ilean")?;
                 fs::write(
                     tree.root.join("expected"),
-                    compute_olean_artifact_set_digest_locked(&node.olean_path)?,
+                    compute_olean_artifact_set_digest_locked(&node.olean_path, current.as_ref())?,
                 )?;
             }
             drop((legacy, current));
