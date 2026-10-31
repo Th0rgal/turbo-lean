@@ -10309,6 +10309,12 @@ lean_exe «demo-exe» where
 
     #[test]
     fn test_native_module_builder_cas_partial_invalidation_lazy_c_and_lake_differential() {
+        // Asserts exact per-module CAS hit counts from real builds, so it must not observe the
+        // `TURBO_LEAN_NO_WORKTREE_LINK` opt-out that the `lake_build` worktree tests set
+        // process-wide: doing so turns a cache hit into a recompile.
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = make_temp_test_dir("native_e2e");
         let store_dir = dir.join(".turbo_store");
         let proj_dir = dir.join("proj");
@@ -10831,6 +10837,14 @@ lean_exe «demo-exe» where
 
     #[test]
     fn test_adversarial_cas_key_dep_digest_validation_and_ambiguous_or_same_mtime_deps() {
+        // Real builds here read `TURBO_LEAN_NO_WORKTREE_LINK` through
+        // `worktree_auto_link_disabled`, which the worktree tests in `lake_build` set and restore
+        // process-wide. Without this the opt-out can be observed mid-build and the first
+        // `build_project_modules_native` fails with "Worktree opt-out prevents compiling". Taken
+        // before `BWRAP_TEST_ENV_LOCK`; every test that needs both uses that order.
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _bwrap_guard = BWRAP_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());

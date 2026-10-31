@@ -7072,6 +7072,12 @@ end Fixture
     /// existing differential test in `module_builder` deletes it and so cannot see this.
     #[test]
     fn test_warm_build_dir_rejects_oleans_stale_against_edited_lake_input() -> Result<()> {
+        // Drives `build` / `ci-verify` / `check` end to end, so it reads process-global state
+        // (`TURBO_LEAN_NO_WORKTREE_LINK` via `worktree_auto_link_disabled`, the zygote warm-up).
+        // Serialize with the other env-mutating tests the way they serialize with each other.
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp_dir = std::env::temp_dir().join(format!(
             "turbo_lean_warm_lake_input_test_{}_{}",
             std::process::id(),
