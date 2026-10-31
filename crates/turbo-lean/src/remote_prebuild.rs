@@ -12,7 +12,6 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,7 +90,8 @@ fn detect_git_repo_and_head(project_dir: &Path) -> (Option<String>, Option<Strin
         .filter(|(s, r)| !s.trim().is_empty() && !r.trim().is_empty())
         .map(|(s, r)| format!("{}/{}.git", s.trim_end_matches('/'), r.trim()));
     let repo = env_repo.or_else(|| {
-        Command::new("git")
+        crate::trusted_tools::git(project_dir)
+            .ok()?
             .args(["config", "--get", "remote.origin.url"])
             .current_dir(project_dir)
             .output()
@@ -105,7 +105,8 @@ fn detect_git_repo_and_head(project_dir: &Path) -> (Option<String>, Option<Strin
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .or_else(|| {
-            Command::new("git")
+            crate::trusted_tools::git(project_dir)
+                .ok()?
                 .args(["rev-parse", "HEAD"])
                 .current_dir(project_dir)
                 .output()

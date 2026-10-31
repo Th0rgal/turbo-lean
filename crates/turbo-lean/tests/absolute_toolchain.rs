@@ -26,6 +26,16 @@ impl Fixture {
                 self.0.join(format!("{cache}-staging")),
             )
             .env("TURBO_LEAN_NO_DAEMON", "1")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.fsmonitor")
+            .env(
+                "GIT_CONFIG_VALUE_0",
+                self.0.join(".lake/build/bin/repo-exec"),
+            )
+            .env(
+                "GIT_EXTERNAL_DIFF",
+                self.0.join(".lake/build/bin/repo-exec"),
+            )
             .env_remove("TURBO_LEAN_DAEMON")
             .env_remove("LEAN_PATH");
         command
@@ -116,8 +126,12 @@ fn project_toolchain_names_cannot_substitute_verifiers_or_prewarm_helpers() {
         fs::remove_file(f.0.join("shim-invoked")).unwrap();
     }
     checked(Command::new("git").current_dir(&f.0).args(["init", "-q"]));
+    fs::write(f.0.join("turbo-lean.toml"), "[axioms]\nallow = []\n").unwrap();
+    fs::write(f.0.join(".gitattributes"), "*.lean filter=attack\n").unwrap();
     checked(Command::new("git").current_dir(&f.0).args([
         "add",
+        "turbo-lean.toml",
+        ".gitattributes",
         "*.lean",
         "lakefile.toml",
         "lean-toolchain",
@@ -131,6 +145,62 @@ fn project_toolchain_names_cannot_substitute_verifiers_or_prewarm_helpers() {
         "-qm",
         "base",
     ]));
+    // Host-side Git/sandbox shims exit successfully: an exit-code-only probe
+    // would accept them. A single marker also catches repository-configured code.
+    use std::os::unix::fs::PermissionsExt;
+    for tool in ["git", "bwrap", "repo-exec"] {
+        let path = f.0.join(".lake/build/bin").join(tool);
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '{MARKER}' > '{}'\nexit 0\n",
+                f.0.join("shim-invoked").display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        checked(&mut Command::new(&path));
+        assert!(f.0.join("shim-invoked").exists());
+        fs::remove_file(f.0.join("shim-invoked")).unwrap();
+    }
+    let repo_exec = f.0.join(".lake/build/bin/repo-exec");
+    for key in [
+        "core.fsmonitor",
+        "core.hooksPath",
+        "diff.external",
+        "filter.attack.smudge",
+        "filter.attack.process",
+    ] {
+        checked(
+            Command::new("/usr/bin/git")
+                .current_dir(&f.0)
+                .args(["config", key])
+                .arg(&repo_exec),
+        );
+    }
+    checked(
+        Command::new("/usr/bin/git")
+            .current_dir(&f.0)
+            .args(["status", "--porcelain"]),
+    );
+    assert!(
+        f.0.join("shim-invoked").exists(),
+        "fsmonitor control must execute the attack"
+    );
+    fs::remove_file(f.0.join("shim-invoked")).unwrap();
+    for override_path in [PathBuf::from("git"), f.0.join(".lake/build/bin/git")] {
+        let out = f
+            .cli("invalid-git-override")
+            .env("TURBO_LEAN_GIT", &override_path)
+            .args(["pr-verify", "--project-dir", ".", "--base", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("Trusted Git"));
+        f.clean();
+    }
+    // The working tree cannot relax the base policy.
+    fs::write(f.0.join("turbo-lean.toml"), "[axioms]\nallow = [\"*\"]\n").unwrap();
     fs::write(
         f.0.join("Demo.lean"),
         "theorem pinned : 1 + 1 = 2 := by\n  decide\n",
@@ -192,6 +262,38 @@ fn project_toolchain_names_cannot_substitute_verifiers_or_prewarm_helpers() {
             }
         }
     }
+    fs::write(
+        f.0.join("Untracked.lean"),
+        "theorem fresh : True := True.intro\n",
+    )
+    .unwrap();
+    let changed = f.run(
+        "git-change-discovery",
+        &[
+            "--json",
+            "pr-verify",
+            "--project-dir",
+            ".",
+            "--base",
+            "HEAD~0",
+        ],
+        true,
+    );
+    assert!(String::from_utf8_lossy(&changed.stdout).contains("Untracked.lean"));
+    fs::write(
+        f.0.join("Demo.lean"),
+        "axiom injected : False\ntheorem pinned : 1 + 1 = 2 := False.elim injected\n",
+    )
+    .unwrap();
+    let rejected = f.run(
+        "git-base-policy",
+        &["pr-verify", "--project-dir", ".", "--base", "HEAD"],
+        false,
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("axiom")
+            || String::from_utf8_lossy(&rejected.stdout).contains("axiom")
+    );
     // A shim that exits zero must never turn a broken proof into a passing verdict.
     fs::write(
         f.0.join("Demo.lean"),
@@ -222,6 +324,7 @@ fn project_toolchain_names_cannot_substitute_verifiers_or_prewarm_helpers() {
     let log = f.0.join("server.log");
     let mut server = Server(
         f.cli("prewarm")
+            .env_remove("TURBO_LEAN_NO_DAEMON")
             .args([
                 "serve",
                 "--listen",

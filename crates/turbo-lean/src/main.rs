@@ -31,6 +31,7 @@ pub mod remote_prebuild;
 pub mod server;
 pub mod shm_cache;
 mod splitter;
+mod trusted_tools;
 #[cfg(all(test, unix))]
 mod worktree_test_support;
 pub mod verify;
@@ -339,7 +340,7 @@ enum Commands {
         /// Cap the maximum number of cone verification jobs (`0` = uncapped)
         #[arg(long, default_value_t = 0)]
         max_cone_jobs: usize,
-        /// Optional external kernel checker binary (`nanoda_bin` or `lean4checker`) for dual-auditor cross-checking
+        /// Absolute external kernel checker path outside the checkout for dual-auditor cross-checking
         #[arg(long)]
         nanoda_bin: Option<PathBuf>,
     },
