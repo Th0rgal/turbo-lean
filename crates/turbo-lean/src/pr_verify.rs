@@ -5096,7 +5096,12 @@ globs = ["Demo.+"]
         ));
         fs::create_dir_all(&dir)?;
         let config = "[axioms]\nallow = [\"*._native.native_decide.ax_*\"]\n[csimp]\nallow = [\"Fixture.fast_eq\"]\n";
-        // All bases keep native permission; isolate csimp rejection from axiom rejection.
+        fs::write(
+            dir.join("turbo-lean.toml"),
+            config.replace("*._native.native_decide.ax_*", ""),
+        )?;
+        git_init_and_commit(&dir, "deny native, allow csimp")?;
+        // The remaining bases keep native permission; isolate csimp rejection from axiom rejection.
         for (permission, label) in [
             ("", "deny"),
             ("Fixture.other_eq", "wrong name"),
@@ -5238,6 +5243,15 @@ end Fixture
                 println!(
                     "kernel policy {mode} {command}: base-allowlisted csimp/native_decide admitted"
                 );
+                let out = verify(command, mode, "HEAD^^^")?;
+                let diagnostic = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                assert!(!out.status.success() && diagnostic.contains("native_decide"),
+                    "{mode} {command} must reject native_decide without base axiom permission: {diagnostic}");
+                println!("kernel policy {mode} {command}: unallowed native_decide rejected");
                 // Reuse the cache: a pass under one policy must not authorize another.
                 for base in ["HEAD^", "HEAD^^"] {
                     let out = verify(command, mode, base)?;

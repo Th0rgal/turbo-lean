@@ -6231,7 +6231,7 @@ pub fn write_lake_module_hashes_and_trace(
     let hygiene = splitter::audit_hygiene(&splitter::strip_lean_comments(&src_raw));
     let no_forbidden_proof_tokens = !hygiene.has_sorry
         && !hygiene.has_axiom
-        && !hygiene.has_native_decide
+        && !hygiene.native_violation()
         && !hygiene.has_trust_compiler;
     let skeleton_clean = src_blake3_matches && no_forbidden_proof_tokens;
     let is_stubbed_skeleton =
