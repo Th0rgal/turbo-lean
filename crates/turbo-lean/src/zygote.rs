@@ -1059,7 +1059,15 @@ fn private_shared_zygote_dir_in(base: &Path) -> Option<PathBuf> {
     let dir = base.join(format!("turbo_lean_shared_zygote_bins_{uid}"));
     #[cfg(unix)]
     {
-        use std::os::unix::fs::DirBuilderExt;
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        // Another user must not be able to rename/replace our dir: the parent may only be
+        // group/other-writable when sticky (like the default /tmp).
+        let Ok(pm) = fs::metadata(base) else {
+            return None;
+        };
+        if pm.mode() & 0o022 != 0 && pm.mode() & 0o1000 == 0 {
+            return None;
+        }
         match fs::DirBuilder::new().mode(0o700).create(&dir) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -3375,12 +3383,12 @@ fn eval_reply_cacheable(rep: &ZygoteEvalReply) -> bool {
 /// Write an eval reply into `eval_shm_cache/` and periodically enforce the `/dev/shm` quota.
 fn write_eval_shm_cache(path: &Path, bytes: &[u8]) {
     static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    if crate::shm_cache::atomic_write_shm(path, bytes).is_err() {
-        return;
-    }
-    if WRITES
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        .is_multiple_of(32)
+    // A failed write (e.g. ENOSPC) also counts: evict so a full cache can recover.
+    let wrote = crate::shm_cache::atomic_write_shm(path, bytes).is_ok();
+    if !wrote
+        || WRITES
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .is_multiple_of(32)
     {
         if let Some(dir) = path.parent() {
             let _ = crate::shm_cache::enforce_shm_quota_lru(dir, 0);
@@ -4363,6 +4371,13 @@ mod tests {
         std::os::unix::fs::symlink(&target, &dir).unwrap();
         assert!(private_shared_zygote_dir_in(&tmp).is_none());
         fs::remove_file(&dir).unwrap();
+        // A non-sticky group/other-writable parent could let others rename our dir.
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(private_shared_zygote_dir_in(&tmp).is_none());
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o1777)).unwrap();
+        let sticky = private_shared_zygote_dir_in(&tmp).expect("sticky parent accepted");
+        fs::remove_dir(&sticky).unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
         // Fresh dir is created 0700 and accepted.
         let got = private_shared_zygote_dir_in(&tmp).expect("private dir");
         assert_eq!(
