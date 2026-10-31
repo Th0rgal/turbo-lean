@@ -2383,16 +2383,10 @@ fn run_lean_temp_file(
         cmd.arg(&cfg.lean_bin);
         crate::module_builder::scrub_untrusted_env(&mut cmd);
         cmd.args(["-M", "4096"]);
-        // Lake's order: weakLeanArgs, then moreLeanArgs (later `-D` flags win); no setup.json
-        // here, so `leanOptions` come last.
-        for arg in &cfg.root_pkg.weak_lean_args {
+        // The owning target's flags (the same ones the shard key digests), already in Lake's
+        // weakLeanArgs < moreLeanArgs < leanOptions order; the hardening flags come last to win.
+        for arg in crate::module_builder::filter_allowed_lean_args(lean_args) {
             cmd.arg(arg);
-        }
-        for arg in &cfg.root_pkg.more_lean_args {
-            cmd.arg(arg);
-        }
-        for (k, v) in &cfg.root_pkg.lean_options {
-            cmd.arg(format!("-D{}={}", k, v));
         }
         cmd.arg("-Dwarn.sorry=true")
             .arg("-Ddebug.skipKernelTC=false")
