@@ -16,6 +16,8 @@ lake env lean B2/Division.lean
 The active root `B2.lean` excludes historical drafts `SpecCore.lean` and
 `SpecE2E.lean`. `B2.Core` contains only definitions. The old draft theorem
 statements still have sorries and are not correctness evidence.
+`B2.AxiomAudit` fails the build if any claimed B2 result transitively
+uses an axiom outside propext/Quot.sound/Classical.choice.
 
 Lake 5.0.0 bundled with Lean 4.34.1 rejects `lake -j4` with
 `unknown short option '-j'`; use `LEAN_NUM_THREADS=4`. Build only named

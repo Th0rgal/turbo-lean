@@ -37,4 +37,6 @@ jobs:
           lake env lean B2/Division.lean
       - name: Check compiler integration on compiler toolchain
         working-directory: lean
-        run: lake build +LeanNative.Driver.CoreCLI
+        run: |
+          lake build +LeanNative.Driver.CoreCLI
+          lake env lean --run ../research/b2-compiler-smoke.lean
