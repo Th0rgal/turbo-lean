@@ -4741,10 +4741,43 @@ pub(crate) fn entry_artifacts_current(
         || olean_digest_is(cfg, olean, &entry.olean_artifact_digest)
 }
 
-/// Whether dependency-package module `imp` may be stale before elaboration. A package without
-/// any verified-sources manifest is Lake-managed (no turbo-lean evidence): `false`. A manifest
-/// that cannot be read or parsed, lacks the module, or no longer proves the module's closure
-/// consistent establishes nothing: `true` (refresh or fail closed).
+/// After Lake refreshed dependency-package module `imp`, drop its now-outdated verified-sources
+/// entry (or an unparseable manifest), so the module counts as Lake-managed from then on.
+pub(crate) fn forget_refreshed_dep_module(cfg: &ProjectConfig, imp: &str) {
+    let ImportSite::Module(spec) = resolve_import_site(cfg, imp) else {
+        return;
+    };
+    let path = spec
+        .pkg_root
+        .join(".lake/build/.turbo_verified_sources.json");
+    let Ok(bytes) = fs::read(&path) else {
+        return;
+    };
+    match serde_json::from_slice::<VerifiedDepManifest>(&bytes) {
+        Ok(mut manifest) => {
+            if manifest.modules.remove(&spec_rel_src(&spec)).is_some() {
+                if let Ok(json) = serde_json::to_vec(&manifest) {
+                    let _ = fs::write(&path, json);
+                }
+            }
+        }
+        Err(_) => {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+/// Source and `.olean` paths of root-package module `imp`, resolved as at build time.
+pub(crate) fn root_module_paths(cfg: &ProjectConfig, imp: &str) -> Option<(PathBuf, PathBuf)> {
+    let spec = resolve_module_in_package(&cfg.root_pkg, true, imp)?;
+    let olean = spec_olean_path(&spec);
+    Some((spec.src_path, olean))
+}
+
+/// Whether dependency-package module `imp` may be stale before elaboration. A module without a
+/// verified-sources entry (no manifest, or never recorded) is Lake-managed: `false`. A manifest
+/// that cannot be read or parsed, or an entry that no longer proves the module's closure
+/// consistent, establishes nothing: `true` (refresh or fail closed).
 pub(crate) fn dep_pkg_module_stale(cfg: &ProjectConfig, memo: &DepImportMemo, imp: &str) -> bool {
     let ImportSite::Module(spec) = resolve_import_site(cfg, imp) else {
         return false;
@@ -4756,17 +4789,13 @@ pub(crate) fn dep_pkg_module_stale(cfg: &ProjectConfig, memo: &DepImportMemo, im
         Ok(bytes) => bytes,
         Err(e) => return e.kind() != std::io::ErrorKind::NotFound,
     };
-    let Some(digest) = serde_json::from_slice::<VerifiedDepManifest>(&bytes)
-        .ok()
-        .and_then(|m| {
-            m.modules
-                .get(&spec_rel_src(&spec))
-                .map(|e| e.olean_artifact_digest.clone())
-        })
-    else {
+    let Ok(manifest) = serde_json::from_slice::<VerifiedDepManifest>(&bytes) else {
         return true;
     };
-    !dep_pkg_import_pins_consistent(cfg, memo, *spec, &digest)
+    let Some(entry) = manifest.modules.get(&spec_rel_src(&spec)) else {
+        return false;
+    };
+    !dep_pkg_import_pins_consistent(cfg, memo, *spec, &entry.olean_artifact_digest)
 }
 
 /// Check-time counterpart of `collect_fresh_dep_pkg_closure` for a dependency-package module

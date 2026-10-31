@@ -2217,12 +2217,22 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
     let mut ordered_imports: Vec<(String, String, PathBuf)> = Vec::new();
     let mut adj: HashMap<String, Vec<String>> = HashMap::new();
     let mut non_root_imports: Vec<String> = Vec::new();
+    // Root modules resolve through the package configuration (as at build time) whenever the
+    // manifest supplied one; Lake-only projects keep the cheap layout heuristic.
+    let root_cfg = manifest_opt.as_ref().and_then(|m| m.cfg.as_ref());
+    let mut olean_of: HashMap<String, PathBuf> = HashMap::new();
     while let Some(mod_name) = worklist.pop() {
         if !visited.insert(mod_name.clone()) {
             continue;
         }
         let imp_slash = crate::module_builder::module_name_to_rel_slash(&mod_name);
-        if let Some(dep_src) = resolve_project_lean_source(canon_dir, &imp_slash) {
+        let root_paths = match root_cfg {
+            Some(cfg) => crate::module_builder::root_module_paths(cfg, &mod_name),
+            None => resolve_project_lean_source(canon_dir, &imp_slash)
+                .map(|src| (src, lib_lean_dir.join(format!("{imp_slash}.olean")))),
+        };
+        if let Some((dep_src, olean)) = root_paths {
+            olean_of.insert(mod_name.clone(), olean);
             let sub_imps = read_header_imports_from_file(&dep_src).unwrap_or_default();
             for sub_imp in &sub_imps {
                 if !visited.contains(sub_imp) {
@@ -2239,31 +2249,32 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
     // otherwise load them next to their rebuilt imports without re-checking. Their evidence
     // lives in their own package manifests, so it is inspected even without a root manifest.
     let mut stale_dep_mods: HashSet<String> = HashSet::new();
-    if !non_root_imports.is_empty() {
-        let fresh_memo = crate::module_builder::DepImportMemo::default();
-        let resolved;
-        let (cfg, memo) = match manifest_opt.as_ref() {
-            Some(m) if m.cfg.is_some() => (m.cfg.as_ref(), &m.dep_import_memo),
-            _ => {
-                resolved = crate::module_builder::resolve_project_config(canon_dir).ok();
-                (resolved.as_ref(), &fresh_memo)
-            }
-        };
-        if let Some(cfg) = cfg {
-            stale_dep_mods.extend(
-                non_root_imports
-                    .into_iter()
-                    .filter(|m| crate::module_builder::dep_pkg_module_stale(cfg, memo, m)),
-            );
+    let dep_cfg: Option<crate::module_builder::ProjectConfig> = if non_root_imports.is_empty() {
+        None
+    } else {
+        match manifest_opt.as_ref().and_then(|m| m.cfg.clone()) {
+            Some(cfg) => Some(cfg),
+            None => crate::module_builder::resolve_project_config(canon_dir).ok(),
         }
+    };
+    if let Some(cfg) = dep_cfg.as_ref() {
+        let fresh_memo = crate::module_builder::DepImportMemo::default();
+        let memo = manifest_opt
+            .as_ref()
+            .map_or(&fresh_memo, |m| &m.dep_import_memo);
+        stale_dep_mods.extend(
+            non_root_imports
+                .into_iter()
+                .filter(|m| crate::module_builder::dep_pkg_module_stale(cfg, memo, m)),
+        );
     }
     if ordered_imports.is_empty() && stale_dep_mods.is_empty() {
         return Ok(0);
     }
 
     let mut stale_mods: HashSet<String> = HashSet::new();
-    for (mod_name, imp_slash, dep_src) in &ordered_imports {
-        let dep_olean = lib_lean_dir.join(format!("{}.olean", imp_slash));
+    for (mod_name, _, dep_src) in &ordered_imports {
+        let dep_olean = olean_of[mod_name].clone();
         let olean_meta = fs::metadata(&dep_olean).ok();
         let src_meta = fs::metadata(dep_src).ok();
         let dep_rel = dep_src
@@ -2323,11 +2334,11 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
     let mut changed = !stale_mods.is_empty();
     while changed {
         changed = false;
-        for (mod_name, imp_slash, _) in &ordered_imports {
+        for (mod_name, _, _) in &ordered_imports {
             if stale_mods.contains(mod_name) {
                 continue;
             }
-            let dep_olean = lib_lean_dir.join(format!("{}.olean", imp_slash));
+            let dep_olean = &olean_of[mod_name];
             let self_om = fs::metadata(&dep_olean).and_then(|m| m.modified()).ok();
             if let Some(children) = adj.get(mod_name) {
                 for ch in children {
@@ -2336,9 +2347,11 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
                         changed = true;
                         break;
                     }
-                    let ch_slash = crate::module_builder::module_name_to_rel_slash(ch);
-                    if let Some(ch_src) = resolve_project_lean_source(canon_dir, &ch_slash) {
-                        let ch_olean = lib_lean_dir.join(format!("{}.olean", ch_slash));
+                    if let Some((ch_src, ch_olean)) = ordered_imports
+                        .iter()
+                        .find(|(m, _, _)| m == ch)
+                        .map(|(_, _, src)| (src, &olean_of[ch]))
+                    {
                         let ch_om = fs::metadata(&ch_olean).and_then(|m| m.modified()).ok();
                         let ch_sm = fs::metadata(&ch_src).and_then(|m| m.modified()).ok();
                         if let (Some(som), Some(com)) = (self_om, ch_om) {
@@ -2377,12 +2390,14 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
         // Lake owns `.lake/build` (whose files may be hard links into its artifact cache):
         // let Lake bring the stale imports up to date instead of deleting or rewriting them.
         lake_build_modules(canon_dir, &targets, None)?;
+        if let Some(cfg) = dep_cfg.as_ref() {
+            for m in &stale_dep_mods {
+                crate::module_builder::forget_refreshed_dep_module(cfg, m);
+            }
+        }
         if let Some(mut manifest) = manifest_opt {
-            for (_, _, dep_src) in &ordered_imports {
-                if targets.iter().any(|t| {
-                    let s = crate::module_builder::module_name_to_rel_slash(t);
-                    resolve_project_lean_source(canon_dir, &s).as_ref() == Some(dep_src)
-                }) {
+            for (mod_name, _, dep_src) in &ordered_imports {
+                if targets.contains(mod_name) {
                     let dep_rel = dep_src
                         .strip_prefix(canon_dir)
                         .unwrap_or(dep_src)
