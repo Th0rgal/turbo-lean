@@ -83,6 +83,15 @@ set_option warn.sorry false
     let path = project_dir.join(format!("_turbo_identity_{nonce}.lean"));
     fs::write(&path, probe)?;
     let result = (|| -> Result<()> {
+        let lean_args = if project_dir.join("lakefile.toml").try_exists()?
+            || project_dir.join("lakefile.lean").try_exists()?
+        {
+            let pkg = crate::module_builder::resolve_package_config(project_dir, false)
+                .context("Failed to resolve Lean options for declaration identity")?;
+            crate::module_builder::resolve_file_lean_args_in_package(&pkg, file)
+        } else {
+            Vec::new()
+        };
         let mut command = if is_untrusted {
             crate::pr_verify::statement_lean_command(project_dir, true)?
         } else {
@@ -90,14 +99,6 @@ set_option warn.sorry false
             let mut command = Command::new(lean_bin_from_env(&env));
             command.current_dir(project_dir).envs(&env);
             command
-        };
-        let lean_args = if project_dir.join("lakefile.toml").try_exists()?
-            || project_dir.join("lakefile.lean").try_exists()?
-        {
-            let pkg = crate::module_builder::resolve_package_config(project_dir, false)?;
-            crate::module_builder::resolve_file_lean_args_in_package(&pkg, file)
-        } else {
-            Vec::new()
         };
         command.args(lean_args).arg(&path);
         let out = crate::zygote::run_lean_command(&mut command, None)?;
