@@ -2193,10 +2193,11 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
     target_files: &[PathBuf],
 ) -> Result<usize> {
     let lib_lean_dir = canon_dir.join(".lake/build/lib/lean");
-    if !lib_lean_dir.is_dir() {
+    let manifest_path = verified_sources_manifest_path(canon_dir);
+    // Without root `.olean`s, a manifest can still vouch for dependency-package imports.
+    if !lib_lean_dir.is_dir() && !manifest_path.is_file() {
         return Ok(0);
     }
-    let manifest_path = verified_sources_manifest_path(canon_dir);
     // Pins and artifact digests describe disk whatever policy they were recorded under, so only
     // the schema has to match here. A manifest that exists but does not parse (legacy schema,
     // corruption) gives no evidence: every built import is refreshed and the file dropped.
