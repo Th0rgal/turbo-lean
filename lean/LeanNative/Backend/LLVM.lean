@@ -642,13 +642,16 @@ def emitLetExpr (dst : VarId) (ty : LNIRType) (expr : LNIRExpr) : EmitM Unit := 
   let opt := st.optimized
   match expr with
   | .scalar e =>
-    let is256 ← scalarExprIs256Bit e
-    if ty.is256Bit || is256 then
-      let val256 ← emitScalarExpr256 e
-      storeI256ToVar dst val256
-    else
-      let val ← emitScalarExpr e
-      storeI64ToVar dst val
+    match e with
+    | .var src => copyVarSlot dst src
+    | _ =>
+      let is256 ← scalarExprIs256Bit e
+      if ty.is256Bit || is256 then
+        let val256 ← emitScalarExpr256 e
+        storeI256ToVar dst val256
+      else
+        let val ← emitScalarExpr e
+        storeI64ToVar dst val
   | .constU256 w =>
     let cVal ← freshTmp "c256"
     emitLine s!"  {cVal} = add i256 0, {w.toNat}"

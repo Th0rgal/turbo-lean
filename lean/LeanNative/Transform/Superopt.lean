@@ -678,11 +678,17 @@ structure SuperoptReport where
 /-- Compute total scalar expression latency cost across an `LNIRCode` block under `p`. -/
 def codeScalarCostWithProfile (p : HardwareCostProfile) : LNIRCode → Nat
   | .letBind _ _ (.scalar se) k => scalarExprCostWithProfile p se + codeScalarCostWithProfile p k
+  | .letBind _ _ (.sarrayEnsureExclusive _ _) k => 6 + codeScalarCostWithProfile p k
+  | .letBind _ _ (.sarraySet _ _ _ _) k => 4 + codeScalarCostWithProfile p k
+  | .letBind _ _ (.sarrayGet _ _ _) k => 2 + codeScalarCostWithProfile p k
   | .letBind _ _ _ k => codeScalarCostWithProfile p k
   | .rawStore _ _ _ _ k => codeScalarCostWithProfile p k
   | .incRef _ _ k => codeScalarCostWithProfile p k
   | .decRef _ _ k => codeScalarCostWithProfile p k
-  | .ite _ t e => 4 + codeScalarCostWithProfile p t + codeScalarCostWithProfile p e
+  | .ite _ t e =>
+    let ct := codeScalarCostWithProfile p t
+    let ce := codeScalarCostWithProfile p e
+    4 + (match e with | .letBind _ _ (.scalar (.var _)) _ => Nat.max ct ce | _ => ct + ce)
   | .seqFor _ _ _ _ _ _ step k => codeScalarCostWithProfile p step + codeScalarCostWithProfile p k
   | .parFor _ _ _ _ (.customScalar _ _ body) k => scalarExprCostWithProfile p body + codeScalarCostWithProfile p k
   | .parFor _ _ _ _ _ k => codeScalarCostWithProfile p k

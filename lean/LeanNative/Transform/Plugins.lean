@@ -650,4 +650,17 @@ def handleTurboPluginLine (line : String) : String :=
   else
     "{}"
 
+#guard (let d0 := LeanNative.IR.Codec.sarrayScaleBiasDecl
+  let d' := hoistExclusivityDecl d0
+  d'.body != d0.body &&
+  (LeanNative.Proofs.validateTranslationDecl d0 d').passed &&
+  declScalarCost .x86_64 d' < declScalarCost .x86_64 d0)
+
+#guard (let m0 := LeanNative.IR.Codec.mkCanonicalBenchmarkModule
+  let (m', rep) := runSegregatedPluginPipeline .x86_64 true m0
+  rep.adversarialRejected &&
+  rep.declAudits.all (·.tvVerified) &&
+  (LeanNative.Proofs.validateTranslationModule m0 m').allPassed &&
+  rep.declAudits.any (fun a => a.declName == "sarray_scale_bias" && a.appliedPlugins.contains "builtin:hoist-exclusivity"))
+
 end LeanNative.Transform

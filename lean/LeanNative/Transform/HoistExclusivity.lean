@@ -256,17 +256,23 @@ def hoistExclusivityCode (nextFree : VarId) (code : LNIRCode) : LNIRCode × VarI
       if arrayAliasesNonEscaping tracked stepBodySub then
         let exclArrVar := nf2 + 1
         let rawPtrVar := nf2 + 2
-        let nf3 := nf2 + 2
+        let tripCondVar := nf2 + 3
+        let nf3 := nf2 + 3
         let isAccArray := cand.targetArr == accVar || cand.targetArr == accInit
         let baseArr := if isAccArray then accInit else cand.targetArr
         let canonicalLoopArr := if isAccArray then accVar else exclArrVar
         let newAccInit := if isAccArray then exclArrVar else accInit
         let rewrittenBody :=
           rewriteLoopBodyForHoistedArray canonicalLoopArr rawPtrVar tracked [] stepBodySub
-        let hoistedLoop : LNIRCode :=
+        let hoistedThen : LNIRCode :=
           .letBind exclArrVar (.sarray cand.elemTy) (.sarrayEnsureExclusive baseArr cand.elemTy)
             (.letBind rawPtrVar (.rawPtr cand.elemTy) (.sarrayDataPtr exclArrVar cand.elemTy)
               (.seqFor idxVar loVar hiVar accVar newAccInit accTy rewrittenBody k'))
+        let hoistedElse : LNIRCode :=
+          .letBind accVar accTy (.scalar (.var accInit)) k'
+        let hoistedLoop : LNIRCode :=
+          .letBind tripCondVar .i1 (.scalar (.binOp .lt (.var loVar) (.var hiVar)))
+            (.ite tripCondVar hoistedThen hoistedElse)
         (hoistedLoop, nf3)
       else
         (.seqFor idxVar loVar hiVar accVar accInit accTy stepBodySub k', nf2)
