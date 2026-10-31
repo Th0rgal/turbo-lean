@@ -1124,7 +1124,8 @@ pub(crate) struct ToolchainExecutables {
 
 impl ToolchainExecutables {
     pub fn resolve(project: &Path, toolchain: &str) -> Result<Self> {
-        let (lean, _, _, _) = resolve_toolchain_compiler_with_trust(project, toolchain, true)?;
+        let project = lake_build::find_project_root(project);
+        let (lean, _, _, _) = resolve_toolchain_compiler_with_trust(&project, toolchain, true)?;
         let tools = Self::from_lean(&lean)?;
         let project = project.canonicalize()?;
         for tool in [&tools.lean, &tools.lake, &tools.leanc] {
