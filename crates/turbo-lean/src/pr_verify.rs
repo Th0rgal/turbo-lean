@@ -4057,6 +4057,61 @@ pub fn run_pr_verify_command(
         }
     }
 
+    // Identity elaboration needs the same compiled imports as shard checking,
+    // including when the only verification results would otherwise be cache hits.
+    if let Some(ref cfg) = untrusted_pr_cfg {
+        let needs_project_imports = shards_by_file.keys().any(|rel_path| {
+            let src = current_files
+                .get(rel_path)
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            let hdr = crate::module_builder::parse_header_info(src);
+            hdr.header_error.is_some()
+                || hdr.imports.iter().any(|m| {
+                    let rel_slash = crate::module_builder::module_name_to_rel_slash(m);
+                    let in_pkg_or_project = crate::module_builder::resolve_module_in_package(
+                        &cfg.root_pkg,
+                        true,
+                        m,
+                    )
+                    .is_some()
+                        || cfg.dep_pkgs.iter().any(|dp| {
+                            crate::module_builder::resolve_module_in_package(dp, false, m)
+                                .is_some()
+                        })
+                        || crate::lake_build::resolve_project_lean_source(
+                            &canon_dir, &rel_slash,
+                        )
+                        .is_some();
+                    in_pkg_or_project
+                        || !crate::module_builder::is_builtin_toolchain_module(
+                            &cfg.toolchain_lib_lean,
+                            m,
+                        )
+                })
+        });
+        if needs_project_imports && !untrusted_deps_built {
+            if !canon_dir.join("lakefile.toml").is_file()
+                && !canon_dir.join("lakefile.lean").is_file()
+            {
+                anyhow::bail!(
+                    "Untrusted PR verification requires a static `lakefile.toml` or `lakefile.lean` to build project imports"
+                );
+            }
+            crate::module_builder::build_project_modules_native(
+                store,
+                &canon_dir,
+                &[],
+                &trust_domain,
+                1,
+                true,
+                json,
+                None,
+            )
+            .context("Untrusted PR dependency build failed")?;
+        }
+    }
+
     // Per-shard names must be attested by Lean before cache hits or verification
     // can be attributed to them, including the single-theorem PR case.
     for (rel_path, file_shards) in &shards_by_file {
@@ -4166,58 +4221,6 @@ pub fn run_pr_verify_command(
     }
 
     if !uncached_by_file.is_empty() {
-        if let Some(ref cfg) = untrusted_pr_cfg {
-            let needs_project_imports = uncached_by_file.iter().any(|(rel_path, _, _)| {
-                let src = current_files
-                    .get(rel_path)
-                    .map(|s| s.as_str())
-                    .unwrap_or("");
-                let hdr = crate::module_builder::parse_header_info(src);
-                hdr.header_error.is_some()
-                    || hdr.imports.iter().any(|m| {
-                        let rel_slash = crate::module_builder::module_name_to_rel_slash(m);
-                        let in_pkg_or_project = crate::module_builder::resolve_module_in_package(
-                            &cfg.root_pkg,
-                            true,
-                            m,
-                        )
-                        .is_some()
-                            || cfg.dep_pkgs.iter().any(|dp| {
-                                crate::module_builder::resolve_module_in_package(dp, false, m)
-                                    .is_some()
-                            })
-                            || crate::lake_build::resolve_project_lean_source(
-                                &canon_dir, &rel_slash,
-                            )
-                            .is_some();
-                        in_pkg_or_project
-                            || !crate::module_builder::is_builtin_toolchain_module(
-                                &cfg.toolchain_lib_lean,
-                                m,
-                            )
-                    })
-            });
-            if needs_project_imports && !untrusted_deps_built {
-                if !canon_dir.join("lakefile.toml").is_file()
-                    && !canon_dir.join("lakefile.lean").is_file()
-                {
-                    anyhow::bail!(
-                        "Untrusted PR verification requires a static `lakefile.toml` or `lakefile.lean` to build project imports"
-                    );
-                }
-                crate::module_builder::build_project_modules_native(
-                    store,
-                    &canon_dir,
-                    &[],
-                    &trust_domain,
-                    1,
-                    true,
-                    json,
-                    None,
-                )
-                .context("Untrusted PR dependency build failed")?;
-            }
-        }
         let fast_lib_dir = canon_dir.join(".lake/build/lib/lean");
         let fast_local_zygote_url = if !is_untrusted && remote_http.is_none() {
             let mut fast_ev = std::collections::HashMap::new();
