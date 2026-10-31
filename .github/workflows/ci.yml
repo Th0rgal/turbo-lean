@@ -11,6 +11,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  LEAN_NUM_THREADS: 4
+  TURBO_LEAN_TELEMETRY: "off"
+  LEAN_NATIVE_TELEMETRY: "off"
   TURBO_LEAN_HOME: ${{ github.workspace }}/.turbo-cache
 
 jobs:
@@ -79,7 +82,7 @@ jobs:
           ./lean/.lake/build/bin/lean-native-core self-test
           ./lean/.lake/build/bin/turbo-lean-native self-test
           cargo build --release
-          cargo test --release
+          cargo test --release -- --nocapture
           ./target/release/turbo-lean --version
           ./scripts/ci_verify.sh
 
@@ -110,7 +113,7 @@ jobs:
               PR_BASE_REF="$PR_BASE_SHA"
             fi
           fi
-          ./target/release/turbo-lean --json ci-verify --project-dir lean --mode "$VERIFY_MODE" --receipt /tmp/ci-receipt.json
+          ./target/release/turbo-lean --json ci-verify --project-dir lean --mode "$VERIFY_MODE" --base "$PR_BASE_REF" --receipt /tmp/ci-receipt.json
           ./target/release/turbo-lean --json verify-receipt /tmp/ci-receipt.json --baseline-receipt /tmp/ci-receipt.json
           ./target/release/turbo-lean --json pr-verify --project-dir lean --base "$PR_BASE_REF" --mode "$VERIFY_MODE"
           ./target/release/turbo-lean build --project-dir lean --json

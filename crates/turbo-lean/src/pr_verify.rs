@@ -2689,6 +2689,15 @@ pub fn run_ci_verify_command(
         full_splits_opt = Some(splits);
     }
 
+    // Untrusted CI always audits compiled modules, including restored artifacts.
+    // Only an explicit caller policy can defer source csimp flags to that gate.
+    if is_untrusted && std::env::var("TURBO_LEAN_ALLOWED_CSIMP").is_ok_and(|s| !s.trim().is_empty())
+    {
+        for (_, items) in &mut flagged_files {
+            items.retain(|item| item.rsplit(": ").next() != Some("csimp"));
+        }
+        flagged_files.retain(|(_, items)| !items.is_empty());
+    }
     if !flagged_files.is_empty() {
         anyhow::bail!(
             "CI Hygiene & Axiom Gate FAILED on {} files: {:?}",
@@ -3683,7 +3692,11 @@ fn ensure_statement_lake_project(project: &Path) -> Result<()> {
                 .map(|rel| rel.with_extension("").to_string_lossy().replace('/', "."))
         })
         .collect::<std::result::Result<_, _>>()?;
-    let config = format!("name = \"turbo-statement-snapshot\"\ndefaultTargets = [\"TurboStatementSnapshot\"]\n[[lean_lib]]\nname = \"TurboStatementSnapshot\"\nroots = {}\nglobs = []\n", serde_json::to_string(&roots)?);
+    let mut config = "name = \"turbo-statement-snapshot\"\n".to_string();
+    if !roots.is_empty() {
+        let modules = serde_json::to_string(&roots)?;
+        config.push_str(&format!("defaultTargets = [\"TurboStatementSnapshot\"]\n[[lean_lib]]\nname = \"TurboStatementSnapshot\"\nroots = {modules}\nglobs = {modules}\n"));
+    }
     fs::write(project.join("lakefile.toml"), config)?;
     Ok(())
 }
@@ -5083,8 +5096,18 @@ globs = ["Demo.+"]
         ));
         fs::create_dir_all(&dir)?;
         let config = "[axioms]\nallow = [\"*._native.native_decide.ax_*\"]\n[csimp]\nallow = [\"Fixture.fast_eq\"]\n";
-        fs::write(dir.join("turbo-lean.toml"), config)?;
-        git_init_and_commit(&dir, "audited policy")?;
+        // All bases keep native permission; isolate csimp rejection from axiom rejection.
+        for (permission, label) in [
+            ("", "deny"),
+            ("Fixture.other_eq", "wrong name"),
+            ("Fixture.fast_eq", "allow"),
+        ] {
+            fs::write(
+                dir.join("turbo-lean.toml"),
+                config.replace("Fixture.fast_eq", permission),
+            )?;
+            git_init_and_commit(&dir, label)?;
+        }
         fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
         fs::write(dir.join(".gitignore"), ".lake/\n")?;
         fs::write(dir.join("lakefile.toml"), "name = \"policy-fixture\"\ndefaultTargets = [\"Fixture\"]\n[[lean_lib]]\nname = \"Fixture\"\n")?;
@@ -5092,11 +5115,12 @@ globs = ["Demo.+"]
             dir.join("Fixture.lean"),
             r#"import Lean
 namespace Fixture
-def slow (n : Nat) : Nat := n + 0
-def fast (n : Nat) : Nat := n
+@[noinline] def slow (n : Nat) : Nat := n + 0
+@[noinline] def fast (n : Nat) : Nat := n
 @[csimp] theorem fast_eq : @slow = @fast := by
   funext n
   simp [slow, fast]
+def callSlow (n : Nat) : Nat := slow n
 theorem witness : (1 + 1 : Nat) = 2 := by native_decide
 end Fixture
 "#,
@@ -5129,40 +5153,109 @@ end Fixture
             .any(|axiom| axiom.starts_with("Fixture.witness._native.native_decide.ax_")));
         let allowed = StatementPolicy::at(&dir, "HEAD");
         allowed.audit(&report)?;
+        let cfg = crate::module_builder::resolve_project_config_with_trust(&dir, true)?;
+        let store = TurboStore::open(Some(&dir.join(".lake/auditor-cache")))?;
+        let env = std::collections::HashMap::from([
+            (
+                "LEAN_PATH".into(),
+                cfg.toolchain_lib_lean.to_string_lossy().into_owned(),
+            ),
+            (
+                "LD_LIBRARY_PATH".into(),
+                cfg.toolchain_lib.to_string_lossy().into_owned(),
+            ),
+        ]);
+        let auditor = crate::zygote::ensure_zygote_binary(&store, &cfg.lean_bin, &env)?;
+        let (lp, _) = crate::module_builder::build_lean_search_path(&cfg, true);
+        for (permission, expected) in [
+            ("Fixture.fast_eq", true),
+            ("Fixture.other_eq", false),
+            ("", false),
+        ] {
+            let out = Command::new(&auditor)
+                .args(["--audit-modules", "Fixture"])
+                .envs(&env)
+                .env("LEAN_PATH", &lp)
+                .env(splitter::ALLOWED_AXIOMS_ENV, "*._native.native_decide.ax_*")
+                .env("TURBO_LEAN_ALLOWED_CSIMP", permission)
+                .output()?;
+            assert_eq!(
+                out.status.success(),
+                expected,
+                "compiled auditor csimp policy {permission:?}: {}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        println!("kernel policy compiled auditor: exact csimp permission admitted; wrong/absent permission rejected");
         let cli = std::env::current_exe()?
             .parent()
             .and_then(Path::parent)
             .map(|path| path.join("turbo-lean"))
             .filter(|path| path.is_file());
-        let verify = || -> Result<std::process::Output> {
-            Command::new(
+        let verify = |command: &str, mode: &str, base: &str| -> Result<std::process::Output> {
+            let mut cmd = Command::new(
                 cli.as_ref()
                     .context("Build the release CLI before the policy fixture")?,
-            )
-            .args(["--json", "pr-verify", "--project-dir"])
-            .arg(&dir)
-            .args([
-                "--base",
-                "HEAD",
-                "--mode",
-                "trusted",
-                "--disallow-statement-changes",
-            ])
-            .env_remove(splitter::ALLOWED_AXIOMS_ENV)
-            .env("TURBO_LEAN_HOME", dir.join(".lake/turbo-policy-cache"))
-            .env("TURBO_LEAN_NO_DAEMON", "1")
-            .output()
-            .map_err(Into::into)
+            );
+            cmd.args(["--no-telemetry", "--json", command, "--project-dir"])
+                .arg(&dir)
+                .args(["--mode", mode])
+                // A policy inherited from another checkout must not override --base.
+                .env("TURBO_LEAN_ALLOWED_CSIMP", "*")
+                .env("TURBO_LEAN_ALLOWED_CSIMP_FROM_CONFIG", "1")
+                .env_remove(splitter::ALLOWED_AXIOMS_ENV)
+                .env("TURBO_LEAN_HOME", dir.join(".lake/turbo-policy-cache"))
+                .env("TURBO_LEAN_NO_DAEMON", "1");
+            if !base.is_empty() {
+                cmd.args(["--base", base]);
+            }
+            if command == "pr-verify" {
+                cmd.arg("--disallow-statement-changes");
+            }
+            Ok(cmd.output()?)
         };
         if cli.is_some() {
-            let out = verify()?;
-            assert!(
-                out.status.success(),
-                "base-allowlisted compiled csimp/native must pass pr-verify: {}\n{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-            println!("kernel policy CLI fixture: base-allowlisted csimp/native_decide admitted by pr-verify");
+            let sandbox = crate::module_builder::probe_bwrap_sandbox().is_some();
+            for (command, mode) in [
+                ("pr-verify", "trusted"),
+                ("pr-verify", "untrusted"),
+                ("ci-verify", "untrusted"),
+            ] {
+                if mode == "untrusted" && !sandbox {
+                    println!(
+                        "kernel policy {mode} {command} fixtures skipped: no working bubblewrap"
+                    );
+                    continue;
+                }
+                let out = verify(command, mode, "HEAD")?;
+                assert!(
+                    out.status.success(),
+                    "base-allowlisted csimp/native must pass {mode} {command}: {}\n{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                println!(
+                    "kernel policy {mode} {command}: base-allowlisted csimp/native_decide admitted"
+                );
+                // Reuse the cache: a pass under one policy must not authorize another.
+                for base in ["HEAD^", "HEAD^^"] {
+                    let out = verify(command, mode, base)?;
+                    let diagnostic = format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    assert!(!out.status.success() && diagnostic.contains("csimp"),
+                        "{mode} {command} must reject non-allowlisted/head-only csimp under {base}: {diagnostic}");
+                    println!("kernel policy {mode} {command}: non-allowlisted/head-only csimp rejected ({base})");
+                }
+                if command == "ci-verify" {
+                    assert!(!verify(command, mode, "")?.status.success(),
+                        "untrusted ci-verify without --base must ignore checkout and inherited config policy");
+                    println!("kernel policy untrusted ci-verify: checkout/inherited config ignored without --base");
+                }
+            }
         }
         fs::write(
             dir.join("turbo-lean.toml"),
@@ -5173,7 +5266,7 @@ end Fixture
         fs::write(dir.join("turbo-lean.toml"), config)?;
         if cli.is_some() {
             assert!(
-                !verify()?.status.success(),
+                !verify("pr-verify", "trusted", "HEAD")?.status.success(),
                 "head-only policy must fail pr-verify"
             );
         }

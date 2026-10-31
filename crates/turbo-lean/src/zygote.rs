@@ -1376,9 +1376,14 @@ fn audit_compiled_module_batch(
         if !auditor_ld_library_path.is_empty() {
             c.args(["--setenv", "LD_LIBRARY_PATH", auditor_ld_library_path]);
         }
-        if let Ok(allowed_ax) = std::env::var(crate::splitter::ALLOWED_AXIOMS_ENV) {
-            if !allowed_ax.trim().is_empty() {
-                c.args(["--setenv", crate::splitter::ALLOWED_AXIOMS_ENV, &allowed_ax]);
+        for key in [
+            crate::splitter::ALLOWED_AXIOMS_ENV,
+            "TURBO_LEAN_ALLOWED_CSIMP",
+        ] {
+            if let Ok(allow) = std::env::var(key) {
+                if !allow.trim().is_empty() {
+                    c.args(["--setenv", key, &allow]);
+                }
             }
         }
         c.args(["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]);

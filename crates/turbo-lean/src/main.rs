@@ -241,6 +241,9 @@ enum Commands {
         /// Verification mode: 'trusted' or 'untrusted'
         #[arg(long, default_value = "trusted")]
         mode: String,
+        /// Trusted git revision supplying project allowlists (untrusted mode ignores checkout policy)
+        #[arg(long)]
+        base: Option<String>,
         /// Project root directory
         #[arg(long, default_value = ".")]
         project_dir: PathBuf,
@@ -536,14 +539,15 @@ fn run(cli: Cli) -> Result<()> {
             project_dir, base, ..
         } => (Some(project_dir.as_path()), Some(base.as_str())),
         Commands::CiVerify {
-            project_dir, mode, ..
-        } => {
-            if mode == "untrusted" {
-                (None, None)
-            } else {
-                (Some(project_dir.as_path()), None)
-            }
-        }
+            project_dir,
+            mode,
+            base,
+            ..
+        } => match base {
+            Some(base) => (Some(project_dir.as_path()), Some(base.as_str())),
+            None if mode == "untrusted" => (None, None),
+            None => (Some(project_dir.as_path()), None),
+        },
         Commands::Check { project_dir, .. }
         | Commands::Build { project_dir, .. }
         | Commands::SeedShards { project_dir, .. } => (Some(project_dir.as_path()), None),
@@ -570,9 +574,27 @@ fn run(cli: Cli) -> Result<()> {
         std::env::remove_var(splitter::ALLOWED_AXIOMS_ENV);
         std::env::remove_var(splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV);
     }
+    let csimp_from_config =
+        std::env::var("TURBO_LEAN_ALLOWED_CSIMP_FROM_CONFIG").as_deref() == Ok("1");
+    if csimp_from_config && dir.is_none() {
+        std::env::remove_var("TURBO_LEAN_ALLOWED_CSIMP");
+        std::env::remove_var("TURBO_LEAN_ALLOWED_CSIMP_FROM_CONFIG");
+    }
     if let Some(dir) = dir {
         let config = splitter::read_project_config(dir, rev).unwrap_or_default();
-        if std::env::var_os(splitter::ALLOWED_AXIOMS_ENV).is_none() || from_cfg_env {
+        if rev.is_some()
+            || std::env::var_os("TURBO_LEAN_ALLOWED_CSIMP").is_none()
+            || csimp_from_config
+        {
+            let allow = accelerators::toml_string_array(&config, "csimp", "allow");
+            std::env::set_var(
+                "TURBO_LEAN_ALLOWED_CSIMP",
+                allow.unwrap_or_default().join(","),
+            );
+            std::env::set_var("TURBO_LEAN_ALLOWED_CSIMP_FROM_CONFIG", "1");
+        }
+        if rev.is_some() || std::env::var_os(splitter::ALLOWED_AXIOMS_ENV).is_none() || from_cfg_env
+        {
             let allow = accelerators::toml_string_array(&config, "axioms", "allow");
             std::env::set_var(
                 splitter::ALLOWED_AXIOMS_ENV,
@@ -1336,6 +1358,7 @@ fn run(cli: Cli) -> Result<()> {
             signing_key,
             seed_shards,
             scope,
+            ..
         } => pr_verify::run_ci_verify_command(
             &mut store,
             cli.json,
