@@ -223,8 +223,9 @@ def buildGraph (env : Environment) (relevantMods : Std.HashSet Nat) :
     IO (Std.HashMap Name (Array (Name × Nat))) := do
   let mut rev : Std.HashMap Name (Array (Name × Nat)) := {}
   for (c, _) in env.constants.toList do
-    let some i := env.getModuleIdxFor? c | continue
-    unless relevantMods.contains i.toNat do continue
+    -- constants of no module exist only when added in memory (self-test fixtures); keep them
+    if let some i := env.getModuleIdxFor? c then
+      unless relevantMods.contains i.toNat do continue
     if isForbidden c then continue   -- forbidden constants are sinks
     for r in (← constRefs env c) do
       if r == c then continue
@@ -684,8 +685,29 @@ def ratchetTests (fixtureVs : Array Violation) : IO (Array String) := do
       errs := errs.push s!"ratchet case `{label}`: expected {if expected.isEmpty then "pass" else s!"{expected}"}, got {got.toList}"
   return errs
 
+/-- The `implemented_by` fixture cannot be a source file (the repository hygiene gate rejects
+    the implemented-by attribute everywhere), so it is added to the imported environment here: a real
+    kernel-checked definition whose logical body is `unaryLogical`'s (no forbidden constant) and
+    whose `implemented_by` attribute names `unaryImpl` (which calls `evalUnaryOp`). -/
+def withImplementedByFixture (env : Environment) : IO Environment := do
+  let ctx : Core.Context := { fileName := "<shadow-self-test>", fileMap := default,
+                              maxHeartbeats := 0, maxRecDepth := 100000 }
+  let act : CoreM Environment := do
+    let some (.defnInfo v) := (← getEnv).find? `UnrelatedTraversal.unaryLogical
+      | throwError "fixture UnrelatedTraversal.unaryLogical missing"
+    let n := `ShadowFixtureTraversal.viaImplementedBy
+    addDecl (.defnDecl { name := n, levelParams := [], type := v.type, value := v.value,
+                         hints := .abbrev, safety := .safe })
+    setImplementedBy n `UnrelatedTraversal.unaryImpl
+    unless Compiler.getImplementedBy? (← getEnv) n == some `UnrelatedTraversal.unaryImpl do
+      throwError "implemented_by not recorded on {n}"
+    getEnv
+  let (env', _) ← act.toIO ctx { env }
+  return env'
+
 def selfTest (env : Environment) (leanDir : System.FilePath) : IO (Array String) := do
   let inv : Inventory := { modules := [], namespaces := fixtureNamespaces, sourceRoots := [] }
+  let env ← withImplementedByFixture env
   let r ← analyze env leanDir inv
   IO.println s!"[self-test] {r.targets.size} fixture targets, {r.violations.size} violations:"
   printTable r.violations
@@ -716,7 +738,7 @@ def selfTest (env : Environment) (leanDir : System.FilePath) : IO (Array String)
     (`ShadowFixtureTraversal.viaInstance, `LeanNative.Semantics.evalBinOp, "call≤3",
       some `UnrelatedTraversal.instDenoteBinOp, "synthesized instance"),
     (`ShadowFixtureTraversal.viaImplementedBy, `LeanNative.Semantics.evalUnaryOp, "call≤3",
-      some `UnrelatedTraversal.unaryImpl, "implemented_by"),
+      some `UnrelatedTraversal.unaryImpl, "implemented_by (synthesized in env)"),
     (`ShadowFixtureTraversal.viaMacro, `LeanNative.Semantics.evalBinOp, "call≤3",
       none, "macro-expanded call"),
     (`ShadowFixtureTraversal.viaUnsafeRec, `LeanNative.Semantics.evalUnaryOp, "call≤3",

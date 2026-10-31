@@ -20,8 +20,12 @@ class Denote (α : Type) where
 instance : Denote BinOp where
   den := evalBinOp
 
-/-! `implemented_by`: the compiled implementation calls `evalUnaryOp`; the logical body does not. -/
+/-! `implemented_by`: the compiled implementation calls `evalUnaryOp`; the logical body does not.
+The repository hygiene gate rejects the implemented-by attribute in any source file, so the attributed
+target `ShadowFixtureTraversal.viaImplementedBy` is NOT written here: the self-test adds it to the
+imported environment (`addDecl` with `unaryLogical`'s body + `setImplementedBy … unaryImpl`). -/
 def unaryImpl (op : UnaryOp) (v : Val) : Except UBError Val := evalUnaryOp op v
+def unaryLogical (_op : UnaryOp) (_v : Val) : Except UBError Val := .error (.typeError "")
 
 /-! Macro: expands to a call of `evalBinOp` at the use site. -/
 macro "shadow_add!" a:term:max b:term:max : term =>

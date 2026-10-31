@@ -13,9 +13,9 @@ def deep (a b : Val) : Except UBError Val := h1 a b
 /-- Synthesized instance: `Denote.den` resolves to `instDenoteBinOp`, which calls `evalBinOp`. -/
 def viaInstance (a b : Val) : Except UBError Val := Denote.den BinOp.add a b
 
-/-- `implemented_by`: logical body is `.error`; the implementation calls `evalUnaryOp`. -/
-@[implemented_by unaryImpl]
-def viaImplementedBy (_op : UnaryOp) (_v : Val) : Except UBError Val := .error (.typeError "")
+/- `implemented_by` (`viaImplementedBy`): synthesized in the imported environment by the
+   self-test (see `UnrelatedTraversal.unaryImpl`), because a source implemented-by attribute is rejected
+   by the repository hygiene gate. -/
 
 /-- Macro-expanded call: `shadow_add!` expands to `evalBinOp .add`. -/
 def viaMacro (a b : Val) : Except UBError Val := shadow_add! a b
