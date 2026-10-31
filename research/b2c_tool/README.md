@@ -104,6 +104,11 @@ While later commits run, `audit.py --commit <prefix>` checks one completed,
 pushed dataset, including every distinct-K median/mean/min/max and total. This
 mode does not certify the unfinished report; the default still requires all 20
 datasets and the final report.
+If the final report has too few distinct non-auxiliary examples in a positive
+bucket, `audit.py --diagnostic-accounting` independently checks all datasets,
+aggregate accounting, rankings, and supplied example membership. It reports the
+shortfalls and explicitly never certifies completion. The default audit retains
+the requirement of three distinct non-auxiliary names per positive bucket.
 
 Total build CPU denominators use `tree_cpu_seconds`, measured around the whole
 memcap/Lake subprocess tree with child resource usage. The Lean module CPU

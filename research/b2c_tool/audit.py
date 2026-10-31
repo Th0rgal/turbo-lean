@@ -18,7 +18,10 @@ def git(args,cwd=RESULTS):return subprocess.check_output(['git',*args],cwd=cwd,t
 def callkey(g):return (g['module'],tuple(g['names']),g['kind'],g['cpu_ns'],g['duplicate_rechecked'])
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--commit',help='audit one complete pushed dataset by commit prefix; does not certify the final report')
+    modes=parser.add_mutually_exclusive_group()
+    modes.add_argument('--commit',help='audit one complete pushed dataset by commit prefix; does not certify the final report')
+    modes.add_argument('--diagnostic-accounting',action='store_true',
+                       help='check all numerical accounting and supplied examples while reporting example-count shortfalls; never certifies completion')
     args=parser.parse_args()
     report=j(RESULTS/'research/B2c.json');md=(RESULTS/'research/B2c.md').read_text()
     commits=git(['rev-list','--first-parent','-n','20','--reverse','5018b95'],CLIFV).splitlines()
@@ -28,7 +31,7 @@ def main():
         assert len(selected)==1,'commit prefix must select exactly one experiment commit'
     else:
         assert report['completed_commits']==commits and report['status']=='measured'
-        assert not report['example_shortfalls']
+        if not args.diagnostic_accounting:assert not report['example_shortfalls']
     assert 'OPTIMISTIC UPPER BOUND' in md
     for missing in ('LEAN_NAT_MAX_SIZE','Lean.reduceBool','constructor field counts','Bool/Nat'):
         assert missing in md
@@ -211,9 +214,14 @@ def main():
     def close(actual,expected):
         if expected is None:assert actual is None
         else:assert abs(actual-expected)<=max(1e-6,abs(expected)*1e-12),(actual,expected)
+    example_shortfalls=[]
     def examples(xs,positive,label,kind=None,module=None):
         if not positive:return
-        assert len({x['name'] for x in xs})>=3
+        count=len({x['name'] for x in xs})
+        if count<3:
+            bucket=f'{label} kind {kind}' if kind else f'{label} module {module}' if module else f'{label} overall'
+            example_shortfalls.append(bucket)
+            assert args.diagnostic_accounting,(bucket,count)
         for x in xs:
             assert nonaux(x['name'])
             assert (x['commit'],x['module'],x['name']) in eligible_examples[label]
@@ -272,9 +280,16 @@ def main():
             examples(v['kernel_reuse_examples'],v.get('optimistic_reusable_kernel_seconds',0)>0,'reuse',module=v['module'])
         for v in report['top_20_module_cutoff_modules']:
             examples(v['cutoff_examples'],v.get('cutoff_avoidable_elapsed_seconds',0)>0,'cutoff',module=v['module'])
+        assert sorted(example_shortfalls)==sorted(report['example_shortfalls'])
     assert git(['branch','--show-current'])=='research/b2c-measurement'
     assert all(p.startswith('research/') for p in git(['diff','--name-only',BASE,'HEAD']).splitlines())
     assert git(['rev-parse','HEAD'])==git(['rev-parse','origin/research/b2c-measurement'])
-    print(json.dumps({'artifact_audit':'passed','scope':'single dataset' if args.commit else 'final report and all datasets',
-                     'commits':observed,'manual_example_and_method_review_still_required':True},indent=2))
+    result={'artifact_audit':'passed','scope':'single dataset' if args.commit else 'final report and all datasets',
+            'commits':observed,'manual_example_and_method_review_still_required':True}
+    if args.diagnostic_accounting:
+        result.update(artifact_audit='not certified: diagnostic mode',
+                      scope='all datasets, numerical accounting, and supplied example membership',
+                      numerical_accounting_audit='passed',completion_certified=False,
+                      example_shortfalls=example_shortfalls)
+    print(json.dumps(result,indent=2))
 if __name__=='__main__':main()
