@@ -171,8 +171,8 @@ def main():
       'top_20_module_cutoff_modules':top_cut,'all_module_buckets':mt,'transitions':transitions,
       'replay_by_commit':[{'commit':c['commit'],**c['replay'],**c['coverage']} for c in allc]}
     (RESULTS/'research/B2c.json').write_text(json.dumps(result,indent=2)+'\n')
-    def pct(x):return 'n/a' if x is None else f'{100*x:.2f}%'
-    def sec(x):return f'{x:,.3f}'
+    def pct(x):return 'n/a' if x is None else '<0.01%' if 0<x<0.0001 else f'{100*x:.2f}%'
+    def sec(x):return '<0.001' if 0<x<0.001 else f'{x:,.3f}'
     def extext(xs):return '; '.join(f"`{x['name']}` ({x['commit'][:8]}, {x['kernel_ms']:.3f} ms)" for x in xs) or 'none'
     p=['# B2c: elaborated-interface cutoff and optimistic kernel reuse','',
        f"Across 19 incremental transitions, module cutoff could avoid **{pct(result['module_cutoff']['share_of_dependent_module_rebuild_elapsed'])}** of dependent-module rebuild seconds ({sec(sums['cutoff_avoidable_elapsed_seconds'])} / {sec(sums['dependent_rebuild_elapsed_seconds'])} s). Declaration reuse could optimistically avoid **{pct(result['optimistic_kernel_reuse']['share_of_rebuilt_kernel'])}** of measured kernel CPU in actually rebuilt modules.",'',
@@ -233,17 +233,30 @@ def main():
     p+=['','## Artifacts and limits','',
          '`B2c.json` contains denominators, all module buckets, transitions, replay totals, and key-bearing examples. `b2c_data/<commit>/rows.jsonl.gz` stores name/kind/module/IF/K/kernel_ms, with group times charged once to the representative. `kernel_groups.jsonl.gz` retains every measured call; repeated K values retain their occurrence times. `replay.jsonl.gz`, source hashes, build logs, per-module CPU/elapsed timings, and coverage checks preserve the evidence. Each completed commit was pushed to `research/b2c-measurement` before advancing; no PR was opened.','',
          'Shared-host timing noise, interpreter/reconstruction overhead, and changed parallel scheduling limit wall-speedup inference. The report estimates avoidable work, not an implemented end-to-end speedup. Kernel times are replay measurements, not profiler samples of the original elaboration.']
-    shortfalls=[]
+    shortfalls=[];shortfall_details=[]
+    def shortfall(label,xs):
+        names=sorted({x['name'] for x in xs})
+        shortfalls.append(label)
+        shortfall_details.append({'bucket':label,'required_distinct_names':3,
+                                  'available_distinct_nonauxiliary_names':len(names),'names':names})
     for label,bs in [('reuse kind',bykind),('cutoff kind',cutkind)]:
         for k,v in bs.items():
-            if v['nonauxiliary_example_shortfall']:shortfalls.append(f'{label} {k}')
+            if v['nonauxiliary_example_shortfall']:shortfall(f'{label} {k}',v['examples'])
     for title,items,key in [('reuse module',top_reuse,'optimistic_reusable_kernel_seconds'),('cutoff module',top_cut,'cutoff_avoidable_elapsed_seconds')]:
         for v in items:
             if v.get(key,0)>0 and len(v['kernel_reuse_examples' if title.startswith('reuse') else 'cutoff_examples'])<3:
-                shortfalls.append(title+' '+v['module'])
+                shortfall(title+' '+v['module'],v['kernel_reuse_examples' if title.startswith('reuse') else 'cutoff_examples'])
     result['example_shortfalls']=shortfalls
+    result['example_shortfall_details']=shortfall_details
+    result['example_requirement_met']=not shortfalls
     (RESULTS/'research/B2c.json').write_text(json.dumps(result,indent=2)+'\n')
-    if shortfalls:p+=['','Example coverage is incomplete for these nonzero buckets: '+', '.join(shortfalls)+'.']
+    if shortfalls:
+        p+=['','## Unmet example requirement','',
+            'All 20 measurement datasets are complete. The requirement of at least three distinct non-auxiliary examples per nonzero bucket remains unmet for the buckets below. These counts include every eligible name; repeated declaration–commit occurrences cannot supply additional distinct names. The default completion audit remains strict and cannot certify this report.','',
+            '| Bucket | Available distinct names | Required | Eligible names |','|---|---:|---:|---|']
+        for v in shortfall_details:
+            p.append(f"| {v['bucket']} | {v['available_distinct_nonauxiliary_names']} | 3 | "+'; '.join('`'+n+'`' for n in v['names'])+' |')
+        p+=['','`B2c_example_inventory.json` exhaustively inventories the measured groups in these buckets, including excluded generated names. `B2c_source_review.json` verifies all selected examples against historical source bytes. No example requirement has been waived.']
     (RESULTS/'research/B2c.md').write_text('\n'.join(p)+'\n')
     print(json.dumps({'status':'analyzed','example_shortfalls':shortfalls,'transitions':len(transitions)}))
 if __name__=='__main__':main()

@@ -1,0 +1,141 @@
+{
+  "report_SHA256": "c5f0f9dabefcc44a200a2b1f73a5d6e99225485d8aa766be586682b06e288bed",
+  "scope": "Exhaustive actual-group inventory for final report shortfalls across C2..C20",
+  "completion_requirement_waived": false,
+  "example_filter": "report.nonaux; generated instances, matchers, and hygienic names excluded",
+  "buckets": {
+    "reuse kind opaque": {
+      "mechanism": "reuse",
+      "category": "kind",
+      "value": "opaque",
+      "eligible_group_occurrences": 18,
+      "kernel_cpu_ns": 196752,
+      "names": [
+        "Backend.Proof.FlowSplit.collectSparse",
+        "iselDestructGoal"
+      ],
+      "excluded_names": [
+        "Backend.Proof.Cov.instBEqAW.beq",
+        "Backend.Proof.Cov.instReprAW.repr",
+        "Backend.Proof.DefGen.instReprA.repr",
+        "Backend.Proof.DefGen.instReprCT.repr",
+        "Backend.instReprV.repr",
+        "ext._@.FV.Backend.Proof.RegallocCSem.2222771746._hygCtx._hyg.3",
+        "extProc._@.FV.Backend.Proof.RegallocCSem.2222771746._hygCtx._hyg.3"
+      ],
+      "source_candidates": [
+        {
+          "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+          "module": "FV.Backend.Proof.IselCmpBase",
+          "kind": "opaque",
+          "name": "iselDestructGoal",
+          "K": "a3be69e52e4b4ad7c0ed4de26b1778bb276f3b117980524eb1ff29365c3e1fe4",
+          "cpu_ns": 14128
+        },
+        {
+          "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+          "module": "FV.Backend.Proof.IselCmpBase",
+          "kind": "opaque",
+          "name": "iselDestructGoal",
+          "K": "a3be69e52e4b4ad7c0ed4de26b1778bb276f3b117980524eb1ff29365c3e1fe4",
+          "cpu_ns": 11488
+        },
+        {
+          "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+          "module": "FV.Backend.Proof.IselFlowSplit",
+          "kind": "opaque",
+          "name": "Backend.Proof.FlowSplit.collectSparse",
+          "K": "8d71f636e3af02096a9fd17389aa1a0497b2391f350d2f3a2d77cf5cd8e76caf",
+          "cpu_ns": 9440
+        }
+      ],
+      "distinct_nonauxiliary_names": 2,
+      "missing_distinct_names": 1
+    },
+    "cutoff kind opaque": {
+      "mechanism": "cutoff",
+      "category": "kind",
+      "value": "opaque",
+      "eligible_group_occurrences": 10,
+      "kernel_cpu_ns": 104368,
+      "names": [
+        "iselDestructGoal"
+      ],
+      "excluded_names": [
+        "Backend.Proof.DefGen.instReprA.repr",
+        "Backend.Proof.DefGen.instReprCT.repr",
+        "Backend.instReprV.repr",
+        "ext._@.FV.Backend.Proof.RegallocCSem.2222771746._hygCtx._hyg.3",
+        "extProc._@.FV.Backend.Proof.RegallocCSem.2222771746._hygCtx._hyg.3"
+      ],
+      "source_candidates": [
+        {
+          "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+          "module": "FV.Backend.Proof.IselCmpBase",
+          "kind": "opaque",
+          "name": "iselDestructGoal",
+          "K": "a3be69e52e4b4ad7c0ed4de26b1778bb276f3b117980524eb1ff29365c3e1fe4",
+          "cpu_ns": 14128
+        }
+      ],
+      "distinct_nonauxiliary_names": 1,
+      "missing_distinct_names": 2
+    },
+    "reuse module FV.Backend.Proof.IselExcl": {
+      "mechanism": "reuse",
+      "category": "module",
+      "value": "FV.Backend.Proof.IselExcl",
+      "eligible_group_occurrences": 18,
+      "kernel_cpu_ns": 29329168288,
+      "names": [
+        "Backend.Proof.exclOk_program",
+        "Backend.Proof.excludedUnmatchable"
+      ],
+      "excluded_names": [
+        "Backend.Proof.exclOk.eq_1",
+        "Backend.Proof.exclOk_program._proof_1_1",
+        "_private.FV.Backend.Proof.IselExcl.0.Backend.Proof.exclOk.match_1.eq_1",
+        "_private.FV.Backend.Proof.IselExcl.0.Backend.Proof.exclOk.match_1.eq_2",
+        "_private.FV.Backend.Proof.IselExcl.0.Backend.Proof.exclOk.match_1.splitter",
+        "_private.FV.Backend.Proof.IselExcl.0.Backend.Proof.exclOk.match_1.splitter._sparseCasesOn_2",
+        "_private.FV.Backend.Proof.IselExcl.0.Backend.Proof.exclOk.match_1.splitter._sparseCasesOn_3"
+      ],
+      "source_candidates": [
+        {
+          "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+          "module": "FV.Backend.Proof.IselExcl",
+          "kind": "theorem",
+          "name": "Backend.Proof.exclOk_program",
+          "K": "a1b36cc27ae2721947f221691739d4822a7698a9ca66d69b34ece39fd60703d9",
+          "cpu_ns": 1564576
+        },
+        {
+          "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+          "module": "FV.Backend.Proof.IselExcl",
+          "kind": "theorem",
+          "name": "Backend.Proof.excludedUnmatchable",
+          "K": "a98897d576db6ec39c08f4f2edffd6a148156efc9f081f450b5e1105fe6873c8",
+          "cpu_ns": 1582992
+        },
+        {
+          "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+          "module": "FV.Backend.Proof.IselExcl",
+          "kind": "theorem",
+          "name": "Backend.Proof.exclOk_program",
+          "K": "a1b36cc27ae2721947f221691739d4822a7698a9ca66d69b34ece39fd60703d9",
+          "cpu_ns": 1543760
+        },
+        {
+          "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+          "module": "FV.Backend.Proof.IselExcl",
+          "kind": "theorem",
+          "name": "Backend.Proof.excludedUnmatchable",
+          "K": "a98897d576db6ec39c08f4f2edffd6a148156efc9f081f450b5e1105fe6873c8",
+          "cpu_ns": 1553808
+        }
+      ],
+      "distinct_nonauxiliary_names": 2,
+      "missing_distinct_names": 1
+    }
+  }
+}

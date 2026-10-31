@@ -1,0 +1,1745 @@
+{
+  "report_SHA256": "c5f0f9dabefcc44a200a2b1f73a5d6e99225485d8aa766be586682b06e288bed",
+  "scope": "Historical source linkage for the supplied report only; report scope and completion gates remain in force",
+  "selected_example_occurrences": 106,
+  "source_linked_examples": 106,
+  "all_selected_examples_source_linked": true,
+  "examples": [
+    {
+      "name": "Backend.Proof.brTable_shape",
+      "commit": "5018b9509dc124154dbe08a5bd85862595d8eab7",
+      "module": "FV.Backend.Proof.IselTermFactsRules",
+      "K": "ce0935664cf2ad1d4c29f934b54e892bc86a8fc30d10e077e132fba11637e276",
+      "kernel_ms": 61.352112,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselTermFactsRules"
+      ],
+      "source_file": "FV/Backend/Proof/IselTermFactsRules.lean",
+      "source_SHA256": "d02bc8a990ddd36c94a27362da08db1e7aa0188710abedcdb6bf8dbd07a0f8d1",
+      "source_line": 350,
+      "source_kind": "theorem",
+      "declaration_start": "theorem brTable_shape {p : Program} (hp : Data p) : BranchShapeOk p rule_lower_3277 := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.tbnz_shape",
+      "commit": "5018b9509dc124154dbe08a5bd85862595d8eab7",
+      "module": "FV.Backend.Proof.IselTermFactsRules",
+      "K": "23648b8a07bf31d4b9a873916a908b2d5aac316a953ce7d37ddd71894017de75",
+      "kernel_ms": 106.341344,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselTermFactsRules"
+      ],
+      "source_file": "FV/Backend/Proof/IselTermFactsRules.lean",
+      "source_SHA256": "d02bc8a990ddd36c94a27362da08db1e7aa0188710abedcdb6bf8dbd07a0f8d1",
+      "source_line": 237,
+      "source_kind": "theorem",
+      "declaration_start": "theorem tbnz_shape {p : Program} (hp : Data p) : BranchShapeOk p rule_lower_3251 := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.tbz_shape",
+      "commit": "5018b9509dc124154dbe08a5bd85862595d8eab7",
+      "module": "FV.Backend.Proof.IselTermFactsRules",
+      "K": "e2605c4bd23ff945b290ffed85a8fca758e04b7cdcc83bfdd0a244f5d0585f12",
+      "kernel_ms": 191.500256,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselTermFactsRules"
+      ],
+      "source_file": "FV/Backend/Proof/IselTermFactsRules.lean",
+      "source_SHA256": "d02bc8a990ddd36c94a27362da08db1e7aa0188710abedcdb6bf8dbd07a0f8d1",
+      "source_line": 287,
+      "source_kind": "theorem",
+      "declaration_start": "theorem tbz_shape {p : Program} (hp : Data p) : BranchShapeOk p rule_lower_3257 := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.Driver.stmtLoop",
+      "commit": "5018b9509dc124154dbe08a5bd85862595d8eab7",
+      "module": "FV.Backend.Proof.LowerLoopRun",
+      "K": "e26824c97f68a44cdbcc847c7752f0c3b9797a771bfe0192a80cdb2bf678825b",
+      "kernel_ms": 14801.26088,
+      "buckets": [
+        "overall reuse",
+        "kernel_reuse_by_kind: theorem",
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.LowerLoopRun"
+      ],
+      "source_file": "FV/Backend/Proof/LowerLoopRun.lean",
+      "source_SHA256": "7b6f4f7e39792ac293e4c868a0aec7573eb9955c4a87f7ef56a417e1ca16f4bc",
+      "source_line": 246,
+      "source_kind": "theorem",
+      "declaration_start": "theorem stmtLoop {f : Clif.Function} {ctx : Ctx} {ranges : Array (Nat \u00d7 Nat)} {st0 : LState}",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.Driver.termPart_ok",
+      "commit": "5018b9509dc124154dbe08a5bd85862595d8eab7",
+      "module": "FV.Backend.Proof.LowerLoopRun",
+      "K": "cf8a43c25a74c23fd9d2efeb430f9b7b430a026a38078e98743fb120803d9f33",
+      "kernel_ms": 14458.266832,
+      "buckets": [
+        "overall reuse",
+        "kernel_reuse_by_kind: theorem",
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.LowerLoopRun"
+      ],
+      "source_file": "FV/Backend/Proof/LowerLoopRun.lean",
+      "source_SHA256": "7b6f4f7e39792ac293e4c868a0aec7573eb9955c4a87f7ef56a417e1ca16f4bc",
+      "source_line": 972,
+      "source_kind": "theorem",
+      "declaration_start": "theorem termPart_ok {f : Clif.Function} {ctx : Ctx} {ranges : Array (Nat \u00d7 Nat)} {st0 : LState}",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.Driver.termTry",
+      "commit": "5018b9509dc124154dbe08a5bd85862595d8eab7",
+      "module": "FV.Backend.Proof.LowerLoopRun",
+      "K": "543241364ddd07ef9f8a5950b845b58fa85cadf97ba7ac7d1e3e2833cf048de5",
+      "kernel_ms": 13983.829344,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.LowerLoopRun"
+      ],
+      "source_file": "FV/Backend/Proof/LowerLoopRun.lean",
+      "source_SHA256": "7b6f4f7e39792ac293e4c868a0aec7573eb9955c4a87f7ef56a417e1ca16f4bc",
+      "source_line": 887,
+      "source_kind": "theorem",
+      "declaration_start": "theorem termTry {f : Clif.Function} {ctx : Ctx} {ranges : Array (Nat \u00d7 Nat)} {st0 : LState}",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Insn",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Backend.Asm",
+      "K": "1340fb82d941ea4390b11b29ce9ccd1b6176bff168172c85dafd4f4741a6655c",
+      "kernel_ms": 4.01296,
+      "buckets": [
+        "cutoff_kernel_by_kind: inductive"
+      ],
+      "source_file": "FV/Backend/Asm.lean",
+      "source_SHA256": "11dcba2076a3185f3a4ef80073272212c7fdcded7c28f6aa7603e5c18757f129",
+      "source_line": 59,
+      "source_kind": "inductive",
+      "declaration_start": "inductive Insn where",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Insn.armFields",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Backend.Encode",
+      "K": "68678a16dce0b4aceb294a916ac2012678d92629b6054c2973f8610dcdbe584b",
+      "kernel_ms": 1.987296,
+      "buckets": [
+        "cutoff_kernel_by_kind: definition"
+      ],
+      "source_file": "FV/Backend/Encode.lean",
+      "source_SHA256": "55ec20591f95b6ca9a92cae605cfac649a796b9190fbdeacd63e5d86caa14970",
+      "source_line": 447,
+      "source_kind": "def",
+      "declaration_start": "def Insn.armFields (env : Env) (i : Insn) : Except String ArmInst := do",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.armBits",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Backend.Encode",
+      "K": "434faccb0783f77b8476327099e19510194b4d168ef0ed838722c4c3871685bd",
+      "kernel_ms": 1.59304,
+      "buckets": [
+        "cutoff_kernel_by_kind: definition"
+      ],
+      "source_file": "FV/Backend/Encode.lean",
+      "source_SHA256": "55ec20591f95b6ca9a92cae605cfac649a796b9190fbdeacd63e5d86caa14970",
+      "source_line": 107,
+      "source_kind": "def",
+      "declaration_start": "def armBits : ArmInst \u2192 BitVec 32",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.lowerFunction",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Backend.Isel",
+      "K": "98aaf57aa7f6f35c30128041ac24d4e7eb80a7ac79a189f224cfc3849e986a63",
+      "kernel_ms": 1.322912,
+      "buckets": [
+        "kernel_reuse_by_kind: definition",
+        "cutoff_kernel_by_kind: definition"
+      ],
+      "source_file": "FV/Backend/Isel.lean",
+      "source_SHA256": "691c090c71ed75cc8087bcbaf074567ef112e1b806297c9d3e53604ece3ebeda",
+      "source_line": 1455,
+      "source_kind": "def",
+      "declaration_start": "def lowerFunction (f : Clif.Function) : Except String VCode := do",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.formOk_mapRegs",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Backend.Proof.CSemRename",
+      "K": "24443331be4f5dfdd87fe8ab94221be82e3537386e09c96b4e2497ebb014c5d2",
+      "kernel_ms": 1318.090784,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Backend.Proof.CSemRename"
+      ],
+      "source_file": "FV/Backend/Proof/CSemRename.lean",
+      "source_SHA256": "d61fb2718da9be634c2d7eaf3ef8e3cafe4de649a0be29a900c991a943c22558",
+      "source_line": 126,
+      "source_kind": "theorem",
+      "declaration_start": "theorem formOk_mapRegs (hg : VRenaming g gn) (ctx : FnCtx) (i : MInst) :",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.ispec_mapRegs",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Backend.Proof.CSemRename",
+      "K": "1f77eefd7c269d0ddbcecc4ff69cb8fe30c7d9b66fb129a88c163fa969b3488b",
+      "kernel_ms": 22922.650112,
+      "buckets": [
+        "cutoff_kernel_by_kind: theorem",
+        "top_20_module_cutoff_modules: FV.Backend.Proof.CSemRename"
+      ],
+      "source_file": "FV/Backend/Proof/CSemRename.lean",
+      "source_SHA256": "d61fb2718da9be634c2d7eaf3ef8e3cafe4de649a0be29a900c991a943c22558",
+      "source_line": 50,
+      "source_kind": "theorem",
+      "declaration_start": "theorem ispec_mapRegs (i : MInst) : ispec (i.mapRegs g) us w = ispec i us w := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.mspec_mapRegs",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Backend.Proof.CSemRename",
+      "K": "e7e4c9242a3ec6cd5b97ae2cf0511f9e74782626b01ebb0aeb94d8c4772f6e95",
+      "kernel_ms": 540.633376,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Backend.Proof.CSemRename"
+      ],
+      "source_file": "FV/Backend/Proof/CSemRename.lean",
+      "source_SHA256": "d61fb2718da9be634c2d7eaf3ef8e3cafe4de649a0be29a900c991a943c22558",
+      "source_line": 219,
+      "source_kind": "theorem",
+      "declaration_start": "theorem mspec_mapRegs (hg : VRenaming g gn) (sb : Nat) (i : MInst) (us : List CV) (w : Arm.ArmState) :",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.program_term_1979",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Backend.Proof.IselData",
+      "K": "5e3e35c1c147d571cc61279c342e701a8e854bdd4037a3fae8199ebf7c481daa",
+      "kernel_ms": 292.79512,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselData"
+      ],
+      "source_file": "FV/Backend/Proof/IselData.lean",
+      "source_SHA256": "4e88c0b032a0e706f900e1df0336aab61d1487d888f081a5ad47e52e6915c4f7",
+      "source_line": 3288,
+      "source_kind": "theorem",
+      "declaration_start": "theorem program_term_1979 : Interp.termOf program 1979 = pure T.\u00abALUOp.Asr\u00bb := rfl",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.program_term_2269",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Backend.Proof.IselData",
+      "K": "ae8049513961f156b707e15c931c363285e6fda8d18d7cc497112fc1caafcc6a",
+      "kernel_ms": 108.554048,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselData"
+      ],
+      "source_file": "FV/Backend/Proof/IselData.lean",
+      "source_SHA256": "4e88c0b032a0e706f900e1df0336aab61d1487d888f081a5ad47e52e6915c4f7",
+      "source_line": 3434,
+      "source_kind": "theorem",
+      "declaration_start": "theorem program_term_2269 : Interp.termOf program 2269 = pure T.\u00abIntCC.Equal\u00bb := rfl",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.program_term_2470",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Backend.Proof.IselData",
+      "K": "27f211fe437e6913c338d795f54f9affdf98947967abc59f784dfdd8684b6f79",
+      "kernel_ms": 108.525248,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselData"
+      ],
+      "source_file": "FV/Backend/Proof/IselData.lean",
+      "source_SHA256": "4e88c0b032a0e706f900e1df0336aab61d1487d888f081a5ad47e52e6915c4f7",
+      "source_line": 3550,
+      "source_kind": "theorem",
+      "declaration_start": "theorem program_term_2470 : Interp.termOf program 2470 = pure T.\u00abInstructionData.StoreNoOffset\u00bb := rfl",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.FlowSplit.collectSparse",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Backend.Proof.IselFlowSplit",
+      "K": "8d71f636e3af02096a9fd17389aa1a0497b2391f350d2f3a2d77cf5cd8e76caf",
+      "kernel_ms": 0.00944,
+      "buckets": [
+        "kernel_reuse_by_kind: opaque"
+      ],
+      "source_file": "FV/Backend/Proof/IselFlowSplit.lean",
+      "source_SHA256": "57e4dcfbf3c7a7ef45ea326c3d1b94ee0128ae5a0e94c47043c056e10c035e8b",
+      "source_line": 59,
+      "source_kind": "def",
+      "declaration_start": "partial def collectSparse (env : Environment) (e : Lean.Expr) : Array Lean.Expr :=",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Isle.Interp.USoundAt",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Backend.Proof.KillGen",
+      "K": "b31c017732f05ec87208ecb539dffa75936e843e8c19ad22e6c1082f28d66644",
+      "kernel_ms": 5.063072,
+      "buckets": [
+        "cutoff_kernel_by_kind: inductive"
+      ],
+      "source_file": "FV/Backend/Proof/KillGen.lean",
+      "source_SHA256": "ebff6e88a34439c7a2f6c966084f35bd1186a5c1e5ab6aad447e28294d1935e0",
+      "source_line": 367,
+      "source_kind": "structure",
+      "declaration_start": "structure USoundAt (n : Nat) : Prop where",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.corr_csetm",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Backend.Proof.RegallocAtomic",
+      "K": "09844585f430d4e7efb475444b788140b514a326d872b2f5c900375f67325c7f",
+      "kernel_ms": 139.741232,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Backend.Proof.RegallocAtomic"
+      ],
+      "source_file": "FV/Backend/Proof/RegallocAtomic.lean",
+      "source_SHA256": "dfb436f8d33ce1320b322cc788fb695a9b37c1de4661a77af3f3c8254d99087a",
+      "source_line": 145,
+      "source_kind": "theorem",
+      "declaration_start": "theorem corr_csetm (F : BitVec 64 \u2192 Prop) (ctx : FnCtx) (env : Env) (c : Cond) (d : Nat) :",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.corr_loadAcquire",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Backend.Proof.RegallocAtomic",
+      "K": "e6ab59b562d48a91729c868c4ef7f423083cf2ccac0616307ad9c8f8ee88022b",
+      "kernel_ms": 40.021392,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Backend.Proof.RegallocAtomic"
+      ],
+      "source_file": "FV/Backend/Proof/RegallocAtomic.lean",
+      "source_SHA256": "dfb436f8d33ce1320b322cc788fb695a9b37c1de4661a77af3f3c8254d99087a",
+      "source_line": 129,
+      "source_kind": "theorem",
+      "declaration_start": "theorem corr_loadAcquire (F : BitVec 64 \u2192 Prop) (ctx : FnCtx) (env : Env) (ty : CTy)",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.corr_storeRelease",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Backend.Proof.RegallocAtomic",
+      "K": "8867f15c886c59d6da2deaf2a48168deb3392063f5b49d417ba0c99f38741772",
+      "kernel_ms": 33.589984,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Backend.Proof.RegallocAtomic"
+      ],
+      "source_file": "FV/Backend/Proof/RegallocAtomic.lean",
+      "source_SHA256": "dfb436f8d33ce1320b322cc788fb695a9b37c1de4661a77af3f3c8254d99087a",
+      "source_line": 137,
+      "source_kind": "theorem",
+      "declaration_start": "theorem corr_storeRelease (F : BitVec 64 \u2192 Prop) (ctx : FnCtx) (env : Env) (ty : CTy)",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.formOk_fpuLoad",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Backend.Proof.RegallocCover",
+      "K": "9a50acca96bd21494d361b175ca4d57682c0fa18afcbe78e8ab8bfdbd1d50d1f",
+      "kernel_ms": 86.441632,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Backend.Proof.RegallocCover"
+      ],
+      "source_file": "FV/Backend/Proof/RegallocCover.lean",
+      "source_SHA256": "677d6de5a02cf417f33acaccafb6a984a01bf34ac583e278373a84529a1c13bb",
+      "source_line": 338,
+      "source_kind": "theorem",
+      "declaration_start": "theorem formOk_fpuLoad {F : BitVec 64 \u2192 Prop} {ctx : FnCtx} {X : ExtSem} {sz : ScalarSize}",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.formOk_sound",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Backend.Proof.RegallocCover",
+      "K": "c14b47c52dc5aa3785c47704c7758dcf633981d1b71d380dd981cb709e51a974",
+      "kernel_ms": 499.784736,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Backend.Proof.RegallocCover"
+      ],
+      "source_file": "FV/Backend/Proof/RegallocCover.lean",
+      "source_SHA256": "677d6de5a02cf417f33acaccafb6a984a01bf34ac583e278373a84529a1c13bb",
+      "source_line": 364,
+      "source_kind": "theorem",
+      "declaration_start": "theorem formOk_sound {F : BitVec 64 \u2192 Prop} {ctx : FnCtx} {X : ExtSem} {i : MInst}",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.formOk_store",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Backend.Proof.RegallocCover",
+      "K": "ddbb4d6461f9d126dfab9eb695f722f76c6a6d4cc153f00983ed9308c92cce08",
+      "kernel_ms": 85.77512,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Backend.Proof.RegallocCover"
+      ],
+      "source_file": "FV/Backend/Proof/RegallocCover.lean",
+      "source_SHA256": "677d6de5a02cf417f33acaccafb6a984a01bf34ac583e278373a84529a1c13bb",
+      "source_line": 281,
+      "source_kind": "theorem",
+      "declaration_start": "theorem formOk_store {F : BitVec 64 \u2192 Prop} {ctx : FnCtx} {X : ExtSem} {op : StoreOp} {d : Nat}",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Opt.Proof.ok_rule_arithmetic_424",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Opt.Proof.RuleArithP1",
+      "K": "288b867eafdebb21e2384876fe4db1d759929fc0a2d30c69d42816dc954da05e",
+      "kernel_ms": 184.44264,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Opt.Proof.RuleArithP1"
+      ],
+      "source_file": "FV/Opt/Proof/RuleArithP1.lean",
+      "source_SHA256": "04d5991e2fa97866caee52607a218790a7578df0dd9afa132a634fdce760ecd6",
+      "source_line": 76,
+      "source_kind": "theorem",
+      "declaration_start": "theorem ok_rule_arithmetic_424 {p : Isle.Program} (hd : Data p) : RuleOk p rule_arithmetic_424 := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Opt.Proof.ok_rule_arithmetic_498",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Opt.Proof.RuleArithP1",
+      "K": "d7c4196cca3d90acb5d3043cda5e9a87c6a3dada6e20745cf08737772a112a62",
+      "kernel_ms": 150.408336,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Opt.Proof.RuleArithP1"
+      ],
+      "source_file": "FV/Opt/Proof/RuleArithP1.lean",
+      "source_SHA256": "04d5991e2fa97866caee52607a218790a7578df0dd9afa132a634fdce760ecd6",
+      "source_line": 108,
+      "source_kind": "theorem",
+      "declaration_start": "theorem ok_rule_arithmetic_498 {p : Isle.Program} (hd : Data p) : RuleOk p rule_arithmetic_498 := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Opt.Proof.ok_rule_arithmetic_556",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Opt.Proof.RuleArithP1",
+      "K": "91f89128453ea95f198202679d143a36de9be5fb6c5dee224e0f51e996e5bf06",
+      "kernel_ms": 161.935568,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Opt.Proof.RuleArithP1"
+      ],
+      "source_file": "FV/Opt/Proof/RuleArithP1.lean",
+      "source_SHA256": "04d5991e2fa97866caee52607a218790a7578df0dd9afa132a634fdce760ecd6",
+      "source_line": 144,
+      "source_kind": "theorem",
+      "declaration_start": "theorem ok_rule_arithmetic_556 {p : Isle.Program} (hd : Data p) : RuleOk p rule_arithmetic_556 := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Opt.Proof.ok_rule_arithmetic_312",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Opt.Proof.RuleArithP2",
+      "K": "6dbb1285e2d0a432696c05046291b6c47ee0b89b9361d8daec58e1149a2d639e",
+      "kernel_ms": 153.575632,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Opt.Proof.RuleArithP2"
+      ],
+      "source_file": "FV/Opt/Proof/RuleArithP2.lean",
+      "source_SHA256": "5a9514c79a50b3561dd08c6acf7885a4ec65a5bc24bf54b39a86f365babe0739",
+      "source_line": 40,
+      "source_kind": "theorem",
+      "declaration_start": "theorem ok_rule_arithmetic_312 {p : Isle.Program} (hd : Data p) : RuleOk p rule_arithmetic_312 := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Opt.Proof.ok_rule_arithmetic_506",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Opt.Proof.RuleArithP2",
+      "K": "34b0b573729f3ea77f14e68ffe464c10b0e629739120ce61d6031fc81832fe10",
+      "kernel_ms": 162.72016,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Opt.Proof.RuleArithP2"
+      ],
+      "source_file": "FV/Opt/Proof/RuleArithP2.lean",
+      "source_SHA256": "5a9514c79a50b3561dd08c6acf7885a4ec65a5bc24bf54b39a86f365babe0739",
+      "source_line": 112,
+      "source_kind": "theorem",
+      "declaration_start": "theorem ok_rule_arithmetic_506 {p : Isle.Program} (hd : Data p) : RuleOk p rule_arithmetic_506 := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Opt.Proof.ok_rule_arithmetic_512",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Opt.Proof.RuleArithP2",
+      "K": "b7a80a3e2ae1a728f09d021efe00c641af96538bec9a5b4c35e54f97e3b20f6a",
+      "kernel_ms": 152.577536,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Opt.Proof.RuleArithP2"
+      ],
+      "source_file": "FV/Opt/Proof/RuleArithP2.lean",
+      "source_SHA256": "5a9514c79a50b3561dd08c6acf7885a4ec65a5bc24bf54b39a86f365babe0739",
+      "source_line": 116,
+      "source_kind": "theorem",
+      "declaration_start": "theorem ok_rule_arithmetic_512 {p : Isle.Program} (hd : Data p) : RuleOk p rule_arithmetic_512 := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Opt.Proof.ok_rule_arithmetic_520",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Opt.Proof.RuleArithP3",
+      "K": "e8c35e613daa2df977d0078a72fe0b38e64f4836f18bbb2663dd0e726ba3e203",
+      "kernel_ms": 161.040992,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Opt.Proof.RuleArithP3"
+      ],
+      "source_file": "FV/Opt/Proof/RuleArithP3.lean",
+      "source_SHA256": "9bd668c70d55f8f3fb2cbd4b181f6e3b10d01b275ceb183d71b81c89658cca45",
+      "source_line": 120,
+      "source_kind": "theorem",
+      "declaration_start": "theorem ok_rule_arithmetic_520 {p : Isle.Program} (hd : Data p) : RuleOk p rule_arithmetic_520 := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Opt.Proof.ok_rule_arithmetic_526",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Opt.Proof.RuleArithP3",
+      "K": "360e855c7e01714f9be4c1798a9a7f3eedc1e271c17c94fa26f621f53de9f311",
+      "kernel_ms": 161.644448,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Opt.Proof.RuleArithP3"
+      ],
+      "source_file": "FV/Opt/Proof/RuleArithP3.lean",
+      "source_SHA256": "9bd668c70d55f8f3fb2cbd4b181f6e3b10d01b275ceb183d71b81c89658cca45",
+      "source_line": 124,
+      "source_kind": "theorem",
+      "declaration_start": "theorem ok_rule_arithmetic_526 {p : Isle.Program} (hd : Data p) : RuleOk p rule_arithmetic_526 := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Opt.Proof.ok_rule_arithmetic_532",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Opt.Proof.RuleArithP3",
+      "K": "d73a8d1affa8c49cd65f02339231d1ff4ffe676c920bc67e537aa52cfe8a7649",
+      "kernel_ms": 151.676,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Opt.Proof.RuleArithP3"
+      ],
+      "source_file": "FV/Opt/Proof/RuleArithP3.lean",
+      "source_SHA256": "9bd668c70d55f8f3fb2cbd4b181f6e3b10d01b275ceb183d71b81c89658cca45",
+      "source_line": 128,
+      "source_kind": "theorem",
+      "declaration_start": "theorem ok_rule_arithmetic_532 {p : Isle.Program} (hd : Data p) : RuleOk p rule_arithmetic_532 := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Opt.Proof.ok_rule_arithmetic_307",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Opt.Proof.RuleArithP4",
+      "K": "714787cc71d576c7e0e69d39641f071899c6a922cbdb134b8f5020dfc4191348",
+      "kernel_ms": 197.591104,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Opt.Proof.RuleArithP4"
+      ],
+      "source_file": "FV/Opt/Proof/RuleArithP4.lean",
+      "source_SHA256": "eba186043b9c0c67738df8c98b832f7dd82e5e08aeec2c87f7a871f3dda417a0",
+      "source_line": 36,
+      "source_kind": "theorem",
+      "declaration_start": "theorem ok_rule_arithmetic_307 {p : Isle.Program} (hd : Data p) : RuleOk p rule_arithmetic_307 := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Opt.Proof.ok_rule_arithmetic_323",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Opt.Proof.RuleArithP4",
+      "K": "e4d67b4a043e6a50d4201adf6740787fe00725fcb1f214fc1660c7aa56840ba1",
+      "kernel_ms": 195.83144,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Opt.Proof.RuleArithP4"
+      ],
+      "source_file": "FV/Opt/Proof/RuleArithP4.lean",
+      "source_SHA256": "eba186043b9c0c67738df8c98b832f7dd82e5e08aeec2c87f7a871f3dda417a0",
+      "source_line": 44,
+      "source_kind": "theorem",
+      "declaration_start": "theorem ok_rule_arithmetic_323 {p : Isle.Program} (hd : Data p) : RuleOk p rule_arithmetic_323 := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Opt.Proof.ok_rule_arithmetic_572",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Opt.Proof.RuleArithP4",
+      "K": "c168337b6061852cb56f4a239045323a063f6b6f9da3cd149eb0c0d15d28a239",
+      "kernel_ms": 164.273392,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Opt.Proof.RuleArithP4"
+      ],
+      "source_file": "FV/Opt/Proof/RuleArithP4.lean",
+      "source_SHA256": "eba186043b9c0c67738df8c98b832f7dd82e5e08aeec2c87f7a871f3dda417a0",
+      "source_line": 152,
+      "source_kind": "theorem",
+      "declaration_start": "theorem ok_rule_arithmetic_572 {p : Isle.Program} (hd : Data p) : RuleOk p rule_arithmetic_572 := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Opt.Proof.ok_rule_arithmetic_233",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Opt.Proof.RuleArithP5",
+      "K": "3189058025eee297a390d6a3964c1a576d0cbcc8388fda5ec914b21c712014b9",
+      "kernel_ms": 157.849872,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Opt.Proof.RuleArithP5"
+      ],
+      "source_file": "FV/Opt/Proof/RuleArithP5.lean",
+      "source_SHA256": "d71ea9415d640d57e19320634d8cd3a44c9021c855b893a8dd5b99e3d5eacafe",
+      "source_line": 24,
+      "source_kind": "theorem",
+      "declaration_start": "theorem ok_rule_arithmetic_233 {p : Isle.Program} (hd : Data p) : RuleOk p rule_arithmetic_233 := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Opt.Proof.ok_rule_arithmetic_308",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Opt.Proof.RuleArithP5",
+      "K": "cfe0b1f8f9059efca912c1e54e74a65a6f8d83fbbbae0a9acd13338d201d8bd7",
+      "kernel_ms": 197.693664,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Opt.Proof.RuleArithP5"
+      ],
+      "source_file": "FV/Opt/Proof/RuleArithP5.lean",
+      "source_SHA256": "d71ea9415d640d57e19320634d8cd3a44c9021c855b893a8dd5b99e3d5eacafe",
+      "source_line": 36,
+      "source_kind": "theorem",
+      "declaration_start": "theorem ok_rule_arithmetic_308 {p : Isle.Program} (hd : Data p) : RuleOk p rule_arithmetic_308 := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Opt.Proof.ok_rule_arithmetic_324",
+      "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+      "module": "FV.Opt.Proof.RuleArithP5",
+      "K": "ef2d21a19d7e433b03b5ddf3c11d74920f582b785a94dab6d048195ad060ac17",
+      "kernel_ms": 195.759728,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Opt.Proof.RuleArithP5"
+      ],
+      "source_file": "FV/Opt/Proof/RuleArithP5.lean",
+      "source_SHA256": "d71ea9415d640d57e19320634d8cd3a44c9021c855b893a8dd5b99e3d5eacafe",
+      "source_line": 44,
+      "source_kind": "theorem",
+      "declaration_start": "theorem ok_rule_arithmetic_324 {p : Isle.Program} (hd : Data p) : RuleOk p rule_arithmetic_324 := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Insn.armFields",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Encode",
+      "K": "68678a16dce0b4aceb294a916ac2012678d92629b6054c2973f8610dcdbe584b",
+      "kernel_ms": 2.0588,
+      "buckets": [
+        "kernel_reuse_by_kind: definition"
+      ],
+      "source_file": "FV/Backend/Encode.lean",
+      "source_SHA256": "55ec20591f95b6ca9a92cae605cfac649a796b9190fbdeacd63e5d86caa14970",
+      "source_line": 447,
+      "source_kind": "def",
+      "declaration_start": "def Insn.armFields (env : Env) (i : Insn) : Except String ArmInst := do",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.armBits",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Encode",
+      "K": "434faccb0783f77b8476327099e19510194b4d168ef0ed838722c4c3871685bd",
+      "kernel_ms": 1.6724,
+      "buckets": [
+        "kernel_reuse_by_kind: definition"
+      ],
+      "source_file": "FV/Backend/Encode.lean",
+      "source_SHA256": "55ec20591f95b6ca9a92cae605cfac649a796b9190fbdeacd63e5d86caa14970",
+      "source_line": 107,
+      "source_kind": "def",
+      "declaration_start": "def armBits : ArmInst \u2192 BitVec 32",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.formOk_mapRegs",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.CSemRename",
+      "K": "24443331be4f5dfdd87fe8ab94221be82e3537386e09c96b4e2497ebb014c5d2",
+      "kernel_ms": 1363.305584,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.CSemRename"
+      ],
+      "source_file": "FV/Backend/Proof/CSemRename.lean",
+      "source_SHA256": "d61fb2718da9be634c2d7eaf3ef8e3cafe4de649a0be29a900c991a943c22558",
+      "source_line": 126,
+      "source_kind": "theorem",
+      "declaration_start": "theorem formOk_mapRegs (hg : VRenaming g gn) (ctx : FnCtx) (i : MInst) :",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.ispec_mapRegs",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.CSemRename",
+      "K": "1f77eefd7c269d0ddbcecc4ff69cb8fe30c7d9b66fb129a88c163fa969b3488b",
+      "kernel_ms": 23673.074848,
+      "buckets": [
+        "overall reuse",
+        "kernel_reuse_by_kind: theorem",
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.CSemRename"
+      ],
+      "source_file": "FV/Backend/Proof/CSemRename.lean",
+      "source_SHA256": "d61fb2718da9be634c2d7eaf3ef8e3cafe4de649a0be29a900c991a943c22558",
+      "source_line": 50,
+      "source_kind": "theorem",
+      "declaration_start": "theorem ispec_mapRegs (i : MInst) : ispec (i.mapRegs g) us w = ispec i us w := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.mspec_mapRegs",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.CSemRename",
+      "K": "e7e4c9242a3ec6cd5b97ae2cf0511f9e74782626b01ebb0aeb94d8c4772f6e95",
+      "kernel_ms": 560.630384,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.CSemRename"
+      ],
+      "source_file": "FV/Backend/Proof/CSemRename.lean",
+      "source_SHA256": "d61fb2718da9be634c2d7eaf3ef8e3cafe4de649a0be29a900c991a943c22558",
+      "source_line": 219,
+      "source_kind": "theorem",
+      "declaration_start": "theorem mspec_mapRegs (hg : VRenaming g gn) (sb : Nat) (i : MInst) (us : List CV) (w : Arm.ArmState) :",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.DefGen.defTab_termOk",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.DefGenTab",
+      "K": "432bdf0dd2592d2688a7aea426947f30a8b7a6ba514d10e80c916930e3802979",
+      "kernel_ms": 35.866704,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.DefGenTab",
+        "top_20_module_cutoff_modules: FV.Backend.Proof.DefGenTab"
+      ],
+      "source_file": "FV/Backend/Proof/DefGenTab.lean",
+      "source_SHA256": "40d9474678aff83bfba1d2d8bd30d59f030f7697e0722a4d142a34f64303dafb",
+      "source_line": 41,
+      "source_kind": "theorem",
+      "declaration_start": "theorem defTab_termOk : defTab.all termOkB = true := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.DefGen.rootLower_ok",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.DefGenTab",
+      "K": "934dab2e210c2bd46c89bb0715b4521f1d70e117a6f9ff6a014012d5bca465bc",
+      "kernel_ms": 18.782048,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.DefGenTab",
+        "top_20_module_cutoff_modules: FV.Backend.Proof.DefGenTab"
+      ],
+      "source_file": "FV/Backend/Proof/DefGenTab.lean",
+      "source_SHA256": "40d9474678aff83bfba1d2d8bd30d59f030f7697e0722a4d142a34f64303dafb",
+      "source_line": 69,
+      "source_kind": "theorem",
+      "declaration_start": "theorem rootLower_ok : (program.rulesOf TId.lower).all (fun rl => defExcl.contains rl.id ||",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.DefGen.tabOK",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.DefGenTab",
+      "K": "e9ec7c7ad44024b098653635b522c04937d16c640b6c0fbde9d6ad0a8a36a07a",
+      "kernel_ms": 0.838064,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.DefGenTab",
+        "top_20_module_cutoff_modules: FV.Backend.Proof.DefGenTab"
+      ],
+      "source_file": "FV/Backend/Proof/DefGenTab.lean",
+      "source_SHA256": "40d9474678aff83bfba1d2d8bd30d59f030f7697e0722a4d142a34f64303dafb",
+      "source_line": 47,
+      "source_kind": "theorem",
+      "declaration_start": "theorem tabOK : TabOK program defT := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "iselDestructGoal",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselCmpBase",
+      "K": "a3be69e52e4b4ad7c0ed4de26b1778bb276f3b117980524eb1ff29365c3e1fe4",
+      "kernel_ms": 0.014128,
+      "buckets": [
+        "kernel_reuse_by_kind: opaque",
+        "cutoff_kernel_by_kind: opaque"
+      ],
+      "source_file": "FV/Backend/Proof/IselCmpBase.lean",
+      "source_SHA256": "b0d191044ffcb1ec44575cb1302e43efef591866c509d0f86e14fb0145259771",
+      "source_line": 272,
+      "source_kind": "def",
+      "declaration_start": "partial def iselDestructGoal (ors : Bool) (goal : MVarId) : MetaM (List MVarId) := goal.withContext do",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.emit_icmp_okT",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselCmpEmit",
+      "K": "d78037b918d69a2b455fc1d917d6a334e1e674e229ae68fef1e28bbed6d943cb",
+      "kernel_ms": 531.136,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Backend.Proof.IselCmpEmit"
+      ],
+      "source_file": "FV/Backend/Proof/IselCmpEmit.lean",
+      "source_SHA256": "9b1b2ba46c3e6ae0caab15f1212849dfd54f725273f8a9859560ea2d32dd8955",
+      "source_line": 650,
+      "source_kind": "theorem",
+      "declaration_start": "theorem emit_icmp_okT {F : BitVec 64 \u2192 Prop} {isem : Sem} (hR : Refines F isem) {f : Clif.Function}",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.lower_extend_op_ok",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselCmpEmit",
+      "K": "b8d3b626f668d021795ec324bf8caff3f34798219b7ca134a7a245cf0a5ac5cd",
+      "kernel_ms": 20.249712,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Backend.Proof.IselCmpEmit"
+      ],
+      "source_file": "FV/Backend/Proof/IselCmpEmit.lean",
+      "source_SHA256": "9b1b2ba46c3e6ae0caab15f1212849dfd54f725273f8a9859560ea2d32dd8955",
+      "source_line": 636,
+      "source_kind": "theorem",
+      "declaration_start": "theorem lower_extend_op_ok {n : Nat} (hn : 40 \u2264 n) {t : CTy} {ai : Nat}",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.mkVariant_intcc",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselCmpEmit",
+      "K": "614a8e3d2d6f3996caa501706aa786dc2f991e06fbd99525e8fdf3a867831d1e",
+      "kernel_ms": 42.812832,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Backend.Proof.IselCmpEmit"
+      ],
+      "source_file": "FV/Backend/Proof/IselCmpEmit.lean",
+      "source_SHA256": "9b1b2ba46c3e6ae0caab15f1212849dfd54f725273f8a9859560ea2d32dd8955",
+      "source_line": 24,
+      "source_kind": "theorem",
+      "declaration_start": "theorem mkVariant_intcc (cc : Clif.IntCC) :",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.cri_ok",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselCmpIcmp",
+      "K": "a1495c2a49a68f59554f45db93498a17505e05fcd72b4d185831df7fe6748891",
+      "kernel_ms": 67.23264,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Backend.Proof.IselCmpIcmp"
+      ],
+      "source_file": "FV/Backend/Proof/IselCmpIcmp.lean",
+      "source_SHA256": "c252fc3043a1cce58a52fa058cb662c261ae5a1bf60a241736e897bf8a08190f",
+      "source_line": 77,
+      "source_kind": "theorem",
+      "declaration_start": "theorem cri_ok {n : Nat} (hn : 40 \u2264 n) {c : V} {P : Nat \u2192 Prop} (hsh : CondShape c P)",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.is_nonzero_okT",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselCmpIcmp",
+      "K": "5af398d1cf0605d6ed4a8042ed6d6b2d05e16ff2e7bf4dd0802c869c9552ba44",
+      "kernel_ms": 993.429328,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Backend.Proof.IselCmpIcmp"
+      ],
+      "source_file": "FV/Backend/Proof/IselCmpIcmp.lean",
+      "source_SHA256": "c252fc3043a1cce58a52fa058cb662c261ae5a1bf60a241736e897bf8a08190f",
+      "source_line": 198,
+      "source_kind": "theorem",
+      "declaration_start": "theorem is_nonzero_okT {F : BitVec 64 \u2192 Prop} {isem : Sem} (hR : Refines F isem) {f : Clif.Function}",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.setsFlags_tst255",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselCmpIcmp",
+      "K": "e84f9cbf1664296110e8c47ba75078dcdc1bb9c17e9f831edba57c3e2b9c415c",
+      "kernel_ms": 38.729776,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Backend.Proof.IselCmpIcmp"
+      ],
+      "source_file": "FV/Backend/Proof/IselCmpIcmp.lean",
+      "source_SHA256": "c252fc3043a1cce58a52fa058cb662c261ae5a1bf60a241736e897bf8a08190f",
+      "source_line": 138,
+      "source_kind": "theorem",
+      "declaration_start": "theorem setsFlags_tst255 (x : Nat) (\u03c1 : Nat \u2192 CV) :",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.branchOk_runTerm",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselContract",
+      "K": "3dcc6b76d3c69576616f6a2086be35fcce86c5bba76eeaa61e8c87a6b8ec48d9",
+      "kernel_ms": 13863.029136,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselContract"
+      ],
+      "source_file": "FV/Backend/Proof/IselContract.lean",
+      "source_SHA256": "7af35b1e8cd48441b4d2c275fb2a1431e1305be804687157b86b225fef4c6577",
+      "source_line": 2083,
+      "source_kind": "theorem",
+      "declaration_start": "theorem branchOk_runTerm (hrules : BranchRulesCorrect program)",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.lowerInstOk_runTerm",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselContract",
+      "K": "417b15348b4a18e2bec2f6058716b15372b8ee6a6d0abdee4aeaf9ae2ec43fef",
+      "kernel_ms": 13752.139488,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselContract"
+      ],
+      "source_file": "FV/Backend/Proof/IselContract.lean",
+      "source_SHA256": "7af35b1e8cd48441b4d2c275fb2a1431e1305be804687157b86b225fef4c6577",
+      "source_line": 1877,
+      "source_kind": "theorem",
+      "declaration_start": "theorem lowerInstOk_runTerm (hrules : LowerRulesCorrect program)",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.tryIndOk_runTerm",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselContract",
+      "K": "65f53caaced402f3cc8bd6c48806eaa1aadcb7cd0fc5a05cc5fe4cf108c3d140",
+      "kernel_ms": 13818.537392,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselContract"
+      ],
+      "source_file": "FV/Backend/Proof/IselContract.lean",
+      "source_SHA256": "7af35b1e8cd48441b4d2c275fb2a1431e1305be804687157b86b225fef4c6577",
+      "source_line": 2382,
+      "source_kind": "theorem",
+      "declaration_start": "theorem tryIndOk_runTerm (hrules : TryIndRulesCorrect program) (hun : TryIndUnmatchable program)",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.lowerInstOkP_runTerm",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselContractP",
+      "K": "9e79f29e0e4cdd3086eb231245c990b875c7407addd9a94a0619f49765edcc2c",
+      "kernel_ms": 13576.836464,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselContractP",
+        "top_20_module_cutoff_modules: FV.Backend.Proof.IselContractP"
+      ],
+      "source_file": "FV/Backend/Proof/IselContractP.lean",
+      "source_SHA256": "e27532f10207b20149c397fe5900e0ff5c3d92d4d46bc918478853a070eaf784",
+      "source_line": 300,
+      "source_kind": "theorem",
+      "declaration_start": "theorem lowerInstOkP_runTerm (hrules : LowerRulesCorrect program)",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.tryIndOkP_runTerm",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselContractP",
+      "K": "cef8f61d53bab6db5ea0df6074403ede4ad2074f0b019cac9ece106a245fe77f",
+      "kernel_ms": 13811.696864,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselContractP",
+        "top_20_module_cutoff_modules: FV.Backend.Proof.IselContractP"
+      ],
+      "source_file": "FV/Backend/Proof/IselContractP.lean",
+      "source_SHA256": "e27532f10207b20149c397fe5900e0ff5c3d92d4d46bc918478853a070eaf784",
+      "source_line": 594,
+      "source_kind": "theorem",
+      "declaration_start": "theorem tryIndOkP_runTerm (hrules : TryIndRulesCorrectP program) (hun : TryIndUnmatchable program)",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.tryOkP_runTerm",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselContractP",
+      "K": "a2229a9a3fdf97e3c03f5c2002ede64bb70098e4dbabf5dd3c44a6f2510ac760",
+      "kernel_ms": 13536.57408,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselContractP",
+        "top_20_module_cutoff_modules: FV.Backend.Proof.IselContractP"
+      ],
+      "source_file": "FV/Backend/Proof/IselContractP.lean",
+      "source_SHA256": "e27532f10207b20149c397fe5900e0ff5c3d92d4d46bc918478853a070eaf784",
+      "source_line": 510,
+      "source_kind": "theorem",
+      "declaration_start": "theorem tryOkP_runTerm (hrules : TryRulesCorrectP program) (hun : TryUnmatchable program)",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.Cov.covStmtTop_ok",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselCovTab",
+      "K": "90d59dd53e7a47a503696d45bffa440d7bd6779abc6ba9c1756e667115fa19ef",
+      "kernel_ms": 17.3236,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselCovTab",
+        "top_20_module_cutoff_modules: FV.Backend.Proof.IselCovTab"
+      ],
+      "source_file": "FV/Backend/Proof/IselCovTab.lean",
+      "source_SHA256": "8b22a89a34a5cc0e9420c91eed99735dab2efadb095fdf0c337781e7a46597ba",
+      "source_line": 818,
+      "source_kind": "theorem",
+      "declaration_start": "theorem covStmtTop_ok : (program.rulesOf TId.lower).all (fun r => !closureRootIds.contains r.id ||",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.Cov.covStmt_ok",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselCovTab",
+      "K": "d8fbfaa948e4ea9b935dfe260487dcf15b343bfe55a34f945a254bf649e8b101",
+      "kernel_ms": 21.164448,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselCovTab",
+        "top_20_module_cutoff_modules: FV.Backend.Proof.IselCovTab"
+      ],
+      "source_file": "FV/Backend/Proof/IselCovTab.lean",
+      "source_SHA256": "8b22a89a34a5cc0e9420c91eed99735dab2efadb095fdf0c337781e7a46597ba",
+      "source_line": 809,
+      "source_kind": "theorem",
+      "declaration_start": "theorem covStmt_ok : (program.rulesOf TId.lower).all (fun r => !closureRootIds.contains r.id || r.id == 587 ||",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.Cov.covTerm_ok",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselCovTab",
+      "K": "9f5ddaa56be5cd320e6cad18711054e38ae3fea1903f1008e95511f2cd6c1c25",
+      "kernel_ms": 18.43424,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselCovTab",
+        "top_20_module_cutoff_modules: FV.Backend.Proof.IselCovTab"
+      ],
+      "source_file": "FV/Backend/Proof/IselCovTab.lean",
+      "source_SHA256": "8b22a89a34a5cc0e9420c91eed99735dab2efadb095fdf0c337781e7a46597ba",
+      "source_line": 826,
+      "source_kind": "theorem",
+      "declaration_start": "theorem covTerm_ok : (program.rulesOf TId.lower).all (fun r => !(r.id == 964 || r.id == 1037) ||",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.mem_lower_2237",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselCtl",
+      "K": "73e6fc0f6c7902ad8c5ec7df1d49cab74c79ae10d6a79326bfd4dbcfc1f39f05",
+      "kernel_ms": 7.138096,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselCtl",
+        "top_20_module_cutoff_modules: FV.Backend.Proof.IselCtl"
+      ],
+      "source_file": "FV/Backend/Proof/IselCtl.lean",
+      "source_SHA256": "afdf2498fcb69b9837471492bf9873c8618dc46e0bc562f5065f055f8b4daef2",
+      "source_line": 45,
+      "source_kind": "theorem",
+      "declaration_start": "theorem mem_lower_2237 : rule_lower_2237 \u2208 program.rulesOf TId.lower :=",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.mem_lower_2518",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselCtl",
+      "K": "57fd15b323e0d926854dff51e7139639e61b3693bff89667ccbf3fbb2d11bd58",
+      "kernel_ms": 7.136304,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselCtl",
+        "top_20_module_cutoff_modules: FV.Backend.Proof.IselCtl"
+      ],
+      "source_file": "FV/Backend/Proof/IselCtl.lean",
+      "source_SHA256": "afdf2498fcb69b9837471492bf9873c8618dc46e0bc562f5065f055f8b4daef2",
+      "source_line": 64,
+      "source_kind": "theorem",
+      "declaration_start": "theorem mem_lower_2518 : rule_lower_2518 \u2208 program.rulesOf TId.lower :=",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.mem_lower_2574",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselCtl",
+      "K": "1623a95e518e52c091a2a86f8e823e6732c1f23748e45ea72c1ec13715849c9b",
+      "kernel_ms": 7.352592,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselCtl",
+        "top_20_module_cutoff_modules: FV.Backend.Proof.IselCtl"
+      ],
+      "source_file": "FV/Backend/Proof/IselCtl.lean",
+      "source_SHA256": "afdf2498fcb69b9837471492bf9873c8618dc46e0bc562f5065f055f8b4daef2",
+      "source_line": 48,
+      "source_kind": "theorem",
+      "declaration_start": "theorem mem_lower_2574 : rule_lower_2574 \u2208 program.rulesOf TId.lower :=",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.tbb_ok",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselCtlTbz",
+      "K": "eab4369f9695617783e40b683a4bd7b9bc02dcd7966d6de6b594060491589502",
+      "kernel_ms": 37.328352,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Backend.Proof.IselCtlTbz"
+      ],
+      "source_file": "FV/Backend/Proof/IselCtlTbz.lean",
+      "source_SHA256": "ac57c4cea45b3dbb7156ffe31f5fcc9ef87eda9da0be9528c5e3031174c5abc2",
+      "source_line": 178,
+      "source_kind": "theorem",
+      "declaration_start": "theorem tbb_ok {n : Nat} (hn : 30 \u2264 n) {k a b r bit : V} {s s' : LState \u00d7 Array RuleId} {v : V}",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.tbnz_ruleOk",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselCtlTbz",
+      "K": "c5d41e5e299e5eb35e477c6b0062702de51b82f248797e2698a229fa634bd3b8",
+      "kernel_ms": 118.584,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Backend.Proof.IselCtlTbz"
+      ],
+      "source_file": "FV/Backend/Proof/IselCtlTbz.lean",
+      "source_SHA256": "ac57c4cea45b3dbb7156ffe31f5fcc9ef87eda9da0be9528c5e3031174c5abc2",
+      "source_line": 211,
+      "source_kind": "theorem",
+      "declaration_start": "theorem tbnz_ruleOk {p : Program} (hp : Data p) {F : BitVec 64 \u2192 Prop} {isem : Sem} {MR : MemRelT}",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.tbz_ruleOk",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselCtlTbz",
+      "K": "52ec538a2519aac499e7ee77148ca941627bf2a74794d3bbc66196f76d69bf23",
+      "kernel_ms": 205.782384,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Backend.Proof.IselCtlTbz"
+      ],
+      "source_file": "FV/Backend/Proof/IselCtlTbz.lean",
+      "source_SHA256": "ac57c4cea45b3dbb7156ffe31f5fcc9ef87eda9da0be9528c5e3031174c5abc2",
+      "source_line": 344,
+      "source_kind": "theorem",
+      "declaration_start": "theorem tbz_ruleOk {p : Program} (hp : Data p) {F : BitVec 64 \u2192 Prop} {isem : Sem} {MR : MemRelT}",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.branchExcludedUnmatchable",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselCtlUnmatch",
+      "K": "27da608b50ec7801e0ffdc4a6a36b765808343a6826608c4b89654e98f523311",
+      "kernel_ms": 2.141456,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselCtlUnmatch"
+      ],
+      "source_file": "FV/Backend/Proof/IselCtlUnmatch.lean",
+      "source_SHA256": "5d0ef5ccf65249d3a5156bac2d7c83d401eebd66aaa48b35beaea51e0fff77b7",
+      "source_line": 236,
+      "source_kind": "theorem",
+      "declaration_start": "theorem branchExcludedUnmatchable : BranchExcludedUnmatchable program := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.fmtKinds_program",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselCtlUnmatch",
+      "K": "56f026c76fe923c3d173c0d2c24e4be749c11c63e8e65a930f7f6d1af6fc175a",
+      "kernel_ms": 39.91088,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselCtlUnmatch"
+      ],
+      "source_file": "FV/Backend/Proof/IselCtlUnmatch.lean",
+      "source_SHA256": "5d0ef5ccf65249d3a5156bac2d7c83d401eebd66aaa48b35beaea51e0fff77b7",
+      "source_line": 49,
+      "source_kind": "theorem",
+      "declaration_start": "theorem fmtKinds_program : FmtKinds program := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.rootFmt_match_k",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselCtlUnmatch",
+      "K": "70963d04b7e829ecf7cd9d1344e39ec0f352663781f4ad1d17fc439778cf9c2a",
+      "kernel_ms": 1.820496,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselCtlUnmatch"
+      ],
+      "source_file": "FV/Backend/Proof/IselCtlUnmatch.lean",
+      "source_SHA256": "5d0ef5ccf65249d3a5156bac2d7c83d401eebd66aaa48b35beaea51e0fff77b7",
+      "source_line": 101,
+      "source_kind": "theorem",
+      "declaration_start": "theorem rootFmt_match_k {q : Pattern} {fT : Nat} (hq : rootFmt q = some fT) {tf : Term} {k : Nat}",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.exclOk_program",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselExcl",
+      "K": "a1b36cc27ae2721947f221691739d4822a7698a9ca66d69b34ece39fd60703d9",
+      "kernel_ms": 1.564576,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselExcl"
+      ],
+      "source_file": "FV/Backend/Proof/IselExcl.lean",
+      "source_SHA256": "24d66a8f25057fcb0e46721973a1f8e717ef0256b4e66b77bfe581af3d3c7940",
+      "source_line": 17,
+      "source_kind": "theorem",
+      "declaration_start": "theorem exclOk_program : (program.rulesOf TId.lower).all (exclOk program) = true := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.excludedUnmatchable",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselExcl",
+      "K": "a98897d576db6ec39c08f4f2edffd6a148156efc9f081f450b5e1105fe6873c8",
+      "kernel_ms": 1.582992,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselExcl"
+      ],
+      "source_file": "FV/Backend/Proof/IselExcl.lean",
+      "source_SHA256": "24d66a8f25057fcb0e46721973a1f8e717ef0256b4e66b77bfe581af3d3c7940",
+      "source_line": 23,
+      "source_kind": "theorem",
+      "declaration_start": "theorem excludedUnmatchable : ExcludedUnmatchable program := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.Flow.flowRoot_ok",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselFlowRootF",
+      "K": "96d393d8e5fabd6c583e4f419bdb60102d9c40b5f243201f706d4de6cbcf32da",
+      "kernel_ms": 0.640992,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselFlowRootF"
+      ],
+      "source_file": "FV/Backend/Proof/IselFlowRootF.lean",
+      "source_SHA256": "154b6f0b9c4c8e29b7f9f07426e9587498d4c8a3a5ea54c5038721ad5d35552d",
+      "source_line": 274,
+      "source_kind": "theorem",
+      "declaration_start": "theorem flowRoot_ok : (program.rulesOf TId.lower).all flowRootOk = true := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.Flow.flowRules18",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselFlowRootF",
+      "K": "ddf42be2666ab9f20f4941b0c82aa905bdfbbc54a1ba1c6754fbd5936eb92a98",
+      "kernel_ms": 0.088816,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselFlowRootF"
+      ],
+      "source_file": "FV/Backend/Proof/IselFlowRootF.lean",
+      "source_SHA256": "154b6f0b9c4c8e29b7f9f07426e9587498d4c8a3a5ea54c5038721ad5d35552d",
+      "source_line": 159,
+      "source_kind": "def",
+      "declaration_start": "def flowRules18 : List Rule :=",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.Flow.flowRules_eq",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselFlowRootF",
+      "K": "1c1a9d5b2196363506dd8b006d48d5e28fc7753462caaaaac9ec9db2620835d7",
+      "kernel_ms": 90.96216,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselFlowRootF"
+      ],
+      "source_file": "FV/Backend/Proof/IselFlowRootF.lean",
+      "source_SHA256": "154b6f0b9c4c8e29b7f9f07426e9587498d4c8a3a5ea54c5038721ad5d35552d",
+      "source_line": 181,
+      "source_kind": "theorem",
+      "declaration_start": "theorem flowRules_eq : program.rulesOf TId.lower = flowRules0 ++ flowRules1 ++ flowRules2 ++ flowRules3 ++ flowRules4 ++ flowRules5 ++ flowRules6 ++ flowRules7 ++ flowRules8 ++ flowRules9 ++ flowRules10 ++ flowRules11 ++ flowRules12 ++ flowRules13 ++ flowRules14 ++ flowRules15 ++ flowRules16 ++ flowRules17 ++ flowRules18 ++ flowRules19 ++ flowRules20 := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.Flow.tlsRootBranch_ok",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselFlowRootT",
+      "K": "2b70da408d17ded5e77c931f06e882357ed45abafba753518e5eaab5bb98f02e",
+      "kernel_ms": 0.190112,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselFlowRootT",
+        "top_20_module_cutoff_modules: FV.Backend.Proof.IselFlowRootT"
+      ],
+      "source_file": "FV/Backend/Proof/IselFlowRootT.lean",
+      "source_SHA256": "e5aeb8a6a11392f7256fe67d541e7a17052ea7799cc26b47d0fa163d8c18311d",
+      "source_line": 280,
+      "source_kind": "theorem",
+      "declaration_start": "theorem tlsRootBranch_ok : (program.rulesOf TId.lower_branch).all",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.Flow.tlsRoot_ok",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselFlowRootT",
+      "K": "a10c93ba655d11078b395f9e44389257d4e89ef8e9230c4e5f3bba07dffde27e",
+      "kernel_ms": 0.611968,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselFlowRootT",
+        "top_20_module_cutoff_modules: FV.Backend.Proof.IselFlowRootT"
+      ],
+      "source_file": "FV/Backend/Proof/IselFlowRootT.lean",
+      "source_SHA256": "e5aeb8a6a11392f7256fe67d541e7a17052ea7799cc26b47d0fa163d8c18311d",
+      "source_line": 274,
+      "source_kind": "theorem",
+      "declaration_start": "theorem tlsRoot_ok : (program.rulesOf TId.lower).all tlsRootOk = true := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.Flow.tlsRules_eq",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselFlowRootT",
+      "K": "defa3c0e574cb56e23f011c74c8521738978683aef14349cbbf068aa2938ea98",
+      "kernel_ms": 98.654992,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselFlowRootT",
+        "top_20_module_cutoff_modules: FV.Backend.Proof.IselFlowRootT"
+      ],
+      "source_file": "FV/Backend/Proof/IselFlowRootT.lean",
+      "source_SHA256": "e5aeb8a6a11392f7256fe67d541e7a17052ea7799cc26b47d0fa163d8c18311d",
+      "source_line": 181,
+      "source_kind": "theorem",
+      "declaration_start": "theorem tlsRules_eq : program.rulesOf TId.lower = tlsRules0 ++ tlsRules1 ++ tlsRules2 ++ tlsRules3 ++ tlsRules4 ++ tlsRules5 ++ tlsRules6 ++ tlsRules7 ++ tlsRules8 ++ tlsRules9 ++ tlsRules10 ++ tlsRules11 ++ tlsRules12 ++ tlsRules13 ++ tlsRules14 ++ tlsRules15 ++ tlsRules16 ++ tlsRules17 ++ tlsRules18 ++ tlsRules19 ++ tlsRules20 := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.Flow.flowTab5_ok",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselFlowTabF",
+      "K": "139abb7c0f8a24a1f9618601b35ffc7f659304d2a925940e286b040abb6afcf5",
+      "kernel_ms": 0.118512,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselFlowTabF"
+      ],
+      "source_file": "FV/Backend/Proof/IselFlowTabF.lean",
+      "source_SHA256": "8a14e385a25b6b73139c47a7a2d107aeb8fb05ad937c4d6d710a753a8349475e",
+      "source_line": 265,
+      "source_kind": "theorem",
+      "declaration_start": "theorem flowTab5_ok :",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.Flow.flowTab8_ok",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselFlowTabF",
+      "K": "6b7d2415f5796004a0f87a63224c0152f12ea383fc561c34e35a692c8435fae5",
+      "kernel_ms": 0.118704,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselFlowTabF"
+      ],
+      "source_file": "FV/Backend/Proof/IselFlowTabF.lean",
+      "source_SHA256": "8a14e385a25b6b73139c47a7a2d107aeb8fb05ad937c4d6d710a753a8349475e",
+      "source_line": 283,
+      "source_kind": "theorem",
+      "declaration_start": "theorem flowTab8_ok :",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.Flow.flowTab_ok",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselFlowTabF",
+      "K": "da6542cb19f577b029da0ad6ab57d7f84df3ee0eab67c49bbe030648bef16a84",
+      "kernel_ms": 0.726336,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselFlowTabF"
+      ],
+      "source_file": "FV/Backend/Proof/IselFlowTabF.lean",
+      "source_SHA256": "8a14e385a25b6b73139c47a7a2d107aeb8fb05ad937c4d6d710a753a8349475e",
+      "source_line": 331,
+      "source_kind": "theorem",
+      "declaration_start": "theorem flowTab_ok : chkTab program flowTab false = true := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.Flow.tlsTab15_ok",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselFlowTabT",
+      "K": "94b96f5c005eab7751e29157fe7817d9a7de2a893c634ee46b094c5623bf7c91",
+      "kernel_ms": 0.119552,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselFlowTabT"
+      ],
+      "source_file": "FV/Backend/Proof/IselFlowTabT.lean",
+      "source_SHA256": "485740da339f6e9190bbad6af4cc3ddc25bfae29bb0ee4475260bad25e477423",
+      "source_line": 332,
+      "source_kind": "theorem",
+      "declaration_start": "theorem tlsTab15_ok :",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.Flow.tlsTab9_ok",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselFlowTabT",
+      "K": "fea7756e3ab1ef3df779e254eb0a6bd46ca04ad58a0e3c560b2718343236b60a",
+      "kernel_ms": 0.12248,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselFlowTabT"
+      ],
+      "source_file": "FV/Backend/Proof/IselFlowTabT.lean",
+      "source_SHA256": "485740da339f6e9190bbad6af4cc3ddc25bfae29bb0ee4475260bad25e477423",
+      "source_line": 296,
+      "source_kind": "theorem",
+      "declaration_start": "theorem tlsTab9_ok :",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.Flow.tlsTab_ok",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselFlowTabT",
+      "K": "a8c3d0aeb877bc7831d754cb369d614575badd7481d0e8e5981a0ae00e66c337",
+      "kernel_ms": 0.642352,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselFlowTabT"
+      ],
+      "source_file": "FV/Backend/Proof/IselFlowTabT.lean",
+      "source_SHA256": "485740da339f6e9190bbad6af4cc3ddc25bfae29bb0ee4475260bad25e477423",
+      "source_line": 338,
+      "source_kind": "theorem",
+      "declaration_start": "theorem tlsTab_ok : chkTab program tlsTab true = true := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.Cov.szStmt_ok",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselSzTab",
+      "K": "ab49593cddd9a37af0550822b1b0a4eba070fe4d9f34a22c15c3524b12999c58",
+      "kernel_ms": 20.055184,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselSzTab",
+        "top_20_module_cutoff_modules: FV.Backend.Proof.IselSzTab"
+      ],
+      "source_file": "FV/Backend/Proof/IselSzTab.lean",
+      "source_SHA256": "a0db2345a8c68b9ac2ca2333eaf7eda175b33e493be5a7841629ed5feb72f9fb",
+      "source_line": 1647,
+      "source_kind": "theorem",
+      "declaration_start": "theorem szStmt_ok : (program.rulesOf TId.lower).all (fun r => !closureRootIds.contains r.id ||",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.Cov.szTerm_ok",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselSzTab",
+      "K": "aaeb33a7f3e0505940ad5ce2322b0c978cf751440e2a4bf2c179630ee3ba24ee",
+      "kernel_ms": 17.78832,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselSzTab",
+        "top_20_module_cutoff_modules: FV.Backend.Proof.IselSzTab"
+      ],
+      "source_file": "FV/Backend/Proof/IselSzTab.lean",
+      "source_SHA256": "a0db2345a8c68b9ac2ca2333eaf7eda175b33e493be5a7841629ed5feb72f9fb",
+      "source_line": 1656,
+      "source_kind": "theorem",
+      "declaration_start": "theorem szTerm_ok : (program.rulesOf TId.lower).all (fun r => !(r.id == 964 || r.id == 1037) ||",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.Cov.tgTerm_ok",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselSzTab",
+      "K": "c1dff371b608fd8abfc3bc3673c0217f7e80ebe1233c19f49a9c59b862fb6ffa",
+      "kernel_ms": 18.043616,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselSzTab",
+        "top_20_module_cutoff_modules: FV.Backend.Proof.IselSzTab"
+      ],
+      "source_file": "FV/Backend/Proof/IselSzTab.lean",
+      "source_SHA256": "a0db2345a8c68b9ac2ca2333eaf7eda175b33e493be5a7841629ed5feb72f9fb",
+      "source_line": 1682,
+      "source_kind": "theorem",
+      "declaration_start": "theorem tgTerm_ok : (program.rulesOf TId.lower).all (fun r => !(r.id == 964 || r.id == 1037) ||",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.refines_ispec",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselTermFactsBase",
+      "K": "dd6efb91a17eb33a4771a2bc9b2cb0a0ba90fb7c1d0745f63f6968f823644e50",
+      "kernel_ms": 0.112704,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselTermFactsBase"
+      ],
+      "source_file": "FV/Backend/Proof/IselTermFactsBase.lean",
+      "source_SHA256": "11d7dca1a61741d8655f93c58416b3e31b858bf3faf77bec283c002350ec7ec8",
+      "source_line": 21,
+      "source_kind": "theorem",
+      "declaration_start": "theorem refines_ispec : Refines (fun _ => True) ispec :=",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.runTerm_lower_branch_rule",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselTermFactsBase",
+      "K": "ae99aef8fe2d9a777af99ea5e5a43bc87509402b531333d6c8186c17a8724170",
+      "kernel_ms": 13790.010672,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselTermFactsBase"
+      ],
+      "source_file": "FV/Backend/Proof/IselTermFactsBase.lean",
+      "source_SHA256": "11d7dca1a61741d8655f93c58416b3e31b858bf3faf77bec283c002350ec7ec8",
+      "source_line": 68,
+      "source_kind": "theorem",
+      "declaration_start": "theorem runTerm_lower_branch_rule {ctx : Ctx} {vs : List V} {st : LState} {out : V}",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.runTerm_lower_rule",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselTermFactsBase",
+      "K": "4d1b41d3b51a2be4fee44a2714cff71ece39057fb92656e1559bcbc624b5a9c2",
+      "kernel_ms": 14080.67296,
+      "buckets": [
+        "cutoff_kernel_by_kind: theorem",
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.IselTermFactsBase"
+      ],
+      "source_file": "FV/Backend/Proof/IselTermFactsBase.lean",
+      "source_SHA256": "11d7dca1a61741d8655f93c58416b3e31b858bf3faf77bec283c002350ec7ec8",
+      "source_line": 27,
+      "source_kind": "theorem",
+      "declaration_start": "theorem runTerm_lower_rule {ctx : Ctx} {vs : List V} {st : LState} {out : V} {st' : LState}",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.brTable_shape",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselTermFactsRules",
+      "K": "ce0935664cf2ad1d4c29f934b54e892bc86a8fc30d10e077e132fba11637e276",
+      "kernel_ms": 61.3348,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Backend.Proof.IselTermFactsRules"
+      ],
+      "source_file": "FV/Backend/Proof/IselTermFactsRules.lean",
+      "source_SHA256": "5da4d8ff90f93f4adff63ecbd445e9dbc9bd9eddce1f8f8f36d2f42124df999a",
+      "source_line": 346,
+      "source_kind": "theorem",
+      "declaration_start": "theorem brTable_shape {p : Program} (hp : Data p) : BranchShapeOk p rule_lower_3277 := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.tbnz_shape",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselTermFactsRules",
+      "K": "23648b8a07bf31d4b9a873916a908b2d5aac316a953ce7d37ddd71894017de75",
+      "kernel_ms": 105.499984,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Backend.Proof.IselTermFactsRules"
+      ],
+      "source_file": "FV/Backend/Proof/IselTermFactsRules.lean",
+      "source_SHA256": "5da4d8ff90f93f4adff63ecbd445e9dbc9bd9eddce1f8f8f36d2f42124df999a",
+      "source_line": 233,
+      "source_kind": "theorem",
+      "declaration_start": "theorem tbnz_shape {p : Program} (hp : Data p) : BranchShapeOk p rule_lower_3251 := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.tbz_shape",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.IselTermFactsRules",
+      "K": "e2605c4bd23ff945b290ffed85a8fca758e04b7cdcc83bfdd0a244f5d0585f12",
+      "kernel_ms": 190.092656,
+      "buckets": [
+        "top_20_module_cutoff_modules: FV.Backend.Proof.IselTermFactsRules"
+      ],
+      "source_file": "FV/Backend/Proof/IselTermFactsRules.lean",
+      "source_SHA256": "5da4d8ff90f93f4adff63ecbd445e9dbc9bd9eddce1f8f8f36d2f42124df999a",
+      "source_line": 283,
+      "source_kind": "theorem",
+      "declaration_start": "theorem tbz_shape {p : Program} (hp : Data p) : BranchShapeOk p rule_lower_3257 := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.Kill.noX_ok",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.KillTab",
+      "K": "35507be3812224cd4d7fc22b009b77f184487cb6649c2c87882c0d2640fb0a7d",
+      "kernel_ms": 129.597456,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.KillTab",
+        "top_20_module_cutoff_modules: FV.Backend.Proof.KillTab"
+      ],
+      "source_file": "FV/Backend/Proof/KillTab.lean",
+      "source_SHA256": "79dfffb3db5c85ccf92df8c43b67d4ea08c0a8b6ebc0a06130164fed46b2dd35",
+      "source_line": 151,
+      "source_kind": "theorem",
+      "declaration_start": "theorem noX_ok : (killTabS ++ killTabB).all (fun t => t != TId.\u00abMInst.AtomicRMWLoop\u00bb &&",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.Kill.nop_rhs_some",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.KillTab",
+      "K": "3c55da5169653f2969e5e19de4efb0912df1e107742cd380725d474c7832f964",
+      "kernel_ms": 80.553856,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.KillTab",
+        "top_20_module_cutoff_modules: FV.Backend.Proof.KillTab"
+      ],
+      "source_file": "FV/Backend/Proof/KillTab.lean",
+      "source_SHA256": "79dfffb3db5c85ccf92df8c43b67d4ea08c0a8b6ebc0a06130164fed46b2dd35",
+      "source_line": 231,
+      "source_kind": "theorem",
+      "declaration_start": "theorem nop_rhs_some {ctx : Ctx} {cfg : Config} (hc : cfg.checkOverlap = false) {n : Nat}",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.Kill.tabOkB_S",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.KillTab",
+      "K": "c00e903539bf36bb13c52bbf4f930a2bb14ddb92d459b721c3f16e7e2df8c0be",
+      "kernel_ms": 264.945312,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.KillTab",
+        "top_20_module_cutoff_modules: FV.Backend.Proof.KillTab"
+      ],
+      "source_file": "FV/Backend/Proof/KillTab.lean",
+      "source_SHA256": "79dfffb3db5c85ccf92df8c43b67d4ea08c0a8b6ebc0a06130164fed46b2dd35",
+      "source_line": 89,
+      "source_kind": "theorem",
+      "declaration_start": "theorem tabOkB_S : tabOkB killTabS = true := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.Cov.LogicImm.pat_of_accept",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.LogicImmComplete",
+      "K": "4c25243bd1423a245be93caf76c698d0e25d77572909ccea68793efbff443a7f",
+      "kernel_ms": 1.626304,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.LogicImmComplete",
+        "top_20_module_cutoff_modules: FV.Backend.Proof.LogicImmComplete"
+      ],
+      "source_file": "FV/Backend/Proof/LogicImmComplete.lean",
+      "source_SHA256": "10a3c190395f2265e4f81e300dbdbe1eaae3b62e74ff9c0c38fb1cd11f335bae",
+      "source_line": 304,
+      "source_kind": "theorem",
+      "declaration_start": "theorem pat_of_accept {v : Nat} (hv : v < 2 ^ 64)",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.Cov.LogicImm.run_of_two",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.LogicImmComplete",
+      "K": "c1474ae3008bf6a792c1667b816a492452ea1582dd3c90e4bdc0cbc0de739deb",
+      "kernel_ms": 2.899728,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.LogicImmComplete",
+        "top_20_module_cutoff_modules: FV.Backend.Proof.LogicImmComplete"
+      ],
+      "source_file": "FV/Backend/Proof/LogicImmComplete.lean",
+      "source_SHA256": "10a3c190395f2265e4f81e300dbdbe1eaae3b62e74ff9c0c38fb1cd11f335bae",
+      "source_line": 193,
+      "source_kind": "theorem",
+      "declaration_start": "theorem run_of_two {b : Nat \u2192 Bool} {e a a' : Nat} (haa : a < a') (ha' : a' < e)",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.Cov.logicImmComplete",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.LogicImmComplete",
+      "K": "5ed8cf9728c7d9818573a20c7f531b31b462acbb7e066c2a546614fcd1d72bd8",
+      "kernel_ms": 4.121136,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.LogicImmComplete",
+        "top_20_module_cutoff_modules: FV.Backend.Proof.LogicImmComplete"
+      ],
+      "source_file": "FV/Backend/Proof/LogicImmComplete.lean",
+      "source_SHA256": "10a3c190395f2265e4f81e300dbdbe1eaae3b62e74ff9c0c38fb1cd11f335bae",
+      "source_line": 334,
+      "source_kind": "theorem",
+      "declaration_start": "theorem logicImmComplete : LogicImmComplete := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.Driver.stmtLoop",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.LowerLoopRun",
+      "K": "e26824c97f68a44cdbcc847c7752f0c3b9797a771bfe0192a80cdb2bf678825b",
+      "kernel_ms": 13982.72112,
+      "buckets": [
+        "cutoff_kernel_by_kind: theorem"
+      ],
+      "source_file": "FV/Backend/Proof/LowerLoopRun.lean",
+      "source_SHA256": "13a7d367482b710d88ac9a411c636a53db4ef80d4a80bdb49b51c06c6225685d",
+      "source_line": 243,
+      "source_kind": "theorem",
+      "declaration_start": "theorem stmtLoop {f : Clif.Function} {ctx : Ctx} {ranges : Array (Nat \u00d7 Nat)} {st0 : LState}",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.Driver.LowerShape",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.LowerShape",
+      "K": "9411f00edec17dc9af81604885e84fd07931eec4e40dea844798e478327ce0cc",
+      "kernel_ms": 3.525984,
+      "buckets": [
+        "cutoff_kernel_by_kind: inductive"
+      ],
+      "source_file": "FV/Backend/Proof/LowerShape.lean",
+      "source_SHA256": "30fa008eff979656665129411ae02c04c3e2485146dc59042e91d12d9dd50220",
+      "source_line": 32,
+      "source_kind": "structure",
+      "declaration_start": "structure LowerShape : Prop where",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.jump_shapeJ",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.SpillEdgesIsel",
+      "K": "be17fcac133618cf43b5cf5feb2d836e097fec2a66025c6de4990c54b09482be",
+      "kernel_ms": 29.553648,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.SpillEdgesIsel"
+      ],
+      "source_file": "FV/Backend/Proof/SpillEdgesIsel.lean",
+      "source_SHA256": "0806a60876332a449eb959f9dfa8b885c0b6b4dfad61110294de8534d54807c8",
+      "source_line": 106,
+      "source_kind": "theorem",
+      "declaration_start": "theorem jump_shapeJ {p : Program} (hp : Data p) {ctx : Ctx}",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.ret_shapeT",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.SpillEdgesIsel",
+      "K": "1f8d362330a994c7008e90385333ab4518f1999ddd1268e5720220f796e35a2e",
+      "kernel_ms": 35.051552,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.SpillEdgesIsel"
+      ],
+      "source_file": "FV/Backend/Proof/SpillEdgesIsel.lean",
+      "source_SHA256": "0806a60876332a449eb959f9dfa8b885c0b6b4dfad61110294de8534d54807c8",
+      "source_line": 77,
+      "source_kind": "theorem",
+      "declaration_start": "theorem ret_shapeT {p : Program} (hp : Data p) : LowerTermShapeOkT p rule_lower_2574 := by",
+      "explicit_source_declaration_verified": true
+    },
+    {
+      "name": "Backend.Proof.trap_shapeT",
+      "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+      "module": "FV.Backend.Proof.SpillEdgesIsel",
+      "K": "c3dcec52fc29d5f7dd1514cb8312a82e945a5d4a4a9205baec442df84055215d",
+      "kernel_ms": 37.308112,
+      "buckets": [
+        "top_20_kernel_reuse_modules: FV.Backend.Proof.SpillEdgesIsel"
+      ],
+      "source_file": "FV/Backend/Proof/SpillEdgesIsel.lean",
+      "source_SHA256": "0806a60876332a449eb959f9dfa8b885c0b6b4dfad61110294de8534d54807c8",
+      "source_line": 41,
+      "source_kind": "theorem",
+      "declaration_start": "theorem trap_shapeT {p : Program} (hp : Data p) : LowerTermShapeOkT p rule_lower_2237 := by",
+      "explicit_source_declaration_verified": true
+    }
+  ],
+  "pending_review": [],
+  "reported_example_shortfalls": [
+    "reuse kind opaque",
+    "cutoff kind opaque",
+    "reuse module FV.Backend.Proof.IselExcl"
+  ]
+}
