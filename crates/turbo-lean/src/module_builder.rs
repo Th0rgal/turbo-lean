@@ -4978,9 +4978,15 @@ pub(crate) struct VerifiedDepModuleEntry {
     pub olean_artifact_digest: String,
     #[serde(default)]
     pub kernel_audited: bool,
+    /// Artifact-set digests of the direct imports this `.olean` was elaborated against.
+    /// Deliberately not `#[serde(default)]`: legacy entries without it fail closed.
+    pub import_olean_digests: BTreeMap<String, String>,
+    /// `olean_artifact_stat_fingerprint` when recorded (empty: always re-hash on use).
+    #[serde(default)]
+    pub artifact_stat_fingerprint: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct VerifiedDepManifest {
     pub pkg_name: String,
     pub toolchain: String,
@@ -4991,6 +4997,350 @@ pub(crate) struct VerifiedDepManifest {
     #[serde(default)]
     pub allowed_axioms: Vec<String>,
     pub modules: BTreeMap<String, VerifiedDepModuleEntry>,
+    /// Workspace configuration the manifest was validated against on load (never serialized).
+    #[serde(skip)]
+    pub cfg: Option<ProjectConfig>,
+    /// Dependency-closure nodes `(package, module, pin)` already found consistent (never
+    /// serialized).
+    #[serde(skip)]
+    pub dep_import_memo: DepImportMemo,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct DepImportMemo(Mutex<HashSet<(String, String, String)>>);
+
+impl Clone for DepImportMemo {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+/// Load `pkg_root`'s verified-sources manifest if it was written for this package, toolchain,
+/// configuration, and (when `strict_policy` is set) workspace and axiom policy.
+fn read_pkg_verified_manifest(
+    cfg: &ProjectConfig,
+    pkg_root: &Path,
+    pkg_name: &str,
+    pkg_config_digest: &str,
+    strict_policy: bool,
+) -> Option<VerifiedDepManifest> {
+    let bytes = fs::read(pkg_root.join(".lake/build/.turbo_verified_sources.json")).ok()?;
+    let manifest: VerifiedDepManifest = serde_json::from_slice(&bytes).ok()?;
+    (manifest.pkg_name == pkg_name
+        && manifest.toolchain == cfg.toolchain
+        && manifest.lean_githash == cfg.lean_githash
+        && manifest.pkg_config_digest == pkg_config_digest
+        && (!strict_policy
+            || (manifest.workspace_config_digest == cfg.canonical_config_digest
+                && manifest.allowed_axioms == crate::splitter::allowed_axioms())))
+    .then_some(manifest)
+}
+
+/// Where an import resolves after the root package, in `build_module_dag_with_trust` (trusted)
+/// order: dependency package, toolchain, prebuilt `.olean`.
+pub(crate) enum ImportSite {
+    Module(Box<DiscoveredModuleSpec>),
+    Toolchain,
+    Prebuilt(PathBuf),
+    Unresolved,
+}
+
+/// Caller `LEAN_PATH` directories searched for prebuilt external `.olean`s (trusted mode).
+fn trusted_lean_path_dirs(cfg: &ProjectConfig) -> Vec<PathBuf> {
+    std::env::var_os("LEAN_PATH")
+        .map(|lp| {
+            std::env::split_paths(&lp)
+                .filter(|p| p.is_dir() && *p != cfg.toolchain_lib_lean)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn resolve_import_site(cfg: &ProjectConfig, imp: &str) -> ImportSite {
+    let mut deps = cfg
+        .dep_pkgs
+        .iter()
+        .filter_map(|dp| resolve_module_in_package(dp, false, imp));
+    match (deps.next(), deps.next()) {
+        (Some(spec), None) => return ImportSite::Module(Box::new(spec)),
+        (Some(_), Some(_)) => return ImportSite::Unresolved,
+        _ => {}
+    }
+    if is_builtin_toolchain_module(&cfg.toolchain_lib_lean, imp) {
+        return ImportSite::Toolchain;
+    }
+    let rel = format!("{}.olean", module_name_to_rel_slash(imp));
+    cfg.dep_pkgs
+        .iter()
+        .map(|dp| dp.pkg_root.join(&dp.build_dir).join(&dp.lean_lib_dir))
+        .chain(trusted_lean_path_dirs(cfg))
+        .map(|d| d.join(&rel))
+        .find(|p| p.is_file())
+        .map_or(ImportSite::Unresolved, ImportSite::Prebuilt)
+}
+
+fn spec_olean_path(spec: &DiscoveredModuleSpec) -> PathBuf {
+    spec.build_lib_lean_dir.join(format!(
+        "{}.olean",
+        module_name_to_rel_slash(&spec.module_name)
+    ))
+}
+
+fn spec_rel_src(spec: &DiscoveredModuleSpec) -> String {
+    spec.src_path
+        .strip_prefix(&spec.pkg_root)
+        .unwrap_or(&spec.src_path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// P0-4: whether `entry`'s `.olean` was elaborated against the current artifacts of its direct
+/// imports. `pin_current(import, pin)` judges each import; only toolchain imports may be
+/// unpinned, and every pin must name a current import.
+pub(crate) fn verified_entry_imports_current(
+    entry: &VerifiedDepModuleEntry,
+    imports: &[String],
+    mut pin_current: impl FnMut(&str, Option<&str>) -> bool,
+) -> bool {
+    entry
+        .import_olean_digests
+        .keys()
+        .all(|k| imports.contains(k))
+        && imports
+            .iter()
+            .all(|imp| pin_current(imp, entry.import_olean_digests.get(imp).map(String::as_str)))
+}
+
+/// Check-time judgement of an import pinned at `pin` from the root package, resolved as at build
+/// time (root package first): prebuilt `.olean`s are re-digested; root- and dependency-package
+/// modules must have a consistent closure (`dep_pkg_import_pins_consistent`), memoized per
+/// manifest load.
+pub(crate) fn import_pin_current(
+    cfg: &ProjectConfig,
+    memo: &DepImportMemo,
+    imp: &str,
+    pin: Option<&str>,
+) -> bool {
+    let site = match resolve_module_in_package(&cfg.root_pkg, true, imp) {
+        Some(spec) => ImportSite::Module(Box::new(spec)),
+        None => resolve_import_site(cfg, imp),
+    };
+    match (site, pin) {
+        (ImportSite::Toolchain, None) => true,
+        (ImportSite::Prebuilt(olean), Some(pin)) => olean_digest_is(cfg, &olean, pin),
+        (ImportSite::Module(spec), Some(pin)) => {
+            dep_pkg_import_pins_consistent(cfg, memo, *spec, pin, true)
+        }
+        _ => false,
+    }
+}
+
+/// Whether `olean`'s artifact set digests to `pin`, hashed under the root worktree policy.
+fn olean_digest_is(cfg: &ProjectConfig, olean: &Path, pin: &str) -> bool {
+    let preserve = crate::lake_build::worktree_auto_link_disabled(&cfg.root_pkg.pkg_root);
+    compute_olean_artifact_set_digest_with_policy(olean, preserve).is_ok_and(|d| d == pin)
+}
+
+/// Inode/size/mtime/ctime fingerprint of an `.olean` artifact set. Any rewrite, replacement,
+/// or timestamp reset changes `ctime`, so an unchanged fingerprint implies unchanged bytes.
+fn olean_artifact_stat_fingerprint(olean: &Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mut h = blake3::Hasher::new();
+        for (tag, path) in olean_artifact_paths(olean) {
+            h.update(tag.as_bytes());
+            match fs::metadata(&path) {
+                Ok(m) => {
+                    for v in [m.ino() as i64, m.len() as i64, m.mtime(), m.mtime_nsec()] {
+                        h.update(&v.to_le_bytes());
+                    }
+                    h.update(&m.ctime().to_le_bytes());
+                    h.update(&m.ctime_nsec().to_le_bytes());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    h.update(b"-");
+                }
+                Err(_) => return None,
+            }
+        }
+        Some(h.finalize().to_hex().to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = olean;
+        None
+    }
+}
+
+/// Whether the `.olean` artifact set at `olean` still matches `entry`: by its recorded stat
+/// fingerprint, else by re-hashing.
+pub(crate) fn entry_artifacts_current(
+    cfg: &ProjectConfig,
+    olean: &Path,
+    entry: &VerifiedDepModuleEntry,
+) -> bool {
+    (!entry.artifact_stat_fingerprint.is_empty()
+        && olean_artifact_stat_fingerprint(olean).as_deref()
+            == Some(entry.artifact_stat_fingerprint.as_str()))
+        || olean_digest_is(cfg, olean, &entry.olean_artifact_digest)
+}
+
+/// After Lake refreshed dependency-package module `imp`, drop its now-outdated verified-sources
+/// entry (or an unparseable manifest), so the module counts as Lake-managed from then on.
+pub(crate) fn forget_refreshed_dep_module(cfg: &ProjectConfig, imp: &str) {
+    let ImportSite::Module(spec) = resolve_import_site(cfg, imp) else {
+        return;
+    };
+    let path = spec
+        .pkg_root
+        .join(".lake/build/.turbo_verified_sources.json");
+    let Ok(bytes) = fs::read(&path) else {
+        return;
+    };
+    match serde_json::from_slice::<VerifiedDepManifest>(&bytes) {
+        Ok(mut manifest) => {
+            if manifest.modules.remove(&spec_rel_src(&spec)).is_some() {
+                if let Ok(json) = serde_json::to_vec(&manifest) {
+                    let _ = fs::write(&path, json);
+                }
+            }
+        }
+        Err(_) => {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+/// Source and `.olean` paths of root-package module `imp`, resolved as at build time.
+pub(crate) fn root_module_paths(cfg: &ProjectConfig, imp: &str) -> Option<(PathBuf, PathBuf)> {
+    let spec = resolve_module_in_package(&cfg.root_pkg, true, imp)?;
+    let olean = spec_olean_path(&spec);
+    Some((spec.src_path, olean))
+}
+
+/// Whether dependency-package module `imp` lacks a built `.olean` on disk.
+pub(crate) fn dep_pkg_module_missing_olean(cfg: &ProjectConfig, imp: &str) -> bool {
+    matches!(resolve_import_site(cfg, imp), ImportSite::Module(s) if !spec_olean_path(&s).is_file())
+}
+
+/// Whether dependency-package module `imp` may be stale before elaboration. A module without a
+/// verified-sources entry (no manifest, or never recorded) is Lake-managed: `false`. A manifest
+/// that cannot be read or parsed, an entry stamped under a different toolchain/package config, or
+/// an entry that no longer proves the module's closure consistent establishes nothing: `true`
+/// (refresh or fail closed). Unlike positive fast-path reuse, `strict_policy` is `false` so a
+/// standalone rebuild inside the dependency package retains untouched sibling entries and still
+/// exposes their now-stale import pins.
+pub(crate) fn dep_pkg_module_stale(cfg: &ProjectConfig, memo: &DepImportMemo, imp: &str) -> bool {
+    let spec = match resolve_import_site(cfg, imp) {
+        ImportSite::Module(spec) => spec,
+        // Two dependency packages own the name: no single closure is safe to elaborate against.
+        ImportSite::Unresolved => return true,
+        _ => return false,
+    };
+    let bytes = match fs::read(
+        spec.pkg_root
+            .join(".lake/build/.turbo_verified_sources.json"),
+    ) {
+        Ok(bytes) => bytes,
+        Err(e) => return e.kind() != std::io::ErrorKind::NotFound,
+    };
+    let Ok(manifest) = serde_json::from_slice::<VerifiedDepManifest>(&bytes) else {
+        return true;
+    };
+    let Some(entry) = manifest.modules.get(&spec_rel_src(&spec)) else {
+        return false;
+    };
+    cfg.lean_bin.as_os_str().is_empty()
+        || !dep_pkg_import_pins_consistent(cfg, memo, *spec, &entry.olean_artifact_digest, false)
+}
+
+/// Check-time counterpart of `collect_fresh_dep_pkg_closure` for a dependency-package module
+/// pinned at `pin` (memoizing verified nodes in `memo`): every visited module's artifacts must
+/// match its manifest entry (by stat fingerprint, else by re-hashing), its source must match the
+/// entry, and every import of that source must be pinned to the current artifacts (root- and
+/// dependency-package modules recursively, root ones kernel-audited under `strict_policy`;
+/// prebuilt imports re-digested).
+fn dep_pkg_import_pins_consistent(
+    cfg: &ProjectConfig,
+    memo: &DepImportMemo,
+    spec: DiscoveredModuleSpec,
+    pin: &str,
+    strict_policy: bool,
+) -> bool {
+    let mut manifests: HashMap<PathBuf, Option<VerifiedDepManifest>> = HashMap::new();
+    let mut seen: HashMap<(String, String), String> = HashMap::new();
+    let mut stack = vec![(spec, pin.to_string())];
+    while let Some((cur, pin)) = stack.pop() {
+        let key = (cur.pkg_name.clone(), cur.module_name.clone());
+        let memo_key = (key.0.clone(), key.1.clone(), pin.clone());
+        if strict_policy && memo.0.lock().is_ok_and(|m| m.contains(&memo_key)) {
+            continue;
+        }
+        if let Some(prev) = seen.get(&key) {
+            if *prev != pin {
+                return false;
+            }
+            continue;
+        }
+        let manifest = manifests.entry(cur.pkg_root.clone()).or_insert_with(|| {
+            read_pkg_verified_manifest(
+                cfg,
+                &cur.pkg_root,
+                &cur.pkg_name,
+                &cur.pkg_config_digest,
+                strict_policy,
+            )
+        });
+        let Some(entry) = manifest
+            .as_ref()
+            .and_then(|m| m.modules.get(&spec_rel_src(&cur)))
+        else {
+            return false;
+        };
+        let artifacts_ok = (!strict_policy || !cur.is_root_pkg || entry.kernel_audited)
+            && entry_artifacts_current(cfg, &spec_olean_path(&cur), entry);
+        let Ok(src) = fs::read_to_string(&cur.src_path) else {
+            return false;
+        };
+        let src_ok = blake3::hash(src.as_bytes()).to_hex().as_str() == entry.src_blake3;
+        let hdr = parse_header_info(&src);
+        let pins_ok = hdr.header_error.is_none()
+            && verified_entry_imports_current(entry, &hdr.imports, |imp, sub_pin| {
+                let site = match resolve_module_in_package(&cfg.root_pkg, true, imp) {
+                    Some(root_spec) => ImportSite::Module(Box::new(root_spec)),
+                    None => resolve_import_site(cfg, imp),
+                };
+                match (site, sub_pin) {
+                    (ImportSite::Toolchain, None) => true,
+                    (ImportSite::Prebuilt(o), Some(p)) => olean_digest_is(cfg, &o, p),
+                    (ImportSite::Module(sub), Some(p)) => {
+                        stack.push((*sub, p.to_string()));
+                        true
+                    }
+                    _ => false,
+                }
+            });
+        if !c_abi::verify_module_cache_key(
+            true,
+            true,
+            src_ok,
+            artifacts_ok && pins_ok && entry.olean_artifact_digest == pin,
+            true,
+        ) {
+            return false;
+        }
+        seen.insert(key, pin);
+    }
+    if strict_policy {
+        if let Ok(mut m) = memo.0.lock() {
+            m.extend(
+                seen.into_iter()
+                    .map(|((pkg, module), pin)| (pkg, module, pin)),
+            );
+        }
+    }
+    true
 }
 
 pub(crate) fn verify_module_lake_sidecars(
@@ -5093,6 +5443,7 @@ fn is_dep_olean_fresh(
     spec: &DiscoveredModuleSpec,
     src_content: &str,
     is_module: bool,
+    imports: &[String],
     olean_path: &Path,
 ) -> Option<std::time::SystemTime> {
     let pkg_root = &spec.pkg_root;
@@ -5129,18 +5480,8 @@ fn is_dep_olean_fresh(
     // (trusted mode only; untrusted builds never call `collect_fresh_dep_pkg_closure` and never
     // accept pre-existing checkout `.olean` files without host `TurboStore` CAS verification).
     // Fail closed (`None`) when the manifest or audited module entry is absent or stale.
-    let verified_manifest_path = pkg_root.join(".lake/build/.turbo_verified_sources.json");
-    let bytes = fs::read(&verified_manifest_path).ok()?;
-    let manifest: VerifiedDepManifest = serde_json::from_slice(&bytes).ok()?;
-    if manifest.pkg_name != spec.pkg_name
-        || manifest.toolchain != cfg.toolchain
-        || manifest.lean_githash != cfg.lean_githash
-        || manifest.pkg_config_digest != spec.pkg_config_digest
-        || manifest.workspace_config_digest != cfg.canonical_config_digest
-        || manifest.allowed_axioms != crate::splitter::allowed_axioms()
-    {
-        return None;
-    }
+    let manifest =
+        read_pkg_verified_manifest(cfg, pkg_root, &spec.pkg_name, &spec.pkg_config_digest, true)?;
     let rel_src = src_path
         .strip_prefix(pkg_root)
         .unwrap_or(src_path)
@@ -5160,6 +5501,27 @@ fn is_dep_olean_fresh(
     )
     .ok()?;
     if entry.olean_artifact_digest != actual_olean_digest {
+        return None;
+    }
+    // Same-package pins compare against `manifest`; other packages' against their on-disk
+    // artifacts. `collect_fresh_dep_pkg_closure` verifies every visited module the same way.
+    let preserve = crate::lake_build::worktree_auto_link_disabled(&cfg.root_pkg.pkg_root);
+    let pins_ok = verified_entry_imports_current(entry, imports, |imp, pin| {
+        match (resolve_import_site(cfg, imp), pin) {
+            (ImportSite::Toolchain, None) => true,
+            (ImportSite::Module(d), Some(pin)) if d.pkg_name == spec.pkg_name => manifest
+                .modules
+                .get(&spec_rel_src(&d))
+                .is_some_and(|e| e.olean_artifact_digest == pin),
+            (ImportSite::Module(d), Some(pin)) => {
+                compute_olean_artifact_set_digest_with_policy(&spec_olean_path(&d), preserve)
+                    .is_ok_and(|dig| dig == pin)
+            }
+            _ => false,
+        }
+    });
+    // Toolchain, configuration, and source were matched above.
+    if !c_abi::verify_module_cache_key(true, true, true, pins_ok, true) {
         return None;
     }
     let rel_slash = module_name_to_rel_slash(&spec.module_name);
@@ -5207,7 +5569,8 @@ fn collect_fresh_dep_pkg_closure(
         }
         let rel_slash = module_name_to_rel_slash(&cur.module_name);
         let olean_path = cur.build_lib_lean_dir.join(format!("{}.olean", rel_slash));
-        let Some(cur_olean_mtime) = is_dep_olean_fresh(cfg, &cur, &src, hdr.is_module, &olean_path)
+        let Some(cur_olean_mtime) =
+            is_dep_olean_fresh(cfg, &cur, &src, hdr.is_module, &hdr.imports, &olean_path)
         else {
             return Ok(None);
         };
@@ -5499,16 +5862,11 @@ pub fn build_module_dag_with_trust(
         }
     }
     // Collect caller LEAN_PATH directories for prebuilt external olean lookup (trusted mode only)
-    let mut external_lean_path_dirs: Vec<PathBuf> = Vec::new();
-    if !is_untrusted {
-        if let Ok(lp) = std::env::var("LEAN_PATH") {
-            for p in std::env::split_paths(&lp) {
-                if p.is_dir() && p != cfg.toolchain_lib_lean {
-                    external_lean_path_dirs.push(p);
-                }
-            }
-        }
-    }
+    let external_lean_path_dirs = if is_untrusted {
+        Vec::new()
+    } else {
+        trusted_lean_path_dirs(cfg)
+    };
     let mut nodes: BTreeMap<String, ModuleNode> = BTreeMap::new();
     let mut root_modules = Vec::new();
     let mut worklist: VecDeque<(DiscoveredModuleSpec, bool)> = VecDeque::new();
@@ -8267,7 +8625,41 @@ pub(crate) fn record_verified_dep_source(
     node: &ModuleNode,
     olean_artifact_digest: &str,
     kernel_audited: bool,
+    olean_digests: &HashMap<String, String>,
 ) {
+    // Pin the direct imports the `.olean` was elaborated against; skip recording if the
+    // source moved on mid-build or a dependency digest is unknown.
+    let Some(header) = fs::read_to_string(&node.src_path)
+        .ok()
+        .filter(|src| blake3::hash(src.as_bytes()).to_hex().as_str() == node.src_blake3)
+        .map(|src| parse_header_info(&src))
+    else {
+        return;
+    };
+    let direct_imports = node.direct_dag_deps.iter().chain(
+        node.external_olean_deps
+            .iter()
+            .map(|(m, _)| m)
+            .filter(|m| header.imports.contains(m)),
+    );
+    let Some(import_olean_digests) = direct_imports
+        .map(|m| Some((m.clone(), olean_digests.get(m)?.clone())))
+        .collect::<Option<BTreeMap<_, _>>>()
+    else {
+        return;
+    };
+    // Fingerprint only a stable artifact set that still digests to the recorded value.
+    let fp = olean_artifact_stat_fingerprint(&node.olean_path);
+    let artifact_stat_fingerprint = fp
+        .filter(|fp| {
+            compute_olean_artifact_set_digest_with_policy(
+                &node.olean_path,
+                crate::lake_build::worktree_auto_link_disabled(&cfg.root_pkg.pkg_root),
+            )
+            .is_ok_and(|d| d == olean_artifact_digest)
+                && olean_artifact_stat_fingerprint(&node.olean_path).as_ref() == Some(fp)
+        })
+        .unwrap_or_default();
     let pkg_root = &node.pkg_root;
     let build_dir = pkg_root.join(".lake/build");
     let _ = fs::create_dir_all(&build_dir);
@@ -8281,8 +8673,22 @@ pub(crate) fn record_verified_dep_source(
                 && m.toolchain == cfg.toolchain
                 && m.lean_githash == cfg.lean_githash
                 && m.pkg_config_digest == node.pkg_config_digest
-                && m.workspace_config_digest == cfg.canonical_config_digest
-                && m.allowed_axioms == allowed_axioms
+        })
+        .map(|mut m| {
+            // Retain untouched sibling entries across workspace-digest or axiom-policy shifts
+            // (`turbo-lean build` rooted inside a dependency package vs. from its consumer, or
+            // under a narrower allowlist) so `dep_pkg_module_stale` never misclassifies a
+            // previously native-built sibling as Lake-managed. Positive fast-path reuse still
+            // checks every visited module's import closure; when `allowed_axioms` changed, drop
+            // `kernel_audited` on retained entries so stale audit bits never carry over.
+            if m.allowed_axioms != allowed_axioms {
+                for e in m.modules.values_mut() {
+                    e.kernel_audited = false;
+                }
+                m.allowed_axioms = allowed_axioms.clone();
+            }
+            m.workspace_config_digest = cfg.canonical_config_digest.clone();
+            m
         })
         .unwrap_or_else(|| VerifiedDepManifest {
             pkg_name: node.pkg_name.clone(),
@@ -8292,6 +8698,8 @@ pub(crate) fn record_verified_dep_source(
             workspace_config_digest: cfg.canonical_config_digest.clone(),
             allowed_axioms,
             modules: BTreeMap::new(),
+            cfg: None,
+            dep_import_memo: DepImportMemo::default(),
         });
     let rel_src = node
         .src_path
@@ -8305,6 +8713,8 @@ pub(crate) fn record_verified_dep_source(
             src_blake3: node.src_blake3.clone(),
             olean_artifact_digest: olean_artifact_digest.to_string(),
             kernel_audited,
+            import_olean_digests,
+            artifact_stat_fingerprint,
         },
     );
     if let Ok(json_bytes) = serde_json::to_vec(&manifest) {
@@ -8586,7 +8996,13 @@ pub fn build_project_modules_native(
                             true,
                         )?;
                         if !is_untrusted {
-                            record_verified_dep_source(&cfg, node, &dig, node.is_root_pkg);
+                            record_verified_dep_source(
+                                &cfg,
+                                node,
+                                &dig,
+                                node.is_root_pkg,
+                                &olean_digests,
+                            );
                         }
                     }
                     olean_digests.insert(mod_name.clone(), dig);
@@ -8783,7 +9199,7 @@ pub fn build_project_modules_native(
                 dur_ms,
             )?;
             if !is_untrusted {
-                record_verified_dep_source(&cfg, node, &dig, node.is_root_pkg);
+                record_verified_dep_source(&cfg, node, &dig, node.is_root_pkg, &olean_digests);
             }
             olean_digests.insert(mod_name.clone(), dig);
             report.modules_compiled += 1;
@@ -8797,6 +9213,12 @@ pub(crate) static BWRAP_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Serialize native builds with tests that toggle `TURBO_LEAN_NO_WORKTREE_LINK`.
+    fn native_build_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
     fn make_temp_test_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "turbo_lean_mod_builder_{}_{}_{}",
@@ -10167,8 +10589,612 @@ lean_exe «demo-exe» where
         Ok(())
     }
 
+    /// P0-4: rebuilding only an imported module (`build App.A`) must invalidate the manifest
+    /// entry of its reverse dependent `App.B`, whose `.olean` was elaborated against the old `A`.
+    #[test]
+    fn test_dependent_manifest_entry_stale_after_import_only_rebuild() {
+        let _env_guard = native_build_env_guard();
+        let dir = make_temp_test_dir("stale_dependent");
+        let proj_dir = dir.join("proj");
+        fs::create_dir_all(proj_dir.join("App")).unwrap();
+        fs::write(
+            proj_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )
+        .unwrap();
+        fs::write(
+            proj_dir.join("lakefile.toml"),
+            "name = \"app_pkg\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\nglobs = [\"App.+\"]\n",
+        )
+        .unwrap();
+        let a_src = |v: u32| format!("namespace App\ndef g : Nat := {v}\nend App\n");
+        fs::write(proj_dir.join("App/A.lean"), a_src(3)).unwrap();
+        let b_file = proj_dir.join("App/B.lean");
+        let b_src = "import App.A\nnamespace App\ntheorem g_eq : g = 3 := rfl\nend App\n";
+        fs::write(&b_file, b_src).unwrap();
+        let mut store = TurboStore::open(Some(&dir.join(".turbo_store"))).unwrap();
+        let mut build = |targets: &[String]| {
+            build_project_modules_native(
+                &mut store,
+                &proj_dir,
+                targets,
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap()
+        };
+        assert_eq!(build(&[]).modules_compiled, 2);
+        let canon = proj_dir.canonicalize().unwrap();
+        let canon_b = b_file.canonicalize().unwrap();
+        assert!(crate::lake_build::is_file_verified_in_lake_build(
+            &canon, &canon_b, b_src
+        ));
+        assert!(crate::lake_build::resolve_prebuilt_module_import(&canon, &canon_b).is_some());
+        // Edit `A` so `B`'s theorem no longer holds, then rebuild only `App.A`.
+        fs::write(proj_dir.join("App/A.lean"), a_src(4)).unwrap();
+        let rep = build(&["App.A".to_string()]);
+        assert_eq!(rep.compiled_modules, vec!["App.A".to_string()]);
+        assert!(
+            !crate::lake_build::is_file_verified_in_lake_build(&canon, &canon_b, b_src),
+            "`App.B` reported verified from an `.olean` built against the old `App.A`"
+        );
+        assert!(crate::lake_build::resolve_prebuilt_module_import(&canon, &canon_b).is_none());
+        // Restoring the original `A` (CAS hit) makes `B`'s recorded inputs current again.
+        fs::write(proj_dir.join("App/A.lean"), a_src(3)).unwrap();
+        let rep = build(&["App.A".to_string()]);
+        assert_eq!(rep.cached_modules, vec!["App.A".to_string()]);
+        assert!(crate::lake_build::is_file_verified_in_lake_build(
+            &canon, &canon_b, b_src
+        ));
+        // Legacy entries without pinned import digests fail closed.
+        let manifest_path = crate::lake_build::verified_sources_manifest_path(&canon);
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        for entry in legacy["modules"].as_object_mut().unwrap().values_mut() {
+            entry
+                .as_object_mut()
+                .unwrap()
+                .remove("import_olean_digests");
+        }
+        fs::write(&manifest_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(!crate::lake_build::is_file_verified_in_lake_build(
+            &canon, &canon_b, b_src
+        ));
+        // ...and gives no freshness evidence before elaboration: every built import is refreshed.
+        let c_file = canon.join("App/C.lean");
+        fs::write(&c_file, "import App.B\n").unwrap();
+        let res = crate::lake_build::ensure_project_imports_fresh_for_check(&canon, &[c_file]);
+        assert!(
+            !matches!(res, Ok(0)),
+            "legacy manifest fell back to timestamps"
+        );
+        assert!(!manifest_path.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// P0-4 across packages: rebuilding only a transitive dependency-package import must
+    /// invalidate the root module, and an entry missing an external pin fails closed.
+    #[test]
+    fn test_root_entry_stale_after_transitive_dep_pkg_rebuild() {
+        let _env_guard = native_build_env_guard();
+        let dir = make_temp_test_dir("stale_dep_pkg");
+        let proj_dir = dir.join("proj");
+        let dep_dir = proj_dir.join(".lake/packages/dep_pkg");
+        fs::create_dir_all(dep_dir.join("DepPkg")).unwrap();
+        fs::create_dir_all(proj_dir.join("App")).unwrap();
+        for d in [&proj_dir, &dep_dir] {
+            fs::write(d.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        }
+        fs::write(
+            dep_dir.join("lakefile.toml"),
+            "name = \"dep_pkg\"\n[[lean_lib]]\nname = \"DepPkg\"\nglobs = [\"DepPkg.+\"]\n",
+        )
+        .unwrap();
+        let a_src = |v: u32| format!("namespace DepPkg\ndef g : Nat := {v}\nend DepPkg\n");
+        fs::write(dep_dir.join("DepPkg/A.lean"), a_src(3)).unwrap();
+        fs::write(
+            dep_dir.join("DepPkg/B.lean"),
+            "import DepPkg.A\nnamespace DepPkg\ndef h : Nat := g\nend DepPkg\n",
+        )
+        .unwrap();
+        fs::write(
+            proj_dir.join("lake-manifest.json"),
+            r#"{"version": "1.2.0", "packagesDir": ".lake/packages", "packages": [{"type": "path", "name": "dep_pkg", "dir": ".lake/packages/dep_pkg", "configFile": "lakefile.toml", "inherited": false}], "name": "app_pkg", "lakeDir": ".lake", "fixedToolchain": false}"#,
+        )
+        .unwrap();
+        fs::write(
+            proj_dir.join("lakefile.toml"),
+            "name = \"app_pkg\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\nglobs = [\"App.+\"]\n",
+        )
+        .unwrap();
+        let c_file = proj_dir.join("App/C.lean");
+        let c_src = "import DepPkg.B\nnamespace App\ntheorem h_eq : DepPkg.h = 3 := rfl\nend App\n";
+        fs::write(&c_file, c_src).unwrap();
+        let mut store = TurboStore::open(Some(&dir.join(".turbo_store"))).unwrap();
+        let mut build = |root: &Path, targets: &[String]| {
+            build_project_modules_native(
+                &mut store,
+                root,
+                targets,
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap()
+        };
+        assert_eq!(build(&proj_dir, &[]).modules_compiled, 3);
+        let canon = proj_dir.canonicalize().unwrap();
+        let canon_c = c_file.canonicalize().unwrap();
+        let verified =
+            || crate::lake_build::is_file_verified_in_lake_build(&canon, &canon_c, c_src);
+        assert!(verified());
+        // An entry missing its external pin fails closed.
+        let manifest_path = crate::lake_build::verified_sources_manifest_path(&canon);
+        let good = fs::read(&manifest_path).unwrap();
+        let mut partial: serde_json::Value = serde_json::from_slice(&good).unwrap();
+        partial["modules"]["App/C.lean"]["import_olean_digests"] = serde_json::json!({});
+        fs::write(&manifest_path, serde_json::to_vec(&partial).unwrap()).unwrap();
+        assert!(!verified(), "unpinned dependency-package import accepted");
+        fs::write(&manifest_path, &good).unwrap();
+        assert!(verified());
+        // ...and so does a dependency-package entry missing a pin.
+        let dep_manifest_path = dep_dir.join(".lake/build/.turbo_verified_sources.json");
+        let dep_good = fs::read(&dep_manifest_path).unwrap();
+        let mut dep_partial: serde_json::Value = serde_json::from_slice(&dep_good).unwrap();
+        assert!(
+            dep_partial["modules"]["DepPkg/A.lean"]["artifact_stat_fingerprint"]
+                .as_str()
+                .is_some_and(|fp| !fp.is_empty())
+        );
+        dep_partial["modules"]["DepPkg/B.lean"]["import_olean_digests"] = serde_json::json!({});
+        fs::write(
+            &dep_manifest_path,
+            serde_json::to_vec(&dep_partial).unwrap(),
+        )
+        .unwrap();
+        assert!(!verified(), "unpinned transitive import accepted");
+        fs::write(&dep_manifest_path, &dep_good).unwrap();
+        assert!(verified());
+        // A foreign rewrite of a transitive `.olean` with an old mtime is detected, and putting
+        // the original bytes back (new ctime, same digest) is accepted again.
+        let a_olean = dep_dir.join(".lake/build/lib/lean/DepPkg/A.olean");
+        let a_bytes = fs::read(&a_olean).unwrap();
+        let _ = fs::remove_file(&a_olean);
+        fs::write(&a_olean, b"foreign olean").unwrap();
+        assert!(Command::new("touch")
+            .args(["-d", "@1000000000"])
+            .arg(&a_olean)
+            .status()
+            .unwrap()
+            .success());
+        assert!(!verified(), "rewritten transitive `.olean` accepted");
+        let _ = fs::remove_file(&a_olean);
+        fs::write(&a_olean, &a_bytes).unwrap();
+        assert!(verified());
+        // Rebuild only the transitive import `DepPkg.A` (inside the dependency package).
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(dep_dir.join("DepPkg/A.lean"), a_src(4)).unwrap();
+        let rep = build(&dep_dir, &["DepPkg.A".to_string()]);
+        assert_eq!(rep.compiled_modules, vec!["DepPkg.A".to_string()]);
+        assert!(
+            !verified(),
+            "`App.C` reported verified against a dependency closure rebuilt underneath it"
+        );
+        assert!(crate::lake_build::resolve_prebuilt_module_import(&canon, &canon_c).is_none());
+        // `check` must not elaborate `App.C` against the stale `DepPkg.B` either.
+        let res = crate::lake_build::ensure_project_imports_fresh_for_check(
+            &canon,
+            std::slice::from_ref(&canon_c),
+        );
+        assert!(
+            !matches!(res, Ok(0)),
+            "stale `DepPkg.B` left in place for elaboration"
+        );
+        // The dependency's own manifest is the evidence: it counts without a root manifest too.
+        let _ = fs::remove_file(&manifest_path);
+        let res = crate::lake_build::ensure_project_imports_fresh_for_check(
+            &canon,
+            std::slice::from_ref(&canon_c),
+        );
+        assert!(
+            !matches!(res, Ok(0)),
+            "dependency evidence ignored without a root manifest"
+        );
+        // Rebuilding the root must not reuse the stale `DepPkg.B` as a fresh external closure:
+        // its pin for `DepPkg.A` no longer matches, so `B` is rebuilt and `App.C` (`h = 3`) fails.
+        let rebuilt = build_project_modules_native(
+            &mut store,
+            &proj_dir,
+            &[],
+            "trusted-internal",
+            1,
+            false,
+            true,
+            None,
+        );
+        assert!(rebuilt.is_err(), "stale `DepPkg.B` reused: {rebuilt:?}");
+        assert!(!verified());
+        // An unreadable dependency manifest establishes nothing: refresh rather than trust it.
+        fs::write(&dep_manifest_path, b"{").unwrap();
+        let res = crate::lake_build::ensure_project_imports_fresh_for_check(
+            &canon,
+            std::slice::from_ref(&canon_c),
+        );
+        assert!(
+            !matches!(res, Ok(0)),
+            "corrupt dependency manifest treated as Lake-managed"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// P0-4 on the elaboration path: a CAS restore of an import (old blob mtime) must still make
+    /// `ensure_project_imports_fresh_for_check` treat dependents built against the newer import
+    /// as stale, so `check` never elaborates against a stale intermediate `.olean`.
+    #[test]
+    fn test_check_refreshes_dependent_after_import_cas_restore() {
+        let _env_guard = native_build_env_guard();
+        let dir = make_temp_test_dir("stale_dependent_restore");
+        let proj_dir = dir.join("proj");
+        fs::create_dir_all(proj_dir.join("App")).unwrap();
+        fs::write(
+            proj_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )
+        .unwrap();
+        fs::write(
+            proj_dir.join("lakefile.toml"),
+            "name = \"app_pkg\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\nglobs = [\"App.+\"]\n",
+        )
+        .unwrap();
+        let a_src = |v: u32| format!("namespace App\ndef g : Nat := {v}\nend App\n");
+        let b_src = |v: u32| {
+            format!("import App.A\nnamespace App\ntheorem g_eq : g = {v} := rfl\nend App\n")
+        };
+        let mut store = TurboStore::open(Some(&dir.join(".turbo_store"))).unwrap();
+        let mut build = |targets: &[String]| {
+            build_project_modules_native(
+                &mut store,
+                &proj_dir,
+                targets,
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap()
+        };
+        fs::write(proj_dir.join("App/A.lean"), a_src(3)).unwrap();
+        fs::write(proj_dir.join("App/B.lean"), b_src(3)).unwrap();
+        build(&[]);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(proj_dir.join("App/A.lean"), a_src(4)).unwrap();
+        fs::write(proj_dir.join("App/B.lean"), b_src(4)).unwrap();
+        build(&[]);
+        // Restore `A` v3 from CAS; `B` (built against `A` v4) is now stale.
+        fs::write(proj_dir.join("App/A.lean"), a_src(3)).unwrap();
+        let rep = build(&["App.A".to_string()]);
+        assert_eq!(rep.cached_modules, vec!["App.A".to_string()]);
+        let canon = proj_dir.canonicalize().unwrap();
+        let c_file = canon.join("App/C.lean");
+        fs::write(&c_file, "import App.B\n").unwrap();
+        // Lake must be asked to refresh `App.B` (which then fails: `g = 4` no longer holds).
+        let res = crate::lake_build::ensure_project_imports_fresh_for_check(&canon, &[c_file]);
+        assert!(
+            !matches!(res, Ok(0)),
+            "stale `App.B` left in place for elaboration"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// P0-4 on the elaboration path: an import whose artifacts were replaced behind turbo-lean's
+    /// back (old mtimes, unchanged source and manifest) must be refreshed before elaboration.
+    #[test]
+    fn test_check_refreshes_after_foreign_import_artifact_restore() {
+        let _env_guard = native_build_env_guard();
+        let dir = make_temp_test_dir("foreign_import_restore");
+        let proj_dir = dir.join("proj");
+        fs::create_dir_all(proj_dir.join("App")).unwrap();
+        fs::write(
+            proj_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )
+        .unwrap();
+        fs::write(
+            proj_dir.join("lakefile.toml"),
+            "name = \"app_pkg\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\nglobs = [\"App.+\"]\n",
+        )
+        .unwrap();
+        let a_src = |v: u32| format!("namespace App\ndef g : Nat := {v}\nend App\n");
+        let b_src = |v: u32| {
+            format!("import App.A\nnamespace App\ntheorem g_eq : g = {v} := rfl\nend App\n")
+        };
+        let mut store = TurboStore::open(Some(&dir.join(".turbo_store"))).unwrap();
+        let mut build = || {
+            build_project_modules_native(
+                &mut store,
+                &proj_dir,
+                &[],
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap()
+        };
+        fs::write(proj_dir.join("App/A.lean"), a_src(3)).unwrap();
+        fs::write(proj_dir.join("App/B.lean"), b_src(3)).unwrap();
+        build();
+        let a_olean = proj_dir.join(".lake/build/lib/lean/App/A.olean");
+        let old_a = fs::read(&a_olean).unwrap();
+        fs::write(proj_dir.join("App/A.lean"), a_src(4)).unwrap();
+        fs::write(proj_dir.join("App/B.lean"), b_src(4)).unwrap();
+        build();
+        // Put the `A` v3 `.olean` back with ordered, old timestamps; source and manifest say v4.
+        let _ = fs::remove_file(&a_olean);
+        fs::write(&a_olean, &old_a).unwrap();
+        for (path, stamp) in [
+            (proj_dir.join("App/A.lean"), "@1000000000"),
+            (a_olean.clone(), "@1000000001"),
+        ] {
+            assert!(Command::new("touch")
+                .args(["-d", stamp])
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let canon = proj_dir.canonicalize().unwrap();
+        let c_file = canon.join("App/C.lean");
+        fs::write(&c_file, "import App.B\n").unwrap();
+        let res = crate::lake_build::ensure_project_imports_fresh_for_check(&canon, &[c_file]);
+        assert!(
+            !matches!(res, Ok(0)),
+            "foreign `App.A` artifact left in place under `App.B`"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// P0-4: a dependency module named `Lean.*` is not a toolchain module. With no root manifest,
+    /// a stale pin still forces a refresh (or a fail-closed error) instead of `Ok(0)`.
+    #[test]
+    fn test_dep_owned_lean_namespace_stale_without_root_manifest() {
+        let _env_guard = native_build_env_guard();
+        let dir = make_temp_test_dir("stale_lean_ns");
+        let proj_dir = dir.join("proj");
+        let dep_dir = proj_dir.join(".lake/packages/dep_pkg");
+        fs::create_dir_all(dep_dir.join("Lean")).unwrap();
+        fs::create_dir_all(proj_dir.join("App")).unwrap();
+        for d in [&proj_dir, &dep_dir] {
+            fs::write(d.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        }
+        fs::write(
+            dep_dir.join("lakefile.toml"),
+            "name = \"dep_pkg\"\n[[lean_lib]]\nname = \"Lean\"\nglobs = [\"Lean.+\"]\n",
+        )
+        .unwrap();
+        fs::write(dep_dir.join("Lean/Base.lean"), "def base : Nat := 1\n").unwrap();
+        fs::write(
+            dep_dir.join("Lean/Extra.lean"),
+            "import Lean.Base\ndef extra : Nat := base\n",
+        )
+        .unwrap();
+        fs::write(
+            proj_dir.join("lake-manifest.json"),
+            r#"{"version": "1.2.0", "packagesDir": ".lake/packages", "packages": [{"type": "path", "name": "dep_pkg", "dir": ".lake/packages/dep_pkg", "configFile": "lakefile.toml", "inherited": false}], "name": "app_pkg", "lakeDir": ".lake", "fixedToolchain": false}"#,
+        )
+        .unwrap();
+        fs::write(
+            proj_dir.join("lakefile.toml"),
+            "name = \"app_pkg\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\nglobs = [\"App.+\"]\n",
+        )
+        .unwrap();
+        let c_file = proj_dir.join("App/C.lean");
+        fs::write(&c_file, "import Lean.Extra\n#check extra\n").unwrap();
+        let mut store = TurboStore::open(Some(&dir.join(".turbo_store"))).unwrap();
+        assert_eq!(
+            build_project_modules_native(
+                &mut store,
+                &proj_dir,
+                &[],
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap()
+            .modules_compiled,
+            3
+        );
+        let dep_manifest_path = dep_dir.join(".lake/build/.turbo_verified_sources.json");
+        let mut dep_partial: serde_json::Value =
+            serde_json::from_slice(&fs::read(&dep_manifest_path).unwrap()).unwrap();
+        dep_partial["modules"]["Lean/Extra.lean"]["import_olean_digests"]
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "Lean.Base".into(),
+                serde_json::json!("not-the-recorded-digest"),
+            );
+        fs::write(
+            &dep_manifest_path,
+            serde_json::to_vec(&dep_partial).unwrap(),
+        )
+        .unwrap();
+        let canon = proj_dir.canonicalize().unwrap();
+        let _ = fs::remove_file(crate::lake_build::verified_sources_manifest_path(&canon));
+        let res = crate::lake_build::ensure_project_imports_fresh_for_check(
+            &canon,
+            std::slice::from_ref(&c_file.canonicalize().unwrap()),
+        );
+        assert!(
+            !matches!(res, Ok(0)),
+            "`Lean.Extra` skipped as a toolchain name: {res:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// P0-4: a root entry recorded for a different toolchain or Lean githash is stale before
+    /// elaboration, even when its only imports are genuine toolchain modules (unpinned).
+    #[test]
+    fn test_root_entry_stale_on_toolchain_identity_mismatch() {
+        let _env_guard = native_build_env_guard();
+        let dir = make_temp_test_dir("stale_tc_identity");
+        let proj_dir = dir.join("proj");
+        fs::create_dir_all(proj_dir.join("App")).unwrap();
+        fs::write(
+            proj_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )
+        .unwrap();
+        fs::write(
+            proj_dir.join("lakefile.toml"),
+            "name = \"app_pkg\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\nglobs = [\"App.+\"]\n",
+        )
+        .unwrap();
+        let b_src = "import Init\ntheorem t : True := trivial\n";
+        fs::write(proj_dir.join("App/B.lean"), b_src).unwrap();
+        let mut store = TurboStore::open(Some(&dir.join(".turbo_store"))).unwrap();
+        build_project_modules_native(
+            &mut store,
+            &proj_dir,
+            &[],
+            "trusted-internal",
+            1,
+            false,
+            true,
+            None,
+        )
+        .unwrap();
+        let canon = proj_dir.canonicalize().unwrap();
+        let manifest_path = crate::lake_build::verified_sources_manifest_path(&canon);
+        let good = fs::read(&manifest_path).unwrap();
+        let c_file = canon.join("App/C.lean");
+        fs::write(&c_file, "import App.B\n").unwrap();
+        let fresh = |bytes: &[u8]| {
+            fs::write(&manifest_path, bytes).unwrap();
+            crate::lake_build::ensure_project_imports_fresh_for_check(
+                &canon,
+                std::slice::from_ref(&c_file),
+            )
+        };
+        assert!(
+            matches!(fresh(&good), Ok(0)),
+            "matching toolchain identity must stay fresh"
+        );
+        for (field, value) in [
+            ("toolchain", "leanprover/lean4:v4.24.0"),
+            ("lean_githash", "0000000000000000000000000000000000000000"),
+        ] {
+            let mut stale: serde_json::Value = serde_json::from_slice(&good).unwrap();
+            stale[field] = serde_json::json!(value);
+            let res = fresh(&serde_json::to_vec(&stale).unwrap());
+            assert!(
+                !matches!(res, Ok(0)),
+                "mismatched `{field}` left `App.B` in place: {res:?}"
+            );
+            fs::write(&manifest_path, &good).unwrap();
+        }
+        // Without a resolvable package config, `lean_githash` cannot be verified, so fail closed.
+        let lakefile = canon.join("lakefile.toml");
+        let saved_lakefile = fs::read(&lakefile).unwrap();
+        fs::remove_file(&lakefile).unwrap();
+        let mut stale: serde_json::Value = serde_json::from_slice(&good).unwrap();
+        stale["lean_githash"] = serde_json::json!("0000000000000000000000000000000000000000");
+        let res = fresh(&serde_json::to_vec(&stale).unwrap());
+        assert!(
+            !matches!(res, Ok(0)),
+            "missing lakefile bypassed `lean_githash` check: {res:?}"
+        );
+        fs::write(&lakefile, saved_lakefile).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// P0-4 across a dependency-to-root edge: `App.C → DepPkg.B → App.A → App.X`; rebuilding only
+    /// `App.X` must invalidate `App.C`.
+    #[test]
+    fn test_root_entry_stale_through_dep_to_root_import() {
+        let _env_guard = native_build_env_guard();
+        let dir = make_temp_test_dir("stale_dep_to_root");
+        let proj_dir = dir.join("proj");
+        let dep_dir = proj_dir.join(".lake/packages/dep_pkg");
+        fs::create_dir_all(dep_dir.join("DepPkg")).unwrap();
+        fs::create_dir_all(proj_dir.join("App")).unwrap();
+        for d in [&proj_dir, &dep_dir] {
+            fs::write(d.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        }
+        fs::write(
+            dep_dir.join("lakefile.toml"),
+            "name = \"dep_pkg\"\n[[lean_lib]]\nname = \"DepPkg\"\nglobs = [\"DepPkg.+\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            dep_dir.join("DepPkg/B.lean"),
+            "import App.A\nnamespace DepPkg\ndef h : Nat := App.k\nend DepPkg\n",
+        )
+        .unwrap();
+        fs::write(
+            proj_dir.join("lake-manifest.json"),
+            r#"{"version": "1.2.0", "packagesDir": ".lake/packages", "packages": [{"type": "path", "name": "dep_pkg", "dir": ".lake/packages/dep_pkg", "configFile": "lakefile.toml", "inherited": false}], "name": "app_pkg", "lakeDir": ".lake", "fixedToolchain": false}"#,
+        )
+        .unwrap();
+        fs::write(
+            proj_dir.join("lakefile.toml"),
+            "name = \"app_pkg\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\nglobs = [\"App.+\"]\n",
+        )
+        .unwrap();
+        let x_src = |v: u32| format!("namespace App\ndef x : Nat := {v}\nend App\n");
+        fs::write(proj_dir.join("App/X.lean"), x_src(3)).unwrap();
+        fs::write(
+            proj_dir.join("App/A.lean"),
+            "import App.X\nnamespace App\ndef k : Nat := x\nend App\n",
+        )
+        .unwrap();
+        let c_file = proj_dir.join("App/C.lean");
+        let c_src = "import DepPkg.B\nnamespace App\ntheorem h_eq : DepPkg.h = 3 := rfl\nend App\n";
+        fs::write(&c_file, c_src).unwrap();
+        let mut store = TurboStore::open(Some(&dir.join(".turbo_store"))).unwrap();
+        let mut build = |targets: &[String]| {
+            build_project_modules_native(
+                &mut store,
+                &proj_dir,
+                targets,
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap()
+        };
+        assert_eq!(build(&[]).modules_compiled, 4);
+        let canon = proj_dir.canonicalize().unwrap();
+        let canon_c = c_file.canonicalize().unwrap();
+        let verified =
+            || crate::lake_build::is_file_verified_in_lake_build(&canon, &canon_c, c_src);
+        assert!(verified());
+        fs::write(proj_dir.join("App/X.lean"), x_src(4)).unwrap();
+        assert_eq!(
+            build(&["App.X".to_string()]).compiled_modules,
+            vec!["App.X".to_string()]
+        );
+        assert!(
+            !verified(),
+            "`App.C` accepted through a dependency-to-root edge onto a rebuilt `App.X`"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_native_module_builder_cas_partial_invalidation_lazy_c_and_lake_differential() {
+        let _env_guard = native_build_env_guard();
         let dir = make_temp_test_dir("native_e2e");
         let store_dir = dir.join(".turbo_store");
         let proj_dir = dir.join("proj");
@@ -10691,10 +11717,7 @@ lean_exe «demo-exe» where
 
     #[test]
     fn test_adversarial_cas_key_dep_digest_validation_and_ambiguous_or_same_mtime_deps() {
-        // Other tests toggle `TURBO_LEAN_NO_WORKTREE_LINK` under the env lock.
-        let _env_guard = crate::pack::tests::env_test_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _env_guard = native_build_env_guard();
         let _bwrap_guard = BWRAP_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());

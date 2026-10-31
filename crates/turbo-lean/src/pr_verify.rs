@@ -3290,7 +3290,19 @@ fn statement_lake_command(project: &Path, is_untrusted: bool) -> Result<Command>
 
 fn statement_lean_command(project: &Path, is_untrusted: bool) -> Result<Command> {
     // Static package paths only: never ask project code to supply PATH/LEAN_PATH.
-    let cfg = crate::module_builder::resolve_project_config_with_trust(project, true)?;
+    let mut cfg = crate::module_builder::resolve_project_config_with_trust(project, is_untrusted)?;
+    if !is_untrusted && cfg.lean_bin.as_os_str().is_empty() {
+        let (lean_bin, lean_githash, toolchain_lib_lean, toolchain_lib) =
+            crate::module_builder::resolve_toolchain_compiler_with_trust(
+                project,
+                &cfg.toolchain,
+                true,
+            )?;
+        cfg.lean_bin = lean_bin;
+        cfg.lean_githash = lean_githash;
+        cfg.toolchain_lib_lean = toolchain_lib_lean;
+        cfg.toolchain_lib = toolchain_lib;
+    }
     let (lean_path, _) = crate::module_builder::build_lean_search_path(&cfg, true);
     statement_toolchain_command(project, is_untrusted, "lean", Some(&lean_path))
 }
@@ -3971,15 +3983,19 @@ pub fn run_pr_verify_command(
             )?;
         }
     } else if !is_untrusted {
+        // Proof-only edits still elaborate against imported `.olean`s. Freshness (including
+        // dependency-package modules and custom `srcDir` layouts) runs either way: opt-out
+        // fails closed inside `ensure_…` before any `.lake` write, while auto-link also builds
+        // unbuilt imports on a fresh worktree and honors `[lake] build_command` at `--base`.
         let edited: Vec<PathBuf> = shards_by_file.keys().map(|f| canon_dir.join(f)).collect();
-        if crate::lake_build::worktree_auto_link_disabled(&canon_dir) {
-            crate::lake_build::ensure_project_imports_fresh_for_check(&canon_dir, &edited)?;
-        } else if crate::lake_build::has_lake_config(&canon_dir) {
-            let imports = crate::lake_build::project_imports_of(&canon_dir, &edited);
-            if !imports.is_empty() {
-                crate::lake_build::lake_build_modules(&canon_dir, &imports, Some(&base))?;
-            }
-        }
+        let build_missing = !crate::lake_build::worktree_auto_link_disabled(&canon_dir)
+            && crate::lake_build::has_lake_config(&canon_dir);
+        crate::lake_build::ensure_project_imports_fresh(
+            &canon_dir,
+            &edited,
+            Some(&base),
+            build_missing,
+        )?;
     }
     let lake_recheck_ms = lake_t0.elapsed().as_millis();
 
@@ -5106,6 +5122,176 @@ mod pr_verify_tests {
         Ok(())
     }
 
+    /// P0-4: a proof-only edit that imports a stale dependency-package `.olean` is refreshed when
+    /// linking is on, and fails closed without touching `.lake` when it is off.
+    #[test]
+    fn test_trusted_pr_verify_refreshes_stale_dep_import() -> Result<()> {
+        use crate::worktree_test_support::snapshot;
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_lean_pr_dep_fresh_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let proj = dir.join("proj");
+        let dep = dir.join("dep_pkg");
+        fs::create_dir_all(dep.join("DepPkg"))?;
+        fs::create_dir_all(proj.join("custom_src/P"))?;
+        for d in [&proj, &dep] {
+            fs::write(d.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        }
+        fs::write(
+            dep.join("lakefile.toml"),
+            "name = \"dep_pkg\"\n[[lean_lib]]\nname = \"DepPkg\"\nglobs = [\"DepPkg.+\"]\n",
+        )?;
+        fs::write(dep.join("DepPkg/Z.lean"), "def z : Nat := 1\n")?;
+        fs::write(
+            dep.join("DepPkg/A.lean"),
+            "import DepPkg.Z\ndef g : Nat := z\n",
+        )?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            format!(
+                "name = \"p\"\nsrcDir = \"custom_src\"\n[[require]]\nname = \"dep_pkg\"\npath = \"{}\"\n[[lean_lib]]\nname = \"P\"\nglobs = [\"P.+\"]\n",
+                dep.display()
+            ),
+        )?;
+        let base_marker = dir.join("base_build_cmd_ran");
+        let head_marker = dir.join("head_build_cmd_ran");
+        fs::write(
+            proj.join("turbo-lean.toml"),
+            format!(
+                "[lake]\nbuild_command = [\"sh\", \"-c\", \"touch '{}' && lake build \\\"$@\\\"\", \"sh\"]\n",
+                base_marker.display()
+            ),
+        )?;
+        fs::write(proj.join(".gitignore"), ".lake/\n")?;
+        fs::write(proj.join("custom_src/P/Local.lean"), "def k : Nat := 1\n")?;
+        let target = "import DepPkg.A\nimport P.Local\ntheorem t : g = k := by\n  rfl\n";
+        fs::write(proj.join("custom_src/P/T.lean"), target)?;
+        let lake = |args: &[&str]| Command::new("lake").args(args).current_dir(&proj).output();
+        let built = lake(&["build", "P.T"])?;
+        assert!(
+            built.status.success(),
+            "lake build P.T failed: {}\n{}",
+            String::from_utf8_lossy(&built.stdout),
+            String::from_utf8_lossy(&built.stderr)
+        );
+        git_init_and_commit(&proj, "base")?;
+        let dep_manifest = dep.join(".lake/build/.turbo_verified_sources.json");
+        let mut store = TurboStore::open(Some(&dir.join("cache")))?;
+        crate::module_builder::build_project_modules_native(
+            &mut store,
+            &proj,
+            &[],
+            "trusted-internal",
+            1,
+            false,
+            true,
+            None,
+        )?;
+        assert!(
+            dep_manifest.is_file(),
+            "dependency manifest was not recorded"
+        );
+        let good = fs::read(&dep_manifest)?;
+        let mut partial: serde_json::Value = serde_json::from_slice(&good)?;
+        partial["modules"]["DepPkg/A.lean"]["import_olean_digests"]
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "DepPkg.Z".into(),
+                serde_json::json!("not-the-recorded-digest"),
+            );
+        fs::write(&dep_manifest, serde_json::to_vec(&partial)?)?;
+        // Also remove the custom-`srcDir` root import `.olean` and retarget head `turbo-lean.toml`:
+        // linking-on `pr-verify` must rebuild both via `--base`'s `[lake] build_command`.
+        let local_olean = proj.join(".lake/build/lib/lean/P/Local.olean");
+        fs::remove_file(&local_olean)?;
+        fs::write(
+            proj.join("turbo-lean.toml"),
+            format!(
+                "[lake]\nbuild_command = [\"sh\", \"-c\", \"touch '{}' && lake build \\\"$@\\\"\", \"sh\"]\n",
+                head_marker.display()
+            ),
+        )?;
+        fs::write(
+            proj.join("custom_src/P/T.lean"),
+            target.replace("rfl", "exact rfl"),
+        )?;
+        let pr = |store: &mut TurboStore| {
+            run_pr_verify_command(
+                store,
+                true,
+                proj.clone(),
+                "HEAD".into(),
+                "trusted".into(),
+                false,
+                None,
+                None,
+                None,
+                None,
+                false,
+                0,
+                None,
+            )
+        };
+        pr(&mut store)?;
+        assert!(
+            base_marker.is_file(),
+            "did not honor --base [lake] build_command"
+        );
+        assert!(
+            !head_marker.exists(),
+            "executed unmerged head [lake] build_command"
+        );
+        assert!(
+            local_olean.is_file(),
+            "did not build missing custom-srcDir root import"
+        );
+        let restored: serde_json::Value = serde_json::from_slice(&fs::read(&dep_manifest)?)?;
+        assert!(
+            restored["modules"].get("DepPkg/A.lean").is_none(),
+            "linking-on pr-verify left the stale dependency entry in place: {restored}"
+        );
+        fs::write(&dep_manifest, &good)?;
+        fs::write(
+            proj.join("turbo-lean.toml"),
+            "[worktree]\nauto_link = false\n",
+        )?;
+        fs::write(
+            proj.join("custom_src/P/T.lean"),
+            target.replace("rfl", "simpa"),
+        )?;
+        let mut partial: serde_json::Value = serde_json::from_slice(&good)?;
+        partial["modules"]["DepPkg/A.lean"]["import_olean_digests"]
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "DepPkg.Z".into(),
+                serde_json::json!("not-the-recorded-digest"),
+            );
+        fs::write(&dep_manifest, serde_json::to_vec(&partial)?)?;
+        let before = snapshot(&proj)?;
+        let before_dep = snapshot(&dep)?;
+        let err = pr(&mut store).unwrap_err().to_string();
+        assert!(
+            err.contains("Worktree opt-out prevents refreshing stale imports: DepPkg.A"),
+            "{err}"
+        );
+        assert_eq!(snapshot(&proj)?, before, "opt-out pr-verify mutated .lake");
+        assert_eq!(
+            snapshot(&dep)?,
+            before_dep,
+            "opt-out pr-verify mutated dep .lake"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_optout_untrusted_ci_cached_audit_failure_preserves_lake_tree() -> Result<()> {
@@ -5930,13 +6116,36 @@ end Fixture
                 workspace_config_digest: cfg.canonical_config_digest.clone(),
                 allowed_axioms: crate::splitter::allowed_axioms(),
                 modules: BTreeMap::new(),
+                ..Default::default()
             });
+        // Pin project-local imports to their (already recorded) entries, like a real build.
+        let import_olean_digests = crate::module_builder::parse_header_info(src_raw)
+            .imports
+            .into_iter()
+            .filter_map(|imp| {
+                let rel_slash = crate::module_builder::module_name_to_rel_slash(&imp);
+                let dep_src = crate::lake_build::resolve_project_lean_source(proj_dir, &rel_slash)?;
+                let dep_rel = dep_src
+                    .strip_prefix(proj_dir)
+                    .ok()?
+                    .to_string_lossy()
+                    .into_owned();
+                let dig = manifest
+                    .modules
+                    .get(&dep_rel)?
+                    .olean_artifact_digest
+                    .clone();
+                Some((imp, dig))
+            })
+            .collect();
         manifest.modules.insert(
             rel_src.to_string(),
             crate::module_builder::VerifiedDepModuleEntry {
                 src_blake3: blake3::hash(src_raw.as_bytes()).to_hex().to_string(),
                 olean_artifact_digest: art_dig,
                 kernel_audited: true,
+                import_olean_digests,
+                artifact_stat_fingerprint: String::new(),
             },
         );
         fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
