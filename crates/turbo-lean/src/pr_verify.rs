@@ -224,6 +224,96 @@ pub(crate) fn fetch_git_blobs_batch(
     Ok(out_map)
 }
 
+/// Lake configuration at `base_ref`, compared with the working tree's.
+enum BaseLakeConfig {
+    /// Neither `lakefile.toml` nor `lakefile.lean` changed: per-file Lean args are unchanged.
+    Same,
+    /// The lakefile changed; the base package (`None`: no lakefile at `base_ref`, so no args).
+    Changed(Option<Box<crate::module_builder::PackageConfig>>),
+    /// The lakefile changed and the base version cannot be read or statically parsed.
+    Unknown,
+}
+
+/// Statically parses `base_ref`'s lakefile against the current package root (fail-closed parsers
+/// only; nothing is executed), so per-file Lean args can be compared across the PR. `strict`
+/// must match how the working-tree config is parsed, so both sides see the same declarations.
+/// Lakefile blobs are cached per resolved `base_sha` (commit contents are immutable), keeping
+/// warm runs free of `git` spawns.
+fn load_base_lake_config(
+    store: &TurboStore,
+    repo_root: &Path,
+    proj_prefix: &str,
+    canon_dir: &Path,
+    base_ref: &str,
+    base_sha: Option<&str>,
+    strict: bool,
+) -> BaseLakeConfig {
+    const NAMES: [&str; 2] = ["lakefile.toml", "lakefile.lean"];
+    let repo_rels: Vec<String> = NAMES
+        .iter()
+        .map(|n| join_proj_prefix(proj_prefix, n))
+        .collect();
+    let cache_file = base_sha.map(|sha| {
+        let key =
+            blake3::hash(format!("base-lakefiles:v1:{}:{}", sha, repo_rels.join(":")).as_bytes());
+        store
+            .fast_staging_dir()
+            .join(format!("git_base_lakefiles_{}.json", &key.to_hex()[..24]))
+    });
+    let cached = cache_file
+        .as_ref()
+        .and_then(|f| fs::read(f).ok())
+        .and_then(|b| serde_json::from_slice::<std::collections::HashMap<String, String>>(&b).ok());
+    let base = match cached {
+        Some(base) => base,
+        None => match fetch_git_blobs_batch(repo_root, base_ref, &repo_rels) {
+            Ok(base) => {
+                if let (Some(f), Ok(bytes)) = (&cache_file, serde_json::to_vec(&base)) {
+                    let _ = crate::shm_cache::atomic_write_shm(f, &bytes);
+                }
+                base
+            }
+            Err(_) => return BaseLakeConfig::Unknown,
+        },
+    };
+    if NAMES
+        .iter()
+        .zip(&repo_rels)
+        .all(|(n, r)| base.get(r) == fs::read_to_string(canon_dir.join(n)).ok().as_ref())
+    {
+        return BaseLakeConfig::Same;
+    }
+    // Same precedence as `resolve_package_config`: `lakefile.toml` first.
+    let Some((name, text)) = NAMES
+        .iter()
+        .zip(&repo_rels)
+        .find_map(|(n, r)| base.get(r).map(|t| (*n, t)))
+    else {
+        return BaseLakeConfig::Changed(None);
+    };
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "turbo_lean_base_lakefile_{}_{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let tmp_file = tmp_dir.join(name);
+    let parsed = fs::create_dir_all(&tmp_dir)
+        .and_then(|_| fs::write(&tmp_file, text))
+        .map_err(anyhow::Error::from)
+        .and_then(|_| {
+            if name == "lakefile.toml" {
+                crate::module_builder::parse_lakefile_toml(canon_dir, &tmp_file, strict)
+            } else {
+                crate::module_builder::parse_lakefile_lean(canon_dir, &tmp_file, strict)
+            }
+        });
+    let _ = fs::remove_dir_all(&tmp_dir);
+    parsed.map_or(BaseLakeConfig::Unknown, |pkg| {
+        BaseLakeConfig::Changed(Some(Box::new(pkg)))
+    })
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub(crate) struct CachedBaseShard {
     name: String,
@@ -1296,7 +1386,44 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
     }
 
     let head_sha_opt = resolve_git_head_sha(&repo_root, base_ref);
-    let head_tree_cache_file = if is_untrusted {
+    // A lakefile edit can change a file's effective Lean args (and so what its source elaborates
+    // to); such files are re-verified like added ones, dependents included. Untrusted configs are
+    // parsed strictly (`resolve_project_config`), trusted ones leniently (`owned_pkg_cfg`).
+    let base_lake_cfg = load_base_lake_config(
+        store,
+        &repo_root,
+        &proj_prefix,
+        canon_dir,
+        base_ref,
+        head_sha_opt.as_deref(),
+        is_untrusted,
+    );
+    // Without a parsed working-tree config the current args are unknown, so a changed lakefile
+    // re-verifies everything rather than comparing against an empty arg list.
+    let head_cfg_unknown = untrusted_cfg.is_none()
+        && owned_pkg_cfg.is_none()
+        && (canon_dir.join("lakefile.toml").is_file() || canon_dir.join("lakefile.lean").is_file());
+    let reconfigured = |rel: &str| -> bool {
+        rel != "lakefile.lean"
+            && match &base_lake_cfg {
+                BaseLakeConfig::Same => false,
+                _ if head_cfg_unknown => true,
+                BaseLakeConfig::Unknown => true,
+                BaseLakeConfig::Changed(base_pkg) => {
+                    let base_args = base_pkg.as_ref().map_or_else(Vec::new, |pkg| {
+                        crate::module_builder::resolve_file_lean_args_in_package(
+                            pkg,
+                            &canon_dir.join(rel),
+                        )
+                    });
+                    base_args != resolve_rel_lean_args(rel)
+                }
+            }
+    };
+
+    // The head-tree fast path only re-splits stat-changed files, so it is skipped when the
+    // lakefile changed.
+    let head_tree_cache_file = if is_untrusted || !matches!(base_lake_cfg, BaseLakeConfig::Same) {
         None
     } else {
         head_sha_opt
@@ -1927,6 +2054,28 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
     for rel_path in all_paths {
         let Some(entry) = entries_by_rel_path.remove(&rel_path) else {
             continue;
+        };
+        let entry = match entry {
+            PrFileEntry::Unchanged(split) if reconfigured(&rel_path) => {
+                let cur_src = fs::read_to_string(canon_dir.join(&rel_path)).unwrap_or_default();
+                changed_current_files.insert(rel_path.clone(), cur_src.clone());
+                PrFileEntry::Changed {
+                    base_src: None,
+                    cur_src: Some(cur_src),
+                    cur_split: Some(split),
+                }
+            }
+            // Source edits do not narrow this: every shard needs the new args, not just edited ones.
+            PrFileEntry::Changed {
+                base_src: Some(_),
+                cur_src: Some(cur_src),
+                cur_split,
+            } if reconfigured(&rel_path) => PrFileEntry::Changed {
+                base_src: None,
+                cur_src: Some(cur_src),
+                cur_split,
+            },
+            entry => entry,
         };
         match entry {
             PrFileEntry::Unchanged(split) => {
@@ -4531,6 +4680,109 @@ mod pr_verify_tests {
                 && changed_files.len() == 1
                 && changed_files["Demo/A.lean"].len() < 512
         );
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_lakefile_option_edit_reverifies_reconfigured_files() -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_lakefile_option_edit_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let repo_dir = tmp_dir.join("repo");
+        fs::create_dir_all(repo_dir.join("Fast"))?;
+        fs::create_dir_all(repo_dir.join("Heavy"))?;
+        let lakefile = |heavy_extra: &str| {
+            format!(
+                "name = \"demo\"\n\n[[lean_lib]]\nname = \"Fast\"\nroots = [\"Fast\"]\n\n[[lean_lib]]\nname = \"Heavy\"\nroots = [\"Heavy\"]\n{}",
+                heavy_extra
+            )
+        };
+        fs::write(repo_dir.join("lakefile.toml"), lakefile(""))?;
+        fs::write(
+            repo_dir.join("Fast/A.lean"),
+            "theorem t_a : 1 + 1 = 2 := by\n  rfl\n",
+        )?;
+        fs::write(
+            repo_dir.join("Heavy/B.lean"),
+            "theorem t_b : 2 + 2 = 4 := by\n  rfl\n",
+        )?;
+        git_init_and_commit(&repo_dir, "init")?;
+
+        let canon_dir = fs::canonicalize(&repo_dir)?;
+        let store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
+        let tc = "leanprover/lean4:v4.35.0";
+        let lean_paths = vec![
+            canon_dir.join("Fast/A.lean"),
+            canon_dir.join("Heavy/B.lean"),
+        ];
+        let (splits, _) = load_and_split_files_cached(&store, &lean_paths)?;
+        warm_git_head_tree_cache(&store, &canon_dir, &lean_paths, tc, Some(&splits));
+
+        // Formatting-only lakefile edit: same effective args, nothing to re-verify.
+        fs::write(
+            canon_dir.join("lakefile.toml"),
+            format!("# comment\n{}", lakefile("")),
+        )?;
+        let (cls, to_verify, _, _) = load_and_classify_pr_from_git(&store, &canon_dir, "HEAD", tc)?;
+        assert!(cls.modified_files.is_empty() && to_verify.is_empty());
+
+        // Only `Heavy`'s args change: its unchanged source is re-verified (dependents too).
+        fs::write(
+            canon_dir.join("lakefile.toml"),
+            lakefile("moreLeanArgs = [\"-DmaxHeartbeats=4000000\"]\n"),
+        )?;
+        let (cls, to_verify, changed_files, _) =
+            load_and_classify_pr_from_git(&store, &canon_dir, "HEAD", tc)?;
+        assert_eq!(cls.modified_files, vec!["Heavy/B.lean"]);
+        assert_eq!(cls.altered_interface_files, vec!["Heavy/B.lean"]);
+        assert_eq!(cls.unchanged_theorems, vec!["Fast/A.lean::t_a"]);
+        assert_eq!(to_verify.keys().collect::<Vec<_>>(), ["Heavy/B.lean"]);
+        assert!(changed_files["Heavy/B.lean"].contains("theorem t_b"));
+        let heavy_key = &to_verify["Heavy/B.lean"][0].0;
+        let plain_key = compute_shard_key(
+            tc,
+            &split_lean_source(&changed_files["Heavy/B.lean"], &[]).shards[0],
+        );
+        assert_ne!(heavy_key, &plain_key);
+
+        // A source edit in a reconfigured file still re-verifies every shard, not just edited ones.
+        fs::write(
+            canon_dir.join("Heavy/B.lean"),
+            "theorem t_b : 2 + 2 = 4 := by\n  rfl\ntheorem t_c : 3 = 3 := rfl\n",
+        )?;
+        let (cls, to_verify, _, _) = load_and_classify_pr_from_git(&store, &canon_dir, "HEAD", tc)?;
+        assert_eq!(cls.altered_interface_files, vec!["Heavy/B.lean"]);
+        assert_eq!(to_verify["Heavy/B.lean"].len(), 2);
+        assert!(!cls
+            .unchanged_theorems
+            .iter()
+            .any(|t| t.starts_with("Heavy/")));
+
+        // An unparsable working-tree lakefile (trusted mode) cannot be compared: re-verify all.
+        fs::write(
+            canon_dir.join("lakefile.toml"),
+            "name = \"demo\"\nmoreLeanArgs = [\"--plugin=evil.so\"]\n",
+        )?;
+        let (cls, _, _, _) = load_and_classify_pr_from_git(&store, &canon_dir, "HEAD", tc)?;
+        assert_eq!(cls.modified_files, vec!["Fast/A.lean", "Heavy/B.lean"]);
+        fs::write(
+            canon_dir.join("Heavy/B.lean"),
+            "theorem t_b : 2 + 2 = 4 := by\n  rfl\n",
+        )?;
+
+        // An unparsable base lakefile fails closed: every file is re-verified.
+        fs::write(
+            canon_dir.join("lakefile.toml"),
+            "name = \"demo\"\nmoreLeanArgs = [\"--plugin=evil.so\"]\n",
+        )?;
+        git_init_and_commit(&repo_dir, "unparsable base")?;
+        fs::write(canon_dir.join("lakefile.toml"), lakefile(""))?;
+        let (cls, to_verify, _, _) = load_and_classify_pr_from_git(&store, &canon_dir, "HEAD", tc)?;
+        assert_eq!(cls.modified_files, vec!["Fast/A.lean", "Heavy/B.lean"]);
+        assert_eq!(to_verify.len(), 2);
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
