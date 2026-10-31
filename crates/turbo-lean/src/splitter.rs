@@ -4705,10 +4705,17 @@ mod tests {
         let audit = plain_lean_audit(src, &names, 1);
         let marker = &audit.stub_marker;
         assert!(audit.source.starts_with(&format!("axiom good : 1 + 1 = 2\n#print \"{marker}\"\nset_option pp.fullNames true in #print axioms good\n@[simp] private axiom g2 : True\n")), "{}", audit.source);
-        assert!(audit.source.contains("theorem bad : False := sorry\nset_option pp.fullNames true in #print axioms bad\n"));
+        assert!(audit.source.contains(
+            "theorem bad : False := sorry\nset_option pp.fullNames true in #print axioms bad\n"
+        ));
         let allowed = allowed_axioms();
         let stub = &format!("{marker}\n'good' depends on axioms: [good]\n");
-        assert!(audit.violations(&format!("{stub}'bad' depends on axioms: [good, propext]\n"), &allowed).is_empty());
+        assert!(audit
+            .violations(
+                &format!("{stub}'bad' depends on axioms: [good, propext]\n"),
+                &allowed
+            )
+            .is_empty());
         let own = format!("{stub}'bad' depends on axioms: [good, sorryAx]\n");
         assert_eq!(audit.violations(&own, &allowed).len(), 1);
         // Only an axiom that reported itself after a stub marker is a stub (not a user `#print axioms`).
@@ -4717,15 +4724,25 @@ mod tests {
         // A missing report fails closed.
         assert_eq!(audit.violations(stub, &allowed).len(), 1);
         // A stub named like the real `sorryAx` never admits it.
-        let shadow = plain_lean_audit("namespace N\ntheorem sorryAx : True := sorry\nend N\ntheorem bad : False := sorry\n", &names, 1);
+        let shadow = plain_lean_audit(
+            "namespace N\ntheorem sorryAx : True := sorry\nend N\ntheorem bad : False := sorry\n",
+            &names,
+            1,
+        );
         let out = format!(
             "{}\n'N.sorryAx' depends on axioms: [N.sorryAx]\n'bad' depends on axioms: [sorryAx]\n",
             shadow.stub_marker
         );
         assert_eq!(shadow.violations(&out, &allowed).len(), 1);
         // Sources that could answer `#print axioms` themselves are refused.
-        let spoof = "macro_rules | `(#print axioms $x) => `(#check $x)\ntheorem bad : True := trivial\n";
-        assert_eq!(plain_lean_audit(spoof, &names, 1).violations("'bad' does not depend on any axioms\n", &allowed).len(), 1);
+        let spoof =
+            "macro_rules | `(#print axioms $x) => `(#check $x)\ntheorem bad : True := trivial\n";
+        assert_eq!(
+            plain_lean_audit(spoof, &names, 1)
+                .violations("'bad' does not depend on any axioms\n", &allowed)
+                .len(),
+            1
+        );
     }
 
     #[test]
