@@ -2194,10 +2194,6 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
 ) -> Result<usize> {
     let lib_lean_dir = canon_dir.join(".lake/build/lib/lean");
     let manifest_path = verified_sources_manifest_path(canon_dir);
-    // Without root `.olean`s, a manifest can still vouch for dependency-package imports.
-    if !lib_lean_dir.is_dir() && !manifest_path.is_file() {
-        return Ok(0);
-    }
     // Pins and artifact digests describe disk whatever policy they were recorded under, so only
     // the schema has to match here. A manifest that exists but does not parse (legacy schema,
     // corruption) gives no evidence: every built import is refreshed and the file dropped.
@@ -2242,12 +2238,7 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
     let mut visited = HashSet::new();
     let mut ordered_imports: Vec<(String, String, PathBuf)> = Vec::new();
     let mut adj: HashMap<String, Vec<String>> = HashMap::new();
-    // Dependency-package imports whose recorded closure is no longer consistent (P0-4): Lean
-    // would otherwise load them next to their rebuilt imports without re-checking.
-    let dep_cfg = manifest_opt
-        .as_ref()
-        .and_then(|m| Some((m.cfg.as_ref()?, &m.dep_import_memo)));
-    let mut stale_dep_mods: HashSet<String> = HashSet::new();
+    let mut non_root_imports: Vec<String> = Vec::new();
     while let Some(mod_name) = worklist.pop() {
         if !visited.insert(mod_name.clone()) {
             continue;
@@ -2262,10 +2253,30 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
             }
             adj.insert(mod_name.clone(), sub_imps);
             ordered_imports.push((mod_name, imp_slash, dep_src));
-        } else if dep_cfg.is_some_and(|(cfg, memo)| {
-            crate::module_builder::dep_pkg_module_stale(cfg, memo, &mod_name)
-        }) {
-            stale_dep_mods.insert(mod_name);
+        } else {
+            non_root_imports.push(mod_name);
+        }
+    }
+    // Dependency-package imports whose closure is not provably consistent (P0-4): Lean would
+    // otherwise load them next to their rebuilt imports without re-checking. Their evidence
+    // lives in their own package manifests, so it is inspected even without a root manifest.
+    let mut stale_dep_mods: HashSet<String> = HashSet::new();
+    if !non_root_imports.is_empty() {
+        let fresh_memo = crate::module_builder::DepImportMemo::default();
+        let resolved;
+        let (cfg, memo) = match manifest_opt.as_ref() {
+            Some(m) if m.cfg.is_some() => (m.cfg.as_ref(), &m.dep_import_memo),
+            _ => {
+                resolved = crate::module_builder::resolve_project_config(canon_dir).ok();
+                (resolved.as_ref(), &fresh_memo)
+            }
+        };
+        if let Some(cfg) = cfg {
+            stale_dep_mods.extend(
+                non_root_imports
+                    .into_iter()
+                    .filter(|m| crate::module_builder::dep_pkg_module_stale(cfg, memo, m)),
+            );
         }
     }
     if ordered_imports.is_empty() && stale_dep_mods.is_empty() {

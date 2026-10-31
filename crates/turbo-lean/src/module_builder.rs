@@ -4735,21 +4735,30 @@ pub(crate) fn entry_artifacts_current(
         || olean_digest_is(cfg, olean, &entry.olean_artifact_digest)
 }
 
-/// Whether dependency-package module `imp` has a verified-sources entry whose closure is no
-/// longer consistent. Without an entry there is no turbo-lean evidence (Lake-managed): `false`.
+/// Whether dependency-package module `imp` may be stale before elaboration. A package without
+/// any verified-sources manifest is Lake-managed (no turbo-lean evidence): `false`. A manifest
+/// that cannot be read or parsed, lacks the module, or no longer proves the module's closure
+/// consistent establishes nothing: `true` (refresh or fail closed).
 pub(crate) fn dep_pkg_module_stale(cfg: &ProjectConfig, memo: &DepImportMemo, imp: &str) -> bool {
     let ImportSite::Module(spec) = resolve_import_site(cfg, imp) else {
         return false;
     };
-    let Some(digest) =
-        read_pkg_verified_manifest(cfg, &spec.pkg_root, &spec.pkg_name, &spec.pkg_config_digest)
-            .and_then(|m| {
-                m.modules
-                    .get(&spec_rel_src(&spec))
-                    .map(|e| e.olean_artifact_digest.clone())
-            })
+    let bytes = match fs::read(
+        spec.pkg_root
+            .join(".lake/build/.turbo_verified_sources.json"),
+    ) {
+        Ok(bytes) => bytes,
+        Err(e) => return e.kind() != std::io::ErrorKind::NotFound,
+    };
+    let Some(digest) = serde_json::from_slice::<VerifiedDepManifest>(&bytes)
+        .ok()
+        .and_then(|m| {
+            m.modules
+                .get(&spec_rel_src(&spec))
+                .map(|e| e.olean_artifact_digest.clone())
+        })
     else {
-        return false;
+        return true;
     };
     !dep_pkg_import_pins_consistent(cfg, memo, *spec, &digest)
 }
@@ -10160,6 +10169,14 @@ lean_exe «demo-exe» where
             !matches!(res, Ok(0)),
             "stale `DepPkg.B` left in place for elaboration"
         );
+        // The dependency's own manifest is the evidence: it counts without a root manifest too.
+        let _ = fs::remove_file(&manifest_path);
+        let res =
+            crate::lake_build::ensure_project_imports_fresh_for_check(&canon, &[canon_c.clone()]);
+        assert!(
+            !matches!(res, Ok(0)),
+            "dependency evidence ignored without a root manifest"
+        );
         // Rebuilding the root must not reuse the stale `DepPkg.B` as a fresh external closure:
         // its pin for `DepPkg.A` no longer matches, so `B` is rebuilt and `App.C` (`h = 3`) fails.
         let rebuilt = build_project_modules_native(
@@ -10174,6 +10191,14 @@ lean_exe «demo-exe» where
         );
         assert!(rebuilt.is_err(), "stale `DepPkg.B` reused: {rebuilt:?}");
         assert!(!verified());
+        // An unreadable dependency manifest establishes nothing: refresh rather than trust it.
+        fs::write(&dep_manifest_path, b"{").unwrap();
+        let res =
+            crate::lake_build::ensure_project_imports_fresh_for_check(&canon, &[canon_c.clone()]);
+        assert!(
+            !matches!(res, Ok(0)),
+            "corrupt dependency manifest treated as Lake-managed"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
