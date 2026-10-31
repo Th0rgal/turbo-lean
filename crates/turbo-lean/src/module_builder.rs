@@ -4613,13 +4613,14 @@ impl Clone for DepImportMemo {
     }
 }
 
-/// Load `pkg_root`'s verified-sources manifest if it was written for this package, workspace,
-/// toolchain, configuration, and axiom policy.
+/// Load `pkg_root`'s verified-sources manifest if it was written for this package, toolchain,
+/// configuration, and (when `strict_policy` is set) workspace and axiom policy.
 fn read_pkg_verified_manifest(
     cfg: &ProjectConfig,
     pkg_root: &Path,
     pkg_name: &str,
     pkg_config_digest: &str,
+    strict_policy: bool,
 ) -> Option<VerifiedDepManifest> {
     let bytes = fs::read(pkg_root.join(".lake/build/.turbo_verified_sources.json")).ok()?;
     let manifest: VerifiedDepManifest = serde_json::from_slice(&bytes).ok()?;
@@ -4627,8 +4628,9 @@ fn read_pkg_verified_manifest(
         && manifest.toolchain == cfg.toolchain
         && manifest.lean_githash == cfg.lean_githash
         && manifest.pkg_config_digest == pkg_config_digest
-        && manifest.workspace_config_digest == cfg.canonical_config_digest
-        && manifest.allowed_axioms == crate::splitter::allowed_axioms())
+        && (!strict_policy
+            || (manifest.workspace_config_digest == cfg.canonical_config_digest
+                && manifest.allowed_axioms == crate::splitter::allowed_axioms())))
     .then_some(manifest)
 }
 
@@ -4725,7 +4727,7 @@ pub(crate) fn import_pin_current(
         (ImportSite::Toolchain, None) => true,
         (ImportSite::Prebuilt(olean), Some(pin)) => olean_digest_is(cfg, &olean, pin),
         (ImportSite::Module(spec), Some(pin)) => {
-            dep_pkg_import_pins_consistent(cfg, memo, *spec, pin)
+            dep_pkg_import_pins_consistent(cfg, memo, *spec, pin, true)
         }
         _ => false,
     }
@@ -4822,8 +4824,11 @@ pub(crate) fn dep_pkg_module_missing_olean(cfg: &ProjectConfig, imp: &str) -> bo
 
 /// Whether dependency-package module `imp` may be stale before elaboration. A module without a
 /// verified-sources entry (no manifest, or never recorded) is Lake-managed: `false`. A manifest
-/// that cannot be read or parsed, or an entry that no longer proves the module's closure
-/// consistent, establishes nothing: `true` (refresh or fail closed).
+/// that cannot be read or parsed, an entry stamped under a different toolchain/package config, or
+/// an entry that no longer proves the module's closure consistent establishes nothing: `true`
+/// (refresh or fail closed). Unlike positive fast-path reuse, `strict_policy` is `false` so a
+/// standalone rebuild inside the dependency package retains untouched sibling entries and still
+/// exposes their now-stale import pins.
 pub(crate) fn dep_pkg_module_stale(cfg: &ProjectConfig, memo: &DepImportMemo, imp: &str) -> bool {
     let spec = match resolve_import_site(cfg, imp) {
         ImportSite::Module(spec) => spec,
@@ -4844,20 +4849,22 @@ pub(crate) fn dep_pkg_module_stale(cfg: &ProjectConfig, memo: &DepImportMemo, im
     let Some(entry) = manifest.modules.get(&spec_rel_src(&spec)) else {
         return false;
     };
-    !dep_pkg_import_pins_consistent(cfg, memo, *spec, &entry.olean_artifact_digest)
+    cfg.lean_bin.as_os_str().is_empty()
+        || !dep_pkg_import_pins_consistent(cfg, memo, *spec, &entry.olean_artifact_digest, false)
 }
 
 /// Check-time counterpart of `collect_fresh_dep_pkg_closure` for a dependency-package module
 /// pinned at `pin` (memoizing verified nodes in `memo`): every visited module's artifacts must
 /// match its manifest entry (by stat fingerprint, else by re-hashing), its source must match the
 /// entry, and every import of that source must be pinned to the current artifacts (root- and
-/// dependency-package modules recursively, root ones kernel-audited; prebuilt imports
-/// re-digested).
+/// dependency-package modules recursively, root ones kernel-audited under `strict_policy`;
+/// prebuilt imports re-digested).
 fn dep_pkg_import_pins_consistent(
     cfg: &ProjectConfig,
     memo: &DepImportMemo,
     spec: DiscoveredModuleSpec,
     pin: &str,
+    strict_policy: bool,
 ) -> bool {
     let mut manifests: HashMap<PathBuf, Option<VerifiedDepManifest>> = HashMap::new();
     let mut seen: HashMap<(String, String), String> = HashMap::new();
@@ -4865,7 +4872,7 @@ fn dep_pkg_import_pins_consistent(
     while let Some((cur, pin)) = stack.pop() {
         let key = (cur.pkg_name.clone(), cur.module_name.clone());
         let memo_key = (key.0.clone(), key.1.clone(), pin.clone());
-        if memo.0.lock().is_ok_and(|m| m.contains(&memo_key)) {
+        if strict_policy && memo.0.lock().is_ok_and(|m| m.contains(&memo_key)) {
             continue;
         }
         if let Some(prev) = seen.get(&key) {
@@ -4875,7 +4882,13 @@ fn dep_pkg_import_pins_consistent(
             continue;
         }
         let manifest = manifests.entry(cur.pkg_root.clone()).or_insert_with(|| {
-            read_pkg_verified_manifest(cfg, &cur.pkg_root, &cur.pkg_name, &cur.pkg_config_digest)
+            read_pkg_verified_manifest(
+                cfg,
+                &cur.pkg_root,
+                &cur.pkg_name,
+                &cur.pkg_config_digest,
+                strict_policy,
+            )
         });
         let Some(entry) = manifest
             .as_ref()
@@ -4883,7 +4896,7 @@ fn dep_pkg_import_pins_consistent(
         else {
             return false;
         };
-        let artifacts_ok = (!cur.is_root_pkg || entry.kernel_audited)
+        let artifacts_ok = (!strict_policy || !cur.is_root_pkg || entry.kernel_audited)
             && entry_artifacts_current(cfg, &spec_olean_path(&cur), entry);
         let Ok(src) = fs::read_to_string(&cur.src_path) else {
             return false;
@@ -4917,11 +4930,13 @@ fn dep_pkg_import_pins_consistent(
         }
         seen.insert(key, pin);
     }
-    if let Ok(mut m) = memo.0.lock() {
-        m.extend(
-            seen.into_iter()
-                .map(|((pkg, module), pin)| (pkg, module, pin)),
-        );
+    if strict_policy {
+        if let Ok(mut m) = memo.0.lock() {
+            m.extend(
+                seen.into_iter()
+                    .map(|((pkg, module), pin)| (pkg, module, pin)),
+            );
+        }
     }
     true
 }
@@ -5064,7 +5079,7 @@ fn is_dep_olean_fresh(
     // accept pre-existing checkout `.olean` files without host `TurboStore` CAS verification).
     // Fail closed (`None`) when the manifest or audited module entry is absent or stale.
     let manifest =
-        read_pkg_verified_manifest(cfg, pkg_root, &spec.pkg_name, &spec.pkg_config_digest)?;
+        read_pkg_verified_manifest(cfg, pkg_root, &spec.pkg_name, &spec.pkg_config_digest, true)?;
     let rel_src = src_path
         .strip_prefix(pkg_root)
         .unwrap_or(src_path)
@@ -8154,8 +8169,22 @@ pub(crate) fn record_verified_dep_source(
                 && m.toolchain == cfg.toolchain
                 && m.lean_githash == cfg.lean_githash
                 && m.pkg_config_digest == node.pkg_config_digest
-                && m.workspace_config_digest == cfg.canonical_config_digest
-                && m.allowed_axioms == allowed_axioms
+        })
+        .map(|mut m| {
+            // Retain untouched sibling entries across workspace-digest or axiom-policy shifts
+            // (`turbo-lean build` rooted inside a dependency package vs. from its consumer, or
+            // under a narrower allowlist) so `dep_pkg_module_stale` never misclassifies a
+            // previously native-built sibling as Lake-managed. Positive fast-path reuse still
+            // checks every visited module's import closure; when `allowed_axioms` changed, drop
+            // `kernel_audited` on retained entries so stale audit bits never carry over.
+            if m.allowed_axioms != allowed_axioms {
+                for e in m.modules.values_mut() {
+                    e.kernel_audited = false;
+                }
+                m.allowed_axioms = allowed_axioms.clone();
+            }
+            m.workspace_config_digest = cfg.canonical_config_digest.clone();
+            m
         })
         .unwrap_or_else(|| VerifiedDepManifest {
             pkg_name: node.pkg_name.clone(),
