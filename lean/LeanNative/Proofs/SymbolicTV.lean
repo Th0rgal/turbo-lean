@@ -1684,29 +1684,66 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
     let stOut := st.markU64Var dst
     if st.isImmediateScalarObj root || st.typedTuples.contains root ||
        st.boolVars.contains root || st.u64Vars.contains root || st.u256Vars.contains root ||
-       st.objPtrVars.contains root || st.allocRoots.contains root then
+       st.objPtrVars.contains root ||
+       (st.allocRoots.contains root && !(st.sarrayVars.contains root)) then
       stOut.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
-    else
+    else if st.sarrayVars.contains root then
       let liveC := st.liveRcCond root
       let stLive := (((st.noteExtRoot root).requireUbCond liveC).noteExtLiveRoot root).markU64Var dst
       let stBound := stLive.bindVar dst { expr := .sarrayLen root, nonPoison := sa.nonPoison, noUB := sa.noUB }
       { stBound with noUB := stBound.noUB && liveC == .constBool true }
+    else
+      (stOut.markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
   | .sarrayDataPtr arrVar _elemTy =>
     let root := st.resolveBuf arrVar
     let arrSv := st.lookupVar arrVar
-    let exclOk := st.isBufExclusive root
-    let stExcl := st.requireUbCond (st.exclRcCond root)
-    let stBound := (stExcl.aliasBuf dst root).bindVar dst { expr := .symVar root, nonPoison := arrSv.nonPoison, noUB := arrSv.noUB }
-    { stBound with ubCond := if arrSv.noUB then stExcl.ubCond else .constBool false, noUB := stBound.noUB && exclOk }
+    if st.isImmediateScalarObj root || st.typedTuples.contains root ||
+       st.boolVars.contains root || st.u64Vars.contains root || st.u256Vars.contains root ||
+       st.objPtrVars.contains root ||
+       (st.allocRoots.contains root && !(st.sarrayVars.contains root)) then
+      ((st.clearAlias dst).unmarkTypedTuple dst).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+    else
+      let exclOk := st.isBufExclusive root
+      let stExcl := st.requireUbCond (st.exclRcCond root)
+      let stBound := (stExcl.aliasBuf dst root).bindVar dst { expr := .symVar root, nonPoison := arrSv.nonPoison, noUB := arrSv.noUB }
+      { stBound with ubCond := if arrSv.noUB then stExcl.ubCond else .constBool false, noUB := stBound.noUB && exclOk }
   | .sarrayEnsureExclusive arrVar _elemTy =>
     let root := st.resolveBuf arrVar
-    ((st.markExclusive root).aliasBuf dst root).bindVar dst { expr := .symVar root, nonPoison := true, noUB := true }
+    let arrSv := st.lookupVar arrVar
+    if st.isImmediateScalarObj root || st.typedTuples.contains root ||
+       st.boolVars.contains root || st.u64Vars.contains root || st.u256Vars.contains root ||
+       st.objPtrVars.contains root ||
+       (st.allocRoots.contains root && !(st.sarrayVars.contains root)) then
+      ((st.clearAlias dst).unmarkTypedTuple dst).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+    else if st.sarrayVars.contains root then
+      let liveC := st.liveRcCond root
+      let stLive := ((st.noteExtRoot root).requireUbCond liveC).noteExtLiveRoot root
+      let stBound := (((stLive.markExclusive root).aliasBuf dst root).markSarrayVar dst).bindVar dst
+        { expr := .symVar root, nonPoison := arrSv.nonPoison, noUB := arrSv.noUB }
+      { stBound with noUB := stBound.noUB && liveC == .constBool true }
+    else
+      (((st.clearAlias dst).unmarkTypedTuple dst).markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
   | .sarraySet arrVar idxVar valVar _elemTy =>
     let root := st.resolveBuf arrVar
+    let arrSv := st.lookupVar arrVar
     let idxSv := st.lookupVar idxVar
     let valSv := st.lookupVar valVar
-    let st3 := ((st.markExclusive root).writeBufSym root idxSv.expr valSv.expr true).aliasBuf dst root
-    st3.bindVar dst { expr := .symVar root, nonPoison := idxSv.nonPoison && valSv.nonPoison, noUB := idxSv.noUB && valSv.noUB }
+    if st.isImmediateScalarObj root || st.typedTuples.contains root ||
+       st.boolVars.contains root || st.u64Vars.contains root || st.u256Vars.contains root ||
+       st.objPtrVars.contains root ||
+       (st.allocRoots.contains root && !(st.sarrayVars.contains root)) then
+      ((st.clearAlias dst).unmarkTypedTuple dst).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+    else if st.sarrayVars.contains root then
+      let liveC := st.liveRcCond root
+      let stLive := ((st.noteExtRoot root).requireUbCond liveC).noteExtLiveRoot root
+      let st3 := (((stLive.markExclusive root).writeBufSym root idxSv.expr valSv.expr true).aliasBuf dst root).markSarrayVar dst
+      let stBound := st3.bindVar dst {
+        expr := .symVar root
+        nonPoison := arrSv.nonPoison && idxSv.nonPoison && valSv.nonPoison
+        noUB := arrSv.noUB && idxSv.noUB && valSv.noUB }
+      { stBound with noUB := stBound.noUB && liveC == .constBool true }
+    else
+      (((st.clearAlias dst).unmarkTypedTuple dst).markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
   | .unboxScalar valVar _ =>
     let r := st.resolveBuf valVar
     let rVal := st.lookupVar r
@@ -1756,20 +1793,46 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
         st2.bindVar dst rVal
       else if fnName == "lean_native_ensure_exclusive" && ptrRet then
         let root := st.resolveBuf a
-        ((st.markExclusive root).aliasBuf dst root).bindVar dst (st.lookupVar root)
+        let rVal := st.lookupVar root
+        if st.sarrayVars.contains root then
+          let liveC := st.liveRcCond root
+          let stLive := ((st.noteExtRoot root).requireUbCond liveC).noteExtLiveRoot root
+          let stBound := (((stLive.markExclusive root).aliasBuf dst root).markSarrayVar dst).bindVar dst
+            { expr := .symVar root, nonPoison := rVal.nonPoison, noUB := rVal.noUB }
+          { stBound with noUB := stBound.noUB && liveC == .constBool true }
+        else if st.objPtrVars.contains root || (st.allocRoots.contains root && !(st.sarrayVars.contains root)) then
+          let stA := (if a != dst then st.aliasBuf dst root else st).markObjPtrVar dst
+          stA.bindVar dst { expr := .symVar root, nonPoison := rVal.nonPoison, noUB := rVal.noUB }
+        else if st.typedTuples.contains root || (match rVal.expr with | .tuple _ => true | _ => false) then
+          (st.clearAlias dst).markTypedTuple dst |>.bindVar dst rVal
+        else if st.isImmediateScalarObj root || st.boolVars.contains root ||
+                st.u64Vars.contains root || st.u256Vars.contains root then
+          let stClear := (st.clearAlias dst).unmarkTypedTuple dst
+          let stSorted :=
+            match symExprScalarSort? stClear rVal.expr with
+            | some 0 => stClear.markBoolVar dst
+            | some 1 => stClear.markU64Var dst
+            | some 2 => stClear.markU256Var dst
+            | _ => stClear
+          stSorted.bindVar dst rVal
+        else
+          (((st.clearAlias dst).unmarkTypedTuple dst).markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
       else if fnName == "lean_native_sarray_len" && i64Ret then
         let root := st.resolveBuf a
         let sa := st.lookupVar a
         let stOut := st.markU64Var dst
         if st.isImmediateScalarObj root || st.typedTuples.contains root ||
            st.boolVars.contains root || st.u64Vars.contains root || st.u256Vars.contains root ||
-           st.objPtrVars.contains root || st.allocRoots.contains root then
+           st.objPtrVars.contains root ||
+           (st.allocRoots.contains root && !(st.sarrayVars.contains root)) then
           stOut.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
-        else
+        else if st.sarrayVars.contains root then
           let liveC := st.liveRcCond root
           let stLive := (((st.noteExtRoot root).requireUbCond liveC).noteExtLiveRoot root).markU64Var dst
           let stBound := stLive.bindVar dst { expr := .sarrayLen root, nonPoison := sa.nonPoison, noUB := sa.noUB }
           { stBound with noUB := stBound.noUB && liveC == .constBool true }
+        else
+          (stOut.markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
       else if fnName == "lean_native_ctor_tag" && i64Ret then
         let root := st.resolveBuf a
         let sa0 := st.lookupVar root
@@ -2971,9 +3034,10 @@ end SymbolicTV
 #guard !(symEvalExpr {} 9 .i64 (.call "lean_native_sarray_len" [1] .i64 true)).noUB
 #guard !(symEvalExpr {} 9 .i64 (.call "lean_native_unknown" [1] .i64)).noUB
 #guard (symEvalExpr {} 9 .i64 (.call "lean_native_unbox_u64" [1] .i64)).lookupVar 9 == (({} : SymExecState).lookupVar 1)
-#guard ((symEvalExpr {} 9 (.sarray .i64) (.call "lean_native_ensure_exclusive" [1] (.sarray .i64))).isBufExclusive 9)
-#guard (symEvalExpr {} 9 .i64 (.call "lean_native_sarray_len" [1] .i64)).lookupVar 9 ==
-  (symEvalExpr {} 9 .i64 (.sarrayLen 1)).lookupVar 9
+#guard ((symEvalExpr (({} : SymExecState).markSarrayVar 1) 9 (.sarray .i64) (.call "lean_native_ensure_exclusive" [1] (.sarray .i64))).isBufExclusive 9)
+#guard !(symEvalExpr (({} : SymExecState).markObjPtrVar 1) 9 .objPtr (.call "lean_native_ensure_exclusive" [1] .objPtr)).isBufExclusive 9
+#guard (symEvalExpr (({} : SymExecState).markSarrayVar 1) 9 .i64 (.call "lean_native_sarray_len" [1] .i64)).lookupVar 9 ==
+  (symEvalExpr (({} : SymExecState).markSarrayVar 1) 9 .i64 (.sarrayLen 1)).lookupVar 9
 
 /-! ## JSON & Human-Readable Formatting for `TVModuleReport` -/
 

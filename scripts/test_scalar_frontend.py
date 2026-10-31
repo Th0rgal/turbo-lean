@@ -2568,6 +2568,25 @@ open LeanNative.IR LeanNative.Proofs
     let wideProjBad := validateTranslationDecl (mkWideFieldProjDecl 0 tagRefine) (mkWideFieldProjDecl 1 tagRefine) 8
     unless !wideProjBad.ubRefines && !wideProjBad.passed do
       throw <| IO.userError s!"ctorGetScalar p 8 treated modeling limit as definite source UB (tagRefine={tagRefine}): {reprStr wideProjBad}"
+  let mkEnsureExclCtorDecl (constTrueAt999 : Bool) : LNIRDecl := {
+    name := "ensure_excl_preserves_ctor_rc"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i1
+    body :=
+      .letBind 1 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+        (.ite 1
+          (.letBind 2 .objPtr (.allocCtor 0 [] [])
+            (.incRef 2 1
+              (.letBind 3 .objPtr (.call "lean_native_ensure_exclusive" [2] .objPtr false)
+                (.letBind 4 .i1 (if constTrueAt999 then .scalar (.constBool true) else .isExclusive 2)
+                  (.decRef 2 2 (.ret 4))))))
+          (.letBind 4 .i1 (.scalar (.constBool true)) (.ret 4)))
+  }
+  let ensureCtorBad := validateTranslationDecl (mkEnsureExclCtorDecl false) (mkEnsureExclCtorDecl true) 8
+  unless !ensureCtorBad.symRetEquiv && !ensureCtorBad.passed do
+    throw <| IO.userError s!"lean_native_ensure_exclusive reset constructor RC to 1: {reprStr ensureCtorBad}"
+  unless (validateTranslationDecl (mkEnsureExclCtorDecl false) (mkEnsureExclCtorDecl false) 8).passed do
+    throw <| IO.userError "equivalent lean_native_ensure_exclusive constructor declaration rejected"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)
