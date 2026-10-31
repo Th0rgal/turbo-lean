@@ -3531,6 +3531,13 @@ pub fn parse_lakefile_lean(
         }
         if indent == 0 {
             block_keys.clear();
+            // A helper's term (e.g. Mathlib's `abbrev ... := #[` ... `]`) continues on a
+            // column-0 closing-bracket or `++` line; no command starts that way.
+            if current_block == DeclBlock::CustomDoBlock
+                && (trimmed.starts_with("++") || trimmed.starts_with([']', ')', '}', '⟩']))
+            {
+                continue;
+            }
             // `@[test_driver]` / `@[lint_driver]` mark a target like `@[default_target]` does,
             // without making it a default target.
             let (attr, is_default) = if trimmed.starts_with("@[default_target]") {
@@ -11145,7 +11152,8 @@ roots = ["Fast"]
         .unwrap();
         fs::write(proj.join("P/A.lean"), "def a : Nat := 1\n").unwrap();
         if resolve_project_config_with_trust(&proj, true).is_err() {
-            return; // no Lean v4.35.0 toolchain on this host
+            eprintln!("skipping: no Lean v4.35.0 toolchain on this host");
+            return;
         }
         std::os::unix::fs::symlink(&outside, proj.join(".lake")).unwrap();
         let mut store = TurboStore::open(Some(&root.join("store"))).unwrap();
@@ -11281,9 +11289,14 @@ roots = ["Fast"]
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("fail-closed"), "{src}: {err}");
-            let pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
-            let why = pkg.unsupported.clone().or(pkg.libs[0].unsupported.clone());
-            assert!(why.is_some(), "dependency accepted `{src}`");
+            // Syntax the reader cannot follow (e.g. `.debug`) fails to parse for any package.
+            match parse_lakefile_lean(&dir, &lf, false) {
+                Ok(pkg) => {
+                    let why = pkg.unsupported.clone().or(pkg.libs[0].unsupported.clone());
+                    assert!(why.is_some(), "dependency accepted `{src}`");
+                }
+                Err(e) => eprintln!("dependency rejected `{src}`: {e}"),
+            }
         }
         // A dependency's update hook may spawn processes; it never runs during a build.
         fs::write(
