@@ -91,12 +91,15 @@ set_option warn.sorry false
             command.current_dir(project_dir).envs(&env);
             command
         };
-        command
-            .args(crate::module_builder::try_resolve_lean_args_for_path(
-                project_dir,
-                Some(file),
-            ))
-            .arg(&path);
+        let lean_args = if project_dir.join("lakefile.toml").try_exists()?
+            || project_dir.join("lakefile.lean").try_exists()?
+        {
+            let pkg = crate::module_builder::resolve_package_config(project_dir, false)?;
+            crate::module_builder::resolve_file_lean_args_in_package(&pkg, file)
+        } else {
+            Vec::new()
+        };
+        command.args(lean_args).arg(&path);
         let out = crate::zygote::run_lean_command(&mut command, None)?;
         let stdout = String::from_utf8_lossy(&out.stdout);
         let names: Vec<_> = stdout
