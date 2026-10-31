@@ -321,6 +321,82 @@ pub(crate) fn scan_lean_char_lit_end(src: &str, start: usize) -> Option<usize> {
     }
 }
 
+/// A literal or comment beginning at a UTF-8 byte boundary. Unterminated strings
+/// and block comments consume the remainder so their contents cannot become code.
+pub(crate) struct LeanLexicalSpan {
+    pub(crate) end: usize,
+    pub(crate) is_comment: bool,
+}
+
+pub(crate) fn skip_lean_lexeme(src: &str, start: usize) -> Option<LeanLexicalSpan> {
+    let bytes = src.as_bytes();
+    let mut i = start;
+    let is_comment = src[start..].starts_with("--") || src[start..].starts_with("/-");
+    match *bytes.get(start)? {
+        b'-' if src[start..].starts_with("--") => {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+        }
+        b'/' if src[start..].starts_with("/-") => {
+            i += 2;
+            let mut depth = 1usize;
+            while i < bytes.len() && depth > 0 {
+                if bytes[i..].starts_with(b"/-") {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i..].starts_with(b"-/") {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        b'\'' => i = crate::splitter::scan_lean_char_lit_end(src, start)?,
+        b'"' => {
+            i += 1;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'\\' => i = (i + 2).min(bytes.len()),
+                    b'"' => {
+                        i += 1;
+                        break;
+                    }
+                    _ => i += 1,
+                }
+            }
+        }
+        b'r' if !src[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '\'') =>
+        {
+            i += 1;
+            while bytes.get(i) == Some(&b'#') {
+                i += 1;
+            }
+            let hashes = i - start - 1;
+            if bytes.get(i) != Some(&b'"') {
+                return None;
+            }
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"'
+                    && bytes[i + 1..].starts_with(&bytes[start + 1..start + 1 + hashes])
+                {
+                    i += 1 + hashes;
+                    break;
+                }
+                i += 1;
+            }
+        }
+        _ => return None,
+    }
+    Some(LeanLexicalSpan { end: i, is_comment })
+}
+
 /// Strip comments while preserving string/character literals, exact byte offsets, and newline counts.
 pub fn strip_lean_comments(src: &str) -> String {
     if !src.contains("--") && !src.contains("/-") {
@@ -866,6 +942,8 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
     let mut pos = 0usize;
     let mut mutual_depth = 0usize;
     let mut scope_depth = 0usize;
+    let mut lexical_cursor = 0usize;
+    let mut literal_end = 0usize;
 
     while pos < total_len {
         let line_start = pos;
@@ -887,6 +965,26 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
         let line_orig = &src[line_start..line_end_no_cr];
         let line_clean = &clean[line_start..line_end_no_cr];
         let trimmed = line_clean.trim_start();
+        let token_start = line_start + line_clean.len() - trimmed.len();
+        // Keep the whole source's lexical context: a command-looking line inside a
+        // literal must not become a declaration or change the namespace stack.
+        while lexical_cursor < token_start {
+            if let Some(span) = skip_lean_lexeme(src, lexical_cursor) {
+                if !span.is_comment {
+                    literal_end = span.end;
+                }
+                lexical_cursor = span.end;
+            } else {
+                lexical_cursor += src[lexical_cursor..].chars().next().unwrap().len_utf8();
+            }
+        }
+        if token_start < literal_end {
+            cur_byte_end = line_end_no_cr;
+            pos = next_pos;
+            line_num += 1;
+            continue;
+        }
+
         let indent = line_orig.len() - line_orig.trim_start().len();
         let at_command_indent = cur_cmd_indent.is_none_or(|base| indent <= base);
         let starts_doc_comment = line_orig.trim_start().starts_with("/--") && at_command_indent;

@@ -52,7 +52,7 @@ fn cache_shm_stat_split(
         let st_path = shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
         let src_b3 = blake3::hash(active_src.as_bytes()).to_hex().to_string();
         let entry = ShmCachedFileSplit {
-            split_key: format!("file-split:v5:{}", src_b3),
+            split_key: format!("file-split:v6:{}", src_b3),
             src_blake3: src_b3,
             split: compact_split_for_shm_cache(split),
             prefix_src: String::new(),
@@ -779,7 +779,7 @@ fn run_check_command_inner(
             let src_b3 = blake3::hash(loaded_src.as_bytes()).to_hex().to_string();
             if let Some((ref st_path, _)) = st_paths_opt {
                 let entry = ShmCachedFileSplit {
-                    split_key: format!("file-split:v5:{}", src_b3),
+                    split_key: format!("file-split:v6:{}", src_b3),
                     src_blake3: src_b3.clone(),
                     split: compact_split_for_shm_cache(&sp),
                     prefix_src: String::new(),
@@ -818,7 +818,7 @@ fn run_check_command_inner(
                     split_key: if src_b3.is_empty() {
                         String::new()
                     } else {
-                        format!("file-split:v5:{}", src_b3)
+                        format!("file-split:v6:{}", src_b3)
                     },
                     src_blake3: src_b3,
                     split: compact_split_for_shm_cache(&fast_res.0),
@@ -1552,7 +1552,7 @@ fn check_single_decl(
                         let st_path =
                             shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
                         let entry = ShmCachedFileSplit {
-                            split_key: format!("file-split:v5:{}", sub_b3),
+                            split_key: format!("file-split:v6:{}", sub_b3),
                             src_blake3: sub_b3.clone(),
                             split: compact_split_for_shm_cache(&sub_split),
                             prefix_src: if sub_src.len() <= 64 * 1024 {
@@ -4305,14 +4305,20 @@ but is expected to have type
             .lines()
             .map(|line| format!("  {line}\n"))
             .collect::<String>();
-        for (order, src) in [format!("{good}{bad}"), format!("{bad}{good}"), indented]
-            .iter()
-            .enumerate()
+        let quoted = format!("def message := \"\nnamespace Literal\ntheorem same (n : Nat) : n = n + 1 := by rfl\nend Literal\n\"\n{good}{bad}");
+        for (order, src) in [
+            format!("{good}{bad}"),
+            format!("{bad}{good}"),
+            indented,
+            quoted,
+        ]
+        .iter()
+        .enumerate()
         {
             fs::write(&file, src).unwrap();
             let cache = dir.join(format!("cache{order}"));
             let mut store = TurboStore::open(Some(&dir.join(format!("stateful{order}")))).unwrap();
-            for target in ["A.same", "same", "B.same", "Other.A.same"] {
+            for target in ["A.same", "same", "B.same", "Other.A.same", "Literal.same"] {
                 let stateful = crate::gpu_fastcheck::evaluate_agent_step_value(
                     &mut store,
                     &file,
@@ -4326,7 +4332,7 @@ but is expected to have type
                         .unwrap_err()
                         .to_string()
                         .contains("Ambiguous declaration")),
-                    "Other.A.same" => assert!(stateful.is_err()),
+                    "Other.A.same" | "Literal.same" => assert!(stateful.is_err()),
                     _ => {
                         let value = stateful.unwrap();
                         assert_eq!(value["decl"], target);
@@ -4354,7 +4360,7 @@ but is expected to have type
                     let output = cli.output().unwrap();
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    if matches!(target, "same" | "Other.A.same") {
+                    if matches!(target, "same" | "Other.A.same" | "Literal.same") {
                         assert!(
                             !output.status.success(),
                             "{command} {target}: {stdout} {stderr}"

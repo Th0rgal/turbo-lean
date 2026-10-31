@@ -1164,8 +1164,8 @@ pub(crate) fn shm_file_splits_dir(store: &TurboStore) -> PathBuf {
 pub(crate) fn compute_single_stat_hash(pk: &str, ms: i64, mn: i64, sz: i64) -> String {
     let mut h = blake3::Hasher::new();
     // v4 rebuilds legacy shards without qualified declaration identities.
-    // v5 also segments indented root commands, so v4 splits cannot resolve targets safely.
-    h.update(b"single-stat-split:v5\n");
+    // v6 preserves indentation and literal context when resolving declaration identities.
+    h.update(b"single-stat-split:v6\n");
     h.update(pk.as_bytes());
     h.update(b":");
     h.update(&ms.to_le_bytes());
