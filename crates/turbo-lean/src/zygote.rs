@@ -2103,6 +2103,7 @@ pub(crate) fn run_audited_lean_shard(
     lean_args: &[String],
     timeout_ms: Option<u64>,
 ) -> Result<std::process::Output> {
+    let started = std::time::Instant::now();
     let mod_name = format!("TurboAuditedShard_{}_{}", std::process::id(), next_tmp_id());
     let tmp_dir = store.fast_staging_dir().join(&mod_name);
     let _ = fs::remove_dir_all(&tmp_dir);
@@ -2193,17 +2194,25 @@ pub(crate) fn run_audited_lean_shard(
     if let Some(dir) = cwd {
         auditor.current_dir(dir);
     }
-    let timeout_secs = std::env::var("TURBO_LEAN_AUDIT_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(300);
-    let audit_out = crate::module_builder::run_command_with_timeout(
-        &mut auditor,
-        std::time::Duration::from_secs(timeout_secs),
-        false,
-    )
-    .context("Failed to execute in-kernel shard auditor (`--audit-modules --shard`)")?;
+    let mut audit_timeout = std::time::Duration::from_secs(
+        std::env::var("TURBO_LEAN_AUDIT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(300),
+    );
+    // A request budget bounds the whole fallback (compile, auditor preparation and audit).
+    if let Some(ms) = timeout_ms {
+        let left = std::time::Duration::from_millis(ms).saturating_sub(started.elapsed());
+        anyhow::ensure!(
+            !left.is_zero(),
+            "Lean request timed out before the shard audit"
+        );
+        audit_timeout = audit_timeout.min(left);
+    }
+    let audit_out =
+        crate::module_builder::run_command_with_timeout(&mut auditor, audit_timeout, false)
+            .context("Failed to execute in-kernel shard auditor (`--audit-modules --shard`)")?;
     let decls = parse_audit_modules_reply(&audit_out, std::slice::from_ref(&mod_name))?
         .decls
         .unwrap_or_default();
@@ -4535,6 +4544,23 @@ mod tests {
             "`hidden`",
         );
         assert!(!run("theorem tgt : 1 = 2 := rfl\n")?.status.success());
+        // A request budget bounds the whole fallback; it never yields a late verdict.
+        let audit = std::collections::HashSet::from(["tgt".to_string()]);
+        let late = run_audited_lean_shard(
+            &store,
+            Path::new("lean"),
+            &env,
+            Some(&dir),
+            "theorem tgt : 1 = 1 := rfl\n",
+            &audit,
+            &[],
+            Some(1),
+        );
+        assert!(
+            !matches!(late, Ok(ref o) if o.status.success()),
+            "{:?}",
+            late
+        );
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
