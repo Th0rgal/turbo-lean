@@ -1424,7 +1424,12 @@ pub fn prestage_blobs_from_shared_cas(
                     0i64
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    fs::metadata(&dest).map(|m| m.ino() as i64).unwrap_or(0)
+                    // Cold `TLZ1` blobs legitimately differ in length; a torn one is left for
+                    // the payload import to repair.
+                    match crate::db::probe_blob_file(&dest, b.size_bytes) {
+                        crate::db::BlobDisk::Intact(m) => m.ino() as i64,
+                        _ => return None,
+                    }
                 }
                 Err(_) => {
                     let src_p = if shared_p.exists() {
@@ -1817,11 +1822,12 @@ pub fn import_pack_bytes_with_policy(
 
     let process_chunk = |chunk: &[(&PackedBlob, &[u8])],
                          root_dir: &Path,
-                         staging_dir_ref: &Path,
+                         #[cfg_attr(unix, allow(unused_variables))] staging_dir_ref: &Path,
                          new_prefixes: &[bool; 256]|
      -> Result<(Vec<(String, String, i64, i64)>, usize)> {
         let mut local = Vec::with_capacity(chunk.len());
         let mut newly_written = 0usize;
+        #[cfg(not(unix))]
         let mut staging_ready = false;
         for &(b, blob_bytes) in chunk {
             // Re-verify BLAKE3 digest of every incoming blob (Zero-Trust transport rule!)
@@ -1841,53 +1847,23 @@ pub fn import_pack_bytes_with_policy(
             let p_idx = u8::from_str_radix(prefix, 16).unwrap_or(0) as usize;
             let dest = root_dir.join("blobs").join(prefix).join(&b.blob_hash);
 
-            // Zero-copy existing-blob skip + single-syscall create_new:
+            // Existing blobs are size-checked and torn ones rewritten; all writes are atomic.
             #[cfg(unix)]
             let inode = {
-                use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-                if !new_prefixes[p_idx] {
-                    if let Ok(m) = fs::metadata(&dest) {
-                        local.push((
-                            b.blob_hash.clone(),
-                            b.kind.clone(),
-                            blob_bytes.len() as i64,
-                            m.ino() as i64,
-                        ));
-                        continue;
-                    }
-                }
-                match fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o444)
-                    .open(&dest)
-                {
-                    Ok(mut f) => {
-                        f.write_all(blob_bytes)?;
+                use crate::db::{probe_blob_file, write_blob_atomic, BlobDisk};
+                use std::os::unix::fs::MetadataExt;
+                let len = blob_bytes.len() as u64;
+                let state = if new_prefixes[p_idx] {
+                    BlobDisk::Missing
+                } else {
+                    probe_blob_file(&dest, len)
+                };
+                match state {
+                    BlobDisk::Intact(m) => m.ino() as i64,
+                    missing_or_torn => {
+                        let replace = matches!(missing_or_torn, BlobDisk::Torn);
                         newly_written += 1;
-                        0i64
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                        fs::metadata(&dest).map(|m| m.ino() as i64).unwrap_or(0)
-                    }
-                    Err(_) => {
-                        if !staging_ready {
-                            fs::create_dir_all(staging_dir_ref)?;
-                            staging_ready = true;
-                        }
-                        let staging_path =
-                            staging_dir_ref.join(format!("{}.{}.tmp", b.blob_hash, next_tmp_id()));
-                        let mut f = fs::OpenOptions::new()
-                            .write(true)
-                            .create(true)
-                            .truncate(true)
-                            .mode(0o444)
-                            .open(&staging_path)?;
-                        f.write_all(blob_bytes)?;
-                        drop(f);
-                        fs::rename(&staging_path, &dest)?;
-                        newly_written += 1;
-                        0i64
+                        write_blob_atomic(root_dir, &dest, &b.blob_hash, blob_bytes, replace)?
                     }
                 }
             };
@@ -2435,8 +2411,54 @@ pub fn http_request_full(
     expected_sha256: Option<&str>,
     on_inflight: impl FnOnce(),
 ) -> Result<Vec<u8>> {
-    use std::time::Duration;
     let resolved_token = resolve_http_auth_token(url, auth_token);
+    http_request_with_resolved_token(
+        method,
+        url,
+        content_type,
+        body,
+        timeout_ms,
+        resolved_token,
+        expected_sha256,
+        on_inflight,
+    )
+}
+
+/// Like [`http_request_full`] but never attaches explicit or ambient (`TURBO_LEAN_*_TOKEN`)
+/// credentials; for URLs supplied by an untrusted server.
+pub fn http_request_full_anonymous(
+    method: &str,
+    url: &str,
+    content_type: &str,
+    body: &[u8],
+    timeout_ms: Option<u64>,
+    expected_sha256: Option<&str>,
+    on_inflight: impl FnOnce(),
+) -> Result<Vec<u8>> {
+    http_request_with_resolved_token(
+        method,
+        url,
+        content_type,
+        body,
+        timeout_ms,
+        None,
+        expected_sha256,
+        on_inflight,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn http_request_with_resolved_token(
+    method: &str,
+    url: &str,
+    content_type: &str,
+    body: &[u8],
+    timeout_ms: Option<u64>,
+    resolved_token: Option<String>,
+    expected_sha256: Option<&str>,
+    on_inflight: impl FnOnce(),
+) -> Result<Vec<u8>> {
+    use std::time::Duration;
 
     if url.starts_with("https://") {
         let connect_dur = Duration::from_millis(timeout_ms.unwrap_or(5_000).clamp(100, 10_000));
@@ -2573,7 +2595,9 @@ pub fn http_request_full(
 
     let mut reader = BufReader::new(stream);
     let mut status_line = String::with_capacity(64);
-    reader.read_line(&mut status_line)?;
+    if reader.read_line(&mut status_line)? == 0 {
+        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "EOF before HTTP response").into());
+    }
     let mut content_len: Option<usize> = None;
     let mut header_sha256: Option<String> = None;
     let mut hline = String::with_capacity(128);
@@ -2945,6 +2969,45 @@ pub(crate) mod tests {
         assert_eq!(
             resolve_http_auth_token("http://10.0.0.1:9400", Some("explicit")).as_deref(),
             Some("explicit")
+        );
+    }
+
+    #[test]
+    fn anonymous_request_never_sends_ambient_loopback_tokens() {
+        use std::io::{Read, Write};
+        let _env_guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("TURBO_LEAN_API_TOKEN", "api-tok");
+        std::env::set_var("TURBO_LEAN_DAEMON_TOKEN", "daemon-tok");
+        let _clear = ScopedEnvClear(&["TURBO_LEAN_API_TOKEN", "TURBO_LEAN_DAEMON_TOKEN"]);
+        let request_seen_by_server = |anonymous: bool| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/artifact", listener.local_addr().unwrap());
+            let srv = std::thread::spawn(move || {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).unwrap();
+                let _ = sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+                String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase()
+            });
+            let body = if anonymous {
+                http_request_full_anonymous("GET", &url, "x/y", &[], Some(5_000), None, || {})
+            } else {
+                http_request_full("GET", &url, "x/y", &[], Some(5_000), None, None, || {})
+            };
+            assert_eq!(body.unwrap(), b"ok");
+            srv.join().unwrap()
+        };
+        let ambient = request_seen_by_server(false);
+        assert!(
+            ambient.contains("authorization: bearer api-tok"),
+            "{ambient}"
+        );
+        let anon = request_seen_by_server(true);
+        assert!(
+            !anon.contains("authorization") && !anon.contains("x-turbo-token"),
+            "{anon}"
         );
     }
 

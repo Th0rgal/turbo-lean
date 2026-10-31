@@ -42,17 +42,6 @@ def decodeHexToString (hex : String) : String := Id.run do
     out := out.push ((hi <<< 4) ||| lo)
   return String.fromUTF8! out
 
-/-- Read a `/dev/shm` payload slot (`shm:/dev/shm/...`) or decode a hex payload. -/
-def decodePayloadOrShm (raw : String) : IO String := do
-  if raw.startsWith "shm:" then
-    let p : System.FilePath := (raw.drop 4).toString
-    if ← p.pathExists then
-      IO.FS.readFile p
-    else
-      pure ""
-  else
-    pure (decodeHexToString raw)
-
 /-- Parse a dot-separated Lean module name (supporting `«...»` guillemet-escaped segments) into a `Lean.Name`. -/
 def parseModuleName (s : String) : Name := Id.run do
   let trimmed := s.trimAscii.toString
@@ -1396,6 +1385,7 @@ def main (args : List String) : IO Unit := do
       else
         (raw1, raw2, parts.drop 3 |>.headD "", parts.drop 4 |>.headD "")
     let hexOpts := parts.drop 5 |>.headD ""
+    let hostClosureDigest := (parts.drop 6 |>.headD "").trimAscii.toString
     let encodedLeanArgs := if hexOpts.isEmpty then "" else TurboLean.ZygoteWorker.decodeHexToString hexOpts
     let isBatchFission := modeFlag == "batch_fission" || modeFlag.startsWith "batch_fission"
     let isRaceCandidates := modeFlag == "race_candidates" || modeFlag.startsWith "race_candidates"
@@ -1435,7 +1425,7 @@ def main (args : List String) : IO Unit := do
       | some c => if c.isEmpty then initCwd else System.FilePath.mk c
       | none => initCwd
     try IO.Process.setCurrentDir targetCwd catch _ => pure ()
-    let bodyCode ← if isBatchFission || isRaceCandidates then pure "" else TurboLean.ZygoteWorker.decodePayloadOrShm hexBody
+    let bodyCode := if isBatchFission || isRaceCandidates then "" else TurboLean.ZygoteWorker.decodeHexToString hexBody
     let hexSubs := if isBatchFission || isRaceCandidates then (hexBody.splitOn ",").filter (fun s => !s.isEmpty) else []
     let (imports, isMod, isHeaderErr) := TurboLean.ZygoteWorker.parseImportsCsvSpec importsCsv
     if poisoned then
@@ -1470,10 +1460,16 @@ def main (args : List String) : IO Unit := do
       continue
     let cachedHit? ← match envCache[importsCsv]? with
       | some (cachedDiskKey, trackedMods, cachedEnv) => do
-        match ← TurboLean.ZygoteWorker.computeImportsClosureDiskKey importsCsv sysroot trackedMods with
-        | some curKey =>
-          if curKey == cachedDiskKey then pure (some (curKey, trackedMods, cachedEnv)) else pure none
-        | none => pure none
+        if !hostClosureDigest.isEmpty then
+          let hostKey := s!"host:{hostClosureDigest}"
+          pure (if cachedDiskKey == hostKey then some (hostKey, trackedMods, cachedEnv) else none)
+        else if cachedDiskKey.startsWith "host:" then
+          pure none
+        else
+          match ← TurboLean.ZygoteWorker.computeImportsClosureDiskKey importsCsv sysroot trackedMods with
+          | some curKey =>
+            pure (if curKey == cachedDiskKey then some (curKey, trackedMods, cachedEnv) else none)
+          | none => pure none
       | none => pure none
     let (envCacheHit, importUs, baseEnv?, envErr?, envDiskKey?, trackedMods) ← match cachedHit? with
       | some (curKey, tMods, env) => pure (true, 0, some env, none, some curKey, tMods)
@@ -1483,8 +1479,12 @@ def main (args : List String) : IO Unit := do
         try
           unsafe enableInitializersExecution
           let env ← Lean.importModules imports {} 1025 #[] false true level
-          let tMods ← TurboLean.ZygoteWorker.extractTrackedClosureMods importsCsv sysroot env
-          let freshKey? ← TurboLean.ZygoteWorker.computeImportsClosureDiskKey importsCsv sysroot tMods
+          let (freshKey?, tMods) ← if !hostClosureDigest.isEmpty then
+              pure (some s!"host:{hostClosureDigest}", #[])
+            else do
+              let tm ← TurboLean.ZygoteWorker.extractTrackedClosureMods importsCsv sysroot env
+              let fk? ← TurboLean.ZygoteWorker.computeImportsClosureDiskKey importsCsv sysroot tm
+              pure (fk?, tm)
           let tImp1 ← IO.monoNanosNow
           pure (false, (tImp1 - tImp0) / 1000, some env, none, freshKey?, tMods)
         catch e =>
@@ -1541,7 +1541,7 @@ def main (args : List String) : IO Unit := do
         let optsCacheSuffix := if hexOpts.isEmpty then "" else s!"\topts:{hexOpts}"
         let importStubKey := (if evalMode || emitOlean?.isSome then s!"{envDiskKey}\t{prefAllowStub}\t{evalMode}\t{fnPref}\t{cwdKey}\t{emitModKey}" else s!"{envDiskKey}\t{prefAllowStub}\t{evalMode}") ++ optsCacheSuffix
         let fullPrefixKey := (if evalMode || emitOlean?.isSome then s!"{envDiskKey}\t{prefAllowStub}\t{evalMode}\t{fnPref}\t{cwdKey}\t{emitModKey}\t{prefixKey}" else s!"{envDiskKey}\t{prefAllowStub}\t{evalMode}\t{prefixKey}") ++ optsCacheSuffix
-        let prefixCode ← TurboLean.ZygoteWorker.decodePayloadOrShm hexPrefix
+        let prefixCode := TurboLean.ZygoteWorker.decodeHexToString hexPrefix
         let (prefixCacheHit, prefixUs, ckptState?, prefErrs, prefMsgs, prefOut, prefHbs, decodedPrefix?) ← match stateCache[fullPrefixKey]? with
           | some (cachedCode, st, cachedMsgs, cachedOut, cachedHbs) =>
             if cachedCode == prefixCode then
@@ -1583,7 +1583,11 @@ def main (args : List String) : IO Unit := do
               | none => none
             let deltaRes? ← match bestAncestor? with
               | some (prevCode, prevState, prevMsgs, prevOut, prevHbs) => do
-                let deltaCode := (prefixCode.drop (String.length prevCode)).toString
+                -- Pad with the ancestor's newlines (and trailing-line columns) so message
+                -- positions match a from-scratch run of `prefixCode`.
+                let lastLine := (prevCode.splitOn "\n").getLast!
+                let padding := "".pushn '\n' (prevCode.toList.filter (· == '\n')).length ++ "".pushn ' ' lastLine.length
+                let deltaCode := padding ++ (prefixCode.drop (String.length prevCode)).toString
                 let (dOk, dUs, dHbs, _dNodes, dErrs, dMsgs, dOut, _dUsed, dNextSt) ←
                   TurboLean.ZygoteWorker.runCommandsFromState prevState deltaCode fnPref prefAllowStub evalMode (finalRun := false)
                 if dErrs.contains TurboLean.ZygoteWorker.runtimePanicErr then poisoned := true

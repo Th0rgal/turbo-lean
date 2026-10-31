@@ -3066,7 +3066,7 @@ pub fn dedup_worktree_packages(
                         let same_inode = false;
 
                         if !same_inode
-                            && crate::db::try_reflink_or_hardlink(&cas_file, &path).is_ok()
+                            && crate::db::try_reflink_or_hardlink(&cas_file, &path, None).is_ok()
                         {
                             hardlinked_files += 1;
                             deduped_bytes += sz;
@@ -3093,7 +3093,8 @@ pub fn dedup_worktree_packages(
                                     let _ = fs::set_permissions(&tmp_cas, perms);
                                 }
                                 if fs::rename(&tmp_cas, &cas_file).is_ok() {
-                                    if crate::db::try_reflink_or_hardlink(&cas_file, &path).is_ok()
+                                    if crate::db::try_reflink_or_hardlink(&cas_file, &path, None)
+                                        .is_ok()
                                     {
                                         hardlinked_files += 1;
                                     }
@@ -3245,7 +3246,7 @@ pub fn run_build_command(
                 lake_env_to_put,
                 None,
             )?;
-            if std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+            if !crate::zygote::daemon_disabled() {
                 if let Some((ref env_vars, _)) = resolved_env {
                     pack::warm_local_zygote_daemon_nonblocking(store, env_vars);
                 }

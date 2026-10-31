@@ -443,7 +443,7 @@ pub fn lookup_distilled_constants(decl_name: &str, stmt_src: &str) -> Vec<String
 }
 
 fn distilled_nodes_shm_path() -> std::path::PathBuf {
-    crate::shm_cache::staging_shm_dir().join("distilled_proof_nodes.json")
+    crate::zygote::OneShotGuard::persistent_staging_dir().join("distilled_proof_nodes.json")
 }
 
 fn distilled_nodes_disk_path() -> Option<std::path::PathBuf> {
