@@ -10736,9 +10736,14 @@ roots = ["Fast"]
         )
         .unwrap();
         assert!(try_resolve_lean_args_for_path(&dir, None).is_err());
-        fs::write(dir.join("lakefile.toml"), "name = \"padded\"\nmoreLeanArgs = [\" -DautoImplicit=false "]\n").unwrap();
+        fs::write(
+            dir.join("lakefile.toml"),
+            r#"name = "padded"
+moreLeanArgs = [" -DautoImplicit=false "]
+"#,
+        )
+        .unwrap();
         assert!(try_resolve_lean_args_for_path(&dir, None).is_err());
-
 
         fs::write(
             dir.join("lakefile.toml"),

@@ -1366,11 +1366,18 @@ fn base_revision_package_config(
     let sha = match resolve_git_head_sha(repo_root, base_ref) {
         Some(sha) => sha,
         None => {
-            let out = Command::new("git").arg("-C").arg(repo_root)
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(repo_root)
                 .args(["rev-parse", "--verify", "--end-of-options"])
                 .arg(format!("{base_ref}^{{commit}}"))
-                .output().context("Failed to resolve Git base revision")?;
-            anyhow::ensure!(out.status.success(), "Invalid git base ref `{base_ref}`: {}", String::from_utf8_lossy(&out.stderr).trim());
+                .output()
+                .context("Failed to resolve Git base revision")?;
+            anyhow::ensure!(
+                out.status.success(),
+                "Invalid git base ref `{base_ref}`: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
             String::from_utf8(out.stdout)?.trim().to_string()
         }
     };
@@ -1450,7 +1457,9 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
     let option_changed_paths: std::collections::HashSet<String> = lean_paths
         .iter()
         .map(|p| rel_path_from_dir(p, canon_dir))
-        .filter(|rel| rel != "lakefile.lean" && resolve_rel_lean_args(rel) != resolve_base_lean_args(rel))
+        .filter(|rel| {
+            rel != "lakefile.lean" && resolve_rel_lean_args(rel) != resolve_base_lean_args(rel)
+        })
         .collect();
 
     enum PrFileEntry {
@@ -5828,7 +5837,9 @@ end Fixture
         git_init_and_commit(&repo, "head options")?;
         for base_ref in [base.as_str(), "HEAD~1", "HEAD^", &base[..12]] {
             assert_eq!(
-                load_and_classify_pr_from_git(&store, &repo, base_ref, tc)?.0.statement_edited_theorems,
+                load_and_classify_pr_from_git(&store, &repo, base_ref, tc)?
+                    .0
+                    .statement_edited_theorems,
                 vec!["Demo/A.lean::affected"]
             );
         }
