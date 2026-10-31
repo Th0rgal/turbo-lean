@@ -4538,6 +4538,9 @@ pub(crate) struct VerifiedDepModuleEntry {
     pub olean_artifact_digest: String,
     #[serde(default)]
     pub kernel_audited: bool,
+    /// Artifact-set digests of the direct imports this `.olean` was elaborated against.
+    /// Deliberately not `#[serde(default)]`: legacy entries without it fail closed.
+    pub import_olean_digests: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -4549,6 +4552,35 @@ pub(crate) struct VerifiedDepManifest {
     #[serde(default)]
     pub allowed_axioms: Vec<String>,
     pub modules: BTreeMap<String, VerifiedDepModuleEntry>,
+    /// Dependency-package `.olean` roots, resolved on load (never serialized).
+    #[serde(skip)]
+    pub dep_lib_lean_dirs: Vec<PathBuf>,
+}
+
+/// Whether `entry`'s `.olean` was elaborated against the current artifacts of its direct
+/// imports. `local_rel_src` maps an import to its source in `manifest`'s package (whose own
+/// entry the caller verifies against disk); other pinned imports are re-digested via
+/// `external_digest`. Every package-local import in `imports` must be pinned.
+pub(crate) fn verified_entry_imports_current(
+    entry: &VerifiedDepModuleEntry,
+    imports: &[String],
+    manifest: &VerifiedDepManifest,
+    local_rel_src: impl Fn(&str) -> Option<String>,
+    external_digest: impl Fn(&str) -> Option<String>,
+) -> bool {
+    imports
+        .iter()
+        .all(|imp| entry.import_olean_digests.contains_key(imp) || local_rel_src(imp).is_none())
+        && entry
+            .import_olean_digests
+            .iter()
+            .all(|(imp, dig)| match local_rel_src(imp) {
+                Some(rel) => manifest
+                    .modules
+                    .get(&rel)
+                    .is_some_and(|e| &e.olean_artifact_digest == dig),
+                None => external_digest(imp).is_some_and(|d| &d == dig),
+            })
 }
 
 pub(crate) fn verify_module_lake_sidecars(
@@ -4651,6 +4683,7 @@ fn is_dep_olean_fresh(
     spec: &DiscoveredModuleSpec,
     src_content: &str,
     is_module: bool,
+    imports: &[String],
     olean_path: &Path,
 ) -> Option<std::time::SystemTime> {
     let pkg_root = &spec.pkg_root;
@@ -4719,6 +4752,42 @@ fn is_dep_olean_fresh(
     if entry.olean_artifact_digest != actual_olean_digest {
         return None;
     }
+    let resolve_dep = |imp: &str| -> Option<DiscoveredModuleSpec> {
+        let mut found = cfg
+            .dep_pkgs
+            .iter()
+            .filter_map(|dp| resolve_module_in_package(dp, false, imp));
+        found.next().filter(|_| found.next().is_none())
+    };
+    if !verified_entry_imports_current(
+        entry,
+        imports,
+        &manifest,
+        |imp| {
+            resolve_dep(imp)
+                .filter(|d| d.pkg_name == spec.pkg_name)
+                .map(|d| {
+                    d.src_path
+                        .strip_prefix(pkg_root)
+                        .unwrap_or(&d.src_path)
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                })
+        },
+        |imp| {
+            let d = resolve_dep(imp)?;
+            let olean = d
+                .build_lib_lean_dir
+                .join(format!("{}.olean", module_name_to_rel_slash(imp)));
+            compute_olean_artifact_set_digest_with_policy(
+                &olean,
+                crate::lake_build::worktree_auto_link_disabled(&cfg.root_pkg.pkg_root),
+            )
+            .ok()
+        },
+    ) {
+        return None;
+    }
     let rel_slash = module_name_to_rel_slash(&spec.module_name);
     if verify_module_lake_sidecars(
         olean_path,
@@ -4764,7 +4833,8 @@ fn collect_fresh_dep_pkg_closure(
         }
         let rel_slash = module_name_to_rel_slash(&cur.module_name);
         let olean_path = cur.build_lib_lean_dir.join(format!("{}.olean", rel_slash));
-        let Some(cur_olean_mtime) = is_dep_olean_fresh(cfg, &cur, &src, hdr.is_module, &olean_path)
+        let Some(cur_olean_mtime) =
+            is_dep_olean_fresh(cfg, &cur, &src, hdr.is_module, &hdr.imports, &olean_path)
         else {
             return Ok(None);
         };
@@ -7722,7 +7792,29 @@ pub(crate) fn record_verified_dep_source(
     node: &ModuleNode,
     olean_artifact_digest: &str,
     kernel_audited: bool,
+    olean_digests: &HashMap<String, String>,
 ) {
+    // Pin the direct imports the `.olean` was elaborated against; skip recording if the
+    // source moved on mid-build or a dependency digest is unknown.
+    let Some(header) = fs::read_to_string(&node.src_path)
+        .ok()
+        .filter(|src| blake3::hash(src.as_bytes()).to_hex().as_str() == node.src_blake3)
+        .map(|src| parse_header_info(&src))
+    else {
+        return;
+    };
+    let direct_imports = node.direct_dag_deps.iter().chain(
+        node.external_olean_deps
+            .iter()
+            .map(|(m, _)| m)
+            .filter(|m| header.imports.contains(m)),
+    );
+    let Some(import_olean_digests) = direct_imports
+        .map(|m| Some((m.clone(), olean_digests.get(m)?.clone())))
+        .collect::<Option<BTreeMap<_, _>>>()
+    else {
+        return;
+    };
     let pkg_root = &node.pkg_root;
     let build_dir = pkg_root.join(".lake/build");
     let _ = fs::create_dir_all(&build_dir);
@@ -7745,6 +7837,7 @@ pub(crate) fn record_verified_dep_source(
             pkg_config_digest: node.pkg_config_digest.clone(),
             allowed_axioms,
             modules: BTreeMap::new(),
+            dep_lib_lean_dirs: Vec::new(),
         });
     let rel_src = node
         .src_path
@@ -7758,6 +7851,7 @@ pub(crate) fn record_verified_dep_source(
             src_blake3: node.src_blake3.clone(),
             olean_artifact_digest: olean_artifact_digest.to_string(),
             kernel_audited,
+            import_olean_digests,
         },
     );
     if let Ok(json_bytes) = serde_json::to_vec(&manifest) {
@@ -8034,7 +8128,13 @@ pub fn build_project_modules_native(
                             true,
                         )?;
                         if !is_untrusted {
-                            record_verified_dep_source(&cfg, node, &dig, node.is_root_pkg);
+                            record_verified_dep_source(
+                                &cfg,
+                                node,
+                                &dig,
+                                node.is_root_pkg,
+                                &olean_digests,
+                            );
                         }
                     }
                     olean_digests.insert(mod_name.clone(), dig);
@@ -8231,7 +8331,7 @@ pub fn build_project_modules_native(
                 dur_ms,
             )?;
             if !is_untrusted {
-                record_verified_dep_source(&cfg, node, &dig, node.is_root_pkg);
+                record_verified_dep_source(&cfg, node, &dig, node.is_root_pkg, &olean_digests);
             }
             olean_digests.insert(mod_name.clone(), dig);
             report.modules_compiled += 1;

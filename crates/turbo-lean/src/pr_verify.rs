@@ -5938,6 +5938,7 @@ end Fixture
                 pkg_config_digest: cfg.root_pkg.config_digest.clone(),
                 allowed_axioms: crate::splitter::allowed_axioms(),
                 modules: BTreeMap::new(),
+                dep_lib_lean_dirs: Vec::new(),
             });
         manifest.modules.insert(
             rel_src.to_string(),
@@ -5945,6 +5946,7 @@ end Fixture
                 src_blake3: blake3::hash(src_raw.as_bytes()).to_hex().to_string(),
                 olean_artifact_digest: art_dig,
                 kernel_audited: true,
+                import_olean_digests: BTreeMap::new(),
             },
         );
         fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;

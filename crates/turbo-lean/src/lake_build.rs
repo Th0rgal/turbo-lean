@@ -1749,7 +1749,7 @@ pub(crate) fn load_verified_project_manifest(
 ) -> Option<crate::module_builder::VerifiedDepManifest> {
     let manifest_path = verified_sources_manifest_path(canon_dir);
     let bytes = fs::read(&manifest_path).ok()?;
-    let manifest: crate::module_builder::VerifiedDepManifest =
+    let mut manifest: crate::module_builder::VerifiedDepManifest =
         serde_json::from_slice(&bytes).ok()?;
     let cfg = crate::module_builder::resolve_project_config(canon_dir).ok()?;
     if manifest.pkg_name != cfg.root_pkg.name
@@ -1760,6 +1760,11 @@ pub(crate) fn load_verified_project_manifest(
     {
         return None;
     }
+    manifest.dep_lib_lean_dirs = cfg
+        .dep_pkgs
+        .iter()
+        .map(|dp| dp.pkg_root.join(&dp.build_dir).join(&dp.lean_lib_dir))
+        .collect();
     Some(manifest)
 }
 
@@ -1796,6 +1801,35 @@ fn verify_project_module_entry_and_sidecars(
     }
     let hdr = crate::module_builder::parse_header_info(&src_raw);
     if hdr.header_error.is_some() {
+        return false;
+    }
+    // P0-4: reject `.olean`s elaborated against an older artifact of one of their imports.
+    if !crate::module_builder::verified_entry_imports_current(
+        entry,
+        &hdr.imports,
+        manifest,
+        |imp| {
+            let rel_slash = crate::module_builder::module_name_to_rel_slash(imp);
+            let dep_src = resolve_project_lean_source(canon_dir, &rel_slash)?;
+            Some(
+                dep_src
+                    .strip_prefix(canon_dir)
+                    .unwrap_or(&dep_src)
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            )
+        },
+        |imp| {
+            let rel_slash = crate::module_builder::module_name_to_rel_slash(imp);
+            let mut found = manifest
+                .dep_lib_lean_dirs
+                .iter()
+                .map(|d| d.join(format!("{rel_slash}.olean")))
+                .filter(|p| p.is_file());
+            let olean = found.next().filter(|_| found.next().is_none())?;
+            crate::module_builder::compute_olean_artifact_set_digest(&olean).ok()
+        },
+    ) {
         return false;
     }
     let lib_lean_dir = canon_dir.join(".lake/build/lib/lean");
@@ -3566,8 +3600,10 @@ mod tests {
                         src_blake3: "previous source".into(),
                         olean_artifact_digest: "previous artifact".into(),
                         kernel_audited: true,
+                        import_olean_digests: Default::default(),
                     },
                 )]),
+                ..Default::default()
             };
             fs::write(
                 verified_sources_manifest_path(&tree.project),
