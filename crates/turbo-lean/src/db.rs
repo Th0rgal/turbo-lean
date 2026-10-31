@@ -128,15 +128,59 @@ impl Drop for CasExclusiveGcGuard {
     }
 }
 
-fn open_gc_publish_lock_file(store_root: &Path) -> Result<File> {
+/// Ensure `<store_root>/locks` exists and durably persist any newly created directory components
+/// (including `store_root`'s entry in its parent directory and any missing ancestors above it)
+/// bottom-up so cold-store callers that open lock files before prestaging/spooling never leave
+/// newly created store directories unpersisted across a crash.
+pub(crate) fn ensure_store_locks_dir_durable(store_root: &Path) -> Result<PathBuf> {
     let locks_dir = store_root.join("locks");
-    fs::create_dir_all(&locks_dir)?;
-    Ok(OpenOptions::new()
+    let mut to_create = Vec::new();
+    let mut cur = Some(locks_dir.as_path());
+    while let Some(p) = cur {
+        if p.as_os_str().is_empty() || p.exists() {
+            break;
+        }
+        to_create.push(p.to_path_buf());
+        cur = p.parent();
+    }
+    let mut parents_to_sync = Vec::new();
+    for p in to_create.iter().rev() {
+        match fs::create_dir(p) {
+            Ok(()) => {
+                if let Some(parent) = p.parent().filter(|par| !par.as_os_str().is_empty()) {
+                    parents_to_sync.push(parent.to_path_buf());
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if let Some(parent) = p.parent().filter(|par| !par.as_os_str().is_empty()) {
+                    parents_to_sync.push(parent.to_path_buf());
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    parents_to_sync.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    parents_to_sync.dedup();
+    for dir in &parents_to_sync {
+        sync_dir(dir)?;
+    }
+    Ok(locks_dir)
+}
+
+fn open_gc_publish_lock_file(store_root: &Path) -> Result<File> {
+    let locks_dir = ensure_store_locks_dir_durable(store_root)?;
+    let lock_path = locks_dir.join("gc_publish.lock");
+    let created_lock = !lock_path.exists();
+    let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(locks_dir.join("gc_publish.lock"))?)
+        .open(&lock_path)?;
+    if created_lock {
+        sync_dir(&locks_dir)?;
+    }
+    Ok(file)
 }
 
 pub fn acquire_cas_publication_guard(store_root: &Path) -> Result<CasPublicationGuard> {
@@ -5412,19 +5456,45 @@ mod tests {
         ));
         let evs = take_log();
         assert!(
-            evs.first()
-                .is_some_and(|s| s.starts_with("file:.deferred_pack_v4.")),
-            "{evs:?}"
+            evs.iter().any(|s| s == "dir:fresh_store"),
+            "newly created locks dir must sync store_root: {evs:?}"
         );
-        let locks_pos = evs
+        let spool_pos = evs
+            .iter()
+            .position(|s| s.starts_with("file:.deferred_pack_v4."))
+            .expect("spool file synced");
+        let locks_after_spool = evs[spool_pos..]
             .iter()
             .position(|s| s == "dir:locks")
-            .expect("locks synced");
-        let root_pos = evs
+            .expect("locks synced after spool publish");
+        assert!(locks_after_spool > 0, "{evs:?}");
+
+        // Cold-store lock initialization into a previously nonexistent store root (with a missing
+        // intermediate parent) must durably sync every newly created ancestor, including the parent
+        // directory naming `brand_new_store` itself.
+        let cold_parent = dir.join("missing_cold_parent");
+        let cold_store_root = cold_parent.join("brand_new_store");
+        assert!(!cold_parent.exists());
+        let cold_guard = acquire_cas_publication_guard(&cold_store_root)?;
+        drop(cold_guard);
+        let evs = take_log();
+        let p_store = evs
             .iter()
-            .position(|s| s == "dir:fresh_store")
-            .expect("root synced for newly created locks dir");
-        assert!(locks_pos < root_pos, "{evs:?}");
+            .position(|s| s == "dir:brand_new_store")
+            .expect("brand_new_store synced for locks/");
+        let p_parent = evs
+            .iter()
+            .position(|s| s == "dir:missing_cold_parent")
+            .expect("missing_cold_parent synced for brand_new_store");
+        let dir_fname = dir.file_name().unwrap().to_string_lossy().to_string();
+        let p_outer = evs
+            .iter()
+            .position(|s| *s == format!("dir:{dir_fname}"))
+            .expect("outer parent synced for missing_cold_parent");
+        assert!(
+            p_store < p_parent && p_parent < p_outer,
+            "expected bottom-up ancestor sync brand_new_store -> missing_cold_parent -> outer dir, got {evs:?}"
+        );
 
         let created = ensure_dir_tracking(&fresh_root.join("nested/stamp_dir"), &fresh_root)?;
         write_bytes_durable(

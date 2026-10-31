@@ -469,14 +469,18 @@ impl Drop for DeferredPackLockGuard {
 }
 
 pub(crate) fn acquire_deferred_pack_lock(store_root: &Path) -> Result<DeferredPackLockGuard> {
-    let locks_dir = store_root.join("locks");
-    fs::create_dir_all(&locks_dir)?;
+    let locks_dir = crate::db::ensure_store_locks_dir_durable(store_root)?;
+    let lock_path = locks_dir.join("deferred_pack.lock");
+    let created_lock = !lock_path.exists();
     let file = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(locks_dir.join("deferred_pack.lock"))?;
+        .open(&lock_path)?;
+    if created_lock {
+        crate::db::sync_dir(&locks_dir)?;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
@@ -525,13 +529,20 @@ pub(crate) fn list_pending_deferred_pack_files(locks_dir: &Path) -> Result<Vec<s
 
 pub(crate) fn replay_pending_deferred_packs_inner(
     store: &mut TurboStore,
-    already_holds_gc_lock: bool,
+    already_holds_gc_or_pub_lock: bool,
 ) -> Result<()> {
     let locks_dir = store.root.join("locks");
     let _ = fs::remove_file(locks_dir.join("deferred_pack_v3.domain"));
     if list_pending_deferred_pack_files(&locks_dir)?.is_empty() {
         return Ok(());
     }
+    // Enforce global lock order `gc_publish.lock` -> `deferred_pack.lock` across both
+    // `TurboStore::open` replay (`LOCK_SH`) and `run_gc` (`LOCK_EX`), avoiding AB-BA deadlock.
+    let _pub_guard = if already_holds_gc_or_pub_lock {
+        None
+    } else {
+        Some(crate::db::acquire_cas_publication_guard(&store.root)?)
+    };
     let _def_lock = acquire_deferred_pack_lock(&store.root)?;
     let pending = list_pending_deferred_pack_files(&locks_dir)?;
     if pending.is_empty() {
@@ -566,7 +577,7 @@ pub(crate) fn replay_pending_deferred_packs_inner(
             &staged_blobs,
             force_commit,
             deferred_td,
-            already_holds_gc_lock,
+            true,
         ) {
             Ok(_) => {
                 if fs::remove_file(&spool_path).is_ok() {
@@ -592,20 +603,13 @@ pub(crate) fn replay_pending_deferred_packs(store: &mut TurboStore) -> Result<()
     replay_pending_deferred_packs_inner(store, false)
 }
 
-pub fn stage_deferred_pack_record(store_root: &Path, td: &str, v3_bytes: &[u8]) -> bool {
-    let root_preexisted = store_root.exists();
-    if fs::create_dir_all(store_root).is_err() {
-        return false;
-    }
-    let locks_dir = store_root.join("locks");
-    let Ok(mut created) = crate::db::ensure_dir_tracking(&locks_dir, store_root) else {
+fn stage_deferred_pack_record_locked(store_root: &Path, td: &str, v3_bytes: &[u8]) -> bool {
+    let Ok(locks_dir) = crate::db::ensure_store_locks_dir_durable(store_root) else {
         return false;
     };
-    if !root_preexisted {
-        if let Some(parent) = store_root.parent().filter(|p| !p.as_os_str().is_empty()) {
-            created.push(parent.to_path_buf());
-        }
-    }
+    let Ok(created) = crate::db::ensure_dir_tracking(&locks_dir, store_root) else {
+        return false;
+    };
     let Ok(_def_lock) = acquire_deferred_pack_lock(store_root) else {
         for dir in &created {
             let _ = crate::db::sync_dir(dir);
@@ -635,6 +639,15 @@ pub fn stage_deferred_pack_record(store_root: &Path, td: &str, v3_bytes: &[u8]) 
     }
     let _ = fs::remove_file(locks_dir.join("deferred_pack_v3.domain"));
     true
+}
+
+#[cfg(test)]
+pub(crate) fn stage_deferred_pack_record(store_root: &Path, td: &str, v3_bytes: &[u8]) -> bool {
+    // Enforce global lock order `gc_publish.lock` -> `deferred_pack.lock`.
+    let Ok(_pub_guard) = crate::db::acquire_cas_publication_guard(store_root) else {
+        return false;
+    };
+    stage_deferred_pack_record_locked(store_root, td, v3_bytes)
 }
 
 pub fn decode_deferred_pack_record(buf: &[u8]) -> Option<(&'static str, PackManifest)> {
@@ -712,7 +725,7 @@ pub fn try_stateless_cold_pull_sync_with_domain(
     .ok()?;
     let _pub_guard = crate::db::acquire_cas_publication_guard(store_root).ok()?;
     let (_, _) = prestage_blobs_from_shared_cas(store_root, &manifest)?;
-    if !stage_deferred_pack_record(store_root, td, &pack_bytes) {
+    if !stage_deferred_pack_record_locked(store_root, td, &pack_bytes) {
         return None;
     }
     drop(_pub_guard);
@@ -1808,7 +1821,7 @@ pub fn try_stateless_cold_import_with_domain(
     v3_bytes.extend_from_slice(b"TLPK\x00\x00\x00\x03");
     v3_bytes.extend_from_slice(&(header_len as u64).to_le_bytes());
     v3_bytes.extend_from_slice(&header_buf);
-    if !stage_deferred_pack_record(store_root, td, &v3_bytes) {
+    if !stage_deferred_pack_record_locked(store_root, td, &v3_bytes) {
         return None;
     }
     drop(_pub_guard);
@@ -4808,6 +4821,34 @@ pub(crate) mod tests {
             .is_some());
         assert!(list_pending_deferred_pack_files(&root_crash.join("locks"))?.is_empty());
         drop(recovered);
+
+        // 3. Concurrent `TurboStore::open` deferred-pack replay vs `run_gc` + `stage_deferred_pack_record`
+        //    must follow uniform lock order (`gc_publish.lock` -> `deferred_pack.lock`) without deadlocking,
+        //    and cold stateless import into a previously nonexistent store directory must succeed cleanly.
+        let root_nonexistent = root_dst.join("nonexistent_parent").join("cold_target_store");
+        assert!(!root_nonexistent.exists());
+        assert!(
+            try_stateless_cold_import_with_domain(&root_nonexistent, &pack_a, Some("trusted"), None, true)
+                .is_some()
+        );
+        let mut gc_peer = TurboStore::open(Some(&root_nonexistent))?;
+        assert!(gc_peer.get_cached_action("def-act-alpha", "trusted")?.is_some());
+
+        let (_, _, hdr_b) = read_pack_header_from_file(&pack_b).unwrap();
+        let mut v3_b = Vec::with_capacity(16 + hdr_b.len());
+        v3_b.extend_from_slice(b"TLPK\x00\x00\x00\x03");
+        v3_b.extend_from_slice(&(hdr_b.len() as u64).to_le_bytes());
+        v3_b.extend_from_slice(&hdr_b);
+
+        for _ in 0..8 {
+            assert!(stage_deferred_pack_record(&root_nonexistent, "trusted", &v3_b));
+            let r_open = root_nonexistent.clone();
+            let h_open = std::thread::spawn(move || TurboStore::open(Some(&r_open)));
+            let _ = gc_peer.run_gc(u64::MAX, 7 * 86400, true)?;
+            let s_open = h_open.join().expect("open replay thread must not panic/deadlock")?;
+            assert!(s_open.get_cached_action("def-act-bravo", "trusted")?.is_some());
+        }
+        drop(gc_peer);
 
         let _ = fs::remove_dir_all(&root_crash);
         let _ = fs::remove_dir_all(&root_a);
