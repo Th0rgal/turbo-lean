@@ -1048,11 +1048,15 @@ fn owned_private_file(path: &Path) -> bool {
 /// Per-uid `$TMPDIR/turbo_lean_shared_zygote_bins_<uid>` (mode 0700), or `None` when it cannot
 /// be created or is not owned by us (e.g. pre-created by another local user).
 pub(crate) fn private_shared_zygote_dir() -> Option<PathBuf> {
+    private_shared_zygote_dir_in(&std::env::temp_dir())
+}
+
+fn private_shared_zygote_dir_in(base: &Path) -> Option<PathBuf> {
     #[cfg(unix)]
     let uid = unsafe { libc::geteuid() };
     #[cfg(not(unix))]
     let uid = 0u32;
-    let dir = std::env::temp_dir().join(format!("turbo_lean_shared_zygote_bins_{uid}"));
+    let dir = base.join(format!("turbo_lean_shared_zygote_bins_{uid}"));
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -4275,6 +4279,101 @@ mod tests {
                     .contains("rsgb_driver.lean:12:7: error(lean.unknownIdentifier):")
         );
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_eval_mode_ancestor_prefix_reuse_preserves_line_numbers() {
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("eval_ancestor")
+        else {
+            return;
+        };
+        let toolchain = "leanprover/lean4:v4.35.0";
+        let isolated_lp = tmp_dir.to_string_lossy().to_string();
+        let run_eval = |src: &str| {
+            eval_with_zygote_pool_opts(
+                &store,
+                toolchain,
+                &isolated_lp,
+                &env_vars,
+                &lean_bin,
+                src,
+                false,
+                true,
+                Some("anc.lean"),
+                Some(30_000),
+            )
+            .unwrap()
+        };
+        let base = "import Init\ndef ancA : Nat := 1\ndef ancB : Nat := ancA + 1\n";
+        assert!(run_eval(&format!("{base}#eval ancB\n")).ok);
+        // The new prefix extends the cached one; the warning in the delta sits on line 4.
+        let rep = run_eval(&format!("{base}theorem ancW : True := sorry\n#eval ancB\n"));
+        let msgs = rep.messages.join("\n");
+        assert!(rep.ok && msgs.contains("anc.lean:4:8: warning"), "{msgs}");
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_eval_reply_cacheable_only_for_clean_successes() {
+        let ok = ZygoteEvalReply {
+            ok: true,
+            import_ok: true,
+            ..Default::default()
+        };
+        assert!(eval_reply_cacheable(&ok));
+        // e.g. "toolchain not installed": ok=false and import_ok=false
+        assert!(!eval_reply_cacheable(&ZygoteEvalReply {
+            ok: false,
+            ..ok.clone()
+        }));
+        assert!(!eval_reply_cacheable(&ZygoteEvalReply {
+            import_ok: false,
+            ..ok.clone()
+        }));
+        assert!(!eval_reply_cacheable(&ZygoteEvalReply {
+            crashed: true,
+            ..ok.clone()
+        }));
+        assert!(!eval_reply_cacheable(&ZygoteEvalReply {
+            timed_out: true,
+            ..ok
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_shared_zygote_dir_rejects_foreign_or_open_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = std::env::temp_dir().join(format!("turbo_zyg_shared_{}", next_tmp_id()));
+        fs::create_dir_all(&tmp).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let dir = tmp.join(format!("turbo_lean_shared_zygote_bins_{uid}"));
+        // Pre-planted world-writable dir (as another local user could create) is rejected.
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(private_shared_zygote_dir_in(&tmp).is_none());
+        // A symlink in its place is rejected too.
+        fs::remove_dir(&dir).unwrap();
+        let target = tmp.join("elsewhere");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&target, &dir).unwrap();
+        assert!(private_shared_zygote_dir_in(&tmp).is_none());
+        fs::remove_file(&dir).unwrap();
+        // Fresh dir is created 0700 and accepted.
+        let got = private_shared_zygote_dir_in(&tmp).expect("private dir");
+        assert_eq!(
+            fs::metadata(&got).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        // A group/other-writable binary is not executable material.
+        let bin = got.join("turbo_zygote_x");
+        fs::write(&bin, b"x").unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(owned_private_file(&bin));
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(!owned_private_file(&bin));
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
