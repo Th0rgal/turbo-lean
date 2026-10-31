@@ -1,0 +1,26 @@
+{
+  "validation": "passed",
+  "scope": "C11 to C12 complete-cone replay identity comparison only; not aggregate savings",
+  "previous_commit": "81cdac89249c134f6a878ff817288ad75e5a0838",
+  "commit": "c533c22a1ec1c20c7d8ca9315edb2ce7994b404e",
+  "group_identity_fields": [
+    "module",
+    "ordered names",
+    "kind",
+    "K",
+    "duplicate_rechecked"
+  ],
+  "group_multiplicities_unchanged": true,
+  "kernel_calls": 303040,
+  "distinct_K": 300116,
+  "rows": 313008,
+  "duplicate_theorems_rechecked": 3096,
+  "actually_rebuilt_modules": 0,
+  "incremental_rebuilt_kernel_ns": 0,
+  "incremental_optimistic_reuse_ns": 0,
+  "previous_kernel_cpu_ns": 3747980363088,
+  "current_kernel_cpu_ns": 3757945456240,
+  "current_total_cpu_ns": 3778425889072,
+  "current_replay_overhead_cpu_ns": 20480432832,
+  "timing_interpretation": "Fresh per-commit measurements, kept distinct; unchanged complete-cone work is not credited as incremental savings."
+}
