@@ -2621,7 +2621,7 @@ pub(crate) fn seed_project_theorem_shards_from_splits(
     let mut files_seeded = 0usize;
     let mut batch_items: Vec<(String, String, Vec<u8>, i64)> = Vec::new();
 
-    let pkg_cfg_opt = crate::module_builder::resolve_package_config(canon_dir, false).ok();
+    let pkg_cfg_opt = crate::module_builder::optional_package_config(canon_dir)?;
     for (lf, _src, split) in split_entries {
         if require_olean && resolve_prebuilt_module_import(canon_dir, lf).is_none() {
             continue;
@@ -3444,6 +3444,51 @@ mod tests {
                 "{state} config changed .lake"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn seeding_rejects_invalid_config_before_publishing() -> Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("turbo_seed_options_{}", crate::pack::next_tmp_id()));
+        let project = dir.join("project");
+        fs::create_dir_all(&project)?;
+        let file = project.join("Demo.lean");
+        let source = "theorem seed_options : True := by trivial\n";
+        fs::write(&file, source)?;
+        let split = split_lean_source(source, &[]);
+        assert_eq!(split.shards.len(), 1);
+        let key = compute_shard_key("test", &split.shards[0]);
+        let splits = vec![(file, source.to_string(), split)];
+        let mut store = TurboStore::open(Some(&dir.join("store")))?;
+        for config in [
+            "name = [",
+            "name = \"bad\"\nmoreLeanArgs = [\"--plugin=bad.so\"]\n",
+        ] {
+            fs::write(project.join("lakefile.toml"), config)?;
+            let err = seed_project_theorem_shards_from_splits(
+                &mut store, &project, "test", "trusted", false, &splits,
+            )
+            .unwrap_err();
+            assert!(format!("{err:#}").contains("Failed to resolve Lean options"));
+            assert!(store
+                .batch_get_theorem_shards_readonly(std::slice::from_ref(&key), "trusted")?
+                .is_empty());
+            let count: i64 = store
+                .conn
+                .query_row("SELECT COUNT(*) FROM actions", [], |r| r.get(0))?;
+            assert_eq!(count, 0, "invalid configuration must publish no entries");
+        }
+        // Standalone projects with no Lake config still have known empty options.
+        fs::remove_file(project.join("lakefile.toml"))?;
+        assert_eq!(
+            seed_project_theorem_shards_from_splits(
+                &mut store, &project, "test", "trusted", false, &splits,
+            )?,
+            (1, 1)
+        );
+        assert!(store.has_cached_action_readonly(&key, "trusted")?);
+        fs::remove_dir_all(dir)?;
         Ok(())
     }
 
