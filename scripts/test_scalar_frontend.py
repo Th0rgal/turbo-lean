@@ -2342,6 +2342,26 @@ open LeanNative.IR LeanNative.Proofs
   let uncachedFieldBad := validateTranslationDecl (mkUncachedCtorFieldExclDecl false) (mkUncachedCtorFieldExclDecl true) 8
   unless !uncachedFieldBad.ubRefines && !uncachedFieldBad.passed do
     throw <| IO.userError s!"ctorGetScalar assumed runtime scalar sort on uncached field: {reprStr uncachedFieldBad}"
+  let mkTupleParamObjPtrProjDecl (constTrue : Bool) : LNIRDecl := {
+    name := "tuple_param_objptr_proj"
+    params := [
+      { id := 0, name := "t", ty := .tuple [.objPtr], borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i1
+    body :=
+      .letBind 2 .i64 (.projTuple 0 0)
+        (.letBind 3 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+          (.ite 3
+            (if constTrue then
+               .letBind 4 .i1 (.scalar (.constBool true)) (.ret 4)
+             else
+               .letBind 4 .i1 (.isExclusive 2) (.ret 4))
+            (.letBind 4 .i1 (.scalar (.constBool true)) (.ret 4))))
+  }
+  let tupleParamObjBad := validateTranslationDecl (mkTupleParamObjPtrProjDecl false) (mkTupleParamObjPtrProjDecl true) 8
+  unless !tupleParamObjBad.ubRefines && !tupleParamObjBad.passed do
+    throw <| IO.userError s!"projTuple manufactured scalar sort for tuple [objPtr] parameter field: {reprStr tupleParamObjBad}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)

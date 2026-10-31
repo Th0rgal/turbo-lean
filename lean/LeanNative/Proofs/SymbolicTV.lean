@@ -1280,11 +1280,6 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
   match e with
   | .scalar se =>
     let isPtrDest := callSlotKind dstTy == some true
-    let markDstSort (cur : SymExecState) : SymExecState :=
-      if dstTy == .i1 then cur.markBoolVar dst
-      else if dstTy == .u256 || dstTy == .i256 then cur.markU256Var dst
-      else if callSlotKind dstTy == some false && dstTy != .unit then cur.markU64Var dst
-      else cur
     let (root?, rNonPoison, rNoUB, rUnsupp) := resolveScalarRoot? st se
     match root? with
     | some root =>
@@ -1329,10 +1324,10 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
           | some 0 => c0.markBoolVar dst
           | some 1 => c0.markU64Var dst
           | some 2 => c0.markU256Var dst
-          | _ => markDstSort c0
-        match sr.val.expr, dstTy with
-        | .tuple _, _ | _, .tuple _ => c1.markTypedTuple dst
-        | _, _ => c1.unmarkTypedTuple dst
+          | _ => c0
+        match sr.val.expr with
+        | .tuple _ => c1.markTypedTuple dst
+        | _ => c1.unmarkTypedTuple dst
       if sr.unsupported then
         ((st.clearAlias dst).markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
       else if isPtrDest || scalarExprMentionsHeapRoot st se then
@@ -1398,9 +1393,8 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
     let slotExpr := if isStorage then (match slotSv.expr with | .constU64 u => .constU256 (UInt256.ofUInt64 u) | x => x) else slotSv.expr
     let elemExpr := st.readBufSym mapVar slotExpr
     let stSorted :=
-      if isStorage || dstTy == .u256 || dstTy == .i256 then st.markU256Var dst
-      else if dstTy == .i1 then st.markBoolVar dst
-      else st.markU64Var dst
+      let c0 := (st.clearAlias dst).unmarkTypedTuple dst
+      if isStorage then c0.markU256Var dst else c0.markU64Var dst
     stSorted.bindVar dst { expr := elemExpr, nonPoison := slotSv.nonPoison, noUB := slotSv.noUB }
   | .storageStore mapVar slotVar valVar =>
     let root := st.resolveBuf mapVar
@@ -1441,14 +1435,8 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
               match fExpr with
               | .symVar fId =>
                 let eff := st.resolveBuf fId
-                let isHeapOrBuf :=
-                  st.allocRoots.contains eff || st.sarrayVars.contains eff || st.objPtrVars.contains eff ||
-                  (st.refCounts.lookup eff).isSome || (st.rcExprs.lookup eff).isSome || st.exclusiveBufs.contains eff ||
-                  st.extSeenRoots.contains eff ||
-                  (match (st.lookupVar eff).expr with
-                   | .tuple _ => !(st.typedTuples.contains eff)
-                   | _ => false)
-                if isHeapOrBuf || callSlotKind dstTy == some true then st.aliasBuf dst eff
+                let isScalarLeaf := st.boolVars.contains eff || st.u64Vars.contains eff || st.u256Vars.contains eff
+                if !isScalarLeaf then st.aliasBuf dst eff
                 else st.clearAlias dst
               | _ => st.clearAlias dst
             let isTypedSubTuple :=
@@ -1465,10 +1453,13 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
                 | some 1 => stU.markU64Var dst
                 | some 2 => stU.markU256Var dst
                 | _ =>
-                  if dstTy == .i1 then stU.markBoolVar dst
-                  else if dstTy == .u256 || dstTy == .i256 then stU.markU256Var dst
-                  else if callSlotKind dstTy == some false && dstTy != .unit then stU.markU64Var dst
-                  else stU
+                  match fExpr with
+                  | .symVar fId =>
+                    let eff := stU.resolveBuf fId
+                    if stU.objPtrVars.contains eff || stU.allocRoots.contains eff then stU.markObjPtrVar dst
+                    else if stU.sarrayVars.contains eff then stU.markSarrayVar dst
+                    else stU
+                  | _ => stU
             stSort.bindVar dst { expr := fExpr, nonPoison := tv.nonPoison, noUB := tv.noUB }
           | none => ((st.clearAlias dst).unmarkTypedTuple dst).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
         else
