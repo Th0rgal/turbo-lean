@@ -3533,9 +3533,29 @@ pub fn parse_lakefile_lean(
     //    declaration's keyword or inside a body the reader skips (helpers, hooks, `require`,
     //    field values) would configure Lake behind the parser's back.
     for (idx, (line, toks)) in clean.lines().zip(lean_tokens_by_line(&clean)).enumerate() {
-        let indented = line.starts_with(char::is_whitespace);
         let mut cmds = toks.iter().filter(|t| is_lean_command_token(t));
-        let hidden = if indented { cmds.next() } else { cmds.nth(1) };
+        let hidden = if line.starts_with(char::is_whitespace) {
+            cmds.next()
+        } else {
+            // A column-0 line may start one command (after an attribute and modifiers); a
+            // command anywhere else on it (e.g. after a helper term's closing `]`) is hidden.
+            let lead = line.trim_start();
+            let lead = match lead.strip_prefix("@[") {
+                Some(rest) => rest.find(']').map_or("", |e| rest[e + 1..].trim_start()),
+                None => lead,
+            };
+            let lead_word = lead
+                .split_whitespace()
+                .find(|w| {
+                    !matches!(
+                        *w,
+                        "private" | "protected" | "noncomputable" | "partial" | "unsafe" | "nonrec"
+                    )
+                })
+                .unwrap_or("");
+            let first = cmds.next();
+            cmds.next().or(first.filter(|c| **c != lead_word))
+        };
         if let Some(cmd) = hidden {
             unsupported_lake_field(
                 &mut pkg_unsupported,
@@ -11653,6 +11673,8 @@ roots = ["Fast"]
             "package t\npost_update pkg do\n  pure ()\n  set_option maxHeartbeats 1\nlean_lib A\n",
             "package t\nrequire foo from git\n  \"https://x\" @ \"main\" lean_lib Hidden\nlean_lib A\n",
             "package t where\n  moreLinkArgs := #[]\n    lean_exe Hidden\nlean_lib A\n",
+            "package t\nlean_lib A\ndef helper := #[0\n] lean_lib Hidden where\n  roots := #[`A]\n  precompileModules := true\n",
+            "package t\nlean_lib A\nabbrev x := 1\nfoo lean_exe Hidden\n",
         ] {
             fs::write(&lf, format!("import Lake\nopen Lake DSL\n{body}")).unwrap();
             assert!(parse_lakefile_lean(&dir, &lf, true).is_err(), "{body}");
