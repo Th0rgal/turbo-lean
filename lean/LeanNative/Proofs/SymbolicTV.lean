@@ -45,8 +45,8 @@ inductive SymExpr where
   | ctorObj   (allocId : SymExpr) (tag : UInt64) (objs : List SymExpr) (scalars : List SymExpr)
   | bufElem   (bufVar : VarId) (idx : SymExpr)
   | arrLen    (bufVar : VarId)
-  | exclCheck (epoch root : VarId)
-  | decCond   (epoch root : VarId)
+  | exclCheck (epoch : Nat) (rootSym : SymExpr)
+  | decCond   (epoch : Nat) (rootSym : SymExpr)
   | unit
   deriving Repr, Inhabited, BEq
 
@@ -64,8 +64,8 @@ def rank : SymExpr → Nat
   | .ite c t e       => 4000 + rank c + rank t + rank e
   | .tuple fs            => 5000 + fs.length
   | .ctorObj aid _ os ss => 5500 + rank aid + os.length + ss.length
-  | .exclCheck e r       => 6000 + e + r
-  | .decCond e r     => 7000 + e + r
+  | .exclCheck e r       => 6000 + e + rank r
+  | .decCond e r     => 7000 + e + rank r
   | .constBool false => 900000
   | .constBool true  => 900001
   | .constU64 v      => 1000000 + (v % 65536).toNat
@@ -195,8 +195,8 @@ mutual
     | .ctorObj aid tag os ss => .ctorObj (normSymExpr aid) tag (normSymExprList os) (normSymExprList ss)
     | .bufElem b idx => .bufElem b (normSymExpr idx)
     | .arrLen b => .arrLen b
-    | .exclCheck e r => .exclCheck e r
-    | .decCond e r => .decCond e r
+    | .exclCheck e r => .exclCheck e (normSymExpr r)
+    | .decCond e r => .decCond e (normSymExpr r)
     | .unit => .unit
 
   def normSymExprList : List SymExpr → List SymExpr
@@ -217,8 +217,8 @@ mutual
     | .ctorObj aid tag os ss => .ctorObj (substSymHeapIds mapId aid) tag (substSymHeapIdsList mapId os) (substSymHeapIdsList mapId ss)
     | .bufElem b idx => .bufElem (mapId b) (substSymHeapIds mapId idx)
     | .arrLen b => .arrLen (mapId b)
-    | .exclCheck e r => .exclCheck e (mapId r)
-    | .decCond e r => .decCond e (mapId r)
+    | .exclCheck e r => .exclCheck e (substSymHeapIds mapId r)
+    | .decCond e r => .decCond e (substSymHeapIds mapId r)
     | .unit => .unit
 
   def substSymHeapIdsList (mapId : VarId → VarId) : List SymExpr → List SymExpr
@@ -236,6 +236,7 @@ structure SymExecState where
   exclusiveBufs   : List VarId := []
   maybeScalarRoots : List VarId := []
   rootRc          : List (VarId × Nat × Option Nat) := []
+  rootRcEpoch     : List (VarId × Nat) := []
   objRoots      : List (VarId × List (Option VarId)) := []
   tupleRoots    : List (VarId × List (Option VarId)) := []
   paramChildRoots : List VarId := []
@@ -301,6 +302,14 @@ def setRootRc (st : SymExecState) (root : VarId) (minRc : Nat) (exactRc? : Optio
     st.rootRc ++ [(root, minRc, exactRc?)]
   { st with rootRc := rc', exclusiveBufs := excl' }
 
+def getRootRcEpoch (st : SymExecState) (root : VarId) : Nat :=
+  (st.rootRcEpoch.lookup root).getD 0
+
+def bumpRootRcEpoch (st : SymExecState) (root : VarId) : SymExecState :=
+  let nextEp := st.getRootRcEpoch root + 1
+  let rest := st.rootRcEpoch.filter (fun (id, _) => id != root)
+  { st with rootRcEpoch := (root, nextEp) :: rest }
+
 def getRootRc (st : SymExecState) (bufVar : VarId) : Nat × Option Nat :=
   let root := st.resolveBuf bufVar
   match st.rootRc.lookup root with
@@ -317,6 +326,11 @@ def isBufExclusive (st : SymExecState) (bufVar : VarId) : Bool :=
 
 def isFreshRuntimeAllocRoot (st : SymExecState) (r : VarId) : Bool :=
   st.freshCtorRoots.contains r || (st.heapAllocSeq.lookup r).isSome
+
+def rootIdentitySym (st : SymExecState) (r : VarId) : SymExpr :=
+  match st.heapAllocSeq.lookup r with
+  | some seq => .ctorObj seq 0 [] []
+  | none => .symVar r
 
 def hasKnownRootTracking (st : SymExecState) (root : VarId) : Bool :=
   (match (st.lookupVar root).expr with
@@ -354,7 +368,7 @@ def incRootRc (st : SymExecState) (objVar : VarId) (count : Nat) : SymExecState 
       else if count == 0 then st
       else
         let st0 := if st.isFreshRuntimeAllocRoot root then st else st.dropAliasedRootBounds root
-        let st1 := st0.setRootRc root (minRc + count) (exactRc?.map (· + count))
+        let st1 := (st0.setRootRc root (minRc + count) (exactRc?.map (· + count))).bumpRootRcEpoch root
         { st1 with rcEpoch := st1.rcEpoch + 1 }
 
 private def dedupIds (xs : List VarId) : List VarId :=
@@ -399,11 +413,20 @@ def mergeBranches (base stT stE : SymExecState) (cExpr : SymExpr) (condNoUB cond
     | some fsT, some fsE => if fsT == fsE then some (v, fsT) else none
     | _, _ => none
   let mergedMaybeScalar := dedupIds (base.maybeScalarRoots ++ stT.maybeScalarRoots ++ stE.maybeScalarRoots)
+  let epKeys := dedupIds (rcKeys ++ base.rootRcEpoch.map (·.1) ++ stT.rootRcEpoch.map (·.1) ++ stE.rootRcEpoch.map (·.1))
+  let mergedRootRcEpoch := epKeys.filterMap fun r =>
+    let epB := base.getRootRcEpoch r
+    let epT := stT.getRootRcEpoch r
+    let epE := stE.getRootRcEpoch r
+    let ep := Nat.max epB (Nat.max epT epE)
+    let nextEp := if epT == epE && branchRcOf stT r == branchRcOf stE r then ep else ep + 1
+    if nextEp == 0 then none else some (r, nextEp)
   { vars := mergedVars
     bufAliases := mergedAliases
     exclusiveBufs := mergedExcl
     maybeScalarRoots := mergedMaybeScalar
     rootRc := mergedRc
+    rootRcEpoch := mergedRootRcEpoch
     objRoots := mergedObjRoots
     tupleRoots := mergedTupleRoots
     paramChildRoots := dedupIds (base.paramChildRoots ++ stT.paramChildRoots ++ stE.paramChildRoots)
@@ -492,7 +515,7 @@ mutual
             else if count == 0 then st
             else
               let r' := r - count
-              let st1 := stBase.setRootRc root r' (some r')
+              let st1 := (stBase.setRootRc root r' (some r')).bumpRootRcEpoch root
               if r' == 0 then
                 let children := ((st1.objRoots.lookup root).getD []).filterMap id
                 let st2 := { st1 with objRoots := st1.objRoots.filter (fun (id, _) => id != root) }
@@ -502,13 +525,15 @@ mutual
             if minRc == 0 then { st with noUB := false }
             else if count == 0 then st
             else
-              let stShared := stBase.setRootRc root (Nat.max 1 (minRc - count)) none
+              let decEp := if st.isFreshRuntimeAllocRoot root then st.getRootRcEpoch root else st.rcEpoch
+              let stShared := (stBase.setRootRc root (Nat.max 1 (minRc - count)) none).bumpRootRcEpoch root
               if minRc <= count then
                 let children := ((stBase.objRoots.lookup root).getD []).filterMap id
                 let stFreed0 :=
-                  { (stBase.setRootRc root 0 (some 0)) with objRoots := stBase.objRoots.filter (fun (id, _) => id != root) }
+                  { ((stBase.setRootRc root 0 (some 0)).bumpRootRcEpoch root) with
+                    objRoots := stBase.objRoots.filter (fun (id, _) => id != root) }
                 let stFreed := decRootListFuel fuel true stFreed0 children 1
-                mergeBranches stBase stShared stFreed (.decCond st.rcEpoch root) true true
+                mergeBranches stBase stShared stFreed (.decCond decEp (st.rootIdentitySym root)) true true
               else stShared
 
   def decRootListFuel : Nat → Bool → SymExecState → List VarId → Nat → SymExecState
@@ -538,11 +563,12 @@ def delRootShell (st : SymExecState) (objVar : VarId) : SymExecState :=
       else
         let st0 := if st.isFreshRuntimeAllocRoot root then st else st.dropAliasedRootBounds root
         let stFreed :=
-          { (st0.setRootRc root 0 (some 0)) with
+          { ((st0.setRootRc root 0 (some 0)).bumpRootRcEpoch root) with
             objRoots := st0.objRoots.filter (fun (id, _) => id != root)
             rcEpoch := st.rcEpoch + 1 }
         if st.maybeScalarRoots.contains root then
-          mergeBranches st0 stFreed { st0 with rcEpoch := st.rcEpoch + 1 } (.decCond st.rcEpoch root) true true
+          let decEp := if st.isFreshRuntimeAllocRoot root then st.getRootRcEpoch root else st.rcEpoch
+          mergeBranches st0 stFreed { st0 with rcEpoch := st.rcEpoch + 1 } (.decCond decEp (st.rootIdentitySym root)) true true
         else stFreed
 
 def bindObjRoots (st : SymExecState) (root : VarId) (fields : List (Option VarId)) : SymExecState :=
@@ -581,10 +607,10 @@ def allocFreshHeapRoot (st : SymExecState) (isCtor : Bool) : VarId × SymExpr ×
 def allocFreshCtor (st : SymExecState) : VarId × SymExpr × SymExecState :=
   st.allocFreshHeapRoot true
 
-def canonicalHeapRootId (allocBase : Nat) (heapRank : List (VarId × Nat)) (r : VarId) : VarId :=
-  match heapRank.lookup r with
-  | some idx => allocBase + 65536 + idx
-  | none => r
+def canonicalHeapRootId (allocBase : Nat) (heapSeq : List (VarId × SymExpr)) (r : VarId) : VarId :=
+  match heapSeq.lookup r with
+  | some (.constU64 idx) => allocBase + 65536 + idx.toNat
+  | _ => r
 
 def projSyntheticRoot (st : SymExecState) (kind : Nat) (base : VarId) (idx : Nat) : VarId :=
   st.allocBase + 16777216 + cantPair kind (cantPair base idx)
@@ -947,7 +973,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
     if isImmSymExpr st.immRoots ov.expr && !st.hasKnownRootTracking root then
       st0.bindVar dst { expr := .constBool true, nonPoison := ov.nonPoison, noUB := ov.noUB }
     else if !st.hasKnownRootTracking root then
-      let st1 := st0.bindVar dst { expr := .exclCheck st.rcEpoch root, nonPoison := ov.nonPoison, noUB := false }
+      let st1 := st0.bindVar dst { expr := .exclCheck st.rcEpoch (st.rootIdentitySym root), nonPoison := ov.nonPoison, noUB := false }
       { st1 with supported := false }
     else if (minRc == 0 || exactRc? == some 0) && !maybeScalar then
       st0.bindVar dst { expr := .constBool false, nonPoison := ov.nonPoison, noUB := false }
@@ -956,8 +982,8 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
         if exactRc? == some 1 && !maybeScalar then .constBool true
         else if minRc >= 2 && !maybeScalar then .constBool false
         else
-          let effEpoch := if !maybeScalar && st.isFreshRuntimeAllocRoot root then 0 else st.rcEpoch
-          .exclCheck effEpoch root
+          let effEpoch := if !maybeScalar && st.isFreshRuntimeAllocRoot root then st.getRootRcEpoch root else st.rcEpoch
+          .exclCheck effEpoch (st.rootIdentitySym root)
       st0.bindVar dst { expr := expr, nonPoison := ov.nonPoison, noUB := ov.noUB }
   | .sarrayLen arrVar =>
     let root := st.resolveBuf arrVar
@@ -981,7 +1007,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
       { st1 with supported := false }
     else
       let stBase := if st.isFreshRuntimeAllocRoot root then st else st.dropAliasedRootBounds root
-      let st1 := (((stBase.clearDstTracking dst).markExclusive root).aliasBuf dst root).bindVar dst
+      let st1 := ((((stBase.clearDstTracking dst).markExclusive root).bumpRootRcEpoch root).aliasBuf dst root).bindVar dst
         { expr := .symVar root, nonPoison := av.nonPoison, noUB := av.noUB }
       { st1 with rcEpoch := st1.rcEpoch + 1 }
   | .sarraySet arrVar idxVar valVar _elemTy =>
@@ -994,7 +1020,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
       { st1 with supported := false }
     else
       let stBase := if st.isFreshRuntimeAllocRoot root then st else st.dropAliasedRootBounds root
-      let st3 := (((stBase.clearDstTracking dst).markExclusive root).writeBufSym root idxSv.expr valSv.expr true).aliasBuf dst root
+      let st3 := ((((stBase.clearDstTracking dst).markExclusive root).bumpRootRcEpoch root).writeBufSym root idxSv.expr valSv.expr true).aliasBuf dst root
       let st4 := st3.bindVar dst { expr := .symVar root, nonPoison := av.nonPoison && idxSv.nonPoison && valSv.nonPoison, noUB := av.noUB && idxSv.noUB && valSv.noUB }
       { st4 with rcEpoch := st4.rcEpoch + 1 }
   | .boxScalar valVar _ | .unboxScalar valVar _ =>
@@ -1026,7 +1052,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
           { st1 with supported := false }
         else
           let stBase := if st.isFreshRuntimeAllocRoot root then st0 else st0.dropAliasedRootBounds root
-          let st1 := ((stBase.markExclusive root).aliasBuf dst root).bindVar dst (st.lookupVar a)
+          let st1 := (((stBase.markExclusive root).bumpRootRcEpoch root).aliasBuf dst root).bindVar dst (st.lookupVar a)
           { st1 with rcEpoch := st1.rcEpoch + 1 }
       else if fnName == "lean_native_sarray_len" && i64Ret then
         let root := st.resolveBuf a
@@ -1053,8 +1079,8 @@ structure SymExecSummary where
   supported  : Bool := true
   nonPoison  : Bool
   retVal     : SymExpr
-  memWrites  : List (VarId × SymExpr × SymExpr)
-  liveRc     : List (VarId × Nat × Option Nat) := []
+  memWrites  : List (SymExpr × SymExpr × SymExpr)
+  liveRc     : List (SymExpr × Nat × Option Nat) := []
   nextHeapId : SymExpr := .constU64 0
   deriving Repr, Inhabited, BEq
 
@@ -1216,19 +1242,21 @@ def symExecDeclFromInit (initState : SymExecState) (loopUnrollBound : Nat := 4) 
     let isFreshAlloc := finalSt.isFreshRuntimeAllocRoot rid
     let defaultUnknown := rid >= initState.allocBase && !isFreshAlloc && (m, ex?) == (1, none)
     if paramIds.contains rid || ex? == some 0 || defaultUnknown then none else some (rid, m, ex?)
-  let liveHeapIds := rawLive.filterMap fun (rid, _, _) =>
-    if finalSt.isFreshRuntimeAllocRoot rid then some rid else none
-  let allHeapIds := finalSt.heapAllocSeq.map (·.1)
-  let orderedHeapIds := liveHeapIds ++ allHeapIds.filter (fun r => !liveHeapIds.contains r)
-  let heapRank := orderedHeapIds.zipIdx.map fun (r, idx) => (r, idx)
-  let mapHeapId := SymExecState.canonicalHeapRootId initState.allocBase heapRank
+  let mapHeapId := SymExecState.canonicalHeapRootId initState.allocBase finalSt.heapAllocSeq
+  let idSym (rid : VarId) : SymExpr :=
+    normSymExpr (substSymHeapIds mapHeapId (finalSt.rootIdentitySym rid))
+  let liveFresh := (rawLive.filterMap fun (rid, m, ex?) =>
+    if finalSt.isFreshRuntimeAllocRoot rid then some (idSym rid, m, ex?) else none).mergeSort
+    (fun (s1, _, _) (s2, _, _) => reprStr s1 <= reprStr s2)
+  let liveOther := rawLive.filterMap fun (rid, m, ex?) =>
+    if finalSt.isFreshRuntimeAllocRoot rid then none else some (idSym rid, m, ex?)
   let canonLiveRc := paramIds.filterMap (fun pid =>
     let (m, ex?) := finalSt.getRootRc pid
     let initDefault := (initState.rootRc.lookup pid).getD (1, none)
-    if (m, ex?) == initDefault then none else some (pid, m, ex?)) ++
-    (rawLive.map fun (rid, m, ex?) => (mapHeapId rid, m, ex?))
+    if (m, ex?) == initDefault then none else some (.symVar pid, m, ex?)) ++
+    liveOther ++ liveFresh
   let canonWrites := finalSt.memWrites.map fun (b, i, v) =>
-    (mapHeapId b, normSymExpr (substSymHeapIds mapHeapId i), normSymExpr (substSymHeapIds mapHeapId v))
+    (idSym b, normSymExpr (substSymHeapIds mapHeapId i), normSymExpr (substSymHeapIds mapHeapId v))
   { declName := d.name
     reachable := finalSt.reachable
     noUB := finalSt.noUB
@@ -1888,7 +1916,8 @@ private def tupleScalarNestedFalseTgt : LNIRDecl :=
   let (s2, _) := symExecCode 16 4 s1 (.ite 0 (.incRef 2 1 (.ret 2)) (.ret 2));
   let s3 := s2.decRootRc 2 1;
   let s4 := symEvalExpr s3 4 (.isExclusive 1);
-  s4.lookupVar 4 |>.expr) == .exclCheck 0 ((symEvalExpr {} 1 (.allocCtor 0 [] [])).resolveBuf 1)
+  let r1 := (symEvalExpr {} 1 (.allocCtor 0 [] [])).resolveBuf 1;
+  (s4.lookupVar 4 |>.expr) == .exclCheck (s3.getRootRcEpoch r1) (s3.rootIdentitySym r1) && s3.getRootRcEpoch r1 > 0)
 #guard !(let s0 := symEvalExpr {} 1 (.allocCtor 0 [] []);
   let (s1, _) := symExecCode 16 4 s0 (.ite 0 (.incRef 1 1 (.ret 1)) (.ret 1));
   let s2 := s1.decRootRc 1 1;
@@ -1897,7 +1926,8 @@ private def tupleScalarNestedFalseTgt : LNIRDecl :=
 #guard (let s0 := symEvalExpr {} 1 (.allocCtor 0 [] []);
   let (s1, _) := symExecCode 16 4 s0 (.ite 0 (.incRef 1 1 (.ret 1)) (.ret 1));
   let s2 := symEvalExpr s1 2 (.isExclusive 1);
-  (s2.lookupVar 2 |>.expr) == .exclCheck 0 (s0.resolveBuf 1))
+  let r1 := s0.resolveBuf 1;
+  (s2.lookupVar 2 |>.expr) == .exclCheck (s1.getRootRcEpoch r1) (s1.rootIdentitySym r1) && s1.getRootRcEpoch r1 > 0)
 #guard !(let s0 := symEvalExpr {} 1 (.allocCtor 0 [] []);
   s0.decRootRcFuel 0 false 1 1).noUB
 #guard !(validateTranslationDecl tupleDecRefNoOpSrc tupleDecRefTrueTgt).symRetEquiv
@@ -2661,6 +2691,227 @@ private def selectCtorProjExclTrueTgt : LNIRDecl :=
   selectCtorProjExclSrc.body selectCtorProjExclTrueTgt.body
 #guard !(validateTranslationDecl selectCtorProjExclSrc selectCtorProjExclTrueTgt).ubRefines
 #guard !(validateTranslationDecl selectCtorProjExclSrc selectCtorProjExclTrueTgt).passed
+
+private def freshRootEpochReorderSrc : LNIRDecl :=
+  { name := "fresh_root_epoch_reorder"
+    params := [{ id := 0, name := "b", ty := .i1, borrow := false },
+               { id := 1, name := "n", ty := .i64, borrow := false }]
+    retTy := .i1
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 2 .objPtr (.allocCtor 0 [] []) <|
+      .letBind 3 .i64 (.scalar (.constU64 0)) <|
+      .letBind 4 .i64 (.scalar (.constU64 4)) <|
+      .seqFor 5 3 4 6 3 .i64
+        (.ite 0 (.incRef 2 1 (.ret 6)) (.ret 6)) <|
+      .letBind 7 .i1 (.isExclusive 2) <|
+      .seqFor 8 3 4 9 3 .i64
+        (.letBind 10 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 100))) <|
+         .ite 10 (.incRef 2 1 (.ret 9)) (.ret 9)) <|
+      .ret 7 }
+
+private def freshRootEpochReorderTgt : LNIRDecl :=
+  { freshRootEpochReorderSrc with
+    body :=
+      .letBind 2 .objPtr (.allocCtor 0 [] []) <|
+      .letBind 3 .i64 (.scalar (.constU64 0)) <|
+      .letBind 4 .i64 (.scalar (.constU64 4)) <|
+      .seqFor 5 3 4 6 3 .i64
+        (.ite 0 (.incRef 2 1 (.ret 6)) (.ret 6)) <|
+      .seqFor 8 3 4 9 3 .i64
+        (.letBind 10 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 100))) <|
+         .ite 10 (.incRef 2 1 (.ret 9)) (.ret 9)) <|
+      .letBind 7 .i1 (.isExclusive 2) <|
+      .ret 7 }
+
+#guard !checkSingleSample 1024 ((VarEnv.empty.bind 0 (.bool false)).bind 1 (.u64 100)) HeapState.empty
+  freshRootEpochReorderSrc.body freshRootEpochReorderTgt.body
+#guard !(validateTranslationDecl freshRootEpochReorderSrc freshRootEpochReorderTgt).symRetEquiv
+#guard !(validateTranslationDecl freshRootEpochReorderSrc freshRootEpochReorderTgt).passed
+
+private def freshRootDecCondEpochSrc : LNIRDecl :=
+  { name := "fresh_root_deccond_epoch"
+    params := [{ id := 0, name := "b", ty := .i1, borrow := false },
+               { id := 1, name := "n", ty := .i64, borrow := false }]
+    retTy := .i1
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 2 .objPtr (.allocCtor 0 [] []) <|
+      .incRef 2 1 <|
+      .letBind 3 .objPtr (.allocCtor 1 [2] []) <|
+      .letBind 4 .i64 (.scalar (.constU64 0)) <|
+      .letBind 5 .i64 (.scalar (.constU64 4)) <|
+      .seqFor 6 4 5 7 4 .i64
+        (.ite 0 (.incRef 3 1 (.ret 7)) (.ret 7)) <|
+      .decRef 3 1 <|
+      .letBind 8 .i1 (.isExclusive 2) <|
+      .seqFor 9 4 5 10 4 .i64
+        (.letBind 11 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 100))) <|
+         .ite 11 (.incRef 2 1 (.ret 10)) (.ret 10)) <|
+      .ret 8 }
+
+private def freshRootDecCondEpochTgt : LNIRDecl :=
+  { freshRootDecCondEpochSrc with
+    body :=
+      .letBind 2 .objPtr (.allocCtor 0 [] []) <|
+      .incRef 2 1 <|
+      .letBind 3 .objPtr (.allocCtor 1 [2] []) <|
+      .letBind 4 .i64 (.scalar (.constU64 0)) <|
+      .letBind 5 .i64 (.scalar (.constU64 4)) <|
+      .seqFor 6 4 5 7 4 .i64
+        (.ite 0 (.incRef 3 1 (.ret 7)) (.ret 7)) <|
+      .seqFor 9 4 5 10 4 .i64
+        (.letBind 11 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 100))) <|
+         .ite 11 (.incRef 2 1 (.ret 10)) (.ret 10)) <|
+      .decRef 3 1 <|
+      .letBind 8 .i1 (.isExclusive 2) <|
+      .ret 8 }
+
+#guard !checkSingleSample 1024 ((VarEnv.empty.bind 0 (.bool false)).bind 1 (.u64 100)) HeapState.empty
+  freshRootDecCondEpochSrc.body freshRootDecCondEpochTgt.body
+#guard !(validateTranslationDecl freshRootDecCondEpochSrc freshRootDecCondEpochTgt).symRetEquiv
+#guard !(validateTranslationDecl freshRootDecCondEpochSrc freshRootDecCondEpochTgt).passed
+
+private def freshRootUnrelatedParamIncSrc : LNIRDecl :=
+  { name := "fresh_root_unrelated_param_inc"
+    params := [{ id := 0, name := "b", ty := .i1, borrow := false },
+               { id := 1, name := "p", ty := .objPtr, borrow := true }]
+    retTy := .i1
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 2 .objPtr (.allocCtor 0 [] []) <|
+      .letBind 4 .i64 (.scalar (.constU64 0)) <|
+      .letBind 5 .i64 (.scalar (.constU64 1)) <|
+      .seqFor 6 4 5 7 4 .i64
+        (.ite 0 (.incRef 2 1 (.ret 7)) (.ret 7)) <|
+      .letBind 3 .i1 (.isExclusive 2) <|
+      .incRef 1 1 <|
+      .decRef 1 1 <|
+      .ret 3 }
+
+private def freshRootUnrelatedParamIncTgt : LNIRDecl :=
+  { freshRootUnrelatedParamIncSrc with
+    body :=
+      .letBind 2 .objPtr (.allocCtor 0 [] []) <|
+      .letBind 4 .i64 (.scalar (.constU64 0)) <|
+      .letBind 5 .i64 (.scalar (.constU64 1)) <|
+      .seqFor 6 4 5 7 4 .i64
+        (.ite 0 (.incRef 2 1 (.ret 7)) (.ret 7)) <|
+      .incRef 1 1 <|
+      .decRef 1 1 <|
+      .letBind 3 .i1 (.isExclusive 2) <|
+      .ret 3 }
+
+#guard (validateTranslationDecl freshRootUnrelatedParamIncSrc freshRootUnrelatedParamIncTgt).symRetEquiv
+#guard (validateTranslationDecl freshRootUnrelatedParamIncSrc freshRootUnrelatedParamIncTgt).passed
+
+private def freshRootHeapRankSwapSrc : LNIRDecl :=
+  { name := "fresh_root_heap_rank_swap"
+    params := [{ id := 0, name := "b", ty := .i1, borrow := false },
+               { id := 1, name := "n", ty := .i64, borrow := false }]
+    retTy := .i1
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 2 .objPtr (.allocCtor 0 [] []) <|
+      .letBind 3 .objPtr (.allocCtor 1 [] []) <|
+      .letBind 4 .i64 (.scalar (.constU64 0)) <|
+      .letBind 5 .i64 (.scalar (.constU64 4)) <|
+      .seqFor 6 4 5 7 4 .i64
+        (.ite 0 (.incRef 2 1 (.ret 7)) (.ret 7)) <|
+      .seqFor 8 4 5 9 4 .i64
+        (.letBind 10 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 100))) <|
+         .ite 10 (.incRef 3 1 (.ret 9)) (.ret 9)) <|
+      .letBind 11 .i1 (.isExclusive 2) <|
+      .decRef 2 1 <|
+      .decRef 3 1 <|
+      .ret 11 }
+
+private def freshRootHeapRankSwapTgt : LNIRDecl :=
+  { freshRootHeapRankSwapSrc with
+    body :=
+      .letBind 2 .objPtr (.allocCtor 0 [] []) <|
+      .letBind 3 .objPtr (.allocCtor 1 [] []) <|
+      .letBind 4 .i64 (.scalar (.constU64 0)) <|
+      .letBind 5 .i64 (.scalar (.constU64 4)) <|
+      .seqFor 6 4 5 7 4 .i64
+        (.ite 0 (.incRef 2 1 (.ret 7)) (.ret 7)) <|
+      .seqFor 8 4 5 9 4 .i64
+        (.letBind 10 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 100))) <|
+         .ite 10 (.incRef 3 1 (.ret 9)) (.ret 9)) <|
+      .letBind 11 .i1 (.isExclusive 3) <|
+      .decRef 3 1 <|
+      .decRef 2 1 <|
+      .ret 11 }
+
+#guard !checkSingleSample 1024 ((VarEnv.empty.bind 0 (.bool false)).bind 1 (.u64 100)) HeapState.empty
+  freshRootHeapRankSwapSrc.body freshRootHeapRankSwapTgt.body
+#guard !(validateTranslationDecl freshRootHeapRankSwapSrc freshRootHeapRankSwapTgt).symRetEquiv
+#guard !(validateTranslationDecl freshRootHeapRankSwapSrc freshRootHeapRankSwapTgt).passed
+
+private def freshRootBranchPrefixHeapRankSwapSrc : LNIRDecl :=
+  { name := "fresh_root_branch_prefix_heap_rank_swap"
+    params := [{ id := 0, name := "c", ty := .i1, borrow := false },
+               { id := 1, name := "b", ty := .i1, borrow := false },
+               { id := 2, name := "n", ty := .i64, borrow := false }]
+    retTy := .i1
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 3 .i64 (.scalar (.constU64 0)) <|
+      .letBind 4 .i64 (.scalar (.constU64 4)) <|
+      .letBind 5 .i64 (.scalar (.constU64 0)) <|
+      .seqFor 6 3 4 7 5 .i64
+        (.letBind 8 .i1 (.scalar (.binOp .eq (.var 6) (.constU64 0))) <|
+         .ite 8
+           (.ite 0
+             (.letBind 9 .objPtr (.allocCtor 0 [] []) <| .decRef 9 1 <| .ret 7)
+             (.ret 7))
+           (.ret 7)) <|
+      .letBind 10 .objPtr (.allocCtor 0 [] []) <|
+      .letBind 11 .objPtr (.allocCtor 1 [] []) <|
+      .seqFor 12 3 4 13 5 .i64
+        (.ite 1 (.incRef 10 1 (.ret 13)) (.ret 13)) <|
+      .seqFor 14 3 4 15 5 .i64
+        (.letBind 16 .i1 (.scalar (.binOp .eq (.var 2) (.constU64 100))) <|
+         .ite 16 (.incRef 11 1 (.ret 15)) (.ret 15)) <|
+      .letBind 17 .i1 (.isExclusive 10) <|
+      .decRef 10 1 <|
+      .decRef 11 1 <|
+      .ret 17 }
+
+private def freshRootBranchPrefixHeapRankSwapTgt : LNIRDecl :=
+  { freshRootBranchPrefixHeapRankSwapSrc with
+    body :=
+      .letBind 3 .i64 (.scalar (.constU64 0)) <|
+      .letBind 4 .i64 (.scalar (.constU64 4)) <|
+      .letBind 5 .i64 (.scalar (.constU64 0)) <|
+      .seqFor 6 3 4 7 5 .i64
+        (.letBind 8 .i1 (.scalar (.binOp .eq (.var 6) (.constU64 0))) <|
+         .ite 8
+           (.ite 0
+             (.letBind 9 .objPtr (.allocCtor 0 [] []) <| .decRef 9 1 <| .ret 7)
+             (.ret 7))
+           (.ret 7)) <|
+      .letBind 10 .objPtr (.allocCtor 0 [] []) <|
+      .letBind 11 .objPtr (.allocCtor 1 [] []) <|
+      .seqFor 12 3 4 13 5 .i64
+        (.ite 1 (.incRef 10 1 (.ret 13)) (.ret 13)) <|
+      .seqFor 14 3 4 15 5 .i64
+        (.letBind 16 .i1 (.scalar (.binOp .eq (.var 2) (.constU64 100))) <|
+         .ite 16 (.incRef 11 1 (.ret 15)) (.ret 15)) <|
+      .letBind 17 .i1 (.isExclusive 11) <|
+      .decRef 11 1 <|
+      .decRef 10 1 <|
+      .ret 17 }
+
+#guard !checkSingleSample 1024 (((VarEnv.empty.bind 0 (.bool true)).bind 1 (.bool false)).bind 2 (.u64 100)) HeapState.empty
+  freshRootBranchPrefixHeapRankSwapSrc.body freshRootBranchPrefixHeapRankSwapTgt.body
+#guard !(validateTranslationDecl freshRootBranchPrefixHeapRankSwapSrc freshRootBranchPrefixHeapRankSwapTgt).symRetEquiv
+#guard !(validateTranslationDecl freshRootBranchPrefixHeapRankSwapSrc freshRootBranchPrefixHeapRankSwapTgt).passed
 
 /-! ## JSON & Human-Readable Formatting for `TVModuleReport` -/
 
