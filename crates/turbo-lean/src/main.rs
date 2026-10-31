@@ -31,9 +31,9 @@ pub mod remote_prebuild;
 pub mod server;
 pub mod shm_cache;
 mod splitter;
+pub mod verify;
 #[cfg(all(test, unix))]
 mod worktree_test_support;
-pub mod verify;
 pub mod zygote;
 
 pub use gpu_fastcheck::*;
@@ -605,9 +605,7 @@ fn run(cli: Cli) -> Result<()> {
             project_dir, base, ..
         } => (Some(project_dir.as_path()), Some(base.as_str())),
         Commands::CiVerify {
-            project_dir,
-            base,
-            ..
+            project_dir, base, ..
         } => match base {
             Some(base) => (Some(project_dir.as_path()), Some(base.as_str())),
             None => (None, None),
@@ -1624,19 +1622,23 @@ fn run(cli: Cli) -> Result<()> {
                 module_builder::try_resolve_lean_args_for_path(&proj_dir, Some(&file))?;
             let filtered_file_lean_args = module_builder::filter_allowed_lean_args(&file_lean_args);
 
+            let file_audit = splitter::split_lean_source(&source, &[])
+                .shards
+                .into_iter()
+                .map(|sh| sh.name)
+                .collect();
             let run_direct_lean = || -> Result<()> {
                 use std::io::Write;
-                let mut cmd = std::process::Command::new(&lean_bin);
-                for arg in &filtered_file_lean_args {
-                    cmd.arg(arg);
-                }
-                cmd.arg(&file).envs(&env_vars);
-                if !req_lp.is_empty() {
-                    cmd.env("LEAN_PATH", &req_lp);
-                } else {
-                    cmd.env_remove("LEAN_PATH");
-                }
-                let out = cmd.output()?;
+                let out = zygote::run_audited_lean_shard(
+                    &store,
+                    &lean_bin,
+                    &env_vars,
+                    Some(&proj_dir),
+                    &source,
+                    &file_audit,
+                    &file_lean_args,
+                    Some(timeout_ms),
+                )?;
                 std::io::stdout().write_all(&out.stdout)?;
                 std::io::stderr().write_all(&out.stderr)?;
                 std::io::stdout().flush()?;
@@ -1728,17 +1730,16 @@ fn run(cli: Cli) -> Result<()> {
             let check_det = verify_determinism
                 || std::env::var("TURBO_LEAN_VERIFY_DETERMINISM").as_deref() == Ok("1");
             if check_det {
-                let mut cmd = std::process::Command::new(&lean_bin);
-                for arg in &filtered_file_lean_args {
-                    cmd.arg(arg);
-                }
-                cmd.arg(&file).envs(&env_vars);
-                if !req_lp.is_empty() {
-                    cmd.env("LEAN_PATH", &req_lp);
-                } else {
-                    cmd.env_remove("LEAN_PATH");
-                }
-                let lean_out = cmd.output()?;
+                let lean_out = zygote::run_audited_lean_shard(
+                    &store,
+                    &lean_bin,
+                    &env_vars,
+                    Some(&proj_dir),
+                    &source,
+                    &file_audit,
+                    &file_lean_args,
+                    Some(timeout_ms),
+                )?;
                 let lean_ok = lean_out.status.success();
                 if reply.ok != lean_ok
                     || rendered_stdout.as_bytes() != lean_out.stdout.as_slice()

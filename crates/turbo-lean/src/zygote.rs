@@ -2444,11 +2444,13 @@ pub(crate) fn run_audited_lean_shard(
     lean_args: &[String],
     timeout_ms: Option<u64>,
 ) -> Result<std::process::Output> {
+    crate::module_builder::validate_lean_args(lean_args)?;
     let started = std::time::Instant::now();
     let mod_name = format!("TurboAuditedShard_{}_{}", std::process::id(), next_tmp_id());
-    let tmp_dir = store.fast_staging_dir().join(&mod_name);
-    let _ = fs::remove_dir_all(&tmp_dir);
-    fs::create_dir_all(&tmp_dir)?;
+    let staging = store.fast_staging_dir();
+    fs::create_dir_all(&staging)?;
+    let tmp_dir = staging.join(&mod_name);
+    fs::create_dir(&tmp_dir)?;
     struct TmpDirGuard(PathBuf);
     impl Drop for TmpDirGuard {
         fn drop(&mut self) {
@@ -2458,14 +2460,16 @@ pub(crate) fn run_audited_lean_shard(
     let _guard = TmpDirGuard(tmp_dir.clone());
     let lean_file = tmp_dir.join(format!("{}.lean", mod_name));
     fs::write(&lean_file, source)?;
+    let olean_file = tmp_dir.join(format!("{}.olean", mod_name));
     let mut cmd = Command::new(lean_bin);
     cmd.args(crate::module_builder::filter_allowed_lean_args(lean_args))
+        .arg("-Dwarn.sorry=true")
         .arg("-Ddebug.skipKernelTC=false")
-        .arg(&lean_file)
         .arg("-R")
         .arg(&tmp_dir)
+        .arg(&lean_file)
         .arg("-o")
-        .arg(tmp_dir.join(format!("{}.olean", mod_name)))
+        .arg(&olean_file)
         .envs(env_vars);
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
@@ -2478,6 +2482,13 @@ pub(crate) fn run_audited_lean_shard(
     if !out.status.success() {
         return Ok(out);
     }
+
+    let artifact = fs::symlink_metadata(&olean_file)
+        .context("Lean verification produced no `.olean` artifact; refusing verification")?;
+    anyhow::ensure!(
+        artifact.is_file() && artifact.len() > 0,
+        "Lean verification produced no regular, nonempty `.olean` artifact"
+    );
 
     let lean_path = env_vars
         .get("LEAN_PATH")
@@ -5060,8 +5071,10 @@ mod tests {
         );
         // The stock compiler can emit an axiom-free, ill-typed theorem when source options
         // disable checking. The artifact auditor must replay it, rather than trust imports.
-        let bad = include_str!("../tests/fixtures/weakening-options/Bad.lean")
-            .replace("import Lean\n", "import Lean\nset_option debug.skipKernelTC true\n");
+        let bad = include_str!("../tests/fixtures/weakening-options/Bad.lean").replace(
+            "import Lean\n",
+            "import Lean\nset_option debug.skipKernelTC true\n",
+        );
         reject(
             format!("{bad}\ntheorem tgt : False := bad\n"),
             "source-level options cannot weaken the artifact audit",
@@ -7408,8 +7421,8 @@ mod tests {
             .unwrap();
         let mut stdin = child.stdin.take().unwrap();
         let mut stdout = BufReader::new(child.stdout.take().unwrap());
-        let src =
-            include_str!("../tests/fixtures/weakening-options/Bad.lean").replace("import Lean\n", "");
+        let src = include_str!("../tests/fixtures/weakening-options/Bad.lean")
+            .replace("import Lean\n", "");
         let mut accepted = Vec::new();
         for arg in std::iter::once(String::new()).chain(
             ORIGINAL_OPTIONS

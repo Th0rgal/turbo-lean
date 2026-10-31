@@ -315,8 +315,8 @@ fn git_head_tree_cache_paths(
     toolchain: &str,
 ) -> (PathBuf, PathBuf) {
     let mut h = blake3::Hasher::new();
-    // v10: cached entries embed `theorem-shard-v1` keys.
-    h.update(b"git-head-tree:v10:");
+    // v11: cached entries embed `theorem-shard-v3` keys.
+    h.update(b"git-head-tree:v11:");
     h.update(repo_root.to_string_lossy().as_bytes());
     h.update(b":");
     h.update(canon_dir.to_string_lossy().as_bytes());
@@ -2643,7 +2643,7 @@ pub fn run_ci_verify_command(
     let mut hasher = blake3::Hasher::new();
     hasher.update(
         format!(
-            "turbo-lean-ci-build-v2\n{}\n{}\n{}\n",
+            "turbo-lean-ci-build-v3\n{}\n{}\n{}\n",
             toolchain, trust_domain, cfg.canonical_config_digest
         )
         .as_bytes(),
@@ -5140,7 +5140,7 @@ mod pr_verify_tests {
         let cfg = crate::module_builder::resolve_project_config(&tree.project)?;
         hasher.update(
             format!(
-                "turbo-lean-ci-build-v2\n{toolchain}\nuntrusted:ci\n{}\n",
+                "turbo-lean-ci-build-v3\n{toolchain}\nuntrusted:ci\n{}\n",
                 cfg.canonical_config_digest
             )
             .as_bytes(),
@@ -5803,7 +5803,6 @@ end Fixture
                         let result = run_lean_temp_file(
                             &store,
                             "must-not-execute",
-                            &dir.join("shard.lean"),
                             "theorem good : True := True.intro",
                             &dir,
                             &Default::default(),

@@ -738,8 +738,8 @@ pub(crate) fn compute_shard_key_with_args(
     lean_args: &[String],
 ) -> String {
     let mut key_hasher = blake3::Hasher::new();
-    // v2: v1 receipts may come from Zygote replies vetted without the stderr panic scan.
-    key_hasher.update(b"theorem-shard-v2:");
+    // v3: replay-audited verdicts. v2: v1 receipts may come from Zygote replies vetted without the stderr panic scan.
+    key_hasher.update(b"theorem-shard-v3:");
     key_hasher.update(toolchain.as_bytes());
     key_hasher.update(b":");
     key_hasher.update(shard.prefix_env_hash.as_bytes());
@@ -1288,7 +1288,7 @@ pub(crate) fn compute_project_interface_key_fast_summary(
     trust_domain: &str,
 ) -> Result<(String, String, BTreeMap<String, String>)> {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"turbo-lean-build-v1\n");
+    hasher.update(b"turbo-lean-build-v2\n");
     hasher.update(toolchain.as_bytes());
     hasher.update(b"\n");
     hasher.update(trust_domain.as_bytes());

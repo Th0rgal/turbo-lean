@@ -4973,7 +4973,8 @@ pub(crate) fn is_builtin_toolchain_module(toolchain_lib_lean: &Path, mod_name: &
 pub(crate) struct VerifiedDepModuleEntry {
     pub src_blake3: String,
     pub olean_artifact_digest: String,
-    #[serde(default)]
+    // Old metadata-only audit receipts cannot attest to kernel replay.
+    #[serde(default, rename = "kernel_replayed")]
     pub kernel_audited: bool,
 }
 
