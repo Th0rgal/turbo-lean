@@ -117,6 +117,113 @@ fn detect_git_repo_and_head(project_dir: &Path) -> (Option<String>, Option<Strin
     (repo, head)
 }
 
+/// `(scheme, host, port)` of an `http(s)` URL with default ports resolved and the host lowercased.
+/// Returns `None` for other schemes, userinfo, backslashes, or malformed authorities so callers
+/// fail closed.
+fn url_origin(url: &str) -> Option<(String, String, u16)> {
+    let (scheme, rest) = url.trim().split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    let default_port = match scheme.as_str() {
+        "http" => 80,
+        "https" => 443,
+        _ => return None,
+    };
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.contains(['@', '\\']) {
+        return None;
+    }
+    let (host, port_part) = if authority.starts_with('[') {
+        let end = authority.find(']')? + 1;
+        authority.split_at(end)
+    } else {
+        authority
+            .find(':')
+            .map_or((authority, ""), |i| authority.split_at(i))
+    };
+    let port = match port_part.strip_prefix(':') {
+        Some(p) => p.parse::<u16>().ok()?,
+        None if port_part.is_empty() => default_port,
+        None => return None,
+    };
+    let host = host.to_ascii_lowercase();
+    (!host.is_empty()).then_some((scheme, host, port))
+}
+
+/// True when both URLs are `http(s)` and share scheme, host, and port.
+fn same_origin(a: &str, b: &str) -> bool {
+    matches!((url_origin(a), url_origin(b)), (Some(x), Some(y)) if x == y)
+}
+
+/// Paths from `git status --porcelain=v1 -z --untracked-files=all` that change what a remote
+/// build of `HEAD` would see: every tracked change, plus untracked Lean sources and build inputs.
+fn build_relevant_dirty_paths(porcelain_z: &[u8]) -> Vec<String> {
+    let mut entries = porcelain_z.split(|&b| b == 0).filter(|e| !e.is_empty());
+    let mut dirty = Vec::new();
+    while let Some(entry) = entries.next() {
+        let entry = String::from_utf8_lossy(entry);
+        let (Some(xy), Some(path)) = (entry.get(..2), entry.get(3..)) else {
+            continue;
+        };
+        if xy.starts_with(['R', 'C']) || xy.ends_with(['R', 'C']) {
+            entries.next();
+        }
+        let file = path.rsplit('/').next().unwrap_or(path);
+        let untracked_input = path.ends_with(".lean")
+            || matches!(
+                file,
+                "lakefile.toml" | "lake-manifest.json" | "lean-toolchain"
+            );
+        if xy != "??" || untracked_input {
+            dirty.push(path.to_string());
+        }
+    }
+    dirty
+}
+
+/// Build-relevant uncommitted paths under `project_dir`; empty when it is not a git work tree.
+fn working_tree_dirty_paths(project_dir: &Path) -> Result<Vec<String>> {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(project_dir)
+            .output()
+    };
+    let inside = git(&["rev-parse", "--is-inside-work-tree"])
+        .ok()
+        .filter(|o| o.status.success())
+        .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "true");
+    if !inside {
+        return Ok(Vec::new());
+    }
+    let out = git(&[
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        "--",
+        ".",
+    ])?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "`git status` failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(build_relevant_dirty_paths(&out.stdout))
+}
+
+/// Refuses a dirty tree unless `allow_dirty`; returns the dirty paths to report when allowed.
+fn dirty_tree_decision(dirty: Vec<String>, allow_dirty: bool) -> Result<Vec<String>, String> {
+    if dirty.is_empty() || allow_dirty {
+        return Ok(dirty);
+    }
+    Err(format!(
+        "working tree has uncommitted build-relevant changes ({}); the remote builds the committed \
+         commit, not this tree. Commit them or pass --allow-dirty to accept the mismatch",
+        dirty.join(", ")
+    ))
+}
+
 fn stream_download_with_sha256(
     url: &str,
     output_path: &Path,
@@ -225,6 +332,7 @@ pub fn run_remote_prebuild_command(
     token: Option<String>,
     timeout_secs: u64,
     poll_interval_ms: u64,
+    allow_dirty: bool,
 ) -> Result<()> {
     let started = Instant::now();
     let deadline = started + Duration::from_secs(timeout_secs.max(1));
@@ -263,7 +371,20 @@ pub fn run_remote_prebuild_command(
         })
         .collect();
 
-    let emit_result = |payload: serde_json::Value| -> Result<()> {
+    // The remote builds a commit, so uncommitted local changes are refused unless `--allow-dirty`;
+    // `accepted_dirty` is non-empty only when they were knowingly accepted.
+    let dirty_decision = working_tree_dirty_paths(project_dir)
+        .map_err(|e| e.to_string())
+        .and_then(|dirty| dirty_tree_decision(dirty, allow_dirty));
+    let accepted_dirty = dirty_decision.clone().unwrap_or_default();
+    let emit_result = |mut payload: serde_json::Value| -> Result<()> {
+        if !accepted_dirty.is_empty() {
+            payload["working_tree_dirty"] = serde_json::json!(true);
+            payload["dirty_paths"] = serde_json::json!(accepted_dirty);
+            payload["warning"] = serde_json::json!(
+                "result describes the committed commit, not the uncommitted local working tree"
+            );
+        }
         if json_mode {
             println!("{}", serde_json::to_string_pretty(&payload)?);
         } else {
@@ -286,6 +407,14 @@ pub fn run_remote_prebuild_command(
         return emit_result(serde_json::json!({
             "status": "fallback",
             "error": "missing repository URL or valid 40-hex commit SHA for remote-prebuild",
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+        }));
+    }
+
+    if let Err(error) = dirty_decision {
+        return emit_result(serde_json::json!({
+            "status": "fallback",
+            "error": error,
             "elapsed_ms": started.elapsed().as_millis() as u64,
         }));
     }
@@ -385,6 +514,18 @@ pub fn run_remote_prebuild_command(
                 "elapsed_ms": started.elapsed().as_millis() as u64,
             }));
         };
+        // `status_url` is server-supplied: never send credentials to another origin.
+        if !same_origin(&resolved_endpoint, s_url) {
+            return emit_result(serde_json::json!({
+                "status": "fallback",
+                "job_id": cur.job_id,
+                "error": format!(
+                    "refusing to poll status_url {} outside the configured endpoint origin {}",
+                    s_url, resolved_endpoint
+                ),
+                "elapsed_ms": started.elapsed().as_millis() as u64,
+            }));
+        }
         let poll_bytes = match http_request_full(
             "GET",
             s_url,
@@ -574,6 +715,7 @@ mod tests {
             Some("test-secret-tok".to_string()),
             10,
             100,
+            false,
         )?;
         assert_eq!(fs::read(&out_file)?, artifact_bytes);
 
@@ -590,6 +732,7 @@ mod tests {
             Some("test-secret-tok".to_string()),
             10,
             100,
+            false,
         )?;
 
         // Tampered SHA-256 fallback path
@@ -606,10 +749,140 @@ mod tests {
             Some("test-secret-tok".to_string()),
             10,
             100,
+            false,
         )?;
         assert!(!tampered_out.exists());
 
         let _ = srv.join();
+        let _ = fs::remove_dir_all(&tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn origin_match_requires_scheme_host_and_port() {
+        let base = "https://Coordinator.example.org/v1/prebuilds";
+        assert!(same_origin(
+            base,
+            "https://coordinator.example.org:443/v1/prebuilds/j1"
+        ));
+        assert!(same_origin("http://127.0.0.1:80/x", "http://127.0.0.1/y"));
+        assert!(same_origin(
+            "http://[::1]:9400/a",
+            "http://[::1]:9400/b?q=1"
+        ));
+        for other in [
+            "https://evil.example/v1/prebuilds/j1",
+            "https://coordinator.example.org.evil.example/x",
+            "https://coordinator.example.org:8443/x",
+            "http://coordinator.example.org/x",
+            "https://coordinator.example.org@evil.example/x",
+            "https://evil.example\\@coordinator.example.org/x",
+            "https://coordinator.example.org:/x",
+            "ftp://coordinator.example.org/x",
+            "/v1/prebuilds/j1",
+        ] {
+            assert!(!same_origin(base, other), "{other}");
+        }
+    }
+
+    #[test]
+    fn porcelain_dirty_paths_cover_tracked_and_build_input_changes_only() {
+        let z = b" M A.lean\0A  new.lean\0R  moved.lean\0old.lean\0?? Extra.lean\0?? sub/lakefile.toml\0?? notes.txt\0?? out/a.bin\0";
+        assert_eq!(
+            build_relevant_dirty_paths(z),
+            [
+                "A.lean",
+                "new.lean",
+                "moved.lean",
+                "Extra.lean",
+                "sub/lakefile.toml"
+            ]
+        );
+        assert!(build_relevant_dirty_paths(b"?? notes.txt\0").is_empty());
+        assert!(build_relevant_dirty_paths(b"").is_empty());
+    }
+
+    #[test]
+    fn dirty_tree_is_refused_unless_explicitly_allowed() {
+        let dirty = vec!["A.lean".to_string()];
+        let err = dirty_tree_decision(dirty.clone(), false).unwrap_err();
+        assert!(err.contains("A.lean") && err.contains("--allow-dirty"));
+        assert_eq!(dirty_tree_decision(dirty.clone(), true), Ok(dirty));
+        assert_eq!(dirty_tree_decision(Vec::new(), false), Ok(Vec::new()));
+    }
+
+    fn git_ok(dir: &Path, args: &[&str]) {
+        let st = Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?}");
+    }
+
+    #[test]
+    fn working_tree_dirty_paths_tracks_real_git_state() -> Result<()> {
+        let tmp = std::env::temp_dir().join(format!("turbo_lean_rp_dirty_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp)?;
+        git_ok(&tmp, &["init", "-q"]);
+        fs::write(tmp.join("A.lean"), "def a := 1\n")?;
+        git_ok(&tmp, &["add", "."]);
+        git_ok(&tmp, &["commit", "-q", "-m", "init"]);
+        assert!(working_tree_dirty_paths(&tmp)?.is_empty());
+        fs::write(tmp.join("notes.txt"), "x")?;
+        assert!(working_tree_dirty_paths(&tmp)?.is_empty());
+        fs::write(tmp.join("A.lean"), "def a := 2\n")?;
+        assert_eq!(working_tree_dirty_paths(&tmp)?, ["A.lean"]);
+        let _ = fs::remove_dir_all(&tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn remote_prebuild_never_polls_or_sends_token_to_foreign_status_url() -> Result<()> {
+        let tmp =
+            std::env::temp_dir().join(format!("turbo_lean_rp_xorigin_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp)?;
+        fs::write(tmp.join("lake-manifest.json"), "{}")?;
+        let coordinator = TcpListener::bind("127.0.0.1:0")?;
+        let coordinator_addr = coordinator.local_addr()?;
+        let foreign = TcpListener::bind("127.0.0.1:0")?;
+        foreign.set_nonblocking(true)?;
+        let foreign_addr = foreign.local_addr()?;
+        let srv = std::thread::spawn(move || {
+            let (mut sock, _) = coordinator.accept().unwrap();
+            let mut rbuf = [0u8; 4096];
+            let _ = sock.read(&mut rbuf);
+            let body = format!(
+                "{{\"job_id\":\"j1\",\"status\":\"queued\",\"status_url\":\"http://{foreign_addr}/steal\"}}"
+            );
+            let _ = write!(
+                sock,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        });
+        run_remote_prebuild_command(
+            true,
+            &format!("http://{coordinator_addr}"),
+            &tmp,
+            Some("https://example.invalid/repo.git".to_string()),
+            Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string()),
+            vec!["Solution".to_string()],
+            None,
+            None,
+            Some("test-secret-tok".to_string()),
+            10,
+            100,
+            false,
+        )?;
+        srv.join().unwrap();
+        let err = foreign
+            .accept()
+            .expect_err("foreign origin must never be contacted");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
         let _ = fs::remove_dir_all(&tmp);
         Ok(())
     }
