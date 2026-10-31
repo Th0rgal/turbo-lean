@@ -2259,19 +2259,22 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
             .replace('\\', "/");
         let cur_hash = compute_cached_source_blake3(dep_src);
 
-        // An entry whose import pins moved on (e.g. an import rebuilt or CAS-restored without
-        // a newer mtime) marks its `.olean` stale even when timestamps look ordered.
+        // An entry whose artifacts or import pins moved on (e.g. an import rebuilt, restored,
+        // or CAS-restored without a newer mtime) marks its `.olean` stale even when timestamps
+        // look ordered; staleness then propagates to dependents below.
         let manifest_stale = match (&manifest_opt, &cur_hash) {
             (Some(m), Some(ch)) => m.modules.get(&dep_rel).is_some_and(|e| {
                 !e.kernel_audited
                     || e.src_blake3 != *ch
                     || (olean_meta.is_some()
-                        && !entry_import_pins_current(
+                        && !(m.cfg.as_ref().is_some_and(|cfg| {
+                            crate::module_builder::entry_artifacts_current(cfg, &dep_olean, e)
+                        }) && entry_import_pins_current(
                             canon_dir,
                             m,
                             e,
                             adj.get(mod_name).map_or(&[][..], Vec::as_slice),
-                        ))
+                        )))
             }),
             _ => false,
         };

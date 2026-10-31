@@ -4592,7 +4592,7 @@ fn read_pkg_verified_manifest(
 
 /// Where a non-root-package import resolves, in `build_module_dag_with_trust` (trusted) order.
 pub(crate) enum ImportSite {
-    DepPkg(Box<DiscoveredModuleSpec>),
+    Module(Box<DiscoveredModuleSpec>),
     Toolchain,
     Prebuilt(PathBuf),
     Unresolved,
@@ -4615,7 +4615,7 @@ pub(crate) fn resolve_import_site(cfg: &ProjectConfig, imp: &str) -> ImportSite 
         .iter()
         .filter_map(|dp| resolve_module_in_package(dp, false, imp));
     match (deps.next(), deps.next()) {
-        (Some(spec), None) => return ImportSite::DepPkg(Box::new(spec)),
+        (Some(spec), None) => return ImportSite::Module(Box::new(spec)),
         (Some(_), Some(_)) => return ImportSite::Unresolved,
         _ => {}
     }
@@ -4676,7 +4676,7 @@ pub(crate) fn external_import_pin_current(
     match (resolve_import_site(cfg, imp), pin) {
         (ImportSite::Toolchain, None) => true,
         (ImportSite::Prebuilt(olean), Some(pin)) => olean_digest_is(cfg, &olean, pin),
-        (ImportSite::DepPkg(spec), Some(pin)) => {
+        (ImportSite::Module(spec), Some(pin)) => {
             let key = (imp.to_string(), pin.to_string());
             if memo.0.lock().is_ok_and(|m| m.contains(&key)) {
                 return true;
@@ -4731,11 +4731,24 @@ fn olean_artifact_stat_fingerprint(olean: &Path) -> Option<String> {
     }
 }
 
+/// Whether the `.olean` artifact set at `olean` still matches `entry`: by its recorded stat
+/// fingerprint, else by re-hashing.
+pub(crate) fn entry_artifacts_current(
+    cfg: &ProjectConfig,
+    olean: &Path,
+    entry: &VerifiedDepModuleEntry,
+) -> bool {
+    (!entry.artifact_stat_fingerprint.is_empty()
+        && olean_artifact_stat_fingerprint(olean).as_deref()
+            == Some(entry.artifact_stat_fingerprint.as_str()))
+        || olean_digest_is(cfg, olean, &entry.olean_artifact_digest)
+}
+
 /// Check-time counterpart of `collect_fresh_dep_pkg_closure` for a dependency-package module
 /// pinned at `pin`: every visited module's artifacts must match its manifest entry (by stat
 /// fingerprint, else by re-hashing), its source must match the entry, and every import of that
-/// source must be pinned to the current artifacts (dependency packages recursively; root and
-/// prebuilt imports re-digested).
+/// source must be pinned to the current artifacts (root- and dependency-package modules
+/// recursively, root ones kernel-audited; prebuilt imports re-digested).
 fn dep_pkg_import_pins_consistent(
     cfg: &ProjectConfig,
     spec: DiscoveredModuleSpec,
@@ -4761,11 +4774,8 @@ fn dep_pkg_import_pins_consistent(
         else {
             return false;
         };
-        let olean = spec_olean_path(&cur);
-        let artifacts_ok = (!entry.artifact_stat_fingerprint.is_empty()
-            && olean_artifact_stat_fingerprint(&olean).as_deref()
-                == Some(entry.artifact_stat_fingerprint.as_str()))
-            || olean_digest_is(cfg, &olean, &entry.olean_artifact_digest);
+        let artifacts_ok = (!cur.is_root_pkg || entry.kernel_audited)
+            && entry_artifacts_current(cfg, &spec_olean_path(&cur), entry);
         let Ok(src) = fs::read_to_string(&cur.src_path) else {
             return false;
         };
@@ -4773,14 +4783,14 @@ fn dep_pkg_import_pins_consistent(
         let hdr = parse_header_info(&src);
         let pins_ok = hdr.header_error.is_none()
             && verified_entry_imports_current(entry, &hdr.imports, |imp, sub_pin| {
-                if let Some(root_spec) = resolve_module_in_package(&cfg.root_pkg, true, imp) {
-                    return sub_pin
-                        .is_some_and(|p| olean_digest_is(cfg, &spec_olean_path(&root_spec), p));
-                }
-                match (resolve_import_site(cfg, imp), sub_pin) {
+                let site = match resolve_module_in_package(&cfg.root_pkg, true, imp) {
+                    Some(root_spec) => ImportSite::Module(Box::new(root_spec)),
+                    None => resolve_import_site(cfg, imp),
+                };
+                match (site, sub_pin) {
                     (ImportSite::Toolchain, None) => true,
                     (ImportSite::Prebuilt(o), Some(p)) => olean_digest_is(cfg, &o, p),
-                    (ImportSite::DepPkg(sub), Some(p)) => {
+                    (ImportSite::Module(sub), Some(p)) => {
                         stack.push((*sub, p.to_string()));
                         true
                     }
@@ -4967,11 +4977,11 @@ fn is_dep_olean_fresh(
     let pins_ok = verified_entry_imports_current(entry, imports, |imp, pin| {
         match (resolve_import_site(cfg, imp), pin) {
             (ImportSite::Toolchain, None) => true,
-            (ImportSite::DepPkg(d), Some(pin)) if d.pkg_name == spec.pkg_name => manifest
+            (ImportSite::Module(d), Some(pin)) if d.pkg_name == spec.pkg_name => manifest
                 .modules
                 .get(&spec_rel_src(&d))
                 .is_some_and(|e| e.olean_artifact_digest == pin),
-            (ImportSite::DepPkg(d), Some(pin)) => {
+            (ImportSite::Module(d), Some(pin)) => {
                 compute_olean_artifact_set_digest_with_policy(&spec_olean_path(&d), preserve)
                     .is_ok_and(|dig| dig == pin)
             }
@@ -10162,6 +10172,148 @@ lean_exe «demo-exe» where
         assert!(
             !matches!(res, Ok(0)),
             "stale `App.B` left in place for elaboration"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// P0-4 on the elaboration path: an import whose artifacts were replaced behind turbo-lean's
+    /// back (old mtimes, unchanged source and manifest) must be refreshed before elaboration.
+    #[test]
+    fn test_check_refreshes_after_foreign_import_artifact_restore() {
+        let dir = make_temp_test_dir("foreign_import_restore");
+        let proj_dir = dir.join("proj");
+        fs::create_dir_all(proj_dir.join("App")).unwrap();
+        fs::write(
+            proj_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )
+        .unwrap();
+        fs::write(
+            proj_dir.join("lakefile.toml"),
+            "name = \"app_pkg\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\nglobs = [\"App.+\"]\n",
+        )
+        .unwrap();
+        let a_src = |v: u32| format!("namespace App\ndef g : Nat := {v}\nend App\n");
+        let b_src = |v: u32| {
+            format!("import App.A\nnamespace App\ntheorem g_eq : g = {v} := rfl\nend App\n")
+        };
+        let mut store = TurboStore::open(Some(&dir.join(".turbo_store"))).unwrap();
+        let mut build = || {
+            build_project_modules_native(
+                &mut store,
+                &proj_dir,
+                &[],
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap()
+        };
+        fs::write(proj_dir.join("App/A.lean"), a_src(3)).unwrap();
+        fs::write(proj_dir.join("App/B.lean"), b_src(3)).unwrap();
+        build();
+        let a_olean = proj_dir.join(".lake/build/lib/lean/App/A.olean");
+        let old_a = fs::read(&a_olean).unwrap();
+        fs::write(proj_dir.join("App/A.lean"), a_src(4)).unwrap();
+        fs::write(proj_dir.join("App/B.lean"), b_src(4)).unwrap();
+        build();
+        // Put the `A` v3 `.olean` back with ordered, old timestamps; source and manifest say v4.
+        let _ = fs::remove_file(&a_olean);
+        fs::write(&a_olean, &old_a).unwrap();
+        for (path, stamp) in [
+            (proj_dir.join("App/A.lean"), "@1000000000"),
+            (a_olean.clone(), "@1000000001"),
+        ] {
+            assert!(Command::new("touch")
+                .args(["-d", stamp])
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let canon = proj_dir.canonicalize().unwrap();
+        let c_file = canon.join("App/C.lean");
+        fs::write(&c_file, "import App.B\n").unwrap();
+        let res = crate::lake_build::ensure_project_imports_fresh_for_check(&canon, &[c_file]);
+        assert!(
+            !matches!(res, Ok(0)),
+            "foreign `App.A` artifact left in place under `App.B`"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// P0-4 across a dependency-to-root edge: `App.C → DepPkg.B → App.A → App.X`; rebuilding only
+    /// `App.X` must invalidate `App.C`.
+    #[test]
+    fn test_root_entry_stale_through_dep_to_root_import() {
+        let dir = make_temp_test_dir("stale_dep_to_root");
+        let proj_dir = dir.join("proj");
+        let dep_dir = proj_dir.join(".lake/packages/dep_pkg");
+        fs::create_dir_all(dep_dir.join("DepPkg")).unwrap();
+        fs::create_dir_all(proj_dir.join("App")).unwrap();
+        for d in [&proj_dir, &dep_dir] {
+            fs::write(d.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        }
+        fs::write(
+            dep_dir.join("lakefile.toml"),
+            "name = \"dep_pkg\"\n[[lean_lib]]\nname = \"DepPkg\"\nglobs = [\"DepPkg.+\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            dep_dir.join("DepPkg/B.lean"),
+            "import App.A\nnamespace DepPkg\ndef h : Nat := App.k\nend DepPkg\n",
+        )
+        .unwrap();
+        fs::write(
+            proj_dir.join("lake-manifest.json"),
+            r#"{"version": "1.2.0", "packagesDir": ".lake/packages", "packages": [{"type": "path", "name": "dep_pkg", "dir": ".lake/packages/dep_pkg", "configFile": "lakefile.toml", "inherited": false}], "name": "app_pkg", "lakeDir": ".lake", "fixedToolchain": false}"#,
+        )
+        .unwrap();
+        fs::write(
+            proj_dir.join("lakefile.toml"),
+            "name = \"app_pkg\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\nglobs = [\"App.+\"]\n",
+        )
+        .unwrap();
+        let x_src = |v: u32| format!("namespace App\ndef x : Nat := {v}\nend App\n");
+        fs::write(proj_dir.join("App/X.lean"), x_src(3)).unwrap();
+        fs::write(
+            proj_dir.join("App/A.lean"),
+            "import App.X\nnamespace App\ndef k : Nat := x\nend App\n",
+        )
+        .unwrap();
+        let c_file = proj_dir.join("App/C.lean");
+        let c_src = "import DepPkg.B\nnamespace App\ntheorem h_eq : DepPkg.h = 3 := rfl\nend App\n";
+        fs::write(&c_file, c_src).unwrap();
+        let mut store = TurboStore::open(Some(&dir.join(".turbo_store"))).unwrap();
+        let mut build = |targets: &[String]| {
+            build_project_modules_native(
+                &mut store,
+                &proj_dir,
+                targets,
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap()
+        };
+        assert_eq!(build(&[]).modules_compiled, 4);
+        let canon = proj_dir.canonicalize().unwrap();
+        let canon_c = c_file.canonicalize().unwrap();
+        let verified =
+            || crate::lake_build::is_file_verified_in_lake_build(&canon, &canon_c, c_src);
+        assert!(verified());
+        fs::write(proj_dir.join("App/X.lean"), x_src(4)).unwrap();
+        assert_eq!(
+            build(&["App.X".to_string()]).compiled_modules,
+            vec!["App.X".to_string()]
+        );
+        assert!(
+            !verified(),
+            "`App.C` accepted through a dependency-to-root edge onto a rebuilt `App.X`"
         );
         let _ = fs::remove_dir_all(&dir);
     }
