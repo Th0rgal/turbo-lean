@@ -444,87 +444,121 @@ impl ExprParser {
         Some(t)
     }
     fn parse_expr(&mut self) -> Result<LeanExpr> {
-        if matches!(self.peek(), Some(Token::Ident(k)) if k == "if") {
-            self.next();
-            let cond = self.parse_expr()?;
-            if !matches!(self.next(), Some(Token::Ident(k)) if k == "then") {
-                bail!("Expected `then` in `if` expression");
-            }
-            let then_branch = self.parse_expr()?;
-            if !matches!(self.next(), Some(Token::Ident(k)) if k == "else") {
-                bail!("Expected `else` in `if` expression");
-            }
-            let else_branch = self.parse_expr()?;
-            return Ok(LeanExpr::IfThenElse(
-                Box::new(cond),
-                Box::new(then_branch),
-                Box::new(else_branch),
-            ));
-        }
-        self.parse_binary(1)
+        self.parse_prec(10)
     }
-    fn op_prec(op: &str) -> Option<(u8, bool)> {
+    fn op_prec(op: &str) -> Option<(u16, u16, u16)> {
         match op {
-            "||" | "∨" => Some((1, false)),
-            "&&" | "∧" => Some((2, false)),
-            "=" | "==" | "!=" | "≠" | "<" | "<=" | "≤" | ">" | ">=" | "≥" => Some((4, false)),
-            "|||" => Some((5, false)),
-            "^^^" => Some((6, false)),
-            "&&&" => Some((7, false)),
-            "+" | "-" => Some((8, false)),
-            "*" | "/" | "%" => Some((9, false)),
-            "<<<" | ">>>" => Some((10, false)),
+            "||" => Some((30, 30, 31)),
+            "∨" => Some((30, 31, 30)),
+            "&&" => Some((35, 35, 36)),
+            "∧" => Some((35, 36, 35)),
+            "=" | "==" | "!=" | "≠" | "<" | "<=" | "≤" | ">" | ">=" | "≥" => Some((50, 51, 51)),
+            "|||" => Some((55, 55, 56)),
+            "^^^" => Some((58, 58, 59)),
+            "&&&" => Some((60, 60, 61)),
+            "+" | "-" => Some((65, 65, 66)),
+            "*" | "/" | "%" => Some((70, 70, 71)),
+            "<<<" | ">>>" => Some((75, 75, 76)),
             _ => None,
         }
     }
-    fn parse_binary(&mut self, min_prec: u8) -> Result<LeanExpr> {
-        let mut lhs = self.parse_unary_or_app()?;
+    fn parse_prec(&mut self, min_prec: u16) -> Result<LeanExpr> {
+        let (mut lhs, mut lhs_prec) = self.parse_led_head(min_prec)?;
         while let Some(Token::Op(op)) = self.peek().cloned() {
-            let Some((prec, right_assoc)) = Self::op_prec(&op) else {
+            let Some((prec, req_lhs_prec, r_prec)) = Self::op_prec(&op) else {
                 break;
             };
-            if prec < min_prec {
+            if prec < min_prec || lhs_prec < req_lhs_prec {
                 break;
             }
             self.next();
-            let rhs = self.parse_binary(if right_assoc { prec } else { prec + 1 })?;
-            if prec == 4 {
-                if let Some(Token::Op(next_op)) = self.peek() {
-                    if Self::op_prec(next_op).map(|(p, _)| p) == Some(4) {
-                        bail!("Non-associative chained comparison `{}` followed by `{}`", op, next_op);
-                    }
-                }
-            }
+            let rhs = self.parse_prec(r_prec)?;
             lhs = LeanExpr::Binary(op, Box::new(lhs), Box::new(rhs));
+            lhs_prec = prec;
         }
         Ok(lhs)
     }
-    fn parse_unary_or_app(&mut self) -> Result<LeanExpr> {
-        if let Some(Token::Op(op)) = self.peek().cloned() {
-            if op == "¬" {
-                self.next();
-                return Ok(LeanExpr::Unary(op, Box::new(self.parse_binary(3)?)));
+    fn parse_led_head(&mut self, min_prec: u16) -> Result<(LeanExpr, u16)> {
+        if matches!(self.peek(), Some(Token::Ident(k)) if k == "if") {
+            if min_prec > 1022 {
+                bail!("`if` expression requires parentheses at precedence {}", min_prec);
             }
-            if matches!(op.as_str(), "~~~" | "!" | "-") {
+            self.next();
+            let cond = self.parse_prec(10)?;
+            if !matches!(self.next(), Some(Token::Ident(k)) if k == "then") {
+                bail!("Expected `then` in `if` expression");
+            }
+            let then_branch = self.parse_prec(10)?;
+            if !matches!(self.next(), Some(Token::Ident(k)) if k == "else") {
+                bail!("Expected `else` in `if` expression");
+            }
+            let else_branch = self.parse_prec(10)?;
+            return Ok((
+                LeanExpr::IfThenElse(
+                    Box::new(cond),
+                    Box::new(then_branch),
+                    Box::new(else_branch),
+                ),
+                1024,
+            ));
+        }
+        if let Some(Token::Op(op)) = self.peek().cloned() {
+            let prec = match op.as_str() {
+                "!" | "¬" => Some((1024u16, 40u16)),
+                "-" => Some((75, 75)),
+                "~~~" => Some((100, 100)),
+                _ => None,
+            };
+            if let Some((head_prec, rhs_prec)) = prec {
+                if head_prec < min_prec {
+                    bail!(
+                        "Unexpected prefix operator `{}` at precedence {}; consider parenthesizing",
+                        op,
+                        min_prec
+                    );
+                }
                 self.next();
-                return Ok(LeanExpr::Unary(op, Box::new(self.parse_unary_or_app()?)));
+                let inner = self.parse_prec(rhs_prec)?;
+                let out_lhs_prec = head_prec;
+                return Ok((LeanExpr::Unary(op, Box::new(inner)), out_lhs_prec));
             }
         }
         let head = self.parse_postfix()?;
         let mut args = Vec::new();
-        while self.can_start_atom() {
-            args.push(self.parse_postfix()?);
+        if min_prec <= 1022 {
+            while self.can_start_arg() {
+                args.push(self.parse_prec(1023)?);
+            }
         }
-        Ok(if args.is_empty() {
+        let mut expr = if args.is_empty() {
             head
         } else {
             LeanExpr::App(Box::new(head), args)
-        })
+        };
+        let mut expr_prec = if matches!(expr, LeanExpr::App(_, _)) {
+            1022
+        } else {
+            1024
+        };
+        if matches!(expr, LeanExpr::App(_, _)) {
+            while matches!(self.peek(), Some(Token::Dot)) {
+                self.next();
+                match self.next() {
+                    Some(Token::Ident(field) | Token::Number(field)) => {
+                        expr = LeanExpr::Member(Box::new(expr), field);
+                        expr_prec = 1024;
+                    }
+                    other => bail!("Expected field or projection after `.`, got {:?}", other),
+                }
+            }
+        }
+        Ok((expr, expr_prec))
     }
-    fn can_start_atom(&self) -> bool {
+    fn can_start_arg(&self) -> bool {
         match self.peek() {
-            Some(Token::Ident(k)) => !matches!(k.as_str(), "then" | "else" | "in"),
+            Some(Token::Ident(k)) => !matches!(k.as_str(), "if" | "then" | "else" | "in"),
             Some(Token::Number(_) | Token::LParen | Token::LAngle) => true,
+            Some(Token::Op(op)) => matches!(op.as_str(), "!" | "¬"),
             _ => false,
         }
     }
@@ -726,6 +760,63 @@ fn expr_mentions_ident_value(expr: &LeanExpr, param_names: &std::collections::Ha
     }
 }
 
+fn expr_produces_bool(expr: &LeanExpr) -> bool {
+    match expr {
+        LeanExpr::Ident(id) => matches!(id.as_str(), "true" | "True" | "false" | "False"),
+        LeanExpr::Unary(op, _) => matches!(op.as_str(), "!" | "¬"),
+        LeanExpr::Binary(op, _, _) => matches!(
+            op.as_str(),
+            "=" | "==" | "!=" | "≠" | "<" | "<=" | "≤" | ">" | ">=" | "≥" | "&&" | "∧" | "||" | "∨"
+        ),
+        LeanExpr::IfThenElse(_, t, e) => expr_produces_bool(t) || expr_produces_bool(e),
+        LeanExpr::App(h, _) => flatten_qualified_name(h).is_some_and(|qname| {
+            let prefix = qname.rsplit_once('.').map(|(p, _)| p);
+            let short = qname.rsplit('.').next().unwrap_or(qname.as_str());
+            prefix == Some("Bool") || matches!(short, "beq" | "fastBeq")
+        }),
+        _ => false,
+    }
+}
+
+fn expr_synthesizes_int_or_complement_without_typed_value(
+    expr: &LeanExpr,
+    value_params: &std::collections::HashSet<&str>,
+) -> bool {
+    if expr_mentions_ident_value(expr, value_params) {
+        return false;
+    }
+    match expr {
+        LeanExpr::Unary(op, _) => matches!(op.as_str(), "-" | "~~~"),
+        LeanExpr::Binary(op, l, r) => {
+            if matches!(
+                op.as_str(),
+                "=" | "==" | "!=" | "≠" | "<" | "<=" | "≤" | ">" | ">=" | "≥" | "&&" | "∧" | "||" | "∨"
+            ) {
+                false
+            } else {
+                expr_synthesizes_int_or_complement_without_typed_value(l, value_params)
+                    || expr_synthesizes_int_or_complement_without_typed_value(r, value_params)
+            }
+        }
+        LeanExpr::IfThenElse(_, t, e) => {
+            expr_synthesizes_int_or_complement_without_typed_value(t, value_params)
+                || expr_synthesizes_int_or_complement_without_typed_value(e, value_params)
+        }
+        _ => false,
+    }
+}
+
+fn untyped_comparison_synthesizes_int_or_complement(
+    lhs: &LeanExpr,
+    rhs: &LeanExpr,
+    value_params: &std::collections::HashSet<&str>,
+) -> bool {
+    !expr_mentions_ident_value(lhs, value_params)
+        && !expr_mentions_ident_value(rhs, value_params)
+        && (expr_synthesizes_int_or_complement_without_typed_value(lhs, value_params)
+            || expr_synthesizes_int_or_complement_without_typed_value(rhs, value_params))
+}
+
 fn nat_count_domain() -> ScalarEvalDomain {
     ScalarEvalDomain {
         word_bits: 64,
@@ -738,19 +829,24 @@ fn shift_count_eval_domain(
     rhs: &LeanExpr,
     eval_dom: Option<ScalarEvalDomain>,
     ambient_bv256: bool,
+    value_params: &std::collections::HashSet<&str>,
     bitvec_params: &std::collections::HashSet<&str>,
 ) -> Result<Option<ScalarEvalDomain>> {
     match eval_dom {
         Some(d) if d.is_bitvec => {
             if expr_mentions_ident_value(rhs, bitvec_params) {
                 Ok(Some(d))
+            } else if expr_synthesizes_int_or_complement_without_typed_value(rhs, value_params) {
+                bail!("Lean rejects Int/Complement shift count on BitVec operand")
             } else {
                 Ok(Some(nat_count_domain()))
             }
         }
         Some(d) if d.is_nat => {
-            if expr_mentions_ident_value(rhs, bitvec_params) {
-                bail!("Lean rejects BitVec shift count on Nat operand")
+            if expr_mentions_ident_value(rhs, bitvec_params)
+                || expr_synthesizes_int_or_complement_without_typed_value(rhs, value_params)
+            {
+                bail!("Lean rejects non-Nat shift count on Nat operand")
             } else {
                 Ok(Some(nat_count_domain()))
             }
@@ -762,6 +858,8 @@ fn shift_count_eval_domain(
                 } else {
                     bail!("Unsupported non-Nat shift count on 256-bit non-BitVec operand")
                 }
+            } else if expr_synthesizes_int_or_complement_without_typed_value(rhs, value_params) {
+                bail!("Lean rejects Int/Complement shift count on 256-bit operand")
             } else {
                 Ok(Some(nat_count_domain()))
             }
@@ -780,6 +878,11 @@ fn subexpr_eval_domain(
     match expr {
         LeanExpr::Binary(op, lhs, rhs) if matches!(op.as_str(), "<<<" | ">>>") => {
             if !expr_mentions_ident_value(lhs, value_params) {
+                if expr_synthesizes_int_or_complement_without_typed_value(lhs, value_params)
+                    || expr_synthesizes_int_or_complement_without_typed_value(rhs, value_params)
+                {
+                    bail!("Lean elaborates untyped unary `-`/`~~~` shift operand in Int/Complement");
+                }
                 if expr_mentions_ident_value(rhs, bitvec_params) {
                     bail!("Lean rejects untyped literal LHS with BitVec shift count");
                 }
@@ -825,11 +928,15 @@ fn emit_cuda_expr_with_ctx(
 ) -> Result<String> {
     let outer_dom = expected_dom;
     if let LeanExpr::Unary(op, inner) = expr {
-        if op == "~~~" {
+        if matches!(op.as_str(), "~~~" | "-") {
             let inner_dom =
                 subexpr_eval_domain(inner, outer_dom, ambient_bv256, value_params, bitvec_params)?;
-            if inner_dom.is_some_and(|d| d.is_nat) {
-                bail!("Lean rejects `~~~` on Nat");
+            if inner_dom.is_some_and(|d| d.is_nat)
+                && !(op == "-"
+                    && (outer_dom.is_some_and(|d| d.is_bitvec)
+                        || (outer_dom.is_none() && ambient_bv256)))
+            {
+                bail!("Lean rejects `{}` on Nat", op);
             }
         }
         if op == "-" && outer_dom.is_some_and(|d| d.is_nat) {
@@ -952,9 +1059,14 @@ fn emit_cuda_expr_with_ctx(
                 op.as_str(),
                 "=" | "==" | "!=" | "≠" | "<" | "<=" | "≤" | ">" | ">=" | "≥"
             ) {
-                let cmp_nat = scalar_dom.is_some_and(|d| d.is_nat)
-                    || (!expr_mentions_ident_value(lhs, value_params)
-                        && !expr_mentions_ident_value(rhs, value_params));
+                if untyped_comparison_synthesizes_int_or_complement(lhs, rhs, value_params) {
+                    bail!("Lean elaborates untyped unary `-`/`~~~` comparison operand in Int/Complement");
+                }
+                let cmp_nat = !expr_produces_bool(lhs)
+                    && !expr_produces_bool(rhs)
+                    && (scalar_dom.is_some_and(|d| d.is_nat)
+                        || (!expr_mentions_ident_value(lhs, value_params)
+                            && !expr_mentions_ident_value(rhs, value_params)));
                 if cmp_nat {
                     let cmp_l = emit_cuda_expr_with_ctx(
                         lhs,
@@ -981,7 +1093,13 @@ fn emit_cuda_expr_with_ctx(
                 }
             }
             let rhs_dom = if matches!(op.as_str(), "<<<" | ">>>") {
-                shift_count_eval_domain(rhs, scalar_dom, ambient_bv256, bitvec_params)?
+                shift_count_eval_domain(
+                    rhs,
+                    scalar_dom,
+                    ambient_bv256,
+                    value_params,
+                    bitvec_params,
+                )?
             } else {
                 scalar_dom
             };
@@ -1588,10 +1706,14 @@ pub fn transpile_lean_theorem_to_cuda(
     if is_ne {
         bail!("Top-level inequality conclusion not yet supported as equality target");
     }
-    let concl_nat = scalar_dom.is_some_and(|d| d.is_nat)
-        || (!expr_mentions_ident_value(&lhs_ast, &value_params)
-            && !expr_mentions_ident_value(&rhs_ast, &value_params)
-            && !matches!(rhs_ast, LeanExpr::Ident(ref id) if matches!(id.as_str(), "true" | "True" | "false" | "False")));
+    if untyped_comparison_synthesizes_int_or_complement(&lhs_ast, &rhs_ast, &value_params) {
+        bail!("Lean elaborates untyped unary `-`/`~~~` top-level comparison operand in Int/Complement");
+    }
+    let concl_nat = !expr_produces_bool(&lhs_ast)
+        && !expr_produces_bool(&rhs_ast)
+        && (scalar_dom.is_some_and(|d| d.is_nat)
+            || (!expr_mentions_ident_value(&lhs_ast, &value_params)
+                && !expr_mentions_ident_value(&rhs_ast, &value_params)));
     let (lhs_cuda_expr, rhs_cuda_expr) = if concl_nat {
         (
             emit_cuda_expr_with_ctx(
@@ -2917,18 +3039,20 @@ pub(crate) fn certify_checked_counterexample(
     let Ok((_, _, lhs_ast, rhs_ast, is_ne)) = parse_conclusion_target(conclusion_str) else {
         return unavailable_cert("statement_not_evaluated");
     };
-    let concl_nat = scalar_dom.is_some_and(|d| d.is_nat)
-        || (!expr_mentions_ident_value(&lhs_ast, &{
-            let mut vp: std::collections::HashSet<&str> = env.keys().map(|s| s.as_str()).collect();
-            vp.insert("__typed_fn__");
-            vp.insert("__u256_const__");
-            vp
-        }) && !expr_mentions_ident_value(&rhs_ast, &{
-            let mut vp: std::collections::HashSet<&str> = env.keys().map(|s| s.as_str()).collect();
-            vp.insert("__typed_fn__");
-            vp.insert("__u256_const__");
-            vp
-        }) && !matches!(rhs_ast, LeanExpr::Ident(ref id) if matches!(id.as_str(), "true" | "True" | "false" | "False")));
+    let concl_vp = {
+        let mut vp: std::collections::HashSet<&str> = env.keys().map(|s| s.as_str()).collect();
+        vp.insert("__typed_fn__");
+        vp.insert("__u256_const__");
+        vp
+    };
+    if untyped_comparison_synthesizes_int_or_complement(&lhs_ast, &rhs_ast, &concl_vp) {
+        return unavailable_cert("statement_not_evaluated");
+    }
+    let concl_nat = !expr_produces_bool(&lhs_ast)
+        && !expr_produces_bool(&rhs_ast)
+        && (scalar_dom.is_some_and(|d| d.is_nat)
+            || (!expr_mentions_ident_value(&lhs_ast, &concl_vp)
+                && !expr_mentions_ident_value(&rhs_ast, &concl_vp)));
     let eval_side = |expr: &LeanExpr| {
         if concl_nat {
             eval_lean_expr_fast_ctx_inner(
@@ -3176,7 +3300,21 @@ fn lower_lean_expr_to_lnir_scalar(
             None
         }
         LeanExpr::Unary(op, arg) => {
-            if op != "-" && op != "~~~" {
+            if !matches!(op.as_str(), "-" | "~~~" | "!" | "¬") {
+                return None;
+            }
+            if matches!(op.as_str(), "-" | "~~~") {
+                let mut vp: std::collections::HashSet<&str> =
+                    param_map.keys().map(|s| s.as_str()).collect();
+                vp.insert("__typed_fn__");
+                vp.insert("__u256_const__");
+                if !expr_mentions_ident_value(arg, &vp)
+                    && matches!(arg.as_ref(), LeanExpr::Binary(iop, _, _) if matches!(iop.as_str(), "<<<" | ">>>"))
+                {
+                    return None;
+                }
+            }
+            if matches!(op.as_str(), "!" | "¬") && !expr_produces_bool(arg) {
                 return None;
             }
             let mut toks = mk_strs(&["S_un", if op == "-" { "U_neg" } else { "U_not" }]);
@@ -3184,6 +3322,15 @@ fn lower_lean_expr_to_lnir_scalar(
             Some(toks)
         }
         LeanExpr::Binary(op, l, r) => {
+            if matches!(op.as_str(), "<<<" | ">>>") {
+                let mut vp: std::collections::HashSet<&str> =
+                    param_map.keys().map(|s| s.as_str()).collect();
+                vp.insert("__typed_fn__");
+                vp.insert("__u256_const__");
+                if !expr_mentions_ident_value(l, &vp) {
+                    return None;
+                }
+            }
             if op == "!=" || op == "≠" {
                 let mut toks = mk_strs(&["S_un", "U_not", "S_bin", "B_eq"]);
                 toks.extend(lower_lean_expr_to_lnir_scalar(l, param_map)?);
@@ -5163,9 +5310,15 @@ fn eval_lean_expr_fast_ctx_inner(
     value_params.insert("__u256_const__");
     let outer_dom = expected_dom;
     if let LeanExpr::Unary(op, inner) = expr {
-        if op == "~~~" {
-            let inner_dom = subexpr_eval_domain(inner, outer_dom, ambient_bv256, &value_params, bitvec_params).ok()?;
-            if inner_dom.is_some_and(|d| d.is_nat) {
+        if matches!(op.as_str(), "~~~" | "-") {
+            let inner_dom =
+                subexpr_eval_domain(inner, outer_dom, ambient_bv256, &value_params, bitvec_params)
+                    .ok()?;
+            if inner_dom.is_some_and(|d| d.is_nat)
+                && !(op == "-"
+                    && (outer_dom.is_some_and(|d| d.is_bitvec)
+                        || (outer_dom.is_none() && ambient_bv256)))
+            {
                 return None;
             }
         }
@@ -5321,9 +5474,18 @@ fn eval_lean_expr_fast_ctx_inner(
             if matches!(
                 op.as_str(),
                 "=" | "==" | "!=" | "≠" | "<" | "<=" | "≤" | ">" | ">=" | "≥"
-            ) && (scalar_dom.is_some_and(|d| d.is_nat)
-                || (!expr_mentions_ident_value(lhs, &value_params)
-                    && !expr_mentions_ident_value(rhs, &value_params)))
+            ) && untyped_comparison_synthesizes_int_or_complement(lhs, rhs, &value_params)
+            {
+                return None;
+            }
+            if matches!(
+                op.as_str(),
+                "=" | "==" | "!=" | "≠" | "<" | "<=" | "≤" | ">" | ">=" | "≥"
+            ) && !expr_produces_bool(lhs)
+                && !expr_produces_bool(rhs)
+                && (scalar_dom.is_some_and(|d| d.is_nat)
+                    || (!expr_mentions_ident_value(lhs, &value_params)
+                        && !expr_mentions_ident_value(rhs, &value_params)))
             {
                 let a = rec(lhs, Some(nat_count_domain()))?.as_u64()?;
                 let b = rec(rhs, Some(nat_count_domain()))?.as_u64()?;
@@ -5338,7 +5500,14 @@ fn eval_lean_expr_fast_ctx_inner(
                 return Some(FastVal::Bool(res));
             }
             let rhs_dom = if matches!(op.as_str(), "<<<" | ">>>") {
-                shift_count_eval_domain(rhs, scalar_dom, ambient_bv256, bitvec_params).ok()?
+                shift_count_eval_domain(
+                    rhs,
+                    scalar_dom,
+                    ambient_bv256,
+                    &value_params,
+                    bitvec_params,
+                )
+                .ok()?
             } else {
                 scalar_dom
             };
@@ -6112,10 +6281,14 @@ fn eval_extracted_decl_in_memory(
     let mut value_params: std::collections::HashSet<&str> = param_names.clone();
     value_params.insert("__typed_fn__");
     value_params.insert("__u256_const__");
-    let concl_nat = scalar_dom.is_some_and(|d| d.is_nat)
-        || (!expr_mentions_ident_value(&lhs_ast, &value_params)
-            && !expr_mentions_ident_value(&rhs_ast, &value_params)
-            && !matches!(rhs_ast, LeanExpr::Ident(ref id) if matches!(id.as_str(), "true" | "True" | "false" | "False")));
+    if untyped_comparison_synthesizes_int_or_complement(&lhs_ast, &rhs_ast, &value_params) {
+        return None;
+    }
+    let concl_nat = !expr_produces_bool(&lhs_ast)
+        && !expr_produces_bool(&rhs_ast)
+        && (scalar_dom.is_some_and(|d| d.is_nat)
+            || (!expr_mentions_ident_value(&lhs_ast, &value_params)
+                && !expr_mentions_ident_value(&rhs_ast, &value_params)));
     let concl_dom = if concl_nat {
         Some(nat_count_domain())
     } else {
@@ -8800,5 +8973,139 @@ end N
         let r_ns_valid = execute_transpiled_cuda_kernel(&k_ns_valid, 64, true).unwrap();
         assert!(r_ns_valid.verified && r_ns_valid.violations == 0);
         assert!(transpile_lean_theorem_to_cuda(root_before_ns, Some("a")).is_err());
+
+        // 5. Lean 4.35 operator precedence & unary `-`/`~~~`/`!`/`¬` differential regressions:
+        // - Unary `-` (`prefix:75`) binds looser than `>>>`/`<<<` (`infixl:75`):
+        //   `-x >>> 1` is `-(x >>> 1)` (NOT `(-x) >>> 1`), whereas `~~~x >>> 1` (`prefix:100`) is `(~~~x) >>> 1`.
+        let neg_shr_valid =
+            "theorem neg_shr_valid (x : BitVec 8) : (-x >>> 1) = -(x >>> 1) := by sorry\n";
+        let k_neg_shr =
+            transpile_lean_theorem_to_cuda(neg_shr_valid, Some("neg_shr_valid")).unwrap();
+        let r_neg_shr = execute_transpiled_cuda_kernel(&k_neg_shr, 256, true).unwrap();
+        assert!(r_neg_shr.verified && r_neg_shr.violations == 0);
+        assert_eq!(try_lnir_fast_reject("neg_shr_valid", neg_shr_valid), None);
+        let (bogus_neg_cert, _, bogus_neg_details) = certify_json_statement_witness(
+            "neg_shr_valid",
+            neg_shr_valid,
+            &[("x".to_string(), "1".to_string())],
+            "127",
+            "0",
+        );
+        assert!(!bogus_neg_cert);
+        assert_eq!(bogus_neg_details["reason"], "witness_mismatch");
+
+        let neg_shr_wrong =
+            "theorem neg_shr_wrong (x : BitVec 8) : (-x >>> 1) = ((-x) >>> 1) := by sorry\n";
+        assert!(try_lnir_fast_reject("neg_shr_wrong", neg_shr_wrong).is_some());
+        let (true_neg_cert, _, _) = certify_json_statement_witness(
+            "neg_shr_wrong",
+            neg_shr_wrong,
+            &[("x".to_string(), "1".to_string())],
+            "0",
+            "127",
+        );
+        assert!(true_neg_cert);
+
+        let bnot_shr_valid =
+            "theorem bnot_shr_valid (x : BitVec 8) : (~~~x >>> 1) = ((~~~x) >>> 1) := by sorry\n";
+        let k_bnot_shr =
+            transpile_lean_theorem_to_cuda(bnot_shr_valid, Some("bnot_shr_valid")).unwrap();
+        let r_bnot_shr = execute_transpiled_cuda_kernel(&k_bnot_shr, 256, true).unwrap();
+        assert!(r_bnot_shr.verified && r_bnot_shr.violations == 0);
+
+        // - Syntax rejected by Lean 4.35 parser: `x <<< -y`, `~~~ -x`, `a && b ∧ c`, `a == b == c`, `f ~~~x`.
+        for bad_expr in [
+            "x <<< -y",
+            "x >>> -1",
+            "~~~ -x",
+            "a && b ∧ c",
+            "a || b ∨ c",
+            "a == b == c",
+            "Nat.succ ~~~x",
+        ] {
+            assert!(
+                parse_lean_expr_str(bad_expr).is_err(),
+                "expected parse error for `{}`",
+                bad_expr
+            );
+        }
+        // `f -x` parses as binary subtraction `f - x` (not application `f (-x)`).
+        assert_eq!(
+            parse_lean_expr_str("f -x").unwrap(),
+            LeanExpr::Binary(
+                "-".to_string(),
+                Box::new(LeanExpr::Ident("f".to_string())),
+                Box::new(LeanExpr::Ident("x".to_string())),
+            )
+        );
+        // `!x == y` parses as `!(x == y)` (`notation:max "!" b:40`), so `!n == 2` on `Nat` is valid!
+        let bang_eq_nat =
+            "theorem bang_eq_nat (n : Nat) (h : n = 1) : !n == 2 := by sorry\n";
+        let k_bang_eq =
+            transpile_lean_theorem_to_cuda(bang_eq_nat, Some("bang_eq_nat")).unwrap();
+        let r_bang_eq = execute_transpiled_cuda_kernel(&k_bang_eq, 64, true).unwrap();
+        assert!(r_bang_eq.verified && r_bang_eq.violations == 0);
+
+        // - Pure-literal `- 3 >>> 1 : BitVec 8` is `- ↑(3 >>> 1) = 255`, while `UInt8` rejects `- 3 >>> 1` (`Neg Nat`),
+        //   and `((-1) >>> 1 : BitVec 8)` / `(x <<< (-1))` / `(-1 == 255)` fail closed (`Int`).
+        let lit_neg_shr_bv8 =
+            "theorem lit_neg_shr_bv8 (x : BitVec 8) (h : x = 255) : (- 3 >>> 1) = x := by sorry\n";
+        let k_lit_neg_shr =
+            transpile_lean_theorem_to_cuda(lit_neg_shr_bv8, Some("lit_neg_shr_bv8")).unwrap();
+        let r_lit_neg_shr = execute_transpiled_cuda_kernel(&k_lit_neg_shr, 64, true).unwrap();
+        assert!(r_lit_neg_shr.verified && r_lit_neg_shr.violations == 0);
+
+        for int_or_bad_thm in [
+            "theorem u8_neg_nat_shr (u : UInt8) : (- 1 >>> 1) = u := by sorry\n",
+            "theorem bv8_paren_int_shr (x : BitVec 8) : ((-1) >>> 1) = x := by sorry\n",
+            "theorem bv8_int_shift_rhs (x : BitVec 8) : (x <<< (-1)) = 0 := by sorry\n",
+            "theorem bv8_int_cmp (x : BitVec 8) : (-1 == 255) → x = x := by sorry\n",
+        ] {
+            let name = int_or_bad_thm
+                .split_whitespace()
+                .nth(1)
+                .unwrap();
+            assert!(
+                transpile_lean_theorem_to_cuda(int_or_bad_thm, Some(name)).is_err(),
+                "expected CUDA transpiler to fail closed on `{}`",
+                name
+            );
+            assert_eq!(try_lnir_fast_reject(name, int_or_bad_thm), None);
+        }
+
+        // - Differential check against live Lean 4.35 (`lean --stdin`) on subtle unary/shift/boolean expressions.
+        if std::process::Command::new("lean").arg("--version").output().is_ok() {
+            let lean_probe = r#"
+def checks : List Bool := [
+  ((- (1 : BitVec 8) >>> 1) == (0 : BitVec 8)),
+  ((- (3 : BitVec 8) >>> 1) == (255 : BitVec 8)),
+  ((- 3 >>> 1 : BitVec 8) == (255 : BitVec 8)),
+  ((~~~ (1 : BitVec 8) >>> 1) == (127 : BitVec 8)),
+  ((! (1 : Nat) == 2) == true),
+  ((1 + if true then 2 else 3 + 4) == 3)
+]
+#eval checks.all id
+"#;
+            let mut cmd = std::process::Command::new("lean");
+            cmd.arg("--stdin")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            if let Ok(mut child) = cmd.spawn() {
+                if let Some(mut stdin) = child.stdin.take() {
+                    use std::io::Write;
+                    let _ = stdin.write_all(lean_probe.as_bytes());
+                }
+                if let Ok(out) = child.wait_with_output() {
+                    assert!(
+                        out.status.success()
+                            && String::from_utf8_lossy(&out.stdout).trim() == "true",
+                        "Lean 4.35 differential check failed: stdout={}, stderr={}",
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                }
+            }
+        }
     }
 }

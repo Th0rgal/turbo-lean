@@ -1054,7 +1054,7 @@ fn tokenize_omega_expr(s: &str) -> Option<Vec<OmegaTok>> {
             _ => {
                 if i + 2 < n {
                     let s3: String = chars[i..i + 3].iter().collect();
-                    if matches!(s3.as_str(), "&&&" | "|||" | "^^^" | "<<<" | ">>>") {
+                    if matches!(s3.as_str(), "&&&" | "|||" | "^^^" | "~~~" | "<<<" | ">>>") {
                         toks.push(OmegaTok::Op(s3));
                         i += 3;
                         continue;
@@ -1078,7 +1078,6 @@ fn tokenize_omega_expr(s: &str) -> Option<Vec<OmegaTok>> {
                         | '<'
                         | '>'
                         | '!'
-                        | '~'
                         | '¬'
                         | '≠'
                         | '≤'
@@ -1113,66 +1112,80 @@ impl OmegaParser {
         Some(t)
     }
 
-    fn op_prec(op: &str) -> Option<u8> {
+    fn op_prec(op: &str) -> Option<(u16, u16, u16)> {
         match op {
-            "||" | "∨" => Some(1),
-            "&&" | "∧" => Some(2),
-            "=" | "==" | "!=" | "≠" | "<" | "<=" | "≤" | ">" | ">=" | "≥" => Some(3),
-            "|||" => Some(4),
-            "^^^" => Some(5),
-            "&&&" => Some(6),
-            "+" | "-" => Some(7),
-            "*" | "/" | "%" => Some(8),
-            "<<<" | ">>>" => Some(9),
+            "||" => Some((30, 30, 31)),
+            "∨" => Some((30, 31, 30)),
+            "&&" => Some((35, 35, 36)),
+            "∧" => Some((35, 36, 35)),
+            "=" | "==" | "!=" | "≠" | "<" | "<=" | "≤" | ">" | ">=" | "≥" => Some((50, 51, 51)),
+            "|||" => Some((55, 55, 56)),
+            "^^^" => Some((58, 58, 59)),
+            "&&&" => Some((60, 60, 61)),
+            "+" | "-" => Some((65, 65, 66)),
+            "*" | "/" | "%" => Some((70, 70, 71)),
+            "<<<" | ">>>" => Some((75, 75, 76)),
             _ => None,
         }
     }
 
-    fn parse_expr(&mut self, min_prec: u8) -> Option<OmegaAst> {
-        let mut lhs = self.parse_unary()?;
+    fn parse_expr(&mut self, min_prec: u16) -> Option<OmegaAst> {
+        let (mut lhs, mut lhs_prec) = self.parse_led_head(min_prec)?;
         while let Some(OmegaTok::Op(op)) = self.peek().cloned() {
-            let prec = Self::op_prec(&op)?;
-            if prec < min_prec {
+            let Some((prec, req_lhs_prec, r_prec)) = Self::op_prec(&op) else {
+                break;
+            };
+            if prec < min_prec || lhs_prec < req_lhs_prec {
                 break;
             }
             self.next();
-            let rhs = self.parse_expr(prec + 1)?;
+            let rhs = self.parse_expr(r_prec)?;
             lhs = OmegaAst::Binary(op, Box::new(lhs), Box::new(rhs));
+            lhs_prec = prec;
         }
         Some(lhs)
     }
 
-    fn parse_unary(&mut self) -> Option<OmegaAst> {
+    fn parse_led_head(&mut self, min_prec: u16) -> Option<(OmegaAst, u16)> {
         if let Some(OmegaTok::Op(op)) = self.peek().cloned() {
-            if matches!(op.as_str(), "-" | "!" | "¬" | "~") {
-                self.next();
-                let inner = if op == "¬" {
-                    self.parse_expr(3)?
-                } else {
-                    self.parse_unary()?
-                };
-                return Some(OmegaAst::Unary(op, Box::new(inner)));
+            let (head_prec, rhs_prec) = match op.as_str() {
+                "!" | "¬" => (1024u16, 40u16),
+                "-" => (75, 75),
+                "~~~" => (100, 100),
+                _ => return None,
+            };
+            if head_prec < min_prec {
+                return None;
             }
+            self.next();
+            return Some((OmegaAst::Unary(op, Box::new(self.parse_expr(rhs_prec)?)), head_prec));
         }
         match self.next()? {
-            OmegaTok::Num(n) => Some(OmegaAst::Lit(n)),
+            OmegaTok::Num(n) => Some((OmegaAst::Lit(n), 1024)),
             OmegaTok::Ident(id) => match id.as_str() {
-                "True" | "true" => Some(OmegaAst::BoolLit(true)),
-                "False" | "false" => Some(OmegaAst::BoolLit(false)),
-                "BitVec.zero" => Some(OmegaAst::TypedBitVecZero),
-                "BitVec.one" => Some(OmegaAst::TypedBitVecOne),
-                "Nat.succ" => {
-                    let arg = self.parse_unary()?;
-                    Some(OmegaAst::Binary(
-                        "+".to_string(),
-                        Box::new(arg),
-                        Box::new(OmegaAst::Lit(1)),
+                "True" | "true" => Some((OmegaAst::BoolLit(true), 1024)),
+                "False" | "false" => Some((OmegaAst::BoolLit(false), 1024)),
+                "BitVec.zero" => Some((OmegaAst::TypedBitVecZero, 1024)),
+                "BitVec.one" => Some((OmegaAst::TypedBitVecOne, 1024)),
+                "Nat.succ" if min_prec <= 1022 => {
+                    let arg = self.parse_expr(1023)?;
+                    Some((
+                        OmegaAst::Binary(
+                            "+".to_string(),
+                            Box::new(arg),
+                            Box::new(OmegaAst::Lit(1)),
+                        ),
+                        1022,
                     ))
                 }
-                "BitVec.not" | "bitNot" => Some(OmegaAst::Unary(
-                    if id == "BitVec.not" { "bv_not" } else { "~" }.to_string(),
-                    Box::new(self.parse_unary()?),
+                "BitVec.not" | "bitNot" if min_prec <= 1022 => Some((
+                    OmegaAst::Unary(
+                        if id == "BitVec.not" { "bv_not" } else { "~~~" }.to_string(),
+                        Box::new(self.parse_expr(1023)?),
+                    ),
+                    1022,
                 )),
+                "Nat.succ" | "BitVec.not" | "bitNot" => None,
                 _ if id.starts_with("Word256.")
                     || id.starts_with("Uint256.")
                     || id.starts_with("UInt256.") =>
@@ -1197,18 +1210,21 @@ impl OmegaParser {
                         _ => None,
                     };
                     if let Some(op) = bin_op {
-                        let a = self.parse_unary()?;
-                        let b = self.parse_unary()?;
-                        Some(OmegaAst::Binary(op.to_string(), Box::new(a), Box::new(b)))
+                        if min_prec > 1022 {
+                            return None;
+                        }
+                        let a = self.parse_expr(1023)?;
+                        let b = self.parse_expr(1023)?;
+                        Some((OmegaAst::Binary(op.to_string(), Box::new(a), Box::new(b)), 1022))
                     } else {
-                        Some(OmegaAst::Var(id))
+                        Some((OmegaAst::Var(id), 1024))
                     }
                 }
             },
             OmegaTok::LParen => {
-                let e = self.parse_expr(1)?;
+                let e = self.parse_expr(10)?;
                 match self.next()? {
-                    OmegaTok::RParen => Some(e),
+                    OmegaTok::RParen => Some((e, 1024)),
                     _ => None,
                 }
             }
@@ -1223,7 +1239,7 @@ fn parse_omega_ast(s: &str) -> Option<OmegaAst> {
         return None;
     }
     let mut parser = OmegaParser { toks, pos: 0 };
-    let ast = parser.parse_expr(1)?;
+    let ast = parser.parse_expr(10)?;
     if parser.pos != parser.toks.len() {
         return None;
     }
@@ -1282,10 +1298,51 @@ fn omega_ast_mentions_typed_value(ast: &OmegaAst, include_bitvec_only: bool, def
     }
 }
 
+fn omega_ast_produces_bool(ast: &OmegaAst) -> bool {
+    match ast {
+        OmegaAst::BoolLit(_) => true,
+        OmegaAst::Unary(op, _) => matches!(op.as_str(), "!" | "¬"),
+        OmegaAst::Binary(op, _, _) => matches!(
+            op.as_str(),
+            "=" | "==" | "!=" | "≠" | "<" | "<=" | "≤" | ">" | ">=" | "≥" | "&&" | "∧" | "||" | "∨"
+        ),
+        _ => false,
+    }
+}
+
+fn omega_ast_synthesizes_int_or_complement_without_typed_value(
+    ast: &OmegaAst,
+    expected: OmegaParamDom,
+) -> bool {
+    if omega_ast_mentions_typed_value(ast, false, expected) {
+        return false;
+    }
+    match ast {
+        OmegaAst::Unary(op, _) => matches!(op.as_str(), "-" | "~~~"),
+        OmegaAst::Binary(op, l, r) => {
+            if matches!(
+                op.as_str(),
+                "=" | "==" | "!=" | "≠" | "<" | "<=" | "≤" | ">" | ">=" | "≥" | "&&" | "∧" | "||" | "∨"
+            ) {
+                false
+            } else {
+                omega_ast_synthesizes_int_or_complement_without_typed_value(l, expected)
+                    || omega_ast_synthesizes_int_or_complement_without_typed_value(r, expected)
+            }
+        }
+        _ => false,
+    }
+}
+
 fn omega_ast_infer_subexpr_dom(ast: &OmegaAst, expected: OmegaParamDom) -> Option<OmegaParamDom> {
     match ast {
         OmegaAst::Binary(op, lhs, rhs) if matches!(op.as_str(), "<<<" | ">>>") => {
             if !omega_ast_mentions_typed_value(lhs, false, expected) {
+                if omega_ast_synthesizes_int_or_complement_without_typed_value(lhs, expected)
+                    || omega_ast_synthesizes_int_or_complement_without_typed_value(rhs, expected)
+                {
+                    return None;
+                }
                 if omega_ast_mentions_typed_value(rhs, true, expected) {
                     return None;
                 }
@@ -1301,9 +1358,9 @@ fn omega_ast_infer_subexpr_dom(ast: &OmegaAst, expected: OmegaParamDom) -> Optio
         }
         OmegaAst::Unary(op, inner) if op != "!" && op != "¬" => {
             let inner_dom = omega_ast_infer_subexpr_dom(inner, expected)?;
-            if op != "bv_not"
+            if matches!(op.as_str(), "-" | "~~~")
                 && matches!(inner_dom, OmegaParamDom::Nat)
-                && !matches!(expected, OmegaParamDom::Nat)
+                && !(op == "-" && matches!(expected, OmegaParamDom::BitVec(_)))
             {
                 return None;
             }
@@ -1382,7 +1439,7 @@ fn eval_omega_ast(
         OmegaAst::BoolLit(b) => Some(OmegaVal::Bool(*b)),
         OmegaAst::Var(name) => env.get(name).copied().map(OmegaVal::Int),
         OmegaAst::Unary(op, inner) => {
-            if op == "~" {
+            if matches!(op.as_str(), "~~~" | "bv_not") {
                 if let OmegaAst::Binary(iop, il, _) = inner.as_ref() {
                     if matches!(iop.as_str(), "<<<" | ">>>")
                         && !omega_ast_mentions_typed_value(il, false, outer_dom)
@@ -1394,10 +1451,18 @@ fn eval_omega_ast(
             if op == "bv_not" && !matches!(outer_dom, OmegaParamDom::BitVec(_)) {
                 return None;
             }
+            if matches!(op.as_str(), "-" | "~~~") {
+                let inner_dom = omega_ast_infer_subexpr_dom(inner, outer_dom)?;
+                if matches!(inner_dom, OmegaParamDom::Nat)
+                    && !(op == "-" && matches!(outer_dom, OmegaParamDom::BitVec(_)))
+                {
+                    return None;
+                }
+            }
             let v = eval_omega_ast(inner, env, outer_dom)?;
             match op.as_str() {
                 "!" | "¬" => Some(OmegaVal::Bool(!v.as_bool()?)),
-                "~" | "bv_not" => match outer_dom {
+                "~~~" | "bv_not" => match outer_dom {
                     OmegaParamDom::UInt(_) | OmegaParamDom::BitVec(_) => {
                         let x = v.as_int()? as u64;
                         mask_for(outer_dom, (!x) as i128).map(OmegaVal::Int)
@@ -1431,11 +1496,21 @@ fn eval_omega_ast(
             if matches!(
                 op.as_str(),
                 "=" | "==" | "!=" | "≠" | "<" | "<=" | "≤" | ">" | ">=" | "≥"
+            ) && !omega_ast_mentions_typed_value(lhs, false, outer_dom)
+                && !omega_ast_mentions_typed_value(rhs, false, outer_dom)
+                && (omega_ast_synthesizes_int_or_complement_without_typed_value(lhs, outer_dom)
+                    || omega_ast_synthesizes_int_or_complement_without_typed_value(rhs, outer_dom))
+            {
+                return None;
+            }
+            if matches!(
+                op.as_str(),
+                "=" | "==" | "!=" | "≠" | "<" | "<=" | "≤" | ">" | ">=" | "≥"
             ) && !matches!(outer_dom, OmegaParamDom::Int)
+                && !omega_ast_produces_bool(lhs)
+                && !omega_ast_produces_bool(rhs)
                 && !omega_ast_mentions_typed_value(lhs, false, outer_dom)
                 && !omega_ast_mentions_typed_value(rhs, false, outer_dom)
-                && !matches!(rhs.as_ref(), OmegaAst::BoolLit(_))
-                && !matches!(lhs.as_ref(), OmegaAst::BoolLit(_))
             {
                 let a = eval_omega_ast(lhs, env, OmegaParamDom::Nat)?.as_int()?;
                 let b = eval_omega_ast(rhs, env, OmegaParamDom::Nat)?.as_int()?;
@@ -1462,12 +1537,22 @@ fn eval_omega_ast(
                 ("<<<" | ">>>", OmegaParamDom::BitVec(_)) => {
                     if omega_ast_mentions_typed_value(rhs, true, default_dom) {
                         default_dom
+                    } else if omega_ast_synthesizes_int_or_complement_without_typed_value(
+                        rhs,
+                        default_dom,
+                    ) {
+                        return None;
                     } else {
                         OmegaParamDom::Nat
                     }
                 }
                 ("<<<" | ">>>", OmegaParamDom::Nat) => {
-                    if omega_ast_mentions_typed_value(rhs, true, default_dom) {
+                    if omega_ast_mentions_typed_value(rhs, true, default_dom)
+                        || omega_ast_synthesizes_int_or_complement_without_typed_value(
+                            rhs,
+                            default_dom,
+                        )
+                    {
                         return None;
                     }
                     OmegaParamDom::Nat
@@ -5739,6 +5824,67 @@ mod tests {
             run(
                 "u8_lit_shift_rejected",
                 "(u : UInt8) : (1 <<< 8) = u",
+                "by bv_decide",
+            ),
+            None
+        );
+        // Unary `-` (`prefix:75`) binds looser than `>>>` (`infixl:75`):
+        // `-x >>> 1 = -(x >>> 1)` holds for all `BitVec 8` (no counterexample!).
+        assert_eq!(
+            run(
+                "bv8_neg_shr_precedence_valid",
+                "(x : BitVec 8) : (-x >>> 1) = -(x >>> 1)",
+                "by bv_decide",
+            ),
+            None
+        );
+        assert!(matches!(
+            run(
+                "bv8_neg_shr_wrong_grouping",
+                "(x : BitVec 8) : (-x >>> 1) = ((-x) >>> 1)",
+                "by bv_decide",
+            ),
+            Some(AcceleratorCertificate::CounterexampleFound { .. })
+        ));
+        // `~~~` (`prefix:100`) binds tighter than `>>>` (`infixl:75`), while single `~` is rejected.
+        assert_eq!(
+            run(
+                "bv8_complement_shr_valid",
+                "(x : BitVec 8) : (~~~x >>> 1) = ((~~~x) >>> 1)",
+                "by bv_decide",
+            ),
+            None
+        );
+        assert_eq!(
+            run(
+                "bv8_single_tilde_rejected",
+                "(x : BitVec 8) : (~x) = x",
+                "by bv_decide",
+            ),
+            None
+        );
+        // `!n == 2` parses as `!(n == 2)`.
+        assert_eq!(
+            run(
+                "nat_bang_beq_valid",
+                "(n : Nat) (h : n = 1) : !n == 2",
+                "by omega",
+            ),
+            None
+        );
+        // `Int`-elaborated / invalid `Neg Nat` subexpressions fail closed (`None`).
+        assert_eq!(
+            run(
+                "bv8_paren_int_shr_rejected",
+                "(x : BitVec 8) : ((-1) >>> 1) = 127",
+                "by bv_decide",
+            ),
+            None
+        );
+        assert_eq!(
+            run(
+                "u8_neg_nat_shr_rejected",
+                "(u : UInt8) : (- 1 >>> 1) = u",
                 "by bv_decide",
             ),
             None
