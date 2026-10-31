@@ -472,8 +472,8 @@ def desugarTmpBase (synVarBase fuel' : Nat) : VarId :=
 /-- Check whether `root` is a heap/constructor object root rather than a pure scalar or typed SSA tuple. -/
 def isDefinitelyHeapRoot (st : SymExecState) (bufVar : VarId) : Bool :=
   let root := st.resolveBuf bufVar
-  if st.allocRoots.contains root || (st.refCounts.lookup root).isSome ||
-     (st.rcExprs.lookup root).isSome || st.exclusiveBufs.contains root then
+  if st.allocRoots.contains root || st.sarrayVars.contains root || st.objPtrVars.contains root ||
+     (st.refCounts.lookup root).isSome || (st.rcExprs.lookup root).isSome || st.exclusiveBufs.contains root then
     true
   else match (st.lookupVar root).expr with
     | .tuple _ => !(st.typedTuples.contains root)
@@ -493,28 +493,59 @@ def unmarkTypedTuple (st : SymExecState) (v : VarId) : SymExecState :=
   { st with typedTuples := st.typedTuples.filter (· != v) }
 
 def markBoolVar (st : SymExecState) (v : VarId) : SymExecState :=
-  { st with
-    boolVars := v :: st.boolVars.filter (· != v)
-    u64Vars := st.u64Vars.filter (· != v)
-    u256Vars := st.u256Vars.filter (· != v) }
+  let root := st.resolveBuf v
+  let heapRoot := st.allocRoots.contains root || st.sarrayVars.contains root || st.objPtrVars.contains root ||
+    (match (st.lookupVar root).expr with | .tuple _ => !(st.typedTuples.contains root) | _ => false)
+  if heapRoot then st
+  else
+    { st with
+      boolVars := v :: st.boolVars.filter (· != v)
+      u64Vars := st.u64Vars.filter (· != v)
+      u256Vars := st.u256Vars.filter (· != v) }
 
 def markU64Var (st : SymExecState) (v : VarId) : SymExecState :=
-  { st with
-    u64Vars := v :: st.u64Vars.filter (· != v)
-    boolVars := st.boolVars.filter (· != v)
-    u256Vars := st.u256Vars.filter (· != v) }
+  let root := st.resolveBuf v
+  let heapRoot := st.allocRoots.contains root || st.sarrayVars.contains root || st.objPtrVars.contains root ||
+    (match (st.lookupVar root).expr with | .tuple _ => !(st.typedTuples.contains root) | _ => false)
+  if heapRoot then st
+  else
+    { st with
+      u64Vars := v :: st.u64Vars.filter (· != v)
+      boolVars := st.boolVars.filter (· != v)
+      u256Vars := st.u256Vars.filter (· != v) }
 
 def markU256Var (st : SymExecState) (v : VarId) : SymExecState :=
-  { st with
-    u256Vars := v :: st.u256Vars.filter (· != v)
-    boolVars := st.boolVars.filter (· != v)
-    u64Vars := st.u64Vars.filter (· != v) }
+  let root := st.resolveBuf v
+  let heapRoot := st.allocRoots.contains root || st.sarrayVars.contains root || st.objPtrVars.contains root ||
+    (match (st.lookupVar root).expr with | .tuple _ => !(st.typedTuples.contains root) | _ => false)
+  if heapRoot then st
+  else
+    { st with
+      u256Vars := v :: st.u256Vars.filter (· != v)
+      boolVars := st.boolVars.filter (· != v)
+      u64Vars := st.u64Vars.filter (· != v) }
 
 def markSarrayVar (st : SymExecState) (v : VarId) : SymExecState :=
-  { st with sarrayVars := v :: st.sarrayVars.filter (· != v) }
+  let root := st.resolveBuf v
+  if st.allocRoots.contains root || st.objPtrVars.contains root then st
+  else
+    { st with
+      sarrayVars := v :: st.sarrayVars.filter (· != v)
+      boolVars := st.boolVars.filter (· != v)
+      u64Vars := st.u64Vars.filter (· != v)
+      u256Vars := st.u256Vars.filter (· != v)
+      objPtrVars := st.objPtrVars.filter (· != v) }
 
 def markObjPtrVar (st : SymExecState) (v : VarId) : SymExecState :=
-  { st with objPtrVars := v :: st.objPtrVars.filter (· != v) }
+  let root := st.resolveBuf v
+  if st.allocRoots.contains root || st.sarrayVars.contains root then st
+  else
+    { st with
+      objPtrVars := v :: st.objPtrVars.filter (· != v)
+      boolVars := st.boolVars.filter (· != v)
+      u64Vars := st.u64Vars.filter (· != v)
+      u256Vars := st.u256Vars.filter (· != v)
+      sarrayVars := st.sarrayVars.filter (· != v) }
 
 /-- True when `bufVar` cannot hold an immediate unboxed scalar/bool/tuple/unit in `VarEnv`
     (i.e. it is an allocated object, `.sarray` parameter, `.objPtr` parameter, or constructor-tag-refined root). -/
@@ -1550,7 +1581,8 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
     let r := st.resolveBuf valVar
     let st1 := if valVar != dst && st.isDefinitelyHeapRoot r then st.aliasBuf dst r else st.clearAlias dst
     let st2 :=
-      if st1.typedTuples.contains r || (match sTy with | .tuple _ => true | _ => false) then st1.markTypedTuple dst
+      if st1.isNeverScalarRef r then st1
+      else if st1.typedTuples.contains r || (match sTy with | .tuple _ => true | _ => false) then st1.markTypedTuple dst
       else if sTy == .i1 || dstTy == .i1 then ((st1.unmarkTypedTuple dst).markBoolVar dst).markBoolVar r
       else if sTy == .u256 || sTy == .i256 || dstTy == .u256 || dstTy == .i256 then ((st1.unmarkTypedTuple dst).markU256Var dst).markU256Var r
       else ((st1.unmarkTypedTuple dst).markU64Var dst).markU64Var r
@@ -1558,7 +1590,10 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
   | .boxScalar valVar _ =>
     let r := st.resolveBuf valVar
     let st1 := if valVar != dst && st.isDefinitelyHeapRoot r then st.aliasBuf dst r else st.clearAlias dst
-    let st2 := if st1.typedTuples.contains r then st1.markTypedTuple dst else st1.unmarkTypedTuple dst
+    let st2 :=
+      if st1.isNeverScalarRef r then st1
+      else if st1.typedTuples.contains r then st1.markTypedTuple dst
+      else st1.unmarkTypedTuple dst
     st2.bindVar dst (st2.lookupVar r)
   | .call fnName args retTy isExt =>
     let ptrRet := callSlotKind retTy == some true
@@ -1568,7 +1603,10 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
       if (fnName == "lean_native_box_u64" && ptrRet) || (fnName == "lean_native_unbox_u64" && i64Ret) then
         let r := st.resolveBuf a
         let st1 := if a != dst then st.aliasBuf dst a else st
-        let st2 := if fnName == "lean_native_unbox_u64" then (st1.markU64Var dst).markU64Var r else st1
+        let st2 :=
+          if fnName == "lean_native_unbox_u64" && !(st1.isNeverScalarRef r) then
+            (st1.markU64Var dst).markU64Var r
+          else st1
         st2.bindVar dst (st2.lookupVar r)
       else if fnName == "lean_native_ensure_exclusive" && ptrRet then
         let root := st.resolveBuf a

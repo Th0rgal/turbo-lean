@@ -2243,6 +2243,27 @@ open LeanNative.IR LeanNative.Proofs
     let tagImmBad := validateTranslationDecl (mkBadCtorTagImmediateDecl useU256 false) (mkBadCtorTagImmediateDecl useU256 true) 8
     unless !tagImmBad.ubRefines && !tagImmBad.passed do
       throw <| IO.userError s!"lean_native_ctor_tag on unsupported immediate accepted (u256={useU256}): {reprStr tagImmBad}"
+  let mkUnboxHeapTypeDecl (checkExcl : Bool) (useRootInExcl : Bool) : LNIRDecl := {
+    name := "unbox_heap_type"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i1
+    body :=
+      .letBind 2 .i64 (.unboxScalar 0 .i64)
+        (if checkExcl then
+           .letBind 3 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+             (.ite 3
+               (.letBind 4 .i1 (.isExclusive (if useRootInExcl then 0 else 2)) (.ret 4))
+               (.letBind 4 .i1 (.scalar (.constBool true)) (.ret 4)))
+         else
+           .letBind 4 .i1 (.scalar (.constBool true)) (.ret 4))
+  }
+  for useRoot in [true, false] do
+    let unboxBad := validateTranslationDecl (mkUnboxHeapTypeDecl true useRoot) (mkUnboxHeapTypeDecl false useRoot) 8
+    unless !unboxBad.symRetEquiv && !unboxBad.passed do
+      throw <| IO.userError s!"unboxScalar erased heap type of objPtr (useRoot={useRoot}): {reprStr unboxBad}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)
