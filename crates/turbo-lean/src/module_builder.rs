@@ -3863,7 +3863,9 @@ pub fn is_allowed_lean_arg(arg: &str) -> bool {
     matches!(t, "--json" | "-q" | "--quiet")
 }
 
-/// Filter and normalize Lean compiler flags via `is_allowed_lean_arg`.
+/// Filter and normalize Lean compiler flags via `is_allowed_lean_arg`, dropping output-format
+/// flags (`--json`, `-q`, `--quiet`): they never change elaboration, and callers that parse
+/// plain-text `lean` output (`#print axioms`, determinism checks) must not receive them.
 pub fn filter_allowed_lean_args<I, S>(args: I) -> Vec<String>
 where
     I: IntoIterator<Item = S>,
@@ -3871,7 +3873,7 @@ where
 {
     args.into_iter()
         .map(|s| s.as_ref().trim().to_string())
-        .filter(|s| is_allowed_lean_arg(s))
+        .filter(|s| is_allowed_lean_arg(s) && !matches!(s.as_str(), "--json" | "-q" | "--quiet"))
         .collect()
 }
 
@@ -3896,14 +3898,7 @@ pub fn compute_lean_args_digest(args: &[String]) -> Option<String> {
 /// Flatten weak-then-strong Lake args into filtered CLI argv order (matching Lean's setup/CLI
 /// precedence where strong args come after weak args and override matching `-D` keys).
 pub fn compose_flat_filtered_args(weak_args: &[String], strong_args: &[String]) -> Vec<String> {
-    let mut out = Vec::with_capacity(weak_args.len() + strong_args.len());
-    for a in weak_args.iter().chain(strong_args.iter()) {
-        let t = a.trim();
-        if is_allowed_lean_arg(t) {
-            out.push(t.to_string());
-        }
-    }
-    out
+    filter_allowed_lean_args(weak_args.iter().chain(strong_args))
 }
 
 /// Resolve filtered package-level Lean compiler flags from `pkg`.
@@ -10283,6 +10278,11 @@ lean_exe «demo-exe» where
         assert!(!is_allowed_lean_arg("-j0"));
         assert!(!is_allowed_lean_arg("-j65"));
 
+        assert_eq!(
+            filter_allowed_lean_args(["--json", " -q ", "--quiet", "-DautoImplicit=false"]),
+            vec!["-DautoImplicit=false".to_string()]
+        );
+        assert_eq!(compute_lean_args_digest(&["--json".to_string()]), None);
         assert_eq!(compute_lean_args_digest(&[]), None);
         assert_eq!(
             compute_lean_args_digest(&["--plugin=evil.so".to_string(), "pos.lean".to_string()]),
