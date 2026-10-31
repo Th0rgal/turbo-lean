@@ -1,0 +1,8 @@
+{
+  "rows": 310275,
+  "kernel_calls": 300319,
+  "all_constants_covered": true,
+  "kernel_cpu_ns": 3595374795440,
+  "distinct_K": 297363,
+  "duplicate_theorems_rechecked": 3137
+}
