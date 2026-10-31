@@ -255,8 +255,8 @@ structure SymExecState where
   deriving Repr, Inhabited, BEq
 
 def isImmSymExpr (immRoots : List VarId := []) : SymExpr → Bool
-  | .constU64 _ | .constBool _ | .unit | .projSym 0 .. | .projSym 3 .. | .projSym 4 ..
-  | .bufElem .. | .arrLen _ | .exclCheck .. | .decCond .. | .unaryOp _ _ => true
+  | .constU64 _ | .constBool _ | .unit | .projSym 0 .. | .bufElem .. | .arrLen _
+  | .exclCheck .. | .decCond .. | .unaryOp _ _ => true
   | .symVar id => immRoots.contains id
   | .binOp .add l r | .binOp .sub l r | .binOp .mul l r | .binOp .div l r
   | .binOp .bitAnd l r | .binOp .bitOr l r | .binOp .bitXor l r
@@ -437,7 +437,7 @@ def mergeBranches (base stT stE : SymExecState) (cExpr : SymExpr) (condNoUB cond
     objRoots := mergedObjRoots
     tupleRoots := mergedTupleRoots
     paramChildRoots := dedupIds (base.paramChildRoots ++ stT.paramChildRoots ++ stE.paramChildRoots)
-    immRoots := dedupIds (base.immRoots ++ stT.immRoots ++ stE.immRoots)
+    immRoots := base.immRoots.filter fun id => stT.immRoots.contains id && stE.immRoots.contains id
     freshCtorRoots := dedupIds (base.freshCtorRoots ++ stT.freshCtorRoots ++ stE.freshCtorRoots)
     heapAllocSeq :=
       let hKeys := dedupIds (base.heapAllocSeq.map (·.1) ++ stT.heapAllocSeq.map (·.1) ++ stE.heapAllocSeq.map (·.1))
@@ -710,7 +710,8 @@ def writeBufSym (st : SymExecState) (bufVar : VarId) (idx val : SymExpr) (requir
 def clearDstTracking (st : SymExecState) (dst : VarId) : SymExecState :=
   { st with
     bufAliases := st.bufAliases.filter (fun (id, _) => id != dst)
-    tupleRoots := st.tupleRoots.filter (fun (id, _) => id != dst) }
+    tupleRoots := st.tupleRoots.filter (fun (id, _) => id != dst)
+    immRoots := st.immRoots.filter (· != dst) }
 
 end SymExecState
 
@@ -867,6 +868,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
         | some known => known
         | none => st0.projSyntheticRoot 0 base idx
       let curFs := st.tupleRoots.lookup (st.resolveBuf tupleVar)
+      let inBounds : Bool := match curFs with | some fs => decide (idx < fs.length) | none => true
       let st1 := match fieldRoot?, curFs with
         | none, none =>
           let stR := if (st0.rootRc.lookup r).isSome then st0 else (st0.setRootRc r 1 none).markMaybeScalar r
@@ -878,15 +880,17 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
           let ksv := st.lookupVar kr
           if ksv.expr matches .tuple _ then ksv.expr
           else if (st.rootRc.lookup kr).isSome || st.exclusiveBufs.contains kr then .symVar kr
-          else .projSym 0 base idx
+          else .projSym 2 base idx
         | none, none => .symVar r
-        | none, some _ => .projSym 0 base idx
-      let st2 := st1.bindVar dst { expr := outExpr, nonPoison := tv.nonPoison, noUB := tv.noUB && knownOk }
-      { st2 with supported := st2.supported && knownOk }
+        | none, some fs => if idx < fs.length then .projSym 0 base idx else .projSym 2 base idx
+      let st2 := st1.bindVar dst { expr := outExpr, nonPoison := tv.nonPoison, noUB := tv.noUB && knownOk && inBounds }
+      { st2 with supported := st2.supported && knownOk && inBounds }
     | _ =>
       let root := st.resolveBuf tupleVar
-      if idx == 0 && fieldRoot?.isNone && st.hasKnownRootTracking root then
-        stA.bindVar dst { expr := .projSym 0 root 0, nonPoison := tv.nonPoison, noUB := tv.noUB }
+      let (minRc, exactRc?) := st.getRootRc root
+      let liveOk := minRc > 0 && exactRc? != some 0
+      if idx == 0 && fieldRoot?.isNone && st.hasKnownRootTracking root && (st.tupleRoots.lookup root).isNone then
+        stA.bindVar dst { expr := .projSym 0 root 0, nonPoison := tv.nonPoison, noUB := tv.noUB && liveOk }
       else
         let outExpr := match fieldRoot? with | some r => .symVar r | none => .projSym 2 root idx
         let knownOk := fieldRoot?.isSome
@@ -953,23 +957,39 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
     let ctorRoot := st.resolveBuf ctorVar
     let (minRc, exactRc?) := st.getRootRc ctorRoot
     let liveOk := minRc > 0 && exactRc? != some 0
-    let st0 := st.clearDstTracking dst
+    let stBase := st.clearDstTracking dst
     match cv.expr with
     | .ctorObj _ _ _ ss =>
       let knownOk := st.hasKnownRootTracking ctorRoot
       match ss[idx]? with
       | some fExpr =>
-        let st1 := st0.bindVar dst { expr := fExpr, nonPoison := cv.nonPoison, noUB := cv.noUB && liveOk && knownOk }
+        let stA :=
+          match fExpr with
+          | .symVar fv =>
+            match st.trackedRoot? fv with
+            | some r => stBase.aliasBuf dst r
+            | none => stBase
+          | _ => stBase
+        let st1 := stA.bindVar dst { expr := fExpr, nonPoison := cv.nonPoison, noUB := cv.noUB && liveOk && knownOk }
         { st1 with supported := st1.supported && knownOk }
-      | none => st0.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+      | none => stBase.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
     | .symVar base =>
       let knownOk := st.hasKnownRootTracking ctorRoot
-      let st1 := st0.bindVar dst
-        { expr := .projSym 3 base idx, nonPoison := cv.nonPoison, noUB := cv.noUB && liveOk && knownOk }
+      let r := stBase.projSyntheticRoot 3 base idx
+      let st0 :=
+        if (stBase.rootRc.lookup r).isSome then stBase
+        else (stBase.setRootRc r 1 none).markMaybeScalar r
+      let st1 := (st0.aliasBuf dst r).bindVar dst
+        { expr := .symVar r, nonPoison := cv.nonPoison, noUB := cv.noUB && liveOk && knownOk }
       { st1 with supported := st1.supported && knownOk }
     | _ =>
       let knownOk := st.hasKnownRootTracking ctorRoot
-      let st1 := st0.bindVar dst { expr := .projSym 4 ctorRoot idx, nonPoison := cv.nonPoison, noUB := cv.noUB && liveOk && knownOk }
+      let r := stBase.projSyntheticRoot 4 ctorRoot idx
+      let st0 :=
+        if (stBase.rootRc.lookup r).isSome then stBase
+        else (stBase.setRootRc r 1 none).markMaybeScalar r
+      let st1 := (st0.aliasBuf dst r).bindVar dst
+        { expr := .symVar r, nonPoison := cv.nonPoison, noUB := cv.noUB && liveOk && knownOk }
       { st1 with supported := st1.supported && knownOk }
   | .isExclusive objVar =>
     let ov := st.lookupVar objVar
@@ -3041,6 +3061,129 @@ private def liveRcCondPredicateMismatchTgt : LNIRDecl :=
   liveRcCondPredicateMismatchSrc.body liveRcCondPredicateMismatchTgt.body
 #guard !(validateTranslationDecl liveRcCondPredicateMismatchSrc liveRcCondPredicateMismatchTgt).memWritesEquiv
 #guard !(validateTranslationDecl liveRcCondPredicateMismatchSrc liveRcCondPredicateMismatchTgt).passed
+
+private def ctorGetScalarSharedObjExclSrc : LNIRDecl :=
+  { name := "ctor_get_scalar_shared_obj_excl"
+    params := [{ id := 0, name := "c", ty := .objPtr, borrow := true }]
+    retTy := .i1
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 1 .i64 (.ctorGetScalar 0 0 .i64) <|
+      .letBind 2 .i1 (.isExclusive 1) <|
+      .ret 2 }
+
+private def ctorGetScalarSharedObjExclTrueTgt : LNIRDecl :=
+  { ctorGetScalarSharedObjExclSrc with
+    body :=
+      .letBind 1 .i64 (.ctorGetScalar 0 0 .i64) <|
+      .letBind 2 .i1 (.scalar (.constBool true)) <|
+      .ret 2 }
+
+#guard !(let (inner, st0) := HeapState.empty.allocCtor 0 [] [];
+  match st0.incRefObj 1 1 with
+  | .ok st1 =>
+    let (outer, st2) := st1.allocCtor 0 [] [inner]
+    checkSingleSample 1024 (VarEnv.empty.bind 0 outer) st2
+      ctorGetScalarSharedObjExclSrc.body ctorGetScalarSharedObjExclTrueTgt.body
+  | .error _ => false)
+#guard !(validateTranslationDecl ctorGetScalarSharedObjExclSrc ctorGetScalarSharedObjExclTrueTgt).symRetEquiv
+#guard !(validateTranslationDecl ctorGetScalarSharedObjExclSrc ctorGetScalarSharedObjExclTrueTgt).passed
+
+private def ctorGetScalarSelectBaseExclSrc : LNIRDecl :=
+  { name := "ctor_get_scalar_select_base_excl"
+    params := [{ id := 0, name := "b", ty := .i1, borrow := false },
+               { id := 1, name := "c1", ty := .objPtr, borrow := true },
+               { id := 2, name := "c2", ty := .objPtr, borrow := true }]
+    retTy := .i1
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 3 .objPtr (.scalar (.select (.var 0) (.var 1) (.var 2))) <|
+      .letBind 4 .i64 (.ctorGetScalar 3 0 .i64) <|
+      .letBind 5 .i1 (.isExclusive 4) <|
+      .ret 5 }
+
+private def ctorGetScalarSelectBaseExclTrueTgt : LNIRDecl :=
+  { ctorGetScalarSelectBaseExclSrc with
+    body :=
+      .letBind 3 .objPtr (.scalar (.select (.var 0) (.var 1) (.var 2))) <|
+      .letBind 4 .i64 (.ctorGetScalar 3 0 .i64) <|
+      .letBind 5 .i1 (.scalar (.constBool true)) <|
+      .ret 5 }
+
+#guard !(let (inner, st0) := HeapState.empty.allocCtor 0 [] [];
+  match st0.incRefObj 1 1 with
+  | .ok st1 =>
+    let (c1, st2) := st1.allocCtor 0 [] [inner]
+    let (c2, st3) := st2.allocCtor 0 [] [inner]
+    checkSingleSample 1024 (((VarEnv.empty.bind 0 (.bool true)).bind 1 c1).bind 2 c2) st3
+      ctorGetScalarSelectBaseExclSrc.body ctorGetScalarSelectBaseExclTrueTgt.body
+  | .error _ => false)
+#guard !(validateTranslationDecl ctorGetScalarSelectBaseExclSrc ctorGetScalarSelectBaseExclTrueTgt).ubRefines
+#guard !(validateTranslationDecl ctorGetScalarSelectBaseExclSrc ctorGetScalarSelectBaseExclTrueTgt).passed
+
+private def ctorGetScalarFreshSharedObjExclSrc : LNIRDecl :=
+  { name := "ctor_get_scalar_fresh_shared_obj_excl"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i1
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 1 .objPtr (.allocCtor 0 [] [0]) <|
+      .incRef 1 1 <|
+      .letBind 2 .objPtr (.allocCtor 0 [] [1]) <|
+      .letBind 3 .i64 (.ctorGetScalar 2 0 .i64) <|
+      .letBind 4 .i1 (.isExclusive 3) <|
+      .decRef 2 1 <|
+      .decRef 1 2 <|
+      .ret 4 }
+
+private def ctorGetScalarFreshSharedObjExclTrueTgt : LNIRDecl :=
+  { ctorGetScalarFreshSharedObjExclSrc with
+    body :=
+      .letBind 1 .objPtr (.allocCtor 0 [] [0]) <|
+      .incRef 1 1 <|
+      .letBind 2 .objPtr (.allocCtor 0 [] [1]) <|
+      .letBind 3 .i64 (.ctorGetScalar 2 0 .i64) <|
+      .letBind 4 .i1 (.scalar (.constBool true)) <|
+      .decRef 2 1 <|
+      .decRef 1 2 <|
+      .ret 4 }
+
+#guard !checkSingleSample 1024 (VarEnv.empty.bind 0 (.u64 7)) HeapState.empty
+  ctorGetScalarFreshSharedObjExclSrc.body ctorGetScalarFreshSharedObjExclTrueTgt.body
+#guard !(validateTranslationDecl ctorGetScalarFreshSharedObjExclSrc ctorGetScalarFreshSharedObjExclTrueTgt).symRetEquiv
+#guard !(validateTranslationDecl ctorGetScalarFreshSharedObjExclSrc ctorGetScalarFreshSharedObjExclTrueTgt).passed
+
+private def immReboundPtrExclSrc : LNIRDecl :=
+  { name := "imm_rebound_ptr_excl"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i1
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 1 .objPtr (.allocCtor 0 [] []) <|
+      .incRef 1 1 <|
+      .letBind 0 .objPtr (.scalar (.var 1)) <|
+      .letBind 2 .i1 (.isExclusive 0) <|
+      .decRef 1 2 <|
+      .ret 2 }
+
+private def immReboundPtrExclTrueTgt : LNIRDecl :=
+  { immReboundPtrExclSrc with
+    body :=
+      .letBind 1 .objPtr (.allocCtor 0 [] []) <|
+      .incRef 1 1 <|
+      .letBind 0 .objPtr (.scalar (.var 1)) <|
+      .letBind 2 .i1 (.scalar (.constBool true)) <|
+      .decRef 1 2 <|
+      .ret 2 }
+
+#guard !checkSingleSample 1024 (VarEnv.empty.bind 0 (.u64 7)) HeapState.empty
+  immReboundPtrExclSrc.body immReboundPtrExclTrueTgt.body
+#guard !(validateTranslationDecl immReboundPtrExclSrc immReboundPtrExclTrueTgt).symRetEquiv
+#guard !(validateTranslationDecl immReboundPtrExclSrc immReboundPtrExclTrueTgt).passed
 
 /-! ## JSON & Human-Readable Formatting for `TVModuleReport` -/
 
