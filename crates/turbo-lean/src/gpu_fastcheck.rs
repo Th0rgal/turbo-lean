@@ -4833,7 +4833,7 @@ pub fn evaluate_agent_step_value(
                 if let Some(ref st_path) = st_path_opt {
                     let src_b3 = blake3::hash(src_text.as_bytes()).to_hex().to_string();
                     let entry = crate::lake_build::ShmCachedFileSplit {
-                        split_key: format!("file-split:v6:{}", src_b3),
+                        split_key: format!("file-split:v8:{}", src_b3),
                         src_blake3: src_b3,
                         split: crate::lake_build::compact_split_for_shm_cache(&sp),
                         prefix_src: if src_text.len() <= 64 * 1024 {

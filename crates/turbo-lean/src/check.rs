@@ -76,7 +76,8 @@ elab "{command}" cmd:command : command => do
 set_option warningAsError false
 set_option warn.sorry false
 {command}
-{signature} := by sorry
+{signature}
+:= by sorry
 "#
     );
     let path = project_dir.join(format!("_turbo_identity_{nonce}.lean"));
@@ -156,7 +157,7 @@ fn cache_shm_stat_split(
         let st_path = shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
         let src_b3 = blake3::hash(active_src.as_bytes()).to_hex().to_string();
         let entry = ShmCachedFileSplit {
-            split_key: format!("file-split:v6:{}", src_b3),
+            split_key: format!("file-split:v8:{}", src_b3),
             src_blake3: src_b3,
             split: compact_split_for_shm_cache(split),
             prefix_src: String::new(),
@@ -884,7 +885,7 @@ fn run_check_command_inner(
             let src_b3 = blake3::hash(loaded_src.as_bytes()).to_hex().to_string();
             if let Some((ref st_path, _)) = st_paths_opt {
                 let entry = ShmCachedFileSplit {
-                    split_key: format!("file-split:v6:{}", src_b3),
+                    split_key: format!("file-split:v8:{}", src_b3),
                     src_blake3: src_b3.clone(),
                     split: compact_split_for_shm_cache(&sp),
                     prefix_src: String::new(),
@@ -923,7 +924,7 @@ fn run_check_command_inner(
                     split_key: if src_b3.is_empty() {
                         String::new()
                     } else {
-                        format!("file-split:v6:{}", src_b3)
+                        format!("file-split:v8:{}", src_b3)
                     },
                     src_blake3: src_b3,
                     split: compact_split_for_shm_cache(&fast_res.0),
@@ -1657,7 +1658,7 @@ fn check_single_decl(
                         let st_path =
                             shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
                         let entry = ShmCachedFileSplit {
-                            split_key: format!("file-split:v6:{}", sub_b3),
+                            split_key: format!("file-split:v8:{}", sub_b3),
                             src_blake3: sub_b3.clone(),
                             split: compact_split_for_shm_cache(&sub_split),
                             prefix_src: if sub_src.len() <= 64 * 1024 {
@@ -4576,19 +4577,31 @@ but is expected to have type
         let canon_file = file.canonicalize().unwrap();
         let (ms, mn, sz) = TurboStore::extract_file_stat_tuple(&fs::metadata(&file).unwrap());
         let pk = canon_file.to_string_lossy();
-        let mut old_hash = blake3::Hasher::new();
-        old_hash.update(b"single-stat-split:v3\n");
-        old_hash.update(pk.as_bytes());
-        old_hash.update(b":");
-        old_hash.update(&ms.to_le_bytes());
-        old_hash.update(&mn.to_le_bytes());
-        old_hash.update(&sz.to_le_bytes());
-        let old_hash = old_hash.finalize().to_hex().to_string();
+        let hash_for_version = |version: &[u8]| {
+            let mut hash = blake3::Hasher::new();
+            hash.update(version);
+            hash.update(pk.as_bytes());
+            hash.update(b":");
+            hash.update(&ms.to_le_bytes());
+            hash.update(&mn.to_le_bytes());
+            hash.update(&sz.to_le_bytes());
+            hash.finalize().to_hex().to_string()
+        };
+        let old_hash = hash_for_version(b"single-stat-split:v3\n");
         let splits_dir = shm_file_splits_dir(&store);
         let old_path = splits_dir.join(format!("st_{}.json", &old_hash[..24]));
         fs::write(&old_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        // The previous PR head stored nonempty, but lexically wrong, identities.
+        let stale_hash = hash_for_version(b"single-stat-split:v6\n");
+        let stale_path = splits_dir.join(format!("st_{}.json", &stale_hash[..24]));
+        for shard in legacy["split"]["shards"].as_array_mut().unwrap() {
+            shard["qualified_name"] = serde_json::json!("Wrong.same");
+        }
+        fs::write(&stale_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
         let new_hash = compute_single_stat_hash(&pk, ms, mn, sz);
         assert_ne!(new_hash, old_hash);
+        assert_ne!(new_hash, stale_hash);
 
         let result = evaluate_check_command_value(
             &mut store,
@@ -4638,6 +4651,7 @@ but is expected to have type
             evaluate_check_command_value(&mut store, file, Some("B.same".into()), proj).is_err()
         );
         let _ = fs::remove_file(old_path);
+        let _ = fs::remove_file(stale_path);
         let _ = fs::remove_file(splits_dir.join(format!("st_{}.json", &new_hash[..24])));
         let _ = fs::remove_dir_all(dir);
     }
