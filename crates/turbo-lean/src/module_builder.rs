@@ -2013,7 +2013,7 @@ pub fn parse_lakefile_toml(
         }
     }
     check_empty_roots(&pkg, &empty_roots)?;
-    finalize_package_config(&mut pkg, is_root_pkg, toml_path, &raw_hash)?;
+    finalize_package_config(&mut pkg, is_root_pkg, toml_path, &raw_hash, &empty_roots)?;
     Ok(pkg)
 }
 fn parse_lean_string_array_expr(expr: &str) -> Result<Vec<String>> {
@@ -2725,8 +2725,10 @@ fn lakefile_lexical_guard(
             let head = head
                 .strip_prefix("@[default_target]")
                 .map_or(head, str::trim_start);
-            if !matches!(head, "package" | "lean_lib" | "lean_exe" | "require")
-                || !pre.ends_with(char::is_whitespace)
+            let in_name_literal = matches!(prev, Some('`' | '.'));
+            if !in_name_literal
+                && (!matches!(head, "package" | "lean_lib" | "lean_exe" | "require")
+                    || !pre.ends_with(char::is_whitespace))
             {
                 return Err("`«»` outside a target name".into());
             }
@@ -3640,7 +3642,7 @@ pub fn parse_lakefile_lean(
         }
     }
     check_empty_roots(&pkg, &empty_roots)?;
-    finalize_package_config(&mut pkg, is_root_pkg, lean_path, &raw_hash)?;
+    finalize_package_config(&mut pkg, is_root_pkg, lean_path, &raw_hash, &empty_roots)?;
     Ok(pkg)
 }
 #[allow(clippy::too_many_arguments)]
@@ -3676,9 +3678,11 @@ where
             let mut words = rest.split_whitespace();
             let name_ok = rest.starts_with(char::is_whitespace)
                 && words.next().is_some_and(|n| {
+                    // `«name»` or Lake's `"name"` (`lake init` emits `package "demo" where`).
                     let n = n
                         .strip_prefix('«')
                         .and_then(|n| n.strip_suffix('»'))
+                        .or_else(|| n.strip_prefix('"').and_then(|n| n.strip_suffix('"')))
                         .unwrap_or(n);
                     n.split('.').all(|seg| {
                         !seg.is_empty()
@@ -3887,9 +3891,11 @@ fn finalize_package_config(
     is_root_pkg: bool,
     config_path: &Path,
     raw_hash: &str,
+    explicit_empty_roots: &BTreeSet<usize>,
 ) -> Result<()> {
-    for lib in &mut pkg.libs {
-        if lib.roots.is_empty() && !lib.name.is_empty() {
+    for (i, lib) in pkg.libs.iter_mut().enumerate() {
+        // Lake's default `roots` is `#[name]`; an explicit `roots = []` stays empty.
+        if lib.roots.is_empty() && !lib.name.is_empty() && !explicit_empty_roots.contains(&i) {
             lib.roots.push(lib.name.clone());
         }
         if lib.globs.is_empty() {
@@ -4300,87 +4306,9 @@ pub(crate) fn resolve_module_in_package(
                 .map(|h| format!("{}:{}", e.name, h))
         })
         .collect();
-    // 1. Check matching lean_lib by root prefix first
-    for lib in &pkg.libs {
-        let lib_src = match &lib.src_dir {
-            Some(sd) => pkg_src_base.join(sd),
-            None => pkg_src_base.clone(),
-        };
-        let matches_root = lib
-            .roots
-            .iter()
-            .any(|r| mod_name == r || mod_name.starts_with(&format!("{}.", r)));
-        if matches_root {
-            let cand = lib_src.join(format!("{}.lean", rel_slash));
-            if cand.is_file() {
-                let (strong_args, weak_args) = compose_effective_args(
-                    pkg,
-                    &lib.lean_options,
-                    &lib.more_lean_args,
-                    &lib.weak_lean_args,
-                );
-                let precompile = lib.precompile_modules.unwrap_or(pkg.precompile_modules)
-                    || lib
-                        .default_facets
-                        .iter()
-                        .any(|f| f == "c" || f == "static" || f == "LeanLib.staticFacet");
-                return Some(DiscoveredModuleSpec {
-                    module_name: mod_name.to_string(),
-                    pkg_name: pkg.name.clone(),
-                    target_name: lib.name.clone(),
-                    is_root_pkg,
-                    pkg_root: pkg.pkg_root.clone(),
-                    src_root: lib_src,
-                    src_path: cand,
-                    build_lib_lean_dir,
-                    build_ir_dir,
-                    precompile_modules: precompile,
-                    is_exe_target: false,
-                    strong_args,
-                    weak_args,
-                    extern_lib_digests: extern_digests,
-                    pkg_config_digest: pkg.config_digest.clone(),
-                });
-            }
-        }
-    }
-    // 2. Check any lean_lib src_dir
-    for lib in &pkg.libs {
-        let lib_src = match &lib.src_dir {
-            Some(sd) => pkg_src_base.join(sd),
-            None => pkg_src_base.clone(),
-        };
-        let cand = lib_src.join(format!("{}.lean", rel_slash));
-        if cand.is_file() {
-            let (strong_args, weak_args) = compose_effective_args(
-                pkg,
-                &lib.lean_options,
-                &lib.more_lean_args,
-                &lib.weak_lean_args,
-            );
-            let precompile = lib.precompile_modules.unwrap_or(pkg.precompile_modules);
-            return Some(DiscoveredModuleSpec {
-                module_name: mod_name.to_string(),
-                pkg_name: pkg.name.clone(),
-                target_name: lib.name.clone(),
-                is_root_pkg,
-                pkg_root: pkg.pkg_root.clone(),
-                src_root: lib_src,
-                src_path: cand,
-                build_lib_lean_dir,
-                build_ir_dir,
-                precompile_modules: precompile,
-                is_exe_target: false,
-                strong_args,
-                weak_args,
-                extern_lib_digests: extern_digests,
-                pkg_config_digest: pkg.config_digest.clone(),
-            });
-        }
-    }
-    // 3. Check lean_exe roots
+    // 1. An executable whose root is the module (Lake checks executables first).
     for exe in &pkg.exes {
-        if exe.root == mod_name || exe.name == mod_name {
+        if exe.root == mod_name {
             let exe_src = match &exe.src_dir {
                 Some(sd) => pkg_src_base.join(sd),
                 None => pkg_src_base.clone(),
@@ -4414,9 +4342,57 @@ pub(crate) fn resolve_module_in_package(
             }
         }
     }
-    // 4. Fallback to package src_dir directly
+    // 2. Like Lake's `findTargetModule?`: the last library that can build the module, i.e.
+    //    one of its globs matches it or it lies under one of its roots.
+    for lib in pkg.libs.iter().rev() {
+        let lib_src = match &lib.src_dir {
+            Some(sd) => pkg_src_base.join(sd),
+            None => pkg_src_base.clone(),
+        };
+        let under = |p: &str| mod_name.starts_with(&format!("{}.", p));
+        let buildable = lib.roots.iter().any(|r| mod_name == r || under(r))
+            || lib.globs.iter().any(|g| match g {
+                GlobSpec::One(m) => mod_name == m,
+                GlobSpec::Submodules(p) => under(p),
+                GlobSpec::AndSubmodules(p) => mod_name == p || under(p),
+            });
+        if buildable {
+            let cand = lib_src.join(format!("{}.lean", rel_slash));
+            if cand.is_file() {
+                let (strong_args, weak_args) = compose_effective_args(
+                    pkg,
+                    &lib.lean_options,
+                    &lib.more_lean_args,
+                    &lib.weak_lean_args,
+                );
+                let precompile = lib.precompile_modules.unwrap_or(pkg.precompile_modules)
+                    || lib
+                        .default_facets
+                        .iter()
+                        .any(|f| f == "c" || f == "static" || f == "LeanLib.staticFacet");
+                return Some(DiscoveredModuleSpec {
+                    module_name: mod_name.to_string(),
+                    pkg_name: pkg.name.clone(),
+                    target_name: lib.name.clone(),
+                    is_root_pkg,
+                    pkg_root: pkg.pkg_root.clone(),
+                    src_root: lib_src,
+                    src_path: cand,
+                    build_lib_lean_dir,
+                    build_ir_dir,
+                    precompile_modules: precompile,
+                    is_exe_target: false,
+                    strong_args,
+                    weak_args,
+                    extern_lib_digests: extern_digests,
+                    pkg_config_digest: pkg.config_digest.clone(),
+                });
+            }
+        }
+    }
+    // 3. A package without targets: its source directory (Lake has no target to ask).
     let cand = pkg_src_base.join(format!("{}.lean", rel_slash));
-    if cand.is_file() {
+    if pkg.libs.is_empty() && pkg.exes.is_empty() && cand.is_file() {
         let (strong_args, weak_args) = compose_effective_args(pkg, &BTreeMap::new(), &[], &[]);
         return Some(DiscoveredModuleSpec {
             module_name: mod_name.to_string(),
@@ -8567,6 +8543,72 @@ lean_exe «demo-exe» where
                 ("weak.linter.style.longFile".to_string(), "1500".to_string()),
             ])
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_lake_init_templates_and_module_resolution_follow_lake() {
+        // Gemini r9: `lake init demo std.lean` output, `«»` in name literals.
+        let dir = make_temp_test_dir("lake_init_resolution");
+        let lf = dir.join("lakefile.lean");
+        fs::write(
+            &lf,
+            "import Lake\nopen Lake DSL\n\npackage \"demo\" where\n  version := v!\"0.1.0\"\n\nlean_lib «Demo» where\n  -- add library configuration options here\n\n@[default_target]\nlean_exe \"demo\" where\n  root := `Main\n",
+        )
+        .unwrap();
+        let pkg = parse_lakefile_lean(&dir, &lf, true).unwrap();
+        assert_eq!(pkg.name, "demo");
+        assert_eq!(pkg.libs[0].name, "Demo");
+        assert_eq!(pkg.exes[0].name, "demo");
+        fs::write(
+            &lf,
+            "import Lake\nopen Lake DSL\npackage «p» where\n  defaultTargets := #[`«demo-exe»]\nlean_exe «demo-exe» where\n  root := `Main\n",
+        )
+        .unwrap();
+        let pkg = parse_lakefile_lean(&dir, &lf, true).unwrap();
+        assert_eq!(pkg.default_targets, vec!["demo-exe".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+
+        // Module-to-target resolution follows Lake's `findTargetModule?`.
+        let dir = make_temp_test_dir("lake_resolution");
+        let tf = dir.join("lakefile.toml");
+        let touch = |rel: &str| {
+            let f = dir.join(rel);
+            fs::create_dir_all(f.parent().unwrap()).unwrap();
+            fs::write(f, "").unwrap();
+        };
+        for f in [
+            "Demo.lean",
+            "Main.lean",
+            "Guest.lean",
+            "Tools.lean",
+            "Tools/Helper.lean",
+            "Parent.lean",
+            "Parent/Child/Leaf.lean",
+        ] {
+            touch(f);
+        }
+        let target = |toml: &str, module: &str| {
+            fs::write(&tf, toml).unwrap();
+            let pkg = parse_lakefile_toml(&dir, &tf, true).unwrap();
+            resolve_module_in_package(&pkg, true, module).map(|m| m.target_name)
+        };
+        // An executable's root belongs to the executable, not to a library sharing srcDir.
+        let std_toml = "name = \"demo\"\ndefaultTargets = [\"demo\"]\n[[lean_lib]]\nname = \"Demo\"\n[[lean_exe]]\nname = \"demo\"\nroot = \"Main\"\n";
+        assert_eq!(target(std_toml, "Main").as_deref(), Some("demo"));
+        assert_eq!(target(std_toml, "Demo").as_deref(), Some("Demo"));
+        // `roots = []` + `globs = ["Tools.+"]`: submodules belong to that library, and
+        // `Tools` itself is no library's module.
+        let tools = "name = \"Guest\"\n[[lean_lib]]\nname = \"Guest\"\n[[lean_lib]]\nname = \"HelperLib\"\nroots = []\nglobs = [\"Tools.+\"]\n";
+        assert_eq!(target(tools, "Tools.Helper").as_deref(), Some("HelperLib"));
+        assert_eq!(target(tools, "Tools"), None);
+        // Later libraries win (`findSomeRev?`).
+        let nested = "name = \"P\"\n[[lean_lib]]\nname = \"Parent\"\n[[lean_lib]]\nname = \"Parent.Child\"\n";
+        assert_eq!(
+            target(nested, "Parent.Child.Leaf").as_deref(),
+            Some("Parent.Child")
+        );
+        assert_eq!(target(nested, "Parent").as_deref(), Some("Parent"));
         let _ = fs::remove_dir_all(&dir);
     }
 
