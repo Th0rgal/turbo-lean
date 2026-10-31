@@ -29,7 +29,8 @@
     "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
     "08d4bf83f7a35786144bd07f83447f2cf6dced9a",
     "e87a5aa68f5d9e2d0a7a2d7e0c0ae36063b14552",
-    "75ec10efe2f3a16c38fc5d846be69cc4c2e949b4"
+    "75ec10efe2f3a16c38fc5d846be69cc4c2e949b4",
+    "1acfcfc314bcd8b96e16b3f48f0f7aa5bede8394"
   ],
   "toolchain": "leanprover/lean4:v4.34.1",
   "toolchain_commit": "5045d0056413266e57c625dcd7c365b10e377c52",
