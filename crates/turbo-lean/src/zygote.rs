@@ -3385,14 +3385,24 @@ fn write_eval_shm_cache(path: &Path, bytes: &[u8]) {
     static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     // A failed write (e.g. ENOSPC) also counts: evict so a full cache can recover.
     let wrote = crate::shm_cache::atomic_write_shm(path, bytes).is_ok();
-    if !wrote
-        || WRITES
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            .is_multiple_of(32)
+    let Some(dir) = path.parent() else { return };
+    if !wrote {
+        // Pressure-driven: the quota may not be exceeded yet (small or shared /dev/shm), so
+        // halve what the cache holds and retry once.
+        let held: u64 = fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.metadata().ok())
+            .map(|m| m.len())
+            .sum();
+        let _ = crate::shm_cache::enforce_shm_quota_lru(dir, (held / 2).max(1));
+        let _ = crate::shm_cache::atomic_write_shm(path, bytes);
+    } else if WRITES
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .is_multiple_of(32)
     {
-        if let Some(dir) = path.parent() {
-            let _ = crate::shm_cache::enforce_shm_quota_lru(dir, 0);
-        }
+        let _ = crate::shm_cache::enforce_shm_quota_lru(dir, 0);
     }
 }
 
