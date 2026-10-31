@@ -9,7 +9,7 @@
 </p>
 
 `turbo-lean` unifies the incremental verification oracle (`TurboLean`) and the verified native compiler (`LeanNative`) on top of [`lean-sys`](https://github.com/Th0rgal/lean-sys):
-1. **Sub-2ms Agent & Proof Verification Loops**: Verify edited theorems in **`~2 ms`** via warm `ZygoteWorker` checkpoints, reject false lemmas in **`< 1 ms`** on CPU SIMD / CUDA / Metal, and certify & triage counterexamples (`CandidateBug | SpecTooStrong | ReferenceDiscrepancy`) in **`~3 ns`** via in-process C-ABI gates.
+1. **Sub-2ms Agent & Proof Verification Loops**: Verify edited theorems in **`~2 ms`** via warm `ZygoteWorker` checkpoints, reject false lemmas in **`< 1 ms`** on CPU SIMD / CUDA / Metal, and triage counterexamples (`CandidateBug | SpecTooStrong | ReferenceDiscrepancy`) only after the candidate statement is re-evaluated (`certification: "eval"`). Unequal witness pairs and evaluation errors stay `certification: "unavailable"`.
 2. **Verified Native Compilation & Acceleration Plugins (`@[simd]`, `@[gpu]`, `@[tpu]`)**: Lower pure Lean 4 / `LNIR` kernels to zero-copy C99/Rust FFI, AVX2 / AVX-512 / ARM64 NEON SIMD, NVIDIA CUDA PTX, Apple Metal 3.0 MSL, and Google Cloud TPU v6e (`StableHLO` / `Pallas`) with **203 kernel-checked refinement & soundness theorems** (`<!-- inventory:leannative_tight_specs -->120/120<!-- /inventory:leannative_tight_specs -->` tight specs in `LeanNative/Spec.lean`, `0 sorryAx`).
 3. **Adversarial Anti-Reward-Hacking Gate**: Enforce in-kernel transitive axiom checks (`{propext, Quot.sound, Classical.choice}`), block macro-hidden `sorryAx` / `native_decide` / `extern` / `implemented_by` / `unsafe` bypasses, pin theorem statements in `< 10 µs`, and emit Ed25519/BLAKE3 receipts.
 
@@ -35,7 +35,7 @@
 
 1. **In-Process C-ABI Oracle & Counterexample Triage (`libturbo_spec_cabi.a`)**
    - Links **<!-- inventory:turbo_cabi_exports -->76<!-- /inventory:turbo_cabi_exports --> zero-runtime C-ABI symbols** (<!-- inventory:turbo_cabi_breakdown -->`41 turbo_spec_*` + `26 leansys_*` + `9 leannative_*`/`lean_native_*`<!-- /inventory:turbo_cabi_breakdown -->) directly into the binary, verified at compile time via `nm` (`owner_count == 1`, `0` undefined symbols).
-   - Evaluates candidate counterexamples in-process through `leannative_certify_cex_witnesses`, `leannative_fastcheck_rewrite_step`, and `leansys_verify_counterexample_triage`, classifying every falsified conjecture into `CandidateBug`, `SpecTooStrong` (vacuous precondition), or `ReferenceDiscrepancy` (domain hazard such as div/mod by zero or shift `>= 64`).
+   - Evaluates candidate counterexamples in-process through `leannative_fastcheck_rewrite_step` and `leansys_verify_counterexample_triage`. A counterexample is certified only when the candidate statement is re-evaluated on the recorded witness (`certification: "eval"`). Raw unequal pairs and evaluation errors stay uncertified (`certification: "unavailable"`). Falsified conjectures are then classified into `CandidateBug`, `SpecTooStrong` (vacuous precondition), or `ReferenceDiscrepancy` (domain hazard such as div/mod by zero or shift `>= 64`).
 2. **Multi-Agent CAS & Memory Governor (`~/.cache/turbo-lean/`)**
    - Coalesces concurrent builds across worktrees via `flock` singleflight, shares immutable `BLAKE3`-addressed `.olean`/shard blobs via reflinks/hardlinks, and bounds RAM (`--max-memory-mb`) with `have`-block proof fission.
 3. **Tight Formal Specifications (`0 sorryAx`)**
@@ -119,7 +119,7 @@ These controls suppress main-clone build/package copying and linking, build-outp
 | **`lfglabs-dev/verity` (`Uint256.add_comm`, 1/53 decls)** | `3,587.5 ms` | **`2.80 ms`** | **`1,280x`** (warm `ZygoteWorker`) |
 | **`lfglabs-dev/verity` (`pr-verify --base HEAD`, 9,275 shards)** | `9,999.4 ms` | **`23.89 ms`** | **`419x`** (full-suffix BLAKE3 + statement pinning) |
 | **`verify-receipt` (695 files, 9,275 shards)** | `> 10,000 ms` | **`0.58 ms`** | **`17,390x`** |
-| **In-Process C-ABI `FastCheck` & Counterexample Triage** | `40 µs` (IPC) | **`~0.003 µs` (`3 ns`)** | **`~13,000x`** vs JSON-RPC subprocess |
+| **In-Process Statement Re-evaluation & Counterexample Triage** | `40 µs` (IPC) | **statement re-eval** | Unequal pairs are not certificates |
 | **1M-State 256-Bit GPU `fast-check` (NVIDIA GB10)** | — | **`0.71 ms`** | **`1,410 M states/s`** (`CuDenote` on `dgx-spark`) |
 | **293-Mutant × 10k-Tx GPU Campaign (NVIDIA GB10)** | — | **`2.97 ms`** | **`292 / 293` mutants killed (`99.7%`)** |
 

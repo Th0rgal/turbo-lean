@@ -99,12 +99,37 @@ def extractRpcStringField (line : String) (key : String) : Option String :=
   let (root, params) := parseRpcTapes line
   JsonTape.lookupString? root key <|> (params.bind fun p => JsonTape.lookupString? p key)
 
-private def invalidRpcWire (line : String) : Bool :=
+private def invalidRpcWireKey (line : String) (key : String) : Bool :=
   let (root, params) := parseRpcTapes line
-  let fields := [JsonTape.lookupSlice? root "wire", params.bind (fun p => JsonTape.lookupSlice? p "wire")]
+  let fields := [JsonTape.lookupSlice? root key, params.bind (fun p => JsonTape.lookupSlice? p key)]
   fields.any fun field => match field with
     | none => false
     | some (_, isString) => !isString
+
+private def invalidRpcWire (line : String) : Bool :=
+  invalidRpcWireKey line "wire"
+
+private def extractRpcStrictStringField (line : String) (key : String) : Option String :=
+  let (root, params) := parseRpcTapes line
+  let sliceOpt := JsonTape.lookupSlice? root key <|> (params.bind fun p => JsonTape.lookupSlice? p key)
+  match sliceOpt with
+  | some (s, true) => some s.toStringLossy
+  | _ => none
+
+private def lookupWitnessField (line : String) (key : String) : Option String :=
+  let (root, params) := parseRpcTapes line
+  let bindings :=
+    (JsonTape.lookupSlice? root "bindings" <|> (params.bind fun p => JsonTape.lookupSlice? p "bindings")).map
+      fun (bs, _) => JsonTape.indexJsonObject bs
+  let sliceOpt :=
+    (bindings.bind fun b => JsonTape.lookupSlice? b key) <|>
+    (params.bind fun p => JsonTape.lookupSlice? p key) <|>
+    JsonTape.lookupSlice? root key
+  match sliceOpt with
+  | some (s, _) =>
+    let raw := s.toStringLossy
+    if raw == "null" then none else some raw
+  | none => none
 
 def hasRpcBoolField (line : String) (key : String) (expected : Bool) : Bool :=
   let (root, params) := parseRpcTapes line
@@ -189,9 +214,82 @@ def handleFastWorkerRequest? (engineName line : String) : Option String :=
   | "ping" =>
     some s!"\{\"id\":{reqId},\"ok\":true,\"result\":\{\"status\":\"pong\",\"engine\":\"{engineName}\",\"version\":\"0.5.0\",\"decls\":8}}"
   | "eval-cex" =>
-    let witnessEnv := (VarEnv.empty.bind 1 (.u64 1000000)).bind 0 (.u64 1000042)
-    let certified := certifyCounterexample 128 evmConstrainedBuggyPropDecl witnessEnv HeapState.empty
-    some s!"\{\"id\":{reqId},\"ok\":true,\"result\":\{\"declName\":\"evm_constrained_buggy_prop\",\"certified\":{certified},\"falsePositives\":0,\"theorem\":\"LeanNative.Backend.FastCheck.certifyCounterexample_no_false_positive\",\"report\":\{\"counterexamplesFound\":1,\"vacuousPasses\":0,\"falsePositives\":0}}}"
+    if invalidRpcWireKey line "decl_wire" || invalidRpcWireKey line "declWire" then
+      some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"invalid_lnir_wire\"}"
+    else
+    let lhsRaw := (lookupWitnessField line "lhs").orElse (fun _ => lookupWitnessField line "lhs_value")
+    let rhsRaw := (lookupWitnessField line "rhs").orElse (fun _ => lookupWitnessField line "rhs_value")
+    let declWireRaw := (extractRpcStrictStringField line "decl_wire").orElse (fun _ => extractRpcStrictStringField line "declWire")
+    let parseHexNat? (h : String) : Option Nat :=
+      if h.isEmpty then none
+      else h.toList.foldlM (fun acc c =>
+        let d? :=
+          if '0' ≤ c && c ≤ '9' then some (c.toNat - '0'.toNat)
+          else if 'a' ≤ c && c ≤ 'f' then some (c.toNat - 'a'.toNat + 10)
+          else if 'A' ≤ c && c ≤ 'F' then some (c.toNat - 'A'.toNat + 10)
+          else none
+        d?.map (acc * 16 + ·)) 0
+    let parseIntNat? (raw : Option String) : Option Nat := raw.bind fun s =>
+      let t := s.trimAscii.toString
+      if t.startsWith "0x" || t.startsWith "0X" then
+        parseHexNat? ((t.drop 2).replace "_" "")
+      else (t.replace "_" "").toNat?
+    let parseU64? (raw : Option String) : Option UInt64 :=
+      (parseIntNat? raw).bind fun n => if n < 2 ^ 64 then some n.toUInt64 else none
+    match declWireRaw with
+    | some rawWire =>
+      match LNIRModule.fromWire? rawWire with
+      | none =>
+        some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"invalid_lnir_wire\"}"
+      | some m =>
+        if m.decls.any (fun (d : LNIRDecl) => d.assurance == .unsupported) then
+          some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"unsupported_assurance_level_decl\"}"
+        else
+          let declNameReq := (extractRpcStrictStringField line "decl").orElse (fun _ => extractRpcStrictStringField line "declName")
+          let declOpt := match declNameReq with
+            | some dn => m.decls.find? (fun (d : LNIRDecl) => d.name == dn)
+            | none => m.decls.head?
+          let bindParam? (p : LNIRParam) (rawVal : Option String) : Option Val :=
+            match p.ty with
+            | .i1 =>
+              rawVal.bind fun s =>
+                let t := s.trimAscii.toString
+                if t == "true" then some (.bool true)
+                else if t == "false" then some (.bool false)
+                else none
+            | .i8 => (parseIntNat? rawVal).bind fun n => if n < 2 ^ 8 then some (.u64 n.toUInt64) else none
+            | .i16 => (parseIntNat? rawVal).bind fun n => if n < 2 ^ 16 then some (.u64 n.toUInt64) else none
+            | .i32 => (parseIntNat? rawVal).bind fun n => if n < 2 ^ 32 then some (.u64 n.toUInt64) else none
+            | .i64 | .usize => (parseU64? rawVal).map Val.u64
+            | .u256 | .i256 =>
+              (parseIntNat? rawVal).bind fun n =>
+                if n < UInt256.modulusNat then some (.u256 (UInt256.ofNat n)) else none
+            | _ => none
+          let bindParams? (ps : List LNIRParam) : Option VarEnv :=
+            ps.foldlM (fun env p =>
+              let rawVal := lookupWitnessField line p.name
+              (bindParam? p rawVal).map (env.bind p.id ·)
+            ) VarEnv.empty
+          match declOpt with
+          | none =>
+            some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"decl_not_found\"}"
+          | some d =>
+            match bindParams? d.params with
+            | none =>
+              some s!"\{\"id\":{reqId},\"ok\":true,\"result\":\{\"declName\":\"{escapeJsonWorker d.name}\",\"certified\":false,\"falsePositives\":1,\"certification\":\"unavailable\",\"reason\":\"witness_not_bound\",\"theorem\":\"LeanNative.Backend.FastCheck.certifyCounterexample_no_false_positive\"}}"
+            | some witnessEnv =>
+              let preOk := checkPreconditionSatisfied 128 [] witnessEnv HeapState.empty d.body
+              let certified := preOk && certifyCounterexample 128 d witnessEnv HeapState.empty
+              let fp : Nat := if certified then 0 else 1
+              let reason := if certified then "null" else if !preOk then "\"precondition_failed\"" else "\"not_a_counterexample\""
+              some s!"\{\"id\":{reqId},\"ok\":true,\"result\":\{\"declName\":\"{escapeJsonWorker d.name}\",\"certified\":{certified},\"falsePositives\":{fp},\"certification\":\"{if certified then "evalCode" else "unavailable"}\",\"reason\":{reason},\"theorem\":\"LeanNative.Backend.FastCheck.certifyCounterexample_no_false_positive\"}}"
+    | none =>
+      match parseU64? lhsRaw, parseU64? rhsRaw with
+      | some lhs, some rhs =>
+        let reason := if lhs == rhs then "lhs_eq_rhs" else "statement_required"
+        some s!"\{\"id\":{reqId},\"ok\":true,\"result\":\{\"declName\":\"candidate_witness\",\"certified\":false,\"falsePositives\":1,\"certification\":\"unavailable\",\"reason\":\"{reason}\",\"theorem\":\"LeanNative.Backend.FastCheck.certifyCounterexample_no_false_positive\"}}"
+      | _, _ =>
+        some s!"\{\"id\":{reqId},\"ok\":true,\"result\":\{\"declName\":\"candidate_witness\",\"certified\":false,\"falsePositives\":1,\"certification\":\"unavailable\",\"reason\":\"missing_witness\",\"theorem\":\"LeanNative.Backend.FastCheck.certifyCounterexample_no_false_positive\"}}"
   | "select-target" =>
     let tripCount := extractRpcNatField line "trip_count" (extractRpcNatField line "tripCount" 65536)
     let tgt := LeanNative.Backend.selectOptimalComputeTarget tripCount

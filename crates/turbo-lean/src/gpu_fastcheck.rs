@@ -96,6 +96,8 @@ pub struct TranspiledCudaKernel {
     pub rhs_cuda_expr: String,
     pub preconditions_cuda: Vec<String>,
     pub cuda_source: String,
+    pub prop_str: String,
+    pub binder_hyps: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,7 +171,7 @@ fn is_ident_continue(c: char) -> bool {
 }
 
 #[derive(Debug, Clone)]
-struct ExtractedDecl {
+pub(crate) struct ExtractedDecl {
     name: String,
     binders: Vec<(Vec<String>, String)>,
     prop_str: String,
@@ -685,8 +687,8 @@ fn emit_cuda_expr(expr: &LeanExpr) -> Result<String> {
                 ("bitMux", 3) => "u256_bit_mux",
                 ("bitMaj", 3) => "u256_bit_maj",
                 ("bitParity", 3) => "u256_bit_parity",
-                ("mulDivDown", 3) => "u256_mul_div_down_val",
-                ("mulDivUp", 3) => "u256_mul_div_up_val",
+                ("mulDivDown" | "mulDiv", 3) => "u256_mul_div_down_checked",
+                ("mulDivUp", 3) => "u256_mul_div_up_checked",
                 ("packHalves", 4) => "packHalves",
                 ("mk", 4) => "make_u256",
                 _ => bail!(
@@ -875,6 +877,7 @@ pub fn transpile_lean_theorem_to_cuda(
 
     let mut params = Vec::new();
     let mut raw_hyp_exprs = Vec::new();
+    let mut binder_hyps = Vec::new();
 
     for (names, ty) in &extracted.binders {
         if let Some(cuda_ty) = classify_binder_cuda_type(ty) {
@@ -886,9 +889,12 @@ pub fn transpile_lean_theorem_to_cuda(
                 });
             }
         } else if let Ok(cond_expr) = parse_lean_expr_str(ty) {
+            binder_hyps.push(ty.clone());
             if emit_cuda_expr(&cond_expr).is_ok() {
                 flatten_conjunctions(cond_expr, &mut raw_hyp_exprs);
             }
+        } else {
+            binder_hyps.push(ty.clone());
         }
     }
 
@@ -1032,6 +1038,8 @@ pub fn transpile_lean_theorem_to_cuda(
         rhs_cuda_expr,
         preconditions_cuda,
         cuda_source,
+        prop_str: extracted.prop_str,
+        binder_hyps,
     })
 }
 
@@ -1284,7 +1292,16 @@ HD uint64_t lean_sub(uint64_t a, uint64_t b) {{
 HD u256 lean_sub(const u256& a, uint64_t b) {{ return u256_sub_with_borrow(a, u256_from_u64(b)).fst; }}
 
 HD u256 lean_mul(const u256& a, const u256& b) {{
-    return make_u256(a.w0 * b.w0, 0ULL, 0ULL, 0ULL);
+    uint64_t aw[4] = {{a.w0, a.w1, a.w2, a.w3}}, bw[4] = {{b.w0, b.w1, b.w2, b.w3}}, pw[4] = {{0ULL, 0ULL, 0ULL, 0ULL}};
+    for (int i = 0; i < 4; i++) {{
+        __uint128_t carry = 0;
+        for (int j = 0; j < 4 - i; j++) {{
+            __uint128_t cur = (__uint128_t)pw[i + j] + (__uint128_t)aw[i] * (__uint128_t)bw[j] + carry;
+            pw[i + j] = (uint64_t)cur;
+            carry = cur >> 64;
+        }}
+    }}
+    return make_u256(pw[0], pw[1], pw[2], pw[3]);
 }}
 HD uint64_t lean_mul(uint64_t a, uint64_t b) {{
     if (IS_NAT) {{
@@ -1296,6 +1313,57 @@ HD uint64_t lean_mul(uint64_t a, uint64_t b) {{
 
 HD uint64_t lean_div(uint64_t a, uint64_t b) {{ uint64_t bm = b & SCALAR_MASK; return bm == 0 ? 0ULL : (((a & SCALAR_MASK) / bm) & SCALAR_MASK); }}
 HD uint64_t lean_mod(uint64_t a, uint64_t b) {{ uint64_t am = a & SCALAR_MASK, bm = b & SCALAR_MASK; return bm == 0 ? am : ((am % bm) & SCALAR_MASK); }}
+HD int u256_div_mod_checked(const u256& a, const u256& d, u256* out_q, u256* out_r) {{
+    if ((d.w0 | d.w1 | d.w2 | d.w3) == 0ULL) return 0;
+    uint64_t aw[4] = {{a.w0, a.w1, a.w2, a.w3}};
+    uint64_t dw[4] = {{d.w0, d.w1, d.w2, d.w3}};
+    uint64_t rem[4] = {{0ULL, 0ULL, 0ULL, 0ULL}};
+    uint64_t quot[4] = {{0ULL, 0ULL, 0ULL, 0ULL}};
+    for (int bit = 255; bit >= 0; bit--) {{
+        uint64_t in_bit = (aw[bit / 64] >> (bit % 64)) & 1ULL;
+        uint64_t top = rem[3] >> 63;
+        rem[3] = (rem[3] << 1) | (rem[2] >> 63);
+        rem[2] = (rem[2] << 1) | (rem[1] >> 63);
+        rem[1] = (rem[1] << 1) | (rem[0] >> 63);
+        rem[0] = (rem[0] << 1) | in_bit;
+        int ge = top != 0ULL;
+        if (!ge) {{
+            for (int k = 3; k >= 0; k--) {{
+                if (rem[k] != dw[k]) {{ ge = rem[k] > dw[k]; break; }}
+                if (k == 0) ge = 1;
+            }}
+        }}
+        if (ge) {{
+            uint64_t borrow = 0ULL;
+            for (int k = 0; k < 4; k++) {{
+                uint64_t d1 = rem[k] - dw[k];
+                uint64_t b1 = rem[k] < dw[k];
+                uint64_t d2 = d1 - borrow;
+                uint64_t b2 = d1 < borrow;
+                rem[k] = d2;
+                borrow = b1 + b2;
+            }}
+            quot[bit / 64] |= 1ULL << (bit % 64);
+        }}
+    }}
+    *out_q = make_u256(quot[0], quot[1], quot[2], quot[3]);
+    *out_r = make_u256(rem[0], rem[1], rem[2], rem[3]);
+    return 1;
+}}
+HD u256 lean_div(const u256& a, const u256& b) {{
+    u256 q = u256_zero(), r = u256_zero();
+    if (!u256_div_mod_checked(a, b, &q, &r)) mark_nat_overflow();
+    return q;
+}}
+HD u256 lean_mod(const u256& a, const u256& b) {{
+    u256 q = u256_zero(), r = u256_zero();
+    if (!u256_div_mod_checked(a, b, &q, &r)) mark_nat_overflow();
+    return r;
+}}
+HD u256 lean_div(const u256& a, uint64_t b) {{ return lean_div(a, u256_from_u64(b)); }}
+HD u256 lean_mod(const u256& a, uint64_t b) {{ return lean_mod(a, u256_from_u64(b)); }}
+HD u256 lean_div(uint64_t a, const u256& b) {{ return lean_div(u256_from_u64(a), b); }}
+HD u256 lean_mod(uint64_t a, const u256& b) {{ return lean_mod(u256_from_u64(a), b); }}
 HD uint64_t lean_shl(uint64_t a, uint64_t b) {{
     if (IS_NAT) {{
         if (a == 0ULL || b == 0ULL) return a;
@@ -1356,13 +1424,75 @@ HD u256 unpackLo128(const u256& s) {{ return make_u256(s.w0, s.w1, 0ULL, 0ULL); 
 HD u256 unpackHi128(const u256& s) {{ return make_u256(s.w2, s.w3, 0ULL, 0ULL); }}
 HD u256 mask128(const u256& s)     {{ return make_u256(s.w0, s.w1, 0ULL, 0ULL); }}
 HD u256 yul_min(const u256& a, const u256& b) {{ return lean_lt(b, a) ? b : a; }}
-HD u256 u256_mul_div_down_val(const u256& x, const u256& y, const u256& d) {{
-    if (d.w0 == 0ULL) return u256_zero();
-    return make_u256((x.w0 * y.w0) / d.w0, 0ULL, 0ULL, 0ULL);
+HD bool u256_is_zero(const u256& a) {{ return (a.w0 | a.w1 | a.w2 | a.w3) == 0ULL; }}
+HD int u256_mul_div_checked(const u256& x, const u256& y, const u256& d, int round_up, u256* out) {{
+    if (u256_is_zero(d)) return 0;
+    uint64_t aw[4] = {{x.w0, x.w1, x.w2, x.w3}};
+    uint64_t bw[4] = {{y.w0, y.w1, y.w2, y.w3}};
+    uint64_t dw[4] = {{d.w0, d.w1, d.w2, d.w3}};
+    uint64_t prod[8] = {{0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL}};
+    for (int i = 0; i < 4; i++) {{
+        __uint128_t carry = 0;
+        for (int j = 0; j < 4; j++) {{
+            __uint128_t cur = (__uint128_t)prod[i + j] + (__uint128_t)aw[i] * (__uint128_t)bw[j] + carry;
+            prod[i + j] = (uint64_t)cur;
+            carry = cur >> 64;
+        }}
+        prod[i + 4] = (uint64_t)carry;
+    }}
+    uint64_t rem[4] = {{0ULL, 0ULL, 0ULL, 0ULL}};
+    uint64_t rem_hi = 0ULL;
+    uint64_t quot[8] = {{0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL}};
+    for (int bit = 511; bit >= 0; bit--) {{
+        uint64_t in_bit = (prod[bit / 64] >> (bit % 64)) & 1ULL;
+        rem_hi = (rem_hi << 1) | (rem[3] >> 63);
+        rem[3] = (rem[3] << 1) | (rem[2] >> 63);
+        rem[2] = (rem[2] << 1) | (rem[1] >> 63);
+        rem[1] = (rem[1] << 1) | (rem[0] >> 63);
+        rem[0] = (rem[0] << 1) | in_bit;
+        int ge = rem_hi != 0ULL;
+        if (!ge) {{
+            for (int k = 3; k >= 0; k--) {{
+                if (rem[k] != dw[k]) {{ ge = rem[k] > dw[k]; break; }}
+                if (k == 0) ge = 1;
+            }}
+        }}
+        if (ge) {{
+            uint64_t borrow = 0ULL;
+            for (int k = 0; k < 4; k++) {{
+                uint64_t d1 = rem[k] - dw[k];
+                uint64_t b1 = rem[k] < dw[k];
+                uint64_t d2 = d1 - borrow;
+                uint64_t b2 = d1 < borrow;
+                rem[k] = d2;
+                borrow = b1 + b2;
+            }}
+            rem_hi -= borrow;
+            quot[bit / 64] |= 1ULL << (bit % 64);
+        }}
+    }}
+    int rem_nz = (rem[0] | rem[1] | rem[2] | rem[3]) != 0ULL;
+    if (round_up && rem_nz) {{
+        uint64_t carry = 1ULL;
+        for (int k = 0; k < 8; k++) {{
+            __uint128_t s = (__uint128_t)quot[k] + carry;
+            quot[k] = (uint64_t)s;
+            carry = (uint64_t)(s >> 64);
+        }}
+    }}
+    if ((quot[4] | quot[5] | quot[6] | quot[7]) != 0ULL) return 0;
+    *out = make_u256(quot[0], quot[1], quot[2], quot[3]);
+    return 1;
 }}
-HD u256 u256_mul_div_up_val(const u256& x, const u256& y, const u256& d) {{
-    if (d.w0 == 0ULL) return u256_zero();
-    return make_u256((x.w0 * y.w0 + (d.w0 - 1ULL)) / d.w0, 0ULL, 0ULL, 0ULL);
+HD u256 u256_mul_div_down_checked(const u256& x, const u256& y, const u256& d) {{
+    u256 out = u256_zero();
+    if (!u256_mul_div_checked(x, y, d, 0, &out)) mark_nat_overflow();
+    return out;
+}}
+HD u256 u256_mul_div_up_checked(const u256& x, const u256& y, const u256& d) {{
+    u256 out = u256_zero();
+    if (!u256_mul_div_checked(x, y, d, 1, &out)) mark_nat_overflow();
+    return out;
 }}
 
 HD uint64_t splitmix64_stateless(uint64_t x) {{
@@ -1755,45 +1885,381 @@ pub fn execute_transpiled_cuda_kernel(
         serde_json::from_str(last_line.trim()).context("Failed to parse transpiled kernel JSON")?;
     report.vacuous_precondition_warning =
         report.satisfied_preconditions == 0 && !kernel.preconditions_cuda.is_empty();
-    if let Ok((certified, version, _)) = certify_with_lean_native_core() {
-        if certified {
-            report.lean_native_certified = true;
-            report.lean_native_engine_version = version;
-        }
-    }
+    let (certified, version, _) =
+        certify_kernel_counterexample(kernel, report.counterexample.as_ref());
+    report.lean_native_certified = certified;
+    report.lean_native_engine_version = version;
     Ok(report)
 }
 
-/// Certify counterexamples in-process via the compiled `LeanNative/Spec.c` C-ABI
-/// (`leannative_certify_cex_witnesses`, `leannative_eval_u64_binop`, `leannative_fastcheck_rewrite_step`)
-/// linked directly into `libturbo_spec_cabi.a` with zero subprocess IPC.
-pub fn certify_with_lean_native_core() -> Result<(bool, String, serde_json::Value)> {
-    let span_ok = crate::c_abi::pack_slice_span_u64(0, 1, 0) != 0
-        && !crate::c_abi::leannative_has_domain_hazard_u64_safe(0, 1, 1);
-    let cabi_ok =
-        span_ok && crate::c_abi::leannative_certify_cex_witnesses_safe(1_000_000, 0, u64::MAX);
-    let a = [0u64, 0, 0, 0];
-    let b = [u64::MAX, u64::MAX, u64::MAX, u64::MAX];
-    let lhs: [u64; 4] =
-        std::array::from_fn(|k| !crate::c_abi::leannative_eval_u64_binop_safe(5, a[k], b[k]));
-    let rhs: [u64; 4] =
-        std::array::from_fn(|k| crate::c_abi::leannative_eval_u64_binop_safe(5, !a[k], !b[k]));
-    let triage_code = crate::c_abi::leannative_fastcheck_rewrite_step_safe(
-        lhs[0], rhs[0], 5, 5, a[0], b[0], false,
-    );
-    let certified = cabi_ok && lhs != rhs && triage_code == 3;
-    Ok((
-        certified,
+fn parse_hex_u64(raw: &str) -> Option<u64> {
+    let hex = raw.trim().replace('_', "");
+    (!hex.is_empty() && hex.len() <= 16 && hex.chars().all(|c| c.is_ascii_hexdigit()))
+        .then(|| u64::from_str_radix(&hex, 16).ok())
+        .flatten()
+}
+
+fn parse_u64_literal(raw: &str) -> Option<u64> {
+    let t = raw.trim();
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        return parse_hex_u64(hex);
+    }
+    if t.chars().all(|c| c.is_ascii_digit()) && !t.is_empty() && t.len() <= 20 {
+        return t.parse::<u64>().ok();
+    }
+    None
+}
+
+fn parse_u64_token(raw: &str) -> Option<u64> {
+    let t = raw.trim();
+    if t.eq_ignore_ascii_case("true") {
+        return Some(1);
+    }
+    if t.eq_ignore_ascii_case("false") {
+        return Some(0);
+    }
+    parse_u64_literal(t)
+}
+
+fn parse_witness_limbs(raw: &str) -> Option<Vec<u64>> {
+    let t = raw
+        .trim()
+        .trim_matches(|c| matches!(c, '(' | ')' | '"' | '\''));
+    if t.is_empty() {
+        return None;
+    }
+    if let Some((fst, snd)) = t.split_once(',') {
+        let mut limbs = parse_witness_limbs(fst)?;
+        let tail = parse_u64_token(snd)?;
+        if limbs.len() > 4 {
+            return None;
+        }
+        limbs.push(tail);
+        return Some(limbs);
+    }
+    if let Some(hex_body) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        let parts: Vec<&str> = hex_body
+            .split('_')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if parts.is_empty() || parts.len() > 4 {
+            return None;
+        }
+        let limbs: Option<Vec<u64>> = parts.iter().rev().map(|p| parse_hex_u64(p)).collect();
+        return limbs.filter(|v| !v.is_empty());
+    }
+    parse_u64_token(t).map(|v| vec![v])
+}
+
+fn unavailable_cert(reason: &str) -> (bool, String, serde_json::Value) {
+    (
+        false,
+        "unavailable".to_string(),
+        serde_json::json!({
+            "certified": false,
+            "certification": "unavailable",
+            "falsePositives": 1,
+            "reason": reason,
+            "engine": "lean-native-cabi-in-process"
+        }),
+    )
+}
+
+fn limbs_disagree(lhs: &[u64], rhs: &[u64]) -> bool {
+    let n = lhs.len().max(rhs.len());
+    (0..n).any(|i| lhs.get(i).copied().unwrap_or(0) != rhs.get(i).copied().unwrap_or(0))
+}
+
+fn parse_contract_state_witness(raw: &str) -> Option<FastVal> {
+    let t = raw.trim();
+    let inner = t
+        .strip_prefix("ContractState(")
+        .and_then(|s| s.strip_suffix(')'))?;
+    let (seed_part, updates_part) = inner.split_once(", updates=")?;
+    let seed_raw = seed_part.trim().strip_prefix("seed=")?.trim();
+    let seed = parse_u64_literal(seed_raw)?;
+    let updates_raw = updates_part.trim();
+    let body = updates_raw
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))?
+        .trim();
+    let mut updates = Vec::new();
+    if !body.is_empty() {
+        for item in body.split("),") {
+            let piece = item.trim().trim_matches(|c| matches!(c, '(' | ')' | ' '));
+            if piece.is_empty() {
+                continue;
+            }
+            let (k_raw, v_raw) = piece.split_once(',')?;
+            updates.push((parse_u64_literal(k_raw)?, parse_u64_literal(v_raw)?));
+        }
+    }
+    Some(FastVal::ContractState(seed, updates))
+}
+
+fn extracted_decl_from_kernel(kernel: &TranspiledCudaKernel) -> ExtractedDecl {
+    ExtractedDecl {
+        name: kernel.decl_name.clone(),
+        binders: kernel
+            .params
+            .iter()
+            .map(|p| (vec![p.name.clone()], p.lean_type.clone()))
+            .chain(kernel.binder_hyps.iter().map(|h| (Vec::new(), h.clone())))
+            .collect(),
+        prop_str: kernel.prop_str.clone(),
+    }
+}
+
+fn certify_kernel_counterexample(
+    kernel: &TranspiledCudaKernel,
+    witness: Option<&CounterexampleWitness>,
+) -> (bool, String, serde_json::Value) {
+    let Some(w) = witness else {
+        return unavailable_cert("missing_witness");
+    };
+    certify_checked_counterexample(
+        &extracted_decl_from_kernel(kernel),
+        &w.bindings,
+        &w.lhs_value,
+        &w.rhs_value,
+    )
+}
+
+/// Concrete witness values are not a certificate. Certification requires the candidate
+/// statement (`certify_checked_counterexample`).
+pub fn certify_candidate_witness(lhs: &str, rhs: &str) -> (bool, String, serde_json::Value) {
+    let (Some(l_limbs), Some(r_limbs)) = (parse_witness_limbs(lhs), parse_witness_limbs(rhs))
+    else {
+        return unavailable_cert("witness_not_u64");
+    };
+    if l_limbs.len() != r_limbs.len() {
+        let pair_mismatch =
+            l_limbs.len() == 5 || r_limbs.len() == 5 || !limbs_disagree(&l_limbs, &r_limbs);
+        if pair_mismatch {
+            return unavailable_cert(if !limbs_disagree(&l_limbs, &r_limbs) {
+                "lhs_eq_rhs"
+            } else {
+                "witness_not_u64"
+            });
+        }
+    } else if !limbs_disagree(&l_limbs, &r_limbs) {
+        return unavailable_cert("lhs_eq_rhs");
+    }
+    unavailable_cert("statement_required")
+}
+
+fn fastval_from_witness(raw: &str) -> Option<FastVal> {
+    let trimmed = raw.trim().trim_matches(|c| matches!(c, '"' | '\''));
+    if trimmed.starts_with("ContractState(") {
+        return parse_contract_state_witness(trimmed);
+    }
+    let t = trimmed.trim_matches(|c| matches!(c, '(' | ')'));
+    if t.eq_ignore_ascii_case("true") {
+        return Some(FastVal::Bool(true));
+    }
+    if t.eq_ignore_ascii_case("false") {
+        return Some(FastVal::Bool(false));
+    }
+    if let Some((fst, snd)) = t.split_once(',') {
+        let word = fastval_from_witness(fst)?.as_u256()?;
+        let flag = match snd.trim() {
+            "true" => true,
+            "false" => false,
+            _ => return None,
+        };
+        return Some(FastVal::U256BoolPair(word, flag));
+    }
+    let limbs = parse_witness_limbs(t)?;
+    match limbs.len() {
+        1 => Some(FastVal::U64(limbs[0])),
+        4 => Some(FastVal::U256([limbs[0], limbs[1], limbs[2], limbs[3]])),
+        _ => None,
+    }
+}
+
+fn fastvals_equal(lhs: &FastVal, rhs: &FastVal) -> bool {
+    match (lhs, rhs) {
+        (FastVal::U256(a), FastVal::U64(b)) => *a == [*b, 0, 0, 0],
+        (FastVal::U64(a), FastVal::U256(b)) => [*a, 0, 0, 0] == *b,
+        _ => lhs == rhs,
+    }
+}
+
+fn env_from_bindings(
+    decl: &ExtractedDecl,
+    bindings: &[(String, String)],
+) -> Option<(std::collections::HashMap<String, FastVal>, ScalarEvalDomain)> {
+    let mut params: Vec<(String, Stage1ParamKind)> = Vec::new();
+    for (names, ty) in &decl.binders {
+        if let Some(pk) = classify_stage1_param_kind(ty) {
+            for name in names {
+                params.push((name.clone(), pk));
+            }
+        }
+    }
+    if params.is_empty() {
+        return None;
+    }
+    let mut scalar_dom: Option<ScalarEvalDomain> = None;
+    for (_, pk) in &params {
+        if let Some(d) = pk.scalar_domain() {
+            if let Some(prev) = scalar_dom {
+                if prev != d {
+                    return None;
+                }
+            } else {
+                scalar_dom = Some(d);
+            }
+        }
+    }
+    let mut env = std::collections::HashMap::with_capacity(params.len());
+    for (name, raw) in bindings {
+        let pk = params.iter().find(|(n, _)| n == name).map(|(_, k)| *k)?;
+        let mut val = fastval_from_witness(raw)?;
+        match pk {
+            Stage1ParamKind::U256 => {
+                if let FastVal::U64(x) = val {
+                    val = FastVal::U256([x, 0, 0, 0]);
+                }
+                if !matches!(val, FastVal::U256(_)) {
+                    return None;
+                }
+            }
+            Stage1ParamKind::Bool => {
+                if !matches!(val, FastVal::Bool(_)) {
+                    return None;
+                }
+            }
+            Stage1ParamKind::ContractState => {
+                if !matches!(val, FastVal::ContractState(_, _)) {
+                    return None;
+                }
+            }
+            Stage1ParamKind::StorageKey => match val {
+                FastVal::U64(_) => {}
+                _ => return None,
+            },
+            _ => {
+                let FastVal::U64(x) = val else {
+                    return None;
+                };
+                if let Some(d) = pk.scalar_domain() {
+                    if !d.is_nat && d.mask(x) != x {
+                        return None;
+                    }
+                }
+            }
+        }
+        if env.insert(name.clone(), val).is_some() {
+            return None;
+        }
+    }
+    if env.len() != params.len() {
+        return None;
+    }
+    Some((env, scalar_dom.unwrap_or(ScalarEvalDomain::U64)))
+}
+
+/// Re-evaluate the candidate statement on the recorded bindings. A counterexample is
+/// certified only when every precondition holds and the conclusion evaluates to false.
+pub(crate) fn certify_checked_counterexample(
+    decl: &ExtractedDecl,
+    bindings: &[(String, String)],
+    lhs_value: &str,
+    rhs_value: &str,
+) -> (bool, String, serde_json::Value) {
+    let Some((env, dom)) = env_from_bindings(decl, bindings) else {
+        return unavailable_cert("witness_not_bound");
+    };
+    let mut hyps: Vec<LeanExpr> = Vec::new();
+    for (_, ty) in &decl.binders {
+        if classify_stage1_param_kind(ty).is_none() {
+            let Some(cond_expr) = parse_lean_expr_str(ty).ok() else {
+                return unavailable_cert("statement_not_evaluated");
+            };
+            flatten_conjunctions(cond_expr, &mut hyps);
+        }
+    }
+    let imp_segments = split_top_level_implications(&decl.prop_str);
+    let Some(conclusion_str) = imp_segments.last() else {
+        return unavailable_cert("statement_not_evaluated");
+    };
+    for pre_str in &imp_segments[..imp_segments.len().saturating_sub(1)] {
+        let Some(pre_expr) = parse_lean_expr_str(strip_hypothesis_binder_name(pre_str)).ok() else {
+            return unavailable_cert("statement_not_evaluated");
+        };
+        flatten_conjunctions(pre_expr, &mut hyps);
+    }
+    for hyp in &hyps {
+        match eval_lean_expr_fast_with_domain(hyp, &env, dom).and_then(|v| v.as_bool()) {
+            Some(true) => {}
+            Some(false) => return unavailable_cert("precondition_failed"),
+            None => return unavailable_cert("statement_not_evaluated"),
+        }
+    }
+    let (lhs_lean, rhs_lean, is_ne) = if let Some((l, r, ne)) = split_top_level_eq(conclusion_str) {
+        (l, r, ne)
+    } else {
+        (conclusion_str.clone(), "true".to_string(), false)
+    };
+    let (Some(lhs_ast), Some(rhs_ast)) = (
+        parse_lean_expr_str(&lhs_lean).ok(),
+        parse_lean_expr_str(&rhs_lean).ok(),
+    ) else {
+        return unavailable_cert("statement_not_evaluated");
+    };
+    let (Some(lv), Some(rv)) = (
+        eval_lean_expr_fast_with_domain(&lhs_ast, &env, dom),
+        eval_lean_expr_fast_with_domain(&rhs_ast, &env, dom),
+    ) else {
+        return unavailable_cert("statement_not_evaluated");
+    };
+    let Some(recorded_l) = fastval_from_witness(lhs_value) else {
+        return unavailable_cert("witness_not_u64");
+    };
+    let Some(recorded_r) = fastval_from_witness(rhs_value) else {
+        return unavailable_cert("witness_not_u64");
+    };
+    if !fastvals_equal(&lv, &recorded_l) || !fastvals_equal(&rv, &recorded_r) {
+        return unavailable_cert("witness_mismatch");
+    }
+    let holds = if is_ne {
+        !fastvals_equal(&lv, &rv)
+    } else {
+        fastvals_equal(&lv, &rv)
+    };
+    if holds {
+        return unavailable_cert("not_a_counterexample");
+    }
+    (
+        true,
         "0.5.0".to_string(),
         serde_json::json!({
-            "certified": certified,
+            "certified": true,
+            "certification": "eval",
             "falsePositives": 0,
-            "triageClassCode": triage_code,
-            "theorem": "LeanNative.Backend.certifyCounterexample_no_false_positive",
+            "lhs": lhs_value,
+            "rhs": rhs_value,
             "engine": "lean-native-cabi-in-process",
             "version": "0.5.0"
         }),
-    ))
+    )
+}
+
+pub(crate) fn certify_report_counterexample(
+    decl: &ExtractedDecl,
+    witness: Option<&CounterexampleWitness>,
+) -> (bool, String, serde_json::Value) {
+    match witness {
+        Some(w) => certify_checked_counterexample(decl, &w.bindings, &w.lhs_value, &w.rhs_value),
+        None => unavailable_cert("missing_witness"),
+    }
+}
+
+/// No candidate witness is supplied, so certification is unavailable.
+pub fn certify_with_lean_native_core() -> Result<(bool, String, serde_json::Value)> {
+    Ok(unavailable_cert("missing_witness"))
 }
 
 fn emit_builtin_fastcheck_ptx(sm_arch: &str) -> String {
@@ -2421,13 +2887,77 @@ end TurboLean.FastCheck
 
     #[test]
     fn test_lean_native_core_v03_cex_certification_and_ptx_emission() {
-        let (certified, version, result) = certify_with_lean_native_core().unwrap();
-        assert!(certified && matches!(version.as_str(), "0.5.0" | "0.3.0" | "0.3.0-builtin"));
-        assert_eq!(result["falsePositives"], 0);
-        assert!(result["theorem"]
-            .as_str()
-            .unwrap_or("")
-            .ends_with("certifyCounterexample_no_false_positive"));
+        let (no_witness_cert, no_witness_ver, no_witness_res) =
+            certify_with_lean_native_core().unwrap();
+        assert!(!no_witness_cert && no_witness_ver == "unavailable");
+        assert_eq!(no_witness_res["certification"], "unavailable");
+        assert_eq!(no_witness_res["falsePositives"], 1);
+        assert_eq!(no_witness_res["reason"], "missing_witness");
+
+        let (cert_u64, ver_u64, res_u64) = certify_candidate_witness("0x1000042", "0x0");
+        assert!(!cert_u64 && ver_u64 == "unavailable");
+        assert_eq!(res_u64["certification"], "unavailable");
+        assert_eq!(res_u64["falsePositives"], 1);
+        assert_eq!(res_u64["reason"], "statement_required");
+
+        let (cert_u256, ver_u256, res_u256) = certify_candidate_witness(
+            "0xffffffffffffffff_ffffffffffffffff_ffffffffffffffff_ffffffffffffffff",
+            "0x0000000000000000_0000000000000000_0000000000000000_0000000000000000",
+        );
+        assert!(!cert_u256 && ver_u256 == "unavailable");
+        assert_eq!(res_u256["reason"], "statement_required");
+
+        let raw_pair_summary = "sample#1: a=0xff, b=0x1 (lhs=(0x0000000000000000_0000000000000000_0000000000000000_0000000000000000, true), rhs=(0x0000000000000000_0000000000000000_0000000000000000_0000000000000000, false))";
+        let (cert_pair, _, res_pair) = certify_witness_summary(raw_pair_summary);
+        assert!(!cert_pair);
+        assert_eq!(res_pair["certification"], "unavailable");
+        assert_eq!(res_pair["reason"], "statement_required");
+
+        let de_morgan = "(a b : Word256) : Word256.bitNot (Word256.bitAnd a b) = Word256.bitAnd (Word256.bitNot a) (Word256.bitNot b)";
+        let summary = try_lnir_fast_reject("buggy_de_morgan", de_morgan)
+            .expect("buggy De Morgan must yield a witness")
+            .0;
+        let (checked, checked_ver, checked_details) =
+            certify_statement_witness("buggy_de_morgan", de_morgan, &summary);
+        assert!(checked && checked_ver == "0.5.0");
+        assert_eq!(checked_details["certification"], "eval");
+        assert_eq!(checked_details["falsePositives"], 0);
+        let valid_de_morgan = "(a b : Word256) : Word256.bitNot (Word256.bitAnd a b) = Word256.bitOr (Word256.bitNot a) (Word256.bitNot b)";
+        let (not_cex, _, not_cex_details) =
+            certify_statement_witness("valid_de_morgan", valid_de_morgan, &summary);
+        assert!(!not_cex);
+        assert_eq!(not_cex_details["certification"], "unavailable");
+
+        for (lhs, rhs, expected_reason) in [
+            ("0x2a", "0x2a", "lhs_eq_rhs"),
+            (
+                "0x0000000000000000_0000000000000000_0000000000000000_0000000000000007",
+                "0x7",
+                "lhs_eq_rhs",
+            ),
+            ("true", "true", "lhs_eq_rhs"),
+            ("not_a_witness", "0x0", "witness_not_u64"),
+            ("", "", "witness_not_u64"),
+            (
+                "(0x0000000000000000_0000000000000000_0000000000000000_0000000000000001, true)",
+                "0x1",
+                "witness_not_u64",
+            ),
+        ] {
+            let (ok, ver, details) = certify_candidate_witness(lhs, rhs);
+            assert!(
+                !ok && ver == "unavailable",
+                "unexpected cert for {lhs} vs {rhs}"
+            );
+            assert_eq!(details["certification"], "unavailable");
+            assert_eq!(details["reason"], expected_reason);
+        }
+
+        let (unparsed_ok, _, unparsed_details) =
+            certify_witness_summary("a = 0, b = 0 (violates `a + b < a`)");
+        assert!(!unparsed_ok);
+        assert_eq!(unparsed_details["certification"], "unavailable");
+        assert_eq!(unparsed_details["reason"], "witness_not_parsed");
 
         let ptx_code = emit_lean_native_fastcheck_code(true, "sm_90").unwrap();
         assert!(
@@ -2766,21 +3296,158 @@ pub fn try_tpu_xla_fast_reject(
     stmt_src: &str,
 ) -> Option<(String, Option<String>)> {
     if let Some((w, h)) = try_riscv_step_budget_fast_reject(decl_name, stmt_src) {
-        return Some((format!("[TPU-v5e-XLA certified] {}", w), Some(h)));
+        return Some((format!("[TPU-v5e-XLA uncertified] {}", w), Some(h)));
     }
     let (witness_summary, suggested_hypothesis) = try_lnir_fast_reject(decl_name, stmt_src)?;
-    let (certified, _, _) = certify_with_lean_native_core().unwrap_or((
-        true,
-        "0.5.0".to_string(),
-        serde_json::json!({}),
-    ));
+    let (certified, _, details) = certify_statement_witness(decl_name, stmt_src, &witness_summary);
     if !certified {
-        return None;
+        return Some((
+            format!("[TPU-v5e-XLA uncertified] {}", witness_summary),
+            suggested_hypothesis.or_else(|| {
+                details
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .map(|r| format!("certification unavailable: {}", r))
+            }),
+        ));
     }
     Some((
         format!("[TPU-v5e-XLA certified] {}", witness_summary),
         suggested_hypothesis,
     ))
+}
+
+fn extract_balanced_witness_token(rest: &str) -> Option<&str> {
+    let s = rest.trim_start();
+    if s.is_empty() {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut end = s.len();
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    end = i + ch.len_utf8();
+                    break;
+                }
+            }
+            ',' | ' ' | '\t' | '\n' if depth == 0 => {
+                end = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let tok = s[..end].trim();
+    (!tok.is_empty()).then_some(tok)
+}
+
+pub fn witness_pair_from_summary(summary: &str) -> Option<(String, String)> {
+    let lhs = extract_balanced_witness_token(summary.split("lhs=").nth(1)?)?;
+    let rhs = extract_balanced_witness_token(summary.split("rhs=").nth(1)?)?;
+    Some((lhs.to_string(), rhs.to_string()))
+}
+
+pub fn certify_witness_summary(summary: &str) -> (bool, String, serde_json::Value) {
+    match witness_pair_from_summary(summary) {
+        Some((lhs, rhs)) => certify_candidate_witness(&lhs, &rhs),
+        None => unavailable_cert("witness_not_parsed"),
+    }
+}
+
+fn parse_witness_bindings_segment(assigns: &str) -> Option<Vec<(String, String)>> {
+    let mut bindings = Vec::new();
+    let s = assigns.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    for (idx, ch) in s.char_indices() {
+        match ch {
+            '(' | '[' | '⟨' => depth += 1,
+            ')' | ']' | '⟩' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                let part = s[start..idx].trim();
+                let (name, raw) = part.split_once('=')?;
+                if name.trim().is_empty() || raw.trim().is_empty() {
+                    return None;
+                }
+                bindings.push((name.trim().to_string(), raw.trim().to_string()));
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = s[start..].trim();
+    let (name, raw) = tail.split_once('=')?;
+    if name.trim().is_empty() || raw.trim().is_empty() {
+        return None;
+    }
+    bindings.push((name.trim().to_string(), raw.trim().to_string()));
+    (!bindings.is_empty()).then_some(bindings)
+}
+
+fn bindings_from_witness_summary(summary: &str) -> Option<Vec<(String, String)>> {
+    let body = summary.split("sample#").nth(1)?;
+    let after_idx = body.split_once(':')?.1.trim();
+    let assigns = after_idx.split(" (lhs=").next()?.trim();
+    parse_witness_bindings_segment(assigns)
+}
+
+pub fn certify_json_statement_witness(
+    decl_name: &str,
+    stmt_src: &str,
+    bindings: &[(String, String)],
+    lhs: &str,
+    rhs: &str,
+) -> (bool, String, serde_json::Value) {
+    let eff_name = if decl_name.trim().is_empty() {
+        "fastcheck_decl"
+    } else {
+        decl_name.trim()
+    };
+    let s = stmt_src.trim();
+    if s.is_empty() {
+        return unavailable_cert("statement_required");
+    }
+    let base = s.split(":=").next().unwrap_or(s).trim();
+    let full_decl_src = if s.starts_with("theorem ") || s.starts_with("lemma ") {
+        if s.contains(":=") {
+            s.to_string()
+        } else {
+            format!("{} := by sorry", s)
+        }
+    } else if s.starts_with(['(', '{', '[', ':']) {
+        format!("theorem {} {} := by sorry", eff_name, base)
+    } else {
+        format!("theorem {} : {} := by sorry", eff_name, base)
+    };
+    let Some(decl) = extract_lean_theorem(&strip_lean_comments(&full_decl_src), None).ok() else {
+        return unavailable_cert("statement_not_evaluated");
+    };
+    certify_checked_counterexample(&decl, bindings, lhs, rhs)
+}
+
+pub fn certify_statement_witness(
+    decl_name: &str,
+    stmt_src: &str,
+    summary: &str,
+) -> (bool, String, serde_json::Value) {
+    let Some((lhs, rhs)) = witness_pair_from_summary(summary) else {
+        return unavailable_cert("witness_not_parsed");
+    };
+    let Some(bindings) = bindings_from_witness_summary(summary) else {
+        return unavailable_cert("witness_not_bound");
+    };
+    certify_json_statement_witness(decl_name, stmt_src, &bindings, &lhs, &rhs)
 }
 
 /// Execute `turbo-lean fast-check <file> --tpu` on Google Cloud TPU v5e (via `$LEAN_NATIVE_COLAB_API_URL`
@@ -2796,7 +3463,8 @@ pub fn run_tpu_fast_check(json: bool, file: &Path, decl_filter: Option<&str>) ->
     let kernel = transpile_lean_theorem_to_cuda(&src_text, eff_filter)?;
     let n_states = 262_144u64;
     let mut report = execute_transpiled_cuda_kernel(&kernel, n_states, false)?;
-    let (certified, engine_ver, cert_details) = certify_with_lean_native_core()?;
+    let (certified, engine_ver, cert_details) =
+        certify_kernel_counterexample(&kernel, report.counterexample.as_ref());
 
     let colab_url = std::env::var("LEAN_NATIVE_COLAB_API_URL").unwrap_or_default();
     let colab_token = std::env::var("LEAN_NATIVE_COLAB_TOKEN").unwrap_or_default();
@@ -2901,7 +3569,7 @@ pub fn run_tpu_fast_check(json: bool, file: &Path, decl_filter: Option<&str>) ->
                 "lean_native_certified": certified,
                 "lean_native_engine_version": engine_ver,
                 "certification_details": cert_details,
-                "false_positives": 0,
+                "false_positives": u64::from(!certified && report.counterexample.is_some()),
                 "compact_summary": compact_summary,
                 "elapsed_ms": elapsed_ms,
             }))?
@@ -3361,7 +4029,8 @@ pub fn run_fast_check_command(
                     "total_ms": t0.elapsed().as_millis(),
                     "n_states": 1_000_000u64,
                     "false_positives": 0u64,
-                    "lean_native_certified": true,
+                    "lean_native_certified": false,
+                    "certification": "unavailable",
                     "throughput_mstates_s": ((1_000_000.0 / (exec_us.max(1) as f64)) * 100.0).round() / 100.0,
                     "output": stdout.trim()
                 }))?
@@ -3457,7 +4126,12 @@ impl FastVal {
                 if *b { "true" } else { "false" }
             ),
             FastVal::ContractState(seed, ups) => {
-                format!("ContractState(seed=0x{:x}, updates={:?})", seed, ups)
+                let updates = ups
+                    .iter()
+                    .map(|(k, v)| format!("({k}, {v})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("ContractState(seed=0x{seed:x}, updates=[{updates}])")
             }
         }
     }
@@ -3531,6 +4205,19 @@ fn u256_add_or_sub_rust(a: [u64; 4], b: [u64; 4], is_sub: bool) -> ([u64; 4], bo
 #[inline]
 fn u256_add_with_carry_rust(a: [u64; 4], b: [u64; 4]) -> ([u64; 4], bool) {
     u256_add_or_sub_rust(a, b, false)
+}
+
+fn u256_mul_rust(a: [u64; 4], b: [u64; 4]) -> [u64; 4] {
+    let mut out = [0u64; 4];
+    for i in 0..4 {
+        let mut carry = 0u128;
+        for j in 0..(4 - i) {
+            let cur = out[i + j] as u128 + (a[i] as u128) * (b[j] as u128) + carry;
+            out[i + j] = cur as u64;
+            carry = cur >> 64;
+        }
+    }
+    out
 }
 
 #[inline]
@@ -3665,7 +4352,7 @@ fn eval_lean_expr_fast_with_domain(
                 (FastVal::U256(w), "w1") => Some(FastVal::U64(w[1])),
                 (FastVal::U256(w), "w2") => Some(FastVal::U64(w[2])),
                 (FastVal::U256(w), "w3") => Some(FastVal::U64(w[3])),
-                (v, "val" | "toNat") => Some(v),
+                (FastVal::U64(x), "val" | "toNat") if dom.is_nat => Some(FastVal::U64(x)),
                 _ => None,
             }
         }
@@ -3818,12 +4505,7 @@ fn eval_lean_expr_fast_with_domain(
                     }
                     _ => {
                         let (a, b) = (l.as_u256()?, r.as_u256()?);
-                        Some(FastVal::U256([
-                            crate::cluster::lean_cabi_eval_u64_binop(2, a[0], b[0]),
-                            0,
-                            0,
-                            0,
-                        ]))
+                        Some(FastVal::U256(u256_mul_rust(a, b)))
                     }
                 },
                 "/" | "%" | "<<<" | ">>>" => {
@@ -3837,15 +4519,21 @@ fn eval_lean_expr_fast_with_domain(
                             u256_shr_rust(a, b)
                         }));
                     }
+                    if matches!(op.as_str(), "/" | "%")
+                        && matches!((&l, &r), (FastVal::U256(_), _) | (_, FastVal::U256(_)))
+                    {
+                        let (a, b) = (l.as_u256()?, r.as_u256()?);
+                        let q = u256_div_mod_rust(a, b)?;
+                        return Some(FastVal::U256(if op == "/" { q.0 } else { q.1 }));
+                    }
                     let la = l.as_u64()?;
                     let rb = r.as_u64()?;
                     match op.as_str() {
-                        "/" => Some(FastVal::U64(if rb == 0 { 0 } else { dom.mask(la / rb) })),
-                        "%" => Some(FastVal::U64(if rb == 0 {
-                            dom.mask(la)
-                        } else {
-                            dom.mask(la % rb)
-                        })),
+                        "/" => Some(FastVal::U64(la.checked_div(rb).map_or(0, |q| dom.mask(q)))),
+                        "%" => Some(FastVal::U64(
+                            la.checked_rem(rb)
+                                .map_or_else(|| dom.mask(la), |r| dom.mask(r)),
+                        )),
                         "<<<" => {
                             if dom.is_nat {
                                 if rb >= 64 {
@@ -3965,8 +4653,23 @@ fn eval_lean_expr_fast_with_domain(
                 }
                 ("mul", 2) => {
                     let (a, b) = (v_args[0].as_u256()?, v_args[1].as_u256()?);
-                    Some(FastVal::U256([a[0].wrapping_mul(b[0]), 0, 0, 0]))
+                    Some(FastVal::U256(u256_mul_rust(a, b)))
                 }
+                ("div" | "mod", 2) => match (&v_args[0], &v_args[1]) {
+                    (FastVal::U64(a), FastVal::U64(b)) if fname.starts_with("Nat.") => {
+                        Some(FastVal::U64(if short == "div" {
+                            a.checked_div(*b).map_or(0, |q| dom.mask(q))
+                        } else {
+                            a.checked_rem(*b)
+                                .map_or_else(|| dom.mask(*a), |r| dom.mask(r))
+                        }))
+                    }
+                    _ => {
+                        let (a, b) = (v_args[0].as_u256()?, v_args[1].as_u256()?);
+                        let q = u256_div_mod_rust(a, b)?;
+                        Some(FastVal::U256(if short == "div" { q.0 } else { q.1 }))
+                    }
+                },
                 ("addWithCarry" | "subWithBorrow", 2) => {
                     let (a, b) = (v_args[0].as_u256()?, v_args[1].as_u256()?);
                     let (res, flag) = if short == "addWithCarry" {
@@ -4008,12 +4711,12 @@ fn eval_lean_expr_fast_with_domain(
                         v_args[1].as_u256()?,
                         v_args[2].as_u256()?,
                     );
-                    Some(FastVal::U256(u256_mul_div_512(
+                    Some(FastVal::U256(u256_mul_div_checked(
                         x,
                         y,
                         d,
                         short == "mulDivUp",
-                    )))
+                    )?))
                 }
                 ("clz" | "clz256", 1) => {
                     let x = v_args[0].as_u256()?;
@@ -4063,10 +4766,12 @@ fn eval_lean_expr_fast_with_domain(
     }
 }
 
-/// Exact 512-bit intermediate `mulDivDown` / `mulDivUp` over 256-bit words (`[u64; 4]` little-endian limbs).
-pub fn u256_mul_div_512(a: [u64; 4], b: [u64; 4], d: [u64; 4], round_up: bool) -> [u64; 4] {
+/// 512-bit product divided by a 256-bit denominator.
+/// `None` when `d == 0` or the (optionally rounded-up) quotient does not fit in 256 bits,
+/// matching `UInt256.mulDivDown` / `mulDivUp` (`Option.none`).
+fn u256_mul_div_checked(a: [u64; 4], b: [u64; 4], d: [u64; 4], round_up: bool) -> Option<[u64; 4]> {
     if d == [0; 4] {
-        return [0; 4];
+        return None;
     }
     let mut prod = [0u64; 8];
     for i in 0..4 {
@@ -4100,12 +4805,46 @@ pub fn u256_mul_div_512(a: [u64; 4], b: [u64; 4], d: [u64; 4], round_up: bool) -
             quot[bit / 64] |= 1u64 << (bit % 64);
         }
     }
-    let q = [quot[0], quot[1], quot[2], quot[3]];
     if round_up && rem != [0; 4] {
-        u256_add_with_carry_rust(q, [1, 0, 0, 0]).0
-    } else {
-        q
+        let mut carry = 1u64;
+        for limb in &mut quot {
+            let sum = (*limb as u128) + (carry as u128);
+            *limb = sum as u64;
+            carry = (sum >> 64) as u64;
+        }
     }
+    if quot[4] | quot[5] | quot[6] | quot[7] != 0 {
+        return None;
+    }
+    Some([quot[0], quot[1], quot[2], quot[3]])
+}
+
+/// `UInt256.div` / `UInt256.mod`: quotient and remainder, or `None` on a zero divisor.
+fn u256_div_mod_rust(a: [u64; 4], d: [u64; 4]) -> Option<([u64; 4], [u64; 4])> {
+    if d == [0; 4] {
+        return None;
+    }
+    let mut rem = [0u64; 4];
+    let mut quot = [0u64; 4];
+    for bit in (0..256).rev() {
+        let in_bit = (a[bit / 64] >> (bit % 64)) & 1;
+        let top = rem[3] >> 63;
+        rem[3] = (rem[3] << 1) | (rem[2] >> 63);
+        rem[2] = (rem[2] << 1) | (rem[1] >> 63);
+        rem[1] = (rem[1] << 1) | (rem[0] >> 63);
+        rem[0] = (rem[0] << 1) | in_bit;
+        if top != 0 || !u256_lt_rust(rem, d) {
+            let mut borrow = 0u64;
+            for k in 0..4 {
+                let (d1, b1) = rem[k].overflowing_sub(d[k]);
+                let (d2, b2) = d1.overflowing_sub(borrow);
+                rem[k] = d2;
+                borrow = (b1 as u64) + (b2 as u64);
+            }
+            quot[bit / 64] |= 1u64 << (bit % 64);
+        }
+    }
+    Some((quot, rem))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4301,9 +5040,11 @@ fn eval_extracted_decl_in_memory(
     let seed = 1337u64;
     let mut violations = 0u64;
     let mut satisfied_preconditions = 0u64;
+    let mut evaluated_states = 0u64;
+    let mut abstained_states = 0u64;
     let mut first_ce: Option<CounterexampleWitness> = None;
 
-    for idx in 0..n_states {
+    'state_loop: for idx in 0..n_states {
         let mut env: std::collections::HashMap<String, FastVal> =
             std::collections::HashMap::with_capacity(params.len());
         for (p_idx, (p_name, p_kind)) in params.iter().enumerate() {
@@ -4327,7 +5068,10 @@ fn eval_extracted_decl_in_memory(
         }
 
         for (t_name, val_expr) in &subst_ast {
-            let mut v = eval_lean_expr_fast_with_domain(val_expr, &env, dom)?;
+            let Some(mut v) = eval_lean_expr_fast_with_domain(val_expr, &env, dom) else {
+                abstained_states += 1;
+                continue 'state_loop;
+            };
             if let Some((_, Stage1ParamKind::U256)) = params.iter().find(|(n, _)| n == t_name) {
                 if let FastVal::U64(x) = v {
                     v = FastVal::U256([x, 0, 0, 0]);
@@ -4338,18 +5082,30 @@ fn eval_extracted_decl_in_memory(
 
         let mut active = true;
         for h in &remaining_hyps {
-            if !eval_lean_expr_fast_with_domain(h, &env, dom)?.as_bool()? {
+            let Some(hv) = eval_lean_expr_fast_with_domain(h, &env, dom).and_then(|v| v.as_bool())
+            else {
+                abstained_states += 1;
+                continue 'state_loop;
+            };
+            if !hv {
                 active = false;
                 break;
             }
         }
         if !active {
+            evaluated_states += 1;
             continue;
         }
-        satisfied_preconditions += 1;
 
-        let lv = eval_lean_expr_fast_with_domain(&lhs_ast, &env, dom)?;
-        let rv = eval_lean_expr_fast_with_domain(&rhs_ast, &env, dom)?;
+        let (Some(lv), Some(rv)) = (
+            eval_lean_expr_fast_with_domain(&lhs_ast, &env, dom),
+            eval_lean_expr_fast_with_domain(&rhs_ast, &env, dom),
+        ) else {
+            abstained_states += 1;
+            continue;
+        };
+        evaluated_states += 1;
+        satisfied_preconditions += 1;
         let eq = match (&lv, &rv) {
             (FastVal::U256(a), FastVal::U64(b)) => *a == [*b, 0, 0, 0],
             (FastVal::U64(a), FastVal::U256(b)) => [*a, 0, 0, 0] == *b,
@@ -4374,6 +5130,11 @@ fn eval_extracted_decl_in_memory(
             }
         }
     }
+    if (evaluated_states == 0 && abstained_states > 0)
+        || (satisfied_preconditions == 0 && abstained_states > 0)
+    {
+        return None;
+    }
 
     let kernel_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let throughput_mstates_s = if kernel_ms > 0.0 {
@@ -4382,6 +5143,8 @@ fn eval_extracted_decl_in_memory(
         0.0
     };
     let vacuous_warn = satisfied_preconditions == 0 && !raw_hyp_exprs.is_empty();
+    let (lean_native_certified, lean_native_engine_version, _) =
+        certify_report_counterexample(decl, first_ce.as_ref());
 
     Some((
         TranspiledFastCheckReport {
@@ -4396,8 +5159,8 @@ fn eval_extracted_decl_in_memory(
             kernel_ms,
             throughput_mstates_s,
             counterexample: first_ce,
-            lean_native_certified: true,
-            lean_native_engine_version: "0.3.0".to_string(),
+            lean_native_certified,
+            lean_native_engine_version,
         },
         lhs_lean,
         rhs_lean,
@@ -4534,7 +5297,6 @@ fn try_eval_decl_stage1_cex_json(
     effective_low_memory: bool,
     max_memory_mb: Option<u64>,
     t0: Instant,
-    cert_fn: impl FnOnce() -> (bool, String),
 ) -> Option<serde_json::Value> {
     let (report, lhs_lean, rhs_lean) = eval_extracted_decl_in_memory(d, 1024)?;
     if report.verified || report.violations == 0 {
@@ -4568,14 +5330,17 @@ fn try_eval_decl_stage1_cex_json(
             },
         );
     }
-    let (lean_native_certified, lean_native_version) = cert_fn();
+    let (lean_native_certified, lean_native_version, _) =
+        certify_report_counterexample(d, report.counterexample.as_ref());
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
     let (lhs_val, rhs_val) = report
         .counterexample
         .as_ref()
         .map(|ce| (Some(ce.lhs_value.as_str()), Some(ce.rhs_value.as_str())))
         .unwrap_or((None, None));
-    let triage_json = crate::c_abi::build_counterexample_triage_json(lhs_val, rhs_val, None);
+    let semantic_triage = lean_native_certified.then_some((suggested_hyp.is_some(), false));
+    let triage_json =
+        crate::c_abi::build_counterexample_triage_json(lhs_val, rhs_val, semantic_triage);
     let mut compact_summary = format!(
         "CEX stage1 decl={} ms={:.1} fix={}",
         d.name,
@@ -4639,11 +5404,6 @@ pub fn try_stateless_agent_step_cex(
             effective_low_memory,
             max_memory_mb,
             t0,
-            || {
-                certify_with_lean_native_core()
-                    .map(|(cert, ver, _)| (cert, ver))
-                    .unwrap_or_else(|_| (true, "0.3.0".to_string()))
-            },
         ) {
             return Some(val);
         }
@@ -4724,20 +5484,7 @@ pub fn evaluate_agent_step_value(
     let (max_memory_mb, effective_low_memory, canon_dir, resolved_file) =
         resolve_agent_step_env_and_paths(file, project_dir, low_memory, use_tpu);
 
-    let custom_lnc = std::env::var("LEAN_NATIVE_CORE_BIN")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .is_some();
-    let lazy_lean_native_cert = || -> (bool, String) {
-        certify_with_lean_native_core()
-            .map(|(cert, ver, _)| (cert, ver))
-            .unwrap_or_else(|_| (true, "0.3.0".to_string()))
-    };
-    let (lean_native_certified, lean_native_version) = if custom_lnc {
-        lazy_lean_native_cert()
-    } else {
-        (true, "0.5.0".to_string())
-    };
+    let (lean_native_certified, lean_native_version) = (false, "unavailable".to_string());
 
     let accel_cfg = crate::accelerators::AcceleratorConfig::load(Some(&canon_dir));
     let accelerators_active = accel_cfg.enabled;
@@ -4774,7 +5521,6 @@ pub fn evaluate_agent_step_value(
                 effective_low_memory,
                 max_memory_mb,
                 t0,
-                lazy_lean_native_cert,
             ) {
                 return Ok(val);
             }
@@ -4933,11 +5679,22 @@ pub fn evaluate_agent_step_value(
                     let suggested_hypothesis = suggested_hypothesis.clone();
                     let accelerator_name = accelerator_name.clone();
                     accelerator_certificates.extend(certs);
-                    let (lean_native_certified, lean_native_version) = lazy_lean_native_cert();
+                    let (accel_certified, accel_version, _) =
+                        certify_statement_witness(&ts.name, &stmt_src, &witness_summary);
                     let elapsed_ms =
                         (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
-                    let triage_json =
-                        crate::c_abi::build_counterexample_triage_json(None, None, None);
+                    let w_pair = witness_pair_from_summary(&witness_summary);
+                    let (lhs_opt, rhs_opt) = w_pair
+                        .as_ref()
+                        .map(|(l, r)| (Some(l.as_str()), Some(r.as_str())))
+                        .unwrap_or((None, None));
+                    let semantic_triage =
+                        accel_certified.then_some((suggested_hypothesis.is_some(), false));
+                    let triage_json = crate::c_abi::build_counterexample_triage_json(
+                        lhs_opt,
+                        rhs_opt,
+                        semantic_triage,
+                    );
                     let mut compact_summary = format!(
                         "CEX stage1_accel decl={} via={} ms={:.1}",
                         ts.name, accelerator_name, elapsed_ms
@@ -4952,9 +5709,9 @@ pub fn evaluate_agent_step_value(
                         "accelerators_active": accelerators_active,
                         "registered_accelerators_count": registered_accelerators_count,
                         "accelerator_certificates": accelerator_certificates,
-                        "stage1_fastcheck_certified": lean_native_certified,
-                        "lean_native_certified": lean_native_certified,
-                        "lean_native_engine_version": lean_native_version,
+                        "stage1_fastcheck_certified": accel_certified,
+                        "lean_native_certified": accel_certified,
+                        "lean_native_engine_version": accel_version,
                         "low_memory_mode": effective_low_memory,
                         "max_memory_mb": max_memory_mb,
                         "violations": 1,
@@ -5680,16 +6437,29 @@ theorem swar_scale_let_conclusion (a b : UInt64) (h : a < 100) :
     #[test]
     fn test_u256_mul_div_512_and_clz_ctz_intrinsics() {
         assert_eq!(
-            u256_mul_div_512([0, 0, 0, 1], [0, 0, 1, 0], [0, 0, 1u64 << 32, 0], false),
-            [0, 0, 1u64 << 32, 0]
+            u256_mul_div_checked([0, 0, 0, 1], [0, 0, 1, 0], [0, 0, 1u64 << 32, 0], false),
+            Some([0, 0, 1u64 << 32, 0])
         );
         assert_eq!(
-            u256_mul_div_512([7, 0, 0, 0], [3, 0, 0, 0], [5, 0, 0, 0], false),
-            [4, 0, 0, 0]
+            u256_mul_div_checked([7, 0, 0, 0], [3, 0, 0, 0], [5, 0, 0, 0], false),
+            Some([4, 0, 0, 0])
         );
         assert_eq!(
-            u256_mul_div_512([7, 0, 0, 0], [3, 0, 0, 0], [5, 0, 0, 0], true),
-            [5, 0, 0, 0]
+            u256_mul_div_checked([7, 0, 0, 0], [3, 0, 0, 0], [5, 0, 0, 0], true),
+            Some([5, 0, 0, 0])
+        );
+        assert_eq!(
+            u256_mul_div_checked([1, 0, 0, 0], [1, 0, 0, 0], [0, 0, 0, 0], false),
+            None
+        );
+        assert_eq!(
+            u256_mul_div_checked([0, 0, 0, 1], [0, 0, 0, 1], [1, 0, 0, 0], false),
+            None
+        );
+        assert_eq!(u256_div_mod_rust([7, 0, 0, 0], [0, 0, 0, 0]), None);
+        assert_eq!(
+            u256_div_mod_rust([7, 0, 0, 0], [3, 0, 0, 0]),
+            Some(([2, 0, 0, 0], [1, 0, 0, 0]))
         );
 
         let env = std::collections::HashMap::new();
@@ -5717,6 +6487,12 @@ theorem swar_scale_let_conclusion (a b : UInt64) (h : a < 100) :
         ] {
             let (rep, lhs, rhs) = eval_extracted_decl_in_memory(decl, 4096).unwrap();
             assert!(!rep.verified && rep.violations > 0);
+            assert!(
+                rep.lean_native_certified && rep.lean_native_engine_version == "0.5.0",
+                "Expected genuine counterexample in `{}` to be certified: {:?}",
+                decl.name,
+                rep
+            );
             let hint = synthesize_missing_hypothesis_hint(
                 &decl.name,
                 &lhs,
@@ -5725,6 +6501,16 @@ theorem swar_scale_let_conclusion (a b : UInt64) (h : a < 100) :
             );
             assert_eq!(hint.as_deref(), Some(exp_hint));
         }
+
+        let valid_src =
+            "theorem valid_add_comm (a b : Word256) : Word256.add a b = Word256.add b a := by sorry";
+        let valid_decl = extract_lean_theorem(valid_src, Some("valid_add_comm")).unwrap();
+        let (valid_rep, _, _) = eval_extracted_decl_in_memory(&valid_decl, 256).unwrap();
+        assert!(valid_rep.verified && valid_rep.violations == 0);
+        assert!(
+            !valid_rep.lean_native_certified
+                && valid_rep.lean_native_engine_version == "unavailable"
+        );
     }
 
     #[test]
@@ -5822,6 +6608,132 @@ theorem swar_scale_let_conclusion (a b : UInt64) (h : a < 100) :
 
         let buggy_u8 = "theorem buggy_u8_shl (x : UInt8) : x <<< 1 = x := by sorry";
         assert!(try_lnir_fast_reject("buggy_u8_shl", buggy_u8).is_some());
+
+        // Wrapped `.toNat` / `.val` projections must fail closed rather than falsely rejecting
+        // valid unbounded-Nat theorems or certifying wrapped witnesses.
+        let valid_tonat =
+            "theorem u256_tonat_no_wrap (a : UInt256) : (a.toNat < a.toNat + 1) = true := by sorry";
+        assert_eq!(
+            try_lnir_fast_reject("u256_tonat_no_wrap", valid_tonat),
+            None
+        );
+        let tonat_decl = extract_lean_theorem(valid_tonat, Some("u256_tonat_no_wrap")).unwrap();
+        assert!(eval_extracted_decl_in_memory(&tonat_decl, 64).is_none());
+        let (tonat_cert, _, tonat_details) = certify_json_statement_witness(
+            "u256_tonat_no_wrap",
+            valid_tonat,
+            &[(
+                "a".to_string(),
+                "0xffffffffffffffff_ffffffffffffffff_ffffffffffffffff_ffffffffffffffff".to_string(),
+            )],
+            "false",
+            "true",
+        );
+        assert!(!tonat_cert);
+        assert_eq!(tonat_details["reason"], "statement_not_evaluated");
+
+        let valid_u8_val =
+            "theorem u8_val_no_wrap (x : UInt8) : (x.val < x.val + 1) = true := by sorry";
+        assert_eq!(try_lnir_fast_reject("u8_val_no_wrap", valid_u8_val), None);
+        let (u8_val_cert, _, u8_val_details) = certify_json_statement_witness(
+            "u8_val_no_wrap",
+            valid_u8_val,
+            &[("x".to_string(), "0xff".to_string())],
+            "false",
+            "true",
+        );
+        assert!(!u8_val_cert);
+        assert_eq!(u8_val_details["reason"], "statement_not_evaluated");
+
+        // Total scalar `/` and `%` on 0 in Lean (`x / 0 = 0`, `x % 0 = x`) vs Option-valued UInt256 div/mod/mulDiv
+        for (name, stmt) in [
+            (
+                "u64_div_zero",
+                "theorem u64_div_zero (x : UInt64) : x / 0 = 0 := by sorry",
+            ),
+            (
+                "u64_mod_zero",
+                "theorem u64_mod_zero (x : UInt64) : x % 0 = x := by sorry",
+            ),
+            (
+                "nat_div_zero",
+                "theorem nat_div_zero (x : Nat) : x / 0 = 0 := by sorry",
+            ),
+            (
+                "nat_mod_zero",
+                "theorem nat_mod_zero (x : Nat) : x % 0 = x := by sorry",
+            ),
+        ] {
+            assert_eq!(try_lnir_fast_reject(name, stmt), None);
+            let decl = extract_lean_theorem(stmt, Some(name)).unwrap();
+            let (rep, _, _) = eval_extracted_decl_in_memory(&decl, 64).unwrap();
+            assert!(rep.verified && rep.violations == 0);
+            let kernel = transpile_lean_theorem_to_cuda(stmt, Some(name)).unwrap();
+            let exec_rep = execute_transpiled_cuda_kernel(&kernel, 64, false).unwrap();
+            assert!(exec_rep.verified && exec_rep.violations == 0);
+        }
+
+        let u256_div_stmt =
+            "theorem u256_div_self (a b : UInt256) (h : b != UInt256.zero) : UInt256.div b b = UInt256.one := by sorry";
+        let u256_div_decl = extract_lean_theorem(u256_div_stmt, Some("u256_div_self")).unwrap();
+        let (u256_div_rep, _, _) = eval_extracted_decl_in_memory(&u256_div_decl, 64).unwrap();
+        assert!(
+            u256_div_rep.verified
+                && u256_div_rep.violations == 0
+                && u256_div_rep.satisfied_preconditions > 0
+        );
+        let u256_div_kernel =
+            transpile_lean_theorem_to_cuda(u256_div_stmt, Some("u256_div_self")).unwrap();
+        let u256_div_exec = execute_transpiled_cuda_kernel(&u256_div_kernel, 64, false).unwrap();
+        assert!(u256_div_exec.verified && u256_div_exec.violations == 0);
+
+        let u256_div_zero_stmt =
+            "theorem u256_div_zero_opt (a : UInt256) : UInt256.div a UInt256.zero = UInt256.one := by sorry";
+        let (div_zero_cert, _, div_zero_details) = certify_json_statement_witness(
+            "u256_div_zero_opt",
+            u256_div_zero_stmt,
+            &[("a".to_string(), "0x5".to_string())],
+            "0x0",
+            "0x1",
+        );
+        assert!(!div_zero_cert);
+        assert_eq!(div_zero_details["reason"], "statement_not_evaluated");
+
+        let muldiv_overflow_stmt =
+            "theorem muldiv_ovf (x y d : UInt256) : UInt256.mulDivDown x y d = UInt256.zero := by sorry";
+        let (md_cert, _, md_details) = certify_json_statement_witness(
+            "muldiv_ovf",
+            muldiv_overflow_stmt,
+            &[
+                (
+                    "x".to_string(),
+                    "0xffffffffffffffff_ffffffffffffffff_ffffffffffffffff_ffffffffffffffff"
+                        .to_string(),
+                ),
+                ("y".to_string(), "0x2".to_string()),
+                ("d".to_string(), "0x1".to_string()),
+            ],
+            "0x0",
+            "0x1",
+        );
+        assert!(!md_cert);
+        assert_eq!(md_details["reason"], "statement_not_evaluated");
+
+        // Full 256-bit cross-limb multiplication catches multi-limb counterexamples and certifies them
+        let buggy_u256_mul =
+            "theorem buggy_u256_mul_limb0_only (a b : UInt256) : UInt256.mul a b = ⟨a.w0 * b.w0, 0, 0, 0⟩ := by sorry";
+        let mul_decl =
+            extract_lean_theorem(buggy_u256_mul, Some("buggy_u256_mul_limb0_only")).unwrap();
+        let (mul_rep, _, _) = eval_extracted_decl_in_memory(&mul_decl, 256).unwrap();
+        assert!(!mul_rep.verified && mul_rep.violations > 0 && mul_rep.lean_native_certified);
+        let mul_kernel =
+            transpile_lean_theorem_to_cuda(buggy_u256_mul, Some("buggy_u256_mul_limb0_only"))
+                .unwrap();
+        let mul_exec = execute_transpiled_cuda_kernel(&mul_kernel, 256, false).unwrap();
+        assert!(!mul_exec.verified && mul_exec.violations > 0);
+        let (mul_kcert, _, _) =
+            certify_kernel_counterexample(&mul_kernel, mul_exec.counterexample.as_ref());
+        assert!(mul_kcert);
     }
 
     #[test]

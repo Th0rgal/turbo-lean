@@ -2123,7 +2123,7 @@ mod tests {
                 "kind": "rewritten_proof", "new_body_src": "by simp only [Nat.add_comm]",
                 "accelerator_name": "builtin:simd-simp-distiller", "estimated_speedup_hint": "9.1x"
             }],
-            "stage1_fastcheck_certified": true, "lean_native_certified": true, "lean_native_engine_version": "0.5.0",
+            "stage1_fastcheck_certified": false, "lean_native_certified": false, "lean_native_engine_version": "unavailable",
             "low_memory_mode": false, "max_memory_mb": 8192, "total_specs_audited": 12, "vacuous_specs": 0, "tight_specs": 12,
             "shard_hits": 1, "shard_misses": 0,
             "shard_key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",

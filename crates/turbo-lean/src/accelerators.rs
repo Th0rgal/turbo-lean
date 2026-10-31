@@ -3550,7 +3550,7 @@ impl TpuGuidedTacticSynthAccel {
                     } else {
                         AcceleratorCertificate::CounterexampleFound {
                             witness_summary: format!(
-                                "[TPU-v5e-XLA certified] ground proposition `{}` evaluates to false",
+                                "[TPU-v5e-XLA uncertified] ground proposition `{}` evaluates to false",
                                 goal.concl_str
                             ),
                             suggested_hypothesis: None,
