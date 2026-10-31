@@ -683,7 +683,16 @@ pub(crate) fn resolve_remote_lean_path(
     parts.join(":")
 }
 
+#[cfg(test)]
 pub(crate) fn compute_shard_key(toolchain: &str, shard: &splitter::TheoremShard) -> String {
+    compute_shard_key_with_args(toolchain, shard, &[])
+}
+
+pub(crate) fn compute_shard_key_with_args(
+    toolchain: &str,
+    shard: &splitter::TheoremShard,
+    lean_args: &[String],
+) -> String {
     let mut key_hasher = blake3::Hasher::new();
     key_hasher.update(b"theorem-shard-v1:");
     key_hasher.update(toolchain.as_bytes());
@@ -698,6 +707,10 @@ pub(crate) fn compute_shard_key(toolchain: &str, shard: &splitter::TheoremShard)
     if allowed.len() > splitter::STANDARD_AXIOMS.len() {
         key_hasher.update(b":axioms:");
         key_hasher.update(allowed.join(",").as_bytes());
+    }
+    if let Some(ad) = crate::module_builder::compute_lean_args_digest(lean_args) {
+        key_hasher.update(b":opts:");
+        key_hasher.update(ad.as_bytes());
     }
     key_hasher.finalize().to_hex().to_string()
 }
@@ -2549,6 +2562,7 @@ pub(crate) fn seed_project_theorem_shards_from_splits(
     let mut files_seeded = 0usize;
     let mut batch_items: Vec<(String, String, Vec<u8>, i64)> = Vec::new();
 
+    let pkg_cfg_opt = crate::module_builder::resolve_package_config(canon_dir, false).ok();
     for (lf, _src, split) in split_entries {
         if require_olean && resolve_prebuilt_module_import(canon_dir, lf).is_none() {
             continue;
@@ -2556,6 +2570,10 @@ pub(crate) fn seed_project_theorem_shards_from_splits(
         if split.shards.is_empty() {
             continue;
         }
+        let file_lean_args = pkg_cfg_opt
+            .as_ref()
+            .map(|pkg| crate::module_builder::resolve_file_lean_args_in_package(pkg, lf))
+            .unwrap_or_default();
         let file_has_sorry = split.hygiene.has_sorry;
         let mut file_had_clean_shard = false;
         for shard in &split.shards {
@@ -2566,7 +2584,7 @@ pub(crate) fn seed_project_theorem_shards_from_splits(
                 continue;
             }
             file_had_clean_shard = true;
-            let shard_key = compute_shard_key(toolchain, shard);
+            let shard_key = compute_shard_key_with_args(toolchain, shard, &file_lean_args);
             batch_items.push((shard_key, shard.name.clone(), shared_receipt.clone(), 1i64));
         }
         if file_had_clean_shard {

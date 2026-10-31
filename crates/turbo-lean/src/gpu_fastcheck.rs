@@ -4473,6 +4473,7 @@ fn is_known_binder_value_type(ty: &str) -> bool {
         || t.contains('→')
         || t.contains("->")
 }
+
 fn resolve_agent_step_env_and_paths(
     file: &Path,
     project_dir: Option<&Path>,
@@ -4650,6 +4651,65 @@ pub fn try_stateless_agent_step_cex(
     None
 }
 
+/// Build structured `rewrite_suggestions` alongside verified `accelerator_certificates`
+/// so consumers can clearly distinguish actually applied winning rewrites (`applied: true`)
+/// from unapplied heuristic proposals (`applied: false`).
+fn partition_certificates_for_verified_step(
+    certs: &[crate::accelerators::AcceleratorCertificate],
+    accelerator_assisted: bool,
+    winning_accelerator: Option<&str>,
+) -> (
+    Vec<crate::accelerators::AcceleratorCertificate>,
+    Vec<serde_json::Value>,
+) {
+    let mut verified_certs = Vec::new();
+    let mut rewrite_suggestions = Vec::new();
+    for c in certs {
+        match c {
+            crate::accelerators::AcceleratorCertificate::RewrittenProof {
+                new_body_src,
+                accelerator_name,
+                estimated_speedup_hint,
+            } => {
+                let is_applied = accelerator_assisted
+                    && winning_accelerator.is_some_and(|w| w == accelerator_name);
+                if is_applied {
+                    verified_certs.push(c.clone());
+                } else {
+                    rewrite_suggestions.push(serde_json::json!({
+                        "kind": "rewritten_proof",
+                        "accelerator_name": accelerator_name,
+                        "new_body_src": new_body_src,
+                        "estimated_speedup_hint": estimated_speedup_hint,
+                        "applied": false,
+                    }));
+                }
+            }
+            crate::accelerators::AcceleratorCertificate::SubgoalCuts {
+                cuts,
+                accelerator_name,
+            } => {
+                let is_applied = accelerator_assisted
+                    && winning_accelerator.is_some_and(|w| w == accelerator_name);
+                if is_applied {
+                    verified_certs.push(c.clone());
+                } else {
+                    rewrite_suggestions.push(serde_json::json!({
+                        "kind": "subgoal_cuts",
+                        "accelerator_name": accelerator_name,
+                        "cuts": cuts,
+                        "applied": false,
+                    }));
+                }
+            }
+            crate::accelerators::AcceleratorCertificate::CounterexampleFound { .. } => {
+                verified_certs.push(c.clone());
+            }
+        }
+    }
+    (verified_certs, rewrite_suggestions)
+}
+
 /// Evaluate the unified Stage 0 -> Stage 1 -> Stage 2 `agent-step` verification funnel in-process
 /// (`0` CLI subprocesses) and return its structured JSON payload.
 pub fn evaluate_agent_step_value(
@@ -4781,8 +4841,7 @@ pub fn evaluate_agent_step_value(
             .collect();
 
         for ts in &target_shards {
-            let (stmt_src, body_src) =
-                crate::splitter::extract_shard_stmt_and_proof(&src_text, ts);
+            let (stmt_src, body_src) = crate::splitter::extract_shard_stmt_and_proof(&src_text, ts);
             if primary_stmt_src.is_empty() {
                 primary_stmt_src = stmt_src.clone();
                 primary_body_src = body_src.clone();
@@ -4791,7 +4850,8 @@ pub fn evaluate_agent_step_value(
             if !accelerators_active {
                 continue;
             }
-            let mut avail_consts = crate::accelerators::lookup_distilled_constants(&ts.name, &stmt_src);
+            let mut avail_consts =
+                crate::accelerators::lookup_distilled_constants(&ts.name, &stmt_src);
             let mut avail_const_set: std::collections::HashSet<String> =
                 avail_consts.iter().cloned().collect();
             for s in &split.shards {
@@ -4916,9 +4976,15 @@ pub fn evaluate_agent_step_value(
             && split.eligible_for_sharding
             && !target_shards.is_empty()
         {
+            let file_lean_args = crate::module_builder::try_resolve_lean_args_for_path(
+                &canon_dir,
+                Some(&resolved_file),
+            );
             let shard_keys: Vec<String> = target_shards
                 .iter()
-                .map(|s| crate::lake_build::compute_shard_key(&toolchain, s))
+                .map(|s| {
+                    crate::lake_build::compute_shard_key_with_args(&toolchain, s, &file_lean_args)
+                })
                 .collect();
             if let Ok(cached_map) = store.batch_get_theorem_shards(&shard_keys, "trusted") {
                 if cached_map.len() == shard_keys.len() {
@@ -4949,6 +5015,45 @@ pub fn evaluate_agent_step_value(
                         &first_shard.name,
                         cached_stmt_src,
                     );
+                    let mut cached_proof_nodes: u64 = 0;
+                    for sh in &target_shards {
+                        let sh_stmt = if !sh.signature_text.is_empty() {
+                            sh.signature_text.as_str()
+                        } else if sh.name == primary_decl_name {
+                            primary_stmt_src.as_str()
+                        } else {
+                            ""
+                        };
+                        let sh_body = if !sh.proof_text.is_empty() {
+                            sh.proof_text.as_str()
+                        } else if sh.name == primary_decl_name {
+                            primary_body_src.as_str()
+                        } else {
+                            ""
+                        };
+                        let sh_key = crate::lake_build::compute_shard_key_with_args(
+                            &toolchain,
+                            sh,
+                            &file_lean_args,
+                        );
+                        let n = cached_map
+                            .get(&sh_key)
+                            .and_then(|bh| fs::read(store.blob_path(bh)).ok())
+                            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                            .and_then(|v| v.get("proof_term_nodes").and_then(|n| n.as_u64()))
+                            .filter(|&n| n > 0)
+                            .or_else(|| {
+                                crate::accelerators::lookup_distilled_proof_term_nodes(
+                                    &sh.name, sh_stmt,
+                                )
+                            })
+                            .unwrap_or_else(|| {
+                                crate::matryoshka::estimate_decl_proof_term_nodes(
+                                    &sh.name, sh_stmt, sh_body,
+                                )
+                            });
+                        cached_proof_nodes = cached_proof_nodes.saturating_add(n);
+                    }
                     let status_str = if decl_filter.is_some() {
                         "theorem_cache_hit"
                     } else {
@@ -4959,6 +5064,12 @@ pub fn evaluate_agent_step_value(
                         first_shard.name, elapsed_ms
                     );
                     compact_summary.truncate(120);
+                    let (verified_certs, rewrite_suggestions) =
+                        partition_certificates_for_verified_step(
+                            &accelerator_certificates,
+                            false,
+                            None,
+                        );
                     return Ok(serde_json::json!({
                         "status": status_str,
                         "verification_status": "verified",
@@ -4967,8 +5078,11 @@ pub fn evaluate_agent_step_value(
                         "file": file.display().to_string(),
                         "stage": "stage2_kernel_verified",
                         "accelerators_active": accelerators_active,
+                        "accelerator_assisted": false,
+                        "winning_accelerator": serde_json::Value::Null,
                         "registered_accelerators_count": registered_accelerators_count,
-                        "accelerator_certificates": accelerator_certificates,
+                        "accelerator_certificates": verified_certs,
+                        "rewrite_suggestions": rewrite_suggestions,
                         "stage1_fastcheck_certified": lean_native_certified,
                         "lean_native_certified": lean_native_certified,
                         "lean_native_engine_version": lean_native_version,
@@ -4984,7 +5098,7 @@ pub fn evaluate_agent_step_value(
                         "goal_head": cached_feats.goal_head,
                         "stmt_consts": cached_feats.stmt_consts,
                         "tactic_skeleton": cached_skel,
-                        "proof_term_nodes": 0,
+                        "proof_term_nodes": cached_proof_nodes,
                         "shard_hits": shard_keys.len(),
                         "shard_misses": 0,
                         "shard_key": shard_keys[0],
@@ -5035,6 +5149,23 @@ pub fn evaluate_agent_step_value(
                 );
             }
         }
+        let accel_assisted = obj
+            .get("accelerator_assisted")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let winning_accel = obj
+            .get("winning_accelerator")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let (verified_certs, rewrite_suggestions) = partition_certificates_for_verified_step(
+            &accelerator_certificates,
+            accel_assisted,
+            winning_accel.as_deref(),
+        );
+        obj.entry("accelerator_assisted".to_string())
+            .or_insert_with(|| serde_json::json!(false));
+        obj.entry("winning_accelerator".to_string())
+            .or_insert_with(|| serde_json::Value::Null);
         obj.insert(
             "file".to_string(),
             serde_json::json!(file.display().to_string()),
@@ -5053,7 +5184,11 @@ pub fn evaluate_agent_step_value(
         );
         obj.insert(
             "accelerator_certificates".to_string(),
-            serde_json::json!(accelerator_certificates),
+            serde_json::json!(verified_certs),
+        );
+        obj.insert(
+            "rewrite_suggestions".to_string(),
+            serde_json::json!(rewrite_suggestions),
         );
         obj.insert(
             "stage1_fastcheck_certified".to_string(),
@@ -5131,12 +5266,39 @@ pub fn evaluate_agent_step_value(
         };
         let feats = crate::matryoshka::parse_lean_stmt_features(fallback_decl, &primary_stmt_src);
         let skel = crate::matryoshka::extract_tactic_skeleton(&primary_body_src);
-        let proof_nodes_val = obj.get("proof_term_nodes").and_then(|v| v.as_u64()).unwrap_or(0);
-        obj.entry("proof_term_nodes".to_string())
-            .or_insert_with(|| serde_json::json!(proof_nodes_val));
+        let proof_nodes_val = obj
+            .get("proof_term_nodes")
+            .and_then(|v| v.as_u64())
+            .filter(|&n| n > 0)
+            .or_else(|| {
+                crate::accelerators::lookup_distilled_proof_term_nodes(
+                    fallback_decl,
+                    &primary_stmt_src,
+                )
+            })
+            .unwrap_or_else(|| {
+                if !primary_stmt_src.is_empty() || !primary_body_src.is_empty() {
+                    crate::matryoshka::estimate_decl_proof_term_nodes(
+                        fallback_decl,
+                        &primary_stmt_src,
+                        &primary_body_src,
+                    )
+                } else {
+                    0
+                }
+            });
+        obj.insert(
+            "proof_term_nodes".to_string(),
+            serde_json::json!(proof_nodes_val),
+        );
         if obj.get("used_constants").is_none() {
-            let dist = crate::accelerators::lookup_distilled_constants(fallback_decl, &primary_stmt_src);
-            let uc = if !dist.is_empty() { dist } else { feats.stmt_consts.clone() };
+            let dist =
+                crate::accelerators::lookup_distilled_constants(fallback_decl, &primary_stmt_src);
+            let uc = if !dist.is_empty() {
+                dist
+            } else {
+                feats.stmt_consts.clone()
+            };
             obj.insert("used_constants".to_string(), serde_json::json!(uc));
         }
         obj.entry("stmt_nodes".to_string())
@@ -6010,5 +6172,72 @@ allow_decl_names = [\"ShadowAst\"]
         );
 
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_empty_audit_reports_no_specs_found_and_require_nonempty_fails() {
+        let empty_src = "def helper (n : Nat) : Nat := n + 1\n";
+        let rep = audit_spec_file_or_source(Path::new("NoThms.lean"), Some(empty_src), None);
+        assert_eq!(rep["ok"].as_bool(), Some(true));
+        assert_eq!(rep["verdict"].as_str(), Some("no_specs_found"));
+        assert_eq!(rep["total_specs_audited"].as_u64(), Some(0));
+        let warnings = rep["warnings"].as_array().unwrap();
+        assert!(warnings.iter().any(|w| {
+            w.as_str()
+                .unwrap_or_default()
+                .starts_with("no_specs_found: 0 theorem/lemma specifications recognized")
+        }));
+
+        let mut failed = rep.clone();
+        apply_require_nonempty_to_audit_report(&mut failed, true);
+        assert_eq!(failed["ok"].as_bool(), Some(false));
+        assert_eq!(failed["verdict"].as_str(), Some("no_specs_found"));
+
+        let tight = "theorem add_zero (n : Nat) : n + 0 = n := by simp\n";
+        let mut tight_rep = audit_spec_file_or_source(Path::new("HasThm.lean"), Some(tight), None);
+        apply_require_nonempty_to_audit_report(&mut tight_rep, true);
+        assert_eq!(tight_rep["ok"].as_bool(), Some(true));
+        assert_eq!(tight_rep["verdict"].as_str(), Some("specs_audited"));
+    }
+
+    #[test]
+    fn test_unapplied_rewrite_hints_move_to_suggestions() {
+        let certs = vec![
+            crate::accelerators::AcceleratorCertificate::RewrittenProof {
+                new_body_src: "by simp only [eligible, Eligible]".to_string(),
+                accelerator_name: "builtin:simd-simp-distiller".to_string(),
+                estimated_speedup_hint: "9.1x".to_string(),
+            },
+            crate::accelerators::AcceleratorCertificate::CounterexampleFound {
+                witness_summary: "a=0".to_string(),
+                suggested_hypothesis: None,
+                accelerator_name: "builtin:cex".to_string(),
+            },
+        ];
+        let (verified, suggestions) = partition_certificates_for_verified_step(&certs, false, None);
+        assert_eq!(verified.len(), 1);
+        assert!(matches!(
+            &verified[0],
+            crate::accelerators::AcceleratorCertificate::CounterexampleFound { .. }
+        ));
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0]["applied"], false);
+        assert_eq!(
+            suggestions[0]["accelerator_name"],
+            "builtin:simd-simp-distiller"
+        );
+        assert_eq!(
+            suggestions[0]["new_body_src"],
+            "by simp only [eligible, Eligible]"
+        );
+        assert_eq!(suggestions[0]["estimated_speedup_hint"], "9.1x");
+
+        let (applied, empty_sugg) = partition_certificates_for_verified_step(
+            &certs,
+            true,
+            Some("builtin:simd-simp-distiller"),
+        );
+        assert_eq!(applied.len(), 2);
+        assert!(empty_sugg.is_empty());
     }
 }
