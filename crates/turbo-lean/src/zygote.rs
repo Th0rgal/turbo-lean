@@ -7448,6 +7448,120 @@ mod tests {
         );
     }
 
+    /// Source text can set `debug.skipKernelTC` itself (top level, `set_option … in`, a cached
+    /// prefix, programmatically). The worker's independent kernel replay must reject all of them.
+    #[test]
+    fn test_zygote_source_options_cannot_bypass_kernel_checking() {
+        let (dir, store, env_vars, lean_bin) =
+            open_test_zygote_env("source_options").expect("Lean toolchain");
+        let bin = ensure_zygote_binary(&store, &lean_bin, &env_vars).unwrap();
+        let mut child = Command::new(bin)
+            .envs(&env_vars)
+            .env("LEAN", &lean_bin)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut ask = |body: &str, mode: &str, key: &str, prefix: &str| -> serde_json::Value {
+            let hex_prefix = if prefix.is_empty() {
+                String::new()
+            } else {
+                hex_encode_bytes(prefix.as_bytes())
+            };
+            writeln!(
+                stdin,
+                "Lean\t{}\t{mode}\t{key}\t{hex_prefix}\t",
+                hex_encode_bytes(body.as_bytes())
+            )
+            .unwrap();
+            stdin.flush().unwrap();
+            let mut line = String::new();
+            stdout.read_line(&mut line).unwrap();
+            serde_json::from_str(&line).unwrap()
+        };
+        let bad = include_str!("../tests/fixtures/weakening-options/Bad.lean")
+            .replace("import Lean\n", "");
+        let skip = "set_option debug.skipKernelTC true\n";
+        let skip_in = bad.replace(
+            "run_elab",
+            "set_option debug.skipKernelTC true in\nrun_elab",
+        );
+        let programmatic = bad.replace(
+            "run_elab do",
+            "run_elab withOptions (fun o => o.setBool `debug.skipKernelTC true) do",
+        );
+        let top = format!("{skip}{bad}");
+        let weak = format!("set_option weak.debug.skipKernelTC true\n{bad}");
+        let mut accepted = Vec::new();
+        let mut replay_missing = Vec::new();
+        // (label, body, mode, prefix key, prefix): the prefix rows use the cached-checkpoint path.
+        let cases: Vec<(&str, &str, &str, &str, &str)> = vec![
+            ("top-level", &top, "strict", "", ""),
+            ("set_option in", &skip_in, "strict", "", ""),
+            ("programmatic", &programmatic, "strict", "", ""),
+            ("weak prefix", &weak, "strict", "", ""),
+            ("cached prefix", &bad, "strict", "skip-prefix", skip),
+            (
+                "cached prefix (reused)",
+                &bad,
+                "strict",
+                "skip-prefix",
+                skip,
+            ),
+            ("stub prefix", &bad, "allow_stub", "skip-stub-prefix", skip),
+            (
+                "bad decl in prefix",
+                "theorem uses_bad : True := True.intro\n",
+                "strict",
+                "bad-prefix",
+                &top,
+            ),
+            ("eval", &top, "eval", "", ""),
+        ];
+        for (label, body, mode, key, prefix) in cases {
+            let reply = ask(body, mode, key, prefix);
+            let errors = reply["errors"].to_string();
+            if reply["ok"] == true {
+                accepted.push(format!("{label}: {reply}"));
+            } else if label != "weak prefix" && !errors.contains("KernelReplay") {
+                // `weak.` options are ignored by Lean, so the normal kernel check rejects that one.
+                replay_missing.push(format!("{label}: {reply}"));
+            }
+        }
+        // Legitimate resource options and normal declarations keep working, including via prefixes.
+        let legit = "set_option maxHeartbeats 400000\nstructure P where\n  a : Nat\n  h : a = a\n\
+            mutual\ninductive A | a | b (x : B)\ninductive B | c (x : A)\nend\n\
+            def f : Nat → Nat\n  | 0 => 0\n  | n+1 => f n\n\
+            theorem tf : f 3 = 0 := by simp [f]\ninstance : Inhabited P := ⟨⟨0, rfl⟩⟩\n";
+        let legit_in = "set_option maxHeartbeats 400000 in\ntheorem good : True := True.intro\n";
+        for (label, body, key, prefix) in [
+            ("legit", legit, "", ""),
+            ("legit in", legit_in, "", ""),
+            (
+                "legit prefix",
+                "theorem z : f 0 = 0 := rfl\n",
+                "legit-prefix",
+                legit,
+            ),
+        ] {
+            let reply = ask(body, "strict", key, prefix);
+            assert_eq!(reply["ok"], true, "{label}: {reply}");
+        }
+        drop(stdin);
+        assert!(child.wait().unwrap().success());
+        fs::remove_dir_all(dir).unwrap();
+        assert!(
+            accepted.is_empty(),
+            "raw worker accepted False from source options: {accepted:#?}"
+        );
+        assert!(
+            replay_missing.is_empty(),
+            "kernel replay did not report: {replay_missing:#?}"
+        );
+    }
+
     #[test]
     fn test_zygote_applies_encoded_max_heartbeats_and_isolates_prefix_cache() {
         let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("lean_args_hb")
