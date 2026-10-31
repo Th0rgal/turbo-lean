@@ -4560,7 +4560,33 @@ mod tests {
         assert!(status_b.success());
 
         let lp_a = lib_a.to_string_lossy().to_string();
-        let dig1 = compute_imported_oleans_digest("DepB", &lp_a);
+        let (dig1, complete1) = compute_imported_oleans_digest_inner("DepB", &lp_a);
+        assert!(complete1);
+        let rep_warm_seed = eval_with_zygote_pool(
+            &store,
+            toolchain,
+            &lp_a,
+            &env_vars,
+            &lean_bin,
+            "import DepB\ntheorem t_warm_1 : midValue = 12 := rfl\n",
+            false,
+        )
+        .unwrap();
+        assert!(rep_warm_seed.ok && rep_warm_seed.import_ok);
+        let rep_warm_hit = eval_with_zygote_pool(
+            &store,
+            toolchain,
+            &lp_a,
+            &env_vars,
+            &lean_bin,
+            "import DepB\ntheorem t_warm_2 : midValue + 1 = 13 := rfl\n",
+            false,
+        )
+        .unwrap();
+        assert!(
+            rep_warm_hit.ok && rep_warm_hit.env_cache_hit,
+            "Zygote worker must hit env_cache via hostClosureDigest on second request"
+        );
 
         // Rebuild transitive leaf DepC with same-length source / different constant value without touching DepB.olean
         fs::write(&src_c1, "def depValue : Nat := 99\n").unwrap();
@@ -4578,6 +4604,20 @@ mod tests {
         assert_ne!(
             dig1, dig2,
             "compute_imported_oleans_digest must track transitive .olean dependencies (DepB -> DepC)"
+        );
+        let rep_after_dep_edit = eval_with_zygote_pool(
+            &store,
+            toolchain,
+            &lp_a,
+            &env_vars,
+            &lean_bin,
+            "import DepB\ntheorem t_after_edit : depValue = 99 := rfl\n",
+            false,
+        )
+        .unwrap();
+        assert!(
+            rep_after_dep_edit.ok && !rep_after_dep_edit.env_cache_hit,
+            "Zygote worker must miss env_cache and reload when transitive DepC.olean changes"
         );
 
         // Module visibility isolation: private import in `module` must be enforced, and `LEAN_PATH`

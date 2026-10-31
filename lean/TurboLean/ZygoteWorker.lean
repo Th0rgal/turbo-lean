@@ -1280,16 +1280,15 @@ def main (args : List String) : IO Unit := do
     let line ← stdin.getLine
     if line.isEmpty then
       break
-    let rawLine := line.dropRightWhile (fun c => c == '\n' || c == '\r')
-    let trimmed := rawLine.trimAscii.toString
+    let trimmed := line.trimAscii.toString
     if trimmed.isEmpty then
       continue
     if trimmed == "ping" || ((trimmed.splitOn "\"cmd\"").length > 1 && (trimmed.splitOn "\"ping\"").length > 1) then
       stdout.putStrLn "{\"ok\":true,\"status\":\"pong\",\"kernel_gate_active\":true,\"import_ok\":true,\"env_cache_hit\":true,\"prefix_cache_hit\":false,\"import_us\":0,\"prefix_us\":0,\"elab_us\":0,\"heartbeats\":0,\"stdout\":\"\",\"messages\":[],\"errors\":[],\"used_constants\":[]}"
       stdout.flush
       continue
-    let parts := rawLine.splitOn "\t"
-    let rawImportsCsv := (parts.headD "Init").trimAscii.toString
+    let parts := trimmed.splitOn "\t"
+    let rawImportsCsv := parts.headD "Init"
     let importsCsv ← TurboLean.ZygoteWorker.coalesceImportsCsv rawImportsCsv
     let raw1 := parts.drop 1 |>.headD ""
     let raw2 := parts.drop 2 |>.headD ""
