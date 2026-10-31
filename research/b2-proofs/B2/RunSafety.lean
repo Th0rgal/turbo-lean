@@ -23,6 +23,28 @@ theorem of_returned (env : Clif.Env) (p : Clif.Program)
       | trapped c => simp [Clif.runLoop_succ, hs] at h
       | stuck msg => simp [Clif.runLoop_succ, hs] at h
 
+/-- The public runner inherits prefix safety, including initialization checks. -/
+theorem of_runWith_returned (env : Clif.Env) (p : Clif.Program) (name : String)
+    (args : List Clif.Val) (m : Clif.Mem) (n : Nat) (vs : List Clif.Val) (m' : Clif.Mem)
+    (h : Clif.runWith env p name args m n = .returned vs m') (fuel : Nat) :
+    (∀ c, Clif.runWith env p name args m fuel ≠ .trapped c) ∧
+    (∀ msg, Clif.runWith env p name args m fuel ≠ .stuck msg) := by
+  cases hi : Clif.initState p name args m with
+  | ok s =>
+    simp only [Clif.runWith, hi] at h ⊢
+    exact of_returned env p n s vs m' h fuel
+  | trap c => simp [Clif.runWith, hi] at h
+  | stuck msg => simp [Clif.runWith, hi] at h
+
+theorem collatz_run_prefix (env : Clif.Env) (p : Clif.Program) (m : Clif.Mem)
+    (n steps : UInt64) (hp : p.func? B2.Smoke.collatz.name = some B2.Smoke.collatz)
+    (fuel : Nat) :
+    (∀ c, Clif.runWith env p B2.Smoke.collatz.name
+      [B2.CollatzClif.cv n, B2.CollatzClif.cv steps] m fuel ≠ .trapped c) ∧
+    (∀ msg, Clif.runWith env p B2.Smoke.collatz.name
+      [B2.CollatzClif.cv n, B2.CollatzClif.cv steps] m fuel ≠ .stuck msg) :=
+  of_runWith_returned env p _ _ m _ _ m (B2.CollatzClif.run_with env p m n steps hp) fuel
+
 theorem collatz_prefix (env : Clif.Env) (p : Clif.Program) (m : Clif.Mem)
     (n steps : UInt64) (fuel : Nat) :
     let s := B2.CollatzClif.entryState (B2.CollatzClif.argumentRegs n steps) m

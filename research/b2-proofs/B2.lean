@@ -4,5 +4,6 @@ import B2.Kernel
 import B2.CollatzSource
 import B2.CollatzClif
 import B2.RunSafety
+import B2.CallFree
 import B2.Smoke
 import B2.AxiomAudit

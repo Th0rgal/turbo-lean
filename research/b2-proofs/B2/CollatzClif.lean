@@ -230,6 +230,16 @@ theorem generated_slots : B2.Smoke.collatz.slots = [] := by decide +kernel
 def argumentRegs (n steps : UInt64) : Regs :=
   (Regs.empty.set 0 (cv n)).set 1 (cv steps)
 
+/-- A slotless activation restores even the optional stack-placement oracle. -/
+theorem slotless_leave (f : Function) (hf : f.slots = []) (m : Mem) :
+    (enterSlots f m).2.leave = m := by
+  rcases m with ⟨allocs, bytes, next, symbols, place⟩
+  cases place with
+  | none => simp [enterSlots, hf, bumpSlots, Mem.leave]
+  | some pl =>
+    simp only [enterSlots, hf]
+    split <;> simp [placeSlots, bumpSlots, Mem.leave]
+
 theorem entered_slots (m : Mem) : (enterSlots B2.Smoke.collatz m).1 = [] := by
   simp only [enterSlots, generated_slots]
   split
@@ -248,10 +258,13 @@ theorem run_with (env : Clif.Env) (p : Program) (m : Mem) (n steps : UInt64)
     (hp : p.func? B2.Smoke.collatz.name = some B2.Smoke.collatz) :
     runWith env p B2.Smoke.collatz.name [cv n, cv steps] m (15 * steps.toNat + 5) =
       .returned [cv (Nat.repeat B2.CollatzSource.step steps.toNat n)]
-        (enterSlots B2.Smoke.collatz m).2.leave := by
+        m := by
   simp only [runWith, initState, hp, Res.ofOption, bind, Res.bind, enter_function]
-  exact from_entry env p (argumentRegs n steps) _ n steps
-    (by simp [argumentRegs, Regs.set]) (by simp [argumentRegs, Regs.set])
+  change runLoop env p (15 * steps.toNat + 5)
+    (entryState (argumentRegs n steps) (enterSlots B2.Smoke.collatz m).2) = _
+  simpa only [slotless_leave _ generated_slots m] using
+    from_entry env p (argumentRegs n steps) (enterSlots B2.Smoke.collatz m).2 n steps
+      (by simp [argumentRegs, Regs.set]) (by simp [argumentRegs, Regs.set])
 
 /-- O3 for the actual LNIR declaration and actual CLIF run, for every UInt64 argument pair. -/
 theorem source_simulation (env : Clif.Env) (p : Program) (m : Mem) (n steps : UInt64)
@@ -262,7 +275,7 @@ theorem source_simulation (env : Clif.Env) (p : Program) (m : Mem) (n steps : UI
       LeanNative.IR.Codec.collatzStepsDecl.body = .ok (v, st')) :
     ∃ rv, B2.ValRel v rv ∧
       runWith env p B2.Smoke.collatz.name [cv n, cv steps] m (15 * steps.toNat + 5) =
-        .returned [rv] (enterSlots B2.Smoke.collatz m).2.leave := by
+        .returned [rv] m := by
   rw [B2.CollatzSource.collatz_eval] at hev
   cases hev
   exact ⟨_, rfl, run_with env p m n steps hp⟩
