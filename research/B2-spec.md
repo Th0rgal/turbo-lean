@@ -112,9 +112,11 @@ Lean-version incompatibility remains an explicit incomplete requirement.
 3. `hC`, `hCT`, `hTls`, `hX`, `hXI`: respectively `CalleeOk`,
    conditionally `CalleeTryOk`, conditionally `TlsOk`, `XCallsOk`,
    `XCallsIndOk` for precisely the sites/signatures in that theorem (O6).
-   Empty externs/signatures and no call sites make the contracts vacuous;
-   prove it. `TrapsExplicit.of_tryFree` handles the try-free case provided
-   its other real premises are met.
+   Empty externs/signatures discharge `hX`/`hXI`; no prepared call sites
+   discharge `CalleeOk.os`. Its unconditional `.pc` and `.ext` clauses
+   remain explicit hook/program-preservation premises. Absence of try/TLS
+   sites discharges `hCT`/`hTls`. `TrapsExplicit.of_tryFree` handles the
+   try-free case provided its other real premises are met.
 4. `hsym`, `hslot`, `hent : AbiEntry`, `hres : StackAvail`,
    `hbe : BodyEntry`, `hargs : ArgsIn`, `hcs : ClifEntry`, and
    `hrel : Rel.holds` are the backend's symbol, layout, machine-entry,

@@ -1,7 +1,7 @@
 # B2 status
 
 Baseline: `5508b9f`; clifv `5018b9509dc124154dbe08a5bd85862595d8eab7`.
-Checkpoint: 2026-10-31 17:55 UTC. The executable lowering lives in
+Checkpoint: 2026-10-31 18:11 UTC. The executable lowering lives in
 `lean/LeanNative/Backend/Clif.lean`; `compile-clif` calls that definition.
 The active root and strict transitive axiom audit pass kernel checks on Lean 4.34.1.
 
@@ -32,9 +32,9 @@ Six compiler/proof source pairs are committed byte-identical (Types,
 AST, Codec, Value, Eval, Clif). `scripts/check_b2_source_identity.py`
 verifies them and a clean pinned clifv. `.github/workflows/b2.yml` enforces
 source identity, the proof build, and compiler-toolchain integration.
-Remote CI for checkpoint `4183cc0` passed:
-https://github.com/Th0rgal/turbo-lean/actions/runs/41224690848 .
-CI for this scope activation is pending the new push.
+Remote CI for scope activation `4a5347d` passed:
+https://github.com/Th0rgal/turbo-lean/actions/runs/41226888299 .
+This verifies the active scope proofs and audit in a fresh default-root build.
 The local Lean 4.35 CoreCLI integration build passed; the actual compiler
 dispatcher emitted collatz_steps CLIF. `research/b2-compiler-smoke.lean`
 records that check and CI runs it too.
@@ -116,3 +116,16 @@ dependencies before checking BackendContracts, then waits for FinalDirect
 before checking EndToEnd. Logs are `.b2-work/{scope,contracts,end-to-end}.log`.
 The end-to-end draft states explicit x0 equality but remains unchecked.
 Pending checks do not establish O6 or O7.
+
+At 18:11 UTC the original FinalDirect scheduler is still checking the upstream
+`FV.Backend.Proof.CSemRename` module, with steady CPU use and about 4.6 GiB RSS.
+Do not restart that working compiler. Broad priority contract builds began
+duplicating this module and were stopped; a narrower auxiliary build was also
+stopped before launching a compiler. There is now one native scheduler. Its
+implementation probes an entire wave before compiling it, so concurrent native
+targets can duplicate work and refresh shared outputs even within one project.
+Use the existing build's results for the remaining B2 checks.
+
+An isolated kernel check of the draft's exact `prepared_call_free` statement
+passed with closure `[propext]`. Complete O6 composition is still pending the
+genuine upstream contract dependencies; this isolated result does not upgrade O6.
