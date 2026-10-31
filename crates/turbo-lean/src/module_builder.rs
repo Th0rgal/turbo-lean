@@ -1708,16 +1708,20 @@ fn classify_lake_field(scope: LakeScope, key: &str, val: &str) -> LakeField {
             LakeField::Unsupported
         }
     };
-    // Only a plain enum literal (`.release`, TOML `"release"`): any other
-    // expression (e.g. `if c then .llvm else .c`) stays unknown and so unsupported.
-    let enum_tag = v
-        .strip_prefix('"')
-        .and_then(|t| t.strip_suffix('"'))
-        // `.llvm` resolves in the expected enum type; a qualified `Backend.default` can name
-        // one of the lakefile's own helpers.
-        .or_else(|| v.strip_prefix('.'))
-        .filter(|t| t.chars().all(|c| c.is_ascii_alphanumeric()))
-        .unwrap_or("");
+    // An enum value passes only as a TOML string (decoded like Lake's `ofString?`) or as a Lean
+    // `.ctor` naming a real constructor: a qualified name (`Backend.default`) or a non-constructor
+    // (`.C`) can name a lakefile's own helper, and any other expression is evaluated by Lake.
+    let toml_str = v
+        .starts_with(['"', '\''])
+        .then(|| parse_toml_string(v).ok())
+        .flatten();
+    let dot_ctor = v.strip_prefix('.');
+    let enum_is = |toml_ok: &dyn Fn(&str) -> bool, ctors: &[&str]| match (&toml_str, dot_ctor) {
+        (Some(t), _) => toml_ok(t),
+        (None, Some(c)) => ctors.contains(&c),
+        _ => false,
+    };
+    const BUILD_TYPES: [&str; 3] = ["release", "relWithDebInfo", "minSizeRel"];
     let empty_array = matches!(v, "[]" | "#[]");
     match (scope, key) {
         (
@@ -1733,16 +1737,24 @@ fn classify_lake_field(scope: LakeScope, key: &str, val: &str) -> LakeField {
             | "allowNonModules",
         ) => LakeField::Passive,
         // Only `debug` adds an option (`debugAssertions`) to `lean`; the rest are `leanc` flags.
-        (_, "buildType") => only_if(matches!(
-            enum_tag,
-            "release"
-                | "Release"
-                | "relWithDebInfo"
-                | "RelWithDebInfo"
-                | "minSizeRel"
-                | "MinSizeRel"
+        (_, "buildType") => only_if(enum_is(
+            &|t| {
+                // Lake's TOML decoder decapitalizes the string.
+                let mut cs = t.chars();
+                let lower: String = cs
+                    .next()
+                    .map(|c| c.to_ascii_lowercase())
+                    .into_iter()
+                    .chain(cs)
+                    .collect();
+                BUILD_TYPES.contains(&lower.as_str())
+            },
+            &BUILD_TYPES,
         )),
-        (_, "backend") => only_if(matches!(enum_tag, "c" | "C" | "default")),
+        (_, "backend") => only_if(enum_is(
+            &|t| matches!(t, "c" | "default"),
+            &["c", "default"],
+        )),
         // `true` drops platform-dependent inputs (none here) from the trace; `false` adds the
         // platform, which turbo-lean's trace does not.
         (_, "platformIndependent") => only_if(matches!(v, "true" | "some true")),
@@ -11499,6 +11511,9 @@ roots = ["Fast"]
             "\"llvm\"",
             "Backend.default",
             "Lake.Backend.c",
+            ".C",
+            ".Default",
+            "\"C\"",
         ] {
             assert!(
                 matches!(
@@ -11514,7 +11529,35 @@ roots = ["Fast"]
                 LakeField::Passive
             ));
         }
-        // A dependency's own helper can shadow a qualified enum name.
+        for (v, ok) in [
+            ("\"Release\"", true),
+            ("\"minSizeRel\"", true),
+            (".relWithDebInfo", true),
+            (".Release", false),
+            (".debug", false),
+            ("\"debug\"", false),
+        ] {
+            assert_eq!(
+                matches!(
+                    classify_lake_field(LakeScope::Package, "buildType", v),
+                    LakeField::Passive
+                ),
+                ok,
+                "{v}"
+            );
+        }
+        // A dependency's own helper can shadow a non-constructor enum name.
+        let lf = dir.join("lakefile.lean");
+        fs::write(
+            &lf,
+            "import Lake\nopen Lake DSL\ndef Lake.Backend.C : Lake.Backend := .llvm\npackage t where\n  backend := .C\nlean_lib A\n",
+        )
+        .unwrap();
+        assert!(parse_lakefile_lean(&dir, &lf, false)
+            .unwrap()
+            .unsupported
+            .is_some());
+        // ... or a qualified enum name.
         let lf = dir.join("lakefile.lean");
         fs::write(
             &lf,
