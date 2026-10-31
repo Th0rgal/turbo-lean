@@ -2796,7 +2796,7 @@ pub fn run_tpu_fast_check(json: bool, file: &Path, decl_filter: Option<&str>) ->
         crate::check::confirm_selected_decl(
             &src_text,
             target,
-            file.parent().unwrap_or(Path::new(".")),
+            &crate::lake_build::find_project_root(file),
             file,
         )?;
     }
@@ -2962,7 +2962,7 @@ pub fn run_fast_check_command(
             crate::check::confirm_selected_decl(
                 &src_text,
                 target,
-                file.parent().unwrap_or(Path::new(".")),
+                &crate::lake_build::find_project_root(&file),
                 &file,
             )?;
         }

@@ -46,7 +46,7 @@ fn lexical_scope_and_elaborated_identity_across_verdict_paths() {
                         .args(["--json", "--cache-dir"])
                         .arg(tmp.0.join("cache"))
                         .arg(mode)
-                        .arg(&file)
+                        .arg("Identity.lean")
                         .args(["--decl", target]);
                     if mode != "fast-check" {
                         cmd.arg("--project-dir").arg(&tmp.0);
