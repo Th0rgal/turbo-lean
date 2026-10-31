@@ -1474,21 +1474,27 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
         -- mark symbolic execution unsupported so TV fails closed even in `src`!
         (((st.clearAlias dst).unmarkTypedTuple dst).markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
   | .allocCtor tag objFields scalarFields =>
-    let svs := (objFields ++ scalarFields).map st.lookupVar
-    let encodeCtorField (v : VarId) : SymExpr :=
-      let root := st.resolveBuf v
-      let rv := st.lookupVar root
-      if st.isHeapObjectRoot root then .symVar root
-      else match rv.expr with
-        | .symVar rId => .symVar (st.resolveBuf rId)
-        | e => e
-    let objectExprs := objFields.map encodeCtorField
-    let scalarExprs := scalarFields.map encodeCtorField
-    (st.markAllocated dst).bindVar dst {
-      expr := .tuple (.constU64 tag.toUInt64 :: objectExprs ++ scalarExprs)
-      nonPoison := svs.all (·.nonPoison)
-      noUB := svs.all (·.noUB)
-    }
+    if tag > 0xFFFFFFFFFFFFFFFF then
+      -- Concrete `HeapObj.tag : Nat` retains unbounded tags whereas `SymExpr.constU64` is 64-bit:
+      -- fail closed (`symUnsupported`) rather than truncating `tag.toUInt64`!
+      (((st.clearAlias dst).unmarkTypedTuple dst).markUnsupported).bindVar dst
+        { expr := .unit, nonPoison := false, noUB := false }
+    else
+      let svs := (objFields ++ scalarFields).map st.lookupVar
+      let encodeCtorField (v : VarId) : SymExpr :=
+        let root := st.resolveBuf v
+        let rv := st.lookupVar root
+        if st.isHeapObjectRoot root then .symVar root
+        else match rv.expr with
+          | .symVar rId => .symVar (st.resolveBuf rId)
+          | e => e
+      let objectExprs := objFields.map encodeCtorField
+      let scalarExprs := scalarFields.map encodeCtorField
+      (st.markAllocated dst).bindVar dst {
+        expr := .tuple (.constU64 tag.toUInt64 :: objectExprs ++ scalarExprs)
+        nonPoison := svs.all (·.nonPoison)
+        noUB := svs.all (·.noUB)
+      }
   | .ctorGetObj ctorVar idx | .ctorGetScalar ctorVar idx _ =>
         let isScalarProj :=
           match e with

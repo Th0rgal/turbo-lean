@@ -2413,6 +2413,22 @@ open LeanNative.IR LeanNative.Proofs
   let tagRetBad := validateTranslationDecl (mkTagRefinedReturnDecl false) (mkTagRefinedReturnDecl true) 8
   unless !tagRetBad.symRetEquiv && !tagRetBad.passed do
     throw <| IO.userError s!"tag-refined input objPtr return collapsed to unboxed tuple: {reprStr tagRetBad}"
+  let mkOverflowTagDecl (tagAt999 : Nat) : LNIRDecl := {
+    name := "alloc_ctor_tag_overflow"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .objPtr
+    body :=
+      .letBind 1 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+        (.ite 1
+          (.letBind 2 .objPtr (.allocCtor tagAt999 [] []) (.ret 2))
+          (.letBind 2 .objPtr (.allocCtor 0 [] []) (.ret 2)))
+  }
+  let ovfTagBad := validateTranslationDecl (mkOverflowTagDecl 0) (mkOverflowTagDecl 18446744073709551616) 8
+  unless !ovfTagBad.ubRefines && !ovfTagBad.passed do
+    throw <| IO.userError s!"allocCtor tag > UInt64.max truncated without failing closed: {reprStr ovfTagBad}"
+  let ovfTagSrcBad := validateTranslationDecl (mkOverflowTagDecl 18446744073709551616) (mkOverflowTagDecl 0) 8
+  unless !ovfTagSrcBad.ubRefines && !ovfTagSrcBad.passed do
+    throw <| IO.userError s!"source allocCtor tag > UInt64.max accepted non-identity target: {reprStr ovfTagSrcBad}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)
