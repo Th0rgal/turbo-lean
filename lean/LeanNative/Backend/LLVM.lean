@@ -2016,7 +2016,7 @@ def localScalarSigsOfModule (m : LNIRModule) : List (String × List LNIRType × 
       some (d.name, d.params.map (·.ty), d.retTy)
     else none
 
-partial def findUnsupportedLLVMCallInCode (localSigs : List (String × List LNIRType × LNIRType)) : LNIRCode → Option String
+private partial def findUnsupportedLLVMCallInCodeAux (localSigs : List (String × List LNIRType × LNIRType)) : LNIRCode → Option String
   | .letBind _ ty (.call callee args _ isExt) k =>
     let ok := !isExt && (
       (callee == "lean_native_box_u64" && args.length == 1 && slotLLVMType ty == "ptr") ||
@@ -2024,17 +2024,27 @@ partial def findUnsupportedLLVMCallInCode (localSigs : List (String × List LNIR
       (callee == "lean_native_ensure_exclusive" && args.length == 1 && slotLLVMType ty == "ptr") ||
       (callee == "lean_native_sarray_len" && args.length == 1 && slotLLVMType ty == "i64") ||
       (slotLLVMType ty == "i64" && localSigs.any (fun (nm, pTys, _) => nm == callee && pTys.length == args.length)))
-    if !ok then some callee else findUnsupportedLLVMCallInCode localSigs k
+    if !ok then some callee else findUnsupportedLLVMCallInCodeAux localSigs k
   | .letBind _ _ (.ctorGetScalar _ _ _) _ => some "ctorGetScalar"
   | .letBind _ _ _ k | .rawStore _ _ _ _ k | .incRef _ _ k | .decRef _ _ k | .parFor _ _ _ _ _ k =>
-    findUnsupportedLLVMCallInCode localSigs k
-  | .ite _ t e => findUnsupportedLLVMCallInCode localSigs t <|> findUnsupportedLLVMCallInCode localSigs e
-  | .seqFor _ _ _ _ _ _ body k => findUnsupportedLLVMCallInCode localSigs body <|> findUnsupportedLLVMCallInCode localSigs k
+    findUnsupportedLLVMCallInCodeAux localSigs k
+  | .ite _ t e => findUnsupportedLLVMCallInCodeAux localSigs t <|> findUnsupportedLLVMCallInCodeAux localSigs e
+  | .seqFor _ _ _ _ _ _ body k => findUnsupportedLLVMCallInCodeAux localSigs body <|> findUnsupportedLLVMCallInCodeAux localSigs k
   | .ret _ | .unreachable => none
+
+/-- P-cert C5 (fail closed): the LLVM backend accepts no RC-ADT (Stage 1D heap) code — any heap-typed binder,
+    ctor op, heap box, `isExclusive`, or heap runtime call is `some`. The heap lowering above is defensive
+    (guarded, C2.3) but is not reachable through the gated CLI/worker paths until the RC-ADT backend lands. -/
+def findUnsupportedLLVMCallInCode (localSigs : List (String × List LNIRType × LNIRType)) (c : LNIRCode) : Option String :=
+  findUnsupportedLLVMCallInCodeAux localSigs c <|> (if c.containsRcAdt [] then some "rc_adt" else none)
+
+/-- Decl-level C5 gate: also rejects heap-typed params/return and `incRef`/`decRef` on a heap param. -/
+def findUnsupportedLLVMCallInDecl (localSigs : List (String × List LNIRType × LNIRType)) (d : LNIRDecl) : Option String :=
+  findUnsupportedLLVMCallInCode localSigs d.body <|> (if d.containsRcAdt then some "rc_adt" else none)
 
 def findUnsupportedLLVMCall? (m : LNIRModule) : Option (String × String) :=
   let sigs := localScalarSigsOfModule m
-  m.decls.findSome? fun d => (findUnsupportedLLVMCallInCode sigs d.body).map (d.name, ·)
+  m.decls.findSome? fun d => (findUnsupportedLLVMCallInDecl sigs d).map (d.name, ·)
 
 def emitLLVMModule (optimized : Bool) (m : LNIRModule) (target : TargetArch := .x86_64)
     (isaOverride? : Option IsaLevel := none) (wasmSimd128 : Bool := false) : String :=
@@ -2059,6 +2069,22 @@ def emitLLVMBaseline (m : LNIRModule) (target : TargetArch := .x86_64)
 def emitLLVMOptimized (m : LNIRModule) (target : TargetArch := .x86_64)
     (isaOverride? : Option IsaLevel := none) (wasmSimd128 : Bool := false) : String :=
   emitLLVMModule true m target isaOverride? wasmSimd128
+
+/-- C5 decl-level: a heap param that is only `incRef`/`decRef`'d (no heap expr in the body) is still rejected. -/
+private def rcParamOnlyDecl : LNIRDecl where
+  name := "rc_param"
+  params := [{ id := 0, name := "p", ty := .objPtr }]
+  retTy := .i64
+  body := .incRef 0 1 (.decRef 0 1 (.letBind 1 .i64 (.scalar (.constU64 0)) (.ret 1)))
+
+private def scalarIdDecl : LNIRDecl where
+  name := "scalar"
+  params := [{ id := 0, name := "x", ty := .i64 }]
+  retTy := .i64
+  body := .ret 0
+
+#guard findUnsupportedLLVMCallInDecl [] rcParamOnlyDecl == some "rc_adt"
+#guard findUnsupportedLLVMCallInDecl [] scalarIdDecl == none
 
 /-- Slot-type regression: a 3-field tuple parameter with an `i256` field, a projection that
     precedes the tuple's own binding, and a `ptr`-returning `.call` with an `i64` argument. -/
@@ -2088,13 +2114,15 @@ def slotTypeRegressionOk : Bool :=
     has s!"%slot_v4 = alloca {tup3}" && has "%slot_v5 = alloca ptr" && has "%slot_v6 = alloca ptr" && has "%slot_v2 = alloca i256" &&
     has s!"extractvalue {tup3}" && has s!"insertvalue {tup3}" && !has "{ i64, i64 }"
 
-/-- C2.3: `allocCtor`/`ctorGetObj` are lowered (the latter behind `emitHeapGuard`); `ctorGetScalar` (C1.2 layout)
-    and the heap-mutation / tag-read calls have no LLVM lowering yet and are rejected rather than emitted. -/
+/-- C5: every RC-ADT decl is rejected — ctor ops (even though `allocCtor`/`ctorGetObj` have a guarded lowering),
+    `ctorGetScalar`, heap calls, and a decl whose only heap use is `isExclusive`/`incRef`/`decRef` on a param. -/
 private def ctorOpsLLVMRegDecls : List (LNIRDecl × Option String) := [
   ({ name := "reg_alloc_ctor", params := [{ id := 0, name := "x", ty := .i64 }], retTy := .objPtr,
-     body := .letBind 1 .objPtr (.allocCtor 0 [] [0]) (.ret 1) }, none),
+     body := .letBind 1 .objPtr (.allocCtor 0 [] [0]) (.ret 1) }, some "rc_adt"),
   ({ name := "reg_ctor_get_obj", params := [{ id := 0, name := "p", ty := .objPtr }], retTy := .objPtr,
-     body := .letBind 1 .objPtr (.ctorGetObj 0 0) (.ret 1) }, none),
+     body := .letBind 1 .objPtr (.ctorGetObj 0 0) (.ret 1) }, some "rc_adt"),
+  ({ name := "reg_isx_rc_only", params := [{ id := 0, name := "p", ty := .objPtr }], retTy := .i64,
+     body := .incRef 0 1 (.letBind 1 .i1 (.isExclusive 0) (.decRef 0 1 (.ret 1))) }, some "rc_adt"),
   ({ name := "reg_ctor_get_scalar", params := [{ id := 0, name := "p", ty := .objPtr }], retTy := .i64,
      body := .letBind 1 .i64 (.ctorGetScalar 0 0 .i64) (.ret 1) }, some "ctorGetScalar"),
   ({ name := "reg_ctor_set", params := [{ id := 0, name := "p", ty := .objPtr }], retTy := .unit,
@@ -2102,7 +2130,7 @@ private def ctorOpsLLVMRegDecls : List (LNIRDecl × Option String) := [
 ]
 
 #guard ctorOpsLLVMRegDecls.all fun (d, expected) =>
-  findUnsupportedLLVMCallInCode [] d.body == expected &&
+  findUnsupportedLLVMCallInDecl [] d == expected &&
   findUnsupportedLLVMCall? { moduleName := "ctor_reg", decls := [d] } == expected.map (d.name, ·)
 
 end LeanNative.Backend.LLVM

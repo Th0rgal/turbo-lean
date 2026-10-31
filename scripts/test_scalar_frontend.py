@@ -1001,11 +1001,23 @@ def probe_rc_drop (sel seed delta : UInt64) : UInt64 :=
             src = tmp / "Stage1DHeap.lean"
             src.write_text(lean_src, encoding="utf-8")
             wire = tmp / "stage1d.lnir"
+            # P-cert C4: without `--allow-rc-adt`, emit-lnir and emit-cabi-bindings hard-fail on a Stage 1D decl
+            # and write nothing (no helper prototypes leak into bindings).
+            for cmd, out in (["emit-lnir", "--wire"], wire), (["emit-cabi-bindings", "--emit-header"], tmp / "h.h"):
+                rej = subprocess.run([engines["full_bin"], *cmd, str(out), str(src)] if cmd[0] != "emit-lnir"
+                                     else [engines["full_bin"], *cmd, str(src), "-o", str(out)], capture_output=True, text=True)
+                self.assertNotEqual(rej.returncode, 0, f"{cmd[0]} must fail closed without --allow-rc-adt")
+                self.assertFalse(out.exists())
             res = subprocess.run(
-                [engines["full_bin"], "emit-lnir", "--wire", str(src), "-o", str(wire)],
+                [engines["full_bin"], "emit-lnir", "--wire", "--allow-rc-adt", str(src), "-o", str(wire)],
                 capture_output=True, text=True,
             )
             self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            # a module loaded from the opted-in wire is still rejected by default emit-lnir/emit-cabi-bindings
+            for cmd in (["emit-lnir", "--wire", "--lnir", str(wire)], ["emit-cabi-bindings", "--lnir", str(wire)]):
+                rej = subprocess.run([engines["core_bin"], *cmd], capture_output=True, text=True)
+                self.assertNotEqual(rej.returncode, 0, f"{cmd[0]} must reject an RC-ADT wire without --allow-rc-adt")
+                self.assertIn("RC-ADT", rej.stderr)
             wire_text = wire.read_text(encoding="utf-8")
             for op in ("C_inc", "C_dec", "E_ctor", "E_cgeto", "E_isexcl", "E_mktup", "E_projtup", "C_ite"):
                 self.assertGreater(wire_text.count(op), 0, f"missing expected opcode {op} in Stage 1D wire")
@@ -1064,7 +1076,7 @@ def probe_tri (x : UInt64) : UInt64 :=
   readThirdField (stepTriField init 7)
 ''', encoding="utf-8")
             tri_wire = tmp / "tri.lnir"
-            subprocess.run([engines["full_bin"], "emit-lnir", "--wire", str(tri_src), "-o", str(tri_wire)],
+            subprocess.run([engines["full_bin"], "emit-lnir", "--wire", "--allow-rc-adt", str(tri_src), "-o", str(tri_wire)],
                            check=True, capture_output=True, text=True)
             tri_tv = json.loads(subprocess.check_output(
                 [engines["core_bin"], "validate-tv", "--lnir", str(tri_wire), "--json"], text=True,
@@ -1087,7 +1099,7 @@ def probe_bad_direct (x : UInt64) : UInt64 := readDirect (.data x)
 ''', encoding="utf-8")
             bad_wire = tmp / "bad_scalar_adt.lnir"
             bad_res = subprocess.run(
-                [engines["full_bin"], "emit-lnir", "--wire", str(bad_scalar_adt), "-o", str(bad_wire)],
+                [engines["full_bin"], "emit-lnir", "--wire", "--allow-rc-adt", str(bad_scalar_adt), "-o", str(bad_wire)],
                 capture_output=True, text=True,
             )
             self.assertNotEqual(bad_res.returncode, 0, "direct scalar-payload heap ADT must fail closed")
