@@ -91,6 +91,27 @@ impl Project {
              theorem sneaky : False := cheat\n",
         )
         .unwrap();
+        // `#print axioms` command-macro spoof, `admit` tactic, French-quote targets/stubs/dots, and namespace qualification.
+        fs::write(
+            root.join("N.lean"),
+            "macro \"#print\" \"axioms\" _id:ident : command => `(command| #check True)\n\
+             macro \"cheat\" : term => return ⟨Lean.Syntax.node .none (Lean.Name.mkStr4 \"Lean\" \"Parser\" \"Term\" (\"sor\" ++ \"ry\")) #[Lean.Syntax.atom .none (\"sor\" ++ \"ry\")]⟩\n\
+             theorem spoofed : False := cheat\n\
+             theorem via_admit : False := by admit\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Q.lean"),
+            "namespace Ns\n\
+             theorem «pre.stub» : 1 + 1 = 2 := rfl\n\
+             theorem «ok.thm» : 1 + 1 = 2 := «pre.stub»\n\
+             theorem «bad.thm» : False := sorry\n\
+             end Ns\n\
+             namespace Other\n\
+             theorem «bad.thm» : True := trivial\n\
+             end Other\n",
+        )
+        .unwrap();
         Self(root)
     }
 
@@ -201,8 +222,28 @@ fn check_decl_rejects_sorry_target_and_keeps_prefix_stubs() {
         // Whole-file and directory checks reject too, even with the targets' shards attempted above;
         // the hidden `sorry` of `H.lean` first, so its whole-file check cannot seed `--decl` caches.
         assert_rejected(&p, "J.lean", "bad", daemon);
+        assert_rejected(&p, "K.lean", "«bad»", daemon);
+        assert_rejected(&p, "K.lean", "bad", daemon);
+        assert_rejected(&p, "N.lean", "spoofed", daemon);
+        assert_rejected(&p, "N.lean", "via_admit", daemon);
+        for qgood in ["«ok.thm»", "Ns.«ok.thm»"] {
+            let ok = p.check("Q.lean", qgood, daemon);
+            assert!(
+                ok.status.success()
+                    && matches!(
+                        status(&ok).as_str(),
+                        "theorem_verified" | "theorem_cache_hit"
+                    ),
+                "Q.lean --decl {qgood} (daemon={daemon}) must verify through French-quote prefix stub:\n{}{}",
+                String::from_utf8_lossy(&ok.stdout),
+                String::from_utf8_lossy(&ok.stderr)
+            );
+        }
+        assert_rejected(&p, "Q.lean", "«bad.thm»", daemon);
+        assert_rejected(&p, "Q.lean", "Ns.«bad.thm»", daemon);
         for target in [
-            "H.lean", "I.lean", "L.lean", "M.lean", "K.lean", "J.lean", "F.lean", "G.lean", ".",
+            "H.lean", "I.lean", "L.lean", "M.lean", "K.lean", "J.lean", "N.lean", "Q.lean",
+            "F.lean", "G.lean", ".",
         ] {
             let out = p.run(&["check", target], daemon);
             assert!(

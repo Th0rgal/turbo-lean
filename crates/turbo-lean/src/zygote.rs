@@ -504,15 +504,16 @@ impl LifecycleProcess {
             return None;
         }
         let proc = PathBuf::from(format!("/proc/{pid}"));
+        let cmdline = fs::read(proc.join("cmdline")).ok()?;
+        let environ = fs::read(proc.join("environ")).ok()?;
+        if cmdline.is_empty() || environ.is_empty() {
+            return None;
+        }
         let process = Self {
             pid,
             pidfd,
             start_time,
-            identity: (
-                fs::read_link(proc.join("exe")).ok()?,
-                fs::read(proc.join("cmdline")).ok()?,
-                fs::read(proc.join("environ")).ok()?,
-            ),
+            identity: (fs::read_link(proc.join("exe")).ok()?, cmdline, environ),
             staging: staging.map(Path::to_path_buf),
             parent,
         };
@@ -2331,8 +2332,9 @@ fn parse_audit_modules_reply(
 /// Plain-`lean` fallback for a shard the zygote could not check (unavailable or import failure):
 /// compile `source` to a scratch `.olean`, then accept it only on the kernel-level
 /// `--audit-modules --shard` verdict over the compiled module (axioms incl. `sorryAx`,
-/// extern/implemented_by, csimp, `unsafe`), never on output the shard itself controls. Only the
-/// source's `:= sorry` prefix stubs outside `audit` are exempt, by name and kernel value, and every
+/// extern/implemented_by, csimp, `unsafe`), never on output the shard itself controls. When
+/// `allow_prefix_stubs` is true, only the source's `:= sorry` prefix stubs outside `audit` are
+/// exempt, by name and kernel value; when false (whole-file audit), zero stubs are exempt. Every
 /// `audit` theorem must be declared. A failed compile returns its non-success output; an audit
 /// rejection is an error.
 #[allow(clippy::too_many_arguments)]
@@ -2346,9 +2348,36 @@ pub(crate) fn run_audited_lean_shard(
     lean_args: &[String],
     timeout_ms: Option<u64>,
 ) -> Result<std::process::Output> {
+    run_audited_lean_shard_at(
+        &store.root,
+        &store.fast_staging_dir(),
+        lean_bin,
+        env_vars,
+        cwd,
+        source,
+        audit,
+        true,
+        lean_args,
+        timeout_ms,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_audited_lean_shard_at(
+    store_root: &Path,
+    staging_dir: &Path,
+    lean_bin: &Path,
+    env_vars: &std::collections::HashMap<String, String>,
+    cwd: Option<&Path>,
+    source: &str,
+    audit: &std::collections::HashSet<String>,
+    allow_prefix_stubs: bool,
+    lean_args: &[String],
+    timeout_ms: Option<u64>,
+) -> Result<std::process::Output> {
     let started = std::time::Instant::now();
     let mod_name = format!("TurboAuditedShard_{}_{}", std::process::id(), next_tmp_id());
-    let tmp_dir = store.fast_staging_dir().join(&mod_name);
+    let tmp_dir = staging_dir.join(&mod_name);
     let _ = fs::remove_dir_all(&tmp_dir);
     fs::create_dir_all(&tmp_dir)?;
     struct TmpDirGuard(PathBuf);
@@ -2401,11 +2430,15 @@ pub(crate) fn run_audited_lean_shard(
             .transpose()
     };
     let zygote_bin = match budget_left("the shard auditor was ready")? {
-        None => ensure_zygote_binary(store, lean_bin, env_vars)?,
+        None => ensure_zygote_binary_at(store_root, lean_bin, env_vars)?,
         // A cold auditor build may outlive the request; it still warms the cache in the background.
         Some(left) => {
             let (tx, rx) = std::sync::mpsc::channel();
-            let (root, lean, env) = (store.root.clone(), lean_bin.to_path_buf(), env_vars.clone());
+            let (root, lean, env) = (
+                store_root.to_path_buf(),
+                lean_bin.to_path_buf(),
+                env_vars.clone(),
+            );
             std::thread::spawn(move || {
                 let _ = tx.send(ensure_zygote_binary_at(&root, &lean, &env));
             });
@@ -2454,11 +2487,13 @@ pub(crate) fn run_audited_lean_shard(
             crate::splitter::extra_allowed_axiom_patterns().join(","),
         );
     }
-    for sh in crate::splitter::split_lean_source(source, &[]).shards {
-        if crate::splitter::strip_lean_comments(&sh.proof_text).trim() == "sorry"
-            && !crate::splitter::matches_uncached_or_fast_verify_name(&sh.name, audit)
-        {
-            auditor.arg(format!("--stub-ok={}", sh.name));
+    if allow_prefix_stubs {
+        for sh in crate::splitter::split_lean_source(source, &[]).shards {
+            if crate::splitter::strip_lean_comments(&sh.proof_text).trim() == "sorry"
+                && !crate::splitter::matches_uncached_or_fast_verify_name(&sh.name, audit)
+            {
+                auditor.arg(format!("--stub-ok={}", sh.name));
+            }
         }
     }
     auditor.arg(&mod_name);
@@ -2698,7 +2733,7 @@ fn stub_mode_flag(allow_stub: bool, stub_targets: &[String], shard_source: &str)
                 .shards
                 .into_iter()
                 .filter(|sh| {
-                    sh.proof_text.trim() == "sorry"
+                    crate::splitter::strip_lean_comments(&sh.proof_text).trim() == "sorry"
                         && !crate::splitter::matches_uncached_or_fast_verify_name(
                             &sh.name, &targets,
                         )
@@ -3841,14 +3876,32 @@ pub fn eval_shard_via_zygote(
             sub_decl_source.trim_start()
         )
     };
-    eval_with_zygote_pool_with_args(
+    let sub_targets: Vec<String> = crate::splitter::split_lean_source(sub_decl_source, &[])
+        .shards
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    if sub_targets.is_empty() {
+        return eval_with_zygote_pool_with_args(
+            store,
+            toolchain,
+            req_lean_path,
+            env_vars,
+            lean_bin,
+            &combined_source,
+            false,
+            lean_args,
+        );
+    }
+    eval_with_zygote_pool_for_targets(
         store,
         toolchain,
         req_lean_path,
         env_vars,
         lean_bin,
         &combined_source,
-        false,
+        &sub_targets,
+        None,
         lean_args,
     )
 }
@@ -3868,6 +3921,34 @@ fn encode_multi_decl_zygote_req(
     let (imports_csv, prefix_body) = split_shard_for_zygote(prefix_source);
     let prefix_key = blake3::hash(prefix_body.as_bytes()).to_hex().to_string();
     let hex_prefix = hex_encode_bytes(prefix_body.as_bytes());
+    let mut targets: Vec<String> = Vec::new();
+    for s in decl_sources {
+        for sh in crate::splitter::split_lean_source(s, &[]).shards {
+            if !targets.contains(&sh.name) {
+                targets.push(sh.name);
+            }
+        }
+    }
+    let target_set: std::collections::HashSet<String> = targets.iter().cloned().collect();
+    let stubs: Vec<String> = crate::splitter::split_lean_source(prefix_source, &[])
+        .shards
+        .into_iter()
+        .filter(|sh| {
+            crate::splitter::strip_lean_comments(&sh.proof_text).trim() == "sorry"
+                && !crate::splitter::matches_uncached_or_fast_verify_name(&sh.name, &target_set)
+        })
+        .map(|sh| sh.name)
+        .collect();
+    let mode_with_stubs = if stubs.is_empty() && targets.is_empty() {
+        mode.to_string()
+    } else {
+        format!(
+            "{}:{}:{}",
+            mode,
+            hex_encode_bytes(targets.join("\n").as_bytes()),
+            hex_encode_bytes(stubs.join("\n").as_bytes())
+        )
+    };
     let hex_decls_csv = decl_sources
         .iter()
         .map(|s| {
@@ -3881,12 +3962,12 @@ fn encode_multi_decl_zygote_req(
     let req_line = if hex_opts.is_empty() {
         format!(
             "{}\t{}\t{}\t{}\t{}\n",
-            imports_csv, mode, prefix_key, hex_prefix, hex_decls_csv
+            imports_csv, mode_with_stubs, prefix_key, hex_prefix, hex_decls_csv
         )
     } else {
         format!(
             "{}\t{}\t{}\t{}\t{}\t{}\n",
-            imports_csv, mode, prefix_key, hex_prefix, hex_decls_csv, hex_opts
+            imports_csv, mode_with_stubs, prefix_key, hex_prefix, hex_decls_csv, hex_opts
         )
     };
     (imports_csv, prefix_key, req_line)
@@ -3912,18 +3993,6 @@ pub fn eval_subshards_batch_via_zygote(
             prefix_cache_hit: true,
             ..Default::default()
         });
-    }
-    if sub_decl_sources.len() == 1 {
-        return eval_shard_via_zygote(
-            store,
-            toolchain,
-            req_lean_path,
-            env_vars,
-            lean_bin,
-            prefix_source,
-            &sub_decl_sources[0],
-            lean_args,
-        );
     }
     let req_tuple =
         encode_multi_decl_zygote_req(prefix_source, "batch_fission", sub_decl_sources, lean_args);
@@ -3970,22 +4039,6 @@ pub fn eval_candidates_race_via_zygote(
             errors: vec!["no candidate declarations provided".to_string()],
             ..Default::default()
         });
-    }
-    if candidate_decl_sources.len() == 1 {
-        let mut rep = eval_shard_via_zygote(
-            store,
-            toolchain,
-            req_lean_path,
-            env_vars,
-            lean_bin,
-            prefix_source,
-            &candidate_decl_sources[0],
-            lean_args,
-        )?;
-        if rep.ok {
-            rep.winning_candidate_idx = Some(0);
-        }
-        return Ok(rep);
     }
     let req_tuple = encode_multi_decl_zygote_req(
         prefix_source,
@@ -4439,25 +4492,6 @@ pub(crate) fn try_zygote_url_check_shard_inner_with_inflight_detailed(
     ))
 }
 
-pub fn try_zygote_url_check_shard_with_inflight(
-    base_url: &str,
-    req: &CheckShardHttpRequest,
-    on_inflight: impl FnOnce(),
-) -> Option<serde_json::Value> {
-    try_zygote_url_check_shard_inner_with_inflight_detailed(base_url, req, on_inflight)
-        .ok()
-        .flatten()
-}
-
-pub fn try_zygote_url_check_shard(
-    base_url: &str,
-    req: &CheckShardHttpRequest,
-) -> Option<serde_json::Value> {
-    try_zygote_url_check_shard_inner_with_inflight_detailed(base_url, req, || {})
-        .ok()
-        .flatten()
-}
-
 pub fn try_local_zygote_check_shard_detailed(
     store: &TurboStore,
     env_vars: &std::collections::HashMap<String, String>,
@@ -4502,16 +4536,6 @@ pub fn try_local_zygote_check_shard_detailed(
         }
         response => finish_check_shard_request(response),
     }
-}
-
-pub fn try_local_zygote_check_shard(
-    store: &TurboStore,
-    env_vars: &std::collections::HashMap<String, String>,
-    req: &CheckShardHttpRequest,
-) -> Option<serde_json::Value> {
-    try_local_zygote_check_shard_detailed(store, env_vars, req)
-        .ok()
-        .flatten()
 }
 
 fn is_pure_eval_source(source: &str) -> bool {

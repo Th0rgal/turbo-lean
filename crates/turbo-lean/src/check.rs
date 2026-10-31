@@ -509,7 +509,7 @@ pub fn try_stateless_remote_single_decl_check(
         skip_cas_lock: false,
         allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
         lean_args: file_lean_args,
-        targets: Vec::new(),
+        targets: vec![target_decl.to_string()],
     })?;
 
     let mut store_opt: Option<TurboStore> = None;
@@ -1200,25 +1200,26 @@ fn check_directory(
                 lean_args: cross_args.clone(),
                 targets: cross_names.iter().cloned().collect(),
             };
-            let mut cross_ok = proj_build_verified
-                || pack::try_local_zygote_check_shard(store, &env_vars, &zreq).is_some();
+            let mut cross_ok = proj_build_verified;
             if !cross_ok {
-                let tmp_cross = staging_dir.join(format!("cross_file_coalesced_{}.lean", pid));
-                let mut cmd = Command::new(&lean_bin);
-                for arg in crate::module_builder::filter_allowed_lean_args(&cross_args) {
-                    cmd.arg(arg);
+                match pack::try_local_zygote_check_shard_detailed(store, &env_vars, &zreq) {
+                    Ok(Some(_)) => cross_ok = true,
+                    Ok(None) => {
+                        cross_ok = crate::zygote::run_audited_lean_shard(
+                            store,
+                            Path::new(&lean_bin),
+                            &env_vars,
+                            Some(canon_dir),
+                            &cross_src,
+                            &cross_names,
+                            &cross_args,
+                            Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+                        )?
+                        .status
+                        .success();
+                    }
+                    Err(_) => {}
                 }
-                cmd.current_dir(canon_dir).envs(&env_vars);
-                cross_ok = run_audited_lean(
-                    cmd,
-                    &tmp_cross,
-                    &cross_src,
-                    &cross_names,
-                    cross_names.len(),
-                    canon_dir,
-                    Some(crate::zygote::remaining_timeout_ms(None, *t0)),
-                )?
-                .0;
             }
             if cross_ok {
                 let dur_ms =
@@ -1246,14 +1247,16 @@ fn check_directory(
         (items, cross_verify_mode)
     } else {
         let local_zygote_url = pack::ensure_local_zygote_daemon(store, &env_vars);
+        let store_root = store.root.clone();
         let next_file_idx = std::sync::atomic::AtomicUsize::new(0);
-        let worker_results: Vec<Result<Vec<(String, String, Vec<u8>, i64)>>> =
-            std::thread::scope(|s| {
+        let worker_results: Vec<Result<Vec<(String, String, Vec<u8>, i64)>>> = std::thread::scope(
+            |s| {
                 let mut handles = Vec::with_capacity(effective_jobs);
                 for _w in 0..effective_jobs {
                     let next_ref = &next_file_idx;
                     let files_ref = &uncached_files;
                     let staging_ref = &staging_dir;
+                    let root_ref = &store_root;
                     let canon_ref = canon_dir;
                     let env_ref = &env_vars;
                     let lean_bin_ref = &lean_bin;
@@ -1277,8 +1280,6 @@ fn check_directory(
                                     .iter()
                                     .map(|(_, sh)| sh.name.clone())
                                     .collect();
-                                let tmp_batch =
-                                    staging_ref.join(format!("dir_batch_{}_{}.lean", pid, f_idx));
                                 let f_t0 = Instant::now();
 
                                 let mut batch_ok = false;
@@ -1290,6 +1291,7 @@ fn check_directory(
                                         &mod_imp,
                                         &uncached_names,
                                     ) {
+                                        let mut fast_unavailable = true;
                                         if let Some(z_url) = z_url_ref {
                                             let zreq = pack::CheckShardHttpRequest {
                                                 decl: "__batch__".to_string(),
@@ -1308,34 +1310,34 @@ fn check_directory(
                                                 lean_args: file_lean_args.clone(),
                                                 targets: uncached_names.iter().cloned().collect(),
                                             };
-                                            if pack::try_zygote_url_check_shard(z_url, &zreq)
-                                                .is_some()
-                                            {
-                                                batch_ok = true;
+                                            match pack::try_zygote_url_check_shard_inner_with_inflight_detailed(
+                                                z_url, &zreq, || {},
+                                            ) {
+                                                Ok(Some(_)) => {
+                                                    batch_ok = true;
+                                                    fast_unavailable = false;
+                                                }
+                                                Ok(None) => {}
+                                                Err(_) => fast_unavailable = false,
                                             }
                                         }
-                                        if !batch_ok {
-                                            let mut cmd = Command::new(lean_bin_ref);
-                                            for arg in
-                                                crate::module_builder::filter_allowed_lean_args(
-                                                    file_lean_args,
-                                                )
-                                            {
-                                                cmd.arg(arg);
-                                            }
-                                            cmd.current_dir(canon_ref).envs(env_ref);
-                                            batch_ok = run_audited_lean(
-                                                cmd,
-                                                &tmp_batch,
+                                        if !batch_ok && fast_unavailable {
+                                            batch_ok = crate::zygote::run_audited_lean_shard_at(
+                                                root_ref,
+                                                staging_ref,
+                                                Path::new(lean_bin_ref),
+                                                env_ref,
+                                                Some(canon_ref),
                                                 &fast_src,
                                                 &uncached_names,
-                                                uncached_names.len(),
-                                                canon_ref,
+                                                true,
+                                                file_lean_args,
                                                 Some(crate::zygote::remaining_timeout_ms(
                                                     None, *t0,
                                                 )),
                                             )?
-                                            .0;
+                                            .status
+                                            .success();
                                         }
                                     }
                                 }
@@ -1345,29 +1347,59 @@ fn check_directory(
                                         src,
                                         &uncached_names,
                                     );
-                                    let mut cmd = Command::new(lean_bin_ref);
-                                    for arg in crate::module_builder::filter_allowed_lean_args(
-                                        file_lean_args,
-                                    ) {
-                                        cmd.arg(arg);
+                                    if let Some(z_url) = z_url_ref {
+                                        let zreq = pack::CheckShardHttpRequest {
+                                            decl: "__batch__".to_string(),
+                                            shard_key: format!("dir_coal_{}_{}", pid, f_idx),
+                                            shard_source: coal_src.clone(),
+                                            interface_hash: String::new(),
+                                            prefix_env_hash: String::new(),
+                                            stmt_hash: String::new(),
+                                            proof_hash: String::new(),
+                                            toolchain: tc_ref.to_string(),
+                                            lean_path: lp_ref.clone(),
+                                            skip_cas_lock: true,
+                                            allowed_axioms: Some(
+                                                splitter::extra_allowed_axiom_patterns(),
+                                            ),
+                                            lean_args: file_lean_args.clone(),
+                                            targets: uncached_names.iter().cloned().collect(),
+                                        };
+                                        match pack::try_zygote_url_check_shard_inner_with_inflight_detailed(
+                                            z_url, &zreq, || {},
+                                        ) {
+                                            Ok(Some(_)) => batch_ok = true,
+                                            Ok(None) => {}
+                                            Err(e) => {
+                                                anyhow::bail!(
+                                                    "Directory check failed in {}:\n{}",
+                                                    lf.display(),
+                                                    e
+                                                );
+                                            }
+                                        }
                                     }
-                                    cmd.current_dir(canon_ref).envs(env_ref);
-                                    let (ok, stdout, stderr) = run_audited_lean(
-                                        cmd,
-                                        &tmp_batch,
-                                        &coal_src,
-                                        &uncached_names,
-                                        uncached_names.len(),
-                                        canon_ref,
-                                        Some(crate::zygote::remaining_timeout_ms(None, *t0)),
-                                    )?;
-                                    if !ok {
-                                        anyhow::bail!(
-                                            "Directory check failed in {}:\n{}\n{}",
-                                            lf.display(),
-                                            stdout,
-                                            stderr
-                                        );
+                                    if !batch_ok {
+                                        let out = crate::zygote::run_audited_lean_shard_at(
+                                            root_ref,
+                                            staging_ref,
+                                            Path::new(lean_bin_ref),
+                                            env_ref,
+                                            Some(canon_ref),
+                                            &coal_src,
+                                            &uncached_names,
+                                            true,
+                                            file_lean_args,
+                                            Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+                                        )?;
+                                        if !out.status.success() {
+                                            anyhow::bail!(
+                                                "Directory check failed in {}:\n{}\n{}",
+                                                lf.display(),
+                                                String::from_utf8_lossy(&out.stdout),
+                                                String::from_utf8_lossy(&out.stderr)
+                                            );
+                                        }
                                     }
                                 }
 
@@ -1397,7 +1429,8 @@ fn check_directory(
                             .unwrap_or_else(|_| Err(anyhow::anyhow!("Worker thread panicked")))
                     })
                     .collect()
-            });
+            },
+        );
 
         let mut items = Vec::with_capacity(total_misses);
         for wr in worker_results {
@@ -1511,73 +1544,6 @@ fn extract_decl_source_from_file(active_src: &str, shard: &splitter::TheoremShar
         return format!("{} := {}", shard.signature_text, shard.proof_text);
     }
     String::new()
-}
-
-/// Whether a project module `src` imports (transitively; dependency packages and the toolchain are
-/// trusted) could answer `#print axioms` (`splitter::source_may_intercept_print`), or is unreadable.
-fn project_imports_may_intercept_print(src: &str, canon_dir: &Path) -> bool {
-    let mut todo = crate::module_builder::parse_header_imports(src);
-    let mut seen = HashSet::new();
-    while let Some(m) = todo.pop() {
-        if !seen.insert(m.clone()) {
-            continue;
-        }
-        let rel = crate::module_builder::module_name_to_rel_slash(&m) + ".lean";
-        if rel.starts_with(".lake/") {
-            continue;
-        }
-        let path = canon_dir.join(&rel);
-        if !path.is_file() {
-            continue;
-        }
-        let Ok(dep_src) = fs::read_to_string(&path) else {
-            return true;
-        };
-        if splitter::source_may_intercept_print(&dep_src) {
-            return true;
-        }
-        todo.extend(crate::module_builder::parse_header_imports(&dep_src));
-    }
-    false
-}
-
-/// Run plain `lean` (`cmd`, without its file argument) on `src` written to `tmp`, under the
-/// `splitter::plain_lean_audit` of the `expected` declarations named by `targets`. Returns
-/// `(ok, stdout, stderr)`: `ok` needs a zero exit and a clean audit, whose failures join `stderr`. The
-/// audit reads Lean's `#print axioms` output, so it is refused when a project module `src` imports
-/// could answer it.
-fn run_audited_lean(
-    mut cmd: Command,
-    tmp: &Path,
-    src: &str,
-    targets: &HashSet<String>,
-    expected: usize,
-    canon_dir: &Path,
-    timeout_ms: Option<u64>,
-) -> Result<(bool, String, String)> {
-    if project_imports_may_intercept_print(src, canon_dir) {
-        return Ok((
-            false,
-            String::new(),
-            "[TurboLean.KernelGate] plain `lean` audit refused: an imported project module could answer `#print axioms`".to_string(),
-        ));
-    }
-    let audit = splitter::plain_lean_audit(src, targets, expected);
-    fs::write(tmp, &audit.source)?;
-    let out = crate::zygote::run_lean_command(cmd.arg(tmp), timeout_ms);
-    let _ = fs::remove_file(tmp);
-    let out = out.context("Failed to execute `lean`")?;
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    let mut ok = out.status.success();
-    if ok {
-        let bad = audit.violations(&stdout, &splitter::allowed_axioms());
-        if !bad.is_empty() {
-            ok = false;
-            stderr = format!("{}\n{}", stderr, bad.join("\n"));
-        }
-    }
-    Ok((ok, stdout, stderr))
 }
 
 /// Hygiene items (`sorry`/`admit`/`sorryAx`, forbidden axioms, ...) that block certifying `shard` alone:
@@ -1893,7 +1859,7 @@ fn check_single_decl(
                 skip_cas_lock: false,
                 allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
                 lean_args: file_lean_args.clone(),
-                targets: Vec::new(),
+                targets: vec![target_decl.to_string()],
             })?;
             match pack::http_request_with_inflight(
                 "POST",
@@ -1973,7 +1939,7 @@ fn check_single_decl(
                 skip_cas_lock: false,
                 allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
                 lean_args: file_lean_args.clone(),
-                targets: Vec::new(),
+                targets: vec![target_decl.to_string()],
             })?;
             if let Ok(resp_bytes) =
                 pack::http_request("POST", &endpoint, "application/json", &req_body)
@@ -2072,20 +2038,6 @@ fn check_single_decl(
                     .canonicalize()
                     .unwrap_or_else(|_| active_file.clone())
             };
-            let safe_name: String = target_decl
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || c == '_' {
-                        c
-                    } else {
-                        '_'
-                    }
-                })
-                .collect();
-            let staging_dir = store.fast_staging_dir();
-            let tmp_shard =
-                staging_dir.join(format!("shard_{}_{}.lean", safe_name, std::process::id()));
-
             let mut single_set = HashSet::new();
             single_set.insert(target_decl.to_string());
             single_set.insert(shard.name.clone());
@@ -2386,7 +2338,7 @@ fn check_single_decl(
                     skip_cas_lock: true,
                     allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
                     lean_args: file_lean_args.clone(),
-                    targets: Vec::new(),
+                    targets: vec![target_decl.to_string()],
                 };
                 if let Some(ref z_url) = fast_local_zygote_url {
                     let res = pack::try_zygote_url_check_shard_inner_with_inflight_detailed(
@@ -2726,10 +2678,57 @@ fn check_single_decl(
                     }
                 }
                 if !verified_via_zygote {
-                    if !verified_via_zygote {
-                        if let Some(daemon_err) = last_daemon_verify_err.take() {
+                    if let Some(daemon_err) = last_daemon_verify_err.take() {
+                        let orig_display = file.display().to_string();
+                        let raw_err = daemon_err
+                            .replace("<zygote-decl>", &orig_display)
+                            .replace("<zygote-shard>", &orig_display);
+                        let m_diags = extract_mismatch_diagnostics(&raw_err);
+                        let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
+                        anyhow::bail!(
+                            "lean check failed for `{}` in {} (lines {}..={}):\n{}{}",
+                            target_decl,
+                            file.display(),
+                            shard.start_line,
+                            shard.end_line,
+                            raw_err,
+                            m_suffix
+                        );
+                    }
+                    if env_vars.len() <= 1 {
+                        let (ev, ech) = resolve_lake_env(store, canon_dir)?;
+                        lean_bin = lean_bin_from_env(&ev);
+                        env_vars = ev;
+                        env_cache_hit = ech;
+                    }
+                    let mut stub_targets: Vec<String> = single_set.iter().cloned().collect();
+                    stub_targets.sort();
+                    if let Ok(reply) = crate::zygote::eval_with_zygote_pool_for_targets(
+                        store,
+                        toolchain,
+                        &local_lean_path,
+                        &env_vars,
+                        Path::new(&lean_bin),
+                        &full_shard_src,
+                        &stub_targets,
+                        Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+                        &file_lean_args,
+                    ) {
+                        let c_abi_sound = unsafe {
+                            crate::splitter::turbo_spec_is_sound_decl_summary(
+                                0,
+                                0,
+                                0,
+                                if reply.ok { 0 } else { 1 },
+                            ) != 0
+                        };
+                        if reply.import_ok && reply.ok && c_abi_sound {
+                            apply_zygote_reply!(reply);
+                        } else if reply.import_ok && !reply.ok {
                             let orig_display = file.display().to_string();
-                            let raw_err = daemon_err
+                            let raw_err = reply
+                                .errors
+                                .join("\n")
                                 .replace("<zygote-decl>", &orig_display)
                                 .replace("<zygote-shard>", &orig_display);
                             let m_diags = extract_mismatch_diagnostics(&raw_err);
@@ -2744,55 +2743,6 @@ fn check_single_decl(
                                 m_suffix
                             );
                         }
-                        if env_vars.len() <= 1 {
-                            let (ev, ech) = resolve_lake_env(store, canon_dir)?;
-                            lean_bin = lean_bin_from_env(&ev);
-                            env_vars = ev;
-                            env_cache_hit = ech;
-                        }
-                        let mut stub_targets: Vec<String> = single_set.iter().cloned().collect();
-                        stub_targets.sort();
-                        if let Ok(reply) = crate::zygote::eval_with_zygote_pool_for_targets(
-                            store,
-                            toolchain,
-                            &local_lean_path,
-                            &env_vars,
-                            Path::new(&lean_bin),
-                            &full_shard_src,
-                            &stub_targets,
-                            Some(crate::zygote::remaining_timeout_ms(None, *t0)),
-                            &file_lean_args,
-                        ) {
-                            let c_abi_sound = unsafe {
-                                crate::splitter::turbo_spec_is_sound_decl_summary(
-                                    0,
-                                    0,
-                                    0,
-                                    if reply.ok { 0 } else { 1 },
-                                ) != 0
-                            };
-                            if reply.import_ok && reply.ok && c_abi_sound {
-                                apply_zygote_reply!(reply);
-                            } else if reply.import_ok && !reply.ok {
-                                let orig_display = file.display().to_string();
-                                let raw_err = reply
-                                    .errors
-                                    .join("\n")
-                                    .replace("<zygote-decl>", &orig_display)
-                                    .replace("<zygote-shard>", &orig_display);
-                                let m_diags = extract_mismatch_diagnostics(&raw_err);
-                                let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
-                                anyhow::bail!(
-                                    "lean check failed for `{}` in {} (lines {}..={}):\n{}{}",
-                                    target_decl,
-                                    file.display(),
-                                    shard.start_line,
-                                    shard.end_line,
-                                    raw_err,
-                                    m_suffix
-                                );
-                            }
-                        }
                     }
                 }
                 if !verified_via_zygote {
@@ -2801,28 +2751,33 @@ fn check_single_decl(
                         .cloned()
                         .or_else(|| std::env::var("LEAN_STACK_SIZE_KB").ok())
                         .unwrap_or_else(|| "262144".to_string());
-                    let mut cmd = Command::new(&lean_bin);
-                    for arg in crate::module_builder::filter_allowed_lean_args(&file_lean_args) {
-                        cmd.arg(arg);
-                    }
-                    cmd.current_dir(canon_dir)
-                        .envs(&env_vars)
-                        .env("LEAN_STACK_SIZE_KB", default_stack);
-                    let (ok, stdout, stderr) = run_audited_lean(
-                        cmd,
-                        &tmp_shard,
+                    let mut fallback_env = env_vars.clone();
+                    fallback_env.insert("LEAN_STACK_SIZE_KB".to_string(), default_stack);
+                    let out = crate::zygote::run_audited_lean_shard(
+                        store,
+                        Path::new(&lean_bin),
+                        &fallback_env,
+                        Some(canon_dir),
                         &full_shard_src,
                         &single_set,
-                        1,
-                        canon_dir,
+                        &file_lean_args,
                         Some(crate::zygote::remaining_timeout_ms(None, *t0)),
-                    )?;
-                    if !ok {
-                        let tmp_display = tmp_shard.display().to_string();
-                        let orig_display = file.display().to_string();
-                        let stderr = stderr.replace(&tmp_display, &orig_display);
-                        let stdout = stdout.replace(&tmp_display, &orig_display);
-                        let combined_err = format!("{}\n{}", stdout, stderr);
+                    )
+                    .with_context(|| {
+                        format!(
+                            "Shard check failed for `{}` in {} (lines {}..={})",
+                            target_decl,
+                            file.display(),
+                            shard.start_line,
+                            shard.end_line
+                        )
+                    })?;
+                    if !out.status.success() {
+                        let combined_err = format!(
+                            "{}\n{}",
+                            String::from_utf8_lossy(&out.stdout),
+                            String::from_utf8_lossy(&out.stderr)
+                        );
                         let m_diags = extract_mismatch_diagnostics(&combined_err);
                         let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
                         anyhow::bail!(
@@ -3333,13 +3288,11 @@ fn check_single_file(
     if use_parallel_shards {
         let effective_jobs = requested_jobs.min(uncached_shards.len());
         let staging_dir = store.fast_staging_dir();
-        let pid = std::process::id();
 
         let uncached_names: HashSet<String> = uncached_shards
             .iter()
             .map(|(_, s)| s.name.clone())
             .collect();
-        let tmp_coalesced = staging_dir.join(format!("coalesced_batch_{}.lean", pid));
         let batch_t0 = Instant::now();
 
         let mut batch_succeeded = fast_verified_batch;
@@ -3418,21 +3371,18 @@ fn check_single_file(
                     batch_succeeded = true;
                 }
                 Ok(None) => {
-                    let mut cmd = Command::new(&lean_bin);
-                    for arg in crate::module_builder::filter_allowed_lean_args(&file_lean_args) {
-                        cmd.arg(arg);
-                    }
-                    cmd.current_dir(canon_dir).envs(&env_vars);
-                    batch_succeeded = run_audited_lean(
-                        cmd,
-                        &tmp_coalesced,
+                    batch_succeeded = crate::zygote::run_audited_lean_shard(
+                        store,
+                        Path::new(&lean_bin),
+                        &env_vars,
+                        Some(canon_dir),
                         &coalesced_src,
                         &uncached_names,
-                        uncached_names.len(),
-                        canon_dir,
+                        &file_lean_args,
                         Some(crate::zygote::remaining_timeout_ms(None, *t0)),
                     )?
-                    .0;
+                    .status
+                    .success();
                 }
                 Err(e) => {
                     last_batch_zygote_err = Some(e.to_string());
@@ -3471,6 +3421,7 @@ fn check_single_file(
             (verified, "coalesced_shards")
         } else {
             let local_zygote_url = pack::ensure_local_zygote_daemon(store, &env_vars);
+            let store_root = store.root.clone();
             let effective_jobs = if local_zygote_url.is_some() {
                 effective_jobs.min(1)
             } else {
@@ -3487,6 +3438,7 @@ fn check_single_file(
                         let abort_ref = &abort_flag;
                         let uncached_ref = &uncached_shards;
                         let staging_ref = &staging_dir;
+                        let root_ref = &store_root;
                         let canon_ref = canon_dir;
                         let env_ref = &env_vars;
                         let lean_bin_ref = &lean_bin;
@@ -3533,7 +3485,7 @@ fn check_single_file(
                                             splitter::extra_allowed_axiom_patterns(),
                                         ),
                                         lean_args: args_ref.clone(),
-                                        targets: Vec::new(),
+                                        targets: vec![shard.name.clone()],
                                     };
                                     match pack::try_zygote_url_check_shard_inner_with_inflight_detailed(
                                         z_url,
@@ -3567,37 +3519,39 @@ fn check_single_file(
                                     }
                                 }
 
-                                let safe_name: String = shard
-                                    .name
-                                    .chars()
-                                    .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
-                                    .collect();
-                                let tmp_shard = staging_ref.join(format!(
-                                    "par_shard_{}_{}_{}.lean",
-                                    safe_name, pid, idx
-                                ));
-                                let mut cmd = Command::new(lean_bin_ref);
-                                for arg in crate::module_builder::filter_allowed_lean_args(args_ref)
-                                {
-                                    cmd.arg(arg);
-                                }
-                                cmd.current_dir(canon_ref).envs(env_ref);
-                                let (ok, stdout, stderr) = run_audited_lean(
-                                    cmd,
-                                    &tmp_shard,
+                                let out = match crate::zygote::run_audited_lean_shard_at(
+                                    root_ref,
+                                    staging_ref,
+                                    Path::new(lean_bin_ref),
+                                    env_ref,
+                                    Some(canon_ref),
                                     &shard_src_owned,
                                     &HashSet::from([shard.name.clone()]),
-                                    1,
-                                    canon_ref,
+                                    true,
+                                    args_ref,
                                     Some(crate::zygote::remaining_timeout_ms(None, *t0)),
-                                )?;
-                                let tmp_display = tmp_shard.display().to_string();
+                                ) {
+                                    Ok(o) => o,
+                                    Err(e) => {
+                                        abort_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        anyhow::bail!(
+                                            "Parallel shard check failed for `{}` in {} (lines {}..={}):\n{}",
+                                            shard.name,
+                                            file_display,
+                                            shard.start_line,
+                                            shard.end_line,
+                                            e
+                                        );
+                                    }
+                                };
 
-                                if !ok {
+                                if !out.status.success() {
                                     abort_ref.store(true, std::sync::atomic::Ordering::Relaxed);
-                                    let stderr = stderr.replace(&tmp_display, &file_display);
-                                    let stdout = stdout.replace(&tmp_display, &file_display);
-                                    let combined_err = format!("{}\n{}", stdout, stderr);
+                                    let combined_err = format!(
+                                        "{}\n{}",
+                                        String::from_utf8_lossy(&out.stdout),
+                                        String::from_utf8_lossy(&out.stderr)
+                                    );
                                     let m_diags = extract_mismatch_diagnostics(&combined_err);
                                     let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
                                     anyhow::bail!(
@@ -3790,8 +3744,7 @@ fn check_single_file(
         }
         // Neither run above audits axioms (zygote eval has no kernel gate, and messages can be
         // dropped by `#guard_msgs`): check the whole file under the zygote's `strict_all` kernel gate,
-        // which reads the environment, else audit every theorem with plain `lean` in a copy beside
-        // the file (which fails closed for a file without textual theorems).
+        // else compile and audit the scratch `.olean` with zero stub exemptions.
         let kernel_audit = (!src.contains("IO.Process.exit")
             && !src.lines().take(20).any(|l| {
                 let t = l.split("--").next().unwrap_or(l).trim();
@@ -3822,34 +3775,25 @@ fn check_single_file(
         }
         if kernel_audit.is_none() {
             let names: HashSet<String> = split.shards.iter().map(|s| s.name.clone()).collect();
-            let audit_tmp = canon_resolved_initial
-                .parent()
-                .unwrap_or(canon_dir)
-                .join(format!(
-                    ".turbo_audit_{}_{}.lean",
-                    std::process::id(),
-                    pack::next_tmp_id()
-                ));
-            let mut cmd = Command::new(&lean_bin);
-            for arg in crate::module_builder::filter_allowed_lean_args(&file_lean_args) {
-                cmd.arg(arg);
-            }
-            cmd.current_dir(canon_dir).envs(&env_vars);
-            let (ok, stdout, stderr) = run_audited_lean(
-                cmd,
-                &audit_tmp,
+            let out = crate::zygote::run_audited_lean_shard_at(
+                &store.root,
+                &store.fast_staging_dir(),
+                Path::new(&lean_bin),
+                &env_vars,
+                Some(canon_dir),
                 src,
                 &names,
-                names.len(),
-                canon_dir,
+                false,
+                &file_lean_args,
                 Some(crate::zygote::remaining_timeout_ms(None, *t0)),
-            )?;
-            if !ok {
+            )
+            .with_context(|| format!("Soundness audit failed for {}", file.display()))?;
+            if !out.status.success() {
                 anyhow::bail!(
                     "Soundness audit failed for {}:\n{}\n{}",
                     file.display(),
-                    stdout,
-                    stderr
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
                 );
             }
         }

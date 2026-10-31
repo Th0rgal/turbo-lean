@@ -2812,16 +2812,29 @@ fn split_lean_source_inner(
     }
 }
 
+pub(crate) fn host_name_components(s: &str) -> Vec<String> {
+    let mut comps = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    for c in s.chars() {
+        if c == '«' {
+            quoted = true;
+        } else if c == '»' {
+            quoted = false;
+        } else if c == '.' && !quoted {
+            comps.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+        }
+    }
+    comps.push(cur);
+    comps
+}
+
 pub(crate) fn decl_name_matches_target(name: &str, target_decl: &str) -> bool {
-    name == target_decl
-        || name
-            .strip_suffix(target_decl)
-            .map(|p| p.ends_with('.'))
-            .unwrap_or(false)
-        || target_decl
-            .strip_suffix(name)
-            .map(|p| p.ends_with('.'))
-            .unwrap_or(false)
+    let nc = host_name_components(name);
+    let tc = host_name_components(target_decl);
+    !nc.is_empty() && !tc.is_empty() && (nc.ends_with(&tc) || tc.ends_with(&nc))
 }
 
 fn find_last_matching_span_idx<F>(spans: &[CmdSpan<'_>], mut pred: F) -> Option<usize>
@@ -2858,8 +2871,9 @@ fn format_stubbed_decl_span(orig_text: &str, sig_clean: &str, proof_clean: &str)
     )
 }
 
-fn sanitize_ident_for_fast_check(name: &str) -> String {
+pub(crate) fn sanitize_ident_for_fast_check(name: &str) -> String {
     name.chars()
+        .filter(|&c| c != '«' && c != '»')
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '_' {
                 c
@@ -3112,8 +3126,15 @@ pub(crate) fn matches_uncached_or_fast_verify_name(
         {
             return uncached_names.iter().any(|u| {
                 let u_short = u.rsplit('.').next().unwrap_or(u.as_str());
+                let u_comps = host_name_components(u);
+                let joined = u_comps.join(".");
                 orig_safe == sanitize_ident_for_fast_check(u)
                     || orig_safe == sanitize_ident_for_fast_check(u_short)
+                    || orig_safe == sanitize_ident_for_fast_check(&joined)
+                    || orig_safe
+                        == sanitize_ident_for_fast_check(
+                            u_comps.last().map(String::as_str).unwrap_or(u),
+                        )
             });
         }
     }

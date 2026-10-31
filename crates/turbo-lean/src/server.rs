@@ -1449,31 +1449,13 @@ fn execute_check_shard_payload_deferred_with_domain(
                 let s = &parsed.shards[0];
                 format!("{}\n{}", s.signature_text, s.proof_text)
             } else {
-                let short_req: String = req
-                    .decl
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or(&req.decl)
-                    .chars()
-                    .map(|c| {
-                        if c.is_ascii_alphanumeric() || c == '_' {
-                            c
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect();
+                let req_set = std::collections::HashSet::from([req.decl.clone()]);
                 parsed
                     .shards
                     .iter()
                     .find(|s| {
                         let base = s.name.split("__turbo_check_").next().unwrap_or(&s.name);
-                        let short_s = base.rsplit('.').next().unwrap_or(base);
-                        base == req.decl
-                            || req.decl.ends_with(&format!(".{}", base))
-                            || base.ends_with(&format!(".{}", req.decl))
-                            || (short_s.starts_with("_turbo_verify_")
-                                && short_s.ends_with(&short_req))
+                        crate::splitter::matches_uncached_or_fast_verify_name(base, &req_set)
                     })
                     .map(|s| format!("{}\n{}", s.signature_text, s.proof_text))
                     .unwrap_or_else(|| clean_source.clone())
