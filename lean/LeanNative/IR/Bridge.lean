@@ -95,7 +95,7 @@ def lowerImpureLetValue (lv : Lean.Compiler.LCNF.LetValue .impure) (retTy : LNIR
   | .lit litVal => return ([], ← lowerLitValueM litVal retTy true)
   | .erased => return ([], .scalar (.constU64 0))
   | .fvar fvarId args => return ([], ← lowerFVarCall fvarId args retTy)
-  | .ctor ctorInfo args _ | .reuse _ ctorInfo _ args _ =>
+  | .ctor ctorInfo args _ =>
     lowerTupleOrEnumCtorM ctorInfo.name ctorInfo.cidx args retTy
   | .oproj idx fvarId _ => return ([], ← lowerTupleProj fvarId idx retTy true)
   | .uproj idx fvarId _ => return ([], ← lowerImpureUproj fvarId idx)
@@ -107,12 +107,8 @@ def lowerImpureLetValue (lv : Lean.Compiler.LCNF.LetValue .impure) (retTy : LNIR
     let vt ← getVarType v
     if isUnboxedScalarOrTuple vt || vt == .objPtr || vt == .taggedPtr then return ([], .scalar (.var v))
     else Lean.throwError s!"[lean-native] Unsupported boxing/unboxing of `{reprStr vt}` in Stage 1B"
-  | .isShared _ _ => Lean.throwError "[lean-native] internal bridge error: unintercepted isShared"
-  | .reset _ fvarId _ => do
-    if (← get).allowRcAdt then
-      let v ← internFVar fvarId
-      if (← getVarType v) == .unit then return ([], .scalar (.constU64 0))
-    Lean.throwError "[lean-native] Unsupported heap reset instruction in Stage 1B"
+  | .isShared _ _ | .reset _ _ _ | .reuse _ _ _ _ _ =>
+    Lean.throwError "[lean-native] internal bridge error: unintercepted heap reuse instruction"
 
 def lowerTagBranch (condVar : VarId) (cidx : Nat) (isBool : Bool) (yes no : LNIRCode) : BridgeM LNIRCode := do
   let condTy ← getVarType condVar
@@ -135,14 +131,16 @@ partial def lowerImpureAlts (discr : Lean.FVarId) (typeName : Lean.Name) (condVa
   match alts with
   | [] => return .unreachable
   | [singleAlt] =>
-    let cidx ← match singleAlt with
-      | .ctorAlt info _ _ => pure info.cidx
+    let (cidx, isDef) ← match singleAlt with
+      | .ctorAlt info _ _ => pure (info.cidx, false)
       | .alt ctorName params _ _ =>
         if !params.isEmpty then Lean.throwError s!"[lean-native] unsupported constructor payload pattern in {ctorName}"
-        lookupCtorIdx ctorName idx
-      | .default _ => pure idx
+        pure (← lookupCtorIdx ctorName idx, false)
+      | .default _ => pure (idx, true)
     let boolMode := isBool || (← getVarType condVar) == .i1
     let st ← get
+    if boolMode && !isDef && (cidx == 0 || cidx == 1) && st.knownBoolMap[condVar]? == some (cidx != 1) then
+      return .unreachable
     lowerArm cidx singleAlt.getCode (boolMode && (st.knownBoolMap[condVar]?).isNone)
   | alt :: rest =>
     let boolMode := isBool || (← getVarType condVar) == .i1

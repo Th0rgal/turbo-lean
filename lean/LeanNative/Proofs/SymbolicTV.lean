@@ -468,7 +468,11 @@ private def dedupIds (xs : List VarId) : List VarId :=
 private def lookupBufWrite (st : SymExecState) (root : VarId) (nidx : SymExpr) : SymExpr :=
   match st.memWrites.find? (fun (b, i, _) => b == root && i == nidx) with
   | some (_, _, val) => val
-  | none => .bufElem root nidx
+  | none =>
+    match st.memWrites.find? (fun (b, i, _) => b == root && i == .unit) with
+    | some (_, _, .ctorObj allocSeq kTag [symIdxExpr] [lenExpr, elemExpr]) =>
+      normSymExpr (.ctorObj allocSeq kTag [nidx, symIdxExpr] [lenExpr, elemExpr])
+    | _ => .bufElem root nidx
 
 def dedupSymExprs (xs : List SymExpr) : List SymExpr :=
   xs.foldl (fun acc x => if acc.contains x then acc else acc ++ [x]) []
@@ -856,11 +860,7 @@ def trackedRoot? (st : SymExecState) (v : VarId) : Option VarId :=
     none
 
 def readBufSym (st : SymExecState) (bufVar : VarId) (idx : SymExpr) : SymExpr :=
-  let root := st.resolveBuf bufVar
-  let nidx := normSymExpr idx
-  match st.memWrites.find? (fun (b, i, _) => b == root && i == nidx) with
-  | some (_, _, val) => val
-  | none => .bufElem root nidx
+  lookupBufWrite st (st.resolveBuf bufVar) (normSymExpr idx)
 
 def writeBufSym (st : SymExecState) (bufVar : VarId) (idx val : SymExpr) (requireExcl : Bool) : SymExecState :=
   let root := st.resolveBuf bufVar
@@ -1545,25 +1545,44 @@ structure SymExecSummary where
   nextHeapId : SymExpr := .constU64 0
   deriving Repr, Inhabited, BEq
 
-/-- Unroll a `seqFor` loop body `unrollCount` times symbolically. -/
+/-- Unroll a `seqFor` loop body `unrollCount` times symbolically.
+    When `hiBound? = some hiExpr` (symbolic upper bound), iteration `curIdx` is merged under `curIdx < hiExpr`
+    so loops with fewer than `unrollCount` runtime trips do not over-execute later iterations. -/
 def symExecLoopUnroll (unrollCount : Nat) (curIdx : Nat) (idxVar accVar : VarId)
-    (st : SymExecState) (execBody : SymExecState → SymExecState × SymExpr × Option VarId) : SymExecState :=
+    (hiBound? : Option SymExpr) (st : SymExecState)
+    (execBody : SymExecState → SymExecState × SymExpr × Option VarId) : SymExecState :=
   match unrollCount with
   | 0 => st
   | n + 1 =>
-    let stIdx := (st.clearDstTracking idxVar).bindVar idxVar { expr := .constU64 curIdx.toUInt64, nonPoison := true, noUB := true }
-    let (stAfter, retExpr, retRoot?) := execBody stIdx
-    let stCleared := stAfter.clearDstTracking accVar
-    let stNext :=
-      match retRoot? with
-      | some r => stCleared.aliasBuf accVar r
-      | none => stCleared
-    let stNextBound := stNext.bindVar accVar {
-      expr := normSymExpr retExpr
-      nonPoison := stAfter.nonPoison
-      noUB := stAfter.noUB
-    }
-    symExecLoopUnroll n (curIdx + 1) idxVar accVar stNextBound execBody
+    let iterGuard := match hiBound? with
+      | none => .constBool true
+      | some hiExpr =>
+        let rawG := normSymBinOpStep .lt (.constU64 curIdx.toUInt64) hiExpr
+        if st.knownConds.contains rawG then .constBool true else rawG
+    if iterGuard == .constBool false then st
+    else
+      let stGuarded := match iterGuard with
+        | .binOp .lt _ _ => st.assumeKnownCond iterGuard
+        | _ => st
+      let stIdx := (stGuarded.clearDstTracking idxVar).bindVar idxVar
+        { expr := .constU64 curIdx.toUInt64, nonPoison := true, noUB := true }
+      let (stAfter, retExpr, retRoot?) := execBody stIdx
+      let stCleared := stAfter.clearDstTracking accVar
+      let stNext :=
+        match retRoot? with
+        | some r => stCleared.aliasBuf accVar r
+        | none => stCleared
+      let stNextBound := stNext.bindVar accVar {
+        expr := normSymExpr retExpr
+        nonPoison := stAfter.nonPoison
+        noUB := stAfter.noUB
+      }
+      let stIter :=
+        if iterGuard == .constBool true then stNextBound
+        else
+          let stM := SymExecState.mergeBranches st stNextBound st iterGuard true true
+          { stM with noUB := st.noUB && stNextBound.noUB }
+      symExecLoopUnroll n (curIdx + 1) idxVar accVar hiBound? stIter execBody
 
 private def symParReadInput (st : SymExecState) (inputs : List VarId) (argIdx : Nat) (idxExpr : SymExpr) :
     SymExecState × SymStateVal :=
@@ -1578,8 +1597,9 @@ private def symParReadInput (st : SymExecState) (inputs : List VarId) (argIdx : 
       let mv := st.lookupVar root
       let kindOk := st.hasKnownRootTracking root && st.isRootLive root
       let elemExpr := st.readBufSym root idxExpr
+      let effEp := if st.isBufExclusive root then .constU64 0 else st.rcEpoch
       let stCap := (st.requireRootLiveAfterEpoch root).requireUbCap
-        (normSymExpr (.ctorObj (.constU64 0) 14 [st.rootIdentitySym root] [idxExpr]))
+        (normSymExpr (.ctorObj effEp 14 [st.rootIdentitySym root] [idxExpr]))
       ({ stCap with
           noUB := stCap.noUB && sv.noUB && mv.noUB && kindOk
           supported := stCap.supported && kindOk
@@ -1589,8 +1609,9 @@ private def symParReadInput (st : SymExecState) (inputs : List VarId) (argIdx : 
       let mv := st.lookupVar root
       let kindOk := st.hasKnownRootTracking root && st.isRootLive br
       let elemExpr := st.readBufSym br idxExpr
+      let effEp := if st.isBufExclusive br then .constU64 0 else st.rcEpoch
       let stCap := (st.requireRootLiveAfterEpoch br).requireUbCap
-        (normSymExpr (.ctorObj (.constU64 0) 14 [st.rootIdentitySym br] [idxExpr]))
+        (normSymExpr (.ctorObj effEp 14 [st.rootIdentitySym br] [idxExpr]))
       ({ stCap with
           noUB := stCap.noUB && sv.noUB && mv.noUB && kindOk
           supported := stCap.supported && kindOk
@@ -1634,20 +1655,35 @@ private def symEvalParKernelElem (st : SymExecState) (inputs : List VarId) (lenE
     let (st2, y) := symParReadInput st1 inputs 1 idxExpr
     let e := normSymBinOpStep .add (normSymBinOpStep .mul (.constU64 alpha) x.expr) y.expr
     (st2, { expr := e, nonPoison := x.nonPoison && y.nonPoison, noUB := x.noUB && y.noUB }, 5)
-  | .stencil1D3Pt wL wC wR =>
+    | .stencil1D3Pt wL wC wR =>
     let idxM1 := normSymBinOpStep .sub idxExpr (.constU64 1)
     let idxP1 := normSymBinOpStep .add idxExpr (.constU64 1)
-    let (st1, c) := symParReadInput st inputs 0 idxExpr
-    let (st2, l) := symParReadInput st1 inputs 0 idxM1
-    let (st3, r) := symParReadInput st2 inputs 0 idxP1
     let isZero := normSymBinOpStep .eq idxExpr (.constU64 0)
     let isLast := normSymBinOpStep .le lenExpr idxP1
-    let isEdge := normSymIteStep isZero (.constBool true) isLast
-    let inner := normSymBinOpStep .add
-      (normSymBinOpStep .add (normSymBinOpStep .mul (.constU64 wL) l.expr) (normSymBinOpStep .mul (.constU64 wC) c.expr))
-      (normSymBinOpStep .mul (.constU64 wR) r.expr)
-    let e := normSymIteStep isEdge c.expr inner
-    (st3, { expr := e, nonPoison := c.nonPoison && l.nonPoison && r.nonPoison, noUB := c.noUB && l.noUB && r.noUB }, 6)
+    let isEdge :=
+      match lenExpr with
+      | .constU64 n => if n <= 2 then .constBool true else normSymIteStep isZero (.constBool true) isLast
+      | _ => normSymIteStep isZero (.constBool true) isLast
+    let (st1, c) := symParReadInput st inputs 0 idxExpr
+    if isEdge == .constBool true then
+      (st1, c, 6)
+    else
+      let (st2, l) := symParReadInput st1 inputs 0 idxM1
+      let (st3, r) := symParReadInput st2 inputs 0 idxP1
+      let interior := normSymUnaryOpStep .not isEdge
+      let keys := SymExecState.dedupSymExprs (st1.ubReqs.map (·.1) ++ st3.ubReqs.map (·.1))
+      let ubReqs := keys.filterMap fun cap =>
+        let r0 := (st1.ubReqs.lookup cap).getD (.constBool false)
+        let rN := (st3.ubReqs.lookup cap).getD (.constBool false)
+        let nextReq := if r0 == rN then r0 else SymExecState.mergeUbCond interior rN r0
+        if nextReq == .constBool false then none else some (cap, nextReq)
+      let inner := normSymBinOpStep .add
+        (normSymBinOpStep .add (normSymBinOpStep .mul (.constU64 wL) l.expr) (normSymBinOpStep .mul (.constU64 wC) c.expr))
+        (normSymBinOpStep .mul (.constU64 wR) r.expr)
+      let e := normSymIteStep isEdge c.expr inner
+      let elemNp := c.nonPoison && l.nonPoison && r.nonPoison
+      let elemNoUB := c.noUB && l.noUB && r.noUB
+      ({ st3 with ubReqs := ubReqs }, { expr := e, nonPoison := elemNp, noUB := elemNoUB }, 6)
   | .customScalar idxVar inVars body =>
     let stIdx := (st.clearDstTracking idxVar).bindVar idxVar { expr := idxExpr, nonPoison := true, noUB := true }
     let (stBound, _) := inVars.foldl (fun (curSt, argIdx) iv =>
@@ -1740,21 +1776,28 @@ private def symExecCodeAux (fuel : Nat) (unrollBound : Nat) (st : SymExecState) 
       let constBounds? : Option (Nat × Nat) := match normSymExpr loSv.expr, normSymExpr hiSv.expr with
         | .constU64 lo, .constU64 hi => some (lo.toNat, hi.toNat - lo.toNat)
         | _, _ => none
-      let (startIdx, unrollCnt, needSymIdx) := match constBounds? with
+      let (startIdx, unrollCnt, needSymIdx, symHiBound?) := match constBounds? with
         | some (loNat, trips) =>
-          if trips <= 64 then (loNat, trips, false) else (loNat, unrollBound, true)
-        | none => (0, unrollBound, true)
-      let stAfterLoop0 := symExecLoopUnroll unrollCnt startIdx idxVar accVar stInit
-        (fun s => symExecCodeAux fuel' unrollBound s stepBody)
+          if trips <= 64 then (loNat, trips, false, none) else (loNat, unrollBound, true, none)
+        | none =>
+          match normSymExpr loSv.expr with
+          | .constU64 lo => (lo.toNat, unrollBound, true, some (normSymExpr hiSv.expr))
+          | _ => (0, 0, true, none)
       let rawTripCond := normSymBinOpStep .lt (normSymExpr loSv.expr) (normSymExpr hiSv.expr)
       let tripCond := if stInit.knownConds.contains rawTripCond then .constBool true else rawTripCond
+      let stLoopBase := match rawTripCond with
+        | .binOp .lt _ _ => stInit.assumeKnownCond rawTripCond
+        | _ => stInit
+      let stAfterLoop0 := symExecLoopUnroll unrollCnt startIdx idxVar accVar symHiBound? stLoopBase
+        (fun s => symExecCodeAux fuel' unrollBound s stepBody)
       let symIdxAnchor := match constBounds? with
         | some (loNat, _) => loNat
-        | none => 0
+        | none => startIdx
       let stAfterLoop1 :=
         if !needSymIdx then stAfterLoop0
         else
           let symIdxR := stAfterLoop0.projSyntheticRoot 6 symIdxAnchor 0
+          let probeCond : SymExpr := .projSym 6 symIdxAnchor 1
           let stSymIn := ((stAfterLoop0.markImmRoot symIdxR).clearDstTracking idxVar).bindVar idxVar
             { expr := .symVar symIdxR, nonPoison := true, noUB := true }
           let (stSymOut, symRet, symRoot?) := symExecCodeAux fuel' unrollBound stSymIn stepBody
@@ -1764,8 +1807,11 @@ private def symExecCodeAux (fuel : Nat) (unrollBound : Nat) (st : SymExecState) 
             | none => stSymCleared
           let stSymBound := stSymNext.bindVar accVar
             { expr := normSymExpr symRet, nonPoison := stSymOut.nonPoison, noUB := stSymOut.noUB }
-          let stProbe := SymExecState.mergeBranches stAfterLoop0 stAfterLoop0 stSymBound
-            (.constBool true) true true
+          let probeTailCond : SymExpr := match normSymExpr loSv.expr with
+            | .constU64 lo => normSymBinOpStep .lt (.constU64 (lo.toNat + unrollCnt).toUInt64) (normSymExpr hiSv.expr)
+            | _ => probeCond
+          let stProbe := SymExecState.mergeBranches stAfterLoop0 stSymBound stAfterLoop0
+            probeTailCond true true
           let probeWrites :=
             if stAfterLoop0.memWrites == stSymBound.memWrites then stAfterLoop0.memWrites
             else
@@ -1777,9 +1823,9 @@ private def symExecCodeAux (fuel : Nat) (unrollBound : Nat) (st : SymExecState) 
                 let vM := match v0?, vS? with
                   | some v0, some vS =>
                     if v0 == vS then v0
-                    else normSymExpr (.ctorObj (.constU64 0) 19 [] [v0, vS])
+                    else normSymIteStep probeTailCond (normSymExpr (.ctorObj (.constU64 0) 19 [] [v0, vS])) v0
                   | some v0, none => v0
-                  | none, some vS => vS
+                  | none, some vS => normSymIteStep probeTailCond vS (.bufElem b i)
                   | none, none => .bufElem b i
                 (b, i, vM)
           let probeVars :=
@@ -1787,7 +1833,7 @@ private def symExecCodeAux (fuel : Nat) (unrollBound : Nat) (st : SymExecState) 
             let svS := stSymBound.lookupVar accVar
             if sv0.expr == svS.expr then stProbe.vars
             else
-              let combExpr := normSymExpr (.ctorObj (.constU64 0) 19 [] [sv0.expr, svS.expr])
+              let combExpr := normSymIteStep probeTailCond (normSymExpr (.ctorObj (.constU64 0) 19 [] [sv0.expr, svS.expr])) sv0.expr
               (accVar, { expr := combExpr, nonPoison := sv0.nonPoison && svS.nonPoison, noUB := true }) ::
                 stProbe.vars.filter (fun (id, _) => id != accVar)
           { stProbe with
@@ -1795,10 +1841,10 @@ private def symExecCodeAux (fuel : Nat) (unrollBound : Nat) (st : SymExecState) 
             memWrites := probeWrites
             rcEpoch :=
               if stAfterLoop0.rcEpoch == stSymBound.rcEpoch then stAfterLoop0.rcEpoch
-              else normSymExpr (.ctorObj stAfterLoop0.rcEpoch 19 [] [stSymBound.rcEpoch])
+              else normSymIteStep probeTailCond (normSymExpr (.ctorObj stAfterLoop0.rcEpoch 19 [] [stSymBound.rcEpoch])) stAfterLoop0.rcEpoch
             nextHeapId :=
               if stAfterLoop0.nextHeapId == stSymBound.nextHeapId then stAfterLoop0.nextHeapId
-              else normSymExpr (.ctorObj stAfterLoop0.nextHeapId 19 [] [stSymBound.nextHeapId])
+              else normSymIteStep probeTailCond (normSymExpr (.ctorObj stAfterLoop0.nextHeapId 19 [] [stSymBound.nextHeapId])) stAfterLoop0.nextHeapId
             ubReqs :=
               let ubKeys := SymExecState.dedupSymExprs (stAfterLoop0.ubReqs.map (·.1) ++ stSymBound.ubReqs.map (·.1))
               ubKeys.filterMap fun cap =>
@@ -1806,10 +1852,7 @@ private def symExecCodeAux (fuel : Nat) (unrollBound : Nat) (st : SymExecState) 
                 let rS := (stSymBound.ubReqs.lookup cap).getD (.constBool false)
                 let nextReq :=
                   if r0 == rS then r0
-                  else match r0, rS with
-                    | .constBool false, x | x, .constBool false => x
-                    | .constBool true, _ | _, .constBool true => .constBool true
-                    | _, _ => SymExecState.mergeUbCond (.projSym 6 symIdxAnchor 1) rS r0
+                  else SymExecState.mergeUbCond probeTailCond rS r0
                 if nextReq == .constBool false then none else some (cap, nextReq)
             noUB := stAfterLoop0.noUB && stSymBound.noUB
             supported := stAfterLoop0.supported && stSymBound.supported
@@ -1876,9 +1919,17 @@ private def symExecCodeAux (fuel : Nat) (unrollBound : Nat) (st : SymExecState) 
         { expr := outExpr, nonPoison := parNp, noUB := parNoUB }
       let st2 := match kernel with
         | .dotProduct =>
-          if lenExpr == SymExpr.constU64 0 then st1.writeBufSym freshOut (.constU64 0) (.constU64 0) true
-          else st1
-        | _ => st1.writeBufSym freshOut (.symVar symIdxR) elemSv.expr true
+          let dotVal : SymExpr :=
+            if tripCond == SymExpr.constBool false then .constU64 0
+            else
+              let sumExpr := normSymExpr (.ctorObj allocSeq 24 [.symVar symIdxR] [lenExpr, elemSv.expr])
+              normSymIteStep tripCond sumExpr (.constU64 0)
+          st1.writeBufSym freshOut (.constU64 0) dotVal true
+        | _ =>
+          if tripCond == SymExpr.constBool false then st1
+          else
+            let genElem := normSymExpr (.ctorObj allocSeq (20 + kTag) [.symVar symIdxR] [lenExpr, elemSv.expr])
+            st1.writeBufSym freshOut .unit genElem true
       symExecCodeAux fuel' unrollBound { st2 with freshCtorRoots := freshOut :: st2.freshCtorRoots } k
     | .ret v =>
       let rSv := st.lookupVar v
@@ -5106,6 +5157,181 @@ private def parForBadLenTgt : LNIRDecl :=
 #guard !(validateTranslationDecl parForKernelCheckSrc parForBadInputsTgt).passed
 #guard !(validateTranslationDecl parForKernelCheckSrc parForBadLenTgt).ubRefines
 #guard !(validateTranslationDecl parForKernelCheckSrc parForBadLenTgt).passed
+
+private def parForStencilEdgeUbSrc : LNIRDecl :=
+  { name := "par_for_stencil_edge_ub"
+    params := [{ id := 0, name := "xs", ty := .sarray .i64, borrow := true },
+               { id := 1, name := "n", ty := .i64, borrow := false }]
+    retTy := .sarray .i64
+    isGpuCand := true
+    assurance := .verifiedKernelProof
+    body :=
+      .parFor 2 1 [0] .i64 (.stencil1D3Pt 1 1 1) (.ret 2) }
+
+private def parForStencilLen1UbSrc : LNIRDecl :=
+  { name := "par_for_stencil_len1_ub"
+    params := [{ id := 0, name := "xs", ty := .sarray .i64, borrow := true }]
+    retTy := .sarray .i64
+    isGpuCand := true
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 1 .i64 (.scalar (.constU64 1)) <|
+      .parFor 2 1 [0] .i64 (.stencil1D3Pt 1 1 1) (.ret 2) }
+
+private def parForStencilLen1UbBadTgt : LNIRDecl :=
+  { parForStencilLen1UbSrc with
+    body :=
+      .letBind 1 .i64 (.scalar (.constU64 1)) <|
+      .letBind 3 .i64 (.sarrayGet 0 1 .i64) <|
+      .parFor 2 1 [0] .i64 (.stencil1D3Pt 1 1 1) (.ret 2) }
+
+#guard !(let buf : ArrayBuffer := { id := 1, exclusive := true, data := #[42] }
+  let st0 : HeapState := { HeapState.empty with buffers := [buf], nextId := 1 }
+  let env0 := VarEnv.empty.bind 0 (.sarrayId 1)
+  checkSingleSample 1024 env0 st0 parForStencilLen1UbSrc.body parForStencilLen1UbBadTgt.body)
+#guard !(validateTranslationDecl parForStencilLen1UbSrc parForStencilLen1UbBadTgt).ubRefines
+#guard !(validateTranslationDecl parForStencilLen1UbSrc parForStencilLen1UbBadTgt).passed
+#guard !(let src2 : LNIRDecl := { parForStencilLen1UbSrc with
+    name := "par_for_stencil_len2_ub"
+    body := .letBind 1 .i64 (.scalar (.constU64 2)) <| .parFor 2 1 [0] .i64 (.stencil1D3Pt 1 1 1) (.ret 2) }
+  let bad2 : LNIRDecl := { src2 with
+    body := .letBind 1 .i64 (.scalar (.constU64 2)) <| .letBind 3 .i64 (.sarrayGet 0 1 .i64) <|
+      .parFor 2 1 [0] .i64 (.stencil1D3Pt 1 1 1) (.ret 2) }
+  (validateTranslationDecl src2 bad2).ubRefines)
+#guard (let sSrc := symExecDecl 4 parForStencilEdgeUbSrc
+  let unguardedReqs := sSrc.ubReqs.map fun (cap, _) => (cap, .binOp .lt (.constU64 0) (.symVar 1))
+  sSrc.ubReqs.length == 3 && !ubReqsRefine sSrc.ubReqs unguardedReqs)
+
+private def parForElemReadDotSrc : LNIRDecl :=
+  { name := "par_for_elem_read_dot"
+    params := [{ id := 0, name := "xs", ty := .sarray .i64, borrow := true },
+               { id := 1, name := "ys", ty := .sarray .i64, borrow := true },
+               { id := 2, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    isGpuCand := true
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 3 .i64 (.scalar (.constU64 4)) <|
+      .letBind 4 .i64 (.scalar (.constU64 0)) <|
+      .letBind 5 .i1 (.scalar (.binOp .eq (.var 2) (.constU64 100))) <|
+      .ite 5
+        (.parFor 6 3 [0, 1] .i64 .dotProduct <|
+         .letBind 7 .i64 (.sarrayGet 6 4 .i64) <|
+         .decRef 6 1 (.ret 7))
+        (.ret 4) }
+
+private def parForElemReadDotBadTgt : LNIRDecl :=
+  { parForElemReadDotSrc with
+    body :=
+      .letBind 3 .i64 (.scalar (.constU64 4)) <|
+      .letBind 4 .i64 (.scalar (.constU64 0)) <|
+      .letBind 5 .i1 (.scalar (.binOp .eq (.var 2) (.constU64 100))) <|
+      .ite 5
+        (.parFor 6 3 [0, 0] .i64 .dotProduct <|
+         .letBind 7 .i64 (.sarrayGet 6 4 .i64) <|
+         .decRef 6 1 (.ret 7))
+        (.ret 4) }
+
+#guard !(validateTranslationDecl parForElemReadDotSrc parForElemReadDotBadTgt).symRetEquiv
+#guard !(validateTranslationDecl parForElemReadDotSrc parForElemReadDotBadTgt).passed
+
+private def parForElemReadMapSrc : LNIRDecl :=
+  { parForElemReadDotSrc with
+    name := "par_for_elem_read_map"
+    body :=
+      .letBind 3 .i64 (.sarrayLen 0) <|
+      .letBind 4 .i64 (.scalar (.constU64 0)) <|
+      .letBind 5 .i1 (.scalar (.binOp .eq (.var 2) (.constU64 100))) <|
+      .ite 5
+        (.parFor 6 3 [0, 1] .i64 .zipAdd <|
+         .letBind 7 .i64 (.sarrayGet 6 4 .i64) <|
+         .decRef 6 1 (.ret 7))
+        (.ret 4) }
+
+private def parForElemReadMapBadTgt : LNIRDecl :=
+  { parForElemReadMapSrc with
+    body :=
+      .letBind 3 .i64 (.sarrayLen 0) <|
+      .letBind 4 .i64 (.scalar (.constU64 0)) <|
+      .letBind 5 .i1 (.scalar (.binOp .eq (.var 2) (.constU64 100))) <|
+      .ite 5
+        (.parFor 6 3 [0, 1] .i64 .zipMul <|
+         .letBind 7 .i64 (.sarrayGet 6 4 .i64) <|
+         .decRef 6 1 (.ret 7))
+        (.ret 4) }
+
+#guard !(validateTranslationDecl parForElemReadMapSrc parForElemReadMapBadTgt).symRetEquiv
+#guard !(validateTranslationDecl parForElemReadMapSrc parForElemReadMapBadTgt).passed
+
+private def loopSymHiOverUnrollSrc : LNIRDecl :=
+  { name := "loop_sym_hi_over_unroll"
+    params := [{ id := 0, name := "arr", ty := .sarray .i64, borrow := true },
+               { id := 1, name := "n", ty := .i64, borrow := false }]
+    retTy := .i64
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 2 .i64 (.scalar (.constU64 0)) <|
+      .seqFor 3 2 1 4 2 .i64
+        (.letBind 5 .i64 (.sarrayGet 0 3 .i64) <|
+         .letBind 6 .i64 (.scalar (.binOp .add (.var 4) (.var 5))) <|
+         .ret 6)
+        (.ret 4) }
+
+private def loopSymHiOverUnrollBadTgt : LNIRDecl :=
+  { loopSymHiOverUnrollSrc with
+    body :=
+      .letBind 2 .i64 (.scalar (.constU64 0)) <|
+      .letBind 7 .i1 (.scalar (.binOp .lt (.var 2) (.var 1))) <|
+      .ite 7
+        (.letBind 8 .i64 (.scalar (.constU64 1)) <|
+         .letBind 9 .i64 (.sarrayGet 0 8 .i64) <|
+         .seqFor 3 2 1 4 2 .i64
+           (.letBind 5 .i64 (.sarrayGet 0 3 .i64) <|
+            .letBind 6 .i64 (.scalar (.binOp .add (.var 4) (.var 5))) <|
+            .ret 6)
+           (.ret 4))
+        (.ret 2) }
+
+#guard !(let buf : ArrayBuffer := { id := 1, exclusive := true, data := #[7] }
+  let st0 : HeapState := { HeapState.empty with buffers := [buf], nextId := 1 }
+  let env0 := (VarEnv.empty.bind 0 (.sarrayId 1)).bind 1 (.u64 1)
+  checkSingleSample 1024 env0 st0 loopSymHiOverUnrollSrc.body loopSymHiOverUnrollBadTgt.body)
+#guard !(validateTranslationDecl loopSymHiOverUnrollSrc loopSymHiOverUnrollBadTgt).ubRefines
+#guard !(validateTranslationDecl loopSymHiOverUnrollSrc loopSymHiOverUnrollBadTgt).passed
+
+private def loop65SymProbeEpochSrc : LNIRDecl :=
+  { name := "loop65_sym_probe_epoch"
+    params := [{ id := 0, name := "p", ty := .objPtr, borrow := false },
+               { id := 1, name := "x", ty := .i64, borrow := false }]
+    retTy := .objPtr
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 2 .i64 (.scalar (.constU64 0)) <|
+      .letBind 3 .i64 (.scalar (.constU64 65)) <|
+      .seqFor 4 2 3 5 2 .i64
+        (.letBind 6 .i64 (.scalar (.binOp .add (.var 5) (.constU64 1))) <| .ret 6)
+        (.ret 0) }
+
+private def loop65SymProbeEpochBadTgt : LNIRDecl :=
+  { loop65SymProbeEpochSrc with
+    body :=
+      .letBind 2 .i64 (.scalar (.constU64 0)) <|
+      .letBind 3 .i64 (.scalar (.constU64 65)) <|
+      .seqFor 4 2 3 5 2 .i64
+        (.letBind 7 .i1 (.scalar (.binOp .eq (.var 4) (.constU64 5))) <|
+         .ite 7
+           (.letBind 8 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 100))) <|
+            .ite 8
+              (.incRef 0 1 <| .decRef 0 1 <|
+               .letBind 6 .i64 (.scalar (.binOp .add (.var 5) (.constU64 1))) <| .ret 6)
+              (.letBind 6 .i64 (.scalar (.binOp .add (.var 5) (.constU64 1))) <| .ret 6))
+           (.letBind 6 .i64 (.scalar (.binOp .add (.var 5) (.constU64 1))) <| .ret 6))
+        (.ret 0) }
+
+#guard !(validateTranslationDecl loop65SymProbeEpochSrc loop65SymProbeEpochBadTgt).memWritesEquiv
+#guard !(validateTranslationDecl loop65SymProbeEpochSrc loop65SymProbeEpochBadTgt).passed
 
 /-! ## JSON & Human-Readable Formatting for `TVModuleReport` -/
 

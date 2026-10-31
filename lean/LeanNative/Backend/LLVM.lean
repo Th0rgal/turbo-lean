@@ -1955,6 +1955,7 @@ partial def findUnsupportedLLVMCallInCode (localSigs : List (String × List LNIR
   | .letBind _ _ (.allocCtor _ _ _) _ => some "allocCtor"
   | .letBind _ _ (.ctorGetObj _ _) _ => some "ctorGetObj"
   | .letBind _ _ (.ctorGetScalar _ _ _) _ => some "ctorGetScalar"
+  | .letBind _ _ (.isExclusive _) _ => some "isExclusive"
   | .letBind _ _ _ k | .rawStore _ _ _ _ k | .incRef _ _ k | .decRef _ _ k | .parFor _ _ _ _ _ k =>
     findUnsupportedLLVMCallInCode localSigs k
   | .ite _ t e => findUnsupportedLLVMCallInCode localSigs t <|> findUnsupportedLLVMCallInCode localSigs e
@@ -2023,7 +2024,9 @@ private def ctorOpsLLVMRegDecls : List (LNIRDecl × String) := [
   ({ name := "reg_ctor_get_obj", params := [{ id := 0, name := "p", ty := .objPtr }], retTy := .objPtr,
      body := .letBind 1 .objPtr (.ctorGetObj 0 0) (.ret 1) }, "ctorGetObj"),
   ({ name := "reg_ctor_get_scalar", params := [{ id := 0, name := "p", ty := .objPtr }], retTy := .i64,
-     body := .letBind 1 .i64 (.ctorGetScalar 0 0 .i64) (.ret 1) }, "ctorGetScalar")
+     body := .letBind 1 .i64 (.ctorGetScalar 0 0 .i64) (.ret 1) }, "ctorGetScalar"),
+  ({ name := "reg_is_exclusive", params := [{ id := 0, name := "p", ty := .objPtr }], retTy := .i1,
+     body := .letBind 1 .i1 (.isExclusive 0) (.ret 1) }, "isExclusive")
 ]
 
 #guard ctorOpsLLVMRegDecls.all fun (d, expected) =>
