@@ -75,6 +75,16 @@ def probeMixed (get : LNIRExpr) : Except UBError (Val × HeapState) :=
 def retVal? (r : Except UBError (Val × HeapState)) : Option Val :=
   match r with | .ok (v, _) => some v | .error _ => none
 
+/-- Id of the first heap allocation on `heapWithChild _` (`nextId + 1`), distinct from `childId`. -/
+def freshObj : Nat := (heapWithChild 1).nextId + 1
+
+/-- `.ok`, and the whole object graph is released: no `HeapObj` remains, no object has a nonzero `rc`, and no
+    `ArrayBuffer` is live. Stronger than "the child's `rc` is `0`": a parent left allocated, or a run that does
+    not reach `.ok`, is rejected. -/
+def allReleased : Except UBError (Val × HeapState) → Bool
+  | .ok (_, st) => st.heapObjs.isEmpty && st.buffers.isEmpty && st.refCounts.all fun (_, _, rc) => rc == 0
+  | .error _ => false
+
 -- REGRESSION(layout_ctorGetObj_indexes_objFields)
 #guard retVal? (probeMixed (.ctorGetObj 1 0)) == some (.objPtr childId)
 
@@ -112,10 +122,14 @@ def objIndexBounded : Bool :=
 def allocOne : Except UBError (Val × HeapState) :=
   run (heapWithChild 1) (.letBind 1 .objPtr (.allocCtor 5 [0] [20]) (.ret 1))
 
-/-- Contract (C1.1): a ctor with fields allocates a live `HeapObj` (`.objPtr o`, `rc o == 1`). -/
+/-- Contract (C1.1): a ctor with fields allocates a fresh live `HeapObj`: the result is `.objPtr freshObj`, the heap
+    gains exactly one `heapObjs` entry `freshObj` with tag `5` and `rc == 1`, and the consumed child reference is
+    not duplicated (`rc child` stays `1`). -/
 def allocLiveRcOne : Bool :=
   match allocOne with
-  | .ok (.objPtr o, st) => st.getObjRefCount o == 1
+  | .ok (.objPtr o, st) =>
+    o == freshObj && st.getObjRefCount o == 1 && ((st.findHeapObj o).map (·.tag)) == some 5 &&
+    st.heapObjs.length == (heapWithChild 1).heapObjs.length + 1 && st.getObjRefCount childId == 1
   | _ => false
 
 -- REGRESSION(layout_alloc_live_rc_one)
@@ -140,11 +154,12 @@ def scalarOOBBounded : Bool :=
 def readAfterFree (get : LNIRExpr) : Except UBError (Val × HeapState) :=
   run (heapWithChild 1) (.letBind 1 .objPtr (.allocCtor 5 [0] [20]) (.decRef 1 1 (.letBind 2 .i64 get (.ret 2))))
 
+/-- Exactly `.error (.useAfterFree freshObj)`: the freed object is the one reported, not some other id. -/
 def isUseAfterFree : Except UBError (Val × HeapState) → Bool
-  | .error (.useAfterFree _) => true
+  | .error (.useAfterFree o) => o == freshObj
   | _ => false
 
-/-- Contract (C1.1): `ctorGetObj` / `ctorGetScalar` on a freed object is `.useAfterFree`. -/
+/-- Contract (C1.1): `ctorGetObj` / `ctorGetScalar` on a freed object is `.useAfterFree` of that object. -/
 def freedReadsAreUAF : Bool :=
   isUseAfterFree (readAfterFree (.ctorGetObj 1 0)) && isUseAfterFree (readAfterFree (.ctorGetScalar 1 0 .i64))
 
@@ -223,10 +238,31 @@ def inPtrRoundTrip (v : UInt64) : UInt64 := ((v <<< 1) ||| 1) >>> 1
 #guard retVal? (evalExpr (VarEnv.empty.bind 0 (.u64 7)) HeapState.empty (.isExclusive 0))
   == some (.bool true)
 
+/-- `x1 := allocCtor 3 [] []; ret x1`: a fieldless ctor, its result and the heap after it. -/
+def allocNullary : Except UBError (Val × HeapState) :=
+  run (heapWithChild 1) (.letBind 1 .objPtr (.allocCtor 3 [] []) (.ret 1))
+
+/-- Contract (C1.1 fieldless-ctor exception, C2.1): `allocCtor 3 [] []` allocates nothing and returns the immediate
+    `.tuple [.u64 3]` (`lean_box(3)`), never an `.objPtr`. The heap is **unchanged** (no new `heapObjs` entry, no
+    `rc` entry, same `nextId`), and RC on the result is a no-op (`incRef 1; decRef 2` leaves the heap unchanged).
+    Inspects the allocation result and the heap directly, not just the end-state `rc` list. -/
+def nullaryCtorImmediate : Bool :=
+  (match allocNullary with
+   | .ok (v, st) => v == .tuple [.u64 3] && st == heapWithChild 1
+   | .error _ => false) &&
+  (match run (heapWithChild 1) (.letBind 1 .objPtr (.allocCtor 3 [] []) (.incRef 1 1 (.decRef 1 2 (.ret 1)))) with
+   | .ok (v, st) => v == .tuple [.u64 3] && st == heapWithChild 1
+   | .error _ => false)
+
 -- REGRESSION(nullary_ctor_is_immediate)
-#guard match run (heapWithChild 1) (.letBind 1 .objPtr (.allocCtor 3 [] []) (.incRef 1 1 (.decRef 1 2 retZero))) with
-  | .ok (_, st) => st.refCounts == (heapWithChild 1).refCounts
-  | .error _ => false
+-- XFAIL(heapobj-contract): flips in 5b — `main`'s `allocCtor` calls `allocHeapCtor` even with empty field lists, so
+-- the nullary ctor is heap object `2` with `rc = 1` (an `.objPtr`, a new `heapObjs` entry); #300 returns the immediate.
+#guard !nullaryCtorImmediate
+/-- info: ok LeanNative.Semantics.Val.objPtr 2 | heapObjs=1 rc=1 -/
+#guard_msgs in
+#eval IO.println s!"{showRes allocNullary} | {match allocNullary with
+  | .ok (_, st) => s!"heapObjs={st.heapObjs.length - (heapWithChild 1).heapObjs.length} rc={st.getObjRefCount 2}"
+  | .error _ => "-"}"
 
 def objParam : LNIRParam := { id := 0, name := "o", ty := .objPtr }
 def mkDecl (name : String) (body : LNIRCode) : LNIRDecl :=
@@ -713,11 +749,10 @@ def showOwnEdges (k : Nat) : String :=
   | .ok (_, st) => s!"ok childRc={st.getObjRefCount childId}"
   | .error e => s!"error {reprStr e}"
 
-/-- Contract (C3.2/C5.1 total-or-error): either every owning edge is released (child freed) or `.error`. -/
-def ownEdgesContract (k : Nat) : Bool :=
-  match runOwnEdges k with
-  | .ok (_, st) => st.getObjRefCount childId == 0
-  | .error _ => true
+/-- Contract (C3.2): dropping the parent is `.ok` and releases the whole graph — the parent **and** the child (all
+    `k` edges) are freed (`allReleased`). `.error` is not accepted: these heaps are well-formed and within the fuel
+    bound, so C5.1's error branch is not applicable. -/
+def ownEdgesContract (k : Nat) : Bool := allReleased (runOwnEdges k)
 
 -- REGRESSION(rc_repeated_edges_arith)
 #guard (List.range 6).all fun k =>
@@ -734,8 +769,8 @@ def ownEdgesContract (k : Nat) : Bool :=
   | .error (.useAfterFree 1), .error (.useAfterFree 1) => true
   | _, _ => false
 
-/-- Contract (C3.2): 2 and 3 repeated owning edges are all released (or `.error`). -/
-def repeatedEdgesReleased : Bool := ownEdgesContract 2 || ownEdgesContract 3
+/-- Contract (C3.2): 1, 2 and 3 repeated owning edges are all released (`k` decrements of the child). -/
+def repeatedEdgesReleased : Bool := [1, 2, 3].all ownEdgesContract
 
 -- REGRESSION(rc_repeated_owning_edges_released)
 -- Holds since #280: dropping the parent releases every one of its 2 (resp. 3) owning edges.
@@ -748,11 +783,8 @@ def grandparentDrop : LNIRCode :=
     (.incRef 1 1 (.letBind 2 .objPtr (.allocCtor 0 [1, 1] []) (.decRef 2 1 retZero)))
 
 /-- Contract (C3.2, recursive): dropping the grandparent releases both edges to the parent, which frees it,
-    which releases its edge to the child (`rc child = 0`), or the whole thing is `.error`. -/
-def recursiveReleaseBeyondParent : Bool :=
-  match run (heapWithChild 1) grandparentDrop with
-  | .ok (_, st) => st.getObjRefCount childId == 0
-  | .error _ => true
+    which releases its edge to the child: `.ok` with grandparent, parent and child all freed (`allReleased`). -/
+def recursiveReleaseBeyondParent : Bool := allReleased (run (heapWithChild 1) grandparentDrop)
 
 -- REGRESSION(rc_recursive_release_grandchild)
 -- Holds since #280: the release recurses through the parent and frees the grandchild.
@@ -766,11 +798,9 @@ def sarrayEdgeDrop : Except UBError (Val × HeapState) :=
   evalCode 4096 (env0.bind 23 (.sarrayId 3)) heapWithBuf
     (.letBind 1 .objPtr (.allocCtor 0 [23] []) (.decRef 1 1 retZero))
 
-/-- Contract (C3.2, `.sarrayId` edge): dropping the parent releases the buffer through `decRefBuf` (freed). -/
-def sarrayEdgeReleased : Bool :=
-  match sarrayEdgeDrop with
-  | .ok (_, st) => (st.findBuffer 3).isNone
-  | .error _ => true
+/-- Contract (C3.2, `.sarrayId` edge): dropping the parent is `.ok`, frees the parent, and
+    releases the buffer through `decRefBuf` (freed): `allReleased`. -/
+def sarrayEdgeReleased : Bool := allReleased sarrayEdgeDrop
 
 -- REGRESSION(rc_sarray_edge_released)
 -- Holds since #280: the buffer owned through a ctor field is released through `decRefBuf`.
@@ -885,12 +915,13 @@ def chainDrop : LNIRCode :=
     (.letBind 2 .objPtr (.allocCtor 0 [1] []) (.letBind 3 .objPtr (.allocCtor 0 [2] []) (.decRef 3 1 retZero)))
 
 /-- Contract (C5.1, total-or-error) on `main`'s actual release path (`evalCode → evalDecRef → decRefObj`),
-    for every evaluator fuel in `0..64`: `.error`, or `.ok` with the whole chain released. -/
+    for every evaluator fuel in `0..64`: `.error`, or `.ok` with the whole chain released (`allReleased`: the three
+    parents and the child). Non-vacuous: at ample fuel the run must be `.ok` and fully released. -/
 def chainReleaseTotalOrError : Bool :=
+  allReleased (run (heapWithChild 1) chainDrop) &&
   (List.range 65).all fun fuel =>
-    match evalCode fuel env0 (heapWithChild 1) chainDrop with
-    | .ok (_, st) => st.getObjRefCount childId == 0
-    | .error _ => true
+    let r := evalCode fuel env0 (heapWithChild 1) chainDrop
+    r matches .error _ || allReleased r
 
 -- REGRESSION(decref_chain_total_or_error)
 -- Holds since #280 at every evaluator fuel in `0..64`: `.error`, or `.ok` with the child freed.
@@ -916,8 +947,11 @@ def withCtor (shareCount : Nat) (op : LNIRExpr) : Except UBError (Val × HeapSta
   run (heapWithChild 1) (.letBind 1 .objPtr (.allocCtor 0 [0] [20])
     (.incRef 1 shareCount (.letBind 3 .unit op (.ret 3))))
 
-/-- Contract: `isExclusive` on a heap object with `rc == 2` is `false`. -/
-def isExclusiveSharedFalse : Bool := retVal? (withCtor 1 (.isExclusive 1)) == some (.bool false)
+/-- Contract (C4.1): `isExclusive` on a live heap object is exactly `rc == 1`: `false` at `rc == 2` (shared), and
+    `true` on the same object at `rc == 1` (so a constant-`false` `isExclusive` is rejected). -/
+def isExclusiveSharedFalse : Bool :=
+  retVal? (withCtor 1 (.isExclusive 1)) == some (.bool false) &&
+  retVal? (withCtor 0 (.isExclusive 1)) == some (.bool true)
 
 -- REGRESSION(isExclusive_shared_obj_false)
 -- Holds since #280: `isExclusive` on a heap object with `rc == 2` is `false`.
@@ -934,8 +968,9 @@ def isExclusiveFreedIsUAF : Bool := isUseAfterFree (onFreedCtor (.isExclusive 1)
 -- Holds since #280: C4.1, `isExclusive` on a freed object is `.useAfterFree`.
 #guard isExclusiveFreedIsUAF
 
+/-- Exactly `.error (.nonExclusiveWrite freshObj)`: the shared object written to is the one reported. -/
 def isNonExclusiveWrite : Except UBError (Val × HeapState) → Bool
-  | .error (.nonExclusiveWrite _) => true
+  | .error (.nonExclusiveWrite o) => o == freshObj
   | _ => false
 
 /-- `ctor_set x1[x22 = 0] := x21` on `x1 := allocCtor 0 [x0] [x20]`. The index var `x22` is bound to `0`,
@@ -951,8 +986,14 @@ def ctorSetThenRead (shareCount : Nat) : Except UBError (Val × HeapState) :=
     or any other reason. -/
 def ctorSetSharedIsUB : Bool := isNonExclusiveWrite (withCtor 1 ctorSet)
 
-/-- Contract (C4.2 exclusive): `rc == 1` ⇒ `ok`, and field `0` now holds the written value `43`. -/
-def ctorSetExclusiveUpdates : Bool := retVal? (ctorSetThenRead 0) == some (.u64 43)
+/-- Contract (C4.2 exclusive): `rc == 1` ⇒ `ok`, field `0` of the **same** object now holds the written value `43`,
+    and the write is in place: no new allocation (`nextId`, `heapObjs` count unchanged) and `rc` stays `1`. -/
+def ctorSetExclusiveUpdates : Bool :=
+  match ctorSetThenRead 0 with
+  | .ok (v, st) =>
+    v == .u64 43 && st.nextId == freshObj && st.getObjRefCount freshObj == 1 &&
+    st.heapObjs.length == (heapWithChild 1).heapObjs.length + 1
+  | .error _ => false
 
 -- REGRESSION(ctor_set_shared_is_ub)
 -- Holds since #280 (`writeHeapObjFieldExclusive`): a shared `ctor_set` is exactly `nonExclusiveWrite`.
@@ -1066,11 +1107,15 @@ def symtvFuelExhaustionFailsClosed : Bool :=
 -- identical-but-unexplored decls pass.
 #guard !symtvFuelExhaustionFailsClosed
 
-/-- Contract (C6.2): dropping an owned `decRef` (a leak) does not validate (`passed = false`). -/
+/-- `drop(o, x)` with body `body`. -/
+def dropDecl (body : LNIRCode) : LNIRDecl :=
+  { name := "drop", params := [objParam, { id := 1, name := "x", ty := .i64 }], retTy := .i64, body := body }
+
+/-- Contract (C6.2): dropping an owned `decRef` (a leak) does not validate (`passed = false`), while the same decl
+    with the `decRef` kept validates against itself (so a validator that rejects everything is not accepted). -/
 def symtvRcEffectsFailClosed : Bool :=
-  !(validateTranslationDecl
-    { name := "drop", params := [objParam, { id := 1, name := "x", ty := .i64 }], retTy := .i64, body := .decRef 0 1 (.ret 1) }
-    { name := "drop", params := [objParam, { id := 1, name := "x", ty := .i64 }], retTy := .i64, body := .ret 1 }).passed
+  !(validateTranslationDecl (dropDecl (.decRef 0 1 (.ret 1))) (dropDecl (.ret 1))).passed &&
+  (validateTranslationDecl (dropDecl (.decRef 0 1 (.ret 1))) (dropDecl (.decRef 0 1 (.ret 1)))).passed
 
 -- REGRESSION(symtv_rc_effects_fail_closed)
 -- Holds since #280: the validator tracks RC effects, so dropping an owned `decRef` (a leak) does not validate.

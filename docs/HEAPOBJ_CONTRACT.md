@@ -17,9 +17,11 @@ allocates a live `HeapObj` with `rc = 1`, but with #280's single flat `fields = 
 `decRefObj` releases every owning edge recursively (incl. `.sarrayId` edges), `isExclusive` is `rc == 1` and
 `useAfterFree` on a freed object, and `lean_native_ctor_set` exists with the C4 exclusivity check. There is no
 `del`/`setTag` operation, no `UBError.fuelExhausted`, and the LLVM emitter still boxes every scalar in-pointer and
-emits unguarded `isExclusive` / unloaded projections. §8 column "today" records which clauses hold on `main`
-(**pass**: 12 of them flipped when #280 landed) and which are explicit **expected failures** (**XFAIL**). The
-remaining XFAILs are fixed by the 5b PR (#300), which must flip every one of them.
+emits unguarded `isExclusive` / unloaded projections. `allocCtor` with **empty** field lists still calls
+`allocHeapCtor` and returns an `.objPtr` (a heap allocation with `rc = 1`), violating the fieldless-ctor exception of
+§C1.1. §8 column "today" records which clauses hold on `main` (**pass**: 12 of them flipped when #280 landed) and
+which are explicit **expected failures** (**XFAIL**). The remaining XFAILs are fixed by the 5b PR (#300), which must
+flip every one of them.
 
 ## Terminology
 
@@ -52,7 +54,9 @@ The model's `rc` and exclusivity are abstractions of the Lean 4.35.0 runtime (`l
 1. `allocCtor tag objFields scalarFields` allocates one `HeapObj` with `rc = 1`. **Exception (fieldless
    ctor):** when `objFields = scalarFields = []` (more generally, `getCtorLayout` reports
    `size = usize = ssize = 0`), nothing is allocated. The result is the immediate `.tuple [.u64 tag]`
-   (`lean_box(tag)`, §C2.1), which has no `rc` entry and is not a `HeapObj`. The two field lists are
+   (`lean_box(tag)`, §C2.1), which has no `rc` entry and is not a `HeapObj`: the heap state is unchanged (no
+   `heapObjs` entry, no `rc` entry, same `nextId`). On `main` this is XFAIL (`nullary_ctor_is_immediate`): the
+   evaluator heap-allocates the nullary ctor and returns `.objPtr`; #300 makes it immediate. The two field lists are
    **separate index spaces**:
    * `ctorGetObj o i` reads `objFields[i]`. If `i ≥ |objFields|` the result is `.error (.outOfBounds i |objFields|)`.
      It never reads a scalar slot.
@@ -98,7 +102,8 @@ The model's `rc` and exclusivity are abstractions of the Lean 4.35.0 runtime (`l
      RC, and is never a tagged immediate.
    * A nullary ctor with tag `t` (more generally, any ctor whose `getCtorLayout` has `size = usize = ssize = 0`)
      is `lean_box(t)`. It is never `null` and never a heap allocation. In the semantics it is an immediate
-     (`.tuple [.u64 t]`). It has no `rc` entry (see §C1.1 for the fieldless-ctor exception).
+     (`.tuple [.u64 t]`). It has no `rc` entry (see §C1.1 for the fieldless-ctor exception). XFAIL on `main` in the
+     semantics (`nullary_ctor_is_immediate`, awaiting #300) and in codegen (`codegen_nullary_ctor_boxed`).
    * `UInt64`/`USize`/`Float` **fields** of a ctor are never boxed. They live unboxed in `scalarFields`.
    * `main`'s LLVM backend lowers every `boxScalar`/`lean_native_box_u64` to the in-pointer `shl 1 | 1`, whatever the
    type. That is correct for `i1/i8/i16/i32` and wrong for `i64`/`usize` values `≥ 2^63` and for `f64`/`f32`
@@ -243,9 +248,16 @@ last column) on a contract predicate over the evaluator/emitter/validator, then 
 Flipped by #280 (now **pass** on `main`, 12): `layout_alloc_live_rc_one`, `layout_freed_read_is_error`,
 `rc_repeated_owning_edges_released`, `rc_recursive_release_grandchild`, `rc_sarray_edge_released`,
 `c3_100_owning_edges`, `decref_chain_total_or_error`, `isExclusive_shared_obj_false`, `isExclusive_freed_is_error`,
-`ctor_set_shared_is_ub`, `ctor_set_exclusive_ok`, `symtv_rc_effects_fail_closed`. The 19 remaining XFAILs await
-#300. Measured on `main` + #300 (adcd211) + this module, 18 of them flip, incl. the recalibrated
-`symtv_source_fuel_exhaustion_fails_closed`. The exception is `codegen_projection_guarded_field_load`: #300 emits
+`ctor_set_shared_is_ub`, `ctor_set_exclusive_ok`, `symtv_rc_effects_fail_closed`. Each of their predicates inspects
+the result and heap directly, not only an end-state `rc` equality: the allocation result is the fresh `.objPtr` with
+one new `heapObjs` entry; release regressions require `.ok` with **no** live `HeapObj`, buffer or nonzero `rc`
+(parents included, not just the child); error regressions require the exact error **and** object id;
+`isExclusive` must be `false` at `rc = 2` and `true` at `rc = 1`; the exclusive `ctor_set` must update in place (no
+new allocation); and the RC-effect validator check also requires the decl with the `decRef` kept to validate.
+`nullary_ctor_is_immediate` was previously mislabelled **pass** (it only compared the end-state `rc` list, which
+holds even though `main` heap-allocates the nullary ctor); it now inspects the allocation result and heap and is
+XFAIL awaiting #300. The 20 remaining XFAILs await #300. Measured on `main` + #300 (adcd211) + this module, 19 of
+them flip, incl. `nullary_ctor_is_immediate` and the recalibrated `symtv_source_fuel_exhaustion_fails_closed`. The exception is `codegen_projection_guarded_field_load`: #300 emits
 the guarded load at `P + 8`, but returns it through a slot whose store is in another basic block (`proj_heap_7` →
 `proj_cont_10`), and the conservative block-local reload rule (`IRCheck.Fn.reachingStore`) resolves that reload
 to `uninitOrigin`. That regression flips only once the emitter returns the loaded value without a cross-block
@@ -269,7 +281,7 @@ slot round-trip, or once the reload rule is made CFG-aware.
 | C2.1 `Float32` boxed as heap scalar carrying the value | `codegen_box_float32_heap` | XFAIL | `#guard !float32BoxIsHeap` |
 | C2.2 RC on immediates is a no-op | `tagged_immediate_rc_noop` | pass | — |
 | C2.2 `isExclusive` immediate | `tagged_immediate_isExclusive_true` | pass | — |
-| C2.1 nullary ctor is immediate | `nullary_ctor_is_immediate` | pass | — |
+| C1.1/C2.1 nullary ctor is immediate `.tuple [.u64 t]`, heap unchanged | `nullary_ctor_is_immediate` | XFAIL | `#guard !nullaryCtorImmediate` |
 | C2.3 RC codegen checks tag bit | `codegen_rc_checks_tag_bit` | pass | — |
 | C2.3 `isExclusive` codegen checks tag bit (P-cert C5) | `codegen_isExclusive_checks_tag_bit` | XFAIL | `#guard !isExclusiveCodegenTagChecked` |
 | C2.3 projection returns a guarded load from `P + 8 + 8·i` (structural) | `codegen_projection_guarded_field_load` | XFAIL | `#guard !projectionGuardedLoad` |
