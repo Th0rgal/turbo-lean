@@ -15,8 +15,9 @@ Conventions (machine-checked by `scripts/ci_verify.sh`):
   clause → regression table of `docs/HEAPOBJ_CONTRACT.md`;
 * a regression that `main` does not satisfy yet is an explicit expected failure: it carries the marker
   `-- XFAIL(heapobj-contract): flips in 5b`, and its **first** command is `#guard !<pred>` where `<pred>` is a
-  `def <pred> : Bool := …` of this module, documented `/-- Contract … -/`, that is not a constant and that
-  reaches the evaluator / heap ops / LLVM emitter / translation validator through the module's defs. Further
+  `def <pred> : Bool := …` of this module, documented `/-- Contract … -/`, whose **elaborated** value
+  (zeta/beta/whnf-reduced with the roots opaque, by a Lean meta check in `ci_verify.sh`) is not a `Bool` literal
+  and still reaches the evaluator / heap ops / LLVM emitter / translation validator. Further
   `#guard`/`#guard_msgs` lines pin today's output. The doc table names that `#guard !<pred>` per XFAIL row.
   When 5b fixes the defect the assertion breaks the build, forcing the xfail to be flipped into a passing
   `#guard <pred>`. Nothing is skipped. `ci_verify.sh` rejects `#guard true`-style guards and self-tests that.

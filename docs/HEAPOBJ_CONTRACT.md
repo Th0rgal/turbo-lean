@@ -280,19 +280,32 @@ To flip an xfail in 5b:
 3. Remove the `XFAIL` marker.
 4. Change "today" to **pass** and the expectation column to `—` in this table.
 
-`ci_verify.sh` validates each XFAIL as a structured executable expectation. It fails if:
+`ci_verify.sh` validates each XFAIL as a structured executable expectation, in two parts.
+
+**Structural (text, step 2b).** It fails if:
 * the table and the module disagree on the set of names, on which names are XFAIL, or on the
   "XFAIL expectation" column;
-* an XFAIL's first command is not `#guard !<pred>`, or `<pred>` is not a module `def <pred> : Bool := …` with a
-  `/-- Contract … -/` docstring, or its body is a constant, or it does not reach (through the module's own defs)
-  one of `evalCode`, `evalExpr`, the `HeapState` RC/write operations, `emitDeclLLVM`,
-  `emitRuntimeAndCAbiHelpers`, `findUnsupportedLLVMCallInCode`, `validateTranslationDecl` or `getCtorLayout`;
+* an XFAIL's first command is not `#guard !<pred>` for a single identifier `<pred>`;
 * any line of the module is a trivial guard (`#guard true`, `#guard !false`, …);
 * a regression has no `#guard`/`#guard_msgs` at all.
 
-Before checking the module, the script runs a self-test that feeds it malformed XFAILs (`#guard true`,
-`#guard !false`, a constant predicate, a predicate that touches no evaluator, a positive `#guard pred`, an undefined
-predicate, a predicate without a `Contract` docstring, a regression without a guard). Each must be rejected.
+**Semantic (Lean meta check, step 3b, over the elaborated definitions).** After `lake build`, a
+`lake env lean --stdin` script imports the module and, for every XFAIL `<pred>`, fails if:
+* `<pred>` is not a definition of type `Bool`, or has no `/-- Contract … -/` docstring;
+* its value, with mvars instantiated and `zetaReduce`d (dead `let`/`have` dropped, used ones substituted) and
+  beta-reduced, `whnf`-reduces to a `Bool` literal while the roots (`evalCode`, `evalExpr`, the `HeapState`
+  RC/write operations, `emitDeclLLVM`, `emitRuntimeAndCAbiHelpers`, `findUnsupportedLLVMCallInCode`,
+  `validateTranslationDecl`, `getCtorLayout`) are kept opaque, i.e. its value does not depend on them;
+* no root occurs in that `whnf` residual, directly or through the zeta-reduced bodies of the module's own
+  definitions it mentions.
+
+Comments never reach the elaborated term, so text tricks cannot satisfy it. Before checking the module, the meta
+check runs a self-test on predicates it must accept (direct evaluator use, through module defs, through a local
+helper) and on 12 it must reject: `false -- evalCode` (comment), `let _ := allocMalformedField; false` (dead
+`let`), a dead `have`, `true` (the `#guard true` case), no evaluator, an alias of a helper with a dead `let`, a
+beta-dead argument, dead `match` / `cond` branches, a `match` on a constant helper, no `Contract` docstring, and
+a non-`Bool` type. The structural part self-tests `#guard true`, `#guard !false`, a positive `#guard pred`, a
+compound `#guard !(… && false)` and a regression without a guard.
 
 ### UNCOVERED clauses
 
