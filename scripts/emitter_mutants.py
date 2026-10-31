@@ -8,7 +8,13 @@ default Lake target binaries (`lean-native`, `lean-native-core`,
 purged and re-linked after Lake's incremental module build. All default
 targets, the Rust executable, and the mutated emitter modules' own .oleans
 are SHA-256 hashed before running C3..C7. A failed C1/C2 skips subsequent
-checks; infrastructure signatures in the full output override all kills.
+checks; infrastructure signatures in the full output or signal termination
+override all kills.
+
+The non-blocking mutation CI job runs on push/workflow_dispatch, not PRs.
+C5 deviates from spec v4's `--tier C1`: the conformance suite rejects --tier,
+so C5 uses its default 50 fuzz seeds without --tier; the rejected invocation
+is recorded separately as a flag check.
 
 After baseline C1, a snapshot of `lean/.lake/build` is kept and restored
 before each mutant so `ci-verify`'s `.olean` writes cannot force a 157-job
@@ -145,7 +151,7 @@ def run_command(argv: list[str], cwd: Path, env: dict[str, str], log_path: Path,
         "wall_s": wall_s,
         "log_tail": text[-LOG_TAIL:],
         "log": str(log_path),
-        "infra_signature": matched_signature(text, signatures),
+        "infra_signature": f"signal:{-exit_code}" if exit_code < 0 else matched_signature(text, signatures),
     }
 
 
@@ -703,8 +709,10 @@ def run_fixtures(logs: Path, full_checks: bool = False) -> dict:
 
 def run_unit_tests() -> bool:
     """Exercise runner acceptance and provenance without requiring build tools."""
+    import signal
     import sys
     import unittest
+    from unittest.mock import Mock, patch
 
     class RunnerTests(unittest.TestCase):
         def setUp(self):
@@ -724,6 +732,54 @@ def run_unit_tests() -> bool:
 
         def summary(self, rows: list[dict], selected: list[str] | None = None, **kwargs) -> dict:
             return summarize(rows, self.spec, list(COMPARISON_UNIVERSE) if selected is None else selected, **kwargs)
+
+        def signaled_command(self, sig=signal.SIGKILL) -> dict:
+            return run_command(
+                [sys.executable, "-c", f"import os; os.kill(os.getpid(), {int(sig)})"],
+                self.root, os.environ.copy(), self.root / "signal.log", self.spec["infra_signatures"],
+            )
+
+        def test_signal_without_output_is_infra_failed_never_killed(self):
+            for sig in (signal.SIGKILL, signal.SIGTERM):
+                with self.subTest(signal=sig):
+                    check = self.signaled_command(sig)
+                    self.assertEqual(check["exit"], -sig)
+                    self.assertEqual(check["log_tail"], "")
+                    self.assertEqual(Path(check["log"]).read_text(), "")
+                    self.assertEqual(check["infra_signature"], f"signal:{int(sig)}")
+                    for name in ("C1", "C2", "C5"):
+                        outcome, killed, infra = classify({"C3": self.command("assertion failed"), name: check})
+                        self.assertEqual((outcome, killed, infra), ("INFRA_FAILED", [], [name]))
+                        rows = self.rows()
+                        self.assertTrue(self.summary(rows)["conclusive"])
+                        rows[0].update(outcome=outcome, infra_failed_checks=infra)
+                        summary = self.summary(rows)
+                        self.assertEqual(summary["run_outcome"], "INCONCLUSIVE")
+                        self.assertFalse(summary["conclusive"])
+                        self.assertEqual(summary["kill_rate_per_backend"]["llvm"]["killed"], 0)
+
+        def test_baseline_signal_marks_whole_run_infra_failed(self):
+            check = self.signaled_command()
+            for name in ("C1", "C5"):
+                with self.subTest(check=name), patch.multiple(
+                    __name__,
+                    make_worktree=Mock(return_value=self.root),
+                    remove_worktree=Mock(),
+                    git=Mock(return_value=subprocess.CompletedProcess([], 0, "test-sha\n", "")),
+                    toolchain=Mock(return_value={}),
+                    c5_flag_check=Mock(return_value={}),
+                    run_pinned_checks=Mock(return_value=({name: check}, {}, {"all_default_targets_built": True})),
+                    evaluate_mutation=Mock(side_effect=AssertionError("mutations must not run after baseline failure")),
+                ):
+                    output = self.root / "report.json"
+                    report = run_suite(output, self.root / "logs")
+                    self.assertEqual(json.loads(output.read_text()), report)
+                    self.assertEqual(report["baseline"]["outcome"], "INFRA_FAILED")
+                    self.assertEqual(report["baseline"]["failed_checks"], [name])
+                    self.assertEqual(report["run_outcome"], "INFRA_FAILED")
+                    self.assertFalse(report["summary"]["conclusive"])
+                    self.assertEqual(report["kill_rate_per_backend"], {})
+                    self.assertEqual(report["mutations"], [])
 
         def test_c1_oom_and_c5_missing_engines_is_infra_failed(self):
             checks = {
