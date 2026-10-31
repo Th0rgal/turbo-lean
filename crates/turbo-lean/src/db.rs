@@ -2231,6 +2231,12 @@ impl TurboStore {
             }
 
             let mode = try_reflink_or_hardlink(&src, &dst)?;
+            // A concurrent GC may have re-compressed the blob after the probe above; the linked
+            // inode is what was installed, so re-check it.
+            if fs::metadata(&dst).map_or(true, |m| m.len() != out.size_bytes) {
+                let _ = fs::remove_file(&dst);
+                anyhow::bail!("CAS blob {} changed while linking", out.blob_hash);
+            }
             if existing_map.get(&out.rel_path) != Some(&out.blob_hash) {
                 db_updates.push((&out.rel_path, &out.blob_hash, mode));
             }
@@ -2270,8 +2276,11 @@ impl TurboStore {
         if f.read_exact(&mut magic).is_ok() && &magic == b"TLZ1" {
             drop(f);
             let compressed = fs::read(&src)?;
-            let raw = decompress_tlz1(&compressed)
-                .ok_or_else(|| anyhow::anyhow!("Failed to decompress TLZ1 blob {}", blob_hash))?;
+            let Some(raw) = decompress_tlz1(&compressed) else {
+                // A truncated cold body passes the header-only probe; drop it so it self-heals.
+                let _ = fs::remove_file(&src);
+                anyhow::bail!("Failed to decompress TLZ1 blob {}", blob_hash);
+            };
             write_blob_atomic(&self.root, &src, blob_hash, &raw, true)?;
             if let Ok(meta) = fs::metadata(&src) {
                 let _ = self.conn.execute(
@@ -2492,7 +2501,11 @@ impl TurboStore {
         if let Ok(f) = OpenOptions::new().read(true).write(true).open(&lock_path) {
             use std::os::unix::io::AsRawFd;
             // Only unlink an uncontended lock: a live leader/follower keeps its flock.
-            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            let lock_id = |m: fs::Metadata| (m.dev(), m.ino());
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0
+                // A concurrent GC may already have replaced the path: never unlink a newer lock.
+                && fs::metadata(&lock_path).ok().map(lock_id) == f.metadata().ok().map(lock_id)
+            {
                 let _ = fs::remove_file(&lock_path);
             }
         }
@@ -3874,6 +3887,18 @@ mod tests {
             .materialize_into_worktree(&wt2, "P", std::slice::from_ref(&entry))
             .is_err());
         assert!(!wt2.join("D.olean").exists());
+
+        // Cold body truncated behind an intact header: restore fails once and unlinks it, then a
+        // writer repairs it.
+        ensure_blob_file(&dir, &path, &bh, &payload, false)?;
+        assert!(store.run_gc(u64::MAX, 7 * 86400, true)?.compressed_blobs >= 1);
+        let cold = fs::read(&path)?;
+        fs::remove_file(&path)?;
+        fs::write(&path, &cold[..cold.len() - 3])?;
+        assert!(store.ensure_blob_uncompressed(&bh).is_err());
+        assert!(!path.exists());
+        ensure_blob_file(&dir, &path, &bh, &payload, false)?;
+        assert_eq!(fs::read(&path)?, payload);
 
         // GC keeps the `.lock` of a live holder; an unlinked lock makes a peer start over.
         let locks = dir.join("locks");
