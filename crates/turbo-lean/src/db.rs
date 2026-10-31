@@ -836,7 +836,7 @@ impl TurboStore {
         for (k, blob_hash) in raw_hits {
             let exists = *exists_cache
                 .entry(blob_hash.clone())
-                .or_insert_with(|| self.blob_path(&blob_hash).exists());
+                .or_insert_with(|| self.blob_intact_by_row(&blob_hash));
             if exists {
                 verified.insert(k, blob_hash);
             }
@@ -914,6 +914,22 @@ impl TurboStore {
         trust_domain: &str,
     ) -> Result<(usize, usize)> {
         batch_import_pack_metadata_with_domain(&self.conn, blobs, actions, trust_domain)
+    }
+
+    /// Size-checked presence of a CAS blob against its `blobs` row (bare existence when the blob
+    /// has no row yet).
+    fn blob_intact_by_row(&self, blob_hash: &str) -> bool {
+        let path = self.blob_path(blob_hash);
+        let recorded: Option<i64> = self
+            .conn
+            .prepare_cached("SELECT size_bytes FROM blobs WHERE blob_hash = ?1")
+            .and_then(|mut st| st.query_row(params![blob_hash], |r| r.get(0)).optional())
+            .ok()
+            .flatten();
+        match recorded {
+            Some(sz) => matches!(probe_blob_file(&path, sz as u64), BlobDisk::Intact(_)),
+            None => path.exists(),
+        }
     }
 
     /// Size-checked (never hashed) presence test for every output blob of an action.
@@ -1161,6 +1177,17 @@ impl TurboStore {
             }
         }
 
+        // GC unlinks an evicted action's uncontended `.lock`; if we locked an inode that is no
+        // longer the one at `lock_path`, a peer may hold a different one, so start over.
+        let lock_id = |m: fs::Metadata| (m.dev(), m.ino());
+        if fs::metadata(&lock_path).ok().map(lock_id) != lock_file.metadata().ok().map(lock_id) {
+            unsafe {
+                libc::flock(fd, libc::LOCK_UN);
+            }
+            drop(lock_file);
+            return self.acquire_singleflight(action_key, toolchain, kind, trust_domain);
+        }
+
         // Now we hold LOCK_EX! If we waited on a peer, re-check if the prior holder completed the action
         if waited_on_peer {
             if let Some(outputs) = self.get_cached_action(action_key, trust_domain)? {
@@ -1373,12 +1400,7 @@ impl TurboStore {
         if hashes.is_empty() {
             return Ok(false);
         }
-        for h in &hashes {
-            if !self.blob_path(h).exists() {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        Ok(hashes.iter().all(|h| self.blob_intact_by_row(h)))
     }
 
     pub fn batch_get_theorem_shards_readonly(
@@ -1408,7 +1430,7 @@ impl TurboStore {
             {
                 let exists = *exists_cache
                     .entry(blob_hash.clone())
-                    .or_insert_with(|| self.blob_path(&blob_hash).exists());
+                    .or_insert_with(|| self.blob_intact_by_row(&blob_hash));
                 if exists {
                     verified.insert(key.clone(), blob_hash);
                 }
@@ -1655,7 +1677,7 @@ impl TurboStore {
     pub fn write_singleflight_done(&self, action_key: &str, outputs: &[BlobEntry]) {
         let done_path = self.root.join("locks").join(format!("{}.done", action_key));
         if let Ok(bytes) = serde_json::to_vec(outputs) {
-            let _ = fs::write(&done_path, &bytes);
+            let _ = write_blob_atomic(&self.root, &done_path, action_key, &bytes, true);
         }
     }
 
@@ -2116,7 +2138,6 @@ impl TurboStore {
         let wt_id = blake3::hash(root_str.as_bytes()).to_hex().to_string();
         let now = now_unix();
 
-        let blobs_root = self.root.join("blobs");
         let wt_last_seen: Option<i64> = self
             .conn
             .query_row(
@@ -2149,14 +2170,13 @@ impl TurboStore {
             if out.rel_path.starts_with("thm:") {
                 continue;
             }
-            let prefix = if out.blob_hash.len() >= 2 {
-                &out.blob_hash[0..2]
-            } else {
-                "00"
-            };
-            let src = self
-                .ensure_blob_uncompressed(&out.blob_hash)
-                .unwrap_or_else(|_| blobs_root.join(prefix).join(&out.blob_hash));
+            let src = self.ensure_blob_uncompressed(&out.blob_hash)?;
+            if !matches!(probe_blob_file(&src, out.size_bytes), BlobDisk::Intact(_)) {
+                anyhow::bail!(
+                    "CAS blob {} is missing or torn; refusing to link",
+                    out.blob_hash
+                );
+            }
             let dst = canon_root.join(&out.rel_path);
             let dst_in_lake_build = is_non_package_lake_build_path(&dst);
 
@@ -2252,21 +2272,7 @@ impl TurboStore {
             let compressed = fs::read(&src)?;
             let raw = decompress_tlz1(&compressed)
                 .ok_or_else(|| anyhow::anyhow!("Failed to decompress TLZ1 blob {}", blob_hash))?;
-            let staging_dir = self.root.join("staging");
-            let _ = fs::create_dir_all(&staging_dir);
-            let staging_path =
-                staging_dir.join(format!("{}.{}.hot.tmp", blob_hash, std::process::id()));
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                let mut out = OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o444)
-                    .open(&staging_path)?;
-                out.write_all(&raw)?;
-            }
-            fs::rename(&staging_path, &src)?;
+            write_blob_atomic(&self.root, &src, blob_hash, &raw, true)?;
             if let Ok(meta) = fs::metadata(&src) {
                 let _ = self.conn.execute(
                     "UPDATE blobs SET inode = ?1, last_accessed = ?2 WHERE blob_hash = ?3",
@@ -2780,9 +2786,6 @@ impl TurboStore {
             mapped.collect::<std::result::Result<Vec<_>, _>>()?
         };
 
-        let staging_dir = self.root.join("staging");
-        let _ = fs::create_dir_all(&staging_dir);
-
         for (bh, kind) in remaining_blobs {
             let k = kind.trim_start_matches('.');
             let is_compressible_kind = matches!(
@@ -2807,31 +2810,13 @@ impl TurboStore {
                 continue;
             }
             let compressed = compress_tlz1(&raw_bytes);
-            if compressed.len() < (raw_bytes.len() * 9) / 10 {
-                let staging_path =
-                    staging_dir.join(format!("{}.{}.tlz1.tmp", bh, std::process::id()));
-                use std::os::unix::fs::OpenOptionsExt;
-                if let Ok(mut out) = OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o444)
-                    .open(&staging_path)
-                {
-                    if out.write_all(&compressed).is_ok() {
-                        drop(out);
-                        if fs::rename(&staging_path, &p).is_ok() {
-                            compressed_blobs += 1;
-                            let saved = (raw_bytes.len() - compressed.len()) as u64;
-                            freed_bytes += saved;
-                            current_reclaimable = current_reclaimable.saturating_sub(saved);
-                        } else {
-                            let _ = fs::remove_file(&staging_path);
-                        }
-                    } else {
-                        let _ = fs::remove_file(&staging_path);
-                    }
-                }
+            if compressed.len() < (raw_bytes.len() * 9) / 10
+                && write_blob_atomic(&self.root, &p, &bh, &compressed, true).is_ok()
+            {
+                compressed_blobs += 1;
+                let saved = (raw_bytes.len() - compressed.len()) as u64;
+                freed_bytes += saved;
+                current_reclaimable = current_reclaimable.saturating_sub(saved);
             }
         }
 
@@ -3469,11 +3454,18 @@ pub(crate) fn write_blob_atomic(
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let staging_dir = store_root.join("staging");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    // pid + per-process sequence + clock: a stale file of a crashed process with a recycled pid
+    // cannot collide.
     let staging_path = staging_dir.join(format!(
-        "{}.{}.{}.tmp",
+        "{}.{}.{}.{}.tmp",
         hash,
         std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
+        SEQ.fetch_add(1, Ordering::Relaxed),
+        nanos
     ));
     let open = || {
         OpenOptions::new()
@@ -3531,7 +3523,7 @@ pub(crate) fn ensure_blob_file(
         probe_blob_file(dest, len)
     };
     match state {
-        BlobDisk::Intact(meta) => Ok((meta.ino() as i64, meta.len() as i64)),
+        BlobDisk::Intact(meta) => Ok((meta.ino() as i64, len as i64)),
         BlobDisk::Missing => Ok((
             write_blob_atomic(store_root, dest, hash, bytes, false)?,
             len as i64,
@@ -3838,6 +3830,73 @@ mod tests {
             .conn
             .query_row("SELECT COUNT(*) FROM actions", [], |r| r.get(0))?;
         assert_eq!(hits, 0);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_cold_blob_probe_materialize_and_lock_races() -> Result<()> {
+        let (dir, mut store) = tmp_store("cold_and_locks")?;
+        let payload = b"olean-bytes-".repeat(200);
+        let bh = store.store_immutable_blob(&payload, "olean", "trusted", 1)?;
+        let path = store.blob_path(&bh);
+        let entry = BlobEntry {
+            blob_hash: bh.clone(),
+            kind: "olean".to_string(),
+            size_bytes: payload.len() as u64,
+            rel_path: "D.olean".to_string(),
+        };
+
+        // A cold TLZ1 blob is intact by its header length, and writers report the raw size.
+        assert!(store.run_gc(u64::MAX, 7 * 86400, true)?.compressed_blobs >= 1);
+        assert!(fs::metadata(&path)?.len() < payload.len() as u64);
+        assert!(matches!(
+            probe_blob_file(&path, payload.len() as u64),
+            BlobDisk::Intact(_)
+        ));
+        let (_, sz) = ensure_blob_file(&dir, &path, &bh, &payload, false)?;
+        assert_eq!(sz, payload.len() as i64);
+        assert!(matches!(
+            probe_blob_file(&path, payload.len() as u64 + 1),
+            BlobDisk::Torn
+        ));
+
+        // materialize re-promotes the cold blob but refuses a torn one.
+        let wt = dir.join("wt");
+        assert_eq!(
+            store.materialize_into_worktree(&wt, "P", std::slice::from_ref(&entry))?,
+            1
+        );
+        assert_eq!(fs::read(wt.join("D.olean"))?, payload);
+        tear_blob(&path, 5)?;
+        let wt2 = dir.join("wt2");
+        assert!(store
+            .materialize_into_worktree(&wt2, "P", std::slice::from_ref(&entry))
+            .is_err());
+        assert!(!wt2.join("D.olean").exists());
+
+        // GC keeps the `.lock` of a live holder; an unlinked lock makes a peer start over.
+        let locks = dir.join("locks");
+        fs::create_dir_all(&locks)?;
+        let held = locks.join("live.lock");
+        let f = OpenOptions::new().create(true).write(true).open(&held)?;
+        assert_eq!(
+            unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&f), libc::LOCK_EX) },
+            0
+        );
+        store.remove_singleflight_markers("live");
+        assert!(held.exists());
+        drop(f);
+        store.remove_singleflight_markers("live");
+        assert!(!held.exists());
+        match store.acquire_singleflight("live", "tc", "olean", "trusted")? {
+            SingleflightOutcome::Leader(l) => {
+                let a = fs::metadata(&held)?.ino();
+                let b = l.lock_file.metadata()?.ino();
+                assert_eq!(a, b, "leader holds the lock file currently on disk");
+            }
+            SingleflightOutcome::CacheHit { .. } => panic!("unexpected hit"),
+        }
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
