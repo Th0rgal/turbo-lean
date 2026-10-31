@@ -25,6 +25,16 @@ pub struct TheoremShard {
     pub shard_source: String,
 }
 
+impl TheoremShard {
+    pub(crate) fn decl_name(&self) -> &str {
+        if self.qualified_name.is_empty() {
+            &self.name
+        } else {
+            &self.qualified_name
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HygieneReport {
     pub has_sorry: bool,
@@ -311,103 +321,106 @@ pub(crate) fn scan_lean_char_lit_end(src: &str, start: usize) -> Option<usize> {
     }
 }
 
+/// A literal or comment beginning at a UTF-8 byte boundary. Unterminated strings
+/// and block comments consume the remainder so their contents cannot become code.
+pub(crate) struct LeanLexicalSpan {
+    pub(crate) end: usize,
+    pub(crate) is_comment: bool,
+}
+
+pub(crate) fn skip_lean_lexeme(src: &str, start: usize) -> Option<LeanLexicalSpan> {
+    let bytes = src.as_bytes();
+    let mut i = start;
+    let is_comment = src[start..].starts_with("--") || src[start..].starts_with("/-");
+    let at_token_start = !src[..start]
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '\'');
+    match *bytes.get(start)? {
+        b'-' if src[start..].starts_with("--") => {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+        }
+        b'/' if src[start..].starts_with("/-") => {
+            i += 2;
+            let mut depth = 1usize;
+            while i < bytes.len() && depth > 0 {
+                if bytes[i..].starts_with(b"/-") {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i..].starts_with(b"-/") {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        b'\'' if at_token_start => i = scan_lean_char_lit_end(src, start)?,
+        b'"' => {
+            i += 1;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'\\' => i = (i + 2).min(bytes.len()),
+                    b'"' => {
+                        i += 1;
+                        break;
+                    }
+                    _ => i += 1,
+                }
+            }
+        }
+        b'r' if at_token_start => {
+            i += 1;
+            while bytes.get(i) == Some(&b'#') {
+                i += 1;
+            }
+            let hashes = i - start - 1;
+            if bytes.get(i) != Some(&b'"') {
+                return None;
+            }
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"'
+                    && bytes[i + 1..].starts_with(&bytes[start + 1..start + 1 + hashes])
+                {
+                    i += 1 + hashes;
+                    break;
+                }
+                i += 1;
+            }
+        }
+        _ => return None,
+    }
+    Some(LeanLexicalSpan { end: i, is_comment })
+}
+
 /// Strip comments while preserving string/character literals, exact byte offsets, and newline counts.
 pub fn strip_lean_comments(src: &str) -> String {
-    if !src.contains("--") && !src.contains("/-") {
-        return src.to_string();
-    }
-    let bytes = src.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
+    mask_lean_lexemes(src, false)
+}
+
+/// Preserve byte offsets and newlines while hiding lexical contents from scope scans.
+fn mask_lean_lexemes(src: &str, literals: bool) -> String {
+    let mut out = src.as_bytes().to_vec();
     let mut i = 0;
-    let mut block_depth = 0usize;
-    let mut in_string = false;
-    let mut char_lit_end = 0usize;
-
-    while i < bytes.len() {
-        if block_depth > 0 {
-            if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'-' {
-                block_depth += 1;
-                out.extend_from_slice(b"  ");
-                i += 2;
-            } else if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'/' {
-                block_depth -= 1;
-                out.extend_from_slice(b"  ");
-                i += 2;
-            } else {
-                out.push(if bytes[i] == b'\n' { b'\n' } else { b' ' });
-                i += 1;
+    while i < src.len() {
+        if let Some(span) = skip_lean_lexeme(src, i) {
+            if literals || span.is_comment {
+                for byte in &mut out[i..span.end] {
+                    if *byte != b'\n' && *byte != b'\r' {
+                        *byte = b' ';
+                    }
+                }
             }
-            continue;
-        }
-
-        if i < char_lit_end {
-            out.push(bytes[i]);
-            i += 1;
-            continue;
-        }
-
-        if in_string {
-            if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                out.push(bytes[i]);
-                out.push(bytes[i + 1]);
-                i += 2;
-            } else if bytes[i] == b'"' {
-                in_string = false;
-                out.push(b'"');
-                i += 1;
-            } else {
-                out.push(bytes[i]);
-                i += 1;
-            }
-            continue;
-        }
-
-        if bytes[i] == b'\'' {
-            if let Some(end) = scan_lean_char_lit_end(src, i) {
-                char_lit_end = end;
-                out.push(bytes[i]);
-                i += 1;
-                continue;
-            }
-        }
-
-        let in_char = i < char_lit_end;
-        if bytes[i] == b'"' {
-            in_string = true;
-            out.push(b'"');
-            i += 1;
-        } else if crate::c_abi::verify_lexer_comment_guard(
-            in_string,
-            in_char,
-            i + 1 < bytes.len(),
-            block_depth as u64,
-            u32::MAX as u64,
-        ) && bytes[i] == b'-'
-            && bytes[i + 1] == b'-'
-        {
-            while i < bytes.len() && bytes[i] != b'\n' {
-                out.push(b' ');
-                i += 1;
-            }
-        } else if crate::c_abi::verify_lexer_comment_guard(
-            in_string,
-            in_char,
-            i + 1 < bytes.len(),
-            block_depth as u64,
-            u32::MAX as u64,
-        ) && bytes[i] == b'/'
-            && bytes[i + 1] == b'-'
-        {
-            block_depth = 1;
-            out.extend_from_slice(b"  ");
-            i += 2;
+            i = span.end;
         } else {
-            out.push(bytes[i]);
-            i += 1;
+            i += src[i..].chars().next().unwrap().len_utf8();
         }
     }
-
-    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+    String::from_utf8(out).expect("lexical masking preserves UTF-8")
 }
 
 fn strip_string_literals(src: &str) -> std::borrow::Cow<'_, str> {
@@ -856,6 +869,8 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
     let mut pos = 0usize;
     let mut mutual_depth = 0usize;
     let mut scope_depth = 0usize;
+    let mut lexical_cursor = 0usize;
+    let mut literal_end = 0usize;
 
     while pos < total_len {
         let line_start = pos;
@@ -877,13 +892,32 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
         let line_orig = &src[line_start..line_end_no_cr];
         let line_clean = &clean[line_start..line_end_no_cr];
         let trimmed = line_clean.trim_start();
+        let token_start = line_start + line_clean.len() - trimmed.len();
+        // Keep the whole source's lexical context: a command-looking line inside a
+        // literal must not become a declaration or change the namespace stack.
+        while lexical_cursor < token_start {
+            if let Some(span) = skip_lean_lexeme(src, lexical_cursor) {
+                if !span.is_comment {
+                    literal_end = span.end;
+                }
+                lexical_cursor = span.end;
+            } else {
+                lexical_cursor += src[lexical_cursor..].chars().next().unwrap().len_utf8();
+            }
+        }
+        if token_start < literal_end {
+            cur_byte_end = line_end_no_cr;
+            pos = next_pos;
+            line_num += 1;
+            continue;
+        }
+
         let indent = line_orig.len() - line_orig.trim_start().len();
-        let is_unindented = indent == 0;
-        let starts_doc_comment = line_orig.trim_start().starts_with("/--")
-            && (is_unindented || (scope_depth > 0 && indent <= cur_cmd_indent.unwrap_or(indent)));
+        let at_command_indent = cur_cmd_indent.is_none_or(|base| indent <= base);
+        let starts_doc_comment = line_orig.trim_start().starts_with("/--") && at_command_indent;
 
         if mutual_depth > 0 {
-            if is_unindented || (scope_depth > 0 && indent <= cur_cmd_indent.unwrap_or(0)) {
+            if at_command_indent {
                 if is_mutual_line_start(trimmed) {
                     mutual_depth += 1;
                 } else if is_end_line_start(trimmed) {
@@ -902,9 +936,8 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
             || prev_trimmed.starts_with("namespace ")
             || is_end_line_start(prev_trimmed);
 
-        let can_start_at_indent = is_unindented
-            || (scope_depth > 0
-                && (prev_is_section_or_ns_header || indent <= cur_cmd_indent.unwrap_or(indent)));
+        let can_start_at_indent =
+            at_command_indent || (scope_depth > 0 && prev_is_section_or_ns_header);
 
         if line_num > 1
             && can_start_at_indent
@@ -1782,7 +1815,7 @@ fn extract_section_header_name(trimmed: &str) -> &str {
 /// Update `stack` for scope commands (`namespace A.B.C`, `section`, `noncomputable section`,
 /// `mutual`, `end A.B.C`) in `clean_chunk`.
 fn update_scope_stack_with_idx(stack: &mut Vec<ScopeFrame>, clean_chunk: &str, span_idx: usize) {
-    for line in clean_chunk.lines() {
+    for line in mask_lean_lexemes(clean_chunk, true).lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("namespace ") {
             let name = rest.split_whitespace().next().unwrap_or("");
@@ -1895,7 +1928,7 @@ fn compute_closed_section_ranges(spans: &[CmdSpan<'_>]) -> Vec<(usize, usize)> {
     let mut closed_sections = Vec::new();
 
     for (idx, span) in spans.iter().enumerate() {
-        for line in span.clean_text.lines() {
+        for line in mask_lean_lexemes(span.clean_text, true).lines() {
             let trimmed = line.trim();
             if let Some(rest) = trimmed.strip_prefix("namespace ") {
                 let name = rest.split_whitespace().next().unwrap_or("");
@@ -2812,40 +2845,76 @@ fn split_lean_source_inner(
     }
 }
 
+/// Match the environment identity, allowing a namespace suffix at a component boundary.
 pub(crate) fn decl_name_matches_target(name: &str, target_decl: &str) -> bool {
     name == target_decl
         || name
             .strip_suffix(target_decl)
             .map(|p| p.ends_with('.'))
             .unwrap_or(false)
-        || target_decl
-            .strip_suffix(name)
-            .map(|p| p.ends_with('.'))
-            .unwrap_or(false)
+}
+
+fn resolve_decl_index<'a>(
+    names: impl Iterator<Item = &'a str>,
+    target_decl: &str,
+) -> anyhow::Result<Option<usize>> {
+    let matches: Vec<_> = names
+        .enumerate()
+        .filter(|(_, name)| decl_name_matches_target(name, target_decl))
+        .collect();
+    anyhow::ensure!(
+        matches.len() <= 1,
+        "Ambiguous declaration `{}`; candidates: {}",
+        target_decl,
+        matches
+            .iter()
+            .map(|(_, name)| *name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(matches.first().map(|(idx, _)| *idx))
+}
+
+pub(crate) fn find_decl_shard_index(
+    shards: &[TheoremShard],
+    target_decl: &str,
+) -> anyhow::Result<Option<usize>> {
+    resolve_decl_index(shards.iter().map(TheoremShard::decl_name), target_decl)
+}
+
+/// Collect each declaration's environment identity and enclosing command span, including mutuals.
+fn qualified_span_declarations(spans: &[CmdSpan<'_>]) -> Vec<(usize, String)> {
+    let mut scope_stack = Vec::new();
+    let mut declarations = Vec::new();
+    for (idx, span) in spans.iter().enumerate() {
+        let mut record = |text: &str| {
+            if let Some((_, name)) = classify_decl_header(text) {
+                if split_at_top_level_assign(text).is_some() {
+                    declarations.push((idx, qualified_decl_name(&name, &scope_stack)));
+                }
+            }
+        };
+        if let Some((_, inner, _)) = split_mutual_block_subspans(span) {
+            for sub in inner {
+                record(sub.clean_text);
+            }
+        } else {
+            record(span.clean_text);
+        }
+        update_scope_stack_with_idx(&mut scope_stack, span.clean_text, idx);
+    }
+    declarations
 }
 
 fn find_last_matching_span_idx<F>(spans: &[CmdSpan<'_>], mut pred: F) -> Option<usize>
 where
     F: FnMut(&str) -> bool,
 {
-    let mut last_idx = None;
-    for (s_idx, span) in spans.iter().enumerate() {
-        if let Some((_, inner_spans, _)) = split_mutual_block_subspans(span) {
-            if inner_spans.iter().any(|sub| {
-                classify_decl_header(sub.clean_text)
-                    .map(|(_, n)| pred(&n))
-                    .unwrap_or(false)
-            }) {
-                last_idx = Some(s_idx);
-            }
-        }
-        if let Some((_kind, name)) = classify_decl_header(span.clean_text) {
-            if split_at_top_level_assign(span.clean_text).is_some() && pred(&name) {
-                last_idx = Some(s_idx);
-            }
-        }
-    }
-    last_idx
+    qualified_span_declarations(spans)
+        .into_iter()
+        .rev()
+        .find(|(_, name)| pred(name))
+        .map(|(idx, _)| idx)
 }
 
 fn format_stubbed_decl_span(orig_text: &str, sig_clean: &str, proof_clean: &str) -> String {
@@ -2856,6 +2925,56 @@ fn format_stubbed_decl_span(orig_text: &str, sig_clean: &str, proof_clean: &str)
         sig_orig,
         "\n".repeat(proof_orig.matches('\n').count())
     )
+}
+
+/// Preserve the source's scopes and declarations for the identity probe while
+/// making earlier theorem proofs irrelevant, as in normal isolated shard checks.
+pub(crate) fn declaration_identity_prefix(src: &str, start_line: usize) -> String {
+    fn stub(src: &str) -> String {
+        let clean = strip_lean_comments(src);
+        parse_command_spans(src, &clean)
+            .iter()
+            .map(|span| {
+                if let Some((header, inner, footer)) = split_mutual_block_subspans(span) {
+                    return format!(
+                        "{header}\n{}\n{footer}",
+                        inner
+                            .iter()
+                            .map(|s| stub(s.orig_text))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    );
+                }
+                if classify_decl_header(span.clean_text).is_some() {
+                    if let Some((sig, proof)) = split_at_top_level_assign(span.clean_text) {
+                        return format_stubbed_decl_span(span.orig_text, sig, proof);
+                    }
+                }
+                sanitize_stubbed_prefix_options(span.orig_text)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    let clean = strip_lean_comments(src);
+    let spans = parse_command_spans(src, &clean);
+    let mut prefix = Vec::new();
+    for span in &spans {
+        if span.start_line >= start_line {
+            break;
+        }
+        if span.end_line >= start_line {
+            // `mutual` changes recursion, not the declaration namespace. Flatten
+            // only this unfinished group so the independent probe is a command.
+            if let Some((_, inner, _)) = split_mutual_block_subspans(span) {
+                for sub in inner.iter().take_while(|s| s.start_line < start_line) {
+                    prefix.push(stub(sub.orig_text));
+                }
+            }
+            break;
+        }
+        prefix.push(stub(span.orig_text));
+    }
+    prefix.join("\n")
 }
 
 fn sanitize_ident_for_fast_check(name: &str) -> String {
@@ -2872,31 +2991,24 @@ fn sanitize_ident_for_fast_check(name: &str) -> String {
 
 /// Reconstruct the self-contained prefix-only `shard_source` (`prefix_skeleton_accum + span.orig_text + closing_scopes`)
 /// for a single theorem declaration `target_decl` on demand in $O(N)$ time and memory.
-pub fn reconstruct_single_shard_source(src: &str, target_decl: &str) -> Option<String> {
+/// Ambiguous namespace suffixes return an error listing every matching identity.
+pub fn reconstruct_single_shard_source(
+    src: &str,
+    target_decl: &str,
+) -> anyhow::Result<Option<String>> {
     let clean = strip_lean_comments(src);
     let spans = parse_command_spans(src, &clean);
     let closed_sections = compute_closed_section_ranges(&spans);
 
-    let mut target_scope = Vec::new();
-    let t_idx = spans.iter().enumerate().find_map(|(idx, span)| {
-        let matches = |text: &str| {
-            classify_decl_header(text)
-                .map(|(_, name)| {
-                    split_at_top_level_assign(text).is_some()
-                        && decl_name_matches_target(
-                            &qualified_decl_name(&name, &target_scope),
-                            target_decl,
-                        )
-                })
-                .unwrap_or(false)
-        };
-        let found = split_mutual_block_subspans(span)
-            .map(|(_, inner, _)| inner.iter().any(|sub| matches(sub.clean_text)))
-            .unwrap_or(false)
-            || matches(span.clean_text);
-        update_scope_stack_with_idx(&mut target_scope, span.clean_text, idx);
-        found.then_some(idx)
-    })?;
+    let declarations = qualified_span_declarations(&spans);
+    let Some(decl_idx) = resolve_decl_index(
+        declarations.iter().map(|(_, name)| name.as_str()),
+        target_decl,
+    )?
+    else {
+        return Ok(None);
+    };
+    let t_idx = declarations[decl_idx].0;
     let omit_mask = compute_omitted_closed_section_spans(&spans, &closed_sections, t_idx);
 
     let mut prefix_skeleton_accum = String::with_capacity(src.len());
@@ -2956,10 +3068,10 @@ pub fn reconstruct_single_shard_source(src: &str, target_decl: &str) -> Option<S
     }
 
     let closing_scopes = format_closing_scopes(&scope_stack);
-    Some(format!(
+    Ok(Some(format!(
         "{}{}\n{}",
         prefix_skeleton_accum, spans[t_idx].orig_text, closing_scopes
-    ))
+    )))
 }
 
 fn normalize_whitespace(s: &str) -> String {
@@ -2986,7 +3098,9 @@ pub fn build_coalesced_shard_source(
     let spans = parse_command_spans(src, &clean);
 
     let mut chunks = Vec::with_capacity(spans.len());
-    for span in &spans {
+    let mut scope_stack = Vec::new();
+    for (idx, span) in spans.iter().enumerate() {
+        update_scope_stack_with_idx(&mut scope_stack, span.clean_text, idx);
         if let Some((header_orig, inner_spans, footer_orig)) = split_mutual_block_subspans(span) {
             let has_inner_thm = inner_spans.iter().any(|sub| {
                 classify_decl_header(sub.clean_text).is_some()
@@ -2997,7 +3111,10 @@ pub fn build_coalesced_shard_source(
                 inner_chunks.push(header_orig.to_string());
                 for sub in &inner_spans {
                     if let Some((_kind, name)) = classify_decl_header(sub.clean_text) {
-                        if !matches_uncached_or_fast_verify_name(&name, uncached_names) {
+                        if !matches_uncached_or_fast_verify_name(
+                            &qualified_decl_name(&name, &scope_stack),
+                            uncached_names,
+                        ) {
                             if let Some((sig_clean, proof_clean)) =
                                 split_at_top_level_assign(sub.clean_text)
                             {
@@ -3019,7 +3136,10 @@ pub fn build_coalesced_shard_source(
         }
 
         if let Some((_kind, name)) = classify_decl_header(span.clean_text) {
-            if !matches_uncached_or_fast_verify_name(&name, uncached_names) {
+            if !matches_uncached_or_fast_verify_name(
+                &qualified_decl_name(&name, &scope_stack),
+                uncached_names,
+            ) {
                 let short = name.rsplit('.').next().unwrap_or(&name);
                 if short.starts_with("_turbo_verify_") {
                     continue;
@@ -3361,10 +3481,11 @@ fn section_contains_uncached_theorem(
     sec_close: usize,
     uncached_names: &std::collections::HashSet<String>,
 ) -> bool {
-    find_last_matching_span_idx(&spans[sec_open..=sec_close], |n| {
+    find_last_matching_span_idx(&spans[..=sec_close], |n| {
         matches_uncached_name(n, uncached_names)
     })
-    .is_some()
+    .map(|idx| idx >= sec_open)
+    .unwrap_or(false)
 }
 
 fn compute_uncached_omitted_closed_section_mask(
@@ -3414,7 +3535,7 @@ pub fn build_fast_olean_shard_source_with_split(
 
     let mut max_end_line = 0usize;
     for (idx, shard) in split.shards.iter().enumerate() {
-        if matches_uncached_name(&shard.name, uncached_names) {
+        if matches_uncached_name(shard.decl_name(), uncached_names) {
             if !shard_is_acyclic_for_fast_import(&split.shards, idx) {
                 return None;
             }
@@ -3517,7 +3638,12 @@ pub fn build_fast_olean_shard_source_with_split(
             if has_inner_thm {
                 let any_uncached = inner_spans.iter().any(|sub| {
                     classify_decl_header(sub.clean_text)
-                        .map(|(_, n)| matches_uncached_name(&n, uncached_names))
+                        .map(|(_, n)| {
+                            matches_uncached_name(
+                                &qualified_decl_name(&n, &scope_stack),
+                                uncached_names,
+                            )
+                        })
                         .unwrap_or(false)
                 });
                 if any_uncached {
@@ -3560,7 +3686,8 @@ pub fn build_fast_olean_shard_source_with_split(
             if split_at_top_level_assign(span.clean_text).is_some() {
                 let cur_idx = thm_idx;
                 thm_idx += 1;
-                if matches_uncached_name(&name, uncached_names) {
+                if matches_uncached_name(&qualified_decl_name(&name, &scope_stack), uncached_names)
+                {
                     let renamed = rename_decl_header_for_fast_check(
                         span.orig_text,
                         span.clean_text,
@@ -3693,7 +3820,8 @@ pub fn build_pruned_imports_shard_source(
 
         if let Some((_kind, name)) = classify_decl_header(span.clean_text) {
             if let Some((sig_clean, proof_clean)) = split_at_top_level_assign(span.clean_text) {
-                if matches_uncached_name(&name, uncached_names) {
+                if matches_uncached_name(&qualified_decl_name(&name, &scope_stack), uncached_names)
+                {
                     if contains_mathlib_tactic_or_namespace(span.clean_text) {
                         return None;
                     }
@@ -3763,7 +3891,7 @@ pub fn can_use_fast_olean_import_with_split(
         return false;
     }
     for (idx, shard) in split.shards.iter().enumerate() {
-        if matches_uncached_name(&shard.name, uncached_names)
+        if matches_uncached_name(shard.decl_name(), uncached_names)
             && !shard_is_acyclic_for_fast_import(&split.shards, idx)
         {
             return false;
@@ -3794,8 +3922,10 @@ pub fn build_cross_file_coalesced_shard(
         } else {
             (b.trim(), *a)
         };
-        let uncached_names: std::collections::HashSet<String> =
-            uncached_shards.iter().map(|s| s.name.clone()).collect();
+        let uncached_names: std::collections::HashSet<String> = uncached_shards
+            .iter()
+            .map(|s| s.decl_name().to_string())
+            .collect();
         let max_end_line = uncached_shards
             .iter()
             .map(|s| s.end_line)
@@ -3860,7 +3990,10 @@ pub fn build_cross_file_coalesced_shard(
                 if split_at_top_level_assign(span.clean_text).is_some() {
                     let cur_idx = base_idx + thm_idx;
                     thm_idx += 1;
-                    if matches_uncached_name(&name, &uncached_names) {
+                    if matches_uncached_name(
+                        &qualified_decl_name(&name, &scope_stack),
+                        &uncached_names,
+                    ) {
                         if let Some(renamed) = rename_decl_header_for_fast_check(
                             span.orig_text,
                             span.clean_text,
@@ -4450,7 +4583,9 @@ pub fn audit_source_declarations(
     .collect();
     let (mut shadowed, mut priv_decls) = (Vec::new(), Vec::new());
 
+    let mut scope_stack = Vec::new();
     for (idx, span) in spans.iter().enumerate() {
+        update_scope_stack_with_idx(&mut scope_stack, span.clean_text, idx);
         let mut after_attrs = span.clean_text.trim_start();
         while let Some(next) = strip_leading_attr_block(after_attrs) {
             after_attrs = next.trim_start();
@@ -4460,7 +4595,7 @@ pub fn audit_source_declarations(
             let short = name.rsplit('.').next().unwrap_or(&name).to_string();
             let matches_filter = decl_filter
                 .filter(|d| !d.is_empty() && *d != "auto")
-                .map(|df| decl_name_matches_target(&name, df))
+                .map(|df| decl_name_matches_target(&qualified_decl_name(&name, &scope_stack), df))
                 .unwrap_or(true);
             if matches_filter && matches!(kw, "theorem" | "lemma") {
                 let sig = split_at_top_level_assign(span.clean_text)
@@ -4543,6 +4678,32 @@ pub fn audit_source_declarations(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn test_indented_set_option_in_is_stripped_as_declaration_prefix() {
+        let src = "  set_option foo bar in\n  theorem wrapped : True := by trivial";
+        assert_eq!(
+            strip_decl_prefixes(src),
+            "theorem wrapped : True := by trivial"
+        );
+        assert_eq!(
+            classify_decl_header(src),
+            Some(("theorem".to_string(), "wrapped".to_string()))
+        );
+        let split = split_lean_source(src, &[]);
+        assert_eq!(split.shards.len(), 1);
+        assert_eq!(split.shards[0].name, "wrapped");
+    }
+
+    #[test]
+    fn lexical_scope_preserves_apostrophes_in_identifiers() {
+        let src = "namespace B'x'y\ndef quote : Char := '\"'\ntheorem same : True := True.intro\nend B'x'y\n";
+        let split = split_lean_source(src, &[]);
+        assert_eq!(split.shards.len(), 1);
+        assert_eq!(split.shards[0].decl_name(), "B'x'y.same");
+        assert!(skip_lean_lexeme("B'x'y", 1).is_none());
+        assert!(skip_lean_lexeme("'x'", 0).is_some());
+    }
 
     #[test]
     fn test_strip_lean_comments_preserves_lines_strings_and_char_literals() {
@@ -4716,6 +4877,25 @@ mod tests {
             &bad_set
         )
         .is_none());
+    }
+
+    #[test]
+    fn test_cross_file_coalescing_selects_qualified_identity() {
+        let src = "namespace A\ntheorem same : True := True.intro\nend A\nnamespace B\ntheorem same : 1 = 1 := rfl\nend B\n";
+        let split = split_lean_source(src, &[]);
+        for (target, proof, other) in [
+            ("A.same", "True.intro", ":= rfl"),
+            ("B.same", ":= rfl", "True.intro"),
+        ] {
+            let idx = find_decl_shard_index(&split.shards, target)
+                .unwrap()
+                .unwrap();
+            let cross =
+                build_cross_file_coalesced_shard(&[("Pkg.Duplicate", src, &[&split.shards[idx]])]);
+            assert!(cross.contains(proof), "{}", cross);
+            assert!(!cross.contains(other), "{}", cross);
+            assert_eq!(cross.matches("theorem _turbo_verify_").count(), 1);
+        }
     }
 
     #[test]
@@ -5487,7 +5667,7 @@ end MathlibEdgeCases
                 shard_lines.get(s.start_line - 1).map(|l| l.trim()),
                 orig_lines.get(s.start_line - 1).map(|l| l.trim())
             );
-            if let Some(rec) = reconstruct_single_shard_source(src, &s.name) {
+            if let Some(rec) = reconstruct_single_shard_source(src, s.decl_name()).unwrap() {
                 assert_eq!(
                     rec.lines().nth(s.start_line - 1).map(str::trim),
                     orig_lines.get(s.start_line - 1).map(|l| l.trim())

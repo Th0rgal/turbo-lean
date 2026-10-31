@@ -22,6 +22,115 @@ use crate::pack;
 use crate::pr_verify::{try_fast_split_single_file, try_fast_split_single_file_from_path};
 use crate::splitter::{self, split_lean_source};
 
+/// Confirm the selected source declaration in Lean's environment, independently of
+/// textual scope tracking. This probe replaces only the proof: false statements
+/// must still have an identity before Stage-1 can attribute a counterexample.
+/// No result or identity is cached; unavailable elaboration fails closed.
+pub(crate) fn confirm_decl_identity(
+    src: &str,
+    shard: &splitter::TheoremShard,
+    project_dir: &Path,
+    file: &Path,
+) -> Result<()> {
+    confirm_decl_identity_with_trust(src, shard, project_dir, file, false)
+}
+
+pub(crate) fn confirm_decl_identity_with_trust(
+    src: &str,
+    shard: &splitter::TheoremShard,
+    project_dir: &Path,
+    file: &Path,
+    is_untrusted: bool,
+) -> Result<()> {
+    let expected = shard.decl_name();
+    let prefix = splitter::declaration_identity_prefix(src, shard.start_line);
+    let header_info = crate::module_builder::parse_header_info(&prefix);
+    let (header, prefix) = prefix.split_at(header_info.body_byte_offset);
+    let (signature, _) = splitter::extract_shard_stmt_and_proof(src, shard);
+    anyhow::ensure!(
+        !signature.is_empty(),
+        "Declaration identity unavailable for `{expected}`: missing signature"
+    );
+    let nonce = format!(
+        "{}{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    );
+    let command = format!("turbo_identity_{nonce}");
+    let marker = format!("TURBO_IDENTITY_{nonce} ");
+    let probe = format!(
+        r#"{header}
+import Lean
+{prefix}
+open Lean Elab Command in
+elab "{command}" cmd:command : command => do
+  let before ← getEnv
+  elabCommand cmd
+  let after ← getEnv
+  for (name, info) in after.constants.toList do
+    if !before.contains name then
+      if info matches .thmInfo _ then
+        logInfo m!"{marker}{{privateToUserName name}}"
+set_option warningAsError false
+set_option warn.sorry false
+{command}
+{signature}
+:= by sorry
+"#
+    );
+    let path = project_dir.join(format!("_turbo_identity_{nonce}.lean"));
+    fs::write(&path, probe)?;
+    let result = (|| -> Result<()> {
+        let lean_args = if project_dir.join("lakefile.toml").try_exists()?
+            || project_dir.join("lakefile.lean").try_exists()?
+        {
+            let pkg = crate::module_builder::resolve_package_config(project_dir, false)
+                .context("Failed to resolve Lean options for declaration identity")?;
+            crate::module_builder::resolve_file_lean_args_in_package(&pkg, file)
+        } else {
+            Vec::new()
+        };
+        let mut command = if is_untrusted {
+            crate::pr_verify::statement_lean_command(project_dir, true)?
+        } else {
+            let env = crate::lake_build::spawn_lake_env(project_dir)?;
+            let mut command = Command::new(lean_bin_from_env(&env));
+            command.current_dir(project_dir).envs(&env);
+            command
+        };
+        command.args(lean_args).arg(&path);
+        let out = crate::zygote::run_lean_command(&mut command, None)?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let names: Vec<_> = stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix(&marker))
+            .collect();
+        anyhow::ensure!(out.status.success() && names == [expected],
+            "Declaration identity confirmation failed for `{expected}`: Lean reported {names:?}; {}{}",
+            stdout, String::from_utf8_lossy(&out.stderr));
+        Ok(())
+    })();
+    let _ = fs::remove_file(path);
+    result.with_context(|| {
+        format!("Cannot report a verdict: declaration identity unconfirmed for `{expected}`")
+    })
+}
+
+/// Resolve a fresh source split before any single-declaration verdict (including Stage-1).
+pub(crate) fn confirm_selected_decl(
+    src: &str,
+    target: &str,
+    project_dir: &Path,
+    file: &Path,
+) -> Result<()> {
+    let split = splitter::split_lean_source(src, &[]);
+    let idx = splitter::find_decl_shard_index(&split.shards, target)?
+        .with_context(|| format!("Declaration `{target}` not found in {}", file.display()))?;
+    confirm_decl_identity(src, &split.shards[idx], project_dir, file)
+}
+
 pub(crate) fn make_shard_receipt_bytes(
     decl: &str,
     prefix_env_hash: &str,
@@ -52,7 +161,7 @@ fn cache_shm_stat_split(
         let st_path = shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
         let src_b3 = blake3::hash(active_src.as_bytes()).to_hex().to_string();
         let entry = ShmCachedFileSplit {
-            split_key: format!("file-split:v3:{}", src_b3),
+            split_key: format!("file-split:v8:{}", src_b3),
             src_blake3: src_b3,
             split: compact_split_for_shm_cache(split),
             prefix_src: String::new(),
@@ -461,19 +570,16 @@ pub fn try_stateless_remote_single_decl_check(
     else {
         return Ok(false);
     };
-    let Some(shard) = split
-        .shards
-        .iter()
-        .find(|s| splitter::decl_name_matches_target(&s.name, target_decl))
-    else {
+    let Some(shard_idx) = splitter::find_decl_shard_index(&split.shards, target_decl)? else {
         return Ok(false);
     };
+    let shard = &split.shards[shard_idx];
+    confirm_decl_identity(&active_src, shard, &canon_dir, &canon_file)?;
     let file_lean_args =
         crate::module_builder::try_resolve_lean_args_for_path(&canon_dir, Some(&canon_file))?;
     let shard_key = compute_shard_key_with_args(&toolchain, shard, &file_lean_args);
     let mut single_set = HashSet::new();
-    single_set.insert(target_decl.to_string());
-    single_set.insert(shard.name.clone());
+    single_set.insert(shard.decl_name().to_string());
     let pruned_src = splitter::build_pruned_imports_shard_source(&active_src, &single_set);
     let fast_olean_src = if pruned_src.is_some() || split.shards.len() <= 1 {
         None
@@ -783,7 +889,7 @@ fn run_check_command_inner(
             let src_b3 = blake3::hash(loaded_src.as_bytes()).to_hex().to_string();
             if let Some((ref st_path, _)) = st_paths_opt {
                 let entry = ShmCachedFileSplit {
-                    split_key: format!("file-split:v3:{}", src_b3),
+                    split_key: format!("file-split:v8:{}", src_b3),
                     src_blake3: src_b3.clone(),
                     split: compact_split_for_shm_cache(&sp),
                     prefix_src: String::new(),
@@ -822,7 +928,7 @@ fn run_check_command_inner(
                     split_key: if src_b3.is_empty() {
                         String::new()
                     } else {
-                        format!("file-split:v3:{}", src_b3)
+                        format!("file-split:v8:{}", src_b3)
                     },
                     src_blake3: src_b3,
                     split: compact_split_for_shm_cache(&fast_res.0),
@@ -1505,11 +1611,7 @@ fn check_single_decl(
     let mut active_src = src;
     let mut active_file = resolved_file.to_path_buf();
 
-    if !split
-        .shards
-        .iter()
-        .any(|s| splitter::decl_name_matches_target(&s.name, target_decl))
-    {
+    if splitter::find_decl_shard_index(&split.shards, target_decl)?.is_none() {
         for mod_name in crate::module_builder::parse_header_imports(&split.imports_header) {
             if mod_name != "Init" {
                 let rel_mod = crate::module_builder::module_name_to_rel_slash(&mod_name) + ".lean";
@@ -1539,11 +1641,7 @@ fn check_single_decl(
                     })
                 });
                 if let Some((sub_src, sub_cb3, sub_split)) = sub_split_opt {
-                    if sub_split
-                        .shards
-                        .iter()
-                        .any(|s| splitter::decl_name_matches_target(&s.name, target_decl))
-                    {
+                    if splitter::find_decl_shard_index(&sub_split.shards, target_decl)?.is_some() {
                         *split = sub_split;
                         *cached_file_blake3 = sub_cb3;
                         active_src = sub_src;
@@ -1564,7 +1662,7 @@ fn check_single_decl(
                         let st_path =
                             shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
                         let entry = ShmCachedFileSplit {
-                            split_key: format!("file-split:v3:{}", sub_b3),
+                            split_key: format!("file-split:v8:{}", sub_b3),
                             src_blake3: sub_b3.clone(),
                             split: compact_split_for_shm_cache(&sub_split),
                             prefix_src: if sub_src.len() <= 64 * 1024 {
@@ -1579,11 +1677,7 @@ fn check_single_decl(
                             let _ = crate::shm_cache::atomic_write_shm(&st_path, &bytes);
                         }
                     }
-                    if sub_split
-                        .shards
-                        .iter()
-                        .any(|s| splitter::decl_name_matches_target(&s.name, target_decl))
-                    {
+                    if splitter::find_decl_shard_index(&sub_split.shards, target_decl)?.is_some() {
                         *split = sub_split;
                         *cached_file_blake3 = Some(sub_b3);
                         active_src = sub_src;
@@ -1595,11 +1689,8 @@ fn check_single_decl(
         }
     }
 
-    let shard_idx = split
-        .shards
-        .iter()
-        .position(|s| splitter::decl_name_matches_target(&s.name, target_decl))
-        .with_context(|| {
+    let shard_idx =
+        splitter::find_decl_shard_index(&split.shards, target_decl)?.with_context(|| {
             format!(
                 "Declaration `{}` not found in {} (found {} theorem shards)",
                 target_decl,
@@ -1626,6 +1717,11 @@ fn check_single_decl(
         }
     }
     let shard = &split.shards[shard_idx];
+    // Stat/split caches are not evidence of the identity in the current source.
+    if active_src.is_empty() {
+        active_src = fs::read_to_string(&active_file)?;
+    }
+    confirm_decl_identity(&active_src, shard, canon_dir, &active_file)?;
     let file_lean_args =
         crate::module_builder::try_resolve_lean_args_for_path(canon_dir, Some(&active_file))?;
 
@@ -1695,8 +1791,7 @@ fn check_single_decl(
                 .unwrap_or_else(|_| active_file.clone())
         };
         let mut single_set = HashSet::new();
-        single_set.insert(target_decl.to_string());
-        single_set.insert(shard.name.clone());
+        single_set.insert(shard.decl_name().to_string());
         let pruned_src = splitter::build_pruned_imports_shard_source(&active_src, &single_set);
         let fast_olean_src = if split.shards.len() <= 1 {
             None
@@ -1744,7 +1839,7 @@ fn check_single_decl(
             full_shard_src = if !shard.shard_source.is_empty() {
                 shard.shard_source.clone()
             } else {
-                splitter::reconstruct_single_shard_source(&active_src, &shard.name)
+                splitter::reconstruct_single_shard_source(&active_src, shard.decl_name())?
                     .unwrap_or_default()
             };
             candidates.push((full_shard_src.as_str(), false));
@@ -1828,7 +1923,7 @@ fn check_single_decl(
             let fallback_src = if !shard.shard_source.is_empty() {
                 shard.shard_source.clone()
             } else {
-                splitter::reconstruct_single_shard_source(&active_src, &shard.name)
+                splitter::reconstruct_single_shard_source(&active_src, shard.decl_name())?
                     .unwrap_or_default()
             };
             let req_body = serde_json::to_vec(&pack::CheckShardHttpRequest {
@@ -1957,8 +2052,7 @@ fn check_single_decl(
                 staging_dir.join(format!("shard_{}_{}.lean", safe_name, std::process::id()));
 
             let mut single_set = HashSet::new();
-            single_set.insert(target_decl.to_string());
-            single_set.insert(shard.name.clone());
+            single_set.insert(shard.decl_name().to_string());
 
             let proj_build_verified = !(known_modified_vs_head && same_as_initial)
                 && split.hygiene.is_clean_for_certification()
@@ -2087,7 +2181,7 @@ fn check_single_decl(
                     let full_shard_src = if !shard.shard_source.is_empty() {
                         shard.shard_source.clone()
                     } else {
-                        splitter::reconstruct_single_shard_source(&active_src, &shard.name)
+                        splitter::reconstruct_single_shard_source(&active_src, shard.decl_name())?
                             .unwrap_or_default()
                     };
                     let (prefix_src, closing_suffix) = if !decl_src.is_empty() {
@@ -2467,7 +2561,7 @@ fn check_single_decl(
                 let full_shard_src = if !shard.shard_source.is_empty() {
                     shard.shard_source.clone()
                 } else {
-                    splitter::reconstruct_single_shard_source(&active_src, &shard.name)
+                    splitter::reconstruct_single_shard_source(&active_src, shard.decl_name())?
                         .unwrap_or_default()
                 };
                 if !verified_via_zygote {
@@ -3378,7 +3472,7 @@ fn check_single_file(
                                 let shard_t0 = Instant::now();
                                 let shard_src_owned = if shard.shard_source.is_empty() {
                                     let mut single_set = HashSet::with_capacity(1);
-                                    single_set.insert(shard.name.clone());
+                                    single_set.insert(shard.decl_name().to_string());
                                     splitter::build_coalesced_shard_source(src_ref, &single_set)
                                 } else {
                                     shard.shard_source.clone()
@@ -3970,6 +4064,32 @@ mod tests {
     use crate::lake_build::compute_shard_key;
 
     #[test]
+    fn declaration_identity_rejects_mislabeled_shards_and_unavailable_elaboration() {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_identity_guard_{}",
+            crate::pack::next_tmp_id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        let file = dir.join("Identity.lean");
+        let src = "namespace A\ntheorem same : True := True.intro\nend A\nnamespace B\ntheorem same (n : Nat) : n = n + 1 := by rfl\nend B\n";
+        let split = split_lean_source(src, &[]);
+        let mut shard = split.shards[1].clone();
+        confirm_decl_identity(src, &shard, &dir, &file).unwrap();
+        shard.qualified_name = "A.same".into();
+        let error = format!(
+            "{:#}",
+            confirm_decl_identity(src, &shard, &dir, &file).unwrap_err()
+        );
+        assert!(error.contains("identity unconfirmed"), "{error}");
+        assert!(error.contains("B.same"), "{error}");
+        let invalid = "namespace B\ndef broken : Nat := noSuchConstant\ntheorem same : True := True.intro\nend B\n";
+        let split = split_lean_source(invalid, &[]);
+        assert!(confirm_decl_identity(invalid, &split.shards[0], &dir, &file).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn test_extract_mismatch_diagnostics_parses_rhs_and_numeric_delta() {
         let sample_err = "\
 <zygote-decl>:42:4: error: type mismatch
@@ -4293,6 +4413,251 @@ but is expected to have type
             assert_eq!(turbo_spec_step_verdict_consistent(1, 1), 1);
             assert_eq!(turbo_spec_step_verdict_consistent(1, 0), 0);
         }
+    }
+
+    #[test]
+    fn test_stage1_qualified_decl_selection_cli_and_stateful() {
+        // Unit-test executables live in <profile>/deps; exercise the actual CLI too.
+        let mut build = Command::new(env!("CARGO"));
+        build
+            .arg("build")
+            .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
+        if !cfg!(debug_assertions) {
+            build.arg("--release");
+        }
+        assert!(build.status().unwrap().success());
+        let binary = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("turbo-lean");
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_stage1_selection_{}",
+            crate::pack::next_tmp_id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        let file = dir.join("Selection.lean");
+        let good = "namespace A\ntheorem same (n : Nat) : n = n := rfl\nend A\n";
+        let bad = "namespace B\ntheorem same (n : Nat) : n = n + 1 := by rfl\nend B\n";
+        let indented = format!("{good}{bad}")
+            .lines()
+            .map(|line| format!("  {line}\n"))
+            .collect::<String>();
+        let quoted = format!("def message := \"\nnamespace Literal\ntheorem same (n : Nat) : n = n + 1 := by rfl\nend Literal\n\"\n{good}{bad}");
+        for (order, src) in [
+            format!("{good}{bad}"),
+            format!("{bad}{good}"),
+            indented,
+            quoted,
+            "namespace B\ndef message : String := \"\nend B\nnamespace A\n\"\ntheorem same (n : Nat) : n = n + 1 := by rfl\nend B\n".to_string() + good,
+        ]
+        .iter()
+        .enumerate()
+        {
+            fs::write(&file, src).unwrap();
+            let cache = dir.join(format!("cache{order}"));
+            let mut store = TurboStore::open(Some(&dir.join(format!("stateful{order}")))).unwrap();
+            for target in ["A.same", "same", "B.same", "Other.A.same", "Literal.same"] {
+                let stateful = crate::gpu_fastcheck::evaluate_agent_step_value(
+                    &mut store,
+                    &file,
+                    Some(target),
+                    Some(&dir),
+                    false,
+                    false,
+                );
+                match target {
+                    "same" => assert!(stateful
+                        .unwrap_err()
+                        .to_string()
+                        .contains("Ambiguous declaration")),
+                    "Other.A.same" | "Literal.same" => assert!(stateful.is_err()),
+                    _ => {
+                        let value = stateful.unwrap();
+                        assert_eq!(value["decl"], target);
+                        assert_eq!(
+                            value["status"],
+                            if target == "A.same" {
+                                "theorem_verified"
+                            } else {
+                                "counterexample_rejected"
+                            }
+                        );
+                    }
+                }
+                for command in ["agent-step", "fast-check"] {
+                    let mut cli = Command::new(&binary);
+                    cli.current_dir(&dir)
+                        .arg("--cache-dir")
+                        .arg(&cache)
+                        .args(["--json", command])
+                        .arg(&file)
+                        .args(["--decl", target]);
+                    if command == "agent-step" {
+                        cli.arg("--project-dir").arg(&dir);
+                    }
+                    let output = cli.output().unwrap();
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    if matches!(target, "same" | "Other.A.same" | "Literal.same") {
+                        assert!(
+                            !output.status.success(),
+                            "{command} {target}: {stdout} {stderr}"
+                        );
+                        if target == "same" {
+                            assert!(
+                                stderr.contains("Ambiguous declaration")
+                                    && stderr.contains("A.same")
+                                    && stderr.contains("B.same"),
+                                "{stderr}"
+                            );
+                        }
+                        assert!(!stdout.contains("counterexample"), "{stdout}");
+                        continue;
+                    }
+                    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+                        .unwrap_or_else(|_| panic!("{command} {target}: {stdout} {stderr}"));
+                    if command == "agent-step" {
+                        assert!(output.status.success(), "{stderr}");
+                        assert_eq!(value["decl"], target);
+                        assert_eq!(
+                            value["status"],
+                            if target == "A.same" {
+                                "theorem_verified"
+                            } else {
+                                "counterexample_rejected"
+                            }
+                        );
+                    } else {
+                        assert_eq!(value["decl_name"], target);
+                        assert_eq!(value["verified"], target == "A.same");
+                        assert_eq!(
+                            value["status"],
+                            if target == "A.same" {
+                                "ok"
+                            } else {
+                                "counterexample_found"
+                            }
+                        );
+                    }
+                }
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn test_check_qualified_decl_rebuilds_legacy_stat_split() {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_legacy_qualified_split_{}",
+            crate::pack::next_tmp_id()
+        ));
+        let proj = dir.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        let file = proj.join("Legacy.lean");
+        // Checking A must succeed even though the later, same-spelled B theorem is invalid.
+        let src = "namespace A\ntheorem same : True := True.intro\nend A\nnamespace B\ntheorem same : False := True.intro\nend B\n";
+        fs::write(&file, src).unwrap();
+        let mut store = TurboStore::open(Some(&dir.join("store"))).unwrap();
+        let src_b3 = blake3::hash(src.as_bytes()).to_hex().to_string();
+        let split = split_lean_source(src, &[]);
+        let mut legacy = serde_json::to_value(ShmCachedFileSplit {
+            src_blake3: src_b3.clone(),
+            split_key: format!("file-split:v3:{}", src_b3),
+            split: compact_split_for_shm_cache(&split),
+            prefix_src: String::new(),
+            known_modified: false,
+            dep_hashes: Vec::new(),
+        })
+        .unwrap();
+        for shard in legacy["split"]["shards"].as_array_mut().unwrap() {
+            shard["name"] = serde_json::json!("same");
+            shard.as_object_mut().unwrap().remove("qualified_name");
+        }
+        let canon_file = file.canonicalize().unwrap();
+        let (ms, mn, sz) = TurboStore::extract_file_stat_tuple(&fs::metadata(&file).unwrap());
+        let pk = canon_file.to_string_lossy();
+        let hash_for_version = |version: &[u8]| {
+            let mut hash = blake3::Hasher::new();
+            hash.update(version);
+            hash.update(pk.as_bytes());
+            hash.update(b":");
+            hash.update(&ms.to_le_bytes());
+            hash.update(&mn.to_le_bytes());
+            hash.update(&sz.to_le_bytes());
+            hash.finalize().to_hex().to_string()
+        };
+        let old_hash = hash_for_version(b"single-stat-split:v3\n");
+        let splits_dir = shm_file_splits_dir(&store);
+        let old_path = splits_dir.join(format!("st_{}.json", &old_hash[..24]));
+        fs::write(&old_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        // The previous PR head stored nonempty, but lexically wrong, identities.
+        let stale_hash = hash_for_version(b"single-stat-split:v6\n");
+        let stale_path = splits_dir.join(format!("st_{}.json", &stale_hash[..24]));
+        for shard in legacy["split"]["shards"].as_array_mut().unwrap() {
+            shard["qualified_name"] = serde_json::json!("Wrong.same");
+        }
+        fs::write(&stale_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let new_hash = compute_single_stat_hash(&pk, ms, mn, sz);
+        assert_ne!(new_hash, old_hash);
+        assert_ne!(new_hash, stale_hash);
+
+        let result = evaluate_check_command_value(
+            &mut store,
+            file.clone(),
+            Some("A.same".into()),
+            proj.clone(),
+        )
+        .unwrap();
+        assert_eq!(result["status"], "theorem_verified");
+        assert_eq!(result["decl"], "A.same");
+        let rebuilt: ShmCachedFileSplit = serde_json::from_slice(
+            &fs::read(splits_dir.join(format!("st_{}.json", &new_hash[..24]))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rebuilt.split.shards[0].decl_name(), "A.same");
+        assert_eq!(rebuilt.split.shards[1].decl_name(), "B.same");
+        let warm = evaluate_check_command_value(
+            &mut store,
+            file.clone(),
+            Some("A.same".into()),
+            proj.clone(),
+        )
+        .unwrap();
+        assert_eq!(warm["status"], "theorem_cache_hit");
+        let agent = crate::gpu_fastcheck::evaluate_agent_step_value(
+            &mut store,
+            &file,
+            Some("A.same"),
+            Some(&proj),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(agent["status"], "theorem_cache_hit");
+        assert_eq!(agent["shard_hits"], 1);
+        let ambiguous = crate::gpu_fastcheck::evaluate_agent_step_value(
+            &mut store,
+            &file,
+            Some("same"),
+            Some(&proj),
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(ambiguous.to_string().contains("Ambiguous declaration"));
+        assert!(
+            evaluate_check_command_value(&mut store, file, Some("B.same".into()), proj).is_err()
+        );
+        let _ = fs::remove_file(old_path);
+        let _ = fs::remove_file(stale_path);
+        let _ = fs::remove_file(splits_dir.join(format!("st_{}.json", &new_hash[..24])));
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

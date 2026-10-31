@@ -176,7 +176,7 @@ struct ExtractedDecl {
 }
 
 fn extract_lean_theorem(clean_src: &str, target_name: Option<&str>) -> Result<ExtractedDecl> {
-    extract_all_lean_theorems(clean_src, target_name)
+    extract_selected_decls(clean_src, target_name)?
         .into_iter()
         .next()
         .ok_or_else(|| match target_name {
@@ -870,8 +870,7 @@ pub fn transpile_lean_theorem_to_cuda(
     lean_src: &str,
     decl_name: Option<&str>,
 ) -> Result<TranspiledCudaKernel> {
-    let clean = strip_lean_comments(lean_src);
-    let extracted = extract_lean_theorem(&clean, decl_name)?;
+    let extracted = extract_lean_theorem(lean_src, decl_name)?;
 
     let mut params = Vec::new();
     let mut raw_hyp_exprs = Vec::new();
@@ -2314,7 +2313,7 @@ end TurboLean.FastCheck
             "subWithBorrow_zero_right",
         ] {
             let kernel = transpile_lean_theorem_to_cuda(lean_src, Some(decl)).unwrap();
-            assert_eq!(kernel.decl_name, decl);
+            assert_eq!(kernel.decl_name, format!("TurboLean.FastCheck.{decl}"));
             assert!(kernel
                 .cuda_source
                 .contains("__global__ void check_transpiled_theorem_kernel"));
@@ -2793,6 +2792,14 @@ pub fn run_tpu_fast_check(json: bool, file: &Path, decl_filter: Option<&str>) ->
         Some(s) if !s.is_empty() && s != "auto" => Some(s),
         _ => None,
     };
+    if let Some(target) = eff_filter {
+        crate::check::confirm_selected_decl(
+            &src_text,
+            target,
+            &crate::lake_build::find_project_root(file),
+            file,
+        )?;
+    }
     let kernel = transpile_lean_theorem_to_cuda(&src_text, eff_filter)?;
     let n_states = 262_144u64;
     let mut report = execute_transpiled_cuda_kernel(&kernel, n_states, false)?;
@@ -2951,6 +2958,14 @@ pub fn run_fast_check_command(
         } else {
             Some(decl_arg.as_str())
         };
+        if let Some(target) = decl_filter {
+            crate::check::confirm_selected_decl(
+                &src_text,
+                target,
+                &crate::lake_build::find_project_root(&file),
+                &file,
+            )?;
+        }
         let kernel = transpile_lean_theorem_to_cuda(&src_text, decl_filter)?;
         let n_states = if Path::new("/usr/local/cuda/bin/nvcc").exists() {
             10_000_000
@@ -4491,21 +4506,9 @@ fn resolve_agent_step_env_and_paths(
         .and_then(|s| s.parse().ok());
     let effective_low_memory = low_memory || max_memory_mb.is_some_and(|m| m <= 2048);
 
-    let inferred_proj_dir = project_dir.map(Path::to_path_buf).unwrap_or_else(|| {
-        let start_dir = if file.is_dir() {
-            file.to_path_buf()
-        } else {
-            file.parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf()
-        };
-        let canon_start = start_dir.canonicalize().unwrap_or(start_dir);
-        canon_start
-            .ancestors()
-            .find(|p| p.join("lean-toolchain").exists() || p.join("lakefile.lean").exists())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."))
-    });
+    let inferred_proj_dir = project_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| crate::lake_build::find_project_root(file));
     let canon_dir = inferred_proj_dir
         .canonicalize()
         .unwrap_or_else(|_| inferred_proj_dir);
@@ -4607,6 +4610,32 @@ fn try_eval_decl_stage1_cex_json(
     }))
 }
 
+/// Resolve against qualified shard identities before extracting any statement for evaluation.
+fn extract_selected_decls(src: &str, target: Option<&str>) -> Result<Vec<ExtractedDecl>> {
+    let split = crate::splitter::split_lean_source(src, &[]);
+    match target.filter(|t| !t.is_empty() && *t != "auto") {
+        Some(target) => Ok(
+            crate::splitter::find_decl_shard_index(&split.shards, target)?
+                .and_then(|idx| extract_shard_decl(src, &split.shards[idx]))
+                .into_iter()
+                .collect(),
+        ),
+        None => Ok(split
+            .shards
+            .iter()
+            .filter_map(|shard| extract_shard_decl(src, shard))
+            .collect()),
+    }
+}
+
+fn extract_shard_decl(src: &str, shard: &crate::splitter::TheoremShard) -> Option<ExtractedDecl> {
+    // The signature excludes neighboring declarations and the proof's lexical contents.
+    let (stmt, _) = crate::splitter::extract_shard_stmt_and_proof(src, shard);
+    let mut decl = extract_decls_fast(&stmt, None).into_iter().next()?;
+    decl.name = shard.decl_name().to_string();
+    Some(decl)
+}
+
 /// Fast pre-SQLite Stage-1 counterexample check for `turbo-lean agent-step`.
 /// Returns `Some(json)` when a counterexample is immediately found in memory without needing `state.db`.
 pub fn try_stateless_agent_step_cex(
@@ -4614,21 +4643,29 @@ pub fn try_stateless_agent_step_cex(
     decl_filter: Option<&str>,
     project_dir: Option<&Path>,
     low_memory: bool,
-) -> Option<serde_json::Value> {
+) -> Result<Option<serde_json::Value>> {
     let t0 = Instant::now();
     let (max_memory_mb, effective_low_memory, canon_dir, resolved_file) =
         resolve_agent_step_env_and_paths(file, project_dir, low_memory, false);
     if !resolved_file.is_file() {
-        return None;
+        return Ok(None);
     }
-    let src_text = fs::read_to_string(&resolved_file).ok()?;
-    let decls = extract_decls_fast(&src_text, decl_filter);
+    let Ok(src_text) = fs::read_to_string(&resolved_file) else {
+        return Ok(None);
+    };
+    if let Some(target) = decl_filter.filter(|t| !t.is_empty() && *t != "auto") {
+        crate::check::confirm_selected_decl(&src_text, target, &canon_dir, &resolved_file)?;
+    }
+    let decls = extract_selected_decls(&src_text, decl_filter)?;
     let accel_cfg = crate::accelerators::AcceleratorConfig::load(Some(&canon_dir));
     let accelerators_active = accel_cfg.enabled;
     let has_ext_plugins = !accel_cfg.external.is_empty();
     let accel_registry = crate::accelerators::AcceleratorRegistry::from_config(accel_cfg);
     let registered_accelerators_count = accel_registry.plugin_count();
     for d in &decls {
+        if decl_filter.is_none_or(|t| t.is_empty() || t == "auto") {
+            crate::check::confirm_selected_decl(&src_text, &d.name, &canon_dir, &resolved_file)?;
+        }
         if let Some(val) = try_eval_decl_stage1_cex_json(
             d,
             file,
@@ -4645,10 +4682,10 @@ pub fn try_stateless_agent_step_cex(
                     .unwrap_or_else(|_| (true, "0.3.0".to_string()))
             },
         ) {
-            return Some(val);
+            return Ok(Some(val));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Build structured `rewrite_suggestions` alongside verified `accelerator_certificates`
@@ -4756,30 +4793,6 @@ pub fn evaluate_agent_step_value(
     if resolved_file.is_file() {
         let src_text = fs::read_to_string(&resolved_file)
             .with_context(|| format!("Failed to read {}", resolved_file.display()))?;
-        let decls = extract_decls_fast(&src_text, decl_filter);
-
-        for d in &decls {
-            total_specs_audited += 1;
-            let (is_vac, is_tight, _) = audit_single_decl_spec(d);
-            vacuous_specs += usize::from(is_vac);
-            tight_specs += usize::from(is_tight);
-
-            if let Some(val) = try_eval_decl_stage1_cex_json(
-                d,
-                file,
-                &accel_registry,
-                accelerators_active,
-                has_ext_plugins,
-                registered_accelerators_count,
-                effective_low_memory,
-                max_memory_mb,
-                t0,
-                lazy_lean_native_cert,
-            ) {
-                return Ok(val);
-            }
-        }
-
         let toolchain = crate::lake_build::detect_toolchain(&canon_dir);
         let canon_resolved = resolved_file
             .canonicalize()
@@ -4808,7 +4821,7 @@ pub fn evaluate_agent_step_value(
                 if let Some(ref st_path) = st_path_opt {
                     let src_b3 = blake3::hash(src_text.as_bytes()).to_hex().to_string();
                     let entry = crate::lake_build::ShmCachedFileSplit {
-                        split_key: format!("file-split:v2:{}", src_b3),
+                        split_key: format!("file-split:v8:{}", src_b3),
                         src_blake3: src_b3,
                         split: crate::lake_build::compact_split_for_shm_cache(&sp),
                         prefix_src: if src_text.len() <= 64 * 1024 {
@@ -4827,25 +4840,51 @@ pub fn evaluate_agent_step_value(
             }
         };
 
-        let target_shards: Vec<&crate::splitter::TheoremShard> = split
-            .shards
+        let target_shards: Vec<&crate::splitter::TheoremShard> = match decl_filter {
+            Some(df) if !df.is_empty() && df != "auto" => {
+                crate::splitter::find_decl_shard_index(&split.shards, df)?
+                    .map(|idx| vec![&split.shards[idx]])
+                    .unwrap_or_default()
+            }
+            _ => split.shards.iter().collect(),
+        };
+
+        for shard in &target_shards {
+            crate::check::confirm_decl_identity(&src_text, shard, &canon_dir, &resolved_file)?;
+        }
+        let decls: Vec<_> = target_shards
             .iter()
-            .filter(|s| match decl_filter {
-                Some(df) if !df.is_empty() && df != "auto" => {
-                    s.name == df
-                        || s.name.ends_with(&format!(".{}", df))
-                        || df.ends_with(&format!(".{}", s.name))
-                }
-                _ => true,
-            })
+            .filter_map(|ts| extract_shard_decl(&src_text, ts))
             .collect();
+
+        for d in &decls {
+            total_specs_audited += 1;
+            let (is_vac, is_tight, _) = audit_single_decl_spec(d);
+            vacuous_specs += usize::from(is_vac);
+            tight_specs += usize::from(is_tight);
+
+            if let Some(val) = try_eval_decl_stage1_cex_json(
+                d,
+                file,
+                &accel_registry,
+                accelerators_active,
+                has_ext_plugins,
+                registered_accelerators_count,
+                effective_low_memory,
+                max_memory_mb,
+                t0,
+                lazy_lean_native_cert,
+            ) {
+                return Ok(val);
+            }
+        }
 
         for ts in &target_shards {
             let (stmt_src, body_src) = crate::splitter::extract_shard_stmt_and_proof(&src_text, ts);
             if primary_stmt_src.is_empty() {
                 primary_stmt_src = stmt_src.clone();
                 primary_body_src = body_src.clone();
-                primary_decl_name = ts.name.clone();
+                primary_decl_name = ts.decl_name().to_string();
             }
             if !accelerators_active {
                 continue;
@@ -4940,12 +4979,14 @@ pub fn evaluate_agent_step_value(
                         crate::c_abi::build_counterexample_triage_json(None, None, None);
                     let mut compact_summary = format!(
                         "CEX stage1_accel decl={} via={} ms={:.1}",
-                        ts.name, accelerator_name, elapsed_ms
+                        ts.decl_name(),
+                        accelerator_name,
+                        elapsed_ms
                     );
                     compact_summary.truncate(120);
                     return Ok(serde_json::json!({
                         "status": "counterexample_rejected",
-                        "decl": ts.name,
+                        "decl": ts.decl_name(),
                         "file": file.display().to_string(),
                         "stage": "stage1_accelerator_fastreject",
                         "accelerator_name": accelerator_name,
@@ -4994,14 +5035,14 @@ pub fn evaluate_agent_step_value(
                     let first_shard = target_shards[0];
                     let cached_stmt_src = if !first_shard.signature_text.is_empty() {
                         first_shard.signature_text.as_str()
-                    } else if first_shard.name == primary_decl_name {
+                    } else if first_shard.decl_name() == primary_decl_name {
                         primary_stmt_src.as_str()
                     } else {
                         ""
                     };
                     let cached_body_src = if !first_shard.proof_text.is_empty() {
                         first_shard.proof_text.as_str()
-                    } else if first_shard.name == primary_decl_name {
+                    } else if first_shard.decl_name() == primary_decl_name {
                         primary_body_src.as_str()
                     } else {
                         ""
@@ -5019,14 +5060,14 @@ pub fn evaluate_agent_step_value(
                     for sh in &target_shards {
                         let sh_stmt = if !sh.signature_text.is_empty() {
                             sh.signature_text.as_str()
-                        } else if sh.name == primary_decl_name {
+                        } else if sh.decl_name() == primary_decl_name {
                             primary_stmt_src.as_str()
                         } else {
                             ""
                         };
                         let sh_body = if !sh.proof_text.is_empty() {
                             sh.proof_text.as_str()
-                        } else if sh.name == primary_decl_name {
+                        } else if sh.decl_name() == primary_decl_name {
                             primary_body_src.as_str()
                         } else {
                             ""
@@ -5061,7 +5102,8 @@ pub fn evaluate_agent_step_value(
                     };
                     let mut compact_summary = format!(
                         "OK stage2_cached decl={} ms={:.1}",
-                        first_shard.name, elapsed_ms
+                        first_shard.decl_name(),
+                        elapsed_ms
                     );
                     compact_summary.truncate(120);
                     let (verified_certs, rewrite_suggestions) =
@@ -5074,7 +5116,7 @@ pub fn evaluate_agent_step_value(
                         "status": status_str,
                         "verification_status": "verified",
                         "verified": true,
-                        "decl": first_shard.name,
+                        "decl": first_shard.decl_name(),
                         "file": file.display().to_string(),
                         "stage": "stage2_kernel_verified",
                         "accelerators_active": accelerators_active,

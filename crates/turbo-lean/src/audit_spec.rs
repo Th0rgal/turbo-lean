@@ -1,6 +1,7 @@
 //! Specification auditor extracted mechanically from gpu_fastcheck.rs.
 
 use super::*;
+use crate::splitter::skip_lean_lexeme;
 
 pub(super) fn inline_stmt_let_bindings(stmt: &str) -> String {
     let mut cur = stmt.trim().to_string();
@@ -49,82 +50,6 @@ pub(super) fn inline_stmt_let_bindings(stmt: &str) -> String {
         cur = replace_ident_boundary(body.trim(), var_name, &rhs_wrapped);
     }
     cur
-}
-
-/// A literal or comment beginning at a UTF-8 byte boundary. Unterminated strings
-/// and block comments consume the remainder so their contents cannot become code.
-struct LeanLexicalSpan {
-    end: usize,
-    is_comment: bool,
-}
-
-fn skip_lean_lexeme(src: &str, start: usize) -> Option<LeanLexicalSpan> {
-    let bytes = src.as_bytes();
-    let mut i = start;
-    let is_comment = src[start..].starts_with("--") || src[start..].starts_with("/-");
-    match *bytes.get(start)? {
-        b'-' if src[start..].starts_with("--") => {
-            i += 2;
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
-        }
-        b'/' if src[start..].starts_with("/-") => {
-            i += 2;
-            let mut depth = 1usize;
-            while i < bytes.len() && depth > 0 {
-                if bytes[i..].starts_with(b"/-") {
-                    depth += 1;
-                    i += 2;
-                } else if bytes[i..].starts_with(b"-/") {
-                    depth -= 1;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-        }
-        b'\'' => i = crate::splitter::scan_lean_char_lit_end(src, start)?,
-        b'"' => {
-            i += 1;
-            while i < bytes.len() {
-                match bytes[i] {
-                    b'\\' => i = (i + 2).min(bytes.len()),
-                    b'"' => {
-                        i += 1;
-                        break;
-                    }
-                    _ => i += 1,
-                }
-            }
-        }
-        b'r' if !src[..start]
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '\'') =>
-        {
-            i += 1;
-            while bytes.get(i) == Some(&b'#') {
-                i += 1;
-            }
-            let hashes = i - start - 1;
-            if bytes.get(i) != Some(&b'"') {
-                return None;
-            }
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == b'"'
-                    && bytes[i + 1..].starts_with(&bytes[start + 1..start + 1 + hashes])
-                {
-                    i += 1 + hashes;
-                    break;
-                }
-                i += 1;
-            }
-        }
-        _ => return None,
-    }
-    Some(LeanLexicalSpan { end: i, is_comment })
 }
 
 /// Audit-only stripping: preserve literal text, byte offsets, and newlines.
@@ -189,9 +114,7 @@ pub(super) fn extract_all_lean_theorems(
                 let decl_name: String = chars[name_start..i].iter().collect();
                 let matches_filter = match target_name {
                     Some(t) if !t.is_empty() && t != "auto" => {
-                        decl_name == t
-                            || decl_name.ends_with(&format!(".{}", t))
-                            || t.ends_with(&format!(".{}", decl_name))
+                        crate::splitter::decl_name_matches_target(&decl_name, t)
                     }
                     _ => true,
                 };
@@ -1969,7 +1892,7 @@ pub(super) fn extract_decls_fast(src: &str, decl_filter: Option<&str>) -> Vec<Ex
 }
 
 /// Schema version for the Blake3 content-addressed `audit-spec` per-file JSON cache.
-pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 12;
+pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 13;
 
 static AUDIT_SPEC_CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
