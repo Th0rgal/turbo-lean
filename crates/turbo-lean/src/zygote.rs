@@ -4719,7 +4719,7 @@ mod tests {
         let remaining = remaining_timeout_ms(Some(100), started);
         assert_eq!(remaining, 0);
         let err =
-            run_lean_command(Command::new("must-not-be-spawned"), Some(remaining)).unwrap_err();
+            run_lean_command(&mut Command::new("must-not-be-spawned"), Some(remaining)).unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
     }
 
