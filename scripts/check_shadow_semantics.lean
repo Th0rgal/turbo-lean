@@ -1,5 +1,5 @@
 /-
-  Track B0 (spec v4, deliverables 3 + 4): shadow-semantics checker and blocking ratchet.
+  Track B0 (spec v4, deliverables 3 + 4): shadow-semantics checker and ratchet.
 
   Run from `lean/`:
     lake env lean --run ../scripts/check_shadow_semantics.lean [--base REV] [--json-out PATH]
@@ -29,7 +29,8 @@
   Forbidden set: every constant `LeanNative.Semantics.eval*` and all its auxiliaries
   (`LeanNative.Semantics.eval*.*`), private or not.
 
-  Ratchet (blocking): the current violation set must be a subset of the allowlist read from
+  Ratchet (fails the CI job; merge-blocking only once `main` requires that check — see
+  docs/SHADOW_SEMANTICS.md "Enforcement"): the current violation set must be a subset of the allowlist read from
   `git show $BASE:scripts/shadow_allowlist.json`; the working-tree allowlist must itself be a
   subset of the base allowlist (no additions) AND equal the current violation set (no missing,
   no stale entries); the inventory may not drop any module / namespace present at base or in the

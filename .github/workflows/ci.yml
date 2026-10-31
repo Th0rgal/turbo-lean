@@ -79,7 +79,10 @@ jobs:
           ./target/release/turbo-lean --version
           ./scripts/ci_verify.sh
 
-      - name: Shadow-semantics checker & ratchet (Track B0, blocking)
+      # Track B0 shadow-semantics checker & ratchet. A failure fails this job, but the job only
+      # blocks merges once `main` has a ruleset requiring this check (not configured today); see
+      # docs/SHADOW_SEMANTICS.md "Enforcement".
+      - name: Shadow-semantics checker & ratchet (Track B0)
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}

@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "_comment": "Shadow-semantics ratchet allowlist (scripts/check_shadow_semantics.lean). Entries may only be REMOVED: CI fails if this file gains an entry not present on the base commit, if a current violation is not listed, or if an entry is stale. `at` is informational.",
+  "_comment": "Shadow-semantics ratchet allowlist (scripts/check_shadow_semantics.lean). Entries may only be REMOVED: The CI job fails if this file gains an entry not present on the base commit, if a current violation is not listed, or if an entry is stale. `at` is informational. The job is merge-blocking only once a ruleset requires it (docs/SHADOW_SEMANTICS.md, Enforcement).",
   "entries": [
     {
       "target": "LCNF.evalLCNF",
