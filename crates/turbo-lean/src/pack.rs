@@ -1420,7 +1420,12 @@ pub fn prestage_blobs_from_shared_cas(
                     0i64
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    fs::metadata(&dest).map(|m| m.ino() as i64).unwrap_or(0)
+                    // Cold `TLZ1` blobs legitimately differ in length; a torn one is left for
+                    // the payload import to repair.
+                    match crate::db::probe_blob_file(&dest, b.size_bytes) {
+                        crate::db::BlobDisk::Intact(m) => m.ino() as i64,
+                        _ => return None,
+                    }
                 }
                 Err(_) => {
                     let src_p = if shared_p.exists() {
