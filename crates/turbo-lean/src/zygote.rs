@@ -2092,6 +2092,7 @@ fn parse_audit_modules_reply(
 /// source's `:= sorry` prefix stubs outside `audit` are exempt, by name and kernel value, and every
 /// `audit` theorem must be declared. A failed compile returns its non-success output; an audit
 /// rejection is an error.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_audited_lean_shard(
     store: &TurboStore,
     lean_bin: &Path,
