@@ -4165,9 +4165,18 @@ mod tests {
         );
 
         let shard2 = format!("{}theorem helper_shift_eq (n : Nat) : shiftByFour n = n + 4 := sorry\ntheorem chained_thm (n : Nat) : shiftByFour n = n + 4 := by\n  simp [helper_shift_eq]\n", prefix1);
-        let rep2 =
-            eval_with_zygote_pool(&store, toolchain, "", &env_vars, &lean_bin, &shard2, true)
-                .unwrap();
+        // Stub exemptions need the checked declaration named (an unnamed request exempts nothing).
+        let rep2 = eval_with_zygote_pool_for_targets(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            &shard2,
+            &["chained_thm".to_string()],
+            &[],
+        )
+        .unwrap();
         assert!(
             rep2.ok
                 && rep2
