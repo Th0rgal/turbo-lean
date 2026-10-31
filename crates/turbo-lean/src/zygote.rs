@@ -5639,10 +5639,11 @@ mod tests {
         assert!(cached.ok && cached.env_cache_hit && cached.prefix_cache_hit);
         assert_eq!(cached.stdout, reply.stdout);
         for invalid in ["--plugin=bad.so", "--json", "-q", " -DautoImplicit=false "] {
-            assert!(
-                eval(&[invalid.to_string()]).is_none(),
-                "invalid argument must not reuse cached reply: {invalid}"
-            );
+            let rejected = eval(&[invalid.to_string()]).expect("invalid options return a final rejection");
+            assert!(!rejected.ok && !rejected.env_cache_hit && !rejected.prefix_cache_hit,
+                "invalid argument must not reuse cached reply: {invalid}: {rejected:?}");
+            assert!(rejected.errors.join("\n").contains(invalid), "{rejected:?}");
+            assert_ne!(rejected.stdout, reply.stdout);
         }
         assert_eq!(fs::read(&path)?, bytes);
         fs::remove_file(path)?;

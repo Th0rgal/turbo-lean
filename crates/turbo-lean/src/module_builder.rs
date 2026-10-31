@@ -4233,6 +4233,7 @@ pub fn is_allowed_lean_arg(arg: &str) -> bool {
 pub fn validate_lean_args(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<()> {
     let args: Vec<String> = args.into_iter().map(|arg| arg.as_ref().to_string()).collect();
     validate_effective_lean_args(&args).map(drop)
+        .map_err(|error| anyhow::anyhow!("{error:#}: fail-closed static Lake config gate"))
 }
 
 /// Filter and normalize Lean compiler flags via `is_allowed_lean_arg`, dropping output-format
