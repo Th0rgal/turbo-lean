@@ -1846,6 +1846,14 @@ pub(crate) fn ensure_zygote_binary(
     lean_bin: &Path,
     env_vars: &std::collections::HashMap<String, String>,
 ) -> Result<std::path::PathBuf> {
+    ensure_zygote_binary_at(&store.root, lean_bin, env_vars)
+}
+
+fn ensure_zygote_binary_at(
+    store_root: &Path,
+    lean_bin: &Path,
+    env_vars: &std::collections::HashMap<String, String>,
+) -> Result<std::path::PathBuf> {
     let _lifecycle = lifecycle_lock(false)?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"turbo-zygote:v3:shared:");
@@ -1856,7 +1864,7 @@ pub(crate) fn ensure_zygote_binary(
     }
     hasher.update(ZYGOTE_WORKER_LEAN_SRC.as_bytes());
     let bin_name = format!("turbo_zygote_{}", &hasher.finalize().to_hex()[..16]);
-    let bin_dir = store.root.join("fastcheck_bins");
+    let bin_dir = store_root.join("fastcheck_bins");
     fs::create_dir_all(&bin_dir)?;
     let cached_bin = bin_dir.join(&bin_name);
     if cached_bin.exists() {
@@ -1971,6 +1979,9 @@ struct ZygoteAuditModulesReply {
     pub audited: Option<Vec<String>>,
     #[serde(default)]
     pub violations: Vec<String>,
+    /// `--shard` mode: the module's non-stub theorems, read from the kernel environment.
+    #[serde(default)]
+    pub decls: Option<Vec<String>>,
 }
 
 pub(crate) struct PinnedFfiPackage {
@@ -2261,7 +2272,14 @@ fn audit_compiled_module_batch(
         is_untrusted,
     )
     .context("Failed to execute in-kernel `.olean` soundness auditor (`--audit-modules`)")?;
+    parse_audit_modules_reply(&out, mod_names).map(drop)
+}
 
+/// The auditor's verdict on `mod_names`: its JSON reply when every module passed, else an error.
+fn parse_audit_modules_reply(
+    out: &std::process::Output,
+    mod_names: &[String],
+) -> Result<ZygoteAuditModulesReply> {
     let stdout_str = String::from_utf8_lossy(&out.stdout);
     let stderr_str = String::from_utf8_lossy(&out.stderr);
     let json_line = stdout_str
@@ -2279,7 +2297,7 @@ fn audit_compiled_module_batch(
                 && reply.violations.is_empty()
                 && reply.audited.as_deref() == Some(mod_names) =>
         {
-            Ok(())
+            Ok(reply)
         }
         Some(reply) => {
             let details = if reply.violations.is_empty() {
@@ -2308,6 +2326,177 @@ fn audit_compiled_module_batch(
             );
         }
     }
+}
+
+/// Plain-`lean` fallback for a shard the zygote could not check (unavailable or import failure):
+/// compile `source` to a scratch `.olean`, then accept it only on the kernel-level
+/// `--audit-modules --shard` verdict over the compiled module (axioms incl. `sorryAx`,
+/// extern/implemented_by, csimp, `unsafe`), never on output the shard itself controls. Only the
+/// source's `:= sorry` prefix stubs outside `audit` are exempt, by name and kernel value, and every
+/// `audit` theorem must be declared. A failed compile returns its non-success output; an audit
+/// rejection is an error.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_audited_lean_shard(
+    store: &TurboStore,
+    lean_bin: &Path,
+    env_vars: &std::collections::HashMap<String, String>,
+    cwd: Option<&Path>,
+    source: &str,
+    audit: &std::collections::HashSet<String>,
+    lean_args: &[String],
+    timeout_ms: Option<u64>,
+) -> Result<std::process::Output> {
+    let started = std::time::Instant::now();
+    let mod_name = format!("TurboAuditedShard_{}_{}", std::process::id(), next_tmp_id());
+    let tmp_dir = store.fast_staging_dir().join(&mod_name);
+    let _ = fs::remove_dir_all(&tmp_dir);
+    fs::create_dir_all(&tmp_dir)?;
+    struct TmpDirGuard(PathBuf);
+    impl Drop for TmpDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _guard = TmpDirGuard(tmp_dir.clone());
+    let lean_file = tmp_dir.join(format!("{}.lean", mod_name));
+    fs::write(&lean_file, source)?;
+    let mut cmd = Command::new(lean_bin);
+    cmd.args(crate::module_builder::filter_allowed_lean_args(lean_args))
+        .arg("-Ddebug.skipKernelTC=false")
+        .arg(&lean_file)
+        .arg("-R")
+        .arg(&tmp_dir)
+        .arg("-o")
+        .arg(tmp_dir.join(format!("{}.olean", mod_name)))
+        .envs(env_vars);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let out = match timeout_ms {
+        Some(_) => run_lean_command(&mut cmd, timeout_ms),
+        None => cmd.output().map_err(Into::into),
+    }
+    .context("Failed to execute `lean` on shard fallback")?;
+    if !out.status.success() {
+        return Ok(out);
+    }
+
+    let lean_path = env_vars
+        .get("LEAN_PATH")
+        .cloned()
+        .or_else(|| std::env::var("LEAN_PATH").ok())
+        .filter(|lp| !lp.is_empty())
+        .map_or_else(
+            || tmp_dir.display().to_string(),
+            |lp| format!("{}:{}", tmp_dir.display(), lp),
+        );
+    // A request budget bounds the whole fallback: compile, auditor preparation and audit.
+    let budget_left = |stage: &str| -> Result<Option<std::time::Duration>> {
+        timeout_ms
+            .map(|ms| {
+                let left = std::time::Duration::from_millis(ms).saturating_sub(started.elapsed());
+                anyhow::ensure!(!left.is_zero(), "Lean request timed out before {}", stage);
+                Ok(left)
+            })
+            .transpose()
+    };
+    let zygote_bin = match budget_left("the shard auditor was ready")? {
+        None => ensure_zygote_binary(store, lean_bin, env_vars)?,
+        // A cold auditor build may outlive the request; it still warms the cache in the background.
+        Some(left) => {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (root, lean, env) = (store.root.clone(), lean_bin.to_path_buf(), env_vars.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(ensure_zygote_binary_at(&root, &lean, &env));
+            });
+            rx.recv_timeout(left).map_err(|_| {
+                anyhow::anyhow!("Lean request timed out before the shard auditor was ready")
+            })??
+        }
+    };
+    let mut auditor = Command::new(zygote_bin);
+    auditor
+        .envs(env_vars)
+        .env("LEAN", lean_bin)
+        .env("LEAN_PATH", lean_path)
+        .args(["--audit-modules", "--shard"]);
+    // The auditor links `libleanshared` from the toolchain, which an elan-proxied `lean` does not
+    // put on the loader path.
+    let mut prefix_cmd = Command::new(lean_bin);
+    prefix_cmd.arg("--print-prefix").envs(env_vars);
+    if let Some(dir) = cwd {
+        prefix_cmd.current_dir(dir);
+    }
+    let prefix_out = match budget_left("the toolchain prefix query")? {
+        None => prefix_cmd.output().ok(),
+        Some(left) => run_lean_command(&mut prefix_cmd, Some(left.as_millis().max(1) as u64)).ok(),
+    };
+    if let Some(p) = prefix_out.filter(|p| p.status.success()) {
+        let prefix = PathBuf::from(String::from_utf8_lossy(&p.stdout).trim());
+        let mut ld = format!(
+            "{}:{}",
+            prefix.join("lib/lean").display(),
+            prefix.join("lib").display()
+        );
+        if let Some(prev) = env_vars
+            .get("LD_LIBRARY_PATH")
+            .cloned()
+            .or_else(|| std::env::var("LD_LIBRARY_PATH").ok())
+            .filter(|l| !l.is_empty())
+        {
+            ld = format!("{}:{}", ld, prev);
+        }
+        auditor.env("LD_LIBRARY_PATH", ld);
+    }
+    if !env_vars.contains_key(crate::splitter::ALLOWED_AXIOMS_ENV) {
+        auditor.env(
+            crate::splitter::ALLOWED_AXIOMS_ENV,
+            crate::splitter::extra_allowed_axiom_patterns().join(","),
+        );
+    }
+    for sh in crate::splitter::split_lean_source(source, &[]).shards {
+        if crate::splitter::strip_lean_comments(&sh.proof_text).trim() == "sorry"
+            && !crate::splitter::matches_uncached_or_fast_verify_name(&sh.name, audit)
+        {
+            auditor.arg(format!("--stub-ok={}", sh.name));
+        }
+    }
+    auditor.arg(&mod_name);
+    if let Some(dir) = cwd {
+        auditor.current_dir(dir);
+    }
+    let mut audit_timeout = std::time::Duration::from_secs(
+        std::env::var("TURBO_LEAN_AUDIT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(300),
+    );
+    if let Some(left) = budget_left("the shard audit")? {
+        audit_timeout = audit_timeout.min(left);
+    }
+    let audit_out =
+        crate::module_builder::run_command_with_timeout(&mut auditor, audit_timeout, false)
+            .context("Failed to execute in-kernel shard auditor (`--audit-modules --shard`)")?;
+    let decls = parse_audit_modules_reply(&audit_out, std::slice::from_ref(&mod_name))?
+        .decls
+        .unwrap_or_default();
+    let missing: Vec<&String> = audit
+        .iter()
+        .filter(|name| {
+            let one = std::collections::HashSet::from([(*name).clone()]);
+            !decls
+                .iter()
+                .any(|d| crate::splitter::matches_uncached_or_fast_verify_name(d, &one))
+        })
+        .collect();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "[TurboLean.KernelGate] audited theorem(s) {:?} missing from the compiled shard",
+            missing
+        );
+    }
+    Ok(out)
 }
 
 static ZYGOTE_LEAN_PATH_CACHE: std::sync::OnceLock<
@@ -4182,16 +4371,43 @@ fn extract_http_error_detail(err: anyhow::Error) -> anyhow::Error {
     err
 }
 
+/// `/check-shard` error `code` for a shard the zygote could not import: unavailable, not rejected.
+pub(crate) const IMPORT_UNAVAILABLE_CODE: &str = "zygote_import_unavailable";
+
+/// The `/check-shard` error the daemon reports with `IMPORT_UNAVAILABLE_CODE`.
+#[derive(Debug)]
+pub(crate) struct ZygoteImportUnavailable(pub String);
+
+impl std::fmt::Display for ZygoteImportUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Zygote import unavailable for `{}`", self.0)
+    }
+}
+
+impl std::error::Error for ZygoteImportUnavailable {}
+
+/// `/check-shard` outcome: an expired daemon (no answer) or the structured
+/// `IMPORT_UNAVAILABLE_CODE` (never message text, which the shard's diagnostics can contain)
+/// means the zygote is unavailable (`Ok(None)`), so only then may an audited fallback run; any
+/// other error is a rejection, which is final.
 fn finish_check_shard_request(response: Result<Vec<u8>>) -> Result<Option<serde_json::Value>> {
     match response {
         Ok(bytes) => parse_check_shard_resp(&bytes),
         Err(err) if is_expired_daemon_transport_error(&err) => Ok(None),
         Err(err) => {
-            let err = extract_http_error_detail(err);
-            if err.to_string().contains("Zygote import unavailable") {
+            let unavailable = err
+                .to_string()
+                .split_once("): {")
+                .and_then(|(_, body)| {
+                    serde_json::from_str::<serde_json::Value>(&format!("{{{}", body)).ok()
+                })
+                .is_some_and(|v| {
+                    v.get("code").and_then(|c| c.as_str()) == Some(IMPORT_UNAVAILABLE_CODE)
+                });
+            if unavailable {
                 Ok(None)
             } else {
-                Err(err)
+                Err(extract_http_error_detail(err))
             }
         }
     }
@@ -4668,6 +4884,152 @@ pub fn try_local_zygote_eval_with_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_finish_check_shard_request_rejection_is_final() {
+        let http = |e: &str| {
+            finish_check_shard_request(Err(anyhow::anyhow!(
+                "HTTP request POST http://127.0.0.1:1/check-shard failed (HTTP 500): {{\"status\":\"error\",\"error\":\"{}\"}}",
+                e
+            )))
+        };
+        let err = http("Remote `lean` shard verification failed for `t`").unwrap_err();
+        assert!(err
+            .to_string()
+            .starts_with("Remote `lean` shard verification failed"));
+        // Only the structured code means unavailable, never text the shard can put in a message.
+        assert!(http("Zygote import unavailable for `«Zygote import unavailable»`").is_err());
+        assert!(matches!(
+            finish_check_shard_request(Err(anyhow::anyhow!(
+                "HTTP request POST http://127.0.0.1:1/check-shard failed (HTTP 500): {{\"status\":\"error\",\"error\":\"x\",\"code\":\"{}\"}}",
+                IMPORT_UNAVAILABLE_CODE
+            ))),
+            Ok(None)
+        ));
+        assert!(matches!(
+            finish_check_shard_request(Err(std::io::Error::from(
+                std::io::ErrorKind::ConnectionRefused
+            )
+            .into())),
+            Ok(None)
+        ));
+    }
+
+    /// A user `macro_rules` that makes Lean 4.35's `#print axioms` report no axioms.
+    pub(crate) const PRINT_AXIOMS_SPOOF: &str = "macro_rules\n  | `(#print axioms $i:ident) => `(#eval IO.println s!\"'{$(Lean.quote i.getId.toString)}' does not depend on any axioms\")\n";
+
+    #[test]
+    fn test_audited_lean_shard_exempts_only_named_explicit_stubs() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_audited_shard_{}_{}",
+            std::process::id(),
+            next_tmp_id()
+        ));
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        let store = TurboStore::open(Some(&dir.join("store")))?;
+        let env = std::collections::HashMap::from([(
+            "ELAN_TOOLCHAIN".to_string(),
+            "leanprover/lean4:v4.35.0".to_string(),
+        )]);
+        let run = |src: &str| {
+            let audit = std::collections::HashSet::from(["tgt".to_string()]);
+            run_audited_lean_shard(
+                &store,
+                Path::new("lean"),
+                &env,
+                Some(&dir),
+                src,
+                &audit,
+                &[],
+                None,
+            )
+        };
+        let stubs = "namespace N\ntheorem s1 (n : Nat) {m : Nat} : n + m = m + n := sorry\ntheorem s2 : 1 = 1 := sorry\nend N\nnamespace M\ntheorem s2 : 2 = 2 := sorry\nend M\n";
+        // Host-named prefix stubs (binders, namespaces, a short name used twice) are exempt; the
+        // target is audited.
+        let ok = run(&format!(
+            "{}theorem N.tgt (a b : Nat) : a + b = b + a := N.s1 a\ntheorem other : 2 = 2 := M.s2\n",
+            stubs
+        ))?;
+        assert!(ok.status.success(), "{:?}", ok);
+        let reject = |src: String, why: &str, needle: &str| {
+            let err = run(&src).expect_err(why);
+            assert!(format!("{:#}", err).contains(needle), "{}: {:#}", why, err);
+        };
+        reject(
+            "theorem tgt : 1 = 1 := sorry\n".into(),
+            "an audited theorem is never a stub",
+            "disallowed axiom `sorryAx`",
+        );
+        reject(
+            format!(
+                "import Lean\n{}theorem Evil.s1 : False := by\n  run_tac do\n    let g ← Lean.Elab.Tactic.getMainGoal\n    g.assign (← Lean.Meta.mkSorry (← g.getType) false)\ntheorem tgt : False := Evil.s1\n",
+                stubs
+            ),
+            "a second explicit sorry matching a stub name is ambiguous",
+            "prefix stub `s1` is ambiguous",
+        );
+        reject(
+            "import Lean\nmacro_rules | `(term| sorry) => `(term| trivial)\ntheorem s1 : True := sorry\ntheorem Evil.s1 : False := by\n  run_tac do\n    let g ← Lean.Elab.Tactic.getMainGoal\n    g.assign (← Lean.Meta.mkSorry (← g.getType) false)\ntheorem tgt : False := Evil.s1\n".into(),
+            "a stub turned into a proof cannot lend its name to an injected sorry",
+            "prefix stub `s1` is ambiguous",
+        );
+        reject(
+            "theorem other : 1 = 1 := rfl\n".into(),
+            "the audited theorem must be declared",
+            "missing from the compiled shard",
+        );
+        // P0-3: the verdict never comes from shard-controlled output (`#print axioms` spoofed by a
+        // user macro), and `addDecl`-made axioms are seen in the kernel environment.
+        reject(
+            format!(
+                "import Lean\n{}theorem tgt : 1 = 1 := by\n  run_tac Lean.Elab.admitGoal (← Lean.Elab.Tactic.getMainGoal)\n",
+                PRINT_AXIOMS_SPOOF
+            ),
+            "a metaprogram sorry under a `#print axioms` spoof",
+            "disallowed axiom `sorryAx`",
+        );
+        reject(
+            "import Lean\nopen Lean in\n#eval show Elab.Command.CommandElabM Unit from Elab.Command.liftCoreM <| addDecl <| .axiomDecl { name := `hidden, levelParams := [], type := mkConst ``False, isUnsafe := false }\ntheorem tgt : 1 = 1 := (hidden).elim\n".into(),
+            "an `addDecl` axiom",
+            "`hidden`",
+        );
+        assert!(!run("theorem tgt : 1 = 2 := rfl\n")?.status.success());
+        // A request budget bounds the whole fallback; it never yields a late verdict.
+        let audit = std::collections::HashSet::from(["tgt".to_string()]);
+        let late = run_audited_lean_shard(
+            &store,
+            Path::new("lean"),
+            &env,
+            Some(&dir),
+            "theorem tgt : 1 = 1 := rfl\n",
+            &audit,
+            &[],
+            Some(1),
+        );
+        assert!(
+            !matches!(late, Ok(ref o) if o.status.success()),
+            "{:?}",
+            late
+        );
+        // Auditor preparation (a cold auditor build in a fresh store) stays within the budget.
+        let cold = TurboStore::open(Some(&dir.join("cold-store")))?;
+        let t0 = std::time::Instant::now();
+        let _ = run_audited_lean_shard(
+            &cold,
+            Path::new("lean"),
+            &env,
+            Some(&dir),
+            "theorem tgt : 1 = 1 := rfl\n",
+            &audit,
+            &[],
+            Some(3_000),
+        );
+        assert!(t0.elapsed() < std::time::Duration::from_secs(15));
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
 
     #[cfg(target_os = "linux")]
     fn open_test_lifecycle_process(

@@ -849,11 +849,12 @@ pub fn serve_cas_http_with_auth(
                             }
                         }
                         Err(e) => {
-                            let _ = write_json_response(
-                                &mut stream,
-                                500,
-                                &serde_json::json!({"status": "error", "error": e.to_string()}),
-                            );
+                            let mut body =
+                                serde_json::json!({"status": "error", "error": e.to_string()});
+                            if e.is::<crate::zygote::ZygoteImportUnavailable>() {
+                                body["code"] = crate::zygote::IMPORT_UNAVAILABLE_CODE.into();
+                            }
+                            let _ = write_json_response(&mut stream, 500, &body);
                         }
                     }
                 }
@@ -1336,61 +1337,13 @@ fn server_receipt_key(shard_key: &str) -> String {
     format!("srv-v2:{}", shard_key)
 }
 
-/// Run `lean` on a temporary source file, applying the `splitter::plain_lean_audit` of the `audit`
-/// declarations under `allowed` when `audit` is non-empty. Returns `(exit_code, stdout, stderr)`.
-#[allow(clippy::too_many_arguments)]
-fn run_lean_temp_file(
-    store: &TurboStore,
-    lean_bin: &Path,
-    env_vars: &std::collections::HashMap<String, String>,
-    toolchain: &str,
-    source: &str,
-    prefix: &str,
-    audit: &std::collections::HashSet<String>,
-    allowed: &[String],
-    lean_args: &[String],
-    timeout_ms: Option<u64>,
-) -> Result<(i32, String, String)> {
-    let staging = store.fast_staging_dir();
-    let tmp = staging.join(format!("{}_{}.lean", prefix, next_tmp_id()));
-    let plan =
-        (!audit.is_empty()).then(|| crate::splitter::plain_lean_audit(source, audit, audit.len()));
-    let audited_src = plan.as_ref().map_or(source, |p| p.source.as_str());
-    fs::write(&tmp, audited_src)?;
-    let mut cmd = Command::new(lean_bin);
-    for arg in crate::module_builder::filter_allowed_lean_args(lean_args) {
-        cmd.arg(arg);
+/// Pin the request's toolchain for an elan-proxied `lean` unless the environment already does.
+fn set_elan_toolchain(env_vars: &mut std::collections::HashMap<String, String>, toolchain: &str) {
+    if !toolchain.is_empty() && toolchain != "unknown" {
+        env_vars
+            .entry("ELAN_TOOLCHAIN".to_string())
+            .or_insert_with(|| toolchain.trim().to_string());
     }
-    cmd.arg(&tmp).envs(env_vars);
-    if !toolchain.is_empty() && toolchain != "unknown" && !env_vars.contains_key("ELAN_TOOLCHAIN") {
-        cmd.env("ELAN_TOOLCHAIN", toolchain.trim());
-    }
-    let out = crate::zygote::run_lean_command(&mut cmd, timeout_ms);
-    let _ = fs::remove_file(&tmp);
-    let out = out.context("Failed to execute `lean` on remote shard payload")?;
-    let mut code = out.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    // The audit reads Lean's `#print axioms` output, which a module the server cannot inspect could
-    // answer: only toolchain imports are trusted here.
-    let untrusted_import = crate::module_builder::parse_header_imports(source)
-        .iter()
-        .any(|m| !matches!(m.split('.').next(), Some("Init" | "Std" | "Lean" | "Lake")));
-    if plan.is_some() && code == 0 && untrusted_import {
-        code = 1;
-        stderr = format!(
-            "{}\n[TurboLean.KernelGate] plain `lean` audit refused: imports beyond the toolchain",
-            stderr
-        );
-    }
-    if let Some(plan) = plan.filter(|_| code == 0) {
-        let bad = plan.violations(&stdout, allowed);
-        if !bad.is_empty() {
-            code = 1;
-            stderr = format!("{}\n{}", stderr, bad.join("\n"));
-        }
-    }
-    Ok((code, stdout, stderr))
 }
 
 fn resolve_request_axiom_policy(
@@ -1611,7 +1564,7 @@ fn execute_check_shard_payload_deferred_with_domain(
             zygote_used_constants = zreply.used_constants;
         }
         Ok(_) if req.skip_cas_lock => {
-            anyhow::bail!("Zygote import unavailable for `{}`", req.decl);
+            return Err(crate::zygote::ZygoteImportUnavailable(req.decl.clone()).into());
         }
         Err(e) if req.skip_cas_lock => return Err(e),
         _ => {}
@@ -1619,24 +1572,23 @@ fn execute_check_shard_payload_deferred_with_domain(
 
     if !zygote_used {
         let audit_set: std::collections::HashSet<String> = stub_targets.iter().cloned().collect();
-        let (code, stdout, stderr) = run_lean_temp_file(
+        set_elan_toolchain(&mut env_vars, &req.toolchain);
+        let out = crate::zygote::run_audited_lean_shard(
             store,
             &lean_bin,
             &env_vars,
-            req.toolchain.as_str(),
+            None,
             &req.shard_source,
-            "http_shard",
             &audit_set,
-            &req_allowed,
             &filtered_req_args,
             Some(crate::zygote::remaining_timeout_ms(timeout_ms, t0)),
         )?;
-        if code != 0 {
+        if !out.status.success() {
             anyhow::bail!(
                 "Remote `lean` shard verification failed for `{}`:\n{}\n{}",
                 req.decl,
-                stdout,
-                stderr
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
             );
         }
     }
@@ -1890,21 +1842,27 @@ fn execute_check_shards_batch_payload_deferred(
             env_vars.insert("LEAN_PATH".to_string(), full_lean_path);
         }
 
-        let (code, out, err) = run_lean_temp_file(
+        set_elan_toolchain(&mut env_vars, &req.toolchain);
+        match crate::zygote::run_audited_lean_shard(
             store,
             &lean_bin,
             &env_vars,
-            req.toolchain.as_str(),
+            None,
             &effective_batch_source,
-            "http_batch_shards",
             &batch_audit,
-            &req_allowed,
             &filtered_batch_args,
             Some(crate::zygote::remaining_timeout_ms(timeout_ms, t0)),
-        )?;
-        exit_code = code;
-        stdout = out;
-        stderr = err;
+        ) {
+            Ok(out) => {
+                exit_code = out.status.code().unwrap_or(-1);
+                stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+                stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            }
+            Err(e) => {
+                exit_code = 1;
+                stderr = format!("{:#}", e);
+            }
+        }
     }
 
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0;
