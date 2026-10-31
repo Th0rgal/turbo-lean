@@ -1,7 +1,7 @@
 # B2 status
 
 Baseline: `5508b9f`; clifv `5018b9509dc124154dbe08a5bd85862595d8eab7`.
-Checkpoint: 2026-10-31 19:13 UTC. The executable lowering lives in
+Checkpoint: 2026-10-31 19:18 UTC. The executable lowering lives in
 `lean/LeanNative/Backend/Clif.lean`; `compile-clif` calls that definition.
 The active root and strict transitive axiom audit pass kernel checks on Lean 4.34.1.
 
@@ -40,6 +40,10 @@ fresh default-root build, plus source identity and compiler integration.
 The local Lean 4.35 CoreCLI integration build passed; the actual compiler
 dispatcher emitted collatz_steps CLIF. `research/b2-compiler-smoke.lean`
 records that check and CI runs it too.
+CI now also assembles the actual exported AArch64 text with Clang, extracts
+`.text` using LLVM objcopy, and compares it byte-for-byte with the exported
+binary. The same commands passed locally on the 352-byte artifact with the
+recorded SHA-256; the new CI step awaits its first remote result.
 
 Instruction selection is certified in `B2.BackendLower`, now active in
 the root and audit. `B2.IsleFuel.runTerm_of_apply` lifts a successful

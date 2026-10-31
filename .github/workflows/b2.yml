@@ -36,6 +36,12 @@ jobs:
           lake env lean B2/Lowering.lean
           lake env lean B2/Division.lean
           lake env lean --run Emit.lean "$RUNNER_TEMP/b2-collatz"
+      - name: Cross-check exported AArch64 bytes
+        run: |
+          clang --target=aarch64-unknown-linux-gnu -c "$RUNNER_TEMP/b2-collatz.s" -o "$RUNNER_TEMP/b2-collatz.o"
+          b2_objcopy="$(command -v llvm-objcopy || command -v llvm-objcopy-18)"
+          "$b2_objcopy" -O binary --only-section=.text "$RUNNER_TEMP/b2-collatz.o" "$RUNNER_TEMP/b2-collatz.asm.bin"
+          cmp "$RUNNER_TEMP/b2-collatz.bin" "$RUNNER_TEMP/b2-collatz.asm.bin"
       - name: Check compiler integration on compiler toolchain
         working-directory: lean
         run: |
