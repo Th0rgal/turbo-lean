@@ -973,7 +973,11 @@ fn check_directory(
         .iter()
         .filter(|(_, _, _, split, _, _)| !split.hygiene.is_clean_for_certification())
         .map(|(lf, _, _, split, _, _)| {
-            format!("{}: {}", lf.display(), split.hygiene.disallowed_items().join(", "))
+            format!(
+                "{}: {}",
+                lf.display(),
+                split.hygiene.disallowed_items().join(", ")
+            )
         })
         .collect();
     if !dirty.is_empty() {
@@ -2729,7 +2733,11 @@ fn check_single_decl(
                         String::from_utf8_lossy(&out.stderr)
                     );
                     if out.status.success()
-                        && splitter::sorry_warning_in_decls(&full_shard_src, &lean_output, &single_set)
+                        && splitter::sorry_warning_in_decls(
+                            &full_shard_src,
+                            &lean_output,
+                            &single_set,
+                        )
                     {
                         anyhow::bail!(
                             "Soundness hygiene violation in `{}` ({}): declaration uses `sorry`",

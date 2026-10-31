@@ -1513,22 +1513,21 @@ fn execute_check_shard_payload_deferred_with_domain(
     }
 
     if !zygote_used {
-        let audit_set: std::collections::HashSet<String> =
-            if !named_target {
-                crate::splitter::split_lean_source(&req.shard_source, &[])
-                    .shards
-                    .into_iter()
-                    .filter(|sh| {
-                        !crate::splitter::audit_hygiene(&crate::splitter::strip_lean_comments(
-                            &sh.proof_text,
-                        ))
-                        .has_sorry
-                    })
-                    .map(|sh| sh.name)
-                    .collect()
-            } else {
-                std::iter::once(req.decl.clone()).collect()
-            };
+        let audit_set: std::collections::HashSet<String> = if !named_target {
+            crate::splitter::split_lean_source(&req.shard_source, &[])
+                .shards
+                .into_iter()
+                .filter(|sh| {
+                    !crate::splitter::audit_hygiene(&crate::splitter::strip_lean_comments(
+                        &sh.proof_text,
+                    ))
+                    .has_sorry
+                })
+                .map(|sh| sh.name)
+                .collect()
+        } else {
+            std::iter::once(req.decl.clone()).collect()
+        };
         let (code, stdout, stderr) = run_lean_temp_file(
             store,
             &lean_bin,

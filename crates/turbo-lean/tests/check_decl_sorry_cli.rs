@@ -1,0 +1,167 @@
+//! P0-1: `check --decl` must never verify (or cache) a target that uses `sorry`, while prefix
+//! `sorry` stubs keep working. Drives the real CLI, through the warm local daemon and without it.
+use serde_json::Value;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+struct Project(PathBuf);
+impl Project {
+    fn new(daemon: bool) -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "turbo_check_decl_sorry_{}_{}_{}",
+            daemon,
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("lean-toolchain"),
+            include_str!("../../../lean/lean-toolchain"),
+        )
+        .unwrap();
+        // The exact P0-1 reproducer.
+        fs::write(
+            root.join("F.lean"),
+            "theorem good : 1 + 1 = 2 := rfl\ntheorem bad : False := sorry\n",
+        )
+        .unwrap();
+        // `uses_good` relies on the prefix stub of `good`; `sneaky` hides its `sorry` behind a macro
+        // (no `sorry` token in the target), and a comment mentions `:= sorry`.
+        fs::write(
+            root.join("G.lean"),
+            "theorem good : 1 + 1 = 2 := rfl\n\
+             theorem uses_good : 1 + 1 = 2 := good\n\
+             macro \"cheat\" : term => `(sorry)\n\
+             -- theorem t : True := sorry\n\
+             theorem sneaky : False := cheat\n",
+        )
+        .unwrap();
+        Self(root)
+    }
+
+    fn check(&self, file: &str, decl: &str, daemon: bool) -> Output {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_turbo-lean"));
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("TURBO_LEAN_") {
+                cmd.env_remove(key);
+            }
+        }
+        cmd.current_dir(&self.0)
+            .args(["--json", "--cache-dir"])
+            .arg(self.0.join("cache"))
+            .args(["check", file, "--decl", decl])
+            .env("TURBO_LEAN_HOME", self.0.join("cache"))
+            .env("TURBO_LEAN_STAGING_DIR", self.0.join("staging"))
+            .env("TURBO_LEAN_TELEMETRY", "off")
+            .env("LEAN_NUM_THREADS", "4");
+        if !daemon {
+            cmd.env("TURBO_LEAN_NO_DAEMON", "1");
+        }
+        cmd.output().unwrap()
+    }
+}
+impl Drop for Project {
+    fn drop(&mut self) {
+        stop_daemons(&self.0.join("cache"));
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Kill the local zygote daemons a test run spawned under `cache`.
+fn stop_daemons(cache: &Path) {
+    let mut stack = vec![cache.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().contains("zygote_daemon"))
+            {
+                let pid = fs::read(&path)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                    .and_then(|v| v["pid"].as_u64());
+                if let Some(pid) = pid {
+                    let _ = Command::new("kill").arg(pid.to_string()).status();
+                }
+            }
+        }
+    }
+}
+
+fn status(out: &Output) -> String {
+    serde_json::from_slice::<Value>(&out.stdout)
+        .ok()
+        .and_then(|v| v["status"].as_str().map(String::from))
+        .unwrap_or_default()
+}
+
+fn assert_rejected(p: &Project, file: &str, decl: &str, daemon: bool) {
+    // Twice: a rejected target must not have been cached by the first run either.
+    for run in 0..2 {
+        let out = p.check(file, decl, daemon);
+        let st = status(&out);
+        assert!(
+            !out.status.success() && !st.contains("verified") && !st.contains("cache_hit"),
+            "{file} --decl {decl} (daemon={daemon}, run {run}) must be rejected, got exit {:?} status {st:?}:\n{}{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+fn lean_available() -> bool {
+    Command::new("lean").arg("--version").output().is_ok()
+}
+
+#[test]
+fn check_decl_rejects_sorry_target_and_keeps_prefix_stubs() {
+    if !lean_available() {
+        return;
+    }
+    for daemon in [false, true] {
+        let p = Project::new(daemon);
+        assert_rejected(&p, "F.lean", "bad", daemon);
+        let good = p.check("G.lean", "uses_good", daemon);
+        assert!(
+            good.status.success()
+                && matches!(
+                    status(&good).as_str(),
+                    "theorem_verified" | "theorem_cache_hit"
+                ),
+            "G.lean --decl uses_good (daemon={daemon}) must verify through the prefix stub:\n{}{}",
+            String::from_utf8_lossy(&good.stdout),
+            String::from_utf8_lossy(&good.stderr)
+        );
+        assert_rejected(&p, "G.lean", "sneaky", daemon);
+        // Whole-file and directory checks reject too, even with the targets' shards attempted above.
+        for target in ["F.lean", "."] {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_turbo-lean"));
+            let out = cmd
+                .current_dir(&p.0)
+                .args(["--json", "--cache-dir"])
+                .arg(p.0.join("cache"))
+                .args(["check", target])
+                .env("TURBO_LEAN_HOME", p.0.join("cache"))
+                .env("TURBO_LEAN_STAGING_DIR", p.0.join("staging"))
+                .env("TURBO_LEAN_TELEMETRY", "off")
+                .env("TURBO_LEAN_NO_DAEMON", "1")
+                .output()
+                .unwrap();
+            assert!(
+                !out.status.success(),
+                "check {target} must be rejected:\n{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+}
