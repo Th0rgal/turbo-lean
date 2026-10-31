@@ -1,0 +1,2 @@
+memcap: systemd user manager unreachable; fallback watchdog caps the process tree at 16G (RSS polled from /proc, SIGKILL + exit 137)
+{"rows": 313008, "modules": 2742, "output": "/var/lib/sandboxed-node/d78f0872-c6d9-426b-8f86-edc88fc09757/results/research/b2c_data/549e0c2f/rows.jsonl.gz"}
