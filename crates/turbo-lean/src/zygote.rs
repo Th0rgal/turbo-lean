@@ -982,6 +982,43 @@ static ZYGOTE_POOL: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<(String, String, String), Vec<ZygoteWorkerProcess>>>,
 > = std::sync::OnceLock::new();
 
+/// Test-only fault injection: named callbacks fired at race-sensitive points of the digest /
+/// import pipeline, and a forced filesystem timestamp granularity. Thread-local, so parallel
+/// tests never observe each other's hooks; compiled out of non-test builds.
+#[cfg(test)]
+mod digest_test_hooks {
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+    type Hook = Box<dyn FnMut()>;
+    thread_local! {
+        static HOOKS: RefCell<HashMap<&'static str, Hook>> = RefCell::new(HashMap::new());
+        pub(super) static FORCED_TS_GRANULARITY_NS: Cell<Option<i128>> = const { Cell::new(None) };
+    }
+    pub(super) fn set(name: &'static str, hook: impl FnMut() + 'static) {
+        HOOKS.with(|h| h.borrow_mut().insert(name, Box::new(hook)));
+    }
+    pub(super) fn clear() {
+        HOOKS.with(|h| h.borrow_mut().clear());
+        FORCED_TS_GRANULARITY_NS.with(|g| g.set(None));
+    }
+    pub(super) fn run(name: &'static str) {
+        let Some(mut hook) = HOOKS.with(|h| h.borrow_mut().remove(name)) else {
+            return;
+        };
+        // Taken out while it runs, so a hook may itself hash (and fire hooks).
+        hook();
+        HOOKS.with(|h| {
+            h.borrow_mut().entry(name).or_insert(hook);
+        });
+    }
+}
+
+#[inline(always)]
+fn run_digest_test_hook(_name: &'static str) {
+    #[cfg(test)]
+    digest_test_hooks::run(_name);
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct OleanFileStatSig {
     dev: u64,
@@ -998,7 +1035,8 @@ impl OleanFileStatSig {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            Self {
+            #[allow(unused_mut)]
+            let mut sig = Self {
                 dev: meta.dev(),
                 ino: meta.ino(),
                 mtime_sec: meta.mtime(),
@@ -1006,7 +1044,18 @@ impl OleanFileStatSig {
                 ctime_sec: meta.ctime(),
                 ctime_nsec: meta.ctime_nsec(),
                 size: meta.len(),
+            };
+            // Emulate a filesystem that only stores timestamps at the forced granularity.
+            #[cfg(test)]
+            if let Some(g) = digest_test_hooks::FORCED_TS_GRANULARITY_NS.with(|c| c.get()) {
+                let trunc = |sec: i64, nsec: i64| {
+                    let ns = ((sec as i128) * 1_000_000_000 + nsec as i128).div_euclid(g) * g;
+                    (ns.div_euclid(1_000_000_000) as i64, ns.rem_euclid(1_000_000_000) as i64)
+                };
+                (sig.mtime_sec, sig.mtime_nsec) = trunc(sig.mtime_sec, sig.mtime_nsec);
+                (sig.ctime_sec, sig.ctime_nsec) = trunc(sig.ctime_sec, sig.ctime_nsec);
             }
+            sig
         }
         #[cfg(not(unix))]
         {
@@ -1023,21 +1072,89 @@ impl OleanFileStatSig {
         }
     }
 
-    fn is_racily_clean(&self, now_ns: i128) -> bool {
-        #[cfg(unix)]
-        {
-            const GUARD_NS: i128 = 50_000_000;
-            let mtime_ns = (self.mtime_sec as i128) * 1_000_000_000 + (self.mtime_nsec as i128);
-            let ctime_ns = (self.ctime_sec as i128) * 1_000_000_000 + (self.ctime_nsec as i128);
-            mtime_ns <= now_ns - GUARD_NS && ctime_ns <= now_ns - GUARD_NS
-        }
-        #[cfg(not(unix))]
-        {
-            const GUARD_NS: i128 = 2_000_000_000;
-            let mtime_ns = (self.mtime_sec as i128) * 1_000_000_000 + (self.mtime_nsec as i128);
-            mtime_ns <= now_ns - GUARD_NS
+    fn ctime_ns(&self) -> i128 {
+        (self.ctime_sec as i128) * 1_000_000_000 + (self.ctime_nsec as i128)
+    }
+}
+
+/// Stat-tuple trust rule for `OLEAN_ENTRY_DIGEST_CACHE`.
+///
+/// A memoized entry digest is reused on a matching `(dev, ino, mtime, ctime, size)` tuple only
+/// if any later rewrite must change that tuple. Every write sets `ctime` to the kernel clock
+/// truncated to the filesystem granularity `g`, so this holds when:
+/// 1. `g` is proven sub-second for the file's device: a stored `ctime`/`mtime` with non-zero
+///    nanoseconds was observed, or a probe file created next to it got one; and
+/// 2. every `ctime` in the entry was more than `max(g, 2 s)` = `STAT_TRUST_WINDOW_NS` older
+///    than the wall clock when hashing began. A write after that point gets a strictly newer
+///    `ctime`, which also covers coarse-clock lag and modest client/server skew.
+///
+/// Everything else re-hashes the bytes and memoizes nothing: coarse or unproven granularity
+/// (FAT, ext3, HFS+, some network/FUSE filesystems), recent `ctime`s, and non-Unix hosts.
+const STAT_TRUST_WINDOW_NS: i128 = 2_000_000_000;
+
+static TS_SUBSECOND_BY_DEV: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<u64, bool>>,
+> = std::sync::OnceLock::new();
+
+/// Whether `sig.dev` is proven to store sub-second timestamps (rule 1 above).
+fn dev_records_subsecond_timestamps(sig: &OleanFileStatSig) -> bool {
+    #[cfg(test)]
+    if digest_test_hooks::FORCED_TS_GRANULARITY_NS
+        .with(|c| c.get())
+        .is_some_and(|g| g >= 1_000_000_000)
+    {
+        return false;
+    }
+    if !cfg!(unix) {
+        return false;
+    }
+    let cache =
+        TS_SUBSECOND_BY_DEV.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    // A stored non-zero nanosecond field is only possible on a sub-second filesystem.
+    let sampled = sig.ctime_nsec != 0 || sig.mtime_nsec != 0;
+    if !sampled {
+        if let Some(&known) = cache.lock().ok().and_then(|g| g.get(&sig.dev).copied()).as_ref() {
+            return known;
         }
     }
+    let proven = sampled || probe_subsecond_ctime(sig.dev);
+    if let Ok(mut g) = cache.lock() {
+        if g.len() >= 1024 {
+            g.clear();
+        }
+        g.insert(sig.dev, proven);
+    }
+    proven
+}
+
+/// Probe write: a fresh file on `dev` stored with non-zero `ctime` nanoseconds (three tries,
+/// as a write can legitimately land on a whole second).
+fn probe_subsecond_ctime(dev: u64) -> bool {
+    (0..3).any(|_| probe_ctime_fence(dev).is_some_and(|ns| ns.rem_euclid(1_000_000_000) != 0))
+}
+
+/// Create and remove a scratch file on `dev` and return its `ctime`: every later write to a
+/// file on that filesystem gets a `ctime` >= this fence. The probe only goes to the temp dir,
+/// never next to the `.olean`s: that would move `LEAN_PATH` directory mtimes, which
+/// `compute_search_path_oleans_digest` hashes for package directories.
+fn probe_ctime_fence(dev: u64) -> Option<i128> {
+    if !cfg!(unix) {
+        return None;
+    }
+    let probe = std::env::temp_dir().join(format!(
+        ".turbo-lean-ts-probe-{}-{}",
+        std::process::id(),
+        next_tmp_id()
+    ));
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .ok()?;
+    let meta = fs::metadata(&probe);
+    let _ = fs::remove_file(&probe);
+    let sig = OleanFileStatSig::from_meta(&meta.ok()?);
+    (sig.dev == dev).then(|| sig.ctime_ns())
 }
 
 #[derive(Clone)]
@@ -1061,12 +1178,31 @@ fn stat_companion_file(path: &Path) -> Result<Option<OleanFileStatSig>, ()> {
     }
 }
 
-fn digest_olean_path_entry(
-    olean_path: &Path,
-    meta: &fs::Metadata,
-    hasher: &mut blake3::Hasher,
-) -> Option<Vec<String>> {
-    let olean_stat = OleanFileStatSig::from_meta(meta);
+/// Canonical digest bytes of one `.olean` and its companions, the stat tuples they were read
+/// under, and its parsed direct imports (`None` when unreadable/unparseable, so the closure
+/// cannot be proven complete).
+#[derive(PartialEq, Eq)]
+struct OleanEntryDigest {
+    bytes: Vec<u8>,
+    stats: [Option<OleanFileStatSig>; 6],
+    deps: Option<Vec<String>>,
+}
+
+fn digest_olean_path_entry(olean_path: &Path) -> OleanEntryDigest {
+    let mut entry_bytes = Vec::with_capacity(256);
+    entry_bytes.extend_from_slice(olean_path.to_string_lossy().as_bytes());
+    entry_bytes.push(b':');
+    let olean_stat = match fs::metadata(olean_path) {
+        Ok(m) if m.is_file() => OleanFileStatSig::from_meta(&m),
+        _ => {
+            entry_bytes.extend_from_slice(b"unreadable;");
+            return OleanEntryDigest {
+                bytes: entry_bytes,
+                stats: Default::default(),
+                deps: None,
+            };
+        }
+    };
     let companions = [
         (
             "srv",
@@ -1094,15 +1230,23 @@ fn digest_olean_path_entry(
             }
         }
     }
+    let mut stats: [Option<OleanFileStatSig>; 6] = Default::default();
+    stats[0] = Some(olean_stat);
+    stats[1..].copy_from_slice(&comp_stats);
+    let stat_trusted = all_comp_stat_ok
+        && stats.iter().flatten().all(dev_records_subsecond_timestamps);
 
     let cache_mutex = OLEAN_ENTRY_DIGEST_CACHE
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    if all_comp_stat_ok {
+    if stat_trusted {
         if let Ok(guard) = cache_mutex.lock() {
             if let Some(hit) = guard.get(olean_path) {
                 if hit.olean_stat == olean_stat && hit.companions_stat == comp_stats {
-                    hasher.update(&hit.entry_bytes);
-                    return hit.parsed_deps.clone();
+                    return OleanEntryDigest {
+                        bytes: hit.entry_bytes.clone(),
+                        stats,
+                        deps: hit.parsed_deps.clone(),
+                    };
                 }
             }
         }
@@ -1112,30 +1256,27 @@ fn digest_olean_path_entry(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as i128)
         .unwrap_or(0);
-    let len = meta.len();
-    let mut entry_bytes = Vec::with_capacity(256);
-    entry_bytes.extend_from_slice(olean_path.to_string_lossy().as_bytes());
-    entry_bytes.push(b':');
-    entry_bytes.extend_from_slice(&len.to_le_bytes());
+    entry_bytes.extend_from_slice(&olean_stat.size.to_le_bytes());
 
     let olean_bytes = match fs::read(olean_path) {
         Ok(b) => b,
         Err(_) => {
             entry_bytes.extend_from_slice(b"unreadable;");
-            hasher.update(&entry_bytes);
-            return None;
+            return OleanEntryDigest {
+                bytes: entry_bytes,
+                stats,
+                deps: None,
+            };
         }
     };
     let parsed_deps = crate::module_builder::parse_olean_binary_imports(&olean_bytes)
         .map(|(imps, _)| imps.into_iter().map(|i| i.module).collect::<Vec<String>>());
     entry_bytes.extend_from_slice(blake3::hash(&olean_bytes).to_hex().as_bytes());
 
-    let mut cacheable = all_comp_stat_ok
-        && olean_stat.is_racily_clean(pre_read_now_ns)
-        && comp_stats
-            .iter()
-            .flatten()
-            .all(|s| s.is_racily_clean(pre_read_now_ns));
+    let trust_cutoff_ns = pre_read_now_ns - STAT_TRUST_WINDOW_NS;
+    let mut cacheable = stat_trusted
+        && pre_read_now_ns > 0
+        && stats.iter().flatten().all(|s| s.ctime_ns() < trust_cutoff_ns);
     for (idx, (tag, comp_path)) in companions.iter().enumerate() {
         entry_bytes.push(b'|');
         entry_bytes.extend_from_slice(tag.as_bytes());
@@ -1175,7 +1316,6 @@ fn digest_olean_path_entry(
         }
     }
     entry_bytes.push(b';');
-    hasher.update(&entry_bytes);
 
     let post_olean_matches = fs::metadata(olean_path)
         .map(|m| m.is_file() && OleanFileStatSig::from_meta(&m) == olean_stat)
@@ -1190,137 +1330,234 @@ fn digest_olean_path_entry(
                 CachedOleanEntryDigest {
                     olean_stat,
                     companions_stat: comp_stats,
-                    entry_bytes,
+                    entry_bytes: entry_bytes.clone(),
                     parsed_deps: parsed_deps.clone(),
                 },
             );
         }
     }
-    parsed_deps
+    OleanEntryDigest {
+        bytes: entry_bytes,
+        stats,
+        deps: parsed_deps,
+    }
 }
 
 /// Compute a deterministic 256-bit BLAKE3 digest over the full transitive closure of
 /// resolved `.olean` files and their companions (`.olean.server`, `.olean.private`, `.ilean`,
 /// `.ir`, `.ir.sig`) for `imports_csv` along `effective_lean_path`.
 pub fn compute_imported_oleans_digest(imports_csv: &str, effective_lean_path: &str) -> String {
-    compute_imported_oleans_digest_inner(imports_csv, effective_lean_path).0
+    ClosureSnapshot::take(imports_csv, effective_lean_path).digest
 }
 
+#[cfg(test)]
 fn compute_imported_oleans_digest_inner(
     imports_csv: &str,
     effective_lean_path: &str,
 ) -> (String, bool) {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"turbo-zygote-olean-digest:v3:");
-    hasher.update(effective_lean_path.as_bytes());
-    hasher.update(b"|");
-    hasher.update(imports_csv.as_bytes());
-    hasher.update(b"|");
+    let snap = ClosureSnapshot::take(imports_csv, effective_lean_path);
+    (snap.digest, snap.complete)
+}
 
-    let search_dirs: Vec<&Path> = effective_lean_path
+fn is_toolchain_builtin_module(mod_name: &str) -> bool {
+    mod_name == "Init"
+        || mod_name.starts_with("Init.")
+        || mod_name == "Lean"
+        || mod_name.starts_with("Lean.")
+}
+
+/// Resolve `mod_name` along `search_dirs` the way the worker's `findOLean` does. `None` for a
+/// toolchain builtin no non-toolchain directory shadows, or for a missing module.
+fn resolve_closure_module(search_dirs: &[&Path], mod_name: &str) -> Option<PathBuf> {
+    let rel_olean = format!(
+        "{}.olean",
+        crate::module_builder::module_name_to_rel_slash(mod_name)
+    );
+    if is_toolchain_builtin_module(mod_name)
+        && !search_dirs
+            .iter()
+            .filter(|d| !d.to_string_lossy().contains("/toolchains/"))
+            .any(|d| d.join(&rel_olean).is_file())
+    {
+        return None;
+    }
+    search_dirs
+        .iter()
+        .map(|d| d.join(&rel_olean))
+        .find(|p| p.is_file())
+}
+
+fn split_lean_path(lean_path: &str) -> Vec<&Path> {
+    lean_path
         .split(':')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(Path::new)
-        .collect();
+        .collect()
+}
 
-    let mut worklist: Vec<String> = Vec::new();
-    for raw_mod in imports_csv.split(',') {
-        if let Some((mod_name, _, _, _)) = parse_zygote_import_entry(raw_mod) {
-            worklist.push(mod_name);
-        }
-    }
+/// The imported `.olean` closure of `imports_csv`: its digest, and per module the resolved
+/// path with the entry bytes and stat tuples that produced it.
+struct ClosureSnapshot {
+    lean_path: String,
+    digest: String,
+    /// Every module resolved, parsed, and read identically twice.
+    complete: bool,
+    entries: std::collections::BTreeMap<String, Option<(PathBuf, OleanEntryDigest)>>,
+    /// Wall clock before the first read.
+    taken_at_ns: i128,
+    /// Per device, the `ctime` of a probe file created after the first read: any later write
+    /// to a file on that device gets a `ctime` >= this fence.
+    fences: std::collections::HashMap<u64, i128>,
+}
 
-    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut ordered_mods: Vec<String> = Vec::new();
-    let mut resolved_map: std::collections::HashMap<String, Option<PathBuf>> =
-        std::collections::HashMap::new();
-    let mut closure_complete = true;
+/// Whether work done between `ClosureSnapshot::take` and `rebind` read the snapshot's bytes.
+#[derive(Debug, PartialEq, Eq)]
+enum ClosureBinding {
+    /// Provably unchanged: the snapshot may label caches.
+    Bound,
+    /// A change was observed: the work read other bytes than the snapshot's.
+    Changed,
+    /// No change observed, but none can be excluded either.
+    Unproven,
+}
 
-    while let Some(mod_name) = worklist.pop() {
-        if !visited.insert(mod_name.clone()) {
-            continue;
-        }
-        ordered_mods.push(mod_name.clone());
-        let is_tc_builtin = mod_name == "Init"
-            || mod_name.starts_with("Init.")
-            || mod_name == "Lean"
-            || mod_name.starts_with("Lean.");
-        if is_tc_builtin {
-            let rel_olean = format!(
-                "{}.olean",
-                crate::module_builder::module_name_to_rel_slash(&mod_name)
-            );
-            let non_tc_hit = search_dirs
-                .iter()
-                .filter(|d| !d.to_string_lossy().contains("/toolchains/"))
-                .map(|d| d.join(&rel_olean))
-                .find(|p| p.is_file());
-            if non_tc_hit.is_none() {
-                resolved_map.insert(mod_name, None);
+fn wall_clock_ns() -> i128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i128)
+        .unwrap_or(0)
+}
+
+impl ClosureSnapshot {
+    /// Single pass: each module's entry is read once, and those same bytes feed both import
+    /// discovery and the digest. Every entry is then re-read; if any changed meanwhile the
+    /// closure was not stable and `complete` is `false`.
+    fn take(imports_csv: &str, lean_path: &str) -> Self {
+        let taken_at_ns = wall_clock_ns();
+        let search_dirs = split_lean_path(lean_path);
+        let mut worklist: Vec<String> = imports_csv
+            .split(',')
+            .filter_map(|m| parse_zygote_import_entry(m).map(|e| e.0))
+            .collect();
+        let mut entries = std::collections::BTreeMap::new();
+        let mut complete = true;
+        while let Some(mod_name) = worklist.pop() {
+            if entries.contains_key(&mod_name) {
                 continue;
             }
-        }
-        let rel_olean = format!(
-            "{}.olean",
-            crate::module_builder::module_name_to_rel_slash(&mod_name)
-        );
-        let found = search_dirs
-            .iter()
-            .map(|d| d.join(&rel_olean))
-            .find(|p| p.is_file());
-        if let Some(ref olean_path) = found {
-            if let Ok(meta) = fs::metadata(olean_path) {
-                let mut sink = blake3::Hasher::new();
-                if let Some(sub_imps) = digest_olean_path_entry(olean_path, &meta, &mut sink) {
-                    for sub_mod in sub_imps {
-                        if !visited.contains(&sub_mod) {
-                            worklist.push(sub_mod);
-                        }
-                    }
-                } else {
-                    closure_complete = false;
+            let entry = resolve_closure_module(&search_dirs, &mod_name).map(|olean_path| {
+                let e = digest_olean_path_entry(&olean_path);
+                match &e.deps {
+                    Some(sub) => worklist.extend(sub.iter().cloned()),
+                    None => complete = false,
                 }
-            } else {
-                closure_complete = false;
-            }
-        } else if !is_tc_builtin {
-            closure_complete = false;
+                (olean_path, e)
+            });
+            complete &= entry.is_some() || is_toolchain_builtin_module(&mod_name);
+            entries.insert(mod_name, entry);
         }
-        resolved_map.insert(mod_name, found);
-    }
 
-    ordered_mods.sort();
-    for mod_name in ordered_mods {
-        hasher.update(b"mod:");
-        hasher.update(mod_name.as_bytes());
-        hasher.update(b":");
-        match resolved_map.get(&mod_name).and_then(|o| o.as_ref()) {
-            Some(olean_path) => {
-                if let Ok(meta) = fs::metadata(olean_path) {
-                    if digest_olean_path_entry(olean_path, &meta, &mut hasher).is_none() {
-                        closure_complete = false;
+        // Per device, a fence strictly newer than every recorded `ctime`: `ctime` comes from a
+        // coarse clock, so a file written just before the snapshot may share the probe's tick
+        // (then a same-tick rewrite would keep its tuple); re-probe briefly until it does not.
+        let mut newest: std::collections::HashMap<u64, i128> = std::collections::HashMap::new();
+        for s in entries.values().flatten().flat_map(|(_, e)| e.stats.iter().flatten()) {
+            let n = newest.entry(s.dev).or_insert(i128::MIN);
+            *n = (*n).max(s.ctime_ns());
+        }
+        let mut fences = std::collections::HashMap::new();
+        for (dev, newest_ctime) in newest {
+            for _ in 0..20 {
+                match probe_ctime_fence(dev) {
+                    Some(f) if f > newest_ctime => {
+                        fences.insert(dev, f);
+                        break;
                     }
-                } else {
-                    closure_complete = false;
-                    hasher.update(b"unreadable;");
+                    Some(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
+                    None => break,
                 }
             }
-            None => {
-                if mod_name == "Init"
-                    || mod_name.starts_with("Init.")
-                    || mod_name == "Lean"
-                    || mod_name.starts_with("Lean.")
-                {
+        }
+
+        run_digest_test_hook("closure_reread");
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"turbo-zygote-olean-digest:v4:");
+        hasher.update(lean_path.as_bytes());
+        hasher.update(b"|");
+        hasher.update(imports_csv.as_bytes());
+        hasher.update(b"|");
+        for (mod_name, entry) in &entries {
+            hasher.update(b"mod:");
+            hasher.update(mod_name.as_bytes());
+            hasher.update(b":");
+            match entry {
+                Some((olean_path, e)) => {
+                    hasher.update(&e.bytes);
+                    complete &= digest_olean_path_entry(olean_path) == *e;
+                }
+                None if is_toolchain_builtin_module(mod_name) => {
                     hasher.update(b"toolchain-builtin;");
-                } else {
-                    closure_complete = false;
+                }
+                None => {
                     hasher.update(b"missing;");
                 }
             }
         }
+        Self {
+            lean_path: lean_path.to_string(),
+            digest: hasher.finalize().to_hex().to_string(),
+            complete,
+            entries,
+            taken_at_ns,
+            fences,
+        }
     }
-    (hasher.finalize().to_hex().to_string(), closure_complete)
+
+    /// Re-read the closure after the work the snapshot labels (one pass).
+    ///
+    /// `Changed` if any module now resolves elsewhere, reads differently, has another stat
+    /// tuple, or has a `ctime` newer than its device's probe fence. `Bound` iff every module resolves to the same path with identical entry bytes and stat
+    /// tuples, and each recorded `ctime` predates a write the snapshot can order against:
+    /// - the device's probe fence (strictly older), so a write after the probe would have
+    ///   changed the tuple: this needs no assumption about timestamp granularity; or
+    /// - with no fence (temp dir on another filesystem), the `STAT_TRUST_WINDOW_NS` rule
+    ///   against `taken_at_ns` on a device with proven sub-second timestamps.
+    ///
+    /// The work (an import) ran after the probe, so it read exactly the snapshot's bytes,
+    /// even across an A -> B -> A rewrite that restores the content.
+    fn rebind(&self) -> ClosureBinding {
+        let search_dirs = split_lean_path(&self.lean_path);
+        for (mod_name, entry) in &self.entries {
+            let now = resolve_closure_module(&search_dirs, mod_name)
+                .map(|p| {
+                    let e = digest_olean_path_entry(&p);
+                    (p, e)
+                });
+            if now != *entry {
+                return ClosureBinding::Changed;
+            }
+        }
+        let stats = || self.entries.values().flatten().flat_map(|(_, e)| e.stats.iter().flatten());
+        // Written after the probe: whatever the work read, it may not be these bytes.
+        if stats().any(|s| self.fences.get(&s.dev).is_some_and(|&f| s.ctime_ns() > f)) {
+            return ClosureBinding::Changed;
+        }
+        let window_cutoff = self.taken_at_ns - STAT_TRUST_WINDOW_NS;
+        let ordered = stats().all(|s| match self.fences.get(&s.dev) {
+            Some(&fence) => s.ctime_ns() < fence,
+            None => {
+                self.taken_at_ns > 0
+                    && s.ctime_ns() < window_cutoff
+                    && dev_records_subsecond_timestamps(s)
+            }
+        });
+        if self.complete && ordered {
+            ClosureBinding::Bound
+        } else {
+            ClosureBinding::Unproven
+        }
+    }
 }
 
 /// Compute a deterministic BLAKE3 digest over all `.olean` files inside non-toolchain,
@@ -1378,9 +1615,7 @@ pub fn compute_search_path_oleans_digest(effective_lean_path: &str) -> String {
     olean_files.dedup();
 
     for olean_path in olean_files {
-        if let Ok(meta) = fs::metadata(&olean_path) {
-            let _ = digest_olean_path_entry(&olean_path, &meta, &mut hasher);
-        }
+        hasher.update(&digest_olean_path_entry(&olean_path).bytes);
     }
     hasher.finalize().to_hex().to_string()
 }
@@ -2680,6 +2915,9 @@ pub(crate) struct ResolvedZygoteContext {
     host_closure_digest: String,
     toolchain_policy: String,
     pub(crate) identity: String,
+    /// The imported closure `identity` was computed from. Every cache keyed by `identity` (warm
+    /// worker env, verdicts, eval shm) is populated only once `closure.rebind()` is `Bound`.
+    closure: ClosureSnapshot,
 }
 
 fn encode_lean_args_hex(lean_args: &[String]) -> String {
@@ -2801,9 +3039,12 @@ pub(crate) fn resolve_zygote_context(
 
     let imports_csv = coalesce_proofkit_imports(raw_imports_csv, &effective_lean_path);
     let search_path_digest = compute_search_path_oleans_digest(&effective_lean_path);
-    let (imported_digest, closure_complete) =
-        compute_imported_oleans_digest_inner(&imports_csv, &effective_lean_path);
-    let host_closure_digest = if closure_complete {
+    // Every cache below (worker env, warm pool, verdicts) is labelled with this snapshot's
+    // digest, and is only populated once `rebind` proves the worker read these bytes.
+    let closure = ClosureSnapshot::take(&imports_csv, &effective_lean_path);
+    run_digest_test_hook("after_closure_snapshot");
+    let imported_digest = closure.digest.clone();
+    let host_closure_digest = if closure.complete {
         imported_digest.as_str()
     } else {
         ""
@@ -2844,10 +3085,17 @@ pub(crate) fn resolve_zygote_context(
         host_closure_digest: host_closure_digest.to_string(),
         toolchain_policy,
         identity,
+        closure,
     }
 }
 
 
+const CLOSURE_CHANGED_ERR: &str = "[turbo-lean] imported .olean closure changed while it was \
+     being evaluated (twice); refusing to report a verdict for bytes that were not hashed";
+
+/// Runs a request against a snapshot of its imported `.olean` closure; if the closure changed
+/// while the worker imported it, the reply is discarded (nothing cached, worker killed) and
+/// the request retried once on a fresh snapshot, then fails closed.
 #[allow(clippy::too_many_arguments)]
 fn eval_with_zygote_pool_inner(
     store: &TurboStore,
@@ -2864,6 +3112,55 @@ fn eval_with_zygote_pool_inner(
     lean_args: &[String],
 ) -> Result<ZygoteEvalReply> {
     let request_started = std::time::Instant::now();
+    let attempt = |timeout_ms: Option<u64>| {
+        eval_with_zygote_pool_attempt(
+            store,
+            toolchain,
+            req_lean_path,
+            env_vars,
+            lean_bin,
+            shard_source,
+            allow_stub,
+            eval_mode,
+            file_name,
+            timeout_ms,
+            batch_fission_override.clone(),
+            lean_args,
+            request_started,
+        )
+    };
+    let (rep, binding) = attempt(timeout_ms)?;
+    if binding != ClosureBinding::Changed {
+        return Ok(rep);
+    }
+    let (rep, binding) = attempt(timeout_ms)?;
+    if binding != ClosureBinding::Changed {
+        return Ok(rep);
+    }
+    Ok(ZygoteEvalReply {
+        kernel_gate_active: !eval_mode,
+        errors: vec![CLOSURE_CHANGED_ERR.to_string()],
+        messages: vec![CLOSURE_CHANGED_ERR.to_string()],
+        ..Default::default()
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn eval_with_zygote_pool_attempt(
+    store: &TurboStore,
+    toolchain: &str,
+    req_lean_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    lean_bin: &Path,
+    shard_source: &str,
+    allow_stub: bool,
+    eval_mode: bool,
+    file_name: Option<&str>,
+    timeout_ms: Option<u64>,
+    batch_fission_override: Option<(String, String, String)>,
+    lean_args: &[String],
+    request_started: std::time::Instant,
+) -> Result<(ZygoteEvalReply, ClosureBinding)> {
     let default_timeout_ms = if eval_mode { 900_000 } else { 30_000 };
     let effective_timeout_ms = timeout_ms.unwrap_or_else(|| {
         std::env::var("TURBO_LEAN_TIMEOUT_MS")
@@ -2890,6 +3187,7 @@ fn eval_with_zygote_pool_inner(
         lean_bin,
         &raw_imports_csv,
     );
+    let closure = context.closure;
     let effective_lean_path = context.lean_path;
     let imports_csv = context.imports_csv;
     let pool_digest_tag = context.search_path_digest;
@@ -2915,7 +3213,8 @@ fn eval_with_zygote_pool_inner(
             std::collections::HashMap<(String, String, bool, String), ZygoteEvalReply>,
         >,
     > = std::sync::OnceLock::new();
-    let verified_cache_key = if !eval_mode && batch_fission_override.is_none() {
+    let verified_cache_key = if !eval_mode && batch_fission_override.is_none() && closure.complete
+    {
         Some((
             verified_cache_policy,
             olean_digest.clone(),
@@ -2935,7 +3234,7 @@ fn eval_with_zygote_pool_inner(
                 hit.import_us = 0;
                 hit.prefix_us = 0;
                 hit.elab_us = 1;
-                return Ok(hit);
+                return Ok((hit, ClosureBinding::Bound));
             }
         }
     }
@@ -3349,12 +3648,19 @@ fn eval_with_zygote_pool_inner(
                     .collect()
             });
 
+            run_digest_test_hook("after_worker_reply");
+            let binding = closure.rebind();
             let mut replies = Vec::with_capacity(needed);
             let mut first_err: Option<anyhow::Error> = None;
             for (mut w, res) in results {
                 match res {
                     WorkerReqOutcome::Reply(r) => {
-                        if r.import_ok && !r.errors.iter().any(|e| e == RUNTIME_PANIC_ERR) {
+                        // A worker whose env is not proven to hold the hashed bytes is killed:
+                        // its in-process env cache is labelled with this digest.
+                        if binding == ClosureBinding::Bound
+                            && r.import_ok
+                            && !r.errors.iter().any(|e| e == RUNTIME_PANIC_ERR)
+                        {
                             w.warm_imports
                                 .insert(imports_csv.clone(), olean_digest.clone());
                             return_worker_to_pool(pool_mutex, pool_key.clone(), w);
@@ -3368,13 +3674,16 @@ fn eval_with_zygote_pool_inner(
                         last_request,
                     } => {
                         drop(w);
-                        return Ok(ZygoteEvalReply::timed_out_reply(
-                            eval_mode,
-                            elapsed_us,
-                            effective_timeout_ms,
-                            peak_rss_mb,
-                            stderr_tail,
-                            Some(last_request),
+                        return Ok((
+                            ZygoteEvalReply::timed_out_reply(
+                                eval_mode,
+                                elapsed_us,
+                                effective_timeout_ms,
+                                peak_rss_mb,
+                                stderr_tail,
+                                Some(last_request),
+                            ),
+                            binding,
                         ));
                     }
                     WorkerReqOutcome::Crashed(diag) => {
@@ -3438,7 +3747,7 @@ fn eval_with_zygote_pool_inner(
                 crashed: false,
                 ..Default::default()
             };
-            if combined_rep.import_ok && combined_rep.ok {
+            if combined_rep.import_ok && combined_rep.ok && binding == ClosureBinding::Bound {
                 if let Some(vkey) = verified_cache_key {
                     let vcache = ZYGOTE_VERIFIED_SHARD_CACHE
                         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -3450,7 +3759,7 @@ fn eval_with_zygote_pool_inner(
                     }
                 }
             }
-            return Ok(combined_rep);
+            return Ok((combined_rep, binding));
         }
     }
 
@@ -3650,13 +3959,16 @@ fn eval_with_zygote_pool_inner(
         selected
     };
     if std::time::Instant::now() >= deadline {
-        return Ok(ZygoteEvalReply::timed_out_reply(
-            eval_mode,
-            request_started.elapsed().as_micros() as u64,
-            effective_timeout_ms,
-            0,
-            String::new(),
-            Some(request_identity.clone()),
+        return Ok((
+            ZygoteEvalReply::timed_out_reply(
+                eval_mode,
+                request_started.elapsed().as_micros() as u64,
+                effective_timeout_ms,
+                0,
+                String::new(),
+                Some(request_identity.clone()),
+            ),
+            ClosureBinding::Unproven,
         ));
     }
     if worker.is_none() {
@@ -3669,13 +3981,16 @@ fn eval_with_zygote_pool_inner(
         drop(w);
         // Respawn and replay share the original request deadline, including on a cold worker.
         if std::time::Instant::now() >= deadline {
-            return Ok(ZygoteEvalReply::timed_out_reply(
-                eval_mode,
-                request_started.elapsed().as_micros() as u64,
-                effective_timeout_ms,
-                first_diag.peak_rss_mb,
-                first_diag.stderr_tail,
-                first_diag.last_request,
+            return Ok((
+                ZygoteEvalReply::timed_out_reply(
+                    eval_mode,
+                    request_started.elapsed().as_micros() as u64,
+                    effective_timeout_ms,
+                    first_diag.peak_rss_mb,
+                    first_diag.stderr_tail,
+                    first_diag.last_request,
+                ),
+                ClosureBinding::Unproven,
             ));
         }
         match spawn_zygote_worker() {
@@ -3683,7 +3998,10 @@ fn eval_with_zygote_pool_inner(
             Err(_) => {
                 let mut diag = first_diag;
                 diag.message = format!("{} (respawn failed)", diag.message);
-                return Ok(ZygoteEvalReply::crashed_reply_with_diag(eval_mode, diag));
+                return Ok((
+                    ZygoteEvalReply::crashed_reply_with_diag(eval_mode, diag),
+                    ClosureBinding::Unproven,
+                ));
             }
         }
         outcome = run_worker_req(&mut w, &req_line, &request_identity);
@@ -3695,11 +4013,15 @@ fn eval_with_zygote_pool_inner(
 
     match outcome {
         WorkerReqOutcome::Reply(rep) => {
+            run_digest_test_hook("after_worker_reply");
+            let binding = closure.rebind();
             let unusable = rep
                 .errors
                 .iter()
                 .any(|e| e == RUNTIME_PANIC_ERR || e.contains("importsCsv changed"));
-            if rep.import_ok && !unusable {
+            // Only a worker proven to have imported the hashed bytes stays warm: its env cache
+            // and every verdict are labelled with `imported_digest`.
+            if binding == ClosureBinding::Bound && rep.import_ok && !unusable {
                 w.warm_imports
                     .insert(imports_csv.clone(), olean_digest.clone());
                 if let Some(pk) = active_prefix_key {
@@ -3730,7 +4052,7 @@ fn eval_with_zygote_pool_inner(
             } else {
                 drop(w);
             }
-            Ok(rep)
+            Ok((rep, binding))
         }
         WorkerReqOutcome::TimedOut {
             elapsed_us,
@@ -3739,18 +4061,24 @@ fn eval_with_zygote_pool_inner(
             last_request,
         } => {
             drop(w);
-            Ok(ZygoteEvalReply::timed_out_reply(
-                eval_mode,
-                elapsed_us,
-                effective_timeout_ms,
-                peak_rss_mb,
-                stderr_tail,
-                Some(last_request),
+            Ok((
+                ZygoteEvalReply::timed_out_reply(
+                    eval_mode,
+                    elapsed_us,
+                    effective_timeout_ms,
+                    peak_rss_mb,
+                    stderr_tail,
+                    Some(last_request),
+                ),
+                ClosureBinding::Unproven,
             ))
         }
         WorkerReqOutcome::Crashed(diag) => {
             drop(w);
-            Ok(ZygoteEvalReply::crashed_reply_with_diag(eval_mode, diag))
+            Ok((
+                ZygoteEvalReply::crashed_reply_with_diag(eval_mode, diag),
+                ClosureBinding::Unproven,
+            ))
         }
     }
 }
@@ -4484,6 +4812,9 @@ pub(crate) fn coalesce_proofkit_imports(imports_csv: &str, lean_path: &str) -> S
     }
 }
 
+/// The cache file name, keyed by `context.identity` (which covers the imported-closure snapshot).
+/// A reply may only be stored under it once `context.closure` `rebind`s as `Bound` after the
+/// eval (`write_eval_shm_cache`).
 fn compute_eval_shm_cache_filename(
     context: &ResolvedZygoteContext,
     file_name: &str,
@@ -4511,7 +4842,13 @@ fn eval_reply_cacheable(rep: &ZygoteEvalReply) -> bool {
 }
 
 /// Write an eval reply into `eval_shm_cache/` and periodically enforce the `/dev/shm` quota.
-fn write_eval_shm_cache(path: &Path, bytes: &[u8]) {
+/// Nothing is written unless `closure` (the snapshot keying `path`) provably still describes
+/// the bytes the eval imported.
+fn write_eval_shm_cache(path: &Path, closure: &ClosureSnapshot, bytes: &[u8]) {
+    run_digest_test_hook("before_eval_shm_write");
+    if !closure.complete || closure.rebind() != ClosureBinding::Bound {
+        return;
+    }
     static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     // A failed write (e.g. ENOSPC) also counts: evict so a full cache can recover.
     let wrote = crate::shm_cache::atomic_write_shm(path, bytes).is_ok();
@@ -4718,7 +5055,7 @@ pub fn try_local_zygote_eval_with_args(
         if eval_reply_cacheable(&rep) {
             if let Some(ref path) = eval_shm_file {
                 if let Ok(bytes) = serde_json::to_vec(&rep) {
-                    write_eval_shm_cache(path, &bytes);
+                    write_eval_shm_cache(path, &context.closure, &bytes);
                 }
             }
             warm_local_zygote_daemon_nonblocking(store, env_vars);
@@ -4804,7 +5141,7 @@ pub fn try_local_zygote_eval_with_args(
     if let Some(ref rep) = parsed {
         if eval_reply_cacheable(rep) {
             if let Some(ref path) = eval_shm_file {
-                write_eval_shm_cache(path, &resp_bytes);
+                write_eval_shm_cache(path, &context.closure, &resp_bytes);
             }
         }
     }
@@ -5840,6 +6177,165 @@ mod tests {
         let d5 = compute_imported_oleans_digest("Foo.Bar", &lp);
         assert_ne!(d4, d5);
 
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// Compile `src` as module `name` under `lib` (`lean -R lib`) and return the `.olean` bytes.
+    fn compile_test_olean(lean_bin: &Path, lib: &Path, name: &str, src: &str) -> Vec<u8> {
+        let src_path = lib.join(format!("{name}.lean"));
+        let out = lib.join(format!("{name}.build.olean"));
+        fs::write(&src_path, src).unwrap();
+        let st = Command::new(lean_bin)
+            .arg("-R")
+            .arg(lib)
+            .arg(&src_path)
+            .arg("-o")
+            .arg(&out)
+            .env("LEAN_PATH", lib)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let bytes = fs::read(&out).unwrap();
+        let _ = fs::remove_file(&out);
+        bytes
+    }
+
+    #[test]
+    fn test_closure_snapshot_reread_change_is_incomplete_and_never_cached() {
+        let Some((tmp_dir, _store, _env_vars, lean_bin)) = open_test_zygote_env("reread") else {
+            return;
+        };
+        let lib = tmp_dir.join("lib");
+        fs::create_dir_all(&lib).unwrap();
+        let a = compile_test_olean(&lean_bin, &lib, "Rr", "def rrVal : Nat := 1\n");
+        let b = compile_test_olean(&lean_bin, &lib, "Rr", "def rrVal : Nat := 2\n");
+        let olean = lib.join("Rr.olean");
+        fs::write(&olean, &a).unwrap();
+        let lp = lib.to_string_lossy().to_string();
+
+        let stable = ClosureSnapshot::take("Rr", &lp);
+        assert!(stable.complete);
+        assert_eq!(stable.rebind(), ClosureBinding::Bound);
+
+        let swap = olean.clone();
+        digest_test_hooks::set("closure_reread", move || fs::write(&swap, &b).unwrap());
+        let raced = ClosureSnapshot::take("Rr", &lp);
+        digest_test_hooks::clear();
+        assert!(
+            !raced.complete,
+            "a module that changed between discovery and re-read must not be complete"
+        );
+        assert_ne!(raced.rebind(), ClosureBinding::Bound);
+
+        // The eval shm cache refuses a snapshot that no longer describes the closure.
+        fs::write(&olean, &a).unwrap();
+        let snap = ClosureSnapshot::take("Rr", &lp);
+        assert!(snap.complete);
+        fs::write(&olean, b"garbage").unwrap();
+        fs::write(&olean, &a).unwrap();
+        let shm = tmp_dir.join("ev_test.json");
+        write_eval_shm_cache(&shm, &snap, b"{}");
+        assert!(!shm.exists(), "eval shm reply cached under a stale closure digest");
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_coarse_timestamp_granularity_same_length_rewrite_rehashes() {
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_zygote_coarse_{}", next_tmp_id()));
+        fs::create_dir_all(tmp_dir.join("Foo")).unwrap();
+        let olean = tmp_dir.join("Foo/Bar.olean");
+        let lp = tmp_dir.to_string_lossy().to_string();
+        digest_test_hooks::FORCED_TS_GRANULARITY_NS.with(|g| g.set(Some(1_000_000_000)));
+        // Start early in a wall-clock second so that every write below shares one truncated
+        // second: (dev, ino, mtime, ctime, size) are then identical across the rewrite.
+        while wall_clock_ns().rem_euclid(1_000_000_000) > 300_000_000 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        fs::write(&olean, b"coarse-olean-v1").unwrap();
+        let sig1 = OleanFileStatSig::from_meta(&fs::metadata(&olean).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let d1 = compute_imported_oleans_digest("Foo.Bar", &lp);
+        assert_eq!(d1, compute_imported_oleans_digest("Foo.Bar", &lp));
+        fs::write(&olean, b"coarse-olean-v2").unwrap();
+        let sig2 = OleanFileStatSig::from_meta(&fs::metadata(&olean).unwrap());
+        let d2 = compute_imported_oleans_digest("Foo.Bar", &lp);
+        let snap = ClosureSnapshot::take("Foo.Bar", &lp);
+        digest_test_hooks::clear();
+        if sig1 == sig2 {
+            eprintln!("coarse-granularity test: identical stat tuples across the rewrite");
+        }
+        assert_ne!(d1, d2, "a same-length rewrite within one coarse tick must re-hash");
+        assert_ne!(snap.rebind(), ClosureBinding::Bound);
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_zygote_aba_swap_during_import_caches_nothing_under_hashed_digest() {
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("aba_swap") else {
+            return;
+        };
+        let toolchain = "leanprover/lean4:v4.35.0";
+        let lib = tmp_dir.join("lib");
+        fs::create_dir_all(&lib).unwrap();
+        let a = compile_test_olean(&lean_bin, &lib, "Swap", "def swapVal : Nat := 1\n");
+        let b = compile_test_olean(&lean_bin, &lib, "Swap", "def swapVal : Nat := 2\n");
+        let olean = lib.join("Swap.olean");
+        fs::write(&olean, &a).unwrap();
+        let lp = lib.to_string_lossy().to_string();
+        let digest_a = compute_imported_oleans_digest("Swap", &lp);
+        let run = |src: &str| {
+            eval_with_zygote_pool(&store, toolchain, &lp, &env_vars, &lean_bin, src, false)
+                .unwrap()
+        };
+        let wrong = "import Swap\ntheorem swap_two : swapVal = 2 := rfl\n";
+
+        // A -> B after the host hashed A, B -> A after the worker imported B: content (and the
+        // digest) is A again, yet the worker's env and verdict were computed on B.
+        let swaps = std::rc::Rc::new(std::cell::Cell::new(0));
+        let (to_b, b_bytes, swaps_b) = (olean.clone(), b.clone(), swaps.clone());
+        digest_test_hooks::set("after_closure_snapshot", move || {
+            if swaps_b.get() == 0 {
+                fs::write(&to_b, &b_bytes).unwrap();
+            }
+        });
+        let (to_a, a_bytes, swaps_a) = (olean.clone(), a.clone(), swaps.clone());
+        digest_test_hooks::set("after_worker_reply", move || {
+            if swaps_a.get() == 0 {
+                fs::write(&to_a, &a_bytes).unwrap();
+                swaps_a.set(1);
+            }
+        });
+        let rep1 = run(wrong);
+        digest_test_hooks::clear();
+        assert_eq!(swaps.get(), 1);
+        assert_eq!(compute_imported_oleans_digest("Swap", &lp), digest_a);
+        assert!(
+            !rep1.ok,
+            "the retry runs on the restored A, where `swapVal = 2` is false: {rep1:?}"
+        );
+        // Neither the verdict nor the env computed on B may be served under D(A).
+        let rep2 = run(wrong);
+        assert!(!rep2.ok, "verdict computed on B served under D(A): {rep2:?}");
+        let rep3 = run("import Swap\ntheorem swap_two' : swapVal = 2 := rfl\n");
+        assert!(!rep3.ok, "env imported from B served under D(A): {rep3:?}");
+        let rep4 = run("import Swap\ntheorem swap_one : swapVal = 1 := rfl\n");
+        assert!(rep4.ok, "{rep4:?}");
+
+        // A closure that keeps changing under every attempt fails closed after one retry.
+        let (to_b, b_bytes) = (olean.clone(), b.clone());
+        digest_test_hooks::set("after_closure_snapshot", move || {
+            fs::write(&to_b, &b_bytes).unwrap()
+        });
+        let (to_a, a_bytes) = (olean.clone(), a.clone());
+        digest_test_hooks::set("after_worker_reply", move || {
+            fs::write(&to_a, &a_bytes).unwrap()
+        });
+        let rep5 = run("import Swap\ntheorem swap_one' : swapVal = 1 := rfl\n");
+        digest_test_hooks::clear();
+        assert!(
+            !rep5.ok && rep5.errors.iter().any(|e| e == CLOSURE_CHANGED_ERR),
+            "{rep5:?}"
+        );
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 
