@@ -633,7 +633,8 @@ mod tests {
     }
 
     #[test]
-    fn remote_prebuild_posts_v1_prebuilds_with_manifest_sha256_and_verifies_artifact() -> Result<()> {
+    fn remote_prebuild_posts_v1_prebuilds_with_manifest_sha256_and_verifies_artifact() -> Result<()>
+    {
         let tmp = std::env::temp_dir().join(format!(
             "turbo_lean_remote_prebuild_v1_test_{}",
             std::process::id()
