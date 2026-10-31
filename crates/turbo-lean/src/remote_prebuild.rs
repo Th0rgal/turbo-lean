@@ -180,14 +180,22 @@ fn working_tree_dirty_paths(project_dir: &Path, selected_sha: &str) -> Result<Ve
     let git = |args: &[&str]| {
         Command::new("git")
             .args(args)
+            .env("LC_ALL", "C")
             .current_dir(project_dir)
             .output()
     };
-    let inside = git(&["rev-parse", "--is-inside-work-tree"])
-        .ok()
-        .filter(|o| o.status.success())
-        .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "true");
-    if !inside {
+    // Only a definite "not a repository" means there is no checkout to compare; any other
+    // failure to inspect (missing git, `safe.directory`, corrupt `.git`) must not read as clean.
+    let probe = git(&["rev-parse", "--is-inside-work-tree"])
+        .map_err(|e| anyhow::anyhow!("cannot run `git` to inspect the working tree: {e}"))?;
+    if !probe.status.success() {
+        let stderr = String::from_utf8_lossy(&probe.stderr);
+        if stderr.contains("not a git repository") {
+            return Ok(Vec::new());
+        }
+        anyhow::bail!("`git rev-parse` failed: {}", stderr.trim());
+    }
+    if String::from_utf8_lossy(&probe.stdout).trim() != "true" {
         return Ok(Vec::new());
     }
     let out = git(&[
@@ -890,6 +898,18 @@ mod tests {
         assert_eq!(working_tree_dirty_paths(&tmp, &head)?, ["dep"]);
         let _ = fs::remove_dir_all(&tmp);
         let _ = fs::remove_dir_all(&sub);
+        Ok(())
+    }
+
+    #[test]
+    fn uninspectable_checkout_is_an_error_but_non_repo_is_not() -> Result<()> {
+        let tmp = std::env::temp_dir().join(format!("turbo_lean_rp_bad_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp)?;
+        assert!(working_tree_dirty_paths(&tmp, &"a".repeat(40))?.is_empty());
+        fs::write(tmp.join(".git"), "not a gitfile\n")?;
+        assert!(working_tree_dirty_paths(&tmp, &"a".repeat(40)).is_err());
+        let _ = fs::remove_dir_all(&tmp);
         Ok(())
     }
 
