@@ -6622,8 +6622,8 @@ end Fixture
     #[test]
     fn test_trusted_pr_verify_rejects_metaprogram_sorry_proof_edits() -> Result<()> {
         // Proof-only edits that close the goal with `sorryAx` without any `sorry`/`admit` token, in
-        // a file that spoofs `#print axioms`: neither a zygote rejection nor the plain-`lean`
-        // fallback may accept them (the fallback is judged by the kernel-level module audit).
+        // a file that spoofs `#print axioms`, are rejected end to end in trusted mode (by the
+        // statement-policy audit, a final zygote rejection, or the audited fallback).
         let repo_dir = std::env::temp_dir().join(format!(
             "turbo_lean_pr_meta_sorry_{}_{}",
             std::process::id(),

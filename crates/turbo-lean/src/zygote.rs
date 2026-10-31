@@ -3745,6 +3745,9 @@ mod tests {
         ));
     }
 
+    /// A user `macro_rules` that makes Lean 4.35's `#print axioms` report no axioms.
+    pub(crate) const PRINT_AXIOMS_SPOOF: &str = "macro_rules\n  | `(#print axioms $i:ident) => `(#eval IO.println s!\"'{$(Lean.quote i.getId.toString)}' does not depend on any axioms\")\n";
+
     #[test]
     fn test_audited_lean_shard_exempts_only_named_explicit_stubs() -> Result<()> {
         let dir = std::env::temp_dir().join(format!(
@@ -3800,6 +3803,21 @@ mod tests {
             "theorem other : 1 = 1 := rfl\n".into(),
             "the audited theorem must be declared",
             "missing from the compiled shard",
+        );
+        // P0-3: the verdict never comes from shard-controlled output (`#print axioms` spoofed by a
+        // user macro), and `addDecl`-made axioms are seen in the kernel environment.
+        reject(
+            format!(
+                "import Lean\n{}theorem tgt : 1 = 1 := by\n  run_tac Lean.Elab.admitGoal (← Lean.Elab.Tactic.getMainGoal)\n",
+                PRINT_AXIOMS_SPOOF
+            ),
+            "a metaprogram sorry under a `#print axioms` spoof",
+            "disallowed axiom `sorryAx`",
+        );
+        reject(
+            "import Lean\nopen Lean in\n#eval show Elab.Command.CommandElabM Unit from Elab.Command.liftCoreM <| addDecl <| .axiomDecl { name := `hidden, levelParams := [], type := mkConst ``False, isUnsafe := false }\ntheorem tgt : 1 = 1 := (hidden).elim\n".into(),
+            "an `addDecl` axiom",
+            "`hidden`",
         );
         assert!(!run("theorem tgt : 1 = 2 := rfl\n")?.status.success());
         let _ = fs::remove_dir_all(&dir);
