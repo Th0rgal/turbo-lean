@@ -1837,8 +1837,15 @@ fn verify_project_module_entry_and_sidecars(
     if hdr.header_error.is_some() {
         return false;
     }
-    // P0-4: reject `.olean`s elaborated against an older artifact of one of their imports.
-    if !entry_import_pins_current(canon_dir, manifest, entry, &hdr.imports) {
+    // P0-4: reject `.olean`s elaborated against an older artifact of one of their imports
+    // (toolchain, configuration, and source were matched above).
+    if !crate::c_abi::verify_module_cache_key(
+        true,
+        true,
+        true,
+        entry_import_pins_current(canon_dir, manifest, entry, &hdr.imports),
+        true,
+    ) {
         return false;
     }
     let lib_lean_dir = canon_dir.join(".lake/build/lib/lean");
@@ -3619,6 +3626,7 @@ mod tests {
                         olean_artifact_digest: "previous artifact".into(),
                         kernel_audited: true,
                         import_olean_digests: Default::default(),
+                        artifact_stat_fingerprint: String::new(),
                     },
                 )]),
                 ..Default::default()

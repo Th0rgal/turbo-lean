@@ -4541,6 +4541,9 @@ pub(crate) struct VerifiedDepModuleEntry {
     /// Artifact-set digests of the direct imports this `.olean` was elaborated against.
     /// Deliberately not `#[serde(default)]`: legacy entries without it fail closed.
     pub import_olean_digests: BTreeMap<String, String>,
+    /// `olean_artifact_stat_fingerprint` when recorded (empty: always re-hash on use).
+    #[serde(default)]
+    pub artifact_stat_fingerprint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -4650,7 +4653,7 @@ fn spec_rel_src(spec: &DiscoveredModuleSpec) -> String {
 pub(crate) fn verified_entry_imports_current(
     entry: &VerifiedDepModuleEntry,
     imports: &[String],
-    pin_current: impl Fn(&str, Option<&str>) -> bool,
+    mut pin_current: impl FnMut(&str, Option<&str>) -> bool,
 ) -> bool {
     entry
         .import_olean_digests
@@ -4661,29 +4664,24 @@ pub(crate) fn verified_entry_imports_current(
             .all(|imp| pin_current(imp, entry.import_olean_digests.get(imp).map(String::as_str)))
 }
 
-/// Check-time judgement of a dependency-package or prebuilt import pinned at `pin` from the
-/// root package: the direct `.olean` is re-digested, and a dependency-package import's
-/// transitive closure must be pin-consistent (`dep_pkg_import_pins_consistent`).
+/// Check-time judgement of a non-root-package import pinned at `pin` from the root package:
+/// prebuilt `.olean`s are re-digested; dependency-package imports must have a consistent
+/// closure (`dep_pkg_import_pins_consistent`), memoized per manifest load.
 pub(crate) fn external_import_pin_current(
     cfg: &ProjectConfig,
     memo: &DepImportMemo,
     imp: &str,
     pin: Option<&str>,
 ) -> bool {
-    let preserve = crate::lake_build::worktree_auto_link_disabled(&cfg.root_pkg.pkg_root);
-    let digest_is = |olean: &Path, pin: &str| {
-        compute_olean_artifact_set_digest_with_policy(olean, preserve).is_ok_and(|d| d == pin)
-    };
     match (resolve_import_site(cfg, imp), pin) {
         (ImportSite::Toolchain, None) => true,
-        (ImportSite::Prebuilt(olean), Some(pin)) => digest_is(&olean, pin),
+        (ImportSite::Prebuilt(olean), Some(pin)) => olean_digest_is(cfg, &olean, pin),
         (ImportSite::DepPkg(spec), Some(pin)) => {
             let key = (imp.to_string(), pin.to_string());
             if memo.0.lock().is_ok_and(|m| m.contains(&key)) {
                 return true;
             }
-            let ok = digest_is(&spec_olean_path(&spec), pin)
-                && dep_pkg_import_pins_consistent(cfg, *spec, pin);
+            let ok = dep_pkg_import_pins_consistent(cfg, *spec, pin);
             if ok {
                 if let Ok(mut m) = memo.0.lock() {
                     m.insert(key);
@@ -4695,11 +4693,49 @@ pub(crate) fn external_import_pin_current(
     }
 }
 
-/// Cheap check-time counterpart of `collect_fresh_dep_pkg_closure` for a dependency-package
-/// module pinned at `pin`: follows recorded import pins through each package's verified-sources
-/// manifest (string compares, no artifact hashing) and requires
-/// `olean_mtime(parent) >= olean_mtime(child)` on every edge, so a dependency rebuilt after its
-/// dependents (by turbo-lean: pin mismatch; by anything else: newer `.olean`) fails closed.
+/// Whether `olean`'s artifact set digests to `pin`, hashed under the root worktree policy.
+fn olean_digest_is(cfg: &ProjectConfig, olean: &Path, pin: &str) -> bool {
+    let preserve = crate::lake_build::worktree_auto_link_disabled(&cfg.root_pkg.pkg_root);
+    compute_olean_artifact_set_digest_with_policy(olean, preserve).is_ok_and(|d| d == pin)
+}
+
+/// Inode/size/mtime/ctime fingerprint of an `.olean` artifact set. Any rewrite, replacement,
+/// or timestamp reset changes `ctime`, so an unchanged fingerprint implies unchanged bytes.
+fn olean_artifact_stat_fingerprint(olean: &Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mut h = blake3::Hasher::new();
+        for (tag, path) in olean_artifact_paths(olean) {
+            h.update(tag.as_bytes());
+            match fs::metadata(&path) {
+                Ok(m) => {
+                    for v in [m.ino() as i64, m.len() as i64, m.mtime(), m.mtime_nsec()] {
+                        h.update(&v.to_le_bytes());
+                    }
+                    h.update(&m.ctime().to_le_bytes());
+                    h.update(&m.ctime_nsec().to_le_bytes());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    h.update(b"-");
+                }
+                Err(_) => return None,
+            }
+        }
+        Some(h.finalize().to_hex().to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = olean;
+        None
+    }
+}
+
+/// Check-time counterpart of `collect_fresh_dep_pkg_closure` for a dependency-package module
+/// pinned at `pin`: every visited module's artifacts must match its manifest entry (by stat
+/// fingerprint, else by re-hashing), its source must match the entry, and every import of that
+/// source must be pinned to the current artifacts (dependency packages recursively; root and
+/// prebuilt imports re-digested).
 fn dep_pkg_import_pins_consistent(
     cfg: &ProjectConfig,
     spec: DiscoveredModuleSpec,
@@ -4707,14 +4743,8 @@ fn dep_pkg_import_pins_consistent(
 ) -> bool {
     let mut manifests: HashMap<PathBuf, Option<VerifiedDepManifest>> = HashMap::new();
     let mut seen: HashMap<(String, String), String> = HashMap::new();
-    let mut stack = vec![(spec, pin.to_string(), None::<std::time::SystemTime>)];
-    while let Some((cur, pin, parent_mtime)) = stack.pop() {
-        let Ok(mtime) = fs::metadata(spec_olean_path(&cur)).and_then(|m| m.modified()) else {
-            return false;
-        };
-        if parent_mtime.is_some_and(|pm| pm < mtime) {
-            return false;
-        }
+    let mut stack = vec![(spec, pin.to_string())];
+    while let Some((cur, pin)) = stack.pop() {
         let key = (cur.pkg_name.clone(), cur.module_name.clone());
         if let Some(prev) = seen.get(&key) {
             if *prev != pin {
@@ -4731,14 +4761,40 @@ fn dep_pkg_import_pins_consistent(
         else {
             return false;
         };
-        if entry.olean_artifact_digest != pin {
+        let olean = spec_olean_path(&cur);
+        let artifacts_ok = (!entry.artifact_stat_fingerprint.is_empty()
+            && olean_artifact_stat_fingerprint(&olean).as_deref()
+                == Some(entry.artifact_stat_fingerprint.as_str()))
+            || olean_digest_is(cfg, &olean, &entry.olean_artifact_digest);
+        let Ok(src) = fs::read_to_string(&cur.src_path) else {
             return false;
-        }
-        for (imp, sub_pin) in &entry.import_olean_digests {
-            let ImportSite::DepPkg(sub) = resolve_import_site(cfg, imp) else {
-                return false;
-            };
-            stack.push((*sub, sub_pin.clone(), Some(mtime)));
+        };
+        let src_ok = blake3::hash(src.as_bytes()).to_hex().as_str() == entry.src_blake3;
+        let hdr = parse_header_info(&src);
+        let pins_ok = hdr.header_error.is_none()
+            && verified_entry_imports_current(entry, &hdr.imports, |imp, sub_pin| {
+                if let Some(root_spec) = resolve_module_in_package(&cfg.root_pkg, true, imp) {
+                    return sub_pin
+                        .is_some_and(|p| olean_digest_is(cfg, &spec_olean_path(&root_spec), p));
+                }
+                match (resolve_import_site(cfg, imp), sub_pin) {
+                    (ImportSite::Toolchain, None) => true,
+                    (ImportSite::Prebuilt(o), Some(p)) => olean_digest_is(cfg, &o, p),
+                    (ImportSite::DepPkg(sub), Some(p)) => {
+                        stack.push((*sub, p.to_string()));
+                        true
+                    }
+                    _ => false,
+                }
+            });
+        if !c_abi::verify_module_cache_key(
+            true,
+            true,
+            src_ok,
+            artifacts_ok && pins_ok && entry.olean_artifact_digest == pin,
+            true,
+        ) {
+            return false;
         }
         seen.insert(key, pin);
     }
@@ -4908,7 +4964,7 @@ fn is_dep_olean_fresh(
     // Same-package pins compare against `manifest`; other packages' against their on-disk
     // artifacts. `collect_fresh_dep_pkg_closure` verifies every visited module the same way.
     let preserve = crate::lake_build::worktree_auto_link_disabled(&cfg.root_pkg.pkg_root);
-    if !verified_entry_imports_current(entry, imports, |imp, pin| {
+    let pins_ok = verified_entry_imports_current(entry, imports, |imp, pin| {
         match (resolve_import_site(cfg, imp), pin) {
             (ImportSite::Toolchain, None) => true,
             (ImportSite::DepPkg(d), Some(pin)) if d.pkg_name == spec.pkg_name => manifest
@@ -4921,7 +4977,9 @@ fn is_dep_olean_fresh(
             }
             _ => false,
         }
-    }) {
+    });
+    // Toolchain, configuration, and source were matched above.
+    if !c_abi::verify_module_cache_key(true, true, true, pins_ok, true) {
         return None;
     }
     let rel_slash = module_name_to_rel_slash(&spec.module_name);
@@ -7946,6 +8004,18 @@ pub(crate) fn record_verified_dep_source(
     else {
         return;
     };
+    // Fingerprint only a stable artifact set that still digests to the recorded value.
+    let fp = olean_artifact_stat_fingerprint(&node.olean_path);
+    let artifact_stat_fingerprint = fp
+        .filter(|fp| {
+            compute_olean_artifact_set_digest_with_policy(
+                &node.olean_path,
+                crate::lake_build::worktree_auto_link_disabled(&cfg.root_pkg.pkg_root),
+            )
+            .is_ok_and(|d| d == olean_artifact_digest)
+                && olean_artifact_stat_fingerprint(&node.olean_path).as_ref() == Some(fp)
+        })
+        .unwrap_or_default();
     let pkg_root = &node.pkg_root;
     let build_dir = pkg_root.join(".lake/build");
     let _ = fs::create_dir_all(&build_dir);
@@ -7984,6 +8054,7 @@ pub(crate) fn record_verified_dep_source(
             olean_artifact_digest: olean_artifact_digest.to_string(),
             kernel_audited,
             import_olean_digests,
+            artifact_stat_fingerprint,
         },
     );
     if let Ok(json_bytes) = serde_json::to_vec(&manifest) {
@@ -9988,6 +10059,40 @@ lean_exe «demo-exe» where
         fs::write(&manifest_path, serde_json::to_vec(&partial).unwrap()).unwrap();
         assert!(!verified(), "unpinned dependency-package import accepted");
         fs::write(&manifest_path, &good).unwrap();
+        assert!(verified());
+        // ...and so does a dependency-package entry missing a pin.
+        let dep_manifest_path = dep_dir.join(".lake/build/.turbo_verified_sources.json");
+        let dep_good = fs::read(&dep_manifest_path).unwrap();
+        let mut dep_partial: serde_json::Value = serde_json::from_slice(&dep_good).unwrap();
+        assert!(
+            dep_partial["modules"]["DepPkg/A.lean"]["artifact_stat_fingerprint"]
+                .as_str()
+                .is_some_and(|fp| !fp.is_empty())
+        );
+        dep_partial["modules"]["DepPkg/B.lean"]["import_olean_digests"] = serde_json::json!({});
+        fs::write(
+            &dep_manifest_path,
+            serde_json::to_vec(&dep_partial).unwrap(),
+        )
+        .unwrap();
+        assert!(!verified(), "unpinned transitive import accepted");
+        fs::write(&dep_manifest_path, &dep_good).unwrap();
+        assert!(verified());
+        // A foreign rewrite of a transitive `.olean` with an old mtime is detected, and putting
+        // the original bytes back (new ctime, same digest) is accepted again.
+        let a_olean = dep_dir.join(".lake/build/lib/lean/DepPkg/A.olean");
+        let a_bytes = fs::read(&a_olean).unwrap();
+        let _ = fs::remove_file(&a_olean);
+        fs::write(&a_olean, b"foreign olean").unwrap();
+        assert!(Command::new("touch")
+            .args(["-d", "@1000000000"])
+            .arg(&a_olean)
+            .status()
+            .unwrap()
+            .success());
+        assert!(!verified(), "rewritten transitive `.olean` accepted");
+        let _ = fs::remove_file(&a_olean);
+        fs::write(&a_olean, &a_bytes).unwrap();
         assert!(verified());
         // Rebuild only the transitive import `DepPkg.A` (inside the dependency package).
         std::thread::sleep(std::time::Duration::from_millis(20));

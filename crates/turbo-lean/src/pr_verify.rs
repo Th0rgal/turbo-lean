@@ -5967,6 +5967,7 @@ end Fixture
                 olean_artifact_digest: art_dig,
                 kernel_audited: true,
                 import_olean_digests,
+                artifact_stat_fingerprint: String::new(),
             },
         );
         fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
