@@ -2181,6 +2181,9 @@ pub fn parse_lakefile_toml(
                         let tbl = parse_toml_lean_options_table(&val_accum)?;
                         lib.lean_options.extend(tbl);
                     }
+                    // Lake's TOML decoder excludes `nativeFacets` (`Load/Toml.lean`), so it has
+                    // no effect in a lakefile.toml.
+                    "nativeFacets" => {}
                     "defaultFacets" => {
                         let facets = parse_toml_string_array(&val_accum)?;
                         for f in &facets {
@@ -3503,8 +3506,6 @@ pub fn parse_lakefile_lean(
             "input_file",
             "input_dir",
             "needs :=",
-            "dynlibs :=",
-            "plugins :=",
             "IO.Process",
             "System.Process",
         ] {
@@ -3748,7 +3749,6 @@ pub fn parse_lakefile_lean(
                 // options through the parent structure; never skip them silently.
                 if key.starts_with("to") && key[2..].starts_with(|c: char| c.is_ascii_uppercase())
                     || key.contains('.')
-                    || matches!(key, "dynlibs" | "plugins")
                 {
                     anyhow::bail!(
                         "Unsupported field `{}` in {} at line {}: fail-closed static Lake config gate",
@@ -3986,7 +3986,25 @@ where
 {
     let is_def = *pending_default_target;
     *pending_default_target = false;
-    if trimmed.starts_with("import ") || trimmed.starts_with("open ") {
+    if let Some(mods) = trimmed.strip_prefix("import ") {
+        // Another import could bring syntax or elaborators that change what the declarations
+        // read here mean to Lake.
+        if mods.split_whitespace().any(|m| m != "Lake") {
+            unsupported_lake_field(
+                &mut pkg.unsupported,
+                is_root_pkg,
+                format!(
+                    "Unsupported lakefile import `{}` in {} at line {}",
+                    trimmed,
+                    lean_path.display(),
+                    line_no
+                ),
+            )?;
+        }
+        *current_block = T::none();
+        return Ok(());
+    }
+    if trimmed.starts_with("open ") {
         *current_block = T::none();
         return Ok(());
     }
@@ -11682,6 +11700,46 @@ roots = ["Fast"]
             if let Ok(pkg) = parse_lakefile_lean(&dir, &lf, false) {
                 assert!(pkg.unsupported.is_some(), "{body}");
             }
+        }
+        // Empty `plugins`/`dynlibs` change nothing; non-empty ones fail closed.
+        for (field, ok) in [
+            ("plugins := #[]", true),
+            ("dynlibs := #[]", true),
+            ("plugins := #[p]", false),
+        ] {
+            fs::write(
+                &lf,
+                format!("import Lake\nopen Lake DSL\npackage t\nlean_lib A where\n  {field}\n"),
+            )
+            .unwrap();
+            assert_eq!(parse_lakefile_lean(&dir, &lf, true).is_ok(), ok, "{field}");
+            let pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
+            assert_eq!(pkg.libs[0].unsupported.is_none(), ok, "{field}");
+        }
+        // Lake's TOML decoder ignores `nativeFacets`.
+        let tf = dir.join("lakefile.toml");
+        fs::write(
+            &tf,
+            "name = \"t\"\n[[lean_lib]]\nname = \"A\"\nnativeFacets = []\n",
+        )
+        .unwrap();
+        assert!(parse_lakefile_toml(&dir, &tf, true).is_ok());
+        fs::remove_file(&tf).unwrap();
+        // Imports beyond `Lake` could change how the lakefile elaborates.
+        for imp in ["import Lake Foo", "import Mathlib"] {
+            fs::write(
+                &lf,
+                format!("{imp}\nopen Lake DSL\npackage t\nlean_lib A\n"),
+            )
+            .unwrap();
+            assert!(parse_lakefile_lean(&dir, &lf, true).is_err(), "{imp}");
+            assert!(
+                parse_lakefile_lean(&dir, &lf, false)
+                    .unwrap()
+                    .unsupported
+                    .is_some(),
+                "{imp}"
+            );
         }
         // A dependency's `needs` only marks the target that sets it.
         let lf = dir.join("lakefile.lean");
