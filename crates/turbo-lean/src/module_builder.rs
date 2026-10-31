@@ -4630,8 +4630,10 @@ pub(crate) fn resolve_import_site(cfg: &ProjectConfig, imp: &str) -> ImportSite 
 }
 
 fn spec_olean_path(spec: &DiscoveredModuleSpec) -> PathBuf {
-    spec.build_lib_lean_dir
-        .join(format!("{}.olean", module_name_to_rel_slash(&spec.module_name)))
+    spec.build_lib_lean_dir.join(format!(
+        "{}.olean",
+        module_name_to_rel_slash(&spec.module_name)
+    ))
 }
 
 fn spec_rel_src(spec: &DiscoveredModuleSpec) -> String {
@@ -4654,12 +4656,9 @@ pub(crate) fn verified_entry_imports_current(
         .import_olean_digests
         .keys()
         .all(|k| imports.contains(k))
-        && imports.iter().all(|imp| {
-            pin_current(
-                imp,
-                entry.import_olean_digests.get(imp).map(String::as_str),
-            )
-        })
+        && imports
+            .iter()
+            .all(|imp| pin_current(imp, entry.import_olean_digests.get(imp).map(String::as_str)))
 }
 
 /// Check-time judgement of a dependency-package or prebuilt import pinned at `pin` from the
@@ -9978,7 +9977,8 @@ lean_exe «demo-exe» where
         assert_eq!(build(&proj_dir, &[]).modules_compiled, 3);
         let canon = proj_dir.canonicalize().unwrap();
         let canon_c = c_file.canonicalize().unwrap();
-        let verified = || crate::lake_build::is_file_verified_in_lake_build(&canon, &canon_c, c_src);
+        let verified =
+            || crate::lake_build::is_file_verified_in_lake_build(&canon, &canon_c, c_src);
         assert!(verified());
         // An entry missing its external pin fails closed.
         let manifest_path = crate::lake_build::verified_sources_manifest_path(&canon);
