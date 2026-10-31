@@ -733,6 +733,8 @@ enum OmegaAst {
     Var(String),
     Lit(i128),
     BoolLit(bool),
+    TypedBitVecZero,
+    TypedBitVecOne,
     Unary(String, Box<OmegaAst>),
     Binary(String, Box<OmegaAst>, Box<OmegaAst>),
 }
@@ -884,6 +886,14 @@ fn scan_stmt_binders(s: &str) -> (Vec<(char, String)>, bool, String, bool) {
     (binders, found_colon, tail, hit_unexpected)
 }
 
+fn looks_like_binder_prop_hyp(ty: &str) -> bool {
+    let t = ty.trim();
+    matches!(t, "True" | "False" | "true" | "false")
+        || ["=", "≠", "!=", "<", ">", "≤", "≥", "∧", "∨", "&&", "||", "¬", "→", "->"]
+            .iter()
+            .any(|op| t.contains(op))
+}
+
 fn parse_omega_stmt(raw_stmt: &str) -> Option<(Vec<(String, OmegaParamDom)>, Vec<String>, String)> {
     let s = strip_decl_header_and_assign(raw_stmt);
     let (binders, found_colon, tail, _) = scan_stmt_binders(&s);
@@ -891,6 +901,9 @@ fn parse_omega_stmt(raw_stmt: &str) -> Option<(Vec<(String, OmegaParamDom)>, Vec
     let mut hyps: Vec<String> = Vec::new();
 
     for (open, inner) in binders {
+        if open == '[' {
+            return None;
+        }
         if open == '(' || open == '{' {
             if let Some((vars_part, ty_part)) = crate::gpu_fastcheck::split_top_level_colon(&inner)
             {
@@ -901,8 +914,10 @@ fn parse_omega_stmt(raw_stmt: &str) -> Option<(Vec<(String, OmegaParamDom)>, Vec
                             params.push((vt.to_string(), dom));
                         }
                     }
-                } else {
+                } else if looks_like_binder_prop_hyp(ty_part) {
                     hyps.push(ty_part.trim().to_string());
+                } else {
+                    return None;
                 }
             } else {
                 hyps.push(inner.trim().to_string());
@@ -1106,9 +1121,9 @@ impl OmegaParser {
             "|||" => Some(4),
             "^^^" => Some(5),
             "&&&" => Some(6),
-            "<<<" | ">>>" => Some(7),
-            "+" | "-" => Some(8),
-            "*" | "/" | "%" => Some(9),
+            "+" | "-" => Some(7),
+            "*" | "/" | "%" => Some(8),
+            "<<<" | ">>>" => Some(9),
             _ => None,
         }
     }
@@ -1144,8 +1159,8 @@ impl OmegaParser {
             OmegaTok::Ident(id) => match id.as_str() {
                 "True" | "true" => Some(OmegaAst::BoolLit(true)),
                 "False" | "false" => Some(OmegaAst::BoolLit(false)),
-                "BitVec.zero" => Some(OmegaAst::Lit(0)),
-                "BitVec.one" => Some(OmegaAst::Lit(1)),
+                "BitVec.zero" => Some(OmegaAst::TypedBitVecZero),
+                "BitVec.one" => Some(OmegaAst::TypedBitVecOne),
                 "Nat.succ" => {
                     let arg = self.parse_unary()?;
                     Some(OmegaAst::Binary(
@@ -1155,7 +1170,7 @@ impl OmegaParser {
                     ))
                 }
                 "BitVec.not" | "bitNot" => Some(OmegaAst::Unary(
-                    "~".to_string(),
+                    if id == "BitVec.not" { "bv_not" } else { "~" }.to_string(),
                     Box::new(self.parse_unary()?),
                 )),
                 _ if id.starts_with("Word256.")
@@ -1166,14 +1181,19 @@ impl OmegaParser {
                 }
                 _ => {
                     let bin_op = match id.as_str() {
-                        "BitVec.shiftLeft" | "shl" => Some("<<<"),
-                        "BitVec.ushiftRight" | "shr" => Some(">>>"),
-                        "BitVec.and" | "bitAnd" => Some("&&&"),
-                        "BitVec.or" | "bitOr" => Some("|||"),
-                        "BitVec.xor" | "bitXor" => Some("^^^"),
-                        "BitVec.add" => Some("+"),
-                        "BitVec.sub" => Some("-"),
-                        "BitVec.mul" => Some("*"),
+                        "BitVec.shiftLeft" => Some("bv_shl"),
+                        "shl" => Some("<<<"),
+                        "BitVec.ushiftRight" => Some("bv_shr"),
+                        "shr" => Some(">>>"),
+                        "BitVec.and" => Some("bv_and"),
+                        "bitAnd" => Some("&&&"),
+                        "BitVec.or" => Some("bv_or"),
+                        "bitOr" => Some("|||"),
+                        "BitVec.xor" => Some("bv_xor"),
+                        "bitXor" => Some("^^^"),
+                        "BitVec.add" => Some("bv_add"),
+                        "BitVec.sub" => Some("bv_sub"),
+                        "BitVec.mul" => Some("bv_mul"),
                         _ => None,
                     };
                     if let Some(op) = bin_op {
@@ -1217,7 +1237,10 @@ fn collect_omega_vars(ast: &OmegaAst, out: &mut Vec<String>) {
                 out.push(v.clone());
             }
         }
-        OmegaAst::Lit(_) | OmegaAst::BoolLit(_) => {}
+        OmegaAst::Lit(_)
+        | OmegaAst::BoolLit(_)
+        | OmegaAst::TypedBitVecZero
+        | OmegaAst::TypedBitVecOne => {}
         OmegaAst::Unary(_, inner) => collect_omega_vars(inner, out),
         OmegaAst::Binary(_, l, r) => {
             collect_omega_vars(l, out);
@@ -1226,18 +1249,104 @@ fn collect_omega_vars(ast: &OmegaAst, out: &mut Vec<String>) {
     }
 }
 
+fn omega_ast_mentions_typed_value(ast: &OmegaAst, include_bitvec_only: bool, default_dom: OmegaParamDom) -> bool {
+    match ast {
+        OmegaAst::Var(_) => !include_bitvec_only || matches!(default_dom, OmegaParamDom::BitVec(_)),
+        OmegaAst::TypedBitVecZero | OmegaAst::TypedBitVecOne => true,
+        OmegaAst::Lit(_) | OmegaAst::BoolLit(_) => false,
+        OmegaAst::Unary(op, inner) => {
+            if op == "bv_not" {
+                true
+            } else {
+                omega_ast_mentions_typed_value(inner, include_bitvec_only, default_dom)
+            }
+        }
+        OmegaAst::Binary(op, l, r) => {
+            if matches!(
+                op.as_str(),
+                "bv_shl" | "bv_shr" | "bv_and" | "bv_or" | "bv_xor" | "bv_add" | "bv_sub" | "bv_mul"
+            ) {
+                true
+            } else if matches!(
+                op.as_str(),
+                "=" | "==" | "!=" | "≠" | "<" | "<=" | "≤" | ">" | ">=" | "≥" | "&&" | "∧" | "||" | "∨"
+            ) {
+                false
+            } else if matches!(op.as_str(), "<<<" | ">>>") {
+                omega_ast_mentions_typed_value(l, include_bitvec_only, default_dom)
+            } else {
+                omega_ast_mentions_typed_value(l, include_bitvec_only, default_dom)
+                    || omega_ast_mentions_typed_value(r, include_bitvec_only, default_dom)
+            }
+        }
+    }
+}
+
+fn omega_ast_infer_subexpr_dom(ast: &OmegaAst, expected: OmegaParamDom) -> Option<OmegaParamDom> {
+    match ast {
+        OmegaAst::Binary(op, lhs, rhs) if matches!(op.as_str(), "<<<" | ">>>") => {
+            if !omega_ast_mentions_typed_value(lhs, false, expected) {
+                if omega_ast_mentions_typed_value(rhs, true, expected) {
+                    return None;
+                }
+                if omega_ast_mentions_typed_value(rhs, false, expected) {
+                    return Some(expected);
+                }
+                if matches!(expected, OmegaParamDom::Nat | OmegaParamDom::BitVec(_)) {
+                    return Some(OmegaParamDom::Nat);
+                }
+                return None;
+            }
+            Some(expected)
+        }
+        OmegaAst::Unary(op, inner) if op != "!" && op != "¬" => {
+            let inner_dom = omega_ast_infer_subexpr_dom(inner, expected)?;
+            if op != "bv_not"
+                && matches!(inner_dom, OmegaParamDom::Nat)
+                && !matches!(expected, OmegaParamDom::Nat)
+            {
+                return None;
+            }
+            Some(expected)
+        }
+        OmegaAst::Binary(op, lhs, rhs)
+            if matches!(op.as_str(), "+" | "-" | "*" | "/" | "%" | "&&&" | "|||" | "^^^") =>
+        {
+            let _ = omega_ast_infer_subexpr_dom(lhs, expected)?;
+            let _ = omega_ast_infer_subexpr_dom(rhs, expected)?;
+            if !omega_ast_mentions_typed_value(lhs, false, expected)
+                && !omega_ast_mentions_typed_value(rhs, false, expected)
+                && matches!(expected, OmegaParamDom::BitVec(_))
+            {
+                let l_dom = omega_ast_infer_subexpr_dom(lhs, OmegaParamDom::Nat);
+                let r_dom = omega_ast_infer_subexpr_dom(rhs, OmegaParamDom::Nat);
+                if (l_dom == Some(OmegaParamDom::Nat)
+                    && matches!(lhs.as_ref(), OmegaAst::Binary(lop, _, _) if matches!(lop.as_str(), "<<<" | ">>>")))
+                    || (r_dom == Some(OmegaParamDom::Nat)
+                        && matches!(rhs.as_ref(), OmegaAst::Binary(rop, _, _) if matches!(rop.as_str(), "<<<" | ">>>")))
+                {
+                    // `1 + (1 <<< 8)` elaborates as `↑1 + ↑(1 <<< 8)` in `BitVec w`, not `↑(1 + (1 <<< 8))`.
+                    return Some(expected);
+                }
+            }
+            Some(expected)
+        }
+        _ => Some(expected),
+    }
+}
+
 fn eval_omega_ast(
     ast: &OmegaAst,
     env: &HashMap<String, i128>,
-    default_dom: OmegaParamDom,
+    expected_dom: OmegaParamDom,
 ) -> Option<OmegaVal> {
-    let dom_width: u32 = match default_dom {
-        OmegaParamDom::UInt(w) | OmegaParamDom::BitVec(w) => w.clamp(1, 64),
-        _ => 64,
-    };
-    let mask_dom = |v: i128| -> Option<i128> {
-        match default_dom {
-            OmegaParamDom::Nat => Some(v.max(0)),
+    let outer_dom = expected_dom;
+    let default_dom = omega_ast_infer_subexpr_dom(ast, outer_dom)?;
+    let coerce_nat_to_bv = matches!(outer_dom, OmegaParamDom::BitVec(_))
+        && matches!(default_dom, OmegaParamDom::Nat);
+    let mask_for = |dom: OmegaParamDom, v: i128| -> Option<i128> {
+        match dom {
+            OmegaParamDom::Nat => (v >= 0).then_some(v),
             OmegaParamDom::Int => Some(v),
             OmegaParamDom::UInt(w) | OmegaParamDom::BitVec(w) => {
                 if w >= 64 {
@@ -1249,29 +1358,59 @@ fn eval_omega_ast(
             }
         }
     };
+    let dom_width: u32 = match default_dom {
+        OmegaParamDom::UInt(w) | OmegaParamDom::BitVec(w) => w.clamp(1, 64),
+        _ => 64,
+    };
+    let mask_dom = |v: i128| mask_for(default_dom, v);
+    let wrap_out = |val: OmegaVal| -> Option<OmegaVal> {
+        if coerce_nat_to_bv {
+            Some(OmegaVal::Int(mask_for(outer_dom, val.as_int()?)?))
+        } else {
+            Some(val)
+        }
+    };
 
-    match ast {
+    let raw = match ast {
         OmegaAst::Lit(n) => Some(OmegaVal::Int(mask_dom(*n)?)),
+        OmegaAst::TypedBitVecZero => matches!(outer_dom, OmegaParamDom::BitVec(_)).then_some(OmegaVal::Int(0)),
+        OmegaAst::TypedBitVecOne => {
+            matches!(outer_dom, OmegaParamDom::BitVec(_))
+                .then(|| mask_for(outer_dom, 1).map(OmegaVal::Int))
+                .flatten()
+        }
         OmegaAst::BoolLit(b) => Some(OmegaVal::Bool(*b)),
         OmegaAst::Var(name) => env.get(name).copied().map(OmegaVal::Int),
         OmegaAst::Unary(op, inner) => {
-            let v = eval_omega_ast(inner, env, default_dom)?;
+            if op == "~" {
+                if let OmegaAst::Binary(iop, il, _) = inner.as_ref() {
+                    if matches!(iop.as_str(), "<<<" | ">>>")
+                        && !omega_ast_mentions_typed_value(il, false, outer_dom)
+                    {
+                        return None;
+                    }
+                }
+            }
+            if op == "bv_not" && !matches!(outer_dom, OmegaParamDom::BitVec(_)) {
+                return None;
+            }
+            let v = eval_omega_ast(inner, env, outer_dom)?;
             match op.as_str() {
                 "!" | "¬" => Some(OmegaVal::Bool(!v.as_bool()?)),
-                "~" => match default_dom {
+                "~" | "bv_not" => match outer_dom {
                     OmegaParamDom::UInt(_) | OmegaParamDom::BitVec(_) => {
                         let x = v.as_int()? as u64;
-                        mask_dom((!x) as i128).map(OmegaVal::Int)
+                        mask_for(outer_dom, (!x) as i128).map(OmegaVal::Int)
                     }
                     _ => None,
                 },
                 "-" => {
                     let x = v.as_int()?;
-                    match default_dom {
+                    match outer_dom {
                         OmegaParamDom::Nat => None,
                         OmegaParamDom::Int => Some(OmegaVal::Int(x.checked_neg()?)),
                         OmegaParamDom::UInt(_) | OmegaParamDom::BitVec(_) => {
-                            mask_dom(0i128.wrapping_sub(x)).map(OmegaVal::Int)
+                            mask_for(outer_dom, 0i128.wrapping_sub(x)).map(OmegaVal::Int)
                         }
                     }
                 }
@@ -1281,16 +1420,62 @@ fn eval_omega_ast(
         OmegaAst::Binary(op, lhs, rhs) => {
             if matches!(op.as_str(), "&&" | "∧" | "||" | "∨") {
                 let short = matches!(op.as_str(), "||" | "∨");
-                let l = eval_omega_ast(lhs, env, default_dom)?.as_bool()?;
+                let l = eval_omega_ast(lhs, env, outer_dom)?.as_bool()?;
                 if l == short {
                     return Some(OmegaVal::Bool(short));
                 }
                 return Some(OmegaVal::Bool(
-                    eval_omega_ast(rhs, env, default_dom)?.as_bool()?,
+                    eval_omega_ast(rhs, env, outer_dom)?.as_bool()?,
                 ));
             }
+            if matches!(
+                op.as_str(),
+                "=" | "==" | "!=" | "≠" | "<" | "<=" | "≤" | ">" | ">=" | "≥"
+            ) && !matches!(outer_dom, OmegaParamDom::Int)
+                && !omega_ast_mentions_typed_value(lhs, false, outer_dom)
+                && !omega_ast_mentions_typed_value(rhs, false, outer_dom)
+                && !matches!(rhs.as_ref(), OmegaAst::BoolLit(_))
+                && !matches!(lhs.as_ref(), OmegaAst::BoolLit(_))
+            {
+                let a = eval_omega_ast(lhs, env, OmegaParamDom::Nat)?.as_int()?;
+                let b = eval_omega_ast(rhs, env, OmegaParamDom::Nat)?.as_int()?;
+                let res = match op.as_str() {
+                    "=" | "==" => a == b,
+                    "!=" | "≠" => a != b,
+                    "<" => a < b,
+                    "<=" | "≤" => a <= b,
+                    ">" => a > b,
+                    _ => a >= b,
+                };
+                return Some(OmegaVal::Bool(res));
+            }
+            if op.starts_with("bv_") && !matches!(default_dom, OmegaParamDom::BitVec(_)) {
+                return None;
+            }
+            if matches!(op.as_str(), "bv_shl" | "bv_shr")
+                && omega_ast_mentions_typed_value(rhs, true, default_dom)
+            {
+                return None;
+            }
+            let rhs_dom = match (op.as_str(), default_dom) {
+                ("bv_shl" | "bv_shr", _) => OmegaParamDom::Nat,
+                ("<<<" | ">>>", OmegaParamDom::BitVec(_)) => {
+                    if omega_ast_mentions_typed_value(rhs, true, default_dom) {
+                        default_dom
+                    } else {
+                        OmegaParamDom::Nat
+                    }
+                }
+                ("<<<" | ">>>", OmegaParamDom::Nat) => {
+                    if omega_ast_mentions_typed_value(rhs, true, default_dom) {
+                        return None;
+                    }
+                    OmegaParamDom::Nat
+                }
+                _ => default_dom,
+            };
             let lv = eval_omega_ast(lhs, env, default_dom)?;
-            let rv = eval_omega_ast(rhs, env, default_dom)?;
+            let rv = eval_omega_ast(rhs, env, rhs_dom)?;
             match op.as_str() {
                 "=" | "==" => return Some(OmegaVal::Bool(lv == rv)),
                 "!=" | "≠" => return Some(OmegaVal::Bool(lv != rv)),
@@ -1298,7 +1483,18 @@ fn eval_omega_ast(
             }
             let (a, b) = (lv.as_int()?, rv.as_int()?);
             let is_int = matches!(default_dom, OmegaParamDom::Nat | OmegaParamDom::Int);
-            match op.as_str() {
+            let norm_op = match op.as_str() {
+                "bv_add" => "+",
+                "bv_sub" => "-",
+                "bv_mul" => "*",
+                "bv_and" => "&&&",
+                "bv_or" => "|||",
+                "bv_xor" => "^^^",
+                "bv_shl" => "<<<",
+                "bv_shr" => ">>>",
+                other => other,
+            };
+            match norm_op {
                 "<" => Some(OmegaVal::Bool(a < b)),
                 "<=" | "≤" => Some(OmegaVal::Bool(a <= b)),
                 ">" => Some(OmegaVal::Bool(a > b)),
@@ -1371,8 +1567,8 @@ fn eval_omega_ast(
                             return None;
                         }
                         let au = a as u128;
-                        let sh = u32::try_from(b).ok()?;
-                        if op == "<<<" {
+                        if norm_op == "<<<" {
+                            let sh = u32::try_from(b).ok()?;
                             if au == 0 || sh == 0 {
                                 Some(OmegaVal::Int(a))
                             } else if sh >= 127 || (au >> (127 - sh)) != 0 {
@@ -1380,38 +1576,44 @@ fn eval_omega_ast(
                             } else {
                                 Some(OmegaVal::Int((au << sh) as i128))
                             }
-                        } else if sh >= 128 {
+                        } else if b >= 128 {
                             Some(OmegaVal::Int(0))
                         } else {
-                            Some(OmegaVal::Int((au >> sh) as i128))
+                            Some(OmegaVal::Int((au >> (b as u32)) as i128))
                         }
                     }
                     OmegaParamDom::Int => None,
                     OmegaParamDom::BitVec(_) => {
+                        if b < 0 {
+                            return None;
+                        }
                         let w_mask = if dom_width >= 64 {
                             u64::MAX
                         } else {
                             (1u64 << dom_width) - 1
                         };
-                        let (au, bu) = ((a as u64) & w_mask, b.max(0) as u64);
-                        let s = if bu >= dom_width as u64 {
+                        let au = (a as u64) & w_mask;
+                        let s = if b >= dom_width as i128 {
                             0
-                        } else if op == "<<<" {
-                            au.wrapping_shl(bu as u32)
+                        } else if norm_op == "<<<" {
+                            au.wrapping_shl(b as u32)
                         } else {
-                            au.wrapping_shr(bu as u32)
+                            au.wrapping_shr(b as u32)
                         };
                         mask_dom(s as i128).map(OmegaVal::Int)
                     }
                     OmegaParamDom::UInt(_) => {
+                        if b < 0 {
+                            return None;
+                        }
                         let w_mask = if dom_width >= 64 {
                             u64::MAX
                         } else {
                             (1u64 << dom_width) - 1
                         };
-                        let (au, bu) = ((a as u64) & w_mask, b.max(0) as u64);
-                        let sh = (bu % (dom_width as u64)) as u32;
-                        let s = if op == "<<<" {
+                        let au = (a as u64) & w_mask;
+                        let sh = ((b as u128) % (dom_width as u128)) as u32;
+                        let s = if norm_op == "<<<" {
                             au.wrapping_shl(sh)
                         } else {
                             au.wrapping_shr(sh)
@@ -1422,7 +1624,8 @@ fn eval_omega_ast(
                 _ => None,
             }
         }
-    }
+    };
+    raw.and_then(wrap_out)
 }
 
 struct ParsedOmegaGoal {
@@ -1437,7 +1640,10 @@ struct ParsedOmegaGoal {
 fn omega_ast_occurs(ast: &OmegaAst, var_name: &str) -> bool {
     match ast {
         OmegaAst::Var(v) => v == var_name,
-        OmegaAst::Lit(_) | OmegaAst::BoolLit(_) => false,
+        OmegaAst::Lit(_)
+        | OmegaAst::BoolLit(_)
+        | OmegaAst::TypedBitVecZero
+        | OmegaAst::TypedBitVecOne => false,
         OmegaAst::Unary(_, inner) => omega_ast_occurs(inner, var_name),
         OmegaAst::Binary(_, l, r) => omega_ast_occurs(l, var_name) || omega_ast_occurs(r, var_name),
     }
@@ -1446,7 +1652,11 @@ fn omega_ast_occurs(ast: &OmegaAst, var_name: &str) -> bool {
 fn omega_ast_subst(ast: &OmegaAst, var_name: &str, replacement: &OmegaAst) -> OmegaAst {
     match ast {
         OmegaAst::Var(v) if v == var_name => replacement.clone(),
-        OmegaAst::Var(_) | OmegaAst::Lit(_) | OmegaAst::BoolLit(_) => ast.clone(),
+        OmegaAst::Var(_)
+        | OmegaAst::Lit(_)
+        | OmegaAst::BoolLit(_)
+        | OmegaAst::TypedBitVecZero
+        | OmegaAst::TypedBitVecOne => ast.clone(),
         OmegaAst::Unary(op, inner) => OmegaAst::Unary(
             op.clone(),
             Box::new(omega_ast_subst(inner, var_name, replacement)),
@@ -3550,7 +3760,7 @@ impl TpuGuidedTacticSynthAccel {
                     } else {
                         AcceleratorCertificate::CounterexampleFound {
                             witness_summary: format!(
-                                "[TPU-v5e-XLA certified] ground proposition `{}` evaluates to false",
+                                "[TPU-v5e-XLA uncertified] ground proposition `{}` evaluates to false",
                                 goal.concl_str
                             ),
                             suggested_hypothesis: None,
@@ -5477,5 +5687,61 @@ mod tests {
                 sd
             );
         }
+    }
+
+    #[test]
+    fn test_simd_omega_fastcheck_bitvec_shift_counts_and_precedence() {
+        let accel = SimdOmegaFastAccel;
+        let run = |name: &str, stmt: &str, body: &str| {
+            accel.try_accelerate(&AcceleratorInput {
+                decl_name: name.into(),
+                stmt_src: stmt.into(),
+                body_src: body.into(),
+                imports_csv: String::new(),
+                available_constants: vec![],
+                budget_ms: 5000,
+            })
+        };
+
+        assert_eq!(
+            run(
+                "bv8_shl_256_valid",
+                "(x : BitVec 8) : (x <<< 256) = 0",
+                "by bv_decide",
+            ),
+            None
+        );
+        assert!(matches!(
+            run(
+                "bv8_shl_8_false",
+                "(x : BitVec 8) : (x <<< 8) = x",
+                "by bv_decide",
+            ),
+            Some(AcceleratorCertificate::CounterexampleFound { .. })
+        ));
+        assert_eq!(
+            run(
+                "bv8_lit_chain_valid",
+                "(x : BitVec 8) (h : x = 128) : ((1 <<< 8) >>> 1) = x",
+                "by bv_decide",
+            ),
+            None
+        );
+        assert_eq!(
+            run(
+                "bv8_add_lit_shift_valid",
+                "(x : BitVec 8) (h : x = 0) : ((1 + (1 <<< 8)) / 2) = x",
+                "by bv_decide",
+            ),
+            None
+        );
+        assert_eq!(
+            run(
+                "u8_lit_shift_rejected",
+                "(u : UInt8) : (1 <<< 8) = u",
+                "by bv_decide",
+            ),
+            None
+        );
     }
 }

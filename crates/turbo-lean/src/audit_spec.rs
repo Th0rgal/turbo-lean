@@ -149,10 +149,46 @@ fn strip_audit_comments(src: &str) -> String {
     String::from_utf8(out).expect("masking comments preserves UTF-8")
 }
 
+pub(super) fn decl_matches_requested_target(
+    decl_name: &str,
+    qualified_name: &str,
+    target: &str,
+) -> bool {
+    let target = target.trim();
+    if let Some(root_target) = target.strip_prefix("_root_.") {
+        return qualified_name == root_target;
+    }
+    qualified_name == target
+        || (!target.contains('.')
+            && (decl_name == target || qualified_name.ends_with(&format!(".{}", target))))
+}
+
+pub(super) fn select_target_decl_unambiguously(
+    decls: Vec<ExtractedDecl>,
+    target_name: Option<&str>,
+) -> Option<ExtractedDecl> {
+    match target_name.map(str::trim) {
+        Some(t) if !t.is_empty() && t != "auto" => {
+            let mut matches: Vec<ExtractedDecl> = decls
+                .into_iter()
+                .filter(|d| decl_matches_requested_target(&d.name, &d.qualified_name, t))
+                .collect();
+            (matches.len() == 1).then(|| matches.swap_remove(0))
+        }
+        _ => decls.into_iter().next(),
+    }
+}
+
 pub(super) fn extract_all_lean_theorems(
     clean_src: &str,
     target_name: Option<&str>,
 ) -> Vec<ExtractedDecl> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum LexScopeKind {
+        Namespace,
+        Section,
+        Mutual,
+    }
     let clean_src = strip_audit_comments(clean_src);
     let chars: Vec<char> = clean_src.chars().collect();
     let byte_offsets: Vec<usize> = clean_src.char_indices().map(|(offset, _)| offset).collect();
@@ -160,9 +196,103 @@ pub(super) fn extract_all_lean_theorems(
         skip_lean_lexeme(&clean_src, byte_offsets[i])
             .map(|span| byte_offsets.partition_point(|offset| *offset < span.end))
     };
+    let is_line_command_head = |pos: usize| -> bool {
+        let mut p = pos;
+        while p > 0 && chars[p - 1] != '\n' {
+            p -= 1;
+        }
+        let mut cur = p;
+        while cur < pos {
+            while cur < pos && chars[cur].is_whitespace() {
+                cur += 1;
+            }
+            if cur >= pos {
+                return true;
+            }
+            if cur + 1 < pos && chars[cur] == '@' && chars[cur + 1] == '[' {
+                let mut depth = 1usize;
+                cur += 2;
+                while cur < pos && depth > 0 {
+                    if let Some(end) = skip_at(cur) {
+                        cur = end;
+                        continue;
+                    }
+                    if chars[cur] == '[' {
+                        depth += 1;
+                    } else if chars[cur] == ']' {
+                        depth -= 1;
+                    }
+                    cur += 1;
+                }
+                continue;
+            }
+            if is_ident_start(chars[cur]) {
+                let ws = cur;
+                while cur < pos && is_ident_continue(chars[cur]) {
+                    cur += 1;
+                }
+                let kw: String = chars[ws..cur].iter().collect();
+                if matches!(
+                    kw.as_str(),
+                    "noncomputable"
+                        | "private"
+                        | "protected"
+                        | "scoped"
+                        | "local"
+                        | "unsafe"
+                        | "partial"
+                        | "nonrec"
+                        | "public"
+                        | "meta"
+                ) {
+                    continue;
+                }
+                if matches!(
+                    kw.as_str(),
+                    "set_option" | "open" | "variable" | "universe" | "include" | "omit"
+                ) {
+                    let mut found_in = false;
+                    while cur < pos {
+                        if let Some(end) = skip_at(cur) {
+                            cur = end;
+                            continue;
+                        }
+                        if is_ident_start(chars[cur]) {
+                            let is = cur;
+                            while cur < pos && is_ident_continue(chars[cur]) {
+                                cur += 1;
+                            }
+                            if chars[is..cur] == ['i', 'n'] {
+                                found_in = true;
+                                break;
+                            }
+                        } else {
+                            cur += 1;
+                        }
+                    }
+                    if found_in {
+                        continue;
+                    }
+                }
+            }
+            return false;
+        }
+        true
+    };
+    let read_dotted_ident = |mut idx: usize, limit: usize| -> (String, usize) {
+        while idx < limit && (chars[idx] == ' ' || chars[idx] == '\t') {
+            idx += 1;
+        }
+        let s = idx;
+        while idx < limit && (is_ident_continue(chars[idx]) || chars[idx] == '.') {
+            idx += 1;
+        }
+        (chars[s..idx].iter().collect(), idx)
+    };
     let n = chars.len();
     let mut i = 0;
-    let mut out = Vec::new();
+    let mut scope_stack: Vec<(LexScopeKind, String)> = Vec::new();
+    let mut all_decls: Vec<ExtractedDecl> = Vec::new();
 
     while i < n {
         if let Some(end) = skip_at(i) {
@@ -171,11 +301,63 @@ pub(super) fn extract_all_lean_theorems(
         }
         if is_ident_start(chars[i]) {
             let start = i;
+            let prev_is_dot_or_guillemet =
+                start > 0 && matches!(chars[start - 1], '.' | '«');
             while i < n && is_ident_continue(chars[i]) {
                 i += 1;
             }
+            if prev_is_dot_or_guillemet {
+                continue;
+            }
             let word: String = chars[start..i].iter().collect();
-            if word == "theorem" || word == "lemma" {
+            if is_line_command_head(start) {
+                match word.as_str() {
+                    "namespace" => {
+                        let (ns_name, next_i) = read_dotted_ident(i, n);
+                        i = next_i;
+                        for seg in ns_name.split('.').filter(|s| !s.is_empty()) {
+                            scope_stack.push((LexScopeKind::Namespace, seg.to_string()));
+                        }
+                        continue;
+                    }
+                    "section" => {
+                        let (sec_name, next_i) = read_dotted_ident(i, n);
+                        i = next_i;
+                        if sec_name.is_empty() {
+                            scope_stack.push((LexScopeKind::Section, String::new()));
+                        } else {
+                            for seg in sec_name.split('.').filter(|s| !s.is_empty()) {
+                                scope_stack.push((LexScopeKind::Section, seg.to_string()));
+                            }
+                        }
+                        continue;
+                    }
+                    "mutual" => {
+                        scope_stack.push((LexScopeKind::Mutual, String::new()));
+                        continue;
+                    }
+                    "end" => {
+                        let (end_name, next_i) = read_dotted_ident(i, n);
+                        i = next_i;
+                        if end_name.is_empty() {
+                            scope_stack.pop();
+                        } else {
+                            for seg in end_name.split('.').filter(|s| !s.is_empty()).rev() {
+                                if let Some(pos) =
+                                    scope_stack.iter().rposition(|(_, name)| name == seg)
+                                {
+                                    scope_stack.truncate(pos);
+                                } else {
+                                    scope_stack.pop();
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            if (word == "theorem" || word == "lemma") && is_line_command_head(start) {
                 while i < n && chars[i].is_whitespace() {
                     i += 1;
                 }
@@ -186,17 +368,23 @@ pub(super) fn extract_all_lean_theorems(
                 if i == name_start {
                     continue;
                 }
-                let decl_name: String = chars[name_start..i].iter().collect();
-                let matches_filter = match target_name {
-                    Some(t) if !t.is_empty() && t != "auto" => {
-                        decl_name == t
-                            || decl_name.ends_with(&format!(".{}", t))
-                            || t.ends_with(&format!(".{}", decl_name))
-                    }
-                    _ => true,
-                };
+                let raw_decl_name: String = chars[name_start..i].iter().collect();
+                let (decl_name, qualified_name) =
+                    if let Some(root_stripped) = raw_decl_name.strip_prefix("_root_.") {
+                        (root_stripped.to_string(), root_stripped.to_string())
+                    } else {
+                        let q = scope_stack
+                            .iter()
+                            .filter(|(k, _)| *k == LexScopeKind::Namespace)
+                            .map(|(_, s)| s.as_str())
+                            .chain(std::iter::once(raw_decl_name.as_str()))
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        (raw_decl_name, q)
+                    };
 
                 let mut binders = Vec::new();
+                let mut instance_binders = Vec::new();
                 let mut found_colon = false;
                 while i < n {
                     while i < n && chars[i].is_whitespace() {
@@ -252,6 +440,11 @@ pub(super) fn extract_all_lean_theorems(
                                     binders.push((var_names, ty_part.trim().to_string()));
                                 }
                             }
+                        } else {
+                            let inst_ty = split_top_level_colon(&inner)
+                                .map(|(_, ty)| ty.trim())
+                                .unwrap_or_else(|| inner.trim());
+                            instance_binders.push(inst_ty.to_string());
                         }
                     } else {
                         i += 1;
@@ -266,6 +459,7 @@ pub(super) fn extract_all_lean_theorems(
                 let mut paren_depth = 0usize;
                 let mut angle_depth = 0usize;
                 let mut pending_let_assign = false;
+                let mut in_stmt_match = false;
                 let mut stmt_end = n;
                 while i < n {
                     if let Some(end) = skip_at(i) {
@@ -281,6 +475,20 @@ pub(super) fn extract_all_lean_theorems(
                         angle_depth += 1;
                     } else if c == '⟩' {
                         angle_depth = angle_depth.saturating_sub(1);
+                    } else if paren_depth == 0
+                        && angle_depth == 0
+                        && c == 'm'
+                        && i + 5 < n
+                        && chars[i + 1] == 'a'
+                        && chars[i + 2] == 't'
+                        && chars[i + 3] == 'c'
+                        && chars[i + 4] == 'h'
+                        && chars[i + 5].is_whitespace()
+                        && (i == stmt_start || !is_ident_continue(chars[i - 1]))
+                    {
+                        in_stmt_match = true;
+                        i += 5;
+                        continue;
                     } else if paren_depth == 0
                         && angle_depth == 0
                         && c == 'l'
@@ -306,7 +514,12 @@ pub(super) fn extract_all_lean_theorems(
                         }
                         stmt_end = i;
                         break;
-                    } else if paren_depth == 0 && angle_depth == 0 && c == '|' && i > stmt_start {
+                    } else if paren_depth == 0
+                        && angle_depth == 0
+                        && !in_stmt_match
+                        && c == '|'
+                        && i > stmt_start
+                    {
                         // Pattern-matching theorem without `:=`
                         let prev_nl = chars[stmt_start..i].contains(&'\n');
                         if prev_nl {
@@ -316,26 +529,30 @@ pub(super) fn extract_all_lean_theorems(
                     }
                     i += 1;
                 }
-                if matches_filter {
-                    let prop_str: String = chars[stmt_start..stmt_end].iter().collect();
-                    let trimmed = inline_stmt_let_bindings(prop_str.trim());
-                    if !trimmed.is_empty() {
-                        out.push(ExtractedDecl {
-                            name: decl_name,
-                            binders,
-                            prop_str: trimmed,
-                        });
-                        if matches!(target_name, Some(t) if !t.is_empty() && t != "auto") {
-                            break;
-                        }
-                    }
+                let prop_str: String = chars[stmt_start..stmt_end].iter().collect();
+                let trimmed = inline_stmt_let_bindings(prop_str.trim());
+                if !trimmed.is_empty() {
+                    all_decls.push(ExtractedDecl {
+                        name: decl_name,
+                        qualified_name,
+                        binders,
+                        instance_binders,
+                        prop_str: trimmed,
+                    });
                 }
             }
         } else {
             i += 1;
         }
     }
-    out
+    match target_name.map(str::trim) {
+        Some(t) if !t.is_empty() && t != "auto" => {
+            select_target_decl_unambiguously(all_decls, Some(t))
+                .into_iter()
+                .collect()
+        }
+        _ => all_decls,
+    }
 }
 
 pub(super) fn split_at_first_top_level_assign(s: &str) -> Option<(&str, &str)> {
@@ -1969,7 +2186,7 @@ pub(super) fn extract_decls_fast(src: &str, decl_filter: Option<&str>) -> Vec<Ex
 }
 
 /// Schema version for the Blake3 content-addressed `audit-spec` per-file JSON cache.
-pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 12;
+pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 13;
 
 static AUDIT_SPEC_CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
@@ -2880,5 +3097,37 @@ theorem actualToo : True := by trivial
         ] {
             assert!(extract_all_lean_theorems(src, None).is_empty());
         }
+    }
+
+    #[test]
+    fn namespace_qualified_and_ambiguous_target_selection_fail_closed() {
+        let src = "\
+theorem a : False := by sorry
+namespace N
+  section S
+    theorem a : True := by trivial
+  end S
+  namespace M
+    theorem b : True := by trivial
+  end M
+end N
+";
+        let na = extract_all_lean_theorems(src, Some("N.a"));
+        assert_eq!(na.len(), 1);
+        assert_eq!(na[0].qualified_name, "N.a");
+        assert_eq!(na[0].prop_str, "True");
+
+        let root_a = extract_all_lean_theorems(src, Some("_root_.a"));
+        assert_eq!(root_a.len(), 1);
+        assert_eq!(root_a[0].qualified_name, "a");
+        assert_eq!(root_a[0].prop_str, "False");
+
+        assert!(extract_all_lean_theorems(src, Some("a")).is_empty());
+        assert!(extract_all_lean_theorems(src, Some("M.b")).is_empty());
+
+        let nmb = extract_all_lean_theorems(src, Some("N.M.b"));
+        assert_eq!(nmb.len(), 1);
+        assert_eq!(nmb[0].qualified_name, "N.M.b");
+        assert_eq!(extract_all_lean_theorems(src, Some("b")).len(), 1);
     }
 }

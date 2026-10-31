@@ -832,21 +832,10 @@ pub fn auto_fastcheck_batch(
     let mut first_witness: Option<String> = None;
     let mut first_hypothesis: Option<String> = None;
     let mut first_failing_decl: Option<String> = None;
+    let mut first_certified = false;
 
     for (decl_name, stmt_src) in items {
-        let formatted_src = if stmt_src.trim_start().starts_with("theorem ")
-            || stmt_src.trim_start().starts_with("lemma ")
-            || stmt_src.contains("\ntheorem ")
-        {
-            stmt_src.clone()
-        } else if stmt_src.trim_start().starts_with('(')
-            || stmt_src.trim_start().starts_with('{')
-            || stmt_src.trim_start().starts_with(':')
-        {
-            format!("theorem {} {} := by sorry", decl_name, stmt_src.trim())
-        } else {
-            format!("theorem {} : {} := by sorry", decl_name, stmt_src.trim())
-        };
+        let formatted_src = stmt_src.clone();
 
         let combined_lower = format!("{} {}", decl_name, stmt_src).to_ascii_lowercase();
         let cbv_offload_recommended = combined_lower.contains("cbv")
@@ -864,12 +853,28 @@ pub fn auto_fastcheck_batch(
 
         if let Some((witness, suggested_hyp)) = cex_opt {
             total_violations += 1;
+            let (locally_recertified, _, cert_details) =
+                crate::gpu_fastcheck::certify_statement_witness(
+                    decl_name,
+                    &formatted_src,
+                    &witness,
+                );
             if first_witness.is_none() {
                 first_witness = Some(witness.clone());
                 first_hypothesis = suggested_hyp.clone();
                 first_failing_decl = Some(decl_name.clone());
+                first_certified = locally_recertified;
             }
-            let triage_json = crate::c_abi::build_counterexample_triage_json(None, None, None);
+            let w_pair = crate::gpu_fastcheck::witness_pair_from_summary(&witness);
+            let (lhs_opt, rhs_opt) = w_pair
+                .as_ref()
+                .map(|(l, r)| (Some(l.as_str()), Some(r.as_str())))
+                .unwrap_or((None, None));
+            let triage_json = crate::c_abi::build_counterexample_triage_json(
+                lhs_opt,
+                rhs_opt,
+                locally_recertified.then_some((suggested_hyp.is_some(), false)),
+            );
             let r_code = lean_cabi_matryoshka_tier_router(50, 120, 380, 0, 1, 0);
             per_decl_results.push(serde_json::json!({
                 "decl": decl_name,
@@ -884,8 +889,9 @@ pub fn auto_fastcheck_batch(
                 "router_action": matryoshka_router_code_to_action(r_code),
                 "cbv_offload_recommended": cbv_offload_recommended,
                 "winning_tactic_hint": "skip_falsified",
-                "locally_recertified": true,
-                "false_positives": 0,
+                "locally_recertified": locally_recertified,
+                "certification": cert_details.get("certification").cloned().unwrap_or(serde_json::json!("unavailable")),
+                "false_positives": u8::from(!locally_recertified),
             }));
         } else {
             let winning_tactic_hint = if cbv_offload_recommended {
@@ -909,7 +915,8 @@ pub fn auto_fastcheck_batch(
                 "router_action": matryoshka_router_code_to_action(r_code),
                 "cbv_offload_recommended": cbv_offload_recommended,
                 "winning_tactic_hint": winning_tactic_hint,
-                "locally_recertified": true,
+                "locally_recertified": false,
+                "certification": "unavailable",
                 "false_positives": 0,
             }));
         }
@@ -934,9 +941,19 @@ pub fn auto_fastcheck_batch(
         .clone()
         .or_else(|| items.first().map(|(d, _)| d.clone()))
         .unwrap_or_else(|| "fastcheck_batch".to_string());
-    let top_triage = first_witness
-        .as_deref()
-        .map(|_| crate::c_abi::build_counterexample_triage_json(None, None, None));
+    let batch_certified = first_witness.is_some() && first_certified;
+    let top_triage = first_witness.as_deref().map(|w| {
+        let w_pair = crate::gpu_fastcheck::witness_pair_from_summary(w);
+        let (lhs_opt, rhs_opt) = w_pair
+            .as_ref()
+            .map(|(l, r)| (Some(l.as_str()), Some(r.as_str())))
+            .unwrap_or((None, None));
+        crate::c_abi::build_counterexample_triage_json(
+            lhs_opt,
+            rhs_opt,
+            batch_certified.then_some((first_hypothesis.is_some(), false)),
+        )
+    });
 
     Ok(serde_json::json!({
         "status": if verified { "ok" } else { "counterexample_rejected" },
@@ -959,8 +976,8 @@ pub fn auto_fastcheck_batch(
         "witness_summary": first_witness,
         "suggested_hypothesis": first_hypothesis,
         "counterexample_triage": top_triage,
-        "lean_native_certified": true,
-        "false_positives": 0,
+        "lean_native_certified": batch_certified,
+        "false_positives": u64::from(first_witness.is_some() && !batch_certified),
         "speculate_forest_endpoint": "/v1/speculate-forest",
         "tpu_speculate_forest_endpoint": "/v1/tpu-speculate-forest",
         "trm_slice": "tpu_v6e_s4_bf16 (d=128, h=256)",
@@ -1324,11 +1341,24 @@ mod tests {
         .expect("auto_fastcheck_decl should succeed");
         assert_eq!(buggy_res["ok"], false);
         assert_eq!(buggy_res["status"], "counterexample_rejected");
+        assert_eq!(buggy_res["lean_native_certified"], true);
         assert_eq!(buggy_res["false_positives"], 0);
+        assert_eq!(buggy_res["results"][0]["locally_recertified"], true);
+        assert_eq!(buggy_res["results"][0]["certification"], "eval");
         assert!(buggy_res["witness_summary"]
             .as_str()
             .unwrap_or("")
             .contains("sample#"));
+
+        let valid_batch_res_check = [
+            ("valid_de_morgan".to_string(),
+             "(a b : Word256) : Word256.bitNot (Word256.bitAnd a b) = Word256.bitOr (Word256.bitNot a) (Word256.bitNot b)".to_string()),
+        ];
+        let valid_single = auto_fastcheck_batch(&valid_batch_res_check, "auto")
+            .expect("valid single batch should succeed");
+        assert_eq!(valid_single["lean_native_certified"], false);
+        assert_eq!(valid_single["results"][0]["locally_recertified"], false);
+        assert_eq!(valid_single["results"][0]["certification"], "unavailable");
 
         let batch_items = vec![
             (

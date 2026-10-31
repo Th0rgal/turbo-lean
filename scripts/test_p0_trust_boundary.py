@@ -380,6 +380,54 @@ class TestP0TrustBoundary(unittest.TestCase):
         for row in rows:
             self.assertFalse(row["ok"], row)
 
+        # `eval-cex` never certifies raw unequal pairs or unbound witnesses; it certifies ONLY
+        # when `decl_wire` + parameter bindings satisfy preconditions and evaluate to false.
+        buggy_fc_wire = (
+            "LNIR_WIRE_V1|46617374436865636b|1|"
+            "D_decl|62756767795f6c74|A_L3|1|2|0|78|0|T_i64|1|79|0|T_i64|T_i1|"
+            "C_let|2|T_i1|E_scalar|S_bin|B_lt|S_var|0|S_u64|10|"
+            "C_let|3|T_i1|E_scalar|S_bool|1|"
+            "C_ite|2|"
+            "C_let|4|T_i1|E_scalar|S_bin|B_lt|S_var|0|S_var|1|C_ret|4|"
+            "C_ret|3"
+        )
+        eval_cex_requests = [
+            {"id": 1, "method": "eval-cex"},
+            {"id": 2, "method": "eval-cex", "lhs": "0x1", "rhs": "0x0"},
+            {"id": 3, "method": "eval-cex", "lhs": "0x5", "rhs": "0x5"},
+            {"id": 4, "method": "eval-cex", "decl_wire": buggy_fc_wire, "x": "5"},
+            {"id": 5, "method": "eval-cex", "decl_wire": buggy_fc_wire, "x": "20", "y": "0"},
+            {"id": 6, "method": "eval-cex", "decl_wire": buggy_fc_wire, "x": "5", "y": "8"},
+            {"id": 7, "method": "eval-cex", "decl_wire": buggy_fc_wire, "bindings": {"x": "5", "y": "5"}},
+            {"id": 8, "method": "eval-cex", "decl_wire": unsupported, "x": "5", "y": "5"},
+            {"id": 9, "method": "eval-cex", "decl_wire": 42},
+        ]
+        ec_res = subprocess.run([str(CORE_BIN), "worker"],
+                                input="".join(json.dumps(r) + "\n" for r in eval_cex_requests),
+                                check=True, capture_output=True, text=True)
+        ec_rows = [json.loads(line) for line in ec_res.stdout.splitlines()]
+        self.assertEqual(len(ec_rows), len(eval_cex_requests))
+        for idx, expected_reason in (
+            (0, "missing_witness"),
+            (1, "statement_required"),
+            (2, "lhs_eq_rhs"),
+            (3, "witness_not_bound"),
+            (4, "precondition_failed"),
+            (5, "not_a_counterexample"),
+        ):
+            self.assertTrue(ec_rows[idx]["ok"], ec_rows[idx])
+            self.assertFalse(ec_rows[idx]["result"]["certified"], ec_rows[idx])
+            self.assertEqual(ec_rows[idx]["result"]["certification"], "unavailable", ec_rows[idx])
+            self.assertEqual(ec_rows[idx]["result"]["reason"], expected_reason, ec_rows[idx])
+            self.assertEqual(ec_rows[idx]["result"]["falsePositives"], 1, ec_rows[idx])
+        self.assertTrue(ec_rows[6]["ok"], ec_rows[6])
+        self.assertTrue(ec_rows[6]["result"]["certified"], ec_rows[6])
+        self.assertEqual(ec_rows[6]["result"]["certification"], "evalCode", ec_rows[6])
+        self.assertIsNone(ec_rows[6]["result"]["reason"], ec_rows[6])
+        self.assertEqual(ec_rows[6]["result"]["falsePositives"], 0, ec_rows[6])
+        self.assertFalse(ec_rows[7]["ok"], ec_rows[7])
+        self.assertFalse(ec_rows[8]["ok"], ec_rows[8])
+
     def test_worker_missing_compile_input_never_uses_benchmark(self) -> None:
         all_methods = (
             "compile-llvm", "compile-ptx", "compile-metal", "compile-mlir",
