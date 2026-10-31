@@ -867,7 +867,24 @@ def isWhitelistedInitExecBridge (env : Environment) (modIdx : ModuleIdx) (declNa
       | _, _ => false
     | none => false
 
-def collectForbiddenAxiomsByDecl (env : Environment) (roots : Array Name) (patterns : List String := []) : Std.HashMap Name (Array Name) := Id.run do
+/-- A prefix stub as the host's shard builder emits it: `theorem n : T := sorry`, elaborated to the
+    explicit (non-synthetic) `sorryAx (Name → T) false label` (or legacy `sorryAx T false`).
+    Elaboration errors and tactics such as `admitGoal` yield synthetic sorries and never qualify. -/
+def isExplicitSorryStub (cinfo : ConstantInfo) : Bool :=
+  match cinfo with
+  | .thmInfo v =>
+    let args := v.value.getAppArgs
+    let tyOk := fun (e : Expr) => e == v.type || match e with
+      | .forallE _ d b _ => d.isConstOf ``Lean.Name && b == v.type
+      | _ => false
+    v.value.getAppFn.isConstOf (Name.mkSimple ("sor" ++ "ryAx")) && args.size ≥ 2 &&
+      args[1]!.isConstOf ``Bool.false && tyOk args[0]!
+  | _ => false
+
+/-- Forbidden axioms reachable from each root; the values of `opaqueStubs` (validated prefix stubs,
+    whose proofs are verified separately) are not traversed. -/
+def collectForbiddenAxiomsByDecl (env : Environment) (roots : Array Name) (patterns : List String := [])
+    (opaqueStubs : Std.HashSet Name := {}) : Std.HashMap Name (Array Name) := Id.run do
   let mut memo : Std.HashMap Name (Array Name) := {}
   let mut visiting : Std.HashMap Name Bool := {}
   let mut stack : Array (Name × Bool) := #[]
@@ -886,7 +903,9 @@ def collectForbiddenAxiomsByDecl (env : Environment) (roots : Array Name) (patte
       let deps : Array Name := match cinfo with
         | .axiomInfo _ => #[]
         | .defnInfo v => v.type.getUsedConstants ++ v.value.getUsedConstants
-        | .thmInfo v => v.type.getUsedConstants ++ v.value.getUsedConstants
+        | .thmInfo v =>
+          if opaqueStubs.contains curr then v.type.getUsedConstants
+          else v.type.getUsedConstants ++ v.value.getUsedConstants
         | .opaqueInfo v => v.type.getUsedConstants ++ v.value.getUsedConstants
         | .quotInfo _ => #[]
         | .ctorInfo v => v.type.getUsedConstants
@@ -993,9 +1012,24 @@ def isPinnedFfiOpaque (env : Environment) (ffiAllow : Array (Name × Name × Str
         (Lean.getExternNameFor env `c cinfo.name).any fun sym => ffiAllow.contains (m, cinfo.name, sym)
   | _ => false
 
+/-- Validated prefix stubs of the audited modules: theorems named in `stubOk` (exact full name)
+    whose kernel value is an explicit `sorry` (`isExplicitSorryStub`). -/
+def collectStubDecls (env : Environment) (targets : Array (String × Name)) (stubOk : Array String) :
+    Std.HashSet Name := Id.run do
+  let mut out : Std.HashSet Name := {}
+  if stubOk.isEmpty then return out
+  for (_, nm) in targets do
+    if let some modIdx := env.getModuleIdx? nm then
+      if h : modIdx.toNat < env.header.moduleData.size then
+        for cinfo in env.header.moduleData[modIdx.toNat].constants do
+          if stubOk.contains (cinfo.name.toString (escape := false)) && isExplicitSorryStub cinfo then
+            out := out.insert cinfo.name
+  return out
+
 def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Name))
     (ffiAllow : Array (Name × Name × String) := #[])
-    (patterns : List String := []) (csimpPatterns : List String := []) : List String := Id.run do
+    (patterns : List String := []) (csimpPatterns : List String := [])
+    (stubs : Std.HashSet Name := {}) : List String := Id.run do
   let csimpAllowed := fun name : Name => csimpPatterns.any (globMatch ·.toList name.toString.toList)
   let unsfTag := "un" ++ "safe"
   let mut violations : List String := []
@@ -1006,7 +1040,7 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
       if h : modIdx.toNat < env.header.moduleData.size then
         for cinfo in env.header.moduleData[modIdx.toNat].constants do
           allRoots := allRoots.push cinfo.name
-  let axMap := collectForbiddenAxiomsByDecl env allRoots patterns
+  let axMap := collectForbiddenAxiomsByDecl env allRoots patterns stubs
   for (rawStr, nm) in targets do
     match env.getModuleIdx? nm with
     | none =>
@@ -1142,6 +1176,37 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
         violations := violations ++ checkCSimpEntry entry
   return violations
 
+/-- Non-stub theorems of the audited modules, read from the kernel environment (never from
+    elaboration output), so the host can confirm every audited target was actually declared. -/
+def collectModuleTheorems (env : Environment) (targets : Array (String × Name))
+    (stubs : Std.HashSet Name) : Array String := Id.run do
+  let mut out : Array String := #[]
+  for (_, nm) in targets do
+    if let some modIdx := env.getModuleIdx? nm then
+      if h : modIdx.toNat < env.header.moduleData.size then
+        for cinfo in env.header.moduleData[modIdx.toNat].constants do
+          if cinfo.isTheorem && !stubs.contains cinfo.name then
+            out := out.push (cinfo.name.toString (escape := false))
+  return out
+
+/-- Audit a single compiled shard module: like `auditModuleSlice`, but exempts validated prefix
+    stubs named in `stubOk` and also returns the module's non-stub theorems. -/
+def auditShardModule (target : String × Name) (ffiAllow : Array (Name × Name × String))
+    (stubOk : Array String) : IO (List String × Array String) := do
+  let patterns := (((← IO.getEnv "TURBO_LEAN_ALLOWED_AXIOMS").getD "").splitOn ",").filterMap fun p =>
+    let t := p.trimAscii.toString
+    if t.isEmpty then none else some t
+  let csimpPatterns := (((← IO.getEnv "TURBO_LEAN_ALLOWED_CSIMP").getD "").splitOn ",").filterMap fun p =>
+    let t := p.trimAscii.toString
+    if t.isEmpty then none else some t
+  try
+    let env ← Lean.importModules #[{ module := target.2, importAll := true }] {} 0 #[] true false .private
+    let stubs := collectStubDecls env #[target] stubOk
+    return (auditImportedModulesInEnv env #[target] ffiAllow patterns csimpPatterns stubs,
+      collectModuleTheorems env #[target] stubs)
+  catch e =>
+    return ([s!"[TurboLean.KernelGate] failed to import `{target.1}` for audit: {e}"], #[])
+
 partial def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name × Name × String) := #[]) : IO (List String) := do
   if slice.isEmpty then
     return []
@@ -1246,15 +1311,33 @@ def main (args : List String) : IO Unit := do
   match args with
   | "--audit-modules" :: modArgs =>
     let stdout ← IO.getStdout
-    let (ffiArgs, mods) := modArgs.partition (·.startsWith "--ffi-allow=")
+    let (ffiArgs, rest) := modArgs.partition (·.startsWith "--ffi-allow=")
+    let (stubArgs, rest) := rest.partition (·.startsWith "--stub-ok=")
+    let (shardFlag, mods) := rest.partition (· == "--shard")
     let ffiAllow := ffiArgs.toArray.filterMap fun a =>
       match ((a.drop 12).toString.splitOn "=") with
       | [m, d, sym] => some (TurboLean.ZygoteWorker.parseModuleName m, TurboLean.ZygoteWorker.parseModuleName d, sym)
       | _ => none
-    let (ok, violations) ← TurboLean.ZygoteWorker.auditCompiledModules mods ffiAllow
-    let ok := ok && ffiAllow.size == ffiArgs.length
     let audited := mods.filter (!·.trimAscii.isEmpty)
-    stdout.putStrLn s!"\{\"ok\":{ok},\"audited\":[{TurboLean.ZygoteWorker.jsonStrList audited}],\"violations\":[{TurboLean.ZygoteWorker.jsonStrList violations}]}"
+    -- `--shard` audits exactly one compiled shard module, exempting validated `--stub-ok=` prefix
+    -- stubs and reporting its theorems; stubs are never exempt in whole-module audits.
+    let (ok, violations, decls) ← match shardFlag.isEmpty, audited with
+      | true, _ =>
+        if stubArgs.isEmpty then
+          let (ok, vs) ← TurboLean.ZygoteWorker.auditCompiledModules mods ffiAllow
+          pure (ok, vs, none)
+        else pure (false, ["[TurboLean.KernelGate] --stub-ok requires --shard"], none)
+      | false, [m] =>
+        let nm := TurboLean.ZygoteWorker.parseModuleName m.trimAscii.toString
+        let (vs, ds) ← TurboLean.ZygoteWorker.auditShardModule (m.trimAscii.toString, nm) ffiAllow
+          (stubArgs.toArray.map fun a => (a.drop 10).toString)
+        pure (vs.isEmpty && !nm.isAnonymous, vs, some ds)
+      | false, _ => pure (false, ["[TurboLean.KernelGate] --shard audits exactly one module"], none)
+    let ok := ok && ffiAllow.size == ffiArgs.length
+    let declsJson := match decls with
+      | some ds => s!",\"decls\":[{TurboLean.ZygoteWorker.jsonStrList ds.toList}]"
+      | none => ""
+    stdout.putStrLn s!"\{\"ok\":{ok},\"audited\":[{TurboLean.ZygoteWorker.jsonStrList audited}],\"violations\":[{TurboLean.ZygoteWorker.jsonStrList violations}]{declsJson}}"
     stdout.flush
     if !ok then
       IO.Process.exit 1
