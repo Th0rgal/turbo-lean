@@ -1,0 +1,63 @@
+{
+  "review_scope": "Manual current-source review and inspection of retained fixture evidence. Does not certify all datasets, final aggregate report, or non-auxiliary example coverage.",
+  "reviewed_at_utc": "2026-10-31T18:42:49.044928+00:00",
+  "toolchain": "leanprover/lean4:v4.34.1",
+  "toolchain_commit": "5045d0056413266e57c625dcd7c365b10e377c52",
+  "source_sha256": {
+    "Extract.lean": "ddb3a7cffe9610c27c89a5f121930eb12bb3a57721e6a112ca53a268309606db",
+    "hash_rows.py": "4fce4b55b83886ff3217ba5c4705014927fa0e12b0a11bf53e3e326771c46ca0",
+    "Replay.lean": "ca8cb1224c57e3aa5c70036cc8dc48034c4e28540c479c7b04ef093c72cf310a",
+    "clock.c": "1a82acfd142b9de4796df625938be33bd63588c168276c5eee587db969dc7458",
+    "run_experiment.py": "bb6e842d64f0c845f59080432918def5f15ccefb298f113385a641e57bf40728",
+    "report.py": "875d7b6d2a1aaa01291fdb041492fc6eccdf4f189dba88e6c768c8595d175f55",
+    "audit.py": "1296b579ef5ed60f331e2ab425ec3eb3aed58d064cea9f222eaf4843964503f0",
+    "lean_wrap.py": "96fa5e2a4470984896e842599398e46ff75548cd96f88df961460db57eb2ced6",
+    "env.sh": "771ed3b6473c82da55ea5ccfd16aff7d20248f22c41848c1585ffb98433dcc2f",
+    "setup_build.sh": "8152ec1c5e553a4ca1b2b14d807ceb5fc8145cecb319ad45de744627b782c7a8",
+    "fixtures.json": "334d3a3119b6a7a3409ab609febb84721430d0d73d4911f0615ca48ffe727b6d"
+  },
+  "pinned_Lean_Declaration_sha256": "fcb928c1686f0655279a790f92bd61f8c0d6df3be51a5eccaa2880de058e5e24",
+  "source_findings": {
+    "expression_serialization": "All Expr variants have explicit tags and structural fields. Retained Expr objects prevent address-reuse memo errors. Object addresses and Expr.hash are not digest inputs; child SHA-256 values remove DAG allocation/sharing/index dependence.",
+    "interfaces": "Theorem payload is kind, structured Name, ordered level parameters, and type; its dependency set is constants of type. Other kinds serialize every field of the pinned ConstantInfo variants, including values, safety, hints, inductive/constructor/recursor metadata. Dependency closure uses sorted names and dependency-first SCC condensation.",
+    "canonical_names": "Every stored occurrence retains its own IF input. Duplicate printed Name collisions are rejected. Repeated-name dependency bindings are resolved against actual imported env.find? records; production missing dependencies are rejected.",
+    "optimistic_keys": "K includes full declaration payload including theorem proof, dependency IFs, and pinned toolchain. Kernel group K hashes sorted member Name/constant-K pairs. This is an incomplete optimistic key, never used to accept a declaration.",
+    "kernel_replay": "A fresh kernel environment is filled in module import order and declaration dependency order. addDecl is called for safe definitions, unsafe/partial mutual groups, opaque constants, axioms, theorems, inductive groups, and quotient initialization. Generated constructor/recursor metadata must match kernel-generated values. Existing duplicate theorem bodies are checked under a fresh name.",
+    "coverage_and_join": "Every stored constant must map to a measured group. Group CPU is charged once to a representative. Retained raw calls, joined rows, module totals, coverage counts, group K values, repeated-key statistics, and CPU conservation are cross-checked by audit.py.",
+    "cpu_accounting": "Native CLOCK_PROCESS_CPUTIME_ID surrounds each addDecl invocation. Total process CPU includes startup; replay-main and startup CPU are separate. Summed kernel CPU is bounded by replay-main CPU and total process CPU; overhead is total minus summed kernel CPU.",
+    "build_accounting": "Measured builds use the requested memcap/Lake targets. A shared four-slot shim accepts unsupported Lake -j4 and passes -j4 to Lean; later builds set B2C_MAX_ACTIVE=1. Module elapsed excludes semaphore waiting. Whole-process-tree build CPU is tree_cpu_seconds; module CPU and wall elapsed remain separate.",
+    "aggregation": "Primary denominators use actually rebuilt FV modules in C2 through C20; C1 is excluded. Full-cone revisits are separately labeled. Local source/config invalidations and observed IF changes prevent cutoff credit. Reuse excludes inductive/quotient groups and requires a preceding group K. Avoidance mechanisms overlap and are not added.",
+    "recovery": "The interrupted C17 partial replay and its CPU are archived and excluded; the successful dataset contains a fresh full replay. Its original measured build digest is unchanged; resume artifact checks are separately excluded."
+  },
+  "retained_fixture_checks": {
+    "proposition_body_changes_theorem_IF": true,
+    "ordered_levelParams_change_IF": true,
+    "proof_body_preserves_IF": true,
+    "proof_body_changes_K": true,
+    "structural_binder_names_preserved": true,
+    "structural_binder_annotations_preserved": true,
+    "structural_expression_metadata_preserved": true,
+    "structural_syntax_source_info_preserved": true
+  },
+  "retained_fixture_kernel_validation": "required constant fixtures",
+  "retained_repeat_result_sha256": {
+    "fixtures-v3-repeat.json": "334d3a3119b6a7a3409ab609febb84721430d0d73d4911f0615ca48ffe727b6d",
+    "fixtures-v3-repeat2.json": "334d3a3119b6a7a3409ab609febb84721430d0d73d4911f0615ca48ffe727b6d"
+  },
+  "fixture_review_limit": "Retained results and fixture source were inspected here; Lean fixture processes were not rerun during the active measured build.",
+  "known_missing_reuse_key_inputs": [
+    "LEAN_NAT_MAX_SIZE",
+    "module-mode Lean.reduceBool axiomInfo",
+    "unit-like eta through constructor field counts",
+    "implicit Bool/Nat dependencies"
+  ],
+  "cutoff_limit": "Own-constant/direct-import IF cutoff is a diagnostic counterfactual; nonconstant elaborator/environment state and transitive visibility require further modeling.",
+  "memory_limit": "Recorded fallback uses process-tree RSS polling, which can miss short-lived children; no claim of cgroup enforcement.",
+  "remaining_completion_gates": [
+    "All twenty complete measured datasets and per-dataset audits",
+    "Final aggregate metrics independently recomputed from actual rebuilds",
+    "At least three genuine non-auxiliary declarations in every positive requested kind/top-20 bucket",
+    "Source-level manual example review",
+    "Final research-only signed commit/push and default audit.py"
+  ]
+}
