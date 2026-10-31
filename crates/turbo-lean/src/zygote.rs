@@ -2444,11 +2444,13 @@ pub(crate) fn run_audited_lean_shard(
     lean_args: &[String],
     timeout_ms: Option<u64>,
 ) -> Result<std::process::Output> {
+    crate::module_builder::validate_lean_args(lean_args)?;
     let started = std::time::Instant::now();
     let mod_name = format!("TurboAuditedShard_{}_{}", std::process::id(), next_tmp_id());
-    let tmp_dir = store.fast_staging_dir().join(&mod_name);
-    let _ = fs::remove_dir_all(&tmp_dir);
-    fs::create_dir_all(&tmp_dir)?;
+    let staging = store.fast_staging_dir();
+    fs::create_dir_all(&staging)?;
+    let tmp_dir = staging.join(&mod_name);
+    fs::create_dir(&tmp_dir)?;
     struct TmpDirGuard(PathBuf);
     impl Drop for TmpDirGuard {
         fn drop(&mut self) {
@@ -2458,14 +2460,16 @@ pub(crate) fn run_audited_lean_shard(
     let _guard = TmpDirGuard(tmp_dir.clone());
     let lean_file = tmp_dir.join(format!("{}.lean", mod_name));
     fs::write(&lean_file, source)?;
+    let olean_file = tmp_dir.join(format!("{}.olean", mod_name));
     let mut cmd = Command::new(lean_bin);
     cmd.args(crate::module_builder::filter_allowed_lean_args(lean_args))
+        .arg("-Dwarn.sorry=true")
         .arg("-Ddebug.skipKernelTC=false")
-        .arg(&lean_file)
         .arg("-R")
         .arg(&tmp_dir)
+        .arg(&lean_file)
         .arg("-o")
-        .arg(tmp_dir.join(format!("{}.olean", mod_name)))
+        .arg(&olean_file)
         .envs(env_vars);
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
@@ -2478,6 +2482,13 @@ pub(crate) fn run_audited_lean_shard(
     if !out.status.success() {
         return Ok(out);
     }
+
+    let artifact = fs::symlink_metadata(&olean_file)
+        .context("Lean verification produced no `.olean` artifact; refusing verification")?;
+    anyhow::ensure!(
+        artifact.is_file() && artifact.len() > 0,
+        "Lean verification produced no regular, nonempty `.olean` artifact"
+    );
 
     let lean_path = env_vars
         .get("LEAN_PATH")
@@ -2961,7 +2972,11 @@ fn eval_with_zygote_pool_inner(
     batch_fission_override: Option<(String, String, String)>,
     lean_args: &[String],
 ) -> Result<ZygoteEvalReply> {
+    if !eval_mode {
+        crate::splitter::reject_checking_weakening(shard_source)?;
+    }
     let request_started = std::time::Instant::now();
+    crate::module_builder::validate_lean_args(lean_args)?;
     let default_timeout_ms = if eval_mode { 900_000 } else { 30_000 };
     let effective_timeout_ms = timeout_ms.unwrap_or_else(|| {
         std::env::var("TURBO_LEAN_TIMEOUT_MS")
@@ -3948,6 +3963,11 @@ pub fn eval_subshards_batch_via_zygote(
     sub_decl_sources: &[String],
     lean_args: &[String],
 ) -> Result<ZygoteEvalReply> {
+    crate::splitter::reject_checking_weakening(prefix_source)?;
+    for source in sub_decl_sources {
+        crate::splitter::reject_checking_weakening(source)?;
+    }
+    crate::module_builder::validate_lean_args(lean_args)?;
     if sub_decl_sources.is_empty() {
         return Ok(ZygoteEvalReply {
             ok: true,
@@ -4004,6 +4024,11 @@ pub fn eval_candidates_race_via_zygote(
     candidate_decl_sources: &[String],
     lean_args: &[String],
 ) -> Result<ZygoteEvalReply> {
+    crate::splitter::reject_checking_weakening(prefix_source)?;
+    for source in candidate_decl_sources {
+        crate::splitter::reject_checking_weakening(source)?;
+    }
+    crate::module_builder::validate_lean_args(lean_args)?;
     if candidate_decl_sources.is_empty() {
         return Ok(ZygoteEvalReply {
             kernel_gate_active: true,
@@ -4504,6 +4529,8 @@ pub fn try_local_zygote_check_shard_detailed(
     env_vars: &std::collections::HashMap<String, String>,
     req: &CheckShardHttpRequest,
 ) -> Result<Option<serde_json::Value>> {
+    crate::module_builder::validate_lean_args(&req.lean_args)?;
+    crate::splitter::reject_checking_weakening(&req.shard_source)?;
     let Some((base_url, auth_token)) = ensure_local_zygote_daemon_with_token(store, env_vars)
     else {
         return Ok(None);
@@ -4766,7 +4793,13 @@ pub fn try_local_zygote_eval_with_args(
     timeout_ms: u64,
     lean_args: &[String],
 ) -> Option<ZygoteEvalReply> {
-    let filtered_args = crate::module_builder::validate_effective_lean_args(lean_args).ok()?;
+    let filtered_args = match crate::module_builder::validate_effective_lean_args(lean_args) {
+        Ok(args) => args,
+        Err(error) => return Some(ZygoteEvalReply {
+            errors: vec![format!("{error:#}")],
+            ..Default::default()
+        }),
+    };
     let (imports_csv, _) = split_shard_for_zygote(source);
     let context = resolve_zygote_context(toolchain, lean_path, env_vars, lean_bin, &imports_csv);
     let timeout_ms = if timeout_ms > 0 {
@@ -4973,6 +5006,144 @@ mod tests {
     pub(crate) const PRINT_AXIOMS_SPOOF: &str = "macro_rules\n  | `(#print axioms $i:ident) => `(#eval IO.println s!\"'{$(Lean.quote i.getId.toString)}' does not depend on any axioms\")\n";
 
     #[test]
+    fn test_certification_admission_checks_worker_prefixes_and_candidates() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("turbo_source_admission_{}", next_tmp_id()));
+        let store = TurboStore::open(Some(&dir))?;
+        let env = std::collections::HashMap::new();
+        for source in ["set_option debug.skipKernelTC true", "run_cmd pure ()", "run_meta pure ()"] {
+            let error = eval_with_zygote_pool_with_args(
+                &store, "test", "", &env, Path::new("lean"), source, false, &[],
+            ).unwrap_err();
+            assert!(format!("{error:#}").contains("checking-weakening"));
+            for as_prefix in [false, true] {
+                let prefix = if as_prefix { source } else { "" };
+                let decls = vec![if as_prefix { "theorem good : True := True.intro" } else { source }.to_string(); 2];
+                for race in [false, true] {
+                    let result = if race {
+                        eval_candidates_race_via_zygote(&store, "test", "", &env, Path::new("lean"), prefix, &decls, &[])
+                    } else {
+                        eval_subshards_batch_via_zygote(&store, "test", "", &env, Path::new("lean"), prefix, &decls, &[])
+                    };
+                    let error = result.unwrap_err();
+                    assert!(format!("{error:#}").contains("checking-weakening"), "prefix={as_prefix}, race={race}: {error:#}");
+                }
+            }
+        }
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_compiled_module_audit_replays_kernel_types() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_raw_replay_{}_{}",
+            std::process::id(),
+            next_tmp_id()
+        ));
+        fs::create_dir_all(&dir)?;
+        let store = TurboStore::open(Some(&dir.join("store")))?;
+        let mut env = std::collections::HashMap::from([
+            (
+                "ELAN_TOOLCHAIN".to_string(),
+                "leanprover/lean4:v4.35.0".to_string(),
+            ),
+            ("LEAN_PATH".to_string(), dir.display().to_string()),
+        ]);
+        let prefix = Command::new("lean")
+            .arg("--print-prefix")
+            .envs(&env)
+            .output()?;
+        assert!(prefix.status.success());
+        let prefix = String::from_utf8_lossy(&prefix.stdout).trim().to_string();
+        env.insert(
+            "LD_LIBRARY_PATH".into(),
+            format!("{prefix}/lib/lean:{prefix}/lib"),
+        );
+        let auditor = ensure_zygote_binary(&store, Path::new("lean"), &env)?;
+        let bad = include_str!("../tests/fixtures/weakening-options/Bad.lean").replace(
+            "import Lean\n",
+            "import Lean\nset_option debug.skipKernelTC true\n",
+        );
+        for (module, source, accepted) in [
+            (
+                "BadArtifact",
+                format!("{bad}\ntheorem uses_bad : False := bad\n"),
+                false,
+            ),
+            (
+                "GoodArtifact",
+                "set_option maxHeartbeats 400000\ntheorem good : True := True.intro\n".to_string(),
+                true,
+            ),
+        ] {
+            let file = dir.join(format!("{module}.lean"));
+            let olean = file.with_extension("olean");
+            fs::write(&file, source)?;
+            let compiled = Command::new("lean")
+                .envs(&env)
+                .arg("-Ddebug.skipKernelTC=false")
+                .arg("-R")
+                .arg(&dir)
+                .arg(&file)
+                .arg("-o")
+                .arg(&olean)
+                .output()?;
+            assert!(compiled.status.success() && olean.is_file(), "{compiled:?}");
+            if !accepted {
+                assert!(String::from_utf8_lossy(&compiled.stdout)
+                    .contains("does not depend on any axioms"));
+            }
+            for shard in [false, true] {
+                let mut command = Command::new(&auditor);
+                command.envs(&env).arg("--audit-modules");
+                if shard {
+                    command.arg("--shard");
+                }
+                let audited = command.arg(module).output()?;
+                let verdict = parse_audit_modules_reply(&audited, &[module.to_string()]);
+                assert_eq!(
+                    verdict.is_ok(),
+                    accepted,
+                    "{module}/shard={shard}: {audited:?}"
+                );
+                if !accepted {
+                    assert!(format!("{:#}", verdict.unwrap_err())
+                        .contains("independent kernel re-check"));
+                }
+            }
+        }
+        // Repeated independent imports used to exhaust the untrusted auditor's 8 GiB
+        // limit, reported misleadingly as a missing .olean.private file (CI #301).
+        let modules: Vec<String> = (0..8).map(|i| format!("Replay{i}")).collect();
+        for module in &modules {
+            let file = dir.join(format!("{module}.lean"));
+            fs::write(
+                &file,
+                format!("import Lean\ntheorem good{module} : True := True.intro\n"),
+            )?;
+            let compiled = Command::new("lean")
+                .envs(&env)
+                .arg("-R")
+                .arg(&dir)
+                .arg(&file)
+                .arg("-o")
+                .arg(file.with_extension("olean"))
+                .output()?;
+            assert!(compiled.status.success(), "{compiled:?}");
+        }
+        let mut command = Command::new(&auditor);
+        command.envs(&env).arg("--audit-modules").args(&modules);
+        let audited = crate::module_builder::run_command_with_timeout(
+            &mut command,
+            std::time::Duration::from_secs(120),
+            true,
+        )?;
+        parse_audit_modules_reply(&audited, &modules)?;
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn test_audited_lean_shard_exempts_only_named_explicit_stubs() -> Result<()> {
         let dir = std::env::temp_dir().join(format!(
             "turbo_audited_shard_{}_{}",
@@ -5048,6 +5219,17 @@ mod tests {
             "import Lean\nopen Lean in\n#eval show Elab.Command.CommandElabM Unit from Elab.Command.liftCoreM <| addDecl <| .axiomDecl { name := `hidden, levelParams := [], type := mkConst ``False, isUnsafe := false }\ntheorem tgt : 1 = 1 := (hidden).elim\n".into(),
             "an `addDecl` axiom",
             "`hidden`",
+        );
+        // The stock compiler can emit an axiom-free, ill-typed theorem when source options
+        // disable checking. The artifact auditor must replay it, rather than trust imports.
+        let bad = include_str!("../tests/fixtures/weakening-options/Bad.lean").replace(
+            "import Lean\n",
+            "import Lean\nset_option debug.skipKernelTC true\n",
+        );
+        reject(
+            format!("{bad}\ntheorem tgt : False := bad\n"),
+            "source-level options cannot weaken the artifact audit",
+            "independent kernel re-check",
         );
         assert!(!run("theorem tgt : 1 = 2 := rfl\n")?.status.success());
         // A request budget bounds the whole fallback; it never yields a late verdict.
@@ -5457,10 +5639,11 @@ mod tests {
         assert!(cached.ok && cached.env_cache_hit && cached.prefix_cache_hit);
         assert_eq!(cached.stdout, reply.stdout);
         for invalid in ["--plugin=bad.so", "--json", "-q", " -DautoImplicit=false "] {
-            assert!(
-                eval(&[invalid.to_string()]).is_none(),
-                "invalid argument must not reuse cached reply: {invalid}"
-            );
+            let rejected = eval(&[invalid.to_string()]).expect("invalid options return a final rejection");
+            assert!(!rejected.ok && !rejected.env_cache_hit && !rejected.prefix_cache_hit,
+                "invalid argument must not reuse cached reply: {invalid}: {rejected:?}");
+            assert!(rejected.errors.join("\n").contains(invalid), "{rejected:?}");
+            assert_ne!(rejected.stdout, reply.stdout);
         }
         assert_eq!(fs::read(&path)?, bytes);
         fs::remove_file(path)?;
@@ -7295,6 +7478,273 @@ mod tests {
             assert_eq!(sig_rep.exit_signal, Some(9));
             assert!(sig_rep.errors[0].contains("signal=9"));
         }
+    }
+
+    #[test]
+    fn test_zygote_options_fail_closed_before_worker_execution() {
+        use crate::module_builder::option_cases::*;
+        let (dir, store, env_vars, _) =
+            open_test_zygote_env("rejected_options").expect("Lean toolchain");
+        let mut failures = Vec::new();
+        for &(name, value) in ORIGINAL_OPTIONS.iter().chain(RESTRICTED_OPTIONS) {
+            for prefix in PREFIXES {
+                if original_case_allowed(name, value, prefix) {
+                    continue;
+                }
+                let arg = format!("-D{prefix}{name}={value}");
+                let result = eval_with_zygote_pool_with_args(
+                    &store,
+                    "leanprover/lean4:v4.35.0",
+                    "",
+                    &env_vars,
+                    Path::new("must-not-execute"),
+                    "theorem good : True := True.intro",
+                    false,
+                    &[arg.clone()],
+                );
+                let batch = eval_subshards_batch_via_zygote(
+                    &store,
+                    "leanprover/lean4:v4.35.0",
+                    "",
+                    &env_vars,
+                    Path::new("must-not-execute"),
+                    "",
+                    &[],
+                    &[arg.clone()],
+                );
+                let race = eval_candidates_race_via_zygote(
+                    &store,
+                    "leanprover/lean4:v4.35.0",
+                    "",
+                    &env_vars,
+                    Path::new("must-not-execute"),
+                    "",
+                    &[],
+                    &[arg.clone()],
+                );
+                for (mode, result) in [
+                    ("pool", result),
+                    ("empty batch", batch),
+                    ("empty race", race),
+                ] {
+                    match result {
+                        Err(error) if format!("{error:#}").contains(&arg) => {}
+                        result => failures.push(format!("{mode}/{arg}: {result:?}")),
+                    }
+                }
+                let reply = try_local_zygote_eval_with_args(
+                    &store,
+                    &env_vars,
+                    Path::new("must-not-execute"),
+                    "leanprover/lean4:v4.35.0",
+                    "",
+                    "theorem good : True := True.intro",
+                    None,
+                    0,
+                    &[arg.clone()],
+                )
+                .expect("invalid options must fail closed, never trigger fallback");
+                assert!(
+                    !reply.ok && reply.errors.iter().any(|e| e.contains(&arg)),
+                    "{reply:?}"
+                );
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+        assert!(
+            failures.is_empty(),
+            "zygote options were not rejected: {}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn test_zygote_raw_options_cannot_bypass_kernel_checking() {
+        use crate::module_builder::option_cases::*;
+        let (dir, store, env_vars, lean_bin) =
+            open_test_zygote_env("raw_options").expect("Lean toolchain");
+        let bin = ensure_zygote_binary(&store, &lean_bin, &env_vars).unwrap();
+        let mut child = Command::new(bin)
+            .envs(&env_vars)
+            .env("LEAN", &lean_bin)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let src = include_str!("../tests/fixtures/weakening-options/Bad.lean")
+            .replace("import Lean\n", "");
+        let mut accepted = Vec::new();
+        for arg in std::iter::once(String::new()).chain(
+            ORIGINAL_OPTIONS
+                .iter()
+                .chain(RESTRICTED_OPTIONS)
+                .flat_map(|(name, value)| {
+                    PREFIXES
+                        .iter()
+                        .map(move |prefix| format!("-D{prefix}{name}={value}"))
+                }),
+        ) {
+            writeln!(
+                stdin,
+                "Lean\t{}\tstrict\t\t\t{}",
+                hex_encode_bytes(src.as_bytes()),
+                hex_encode_bytes(arg.as_bytes())
+            )
+            .unwrap();
+            stdin.flush().unwrap();
+            let mut line = String::new();
+            stdout.read_line(&mut line).unwrap();
+            let reply: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if reply["ok"] == true {
+                accepted.push((arg, reply));
+            }
+        }
+        let control = "theorem raw_control : True := True.intro";
+        writeln!(
+            stdin,
+            "Lean\t{}\tstrict\t\t\t",
+            hex_encode_bytes(control.as_bytes())
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        let control: serde_json::Value = serde_json::from_str(&line).unwrap();
+        drop(stdin);
+        assert!(child.wait().unwrap().success());
+        assert_eq!(control["ok"], true, "{control}");
+        fs::remove_dir_all(dir).unwrap();
+        assert!(
+            accepted.is_empty(),
+            "raw worker accepted False with zero axioms: {accepted:?}"
+        );
+    }
+
+    /// Source text can set `debug.skipKernelTC` itself (top level, `set_option … in`, a cached
+    /// prefix, programmatically). The worker's independent kernel replay must reject all of them.
+    #[test]
+    fn test_zygote_source_options_cannot_bypass_kernel_checking() {
+        let (dir, store, env_vars, lean_bin) =
+            open_test_zygote_env("source_options").expect("Lean toolchain");
+        let bin = ensure_zygote_binary(&store, &lean_bin, &env_vars).unwrap();
+        let mut child = Command::new(bin)
+            .envs(&env_vars)
+            .env("LEAN", &lean_bin)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut ask = |body: &str, mode: &str, key: &str, prefix: &str| -> serde_json::Value {
+            let hex_prefix = if prefix.is_empty() {
+                String::new()
+            } else {
+                hex_encode_bytes(prefix.as_bytes())
+            };
+            writeln!(
+                stdin,
+                "Lean\t{}\t{mode}\t{key}\t{hex_prefix}\t",
+                hex_encode_bytes(body.as_bytes())
+            )
+            .unwrap();
+            stdin.flush().unwrap();
+            let mut line = String::new();
+            stdout.read_line(&mut line).unwrap();
+            serde_json::from_str(&line).unwrap()
+        };
+        let bad = include_str!("../tests/fixtures/weakening-options/Bad.lean")
+            .replace("import Lean\n", "");
+        let skip = "set_option debug.skipKernelTC true\n";
+        let skip_in = bad.replace(
+            "run_elab",
+            "set_option debug.skipKernelTC true in\nrun_elab",
+        );
+        let programmatic = bad.replace(
+            "run_elab do",
+            "run_elab withOptions (fun o => o.setBool `debug.skipKernelTC true) do",
+        );
+        let top = format!("{skip}{bad}");
+        let weak = format!("set_option weak.debug.skipKernelTC true\n{bad}");
+        let rejected_artifacts: Vec<_> = ["RejectedBody", "RejectedPrefix"]
+            .into_iter().map(|name| (name, dir.join(format!("{name}.olean")))).collect();
+        let emit_modes: Vec<_> = rejected_artifacts.iter().map(|(name, path)| {
+            format!("emit_olean:{}:{}:", hex_encode_bytes(name.as_bytes()),
+                hex_encode_bytes(path.to_str().unwrap().as_bytes()))
+        }).collect();
+        let mut accepted = Vec::new();
+        let mut replay_missing = Vec::new();
+        // (label, body, mode, prefix key, prefix): the prefix rows use the cached-checkpoint path.
+        let cases: Vec<(&str, &str, &str, &str, &str)> = vec![
+            ("top-level", &top, "strict", "", ""),
+            ("set_option in", &skip_in, "strict", "", ""),
+            ("programmatic", &programmatic, "strict", "", ""),
+            ("weak prefix", &weak, "strict", "", ""),
+            ("cached prefix", &bad, "strict", "skip-prefix", skip),
+            (
+                "cached prefix (reused)",
+                &bad,
+                "strict",
+                "skip-prefix",
+                skip,
+            ),
+            ("stub prefix", &bad, "allow_stub", "skip-stub-prefix", skip),
+            (
+                "bad decl in prefix",
+                "theorem uses_bad : True := True.intro\n",
+                "strict",
+                "bad-prefix",
+                &top,
+            ),
+            ("emit body", &top, &emit_modes[0], "", ""),
+            ("emit prefix", "", &emit_modes[1], "bad-emit-prefix", &top),
+            ("eval", &top, "eval", "", ""),
+        ];
+        for (label, body, mode, key, prefix) in cases {
+            let reply = ask(body, mode, key, prefix);
+            let errors = reply["errors"].to_string();
+            if reply["ok"] == true {
+                accepted.push(format!("{label}: {reply}"));
+            } else if label != "weak prefix" && !errors.contains("KernelReplay") {
+                // `weak.` options are ignored by Lean, so the normal kernel check rejects that one.
+                replay_missing.push(format!("{label}: {reply}"));
+            }
+        }
+        for (_, path) in &rejected_artifacts {
+            assert!(!path.exists(), "rejected declarations emitted {}", path.display());
+        }
+        // Legitimate resource options and normal declarations keep working, including via prefixes.
+        let legit = "set_option maxHeartbeats 400000\nstructure P where\n  a : Nat\n  h : a = a\n\
+            mutual\ninductive A | a | b (x : B)\ninductive B | c (x : A)\nend\n\
+            def f : Nat → Nat\n  | 0 => 0\n  | n+1 => f n\n\
+            theorem tf : f 3 = 0 := by simp [f]\ninstance : Inhabited P := ⟨⟨0, rfl⟩⟩\n";
+        let legit_in = "set_option maxHeartbeats 400000 in\ntheorem good : True := True.intro\n";
+        for (label, body, key, prefix) in [
+            ("legit", legit, "", ""),
+            ("legit in", legit_in, "", ""),
+            (
+                "legit prefix",
+                "theorem z : f 0 = 0 := rfl\n",
+                "legit-prefix",
+                legit,
+            ),
+        ] {
+            let reply = ask(body, "strict", key, prefix);
+            assert_eq!(reply["ok"], true, "{label}: {reply}");
+        }
+        drop(stdin);
+        assert!(child.wait().unwrap().success());
+        fs::remove_dir_all(dir).unwrap();
+        assert!(
+            accepted.is_empty(),
+            "raw worker accepted False from source options: {accepted:#?}"
+        );
+        assert!(
+            replay_missing.is_empty(),
+            "kernel replay did not report: {replay_missing:#?}"
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::process::Command;
 use std::time::Instant;
 
@@ -950,6 +951,8 @@ fn check_directory(
     let mut all_shard_keys = Vec::new();
 
     for (lf, src_blake3, src, split) in split_entries {
+        anyhow::ensure!(!split.hygiene.has_checking_weakening,
+            "Soundness hygiene violation in {}: {:?}", lf.display(), split.hygiene.disallowed_items());
         let rel = lf.strip_prefix(canon_dir).unwrap_or(&lf);
         dir_hasher.update(rel.to_string_lossy().as_bytes());
         dir_hasher.update(b":");
@@ -1032,7 +1035,6 @@ fn check_directory(
     }
 
     let effective_jobs = default_parallel_jobs(jobs).min(uncached_files.len());
-    let staging_dir = store.fast_staging_dir();
     let pid = std::process::id();
 
     let proj_build_verified = remote_http.is_none()
@@ -1179,17 +1181,20 @@ fn check_directory(
             let mut cross_ok = proj_build_verified
                 || pack::try_local_zygote_check_shard(store, &env_vars, &zreq).is_some();
             if !cross_ok {
-                let tmp_cross = staging_dir.join(format!("cross_file_coalesced_{}.lean", pid));
-                fs::write(&tmp_cross, &cross_src)?;
-                let mut cmd = Command::new(&lean_bin);
-                for arg in crate::module_builder::filter_allowed_lean_args(&cross_args) {
-                    cmd.arg(arg);
-                }
-                let cross_out = crate::zygote::run_lean_command(
-                    cmd.arg(&tmp_cross).current_dir(canon_dir).envs(&env_vars),
+                let audit = uncached_files
+                    .iter()
+                    .flat_map(|(_, _, shards, _)| shards.iter().map(|(_, sh)| sh.name.clone()))
+                    .collect();
+                let cross_out = crate::zygote::run_audited_lean_shard(
+                    store,
+                    Path::new(&lean_bin),
+                    &env_vars,
+                    Some(canon_dir),
+                    &cross_src,
+                    &audit,
+                    &cross_args,
                     Some(crate::zygote::remaining_timeout_ms(None, *t0)),
                 )?;
-                let _ = fs::remove_file(&tmp_cross);
                 cross_ok = cross_out.status.success();
             }
             if cross_ok {
@@ -1225,7 +1230,7 @@ fn check_directory(
                 for _w in 0..effective_jobs {
                     let next_ref = &next_file_idx;
                     let files_ref = &uncached_files;
-                    let staging_ref = &staging_dir;
+                    let store_root_ref = &store.root;
                     let canon_ref = canon_dir;
                     let env_ref = &env_vars;
                     let lean_bin_ref = &lean_bin;
@@ -1235,6 +1240,7 @@ fn check_directory(
 
                     handles.push(s.spawn(
                         move || -> Result<Vec<(String, String, Vec<u8>, i64)>> {
+                            let worker_store = TurboStore::open(Some(store_root_ref))?;
                             let mut items = Vec::new();
                             loop {
                                 let f_idx =
@@ -1249,8 +1255,6 @@ fn check_directory(
                                     .iter()
                                     .map(|(_, sh)| sh.name.clone())
                                     .collect();
-                                let tmp_batch =
-                                    staging_ref.join(format!("dir_batch_{}_{}.lean", pid, f_idx));
                                 let f_t0 = Instant::now();
 
                                 let mut batch_ok = false;
@@ -1286,24 +1290,18 @@ fn check_directory(
                                             }
                                         }
                                         if !batch_ok {
-                                            fs::write(&tmp_batch, &fast_src)?;
-                                            let mut cmd = Command::new(lean_bin_ref);
-                                            for arg in
-                                                crate::module_builder::filter_allowed_lean_args(
-                                                    file_lean_args,
-                                                )
-                                            {
-                                                cmd.arg(arg);
-                                            }
-                                            let out = crate::zygote::run_lean_command(
-                                                cmd.arg(&tmp_batch)
-                                                    .current_dir(canon_ref)
-                                                    .envs(env_ref),
+                                            let out = crate::zygote::run_audited_lean_shard(
+                                                &worker_store,
+                                                Path::new(lean_bin_ref),
+                                                env_ref,
+                                                Some(canon_ref),
+                                                &fast_src,
+                                                &uncached_names,
+                                                file_lean_args,
                                                 Some(crate::zygote::remaining_timeout_ms(
                                                     None, *t0,
                                                 )),
                                             )?;
-                                            let _ = fs::remove_file(&tmp_batch);
                                             if out.status.success() {
                                                 batch_ok = true;
                                             }
@@ -1316,18 +1314,16 @@ fn check_directory(
                                         src,
                                         &uncached_names,
                                     );
-                                    fs::write(&tmp_batch, &coal_src)?;
-                                    let mut cmd = Command::new(lean_bin_ref);
-                                    for arg in crate::module_builder::filter_allowed_lean_args(
+                                    let out = crate::zygote::run_audited_lean_shard(
+                                        &worker_store,
+                                        Path::new(lean_bin_ref),
+                                        env_ref,
+                                        Some(canon_ref),
+                                        &coal_src,
+                                        &uncached_names,
                                         file_lean_args,
-                                    ) {
-                                        cmd.arg(arg);
-                                    }
-                                    let out = crate::zygote::run_lean_command(
-                                        cmd.arg(&tmp_batch).current_dir(canon_ref).envs(env_ref),
                                         Some(crate::zygote::remaining_timeout_ms(None, *t0)),
                                     )?;
-                                    let _ = fs::remove_file(&tmp_batch);
                                     if !out.status.success() {
                                         let stderr = String::from_utf8_lossy(&out.stderr);
                                         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1625,6 +1621,8 @@ fn check_single_decl(
             split.shards[shard_idx].proof_text = prf;
         }
     }
+    anyhow::ensure!(!split.hygiene.has_checking_weakening,
+        "Soundness hygiene violation in {}: {:?}", active_file.display(), split.hygiene.disallowed_items());
     let shard = &split.shards[shard_idx];
     let file_lean_args =
         crate::module_builder::try_resolve_lean_args_for_path(canon_dir, Some(&active_file))?;
@@ -1942,20 +1940,6 @@ fn check_single_decl(
                     .canonicalize()
                     .unwrap_or_else(|_| active_file.clone())
             };
-            let safe_name: String = target_decl
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || c == '_' {
-                        c
-                    } else {
-                        '_'
-                    }
-                })
-                .collect();
-            let staging_dir = store.fast_staging_dir();
-            let tmp_shard =
-                staging_dir.join(format!("shard_{}_{}.lean", safe_name, std::process::id()));
-
             let mut single_set = HashSet::new();
             single_set.insert(target_decl.to_string());
             single_set.insert(shard.name.clone());
@@ -2662,28 +2646,20 @@ fn check_single_decl(
                     }
                 }
                 if !verified_via_zygote {
-                    fs::write(&tmp_shard, &full_shard_src)?;
-                    let default_stack = env_vars
-                        .get("LEAN_STACK_SIZE_KB")
-                        .cloned()
-                        .or_else(|| std::env::var("LEAN_STACK_SIZE_KB").ok())
-                        .unwrap_or_else(|| "262144".to_string());
-                    let mut cmd = Command::new(&lean_bin);
-                    for arg in crate::module_builder::filter_allowed_lean_args(&file_lean_args) {
-                        cmd.arg(arg);
-                    }
-                    let out = crate::zygote::run_lean_command(
-                        cmd.arg(&tmp_shard)
-                            .current_dir(canon_dir)
-                            .envs(&env_vars)
-                            .env("LEAN_STACK_SIZE_KB", default_stack),
+                    let out = crate::zygote::run_audited_lean_shard(
+                        store,
+                        Path::new(&lean_bin),
+                        &env_vars,
+                        Some(canon_dir),
+                        &full_shard_src,
+                        &HashSet::from([shard.name.clone()]),
+                        &file_lean_args,
                         Some(crate::zygote::remaining_timeout_ms(None, *t0)),
                     )
-                    .context("Failed to execute `lean` on theorem shard")?;
-                    let _ = fs::remove_file(&tmp_shard);
+                    .context("Failed to audit theorem shard")?;
 
                     if !out.status.success() {
-                        let tmp_display = tmp_shard.display().to_string();
+                        let tmp_display = "<audited-shard>";
                         let orig_display = file.display().to_string();
                         let stderr = String::from_utf8_lossy(&out.stderr)
                             .replace(&tmp_display, &orig_display);
@@ -3199,14 +3175,11 @@ fn check_single_file(
 
     if use_parallel_shards {
         let effective_jobs = requested_jobs.min(uncached_shards.len());
-        let staging_dir = store.fast_staging_dir();
-        let pid = std::process::id();
 
         let uncached_names: HashSet<String> = uncached_shards
             .iter()
             .map(|(_, s)| s.name.clone())
             .collect();
-        let tmp_coalesced = staging_dir.join(format!("coalesced_batch_{}.lean", pid));
         let batch_t0 = Instant::now();
 
         let mut batch_succeeded = fast_verified_batch;
@@ -3284,19 +3257,17 @@ fn check_single_file(
                     batch_succeeded = true;
                 }
                 Ok(None) => {
-                    fs::write(&tmp_coalesced, &coalesced_src)?;
-                    let mut cmd = Command::new(&lean_bin);
-                    for arg in crate::module_builder::filter_allowed_lean_args(&file_lean_args) {
-                        cmd.arg(arg);
-                    }
-                    let batch_out = crate::zygote::run_lean_command(
-                        cmd.arg(&tmp_coalesced)
-                            .current_dir(canon_dir)
-                            .envs(&env_vars),
+                    let batch_out = crate::zygote::run_audited_lean_shard(
+                        store,
+                        Path::new(&lean_bin),
+                        &env_vars,
+                        Some(canon_dir),
+                        &coalesced_src,
+                        &uncached_names,
+                        &file_lean_args,
                         Some(crate::zygote::remaining_timeout_ms(None, *t0)),
                     )
-                    .context("Failed to execute `lean` on coalesced shard batch")?;
-                    let _ = fs::remove_file(&tmp_coalesced);
+                    .context("Failed to audit coalesced shard batch")?;
                     if batch_out.status.success() {
                         batch_succeeded = true;
                     }
@@ -3353,7 +3324,7 @@ fn check_single_file(
                         let next_idx_ref = &next_idx;
                         let abort_ref = &abort_flag;
                         let uncached_ref = &uncached_shards;
-                        let staging_ref = &staging_dir;
+                        let store_root_ref = &store.root;
                         let canon_ref = canon_dir;
                         let env_ref = &env_vars;
                         let lean_bin_ref = &lean_bin;
@@ -3365,6 +3336,7 @@ fn check_single_file(
                         let args_ref = &file_lean_args;
 
                         handles.push(s.spawn(move || -> Result<Vec<(String, &splitter::TheoremShard, i64)>> {
+                            let worker_store = TurboStore::open(Some(store_root_ref))?;
                             let mut verified = Vec::new();
                             loop {
                                 if abort_ref.load(std::sync::atomic::Ordering::Relaxed) {
@@ -3433,31 +3405,12 @@ fn check_single_file(
                                     }
                                 }
 
-                                let safe_name: String = shard
-                                    .name
-                                    .chars()
-                                    .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
-                                    .collect();
-                                let tmp_shard = staging_ref.join(format!(
-                                    "par_shard_{}_{}_{}.lean",
-                                    safe_name, pid, idx
-                                ));
-                                fs::write(&tmp_shard, &shard_src_owned)?;
-
-                                let mut cmd = Command::new(lean_bin_ref);
-                                for arg in crate::module_builder::filter_allowed_lean_args(args_ref)
-                                {
-                                    cmd.arg(arg);
-                                }
-                                let out = crate::zygote::run_lean_command(cmd
-                                    .arg(&tmp_shard)
-                                    .current_dir(canon_ref)
-                                    .envs(env_ref), Some(crate::zygote::remaining_timeout_ms(None, *t0)))
-                                    .with_context(|| {
-                                        format!("Failed to execute `lean` on shard `{}`", shard.name)
-                                    })?;
-                                let tmp_display = tmp_shard.display().to_string();
-                                let _ = fs::remove_file(&tmp_shard);
+                                let out = crate::zygote::run_audited_lean_shard(
+                                    &worker_store, Path::new(lean_bin_ref), env_ref, Some(canon_ref),
+                                    &shard_src_owned, &HashSet::from([shard.name.clone()]), args_ref,
+                                    Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+                                ).with_context(|| format!("Failed to audit shard `{}`", shard.name))?;
+                                let tmp_display = "<audited-shard>";
 
                                 if !out.status.success() {
                                     abort_ref.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3633,17 +3586,17 @@ fn check_single_file(
             }
         }
         if !verified_via_zygote_eval {
-            let mut cmd = Command::new(&lean_bin);
-            for arg in crate::module_builder::filter_allowed_lean_args(&file_lean_args) {
-                cmd.arg(arg);
-            }
-            let out = crate::zygote::run_lean_command(
-                cmd.arg(canon_resolved_initial)
-                    .current_dir(canon_dir)
-                    .envs(&env_vars),
+            let out = crate::zygote::run_audited_lean_shard(
+                store,
+                Path::new(&lean_bin),
+                &env_vars,
+                Some(canon_dir),
+                src,
+                &split.shards.iter().map(|sh| sh.name.clone()).collect(),
+                &file_lean_args,
                 Some(crate::zygote::remaining_timeout_ms(None, *t0)),
             )
-            .context("Failed to execute `lean`")?;
+            .context("Failed to audit Lean file")?;
             if !out.status.success() {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 let stdout = String::from_utf8_lossy(&out.stdout);

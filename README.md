@@ -131,3 +131,19 @@ These controls suppress main-clone build/package copying and linking, build-outp
 - [`lean/LeanNative/`](lean/LeanNative/) — Verified `LNIR` native compiler, `@[simd]`/`@[gpu]`/`@[tpu]` plugins (`Transform/Plugins.lean`, `Superopt.lean`), semantics & 207 soundness theorems (`Semantics/Eval.lean`, `Proofs/`), and multi-backend codegen (`Backend/LLVM.lean`, `PTX.lean`, `Metal.lean`, `MLIR.lean`, `FastCheck.lean`).
 - [`crates/turbo-lean/src/`](crates/turbo-lean/src/) — CLI & system orchestrator (`c_abi.rs` <!-- inventory:turbo_cabi_exports -->76<!-- /inventory:turbo_cabi_exports -->-symbol FFI bridge, `module_builder.rs` event-driven ready-queue DAG scheduler, `accelerators.rs` & `gpu_fastcheck.rs` multi-domain `UInt`/`BitVec`/`Word256`/`Nat` counterexample engines, `zygote.rs`, `splitter.rs`, `pr_verify.rs`, `mcp.rs`).
 - [`roadmap/`](roadmap/README.md) — Autonomous research & verification roadmap separating North-Star technical goals ([`GOALS.md`](roadmap/GOALS.md)), cheat-proof theorem contracts ([`VALIDATION_CONTRACTS.md`](roadmap/VALIDATION_CONTRACTS.md)), 3-way non-FV differential conformance ([`CONFORMANCE_SUITE.md`](roadmap/CONFORMANCE_SUITE.md)), and Maxwell/Orb execution strategies ([`MAXWELL_STRATEGIES.md`](roadmap/MAXWELL_STRATEGIES.md)).
+
+Lean compiler flags use the static Lake allowlist in `module_builder::is_allowed_lean_arg`
+for package/library/executable `moreLeanArgs`, `weakLeanArgs`, and `leanOptions` in
+both Lake formats. HTTP and zygote requests and PR/CI shard subprocesses validate
+against that same policy before filtering flags or using cached results. Trusted
+PR verification also validates Lake configuration when the diff is unchanged.
+`warn.sorry` must be exactly `true`; `debug.skipKernelTC` may only be `false`.
+The raw Lean worker forces these two safety settings after decoding options, as
+the native compiler subprocesses do. Other `debug.*`, `internal.*`, diagnostic
+redirection, arbitrary `pp.*`, program/file options, and plugin/trust flags remain
+restricted by the allowlist; repeated `weak.` prefixes cannot bypass it.
+Source certification also rejects all `set_option debug.*` and `weak.*` settings,
+`warn.sorry` values other than `true`, and `run_elab`/`run_cmd`/`run_meta`, including
+scoped commands and worker prefixes. Benign options such as `maxHeartbeats` remain
+allowed. Every worker declaration and compiled artifact must independently replay
+through the kernel before it can produce a verified result or cache entry.
