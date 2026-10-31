@@ -1,9 +1,9 @@
 # B2 status
 
 Baseline: `5508b9f`; clifv `5018b9509dc124154dbe08a5bd85862595d8eab7`.
-Checkpoint: 2026-10-31 17:28 UTC. The executable lowering lives in
+Checkpoint: 2026-10-31 17:55 UTC. The executable lowering lives in
 `lean/LeanNative/Backend/Clif.lean`; `compile-clif` calls that definition.
-The default proof build and transitive axiom audit pass on Lean 4.34.1.
+The active root and strict transitive axiom audit pass kernel checks on Lean 4.34.1.
 
 | Obligation | Status | Evidence / remaining work |
 | --- | --- | --- |
@@ -11,7 +11,7 @@ The default proof build and transitive axiom audit pass on Lean 4.34.1.
 | O2 signature | PROVED | `B2.Lowering.lower_sig`, for every successful lowering; axioms `[propext]`. |
 | O3 simulation | PROVED (collatz_steps) | `B2.CollatzClif.source_simulation` connects the actual LNIR evaluator to `Clif.runWith` on the actual lowered function for every UInt64 argument pair and arbitrary source heap/CLIF memory. Fuel is `15 * steps.toNat + 5`; the entire initial memory, including the slot-placement oracle, is preserved. Generic F64 simulation remains open. |
 | O4 safety | PROVED (collatz_steps) | `B2.BackendEntry.entry_eq` and `returns` establish the exact upstream `ClifEntry` contract. `reachable_step_safe` excludes trapped/stuck steps at every reachable state; `traps_explicit` proves the exact upstream `E2E.TrapsExplicit` premise. `B2.RunSafety.collatz_run_prefix` also excludes trapped/stuck public runs at every fuel. |
-| O5 backend artifacts | SORRY | `B2.Artifacts.input_eq`, `verifiable`, and `lower` certify the exact instruction-selection artifact from `Backend.lowerFunction`. `B2.Artifacts.prepared`, `spill_alloc`, and `allocation_checked` certify the actual block permutation 0,1,3,2, exact spill allocation, and acceptance by upstream `checkAlloc`. `B2.Artifacts.allocated`, `emitted`, and `laid_out` certify actual AArch64 lowering, emission, and binary layout. Input subset/dominance/scope packaging is still unchecked in the contract draft. |
+| O5 backend artifacts | PROVED (collatz_steps) | `B2.Artifacts.input_eq`, `verifiable`, and `lower` certify the exact instruction-selection artifact from `Backend.lowerFunction`. `B2.Artifacts.prepared`, `spill_alloc`, and `allocation_checked` certify the actual block permutation 0,1,3,2, exact spill allocation, and acceptance by upstream `checkAlloc`. `B2.Artifacts.allocated`, `emitted`, and `laid_out` certify actual AArch64 lowering, emission, and binary layout. `B2.BackendContracts.subset`, `dominated`, and `scope` discharge the exact upstream input predicates; all are active and pass the strict transitive audit. |
 | O6 contracts | SORRY | `B2.Lowering.lower_declarations` proves empty extern/signature/global/slot declarations generically. `B2.CallFree` proves absence of try calls, indirect statements/signatures, and TLS for the actual Collatz function. Complete contract composition remains unchecked. |
 | O7 AArch64 x0 | SORRY | Needs O6, backend composition, and its transitive axiom audit. No AArch64-success claim yet. |
 
@@ -32,8 +32,9 @@ Six compiler/proof source pairs are committed byte-identical (Types,
 AST, Codec, Value, Eval, Clif). `scripts/check_b2_source_identity.py`
 verifies them and a clean pinned clifv. `.github/workflows/b2.yml` enforces
 source identity, the proof build, and compiler-toolchain integration.
-Remote CI for checkpoint `3384b43` passed:
-https://github.com/Th0rgal/turbo-lean/actions/runs/41222068418 .
+Remote CI for checkpoint `4183cc0` passed:
+https://github.com/Th0rgal/turbo-lean/actions/runs/41224690848 .
+CI for this scope activation is pending the new push.
 The local Lean 4.35 CoreCLI integration build passed; the actual compiler
 dispatcher emitted collatz_steps CLIF. `research/b2-compiler-smoke.lean`
 records that check and CI runs it too.
@@ -95,25 +96,23 @@ the active build step. The new export produced 352 bytes with SHA-256
 `ccc8f0891484b6692e2be2315f2e729c2fc4e75831561fb07a7c76884991557b`;
 Clang 18's AArch64 assembler produced byte-identical `.text`.
 
-Durable follow-up job `8a4a171c-8b2e-54c2-b067-6c1d0b087c9e` waits for those
-existing dependency artifacts before checking the excluded scope, contracts,
-and end-to-end drafts in sequence. Its outputs are in `.b2-work/scope.log`,
-`contracts.log`, and `end-to-end.log`; pending checks do not establish any
-of O5/O6/O7.
+The priority build of `FV.Backend.Proof.LowerDecide` passed at 17:47 UTC.
+The old follow-up failed before checking any proof because an empty scratch
+namespace directory hid the real B2 library. The corrected checker writes only
+B2 outputs into the existing library and uses the provisioned compiler. Durable
+replacement job `2b881e4f-a6e2-5984-8304-5e41574f486b` never launched a process;
+it was cancelled and acknowledged before starting the local replacement.
 
-`B2.BackendScope` is an excluded, unverified draft split from BackendContracts
-to isolate the dominance check. Its Boolean `insertIfNew` lookup lemma passed
-an isolated kernel check and two concrete lookup tests with only the allowed
-axioms. Actual `dominatedB` still awaits checking; earlier reductions repeated
-decidable-instance transport and exceeded recursion limits. An isolated
-diagnostic identifies an unrewritten raw hash-map lookup reaching the opaque
-`System.Platform.getNumBits`; this is a reduction obstacle, not evidence of a
-false dominance predicate. Method-level lookup rewrites passed isolated kernel checks and concrete
-examples. The exact availability array also passed a diagnostic kernel check
-against the runtime-extracted context, with only the allowed axioms. A second isolated check now computes directly through
-`buildCtx B2.Artifacts.input` and proves the same exact availability array,
-with only the allowed axioms; the complete `dominatedB` statement is still
-pending. The helper's documentation-comment parse error was fixed and that
-complete diagnostic file passed. `B2.EndToEnd`
-now drafts the explicit equality with x0, but composition is still unchecked.
-These draft changes do not upgrade O5, O6, or O7.
+`B2.BackendScope` passed at 17:53 UTC and is now active in the root and audit.
+Its certified method-level HashMap rewrites avoid reduction through opaque
+`System.Platform.getNumBits`; no container implementation or upstream source
+changed. Actual `dominatedB` computes through `buildCtx` on the exact input,
+without a context snapshot. The active-root and strict transitive audit checks
+passed at 17:54 UTC, including subset, dominance, scope, and lookup helpers;
+their closures contain only the allowed axioms.
+
+The local `.b2-work/proof_followups.py` process now waits for existing contract
+dependencies before checking BackendContracts, then waits for FinalDirect
+before checking EndToEnd. Logs are `.b2-work/{scope,contracts,end-to-end}.log`.
+The end-to-end draft states explicit x0 equality but remains unchecked.
+Pending checks do not establish O6 or O7.

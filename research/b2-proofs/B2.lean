@@ -10,4 +10,5 @@ import B2.BackendLower
 import B2.BackendAlloc
 import B2.Artifacts
 import B2.BackendEntry
+import B2.BackendScope
 import B2.AxiomAudit
