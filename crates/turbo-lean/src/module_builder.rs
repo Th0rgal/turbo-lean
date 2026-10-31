@@ -11035,4 +11035,312 @@ roots = ["Fast"]
         assert_eq!(try_resolve_lean_args_for_path(&dir, None), fast_args);
         fs::remove_dir_all(dir).unwrap();
     }
+    #[test]
+    fn test_lakefile_and_manifest_path_fields_reject_escapes() {
+        // P0-5: `irDir = "/abs"` (or `..`) in any package used to send `.c` writes and stale
+        // deletes anywhere on the host.
+        let dir = make_temp_test_dir("path_escape");
+        let tf = dir.join("lakefile.toml");
+        let lf = dir.join("lakefile.lean");
+        for (field, lean_block) in [
+            ("srcDir", "package p where\n  srcDir := {v}\n"),
+            ("buildDir", "package p where\n  buildDir := {v}\n"),
+            ("leanLibDir", "package p where\n  leanLibDir := {v}\n"),
+            ("irDir", "package p where\n  irDir := {v}\n"),
+            ("packagesDir", "package p where\n  packagesDir := {v}\n"),
+            ("nativeLibDir", "package p where\n  nativeLibDir := {v}\n"),
+            ("srcDir", "package p\nlean_lib A where\n  srcDir := {v}\n"),
+        ] {
+            for bad in ["/tmp/turbo-evil", "../sibling", "src/../../up"] {
+                for is_root in [true, false] {
+                    let toml = if lean_block.contains("lean_lib") {
+                        format!("name = \"p\"\n[[lean_lib]]\nname = \"A\"\n{field} = \"{bad}\"\n")
+                    } else {
+                        format!("name = \"p\"\n{field} = \"{bad}\"\n")
+                    };
+                    fs::write(&tf, toml).unwrap();
+                    let err = parse_lakefile_toml(&dir, &tf, is_root)
+                        .unwrap_err()
+                        .to_string();
+                    assert!(
+                        err.contains(field) && err.contains("relative"),
+                        "{field}={bad}: {err}"
+                    );
+                    let lean = format!(
+                        "import Lake\nopen Lake DSL\n{}",
+                        lean_block.replace("{v}", &format!("\"{bad}\""))
+                    );
+                    fs::write(&lf, lean).unwrap();
+                    let err = parse_lakefile_lean(&dir, &lf, is_root)
+                        .unwrap_err()
+                        .to_string();
+                    assert!(
+                        err.contains(field) && err.contains("relative"),
+                        "{field}={bad}: {err}"
+                    );
+                }
+            }
+        }
+        // Package-relative paths keep working.
+        fs::write(
+            &tf,
+            "name = \"p\"\nsrcDir = \"./src\"\nbuildDir = \"out/build\"\n",
+        )
+        .unwrap();
+        let pkg = parse_lakefile_toml(&dir, &tf, true).unwrap();
+        assert_eq!(pkg.build_dir, PathBuf::from("out/build"));
+        fs::remove_file(&tf).unwrap();
+        fs::remove_file(&lf).unwrap();
+
+        let manifest = |pkgs_dir: &str, pkg: serde_json::Value| {
+            let m = serde_json::json!({"version": "1.1.0", "packagesDir": pkgs_dir,
+                "packages": [pkg]});
+            fs::write(dir.join("lake-manifest.json"), m.to_string()).unwrap();
+        };
+        let git = |name: &str| serde_json::json!({"type": "git", "name": name, "rev": "0"});
+        manifest("/tmp/turbo-evil", git("dep"));
+        assert!(parse_lake_manifest(&dir, false).is_err());
+        manifest("../up", git("dep"));
+        assert!(parse_lake_manifest(&dir, false).is_err());
+        manifest(".lake/packages", git("../../escape"));
+        assert!(parse_lake_manifest(&dir, false).is_err());
+        let mut sub = git("dep");
+        sub["subDir"] = "../../escape".into();
+        manifest(".lake/packages", sub);
+        assert!(parse_lake_manifest(&dir, false).is_err());
+        // A `path` dependency on another host project: untrusted builds would publish into it.
+        for d in ["../other-project", "/home/victim/project"] {
+            manifest(
+                ".lake/packages",
+                serde_json::json!({"type": "path", "name": "dep", "dir": d}),
+            );
+            let err = parse_lake_manifest(&dir, true).unwrap_err().to_string();
+            assert!(err.contains("`dir`"), "{err}");
+            // A trusted workspace may still use a sibling checkout, as Lake does.
+            let (_, entries, _) = parse_lake_manifest(&dir, false).unwrap();
+            assert_eq!(entries[0].dir, dir.join(d));
+        }
+        manifest(".lake/packages", git("dep"));
+        let (pkgs_dir, entries, _) = parse_lake_manifest(&dir, true).unwrap();
+        assert_eq!(pkgs_dir, PathBuf::from(".lake/packages"));
+        assert_eq!(entries[0].dir, dir.join(".lake/packages/dep"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_untrusted_build_never_writes_outside_the_checkout() {
+        // P0-5: a symlinked build directory or a dependency that resolves elsewhere on the host
+        // must fail before the first filesystem write.
+        let root = make_temp_test_dir("write_escape");
+        let proj = root.join("proj");
+        let outside = root.join("outside");
+        fs::create_dir_all(proj.join("P")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"p\"\n[[lean_lib]]\nname = \"P\"\nglobs = [\"P.+\"]\n",
+        )
+        .unwrap();
+        fs::write(proj.join("P/A.lean"), "def a : Nat := 1\n").unwrap();
+        if resolve_project_config_with_trust(&proj, true).is_err() {
+            return; // no Lean v4.35.0 toolchain on this host
+        }
+        std::os::unix::fs::symlink(&outside, proj.join(".lake")).unwrap();
+        let mut store = TurboStore::open(Some(&root.join("store"))).unwrap();
+        let err = build_project_modules_native(
+            &mut store,
+            &proj,
+            &[],
+            "untrusted:pr",
+            1,
+            true,
+            true,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("fail-closed build path gate"), "{err}");
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0, "wrote outside");
+        // A trusted build keeps following the user's own symlinks.
+        let cfg = resolve_project_config(&proj).unwrap();
+        let dag = build_module_dag(&cfg, &[]).unwrap();
+        let canon = proj.canonicalize().unwrap();
+        validate_build_write_dirs(&cfg, &dag, &canon, false).unwrap();
+        assert!(validate_build_write_dirs(&cfg, &dag, &canon, true).is_err());
+        fs::remove_file(proj.join(".lake")).unwrap();
+
+        // A dependency symlinked to another project on the host.
+        let other = root.join("other");
+        fs::create_dir_all(other.join("Q")).unwrap();
+        fs::write(
+            other.join("lakefile.toml"),
+            "name = \"q\"\n[[lean_lib]]\nname = \"Q\"\n",
+        )
+        .unwrap();
+        fs::write(other.join("Q.lean"), "def q : Nat := 1\n").unwrap();
+        fs::create_dir_all(proj.join(".lake/packages")).unwrap();
+        std::os::unix::fs::symlink(&other, proj.join(".lake/packages/q")).unwrap();
+        let err = resolve_project_config_with_trust(&proj, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("outside the workspace"), "{err}");
+        resolve_project_config_with_trust(&proj, false).unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_dependency_lakefile_compile_affecting_config_fails_closed() {
+        // P0-6: a dependency's compile-affecting settings used to be skipped silently, so its
+        // modules were built differently from Lake yet published with a Lake trace.
+        let dir = make_temp_test_dir("dep_fail_closed");
+        let tf = dir.join("lakefile.toml");
+        let lib = "[[lean_lib]]\nname = \"A\"\n";
+        for (top, lib_extra) in [
+            ("buildType = \"debug\"\n", ""),
+            ("buildType = \"Debug\"\n", ""),
+            ("plugins = [\"evil\"]\n", ""),
+            ("dynlibs = [\"evil\"]\n", ""),
+            ("precompileImports = true\n", ""),
+            ("platformIndependent = false\n", ""),
+            ("backend = \"llvm\"\n", ""),
+            ("extraDepTargets = [\"gen\"]\n", ""),
+            ("someFutureKey = 1\n", ""),
+            ("\"buildType\" = \"debug\"\n", ""),
+            ("", "needs = [\"gen\"]\n"),
+            ("", "buildType = \"debug\"\n"),
+            ("", "precompileLibrary = true\n"),
+            ("", "defaultFacets = [\"shared\"]\n"),
+            ("", "extraDepTargets = [\"gen\"]\n"),
+            ("", "someFutureKey = 1\n"),
+        ] {
+            let src = format!("name = \"d\"\n{top}{lib}{lib_extra}");
+            fs::write(&tf, &src).unwrap();
+            let err = parse_lakefile_toml(&dir, &tf, true)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("fail-closed"), "{src}: {err}");
+            let pkg = parse_lakefile_toml(&dir, &tf, false).unwrap();
+            let why = pkg.unsupported.clone().or(pkg.libs[0].unsupported.clone());
+            assert!(why.is_some(), "dependency accepted `{src}`");
+        }
+        // Lake reads a quoted key as the bare key, so a quoted `moreLeanArgs` applies.
+        fs::write(
+            &tf,
+            format!("name = \"d\"\n\"moreLeanArgs\" = [\"-DautoImplicit=false\"]\n{lib}"),
+        )
+        .unwrap();
+        for is_root in [true, false] {
+            let pkg = parse_lakefile_toml(&dir, &tf, is_root).unwrap();
+            assert_eq!(pkg.more_lean_args, vec!["-DautoImplicit=false".to_string()]);
+        }
+        fs::write(
+            &tf,
+            format!("name = \"d\"\n'moreLeanArgs' = [\"--plugin=x.so\"]\n{lib}"),
+        )
+        .unwrap();
+        assert!(parse_lakefile_toml(&dir, &tf, false).is_err());
+        // Settings Lake builds identically with (and metadata) pass for every package.
+        fs::write(
+            &tf,
+            format!(
+                "name = \"d\"\nplatformIndependent = true\nbuildType = \"release\"\n\
+                 precompileImports = false\ntestRunner = \"T\"\nfixedToolchain = true\n\
+                 moreLinkArgs = [\"-lfoo\"]\n{lib}needs = []\nlibName = \"a\"\n"
+            ),
+        )
+        .unwrap();
+        for is_root in [true, false] {
+            let pkg = parse_lakefile_toml(&dir, &tf, is_root).unwrap();
+            assert!(pkg.unsupported.is_none() && pkg.libs[0].unsupported.is_none());
+        }
+        fs::remove_file(&tf).unwrap();
+
+        let lf = dir.join("lakefile.lean");
+        let head = "import Lake\nopen Lake DSL\n";
+        for body in [
+            "package d where\n  buildType := .debug\nlean_lib A\n",
+            "package d where\n  buildType := BuildType.debug\nlean_lib A\n",
+            "package d where\n  precompileImports := true\nlean_lib A\n",
+            "package d where\n  platformIndependent := false\nlean_lib A\n",
+            "package d where\n  bootstrap := true\nlean_lib A\n",
+            "package d where\n  someFutureKey := 1\nlean_lib A\n",
+            "package d\nlean_lib A where\n  needs := #[gen]\n",
+            "package d\nlean_lib A where\n  extraDepTargets := #[`gen]\n",
+            "package d\nlean_lib A where\n  defaultFacets := #[LeanLib.sharedFacet]\n",
+            "package d\nlean_lib A where\n  someFutureKey := 1\n",
+            "package d\nmeta if true then\n  lean_lib B\nlean_lib A\n",
+            "package d\n#eval IO.println \"x\"\nlean_lib A\n",
+            "package d\nset_option autoImplicit false\nlean_lib A\n",
+            "package d\ninput_file gen where\n  path := \"x\"\nlean_lib A\n",
+        ] {
+            let src = format!("{head}{body}");
+            fs::write(&lf, &src).unwrap();
+            let err = parse_lakefile_lean(&dir, &lf, true)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("fail-closed"), "{src}: {err}");
+            let pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
+            let why = pkg.unsupported.clone().or(pkg.libs[0].unsupported.clone());
+            assert!(why.is_some(), "dependency accepted `{src}`");
+        }
+        // A dependency's update hook may spawn processes; it never runs during a build.
+        fs::write(
+            &lf,
+            format!(
+                "{head}package d where\n  platformIndependent := true\n  fixedToolchain := true\n\
+                 lean_lib A\npost_update pkg do\n  let _ ← IO.Process.getCurrentDir\n"
+            ),
+        )
+        .unwrap();
+        let pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
+        assert!(pkg.unsupported.is_none() && pkg.libs[0].unsupported.is_none());
+        assert!(parse_lakefile_lean(&dir, &lf, true).is_err());
+        // Mathlib as a dependency stays buildable.
+        fs::write(
+            &lf,
+            include_str!("../tests/fixtures/mathlib-0df444a3-lakefile.lean"),
+        )
+        .unwrap();
+        let pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
+        assert_eq!(pkg.unsupported, None);
+        assert!(pkg.libs.iter().all(|l| l.unsupported.is_none()));
+        assert!(pkg.exes.iter().all(|e| e.unsupported.is_none()));
+        let _ = fs::remove_dir_all(&dir);
+
+        // Building (not reusing) a module of such a dependency fails closed.
+        let proj = make_temp_test_dir("dep_fail_closed_dag");
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"app\"\n[[lean_lib]]\nname = \"App\"\n",
+        )
+        .unwrap();
+        fs::write(proj.join("App.lean"), "import Dep\ndef app : Nat := 1\n").unwrap();
+        let dep = proj.join(".lake/packages/dep");
+        fs::create_dir_all(&dep).unwrap();
+        fs::write(
+            dep.join("lakefile.toml"),
+            "name = \"dep\"\nbuildType = \"debug\"\n[[lean_lib]]\nname = \"Dep\"\n",
+        )
+        .unwrap();
+        fs::write(dep.join("Dep.lean"), "def dep : Nat := 1\n").unwrap();
+        let cfg = resolve_project_config(&proj).unwrap();
+        let err = build_module_dag_with_trust(&cfg, &[], true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`Dep`") && err.contains("buildType") && err.contains("fail-closed"),
+            "{err}"
+        );
+        fs::write(
+            dep.join("lakefile.toml"),
+            "name = \"dep\"\nbuildType = \"release\"\n[[lean_lib]]\nname = \"Dep\"\n",
+        )
+        .unwrap();
+        let cfg = resolve_project_config(&proj).unwrap();
+        build_module_dag_with_trust(&cfg, &[], true).unwrap();
+        let _ = fs::remove_dir_all(&proj);
+    }
 }
