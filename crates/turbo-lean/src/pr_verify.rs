@@ -2443,14 +2443,12 @@ struct PrVerificationTrust<'a> {
     untrusted_cfg: Option<&'a crate::module_builder::ProjectConfig>,
 }
 
-/// Plain-`lean` fallback for a shard the zygote did not accept. It applies the zygote's axiom
-/// gate (standard axioms plus the project allowlist) to the `audit` theorems (`#print axioms`),
-/// so a zygote rejection cannot turn into a pass.
+/// Kernel-audited fallback for a shard the zygote could not check (`run_audited_lean_shard`,
+/// sandboxed with a compiled-module audit in untrusted mode). A zygote rejection never reaches it.
 #[allow(clippy::too_many_arguments)]
 fn run_lean_temp_file(
     store: &TurboStore,
     lean_bin: &str,
-    tmp_path: &Path,
     src: &str,
     canon_dir: &Path,
     env_vars: &std::collections::HashMap<String, String>,
@@ -2612,46 +2610,16 @@ fn run_lean_temp_file(
         return Ok(out);
     }
 
-    // Unique per call: concurrent pr-verify runs in one process (MCP server, tests) share the
-    // pid-based staging names.
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp_path = &tmp_path.with_extension(format!("{}.lean", n));
-    let (audited_src, audited) = splitter::with_axiom_audit(src, audit);
-    fs::write(tmp_path, audited_src.as_bytes())?;
-    let mut cmd = Command::new(lean_bin);
-    for arg in crate::module_builder::filter_allowed_lean_args(lean_args) {
-        cmd.arg(arg);
-    }
-    cmd.arg(tmp_path).current_dir(canon_dir).envs(env_vars);
-    let out = cmd.output()?;
-    let _ = fs::remove_file(tmp_path);
-    if out.status.success() {
-        let mut reports = splitter::parse_print_axioms(&String::from_utf8_lossy(&out.stdout));
-        reports.retain(|(n, _)| splitter::matches_uncached_or_fast_verify_name(n, audit));
-        if audited < audit.len() || reports.len() < audited {
-            anyhow::bail!(
-                "[TurboLean.KernelGate] axiom audit incomplete: {} of {} theorems reported",
-                reports.len(),
-                audit.len()
-            );
-        }
-        // `sorryAx` comes from the shard's own `:= sorry` prefix stubs; `sorry` itself is gated
-        // by the hygiene scan of the modified files.
-        let bad: Vec<String> = reports
-            .iter()
-            .flat_map(|(n, axs)| axs.iter().map(move |a| (n, a)))
-            .filter(|(_, a)| !splitter::axiom_allowed(a) && a.as_str() != "sorryAx")
-            .map(|(n, a)| format!("`{}` depends on `{}`", n, a))
-            .collect();
-        if !bad.is_empty() {
-            anyhow::bail!(
-                "[TurboLean.KernelGate] disallowed axioms: {}",
-                bad.join(", ")
-            );
-        }
-    }
-    Ok(out)
+    crate::zygote::run_audited_lean_shard(
+        store,
+        Path::new(lean_bin),
+        env_vars,
+        Some(canon_dir),
+        src,
+        audit,
+        lean_args,
+        None,
+    )
 }
 
 /// Execute `turbo-lean seed-shards`.
@@ -4268,7 +4236,6 @@ pub fn run_pr_verify_command(
             (ev, lb, lp)
         };
 
-        let staging_dir = store.fast_staging_dir();
         let pid = std::process::id();
         let trusted_pkg_cfg = if is_untrusted {
             None
@@ -4368,46 +4335,52 @@ pub fn run_pr_verify_command(
                     &lean_path_str,
                     cross_args.clone(),
                 );
-                let mut cross_ok = if let Some(ref z_url) = fast_local_zygote_url {
-                    pack::try_zygote_url_check_shard_with_inflight(z_url, &zreq, || {
-                        let now = crate::db::now_unix();
-                        batch_to_publish.reserve(total_uncached);
-                        for (_rel_path, file_uncached, _) in &uncached_by_file {
-                            for (k, sh) in file_uncached {
-                                if let Ok(r_bytes) = serialize_shard_receipt_bytes(sh, now) {
-                                    batch_to_publish.push((
-                                        k.clone(),
-                                        sh.name.clone(),
-                                        r_bytes,
-                                        1i64,
-                                    ));
+                let cross_res = if let Some(ref z_url) = fast_local_zygote_url {
+                    pack::try_zygote_url_check_shard_inner_with_inflight_detailed(
+                        z_url,
+                        &zreq,
+                        || {
+                            let now = crate::db::now_unix();
+                            batch_to_publish.reserve(total_uncached);
+                            for (_rel_path, file_uncached, _) in &uncached_by_file {
+                                for (k, sh) in file_uncached {
+                                    if let Ok(r_bytes) = serialize_shard_receipt_bytes(sh, now) {
+                                        batch_to_publish.push((
+                                            k.clone(),
+                                            sh.name.clone(),
+                                            r_bytes,
+                                            1i64,
+                                        ));
+                                    }
                                 }
                             }
-                        }
-                        let _ = store.prestage_theorem_shard_blobs(&batch_to_publish);
-                        if store
-                            .begin_inflight_publish_theorem_shards(
-                                &toolchain,
-                                &trust_domain,
-                                &batch_to_publish,
-                            )
-                            .is_ok()
-                        {
-                            inflight_tx_open = true;
-                        }
-                    })
-                    .is_some()
+                            let _ = store.prestage_theorem_shard_blobs(&batch_to_publish);
+                            if store
+                                .begin_inflight_publish_theorem_shards(
+                                    &toolchain,
+                                    &trust_domain,
+                                    &batch_to_publish,
+                                )
+                                .is_ok()
+                            {
+                                inflight_tx_open = true;
+                            }
+                        },
+                    )
                 } else if !is_untrusted {
-                    pack::try_local_zygote_check_shard(store, &env_vars, &zreq).is_some()
+                    pack::try_local_zygote_check_shard_detailed(store, &env_vars, &zreq)
                 } else {
-                    false
+                    Ok(None)
                 };
+                let mut cross_ok = matches!(cross_res, Ok(Some(_)));
                 if !cross_ok {
                     if inflight_tx_open {
                         store.rollback_inflight_publish();
                         inflight_tx_open = false;
                     }
                     batch_to_publish.clear();
+                    cross_res
+                        .context("Zygote kernel gate rejected the cross-file PR shard batch")?;
                     if !is_untrusted && env_vars.is_empty() {
                         if let Ok((ev, _)) = resolve_lake_env(store, &canon_dir) {
                             env_vars = ev;
@@ -4418,7 +4391,6 @@ pub fn run_pr_verify_command(
                     } else {
                         lean_bin_from_env(&env_vars)
                     };
-                    let tmp_cross = staging_dir.join(format!("pr_verify_cross_{}.lean", pid));
                     let cross_names: std::collections::HashSet<String> = uncached_by_file
                         .iter()
                         .flat_map(|(_, fu, _)| fu.iter().map(|(_, sh)| sh.name.clone()))
@@ -4426,7 +4398,6 @@ pub fn run_pr_verify_command(
                     cross_ok = run_lean_temp_file(
                         store,
                         &lb,
-                        &tmp_cross,
                         &cross_src,
                         &canon_dir,
                         &env_vars,
@@ -4588,7 +4559,6 @@ pub fn run_pr_verify_command(
                         .iter()
                         .map(|(_, sh)| sh.name.clone())
                         .collect();
-                    let tmp_batch = staging_dir.join(format!("pr_verify_{}_{}.lean", pid, f_idx));
                     let f_t0 = Instant::now();
 
                     let mut verified_ok = false;
@@ -4618,7 +4588,8 @@ pub fn run_pr_verify_command(
                                         &lean_path_str,
                                         file_lean_args.clone(),
                                     );
-                                    if pack::try_zygote_url_check_shard_with_inflight(
+                                    let fast_res =
+                                        pack::try_zygote_url_check_shard_inner_with_inflight_detailed(
                                         z_url,
                                         &zreq,
                                         || {
@@ -4653,9 +4624,8 @@ pub fn run_pr_verify_command(
                                                 }
                                             }
                                         },
-                                    )
-                                    .is_some()
-                                    {
+                                    );
+                                    if matches!(fast_res, Ok(Some(_))) {
                                         verified_ok = true;
                                         local_fast_olean = true;
                                     } else {
@@ -4666,13 +4636,18 @@ pub fn run_pr_verify_command(
                                             local_tx_open = false;
                                         }
                                         local_publish.clear();
+                                        fast_res.with_context(|| {
+                                            format!(
+                                                "Zygote kernel gate rejected PR shards in {}",
+                                                rel_path
+                                            )
+                                        })?;
                                     }
                                 }
                                 if !verified_ok {
                                     if run_lean_temp_file(
                                         worker_store,
                                         &lean_bin,
-                                        &tmp_batch,
                                         &fast_src,
                                         &canon_dir,
                                         &env_vars,
@@ -4701,14 +4676,22 @@ pub fn run_pr_verify_command(
                                     &lean_path_str,
                                     file_lean_args.clone(),
                                 );
-                                if pack::try_zygote_url_check_shard(z_url, &zreq).is_some() {
+                                if pack::try_zygote_url_check_shard_inner_with_inflight_detailed(
+                                    z_url,
+                                    &zreq,
+                                    || {},
+                                )
+                                .with_context(|| {
+                                    format!("Zygote kernel gate rejected PR shards in {}", rel_path)
+                                })?
+                                .is_some()
+                                {
                                     return Ok(true);
                                 }
                             }
                             Ok(run_lean_temp_file(
                                 worker_store,
                                 &lean_bin,
-                                &tmp_batch,
                                 src_to_check,
                                 &canon_dir,
                                 &env_vars,
@@ -4724,7 +4707,6 @@ pub fn run_pr_verify_command(
                         let out = run_lean_temp_file(
                             worker_store,
                             &lean_bin,
-                            &tmp_batch,
                             &src,
                             &canon_dir,
                             &env_vars,
@@ -4779,9 +4761,7 @@ pub fn run_pr_verify_command(
                         )?;
                     } else {
                         let now = crate::db::now_unix();
-                        for (s_idx, (k, sh)) in file_uncached.iter().enumerate() {
-                            let tmp_single = staging_dir
-                                .join(format!("pr_verify_single_{}_{}_{}.lean", pid, f_idx, s_idx));
+                        for (k, sh) in file_uncached.iter() {
                             let s_t0 = Instant::now();
                             let single_src: std::borrow::Cow<'_, str> =
                                 if sh.shard_source.is_empty() {
@@ -4816,56 +4796,64 @@ pub fn run_pr_verify_command(
                                     allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
                                     lean_args: file_lean_args.clone(),
                                 };
-                                if pack::try_zygote_url_check_shard_with_inflight(
-                                    z_url,
-                                    &zreq,
-                                    || {
-                                        if file_uncached.len() == 1 {
-                                            if let Ok(r_bytes) =
-                                                serialize_shard_receipt_bytes(sh, now)
-                                            {
-                                                local_publish.push((
-                                                    k.clone(),
-                                                    sh.name.clone(),
-                                                    r_bytes,
-                                                    1i64,
-                                                ));
-                                                let _ = crate::db::prestage_theorem_shard_blobs_at(
-                                                    store_root,
-                                                    &local_publish,
-                                                );
-                                                if let Some(st) = inflight_store {
-                                                    if st
-                                                        .begin_inflight_publish_theorem_shards(
-                                                            &toolchain,
-                                                            &trust_domain,
+                                let single_res =
+                                    pack::try_zygote_url_check_shard_inner_with_inflight_detailed(
+                                        z_url,
+                                        &zreq,
+                                        || {
+                                            if file_uncached.len() == 1 {
+                                                if let Ok(r_bytes) =
+                                                    serialize_shard_receipt_bytes(sh, now)
+                                                {
+                                                    local_publish.push((
+                                                        k.clone(),
+                                                        sh.name.clone(),
+                                                        r_bytes,
+                                                        1i64,
+                                                    ));
+                                                    let _ =
+                                                        crate::db::prestage_theorem_shard_blobs_at(
+                                                            store_root,
                                                             &local_publish,
-                                                        )
-                                                        .is_ok()
-                                                    {
-                                                        local_tx_open = true;
+                                                        );
+                                                    if let Some(st) = inflight_store {
+                                                        if st
+                                                            .begin_inflight_publish_theorem_shards(
+                                                                &toolchain,
+                                                                &trust_domain,
+                                                                &local_publish,
+                                                            )
+                                                            .is_ok()
+                                                        {
+                                                            local_tx_open = true;
+                                                        }
                                                     }
                                                 }
                                             }
-                                        }
-                                    },
-                                )
-                                .is_some()
-                                {
+                                        },
+                                    );
+                                if matches!(single_res, Ok(Some(_))) {
                                     single_ok = true;
-                                } else if local_tx_open {
-                                    if let Some(st) = inflight_store {
-                                        st.rollback_inflight_publish();
+                                } else {
+                                    if local_tx_open {
+                                        if let Some(st) = inflight_store {
+                                            st.rollback_inflight_publish();
+                                        }
+                                        local_tx_open = false;
+                                        local_publish.clear();
                                     }
-                                    local_tx_open = false;
-                                    local_publish.clear();
+                                    single_res.with_context(|| {
+                                        format!(
+                                            "Zygote kernel gate rejected PR shard `{}` in {}",
+                                            sh.name, rel_path
+                                        )
+                                    })?;
                                 }
                             }
                             if !single_ok {
                                 let out = run_lean_temp_file(
                                     worker_store,
                                     &lean_bin,
-                                    &tmp_single,
                                     &single_src,
                                     &canon_dir,
                                     &env_vars,
@@ -6652,6 +6640,65 @@ end Fixture
         }
         let _ = fs::remove_dir_all(&repo_dir);
         let _ = fs::remove_dir_all(&fake_bwrap_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_trusted_pr_verify_rejects_metaprogram_sorry_proof_edits() -> Result<()> {
+        // Proof-only edits that close the goal with `sorryAx` without any `sorry`/`admit` token, in
+        // a file that spoofs `#print axioms`, are rejected end to end in trusted mode (by the
+        // statement-policy audit, a final zygote rejection, or the audited fallback).
+        let repo_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_pr_meta_sorry_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&repo_dir);
+        fs::create_dir_all(&repo_dir)?;
+        fs::write(
+            repo_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )?;
+        let spoof = "macro_rules\n  | `(#print axioms $i:ident) => `(#eval IO.println s!\"'{$(Lean.quote i.getId.toString)}' does not depend on any axioms\")\n";
+        let base = format!("import Lean\n{}theorem t : 2 + 2 = 4 := rfl\n", spoof);
+        fs::write(repo_dir.join("A.lean"), &base)?;
+        git_init_and_commit(&repo_dir, "base")?;
+        let proofs = [
+            "run_tac Lean.Elab.admitGoal (← Lean.Elab.Tactic.getMainGoal)",
+            "run_tac do\n    let g ← Lean.Elab.Tactic.getMainGoal\n    g.assign (← Lean.Meta.mkSorry (← g.getType) false)",
+            "run_tac do\n    let g ← Lean.Elab.Tactic.getMainGoal\n    g.assign (Lean.mkApp2 (Lean.mkConst (Lean.Name.mkSimple (\"sor\" ++ \"ryAx\")) [Lean.levelZero]) (← g.getType) (Lean.mkConst ``Bool.false))",
+        ];
+        for (i, proof) in proofs.iter().enumerate() {
+            let src = format!(
+                "import Lean\n{}theorem t : 2 + 2 = 4 := by\n  {}\n",
+                spoof, proof
+            );
+            fs::write(repo_dir.join("A.lean"), src)?;
+            let mut store = TurboStore::open(Some(&repo_dir.join(format!(".cache-{}", i))))?;
+            let res = run_pr_verify_command(
+                &mut store,
+                true,
+                repo_dir.clone(),
+                "HEAD".into(),
+                "trusted".into(),
+                false,
+                None,
+                None,
+                None,
+                None,
+                false,
+                0,
+                None,
+            );
+            let err = res.expect_err(&format!("metaprogram sorry #{} was accepted", i));
+            assert!(
+                format!("{:#}", err).contains("sorryAx"),
+                "#{}: {:#}",
+                i,
+                err
+            );
+        }
+        let _ = fs::remove_dir_all(&repo_dir);
         Ok(())
     }
 
