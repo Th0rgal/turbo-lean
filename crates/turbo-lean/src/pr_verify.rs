@@ -5940,13 +5940,25 @@ end Fixture
                 modules: BTreeMap::new(),
                 dep_lib_lean_dirs: Vec::new(),
             });
+        // Pin project-local imports to their (already recorded) entries, like a real build.
+        let import_olean_digests = crate::module_builder::parse_header_info(src_raw)
+            .imports
+            .into_iter()
+            .filter_map(|imp| {
+                let rel_slash = crate::module_builder::module_name_to_rel_slash(&imp);
+                let dep_src = crate::lake_build::resolve_project_lean_source(proj_dir, &rel_slash)?;
+                let dep_rel = dep_src.strip_prefix(proj_dir).ok()?.to_string_lossy().into_owned();
+                let dig = manifest.modules.get(&dep_rel)?.olean_artifact_digest.clone();
+                Some((imp, dig))
+            })
+            .collect();
         manifest.modules.insert(
             rel_src.to_string(),
             crate::module_builder::VerifiedDepModuleEntry {
                 src_blake3: blake3::hash(src_raw.as_bytes()).to_hex().to_string(),
                 olean_artifact_digest: art_dig,
                 kernel_audited: true,
-                import_olean_digests: BTreeMap::new(),
+                import_olean_digests,
             },
         );
         fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;

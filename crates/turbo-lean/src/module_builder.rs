@@ -9774,6 +9774,17 @@ lean_exe «demo-exe» where
         assert!(crate::lake_build::is_file_verified_in_lake_build(
             &canon, &canon_b, b_src
         ));
+        // Legacy entries without pinned import digests fail closed.
+        let manifest_path = crate::lake_build::verified_sources_manifest_path(&canon);
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        for entry in legacy["modules"].as_object_mut().unwrap().values_mut() {
+            entry.as_object_mut().unwrap().remove("import_olean_digests");
+        }
+        fs::write(&manifest_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(!crate::lake_build::is_file_verified_in_lake_build(
+            &canon, &canon_b, b_src
+        ));
         let _ = fs::remove_dir_all(&dir);
     }
 
