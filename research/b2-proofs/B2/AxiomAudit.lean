@@ -7,6 +7,8 @@ import B2.CollatzSource
 import B2.CollatzClif
 import B2.RunSafety
 import B2.CallFree
+import B2.BackendLower
+import B2.BackendEntry
 
 /-! A build-failing transitive axiom audit of the results claimed by B2-status.md.
 Historical draft statements are intentionally outside the active root. -/
@@ -36,7 +38,11 @@ run_cmd do
         ``B2.CollatzClif.slotless_leave, ``B2.RunSafety.collatz_run_prefix,
         ``B2.CallFree.declarations, ``B2.CallFree.try_free, ``B2.CallFree.no_indirect_stmt,
         ``B2.CallFree.no_indirect_sigs, ``B2.CallFree.no_tls,
-        ``B2.RunSafety.of_returned] do
+        ``B2.RunSafety.of_returned, ``B2.Artifacts.input_eq,
+        ``B2.Artifacts.verifiable, ``B2.Artifacts.lower,
+        ``B2.BackendEval.runTerm_of_apply,
+        ``B2.BackendEntry.entry_eq, ``B2.BackendEntry.returns,
+        ``B2.BackendEntry.reachable_step_safe, ``B2.BackendEntry.traps_explicit] do
       let axs ← Lean.collectAxioms name
       let rejected := axs.filter fun a => !allowed.contains a
       unless rejected.isEmpty do
