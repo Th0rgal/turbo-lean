@@ -4096,26 +4096,6 @@ fn checked_input_path(path: &Path) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
-/// Process-local memo for [`hash_input_target`], keyed by the input declaration plus the
-/// `(len, mtime)` of every file it selects. One command resolves the project config several times
-/// (`load_verified_project_manifest`, `update_with_lake_input_digests`, the DAG builder), and each
-/// resolve would otherwise re-read every byte of every declared input. The directory walk still
-/// runs, so the file set and its stats are always observed fresh; only the content hashing is
-/// reused.
-///
-/// `(len, mtime)` alone is not a safe content key in a process that outlives an edit (`serve`, the
-/// zygote daemon): a write that keeps the length and lands in the same filesystem mtime tick would
-/// be served the old hash. [`INPUT_MEMO_SETTLE`] closes that window.
-static INPUT_HASH_MEMO: OnceLock<Mutex<HashMap<String, (String, String)>>> = OnceLock::new();
-
-/// How far in the past every selected file's mtime must sit before its hash may be memoized.
-///
-/// A file touched more recently than this is hashed fresh on every resolve and never cached, so no
-/// `(len, mtime)` collision can hide an in-flight edit. Coarse-granularity filesystems (HFS+ and
-/// some network mounts tick once per second) are covered with room to spare, and the inputs a build
-/// actually re-reads are almost always older than this, so the memo still elides the repeat work.
-const INPUT_MEMO_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
-
 /// BLAKE3 and Lake file hash of the files an `input_file` / `input_dir` selects, read exactly like
 /// Lake's `inputFile` / `inputDir`: a recursive walk (following symlinks) of regular files kept by
 /// the extension filter, ordered by full path like Lake's `qsort (toString · < toString ·)`.
@@ -4126,6 +4106,15 @@ const INPUT_MEMO_SETTLE: std::time::Duration = std::time::Duration::from_secs(2)
 /// both hashes even when that target lives outside the repository. The pr-verify path classifier
 /// only sees git-tracked paths and would not report such a file as changed, but the digests here --
 /// and so [`compute_module_cas_key`] -- still move when its contents do.
+///
+/// Deliberately **not** memoized by `(path, len, mtime)`. One command resolves the project config
+/// several times, so a cache would save real work, but these digests gate `.olean` reuse and a
+/// stats-keyed cache is only sound here if it can be bypassed for untrusted input -- which is what
+/// `load_project_stat_summary_cached` does, and why `ci-verify` re-reads sources in untrusted mode.
+/// Trust is not plumbed through `resolve_package_config`, so there is nothing to bypass on, and a
+/// same-length write with a restored mtime -- the poisoning the untrusted `ci-verify` test
+/// simulates with `utimensat` -- would be served the cached hash inside one long-lived `serve` or
+/// zygote process. Memoizing per top-level command, cleared at dispatch, would be the safe form.
 fn hash_input_target(pkg_root: &Path, input: &InputTargetConfig) -> Result<(String, String)> {
     let root = pkg_root.join(checked_input_path(&input.path)?);
     let mut files = vec![root.clone()];
@@ -4145,54 +4134,6 @@ fn hash_input_target(pkg_root: &Path, input: &InputTargetConfig) -> Result<(Stri
             }
         }
         files.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
-    }
-    let mut memo_key = format!(
-        "{}\u{0}{}\u{0}{}{}\u{0}{}",
-        pkg_root.display(),
-        input.path.display(),
-        u8::from(input.is_dir),
-        u8::from(input.text),
-        input.extension.as_deref().unwrap_or("")
-    );
-    // Only files that have been still for `INPUT_MEMO_SETTLE` may be keyed by `(len, mtime)`; one
-    // recently written file makes this whole target hash fresh every time.
-    let mut memoizable = true;
-    let settled_before = std::time::SystemTime::now()
-        .checked_sub(INPUT_MEMO_SETTLE)
-        .unwrap_or(std::time::UNIX_EPOCH);
-    for f in &files {
-        let Ok(m) = fs::metadata(f) else {
-            // Unreadable here means the read below will fail too, or the walk raced a deletion;
-            // either way do not record a hash for a file set we could not fully stat.
-            memoizable = false;
-            continue;
-        };
-        let Ok(mtime) = m.modified() else {
-            memoizable = false;
-            continue;
-        };
-        if mtime > settled_before {
-            memoizable = false;
-        }
-        let nanos = mtime
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        memo_key.push_str(&format!(
-            "\u{0}{}\u{0}{}\u{0}{}",
-            f.display(),
-            m.len(),
-            nanos
-        ));
-    }
-    let memo = INPUT_HASH_MEMO.get_or_init(Default::default);
-    if memoizable {
-        if let Some(hit) = memo
-            .lock()
-            .ok()
-            .and_then(|cache| cache.get(&memo_key).cloned())
-        {
-            return Ok(hit);
-        }
     }
     let mut h = blake3::Hasher::new();
     h.update(b"turbo-lean-lake-input-v1\n");
@@ -4222,13 +4163,7 @@ fn hash_input_target(pkg_root: &Path, input: &InputTargetConfig) -> Result<(Stri
         );
         update_hasher_lp(&mut h, &bytes);
     }
-    let out = (h.finalize().to_hex().to_string(), format!("{lake:016x}"));
-    if memoizable {
-        if let Ok(mut cache) = memo.lock() {
-            cache.insert(memo_key, out.clone());
-        }
-    }
-    Ok(out)
+    Ok((h.finalize().to_hex().to_string(), format!("{lake:016x}")))
 }
 
 fn finalize_package_config(
