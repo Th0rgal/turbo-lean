@@ -2284,6 +2284,23 @@ open LeanNative.IR LeanNative.Proofs
     let projSortBad := validateTranslationDecl (mkProjCachedSortDecl false cmpProjected) (mkProjCachedSortDecl true cmpProjected) 8
     unless !projSortBad.symRetEquiv && !projSortBad.passed do
       throw <| IO.userError s!"ctorGetScalar overwrote cached field runtime sort (cmpProjected={cmpProjected}): {reprStr projSortBad}"
+  let mkProjTupleOnHeapCtorDecl (projHeap : Bool) : LNIRDecl := {
+    name := "proj_tuple_on_heap_ctor"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 1 .objPtr (.allocCtor 0 [] [0])
+        (if projHeap then
+           .letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+             (.ite 2
+               (.letBind 3 .i64 (.projTuple 1 0) (.decRef 1 1 (.letBind 4 .i64 (.scalar (.constU64 0)) (.ret 4))))
+               (.decRef 1 1 (.letBind 4 .i64 (.scalar (.constU64 0)) (.ret 4))))
+         else
+           .decRef 1 1 (.letBind 4 .i64 (.scalar (.constU64 0)) (.ret 4)))
+  }
+  let projHeapBad := validateTranslationDecl (mkProjTupleOnHeapCtorDecl false) (mkProjTupleOnHeapCtorDecl true) 8
+  unless !projHeapBad.ubRefines && !projHeapBad.passed do
+    throw <| IO.userError s!"projTuple on heap constructor root accepted: {reprStr projHeapBad}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)

@@ -1431,47 +1431,57 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
         | e => e
     (st.markTypedTuple dst).bindVar dst { expr := .tuple fieldExprs, nonPoison := svs.all (·.nonPoison), noUB := svs.all (·.noUB) }
   | .projTuple tupleVar idx =>
-    let tv := st.lookupVar (st.resolveBuf tupleVar)
-    match tv.expr with
-    | .tuple fs =>
-      match fs[idx]? with
-      | some fExpr =>
-        let st' :=
-          match fExpr with
-          | .symVar fId =>
-            let eff := st.resolveBuf fId
-            let isHeapOrBuf :=
-              st.allocRoots.contains eff || (st.refCounts.lookup eff).isSome ||
-              (st.rcExprs.lookup eff).isSome || st.exclusiveBufs.contains eff ||
-              st.extSeenRoots.contains eff ||
-              (match (st.lookupVar eff).expr with
-               | .tuple _ => !(st.typedTuples.contains eff)
-               | _ => false)
-            if isHeapOrBuf || callSlotKind dstTy == some true then st.aliasBuf dst eff
-            else st.clearAlias dst
-          | _ => st.clearAlias dst
-        let isTypedSubTuple :=
-          match fExpr with
-          | .tuple _ => true
-          | _ => false
-        let stSort :=
-          if isTypedSubTuple then st'.markTypedTuple dst
-          else
-            match symExprScalarSort? st' fExpr with
-            | some 0 => st'.markBoolVar dst
-            | some 1 => st'.markU64Var dst
-            | some 2 => st'.markU256Var dst
-            | _ =>
-              if dstTy == .i1 then st'.markBoolVar dst
-              else if dstTy == .u256 || dstTy == .i256 then st'.markU256Var dst
-              else if callSlotKind dstTy == some false && dstTy != .unit then st'.markU64Var dst
-              else st'
-        stSort.bindVar dst { expr := fExpr, nonPoison := tv.nonPoison, noUB := tv.noUB }
-      | none => (st.clearAlias dst).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
-    | _ =>
-      -- Projected field from a non-tuple or unresolved conditional `.ite` tuple:
-      -- mark symbolic execution unsupported so TV fails closed even in `src`!
-      ((st.clearAlias dst).markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+    let root := st.resolveBuf tupleVar
+    let tv := st.lookupVar root
+    if st.isDefinitelyHeapRoot root || st.boolVars.contains root || st.u64Vars.contains root || st.u256Vars.contains root ||
+       st.isImmediateScalarObj root then
+      ((st.clearAlias dst).unmarkTypedTuple dst).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+    else
+      match tv.expr with
+      | .tuple fs =>
+        if st.typedTuples.contains root then
+          match fs[idx]? with
+          | some fExpr =>
+            let st' :=
+              match fExpr with
+              | .symVar fId =>
+                let eff := st.resolveBuf fId
+                let isHeapOrBuf :=
+                  st.allocRoots.contains eff || st.sarrayVars.contains eff || st.objPtrVars.contains eff ||
+                  (st.refCounts.lookup eff).isSome || (st.rcExprs.lookup eff).isSome || st.exclusiveBufs.contains eff ||
+                  st.extSeenRoots.contains eff ||
+                  (match (st.lookupVar eff).expr with
+                   | .tuple _ => !(st.typedTuples.contains eff)
+                   | _ => false)
+                if isHeapOrBuf || callSlotKind dstTy == some true then st.aliasBuf dst eff
+                else st.clearAlias dst
+              | _ => st.clearAlias dst
+            let isTypedSubTuple :=
+              match fExpr with
+              | .tuple _ => true
+              | .symVar fId => st.typedTuples.contains (st.resolveBuf fId)
+              | _ => false
+            let stSort :=
+              if isTypedSubTuple then st'.markTypedTuple dst
+              else
+                let stU := st'.unmarkTypedTuple dst
+                match symExprScalarSort? stU fExpr with
+                | some 0 => stU.markBoolVar dst
+                | some 1 => stU.markU64Var dst
+                | some 2 => stU.markU256Var dst
+                | _ =>
+                  if dstTy == .i1 then stU.markBoolVar dst
+                  else if dstTy == .u256 || dstTy == .i256 then stU.markU256Var dst
+                  else if callSlotKind dstTy == some false && dstTy != .unit then stU.markU64Var dst
+                  else stU
+            stSort.bindVar dst { expr := fExpr, nonPoison := tv.nonPoison, noUB := tv.noUB }
+          | none => ((st.clearAlias dst).unmarkTypedTuple dst).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+        else
+          ((st.clearAlias dst).unmarkTypedTuple dst).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+      | _ =>
+        -- Projected field from an unresolved non-tuple or conditional `.ite` tuple:
+        -- mark symbolic execution unsupported so TV fails closed even in `src`!
+        (((st.clearAlias dst).unmarkTypedTuple dst).markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
   | .allocCtor tag objFields scalarFields =>
     let svs := (objFields ++ scalarFields).map st.lookupVar
     let objectExprs := objFields.map fun v =>
@@ -1502,6 +1512,10 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
           else if callSlotKind projSortTy == some false && projSortTy != .unit then cur.markU64Var vid
           else cur
     let rootVar := st.resolveBuf ctorVar
+    if st.typedTuples.contains rootVar || st.sarrayVars.contains rootVar ||
+       st.boolVars.contains rootVar || st.u64Vars.contains rootVar || st.u256Vars.contains rootVar then
+      ((st.clearAlias dst).unmarkTypedTuple dst).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+    else
     let liveOk := st.isBufLive rootVar
     let stLive := (st.requireUbCond (st.liveRcCond rootVar)).noteExtLiveRoot rootVar
     let cv := stLive.lookupVar rootVar
@@ -1754,6 +1768,13 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
     | false, [objVar, idxVar, valVar] =>
       if fnName == "lean_native_ctor_set" && retTy == .unit then
         let root := st.resolveBuf objVar
+        let idxRoot := st.resolveBuf idxVar
+        if st.typedTuples.contains root || st.sarrayVars.contains root ||
+           st.boolVars.contains root || st.u64Vars.contains root || st.u256Vars.contains root ||
+           st.typedTuples.contains idxRoot || st.isDefinitelyHeapRoot idxRoot ||
+           st.boolVars.contains idxRoot || st.u256Vars.contains idxRoot then
+          ((st.clearAlias dst).unmarkTypedTuple dst).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+        else
         let objSv := st.lookupVar root
         let idxSv := st.lookupVar idxVar
         let valRoot := st.resolveBuf valVar
@@ -1928,7 +1949,12 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
           let st1 := symEvalExpr st0 dst ty val
           symExecCode fuel' unrollBound st1 k
       | .projTuple tupleVar idx =>
-        let tv := st.lookupVar (st.resolveBuf tupleVar)
+        let tRoot := st.resolveBuf tupleVar
+        let tv := st.lookupVar tRoot
+        if !(st.typedTuples.contains tRoot) || st.isDefinitelyHeapRoot tRoot then
+          let st1 := symEvalExpr st dst ty val
+          symExecCode fuel' unrollBound st1 k
+        else
         match tv.expr with
         | .tuple fs =>
           match fs[idx]? with
@@ -1950,7 +1976,7 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
                   let s1 := (curSt.clearAlias tmpId).bindVar tmpId { expr := .tuple [bExpr], nonPoison := tv.nonPoison, noUB := tv.noUB }
                   let s2 := s1.markTypedTuple tmpId
                   (s2, .letBind dst ty (.projTuple tmpId 0) k)
-              let stCond := (st.clearAlias condTmp).bindVar condTmp { expr := cond, nonPoison := tv.nonPoison, noUB := tv.noUB }
+              let stCond := ((st.clearAlias condTmp).markBoolVar condTmp).bindVar condTmp { expr := cond, nonPoison := tv.nonPoison, noUB := tv.noUB }
               let (stWithT, codeT) := mkBranchBind tTmp tBranch stCond
               let (stWithTE, codeE) := mkBranchBind eTmp eBranch stWithT
               symExecCode fuel' unrollBound stWithTE (.ite condTmp codeT codeE)
@@ -1966,6 +1992,11 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
       | .ctorGetObj ctorVar idx =>
         let rootVar := st.resolveBuf ctorVar
         let cv := st.lookupVar rootVar
+        if st.typedTuples.contains rootVar || st.sarrayVars.contains rootVar ||
+           st.boolVars.contains rootVar || st.u64Vars.contains rootVar || st.u256Vars.contains rootVar then
+          let st1 := symEvalExpr st dst ty val
+          symExecCode fuel' unrollBound st1 k
+        else
         match cv.expr with
         | .tuple (_tag :: fs) =>
           match fs[idx]? with
@@ -1987,7 +2018,7 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
                 let s1 := (curSt.clearAlias tmpId).bindVar tmpId { expr := .tuple [bExpr], nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
                 let s2 := s1.markTypedTuple tmpId
                 (s2, .letBind dst ty (.projTuple tmpId 0) k)
-            let stCond := (stLive.clearAlias condTmp).bindVar condTmp { expr := cond, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
+            let stCond := ((stLive.clearAlias condTmp).markBoolVar condTmp).bindVar condTmp { expr := cond, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
             let (stWithT, codeT) := mkBranchBind tTmp tBranch stCond
             let (stWithTE, codeE) := mkBranchBind eTmp eBranch stWithT
             symExecCode fuel' unrollBound stWithTE (.ite condTmp codeT codeE)
