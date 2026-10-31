@@ -154,8 +154,9 @@ pub(crate) fn git(project: &Path) -> Result<GitCommand> {
         command
     };
     let mut command = prepare();
-    // Worktree checkout can otherwise execute repository-configured filters.
-    // `git config` only reads data; suppress each filter before any operation.
+    // Status/diff can run clean filters in this repository. Suppress its filters.
+    // This is NOT checkout isolation: conditional includes can change with the
+    // git directory. Verification snapshots must use raw objects, never checkout.
     let filters = command
         .args(["-C"])
         .arg(project)
