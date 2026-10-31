@@ -228,6 +228,14 @@ end
 
 /-! ## Symbolic Execution of `ScalarExpr`, `LNIRExpr`, `LNIRCode`, and `LNIRDecl` -/
 
+inductive SymRootKind where
+  | objPtr
+  | taggedPtr
+  | sarray
+  | rawPtr (bufRoot : VarId)
+  | storageMap
+  deriving Repr, DecidableEq, Inhabited, BEq
+
 /-- Symbolic execution state tracking variable bindings, buffer aliases, exclusivity,
     normalized memory writes, and Alive2 `noUB` / `nonPoison` flags. -/
 structure SymExecState where
@@ -235,6 +243,7 @@ structure SymExecState where
   bufAliases      : List (VarId × VarId) := []
   exclusiveBufs   : List VarId := []
   maybeScalarRoots : List VarId := []
+  rootKinds       : List (VarId × SymRootKind) := []
   rootRc          : List (VarId × Nat × Option Nat) := []
   rootRcEpoch     : List (VarId × SymExpr) := []
   objRoots      : List (VarId × List (Option VarId)) := []
@@ -335,12 +344,30 @@ def isBufExclusive (st : SymExecState) (bufVar : VarId) : Bool :=
 def isFreshRuntimeAllocRoot (st : SymExecState) (r : VarId) : Bool :=
   st.freshCtorRoots.contains r || (st.heapAllocSeq.lookup r).isSome
 
+def setRootKind (st : SymExecState) (root : VarId) (kind : SymRootKind) : SymExecState :=
+  { st with rootKinds := (root, kind) :: st.rootKinds.filter (fun (id, _) => id != root) }
+
+def getRootKind? (st : SymExecState) (v : VarId) : Option SymRootKind :=
+  st.rootKinds.lookup (st.resolveBuf v)
+
+def isNonRcRoot (st : SymExecState) (root : VarId) : Bool :=
+  match st.rootKinds.lookup root with
+  | some (.rawPtr _) | some .storageMap => true
+  | _ => false
+
+def isRootLive (st : SymExecState) (root : VarId) : Bool :=
+  let (minRc, exactRc?) := st.getRootRc root
+  minRc > 0 && exactRc? != some 0
+
 def hasKnownRootTracking (st : SymExecState) (root : VarId) : Bool :=
   match (st.lookupVar root).expr with
   | .symVar base =>
-    base == root && ((st.rootRc.lookup root).isSome || st.exclusiveBufs.contains root || !(st.vars.lookup root).isSome)
+    base == root && ((st.rootKinds.lookup root).isSome || (st.rootRc.lookup root).isSome ||
+      st.exclusiveBufs.contains root || !(st.vars.lookup root).isSome)
   | .ctorObj .. | .tuple _ =>
-    (st.rootRc.lookup root).isSome || st.exclusiveBufs.contains root
+    (st.rootKinds.lookup root).isSome || (st.rootRc.lookup root).isSome || st.exclusiveBufs.contains root
+  | .projSym 5 base 0 =>
+    st.rootKinds.lookup root == some (.rawPtr base)
   | _ => false
 
 def dropAliasedRootBounds (st : SymExecState) (keepRoot : VarId) : SymExecState :=
@@ -364,7 +391,7 @@ def incRootRc (st : SymExecState) (objVar : VarId) (count : Nat) : SymExecState 
   match sv.expr with
   | .constU64 _ | .constBool _ | .unit | .tuple _ => st
   | _ =>
-    if isImmSymExpr st.immRoots sv.expr then st
+    if isImmSymExpr st.immRoots sv.expr || (st.hasKnownRootTracking root && st.isNonRcRoot root) then st
     else if !st.hasKnownRootTracking root then
       if count == 0 then st else { st with noUB := false, supported := false }
     else
@@ -428,6 +455,13 @@ def mergeBranches (base stT stE : SymExecState) (cExpr : SymExpr) (condNoUB cond
     | some fsT, some fsE => if fsT == fsE then some (v, fsT) else none
     | _, _ => none
   let mergedMaybeScalar := dedupIds (base.maybeScalarRoots ++ stT.maybeScalarRoots ++ stE.maybeScalarRoots)
+  let kindKeys := dedupIds (base.rootKinds.map (·.1) ++ stT.rootKinds.map (·.1) ++ stE.rootKinds.map (·.1))
+  let mergedRootKinds := kindKeys.filterMap fun r =>
+    match stT.rootKinds.lookup r, stE.rootKinds.lookup r, base.rootKinds.lookup r with
+    | some kT, some kE, _ => if kT == kE then some (r, kT) else none
+    | some kT, none, none => if !(stE.vars.lookup r).isSome then some (r, kT) else none
+    | none, some kE, none => if !(stT.vars.lookup r).isSome then some (r, kE) else none
+    | _, _, _ => none
   let epKeys := dedupIds (rcKeys ++ base.rootRcEpoch.map (·.1) ++ stT.rootRcEpoch.map (·.1) ++ stE.rootRcEpoch.map (·.1))
   let mergedRootRcEpoch := epKeys.filterMap fun r =>
     let epT := stT.getRootRcEpoch r
@@ -444,6 +478,7 @@ def mergeBranches (base stT stE : SymExecState) (cExpr : SymExpr) (condNoUB cond
     bufAliases := mergedAliases
     exclusiveBufs := mergedExcl
     maybeScalarRoots := mergedMaybeScalar
+    rootKinds := mergedRootKinds
     rootRc := mergedRc
     rootRcEpoch := mergedRootRcEpoch
     objRoots := mergedObjRoots
@@ -521,7 +556,7 @@ mutual
           | some fs => decRootListFuel fuel true st (fs.filterMap id) count
           | none => { st with noUB := false, supported := false }
       | _ =>
-        if isImmSymExpr st.immRoots sv.expr then st
+        if isImmSymExpr st.immRoots sv.expr || (st.hasKnownRootTracking root && st.isNonRcRoot root) then st
         else if !st.hasKnownRootTracking root then
           if count == 0 then st else { st with noUB := false, supported := false }
         else
@@ -575,7 +610,8 @@ def delRootShell (st : SymExecState) (objVar : VarId) : SymExecState :=
   match sv.expr with
   | .constU64 _ | .constBool _ | .unit | .tuple _ => st
   | _ =>
-    if isImmSymExpr st.immRoots sv.expr then st
+    if isImmSymExpr st.immRoots sv.expr ||
+       (st.hasKnownRootTracking root && (st.isNonRcRoot root || st.rootKinds.lookup root == some .sarray)) then st
     else if !st.hasKnownRootTracking root then { st with noUB := false, supported := false }
     else
       let (_, exactRc?) := st.getRootRc root
@@ -621,7 +657,8 @@ def allocFreshHeapRoot (st : SymExecState) (isCtor : Bool) : VarId × SymExpr ×
   (r, seq, { st1 with
     freshCtorRoots := if isCtor then r :: st1.freshCtorRoots else st1.freshCtorRoots
     heapAllocSeq := st1.heapAllocSeq ++ [(r, seq)]
-    nextHeapId := nextSeq })
+    nextHeapId := nextSeq
+    rootKinds := (r, if isCtor then .objPtr else .sarray) :: st1.rootKinds })
 
 def allocFreshCtor (st : SymExecState) : VarId × SymExpr × SymExecState :=
   st.allocFreshHeapRoot true
@@ -650,13 +687,19 @@ def trackedTupleParamRoots : Nat → LNIRType → SymExecState → Option VarId 
     match ty with
     | .rawPtr _ =>
       let (r, st1) := st.allocParamRoot
-      (some r, st1.markExclusive r)
+      (some r, (st1.markExclusive r).setRootKind r (.rawPtr r))
     | .taggedPtr =>
       let (r, st1) := st.allocParamRoot
-      (some r, (st1.setRootRc r 1 none).markMaybeScalar r)
-    | .objPtr | .sarray _ | .storageMap =>
+      (some r, ((st1.setRootRc r 1 none).markMaybeScalar r).setRootKind r .taggedPtr)
+    | .objPtr =>
       let (r, st1) := st.allocParamRoot
-      (some r, st1.setRootRc r 1 none)
+      (some r, (st1.setRootRc r 1 none).setRootKind r .objPtr)
+    | .sarray _ =>
+      let (r, st1) := st.allocParamRoot
+      (some r, (st1.setRootRc r 1 none).setRootKind r .sarray)
+    | .storageMap =>
+      let (r, st1) := st.allocParamRoot
+      (some r, (st1.setRootRc r 1 none).setRootKind r .storageMap)
     | .tuple fs =>
       let (r, st0) := st.allocParamRoot
       let (childRoots, st1) := fs.foldl (fun (acc, curSt) fty =>
@@ -697,7 +740,8 @@ def isHeapish (st : SymExecState) (v : VarId) : Bool :=
 def trackedRoot? (st : SymExecState) (v : VarId) : Option VarId :=
   let r := st.resolveBuf v
   let hasTup := (st.tupleRoots.lookup r).isSome
-  if (st.bufAliases.lookup v).isSome || (st.rootRc.lookup r).isSome || st.exclusiveBufs.contains r || hasTup then
+  if (st.bufAliases.lookup v).isSome || (st.rootKinds.lookup r).isSome ||
+     (st.rootRc.lookup r).isSome || st.exclusiveBufs.contains r || hasTup then
     some r
   else
     none
@@ -787,9 +831,10 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
         match st.trackedRoot? src with
         | some r =>
           if st.isHeapish src then
-            match sv.expr with
-            | .symVar _ => { sv with expr := .symVar r }
-            | _ => sv
+            match sv.expr, (st.lookupVar r).expr with
+            | .symVar _, .projSym 5 base 0 => { sv with expr := .projSym 5 base 0 }
+            | .symVar _, _ => { sv with expr := .symVar r }
+            | _, _ => sv
           else sv
         | none => sv
       | _ => sv
@@ -819,21 +864,49 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
       nonPoison := sa.nonPoison && sb.nonPoison && sd.nonPoison
       noUB := sa.noUB && sb.noUB && sd.noUB && !divZero
     }
-  | .storageLoad mapVar slotVar | .sarrayGet mapVar slotVar _ | .rawLoad mapVar slotVar _ =>
+  | .storageLoad mapVar slotVar =>
     let root := st.resolveBuf mapVar
     let mv := st.lookupVar root
-    let knownOk := st.hasKnownRootTracking root
+    let kindOk := match st.rootKinds.lookup root with
+      | none | some .storageMap => st.hasKnownRootTracking root
+      | _ => false
     let st0 := st.clearDstTracking dst
     let slotSv := st.lookupVar slotVar
-    let elemExpr := st.readBufSym mapVar slotSv.expr
-    let st1 := st0.bindVar dst { expr := elemExpr, nonPoison := mv.nonPoison && slotSv.nonPoison, noUB := mv.noUB && slotSv.noUB && knownOk }
-    { st1 with supported := st1.supported && knownOk }
+    let elemExpr := st.readBufSym root slotSv.expr
+    let st1 := st0.bindVar dst { expr := elemExpr, nonPoison := mv.nonPoison && slotSv.nonPoison, noUB := mv.noUB && slotSv.noUB && kindOk }
+    { st1 with supported := st1.supported && kindOk }
+  | .sarrayGet arrVar idxVar _ =>
+    let root := st.resolveBuf arrVar
+    let mv := st.lookupVar root
+    let kindOk := match st.rootKinds.lookup root with
+      | none | some .sarray => st.hasKnownRootTracking root && st.isRootLive root
+      | _ => false
+    let st0 := st.clearDstTracking dst
+    let idxSv := st.lookupVar idxVar
+    let elemExpr := st.readBufSym root idxSv.expr
+    let st1 := st0.bindVar dst { expr := elemExpr, nonPoison := mv.nonPoison && idxSv.nonPoison, noUB := mv.noUB && idxSv.noUB && kindOk }
+    { st1 with supported := st1.supported && kindOk }
+  | .rawLoad ptrVar idxVar _ =>
+    let root := st.resolveBuf ptrVar
+    let mv := st.lookupVar root
+    let (bufRoot, kindOk) := match st.rootKinds.lookup root with
+      | some (.rawPtr br) => (br, st.hasKnownRootTracking root && st.isRootLive br)
+      | none | some .sarray => (root, st.hasKnownRootTracking root && st.isRootLive root)
+      | _ => (root, false)
+    let st0 := st.clearDstTracking dst
+    let idxSv := st.lookupVar idxVar
+    let elemExpr := st.readBufSym bufRoot idxSv.expr
+    let st1 := st0.bindVar dst { expr := elemExpr, nonPoison := mv.nonPoison && idxSv.nonPoison, noUB := mv.noUB && idxSv.noUB && kindOk }
+    { st1 with supported := st1.supported && kindOk }
   | .storageStore mapVar slotVar valVar =>
     let root := st.resolveBuf mapVar
     let mv := st.lookupVar root
     let slotSv := st.lookupVar slotVar
     let valSv := st.lookupVar valVar
-    if !st.hasKnownRootTracking root then
+    let kindOk := match st.rootKinds.lookup root with
+      | none | some .storageMap => st.hasKnownRootTracking root
+      | _ => false
+    if !kindOk then
       let st1 := (st.clearDstTracking dst).bindVar dst { expr := .symVar root, nonPoison := false, noUB := false }
       { st1 with supported := false }
     else
@@ -861,7 +934,10 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
       match fs[idx]? with
       | some fExpr =>
         let fExpr' := match fieldRoot?, fExpr with
-          | some r, .symVar _ => if (st.rootRc.lookup r).isSome || st.exclusiveBufs.contains r then .symVar r else fExpr
+          | some r, .symVar _ =>
+            match (st.lookupVar r).expr with
+            | .projSym 5 base 0 => .projSym 5 base 0
+            | _ => if (st.rootRc.lookup r).isSome || st.exclusiveBufs.contains r then .symVar r else fExpr
           | _, _ => fExpr
         stA.bindVar dst { expr := fExpr', nonPoison := tv.nonPoison, noUB := tv.noUB }
       | none => st0.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
@@ -890,8 +966,8 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
       let outExpr := match fieldRoot?, curFs with
         | some kr, _ =>
           let ksv := st.lookupVar kr
-          if ksv.expr matches .tuple _ then ksv.expr
-          else if (st.rootRc.lookup kr).isSome || st.exclusiveBufs.contains kr then .symVar kr
+          if ksv.expr matches .tuple _ | .projSym 5 _ 0 then ksv.expr
+          else if (st.rootKinds.lookup kr).isSome || (st.rootRc.lookup kr).isSome || st.exclusiveBufs.contains kr then .symVar kr
           else .projSym 2 base idx
         | none, none => .symVar r
         | none, some fs => if idx < fs.length then .projSym 0 base idx else .projSym 2 base idx
@@ -1009,7 +1085,10 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
     let st0 := st.clearDstTracking dst
     let (minRc, exactRc?) := st.getRootRc root
     let maybeScalar := st.maybeScalarRoots.contains root
-    if isImmSymExpr st.immRoots ov.expr && !st.hasKnownRootTracking root then
+    let nonRc := match st.rootKinds.lookup root with
+      | some (.rawPtr _) | some .storageMap => true
+      | _ => false
+    if nonRc || (isImmSymExpr st.immRoots ov.expr && !st.hasKnownRootTracking root) then
       st0.bindVar dst { expr := .constBool true, nonPoison := ov.nonPoison, noUB := ov.noUB }
     else if !st.hasKnownRootTracking root then
       let st1 := st0.bindVar dst { expr := .exclCheck st.rcEpoch (st.rootIdentitySym root), nonPoison := ov.nonPoison, noUB := false }
@@ -1027,23 +1106,43 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
   | .sarrayLen arrVar =>
     let root := st.resolveBuf arrVar
     let av := st.lookupVar root
-    let knownOk := st.hasKnownRootTracking root
+    let kindOk := match st.rootKinds.lookup root with
+      | none | some .sarray => st.hasKnownRootTracking root && st.isRootLive root
+      | _ => false
     let st0 := st.clearDstTracking dst
-    let st1 := st0.bindVar dst { expr := .arrLen root, nonPoison := av.nonPoison, noUB := av.noUB && knownOk }
-    { st1 with supported := st1.supported && knownOk }
-  | .sarrayDataPtr arrVar _elemTy =>
+    let st1 := st0.bindVar dst { expr := .arrLen root, nonPoison := av.nonPoison, noUB := av.noUB && kindOk }
+    { st1 with supported := st1.supported && kindOk }
+    | .sarrayDataPtr arrVar _elemTy =>
     let root := st.resolveBuf arrVar
     let av := st.lookupVar root
-    let knownOk := st.hasKnownRootTracking root
-    let exclOk := st.isBufExclusive root && knownOk
-    let st1 := ((st.clearDstTracking dst).aliasBuf dst root).bindVar dst { expr := .symVar root, nonPoison := av.nonPoison, noUB := av.noUB && exclOk }
-    { st1 with supported := st1.supported && knownOk }
+    match st.rootKinds.lookup root with
+    | some (.rawPtr _) =>
+      let knownOk := st.hasKnownRootTracking root
+      let st1 := ((st.clearDstTracking dst).aliasBuf dst root).bindVar dst
+        { expr := av.expr, nonPoison := av.nonPoison, noUB := av.noUB && knownOk }
+      { st1 with supported := st1.supported && knownOk }
+    | none | some .sarray =>
+      let rawR := st.projSyntheticRoot 5 root 0
+      let knownOk := st.hasKnownRootTracking root && st.isRootLive root
+      let exclOk := knownOk && st.isBufExclusive root
+      let rawSv : SymStateVal := { expr := .projSym 5 root 0, nonPoison := av.nonPoison, noUB := av.noUB && exclOk }
+      let st0 := ((st.clearDstTracking dst).setRootKind rawR (.rawPtr root)).bindVar rawR rawSv
+      let st1 := (st0.aliasBuf dst rawR).bindVar dst rawSv
+      { st1 with supported := st1.supported && knownOk }
+    | _ =>
+      let st1 := (st.clearDstTracking dst).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+      { st1 with supported := false }
   | .sarrayEnsureExclusive arrVar _elemTy =>
     let root := st.resolveBuf arrVar
     let av := st.lookupVar root
-    if !st.hasKnownRootTracking root then
+    let kindOk := match st.rootKinds.lookup root with
+      | none | some .sarray => st.hasKnownRootTracking root
+      | _ => false
+    if !kindOk then
       let st1 := (st.clearDstTracking dst).bindVar dst { expr := .symVar root, nonPoison := av.nonPoison, noUB := false }
       { st1 with supported := false }
+    else if !st.isRootLive root then
+      (st.clearDstTracking dst).bindVar dst { expr := .symVar root, nonPoison := av.nonPoison, noUB := false }
     else
       let stBase := if st.isFreshRuntimeAllocRoot root then st else st.dropAliasedRootBounds root
       let st1 := ((((stBase.clearDstTracking dst).markExclusive root).recordRootRcOp root 9 (.constU64 1)).aliasBuf dst root).bindVar dst
@@ -1054,9 +1153,14 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
     let av := st.lookupVar root
     let idxSv := st.lookupVar idxVar
     let valSv := st.lookupVar valVar
-    if !st.hasKnownRootTracking root then
+    let kindOk := match st.rootKinds.lookup root with
+      | none | some .sarray => st.hasKnownRootTracking root
+      | _ => false
+    if !kindOk then
       let st1 := (st.clearDstTracking dst).bindVar dst { expr := .symVar root, nonPoison := false, noUB := false }
       { st1 with supported := false }
+    else if !st.isRootLive root then
+      (st.clearDstTracking dst).bindVar dst { expr := .symVar root, nonPoison := false, noUB := false }
     else
       let stBase := if st.isFreshRuntimeAllocRoot root then st else st.dropAliasedRootBounds root
       let st3 := ((((stBase.clearDstTracking dst).markExclusive root).recordRootRcOp root 10 idxSv.expr).writeBufSym root idxSv.expr valSv.expr true).aliasBuf dst root
@@ -1067,7 +1171,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
     let st0 := st.clearDstTracking dst
     let st1 := match st.trackedRoot? valVar with | some r => st0.aliasBuf dst r | none => st0
     let sv' := match st.trackedRoot? valVar, sv.expr with
-      | some r, .symVar _ => { sv with expr := .symVar r }
+      | some r, .symVar _ => { sv with expr := (st.lookupVar r).expr }
       | _, _ => sv
     st1.bindVar dst sv'
   | .call fnName args retTy isExt =>
@@ -1080,25 +1184,36 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
         let sv := st.lookupVar a
         let st1 := match st.trackedRoot? a with | some r => st0.aliasBuf dst r | none => st0
         let sv' := match st.trackedRoot? a, sv.expr with
-          | some r, .symVar _ => { sv with expr := .symVar r }
+          | some r, .symVar _ => { sv with expr := (st.lookupVar r).expr }
           | _, _ => sv
         st1.bindVar dst sv'
       else if fnName == "lean_native_ensure_exclusive" && ptrRet then
         let root := st.resolveBuf a
-        let av := st.lookupVar root
-        if !st.hasKnownRootTracking root then
-          let st1 := st0.bindVar dst { expr := av.expr, nonPoison := av.nonPoison, noUB := false }
-          { st1 with supported := false }
+        let av := st.lookupVar a
+        if isImmSymExpr st.immRoots av.expr && !st.hasKnownRootTracking root then
+          st0.bindVar dst av
         else
-          let stBase := if st.isFreshRuntimeAllocRoot root then st else st.dropAliasedRootBounds root
-          let st1 := ((((stBase.clearDstTracking dst).markExclusive root).recordRootRcOp root 9 (.constU64 1)).aliasBuf dst root).bindVar dst (st.lookupVar a)
-          st1.recordGlobalRcOp root 9 (.constU64 1)
+          match st.hasKnownRootTracking root, st.rootKinds.lookup root with
+          | true, some (.rawPtr _) | true, some .storageMap | true, some .objPtr =>
+            (st0.aliasBuf dst root).bindVar dst av
+          | true, none | true, some .sarray =>
+            if !st.isRootLive root then
+              st0.bindVar dst { expr := av.expr, nonPoison := av.nonPoison, noUB := false }
+            else
+              let stBase := if st.isFreshRuntimeAllocRoot root then st else st.dropAliasedRootBounds root
+              let st1 := ((((stBase.clearDstTracking dst).markExclusive root).recordRootRcOp root 9 (.constU64 1)).aliasBuf dst root).bindVar dst av
+              st1.recordGlobalRcOp root 9 (.constU64 1)
+          | _, _ =>
+            let st1 := st0.bindVar dst { expr := av.expr, nonPoison := av.nonPoison, noUB := false }
+            { st1 with supported := false }
       else if fnName == "lean_native_sarray_len" && i64Ret then
         let root := st.resolveBuf a
         let sa := st.lookupVar a
-        let knownOk := st.hasKnownRootTracking root
-        let st1 := st0.bindVar dst { expr := .arrLen root, nonPoison := sa.nonPoison, noUB := sa.noUB && knownOk }
-        { st1 with supported := st1.supported && knownOk }
+        let kindOk := match st.rootKinds.lookup root with
+          | none | some .sarray => st.hasKnownRootTracking root && st.isRootLive root
+          | _ => false
+        let st1 := st0.bindVar dst { expr := .arrLen root, nonPoison := sa.nonPoison, noUB := sa.noUB && kindOk }
+        { st1 with supported := st1.supported && kindOk }
       else if fnName == "lean_native_del_obj" && retTy == .unit then
         let sa := st.lookupVar a
         let st1 := st0.delRootShell a
@@ -1157,11 +1272,14 @@ private def symExecCodeAux (fuel : Nat) (unrollBound : Nat) (st : SymExecState) 
       let pv := st.lookupVar root
       let idxSv := st.lookupVar idxVar
       let valSv := st.lookupVar valVar
-      let knownOk := st.hasKnownRootTracking root
-      let st1 := st.writeBufSym ptrVar idxSv.expr valSv.expr true
+      let (bufRoot, kindOk) := match st.rootKinds.lookup root with
+        | some (.rawPtr br) => (br, st.hasKnownRootTracking root && st.isRootLive br)
+        | none | some .sarray => (root, st.hasKnownRootTracking root && st.isRootLive root)
+        | _ => (root, false)
+      let st1 := st.writeBufSym bufRoot idxSv.expr valSv.expr true
       let st2 := { st1 with
-        noUB := st1.noUB && pv.noUB && idxSv.noUB && valSv.noUB && knownOk
-        supported := st1.supported && knownOk
+        noUB := st1.noUB && pv.noUB && idxSv.noUB && valSv.noUB && kindOk
+        supported := st1.supported && kindOk
         nonPoison := st1.nonPoison && pv.nonPoison && idxSv.nonPoison && valSv.nonPoison }
       symExecCodeAux fuel' unrollBound st2 k
     | .incRef objVar count k =>
@@ -1263,13 +1381,19 @@ def initDeclSymState (allocBase : Nat) (d : LNIRDecl) : SymExecState :=
     match p.ty with
     | .rawPtr _ =>
       let (r, st0) := acc.allocParamRoot
-      bindParamRoot (st0.markExclusive r) r
+      bindParamRoot ((st0.markExclusive r).setRootKind r (.rawPtr r)) r
     | .taggedPtr =>
       let (r, st0) := acc.allocParamRoot
-      bindParamRoot ((st0.setRootRc r 1 none).markMaybeScalar r) r
-    | .objPtr | .sarray _ | .storageMap =>
+      bindParamRoot (((st0.setRootRc r 1 none).markMaybeScalar r).setRootKind r .taggedPtr) r
+    | .objPtr =>
       let (r, st0) := acc.allocParamRoot
-      bindParamRoot (st0.setRootRc r 1 none) r
+      bindParamRoot ((st0.setRootRc r 1 none).setRootKind r .objPtr) r
+    | .sarray _ =>
+      let (r, st0) := acc.allocParamRoot
+      bindParamRoot ((st0.setRootRc r 1 none).setRootKind r .sarray) r
+    | .storageMap =>
+      let (r, st0) := acc.allocParamRoot
+      bindParamRoot ((st0.setRootRc r 1 none).setRootKind r .storageMap) r
     | .tuple _ | .u256 | .i256 =>
       let (r?, st0) := SymExecState.trackedTupleParamRoots (SymExecState.lnirTypeWalkDepth p.ty + 2) p.ty acc
       match r? with
@@ -3549,6 +3673,177 @@ private def reboundSArrayParamDataPtrBadTgt : LNIRDecl :=
     reboundSArrayParamDataPtrSrc.body reboundSArrayParamDataPtrBadTgt.body)
 #guard !(validateTranslationDecl reboundSArrayParamDataPtrSrc reboundSArrayParamDataPtrBadTgt).ubRefines
 #guard !(validateTranslationDecl reboundSArrayParamDataPtrSrc reboundSArrayParamDataPtrBadTgt).passed
+
+private def rawPtrIncExclSrc : LNIRDecl :=
+  { name := "rawptr_inc_isexclusive"
+    params := [{ id := 0, name := "n", ty := .i64, borrow := false },
+               { id := 1, name := "p", ty := .rawPtr .i64, borrow := true }]
+    retTy := .i1
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 100))) <|
+      .ite 2
+        (.incRef 1 1 <| .letBind 3 .i1 (.isExclusive 1) <| .decRef 1 1 <| .ret 3)
+        (.letBind 3 .i1 (.scalar (.constBool false)) <| .ret 3) }
+
+private def rawPtrIncExclFalseTgt : LNIRDecl :=
+  { rawPtrIncExclSrc with
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 100))) <|
+      .ite 2
+        (.incRef 1 1 <| .letBind 3 .i1 (.scalar (.constBool false)) <| .decRef 1 1 <| .ret 3)
+        (.letBind 3 .i1 (.scalar (.constBool false)) <| .ret 3) }
+
+#guard !(let buf : ArrayBuffer := { id := 1, exclusive := true, data := #[42] };
+  let st0 : HeapState := { HeapState.empty with buffers := [buf], nextId := 1 };
+  checkSingleSample 1024 ((VarEnv.empty.bind 0 (.u64 100)).bind 1 (.rawPtrId 1)) st0
+    rawPtrIncExclSrc.body rawPtrIncExclFalseTgt.body)
+#guard !(validateTranslationDecl rawPtrIncExclSrc rawPtrIncExclFalseTgt).symRetEquiv
+#guard !(validateTranslationDecl rawPtrIncExclSrc rawPtrIncExclFalseTgt).passed
+
+private def storageMapIncExclSrc : LNIRDecl :=
+  { name := "storagemap_inc_isexclusive"
+    params := [{ id := 0, name := "n", ty := .i64, borrow := false },
+               { id := 1, name := "m", ty := .storageMap, borrow := true }]
+    retTy := .i1
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 100))) <|
+      .ite 2
+        (.incRef 1 1 <| .letBind 3 .i1 (.isExclusive 1) <| .decRef 1 1 <| .ret 3)
+        (.letBind 3 .i1 (.scalar (.constBool false)) <| .ret 3) }
+
+private def storageMapIncExclFalseTgt : LNIRDecl :=
+  { storageMapIncExclSrc with
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 100))) <|
+      .ite 2
+        (.incRef 1 1 <| .letBind 3 .i1 (.scalar (.constBool false)) <| .decRef 1 1 <| .ret 3)
+        (.letBind 3 .i1 (.scalar (.constBool false)) <| .ret 3) }
+
+#guard !(let mapBuf : StorageMapBuffer := { id := 1, entries := [] };
+  let st0 : HeapState := { HeapState.empty with storageMaps := [mapBuf], nextId := 1 };
+  checkSingleSample 1024 ((VarEnv.empty.bind 0 (.u64 100)).bind 1 (.storageMapId 1)) st0
+    storageMapIncExclSrc.body storageMapIncExclFalseTgt.body)
+#guard !(validateTranslationDecl storageMapIncExclSrc storageMapIncExclFalseTgt).symRetEquiv
+#guard !(validateTranslationDecl storageMapIncExclSrc storageMapIncExclFalseTgt).passed
+
+private def dataPtrDistinctSrc : LNIRDecl :=
+  { name := "dataptr_distinct_from_sarray"
+    params := [{ id := 0, name := "n", ty := .i64, borrow := false },
+               { id := 1, name := "arr", ty := .sarray .i64, borrow := false }]
+    retTy := .i1
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 2 (.sarray .i64) (.sarrayEnsureExclusive 1 .i64) <|
+      .letBind 3 (.rawPtr .i64) (.sarrayDataPtr 2 .i64) <|
+      .letBind 4 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 100))) <|
+      .ite 4
+        (.incRef 3 1 <| .letBind 5 .i1 (.isExclusive 2) <| .decRef 2 1 <| .ret 5)
+        (.letBind 5 .i1 (.scalar (.constBool false)) <| .ret 5) }
+
+private def dataPtrDistinctFalseTgt : LNIRDecl :=
+  { dataPtrDistinctSrc with
+    body :=
+      .letBind 2 (.sarray .i64) (.sarrayEnsureExclusive 1 .i64) <|
+      .letBind 3 (.rawPtr .i64) (.sarrayDataPtr 2 .i64) <|
+      .letBind 4 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 100))) <|
+      .ite 4
+        (.incRef 3 1 <| .letBind 5 .i1 (.scalar (.constBool false)) <| .decRef 2 1 <| .ret 5)
+        (.letBind 5 .i1 (.scalar (.constBool false)) <| .ret 5) }
+
+#guard !(let buf : ArrayBuffer := { id := 1, exclusive := true, data := #[42] };
+  let st0 : HeapState := { HeapState.empty with buffers := [buf], nextId := 1 };
+  checkSingleSample 1024 ((VarEnv.empty.bind 0 (.u64 100)).bind 1 (.sarrayId 1)) st0
+    dataPtrDistinctSrc.body dataPtrDistinctFalseTgt.body)
+#guard !(validateTranslationDecl dataPtrDistinctSrc dataPtrDistinctFalseTgt).symRetEquiv
+#guard !(validateTranslationDecl dataPtrDistinctSrc dataPtrDistinctFalseTgt).passed
+
+private def dataPtrRetSrc : LNIRDecl :=
+  { name := "dataptr_ret_vs_sarray_ret"
+    params := [{ id := 0, name := "n", ty := .i64, borrow := false },
+               { id := 1, name := "arr", ty := .sarray .i64, borrow := false }]
+    retTy := .rawPtr .i64
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 2 (.sarray .i64) (.sarrayEnsureExclusive 1 .i64) <|
+      .letBind 3 (.rawPtr .i64) (.sarrayDataPtr 2 .i64) <|
+      .ret 3 }
+
+private def dataPtrRetSArrayTgt : LNIRDecl :=
+  { dataPtrRetSrc with
+    body :=
+      .letBind 2 (.sarray .i64) (.sarrayEnsureExclusive 1 .i64) <|
+      .letBind 3 (.rawPtr .i64) (.sarrayDataPtr 2 .i64) <|
+      .letBind 4 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 100))) <|
+      .ite 4 (.ret 2) (.ret 3) }
+
+#guard !(let buf : ArrayBuffer := { id := 1, exclusive := true, data := #[42] };
+  let st0 : HeapState := { HeapState.empty with buffers := [buf], nextId := 1 };
+  checkSingleSample 1024 ((VarEnv.empty.bind 0 (.u64 100)).bind 1 (.sarrayId 1)) st0
+    dataPtrRetSrc.body dataPtrRetSArrayTgt.body)
+#guard !(validateTranslationDecl dataPtrRetSrc dataPtrRetSArrayTgt).symRetEquiv
+#guard !(validateTranslationDecl dataPtrRetSrc dataPtrRetSArrayTgt).passed
+
+private def sarrayLenOnRawPtrSrc : LNIRDecl :=
+  { name := "sarray_len_on_rawptr"
+    params := [{ id := 0, name := "n", ty := .i64, borrow := false },
+               { id := 1, name := "p", ty := .rawPtr .i64, borrow := true }]
+    retTy := .i64
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body := .letBind 2 .i64 (.scalar (.constU64 0)) <| .ret 2 }
+
+private def sarrayLenOnRawPtrBadTgt : LNIRDecl :=
+  { sarrayLenOnRawPtrSrc with
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 100))) <|
+      .ite 2
+        (.letBind 3 .i64 (.sarrayLen 1) <| .letBind 4 .i64 (.scalar (.constU64 0)) <| .ret 4)
+        (.letBind 4 .i64 (.scalar (.constU64 0)) <| .ret 4) }
+
+#guard !(let buf : ArrayBuffer := { id := 1, exclusive := true, data := #[42] };
+  let st0 : HeapState := { HeapState.empty with buffers := [buf], nextId := 1 };
+  checkSingleSample 1024 ((VarEnv.empty.bind 0 (.u64 100)).bind 1 (.rawPtrId 1)) st0
+    sarrayLenOnRawPtrSrc.body sarrayLenOnRawPtrBadTgt.body)
+#guard !(validateTranslationDecl sarrayLenOnRawPtrSrc sarrayLenOnRawPtrBadTgt).ubRefines
+#guard !(validateTranslationDecl sarrayLenOnRawPtrSrc sarrayLenOnRawPtrBadTgt).passed
+
+private def ctorDelOnSArraySrc : LNIRDecl :=
+  { name := "del_obj_on_sarray"
+    params := [{ id := 0, name := "n", ty := .i64, borrow := false },
+               { id := 1, name := "arr", ty := .sarray .i64, borrow := false }]
+    retTy := .i1
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 2 (.sarray .i64) (.sarrayEnsureExclusive 1 .i64) <|
+      .letBind 3 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 100))) <|
+      .ite 3
+        (.letBind 4 .unit (.call "lean_native_del_obj" [2] .unit false) <|
+         .letBind 5 .i1 (.isExclusive 2) <| .ret 5)
+        (.letBind 5 .i1 (.scalar (.constBool false)) <| .ret 5) }
+
+private def ctorDelOnSArrayBadTgt : LNIRDecl :=
+  { ctorDelOnSArraySrc with
+    body :=
+      .letBind 2 (.sarray .i64) (.sarrayEnsureExclusive 1 .i64) <|
+      .letBind 3 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 100))) <|
+      .ite 3
+        (.letBind 4 .unit (.call "lean_native_del_obj" [2] .unit false) <|
+         .letBind 5 .i1 (.scalar (.constBool false)) <| .ret 5)
+        (.letBind 5 .i1 (.scalar (.constBool false)) <| .ret 5) }
+
+#guard !(let buf : ArrayBuffer := { id := 1, exclusive := true, data := #[42] };
+  let st0 : HeapState := { HeapState.empty with buffers := [buf], nextId := 1 };
+  checkSingleSample 1024 ((VarEnv.empty.bind 0 (.u64 100)).bind 1 (.sarrayId 1)) st0
+    ctorDelOnSArraySrc.body ctorDelOnSArrayBadTgt.body)
+#guard !(validateTranslationDecl ctorDelOnSArraySrc ctorDelOnSArrayBadTgt).symRetEquiv
+#guard !(validateTranslationDecl ctorDelOnSArraySrc ctorDelOnSArrayBadTgt).passed
 
 /-! ## JSON & Human-Readable Formatting for `TVModuleReport` -/
 
