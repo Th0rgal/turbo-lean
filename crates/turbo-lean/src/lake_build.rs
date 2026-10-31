@@ -2197,7 +2197,21 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
         return Ok(0);
     }
     let manifest_path = verified_sources_manifest_path(canon_dir);
-    let manifest_opt = load_verified_project_manifest(canon_dir);
+    // Pins and artifact digests describe disk whatever policy they were recorded under, so only
+    // the schema has to match here. A manifest that exists but does not parse (legacy schema,
+    // corruption) gives no evidence: every built import is refreshed and the file dropped.
+    let (manifest_opt, unusable_manifest) = match fs::read(&manifest_path) {
+        Ok(bytes) => {
+            match serde_json::from_slice::<crate::module_builder::VerifiedDepManifest>(&bytes) {
+                Ok(mut m) => {
+                    m.cfg = crate::module_builder::resolve_project_config(canon_dir).ok();
+                    (Some(m), false)
+                }
+                Err(_) => (None, true),
+            }
+        }
+        Err(_) => (None, false),
+    };
 
     let mut worklist: Vec<String> = Vec::new();
     let mut target_rel_slashes: Vec<String> = Vec::new();
@@ -2306,7 +2320,11 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
         } else {
             false
         };
-        if manifest_stale || mtime_stale || trace_corrupt {
+        if manifest_stale
+            || mtime_stale
+            || trace_corrupt
+            || (unusable_manifest && olean_meta.is_some())
+        {
             stale_mods.insert(mod_name.clone());
         }
     }
@@ -2389,6 +2407,8 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
             } else {
                 let _ = fs::remove_file(&manifest_path);
             }
+        } else if unusable_manifest {
+            let _ = fs::remove_file(&manifest_path);
         }
         return Ok(targets.len());
     }

@@ -10030,6 +10030,15 @@ lean_exe «demo-exe» where
         assert!(!crate::lake_build::is_file_verified_in_lake_build(
             &canon, &canon_b, b_src
         ));
+        // ...and gives no freshness evidence before elaboration: every built import is refreshed.
+        let c_file = canon.join("App/C.lean");
+        fs::write(&c_file, "import App.B\n").unwrap();
+        let res = crate::lake_build::ensure_project_imports_fresh_for_check(&canon, &[c_file]);
+        assert!(
+            !matches!(res, Ok(0)),
+            "legacy manifest fell back to timestamps"
+        );
+        assert!(!manifest_path.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
