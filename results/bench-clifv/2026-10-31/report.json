@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "status": "aborted",
+  "telemetry": "off",
+  "pairs_requested": 3,
+  "turbo_command": "build",
+  "machine": {
+    "hostname": "runnervm48cm3",
+    "platform": "Linux runnervm48cm3 7.0.0-1017-azure #17~24.04.1-Ubuntu SMP PREEMPT Thu Sep 24 18:46:57 UTC 2026 x86_64",
+    "nproc": 4,
+    "mem_total_kib": 16367524,
+    "load_before": [
+      2.39208984375,
+      1.55859375,
+      0.68408203125
+    ],
+    "load_after": [
+      4.10498046875,
+      4.32275390625,
+      4.9716796875
+    ],
+    "LEAN_NUM_THREADS": null,
+    "started_utc": "2026-10-31T15:25:57.600086+00:00",
+    "clifv_sha": "ff90b88aa69bfb7b8fb9ccffc2fe9d02b012b0ed",
+    "turbo_lean_sha": "fcda0ded2aacf1538719f77944445bf179ff96ca",
+    "toolchain": "leanprover/lean4:v4.34.1",
+    "turbo_binary": "/home/runner/work/turbo-lean/turbo-lean/target/release/turbo-lean",
+    "turbo_binary_sha256": "e85241363d0c0e644ee31b429edbc9c560368439c9c66d88e5714156a7963da9",
+    "turbo_version": "turbo-lean 0.1.0",
+    "lean_version": "Lean (version 4.34.1, x86_64-unknown-linux-gnu, commit 5045d0056413266e57c625dcd7c365b10e377c52, Release)",
+    "environment_overrides": {
+      "TURBO_LEAN_TELEMETRY": "off",
+      "TURBO_LEAN_HOME": "/home/runner/work/_temp/bench/work/turbo-cache",
+      "TURBO_LEAN_STAGING_DIR": "/dev/shm/bench-clifv-1001-rl7ys1gn",
+      "TURBO_LEAN_NO_DAEMON": "1",
+      "TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK": "0",
+      "TMPDIR": "/home/runner/work/_temp/bench/work/tmp",
+      "ELAN_TOOLCHAIN": "leanprover/lean4:v4.34.1"
+    },
+    "daemon_stop": "command + owned-worker cleanup"
+  },
+  "scenarios": []
+}
