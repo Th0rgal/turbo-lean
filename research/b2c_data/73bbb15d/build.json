@@ -1,0 +1,19 @@
+{
+  "wall_seconds": 0.4224688069662079,
+  "tree_cpu_seconds": 0.26186200000032045,
+  "exit_code": 0,
+  "max_active_builds": 1,
+  "module_elapsed_seconds": 0,
+  "module_cpu_seconds": 0,
+  "modules": [],
+  "command": [
+    "scripts/memcap.sh",
+    "lake",
+    "-j4",
+    "build",
+    "FV.Backend.Proof.DefGenTab",
+    "FV.Backend.Proof.IselSzTab",
+    "FV.Backend.Proof.IselCtlTry",
+    "FV.Opt.Proof.RuleArith"
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "artifact_audit": "passed",
+  "scope": "single dataset",
+  "commits": [
+    {
+      "commit": "e9a91e8a84861c34f3e3c67ca053f280d2f9c921",
+      "rows": 313008,
+      "calls": 303040,
+      "distinct_K": 300116,
+      "kernel_cpu_ns": 3665347803264,
+      "total_cpu_ns": 3687314533424
+    }
+  ],
+  "manual_example_and_method_review_still_required": true
+}
