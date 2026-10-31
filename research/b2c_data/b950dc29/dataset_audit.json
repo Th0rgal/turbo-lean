@@ -1,0 +1,27 @@
+{
+  "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+  "dataset_audit": "passed",
+  "command": [
+    "python3",
+    "research/b2c_tool/audit.py",
+    "--commit",
+    "b950dc29"
+  ],
+  "audit_tool_SHA256": "1296b579ef5ed60f331e2ab425ec3eb3aed58d064cea9f222eaf4843964503f0",
+  "validated_at_utc": "2026-10-31T21:48:08.831437+00:00",
+  "result": {
+    "artifact_audit": "passed",
+    "scope": "single dataset",
+    "commits": [
+      {
+        "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+        "rows": 310275,
+        "calls": 300319,
+        "distinct_K": 297363,
+        "kernel_cpu_ns": 3595374795440,
+        "total_cpu_ns": 3614812607344
+      }
+    ],
+    "manual_example_and_method_review_still_required": true
+  }
+}
