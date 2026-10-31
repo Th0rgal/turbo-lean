@@ -1,0 +1,68 @@
+{
+  "commit": "b950dc29b1c6e1e4cdc6ae9c771321420e08fb72",
+  "previous_commit": "73bbb15dbdeb25c9b6a1c5b2c0a25f2afa2a967f",
+  "scope": "Two closed individual kernel records from the original live C19 replay attempt; full replay coverage and CPU conservation remain pending",
+  "not_full_dataset_completion": true,
+  "examples": [
+    {
+      "name": "iselDestructGoal",
+      "module": "FV.Backend.Proof.IselCmpBase",
+      "kind": "opaque",
+      "source_file": "FV/Backend/Proof/IselCmpBase.lean",
+      "source_line": 271,
+      "source_SHA256": "63fa6f0412a0375a6bcfd7399b5afb49144fa4f01d363f5814731aa3fa407ca6",
+      "declaration_start": "partial def iselDestructGoal (ors : Bool) (goal : MVarId) : MetaM (List MVarId) := goal.withContext do",
+      "previous_group_K": "a3be69e52e4b4ad7c0ed4de26b1778bb276f3b117980524eb1ff29365c3e1fe4",
+      "current_source_explicit_declaration_verified": true,
+      "C19_reuse_or_cutoff_eligibility": "unchanged-key observed kernel group in actually rebuilt module; final whole-dataset coverage still pending",
+      "current_constant_K": "38d0f81ea7aec19f4cb271e71a7f928ecec0c0a19ab430b6a6ffe565940d8537",
+      "current_IF": "b7cb339092803f38cc93e372a3abc3d4f9c333b1b960cf5e16341e0b94d1c336",
+      "current_group_K": "a3be69e52e4b4ad7c0ed4de26b1778bb276f3b117980524eb1ff29365c3e1fe4",
+      "unchanged_group_K_from_previous": true,
+      "K": "a3be69e52e4b4ad7c0ed4de26b1778bb276f3b117980524eb1ff29365c3e1fe4",
+      "kernel_ms": 0.011488,
+      "current_closed_individual_kernel_record": {
+        "cpu_ns": 11488,
+        "duplicate_rechecked": false,
+        "event": "kernel",
+        "kind": "opaque",
+        "module": "FV.Backend.Proof.IselCmpBase",
+        "names": [
+          "iselDestructGoal"
+        ]
+      },
+      "current_replay_record_confirmed": true,
+      "historical_source_hash_and_declaration_line_reverified": true
+    },
+    {
+      "name": "Backend.Proof.FlowSplit.collectSparse",
+      "module": "FV.Backend.Proof.IselFlowSplit",
+      "kind": "opaque",
+      "source_file": "FV/Backend/Proof/IselFlowSplit.lean",
+      "source_line": 59,
+      "source_SHA256": "57e4dcfbf3c7a7ef45ea326c3d1b94ee0128ae5a0e94c47043c056e10c035e8b",
+      "declaration_start": "partial def collectSparse (env : Environment) (e : Lean.Expr) : Array Lean.Expr :=",
+      "previous_group_K": "8d71f636e3af02096a9fd17389aa1a0497b2391f350d2f3a2d77cf5cd8e76caf",
+      "current_source_explicit_declaration_verified": true,
+      "C19_reuse_or_cutoff_eligibility": "unchanged-key observed kernel group in actually rebuilt module; final whole-dataset coverage still pending",
+      "current_constant_K": "c7ea52dc47b3e7d5979bb483b126f9ce1f8d4770661394629a16b141ed93c670",
+      "current_IF": "8f2c7d809809537339cc650d0ef9b74b2e442e7c4288de7993ac645403ea36cc",
+      "current_group_K": "8d71f636e3af02096a9fd17389aa1a0497b2391f350d2f3a2d77cf5cd8e76caf",
+      "unchanged_group_K_from_previous": true,
+      "K": "8d71f636e3af02096a9fd17389aa1a0497b2391f350d2f3a2d77cf5cd8e76caf",
+      "kernel_ms": 0.00944,
+      "current_closed_individual_kernel_record": {
+        "cpu_ns": 9440,
+        "duplicate_rechecked": false,
+        "event": "kernel",
+        "kind": "opaque",
+        "module": "FV.Backend.Proof.IselFlowSplit",
+        "names": [
+          "Backend.Proof.FlowSplit.collectSparse"
+        ]
+      },
+      "current_replay_record_confirmed": true,
+      "historical_source_hash_and_declaration_line_reverified": true
+    }
+  ]
+}
