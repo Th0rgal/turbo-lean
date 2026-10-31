@@ -11,7 +11,7 @@ The proof package's default `lake build` passes on Lean 4.34.1.
 | O2 signature | PROVED | `B2.Lowering.lower_sig`, for every successful lowering; `#print axioms`: `[propext]`. |
 | O3 simulation | PROVED (collatz_steps) | `B2.CollatzClif.source_simulation` connects the real LNIR evaluator to `Clif.runWith` on the real successfully lowered function, for every UInt64 argument pair and arbitrary source heap/CLIF memory; fuel `15 * steps.toNat + 5`. `loop_returns` proves bounded-loop termination, including non-overflow of the taken index increment. Axioms: `[propext, Classical.choice, Quot.sound]`. The public CLIF run preserves the entire initial memory, including the optional slot-placement oracle. Generic F64 simulation remains open. |
 | O4 safety | SORRY | `B2.RunSafety.collatz_run_prefix` excludes both trapped and stuck outcomes of the public `runWith` at every fuel, including initialization, using the all-input termination proof; allowed axioms only. Connecting this to reachable-state `TrapsExplicit` remains open. |
-| O5 backend artifacts | SORRY | `B2.Smoke.collatz_lowered` proves the real lowering succeeds (`[propext]`); no checked backend artifacts/allocation yet. FinalDirect dependency cone building in background. |
+| O5 backend artifacts | SORRY | `B2.Smoke.collatz_lowered` proves the real lowering succeeds (`[propext]`); The exact VCode artifact now has a kernel-checked lowering equation (allowed axioms only); allocation, emission and layout are still open. FinalDirect dependency cone building in background. |
 | O6 contracts | SORRY | Generic empty extern/signature/global/slot declarations: `B2.Lowering.lower_declarations` (`[propext]`). `B2.CallFree` proves absent try calls, indirect statements/signatures, and TLS for the actual Collatz function, with only allowed axioms. Complete site/contract discharge remains open. |
 | O7 AArch64 x0 | SORRY | Needs O3–O6, backend composition, and transitive axiom audit. |
 
@@ -103,3 +103,16 @@ applied `externCtor` also exhausted its resource limit. The excluded WIP
 lookup reduction, leaving upstream sources untouched. Its isolated actual
 `opcodeV "Iconst"` lookup checked with only the allowed axioms; full lowering remains open.
 The original ISLE interpreter and its default million-step fuel remain in use.
+
+The concrete instruction-selection obstruction is resolved: `/tmp/b2-fuel-concrete.log`
+checked the exact `B2.Artifacts.lower` equation with `[propext, Classical.choice,
+Quot.sound]`. `B2.BackendLower` preserves that literal VCode and proof as a separate
+module (its standalone build is running). `B2.IsleFuel.runTerm_of_apply` checked
+with the same allowed closure: a successful 1024-fuel call of the actual interpreter
+transfers, by upstream fuel monotonicity, to `Backend.runTerm`'s unchanged default
+million-fuel execution. `B2.BackendEval` caches individually checked call certificates.
+No upstream source or executable semantics changed. Direct million-fuel certificate
+replay exceeded both 4 and 8 GiB checker limits; that route is superseded.
+The concrete prepared VCode equation checked separately on the inspected candidate;
+`B2.Artifacts` still awaits complete checking and remains excluded from the active root.
+The original dependency build continues with one compiler; RegallocAtomic is live.
