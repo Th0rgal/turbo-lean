@@ -465,6 +465,9 @@ enum Commands {
         /// Poll interval in milliseconds while the remote job is queued/running
         #[arg(long, default_value_t = 1000)]
         poll_interval_ms: u64,
+        /// Proceed although the local checkout differs from the commit the remote builds (uncommitted/untracked files or another HEAD); the result is flagged `working_tree_dirty`
+        #[arg(long)]
+        allow_dirty: bool,
     },
 }
 
@@ -736,6 +739,7 @@ fn run(cli: Cli) -> Result<()> {
         token,
         timeout_secs,
         poll_interval_ms,
+        allow_dirty,
     } = cli.command
     {
         return remote_prebuild::run_remote_prebuild_command(
@@ -750,6 +754,7 @@ fn run(cli: Cli) -> Result<()> {
             token,
             timeout_secs,
             poll_interval_ms,
+            allow_dirty,
         );
     }
     if let Commands::Serve {

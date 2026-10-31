@@ -2431,8 +2431,54 @@ pub fn http_request_full(
     expected_sha256: Option<&str>,
     on_inflight: impl FnOnce(),
 ) -> Result<Vec<u8>> {
-    use std::time::Duration;
     let resolved_token = resolve_http_auth_token(url, auth_token);
+    http_request_with_resolved_token(
+        method,
+        url,
+        content_type,
+        body,
+        timeout_ms,
+        resolved_token,
+        expected_sha256,
+        on_inflight,
+    )
+}
+
+/// Like [`http_request_full`] but never attaches explicit or ambient (`TURBO_LEAN_*_TOKEN`)
+/// credentials; for URLs supplied by an untrusted server.
+pub fn http_request_full_anonymous(
+    method: &str,
+    url: &str,
+    content_type: &str,
+    body: &[u8],
+    timeout_ms: Option<u64>,
+    expected_sha256: Option<&str>,
+    on_inflight: impl FnOnce(),
+) -> Result<Vec<u8>> {
+    http_request_with_resolved_token(
+        method,
+        url,
+        content_type,
+        body,
+        timeout_ms,
+        None,
+        expected_sha256,
+        on_inflight,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn http_request_with_resolved_token(
+    method: &str,
+    url: &str,
+    content_type: &str,
+    body: &[u8],
+    timeout_ms: Option<u64>,
+    resolved_token: Option<String>,
+    expected_sha256: Option<&str>,
+    on_inflight: impl FnOnce(),
+) -> Result<Vec<u8>> {
+    use std::time::Duration;
 
     if url.starts_with("https://") {
         let connect_dur = Duration::from_millis(timeout_ms.unwrap_or(5_000).clamp(100, 10_000));
@@ -2943,6 +2989,45 @@ pub(crate) mod tests {
         assert_eq!(
             resolve_http_auth_token("http://10.0.0.1:9400", Some("explicit")).as_deref(),
             Some("explicit")
+        );
+    }
+
+    #[test]
+    fn anonymous_request_never_sends_ambient_loopback_tokens() {
+        use std::io::{Read, Write};
+        let _env_guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("TURBO_LEAN_API_TOKEN", "api-tok");
+        std::env::set_var("TURBO_LEAN_DAEMON_TOKEN", "daemon-tok");
+        let _clear = ScopedEnvClear(&["TURBO_LEAN_API_TOKEN", "TURBO_LEAN_DAEMON_TOKEN"]);
+        let request_seen_by_server = |anonymous: bool| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/artifact", listener.local_addr().unwrap());
+            let srv = std::thread::spawn(move || {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).unwrap();
+                let _ = sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+                String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase()
+            });
+            let body = if anonymous {
+                http_request_full_anonymous("GET", &url, "x/y", &[], Some(5_000), None, || {})
+            } else {
+                http_request_full("GET", &url, "x/y", &[], Some(5_000), None, None, || {})
+            };
+            assert_eq!(body.unwrap(), b"ok");
+            srv.join().unwrap()
+        };
+        let ambient = request_seen_by_server(false);
+        assert!(
+            ambient.contains("authorization: bearer api-tok"),
+            "{ambient}"
+        );
+        let anon = request_seen_by_server(true);
+        assert!(
+            !anon.contains("authorization") && !anon.contains("x-turbo-token"),
+            "{anon}"
         );
     }
 
