@@ -7,7 +7,7 @@ it is not a soundness proof for the deliberately incomplete reuse key.
 """
 import argparse, collections, gzip, hashlib, json, pathlib, re, statistics, subprocess
 from run_experiment import CLIFV, DATA, RESULTS, TARGETS, H
-from report import nonaux
+from report import nonaux, frac
 BASE='d6f9243a9e2148709875a2020622c95b0d9d2ccc'
 
 def j(p):return json.loads(p.read_text())
@@ -34,6 +34,10 @@ def main():
         assert missing in md
     previous_keys=set();previous_sources={};previous_interfaces={}
     previous_push=None;observed=[];example_index={}
+    sums=collections.Counter();module_work=collections.defaultdict(collections.Counter)
+    kind_work={'reuse':collections.Counter(),'cutoff':collections.Counter()}
+    eligible_examples={'reuse':set(),'cutoff':set()}
+    cone_total=cone_reused=0
     for i,c in enumerate(commits):
         if c not in selected:continue
         d=DATA/c[:8];complete=j(d/'complete.json');pushed=j(d/'pushed.json')
@@ -173,24 +177,101 @@ def main():
             assert t['rebuilt_kernel_ns']==sum(g['cpu_ns'] for g in rebuilt)
             assert t['optimistic_reusable_kernel_ns']==sum(g['cpu_ns'] for g in reused)
             assert t['cutoff_kernel_ns']==sum(g['cpu_ns'] for g in rebuilt if g['module'] in cut)
+            for field in ('dependent_rebuild_elapsed_seconds','cutoff_avoidable_elapsed_seconds',
+                          'cutoff_avoidable_build_cpu_seconds','rebuilt_kernel_ns',
+                          'optimistic_reusable_kernel_ns','cutoff_kernel_ns'):
+                sums[field]+=t[field]  # Each transition value was independently checked above.
+            for field,build_field in (('build_cpu_seconds','tree_cpu_seconds'),
+                                     ('module_build_cpu_seconds','module_cpu_seconds'),
+                                     ('module_elapsed_seconds','module_elapsed_seconds'),
+                                     ('build_wall_seconds','wall_seconds')):
+                sums[field]+=build[build_field]
+            for b in build['modules']:
+                m=b['module'];v=module_work[m]
+                v['build_elapsed_seconds']+=b['seconds'];v['build_cpu_seconds']+=b['cpu_seconds']
+                v['rebuilt_transitions']+=1
+                if m in dependent:v['dependent_rebuild_elapsed_seconds']+=b['seconds']
+                if m in cut:
+                    v['cutoff_avoidable_elapsed_seconds']+=b['seconds']
+                    v['cutoff_avoidable_build_cpu_seconds']+=b['cpu_seconds']
+            for g in rebuilt:module_work[g['module']]['kernel_seconds']+=g['cpu_ns']/1e9
+            for label,gs,field in (('reuse',reused,'optimistic_reusable_kernel_seconds'),
+                                   ('cutoff',[g for g in rebuilt if g['module'] in cut],'cutoff_kernel_seconds')):
+                for g in gs:
+                    module_work[g['module']][field]+=g['cpu_ns']/1e9
+                    kind_work[label][g['kind']]+=g['cpu_ns']
+                    eligible_examples[label].update((c,g['module'],n) for n in g['names'])
+            cone=[g for g in groups if g['module'].startswith('FV.')]
+            cone_total+=sum(g['cpu_ns'] for g in cone)
+            cone_reused+=sum(g['cpu_ns'] for g in cone if g['kind'] not in ('inductive','quotient') and g['K'] in previous_keys)
         observed.append({'commit':c,'rows':len(rows),'calls':len(groups),'distinct_K':len(keytimes),
                          'kernel_cpu_ns':total['kernel_cpu_ns'],'total_cpu_ns':total['cpu_ns']})
         previous_keys=set(keytimes)
         previous_sources=sources;previous_interfaces=interfaces
-    def examples(xs,positive):
+    def close(actual,expected):
+        if expected is None:assert actual is None
+        else:assert abs(actual-expected)<=max(1e-6,abs(expected)*1e-12),(actual,expected)
+    def examples(xs,positive,label,kind=None,module=None):
         if not positive:return
         assert len({x['name'] for x in xs})>=3
         for x in xs:
             assert nonaux(x['name'])
+            assert (x['commit'],x['module'],x['name']) in eligible_examples[label]
             g=example_index[x['commit'],x['module'],x['name']]
             assert g['K']==x['K'] and x['kernel_ms']==g['cpu_ns']/1e6
+            assert kind is None or g['kind']==kind
+            assert module is None or g['module']==module
     if not args.commit:
-        for bs in (report['kernel_reuse_by_kind'],report['cutoff_kernel_by_kind']):
-            for v in bs.values():examples(v['examples'],v['kernel_seconds']>0)
+        assert set(report['sums'])==set(sums)
+        for field,value in sums.items():close(report['sums'][field],value)
+        kernel=sums['rebuilt_kernel_ns'];cpu=sums['build_cpu_seconds'];elapsed=sums['module_elapsed_seconds']
+        for label,bs in (('reuse',report['kernel_reuse_by_kind']),('cutoff',report['cutoff_kernel_by_kind'])):
+            assert set(bs)==set(kind_work[label])
+            for kind,v in bs.items():
+                ns=kind_work[label][kind]
+                close(v['kernel_seconds'],ns/1e9)
+                close(v['share_of_rebuilt_kernel'],frac(ns,kernel))
+                close(v['share_of_build_cpu'],frac(ns/1e9,cpu))
+                close(v['share_of_summed_module_elapsed'],frac(ns/1e9,elapsed))
+                examples(v['examples'],ns>0,label,kind=kind)
+        actual_modules={v['module']:v for v in report['all_module_buckets']}
+        assert len(actual_modules)==len(report['all_module_buckets']) and set(actual_modules)==set(module_work)
+        for m,v in module_work.items():
+            actual=actual_modules[m]
+            for field,value in v.items():close(actual[field],value)
+            for field,expected in (
+                ('kernel_reuse_share_of_rebuilt_kernel',frac(v['optimistic_reusable_kernel_seconds'],kernel/1e9)),
+                ('kernel_reuse_share_of_total_build_cpu',frac(v['optimistic_reusable_kernel_seconds'],cpu)),
+                ('cutoff_share_of_dependent_rebuild_elapsed',frac(v['cutoff_avoidable_elapsed_seconds'],sums['dependent_rebuild_elapsed_seconds'])),
+                ('cutoff_share_of_total_build_cpu',frac(v['cutoff_avoidable_build_cpu_seconds'],cpu)),
+                ('cutoff_share_of_rebuilt_kernel',frac(v['cutoff_kernel_seconds'],kernel/1e9))):
+                close(actual[field],expected)
+        for field,expected in (
+            ('share_of_dependent_module_rebuild_elapsed',frac(sums['cutoff_avoidable_elapsed_seconds'],sums['dependent_rebuild_elapsed_seconds'])),
+            ('share_of_total_module_build_elapsed',frac(sums['cutoff_avoidable_elapsed_seconds'],elapsed)),
+            ('share_of_total_build_cpu',frac(sums['cutoff_avoidable_build_cpu_seconds'],cpu)),
+            ('elapsed_work_over_total_build_wall',frac(sums['cutoff_avoidable_elapsed_seconds'],sums['build_wall_seconds'])),
+            ('share_of_rebuilt_kernel_cpu',frac(sums['cutoff_kernel_ns'],kernel))):
+            close(report['module_cutoff'][field],expected)
+        reuse=report['optimistic_kernel_reuse'];ns=sums['optimistic_reusable_kernel_ns']
+        for field,expected in (('kernel_seconds',ns/1e9),('share_of_rebuilt_kernel',frac(ns,kernel)),
+                               ('share_of_build_cpu',frac(ns/1e9,cpu)),
+                               ('share_of_summed_module_elapsed',frac(ns/1e9,elapsed)),
+                               ('kernel_cpu_over_total_build_wall',frac(ns/1e9,sums['build_wall_seconds']))):
+            close(reuse[field],expected)
+        examples(reuse['examples'],ns>0,'reuse')
+        cone=report['all_cone_revisit_diagnostic']
+        close(cone['kernel_seconds'],cone_total/1e9);close(cone['optimistically_reusable_seconds'],cone_reused/1e9)
+        close(cone['share'],frac(cone_reused,cone_total))
+        for table,metric in (('top_20_kernel_reuse_modules','optimistic_reusable_kernel_seconds'),
+                             ('top_20_module_cutoff_modules','cutoff_avoidable_elapsed_seconds')):
+            expected=sorted(module_work,key=lambda m:-module_work[m][metric])[:20]
+            assert [v['module'] for v in report[table]]==expected
+            assert all(v==actual_modules[v['module']] for v in report[table])
         for v in report['top_20_kernel_reuse_modules']:
-            examples(v['kernel_reuse_examples'],v.get('optimistic_reusable_kernel_seconds',0)>0)
+            examples(v['kernel_reuse_examples'],v.get('optimistic_reusable_kernel_seconds',0)>0,'reuse',module=v['module'])
         for v in report['top_20_module_cutoff_modules']:
-            examples(v['cutoff_examples'],v.get('cutoff_avoidable_elapsed_seconds',0)>0)
+            examples(v['cutoff_examples'],v.get('cutoff_avoidable_elapsed_seconds',0)>0,'cutoff',module=v['module'])
     assert git(['branch','--show-current'])=='research/b2c-measurement'
     assert all(p.startswith('research/') for p in git(['diff','--name-only',BASE,'HEAD']).splitlines())
     assert git(['rev-parse','HEAD'])==git(['rev-parse','origin/research/b2c-measurement'])

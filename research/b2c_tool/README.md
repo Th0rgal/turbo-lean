@@ -40,6 +40,11 @@ python3 results/research/b2c_tool/report.py
 ```
 
 Audit the report and any `example_shortfalls` before calling the goal complete.
+The report includes kernel/build CPU shares for kind and top-module buckets,
+and separate summed-kernel, overhead, and total replay CPU for every commit.
+The final audit recomputes aggregate denominators and bucket totals from the
+measured transitions, verifies top-module rankings, and requires each example
+to belong to its actual reuse/cutoff bucket in that transition.
 Report generation alone is not a completion claim. Check per-commit coverage,
 all targets, first-parent history, replay sums, build attempts, raw timing groups,
 and final staged paths. Push the final audited report on the same branch.

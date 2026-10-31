@@ -132,6 +132,7 @@ def main():
                 ms['cutoff_avoidable_elapsed_seconds']+=r['seconds'];ms['cutoff_avoidable_build_cpu_seconds']+=r['cpu_seconds']
                 module_cutexamples[m].extend(g for g in cg if g['module']==m)
         for g in gs:module_stats[g['module']]['kernel_seconds']+=g['cpu_ns']/1e9
+        for g in cg:module_stats[g['module']]['cutoff_kernel_seconds']+=g['cpu_ns']/1e9
         for g in eligible:
             module_stats[g['module']]['optimistic_reusable_kernel_seconds']+=g['cpu_ns']/1e9
             module_reuse[g['module']].append(g)
@@ -143,7 +144,13 @@ def main():
     cutkind={k:bucket([g for g in cutgroups if g['kind']==k],total,bc,be) for k in sorted({g['kind'] for g in cutgroups})}
     mt=[]
     for mod,v in module_stats.items():
-        mt.append({'module':mod,**dict(v),'kernel_reuse_examples':examples(module_reuse[mod]),
+        mt.append({'module':mod,**dict(v),
+                   'kernel_reuse_share_of_rebuilt_kernel':frac(v['optimistic_reusable_kernel_seconds'],total/1e9),
+                   'kernel_reuse_share_of_total_build_cpu':frac(v['optimistic_reusable_kernel_seconds'],bc),
+                   'cutoff_share_of_dependent_rebuild_elapsed':frac(v['cutoff_avoidable_elapsed_seconds'],sums['dependent_rebuild_elapsed_seconds']),
+                   'cutoff_share_of_total_build_cpu':frac(v['cutoff_avoidable_build_cpu_seconds'],bc),
+                   'cutoff_share_of_rebuilt_kernel':frac(v['cutoff_kernel_seconds'],total/1e9),
+                   'kernel_reuse_examples':examples(module_reuse[mod]),
                    'cutoff_examples':examples(module_cutexamples[mod])})
     top_reuse=sorted(mt,key=lambda x:-x.get('optimistic_reusable_kernel_seconds',0))[:20]
     top_cut=sorted(mt,key=lambda x:-x.get('cutoff_avoidable_elapsed_seconds',0))[:20]
@@ -195,14 +202,20 @@ def main():
     for k,v in bykind.items():p += [f"{k}: {extext(v['examples'])}.",'']
     p+=['## Kernel inside cutoff-skippable modules, by kind','',
          'Module build seconds cannot be apportioned to declaration kinds without inventing an allocation. The kind split below uses measured kernel CPU within modules the cutoff would skip.','',
-         '| Kind | Kernel seconds | Share of rebuilt kernel |','|---|---:|---:|']
-    for k,v in cutkind.items():p.append(f"| {k} | {sec(v['kernel_seconds'])} | {pct(v['share_of_rebuilt_kernel'])} |")
+         '| Kind | Kernel seconds | Share of rebuilt kernel | Share of build CPU |','|---|---:|---:|---:|']
+    for k,v in cutkind.items():p.append(f"| {k} | {sec(v['kernel_seconds'])} | {pct(v['share_of_rebuilt_kernel'])} | {pct(v['share_of_build_cpu'])} |")
     p+=['']
     for k,v in cutkind.items():p += [f"{k}: {extext(v['examples'])}.",'']
     for title,items,key in [('Top 20 modules: optimistic kernel reuse',top_reuse,'optimistic_reusable_kernel_seconds'),
                             ('Top 20 modules: module cutoff',top_cut,'cutoff_avoidable_elapsed_seconds')]:
-        p+=['## '+title,'','| Module | Avoidable seconds |','|---|---:|']
-        for v in items:p.append(f"| `{v['module']}` | {sec(v.get(key,0))} |")
+        if key.startswith('optimistic'):
+            p+=['## '+title,'','Shares use the aggregate rebuilt-kernel and total build CPU denominators above.','',
+                '| Module | Reusable kernel seconds | Share of rebuilt kernel | Share of build CPU |','|---|---:|---:|---:|']
+            for v in items:p.append(f"| `{v['module']}` | {sec(v.get(key,0))} | {pct(v['kernel_reuse_share_of_rebuilt_kernel'])} | {pct(v['kernel_reuse_share_of_total_build_cpu'])} |")
+        else:
+            p+=['## '+title,'','Elapsed shares use all dependent-module rebuild seconds; CPU shares use total build process-tree CPU. The kernel columns count measured kernel work inside the skippable modules.','',
+                '| Module | Avoidable build elapsed | Share of dependent elapsed | Share of build CPU | Kernel seconds | Share of rebuilt kernel |','|---|---:|---:|---:|---:|---:|']
+            for v in items:p.append(f"| `{v['module']}` | {sec(v.get(key,0))} | {pct(v['cutoff_share_of_dependent_rebuild_elapsed'])} | {pct(v['cutoff_share_of_total_build_cpu'])} | {sec(v.get('cutoff_kernel_seconds',0))} | {pct(v['cutoff_share_of_rebuilt_kernel'])} |")
         p+=['']
         for v in items:
             if v.get(key,0)>0:
@@ -210,6 +223,12 @@ def main():
                 p += [f"`{v['module']}`: {extext(xs)}.",'']
     p+=['## Commit transitions','','| Commit | Built modules | Cutoff seconds | Optimistic reusable kernel seconds |','|---|---:|---:|---:|']
     for t in transitions:p.append(f"| `{t['commit'][:8]}` | {len(t['built_modules'])} | {sec(t['cutoff_avoidable_elapsed_seconds'])} | {sec(t['optimistic_reusable_kernel_ns']/1e9)} |")
+    p+=['','## Replay accounting','',
+         'These are complete-cone replay CPU measurements, including modules Lake did not rebuild. Overhead is total process CPU minus summed addDecl CPU; startup is included in that overhead. Each dataset independently checks the CPU bound.','',
+         '| Commit | Summed kernel CPU seconds | Replay overhead seconds | Total process CPU seconds |','|---|---:|---:|---:|']
+    for c in allc:
+        r=c['replay']
+        p.append(f"| `{c['commit'][:8]}` | {sec(r['kernel_cpu_ns']/1e9)} | {sec(r['overhead_cpu_ns']/1e9)} | {sec(r['cpu_ns']/1e9)} |")
     p+=['','## Artifacts and limits','',
          '`B2c.json` contains denominators, all module buckets, transitions, replay totals, and key-bearing examples. `b2c_data/<commit>/rows.jsonl.gz` stores name/kind/module/IF/K/kernel_ms, with group times charged once to the representative. `kernel_groups.jsonl.gz` retains every measured call; repeated K values retain their occurrence times. `replay.jsonl.gz`, source hashes, build logs, per-module CPU/elapsed timings, and coverage checks preserve the evidence. Each completed commit was pushed to `research/b2c-measurement` before advancing; no PR was opened.','',
          'Shared-host timing noise, interpreter/reconstruction overhead, and changed parallel scheduling limit wall-speedup inference. The report estimates avoidable work, not an implemented end-to-end speedup. Kernel times are replay measurements, not profiler samples of the original elaboration.']
