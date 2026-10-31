@@ -916,6 +916,39 @@ impl TurboStore {
         batch_import_pack_metadata_with_domain(&self.conn, blobs, actions, trust_domain)
     }
 
+    /// Size-checked (never hashed) presence test for every output blob of an action.
+    fn entries_intact_on_disk(&self, entries: &[BlobEntry]) -> bool {
+        entries.iter().all(|e| {
+            matches!(
+                probe_blob_file(&self.blob_path(&e.blob_hash), e.size_bytes),
+                BlobDisk::Intact(_)
+            )
+        })
+    }
+
+    /// A `.done` marker is only trusted while its action still has a completed row in the DB
+    /// (GC may have evicted it) and all of its blobs are intact on disk.
+    fn done_outputs_valid(
+        &self,
+        action_key: &str,
+        trust_domain: &str,
+        outputs: &[BlobEntry],
+    ) -> bool {
+        !outputs.is_empty()
+            && self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM actions WHERE action_key = ?1 AND trust_domain = ?2 AND status = 'completed'",
+                    params![action_key, trust_domain],
+                    |_| Ok(()),
+                )
+                .optional()
+                .ok()
+                .flatten()
+                .is_some()
+            && self.entries_intact_on_disk(outputs)
+    }
+
     pub fn get_cached_action_no_hit_bump(
         &self,
         action_key: &str,
@@ -943,10 +976,8 @@ impl TurboStore {
         if entries.is_empty() {
             return Ok(None);
         }
-        for e in &entries {
-            if !self.blob_path(&e.blob_hash).exists() {
-                return Ok(None);
-            }
+        if !self.entries_intact_on_disk(&entries) {
+            return Ok(None);
         }
         Ok(Some(entries))
     }
@@ -988,10 +1019,8 @@ impl TurboStore {
         }
 
         // Verify all blobs actually exist on disk
-        for e in &entries {
-            if !self.blob_path(&e.blob_hash).exists() {
-                return Ok(None);
-            }
+        if !self.entries_intact_on_disk(&entries) {
+            return Ok(None);
         }
 
         if let Ok(tx) = self.conn.unchecked_transaction() {
@@ -1028,11 +1057,7 @@ impl TurboStore {
         if trust_domain == "trusted" {
             if let Ok(done_bytes) = fs::read(&done_path) {
                 if let Ok(outputs) = serde_json::from_slice::<Vec<BlobEntry>>(&done_bytes) {
-                    if !outputs.is_empty()
-                        && outputs
-                            .iter()
-                            .all(|e| self.blob_path(&e.blob_hash).exists())
-                    {
+                    if self.done_outputs_valid(action_key, trust_domain, &outputs) {
                         if let Ok(tx) = self.conn.unchecked_transaction() {
                             let _ = tx.execute(
                                 "UPDATE actions SET hit_count = hit_count + 1 WHERE action_key = ?1",
@@ -1103,11 +1128,7 @@ impl TurboStore {
             if trust_domain == "trusted" {
                 if let Ok(done_bytes) = fs::read(&done_path) {
                     if let Ok(outputs) = serde_json::from_slice::<Vec<BlobEntry>>(&done_bytes) {
-                        if !outputs.is_empty()
-                            && outputs
-                                .iter()
-                                .all(|e| self.blob_path(&e.blob_hash).exists())
-                        {
+                        if self.done_outputs_valid(action_key, trust_domain, &outputs) {
                             if !counted_by_leader {
                                 if let Ok(tx) = self.conn.unchecked_transaction() {
                                     let _ = tx.execute(
@@ -1182,42 +1203,7 @@ impl TurboStore {
             anyhow::bail!("CAS digest failed LeanSys C-ABI path safety gate: {}", hash);
         }
         let dest = self.blob_path(hash);
-        if let Ok(meta) = fs::metadata(&dest) {
-            return Ok((meta.ino() as i64, meta.len() as i64));
-        }
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        use std::os::unix::fs::OpenOptionsExt;
-        let ino = match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o444)
-            .open(&dest)
-        {
-            Ok(mut f) => {
-                f.write_all(bytes)?;
-                f.metadata().map(|m| m.ino() as i64).unwrap_or(0)
-            }
-            Err(_) => {
-                let staging_path =
-                    self.root
-                        .join("staging")
-                        .join(format!("{}.{}.tmp", hash, std::process::id()));
-                let mut f = OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o444)
-                    .open(&staging_path)?;
-                f.write_all(bytes)?;
-                let i = f.metadata().map(|m| m.ino() as i64).unwrap_or(0);
-                drop(f);
-                fs::rename(&staging_path, &dest)?;
-                i
-            }
-        };
-        Ok((ino, bytes.len() as i64))
+        ensure_blob_file(&self.root, &dest, hash, bytes, false)
     }
 
     /// Stage bytes into an immutable `0444` CAS blob and return its BLAKE3 hash.
@@ -1258,7 +1244,6 @@ impl TurboStore {
             return Ok(Vec::new());
         }
         let now = now_unix();
-        let pid = std::process::id();
         let mut entries = Vec::with_capacity(items.len());
         let mut seen_blobs: std::collections::HashMap<String, (i64, i64, String)> =
             std::collections::HashMap::with_capacity(items.len());
@@ -1272,25 +1257,12 @@ impl TurboStore {
             };
             if !seen_blobs.contains_key(&hash) {
                 let dest = self.blob_path(&hash);
-                if !dest.exists() {
-                    if let Some(parent) = dest.parent() {
-                        if created_dirs.insert(parent.to_path_buf()) {
-                            fs::create_dir_all(parent)?;
-                        }
+                if let Some(parent) = dest.parent() {
+                    if created_dirs.insert(parent.to_path_buf()) {
+                        fs::create_dir_all(parent)?;
                     }
-                    let staging_path = self
-                        .root
-                        .join("staging")
-                        .join(format!("{}.{}.tmp", hash, pid));
-                    fs::write(&staging_path, bytes)?;
-                    let mut perms = fs::metadata(&staging_path)?.permissions();
-                    perms.set_mode(0o444);
-                    fs::set_permissions(&staging_path, perms)?;
-                    fs::rename(&staging_path, &dest)?;
                 }
-                let meta = fs::metadata(&dest)?;
-                let ino = meta.ino() as i64;
-                let sz = meta.len() as i64;
+                let (ino, sz) = ensure_blob_file(&self.root, &dest, &hash, bytes, false)?;
                 seen_blobs.insert(hash.clone(), (ino, sz, kind.clone()));
             }
             let actual_size = if *size_bytes > 0 {
@@ -1479,7 +1451,6 @@ impl TurboStore {
             return Ok(());
         }
         let now = now_unix();
-        let pid = std::process::id();
         let mut staged = Vec::with_capacity(items.len());
         let mut seen_blobs: std::collections::HashMap<String, (i64, i64)> =
             std::collections::HashMap::with_capacity(items.len());
@@ -1502,37 +1473,15 @@ impl TurboStore {
                         }
                     }
                 }
-                let (ino, sz) = if !newly_created_prefix[p_idx] && fs::metadata(&dest).is_ok() {
-                    (0i64, receipt_bytes.len() as i64)
-                } else {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    match OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .mode(0o444)
-                        .open(&dest)
-                    {
-                        Ok(mut f) => {
-                            f.write_all(receipt_bytes)?;
-                        }
-                        Err(_) => {
-                            let staging_path = self
-                                .root
-                                .join("staging")
-                                .join(format!("{}.{}.tmp", hash, pid));
-                            let mut f = OpenOptions::new()
-                                .write(true)
-                                .create(true)
-                                .truncate(true)
-                                .mode(0o444)
-                                .open(&staging_path)?;
-                            f.write_all(receipt_bytes)?;
-                            drop(f);
-                            let _ = fs::rename(&staging_path, &dest);
-                        }
-                    }
-                    (0i64, receipt_bytes.len() as i64)
-                };
+                // Inode is left 0 as before; only completeness matters here.
+                let (_, sz) = ensure_blob_file(
+                    &self.root,
+                    &dest,
+                    &hash,
+                    receipt_bytes,
+                    newly_created_prefix[p_idx],
+                )?;
+                let ino = 0i64;
                 seen_blobs.insert(hash.clone(), (ino, sz));
                 (ino, sz)
             };
@@ -2328,10 +2277,39 @@ impl TurboStore {
         Ok(src)
     }
 
+    /// Refuse to link a CAS blob whose bytes are not the recorded blob: size check against the
+    /// `blobs` row (cheap), falling back to a full BLAKE3 check only for blobs with no row.
+    /// A torn blob is unlinked so the next producer rewrites it.
+    fn verify_blob_before_link(&self, blob_hash: &str, src: &Path) -> Result<()> {
+        let recorded: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT size_bytes FROM blobs WHERE blob_hash = ?1",
+                params![blob_hash],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let ok = match recorded {
+            Some(sz) => matches!(probe_blob_file(src, sz as u64), BlobDisk::Intact(_)),
+            None => fs::read(src)
+                .map(|b| blake3::hash(&b).to_hex().as_str() == blob_hash)
+                .unwrap_or(false),
+        };
+        if !ok {
+            let _ = fs::remove_file(src);
+            anyhow::bail!(
+                "CAS blob {} is missing or torn; refusing to link",
+                blob_hash
+            );
+        }
+        Ok(())
+    }
+
     /// Restore a CAS blob to `dest_path`, transparently re-promoting cold `TLZ1`-compressed
     /// blobs back to raw `0o444` Hot-tier bytes before hardlinking/copying.
     pub fn restore_blob_to_path(&self, blob_hash: &str, dest_path: &Path) -> Result<&'static str> {
         let src = self.ensure_blob_uncompressed(blob_hash)?;
+        self.verify_blob_before_link(blob_hash, &src)?;
         if let Some(parent) = dest_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -2504,6 +2482,38 @@ impl TurboStore {
     /// - Step A: Immediate Supersession Eviction (`pin_level < 0` and not in any active worktree lease),
     /// - Step B: Standard GDSF Eviction to bring reclaimable bytes under `max_reclaimable_bytes`,
     /// - Step C: Cold Unlinked Blob Compression (`TLZ1`) for `nlink == 1` `.olean`/`.ilean`/`.c` blobs.
+    /// Drop the per-action `.done` / `.waiters` markers (and the `.lock` file when no peer holds
+    /// it) of an action that GC evicted, so they neither leak nor short-circuit later lookups.
+    fn remove_singleflight_markers(&self, action_key: &str) {
+        let locks = self.root.join("locks");
+        let _ = fs::remove_file(locks.join(format!("{}.done", action_key)));
+        let _ = fs::remove_file(locks.join(format!("{}.waiters", action_key)));
+        let lock_path = locks.join(format!("{}.lock", action_key));
+        if let Ok(f) = OpenOptions::new().read(true).write(true).open(&lock_path) {
+            use std::os::unix::io::AsRawFd;
+            // Only unlink an uncontended lock: a live leader/follower keeps its flock.
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                let _ = fs::remove_file(&lock_path);
+            }
+        }
+    }
+
+    fn remove_singleflight_markers_for_blob(&self, blob_hash: &str) {
+        let Ok(mut stmt) = self
+            .conn
+            .prepare_cached("SELECT action_key FROM action_outputs WHERE blob_hash = ?1")
+        else {
+            return;
+        };
+        let keys: Vec<String> = stmt
+            .query_map(params![blob_hash], |r| r.get(0))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default();
+        for k in keys {
+            self.remove_singleflight_markers(&k);
+        }
+    }
+
     pub fn run_gc(
         &mut self,
         max_reclaimable_bytes: u64,
@@ -2655,6 +2665,7 @@ impl TurboStore {
             if p.exists() {
                 let _ = fs::remove_file(&p);
             }
+            self.remove_singleflight_markers_for_blob(&bh);
             self.conn.execute(
                 "DELETE FROM actions WHERE action_key IN (SELECT action_key FROM action_outputs WHERE blob_hash = ?1)",
                 params![bh],
@@ -2708,6 +2719,7 @@ impl TurboStore {
                     "DELETE FROM actions WHERE action_key = ?1",
                     params![action_key],
                 )?;
+                self.remove_singleflight_markers(&action_key);
                 evicted_actions += 1;
 
                 // Find orphan blobs no longer referenced by any action_outputs or active worktree leases
@@ -3412,6 +3424,125 @@ pub fn batch_put_file_stats(
     Ok(())
 }
 
+/// On-disk state of a CAS blob file relative to its expected raw size.
+pub(crate) enum BlobDisk {
+    Missing,
+    Intact(fs::Metadata),
+    /// Present but not the expected size (a partial write left by an older writer or a crash).
+    Torn,
+}
+
+/// Classify the CAS file at `path` by size alone (no hashing): a raw blob has `len == expected`,
+/// a cold `TLZ1` blob carries the raw length in its 12-byte header.
+pub(crate) fn probe_blob_file(path: &Path, expected_len: u64) -> BlobDisk {
+    let Ok(meta) = fs::metadata(path) else {
+        return BlobDisk::Missing;
+    };
+    if meta.len() == expected_len {
+        return BlobDisk::Intact(meta);
+    }
+    let mut hdr = [0u8; 12];
+    let tlz1_len = File::open(path)
+        .and_then(|mut f| f.read_exact(&mut hdr))
+        .ok()
+        .filter(|_| &hdr[..4] == b"TLZ1")
+        .map(|_| u64::from_le_bytes(hdr[4..].try_into().unwrap()));
+    if tlz1_len == Some(expected_len) {
+        BlobDisk::Intact(meta)
+    } else {
+        BlobDisk::Torn
+    }
+}
+
+/// Atomically publish `bytes` as the CAS blob `dest` through a unique staging file under
+/// `<store_root>/staging`, so a partially written final blob is never observable. A missing
+/// `dest` is created with `link` (never clobbering a concurrent valid writer); `replace` swaps
+/// a torn file out with `rename`. Returns the inode of the published file.
+pub(crate) fn write_blob_atomic(
+    store_root: &Path,
+    dest: &Path,
+    hash: &str,
+    bytes: &[u8],
+    replace: bool,
+) -> Result<i64> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let staging_dir = store_root.join("staging");
+    let staging_path = staging_dir.join(format!(
+        "{}.{}.{}.tmp",
+        hash,
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let open = || {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o444)
+            .open(&staging_path)
+    };
+    let mut f = match open() {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(&staging_dir)?;
+            open()?
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let res = (|| -> Result<i64> {
+        f.write_all(bytes)?;
+        let ino = f.metadata()?.ino() as i64;
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if replace {
+            fs::rename(&staging_path, dest)?;
+            return Ok(ino);
+        }
+        match fs::hard_link(&staging_path, dest) {
+            Ok(()) => Ok(ino),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                Ok(fs::metadata(dest)?.ino() as i64)
+            }
+            Err(e) => Err(e.into()),
+        }
+    })();
+    drop(f);
+    if !replace || res.is_err() {
+        let _ = fs::remove_file(&staging_path);
+    }
+    res
+}
+
+/// Ensure `dest` holds a complete copy of `bytes`: write it when missing, rewrite it when torn.
+/// `known_missing` skips the existence probe (freshly created shard directory).
+pub(crate) fn ensure_blob_file(
+    store_root: &Path,
+    dest: &Path,
+    hash: &str,
+    bytes: &[u8],
+    known_missing: bool,
+) -> Result<(i64, i64)> {
+    let len = bytes.len() as u64;
+    let state = if known_missing {
+        BlobDisk::Missing
+    } else {
+        probe_blob_file(dest, len)
+    };
+    match state {
+        BlobDisk::Intact(meta) => Ok((meta.ino() as i64, meta.len() as i64)),
+        BlobDisk::Missing => Ok((
+            write_blob_atomic(store_root, dest, hash, bytes, false)?,
+            len as i64,
+        )),
+        BlobDisk::Torn => Ok((
+            write_blob_atomic(store_root, dest, hash, bytes, true)?,
+            len as i64,
+        )),
+    }
+}
+
 pub fn prestage_theorem_shard_blobs_at(
     store_root: &Path,
     items: &[(String, String, Vec<u8>, i64)],
@@ -3419,7 +3550,6 @@ pub fn prestage_theorem_shard_blobs_at(
     if items.is_empty() {
         return Ok(());
     }
-    let pid = std::process::id();
     let mut seen_blobs = std::collections::HashSet::with_capacity(items.len());
     let mut seen_prefix = [false; 256];
     let mut newly_created_prefix = [false; 256];
@@ -3440,32 +3570,13 @@ pub fn prestage_theorem_shard_blobs_at(
                 }
             }
         }
-        if !newly_created_prefix[p_idx] && fs::metadata(&dest).is_ok() {
-            continue;
-        }
-        use std::os::unix::fs::OpenOptionsExt;
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o444)
-            .open(&dest)
-        {
-            Ok(mut f) => f.write_all(receipt_bytes)?,
-            Err(_) => {
-                let staging_path = store_root
-                    .join("staging")
-                    .join(format!("{}.{}.tmp", hash, pid));
-                let mut f = OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o444)
-                    .open(&staging_path)?;
-                f.write_all(receipt_bytes)?;
-                drop(f);
-                let _ = fs::rename(&staging_path, &dest);
-            }
-        }
+        ensure_blob_file(
+            store_root,
+            &dest,
+            &hash,
+            receipt_bytes,
+            newly_created_prefix[p_idx],
+        )?;
     }
     Ok(())
 }
@@ -3595,6 +3706,141 @@ pub(crate) fn try_reflink_or_hardlink(src: &Path, dst: &Path) -> Result<&'static
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    fn tmp_store(name: &str) -> Result<(PathBuf, TurboStore)> {
+        let dir = std::env::temp_dir().join(format!("turbo_lean_{}_{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let store = TurboStore::open(Some(&dir))?;
+        Ok((dir, store))
+    }
+
+    /// Simulate the leftover of a pre-fix writer that died mid `write_all`.
+    fn tear_blob(path: &Path, keep: usize) -> Result<()> {
+        let bytes = fs::read(path)?;
+        fs::remove_file(path)?;
+        fs::write(path, &bytes[..keep])?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_torn_cas_blob_is_detected_rewritten_and_never_linked() -> Result<()> {
+        let (dir, mut store) = tmp_store("torn_blob")?;
+        let payload = b"0123456789abcdef-receipt-payload".to_vec();
+        let bh = store.store_immutable_blob(&payload, "olean", "trusted", 1)?;
+        let path = store.blob_path(&bh);
+
+        // Torn blob: never a cache hit, never hard-linked into a worktree.
+        let entry = BlobEntry {
+            blob_hash: bh.clone(),
+            kind: "olean".to_string(),
+            size_bytes: payload.len() as u64,
+            rel_path: "A.olean".to_string(),
+        };
+        {
+            let lease = match store.acquire_singleflight("torn_key", "tc", "olean", "trusted")? {
+                SingleflightOutcome::Leader(l) => l,
+                _ => panic!("expected leader"),
+            };
+            store.publish_action(&lease, &[entry], 5, 0, 0, "trusted")?;
+        }
+        assert!(store.get_cached_action("torn_key", "trusted")?.is_some());
+        tear_blob(&path, 7)?;
+        assert!(store.get_cached_action("torn_key", "trusted")?.is_none());
+        assert!(store
+            .get_cached_action_no_hit_bump("torn_key", "trusted")?
+            .is_none());
+        let dst = dir.join("wt").join("A.olean");
+        assert!(store.restore_blob_to_path(&bh, &dst).is_err());
+        assert!(!dst.exists(), "unverified bytes must not be linked");
+
+        // Writers repair the torn blob instead of treating existence as validity.
+        assert!(!path.exists(), "restore unlinks the torn blob");
+        fs::write(&path, &payload[..7])?;
+        assert_eq!(
+            store.store_immutable_blob(&payload, "olean", "trusted", 1)?,
+            bh
+        );
+        assert_eq!(fs::read(&path)?, payload);
+        let size: i64 = store.conn.query_row(
+            "SELECT size_bytes FROM blobs WHERE blob_hash = ?1",
+            params![bh],
+            |r| r.get(0),
+        )?;
+        assert_eq!(size, payload.len() as i64);
+
+        let items = vec![("k".to_string(), "d".to_string(), payload.clone(), 1i64)];
+        tear_blob(&path, 3)?;
+        prestage_theorem_shard_blobs_at(&dir, &items)?;
+        assert_eq!(fs::read(&path)?, payload);
+        tear_blob(&path, 3)?;
+        store.begin_inflight_publish_theorem_shards("tc", "trusted", &items)?;
+        assert_eq!(fs::read(&path)?, payload);
+        assert_eq!(store.restore_blob_to_path(&bh, &dst)?, "hardlink");
+        assert_eq!(fs::read(&dst)?, payload);
+
+        // No staging leftovers from the atomic writer.
+        let leftovers = fs::read_dir(dir.join("staging"))?.flatten().count();
+        assert_eq!(leftovers, 0);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_gc_eviction_removes_done_and_lock_so_singleflight_never_hits_missing_row() -> Result<()>
+    {
+        let (dir, mut store) = tmp_store("evicted_done")?;
+        let payload = b"pinned output survives eviction".to_vec();
+        let bh = store.store_immutable_blob(&payload, "olean", "trusted", 1)?;
+        let entry = BlobEntry {
+            blob_hash: bh.clone(),
+            kind: "olean".to_string(),
+            size_bytes: payload.len() as u64,
+            rel_path: "B.olean".to_string(),
+        };
+        let lease = match store.acquire_singleflight("evict_key", "tc", "olean", "trusted")? {
+            SingleflightOutcome::Leader(l) => l,
+            _ => panic!("expected leader"),
+        };
+        store.publish_action(&lease, &[entry.clone()], 5, 0, 0, "trusted")?;
+        drop(lease);
+        store.write_singleflight_done("evict_key", &[entry.clone()]);
+        // An unpinned action makes the store reclaimable so GC step B actually runs.
+        let filler =
+            store.store_immutable_blob(b"unpinned filler output", "olean", "trusted", 0)?;
+        let lease = match store.acquire_singleflight("filler_key", "tc", "olean", "trusted")? {
+            SingleflightOutcome::Leader(l) => l,
+            _ => panic!("expected leader"),
+        };
+        let filler_entry = BlobEntry {
+            blob_hash: filler,
+            kind: "olean".to_string(),
+            size_bytes: 22,
+            rel_path: "C.olean".to_string(),
+        };
+        store.publish_action(&lease, &[filler_entry], 5, 0, 0, "trusted")?;
+        drop(lease);
+        let locks = dir.join("locks");
+        assert!(locks.join("evict_key.done").exists() && locks.join("evict_key.lock").exists());
+
+        let report = store.run_gc(0, 7 * 86400, true)?;
+        assert_eq!(report.evicted_actions, 2);
+        assert!(store.blob_path(&bh).exists(), "pinned blob survives");
+        assert!(!locks.join("evict_key.done").exists());
+        assert!(!locks.join("evict_key.lock").exists());
+
+        // Even a stale marker (e.g. written by a racing leader) cannot fake a hit.
+        store.write_singleflight_done("evict_key", &[entry]);
+        match store.acquire_singleflight("evict_key", "tc", "olean", "trusted")? {
+            SingleflightOutcome::Leader(_) => {}
+            SingleflightOutcome::CacheHit { .. } => panic!("hit for action missing from DB"),
+        }
+        let hits: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM actions", [], |r| r.get(0))?;
+        assert_eq!(hits, 0);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
 
     #[test]
     fn test_lake_env_cache_roundtrip_and_invalidation() -> Result<()> {
