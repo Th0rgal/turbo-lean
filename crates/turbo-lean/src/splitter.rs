@@ -3204,13 +3204,25 @@ pub fn plain_lean_audit(
             );
         }
     }
-    // Syntax or elaborators for `#print` could answer the audit commands themselves.
-    let clean = strip_string_literals(&strip_lean_comments(src)).into_owned();
+    // Syntax or elaborators for `#print` (whose tokens are string literals, so they are kept here), or
+    // elaboration-time code with `Lean` imported, could answer the audit commands themselves.
+    let clean = strip_lean_comments(src);
+    let defines = |kws: &[&str]| {
+        kws.iter()
+            .any(|kw| contains_word(&clean, kw) || clean.contains(&format!("{kw}_rules")))
+    };
+    let imports_lean = clean.lines().any(|l| {
+        let l = l.trim();
+        l == "import Lean" || l.starts_with("import Lean.") || l.starts_with("import Lean ")
+    });
     let intercepts_print = clean.contains("printAxioms")
         || (clean.contains("#print")
-            && ["macro", "syntax", "elab", "command_elab", "notation"]
-                .iter()
-                .any(|kw| contains_word(&clean, kw) || clean.contains(&format!("{kw}_rules"))));
+            && defines(&["macro", "syntax", "elab", "command_elab", "notation"]))
+        || (imports_lean
+            && (defines(&["elab", "run_cmd", "run_elab", "run_meta", "initialize"])
+                || clean.contains("#eval")
+                || clean.contains("command_elab")
+                || clean.contains("builtin_initialize")));
     let (source, audited) = with_axiom_audit(&lines.concat(), names);
     PlainLeanAudit {
         source,
@@ -4737,6 +4749,13 @@ mod tests {
         // Sources that could answer `#print axioms` themselves are refused.
         let spoof =
             "macro_rules | `(#print axioms $x) => `(#check $x)\ntheorem bad : True := trivial\n";
+        let elab_spoof = "import Lean\nelab (priority := high) \"#print\" \"axioms\" x:ident : command => pure ()\ntheorem bad : True := trivial\n";
+        assert_eq!(
+            plain_lean_audit(elab_spoof, &names, 1)
+                .violations("'bad' does not depend on any axioms\n", &allowed)
+                .len(),
+            1
+        );
         assert_eq!(
             plain_lean_audit(spoof, &names, 1)
                 .violations("'bad' does not depend on any axioms\n", &allowed)

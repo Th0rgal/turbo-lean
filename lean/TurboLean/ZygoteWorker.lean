@@ -314,48 +314,71 @@ def collectNewDeclAxioms (beforeEnv afterEnv : Environment) (rootName : Name)
           axioms := axioms.push ax
   return axioms
 
-/-- Whether `n` is a `sorry` stub in `env`: its kernel value is `fun xs => sorryAx ..` (what the
-    host's `theorem t : T := sorry` prefix stubs elaborate to). -/
+/-- Whether `n` is a `sorry` stub theorem in `env`: its kernel value is `fun xs => sorryAx ..` (what the
+    host's `theorem t : T := sorry` prefix stubs elaborate to). Definitions never count: the host does not
+    stub them, and their values are computationally relevant. -/
 def isSorryStubDecl (env : Environment) (n : Name) : Bool :=
   let rec peel : Expr → Expr
     | .lam _ _ b _ => peel b
     | .mdata _ b => peel b
     | e => e
   match env.find? n with
-  | some (.thmInfo v) | some (.defnInfo v) | some (.opaqueInfo v) =>
-    (peel v.value).isAppOf (Name.mkSimple ("sor" ++ "ryAx"))
+  | some (.thmInfo v) => (peel v.value).isAppOf (Name.mkSimple ("sor" ++ "ryAx"))
   | _ => false
+
+/-- Unescaped components of a host declaration name (`.`-separated, `«…»` quoting). -/
+def hostNameComponents (s : String) : List String := Id.run do
+  let mut comps : Array String := #[]
+  let mut cur := ""
+  let mut quoted := false
+  for c in s.toList do
+    if c == '«' then quoted := true
+    else if c == '»' then quoted := false
+    else if c == '.' && !quoted then
+      comps := comps.push cur
+      cur := ""
+    else cur := cur.push c
+  return (comps.push cur).toList
+
+/-- Unescaped components of `n`, with any `private` prefix removed. -/
+def userNameComponents (n : Name) : List String :=
+  (privateToUserName n).components.map (·.toString (escape := false))
 
 /-- Whether new declaration `n` belongs to one of the host-named check `targets`: the target itself,
     its auxiliary declarations (`t.proof_1`, `t.match_1`), a `private` copy, or any fast-olean rename
-    `_turbo_verify_<i>_<sanitized t>` (the host generates those only for targets, so their sanitized
-    spelling never matters). Matching is by name-component suffix in either direction, so an ambiguous
-    name only makes the gate stricter. -/
+    `_turbo_verify_<i>_<sanitized t>` (the host generates those only for targets). Matching is by
+    name-component suffix in either direction, so an ambiguous name only makes the gate stricter. -/
 def ownedByTarget (targets : List String) (n : Name) : Bool :=
-  let comps := (privateToUserName n).components.map (·.toString (escape := false))
-  !targets.isEmpty && (comps.any (·.startsWith "_turbo_verify_") || targets.any fun t =>
-    let tc := t.splitOn "."
+  let comps := userNameComponents n
+  comps.any (·.startsWith "_turbo_verify_") || targets.any fun t =>
+    let tc := hostNameComponents t
     (List.range comps.length).any fun i =>
       let pre := comps.take (i + 1)
-      tc.isSuffixOf pre || pre.isSuffixOf tc)
+      tc.isSuffixOf pre || pre.isSuffixOf tc
 
-/-- Per-declaration `sorryAx` exemption for stubbed elaboration (`allowStub`), never by source text: only
-    `sorry` stubs (by kernel value) that no host-named target owns are exempt (their values are also opaque to
-    the transitive audit), so a named target's own `sorry` is always rejected. A final run (the one elaborating
-    the targets) exempts nothing unless the host named targets and one of them is among its new declarations; a
-    prefix run gets no names, so the final run rejects a target stubbed there (`targetInStubbedPrefix`). -/
-def stubSorryExemption (beforeEnv afterEnv : Environment) (allowStub finalRun : Bool)
-    (targets : List String) : Name → Bool :=
-  let beforeMap := beforeEnv.constants.map₂
-  let anyOwned := afterEnv.constants.map₂.foldl
-    (fun acc n _ => acc || (!beforeMap.contains n && ownedByTarget targets n)) false
-  fun n => allowStub && (!finalRun || anyOwned) && !ownedByTarget targets n && isSorryStubDecl afterEnv n
+/-- Whether `n` is one of the host's prefix `stubs` (the declarations it replaced by `:= sorry`), up to
+    namespace qualification. -/
+def isHostStub (stubs : List String) (n : Name) : Bool :=
+  let comps := userNameComponents n
+  stubs.any fun s =>
+    let sc := hostNameComponents s
+    sc.isSuffixOf comps || comps.isSuffixOf sc
 
-/-- Whether a `sorry` stub owned by one of `targets` was added in a stubbed prefix run (it is in `prefixEnv`'s
-    local constants), where `sorry` stubs are exempt without regard to target names. -/
-def targetInStubbedPrefix (prefixEnv : Environment) (targets : List String) : Bool :=
-  !targets.isEmpty && prefixEnv.constants.map₂.foldl
-    (fun acc n _ => acc || (ownedByTarget targets n && isSorryStubDecl prefixEnv n)) false
+/-- Per-declaration `sorryAx` exemption for stubbed elaboration (`allowStub`), never by source text: only a
+    `sorry` stub theorem by kernel value is exempt (and its value opaque to the transitive audit). In a final
+    run (the one elaborating the checked declarations) it must also be one of the host-listed `stubs` and
+    owned by no host-named target, so without listed stubs nothing is exempt. A prefix-checkpoint run never
+    holds the checked declarations, and the final run re-validates its stubs (`unexemptPrefixStub`). -/
+def stubSorryExemption (afterEnv : Environment) (allowStub finalRun : Bool)
+    (stubs targets : List String) : Name → Bool :=
+  fun n => allowStub && isSorryStubDecl afterEnv n &&
+    (!finalRun || (isHostStub stubs n && !ownedByTarget targets n))
+
+/-- Whether the stubbed prefix checkpoint `prefixEnv` holds a `sorry` stub theorem that this final run
+    does not exempt (a checkpoint is shared by requests with other stubs and targets). -/
+def unexemptPrefixStub (prefixEnv : Environment) (stubs targets : List String) : Bool :=
+  prefixEnv.constants.map₂.foldl (fun acc n _ =>
+    acc || (isSorryStubDecl prefixEnv n && !stubSorryExemption prefixEnv true true stubs targets n)) false
 
 /-- In-kernel soundness gate auditing all newly added declarations in `afterEnv.constants.map₂`
     (relative to `beforeEnv.constants.map₂`) for unapproved axioms, compiler-trusted evaluation,
@@ -507,8 +530,9 @@ def sanitizeStubbedPrefixCode (code : String) : String :=
   String.intercalate "warningAsError false" (s1.splitOn "warningAsError true")
 
 /-- Elaborate and kernel-typecheck `code` starting from an immutable `baseState : Command.State`
-    without mutating `baseState`. `finalRun = false` marks a stubbed prefix-checkpoint run (no `stubTargets`),
-    whose `sorry` stubs are exempt from the `sorryAx` gate (see `stubSorryExemption`).
+    without mutating `baseState`. With `allowStub`, `sorry` stubs are exempt from the `sorryAx` gate (in a
+    `finalRun`, only the host-listed `stubs` that no `stubTargets` owns; see `stubSorryExemption`), and a
+    `finalRun` also rejects a checkpoint stub it does not exempt (`unexemptPrefixStub`).
     Returns `(ok, elapsed_us, heartbeats, proof_term_nodes, error_messages, all_messages, captured_stdout, used_constants, next_clean_state)`. -/
 def runCommandsFromState
     (baseState : Command.State)
@@ -517,6 +541,7 @@ def runCommandsFromState
     (allowStub : Bool := false)
     (evalMode : Bool := false)
     (stubTargets : List String := [])
+    (stubs : List String := [])
     (finalRun : Bool := true) : IO (Bool × Nat × Nat × Nat × List String × List String × String × List String × Command.State) := do
   let t0 ← IO.monoNanosNow
   let hb0 ← IO.getNumHeartbeats
@@ -559,11 +584,11 @@ def runCommandsFromState
   if allMessages.any isRuntimePanicText then
     errs := errs ++ [runtimePanicErr]
   if !evalMode then
-    let stubExempt := stubSorryExemption baseState.env s.commandState.env allowStub finalRun stubTargets
+    let stubExempt := stubSorryExemption s.commandState.env allowStub finalRun stubs stubTargets
     let (_, kernelErrs) ← auditNewKernelDecls baseState.env s.commandState.env stubExempt
     errs := errs ++ kernelErrs
-    if allowStub && finalRun && targetInStubbedPrefix baseState.env stubTargets then
-      errs := errs ++ ["[TurboLean.KernelGate] check target was elaborated in the stubbed prefix"]
+    if allowStub && finalRun && unexemptPrefixStub baseState.env stubs stubTargets then
+      errs := errs ++ ["[TurboLean.KernelGate] stubbed prefix holds a `sorry` theorem this check does not exempt"]
     usedConstants := (collectNewDeclUsedConstants baseState.env s.commandState.env).toList
     proofTermNodes := countNewDeclExprNodes baseState.env s.commandState.env
   let t1 ← IO.monoNanosNow
@@ -766,7 +791,8 @@ def checkShardWithEnv
     (fileName : String := "<zygote-shard>")
     (emitOlean? : Option (Name × System.FilePath) := none)
     (encodedLeanArgs : String := "")
-    (stubTargets : List String := []) : IO (Bool × Nat × Nat × Nat × List String × List String × String × List String) := do
+    (stubTargets : List String := [])
+    (stubs : List String := []) : IO (Bool × Nat × Nat × Nat × List String × List String × String × List String) := do
   -- Eval mode elaborates with the options `Lean.Elab.runFrontend` forces on the command
   -- line (snapshot reporting and asynchronous elaboration); check mode keeps `{}`.
   let initOpts : Options := if evalMode then
@@ -782,7 +808,7 @@ def checkShardWithEnv
       else pure baseEnv
   let baseState := Command.mkState env {} (← withToolchainSatSolver opts)
   let (ok, elapsedUs, heartbeats, proofTermNodes, errs, allMessages, capturedStdout, usedConstants, finalSt) ←
-    runCommandsFromState baseState bodyCode fileName allowStub evalMode stubTargets
+    runCommandsFromState baseState bodyCode fileName allowStub evalMode stubTargets stubs
   let mut finalOk := ok
   let mut finalErrs := errs
   if finalOk then
@@ -1355,9 +1381,13 @@ def main (args : List String) : IO Unit := do
     let isRaceCandidates := modeFlag == "race_candidates" || modeFlag.startsWith "race_candidates"
     let allowStub := modeFlag == "allow_stub" || modeFlag.startsWith "allow_stub:"
     -- `allow_stub:<hex>`: newline-separated names of the declarations under check (never stub-exempt).
-    let stubTargets := if modeFlag.startsWith "allow_stub:" then
-        ((TurboLean.ZygoteWorker.decodeHexToString (modeFlag.drop 11).toString).splitOn "\n").filter (!·.isEmpty)
-      else []
+    -- `allow_stub:<hex targets>:<hex stubs>`: newline-separated names of the declarations under check
+    -- (never stub-exempt) and of the prefix declarations the host stubbed (the only exemptable ones).
+    let stubLists := ((modeFlag.drop 11).toString.splitOn ":").map fun h =>
+      ((TurboLean.ZygoteWorker.decodeHexToString h).splitOn "\n").filter (!·.isEmpty)
+    let (stubTargets, stubs) := if modeFlag.startsWith "allow_stub:" then
+        (stubLists.headD [], (stubLists.drop 1).headD [])
+      else ([], [])
     let evalMode := modeFlag == "eval" || modeFlag.startsWith "eval:"
     let (customFileName?, customCwd?, emitOlean?) := if modeFlag.startsWith "eval:" then
       let metaParts := ((modeFlag.drop 5).toString).splitOn ":"
@@ -1464,18 +1494,18 @@ def main (args : List String) : IO Unit := do
         if isBatchFission then
           let (bOk, bElabUs, bHbs, bNodes, bVer, bOut, bMsgs, bErrs, bUsed) ←
             TurboLean.ZygoteWorker.runBatchFissionSubs hexSubs (fun sc =>
-              TurboLean.ZygoteWorker.checkShardWithEnv baseEnv (combineWithPref sc) allowStub false fn none encodedLeanArgs stubTargets)
+              TurboLean.ZygoteWorker.checkShardWithEnv baseEnv (combineWithPref sc) allowStub false fn none encodedLeanArgs stubTargets stubs)
           if !bOk && bErrs.contains TurboLean.ZygoteWorker.runtimePanicErr then poisoned := true
           TurboLean.ZygoteWorker.emitZygoteReply stdout bOk none kgActive true envCacheHit false importUs 0 bElabUs bHbs bNodes bVer bOut bMsgs bErrs bUsed
         else if isRaceCandidates then
           let (rOk, winIdx, rElabUs, rHbs, rNodes, rVer, rOut, rMsgs, rErrs, rUsed) ←
             TurboLean.ZygoteWorker.runRaceCandidatesSubs hexSubs (fun cc =>
-              TurboLean.ZygoteWorker.checkShardWithEnv baseEnv (combineWithPref cc) allowStub false fn none encodedLeanArgs stubTargets)
+              TurboLean.ZygoteWorker.checkShardWithEnv baseEnv (combineWithPref cc) allowStub false fn none encodedLeanArgs stubTargets stubs)
           if !rOk && rErrs.contains TurboLean.ZygoteWorker.runtimePanicErr then poisoned := true
           TurboLean.ZygoteWorker.emitZygoteReply stdout rOk (some winIdx) kgActive true envCacheHit false importUs 0 rElabUs rHbs rNodes rVer rOut rMsgs rErrs rUsed
         else
           let (ok, elabUs, hbs, ptNodes, errs, msgs, capOut, usedConsts) ←
-            TurboLean.ZygoteWorker.checkShardWithEnv baseEnv bodyCode allowStub evalMode fn emitOlean? encodedLeanArgs stubTargets
+            TurboLean.ZygoteWorker.checkShardWithEnv baseEnv bodyCode allowStub evalMode fn emitOlean? encodedLeanArgs stubTargets stubs
           if !ok && errs.contains TurboLean.ZygoteWorker.runtimePanicErr then poisoned := true
           TurboLean.ZygoteWorker.emitZygoteReply stdout ok none kgActive true envCacheHit false importUs 0 elabUs hbs ptNodes (if ok then 1 else 0) capOut msgs errs usedConsts
       else
@@ -1580,7 +1610,7 @@ def main (args : List String) : IO Unit := do
           let fn := customFileName?.getD "<zygote-decl>"
           let evalFromCkpt := fun (sc : String) => do
             let (ok, us, hbs, nodes, errs, msgs, outS, used, _) ←
-              TurboLean.ZygoteWorker.runCommandsFromState ckptState sc fn allowStub false stubTargets
+              TurboLean.ZygoteWorker.runCommandsFromState ckptState sc fn allowStub false stubTargets stubs
             pure (ok, us, hbs, nodes, errs, msgs, outS, used)
           if isBatchFission then
             if hexSubs.isEmpty then
@@ -1615,7 +1645,7 @@ def main (args : List String) : IO Unit := do
             TurboLean.ZygoteWorker.emitZygoteReply stdout emitOk none kgActive true envCacheHit prefixCacheHit importUs prefixUs 0 prefHbs prefPtNodes (if emitOk then 1 else 0) prefOut prefMsgs emitErrs prefUsed
           else
             let (ok, elabUs, dHbs, ptNodes, errs, dMsgs, dOut, usedConsts, finalSt) ←
-              TurboLean.ZygoteWorker.runCommandsFromState ckptState bodyCode fn allowStub evalMode stubTargets
+              TurboLean.ZygoteWorker.runCommandsFromState ckptState bodyCode fn allowStub evalMode stubTargets stubs
             let mut finalOk := ok
             let mut finalErrs := errs
             if finalOk then
@@ -1638,7 +1668,7 @@ def main (args : List String) : IO Unit := do
           let prefixCode := decodedPrefix?.getD (TurboLean.ZygoteWorker.decodeHexToString hexPrefix)
           let fn := customFileName?.getD "<zygote-shard>"
           let evalCombined := fun (sc : String) =>
-            TurboLean.ZygoteWorker.checkShardWithEnv baseEnv (prefixCode ++ "\n" ++ sc) allowStub false fn none encodedLeanArgs stubTargets
+            TurboLean.ZygoteWorker.checkShardWithEnv baseEnv (prefixCode ++ "\n" ++ sc) allowStub false fn none encodedLeanArgs stubTargets stubs
           if isBatchFission then
             if hexSubs.isEmpty then
               TurboLean.ZygoteWorker.emitZygoteReply stdout false none kgActive true envCacheHit false importUs prefixUs 0 prefHbs 0 0 prefOut prefMsgs prefErrs []
@@ -1662,7 +1692,7 @@ def main (args : List String) : IO Unit := do
             let rest := (bodyCode.drop prefNewlines).toString
             let combined := if prefixCode.endsWith "\n" then prefixCode ++ rest else prefixCode ++ "\n" ++ rest
             let (ok, elabUs, hbs, ptNodes, errs, msgs, capOut, usedConsts) ←
-              TurboLean.ZygoteWorker.checkShardWithEnv baseEnv combined allowStub evalMode fn emitOlean? encodedLeanArgs stubTargets
+              TurboLean.ZygoteWorker.checkShardWithEnv baseEnv combined allowStub evalMode fn emitOlean? encodedLeanArgs stubTargets stubs
             if !ok && errs.contains TurboLean.ZygoteWorker.runtimePanicErr then poisoned := true
             TurboLean.ZygoteWorker.emitZygoteReply stdout ok none kgActive true envCacheHit false importUs prefixUs elabUs hbs ptNodes (if ok then 1 else 0) capOut msgs errs usedConsts
     | none =>

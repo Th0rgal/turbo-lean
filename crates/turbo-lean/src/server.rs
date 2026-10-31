@@ -1222,6 +1222,12 @@ fn toolchain_dir_candidates(toolchain: &str) -> (String, String, String) {
     )
 }
 
+/// Store key of a receipt this server publishes for a caller-supplied shard key. The epoch makes
+/// receipts written before the `sorry` target gates (P0-1) unreachable, whatever keys callers send.
+fn server_receipt_key(shard_key: &str) -> String {
+    format!("srv-v2:{}", shard_key)
+}
+
 /// Run `lean` on a temporary source file, applying the `splitter::plain_lean_audit` of the `audit`
 /// declarations under `allowed` when `audit` is non-empty. Returns `(exit_code, stdout, stderr)`.
 #[allow(clippy::too_many_arguments)]
@@ -1410,7 +1416,8 @@ fn execute_check_shard_payload_deferred_with_domain(
         }
     }
 
-    if !req.skip_cas_lock && store.has_cached_action_readonly(&req.shard_key, trust_domain)? {
+    let receipt_key = server_receipt_key(&req.shard_key);
+    if !req.skip_cas_lock && store.has_cached_action_readonly(&receipt_key, trust_domain)? {
         return Ok((
             serde_json::json!({
                 "status": "remote_theorem_cache_hit",
@@ -1423,7 +1430,7 @@ fn execute_check_shard_payload_deferred_with_domain(
                 "server_elapsed_ms": t0.elapsed().as_millis()
             }),
             None,
-            Some(req.shard_key.clone()),
+            Some(receipt_key),
         ));
     }
 
@@ -1534,7 +1541,7 @@ fn execute_check_shard_payload_deferred_with_domain(
         let receipt = serde_json::to_vec(&receipt_obj)?;
         Some((
             toolchain.to_string(),
-            vec![(req.shard_key.clone(), req.decl.clone(), receipt, dur_ms)],
+            vec![(receipt_key, req.decl.clone(), receipt, dur_ms)],
         ))
     };
 
@@ -1603,13 +1610,19 @@ fn execute_check_shards_batch_payload_deferred(
         req.toolchain.as_str()
     };
 
-    let keys: Vec<String> = req.items.iter().map(|i| i.shard_key.clone()).collect();
-    let cached_map = store.batch_get_theorem_shards_readonly(&keys, trust_domain)?;
-    let hit_keys: Vec<String> = req
+    let keys: Vec<String> = req
         .items
         .iter()
-        .filter(|i| cached_map.contains_key(&i.shard_key))
-        .map(|i| i.shard_key.clone())
+        .map(|i| server_receipt_key(&i.shard_key))
+        .collect();
+    let cached_map = store.batch_get_theorem_shards_readonly(&keys, trust_domain)?;
+    let is_hit = |i: &crate::pack::CheckShardBatchItem| {
+        cached_map.contains_key(&server_receipt_key(&i.shard_key))
+    };
+    let hit_keys: Vec<String> = keys
+        .iter()
+        .filter(|k| cached_map.contains_key(*k))
+        .cloned()
         .collect();
     let cache_hits = hit_keys.len();
 
@@ -1681,7 +1694,7 @@ fn execute_check_shards_batch_payload_deferred(
         let server_uncached_decls: HashSet<String> = req
             .items
             .iter()
-            .filter(|i| !cached_map.contains_key(&i.shard_key))
+            .filter(|i| !is_hit(i))
             .map(|i| i.decl_name.clone())
             .collect();
         crate::splitter::build_coalesced_shard_source(
@@ -1711,7 +1724,7 @@ fn execute_check_shards_batch_payload_deferred(
     let batch_audit: std::collections::HashSet<String> = req
         .items
         .iter()
-        .filter(|i| !cached_map.contains_key(&i.shard_key))
+        .filter(|i| !is_hit(i))
         .map(|i| i.decl_name.clone())
         .collect();
     let mut batch_targets: Vec<String> = batch_audit.iter().cloned().collect();
@@ -1795,7 +1808,7 @@ fn execute_check_shards_batch_payload_deferred(
     let now = now_unix();
     let mut publish_items = Vec::with_capacity(uncached_count);
     for item in &req.items {
-        if cached_map.contains_key(&item.shard_key) {
+        if is_hit(item) {
             continue;
         }
         let mut receipt_obj = serde_json::json!({
@@ -1815,7 +1828,7 @@ fn execute_check_shards_batch_payload_deferred(
         }
         let receipt = serde_json::to_vec(&receipt_obj)?;
         publish_items.push((
-            item.shard_key.clone(),
+            server_receipt_key(&item.shard_key),
             item.decl_name.clone(),
             receipt,
             per_shard_ms,

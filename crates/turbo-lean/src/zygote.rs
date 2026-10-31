@@ -1673,17 +1673,33 @@ fn encode_lean_args_hex(lean_args: &[String]) -> String {
     }
 }
 
-/// Worker mode flag for a stubbed (`allow_stub`) or strict check. Named `stub_targets` (the declarations
-/// under check) travel as `allow_stub:<hex>`; the worker never exempts their `sorryAx`, exempts only
-/// kernel-value `sorry` stubs (never by source text), and exempts nothing in a final run without them.
-fn stub_mode_flag(allow_stub: bool, stub_targets: &[String]) -> String {
+/// Worker mode flag for a stubbed (`allow_stub`) or strict check of `shard_source`. Named `stub_targets`
+/// (the declarations under check) travel as `allow_stub:<hex targets>:<hex stubs>`, with the stubs the
+/// host wrote (`… := sorry` declarations that are not targets). The worker exempts only those, by kernel
+/// value and name, never a target; with no named targets it exempts nothing in the final run.
+fn stub_mode_flag(allow_stub: bool, stub_targets: &[String], shard_source: &str) -> String {
     match (allow_stub, stub_targets.is_empty()) {
         (false, _) => "strict".to_string(),
         (true, true) => "allow_stub".to_string(),
-        (true, false) => format!(
-            "allow_stub:{}",
-            hex_encode_bytes(stub_targets.join("\n").as_bytes())
-        ),
+        (true, false) => {
+            let targets: std::collections::HashSet<String> = stub_targets.iter().cloned().collect();
+            let stubs: Vec<String> = crate::splitter::split_lean_source(shard_source, &[])
+                .shards
+                .into_iter()
+                .filter(|sh| {
+                    sh.proof_text.trim() == "sorry"
+                        && !crate::splitter::matches_uncached_or_fast_verify_name(
+                            &sh.name, &targets,
+                        )
+                })
+                .map(|sh| sh.name)
+                .collect();
+            format!(
+                "allow_stub:{}:{}",
+                hex_encode_bytes(stub_targets.join("\n").as_bytes()),
+                hex_encode_bytes(stubs.join("\n").as_bytes())
+            )
+        }
     }
 }
 
@@ -1732,7 +1748,7 @@ fn eval_with_zygote_pool_inner(
     lean_args: &[String],
     stub_targets: &[String],
 ) -> Result<ZygoteEvalReply> {
-    let stub_mode = stub_mode_flag(allow_stub, stub_targets);
+    let stub_mode = stub_mode_flag(allow_stub, stub_targets, shard_source);
     let default_timeout_ms = if eval_mode { 900_000 } else { 30_000 };
     let effective_timeout_ms = timeout_ms.filter(|&ms| ms > 0).unwrap_or_else(|| {
         std::env::var("TURBO_LEAN_TIMEOUT_MS")

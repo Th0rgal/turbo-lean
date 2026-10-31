@@ -3726,8 +3726,39 @@ fn check_single_file(
             eval_stdout_text = String::from_utf8_lossy(&out.stdout).to_string();
         }
         // Neither run above audits axioms (zygote eval has no kernel gate, and messages can be
-        // dropped by `#guard_msgs`), so audit every theorem in a copy beside the file.
-        if !split.shards.is_empty() {
+        // dropped by `#guard_msgs`): check the file under the zygote's strict kernel gate, which reads
+        // the environment, else audit every theorem with plain `lean` in a copy beside the file.
+        let kernel_audit = (!split.shards.is_empty()
+            && !src.contains("IO.Process.exit")
+            && !src.lines().take(20).any(|l| {
+                let t = l.split("--").next().unwrap_or(l).trim();
+                t == "module" || t.starts_with("module ")
+            }))
+        .then(|| {
+            crate::zygote::eval_with_zygote_pool_with_args(
+                store,
+                toolchain,
+                &local_lean_path,
+                &env_vars,
+                Path::new(&lean_bin),
+                src,
+                false,
+                &file_lean_args,
+            )
+            .ok()
+        })
+        .flatten()
+        .filter(|r| r.import_ok && !r.crashed && !r.timed_out);
+        if let Some(rep) = kernel_audit.as_ref().filter(|r| !r.ok) {
+            anyhow::bail!(
+                "Soundness audit failed for {}:\n{}",
+                file.display(),
+                rep.errors
+                    .join("\n")
+                    .replace("<zygote-shard>", &orig_display)
+            );
+        }
+        if kernel_audit.is_none() && !split.shards.is_empty() {
             let names: HashSet<String> = split.shards.iter().map(|s| s.name.clone()).collect();
             let audit_tmp = canon_resolved_initial
                 .parent()
