@@ -42,17 +42,6 @@ def decodeHexToString (hex : String) : String := Id.run do
     out := out.push ((hi <<< 4) ||| lo)
   return String.fromUTF8! out
 
-/-- Read a `/dev/shm` payload slot (`shm:/dev/shm/...`) or decode a hex payload. -/
-def decodePayloadOrShm (raw : String) : IO String := do
-  if raw.startsWith "shm:" then
-    let p : System.FilePath := (raw.drop 4).toString
-    if ← p.pathExists then
-      IO.FS.readFile p
-    else
-      pure ""
-  else
-    pure (decodeHexToString raw)
-
 /-- Parse a dot-separated Lean module name (supporting `«...»` guillemet-escaped segments) into a `Lean.Name`. -/
 def parseModuleName (s : String) : Name := Id.run do
   let trimmed := s.trimAscii.toString
@@ -1326,7 +1315,7 @@ def main (args : List String) : IO Unit := do
       | some c => if c.isEmpty then initCwd else System.FilePath.mk c
       | none => initCwd
     try IO.Process.setCurrentDir targetCwd catch _ => pure ()
-    let bodyCode ← if isBatchFission || isRaceCandidates then pure "" else TurboLean.ZygoteWorker.decodePayloadOrShm hexBody
+    let bodyCode := if isBatchFission || isRaceCandidates then "" else TurboLean.ZygoteWorker.decodeHexToString hexBody
     let hexSubs := if isBatchFission || isRaceCandidates then (hexBody.splitOn ",").filter (fun s => !s.isEmpty) else []
     let (imports, isMod, isHeaderErr) := TurboLean.ZygoteWorker.parseImportsCsvSpec importsCsv
     if poisoned then
@@ -1431,7 +1420,7 @@ def main (args : List String) : IO Unit := do
         let optsCacheSuffix := if hexOpts.isEmpty then "" else s!"\topts:{hexOpts}"
         let importStubKey := (if evalMode || emitOlean?.isSome then s!"{envDiskKey}\t{prefAllowStub}\t{evalMode}\t{fnPref}\t{cwdKey}\t{emitModKey}" else s!"{envDiskKey}\t{prefAllowStub}\t{evalMode}") ++ optsCacheSuffix
         let fullPrefixKey := (if evalMode || emitOlean?.isSome then s!"{envDiskKey}\t{prefAllowStub}\t{evalMode}\t{fnPref}\t{cwdKey}\t{emitModKey}\t{prefixKey}" else s!"{envDiskKey}\t{prefAllowStub}\t{evalMode}\t{prefixKey}") ++ optsCacheSuffix
-        let prefixCode ← TurboLean.ZygoteWorker.decodePayloadOrShm hexPrefix
+        let prefixCode := TurboLean.ZygoteWorker.decodeHexToString hexPrefix
         let (prefixCacheHit, prefixUs, ckptState?, prefErrs, prefMsgs, prefOut, prefHbs, decodedPrefix?) ← match stateCache[fullPrefixKey]? with
           | some (cachedCode, st, cachedMsgs, cachedOut, cachedHbs) =>
             if cachedCode == prefixCode then
@@ -1473,7 +1462,11 @@ def main (args : List String) : IO Unit := do
               | none => none
             let deltaRes? ← match bestAncestor? with
               | some (prevCode, prevState, prevMsgs, prevOut, prevHbs) => do
-                let deltaCode := (prefixCode.drop (String.length prevCode)).toString
+                -- Pad with the ancestor's newlines (and trailing-line columns) so message
+                -- positions match a from-scratch run of `prefixCode`.
+                let lastLine := (prevCode.splitOn "\n").getLast!
+                let padding := "".pushn '\n' (prevCode.toList.filter (· == '\n')).length ++ "".pushn ' ' lastLine.length
+                let deltaCode := padding ++ (prefixCode.drop (String.length prevCode)).toString
                 let (dOk, dUs, dHbs, _dNodes, dErrs, dMsgs, dOut, _dUsed, dNextSt) ←
                   TurboLean.ZygoteWorker.runCommandsFromState prevState deltaCode fnPref prefAllowStub evalMode
                 if dErrs.contains TurboLean.ZygoteWorker.runtimePanicErr then poisoned := true

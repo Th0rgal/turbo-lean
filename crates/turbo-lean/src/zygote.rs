@@ -1608,6 +1608,70 @@ pub fn split_shard_for_zygote(shard_source: &str) -> (String, String) {
     (entries.join(","), body)
 }
 
+/// True iff `path` is a non-symlink entry of the expected kind, owned by the effective uid,
+/// with no group/other write access (directories additionally no group/other access).
+#[cfg(unix)]
+fn owned_private_entry(path: &Path, want_dir: bool) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(m) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    let mask = if want_dir { 0o077 } else { 0o022 };
+    let kind_ok = if want_dir { m.is_dir() } else { m.is_file() };
+    kind_ok && m.uid() == unsafe { libc::geteuid() } && m.mode() & mask == 0
+}
+
+#[cfg(not(unix))]
+fn owned_private_entry(_path: &Path, _want_dir: bool) -> bool {
+    true
+}
+
+fn owned_private_file(path: &Path) -> bool {
+    owned_private_entry(path, false)
+}
+
+/// Per-uid `$TMPDIR/turbo_lean_shared_zygote_bins_<uid>` (mode 0700), or `None` when it cannot
+/// be created or is not owned by us (e.g. pre-created by another local user).
+pub(crate) fn private_shared_zygote_dir() -> Option<PathBuf> {
+    private_shared_zygote_dir_in(&std::env::temp_dir())
+}
+
+fn private_shared_zygote_dir_in(base: &Path) -> Option<PathBuf> {
+    #[cfg(unix)]
+    let uid = unsafe { libc::geteuid() };
+    #[cfg(not(unix))]
+    let uid = 0u32;
+    #[cfg(unix)]
+    let dir = {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        // Another user must not be able to rename/replace our dir anywhere up the resolved
+        // hierarchy: every ancestor must be owned by root or us and may only be
+        // group/other-writable when sticky (like the default /tmp).
+        let base = fs::canonicalize(base).ok()?;
+        for anc in base.ancestors() {
+            let pm = fs::metadata(anc).ok()?;
+            let writable_by_others = pm.mode() & 0o022 != 0 && pm.mode() & 0o1000 == 0;
+            if writable_by_others || (pm.uid() != 0 && pm.uid() != uid) {
+                return None;
+            }
+        }
+        let dir = base.join(format!("turbo_lean_shared_zygote_bins_{uid}"));
+        match fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return None,
+        }
+        dir
+    };
+    #[cfg(not(unix))]
+    let dir = {
+        let dir = base.join(format!("turbo_lean_shared_zygote_bins_{uid}"));
+        let _ = fs::create_dir_all(&dir);
+        dir
+    };
+    owned_private_entry(&dir, true).then_some(dir)
+}
+
 pub(crate) fn ensure_zygote_binary(
     store: &TurboStore,
     lean_bin: &Path,
@@ -1630,29 +1694,29 @@ pub(crate) fn ensure_zygote_binary(
         return Ok(cached_bin);
     }
 
-    let shared_dir = std::env::temp_dir().join("turbo_lean_shared_zygote_bins");
-    let shared_bin = shared_dir.join(&bin_name);
-    let _lock_guard = crate::shm_cache::acquire_flock(
-        &shared_dir.join(format!("{}.lock", bin_name)),
-        true,
-        false,
-    )
-    .ok()
-    .flatten();
+    // The shared dir lives in world-writable $TMPDIR: only use it when it is a private,
+    // euid-owned 0700 directory, and only execute regular files we own.
+    let shared_dir = private_shared_zygote_dir();
+    let shared_bin = shared_dir.as_ref().map(|d| d.join(&bin_name));
+    let _lock_guard = shared_dir
+        .as_ref()
+        .and_then(|d| {
+            crate::shm_cache::acquire_flock(&d.join(format!("{}.lock", bin_name)), true, false).ok()
+        })
+        .flatten();
 
     if cached_bin.exists() {
         return Ok(cached_bin);
     }
-    if shared_bin.exists() {
+    if let Some(shared_bin) = shared_bin.as_ref().filter(|b| owned_private_file(b)) {
         let tmp_copy = bin_dir.join(format!(".{}.{}.tmp", bin_name, next_tmp_id()));
-        if fs::hard_link(&shared_bin, &tmp_copy).is_ok() || fs::copy(&shared_bin, &tmp_copy).is_ok()
-        {
+        if fs::hard_link(shared_bin, &tmp_copy).is_ok() || fs::copy(shared_bin, &tmp_copy).is_ok() {
             let _ = fs::rename(&tmp_copy, &cached_bin);
             if cached_bin.exists() {
                 return Ok(cached_bin);
             }
         }
-        return Ok(shared_bin);
+        return Ok(shared_bin.clone());
     }
 
     let tmp_id = next_tmp_id();
@@ -1721,9 +1785,11 @@ pub(crate) fn ensure_zygote_binary(
             let _ = fs::set_permissions(&tmp_bin, p);
         }
     }
-    let shared_tmp = shared_dir.join(format!(".{}.{}.tmp", bin_name, tmp_id));
-    if fs::hard_link(&tmp_bin, &shared_tmp).is_ok() || fs::copy(&tmp_bin, &shared_tmp).is_ok() {
-        let _ = fs::rename(&shared_tmp, &shared_bin);
+    if let (Some(shared_dir), Some(shared_bin)) = (&shared_dir, &shared_bin) {
+        let shared_tmp = shared_dir.join(format!(".{}.{}.tmp", bin_name, tmp_id));
+        if fs::hard_link(&tmp_bin, &shared_tmp).is_ok() || fs::copy(&tmp_bin, &shared_tmp).is_ok() {
+            let _ = fs::rename(&shared_tmp, shared_bin);
+        }
     }
     fs::rename(&tmp_bin, &cached_bin)?;
     Ok(cached_bin)
@@ -3958,7 +4024,7 @@ fn compute_eval_shm_cache_filename(
     let (imports_csv, _) = split_shard_for_zygote(source);
     let imp_dig = compute_imported_oleans_digest(&imports_csv, lean_path);
     let mut h = blake3::Hasher::new();
-    h.update(b"eval-shm:v2:");
+    h.update(b"eval-shm:v3:");
     h.update(toolchain.as_bytes());
     h.update(b":");
     h.update(lean_path.as_bytes());
@@ -3976,6 +4042,38 @@ fn compute_eval_shm_cache_filename(
     }
     let key_hex = h.finalize().to_hex();
     format!("ev_{}.json", &key_hex[..24])
+}
+
+/// Only successful, import-clean replies may be cached: failures (missing toolchain, import
+/// errors, ...) are environmental and must be re-evaluated rather than replayed forever.
+fn eval_reply_cacheable(rep: &ZygoteEvalReply) -> bool {
+    rep.ok && rep.import_ok && !rep.crashed && !rep.timed_out
+}
+
+/// Write an eval reply into `eval_shm_cache/` and periodically enforce the `/dev/shm` quota.
+fn write_eval_shm_cache(path: &Path, bytes: &[u8]) {
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // A failed write (e.g. ENOSPC) also counts: evict so a full cache can recover.
+    let wrote = crate::shm_cache::atomic_write_shm(path, bytes).is_ok();
+    let Some(dir) = path.parent() else { return };
+    if !wrote {
+        // Pressure-driven: the quota may not be exceeded yet (small or shared /dev/shm), so
+        // halve what the cache holds and retry once.
+        let held: u64 = fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.metadata().ok())
+            .map(|m| m.len())
+            .sum();
+        let _ = crate::shm_cache::enforce_shm_quota_lru(dir, (held / 2).max(1));
+        let _ = crate::shm_cache::atomic_write_shm(path, bytes);
+    } else if WRITES
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .is_multiple_of(32)
+    {
+        let _ = crate::shm_cache::enforce_shm_quota_lru(dir, 0);
+    }
 }
 
 fn read_cached_eval_shm_reply(path: &Path) -> Option<ZygoteEvalReply> {
@@ -4020,8 +4118,9 @@ pub fn try_stateless_eval_shm_cache(
         None => return None,
     };
     let toolchain = crate::lake_build::detect_toolchain(&proj_dir);
-    let resolved_lean_args =
-        crate::module_builder::try_resolve_lean_args_for_path(&proj_dir, Some(file));
+    let resolved_lean_args = crate::module_builder::filter_allowed_lean_args(
+        crate::module_builder::try_resolve_lean_args_for_path(&proj_dir, Some(file)),
+    );
     let caller_cwd = std::env::current_dir()
         .ok()
         .map(|p| p.to_string_lossy().to_string());
@@ -4148,10 +4247,10 @@ pub fn try_local_zygote_eval_with_args(
             &filtered_args,
         )
         .ok()?;
-        if rep.ok && !rep.crashed && !rep.timed_out {
+        if eval_reply_cacheable(&rep) {
             if let Some(ref path) = eval_shm_file {
                 if let Ok(bytes) = serde_json::to_vec(&rep) {
-                    let _ = crate::shm_cache::atomic_write_shm(path, &bytes);
+                    write_eval_shm_cache(path, &bytes);
                 }
             }
             warm_local_zygote_daemon_nonblocking(store, env_vars);
@@ -4234,9 +4333,9 @@ pub fn try_local_zygote_eval_with_args(
     };
     let parsed = serde_json::from_slice::<ZygoteEvalReply>(&resp_bytes).ok();
     if let Some(ref rep) = parsed {
-        if !rep.timed_out && !rep.crashed {
+        if eval_reply_cacheable(rep) {
             if let Some(ref path) = eval_shm_file {
-                let _ = crate::shm_cache::atomic_write_shm(path, &resp_bytes);
+                write_eval_shm_cache(path, &resp_bytes);
             }
         }
     }
@@ -5122,6 +5221,108 @@ mod tests {
                     .contains("rsgb_driver.lean:12:7: error(lean.unknownIdentifier):")
         );
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_eval_mode_ancestor_prefix_reuse_preserves_line_numbers() {
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("eval_ancestor")
+        else {
+            return;
+        };
+        let toolchain = "leanprover/lean4:v4.35.0";
+        let isolated_lp = tmp_dir.to_string_lossy().to_string();
+        let run_eval = |src: &str| {
+            eval_with_zygote_pool_opts(
+                &store,
+                toolchain,
+                &isolated_lp,
+                &env_vars,
+                &lean_bin,
+                src,
+                false,
+                true,
+                Some("anc.lean"),
+                Some(30_000),
+            )
+            .unwrap()
+        };
+        let base = "import Init\ndef ancA : Nat := 1\ndef ancB : Nat := ancA + 1\n";
+        assert!(run_eval(&format!("{base}#eval ancB\n")).ok);
+        // The new prefix extends the cached one; the warning in the delta sits on line 4.
+        let rep = run_eval(&format!("{base}theorem ancW : True := sorry\n#eval ancB\n"));
+        let msgs = rep.messages.join("\n");
+        assert!(rep.ok && msgs.contains("anc.lean:4:8: warning"), "{msgs}");
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_eval_reply_cacheable_only_for_clean_successes() {
+        let ok = ZygoteEvalReply {
+            ok: true,
+            import_ok: true,
+            ..Default::default()
+        };
+        assert!(eval_reply_cacheable(&ok));
+        // e.g. "toolchain not installed": ok=false and import_ok=false
+        assert!(!eval_reply_cacheable(&ZygoteEvalReply {
+            ok: false,
+            ..ok.clone()
+        }));
+        assert!(!eval_reply_cacheable(&ZygoteEvalReply {
+            import_ok: false,
+            ..ok.clone()
+        }));
+        assert!(!eval_reply_cacheable(&ZygoteEvalReply {
+            crashed: true,
+            ..ok.clone()
+        }));
+        assert!(!eval_reply_cacheable(&ZygoteEvalReply {
+            timed_out: true,
+            ..ok
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_shared_zygote_dir_rejects_foreign_or_open_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = std::env::temp_dir().join(format!("turbo_zyg_shared_{}", next_tmp_id()));
+        fs::create_dir_all(&tmp).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let dir = tmp.join(format!("turbo_lean_shared_zygote_bins_{uid}"));
+        // Pre-planted world-writable dir (as another local user could create) is rejected.
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(private_shared_zygote_dir_in(&tmp).is_none());
+        // A symlink in its place is rejected too.
+        fs::remove_dir(&dir).unwrap();
+        let target = tmp.join("elsewhere");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&target, &dir).unwrap();
+        assert!(private_shared_zygote_dir_in(&tmp).is_none());
+        fs::remove_file(&dir).unwrap();
+        // A non-sticky group/other-writable parent could let others rename our dir.
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(private_shared_zygote_dir_in(&tmp).is_none());
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o1777)).unwrap();
+        let sticky = private_shared_zygote_dir_in(&tmp).expect("sticky parent accepted");
+        fs::remove_dir(&sticky).unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
+        // Fresh dir is created 0700 and accepted.
+        let got = private_shared_zygote_dir_in(&tmp).expect("private dir");
+        assert_eq!(
+            fs::metadata(&got).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        // A group/other-writable binary is not executable material.
+        let bin = got.join("turbo_zygote_x");
+        fs::write(&bin, b"x").unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(owned_private_file(&bin));
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(!owned_private_file(&bin));
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
