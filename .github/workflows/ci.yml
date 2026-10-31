@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -22,6 +23,9 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Test emitter mutation runner acceptance and provenance
+        run: python3 scripts/emitter_mutants.py --unit-tests
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -132,3 +136,102 @@ jobs:
           ./target/release/turbo-lean status --json
           ./target/release/turbo-lean gc --max-reclaimable-bytes 2147483648 --json
           ./target/release/turbo-lean export -o .turbo-pack/cache.tlpack --json
+
+  emitter-mutation-report:
+    name: Emitter Mutation Report (B-3, Non-Blocking)
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Test emitter mutation runner acceptance and provenance
+        run: python3 scripts/emitter_mutants.py --unit-tests
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - name: Provision bubblewrap sandbox
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap clang
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --unshare-all --new-session --die-with-parent --clearenv --setenv PATH /usr/bin:/bin --dev /dev --proc /proc --tmpfs /tmp --ro-bind /usr /usr --ro-bind /bin /bin --ro-bind /lib /lib --ro-bind /lib64 /lib64 --ro-bind /etc /etc true
+
+      - name: Setup Lean 4 toolchain
+        run: |
+          TOOLCHAIN="$(tr -d '[:space:]' < lean/lean-toolchain)"
+          if [ ! -x "$HOME/.elan/bin/elan" ]; then
+            curl --retry 5 --retry-all-errors -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain "$TOOLCHAIN"
+          else
+            "$HOME/.elan/bin/elan" toolchain install "$TOOLCHAIN"
+          fi
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          echo "${GITHUB_WORKSPACE}/lean/.lake/build/bin" >> "$GITHUB_PATH"
+          (cd lean && "$HOME/.elan/bin/lean" --version)
+
+      - name: Prime Lake and Cargo caches on baseline checkout
+        run: |
+          (cd lean && lake build)
+          cargo build --release -p turbo-lean
+
+      - name: Run emitter mutation self-test fixtures (F1..F4)
+        run: |
+          mkdir -p emitter-mutation-artifact
+          python3 scripts/emitter_mutants.py \
+            --fixtures \
+            --full-fixtures \
+            --fixtures-output emitter-mutation-artifact/emitter-mutation-fixtures.json \
+            --logs emitter-mutation-artifact/logs
+
+      - name: Run B-3 emitter mutation suite (M1..M11, C1..C7)
+        run: |
+          mkdir -p emitter-mutation-artifact
+          python3 scripts/emitter_mutants.py \
+            --output emitter-mutation-artifact/emitter-mutation-report.json \
+            --logs emitter-mutation-artifact/suite-logs
+
+      - name: Summarize emitter mutation report
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          p = pathlib.Path("emitter-mutation-artifact/emitter-mutation-report.json")
+          fp = pathlib.Path("emitter-mutation-artifact/emitter-mutation-fixtures.json")
+          lines = ["### Emitter Mutation Report (B-3)\n"]
+          if fp.is_file():
+              fd = json.loads(fp.read_text())
+              lines.append(f"- **Fixtures passed**: `{fd.get('passed')}` (`baseline_compile_ok={fd.get('baseline_compile_ok')}`)")
+              for k, v in fd.get("fixtures", {}).items():
+                  lines.append(f"  - `{k}` (`{v.get('id')}`): `{v.get('outcome')}` (expected `{v.get('expected')}`, killed_by={v.get('killed_by')}, passed={v.get('passed')})")
+          if p.is_file():
+              d = json.loads(p.read_text())
+              lines.append(f"- **Run outcome**: `{d.get('run_outcome')}` (`commit={d.get('commit')}`)")
+              lines.append(f"- **Baseline**: `{d.get('baseline', {}).get('outcome')}`")
+              lines.append(f"- **Kill rate per backend**: `{json.dumps(d.get('kill_rate_per_backend', {}), sort_keys=True)}`")
+              lines.append("\n| ID | Backend | Outcome | Killed By |\n|---|---|---|---|")
+              for m in d.get("mutations", []):
+                  lines.append(f"| `{m.get('id')}` | `{m.get('backend')}` | `{m.get('outcome')}` | `{','.join(m.get('killed_by', []))}` |")
+          text = "\n".join(lines) + "\n"
+          print(text)
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              with open(summary_path, "a", encoding="utf-8") as fh:
+                  fh.write(text)
+          PY
+
+      - name: Upload emitter mutation JSON report and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: emitter-mutation-report
+          path: emitter-mutation-artifact/
+          if-no-files-found: warn
+          retention-days: 30
