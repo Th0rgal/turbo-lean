@@ -740,11 +740,16 @@ def expandHeapExpr (st : SymExecState) : Nat → SymExpr → SymExpr
   | 0, e => e
   | d + 1, .symVar id =>
     let root := st.resolveBuf id
-    if st.allocRoots.contains root || (st.refCounts.lookup root).isSome || (st.rcExprs.lookup root).isSome then
+    let rootExpr := (st.lookupVar root).expr
+    let hasCachedCtorTuple :=
+      !(st.typedTuples.contains root) &&
+      (match rootExpr with | .tuple _ => true | _ => false)
+    if st.allocRoots.contains root || (st.refCounts.lookup root).isSome ||
+       (st.rcExprs.lookup root).isSome || hasCachedCtorTuple then
       let rcExpr := st.lookupRcExpr root
       let rootMarker : SymExpr :=
         if st.allocRoots.contains root then .allocTag root else .symVar root
-      match (st.lookupVar root).expr with
+      match rootExpr with
       | .tuple fs =>
         let fs' := fs.map (expandHeapExpr st d)
         .tuple (rootMarker :: rcExpr :: fs')
@@ -2314,7 +2319,7 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
           .symVar rRoot
         else match rSv.expr with
           | .tuple _ =>
-            if !(st.typedTuples.contains rRoot) && ((st.refCounts.lookup rRoot).isSome || (st.rcExprs.lookup rRoot).isSome) then
+            if !(st.typedTuples.contains rRoot) then
               .symVar rRoot
             else
               rSv.expr
