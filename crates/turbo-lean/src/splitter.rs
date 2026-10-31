@@ -106,7 +106,8 @@ pub fn axiom_allowed(ax: &str) -> bool {
 pub fn read_project_config(dir: &std::path::Path, rev: Option<&str>) -> Option<String> {
     let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     dir.ancestors().find_map(|a| match rev {
-        Some(r) => std::process::Command::new("git")
+        Some(r) => crate::trusted_tools::git(&dir)
+            .ok()?
             .arg("-C")
             .arg(a)
             .args(["show", &format!("{}:./turbo-lean.toml", r)])

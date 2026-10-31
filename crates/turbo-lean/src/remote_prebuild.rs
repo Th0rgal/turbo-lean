@@ -12,7 +12,6 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,7 +90,8 @@ fn detect_git_repo_and_head(project_dir: &Path) -> (Option<String>, Option<Strin
         .filter(|(s, r)| !s.trim().is_empty() && !r.trim().is_empty())
         .map(|(s, r)| format!("{}/{}.git", s.trim_end_matches('/'), r.trim()));
     let repo = env_repo.or_else(|| {
-        Command::new("git")
+        crate::trusted_tools::git(project_dir)
+            .ok()?
             .args(["config", "--get", "remote.origin.url"])
             .current_dir(project_dir)
             .output()
@@ -105,7 +105,8 @@ fn detect_git_repo_and_head(project_dir: &Path) -> (Option<String>, Option<Strin
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .or_else(|| {
-            Command::new("git")
+            crate::trusted_tools::git(project_dir)
+                .ok()?
                 .args(["rev-parse", "HEAD"])
                 .current_dir(project_dir)
                 .output()
@@ -178,12 +179,11 @@ fn dirty_paths_from_porcelain(porcelain_z: &[u8]) -> Vec<String> {
 /// remote will build (uncommitted paths, or a `HEAD` on another commit); empty when it is not a git
 /// work tree.
 fn working_tree_dirty_paths(project_dir: &Path, selected_sha: &str) -> Result<Vec<String>> {
-    let git = |args: &[&str]| {
-        Command::new("git")
+    let git = |args: &[&str]| -> Result<std::process::Output> {
+        Ok(crate::trusted_tools::git(project_dir)?
             .args(args)
-            .env("LC_ALL", "C")
             .current_dir(project_dir)
-            .output()
+            .output()?)
     };
     // Only a definite "not a repository" means there is no checkout to compare; any other
     // failure to inspect (missing git, `safe.directory`, corrupt `.git`) must not read as clean.
@@ -639,6 +639,7 @@ pub fn run_remote_prebuild_command(
 mod tests {
     use super::*;
     use std::net::TcpListener;
+    use std::process::Command;
 
     #[test]
     fn resolves_base_origin_to_v1_prebuilds_and_preserves_explicit_paths() {

@@ -168,10 +168,12 @@ pub fn measure_process_rss_mb(pid: u32) -> u64 {
         }
     }
 
-    if let Ok(out) = Command::new("ps")
-        .args(["-o", "rss=", "-p", &pid.to_string()])
-        .output()
-    {
+    if let Ok(out) = crate::trusted_tools::system_command("ps").and_then(|mut command| {
+        command
+            .args(["-o", "rss=", "-p", &pid.to_string()])
+            .output()
+            .map_err(Into::into)
+    }) {
         if out.status.success() {
             if let Ok(rss_kb) = String::from_utf8_lossy(&out.stdout).trim().parse::<u64>() {
                 return rss_kb / 1024;
@@ -694,9 +696,11 @@ fn portable_process_alive(pid: u32) -> bool {
         return false;
     }
     // A zombie cannot use staging. On any ps failure retain it conservatively.
-    Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "stat="])
-        .output()
+    crate::trusted_tools::system_command("ps")
+        .and_then(|mut command| {
+            command.args(["-p", &pid.to_string(), "-o", "stat="])
+                .output().map_err(Into::into)
+        })
         .map(|out| {
             !out.status.success()
                 || out.stdout.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'Z')
@@ -723,7 +727,7 @@ struct PortableProcessIdentity {
 
 #[cfg(any(not(target_os = "linux"), test))]
 fn portable_process_identity(pid: u32) -> Result<Option<PortableProcessIdentity>> {
-    let output = Command::new("ps")
+    let output = crate::trusted_tools::system_command("ps")?
         .args([
             "eww",
             "-p",
@@ -1678,8 +1682,15 @@ pub(crate) fn ensure_zygote_binary(
     env_vars: &std::collections::HashMap<String, String>,
 ) -> Result<std::path::PathBuf> {
     let _lifecycle = lifecycle_lock(false)?;
+    let tools = crate::module_builder::ToolchainExecutables::from_lean(lean_bin)?;
+    let lean_bin = tools.lean.as_path();
+    let leanc_bin = tools.leanc.as_path();
+    let mut env_vars = env_vars.clone();
+    tools.apply_env(&mut env_vars);
+    let env_vars = &env_vars;
+
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"turbo-zygote:v3:shared:");
+    hasher.update(b"turbo-zygote:v4:absolute-tools:");
     hasher.update(std::env::consts::ARCH.as_bytes());
     hasher.update(lean_bin.to_string_lossy().as_bytes());
     if let Some(tc) = env_vars.get("ELAN_TOOLCHAIN") {
@@ -1721,11 +1732,7 @@ pub(crate) fn ensure_zygote_binary(
 
     let tmp_id = next_tmp_id();
     // Compile embedded ZygoteWorker.lean via `lean -c` + `leanc -O3 -lleanshared -Wl,-rpath,<sysroot>/lib/lean`
-    let leanc_bin = lean_bin
-        .parent()
-        .map(|p| p.join("leanc"))
-        .filter(|c| c.exists())
-        .unwrap_or_else(|| std::path::PathBuf::from("leanc"));
+
     let tmp_lean = bin_dir.join(format!("ZygoteWorker_{}.lean", tmp_id));
     let tmp_c = bin_dir.join(format!("ZygoteWorker_{}.c", tmp_id));
     let tmp_bin = bin_dir.join(format!(".{}.{}.tmp", bin_name, tmp_id));
@@ -1948,6 +1955,10 @@ fn build_auditor_bootstrap_env(
     if !tc_ld_parts.is_empty() {
         bootstrap_env.insert("LD_LIBRARY_PATH".to_string(), tc_ld_parts.join(":"));
     }
+    bootstrap_env.insert(
+        "PATH".into(),
+        crate::module_builder::verifier_path(&cfg.lean_bin),
+    );
     bootstrap_env.insert("ELAN_TOOLCHAIN".to_string(), cfg.toolchain.clone());
     bootstrap_env
 }
@@ -1983,7 +1994,7 @@ fn audit_compiled_module_batch(
         .unwrap_or(if is_untrusted { 120 } else { 300 });
 
     let mut cmd = if is_untrusted {
-        let bwrap_path = crate::module_builder::probe_bwrap_sandbox().ok_or_else(|| {
+        let bwrap_path = crate::module_builder::probe_bwrap_sandbox(&cfg.root_pkg.pkg_root).ok_or_else(|| {
             anyhow::anyhow!(
                 "Untrusted kernel `.olean` audit requires a working bubblewrap (`bwrap`) sandbox: fail-closed sandbox gate"
             )
@@ -2071,6 +2082,7 @@ fn audit_compiled_module_batch(
     } else {
         let mut c = Command::new(&canon_zygote);
         c.current_dir(&cfg.root_pkg.pkg_root)
+            .env("PATH", crate::module_builder::verifier_path(&cfg.lean_bin))
             .env("LEAN", &cfg.lean_bin)
             .env("LEAN_PATH", lean_path_env)
             .env("LD_LIBRARY_PATH", auditor_ld_library_path)
@@ -2509,6 +2521,7 @@ fn eval_with_zygote_pool_inner(
         cmd.envs(env_vars)
             .env("LEAN_STACK_SIZE_KB", default_stack_kb)
             .env("LEAN_PATH", &effective_lean_path)
+            .env("PATH", crate::module_builder::verifier_path(lean_bin))
             .env("LEAN", lean_bin)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -4647,7 +4660,8 @@ mod tests {
         let _ = fs::create_dir_all(&tmp_dir);
         let store = TurboStore::open(Some(&tmp_dir)).expect("open store");
         let (mut env_vars, lean_bin) =
-            crate::pack::resolve_server_lean_env_and_bin(&store, "leanprover/lean4:v4.35.0", "");
+            crate::pack::resolve_server_lean_env_and_bin(&store, "leanprover/lean4:v4.35.0", "")
+                .unwrap();
         env_vars.insert(
             "LEAN_PATH".to_string(),
             tmp_dir.to_string_lossy().to_string(),
@@ -5605,7 +5619,7 @@ mod tests {
             false,
         )
         .expect("trusted auditor must ignore poisoned .lake/build/lib/libleanshared.so");
-        if crate::module_builder::probe_bwrap_sandbox().is_some() {
+        if crate::module_builder::probe_bwrap_sandbox(std::path::Path::new(".")).is_some() {
             audit_compiled_modules_with_zygote(
                 &store,
                 &cfg,
@@ -5686,7 +5700,8 @@ mod tests {
         let store = TurboStore::open(Some(&tmp_dir.join("store"))).unwrap();
         let (lean_path_env, _) = crate::module_builder::build_lean_search_path(&cfg, true);
         let prev_allow = std::env::var(crate::splitter::ALLOWED_AXIOMS_ENV).ok();
-        let has_bwrap = crate::module_builder::probe_bwrap_sandbox().is_some();
+        let has_bwrap =
+            crate::module_builder::probe_bwrap_sandbox(std::path::Path::new(".")).is_some();
 
         // 1. Default policy rejects `native_decide` auxiliary axioms in both trusted and untrusted Stage 1C audits.
         std::env::remove_var(crate::splitter::ALLOWED_AXIOMS_ENV);

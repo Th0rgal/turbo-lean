@@ -820,7 +820,9 @@ fn probe_system_budget_mb() -> u64 {
         return cg;
     }
 
-    if let Ok(out) = std::process::Command::new("vm_stat").output() {
+    if let Ok(out) = crate::trusted_tools::system_command("vm_stat")
+        .and_then(|mut command| command.output().map_err(Into::into))
+    {
         if out.status.success() {
             let text = String::from_utf8_lossy(&out.stdout);
             if let Some(budget_mb) = parse_macos_vm_stat_budget_mb(&text) {
@@ -828,10 +830,12 @@ fn probe_system_budget_mb() -> u64 {
             }
         }
     }
-    if let Ok(out) = std::process::Command::new("sysctl")
-        .args(["-n", "hw.memsize"])
-        .output()
-    {
+    if let Ok(out) = crate::trusted_tools::system_command("sysctl").and_then(|mut command| {
+        command
+            .args(["-n", "hw.memsize"])
+            .output()
+            .map_err(Into::into)
+    }) {
         if out.status.success() {
             if let Ok(bytes) = String::from_utf8_lossy(&out.stdout).trim().parse::<u64>() {
                 let total_mb = bytes / (1024 * 1024);

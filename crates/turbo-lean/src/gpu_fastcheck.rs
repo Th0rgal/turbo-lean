@@ -3248,7 +3248,7 @@ pub fn run_fast_check_command(
                 }
                 let tc = crate::lake_build::detect_toolchain(&lean_dir);
                 let (mut env_vars, mut lean_bin_path) =
-                    crate::pack::resolve_server_lean_env_and_bin(store, &tc, "");
+                    crate::pack::resolve_server_lean_env_and_bin(store, &tc, "")?;
 
                 let pid = std::process::id();
                 let tmp_c = staging.join(format!("fastcheck_{}.c", pid));
@@ -3274,7 +3274,7 @@ pub fn run_fast_check_command(
                     if let Ok((lake_env, _)) = crate::lake_build::resolve_lake_env(store, &lean_dir)
                     {
                         lean_bin_path =
-                            PathBuf::from(crate::lake_build::lean_bin_from_env(&lake_env));
+                            PathBuf::from(crate::lake_build::resolve_lean_bin(&lean_dir)?);
                         env_vars = lake_env;
                     }
                     let compile_target = if has_main {
@@ -3298,15 +3298,8 @@ pub fn run_fast_check_command(
                     }
                 }
                 let _ = fs::remove_file(&tmp_lean);
-
-                let leanc_bin = lean_bin_path
-                    .parent()
-                    .map(|p| p.join("leanc"))
-                    .filter(|c| c.exists())
-                    .unwrap_or_else(|| PathBuf::from("leanc"));
                 let out2 = crate::pack::compile_fastcheck_c_to_bin(
                     &lean_bin_path,
-                    &leanc_bin,
                     &tmp_c,
                     &tmp_bin,
                     &lean_dir,
