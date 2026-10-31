@@ -1,0 +1,16 @@
+{
+  "previous_commit": "08d4bf83f7a35786144bd07f83447f2cf6dced9a",
+  "commit": "e87a5aa68f5d9e2d0a7a2d7e0c0ae36063b14552",
+  "hash_validation": "passed",
+  "scope": "C5 independently re-extracted constant hashes; kernel coverage and timings not yet certified",
+  "identical_FV_source_files": 4447,
+  "identical_module_metadata": true,
+  "identical_name_resolution_metadata": true,
+  "rows_compared": 313008,
+  "modules": 2742,
+  "FV_modules": 386,
+  "all_IF_and_constant_K_identical": true,
+  "actually_rebuilt_modules": 0,
+  "constant_rows_digest": "ac0e2dcbbb2d0af5fdaf1ba94dd1aac928db1977f7d1fadde9dc0553d888d08d",
+  "note": "Independent fresh Lean extraction/hash after a FVTest-only change. The successful FV build was a no-op; full-cone replay is not incremental savings."
+}
