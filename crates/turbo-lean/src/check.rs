@@ -1463,7 +1463,7 @@ pub(crate) fn compute_fission_store_key_with_args(
     let mut base = if allowed.len() > splitter::STANDARD_AXIOMS.len() {
         let ax_hash = blake3::hash(allowed.join(",").as_bytes()).to_hex();
         format!(
-            "fission:{}:{}:{}:ax:{}",
+            "fission-v2:{}:{}:{}:ax:{}",
             toolchain,
             prefix_env_hash,
             sub_shard_key,
@@ -1471,7 +1471,7 @@ pub(crate) fn compute_fission_store_key_with_args(
         )
     } else {
         format!(
-            "fission:{}:{}:{}",
+            "fission-v2:{}:{}:{}",
             toolchain, prefix_env_hash, sub_shard_key
         )
     };
@@ -3708,7 +3708,6 @@ fn check_single_file(
                 cmd.arg(arg);
             }
             let out = cmd
-                .arg("-Dwarn.sorry=true")
                 .arg(canon_resolved_initial)
                 .current_dir(canon_dir)
                 .envs(&env_vars)
@@ -3726,19 +3725,29 @@ fn check_single_file(
             }
             eval_stdout_text = String::from_utf8_lossy(&out.stdout).to_string();
         }
-        // This path runs the unstubbed file (no axiom audit), so any `sorry` Lean reports is the
-        // file's own: reject it, and a source that can switch the warning off.
-        let sorry_reported = |t: &str| {
-            t.contains("declaration uses 'sorry'") || t.contains("declaration uses `sorry`")
-        };
-        if splitter::strip_lean_comments(src).contains("warn.sorry")
-            || sorry_reported(&eval_stdout_text)
-            || eval_messages.iter().any(|m| sorry_reported(m))
-        {
-            anyhow::bail!(
-                "Soundness hygiene violation in {}: declaration uses `sorry`",
-                file.display()
-            );
+        // Neither run above audits axioms (zygote eval has no kernel gate, and messages can be
+        // dropped by `#guard_msgs`), so audit every theorem in a copy beside the file.
+        if !split.shards.is_empty() {
+            let names: HashSet<String> = split.shards.iter().map(|s| s.name.clone()).collect();
+            let audit_tmp = canon_resolved_initial
+                .parent()
+                .unwrap_or(canon_dir)
+                .join(format!(".turbo_audit_{}_{}.lean", std::process::id(), pack::next_tmp_id()));
+            let mut cmd = Command::new(&lean_bin);
+            for arg in crate::module_builder::filter_allowed_lean_args(&file_lean_args) {
+                cmd.arg(arg);
+            }
+            cmd.current_dir(canon_dir).envs(&env_vars);
+            let (ok, stdout, stderr) =
+                run_audited_lean(cmd, &audit_tmp, src, &names, names.len())?;
+            if !ok {
+                anyhow::bail!(
+                    "Soundness audit failed for {}:\n{}\n{}",
+                    file.display(),
+                    stdout,
+                    stderr
+                );
+            }
         }
         if emit_stdout && !json_output {
             if !eval_stdout_text.is_empty() {

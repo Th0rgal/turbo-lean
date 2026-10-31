@@ -3142,26 +3142,41 @@ pub fn with_axiom_audit(src: &str, names: &std::collections::HashSet<String>) ->
 
 /// A plain-`lean` axiom audit of the `names` declarations of a shard source (see `plain_lean_audit`).
 pub struct PlainLeanAudit {
-    /// The source to run: other theorems' one-line `… := sorry` stubs become `axiom`s, and every
-    /// audited theorem is followed by `#print axioms`.
+    /// The source to run: other theorems' one-line `… := sorry` stubs become `axiom`s (each followed by
+    /// a `#print axioms` of itself), and every audited theorem is followed by `#print axioms`.
     pub source: String,
     audited: usize,
     expected: usize,
-    stubs: Vec<String>,
+    intercepts_print: bool,
+    stub_marker: String,
     names: std::collections::HashSet<String>,
 }
 
 /// Prepare a plain-`lean` audit of the `expected` declarations named by `names` in `src`. Turning the
 /// host's `sorry` stubs into named axioms makes `#print axioms` exact: a `sorryAx` it reports for an
 /// audited theorem is the theorem's own (or a real dependency's), never a stub's, and no option or
-/// warning setting can hide it.
+/// warning setting can hide it. A stub axiom is admitted only under the fully qualified name Lean
+/// reports for it, never as `sorryAx` itself.
 pub fn plain_lean_audit(
     src: &str,
     names: &std::collections::HashSet<String>,
     expected: usize,
 ) -> PlainLeanAudit {
+    // Unpredictable, so only the host's own stub reports follow it.
+    let stub_marker = format!(
+        "turbo-stub-{}",
+        &blake3::hash(
+            format!(
+                "{}:{}:{:?}",
+                std::process::id(),
+                crate::pack::next_tmp_id(),
+                std::time::SystemTime::now()
+            )
+            .as_bytes()
+        )
+        .to_hex()[..24]
+    );
     let mut lines: Vec<String> = src.split_inclusive('\n').map(String::from).collect();
-    let mut stubs = Vec::new();
     for sh in split_lean_source(src, &[]).shards {
         if sh.start_line != sh.end_line || matches_uncached_or_fast_verify_name(&sh.name, names) {
             continue;
@@ -3180,45 +3195,72 @@ pub fn plain_lean_audit(
                 })
         });
         if let Some((i, len)) = keyword {
-            *line = format!("{}axiom {}\n", &head[..i], head[i + len..].trim_end());
-            stubs.push(sh.name);
+            *line = format!(
+                "{}axiom {}\n#print \"{}\"\nset_option pp.fullNames true in #print axioms {}\n",
+                &head[..i],
+                head[i + len..].trim_end(),
+                stub_marker,
+                sh.name
+            );
         }
     }
+    // Syntax or elaborators for `#print` could answer the audit commands themselves.
+    let clean = strip_string_literals(&strip_lean_comments(src)).into_owned();
+    let intercepts_print = clean.contains("printAxioms")
+        || (clean.contains("#print")
+            && ["macro", "syntax", "elab", "command_elab", "notation"]
+                .iter()
+                .any(|kw| contains_word(&clean, kw) || clean.contains(&format!("{kw}_rules"))));
     let (source, audited) = with_axiom_audit(&lines.concat(), names);
     PlainLeanAudit {
         source,
         audited,
         expected,
-        stubs,
+        intercepts_print,
+        stub_marker,
         names: names.clone(),
     }
 }
 
 impl PlainLeanAudit {
     /// Audit failures in Lean's `stdout`: missing reports, and any axiom of an audited theorem that is
-    /// neither admitted by `allowed` nor a stub axiom (so always `sorryAx`).
+    /// neither admitted by `allowed` nor a stub axiom.
     pub fn violations(&self, stdout: &str, allowed: &[String]) -> Vec<String> {
-        let mut reports = parse_print_axioms(stdout);
-        reports.retain(|(n, _)| matches_uncached_or_fast_verify_name(n, &self.names));
-        if self.audited < self.expected.max(1) || reports.len() < self.audited {
+        if self.intercepts_print {
+            return vec![
+                "[TurboLean.KernelGate] axiom audit refused: the source defines syntax or elaborators that could answer `#print axioms`".to_string(),
+            ];
+        }
+        let reports = parse_print_axioms(stdout);
+        // A stub axiom is the one that reports exactly itself right after a host stub marker.
+        let stub_reports: Vec<(String, Vec<String>)> = stdout
+            .split(self.stub_marker.as_str())
+            .skip(1)
+            .filter_map(|seg| parse_print_axioms(seg).into_iter().next())
+            .collect();
+        let stubs: std::collections::HashSet<&str> = stub_reports
+            .iter()
+            .filter(|(n, axs)| axs.len() == 1 && &axs[0] == n)
+            .map(|(n, _)| n.as_str())
+            .filter(|n| !matches!(*n, "sorryAx" | "Lean.trustCompiler"))
+            .collect();
+        let audited: Vec<&(String, Vec<String>)> = reports
+            .iter()
+            .filter(|(n, _)| {
+                !stubs.contains(n.as_str()) && matches_uncached_or_fast_verify_name(n, &self.names)
+            })
+            .collect();
+        if self.audited < self.expected.max(1) || audited.len() < self.audited {
             return vec![format!(
                 "[TurboLean.KernelGate] axiom audit incomplete: {} of {} declarations reported",
-                reports.len(),
+                audited.len(),
                 self.expected
             )];
         }
-        let is_stub = |ax: &str| {
-            self.stubs.iter().any(|s| {
-                ax == s
-                    || ax
-                        .strip_suffix(s.as_str())
-                        .is_some_and(|p| p.ends_with('.'))
-            })
-        };
-        reports
+        audited
             .iter()
             .flat_map(|(n, axs)| axs.iter().map(move |a| (n, a)))
-            .filter(|(_, a)| !axiom_allowed_under(a, allowed) && !is_stub(a))
+            .filter(|(_, a)| !axiom_allowed_under(a, allowed) && !stubs.contains(a.as_str()))
             .map(|(n, a)| {
                 format!(
                     "[TurboLean.KernelGate] `{}` depends on disallowed axiom `{}`",
@@ -4661,15 +4703,29 @@ mod tests {
         let src = "theorem good : 1 + 1 = 2 := sorry\n@[simp] private theorem g2 : True := sorry\ntheorem bad : False := sorry\n";
         let names = HashSet::from(["bad".to_string()]);
         let audit = plain_lean_audit(src, &names, 1);
-        assert!(audit.source.starts_with("axiom good : 1 + 1 = 2\n@[simp] private axiom g2 : True\ntheorem bad : False := sorry\n"), "{}", audit.source);
-        assert!(audit.source.contains("#print axioms bad"));
+        let marker = &audit.stub_marker;
+        assert!(audit.source.starts_with(&format!("axiom good : 1 + 1 = 2\n#print \"{marker}\"\nset_option pp.fullNames true in #print axioms good\n@[simp] private axiom g2 : True\n")), "{}", audit.source);
+        assert!(audit.source.contains("theorem bad : False := sorry\nset_option pp.fullNames true in #print axioms bad\n"));
         let allowed = allowed_axioms();
-        let ok = "'bad' depends on axioms: [good, propext]\n";
-        assert!(audit.violations(ok, &allowed).is_empty());
-        let own = "'bad' depends on axioms: [good, sorryAx]\n";
-        assert_eq!(audit.violations(own, &allowed).len(), 1);
+        let stub = &format!("{marker}\n'good' depends on axioms: [good]\n");
+        assert!(audit.violations(&format!("{stub}'bad' depends on axioms: [good, propext]\n"), &allowed).is_empty());
+        let own = format!("{stub}'bad' depends on axioms: [good, sorryAx]\n");
+        assert_eq!(audit.violations(&own, &allowed).len(), 1);
+        // Only an axiom that reported itself after a stub marker is a stub (not a user `#print axioms`).
+        let unmarked = "'good' depends on axioms: [good]\n'bad' depends on axioms: [good]\n";
+        assert_eq!(audit.violations(unmarked, &allowed).len(), 1);
         // A missing report fails closed.
-        assert_eq!(audit.violations("", &allowed).len(), 1);
+        assert_eq!(audit.violations(stub, &allowed).len(), 1);
+        // A stub named like the real `sorryAx` never admits it.
+        let shadow = plain_lean_audit("namespace N\ntheorem sorryAx : True := sorry\nend N\ntheorem bad : False := sorry\n", &names, 1);
+        let out = format!(
+            "{}\n'N.sorryAx' depends on axioms: [N.sorryAx]\n'bad' depends on axioms: [sorryAx]\n",
+            shadow.stub_marker
+        );
+        assert_eq!(shadow.violations(&out, &allowed).len(), 1);
+        // Sources that could answer `#print axioms` themselves are refused.
+        let spoof = "macro_rules | `(#print axioms $x) => `(#check $x)\ntheorem bad : True := trivial\n";
+        assert_eq!(plain_lean_audit(spoof, &names, 1).violations("'bad' does not depend on any axioms\n", &allowed).len(), 1);
     }
 
     #[test]

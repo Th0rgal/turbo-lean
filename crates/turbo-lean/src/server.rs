@@ -1613,23 +1613,6 @@ fn execute_check_shards_batch_payload_deferred(
         .collect();
     let cache_hits = hit_keys.len();
 
-    if cache_hits == req.items.len() {
-        return Ok((
-            CheckShardsBatchResponse {
-                ok: true,
-                verified_count: 0,
-                cache_hits,
-                elapsed_ms: (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0,
-                exit_code: 0,
-                stdout: String::new(),
-                stderr: String::new(),
-                error: None,
-            },
-            None,
-            hit_keys,
-        ));
-    }
-
     let (req_allowed, req_allowed_csv) =
         resolve_request_axiom_policy(req.allowed_axioms.as_deref(), trust_domain);
 
@@ -1674,6 +1657,24 @@ fn execute_check_shards_batch_payload_deferred(
                 );
             }
         }
+    }
+
+    // Cached results are served only after the payload passed the hygiene gates above.
+    if cache_hits == req.items.len() {
+        return Ok((
+            CheckShardsBatchResponse {
+                ok: true,
+                verified_count: 0,
+                cache_hits,
+                elapsed_ms: (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0,
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                error: None,
+            },
+            None,
+            hit_keys,
+        ));
     }
 
     let effective_batch_source = if cache_hits > 0 {

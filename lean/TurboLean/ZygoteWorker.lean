@@ -327,19 +327,17 @@ def isSorryStubDecl (env : Environment) (n : Name) : Bool :=
   | _ => false
 
 /-- Whether new declaration `n` belongs to one of the host-named check `targets`: the target itself,
-    its auxiliary declarations (`t.proof_1`, `t.match_1`), a `private` copy, or the fast-olean rename
-    `_turbo_verify_<i>_<t>`. Matching is by name-component suffix in either direction, so an ambiguous
+    its auxiliary declarations (`t.proof_1`, `t.match_1`), a `private` copy, or any fast-olean rename
+    `_turbo_verify_<i>_<sanitized t>` (the host generates those only for targets, so their sanitized
+    spelling never matters). Matching is by name-component suffix in either direction, so an ambiguous
     name only makes the gate stricter. -/
 def ownedByTarget (targets : List String) (n : Name) : Bool :=
   let comps := (privateToUserName n).components.map (·.toString (escape := false))
-  targets.any fun t =>
+  !targets.isEmpty && (comps.any (·.startsWith "_turbo_verify_") || targets.any fun t =>
     let tc := t.splitOn "."
-    let short := tc.getLast?.getD t
     (List.range comps.length).any fun i =>
       let pre := comps.take (i + 1)
-      let last := pre.getLast?.getD ""
-      tc.isSuffixOf pre || pre.isSuffixOf tc ||
-        (last.startsWith "_turbo_verify_" && last.endsWith ("_" ++ short))
+      tc.isSuffixOf pre || pre.isSuffixOf tc)
 
 /-- Per-declaration `sorryAx` exemption for stubbed elaboration (`allowStub`), never by source text: only
     `sorry` stubs (by kernel value) that no host-named target owns are exempt (their values are also opaque to
