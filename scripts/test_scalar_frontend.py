@@ -2542,6 +2542,32 @@ open LeanNative.IR LeanNative.Proofs
   let uncondLiveBad := validateTranslationDecl (mkUncondAfterUnprovenLiveDecl false) (mkUncondAfterUnprovenLiveDecl true) 8
   unless !uncondLiveBad.ubRefines && !uncondLiveBad.passed do
     throw <| IO.userError s!"unproven liveness failed to clear unconditional noUB: {reprStr uncondLiveBad}"
+  let mkWideFieldProjDecl (retAt999 : UInt64) (tagRefineFirst : Bool) : LNIRDecl := {
+    name := "wide_field_proj_fail_closed"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+        (.ite 2
+          (if tagRefineFirst then
+             .letBind 3 .i64 (.call "lean_native_ctor_tag" [0] .i64 false)
+               (.letBind 4 .i1 (.scalar (.binOp .eq (.var 3) (.constU64 0)))
+                 (.ite 4
+                   (.letBind 5 .i64 (.ctorGetScalar 0 8 .i64)
+                     (.letBind 6 .i64 (.scalar (.constU64 retAt999)) (.ret 6)))
+                   (.letBind 6 .i64 (.scalar (.constU64 0)) (.ret 6))))
+           else
+             .letBind 5 .i64 (.ctorGetScalar 0 8 .i64)
+               (.letBind 6 .i64 (.scalar (.constU64 retAt999)) (.ret 6)))
+          (.letBind 6 .i64 (.scalar (.constU64 0)) (.ret 6)))
+  }
+  for tagRefine in [false, true] do
+    let wideProjBad := validateTranslationDecl (mkWideFieldProjDecl 0 tagRefine) (mkWideFieldProjDecl 1 tagRefine) 8
+    unless !wideProjBad.ubRefines && !wideProjBad.passed do
+      throw <| IO.userError s!"ctorGetScalar p 8 treated modeling limit as definite source UB (tagRefine={tagRefine}): {reprStr wideProjBad}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)

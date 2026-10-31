@@ -1629,7 +1629,12 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
         let stBound := st'.bindVar dst { expr := fExpr, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
         { stBound with noUB := stBound.noUB && st.liveRcCond rootVar == .constBool true &&
             (stLive.allocRoots.contains rootVar || stBounds.ubCond == .constBool true) }
-      | none => stBounds.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+      | none =>
+        if stLive.allocRoots.contains rootVar then
+          stBounds.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+        else
+          -- External input/projected constructor cached at the 8-field modeling window may have >= 9 concrete fields!
+          (stBounds.markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
     | .symVar rootId =>
       if !(st.objPtrVars.contains rootVar || st.allocRoots.contains rootVar ||
            (st.refCounts.lookup rootVar).isSome || (st.rcExprs.lookup rootVar).isSome ||
@@ -1638,7 +1643,9 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
         -- an unboxed tuple (`.tuple (_ :: _)`), or a heap `.objPtr`!
         (stLive.markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
       else if idx ≥ 8 then
-        stLive.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+        -- Concrete `evalExpr` permits arbitrary `obj.fields` lengths on `.objPtr`: mark `idx >= 8`
+        -- unsupported (`symUnsupported`) rather than assuming definite source UB!
+        (stLive.markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
       else
         let effRoot := stLive.resolveBuf rootId
         let stBounds := stLive.requireUbCond (.binOp .lt (.constU64 idx.toUInt64) (.ctorLen stLive.heapStepEpoch effRoot))
@@ -1858,8 +1865,10 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
                 nonPoison := objSv.nonPoison && idxSv.nonPoison && valSv.nonPoison
                 noUB := operandsOk }
               ({ sb with ubCond := if operandsOk then stBnd.ubCond else .constBool false }, true)
-            else
+            else if stExcl.allocRoots.contains root then
               ({ stExcl with noUB := false, nonPoison := false, ubCond := .constBool false }, false)
+            else
+              (stExcl.markUnsupported, false)
           | .symVar rootId, .constU64 idxU64 =>
             let idx := idxU64.toNat
             if idx < 8 then
@@ -1874,7 +1883,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
                 noUB := operandsOk }
               ({ sb with ubCond := if operandsOk then stBnd.ubCond else .constBool false }, true)
             else
-              ({ stExcl with noUB := false, nonPoison := false, ubCond := .constBool false }, false)
+              (stExcl.markUnsupported, false)
           | .constU64 _, _ | .constU256 _, _ | .constBool _, _ | .unit, _ =>
             -- Definite non-heap immediate passed to `lean_native_ctor_set`: concrete UB (`typeError`)!
             ({ stExcl with noUB := false, nonPoison := false, ubCond := .constBool false }, false)
