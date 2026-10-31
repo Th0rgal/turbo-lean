@@ -10114,6 +10114,20 @@ lean_exe «demo-exe» where
             "`App.C` reported verified against a dependency closure rebuilt underneath it"
         );
         assert!(crate::lake_build::resolve_prebuilt_module_import(&canon, &canon_c).is_none());
+        // Rebuilding the root must not reuse the stale `DepPkg.B` as a fresh external closure:
+        // its pin for `DepPkg.A` no longer matches, so `B` is rebuilt and `App.C` (`h = 3`) fails.
+        let rebuilt = build_project_modules_native(
+            &mut store,
+            &proj_dir,
+            &[],
+            "trusted-internal",
+            1,
+            false,
+            true,
+            None,
+        );
+        assert!(rebuilt.is_err(), "stale `DepPkg.B` reused: {rebuilt:?}");
+        assert!(!verified());
         let _ = fs::remove_dir_all(&dir);
     }
 
