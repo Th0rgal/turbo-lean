@@ -150,3 +150,62 @@ pub(crate) fn assert_stale_error(err: &anyhow::Error) {
         "{text}"
     );
 }
+
+/// Re-execute one test in an isolated process, keeping environment changes out of other tests.
+pub(crate) struct TestChild(std::process::Child);
+
+impl TestChild {
+    pub fn command(test: &str) -> Result<Command> {
+        let mut command = Command::new(std::env::current_exe()?);
+        command
+            .args(["--exact", test, "--nocapture"])
+            .env("TURBO_LEAN_TELEMETRY", "off")
+            .env("LEAN_NATIVE_TELEMETRY", "off")
+            .env("TURBO_LEAN_NO_REMOTE_TELEMETRY", "1");
+        Ok(command)
+    }
+
+    pub fn spawn(command: &mut Command) -> Result<Self> {
+        Ok(Self(command.spawn()?))
+    }
+
+    pub fn wait_for(&mut self, path: &Path) -> Result<()> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !path.exists() {
+            anyhow::ensure!(
+                self.0.try_wait()?.is_none(),
+                "child exited before {}",
+                path.display()
+            );
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "child timed out: {}",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
+    pub fn assert_blocked(&mut self, done: &Path) -> Result<()> {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        anyhow::ensure!(
+            !done.exists() && self.0.try_wait()?.is_none(),
+            "publication lock did not block child"
+        );
+        Ok(())
+    }
+
+    pub fn finish(&mut self, done: &Path) -> Result<()> {
+        self.wait_for(done)?;
+        anyhow::ensure!(self.0.wait()?.success(), "child test failed");
+        Ok(())
+    }
+}
+
+impl Drop for TestChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}

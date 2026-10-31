@@ -46,7 +46,7 @@ pub fn staging_shm_dir() -> PathBuf {
     base.join(format!("turbo-lean-staging-{}", uid))
 }
 
-/// Persistent per-user cache root, shared by the store and project publication locks.
+/// Persistent per-user cache root for the store.
 pub fn cache_root() -> PathBuf {
     std::env::var("TURBO_LEAN_HOME")
         .map(PathBuf::from)
@@ -56,16 +56,39 @@ pub fn cache_root() -> PathBuf {
         })
 }
 
-/// Lock outside the user's Lake tree, even for read-only artifact inspection. All readers
-/// and publishers use the same canonical-path key regardless of the invocation's opt-out.
+/// Package publication protocol (independent of HOME/TURBO_LEAN_HOME): every new reader
+/// and publisher first locks the existing package directory, then the legacy
+/// `.lake/build/.turbo_publish.lock`. Default users create that legacy lock as before,
+/// preserving exclusion with old binaries. Opted-out users open it read-only WITHOUT
+/// O_CREAT; if absent, only the directory lock is needed because they never publish
+/// into the tree. New publishers also take the directory lock before creating the
+/// legacy file, so its first creation cannot race an opted-out reader. Old binaries
+/// participate through the legacy file when present; lock files must never be unlinked.
 pub fn acquire_publish_flock(
     pkg_root: &Path,
     exclusive: bool,
-) -> std::io::Result<Option<FlockGuard>> {
-    let canonical = pkg_root.canonicalize()?;
-    let key = blake3::hash(canonical.as_os_str().as_encoded_bytes());
-    let lock_path = cache_root().join("locks/module-publication").join(format!("{key}.lock"));
-    acquire_flock(&lock_path, exclusive, false)
+) -> std::io::Result<PublishFlockGuard> {
+    let directory = flock_file(fs::File::open(pkg_root)?, exclusive, false)?;
+    let lock_path = pkg_root.join(".lake/build/.turbo_publish.lock");
+    let legacy = if crate::lake_build::worktree_auto_link_disabled(pkg_root) {
+        match fs::File::open(&lock_path) {
+            Ok(file) => flock_file(file, exclusive, false)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        }
+    } else {
+        acquire_flock(&lock_path, exclusive, false)?
+    };
+    Ok(PublishFlockGuard {
+        _legacy: legacy,
+        _directory: directory,
+    })
+}
+
+/// Release the legacy lock before the package directory lock (field drop order).
+pub struct PublishFlockGuard {
+    _legacy: Option<FlockGuard>,
+    _directory: Option<FlockGuard>,
 }
 
 /// RAII advisory `flock` guard that releases `LOCK_UN` on drop.
@@ -83,7 +106,11 @@ impl Drop for FlockGuard {
 
 /// Acquire an advisory `flock` (`exclusive` => `LOCK_EX`, else `LOCK_SH`; `nonblocking` => `| LOCK_NB`).
 /// Returns `Ok(None)` when `nonblocking` is true and another holder currently owns a conflicting lock.
-pub fn acquire_flock(lock_path: &Path, exclusive: bool, nonblocking: bool) -> std::io::Result<Option<FlockGuard>> {
+pub fn acquire_flock(
+    lock_path: &Path,
+    exclusive: bool,
+    nonblocking: bool,
+) -> std::io::Result<Option<FlockGuard>> {
     if let Some(parent) = lock_path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
@@ -95,18 +122,31 @@ pub fn acquire_flock(lock_path: &Path, exclusive: bool, nonblocking: bool) -> st
         .write(true)
         .truncate(false)
         .open(lock_path)?;
+    flock_file(f, exclusive, nonblocking)
+}
+
+fn flock_file(
+    f: fs::File,
+    exclusive: bool,
+    nonblocking: bool,
+) -> std::io::Result<Option<FlockGuard>> {
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
-        let mut op = if exclusive { libc::LOCK_EX } else { libc::LOCK_SH };
+        let mut op = if exclusive {
+            libc::LOCK_EX
+        } else {
+            libc::LOCK_SH
+        };
         if nonblocking {
             op |= libc::LOCK_NB;
         }
         if unsafe { libc::flock(f.as_raw_fd(), op) } != 0 {
-            if nonblocking {
+            let err = std::io::Error::last_os_error();
+            if nonblocking && err.kind() == std::io::ErrorKind::WouldBlock {
                 return Ok(None);
             }
-            return Err(std::io::Error::last_os_error());
+            return Err(err);
         }
     }
     #[cfg(not(unix))]
@@ -784,28 +824,58 @@ pub fn read_shm_or_disk_spill(shm_path: &Path, disk_spill_dir: Option<&Path>) ->
 mod tests {
     #[cfg(unix)]
     #[test]
-    fn test_publication_lock_never_creates_lake_tree_and_uses_canonical_key() -> anyhow::Result<()>
-    {
+    fn test_publication_lock_preserves_opted_out_tree_and_locks_aliases() -> anyhow::Result<()> {
+        use crate::worktree_test_support::snapshot;
         use std::os::unix::fs::MetadataExt;
         let root = std::env::temp_dir().join(format!(
             "turbo_pub_lock_{}_{}",
             std::process::id(),
             crate::pack::next_tmp_id()
         ));
-        std::fs::create_dir_all(root.join("project"))?;
-        std::os::unix::fs::symlink(root.join("project"), root.join("alias"))?;
-        let reader = super::acquire_publish_flock(&root.join("project"), false)?.unwrap();
-        let alias_reader = super::acquire_publish_flock(&root.join("alias"), false)?.unwrap();
-        assert_eq!(reader.0.metadata()?.ino(), alias_reader.0.metadata()?.ino());
-        drop((reader, alias_reader));
-        let _publisher = super::acquire_publish_flock(&root.join("project"), true)?;
-        assert!(
-            !root.join("project/.lake").exists(),
-            "locking must not create Lake build directories"
-        );
+        let project = root.join("project");
+        std::fs::create_dir_all(&project)?;
+        std::fs::write(
+            project.join("turbo-lean.toml"),
+            "[worktree]\nauto_link = false\n",
+        )?;
+        std::os::unix::fs::symlink(&project, root.join("alias"))?;
+        for legacy in [false, true] {
+            let reader = super::acquire_publish_flock(&project, false)?;
+            let alias_reader = super::acquire_publish_flock(&root.join("alias"), false)?;
+            assert_eq!(
+                reader._directory.as_ref().unwrap().0.metadata()?.ino(),
+                alias_reader
+                    ._directory
+                    .as_ref()
+                    .unwrap()
+                    .0
+                    .metadata()?
+                    .ino()
+            );
+            assert_eq!(reader._legacy.is_some(), legacy);
+            assert!(super::flock_file(std::fs::File::open(&project)?, true, true)?.is_none());
+            drop((reader, alias_reader));
+            if !legacy {
+                assert!(!project.join(".lake").exists());
+                std::fs::create_dir_all(project.join(".lake/build"))?;
+                // Opt-out must also preserve a populated build directory without a legacy lock.
+                let before = snapshot(&project)?;
+                drop(super::acquire_publish_flock(&project, true)?);
+                assert_eq!(before, snapshot(&project)?);
+                let lock = project.join(".lake/build/.turbo_publish.lock");
+                std::fs::write(&lock, b"legacy")?;
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(lock, std::fs::Permissions::from_mode(0o444))?;
+            } else {
+                let before = snapshot(&project)?;
+                drop(super::acquire_publish_flock(&project, true)?);
+                assert_eq!(before, snapshot(&project)?);
+            }
+        }
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
+
     use super::*;
     use std::time::Duration;
 

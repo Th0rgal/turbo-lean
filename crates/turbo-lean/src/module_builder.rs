@@ -5442,7 +5442,7 @@ pub fn compute_olean_artifact_set_digest(olean_path: &Path) -> Result<String> {
         .lock()
         .map_err(|_| anyhow::anyhow!("Module artifact publication mutex poisoned"))?;
     let _flock_guard = if let Some(pkg_root) = infer_pkg_root_from_artifact_path(olean_path) {
-        acquire_publish_flock_mode(&pkg_root, false)?
+        Some(acquire_publish_flock_mode(&pkg_root, false)?)
     } else {
         None
     };
@@ -6653,12 +6653,12 @@ static PUBLISH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 fn acquire_publish_flock_mode(
     pkg_root: &Path,
     exclusive: bool,
-) -> Result<Option<crate::shm_cache::FlockGuard>> {
+) -> Result<crate::shm_cache::PublishFlockGuard> {
     crate::shm_cache::acquire_publish_flock(pkg_root, exclusive)
         .with_context(|| format!("Failed to acquire publication flock for `{}`", pkg_root.display()))
 }
 
-fn acquire_publish_flock(pkg_root: &Path) -> Result<Option<crate::shm_cache::FlockGuard>> {
+fn acquire_publish_flock(pkg_root: &Path) -> Result<crate::shm_cache::PublishFlockGuard> {
     acquire_publish_flock_mode(pkg_root, true)
 }
 
@@ -8210,6 +8210,126 @@ mod tests {
         fs::create_dir_all(&dir).expect("create temp test dir");
         dir
     }
+    #[cfg(unix)]
+    #[test]
+    fn test_publication_process_child() -> Result<()> {
+        let Some(root) = std::env::var_os("TURBO_TEST_PUBLISH_ROOT").map(PathBuf::from) else {
+            return Ok(());
+        };
+        let mode = std::env::var("TURBO_TEST_PUBLISH_MODE")?;
+        let node: ModuleNode = serde_json::from_slice(&fs::read(root.join("node.json"))?)?;
+        fs::write(root.join("starting"), b"")?;
+        if mode == "reader" {
+            let digest = compute_olean_artifact_set_digest(&node.olean_path)?;
+            assert_eq!(digest, fs::read_to_string(root.join("expected"))?);
+        } else {
+            let tmp = root.join("staged");
+            publish_module_artifacts_atomic(
+                &tmp,
+                &node,
+                &tmp.join("P.olean"),
+                &tmp.join("P.ilean"),
+                &tmp.join("P.olean.server"),
+                &tmp.join("P.olean.private"),
+                &tmp.join("P.ir"),
+                &tmp.join("P.ir.sig"),
+                &tmp.join("P.c"),
+            )?;
+        }
+        fs::write(root.join("done"), b"")?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_publication_process_contention_across_cache_homes_and_legacy() -> Result<()> {
+        use crate::worktree_test_support::{LakeTree, TestChild};
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tree = LakeTree::new(
+            "publish_contention",
+            &[("P/A.lean", "def value : Nat := 1\n")],
+        )?;
+        let cfg = resolve_project_config(&tree.project)?;
+        let dag = build_module_dag(&cfg, &[])?;
+        let node = &dag.nodes["P.A"];
+        fs::write(tree.root.join("node.json"), serde_json::to_vec(node)?)?;
+        fs::create_dir_all(tree.root.join("staged"))?;
+        // The parent and child use different HOME and TURBO_LEAN_HOME values. Exercise
+        // both lock directions, first publication without a legacy file, and old holders.
+        for (mode, legacy_holder, optout, missing_legacy) in [
+            ("publisher", false, true, true),
+            ("publisher", false, false, false),
+            ("reader", false, false, false),
+            ("reader", false, true, false),
+            ("publisher", true, false, false),
+            ("reader", true, true, false),
+        ] {
+            for name in ["starting", "done"] {
+                let _ = fs::remove_file(tree.root.join(name));
+            }
+            if missing_legacy {
+                let _ = fs::remove_file(tree.project.join(".lake/build/.turbo_publish.lock"));
+            }
+            if optout {
+                tree.opt_out()?;
+            } else {
+                let _ = fs::remove_file(tree.project.join("turbo-lean.toml"));
+            }
+            let legacy = if legacy_holder {
+                crate::shm_cache::acquire_flock(
+                    &tree.project.join(".lake/build/.turbo_publish.lock"),
+                    true,
+                    false,
+                )?
+            } else {
+                None
+            };
+            let current = if legacy_holder {
+                None
+            } else {
+                Some(acquire_publish_flock_mode(&tree.project, mode == "reader")?)
+            };
+            let mut command =
+                TestChild::command("module_builder::tests::test_publication_process_child")?;
+            command
+                .env("TURBO_TEST_PUBLISH_ROOT", &tree.root)
+                .env("TURBO_TEST_PUBLISH_MODE", mode)
+                .env("TURBO_LEAN_HOME", tree.root.join("other-cache"))
+                .env("HOME", tree.root.join("other-home"))
+                // Only the reader opts out; its competing publisher must still create the
+                // legacy lock once the directory reader has released it.
+                .env("TURBO_LEAN_NO_WORKTREE_LINK", "0");
+            if mode == "publisher" && optout {
+                fs::remove_file(tree.project.join("turbo-lean.toml"))?;
+            }
+            if mode == "publisher" {
+                fs::write(tree.root.join("staged/P.olean"), b"new olean generation")?;
+                fs::write(tree.root.join("staged/P.ilean"), b"new ilean generation")?;
+            }
+            let mut child = TestChild::spawn(&mut command)?;
+            child.wait_for(&tree.root.join("starting"))?;
+            child.assert_blocked(&tree.root.join("done"))?;
+            if mode == "reader" {
+                // Finish a multi-file transaction while the real digest reader is blocked.
+                fs::write(&node.olean_path, b"committed olean")?;
+                fs::write(&node.ilean_path, b"committed ilean")?;
+                fs::write(
+                    tree.root.join("expected"),
+                    compute_olean_artifact_set_digest_locked(&node.olean_path)?,
+                )?;
+            }
+            drop((legacy, current));
+            child.finish(&tree.root.join("done"))?;
+            if mode == "publisher" {
+                assert_eq!(fs::read(&node.olean_path)?, b"new olean generation");
+                assert_eq!(fs::read(&node.ilean_path)?, b"new ilean generation");
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn test_parse_lakefile_lean_namespaced_static_facet() {
         let dir = make_temp_test_dir("namespaced_static_facet");
