@@ -2499,6 +2499,10 @@ pub(crate) fn run_audited_lean_shard(
     Ok(out)
 }
 
+static ZYGOTE_LEAN_PATH_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(String, String, std::path::PathBuf), String>>,
+> = std::sync::OnceLock::new();
+
 fn read_line_with_timeout(
     reader: &mut BufReader<std::process::ChildStdout>,
     line: &mut String,
@@ -2667,15 +2671,6 @@ pub fn eval_with_zygote_pool_opts_with_args(
     )
 }
 
-fn encode_lean_args_hex(lean_args: &[String]) -> String {
-    let filtered = crate::module_builder::filter_allowed_lean_args(lean_args);
-    if filtered.is_empty() {
-        String::new()
-    } else {
-        hex_encode_bytes(filtered.join("\n").as_bytes())
-    }
-}
-
 /// The cache and executor must agree on the final import search order and artifacts.
 pub(crate) struct ResolvedZygoteContext {
     lean_path: String,
@@ -2687,106 +2682,12 @@ pub(crate) struct ResolvedZygoteContext {
     pub(crate) identity: String,
 }
 
-pub(crate) fn resolve_zygote_context(
-    toolchain: &str,
-    req_lean_path: &str,
-    env_vars: &std::collections::HashMap<String, String>,
-    lean_bin: &Path,
-    raw_imports_csv: &str,
-) -> ResolvedZygoteContext {
-    let env_lp = env_vars.get("LEAN_PATH").cloned().unwrap_or_default();
-    let mut path_parts: Vec<String> = Vec::new();
-    let is_sysroot_lib_lean = |norm: &str| -> bool {
-        let p = Path::new(norm);
-        p.ends_with("lib/lean")
-            && p.parent()
-                .and_then(|lib| lib.parent())
-                .map(|tc| tc.join("bin/lean").exists())
-                .unwrap_or(false)
-    };
-    let mut add_part = |p: &str| {
-        for seg in p.split(':') {
-            let s = seg.trim();
-            if !s.is_empty() {
-                let norm = fs::canonicalize(s)
-                    .map(|c| c.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| s.to_string());
-                if is_sysroot_lib_lean(&norm) {
-                    continue;
-                }
-                if !path_parts.iter().any(|x| x == &norm) {
-                    path_parts.push(norm);
-                }
-            }
-        }
-    };
-    if !req_lean_path.is_empty() {
-        add_part(req_lean_path);
-    }
-    if !env_lp.is_empty() {
-        add_part(&env_lp);
-    }
-    if req_lean_path.is_empty() && env_lp.is_empty() {
-        if let Some(repo_lean_dir) = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|r| r.join("lean"))
-            .filter(|p| p.join(".lake/build/lib/lean").exists())
-        {
-            add_part(&crate::lake_build::resolve_remote_lean_path(
-                &repo_lean_dir,
-                None,
-            ));
-        }
-    }
-    if let Some(tc_lib_lean) = lean_bin
-        .parent()
-        .and_then(|b| b.parent())
-        .map(|tc| tc.join("lib").join("lean"))
-        .filter(|p| p.exists())
-    {
-        let norm = fs::canonicalize(&tc_lib_lean)
-            .map(|c| c.to_string_lossy().to_string())
-            .unwrap_or_else(|_| tc_lib_lean.to_string_lossy().to_string());
-        if !path_parts.iter().any(|x| x == &norm) {
-            path_parts.push(norm);
-        }
-    }
-    let lean_path = path_parts.join(":");
-    let imports_csv = coalesce_proofkit_imports(raw_imports_csv, &lean_path);
-    let search_path_digest = compute_search_path_oleans_digest(&lean_path);
-    let (imported_digest, closure_complete) = compute_imported_oleans_digest_inner(&imports_csv, &lean_path);
-    let host_closure_digest = if closure_complete { imported_digest.clone() } else { String::new() };
-    let olean_digest = format!("{}:{}", search_path_digest, imported_digest);
-    let compiler_path = fs::canonicalize(lean_bin).unwrap_or_else(|_| lean_bin.to_path_buf());
-    let compiler_digest = fs::read(&compiler_path)
-        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
-        .unwrap_or_default();
-    let policy = env_vars
-        .get(crate::splitter::ALLOWED_AXIOMS_ENV)
-        .cloned()
-        .unwrap_or_else(|| crate::splitter::allowed_axioms().join(","));
-    let compiler_identity = blake3::hash(
-        &serde_json::to_vec(&(toolchain, &compiler_path, compiler_digest, &policy))
-            .expect("compiler identity serializes"),
-    )
-    .to_hex()
-    .to_string();
-    let identity = blake3::hash(
-        &serde_json::to_vec(&(&compiler_identity, &lean_path, &imports_csv, &olean_digest))
-            .expect("execution identity serializes"),
-    )
-    .to_hex()
-    .to_string();
-    let toolchain_policy = format!("{}#{}#{}", toolchain, policy, compiler_identity);
-    ResolvedZygoteContext {
-        lean_path,
-        imports_csv,
-        olean_digest,
-        search_path_digest,
-        host_closure_digest,
-        toolchain_policy,
-        identity,
+fn encode_lean_args_hex(lean_args: &[String]) -> String {
+    let filtered = crate::module_builder::filter_allowed_lean_args(lean_args);
+    if filtered.is_empty() {
+        String::new()
+    } else {
+        hex_encode_bytes(filtered.join("\n").as_bytes())
     }
 }
 
@@ -2806,6 +2707,146 @@ fn attach_host_closure_digest(req_line: &str, host_closure_digest: &str) -> Stri
     out.push('\n');
     out
 }
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_zygote_context(
+    toolchain: &str,
+    req_lean_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    lean_bin: &Path,
+    raw_imports_csv: &str,
+) -> ResolvedZygoteContext {
+    let env_lp = env_vars.get("LEAN_PATH").cloned().unwrap_or_default();
+    let lp_cache_key = (
+        req_lean_path.to_string(),
+        env_lp.clone(),
+        lean_bin.to_path_buf(),
+    );
+    let lp_cache_mutex = ZYGOTE_LEAN_PATH_CACHE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let cached_lp = lp_cache_mutex
+        .lock()
+        .ok()
+        .and_then(|g| g.get(&lp_cache_key).cloned());
+
+    let effective_lean_path = if let Some(eff) = cached_lp {
+        eff
+    } else {
+        let mut path_parts: Vec<String> = Vec::new();
+        let is_sysroot_lib_lean = |norm: &str| -> bool {
+            let p = Path::new(norm);
+            p.ends_with("lib/lean")
+                && p.parent()
+                    .and_then(|lib| lib.parent())
+                    .map(|tc| tc.join("bin/lean").exists())
+                    .unwrap_or(false)
+        };
+        let mut add_part = |p: &str| {
+            for seg in p.split(':') {
+                let s = seg.trim();
+                if !s.is_empty() {
+                    let norm = fs::canonicalize(s)
+                        .map(|c| c.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| s.to_string());
+                    if is_sysroot_lib_lean(&norm) {
+                        continue;
+                    }
+                    if !path_parts.iter().any(|x| x == &norm) {
+                        path_parts.push(norm);
+                    }
+                }
+            }
+        };
+        if !req_lean_path.is_empty() {
+            add_part(req_lean_path);
+        }
+        if !env_lp.is_empty() {
+            add_part(&env_lp);
+        }
+        if req_lean_path.is_empty() && env_lp.is_empty() {
+            if let Some(repo_lean_dir) = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|r| r.join("lean"))
+                .filter(|p| p.join(".lake/build/lib/lean").exists())
+            {
+                add_part(&crate::lake_build::resolve_remote_lean_path(
+                    &repo_lean_dir,
+                    None,
+                ));
+            }
+        }
+        if let Some(tc_lib_lean) = lean_bin
+            .parent()
+            .and_then(|b| b.parent())
+            .map(|tc| tc.join("lib").join("lean"))
+            .filter(|p| p.exists())
+        {
+            let norm = fs::canonicalize(&tc_lib_lean)
+                .map(|c| c.to_string_lossy().to_string())
+                .unwrap_or_else(|_| tc_lib_lean.to_string_lossy().to_string());
+            if !path_parts.iter().any(|x| x == &norm) {
+                path_parts.push(norm);
+            }
+        }
+        let eff = path_parts.join(":");
+        if let Ok(mut g) = lp_cache_mutex.lock() {
+            if g.len() >= 512 {
+                g.clear();
+            }
+            g.insert(lp_cache_key, eff.clone());
+        }
+        eff
+    };
+
+    let imports_csv = coalesce_proofkit_imports(raw_imports_csv, &effective_lean_path);
+    let search_path_digest = compute_search_path_oleans_digest(&effective_lean_path);
+    let (imported_digest, closure_complete) =
+        compute_imported_oleans_digest_inner(&imports_csv, &effective_lean_path);
+    let host_closure_digest = if closure_complete {
+        imported_digest.as_str()
+    } else {
+        ""
+    };
+    let pool_digest_tag = search_path_digest.clone();
+    // Workers enforce the axiom policy they were spawned with: key them (and their replies) by it.
+    let toolchain_policy = format!(
+        "{}#{}",
+        toolchain,
+        env_vars
+            .get(crate::splitter::ALLOWED_AXIOMS_ENV)
+            .cloned()
+            .unwrap_or_else(|| crate::splitter::allowed_axioms().join(","))
+    );
+    let olean_digest = format!("{}:{}", search_path_digest, imported_digest);
+    let compiler_path = fs::canonicalize(lean_bin).unwrap_or_else(|_| lean_bin.to_path_buf());
+    let compiler_digest = fs::read(&compiler_path)
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+        .unwrap_or_default();
+    let compiler_identity = blake3::hash(
+        &serde_json::to_vec(&(&toolchain_policy, &compiler_path, compiler_digest))
+            .expect("compiler identity serializes"),
+    )
+    .to_hex()
+    .to_string();
+    let identity = blake3::hash(
+        &serde_json::to_vec(&(&compiler_identity, &effective_lean_path, &imports_csv, &olean_digest))
+            .expect("execution identity serializes"),
+    )
+    .to_hex()
+    .to_string();
+    let toolchain_policy = format!("{}#{}", toolchain_policy, compiler_identity);
+    ResolvedZygoteContext {
+        lean_path: effective_lean_path,
+        imports_csv,
+        olean_digest,
+        search_path_digest: pool_digest_tag,
+        host_closure_digest: host_closure_digest.to_string(),
+        toolchain_policy,
+        identity,
+    }
+}
+
 
 #[allow(clippy::too_many_arguments)]
 fn eval_with_zygote_pool_inner(
@@ -5253,12 +5294,13 @@ mod tests {
         let source = "#eval 17305\n";
         let file_name = dir.join("Cached.lean").to_string_lossy().to_string();
         let cwd = std::env::current_dir()?.to_string_lossy().to_string();
+        let (imports_csv, _) = split_shard_for_zygote(source);
         let context = resolve_zygote_context(
             "test",
             "",
             &std::collections::HashMap::new(),
             Path::new("/no-lean-needed"),
-            "",
+            &imports_csv,
         );
         let filename =
             compute_eval_shm_cache_filename(&context, &file_name, Some(&cwd), source, &[])?;
