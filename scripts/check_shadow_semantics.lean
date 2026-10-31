@@ -31,12 +31,13 @@
 
   Ratchet (blocking): the current violation set must be a subset of the allowlist read from
   `git show $BASE:scripts/shadow_allowlist.json`; the working-tree allowlist must itself be a
-  subset of the base allowlist (no additions) and must not contain stale entries; the inventory
-  may not drop any module / namespace present at base or in the hard-coded minimum below.
-  Bootstrap: when the base commit has neither this checker nor an allowlist (only the PR that
-  introduces the checker), the base allowlist is taken to be the current violation set, so the
-  introducing allowlist must list exactly the existing violations. `--bootstrap` only skips the
-  allowlist comparison for local inventory dumps; CI never passes it.
+  subset of the base allowlist (no additions) AND equal the current violation set (no missing,
+  no stale entries); the inventory may not drop any module / namespace present at base or in the
+  hard-coded minimum below. Bootstrap: when the base commit has neither this checker nor an
+  allowlist (only the PR that introduces the checker), the base allowlist is taken to be the
+  current violation set; the equality check then forces the introducing allowlist to list exactly
+  the existing violations (an empty allowlist fails). `--bootstrap` only skips the allowlist
+  comparison for local inventory dumps; CI never passes it.
 -/
 import Lean
 
@@ -524,6 +525,19 @@ def printTable (vs : Array Violation) : IO Unit := do
 
 /-! ## Ratchet -/
 
+/-- Allowlist file == violation set (both inclusions). -/
+def allowlistEqualsViolations (cur : List AllowEntry) (vs : Array Violation) : Array String := Id.run do
+  let mut errs := #[]
+  let curKeys : Std.HashSet String := cur.foldl (·.insert ·.key) {}
+  for v in vs do
+    unless curKeys.contains v.key do
+      errs := errs.push s!"violation missing from {allowlistPath}: {v.key} ({v.file}:{v.line})"
+  let vKeys : Std.HashSet String := vs.foldl (·.insert ·.key) {}
+  for a in cur do
+    unless vKeys.contains a.key do
+      errs := errs.push s!"stale allowlist entry (violation gone; remove it): {a.key}"
+  return errs
+
 def checkRatchet (repo : System.FilePath) (base : String) (inv : Inventory)
     (vs : Array Violation) : IO (Array String) := do
   let mut errs := #[]
@@ -548,10 +562,10 @@ def checkRatchet (repo : System.FilePath) (base : String) (inv : Inventory)
   for v in vs do
     unless baseKeys.contains v.key do
       errs := errs.push s!"NEW violation not in base allowlist: {v.key} ({v.file}:{v.line})"
-  let vKeys : Std.HashSet String := vs.foldl (·.insert ·.key) {}
-  for a in cur do
-    unless vKeys.contains a.key do
-      errs := errs.push s!"stale allowlist entry (violation gone; remove it): {a.key}"
+  -- Working-tree allowlist == current violation set, both inclusions, in EVERY mode. In bootstrap
+  -- the base allowlist IS the violation set, so the check above is vacuous there; this one makes
+  -- an introducing allowlist that omits an existing violation (e.g. an empty one) fail.
+  errs := errs ++ allowlistEqualsViolations cur vs
   -- inventory may not shrink relative to base
   if let some baseInvS ← gitShowAt repo base inventoryPath then
     let bi ← IO.ofExcept (parseInventory baseInvS)
@@ -644,6 +658,16 @@ def ratchetTests (fixtureVs : Array Violation) : IO (Array String) := do
       [checker], allowJson first, first, inv, ["has the checker but no"]),
     ("bootstrap: allowlist == violations → pass",
       [], allowJson (first ++ helper), first ++ helper, inv, []),
+    ("bootstrap: EMPTY allowlist with existing violations → fail",
+      [], allowJson [], first ++ helper, inv,
+      ["violation missing from", (first.head!).key]),
+    ("bootstrap: allowlist omits one existing violation → fail",
+      [], allowJson first, first ++ helper, inv,
+      ["violation missing from", (helper.head!).key]),
+    ("entry dropped while its violation remains → fail",
+      [checker, (allowlistPath, allowJson (first ++ helper))],
+      allowJson first, first ++ helper, inv,
+      ["violation missing from", (helper.head!).key]),
     ("bootstrap: extra allowlist entry → fail",
       [], allowJson (first ++ [fakeV]), first, inv, ["allowlist ADDS entry not in base", s!": {fakeV.key}"])]
   let mut errs := #[]
@@ -829,12 +853,7 @@ unsafe def run (args : Args) : IO UInt32 := do
     if !args.bootstrap then
       -- without a base, compare against the working-tree allowlist (local developer mode)
       let cur ← IO.ofExcept (parseAllowlist (← IO.FS.readFile (repo / allowlistPath)))
-      let keys : Std.HashSet String := cur.foldl (·.insert ·.key) {}
-      for v in r.violations do
-        unless keys.contains v.key do errs := errs.push s!"violation not in allowlist: {v.key} ({v.file}:{v.line})"
-      let vKeys : Std.HashSet String := r.violations.foldl (·.insert ·.key) {}
-      for a in cur do
-        unless vKeys.contains a.key do errs := errs.push s!"stale allowlist entry: {a.key}"
+      errs := errs ++ allowlistEqualsViolations cur r.violations
   if errs.isEmpty then
     IO.println "[shadow-semantics] PASS"
     return 0
