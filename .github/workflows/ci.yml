@@ -11,6 +11,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  LEAN_NUM_THREADS: "4"
+  # Axiom-policy audit tests change process-wide environment variables.
+  RUST_TEST_THREADS: "1"
   TURBO_LEAN_HOME: ${{ github.workspace }}/.turbo-cache
 
 jobs:

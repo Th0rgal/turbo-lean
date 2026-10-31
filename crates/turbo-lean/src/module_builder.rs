@@ -7089,7 +7089,7 @@ impl Drop for TempDirGuard {
 }
 
 pub(crate) fn run_command_with_timeout(
-    mut cmd: Command,
+    cmd: &mut Command,
     timeout: std::time::Duration,
     is_untrusted: bool,
 ) -> Result<std::process::Output> {
@@ -7159,10 +7159,9 @@ pub(crate) fn run_command_with_timeout(
             }
             let _ = child.kill();
             let _ = child.wait();
-            anyhow::bail!(
-                "`lean` module compilation exceeded timeout of {}s",
-                timeout.as_secs()
-            );
+            let _ = out_handle.join();
+            let _ = err_handle.join();
+            anyhow::bail!("`lean` command timed out after {}ms", timeout.as_millis());
         }
         let sleep_dur = if poll_iter < 25 {
             std::time::Duration::from_micros(200)
@@ -7561,7 +7560,7 @@ fn compile_single_module_direct(
         "plugins": []
     });
     fs::write(&tmp_setup, serde_json::to_vec(&setup_json)?)?;
-    let cmd = build_module_compile_command(
+    let mut cmd = build_module_compile_command(
         cfg,
         node,
         &tmp_dir,
@@ -7584,7 +7583,7 @@ fn compile_single_module_direct(
             .unwrap_or(300)
     };
     let output = run_command_with_timeout(
-        cmd,
+        &mut cmd,
         std::time::Duration::from_secs(timeout_secs),
         is_untrusted,
     )
