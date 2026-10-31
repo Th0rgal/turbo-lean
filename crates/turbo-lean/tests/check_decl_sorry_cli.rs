@@ -112,6 +112,8 @@ impl Project {
             .env("TURBO_LEAN_HOME", self.0.join("cache"))
             .env("TURBO_LEAN_STAGING_DIR", self.0.join("staging"))
             .env("TURBO_LEAN_TELEMETRY", "off")
+            // A cold run also builds the zygote worker; keep that within the per-check timeout.
+            .env("TURBO_LEAN_TIMEOUT_MS", "600000")
             .env("LEAN_NUM_THREADS", "4");
         if !daemon {
             cmd.env("TURBO_LEAN_NO_DAEMON", "1");
