@@ -1589,12 +1589,19 @@ impl TurboStore {
         let mut lease_done_entry: Option<(String, BlobEntry)> = None;
 
         let commit_now = now_unix().max(staged.now);
-        self.conn
-            .execute_batch("PRAGMA foreign_keys = OFF; PRAGMA synchronous = OFF;")?;
+        let restore_pragmas = || {
+            let _ = self.conn.execute_batch("PRAGMA synchronous = NORMAL;");
+            let _ = self.conn.execute_batch("PRAGMA foreign_keys = ON;");
+        };
+        if let Err(e) = self
+            .conn
+            .execute_batch("PRAGMA foreign_keys = OFF; PRAGMA synchronous = OFF;")
+        {
+            restore_pragmas();
+            return Err(e.into());
+        }
         if let Err(e) = self.conn.execute_batch("BEGIN IMMEDIATE;") {
-            let _ = self
-                .conn
-                .execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
+            restore_pragmas();
             return Err(e.into());
         }
         let res = (|| -> Result<()> {
@@ -1693,15 +1700,13 @@ impl TurboStore {
                 )?;
                 upd_waits.execute(params![waiters])?;
             }
-            self.conn
-                .execute_batch("COMMIT; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;")?;
+            self.conn.execute_batch("COMMIT;")?;
             Ok(())
         })();
         if res.is_err() {
-            let _ = self
-                .conn
-                .execute_batch("ROLLBACK; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
+            let _ = self.conn.execute_batch("ROLLBACK;");
         }
+        restore_pragmas();
         let _ = fs::remove_file(
             self.root
                 .join("locks")
@@ -4162,6 +4167,42 @@ mod tests {
         client_store.commit_inflight_publish_for_lease("inflight_key_1")?;
         assert!(concurrent_writer.has_cached_action_readonly("inflight_key_1", "trusted")?);
         assert!(cache_dir.join("locks").join("inflight_key_1.done").exists());
+
+        // Verify commit failure after an automatic SQLite transaction rollback still restores pragmas.
+        client_store.conn.execute_batch(
+            "CREATE TEMP TRIGGER abort_inflight_test BEFORE INSERT ON actions \
+             WHEN NEW.action_key = 'auto_rollback_key_1' \
+             BEGIN SELECT RAISE(ROLLBACK, 'simulated_auto_rollback'); END;",
+        )?;
+        let auto_rollback_items = vec![(
+            "auto_rollback_key_1".to_string(),
+            "thm_auto_rollback_1".to_string(),
+            b"{\"decl\":\"thm_auto_rollback_1\",\"ok\":true}".to_vec(),
+            5i64,
+        )];
+        client_store.begin_inflight_publish_theorem_shards(
+            "leanprover/lean4:v4.35.0",
+            "trusted",
+            &auto_rollback_items,
+        )?;
+        assert!(client_store
+            .commit_inflight_publish_for_lease("auto_rollback_key_1")
+            .is_err());
+        let sync_mode: i64 = client_store
+            .conn
+            .query_row("PRAGMA synchronous;", [], |r| r.get(0))?;
+        let fk_mode: i64 = client_store
+            .conn
+            .query_row("PRAGMA foreign_keys;", [], |r| r.get(0))?;
+        assert_eq!(sync_mode, 1);
+        assert_eq!(fk_mode, 1);
+        assert!(!cache_dir
+            .join("locks")
+            .join("auto_rollback_key_1.done")
+            .exists());
+        client_store
+            .conn
+            .execute_batch("DROP TRIGGER temp.abort_inflight_test;")?;
 
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
