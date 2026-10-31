@@ -40,6 +40,9 @@ pub struct LeanLibConfig {
     pub precompile_modules: Option<bool>,
     pub default_facets: Vec<String>,
     pub is_default_target: bool,
+    /// Why turbo-lean cannot build this dependency target like Lake (see `PackageConfig`).
+    #[serde(default)]
+    pub unsupported: Option<String>,
 }
 /// Static configuration of a `lean_exe` target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +55,8 @@ pub struct LeanExeConfig {
     pub weak_lean_args: Vec<String>,
     pub lean_options: BTreeMap<String, String>,
     pub is_default_target: bool,
+    #[serde(default)]
+    pub unsupported: Option<String>,
 }
 /// Static representation of an `extern_lib` declaration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +98,11 @@ pub struct PackageConfig {
     pub extern_libs: Vec<ExternLibConfig>,
     pub custom_targets: Vec<String>,
     pub config_digest: String,
+    /// Why turbo-lean cannot build this dependency's modules like Lake (a compile-affecting
+    /// setting it does not mirror). A root package fails to parse instead; a dependency can
+    /// still be used through Lake's own fresh build outputs.
+    #[serde(default)]
+    pub unsupported: Option<String>,
 }
 /// Resolved workspace configuration combining root package, `lean-toolchain`, `lake-manifest.json`,
 /// and dependency packages.
@@ -1127,9 +1137,12 @@ pub fn resolve_toolchain_compiler_with_trust(
     }
     Ok((canon_bin, githash, lib_lean, lib))
 }
-/// Parse `lake-manifest.json` in `project_dir` if present.
+/// Parse `lake-manifest.json` in `project_dir` if present. `packagesDir`, package names and
+/// `subDir` must stay inside the workspace; so must a `path` dependency's `dir` when
+/// `is_untrusted` (a trusted workspace may point one at a sibling checkout, as Lake allows).
 pub fn parse_lake_manifest(
     project_dir: &Path,
+    is_untrusted: bool,
 ) -> Result<(PathBuf, Vec<ManifestPackageEntry>, Option<String>)> {
     let manifest_path = project_dir.join("lake-manifest.json");
     if !manifest_path.is_file() {
@@ -1144,7 +1157,7 @@ pub fn parse_lake_manifest(
         .get("packagesDir")
         .and_then(|v| v.as_str())
         .unwrap_or(".lake/packages");
-    let packages_dir = PathBuf::from(packages_dir_str);
+    let packages_dir = lake_rel_path("packagesDir", packages_dir_str)?;
     let mut entries = Vec::new();
     if let Some(pkgs) = val.get("packages").and_then(|v| v.as_array()) {
         for pkg in pkgs {
@@ -1152,6 +1165,14 @@ pub fn parse_lake_manifest(
             let name = clean_lake_ident(raw_name);
             if name.is_empty() {
                 continue;
+            }
+            // The name is a directory under `packagesDir`.
+            if name.contains('/') || name == "." || name == ".." {
+                anyhow::bail!(
+                    "Unsupported package name `{}` in {}: fail-closed static Lake config gate",
+                    name,
+                    manifest_path.display()
+                );
             }
             let pkg_type = pkg
                 .get("type")
@@ -1161,9 +1182,14 @@ pub fn parse_lake_manifest(
             let sub_dir = pkg
                 .get("subDir")
                 .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty());
+                .filter(|s| !s.is_empty())
+                .map(|sd| lake_rel_path("subDir", sd))
+                .transpose()?;
             let base_dir = if pkg_type == "path" {
                 if let Some(d) = pkg.get("dir").and_then(|v| v.as_str()) {
+                    if is_untrusted {
+                        lake_rel_path("dir", d)?;
+                    }
                     project_dir.join(d)
                 } else {
                     project_dir.join(&packages_dir).join(&name)
@@ -1635,6 +1661,172 @@ fn parse_toml_globs(val: &str) -> Result<Vec<GlobSpec>> {
     }
     Ok(out)
 }
+/// A lakefile or manifest directory field, which must stay relative to its package: an absolute
+/// path or `..` would point builds (and their writes) outside it.
+fn lake_rel_path(field: &str, raw: &str) -> Result<PathBuf> {
+    let p = PathBuf::from(raw);
+    if p.components().any(|c| {
+        !matches!(
+            c,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    }) {
+        let _ = c_abi::verify_static_lake_config(true, true, false, false);
+        anyhow::bail!(
+            "Unsupported path `{}` for `{}`: must be relative and free of `..`: fail-closed static Lake config gate",
+            raw,
+            field
+        );
+    }
+    Ok(p)
+}
+/// The lakefile scope a field belongs to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LakeScope {
+    Package,
+    Lib,
+    Exe,
+}
+/// How a Lake 4.35 field that turbo-lean does not read itself affects the build.
+enum LakeField {
+    /// Metadata, server, linker and native-library settings: no effect on a module's
+    /// `.olean`/`.ilean`/`.c` or on the trace turbo-lean writes for it.
+    Passive,
+    /// A compile-affecting value turbo-lean does not mirror.
+    Unsupported,
+    Unknown,
+}
+/// Classify a field by `scope`, `key` and its raw value (`lakefile.toml` or `lakefile.lean`
+/// syntax). Compile-affecting fields pass only at the value turbo-lean builds with.
+fn classify_lake_field(scope: LakeScope, key: &str, val: &str) -> LakeField {
+    use LakeScope::*;
+    let v = val.trim();
+    let only_if = |ok: bool| {
+        if ok {
+            LakeField::Passive
+        } else {
+            LakeField::Unsupported
+        }
+    };
+    // Lean enum literals: `.release`, `BuildType.release`, TOML `"release"`.
+    let enum_tag = v.trim_matches('"').rsplit('.').next().unwrap_or("");
+    let empty_array = matches!(v, "[]" | "#[]");
+    match (scope, key) {
+        (
+            _,
+            "moreLeancArgs"
+            | "weakLeancArgs"
+            | "moreLinkObjs"
+            | "moreLinkLibs"
+            | "moreLinkArgs"
+            | "weakLinkArgs"
+            | "moreServerOptions"
+            | "requiresModuleSystem"
+            | "allowNonModules",
+        ) => LakeField::Passive,
+        // Only `debug` adds an option (`debugAssertions`) to `lean`; the rest are `leanc` flags.
+        (_, "buildType") => only_if(matches!(
+            enum_tag,
+            "release"
+                | "Release"
+                | "relWithDebInfo"
+                | "RelWithDebInfo"
+                | "minSizeRel"
+                | "MinSizeRel"
+        )),
+        (_, "backend") => only_if(matches!(enum_tag, "c" | "C" | "default")),
+        // `true` drops platform-dependent inputs (none here) from the trace; `false` adds the
+        // platform, which turbo-lean's trace does not.
+        (_, "platformIndependent") => only_if(matches!(v, "true" | "some true")),
+        (_, "precompileImports") => only_if(v == "false"),
+        (_, "dynlibs" | "plugins") => only_if(empty_array),
+        (Package | Lib | Exe, "extraDepTargets") => only_if(empty_array),
+        (Lib | Exe, "needs") => only_if(empty_array),
+        (
+            Package,
+            "version"
+            | "versionTags"
+            | "description"
+            | "keywords"
+            | "homepage"
+            | "license"
+            | "licenseFiles"
+            | "readmeFile"
+            | "reservoir"
+            | "testDriver"
+            | "testRunner"
+            | "testDriverArgs"
+            | "lintDriver"
+            | "lintDriverArgs"
+            | "releaseRepo"
+            | "releaseRepo?"
+            | "buildArchive"
+            | "buildArchive?"
+            | "preferReleaseBuild"
+            | "moreServerArgs"
+            | "moreGlobalServerArgs"
+            | "fixedToolchain"
+            | "restoreAllArtifacts"
+            | "restoreAllArtifacts?"
+            | "enableArtifactCache"
+            | "enableArtifactCache?"
+            | "libPrefixOnWindows"
+            | "allowImportAll"
+            | "builtinLint"
+            | "builtinLint?"
+            | "checks",
+        ) => LakeField::Passive,
+        (Package, "bootstrap") => only_if(v == "false"),
+        (Lib, "libName" | "libPrefixOnWindows" | "allowImportAll") => LakeField::Passive,
+        (Lib, "precompileLibrary") => only_if(v == "false"),
+        (Exe, "exeName") => LakeField::Passive,
+        _ => LakeField::Unknown,
+    }
+}
+/// A field turbo-lean cannot build like Lake: the root package fails closed now; a dependency
+/// records `why` in `slot`, so only building one of its modules fails closed.
+fn unsupported_lake_field(slot: &mut Option<String>, is_root_pkg: bool, why: String) -> Result<()> {
+    if is_root_pkg {
+        let _ = c_abi::verify_static_lake_config(true, true, false, false);
+        anyhow::bail!("{}: fail-closed static Lake config gate", why);
+    }
+    slot.get_or_insert(why);
+    Ok(())
+}
+/// Handle a field the parser does not read: pass it, or fail closed via
+/// `unsupported_lake_field`.
+fn check_lake_field(
+    slot: &mut Option<String>,
+    is_root_pkg: bool,
+    scope: LakeScope,
+    key: &str,
+    val: &str,
+    location: impl FnOnce() -> String,
+) -> Result<()> {
+    let what = match classify_lake_field(scope, key, val) {
+        LakeField::Passive => return Ok(()),
+        LakeField::Unsupported => "Unsupported value for",
+        LakeField::Unknown => "Unsupported",
+    };
+    let scope_name = match scope {
+        LakeScope::Package => "package",
+        LakeScope::Lib => "lean_lib",
+        LakeScope::Exe => "lean_exe",
+    };
+    unsupported_lake_field(
+        slot,
+        is_root_pkg,
+        format!("{} {} field `{}` in {}", what, scope_name, key, location()),
+    )
+}
+/// TOML reads a quoted key without a dot (`"moreLeanArgs"`) as the bare key.
+fn toml_bare_key(raw: &str) -> String {
+    let k = raw.trim();
+    match parse_toml_string(k) {
+        Ok(s) if !s.contains('.') => s,
+        _ => k.to_string(),
+    }
+}
 /// Parse a static `lakefile.toml` file into `PackageConfig`.
 /// Fails closed if unsupported dynamic targets, plugins, or facets are configured.
 pub fn parse_lakefile_toml(
@@ -1675,6 +1867,7 @@ pub fn parse_lakefile_toml(
         extern_libs: Vec::new(),
         custom_targets: Vec::new(),
         config_digest: String::new(),
+        unsupported: None,
     };
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Section {
@@ -1715,6 +1908,7 @@ pub fn parse_lakefile_toml(
                             precompile_modules: None,
                             default_facets: Vec::new(),
                             is_default_target: false,
+                            unsupported: None,
                         });
                         section = Section::LeanLib(lib_idx);
                     }
@@ -1729,6 +1923,7 @@ pub fn parse_lakefile_toml(
                             weak_lean_args: Vec::new(),
                             lean_options: BTreeMap::new(),
                             is_default_target: false,
+                            unsupported: None,
                         });
                         section = Section::LeanExe(exe_idx);
                     }
@@ -1783,7 +1978,8 @@ pub fn parse_lakefile_toml(
                 stripped
             );
         };
-        let key = raw_key.trim();
+        let key_owned = toml_bare_key(raw_key);
+        let key = key_owned.as_str();
         let mut val_accum = raw_val_start.trim().to_string();
         // Handle multi-line array `[...]` or inline table `{...}`
         while (val_accum.starts_with('[') && !val_accum.ends_with(']'))
@@ -1810,6 +2006,9 @@ pub fn parse_lakefile_toml(
                 map.insert(k, v);
                 Ok(())
             };
+        let toml_path_field =
+            || -> Result<PathBuf> { lake_rel_path(key, &parse_toml_string(&val_accum)?) };
+        let location = || format!("{} at line {}", toml_path.display(), line_no);
         match section {
             Section::Top => {
                 if let Some(opt_key) = key.strip_prefix("leanOptions.") {
@@ -1818,18 +2017,13 @@ pub fn parse_lakefile_toml(
                 }
                 match key {
                     "name" => pkg.name = clean_lake_ident(&parse_toml_string(&val_accum)?),
-                    "version" | "versionTags" | "description" | "keywords" | "homepage"
-                    | "license" | "licenseFiles" | "readmeFile" | "reservoir" | "testDriver"
-                    | "testDriverArgs" | "lintDriver" | "lintDriverArgs" | "releaseRepo"
-                    | "buildArchive" | "preferReleaseBuild" => {}
-                    "srcDir" => pkg.src_dir = PathBuf::from(parse_toml_string(&val_accum)?),
-                    "buildDir" => pkg.build_dir = PathBuf::from(parse_toml_string(&val_accum)?),
-                    "leanLibDir" => {
-                        pkg.lean_lib_dir = PathBuf::from(parse_toml_string(&val_accum)?)
-                    }
-                    "irDir" => pkg.ir_dir = PathBuf::from(parse_toml_string(&val_accum)?),
-                    "packagesDir" => {
-                        pkg.packages_dir = PathBuf::from(parse_toml_string(&val_accum)?)
+                    "srcDir" => pkg.src_dir = toml_path_field()?,
+                    "buildDir" => pkg.build_dir = toml_path_field()?,
+                    "leanLibDir" => pkg.lean_lib_dir = toml_path_field()?,
+                    "irDir" => pkg.ir_dir = toml_path_field()?,
+                    "packagesDir" => pkg.packages_dir = toml_path_field()?,
+                    "nativeLibDir" | "binDir" => {
+                        toml_path_field()?;
                     }
                     "defaultTargets" => {
                         pkg.default_targets = parse_toml_string_array(&val_accum)?
@@ -1844,30 +2038,14 @@ pub fn parse_lakefile_toml(
                         let tbl = parse_toml_lean_options_table(&val_accum)?;
                         pkg.lean_options.extend(tbl);
                     }
-                    "dynlibs" | "plugins" | "needs" => {
-                        let arr = parse_toml_string_array(&val_accum)
-                            .unwrap_or_else(|_| vec![val_accum.clone()]);
-                        if !arr.is_empty() && is_root_pkg {
-                            let _ = c_abi::verify_static_lake_config(true, true, false, false);
-                            anyhow::bail!(
-                                "Unsupported dynamic setting `{}` in {} at line {}",
-                                key,
-                                toml_path.display(),
-                                line_no
-                            );
-                        }
-                    }
-                    other => {
-                        if is_root_pkg {
-                            let _ = c_abi::verify_static_lake_config(true, true, false, false);
-                            anyhow::bail!(
-                                "Unsupported top-level key `{}` in {} at line {}: fail-closed static Lake config gate",
-                                other,
-                                toml_path.display(),
-                                line_no
-                            );
-                        }
-                    }
+                    other => check_lake_field(
+                        &mut pkg.unsupported,
+                        is_root_pkg,
+                        LakeScope::Package,
+                        other,
+                        &val_accum,
+                        location,
+                    )?,
                 }
             }
             Section::LeanOptions => {
@@ -1884,7 +2062,7 @@ pub fn parse_lakefile_toml(
                 }
                 match key {
                     "name" => lib.name = clean_lake_ident(&parse_toml_string(&val_accum)?),
-                    "srcDir" => lib.src_dir = Some(PathBuf::from(parse_toml_string(&val_accum)?)),
+                    "srcDir" => lib.src_dir = Some(toml_path_field()?),
                     "roots" => {
                         lib.roots = parse_toml_string_array(&val_accum)?
                             .into_iter()
@@ -1916,44 +2094,30 @@ pub fn parse_lakefile_toml(
                                     | "static"
                                     | "default"
                                     | "modules"
-                            ) && is_root_pkg
-                            {
+                            ) {
                                 let _ = c_abi::verify_static_lake_config(true, false, false, true);
-                                anyhow::bail!(
-                                    "Unsupported defaultFacet `{}` on library `{}` in {}",
-                                    f,
-                                    lib.name,
-                                    toml_path.display()
-                                );
+                                unsupported_lake_field(
+                                    &mut lib.unsupported,
+                                    is_root_pkg,
+                                    format!(
+                                        "Unsupported defaultFacet `{}` on library `{}` in {}",
+                                        f,
+                                        lib.name,
+                                        toml_path.display()
+                                    ),
+                                )?;
                             }
                         }
                         lib.default_facets = facets;
                     }
-                    "dynlibs" | "plugins" | "needs" | "nativeFacets" => {
-                        let arr = parse_toml_string_array(&val_accum)
-                            .unwrap_or_else(|_| vec![val_accum.clone()]);
-                        if !arr.is_empty() && is_root_pkg {
-                            let _ = c_abi::verify_static_lake_config(true, true, false, false);
-                            anyhow::bail!(
-                                "Unsupported dynamic library setting `{}` on `{}` in {}",
-                                key,
-                                lib.name,
-                                toml_path.display()
-                            );
-                        }
-                    }
-                    "libName" | "extraDepTargets" if !is_root_pkg => {}
-                    other => {
-                        if is_root_pkg {
-                            let _ = c_abi::verify_static_lake_config(true, true, false, false);
-                            anyhow::bail!(
-                                "Unsupported `[[lean_lib]]` key `{}` in {} at line {}",
-                                other,
-                                toml_path.display(),
-                                line_no
-                            );
-                        }
-                    }
+                    other => check_lake_field(
+                        &mut lib.unsupported,
+                        is_root_pkg,
+                        LakeScope::Lib,
+                        other,
+                        &val_accum,
+                        location,
+                    )?,
                 }
             }
             Section::LeanLibOptions(i) => {
@@ -1967,7 +2131,7 @@ pub fn parse_lakefile_toml(
                 }
                 match key {
                     "name" => exe.name = clean_lake_ident(&parse_toml_string(&val_accum)?),
-                    "srcDir" => exe.src_dir = Some(PathBuf::from(parse_toml_string(&val_accum)?)),
+                    "srcDir" => exe.src_dir = Some(toml_path_field()?),
                     "root" => exe.root = clean_lake_ident(&parse_toml_string(&val_accum)?),
                     "supportInterpreter" => exe.support_interpreter = parse_toml_bool(&val_accum)?,
                     "moreLeanArgs" => exe.more_lean_args = parse_toml_string_array(&val_accum)?,
@@ -1976,18 +2140,14 @@ pub fn parse_lakefile_toml(
                         let tbl = parse_toml_lean_options_table(&val_accum)?;
                         exe.lean_options.extend(tbl);
                     }
-                    "exeName" | "moreLinkArgs" | "moreLinkObjs" | "moreLinkLibs" => {}
-                    other => {
-                        if is_root_pkg {
-                            let _ = c_abi::verify_static_lake_config(true, true, false, false);
-                            anyhow::bail!(
-                                "Unsupported `[[lean_exe]]` key `{}` in {} at line {}",
-                                other,
-                                toml_path.display(),
-                                line_no
-                            );
-                        }
-                    }
+                    other => check_lake_field(
+                        &mut exe.unsupported,
+                        is_root_pkg,
+                        LakeScope::Exe,
+                        other,
+                        &val_accum,
+                        location,
+                    )?,
                 }
             }
             Section::LeanExeOptions(i) => {
@@ -1998,7 +2158,7 @@ pub fn parse_lakefile_toml(
                 match key {
                     "name" => ext.name = clean_lake_ident(&parse_toml_string(&val_accum)?),
                     "path" => {
-                        let p = pkg_root.join(parse_toml_string(&val_accum)?);
+                        let p = pkg_root.join(toml_path_field()?);
                         if p.is_file() {
                             if let Ok(b) = fs::read(&p) {
                                 ext.static_artifact_blake3 =
@@ -2007,7 +2167,11 @@ pub fn parse_lakefile_toml(
                             }
                         }
                     }
-                    _ => {}
+                    other => unsupported_lake_field(
+                        &mut pkg.unsupported,
+                        is_root_pkg,
+                        format!("Unsupported extern_lib field `{}` in {}", other, location()),
+                    )?,
                 }
             }
         }
@@ -3155,11 +3319,11 @@ fn resolve_lean_options_in(
     }
     parse_lean_options_expr(s)
 }
-fn parse_lean_path_literal(expr: &str) -> Result<PathBuf> {
+fn parse_lean_path_literal(field: &str, expr: &str) -> Result<PathBuf> {
     // Only a string literal: `FilePath.mk "..."` can be shadowed by the lakefile itself.
     let s = expr.trim();
     if s.starts_with('"') {
-        return Ok(PathBuf::from(plain_string_literal(s)?));
+        return lake_rel_path(field, &plain_string_literal(s)?);
     }
     anyhow::bail!(
         "Unsupported non-literal path expression `{}` in lakefile.lean",
@@ -3206,43 +3370,61 @@ pub fn parse_lakefile_lean(
             lean_path.display()
         );
     }
-    // 1. Fail-closed scan for dynamic metaprogramming or script hooks (root package only)
-    if is_root_pkg {
-        for (idx, line) in clean.lines().enumerate() {
-            let ln = idx + 1;
-            let t = line.trim();
-            if t.is_empty() {
+    // 1. Fail-closed scan for dynamic metaprogramming or script hooks. A dependency's
+    //    `post_update`/`script` hooks never run during a build, so they (and processes their
+    //    bodies spawn) only matter for the root; anything else marks the dependency unbuildable.
+    let mut pkg_unsupported: Option<String> = None;
+    let mut in_hook_body = false;
+    for (idx, line) in clean.lines().enumerate() {
+        let ln = idx + 1;
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let is_hook = |w: &str| matches!(w, "script " | "lean_script " | "post_update");
+        if !line.starts_with(char::is_whitespace) {
+            in_hook_body = ["script ", "lean_script ", "post_update"]
+                .iter()
+                .any(|h| t.starts_with(h));
+        }
+        for forbidden in [
+            "meta if ",
+            "meta if(",
+            "run_cmd",
+            "run_elab",
+            "run_meta",
+            "#eval",
+            "elab ",
+            "elab_rules",
+            "macro ",
+            "macro_rules",
+            "script ",
+            "lean_script ",
+            "post_update",
+            "input_file",
+            "input_dir",
+            "needs :=",
+            "dynlibs :=",
+            "plugins :=",
+            "IO.Process",
+            "System.Process",
+        ] {
+            let in_hook_ok = is_hook(forbidden)
+                || (in_hook_body && matches!(forbidden, "IO.Process" | "System.Process"));
+            if !is_root_pkg && in_hook_ok {
                 continue;
             }
-            for forbidden in [
-                "meta if ",
-                "meta if(",
-                "run_cmd",
-                "#eval",
-                "elab ",
-                "elab_rules",
-                "macro ",
-                "macro_rules",
-                "script ",
-                "lean_script ",
-                "post_update",
-                "input_file",
-                "input_dir",
-                "needs :=",
-                "dynlibs :=",
-                "plugins :=",
-                "IO.Process",
-                "System.Process",
-            ] {
-                if t.starts_with(forbidden) || t.contains(&format!(" {}", forbidden)) {
-                    let _ = c_abi::verify_static_lake_config(true, true, false, false);
-                    anyhow::bail!(
-                    "Unsupported dynamic Lake construct `{}` in {} at line {}: fail-closed static Lake config gate",
-                    forbidden.trim(),
-                    lean_path.display(),
-                    ln
-                );
-                }
+            if t.starts_with(forbidden) || t.contains(&format!(" {}", forbidden)) {
+                unsupported_lake_field(
+                    &mut pkg_unsupported,
+                    is_root_pkg,
+                    format!(
+                        "Unsupported dynamic Lake construct `{}` in {} at line {}",
+                        forbidden.trim(),
+                        lean_path.display(),
+                        ln
+                    ),
+                )?;
             }
         }
     }
@@ -3268,6 +3450,7 @@ pub fn parse_lakefile_lean(
         extern_libs: Vec::new(),
         custom_targets: Vec::new(),
         config_digest: String::new(),
+        unsupported: pkg_unsupported,
     };
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum DeclBlock {
@@ -3395,15 +3578,21 @@ pub fn parse_lakefile_lean(
             DeclBlock::None | DeclBlock::Require | DeclBlock::CustomDoBlock => continue,
             DeclBlock::Package | DeclBlock::LeanLib(_) | DeclBlock::LeanExe(_) => {
                 let Some((k_raw, v_start)) = trimmed.split_once(":=") else {
-                    if is_root_pkg {
-                        let _ = c_abi::verify_static_lake_config(true, true, false, false);
-                        anyhow::bail!(
+                    let slot = match current_block {
+                        DeclBlock::LeanLib(idx) => &mut pkg.libs[idx].unsupported,
+                        DeclBlock::LeanExe(idx) => &mut pkg.exes[idx].unsupported,
+                        _ => &mut pkg.unsupported,
+                    };
+                    unsupported_lake_field(
+                        slot,
+                        is_root_pkg,
+                        format!(
                             "Unsupported statement `{}` inside declaration block in {} at line {}",
                             trimmed,
                             lean_path.display(),
                             line_no
-                        );
-                    }
+                        ),
+                    )?;
                     continue;
                 };
                 let key = k_raw.trim();
@@ -3471,31 +3660,21 @@ pub fn parse_lakefile_lean(
                         line_no
                     );
                 }
+                let location = || format!("{} at line {}", lean_path.display(), line_no);
                 match current_block {
                     DeclBlock::Package => match key {
-                        "version"
-                        | "versionTags"
-                        | "description"
-                        | "keywords"
-                        | "homepage"
-                        | "license"
-                        | "licenseFiles"
-                        | "readmeFile"
-                        | "reservoir"
-                        | "testDriver"
-                        | "testDriverArgs"
-                        | "lintDriver"
-                        | "lintDriverArgs"
-                        | "releaseRepo"
-                        | "buildArchive"
-                        | "preferReleaseBuild"
-                        | "moreLinkArgs"
-                        | "moreGlobalServerArgs" => {}
-                        "srcDir" => pkg.src_dir = parse_lean_path_literal(&val_accum)?,
-                        "buildDir" => pkg.build_dir = parse_lean_path_literal(&val_accum)?,
-                        "leanLibDir" => pkg.lean_lib_dir = parse_lean_path_literal(&val_accum)?,
-                        "irDir" => pkg.ir_dir = parse_lean_path_literal(&val_accum)?,
-                        "packagesDir" => pkg.packages_dir = parse_lean_path_literal(&val_accum)?,
+                        "nativeLibDir" | "binDir" => {
+                            parse_lean_path_literal(key, &val_accum)?;
+                        }
+                        "srcDir" => pkg.src_dir = parse_lean_path_literal(key, &val_accum)?,
+                        "buildDir" => pkg.build_dir = parse_lean_path_literal(key, &val_accum)?,
+                        "leanLibDir" => {
+                            pkg.lean_lib_dir = parse_lean_path_literal(key, &val_accum)?
+                        }
+                        "irDir" => pkg.ir_dir = parse_lean_path_literal(key, &val_accum)?,
+                        "packagesDir" => {
+                            pkg.packages_dir = parse_lean_path_literal(key, &val_accum)?
+                        }
                         "defaultTargets" => {
                             pkg.default_targets = parse_lean_ident_array_expr(&val_accum)?;
                         }
@@ -3515,22 +3694,21 @@ pub fn parse_lakefile_lean(
                                 line_no,
                             )?);
                         }
-                        other => {
-                            if is_root_pkg {
-                                let _ = c_abi::verify_static_lake_config(true, true, false, false);
-                                anyhow::bail!(
-                                    "Unsupported package field `{}` in {} at line {}: fail-closed static Lake config gate",
-                                    other,
-                                    lean_path.display(),
-                                    line_no
-                                );
-                            }
-                        }
+                        other => check_lake_field(
+                            &mut pkg.unsupported,
+                            is_root_pkg,
+                            LakeScope::Package,
+                            other,
+                            &val_accum,
+                            location,
+                        )?,
                     },
                     DeclBlock::LeanLib(lib_idx) => {
                         let lib = &mut pkg.libs[lib_idx];
                         match key {
-                            "srcDir" => lib.src_dir = Some(parse_lean_path_literal(&val_accum)?),
+                            "srcDir" => {
+                                lib.src_dir = Some(parse_lean_path_literal(key, &val_accum)?)
+                            }
                             "roots" => {
                                 lib.roots = parse_lean_ident_array_expr(&val_accum)?;
                                 if lib.roots.is_empty() {
@@ -3570,40 +3748,40 @@ pub fn parse_lakefile_lean(
                                             | "LeanLib.staticFacet"
                                             | "default"
                                             | "modules"
-                                    ) && is_root_pkg
-                                    {
+                                    ) {
                                         let _ = c_abi::verify_static_lake_config(
                                             true, false, false, true,
                                         );
-                                        anyhow::bail!(
-                                            "Unsupported defaultFacet `{}` on library `{}` in {}",
-                                            f,
-                                            lib.name,
-                                            lean_path.display()
-                                        );
+                                        unsupported_lake_field(
+                                            &mut lib.unsupported,
+                                            is_root_pkg,
+                                            format!(
+                                                "Unsupported defaultFacet `{}` on library `{}` in {}",
+                                                f,
+                                                lib.name,
+                                                lean_path.display()
+                                            ),
+                                        )?;
                                     }
                                 }
                                 lib.default_facets = facets;
                             }
-                            "libName" | "moreLinkArgs" => {}
-                            other => {
-                                if is_root_pkg {
-                                    let _ =
-                                        c_abi::verify_static_lake_config(true, true, false, false);
-                                    anyhow::bail!(
-                                        "Unsupported `lean_lib` field `{}` in {} at line {}: fail-closed static Lake config gate",
-                                        other,
-                                        lean_path.display(),
-                                        line_no
-                                    );
-                                }
-                            }
+                            other => check_lake_field(
+                                &mut lib.unsupported,
+                                is_root_pkg,
+                                LakeScope::Lib,
+                                other,
+                                &val_accum,
+                                location,
+                            )?,
                         }
                     }
                     DeclBlock::LeanExe(exe_idx) => {
                         let exe = &mut pkg.exes[exe_idx];
                         match key {
-                            "srcDir" => exe.src_dir = Some(parse_lean_path_literal(&val_accum)?),
+                            "srcDir" => {
+                                exe.src_dir = Some(parse_lean_path_literal(key, &val_accum)?)
+                            }
                             "root" => exe.root = lake_name_literal(&val_accum, "root")?,
                             "supportInterpreter" => {
                                 exe.support_interpreter = parse_toml_bool(&val_accum)?;
@@ -3621,19 +3799,14 @@ pub fn parse_lakefile_lean(
                                     line_no,
                                 )?);
                             }
-                            "exeName" | "moreLinkArgs" | "moreLinkObjs" | "moreLinkLibs" => {}
-                            other => {
-                                if is_root_pkg {
-                                    let _ =
-                                        c_abi::verify_static_lake_config(true, true, false, false);
-                                    anyhow::bail!(
-                                        "Unsupported `lean_exe` field `{}` in {} at line {}: fail-closed static Lake config gate",
-                                        other,
-                                        lean_path.display(),
-                                        line_no
-                                    );
-                                }
-                            }
+                            other => check_lake_field(
+                                &mut exe.unsupported,
+                                is_root_pkg,
+                                LakeScope::Exe,
+                                other,
+                                &val_accum,
+                                location,
+                            )?,
                         }
                     }
                     _ => {}
@@ -3727,6 +3900,7 @@ where
             precompile_modules: None,
             default_facets: Vec::new(),
             is_default_target: is_def,
+            unsupported: None,
         });
         *current_block = T::lean_lib(idx);
         return Ok(());
@@ -3744,6 +3918,7 @@ where
             weak_lean_args: Vec::new(),
             lean_options: BTreeMap::new(),
             is_default_target: is_def,
+            unsupported: None,
         });
         *current_block = T::lean_exe(idx);
         return Ok(());
@@ -3771,7 +3946,23 @@ where
         *current_block = T::custom_do();
         return Ok(());
     }
-    if is_root_pkg {
+    // A dependency may define helpers (only literal field values are read, so a helper cannot
+    // reach the config) and update/script hooks; any other command could change what Lake builds.
+    let inert_dep_decl = ["abbrev ", "def ", "nonrec def ", "post_update ", "script "]
+        .iter()
+        .any(|kw| trimmed.starts_with(kw));
+    if !inert_dep_decl {
+        unsupported_lake_field(
+            &mut pkg.unsupported,
+            is_root_pkg,
+            format!(
+                "Unsupported top-level declaration `{}` in {} at line {}",
+                trimmed,
+                lean_path.display(),
+                line_no
+            ),
+        )?;
+    } else if is_root_pkg {
         let _ = c_abi::verify_static_lake_config(true, true, false, false);
         anyhow::bail!(
             "Unsupported top-level declaration `{}` in {} at line {}: fail-closed static Lake config gate",
@@ -4152,7 +4343,7 @@ pub fn resolve_project_config_with_trust(
         };
     let root_pkg = resolve_package_config(&canon_dir, true)?;
     let (manifest_pkgs_dir, manifest_packages, manifest_hash_opt) =
-        parse_lake_manifest(&canon_dir)?;
+        parse_lake_manifest(&canon_dir, is_untrusted)?;
     let mut dep_dirs: Vec<PathBuf> = Vec::new();
     let mut seen_dep_dirs: HashSet<PathBuf> = HashSet::new();
     for mp in &manifest_packages {
@@ -4181,7 +4372,17 @@ pub fn resolve_project_config_with_trust(
         }
     }
     let mut dep_pkgs = Vec::new();
+    // An untrusted workspace must not adopt (and later publish into) a package elsewhere on
+    // the host, whether through the manifest or a symlink.
+    let package_roots = untrusted_package_roots(&canon_dir);
     for dep_dir in dep_dirs {
+        if is_untrusted && !package_roots.iter().any(|r| dep_dir.starts_with(r)) {
+            anyhow::bail!(
+                "Dependency package `{}` resolves outside the workspace `{}`: fail-closed build path gate",
+                dep_dir.display(),
+                canon_dir.display()
+            );
+        }
         if dep_dir.join("lakefile.toml").is_file() || dep_dir.join("lakefile.lean").is_file() {
             let dep_cfg = resolve_package_config(&dep_dir, false)?;
             dep_pkgs.push(dep_cfg);
@@ -4249,6 +4450,8 @@ pub(crate) struct DiscoveredModuleSpec {
     weak_args: Vec<String>,
     extern_lib_digests: Vec<String>,
     pub(crate) pkg_config_digest: String,
+    /// Set when turbo-lean cannot build the module like Lake (`PackageConfig::unsupported`).
+    unsupported: Option<String>,
 }
 fn compose_effective_args(
     pkg: &PackageConfig,
@@ -4431,6 +4634,7 @@ pub(crate) fn resolve_module_in_package(
                     weak_args,
                     extern_lib_digests: extern_digests,
                     pkg_config_digest: pkg.config_digest.clone(),
+                    unsupported: pkg.unsupported.clone().or_else(|| exe.unsupported.clone()),
                 });
             }
         }
@@ -4487,6 +4691,7 @@ pub(crate) fn resolve_module_in_package(
                     weak_args,
                     extern_lib_digests: extern_digests,
                     pkg_config_digest: pkg.config_digest.clone(),
+                    unsupported: pkg.unsupported.clone().or_else(|| lib.unsupported.clone()),
                 });
             }
         }
@@ -4511,6 +4716,7 @@ pub(crate) fn resolve_module_in_package(
             weak_args,
             extern_lib_digests: extern_digests,
             pkg_config_digest: pkg.config_digest.clone(),
+            unsupported: pkg.unsupported.clone(),
         });
     }
     None
@@ -4965,6 +5171,10 @@ pub fn build_module_dag_with_trust(
                                 weak_args: weak_args.clone(),
                                 extern_lib_digests: extern_digests.clone(),
                                 pkg_config_digest: target_pkg.config_digest.clone(),
+                                unsupported: target_pkg
+                                    .unsupported
+                                    .clone()
+                                    .or_else(|| lib.unsupported.clone()),
                             },
                             force_c_for_target || precompile,
                         ));
@@ -5043,6 +5253,7 @@ pub fn build_module_dag_with_trust(
                             weak_args: weak_args.clone(),
                             extern_lib_digests: Vec::new(),
                             pkg_config_digest: root_pkg.config_digest.clone(),
+                            unsupported: root_pkg.unsupported.clone(),
                         },
                         global_emit_c || root_pkg.precompile_modules,
                     ));
@@ -5087,6 +5298,17 @@ pub fn build_module_dag_with_trust(
                 existing.needs_c = true;
             }
             continue;
+        }
+        // Every DAG node is compiled or restored and published with a Lake trace, which must
+        // not happen for a module Lake would build differently.
+        if let Some(why) = &spec.unsupported {
+            let _ = c_abi::verify_static_lake_config(true, true, false, false);
+            anyhow::bail!(
+                "Cannot build module `{}` of package `{}` like Lake ({}): fail-closed static Lake config gate",
+                spec.module_name,
+                spec.pkg_name,
+                why
+            );
         }
         let src = fs::read_to_string(&spec.src_path).with_context(|| {
             format!(
@@ -7299,7 +7521,8 @@ fn canonicalize_path_with_missing_tail(p: &Path) -> Result<PathBuf> {
     }
     let mut cur = p;
     let mut tail_names: Vec<std::ffi::OsString> = Vec::new();
-    while !cur.exists() {
+    // A dangling symlink is not a missing tail: canonicalizing it below fails closed.
+    while fs::symlink_metadata(cur).is_err() {
         let fname = cur.file_name().ok_or_else(|| {
             anyhow::anyhow!("Cannot resolve non-existent root path `{}`", p.display())
         })?;
@@ -7319,6 +7542,70 @@ fn canonicalize_path_with_missing_tail(p: &Path) -> Result<PathBuf> {
         canon.push(name);
     }
     Ok(canon)
+}
+
+/// Roots an untrusted build may use as package roots: the checkout, plus directories the
+/// operator lists in `TURBO_LEAN_TRUSTED_PACKAGES_DIR` (e.g. a shared `.lake/packages` cache).
+fn untrusted_package_roots(canon_dir: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![canon_dir.to_path_buf()];
+    if let Some(v) = std::env::var_os("TURBO_LEAN_TRUSTED_PACKAGES_DIR") {
+        roots.extend(
+            std::env::split_paths(&v)
+                .filter(|p| p.is_absolute())
+                .filter_map(|p| p.canonicalize().ok()),
+        );
+    }
+    roots
+}
+
+/// Fail closed unless every directory a native build writes to (package build directories and
+/// each module's artifact directories) lies inside its package root. Untrusted builds also
+/// resolve symlinks and require each package root inside the checkout or a trusted packages dir.
+fn validate_build_write_dirs(
+    cfg: &ProjectConfig,
+    dag: &ModuleDag,
+    canon_dir: &Path,
+    is_untrusted: bool,
+) -> Result<()> {
+    let roots = untrusted_package_roots(canon_dir);
+    let check = |pkg_root: &Path, dir: &Path| -> Result<()> {
+        let lexical_ok = dir.starts_with(pkg_root)
+            && !dir
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir));
+        let canonical_ok = !is_untrusted
+            || (|| -> Result<bool> {
+                let canon_root = pkg_root.canonicalize()?;
+                Ok(roots.iter().any(|r| canon_root.starts_with(r))
+                    && canonicalize_path_with_missing_tail(dir)?.starts_with(&canon_root))
+            })()
+            .unwrap_or(false);
+        if !(lexical_ok && canonical_ok) {
+            anyhow::bail!(
+                "Refusing to write build outputs to `{}`: outside package `{}`: fail-closed build path gate",
+                dir.display(),
+                pkg_root.display()
+            );
+        }
+        Ok(())
+    };
+    for pkg in std::iter::once(&cfg.root_pkg).chain(&cfg.dep_pkgs) {
+        let build = pkg.pkg_root.join(&pkg.build_dir);
+        for dir in [
+            build.join(&pkg.lean_lib_dir),
+            build.join(&pkg.ir_dir),
+            pkg.pkg_root.join(".lake/build"),
+        ] {
+            check(&pkg.pkg_root, &dir)?;
+        }
+    }
+    for node in dag.nodes.values() {
+        check(&node.pkg_root, &node.pkg_root.join(".lake/build"))?;
+        for p in [&node.olean_path, &node.ilean_path, &node.c_path] {
+            check(&node.pkg_root, p.parent().unwrap_or(p))?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_untrusted_sandbox_search_paths(
@@ -7806,6 +8093,7 @@ pub fn build_project_modules_native(
         .unwrap_or_else(|| "lean-project".to_string());
     let cfg = resolve_project_config_with_trust(&canon_dir, is_untrusted)?;
     let dag = build_module_dag_with_trust(&cfg, targets, is_untrusted)?;
+    validate_build_write_dirs(&cfg, &dag, &canon_dir, is_untrusted)?;
     let preserve_project = crate::lake_build::worktree_auto_link_disabled(&canon_dir);
     let mut report = NativeBuildReport {
         modules_total: dag.nodes.len(),
