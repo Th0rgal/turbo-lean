@@ -3801,9 +3801,9 @@ mod tests {
             SingleflightOutcome::Leader(l) => l,
             _ => panic!("expected leader"),
         };
-        store.publish_action(&lease, &[entry.clone()], 5, 0, 0, "trusted")?;
+        store.publish_action(&lease, std::slice::from_ref(&entry), 5, 0, 0, "trusted")?;
         drop(lease);
-        store.write_singleflight_done("evict_key", &[entry.clone()]);
+        store.write_singleflight_done("evict_key", std::slice::from_ref(&entry));
         // An unpinned action makes the store reclaimable so GC step B actually runs.
         let filler =
             store.store_immutable_blob(b"unpinned filler output", "olean", "trusted", 0)?;
