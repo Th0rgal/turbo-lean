@@ -3025,7 +3025,9 @@ pub fn build_coalesced_shard_source(
     let spans = parse_command_spans(src, &clean);
 
     let mut chunks = Vec::with_capacity(spans.len());
-    for span in &spans {
+    let mut scope_stack = Vec::new();
+    for (idx, span) in spans.iter().enumerate() {
+        update_scope_stack_with_idx(&mut scope_stack, span.clean_text, idx);
         if let Some((header_orig, inner_spans, footer_orig)) = split_mutual_block_subspans(span) {
             let has_inner_thm = inner_spans.iter().any(|sub| {
                 classify_decl_header(sub.clean_text).is_some()
@@ -3036,7 +3038,10 @@ pub fn build_coalesced_shard_source(
                 inner_chunks.push(header_orig.to_string());
                 for sub in &inner_spans {
                     if let Some((_kind, name)) = classify_decl_header(sub.clean_text) {
-                        if !matches_uncached_or_fast_verify_name(&name, uncached_names) {
+                        if !matches_uncached_or_fast_verify_name(
+                            &qualified_decl_name(&name, &scope_stack),
+                            uncached_names,
+                        ) {
                             if let Some((sig_clean, proof_clean)) =
                                 split_at_top_level_assign(sub.clean_text)
                             {
@@ -3058,7 +3063,10 @@ pub fn build_coalesced_shard_source(
         }
 
         if let Some((_kind, name)) = classify_decl_header(span.clean_text) {
-            if !matches_uncached_or_fast_verify_name(&name, uncached_names) {
+            if !matches_uncached_or_fast_verify_name(
+                &qualified_decl_name(&name, &scope_stack),
+                uncached_names,
+            ) {
                 let short = name.rsplit('.').next().unwrap_or(&name);
                 if short.starts_with("_turbo_verify_") {
                     continue;
@@ -4497,7 +4505,9 @@ pub fn audit_source_declarations(
     .collect();
     let (mut shadowed, mut priv_decls) = (Vec::new(), Vec::new());
 
+    let mut scope_stack = Vec::new();
     for (idx, span) in spans.iter().enumerate() {
+        update_scope_stack_with_idx(&mut scope_stack, span.clean_text, idx);
         let mut after_attrs = span.clean_text.trim_start();
         while let Some(next) = strip_leading_attr_block(after_attrs) {
             after_attrs = next.trim_start();
@@ -4507,7 +4517,7 @@ pub fn audit_source_declarations(
             let short = name.rsplit('.').next().unwrap_or(&name).to_string();
             let matches_filter = decl_filter
                 .filter(|d| !d.is_empty() && *d != "auto")
-                .map(|df| decl_name_matches_target(&name, df))
+                .map(|df| decl_name_matches_target(&qualified_decl_name(&name, &scope_stack), df))
                 .unwrap_or(true);
             if matches_filter && matches!(kw, "theorem" | "lemma") {
                 let sig = split_at_top_level_assign(span.clean_text)

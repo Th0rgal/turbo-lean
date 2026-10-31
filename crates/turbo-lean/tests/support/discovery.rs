@@ -119,6 +119,15 @@ fn qualified_targets_select_only_one_proof_in_fast_sources() {
             !pruned.contains(&format!("theorem same : {other} := rfl")),
             "{pruned}"
         );
+        let coalesced = build_coalesced_shard_source(src, &names);
+        assert!(
+            coalesced.contains(&format!("theorem same : {selected} := rfl")),
+            "{coalesced}"
+        );
+        assert!(
+            !coalesced.contains(&format!("theorem same : {other} := rfl")),
+            "{coalesced}"
+        );
         let fast =
             build_fast_olean_shard_source_with_split(src, &split, "Fixture", &names).unwrap();
         assert_eq!(fast.matches("_turbo_verify_").count(), 1, "{fast}");
