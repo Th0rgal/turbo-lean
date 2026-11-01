@@ -1918,6 +1918,9 @@ pub(crate) fn resolve_prebuilt_module_import(
     canon_project_dir: &Path,
     canon_file: &Path,
 ) -> Option<String> {
+    if !crate::module_builder::source_compilation_authorized(store, canon_project_dir, canon_file) {
+        return None;
+    }
     let module = fresh_prebuilt_module_import(canon_project_dir, canon_file)?;
     // A writable freshness manifest cannot vouch for the target module itself. Reject the
     // shortcut on replay/policy failure; callers can still check the complete source.
@@ -2545,6 +2548,16 @@ pub(crate) fn seed_project_theorem_shards_from_splits(
     let mut batch_items: Vec<(String, String, Vec<u8>, i64)> = Vec::new();
 
     let pkg_cfg_opt = crate::module_builder::optional_package_config(canon_dir)?;
+    crate::module_builder::require_source_compilations(
+        store,
+        canon_dir,
+        &split_entries
+            .iter()
+            .filter(|(_, _, sp)| !sp.shards.is_empty())
+            .map(|(p, _, _)| p.clone())
+            .collect::<Vec<_>>(),
+        trust_domain == "untrusted",
+    )?;
     for (lf, _src, split) in split_entries {
         if require_olean && resolve_prebuilt_module_import(store, canon_dir, lf).is_none() {
             continue;
@@ -3132,7 +3145,16 @@ pub fn run_build_command(
         }
         SingleflightOutcome::Leader(lease) => {
             let mut build_report = crate::module_builder::NativeBuildReport::default();
-            if !targets.is_empty() || !are_all_project_oleans_up_to_date(&canon_dir, &file_hashes) {
+            if !targets.is_empty()
+                || !are_all_project_oleans_up_to_date(&canon_dir, &file_hashes)
+                || crate::module_builder::require_source_compilations(
+                    store,
+                    &canon_dir,
+                    &collect_lean_files(&canon_dir),
+                    trust_domain == "untrusted",
+                )
+                .is_err()
+            {
                 build_report = crate::module_builder::build_project_modules_native(
                     store,
                     &canon_dir,
@@ -3144,7 +3166,9 @@ pub fn run_build_command(
                     Some(&file_hashes),
                 )?;
             } else {
-                crate::module_builder::audit_existing_project_artifacts(store, &canon_dir, &targets)?;
+                crate::module_builder::audit_existing_project_artifacts(
+                    store, &canon_dir, &targets,
+                )?;
             }
 
             let env_key = TurboStore::compute_lake_env_key(&canon_dir);
@@ -3454,14 +3478,11 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM actions", [], |r| r.get(0))?;
             assert_eq!(count, 0, "invalid configuration must publish no entries");
         }
-        // Standalone projects with no Lake config still have known empty options.
+        // Without compilation provenance, even a standalone file is checked from source.
         fs::remove_file(project.join("lakefile.toml"))?;
-        assert_eq!(
-            seed_project_theorem_shards_from_splits(
-                &mut store, &project, "test", "trusted", false, &splits,
-            )?,
-            (1, 1)
-        );
+        assert_eq!(seed_project_theorem_shards_from_splits(
+            &mut store, &project, "test", "trusted", false, &splits,
+        )?, (1, 1));
         assert!(store.has_cached_action_readonly(&key, "trusted")?);
         fs::remove_dir_all(dir)?;
         Ok(())

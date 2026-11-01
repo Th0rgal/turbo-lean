@@ -2811,7 +2811,7 @@ pub fn run_ci_verify_command(
         } else {
             crate::module_builder::audit_existing_project_artifacts(store_ref, &canon_dir, &[])?;
         }
-        Ok(())
+        crate::module_builder::require_source_compilations(store_ref, &canon_dir, &lean_paths, is_untrusted)
     };
 
     let (build_status, _resolved_env_opt) = if let Some(outputs) =
@@ -2833,8 +2833,10 @@ pub fn run_ci_verify_command(
         };
         ("cache_hit(coalesced=false)".to_string(), resolved_env)
     } else {
-        let oleans_up_to_date =
-            !is_untrusted && are_all_project_oleans_up_to_date(&canon_dir, &file_hashes);
+        let oleans_up_to_date = !is_untrusted
+            && are_all_project_oleans_up_to_date(&canon_dir, &file_hashes)
+            && crate::module_builder::require_source_compilations(store, &canon_dir, &lean_paths, is_untrusted)
+                .is_ok();
         let mut singleflight_hit_status: Option<String> = None;
         let lease_opt = if oleans_up_to_date {
             None
@@ -2883,6 +2885,8 @@ pub fn run_ci_verify_command(
             if oleans_up_to_date {
                 crate::module_builder::audit_existing_project_artifacts(store, &canon_dir, &[])?;
             }
+
+            crate::module_builder::require_source_compilations(store, &canon_dir, &lean_paths, is_untrusted)?;
 
             let env_key = TurboStore::compute_lake_env_key(&canon_dir);
             let resolved_env = if is_untrusted {

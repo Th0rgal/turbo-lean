@@ -8599,6 +8599,151 @@ fn ensure_module_closure_replayed(
     replay_resolved_artifacts(store, cfg, imported, lean_path)
 }
 
+fn verifier_controls_store(store: &TurboStore, cfg: &ProjectConfig) -> Result<bool> {
+    let authority_paths = [
+        store.root.canonicalize()?,
+        store.root.join("state.db").canonicalize()?,
+    ];
+    Ok(std::iter::once(&cfg.root_pkg)
+        .chain(&cfg.dep_pkgs)
+        .all(|p| {
+            p.pkg_root
+                .canonicalize()
+                .is_ok_and(|r| authority_paths.iter().all(|p| !p.starts_with(&r)))
+        }))
+}
+
+fn resolved_environment_digest(imported: &[(String, PathBuf, String)]) -> Result<String> {
+    let mut environment: Vec<_> = imported
+        .iter()
+        .map(|(m, p, dig)| Ok((m.clone(), p.canonicalize()?, dig.clone())))
+        .collect::<Result<_>>()?;
+    environment.sort();
+    Ok(blake3::hash(&serde_json::to_vec(&environment)?)
+        .to_hex()
+        .to_string())
+}
+
+/// Unlike replay authority, this record establishes compilation from these exact source
+/// bytes. Only native compilation followed by the root kernel/policy audit may write it.
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+struct SourceCompilationRecord {
+    source_path: PathBuf,
+    source_digest: String,
+    workspace_config_digest: String,
+    allowed_axioms: Vec<String>,
+    scanner_version: u32,
+    replay: DependencyReplayRecord,
+}
+
+impl SourceCompilationRecord {
+    fn new(cfg: &ProjectConfig, file: &Path, module: &str) -> Result<Self> {
+        let lp = lake_build::resolve_remote_lean_path(&cfg.root_pkg.pkg_root, None);
+        let lp = format!("{}:{}", lp, cfg.toolchain_lib_lean.display());
+        let imported = resolve_dependency_artifacts(
+            vec![module.to_string()],
+            &lp,
+            &cfg.toolchain_lib_lean,
+            &cfg.lean_githash,
+            lake_build::worktree_auto_link_disabled(&cfg.root_pkg.pkg_root),
+        )?;
+        let dig = imported
+            .iter()
+            .find(|(m, _, _)| m == module)
+            .context("Root module resolved to toolchain instead of project: fail-closed")?
+            .2
+            .clone();
+        Ok(Self {
+            source_path: file.canonicalize()?,
+            source_digest: blake3::hash(&fs::read(file)?).to_hex().to_string(),
+            workspace_config_digest: cfg.canonical_config_digest.clone(),
+            allowed_axioms: crate::splitter::allowed_axioms(),
+            scanner_version: crate::zygote::ZYGOTE_SCANNER_VERSION,
+            replay: DependencyReplayRecord::new(
+                cfg,
+                module,
+                dig,
+                &resolved_environment_digest(&imported)?,
+            )?,
+        })
+    }
+}
+
+pub(crate) fn source_compilation_authorized(store: &TurboStore, root: &Path, file: &Path) -> bool {
+    let lookup = || -> Result<bool> {
+        let cfg = resolve_project_config(root)?;
+        if !verifier_controls_store(store, &cfg)? {
+            return Ok(false);
+        }
+        let path = serde_json::to_string(&file.canonicalize()?)?;
+        let key = blake3::hash(path.as_bytes()).to_hex().to_string();
+        let actual: String = store.conn.query_row(
+            "SELECT record_json FROM source_kernel_compilations WHERE compilation_key = ?1",
+            [&key],
+            |r| r.get(0),
+        )?;
+        let actual: SourceCompilationRecord = serde_json::from_str(&actual)?;
+        Ok(actual == SourceCompilationRecord::new(&cfg, file, &actual.replay.module)?)
+    };
+    lookup().unwrap_or(false)
+}
+
+pub(crate) fn require_source_compilations(
+    store: &TurboStore, root: &Path, files: &[PathBuf], is_untrusted: bool,
+) -> Result<()> {
+    for file in files {
+        if file.file_name().is_some_and(|n| n == "lakefile.lean") { continue; }
+        if source_compilation_authorized(store, root, file) { continue; }
+        anyhow::ensure!(!is_untrusted,
+            "No verifier-controlled source compilation for {}: fail-closed untrusted source gate", file.display());
+        // Checkout-local stores and older CAS entries have no compilation authority.
+        // Check the full source now, including files outside the default target closure.
+        let source = fs::read_to_string(file)?;
+        crate::splitter::reject_checking_weakening(&source)?;
+        ensure_imported_oleans_replayed(store, root, std::slice::from_ref(file))?;
+        let (lean, _, lib, _) = resolve_toolchain_compiler(root, &lake_build::detect_toolchain(root))?;
+        let lp = format!("{}:{}", lake_build::resolve_remote_lean_path(root, None), lib.display());
+        let env = HashMap::from([("LEAN_PATH".to_string(), lp)]);
+        let pkg = optional_package_config(root)?;
+        let args = pkg.as_ref().map(|p| resolve_file_lean_args_in_package(p, file)).unwrap_or_default();
+        let audit = crate::splitter::split_lean_source(&source, &[]).shards.into_iter().map(|sh| sh.name).collect();
+        let out = crate::zygote::run_audited_lean_shard(store, &lean, &env, Some(root), &source, &audit, &args, None)?;
+        anyhow::ensure!(out.status.success(), "Source compilation failed for {}: {}{}",
+            file.display(), String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        anyhow::ensure!(fs::read_to_string(file)? == source, "Source changed during verification: fail-closed");
+    }
+    Ok(())
+}
+
+fn record_source_compilation(
+    store: &TurboStore,
+    cfg: &ProjectConfig,
+    node: &ModuleNode,
+    digest: &str,
+) -> Result<()> {
+    if !node.is_root_pkg || !verifier_controls_store(store, cfg)? {
+        return Ok(());
+    }
+    let record = SourceCompilationRecord::new(cfg, &node.src_path, &node.module_name)?;
+    anyhow::ensure!(
+        record.source_digest == node.src_blake3 && record.replay.artifact_digest == digest,
+        "Source or artifact changed during compilation of {}: fail-closed",
+        node.module_name
+    );
+    let json = serde_json::to_string(&record)?;
+    let path = serde_json::to_string(&record.source_path)?;
+    let key = blake3::hash(path.as_bytes()).to_hex().to_string();
+    store.conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS source_kernel_compilations (
+        compilation_key TEXT PRIMARY KEY, record_json TEXT NOT NULL)",
+    )?;
+    store.conn.execute(
+        "INSERT OR REPLACE INTO source_kernel_compilations VALUES (?1, ?2)",
+        rusqlite::params![key, json],
+    )?;
+    Ok(())
+}
+
 fn replay_resolved_artifacts(
     store: &TurboStore,
     cfg: &ProjectConfig,
@@ -8611,17 +8756,7 @@ fn replay_resolved_artifacts(
     // A user-selected checkout-local store is not a verifier-controlled authority. It may
     // receive ordinary CAS data, but replay must run on every use and no record is accepted.
     let preserve_caller = crate::lake_build::worktree_auto_link_disabled(&cfg.root_pkg.pkg_root);
-    let authority_paths = [
-        store.root.canonicalize()?,
-        store.root.join("state.db").canonicalize()?,
-    ];
-    let controlled_store = std::iter::once(&cfg.root_pkg)
-        .chain(&cfg.dep_pkgs)
-        .all(|p| {
-            p.pkg_root
-                .canonicalize()
-                .is_ok_and(|r| authority_paths.iter().all(|p| !p.starts_with(&r)))
-        });
+    let controlled_store = verifier_controls_store(store, cfg)?;
     if controlled_store {
         store.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS dependency_kernel_replays (
@@ -8631,14 +8766,7 @@ fn replay_resolved_artifacts(
     }
     // Kernel replay is relative to the resolved import environment. A valid child whose
     // interface changes invalidates its parents' records even when their own bytes do not.
-    let mut environment: Vec<_> = imported
-        .iter()
-        .map(|(m, p, dig)| Ok((m.clone(), p.canonicalize()?, dig.clone())))
-        .collect::<Result<_>>()?;
-    environment.sort();
-    let environment_digest = blake3::hash(&serde_json::to_vec(&environment)?)
-        .to_hex()
-        .to_string();
+    let environment_digest = resolved_environment_digest(&imported)?;
     let mut pending = Vec::new();
     for (m, path, dig) in &imported {
         anyhow::ensure!(
@@ -9293,6 +9421,7 @@ pub fn build_project_modules_native(
             if !is_untrusted {
                 record_verified_dep_source(&cfg, node, &dig);
             }
+            record_source_compilation(store, &cfg, node, &dig)?;
             olean_digests.insert(mod_name.clone(), dig);
             report.modules_compiled += 1;
             report.compiled_modules.push(mod_name.clone());
@@ -10738,12 +10867,147 @@ lean_exe «demo-exe» where
 
     #[cfg(unix)]
     #[test]
+    fn test_source_compilation_authority_binds_source_artifacts_and_coverage() -> Result<()> {
+        use crate::worktree_test_support::LakeTree;
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tree = LakeTree::new(
+            "source_authority",
+            &[("P/Target.lean", "theorem target : True := trivial\n")],
+        )?;
+        let target = tree.project.join("P/Target.lean");
+        let mut store = TurboStore::open(Some(&tree.root.join("cache")))?;
+        assert!(!source_compilation_authorized(
+            &store,
+            &tree.project,
+            &target
+        ));
+        let rep = build_project_modules_native(
+            &mut store,
+            &tree.project,
+            &[],
+            "trusted",
+            1,
+            false,
+            true,
+            None,
+        )?;
+        assert_eq!(rep.modules_compiled, 1);
+        assert!(source_compilation_authorized(
+            &store,
+            &tree.project,
+            &target
+        ));
+        let receipt = tree.root.join("receipt.json");
+        crate::pr_verify::run_ci_verify_command(
+            &mut store,
+            true,
+            "trusted".into(),
+            tree.project.clone(),
+            Some(receipt.clone()),
+            None,
+            true,
+            None,
+        )?;
+        assert!(receipt.exists());
+        fs::remove_file(&receipt)?;
+        // A valid unrelated artifact cannot authorize changed proof source.
+        let source = fs::read(&target)?;
+        fs::write(&target, "theorem bad : False := by trivial\n")?;
+        assert!(!source_compilation_authorized(
+            &store,
+            &tree.project,
+            &target
+        ));
+        fs::write(&target, source)?;
+        assert!(source_compilation_authorized(
+            &store,
+            &tree.project,
+            &target
+        ));
+        let ilean = tree.project.join(".lake/build/lib/lean/P/Target.ilean");
+        let bytes = fs::read(&ilean)?;
+        fs::write(&ilean, b"changed companion")?;
+        assert!(!source_compilation_authorized(
+            &store,
+            &tree.project,
+            &target
+        ));
+        fs::write(&ilean, bytes)?;
+        assert!(source_compilation_authorized(
+            &store,
+            &tree.project,
+            &target
+        ));
+        // Default target P remains valid; Scratch is outside its build closure.
+        let scratch = tree.project.join("Scratch.lean");
+        fs::write(&scratch, "theorem scratch : False := by trivial\n")?;
+        assert!(source_compilation_authorized(
+            &store,
+            &tree.project,
+            &target
+        ));
+        assert!(!source_compilation_authorized(
+            &store,
+            &tree.project,
+            &scratch
+        ));
+        let count: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM actions", [], |r| r.get(0))?;
+        let err = crate::lake_build::seed_project_theorem_shards(
+            &mut store,
+            &tree.project,
+            &crate::lake_build::detect_toolchain(&tree.project),
+            "trusted",
+            false,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("Scratch.lean"), "{err:#}");
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT count(*) FROM actions", [], |r| r.get::<_, i64>(0))?,
+            count
+        );
+        let err = crate::pr_verify::run_ci_verify_command(
+            &mut store,
+            true,
+            "trusted".into(),
+            tree.project.clone(),
+            Some(receipt.clone()),
+            None,
+            true,
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("Scratch.lean"), "{err:#}");
+        assert!(!receipt.exists());
+        // Even a record stored at the right key is rechecked in full on read.
+        store.conn.execute(
+            "UPDATE source_kernel_compilations SET record_json = '{}'",
+            [],
+        )?;
+        assert!(!source_compilation_authorized(
+            &store,
+            &tree.project,
+            &target
+        ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn test_root_freshness_manifests_cannot_authorize_ci_or_fast_checks() -> Result<()> {
         use crate::worktree_test_support::{LakeTree, FORGED_DEPENDENCY_SOURCE};
         let _guard = crate::pack::tests::env_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        for poisoned_root in [false, true] {
+        for (attack, version) in [0, 1, 2].into_iter().flat_map(|attack| {
+            [0, crate::zygote::ZYGOTE_REPLAY_VERSION].map(|version| (attack, version))
+        }) {
+            let poisoned_root = attack != 0;
             let tree = LakeTree::new(
                 "root_replay",
                 &[("P/Target.lean", "theorem target : True := trivial\n")],
@@ -10752,7 +11016,11 @@ lean_exe «demo-exe» where
             if poisoned_root {
                 fs::write(
                     &target,
-                    format!("{FORGED_DEPENDENCY_SOURCE}\ntheorem other : True := trivial\n"),
+                    if attack == 1 {
+                        format!("{FORGED_DEPENDENCY_SOURCE}\ntheorem other : True := trivial\n")
+                    } else {
+                        "import Lean\ntheorem other : True := trivial\n".to_string()
+                    },
                 )?;
                 tree.lake(&["build", "P.Target"])?;
                 // The checkout can rewrite all freshness evidence around a poisoned artifact.
@@ -10800,59 +11068,62 @@ lean_exe «demo-exe» where
                 .join(".lake/build/.turbo_verified_sources.json");
             let hashes = BTreeMap::from([("P/Target.lean".to_string(), node.src_blake3.clone())]);
             let mut store = TurboStore::open(Some(&tree.root.join("cache")))?;
-            for version in [0, crate::zygote::ZYGOTE_REPLAY_VERSION] {
-                let mut manifest: VerifiedDepManifest =
-                    serde_json::from_slice(&fs::read(&manifest_path)?)?;
-                manifest
-                    .modules
-                    .get_mut("P/Target.lean")
-                    .unwrap()
-                    .replay_version = version;
-                fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
-                assert!(
-                    crate::lake_build::are_all_project_oleans_up_to_date(&tree.project, &hashes),
-                    "fixture must reach root freshness shortcut"
-                );
-                assert_eq!(
-                    crate::lake_build::fresh_prebuilt_module_import(&tree.project, &target)
-                        .as_deref(),
-                    Some("P.Target")
-                );
-                assert!(crate::lake_build::resolve_prebuilt_module_import(
-                    &store,
-                    &tree.project,
-                    &target
-                )
-                .is_none());
-                let receipt = tree.root.join("receipt.json");
-                let err = crate::pr_verify::run_ci_verify_command(
-                    &mut store,
-                    true,
-                    "trusted".into(),
-                    tree.project.clone(),
-                    Some(receipt.clone()),
-                    None,
-                    true,
-                    None,
-                )
-                .unwrap_err();
-                assert!(format!("{err:#}").contains("KernelReplay"), "{err:#}");
-                assert!(!receipt.exists());
-                let attestations: i64 =
-                    store
-                        .conn
-                        .query_row("SELECT count(*) FROM attestations", [], |r| r.get(0))?;
-                let completed: i64 = store.conn.query_row(
-                    "SELECT count(*) FROM actions WHERE status = 'completed'",
-                    [],
-                    |r| r.get(0),
-                )?;
-                assert_eq!(attestations, 0, "rejected root must not be attested");
-                assert_eq!(
-                    completed, 0,
-                    "rejected root must not seed actions or shards"
-                );
-            }
+            let mut manifest: VerifiedDepManifest =
+                serde_json::from_slice(&fs::read(&manifest_path)?)?;
+            manifest
+                .modules
+                .get_mut("P/Target.lean")
+                .unwrap()
+                .replay_version = version;
+            fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
+            assert!(
+                crate::lake_build::are_all_project_oleans_up_to_date(&tree.project, &hashes),
+                "fixture must reach root freshness shortcut"
+            );
+            assert_eq!(
+                crate::lake_build::fresh_prebuilt_module_import(&tree.project, &target)
+                    .as_deref(),
+                Some("P.Target")
+            );
+            assert!(crate::lake_build::resolve_prebuilt_module_import(
+                &store,
+                &tree.project,
+                &target
+            )
+            .is_none());
+            let receipt = tree.root.join("receipt.json");
+            let err = crate::pr_verify::run_ci_verify_command(
+                &mut store,
+                true,
+                "trusted".into(),
+                tree.project.clone(),
+                Some(receipt.clone()),
+                None,
+                true,
+                None,
+            )
+            .unwrap_err();
+            let diagnostic = format!("{err:#}");
+            assert!(
+                diagnostic.contains("KernelReplay")
+                    || (diagnostic.contains("Lean compilation failed") || diagnostic.contains("Source compilation failed")),
+                "{diagnostic}"
+            );
+            assert!(!receipt.exists());
+            let attestations: i64 =
+                store
+                    .conn
+                    .query_row("SELECT count(*) FROM attestations", [], |r| r.get(0))?;
+            let completed: i64 = store.conn.query_row(
+                "SELECT count(*) FROM actions WHERE status = 'completed'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(attestations, 0, "rejected root must not be attested");
+            assert_eq!(
+                completed, 0,
+                "rejected root must not seed actions or shards"
+            );
             if poisoned_root {
                 for decl in [Some("bad".to_string()), None] {
                     let outcome = crate::check::evaluate_check_command_value(
