@@ -8599,6 +8599,7 @@ fn ensure_module_closure_replayed(
     replay_resolved_artifacts(store, cfg, imported, lean_path)
 }
 
+// Storage separation only: SQLite rows still require a current-process verification receipt.
 fn verifier_controls_store(store: &TurboStore, cfg: &ProjectConfig) -> Result<bool> {
     let authority_paths = [
         store.root.canonicalize()?,
@@ -8624,11 +8625,16 @@ fn resolved_environment_digest(imported: &[(String, PathBuf, String)]) -> Result
         .to_string())
 }
 
-// Source compilation performed in this verifier process remains evidence even when the
-// selected store is checkout-local. Never persist or accept project-writable source records.
-// Dependency replay authority remains separate and still replays every checkout-local use.
+// Source compilation authority is process-local, including for external cache directories.
+// SQLite stores optional cache data only; every accepted row needs a matching memory receipt.
+// Dependency replay remains separate and replays every checkout-local use.
 type SourceCompilationMemory = HashMap<(PathBuf, PathBuf), String>;
 static SOURCE_COMPILATION_MEMORY: OnceLock<Mutex<SourceCompilationMemory>> = OnceLock::new();
+// SQLite is an untrusted, user-selectable cache. Only receipts created after successful
+// verification in this process confer authority; imported rows always require verification.
+// No disk key or database permission is treated as authentication.
+type ReplayMemory = HashMap<(PathBuf, String), String>;
+static REPLAY_MEMORY: OnceLock<Mutex<ReplayMemory>> = OnceLock::new();
 
 /// Unlike replay authority, this record establishes compilation from these exact source
 /// bytes. Only native compilation followed by the root kernel/policy audit may write it.
@@ -8699,6 +8705,10 @@ fn source_compilation_authorized_with_trust(store: &TurboStore, root: &Path, fil
                 .get(&(store.root.canonicalize()?, source_path)).cloned()
                 .context("No source compilation in this verifier process")?
         };
+        let receipt = SOURCE_COMPILATION_MEMORY.get_or_init(|| Mutex::new(HashMap::new()))
+            .lock().map_err(|_| anyhow::anyhow!("Source provenance memory poisoned"))?
+            .get(&(store.root.canonicalize()?, file.canonicalize()?)).cloned();
+        anyhow::ensure!(receipt.as_ref() == Some(&actual), "Unauthenticated source compilation row");
         let actual: SourceCompilationRecord = serde_json::from_str(&actual)?;
         Ok(actual == SourceCompilationRecord::new(&cfg, file, &actual.replay.module, is_untrusted)?)
     };
@@ -8765,11 +8775,10 @@ fn record_source_compilation(
             "INSERT OR REPLACE INTO source_kernel_compilations VALUES (?1, ?2)",
             rusqlite::params![key, json],
         )?;
-    } else {
-        SOURCE_COMPILATION_MEMORY.get_or_init(|| Mutex::new(HashMap::new()))
-            .lock().map_err(|_| anyhow::anyhow!("Source provenance memory poisoned"))?
-            .insert((store.root.canonicalize()?, record.source_path), json);
     }
+    SOURCE_COMPILATION_MEMORY.get_or_init(|| Mutex::new(HashMap::new()))
+        .lock().map_err(|_| anyhow::anyhow!("Source provenance memory poisoned"))?
+        .insert((store.root.canonicalize()?, record.source_path), json);
     Ok(())
 }
 
@@ -8781,6 +8790,24 @@ fn replay_resolved_artifacts(
 ) -> Result<usize> {
     if imported.is_empty() {
         return Ok(0);
+    }
+    for (module, _, _) in &imported {
+        let rel = format!("{}.lean", module_name_to_rel_slash(module));
+        for pkg in std::iter::once(&cfg.root_pkg).chain(&cfg.dep_pkgs) {
+            let base = pkg.pkg_root.join(&pkg.src_dir);
+            let dirs = std::iter::once(None)
+                .chain(pkg.libs.iter().map(|l| l.src_dir.as_ref()))
+                .chain(pkg.exes.iter().map(|e| e.src_dir.as_ref()));
+            for dir in dirs {
+                let source = dir.map_or_else(|| base.join(&rel), |d| base.join(d).join(&rel));
+                match fs::read_to_string(&source) {
+                    Ok(text) => crate::splitter::reject_checking_weakening(&text)
+                        .with_context(|| format!("[TurboLean.KernelReplay] Imported source hygiene violation for `{module}` in {}", source.display()))?,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+                    Err(e) => return Err(e).with_context(|| format!("Cannot inspect imported source {}", source.display())),
+                }
+            }
+        }
     }
     // A user-selected checkout-local store is not a verifier-controlled authority. It may
     // receive ordinary CAS data, but replay must run on every use and no record is accepted.
@@ -8818,7 +8845,11 @@ fn replay_resolved_artifacts(
         } else {
             None
         };
-        if cached.as_ref() != Some(&record) {
+        let receipt = REPLAY_MEMORY.get_or_init(|| Mutex::new(HashMap::new()))
+            .lock().map_err(|_| anyhow::anyhow!("Replay provenance memory poisoned"))?
+            .get(&(store.root.canonicalize()?, key.clone())).cloned();
+        if cached.as_ref() != Some(&record)
+            || receipt.as_deref() != Some(serde_json::to_string(&record)?.as_str()) {
             crate::zygote::kernel_replay_modules_with_zygote(
                 store,
                 cfg,
@@ -8843,13 +8874,16 @@ fn replay_resolved_artifacts(
                 "INSERT OR REPLACE INTO dependency_kernel_replays (replay_key, record_json) VALUES (?1, ?2)",
                 rusqlite::params![key, serde_json::to_string(record)?],
             )?;
+            REPLAY_MEMORY.get_or_init(|| Mutex::new(HashMap::new()))
+                .lock().map_err(|_| anyhow::anyhow!("Replay provenance memory poisoned"))?
+                .insert((store.root.canonicalize()?, key.clone()), serde_json::to_string(record)?);
         }
     }
     Ok(pending.len())
 }
 
 /// `check` / trusted `pr-verify` gate. Project manifests establish freshness only; replay
-/// authority comes exclusively from the verifier's store or successful independent replay now.
+/// authority comes exclusively from successful independent replay in this verifier process.
 pub(crate) fn ensure_imported_oleans_replayed(
     store: &TurboStore,
     canon_dir: &Path,
@@ -10933,6 +10967,19 @@ lean_exe «demo-exe» where
             &tree.project,
             &target
         ));
+        // A byte-for-byte valid SQLite row in a different configurable store has no
+        // process receipt. Even world-writable external caches cannot grant authority.
+        let external = TurboStore::open(Some(&tree.root.join("external-source-cache")))?;
+        external.conn.execute_batch("CREATE TABLE source_kernel_compilations (
+            compilation_key TEXT PRIMARY KEY, record_json TEXT NOT NULL)")?;
+        let (key_copy, json_copy): (String, String) = store.conn.query_row(
+            "SELECT compilation_key, record_json FROM source_kernel_compilations", [],
+            |r| Ok((r.get(0)?, r.get(1)?)))?;
+        external.conn.execute("INSERT INTO source_kernel_compilations VALUES (?1, ?2)",
+            rusqlite::params![key_copy, json_copy])?;
+        assert!(!source_compilation_authorized(&external, &tree.project, &target));
+        assert!(require_source_compilations(&external, &tree.project,
+            std::slice::from_ref(&target), true).is_err());
         // A record from another csimp permission cannot authorize this policy.
         let cfg = resolve_project_config(&tree.project)?;
         let mut different_policy = SourceCompilationRecord::new(&cfg, &target, "P.Target", false)?;
@@ -11608,6 +11655,35 @@ lean_exe «demo-exe» where
         let targets = [proj.join("App.lean")];
         assert_eq!(ensure_imported_oleans_replayed(&store, &proj, &targets)?, 1);
         assert_eq!(ensure_imported_oleans_replayed(&store, &proj, &targets)?, 0);
+        // Imported SQLite rows cannot suppress replay, even when they are exact valid
+        // records generated for these bytes and policies by another store.
+        let external = TurboStore::open(Some(&dir.join("external-replay-cache")))?;
+        external.conn.execute_batch("CREATE TABLE dependency_kernel_replays (
+            replay_key TEXT PRIMARY KEY, record_json TEXT NOT NULL)")?;
+        let (key_copy, json_copy): (String, String) = store.conn.query_row(
+            "SELECT replay_key, record_json FROM dependency_kernel_replays", [],
+            |r| Ok((r.get(0)?, r.get(1)?)))?;
+        external.conn.execute("INSERT INTO dependency_kernel_replays VALUES (?1, ?2)",
+            rusqlite::params![key_copy, json_copy])?;
+        assert_eq!(ensure_imported_oleans_replayed(&external, &proj, &targets)?, 1);
+        // The valid binary and warm receipt must not hide forbidden source directives.
+        // Exercise both dependency and root package sources without rebuilding artifacts.
+        let good_source = fs::read(dep.join("Dep/Bad.lean"))?;
+        for source in [dep.join("Dep/Bad.lean"), proj.join("Dep/Bad.lean")] {
+            fs::create_dir_all(source.parent().unwrap())?;
+            fs::write(&source, "set_option debug.skipKernelTC true in\ntheorem bad : True := True.intro\n")?;
+            if source.starts_with(&dep) {
+                let out = Command::new("lake").args(["build", "Dep.Bad"]).current_dir(&proj).output()?;
+                anyhow::ensure!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            }
+            let err = ensure_imported_oleans_replayed(&store, &proj, &targets).unwrap_err();
+            assert!(format!("{err:#}").contains("Imported source hygiene violation"), "{err:#}");
+            if source.starts_with(&dep) {
+                fs::write(&source, &good_source)?;
+                let out = Command::new("lake").args(["build", "Dep.Bad"]).current_dir(&proj).output()?;
+                anyhow::ensure!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            } else { fs::remove_file(&source)?; }
+        }
         store.conn.execute(
             "UPDATE dependency_kernel_replays SET record_json = '{}'",
             [],
