@@ -176,6 +176,7 @@ impl Project {
 impl Drop for Project {
     fn drop(&mut self) {
         stop_daemons(&self.0.join("cache"));
+        stop_daemons(&self.0.join("staging"));
         let _ = fs::remove_dir_all(&self.0);
     }
 }
@@ -313,5 +314,142 @@ fn check_decl_rejects_sorry_target_and_keeps_prefix_stubs() {
             );
         }
         assert_rejected(&p, "H.lean", "sneaky", daemon);
+    }
+}
+
+#[test]
+fn whole_file_check_preserves_original_filename_and_dir_without_daemon() {
+    if !lean_available() {
+        return;
+    }
+    for daemon in [false, true] {
+        let p = Project::new(daemon);
+        let sub = p.0.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("fixture.txt"), "hello-from-sibling-fixture\n").unwrap();
+        // `#eval` makes the file ineligible for sharding (`eligible_for_sharding == false`),
+        // exercising the whole-file check path (including `run_audited_lean_shard_at` when
+        // `TURBO_LEAN_NO_DAEMON=1` or under `module` / `IO.Process.exit` audit fallback).
+        let canon_sub = sub.canonicalize().unwrap_or_else(|_| sub.clone());
+        let expected_file = canon_sub.join("WithFixture.lean");
+        fs::write(
+            sub.join("WithFixture.lean"),
+            r#"import Lean
+elab "__file__" : term => do
+  return Lean.mkStrLit (← Lean.getFileName)
+elab "__dir__" : term => do
+  let fn ← Lean.getFileName
+  let d := (System.FilePath.mk fn).parent.getD (System.FilePath.mk ".")
+  return Lean.mkStrLit d.toString
+def embedded : String := include_str "fixture.txt"
+#eval do
+  let s ← IO.FS.readFile ((System.FilePath.mk __dir__) / "fixture.txt")
+  if s.trimAscii.toString != "hello-from-sibling-fixture" then
+    throw <| IO.userError s!"unexpected fixture: {s}"
+  IO.println s!"FILE={__file__}"
+theorem fixture_eq : embedded = "hello-from-sibling-fixture\n" := rfl
+"#,
+        )
+        .unwrap();
+        let out = p.run(&["check", "sub/WithFixture.lean"], daemon);
+        assert!(
+            out.status.success() && status(&out) == "file_verified",
+            "whole-file check sub/WithFixture.lean (daemon={daemon}) must preserve __file__/__dir__:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(
+            v["mode"],
+            if daemon {
+                "zygote_whole_file"
+            } else {
+                "whole_file"
+            },
+            "unexpected check json: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let eval_out = v["stdout"].as_str().unwrap_or_default();
+        if !daemon {
+            assert!(
+                eval_out.contains(&format!("FILE={}", expected_file.display())),
+                "expected __file__ to point to {}, got json: {}",
+                expected_file.display(),
+                String::from_utf8_lossy(&out.stdout)
+            );
+        } else {
+            let msgs_joined = v["messages"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|m| m.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            let combined = format!("{eval_out}\n{msgs_joined}");
+            assert!(
+                combined.contains("FILE=")
+                    && combined.contains("WithFixture.lean")
+                    && !combined.contains("TurboAuditedShard_"),
+                "expected __file__ to preserve WithFixture.lean, got json: {}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+
+        // Also exercise `--project-dir` from a different working directory.
+        let outside = std::env::temp_dir().join(format!(
+            "turbo_outside_cwd_{}_{}",
+            daemon,
+            std::process::id()
+        ));
+        fs::create_dir_all(&outside).unwrap();
+        let mut ext_cmd = Command::new(env!("CARGO_BIN_EXE_turbo-lean"));
+        ext_cmd
+            .current_dir(&outside)
+            .args(["--json", "--cache-dir"])
+            .arg(p.0.join("cache"))
+            .args([
+                "check",
+                "sub/WithFixture.lean",
+                "--project-dir",
+                &p.0.to_string_lossy(),
+            ])
+            .env("TURBO_LEAN_HOME", p.0.join("cache"))
+            .env("TURBO_LEAN_STAGING_DIR", p.0.join("staging"))
+            .env("TURBO_LEAN_TELEMETRY", "off")
+            .env("TURBO_LEAN_TIMEOUT_MS", "600000")
+            .env("LEAN_NUM_THREADS", "4");
+        if !daemon {
+            ext_cmd.env("TURBO_LEAN_NO_DAEMON", "1");
+        }
+        let ext_out = ext_cmd.output().unwrap();
+        let _ = fs::remove_dir_all(&outside);
+        assert!(
+            ext_out.status.success() && status(&ext_out) == "file_verified",
+            "whole-file check with --project-dir (daemon={daemon}) failed:\n{}{}",
+            String::from_utf8_lossy(&ext_out.stdout),
+            String::from_utf8_lossy(&ext_out.stderr)
+        );
+
+        // Also verify whole-file soundness rejection still fires on this path when a hidden sorry is added.
+        fs::write(
+            sub.join("BadFixture.lean"),
+            r#"import Lean
+def embedded : String := include_str "fixture.txt"
+macro "cheat" : term => return ⟨Lean.Syntax.node .none (Lean.Name.mkStr4 "Lean" "Parser" "Term" ("sor" ++ "ry")) #[Lean.Syntax.atom .none ("sor" ++ "ry")]⟩
+#eval IO.println embedded.trimAscii
+#guard_msgs (drop warning) in
+theorem bad : False := cheat
+"#,
+        )
+        .unwrap();
+        let bad_out = p.run(&["check", "sub/BadFixture.lean"], daemon);
+        assert!(
+            !bad_out.status.success(),
+            "whole-file check sub/BadFixture.lean (daemon={daemon}) must still reject hidden sorry:\n{}{}",
+            String::from_utf8_lossy(&bad_out.stdout),
+            String::from_utf8_lossy(&bad_out.stderr)
+        );
     }
 }

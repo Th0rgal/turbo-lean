@@ -1530,9 +1530,10 @@ def main (args : List String) : IO Unit := do
       ((modeFlag.startsWith "batch_fission:" || modeFlag.startsWith "race_candidates:") && !stubs.isEmpty)
     let evalMode := modeFlag == "eval" || modeFlag.startsWith "eval:"
     -- `strict_all`: no `sorry` stub is exempt anywhere, prefix checkpoints included (whole-file audits).
-    let strictAll := modeFlag == "strict_all"
-    let (customFileName?, customCwd?, emitOlean?) := if modeFlag.startsWith "eval:" then
-      let metaParts := ((modeFlag.drop 5).toString).splitOn ":"
+    let strictAll := modeFlag == "strict_all" || modeFlag.startsWith "strict_all:"
+    let (customFileName?, customCwd?, emitOlean?) := if modeFlag.startsWith "eval:" || modeFlag.startsWith "strict_all:" then
+      let pfxLen := if modeFlag.startsWith "eval:" then 5 else 11
+      let metaParts := ((modeFlag.drop pfxLen).toString).splitOn ":"
       let hexFn := metaParts.headD ""
       let hexCwd := metaParts.drop 1 |>.headD ""
       let fnOpt := if hexFn.isEmpty then none else some (TurboLean.ZygoteWorker.decodeHexToString hexFn)

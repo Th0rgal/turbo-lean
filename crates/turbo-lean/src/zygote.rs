@@ -3518,6 +3518,7 @@ pub(crate) fn run_audited_lean_shard(
         lean_bin,
         env_vars,
         cwd,
+        None,
         source,
         audit,
         true,
@@ -3533,6 +3534,7 @@ pub(crate) fn run_audited_lean_shard_at(
     lean_bin: &Path,
     env_vars: &std::collections::HashMap<String, String>,
     cwd: Option<&Path>,
+    source_path: Option<&Path>,
     source: &str,
     audit: &std::collections::HashSet<String>,
     allow_prefix_stubs: bool,
@@ -3551,14 +3553,23 @@ pub(crate) fn run_audited_lean_shard_at(
         }
     }
     let _guard = TmpDirGuard(tmp_dir.clone());
-    let lean_file = tmp_dir.join(format!("{}.lean", mod_name));
-    fs::write(&lean_file, source)?;
+    let (lean_file, root_dir) = if let Some(orig) = source_path {
+        let root = cwd
+            .filter(|d| orig.starts_with(d))
+            .or_else(|| orig.parent())
+            .unwrap_or(&tmp_dir);
+        (orig.to_path_buf(), root.to_path_buf())
+    } else {
+        let lf = tmp_dir.join(format!("{}.lean", mod_name));
+        fs::write(&lf, source)?;
+        (lf, tmp_dir.clone())
+    };
     let mut cmd = Command::new(lean_bin);
     cmd.args(crate::module_builder::filter_allowed_lean_args(lean_args))
         .arg("-Ddebug.skipKernelTC=false")
         .arg(&lean_file)
         .arg("-R")
-        .arg(&tmp_dir)
+        .arg(&root_dir)
         .arg("-o")
         .arg(tmp_dir.join(format!("{}.olean", mod_name)))
         .envs(env_vars);
@@ -4039,6 +4050,7 @@ pub fn eval_with_zygote_pool_audit_all(
     env_vars: &std::collections::HashMap<String, String>,
     lean_bin: &Path,
     shard_source: &str,
+    file_name: Option<&str>,
     timeout_ms: Option<u64>,
     lean_args: &[String],
 ) -> Result<ZygoteEvalReply> {
@@ -4051,7 +4063,7 @@ pub fn eval_with_zygote_pool_audit_all(
         shard_source,
         false,
         false,
-        None,
+        file_name,
         timeout_ms,
         None,
         lean_args,
@@ -4316,6 +4328,36 @@ fn eval_with_zygote_pool_inner(
     .map(|(rep, _, _)| rep)
 }
 
+fn encode_mode_with_file_and_cwd(
+    base: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    file_name: Option<&str>,
+) -> String {
+    let caller_cwd = env_vars
+        .get("TURBO_LEAN_CALLER_CWD")
+        .cloned()
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string())
+        })
+        .unwrap_or_default();
+    let hex_fn = file_name
+        .filter(|s| !s.is_empty())
+        .map(|s| hex_encode_bytes(s.as_bytes()))
+        .unwrap_or_default();
+    let hex_cwd = if caller_cwd.is_empty() {
+        String::new()
+    } else {
+        hex_encode_bytes(caller_cwd.as_bytes())
+    };
+    if hex_fn.is_empty() && hex_cwd.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}:{hex_fn}:{hex_cwd}")
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn eval_with_zygote_pool_inner_with_context(
     store: &TurboStore,
@@ -4345,7 +4387,7 @@ fn eval_with_zygote_pool_inner_with_context(
                 "Fast-verify renamed declarations are forbidden in `strict_all` whole-file audits"
             );
         }
-        "strict_all".to_string()
+        encode_mode_with_file_and_cwd("strict_all", env_vars, file_name)
     } else {
         stub_mode_flag(allow_stub, stub_targets, shard_source)?
     };
@@ -5129,29 +5171,7 @@ fn eval_with_zygote_pool_attempt(
                 (rl, None, None)
             }
         } else {
-            let caller_cwd = env_vars
-                .get("TURBO_LEAN_CALLER_CWD")
-                .cloned()
-                .or_else(|| {
-                    std::env::current_dir()
-                        .ok()
-                        .map(|p| p.to_string_lossy().to_string())
-                })
-                .unwrap_or_default();
-            let hex_fn = file_name
-                .filter(|s| !s.is_empty())
-                .map(|s| hex_encode_bytes(s.as_bytes()))
-                .unwrap_or_default();
-            let hex_cwd = if caller_cwd.is_empty() {
-                String::new()
-            } else {
-                hex_encode_bytes(caller_cwd.as_bytes())
-            };
-            let mode_flag = if hex_fn.is_empty() && hex_cwd.is_empty() {
-                "eval".to_string()
-            } else {
-                format!("eval:{}:{}", hex_fn, hex_cwd)
-            };
+            let mode_flag = encode_mode_with_file_and_cwd("eval", env_vars, file_name);
             if let Some((prefix_key, prefix_code, decl_code)) =
                 split_eval_body_into_prefix_and_cmds(&body_code)
             {

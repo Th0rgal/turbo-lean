@@ -445,13 +445,12 @@ pub(crate) fn scan_lean_norm_literal_end(src: &str, start: usize) -> Option<usiz
     scan_lean_interpolated_string_end(src, start).or_else(|| scan_lean_literal_end(src, start))
 }
 
-/// Strip comments while preserving string/character literals, exact byte offsets, and newline counts.
-pub fn strip_lean_comments(src: &str) -> String {
-    if !src.contains("--") && !src.contains("/-") {
-        return src.to_string();
-    }
+fn scan_lean_comments_with(
+    src: &str,
+    out: &mut Vec<u8>,
+    on_line_comment: &mut dyn FnMut(usize, usize),
+) {
     let bytes = src.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     let mut block_depth = 0usize;
     let mut in_string = false;
@@ -520,8 +519,9 @@ pub fn strip_lean_comments(src: &str) -> String {
                 while j < end {
                     if interp_depth > 0 {
                         if let Some(sub_end) = scan_lean_norm_literal_end(src, j) {
-                            let stripped = strip_lean_comments(&src[j..sub_end]);
-                            out.extend_from_slice(stripped.as_bytes());
+                            scan_lean_comments_with(&src[j..sub_end], out, &mut |s, e| {
+                                on_line_comment(j + s, j + e);
+                            });
                             j = sub_end;
                             continue;
                         }
@@ -546,10 +546,12 @@ pub fn strip_lean_comments(src: &str) -> String {
                             continue;
                         }
                         if j + 1 < end && bytes[j] == b'-' && bytes[j + 1] == b'-' {
+                            let c_start = j;
                             while j < end && bytes[j] != b'\n' {
                                 out.push(b' ');
                                 j += 1;
                             }
+                            on_line_comment(c_start, j);
                             continue;
                         }
                         match bytes[j] {
@@ -591,10 +593,12 @@ pub fn strip_lean_comments(src: &str) -> String {
         ) && bytes[i] == b'-'
             && bytes[i + 1] == b'-'
         {
+            let c_start = i;
             while i < bytes.len() && bytes[i] != b'\n' {
                 out.push(b' ');
                 i += 1;
             }
+            on_line_comment(c_start, i);
         } else if crate::c_abi::verify_lexer_comment_guard(
             in_string,
             in_char,
@@ -612,7 +616,15 @@ pub fn strip_lean_comments(src: &str) -> String {
             i += 1;
         }
     }
+}
 
+/// Strip comments while preserving string/character literals, exact byte offsets, and newline counts.
+pub fn strip_lean_comments(src: &str) -> String {
+    if !src.contains("--") && !src.contains("/-") {
+        return src.to_string();
+    }
+    let mut out = Vec::with_capacity(src.len());
+    scan_lean_comments_with(src, &mut out, &mut |_, _| {});
     String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
@@ -3594,8 +3606,20 @@ impl FastVerifyMap {
         let mut orig_to_gen = std::collections::HashMap::new();
         let mut gen_to_orig = std::collections::HashMap::new();
 
-        for line in src.lines() {
-            let trimmed = line.trim();
+        let mut line_comments = Vec::new();
+        if src.contains("--") {
+            let mut scratch = Vec::with_capacity(src.len());
+            scan_lean_comments_with(src, &mut scratch, &mut |s, e| line_comments.push((s, e)));
+        }
+        for (c_start, c_end) in line_comments {
+            let line_start = src[..c_start].rfind('\n').map_or(0, |p| p + 1);
+            if !src[line_start..c_start]
+                .chars()
+                .all(|c| c.is_whitespace() && c != '\n')
+            {
+                continue;
+            }
+            let trimmed = src[c_start..c_end].trim();
             if let Some(rest) = trimmed.strip_prefix("-- @turbo_fast_verify") {
                 if !rest.starts_with(' ') {
                     anyhow::bail!("Malformed fast-verify directive line: `{}`", trimmed);
@@ -6347,6 +6371,31 @@ end MathlibEdgeCases
         let dup_dir = format!("{}\n{}", first_dir, fast_src);
         let dup_shards = split_lean_source(&dup_dir, &[]).shards;
         assert!(FastVerifyMap::parse_and_validate(&dup_dir, &dup_shards).is_err());
+
+        // `-- @turbo_fast_verify` inside block comments, multiline strings, raw strings, or
+        // interpolated strings is not a real line-comment directive and must be ignored.
+        let benign_docs = concat!(
+            "/- Docs mentioning:\n",
+            "   -- @turbo_fast_verify malformed\n",
+            "   /- nested\n",
+            "      -- @turbo_fast_verify 00\n",
+            "   -/\n",
+            "-/\n",
+            "def strDoc : String := \"line1\n  -- @turbo_fast_verify malformed\nline3\"\n",
+            "def rawDoc : String := r#\"line1\n-- @turbo_fast_verify malformed\n\"#\n",
+            "def interpDoc : String := s!\"line1\n-- @turbo_fast_verify malformed {1 + 1}\"\n",
+            "def trailingCode : Nat := 1 -- @turbo_fast_verify malformed\n",
+            "theorem clean_thm : strDoc.length > 0 := by decide\n",
+        );
+        let benign_shards = split_lean_source(benign_docs, &[]).shards;
+        let benign_map = FastVerifyMap::parse_and_validate(benign_docs, &benign_shards)
+            .expect("comments/strings mentioning @turbo_fast_verify must not fail validation");
+        assert!(benign_map.is_empty());
+
+        // Actual standalone line-comment directives that are malformed must still fail closed.
+        let real_bad = "  -- @turbo_fast_verify malformed\ntheorem t : True := trivial\n";
+        let real_bad_shards = split_lean_source(real_bad, &[]).shards;
+        assert!(FastVerifyMap::parse_and_validate(real_bad, &real_bad_shards).is_err());
     }
 
     #[test]

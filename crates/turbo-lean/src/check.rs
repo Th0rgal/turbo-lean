@@ -1324,6 +1324,7 @@ fn check_directory(
                                                 Path::new(lean_bin_ref),
                                                 env_ref,
                                                 Some(canon_ref),
+                                                None,
                                                 &fast_src,
                                                 &uncached_names,
                                                 true,
@@ -1382,6 +1383,7 @@ fn check_directory(
                                             Path::new(lean_bin_ref),
                                             env_ref,
                                             Some(canon_ref),
+                                            None,
                                             &coal_src,
                                             &uncached_names,
                                             true,
@@ -3523,6 +3525,7 @@ fn check_single_file(
                                     Path::new(lean_bin_ref),
                                     env_ref,
                                     Some(canon_ref),
+                                    None,
                                     &shard_src_owned,
                                     &HashSet::from([rooted_target]),
                                     true,
@@ -3682,15 +3685,19 @@ fn check_single_file(
                 let t = l.split("--").next().unwrap_or(l).trim();
                 t == "module" || t.starts_with("module ")
             });
+        let mut zygote_env = env_vars.clone();
+        zygote_env
+            .entry("TURBO_LEAN_CALLER_CWD".to_string())
+            .or_insert_with(|| canon_dir.to_string_lossy().to_string());
         if can_use_zygote_eval {
             if let Some(rep) = crate::zygote::try_local_zygote_eval_with_args(
                 store,
-                &env_vars,
+                &zygote_env,
                 Path::new(&lean_bin),
                 toolchain,
                 &local_lean_path,
                 src,
-                Some(&orig_display),
+                Some(&canon_resolved_initial.to_string_lossy()),
                 0,
                 &file_lean_args,
             )
@@ -3727,6 +3734,7 @@ fn check_single_file(
                 Path::new(&lean_bin),
                 &env_vars,
                 Some(canon_dir),
+                Some(canon_resolved_initial),
                 src,
                 &names,
                 false,
@@ -3762,9 +3770,10 @@ fn check_single_file(
                     store,
                     toolchain,
                     &local_lean_path,
-                    &env_vars,
+                    &zygote_env,
                     Path::new(&lean_bin),
                     src,
+                    Some(&canon_resolved_initial.to_string_lossy()),
                     Some(crate::zygote::remaining_timeout_ms(None, *t0)),
                     &file_lean_args,
                 )
@@ -3789,6 +3798,7 @@ fn check_single_file(
                     Path::new(&lean_bin),
                     &env_vars,
                     Some(canon_dir),
+                    Some(canon_resolved_initial),
                     src,
                     &names,
                     false,
