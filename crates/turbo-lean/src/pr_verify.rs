@@ -4261,6 +4261,7 @@ pub fn run_pr_verify_command(
             untrusted_deps_built = true;
         } else {
             lake_rechecked_modules = crate::lake_build::lake_recheck_dependents(
+                store,
                 &canon_dir,
                 &classification.altered_interface_files,
                 Some(&base),
@@ -4276,6 +4277,10 @@ pub fn run_pr_verify_command(
                 crate::lake_build::lake_build_modules(&canon_dir, &imports, Some(&base))?;
             }
         }
+    }
+    // All trusted build branches pass through this gate before looking up any shard hits.
+    if !is_untrusted {
+        let edited: Vec<PathBuf> = shards_by_file.keys().map(|f| canon_dir.join(f)).collect();
         crate::module_builder::ensure_imported_oleans_replayed(store, &canon_dir, &edited)?;
     }
     let lake_recheck_ms = lake_t0.elapsed().as_millis();
@@ -5366,6 +5371,77 @@ mod pr_verify_tests {
     use crate::lake_build::{
         compute_imported_olean_interface_hashes, compute_shard_key, is_file_verified_in_lake_build,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn test_trusted_pr_interface_change_replays_lake_dependency_closure() -> Result<()> {
+        use crate::worktree_test_support::{LakeTree, FORGED_DEPENDENCY_SOURCE};
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tree = LakeTree::new("pr_interface_replay", &[("P/A.lean", "def a : Nat := 1\n")])?;
+        let dep = tree.project.join(".lake/packages/dep");
+        fs::create_dir_all(dep.join("Dep"))?;
+        fs::write(
+            dep.join("lean-toolchain"),
+            include_str!("../../../lean/lean-toolchain"),
+        )?;
+        fs::write(
+            dep.join("lakefile.toml"),
+            "name = \"dep\"\n[[lean_lib]]\nname = \"Dep\"\n",
+        )?;
+        fs::write(dep.join("Dep/Bad.lean"), FORGED_DEPENDENCY_SOURCE)?;
+        let config = tree.project.join("lakefile.toml");
+        let mut text = fs::read_to_string(&config)?;
+        text.push_str("\n[[require]]\nname = \"dep\"\npath = \".lake/packages/dep\"\n");
+        fs::write(config, text)?;
+        fs::write(
+            tree.project.join("P/Consumer.lean"),
+            "import P.A\nimport Dep.Bad\ntheorem uses_bad : False := bad\n",
+        )?;
+        tree.lake(&["update"])?;
+        tree.lake(&["build", "P"])?;
+        git_init_and_commit(&tree.project, "base")?;
+        // The edited module itself imports only Init. Its unchanged dependent imports the
+        // forged Lake artifact, and lies outside the PR scope. That closure still needs replay.
+        fs::write(
+            tree.project.join("P/A.lean"),
+            "def a : Nat := 1\ndef added : Nat := 2\n",
+        )?;
+        let edits = vec!["P/A.lean".to_string()];
+        let (_, closure) = crate::lake_build::dependent_closure_modules(&tree.project, &edits, false)?;
+        assert!(closure
+            .context("fixture must have a dependent closure")?
+            .contains(&"P.Consumer".to_string()));
+        let mut store = TurboStore::open(Some(&tree.root.join("cache")))?;
+        let receipt = tree.root.join("receipt.json");
+        let err = run_pr_verify_command(
+            &mut store,
+            true,
+            tree.project.clone(),
+            "HEAD".into(),
+            "trusted".into(),
+            false,
+            Some(receipt.clone()),
+            None,
+            None,
+            Some(PathBuf::from("P/A.lean")),
+            false,
+            0,
+            None,
+        )
+        .unwrap_err();
+        let error = format!("{err:#}");
+        assert!(
+            error.contains("KernelReplay") && error.contains("Dep.Bad"),
+            "{error}"
+        );
+        assert!(
+            !receipt.exists(),
+            "rejected dependency must not produce a verification receipt"
+        );
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]
@@ -7549,8 +7625,9 @@ end Fixture
             a.replace("(n : Nat)", "(n : Nat) (_h : True := trivial)"),
         )?;
         let edits = crate::lake_build::nonlocal_edits(&a_file, "HEAD");
+        let store = TurboStore::open(Some(&dir.join(".cache-dependent-replay")))?;
         assert_eq!(
-            crate::lake_build::lake_recheck_dependents(&dir, &edits, None)?,
+            crate::lake_build::lake_recheck_dependents(&store, &dir, &edits, None)?,
             2
         );
         // Non-local edit introducing an unallowed axiom (`native_decide` hidden via macro) is rejected by Stage 1C in untrusted mode.

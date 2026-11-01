@@ -409,7 +409,7 @@ pub fn try_stateless_remote_check(
     cache_shm_stat_split(&store, &canon_file, &active_src, &split, dep_hashes);
 
     let dur_ms = t0.elapsed().as_millis() as i64;
-    crate::lake_build::recheck_dependents_if_nonlocal(&canon_dir, &canon_file)?;
+    crate::lake_build::recheck_dependents_if_nonlocal(&store, &canon_dir, &canon_file)?;
     let misses = req_items.len();
     let effective_jobs = default_parallel_jobs(jobs).min(misses);
     let out_json = serde_json::json!({
@@ -603,7 +603,7 @@ pub fn try_stateless_remote_single_decl_check(
     }
 
     cache_shm_stat_split(&store, &canon_file, &active_src, &split, dep_hashes);
-    crate::lake_build::recheck_dependents_if_nonlocal(&canon_dir, &canon_file)?;
+    crate::lake_build::recheck_dependents_if_nonlocal(&store, &canon_dir, &canon_file)?;
 
     emit_remote_decl_result(
         json_output,
@@ -929,7 +929,7 @@ fn run_check_command_inner(
             remote_http.as_deref(),
         )?
     };
-    crate::lake_build::recheck_dependents_if_nonlocal(&canon_dir, &resolved_file)?;
+    crate::lake_build::recheck_dependents_if_nonlocal(store, &canon_dir, &resolved_file)?;
     Ok(res)
 }
 
@@ -1427,7 +1427,7 @@ fn check_directory(
         };
         pack::warm_local_zygote_daemon_nonblocking(store, &ev);
     }
-    crate::lake_build::recheck_dependents_if_nonlocal(canon_dir, resolved_file)?;
+    crate::lake_build::recheck_dependents_if_nonlocal(store, canon_dir, resolved_file)?;
     Ok(out_json)
 }
 

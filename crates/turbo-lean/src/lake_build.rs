@@ -2390,7 +2390,11 @@ pub(crate) fn dependent_closure_modules(
 /// imports them, directly or not (Lake replays unchanged imports from its build or artifact
 /// cache). Without a module graph it re-checks every `lean_lib`; without a Lake config it
 /// refuses to pass. Returns the number of modules re-checked (0: all libraries).
-pub(crate) fn recheck_dependents_if_nonlocal(canon_dir: &Path, target: &Path) -> Result<()> {
+pub(crate) fn recheck_dependents_if_nonlocal(
+    store: &TurboStore,
+    canon_dir: &Path,
+    target: &Path,
+) -> Result<()> {
     let lake_root = target.canonicalize().ok().and_then(|f| {
         f.ancestors()
             .find(|a| has_lake_config(a))
@@ -2414,7 +2418,7 @@ pub(crate) fn recheck_dependents_if_nonlocal(canon_dir: &Path, target: &Path) ->
             "[turbo-lean] non-local edit in {}: re-checking dependents with Lake",
             edits.join(", ")
         );
-        let n = lake_recheck_dependents(&dir, &edits, None)?;
+        let n = lake_recheck_dependents(store, &dir, &edits, None)?;
         eprintln!(
             "[turbo-lean] Lake re-checked {} modules (0: all libraries)",
             n
@@ -2424,6 +2428,7 @@ pub(crate) fn recheck_dependents_if_nonlocal(canon_dir: &Path, target: &Path) ->
 }
 
 pub(crate) fn lake_recheck_dependents(
+    store: &TurboStore,
     canon_dir: &Path,
     edits: &[String],
     rev: Option<&str>,
@@ -2436,15 +2441,27 @@ pub(crate) fn lake_recheck_dependents(
         );
     }
     let (libs, closure) = dependent_closure_modules(canon_dir, edits, false)?;
-    match closure {
+    let (targets, count) = match closure {
         Some(mods) if !mods.is_empty() => {
-            lake_build_modules(canon_dir, &mods, rev)?;
-            Ok(mods.len())
+            let n = mods.len();
+            (mods, n)
         }
-        _ => lake_build_modules(canon_dir, &libs, rev).map(|_| 0),
-    }
+        _ => (libs, 0),
+    };
+    lake_build_modules(canon_dir, &targets, rev)?;
+    // Lake success is freshness evidence only. Replay dependencies of every rebuilt consumer,
+    // including dependents outside a scoped PR, before their artifacts or shard hits count.
+    let cfg = crate::module_builder::resolve_project_config(canon_dir)?;
+    let dag = crate::module_builder::build_module_dag(&cfg, &targets)?;
+    let sources: Vec<PathBuf> = dag
+        .nodes
+        .values()
+        .filter(|n| n.is_root_pkg)
+        .map(|n| n.src_path.clone())
+        .collect();
+    crate::module_builder::ensure_imported_oleans_replayed(store, canon_dir, &sources)?;
+    Ok(count)
 }
-
 pub(crate) fn untrusted_recheck_dependents(
     store: &mut TurboStore,
     canon_dir: &Path,
