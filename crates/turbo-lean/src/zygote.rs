@@ -3576,10 +3576,32 @@ fn audit_compiled_module_batch(
         &mut cmd,
         std::time::Duration::from_secs(timeout_secs),
         is_untrusted,
-    )
-    .context("Failed to execute in-kernel `.olean` soundness auditor (`--audit-modules`)")?;
-    parse_audit_modules_reply(&out, mod_names)?;
-    if !is_untrusted {
+    );
+    match out.and_then(|o| parse_audit_modules_reply(&o, mod_names)) {
+        Ok(_) => {}
+        Err(_) if mod_names.len() > 1 => {
+            let mid = mod_names.len() / 2;
+            audit_compiled_module_batch(
+                store,
+                cfg,
+                &mod_names[..mid],
+                lean_path_env,
+                extra_ro_binds,
+                is_untrusted,
+            )?;
+            audit_compiled_module_batch(
+                store,
+                cfg,
+                &mod_names[mid..],
+                lean_path_env,
+                extra_ro_binds,
+                is_untrusted,
+            )?;
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    }
+    if !is_untrusted && extra_ro_binds.is_empty() {
         let dirs: Vec<PathBuf> = std::env::split_paths(lean_path_env).collect();
         let all_on_lean_path = mod_names.iter().all(|m| {
             let rel_slash = crate::module_builder::module_name_to_rel_slash(m);
@@ -10544,6 +10566,114 @@ mod tests {
         }
         purge_snapshot_dir(&fake_label_dir);
         purge_snapshot_dir(&snap_dir);
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_audit_compiled_modules_bisects_colliding_root_main_modules_across_processes() {
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_audit_main_collide_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(tmp_dir.join("App")).unwrap();
+        fs::write(tmp_dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            tmp_dir.join("lakefile.toml"),
+            "name = \"app_pkg\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\nroots = [\"App.MainA\", \"App.MainB\", \"App.Sorry\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp_dir.join("App/MainA.lean"),
+            "def main : IO Unit := pure ()\ntheorem mainA_ok : (1 : Nat) = 1 := rfl\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp_dir.join("App/MainB.lean"),
+            "def main : IO UInt32 := pure 0\ntheorem mainB_ok : (2 : Nat) = 2 := rfl\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp_dir.join("App/Sorry.lean"),
+            "theorem t_sorry : 1 = 2 := sorry\n",
+        )
+        .unwrap();
+        let Ok(cfg) = crate::module_builder::resolve_project_config(&tmp_dir) else {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return;
+        };
+        let env = build_auditor_bootstrap_env(&cfg);
+        let ld = env.get("LD_LIBRARY_PATH").cloned().unwrap_or_default();
+        let olean_dir = tmp_dir.join(".lake/build/lib/lean/App");
+        fs::create_dir_all(&olean_dir).unwrap();
+        for (src, olean) in [
+            ("App/MainA.lean", "MainA.olean"),
+            ("App/MainB.lean", "MainB.olean"),
+            ("App/Sorry.lean", "Sorry.olean"),
+        ] {
+            let out = Command::new(&cfg.lean_bin)
+                .current_dir(&tmp_dir)
+                .arg("-R")
+                .arg(&tmp_dir)
+                .arg("-o")
+                .arg(olean_dir.join(olean))
+                .arg(tmp_dir.join(src))
+                .env("LEAN_PATH", &cfg.toolchain_lib_lean)
+                .env("LD_LIBRARY_PATH", &ld)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "lean compile {} failed: {:?}",
+                src,
+                out
+            );
+        }
+        let fake_bwrap =
+            crate::module_builder::ScopedTestBwrapOverride::write_fake_bwrap_script(&tmp_dir)
+                .unwrap();
+        let _bwrap =
+            crate::module_builder::ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy());
+        let store = TurboStore::open(Some(&tmp_dir.join("store"))).unwrap();
+        let (lean_path_env, _) = crate::module_builder::build_lean_search_path(&cfg, true);
+
+        for is_untrusted in [false, true] {
+            audit_compiled_modules_with_zygote(
+                &store,
+                &cfg,
+                &["App.MainA".to_string(), "App.MainB".to_string()],
+                &lean_path_env,
+                &[],
+                is_untrusted,
+            )
+            .unwrap_or_else(|e| {
+                panic!("colliding root `main` modules must pass batch audit via process bisection (untrusted={is_untrusted}): {e:#}")
+            });
+
+            let err = audit_compiled_modules_with_zygote(
+                &store,
+                &cfg,
+                &[
+                    "App.MainA".to_string(),
+                    "App.MainB".to_string(),
+                    "App.Sorry".to_string(),
+                ],
+                &lean_path_env,
+                &[],
+                is_untrusted,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("sorryAx"),
+                "bisected batch audit must still reject sorryAx (untrusted={is_untrusted}): {err}"
+            );
+        }
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 }

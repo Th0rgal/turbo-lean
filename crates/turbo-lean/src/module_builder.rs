@@ -8019,9 +8019,7 @@ pub(crate) fn run_command_with_timeout(
 }
 
 #[cfg(test)]
-std::thread_local! {
-    static TEST_BWRAP_BIN_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
-}
+static TEST_BWRAP_BIN_OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 #[cfg(test)]
 pub(crate) struct ScopedTestBwrapOverride {
@@ -8031,7 +8029,10 @@ pub(crate) struct ScopedTestBwrapOverride {
 #[cfg(test)]
 impl ScopedTestBwrapOverride {
     pub(crate) fn set(val: impl Into<String>) -> Self {
-        let prev = TEST_BWRAP_BIN_OVERRIDE.with(|cell| cell.replace(Some(val.into())));
+        let mut guard = TEST_BWRAP_BIN_OVERRIDE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = guard.replace(val.into());
         Self { prev }
     }
 
@@ -8067,16 +8068,19 @@ impl ScopedTestBwrapOverride {
 impl Drop for ScopedTestBwrapOverride {
     fn drop(&mut self) {
         let prev = self.prev.take();
-        TEST_BWRAP_BIN_OVERRIDE.with(|cell| {
-            *cell.borrow_mut() = prev;
-        });
+        let mut guard = TEST_BWRAP_BIN_OVERRIDE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = prev;
     }
 }
 
 pub(crate) fn probe_bwrap_sandbox(project: &Path) -> Option<PathBuf> {
     #[cfg(test)]
     if let Some(test_bwrap) = TEST_BWRAP_BIN_OVERRIDE
-        .with(|cell| cell.borrow().clone())
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
         .or_else(|| std::env::var("TURBO_LEAN_TEST_BWRAP_BIN").ok())
     {
         let trimmed = test_bwrap.trim();

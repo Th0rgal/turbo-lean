@@ -1167,7 +1167,7 @@ def auditShardModule (target : String × Name) (ffiAllow : Array (Name × Name �
   catch e =>
     return ([s!"[TurboLean.KernelGate] failed to import `{target.1}` for audit: {e}"], #[])
 
-partial def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name × Name × String) := #[]) : IO (List String) := do
+def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name × Name × String) := #[]) : IO (List String) := do
   if slice.isEmpty then
     return []
   let patterns := (((← IO.getEnv "TURBO_LEAN_ALLOWED_AXIOMS").getD "").splitOn ",").filterMap fun p =>
@@ -1190,45 +1190,31 @@ partial def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array 
     if slice.size == 1 then
       let (rawStr, _) := slice[0]!
       return [s!"[TurboLean.KernelGate] failed to import `{rawStr}` for audit: {errMsg}"]
-    let missingIdx? : Option Nat := Id.run do
-      if (errMsg.splitOn "does not exist").length > 1 then
-        let parts := errMsg.splitOn "of module "
-        if parts.length > 1 then
-          let modPart := ((parts[1]!).splitOn " does not exist").headD ""
-          if !modPart.isEmpty then
-            return slice.findIdx? (fun (_, nm) => nm.toString == modPart)
-      return none
-    match missingIdx? with
-    | some idx =>
-      let (rawStr, _) := slice[idx]!
-      let without := (slice.extract 0 idx) ++ (slice.extract (idx + 1) slice.size)
-      let vRest ← auditModuleSlice without ffiAllow
-      return [s!"[TurboLean.KernelGate] failed to import `{rawStr}` for audit: {errMsg}"] ++ vRest
-    | none =>
-      let collideIdx? : Option Nat := Id.run do
-        let parts := errMsg.splitOn "import "
-        if parts.length > 1 then
-          let modPart := ((parts[1]!).splitOn " failed").headD ""
-          if !modPart.isEmpty then
-            return slice.findIdx? (fun (_, nm) => nm.toString == modPart)
-        return none
-      match collideIdx? with
-      | some idx =>
-        if idx > 0 then
-          let without := (slice.extract 0 idx) ++ (slice.extract (idx + 1) slice.size)
-          let vRest ← auditModuleSlice without ffiAllow
-          let vSingle ← auditModuleSlice #[slice[idx]!] ffiAllow
-          return vRest ++ vSingle
-        else
-          let mid := slice.size / 2
-          let v1 ← auditModuleSlice (slice.extract 0 mid) ffiAllow
-          let v2 ← auditModuleSlice (slice.extract mid slice.size) ffiAllow
-          return v1 ++ v2
-      | none =>
-        let mid := slice.size / 2
-        let v1 ← auditModuleSlice (slice.extract 0 mid) ffiAllow
-        let v2 ← auditModuleSlice (slice.extract mid slice.size) ffiAllow
-        return v1 ++ v2
+    -- Compacted `.olean` import regions are never unmapped within a single OS process; bisecting
+    -- `Lean.importModules` in-process would accumulate mappings across retries and exhaust the
+    -- untrusted 8 GiB `RLIMIT_DATA` cap. Spawn fresh OS child processes for each half instead.
+    let app := (← IO.appPath).toString
+    let ffiFlags : Array String := ffiAllow.map fun (m, d, sym) =>
+      s!"--ffi-allow={m}={d}={sym}"
+    let runSubSlice (sub : Array (String × Name)) : IO (List String) := do
+      let modFlags := sub.map (·.1)
+      let child ← IO.Process.output {
+        cmd := app
+        args := #["--audit-modules"] ++ ffiFlags ++ modFlags
+      }
+      if child.exitCode == 0 then
+        return []
+      let lastJson? := (child.stdout.splitOn "\n").reverse.find? fun l =>
+        let t := l.trimAscii.toString
+        t.startsWith "{" && t.endsWith "}"
+      let detail := (lastJson?.getD child.stdout).trimAscii.toString
+      let errTail := child.stderr.trimAscii.toString
+      let summary := if detail.isEmpty then errTail else if errTail.isEmpty then detail else s!"{detail} ({errTail})"
+      return [s!"[TurboLean.KernelGate] sub-batch audit failed (exit {child.exitCode}) on {modFlags.toList}: {summary}"]
+    let mid := slice.size / 2
+    let v1 ← runSubSlice (slice.extract 0 mid)
+    let v2 ← runSubSlice (slice.extract mid slice.size)
+    return v1 ++ v2
 
 def auditCompiledModules (modNames : List String) (ffiAllow : Array (Name × Name × String) := #[]) : IO (Bool × List String) := do
   let mut parsed : Array (String × Name) := #[]
