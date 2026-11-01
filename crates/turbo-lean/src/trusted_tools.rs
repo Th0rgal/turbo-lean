@@ -162,7 +162,7 @@ pub(crate) fn git(project: &Path) -> Result<GitCommand> {
     }).as_ref().map_err(|e| anyhow::anyhow!("Trusted Git unavailable: {e}"))?;
     let program = outside_checkout(program, project)?;
     let home = PrivateHome::new()?;
-    let prepare = || {
+    let prepare = |extra: &[String]| {
         let mut command = Command::new(&program);
         command
             .env_clear()
@@ -182,26 +182,25 @@ pub(crate) fn git(project: &Path) -> Result<GitCommand> {
             .env("LC_ALL", "C")
             .env_remove("GIT_ASKPASS")
             .env_remove("SSH_ASKPASS");
-        for config in [
-            "core.fsmonitor=",
-            "core.hooksPath=/dev/null",
-            "core.sshCommand=false",
-            "core.askPass=",
-            "credential.helper=",
-            "protocol.allow=never",
-            "diff.external=",
-            "log.showSignature=false",
-            "core.pager=cat",
-            "core.attributesFile=/dev/null",
-        ] {
-            command.args(["-c", config]);
-        }
+        // Overrides travel in GIT_CONFIG_PARAMETERS (the `-c` channel) so that every Git
+        // process this one spawns inherits them too: Git keeps that variable even for the
+        // child processes it runs inside submodules.
+        let config = BASE_CONFIG
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .chain(extra.iter().map(|k| (k.as_str(), filter_override(k))))
+            .map(|(k, v)| format!("{}={}", sq_quote(k), sq_quote(v)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        command.env("GIT_CONFIG_PARAMETERS", config);
         command
     };
-    let mut command = prepare();
+    let mut command = prepare(&[]);
     // Status/diff can run clean filters in this repository. Suppress its filters.
     // This is NOT checkout isolation: conditional includes can change with the
     // git directory. Verification snapshots must use raw objects, never checkout.
+    // Nor does it cover a submodule's own config: callers must never let Git recurse
+    // into submodules (`NO_SUBMODULES`, and `reject_gitlinks` where contents matter).
     let filters = command
         .args(["-C"])
         .arg(project)
@@ -218,22 +217,95 @@ pub(crate) fn git(project: &Path) -> Result<GitCommand> {
         "Cannot isolate repository Git filters: {}",
         String::from_utf8_lossy(&filters.stderr)
     );
-    let mut isolated = prepare();
-    for key in filters.stdout.split(|b| *b == 0).filter(|s| !s.is_empty()) {
-        let key = std::str::from_utf8(key)?;
-        isolated.arg("-c").arg(format!(
-            "{key}={}",
-            if key.ends_with(".required") {
-                "false"
-            } else {
-                ""
-            }
-        ));
-    }
+    let keys = filters
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|k| Ok(std::str::from_utf8(k)?.to_owned()))
+        .collect::<Result<Vec<_>>>()?;
     Ok(GitCommand {
-        command: isolated,
+        command: prepare(&keys),
         _home: home,
     })
+}
+
+/// Every key that could run a program, reach the network, or make Git recurse into a
+/// submodule (whose own config, filters and includes this process never vetted).
+const BASE_CONFIG: [(&str, &str); 13] = [
+    ("core.fsmonitor", ""),
+    ("core.hooksPath", "/dev/null"),
+    ("core.sshCommand", "false"),
+    ("core.askPass", ""),
+    ("credential.helper", ""),
+    ("protocol.allow", "never"),
+    ("diff.external", ""),
+    ("log.showSignature", "false"),
+    ("core.pager", "cat"),
+    ("core.attributesFile", "/dev/null"),
+    ("submodule.recurse", "false"),
+    ("diff.ignoreSubmodules", "all"),
+    ("status.submoduleSummary", "false"),
+];
+
+/// Pass to every `status`/`diff` on a verification path. Config alone is not enough: a
+/// repository's `submodule.<name>.ignore` outranks `diff.ignoreSubmodules`, and recursing
+/// runs `git status` inside the submodule with that submodule's own filters.
+pub(crate) const NO_SUBMODULES: &str = "--ignore-submodules=all";
+
+fn filter_override(key: &str) -> &'static str {
+    if key.ends_with(".required") {
+        "false"
+    } else {
+        ""
+    }
+}
+
+/// Git's `sq_quote`: the encoding `GIT_CONFIG_PARAMETERS` is parsed with.
+fn sq_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''").replace('!', "'\\!'"))
+}
+
+/// Fail closed on submodule gitlinks in the index (and in `revs`) under `pathspec`. Their
+/// contents are never inspected, so a dirty-state or source answer would be incomplete.
+/// Neither `ls-files -s` nor `ls-tree` enters a submodule.
+pub(crate) fn reject_gitlinks(repo: &Path, revs: &[&str], pathspec: &Path) -> Result<()> {
+    let mut lists = vec![git(repo)?
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-files", "-s", "-z", "--"])
+        .arg(pathspec)
+        .output()?];
+    for rev in revs {
+        anyhow::ensure!(!rev.starts_with('-'), "Invalid git revision `{rev}`");
+        lists.push(
+            git(repo)?
+                .arg("-C")
+                .arg(repo)
+                .args(["ls-tree", "-r", "-z", rev, "--"])
+                .arg(pathspec)
+                .output()?,
+        );
+    }
+    for out in lists {
+        anyhow::ensure!(
+            out.status.success(),
+            "Cannot list Git entries: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        if let Some(link) = out
+            .stdout
+            .split(|b| *b == 0)
+            .find(|e| e.starts_with(b"160000 "))
+        {
+            let path = link.splitn(2, |b| *b == b'\t').nth(1).unwrap_or_default();
+            anyhow::bail!(
+                "Submodule gitlinks are not supported on verification paths (their contents \
+                 and config are never inspected): {}",
+                String::from_utf8_lossy(path)
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -406,5 +478,209 @@ fn trusted_git_never_lazily_fetches_or_runs_repository_helpers() -> Result<()> {
     assert!(format!("{err:#}").contains("missing"), "{err:#}");
     assert!(!marker.exists());
     fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+/// Test fixture: a repository with an initialized submodule `dep` whose tracked `data.txt`
+/// has a clean filter defined ONLY in the submodule's own config (directly, or through an
+/// `include.path` there) that touches `marker`. `data.txt` is modified with a new mtime, so
+/// any `git status`/`diff` that enters the submodule runs the filter.
+#[cfg(test)]
+pub(crate) fn submodule_filter_fixture(root: &Path, via_include: bool) -> Result<PathBuf> {
+    let plain = |dir: &Path, args: &[&str]| -> Result<()> {
+        let out = Command::new("/usr/bin/git")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(["-c", "protocol.file.allow=always"])
+            .current_dir(dir)
+            .args(args)
+            .output()?;
+        anyhow::ensure!(out.status.success(), "{args:?}: {out:?}");
+        Ok(())
+    };
+    let (sub, repo, marker) = (root.join("sub"), root.join("repo"), root.join("marker"));
+    fs::create_dir_all(&sub)?;
+    fs::create_dir_all(&repo)?;
+    plain(&sub, &["init", "-q"])?;
+    fs::write(sub.join(".gitattributes"), "*.txt filter=subattack\n")?;
+    fs::write(sub.join("data.txt"), "a\n")?;
+    fs::write(sub.join("S.lean"), "def s := 1\n")?;
+    plain(&sub, &["add", "."])?;
+    plain(&sub, &["commit", "-qm", "sub"])?;
+    plain(&repo, &["init", "-q"])?;
+    fs::write(repo.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+    fs::write(repo.join(".gitignore"), ".lake/\ncache/\ncache-staging/\n")?;
+    fs::write(
+        repo.join("Demo.lean"),
+        "theorem pinned : 1 + 1 = 2 := rfl\n",
+    )?;
+    plain(&repo, &["add", "."])?;
+    plain(&repo, &["commit", "-qm", "base"])?;
+    plain(
+        &repo,
+        &["submodule", "add", "-q", &sub.to_string_lossy(), "dep"],
+    )?;
+    plain(&repo, &["commit", "-qm", "dep"])?;
+    let filter = format!("touch '{}'; cat", marker.display());
+    let dep = repo.join("dep");
+    if via_include {
+        let inc = root.join("sub-include");
+        plain(
+            root,
+            &[
+                "config",
+                "--file",
+                &inc.to_string_lossy(),
+                "filter.subattack.clean",
+                &filter,
+            ],
+        )?;
+        plain(&dep, &["config", "include.path", &inc.to_string_lossy()])?;
+    } else {
+        plain(&dep, &["config", "filter.subattack.clean", &filter])?;
+    }
+    fs::write(dep.join("data.txt"), "b\n")?;
+    Ok(repo)
+}
+
+/// Give `data.txt` a new mtime (same size as the committed blob) so Git cannot decide from
+/// stat data alone and must run the clean filter to compare contents.
+#[cfg(test)]
+pub(crate) fn restat_submodule_file(repo: &Path) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static RESTAT: AtomicU64 = AtomicU64::new(0);
+    let f = fs::File::options()
+        .append(true)
+        .open(repo.join("dep/data.txt"))?;
+    f.set_modified(
+        std::time::SystemTime::now()
+            + std::time::Duration::from_secs(1 + RESTAT.fetch_add(1, Ordering::Relaxed)),
+    )?;
+    Ok(())
+}
+
+/// A clean filter defined only in a submodule's config (or an include there) is invisible to
+/// the superproject's filter enumeration. Plain `git status` runs it; trusted Git must never
+/// enter the submodule, and gitlinks are refused where their contents would matter.
+#[cfg(test)]
+#[test]
+fn trusted_git_never_runs_submodule_only_filters() -> Result<()> {
+    for via_include in [false, true] {
+        let root = std::env::temp_dir().join(format!(
+            "turbo-sub-filter-{}-{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let repo = submodule_filter_fixture(&root, via_include)?;
+        let marker = root.join("marker");
+        let plain = |args: &[&str]| -> Result<std::process::Output> {
+            restat_submodule_file(&repo)?;
+            Ok(Command::new("/usr/bin/git")
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", &root)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .current_dir(&repo)
+                .args(args)
+                .output()?)
+        };
+        // The superproject's effective config does not contain the filter.
+        assert_eq!(
+            plain(&["config", "--get", "filter.subattack.clean"])?
+                .status
+                .code(),
+            Some(1)
+        );
+        // Positive controls: plain status and diff recurse and run the submodule's filter.
+        for args in [
+            &["status", "--porcelain"][..],
+            &["diff", "--name-only", "HEAD"],
+        ] {
+            assert!(plain(args)?.status.success());
+            assert!(
+                marker.exists(),
+                "{via_include}: control {args:?} did not run the filter"
+            );
+            fs::remove_file(&marker)?;
+        }
+        // Trusted Git, with and without the explicit flag (config defaults), and even with a
+        // repository `submodule.<name>.ignore=none` that outranks `diff.ignoreSubmodules`.
+        for repo_ignore in [None, Some("none")] {
+            if let Some(v) = repo_ignore {
+                assert!(plain(&["config", "submodule.dep.ignore", v])?
+                    .status
+                    .success());
+            }
+            let mut cases = vec![
+                vec!["status", "--porcelain", "-uall", NO_SUBMODULES],
+                vec![
+                    "status",
+                    "--porcelain=v1",
+                    "-z",
+                    "--untracked-files=all",
+                    NO_SUBMODULES,
+                ],
+                vec![
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    NO_SUBMODULES,
+                    "--name-only",
+                    "HEAD",
+                ],
+                vec!["ls-files", "--others", "--exclude-standard"],
+                vec![
+                    "ls-files",
+                    "-z",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                ],
+                vec!["ls-files", "-s", "-z"],
+                vec!["ls-tree", "-r", "-z", "HEAD"],
+            ];
+            if repo_ignore.is_none() {
+                cases.push(vec!["status", "--porcelain"]);
+                cases.push(vec!["diff", "--name-only", "HEAD"]);
+            }
+            for args in cases {
+                restat_submodule_file(&repo)?;
+                let out = git(&repo)?.arg("-C").arg(&repo).args(&args).output()?;
+                assert!(out.status.success(), "{args:?}: {out:?}");
+                assert!(
+                    !marker.exists(),
+                    "{via_include} {repo_ignore:?}: {args:?} ran the filter"
+                );
+            }
+        }
+        // Inherited by child processes: GIT_CONFIG_PARAMETERS carries the overrides.
+        let probe = git(&repo)?
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "config",
+                "--show-scope",
+                "--get-regexp",
+                "^(submodule\\.recurse|diff\\.ignoresubmodules|status\\.submodulesummary)$",
+            ])
+            .output()?;
+        let shown = String::from_utf8(probe.stdout)?;
+        for line in [
+            "command\tsubmodule.recurse false",
+            "command\tdiff.ignoresubmodules all",
+            "command\tstatus.submodulesummary false",
+        ] {
+            assert!(shown.contains(line), "{shown}");
+        }
+        let err = reject_gitlinks(&repo, &["HEAD"], &repo).expect_err("gitlink must be refused");
+        assert!(format!("{err:#}").contains("gitlinks") && format!("{err:#}").contains("dep"));
+        // Outside the gitlink's pathspec the repository is acceptable.
+        reject_gitlinks(&repo, &["HEAD"], &repo.join("Demo.lean"))?;
+        assert!(!marker.exists());
+        fs::remove_dir_all(root)?;
+    }
     Ok(())
 }
