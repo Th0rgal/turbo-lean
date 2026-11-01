@@ -178,18 +178,38 @@ require a real pinned clifv run; this PR does not publish measurements.
 
 ## Running it on Orb nodes
 
-Static Orb fleet nodes run missions and durable jobs inside cgroup memory caps
-(typically ~8 GiB per mission unless raised; even a 16 GiB job cap with
-`memory.high ≈ 14.4 GiB` and `swap = 0` throttled and aborted default
-8-process `lake build FV` primes on `clifv`, whose heavy modules reach 1–6 GiB
-RSS each). When running `scripts/bench_clifv.sh` on a capped node:
+Static Orb fleet nodes and managed VMs run inside cgroup memory and lifetime
+caps (typically ~8 GiB per static mission unless raised; a 16 GiB job cap with
+`memory.high ≈ 14.4 GiB` and `swap = 0` throttled and aborted 8-job `lake build FV`
+primes on `uruk`, and on a dedicated 64 GiB Vast.ai VM with `memory.max = 60.13 GiB`
+`LEAN_NUM_THREADS=12` hit `oom_kill` at step `3470/4556` when concurrent
+`StockCmp*DriverRuns` / `StockRotate*Witness` Lean processes reached 7–10 GiB RSS
+each). When running `scripts/bench_clifv.sh` on a capped node or managed VM:
 
-- Bound parallelism by **available cgroup RAM**, not `nproc`: set both
-  `LEAN_NUM_THREADS` (controls Lake's concurrent `lean` jobs in Arm A and Arm B)
-  and `TURBO_LEAN_JOBS` / `TURBO_LEAN_MAX_MEMORY_MB` (controls `turbo-lean`
-  concurrency and memory governor in Arm B) identically before invoking the
-  runner (for example `LEAN_NUM_THREADS=3 TURBO_LEAN_JOBS=3
-  TURBO_LEAN_MAX_MEMORY_MB=14336` under a 16 GiB cap).
+- Separate the parallelism controls by subcommand and bound them by **available
+  cgroup RAM**, not `nproc`:
+  - `LEAN_NUM_THREADS` sets per-process Lean runtime worker threads in both arms,
+    and Lake `v4.34.1` (which has no `-j` flag) also sizes its `lake build FV`
+    module-job pool from `LEAN_NUM_THREADS` (recorded in `results.json`).
+  - `TURBO_LEAN_JOBS` caps `turbo-lean build`'s module-DAG worker pool
+    (`crates/turbo-lean/src/module_builder.rs:9111`); **`turbo-lean check` does
+    not read `TURBO_LEAN_JOBS`**.
+  - `turbo-lean check` sizes its worker pool from `--jobs <N>` (not passed by
+    `scripts/bench_clifv.py`, which invokes `turbo-lean --cache-dir ... check FV
+    --project-dir .`) or, when `--jobs` is unset, `MemoryBudgetGovernor::detect()`
+    (`crates/turbo-lean/src/check.rs:1061`, `shm_cache.rs:680`): it clamps workers
+    from `TURBO_LEAN_MAX_MEMORY_MB` only in low-memory mode
+    (`TURBO_LEAN_LOW_MEMORY=1` or `TURBO_LEAN_MAX_MEMORY_MB <= 4096`), and
+    otherwise defaults to `available_parallelism()`. On `60–64 GiB` cgroups, keep
+    `LEAN_NUM_THREADS=6` and `TURBO_LEAN_JOBS=6` (with `TURBO_LEAN_MAX_MEMORY_MB=53248`
+    for `build`, which peaked at `59.08 GiB` with 0 OOM kills); use `>= 96–128 GiB`
+    RAM before raising `LEAN_NUM_THREADS` / `TURBO_LEAN_JOBS` to `12`.
+- Account for managed-VM **lifetime caps** (`720` min hard ceiling on Orb managed
+  VMs): non-`cold` scenarios run three untimed full builds (`prime-lake` in both
+  arms plus `prime-turbo`) before the first timed pair, so `--scenarios cold,warm`
+  needs at least four full `FV` builds (~8–10 h each on 2.40 GHz Broadwell at 6
+  jobs). On 12-hour VMs, run `--scenarios cold` separately (no untimed baseline
+  prime) or use a higher-IPC host without a 720-minute reaper ceiling.
 - Unset node-injected remote-execution variables (`TURBO_LEAN_COMPUTE_NODES`,
   `LEAN_NATIVE_COLAB_API_URL`, `LEAN_NATIVE_COLAB_TOKEN`) so Arm B executes
   strictly locally on the benchmark host.

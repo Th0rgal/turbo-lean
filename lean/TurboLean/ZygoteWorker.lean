@@ -7,13 +7,17 @@
   reload or process startup overhead, leaving `baseEnv` completely unmutated.
 -/
 import Lean.Elab.Frontend
+import Lean.Data.Json
 import Lean.Util.CollectAxioms
+import Lean.Replay
 import Lean.Compiler.ImplementedByAttr
 import Lean.Compiler.ExternAttr
 import Lean.Compiler.CSimpAttr
 import Lean.Compiler.LCNF.PhaseExt
 import Lean.Compiler.IR.CompilerM
 import Std.Data.HashMap
+import TurboLean.Blake3
+import TurboLean.StatementHash
 
 open Lean Elab
 
@@ -147,6 +151,10 @@ def jsonEscape (s : String) : String := Id.run do
 def jsonStrList (xs : List String) : String :=
   String.intercalate "," (xs.map (fun x => s!"\"{jsonEscape x}\""))
 
+/-- Format `(key, val)` string pairs as a comma-separated JSON object body. -/
+def jsonKvObj (kvs : List (String × String)) : String :=
+  String.intercalate "," (kvs.map (fun (k, v) => s!"\"{jsonEscape k}\":\"{jsonEscape v}\""))
+
 /-- Line written to the process stderr right before every reply. Panics printed straight to stderr
     (`set_option stderrAsMessages false`, other threads) precede it, so the host
     (`zygote.rs`, `ZYGOTE_STDERR_REPLY_MARK`) waits for it and then knows whether the request panicked. -/
@@ -154,13 +162,14 @@ def stderrReplyMark : String := "[TurboLean.ZygoteWorker] reply"
 
 /-- Emit a single-line JSON Zygote reply and flush `stdout`. -/
 def emitZygoteReply (stdout : IO.FS.Stream) (ok : Bool) (winIdx? : Option String) (kgActive importOk envHit prefHit : Bool)
-    (importUs prefixUs elabUs hbs nodes subVerified : Nat) (outStr : String) (msgs errs used : List String) : IO Unit := do
+    (importUs prefixUs elabUs hbs nodes subVerified : Nat) (outStr : String) (msgs errs used : List String)
+    (declTypes : List (String × String) := []) : IO Unit := do
   let stderr ← IO.getStderr
   stderr.putStrLn s!"\n{stderrReplyMark}"
   stderr.flush
   let winPart := match winIdx? with | some w => s!"\"winning_candidate_idx\":{w}," | none => ""
   let kgPart := if importOk then s!"\"kernel_gate_active\":{kgActive}," else ""
-  stdout.putStrLn s!"\{\"ok\":{ok},{winPart}{kgPart}\"import_ok\":{importOk},\"env_cache_hit\":{envHit},\"prefix_cache_hit\":{prefHit},\"import_us\":{importUs},\"prefix_us\":{prefixUs},\"elab_us\":{elabUs},\"heartbeats\":{hbs},\"proof_term_nodes\":{nodes},\"subshards_verified\":{subVerified},\"stdout\":\"{jsonEscape outStr}\",\"messages\":[{jsonStrList msgs}],\"errors\":[{jsonStrList errs}],\"used_constants\":[{jsonStrList used}]}"
+  stdout.putStrLn s!"\{\"ok\":{ok},{winPart}{kgPart}\"import_ok\":{importOk},\"env_cache_hit\":{envHit},\"prefix_cache_hit\":{prefHit},\"import_us\":{importUs},\"prefix_us\":{prefixUs},\"elab_us\":{elabUs},\"heartbeats\":{hbs},\"proof_term_nodes\":{nodes},\"subshards_verified\":{subVerified},\"stdout\":\"{jsonEscape outStr}\",\"messages\":[{jsonStrList msgs}],\"errors\":[{jsonStrList errs}],\"used_constants\":[{jsonStrList used}],\"decl_types\":\{{jsonKvObj declTypes}}}"
   stdout.flush
 
 /-- The toolchain's `cadical`, set in `main` from the sysroot: `bv_decide` looks for it next to the
@@ -472,15 +481,91 @@ def collectNewDeclUsedConstants (beforeEnv afterEnv : Environment) : Array Strin
         out := out.push cs
   return out
 
+/-- Independent kernel replay. `IO.processCommands` honors source-level options such as
+    `set_option debug.skipKernelTC true` (or `set_option … in`), and these options persist in cached
+    prefix `Command.State`s. So every declaration added since `beforeEnv` is sent to the kernel again,
+    starting from `beforeEnv`'s kernel environment with checking forced on and ignoring all elaboration
+    options (`Kernel.Environment.replay` calls `addDeclCore` directly). Inductive types are re-added
+    and their constructors and recursors must match the regenerated ones exactly. The replay skips
+    `unsafe` declarations (`auditNewKernelDecls` rejects them) and `partial` ones (the kernel never
+    lets a safe declaration refer to them). Changing a constant that existed before the request also
+    fails the check. Returns the errors; an empty list means the replay succeeded. -/
+def kernelReplayNewDecls (beforeEnv afterEnv : Environment) : IO (List String) := do
+  let beforeMap := beforeEnv.constants.map₂
+  let afterMap := afterEnv.constants.map₂
+  let mut errs : List String := []
+  for (name, oldInfo) in beforeMap.toList do
+    match afterMap.find? name with
+    | some newInfo =>
+      if !(newInfo == oldInfo) then
+        errs := errs ++ [s!"[TurboLean.KernelReplay] declaration `{name}` from the checked prefix was replaced"]
+    | none =>
+      errs := errs ++ [s!"[TurboLean.KernelReplay] declaration `{name}` from the checked prefix is missing"]
+  let newConsts : Std.HashMap Name ConstantInfo := afterMap.foldl (fun acc name cinfo =>
+    if beforeMap.contains name then acc else acc.insert name cinfo) {}
+  for (name, _) in newConsts.toList do
+    if beforeEnv.contains name then
+      errs := errs ++ [s!"[TurboLean.KernelReplay] declaration `{name}` redeclares an imported constant"]
+  if !errs.isEmpty || newConsts.isEmpty then
+    return errs
+  try
+    let _ ← beforeEnv.toKernelEnv.replay newConsts
+    return []
+  catch e =>
+    return [s!"[TurboLean.KernelReplay] independent kernel re-check failed: {e}"]
+
+/-- 256-bit cryptographic BLAKE3 content digest over raw artifact bytes. -/
+def hashBytesBlake3Hex (bs : ByteArray) : String :=
+  TurboLean.Blake3.blake3Bytes bs
+
+def canonicalComponent (s : String) : String :=
+  if s.any (fun c => c == '.' || c == '«' || c == '»') then s!"«{s}»" else s
+
+def canonicalName : Name → String
+  | .anonymous => ""
+  | .str .anonymous s => canonicalComponent s
+  | .str p s => s!"{canonicalName p}.{canonicalComponent s}"
+  | .num .anonymous n => s!"{n}"
+  | .num p n => s!"{canonicalName p}.{n}"
+
+/-- Canonical BLAKE3 digest of `(c.levelParams, c.type)` under the `statement-v1` schema,
+    normalizing module-local private constant names so probe, shard, and module elaborations match. -/
+def kernelStatementHash (c : ConstantInfo) (localMod? : Option Name := none) : String :=
+  let j := TurboLean.StatementHash.statement c (TurboLean.StatementHash.normalizeLocalPrivateName localMod?)
+  TurboLean.Blake3.blake3Bytes j.compress.toUTF8
+
+/-- Collect `(declName, kernelStatementHash)` for newly added `.thmInfo` declarations between
+    `beforeEnv` and `afterEnv`, keyed by user-facing name (and raw kernel name if private). -/
+def collectNewTheoremTypeHashes (beforeEnv afterEnv : Environment) : List (String × String) := Id.run do
+  let beforeMap := beforeEnv.constants.map₂
+  let afterMap := afterEnv.constants.map₂
+  let newDecls := afterMap.foldl (fun acc name cinfo =>
+    if !beforeMap.contains name then (name, cinfo) :: acc else acc) []
+  let localMod? : Option Name := if afterEnv.mainModule.isAnonymous then none else some afterEnv.mainModule
+  let mut seen : Std.HashMap String Bool := {}
+  let mut out : List (String × String) := []
+  for (_, cinfo) in newDecls.reverse do
+    if cinfo matches .thmInfo _ then
+      let h := kernelStatementHash cinfo localMod?
+      let userNm := canonicalName (Lean.privateToUserName cinfo.name)
+      if !(seen[userNm]?.getD false) then
+        seen := seen.insert userNm true
+        out := out ++ [(userNm, h)]
+      let rawNm := canonicalName cinfo.name
+      if rawNm != userNm && !(seen[rawNm]?.getD false) then
+        seen := seen.insert rawNm true
+        out := out ++ [(rawNm, h)]
+  return out
+
 /-- Elaborate and kernel-typecheck `code` starting from an immutable `baseState : Command.State`
     without mutating `baseState`.
-    Returns `(ok, elapsed_us, heartbeats, proof_term_nodes, error_messages, all_messages, captured_stdout, used_constants, next_clean_state)`. -/
+    Returns `(ok, elapsed_us, heartbeats, proof_term_nodes, error_messages, all_messages, captured_stdout, used_constants, decl_types, next_clean_state)`. -/
 def runCommandsFromState
     (baseState : Command.State)
     (code : String)
     (fileName : String := "<zygote-shard>")
     (allowStub : Bool := false)
-    (evalMode : Bool := false) : IO (Bool × Nat × Nat × Nat × List String × List String × String × List String × Command.State) := do
+    (evalMode : Bool := false) : IO (Bool × Nat × Nat × Nat × List String × List String × String × List String × List (String × String) × Command.State) := do
   let t0 ← IO.monoNanosNow
   let hb0 ← IO.getNumHeartbeats
   -- `warningAsError` is never rewritten: a stubbed prefix only drops its `sorry` diagnostics (below),
@@ -516,8 +601,13 @@ def runCommandsFromState
       errs := errs ++ [s!"forbidden token detected: {txt}"]
   let mut usedConstants : List String := []
   let mut proofTermNodes : Nat := 0
+  let mut declTypes : List (String × String) := []
   if allMessages.any isRuntimePanicText then
     errs := errs ++ [runtimePanicErr]
+  -- Primary gate: re-check every new declaration in the kernel, independently of the options the
+  -- elaborator ran under. Checkpoints are only cached after this passes, so prefix declarations are
+  -- covered by induction (each prefix/delta replay starts from an already replayed environment).
+  errs := errs ++ (← kernelReplayNewDecls baseState.env s.commandState.env)
   if !evalMode then
     let explicitStubToken := ":= " ++ forbiddenToken
     let allowSorryInKernel := allowStub && (code.splitOn explicitStubToken).length > 1
@@ -525,16 +615,19 @@ def runCommandsFromState
     errs := errs ++ kernelErrs
     usedConstants := (collectNewDeclUsedConstants baseState.env s.commandState.env).toList
     proofTermNodes := countNewDeclExprNodes baseState.env s.commandState.env
+    declTypes := collectNewTheoremTypeHashes baseState.env s.commandState.env
   let t1 ← IO.monoNanosNow
   let elapsedUs := (t1 - t0) / 1000
   let cleanNextState : Command.State := { s.commandState with messages := {} }
-  return (errs.isEmpty, elapsedUs, heartbeats, proofTermNodes, errs, allMessages, capturedStdout, usedConstants, cleanNextState)
+  return (errs.isEmpty, elapsedUs, heartbeats, proofTermNodes, errs, allMessages, capturedStdout, usedConstants, declTypes, cleanNextState)
 
 /-- Atomically serialize `finalEnv` (and any module-system companions `.olean.server`, `.olean.private`, `.ir`, `.ir.sig`)
     to `oleanPath` only after verifying `mainModule == modName` and re-auditing all declarations added since `baseEnv`
     for zero forbidden axioms (`sorryAx`, `reduceBool`, `trustCompiler`). -/
 def writeVerifiedModuleOlean (baseEnv finalEnv : Environment) (modName : Name) (oleanPath : System.FilePath) : IO Bool := do
   if modName.isAnonymous || finalEnv.mainModule != modName then
+    return false
+  if !(← kernelReplayNewDecls baseEnv finalEnv).isEmpty then
     return false
   let (clean, kErrs) ← auditNewKernelDecls baseEnv finalEnv false
   if !clean || !kErrs.isEmpty then
@@ -573,150 +666,9 @@ def writeVerifiedModuleOlean (baseEnv finalEnv : Environment) (modName : Name) (
     cleanupTmp
     return false
 
-namespace ZygoteBlake3
-
-def IV : Array UInt32 := #[0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19]
-def MSG_PERMUTATION : Array Nat := #[2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8]
-
-@[inline] def rotr32 (x : UInt32) (n : UInt32) : UInt32 := (x >>> n) ||| (x <<< (32 - n))
-
-@[inline] def g (state : Array UInt32) (a b c d : Nat) (mx my : UInt32) : Array UInt32 :=
-  let va := state[a]! + state[b]! + mx; let vd := rotr32 (state[d]! ^^^ va) 16
-  let vc := state[c]! + vd; let vb := rotr32 (state[b]! ^^^ vc) 12
-  let va := va + vb + my; let vd := rotr32 (vd ^^^ va) 8
-  let vc := vc + vd; let vb := rotr32 (vb ^^^ vc) 7
-  (((state.set! a va).set! b vb).set! c vc).set! d vd
-
-@[inline] def roundFn (state : Array UInt32) (m : Array UInt32) : Array UInt32 :=
-  let state := g (g (g (g state 0 4 8 12 m[0]! m[1]!) 1 5 9 13 m[2]! m[3]!) 2 6 10 14 m[4]! m[5]!) 3 7 11 15 m[6]! m[7]!
-  g (g (g (g state 0 5 10 15 m[8]! m[9]!) 1 6 11 12 m[10]! m[11]!) 2 7 8 13 m[12]! m[13]!) 3 4 9 14 m[14]! m[15]!
-
-@[inline] def permute (m : Array UInt32) : Array UInt32 := MSG_PERMUTATION.map (fun idx => m[idx]!)
-
-def compress (cv : Array UInt32) (blockWords : Array UInt32) (counter : UInt64) (blockLen : UInt32) (flags : UInt32) : Array UInt32 :=
-  let st0 : Array UInt32 := #[cv[0]!, cv[1]!, cv[2]!, cv[3]!, cv[4]!, cv[5]!, cv[6]!, cv[7]!,
-    IV[0]!, IV[1]!, IV[2]!, IV[3]!, counter.toUInt32, (counter >>> 32).toUInt32, blockLen, flags]
-  let (st, _) := (List.range 7).foldl (fun (st, m) r => (roundFn st m, if r < 6 then permute m else m)) (st0, blockWords)
-  (List.range 8).foldl (fun acc i => (acc.set! i (acc[i]! ^^^ acc[i + 8]!)).set! (i + 8) (acc[i + 8]! ^^^ cv[i]!)) st
-
-def blockBytesToWords (bytes : ByteArray) (offset : Nat) (len : Nat) : Array UInt32 :=
-  let getByte (k : Nat) : UInt32 := if k < len && offset + k < bytes.size then (bytes.get! (offset + k)).toUInt32 else 0
-  (Array.range 16).map (fun w =>
-    let base := w * 4
-    getByte base ||| (getByte (base + 1) <<< 8) ||| (getByte (base + 2) <<< 16) ||| (getByte (base + 3) <<< 24))
-
-def wordToHexLE (w : UInt32) : String :=
-  let hexChars := "0123456789abcdef".toList
-  let byteHex (b : UInt32) : List Char := [hexChars[((b >>> 4) &&& 0xf).toNat]?.getD '0', hexChars[(b &&& 0xf).toNat]?.getD '0']
-  String.ofList (byteHex (w &&& 0xff) ++ byteHex ((w >>> 8) &&& 0xff) ++ byteHex ((w >>> 16) &&& 0xff) ++ byteHex ((w >>> 24) &&& 0xff))
-
-def cvToHex (cv : Array UInt32) : String := String.join ((List.range 8).map (fun i => wordToHexLE cv[i]!))
-
-def hashChunk (bytes : ByteArray) (chunkOffset : Nat) (chunkLen : Nat) (chunkCounter : UInt64) (isRoot : Bool) : Array UInt32 :=
-  let numBlocks := if chunkLen == 0 then 1 else (chunkLen + 63) / 64
-  (List.range numBlocks).foldl (fun cv bIdx =>
-    let blkOffset := chunkOffset + bIdx * 64
-    let blkLen := if chunkLen == 0 then 0 else Nat.min 64 (chunkLen - bIdx * 64)
-    let flags : UInt32 := (if bIdx == 0 then 1 else 0) ||| (if bIdx + 1 == numBlocks then 2 ||| (if isRoot then 8 else 0) else 0)
-    (compress cv (blockBytesToWords bytes blkOffset blkLen) chunkCounter blkLen.toUInt32 flags).extract 0 8) IV
-
-def mergeStack (fuel : Nat) (stack : List (Array UInt32)) (count : Nat) (isFinalChunk : Bool) : List (Array UInt32) :=
-  match fuel with
-  | 0 => stack
-  | fuel' + 1 =>
-    if count % 2 == 1 then stack
-    else match stack with
-      | rightCv :: leftCv :: rest =>
-        let flags : UInt32 := 4 ||| (if isFinalChunk && rest.isEmpty && (count / 2 == 1) then 8 else 0)
-        mergeStack fuel' (((compress IV (leftCv ++ rightCv) 0 64 flags).extract 0 8) :: rest) (count / 2) isFinalChunk
-      | _ => stack
-
-def finalizeStack (fuel : Nat) (stack : List (Array UInt32)) : Array UInt32 :=
-  match fuel, stack with
-  | 0, _ => stack.head?.getD IV
-  | _, [] => IV
-  | _, [rootCv] => rootCv
-  | fuel' + 1, rightCv :: leftCv :: rest =>
-    let flags : UInt32 := 4 ||| (if rest.isEmpty then 8 else 0)
-    finalizeStack fuel' (((compress IV (leftCv ++ rightCv) 0 64 flags).extract 0 8) :: rest)
-
-def blake3Bytes (bytes : ByteArray) : String :=
-  let totalLen := bytes.size
-  let numChunks := if totalLen == 0 then 1 else (totalLen + 1023) / 1024
-  if numChunks == 1 then cvToHex (hashChunk bytes 0 totalLen 0 true)
-  else
-    let stack := (List.range numChunks).foldl (fun st cIdx =>
-      let cOff := cIdx * 1024
-      let cLen := Nat.min 1024 (totalLen - cOff)
-      let cv := hashChunk bytes cOff cLen cIdx.toUInt64 false
-      mergeStack 64 (cv :: st) (cIdx + 1) (cIdx + 1 == numChunks)) []
-    cvToHex (finalizeStack 64 stack)
-
-end ZygoteBlake3
-
-/-- 256-bit cryptographic BLAKE3 content digest over raw artifact bytes. -/
-def hashBytesBlake3Hex (bs : ByteArray) : String :=
-  ZygoteBlake3.blake3Bytes bs
-
-/-- Extract all direct imports plus any transitive modules in `env.header.moduleNames`
-    whose `.olean` lives outside the immutable toolchain `sysroot`. -/
-def extractTrackedClosureMods (importsCsv : String) (sysroot : System.FilePath) (env : Environment) : IO (Array Name) := do
-  let sysPrefix := (← try IO.FS.realPath sysroot catch _ => pure sysroot).toString
-  let mut out : Array Name := #[]
-  for imp in parseImportsCsv importsCsv do
-    if !out.contains imp.module then
-      out := out.push imp.module
-  for modName in env.header.moduleNames do
-    if !out.contains modName then
-      try
-        let p ← Lean.findOLean modName
-        let rp ← try IO.FS.realPath p catch _ => pure p
-        if !rp.toString.startsWith sysPrefix then
-          out := out.push modName
-      catch _ =>
-        out := out.push modName
-  return out
-
-/-- Compute a 256-bit BLAKE3 content-verified cache key over the tracked import closure `trackedMods`,
-    including canonical resolved path, byte size, and BLAKE3 content digest for every non-sysroot
-    `.olean` and its module-system companions (`.olean.server`, `.olean.private`, `.ilean`, `.ir`, `.ir.sig`). -/
-def computeImportsClosureDiskKey (importsCsv : String) (sysroot : System.FilePath) (trackedMods : Array Name) : IO (Option String) := do
-  let sysPrefix := (← try IO.FS.realPath sysroot catch _ => pure sysroot).toString
-  let mut parts : List String := [importsCsv]
-  for modName in trackedMods do
-    try
-      let p ← Lean.findOLean modName
-      let rp ← try IO.FS.realPath p catch _ => pure p
-      let m ← rp.metadata
-      let isSys := rp.toString.startsWith sysPrefix
-      let oleanDigest ← if isSys then pure "sys" else do
-        let bs ← IO.FS.readBinFile rp
-        pure (hashBytesBlake3Hex bs)
-      let mut compParts : List String := [s!"{modName}:{rp}:{m.byteSize}:{oleanDigest}"]
-      if !isSys then
-        let companions : List (String × System.FilePath) := [
-          ("srv", System.FilePath.mk s!"{p}.server"),
-          ("prv", System.FilePath.mk s!"{p}.private"),
-          ("ilean", p.withExtension "ilean"),
-          ("ir", p.withExtension "ir"),
-          ("sig", System.FilePath.mk s!"{p.withExtension "ir"}.sig")
-        ]
-        for (tag, cp) in companions do
-          if ← cp.pathExists then
-            let crp ← try IO.FS.realPath cp catch _ => pure cp
-            let cm ← crp.metadata
-            let cbs ← IO.FS.readBinFile crp
-            compParts := s!"{tag}:{crp}:{cm.byteSize}:{hashBytesBlake3Hex cbs}" :: compParts
-          else
-            compParts := s!"{tag}:none" :: compParts
-      parts := (String.intercalate "," compParts.reverse) :: parts
-    catch _ =>
-      return none
-  return some (String.intercalate "|" parts.reverse)
-
 /-- Elaborate and kernel-typecheck `bodyCode` on top of an immutable `baseEnv : Lean.Environment`
     without mutating `baseEnv`.
-    Returns `(ok, elapsed_us, heartbeats, proof_term_nodes, error_messages, all_messages, captured_stdout, used_constants)`. -/
+    Returns `(ok, elapsed_us, heartbeats, proof_term_nodes, error_messages, all_messages, captured_stdout, used_constants, decl_types)`. -/
 def checkShardWithEnv
     (baseEnv : Environment)
     (bodyCode : String)
@@ -724,7 +676,7 @@ def checkShardWithEnv
     (evalMode : Bool := false)
     (fileName : String := "<zygote-shard>")
     (emitOlean? : Option (Name × System.FilePath) := none)
-    (encodedLeanArgs : String := "") : IO (Bool × Nat × Nat × Nat × List String × List String × String × List String) := do
+    (encodedLeanArgs : String := "") : IO (Bool × Nat × Nat × Nat × List String × List String × String × List String × List (String × String)) := do
   -- Eval mode elaborates with the options `Lean.Elab.runFrontend` forces on the command
   -- line (snapshot reporting and asynchronous elaboration); check mode keeps `{}`.
   let initOpts : Options := if evalMode then
@@ -739,7 +691,7 @@ def checkShardWithEnv
         pure (if mainMod.isAnonymous then baseEnv else baseEnv.setMainModule mainMod)
       else pure baseEnv
   let baseState := Command.mkState env {} (← withToolchainSatSolver opts)
-  let (ok, elapsedUs, heartbeats, proofTermNodes, errs, allMessages, capturedStdout, usedConstants, finalSt) ←
+  let (ok, elapsedUs, heartbeats, proofTermNodes, errs, allMessages, capturedStdout, usedConstants, declTypes, finalSt) ←
     runCommandsFromState baseState bodyCode fileName allowStub evalMode
   let mut finalOk := ok
   let mut finalErrs := errs
@@ -753,12 +705,12 @@ def checkShardWithEnv
         if !wrote then
           finalOk := false
           finalErrs := finalErrs ++ ["emit_olean failed module identity or kernel hygiene gate"]
-  return (finalOk, elapsedUs, heartbeats, proofTermNodes, finalErrs, allMessages, capturedStdout, usedConstants)
+  return (finalOk, elapsedUs, heartbeats, proofTermNodes, finalErrs, allMessages, capturedStdout, usedConstants, declTypes)
 
-/-- Run a `batch_fission` sub-shard loop using `evalSub` and return `(ok, elabUs, hbs, nodes, verifiedCount, outStr, msgs, errs, used)`. -/
+/-- Run a `batch_fission` sub-shard loop using `evalSub` and return `(ok, elabUs, hbs, nodes, verifiedCount, outStr, msgs, errs, used, declTypes)`. -/
 def runBatchFissionSubs (hexSubs : List String)
-    (evalSub : String → IO (Bool × Nat × Nat × Nat × List String × List String × String × List String))
-    : IO (Bool × Nat × Nat × Nat × Nat × String × List String × List String × List String) := do
+    (evalSub : String → IO (Bool × Nat × Nat × Nat × List String × List String × String × List String × List (String × String)))
+    : IO (Bool × Nat × Nat × Nat × Nat × String × List String × List String × List String × List (String × String)) := do
   let mut batchOk := true
   let mut totalElabUs : Nat := 0
   let mut totalHbs : Nat := 0
@@ -767,10 +719,11 @@ def runBatchFissionSubs (hexSubs : List String)
   let mut allMsgs : List String := []
   let mut allOut : String := ""
   let mut allUsed : List String := []
+  let mut allDeclTypes : List (String × String) := []
   let mut verifiedCount : Nat := 0
   for hexSub in hexSubs do
     let subCode := decodeHexToString hexSub
-    let (subOk, subElabUs, subHbs, subNodes, subErrs, subMsgs, subOut, subUsed) ← evalSub subCode
+    let (subOk, subElabUs, subHbs, subNodes, subErrs, subMsgs, subOut, subUsed, subDeclTypes) ← evalSub subCode
     totalElabUs := totalElabUs + subElabUs
     totalHbs := totalHbs + subHbs
     totalNodes := totalNodes + subNodes
@@ -778,15 +731,18 @@ def runBatchFissionSubs (hexSubs : List String)
     allOut := allOut ++ subOut
     for c in subUsed do
       if !allUsed.contains c then allUsed := allUsed ++ [c]
+    for (dn, dh) in subDeclTypes do
+      if !(allDeclTypes.any (fun (k, _) => k == dn)) then
+        allDeclTypes := allDeclTypes ++ [(dn, dh)]
     if subOk then verifiedCount := verifiedCount + 1
     else batchOk := false; allErrs := allErrs ++ subErrs; break
-  return (batchOk, totalElabUs, totalHbs, totalNodes, verifiedCount, allOut, allMsgs, allErrs, allUsed)
+  return (batchOk, totalElabUs, totalHbs, totalNodes, verifiedCount, allOut, allMsgs, allErrs, allUsed, allDeclTypes)
 
-/-- Run a `race_candidates` loop using `evalCand` and return `(ok, winIdxJson, elabUs, hbs, nodes, subVerified, outStr, msgs, errs, used)`. -/
+/-- Run a `race_candidates` loop using `evalCand` and return `(ok, winIdxJson, elabUs, hbs, nodes, subVerified, outStr, msgs, errs, used, declTypes)`. -/
 def runRaceCandidatesSubs (hexSubs : List String)
-    (evalCand : String → IO (Bool × Nat × Nat × Nat × List String × List String × String × List String))
+    (evalCand : String → IO (Bool × Nat × Nat × Nat × List String × List String × String × List String × List (String × String)))
     (abortOnFirstFail : Bool := false)
-    : IO (Bool × String × Nat × Nat × Nat × Nat × String × List String × List String × List String) := do
+    : IO (Bool × String × Nat × Nat × Nat × Nat × String × List String × List String × List String × List (String × String)) := do
   let mut raceOk := false
   let mut winningIdx? : Option Nat := none
   let mut totalElabUs : Nat := 0
@@ -796,23 +752,24 @@ def runRaceCandidatesSubs (hexSubs : List String)
   let mut winMsgs : List String := []
   let mut winOut : String := ""
   let mut winUsed : List String := []
+  let mut winDeclTypes : List (String × String) := []
   let mut candIdx : Nat := 0
   for hexCand in hexSubs do
     let candCode := decodeHexToString hexCand
-    let (candOk, candElabUs, candHbs, candNodes, candErrs, candMsgs, candOut, candUsed) ← evalCand candCode
+    let (candOk, candElabUs, candHbs, candNodes, candErrs, candMsgs, candOut, candUsed, candDeclTypes) ← evalCand candCode
     totalElabUs := totalElabUs + candElabUs
     totalHbs := totalHbs + candHbs
     -- A runtime panic poisons the whole process: abort the race and fail the request even if an
     -- earlier candidate already won.
     if candErrs.contains runtimePanicErr then
       raceOk := false; winningIdx? := none; lastErrs := candErrs; winMsgs := candMsgs; winOut := candOut
-      winUsed := []; winNodes := 0
+      winUsed := []; winDeclTypes := []; winNodes := 0
       break
     if candOk then
       let isBetter := !raceOk || (candNodes > 0 && (winNodes == 0 || candNodes < winNodes))
       if isBetter then
         raceOk := true; winningIdx? := some candIdx; winNodes := candNodes
-        winMsgs := candMsgs; winOut := candOut; winUsed := candUsed; lastErrs := []
+        winMsgs := candMsgs; winOut := candOut; winUsed := candUsed; winDeclTypes := candDeclTypes; lastErrs := []
       if candNodes <= 500 || totalElabUs >= 8000 then break
       candIdx := candIdx + 1
     else
@@ -821,7 +778,7 @@ def runRaceCandidatesSubs (hexSubs : List String)
       candIdx := candIdx + 1
       if abortOnFirstFail then break
   let winIdxJson := match winningIdx? with | some idx => toString idx | none => "null"
-  return (raceOk, winIdxJson, totalElabUs, totalHbs, winNodes, if raceOk then 1 else 0, winOut, winMsgs, lastErrs, winUsed)
+  return (raceOk, winIdxJson, totalElabUs, totalHbs, winNodes, if raceOk then 1 else 0, winOut, winMsgs, lastErrs, winUsed, winDeclTypes)
 
 def isWhitelistedInitExecUnsafe (env : Environment) (modIdx : ModuleIdx) (cinfo : ConstantInfo) : Bool :=
   if !cinfo.isUnsafe then false
@@ -1045,8 +1002,9 @@ def collectStubDecls (consts : Array ConstantInfo) (stubOk : Array String) :
   let mut violations : List String := []
   for e in stubOk.toList.eraseDups do
     let hits := consts.filter fun c =>
-      let s := c.name.toString (escape := false)
-      c.isTheorem && (s == e || s.endsWith ("." ++ e))
+      let s := canonicalName (Lean.privateToUserName c.name)
+      let sr := canonicalName c.name
+      c.isTheorem && (s == e || s.endsWith ("." ++ e) || sr == e || sr.endsWith ("." ++ e))
     if hits.size ≤ stubOk.count e then
       out := (hits.filter isExplicitSorryStub).foldl (·.insert ·.name) out
     else
@@ -1054,16 +1012,55 @@ def collectStubDecls (consts : Array ConstantInfo) (stubOk : Array String) :
         [s!"[TurboLean.KernelGate] prefix stub `{e}` is ambiguous: {hits.map (·.name)}"]
   return (out, violations)
 
+/-- Recheck the complete (most private) module data against only its imports, as in
+    LeanChecker.replayFromImports. Importing the target itself would trust its declarations
+    without checking their types. Both module and shard audits call this same gate. -/
+def replayAuditedModule (moduleName : Name) : IO Unit := do
+  let file ← findOLean moduleName
+  let mut files := #[file]
+  let server := OLeanLevel.server.adjustFileName file
+  if ← server.pathExists then
+    files := files.push server
+    let privateFile := OLeanLevel.private.adjustFileName file
+    if ← privateFile.pathExists then
+      files := files.push privateFile
+  let parts ← readModuleDataParts files
+  if h : parts.size = 0 then
+    throw <| IO.userError s!"missing module data for `{moduleName}`"
+  else
+  let mod := parts[0].1
+  let (_, imports) ← importModulesCore mod.imports |>.run
+  let base ← finalizeImport imports mod.imports {} 0 false false (isModule := true)
+  let mut constants := {}
+  let full := parts[parts.size - 1].1
+  for name in full.constNames, ci in full.constants do
+    if base.contains name then
+      throw <| IO.userError s!"`{moduleName}` redeclares imported constant `{name}`"
+    constants := constants.insert name ci
+  discard <| base.toKernelEnv.replay constants
+
 def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Name))
     (ffiAllow : Array (Name × Name × String) := #[])
     (patterns : List String := []) (csimpPatterns : List String := [])
-    (stubs : Std.HashSet Name := {}) : List String := Id.run do
+    (stubs : Std.HashSet Name := {}) : IO (List String) := do
   let csimpAllowed := fun name : Name => csimpPatterns.any (globMatch ·.toList name.toString.toList)
   let unsfTag := "un" ++ "safe"
   let mut violations : List String := []
   let mut targetIdxs : Std.HashMap ModuleIdx String := {}
   let mut allRoots : Array Name := #[]
-  for (_, nm) in targets do
+  for (rawStr, nm) in targets do
+    try
+      -- Compacted import regions are not reclaimed automatically. Isolate each replay so
+      -- repeated dependency imports cannot exhaust the auditor's 8 GiB sandbox limit.
+      -- The child only reads module data and kernel-replays; it never runs initializers.
+      let replay ← IO.Process.output {
+        cmd := (← IO.appPath).toString
+        args := #["--kernel-replay-module", nm.toString]
+      }
+      unless replay.exitCode == 0 do
+        throw <| IO.userError s!"kernel replay child exited {replay.exitCode}: {replay.stderr}"
+    catch e =>
+      violations := violations ++ [s!"[TurboLean.KernelReplay] independent kernel re-check of `{rawStr}` failed: {e}"]
     if let some modIdx := env.getModuleIdx? nm then
       if h : modIdx.toNat < env.header.moduleData.size then
         for cinfo in env.header.moduleData[modIdx.toNat].constants do
@@ -1205,11 +1202,12 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
   return violations
 
 /-- Audit a single compiled shard module: like `auditModuleSlice`, but exempts validated prefix
-    stubs named in `stubOk` and also returns the module's non-stub theorems, read from the kernel
-    environment (never from elaboration output) so the host can confirm every audited target
-    was actually declared. -/
+    stubs named in `stubOk` and also returns the module's non-stub theorems (plus their canonical
+    `statement-v1` kernel type hashes), read from the kernel environment (never from elaboration
+    output) so the host can confirm every audited target was actually declared with the expected
+    kernel type. -/
 def auditShardModule (target : String × Name) (ffiAllow : Array (Name × Name × String))
-    (stubOk : Array String) : IO (List String × Array String) := do
+    (stubOk : Array String) : IO (List String × Array String × List (String × String)) := do
   let patterns := (((← IO.getEnv "TURBO_LEAN_ALLOWED_AXIOMS").getD "").splitOn ",").filterMap fun p =>
     let t := p.trimAscii.toString
     if t.isEmpty then none else some t
@@ -1222,14 +1220,27 @@ def auditShardModule (target : String × Name) (ffiAllow : Array (Name × Name �
       | some modIdx => (env.header.moduleData[modIdx.toNat]?).map (·.constants) |>.getD #[]
       | none => #[]
     let (stubs, stubViolations) := collectStubDecls consts stubOk
-    let decls := consts.filterMap fun c =>
-      if c.isTheorem && !stubs.contains c.name then some (c.name.toString (escape := false)) else none
-    return (stubViolations ++ auditImportedModulesInEnv env #[target] ffiAllow patterns csimpPatterns stubs,
-      decls)
+    let mut decls : Array String := #[]
+    let mut declTypes : List (String × String) := []
+    let mut seen : Std.HashMap String Bool := {}
+    for c in consts do
+      if c.isTheorem && !stubs.contains c.name then
+        let userNm := canonicalName (Lean.privateToUserName c.name)
+        let rawNm := canonicalName c.name
+        decls := decls.push userNm
+        let h := kernelStatementHash c (some target.2)
+        if !(seen[userNm]?.getD false) then
+          seen := seen.insert userNm true
+          declTypes := declTypes ++ [(userNm, h)]
+        if rawNm != userNm && !(seen[rawNm]?.getD false) then
+          seen := seen.insert rawNm true
+          declTypes := declTypes ++ [(rawNm, h)]
+    return (stubViolations ++ (← auditImportedModulesInEnv env #[target] ffiAllow patterns csimpPatterns stubs),
+      decls, declTypes)
   catch e =>
-    return ([s!"[TurboLean.KernelGate] failed to import `{target.1}` for audit: {e}"], #[])
+    return ([s!"[TurboLean.KernelGate] failed to import `{target.1}` for audit: {e}"], #[], [])
 
-partial def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name × Name × String) := #[]) : IO (List String) := do
+def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name × Name × String) := #[]) : IO (List String) := do
   if slice.isEmpty then
     return []
   let patterns := (((← IO.getEnv "TURBO_LEAN_ALLOWED_AXIOMS").getD "").splitOn ",").filterMap fun p =>
@@ -1247,50 +1258,36 @@ partial def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array 
     pure (Except.error (toString e))
   match batchRes with
   | .ok env =>
-    return auditImportedModulesInEnv env slice ffiAllow patterns csimpPatterns
+    auditImportedModulesInEnv env slice ffiAllow patterns csimpPatterns
   | .error errMsg =>
     if slice.size == 1 then
       let (rawStr, _) := slice[0]!
       return [s!"[TurboLean.KernelGate] failed to import `{rawStr}` for audit: {errMsg}"]
-    let missingIdx? : Option Nat := Id.run do
-      if (errMsg.splitOn "does not exist").length > 1 then
-        let parts := errMsg.splitOn "of module "
-        if parts.length > 1 then
-          let modPart := ((parts[1]!).splitOn " does not exist").headD ""
-          if !modPart.isEmpty then
-            return slice.findIdx? (fun (_, nm) => nm.toString == modPart)
-      return none
-    match missingIdx? with
-    | some idx =>
-      let (rawStr, _) := slice[idx]!
-      let without := (slice.extract 0 idx) ++ (slice.extract (idx + 1) slice.size)
-      let vRest ← auditModuleSlice without ffiAllow
-      return [s!"[TurboLean.KernelGate] failed to import `{rawStr}` for audit: {errMsg}"] ++ vRest
-    | none =>
-      let collideIdx? : Option Nat := Id.run do
-        let parts := errMsg.splitOn "import "
-        if parts.length > 1 then
-          let modPart := ((parts[1]!).splitOn " failed").headD ""
-          if !modPart.isEmpty then
-            return slice.findIdx? (fun (_, nm) => nm.toString == modPart)
-        return none
-      match collideIdx? with
-      | some idx =>
-        if idx > 0 then
-          let without := (slice.extract 0 idx) ++ (slice.extract (idx + 1) slice.size)
-          let vRest ← auditModuleSlice without ffiAllow
-          let vSingle ← auditModuleSlice #[slice[idx]!] ffiAllow
-          return vRest ++ vSingle
-        else
-          let mid := slice.size / 2
-          let v1 ← auditModuleSlice (slice.extract 0 mid) ffiAllow
-          let v2 ← auditModuleSlice (slice.extract mid slice.size) ffiAllow
-          return v1 ++ v2
-      | none =>
-        let mid := slice.size / 2
-        let v1 ← auditModuleSlice (slice.extract 0 mid) ffiAllow
-        let v2 ← auditModuleSlice (slice.extract mid slice.size) ffiAllow
-        return v1 ++ v2
+    -- Compacted `.olean` import regions are never unmapped within a single OS process; bisecting
+    -- `Lean.importModules` in-process would accumulate mappings across retries and exhaust the
+    -- untrusted 8 GiB `RLIMIT_DATA` cap. Spawn fresh OS child processes for each half instead.
+    let app := (← IO.appPath).toString
+    let ffiFlags : Array String := ffiAllow.map fun (m, d, sym) =>
+      s!"--ffi-allow={m}={d}={sym}"
+    let runSubSlice (sub : Array (String × Name)) : IO (List String) := do
+      let modFlags := sub.map (·.1)
+      let child ← IO.Process.output {
+        cmd := app
+        args := #["--audit-modules"] ++ ffiFlags ++ modFlags
+      }
+      if child.exitCode == 0 then
+        return []
+      let lastJson? := (child.stdout.splitOn "\n").reverse.find? fun l =>
+        let t := l.trimAscii.toString
+        t.startsWith "{" && t.endsWith "}"
+      let detail := (lastJson?.getD child.stdout).trimAscii.toString
+      let errTail := child.stderr.trimAscii.toString
+      let summary := if detail.isEmpty then errTail else if errTail.isEmpty then detail else s!"{detail} ({errTail})"
+      return [s!"[TurboLean.KernelGate] sub-batch audit failed (exit {child.exitCode}) on {modFlags.toList}: {summary}"]
+    let mid := slice.size / 2
+    let v1 ← runSubSlice (slice.extract 0 mid)
+    let v2 ← runSubSlice (slice.extract mid slice.size)
+    return v1 ++ v2
 
 def auditCompiledModules (modNames : List String) (ffiAllow : Array (Name × Name × String) := #[]) : IO (Bool × List String) := do
   let mut parsed : Array (String × Name) := #[]
@@ -1331,6 +1328,9 @@ def main (args : List String) : IO Unit := do
       dedupSp := dedupSp ++ [p]
   Lean.searchPathRef.set dedupSp
   match args with
+  | ["--kernel-replay-module", moduleName] =>
+    TurboLean.ZygoteWorker.replayAuditedModule (TurboLean.ZygoteWorker.parseModuleName moduleName)
+    return
   | "--audit-modules" :: modArgs =>
     let stdout ← IO.getStdout
     let (ffiArgs, rest) := modArgs.partition (·.startsWith "--ffi-allow=")
@@ -1343,26 +1343,53 @@ def main (args : List String) : IO Unit := do
     let audited := mods.filter (!·.trimAscii.isEmpty)
     -- `--shard` audits exactly one compiled shard module, exempting validated `--stub-ok=` prefix
     -- stubs and reporting its theorems; stubs are never exempt in whole-module audits.
-    let (ok, violations, decls) ← match shardFlag.isEmpty, audited with
+    let (ok, violations, decls, declTypes) ← match shardFlag.isEmpty, audited with
       | true, _ =>
         if stubArgs.isEmpty then
           let (ok, vs) ← TurboLean.ZygoteWorker.auditCompiledModules mods ffiAllow
-          pure (ok, vs, none)
-        else pure (false, ["[TurboLean.KernelGate] --stub-ok requires --shard"], none)
+          pure (ok, vs, none, none)
+        else pure (false, ["[TurboLean.KernelGate] --stub-ok requires --shard"], none, none)
       | false, [m] =>
         let nm := TurboLean.ZygoteWorker.parseModuleName m.trimAscii.toString
-        let (vs, ds) ← TurboLean.ZygoteWorker.auditShardModule (m.trimAscii.toString, nm) ffiAllow
+        let (vs, ds, dts) ← TurboLean.ZygoteWorker.auditShardModule (m.trimAscii.toString, nm) ffiAllow
           (stubArgs.toArray.map fun a => (a.drop 10).toString)
-        pure (vs.isEmpty && !nm.isAnonymous, vs, some ds)
-      | false, _ => pure (false, ["[TurboLean.KernelGate] --shard audits exactly one module"], none)
+        pure (vs.isEmpty && !nm.isAnonymous, vs, some ds, some dts)
+      | false, _ => pure (false, ["[TurboLean.KernelGate] --shard audits exactly one module"], none, none)
     let ok := ok && ffiAllow.size == ffiArgs.length
     let declsJson := match decls with
       | some ds => s!",\"decls\":[{TurboLean.ZygoteWorker.jsonStrList ds.toList}]"
       | none => ""
-    stdout.putStrLn s!"\{\"ok\":{ok},\"audited\":[{TurboLean.ZygoteWorker.jsonStrList audited}],\"violations\":[{TurboLean.ZygoteWorker.jsonStrList violations}]{declsJson}}"
+    let declTypesJson := match declTypes with
+      | some dts => s!",\"decl_types\":\{{TurboLean.ZygoteWorker.jsonKvObj dts}}"
+      | none => ""
+    stdout.putStrLn s!"\{\"ok\":{ok},\"audited\":[{TurboLean.ZygoteWorker.jsonStrList audited}],\"violations\":[{TurboLean.ZygoteWorker.jsonStrList violations}]{declsJson}{declTypesJson}}"
     stdout.flush
     if !ok then
       IO.Process.exit 1
+    return
+  | "--statement-dump" :: mods =>
+    statementHashCliMain mods
+    return
+  -- Declaration identity: read the theorems (and their canonical `statement-v1` kernel type hashes)
+  -- a compiled probe declares within `[minLine, maxLine]` from its `.olean` (data only,
+  -- initializers disabled), never from output the probe controls.
+  | ["--decl-identity", mod, minLineStr, maxLineStr] =>
+    let nm := TurboLean.ZygoteWorker.parseModuleName mod
+    let env ← Lean.importModules #[{ module := nm, importAll := true }] {} 0 #[] true false .private
+    let some idx := env.getModuleIdx? nm | throw (IO.userError s!"module `{mod}` not imported")
+    let some minLine := minLineStr.trimAscii.toString.toNat? | throw (IO.userError s!"invalid minLine `{minLineStr}`")
+    let some maxLine := maxLineStr.trimAscii.toString.toNat? | throw (IO.userError s!"invalid maxLine `{maxLineStr}`")
+    let entries := (env.header.moduleData[idx.toNat]!.constants).filterMap fun c =>
+      if c matches .thmInfo _ then
+        (Lean.declRangeExt.find? (level := .server) env c.name).bind fun r =>
+          let ln := r.selectionRange.pos.line
+          if ln ≥ minLine && ln ≤ maxLine then
+            let userNm := TurboLean.ZygoteWorker.canonicalName (Lean.privateToUserName c.name)
+            let th := TurboLean.ZygoteWorker.kernelStatementHash c (some nm)
+            some s!"\{\"name\":\"{TurboLean.ZygoteWorker.jsonEscape userNm}\",\"type_hash\":\"{TurboLean.ZygoteWorker.jsonEscape th}\",\"line\":{ln}}"
+          else none
+      else none
+    IO.println s!"\{\"decls\":[{String.intercalate "," entries.toList}]}"
     return
   | _ => pure ()
   unsafe enableInitializersExecution
@@ -1372,7 +1399,9 @@ def main (args : List String) : IO Unit := do
     | some s => pure (match s.trimAscii.toString.toNat? with | some n => if n > 0 then n else 32 | none => 32)
     | none => pure 32
   let maxEnvCache : Nat := 16
-  let mut envCache : Std.HashMap String (String × Array Name × Lean.Environment) := {}
+  -- Envs are cached only under a host-supplied closure digest: the host re-reads the closure
+  -- after each import and kills this worker unless the digest provably labels the bytes read.
+  let mut envCache : Std.HashMap String (String × Lean.Environment) := {}
   let mut envCacheOrder : Array String := #[]
   let mut stateCache : Std.HashMap String (String × Command.State × List String × String × Nat) := {}
   let mut stateCacheOrder : Array String := #[]
@@ -1465,38 +1494,24 @@ def main (args : List String) : IO Unit := do
       TurboLean.ZygoteWorker.emitZygoteReply stdout false none (!evalMode) false false false 0 0 0 0 0 0 "" hMsgs hErrs []
       try IO.Process.setCurrentDir initCwd catch _ => pure ()
       continue
-    let cachedHit? ← match envCache[importsCsv]? with
-      | some (cachedDiskKey, trackedMods, cachedEnv) => do
-        if !hostClosureDigest.isEmpty then
-          let hostKey := s!"host:{hostClosureDigest}"
-          pure (if cachedDiskKey == hostKey then some (hostKey, trackedMods, cachedEnv) else none)
-        else if cachedDiskKey.startsWith "host:" then
-          pure none
-        else
-          match ← TurboLean.ZygoteWorker.computeImportsClosureDiskKey importsCsv sysroot trackedMods with
-          | some curKey =>
-            pure (if curKey == cachedDiskKey then some (curKey, trackedMods, cachedEnv) else none)
-          | none => pure none
-      | none => pure none
-    let (envCacheHit, importUs, baseEnv?, envErr?, envDiskKey?, trackedMods) ← match cachedHit? with
-      | some (curKey, tMods, env) => pure (true, 0, some env, none, some curKey, tMods)
+    let hostKey? := if hostClosureDigest.isEmpty then none else some s!"host:{hostClosureDigest}"
+    let cachedHit? := match envCache[importsCsv]?, hostKey? with
+      | some (cachedKey, cachedEnv), some hostKey => if cachedKey == hostKey then some cachedEnv else none
+      | _, _ => none
+    let (envCacheHit, importUs, baseEnv?, envErr?) ← match cachedHit? with
+      | some env => pure (true, 0, some env, none)
       | none => do
         let tImp0 ← IO.monoNanosNow
         let level : OLeanLevel := if isMod then .exported else .private
         try
           unsafe enableInitializersExecution
           let env ← Lean.importModules imports {} 1025 #[] false true level
-          let (freshKey?, tMods) ← if !hostClosureDigest.isEmpty then
-              pure (some s!"host:{hostClosureDigest}", #[])
-            else do
-              let tm ← TurboLean.ZygoteWorker.extractTrackedClosureMods importsCsv sysroot env
-              let fk? ← TurboLean.ZygoteWorker.computeImportsClosureDiskKey importsCsv sysroot tm
-              pure (fk?, tm)
           let tImp1 ← IO.monoNanosNow
-          pure (false, (tImp1 - tImp0) / 1000, some env, none, freshKey?, tMods)
+          pure (false, (tImp1 - tImp0) / 1000, some env, none)
         catch e =>
           let tImp1 ← IO.monoNanosNow
-          pure (false, (tImp1 - tImp0) / 1000, none, some (toString e), none, #[])
+          pure (false, (tImp1 - tImp0) / 1000, none, some (toString e))
+    let envDiskKey? := hostKey?
     match baseEnv? with
     | some baseEnv =>
       if !envCacheHit then
@@ -1508,7 +1523,7 @@ def main (args : List String) : IO Unit := do
               envCacheOrder := envCacheOrder.extract 1 envCacheOrder.size
             | none =>
               envCache := {}
-          envCache := envCache.insert importsCsv (validDiskKey, trackedMods, baseEnv)
+          envCache := envCache.insert importsCsv (validDiskKey, baseEnv)
           if !envCacheOrder.contains importsCsv then
             envCacheOrder := envCacheOrder.push importsCsv
       let envDiskKey ← match envDiskKey? with
@@ -1527,22 +1542,22 @@ def main (args : List String) : IO Unit := do
         let combineWithPref := fun (subCode : String) =>
           if prefixCode.trimAscii.toString.isEmpty then subCode else prefixCode ++ "\n" ++ subCode
         if isBatchFission then
-          let (bOk, bElabUs, bHbs, bNodes, bVer, bOut, bMsgs, bErrs, bUsed) ←
+          let (bOk, bElabUs, bHbs, bNodes, bVer, bOut, bMsgs, bErrs, bUsed, bDeclTypes) ←
             TurboLean.ZygoteWorker.runBatchFissionSubs hexSubs (fun sc =>
               TurboLean.ZygoteWorker.checkShardWithEnv baseEnv (combineWithPref sc) allowStub false fn none encodedLeanArgs)
           if !bOk && bErrs.contains TurboLean.ZygoteWorker.runtimePanicErr then poisoned := true
-          TurboLean.ZygoteWorker.emitZygoteReply stdout bOk none kgActive true envCacheHit false importUs 0 bElabUs bHbs bNodes bVer bOut bMsgs bErrs bUsed
+          TurboLean.ZygoteWorker.emitZygoteReply stdout bOk none kgActive true envCacheHit false importUs 0 bElabUs bHbs bNodes bVer bOut bMsgs bErrs bUsed bDeclTypes
         else if isRaceCandidates then
-          let (rOk, winIdx, rElabUs, rHbs, rNodes, rVer, rOut, rMsgs, rErrs, rUsed) ←
+          let (rOk, winIdx, rElabUs, rHbs, rNodes, rVer, rOut, rMsgs, rErrs, rUsed, rDeclTypes) ←
             TurboLean.ZygoteWorker.runRaceCandidatesSubs hexSubs (fun cc =>
               TurboLean.ZygoteWorker.checkShardWithEnv baseEnv (combineWithPref cc) allowStub false fn none encodedLeanArgs)
           if !rOk && rErrs.contains TurboLean.ZygoteWorker.runtimePanicErr then poisoned := true
-          TurboLean.ZygoteWorker.emitZygoteReply stdout rOk (some winIdx) kgActive true envCacheHit false importUs 0 rElabUs rHbs rNodes rVer rOut rMsgs rErrs rUsed
+          TurboLean.ZygoteWorker.emitZygoteReply stdout rOk (some winIdx) kgActive true envCacheHit false importUs 0 rElabUs rHbs rNodes rVer rOut rMsgs rErrs rUsed rDeclTypes
         else
-          let (ok, elabUs, hbs, ptNodes, errs, msgs, capOut, usedConsts) ←
+          let (ok, elabUs, hbs, ptNodes, errs, msgs, capOut, usedConsts, declTypes) ←
             TurboLean.ZygoteWorker.checkShardWithEnv baseEnv bodyCode allowStub evalMode fn emitOlean? encodedLeanArgs
           if !ok && errs.contains TurboLean.ZygoteWorker.runtimePanicErr then poisoned := true
-          TurboLean.ZygoteWorker.emitZygoteReply stdout ok none kgActive true envCacheHit false importUs 0 elabUs hbs ptNodes (if ok then 1 else 0) capOut msgs errs usedConsts
+          TurboLean.ZygoteWorker.emitZygoteReply stdout ok none kgActive true envCacheHit false importUs 0 elabUs hbs ptNodes (if ok then 1 else 0) capOut msgs errs usedConsts declTypes
       else
         let fnPref := customFileName?.getD "<zygote-prefix>"
         let cwdKey := targetCwd.toString
@@ -1569,7 +1584,7 @@ def main (args : List String) : IO Unit := do
                     pure (if mainMod.isAnonymous then baseEnv else baseEnv.setMainModule mainMod)
                   else pure baseEnv
               let baseState := Command.mkState envForPref {} (← TurboLean.ZygoteWorker.withToolchainSatSolver opts)
-              let (pOk, pUs, pHbs, _pNodes, pErrs, pMsgs, pOut, _pUsed, nextSt) ←
+              let (pOk, pUs, pHbs, _pNodes, pErrs, pMsgs, pOut, _pUsed, _pDeclTypes, nextSt) ←
                 TurboLean.ZygoteWorker.runCommandsFromState baseState prefixCode fnPref prefAllowStub evalMode
               if pErrs.contains TurboLean.ZygoteWorker.runtimePanicErr then poisoned := true
               if pOk then pure (false, pUs, some nextSt, [], pMsgs, pOut, pHbs, some prefixCode)
@@ -1598,7 +1613,7 @@ def main (args : List String) : IO Unit := do
                 let lastLine := (prevCode.splitOn "\n").getLast!
                 let padding := "".pushn '\n' (prevCode.toList.filter (· == '\n')).length ++ "".pushn ' ' lastLine.length
                 let deltaCode := padding ++ (prefixCode.drop (String.length prevCode)).toString
-                let (dOk, dUs, dHbs, _dNodes, dErrs, dMsgs, dOut, _dUsed, dNextSt) ←
+                let (dOk, dUs, dHbs, _dNodes, dErrs, dMsgs, dOut, _dUsed, _dDeclTypes, dNextSt) ←
                   TurboLean.ZygoteWorker.runCommandsFromState prevState deltaCode fnPref prefAllowStub evalMode
                 if dOk then
                   pure (some (false, dUs, some dNextSt, ([] : List String), prevMsgs ++ dMsgs, prevOut ++ dOut, prevHbs + dHbs, some prefixCode))
@@ -1623,7 +1638,7 @@ def main (args : List String) : IO Unit := do
                     pure (if mainMod.isAnonymous then baseEnv else baseEnv.setMainModule mainMod)
                   else pure baseEnv
               let baseState := Command.mkState envForPref {} (← TurboLean.ZygoteWorker.withToolchainSatSolver opts)
-              let (pOk, pUs, pHbs, _pNodes, pErrs, pMsgs, pOut, _pUsed, nextSt) ←
+              let (pOk, pUs, pHbs, _pNodes, pErrs, pMsgs, pOut, _pUsed, _pDeclTypes, nextSt) ←
                 TurboLean.ZygoteWorker.runCommandsFromState baseState prefixCode fnPref prefAllowStub evalMode
               if pErrs.contains TurboLean.ZygoteWorker.runtimePanicErr then poisoned := true
               if pOk then pure (false, pUs, some nextSt, [], pMsgs, pOut, pHbs, some prefixCode)
@@ -1656,25 +1671,25 @@ def main (args : List String) : IO Unit := do
                 (boundedTree.push (pCode, ckptState, prefMsgs, prefOut, prefHbs))
           let fn := customFileName?.getD "<zygote-decl>"
           let evalFromCkpt := fun (sc : String) => do
-            let (ok, us, hbs, nodes, errs, msgs, outS, used, _) ←
+            let (ok, us, hbs, nodes, errs, msgs, outS, used, dts, _) ←
               TurboLean.ZygoteWorker.runCommandsFromState ckptState sc fn allowStub false
-            pure (ok, us, hbs, nodes, errs, msgs, outS, used)
+            pure (ok, us, hbs, nodes, errs, msgs, outS, used, dts)
           if isBatchFission then
             if hexSubs.isEmpty then
               TurboLean.ZygoteWorker.emitZygoteReply stdout true none kgActive true envCacheHit prefixCacheHit importUs prefixUs 0 prefHbs 0 0 prefOut prefMsgs [] []
             else
-              let (bOk, bElabUs, bHbs, bNodes, bVer, bOut, bMsgs, bErrs, bUsed) ←
+              let (bOk, bElabUs, bHbs, bNodes, bVer, bOut, bMsgs, bErrs, bUsed, bDeclTypes) ←
                 TurboLean.ZygoteWorker.runBatchFissionSubs hexSubs evalFromCkpt
               if !bOk && bErrs.contains TurboLean.ZygoteWorker.runtimePanicErr then poisoned := true
-              TurboLean.ZygoteWorker.emitZygoteReply stdout bOk none kgActive true envCacheHit prefixCacheHit importUs prefixUs bElabUs bHbs bNodes bVer bOut bMsgs bErrs bUsed
+              TurboLean.ZygoteWorker.emitZygoteReply stdout bOk none kgActive true envCacheHit prefixCacheHit importUs prefixUs bElabUs bHbs bNodes bVer bOut bMsgs bErrs bUsed bDeclTypes
           else if isRaceCandidates then
             if hexSubs.isEmpty then
               TurboLean.ZygoteWorker.emitZygoteReply stdout false (some "null") kgActive true envCacheHit prefixCacheHit importUs prefixUs 0 prefHbs 0 0 prefOut prefMsgs [] []
             else
-              let (rOk, winIdx, rElabUs, rHbs, rNodes, rVer, rOut, rMsgs, rErrs, rUsed) ←
+              let (rOk, winIdx, rElabUs, rHbs, rNodes, rVer, rOut, rMsgs, rErrs, rUsed, rDeclTypes) ←
                 TurboLean.ZygoteWorker.runRaceCandidatesSubs hexSubs evalFromCkpt
               if !rOk && rErrs.contains TurboLean.ZygoteWorker.runtimePanicErr then poisoned := true
-              TurboLean.ZygoteWorker.emitZygoteReply stdout rOk (some winIdx) kgActive true envCacheHit prefixCacheHit importUs prefixUs rElabUs rHbs rNodes rVer rOut rMsgs rErrs rUsed
+              TurboLean.ZygoteWorker.emitZygoteReply stdout rOk (some winIdx) kgActive true envCacheHit prefixCacheHit importUs prefixUs rElabUs rHbs rNodes rVer rOut rMsgs rErrs rUsed rDeclTypes
           else if bodyCode.trimAscii.toString.isEmpty then
             let mut emitOk := true
             let mut emitErrs : List String := []
@@ -1689,9 +1704,10 @@ def main (args : List String) : IO Unit := do
                   emitErrs := ["emit_olean failed module identity or kernel hygiene gate"]
             let prefPtNodes := if !evalMode then TurboLean.ZygoteWorker.countNewDeclExprNodes baseEnv ckptState.env else 0
             let prefUsed := if !evalMode then (TurboLean.ZygoteWorker.collectNewDeclUsedConstants baseEnv ckptState.env).toList else []
-            TurboLean.ZygoteWorker.emitZygoteReply stdout emitOk none kgActive true envCacheHit prefixCacheHit importUs prefixUs 0 prefHbs prefPtNodes (if emitOk then 1 else 0) prefOut prefMsgs emitErrs prefUsed
+            let prefDeclTypes := if !evalMode then TurboLean.ZygoteWorker.collectNewTheoremTypeHashes baseEnv ckptState.env else []
+            TurboLean.ZygoteWorker.emitZygoteReply stdout emitOk none kgActive true envCacheHit prefixCacheHit importUs prefixUs 0 prefHbs prefPtNodes (if emitOk then 1 else 0) prefOut prefMsgs emitErrs prefUsed prefDeclTypes
           else
-            let (ok, elabUs, dHbs, ptNodes, errs, dMsgs, dOut, usedConsts, finalSt) ←
+            let (ok, elabUs, dHbs, ptNodes, errs, dMsgs, dOut, usedConsts, declTypes, finalSt) ←
               TurboLean.ZygoteWorker.runCommandsFromState ckptState bodyCode fn allowStub evalMode
             let mut finalOk := ok
             let mut finalErrs := errs
@@ -1709,7 +1725,7 @@ def main (args : List String) : IO Unit := do
             let finalOut := if evalMode then prefOut ++ dOut else dOut
             let finalHbs := if evalMode then prefHbs + dHbs else dHbs
             if !finalOk && finalErrs.contains TurboLean.ZygoteWorker.runtimePanicErr then poisoned := true
-            TurboLean.ZygoteWorker.emitZygoteReply stdout finalOk none kgActive true envCacheHit prefixCacheHit importUs prefixUs elabUs finalHbs ptNodes (if finalOk then 1 else 0) finalOut finalMsgs finalErrs usedConsts
+            TurboLean.ZygoteWorker.emitZygoteReply stdout finalOk none kgActive true envCacheHit prefixCacheHit importUs prefixUs elabUs finalHbs ptNodes (if finalOk then 1 else 0) finalOut finalMsgs finalErrs usedConsts declTypes
         | none, false =>
           -- Fallback: if prefix failed on its own (e.g. split mid-command or error in prefix), elaborate combined prefix + body from baseEnv
           let prefixCode := decodedPrefix?.getD (TurboLean.ZygoteWorker.decodeHexToString hexPrefix)
@@ -1720,28 +1736,28 @@ def main (args : List String) : IO Unit := do
             if hexSubs.isEmpty then
               TurboLean.ZygoteWorker.emitZygoteReply stdout false none kgActive true envCacheHit false importUs prefixUs 0 prefHbs 0 0 prefOut prefMsgs prefErrs []
             else
-              let (bOk, bElabUs, bHbs, bNodes, bVer, bOut, bMsgs, bErrs, bUsed) ←
+              let (bOk, bElabUs, bHbs, bNodes, bVer, bOut, bMsgs, bErrs, bUsed, bDeclTypes) ←
                 TurboLean.ZygoteWorker.runBatchFissionSubs hexSubs evalCombined
               if !bOk && bErrs.contains TurboLean.ZygoteWorker.runtimePanicErr then poisoned := true
-              TurboLean.ZygoteWorker.emitZygoteReply stdout bOk none kgActive true envCacheHit false importUs prefixUs bElabUs bHbs bNodes bVer bOut bMsgs bErrs bUsed
+              TurboLean.ZygoteWorker.emitZygoteReply stdout bOk none kgActive true envCacheHit false importUs prefixUs bElabUs bHbs bNodes bVer bOut bMsgs bErrs bUsed bDeclTypes
           else if isRaceCandidates then
             if hexSubs.isEmpty then
               TurboLean.ZygoteWorker.emitZygoteReply stdout false (some "null") kgActive true envCacheHit false importUs prefixUs 0 prefHbs 0 0 prefOut prefMsgs prefErrs []
             else
-              let (rOk, winIdx, rElabUs, rHbs, rNodes, rVer, rOut, rMsgs, rErrs, rUsed) ←
+              let (rOk, winIdx, rElabUs, rHbs, rNodes, rVer, rOut, rMsgs, rErrs, rUsed, rDeclTypes) ←
                 TurboLean.ZygoteWorker.runRaceCandidatesSubs hexSubs evalCombined (!prefErrs.isEmpty)
               if !rOk && rErrs.contains TurboLean.ZygoteWorker.runtimePanicErr then poisoned := true
-              TurboLean.ZygoteWorker.emitZygoteReply stdout rOk (some winIdx) kgActive true envCacheHit false importUs prefixUs rElabUs rHbs rNodes rVer rOut rMsgs rErrs rUsed
+              TurboLean.ZygoteWorker.emitZygoteReply stdout rOk (some winIdx) kgActive true envCacheHit false importUs prefixUs rElabUs rHbs rNodes rVer rOut rMsgs rErrs rUsed rDeclTypes
           else if bodyCode.trimAscii.toString.isEmpty then
             TurboLean.ZygoteWorker.emitZygoteReply stdout false none kgActive true envCacheHit false importUs prefixUs 0 prefHbs 0 0 prefOut prefMsgs prefErrs []
           else
             let prefNewlines := prefixCode.toList.filter (· == '\n') |>.length
             let rest := (bodyCode.drop prefNewlines).toString
             let combined := if prefixCode.endsWith "\n" then prefixCode ++ rest else prefixCode ++ "\n" ++ rest
-            let (ok, elabUs, hbs, ptNodes, errs, msgs, capOut, usedConsts) ←
+            let (ok, elabUs, hbs, ptNodes, errs, msgs, capOut, usedConsts, declTypes) ←
               TurboLean.ZygoteWorker.checkShardWithEnv baseEnv combined allowStub evalMode fn emitOlean? encodedLeanArgs
             if !ok && errs.contains TurboLean.ZygoteWorker.runtimePanicErr then poisoned := true
-            TurboLean.ZygoteWorker.emitZygoteReply stdout ok none kgActive true envCacheHit false importUs prefixUs elabUs hbs ptNodes (if ok then 1 else 0) capOut msgs errs usedConsts
+            TurboLean.ZygoteWorker.emitZygoteReply stdout ok none kgActive true envCacheHit false importUs prefixUs elabUs hbs ptNodes (if ok then 1 else 0) capOut msgs errs usedConsts declTypes
     | none =>
       let rawErr := envErr?.getD "importModules failed"
       let formattedErr := match customFileName? with

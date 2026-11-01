@@ -161,10 +161,11 @@ pub fn derive_telemetry_project_id(dir: Option<&Path>) -> String {
         .unwrap_or_else(|| PathBuf::from("."));
     let canon = work_dir.canonicalize().unwrap_or(work_dir);
     let mut ident = canon.display().to_string();
-    if let Ok(out) = std::process::Command::new("git")
-        .args(["-C", &ident, "config", "--get", "remote.origin.url"])
-        .output()
-    {
+    if let Ok(out) = crate::trusted_tools::git(&canon).and_then(|mut git| {
+        git.args(["-C", &ident, "config", "--get", "remote.origin.url"])
+            .output()
+            .map_err(Into::into)
+    }) {
         if out.status.success() {
             let rem = String::from_utf8_lossy(&out.stdout)
                 .trim()
@@ -1292,8 +1293,29 @@ pub fn execute_fast_check(
         if let Some(stmt) = stmt_src.filter(|s| !s.trim().is_empty()) {
             batch_pairs.push((decl_name.to_string(), stmt.to_string()));
         } else if let Some(f_str) = file.filter(|s| !s.trim().is_empty()) {
-            match fs::read_to_string(f_str) {
-                Ok(src_text) => batch_pairs.push((decl_name.to_string(), src_text)),
+            let raw_path = Path::new(f_str);
+            let resolved_path = if raw_path.is_relative() {
+                project_dir
+                    .map(|pd| pd.join(raw_path))
+                    .unwrap_or_else(|| raw_path.to_path_buf())
+            } else {
+                raw_path.to_path_buf()
+            };
+            match fs::read_to_string(&resolved_path) {
+                Ok(src_text) => {
+                    let proj_root = project_dir
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| crate::lake_build::find_project_root(&resolved_path));
+                    match crate::gpu_fastcheck::extract_confirmed_fastcheck_pairs(
+                        &src_text,
+                        decl,
+                        &proj_root,
+                        &resolved_path,
+                    ) {
+                        Ok(pairs) => batch_pairs = pairs,
+                        Err(e) => file_read_err = Some(format!("{:#}", e)),
+                    }
+                }
                 Err(e) => {
                     file_read_err = Some(format!("Failed to read `{}`: {}", f_str, e));
                 }
@@ -1362,7 +1384,7 @@ pub fn execute_fast_check(
 }
 
 fn resolve_cli_bin() -> PathBuf {
-    let mut cli_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("turbo-lean"));
+    let mut cli_bin = std::env::current_exe().unwrap_or_default();
     if cli_bin.file_name().and_then(|s| s.to_str()) != Some("turbo-lean") {
         if let Some(parent_bin) = cli_bin
             .parent()

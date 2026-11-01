@@ -161,6 +161,9 @@ pub struct ModuleNode {
     pub src_blake3: String,
     pub direct_dag_deps: Vec<String>,
     pub external_olean_deps: Vec<(String, PathBuf)>,
+    /// Source-less prebuilt `.olean`s among `external_olean_deps` (no replay provenance).
+    #[serde(default)]
+    pub prebuilt_olean_deps: Vec<String>,
     pub expected_all_deps: Vec<String>,
     pub extern_lib_digests: Vec<String>,
     pub pkg_config_digest: String,
@@ -975,23 +978,6 @@ pub fn resolve_toolchain_compiler_with_trust(
             let c = cand.canonicalize().unwrap_or_else(|_| cand.clone());
             !c.starts_with(&canon_proj)
         })
-        .or_else(|| {
-            // Never execute `spawn_lake_env` on untrusted projects or when strict toolchain mode is active
-            if strict_tc {
-                None
-            } else {
-                lake_build::spawn_lake_env(project_dir)
-                    .ok()
-                    .map(|env| PathBuf::from(lake_build::lean_bin_from_env(&env)))
-                    .filter(|p| {
-                        p.is_file()
-                            && !p
-                                .canonicalize()
-                                .unwrap_or_else(|_| p.clone())
-                                .starts_with(&canon_proj)
-                    })
-            }
-        })
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "Could not locate installed `lean` compiler binary matching toolchain `{}` for {}: fail-closed toolchain gate",
@@ -1019,6 +1005,7 @@ pub fn resolve_toolchain_compiler_with_trust(
         }
     }
     let githash_out = Command::new(&canon_bin)
+        .env("PATH", "/usr/bin:/bin")
         .arg("--githash")
         .output()
         .context("Failed to execute `lean --githash`")?;
@@ -1078,6 +1065,7 @@ pub fn resolve_toolchain_compiler_with_trust(
             .unwrap_or(false)
         {
             let ver_out = Command::new(&canon_bin)
+                .env("PATH", "/usr/bin:/bin")
                 .arg("--version")
                 .output()
                 .context("Failed to execute `lean --version` for toolchain verification")?;
@@ -1107,6 +1095,7 @@ pub fn resolve_toolchain_compiler_with_trust(
         .filter(|p| p.join("lib/lean").is_dir())
         .or_else(|| {
             let out = Command::new(&canon_bin)
+        .env("PATH", "/usr/bin:/bin")
                 .arg("--print-prefix")
                 .output()
                 .ok()?;
@@ -1137,6 +1126,111 @@ pub fn resolve_toolchain_compiler_with_trust(
     }
     Ok((canon_bin, githash, lib_lean, lib))
 }
+/// Absolute verifier tools from one installed toolchain. Never derive these from Lake's
+/// environment: Lake prepends project executable directories to PATH.
+#[derive(Clone, Debug)]
+pub(crate) struct ToolchainExecutables {
+    pub lean: PathBuf,
+    pub lake: PathBuf,
+    pub leanc: PathBuf,
+}
+
+impl ToolchainExecutables {
+    pub fn resolve(project: &Path, toolchain: &str) -> Result<Self> {
+        let project = lake_build::find_project_root(project);
+        let (lean, _, _, _) = resolve_toolchain_compiler_with_trust(&project, toolchain, true)?;
+        let tools = Self::from_lean(&lean)?;
+        let project = project.canonicalize()?;
+        for tool in [&tools.lean, &tools.lake, &tools.leanc] {
+            anyhow::ensure!(
+                !tool.starts_with(&project),
+                "Verifier executable `{}` is inside project: fail-closed toolchain gate",
+                tool.display()
+            );
+        }
+        Ok(tools)
+    }
+
+    pub fn from_lean(lean: &Path) -> Result<Self> {
+        anyhow::ensure!(
+            lean.is_absolute(),
+            "Verifier compiler `{}` must be absolute: fail-closed toolchain gate",
+            lean.display()
+        );
+        let lean = lean.canonicalize().with_context(|| {
+            format!(
+                "Missing verifier compiler `{}`: fail-closed toolchain gate",
+                lean.display()
+            )
+        })?;
+        let bin = lean
+            .parent()
+            .context("Missing verifier toolchain bin directory")?;
+        let sibling = |name: &str| -> Result<PathBuf> {
+            let path = bin.join(name);
+            let canonical = path.canonicalize().with_context(|| {
+                format!(
+                    "Missing required toolchain sibling `{}`: fail-closed toolchain gate",
+                    path.display()
+                )
+            })?;
+            anyhow::ensure!(
+                canonical.is_file() && canonical.parent() == Some(bin),
+                "Invalid toolchain sibling `{}`: fail-closed toolchain gate",
+                path.display()
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                anyhow::ensure!(
+                    canonical.metadata()?.permissions().mode() & 0o111 != 0,
+                    "Toolchain sibling `{}` is not executable: fail-closed toolchain gate",
+                    path.display()
+                );
+            }
+            Ok(canonical)
+        };
+        Ok(Self {
+            lake: sibling("lake")?,
+            leanc: sibling("leanc")?,
+            lean,
+        })
+    }
+
+    pub fn path(&self) -> String {
+        verifier_path(&self.lean)
+    }
+
+    pub fn apply_env(&self, env: &mut HashMap<String, String>) {
+        env.insert("PATH".into(), self.path());
+        for (name, path) in [
+            ("LEAN", &self.lean),
+            ("LAKE", &self.lake),
+            ("LEANC", &self.leanc),
+        ] {
+            env.insert(name.into(), path.to_string_lossy().into_owned());
+        }
+    }
+}
+
+/// Only the resolved toolchain and fixed system utilities, never caller/project bins.
+pub(crate) fn verifier_path(lean: &Path) -> String {
+    match lean.parent().filter(|p| p.is_absolute()) {
+        Some(bin) => format!("{}:/usr/bin:/bin", bin.display()),
+        None => "/usr/bin:/bin".into(),
+    }
+}
+
+/// Revalidate toolchain siblings and replace executable overrides after supplied envs.
+pub(crate) fn verifier_command(lean: &Path, env: &HashMap<String, String>) -> Result<Command> {
+    let tools = ToolchainExecutables::from_lean(lean)?;
+    let mut env = env.clone();
+    tools.apply_env(&mut env);
+    let mut command = Command::new(&tools.lean);
+    command.envs(env);
+    Ok(command)
+}
+
 /// Parse `lake-manifest.json` in `project_dir` if present. `packagesDir`, package names and
 /// `subDir` must stay inside the workspace; so must a `path` dependency's `dir` when
 /// `is_untrusted` (a trusted workspace may point one at a sibling checkout, as Lake allows).
@@ -4228,6 +4322,18 @@ pub fn is_allowed_lean_arg(arg: &str) -> bool {
     matches!(t, "--json" | "-q" | "--quiet")
 }
 
+/// Fail closed at request/process boundaries using the static Lake argument policy.
+/// Validate before filtering output-format flags or looking up cached verification results.
+pub fn validate_lean_args(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<()> {
+    let args: Vec<String> = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_string())
+        .collect();
+    validate_effective_lean_args(&args)
+        .map(drop)
+        .map_err(|error| anyhow::anyhow!("{error:#}: fail-closed static Lake config gate"))
+}
+
 /// Filter and normalize Lean compiler flags via `is_allowed_lean_arg`, dropping output-format
 /// flags (`--json`, `-q`, `--quiet`): they never change elaboration, and callers that parse
 /// plain-text `lean` output (`#print axioms`, determinism checks) must not receive them.
@@ -4416,19 +4522,14 @@ fn finalize_package_config(
         }
     }
     let check_allowed_args = |args: &[String], scope: &str| -> Result<()> {
-        for a in args {
-            let allowed = validate_effective_lean_args(std::slice::from_ref(a)).is_ok();
-            if !c_abi::verify_static_lake_config(true, !allowed, false, false) {
-                anyhow::bail!(
-                    "Unsupported or unsafe Lean compiler flag `{}` in {} of {} ({}): fail-closed static Lake config gate",
-                    a.trim(),
-                    scope,
-                    pkg.name,
-                    config_path.display()
-                );
-            }
-        }
-        Ok(())
+        validate_lean_args(args).map_err(|error| {
+            anyhow::anyhow!(
+                "{} of {} ({}): {error:#}",
+                scope,
+                pkg.name,
+                config_path.display()
+            )
+        })
     };
     // `leanOptions` reach Lean as `-Dk=v`, so they pass the same gate as explicit flags
     // (e.g. `warn.sorry=false` and malformed keys are rejected).
@@ -4555,7 +4656,7 @@ pub fn resolve_project_config_with_trust(
         .unwrap_or_else(|_| project_dir.to_path_buf());
     let toolchain = lake_build::detect_toolchain(&canon_dir);
     let (lean_bin, lean_githash, toolchain_lib_lean, toolchain_lib) =
-        match resolve_toolchain_compiler_with_trust(&canon_dir, &toolchain, is_untrusted) {
+        match resolve_toolchain_compiler_with_trust(&canon_dir, &toolchain, true) {
             Ok(resolved) => resolved,
             Err(e) => {
                 let strict_tc = is_untrusted
@@ -4575,6 +4676,9 @@ pub fn resolve_project_config_with_trust(
                 )
             }
         };
+    if lean_bin.is_absolute() {
+        ToolchainExecutables::from_lean(&lean_bin)?;
+    }
     let root_pkg = resolve_package_config(&canon_dir, true)?;
     let (manifest_pkgs_dir, manifest_packages, manifest_hash_opt) =
         parse_lake_manifest(&canon_dir, is_untrusted)?;
@@ -4955,29 +5059,90 @@ pub(crate) fn resolve_module_in_package(
     }
     None
 }
-pub(crate) fn is_builtin_toolchain_module(toolchain_lib_lean: &Path, mod_name: &str) -> bool {
-    if mod_name == "Init"
-        || mod_name.starts_with("Init.")
-        || mod_name == "Std"
-        || mod_name.starts_with("Std.")
-        || mod_name == "Lean"
-        || mod_name.starts_with("Lean.")
-        || mod_name == "Lake"
-        || mod_name.starts_with("Lake.")
-    {
+pub(crate) fn is_verified_toolchain_olean_file(
+    toolchain_lib_lean: &Path,
+    lean_githash: Option<&str>,
+    olean_path: &Path,
+) -> bool {
+    if toolchain_lib_lean.as_os_str().is_empty() || !olean_path.is_file() {
+        return false;
+    }
+    let Ok(canon_tc) = toolchain_lib_lean.canonicalize() else {
+        return false;
+    };
+    let Ok(canon_olean) = olean_path.canonicalize() else {
+        return false;
+    };
+    if !canon_olean.starts_with(&canon_tc) {
+        return false;
+    }
+    let Some(expected_gh) = lean_githash
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "lean-not-installed")
+    else {
         return true;
+    };
+    let Ok(mut f) = fs::File::open(&canon_olean) else {
+        return false;
+    };
+    let mut hdr = [0u8; 80];
+    if std::io::Read::read_exact(&mut f, &mut hdr).is_err() {
+        return false;
+    }
+    &hdr[0..5] == b"olean" && hdr[5] == 2 && &hdr[40..80] == expected_gh.as_bytes()
+}
+
+pub(crate) fn is_builtin_toolchain_module(
+    toolchain_lib_lean: &Path,
+    lean_githash: Option<&str>,
+    mod_name: &str,
+) -> bool {
+    if toolchain_lib_lean.as_os_str().is_empty() {
+        return mod_name == "Init"
+            || mod_name.starts_with("Init.")
+            || mod_name == "Std"
+            || mod_name.starts_with("Std.")
+            || mod_name == "Lean"
+            || mod_name.starts_with("Lean.")
+            || mod_name == "Lake"
+            || mod_name.starts_with("Lake.");
     }
     let rel_slash = module_name_to_rel_slash(mod_name);
-    toolchain_lib_lean
-        .join(format!("{}.olean", rel_slash))
-        .is_file()
+    let cand = toolchain_lib_lean.join(format!("{}.olean", rel_slash));
+    is_verified_toolchain_olean_file(toolchain_lib_lean, lean_githash, &cand)
+}
+
+pub(crate) fn is_unshadowed_toolchain_olean_import(
+    cfg: &ProjectConfig,
+    search_dirs: &[PathBuf],
+    mod_name: &str,
+    is_untrusted: bool,
+) -> bool {
+    if resolve_module_in_package(&cfg.root_pkg, true, mod_name).is_some()
+        || cfg
+            .dep_pkgs
+            .iter()
+            .any(|dp| resolve_module_in_package(dp, false, mod_name).is_some())
+    {
+        return false;
+    }
+    let rel = format!("{}.olean", module_name_to_rel_slash(mod_name));
+    let mut all_dirs: Vec<PathBuf> = search_dirs.to_vec();
+    if !cfg.toolchain_lib_lean.as_os_str().is_empty() && !all_dirs.contains(&cfg.toolchain_lib_lean)
+    {
+        all_dirs.push(cfg.toolchain_lib_lean.clone());
+    }
+    let Some(first_hit) = all_dirs.iter().map(|d| d.join(&rel)).find(|p| p.is_file()) else {
+        return !is_untrusted
+            && cfg.toolchain_lib_lean.as_os_str().is_empty()
+            && is_builtin_toolchain_module(&cfg.toolchain_lib_lean, None, mod_name);
+    };
+    is_verified_toolchain_olean_file(&cfg.toolchain_lib_lean, Some(&cfg.lean_githash), &first_hit)
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub(crate) struct VerifiedDepModuleEntry {
     pub src_blake3: String,
     pub olean_artifact_digest: String,
-    #[serde(default)]
-    pub kernel_audited: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -5147,9 +5312,6 @@ fn is_dep_olean_fresh(
         .to_string_lossy()
         .replace('\\', "/");
     let entry = manifest.modules.get(&rel_src)?;
-    if spec.is_root_pkg && !entry.kernel_audited {
-        return None;
-    }
     let actual_src_hash = blake3::hash(src_content.as_bytes()).to_hex().to_string();
     if entry.src_blake3 != actual_src_hash {
         return None;
@@ -5201,6 +5363,8 @@ fn collect_fresh_dep_pkg_closure(
         let Ok(src) = fs::read_to_string(&cur.src_path) else {
             return Ok(None);
         };
+        splitter::reject_checking_weakening(&src)
+            .with_context(|| format!("Module {} ({})", cur.module_name, cur.src_path.display()))?;
         let hdr = parse_header_info(&src);
         if hdr.header_error.is_some() {
             return Ok(None);
@@ -5244,11 +5408,13 @@ fn collect_fresh_dep_pkg_closure(
             if resolve_module_in_package(&cfg.root_pkg, true, &imp).is_some() {
                 return Ok(None);
             }
-            if is_builtin_toolchain_module(&cfg.toolchain_lib_lean, &imp) {
+            let (eff_lp, _) = build_lean_search_path(cfg, false);
+            let search_dirs: Vec<PathBuf> = std::env::split_paths(&eff_lp).collect();
+            if is_unshadowed_toolchain_olean_import(cfg, &search_dirs, &imp, false) {
                 continue;
             }
-            // Unresolved import inside dependency closure: force native DAG traversal so
-            // root-package imports or missing-module errors are handled deterministically.
+            // Unresolved or shadowed import inside dependency closure: force native DAG traversal so
+            // root-package/LEAN_PATH imports or missing-module errors are handled deterministically.
             return Ok(None);
         }
     }
@@ -5554,6 +5720,9 @@ pub fn build_module_dag_with_trust(
                 spec.src_path.display()
             )
         })?;
+        splitter::reject_checking_weakening(&src).with_context(|| {
+            format!("Module {} ({})", spec.module_name, spec.src_path.display())
+        })?;
         let src_blake3 = blake3::hash(src.as_bytes()).to_hex().to_string();
         let header = parse_header_info(&src);
         if let Some(ref herr) = header.header_error {
@@ -5568,6 +5737,7 @@ pub fn build_module_dag_with_trust(
             requested_c || spec.precompile_modules || header.has_c_export || global_emit_c;
         let mut direct_dag_deps = Vec::new();
         let mut external_olean_deps = Vec::new();
+        let mut prebuilt_olean_deps = Vec::new();
         for imp in &header.imports {
             if imp == &spec.module_name {
                 anyhow::bail!(
@@ -5610,11 +5780,8 @@ pub fn build_module_dag_with_trust(
                 worklist.push_back((dep_spec, false));
                 continue;
             }
-            // 3. Check if `imp` is a built-in toolchain module (`Init.*`, `Std.*`, `Lean.*`, `Lake.*`)
-            if is_builtin_toolchain_module(&cfg.toolchain_lib_lean, imp) {
-                continue;
-            }
-            // 4. In trusted mode only, check if `imp` exists as a prebuilt `.olean` in `.lake/packages/*/.lake/build/lib/lean` or `LEAN_PATH`
+            // 3. In trusted mode only, check if `imp` exists as a prebuilt `.olean` in `.lake/packages/*/.lake/build/lib/lean` or `LEAN_PATH`
+            // BEFORE checking the toolchain library, matching Lean's actual `LEAN_PATH` search order.
             if !is_untrusted {
                 let rel_slash = module_name_to_rel_slash(imp);
                 let mut found_prebuilt: Option<PathBuf> = None;
@@ -5632,7 +5799,13 @@ pub fn build_module_dag_with_trust(
                 if found_prebuilt.is_none() {
                     for dir in &external_lean_path_dirs {
                         let cand = dir.join(format!("{}.olean", rel_slash));
-                        if cand.is_file() {
+                        if cand.is_file()
+                            && !is_verified_toolchain_olean_file(
+                                &cfg.toolchain_lib_lean,
+                                Some(&cfg.lean_githash),
+                                &cand,
+                            )
+                        {
                             found_prebuilt = Some(cand);
                             break;
                         }
@@ -5640,8 +5813,13 @@ pub fn build_module_dag_with_trust(
                 }
                 if let Some(pb_path) = found_prebuilt {
                     external_olean_deps.push((imp.clone(), pb_path));
+                    prebuilt_olean_deps.push(imp.clone());
                     continue;
                 }
+            }
+            // 4. Check if `imp` resolves to a genuine built-in toolchain `.olean` inside `toolchain_lib_lean`
+            if is_builtin_toolchain_module(&cfg.toolchain_lib_lean, Some(&cfg.lean_githash), imp) {
+                continue;
             }
             anyhow::bail!(
                 "Missing module `{}` imported by `{}` ({}): not found in project sources, package dependencies, or toolchain `{}`",
@@ -5655,6 +5833,8 @@ pub fn build_module_dag_with_trust(
         direct_dag_deps.dedup();
         external_olean_deps.sort_by(|a, b| a.0.cmp(&b.0));
         external_olean_deps.dedup_by(|a, b| a.0 == b.0);
+        prebuilt_olean_deps.sort();
+        prebuilt_olean_deps.dedup();
         let rel_slash = module_name_to_rel_slash(&spec.module_name);
         let olean_path = spec.build_lib_lean_dir.join(format!("{}.olean", rel_slash));
         let ilean_path = spec.build_lib_lean_dir.join(format!("{}.ilean", rel_slash));
@@ -5683,6 +5863,7 @@ pub fn build_module_dag_with_trust(
                 src_blake3,
                 direct_dag_deps,
                 external_olean_deps,
+                prebuilt_olean_deps,
                 expected_all_deps: Vec::new(),
                 extern_lib_digests: spec.extern_lib_digests,
                 pkg_config_digest: spec.pkg_config_digest,
@@ -5984,6 +6165,199 @@ fn read_olean_artifact_set_digest(
         Some(guard) => guard.read_consistent(&paths, digest),
         None => digest(),
     }
+}
+
+/// Compute BLAKE3 digest of on-disk `.olean` + `.ilean` bytes (plus `module` companion `.olean.server`
+/// / `.olean.private` when present) under a read-only shared package publication flock (never creating
+/// `.lake/build/.turbo_publish.lock` inside external/opted-out worktrees), failing closed if
+/// `.olean` is missing, unreadable, or non-regular, and binding `.ilean` presence + bytes (`1` + hash
+/// when present, `0` when absent).
+pub(crate) fn compute_replayed_olean_ilean_digest(olean_path: &Path) -> Result<String> {
+    let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Module artifact publication mutex poisoned"))?;
+    let _flock_guard = if let Some(pkg_root) = infer_pkg_root_from_artifact_path(olean_path) {
+        Some(acquire_publish_flock_mode(&pkg_root, false, true)?)
+    } else {
+        None
+    };
+    let ilean_path = olean_path.with_extension("ilean");
+    let srv_path = olean_path.with_extension("olean.server");
+    let priv_path = olean_path.with_extension("olean.private");
+    let paths = vec![
+        olean_path.to_path_buf(),
+        ilean_path.clone(),
+        srv_path.clone(),
+        priv_path.clone(),
+    ];
+    let digest = || -> Result<String> {
+        let mut h = blake3::Hasher::new();
+        h.update(b"turbo-lean-replayed-olean-ilean-v1\n");
+        for (tag, p, required) in [
+            ("olean", olean_path, true),
+            ("ilean", ilean_path.as_path(), false),
+            ("srv", srv_path.as_path(), false),
+            ("priv", priv_path.as_path(), false),
+        ] {
+            let present = match fs::metadata(p) {
+                Ok(meta) => {
+                    anyhow::ensure!(
+                        meta.is_file() && (!required || meta.len() > 0),
+                        "Replay-verified artifact `{}` is not a non-empty regular file",
+                        p.display()
+                    );
+                    true
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => false,
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("Failed to stat replay-verified artifact `{}`", p.display())
+                    })
+                }
+            };
+            h.update(&[u8::from(present)]);
+            if present {
+                let bytes = fs::read(p).with_context(|| {
+                    format!("Failed to read replay-verified artifact `{}`", p.display())
+                })?;
+                update_lp(&mut h, tag.as_bytes(), blake3::hash(&bytes).as_bytes());
+            } else {
+                update_lp(&mut h, tag.as_bytes(), b"");
+            }
+        }
+        Ok(h.finalize().to_hex().to_string())
+    };
+    match _flock_guard.as_ref() {
+        Some(g) => g.read_consistent(&paths, digest),
+        None => digest(),
+    }
+}
+
+pub(crate) fn project_disallowed_replay_store_roots(cfg: &ProjectConfig) -> Vec<PathBuf> {
+    let mut roots = Vec::with_capacity(1 + cfg.dep_pkgs.len() + cfg.manifest_packages.len());
+    roots.push(cfg.root_pkg.pkg_root.clone());
+    for dp in &cfg.dep_pkgs {
+        roots.push(dp.pkg_root.clone());
+    }
+    for mp in &cfg.manifest_packages {
+        roots.push(mp.dir.clone());
+    }
+    roots
+}
+
+/// Compute the deterministic transitive binary import environment digest for `olean_path` along
+/// `lean_path_env` (plus `cfg.toolchain_lib_lean`), binding every reachable non-toolchain `.olean`
+/// (with `.ilean`/companion files via `compute_replayed_olean_ilean_digest`) and marking verified
+/// toolchain modules by `(module_name, cfg.lean_githash)` while failing closed (`Err`) if any
+/// binary import is unresolvable or unreadable. Because every imported non-toolchain artifact's
+/// full content digest is folded into `environment_digest`, modifying a child module's interface
+/// immediately invalidates the parent module's replay authority even when the parent `.olean` bytes
+/// were left untouched on disk.
+pub(crate) fn compute_olean_transitive_env_digest(
+    cfg: &ProjectConfig,
+    lean_path_env: &str,
+    olean_path: &Path,
+) -> Result<String> {
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(lean_path_env).collect();
+    if !cfg.toolchain_lib_lean.as_os_str().is_empty() && !dirs.contains(&cfg.toolchain_lib_lean) {
+        dirs.push(cfg.toolchain_lib_lean.clone());
+    }
+    let root_bytes = fs::read(olean_path).with_context(|| {
+        format!(
+            "Failed to read `.olean` `{}` for transitive replay environment digest",
+            olean_path.display()
+        )
+    })?;
+    let (root_imps, _) = parse_olean_binary_imports(&root_bytes).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Failed to parse binary `.olean` header of `{}`: fail-closed",
+            olean_path.display()
+        )
+    })?;
+    let mut worklist: Vec<String> = root_imps.into_iter().map(|i| i.module).collect();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut resolved_non_tc: BTreeMap<String, String> = BTreeMap::new();
+    let mut resolved_tc: BTreeSet<String> = BTreeSet::new();
+    while let Some(m) = worklist.pop() {
+        if !seen.insert(m.clone()) {
+            continue;
+        }
+        let rel = format!("{}.olean", module_name_to_rel_slash(&m));
+        let path = dirs
+            .iter()
+            .map(|d| d.join(&rel))
+            .find(|p| p.is_file())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Unresolvable binary import `{}` required by `{}` along LEAN_PATH: fail-closed",
+                    m,
+                    olean_path.display()
+                )
+            })?;
+        if is_verified_toolchain_olean_file(&cfg.toolchain_lib_lean, Some(&cfg.lean_githash), &path)
+        {
+            resolved_tc.insert(m);
+            continue;
+        }
+        let dep_dig = compute_replayed_olean_ilean_digest(&path)?;
+        let dep_bytes = fs::read(&path).with_context(|| {
+            format!(
+                "Failed to read imported `.olean` `{}` for transitive replay environment digest",
+                path.display()
+            )
+        })?;
+        let (sub_imps, _) = parse_olean_binary_imports(&dep_bytes).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Failed to parse binary `.olean` header of imported `{}` (`{}`): fail-closed",
+                m,
+                path.display()
+            )
+        })?;
+        worklist.extend(sub_imps.into_iter().map(|i| i.module));
+        resolved_non_tc.insert(m, dep_dig);
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(b"turbo-lean-olean-transitive-env-v1\n");
+    update_lp(&mut h, b"githash", cfg.lean_githash.as_bytes());
+    h.update(&(resolved_tc.len() as u64).to_le_bytes());
+    for tc_m in &resolved_tc {
+        update_lp(&mut h, b"tc", tc_m.as_bytes());
+    }
+    h.update(&(resolved_non_tc.len() as u64).to_le_bytes());
+    for (dep_m, dep_dig) in &resolved_non_tc {
+        update_lp(&mut h, b"dep_mod", dep_m.as_bytes());
+        update_lp(&mut h, b"dep_dig", dep_dig.as_bytes());
+    }
+    Ok(h.finalize().to_hex().to_string())
+}
+
+pub(crate) fn is_olean_replayed_in_store(
+    store: &TurboStore,
+    cfg: &ProjectConfig,
+    lean_path_env: &str,
+    olean_path: &Path,
+) -> bool {
+    if cfg.lean_githash.is_empty() {
+        return false;
+    }
+    let disallowed_roots = project_disallowed_replay_store_roots(cfg);
+    if !store.is_store_outside_disallowed_roots(&disallowed_roots) {
+        return false;
+    }
+    let Ok(dig) = compute_replayed_olean_ilean_digest(olean_path) else {
+        return false;
+    };
+    let Ok(env_dig) = compute_olean_transitive_env_digest(cfg, lean_path_env, olean_path) else {
+        return false;
+    };
+    store.has_kernel_replayed_olean(
+        &dig,
+        &env_dig,
+        crate::zygote::ZYGOTE_REPLAY_VERSION,
+        &cfg.lean_githash,
+        &disallowed_roots,
+    )
 }
 
 /// Compute the per-module CAS action key (`module_unit`), incorporating:
@@ -6598,7 +6972,11 @@ fn compute_lake_export_info(
                     .iter()
                     .any(|dp| resolve_module_in_package(dp, false, &sub_imp.module).is_some());
             if !is_ws_or_pkg
-                && is_builtin_toolchain_module(&cfg.toolchain_lib_lean, &sub_imp.module)
+                && is_builtin_toolchain_module(
+                    &cfg.toolchain_lib_lean,
+                    Some(&cfg.lean_githash),
+                    &sub_imp.module,
+                )
             {
                 continue;
             }
@@ -6718,7 +7096,8 @@ pub fn write_lake_module_hashes_and_trace(
     let no_forbidden_proof_tokens = !hygiene.has_sorry
         && !hygiene.has_axiom
         && !hygiene.native_violation()
-        && !hygiene.has_trust_compiler;
+        && !hygiene.has_trust_compiler
+        && !hygiene.has_checking_weakening;
     let skeleton_clean = src_blake3_matches && no_forbidden_proof_tokens;
     let is_stubbed_skeleton =
         hygiene.has_sorry || !no_forbidden_proof_tokens || !src_blake3_matches;
@@ -6772,7 +7151,11 @@ pub fn write_lake_module_hashes_and_trace(
                     .iter()
                     .any(|dp| resolve_module_in_package(dp, false, &imp.module).is_some());
             if !is_ws_or_pkg {
-                if is_builtin_toolchain_module(&cfg.toolchain_lib_lean, &imp.module) {
+                if is_builtin_toolchain_module(
+                    &cfg.toolchain_lib_lean,
+                    Some(&cfg.lean_githash),
+                    &imp.module,
+                ) {
                     continue;
                 }
                 dep_trace_fresh = false;
@@ -7606,6 +7989,15 @@ pub(crate) fn run_command_with_timeout(
     let mut poll_iter = 0u32;
     loop {
         if let Some(status) = child.try_wait()? {
+            #[cfg(unix)]
+            {
+                let pgid = child.id() as i32;
+                if pgid > 0 {
+                    unsafe {
+                        let _ = libc::kill(-pgid, libc::SIGKILL);
+                    }
+                }
+            }
             let stdout = out_handle.join().unwrap_or_default();
             let stderr = err_handle.join().unwrap_or_default();
             return Ok(std::process::Output {
@@ -7643,9 +8035,7 @@ pub(crate) fn run_command_with_timeout(
 }
 
 #[cfg(test)]
-std::thread_local! {
-    static TEST_BWRAP_BIN_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
-}
+static TEST_BWRAP_BIN_OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 #[cfg(test)]
 pub(crate) struct ScopedTestBwrapOverride {
@@ -7655,7 +8045,10 @@ pub(crate) struct ScopedTestBwrapOverride {
 #[cfg(test)]
 impl ScopedTestBwrapOverride {
     pub(crate) fn set(val: impl Into<String>) -> Self {
-        let prev = TEST_BWRAP_BIN_OVERRIDE.with(|cell| cell.replace(Some(val.into())));
+        let mut guard = TEST_BWRAP_BIN_OVERRIDE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = guard.replace(val.into());
         Self { prev }
     }
 
@@ -7691,16 +8084,19 @@ impl ScopedTestBwrapOverride {
 impl Drop for ScopedTestBwrapOverride {
     fn drop(&mut self) {
         let prev = self.prev.take();
-        TEST_BWRAP_BIN_OVERRIDE.with(|cell| {
-            *cell.borrow_mut() = prev;
-        });
+        let mut guard = TEST_BWRAP_BIN_OVERRIDE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = prev;
     }
 }
 
-pub(crate) fn probe_bwrap_sandbox() -> Option<PathBuf> {
+pub(crate) fn probe_bwrap_sandbox(project: &Path) -> Option<PathBuf> {
     #[cfg(test)]
     if let Some(test_bwrap) = TEST_BWRAP_BIN_OVERRIDE
-        .with(|cell| cell.borrow().clone())
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
         .or_else(|| std::env::var("TURBO_LEAN_TEST_BWRAP_BIN").ok())
     {
         let trimmed = test_bwrap.trim();
@@ -7713,13 +8109,17 @@ pub(crate) fn probe_bwrap_sandbox() -> Option<PathBuf> {
         }
         return None;
     }
-    let candidates = [
-        PathBuf::from("/usr/bin/bwrap"),
-        PathBuf::from("/bin/bwrap"),
-        PathBuf::from("bwrap"),
-    ];
-    for cand in candidates {
+    probe_bwrap_candidates(project, &["/usr/bin/bwrap", "/bin/bwrap"])
+}
+
+fn probe_bwrap_candidates(project: &Path, candidates: &[&str]) -> Option<PathBuf> {
+    for candidate in candidates {
+        let Ok(cand) = crate::trusted_tools::system_executable(Path::new(candidate), project)
+        else {
+            continue;
+        };
         let mut probe = Command::new(&cand);
+        probe.env_clear().env("PATH", "/usr/bin:/bin");
         probe.args([
             "--unshare-all",
             "--new-session",
@@ -7742,7 +8142,7 @@ pub(crate) fn probe_bwrap_sandbox() -> Option<PathBuf> {
             }
         }
         if probe
-            .arg("true")
+            .arg("/usr/bin/true")
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
@@ -7751,6 +8151,36 @@ pub(crate) fn probe_bwrap_sandbox() -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+#[test]
+fn unusable_system_sandbox_never_falls_back_to_project_bwrap() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let root = std::env::temp_dir().join(format!(
+        "turbo-bwrap-shim-{}-{}",
+        std::process::id(),
+        crate::pack::next_tmp_id()
+    ));
+    fs::create_dir_all(&root)?;
+    let shim = root.join("bwrap");
+    let marker = root.join("executed");
+    fs::write(
+        &shim,
+        format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+    )?;
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755))?;
+    assert!(Command::new(&shim).status()?.success());
+    fs::remove_file(&marker)?;
+    // An absolute, executable system candidate fails its probe; neither a bare
+    // PATH fallback nor an absolute checkout shim may replace it.
+    assert!(
+        probe_bwrap_candidates(&root, &["/usr/bin/false", "bwrap", shim.to_str().unwrap()])
+            .is_none()
+    );
+    assert!(!marker.exists());
+    fs::remove_dir_all(root)?;
+    Ok(())
 }
 
 fn canonicalize_path_with_missing_tail(p: &Path) -> Result<PathBuf> {
@@ -7991,6 +8421,7 @@ fn build_module_compile_command(
     } else {
         let mut c = Command::new(&cfg.lean_bin);
         c.current_dir(&node.pkg_root)
+            .env("PATH", verifier_path(&cfg.lean_bin))
             .env("LEAN_PATH", lean_path_env)
             .env("LD_LIBRARY_PATH", ld_library_path_env)
             .env("LEAN_STACK_SIZE_KB", &stack_kb);
@@ -8262,11 +8693,298 @@ fn store_module_artifacts_in_cas(
     Ok(entries)
 }
 
+/// Gate for every compiled or CAS-materialized module before anything may import it: untrusted
+/// builds and root-package modules get the full in-kernel policy audit (which includes the
+/// independent kernel replay); trusted dependency modules get the independent kernel replay.
+/// Toolchain modules never enter the DAG and stay trusted.
+fn audit_or_replay_modules(
+    store: &TurboStore,
+    cfg: &ProjectConfig,
+    dag: &ModuleDag,
+    mod_names: &[String],
+    lean_path_env: &str,
+    is_untrusted: bool,
+) -> Result<()> {
+    let (audit, replay): (Vec<String>, Vec<String>) = mod_names
+        .iter()
+        .cloned()
+        .partition(|m| is_untrusted || dag.nodes.get(m).is_none_or(|n| n.is_root_pkg));
+    crate::zygote::audit_compiled_modules_with_zygote(
+        store,
+        cfg,
+        &audit,
+        lean_path_env,
+        &[],
+        is_untrusted,
+    )?;
+    crate::zygote::kernel_replay_modules_with_zygote(store, cfg, &replay, lean_path_env)
+}
+
+/// `check` / trusted `pr-verify` gate: every non-toolchain `.olean` that `target_files`
+/// transitively import (project-local or dependency, however it was built) must carry current
+/// kernel-replay authority in `TurboStore` (`kernel_replayed_oleans` keyed by freshly hashed
+/// on-disk `.olean`+`.ilean` bytes, `ZYGOTE_REPLAY_VERSION`, and `lean_githash`) or be
+/// independently replayed now. Checkout manifests (`.turbo_verified_sources.json`) are freshness
+/// metadata only and never grant replay authority. Fails closed.
+/// Verify that an imported non-toolchain module belonging to the workspace root package or one
+/// of its dependency packages resolves unambiguously to a `.lean` source file whose directives
+/// satisfy checking-weakening and native-decide hygiene gates. Fails closed if a workspace or
+/// dependency package `.olean` artifact lacks a resolvable `.lean` source or fails source hygiene.
+pub(crate) fn verify_imported_package_module_source_hygiene(
+    cfg: &ProjectConfig,
+    mod_name: &str,
+    olean_path: &Path,
+    allowed_axioms: &[String],
+) -> Result<()> {
+    let mut specs = Vec::new();
+    if let Some(root_spec) = resolve_module_in_package(&cfg.root_pkg, true, mod_name) {
+        specs.push(root_spec);
+    }
+    for dp in &cfg.dep_pkgs {
+        if let Some(dep_spec) = resolve_module_in_package(dp, false, mod_name) {
+            specs.push(dep_spec);
+        }
+    }
+    let canon_olean = olean_path
+        .canonicalize()
+        .unwrap_or_else(|_| olean_path.to_path_buf());
+    let belongs_to_pkg = std::iter::once(&cfg.root_pkg)
+        .chain(cfg.dep_pkgs.iter())
+        .any(|pkg| {
+            let pkg_root_canon = pkg
+                .pkg_root
+                .canonicalize()
+                .unwrap_or_else(|_| pkg.pkg_root.clone());
+            let pkg_lib_canon = pkg
+                .pkg_root
+                .join(&pkg.build_dir)
+                .join(&pkg.lean_lib_dir)
+                .canonicalize()
+                .unwrap_or_else(|_| pkg.pkg_root.join(&pkg.build_dir).join(&pkg.lean_lib_dir));
+            canon_olean.starts_with(&pkg_lib_canon) || canon_olean.starts_with(&pkg_root_canon)
+        });
+    if specs.len() > 1 {
+        let pkg_names: Vec<&str> = specs.iter().map(|s| s.pkg_name.as_str()).collect();
+        anyhow::bail!(
+            "Ambiguous imported module `{mod_name}` resolved in multiple packages ({pkg_names:?}): fail-closed"
+        );
+    }
+    let Some(spec) = specs.into_iter().next() else {
+        if belongs_to_pkg {
+            // Standalone root-package `.lean` files outside Lake library/exe globs (e.g.
+            // `TurboLean.lean` alongside `TurboLean.+`, or auxiliary scripts compiled by
+            // `stock_statement_build`) still resolve unambiguously under a root-package source dir.
+            let canon_root_lib = cfg
+                .root_pkg
+                .pkg_root
+                .join(&cfg.root_pkg.build_dir)
+                .join(&cfg.root_pkg.lean_lib_dir)
+                .canonicalize()
+                .unwrap_or_else(|_| {
+                    cfg.root_pkg
+                        .pkg_root
+                        .join(&cfg.root_pkg.build_dir)
+                        .join(&cfg.root_pkg.lean_lib_dir)
+                });
+            let canon_root_pkg = cfg
+                .root_pkg
+                .pkg_root
+                .canonicalize()
+                .unwrap_or_else(|_| cfg.root_pkg.pkg_root.clone());
+            let canon_packages = cfg
+                .root_pkg
+                .pkg_root
+                .join(&cfg.root_pkg.packages_dir)
+                .canonicalize()
+                .unwrap_or_else(|_| cfg.root_pkg.pkg_root.join(&cfg.root_pkg.packages_dir));
+            if canon_olean.starts_with(&canon_root_lib)
+                || (canon_olean.starts_with(&canon_root_pkg)
+                    && !canon_olean.starts_with(&canon_packages))
+            {
+                let rel_slash = module_name_to_rel_slash(mod_name);
+                let base = cfg.root_pkg.pkg_root.join(&cfg.root_pkg.src_dir);
+                let mut roots = vec![base.clone()];
+                roots.extend(
+                    cfg.root_pkg
+                        .libs
+                        .iter()
+                        .filter_map(|l| l.src_dir.as_ref())
+                        .map(|d| base.join(d)),
+                );
+                roots.extend(
+                    cfg.root_pkg
+                        .exes
+                        .iter()
+                        .filter_map(|e| e.src_dir.as_ref())
+                        .map(|d| base.join(d)),
+                );
+                roots.sort();
+                roots.dedup();
+                let cands: Vec<PathBuf> = roots
+                    .into_iter()
+                    .map(|r| r.join(format!("{rel_slash}.lean")))
+                    .filter(|p| p.is_file())
+                    .collect();
+                if cands.len() == 1 {
+                    let standalone_src = &cands[0];
+                    let src = fs::read_to_string(standalone_src).with_context(|| {
+                        format!(
+                            "Failed to read `.lean` source `{}` for imported module `{mod_name}`: fail-closed",
+                            standalone_src.display()
+                        )
+                    })?;
+                    let hygiene = splitter::audit_hygiene(&splitter::strip_lean_comments(&src));
+                    anyhow::ensure!(
+                        !hygiene.has_checking_weakening,
+                        "Soundness hygiene violation in imported module `{mod_name}` ({}): {:?}",
+                        standalone_src.display(),
+                        hygiene.disallowed_items_under(allowed_axioms)
+                    );
+                    anyhow::ensure!(
+                        !hygiene.native_violation_under(allowed_axioms),
+                        "[TurboLean.KernelGate] native_decide/bv_decide in imported module `{mod_name}` ({}) is not admitted by the project's axiom allowlist",
+                        standalone_src.display()
+                    );
+                    anyhow::ensure!(
+                        !hygiene.has_trust_compiler,
+                        "Soundness hygiene violation (trustCompiler) in imported module `{mod_name}` ({})",
+                        standalone_src.display()
+                    );
+                    return Ok(());
+                }
+            }
+            anyhow::bail!(
+                "Workspace/dependency `.olean` `{}` for imported module `{mod_name}` has no resolvable `.lean` source in project or dependency packages: fail-closed",
+                olean_path.display()
+            );
+        }
+        return Ok(());
+    };
+    let src = fs::read_to_string(&spec.src_path).with_context(|| {
+        format!(
+            "Failed to read `.lean` source `{}` for imported module `{mod_name}`: fail-closed",
+            spec.src_path.display()
+        )
+    })?;
+    let hygiene = splitter::audit_hygiene(&splitter::strip_lean_comments(&src));
+    anyhow::ensure!(
+        !hygiene.has_checking_weakening,
+        "Soundness hygiene violation in imported module `{mod_name}` ({}): {:?}",
+        spec.src_path.display(),
+        hygiene.disallowed_items_under(allowed_axioms)
+    );
+    anyhow::ensure!(
+        !hygiene.native_violation_under(allowed_axioms),
+        "[TurboLean.KernelGate] native_decide/bv_decide in imported module `{mod_name}` ({}) is not admitted by the project's axiom allowlist",
+        spec.src_path.display()
+    );
+    anyhow::ensure!(
+        !hygiene.has_trust_compiler,
+        "Soundness hygiene violation (trustCompiler) in imported module `{mod_name}` ({})",
+        spec.src_path.display()
+    );
+    Ok(())
+}
+
+pub(crate) fn ensure_imported_oleans_replayed(
+    store: &TurboStore,
+    canon_dir: &Path,
+    target_files: &[PathBuf],
+) -> Result<usize> {
+    ensure_imported_oleans_replayed_with_roots(store, canon_dir, target_files, &[])
+}
+
+pub(crate) fn ensure_imported_oleans_replayed_with_roots(
+    store: &TurboStore,
+    canon_dir: &Path,
+    target_files: &[PathBuf],
+    root_modules: &[String],
+) -> Result<usize> {
+    ensure_imported_oleans_replayed_with_roots_and_axioms(
+        store,
+        canon_dir,
+        target_files,
+        root_modules,
+        &splitter::allowed_axioms(),
+    )
+}
+
+pub(crate) fn ensure_imported_oleans_replayed_with_roots_and_axioms(
+    store: &TurboStore,
+    canon_dir: &Path,
+    target_files: &[PathBuf],
+    root_modules: &[String],
+    allowed_axioms: &[String],
+) -> Result<usize> {
+    let mut worklist: Vec<String> = target_files
+        .iter()
+        .filter_map(|f| fs::read_to_string(f).ok())
+        .flat_map(|s| parse_header_info(&s).imports)
+        .chain(root_modules.iter().cloned())
+        .collect();
+    if worklist.is_empty() {
+        return Ok(0);
+    }
+    let cfg = resolve_project_config(canon_dir);
+    let tc_lib = cfg.as_ref().map(|c| c.toolchain_lib_lean.clone()).ok();
+    let tc_gh = cfg.as_ref().map(|c| c.lean_githash.clone()).ok();
+    let lean_path = lake_build::resolve_remote_lean_path(canon_dir, None);
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(&lean_path).collect();
+    if let Some(ref t) = tc_lib {
+        if !t.as_os_str().is_empty() && !dirs.contains(t) {
+            dirs.push(t.clone());
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut imported: Vec<(String, PathBuf)> = Vec::new();
+    while let Some(m) = worklist.pop() {
+        if !seen.insert(m.clone()) {
+            continue;
+        }
+        let rel = format!("{}.olean", module_name_to_rel_slash(&m));
+        let Some(path) = dirs.iter().map(|d| d.join(&rel)).find(|p| p.is_file()) else {
+            continue;
+        };
+        if let Some(ref t) = tc_lib {
+            if is_verified_toolchain_olean_file(t, tc_gh.as_deref(), &path) {
+                continue;
+            }
+        }
+        let bytes = fs::read(&path)?;
+        let (imps, _) = parse_olean_binary_imports(&bytes).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Failed to parse binary `.olean` header of imported `{m}` (`{}`): fail-closed",
+                path.display()
+            )
+        })?;
+        worklist.extend(imps.into_iter().map(|i| i.module));
+        imported.push((m, path));
+    }
+    if imported.is_empty() {
+        return Ok(0);
+    }
+    let cfg = cfg.context(
+        "Cannot kernel-replay imported `.olean`s without a resolvable project configuration: fail-closed",
+    )?;
+    let mut pending = Vec::new();
+    let replay_lp = format!("{}:{}", lean_path, cfg.toolchain_lib_lean.display());
+    for (m, path) in &imported {
+        verify_imported_package_module_source_hygiene(&cfg, m, path, allowed_axioms)?;
+        if !is_olean_replayed_in_store(store, &cfg, &replay_lp, path) {
+            pending.push(m.clone());
+        }
+    }
+    if !pending.is_empty() {
+        crate::zygote::kernel_replay_modules_with_zygote(store, &cfg, &pending, &replay_lp)
+            .context("Imported `.olean` failed independent kernel replay")?;
+    }
+    Ok(pending.len())
+}
+
 pub(crate) fn record_verified_dep_source(
     cfg: &ProjectConfig,
     node: &ModuleNode,
     olean_artifact_digest: &str,
-    kernel_audited: bool,
 ) {
     let pkg_root = &node.pkg_root;
     let build_dir = pkg_root.join(".lake/build");
@@ -8304,7 +9022,6 @@ pub(crate) fn record_verified_dep_source(
         VerifiedDepModuleEntry {
             src_blake3: node.src_blake3.clone(),
             olean_artifact_digest: olean_artifact_digest.to_string(),
-            kernel_audited,
         },
     );
     if let Ok(json_bytes) = serde_json::to_vec(&manifest) {
@@ -8377,7 +9094,7 @@ pub fn build_project_modules_native(
     }
     let (lean_path_env, ld_library_path_env) = build_lean_search_path(&cfg, is_untrusted);
     let bwrap_bin = if is_untrusted {
-        probe_bwrap_sandbox()
+        probe_bwrap_sandbox(&canon_dir)
     } else {
         None
     };
@@ -8407,14 +9124,33 @@ pub fn build_project_modules_native(
     };
     // Map from module_name -> olean artifact set digest
     let mut olean_digests: HashMap<String, String> = HashMap::new();
-    // Pre-compute digests for external prebuilt `.olean` dependencies (only populated when `!is_untrusted`)
+    // Pre-compute digests for external `.olean` dependencies (only populated when `!is_untrusted`)
+    // and ensure every external `.olean` carries kernel-replay authority in `TurboStore` DB
+    // (`.turbo_verified_sources.json` is freshness-only and never grants replay authority).
+    let mut unverified_external_deps: BTreeSet<String> = dag
+        .nodes
+        .values()
+        .flat_map(|n| n.prebuilt_olean_deps.iter().cloned())
+        .collect();
     for node in dag.nodes.values() {
         for (ext_mod, ext_path) in &node.external_olean_deps {
             if !olean_digests.contains_key(ext_mod) {
                 let d = compute_olean_artifact_set_digest_with_policy(ext_path, preserve_project)?;
                 olean_digests.insert(ext_mod.clone(), d);
             }
+            if !is_olean_replayed_in_store(store, &cfg, &lean_path_env, ext_path) {
+                unverified_external_deps.insert(ext_mod.clone());
+            }
         }
+    }
+    if !unverified_external_deps.is_empty() {
+        crate::zygote::kernel_replay_modules_with_zygote(
+            store,
+            &cfg,
+            &unverified_external_deps.into_iter().collect::<Vec<_>>(),
+            &lean_path_env,
+        )
+        .context("External dependency `.olean` failed independent kernel replay")?;
     }
     // Execute topological waves
     for wave in &dag.waves {
@@ -8548,13 +9284,14 @@ pub fn build_project_modules_native(
                     restored
                 };
                 if let Some(dig) = cas_restored_dig_opt {
-                    if is_untrusted || node.is_root_pkg {
-                        let audit_res = crate::zygote::audit_compiled_modules_with_zygote(
+                    // CAS entries carry no replay provenance: every restore is re-audited.
+                    {
+                        let audit_res = audit_or_replay_modules(
                             store,
                             &cfg,
+                            &dag,
                             std::slice::from_ref(mod_name),
                             &lean_path_env,
-                            &[],
                             is_untrusted,
                         );
                         if let Err(audit_err) = audit_res {
@@ -8586,7 +9323,7 @@ pub fn build_project_modules_native(
                             true,
                         )?;
                         if !is_untrusted {
-                            record_verified_dep_source(&cfg, node, &dig, node.is_root_pkg);
+                            record_verified_dep_source(&cfg, node, &dig);
                         }
                     }
                     olean_digests.insert(mod_name.clone(), dig);
@@ -8711,24 +9448,16 @@ pub fn build_project_modules_native(
             }
             return Err(err);
         }
-        let wave_audit_mod_names: Vec<String> = compiled_wave_ok
+        let wave_mod_names: Vec<String> = compiled_wave_ok
             .iter()
-            .filter_map(|(i, _, _, _)| {
-                let mod_name = &misses_to_compile[*i].0;
-                let node = dag.nodes.get(mod_name)?;
-                if is_untrusted || node.is_root_pkg {
-                    Some(mod_name.clone())
-                } else {
-                    None
-                }
-            })
+            .map(|(i, _, _, _)| misses_to_compile[*i].0.clone())
             .collect();
-        if let Err(audit_err) = crate::zygote::audit_compiled_modules_with_zygote(
+        if let Err(audit_err) = audit_or_replay_modules(
             store,
             &cfg,
-            &wave_audit_mod_names,
+            &dag,
+            &wave_mod_names,
             &lean_path_env,
-            &[],
             is_untrusted,
         ) {
             let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
@@ -8783,7 +9512,7 @@ pub fn build_project_modules_native(
                 dur_ms,
             )?;
             if !is_untrusted {
-                record_verified_dep_source(&cfg, node, &dig, node.is_root_pkg);
+                record_verified_dep_source(&cfg, node, &dig);
             }
             olean_digests.insert(mod_name.clone(), dig);
             report.modules_compiled += 1;
@@ -8794,6 +9523,10 @@ pub fn build_project_modules_native(
 }
 #[cfg(test)]
 pub(crate) static BWRAP_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[cfg(test)]
+#[path = "../tests/support/lean_options.rs"]
+pub(crate) mod option_cases;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8981,6 +9714,59 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn test_weakening_options_all_sources_fail_closed() {
+        use option_cases::*;
+        let dir = make_temp_test_dir("weakening_options");
+        for (cases, allowed) in [
+            (ORIGINAL_OPTIONS, false),
+            (RESTRICTED_OPTIONS, false),
+            (GOOD_OPTIONS, true),
+        ] {
+            for &(name, value) in cases {
+                for prefix in PREFIXES {
+                    let key = format!("{prefix}{name}");
+                    let arg = format!("-D{key}={value}");
+                    let allowed = if allowed {
+                        matches!(*prefix, "" | "weak.")
+                    } else {
+                        original_case_allowed(name, value, prefix)
+                    };
+                    assert_eq!(is_allowed_lean_arg(&arg), allowed, "{arg}");
+                    assert_eq!(validate_lean_args([&arg]).is_ok(), allowed, "{arg}");
+                    for format in ["lean", "toml"] {
+                        for scope in SCOPES {
+                            for field in FIELDS {
+                                let path = dir.join(format!("lakefile.{format}"));
+                                fs::write(&path, lakefile(format, scope, field, &key, value))
+                                    .unwrap();
+                                for root in [false, true] {
+                                    let result = if format == "lean" {
+                                        parse_lakefile_lean(&dir, &path, root)
+                                    } else {
+                                        parse_lakefile_toml(&dir, &path, root)
+                                    };
+                                    if allowed {
+                                        result.unwrap_or_else(|e| {
+                                            panic!("{format}/{scope}/{field}/{arg}: {e:#}")
+                                        });
+                                    } else {
+                                        let error = format!("{:#}", result.unwrap_err());
+                                        assert!(
+                                            error.contains(&key),
+                                            "{format}/{scope}/{field}/{arg}: {error}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -10172,8 +10958,679 @@ lean_exe «demo-exe» where
         Ok(())
     }
 
+    /// Astra r4: a trusted dependency module forging a theorem with `debug.skipKernelTC` must
+    /// not be importable on the fresh-build, CAS-restore, or stale-manifest paths.
+    #[cfg(unix)]
+    #[test]
+    fn test_trusted_dependency_modules_are_kernel_replayed_before_import() -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = make_temp_test_dir("dep_replay");
+        let (proj, dep) = (dir.join("app"), dir.join("app/.lake/packages/dep"));
+        fs::create_dir_all(dep.join("Dep"))?;
+        let toolchain = include_str!("../../../lean/lean-toolchain");
+        fs::write(proj.join("lean-toolchain"), toolchain)?;
+        fs::write(dep.join("lean-toolchain"), toolchain)?;
+        fs::write(
+            dep.join("lakefile.toml"),
+            "name = \"dep\"\n[[lean_lib]]\nname = \"Dep\"\n",
+        )?;
+        fs::write(dep.join("Dep/Bad.lean"), "import Lean\nopen Lean Elab Command Term\nelab \"forge_bad\" : command => liftTermElabM do\n  withOptions (fun o => o.setBool `debug.skipKernelTC true) do\n    Lean.addDecl <| .thmDecl {name := `bad, levelParams := [], type := mkConst ``False, value := mkConst ``True.intro}\nforge_bad\n")?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            r#"{"version": "1.2.0", "packagesDir": ".lake/packages", "packages": [{"type": "path", "name": "dep", "dir": ".lake/packages/dep", "configFile": "lakefile.toml", "inherited": false}], "name": "app", "lakeDir": ".lake", "fixedToolchain": false}"#,
+        )?;
+        fs::write(proj.join("lakefile.toml"), "name = \"app\"\ndefaultTargets = [\"App\"]\n[[require]]\nname = \"dep\"\npath = \".lake/packages/dep\"\n[[lean_lib]]\nname = \"App\"\n")?;
+        fs::write(
+            proj.join("App.lean"),
+            "import Dep.Bad\ntheorem uses_bad : False := bad\n",
+        )?;
+        let mut store = TurboStore::open(Some(&dir.join("cache")))?;
+        let dep_olean = dep.join(".lake/build/lib/lean/Dep/Bad.olean");
+        let manifest_path = dep.join(".lake/build/.turbo_verified_sources.json");
+        let build = |store: &mut TurboStore| {
+            format!(
+                "{:#}",
+                build_project_modules_native(
+                    store,
+                    &proj,
+                    &[],
+                    "trusted-internal",
+                    1,
+                    false,
+                    true,
+                    None,
+                )
+                .map(|_| ())
+                .unwrap_err()
+            )
+        };
+        let assert_rejected = |store: &TurboStore, err: &str, path: &str| {
+            assert!(err.contains("Dep.Bad"), "{path}: {err}");
+            assert!(
+                !proj.join(".lake/build/lib/lean/App.olean").exists(),
+                "{path}"
+            );
+            let cfg = resolve_project_config(&proj).unwrap();
+            let (lp_env, _) = build_lean_search_path(&cfg, false);
+            assert!(
+                !is_olean_replayed_in_store(store, &cfg, &lp_env, &dep_olean),
+                "{path}: forged `.olean` must never gain store DB replay authority"
+            );
+        };
+        // 1. Fresh build: the compiled dependency is replayed (and rejected) before App imports it.
+        let err = build(&mut store);
+        assert!(err.contains("KernelReplay"), "{err}");
+        assert_rejected(&store, &err, "fresh");
+        // 2. CAS restore of the unreplayed Lake artifacts (as stored before this fix).
+        let lake = Command::new("lake")
+            .args(["build", "Dep.Bad"])
+            .current_dir(&proj)
+            .output()?;
+        anyhow::ensure!(
+            lake.status.success(),
+            "{}",
+            String::from_utf8_lossy(&lake.stderr)
+        );
+        let cfg = resolve_project_config(&proj)?;
+        let dag = build_module_dag_with_trust(&cfg, &[], false)?;
+        let node = &dag.nodes["Dep.Bad"];
+        let key = compute_module_cas_key(&cfg, node, &[], node.needs_c)?;
+        store_module_artifacts_in_cas(
+            &mut store,
+            &proj,
+            node,
+            &key,
+            &cfg.toolchain,
+            "trusted-internal",
+            1,
+            0,
+        )?;
+        fs::remove_dir_all(dep.join(".lake/build"))?;
+        let err = build(&mut store);
+        assert!(err.contains("materialized CAS hit"), "{err}");
+        assert_rejected(&store, &err, "restore");
+        // 3. A forged current-version `.turbo_verified_sources.json` manifest makes the `.olean`
+        // appear fresh, yet `TurboStore` DB holds no replay row, so `build`, `ci-verify`, `check`,
+        // and `pr-verify` all kernel-replay and reject `Dep.Bad`!
+        let lake = Command::new("lake")
+            .args(["build", "Dep.Bad"])
+            .current_dir(&proj)
+            .output()?;
+        anyhow::ensure!(
+            lake.status.success(),
+            "{}",
+            String::from_utf8_lossy(&lake.stderr)
+        );
+        let forged_dep_manifest = serde_json::json!({
+            "pkg_name": node.pkg_name,
+            "toolchain": cfg.toolchain,
+            "lean_githash": cfg.lean_githash,
+            "pkg_config_digest": node.pkg_config_digest,
+            "workspace_config_digest": cfg.canonical_config_digest,
+            "allowed_axioms": crate::splitter::allowed_axioms(),
+            "modules": {
+                "Dep/Bad.lean": {
+                    "src_blake3": node.src_blake3,
+                    "olean_artifact_digest": compute_olean_artifact_set_digest(&dep_olean)?,
+                    "replay_version": crate::zygote::ZYGOTE_REPLAY_VERSION,
+                }
+            }
+        });
+        fs::write(&manifest_path, serde_json::to_vec(&forged_dep_manifest)?)?;
+        let fresh_dag = build_module_dag_with_trust(&cfg, &[], false)?;
+        assert!(
+            !fresh_dag.nodes.contains_key("Dep.Bad"),
+            "forged manifest exercises external_olean_deps path"
+        );
+        let err = build(&mut store);
+        assert!(err.contains("KernelReplay"), "forged manifest build: {err}");
+        assert_rejected(&store, &err, "forged manifest build");
+        // 4. `check` and `ci-verify` with forged manifest on disk also reject `Dep.Bad` via store DB authority.
+        fs::write(&manifest_path, serde_json::to_vec(&forged_dep_manifest)?)?;
+        let err = crate::check::evaluate_check_command_value(
+            &mut store,
+            proj.join("App.lean"),
+            None,
+            proj.clone(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("KernelReplay"),
+            "check: {err:#}"
+        );
+        fs::write(&manifest_path, serde_json::to_vec(&forged_dep_manifest)?)?;
+        let ci_err = crate::pr_verify::run_ci_verify_command(
+            &mut store,
+            true,
+            "trusted".to_string(),
+            proj.clone(),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{ci_err:#}").contains("KernelReplay"),
+            "ci-verify: {ci_err:#}"
+        );
+        // 5. Even if `App` itself is built by Lake with a forged root `.turbo_verified_sources.json`,
+        // `build`, `ci-verify`, `check`, and `pr-verify` reject it because `TurboStore` DB lacks replay authority.
+        let lake_app = Command::new("lake")
+            .args(["build", "App"])
+            .current_dir(&proj)
+            .output()?;
+        anyhow::ensure!(
+            lake_app.status.success(),
+            "{}",
+            String::from_utf8_lossy(&lake_app.stderr)
+        );
+        fs::write(&manifest_path, serde_json::to_vec(&forged_dep_manifest)?)?;
+        let app_olean = proj.join(".lake/build/lib/lean/App.olean");
+        let app_src_raw = fs::read_to_string(proj.join("App.lean"))?;
+        let forged_root_manifest = serde_json::json!({
+            "pkg_name": cfg.root_pkg.name,
+            "toolchain": cfg.toolchain,
+            "lean_githash": cfg.lean_githash,
+            "pkg_config_digest": cfg.root_pkg.config_digest,
+            "workspace_config_digest": cfg.canonical_config_digest,
+            "allowed_axioms": crate::splitter::allowed_axioms(),
+            "modules": {
+                "App.lean": {
+                    "src_blake3": blake3::hash(app_src_raw.as_bytes()).to_hex().to_string(),
+                    "olean_artifact_digest": compute_olean_artifact_set_digest(&app_olean)?,
+                    "replay_version": crate::zygote::ZYGOTE_REPLAY_VERSION,
+                }
+            }
+        });
+        fs::write(
+            proj.join(".lake/build/.turbo_verified_sources.json"),
+            serde_json::to_vec(&forged_root_manifest)?,
+        )?;
+        let build_cmd_err = crate::lake_build::run_build_command(
+            &mut store,
+            true,
+            vec![],
+            proj.clone(),
+            "trusted".to_string(),
+            1,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{build_cmd_err:#}").contains("KernelReplay"),
+            "run_build_command forged root manifest: {build_cmd_err:#}"
+        );
+        let ci_root_err = crate::pr_verify::run_ci_verify_command(
+            &mut store,
+            true,
+            "trusted".to_string(),
+            proj.clone(),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{ci_root_err:#}").contains("KernelReplay"),
+            "ci-verify forged root manifest: {ci_root_err:#}"
+        );
+        let check_decl_err = crate::check::evaluate_check_command_value(
+            &mut store,
+            proj.join("App.lean"),
+            Some("uses_bad".to_string()),
+            proj.clone(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{check_decl_err:#}").contains("KernelReplay"),
+            "check --decl forged root manifest: {check_decl_err:#}"
+        );
+        // 6. Initialize a git base commit and edit `App.lean`'s proof body so `pr-verify` runs in
+        // trusted mode with forged `.turbo_verified_sources.json` manifests on disk: `TurboStore` DB
+        // still has no replay row, so `pr-verify` rejects `Dep.Bad` via independent kernel replay.
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec![
+                "add",
+                "lean-toolchain",
+                "lakefile.toml",
+                "lake-manifest.json",
+                "App.lean",
+            ],
+            vec!["commit", "-m", "base"],
+        ] {
+            let g = Command::new("git")
+                .args(&args)
+                .current_dir(&proj)
+                .output()?;
+            anyhow::ensure!(
+                g.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&g.stderr)
+            );
+        }
+        let edited_app = "import Dep.Bad\ntheorem uses_bad : False := by exact bad\n";
+        fs::write(proj.join("App.lean"), edited_app)?;
+        let lake_app2 = Command::new("lake")
+            .args(["build", "App"])
+            .current_dir(&proj)
+            .output()?;
+        anyhow::ensure!(
+            lake_app2.status.success(),
+            "{}",
+            String::from_utf8_lossy(&lake_app2.stderr)
+        );
+        fs::write(&manifest_path, serde_json::to_vec(&forged_dep_manifest)?)?;
+        let forged_root_manifest2 = serde_json::json!({
+            "pkg_name": cfg.root_pkg.name,
+            "toolchain": cfg.toolchain,
+            "lean_githash": cfg.lean_githash,
+            "pkg_config_digest": cfg.root_pkg.config_digest,
+            "workspace_config_digest": cfg.canonical_config_digest,
+            "allowed_axioms": crate::splitter::allowed_axioms(),
+            "modules": {
+                "App.lean": {
+                    "src_blake3": blake3::hash(edited_app.as_bytes()).to_hex().to_string(),
+                    "olean_artifact_digest": compute_olean_artifact_set_digest(&app_olean)?,
+                    "replay_version": crate::zygote::ZYGOTE_REPLAY_VERSION,
+                }
+            }
+        });
+        fs::write(
+            proj.join(".lake/build/.turbo_verified_sources.json"),
+            serde_json::to_vec(&forged_root_manifest2)?,
+        )?;
+        let pr_err = crate::pr_verify::run_pr_verify_command(
+            &mut store,
+            true,
+            proj.clone(),
+            "HEAD".to_string(),
+            "trusted".to_string(),
+            false,
+            None,
+            None,
+            None,
+            None,
+            false,
+            1,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{pr_err:#}").contains("KernelReplay"),
+            "pr-verify forged manifest: {pr_err:#}"
+        );
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Regression test: a module under `Std.*` (`Std.Forge`) that is NOT in the installed
+    /// toolchain `lib/lean` (or shadows it on `LEAN_PATH` / package search order) must never be
+    /// exempted as a builtin toolchain module, and must be kernel-replayed and rejected across
+    /// `build`, `check`, `ci-verify`, and `pr-verify`.
+    #[cfg(unix)]
+    #[test]
+    fn test_std_prefix_module_is_not_exempted_as_builtin_toolchain_module() -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = make_temp_test_dir("std_forge_replay");
+        let (proj, ext_pkg) = (dir.join("app"), dir.join("ext_std"));
+        fs::create_dir_all(&proj)?;
+        fs::create_dir_all(ext_pkg.join("Std"))?;
+        let toolchain = include_str!("../../../lean/lean-toolchain");
+        fs::write(proj.join("lean-toolchain"), toolchain)?;
+        fs::write(ext_pkg.join("lean-toolchain"), toolchain)?;
+        let forge_src = "import Init\n";
+        fs::write(ext_pkg.join("Std/Forge.lean"), forge_src)?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"app\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\n",
+        )?;
+        fs::write(
+            proj.join("App.lean"),
+            "import Std.Forge\ntheorem bad_from_std : False := std_forged_false\n",
+        )?;
+        let cfg = resolve_project_config(&proj)?;
+        let ext_lib_lean = ext_pkg.join(".lake/build/lib/lean");
+        fs::create_dir_all(ext_lib_lean.join("Std"))?;
+        let ext_olean = ext_lib_lean.join("Std/Forge.olean");
+        let ext_ilean = ext_lib_lean.join("Std/Forge.ilean");
+        fs::write(&ext_ilean, b"{}")?;
+        let maker_path = dir.join("Maker.lean");
+        fs::write(
+            &maker_path,
+            "import Lean\nopen Lean\ndef main (args : List String) : IO Unit := do\n  searchPathRef.set [System.FilePath.mk args[1]!]\n  let env ← importModules #[{ module := `Init }] {} 0\n  let env := env.setMainModule `Std.Forge\n  let decl : Declaration := .thmDecl {\n    name := `std_forged_false,\n    levelParams := [],\n    type := mkConst ``False,\n    value := mkConst ``True.intro\n  }\n  match env.addDeclCore 0 0 decl none false with\n  | Except.ok env2 => writeModule env2 args[0]! false\n  | Except.error _ => throw <| IO.userError \"addDecl failed\"\n",
+        )?;
+        let compile_ext = Command::new(&cfg.lean_bin)
+            .arg("--run")
+            .arg(&maker_path)
+            .arg(&ext_olean)
+            .arg(&cfg.toolchain_lib_lean)
+            .env("LEAN_PATH", &cfg.toolchain_lib_lean)
+            .output()?;
+        anyhow::ensure!(
+            compile_ext.status.success(),
+            "stdout: {} stderr: {}",
+            String::from_utf8_lossy(&compile_ext.stdout),
+            String::from_utf8_lossy(&compile_ext.stderr)
+        );
+        assert!(ext_olean.is_file(), "lean must emit Std/Forge.olean");
+        assert!(
+            !is_builtin_toolchain_module(
+                &cfg.toolchain_lib_lean,
+                Some(&cfg.lean_githash),
+                "Std.Forge"
+            ),
+            "Std.Forge does not exist in toolchain_lib_lean and must not be exempted by prefix"
+        );
+        assert!(
+            is_builtin_toolchain_module(&cfg.toolchain_lib_lean, Some(&cfg.lean_githash), "Init"),
+            "real toolchain Init.olean with matching githash must be recognized"
+        );
+        assert!(
+            !is_verified_toolchain_olean_file(
+                &cfg.toolchain_lib_lean,
+                Some(&cfg.lean_githash),
+                &ext_olean
+            ),
+            "external Std/Forge.olean outside toolchain_lib_lean must not pass toolchain verification"
+        );
+
+        // Part A: Prebuilt `Std.Forge` supplied via `LEAN_PATH` (earlier in search order than toolchain).
+        let prev_lp = std::env::var_os("LEAN_PATH");
+        std::env::set_var("LEAN_PATH", &ext_lib_lean);
+        let res_a = (|| -> Result<()> {
+            let mut store = TurboStore::open(Some(&dir.join("cache_lp")))?;
+            let dag = build_module_dag_with_trust(&cfg, &[], false)?;
+            assert!(
+                dag.nodes["App"]
+                    .external_olean_deps
+                    .iter()
+                    .any(|(m, _)| m == "Std.Forge"),
+                "LEAN_PATH Std.Forge must be tracked in external_olean_deps, not skipped as toolchain"
+            );
+            let build_err = build_project_modules_native(
+                &mut store,
+                &proj,
+                &[],
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                format!("{build_err:#}").contains("KernelReplay"),
+                "native build with LEAN_PATH Std.Forge: {build_err:#}"
+            );
+            let check_err = crate::check::evaluate_check_command_value(
+                &mut store,
+                proj.join("App.lean"),
+                None,
+                proj.clone(),
+            )
+            .unwrap_err();
+            assert!(
+                format!("{check_err:#}").contains("KernelReplay"),
+                "check with LEAN_PATH Std.Forge: {check_err:#}"
+            );
+            Ok(())
+        })();
+        match prev_lp {
+            Some(v) => std::env::set_var("LEAN_PATH", v),
+            None => std::env::remove_var("LEAN_PATH"),
+        }
+        res_a?;
+
+        // Part B: Dependency-package `Std/Forge.lean` (`dep_std`): `Std.Forge` is a prebuilt
+        // dependency `.olean` in `.lake/packages/dep_std` (whose source only imports `Init`, so
+        // `Std.Forge.olean` has zero `Std.*` transitive imports). Before our fix, `Std.Forge` was
+        // skipped by prefix across `build_module_dag_with_trust`, `are_all_project_oleans_replayed_in_store`,
+        // `ensure_imported_oleans_replayed`, and `stateless_imports_replayed_in_store`; now all four
+        // entrypoints (`build`, `ci-verify`, `check`, and `pr-verify`) kernel-replay `Std/Forge.olean`
+        // and reject it.
+        let dep_std = proj.join(".lake/packages/dep_std");
+        fs::create_dir_all(dep_std.join("Std"))?;
+        fs::write(dep_std.join("lean-toolchain"), toolchain)?;
+        fs::write(dep_std.join("Std/Forge.lean"), forge_src)?;
+        fs::write(
+            dep_std.join("lakefile.toml"),
+            "name = \"dep_std\"\n[[lean_lib]]\nname = \"DepStd\"\nroots = [\"Std.Forge\"]\n",
+        )?;
+        let dep_lib_lean = dep_std.join(".lake/build/lib/lean");
+        let lake_bin = cfg.lean_bin.parent().expect("lean bin parent").join("lake");
+        let lake_dep = Command::new(&lake_bin)
+            .args(["build", "Std.Forge"])
+            .current_dir(&dep_std)
+            .env("SANDBOXED_ALLOW_RAW_LAKE", "1")
+            .output()?;
+        anyhow::ensure!(
+            lake_dep.status.success(),
+            "lake build Std.Forge: {} {}",
+            String::from_utf8_lossy(&lake_dep.stdout),
+            String::from_utf8_lossy(&lake_dep.stderr)
+        );
+        // Replace `Std/Forge.olean` with the forged `.olean` containing `std_forged_false : False`
+        // and update `Std/Forge.trace`'s `outputs.o[0]` hash so `verify_module_lake_sidecars`
+        // accepts `Std.Forge` as a fresh Lake-built dependency artifact!
+        fs::copy(&ext_olean, dep_lib_lean.join("Std/Forge.olean"))?;
+        let new_olean_h = lake_hash_bytes(&fs::read(dep_lib_lean.join("Std/Forge.olean"))?);
+        fs::write(
+            dep_lib_lean.join("Std/Forge.olean.hash"),
+            format!("{:016x}\n", new_olean_h),
+        )?;
+        let dep_trace_path = dep_lib_lean.join("Std/Forge.trace");
+        let mut dep_tv: serde_json::Value = serde_json::from_slice(&fs::read(&dep_trace_path)?)?;
+        dep_tv["outputs"]["o"][0] =
+            serde_json::Value::String(format!("{:016x}.olean", new_olean_h));
+        fs::write(&dep_trace_path, serde_json::to_vec(&dep_tv)?)?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            r#"{"version": "1.2.0", "packagesDir": ".lake/packages", "packages": [{"type": "path", "name": "dep_std", "dir": ".lake/packages/dep_std", "configFile": "lakefile.toml", "inherited": false}], "name": "app", "lakeDir": ".lake", "fixedToolchain": false}"#,
+        )?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"app\"\ndefaultTargets = [\"App\"]\n[[require]]\nname = \"dep_std\"\npath = \".lake/packages/dep_std\"\n[[lean_lib]]\nname = \"App\"\n",
+        )?;
+        let cfg_b = resolve_project_config(&proj)?;
+        let dep_pkg_cfg = &cfg_b.dep_pkgs[0];
+        let forged_dep_std_manifest = serde_json::json!({
+            "pkg_name": dep_pkg_cfg.name,
+            "toolchain": cfg_b.toolchain,
+            "lean_githash": cfg_b.lean_githash,
+            "pkg_config_digest": dep_pkg_cfg.config_digest,
+            "workspace_config_digest": cfg_b.canonical_config_digest,
+            "allowed_axioms": crate::splitter::allowed_axioms(),
+            "modules": {
+                "Std/Forge.lean": {
+                    "src_blake3": blake3::hash(forge_src.as_bytes()).to_hex().to_string(),
+                    "olean_artifact_digest": compute_olean_artifact_set_digest(&dep_lib_lean.join("Std/Forge.olean"))?,
+                }
+            }
+        });
+        fs::write(
+            dep_std.join(".lake/build/.turbo_verified_sources.json"),
+            serde_json::to_vec(&forged_dep_std_manifest)?,
+        )?;
+        let dag_b = build_module_dag_with_trust(&cfg_b, &[], false)?;
+        assert!(
+            dag_b.nodes["App"]
+                .external_olean_deps
+                .iter()
+                .any(|(m, _)| m == "Std.Forge"),
+            "dep_std Std.Forge must be in App's external_olean_deps (not skipped as builtin toolchain)"
+        );
+        let lake_app = Command::new(&lake_bin)
+            .args(["build", "App"])
+            .current_dir(&proj)
+            .env("SANDBOXED_ALLOW_RAW_LAKE", "1")
+            .output()?;
+        anyhow::ensure!(
+            lake_app.status.success(),
+            "lake build App: {} {}",
+            String::from_utf8_lossy(&lake_app.stdout),
+            String::from_utf8_lossy(&lake_app.stderr)
+        );
+        let proj_lib_lean = proj.join(".lake/build/lib/lean");
+        let app_src_b = fs::read_to_string(proj.join("App.lean"))?;
+        let forged_root_b = serde_json::json!({
+            "pkg_name": cfg_b.root_pkg.name,
+            "toolchain": cfg_b.toolchain,
+            "lean_githash": cfg_b.lean_githash,
+            "pkg_config_digest": cfg_b.root_pkg.config_digest,
+            "workspace_config_digest": cfg_b.canonical_config_digest,
+            "allowed_axioms": crate::splitter::allowed_axioms(),
+            "modules": {
+                "App.lean": {
+                    "src_blake3": blake3::hash(app_src_b.as_bytes()).to_hex().to_string(),
+                    "olean_artifact_digest": compute_olean_artifact_set_digest(&proj_lib_lean.join("App.olean"))?,
+                }
+            }
+        });
+        fs::write(
+            proj.join(".lake/build/.turbo_verified_sources.json"),
+            serde_json::to_vec(&forged_root_b)?,
+        )?;
+        let mut store_b = TurboStore::open(Some(&dir.join("cache_proj")))?;
+        let build_cmd_err = crate::lake_build::run_build_command(
+            &mut store_b,
+            true,
+            vec![],
+            proj.clone(),
+            "trusted".to_string(),
+            1,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{build_cmd_err:#}").contains("KernelReplay"),
+            "run_build_command project Std.Forge: {build_cmd_err:#}"
+        );
+        let ci_err = crate::pr_verify::run_ci_verify_command(
+            &mut store_b,
+            true,
+            "trusted".to_string(),
+            proj.clone(),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{ci_err:#}").contains("KernelReplay"),
+            "ci-verify project Std.Forge: {ci_err:#}"
+        );
+        let check_proj_err = crate::check::evaluate_check_command_value(
+            &mut store_b,
+            proj.join("App.lean"),
+            Some("bad_from_std".to_string()),
+            proj.clone(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{check_proj_err:#}").contains("KernelReplay"),
+            "check --decl project Std.Forge: {check_proj_err:#}"
+        );
+
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec![
+                "add",
+                "lean-toolchain",
+                "lakefile.toml",
+                "lake-manifest.json",
+                "App.lean",
+            ],
+            vec!["commit", "-m", "base"],
+        ] {
+            let g = Command::new("git")
+                .args(&args)
+                .current_dir(&proj)
+                .output()?;
+            anyhow::ensure!(
+                g.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&g.stderr)
+            );
+        }
+        let edited_app_b =
+            "import Std.Forge\ntheorem bad_from_std : False := by exact std_forged_false\n";
+        fs::write(proj.join("App.lean"), edited_app_b)?;
+        let lake_app2 = Command::new(&lake_bin)
+            .args(["build", "App"])
+            .current_dir(&proj)
+            .env("SANDBOXED_ALLOW_RAW_LAKE", "1")
+            .output()?;
+        anyhow::ensure!(
+            lake_app2.status.success(),
+            "lake build App (2): {} {}",
+            String::from_utf8_lossy(&lake_app2.stdout),
+            String::from_utf8_lossy(&lake_app2.stderr)
+        );
+        let forged_root_b2 = serde_json::json!({
+            "pkg_name": cfg_b.root_pkg.name,
+            "toolchain": cfg_b.toolchain,
+            "lean_githash": cfg_b.lean_githash,
+            "pkg_config_digest": cfg_b.root_pkg.config_digest,
+            "workspace_config_digest": cfg_b.canonical_config_digest,
+            "allowed_axioms": crate::splitter::allowed_axioms(),
+            "modules": {
+                "App.lean": {
+                    "src_blake3": blake3::hash(edited_app_b.as_bytes()).to_hex().to_string(),
+                    "olean_artifact_digest": compute_olean_artifact_set_digest(&proj_lib_lean.join("App.olean"))?,
+                }
+            }
+        });
+        fs::write(
+            proj.join(".lake/build/.turbo_verified_sources.json"),
+            serde_json::to_vec(&forged_root_b2)?,
+        )?;
+        let pr_err = crate::pr_verify::run_pr_verify_command(
+            &mut store_b,
+            true,
+            proj.clone(),
+            "HEAD".to_string(),
+            "trusted".to_string(),
+            false,
+            None,
+            None,
+            None,
+            None,
+            false,
+            1,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{pr_err:#}").contains("KernelReplay"),
+            "pr-verify project Std.Forge: {pr_err:#}"
+        );
+        drop(store_b);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     #[test]
     fn test_native_module_builder_cas_partial_invalidation_lazy_c_and_lake_differential() {
+        // Other tests toggle `TURBO_LEAN_NO_WORKTREE_LINK` under the env lock, which disables
+        // compiling uncached modules in `build_project_modules_native` when multi-threaded.
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = make_temp_test_dir("native_e2e");
         let store_dir = dir.join(".turbo_store");
         let proj_dir = dir.join("proj");
@@ -10481,8 +11938,10 @@ lean_exe «demo-exe» where
 
     #[test]
     fn test_parallel_diamond_dag_and_ci_verify_native_builder() {
-        let dir = std::env::temp_dir().join(format!("turbo_mod_diamond_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = make_temp_test_dir("diamond");
         let proj_dir = dir.join("diamond_proj");
         let store_dir = dir.join("store");
         fs::create_dir_all(proj_dir.join("Diamond")).unwrap();
@@ -11944,5 +13403,426 @@ roots = ["Fast"]
         .unwrap();
         parse_lakefile_toml(&dir, &tf, false).unwrap();
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_raw_sqlite_replay_row_and_checkout_local_store_never_suppress_kernel_replay(
+    ) -> Result<()> {
+        let _env_guard = BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = make_temp_test_dir("replay_sqlite_mac_and_local_store");
+        let toolchain = "leanprover/lean4:v4.35.0\n";
+        let Ok((lean_bin, _, _, _)) = resolve_toolchain_compiler(&dir, toolchain.trim()) else {
+            let _ = fs::remove_dir_all(&dir);
+            return Ok(());
+        };
+        if !lean_bin.is_file() {
+            let _ = fs::remove_dir_all(&dir);
+            return Ok(());
+        }
+        let proj = dir.join("proj");
+        let dep = proj.join(".lake/packages/dep");
+        fs::create_dir_all(dep.join("Dep"))?;
+        fs::write(proj.join("lean-toolchain"), toolchain)?;
+        fs::write(dep.join("lean-toolchain"), toolchain)?;
+        let bad_src = "import Lean\nopen Lean Elab Command\nelab \"forge_bad\" : command => do\n  let k := Name.mkStr (Name.mkStr .anonymous \"debug\") (\"skip\" ++ \"KernelTC\")\n  withScope (fun sc => { sc with opts := sc.opts.setBool k true }) do\n    liftCoreM <| addDecl <| .thmDecl {\n      name := `bad, levelParams := [], type := mkConst ``False, value := mkConst ``True.intro }\nforge_bad\n";
+        fs::write(dep.join("Dep/Bad.lean"), bad_src)?;
+        fs::write(
+            dep.join("lakefile.toml"),
+            "name = \"dep\"\n[[lean_lib]]\nname = \"Dep\"\n",
+        )?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"app\"\ndefaultTargets = [\"App\"]\n[[require]]\nname = \"dep\"\npath = \".lake/packages/dep\"\n[[lean_lib]]\nname = \"App\"\n",
+        )?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            r#"{"version": "1.2.0", "packagesDir": ".lake/packages", "packages": [{"type": "path", "name": "dep", "dir": ".lake/packages/dep", "configFile": "lakefile.toml", "inherited": false}], "name": "app", "lakeDir": ".lake", "fixedToolchain": false}"#,
+        )?;
+        fs::write(
+            proj.join("App.lean"),
+            "import Dep.Bad\ntheorem uses_bad : False := bad\n",
+        )?;
+        let lake_bin = lean_bin.parent().expect("lean bin parent").join("lake");
+        let lake_out = Command::new(&lake_bin)
+            .args(["build", "Dep.Bad"])
+            .current_dir(&proj)
+            .env("SANDBOXED_ALLOW_RAW_LAKE", "1")
+            .output()?;
+        anyhow::ensure!(
+            lake_out.status.success(),
+            "lake build Dep.Bad: {}",
+            String::from_utf8_lossy(&lake_out.stderr)
+        );
+        let cfg = resolve_project_config(&proj)?;
+        let dep_cfg = &cfg.dep_pkgs[0];
+        let dep_olean = dep.join(".lake/build/lib/lean/Dep/Bad.olean");
+        let forged_manifest = serde_json::json!({
+            "pkg_name": dep_cfg.name,
+            "toolchain": cfg.toolchain,
+            "lean_githash": cfg.lean_githash,
+            "pkg_config_digest": dep_cfg.config_digest,
+            "workspace_config_digest": cfg.canonical_config_digest,
+            "allowed_axioms": crate::splitter::allowed_axioms(),
+            "modules": {
+                "Dep/Bad.lean": {
+                    "src_blake3": blake3::hash(bad_src.as_bytes()).to_hex().to_string(),
+                    "olean_artifact_digest": compute_olean_artifact_set_digest(&dep_olean)?,
+                }
+            }
+        });
+        fs::write(
+            dep.join(".lake/build/.turbo_verified_sources.json"),
+            serde_json::to_vec(&forged_manifest)?,
+        )?;
+        let (lp_env, _) = build_lean_search_path(&cfg, false);
+        let art_dig = compute_replayed_olean_ilean_digest(&dep_olean)?;
+        let env_dig = compute_olean_transitive_env_digest(&cfg, &lp_env, &dep_olean)?;
+
+        // 1. External verifier store with raw SQLite row insertion into both `kernel_replayed_oleans`
+        // and `kernel_replayed_oleans_auth` (forged MAC): `check` and `build` MUST still run
+        // independent kernel replay and reject `Dep.Bad` (`KernelReplay`)!
+        let mut ext_store = TurboStore::open(Some(&dir.join("external_cache")))?;
+        ext_store.conn.execute(
+            "INSERT INTO kernel_replayed_oleans (artifact_digest, replay_version, toolchain_hash, module_name, verified_at)
+             VALUES (?1, ?2, ?3, 'Dep.Bad', 1)",
+            rusqlite::params![
+                &art_dig,
+                i64::from(crate::zygote::ZYGOTE_REPLAY_VERSION),
+                &cfg.lean_githash
+            ],
+        )?;
+        ext_store.conn.execute(
+            "INSERT INTO kernel_replayed_oleans_auth (artifact_digest, environment_digest, replay_version, toolchain_hash, module_name, replay_mac, verified_at)
+             VALUES (?1, ?2, ?3, ?4, 'Dep.Bad', 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff', 1)",
+            rusqlite::params![
+                &art_dig,
+                &env_dig,
+                i64::from(crate::zygote::ZYGOTE_REPLAY_VERSION),
+                &cfg.lean_githash
+            ],
+        )?;
+        assert!(
+            !is_olean_replayed_in_store(&ext_store, &cfg, &lp_env, &dep_olean),
+            "unauthenticated SQLite row must never grant replay authority"
+        );
+        let check_err = crate::check::evaluate_check_command_value(
+            &mut ext_store,
+            proj.join("App.lean"),
+            None,
+            proj.clone(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{check_err:#}").contains("KernelReplay"),
+            "raw SQLite row suppressed check kernel replay: {check_err:#}"
+        );
+        let build_err = build_project_modules_native(
+            &mut ext_store,
+            &proj,
+            &[],
+            "trusted-internal",
+            1,
+            false,
+            true,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{build_err:#}").contains("KernelReplay"),
+            "raw SQLite row suppressed native build kernel replay: {build_err:#}"
+        );
+
+        // 2. Checkout-local store (`proj/.turbo-cache`): even if an attacker writes a valid 0600
+        // `.verifier_replay_hmac_key` AND valid keyed MAC inside the checkout, checkout-local stores
+        // are rejected as replay authority and kernel replay still executes and rejects `Dep.Bad`!
+        let local_cache = proj.join(".turbo-cache");
+        let mut local_store = TurboStore::open(Some(&local_cache))?;
+        let attacker_key = [0x42u8; 32];
+        let key_path = local_cache.join(".verifier_replay_hmac_key");
+        fs::write(&key_path, attacker_key)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
+        }
+        let mut mac_msg = Vec::new();
+        mac_msg.extend_from_slice(b"turbo-lean-verifier-replay-mac-v1\n");
+        mac_msg.extend_from_slice(&(art_dig.len() as u64).to_le_bytes());
+        mac_msg.extend_from_slice(art_dig.as_bytes());
+        mac_msg.extend_from_slice(&(env_dig.len() as u64).to_le_bytes());
+        mac_msg.extend_from_slice(env_dig.as_bytes());
+        mac_msg.extend_from_slice(&crate::zygote::ZYGOTE_REPLAY_VERSION.to_le_bytes());
+        mac_msg.extend_from_slice(&(cfg.lean_githash.len() as u64).to_le_bytes());
+        mac_msg.extend_from_slice(cfg.lean_githash.as_bytes());
+        let attacker_mac = blake3::keyed_hash(&attacker_key, &mac_msg)
+            .to_hex()
+            .to_string();
+        local_store.conn.execute(
+            "INSERT INTO kernel_replayed_oleans_auth (artifact_digest, environment_digest, replay_version, toolchain_hash, module_name, replay_mac, verified_at)
+             VALUES (?1, ?2, ?3, ?4, 'Dep.Bad', ?5, 1)",
+            rusqlite::params![
+                &art_dig,
+                &env_dig,
+                i64::from(crate::zygote::ZYGOTE_REPLAY_VERSION),
+                &cfg.lean_githash,
+                &attacker_mac
+            ],
+        )?;
+        assert!(
+            !is_olean_replayed_in_store(&local_store, &cfg, &lp_env, &dep_olean),
+            "checkout-local store must never be accepted as replay authority"
+        );
+        let local_check_err = crate::check::evaluate_check_command_value(
+            &mut local_store,
+            proj.join("App.lean"),
+            None,
+            proj.clone(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{local_check_err:#}").contains("KernelReplay"),
+            "checkout-local store suppressed kernel replay: {local_check_err:#}"
+        );
+
+        // 3. Transitive import environment binding: if `Mid` imports `Base` (`def k : Nat := 1`)
+        // and `Mid` is genuinely replayed & MAC-authenticated in `ext_store`, modifying `Base`'s
+        // `.olean` on disk immediately invalidates `Mid`'s replay authority (`env_dig` changes)
+        // even when `Mid.olean` bytes themselves are untouched!
+        let env_proj = dir.join("env_proj");
+        fs::create_dir_all(env_proj.join("Pkg"))?;
+        fs::write(env_proj.join("lean-toolchain"), toolchain)?;
+        fs::write(
+            env_proj.join("lakefile.toml"),
+            "name = \"env_proj\"\ndefaultTargets = [\"Pkg\"]\n[[lean_lib]]\nname = \"Pkg\"\nroots = [\"Pkg.Base\", \"Pkg.Mid\"]\n",
+        )?;
+        fs::write(env_proj.join("Pkg/Base.lean"), "def k : Nat := 1\n")?;
+        fs::write(
+            env_proj.join("Pkg/Mid.lean"),
+            "import Pkg.Base\ntheorem mid_ok : k = 1 := rfl\n",
+        )?;
+        build_project_modules_native(
+            &mut ext_store,
+            &env_proj,
+            &[],
+            "trusted-internal",
+            1,
+            false,
+            true,
+            None,
+        )?;
+        let env_cfg = resolve_project_config(&env_proj)?;
+        let (env_lp, _) = build_lean_search_path(&env_cfg, false);
+        let mid_olean = env_proj.join(".lake/build/lib/lean/Pkg/Mid.olean");
+        let base_olean = env_proj.join(".lake/build/lib/lean/Pkg/Base.olean");
+        assert!(
+            is_olean_replayed_in_store(&ext_store, &env_cfg, &env_lp, &mid_olean),
+            "freshly audited Mid.olean must hold authenticated replay authority under Base v1"
+        );
+        fs::write(env_proj.join("Pkg/Base.lean"), "def k : Nat := 2\n")?;
+        let recompile_base = Command::new(&env_cfg.lean_bin)
+            .arg("-R")
+            .arg(&env_proj)
+            .arg(env_proj.join("Pkg/Base.lean"))
+            .arg("-o")
+            .arg(&base_olean)
+            .arg("-i")
+            .arg(base_olean.with_extension("ilean"))
+            .current_dir(&env_proj)
+            .env("LEAN_PATH", &env_lp)
+            .output()?;
+        anyhow::ensure!(
+            recompile_base.status.success(),
+            "lean Base.lean v2: {}",
+            String::from_utf8_lossy(&recompile_base.stderr)
+        );
+        assert!(
+            !is_olean_replayed_in_store(&ext_store, &env_cfg, &env_lp, &mid_olean),
+            "editing child Base.olean must invalidate parent Mid.olean replay authority"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_prebuilt_dependency_checking_weakening_directive_and_missing_source_rejected(
+    ) -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = make_temp_test_dir("dep_source_hygiene");
+        let (proj, dep) = (dir.join("app"), dir.join("app/.lake/packages/dep"));
+        fs::create_dir_all(dep.join("Dep"))?;
+        let toolchain = include_str!("../../../lean/lean-toolchain");
+        fs::write(proj.join("lean-toolchain"), toolchain)?;
+        fs::write(dep.join("lean-toolchain"), toolchain)?;
+        fs::write(
+            dep.join("lakefile.toml"),
+            "name = \"dep\"\n[[lean_lib]]\nname = \"Dep\"\n",
+        )?;
+        let dep_src = "set_option debug.skipKernelTC true\ntheorem ok : True := True.intro\n";
+        fs::write(dep.join("Dep/Weak.lean"), dep_src)?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            r#"{"version": "1.2.0", "packagesDir": ".lake/packages", "packages": [{"type": "path", "name": "dep", "dir": ".lake/packages/dep", "configFile": "lakefile.toml", "inherited": false}], "name": "app", "lakeDir": ".lake", "fixedToolchain": false}"#,
+        )?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"app\"\ndefaultTargets = [\"App\"]\n[[require]]\nname = \"dep\"\npath = \".lake/packages/dep\"\n[[lean_lib]]\nname = \"App\"\n",
+        )?;
+        fs::write(
+            proj.join("App.lean"),
+            "import Dep.Weak\ntheorem uses_ok : True := ok\n",
+        )?;
+
+        let cfg = resolve_project_config(&proj)?;
+        let lake_bin = cfg.lean_bin.parent().expect("lean bin parent").join("lake");
+        let lake_out = Command::new(&lake_bin)
+            .args(["build", "App"])
+            .current_dir(&proj)
+            .env("SANDBOXED_ALLOW_RAW_LAKE", "1")
+            .output()?;
+        anyhow::ensure!(
+            lake_out.status.success(),
+            "lake build App: {} {}",
+            String::from_utf8_lossy(&lake_out.stdout),
+            String::from_utf8_lossy(&lake_out.stderr)
+        );
+
+        let mut store = TurboStore::open(Some(&dir.join("cache")))?;
+
+        // 1. `check` rejects importing a prebuilt dependency whose `.lean` source contains
+        // `set_option debug.skipKernelTC true`, even though `ok : True := True.intro` kernel-replays cleanly.
+        let check_err = crate::check::evaluate_check_command_value(
+            &mut store,
+            proj.join("App.lean"),
+            None,
+            proj.clone(),
+        )
+        .unwrap_err();
+        let check_msg = format!("{check_err:#}");
+        assert!(
+            check_msg.contains("checking-weakening")
+                || check_msg.contains("Soundness hygiene violation"),
+            "check must reject prebuilt dependency checking-weakening directive: {check_msg}"
+        );
+
+        // 2. `ci-verify` rejects the prebuilt dependency as well.
+        let ci_err = crate::pr_verify::run_ci_verify_command(
+            &mut store,
+            true,
+            "trusted".to_string(),
+            proj.clone(),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap_err();
+        let ci_msg = format!("{ci_err:#}");
+        assert!(
+            ci_msg.contains("checking-weakening") || ci_msg.contains("Soundness hygiene violation"),
+            "ci-verify must reject prebuilt dependency checking-weakening directive: {ci_msg}"
+        );
+
+        // 3. `pr-verify` rejects a PR whose dependency has `set_option debug.skipKernelTC true`.
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec![
+                "add",
+                "lean-toolchain",
+                "lakefile.toml",
+                "lake-manifest.json",
+                "App.lean",
+            ],
+            vec!["commit", "-m", "base"],
+        ] {
+            let g = Command::new("git")
+                .args(&args)
+                .current_dir(&proj)
+                .output()?;
+            anyhow::ensure!(
+                g.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&g.stderr)
+            );
+        }
+        fs::write(
+            proj.join("App.lean"),
+            "import Dep.Weak\ntheorem uses_ok : True := by exact ok\n",
+        )?;
+        let receipt_path = dir.join("pr_receipt.json");
+        let pr_err = crate::pr_verify::run_pr_verify_command(
+            &mut store,
+            true,
+            proj.clone(),
+            "HEAD".to_string(),
+            "trusted".to_string(),
+            true,
+            Some(receipt_path.clone()),
+            None,
+            None,
+            None,
+            false,
+            2,
+            None,
+        )
+        .unwrap_err();
+        let pr_msg = format!("{pr_err:#}");
+        assert!(
+            pr_msg.contains("checking-weakening") || pr_msg.contains("Soundness hygiene violation"),
+            "pr-verify must reject prebuilt dependency checking-weakening directive: {pr_msg}"
+        );
+        assert!(
+            !receipt_path.exists(),
+            "rejected pr-verify must emit no receipt"
+        );
+
+        // 4. Deleting `Dep/Weak.lean` while leaving `Dep/Weak.olean` in `.lake/packages/dep/.lake/build/lib/lean`
+        // must also fail closed on both `check` and `pr-verify` due to missing package `.lean` source.
+        fs::remove_file(dep.join("Dep/Weak.lean"))?;
+        let missing_src_check = crate::check::evaluate_check_command_value(
+            &mut store,
+            proj.join("App.lean"),
+            None,
+            proj.clone(),
+        )
+        .unwrap_err();
+        let missing_check_msg = format!("{missing_src_check:#}");
+        assert!(
+            missing_check_msg.contains("no resolvable `.lean` source"),
+            "check must reject package `.olean` without `.lean` source: {missing_check_msg}"
+        );
+        let missing_src_pr = crate::pr_verify::run_pr_verify_command(
+            &mut store,
+            true,
+            proj.clone(),
+            "HEAD".to_string(),
+            "trusted".to_string(),
+            true,
+            Some(receipt_path.clone()),
+            None,
+            None,
+            None,
+            false,
+            2,
+            None,
+        )
+        .unwrap_err();
+        let missing_pr_msg = format!("{missing_src_pr:#}");
+        assert!(
+            missing_pr_msg.contains("no resolvable `.lean` source"),
+            "pr-verify must reject package `.olean` without `.lean` source: {missing_pr_msg}"
+        );
+        assert!(!receipt_path.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
     }
 }

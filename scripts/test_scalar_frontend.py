@@ -1,6 +1,7 @@
 """Actual stock-Lean/LNIR/LLVM execution; no Python result oracle."""
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -8,6 +9,8 @@ import unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fuzz_lcnf_conformance as fuzzer
+
+SPEC_LEAN = fuzzer.ROOT / "lean" / "LeanNative" / "Spec.lean"
 
 
 def _requested_sanitizers() -> tuple[bool, bool]:
@@ -1001,11 +1004,127 @@ def probe_rc_drop (sel seed delta : UInt64) : UInt64 :=
             src = tmp / "Stage1DHeap.lean"
             src.write_text(lean_src, encoding="utf-8")
             wire = tmp / "stage1d.lnir"
+            # P-cert C4: without `--allow-rc-adt`, emit-lnir and emit-cabi-bindings hard-fail on a Stage 1D decl
+            # and write nothing (no helper prototypes leak into bindings).
+            for cmd, out in (["emit-lnir", "--wire"], wire), (["emit-cabi-bindings", "--emit-header"], tmp / "h.h"):
+                rej = subprocess.run([engines["full_bin"], *cmd, str(out), str(src)] if cmd[0] != "emit-lnir"
+                                     else [engines["full_bin"], *cmd, str(src), "-o", str(out)], capture_output=True, text=True)
+                self.assertNotEqual(rej.returncode, 0, f"{cmd[0]} must fail closed without --allow-rc-adt")
+                self.assertFalse(out.exists())
+            # Input is resolved ONCE: extraction and the Stage 1D gate must never read different inputs, so any
+            # mix of --lean / --input / --lnir / positional is a selector-conflict hard error that writes nothing.
+            scalar_src = tmp / "ScalarOnly.lean"
+            scalar_src.write_text("@[export scalar_only_add]\ndef scalar_only_add (a b : UInt64) : UInt64 := a + b\n",
+                                  encoding="utf-8")
+            scalar_wire = tmp / "scalar_only.lnir"
+            subprocess.run([engines["full_bin"], "emit-lnir", "--wire", str(scalar_src), "-o", str(scalar_wire)],
+                           check=True, capture_output=True, text=True)
+            conflict_h = tmp / "conflict.h"
+            conflicts = [
+                (engines["full_bin"], ["emit-cabi-bindings", "--emit-header", str(conflict_h), "--lean", str(src), "--input", str(scalar_src)]),
+                (engines["full_bin"], ["emit-cabi-bindings", "--emit-header", str(conflict_h), str(src), "--lnir", str(scalar_wire)]),
+                (engines["full_bin"], ["emit-cabi-bindings", "--emit-header", str(conflict_h), "--lean", str(src), "--canonical-benchmark"]),
+                (engines["full_bin"], ["emit-cabi-bindings", "--emit-header", str(conflict_h), "--input", str(scalar_src), "--input", str(src)]),
+                (engines["full_bin"], ["compile-c-abi", "--emit-header", str(conflict_h), "--lean", str(src), "--input", str(scalar_src)]),
+                (engines["full_bin"], ["compile-static-lib", "--lnir", str(scalar_wire), str(src), "-o", str(conflict_h)]),
+                (engines["full_bin"], ["--c-abi", "--lnir", str(scalar_wire), "--input", str(src), "-o", str(conflict_h)]),
+                (engines["full_bin"], ["--emit-c-abi", "--lean", str(src), "--canonical-benchmark", "-o", str(conflict_h)]),
+                (engines["full_bin"], ["compile-llvm", "--lnir", str(scalar_wire), "--lean", str(src), "-o", str(conflict_h)]),
+                (engines["full_bin"], ["compile-mlir", "--lnir", str(scalar_wire), str(src), "-o", str(conflict_h)]),
+                (engines["full_bin"], ["compile-ptx", "--lean", str(src), "--canonical-benchmark", "-o", str(conflict_h)]),
+                (engines["full_bin"], ["compile-metal", "--lean", str(src), "--fastcheck-sample", "-o", str(conflict_h)]),
+                (engines["full_bin"], ["compile-fastcheck", "--lean", str(src), "--fastcheck-sample", "-o", str(conflict_h)]),
+                (engines["full_bin"], ["compile-hybrid", "--lnir", str(scalar_wire), "--input", str(src), "-o", str(conflict_h)]),
+                (engines["full_bin"], ["superopt", "--lnir", str(scalar_wire), "--canonical-benchmark", "-o", str(conflict_h)]),
+                (engines["full_bin"], ["plugins", "--lnir", str(scalar_wire), "--canonical-benchmark", "-o", str(conflict_h)]),
+                (engines["full_bin"], ["verify-certs", "--lnir", str(scalar_wire), "--input", str(src), "-o", str(conflict_h)]),
+                (engines["full_bin"], ["validate-tv", "--lnir", str(scalar_wire), "--input", str(src), "-o", str(conflict_h)]),
+                (engines["full_bin"], ["emit-lnir", "--lnir", str(scalar_wire), str(src), "-o", str(conflict_h)]),
+                (engines["full_bin"], ["eval-lnir", "--lnir", str(scalar_wire), str(src)]),
+                (engines["full_bin"], ["build-exe", str(src), "--input", str(scalar_src), "-o", str(conflict_h)]),
+                (engines["core_bin"], ["emit-cabi-bindings", "--signatures-only", "--emit-header", str(conflict_h),
+                                       "--lean", str(scalar_src), str(src)]),
+                (engines["core_bin"], ["compile-static-lib", "--lnir", str(scalar_wire), "--input", str(src), "-o", str(conflict_h)]),
+            ]
+            for binary, cmd in conflicts:
+                rej = subprocess.run([binary, *cmd], capture_output=True, text=True)
+                self.assertNotEqual(rej.returncode, 0, f"{cmd} must reject conflicting input selectors: {rej.stdout}")
+                self.assertIn("Conflicting input selectors", rej.stderr, cmd)
+                self.assertFalse(conflict_h.exists(), cmd)
+                self.assertEqual([p.name for p in tmp.iterdir() if p.name.startswith("conflict")], [], cmd)
+            w_rej = subprocess.run(
+                [engines["core_bin"], "worker"],
+                input=(
+                    '{"id":1,"method":"compile-llvm","canonical_benchmark":true,"fastcheck_sample":true}\n'
+                    '{"id":2,"method":"batch-fastcheck","canonical_benchmark":true,"fastcheck_sample":true}\n'
+                    '{"id":3,"method":"exit"}\n'
+                ),
+                capture_output=True, text=True, check=True,
+            )
+            w_rows = [json.loads(ln) for ln in w_rej.stdout.splitlines() if ln.strip()]
+            self.assertEqual(w_rows[0]["error"], "conflicting_input_selectors")
+            self.assertEqual(w_rows[1]["error"], "conflicting_input_selectors")
+            # single-selector RC-ADT input is still rejected; single-selector scalar input still works
+            for sel in (["--lean", str(src)], ["--input", str(src)], [str(src)]):
+                rej = subprocess.run([engines["full_bin"], "emit-cabi-bindings", "--emit-header", str(conflict_h), *sel],
+                                     capture_output=True, text=True)
+                self.assertNotEqual(rej.returncode, 0, f"RC-ADT {sel} must be rejected")
+                self.assertFalse(conflict_h.exists(), sel)
+            for sel in (["--lean", str(scalar_src)], ["--input", str(scalar_src)], [str(scalar_src)], ["--lnir", str(scalar_wire)]):
+                ok = subprocess.run([engines["full_bin"], "emit-cabi-bindings", "--emit-header", str(conflict_h), *sel],
+                                    capture_output=True, text=True)
+                self.assertEqual(ok.returncode, 0, f"{sel}: {ok.stdout}{ok.stderr}")
+                self.assertIn("scalar_only_add(", conflict_h.read_text(encoding="utf-8"), sel)
+                conflict_h.unlink()
+            # P-cert C4 (core binary, no elaboration hook): a `.lean` source is a hard error for emit-cabi-bindings
+            # (unless --signatures-only), compile-c-abi and compile-static-lib, and nothing is written.
+            core_rejects = [
+                (["emit-cabi-bindings", "--emit-header", str(tmp / "c.h"), str(src)], tmp / "c.h"),
+                (["compile-c-abi", "--emit-header", str(tmp / "cc.h"), str(src)], tmp / "cc.h"),
+                (["compile-c-abi", "--signatures-only", "--emit-header", str(tmp / "cs.h"), str(src)], tmp / "cs.h"),
+                (["compile-static-lib", str(src), "-o", str(tmp / "s.a"), "--emit-header", str(tmp / "s.h")], tmp / "s.a"),
+                (["compile-static-lib", str(SPEC_LEAN), "-o", str(tmp / "spec.a")], tmp / "spec.a"),
+                (["--c-abi", str(src), "-o", str(tmp / "cabi.c")], tmp / "cabi.c"),
+            ]
+            for cmd, out in core_rejects:
+                rej = subprocess.run([engines["core_bin"], *cmd], capture_output=True, text=True)
+                self.assertNotEqual(rej.returncode, 0, f"core {cmd[:2]} must reject a .lean source: {rej.stdout}")
+                self.assertFalse(out.exists(), cmd)
+            self.assertFalse((tmp / "s.h").exists())
+            # --signatures-only: exported signatures only, no helper/RC-ADT runtime prototypes, provenance recorded
+            sig_h, sig_fix = tmp / "sig.h", tmp / "sig.json"
+            subprocess.run([engines["core_bin"], "emit-cabi-bindings", "--signatures-only", "--emit-header", str(sig_h),
+                            "--emit-fixtures", str(sig_fix), str(src)], check=True, capture_output=True, text=True)
+            protos = re.findall(r"^\w+ (\w+)\(.*\);$", sig_h.read_text(encoding="utf-8"), re.M)
+            self.assertEqual(protos, ["probe_rc_reuse", "probe_rc_alias", "probe_rc_drop"])
+            self.assertIn("signatures-only: no Stage1D gate applied", sig_h.read_text(encoding="utf-8"))
+            self.assertEqual(json.loads(sig_fix.read_text(encoding="utf-8"))["provenance"],
+                             "signatures-only: no Stage1D gate applied")
+            # ... and fails closed (nothing written) when any exported signature is non-scalar
+            nonscalar = tmp / "NonScalarExport.lean"
+            nonscalar.write_text(lean_src + "\n@[export probe_rc_mk]\ndef probe_rc_mk (seed : UInt64) : RcPacket := .empty\n",
+                                 encoding="utf-8")
+            for extra in ([], ["--emit-header", str(tmp / "ns.h")]):
+                rej = subprocess.run([engines["core_bin"], "emit-cabi-bindings", "--signatures-only", *extra, str(nonscalar)],
+                                     capture_output=True, text=True)
+                self.assertNotEqual(rej.returncode, 0, "--signatures-only must reject a non-scalar exported signature")
+                self.assertIn("non-scalar", rej.stderr)
+                self.assertEqual(rej.stdout, "")
+            self.assertFalse((tmp / "ns.h").exists())
+            # the full binary applies the Stage 1D gate itself and refuses --signatures-only
+            rej = subprocess.run([engines["full_bin"], "emit-cabi-bindings", "--signatures-only", str(src)],
+                                 capture_output=True, text=True)
+            self.assertNotEqual(rej.returncode, 0)
             res = subprocess.run(
-                [engines["full_bin"], "emit-lnir", "--wire", str(src), "-o", str(wire)],
+                [engines["full_bin"], "emit-lnir", "--wire", "--allow-rc-adt", str(src), "-o", str(wire)],
                 capture_output=True, text=True,
             )
             self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            # a module loaded from the opted-in wire is still rejected by default emit-lnir/emit-cabi-bindings
+            for cmd in (["emit-lnir", "--wire", "--lnir", str(wire)], ["emit-cabi-bindings", "--lnir", str(wire)]):
+                rej = subprocess.run([engines["core_bin"], *cmd], capture_output=True, text=True)
+                self.assertNotEqual(rej.returncode, 0, f"{cmd[0]} must reject an RC-ADT wire without --allow-rc-adt")
+                self.assertIn("RC-ADT", rej.stderr)
             wire_text = wire.read_text(encoding="utf-8")
             for op in ("C_inc", "C_dec", "E_ctor", "E_cgeto", "E_isexcl", "E_mktup", "E_projtup", "C_ite"):
                 self.assertGreater(wire_text.count(op), 0, f"missing expected opcode {op} in Stage 1D wire")
@@ -1064,7 +1183,7 @@ def probe_tri (x : UInt64) : UInt64 :=
   readThirdField (stepTriField init 7)
 ''', encoding="utf-8")
             tri_wire = tmp / "tri.lnir"
-            subprocess.run([engines["full_bin"], "emit-lnir", "--wire", str(tri_src), "-o", str(tri_wire)],
+            subprocess.run([engines["full_bin"], "emit-lnir", "--wire", "--allow-rc-adt", str(tri_src), "-o", str(tri_wire)],
                            check=True, capture_output=True, text=True)
             tri_tv = json.loads(subprocess.check_output(
                 [engines["core_bin"], "validate-tv", "--lnir", str(tri_wire), "--json"], text=True,
@@ -1087,7 +1206,7 @@ def probe_bad_direct (x : UInt64) : UInt64 := readDirect (.data x)
 ''', encoding="utf-8")
             bad_wire = tmp / "bad_scalar_adt.lnir"
             bad_res = subprocess.run(
-                [engines["full_bin"], "emit-lnir", "--wire", str(bad_scalar_adt), "-o", str(bad_wire)],
+                [engines["full_bin"], "emit-lnir", "--wire", "--allow-rc-adt", str(bad_scalar_adt), "-o", str(bad_wire)],
                 capture_output=True, text=True,
             )
             self.assertNotEqual(bad_res.returncode, 0, "direct scalar-payload heap ADT must fail closed")
@@ -1205,11 +1324,11 @@ open LeanNative.IR LeanNative.Proofs
     params := []
     retTy := .i1
     body :=
-      .letBind 0 .objPtr (.allocCtor 0 [] [])
+      .letBind 9 .i64 (.scalar (.constU64 7)) (.letBind 0 .objPtr (.allocCtor 0 [] [9])
         (.letBind 1 .objPtr (.allocCtor 0 [0] [])
           (.letBind 2 .objPtr (.ctorGetObj 1 0)
             (.letBind 3 .i1 (.isExclusive (if project then 2 else 0))
-              (.decRef 1 1 (.ret 3)))))
+              (.decRef 1 1 (.ret 3))))))
   }
   let childRes := validateTranslationDecl (childDecl true) (childDecl false) 8
   unless childRes.passed && childRes.symRetEquiv do
@@ -1272,12 +1391,12 @@ open LeanNative.IR LeanNative.Proofs
     params := []
     retTy := .i1
     body :=
-      .letBind 0 .objPtr (.allocCtor 0 [] [])
+      .letBind 9 .i64 (.scalar (.constU64 7)) (.letBind 0 .objPtr (.allocCtor 0 [] [9])
         (.incRef 0 1
           (.letBind 1 .objPtr (.allocCtor 0 [0] [])
             (.decRef 1 1
               (.letBind 2 .i1 (if foldTrue then .scalar (.constBool true) else .isExclusive 0)
-                (.decRef 0 1 (.ret 2))))))
+                (.decRef 0 1 (.ret 2)))))))
   }
   let dropRes := validateTranslationDecl (mkParentDropDecl false) (mkParentDropDecl true) 8
   unless dropRes.passed && dropRes.symRetEquiv do
@@ -1616,7 +1735,7 @@ open LeanNative.IR LeanNative.Proofs
               (.letBind 5 .i64 (.scalar (.constU64 0))
                 (.letBind 6 .i64 (.scalar (.constU64 2))
                   (.letBind 7 .unit (.call "lean_native_ctor_set" [0, 5, 6] .unit false)
-                    (.letBind 8 .i64 (.ctorGetScalar 0 0 .i64)
+                    (.letBind 8 .i64 (.ctorGetObj 0 0)
                       (.letBind 9 .i64 (.scalar (.constU64 3))
                         (.letBind 10 .i1 (.isExclusive 1)
                           (.ite 10
@@ -1626,7 +1745,7 @@ open LeanNative.IR LeanNative.Proofs
                                   (if rereadAfterWrite then
                                      .letBind 13 .i1 (.scalar (.binOp .eq (.var 2) (.constU64 999)))
                                        (.ite 13
-                                         (.letBind 14 .i64 (.ctorGetScalar 0 0 .i64) (.ret 14))
+                                         (.letBind 14 .i64 (.ctorGetObj 0 0) (.ret 14))
                                          (.ret 8))
                                    else
                                      .ret 8)
@@ -1687,7 +1806,7 @@ open LeanNative.IR LeanNative.Proofs
           (.letBind 3 .objPtr (.scalar (.select (.constBool true) (.var 2) (.var 2)))
             (.letBind 4 .i64 (.scalar (.constU64 0))
               (.letBind 5 .i64 (.scalar (.select (.binOp .eq (.var 0) (.constU64 999)) (.constU64 2) (.constU64 1)))
-                (.letBind 6 .unit (.call "lean_native_ctor_set" [2, 4, 5] .unit false)
+                (.letBind 6 .unit (.call "lean_native_ctor_set_scalar" [2, 4, 5] .unit false)
                   (if constOneTarget then
                      .decRef 2 1 (.ret 1)
                    else
@@ -1708,7 +1827,7 @@ open LeanNative.IR LeanNative.Proofs
             (.letBind 4 .objPtr (.scalar (.select (.binOp .eq (.var 0) (.constU64 999)) (.var 2) (.var 3)))
               (.letBind 5 .i64 (.scalar (.constU64 0))
                 (.letBind 6 .i64 (.scalar (.constU64 2))
-                  (.letBind 7 .unit (.call "lean_native_ctor_set" [2, 5, 6] .unit false)
+                  (.letBind 7 .unit (.call "lean_native_ctor_set_scalar" [2, 5, 6] .unit false)
                     (if constOneTarget then
                        .decRef 2 1 (.decRef 3 1 (.ret 1))
                      else
@@ -1730,7 +1849,7 @@ open LeanNative.IR LeanNative.Proofs
             (.letBind 4 .objPtr (.projTuple 3 0)
               (.letBind 5 .i64 (.scalar (.constU64 0))
                 (.letBind 6 .i64 (.scalar (.select (.binOp .eq (.var 0) (.constU64 999)) (.constU64 2) (.constU64 1)))
-                  (.letBind 7 .unit (.call "lean_native_ctor_set" [2, 5, 6] .unit false)
+                  (.letBind 7 .unit (.call "lean_native_ctor_set_scalar" [2, 5, 6] .unit false)
                     (if constOneTarget then
                        .decRef 2 1 (.ret 1)
                      else
@@ -1754,7 +1873,7 @@ open LeanNative.IR LeanNative.Proofs
                 (.letBind 6 (.tuple [.objPtr]) (.mkTuple [3])
                   (.letBind 7 .i64 (.scalar (.constU64 0))
                     (.letBind 8 .i64 (.scalar (.constU64 2))
-                      (.letBind 9 .unit (.call "lean_native_ctor_set" [2, 7, 8] .unit false)
+                      (.letBind 9 .unit (.call "lean_native_ctor_set_scalar" [2, 7, 8] .unit false)
                         (.ite 4
                           (.letBind 10 .objPtr (.projTuple 5 0)
                             (if constOneTarget then
@@ -1868,7 +1987,7 @@ open LeanNative.IR LeanNative.Proofs
                       (.letBind 7 .i64 (.ctorGetScalar 0 0 .i64)
                         (.letBind 8 .i64 (.scalar (.constU64 0))
                           (.letBind 9 .i64 (.scalar (.binOp .add (.var 7) (.constU64 1)))
-                            (.letBind 10 .unit (.call "lean_native_ctor_set" [0, 8, 9] .unit false)
+                            (.letBind 10 .unit (.call "lean_native_ctor_set_scalar" [0, 8, 9] .unit false)
                               (.letBind 11 .objPtr (.ctorGetObj 5 0)
                                 (.letBind 12 .i64 (.ctorGetScalar 11 0 .i64)
                                   (.incRef 0 1
@@ -2201,12 +2320,14 @@ open LeanNative.IR LeanNative.Proofs
   unless !unkFreeBad.ubRefines && !unkFreeBad.passed do
     throw <| IO.userError s!"unknown-RC decRef on objPtr masked post-free alias read: {reprStr unkFreeBad}"
   -- 37. Zero-count `incRef a 0` / `decRef a 0` on a freed heap object must check liveness (never skipping `rc == 0` UB)!
+  --     The object needs a field: a fieldless `allocCtor 0 [] []` is the immediate `.tuple [0]` (Eval.lean C1.1), on
+  --     which `incRef`/`decRef` are no-ops in the concrete semantics, so it is never freed.
   let mkFreedZeroCountRcDecl (incZeroAt999 : Bool) : LNIRDecl := {
     name := "freed_zero_count_rc"
     params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
     retTy := .i64
     body :=
-      .letBind 1 .objPtr (.allocCtor 0 [] [])
+      .letBind 1 .objPtr (.allocCtor 0 [] [0])
         (.decRef 1 1
           (if incZeroAt999 then
              .letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
@@ -2224,7 +2345,8 @@ open LeanNative.IR LeanNative.Proofs
     params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
     retTy := .objPtr
     body :=
-      .letBind 1 .objPtr (.allocCtor 0 [] [])
+      -- heap ctor (one scalar field): RC ops on the immediate fieldless `allocCtor 0 [] []` are no-ops
+      .letBind 1 .objPtr (.allocCtor 0 [] [0])
         (.letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
           (.ite 2 (.incRef 1 count (.ret 1)) (.ret 1)))
   }
@@ -2373,8 +2495,10 @@ open LeanNative.IR LeanNative.Proofs
     params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
     retTy := .i1
     body :=
-      .letBind 1 .objPtr (.allocCtor 0 [] [])
-        (.letBind 2 .objPtr (.allocCtor 0 [] [1])
+      -- the child must be a genuinely heap-allocated (non-nullary) ctor: a fieldless `allocCtor 0 [] []` is the
+      -- immediate `.tuple [0]` (always exclusive), which would make this aliasing check vacuous
+      .letBind 1 .objPtr (.allocCtor 0 [] [0])
+        (.letBind 2 .objPtr (.allocCtor 0 [1] [])
           (.letBind 3 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
             (.ite 3
               (.incRef 1 1
@@ -2530,17 +2654,17 @@ open LeanNative.IR LeanNative.Proofs
         (.ite 1
           (.letBind 2 .i64 (.scalar (.constU64 0))
             (.letBind 3 .i64 (.scalar (.constU64 4))
-              (.letBind 4 .objPtr (.allocCtor 0 [] [])
+              (.letBind 4 .objPtr (.allocCtor 0 [] [2])
                 (if allocInsideLoop then
                    .seqFor 5 2 3 6 4 .objPtr
-                     (.letBind 7 .objPtr (.allocCtor 0 [] []) (.ret 7))
+                     (.letBind 7 .objPtr (.allocCtor 0 [] [2]) (.ret 7))
                      (.ret 6)
                  else
-                   .letBind 7 .objPtr (.allocCtor 0 [] [])
+                   .letBind 7 .objPtr (.allocCtor 0 [] [2])
                      (.seqFor 5 2 3 6 4 .objPtr
                        (.ret 7)
                        (.ret 6))))))
-          (.letBind 8 .objPtr (.allocCtor 0 [] []) (.ret 8)))
+          (.letBind 8 .objPtr (.allocCtor 0 [] [0]) (.ret 8)))
   }
   let loopRepeatAllocBad := validateTranslationDecl (mkLoopRepeatAllocDecl true) (mkLoopRepeatAllocDecl false) 8
   unless !loopRepeatAllocBad.memWritesEquiv && !loopRepeatAllocBad.passed do
@@ -2554,14 +2678,14 @@ open LeanNative.IR LeanNative.Proofs
         (.ite 1
           (.letBind 2 .i64 (.scalar (.constU64 0))
             (.letBind 3 .i64 (.scalar (.constU64 4))
-              (.letBind 4 .objPtr (.allocCtor 0 [] [])
+              (.letBind 4 .objPtr (.allocCtor 0 [] [2])
                 (.seqFor 5 2 3 6 4 .objPtr
                   (if dropPrev then
-                     .decRef 6 1 (.letBind 7 .objPtr (.allocCtor 0 [] []) (.ret 7))
+                     .decRef 6 1 (.letBind 7 .objPtr (.allocCtor 0 [] [2]) (.ret 7))
                    else
-                     .letBind 7 .objPtr (.allocCtor 0 [] []) (.ret 7))
+                     .letBind 7 .objPtr (.allocCtor 0 [] [2]) (.ret 7))
                   (.ret 6)))))
-          (.letBind 8 .objPtr (.allocCtor 0 [] []) (.ret 8)))
+          (.letBind 8 .objPtr (.allocCtor 0 [] [0]) (.ret 8)))
   }
   let loopDropBad := validateTranslationDecl (mkLoopLinearChainDecl true) (mkLoopLinearChainDecl false) 8
   unless !loopDropBad.memWritesEquiv && !loopDropBad.passed do
@@ -2641,7 +2765,7 @@ open LeanNative.IR LeanNative.Proofs
     body :=
       .letBind 1 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
         (.ite 1
-          (.letBind 2 .objPtr (.allocCtor 0 [] [])
+          (.letBind 2 .objPtr (.allocCtor 0 [] [0])
             (.incRef 2 1
               (.letBind 3 .objPtr (.call "lean_native_ensure_exclusive" [2] .objPtr false)
                 (.letBind 4 .i1 (if constTrueAt999 then .scalar (.constBool true) else .isExclusive 2)

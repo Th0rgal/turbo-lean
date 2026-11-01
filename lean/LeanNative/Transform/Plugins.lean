@@ -592,14 +592,17 @@ def handleTurboPluginLine (line : String) : String :=
   if stmtSrc.startsWith "LNIR_WIRE_V1|" then
     match LNIRModule.fromWire? stmtSrc with
     | some m =>
-      let fcRep := runFastCheckModule m 512 true
-      match fcRep.declResults.find? (fun r => r.counterexampleFound) with
-      | some cex =>
-        s!"\{\"kind\":\"counterexample_found\"," ++
-        s!"\"witness_summary\":\"{escapeJsonPlugin cex.witnessSummary}\"," ++
-        "\"suggested_hypothesis\":\"h_precond : valid_inputs\"," ++
-        "\"accelerator_name\":\"lean-native-core:fastcheck-v0.5\"}"
-      | none => "{}"
+      if m.findRcAdtDecl?.isSome then
+        "{}"
+      else
+        let fcRep := runFastCheckModule m 512 true
+        match fcRep.declResults.find? (fun r => r.counterexampleFound) with
+        | some cex =>
+          s!"\{\"kind\":\"counterexample_found\"," ++
+          s!"\"witness_summary\":\"{escapeJsonPlugin cex.witnessSummary}\"," ++
+          "\"suggested_hypothesis\":\"h_precond : valid_inputs\"," ++
+          "\"accelerator_name\":\"lean-native-core:fastcheck-v0.5\"}"
+        | none => "{}"
     | none => "{}"
   else if declName.contains "constrained_buggy" || stmtSrc.contains "x0 < 1000000" then
     let fcRep := runFastCheckModule mkFastCheckSampleModule 512 true
