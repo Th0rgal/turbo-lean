@@ -7811,6 +7811,9 @@ end Fixture
 
     #[test]
     fn test_trusted_pr_verify_interface_change_replays_dependent_consumer_imports() -> Result<()> {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "turbo_pr_verify_trusted_closure_replay_{}",
             std::process::id()

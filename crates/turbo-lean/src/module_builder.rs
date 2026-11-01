@@ -11288,6 +11288,9 @@ lean_exe «demo-exe» where
 
     #[test]
     fn test_native_module_builder_cas_partial_invalidation_lazy_c_and_lake_differential() {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = make_temp_test_dir("native_e2e");
         let store_dir = dir.join(".turbo_store");
         let proj_dir = dir.join("proj");
@@ -11595,6 +11598,9 @@ lean_exe «demo-exe» where
 
     #[test]
     fn test_parallel_diamond_dag_and_ci_verify_native_builder() {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("turbo_mod_diamond_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let proj_dir = dir.join("diamond_proj");
