@@ -89,8 +89,8 @@ def withElaboratedFrontend {α : Type} (filePath : String) (modName : Lean.Name)
 /-- Elaborate a `.lean` source file and inline local calls while preserving every
     lowered declaration. An ABI symbol's spelling does not establish internal ownership. -/
 def ingestLeanSourceFile (filePath : String) (moduleName : String := "LeanNative.FileInput")
-    (arch : TargetArch := .x86_64) : IO LNIRModule :=
-  normalizeAndInlineLocalDefs <$> withElaboratedFrontend filePath `LeanNativeInput (ingestAllLocalDecls moduleName arch)
+    (arch : TargetArch := .x86_64) (allowRcAdt : Bool := false) : IO LNIRModule :=
+  normalizeAndInlineLocalDefs <$> withElaboratedFrontend filePath `LeanNativeInput (ingestAllLocalDecls moduleName arch allowRcAdt)
 
 /-- Elaborate `filePath` with `Lean.Elab.runFrontend`, extracting both the Lean 4.31 C module code
     (`Lean.Compiler.LCNF.emitC modName`) and the lowered `LNIRModule` via `ingestAllLocalDecls`. -/
@@ -100,6 +100,14 @@ def emitLeanCFromSourceFile (filePath : String) (modName : Lean.Name := `Main)
     let mod ← ingestAllLocalDecls modName.toString arch
     return (← Lean.Compiler.LCNF.emitC modName, mod)
 
+/-- P-cert C4/C5 `build-exe` gate (fail closed, checked before any file is written): the Bridge already refuses
+    RC-ADT decls without `allowRcAdt`, but the LLVM backend accepts no heap code, so `build-exe` re-checks
+    `findRcAdtDecl?` on the lowered module and `findUnsupportedLLVMCall?` on the optimized one explicitly. -/
+def buildExeLLVMGate? (rawMod optMod : LNIRModule) : Option String :=
+  (rawMod.findRcAdtDecl?.map fun d => s!"[lean-native] build-exe: RC-ADT declaration '{d}' is unsupported by the LLVM backend") <|>
+  ((LeanNative.Backend.LLVM.findUnsupportedLLVMCall? optMod).map fun (d, c) =>
+    s!"[lean-native] build-exe: unsupported external or non-scalar call '{c}' in '{d}'")
+
 /-- Full LCNF-to-Executable builder (`buildNativeExecutable` / `buildExecutableFromLeanFile`). -/
 def buildNativeExecutable (filePath : String) (outBin : String) (optLevel : String := "-O3")
     (cliArgs : List String := []) : IO (LNIRModule × String) := do
@@ -108,6 +116,7 @@ def buildNativeExecutable (filePath : String) (outBin : String) (optLevel : Stri
     if System.Platform.target.startsWith "aarch64" || System.Platform.target.startsWith "arm64" then .arm64 else .x86_64
   let (cCode, rawMod) ← emitLeanCFromSourceFile filePath `Main hostArch
   let (optMod, _) := LeanNative.Transform.runDefaultPipeline rawMod
+  if let some err := buildExeLLVMGate? rawMod optMod then throw <| IO.userError err
   let superoptTgt : LeanNative.Transform.SuperoptTarget :=
     match hostArch with
     | .arm64 => .arm64

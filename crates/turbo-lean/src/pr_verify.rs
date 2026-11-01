@@ -4,11 +4,11 @@
 use crate::db::{SingleflightOutcome, TurboStore};
 use crate::lake_build::{
     are_all_project_oleans_up_to_date, compute_shard_key_with_args, detect_toolchain,
-    lean_bin_from_env, load_and_split_files_cached, load_and_split_files_with_hashes_cached,
-    load_project_stat_summary_cached, resolve_lake_env, resolve_or_share_lake_env,
-    resolve_prebuilt_module_import, resolve_remote_lean_path, seed_project_theorem_shards,
-    seed_project_theorem_shards_from_splits, stage_lake_build_outputs, FileSplitsWithCacheHits,
-    SourceFileSplit,
+    load_and_split_files_cached, load_and_split_files_with_hashes_cached,
+    load_project_stat_summary_cached, resolve_lake_env, resolve_lean_bin,
+    resolve_or_share_lake_env, resolve_prebuilt_module_import, resolve_remote_lean_path,
+    seed_project_theorem_shards, seed_project_theorem_shards_from_splits, stage_lake_build_outputs,
+    FileSplitsWithCacheHits, SourceFileSplit,
 };
 use crate::pack;
 use crate::splitter::{self, split_lean_source, split_lean_source_fast_no_cone};
@@ -43,7 +43,7 @@ pub(crate) fn resolve_git_toplevel(dir: &Path) -> Result<PathBuf> {
             return Ok(anc.to_path_buf());
         }
     }
-    let out = Command::new("git")
+    let out = crate::trusted_tools::git(dir)?
         .args(["-C", &dir.to_string_lossy(), "rev-parse", "--show-toplevel"])
         .output()
         .context("Failed to execute `git rev-parse --show-toplevel`")?;
@@ -143,84 +143,91 @@ pub(crate) fn resolve_git_head_sha(repo_root: &Path, base_ref: &str) -> Option<S
     }
 }
 
+/// Contents at `base_ref` of each path in `repo_rels` present in that revision's tree.
+/// Paths are resolved to object ids from the tree first, so an absent path (new file) is
+/// distinguishable from a missing object (e.g. a promised blob in a partial clone, which
+/// the trusted Git wrapper never lazily fetches): the latter is a hard error.
 pub(crate) fn fetch_git_blobs_batch(
     repo_root: &Path,
     base_ref: &str,
     repo_rels: &[String],
 ) -> Result<std::collections::HashMap<String, String>> {
+    use std::io::{BufRead, BufReader, Read, Write};
     let mut out_map = std::collections::HashMap::with_capacity(repo_rels.len());
     if repo_rels.is_empty() {
         return Ok(out_map);
     }
-    if repo_rels.len() == 1 {
-        let repo_rel = &repo_rels[0];
-        let show_out = Command::new("git")
-            .args([
-                "-C",
-                &repo_root.to_string_lossy(),
-                "show",
-                &format!("{}:{}", base_ref, repo_rel),
-            ])
-            .output()
-            .context("Failed to execute `git show`")?;
-        if show_out.status.success() {
-            out_map.insert(
-                repo_rel.clone(),
-                String::from_utf8_lossy(&show_out.stdout).to_string(),
-            );
+    anyhow::ensure!(!base_ref.starts_with('-'), "Invalid git revision `{base_ref}`");
+    let wanted: std::collections::HashSet<&str> = repo_rels.iter().map(String::as_str).collect();
+    let tree = crate::trusted_tools::git(repo_root)?
+        .arg("-C")
+        .arg(repo_root)
+        .args(["ls-tree", "-r", "-z", "--full-tree", base_ref, "--"])
+        .output()
+        .context("Failed to execute `git ls-tree`")?;
+    anyhow::ensure!(
+        tree.status.success(),
+        "Cannot read Git tree at `{base_ref}`: {}",
+        String::from_utf8_lossy(&tree.stderr).trim()
+    );
+    let mut blobs = Vec::new();
+    for entry in tree.stdout.split(|&b| b == 0).filter(|e| !e.is_empty()) {
+        let Some(tab) = entry.iter().position(|&b| b == b'\t') else {
+            anyhow::bail!("Invalid Git tree entry at `{base_ref}`");
+        };
+        let path = String::from_utf8_lossy(&entry[tab + 1..]);
+        if !wanted.contains(path.as_ref()) {
+            continue;
         }
+        let header = std::str::from_utf8(&entry[..tab])?;
+        let fields: Vec<_> = header.split(' ').collect();
+        anyhow::ensure!(fields.len() == 3, "Invalid Git tree header: {header}");
+        if fields[1] == "blob" {
+            blobs.push((path.into_owned(), fields[2].to_owned()));
+        }
+    }
+    if blobs.is_empty() {
         return Ok(out_map);
     }
-
-    let mut child = Command::new("git")
-        .args(["-C", &repo_root.to_string_lossy(), "cat-file", "--batch"])
+    let mut git = crate::trusted_tools::git(repo_root)?;
+    let mut child = git
+        .arg("-C")
+        .arg(repo_root)
+        .args(["cat-file", "--batch"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
         .context("Failed to spawn `git cat-file --batch`")?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        let mut req_buf = String::new();
-        for r in repo_rels {
-            req_buf.push_str(base_ref);
-            req_buf.push(':');
-            req_buf.push_str(r);
-            req_buf.push('\n');
+    let mut input = child.stdin.take().context("Missing Git batch stdin")?;
+    let request: String = blobs.iter().map(|(_, oid)| format!("{oid}\n")).collect();
+    let writer = std::thread::spawn(move || input.write_all(request.as_bytes()));
+    let result = (|| -> Result<()> {
+        let mut output = BufReader::new(child.stdout.take().context("Missing Git batch stdout")?);
+        for (path, oid) in &blobs {
+            let mut header = String::new();
+            output.read_line(&mut header)?;
+            let fields: Vec<_> = header.trim_end().split(' ').collect();
+            anyhow::ensure!(
+                fields.len() == 3 && fields[0] == oid && fields[1] == "blob",
+                "Git object {oid} for `{path}` at `{base_ref}` is missing or invalid \
+                 (lazy fetching is disabled): fail-closed"
+            );
+            let size: usize = fields[2].parse()?;
+            let mut bytes = vec![0; size + 1];
+            output.read_exact(&mut bytes)?;
+            anyhow::ensure!(bytes.pop() == Some(b'\n'), "Invalid Git batch terminator");
+            out_map.insert(path.clone(), String::from_utf8_lossy(&bytes).into_owned());
         }
-        let _ = stdin.write_all(req_buf.as_bytes());
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = child.kill();
     }
-
-    let out = child
-        .wait_with_output()
-        .context("Failed waiting on `git cat-file --batch`")?;
-    if out.status.success() {
-        let bytes = &out.stdout;
-        let mut pos = 0usize;
-        for repo_rel in repo_rels {
-            let Some(nl_rel) = bytes[pos..].iter().position(|&b| b == b'\n') else {
-                break;
-            };
-            let header = String::from_utf8_lossy(&bytes[pos..pos + nl_rel]);
-            pos += nl_rel + 1;
-            let parts: Vec<&str> = header.split_whitespace().collect();
-            if parts.len() >= 3 && parts[1] == "blob" {
-                if let Ok(sz) = parts[2].parse::<usize>() {
-                    if pos + sz <= bytes.len() {
-                        let content = String::from_utf8_lossy(&bytes[pos..pos + sz]).to_string();
-                        out_map.insert(repo_rel.clone(), content);
-                        pos += sz;
-                        if pos < bytes.len() && bytes[pos] == b'\n' {
-                            pos += 1;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-            }
-        }
-    }
+    let status = child.wait()?;
+    let _ = writer.join();
+    result?;
+    anyhow::ensure!(status.success(), "Git batch object read failed");
     Ok(out_map)
 }
 
@@ -1278,7 +1285,7 @@ fn base_revision_package_config(
     let sha = match resolve_git_head_sha(repo_root, base_ref) {
         Some(sha) => sha,
         None => {
-            let out = Command::new("git")
+            let out = crate::trusted_tools::git(repo_root)?
                 .arg("-C")
                 .arg(repo_root)
                 .args(["rev-parse", "--verify", "--end-of-options"])
@@ -1347,6 +1354,14 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
         crate::module_builder::optional_package_config(canon_dir)?
     };
     let base_pkg_cfg = base_revision_package_config(store, &repo_root, canon_dir, base_ref)?;
+    // Change discovery never enters submodules (their config and filters are unvetted), so a
+    // gitlink's contents would silently read as unchanged: fail closed, like snapshots do.
+    let revs: &[&str] = if base_ref == "HEAD" {
+        &["HEAD"]
+    } else {
+        &[base_ref, "HEAD"]
+    };
+    crate::trusted_tools::reject_gitlinks(&repo_root, revs, canon_dir)?;
     let resolve_base_lean_args = |rel: &str| -> Vec<String> {
         base_pkg_cfg
             .as_ref()
@@ -1686,7 +1701,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
             let repo_ref = &repo_root;
             let all_rels_ref = &all_lean_repo_rels;
             let status_h = s.spawn(move || {
-                Command::new("git")
+                crate::trusted_tools::git(repo_ref)?
                     .args([
                         "--no-optional-locks",
                         "-C",
@@ -1694,6 +1709,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                         "status",
                         "--porcelain",
                         "-uall",
+                        crate::trusted_tools::NO_SUBMODULES,
                         "--",
                         &canon_dir.to_string_lossy(),
                     ])
@@ -1755,12 +1771,15 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
         let (diff_res, untracked_res, preloaded) = std::thread::scope(|s| {
             let repo_ref = &repo_root;
             let diff_h = s.spawn(move || {
-                Command::new("git")
+                crate::trusted_tools::git(repo_ref)?
                     .args([
                         "--no-optional-locks",
                         "-C",
                         &repo_ref.to_string_lossy(),
                         "diff",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                        crate::trusted_tools::NO_SUBMODULES,
                         "--name-only",
                         base_ref,
                         "--",
@@ -1770,7 +1789,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                     .context("Failed to execute `git diff --name-only`")
             });
             let untracked_h = s.spawn(move || {
-                Command::new("git")
+                crate::trusted_tools::git(repo_ref)?
                     .args([
                         "--no-optional-locks",
                         "-C",
@@ -2393,7 +2412,7 @@ fn run_lean_temp_file(
                 "Untrusted PR shard verification requires a resolved static ProjectConfig: fail-closed sandbox gate"
             )
         })?;
-        let bwrap_path = crate::module_builder::probe_bwrap_sandbox().ok_or_else(|| {
+        let bwrap_path = crate::module_builder::probe_bwrap_sandbox(canon_dir).ok_or_else(|| {
             anyhow::anyhow!(
                 "Untrusted PR shard verification requires a working bubblewrap (`bwrap`) sandbox: fail-closed sandbox gate"
             )
@@ -2617,7 +2636,7 @@ pub fn run_ci_verify_command(
         "trusted".to_string()
     };
 
-    if is_untrusted && crate::module_builder::probe_bwrap_sandbox().is_none() {
+    if is_untrusted && crate::module_builder::probe_bwrap_sandbox(&canon_dir).is_none() {
         anyhow::bail!(
             "Untrusted CI verification requires a working bubblewrap (`bwrap`) sandbox: fail-closed sandbox gate"
         );
@@ -3105,7 +3124,12 @@ struct StatementPolicy {
 
 impl StatementPolicy {
     fn at(project: &Path, base: &str) -> Self {
-        let config = splitter::read_project_config(project, Some(base)).unwrap_or_default();
+        // An unreadable base config falls back to the restrictive default; the CLI has already
+        // rejected it while loading the same policy at startup.
+        let config = splitter::read_project_config(project, Some(base))
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         Self {
             axioms: splitter::allowed_axioms_with_extra(
                 &crate::accelerators::toml_string_array(&config, "axioms", "allow")
@@ -3245,46 +3269,288 @@ fn parse_kernel_statement_dump(raw: &[u8], module: &str) -> Result<BTreeMap<Stri
     Ok(result)
 }
 
-struct StatementWorktree {
-    repo: PathBuf,
+// A source snapshot has no Git worktree registration and never runs checkout
+// conversion (attributes, smudge/process filters, or EOL rewriting).
+struct StatementSnapshot {
     path: PathBuf,
 }
 
-impl StatementWorktree {
+impl StatementSnapshot {
     fn at(repo: &Path, rev: &str) -> Result<Self> {
-        let path = std::env::temp_dir().join(format!(
-            "turbo-statements-{}-{}",
-            std::process::id(),
-            pack::next_tmp_id()
-        ));
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(["worktree", "add", "--detach", "--force"])
-            .arg(&path)
-            .arg(rev)
-            .output()?;
-        anyhow::ensure!(
-            out.status.success(),
-            "Cannot create statement baseline worktree: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        Ok(Self {
-            repo: repo.to_path_buf(),
-            path,
-        })
+        use std::os::unix::fs::DirBuilderExt;
+        let snapshot = loop {
+            let path = Path::new("/tmp").join(format!(
+                "turbo-statements-{}-{}",
+                std::process::id(),
+                pack::next_tmp_id()
+            ));
+            match fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => break Self { path },
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        };
+        materialize_statement_tree(repo, rev, &snapshot.path, None)?;
+        Ok(snapshot)
     }
 }
 
-impl Drop for StatementWorktree {
+impl Drop for StatementSnapshot {
     fn drop(&mut self) {
-        let _ = Command::new("git")
-            .arg("-C")
-            .arg(&self.repo)
-            .args(["worktree", "remove", "--force"])
-            .arg(&self.path)
-            .output();
+        let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+fn dependency_symlink_touches_build(
+    rel: &Path,
+    dep: &crate::module_builder::PackageConfig,
+) -> bool {
+    let norm = |p: &Path| -> PathBuf {
+        p.components()
+            .filter(|c| !matches!(c, std::path::Component::CurDir))
+            .collect()
+    };
+    let rel = norm(rel);
+    if dep.unsupported.is_some()
+        || !dep.extern_libs.is_empty()
+        || !dep.custom_targets.is_empty()
+        || rel.extension().is_some_and(|e| e == "lean")
+    {
+        return true;
+    }
+    if let Some(name) = rel.file_name().and_then(|n| n.to_str()) {
+        if matches!(
+            name,
+            "lakefile.lean" | "lakefile.toml" | "lake-manifest.json" | "lean-toolchain"
+        ) || (rel.parent().is_some_and(|p| p.as_os_str().is_empty())
+            && matches!(rel.file_stem().and_then(|s| s.to_str()), Some("lakefile")))
+        {
+            return true;
+        }
+    }
+    let overlaps = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
+    let base = norm(&dep.src_dir);
+    for path in [&dep.build_dir, &dep.packages_dir] {
+        if overlaps(&rel, &norm(path)) {
+            return true;
+        }
+    }
+    if dep.libs.is_empty() && dep.exes.is_empty() {
+        return overlaps(&rel, &base);
+    }
+    let module_prefix = |root: &Path, module: &str| {
+        let first = module.split('.').next().unwrap_or(module);
+        norm(&root.join(first))
+    };
+    for lib in &dep.libs {
+        let root = match &lib.src_dir {
+            Some(dir) => norm(&base.join(dir)),
+            None => base.clone(),
+        };
+        if lib.globs.is_empty() && lib.roots.is_empty() && overlaps(&rel, &root) {
+            return true;
+        }
+        let names = lib
+            .roots
+            .iter()
+            .map(String::as_str)
+            .chain(lib.globs.iter().map(|g| {
+                use crate::module_builder::GlobSpec;
+                match g {
+                    GlobSpec::One(n) | GlobSpec::Submodules(n) | GlobSpec::AndSubmodules(n) => {
+                        n.as_str()
+                    }
+                }
+            }));
+        for name in names {
+            let prefix = module_prefix(&root, name);
+            if overlaps(&rel, &prefix) || overlaps(&rel, &prefix.with_extension("lean")) {
+                return true;
+            }
+        }
+    }
+    for exe in &dep.exes {
+        let root = match &exe.src_dir {
+            Some(dir) => norm(&base.join(dir)),
+            None => base.clone(),
+        };
+        let prefix = module_prefix(&root, &exe.root);
+        if overlaps(&rel, &prefix) || overlaps(&rel, &prefix.with_extension("lean")) {
+            return true;
+        }
+    }
+    false
+}
+
+fn materialize_statement_tree(
+    repo: &Path,
+    rev: &str,
+    root: &Path,
+    dep: Option<&crate::module_builder::PackageConfig>,
+) -> Result<()> {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::{
+        ffi::OsStrExt,
+        fs::{symlink, PermissionsExt},
+    };
+    use std::process::Stdio;
+
+    anyhow::ensure!(!rev.starts_with('-'), "Invalid statement snapshot revision");
+    let tree = crate::trusted_tools::git(repo)?
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-tree", "-r", "-z", "--full-tree", rev, "--"])
+        .output()?;
+    anyhow::ensure!(
+        tree.status.success(),
+        "Cannot enumerate statement snapshot: {}",
+        String::from_utf8_lossy(&tree.stderr)
+    );
+    let mut entries = Vec::new();
+    for entry in tree.stdout.split(|&b| b == 0).filter(|e| !e.is_empty()) {
+        let (header, path) = entry.split_at(
+            entry
+                .iter()
+                .position(|&b| b == b'\t')
+                .context("Invalid Git tree entry")?,
+        );
+        let fields: Vec<_> = std::str::from_utf8(header)?.split(' ').collect();
+        anyhow::ensure!(fields.len() == 3, "Invalid Git tree header");
+        let rel = Path::new(std::ffi::OsStr::from_bytes(&path[1..]));
+        anyhow::ensure!(!rel.as_os_str().is_empty() && rel.components().all(|c|
+            matches!(c, std::path::Component::Normal(p) if !p.eq_ignore_ascii_case(".git"))),
+            "Invalid statement snapshot path: {}", rel.display());
+        anyhow::ensure!(
+            fields[0] != "160000",
+            "Statement snapshots do not support submodule gitlinks: {}",
+            rel.display()
+        );
+        anyhow::ensure!(
+            fields[1] == "blob"
+                && matches!(fields[0], "100644" | "100755" | "120000")
+                && matches!(fields[2].len(), 40 | 64)
+                && fields[2].bytes().all(|b| b.is_ascii_hexdigit()),
+            "Unsupported Git tree entry: {}",
+            rel.display()
+        );
+        entries.push((
+            fields[0].to_owned(),
+            fields[2].to_owned(),
+            rel.to_path_buf(),
+            root.join(rel),
+        ));
+    }
+    let mut git = crate::trusted_tools::git(repo)?;
+    let mut child = git
+        .arg("-C")
+        .arg(repo)
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let result = (|| -> Result<()> {
+        let mut input = child.stdin.take().context("Missing Git batch stdin")?;
+        let mut output = BufReader::new(child.stdout.take().context("Missing Git batch stdout")?);
+        let mut links = Vec::new();
+        for (mode, oid, rel, target) in entries {
+            ensure_statement_snapshot_path(root, &target)?;
+            fs::create_dir_all(target.parent().context("Missing snapshot parent")?)?;
+            writeln!(input, "{oid}")?;
+            input.flush()?;
+            let mut header = String::new();
+            output.read_line(&mut header)?;
+            let fields: Vec<_> = header.trim_end().split(' ').collect();
+            anyhow::ensure!(
+                fields.len() == 3 && fields[0] == oid && fields[1] == "blob",
+                "Invalid Git batch blob header: {header}"
+            );
+            let size: u64 = fields[2].parse()?;
+            let mut blob = output.by_ref().take(size);
+            if mode == "120000" {
+                let mut bytes = Vec::new();
+                blob.read_to_end(&mut bytes)?;
+                anyhow::ensure!(bytes.len() as u64 == size, "Truncated Git symlink blob");
+                let link = PathBuf::from(std::ffi::OsStr::from_bytes(&bytes));
+                if link.is_absolute() {
+                    if dep.is_none_or(|d| dependency_symlink_touches_build(&rel, d)) {
+                        anyhow::bail!(
+                            "Absolute symlink in statement snapshot: {}",
+                            target.display()
+                        );
+                    }
+                } else {
+                    links.push((rel, target, link));
+                }
+            } else {
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&target)?;
+                anyhow::ensure!(
+                    std::io::copy(&mut blob, &mut file)? == size,
+                    "Truncated Git blob"
+                );
+                file.set_permissions(fs::Permissions::from_mode(if mode == "100755" {
+                    0o755
+                } else {
+                    0o644
+                }))?;
+            }
+            let mut newline = [0];
+            output.read_exact(&mut newline)?;
+            anyhow::ensure!(newline == [b'\n'], "Invalid Git batch blob terminator");
+        }
+        // Create links only after every regular file has been written, so even
+        // malformed trees cannot redirect writes. Validate actual resolution,
+        // including link chains and `..` traversing another symlink.
+        for (_, target, link) in &links {
+            ensure_statement_snapshot_path(root, target)?;
+            symlink(link, target)?;
+        }
+        let canonical_root = root.canonicalize()?;
+        loop {
+            let mut removed = false;
+            for (rel, target, _) in &links {
+                if !target.is_symlink() {
+                    continue;
+                }
+                match target.canonicalize() {
+                    Ok(resolved) if resolved.starts_with(&canonical_root) => {}
+                    res => {
+                        let _ = fs::remove_file(target);
+                        removed = true;
+                        if dep.is_none_or(|d| dependency_symlink_touches_build(rel, d)) {
+                            match res {
+                                Ok(_) => anyhow::bail!(
+                                    "Symlink escapes statement snapshot: {}",
+                                    target.display()
+                                ),
+                                Err(e) => {
+                                    return Err(e).with_context(|| {
+                                        format!(
+                                            "Unresolvable statement snapshot symlink: {}",
+                                            target.display()
+                                        )
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !removed {
+                break;
+            }
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    result?;
+    anyhow::ensure!(status.success(), "Git batch object read failed");
+    Ok(())
 }
 
 // Stock toolchain commands run inside bwrap for untrusted inputs. The Lake configuration
@@ -3307,16 +3573,25 @@ fn statement_toolchain_command(
     tool: &str,
     lean_path: Option<&str>,
 ) -> Result<Command> {
-    let (lean, _, _, lib) = crate::module_builder::resolve_toolchain_compiler_with_trust(
-        project,
-        &detect_toolchain(project),
-        true, // Resolve installed toolchains only, even for trusted statement builds.
-    )?;
-    let executable = lean.with_file_name(tool);
+    let tools =
+        crate::module_builder::ToolchainExecutables::resolve(project, &detect_toolchain(project))?;
+    let executable = match tool {
+        "lean" => &tools.lean,
+        "lake" => &tools.lake,
+        "leanc" => &tools.leanc,
+        _ => anyhow::bail!("Unknown verifier tool `{tool}`"),
+    };
+    let lib = tools
+        .lean
+        .parent()
+        .and_then(Path::parent)
+        .context("Missing stock toolchain prefix")?
+        .join("lib");
     if !is_untrusted {
         let mut command = Command::new(&executable);
         command
             .current_dir(project)
+            .env("PATH", tools.path())
             .env_remove("LEAN_PATH")
             .env_remove("LEAN_SRC_PATH")
             .env(
@@ -3328,7 +3603,7 @@ fn statement_toolchain_command(
         }
         return Ok(command);
     }
-    let bwrap = crate::module_builder::probe_bwrap_sandbox()
+    let bwrap = crate::module_builder::probe_bwrap_sandbox(project)
         .context("Kernel statement builds require a working bubblewrap sandbox")?;
     let prefix = lib.parent().context("Missing stock toolchain prefix")?;
     let mut command = Command::new(bwrap);
@@ -3350,10 +3625,7 @@ fn statement_toolchain_command(
             "--setenv",
             "PATH",
         ])
-        .arg(format!(
-            "{}:/usr/bin:/bin",
-            lean.parent().context("Missing toolchain bin")?.display()
-        ))
+        .arg(tools.path())
         .args(["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]);
     for path in [
         "/usr",
@@ -3402,7 +3674,7 @@ fn ensure_statement_snapshot_path(root: &Path, target: &Path) -> Result<()> {
 // Overlay only Git's tracked/unignored source files on a clean HEAD snapshot.
 // Never bring across .olean files, traces, or native build products from head.
 fn overlay_statement_sources(repo: &Path, snapshot: &Path) -> Result<()> {
-    let out = Command::new("git")
+    let out = crate::trusted_tools::git(repo)?
         .arg("-C")
         .arg(repo)
         .args([
@@ -3467,8 +3739,8 @@ fn clear_untrusted_statement_build_products(project: &Path) -> Result<()> {
     Ok(())
 }
 
-// Seed an offline sandbox with independent Git clones of already resolved
-// dependencies, never with shared/hard-linked worktree build outputs.
+// Seed offline dependencies without checkout conversion or shared build outputs.
+// Keep independent Git metadata for Lake revision checks; write sources as raw blobs.
 fn seed_statement_dependencies(
     project: &Path,
     cfg: &crate::module_builder::ProjectConfig,
@@ -3485,10 +3757,22 @@ fn seed_statement_dependencies(
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
-        let out = Command::new("git")
-            .args(["clone", "--quiet", "--no-hardlinks"])
-            .arg(&dep.pkg_root)
+        // Local object copy only: a canonical absolute directory (never a URL or remote
+        // helper); `file` is the only transport this one command may use.
+        let source = dep.pkg_root.canonicalize()?;
+        anyhow::ensure!(
+            source.is_absolute() && source.is_dir(),
+            "Statement dependency {} is not a local directory",
+            dep.name
+        );
+        let out = crate::trusted_tools::git(project)?
+            .env("GIT_ALLOW_PROTOCOL", "file")
+            .args(["clone", "--local"])
+            .args(["--quiet", "--no-hardlinks", "--no-checkout", "--template="])
+            .arg("--")
+            .arg(&source)
             .arg(&target)
+            .current_dir("/")
             .output()?;
         anyhow::ensure!(
             out.status.success(),
@@ -3496,6 +3780,7 @@ fn seed_statement_dependencies(
             dep.name,
             String::from_utf8_lossy(&out.stderr)
         );
+        materialize_statement_tree(&target, "HEAD", &target, Some(dep))?;
     }
     Ok(())
 }
@@ -3585,12 +3870,12 @@ fn stock_statement_build_with_trust(project: &Path, is_untrusted: bool) -> Resul
                 })
         }) || pkg.exes.iter().any(|exe| exe.root == name);
         if owned {
-            lake_targets.push(format!("+{name}"));
+            lake_targets.push(format!("+{name}:olean"));
         } else {
             standalone.insert(name, (source, root));
         }
     }
-    // Ask Lake to refresh every registered module, including non-default targets.
+    // Ask Lake to refresh every registered module `.olean`, including non-default targets.
     if !lake_targets.is_empty() {
         let mut command = statement_lake_command(project, is_untrusted)?;
         command.arg("build").args(&lake_targets);
@@ -3820,7 +4105,7 @@ fn kernel_statement_changes_with_trust(
     untrusted_cfg: Option<&crate::module_builder::ProjectConfig>,
 ) -> Result<Vec<String>> {
     let repo = resolve_git_toplevel(project)?;
-    let baseline = StatementWorktree::at(&repo, base)?;
+    let baseline = StatementSnapshot::at(&repo, base)?;
     let base_project = baseline.path.join(project.strip_prefix(&repo)?);
     let relative_scope = scope
         .map(|p| -> Result<PathBuf> {
@@ -3852,7 +4137,7 @@ fn kernel_statement_changes_with_trust(
         seed_statement_dependencies(&base_project, cfg)?;
     }
     let head_snapshot = if is_untrusted || !crate::lake_build::has_lake_config(project) {
-        let snapshot = StatementWorktree::at(&repo, "HEAD")?;
+        let snapshot = StatementSnapshot::at(&repo, "HEAD")?;
         overlay_statement_sources(&repo, &snapshot.path)?;
         let snapshot_project = snapshot.path.join(project.strip_prefix(&repo)?);
         ensure_statement_lake_project(&snapshot_project)?;
@@ -3922,7 +4207,7 @@ pub fn run_pr_verify_command(
     let toolchain = detect_toolchain(&canon_dir);
 
     let untrusted_pr_cfg = if is_untrusted {
-        if crate::module_builder::probe_bwrap_sandbox().is_none() {
+        if crate::module_builder::probe_bwrap_sandbox(&canon_dir).is_none() {
             anyhow::bail!(
                 "Untrusted PR verification requires a working bubblewrap (`bwrap`) sandbox: fail-closed sandbox gate"
             );
@@ -4169,10 +4454,10 @@ pub fn run_pr_verify_command(
             let lp = resolve_remote_lean_path(&canon_dir, None);
             let mut fast_ev = std::collections::HashMap::new();
             fast_ev.insert("LEAN_PATH".to_string(), lp.clone());
-            (fast_ev, "lean".to_string(), lp)
+            (fast_ev, resolve_lean_bin(&canon_dir)?, lp)
         } else {
             let (ev, _) = resolve_lake_env(store, &canon_dir)?;
-            let lb = lean_bin_from_env(&ev);
+            let lb = resolve_lean_bin(&canon_dir)?;
             let lp = resolve_remote_lean_path(&canon_dir, Some(&ev));
             (ev, lb, lp)
         };
@@ -4330,7 +4615,7 @@ pub fn run_pr_verify_command(
                     let lb = if env_vars.is_empty() {
                         lean_bin.clone()
                     } else {
-                        lean_bin_from_env(&env_vars)
+                        resolve_lean_bin(&canon_dir)?
                     };
                     let cross_names: std::collections::HashSet<String> = uncached_by_file
                         .iter()
@@ -4914,8 +5199,14 @@ pub fn run_pr_verify_command(
                 nanoda_path.display()
             );
         }
-        let mut nanoda_cmd = Command::new(nanoda_path);
-        nanoda_cmd.arg(&canon_dir).current_dir(&canon_dir);
+        let nanoda_path = crate::trusted_tools::outside_checkout(nanoda_path, &canon_dir)
+            .context("--nanoda-bin must be an absolute executable outside the project/checkout")?;
+        let mut nanoda_cmd = Command::new(&nanoda_path);
+        nanoda_cmd
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .arg(&canon_dir)
+            .current_dir(&canon_dir);
         if is_untrusted {
             scrub_sensitive_env_cmd(&mut nanoda_cmd);
         }
@@ -5189,6 +5480,224 @@ mod pr_verify_tests {
             before,
             "CI rejection wiped the pre-existing build tree"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn statement_snapshots_preserve_raw_blobs_and_reject_unsafe_entries() -> Result<()> {
+        use std::os::unix::{
+            ffi::OsStrExt,
+            fs::{symlink, PermissionsExt},
+        };
+        let dir = Path::new("/tmp").join(format!(
+            "turbo-raw-tree-{}-{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        fs::create_dir_all(dir.join("dir"))?;
+        let raw = b"raw\r\nbytes\0\xff\n";
+        let name = std::ffi::OsStr::from_bytes(b"dir/odd\t\n\xff");
+        fs::write(dir.join(name), raw)?;
+        fs::write(dir.join("script"), b"#!/bin/sh\nexit 0\n")?;
+        fs::set_permissions(dir.join("script"), fs::Permissions::from_mode(0o755))?;
+        symlink(name, dir.join("link"))?;
+        git_init_and_commit(&dir, "raw tree")?;
+        let snapshot = StatementSnapshot::at(&dir, "HEAD")?;
+        assert_eq!(fs::read(snapshot.path.join(name))?, raw);
+        assert_eq!(fs::read(snapshot.path.join("link"))?, raw);
+        assert_eq!(
+            fs::metadata(snapshot.path.join("script"))?
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(snapshot.path.join(name))?.permissions().mode() & 0o777,
+            0o644
+        );
+        assert!(!snapshot.path.join(".git").exists());
+        let path = snapshot.path.clone();
+        drop(snapshot);
+        assert!(!path.exists());
+        for target in ["../../etc/passwd", "/etc/passwd", "missing"] {
+            fs::remove_file(dir.join("link"))?;
+            symlink(target, dir.join("link"))?;
+            git_init_and_commit(&dir, "unsafe link")?;
+            assert!(StatementSnapshot::at(&dir, "HEAD").is_err(), "{target}");
+        }
+        let oid = crate::trusted_tools::git(&dir)?
+            .arg("-C")
+            .arg(&dir)
+            .args(["rev-parse", "HEAD"])
+            .output()?;
+        let oid = std::str::from_utf8(&oid.stdout)?.trim();
+        let out = Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(&dir)
+            .args([
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{oid},submodule"),
+            ])
+            .output()?;
+        assert!(out.status.success());
+        let tree = Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(&dir)
+            .arg("write-tree")
+            .output()?;
+        assert!(tree.status.success());
+        let error = StatementSnapshot::at(&dir, std::str::from_utf8(&tree.stdout)?.trim())
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("submodule gitlinks: submodule"),
+            "{error}"
+        );
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn seed_statement_dependencies_omits_non_lean_broken_symlinks_and_fails_closed_on_build_paths(
+    ) -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let dir = Path::new("/tmp").join(format!(
+            "turbo-dep-symlinks-{}-{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let root_proj = dir.join("root");
+        let dep_repo = root_proj.join(".lake/packages/fv");
+        fs::create_dir_all(dep_repo.join("FV"))?;
+        fs::create_dir_all(dep_repo.join("corpus/dsl/Corpus"))?;
+        fs::create_dir_all(dep_repo.join("docs"))?;
+        fs::write(
+            root_proj.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )?;
+        fs::write(
+            root_proj.join("lakefile.toml"),
+            "name = \"root_pkg\"\ndefaultTargets = [\"Root\"]\n[[lean_lib]]\nname = \"Root\"\n",
+        )?;
+        fs::write(
+            root_proj.join("Root.lean"),
+            "import FV.Basic\ntheorem ok : FV.val = 1 := rfl\n",
+        )?;
+        fs::write(
+            root_proj.join("lake-manifest.json"),
+            r#"{
+  "version": "1.2.0",
+  "packagesDir": ".lake/packages",
+  "packages": [
+    { "type": "git", "name": "fv", "rev": "HEAD", "url": "https://example.invalid/fv.git", "inherited": false }
+  ],
+  "name": "root_pkg",
+  "lakeDir": ".lake",
+  "fixedToolchain": false
+}"#,
+        )?;
+        fs::write(
+            dep_repo.join("lakefile.toml"),
+            r#"name = "fv"
+defaultTargets = ["FV"]
+[[lean_lib]]
+name = "FV"
+globs = ["FV.+"]
+[[lean_lib]]
+name = "Corpus"
+srcDir = "corpus/dsl"
+globs = ["Corpus.+"]
+"#,
+        )?;
+        fs::write(
+            dep_repo.join("FV/Basic.lean"),
+            "namespace FV\ndef val : Nat := 1\nend FV\n",
+        )?;
+        fs::write(
+            dep_repo.join("corpus/dsl/Corpus/Spec.lean"),
+            "namespace Corpus\ndef c : Nat := 2\nend Corpus\n",
+        )?;
+        fs::write(dep_repo.join("docs/real.txt"), "kept\n")?;
+        symlink(
+            "/home/kev/work/clifv-wt/publish-stack/lnsym-upstream",
+            dep_repo.join("lnsym-upstream"),
+        )?;
+        symlink("../../../etc/passwd", dep_repo.join("docs/escape-link"))?;
+        symlink("nonexistent-target", dep_repo.join("docs/dangling-link"))?;
+        symlink("dangling-link", dep_repo.join("docs/chained-dangling"))?;
+        symlink("real.txt", dep_repo.join("docs/valid-link"))?;
+        git_init_and_commit(&dep_repo, "clifv-like dep with non-lean broken symlinks")?;
+
+        let cfg = crate::module_builder::resolve_project_config_with_trust(&root_proj, true)?;
+        let snap = dir.join("snap-ok");
+        fs::create_dir_all(&snap)?;
+        seed_statement_dependencies(&snap, &cfg)?;
+        let seeded = snap.join(".lake/packages/fv");
+        assert!(seeded.join("FV/Basic.lean").is_file());
+        assert_eq!(
+            fs::read_to_string(seeded.join("docs/valid-link"))?,
+            "kept\n"
+        );
+        for omitted in [
+            "lnsym-upstream",
+            "docs/escape-link",
+            "docs/dangling-link",
+            "docs/chained-dangling",
+        ] {
+            assert!(
+                fs::symlink_metadata(seeded.join(omitted)).is_err(),
+                "unsafe non-build symlink `{omitted}` must not exist on disk"
+            );
+        }
+
+        let live_fv_snap = dir.join("snap-live-fv");
+        fs::create_dir_all(&live_fv_snap)?;
+        let repo_lean = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lean");
+        if repo_lean.join(".lake/packages/fv/.git").exists() {
+            let live_cfg =
+                crate::module_builder::resolve_project_config_with_trust(&repo_lean, true)?;
+            seed_statement_dependencies(&live_fv_snap, &live_cfg)?;
+            assert!(
+                fs::symlink_metadata(live_fv_snap.join(".lake/packages/fv/lnsym-upstream"))
+                    .is_err(),
+                "upstream broken absolute symlink in clifv must be omitted"
+            );
+            assert!(
+                live_fv_snap
+                    .join(".lake/packages/fv/FV/Basic.lean")
+                    .exists()
+                    || live_fv_snap
+                        .join(".lake/packages/fv/lakefile.toml")
+                        .is_file()
+            );
+        }
+
+        for (bad_rel, bad_target) in [
+            ("FV/Bad.lean", "/etc/passwd"),
+            ("FV/Sub", "../../../etc"),
+            ("corpus/dsl/Corpus/Bad", "missing"),
+            ("lakefile.lean", "/etc/passwd"),
+            ("lean-toolchain", "missing"),
+        ] {
+            let full = dep_repo.join(bad_rel);
+            if let Some(p) = full.parent() {
+                fs::create_dir_all(p)?;
+            }
+            symlink(bad_target, &full)?;
+            git_init_and_commit(&dep_repo, &format!("bad symlink {bad_rel}"))?;
+            let snap_bad = dir.join(format!("snap-bad-{}", pack::next_tmp_id()));
+            fs::create_dir_all(&snap_bad)?;
+            assert!(
+                seed_statement_dependencies(&snap_bad, &cfg).is_err(),
+                "dependency symlink at `{bad_rel}` -> `{bad_target}` must fail closed"
+            );
+            fs::remove_file(&full)?;
+            git_init_and_commit(&dep_repo, &format!("cleanup {bad_rel}"))?;
+        }
+        fs::remove_dir_all(dir)?;
         Ok(())
     }
 
@@ -5541,7 +6050,7 @@ end Fixture
             git_init_and_commit(&dir, label)?;
         }
         stock_statement_build(&dir)?;
-        if crate::module_builder::probe_bwrap_sandbox().is_some() {
+        if crate::module_builder::probe_bwrap_sandbox(std::path::Path::new(".")).is_some() {
             fs::write(dir.join("fixture.c"), "int fixture(void) { return 0; }\n")?;
             let mut command = statement_lake_command(&dir, true)?;
             command.args(["env", "cc", "-c", "fixture.c", "-o", "fixture.o"]);
@@ -5651,7 +6160,8 @@ end Fixture
         };
         if cli.is_some() {
             verify_default_policy("trusted")?;
-            let sandbox = crate::module_builder::probe_bwrap_sandbox().is_some();
+            let sandbox =
+                crate::module_builder::probe_bwrap_sandbox(std::path::Path::new(".")).is_some();
             for (command, mode) in [
                 ("pr-verify", "trusted"),
                 ("pr-verify", "untrusted"),
@@ -7083,11 +7593,11 @@ end Fixture
             "{}",
             untrusted_err
         );
-        // Trusted mode uses `[lake] build_command` (read at `--base`) and catches `P.B` too.
+        // Trusted mode also uses stock Lake and catches P.B without executing the wrapper.
         let trusted_err = pr_verify_mode("trusted").unwrap_err().to_string();
         assert!(
-            rce_marker.exists(),
-            "trusted dependent recheck should honor [lake] build_command at --base"
+            !rce_marker.exists(),
+            "trusted dependent recheck must use stock Lake instead of [lake] build_command"
         );
         assert!(
             trusted_err.contains("P.B") || trusted_err.contains("P/B.lean"),
