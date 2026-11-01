@@ -5316,6 +5316,26 @@ pub(crate) fn root_module_paths(cfg: &ProjectConfig, imp: &str) -> Option<(PathB
     Some((spec.src_path, olean))
 }
 
+pub(crate) fn root_module_lake_sidecars_current(cfg: &ProjectConfig, imp: &str) -> bool {
+    let Some(spec) = resolve_module_in_package(&cfg.root_pkg, true, imp) else {
+        return false;
+    };
+    let Ok(src) = fs::read_to_string(&spec.src_path) else {
+        return false;
+    };
+    let hdr = parse_header_info(&src);
+    hdr.header_error.is_none()
+        && verify_module_lake_sidecars(
+            &spec_olean_path(&spec),
+            Some(&spec.build_ir_dir),
+            &module_name_to_rel_slash(imp),
+            &src,
+            hdr.is_module,
+            spec.precompile_modules || spec.is_exe_target,
+        )
+        .is_ok()
+}
+
 /// Whether dependency-package module `imp` lacks a built `.olean` on disk.
 pub(crate) fn dep_pkg_module_missing_olean(cfg: &ProjectConfig, imp: &str) -> bool {
     matches!(resolve_import_site(cfg, imp), ImportSite::Module(s) if !spec_olean_path(&s).is_file())
@@ -5993,14 +6013,25 @@ fn dep_pkg_import_pins_consistent(
             seen.insert(key, pin);
             continue;
         };
+        let olean_path = spec_olean_path(&cur);
         let artifacts_ok = (!strict_policy || !cur.is_root_pkg || entry.kernel_audited)
-            && entry_artifacts_current(cfg, &spec_olean_path(&cur), &entry);
+            && entry_artifacts_current(cfg, &olean_path, &entry);
         let Ok(src) = fs::read_to_string(&cur.src_path) else {
             return false;
         };
         let src_ok = blake3::hash(src.as_bytes()).to_hex().as_str() == entry.src_blake3;
         let hdr = parse_header_info(&src);
-        let pins_ok = hdr.header_error.is_none()
+        let sidecars_ok = hdr.header_error.is_none()
+            && verify_module_lake_sidecars(
+                &olean_path,
+                Some(&cur.build_ir_dir),
+                &module_name_to_rel_slash(&cur.module_name),
+                &src,
+                hdr.is_module,
+                cur.precompile_modules || cur.is_exe_target,
+            )
+            .is_ok();
+        let pins_ok = sidecars_ok
             && verified_entry_imports_current(&entry, &hdr.imports, |imp, sub_pin| {
                 let site = match resolve_module_in_package(&cfg.root_pkg, true, imp) {
                     Some(root_spec) => ImportSite::Module(Box::new(root_spec)),
@@ -6008,7 +6039,9 @@ fn dep_pkg_import_pins_consistent(
                 };
                 match (site, sub_pin) {
                     (ImportSite::Toolchain, None) => true,
-                    (ImportSite::Prebuilt(o), Some(p)) => olean_digest_is(cfg, &o, p),
+                    (ImportSite::Prebuilt(o), Some(p)) => {
+                        olean_digest_is(cfg, &o, p) && prebuilt_olean_export_info(&o).is_some()
+                    }
                     (ImportSite::Module(sub), Some(p)) => {
                         stack.push((*sub, p.to_string()));
                         true
@@ -12604,6 +12637,149 @@ lean_exe «demo-exe» where
             crate::lake_build::ensure_project_imports_fresh_for_check(
                 &canon,
                 std::slice::from_ref(&direct_file),
+            )
+            .unwrap(),
+            0
+        );
+
+        let canon_dep = dep_dir.canonicalize().unwrap();
+        let mid_trace = canon.join(".lake/build/lib/lean/App/Mid.trace");
+        let mid_hash = canon.join(".lake/build/lib/lean/App/Mid.olean.hash");
+        let dep_b_trace = canon_dep.join(".lake/build/lib/lean/DepPkg/B.trace");
+        let dep_a_trace = canon_dep.join(".lake/build/lib/lean/DepPkg/A.trace");
+        let assert_optout_stale_preserves_trees =
+            |target: &PathBuf, expected_mod: &str, label: &str| {
+                fs::write(
+                    canon.join("turbo-lean.toml"),
+                    "[worktree]\nauto_link = false\n",
+                )
+                .unwrap();
+                let sp = snapshot(&canon).unwrap();
+                let sd = snapshot(&canon_dep).unwrap();
+                let err = crate::lake_build::ensure_project_imports_fresh_for_check(
+                    &canon,
+                    std::slice::from_ref(target),
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(
+                    err.contains("Worktree opt-out prevents refreshing stale imports")
+                        && err.contains(expected_mod),
+                    "{label}: unexpected opt-out result: {err}"
+                );
+                assert_eq!(snapshot(&canon).unwrap(), sp, "{label}: mutated root `.lake`");
+                assert_eq!(
+                    snapshot(&canon_dep).unwrap(),
+                    sd,
+                    "{label}: mutated dep `.lake`"
+                );
+                fs::remove_file(canon.join("turbo-lean.toml")).unwrap();
+            };
+
+        let _ = fs::remove_file(&root_turbo_manifest);
+        let _ = fs::remove_file(&dep_turbo_manifest);
+        run_lake(&proj_dir, &["build", "App.Mid"]);
+        assert!(!root_turbo_manifest.exists() && !dep_turbo_manifest.exists());
+        fs::remove_file(&mid_trace).unwrap();
+        assert_optout_stale_preserves_trees(&canon_c, "App.Mid", "missing Lake root trace");
+        assert!(
+            crate::lake_build::ensure_project_imports_fresh_for_check(
+                &canon,
+                std::slice::from_ref(&canon_c),
+            )
+            .unwrap()
+                >= 1
+        );
+        assert!(mid_trace.is_file());
+        assert_eq!(
+            crate::lake_build::ensure_project_imports_fresh_for_check(
+                &canon,
+                std::slice::from_ref(&canon_c),
+            )
+            .unwrap(),
+            0
+        );
+        fs::remove_file(&dep_a_trace).unwrap();
+        assert_optout_stale_preserves_trees(&direct_file, "DepPkg.B", "missing Lake dep trace");
+        run_lake(&dep_dir, &["build", "DepPkg.B"]);
+        run_lake(&proj_dir, &["build", "App.Mid"]);
+        assert!(dep_a_trace.is_file());
+
+        build_project_modules_native(
+            &mut store,
+            &dep_dir,
+            &["DepPkg.B".to_string()],
+            "trusted-internal",
+            1,
+            false,
+            true,
+            None,
+        )
+        .unwrap();
+        build_project_modules_native(
+            &mut store,
+            &proj_dir,
+            &["App.Mid".to_string()],
+            "trusted-internal",
+            1,
+            false,
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(root_turbo_manifest.is_file() && dep_turbo_manifest.is_file());
+        assert_eq!(
+            crate::lake_build::ensure_project_imports_fresh_for_check(
+                &canon,
+                std::slice::from_ref(&canon_c),
+            )
+            .unwrap(),
+            0
+        );
+
+        let saved_mid_trace = fs::read(&mid_trace).unwrap();
+        fs::remove_file(&mid_trace).unwrap();
+        assert_optout_stale_preserves_trees(&canon_c, "App.Mid", "missing manifest root trace");
+        fs::write(&mid_trace, &saved_mid_trace).unwrap();
+
+        let saved_mid_hash = fs::read(&mid_hash).unwrap();
+        fs::remove_file(&mid_hash).unwrap();
+        assert_optout_stale_preserves_trees(&canon_c, "App.Mid", "missing manifest root hash sidecar");
+        fs::write(&mid_hash, &saved_mid_hash).unwrap();
+
+        let saved_dep_b_trace = fs::read(&dep_b_trace).unwrap();
+        fs::remove_file(&dep_b_trace).unwrap();
+        assert_optout_stale_preserves_trees(&direct_file, "DepPkg.B", "missing manifest dep trace (direct)");
+        assert_optout_stale_preserves_trees(&canon_c, "App.Mid", "missing manifest dep trace (via root)");
+        fs::write(&dep_b_trace, &saved_dep_b_trace).unwrap();
+
+        let saved_dep_a_trace = fs::read(&dep_a_trace).unwrap();
+        fs::remove_file(&dep_a_trace).unwrap();
+        assert_optout_stale_preserves_trees(&direct_file, "DepPkg.B", "missing transitive manifest dep trace");
+        fs::write(&dep_a_trace, &saved_dep_a_trace).unwrap();
+
+        assert_eq!(
+            crate::lake_build::ensure_project_imports_fresh_for_check(
+                &canon,
+                std::slice::from_ref(&canon_c),
+            )
+            .unwrap(),
+            0
+        );
+        fs::remove_file(&mid_trace).unwrap();
+        assert_eq!(
+            crate::lake_build::ensure_project_imports_fresh_for_check(
+                &canon,
+                std::slice::from_ref(&canon_c),
+            )
+            .unwrap(),
+            1
+        );
+        assert!(mid_trace.is_file());
+        assert_eq!(
+            crate::lake_build::ensure_project_imports_fresh_for_check(
+                &canon,
+                std::slice::from_ref(&canon_c),
             )
             .unwrap(),
             0

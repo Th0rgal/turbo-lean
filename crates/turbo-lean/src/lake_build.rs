@@ -2487,6 +2487,9 @@ pub(crate) fn ensure_project_imports_fresh(
                         || (olean_meta.is_some()
                             && !(m.cfg.as_ref().is_some_and(|cfg| {
                                 crate::module_builder::entry_artifacts_current(cfg, &dep_olean, e)
+                                    && crate::module_builder::root_module_lake_sidecars_current(
+                                        cfg, mod_name,
+                                    )
                             }) && entry_import_pins_fresh_for_build(
                                 m,
                                 e,
@@ -2508,20 +2511,23 @@ pub(crate) fn ensure_project_imports_fresh(
             (Some(_), None) => true,
             (None, _) => false,
         };
-        let trace_corrupt = if olean_meta.as_ref().is_some_and(|m| m.is_file()) {
+        let trace_stale = if olean_meta.as_ref().is_some_and(|m| m.is_file()) {
             let trace_path = dep_olean.with_extension("trace");
-            trace_path.is_file()
-                && fs::read(&trace_path)
+            if trace_path.is_file() {
+                fs::read(&trace_path)
                     .ok()
                     .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
                     .is_none()
+            } else {
+                has_workspace_cfg || has_manifest_entry
+            }
         } else {
             false
         };
         if manifest_stale
             || lake_root_stale
             || mtime_stale
-            || trace_corrupt
+            || trace_stale
             || (unusable_manifest && olean_meta.is_some())
             || (build_missing && !olean_meta.as_ref().is_some_and(|m| m.is_file()))
         {
@@ -3950,6 +3956,47 @@ mod tests {
                     "check mutated Lake tree (config={lake_config})"
                 );
             }
+        }
+        for manifest_backed in [false, true] {
+            let tree = LakeTree::imports("missing_trace")?;
+            let mut store = TurboStore::open(Some(&tree.root.join("cache")))?;
+            if manifest_backed {
+                crate::module_builder::build_project_modules_native(
+                    &mut store,
+                    &tree.project,
+                    &["P.Middle".into()],
+                    "trusted-internal",
+                    1,
+                    false,
+                    true,
+                    None,
+                )?;
+                assert!(verified_sources_manifest_path(&tree.project).is_file());
+            } else {
+                assert!(!verified_sources_manifest_path(&tree.project).exists());
+            }
+            fs::remove_file(tree.project.join(".lake/build/lib/lean/P/A.trace"))?;
+            tree.opt_out()?;
+            tree.prepare_snapshot(".lake/build/lib/lean/P/A.olean")?;
+            let before = snapshot(&tree.project)?;
+            let err = crate::check::run_check_command(
+                &mut store,
+                false,
+                true,
+                tree.project.join("P/Target.lean"),
+                None,
+                tree.project.clone(),
+                None,
+                false,
+                None,
+            )
+            .unwrap_err();
+            assert_stale_error(&err);
+            assert_eq!(
+                snapshot(&tree.project)?,
+                before,
+                "missing-trace check mutated Lake tree (manifest={manifest_backed})"
+            );
         }
         Ok(())
     }
