@@ -1052,34 +1052,127 @@ impl TurboStore {
         self.root.join("staging")
     }
 
-    /// Batch-lookup multiple theorem shard keys in a single `BEGIN IMMEDIATE ... COMMIT` SQLite
-    /// transaction, verifying that the backing CAS blobs exist on disk and atomically incrementing
-    /// `hit_count` and `last_accessed`.
+    /// Batch-lookup multiple theorem shard keys in a single SQLite pass, verifying that the
+    /// backing CAS blobs are digest-intact on disk BEFORE incrementing `hit_count` and
+    /// `last_accessed`.
     pub fn batch_get_theorem_shards(
         &self,
         shard_keys: &[String],
         trust_domain: &str,
     ) -> Result<std::collections::HashMap<String, String>> {
-        let raw_hits = if trust_domain == "trusted" {
-            batch_get_theorem_shards(&self.conn, shard_keys)?
-        } else {
-            batch_get_theorem_shards_in_domain(&self.conn, shard_keys, trust_domain)?
-        };
-        let mut verified = std::collections::HashMap::with_capacity(raw_hits.len());
-        let mut exists_cache: std::collections::HashMap<String, bool> =
+        if shard_keys.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let now = now_unix();
+        let mut verified = std::collections::HashMap::with_capacity(shard_keys.len());
+        let mut intact_cache: std::collections::HashMap<String, bool> =
             std::collections::HashMap::new();
-        for (k, blob_hash) in raw_hits {
-            let exists = *exists_cache
-                .entry(blob_hash.clone())
-                .or_insert_with(|| self.blob_intact_by_row(&blob_hash));
-            if exists {
-                verified.insert(k, blob_hash);
+        let mut hit_keys_in_order = Vec::new();
+        let mut touched_blobs = std::collections::HashSet::new();
+
+        if shard_keys.len() >= 128 {
+            let mut db_map = std::collections::HashMap::with_capacity(shard_keys.len());
+            {
+                let mut scan_stmt = self.conn.prepare_cached(
+                    "SELECT a.action_key, ao.blob_hash, b.size_bytes, b.last_accessed
+                     FROM actions a JOIN action_outputs ao ON ao.action_key = a.action_key
+                     JOIN blobs b ON b.blob_hash = ao.blob_hash
+                     WHERE a.kind = 'theorem_shard' AND a.status = 'completed'
+                       AND ((?1 = 'trusted' AND a.trust_domain = 'trusted' AND b.trust_domain = 'trusted')
+                            OR (?1 != 'trusted' AND (a.trust_domain = 'trusted' OR a.trust_domain = ?1)))",
+                )?;
+                let mut rows = scan_stmt.query(params![trust_domain])?;
+                while let Some(row) = rows.next()? {
+                    db_map.insert(
+                        row.get::<_, String>(0)?,
+                        (
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ),
+                    );
+                }
             }
+            for key in shard_keys {
+                if let Some((blob_hash, sz, last_acc)) = db_map.get(key) {
+                    let intact = *intact_cache.entry(blob_hash.clone()).or_insert_with(|| {
+                        matches!(
+                            probe_blob_digest(&self.blob_path(blob_hash), blob_hash, *sz as u64),
+                            BlobDisk::Intact(_)
+                        )
+                    });
+                    if intact {
+                        hit_keys_in_order.push(key.as_str());
+                        if now - *last_acc >= 60 {
+                            touched_blobs.insert(blob_hash.clone());
+                        }
+                        verified.insert(key.clone(), blob_hash.clone());
+                    }
+                }
+            }
+        } else {
+            let mut sel_stmt = self.conn.prepare_cached(
+                "SELECT ao.blob_hash, b.size_bytes, b.last_accessed FROM actions a
+                 JOIN action_outputs ao ON ao.action_key = a.action_key
+                 JOIN blobs b ON b.blob_hash = ao.blob_hash
+                 WHERE a.action_key = ?1 AND a.status = 'completed'
+                   AND ((?2 = 'trusted' AND a.trust_domain = 'trusted' AND b.trust_domain = 'trusted')
+                        OR (?2 != 'trusted' AND (a.trust_domain = 'trusted' OR a.trust_domain = ?2)))
+                 LIMIT 1",
+            )?;
+            for key in shard_keys {
+                if let Some((blob_hash, sz, last_acc)) = sel_stmt
+                    .query_row(params![key, trust_domain], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, i64>(2)?,
+                        ))
+                    })
+                    .optional()?
+                {
+                    let intact = *intact_cache.entry(blob_hash.clone()).or_insert_with(|| {
+                        matches!(
+                            probe_blob_digest(&self.blob_path(&blob_hash), &blob_hash, sz as u64),
+                            BlobDisk::Intact(_)
+                        )
+                    });
+                    if intact {
+                        hit_keys_in_order.push(key.as_str());
+                        if now - last_acc >= 60 {
+                            touched_blobs.insert(blob_hash.clone());
+                        }
+                        verified.insert(key.clone(), blob_hash);
+                    }
+                }
+            }
+        }
+
+        if !hit_keys_in_order.is_empty() {
+            let tx = self.conn.unchecked_transaction()?;
+            {
+                let mut upd_action = tx.prepare_cached(
+                    "UPDATE actions SET hit_count = hit_count + 1 WHERE action_key = ?1",
+                )?;
+                for k in hit_keys_in_order {
+                    upd_action.execute(params![k])?;
+                }
+                if !touched_blobs.is_empty() {
+                    let mut upd_blob = tx.prepare_cached(
+                        "UPDATE blobs SET last_accessed = ?1 WHERE blob_hash = ?2",
+                    )?;
+                    for bh in touched_blobs {
+                        upd_blob.execute(params![now, &bh])?;
+                    }
+                }
+            }
+            tx.commit()?;
         }
         Ok(verified)
     }
 
-    /// Fast read-only batch check for completed action keys in `trust_domain` (or `'trusted'`).
+    /// Batch check for completed action keys in `trust_domain` (or `'trusted'`) whose backing
+    /// output CAS blobs exist and verify their BLAKE3 digests on disk.
     pub fn batch_completed_action_keys(
         &self,
         keys: &[String],
@@ -1089,32 +1182,32 @@ impl TurboStore {
             return Ok(std::collections::HashSet::new());
         }
         let mut hits = std::collections::HashSet::with_capacity(keys.len());
-        if trust_domain != "trusted" {
-            let mut stmt = self.conn.prepare_cached(
-                "SELECT 1 FROM actions
-                 WHERE action_key = ?1 AND status = 'completed'
-                   AND (trust_domain = 'trusted' OR trust_domain = ?2)
-                 LIMIT 1",
-            )?;
-            for k in keys {
-                let found: Option<i64> = stmt
-                    .query_row(params![k, trust_domain], |r| r.get(0))
-                    .optional()?;
-                if found.is_some() {
-                    hits.insert(k.clone());
-                }
-            }
-        } else {
-            let mut stmt = self.conn.prepare_cached(
-                "SELECT 1 FROM actions
-                 WHERE action_key = ?1 AND status = 'completed' AND trust_domain = 'trusted'
-                 LIMIT 1",
-            )?;
-            for k in keys {
-                let found: Option<i64> = stmt.query_row(params![k], |r| r.get(0)).optional()?;
-                if found.is_some() {
-                    hits.insert(k.clone());
-                }
+        let mut intact_cache: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT ao.blob_hash, b.size_bytes
+             FROM actions a
+             JOIN action_outputs ao ON ao.action_key = a.action_key
+             JOIN blobs b ON b.blob_hash = ao.blob_hash
+             WHERE a.action_key = ?1 AND a.status = 'completed'
+               AND ((?2 = 'trusted' AND a.trust_domain = 'trusted' AND b.trust_domain = 'trusted')
+                    OR (?2 != 'trusted' AND (a.trust_domain = 'trusted' OR a.trust_domain = ?2)))",
+        )?;
+        for k in keys {
+            let outputs: Vec<(String, i64)> = stmt
+                .query_map(params![k, trust_domain], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if !outputs.is_empty()
+                && outputs.iter().all(|(bh, sz)| {
+                    *intact_cache.entry(bh.clone()).or_insert_with(|| {
+                        matches!(
+                            probe_blob_digest(&self.blob_path(bh), bh, (*sz).max(0) as u64),
+                            BlobDisk::Intact(_)
+                        )
+                    })
+                })
+            {
+                hits.insert(k.clone());
             }
         }
         if !hits.is_empty() {
@@ -1210,8 +1303,8 @@ impl TurboStore {
         Ok(())
     }
 
-    /// Size-checked presence of a CAS blob against its `blobs` row (bare existence when the blob
-    /// has no row yet).
+    /// Digest-checked presence of a CAS blob against its `blobs` row (or direct BLAKE3 check when
+    /// the blob has no row yet).
     fn blob_intact_by_row(&self, blob_hash: &str) -> bool {
         let path = self.blob_path(blob_hash);
         let recorded: Option<i64> = self
@@ -1221,16 +1314,19 @@ impl TurboStore {
             .ok()
             .flatten();
         match recorded {
-            Some(sz) => matches!(probe_blob_file(&path, sz as u64), BlobDisk::Intact(_)),
-            None => path.exists(),
+            Some(sz) => matches!(
+                probe_blob_digest(&path, blob_hash, sz.max(0) as u64),
+                BlobDisk::Intact(_)
+            ),
+            None => read_cas_blob_verified(&path, blob_hash, None).is_some(),
         }
     }
 
-    /// Size-checked (never hashed) presence test for every output blob of an action.
+    /// Digest-checked presence test for every output blob of an action.
     fn entries_intact_on_disk(&self, entries: &[BlobEntry]) -> bool {
         entries.iter().all(|e| {
             matches!(
-                probe_blob_file(&self.blob_path(&e.blob_hash), e.size_bytes),
+                probe_blob_digest(&self.blob_path(&e.blob_hash), &e.blob_hash, e.size_bytes),
                 BlobDisk::Intact(_)
             )
         })
@@ -1638,7 +1734,7 @@ impl TurboStore {
         let _pub_guard = acquire_cas_publication_guard(&self.root)?;
         for (hash, _, size, _) in blobs {
             if !matches!(
-                probe_blob_file(&self.blob_path(hash), (*size).max(0) as u64),
+                probe_blob_digest(&self.blob_path(hash), hash, (*size).max(0) as u64),
                 BlobDisk::Intact(_)
             ) {
                 anyhow::bail!(
@@ -1675,21 +1771,6 @@ impl TurboStore {
         Ok(())
     }
 
-    /// Batch-publish multiple verified theorem shard receipts in a single atomic SQLite transaction.
-    pub fn has_completed_action(&self, action_key: &str) -> bool {
-        self.has_completed_action_in_domain(action_key, "trusted")
-    }
-
-    pub fn has_completed_action_in_domain(&self, action_key: &str, trust_domain: &str) -> bool {
-        self.conn
-            .query_row(
-                "SELECT 1 FROM actions WHERE action_key = ?1 AND status = 'completed' AND trust_domain = ?2",
-                params![action_key, trust_domain],
-                |_| Ok(()),
-            )
-            .is_ok()
-    }
-
     pub fn has_cached_action_readonly(&self, action_key: &str, trust_domain: &str) -> Result<bool> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT ao.blob_hash
@@ -1708,6 +1789,18 @@ impl TurboStore {
         Ok(hashes.iter().all(|h| self.blob_intact_by_row(h)))
     }
 
+    /// Read and digest-verify a CAS blob (transparently decompressing cold `TLZ1` blobs).
+    pub(crate) fn read_verified_blob(&self, blob_hash: &str) -> Option<Vec<u8>> {
+        let path = self.blob_path(blob_hash);
+        let recorded: Option<i64> = self
+            .conn
+            .prepare_cached("SELECT size_bytes FROM blobs WHERE blob_hash = ?1")
+            .and_then(|mut st| st.query_row(params![blob_hash], |r| r.get(0)).optional())
+            .ok()
+            .flatten();
+        read_cas_blob_verified(&path, blob_hash, recorded.map(|sz| sz.max(0) as u64))
+    }
+
     pub fn batch_get_theorem_shards_readonly(
         &self,
         shard_keys: &[String],
@@ -1717,26 +1810,36 @@ impl TurboStore {
             return Ok(std::collections::HashMap::new());
         }
         let mut verified = std::collections::HashMap::with_capacity(shard_keys.len());
-        let mut exists_cache: std::collections::HashMap<String, bool> =
+        let mut intact_cache: std::collections::HashMap<String, bool> =
             std::collections::HashMap::new();
         let mut sel_stmt = self.conn.prepare_cached(
-            "SELECT ao.blob_hash
+            "SELECT ao.blob_hash, b.size_bytes
              FROM actions a
              JOIN action_outputs ao ON ao.action_key = a.action_key
              JOIN blobs b ON b.blob_hash = ao.blob_hash
-             WHERE a.action_key = ?1 AND a.status = 'completed' AND a.trust_domain = ?2
-               AND (?2 != 'trusted' OR b.trust_domain = 'trusted')
+             WHERE a.action_key = ?1 AND a.status = 'completed'
+               AND ((?2 = 'trusted' AND a.trust_domain = 'trusted' AND b.trust_domain = 'trusted')
+                    OR (?2 != 'trusted' AND (a.trust_domain = 'trusted' OR a.trust_domain = ?2)))
              LIMIT 1",
         )?;
         for key in shard_keys {
-            if let Some(blob_hash) = sel_stmt
-                .query_row(params![key, trust_domain], |r| r.get::<_, String>(0))
+            if let Some((blob_hash, sz)) = sel_stmt
+                .query_row(params![key, trust_domain], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                })
                 .optional()?
             {
-                let exists = *exists_cache
-                    .entry(blob_hash.clone())
-                    .or_insert_with(|| self.blob_intact_by_row(&blob_hash));
-                if exists {
+                let intact = *intact_cache.entry(blob_hash.clone()).or_insert_with(|| {
+                    matches!(
+                        probe_blob_digest(
+                            &self.blob_path(&blob_hash),
+                            &blob_hash,
+                            sz.max(0) as u64
+                        ),
+                        BlobDisk::Intact(_)
+                    )
+                });
+                if intact {
                     verified.insert(key.clone(), blob_hash);
                 }
             }
@@ -1850,7 +1953,11 @@ impl TurboStore {
         };
         for row in &staged.rows {
             if !matches!(
-                probe_blob_file(&self.blob_path(&row.blob_hash), row.size as u64),
+                probe_blob_digest(
+                    &self.blob_path(&row.blob_hash),
+                    &row.blob_hash,
+                    row.size as u64
+                ),
                 BlobDisk::Intact(_)
             ) {
                 anyhow::bail!(
@@ -2056,9 +2163,10 @@ impl TurboStore {
     pub fn write_singleflight_done(&self, action_key: &str, outputs: &[BlobEntry]) -> Result<()> {
         let _pub_guard = acquire_cas_publication_guard(&self.root)?;
         let locks = self.root.join("locks");
+        let created = ensure_dir_tracking(&locks, &self.root)?;
         let done_path = locks.join(format!("{}.done", action_key));
         let bytes = serde_json::to_vec(outputs)?;
-        write_blob_atomic(&self.root, &done_path, action_key, &bytes, true)?;
+        write_bytes_durable(&done_path, &bytes, &created)?;
         Ok(())
     }
 
@@ -2080,7 +2188,7 @@ impl TurboStore {
         let _pub_guard = acquire_cas_publication_guard(&self.root)?;
         for o in outputs {
             if !matches!(
-                probe_blob_file(&self.blob_path(&o.blob_hash), o.size_bytes),
+                probe_blob_digest(&self.blob_path(&o.blob_hash), &o.blob_hash, o.size_bytes),
                 BlobDisk::Intact(_)
             ) {
                 anyhow::bail!(
@@ -2350,7 +2458,7 @@ impl TurboStore {
         let _pub_guard = acquire_cas_publication_guard(&self.root)?;
         for (hash, _, size, _) in reg_blobs {
             if !matches!(
-                probe_blob_file(&self.blob_path(hash), (*size).max(0) as u64),
+                probe_blob_digest(&self.blob_path(hash), hash, (*size).max(0) as u64),
                 BlobDisk::Intact(_)
             ) {
                 anyhow::bail!(
@@ -2362,7 +2470,7 @@ impl TurboStore {
         }
         for o in outputs {
             if !matches!(
-                probe_blob_file(&self.blob_path(&o.blob_hash), o.size_bytes),
+                probe_blob_digest(&self.blob_path(&o.blob_hash), &o.blob_hash, o.size_bytes),
                 BlobDisk::Intact(_)
             ) {
                 anyhow::bail!(
@@ -2596,7 +2704,11 @@ impl TurboStore {
                 continue;
             }
             let src = self.ensure_blob_uncompressed(&out.blob_hash)?;
-            if !matches!(probe_blob_file(&src, out.size_bytes), BlobDisk::Intact(_)) {
+            if !matches!(
+                probe_blob_digest(&src, &out.blob_hash, out.size_bytes),
+                BlobDisk::Intact(_)
+            ) {
+                let _ = fs::remove_file(&src);
                 anyhow::bail!(
                     "CAS blob {} is missing or torn; refusing to link",
                     out.blob_hash
@@ -2699,13 +2811,15 @@ impl TurboStore {
             let mut compressed = magic.to_vec();
             f.read_to_end(&mut compressed)?;
             drop(f);
-            let Some(raw) = decompress_tlz1(&compressed) else {
-                // A truncated cold body passes the header-only probe; drop it so it self-heals,
-                // unless a concurrent promotion already replaced it.
+            let Some(raw) = decompress_tlz1(&compressed)
+                .filter(|b| blake3::hash(b).to_hex().as_str() == blob_hash)
+            else {
+                // A truncated or corrupt cold body passes the header-only probe; drop it so it
+                // self-heals, unless a concurrent promotion already replaced it.
                 if fs::metadata(&src).is_ok_and(|m| m.ino() == opened_ino) {
                     let _ = fs::remove_file(&src);
                 }
-                anyhow::bail!("Failed to decompress TLZ1 blob {}", blob_hash);
+                anyhow::bail!("Failed to decompress or verify TLZ1 blob {}", blob_hash);
             };
             write_blob_atomic(&self.root, &src, blob_hash, &raw, true)?;
             if let Ok(meta) = fs::metadata(&src) {
@@ -2718,9 +2832,8 @@ impl TurboStore {
         Ok(src)
     }
 
-    /// Refuse to link a CAS blob whose bytes are not the recorded blob: size check against the
-    /// `blobs` row (cheap), falling back to a full BLAKE3 check only for blobs with no row.
-    /// A torn blob is unlinked so the next producer rewrites it.
+    /// Refuse to link a CAS blob whose bytes do not verify against `blob_hash`.
+    /// A torn or corrupt blob is unlinked so the next producer rewrites it.
     fn verify_blob_before_link(&self, blob_hash: &str, src: &Path) -> Result<u64> {
         let recorded: Option<i64> = self
             .conn
@@ -2731,13 +2844,12 @@ impl TurboStore {
             )
             .optional()?;
         let len = match recorded {
-            Some(sz) => {
-                matches!(probe_blob_file(src, sz as u64), BlobDisk::Intact(_)).then_some(sz as u64)
-            }
-            None => fs::read(src)
-                .ok()
-                .filter(|b| blake3::hash(b).to_hex().as_str() == blob_hash)
-                .map(|b| b.len() as u64),
+            Some(sz) => matches!(
+                probe_blob_digest(src, blob_hash, sz.max(0) as u64),
+                BlobDisk::Intact(_)
+            )
+            .then_some(sz.max(0) as u64),
+            None => read_cas_blob_verified(src, blob_hash, None).map(|b| b.len() as u64),
         };
         let Some(len) = len else {
             let _ = fs::remove_file(src);
@@ -3565,9 +3677,13 @@ impl TurboStore {
                 Self::unlock_singleflights(guards);
                 continue;
             }
+            if blake3::hash(&raw_bytes).to_hex().as_str() != bh {
+                Self::unlock_singleflights(guards);
+                continue;
+            }
             let compressed = compress_tlz1(&raw_bytes);
             if compressed.len() < (raw_bytes.len() * 9) / 10
-                && write_blob_atomic(&self.root, &p, &bh, &compressed, true).is_ok()
+                && write_blob_bytes_checked(&self.root, &p, &bh, &compressed, true).is_ok()
             {
                 compressed_blobs += 1;
                 let saved = (raw_bytes.len() - compressed.len()) as u64;
@@ -3809,122 +3925,6 @@ fn mark_superseded_worktree_blobs(
         }
     }
     Ok(newly_superseded)
-}
-
-/// Batch-query theorem shards in SQLite inside a single `BEGIN IMMEDIATE ... COMMIT` transaction,
-/// incrementing `hit_count` and updating `last_accessed` in one atomic commit.
-pub fn batch_get_theorem_shards(
-    conn: &Connection,
-    shard_keys: &[String],
-) -> Result<std::collections::HashMap<String, String>> {
-    batch_get_theorem_shards_in_domain(conn, shard_keys, "trusted")
-}
-
-pub fn batch_get_theorem_shards_in_domain(
-    conn: &Connection,
-    shard_keys: &[String],
-    trust_domain: &str,
-) -> Result<std::collections::HashMap<String, String>> {
-    if shard_keys.is_empty() {
-        return Ok(std::collections::HashMap::new());
-    }
-    let now = now_unix();
-    let mut hits = std::collections::HashMap::with_capacity(shard_keys.len());
-    if shard_keys.len() >= 128 {
-        let tx = conn.unchecked_transaction()?;
-        let mut db_map = std::collections::HashMap::with_capacity(shard_keys.len());
-        {
-            let mut scan_stmt = tx.prepare_cached(
-                "SELECT a.action_key, ao.blob_hash, b.last_accessed
-                 FROM actions a JOIN action_outputs ao ON ao.action_key = a.action_key
-                 JOIN blobs b ON b.blob_hash = ao.blob_hash
-                 WHERE a.kind = 'theorem_shard' AND a.status = 'completed' AND a.trust_domain = ?1
-                   AND (?1 != 'trusted' OR b.trust_domain = 'trusted')",
-            )?;
-            let mut rows = scan_stmt.query(params![trust_domain])?;
-            while let Some(row) = rows.next()? {
-                db_map.insert(
-                    row.get::<_, String>(0)?,
-                    (row.get::<_, String>(1)?, row.get::<_, i64>(2)?),
-                );
-            }
-        }
-        let mut touched_blobs = std::collections::HashSet::new();
-        let mut hit_keys_in_order = Vec::with_capacity(shard_keys.len());
-        for key in shard_keys {
-            if let Some((blob_hash, last_acc)) = db_map.get(key) {
-                hit_keys_in_order.push(key.as_str());
-                if now - *last_acc >= 60 {
-                    touched_blobs.insert(blob_hash.clone());
-                }
-                hits.insert(key.clone(), blob_hash.clone());
-            }
-        }
-        if !hit_keys_in_order.is_empty() {
-            if hits.len() == db_map.len() && hit_keys_in_order.len() == hits.len() {
-                tx.execute(
-                    "UPDATE actions SET hit_count = hit_count + 1 WHERE kind = 'theorem_shard' AND status = 'completed' AND trust_domain = ?1",
-                    params![trust_domain],
-                )?;
-            } else {
-                let mut upd_action = tx.prepare_cached(
-                    "UPDATE actions SET hit_count = hit_count + 1 WHERE action_key = ?1",
-                )?;
-                for k in hit_keys_in_order {
-                    upd_action.execute(params![k])?;
-                }
-            }
-            if !touched_blobs.is_empty() {
-                let mut upd_blob =
-                    tx.prepare_cached("UPDATE blobs SET last_accessed = ?1 WHERE blob_hash = ?2")?;
-                for bh in touched_blobs {
-                    upd_blob.execute(params![now, &bh])?;
-                }
-            }
-            tx.commit()?;
-        }
-    } else {
-        let mut hit_rows: Vec<(&str, String, i64)> = Vec::new();
-        {
-            let mut sel_stmt = conn.prepare_cached(
-                "SELECT ao.blob_hash, b.last_accessed FROM actions a
-                 JOIN action_outputs ao ON ao.action_key = a.action_key
-                 JOIN blobs b ON b.blob_hash = ao.blob_hash
-                 WHERE a.action_key = ?1 AND a.status = 'completed' AND a.trust_domain = ?2
-                   AND (?2 != 'trusted' OR b.trust_domain = 'trusted') LIMIT 1",
-            )?;
-            for key in shard_keys {
-                if let Some((blob_hash, last_acc)) = sel_stmt
-                    .query_row(params![key, trust_domain], |r| {
-                        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-                    })
-                    .optional()?
-                {
-                    hit_rows.push((key.as_str(), blob_hash.clone(), last_acc));
-                    hits.insert(key.clone(), blob_hash);
-                }
-            }
-        }
-        if !hit_rows.is_empty() {
-            let tx = conn.unchecked_transaction()?;
-            {
-                let mut upd_action = tx.prepare_cached(
-                    "UPDATE actions SET hit_count = hit_count + 1 WHERE action_key = ?1",
-                )?;
-                let mut upd_blob =
-                    tx.prepare_cached("UPDATE blobs SET last_accessed = ?1 WHERE blob_hash = ?2")?;
-                let mut touched_blobs = std::collections::HashSet::new();
-                for (key, blob_hash, last_acc) in hit_rows {
-                    upd_action.execute(params![key])?;
-                    if now - last_acc >= 60 && touched_blobs.insert(blob_hash.clone()) {
-                        upd_blob.execute(params![now, &blob_hash])?;
-                    }
-                }
-            }
-            tx.commit()?;
-        }
-    }
-    Ok(hits)
 }
 
 /// Batch-insert or update imported `.tlpack` blobs, actions, and action_outputs inside a single
@@ -4433,39 +4433,92 @@ pub(crate) enum BlobDisk {
     Torn,
 }
 
-/// Classify the CAS file at `path` by size alone (no hashing): a raw blob has `len == expected`,
-/// a cold `TLZ1` blob carries the raw length in its 12-byte header.
-pub(crate) fn probe_blob_file(path: &Path, expected_len: u64) -> BlobDisk {
-    let Ok(meta) = fs::metadata(path) else {
-        return BlobDisk::Missing;
-    };
-    if meta.len() == expected_len {
-        return BlobDisk::Intact(meta);
+/// Read a CAS blob (raw or `TLZ1`-compressed) and verify its uncompressed length (when supplied)
+/// and BLAKE3 digest against `expected_hash`.
+pub(crate) fn read_cas_blob_verified(
+    path: &Path,
+    expected_hash: &str,
+    expected_len: Option<u64>,
+) -> Option<Vec<u8>> {
+    let disk_bytes = fs::read(path).ok()?;
+    if let Some(exp) = expected_len {
+        if disk_bytes.len() as u64 == exp
+            && blake3::hash(&disk_bytes).to_hex().as_str() == expected_hash
+        {
+            return Some(disk_bytes);
+        }
+    } else if blake3::hash(&disk_bytes).to_hex().as_str() == expected_hash {
+        return Some(disk_bytes);
     }
-    let mut hdr = [0u8; 12];
-    let tlz1_len = File::open(path)
-        .and_then(|mut f| f.read_exact(&mut hdr))
-        .ok()
-        .filter(|_| &hdr[..4] == b"TLZ1")
-        .map(|_| u64::from_le_bytes(hdr[4..].try_into().unwrap()));
-    if tlz1_len == Some(expected_len) {
-        BlobDisk::Intact(meta)
-    } else {
-        BlobDisk::Torn
+    if disk_bytes.len() >= 12 && &disk_bytes[..4] == b"TLZ1" {
+        let hdr_len = u64::from_le_bytes(disk_bytes[4..12].try_into().ok()?);
+        if expected_len.is_some_and(|exp| hdr_len != exp) {
+            return None;
+        }
+        let raw = decompress_tlz1(&disk_bytes)?;
+        if raw.len() as u64 == hdr_len && blake3::hash(&raw).to_hex().as_str() == expected_hash {
+            return Some(raw);
+        }
     }
+    None
 }
 
-/// Atomically publish `bytes` as the CAS blob `dest` through a unique staging file under
-/// `<store_root>/staging`, so a partially written final blob is never observable. A missing
-/// `dest` is created with `link` (never clobbering a concurrent valid writer); `replace` swaps
-/// a torn file out with `rename`. Returns the inode of the published file.
-pub(crate) fn write_blob_atomic(
+/// Classify the CAS file at `path` by verifying both its uncompressed length (`expected_len`) and
+/// its BLAKE3 digest (`expected_hash`), transparently decompressing cold `TLZ1` blobs.
+pub(crate) fn probe_blob_digest(path: &Path, expected_hash: &str, expected_len: u64) -> BlobDisk {
+    let mut f = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return BlobDisk::Missing,
+        Err(_) => return BlobDisk::Torn,
+    };
+    let Ok(meta) = f.metadata() else {
+        return BlobDisk::Torn;
+    };
+    let mut buf = Vec::with_capacity(meta.len().min(64 * 1024 * 1024) as usize);
+    if f.read_to_end(&mut buf).is_err() {
+        return BlobDisk::Torn;
+    }
+    if buf.len() as u64 == expected_len && blake3::hash(&buf).to_hex().as_str() == expected_hash {
+        return BlobDisk::Intact(meta);
+    }
+    if buf.len() >= 12 && &buf[..4] == b"TLZ1" {
+        let hdr_len = u64::from_le_bytes(buf[4..12].try_into().unwrap());
+        if hdr_len == expected_len
+            && decompress_tlz1(&buf)
+                .is_some_and(|raw| blake3::hash(&raw).to_hex().as_str() == expected_hash)
+        {
+            return BlobDisk::Intact(meta);
+        }
+    }
+    BlobDisk::Torn
+}
+
+fn verify_blob_payload_matches_hash(hash: &str, bytes: &[u8]) -> Result<u64> {
+    if blake3::hash(bytes).to_hex().as_str() == hash {
+        return Ok(bytes.len() as u64);
+    }
+    if bytes.len() >= 12 && &bytes[..4] == b"TLZ1" {
+        let raw_len = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
+        if let Some(raw) = decompress_tlz1(bytes) {
+            if raw.len() as u64 == raw_len && blake3::hash(&raw).to_hex().as_str() == hash {
+                return Ok(raw_len);
+            }
+        }
+    }
+    anyhow::bail!(
+        "Refusing to publish CAS blob {}: payload digest does not match supplied hash",
+        hash
+    )
+}
+
+pub(crate) fn write_blob_bytes_checked(
     store_root: &Path,
     dest: &Path,
     hash: &str,
     bytes: &[u8],
     replace: bool,
 ) -> Result<i64> {
+    let expected_raw_len = verify_blob_payload_matches_hash(hash, bytes)?;
     let staging_dir = store_root.join("staging");
     let staging_dirs = ensure_dir_tracking(&staging_dir, store_root)?;
     let mut created_dirs = match dest.parent() {
@@ -4489,11 +4542,10 @@ pub(crate) fn write_blob_atomic(
             match fs::hard_link(staging_path, dst) {
                 Ok(()) => Ok(staged_ino),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Lost a race (or a pre-fix writer left a partial file): keep a complete
-                    // blob (and still sync its bytes before `sync_published` syncs its directory
-                    // chain in case the winner has not finished its barriers yet), otherwise
-                    // replace it with ours.
-                    match probe_blob_file(dst, bytes.len() as u64) {
+                    // Lost a race (or a pre-fix writer left a partial/corrupt file): keep an
+                    // intact digest-verified blob (and still sync its bytes before `sync_published`
+                    // syncs its directory chain), otherwise replace it with ours.
+                    match probe_blob_digest(dst, hash, expected_raw_len) {
                         BlobDisk::Intact(m) => {
                             let peer_f = File::open(dst)?;
                             durability_barrier(&peer_f)?;
@@ -4512,10 +4564,31 @@ pub(crate) fn write_blob_atomic(
     Ok(ino)
 }
 
-/// Ensure `dest` holds a complete, crash-durable copy of `bytes`: write it when missing, rewrite
-/// it when torn, and sync its containing directory + ancestor chain up to `store_root` when an
-/// existing copy is reused (so a concurrent publisher that has not yet synced its directory entry
-/// cannot leave our caller's marker pointing at a non-durable blob).
+/// Atomically publish raw `bytes` (whose BLAKE3 digest MUST equal `hash`) as the CAS blob `dest`
+/// through a unique staging file under `<store_root>/staging`, so neither a partially written nor
+/// a hash-mismatched final blob is ever observable. A missing `dest` is created with `link` (never
+/// clobbering a concurrent digest-verified writer); `replace` swaps a torn/corrupt file out with
+/// `rename`. Returns the inode of the published file.
+pub(crate) fn write_blob_atomic(
+    store_root: &Path,
+    dest: &Path,
+    hash: &str,
+    bytes: &[u8],
+    replace: bool,
+) -> Result<i64> {
+    if blake3::hash(bytes).to_hex().as_str() != hash {
+        anyhow::bail!(
+            "Refusing to publish CAS blob {}: raw payload digest does not match supplied hash",
+            hash
+        );
+    }
+    write_blob_bytes_checked(store_root, dest, hash, bytes, replace)
+}
+
+/// Ensure `dest` holds a complete, digest-verified, crash-durable copy of raw `bytes` (whose
+/// BLAKE3 digest MUST equal `hash`): write it when missing, rewrite it when torn/corrupt, and sync
+/// its containing directory + ancestor chain up to `store_root` when an existing verified copy is
+/// reused.
 pub(crate) fn ensure_blob_file(
     store_root: &Path,
     dest: &Path,
@@ -4523,11 +4596,17 @@ pub(crate) fn ensure_blob_file(
     bytes: &[u8],
     known_missing: bool,
 ) -> Result<(i64, i64)> {
+    if blake3::hash(bytes).to_hex().as_str() != hash {
+        anyhow::bail!(
+            "Refusing to publish CAS blob {}: raw payload digest does not match supplied hash",
+            hash
+        );
+    }
     let len = bytes.len() as u64;
     let state = if known_missing {
         BlobDisk::Missing
     } else {
-        probe_blob_file(dest, len)
+        probe_blob_digest(dest, hash, len)
     };
     match state {
         BlobDisk::Intact(meta) => {
@@ -4901,17 +4980,17 @@ mod tests {
             rel_path: "D.olean".to_string(),
         };
 
-        // A cold TLZ1 blob is intact by its header length, and writers report the raw size.
+        // A cold TLZ1 blob is intact by its decompressed digest, and writers report the raw size.
         assert!(store.run_gc(u64::MAX, 7 * 86400, true)?.compressed_blobs >= 1);
         assert!(fs::metadata(&path)?.len() < payload.len() as u64);
         assert!(matches!(
-            probe_blob_file(&path, payload.len() as u64),
+            probe_blob_digest(&path, &bh, payload.len() as u64),
             BlobDisk::Intact(_)
         ));
         let (_, sz) = ensure_blob_file(&dir, &path, &bh, &payload, false)?;
         assert_eq!(sz, payload.len() as i64);
         assert!(matches!(
-            probe_blob_file(&path, payload.len() as u64 + 1),
+            probe_blob_digest(&path, &bh, payload.len() as u64 + 1),
             BlobDisk::Torn
         ));
 
@@ -5066,7 +5145,7 @@ mod tests {
             "shard_key_beta".to_string(),
             "shard_key_missing".to_string(),
         ];
-        let hits1 = batch_get_theorem_shards(&store.conn, &query_keys)?;
+        let hits1 = store.batch_get_theorem_shards(&query_keys, "trusted")?;
         assert!(
             hits1.len() == 2
                 && hits1.contains_key("shard_key_alpha")
@@ -5621,7 +5700,7 @@ mod tests {
         let evs = take_log();
         let done_pos = evs
             .iter()
-            .position(|s| s.starts_with("file:durable_act."))
+            .position(|s| s.starts_with("file:.durable_act.done."))
             .expect(".done staging file synced before rename");
         let locks_after_done = evs[done_pos..]
             .iter()
@@ -6484,6 +6563,156 @@ mod tests {
         assert!(
             err_store.blob_path(&live_bh).exists(),
             "GC must fail closed on SQLite reachability errors without unlinking CAS blobs"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_action_and_shard_cache_hits_verify_blob_digest_and_reject_mismatched_writes(
+    ) -> Result<()> {
+        let (dir, mut store) = tmp_store("digest_gate_and_checked_write")?;
+        let tc = "leanprover/lean4:v4.35.0";
+
+        // 1. `write_blob_atomic` and `ensure_blob_file` reject payloads whose BLAKE3 digest
+        //    does not match `hash`, without leaving a file at `dest`.
+        let valid_payload = b"verified-olean-payload-".repeat(40);
+        let valid_bh = blake3::hash(&valid_payload).to_hex().to_string();
+        let wrong_dest = store.blob_path(&valid_bh);
+        assert!(write_blob_atomic(&dir, &wrong_dest, &valid_bh, b"wrong-bytes", false).is_err());
+        assert!(!wrong_dest.exists());
+        assert!(ensure_blob_file(&dir, &wrong_dest, &valid_bh, b"wrong-bytes", false).is_err());
+        assert!(!wrong_dest.exists());
+
+        // 2. Publish a valid action + `.done` marker and a theorem shard receipt.
+        let bh = store.store_immutable_blob(&valid_payload, "olean", "trusted", 1)?;
+        let blob_path = store.blob_path(&bh);
+        let entry = BlobEntry {
+            blob_hash: bh.clone(),
+            kind: "olean".to_string(),
+            size_bytes: valid_payload.len() as u64,
+            rel_path: "DigestChecked.olean".to_string(),
+        };
+        let lease = match store.acquire_singleflight("act_digest", tc, "olean", "trusted")? {
+            SingleflightOutcome::Leader(l) => l,
+            _ => panic!("expected leader"),
+        };
+        store.publish_action(&lease, std::slice::from_ref(&entry), 3, 0, 0, "trusted")?;
+        store.write_singleflight_done("act_digest", std::slice::from_ref(&entry))?;
+        drop(lease);
+
+        let shard_bytes = b"{\"decl\":\"thm_digest\",\"lean_args_digest\":\"\"}".to_vec();
+        let shard_bh = blake3::hash(&shard_bytes).to_hex().to_string();
+        store.batch_publish_theorem_shards(
+            tc,
+            "trusted",
+            &[(
+                "shard_digest".to_string(),
+                "thm_digest".to_string(),
+                shard_bytes.clone(),
+                2,
+            )],
+        )?;
+        let shard_path = store.blob_path(&shard_bh);
+
+        let all_keys = vec!["act_digest".to_string(), "shard_digest".to_string()];
+        assert_eq!(
+            store
+                .batch_completed_action_keys(&all_keys, "trusted")?
+                .len(),
+            2
+        );
+        assert!(store.has_cached_action_readonly("act_digest", "trusted")?);
+        assert!(store.get_cached_action("act_digest", "trusted")?.is_some());
+        assert_eq!(
+            store
+                .batch_get_theorem_shards(&["shard_digest".to_string()], "trusted")?
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .batch_get_theorem_shards_readonly(&["shard_digest".to_string()], "trusted")?
+                .len(),
+            1
+        );
+
+        // 3. Same-size payload corruption on disk must miss EVERY cache query (`.done` fast path,
+        //    `get_cached_action`, `has_cached_action_readonly`, `batch_completed_action_keys`,
+        //    `batch_get_theorem_shards`, and `batch_get_theorem_shards_readonly`) without bumping `hit_count`.
+        let mut corrupt_olean = valid_payload.clone();
+        corrupt_olean[0] ^= 0xFF;
+        assert_eq!(corrupt_olean.len(), valid_payload.len());
+        fs::remove_file(&blob_path)?;
+        fs::write(&blob_path, &corrupt_olean)?;
+
+        let mut corrupt_shard = shard_bytes.clone();
+        corrupt_shard[0] ^= 0xFF;
+        assert_eq!(corrupt_shard.len(), shard_bytes.len());
+        fs::remove_file(&shard_path)?;
+        fs::write(&shard_path, &corrupt_shard)?;
+
+        let hits_before: i64 = store.conn.query_row(
+            "SELECT hit_count FROM actions WHERE action_key = 'shard_digest'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert!(store.get_cached_action("act_digest", "trusted")?.is_none());
+        assert!(store
+            .get_cached_action_no_hit_bump("act_digest", "trusted")?
+            .is_none());
+        assert!(!store.has_cached_action_readonly("act_digest", "trusted")?);
+        assert!(store
+            .batch_completed_action_keys(&all_keys, "trusted")?
+            .is_empty());
+        assert!(store
+            .batch_get_theorem_shards(&["shard_digest".to_string()], "trusted")?
+            .is_empty());
+        assert!(store
+            .batch_get_theorem_shards_readonly(&["shard_digest".to_string()], "trusted")?
+            .is_empty());
+        let hits_after: i64 = store.conn.query_row(
+            "SELECT hit_count FROM actions WHERE action_key = 'shard_digest'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(
+            hits_after, hits_before,
+            "corrupt shard must not bump hit_count"
+        );
+        match store.acquire_singleflight("act_digest", tc, "olean", "trusted")? {
+            SingleflightOutcome::Leader(l) => drop(l),
+            SingleflightOutcome::CacheHit { .. } => {
+                panic!("corrupt blob behind .done marker must not produce CacheHit")
+            }
+        }
+
+        // 4. Same-uncompressed-length forged `TLZ1` cold blob (valid TLZ1 stream of different bytes
+        //    decompressing to `valid_payload.len()`) must also be rejected as Torn by `probe_blob_digest`
+        //    and repaired by `ensure_blob_file`.
+        let forged_raw = vec![b'X'; valid_payload.len()];
+        let forged_tlz1 = compress_tlz1(&forged_raw);
+        fs::remove_file(&blob_path)?;
+        fs::write(&blob_path, &forged_tlz1)?;
+        assert!(matches!(
+            probe_blob_digest(&blob_path, &bh, valid_payload.len() as u64),
+            BlobDisk::Torn
+        ));
+        assert!(store.get_cached_action("act_digest", "trusted")?.is_none());
+        assert!(store.ensure_blob_uncompressed(&bh).is_err());
+        assert!(
+            !blob_path.exists(),
+            "corrupt TLZ1 blob must be unlinked for self-healing"
+        );
+
+        ensure_blob_file(&dir, &blob_path, &bh, &valid_payload, false)?;
+        ensure_blob_file(&dir, &shard_path, &shard_bh, &shard_bytes, false)?;
+        assert_eq!(
+            store
+                .batch_completed_action_keys(&all_keys, "trusted")?
+                .len(),
+            2
         );
 
         let _ = fs::remove_dir_all(&dir);

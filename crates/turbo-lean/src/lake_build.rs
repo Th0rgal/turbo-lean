@@ -2918,7 +2918,7 @@ pub(crate) fn stage_lake_build_outputs(
             }
         };
         let ino = if matches!(
-            crate::db::probe_blob_file(&dest, entry.size_bytes),
+            crate::db::probe_blob_digest(&dest, &entry.blob_hash, entry.size_bytes),
             crate::db::BlobDisk::Intact(_)
         ) {
             let f = fs::File::open(&dest)?;
@@ -2929,12 +2929,12 @@ pub(crate) fn stage_lake_build_outputs(
             sync_shared(&dest);
             dest_ino(&dest)
         } else if (matches!(
-            crate::db::probe_blob_file(&shared_p, entry.size_bytes),
+            crate::db::probe_blob_digest(&shared_p, &entry.blob_hash, entry.size_bytes),
             crate::db::BlobDisk::Intact(_)
         ) && crate::db::publish_durable_link(&shared_p, &dest, &[]).is_ok())
             || (has_distinct_fallback
                 && matches!(
-                    crate::db::probe_blob_file(&fallback_p, entry.size_bytes),
+                    crate::db::probe_blob_digest(&fallback_p, &entry.blob_hash, entry.size_bytes),
                     crate::db::BlobDisk::Intact(_)
                 )
                 && crate::db::publish_durable_link(&fallback_p, &dest, &[]).is_ok())
@@ -3035,7 +3035,7 @@ pub fn dedup_worktree_packages(
     if lake_dir.is_dir() {
         let _pub_guard = crate::db::acquire_cas_publication_guard(&store.root)?;
         let mut stack = vec![lake_dir];
-        let mut seen_hash_cache: HashMap<(u64, u64), String> = HashMap::new();
+        let mut seen_hash_cache: HashMap<(u64, u64), (String, u64)> = HashMap::new();
         while let Some(dir) = stack.pop() {
             let Ok(entries) = fs::read_dir(&dir) else {
                 continue;
@@ -3087,11 +3087,13 @@ pub fn dedup_worktree_packages(
                     || name.ends_with(".olean.server")
                     || name.ends_with(".ilean");
                 if is_dedup_ext && path.starts_with(&packages_dir) {
-                    let Ok(meta) = entry.metadata() else {
+                    let Ok(mut src_file) = fs::File::open(&path) else {
                         continue;
                     };
-                    let sz = meta.len();
-                    if sz == 0 {
+                    let Ok(meta) = src_file.metadata() else {
+                        continue;
+                    };
+                    if meta.len() == 0 {
                         continue;
                     }
                     #[cfg(unix)]
@@ -3099,18 +3101,28 @@ pub fn dedup_worktree_packages(
                     #[cfg(not(unix))]
                     let file_ino = (0u64, 0u64);
 
-                    let hash_hex = if let Some(h) = seen_hash_cache.get(&file_ino) {
-                        h.clone()
+                    let mut read_bytes: Option<Vec<u8>> = None;
+                    let (hash_hex, sz) = if let Some((h, cached_sz)) =
+                        seen_hash_cache.get(&file_ino).filter(|(_, csz)| {
+                            #[cfg(unix)]
+                            let ro = (meta.permissions().mode() & 0o222) == 0;
+                            #[cfg(not(unix))]
+                            let ro = false;
+                            ro && *csz == meta.len()
+                        }) {
+                        (h.clone(), *cached_sz)
                     } else {
-                        let Ok(bytes) = fs::read(&path) else {
+                        use std::io::Read;
+                        let mut bytes = Vec::with_capacity(meta.len() as usize);
+                        if src_file.read_to_end(&mut bytes).is_err() || bytes.is_empty() {
                             continue;
-                        };
-                        let h = blake3::hash(&bytes).to_hex().to_string();
-                        if file_ino.1 != 0 {
-                            seen_hash_cache.insert(file_ino, h.clone());
                         }
-                        h
+                        let actual_sz = bytes.len() as u64;
+                        let h = blake3::hash(&bytes).to_hex().to_string();
+                        read_bytes = Some(bytes);
+                        (h, actual_sz)
                     };
+                    drop(src_file);
 
                     let shard_dir = pkg_cas_dir.join(&hash_hex[0..2]);
                     let Ok(created) = crate::db::ensure_dir_tracking(&shard_dir, &store.root)
@@ -3119,10 +3131,8 @@ pub fn dedup_worktree_packages(
                     };
                     let cas_file = shard_dir.join(&hash_hex);
 
-                    if let Ok(cas_meta) = fs::metadata(&cas_file)
-                        .ok()
-                        .filter(|m| m.len() == sz)
-                        .ok_or(())
+                    if let crate::db::BlobDisk::Intact(cas_meta) =
+                        crate::db::probe_blob_digest(&cas_file, &hash_hex, sz)
                     {
                         let cas_durable = fs::File::open(&cas_file)
                             .and_then(|f| crate::db::durability_barrier(&f))
@@ -3135,47 +3145,61 @@ pub fn dedup_worktree_packages(
                         #[cfg(not(unix))]
                         let same_inode = false;
 
-                        if cas_durable
-                            && !same_inode
+                        if cas_durable {
+                            if same_inode {
+                                #[cfg(unix)]
+                                if (cas_meta.permissions().mode() & 0o222) != 0 {
+                                    let mut perms = cas_meta.permissions();
+                                    perms.set_mode(0o444);
+                                    let _ = fs::set_permissions(&cas_file, perms);
+                                }
+                                if file_ino.1 != 0 {
+                                    seen_hash_cache.insert(file_ino, (hash_hex, sz));
+                                }
+                            } else if crate::db::try_reflink_or_hardlink(&cas_file, &path, Some(sz))
+                                .is_ok()
+                            {
+                                #[cfg(unix)]
+                                if let Ok(new_meta) = fs::metadata(&path) {
+                                    seen_hash_cache
+                                        .insert((new_meta.dev(), new_meta.ino()), (hash_hex, sz));
+                                }
+                                hardlinked_files += 1;
+                                deduped_bytes += sz;
+                            }
+                        }
+                    } else {
+                        let bytes = match read_bytes {
+                            Some(b) => b,
+                            None => {
+                                let Ok(b) = fs::read(&path) else {
+                                    continue;
+                                };
+                                if b.len() as u64 != sz
+                                    || blake3::hash(&b).to_hex().as_str() != hash_hex
+                                {
+                                    continue;
+                                }
+                                b
+                            }
+                        };
+                        if crate::db::ensure_blob_file(
+                            &store.root,
+                            &cas_file,
+                            &hash_hex,
+                            &bytes,
+                            false,
+                        )
+                        .is_ok()
                             && crate::db::try_reflink_or_hardlink(&cas_file, &path, Some(sz))
                                 .is_ok()
                         {
+                            #[cfg(unix)]
+                            if let Ok(new_meta) = fs::metadata(&path) {
+                                seen_hash_cache
+                                    .insert((new_meta.dev(), new_meta.ino()), (hash_hex, sz));
+                            }
                             hardlinked_files += 1;
-                            deduped_bytes += sz;
-                        }
-                    } else {
-                        #[cfg(unix)]
-                        {
-                            let mut perms = meta.permissions();
-                            if (perms.mode() & 0o222) != 0 {
-                                perms.set_mode(0o444);
-                                let _ = fs::set_permissions(&path, perms);
-                            }
-                        }
-                        let synced = fs::File::open(&path)
-                            .and_then(|f| crate::db::durability_barrier(&f))
-                            .is_ok();
-                        if synced && fs::hard_link(&path, &cas_file).is_ok() {
-                            if crate::db::sync_dir(&shard_dir).is_ok()
-                                && created.iter().all(|dir| crate::db::sync_dir(dir).is_ok())
-                            {
-                                hardlinked_files += 1;
-                            }
-                        } else if let Ok(bytes) = fs::read(&path) {
-                            if crate::db::write_blob_atomic(
-                                &store.root,
-                                &cas_file,
-                                &hash_hex,
-                                &bytes,
-                                true,
-                            )
-                            .is_ok()
-                                && created.iter().all(|dir| crate::db::sync_dir(dir).is_ok())
-                                && crate::db::try_reflink_or_hardlink(&cas_file, &path, Some(sz))
-                                    .is_ok()
-                            {
-                                hardlinked_files += 1;
-                            }
                         }
                     }
                 }
@@ -4110,6 +4134,88 @@ mod tests {
                 .exists(),
             ".turbo_verified_sources.json must not be copied into worktree"
         );
+
+        match saved_wt_env {
+            Some(v) => std::env::set_var("TURBO_LEAN_NO_WORKTREE_LINK", v),
+            None => std::env::remove_var("TURBO_LEAN_NO_WORKTREE_LINK"),
+        }
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_dedup_worktree_packages_verifies_cas_digest_and_stages_exact_bytes() -> Result<()> {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let saved_wt_env = std::env::var("TURBO_LEAN_NO_WORKTREE_LINK").ok();
+        std::env::remove_var("TURBO_LEAN_NO_WORKTREE_LINK");
+        #[cfg(unix)]
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_dedup_digest_test_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let cache_dir = tmp_dir.join("cache");
+        let wt = tmp_dir.join("wt");
+        let pkg_dir = wt.join(".lake/packages/dep/.lake/build/lib/lean/Dep");
+        fs::create_dir_all(&pkg_dir)?;
+
+        let store = TurboStore::open(Some(&cache_dir))?;
+        let good_bytes = vec![0x5Au8; 1024];
+        let good_hash = blake3::hash(&good_bytes).to_hex().to_string();
+        let cas_file = store
+            .root
+            .join("pkg_cas")
+            .join(&good_hash[..2])
+            .join(&good_hash);
+        fs::create_dir_all(cas_file.parent().unwrap())?;
+        // Pre-seed a corrupt `pkg_cas` entry with the EXACT same byte length (1024 bytes).
+        fs::write(&cas_file, vec![0xFFu8; 1024])?;
+
+        let olean_a = pkg_dir.join("A.olean");
+        let olean_b = pkg_dir.join("B.olean");
+        fs::write(&olean_a, &good_bytes)?;
+        fs::write(&olean_b, &good_bytes)?;
+
+        // Also place two hardlinked writable files sharing an inode (`C.olean` and `D.olean`):
+        // if an external writer mutated the shared inode if it stayed writable, `seen_hash_cache`
+        // would have served a stale hash. Verify `dedup_worktree_packages` stages immutable `0o444`
+        // CAS bytes and links all matching package artifacts to the verified CAS inode.
+        let shared_bytes = vec![0x3Cu8; 768];
+        let olean_c = pkg_dir.join("C.olean");
+        let olean_d = pkg_dir.join("D.olean");
+        fs::write(&olean_c, &shared_bytes)?;
+        fs::hard_link(&olean_c, &olean_d)?;
+
+        let rep = dedup_worktree_packages(&store, &wt)?;
+        assert_eq!(rep["status"], "worktree_packages_deduped");
+        assert_eq!(
+            fs::read(&cas_file)?,
+            good_bytes,
+            "same-size corrupt pkg_cas entry must be replaced with digest-verified bytes, never linked over worktree files"
+        );
+        assert_eq!(fs::read(&olean_a)?, good_bytes);
+        assert_eq!(fs::read(&olean_b)?, good_bytes);
+        assert_eq!(fs::read(&olean_c)?, shared_bytes);
+        assert_eq!(fs::read(&olean_d)?, shared_bytes);
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                fs::metadata(&olean_a)?.ino(),
+                fs::metadata(&cas_file)?.ino()
+            );
+            assert_eq!(
+                fs::metadata(&olean_b)?.ino(),
+                fs::metadata(&cas_file)?.ino()
+            );
+            assert_eq!(fs::metadata(&cas_file)?.permissions().mode() & 0o222, 0);
+            assert_eq!(fs::metadata(&olean_c)?.ino(), fs::metadata(&olean_d)?.ino());
+            assert_eq!(fs::metadata(&olean_c)?.permissions().mode() & 0o222, 0);
+        }
 
         match saved_wt_env {
             Some(v) => std::env::set_var("TURBO_LEAN_NO_WORKTREE_LINK", v),

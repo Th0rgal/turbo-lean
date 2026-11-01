@@ -1448,8 +1448,8 @@ fn option_matching_http_hits(
 ) -> Result<std::collections::HashMap<String, String>> {
     let mut hits = store.batch_get_theorem_shards_readonly(keys, trust_domain)?;
     hits.retain(|_, blob_hash| {
-        let receipt = fs::read(store.blob_path(blob_hash))
-            .ok()
+        let receipt = store
+            .read_verified_blob(blob_hash)
             .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
         receipt
             .as_ref()

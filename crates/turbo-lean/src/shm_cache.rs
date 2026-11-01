@@ -589,7 +589,7 @@ impl StagedTempFile {
                 fs::create_dir_all(parent)?;
             }
         }
-        let lease = acquire_flock(&staging_lease_lock_path(&path), false, false)?;
+        let lease = acquire_staging_lease(&staging_lease_lock_path(&path))?;
         Ok(Self {
             path,
             _lease: lease,
@@ -651,30 +651,72 @@ fn path_nofollow_inode_key(path: &Path) -> Option<(u64, u64)> {
     fs::symlink_metadata(path).ok().map(|m| (m.dev(), m.ino()))
 }
 
-fn try_lock_unheld_sidecar(lock_path: &Path) -> Option<FlockGuard> {
-    let mut opts = fs::OpenOptions::new();
-    opts.read(true).write(true).create(false);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut opts, libc::O_NOFOLLOW);
-    let f = opts.open(lock_path).ok()?;
-    let guard = flock_file(f, true, true).ok()??;
-    #[cfg(unix)]
-    if file_inode_key(&guard.0) != path_nofollow_inode_key(lock_path) {
-        return None;
+#[cfg(unix)]
+fn inode_matches_nofollow(f: &fs::File, path: &Path) -> bool {
+    matches!(
+        (file_inode_key(f), path_nofollow_inode_key(path)),
+        (Some(a), Some(b)) if a == b
+    )
+}
+
+fn acquire_staging_lease(lock_path: &Path) -> std::io::Result<Option<FlockGuard>> {
+    for attempt in 0..4096u32 {
+        let Some(guard) = acquire_flock(lock_path, false, false)? else {
+            continue;
+        };
+        #[cfg(unix)]
+        if !inode_matches_nofollow(&guard.0, lock_path) {
+            drop(guard);
+            if attempt >= 4 {
+                std::thread::yield_now();
+            }
+            continue;
+        }
+        #[cfg(not(unix))]
+        let _ = attempt;
+        return Ok(Some(guard));
     }
-    Some(guard)
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "staging lease sidecar contended during acquisition",
+    ))
+}
+
+fn try_lock_sidecar(lock_path: &Path, create: bool) -> Option<FlockGuard> {
+    for _ in 0..16u8 {
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true).write(true).create(create).truncate(false);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::custom_flags(&mut opts, libc::O_NOFOLLOW);
+        let f = opts.open(lock_path).ok()?;
+        let guard = flock_file(f, true, true).ok()??;
+        #[cfg(unix)]
+        if !inode_matches_nofollow(&guard.0, lock_path) {
+            drop(guard);
+            if create {
+                continue;
+            }
+            return None;
+        }
+        return Some(guard);
+    }
+    None
+}
+
+fn try_lock_unheld_sidecar(lock_path: &Path) -> Option<FlockGuard> {
+    try_lock_sidecar(lock_path, false)
 }
 
 pub fn try_remove_unleased_staged_file(target: &Path) -> bool {
-    let lock_path = staging_lease_lock_path(target);
-    if !lock_path.exists() {
-        return fs::remove_file(target).is_ok();
+    if fs::symlink_metadata(target).is_err() {
+        return false;
     }
-    let Some(guard) = try_lock_unheld_sidecar(&lock_path) else {
+    let lock_path = staging_lease_lock_path(target);
+    let Some(guard) = try_lock_sidecar(&lock_path, true) else {
         return false;
     };
     let removed = fs::remove_file(target).is_ok();
-    if !target.exists() {
+    if fs::symlink_metadata(target).is_err() {
         let _ = fs::remove_file(&lock_path);
     }
     drop(guard);
@@ -690,11 +732,13 @@ pub fn reap_stale_lock_if_unheld(lock_path: &Path) -> bool {
             .strip_prefix('.')
             .and_then(|s| s.strip_suffix(".lease.lock"))
         {
-            if lock_path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(orig)
-                .exists()
+            if fs::symlink_metadata(
+                lock_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(orig),
+            )
+            .is_ok()
             {
                 return false;
             }
@@ -707,7 +751,11 @@ pub fn reap_stale_lock_if_unheld(lock_path: &Path) -> bool {
 
 pub fn is_staging_lease_held(target: &Path) -> bool {
     let lock_path = staging_lease_lock_path(target);
-    lock_path.exists() && try_lock_unheld_sidecar(&lock_path).is_none()
+    #[cfg(unix)]
+    let exists = path_nofollow_inode_key(&lock_path).is_some();
+    #[cfg(not(unix))]
+    let exists = lock_path.exists();
+    exists && try_lock_unheld_sidecar(&lock_path).is_none()
 }
 
 fn scan_evictable_shm_files(
@@ -1342,6 +1390,140 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&base_dir);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_staged_temp_file_reserve_races_cleanup_and_gc_without_orphaned_lease(
+    ) -> anyhow::Result<()> {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Barrier,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "turbo_lease_race_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let store_root = root.join("store");
+        let staging = store_root.join("staging");
+        let spill = root.join("spill");
+        let _ = crate::db::TurboStore::open(Some(&store_root))?;
+
+        // 1. Deterministic step-by-step interleaving of the exact P2 #3 window:
+        //    writer opens `.lease.lock` BEFORE `flock(LOCK_SH)`, concurrent reaper acquires
+        //    `LOCK_EX` and unlinks the sidecar because `target` does not exist yet, and
+        //    `acquire_staging_lease` must detect the unlinked fd and re-bind to a live sidecar.
+        let det_target = staging.join("deterministic_race.lean");
+        let det_lock = staging_lease_lock_path(&det_target);
+        fs::create_dir_all(&staging)?;
+        let pre_opened = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&det_lock)?;
+        assert!(reap_stale_lock_if_unheld(&det_lock));
+        let stale_guard = flock_file(pre_opened, false, false)?.expect("flock on unlinked fd");
+        assert!(
+            !inode_matches_nofollow(&stale_guard.0, &det_lock),
+            "unlinked sidecar fd must fail pathname inode validation"
+        );
+        drop(stale_guard);
+
+        let leased = StagedTempFile::write(det_target.clone(), b"-- active staged source\n")?;
+        assert!(is_staging_lease_held(&det_target));
+        assert!(!reap_stale_lock_if_unheld(&det_lock));
+        assert!(!try_remove_unleased_staged_file(&det_target));
+        drop(leased);
+        assert!(!det_target.exists() && !det_lock.exists());
+
+        // 2. Multi-threaded stress race: writers repeatedly `reserve` + write + hold + verify
+        //    against concurrent `reap_stale_lock_if_unheld`, `try_remove_unleased_staged_file`,
+        //    `enforce_shm_quota_lru`, `spill_shm_to_disk_dir`, and `TurboStore::run_gc(0, ...)`.
+        let slots: Arc<Vec<PathBuf>> = Arc::new(
+            (0..4)
+                .map(|i| staging.join(format!("slot_{i}.lean")))
+                .collect(),
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let barrier = Arc::new(Barrier::new(7));
+        let mut handles = Vec::new();
+
+        for (wi, slot) in slots.iter().cloned().enumerate() {
+            let bar = Arc::clone(&barrier);
+            let stop_flag = Arc::clone(&stop);
+            handles.push(std::thread::spawn(move || -> anyhow::Result<()> {
+                bar.wait();
+                for iter in 0..120u32 {
+                    let g = StagedTempFile::reserve(slot.clone())?;
+                    let lock_p = staging_lease_lock_path(g.path());
+                    anyhow::ensure!(
+                        is_staging_lease_held(g.path()),
+                        "writer {wi} iter {iter}: lease not discoverable right after reserve"
+                    );
+                    let payload = format!("-- writer {wi} iter {iter}\n");
+                    fs::write(g.path(), payload.as_bytes())?;
+                    std::thread::yield_now();
+                    anyhow::ensure!(
+                        is_staging_lease_held(g.path()) && lock_p.exists(),
+                        "writer {wi} iter {iter}: sidecar unlinked while lease held"
+                    );
+                    let got = fs::read(g.path())?;
+                    anyhow::ensure!(
+                        got == payload.as_bytes(),
+                        "writer {wi} iter {iter}: active staged file mutated or truncated"
+                    );
+                    drop(g);
+                }
+                stop_flag.store(true, Ordering::Release);
+                Ok(())
+            }));
+        }
+
+        for cleaner_id in 0..2usize {
+            let bar = Arc::clone(&barrier);
+            let stop_flag = Arc::clone(&stop);
+            let paths = Arc::clone(&slots);
+            let staging_dir = staging.clone();
+            let spill_dir = spill.join(format!("c{cleaner_id}"));
+            handles.push(std::thread::spawn(move || -> anyhow::Result<()> {
+                bar.wait();
+                while !stop_flag.load(Ordering::Acquire) {
+                    for p in paths.iter() {
+                        let lp = staging_lease_lock_path(p);
+                        let _ = reap_stale_lock_if_unheld(&lp);
+                        let _ = try_remove_unleased_staged_file(p);
+                    }
+                    let _ = enforce_shm_quota_lru(&staging_dir, 1);
+                    let _ = spill_shm_to_disk_dir(&staging_dir, &spill_dir, 0);
+                }
+                Ok(())
+            }));
+        }
+
+        {
+            let bar = Arc::clone(&barrier);
+            let stop_flag = Arc::clone(&stop);
+            let gc_root = store_root.clone();
+            handles.push(std::thread::spawn(move || -> anyhow::Result<()> {
+                let mut gc_store = crate::db::TurboStore::open(Some(&gc_root))?;
+                bar.wait();
+                while !stop_flag.load(Ordering::Acquire) {
+                    let _ = gc_store.run_gc(0, 7 * 86400, true);
+                    std::thread::yield_now();
+                }
+                Ok(())
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("race thread panicked")?;
+        }
+
+        let _ = fs::remove_dir_all(&root);
         Ok(())
     }
 }

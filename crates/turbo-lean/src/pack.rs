@@ -1671,7 +1671,8 @@ pub fn prestage_blobs_from_shared_cas(
                     let _ = crate::db::sync_dir(dir);
                 }
             };
-            if let crate::db::BlobDisk::Intact(m) = crate::db::probe_blob_file(&dest, b.size_bytes)
+            if let crate::db::BlobDisk::Intact(m) =
+                crate::db::probe_blob_digest(&dest, &b.blob_hash, b.size_bytes)
             {
                 let durable = fs::File::open(&dest)
                     .and_then(|f| crate::db::durability_barrier(&f))
@@ -1692,11 +1693,11 @@ pub fn prestage_blobs_from_shared_cas(
             let shared_p = shared_blobs.join(prefix).join(&b.blob_hash);
             let shared_p_alt = shared_blobs_shm.join(prefix).join(&b.blob_hash);
             let shared_ok = matches!(
-                crate::db::probe_blob_file(&shared_p, b.size_bytes),
+                crate::db::probe_blob_digest(&shared_p, &b.blob_hash, b.size_bytes),
                 crate::db::BlobDisk::Intact(_)
             );
             let shared_alt_ok = matches!(
-                crate::db::probe_blob_file(&shared_p_alt, b.size_bytes),
+                crate::db::probe_blob_digest(&shared_p_alt, &b.blob_hash, b.size_bytes),
                 crate::db::BlobDisk::Intact(_)
             );
             let link_res = if shared_ok {
@@ -1730,7 +1731,7 @@ pub fn prestage_blobs_from_shared_cas(
                     0i64
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    match crate::db::probe_blob_file(&dest, b.size_bytes) {
+                    match crate::db::probe_blob_digest(&dest, &b.blob_hash, b.size_bytes) {
                         crate::db::BlobDisk::Intact(m) => {
                             let durable = fs::File::open(&dest)
                                 .and_then(|f| crate::db::durability_barrier(&f))
@@ -1940,13 +1941,17 @@ pub(crate) fn finish_import_from_prestaged_shared_cas_inner(
     let mut effective_newly_written = total_newly_written;
     let missing_on_disk = staged_blobs.iter().any(|(bh, _, sz, _)| {
         !matches!(
-            crate::db::probe_blob_file(&store.blob_path(bh), (*sz).max(0) as u64),
+            crate::db::probe_blob_digest(&store.blob_path(bh), bh, (*sz).max(0) as u64),
             crate::db::BlobDisk::Intact(_)
         )
     }) || manifest.actions.iter().any(|a| {
         a.outputs.iter().any(|o| {
             !matches!(
-                crate::db::probe_blob_file(&store.blob_path(&o.blob_hash), o.size_bytes),
+                crate::db::probe_blob_digest(
+                    &store.blob_path(&o.blob_hash),
+                    &o.blob_hash,
+                    o.size_bytes
+                ),
                 crate::db::BlobDisk::Intact(_)
             )
         })
@@ -1959,7 +1964,11 @@ pub(crate) fn finish_import_from_prestaged_shared_cas_inner(
         for a in &manifest.actions {
             for o in &a.outputs {
                 if !matches!(
-                    crate::db::probe_blob_file(&store.blob_path(&o.blob_hash), o.size_bytes),
+                    crate::db::probe_blob_digest(
+                        &store.blob_path(&o.blob_hash),
+                        &o.blob_hash,
+                        o.size_bytes
+                    ),
                     crate::db::BlobDisk::Intact(_)
                 ) {
                     anyhow::bail!(
@@ -1996,9 +2005,13 @@ pub(crate) fn finish_import_from_prestaged_shared_cas_inner(
             .unwrap_or(0);
         if (existing_completed as usize) >= manifest.actions.len()
             && manifest.actions.iter().all(|a| {
-                store.has_completed_action_in_domain(&a.action_key, td)
+                store
+                    .has_cached_action_readonly(&a.action_key, td)
+                    .unwrap_or(false)
                     || (td == "untrusted"
-                        && store.has_completed_action_in_domain(&a.action_key, "trusted"))
+                        && store
+                            .has_cached_action_readonly(&a.action_key, "trusted")
+                            .unwrap_or(false))
             })
         {
             store.sync_sqlite_durable()?;
@@ -2245,15 +2258,15 @@ pub fn import_pack_bytes_with_policy(
             };
             let dest = root_dir.join("blobs").join(prefix).join(&b.blob_hash);
 
-            // Existing blobs are size-checked and torn ones rewritten; all writes are atomic.
+            // Existing blobs are digest-checked and torn/corrupt ones rewritten; all writes are atomic.
             #[cfg(unix)]
             let inode = {
                 use crate::db::{
-                    durability_barrier, probe_blob_file, sync_dir, write_blob_atomic, BlobDisk,
+                    durability_barrier, probe_blob_digest, sync_dir, write_blob_atomic, BlobDisk,
                 };
                 use std::os::unix::fs::MetadataExt;
                 let len = blob_bytes.len() as u64;
-                match probe_blob_file(&dest, len) {
+                match probe_blob_digest(&dest, &b.blob_hash, len) {
                     BlobDisk::Intact(m) => {
                         let f = fs::File::open(&dest)?;
                         durability_barrier(&f)?;
@@ -2364,9 +2377,13 @@ pub fn import_pack_bytes_with_policy(
             .unwrap_or(0);
         if (existing_completed as usize) >= manifest.actions.len()
             && manifest.actions.iter().all(|a| {
-                store.has_completed_action_in_domain(&a.action_key, td)
+                store
+                    .has_cached_action_readonly(&a.action_key, td)
+                    .unwrap_or(false)
                     || (td == "untrusted"
-                        && store.has_completed_action_in_domain(&a.action_key, "trusted"))
+                        && store
+                            .has_cached_action_readonly(&a.action_key, "trusted")
+                            .unwrap_or(false))
             })
         {
             return Ok((manifest.actions.len(), staged_blobs.len()));
