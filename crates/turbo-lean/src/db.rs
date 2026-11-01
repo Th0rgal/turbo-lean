@@ -2736,14 +2736,13 @@ impl TurboStore {
                 }
             } else {
                 match (open_regular_nofollow(&src), open_regular_nofollow(&dst)) {
-                    (Ok((src_f, src_meta)), Ok((mut dst_f, dst_meta))) => {
+                    (Ok((_src_f, src_meta)), Ok((mut dst_f, dst_meta))) => {
                         let dst_owned =
-                            is_store_owned_immutable_cas_inode(&dst_f, &dst_meta, &out.blob_hash);
+                            is_exclusively_created_immutable_cas_inode(&dst_meta, &out.blob_hash);
                         (src_meta.dev() == dst_meta.dev()
                             && src_meta.ino() == dst_meta.ino()
                             && dst_owned
-                            && is_store_owned_immutable_cas_inode(
-                                &src_f,
+                            && is_exclusively_created_immutable_cas_inode(
                                 &src_meta,
                                 &out.blob_hash,
                             ))
@@ -2857,7 +2856,7 @@ impl TurboStore {
         } else {
             #[cfg(unix)]
             if let Ok(meta) = f.metadata() {
-                if !is_store_owned_immutable_cas_inode(&f, &meta, blob_hash) {
+                if !is_exclusively_created_immutable_cas_inode(&meta, blob_hash) {
                     use std::io::Seek;
                     let _pub_guard = acquire_cas_publication_guard(&self.root)?;
                     if f.seek(std::io::SeekFrom::Start(0)).is_ok() {
@@ -4363,10 +4362,7 @@ where
         populate(&mut f)?;
         #[cfg(unix)]
         if let Some(hash) = immutable_cas_hash {
-            stamp_immutable_cas_inode(&f, hash);
-            let mut perms = f.metadata()?.permissions();
-            perms.set_mode(mode);
-            f.set_permissions(perms)?;
+            seal_exclusively_created_cas_inode(&f, mode, hash)?;
         }
         durability_barrier(&f)?;
         let out = publish(&f, &staging, dest)?;
@@ -4523,73 +4519,76 @@ pub(crate) fn link_regular_nofollow(src: &Path, dst: &Path) -> std::io::Result<(
     Ok(())
 }
 
-const IMMUTABLE_CAS_OWNER_XATTR: &[u8] = b"user.turbo_lean.cas_immutable\0";
+#[cfg(unix)]
+type ExclusivelyCreatedCasKey = (u64, u64);
 
 #[cfg(unix)]
-fn stamp_immutable_cas_inode(f: &File, expected_hash: &str) {
-    use std::os::unix::io::AsRawFd;
-    let val = expected_hash.as_bytes();
-    #[cfg(target_os = "linux")]
-    let _ = unsafe {
-        libc::fsetxattr(
-            f.as_raw_fd(),
-            IMMUTABLE_CAS_OWNER_XATTR.as_ptr().cast(),
-            val.as_ptr().cast(),
-            val.len(),
-            0,
-        )
-    };
-    #[cfg(target_os = "macos")]
-    let _ = unsafe {
-        libc::fsetxattr(
-            f.as_raw_fd(),
-            IMMUTABLE_CAS_OWNER_XATTR.as_ptr().cast(),
-            val.as_ptr().cast(),
-            val.len(),
-            0,
-            0,
-        )
-    };
+#[derive(Clone)]
+struct ExclusivelyCreatedCasEntry {
+    mtime: (i64, i64),
+    size: u64,
+    expected_hash: String,
 }
 
 #[cfg(unix)]
-pub(crate) fn is_store_owned_immutable_cas_inode(
+fn exclusively_created_cas_registry() -> &'static std::sync::Mutex<
+    std::collections::HashMap<ExclusivelyCreatedCasKey, ExclusivelyCreatedCasEntry>,
+> {
+    static REGISTRY: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<ExclusivelyCreatedCasKey, ExclusivelyCreatedCasEntry>,
+        >,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(unix)]
+fn seal_exclusively_created_cas_inode(
     f: &File,
+    mode: u32,
+    expected_hash: &str,
+) -> std::io::Result<()> {
+    let mut perms = f.metadata()?.permissions();
+    perms.set_mode(mode);
+    f.set_permissions(perms)?;
+    let meta = f.metadata()?;
+    let mut guard = exclusively_created_cas_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if guard.len() >= 131_072 {
+        guard.clear();
+    }
+    guard.insert(
+        (meta.dev(), meta.ino()),
+        ExclusivelyCreatedCasEntry {
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            size: meta.len(),
+            expected_hash: expected_hash.to_string(),
+        },
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn is_exclusively_created_immutable_cas_inode(
     meta: &fs::Metadata,
     expected_hash: &str,
 ) -> bool {
-    use std::os::unix::io::AsRawFd;
-    if !meta.is_file() || (meta.permissions().mode() & 0o222) != 0 {
+    if !meta.is_file()
+        || (meta.permissions().mode() & 0o222) != 0
+        || expected_hash.is_empty()
+        || expected_hash.len() > 128
+    {
         return false;
     }
-    let exp = expected_hash.as_bytes();
-    if exp.is_empty() || exp.len() > 128 {
-        return false;
-    }
-    let mut buf = [0u8; 128];
-    #[cfg(target_os = "linux")]
-    let n = unsafe {
-        libc::fgetxattr(
-            f.as_raw_fd(),
-            IMMUTABLE_CAS_OWNER_XATTR.as_ptr().cast(),
-            buf.as_mut_ptr().cast(),
-            buf.len(),
-        )
-    };
-    #[cfg(target_os = "macos")]
-    let n = unsafe {
-        libc::fgetxattr(
-            f.as_raw_fd(),
-            IMMUTABLE_CAS_OWNER_XATTR.as_ptr().cast(),
-            buf.as_mut_ptr().cast(),
-            buf.len(),
-            0,
-            0,
-        )
-    };
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let n: isize = -1;
-    n >= 0 && (n as usize) == exp.len() && &buf[..n as usize] == exp
+    let guard = exclusively_created_cas_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard.get(&(meta.dev(), meta.ino())).is_some_and(|e| {
+        e.mtime == (meta.mtime(), meta.mtime_nsec())
+            && e.size == meta.len()
+            && e.expected_hash == expected_hash
+    })
 }
 fn reserve_unique_staging_path(dir: &Path, stem: &str) -> std::io::Result<PathBuf> {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -4608,6 +4607,7 @@ fn reserve_unique_staging_path(dir: &Path, stem: &str) -> std::io::Result<PathBu
     ))
 }
 
+#[cfg(test)]
 fn clone_or_copy_from_open_file(mut src_file: &File, dst_file: &mut File) -> std::io::Result<bool> {
     #[cfg(target_os = "linux")]
     {
@@ -4627,6 +4627,7 @@ fn clone_or_copy_from_open_file(mut src_file: &File, dst_file: &mut File) -> std
 /// regular file) and hardlink via `linkat(..., 0)` when the two share a device, or stage into a
 /// private sibling file (reflink or copy from the open `src` descriptor, mode `0o444`, fsynced) and
 /// atomically rename into place otherwise.
+#[cfg(test)]
 pub(crate) fn publish_durable_link(
     src: &Path,
     dest: &Path,
@@ -4649,12 +4650,12 @@ pub(crate) fn publish_durable_link(
 }
 
 /// Publish a CAS blob from `src` to `dest`, binding BLAKE3 digest + byte-length verification to an
-/// isolated store-owned inode before atomic publication at `dest`. Only a previously stamped
-/// store-owned immutable CAS inode (`is_store_owned_immutable_cas_inode`, created exclusively via
-/// `O_CREAT | O_EXCL` with no external writable fd ever exposed) may use the same-device hardlink
-/// fast path; externally supplied or legacy inodes are snapshotted into a fresh `O_CREAT | O_EXCL`
-/// staging inode (via verified `FICLONE` or verified byte copy), stamped, `chmod 0o444`ed, fsynced,
-/// and atomically renamed onto `dest`. Returns the published destination inode.
+/// isolated store-owned inode before atomic publication at `dest`. Only an inode proven in-process
+/// to have been created exclusively by `turbo-lean` via `O_CREAT | O_EXCL` with its sole writable
+/// fd closed (`is_exclusively_created_immutable_cas_inode`) may use the same-device hardlink fast
+/// path; externally supplied or prior-process inodes are snapshotted into a fresh `O_CREAT | O_EXCL`
+/// staging inode (via verified `FICLONE` or verified byte copy), `chmod 0o444`ed, fsynced, and
+/// atomically renamed onto `dest`. Returns the published destination inode.
 pub(crate) fn publish_verified_durable_blob(
     src: &Path,
     dest: &Path,
@@ -4671,21 +4672,20 @@ pub(crate) fn publish_verified_durable_blob(
         ".{}",
         dest.file_name().and_then(|s| s.to_str()).unwrap_or("blob")
     );
-    // 1. Same-device fast path ONLY when the staged hardlink resolves to a store-owned immutable
-    //    CAS inode (`user.turbo_lean.cas_immutable == expected_hash` and `(mode & 0o222) == 0`).
-    //    Mode `0o444` alone never authorizes hardlinking because `chmod` does not revoke pre-opened
-    //    writable descriptors on externally created inodes.
+    // 1. Same-device fast path ONLY when the staged hardlink resolves to an inode exclusively
+    //    created in this process via `O_CREAT | O_EXCL` with no external writable fd ever exposed.
+    //    Filesystem metadata (`0o444`, user xattrs) alone never authorizes hardlinking.
     #[cfg(unix)]
     if let Ok(staged_link) = reserve_unique_staging_path(parent, &stem) {
         if link_regular_nofollow(src, &staged_link).is_ok() {
             let link_ok = (|| -> std::io::Result<i64> {
                 let (mut f, meta) = open_regular_nofollow(&staged_link)?;
-                if !is_store_owned_immutable_cas_inode(&f, &meta, expected_hash)
+                if !is_exclusively_created_immutable_cas_inode(&meta, expected_hash)
                     || meta.len() != expected_len
                 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        "staged hardlink is not a store-owned immutable CAS inode",
+                        "staged hardlink is not an exclusively created immutable CAS inode",
                     ));
                 }
                 let mut buf = Vec::with_capacity(expected_len.min(64 * 1024 * 1024) as usize);
@@ -5004,7 +5004,7 @@ pub(crate) fn write_blob_bytes_checked(
                         let peer_owned = {
                             #[cfg(unix)]
                             {
-                                is_store_owned_immutable_cas_inode(&peer_f, &m, hash)
+                                is_exclusively_created_immutable_cas_inode(&m, hash)
                             }
                             #[cfg(not(unix))]
                             {
@@ -5077,7 +5077,7 @@ pub(crate) fn ensure_blob_file(
             let owned_immutable = {
                 #[cfg(unix)]
                 {
-                    is_store_owned_immutable_cas_inode(&f, &meta, hash)
+                    is_exclusively_created_immutable_cas_inode(&meta, hash)
                 }
                 #[cfg(not(unix))]
                 {
@@ -5300,10 +5300,11 @@ fn install_blob_to_path_checked(
     }
 
     // 1. Try immutable hardlink (`linkat(..., 0)`, no symlink following) to a private staging path
-    //    ONLY when the staged inode is a stamped store-owned immutable CAS inode (`0o444` +
-    //    `user.turbo_lean.cas_immutable` matching the verified digest). Externally supplied or
-    //    unstamped `0o444` files fall through to fresh-inode isolation so retained writable fds can
-    //    never mutate `dst` between verification and rename or after return.
+    //    ONLY when the staged inode is proven in-process to have been created exclusively by
+    //    `turbo-lean` via `O_CREAT | O_EXCL` (`is_exclusively_created_immutable_cas_inode`).
+    //    Externally supplied files (even with `0o444` or forged `user.*` xattrs) fall through to
+    //    fresh-inode isolation so retained writable fds can never mutate `dst` between verification
+    //    and rename or after return.
     if let Ok(tmp_link) = reserve_unique_staging_path(parent, &stem) {
         if link_regular_nofollow(src, &tmp_link).is_ok() {
             enum HardlinkAttempt {
@@ -5338,7 +5339,7 @@ fn install_blob_to_path_checked(
                             computed.as_str()
                         }
                     };
-                    if !is_store_owned_immutable_cas_inode(&f, &meta, hash_for_stamp) {
+                    if !is_exclusively_created_immutable_cas_inode(&meta, hash_for_stamp) {
                         return HardlinkAttempt::UnstampedFallback;
                     }
                 }
@@ -5381,13 +5382,13 @@ fn install_blob_to_path_checked(
         (b, f, h)
     };
 
-    // If hardlinking was unavailable (e.g. EXDEV across filesystems) and `dst` already exists as a
-    // stamped store-owned immutable `0o444` file with identical verified bytes, preserve `dst`.
+    // If hardlinking was unavailable (e.g. EXDEV across filesystems) and `dst` already exists as an
+    // exclusively created store-owned `0o444` file with identical verified bytes, preserve `dst`.
     if let Ok((mut dst_f, dst_meta)) = open_regular_nofollow(dst) {
         let dst_owned = {
             #[cfg(unix)]
             {
-                is_store_owned_immutable_cas_inode(&dst_f, &dst_meta, &effective_hash)
+                is_exclusively_created_immutable_cas_inode(&dst_meta, &effective_hash)
             }
             #[cfg(not(unix))]
             {
@@ -5403,17 +5404,14 @@ fn install_blob_to_path_checked(
     }
 
     // 2. Stage into a fresh `O_CREAT | O_EXCL` temp file (FICLONE from verified `src_file` when on
-    //    a CoW FS and re-verified on the independent snapshot, otherwise write `src_bytes`), stamp
-    //    store-owned immutability + `chmod 0o444`, and atomically rename onto `dst`.
+    //    a CoW FS and re-verified on the independent snapshot, otherwise write `src_bytes`), seal
+    //    in-process exclusive immutability + `chmod 0o444`, and atomically rename onto `dst`.
     let (mut dst_file, tmp_dst) = open_unique_staging_file(parent, &stem, 0o600)?;
     let install_res = (|| -> Result<&'static str> {
         let finalize_immutable = |f: &File| -> std::io::Result<()> {
             #[cfg(unix)]
             {
-                stamp_immutable_cas_inode(f, &effective_hash);
-                let mut perms = f.metadata()?.permissions();
-                perms.set_mode(0o444);
-                f.set_permissions(perms)?;
+                seal_exclusively_created_cas_inode(f, 0o444, &effective_hash)?;
             }
             Ok(())
         };
@@ -7548,7 +7546,40 @@ mod tests {
             mutated_b2[1] ^= 0xAA;
             let orig_hash = blake3::hash(&orig_b).to_hex().to_string();
 
-            // 4a. `publish_verified_durable_blob`: external `0o444` source with retained writable fd.
+            let forge_xattr_and_ro = |f: &File, p: &Path, h: &str| -> Result<()> {
+                #[cfg(target_os = "linux")]
+                unsafe {
+                    use std::os::unix::io::AsRawFd;
+                    const FORGED_XATTR: &[u8] = b"user.turbo_lean.cas_immutable\0";
+                    let _ = libc::fsetxattr(
+                        f.as_raw_fd(),
+                        FORGED_XATTR.as_ptr().cast(),
+                        h.as_bytes().as_ptr().cast(),
+                        h.len(),
+                        0,
+                    );
+                }
+                #[cfg(target_os = "macos")]
+                unsafe {
+                    use std::os::unix::io::AsRawFd;
+                    const FORGED_XATTR: &[u8] = b"user.turbo_lean.cas_immutable\0";
+                    let _ = libc::fsetxattr(
+                        f.as_raw_fd(),
+                        FORGED_XATTR.as_ptr().cast(),
+                        h.as_bytes().as_ptr().cast(),
+                        h.len(),
+                        0,
+                        0,
+                    );
+                }
+                let mut ro = fs::metadata(p)?.permissions();
+                ro.set_mode(0o444);
+                fs::set_permissions(p, ro)?;
+                Ok(())
+            };
+
+            // 4a. `publish_verified_durable_blob`: external `0o444` source carrying forged
+            //     `user.turbo_lean.cas_immutable` xattr + retained writable fd.
             let ext_src = dir.join("external_shared_src.olean");
             let retained_fd = std::sync::Arc::new(std::sync::Mutex::new(
                 OpenOptions::new()
@@ -7558,10 +7589,11 @@ mod tests {
                     .write(true)
                     .open(&ext_src)?,
             ));
-            retained_fd.lock().unwrap().write_all(&orig_b)?;
-            let mut ro_p = fs::metadata(&ext_src)?.permissions();
-            ro_p.set_mode(0o444);
-            fs::set_permissions(&ext_src, ro_p)?;
+            {
+                let mut f = retained_fd.lock().unwrap();
+                f.write_all(&orig_b)?;
+                forge_xattr_and_ro(&f, &ext_src, &orig_hash)?;
+            }
 
             let fd_in_hook = std::sync::Arc::clone(&retained_fd);
             let m1_for_hook = mutated_b1.clone();
@@ -7584,7 +7616,7 @@ mod tests {
             assert_ne!(
                 pub_ino as u64,
                 fs::metadata(&ext_src)?.ino(),
-                "publish_verified_durable_blob must allocate an independent inode for external 0o444 sources"
+                "publish_verified_durable_blob must allocate an independent inode even when external 0o444 source carries forged xattr"
             );
             assert_eq!(
                 fs::read(&isolated_cas_dst)?,
@@ -7602,8 +7634,9 @@ mod tests {
                 "mutation after return via retained writable fd must not affect published CAS blob"
             );
 
-            // 4b. `install_verified_blob_to_path`: external `0o444` source with retained writable fd
-            //     targeting a package/non-mutable destination path.
+            // 4b. `install_verified_blob_to_path`: external `0o444` source carrying forged
+            //     `user.turbo_lean.cas_immutable` xattr + retained writable fd targeting a
+            //     package/non-mutable destination path.
             let ext_pkg_src = dir.join("external_pkg_src.olean");
             let pkg_fd = std::sync::Arc::new(std::sync::Mutex::new(
                 OpenOptions::new()
@@ -7613,10 +7646,11 @@ mod tests {
                     .write(true)
                     .open(&ext_pkg_src)?,
             ));
-            pkg_fd.lock().unwrap().write_all(&orig_b)?;
-            let mut ro_pkg = fs::metadata(&ext_pkg_src)?.permissions();
-            ro_pkg.set_mode(0o444);
-            fs::set_permissions(&ext_pkg_src, ro_pkg)?;
+            {
+                let mut f = pkg_fd.lock().unwrap();
+                f.write_all(&orig_b)?;
+                forge_xattr_and_ro(&f, &ext_pkg_src, &orig_hash)?;
+            }
 
             let pkg_fd_hook = std::sync::Arc::clone(&pkg_fd);
             let m1_pkg = mutated_b1.clone();
@@ -7634,7 +7668,7 @@ mod tests {
             assert_ne!(
                 fs::metadata(&pkg_dst)?.ino(),
                 fs::metadata(&ext_pkg_src)?.ino(),
-                "install_verified_blob_to_path must isolate unstamped 0o444 source into a fresh inode"
+                "install_verified_blob_to_path must isolate forged-xattr 0o444 source into a fresh inode"
             );
             assert_eq!(fs::read(&pkg_dst)?, orig_b);
             {
@@ -7648,8 +7682,9 @@ mod tests {
                 "post-install write through retained source fd must leave installed artifact intact"
             );
 
-            // 4c. `ensure_blob_file`: pre-existing digest-matching unstamped/writable destination
-            //     with a retained writable fd must be replaced with a fresh store-owned inode.
+            // 4c. `ensure_blob_file`: pre-planted `0o444` destination carrying forged
+            //     `user.turbo_lean.cas_immutable` xattr + retained writable fd must be replaced
+            //     with a fresh store-owned inode rather than reused.
             let pre_dest = dir.join("blobs").join(&orig_hash[..2]).join(&orig_hash);
             fs::create_dir_all(pre_dest.parent().unwrap())?;
             let mut pre_rw = OpenOptions::new()
@@ -7659,15 +7694,19 @@ mod tests {
                 .write(true)
                 .open(&pre_dest)?;
             pre_rw.write_all(&orig_b)?;
+            forge_xattr_and_ro(&pre_rw, &pre_dest, &orig_hash)?;
             let pre_ino = pre_rw.metadata()?.ino();
             let (ensured_ino, _) = ensure_blob_file(&dir, &pre_dest, &orig_hash, &orig_b, false)?;
-            assert_ne!(ensured_ino as u64, pre_ino);
+            assert_ne!(
+                ensured_ino as u64, pre_ino,
+                "ensure_blob_file must replace pre-planted 0o444 forged-xattr destination inode"
+            );
             pre_rw.seek(std::io::SeekFrom::Start(0))?;
             pre_rw.write_all(&mutated_b2)?;
             assert_eq!(
                 fs::read(&pre_dest)?,
                 orig_b,
-                "ensure_blob_file must replace externally writable/unstamped inode rather than reusing it"
+                "ensure_blob_file must isolate destination against retained writable fd even with forged xattr + 0o444"
             );
         }
 

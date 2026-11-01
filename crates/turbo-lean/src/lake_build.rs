@@ -2903,8 +2903,10 @@ pub(crate) fn stage_lake_build_outputs(
                 .is_some_and(|(mut sf, sm)| {
                     use std::io::Read;
                     #[cfg(unix)]
-                    let owned =
-                        crate::db::is_store_owned_immutable_cas_inode(&sf, &sm, &entry.blob_hash);
+                    let owned = crate::db::is_exclusively_created_immutable_cas_inode(
+                        &sm,
+                        &entry.blob_hash,
+                    );
                     #[cfg(not(unix))]
                     let owned = true;
                     if !owned {
@@ -2935,7 +2937,8 @@ pub(crate) fn stage_lake_build_outputs(
                 .and_then(|(mut f, m)| {
                     use std::io::Read;
                     #[cfg(unix)]
-                    if !crate::db::is_store_owned_immutable_cas_inode(&f, &m, &entry.blob_hash) {
+                    if !crate::db::is_exclusively_created_immutable_cas_inode(&m, &entry.blob_hash)
+                    {
                         return None;
                     }
                     let mut buf = Vec::with_capacity(m.len().min(64 * 1024 * 1024) as usize);
@@ -3157,11 +3160,11 @@ pub fn dedup_worktree_packages(
                         #[cfg(unix)]
                         let already_same_cas_inode = crate::db::open_regular_nofollow(&cas_file)
                             .ok()
-                            .is_some_and(|(cf, cm)| {
+                            .is_some_and(|(_cf, cm)| {
                                 cm.dev() == meta.dev()
                                     && cm.ino() == meta.ino()
-                                    && crate::db::is_store_owned_immutable_cas_inode(
-                                        &cf, &cm, &hash_hex,
+                                    && crate::db::is_exclusively_created_immutable_cas_inode(
+                                        &cm, &hash_hex,
                                     )
                             });
                         #[cfg(not(unix))]

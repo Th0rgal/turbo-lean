@@ -1000,7 +1000,7 @@ fn ensure_blob_in_shared_cas(
     let shared_dest = shared_dir.join(bh);
     if let Ok((mut f, meta)) = crate::db::open_regular_nofollow(&shared_dest) {
         #[cfg(unix)]
-        let owned = crate::db::is_store_owned_immutable_cas_inode(&f, &meta, bh);
+        let owned = crate::db::is_exclusively_created_immutable_cas_inode(&meta, bh);
         #[cfg(not(unix))]
         let owned = true;
         if owned {
@@ -1244,9 +1244,17 @@ pub fn export_pack_filtered_with_mode_and_signing_key(
                                             if header_only_shared_cas { 1 } else { 0 }
                                         ));
                                         if !last_file.exists() {
-                                            let _ = crate::db::publish_durable_link(
-                                                &cache_file,
+                                            let mut full_cache =
+                                                Vec::with_capacity(24 + stream.len());
+                                            full_cache
+                                                .extend_from_slice(&(n_acts as u64).to_le_bytes());
+                                            full_cache
+                                                .extend_from_slice(&(n_blobs as u64).to_le_bytes());
+                                            full_cache.extend_from_slice(&raw_bytes.to_le_bytes());
+                                            full_cache.extend_from_slice(&stream);
+                                            let _ = crate::db::write_bytes_durable(
                                                 &last_file,
+                                                &full_cache,
                                                 &created,
                                             );
                                         } else {
@@ -1378,8 +1386,8 @@ pub fn export_pack_filtered_with_mode_and_signing_key(
                                                 let last_1 =
                                                     locks_dir.join("last_full_export_1.bin");
                                                 if !last_1.exists() {
-                                                    let _ = crate::db::publish_durable_link(
-                                                        &v3_file, &last_1, &created,
+                                                    let _ = crate::db::write_bytes_durable(
+                                                        &last_1, &v3_cached, &created,
                                                     );
                                                 }
                                             }
@@ -1859,7 +1867,7 @@ pub fn prestage_blobs_from_shared_cas(
             };
             if let Ok((mut f, m)) = crate::db::open_regular_nofollow(&dest) {
                 let mut buf = Vec::with_capacity(m.len().min(64 * 1024 * 1024) as usize);
-                if crate::db::is_store_owned_immutable_cas_inode(&f, &m, &b.blob_hash)
+                if crate::db::is_exclusively_created_immutable_cas_inode(&m, &b.blob_hash)
                     && f.read_to_end(&mut buf).is_ok()
                     && buf.len() as u64 == b.size_bytes
                     && blake3::hash(&buf).to_hex().as_str() == b.blob_hash
@@ -2415,14 +2423,16 @@ pub fn import_pack_bytes_with_policy(
             #[cfg(unix)]
             let inode = {
                 use crate::db::{
-                    durability_barrier, is_store_owned_immutable_cas_inode, open_regular_nofollow,
-                    sync_dir, write_blob_atomic,
+                    durability_barrier, is_exclusively_created_immutable_cas_inode,
+                    open_regular_nofollow, sync_dir, write_blob_atomic,
                 };
                 use std::os::unix::fs::MetadataExt;
                 let len = blob_bytes.len() as u64;
                 let existing_intact = (|| -> Option<(fs::File, fs::Metadata)> {
                     let (mut f, m) = open_regular_nofollow(&dest).ok()?;
-                    if m.len() != len || !is_store_owned_immutable_cas_inode(&f, &m, &b.blob_hash) {
+                    if m.len() != len
+                        || !is_exclusively_created_immutable_cas_inode(&m, &b.blob_hash)
+                    {
                         return None;
                     }
                     let mut buf = Vec::with_capacity(len.min(64 * 1024 * 1024) as usize);
