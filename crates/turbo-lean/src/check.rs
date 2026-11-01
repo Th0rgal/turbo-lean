@@ -263,20 +263,25 @@ fn stateless_imports_replayed_in_store(
     let Ok(cfg) = crate::module_builder::resolve_project_config(canon_dir) else {
         return false;
     };
-    let dirs: Vec<PathBuf> = std::env::split_paths(local_lean_path).collect();
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(local_lean_path).collect();
+    if !cfg.toolchain_lib_lean.as_os_str().is_empty() && !dirs.contains(&cfg.toolchain_lib_lean) {
+        dirs.push(cfg.toolchain_lib_lean.clone());
+    }
     let mut worklist = crate::module_builder::parse_header_info(active_src).imports;
     let mut seen = HashSet::new();
     while let Some(m) = worklist.pop() {
-        if !seen.insert(m.clone())
-            || crate::module_builder::is_builtin_toolchain_module(&cfg.toolchain_lib_lean, &m)
-        {
+        if !seen.insert(m.clone()) {
             continue;
         }
         let rel = format!("{}.olean", crate::module_builder::module_name_to_rel_slash(&m));
         let Some(path) = dirs.iter().map(|d| d.join(&rel)).find(|p| p.is_file()) else {
             return false;
         };
-        if path.starts_with(&cfg.toolchain_lib_lean) {
+        if crate::module_builder::is_verified_toolchain_olean_file(
+            &cfg.toolchain_lib_lean,
+            Some(&cfg.lean_githash),
+            &path,
+        ) {
             continue;
         }
         if !crate::module_builder::is_olean_replayed_in_store(ro_store, &cfg.lean_githash, &path) {

@@ -1481,11 +1481,44 @@ fn compute_imported_oleans_digest_inner(
     (snap.digest, snap.complete)
 }
 
-fn is_toolchain_builtin_module(mod_name: &str) -> bool {
+fn is_toolchain_builtin_prefix(mod_name: &str) -> bool {
     mod_name == "Init"
         || mod_name.starts_with("Init.")
+        || mod_name == "Std"
+        || mod_name.starts_with("Std.")
         || mod_name == "Lean"
         || mod_name.starts_with("Lean.")
+        || mod_name == "Lake"
+        || mod_name.starts_with("Lake.")
+}
+
+fn find_toolchain_dir<'a>(
+    search_dirs: &[&'a Path],
+    toolchain_lib: Option<&'a Path>,
+) -> Option<&'a Path> {
+    if let Some(tc) = toolchain_lib.filter(|p| !p.as_os_str().is_empty()) {
+        return Some(tc);
+    }
+    search_dirs.iter().copied().find(|d| {
+        d.ends_with("lib/lean")
+            && d.parent()
+                .and_then(|lib| lib.parent())
+                .is_some_and(|tc| tc.join("bin/lean").exists())
+    })
+}
+
+fn is_toolchain_builtin_module(
+    mod_name: &str,
+    search_dirs: &[&Path],
+    toolchain_lib: Option<&Path>,
+) -> bool {
+    if !is_toolchain_builtin_prefix(mod_name) {
+        return false;
+    }
+    match find_toolchain_dir(search_dirs, toolchain_lib) {
+        Some(td) => crate::module_builder::is_builtin_toolchain_module(td, None, mod_name),
+        None => true,
+    }
 }
 
 /// Resolve `mod_name` along `search_dirs` the way Lean's `findOLean` (`findWithExt`) does:
@@ -1514,7 +1547,9 @@ fn resolve_closure_module(
                     .is_some_and(|tc| tc.join("bin/lean").exists())
         }
     };
-    if is_toolchain_builtin_module(mod_name) && root.is_none_or(|d| on_toolchain(d)) {
+    if is_toolchain_builtin_module(mod_name, search_dirs, toolchain_lib)
+        && root.is_none_or(|d| on_toolchain(d))
+    {
         return None;
     }
     Some(root?.join(format!("{rel}.olean"))).filter(|p| p.is_file())
@@ -1793,7 +1828,8 @@ impl ClosureSnapshot {
                 }
                 (olean_path, e)
             });
-            complete &= entry.is_some() || is_toolchain_builtin_module(&mod_name);
+            complete &=
+                entry.is_some() || is_toolchain_builtin_module(&mod_name, &search_dirs, tc_ref);
             entries.insert(mod_name, entry);
         }
 
@@ -1835,7 +1871,7 @@ impl ClosureSnapshot {
                     hasher.update(&e.bytes);
                     complete &= digest_olean_path_entry(olean_path) == *e;
                 }
-                None if is_toolchain_builtin_module(mod_name) => {
+                None if is_toolchain_builtin_module(mod_name, &search_dirs, tc_ref) => {
                     hasher.update(b"toolchain-builtin;");
                 }
                 None => {

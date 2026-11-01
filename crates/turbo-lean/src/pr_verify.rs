@@ -1217,16 +1217,13 @@ fn compute_source_only_import_digests(
                 Err(_) => {}
             }
         } else if strict_untrusted {
-            let is_tc = cfg_opt
-                .map(|cfg| {
-                    crate::module_builder::is_builtin_toolchain_module(
-                        &cfg.toolchain_lib_lean,
-                        &mod_name,
-                    )
-                })
-                .unwrap_or_else(|| {
-                    crate::module_builder::is_builtin_toolchain_module(Path::new(""), &mod_name)
-                });
+            let is_tc = cfg_opt.is_some_and(|cfg| {
+                crate::module_builder::is_builtin_toolchain_module(
+                    &cfg.toolchain_lib_lean,
+                    Some(&cfg.lean_githash),
+                    &mod_name,
+                )
+            });
             if !is_tc {
                 anyhow::bail!(
                     "Unresolved non-toolchain import `{}` in untrusted verification (fail-closed)",
@@ -4429,6 +4426,7 @@ pub fn run_pr_verify_command(
                         in_pkg_or_project
                             || !crate::module_builder::is_builtin_toolchain_module(
                                 &cfg.toolchain_lib_lean,
+                                Some(&cfg.lean_githash),
                                 m,
                             )
                     })

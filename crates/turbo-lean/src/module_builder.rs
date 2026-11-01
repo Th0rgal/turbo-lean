@@ -5050,22 +5050,84 @@ pub(crate) fn resolve_module_in_package(
     }
     None
 }
-pub(crate) fn is_builtin_toolchain_module(toolchain_lib_lean: &Path, mod_name: &str) -> bool {
-    if mod_name == "Init"
-        || mod_name.starts_with("Init.")
-        || mod_name == "Std"
-        || mod_name.starts_with("Std.")
-        || mod_name == "Lean"
-        || mod_name.starts_with("Lean.")
-        || mod_name == "Lake"
-        || mod_name.starts_with("Lake.")
-    {
+pub(crate) fn is_verified_toolchain_olean_file(
+    toolchain_lib_lean: &Path,
+    lean_githash: Option<&str>,
+    olean_path: &Path,
+) -> bool {
+    if toolchain_lib_lean.as_os_str().is_empty() || !olean_path.is_file() {
+        return false;
+    }
+    let Ok(canon_tc) = toolchain_lib_lean.canonicalize() else {
+        return false;
+    };
+    let Ok(canon_olean) = olean_path.canonicalize() else {
+        return false;
+    };
+    if !canon_olean.starts_with(&canon_tc) {
+        return false;
+    }
+    let Some(expected_gh) = lean_githash
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "lean-not-installed")
+    else {
         return true;
+    };
+    let Ok(mut f) = fs::File::open(&canon_olean) else {
+        return false;
+    };
+    let mut hdr = [0u8; 80];
+    if std::io::Read::read_exact(&mut f, &mut hdr).is_err() {
+        return false;
+    }
+    &hdr[0..5] == b"olean" && hdr[5] == 2 && &hdr[40..80] == expected_gh.as_bytes()
+}
+
+pub(crate) fn is_builtin_toolchain_module(
+    toolchain_lib_lean: &Path,
+    lean_githash: Option<&str>,
+    mod_name: &str,
+) -> bool {
+    if toolchain_lib_lean.as_os_str().is_empty() {
+        return mod_name == "Init"
+            || mod_name.starts_with("Init.")
+            || mod_name == "Std"
+            || mod_name.starts_with("Std.")
+            || mod_name == "Lean"
+            || mod_name.starts_with("Lean.")
+            || mod_name == "Lake"
+            || mod_name.starts_with("Lake.");
     }
     let rel_slash = module_name_to_rel_slash(mod_name);
-    toolchain_lib_lean
-        .join(format!("{}.olean", rel_slash))
-        .is_file()
+    let cand = toolchain_lib_lean.join(format!("{}.olean", rel_slash));
+    is_verified_toolchain_olean_file(toolchain_lib_lean, lean_githash, &cand)
+}
+
+pub(crate) fn is_unshadowed_toolchain_olean_import(
+    cfg: &ProjectConfig,
+    search_dirs: &[PathBuf],
+    mod_name: &str,
+    is_untrusted: bool,
+) -> bool {
+    if resolve_module_in_package(&cfg.root_pkg, true, mod_name).is_some()
+        || cfg
+            .dep_pkgs
+            .iter()
+            .any(|dp| resolve_module_in_package(dp, false, mod_name).is_some())
+    {
+        return false;
+    }
+    let rel = format!("{}.olean", module_name_to_rel_slash(mod_name));
+    let mut all_dirs: Vec<PathBuf> = search_dirs.to_vec();
+    if !cfg.toolchain_lib_lean.as_os_str().is_empty() && !all_dirs.contains(&cfg.toolchain_lib_lean)
+    {
+        all_dirs.push(cfg.toolchain_lib_lean.clone());
+    }
+    let Some(first_hit) = all_dirs.iter().map(|d| d.join(&rel)).find(|p| p.is_file()) else {
+        return !is_untrusted && cfg.toolchain_lib_lean.as_os_str().is_empty()
+            && is_builtin_toolchain_module(&cfg.toolchain_lib_lean, None, mod_name);
+    };
+    is_verified_toolchain_olean_file(&cfg.toolchain_lib_lean, Some(&cfg.lean_githash), &first_hit)
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub(crate) struct VerifiedDepModuleEntry {
@@ -5334,11 +5396,13 @@ fn collect_fresh_dep_pkg_closure(
             if resolve_module_in_package(&cfg.root_pkg, true, &imp).is_some() {
                 return Ok(None);
             }
-            if is_builtin_toolchain_module(&cfg.toolchain_lib_lean, &imp) {
+            let (eff_lp, _) = build_lean_search_path(cfg, false);
+            let search_dirs: Vec<PathBuf> = std::env::split_paths(&eff_lp).collect();
+            if is_unshadowed_toolchain_olean_import(cfg, &search_dirs, &imp, false) {
                 continue;
             }
-            // Unresolved import inside dependency closure: force native DAG traversal so
-            // root-package imports or missing-module errors are handled deterministically.
+            // Unresolved or shadowed import inside dependency closure: force native DAG traversal so
+            // root-package/LEAN_PATH imports or missing-module errors are handled deterministically.
             return Ok(None);
         }
     }
@@ -5703,11 +5767,8 @@ pub fn build_module_dag_with_trust(
                 worklist.push_back((dep_spec, false));
                 continue;
             }
-            // 3. Check if `imp` is a built-in toolchain module (`Init.*`, `Std.*`, `Lean.*`, `Lake.*`)
-            if is_builtin_toolchain_module(&cfg.toolchain_lib_lean, imp) {
-                continue;
-            }
-            // 4. In trusted mode only, check if `imp` exists as a prebuilt `.olean` in `.lake/packages/*/.lake/build/lib/lean` or `LEAN_PATH`
+            // 3. In trusted mode only, check if `imp` exists as a prebuilt `.olean` in `.lake/packages/*/.lake/build/lib/lean` or `LEAN_PATH`
+            // BEFORE checking the toolchain library, matching Lean's actual `LEAN_PATH` search order.
             if !is_untrusted {
                 let rel_slash = module_name_to_rel_slash(imp);
                 let mut found_prebuilt: Option<PathBuf> = None;
@@ -5725,7 +5786,13 @@ pub fn build_module_dag_with_trust(
                 if found_prebuilt.is_none() {
                     for dir in &external_lean_path_dirs {
                         let cand = dir.join(format!("{}.olean", rel_slash));
-                        if cand.is_file() {
+                        if cand.is_file()
+                            && !is_verified_toolchain_olean_file(
+                                &cfg.toolchain_lib_lean,
+                                Some(&cfg.lean_githash),
+                                &cand,
+                            )
+                        {
                             found_prebuilt = Some(cand);
                             break;
                         }
@@ -5736,6 +5803,14 @@ pub fn build_module_dag_with_trust(
                     prebuilt_olean_deps.push(imp.clone());
                     continue;
                 }
+            }
+            // 4. Check if `imp` resolves to a genuine built-in toolchain `.olean` inside `toolchain_lib_lean`
+            if is_builtin_toolchain_module(
+                &cfg.toolchain_lib_lean,
+                Some(&cfg.lean_githash),
+                imp,
+            ) {
+                continue;
             }
             anyhow::bail!(
                 "Missing module `{}` imported by `{}` ({}): not found in project sources, package dependencies, or toolchain `{}`",
@@ -6776,7 +6851,11 @@ fn compute_lake_export_info(
                     .iter()
                     .any(|dp| resolve_module_in_package(dp, false, &sub_imp.module).is_some());
             if !is_ws_or_pkg
-                && is_builtin_toolchain_module(&cfg.toolchain_lib_lean, &sub_imp.module)
+                && is_builtin_toolchain_module(
+                    &cfg.toolchain_lib_lean,
+                    Some(&cfg.lean_githash),
+                    &sub_imp.module,
+                )
             {
                 continue;
             }
@@ -6951,7 +7030,11 @@ pub fn write_lake_module_hashes_and_trace(
                     .iter()
                     .any(|dp| resolve_module_in_package(dp, false, &imp.module).is_some());
             if !is_ws_or_pkg {
-                if is_builtin_toolchain_module(&cfg.toolchain_lib_lean, &imp.module) {
+                if is_builtin_toolchain_module(
+                    &cfg.toolchain_lib_lean,
+                    Some(&cfg.lean_githash),
+                    &imp.module,
+                ) {
                     continue;
                 }
                 dep_trace_fresh = false;
@@ -8524,22 +8607,28 @@ pub(crate) fn ensure_imported_oleans_replayed(
     }
     let cfg = resolve_project_config(canon_dir);
     let tc_lib = cfg.as_ref().map(|c| c.toolchain_lib_lean.clone()).ok();
+    let tc_gh = cfg.as_ref().map(|c| c.lean_githash.clone()).ok();
     let lean_path = lake_build::resolve_remote_lean_path(canon_dir, None);
-    let dirs: Vec<PathBuf> = std::env::split_paths(&lean_path).collect();
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(&lean_path).collect();
+    if let Some(ref t) = tc_lib {
+        if !t.as_os_str().is_empty() && !dirs.contains(t) {
+            dirs.push(t.clone());
+        }
+    }
     let mut seen = HashSet::new();
     let mut imported: Vec<(String, PathBuf)> = Vec::new();
     while let Some(m) = worklist.pop() {
-        if !seen.insert(m.clone())
-            || is_builtin_toolchain_module(tc_lib.as_deref().unwrap_or(Path::new("")), &m)
-        {
+        if !seen.insert(m.clone()) {
             continue;
         }
         let rel = format!("{}.olean", module_name_to_rel_slash(&m));
         let Some(path) = dirs.iter().map(|d| d.join(&rel)).find(|p| p.is_file()) else {
             continue;
         };
-        if tc_lib.as_ref().is_some_and(|t| path.starts_with(t)) {
-            continue;
+        if let Some(ref t) = tc_lib {
+            if is_verified_toolchain_olean_file(t, tc_gh.as_deref(), &path) {
+                continue;
+            }
         }
         let bytes = fs::read(&path)?;
         worklist.extend(
@@ -10838,6 +10927,351 @@ lean_exe «demo-exe» where
             "pr-verify forged manifest: {pr_err:#}"
         );
         drop(store);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Regression test: a module under `Std.*` (`Std.Forge`) that is NOT in the installed
+    /// toolchain `lib/lean` (or shadows it on `LEAN_PATH` / package search order) must never be
+    /// exempted as a builtin toolchain module, and must be kernel-replayed and rejected across
+    /// `build`, `check`, `ci-verify`, and `pr-verify`.
+    #[cfg(unix)]
+    #[test]
+    fn test_std_prefix_module_is_not_exempted_as_builtin_toolchain_module() -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = make_temp_test_dir("std_forge_replay");
+        let (proj, ext_pkg) = (dir.join("app"), dir.join("ext_std"));
+        fs::create_dir_all(&proj)?;
+        fs::create_dir_all(ext_pkg.join("Std"))?;
+        let toolchain = include_str!("../../../lean/lean-toolchain");
+        fs::write(proj.join("lean-toolchain"), toolchain)?;
+        fs::write(ext_pkg.join("lean-toolchain"), toolchain)?;
+        let forge_src = "import Init\n";
+        fs::write(ext_pkg.join("Std/Forge.lean"), forge_src)?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"app\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\n",
+        )?;
+        fs::write(
+            proj.join("App.lean"),
+            "import Std.Forge\ntheorem bad_from_std : False := std_forged_false\n",
+        )?;
+        let cfg = resolve_project_config(&proj)?;
+        let ext_lib_lean = ext_pkg.join(".lake/build/lib/lean");
+        fs::create_dir_all(ext_lib_lean.join("Std"))?;
+        let ext_olean = ext_lib_lean.join("Std/Forge.olean");
+        let ext_ilean = ext_lib_lean.join("Std/Forge.ilean");
+        fs::write(&ext_ilean, b"{}")?;
+        let maker_path = dir.join("Maker.lean");
+        fs::write(
+            &maker_path,
+            "import Lean\nopen Lean\ndef main (args : List String) : IO Unit := do\n  searchPathRef.set [System.FilePath.mk args[1]!]\n  let env ← importModules #[{ module := `Init }] {} 0\n  let env := env.setMainModule `Std.Forge\n  let decl : Declaration := .thmDecl {\n    name := `std_forged_false,\n    levelParams := [],\n    type := mkConst ``False,\n    value := mkConst ``True.intro\n  }\n  match env.addDeclCore 0 0 decl none false with\n  | Except.ok env2 => writeModule env2 args[0]! false\n  | Except.error _ => throw <| IO.userError \"addDecl failed\"\n",
+        )?;
+        let compile_ext = Command::new(&cfg.lean_bin)
+            .arg("--run")
+            .arg(&maker_path)
+            .arg(&ext_olean)
+            .arg(&cfg.toolchain_lib_lean)
+            .env("LEAN_PATH", &cfg.toolchain_lib_lean)
+            .output()?;
+        anyhow::ensure!(
+            compile_ext.status.success(),
+            "stdout: {} stderr: {}",
+            String::from_utf8_lossy(&compile_ext.stdout),
+            String::from_utf8_lossy(&compile_ext.stderr)
+        );
+        assert!(ext_olean.is_file(), "lean must emit Std/Forge.olean");
+        assert!(
+            !is_builtin_toolchain_module(
+                &cfg.toolchain_lib_lean,
+                Some(&cfg.lean_githash),
+                "Std.Forge"
+            ),
+            "Std.Forge does not exist in toolchain_lib_lean and must not be exempted by prefix"
+        );
+        assert!(
+            is_builtin_toolchain_module(&cfg.toolchain_lib_lean, Some(&cfg.lean_githash), "Init"),
+            "real toolchain Init.olean with matching githash must be recognized"
+        );
+        assert!(
+            !is_verified_toolchain_olean_file(
+                &cfg.toolchain_lib_lean,
+                Some(&cfg.lean_githash),
+                &ext_olean
+            ),
+            "external Std/Forge.olean outside toolchain_lib_lean must not pass toolchain verification"
+        );
+
+        // Part A: Prebuilt `Std.Forge` supplied via `LEAN_PATH` (earlier in search order than toolchain).
+        let prev_lp = std::env::var_os("LEAN_PATH");
+        std::env::set_var("LEAN_PATH", &ext_lib_lean);
+        let res_a = (|| -> Result<()> {
+            let mut store = TurboStore::open(Some(&dir.join("cache_lp")))?;
+            let dag = build_module_dag_with_trust(&cfg, &[], false)?;
+            assert!(
+                dag.nodes["App"]
+                    .external_olean_deps
+                    .iter()
+                    .any(|(m, _)| m == "Std.Forge"),
+                "LEAN_PATH Std.Forge must be tracked in external_olean_deps, not skipped as toolchain"
+            );
+            let build_err = build_project_modules_native(
+                &mut store,
+                &proj,
+                &[],
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                format!("{build_err:#}").contains("KernelReplay"),
+                "native build with LEAN_PATH Std.Forge: {build_err:#}"
+            );
+            let check_err = crate::check::evaluate_check_command_value(
+                &mut store,
+                proj.join("App.lean"),
+                None,
+                proj.clone(),
+            )
+            .unwrap_err();
+            assert!(
+                format!("{check_err:#}").contains("KernelReplay"),
+                "check with LEAN_PATH Std.Forge: {check_err:#}"
+            );
+            Ok(())
+        })();
+        match prev_lp {
+            Some(v) => std::env::set_var("LEAN_PATH", v),
+            None => std::env::remove_var("LEAN_PATH"),
+        }
+        res_a?;
+
+        // Part B: Dependency-package `Std/Forge.lean` (`dep_std`): `Std.Forge` is a prebuilt
+        // dependency `.olean` in `.lake/packages/dep_std` (whose source only imports `Init`, so
+        // `Std.Forge.olean` has zero `Std.*` transitive imports). Before our fix, `Std.Forge` was
+        // skipped by prefix across `build_module_dag_with_trust`, `are_all_project_oleans_replayed_in_store`,
+        // `ensure_imported_oleans_replayed`, and `stateless_imports_replayed_in_store`; now all four
+        // entrypoints (`build`, `ci-verify`, `check`, and `pr-verify`) kernel-replay `Std/Forge.olean`
+        // and reject it.
+        let dep_std = proj.join(".lake/packages/dep_std");
+        fs::create_dir_all(dep_std.join("Std"))?;
+        fs::write(dep_std.join("lean-toolchain"), toolchain)?;
+        fs::write(dep_std.join("Std/Forge.lean"), forge_src)?;
+        fs::write(
+            dep_std.join("lakefile.toml"),
+            "name = \"dep_std\"\n[[lean_lib]]\nname = \"DepStd\"\nroots = [\"Std.Forge\"]\n",
+        )?;
+        let dep_lib_lean = dep_std.join(".lake/build/lib/lean");
+        let lake_bin = cfg
+            .lean_bin
+            .parent()
+            .expect("lean bin parent")
+            .join("lake");
+        let lake_dep = Command::new(&lake_bin)
+            .args(["build", "Std.Forge"])
+            .current_dir(&dep_std)
+            .env("SANDBOXED_ALLOW_RAW_LAKE", "1")
+            .output()?;
+        anyhow::ensure!(
+            lake_dep.status.success(),
+            "lake build Std.Forge: {} {}",
+            String::from_utf8_lossy(&lake_dep.stdout),
+            String::from_utf8_lossy(&lake_dep.stderr)
+        );
+        // Replace `Std/Forge.olean` with the forged `.olean` containing `std_forged_false : False`
+        // and update `Std/Forge.trace`'s `outputs.o[0]` hash so `verify_module_lake_sidecars`
+        // accepts `Std.Forge` as a fresh Lake-built dependency artifact!
+        fs::copy(&ext_olean, dep_lib_lean.join("Std/Forge.olean"))?;
+        let new_olean_h = lake_hash_bytes(&fs::read(dep_lib_lean.join("Std/Forge.olean"))?);
+        fs::write(
+            dep_lib_lean.join("Std/Forge.olean.hash"),
+            format!("{:016x}\n", new_olean_h),
+        )?;
+        let dep_trace_path = dep_lib_lean.join("Std/Forge.trace");
+        let mut dep_tv: serde_json::Value = serde_json::from_slice(&fs::read(&dep_trace_path)?)?;
+        dep_tv["outputs"]["o"][0] = serde_json::Value::String(format!("{:016x}.olean", new_olean_h));
+        fs::write(&dep_trace_path, serde_json::to_vec(&dep_tv)?)?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            r#"{"version": "1.2.0", "packagesDir": ".lake/packages", "packages": [{"type": "path", "name": "dep_std", "dir": ".lake/packages/dep_std", "configFile": "lakefile.toml", "inherited": false}], "name": "app", "lakeDir": ".lake", "fixedToolchain": false}"#,
+        )?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"app\"\ndefaultTargets = [\"App\"]\n[[require]]\nname = \"dep_std\"\npath = \".lake/packages/dep_std\"\n[[lean_lib]]\nname = \"App\"\n",
+        )?;
+        let cfg_b = resolve_project_config(&proj)?;
+        let dep_pkg_cfg = &cfg_b.dep_pkgs[0];
+        let forged_dep_std_manifest = serde_json::json!({
+            "pkg_name": dep_pkg_cfg.name,
+            "toolchain": cfg_b.toolchain,
+            "lean_githash": cfg_b.lean_githash,
+            "pkg_config_digest": dep_pkg_cfg.config_digest,
+            "workspace_config_digest": cfg_b.canonical_config_digest,
+            "allowed_axioms": crate::splitter::allowed_axioms(),
+            "modules": {
+                "Std/Forge.lean": {
+                    "src_blake3": blake3::hash(forge_src.as_bytes()).to_hex().to_string(),
+                    "olean_artifact_digest": compute_olean_artifact_set_digest(&dep_lib_lean.join("Std/Forge.olean"))?,
+                }
+            }
+        });
+        fs::write(
+            dep_std.join(".lake/build/.turbo_verified_sources.json"),
+            serde_json::to_vec(&forged_dep_std_manifest)?,
+        )?;
+        let dag_b = build_module_dag_with_trust(&cfg_b, &[], false)?;
+        assert!(
+            dag_b.nodes["App"]
+                .external_olean_deps
+                .iter()
+                .any(|(m, _)| m == "Std.Forge"),
+            "dep_std Std.Forge must be in App's external_olean_deps (not skipped as builtin toolchain)"
+        );
+        let lake_app = Command::new(&lake_bin)
+            .args(["build", "App"])
+            .current_dir(&proj)
+            .env("SANDBOXED_ALLOW_RAW_LAKE", "1")
+            .output()?;
+        anyhow::ensure!(
+            lake_app.status.success(),
+            "lake build App: {} {}",
+            String::from_utf8_lossy(&lake_app.stdout),
+            String::from_utf8_lossy(&lake_app.stderr)
+        );
+        let proj_lib_lean = proj.join(".lake/build/lib/lean");
+        let app_src_b = fs::read_to_string(proj.join("App.lean"))?;
+        let forged_root_b = serde_json::json!({
+            "pkg_name": cfg_b.root_pkg.name,
+            "toolchain": cfg_b.toolchain,
+            "lean_githash": cfg_b.lean_githash,
+            "pkg_config_digest": cfg_b.root_pkg.config_digest,
+            "workspace_config_digest": cfg_b.canonical_config_digest,
+            "allowed_axioms": crate::splitter::allowed_axioms(),
+            "modules": {
+                "App.lean": {
+                    "src_blake3": blake3::hash(app_src_b.as_bytes()).to_hex().to_string(),
+                    "olean_artifact_digest": compute_olean_artifact_set_digest(&proj_lib_lean.join("App.olean"))?,
+                }
+            }
+        });
+        fs::write(
+            proj.join(".lake/build/.turbo_verified_sources.json"),
+            serde_json::to_vec(&forged_root_b)?,
+        )?;
+        let mut store_b = TurboStore::open(Some(&dir.join("cache_proj")))?;
+        let build_cmd_err = crate::lake_build::run_build_command(
+            &mut store_b,
+            true,
+            vec![],
+            proj.clone(),
+            "trusted".to_string(),
+            1,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{build_cmd_err:#}").contains("KernelReplay"),
+            "run_build_command project Std.Forge: {build_cmd_err:#}"
+        );
+        let ci_err = crate::pr_verify::run_ci_verify_command(
+            &mut store_b,
+            true,
+            "trusted".to_string(),
+            proj.clone(),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{ci_err:#}").contains("KernelReplay"),
+            "ci-verify project Std.Forge: {ci_err:#}"
+        );
+        let check_proj_err = crate::check::evaluate_check_command_value(
+            &mut store_b,
+            proj.join("App.lean"),
+            Some("bad_from_std".to_string()),
+            proj.clone(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{check_proj_err:#}").contains("KernelReplay"),
+            "check --decl project Std.Forge: {check_proj_err:#}"
+        );
+
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["add", "lean-toolchain", "lakefile.toml", "lake-manifest.json", "App.lean"],
+            vec!["commit", "-m", "base"],
+        ] {
+            let g = Command::new("git").args(&args).current_dir(&proj).output()?;
+            anyhow::ensure!(
+                g.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&g.stderr)
+            );
+        }
+        let edited_app_b = "import Std.Forge\ntheorem bad_from_std : False := by exact std_forged_false\n";
+        fs::write(proj.join("App.lean"), edited_app_b)?;
+        let lake_app2 = Command::new(&lake_bin)
+            .args(["build", "App"])
+            .current_dir(&proj)
+            .env("SANDBOXED_ALLOW_RAW_LAKE", "1")
+            .output()?;
+        anyhow::ensure!(
+            lake_app2.status.success(),
+            "lake build App (2): {} {}",
+            String::from_utf8_lossy(&lake_app2.stdout),
+            String::from_utf8_lossy(&lake_app2.stderr)
+        );
+        let forged_root_b2 = serde_json::json!({
+            "pkg_name": cfg_b.root_pkg.name,
+            "toolchain": cfg_b.toolchain,
+            "lean_githash": cfg_b.lean_githash,
+            "pkg_config_digest": cfg_b.root_pkg.config_digest,
+            "workspace_config_digest": cfg_b.canonical_config_digest,
+            "allowed_axioms": crate::splitter::allowed_axioms(),
+            "modules": {
+                "App.lean": {
+                    "src_blake3": blake3::hash(edited_app_b.as_bytes()).to_hex().to_string(),
+                    "olean_artifact_digest": compute_olean_artifact_set_digest(&proj_lib_lean.join("App.olean"))?,
+                }
+            }
+        });
+        fs::write(
+            proj.join(".lake/build/.turbo_verified_sources.json"),
+            serde_json::to_vec(&forged_root_b2)?,
+        )?;
+        let pr_err = crate::pr_verify::run_pr_verify_command(
+            &mut store_b,
+            true,
+            proj.clone(),
+            "HEAD".to_string(),
+            "trusted".to_string(),
+            false,
+            None,
+            None,
+            None,
+            None,
+            false,
+            1,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{pr_err:#}").contains("KernelReplay"),
+            "pr-verify project Std.Forge: {pr_err:#}"
+        );
+        drop(store_b);
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }

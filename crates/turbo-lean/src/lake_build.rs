@@ -918,6 +918,15 @@ pub fn compute_imported_olean_interface_hashes(
         return Vec::new();
     }
 
+    let resolved_tc: Option<(PathBuf, String)> = if project_dir.as_os_str().is_empty() {
+        None
+    } else {
+        let tc = detect_toolchain(project_dir);
+        crate::module_builder::resolve_toolchain_compiler(project_dir, &tc)
+            .ok()
+            .map(|(_, gh, tc_lib_lean, _)| (tc_lib_lean, gh))
+    };
+
     let mut visited = std::collections::HashSet::new();
     let mut out = Vec::new();
 
@@ -951,24 +960,29 @@ pub fn compute_imported_olean_interface_hashes(
             (None, Some(sd)) if !search_dirs.is_empty() => {
                 out.push(format!("{}:unbuilt:src={}", mod_name, sd));
             }
-            (None, _)
-                if !search_dirs.is_empty()
-                    && mod_name != "Init"
-                    && !mod_name.starts_with("Init.")
-                    && mod_name != "Lean"
-                    && !mod_name.starts_with("Lean.") =>
-            {
-                out.push(format!("{}:missing", mod_name));
+            (None, None) if !search_dirs.is_empty() => {
+                let tc_exempt = match resolved_tc {
+                    Some((ref tc_lib_lean, ref gh)) => {
+                        crate::module_builder::is_builtin_toolchain_module(
+                            tc_lib_lean,
+                            Some(gh.as_str()),
+                            &mod_name,
+                        )
+                    }
+                    None => crate::module_builder::is_builtin_toolchain_module(
+                        Path::new(""),
+                        None,
+                        &mod_name,
+                    ),
+                };
+                if !tc_exempt {
+                    out.push(format!("{}:missing", mod_name));
+                }
             }
             _ => {}
         }
         for sub_mod in olean_sub_mods {
-            if !visited.contains(&sub_mod)
-                && sub_mod != "Init"
-                && !sub_mod.starts_with("Init.")
-                && sub_mod != "Lean"
-                && !sub_mod.starts_with("Lean.")
-            {
+            if !visited.contains(&sub_mod) {
                 worklist.push(sub_mod);
             }
         }
@@ -1784,7 +1798,10 @@ pub(crate) fn are_all_project_oleans_replayed_in_store(
         return false;
     };
     let lean_path = resolve_remote_lean_path(canon_dir, None);
-    let dirs: Vec<PathBuf> = std::env::split_paths(&lean_path).collect();
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(&lean_path).collect();
+    if !cfg.toolchain_lib_lean.as_os_str().is_empty() && !dirs.contains(&cfg.toolchain_lib_lean) {
+        dirs.push(cfg.toolchain_lib_lean.clone());
+    }
     let mut worklist = Vec::new();
     for rel_path in file_hashes.keys() {
         if rel_path == "lakefile.lean" || rel_path.ends_with("/lakefile.lean") {
@@ -1808,16 +1825,18 @@ pub(crate) fn are_all_project_oleans_replayed_in_store(
     }
     let mut seen = HashSet::new();
     while let Some(m) = worklist.pop() {
-        if !seen.insert(m.clone())
-            || crate::module_builder::is_builtin_toolchain_module(&cfg.toolchain_lib_lean, &m)
-        {
+        if !seen.insert(m.clone()) {
             continue;
         }
         let rel = format!("{}.olean", crate::module_builder::module_name_to_rel_slash(&m));
         let Some(path) = dirs.iter().map(|d| d.join(&rel)).find(|p| p.is_file()) else {
             return false;
         };
-        if path.starts_with(&cfg.toolchain_lib_lean) {
+        if crate::module_builder::is_verified_toolchain_olean_file(
+            &cfg.toolchain_lib_lean,
+            Some(&cfg.lean_githash),
+            &path,
+        ) {
             continue;
         }
         if !crate::module_builder::is_olean_replayed_in_store(store, &cfg.lean_githash, &path) {
@@ -1842,7 +1861,7 @@ pub(crate) fn ensure_project_and_imported_oleans_replayed_in_store(
         "Cannot kernel-replay project `.olean`s without a resolvable project configuration: fail-closed",
     )?;
     let lean_path = resolve_remote_lean_path(canon_dir, None);
-    let dirs: Vec<PathBuf> = std::env::split_paths(&lean_path).collect();
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(&lean_path).collect();
     let mut root_mods: Vec<(String, PathBuf)> = Vec::new();
     let mut worklist = Vec::new();
     for rel_path in file_hashes.keys() {
@@ -1874,17 +1893,22 @@ pub(crate) fn ensure_project_and_imported_oleans_replayed_in_store(
     }
     let mut seen: HashSet<String> = root_mods.iter().map(|(m, _)| m.clone()).collect();
     let mut dep_mods: Vec<(String, PathBuf)> = Vec::new();
+    if !cfg.toolchain_lib_lean.as_os_str().is_empty() && !dirs.contains(&cfg.toolchain_lib_lean) {
+        dirs.push(cfg.toolchain_lib_lean.clone());
+    }
     while let Some(m) = worklist.pop() {
-        if !seen.insert(m.clone())
-            || crate::module_builder::is_builtin_toolchain_module(&cfg.toolchain_lib_lean, &m)
-        {
+        if !seen.insert(m.clone()) {
             continue;
         }
         let rel = format!("{}.olean", crate::module_builder::module_name_to_rel_slash(&m));
         let Some(path) = dirs.iter().map(|d| d.join(&rel)).find(|p| p.is_file()) else {
             continue;
         };
-        if path.starts_with(&cfg.toolchain_lib_lean) {
+        if crate::module_builder::is_verified_toolchain_olean_file(
+            &cfg.toolchain_lib_lean,
+            Some(&cfg.lean_githash),
+            &path,
+        ) {
             continue;
         }
         let bytes = fs::read(&path)?;
@@ -2141,20 +2165,25 @@ pub(crate) fn resolve_replayed_prebuilt_module_import(
         return None;
     }
     let lean_path = resolve_remote_lean_path(canon_project_dir, None);
-    let dirs: Vec<PathBuf> = std::env::split_paths(&lean_path).collect();
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(&lean_path).collect();
+    if !cfg.toolchain_lib_lean.as_os_str().is_empty() && !dirs.contains(&cfg.toolchain_lib_lean) {
+        dirs.push(cfg.toolchain_lib_lean.clone());
+    }
     let bytes = fs::read(&olean_path).ok()?;
     let (imps, _) = crate::module_builder::parse_olean_binary_imports(&bytes)?;
     let mut worklist: Vec<String> = imps.into_iter().map(|i| i.module).collect();
     let mut seen = HashSet::new();
     while let Some(m) = worklist.pop() {
-        if !seen.insert(m.clone())
-            || crate::module_builder::is_builtin_toolchain_module(&cfg.toolchain_lib_lean, &m)
-        {
+        if !seen.insert(m.clone()) {
             continue;
         }
         let rel = format!("{}.olean", crate::module_builder::module_name_to_rel_slash(&m));
         let path = dirs.iter().map(|d| d.join(&rel)).find(|p| p.is_file())?;
-        if path.starts_with(&cfg.toolchain_lib_lean) {
+        if crate::module_builder::is_verified_toolchain_olean_file(
+            &cfg.toolchain_lib_lean,
+            Some(&cfg.lean_githash),
+            &path,
+        ) {
             continue;
         }
         if !crate::module_builder::is_olean_replayed_in_store(store, &cfg.lean_githash, &path) {
