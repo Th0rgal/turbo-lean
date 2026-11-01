@@ -111,7 +111,6 @@ structure CoreCLIOptions where
   numSamples : Nat := 4096
   useConstraintProp : Bool := true
   deriving Repr, Inhabited, BEq
-
 def parseCoreCLIOptions (args : List String) : IO CoreCLIOptions := do
   validateValueTakingFlags args
   let sel ← resolveInput args
@@ -415,41 +414,27 @@ def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → Targ
   return 0
 
 def runCompileMLIR (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
-  let outPath := findFlagValue args "-o" ""
+  let (outPath, baseMod) := (findFlagValue args "-o" "", ← loadInputModule elaborateHook? args)
   let isStableHLO := hasFlag args "--tpu" || hasFlag args "--stablehlo" || hasFlag args "--tpu-stablehlo"
   let isPallas := hasFlag args "--pallas" || hasFlag args "--tpu-pallas"
-  let baseMod ← loadInputModule elaborateHook? args
   let (optMod, _) := runDefaultPipeline baseMod
-  let mlirText :=
-    if isPallas then emitTPUPallasModule optMod
-    else if isStableHLO then emitStableHLOModule optMod
-    else emitMLIRModule optMod
+  let mlirText := if isPallas then emitTPUPallasModule optMod else if isStableHLO then emitStableHLOModule optMod else emitMLIRModule optMod
   let kind := if isPallas then "TPU Pallas" else if isStableHLO then "TPU v5e StableHLO" else "GPU MLIR"
   writeOrPrint outPath mlirText (some s!"[{tag}] Wrote {kind} module to {outPath}")
 
 def runCompilePTX (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
-  let smArch := findFlagValue args "--sm" "sm_90"
-  let outPath := findFlagValue args "-o" ""
-  let isFastCheck := hasFlag args "--fastcheck"
+  let (smArch, outPath, isFastCheck) := (findFlagValue args "--sm" "sm_90", findFlagValue args "-o" "", hasFlag args "--fastcheck")
   let baseMod ← loadInputModule elaborateHook? args isFastCheck
-  let ptxText :=
-    if isFastCheck then emitFastCheckPTX baseMod smArch
-    else emitPTXModule (runDefaultPipeline baseMod).1 smArch
+  let ptxText := if isFastCheck then emitFastCheckPTX baseMod smArch else emitPTXModule (runDefaultPipeline baseMod).1 smArch
   writeOrPrint outPath ptxText (some s!"[{tag}] Wrote NVIDIA PTX 8.0 ({smArch}, fastcheck={isFastCheck}) to {outPath}")
 
 def runCompileMetal (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
-  let outPath := findFlagValue args "-o" ""
-  let isFastCheck := hasFlag args "--fastcheck"
+  let (outPath, isFastCheck) := (findFlagValue args "-o" "", hasFlag args "--fastcheck")
   let baseMod ← loadInputModule elaborateHook? args isFastCheck
-  let mslText :=
-    if isFastCheck then emitFastCheckMetal baseMod
-    else emitMetalModule (runDefaultPipeline baseMod).1
+  let mslText := if isFastCheck then emitFastCheckMetal baseMod else emitMetalModule (runDefaultPipeline baseMod).1
   let (valid, errs) := validateMetalShader mslText
-  if !valid then
-    IO.eprintln s!"[{tag}] Metal shader validation errors: {errs}"
-    return 1
-  writeOrPrint outPath mslText
-    (some s!"[{tag}] Wrote Apple Metal Shading Language 3.0 (fastcheck={isFastCheck}, valid={valid}) to {outPath}")
+  if !valid then IO.eprintln s!"[{tag}] Metal shader validation errors: {errs}"; return 1
+  writeOrPrint outPath mslText (some s!"[{tag}] Wrote Apple Metal Shading Language 3.0 (fastcheck={isFastCheck}, valid={valid}) to {outPath}")
 
 def runCompileFastCheck (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   let outPath := findFlagValue args "-o" ""
@@ -941,18 +926,13 @@ def runEvalLNIR (elaborateHook? : Option (String → TargetArch → IO LNIRModul
   IO.println jsonRow
   return if ok then 0 else 1
 
-def runCompileClif (elaborateHook? : Option (String → TargetArch → IO LNIRModule))
-    (args : List String) : IO UInt32 := do
-  let m ← loadInputModule elaborateHook? args
-  let selected := findFlagValue args "--decl" ""
+def runCompileClif (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
+  let (m, selected, path) := (← loadInputModule elaborateHook? args, findFlagValue args "--decl" "", findFlagValue args "-o" "")
   let ds := if selected.isEmpty then m.decls else m.decls.filter (·.name == selected)
   if ds.isEmpty then throw <| IO.userError "[lean-native] No matching CLIF declarations"
-  let fs ← ds.mapM fun d =>
-    match LeanNative.Backend.Clif.lowerDecl d with
-    | .ok f => pure f
-    | .error e => throw <| IO.userError s!"[lean-native] {d.name}: {e}"
+  let fs ← ds.mapM fun d => match LeanNative.Backend.Clif.lowerDecl d with
+    | .ok f => pure f | .error e => throw <| IO.userError s!"[lean-native] {d.name}: {e}"
   let text := _root_.Clif.print { funcs := fs }
-  let path := findFlagValue args "-o" ""
   if path.isEmpty then IO.print text else IO.FS.writeFile path text
   return 0
 
