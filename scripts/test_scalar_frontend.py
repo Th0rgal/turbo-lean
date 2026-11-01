@@ -1258,11 +1258,11 @@ open LeanNative.IR LeanNative.Proofs
     params := []
     retTy := .i1
     body :=
-      .letBind 0 .objPtr (.allocCtor 0 [] [])
+      .letBind 9 .i64 (.scalar (.constU64 7)) (.letBind 0 .objPtr (.allocCtor 0 [] [9])
         (.letBind 1 .objPtr (.allocCtor 0 [0] [])
           (.letBind 2 .objPtr (.ctorGetObj 1 0)
             (.letBind 3 .i1 (.isExclusive (if project then 2 else 0))
-              (.decRef 1 1 (.ret 3)))))
+              (.decRef 1 1 (.ret 3))))))
   }
   let childRes := validateTranslationDecl (childDecl true) (childDecl false) 8
   unless childRes.passed && childRes.symRetEquiv do
@@ -1325,12 +1325,12 @@ open LeanNative.IR LeanNative.Proofs
     params := []
     retTy := .i1
     body :=
-      .letBind 0 .objPtr (.allocCtor 0 [] [])
+      .letBind 9 .i64 (.scalar (.constU64 7)) (.letBind 0 .objPtr (.allocCtor 0 [] [9])
         (.incRef 0 1
           (.letBind 1 .objPtr (.allocCtor 0 [0] [])
             (.decRef 1 1
               (.letBind 2 .i1 (if foldTrue then .scalar (.constBool true) else .isExclusive 0)
-                (.decRef 0 1 (.ret 2))))))
+                (.decRef 0 1 (.ret 2)))))))
   }
   let dropRes := validateTranslationDecl (mkParentDropDecl false) (mkParentDropDecl true) 8
   unless dropRes.passed && dropRes.symRetEquiv do
@@ -2254,12 +2254,14 @@ open LeanNative.IR LeanNative.Proofs
   unless !unkFreeBad.ubRefines && !unkFreeBad.passed do
     throw <| IO.userError s!"unknown-RC decRef on objPtr masked post-free alias read: {reprStr unkFreeBad}"
   -- 37. Zero-count `incRef a 0` / `decRef a 0` on a freed heap object must check liveness (never skipping `rc == 0` UB)!
+  --     The object needs a field: a fieldless `allocCtor 0 [] []` is the immediate `.tuple [0]` (Eval.lean C1.1), on
+  --     which `incRef`/`decRef` are no-ops in the concrete semantics, so it is never freed.
   let mkFreedZeroCountRcDecl (incZeroAt999 : Bool) : LNIRDecl := {
     name := "freed_zero_count_rc"
     params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
     retTy := .i64
     body :=
-      .letBind 1 .objPtr (.allocCtor 0 [] [])
+      .letBind 1 .objPtr (.allocCtor 0 [] [0])
         (.decRef 1 1
           (if incZeroAt999 then
              .letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
@@ -2277,7 +2279,8 @@ open LeanNative.IR LeanNative.Proofs
     params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
     retTy := .objPtr
     body :=
-      .letBind 1 .objPtr (.allocCtor 0 [] [])
+      -- heap ctor (one scalar field): RC ops on the immediate fieldless `allocCtor 0 [] []` are no-ops
+      .letBind 1 .objPtr (.allocCtor 0 [] [0])
         (.letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
           (.ite 2 (.incRef 1 count (.ret 1)) (.ret 1)))
   }
@@ -2585,17 +2588,17 @@ open LeanNative.IR LeanNative.Proofs
         (.ite 1
           (.letBind 2 .i64 (.scalar (.constU64 0))
             (.letBind 3 .i64 (.scalar (.constU64 4))
-              (.letBind 4 .objPtr (.allocCtor 0 [] [])
+              (.letBind 4 .objPtr (.allocCtor 0 [] [2])
                 (if allocInsideLoop then
                    .seqFor 5 2 3 6 4 .objPtr
-                     (.letBind 7 .objPtr (.allocCtor 0 [] []) (.ret 7))
+                     (.letBind 7 .objPtr (.allocCtor 0 [] [2]) (.ret 7))
                      (.ret 6)
                  else
-                   .letBind 7 .objPtr (.allocCtor 0 [] [])
+                   .letBind 7 .objPtr (.allocCtor 0 [] [2])
                      (.seqFor 5 2 3 6 4 .objPtr
                        (.ret 7)
                        (.ret 6))))))
-          (.letBind 8 .objPtr (.allocCtor 0 [] []) (.ret 8)))
+          (.letBind 8 .objPtr (.allocCtor 0 [] [0]) (.ret 8)))
   }
   let loopRepeatAllocBad := validateTranslationDecl (mkLoopRepeatAllocDecl true) (mkLoopRepeatAllocDecl false) 8
   unless !loopRepeatAllocBad.memWritesEquiv && !loopRepeatAllocBad.passed do
@@ -2609,14 +2612,14 @@ open LeanNative.IR LeanNative.Proofs
         (.ite 1
           (.letBind 2 .i64 (.scalar (.constU64 0))
             (.letBind 3 .i64 (.scalar (.constU64 4))
-              (.letBind 4 .objPtr (.allocCtor 0 [] [])
+              (.letBind 4 .objPtr (.allocCtor 0 [] [2])
                 (.seqFor 5 2 3 6 4 .objPtr
                   (if dropPrev then
-                     .decRef 6 1 (.letBind 7 .objPtr (.allocCtor 0 [] []) (.ret 7))
+                     .decRef 6 1 (.letBind 7 .objPtr (.allocCtor 0 [] [2]) (.ret 7))
                    else
-                     .letBind 7 .objPtr (.allocCtor 0 [] []) (.ret 7))
+                     .letBind 7 .objPtr (.allocCtor 0 [] [2]) (.ret 7))
                   (.ret 6)))))
-          (.letBind 8 .objPtr (.allocCtor 0 [] []) (.ret 8)))
+          (.letBind 8 .objPtr (.allocCtor 0 [] [0]) (.ret 8)))
   }
   let loopDropBad := validateTranslationDecl (mkLoopLinearChainDecl true) (mkLoopLinearChainDecl false) 8
   unless !loopDropBad.memWritesEquiv && !loopDropBad.passed do
@@ -2696,7 +2699,7 @@ open LeanNative.IR LeanNative.Proofs
     body :=
       .letBind 1 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
         (.ite 1
-          (.letBind 2 .objPtr (.allocCtor 0 [] [])
+          (.letBind 2 .objPtr (.allocCtor 0 [] [0])
             (.incRef 2 1
               (.letBind 3 .objPtr (.call "lean_native_ensure_exclusive" [2] .objPtr false)
                 (.letBind 4 .i1 (if constTrueAt999 then .scalar (.constBool true) else .isExclusive 2)
