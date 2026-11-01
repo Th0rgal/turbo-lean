@@ -1,0 +1,19 @@
+=== 2026-11-01T06:05:45Z [BEFORE-setup] ===
+ 06:05:45 up 136 days, 22:46,  0 user,  load average: 0.15, 0.22, 0.78
+cgroup_mem_bytes=4392812544 / 64560824320
+               total        used        free      shared  buff/cache   available
+Mem:            62Gi       3.6Gi        25Gi       2.2Mi        34Gi        59Gi
+Swap:          9.3Gi       305Mi       9.0Gi
+    PID USER     %CPU %MEM   RSS COMMAND
+   6531 orbnode  12.0  0.7 476012 opencode
+   5465 orbnode   0.3  0.0 17552 sandboxed-node
+   6549 orbnode   0.1  0.0 15180 sandboxed-mcp
+   6501 orbnode   0.0  0.0 14504 sandboxed-mcp
+    347 root      0.0  0.0  8344 ssh
+      1 root      0.0  0.0  1824 sh
+     51 root      0.0  0.0  3484 bash
+    341 root      0.0  0.0  2952 sshd
+   5462 root      0.0  0.0  3612 bash
+   5464 root      0.0  0.0  3468 runuser
+   6494 orbnode   0.0  0.0  4124 bash
+
