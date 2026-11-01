@@ -99,9 +99,9 @@ def scalarSlotIndexing : Bool :=
   retVal? (probeMixed (.ctorGetScalar 1 1 .i64)) == some (.u64 43)
 
 -- REGRESSION(layout_scalar_slot_indexing)
--- XFAIL(heapobj-contract): flips in 5b — `main` indexes the flat list `objFields ++ scalarFields`.
-#guard !scalarSlotIndexing
-/-- info: ok LeanNative.Semantics.Val.objPtr 1 | ok LeanNative.Semantics.Val.u64 42 -/
+-- Flipped by #300 (5b). Was XFAIL on `main`: `main` indexes the flat list `objFields ++ scalarFields`.
+#guard scalarSlotIndexing
+/-- info: ok LeanNative.Semantics.Val.u64 42 | ok LeanNative.Semantics.Val.u64 43 -/
 #guard_msgs in
 #eval IO.println s!"{showRes (probeMixed (.ctorGetScalar 1 0 .i64))} | {showRes (probeMixed (.ctorGetScalar 1 1 .i64))}"
 
@@ -112,9 +112,9 @@ def objIndexBounded : Bool :=
   | _ => false
 
 -- REGRESSION(layout_ctorGetObj_out_of_objFields_is_error)
--- XFAIL(heapobj-contract): flips in 5b — `main` lets `ctorGetObj 1` alias `scalarFields[0]`.
-#guard !objIndexBounded
-/-- info: ok LeanNative.Semantics.Val.u64 42 -/
+-- Flipped by #300 (5b). Was XFAIL on `main`: `main` lets `ctorGetObj 1` alias `scalarFields[0]`.
+#guard objIndexBounded
+/-- info: error LeanNative.Semantics.UBError.outOfBounds 1 1 -/
 #guard_msgs in
 #eval IO.println (showRes (probeMixed (.ctorGetObj 1 1)))
 
@@ -143,10 +143,10 @@ def scalarOOBBounded : Bool :=
   | _ => false
 
 -- REGRESSION(layout_scalar_oob_is_error)
--- XFAIL(heapobj-contract): flips in 5b — `main` bounds the index by the flat length (3), so index 2 reads
+-- Flipped by #300 (5b). Was XFAIL on `main`: `main` bounds the index by the flat length (3), so index 2 reads
 -- `scalarFields[1]`.
-#guard !scalarOOBBounded
-/-- info: ok LeanNative.Semantics.Val.u64 43 -/
+#guard scalarOOBBounded
+/-- info: error LeanNative.Semantics.UBError.outOfBounds 2 2 -/
 #guard_msgs in
 #eval IO.println (showRes (probeMixed (.ctorGetScalar 1 2 .i64)))
 
@@ -255,10 +255,11 @@ def nullaryCtorImmediate : Bool :=
    | .error _ => false)
 
 -- REGRESSION(nullary_ctor_is_immediate)
--- XFAIL(heapobj-contract): flips in 5b — `main`'s `allocCtor` calls `allocHeapCtor` even with empty field lists, so
--- the nullary ctor is heap object `2` with `rc = 1` (an `.objPtr`, a new `heapObjs` entry); #300 returns the immediate.
-#guard !nullaryCtorImmediate
-/-- info: ok LeanNative.Semantics.Val.objPtr 2 | heapObjs=1 rc=1 -/
+-- Flipped by #300 (5b). Was XFAIL on `main`: `main`'s `allocCtor` calls `allocHeapCtor` even with empty field lists,
+-- so the nullary ctor is heap object `2` with `rc = 1` (an `.objPtr`, a new `heapObjs` entry); #300 returns the
+-- immediate.
+#guard nullaryCtorImmediate
+/-- info: ok LeanNative.Semantics.Val.tuple [LeanNative.Semantics.Val.u64 3] | heapObjs=0 rc=0 -/
 #guard_msgs in
 #eval IO.println s!"{showRes allocNullary} | {match allocNullary with
   | .ok (_, st) => s!"heapObjs={st.heapObjs.length - (heapWithChild 1).heapObjs.length} rc={st.getObjRefCount 2}"
@@ -611,33 +612,33 @@ def heapOK (body : String) : Bool := IRCheck.heapBoxCarries (bxIR body) "bx" "%a
 def u64BoxIsHeap : Bool := boxIsHeap .i64
 
 -- REGRESSION(codegen_box_u64_high_bit)
--- XFAIL(heapobj-contract): flips in 5b — `main` boxes `i64` in-pointer (`shl 1 | 1`), dropping bit 63.
-#guard !u64BoxIsHeap
-#guard boxIsInPtr .i64
+-- Flipped by #300 (5b). Was XFAIL on `main`: `main` boxes `i64` in-pointer (`shl 1 | 1`), dropping bit 63.
+#guard u64BoxIsHeap
+#guard !boxIsInPtr .i64
 
 /-- Contract (C2.1 table): `USize` is boxed as a heap scalar object (`lean_box_usize`). -/
 def usizeBoxIsHeap : Bool := boxIsHeap .usize
 
 -- REGRESSION(codegen_box_usize_heap)
--- XFAIL(heapobj-contract): flips in 5b — `main` boxes `usize` in-pointer (`shl 1 | 1`).
-#guard !usizeBoxIsHeap
-#guard boxIsInPtr .usize
+-- Flipped by #300 (5b). Was XFAIL on `main`: `main` boxes `usize` in-pointer (`shl 1 | 1`).
+#guard usizeBoxIsHeap
+#guard !boxIsInPtr .usize
 
 /-- Contract (C2.1 table): `Float` is boxed as a heap scalar object (`lean_box_float`). -/
 def floatBoxIsHeap : Bool := boxIsHeap .f64
 
 -- REGRESSION(codegen_box_float_heap)
--- XFAIL(heapobj-contract): flips in 5b — `main` boxes `f64` in-pointer (`shl 1 | 1`).
-#guard !floatBoxIsHeap
-#guard boxIsInPtr .f64
+-- Flipped by #300 (5b). Was XFAIL on `main`: `main` boxes `f64` in-pointer (`shl 1 | 1`).
+#guard floatBoxIsHeap
+#guard !boxIsInPtr .f64
 
 /-- Contract (C2.1 table): `Float32` is boxed as a heap scalar object (`lean_box_float32`). -/
 def float32BoxIsHeap : Bool := boxIsHeap .f32
 
 -- REGRESSION(codegen_box_float32_heap)
--- XFAIL(heapobj-contract): flips in 5b — `main` boxes `f32` in-pointer (`shl 1 | 1`).
-#guard !float32BoxIsHeap
-#guard boxIsInPtr .f32
+-- Flipped by #300 (5b). Was XFAIL on `main`: `main` boxes `f32` in-pointer (`shl 1 | 1`).
+#guard float32BoxIsHeap
+#guard !boxIsInPtr .f32
 
 -- REGRESSION(codegen_rc_checks_tag_bit)
 -- Structural: inline RC (`incRef`/`decRef`) and the `lean_native_inc`/`lean_native_dec` helpers dereference
@@ -652,9 +653,9 @@ def isxDecl : LNIRDecl := mkDecl "isx" (.letBind 1 .i64 (.isExclusive 0) (.ret 1
 def isExclusiveCodegenTagChecked : Bool := IRCheck.allGuarded (declDerefs isxDecl)
 
 -- REGRESSION(codegen_isExclusive_checks_tag_bit)
--- XFAIL(heapobj-contract): flips in 5b — LLVM emits a direct `load i32` from the object pointer (P-cert C5).
-#guard !isExclusiveCodegenTagChecked
-#guard declDerefs isxDecl == [false]
+-- Flipped by #300 (5b). Was XFAIL on `main`: LLVM emits a direct `load i32` from the object pointer (P-cert C5).
+#guard isExclusiveCodegenTagChecked
+#guard declDerefs isxDecl == [true]
 
 /-- A field projection on a `taggedPtr` parameter. -/
 def projDecl : LNIRDecl :=
@@ -701,10 +702,13 @@ def prjOK (heapPath : String) (off : Nat := 8) : Bool := IRCheck.projectionLoads
 #guard prjOK "  %a = getelementptr inbounds i8, ptr %p, i64 16\n  %r = load ptr, ptr %a, align 8\n  ret ptr %r\n" 16
 
 -- REGRESSION(codegen_projection_guarded_field_load)
--- XFAIL(heapobj-contract): flips in 5b — `ctorGetObj` emits no field load at all (it copies the object
--- pointer), so there is neither a field read nor a guard.
+-- XFAIL(heapobj-contract): flips in 5b — #300 emits the guarded field load at `P + 8` (`declDerefs` is `[true]`),
+-- but stores it to `%slot_v1` in `proj_heap_7` and reloads it in `proj_cont_10`; the block-local reload rule
+-- (`IRCheck.Fn.reachingStore`) resolves that cross-block reload to `uninitOrigin`, so the returned value is not
+-- recognised as the field load. Flips once the emitter returns the load without a cross-block slot round-trip, or
+-- the reload rule is made CFG-aware.
 #guard !projectionGuardedLoad
-#guard declDerefs projDecl == []
+#guard declDerefs projDecl == [true]
 
 -- REGRESSION(codegen_tag_read_rejected)
 -- C2.3 fallback, tag reads: `main` has no tag-read lowering, so a decl reading the tag is rejected by
@@ -720,10 +724,10 @@ def unguardedDeclRejected (d : LNIRDecl) : Bool :=
 def isxDeclGuardedOrRejected : Bool := unguardedDeclRejected isxDecl
 
 -- REGRESSION(codegen_unguarded_decl_rejected)
--- XFAIL(heapobj-contract): flips in 5b — the `isExclusive` decl is emitted with an unguarded load and
+-- Flipped by #300 (5b). Was XFAIL on `main`: the `isExclusive` decl is emitted with an unguarded load and
 -- `findUnsupportedLLVMCallInCode` returns `none`.
-#guard !isxDeclGuardedOrRejected
-#guard (LeanNative.Backend.LLVM.findUnsupportedLLVMCallInCode [] isxDecl.body).isNone
+#guard isxDeclGuardedOrRejected
+#guard LeanNative.Backend.LLVM.findUnsupportedLLVMCallInCode [] isxDecl.body == some "rc_adt"
 
 /-- Contract: a nullary ctor with tag `t` is emitted as `lean_box(t)` (`inttoptr (2t+1)`), never `null`. -/
 def nullaryCtorCodegenBoxed : Bool :=
@@ -732,8 +736,8 @@ def nullaryCtorCodegenBoxed : Bool :=
   (LeanNative.Backend.LLVM.emitDeclLLVM true d).contains "inttoptr i64 7"
 
 -- REGRESSION(codegen_nullary_ctor_boxed)
--- XFAIL(heapobj-contract): flips in 5b — LLVM stores `null` for every nullary `allocCtor`.
-#guard !nullaryCtorCodegenBoxed
+-- Flipped by #300 (5b). Was XFAIL on `main`: LLVM stores `null` for every nullary `allocCtor`.
+#guard nullaryCtorCodegenBoxed
 
 /-! ## C3 owning-edge multiplicity & decRef total-or-error -/
 
@@ -892,10 +896,10 @@ def nestedTupleOwnershipRejected : Bool :=
   | _ => false
 
 -- REGRESSION(wf_objFields_no_nested_tuple_ownership)
--- XFAIL(heapobj-contract): flips in 5b — `main`'s `allocCtor` accepts the owning tuple and stores it as a field
+-- Flipped by #300 (5b). Was XFAIL on `main`: `main`'s `allocCtor` accepts the owning tuple and stores it as a field
 -- of a fresh heap object instead of rejecting it.
-#guard !nestedTupleOwnershipRejected
-/-- info: ok LeanNative.Semantics.Val.objPtr 2 -/
+#guard nestedTupleOwnershipRejected
+/-- info: error LeanNative.Semantics.UBError.typeError "allocCtor: object field is a tuple owning an edge" -/
 #guard_msgs in
 #eval IO.println (showRes allocMalformedField)
 
@@ -1007,9 +1011,9 @@ def ctorSetExclusiveUpdates : Bool :=
 def delSharedIsUB : Bool := isNonExclusiveWrite (withCtor 1 (.call "lean_native_del_obj" [1] .unit))
 
 -- REGRESSION(del_shared_is_ub)
--- XFAIL(heapobj-contract): flips in 5b — `lean_native_del_obj` is not an LNIR operation on `main`.
-#guard !delSharedIsUB
-/-- info: error LeanNative.Semantics.UBError.unsupportedCall "lean_native_del_obj" -/
+-- Flipped by #300 (5b). Was XFAIL on `main`: `lean_native_del_obj` is not an LNIR operation on `main`.
+#guard delSharedIsUB
+/-- info: error LeanNative.Semantics.UBError.nonExclusiveWrite 2 -/
 #guard_msgs in
 #eval IO.println (showRes (withCtor 1 (.call "lean_native_del_obj" [1] .unit)))
 
@@ -1026,9 +1030,9 @@ def delExclusivePreservesFields : Bool :=
   | _ => false
 
 -- REGRESSION(del_exclusive_preserves_fields)
--- XFAIL(heapobj-contract): flips in 5b — `lean_native_del_obj` is not an LNIR operation on `main`.
-#guard !delExclusivePreservesFields
-/-- info: error LeanNative.Semantics.UBError.unsupportedCall "lean_native_del_obj" -/
+-- Flipped by #300 (5b). Was XFAIL on `main`: `lean_native_del_obj` is not an LNIR operation on `main`.
+#guard delExclusivePreservesFields
+/-- info: ok LeanNative.Semantics.Val.objPtr 2 -/
 #guard_msgs in
 #eval IO.println (showRes delExclusive)
 
@@ -1042,10 +1046,10 @@ def ctorSetOOBIsError : Bool :=
   | _ => false
 
 -- REGRESSION(ctor_set_out_of_bounds_is_error)
--- XFAIL(heapobj-contract): flips in 5b — `main` bounds the index by the flat field list (`objFields ++
+-- Flipped by #300 (5b). Was XFAIL on `main`: `main` bounds the index by the flat field list (`objFields ++
 -- scalarFields`, length 2), not by `objFields` (length 1).
-#guard !ctorSetOOBIsError
-/-- info: error LeanNative.Semantics.UBError.outOfBounds 5 2 -/
+#guard ctorSetOOBIsError
+/-- info: error LeanNative.Semantics.UBError.outOfBounds 5 1 -/
 #guard_msgs in
 #eval IO.println (showRes ctorSetOOB)
 
@@ -1060,9 +1064,9 @@ def ctorSetNestedTupleRejected : Bool :=
   | _ => false
 
 -- REGRESSION(ctor_set_nested_tuple_ownership_rejected)
--- XFAIL(heapobj-contract): flips in 5b — `main`'s `ctor_set` accepts the owning tuple and writes it in place.
-#guard !ctorSetNestedTupleRejected
-/-- info: ok LeanNative.Semantics.Val.unit -/
+-- Flipped by #300 (5b). Was XFAIL on `main`: `main`'s `ctor_set` accepts the owning tuple and writes it in place.
+#guard ctorSetNestedTupleRejected
+/-- info: error LeanNative.Semantics.UBError.typeError "ctor_set: field value is a tuple owning an edge" -/
 #guard_msgs in
 #eval IO.println (showRes ctorSetMalformed)
 
@@ -1077,10 +1081,10 @@ def freedMutationIsUAF : Bool :=
   isUseAfterFree (onFreedCtor ctorSet) && isUseAfterFree (onFreedCtor (.call "lean_native_del_obj" [1] .unit))
 
 -- REGRESSION(mutation_freed_is_error)
--- XFAIL(heapobj-contract): flips in 5b — `ctor_set` on a freed object is already `useAfterFree` (#280), but
+-- Flipped by #300 (5b). Was XFAIL on `main`: `ctor_set` on a freed object is already `useAfterFree` (#280), but
 -- `lean_native_del_obj` does not exist on `main` (`unsupportedCall`).
-#guard !freedMutationIsUAF
-/-- info: error LeanNative.Semantics.UBError.useAfterFree 2 | error LeanNative.Semantics.UBError.unsupportedCall "lean_native_del_obj" -/
+#guard freedMutationIsUAF
+/-- info: error LeanNative.Semantics.UBError.useAfterFree 2 | error LeanNative.Semantics.UBError.useAfterFree 2 -/
 #guard_msgs in
 #eval IO.println s!"{showRes (onFreedCtor ctorSet)} | {showRes (onFreedCtor (.call "lean_native_del_obj" [1] .unit))}"
 
@@ -1103,9 +1107,9 @@ def symtvFuelExhaustionFailsClosed : Bool :=
   !(validateTranslationDecl (scalarDecl "long" (longBody 300)) (scalarDecl "long" (longBody 300))).passed
 
 -- REGRESSION(symtv_fuel_exhaustion_fails_closed)
--- XFAIL(heapobj-contract): flips in 5b — `symExecCode` silently returns `.unit` at fuel 0 and the
+-- Flipped by #300 (5b). Was XFAIL on `main`: `symExecCode` silently returns `.unit` at fuel 0 and the
 -- identical-but-unexplored decls pass.
-#guard !symtvFuelExhaustionFailsClosed
+#guard symtvFuelExhaustionFailsClosed
 
 /-- `drop(o, x)` with body `body`. -/
 def dropDecl (body : LNIRCode) : LNIRDecl :=
@@ -1145,13 +1149,13 @@ def fuelHungryExhausted : Nat :=
 def symtvSourceFuelExhaustionFailsClosed : Bool := !(validateTranslationDecl fuelHungry fuelHungry).passed
 
 -- REGRESSION(symtv_source_fuel_exhaustion_fails_closed)
--- XFAIL(heapobj-contract): flips in 5b — C6.3: samples where the source exhausts evaluator fuel (at the
+-- Flipped by #300 (5b). Was XFAIL on `main`: C6.3: samples where the source exhausts evaluator fuel (at the
 -- validator's floor 256) are counted as "source UB" (vacuous), so the decl still passes. The contract requires
 -- `passed = false`. The pin shows that `main` reports the exhaustion as `.outOfBounds 320 256`; on flip it becomes
 -- the distinguished `.fuelExhausted` (5b).
-#guard !symtvSourceFuelExhaustionFailsClosed
+#guard symtvSourceFuelExhaustionFailsClosed
 #guard fuelHungryExhausted > 0
-/-- info: error LeanNative.Semantics.UBError.outOfBounds 320 256 -/
+/-- info: error LeanNative.Semantics.UBError.fuelExhausted -/
 #guard_msgs in
 #eval IO.println (showRes (fuelHungrySample 256 0))
 
