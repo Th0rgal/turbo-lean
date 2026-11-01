@@ -5353,6 +5353,8 @@ fn collect_fresh_dep_pkg_closure(
         let Ok(src) = fs::read_to_string(&cur.src_path) else {
             return Ok(None);
         };
+        splitter::reject_checking_weakening(&src)
+            .with_context(|| format!("Module {} ({})", cur.module_name, cur.src_path.display()))?;
         let hdr = parse_header_info(&src);
         if hdr.header_error.is_some() {
             return Ok(None);
@@ -8704,6 +8706,84 @@ fn audit_or_replay_modules(
 /// on-disk `.olean`+`.ilean` bytes, `ZYGOTE_REPLAY_VERSION`, and `lean_githash`) or be
 /// independently replayed now. Checkout manifests (`.turbo_verified_sources.json`) are freshness
 /// metadata only and never grant replay authority. Fails closed.
+/// Verify that an imported non-toolchain module belonging to the workspace root package or one
+/// of its dependency packages resolves unambiguously to a `.lean` source file whose directives
+/// satisfy checking-weakening and native-decide hygiene gates. Fails closed if a workspace or
+/// dependency package `.olean` artifact lacks a resolvable `.lean` source or fails source hygiene.
+pub(crate) fn verify_imported_package_module_source_hygiene(
+    cfg: &ProjectConfig,
+    mod_name: &str,
+    olean_path: &Path,
+    allowed_axioms: &[String],
+) -> Result<()> {
+    let mut specs = Vec::new();
+    if let Some(root_spec) = resolve_module_in_package(&cfg.root_pkg, true, mod_name) {
+        specs.push(root_spec);
+    }
+    for dp in &cfg.dep_pkgs {
+        if let Some(dep_spec) = resolve_module_in_package(dp, false, mod_name) {
+            specs.push(dep_spec);
+        }
+    }
+    let canon_olean = olean_path
+        .canonicalize()
+        .unwrap_or_else(|_| olean_path.to_path_buf());
+    let belongs_to_pkg = std::iter::once(&cfg.root_pkg)
+        .chain(cfg.dep_pkgs.iter())
+        .any(|pkg| {
+            let pkg_root_canon = pkg
+                .pkg_root
+                .canonicalize()
+                .unwrap_or_else(|_| pkg.pkg_root.clone());
+            let pkg_lib_canon = pkg
+                .pkg_root
+                .join(&pkg.build_dir)
+                .join(&pkg.lean_lib_dir)
+                .canonicalize()
+                .unwrap_or_else(|_| pkg.pkg_root.join(&pkg.build_dir).join(&pkg.lean_lib_dir));
+            canon_olean.starts_with(&pkg_lib_canon) || canon_olean.starts_with(&pkg_root_canon)
+        });
+    if specs.len() > 1 {
+        let pkg_names: Vec<&str> = specs.iter().map(|s| s.pkg_name.as_str()).collect();
+        anyhow::bail!(
+            "Ambiguous imported module `{mod_name}` resolved in multiple packages ({pkg_names:?}): fail-closed"
+        );
+    }
+    let Some(spec) = specs.into_iter().next() else {
+        if belongs_to_pkg {
+            anyhow::bail!(
+                "Workspace/dependency `.olean` `{}` for imported module `{mod_name}` has no resolvable `.lean` source in project or dependency packages: fail-closed",
+                olean_path.display()
+            );
+        }
+        return Ok(());
+    };
+    let src = fs::read_to_string(&spec.src_path).with_context(|| {
+        format!(
+            "Failed to read `.lean` source `{}` for imported module `{mod_name}`: fail-closed",
+            spec.src_path.display()
+        )
+    })?;
+    let hygiene = splitter::audit_hygiene(&splitter::strip_lean_comments(&src));
+    anyhow::ensure!(
+        !hygiene.has_checking_weakening,
+        "Soundness hygiene violation in imported module `{mod_name}` ({}): {:?}",
+        spec.src_path.display(),
+        hygiene.disallowed_items_under(allowed_axioms)
+    );
+    anyhow::ensure!(
+        !hygiene.native_violation_under(allowed_axioms),
+        "[TurboLean.KernelGate] native_decide/bv_decide in imported module `{mod_name}` ({}) is not admitted by the project's axiom allowlist",
+        spec.src_path.display()
+    );
+    anyhow::ensure!(
+        !hygiene.has_trust_compiler,
+        "Soundness hygiene violation (trustCompiler) in imported module `{mod_name}` ({})",
+        spec.src_path.display()
+    );
+    Ok(())
+}
+
 pub(crate) fn ensure_imported_oleans_replayed(
     store: &TurboStore,
     canon_dir: &Path,
@@ -8717,6 +8797,22 @@ pub(crate) fn ensure_imported_oleans_replayed_with_roots(
     canon_dir: &Path,
     target_files: &[PathBuf],
     root_modules: &[String],
+) -> Result<usize> {
+    ensure_imported_oleans_replayed_with_roots_and_axioms(
+        store,
+        canon_dir,
+        target_files,
+        root_modules,
+        &splitter::allowed_axioms(),
+    )
+}
+
+pub(crate) fn ensure_imported_oleans_replayed_with_roots_and_axioms(
+    store: &TurboStore,
+    canon_dir: &Path,
+    target_files: &[PathBuf],
+    root_modules: &[String],
+    allowed_axioms: &[String],
 ) -> Result<usize> {
     let mut worklist: Vec<String> = target_files
         .iter()
@@ -8753,12 +8849,13 @@ pub(crate) fn ensure_imported_oleans_replayed_with_roots(
             }
         }
         let bytes = fs::read(&path)?;
-        worklist.extend(
-            parse_olean_binary_imports(&bytes)
-                .map(|(imps, _)| imps.into_iter().map(|i| i.module))
-                .into_iter()
-                .flatten(),
-        );
+        let (imps, _) = parse_olean_binary_imports(&bytes).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Failed to parse binary `.olean` header of imported `{m}` (`{}`): fail-closed",
+                path.display()
+            )
+        })?;
+        worklist.extend(imps.into_iter().map(|i| i.module));
         imported.push((m, path));
     }
     if imported.is_empty() {
@@ -8770,6 +8867,7 @@ pub(crate) fn ensure_imported_oleans_replayed_with_roots(
     let mut pending = Vec::new();
     let replay_lp = format!("{}:{}", lean_path, cfg.toolchain_lib_lean.display());
     for (m, path) in &imported {
+        verify_imported_package_module_source_hygiene(&cfg, m, path, allowed_axioms)?;
         if !is_olean_replayed_in_store(store, &cfg, &replay_lp, path) {
             pending.push(m.clone());
         }
@@ -13412,6 +13510,185 @@ roots = ["Fast"]
             !is_olean_replayed_in_store(&ext_store, &env_cfg, &env_lp, &mid_olean),
             "editing child Base.olean must invalidate parent Mid.olean replay authority"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_prebuilt_dependency_checking_weakening_directive_and_missing_source_rejected() -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = make_temp_test_dir("dep_source_hygiene");
+        let (proj, dep) = (dir.join("app"), dir.join("app/.lake/packages/dep"));
+        fs::create_dir_all(dep.join("Dep"))?;
+        let toolchain = include_str!("../../../lean/lean-toolchain");
+        fs::write(proj.join("lean-toolchain"), toolchain)?;
+        fs::write(dep.join("lean-toolchain"), toolchain)?;
+        fs::write(
+            dep.join("lakefile.toml"),
+            "name = \"dep\"\n[[lean_lib]]\nname = \"Dep\"\n",
+        )?;
+        let dep_src = "set_option debug.skipKernelTC true\ntheorem ok : True := True.intro\n";
+        fs::write(dep.join("Dep/Weak.lean"), dep_src)?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            r#"{"version": "1.2.0", "packagesDir": ".lake/packages", "packages": [{"type": "path", "name": "dep", "dir": ".lake/packages/dep", "configFile": "lakefile.toml", "inherited": false}], "name": "app", "lakeDir": ".lake", "fixedToolchain": false}"#,
+        )?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"app\"\ndefaultTargets = [\"App\"]\n[[require]]\nname = \"dep\"\npath = \".lake/packages/dep\"\n[[lean_lib]]\nname = \"App\"\n",
+        )?;
+        fs::write(
+            proj.join("App.lean"),
+            "import Dep.Weak\ntheorem uses_ok : True := ok\n",
+        )?;
+
+        let cfg = resolve_project_config(&proj)?;
+        let lake_bin = cfg
+            .lean_bin
+            .parent()
+            .expect("lean bin parent")
+            .join("lake");
+        let lake_out = Command::new(&lake_bin)
+            .args(["build", "App"])
+            .current_dir(&proj)
+            .env("SANDBOXED_ALLOW_RAW_LAKE", "1")
+            .output()?;
+        anyhow::ensure!(
+            lake_out.status.success(),
+            "lake build App: {} {}",
+            String::from_utf8_lossy(&lake_out.stdout),
+            String::from_utf8_lossy(&lake_out.stderr)
+        );
+
+        let mut store = TurboStore::open(Some(&dir.join("cache")))?;
+
+        // 1. `check` rejects importing a prebuilt dependency whose `.lean` source contains
+        // `set_option debug.skipKernelTC true`, even though `ok : True := True.intro` kernel-replays cleanly.
+        let check_err = crate::check::evaluate_check_command_value(
+            &mut store,
+            proj.join("App.lean"),
+            None,
+            proj.clone(),
+        )
+        .unwrap_err();
+        let check_msg = format!("{check_err:#}");
+        assert!(
+            check_msg.contains("checking-weakening") || check_msg.contains("Soundness hygiene violation"),
+            "check must reject prebuilt dependency checking-weakening directive: {check_msg}"
+        );
+
+        // 2. `ci-verify` rejects the prebuilt dependency as well.
+        let ci_err = crate::pr_verify::run_ci_verify_command(
+            &mut store,
+            true,
+            "trusted".to_string(),
+            proj.clone(),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap_err();
+        let ci_msg = format!("{ci_err:#}");
+        assert!(
+            ci_msg.contains("checking-weakening") || ci_msg.contains("Soundness hygiene violation"),
+            "ci-verify must reject prebuilt dependency checking-weakening directive: {ci_msg}"
+        );
+
+        // 3. `pr-verify` rejects a PR whose dependency has `set_option debug.skipKernelTC true`.
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec![
+                "add",
+                "lean-toolchain",
+                "lakefile.toml",
+                "lake-manifest.json",
+                "App.lean",
+            ],
+            vec!["commit", "-m", "base"],
+        ] {
+            let g = Command::new("git").args(&args).current_dir(&proj).output()?;
+            anyhow::ensure!(
+                g.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&g.stderr)
+            );
+        }
+        fs::write(
+            proj.join("App.lean"),
+            "import Dep.Weak\ntheorem uses_ok : True := by exact ok\n",
+        )?;
+        let receipt_path = dir.join("pr_receipt.json");
+        let pr_err = crate::pr_verify::run_pr_verify_command(
+            &mut store,
+            true,
+            proj.clone(),
+            "HEAD".to_string(),
+            "trusted".to_string(),
+            true,
+            Some(receipt_path.clone()),
+            None,
+            None,
+            None,
+            false,
+            2,
+            None,
+        )
+        .unwrap_err();
+        let pr_msg = format!("{pr_err:#}");
+        assert!(
+            pr_msg.contains("checking-weakening") || pr_msg.contains("Soundness hygiene violation"),
+            "pr-verify must reject prebuilt dependency checking-weakening directive: {pr_msg}"
+        );
+        assert!(
+            !receipt_path.exists(),
+            "rejected pr-verify must emit no receipt"
+        );
+
+        // 4. Deleting `Dep/Weak.lean` while leaving `Dep/Weak.olean` in `.lake/packages/dep/.lake/build/lib/lean`
+        // must also fail closed on both `check` and `pr-verify` due to missing package `.lean` source.
+        fs::remove_file(dep.join("Dep/Weak.lean"))?;
+        let missing_src_check = crate::check::evaluate_check_command_value(
+            &mut store,
+            proj.join("App.lean"),
+            None,
+            proj.clone(),
+        )
+        .unwrap_err();
+        let missing_check_msg = format!("{missing_src_check:#}");
+        assert!(
+            missing_check_msg.contains("no resolvable `.lean` source"),
+            "check must reject package `.olean` without `.lean` source: {missing_check_msg}"
+        );
+        let missing_src_pr = crate::pr_verify::run_pr_verify_command(
+            &mut store,
+            true,
+            proj.clone(),
+            "HEAD".to_string(),
+            "trusted".to_string(),
+            true,
+            Some(receipt_path.clone()),
+            None,
+            None,
+            None,
+            false,
+            2,
+            None,
+        )
+        .unwrap_err();
+        let missing_pr_msg = format!("{missing_src_pr:#}");
+        assert!(
+            missing_pr_msg.contains("no resolvable `.lean` source"),
+            "pr-verify must reject package `.olean` without `.lean` source: {missing_pr_msg}"
+        );
+        assert!(!receipt_path.exists());
 
         let _ = fs::remove_dir_all(&dir);
         Ok(())

@@ -1913,14 +1913,27 @@ pub(crate) fn ensure_project_and_imported_oleans_replayed_in_store(
             continue;
         }
         let bytes = fs::read(&path)?;
-        if let Some((imps, _)) = crate::module_builder::parse_olean_binary_imports(&bytes) {
-            worklist.extend(imps.into_iter().map(|i| i.module));
-        }
+        let (imps, _) = crate::module_builder::parse_olean_binary_imports(&bytes).ok_or_else(
+            || {
+                anyhow::anyhow!(
+                    "Failed to parse binary `.olean` header of imported `{m}` (`{}`): fail-closed",
+                    path.display()
+                )
+            },
+        )?;
+        worklist.extend(imps.into_iter().map(|i| i.module));
         dep_mods.push((m, path));
     }
+    let allowed_axioms = crate::splitter::allowed_axioms();
     let replay_lp = format!("{}:{}", lean_path, cfg.toolchain_lib_lean.display());
     let mut pending_deps = Vec::new();
     for (m, path) in &dep_mods {
+        crate::module_builder::verify_imported_package_module_source_hygiene(
+            &cfg,
+            m,
+            path,
+            &allowed_axioms,
+        )?;
         if !crate::module_builder::is_olean_replayed_in_store(store, &cfg, &replay_lp, path) {
             pending_deps.push(m.clone());
         }

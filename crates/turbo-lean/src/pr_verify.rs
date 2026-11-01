@@ -4214,6 +4214,14 @@ fn certify_head_statement_modules_and_replay(
         worklist.extend(imps.into_iter().map(|i| i.module));
         dep_mods.push((m, path));
     }
+    for (m, path) in &dep_mods {
+        crate::module_builder::verify_imported_package_module_source_hygiene(
+            &cfg,
+            m,
+            path,
+            &policy.axioms,
+        )?;
+    }
 
     if is_untrusted {
         let mut all_mods: Vec<String> = dep_mods
