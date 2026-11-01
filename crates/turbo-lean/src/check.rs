@@ -2523,7 +2523,9 @@ pub(crate) fn compute_fission_store_key_with_args(
     let mut base = if allowed.len() > splitter::STANDARD_AXIOMS.len() {
         let ax_hash = blake3::hash(allowed.join(",").as_bytes()).to_hex();
         format!(
-            "fission-v2:{}:{}:{}:ax:{}",
+            "fission-v3:{}:{}:{}:{}:{}:ax:{}",
+            crate::zygote::ZYGOTE_SCANNER_VERSION,
+            crate::zygote::ZYGOTE_REPLAY_VERSION,
             toolchain,
             prefix_env_hash,
             sub_shard_key,
@@ -2531,8 +2533,12 @@ pub(crate) fn compute_fission_store_key_with_args(
         )
     } else {
         format!(
-            "fission-v2:{}:{}:{}",
-            toolchain, prefix_env_hash, sub_shard_key
+            "fission-v3:{}:{}:{}:{}:{}",
+            crate::zygote::ZYGOTE_SCANNER_VERSION,
+            crate::zygote::ZYGOTE_REPLAY_VERSION,
+            toolchain,
+            prefix_env_hash,
+            sub_shard_key
         )
     };
     if let Some(opts_digest) = crate::module_builder::effective_lean_args_digest(lean_args) {
@@ -2540,6 +2546,28 @@ pub(crate) fn compute_fission_store_key_with_args(
         base.push_str(&opts_digest);
     }
     base
+}
+
+fn subshard_receipt_provenance_ok(store: &TurboStore, blob_hash: &str) -> bool {
+    let Ok(bytes) = fs::read(store.blob_path(blob_hash)) else {
+        return false;
+    };
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    let version = |field: &str| val[field].as_u64().and_then(|v| u32::try_from(v).ok());
+    crate::zygote::verifier_provenance_ok(
+        version("scanner_version").unwrap_or(0),
+        version("replay_version").unwrap_or(0),
+    )
+}
+
+fn store_has_provenanced_subshard(store: &TurboStore, key: &str) -> bool {
+    store
+        .batch_get_theorem_shards_readonly(std::slice::from_ref(&key.to_string()), "trusted")
+        .ok()
+        .and_then(|m| m.get(key).cloned())
+        .is_some_and(|bh| subshard_receipt_provenance_ok(store, &bh))
 }
 
 fn extract_decl_source_from_file(active_src: &str, shard: &splitter::TheoremShard) -> String {
@@ -3239,9 +3267,12 @@ fn check_single_decl(
                         )
                     })
                     .collect();
-                let cached_subs = store
-                    .batch_get_theorem_shards(&fission_keys, "trusted")
-                    .unwrap_or_default();
+                let cached_subs: HashMap<String, String> = store
+                    .batch_get_theorem_shards_readonly(&fission_keys, "trusted")
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|(_, bh)| subshard_receipt_provenance_ok(store, bh))
+                    .collect();
                 let fission_cold_enabled = std::env::var("TURBO_LEAN_FISSION_COLD").as_deref()
                     == Ok("1")
                     || crate::shm_cache::MemoryBudgetGovernor::detect().is_low_memory_mode();
@@ -3390,6 +3421,8 @@ fn check_single_decl(
                                         "stmt_hash": sub_hash,
                                         "proof_hash": sub_hash,
                                         "verified_at": now_ts,
+                                        "scanner_version": crate::zygote::ZYGOTE_SCANNER_VERSION,
+                                        "replay_version": crate::zygote::ZYGOTE_REPLAY_VERSION,
                                     }))?;
                                     newly_verified_subshards.push((
                                         (*f_key).clone(),
@@ -4110,6 +4143,8 @@ fn check_single_decl(
                         "proof_hash": sub_hash,
                         "seeded_from_full_decl": true,
                         "verified_at": now,
+                        "scanner_version": crate::zygote::ZYGOTE_SCANNER_VERSION,
+                        "replay_version": crate::zygote::ZYGOTE_REPLAY_VERSION,
                     }))?;
                     seed_items.push((f_key, sub.step_label.clone(), sub_receipt, per_sub_dur));
                 }
@@ -5130,7 +5165,7 @@ pub fn verify_subshards_out_of_core(
     let prefix_env_hash = blake3::hash(prefix_source.as_bytes()).to_hex().to_string();
     let (mut disk_cached_hits, mut newly_verified) = (0usize, 0usize);
     for (step_label, sub_shard_key, sub_decl_source) in subshards {
-        if store.has_theorem_shard(sub_shard_key) {
+        if store_has_provenanced_subshard(store, sub_shard_key) {
             let _ = store.batch_increment_action_hits(std::slice::from_ref(sub_shard_key));
             disk_cached_hits += 1;
             continue;
@@ -5161,6 +5196,8 @@ pub fn verify_subshards_out_of_core(
         let receipt = serde_json::to_vec(&serde_json::json!({
             "decl": step_label, "sub_shard_key": sub_shard_key, "prefix_env_hash": prefix_env_hash,
             "stmt_hash": sub_hash, "proof_hash": sub_hash, "verified_at": db::now_unix(),
+            "scanner_version": crate::zygote::ZYGOTE_SCANNER_VERSION,
+            "replay_version": crate::zygote::ZYGOTE_REPLAY_VERSION,
         }))?;
         store.put_theorem_shard(toolchain, sub_shard_key, step_label, &receipt, dur_ms)?;
         newly_verified += 1;
@@ -6618,5 +6655,243 @@ theorem after_macro : ext_magic = 7 := rfl
 
         let _ = fs::remove_dir_all(&dir);
         Ok(())
+    }
+
+    #[test]
+    fn test_fission_subshard_rejects_legacy_v2_keys_and_unattested_v3_receipts() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_fission_provenance_test_{}",
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let (store_dir, proj_dir) = (tmp_dir.join("store"), tmp_dir.join("proj"));
+        fs::create_dir_all(&store_dir).unwrap();
+        fs::create_dir_all(&proj_dir).unwrap();
+
+        let toolchain = "leanprover/lean4:v4.35.0";
+        let f_key = compute_fission_store_key(toolchain, "pref_hash", "sub_hash");
+        assert!(
+            f_key.starts_with(&format!(
+                "fission-v3:{}:{}:{}:pref_hash:sub_hash",
+                crate::zygote::ZYGOTE_SCANNER_VERSION,
+                crate::zygote::ZYGOTE_REPLAY_VERSION,
+                toolchain
+            )),
+            "unexpected fission store key format: {f_key}"
+        );
+
+        fs::write(proj_dir.join("lean-toolchain"), format!("{toolchain}\n")).unwrap();
+        let mut store = TurboStore::open(Some(&store_dir)).unwrap();
+        let (env_vars, lean_bin) =
+            crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "").unwrap();
+        if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return;
+        }
+        crate::zygote::ensure_zygote_binary(&store, &lean_bin, &env_vars).unwrap();
+
+        // 1) `verify_subshards_out_of_core` treats unattested or version-mismatched rows as misses
+        // and re-verifies before minting a current-provenance sub-shard receipt.
+        let ooc_prefix = "namespace FissionProvenanceOoc\ndef idNat (n : Nat) : Nat := n\n";
+        let ooc_step0 = (
+            "prov_step_0".to_string(),
+            "prov_ooc_key_0".to_string(),
+            "theorem prov_step_0 (n : Nat) : idNat n = n := rfl\n".to_string(),
+        );
+        let ooc_step1 = (
+            "prov_step_1".to_string(),
+            "prov_ooc_key_1".to_string(),
+            "theorem prov_step_1 : idNat 7 = 7 := rfl\n".to_string(),
+        );
+        store
+            .put_theorem_shard(
+                toolchain,
+                &ooc_step0.1,
+                &ooc_step0.0,
+                br#"{"decl":"prov_step_0","verified_at":1}"#,
+                1,
+            )
+            .unwrap();
+        let stale_ooc_receipt = serde_json::to_vec(&serde_json::json!({
+            "decl": ooc_step1.0,
+            "verified_at": 1,
+            "scanner_version": crate::zygote::ZYGOTE_SCANNER_VERSION.saturating_sub(1),
+            "replay_version": crate::zygote::ZYGOTE_REPLAY_VERSION,
+        }))
+        .unwrap();
+        store
+            .put_theorem_shard(toolchain, &ooc_step1.1, &ooc_step1.0, &stale_ooc_receipt, 1)
+            .unwrap();
+        assert!(!store_has_provenanced_subshard(&store, &ooc_step0.1));
+        assert!(!store_has_provenanced_subshard(&store, &ooc_step1.1));
+        let (ooc_hits, ooc_verified) = verify_subshards_out_of_core(
+            &mut store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            ooc_prefix,
+            &[ooc_step0.clone(), ooc_step1.clone()],
+        )
+        .unwrap();
+        assert_eq!((ooc_hits, ooc_verified), (0, 2));
+        assert!(store_has_provenanced_subshard(&store, &ooc_step0.1));
+        assert!(store_has_provenanced_subshard(&store, &ooc_step1.1));
+
+        // 2) Cut-fission in `check_single_decl` ignores both legacy `fission-v2:` keys and
+        // `fission-v3:` rows lacking current scanner/replay provenance, refusing to skip
+        // verification or mint an attested parent receipt from unattested sub-shards.
+        let lean_file = proj_dir.join("FissionProvenanceTest.lean");
+        let canon_proj = proj_dir.canonicalize().unwrap_or_else(|_| proj_dir.clone());
+        let src = "def bump (n : Nat) : Nat := n + 1\ntheorem prov_cut_thm (a b : Nat) : (a + 1) + (b + 2) = a + b + 3 := by\n  have h1 : a + 1 = 1 + a := by\n    omega\n  have h2 : b + 2 = 2 + b := by\n    omega\n  omega\n";
+        fs::write(&lean_file, src).unwrap();
+        let canon_file = lean_file
+            .canonicalize()
+            .unwrap_or_else(|_| lean_file.clone());
+        let mut split = split_lean_source(src, &[]);
+        let shard = split.shards[0].clone();
+        let subs = splitter::fission_theorem_have_blocks(
+            &extract_decl_source_from_file(src, &shard),
+            "prov_cut_thm",
+        );
+        assert_eq!(subs.len(), 3);
+
+        // Poison legacy `fission-v2:` keys AND `fission-v3:` keys with unattested / stale-version
+        // receipts (simulating a pre-upgrade forged sub-shard DB row).
+        for (idx, sub) in subs.iter().enumerate() {
+            let legacy_v2_key = format!(
+                "fission-v2:{}:{}:{}",
+                toolchain, shard.prefix_env_hash, sub.sub_shard_key
+            );
+            let forged_ok = serde_json::to_vec(&serde_json::json!({
+                "decl": sub.step_label,
+                "parent_decl": "prov_cut_thm",
+                "sub_shard_key": sub.sub_shard_key,
+                "prefix_env_hash": shard.prefix_env_hash,
+                "verified_at": 1,
+                "scanner_version": crate::zygote::ZYGOTE_SCANNER_VERSION,
+                "replay_version": crate::zygote::ZYGOTE_REPLAY_VERSION,
+            }))
+            .unwrap();
+            store
+                .put_theorem_shard(toolchain, &legacy_v2_key, &sub.step_label, &forged_ok, 1)
+                .unwrap();
+
+            let v3_key =
+                compute_fission_store_key(toolchain, &shard.prefix_env_hash, &sub.sub_shard_key);
+            let unattested_v3 = if idx == 0 {
+                serde_json::to_vec(&serde_json::json!({
+                    "decl": sub.step_label,
+                    "parent_decl": "prov_cut_thm",
+                    "sub_shard_key": sub.sub_shard_key,
+                    "prefix_env_hash": shard.prefix_env_hash,
+                    "verified_at": 1,
+                }))
+                .unwrap()
+            } else {
+                serde_json::to_vec(&serde_json::json!({
+                    "decl": sub.step_label,
+                    "parent_decl": "prov_cut_thm",
+                    "sub_shard_key": sub.sub_shard_key,
+                    "prefix_env_hash": shard.prefix_env_hash,
+                    "verified_at": 1,
+                    "scanner_version": crate::zygote::ZYGOTE_SCANNER_VERSION,
+                    "replay_version": crate::zygote::ZYGOTE_REPLAY_VERSION.saturating_sub(1),
+                }))
+                .unwrap()
+            };
+            store
+                .put_theorem_shard(toolchain, &v3_key, &sub.step_label, &unattested_v3, 1)
+                .unwrap();
+            assert!(!store_has_provenanced_subshard(&store, &v3_key));
+        }
+
+        // Also confirm an invalid theorem whose `fission-v3:` sub-shards were forged WITHOUT
+        // current provenance CANNOT mint a parent receipt and fails verification.
+        let bad_src = src.replacen(
+            "  have h2 : b + 2 = 2 + b := by\n    omega\n  omega\n",
+            "  have h2 : b + 2 = 2 + b := by\n    omega\n  exact nonexistent_ident_xyz\n",
+            1,
+        );
+        fs::write(&lean_file, &bad_src).unwrap();
+        let mut bad_split = split_lean_source(&bad_src, &[]);
+        let bad_shard = bad_split.shards[0].clone();
+        let bad_subs = splitter::fission_theorem_have_blocks(
+            &extract_decl_source_from_file(&bad_src, &bad_shard),
+            "prov_cut_thm",
+        );
+        for sub in &bad_subs {
+            let v3_key = compute_fission_store_key(
+                toolchain,
+                &bad_shard.prefix_env_hash,
+                &sub.sub_shard_key,
+            );
+            store
+                .put_theorem_shard(
+                    toolchain,
+                    &v3_key,
+                    &sub.step_label,
+                    br#"{"decl":"forged_without_provenance","verified_at":1}"#,
+                    1,
+                )
+                .unwrap();
+        }
+        let mut cb3 = None;
+        let t0 = Instant::now();
+        assert!(check_single_decl(
+            &mut store,
+            true,
+            false,
+            false,
+            &t0,
+            &lean_file,
+            &lean_file,
+            &canon_file,
+            &canon_proj,
+            toolchain,
+            "prov_cut_thm",
+            bad_src,
+            &mut cb3,
+            &mut bad_split,
+            true,
+            0,
+            None,
+        )
+        .is_err());
+
+        // Now verify the valid theorem: zero sub-shards may be counted as cached hits, and after
+        // verification all `fission-v3:` sub-shard receipts carry current provenance.
+        fs::write(&lean_file, src).unwrap();
+        let mut cb3_ok = None;
+        let t0_ok = Instant::now();
+        let ok_json = check_single_decl(
+            &mut store,
+            true,
+            false,
+            false,
+            &t0_ok,
+            &lean_file,
+            &lean_file,
+            &canon_file,
+            &canon_proj,
+            toolchain,
+            "prov_cut_thm",
+            src.to_string(),
+            &mut cb3_ok,
+            &mut split,
+            true,
+            0,
+            None,
+        )
+        .unwrap();
+        assert_eq!(ok_json["status"], "theorem_verified");
+        assert_eq!(ok_json["fission_cached_subshards"], 0);
+        for sub in &subs {
+            let v3_key =
+                compute_fission_store_key(toolchain, &shard.prefix_env_hash, &sub.sub_shard_key);
+            assert!(store_has_provenanced_subshard(&store, &v3_key));
+        }
+
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 }
