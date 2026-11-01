@@ -6626,7 +6626,14 @@ pub fn build_module_dag_with_trust(
         let mut force_shared_for_target = false;
         if let Some(facet) = facet_opt {
             match facet {
-                "olean" | "ilean" | "lib" | "modules" | "default" | "leanArts" => {}
+                "olean"
+                | "ilean"
+                | "lib"
+                | "modules"
+                | "default"
+                | "LeanLib.defaultFacet"
+                | "leanArts"
+                | "LeanLib.leanArtsFacet" => {}
                 "c" | "static" | "LeanLib.staticFacet" => {
                     force_c_for_target = true;
                 }
@@ -6763,8 +6770,12 @@ pub fn build_module_dag_with_trust(
                         .default_facets
                         .iter()
                         .any(|f| matches!(f.as_str(), "c" | "static" | "LeanLib.staticFacet"));
+                let is_default_lib_facet = match facet_opt {
+                    None => true,
+                    Some(f) => matches!(f, "default" | "LeanLib.defaultFacet"),
+                };
                 if force_shared_for_target
-                    || (facet_opt.is_none() && (precompile || lib_shared_default))
+                    || (is_default_lib_facet && (precompile || lib_shared_default))
                 {
                     requested_shared_libs.insert((target_pkg.name.clone(), lib.name.clone()));
                 }
@@ -6861,6 +6872,8 @@ pub fn build_module_dag_with_trust(
                         f,
                         "lib"
                             | "modules"
+                            | "LeanLib.defaultFacet"
+                            | "LeanLib.leanArtsFacet"
                             | "static"
                             | "LeanLib.staticFacet"
                             | "shared"
@@ -7350,6 +7363,76 @@ pub fn build_module_dag_with_trust(
                 }
             }
             if let Some(n_mut) = nodes.get_mut(&sm) {
+                for dm in promoted_direct {
+                    if !n_mut.direct_dag_deps.contains(&dm) {
+                        n_mut.direct_dag_deps.push(dm);
+                    }
+                }
+                n_mut.external_olean_deps = kept_external;
+            }
+        }
+        let precomp_promo_mods: Vec<String> = nodes
+            .values()
+            .filter(|n| !n.external_olean_deps.is_empty())
+            .map(|n| n.module_name.clone())
+            .collect();
+        for pm in precomp_promo_mods {
+            let Some(node) = nodes.get(&pm) else {
+                continue;
+            };
+            let mut has_precomp_ext = false;
+            for (ext_m, _) in &node.external_olean_deps {
+                for dp in &cfg.dep_pkgs {
+                    if let Some(ds) = resolve_module_in_package(dp, false, ext_m) {
+                        if ds.precompile_modules {
+                            has_precomp_ext = true;
+                        }
+                        break;
+                    }
+                }
+            }
+            if !has_precomp_ext {
+                continue;
+            }
+            let mut promoted_direct: Vec<String> = Vec::new();
+            let mut kept_external: Vec<(String, PathBuf)> = Vec::new();
+            for (ext_m, ext_p) in &node.external_olean_deps {
+                let mut dep_spec_opt = None;
+                for dp in &cfg.dep_pkgs {
+                    if let Some(ds) = resolve_module_in_package(dp, false, ext_m) {
+                        dep_spec_opt = Some(ds);
+                        break;
+                    }
+                }
+                if let Some(ds) = dep_spec_opt {
+                    if ds.precompile_modules {
+                        if !ds.is_exe_target {
+                            enqueue_shared_lib_mods(
+                                &ds.pkg_name,
+                                &ds.target_name,
+                                false,
+                                &mut expanded_shared_libs,
+                                &mut requested_shared_libs,
+                                &mut worklist,
+                            )?;
+                        }
+                        if node.import_specs.iter().any(|is| &is.module == ext_m) {
+                            promoted_direct.push(ext_m.clone());
+                        }
+                        worklist.push_back((ds, true));
+                        promoted_ext_deps = true;
+                    } else if node.import_specs.iter().any(|is| &is.module == ext_m) {
+                        promoted_direct.push(ext_m.clone());
+                        worklist.push_back((ds, false));
+                        promoted_ext_deps = true;
+                    } else {
+                        kept_external.push((ext_m.clone(), ext_p.clone()));
+                    }
+                } else {
+                    kept_external.push((ext_m.clone(), ext_p.clone()));
+                }
+            }
+            if let Some(n_mut) = nodes.get_mut(&pm) {
                 for dm in promoted_direct {
                     if !n_mut.direct_dag_deps.contains(&dm) {
                         n_mut.direct_dag_deps.push(dm);
@@ -9363,44 +9446,76 @@ fn compute_module_raw_import_dynlibs(dag: &ModuleDag, node: &ModuleNode) -> Vec<
 
 fn compute_ordered_trans_imports(dag: &ModuleDag, node: &ModuleNode) -> Vec<String> {
     let mut out = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    fn walk(dag: &ModuleDag, cur: &str, out: &mut Vec<String>, seen: &mut HashSet<String>) {
-        if !seen.insert(cur.to_string()) {
+    let mut visited_mods: HashSet<String> = HashSet::new();
+    let mut inserted: HashSet<String> = HashSet::new();
+    fn walk(
+        dag: &ModuleDag,
+        cur: &str,
+        out: &mut Vec<String>,
+        visited_mods: &mut HashSet<String>,
+        inserted: &mut HashSet<String>,
+    ) {
+        if !visited_mods.insert(cur.to_string()) {
             return;
         }
         let Some(dn) = dag.nodes.get(cur) else {
             return;
         };
-        for imp in &dn.direct_dag_deps {
-            walk(dag, imp, out, seen);
+        let mut seen_local: HashSet<&str> = HashSet::new();
+        for imp in &dn.import_specs {
+            let m = imp.module.as_str();
+            if m != cur && seen_local.insert(m) && dag.nodes.contains_key(m) {
+                walk(dag, m, out, visited_mods, inserted);
+            }
         }
-        out.push(cur.to_string());
+        if inserted.insert(cur.to_string()) {
+            out.push(cur.to_string());
+        }
     }
-    for imp in &node.direct_dag_deps {
-        walk(dag, imp, &mut out, &mut seen);
+    let mut seen_root: HashSet<&str> = HashSet::new();
+    for imp in &node.import_specs {
+        let m = imp.module.as_str();
+        if m != node.module_name && seen_root.insert(m) && dag.nodes.contains_key(m) {
+            walk(dag, m, &mut out, &mut visited_mods, &mut inserted);
+        }
     }
     out
 }
 
 fn compute_ordered_precompile_imports(dag: &ModuleDag, node: &ModuleNode) -> Vec<String> {
     let mut out = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    fn walk(dag: &ModuleDag, cur: &str, out: &mut Vec<String>, seen: &mut HashSet<String>) {
-        if !seen.insert(cur.to_string()) {
+    let mut visited_mods: HashSet<String> = HashSet::new();
+    let mut inserted: HashSet<String> = HashSet::new();
+    fn walk(
+        dag: &ModuleDag,
+        cur: &str,
+        out: &mut Vec<String>,
+        visited_mods: &mut HashSet<String>,
+        inserted: &mut HashSet<String>,
+    ) {
+        if !visited_mods.insert(cur.to_string()) {
             return;
         }
         let Some(dn) = dag.nodes.get(cur) else {
             return;
         };
-        for imp in &dn.direct_dag_deps {
-            walk(dag, imp, out, seen);
+        let mut seen_local: HashSet<&str> = HashSet::new();
+        for imp in &dn.import_specs {
+            let m = imp.module.as_str();
+            if m != cur && seen_local.insert(m) && dag.nodes.contains_key(m) {
+                walk(dag, m, out, visited_mods, inserted);
+            }
         }
-        if dn.precompile_modules {
+        if dn.precompile_modules && inserted.insert(cur.to_string()) {
             out.push(cur.to_string());
         }
     }
-    for imp in &node.direct_dag_deps {
-        walk(dag, imp, &mut out, &mut seen);
+    let mut seen_root: HashSet<&str> = HashSet::new();
+    for imp in &node.import_specs {
+        let m = imp.module.as_str();
+        if m != node.module_name && seen_root.insert(m) && dag.nodes.contains_key(m) {
+            walk(dag, m, &mut out, &mut visited_mods, &mut inserted);
+        }
     }
     out
 }
@@ -14876,6 +14991,141 @@ globs = ["Demo.+"]
                 assert!(
                     err.contains("fail-closed"),
                     "expected `{bad_c_tgt}` to fail closed on custom leanc settings, got: {err}"
+                );
+            }
+
+            // 7. Reverse-lexical precompiled import declaration order (`import Ord.Z` before `import Ord.A`)
+            // + explicit `Lib:default` spelling with `defaultFacets = ["shared"]`:
+            let ord_proj = dir.join("ws9_ord_default");
+            fs::create_dir_all(ord_proj.join("Ord")).unwrap();
+            fs::create_dir_all(ord_proj.join("DefSh")).unwrap();
+            fs::write(
+                ord_proj.join("lean-toolchain"),
+                "leanprover/lean4:v4.35.0\n",
+            )
+            .unwrap();
+            fs::write(ord_proj.join("Ord/Z.lean"), "def zVal : Nat := 100\n").unwrap();
+            fs::write(ord_proj.join("Ord/A.lean"), "def aVal : Nat := 23\n").unwrap();
+            fs::write(
+                ord_proj.join("Ord/Top.lean"),
+                "import Ord.Z\nimport Ord.A\ndef topOrd : Nat := zVal + aVal\n",
+            )
+            .unwrap();
+            fs::write(ord_proj.join("DefSh/One.lean"), "def defShVal : Nat := 9\n").unwrap();
+            fs::write(
+                ord_proj.join("lakefile.toml"),
+                "name = \"ws9_ord\"\n[[lean_lib]]\nname = \"Ord\"\nprecompileModules = true\nglobs = [\"Ord.+\"]\n[[lean_lib]]\nname = \"DefSh\"\ndefaultFacets = [\"shared\"]\nglobs = [\"DefSh.+\"]\n",
+            )
+            .unwrap();
+            // Explicit `DefSh:default` and `Ord:default` must materialize both shared libs and match Lake traces bit-for-bit
+            // even though `Ord.Top` imports `Ord.Z` before `Ord.A` (reverse-lexical):
+            build_project_modules_native(
+                &mut store,
+                &ord_proj,
+                &["Ord:default".to_string(), "DefSh:default".to_string()],
+                "trusted-internal",
+                2,
+                false,
+                true,
+                None,
+            )
+            .unwrap();
+            assert!(ord_proj
+                .join(format!(
+                    ".lake/build/lib/{sh_prefix}ws9__ord_DefSh.{sh_ext}"
+                ))
+                .is_file());
+            assert!(ord_proj
+                .join(format!(".lake/build/lib/{sh_prefix}ws9__ord_Ord.{sh_ext}"))
+                .is_file());
+            let ord_top_trace_path = ord_proj.join(".lake/build/lib/lean/Ord/Top.trace");
+            let ours_ord_top_trace: serde_json::Value =
+                serde_json::from_slice(&fs::read(&ord_top_trace_path).unwrap()).unwrap();
+            let ord_no_build = Command::new(&lake_bin)
+                .args(["build", "Ord:default", "DefSh:default", "--no-build"])
+                .env("SANDBOXED_ALLOW_RAW_LAKE", "1")
+                .env("LAKE_CACHE_DIR", &lake_cache)
+                .current_dir(&ord_proj)
+                .status()
+                .unwrap();
+            assert!(
+                ord_no_build.success(),
+                "`lake build Ord:default DefSh:default --no-build` must exit 0 with reverse-lexical precompiled imports and explicit :default shared facet"
+            );
+            fs::remove_dir_all(ord_proj.join(".lake/build")).unwrap();
+            let clean_ord_lake = Command::new(&lake_bin)
+                .args(["build", "Ord:default", "DefSh:default"])
+                .env("SANDBOXED_ALLOW_RAW_LAKE", "1")
+                .env("LAKE_CACHE_DIR", &lake_cache)
+                .current_dir(&ord_proj)
+                .status()
+                .unwrap();
+            assert!(clean_ord_lake.success());
+            let lake_ord_top_trace: serde_json::Value =
+                serde_json::from_slice(&fs::read(&ord_top_trace_path).unwrap()).unwrap();
+            assert_eq!(
+                ours_ord_top_trace["depHash"], lake_ord_top_trace["depHash"],
+                "reverse-lexical precompiled import depHash mismatch on Ord.Top"
+            );
+            assert_eq!(
+                ours_ord_top_trace["outputs"], lake_ord_top_trace["outputs"],
+                "reverse-lexical precompiled import outputs mismatch on Ord.Top"
+            );
+            assert_eq!(
+                ours_ord_top_trace["inputs"][0], lake_ord_top_trace["inputs"][0],
+                "reverse-lexical precompiled import deps order mismatch on Ord.Top"
+            );
+            assert_eq!(
+                ours_ord_top_trace["inputs"][1], lake_ord_top_trace["inputs"][1],
+                "reverse-lexical precompiled import dynlibs order mismatch on Ord.Top"
+            );
+            // Also verify bare `DefSh` (omitted facet) and fail-closed `DefSh:default` under custom linker flags:
+            let _ = fs::remove_dir_all(ord_proj.join(".lake/build"));
+            build_project_modules_native(
+                &mut store,
+                &ord_proj,
+                &["DefSh".to_string()],
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap();
+            assert!(ord_proj
+                .join(format!(
+                    ".lake/build/lib/{sh_prefix}ws9__ord_DefSh.{sh_ext}"
+                ))
+                .is_file());
+            let bare_defsh_no_build = Command::new(&lake_bin)
+                .args(["build", "DefSh", "--no-build"])
+                .env("SANDBOXED_ALLOW_RAW_LAKE", "1")
+                .env("LAKE_CACHE_DIR", &lake_cache)
+                .current_dir(&ord_proj)
+                .status()
+                .unwrap();
+            assert!(bare_defsh_no_build.success());
+            fs::write(
+                ord_proj.join("lakefile.toml"),
+                "name = \"ws9_ord\"\n[[lean_lib]]\nname = \"DefSh\"\ndefaultFacets = [\"shared\"]\nmoreLinkArgs = [\"-lm\"]\nglobs = [\"DefSh.+\"]\n",
+            )
+            .unwrap();
+            for sh_def_tgt in ["DefSh", "DefSh:default"] {
+                let err_def = build_project_modules_native(
+                    &mut store,
+                    &ord_proj,
+                    &[sh_def_tgt.to_string()],
+                    "trusted-internal",
+                    1,
+                    false,
+                    true,
+                    None,
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(
+                    err_def.contains("fail-closed"),
+                    "expected `{sh_def_tgt}` with `defaultFacets = [\"shared\"]` and `moreLinkArgs` to fail closed, got: {err_def}"
                 );
             }
         }
