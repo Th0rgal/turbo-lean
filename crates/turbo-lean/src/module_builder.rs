@@ -6603,6 +6603,9 @@ pub fn build_module_dag_with_trust(
             root_pkg
         };
         let target_is_root = target_pkg.pkg_root == root_pkg.pkg_root;
+        let explicit_module = raw_target.trim_start().starts_with('+')
+            || raw_target.trim_start().starts_with("@+")
+            || target_base.contains('+');
         if target_pkg.custom_targets.iter().any(|ct| ct == &item_name)
             || target_pkg.extern_libs.iter().any(|el| {
                 el.name == item_name && el.is_dynamic_recipe && el.static_artifact_path.is_none()
@@ -6618,8 +6621,18 @@ pub fn build_module_dag_with_trust(
         let mut matched = false;
         // 1. Match against lean_lib targets
         for lib in &target_pkg.libs {
-            if lib.name == item_name || (item_name.is_empty() && pkg_filter.is_some()) {
+            if !explicit_module
+                && (lib.name == item_name || (item_name.is_empty() && pkg_filter.is_some()))
+            {
                 matched = true;
+                if facet_opt.is_some_and(|f| matches!(f, "dynlib" | "o.export" | "c.o.export")) {
+                    let _ = c_abi::verify_static_lake_config(true, false, false, true);
+                    anyhow::bail!(
+                        "Unsupported target facet `:{}` on lean_lib `{}`: fail-closed static Lake config gate",
+                        facet_opt.unwrap_or(""),
+                        raw_target
+                    );
+                }
                 let pkg_src_base = target_pkg.pkg_root.join(&target_pkg.src_dir);
                 let lib_src = match &lib.src_dir {
                     Some(sd) => pkg_src_base.join(sd),
@@ -6702,21 +6715,24 @@ pub fn build_module_dag_with_trust(
                 }
             }
         }
-        // 2. Match against lean_exe targets
+        // 2. Match against lean_exe targets. Lake's LeanExe facets are only `default` and `exe`
+        // (`LeanExe.initFacetConfigs`). Named exe roots still accept module facets (`+root:dynlib`).
         for exe in &target_pkg.exes {
-            if exe.name == item_name {
+            if exe.name == item_name && !explicit_module {
                 matched = true;
+                if facet_opt.is_some_and(|f| !matches!(f, "default" | "exe")) {
+                    let _ = c_abi::verify_static_lake_config(true, false, false, true);
+                    anyhow::bail!(
+                        "Unsupported target facet `:{}` on lean_exe `{}`: fail-closed static Lake config gate",
+                        facet_opt.unwrap_or(""),
+                        raw_target
+                    );
+                }
                 if let Some(spec) = resolve_module_in_package(target_pkg, target_is_root, &exe.root)
                 {
                     // Note: `turbo-lean build` is a module builder; when a `lean_exe` is in defaultTargets
                     // (not explicitly requested by name), we compile its root module and dependencies
                     // and emit `.c` if `targets` explicitly requested the exe or `force_c_for_target`.
-                    if force_co_export_for_target {
-                        explicit_co_export_mods.insert(spec.module_name.clone());
-                    }
-                    if force_dynlib_for_target {
-                        explicit_dynlib_mods.insert(spec.module_name.clone());
-                    }
                     let emit_c = force_c_for_target || !targets.is_empty() || spec.emit_c_default;
                     initial_specs.push((spec, emit_c));
                 } else {
@@ -6732,14 +6748,29 @@ pub fn build_module_dag_with_trust(
         // 3. Match against a specific module name (e.g. `TurboLean.Spec`)
         if !matched {
             if let Some(spec) = resolve_module_in_package(target_pkg, target_is_root, &item_name) {
+                if facet_opt.is_some_and(|f| {
+                    matches!(
+                        f,
+                        "lib"
+                            | "modules"
+                            | "static"
+                            | "LeanLib.staticFacet"
+                            | "shared"
+                            | "LeanLib.sharedFacet"
+                    )
+                }) {
+                    let _ = c_abi::verify_static_lake_config(true, false, false, true);
+                    anyhow::bail!(
+                        "Unsupported target facet `:{}` on module `{}`: fail-closed static Lake config gate",
+                        facet_opt.unwrap_or(""),
+                        raw_target
+                    );
+                }
                 if force_co_export_for_target {
                     explicit_co_export_mods.insert(spec.module_name.clone());
                 }
                 if force_dynlib_for_target {
                     explicit_dynlib_mods.insert(spec.module_name.clone());
-                }
-                if force_shared_for_target && !spec.is_exe_target {
-                    requested_shared_libs.insert((spec.pkg_name.clone(), spec.target_name.clone()));
                 }
                 let emit_c = force_c_for_target || spec.emit_c_default || spec.is_exe_target;
                 initial_specs.push((spec, emit_c));
@@ -6977,19 +7008,20 @@ pub fn build_module_dag_with_trust(
                 );
                 }
                 if let Some(dep_spec) = dep_matches.into_iter().next() {
+                    let importer_needs_dep_dynlib = spec.precompile_modules
+                        || dep_spec.precompile_modules
+                        || explicit_dynlib_mods.contains(&spec.module_name);
                     if !is_untrusted {
                         if let Some(fresh_closure) = collect_fresh_dep_pkg_closure(
                             cfg,
                             &dep_spec,
-                            spec.precompile_modules || dep_spec.precompile_modules,
+                            importer_needs_dep_dynlib,
                         )? {
                             external_olean_deps.extend(fresh_closure);
                             continue;
                         }
                     }
-                    if !dep_spec.is_exe_target
-                        && (spec.precompile_modules || dep_spec.precompile_modules)
-                    {
+                    if !dep_spec.is_exe_target && importer_needs_dep_dynlib {
                         enqueue_shared_lib_mods(
                             &dep_spec.pkg_name,
                             &dep_spec.target_name,
@@ -7000,10 +7032,7 @@ pub fn build_module_dag_with_trust(
                         )?;
                     }
                     direct_dag_deps.push(imp.clone());
-                    worklist.push_back((
-                        dep_spec.clone(),
-                        spec.precompile_modules || dep_spec.precompile_modules,
-                    ));
+                    worklist.push_back((dep_spec.clone(), importer_needs_dep_dynlib));
                     continue;
                 }
                 // 3. Check if `imp` is a built-in toolchain module (`Init.*`, `Std.*`, `Lean.*`, `Lake.*`)
@@ -7092,6 +7121,7 @@ pub fn build_module_dag_with_trust(
                 },
             );
         }
+        let mut promoted_ext_deps = false;
         let mut native_stack: Vec<String> = explicit_dynlib_mods.iter().cloned().collect();
         while let Some(m) = native_stack.pop() {
             let Some(node) = nodes.get(&m) else {
@@ -7109,8 +7139,51 @@ pub fn build_module_dag_with_trust(
                     }
                 }
             }
+            if !node.external_olean_deps.is_empty() {
+                let mut promoted_direct: Vec<String> = Vec::new();
+                let mut kept_external: Vec<(String, PathBuf)> = Vec::new();
+                for (ext_m, ext_p) in &node.external_olean_deps {
+                    let mut dep_spec_opt = None;
+                    for dp in &cfg.dep_pkgs {
+                        if let Some(ds) = resolve_module_in_package(dp, false, ext_m) {
+                            dep_spec_opt = Some(ds);
+                            break;
+                        }
+                    }
+                    if let Some(ds) = dep_spec_opt {
+                        let is_direct = node.import_specs.iter().any(|is| &is.module == ext_m);
+                        if is_direct {
+                            if !ds.is_exe_target {
+                                enqueue_shared_lib_mods(
+                                    &ds.pkg_name,
+                                    &ds.target_name,
+                                    false,
+                                    &mut expanded_shared_libs,
+                                    &mut requested_shared_libs,
+                                    &mut worklist,
+                                )?;
+                            }
+                            promoted_direct.push(ext_m.clone());
+                            worklist.push_back((ds, true));
+                            promoted_ext_deps = true;
+                        } else {
+                            kept_external.push((ext_m.clone(), ext_p.clone()));
+                        }
+                    } else {
+                        kept_external.push((ext_m.clone(), ext_p.clone()));
+                    }
+                }
+                if let Some(n_mut) = nodes.get_mut(&m) {
+                    for dm in promoted_direct {
+                        if !n_mut.direct_dag_deps.contains(&dm) {
+                            n_mut.direct_dag_deps.push(dm);
+                        }
+                    }
+                    n_mut.external_olean_deps = kept_external;
+                }
+            }
         }
-        let mut discovered_new_shared = false;
+        let mut discovered_new_shared = promoted_ext_deps;
         let snapshot_nodes: Vec<(String, String, String, bool, Vec<String>)> = nodes
             .values()
             .map(|n| {
@@ -7162,7 +7235,10 @@ pub fn build_module_dag_with_trust(
                 if let Some(dn) = nodes.get(&dm) {
                     if !dn.is_exe_target
                         && (dn.pkg_name != *imp_pkg || dn.target_name != *imp_target)
-                        && (*imp_precomp || importer_is_in_shared || dn.precompile_modules)
+                        && (*imp_precomp
+                            || importer_is_in_shared
+                            || explicit_dynlib
+                            || dn.precompile_modules)
                     {
                         let key = (dn.pkg_name.clone(), dn.target_name.clone());
                         if !expanded_shared_libs.contains(&key) {
@@ -7594,6 +7670,36 @@ pub fn build_module_dag_with_trust(
             }
         }
     } else {
+        for (pkg_name, lib_name) in &requested_shared_libs {
+            if let Some(pkg) = std::iter::once(&cfg.root_pkg)
+                .chain(&cfg.dep_pkgs)
+                .find(|p| &p.name == pkg_name)
+            {
+                let lib_why = pkg
+                    .libs
+                    .iter()
+                    .find(|l| &l.name == lib_name)
+                    .and_then(|l| l.native_unsupported.as_deref());
+                if let Some(why) = pkg.native_unsupported.as_deref().or(lib_why) {
+                    let _ = c_abi::verify_static_lake_config(true, true, false, false);
+                    anyhow::bail!(
+                        "Cannot build shared library `{}` of package `{}` like Lake ({}): fail-closed static Lake config gate",
+                        lib_name,
+                        pkg_name,
+                        why
+                    );
+                }
+                if !pkg.extern_libs.is_empty() {
+                    let _ = c_abi::verify_static_lake_config(true, true, false, false);
+                    anyhow::bail!(
+                        "Cannot build shared library `{}` of package `{}` like Lake (package declares `extern_lib` {:?}): fail-closed static Lake config gate",
+                        lib_name,
+                        pkg_name,
+                        pkg.extern_libs.iter().map(|e| &e.name).collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
         for m in &topological_order {
             if let Some(node) = nodes.get(m) {
                 if node.needs_c || node.needs_co_export || node.needs_dynlib {
@@ -7605,6 +7711,22 @@ pub fn build_module_dag_with_trust(
                             node.pkg_name,
                             why
                         );
+                    }
+                }
+                if node.precompile_modules || node.needs_dynlib {
+                    if let Some(pkg) = std::iter::once(&cfg.root_pkg)
+                        .chain(&cfg.dep_pkgs)
+                        .find(|p| p.name == node.pkg_name)
+                    {
+                        if !pkg.extern_libs.is_empty() {
+                            let _ = c_abi::verify_static_lake_config(true, true, false, false);
+                            anyhow::bail!(
+                                "Cannot build module `{}` of package `{}` like Lake (package declares `extern_lib` {:?}): fail-closed static Lake config gate",
+                                node.module_name,
+                                node.pkg_name,
+                                pkg.extern_libs.iter().map(|e| &e.name).collect::<Vec<_>>()
+                            );
+                        }
                     }
                 }
             }
@@ -14363,6 +14485,31 @@ globs = ["Demo.+"]
                     "explicit :dynlib .rsp mismatch vs Lake on {rel}"
                 );
             }
+            let bad_exe = dir.join("ws9_exe_facet");
+            fs::create_dir_all(&bad_exe).unwrap();
+            fs::write(bad_exe.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+            fs::write(
+                bad_exe.join("lakefile.toml"),
+                "name = \"ws9_exe\"\n[[lean_exe]]\nname = \"main\"\nroot = \"Main\"\n",
+            )
+            .unwrap();
+            fs::write(bad_exe.join("Main.lean"), "def main : IO Unit := pure ()\n").unwrap();
+            let err_exe = build_project_modules_native(
+                &mut store,
+                &bad_exe,
+                &["main:dynlib".to_string()],
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err_exe.contains("lean_exe") && err_exe.contains("fail-closed"),
+                "expected lean_exe facet rejection, got: {err_exe}"
+            );
         }
         let _ = fs::remove_dir_all(&dir);
     }
