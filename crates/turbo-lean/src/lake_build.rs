@@ -1036,7 +1036,10 @@ pub(crate) fn shm_file_splits_dir(store: &TurboStore) -> PathBuf {
 
 pub(crate) fn compute_single_stat_hash(pk: &str, ms: i64, mn: i64, sz: i64) -> String {
     let mut h = blake3::Hasher::new();
-    h.update(b"single-stat-split:v4\n");
+    // v4 rebuilds legacy shards without qualified declaration identities.
+    // v9 invalidates declaration scopes computed before lossless dotted-component canonicalization.
+    // v10 includes checking-weakening hygiene fields in cached file splits.
+    h.update(b"single-stat-split:v10\n");
     h.update(pk.as_bytes());
     h.update(b":");
     h.update(&ms.to_le_bytes());
@@ -1062,7 +1065,7 @@ pub(crate) fn compact_split_for_shm_cache(split: &splitter::SplitResult) -> spli
 
 pub(crate) fn compute_stat_slice_hash(stats: &[(String, i64, i64, i64)]) -> String {
     let mut h = blake3::Hasher::new();
-    h.update(b"project-stat-splits:v4\n");
+    h.update(b"project-stat-splits:v8\n");
     for (pk, ms, mn, sz) in stats {
         h.update(pk.as_bytes());
         h.update(b":");
@@ -1829,7 +1832,10 @@ pub(crate) fn are_all_project_oleans_replayed_in_store(
         if !seen.insert(m.clone()) {
             continue;
         }
-        let rel = format!("{}.olean", crate::module_builder::module_name_to_rel_slash(&m));
+        let rel = format!(
+            "{}.olean",
+            crate::module_builder::module_name_to_rel_slash(&m)
+        );
         let Some(path) = dirs.iter().map(|d| d.join(&rel)).find(|p| p.is_file()) else {
             return false;
         };
@@ -1901,7 +1907,10 @@ pub(crate) fn ensure_project_and_imported_oleans_replayed_in_store(
         if !seen.insert(m.clone()) {
             continue;
         }
-        let rel = format!("{}.olean", crate::module_builder::module_name_to_rel_slash(&m));
+        let rel = format!(
+            "{}.olean",
+            crate::module_builder::module_name_to_rel_slash(&m)
+        );
         let Some(path) = dirs.iter().map(|d| d.join(&rel)).find(|p| p.is_file()) else {
             continue;
         };
@@ -1913,14 +1922,13 @@ pub(crate) fn ensure_project_and_imported_oleans_replayed_in_store(
             continue;
         }
         let bytes = fs::read(&path)?;
-        let (imps, _) = crate::module_builder::parse_olean_binary_imports(&bytes).ok_or_else(
-            || {
+        let (imps, _) =
+            crate::module_builder::parse_olean_binary_imports(&bytes).ok_or_else(|| {
                 anyhow::anyhow!(
                     "Failed to parse binary `.olean` header of imported `{m}` (`{}`): fail-closed",
                     path.display()
                 )
-            },
-        )?;
+            })?;
         worklist.extend(imps.into_iter().map(|i| i.module));
         dep_mods.push((m, path));
     }
@@ -2191,7 +2199,10 @@ pub(crate) fn resolve_replayed_prebuilt_module_import(
         if !seen.insert(m.clone()) {
             continue;
         }
-        let rel = format!("{}.olean", crate::module_builder::module_name_to_rel_slash(&m));
+        let rel = format!(
+            "{}.olean",
+            crate::module_builder::module_name_to_rel_slash(&m)
+        );
         let path = dirs.iter().map(|d| d.join(&rel)).find(|p| p.is_file())?;
         if crate::module_builder::is_verified_toolchain_olean_file(
             &cfg.toolchain_lib_lean,
@@ -2322,10 +2333,7 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
         let cur_hash = compute_cached_source_blake3(dep_src);
 
         let manifest_stale = match (&manifest_opt, &cur_hash) {
-            (Some(m), Some(ch)) => m
-                .modules
-                .get(&dep_rel)
-                .is_some_and(|e| e.src_blake3 != *ch),
+            (Some(m), Some(ch)) => m.modules.get(&dep_rel).is_some_and(|e| e.src_blake3 != *ch),
             _ => false,
         };
         let mtime_stale = match (&olean_meta, &src_meta) {
@@ -2595,7 +2603,10 @@ struct ProjectDependentClosure {
     standalone_modules: Vec<StandaloneModuleSpec>,
 }
 
-fn package_source_roots(canon_dir: &Path, pkg: &crate::module_builder::PackageConfig) -> Vec<PathBuf> {
+fn package_source_roots(
+    canon_dir: &Path,
+    pkg: &crate::module_builder::PackageConfig,
+) -> Vec<PathBuf> {
     let canon = |p: PathBuf| p.canonicalize().unwrap_or(p);
     let base = canon(canon_dir.join(&pkg.src_dir));
     let mut roots = vec![base.clone()];
@@ -2658,8 +2669,12 @@ fn discover_standalone_project_modules(
             continue;
         }
         if is_untrusted {
-            let meta = fs::symlink_metadata(&source)
-                .with_context(|| format!("Failed to stat standalone Lean source `{}`", source.display()))?;
+            let meta = fs::symlink_metadata(&source).with_context(|| {
+                format!(
+                    "Failed to stat standalone Lean source `{}`",
+                    source.display()
+                )
+            })?;
             anyhow::ensure!(
                 !meta.file_type().is_symlink(),
                 "Untrusted dependent recheck rejected symlink standalone source `{}`",
@@ -2758,8 +2773,13 @@ fn compute_project_dependent_closure(
     } else {
         crate::module_builder::build_module_dag_with_trust(&cfg, &seeds, false).ok()
     };
-    let standalone_all =
-        discover_standalone_project_modules(canon_dir, &cfg, dag_opt.as_ref(), &edited, is_untrusted)?;
+    let standalone_all = discover_standalone_project_modules(
+        canon_dir,
+        &cfg,
+        dag_opt.as_ref(),
+        &edited,
+        is_untrusted,
+    )?;
 
     if let Some(dag) = dag_opt {
         let mut dag_closure: std::collections::BTreeSet<String> = dag
@@ -2813,7 +2833,9 @@ fn compute_project_dependent_closure(
             for m in current {
                 if let Some(spec) = standalone_all.get(&m) {
                     for imp in &spec.imports {
-                        if standalone_all.contains_key(imp) && standalone_closure.insert(imp.clone()) {
+                        if standalone_all.contains_key(imp)
+                            && standalone_closure.insert(imp.clone())
+                        {
                             up_changed = true;
                         }
                     }
@@ -2824,7 +2846,8 @@ fn compute_project_dependent_closure(
             .iter()
             .filter_map(|m| dag.nodes.get(m).map(|n| n.src_path.clone()))
             .collect();
-        let standalone_specs = topologically_order_standalone_modules(&standalone_all, &standalone_closure)?;
+        let standalone_specs =
+            topologically_order_standalone_modules(&standalone_all, &standalone_closure)?;
         Ok(ProjectDependentClosure {
             seeds,
             dag_modules: Some(dag_closure.into_iter().collect()),
@@ -2834,7 +2857,8 @@ fn compute_project_dependent_closure(
     } else {
         let standalone_closure: std::collections::BTreeSet<String> =
             standalone_all.keys().cloned().collect();
-        let standalone_specs = topologically_order_standalone_modules(&standalone_all, &standalone_closure)?;
+        let standalone_specs =
+            topologically_order_standalone_modules(&standalone_all, &standalone_closure)?;
         Ok(ProjectDependentClosure {
             seeds,
             dag_modules: None,
@@ -3015,73 +3039,73 @@ fn check_and_audit_standalone_modules(
     // Merging target-owned `.olean`s into `olean_out_dir` lets both `TurboLean.olean` and
     // `TurboLean/Spec.olean` resolve cleanly without touching `.lake` (preserving
     // `--no-auto-worktree-link` snapshots) while never copying unverified non-target `.olean`s.
-    let merge_pkg_oleans =
-        |pkg: &crate::module_builder::PackageConfig, is_root: bool, dst_dir: &Path| -> Result<()> {
-            let src_dir = pkg.pkg_root.join(&pkg.build_dir).join(&pkg.lean_lib_dir);
-            if !src_dir.is_dir() {
-                return Ok(());
-            }
-            let mut stack = vec![(src_dir.clone(), dst_dir.to_path_buf())];
-            while let Some((cur_src, cur_dst)) = stack.pop() {
-                let Ok(rd) = fs::read_dir(&cur_src) else {
+    let merge_pkg_oleans = |pkg: &crate::module_builder::PackageConfig,
+                            is_root: bool,
+                            dst_dir: &Path|
+     -> Result<()> {
+        let src_dir = pkg.pkg_root.join(&pkg.build_dir).join(&pkg.lean_lib_dir);
+        if !src_dir.is_dir() {
+            return Ok(());
+        }
+        let mut stack = vec![(src_dir.clone(), dst_dir.to_path_buf())];
+        while let Some((cur_src, cur_dst)) = stack.pop() {
+            let Ok(rd) = fs::read_dir(&cur_src) else {
+                continue;
+            };
+            for entry in rd.flatten() {
+                let p = entry.path();
+                let Ok(meta) = fs::symlink_metadata(&p) else {
                     continue;
                 };
-                for entry in rd.flatten() {
-                    let p = entry.path();
-                    let Ok(meta) = fs::symlink_metadata(&p) else {
+                if meta.file_type().is_symlink() {
+                    continue;
+                }
+                let dst_p = cur_dst.join(entry.file_name());
+                if meta.file_type().is_dir() {
+                    stack.push((p, dst_p));
+                } else if meta.file_type().is_file() {
+                    let base_rel = if let Ok(r) = p.strip_prefix(&src_dir) {
+                        let rs = r.to_string_lossy();
+                        rs.strip_suffix(".olean.server")
+                            .or_else(|| rs.strip_suffix(".olean.private"))
+                            .or_else(|| rs.strip_suffix(".olean"))
+                            .or_else(|| rs.strip_suffix(".ilean"))
+                            .map(String::from)
+                    } else {
+                        None
+                    };
+                    let Some(rel_no_ext) = base_rel else {
                         continue;
                     };
-                    if meta.file_type().is_symlink() {
+                    let mod_name = crate::module_builder::format_lean_module_name_from_parts(
+                        Path::new(&rel_no_ext)
+                            .components()
+                            .filter_map(|c| c.as_os_str().to_str()),
+                    );
+                    if mod_name.is_empty()
+                        || standalone_names.contains(mod_name.as_str())
+                        || crate::module_builder::resolve_module_in_package(pkg, is_root, &mod_name)
+                            .is_none()
+                        || (is_untrusted
+                            && !verified_target_modules
+                                .is_some_and(|allowed| allowed.contains(mod_name.as_str())))
+                    {
                         continue;
                     }
-                    let dst_p = cur_dst.join(entry.file_name());
-                    if meta.file_type().is_dir() {
-                        stack.push((p, dst_p));
-                    } else if meta.file_type().is_file() {
-                        let base_rel = if let Ok(r) = p.strip_prefix(&src_dir) {
-                            let rs = r.to_string_lossy();
-                            rs.strip_suffix(".olean.server")
-                                .or_else(|| rs.strip_suffix(".olean.private"))
-                                .or_else(|| rs.strip_suffix(".olean"))
-                                .or_else(|| rs.strip_suffix(".ilean"))
-                                .map(String::from)
-                        } else {
-                            None
-                        };
-                        let Some(rel_no_ext) = base_rel else {
-                            continue;
-                        };
-                        let mod_name = crate::module_builder::format_lean_module_name_from_parts(
-                            Path::new(&rel_no_ext)
-                                .components()
-                                .filter_map(|c| c.as_os_str().to_str()),
-                        );
-                        if mod_name.is_empty()
-                            || standalone_names.contains(mod_name.as_str())
-                            || crate::module_builder::resolve_module_in_package(
-                                pkg, is_root, &mod_name,
-                            )
-                            .is_none()
-                            || (is_untrusted
-                                && !verified_target_modules
-                                    .is_some_and(|allowed| allowed.contains(mod_name.as_str())))
-                        {
-                            continue;
-                        }
-                        if dst_p.exists() {
-                            continue;
-                        }
-                        if let Some(parent) = dst_p.parent() {
-                            fs::create_dir_all(parent)?;
-                        }
-                        if fs::hard_link(&p, &dst_p).is_err() {
-                            fs::copy(&p, &dst_p)?;
-                        }
+                    if dst_p.exists() {
+                        continue;
+                    }
+                    if let Some(parent) = dst_p.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    if fs::hard_link(&p, &dst_p).is_err() {
+                        fs::copy(&p, &dst_p)?;
                     }
                 }
             }
-            Ok(())
-        };
+        }
+        Ok(())
+    };
     merge_pkg_oleans(&cfg.root_pkg, true, &olean_out_dir)?;
     for dp in &cfg.dep_pkgs {
         merge_pkg_oleans(dp, false, &olean_out_dir)?;
@@ -3216,7 +3240,8 @@ fn check_and_audit_standalone_modules(
             }
             let stdout_str = String::from_utf8_lossy(&out.stdout);
             let stderr_str = String::from_utf8_lossy(&out.stderr);
-            if stdout_str.contains("declaration uses ") || stderr_str.contains("declaration uses ") {
+            if stdout_str.contains("declaration uses ") || stderr_str.contains("declaration uses ")
+            {
                 anyhow::bail!(
                     "Untrusted standalone module `{}` rejected due to `sorry` axiom usage",
                     spec.module_name
@@ -3262,7 +3287,9 @@ fn check_and_audit_standalone_modules(
             std::slice::from_ref(&olean_out_dir),
             true,
         )
-        .context("Untrusted standalone module `.olean` failed in-kernel soundness & replay audit")?;
+        .context(
+            "Untrusted standalone module `.olean` failed in-kernel soundness & replay audit",
+        )?;
     } else {
         let mut env_vars = HashMap::new();
         env_vars.insert("LEAN_PATH".to_string(), combined_lp.clone());
@@ -3324,7 +3351,8 @@ fn check_and_audit_standalone_modules(
             }
             let stdout_str = String::from_utf8_lossy(&out.stdout);
             let stderr_str = String::from_utf8_lossy(&out.stderr);
-            if stdout_str.contains("declaration uses ") || stderr_str.contains("declaration uses ") {
+            if stdout_str.contains("declaration uses ") || stderr_str.contains("declaration uses ")
+            {
                 anyhow::bail!(
                     "Standalone module `{}` rejected due to `sorry` axiom usage",
                     spec.module_name
@@ -3424,6 +3452,7 @@ pub(crate) fn lake_recheck_dependents(
     Ok((count, files, mods))
 }
 
+#[allow(clippy::type_complexity)]
 pub(crate) fn lake_recheck_dependents_with_store(
     store_opt: Option<&TurboStore>,
     canon_dir: &Path,
@@ -3517,10 +3546,9 @@ pub(crate) fn untrusted_recheck_dependents(
                 continue;
             }
             if crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, imp).is_some()
-                || cfg
-                    .dep_pkgs
-                    .iter()
-                    .any(|dp| crate::module_builder::resolve_module_in_package(dp, false, imp).is_some())
+                || cfg.dep_pkgs.iter().any(|dp| {
+                    crate::module_builder::resolve_module_in_package(dp, false, imp).is_some()
+                })
             {
                 standalone_target_imports.push(imp.clone());
             }
@@ -3569,7 +3597,11 @@ pub(crate) fn untrusted_recheck_dependents(
         None,
         false,
     )?;
-    Ok((dag_count + closure.standalone_modules.len(), built_all, None))
+    Ok((
+        dag_count + closure.standalone_modules.len(),
+        built_all,
+        None,
+    ))
 }
 
 /// Build any standalone (non-target) project modules transitively imported by `target_files`
@@ -3586,12 +3618,12 @@ pub(crate) fn build_imported_standalone_modules_overlay(
     if !has_lake_config(canon_dir) || target_files.is_empty() {
         return Ok(None);
     }
-    let cfg = match crate::module_builder::resolve_project_config_with_trust(canon_dir, is_untrusted)
-    {
-        Ok(c) => c,
-        Err(_) if !is_untrusted => return Ok(None),
-        Err(e) => return Err(e),
-    };
+    let cfg =
+        match crate::module_builder::resolve_project_config_with_trust(canon_dir, is_untrusted) {
+            Ok(c) => c,
+            Err(_) if !is_untrusted => return Ok(None),
+            Err(e) => return Err(e),
+        };
     let mut seeds: Vec<String> = cfg.root_pkg.libs.iter().map(|l| l.name.clone()).collect();
     for exe in &cfg.root_pkg.exes {
         let root_mod = exe.root.trim();
@@ -3605,13 +3637,20 @@ pub(crate) fn build_imported_standalone_modules_overlay(
         }
     }
     let dag_opt = if is_untrusted {
-        Some(crate::module_builder::build_module_dag_with_trust(&cfg, &seeds, true)?)
+        Some(crate::module_builder::build_module_dag_with_trust(
+            &cfg, &seeds, true,
+        )?)
     } else {
         crate::module_builder::build_module_dag_with_trust(&cfg, &seeds, false).ok()
     };
     let empty_edits = HashSet::new();
-    let standalone_all =
-        discover_standalone_project_modules(canon_dir, &cfg, dag_opt.as_ref(), &empty_edits, is_untrusted)?;
+    let standalone_all = discover_standalone_project_modules(
+        canon_dir,
+        &cfg,
+        dag_opt.as_ref(),
+        &empty_edits,
+        is_untrusted,
+    )?;
     if standalone_all.is_empty() {
         return Ok(None);
     }
@@ -4618,7 +4657,10 @@ mod tests {
                 .env("PATH", &bin)
                 .env("HOME", tree.root.join("isolated/a/b/home"))
                 // Register the installed toolchain explicitly; verification never trusts PATH discovery.
-                .env("ELAN_HOME", lean.ancestors().nth(4).expect("installed Elan toolchain"))
+                .env(
+                    "ELAN_HOME",
+                    lean.ancestors().nth(4).expect("installed Elan toolchain"),
+                )
                 .env("TURBO_LEAN_HOME", tree.root.join("cache"))
                 .env("TURBO_LEAN_STAGING_DIR", tree.root.join("staging"))
                 .env("TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK", "0")
@@ -5179,7 +5221,11 @@ mod tests {
             assert_eq!(fs::metadata(&wt_local)?.permissions().mode() & 0o777, 0o600);
         }
         for (path, bytes) in &main_lake_bytes {
-            assert_eq!(&fs::read(path)?, bytes, "opt-out must not copy or rewrite main `.lake`");
+            assert_eq!(
+                &fs::read(path)?,
+                bytes,
+                "opt-out must not copy or rewrite main `.lake`"
+            );
         }
         #[cfg(unix)]
         {

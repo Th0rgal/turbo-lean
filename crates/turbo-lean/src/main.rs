@@ -606,11 +606,11 @@ fn run(cli: Cli) -> Result<()> {
             project_dir, base, ..
         } => (Some(project_dir.as_path()), Some(base.as_str())),
         Commands::CiVerify {
-            project_dir, base, ..
-        } => match base {
-            Some(base) => (Some(project_dir.as_path()), Some(base.as_str())),
-            None => (None, None),
-        },
+            project_dir,
+            base: Some(base),
+            ..
+        } => (Some(project_dir.as_path()), Some(base.as_str())),
+        Commands::CiVerify { base: None, .. } => (None, None),
         Commands::Check { project_dir, .. }
         | Commands::Build { project_dir, .. }
         | Commands::SeedShards { project_dir, .. } => (Some(project_dir.as_path()), None),
@@ -825,7 +825,7 @@ fn run(cli: Cli) -> Result<()> {
             decl.as_deref(),
             project_dir.as_deref(),
             low_memory,
-        ) {
+        )? {
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&out_json)?);
             } else {

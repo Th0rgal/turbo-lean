@@ -4325,8 +4325,12 @@ pub fn is_allowed_lean_arg(arg: &str) -> bool {
 /// Fail closed at request/process boundaries using the static Lake argument policy.
 /// Validate before filtering output-format flags or looking up cached verification results.
 pub fn validate_lean_args(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<()> {
-    let args: Vec<String> = args.into_iter().map(|arg| arg.as_ref().to_string()).collect();
-    validate_effective_lean_args(&args).map(drop)
+    let args: Vec<String> = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_string())
+        .collect();
+    validate_effective_lean_args(&args)
+        .map(drop)
         .map_err(|error| anyhow::anyhow!("{error:#}: fail-closed static Lake config gate"))
 }
 
@@ -4519,7 +4523,12 @@ fn finalize_package_config(
     }
     let check_allowed_args = |args: &[String], scope: &str| -> Result<()> {
         validate_lean_args(args).map_err(|error| {
-            anyhow::anyhow!("{} of {} ({}): {error:#}", scope, pkg.name, config_path.display())
+            anyhow::anyhow!(
+                "{} of {} ({}): {error:#}",
+                scope,
+                pkg.name,
+                config_path.display()
+            )
         })
     };
     // `leanOptions` reach Lean as `-Dk=v`, so they pass the same gate as explicit flags
@@ -5124,7 +5133,8 @@ pub(crate) fn is_unshadowed_toolchain_olean_import(
         all_dirs.push(cfg.toolchain_lib_lean.clone());
     }
     let Some(first_hit) = all_dirs.iter().map(|d| d.join(&rel)).find(|p| p.is_file()) else {
-        return !is_untrusted && cfg.toolchain_lib_lean.as_os_str().is_empty()
+        return !is_untrusted
+            && cfg.toolchain_lib_lean.as_os_str().is_empty()
             && is_builtin_toolchain_module(&cfg.toolchain_lib_lean, None, mod_name);
     };
     is_verified_toolchain_olean_file(&cfg.toolchain_lib_lean, Some(&cfg.lean_githash), &first_hit)
@@ -5710,8 +5720,9 @@ pub fn build_module_dag_with_trust(
                 spec.src_path.display()
             )
         })?;
-        splitter::reject_checking_weakening(&src)
-            .with_context(|| format!("Module {} ({})", spec.module_name, spec.src_path.display()))?;
+        splitter::reject_checking_weakening(&src).with_context(|| {
+            format!("Module {} ({})", spec.module_name, spec.src_path.display())
+        })?;
         let src_blake3 = blake3::hash(src.as_bytes()).to_hex().to_string();
         let header = parse_header_info(&src);
         if let Some(ref herr) = header.header_error {
@@ -5807,11 +5818,7 @@ pub fn build_module_dag_with_trust(
                 }
             }
             // 4. Check if `imp` resolves to a genuine built-in toolchain `.olean` inside `toolchain_lib_lean`
-            if is_builtin_toolchain_module(
-                &cfg.toolchain_lib_lean,
-                Some(&cfg.lean_githash),
-                imp,
-            ) {
+            if is_builtin_toolchain_module(&cfg.toolchain_lib_lean, Some(&cfg.lean_githash), imp) {
                 continue;
             }
             anyhow::bail!(
@@ -7982,6 +7989,15 @@ pub(crate) fn run_command_with_timeout(
     let mut poll_iter = 0u32;
     loop {
         if let Some(status) = child.try_wait()? {
+            #[cfg(unix)]
+            {
+                let pgid = child.id() as i32;
+                if pgid > 0 {
+                    unsafe {
+                        let _ = libc::kill(-pgid, libc::SIGKILL);
+                    }
+                }
+            }
             let stdout = out_handle.join().unwrap_or_default();
             let stderr = err_handle.join().unwrap_or_default();
             return Ok(std::process::Output {
@@ -9724,7 +9740,8 @@ mod tests {
                         for scope in SCOPES {
                             for field in FIELDS {
                                 let path = dir.join(format!("lakefile.{format}"));
-                                fs::write(&path, lakefile(format, scope, field, &key, value)).unwrap();
+                                fs::write(&path, lakefile(format, scope, field, &key, value))
+                                    .unwrap();
                                 for root in [false, true] {
                                     let result = if format == "lean" {
                                         parse_lakefile_lean(&dir, &path, root)
@@ -11079,7 +11096,10 @@ lean_exe «demo-exe» where
             proj.clone(),
         )
         .unwrap_err();
-        assert!(format!("{err:#}").contains("KernelReplay"), "check: {err:#}");
+        assert!(
+            format!("{err:#}").contains("KernelReplay"),
+            "check: {err:#}"
+        );
         fs::write(&manifest_path, serde_json::to_vec(&forged_dep_manifest)?)?;
         let ci_err = crate::pr_verify::run_ci_verify_command(
             &mut store,
@@ -11176,11 +11196,25 @@ lean_exe «demo-exe» where
             vec!["init"],
             vec!["config", "user.email", "test@example.com"],
             vec!["config", "user.name", "Test"],
-            vec!["add", "lean-toolchain", "lakefile.toml", "lake-manifest.json", "App.lean"],
+            vec![
+                "add",
+                "lean-toolchain",
+                "lakefile.toml",
+                "lake-manifest.json",
+                "App.lean",
+            ],
             vec!["commit", "-m", "base"],
         ] {
-            let g = Command::new("git").args(&args).current_dir(&proj).output()?;
-            anyhow::ensure!(g.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&g.stderr));
+            let g = Command::new("git")
+                .args(&args)
+                .current_dir(&proj)
+                .output()?;
+            anyhow::ensure!(
+                g.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&g.stderr)
+            );
         }
         let edited_app = "import Dep.Bad\ntheorem uses_bad : False := by exact bad\n";
         fs::write(proj.join("App.lean"), edited_app)?;
@@ -11374,11 +11408,7 @@ lean_exe «demo-exe» where
             "name = \"dep_std\"\n[[lean_lib]]\nname = \"DepStd\"\nroots = [\"Std.Forge\"]\n",
         )?;
         let dep_lib_lean = dep_std.join(".lake/build/lib/lean");
-        let lake_bin = cfg
-            .lean_bin
-            .parent()
-            .expect("lean bin parent")
-            .join("lake");
+        let lake_bin = cfg.lean_bin.parent().expect("lean bin parent").join("lake");
         let lake_dep = Command::new(&lake_bin)
             .args(["build", "Std.Forge"])
             .current_dir(&dep_std)
@@ -11401,7 +11431,8 @@ lean_exe «demo-exe» where
         )?;
         let dep_trace_path = dep_lib_lean.join("Std/Forge.trace");
         let mut dep_tv: serde_json::Value = serde_json::from_slice(&fs::read(&dep_trace_path)?)?;
-        dep_tv["outputs"]["o"][0] = serde_json::Value::String(format!("{:016x}.olean", new_olean_h));
+        dep_tv["outputs"]["o"][0] =
+            serde_json::Value::String(format!("{:016x}.olean", new_olean_h));
         fs::write(&dep_trace_path, serde_json::to_vec(&dep_tv)?)?;
         fs::write(
             proj.join("lake-manifest.json"),
@@ -11516,10 +11547,19 @@ lean_exe «demo-exe» where
             vec!["init"],
             vec!["config", "user.email", "test@example.com"],
             vec!["config", "user.name", "Test"],
-            vec!["add", "lean-toolchain", "lakefile.toml", "lake-manifest.json", "App.lean"],
+            vec![
+                "add",
+                "lean-toolchain",
+                "lakefile.toml",
+                "lake-manifest.json",
+                "App.lean",
+            ],
             vec!["commit", "-m", "base"],
         ] {
-            let g = Command::new("git").args(&args).current_dir(&proj).output()?;
+            let g = Command::new("git")
+                .args(&args)
+                .current_dir(&proj)
+                .output()?;
             anyhow::ensure!(
                 g.status.success(),
                 "git {:?}: {}",
@@ -11527,7 +11567,8 @@ lean_exe «demo-exe» where
                 String::from_utf8_lossy(&g.stderr)
             );
         }
-        let edited_app_b = "import Std.Forge\ntheorem bad_from_std : False := by exact std_forged_false\n";
+        let edited_app_b =
+            "import Std.Forge\ntheorem bad_from_std : False := by exact std_forged_false\n";
         fs::write(proj.join("App.lean"), edited_app_b)?;
         let lake_app2 = Command::new(&lake_bin)
             .args(["build", "App"])
@@ -11585,6 +11626,8 @@ lean_exe «demo-exe» where
 
     #[test]
     fn test_native_module_builder_cas_partial_invalidation_lazy_c_and_lake_differential() {
+        // Other tests toggle `TURBO_LEAN_NO_WORKTREE_LINK` under the env lock, which disables
+        // compiling uncached modules in `build_project_modules_native` when multi-threaded.
         let _env_guard = crate::pack::tests::env_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -11898,8 +11941,7 @@ lean_exe «demo-exe» where
         let _env_guard = crate::pack::tests::env_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("turbo_mod_diamond_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = make_temp_test_dir("diamond");
         let proj_dir = dir.join("diamond_proj");
         let store_dir = dir.join("store");
         fs::create_dir_all(proj_dir.join("Diamond")).unwrap();
@@ -13364,7 +13406,8 @@ roots = ["Fast"]
     }
 
     #[test]
-    fn test_raw_sqlite_replay_row_and_checkout_local_store_never_suppress_kernel_replay() -> Result<()> {
+    fn test_raw_sqlite_replay_row_and_checkout_local_store_never_suppress_kernel_replay(
+    ) -> Result<()> {
         let _env_guard = BWRAP_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -13513,7 +13556,9 @@ roots = ["Fast"]
         mac_msg.extend_from_slice(&crate::zygote::ZYGOTE_REPLAY_VERSION.to_le_bytes());
         mac_msg.extend_from_slice(&(cfg.lean_githash.len() as u64).to_le_bytes());
         mac_msg.extend_from_slice(cfg.lean_githash.as_bytes());
-        let attacker_mac = blake3::keyed_hash(&attacker_key, &mac_msg).to_hex().to_string();
+        let attacker_mac = blake3::keyed_hash(&attacker_key, &mac_msg)
+            .to_hex()
+            .to_string();
         local_store.conn.execute(
             "INSERT INTO kernel_replayed_oleans_auth (artifact_digest, environment_digest, replay_version, toolchain_hash, module_name, replay_mac, verified_at)
              VALUES (?1, ?2, ?3, ?4, 'Dep.Bad', ?5, 1)",
@@ -13603,7 +13648,8 @@ roots = ["Fast"]
 
     #[cfg(unix)]
     #[test]
-    fn test_prebuilt_dependency_checking_weakening_directive_and_missing_source_rejected() -> Result<()> {
+    fn test_prebuilt_dependency_checking_weakening_directive_and_missing_source_rejected(
+    ) -> Result<()> {
         let _guard = crate::pack::tests::env_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -13633,11 +13679,7 @@ roots = ["Fast"]
         )?;
 
         let cfg = resolve_project_config(&proj)?;
-        let lake_bin = cfg
-            .lean_bin
-            .parent()
-            .expect("lean bin parent")
-            .join("lake");
+        let lake_bin = cfg.lean_bin.parent().expect("lean bin parent").join("lake");
         let lake_out = Command::new(&lake_bin)
             .args(["build", "App"])
             .current_dir(&proj)
@@ -13663,7 +13705,8 @@ roots = ["Fast"]
         .unwrap_err();
         let check_msg = format!("{check_err:#}");
         assert!(
-            check_msg.contains("checking-weakening") || check_msg.contains("Soundness hygiene violation"),
+            check_msg.contains("checking-weakening")
+                || check_msg.contains("Soundness hygiene violation"),
             "check must reject prebuilt dependency checking-weakening directive: {check_msg}"
         );
 
@@ -13699,7 +13742,10 @@ roots = ["Fast"]
             ],
             vec!["commit", "-m", "base"],
         ] {
-            let g = Command::new("git").args(&args).current_dir(&proj).output()?;
+            let g = Command::new("git")
+                .args(&args)
+                .current_dir(&proj)
+                .output()?;
             anyhow::ensure!(
                 g.status.success(),
                 "git {:?}: {}",

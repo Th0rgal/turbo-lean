@@ -657,10 +657,10 @@ impl TurboStore {
     }
 
     /// Compute the deterministic BLAKE3 cache key for `file_split_cache` from an existing
-    /// hex-encoded BLAKE3 digest of the raw file bytes (`BLAKE3("file-split:v7:" + src_blake3_hex)`).
+    /// hex-encoded BLAKE3 digest of the raw file bytes (`BLAKE3("file-split:v11:" + src_blake3_hex)`).
     pub fn compute_file_split_key_from_src_hash(src_blake3_hex: &str) -> String {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"file-split:v7:");
+        hasher.update(b"file-split:v11:");
         hasher.update(src_blake3_hex.as_bytes());
         hasher.finalize().to_hex().to_string()
     }
@@ -1653,6 +1653,61 @@ impl TurboStore {
                 |_| Ok(()),
             )
             .is_ok()
+    }
+
+    /// Verify that a cached theorem-shard action in `trust_domain` has an intact receipt blob
+    /// whose `"decl"` AND `"kernel_type_hash"` match the freshly attested probe values.
+    pub fn has_attested_decl_receipt(
+        &self,
+        action_key: &str,
+        trust_domain: &str,
+        expected_decl: &str,
+        expected_kernel_type_hash: &str,
+    ) -> bool {
+        let Ok(Some(entries)) = self.get_cached_action_no_hit_bump(action_key, trust_domain) else {
+            return false;
+        };
+        self.outputs_have_attested_decl_receipt(&entries, expected_decl, expected_kernel_type_hash)
+    }
+
+    pub fn outputs_have_attested_decl_receipt(
+        &self,
+        entries: &[BlobEntry],
+        expected_decl: &str,
+        expected_kernel_type_hash: &str,
+    ) -> bool {
+        entries.iter().any(|entry| {
+            let Ok(bytes) = fs::read(self.blob_path(&entry.blob_hash)) else {
+                return false;
+            };
+            let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                return false;
+            };
+            let version = |field: &str| val[field].as_u64().and_then(|v| u32::try_from(v).ok());
+            val["decl"].as_str().is_some_and(|d| {
+                crate::splitter::canonicalize_lean_name(d)
+                    == crate::splitter::canonicalize_lean_name(expected_decl)
+            }) && val["kernel_type_hash"].as_str() == Some(expected_kernel_type_hash)
+                && crate::zygote::verifier_provenance_ok(
+                    version("scanner_version").unwrap_or(0),
+                    version("replay_version").unwrap_or(0),
+                )
+        })
+    }
+
+    /// Evict an unattested or stale cached action and its `.done` marker so singleflight can
+    /// re-acquire leader ownership and publish an attested receipt.
+    pub fn invalidate_action_for_reattestation(&self, action_key: &str) -> Result<()> {
+        let _ = fs::remove_file(self.root.join("locks").join(format!("{}.done", action_key)));
+        self.conn.execute(
+            "DELETE FROM action_outputs WHERE action_key = ?1",
+            params![action_key],
+        )?;
+        self.conn.execute(
+            "DELETE FROM actions WHERE action_key = ?1",
+            params![action_key],
+        )?;
+        Ok(())
     }
 
     pub fn has_cached_action_readonly(&self, action_key: &str, trust_domain: &str) -> Result<bool> {
@@ -5003,9 +5058,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version;", [], |r| r.get(0))?;
         assert_eq!(uv, 4);
-        assert!(
-            !store.has_kernel_replayed_olean("dig1", "env1", 2, "tc1", &[])
-        );
+        assert!(!store.has_kernel_replayed_olean("dig1", "env1", 2, "tc1", &[]));
         assert!(store
             .record_kernel_replayed_olean("", "env1", 2, "tc1", "M", &[])
             .is_err());
