@@ -5360,7 +5360,7 @@ mod tests {
                 "SnarkFast.tri_accum_reduce_eq".into(),
                 "SnarkFast.karatsuba_mul_const_eq".into(),
             ],
-            budget_ms: 5000,
+            budget_ms: 50,
         };
         assert_eq!(
             snark_accel.try_accelerate(&distill_in),
@@ -5379,7 +5379,7 @@ mod tests {
             body_src: "by simp".into(),
             imports_csv: "SnarkFast.Kernels.Field".into(),
             available_constants: vec![],
-            budget_ms: 5000,
+            budget_ms: 50,
         };
         assert!(matches!(
             snark_accel.try_accelerate(&mutant_in),
@@ -5404,12 +5404,18 @@ mod tests {
             timeout_ms: 5000,
             trigger_tactics: vec![],
         });
+        // The in-process builtin above meets the 50 ms budget; the external plugin pays a Python process start,
+        // so its inputs get a budget equal to its own `timeout_ms` instead of the builtin's 50 ms.
+        let with_plugin_budget = |inp: &AcceleratorInput| AcceleratorInput {
+            budget_ms: 5000,
+            ..inp.clone()
+        };
         assert!(matches!(
-            plug.try_accelerate(&distill_in),
+            plug.try_accelerate(&with_plugin_budget(&distill_in)),
             Some(AcceleratorCertificate::RewrittenProof { .. })
         ));
         assert!(matches!(
-            plug.try_accelerate(&mutant_in),
+            plug.try_accelerate(&with_plugin_budget(&mutant_in)),
             Some(AcceleratorCertificate::CounterexampleFound { .. })
         ));
     }
