@@ -3,6 +3,7 @@ import LeanNative.Semantics.Eval
 import LeanNative.Proofs.SymbolicTV
 import LeanNative.Backend.LLVM
 import LeanNative.IR.Bridge
+import LeanNative.Driver.BuildExe
 
 /-!
 # HeapObj step-5b regressions (D1, PR #300)
@@ -246,5 +247,22 @@ def nullaryCtorTvContract : Bool :=
 
 -- REGRESSION(symtv_nullary_ctor_immediate_exclusive)
 #guard nullaryCtorTvContract
+
+/-! ## C4/C5 `build-exe` gate: RC-ADT and unsupported LLVM calls are rejected before emission -/
+
+def gateMod (body : LNIRCode) (retTy : LNIRType := .i64) : LNIRModule :=
+  { moduleName := "build_exe_gate", decls := [{ name := "f", params := [{ id := 0, name := "x", ty := .i64 }], retTy, body }] }
+
+/-- An RC-ADT decl, an external call and a `ctorGetScalar` are each rejected; a scalar decl passes. -/
+def buildExeGateContract : Bool :=
+  let rcAdt := gateMod (.letBind 1 .objPtr (.allocCtor 0 [] [0]) (.ret 1)) .objPtr
+  let extCall := gateMod (.letBind 1 .i64 (.call "puts" [0] .i64 true) (.ret 1))
+  let scalar := gateMod (.letBind 1 .i64 (.scalar (.binOp .add (.var 0) (.constU64 1))) (.ret 1))
+  (buildExeLLVMGate? rcAdt rcAdt).isSome &&
+  (buildExeLLVMGate? scalar extCall).isSome &&
+  (buildExeLLVMGate? scalar scalar).isNone
+
+-- REGRESSION(build_exe_llvm_gate_fail_closed)
+#guard buildExeGateContract
 
 end LeanNative.Tests.HeapObj5b

@@ -756,6 +756,10 @@ def emitLetExpr (dst : VarId) (ty : LNIRType) (expr : LNIRExpr) : EmitM Unit := 
   | .ctorGetScalar _ _ _ =>
     -- C1.2: scalar slot `i` lives after the `numObjs` object words (`getCtorLayout`), which a projection site
     -- does not know; `findUnsupportedLLVMCallInCode` rejects it, and a direct emission traps (fail closed).
+    -- Dead code: every CLI/worker/build-exe path calls `findUnsupportedLLVMCall?` first, so this arm is only
+    -- reached by a direct `emitLLVM*` call. The `store` after the trap is never executed; it is kept because
+    -- the continuation is emitted into the same basic block and may load `dst`'s slot; writing it keeps
+    -- that load defined without opening a fresh block after an `unreachable` terminator.
     emitLine "  call void @llvm.trap()"
     storeI64ToVar dst "0"
   | .ctorGetObj ctorVar idx =>
