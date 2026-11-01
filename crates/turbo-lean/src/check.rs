@@ -16,7 +16,7 @@ use crate::lake_build::{
     compute_shard_key_with_args, compute_single_stat_hash, detect_toolchain,
     is_file_hash_verified_in_lake_build, is_file_verified_in_lake_build,
     load_and_split_files_with_hashes_cached, load_verified_project_manifest, resolve_lake_env,
-    resolve_lean_bin, resolve_prebuilt_module_import, resolve_remote_lean_path,
+    resolve_lean_bin, resolve_remote_lean_path, resolve_replayed_prebuilt_module_import,
     shm_file_splits_dir, split_and_audit_cached, ShmCachedFileSplit,
 };
 use crate::pack;
@@ -254,6 +254,44 @@ fn rollback_inflight(store_opt: &Option<TurboStore>, inflight_tx_open: bool) {
     }
 }
 
+fn stateless_imports_replayed_in_store(
+    ro_store: &TurboStore,
+    canon_dir: &Path,
+    local_lean_path: &str,
+    active_src: &str,
+) -> bool {
+    let Ok(cfg) = crate::module_builder::resolve_project_config(canon_dir) else {
+        return false;
+    };
+    let dirs: Vec<PathBuf> = std::env::split_paths(local_lean_path).collect();
+    let mut worklist = crate::module_builder::parse_header_info(active_src).imports;
+    let mut seen = HashSet::new();
+    while let Some(m) = worklist.pop() {
+        if !seen.insert(m.clone())
+            || crate::module_builder::is_builtin_toolchain_module(&cfg.toolchain_lib_lean, &m)
+        {
+            continue;
+        }
+        let rel = format!("{}.olean", crate::module_builder::module_name_to_rel_slash(&m));
+        let Some(path) = dirs.iter().map(|d| d.join(&rel)).find(|p| p.is_file()) else {
+            return false;
+        };
+        if path.starts_with(&cfg.toolchain_lib_lean) {
+            continue;
+        }
+        if !crate::module_builder::is_olean_replayed_in_store(ro_store, &cfg.lean_githash, &path) {
+            return false;
+        }
+        let Ok(bytes) = fs::read(&path) else {
+            return false;
+        };
+        if let Some((imps, _)) = crate::module_builder::parse_olean_binary_imports(&bytes) {
+            worklist.extend(imps.into_iter().map(|i| i.module));
+        }
+    }
+    true
+}
+
 pub fn try_stateless_remote_check(
     cache_root: &Path,
     json_output: bool,
@@ -296,17 +334,33 @@ pub fn try_stateless_remote_check(
     let uncached_names: HashSet<String> = split.shards.iter().map(|s| s.name.clone()).collect();
     let pruned_batch_src =
         splitter::build_pruned_imports_shard_source(&active_src, &uncached_names);
+    let need_store = !dep_hashes.is_empty() || (pruned_batch_src.is_none() && split.shards.len() > 1);
+    let ro_store = if need_store && cache_root.join("state.db").is_file() {
+        TurboStore::open(Some(cache_root)).ok()
+    } else {
+        None
+    };
+    if !dep_hashes.is_empty()
+        && !ro_store.as_ref().is_some_and(|st| {
+            stateless_imports_replayed_in_store(st, &canon_dir, &local_lean_path, &active_src)
+        })
+    {
+        return Ok(false);
+    }
     let fast_batch_src = if pruned_batch_src.is_some() || split.shards.len() <= 1 {
         None
     } else {
-        resolve_prebuilt_module_import(&canon_dir, &canon_file).and_then(|mod_imp| {
-            splitter::build_fast_olean_shard_source_with_split(
-                &active_src,
-                &split,
-                &mod_imp,
-                &uncached_names,
-            )
-        })
+        ro_store
+            .as_ref()
+            .and_then(|st| resolve_replayed_prebuilt_module_import(st, &canon_dir, &canon_file))
+            .and_then(|mod_imp| {
+                splitter::build_fast_olean_shard_source_with_split(
+                    &active_src,
+                    &split,
+                    &mod_imp,
+                    &uncached_names,
+                )
+            })
     };
     let Some(batch_src) = pruned_batch_src.or(fast_batch_src) else {
         return Ok(false);
@@ -478,17 +532,33 @@ pub fn try_stateless_remote_single_decl_check(
     single_set.insert(target_decl.to_string());
     single_set.insert(shard.name.clone());
     let pruned_src = splitter::build_pruned_imports_shard_source(&active_src, &single_set);
+    let need_store = !dep_hashes.is_empty() || (pruned_src.is_none() && split.shards.len() > 1);
+    let ro_store = if need_store && cache_root.join("state.db").is_file() {
+        TurboStore::open(Some(cache_root)).ok()
+    } else {
+        None
+    };
+    if !dep_hashes.is_empty()
+        && !ro_store.as_ref().is_some_and(|st| {
+            stateless_imports_replayed_in_store(st, &canon_dir, &local_lean_path, &active_src)
+        })
+    {
+        return Ok(false);
+    }
     let fast_olean_src = if pruned_src.is_some() || split.shards.len() <= 1 {
         None
     } else {
-        resolve_prebuilt_module_import(&canon_dir, &canon_file).and_then(|mod_imp| {
-            splitter::build_fast_olean_shard_source_with_split(
-                &active_src,
-                &split,
-                &mod_imp,
-                &single_set,
-            )
-        })
+        ro_store
+            .as_ref()
+            .and_then(|st| resolve_replayed_prebuilt_module_import(st, &canon_dir, &canon_file))
+            .and_then(|mod_imp| {
+                splitter::build_fast_olean_shard_source_with_split(
+                    &active_src,
+                    &split,
+                    &mod_imp,
+                    &single_set,
+                )
+            })
     };
     let Some(cand_src) = pruned_src.as_deref().or(fast_olean_src.as_deref()) else {
         return Ok(false);
@@ -1053,6 +1123,7 @@ fn check_directory(
                     && crate::lake_build::is_file_and_imports_verified_in_manifest(
                         canon_dir, lf, sb, &manifest,
                     )
+                    && resolve_replayed_prebuilt_module_import(store, canon_dir, lf).is_some()
             })
         });
 
@@ -1082,7 +1153,8 @@ fn check_directory(
             Some(_) => {}
         }
         let canon_lf = lf.canonicalize().unwrap_or_else(|_| lf.clone());
-        if let Some(mod_imp) = resolve_prebuilt_module_import(canon_dir, &canon_lf) {
+        if let Some(mod_imp) = resolve_replayed_prebuilt_module_import(store, canon_dir, &canon_lf)
+        {
             if proj_build_verified {
                 cross_eligible.push((mod_imp, src.as_str(), file_uncached));
             } else {
@@ -1266,9 +1338,11 @@ fn check_directory(
                                 let f_t0 = Instant::now();
 
                                 let mut batch_ok = false;
-                                if let Some(mod_imp) =
-                                    resolve_prebuilt_module_import(canon_ref, &canon_lf)
-                                {
+                                if let Some(mod_imp) = resolve_replayed_prebuilt_module_import(
+                                    &worker_store,
+                                    canon_ref,
+                                    &canon_lf,
+                                ) {
                                     if let Some(fast_src) = splitter::build_fast_olean_shard_source(
                                         src,
                                         &mod_imp,
@@ -1707,14 +1781,16 @@ fn check_single_decl(
         let fast_olean_src = if split.shards.len() <= 1 {
             None
         } else {
-            resolve_prebuilt_module_import(canon_dir, &canon_file).and_then(|mod_imp| {
-                splitter::build_fast_olean_shard_source_with_split(
-                    &active_src,
-                    split,
-                    &mod_imp,
-                    &single_set,
-                )
-            })
+            resolve_replayed_prebuilt_module_import(store, canon_dir, &canon_file).and_then(
+                |mod_imp| {
+                    splitter::build_fast_olean_shard_source_with_split(
+                        &active_src,
+                        split,
+                        &mod_imp,
+                        &single_set,
+                    )
+                },
+            )
         };
         let endpoint = format!("{}/check-shard", remote_url.trim_end_matches('/'));
         let cached_env = if db_warm_on_open {
@@ -1963,7 +2039,8 @@ fn check_single_decl(
                         }
                         is_file_verified_in_lake_build(canon_dir, &canon_file, &active_src)
                     });
-            let prebuilt_mod = resolve_prebuilt_module_import(canon_dir, &canon_file);
+            let prebuilt_mod =
+                resolve_replayed_prebuilt_module_import(store, canon_dir, &canon_file);
             let mut verified_via_fast_olean = proj_build_verified && prebuilt_mod.is_some();
             let mut verified_via_zygote = verified_via_fast_olean;
             let mut zygote_env_cache_hit = verified_via_fast_olean;
@@ -3062,7 +3139,7 @@ fn check_single_file(
             let mut remote_resp = if split.shards.len() <= 1 {
                 None
             } else {
-                resolve_prebuilt_module_import(canon_dir, canon_resolved_initial)
+                resolve_replayed_prebuilt_module_import(store, canon_dir, canon_resolved_initial)
                     .and_then(|mod_imp| {
                         splitter::build_fast_olean_shard_source_with_split(
                             src,
@@ -3156,7 +3233,8 @@ fn check_single_file(
                 }
                 is_file_verified_in_lake_build(canon_dir, canon_resolved_initial, src)
             });
-    let prebuilt_batch_mod = resolve_prebuilt_module_import(canon_dir, canon_resolved_initial);
+    let prebuilt_batch_mod =
+        resolve_replayed_prebuilt_module_import(store, canon_dir, canon_resolved_initial);
     let fast_verified_batch =
         use_parallel_shards && proj_build_verified && prebuilt_batch_mod.is_some();
 

@@ -3273,6 +3273,43 @@ pub(crate) fn audit_compiled_modules_with_zygote(
     Ok(())
 }
 
+fn record_replayed_modules_in_store(
+    store: &TurboStore,
+    cfg: &crate::module_builder::ProjectConfig,
+    mod_names: &[String],
+    lean_path_env: &str,
+) -> Result<()> {
+    let dirs: Vec<PathBuf> = std::env::split_paths(lean_path_env).collect();
+    for m in mod_names {
+        let rel_slash = crate::module_builder::module_name_to_rel_slash(m);
+        let rel_olean = format!("{}.olean", rel_slash);
+        let Some(olean_path) = dirs
+            .iter()
+            .map(|d| d.join(&rel_olean))
+            .find(|p| p.is_file())
+        else {
+            anyhow::bail!(
+                "Replayed module `{}` missing `.olean` along auditor LEAN_PATH: fail-closed",
+                m
+            );
+        };
+        let dig = crate::module_builder::compute_replayed_olean_ilean_digest(&olean_path)
+            .with_context(|| {
+                format!(
+                    "Failed to compute post-replay `.olean`+`.ilean` digest for `{}`",
+                    m
+                )
+            })?;
+        store.record_kernel_replayed_olean(
+            &dig,
+            ZYGOTE_REPLAY_VERSION,
+            &cfg.lean_githash,
+            m,
+        )?;
+    }
+    Ok(())
+}
+
 /// Independent kernel replay (`--kernel-replay-module`, one child per module so import regions
 /// are reclaimed between modules) of trusted dependency artifacts that skip the full policy
 /// audit: their declarations are rechecked against their imports before anything imports them.
@@ -3302,6 +3339,7 @@ pub(crate) fn kernel_replay_modules_with_zygote(
             out.status,
             String::from_utf8_lossy(&out.stderr).trim()
         );
+        record_replayed_modules_in_store(store, cfg, std::slice::from_ref(m), lean_path_env)?;
     }
     Ok(())
 }
@@ -3490,7 +3528,19 @@ fn audit_compiled_module_batch(
         is_untrusted,
     )
     .context("Failed to execute in-kernel `.olean` soundness auditor (`--audit-modules`)")?;
-    parse_audit_modules_reply(&out, mod_names).map(drop)
+    parse_audit_modules_reply(&out, mod_names)?;
+    if !is_untrusted {
+        let dirs: Vec<PathBuf> = std::env::split_paths(lean_path_env).collect();
+        let all_on_lean_path = mod_names.iter().all(|m| {
+            let rel_slash = crate::module_builder::module_name_to_rel_slash(m);
+            let rel_olean = format!("{}.olean", rel_slash);
+            dirs.iter().map(|d| d.join(&rel_olean)).any(|p| p.is_file())
+        });
+        if all_on_lean_path {
+            record_replayed_modules_in_store(store, cfg, mod_names, lean_path_env)?;
+        }
+    }
+    Ok(())
 }
 
 /// The auditor's verdict on `mod_names`: its JSON reply when every module passed, else an error.

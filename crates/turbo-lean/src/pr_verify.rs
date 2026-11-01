@@ -3,12 +3,14 @@
 
 use crate::db::{SingleflightOutcome, TurboStore};
 use crate::lake_build::{
-    are_all_project_oleans_up_to_date, compute_shard_key_with_args, detect_toolchain,
-    load_and_split_files_cached, load_and_split_files_with_hashes_cached,
-    load_project_stat_summary_cached, resolve_lake_env, resolve_lean_bin,
-    resolve_or_share_lake_env, resolve_prebuilt_module_import, resolve_remote_lean_path,
-    seed_project_theorem_shards, seed_project_theorem_shards_from_splits, stage_lake_build_outputs,
-    FileSplitsWithCacheHits, SourceFileSplit,
+    are_all_project_oleans_replayed_in_store, are_all_project_oleans_up_to_date,
+    compute_shard_key_with_args, detect_toolchain,
+    ensure_project_and_imported_oleans_replayed_in_store, load_and_split_files_cached,
+    load_and_split_files_with_hashes_cached, load_project_stat_summary_cached, resolve_lake_env,
+    resolve_lean_bin, resolve_or_share_lake_env, resolve_remote_lean_path,
+    resolve_replayed_prebuilt_module_import, seed_project_theorem_shards,
+    seed_project_theorem_shards_from_splits, stage_lake_build_outputs, FileSplitsWithCacheHits,
+    SourceFileSplit,
 };
 use crate::pack;
 use crate::splitter::{self, split_lean_source, split_lean_source_fast_no_cone};
@@ -2824,7 +2826,11 @@ pub fn run_ci_verify_command(
         store.get_cached_action(&action_key, &trust_domain)?
     {
         store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
-        audit_untrusted_materialized(store)?;
+        if is_untrusted {
+            audit_untrusted_materialized(store)?;
+        } else {
+            ensure_project_and_imported_oleans_replayed_in_store(store, &canon_dir, &file_hashes)?;
+        }
         store.record_attestation(
             &action_key,
             "turbo-lean-ci-gate",
@@ -2839,8 +2845,9 @@ pub fn run_ci_verify_command(
         };
         ("cache_hit(coalesced=false)".to_string(), resolved_env)
     } else {
-        let oleans_up_to_date =
-            !is_untrusted && are_all_project_oleans_up_to_date(&canon_dir, &file_hashes);
+        let oleans_up_to_date = !is_untrusted
+            && are_all_project_oleans_up_to_date(&canon_dir, &file_hashes)
+            && are_all_project_oleans_replayed_in_store(store, &canon_dir, &file_hashes);
         let mut singleflight_hit_status: Option<String> = None;
         let lease_opt = if oleans_up_to_date {
             None
@@ -2853,7 +2860,15 @@ pub fn run_ci_verify_command(
             )? {
                 SingleflightOutcome::CacheHit { outputs, coalesced } => {
                     store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
-                    audit_untrusted_materialized(store)?;
+                    if is_untrusted {
+                        audit_untrusted_materialized(store)?;
+                    } else {
+                        ensure_project_and_imported_oleans_replayed_in_store(
+                            store,
+                            &canon_dir,
+                            &file_hashes,
+                        )?;
+                    }
                     store.record_attestation(
                         &action_key,
                         "turbo-lean-ci-gate",
@@ -4512,7 +4527,9 @@ pub fn run_pr_verify_command(
                     .iter()
                     .map(|(_, sh)| sh.name.clone())
                     .collect();
-                if let Some(mod_imp) = resolve_prebuilt_module_import(&canon_dir, &abs_file) {
+                if let Some(mod_imp) =
+                    resolve_replayed_prebuilt_module_import(store, &canon_dir, &abs_file)
+                {
                     let fast_ok = if let Some(sp) = current_splits.get(rel_path) {
                         splitter::can_use_fast_olean_import_with_split(sp, &uncached_names)
                     } else {
@@ -4682,7 +4699,8 @@ pub fn run_pr_verify_command(
 
                     let mut remote_ok = false;
                     if can_fast_olean {
-                        if let Some(mod_imp) = resolve_prebuilt_module_import(&canon_dir, &canon_lf)
+                        if let Some(mod_imp) =
+                            resolve_replayed_prebuilt_module_import(store, &canon_dir, &canon_lf)
                         {
                             let fast_src_opt = if let Some(sp) = current_splits.get(&rel_path) {
                                 splitter::build_fast_olean_shard_source_with_split(
@@ -4801,8 +4819,11 @@ pub fn run_pr_verify_command(
 
                     let mut verified_ok = false;
                     if can_fast_olean {
-                        if let Some(mod_imp) = resolve_prebuilt_module_import(&canon_dir, &abs_file)
-                        {
+                        if let Some(mod_imp) = resolve_replayed_prebuilt_module_import(
+                            worker_store,
+                            &canon_dir,
+                            &abs_file,
+                        ) {
                             let fast_src_opt = if let Some(sp) = current_splits.get(rel_path) {
                                 splitter::build_fast_olean_shard_source_with_split(
                                     &src,
@@ -6547,7 +6568,6 @@ end Fixture
             crate::module_builder::VerifiedDepModuleEntry {
                 src_blake3: blake3::hash(src_raw.as_bytes()).to_hex().to_string(),
                 olean_artifact_digest: art_dig,
-                replay_version: crate::zygote::ZYGOTE_REPLAY_VERSION,
             },
         );
         fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;

@@ -141,6 +141,17 @@ const WORKTREE_LEASES_DDL: &str = "
     CREATE INDEX IF NOT EXISTS idx_wfb_blob ON worktree_file_blobs(blob_hash);
 ";
 
+const KERNEL_REPLAYED_OLEANS_DDL: &str = "
+    CREATE TABLE IF NOT EXISTS kernel_replayed_oleans (
+        artifact_digest TEXT NOT NULL,
+        replay_version INTEGER NOT NULL,
+        toolchain_hash TEXT NOT NULL,
+        module_name TEXT NOT NULL DEFAULT '',
+        verified_at INTEGER NOT NULL,
+        PRIMARY KEY (artifact_digest, replay_version, toolchain_hash)
+    );
+";
+
 fn template_shm_path() -> (PathBuf, u32) {
     let shm_base = if Path::new("/dev/shm").is_dir() {
         PathBuf::from("/dev/shm")
@@ -149,7 +160,7 @@ fn template_shm_path() -> (PathBuf, u32) {
     };
     let uid = unsafe { libc::geteuid() };
     (
-        shm_base.join(format!("turbo_lean_template_state_v4_{}.db", uid)),
+        shm_base.join(format!("turbo_lean_template_state_v5_{}.db", uid)),
         uid,
     )
 }
@@ -302,6 +313,12 @@ impl TurboStore {
                         WORKTREE_LEASES_DDL
                     ))?;
                 }
+                if uver < 3 {
+                    conn.execute_batch(&format!(
+                        "{}\nPRAGMA user_version = 3;",
+                        KERNEL_REPLAYED_OLEANS_DDL
+                    ))?;
+                }
             }
         } else {
             conn.execute_batch(&format!(
@@ -336,6 +353,7 @@ impl TurboStore {
                      PRIMARY KEY (worktree_id, rel_path)
                  );
                  {}
+                 {}
                  CREATE TABLE IF NOT EXISTS inflight_leases (
                      action_key TEXT PRIMARY KEY, fencing_token INTEGER NOT NULL, worker_pid INTEGER NOT NULL,
                      boot_id TEXT NOT NULL, started_at INTEGER NOT NULL, waiter_count INTEGER NOT NULL DEFAULT 1
@@ -353,10 +371,11 @@ impl TurboStore {
                      path_key TEXT PRIMARY KEY, mtime_sec INTEGER NOT NULL, mtime_nsec INTEGER NOT NULL,
                      size_bytes INTEGER NOT NULL, split_key TEXT NOT NULL, updated_at INTEGER NOT NULL
                  );
-                 PRAGMA user_version = 2;
+                 PRAGMA user_version = 3;
                  COMMIT;
                  PRAGMA wal_checkpoint(TRUNCATE);",
-                WORKTREE_LEASES_DDL
+                WORKTREE_LEASES_DDL,
+                KERNEL_REPLAYED_OLEANS_DDL
             ))?;
             if !template_path.exists() {
                 if let Some(shm_base) = template_path.parent() {
@@ -2002,6 +2021,49 @@ impl TurboStore {
             params![action_key, checker_name, checker_version, axioms_json, signature, now],
         )?;
         Ok(())
+    }
+
+    pub(crate) fn record_kernel_replayed_olean(
+        &self,
+        artifact_digest: &str,
+        replay_version: u32,
+        toolchain_hash: &str,
+        module_name: &str,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !artifact_digest.is_empty() && replay_version > 0 && !toolchain_hash.is_empty(),
+            "Refusing to record empty kernel-replay authority row (fail-closed)"
+        );
+        let now = now_unix();
+        self.conn.execute(
+            "INSERT INTO kernel_replayed_oleans (artifact_digest, replay_version, toolchain_hash, module_name, verified_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(artifact_digest, replay_version, toolchain_hash) DO UPDATE SET
+                module_name = excluded.module_name,
+                verified_at = excluded.verified_at",
+            params![artifact_digest, i64::from(replay_version), toolchain_hash, module_name, now],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn has_kernel_replayed_olean(
+        &self,
+        artifact_digest: &str,
+        replay_version: u32,
+        toolchain_hash: &str,
+    ) -> bool {
+        if artifact_digest.is_empty() || replay_version == 0 || toolchain_hash.is_empty() {
+            return false;
+        }
+        self.conn
+            .query_row(
+                "SELECT 1 FROM kernel_replayed_oleans
+                 WHERE artifact_digest = ?1 AND replay_version = ?2 AND toolchain_hash = ?3
+                 LIMIT 1",
+                params![artifact_digest, i64::from(replay_version), toolchain_hash],
+                |_| Ok(()),
+            )
+            .is_ok()
     }
 
     /// Single-transaction publication of an ingested worktree build action:
@@ -4616,6 +4678,59 @@ mod tests {
             .conn
             .execute_batch("DROP TRIGGER temp.abort_inflight_test;")?;
 
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_kernel_replayed_oleans_table_and_v2_migration() -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_db_replay_authority_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let cache_dir = tmp_dir.join("cache");
+        fs::create_dir_all(&cache_dir)?;
+
+        // Simulate a v2 DB before `kernel_replayed_oleans` existed.
+        {
+            let conn = Connection::open(cache_dir.join("state.db"))?;
+            conn.execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 CREATE TABLE blobs (blob_hash TEXT PRIMARY KEY, size_bytes INTEGER NOT NULL, ref_count INTEGER NOT NULL DEFAULT 0, pin_level INTEGER NOT NULL DEFAULT 0, last_accessed INTEGER NOT NULL);
+                 PRAGMA user_version = 2;",
+            )?;
+        }
+
+        let store = TurboStore::open(Some(&cache_dir))?;
+        let uv: i64 = store
+            .conn
+            .query_row("PRAGMA user_version;", [], |r| r.get(0))?;
+        assert_eq!(uv, 3);
+        assert!(!store.has_kernel_replayed_olean("dig1", 2, "tc1"));
+        assert!(store
+            .record_kernel_replayed_olean("", 2, "tc1", "M")
+            .is_err());
+        assert!(store
+            .record_kernel_replayed_olean("dig1", 0, "tc1", "M")
+            .is_err());
+        assert!(store
+            .record_kernel_replayed_olean("dig1", 2, "", "M")
+            .is_err());
+
+        store.record_kernel_replayed_olean("dig1", 2, "tc1", "Dep.Good")?;
+        assert!(store.has_kernel_replayed_olean("dig1", 2, "tc1"));
+        assert!(!store.has_kernel_replayed_olean("dig2", 2, "tc1"));
+        assert!(!store.has_kernel_replayed_olean("dig1", 1, "tc1"));
+        assert!(!store.has_kernel_replayed_olean("dig1", 3, "tc1"));
+        assert!(!store.has_kernel_replayed_olean("dig1", 2, "tc2"));
+
+        let ro = TurboStore::open(Some(&cache_dir))?;
+        assert!(ro.has_kernel_replayed_olean("dig1", 2, "tc1"));
+
+        drop(ro);
+        drop(store);
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }

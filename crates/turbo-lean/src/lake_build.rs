@@ -1636,7 +1636,7 @@ fn verify_project_module_entry_and_sidecars(
     let Some(entry) = manifest.modules.get(rel_src) else {
         return false;
     };
-    if !entry.kernel_replayed() || entry.src_blake3 != expected_src_blake3 {
+    if entry.src_blake3 != expected_src_blake3 {
         return false;
     }
     let olean_path = resolve_project_olean_for_rel_path(canon_dir, rel_src);
@@ -1775,6 +1775,155 @@ pub(crate) fn are_all_project_oleans_up_to_date(
     checked_oleans > 0
 }
 
+pub(crate) fn are_all_project_oleans_replayed_in_store(
+    store: &TurboStore,
+    canon_dir: &Path,
+    file_hashes: &BTreeMap<String, String>,
+) -> bool {
+    let Ok(cfg) = crate::module_builder::resolve_project_config(canon_dir) else {
+        return false;
+    };
+    let lean_path = resolve_remote_lean_path(canon_dir, None);
+    let dirs: Vec<PathBuf> = std::env::split_paths(&lean_path).collect();
+    let mut worklist = Vec::new();
+    for rel_path in file_hashes.keys() {
+        if rel_path == "lakefile.lean" || rel_path.ends_with("/lakefile.lean") {
+            continue;
+        }
+        let olean_path = resolve_project_olean_for_rel_path(canon_dir, rel_path);
+        if olean_path.is_file() {
+            if !crate::module_builder::is_olean_replayed_in_store(
+                store,
+                &cfg.lean_githash,
+                &olean_path,
+            ) {
+                return false;
+            }
+            if let Ok(bytes) = fs::read(&olean_path) {
+                if let Some((imps, _)) = crate::module_builder::parse_olean_binary_imports(&bytes) {
+                    worklist.extend(imps.into_iter().map(|i| i.module));
+                }
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    while let Some(m) = worklist.pop() {
+        if !seen.insert(m.clone())
+            || crate::module_builder::is_builtin_toolchain_module(&cfg.toolchain_lib_lean, &m)
+        {
+            continue;
+        }
+        let rel = format!("{}.olean", crate::module_builder::module_name_to_rel_slash(&m));
+        let Some(path) = dirs.iter().map(|d| d.join(&rel)).find(|p| p.is_file()) else {
+            return false;
+        };
+        if path.starts_with(&cfg.toolchain_lib_lean) {
+            continue;
+        }
+        if !crate::module_builder::is_olean_replayed_in_store(store, &cfg.lean_githash, &path) {
+            return false;
+        }
+        let Ok(bytes) = fs::read(&path) else {
+            return false;
+        };
+        if let Some((imps, _)) = crate::module_builder::parse_olean_binary_imports(&bytes) {
+            worklist.extend(imps.into_iter().map(|i| i.module));
+        }
+    }
+    true
+}
+
+pub(crate) fn ensure_project_and_imported_oleans_replayed_in_store(
+    store: &TurboStore,
+    canon_dir: &Path,
+    file_hashes: &BTreeMap<String, String>,
+) -> Result<()> {
+    let cfg = crate::module_builder::resolve_project_config(canon_dir).context(
+        "Cannot kernel-replay project `.olean`s without a resolvable project configuration: fail-closed",
+    )?;
+    let lean_path = resolve_remote_lean_path(canon_dir, None);
+    let dirs: Vec<PathBuf> = std::env::split_paths(&lean_path).collect();
+    let mut root_mods: Vec<(String, PathBuf)> = Vec::new();
+    let mut worklist = Vec::new();
+    for rel_path in file_hashes.keys() {
+        if rel_path == "lakefile.lean" || rel_path.ends_with("/lakefile.lean") {
+            continue;
+        }
+        let olean_path = resolve_project_olean_for_rel_path(canon_dir, rel_path);
+        if olean_path.is_file() {
+            let lib_lean_dir = canon_dir.join(".lake/build/lib/lean");
+            let rel_no_ext = olean_path
+                .strip_prefix(&lib_lean_dir)
+                .unwrap_or(&olean_path)
+                .with_extension("");
+            let parts: Vec<String> = rel_no_ext
+                .components()
+                .filter_map(|c| c.as_os_str().to_str().map(|s| s.to_string()))
+                .collect();
+            if !parts.is_empty() {
+                let mod_name = crate::module_builder::format_lean_module_name_from_parts(
+                    parts.iter().map(String::as_str),
+                );
+                let bytes = fs::read(&olean_path)?;
+                if let Some((imps, _)) = crate::module_builder::parse_olean_binary_imports(&bytes) {
+                    worklist.extend(imps.into_iter().map(|i| i.module));
+                }
+                root_mods.push((mod_name, olean_path));
+            }
+        }
+    }
+    let mut seen: HashSet<String> = root_mods.iter().map(|(m, _)| m.clone()).collect();
+    let mut dep_mods: Vec<(String, PathBuf)> = Vec::new();
+    while let Some(m) = worklist.pop() {
+        if !seen.insert(m.clone())
+            || crate::module_builder::is_builtin_toolchain_module(&cfg.toolchain_lib_lean, &m)
+        {
+            continue;
+        }
+        let rel = format!("{}.olean", crate::module_builder::module_name_to_rel_slash(&m));
+        let Some(path) = dirs.iter().map(|d| d.join(&rel)).find(|p| p.is_file()) else {
+            continue;
+        };
+        if path.starts_with(&cfg.toolchain_lib_lean) {
+            continue;
+        }
+        let bytes = fs::read(&path)?;
+        if let Some((imps, _)) = crate::module_builder::parse_olean_binary_imports(&bytes) {
+            worklist.extend(imps.into_iter().map(|i| i.module));
+        }
+        dep_mods.push((m, path));
+    }
+    let replay_lp = format!("{}:{}", lean_path, cfg.toolchain_lib_lean.display());
+    let mut pending_deps = Vec::new();
+    for (m, path) in &dep_mods {
+        if !crate::module_builder::is_olean_replayed_in_store(store, &cfg.lean_githash, path) {
+            pending_deps.push(m.clone());
+        }
+    }
+    if !pending_deps.is_empty() {
+        crate::zygote::kernel_replay_modules_with_zygote(store, &cfg, &pending_deps, &replay_lp)
+            .context("Imported `.olean` failed independent kernel replay")?;
+    }
+    let mut pending_roots = Vec::new();
+    for (m, path) in &root_mods {
+        if !crate::module_builder::is_olean_replayed_in_store(store, &cfg.lean_githash, path) {
+            pending_roots.push(m.clone());
+        }
+    }
+    if !pending_roots.is_empty() {
+        crate::zygote::audit_compiled_modules_with_zygote(
+            store,
+            &cfg,
+            &pending_roots,
+            &replay_lp,
+            &[],
+            false,
+        )
+        .context("Project `.olean` failed in-kernel soundness & replay audit")?;
+    }
+    Ok(())
+}
+
 pub(crate) fn is_file_and_imports_verified_in_manifest(
     canon_dir: &Path,
     canon_file: &Path,
@@ -1907,13 +2056,18 @@ pub(crate) fn collect_lean_files(root: &Path) -> Vec<PathBuf> {
     collect_project_lean_files(root, false, None)
 }
 
-/// Resolve the pre-compiled `.olean` module import name (e.g. `TurboLean.Reflection`) if
-/// `.lake/build/lib/lean/<Module>.olean` exists on disk and its source + transitive project-local
-/// imports are not stale relative to the `.olean` on disk.
+#[cfg(test)]
 pub(crate) fn resolve_prebuilt_module_import(
     canon_project_dir: &Path,
     canon_file: &Path,
 ) -> Option<String> {
+    resolve_prebuilt_module_import_with_path(canon_project_dir, canon_file).map(|(m, _)| m)
+}
+
+fn resolve_prebuilt_module_import_with_path(
+    canon_project_dir: &Path,
+    canon_file: &Path,
+) -> Option<(String, PathBuf)> {
     let rel = canon_file.strip_prefix(canon_project_dir).ok()?;
     let rel_no_ext = rel.with_extension("");
     let parts: Vec<String> = rel_no_ext
@@ -1929,7 +2083,7 @@ pub(crate) fn resolve_prebuilt_module_import(
             .join(".lake")
             .join("packages")
             .join(pkg_name);
-        return resolve_prebuilt_module_import(&pkg_root, canon_file);
+        return resolve_prebuilt_module_import_with_path(&pkg_root, canon_file);
     }
     let lib_lean_dir = canon_project_dir
         .join(".lake")
@@ -1937,7 +2091,7 @@ pub(crate) fn resolve_prebuilt_module_import(
         .join("lib")
         .join("lean");
     let direct_olean = lib_lean_dir.join(&rel_no_ext).with_extension("olean");
-    let (_olean_path, mod_parts) = if direct_olean.is_file() {
+    let (olean_path, mod_parts) = if direct_olean.is_file() {
         (direct_olean, parts.as_slice())
     } else if parts.len() >= 2 && matches!(parts[0].as_str(), "submission" | "src" | "lean") {
         let mut stripped_rel = PathBuf::new();
@@ -1964,9 +2118,53 @@ pub(crate) fn resolve_prebuilt_module_import(
     ) {
         return None;
     }
-    Some(crate::module_builder::format_lean_module_name_from_parts(
-        mod_parts.iter().map(String::as_str),
+    Some((
+        crate::module_builder::format_lean_module_name_from_parts(
+            mod_parts.iter().map(String::as_str),
+        ),
+        olean_path,
     ))
+}
+
+/// Resolve the pre-compiled `.olean` module import name ONLY when both local manifest freshness AND
+/// `TurboStore` SQLite DB kernel-replay authority (`kernel_replayed_oleans`) hold for the target
+/// `.olean` and all of its transitive non-toolchain `.olean` imports.
+pub(crate) fn resolve_replayed_prebuilt_module_import(
+    store: &TurboStore,
+    canon_project_dir: &Path,
+    canon_file: &Path,
+) -> Option<String> {
+    let (mod_name, olean_path) =
+        resolve_prebuilt_module_import_with_path(canon_project_dir, canon_file)?;
+    let cfg = crate::module_builder::resolve_project_config(canon_project_dir).ok()?;
+    if !crate::module_builder::is_olean_replayed_in_store(store, &cfg.lean_githash, &olean_path) {
+        return None;
+    }
+    let lean_path = resolve_remote_lean_path(canon_project_dir, None);
+    let dirs: Vec<PathBuf> = std::env::split_paths(&lean_path).collect();
+    let bytes = fs::read(&olean_path).ok()?;
+    let (imps, _) = crate::module_builder::parse_olean_binary_imports(&bytes)?;
+    let mut worklist: Vec<String> = imps.into_iter().map(|i| i.module).collect();
+    let mut seen = HashSet::new();
+    while let Some(m) = worklist.pop() {
+        if !seen.insert(m.clone())
+            || crate::module_builder::is_builtin_toolchain_module(&cfg.toolchain_lib_lean, &m)
+        {
+            continue;
+        }
+        let rel = format!("{}.olean", crate::module_builder::module_name_to_rel_slash(&m));
+        let path = dirs.iter().map(|d| d.join(&rel)).find(|p| p.is_file())?;
+        if path.starts_with(&cfg.toolchain_lib_lean) {
+            continue;
+        }
+        if !crate::module_builder::is_olean_replayed_in_store(store, &cfg.lean_githash, &path) {
+            return None;
+        }
+        let sub_bytes = fs::read(&path).ok()?;
+        let (sub_imps, _) = crate::module_builder::parse_olean_binary_imports(&sub_bytes)?;
+        worklist.extend(sub_imps.into_iter().map(|i| i.module));
+    }
+    Some(mod_name)
 }
 
 fn remove_module_build_artifacts(canon_dir: &Path, rel_slash: &str) {
@@ -2084,7 +2282,7 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
             (Some(m), Some(ch)) => m
                 .modules
                 .get(&dep_rel)
-                .is_some_and(|e| !e.kernel_replayed() || e.src_blake3 != *ch),
+                .is_some_and(|e| e.src_blake3 != *ch),
             _ => false,
         };
         let mtime_stale = match (&olean_meta, &src_meta) {
@@ -2507,7 +2705,8 @@ pub(crate) fn seed_project_theorem_shards_from_splits(
 
     let pkg_cfg_opt = crate::module_builder::optional_package_config(canon_dir)?;
     for (lf, _src, split) in split_entries {
-        if require_olean && resolve_prebuilt_module_import(canon_dir, lf).is_none() {
+        if require_olean && resolve_replayed_prebuilt_module_import(store, canon_dir, lf).is_none()
+        {
             continue;
         }
         if split.shards.is_empty() {
@@ -2551,7 +2750,10 @@ pub(crate) fn seed_project_theorem_shards(
 ) -> Result<(usize, usize, usize)> {
     let lean_files: Vec<PathBuf> = collect_lean_files(canon_dir)
         .into_iter()
-        .filter(|lf| !require_olean || resolve_prebuilt_module_import(canon_dir, lf).is_some())
+        .filter(|lf| {
+            !require_olean
+                || resolve_replayed_prebuilt_module_import(store, canon_dir, lf).is_some()
+        })
         .collect();
 
     let (split_entries, split_cache_hits) = load_and_split_files_cached(store, &lean_files)?;
@@ -3049,6 +3251,7 @@ pub fn run_build_command(
     match store.acquire_singleflight(&action_key, &toolchain, "module_full", &trust_domain)? {
         SingleflightOutcome::CacheHit { outputs, coalesced } => {
             let linked = store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
+            ensure_project_and_imported_oleans_replayed_in_store(store, &canon_dir, &file_hashes)?;
             let seeded_shards = if seed_shards {
                 seed_project_theorem_shards(store, &canon_dir, &toolchain, &trust_domain, false)?.1
             } else {
@@ -3092,7 +3295,10 @@ pub fn run_build_command(
         }
         SingleflightOutcome::Leader(lease) => {
             let mut build_report = crate::module_builder::NativeBuildReport::default();
-            if !targets.is_empty() || !are_all_project_oleans_up_to_date(&canon_dir, &file_hashes) {
+            if !targets.is_empty()
+                || !are_all_project_oleans_up_to_date(&canon_dir, &file_hashes)
+                || !are_all_project_oleans_replayed_in_store(store, &canon_dir, &file_hashes)
+            {
                 build_report = crate::module_builder::build_project_modules_native(
                     store,
                     &canon_dir,
@@ -3543,7 +3749,6 @@ mod tests {
                     crate::module_builder::VerifiedDepModuleEntry {
                         src_blake3: "previous source".into(),
                         olean_artifact_digest: "previous artifact".into(),
-                        replay_version: crate::zygote::ZYGOTE_REPLAY_VERSION,
                     },
                 )]),
             };
