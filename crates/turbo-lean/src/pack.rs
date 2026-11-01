@@ -3500,21 +3500,10 @@ pub(crate) mod tests {
             resp1.ok && resp1.verified_count == 2 && resp1.cache_hits == 0 && resp1.exit_code == 0
         );
 
-        let store_srv_check = TurboStore::open(Some(&dir_server))?;
         let both_keys = [
             "batch_shard_key_1".to_string(),
             "batch_shard_key_2".to_string(),
         ];
-        for _ in 0..20 {
-            if store_srv_check
-                .batch_get_theorem_shards(&both_keys, "trusted")?
-                .len()
-                == 2
-            {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
         assert_eq!(
             store_client
                 .batch_get_theorem_shards(&both_keys, "trusted")?

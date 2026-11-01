@@ -2814,12 +2814,12 @@ pub fn eval_with_zygote_pool_opts_with_args(
 
 /// The cache and executor must agree on the final import search order and artifacts.
 pub(crate) struct ResolvedZygoteContext {
-    lean_path: String,
-    imports_csv: String,
-    olean_digest: String,
+    pub(crate) lean_path: String,
+    pub(crate) imports_csv: String,
+    pub(crate) olean_digest: String,
     search_path_digest: String,
     host_closure_digest: String,
-    toolchain_policy: String,
+    pub(crate) toolchain_policy: String,
     pub(crate) identity: String,
 }
 
