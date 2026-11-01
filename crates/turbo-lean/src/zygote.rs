@@ -1438,22 +1438,32 @@ fn compute_imported_oleans_digest_inner(
 /// three at once: the memo key contains it, `warm_imports` is compared against it before a worker
 /// is reused, and prefix reuse requires that same `warm_imports` match.
 ///
-/// Package roots are recovered from the search path (`<pkg_root>/.lake/build/lib/lean`), which is
-/// the only project location this function is given. Empty -- and free, see
-/// `workspace_may_declare_lake_inputs` -- for every workspace that declares no inputs.
+/// Package roots are recovered from the search path, which is the only project location this
+/// function is given. `<pkg_root>/.lake/build/lib/lean` is only the *default* layout -- `buildDir`
+/// and `leanLibDir` are both Lake package fields -- so each entry is walked up to the nearest
+/// ancestor that carries a Lake config instead of counting a fixed four components. A package whose
+/// `buildDir` is custom would otherwise contribute no tag at all, and its `input_dir` edit would
+/// leave `olean_digest` unmoved: a warm worker answering from the old bytes.
+///
+/// Empty -- and free, see `workspace_may_declare_lake_inputs` -- for every workspace that declares
+/// no inputs, including every toolchain entry on the path, which carries no Lake config.
 fn compute_lean_path_lake_inputs_digest(effective_lean_path: &str) -> String {
     let mut tags: Vec<String> = Vec::new();
     for part in effective_lean_path.split(':').filter(|p| !p.is_empty()) {
-        if !Path::new(part).ends_with(".lake/build/lib/lean") {
-            continue;
-        }
-        let Some(pkg_root) = Path::new(part).ancestors().nth(4) else {
-            continue;
-        };
-        if let Some(tag) = crate::module_builder::project_lake_inputs_tag(pkg_root) {
-            if !tags.contains(&tag) {
-                tags.push(tag);
+        // Bounded: the deepest default layout is four components below the package root, and a
+        // custom `buildDir` / `leanLibDir` pair is not deeper in practice. Stopping at the nearest
+        // package root also keeps a dependency attributed to itself rather than to the workspace
+        // whose `.lake/packages` contains it.
+        for anc in Path::new(part).ancestors().take(8) {
+            if !crate::lake_build::has_lake_config(anc) {
+                continue;
             }
+            if let Some(tag) = crate::module_builder::project_lake_inputs_tag(anc) {
+                if !tags.contains(&tag) {
+                    tags.push(tag);
+                }
+            }
+            break;
         }
     }
     tags.sort();
@@ -6021,6 +6031,10 @@ mod tests {
     /// in-process verified-shard memo is keyed on `olean_digest` too. A `needs`-ed `input_dir` file
     /// is read while a module elaborates and moves no `.olean` byte, so without this component an
     /// edited input left every one of them matching and the worker answered from the old bytes.
+    ///
+    /// Covers the layouts as well as the contents: the package root is recovered by walking the
+    /// search-path entry up to the nearest Lake config, so a package whose `buildDir` is not
+    /// `.lake/build` is folded in just the same.
     #[test]
     fn test_zygote_lake_inputs_digest_tracks_declared_input_contents() {
         // Drives the process-global Lake-input memo window, as the tests in `module_builder` do.
@@ -6070,8 +6084,32 @@ mod tests {
         fs::write(tmp_dir.join("Data/a.sol"), "contract A {}").unwrap();
         assert_eq!(d1, digest(&lp));
 
-        // A search-path entry that is not a package build directory is ignored.
-        assert_eq!(digest(&tmp_dir.to_string_lossy()), "");
+        // A custom `buildDir` / `leanLibDir` must contribute the same tag. `buildDir` is a Lake
+        // package field, so `<pkg_root>/.lake/build/lib/lean` is only the default layout; counting
+        // a fixed four components up from the search path entry left every such package out of
+        // `olean_digest`, and a warm worker survived an edit to its inputs.
+        let custom_lib = tmp_dir.join("out/lib/lean");
+        fs::create_dir_all(&custom_lib).unwrap();
+        assert_eq!(
+            digest(&custom_lib.to_string_lossy()),
+            d1,
+            "a custom build directory must resolve to the same package root"
+        );
+        // So must the package root itself, which is the shallowest entry that can name it.
+        assert_eq!(digest(&tmp_dir.to_string_lossy()), d1);
+
+        // A search-path entry with no Lake package above it -- every toolchain entry, for one --
+        // still contributes nothing. Nested deeply enough that the ancestor walk cannot reach the
+        // shared temp root.
+        let other = std::env::temp_dir().join(format!(
+            "turbo_zygote_no_lake_{}_{}",
+            std::process::id(),
+            next_tmp_id()
+        ));
+        let bare = other.join("a/b/c/d/e/lib/lean");
+        fs::create_dir_all(&bare).unwrap();
+        assert_eq!(digest(&bare.to_string_lossy()), "");
+        let _ = fs::remove_dir_all(&other);
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 

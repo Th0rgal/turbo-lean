@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use walkdir::WalkDir;
@@ -62,6 +63,14 @@ pub struct InputTargetConfig {
     /// Lake's own 16-hex file hash of the same files (an `input_dir` folds them left-to-right),
     /// so the `.trace` files written here keep matching Lake's `extraDep` trace.
     pub lake_hash: String,
+    /// Why turbo-lean cannot read this dependency's input the way Lake does: an unknown field, or
+    /// a `filter` that is not `.extension "<ext>"`. The root package fails closed at parse time
+    /// instead (see `unsupported_lake_field`); for a dependency this is promoted onto
+    /// `PackageConfig::unsupported` by `finalize_package_config`, so building any of the
+    /// package's modules fails closed, and spelled into `workspace_lake_inputs_digest` so no key
+    /// derived from the inputs can collide with one from a version turbo-lean did understand.
+    #[serde(default)]
+    pub unsupported: Option<String>,
 }
 /// Static configuration of a `lean_exe` target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4057,8 +4066,14 @@ pub fn parse_lakefile_lean(
                     }
                     DeclBlock::Input(input_idx) => {
                         let input = &mut pkg.inputs[input_idx];
-                        // A dependency's unsupported `filter` keeps every file of the directory
-                        // (an over-approximation); the root package fails closed.
+                        // A `filter` that is not `.extension "<ext>"` keeps every file of the
+                        // directory, so the digest an unrecognised filter produces is always a
+                        // superset -- but a superset is not the same set Lake hashes, and the
+                        // field could equally be one that makes Lake read files this parser never
+                        // selects. So an unknown field and an unrecognised filter take the same
+                        // route as every other dependency field: the root package fails closed
+                        // here, a dependency records `why` and fails closed once its inputs are
+                        // what a key depends on (see `InputTargetConfig::unsupported`).
                         let ext = (key == "filter" && input.is_dir)
                             .then(|| lean_extension_filter(&val_accum))
                             .flatten();
@@ -4072,18 +4087,21 @@ pub fn parse_lakefile_lean(
                             }
                             "text" => input.text = parse_toml_bool(&val_accum)?,
                             "filter" if ext.is_some() => input.extension = ext,
-                            other if is_root_pkg => {
-                                let _ = c_abi::verify_static_lake_config(true, true, false, false);
-                                anyhow::bail!(
-                                    "Unsupported `{}` field `{} := {}` in {} at line {} (only `path`, `text` and `filter := .extension \"<ext>\"`): fail-closed static Lake config gate",
+                            other => {
+                                let why = format!(
+                                    "Unsupported `{}` field `{} := {}` in {} at line {} (only `path`, `text` and `filter := .extension \"<ext>\"`)",
                                     if input.is_dir { "input_dir" } else { "input_file" },
                                     other,
                                     val_accum,
                                     lean_path.display(),
                                     line_no
                                 );
+                                unsupported_lake_field(
+                                    &mut input.unsupported,
+                                    is_root_pkg,
+                                    why,
+                                )?;
                             }
-                            _ => {}
                         }
                     }
                     _ => {}
@@ -4231,6 +4249,7 @@ where
                 text: false,
                 blake3: String::new(),
                 lake_hash: String::new(),
+                unsupported: None,
             });
             *current_block = T::input(pkg.inputs.len() - 1);
             return Ok(());
@@ -4727,6 +4746,15 @@ fn finalize_package_config(
             dup.name,
             config_path.display()
         );
+    }
+    // An input this parser could not read like Lake makes every module of the package
+    // unbuildable, not just the libraries that `needs` it: an input's `filter` or an unknown field
+    // decides which bytes elaboration sees, and `workspace_lake_inputs_digest` folds the package's
+    // inputs into keys that modules of *other* packages use too. The root package already failed
+    // closed at parse time; this is the dependency half of the same gate, routed through the slot
+    // `build_module_dag` already checks before it publishes a Lake trace for any module.
+    if let Some(why) = pkg.inputs.iter().find_map(|i| i.unsupported.clone()) {
+        pkg.unsupported.get_or_insert(why);
     }
     let pkg_root = pkg.pkg_root.clone();
     for input in &mut pkg.inputs {
@@ -6423,7 +6451,12 @@ pub(crate) fn module_lake_input_digest(cfg: &ProjectConfig, node: &ModuleNode) -
     pkg.inputs
         .iter()
         .filter(|i| needed.contains(i.name.as_str()))
-        .map(|i| format!("{}:{}\n", i.name, i.blake3))
+        .map(|i| match &i.unsupported {
+            // Same reasoning as `workspace_lake_inputs_digest`: an input whose declaration was not
+            // understood must not be represented by a digest that claims it was.
+            Some(why) => format!("{}:unsupported:{}\n", i.name, why),
+            None => format!("{}:{}\n", i.name, i.blake3),
+        })
         .collect()
 }
 
@@ -6446,41 +6479,105 @@ pub(crate) fn module_lake_input_digest(cfg: &ProjectConfig, node: &ModuleNode) -
 /// Empty when no package in the workspace declares inputs, so a manifest written before this field
 /// existed stays valid for every input-free project (its recorded digest defaults to the empty
 /// string) and every such project's keys stay byte-identical.
+///
+/// An input whose declaration this parser could not read like Lake
+/// ([`InputTargetConfig::unsupported`]) contributes its reason instead of pretending the digest
+/// answers for it. The reason is constant, so it does not thrash, but it cannot collide with the
+/// digest of a version of the same input that turbo-lean *did* understand -- and
+/// `finalize_package_config` has already made every module of that package fail closed.
 pub(crate) fn workspace_lake_inputs_digest(cfg: &ProjectConfig) -> String {
     std::iter::once(&cfg.root_pkg)
         .chain(cfg.dep_pkgs.iter())
         .filter(|p| !p.inputs.is_empty())
         .flat_map(|p| {
-            p.inputs
-                .iter()
-                .map(move |i| format!("{}/{}:{}\n", p.name, i.name, i.blake3))
+            p.inputs.iter().map(move |i| match &i.unsupported {
+                Some(why) => format!("{}/{}:unsupported:{}\n", p.name, i.name, why),
+                None => format!("{}/{}:{}\n", p.name, i.name, i.blake3),
+            })
         })
         .collect()
 }
 
-/// Cheap "could this workspace declare Lake file inputs at all?" test: a byte scan of the root and
-/// dependency Lake configs for `input_file` / `input_dir`.
+/// Every Lake config file a workspace resolve would read: the root package's, plus one per
+/// dependency package [`resolve_project_config_with_trust`] would adopt.
+///
+/// Derived from the same manifest and resolver logic rather than from `.lake/packages/*`, because
+/// four manifest fields move a package's config somewhere else entirely -- `packagesDir`, a
+/// package's `subDir`, a `type: path` dependency's `dir`, and a `configFile` that is not
+/// `lakefile` -- and a dependency config this list misses is a dependency whose `input_dir`
+/// reaches no cache key at all: invisible to [`project_lake_inputs_tag`] and to
+/// `lake_build::update_with_lake_input_digests`, so an edit under it is served the old bytes.
+///
+/// Over-approximates where that is the cheaper side: it enumerates the `packagesDir` directories
+/// even when a manifest pins the package list, and lists candidates the resolve may discard. A
+/// candidate that declares no input costs one `read_to_string`; a candidate that declares one but
+/// is not adopted costs a resolve whose digest simply will not mention it.
+///
+/// `Err` is the fail-closed answer, and every caller reads it as "may declare inputs": a manifest
+/// or a `configFile` that will not parse leaves the dependency set unknown, and the alternative --
+/// reporting the default `.lake/packages` layout for a workspace whose real layout nobody could
+/// read -- is exactly the silent stale hit this guards. Every `Err` here is one
+/// `resolve_project_config` raises too, so no workspace that resolves today starts failing.
+fn workspace_lake_config_candidates(project_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let root_config = package_config_path(project_dir, None)?;
+    out.extend(root_config.clone());
+    // `is_untrusted = false`: this enumerates candidates to byte-scan, it does not adopt a
+    // package. The trust gate stays in `resolve_project_config_with_trust`, which rejects an
+    // out-of-workspace dependency before reading anything out of it.
+    let (manifest_pkgs_dir, manifest_packages, manifest_hash) =
+        parse_lake_manifest(project_dir, false)?;
+    for mp in &manifest_packages {
+        out.extend(package_config_path(&mp.dir, mp.config_file.as_deref())?);
+    }
+    let mut pkgs_dirs: Vec<PathBuf> = vec![manifest_pkgs_dir];
+    if manifest_hash.is_none() {
+        // The resolver's no-manifest path enumerates the root package's `packagesDir` as well.
+        // That field only exists inside the root config, so learning a custom value needs the
+        // root parse -- paid for only when the config names the field at all, and `is_root_pkg
+        // = false` so an unsupported field elsewhere in the config is recorded rather than
+        // turning every such project into one that "may declare inputs".
+        if root_config
+            .as_ref()
+            .is_some_and(|p| fs::read_to_string(p).is_ok_and(|s| s.contains("packagesDir")))
+        {
+            pkgs_dirs.push(resolve_package_config(project_dir, false)?.packages_dir);
+        }
+    }
+    for pkgs_rel in pkgs_dirs {
+        let Ok(entries) = fs::read_dir(project_dir.join(pkgs_rel)) else {
+            continue;
+        };
+        let mut dirs: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        dirs.sort();
+        for d in dirs {
+            out.extend(package_config_path(&d, None)?);
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// Cheap "could this workspace declare Lake file inputs at all?" test: a byte scan of every Lake
+/// config [`workspace_lake_config_candidates`] names for `input_file` / `input_dir`.
 ///
 /// Every project that declares none -- which is every project but the one this feature exists for
 /// -- answers `false` here and never pays for a config resolve, so the hot per-file key paths that
-/// consult [`project_lake_inputs_tag`] stay as fast as they were. It can only over-approximate
-/// (the words also appear in comments and strings), never under-approximate: a package that really
-/// declares an input necessarily contains the word that declares it.
+/// consult [`project_lake_inputs_tag`] stay cheap. It can only over-approximate (the words also
+/// appear in comments and strings), never under-approximate: a package that really declares an
+/// input necessarily contains the word that declares it, in a file this candidate list names.
 pub(crate) fn workspace_may_declare_lake_inputs(project_dir: &Path) -> bool {
-    let declares = |dir: &Path| {
-        ["lakefile.lean", "lakefile.toml"].iter().any(|f| {
-            fs::read_to_string(dir.join(f))
-                .is_ok_and(|s| s.contains("input_file") || s.contains("input_dir"))
-        })
-    };
-    if declares(project_dir) {
-        return true;
+    match workspace_lake_config_candidates(project_dir) {
+        Ok(candidates) => candidates.iter().any(|p| {
+            fs::read_to_string(p).is_ok_and(|s| s.contains("input_file") || s.contains("input_dir"))
+        }),
+        Err(_) => true,
     }
-    fs::read_dir(project_dir.join(".lake/packages")).is_ok_and(|entries| {
-        entries
-            .flatten()
-            .any(|e| e.path().is_dir() && declares(&e.path()))
-    })
 }
 
 /// Wrap a [`workspace_lake_inputs_digest`] into the synthetic dependency-interface-hash entry.
@@ -6510,20 +6607,43 @@ pub(crate) fn lake_inputs_tag_from_digest(digest: &str) -> Option<String> {
 ///
 /// `None` for a workspace that declares no inputs, so those keys are untouched.
 ///
-/// Memoized per top-level command, keyed on the project directory alone. This runs once per `.lean`
-/// file, and resolving the workspace re-reads every declared input byte: measured at 33 ms per call
-/// for a 200-file `input_dir`, i.e. ~16 s on a 500-module project, down to 0.4 ms amortized with
-/// the memo (and 104 µs → 3.5 µs for a project that declares no inputs, where only the config scan
-/// runs). The memo is the form the reverted `hash_input_target` memo's docstring identified as the
-/// safe one, and it is safe for the reason that one was not: there is no `(len, mtime)` in the key,
-/// so a same-length write with a restored mtime cannot be served a stale digest -- the only thing
-/// the memo asserts is that the inputs are read once per command, which is already how every other
-/// config resolution behaves. [`reset_lake_inputs_tag_memo`] bounds that window.
-static LAKE_INPUTS_TAG_MEMO: OnceLock<Mutex<HashMap<PathBuf, Option<String>>>> = OnceLock::new();
+/// Memoized per top-level command / request, keyed on the project directory *and the memo window
+/// it was computed in*. This runs once per `.lean` file, and resolving the workspace re-reads every
+/// declared input byte: measured at 33 ms per call for a 200-file `input_dir`, i.e. ~16 s on a
+/// 500-module project, down to 0.4 ms amortized with the memo (and 104 µs → 3.5 µs for a project
+/// that declares no inputs, where only the config scan runs). The memo is the form the reverted
+/// `hash_input_target` memo's docstring identified as the safe one, and it is safe for the reason
+/// that one was not: there is no `(len, mtime)` in the key, so a same-length write with a restored
+/// mtime cannot be served a stale digest -- the only thing the memo asserts is that the inputs are
+/// read once per window, which is already how every other config resolution behaves.
+///
+/// The window id is what makes the memo safe in a process that serves *concurrent* requests.
+/// `serve` runs up to 64 handlers at once and `reset_lake_inputs_tag_memo` is called by each; a
+/// handler that is still mid-request when the next one resets would otherwise publish the digest it
+/// read before the reset into the new request's window, which is a hit against bytes that may no
+/// longer exist. Every entry therefore records the window it was computed in,
+/// [`project_lake_inputs_tag`] reads only entries from the window it entered, and
+/// [`publish_lake_inputs_tag`] refuses to store one whose window has been superseded.
+///
+/// The price is that a superseded in-flight request stops memoizing and recomputes per `.lean`
+/// file. That is the over-invalidating side of the trade the project-wide rule asks for, and it is
+/// bounded to the overlap between two concurrent requests on the same project; the one-shot CLI
+/// path, where the figures above were measured, has a single window and is unaffected.
+static LAKE_INPUTS_TAG_MEMO: OnceLock<Mutex<HashMap<PathBuf, (u64, Option<String>)>>> =
+    OnceLock::new();
 
-/// End the memo window above. Called once per CLI command and once per `serve` / MCP request, so a
-/// process that outlives a single command never answers from a previous request's input bytes.
+/// Current memo window. Bumped by [`reset_lake_inputs_tag_memo`] before it takes the memo lock, so
+/// a publication that observes the old value under that lock is necessarily one that started before
+/// the reset.
+static LAKE_INPUTS_TAG_MEMO_WINDOW: AtomicU64 = AtomicU64::new(0);
+
+/// End the memo window above and open the next one. Called once per CLI command and once per
+/// `serve` / MCP request, so a process that outlives a single command never answers from a previous
+/// request's input bytes.
 pub fn reset_lake_inputs_tag_memo() {
+    // Bump first: a concurrent `publish_lake_inputs_tag` either already holds the lock (and this
+    // clear removes its entry) or takes it after this store and sees its own window superseded.
+    LAKE_INPUTS_TAG_MEMO_WINDOW.fetch_add(1, Ordering::SeqCst);
     if let Some(m) = LAKE_INPUTS_TAG_MEMO.get() {
         if let Ok(mut g) = m.lock() {
             g.clear();
@@ -6531,14 +6651,37 @@ pub fn reset_lake_inputs_tag_memo() {
     }
 }
 
+/// Store `tag` for `project_dir` as a caller that entered in `window` computed it. `false` when the
+/// window has been superseded, i.e. another command or request reset the memo while this caller was
+/// reading input bytes -- those bytes answer for a window nobody is in any more.
+fn publish_lake_inputs_tag(project_dir: &Path, window: u64, tag: &Option<String>) -> bool {
+    let memo = LAKE_INPUTS_TAG_MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut g) = memo.lock() else {
+        return false;
+    };
+    if LAKE_INPUTS_TAG_MEMO_WINDOW.load(Ordering::SeqCst) != window {
+        return false;
+    }
+    // Bounded: one entry per project directory seen, cleared at every window boundary.
+    if g.len() >= 256 {
+        g.clear();
+    }
+    g.insert(project_dir.to_path_buf(), (window, tag.clone()));
+    true
+}
+
 pub(crate) fn project_lake_inputs_tag(project_dir: &Path) -> Option<String> {
     if project_dir.as_os_str().is_empty() {
         return None;
     }
     let memo = LAKE_INPUTS_TAG_MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    // Read *before* any input byte is, and re-checked by `publish_lake_inputs_tag` afterwards.
+    let window = LAKE_INPUTS_TAG_MEMO_WINDOW.load(Ordering::SeqCst);
     if let Ok(g) = memo.lock() {
-        if let Some(hit) = g.get(project_dir) {
-            return hit.clone();
+        if let Some((w, hit)) = g.get(project_dir) {
+            if *w == window {
+                return hit.clone();
+            }
         }
     }
     let tag = if workspace_may_declare_lake_inputs(project_dir) {
@@ -6553,13 +6696,7 @@ pub(crate) fn project_lake_inputs_tag(project_dir: &Path) -> Option<String> {
     } else {
         None
     };
-    if let Ok(mut g) = memo.lock() {
-        // Bounded: one entry per project directory seen, cleared at every command boundary.
-        if g.len() >= 256 {
-            g.clear();
-        }
-        g.insert(project_dir.to_path_buf(), tag.clone());
-    }
+    let _ = publish_lake_inputs_tag(project_dir, window, &tag);
     tag
 }
 
@@ -10113,6 +10250,353 @@ lean_lib Later where
             .unwrap_err()
             .to_string();
         assert!(err.contains("needs"), "{err}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A dependency's declared inputs must reach the cache keys wherever the manifest puts that
+    /// dependency, not only in `.lake/packages/<name>/lakefile.{lean,toml}`.
+    ///
+    /// `resolve_project_config` honours four fields that relocate a package: `packagesDir`, a
+    /// package's `subDir`, a `type: path` dependency's `dir`, and a `configFile` that is not
+    /// `lakefile`. The cheap pre-scan that decides whether a workspace declares inputs at all is
+    /// what every key path consults first, so a layout it does not know about is a dependency
+    /// whose `input_dir` edit moves *nothing*: `update_with_lake_input_digests` returns before it
+    /// hashes anything and `project_lake_inputs_tag` answers `None`, which is indistinguishable
+    /// from "this workspace declares no inputs". `build` / `ci-verify` then hit their old action
+    /// key and every content-derived shard cache answers from the old bytes.
+    #[test]
+    fn test_lake_inputs_follow_relocated_dependency_packages() {
+        // Drives the process-global Lake-input memo window.
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        const DEP_CFG: &str = "import Lake\nopen Lake DSL\npackage dep_pkg\ninput_dir depSources where\n  path := \"Data\"\n  filter := .extension \"sol\"\nlean_lib DepPkg where\n  globs := #[.submodules `DepPkg]\n  needs := #[depSources]\n";
+        // Deliberately mentions neither `input_dir` nor `input_file`: the scan must find the
+        // dependency's declaration, not the root's.
+        const ROOT_CFG: &str = "import Lake\nopen Lake DSL\npackage app_pkg\n@[default_target]\nlean_lib App where\n  globs := #[.submodules `App]\n";
+
+        let build_workspace = |tag: &str,
+                               root_cfg: &str,
+                               manifest: Option<&str>,
+                               dep_rel: &str,
+                               dep_cfg_name: &str|
+         -> (PathBuf, PathBuf) {
+            let dir = make_temp_test_dir(tag);
+            let dep_dir = dir.join(dep_rel);
+            fs::create_dir_all(dep_dir.join("DepPkg")).unwrap();
+            fs::create_dir_all(dep_dir.join("Data")).unwrap();
+            fs::create_dir_all(dir.join("App")).unwrap();
+            fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+            fs::write(dir.join("lakefile.lean"), root_cfg).unwrap();
+            if let Some(m) = manifest {
+                fs::write(dir.join("lake-manifest.json"), m).unwrap();
+            }
+            fs::write(dir.join("App/A.lean"), "def a : Nat := 1\n").unwrap();
+            fs::write(dep_dir.join(dep_cfg_name), DEP_CFG).unwrap();
+            fs::write(dep_dir.join("DepPkg/Base.lean"), "def d : Nat := 1\n").unwrap();
+            fs::write(dep_dir.join("Data/d.sol"), "contract D {}").unwrap();
+            (dir, dep_dir)
+        };
+        // (project action-key fold, shard dependency-hash tag) -- the two folds a relocated
+        // dependency was invisible to.
+        let folds = |dir: &Path| -> (String, Option<String>) {
+            reset_lake_inputs_tag_memo();
+            let mut h = blake3::Hasher::new();
+            lake_build::update_with_lake_input_digests(&mut h, dir).unwrap();
+            (
+                h.finalize().to_hex().to_string(),
+                project_lake_inputs_tag(dir),
+            )
+        };
+
+        for (tag, root_cfg, manifest, dep_rel, dep_cfg_name) in [
+            // A `type: path` dependency pointed outside `.lake/packages` entirely, and reading a
+            // `configFile` that is not `lakefile.lean`: two misses in one layout.
+            (
+                "reloc_path_dep",
+                ROOT_CFG,
+                Some(
+                    r#"{"version":"1.2.0","packagesDir":".lake/packages","packages":[{"type":"path","name":"dep_pkg","dir":"vendor/dep_pkg","configFile":"dep_lakefile.lean","inherited":false}],"name":"app_pkg","lakeDir":".lake","fixedToolchain":false}"#,
+                ),
+                "vendor/dep_pkg",
+                "dep_lakefile.lean",
+            ),
+            // A manifest `packagesDir` plus the package's own `subDir`.
+            (
+                "reloc_pkgs_dir",
+                ROOT_CFG,
+                Some(
+                    r#"{"version":"1.2.0","packagesDir":"deps","packages":[{"type":"git","name":"dep_pkg","subDir":"sub","inherited":false}],"name":"app_pkg","lakeDir":".lake","fixedToolchain":false}"#,
+                ),
+                "deps/dep_pkg/sub",
+                "lakefile.lean",
+            ),
+            // No manifest at all: the resolver enumerates the root package's `packagesDir`, which
+            // only the root config knows.
+            (
+                "reloc_root_pkgs_dir",
+                "import Lake\nopen Lake DSL\npackage app_pkg where\n  packagesDir := \"deps\"\n@[default_target]\nlean_lib App where\n  globs := #[.submodules `App]\n",
+                None,
+                "deps/dep_pkg",
+                "lakefile.lean",
+            ),
+        ] {
+            let (dir, dep_dir) = build_workspace(tag, root_cfg, manifest, dep_rel, dep_cfg_name);
+            assert!(
+                workspace_may_declare_lake_inputs(&dir),
+                "{tag}: the pre-scan must find the relocated dependency's declaration"
+            );
+            let cfg = resolve_project_config(&dir).unwrap();
+            assert!(
+                workspace_lake_inputs_digest(&cfg).contains("dep_pkg/depSources"),
+                "{tag}: the relocated dependency must be adopted and its input digested"
+            );
+            let f0 = folds(&dir);
+            assert!(
+                f0.1.is_some(),
+                "{tag}: a workspace with inputs must carry a shard tag"
+            );
+            fs::write(dep_dir.join("Data/d.sol"), "contract DMuchLongerName {}").unwrap();
+            let f1 = folds(&dir);
+            assert_ne!(
+                f1.0, f0.0,
+                "{tag}: editing the dependency's input must move the project action key"
+            );
+            assert_ne!(
+                f1.1, f0.1,
+                "{tag}: editing the dependency's input must move the shard tag"
+            );
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        // Negative control: widening the candidate list must not make every workspace answer
+        // "may declare inputs", or the fast path this scan protects is gone.
+        let (plain, _) = build_workspace(
+            "reloc_no_inputs",
+            ROOT_CFG,
+            Some(
+                r#"{"version":"1.2.0","packagesDir":"deps","packages":[],"name":"app_pkg","lakeDir":".lake","fixedToolchain":false}"#,
+            ),
+            "deps/unused",
+            "ignored.txt",
+        );
+        assert!(
+            !workspace_may_declare_lake_inputs(&plain),
+            "a workspace whose configs name no input must still take the fast path"
+        );
+        reset_lake_inputs_tag_memo();
+        assert_eq!(project_lake_inputs_tag(&plain), None);
+        // And a manifest nobody can parse is the fail-closed answer, not the default layout.
+        fs::write(plain.join("lake-manifest.json"), "{not json").unwrap();
+        assert!(
+            workspace_may_declare_lake_inputs(&plain),
+            "an unparseable manifest leaves the dependency set unknown, so it may declare inputs"
+        );
+        fs::remove_dir_all(plain).unwrap();
+    }
+
+    /// The Lake-input memo must not let one request publish into another's window.
+    ///
+    /// `serve` runs up to 64 handler threads and each calls `reset_lake_inputs_tag_memo`. A
+    /// handler that read its input bytes *before* the next handler's reset used to insert them
+    /// afterwards, keyed on the project directory alone -- so the next request, whose whole reason
+    /// for resetting was that the inputs may have changed, was served the previous request's
+    /// digest and hit the cache against bytes that no longer existed.
+    ///
+    /// Exercised deterministically rather than with threads: `publish_lake_inputs_tag` is the
+    /// publication half of `project_lake_inputs_tag`, so calling it with a stale window is exactly
+    /// the interleaving a race would produce, without depending on one happening.
+    #[test]
+    fn test_lake_inputs_tag_memo_rejects_cross_request_publication() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = make_temp_test_dir("input_tag_memo_race");
+        fs::create_dir_all(dir.join("Data")).unwrap();
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            dir.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage demo\ninput_dir d where\n  path := \"Data\"\n  filter := .extension \"sol\"\n@[default_target]\nlean_lib Smoke where\n  globs := #[.submodules `Smoke]\n  needs := #[d]\n",
+        )
+        .unwrap();
+        fs::write(dir.join("Data/a.sol"), "contract A {}").unwrap();
+
+        // Request 1 enters, reads the inputs, and is still running.
+        reset_lake_inputs_tag_memo();
+        let window_1 = LAKE_INPUTS_TAG_MEMO_WINDOW.load(std::sync::atomic::Ordering::SeqCst);
+        let tag_1 = project_lake_inputs_tag(&dir).expect("declared inputs produce a tag");
+        // The input changes and request 2 opens its own window.
+        fs::write(dir.join("Data/a.sol"), "contract AMuchLongerName {}").unwrap();
+        reset_lake_inputs_tag_memo();
+        // Request 1 now tries to publish what it read before that reset.
+        assert!(
+            !publish_lake_inputs_tag(&dir, window_1, &Some(tag_1.clone())),
+            "a superseded window must not be able to publish into the current one"
+        );
+        let tag_2 = project_lake_inputs_tag(&dir).expect("still declares inputs");
+        assert_ne!(
+            tag_1, tag_2,
+            "request 2 must read the new bytes, not request 1's digest"
+        );
+
+        // The memo is still a memo: a publication from the *current* window is accepted and read
+        // back, so the test above is not just observing a disabled cache.
+        let window_2 = LAKE_INPUTS_TAG_MEMO_WINDOW.load(std::sync::atomic::Ordering::SeqCst);
+        let sentinel = Some("\u{0}lake-inputs:sentinel".to_string());
+        assert!(
+            publish_lake_inputs_tag(&dir, window_2, &sentinel),
+            "the current window must be able to publish"
+        );
+        assert_eq!(
+            project_lake_inputs_tag(&dir),
+            sentinel,
+            "a same-window entry must be served from the memo"
+        );
+
+        // Concurrent handlers resetting and reading at once must stay consistent: every tag any
+        // thread observes has to be one of the two digests the two file contents can produce,
+        // never a mix and never a value from a window that had already ended.
+        reset_lake_inputs_tag_memo();
+        fs::write(dir.join("Data/a.sol"), "contract A {}").unwrap();
+        let legal = {
+            reset_lake_inputs_tag_memo();
+            let a = project_lake_inputs_tag(&dir).unwrap();
+            fs::write(dir.join("Data/a.sol"), "contract AMuchLongerName {}").unwrap();
+            reset_lake_inputs_tag_memo();
+            let b = project_lake_inputs_tag(&dir).unwrap();
+            [a, b]
+        };
+        let shared_dir = dir.clone();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let d = shared_dir.clone();
+                let legal = legal.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..8 {
+                        reset_lake_inputs_tag_memo();
+                        let t = project_lake_inputs_tag(&d).expect("declared inputs");
+                        assert!(legal.contains(&t), "observed an impossible tag: {t}");
+                    }
+                })
+            })
+            .collect();
+        for (i, h) in handles.into_iter().enumerate() {
+            h.join().unwrap_or_else(|_| panic!("handler thread {i} panicked"));
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An unknown field, or a `filter` this parser does not recognise, on a *dependency's*
+    /// `input_dir` must fail closed instead of being silently dropped.
+    ///
+    /// The root package has always failed closed here. A dependency's fell through a bare
+    /// `_ => {}`, so the resolve reported a clean config and a digest derived from whatever set of
+    /// files *this* parser happened to select -- while the field that was ignored is precisely the
+    /// one that decides which files Lake reads. Routing it through `unsupported_lake_field` puts it
+    /// on the same footing as every other dependency field: recorded, promoted onto the package so
+    /// `build_module_dag` refuses to publish a Lake trace for any of its modules, and spelled into
+    /// the input digests so no key can collide with one from a declaration turbo-lean understood.
+    #[test]
+    fn test_dependency_input_unsupported_field_fails_closed() {
+        // Drives the process-global Lake-input memo window.
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = make_temp_test_dir("dep_input_unsupported");
+        let dep_dir = dir.join(".lake/packages/dep_pkg");
+        fs::create_dir_all(dep_dir.join("Data")).unwrap();
+        fs::create_dir_all(dep_dir.join("DepPkg")).unwrap();
+        fs::create_dir_all(dir.join("App")).unwrap();
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            dir.join("lakefile.toml"),
+            "name = \"app_pkg\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\nglobs = [\"App.+\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("lake-manifest.json"),
+            r#"{"version":"1.2.0","packagesDir":".lake/packages","packages":[{"type":"path","name":"dep_pkg","dir":".lake/packages/dep_pkg","configFile":"lakefile.lean","inherited":false}],"name":"app_pkg","lakeDir":".lake","fixedToolchain":false}"#,
+        )
+        .unwrap();
+        fs::write(dir.join("App/A.lean"), "def a : Nat := 1\n").unwrap();
+        fs::write(dep_dir.join("DepPkg/Base.lean"), "def d : Nat := 1\n").unwrap();
+        fs::write(dep_dir.join("Data/d.sol"), "contract D {}").unwrap();
+        let write_cfg = |extra: &str| {
+            fs::write(
+                dep_dir.join("lakefile.lean"),
+                format!(
+                    "import Lake\nopen Lake DSL\npackage dep_pkg\ninput_dir depSources where\n  path := \"Data\"\n{extra}lean_lib DepPkg where\n  globs := #[.submodules `DepPkg]\n  needs := #[depSources]\n"
+                ),
+            )
+            .unwrap();
+        };
+        let workspace_digest = || {
+            workspace_lake_inputs_digest(&resolve_project_config(&dir).expect("workspace resolves"))
+        };
+
+        // The understood baseline: a recognised filter leaves nothing unsupported, and the digest
+        // is the input's content hash.
+        write_cfg("  filter := .extension \"sol\"\n");
+        let ok = resolve_package_config(&dep_dir, false).unwrap();
+        assert!(
+            ok.inputs[0].unsupported.is_none() && ok.unsupported.is_none(),
+            "a recognised `filter` must stay supported"
+        );
+        let ok_digest = workspace_digest();
+        assert!(
+            ok_digest.contains(&ok.inputs[0].blake3) && !ok_digest.contains("unsupported:"),
+            "{ok_digest}"
+        );
+
+        for extra in [
+            // An unknown field.
+            "  followSymlinks := true\n",
+            // A `filter` that is not `.extension "<ext>"`. Keeping every file of the directory is a
+            // superset of what Lake selects, but it is not the same set, and the next filter form
+            // Lake grows may just as easily be a narrower one that reads files this parser skips.
+            "  filter := .name \"d.sol\"\n",
+        ] {
+            write_cfg(extra);
+            // The root package still fails the parse outright.
+            let err = resolve_package_config(&dep_dir, true)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("Unsupported `input_dir` field")
+                    && err.contains("fail-closed static Lake config gate"),
+                "{extra}: {err}"
+            );
+            // A dependency records it, and it is promoted onto the package, which is the slot
+            // `build_module_dag` checks before it builds any of the package's modules.
+            let dep = resolve_package_config(&dep_dir, false).unwrap();
+            let why = dep.inputs[0]
+                .unsupported
+                .clone()
+                .unwrap_or_else(|| panic!("{extra}: a dependency's input field must be recorded"));
+            assert!(
+                why.contains("Unsupported `input_dir` field"),
+                "{extra}: {why}"
+            );
+            assert_eq!(
+                dep.unsupported.as_deref(),
+                Some(why.as_str()),
+                "{extra}: an unread input must make every module of the package fail closed"
+            );
+            // And it must reach the workspace digest, so no key derived from these inputs can
+            // equal one derived from a declaration that was understood.
+            let digest = workspace_digest();
+            assert!(
+                digest.contains("dep_pkg/depSources:unsupported:") && digest != ok_digest,
+                "{extra}: {digest}"
+            );
+            // The per-module digest is the same question asked of one module, and must agree.
+            reset_lake_inputs_tag_memo();
+            assert_ne!(
+                project_lake_inputs_tag(&dir),
+                None,
+                "{extra}: the workspace still declares inputs"
+            );
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 

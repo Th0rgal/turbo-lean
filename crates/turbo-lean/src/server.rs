@@ -413,10 +413,6 @@ pub fn serve_cas_http_with_auth(
         let _ = stream.set_nodelay(true);
         let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
         let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
-        // New request, new Lake-input memo window: a daemon must never answer from the input bytes
-        // a previous request read. See `module_builder::reset_lake_inputs_tag_memo`.
-        crate::module_builder::reset_lake_inputs_tag_memo();
-
         if !state.admit() {
             drop(state);
             let _ = write_http_response(
@@ -434,6 +430,12 @@ pub fn serve_cas_http_with_auth(
         let expected_token_clone = expected_token.clone();
 
         std::thread::spawn(move || {
+            // New request, new Lake-input memo window: a daemon must never answer from the input
+            // bytes a previous request read. Opened here on the handler thread rather than on the
+            // accept loop, so the window belongs to the request that does the reading and a
+            // rejected 503 opens none. Concurrent handlers are safe because every memo entry
+            // records its window; see `module_builder::reset_lake_inputs_tag_memo`.
+            crate::module_builder::reset_lake_inputs_tag_memo();
             struct ConnDropGuard(std::sync::Arc<std::sync::Mutex<ServerActivity>>);
             impl Drop for ConnDropGuard {
                 fn drop(&mut self) {

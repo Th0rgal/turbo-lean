@@ -7328,6 +7328,25 @@ end Fixture
         Ok(())
     }
 
+    /// Recursive file copy, so a test can snapshot a warm `.lake/build` and hand an identical one
+    /// to each entry point it measures. Lake's own files there may be hard links into its artifact
+    /// cache; this materializes them, which is what a restored baseline wants anyway.
+    fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
+        if src.is_dir() {
+            fs::create_dir_all(dst)?;
+            for entry in fs::read_dir(src)? {
+                let entry = entry?;
+                copy_tree(&entry.path(), &dst.join(entry.file_name()))?;
+            }
+        } else if src.is_file() {
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(src, dst)?;
+        }
+        Ok(())
+    }
+
     /// A warm `.lake/build` must not vouch for `.olean` files elaborated against Lake file inputs
     /// that have since changed.
     ///
@@ -7415,7 +7434,9 @@ end Fixture
                 .map(|m| m.lake_inputs_digest)
         };
         // Empty `targets` is what makes `build` consult the warm-directory fast path at all.
-        let build = |st: &mut TurboStore| {
+        // All three discard their success value so step 3 can hold them in one `&dyn Fn` list and
+        // give each an independently restored warm baseline.
+        let build = |st: &mut TurboStore| -> Result<()> {
             crate::lake_build::run_build_command(
                 st,
                 true,
@@ -7425,8 +7446,9 @@ end Fixture
                 0,
                 false,
             )
+            .map(|_| ())
         };
-        let ci_verify = |st: &mut TurboStore| {
+        let ci_verify = |st: &mut TurboStore| -> Result<()> {
             run_ci_verify_command(
                 st,
                 true,
@@ -7437,8 +7459,9 @@ end Fixture
                 false,
                 None,
             )
+            .map(|_| ())
         };
-        let check_b = |st: &mut TurboStore| {
+        let check_b = |st: &mut TurboStore| -> Result<()> {
             crate::check::run_check_command(
                 st,
                 false,
@@ -7450,6 +7473,7 @@ end Fixture
                 false,
                 None,
             )
+            .map(|_| ())
         };
 
         // 1. Cold build of the consistent tree, then record what the warm directory vouches for.
@@ -7479,37 +7503,56 @@ end Fixture
             "an unchanged tree must not re-elaborate"
         );
 
-        // 2. Edit a matched `.sol` and leave `.lake/build` fully populated.
-        fs::write(canon_repo.join("Data/a.sol"), v2)?;
-        assert_ne!(
-            inputs_digest(),
-            v1_digest,
-            "editing a matched input must move the package input digest"
-        );
+        // 2. Snapshot the warm directory -- artifacts *and*
+        // `.lake/build/.turbo_verified_sources.json` both live under `.lake/build` -- so each
+        // entry point below can be given its own copy of it.
+        let warm_snapshot = tmp_dir.join("warm_lake_build");
+        let lake_build_dir = canon_repo.join(".lake/build");
+        copy_tree(&lake_build_dir, &warm_snapshot)?;
         assert!(
-            crate::lake_build::lake_inputs_changed_since_manifest(&canon_repo),
-            "the on-disk manifest must now read as stale"
+            warm_snapshot.join(".turbo_verified_sources.json").is_file(),
+            "the warm snapshot must capture the manifest the fast paths read"
         );
 
         // 3. Each entry point must re-elaborate against the new bytes, which makes the pinned
         // length false. Before the fix the warm `.olean` was accepted and all three passed, so
         // collect all three outcomes rather than short-circuiting: a regression in any one of them
         // should name itself.
+        //
+        // Each gets an independently restored warm baseline. `build`, `ci-verify` and `check` all
+        // rewrite or purge `.lake/build` and the manifest on their way to a verdict, so running
+        // them in sequence would hand the second and third a directory the first had already
+        // invalidated: their verdicts would say nothing about the *warm* fast path, which is the
+        // only thing this test is about. Restore the snapshot, then re-apply the edit, so every
+        // run starts from the same "warm directory, consistent manifest, edited input" state.
+        let restore_warm = |label: &str| -> Result<()> {
+            let _ = fs::remove_dir_all(&lake_build_dir);
+            copy_tree(&warm_snapshot, &lake_build_dir)
+                .with_context(|| format!("restoring the warm baseline for `{label}`"))?;
+            fs::write(canon_repo.join("Data/a.sol"), v2)?;
+            assert_ne!(
+                inputs_digest(),
+                v1_digest,
+                "`{label}` must start from the edited input"
+            );
+            assert!(
+                crate::lake_build::lake_inputs_changed_since_manifest(&canon_repo),
+                "the restored manifest must read as stale for `{label}`"
+            );
+            assert!(
+                olean_a.is_file(),
+                "`{label}` must start from a populated warm build directory"
+            );
+            Ok(())
+        };
         let mut false_greens: Vec<&str> = Vec::new();
-        for (label, outcome) in [
-            ("build", build(&mut store)),
-            // A failed run may have cleared artifacts, so re-assert the edited input before each
-            // entry point and let it rebuild whatever it needs from the same starting state.
-            ("ci-verify", {
-                fs::write(canon_repo.join("Data/a.sol"), v2)?;
-                ci_verify(&mut store)
-            }),
-            ("check", {
-                fs::write(canon_repo.join("Data/a.sol"), v2)?;
-                check_b(&mut store)
-            }),
+        for (label, run) in [
+            ("build", &build as &dyn Fn(&mut TurboStore) -> Result<()>),
+            ("ci-verify", &ci_verify),
+            ("check", &check_b),
         ] {
-            if outcome.is_ok() {
+            restore_warm(label)?;
+            if run(&mut store).is_ok() {
                 false_greens.push(label);
             }
         }

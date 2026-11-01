@@ -2468,16 +2468,23 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
                     manifest.modules.remove(&dep_rel);
                 }
             }
-            // Lake has now rebuilt every stale import against the inputs on disk, so record which
-            // inputs that was. Without this the next `check` recomputes
-            // `lake_inputs_changed_since_manifest() == true` from the same unchanged recorded
-            // digest and hands Lake the identical target list again -- a full refresh on every
-            // check for as long as the manifest is never rewritten by a native build.
+            // Deliberately *not* re-stamping `manifest.lake_inputs_digest` here. Reaching this
+            // branch at all means `load_verified_project_manifest` accepted the manifest, which it
+            // only does when the recorded digest already equals the workspace digest (see its
+            // `lake_inputs_digest` check), so the assignment could only ever be a no-op -- and a
+            // no-op that would silently *clear* a recorded digest if the two resolves it compares
+            // ever disagreed.
             //
-            // Safe only because the entries answer for themselves: the modules this run rebuilt had
-            // their entries dropped just above, and any entry it did *not* rebuild keeps the older
-            // `lake_inputs_digest` and is still rejected by the checks that read it.
-            manifest.lake_inputs_digest = expected_lake_inputs;
+            // The cost is that the whole-manifest mismatch cannot be retired by this refresh: when
+            // an input really has changed, `load_verified_project_manifest` returns `None`, there
+            // is no manifest to stamp, and every later `check` recomputes
+            // `lake_inputs_changed_since_manifest() == true` and hands Lake the same target list
+            // again -- a full Lake refresh per `check` until a native build rewrites the manifest.
+            // Retiring that needs the per-entry `lake_inputs_digest` to be compared inside
+            // `verify_project_module_entry_and_sidecars` first; without it, re-stamping the
+            // whole-manifest field would let `are_all_project_oleans_up_to_date` and
+            // `is_file_and_imports_verified_in_manifest` vouch for entries this run never
+            // rebuilt, which is exactly the stale-`.olean` hit round 1 found.
             if let Ok(json_bytes) = serde_json::to_vec(&manifest) {
                 let _ = fs::write(&manifest_path, json_bytes);
             } else {
