@@ -9709,44 +9709,56 @@ fn build_module_co_export(cfg: &ProjectConfig, node: &ModuleNode) -> Result<Path
         .parent()
         .and_then(|p| p.parent())
         .ok_or_else(|| anyhow::anyhow!("Cannot derive Lean sysroot"))?;
+    let Some(co_fname) = co_path.file_name() else {
+        anyhow::bail!(
+            "`.c.o.export` path `{}` has no file name",
+            co_path.display()
+        );
+    };
     let pid = std::process::id();
     let seq = crate::pack::next_tmp_id();
-    let tmp_co = parent.join(format!(".turbo_tmp_co_{}_{}.o", pid, seq));
-    let _ = fs::remove_file(&tmp_co);
-    let mut cmd = Command::new(&cc);
-    cmd.arg("-c")
-        .arg("-o")
-        .arg(&tmp_co)
-        .arg(&node.c_path)
-        .arg("-I")
-        .arg(sysroot.join("include"));
-    for flag in &cflags {
-        cmd.arg(flag);
-    }
-    cmd.arg("-O3").arg("-DNDEBUG").arg("-DLEAN_EXPORTING");
-    let out = cmd.output().with_context(|| {
-        let _ = fs::remove_file(&tmp_co);
+    let tmp_dir = parent.join(format!(".turbo_tmp_co_dir_{}_{}", pid, seq));
+    fs::create_dir(&tmp_dir).with_context(|| {
         format!(
-            "Failed to spawn clang for `.c.o.export` of `{}`",
-            node.module_name
+            "Failed to create private staging directory `{}` for `{}`",
+            tmp_dir.display(),
+            co_path.display()
         )
     })?;
-    if !out.status.success() {
-        let _ = fs::remove_file(&tmp_co);
-        anyhow::bail!(
-            "clang failed building `.c.o.export` for `{}`: {}",
-            node.module_name,
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    let co_bytes = fs::read(&tmp_co).with_context(|| {
-        let _ = fs::remove_file(&tmp_co);
-        format!("Failed to read staged `{}`", tmp_co.display())
-    })?;
-    fs::rename(&tmp_co, &co_path).with_context(|| {
-        let _ = fs::remove_file(&tmp_co);
-        format!("Failed to commit `{}`", co_path.display())
-    })?;
+    let tmp_co = tmp_dir.join(co_fname);
+    let co_res: Result<Vec<u8>> = (|| {
+        let mut cmd = Command::new(&cc);
+        cmd.arg("-c")
+            .arg("-o")
+            .arg(&tmp_co)
+            .arg(&node.c_path)
+            .arg("-I")
+            .arg(sysroot.join("include"));
+        for flag in &cflags {
+            cmd.arg(flag);
+        }
+        cmd.arg("-O3").arg("-DNDEBUG").arg("-DLEAN_EXPORTING");
+        let out = cmd.output().with_context(|| {
+            format!(
+                "Failed to spawn clang for `.c.o.export` of `{}`",
+                node.module_name
+            )
+        })?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "clang failed building `.c.o.export` for `{}`: {}",
+                node.module_name,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let co_bytes = fs::read(&tmp_co)
+            .with_context(|| format!("Failed to read staged `{}`", tmp_co.display()))?;
+        fs::rename(&tmp_co, &co_path)
+            .with_context(|| format!("Failed to commit `{}`", co_path.display()))?;
+        Ok(co_bytes)
+    })();
+    let _ = fs::remove_dir_all(&tmp_dir);
+    let co_bytes = co_res?;
     let co_h = lake_hash_bytes(&co_bytes);
     write_file_atomic(
         &PathBuf::from(format!("{}.hash", co_path.display())),
@@ -9910,8 +9922,11 @@ fn build_shared_object(
     let tmp_so = tmp_dir.join(so_fname);
     let link_res: Result<Vec<u8>> = (|| {
         let mut cmd = Command::new(&cc);
-        cmd.arg("-shared")
-            .arg("-o")
+        cmd.arg("-shared");
+        if toolchain_native.is_osx {
+            cmd.arg(format!("-Wl,-install_name,{}", so_path.display()));
+        }
+        cmd.arg("-o")
             .arg(&tmp_so)
             .arg(format!("@{}", rsp_path.display()));
         let out = cmd.output().with_context(|| {
