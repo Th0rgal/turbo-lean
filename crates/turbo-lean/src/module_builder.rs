@@ -7700,6 +7700,15 @@ pub(crate) fn run_command_with_timeout(
     let mut poll_iter = 0u32;
     loop {
         if let Some(status) = child.try_wait()? {
+            #[cfg(unix)]
+            {
+                let pgid = child.id() as i32;
+                if pgid > 0 {
+                    unsafe {
+                        let _ = libc::kill(-pgid, libc::SIGKILL);
+                    }
+                }
+            }
             let stdout = out_handle.join().unwrap_or_default();
             let stderr = err_handle.join().unwrap_or_default();
             return Ok(std::process::Output {
@@ -10305,6 +10314,11 @@ lean_exe «demo-exe» where
 
     #[test]
     fn test_native_module_builder_cas_partial_invalidation_lazy_c_and_lake_differential() {
+        // Other tests toggle `TURBO_LEAN_NO_WORKTREE_LINK` under the env lock, which disables
+        // compiling uncached modules in `build_project_modules_native` when multi-threaded.
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = make_temp_test_dir("native_e2e");
         let store_dir = dir.join(".turbo_store");
         let proj_dir = dir.join("proj");
@@ -10612,8 +10626,10 @@ lean_exe «demo-exe» where
 
     #[test]
     fn test_parallel_diamond_dag_and_ci_verify_native_builder() {
-        let dir = std::env::temp_dir().join(format!("turbo_mod_diamond_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = make_temp_test_dir("diamond");
         let proj_dir = dir.join("diamond_proj");
         let store_dir = dir.join("store");
         fs::create_dir_all(proj_dir.join("Diamond")).unwrap();

@@ -578,6 +578,62 @@ pub fn atomic_write_shm(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+pub(crate) struct StagingLeaseGuard {
+    lock_path: PathBuf,
+    _lease: Option<FlockGuard>,
+}
+
+impl StagingLeaseGuard {
+    pub(crate) fn acquire_for_target(target: &Path) -> std::io::Result<Self> {
+        if let Some(parent) = target.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        #[cfg(unix)]
+        let mut dir_lease = lock_staging_parent_dir(target, false, false)?;
+        let lock_path = staging_lease_lock_path(target);
+        let lease = match acquire_staging_lease(&lock_path) {
+            Ok(l) => l,
+            Err(e) => {
+                #[cfg(unix)]
+                drop(dir_lease);
+                return Err(e);
+            }
+        };
+        #[cfg(unix)]
+        drop(dir_lease.take());
+        Ok(Self {
+            lock_path,
+            _lease: lease,
+        })
+    }
+}
+
+impl Drop for StagingLeaseGuard {
+    fn drop(&mut self) {
+        let _ = self._lease.take();
+        let _ = reap_stale_lock_if_unheld(&self.lock_path);
+    }
+}
+
+pub fn is_staging_lease_held_on_self_or_ancestor(target: &Path, root: &Path) -> bool {
+    let mut cur = target;
+    loop {
+        if is_staging_lease_held(cur) {
+            return true;
+        }
+        let Some(parent) = cur.parent() else {
+            break;
+        };
+        if parent == cur || parent == root {
+            break;
+        }
+        cur = parent;
+    }
+    false
+}
+
 pub struct StagedTempFile {
     path: PathBuf,
     _lease: Option<FlockGuard>,
@@ -874,6 +930,28 @@ pub fn try_remove_unleased_staged_file(target: &Path) -> bool {
     removed
 }
 
+pub fn try_remove_unleased_staged_dir(target: &Path) -> bool {
+    if !fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_dir()) {
+        return false;
+    }
+    #[cfg(unix)]
+    let _dir_guard = match lock_staging_parent_dir(target, true, true) {
+        Ok(Some(g)) => Some(g),
+        _ => return false,
+    };
+    let lock_path = staging_lease_lock_path(target);
+    let Some(guard) = try_lock_sidecar(&lock_path, true) else {
+        return false;
+    };
+    crate::check::thaw_private_dir_tree(target);
+    let removed = fs::remove_dir_all(target).is_ok();
+    if fs::symlink_metadata(target).is_err() {
+        let _ = fs::remove_file(&lock_path);
+    }
+    drop(guard);
+    removed
+}
+
 pub fn reap_stale_lock_if_unheld(lock_path: &Path) -> bool {
     #[cfg(unix)]
     let _dir_guard = match lock_staging_parent_dir(lock_path, true, true) {
@@ -938,7 +1016,7 @@ fn scan_evictable_shm_files(
             }
             continue;
         }
-        if is_staging_lease_held(path) {
+        if is_staging_lease_held_on_self_or_ancestor(path, shm_dir) {
             continue;
         }
         let fname = path
@@ -949,7 +1027,6 @@ fn scan_evictable_shm_files(
             || fname == "zygote_daemon.json"
             || fname == "zygote_lru_registry.json"
             || path.to_string_lossy().contains("zygote_daemon_cas_")
-            || path.to_string_lossy().contains("TurboAuditedShard_")
             || path.to_string_lossy().contains("fastcheck_shared_bins")
         {
             continue;
@@ -1215,7 +1292,7 @@ pub fn spill_shm_to_disk_dir(
         if max_shm_bytes > 0 && total_size <= target_bytes {
             break;
         }
-        if is_staging_lease_held(&path) {
+        if is_staging_lease_held_on_self_or_ancestor(&path, shm_dir) {
             continue;
         }
         let Some(file_name) = path.file_name() else {
