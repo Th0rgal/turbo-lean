@@ -2813,7 +2813,7 @@ pub fn run_ci_verify_command(
                 }
             }
         } else {
-            crate::module_builder::audit_existing_project_artifacts(store_ref, &canon_dir, &[])?;
+            crate::module_builder::audit_existing_project_artifacts(store_ref, &canon_dir, &ci_targets)?;
         }
         crate::module_builder::require_source_compilations(store_ref, &canon_dir, &lean_paths, is_untrusted)
     };
@@ -2894,7 +2894,7 @@ pub fn run_ci_verify_command(
             }
 
             if oleans_up_to_date {
-                crate::module_builder::audit_existing_project_artifacts(store, &canon_dir, &[])?;
+                crate::module_builder::audit_existing_project_artifacts(store, &canon_dir, &ci_targets)?;
             }
 
             crate::module_builder::require_source_compilations(store, &canon_dir, &lean_paths, is_untrusted)?;

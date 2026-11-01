@@ -8638,6 +8638,7 @@ struct SourceCompilationRecord {
     source_digest: String,
     workspace_config_digest: String,
     allowed_axioms: Vec<String>,
+    allowed_csimp: String,
     scanner_version: u32,
     is_untrusted: bool,
     replay: DependencyReplayRecord,
@@ -8664,6 +8665,7 @@ impl SourceCompilationRecord {
             source_digest: blake3::hash(&fs::read(file)?).to_hex().to_string(),
             workspace_config_digest: cfg.canonical_config_digest.clone(),
             allowed_axioms: crate::splitter::allowed_axioms(),
+            allowed_csimp: std::env::var("TURBO_LEAN_ALLOWED_CSIMP").unwrap_or_default().trim().to_string(),
             scanner_version: crate::zygote::ZYGOTE_SCANNER_VERSION,
             is_untrusted,
             replay: DependencyReplayRecord::new(
@@ -10926,6 +10928,19 @@ lean_exe «demo-exe» where
             &tree.project,
             &target
         ));
+        // A record from another csimp permission cannot authorize this policy.
+        let cfg = resolve_project_config(&tree.project)?;
+        let mut different_policy = SourceCompilationRecord::new(&cfg, &target, "P.Target", false)?;
+        different_policy.allowed_csimp.push_str("different-permission");
+        let key = blake3::hash(serde_json::to_string(&target.canonicalize()?)?.as_bytes()).to_hex().to_string();
+        let original: String = store.conn.query_row(
+            "SELECT record_json FROM source_kernel_compilations WHERE compilation_key = ?1", [&key], |r| r.get(0),
+        )?;
+        store.conn.execute("UPDATE source_kernel_compilations SET record_json = ?1 WHERE compilation_key = ?2",
+            rusqlite::params![serde_json::to_string(&different_policy)?, key])?;
+        assert!(!source_compilation_authorized(&store, &tree.project, &target));
+        store.conn.execute("UPDATE source_kernel_compilations SET record_json = ?1 WHERE compilation_key = ?2",
+            rusqlite::params![original, key])?;
         let receipt = tree.root.join("receipt.json");
         crate::pr_verify::run_ci_verify_command(
             &mut store,
