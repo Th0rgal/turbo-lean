@@ -153,7 +153,8 @@ impl Project {
     fn run(&self, args: &[&str], daemon: bool) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_turbo-lean"));
         for (key, _) in std::env::vars_os() {
-            if key.to_string_lossy().starts_with("TURBO_LEAN_") {
+            let k = key.to_string_lossy();
+            if k.starts_with("TURBO_LEAN_") && k != "TURBO_LEAN_GIT" {
                 cmd.env_remove(key);
             }
         }
