@@ -941,6 +941,8 @@ pub fn compute_imported_olean_interface_hashes(
         return Vec::new();
     }
 
+    let search_refs: Vec<&Path> = search_dirs.iter().map(PathBuf::as_path).collect();
+    let tc_ref = resolved_tc_lib.as_deref();
     let mut visited = std::collections::HashSet::new();
     let mut out = Vec::new();
 
@@ -949,19 +951,16 @@ pub fn compute_imported_olean_interface_hashes(
             continue;
         }
         let rel_slash = crate::module_builder::module_name_to_rel_slash(&mod_name);
-        let rel_olean = format!("{}.olean", rel_slash);
         let sub_lean_opt = resolve_project_lean_source(project_dir, &rel_slash);
         let src_digest_opt = sub_lean_opt
             .as_deref()
             .and_then(compute_cached_source_blake3);
         let mut olean_digest_opt = None;
         let mut olean_sub_mods = Vec::new();
-        for dir in &search_dirs {
-            let cand = dir.join(&rel_olean);
+        if let Some(cand) = crate::zygote::resolve_closure_module(&search_refs, &mod_name, tc_ref) {
             if let Some((digest, sub_deps)) = compute_single_olean_digest_and_imports(&cand) {
                 olean_digest_opt = Some(digest);
                 olean_sub_mods = sub_deps;
-                break;
             }
         }
         match (olean_digest_opt, src_digest_opt) {
@@ -976,24 +975,21 @@ pub fn compute_imported_olean_interface_hashes(
             }
             (None, _)
                 if !search_dirs.is_empty()
-                    && mod_name != "Init"
-                    && !mod_name.starts_with("Init.")
-                    && mod_name != "Lean"
-                    && !mod_name.starts_with("Lean.") =>
+                    && !crate::zygote::is_resolved_toolchain_builtin(
+                        &search_refs,
+                        &mod_name,
+                        tc_ref,
+                    ) =>
             {
                 out.push(format!("{}:missing", mod_name));
             }
             _ => {}
         }
         for sub_mod in olean_sub_mods {
-            if !visited.contains(&sub_mod) {
-                let rel_sub = format!(
-                    "{}.olean",
-                    crate::module_builder::module_name_to_rel_slash(&sub_mod)
-                );
-                if search_dirs.iter().any(|d| d.join(&rel_sub).is_file()) {
-                    worklist.push(sub_mod);
-                }
+            if !visited.contains(&sub_mod)
+                && crate::zygote::resolve_closure_module(&search_refs, &sub_mod, tc_ref).is_some()
+            {
+                worklist.push(sub_mod);
             }
         }
         if let Some(ref sub_lean) = sub_lean_opt {
@@ -2078,6 +2074,16 @@ pub(crate) fn ensure_project_imports_fresh(
     rev: Option<&str>,
     build_missing: bool,
 ) -> Result<usize> {
+    ensure_project_imports_fresh_inner(canon_dir, target_files, rev, build_missing, false)
+}
+
+fn ensure_project_imports_fresh_inner(
+    canon_dir: &Path,
+    target_files: &[PathBuf],
+    rev: Option<&str>,
+    build_missing: bool,
+    verify_only: bool,
+) -> Result<usize> {
     let lib_lean_dir = canon_dir.join(".lake/build/lib/lean");
     let manifest_path = verified_sources_manifest_path(canon_dir);
     // Pins and artifact digests describe disk whatever policy they were recorded under, so only
@@ -2421,6 +2427,12 @@ pub(crate) fn ensure_project_imports_fresh(
     }
     let mut targets: Vec<String> = stale_mods.iter().cloned().collect();
     targets.sort();
+    if verify_only {
+        anyhow::bail!(
+            "Imports remained stale after `lake build`: {}",
+            targets.join(", ")
+        );
+    }
     if worktree_auto_link_disabled(canon_dir) {
         anyhow::bail!(
             "Worktree opt-out prevents refreshing stale imports: {}. Rebuild explicitly with Lake (`lake build {}`), then retry.",
@@ -2456,6 +2468,7 @@ pub(crate) fn ensure_project_imports_fresh(
                 crate::module_builder::forget_refreshed_dep_module(cfg, m);
             }
         }
+        ensure_project_imports_fresh_inner(canon_dir, target_files, rev, build_missing, true)?;
         return Ok(targets.len());
     }
     if !stale_dep_mods.is_empty() {
@@ -3815,6 +3828,29 @@ mod tests {
         let extra_h2 =
             compute_imported_olean_interface_hashes(extra_src, &tmp_dir, Some(&extra_lp));
         assert_ne!(extra_h1, extra_h2);
+
+        let pkg_root_first = tmp_dir.join("pkg_root_first");
+        let pkg_root_second = tmp_dir.join("pkg_root_second");
+        fs::create_dir_all(pkg_root_first.join("ShadowPkg")).unwrap();
+        fs::create_dir_all(pkg_root_second.join("ShadowPkg")).unwrap();
+        let shadowed_olean = pkg_root_second.join("ShadowPkg/Sub.olean");
+        fs::write(&shadowed_olean, [0xA1u8; 128]).unwrap();
+        let shadow_lp = format!("{}:{}", pkg_root_first.display(), pkg_root_second.display());
+        let shadow_src = "import ShadowPkg.Sub\ntheorem t : True := trivial\n";
+        let shadow_h1 =
+            compute_imported_olean_interface_hashes(shadow_src, &tmp_dir, Some(&shadow_lp));
+        assert_eq!(shadow_h1, vec!["ShadowPkg.Sub:missing".to_string()]);
+        fs::write(&shadowed_olean, [0xA2u8; 128]).unwrap();
+        let shadow_h2 =
+            compute_imported_olean_interface_hashes(shadow_src, &tmp_dir, Some(&shadow_lp));
+        assert_eq!(shadow_h1, shadow_h2);
+        let first_olean = pkg_root_first.join("ShadowPkg/Sub.olean");
+        fs::write(&first_olean, [0xB1u8; 128]).unwrap();
+        let shadow_h3 =
+            compute_imported_olean_interface_hashes(shadow_src, &tmp_dir, Some(&shadow_lp));
+        assert_ne!(shadow_h3, shadow_h1);
+        assert!(shadow_h3[0].starts_with("ShadowPkg.Sub:"));
+        assert!(!shadow_h3[0].ends_with(":missing"));
 
         match prev_lp {
             Some(v) => std::env::set_var("LEAN_PATH", v),

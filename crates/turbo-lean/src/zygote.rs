@@ -1509,7 +1509,7 @@ pub(crate) fn is_toolchain_dir_match(dir: &Path, toolchain_lib: Option<&Path>) -
     }
 }
 
-fn is_resolved_toolchain_builtin(
+pub(crate) fn is_resolved_toolchain_builtin(
     search_dirs: &[&Path],
     mod_name: &str,
     toolchain_lib: Option<&Path>,
@@ -1537,7 +1537,7 @@ fn is_resolved_toolchain_builtin(
 /// so a closure snapshot with one search root resolves every module exactly as the live
 /// search path did. `None` for a toolchain builtin no other directory shadows, or for a
 /// missing module.
-fn resolve_closure_module(
+pub(crate) fn resolve_closure_module(
     search_dirs: &[&Path],
     mod_name: &str,
     toolchain_lib: Option<&Path>,
