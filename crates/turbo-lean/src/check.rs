@@ -3708,7 +3708,9 @@ fn check_single_file(
                 Some(&orig_display),
                 0,
                 &file_lean_args,
-            ) {
+            )
+            .with_context(|| format!("Check failed for {}", orig_display))?
+            {
                 if rep.import_ok && rep.ok && !rep.crashed && !rep.timed_out {
                     verified_via_zygote_eval = true;
                     eval_stdout_text = rep.stdout;

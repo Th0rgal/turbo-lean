@@ -1658,7 +1658,7 @@ fn run(cli: Cli) -> Result<()> {
             }
 
             let file_display = file.to_string_lossy().to_string();
-            let reply = if let Some(daemon_rep) = zygote::try_local_zygote_eval_with_args(
+            let reply = match zygote::try_local_zygote_eval_with_args(
                 &store,
                 &env_vars,
                 &lean_bin,
@@ -1669,9 +1669,8 @@ fn run(cli: Cli) -> Result<()> {
                 timeout_ms,
                 &filtered_file_lean_args,
             ) {
-                daemon_rep
-            } else {
-                zygote::eval_with_zygote_pool_opts_with_args(
+                Ok(Some(daemon_rep)) => daemon_rep,
+                Ok(None) => zygote::eval_with_zygote_pool_opts_with_args(
                     &store,
                     &toolchain,
                     &req_lp,
@@ -1687,7 +1686,8 @@ fn run(cli: Cli) -> Result<()> {
                         None
                     },
                     &filtered_file_lean_args,
-                )?
+                )?,
+                Err(e) => return Err(e),
             };
 
             if reply.timed_out {
@@ -1699,7 +1699,7 @@ fn run(cli: Cli) -> Result<()> {
                 std::process::exit(124);
             }
 
-            if (reply.crashed || !reply.import_ok) && !cli.json {
+            if !reply.import_ok && !reply.crashed && !reply.timed_out && !cli.json {
                 run_direct_lean()?;
             }
 

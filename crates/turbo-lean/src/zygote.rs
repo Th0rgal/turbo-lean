@@ -3068,13 +3068,20 @@ pub(crate) fn resolve_zygote_context(
     };
     let pool_digest_tag = search_path_digest.clone();
     // Workers enforce the axiom policy they were spawned with: key them (and their replies) by it.
+    let extra_axioms: Vec<String> = env_vars
+        .get(crate::splitter::ALLOWED_AXIOMS_ENV)
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_else(crate::splitter::extra_allowed_axiom_patterns);
     let toolchain_policy = format!(
         "{}#{}",
         toolchain,
-        env_vars
-            .get(crate::splitter::ALLOWED_AXIOMS_ENV)
-            .cloned()
-            .unwrap_or_else(|| crate::splitter::allowed_axioms().join(","))
+        crate::splitter::allowed_axioms_with_extra(&extra_axioms).join(",")
     );
     let olean_digest = format!("{}:{}", search_path_digest, imported_digest);
     let compiler_path = fs::canonicalize(lean_bin).unwrap_or_else(|_| lean_bin.to_path_buf());
@@ -4932,6 +4939,18 @@ pub fn try_local_zygote_eval(
         timeout_ms,
         &[],
     )
+    .ok()
+    .flatten()
+}
+
+fn finish_eval_http_request(response: Result<Vec<u8>>) -> Result<Option<ZygoteEvalReply>> {
+    match response {
+        Ok(bytes) => serde_json::from_slice::<ZygoteEvalReply>(&bytes)
+            .map(Some)
+            .map_err(|err| anyhow::anyhow!("unparseable zygote /eval reply: {err}")),
+        Err(err) if is_expired_daemon_transport_error(&err) => Ok(None),
+        Err(err) => Err(extract_http_error_detail(err)),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4945,10 +4964,23 @@ pub fn try_local_zygote_eval_with_args(
     file_name: Option<&str>,
     timeout_ms: u64,
     lean_args: &[String],
-) -> Option<ZygoteEvalReply> {
-    let filtered_args = crate::module_builder::validate_effective_lean_args(lean_args).ok()?;
+) -> Result<Option<ZygoteEvalReply>> {
+    let filtered_args = crate::module_builder::validate_effective_lean_args(lean_args)?;
+    let effective_tc = if toolchain.is_empty() || toolchain == "unknown" {
+        "leanprover/lean4:v4.35.0"
+    } else {
+        toolchain
+    };
+    let resolved_lean_bin;
+    let lean_bin = if !lean_bin.exists() && lean_bin.components().count() == 1 {
+        resolved_lean_bin =
+            crate::server::resolve_server_lean_env_and_bin(store, effective_tc, "").1;
+        resolved_lean_bin.as_path()
+    } else {
+        lean_bin
+    };
     let (imports_csv, _) = split_shard_for_zygote(source);
-    let context = resolve_zygote_context(toolchain, lean_path, env_vars, lean_bin, &imports_csv);
+    let context = resolve_zygote_context(effective_tc, lean_path, env_vars, lean_bin, &imports_csv);
     let timeout_ms = if timeout_ms > 0 {
         timeout_ms
     } else {
@@ -4967,13 +4999,12 @@ pub fn try_local_zygote_eval_with_args(
             caller_cwd.as_deref(),
             source,
             &filtered_args,
-        )
-        .ok()?;
+        )?;
         let dir = store.fast_staging_dir().join("eval_shm_cache");
         let _ = fs::create_dir_all(&dir);
         let path = dir.join(filename);
         if let Some(cached_rep) = read_cached_eval_shm_reply(&path) {
-            return Some(cached_rep);
+            return Ok(Some(cached_rep));
         }
         Some(path)
     } else {
@@ -5001,7 +5032,7 @@ pub fn try_local_zygote_eval_with_args(
     let Some((base_url, auth_token)) = existing_daemon else {
         let rep = eval_with_zygote_pool_opts_with_args(
             store,
-            toolchain,
+            effective_tc,
             lean_path,
             env_vars,
             lean_bin,
@@ -5015,8 +5046,7 @@ pub fn try_local_zygote_eval_with_args(
                 None
             },
             &filtered_args,
-        )
-        .ok()?;
+        )?;
         if eval_reply_cacheable(&rep) {
             if let Some(ref path) = eval_shm_file {
                 if let Ok(bytes) = serde_json::to_vec(&rep) {
@@ -5025,7 +5055,7 @@ pub fn try_local_zygote_eval_with_args(
             }
             warm_local_zygote_daemon_nonblocking(store, env_vars);
         }
-        return Some(rep);
+        return Ok(Some(rep));
     };
     let endpoint = format!("{}/eval", base_url.trim_end_matches('/'));
     let mut forwarded_env: std::collections::HashMap<String, String> = std::env::vars()
@@ -5041,21 +5071,31 @@ pub fn try_local_zygote_eval_with_args(
     } else {
         None
     };
+    let allowed_axioms: Vec<String> = env_vars
+        .get(crate::splitter::ALLOWED_AXIOMS_ENV)
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_else(crate::splitter::extra_allowed_axiom_patterns);
     let body = serde_json::to_vec(&serde_json::json!({
-        "toolchain": toolchain,
+        "toolchain": effective_tc,
         "lean_path": context.lean_path,
         "execution_identity": context.identity,
         "source": source,
         "file_name": file_name,
         "cwd": caller_cwd,
         "env_vars": forwarded_env,
+        "allowed_axioms": allowed_axioms,
         "timeout_ms": effective_timeout_opt,
         "verify_determinism": false,
         "lean_args": filtered_args
-    }))
-    .ok()?;
+    }))?;
     let http_timeout = effective_timeout_opt.map(|ms| ms.saturating_add(250));
-    let resp_bytes = match http_request_with_timeout_and_token(
+    let outcome = match http_request_with_timeout_and_token(
         "POST",
         &endpoint,
         "application/json",
@@ -5064,7 +5104,7 @@ pub fn try_local_zygote_eval_with_args(
         Some(&auth_token),
         || {},
     ) {
-        Ok(b) => b,
+        Ok(b) => finish_eval_http_request(Ok(b))?,
         Err(e) => {
             if let Some(limit_ms) = effective_timeout_opt {
                 if t0.elapsed().as_millis() as u64 >= limit_ms
@@ -5072,25 +5112,29 @@ pub fn try_local_zygote_eval_with_args(
                     || e.to_string().contains("timed out")
                     || e.to_string().contains("TimedOut")
                 {
-                    return Some(ZygoteEvalReply::timed_out_reply(
+                    return Ok(Some(ZygoteEvalReply::timed_out_reply(
                         true,
                         t0.elapsed().as_micros() as u64,
                         limit_ms,
                         0,
                         String::new(),
                         None,
-                    ));
+                    )));
                 }
             }
-            if e.to_string().contains("HTTP ") {
-                return None;
+            if !is_expired_daemon_transport_error(&e) {
+                return Err(extract_http_error_detail(e));
             }
             if let Some((_, _, _, _, state_file)) = current_exe_daemon_paths(store) {
                 terminate_and_remove_daemon_state_file(&state_file);
             }
-            let (retry_url, retry_token) = ensure_local_zygote_daemon_with_token(store, env_vars)?;
+            let Some((retry_url, retry_token)) =
+                ensure_local_zygote_daemon_with_token(store, env_vars)
+            else {
+                return Ok(None);
+            };
             let retry_endpoint = format!("{}/eval", retry_url.trim_end_matches('/'));
-            http_request_with_timeout_and_token(
+            finish_eval_http_request(http_request_with_timeout_and_token(
                 "POST",
                 &retry_endpoint,
                 "application/json",
@@ -5098,12 +5142,10 @@ pub fn try_local_zygote_eval_with_args(
                 http_timeout,
                 Some(&retry_token),
                 || {},
-            )
-            .ok()?
+            ))?
         }
     };
-    let parsed = serde_json::from_slice::<ZygoteEvalReply>(&resp_bytes).ok();
-    if let Some(ref rep) = parsed {
+    if let Some(ref rep) = outcome {
         if eval_reply_cacheable(rep) {
             if let Some(ref path) = eval_shm_file {
                 if let Ok(bytes) = serde_json::to_vec(rep) {
@@ -5112,7 +5154,7 @@ pub fn try_local_zygote_eval_with_args(
             }
         }
     }
-    parsed
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -5142,6 +5184,52 @@ mod tests {
         ));
         assert!(matches!(
             finish_check_shard_request(Err(std::io::Error::from(
+                std::io::ErrorKind::ConnectionRefused
+            )
+            .into())),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn test_finish_eval_http_request_fails_closed_on_errors_and_crash_replies() {
+        let http_409 = finish_eval_http_request(Err(anyhow::anyhow!(
+            "HTTP request POST http://127.0.0.1:1/eval failed (HTTP 409): {{\"ok\":false,\"error\":\"eval execution identity changed\"}}"
+        )))
+        .unwrap_err();
+        assert_eq!(http_409.to_string(), "eval execution identity changed");
+        let http_err = finish_eval_http_request(Err(anyhow::anyhow!(
+            "HTTP request POST http://127.0.0.1:1/eval failed (HTTP 500): {{\"ok\":false,\"error\":\"internal daemon failure\"}}"
+        )))
+        .unwrap_err();
+        assert_eq!(http_err.to_string(), "internal daemon failure");
+        assert!(finish_eval_http_request(Ok(b"{\"ok\":false}".to_vec())).is_err());
+        let server_crash = serde_json::to_vec(&serde_json::json!({
+            "ok": false,
+            "kernel_gate_active": false,
+            "import_ok": false,
+            "env_cache_hit": false,
+            "prefix_cache_hit": false,
+            "import_us": 0,
+            "prefix_us": 0,
+            "elab_us": 0,
+            "heartbeats": 0,
+            "stdout": "",
+            "messages": [],
+            "error": "worker pool failed",
+            "errors": ["worker pool failed"],
+            "timed_out": false,
+            "crashed": true,
+            "deterministic": false
+        }))
+        .unwrap();
+        let rep = finish_eval_http_request(Ok(server_crash))
+            .unwrap()
+            .expect("server crash payload must parse as a crash reply");
+        assert!(rep.crashed && !rep.ok && !rep.import_ok);
+        assert_eq!(rep.errors, vec!["worker pool failed"]);
+        assert!(matches!(
+            finish_eval_http_request(Err(std::io::Error::from(
                 std::io::ErrorKind::ConnectionRefused
             )
             .into())),
@@ -5560,7 +5648,7 @@ mod tests {
                     Some(&file),
                     60_000,
                     &[],
-                )
+                )?
                 .context("local eval must produce a reply")?;
                 assert!(reply.ok && reply.import_ok, "{reply:?}");
                 assert_eq!(
@@ -5585,7 +5673,7 @@ mod tests {
                 Some(&file),
                 60_000,
                 &[],
-            )
+            )?
             .context("replaced import eval")?;
             assert!(reply.ok && reply.import_ok, "{reply:?}");
             assert_eq!(reply.messages.concat().trim(), "17", "{reply:?}");
@@ -5645,12 +5733,12 @@ mod tests {
                 args,
             )
         };
-        let cached = eval(&[]).expect("fixture must hit the empty-option cache");
+        let cached = eval(&[])?.expect("fixture must hit the empty-option cache");
         assert!(cached.ok && cached.env_cache_hit && cached.prefix_cache_hit);
         assert_eq!(cached.stdout, reply.stdout);
         for invalid in ["--plugin=bad.so", "--json", "-q", " -DautoImplicit=false "] {
             assert!(
-                eval(&[invalid.to_string()]).is_none(),
+                eval(&[invalid.to_string()]).is_err(),
                 "invalid argument must not reuse cached reply: {invalid}"
             );
         }
@@ -7184,6 +7272,7 @@ mod tests {
             60_000,
             &[],
         )
+        .expect("eval must not error")
         .expect("worker must execute");
         assert!(
             !rep.ok && rep.errors.iter().any(|e| e == RUNTIME_PANIC_ERR),
@@ -7206,6 +7295,7 @@ mod tests {
             60_000,
             &[],
         )
+        .unwrap()
         .unwrap();
         assert!(!again.ok && again.errors.iter().any(|e| e == RUNTIME_PANIC_ERR));
         for name in [&v3_name, &v4_name] {

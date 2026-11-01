@@ -923,6 +923,8 @@ pub fn serve_cas_http_with_auth(
                         #[serde(default)]
                         env_vars: Option<std::collections::HashMap<String, String>>,
                         #[serde(default)]
+                        allowed_axioms: Option<Vec<String>>,
+                        #[serde(default)]
                         timeout_ms: Option<u64>,
                         #[serde(default)]
                         verify_determinism: bool,
@@ -954,7 +956,7 @@ pub fn serve_cas_http_with_auth(
                     } else {
                         req.code.as_str()
                     };
-                    let tc = if req.toolchain.is_empty() {
+                    let tc = if req.toolchain.is_empty() || req.toolchain == "unknown" {
                         "leanprover/lean4:v4.35.0"
                     } else {
                         req.toolchain.as_str()
@@ -1011,6 +1013,19 @@ pub fn serve_cas_http_with_auth(
                     } else {
                         env_vars.remove("LEAN_PATH");
                     }
+                    let eval_trust_domain = if caller_authorized_trusted {
+                        "trusted"
+                    } else {
+                        "unverified"
+                    };
+                    let (_, eval_allowed_csv) = resolve_request_axiom_policy(
+                        req.allowed_axioms.as_deref(),
+                        eval_trust_domain,
+                    );
+                    env_vars.insert(
+                        crate::splitter::ALLOWED_AXIOMS_ENV.to_string(),
+                        eval_allowed_csv,
+                    );
                     if let Some(expected) = req.execution_identity.as_deref() {
                         let (imports, _) = crate::zygote::split_shard_for_zygote(src);
                         let actual = crate::zygote::resolve_zygote_context(
@@ -1108,14 +1123,27 @@ pub fn serve_cas_http_with_auth(
                             );
                         }
                         Err(e) => {
+                            let msg = e.to_string();
                             let _ = write_json_response(
                                 &mut stream,
                                 200,
                                 &serde_json::json!({
                                     "ok": false,
-                                    "error": e.to_string(),
-                                    "errors": [e.to_string()],
-                                    "crashed": true
+                                    "kernel_gate_active": false,
+                                    "import_ok": false,
+                                    "env_cache_hit": false,
+                                    "prefix_cache_hit": false,
+                                    "import_us": 0,
+                                    "prefix_us": 0,
+                                    "elab_us": 0,
+                                    "heartbeats": 0,
+                                    "stdout": "",
+                                    "messages": [],
+                                    "error": msg,
+                                    "errors": [msg],
+                                    "timed_out": false,
+                                    "crashed": true,
+                                    "deterministic": false
                                 }),
                             );
                         }
