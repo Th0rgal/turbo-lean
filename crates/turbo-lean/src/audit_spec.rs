@@ -3,7 +3,12 @@
 use super::*;
 
 pub(super) fn inline_stmt_let_bindings(stmt: &str) -> String {
+    inline_stmt_let_bindings_checked(stmt).0
+}
+
+fn inline_stmt_let_bindings_checked(stmt: &str) -> (String, bool) {
     let mut cur = stmt.trim().to_string();
+    let mut clean_let = true;
     for _ in 0..16 {
         let trimmed = cur.trim_start();
         let Some(after_let) = trimmed
@@ -16,16 +21,22 @@ pub(super) fn inline_stmt_let_bindings(stmt: &str) -> String {
         let name_end = rest
             .find(|c: char| !is_ident_continue(c))
             .unwrap_or(rest.len());
-        if name_end == 0 {
+        if name_end == 0 || !is_ident_start(rest.chars().next().unwrap_or('0')) {
+            clean_let = false;
             break;
         }
         let var_name = &rest[..name_end];
-        let after_name = &rest[name_end..];
-        let Some(eq_idx) = after_name.find(":=") else {
+        if var_name == "rec" {
+            clean_let = false;
+            break;
+        }
+        let after_name = rest[name_end..].trim_start();
+        let Some(after_eq_raw) = after_name.strip_prefix(":=") else {
+            clean_let = false;
             break;
         };
-        let after_eq = after_name[eq_idx + 2..].trim_start();
-        // Find top-level `;` or `\n` terminating the `let` RHS
+        let after_eq = after_eq_raw.trim_start();
+        // Find top-level `;` terminating the `let` RHS (multiline layout `let` without `;` is untrusted)
         let chars: Vec<char> = after_eq.chars().collect();
         let mut p_depth = 0usize;
         let mut split_char_idx = None;
@@ -33,14 +44,19 @@ pub(super) fn inline_stmt_let_bindings(stmt: &str) -> String {
             match ch {
                 '(' | '{' | '[' | '⟨' => p_depth += 1,
                 ')' | '}' | ']' | '⟩' => p_depth = p_depth.saturating_sub(1),
-                ';' | '\n' if p_depth == 0 => {
+                ';' if p_depth == 0 => {
                     split_char_idx = Some(idx);
+                    break;
+                }
+                '\n' if p_depth == 0 => {
+                    clean_let = false;
                     break;
                 }
                 _ => {}
             }
         }
         let Some(sc_idx) = split_char_idx else {
+            clean_let = false;
             break;
         };
         let rhs: String = chars[..sc_idx].iter().collect();
@@ -48,7 +64,18 @@ pub(super) fn inline_stmt_let_bindings(stmt: &str) -> String {
         let rhs_wrapped = format!("({})", rhs.trim());
         cur = replace_ident_boundary(body.trim(), var_name, &rhs_wrapped);
     }
-    cur
+    let rem = cur.trim_start();
+    for kw in [
+        "let", "letI", "have", "haveI", "match", "fun", "show", "suffices", "do",
+    ] {
+        if rem
+            .strip_prefix(kw)
+            .is_some_and(|r| r.is_empty() || !is_ident_continue(r.chars().next().unwrap()))
+        {
+            clean_let = false;
+        }
+    }
+    (cur, clean_let)
 }
 
 /// A literal or comment beginning at a UTF-8 byte boundary. Unterminated strings
@@ -179,6 +206,187 @@ pub(super) fn select_target_decl_unambiguously(
     }
 }
 
+fn source_has_no_untrusted_elab_tokens(
+    chars: &[char],
+    skip_at: &impl Fn(usize) -> Option<usize>,
+) -> bool {
+    let n = chars.len();
+    let ident_at = |idx: usize| -> Option<(String, usize)> {
+        if idx >= n || !is_ident_start(chars[idx]) {
+            return None;
+        }
+        let mut j = idx + 1;
+        while j < n && is_ident_continue(chars[j]) {
+            j += 1;
+        }
+        Some((chars[idx..j].iter().collect(), j))
+    };
+    let dotted_at = |idx: usize| -> Option<(String, usize)> {
+        let mut j = idx;
+        let mut out = String::new();
+        loop {
+            let (seg, next) = ident_at(j)?;
+            out.push_str(&seg);
+            j = next;
+            if j < n && chars[j] == '.' {
+                out.push('.');
+                j += 1;
+                continue;
+            }
+            return Some((out, j));
+        }
+    };
+    let mut k = 0usize;
+    let mut allow_imports = true;
+    while k < n {
+        if let Some(end) = skip_at(k) {
+            k = end;
+            continue;
+        }
+        if chars[k].is_whitespace() {
+            k += 1;
+            continue;
+        }
+        if chars[k] == '@' && k + 1 < n && chars[k + 1] == '[' {
+            return false;
+        }
+        if chars[k] == '#' && (k == 0 || !is_ident_continue(chars[k - 1])) {
+            return false;
+        }
+        if matches!(chars[k], '«' | '»' | '⦃' | '⦄') {
+            return false;
+        }
+        if is_ident_start(chars[k]) {
+            let prev_dot = k > 0 && chars[k - 1] == '.';
+            let Some((word, mut next_k)) = ident_at(k) else {
+                k += 1;
+                continue;
+            };
+            if prev_dot {
+                k = next_k;
+                continue;
+            }
+            if word != "import" {
+                allow_imports = false;
+            }
+            match word.as_str() {
+                "import" => {
+                    if !allow_imports {
+                        return false;
+                    }
+                    while next_k < n && chars[next_k].is_whitespace() {
+                        next_k += 1;
+                    }
+                    let Some((path, after_path)) = dotted_at(next_k) else {
+                        return false;
+                    };
+                    if !matches!(
+                        path.as_str(),
+                        "LeanNative.Backend.FastCheck" | "TurboLean.FastCheck"
+                    ) {
+                        return false;
+                    }
+                    k = after_path;
+                    continue;
+                }
+                "open" => {
+                    while next_k < n && chars[next_k].is_whitespace() {
+                        next_k += 1;
+                    }
+                    let Some((path, after_path)) = dotted_at(next_k) else {
+                        return false;
+                    };
+                    if !matches!(
+                        path.as_str(),
+                        "LeanNative.Backend.FastCheck" | "TurboLean.FastCheck"
+                    ) {
+                        return false;
+                    }
+                    let mut p = after_path;
+                    while p < n && chars[p] != '\n' && chars[p].is_whitespace() {
+                        p += 1;
+                    }
+                    if p < n && chars[p] != '\n' {
+                        return false;
+                    }
+                    k = after_path;
+                    continue;
+                }
+                "abbrev" => {
+                    while next_k < n && chars[next_k].is_whitespace() {
+                        next_k += 1;
+                    }
+                    let Some((name, after_name)) = ident_at(next_k) else {
+                        return false;
+                    };
+                    if name != "Word256" {
+                        return false;
+                    }
+                    next_k = after_name;
+                    while next_k < n && chars[next_k].is_whitespace() {
+                        next_k += 1;
+                    }
+                    if chars.get(next_k) != Some(&':') || chars.get(next_k + 1) != Some(&'=') {
+                        return false;
+                    }
+                    next_k += 2;
+                    while next_k < n && chars[next_k].is_whitespace() {
+                        next_k += 1;
+                    }
+                    let Some((rhs, after_rhs)) = dotted_at(next_k) else {
+                        return false;
+                    };
+                    if rhs != "LeanNative.Backend.FastCheck.Word256" {
+                        return false;
+                    }
+                    k = after_rhs;
+                    continue;
+                }
+                "set_option" => {
+                    while next_k < n && chars[next_k].is_whitespace() {
+                        next_k += 1;
+                    }
+                    let Some((opt, after_opt)) = ident_at(next_k) else {
+                        return false;
+                    };
+                    if opt != "maxHeartbeats" {
+                        return false;
+                    }
+                    next_k = after_opt;
+                    while next_k < n && chars[next_k].is_whitespace() {
+                        next_k += 1;
+                    }
+                    let d0 = next_k;
+                    while next_k < n && chars[next_k].is_ascii_digit() {
+                        next_k += 1;
+                    }
+                    if next_k == d0 {
+                        return false;
+                    }
+                    k = next_k;
+                    continue;
+                }
+                "local" | "scoped" | "instance" | "attribute" | "notation" | "infix" | "infixl"
+                | "infixr" | "prefix" | "postfix" | "macro" | "macro_rules" | "syntax" | "elab"
+                | "elab_rules" | "variable" | "variables" | "universe" | "universes" | "export"
+                | "include" | "omit" | "mutual" | "opaque" | "axiom" | "constant" | "structure"
+                | "class" | "inductive" | "coinductive" | "deriving" | "def" | "example"
+                | "initialize" | "builtin_initialize" | "register_option"
+                | "declare_syntax_cat" | "unif_hint" | " unsafe" | "unsafe" | "partial"
+                | "meta" | "haveI" | "letI" => {
+                    return false;
+                }
+                _ => {
+                    k = next_k;
+                    continue;
+                }
+            }
+        }
+        k += 1;
+    }
+    true
+}
+
 pub(super) fn extract_all_lean_theorems(
     clean_src: &str,
     target_name: Option<&str>,
@@ -293,16 +501,20 @@ pub(super) fn extract_all_lean_theorems(
     let mut i = 0;
     let mut scope_stack: Vec<(LexScopeKind, String)> = Vec::new();
     let mut all_decls: Vec<ExtractedDecl> = Vec::new();
+    let file_elab_trusted = source_has_no_untrusted_elab_tokens(&chars, &skip_at);
 
     while i < n {
         if let Some(end) = skip_at(i) {
             i = end;
             continue;
         }
+        if chars[i].is_whitespace() {
+            i += 1;
+            continue;
+        }
         if is_ident_start(chars[i]) {
             let start = i;
-            let prev_is_dot_or_guillemet =
-                start > 0 && matches!(chars[start - 1], '.' | '«');
+            let prev_is_dot_or_guillemet = start > 0 && matches!(chars[start - 1], '.' | '«');
             while i < n && is_ident_continue(chars[i]) {
                 i += 1;
             }
@@ -386,6 +598,21 @@ pub(super) fn extract_all_lean_theorems(
                 let mut binders = Vec::new();
                 let mut instance_binders = Vec::new();
                 let mut found_colon = false;
+                let mut header_trusted = true;
+                let mut seen_names: Vec<String> = Vec::new();
+                if i < n && chars[i] == '.' && chars.get(i + 1) == Some(&'{') {
+                    header_trusted = false;
+                    let mut depth = 1usize;
+                    i += 2;
+                    while i < n && depth > 0 {
+                        if chars[i] == '{' {
+                            depth += 1;
+                        } else if chars[i] == '}' {
+                            depth -= 1;
+                        }
+                        i += 1;
+                    }
+                }
                 while i < n {
                     while i < n && chars[i].is_whitespace() {
                         i += 1;
@@ -416,6 +643,7 @@ pub(super) fn extract_all_lean_theorems(
                         i += 1;
                         let b_start = i;
                         let mut depth = 1usize;
+                        let mut closed = false;
                         while i < n && depth > 0 {
                             if let Some(end) = skip_at(i) {
                                 i = end;
@@ -425,10 +653,19 @@ pub(super) fn extract_all_lean_theorems(
                                 depth += 1;
                             } else if chars[i] == close {
                                 depth -= 1;
+                                if depth == 0 {
+                                    closed = true;
+                                }
                             }
                             i += 1;
                         }
+                        if !closed {
+                            header_trusted = false;
+                        }
                         let inner: String = chars[b_start..i.saturating_sub(1)].iter().collect();
+                        if inner.contains(":=") || inner.contains("⦃") || inner.contains("⦄") {
+                            header_trusted = false;
+                        }
                         if open == '(' || open == '{' {
                             if let Some((vars_part, ty_part)) = split_top_level_colon(&inner) {
                                 let var_names: Vec<String> = vars_part
@@ -436,17 +673,42 @@ pub(super) fn extract_all_lean_theorems(
                                     .map(|s| s.trim().to_string())
                                     .filter(|s| !s.is_empty())
                                     .collect();
+                                if var_names.is_empty()
+                                    || var_names.iter().any(|v| {
+                                        v == "_"
+                                            || !v.chars().enumerate().all(|(idx, c)| {
+                                                if idx == 0 {
+                                                    is_ident_start(c)
+                                                } else {
+                                                    is_ident_continue(c)
+                                                }
+                                            })
+                                    })
+                                    || ty_part.trim().is_empty()
+                                {
+                                    header_trusted = false;
+                                }
+                                for v in &var_names {
+                                    if seen_names.iter().any(|s| s == v) {
+                                        header_trusted = false;
+                                    }
+                                    seen_names.push(v.clone());
+                                }
                                 if !var_names.is_empty() {
                                     binders.push((var_names, ty_part.trim().to_string()));
                                 }
+                            } else {
+                                header_trusted = false;
                             }
                         } else {
+                            header_trusted = false;
                             let inst_ty = split_top_level_colon(&inner)
                                 .map(|(_, ty)| ty.trim())
                                 .unwrap_or_else(|| inner.trim());
                             instance_binders.push(inst_ty.to_string());
                         }
                     } else {
+                        header_trusted = false;
                         i += 1;
                     }
                 }
@@ -530,7 +792,13 @@ pub(super) fn extract_all_lean_theorems(
                     i += 1;
                 }
                 let prop_str: String = chars[stmt_start..stmt_end].iter().collect();
-                let trimmed = inline_stmt_let_bindings(prop_str.trim());
+                let (trimmed, let_ok) = inline_stmt_let_bindings_checked(prop_str.trim());
+                let decl_trusted = file_elab_trusted
+                    && header_trusted
+                    && let_ok
+                    && !trimmed.contains(';')
+                    && instance_binders.is_empty()
+                    && !trimmed.is_empty();
                 if !trimmed.is_empty() {
                     all_decls.push(ExtractedDecl {
                         name: decl_name,
@@ -538,6 +806,7 @@ pub(super) fn extract_all_lean_theorems(
                         binders,
                         instance_binders,
                         prop_str: trimmed,
+                        trusted_elab_context: decl_trusted,
                     });
                 }
             }
@@ -2054,7 +2323,7 @@ pub(super) fn audit_single_decl_spec_full_with_policy(
     let mut pos_witness = "precondition_satisfiable(unconstrained_or_symbolic)".to_string();
     let mut droppable_hyps = Vec::new();
     if !is_vacuous && !hyp_strings.is_empty() {
-        if let Some((rep, _, _)) = eval_extracted_decl_in_memory(&unfolded_decl, 256) {
+        if let Some((rep, _, _)) = eval_extracted_decl_for_audit_spec(&unfolded_decl, 256) {
             if rep.vacuous_precondition_warning || rep.satisfied_preconditions == 0 {
                 is_vacuous = true;
             } else {
@@ -2069,7 +2338,9 @@ pub(super) fn audit_single_decl_spec_full_with_policy(
                     if !is_known_binder_value_type(ty) {
                         let mut mutated = unfolded_decl.clone();
                         mutated.binders.remove(b_idx);
-                        if let Some((m_rep, _, _)) = eval_extracted_decl_in_memory(&mutated, 256) {
+                        if let Some((m_rep, _, _)) =
+                            eval_extracted_decl_for_audit_spec(&mutated, 256)
+                        {
                             if m_rep.verified && m_rep.violations == 0 {
                                 let mut hyp_vars = std::collections::HashSet::new();
                                 let mut concl_vars = std::collections::HashSet::new();

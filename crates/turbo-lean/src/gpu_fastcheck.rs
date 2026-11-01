@@ -98,6 +98,8 @@ pub struct TranspiledCudaKernel {
     pub cuda_source: String,
     pub prop_str: String,
     pub binder_hyps: Vec<String>,
+    #[serde(default)]
+    pub trusted_elab_context: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,6 +179,7 @@ pub(crate) struct ExtractedDecl {
     binders: Vec<(Vec<String>, String)>,
     instance_binders: Vec<String>,
     prop_str: String,
+    trusted_elab_context: bool,
 }
 
 fn extract_lean_theorem(clean_src: &str, target_name: Option<&str>) -> Result<ExtractedDecl> {
@@ -452,7 +455,9 @@ impl ExprParser {
             "∨" => Some((30, 31, 30)),
             "&&" => Some((35, 35, 36)),
             "∧" => Some((35, 36, 35)),
-            "=" | "==" | "!=" | "≠" | "<" | "<=" | "≤" | ">" | ">=" | "≥" => Some((50, 51, 51)),
+            "=" | "==" | "!=" | "≠" | "<" | "<=" | "≤" | ">" | ">=" | "≥" => {
+                Some((50, 51, 51))
+            }
             "|||" => Some((55, 55, 56)),
             "^^^" => Some((58, 58, 59)),
             "&&&" => Some((60, 60, 61)),
@@ -481,7 +486,10 @@ impl ExprParser {
     fn parse_led_head(&mut self, min_prec: u16) -> Result<(LeanExpr, u16)> {
         if matches!(self.peek(), Some(Token::Ident(k)) if k == "if") {
             if min_prec > 1022 {
-                bail!("`if` expression requires parentheses at precedence {}", min_prec);
+                bail!(
+                    "`if` expression requires parentheses at precedence {}",
+                    min_prec
+                );
             }
             self.next();
             let cond = self.parse_prec(10)?;
@@ -494,11 +502,7 @@ impl ExprParser {
             }
             let else_branch = self.parse_prec(10)?;
             return Ok((
-                LeanExpr::IfThenElse(
-                    Box::new(cond),
-                    Box::new(then_branch),
-                    Box::new(else_branch),
-                ),
+                LeanExpr::IfThenElse(Box::new(cond), Box::new(then_branch), Box::new(else_branch)),
                 1024,
             ));
         }
@@ -693,16 +697,25 @@ fn scalar_domain_matches_fn_prefix(prefix: &str, dom: ScalarEvalDomain) -> bool 
     }
 }
 
-fn cuda_fn_prefix_allowed(prefix: Option<&str>, eval_dom: Option<ScalarEvalDomain>, ambient_bv256: bool) -> bool {
+fn cuda_fn_prefix_allowed(
+    prefix: Option<&str>,
+    eval_dom: Option<ScalarEvalDomain>,
+    ambient_bv256: bool,
+) -> bool {
     match prefix {
         None | Some("Bool") => true,
         Some(p) if is_u256_fn_prefix(p) => eval_dom.is_none(),
-        Some("BitVec") => eval_dom.is_some_and(|d| d.is_bitvec) || (eval_dom.is_none() && ambient_bv256),
+        Some("BitVec") => {
+            eval_dom.is_some_and(|d| d.is_bitvec) || (eval_dom.is_none() && ambient_bv256)
+        }
         Some(p) => eval_dom.is_some_and(|d| scalar_domain_matches_fn_prefix(p, d)),
     }
 }
 
-fn expr_mentions_ident_value(expr: &LeanExpr, param_names: &std::collections::HashSet<&str>) -> bool {
+fn expr_mentions_ident_value(
+    expr: &LeanExpr,
+    param_names: &std::collections::HashSet<&str>,
+) -> bool {
     if let Some(qname) = flatten_qualified_name(expr) {
         if let Some((prefix, _)) = qname.rsplit_once('.') {
             if prefix == "BitVec" || is_u256_const_prefix(prefix) {
@@ -717,20 +730,35 @@ fn expr_mentions_ident_value(expr: &LeanExpr, param_names: &std::collections::Ha
         LeanExpr::Binary(op, l, r) => {
             if matches!(
                 op.as_str(),
-                "=" | "==" | "!=" | "≠" | "<" | "<=" | "≤" | ">" | ">=" | "≥" | "&&" | "∧" | "||" | "∨"
+                "=" | "=="
+                    | "!="
+                    | "≠"
+                    | "<"
+                    | "<="
+                    | "≤"
+                    | ">"
+                    | ">="
+                    | "≥"
+                    | "&&"
+                    | "∧"
+                    | "||"
+                    | "∨"
             ) {
                 false
             } else if matches!(op.as_str(), "<<<" | ">>>") {
                 expr_mentions_ident_value(l, param_names)
             } else {
-                expr_mentions_ident_value(l, param_names) || expr_mentions_ident_value(r, param_names)
+                expr_mentions_ident_value(l, param_names)
+                    || expr_mentions_ident_value(r, param_names)
             }
         }
         LeanExpr::App(h, args) => {
             if let Some(qname) = flatten_qualified_name(h) {
                 let prefix = qname.rsplit_once('.').map(|(p, _)| p);
                 let short = qname.rsplit('.').next().unwrap_or(qname.as_str());
-                if prefix == Some("Nat") || prefix == Some("Bool") || matches!(short, "beq" | "fastBeq")
+                if prefix == Some("Nat")
+                    || prefix == Some("Bool")
+                    || matches!(short, "beq" | "fastBeq")
                 {
                     return false;
                 }
@@ -744,14 +772,18 @@ fn expr_mentions_ident_value(expr: &LeanExpr, param_names: &std::collections::Ha
                         return param_names.contains("__typed_fn__");
                     }
                 }
-                if matches!(short, "shiftLeft" | "shiftRight" | "ushiftRight" | "shl" | "shr")
-                    && !args.is_empty()
+                if matches!(
+                    short,
+                    "shiftLeft" | "shiftRight" | "ushiftRight" | "shl" | "shr"
+                ) && !args.is_empty()
                 {
                     return expr_mentions_ident_value(&args[0], param_names);
                 }
             }
             expr_mentions_ident_value(h, param_names)
-                || args.iter().any(|a| expr_mentions_ident_value(a, param_names))
+                || args
+                    .iter()
+                    .any(|a| expr_mentions_ident_value(a, param_names))
         }
         LeanExpr::IfThenElse(_, t, e) => {
             expr_mentions_ident_value(t, param_names) || expr_mentions_ident_value(e, param_names)
@@ -790,7 +822,19 @@ fn expr_synthesizes_int_or_complement_without_typed_value(
         LeanExpr::Binary(op, l, r) => {
             if matches!(
                 op.as_str(),
-                "=" | "==" | "!=" | "≠" | "<" | "<=" | "≤" | ">" | ">=" | "≥" | "&&" | "∧" | "||" | "∨"
+                "=" | "=="
+                    | "!="
+                    | "≠"
+                    | "<"
+                    | "<="
+                    | "≤"
+                    | ">"
+                    | ">="
+                    | "≥"
+                    | "&&"
+                    | "∧"
+                    | "||"
+                    | "∨"
             ) {
                 false
             } else {
@@ -881,7 +925,9 @@ fn subexpr_eval_domain(
                 if expr_synthesizes_int_or_complement_without_typed_value(lhs, value_params)
                     || expr_synthesizes_int_or_complement_without_typed_value(rhs, value_params)
                 {
-                    bail!("Lean elaborates untyped unary `-`/`~~~` shift operand in Int/Complement");
+                    bail!(
+                        "Lean elaborates untyped unary `-`/`~~~` shift operand in Int/Complement"
+                    );
                 }
                 if expr_mentions_ident_value(rhs, bitvec_params) {
                     bail!("Lean rejects untyped literal LHS with BitVec shift count");
@@ -899,8 +945,10 @@ fn subexpr_eval_domain(
             Ok(expected)
         }
         LeanExpr::IfThenElse(_, t, e) => {
-            let t_dom = subexpr_eval_domain(t, expected, ambient_bv256, value_params, bitvec_params)?;
-            let e_dom = subexpr_eval_domain(e, expected, ambient_bv256, value_params, bitvec_params)?;
+            let t_dom =
+                subexpr_eval_domain(t, expected, ambient_bv256, value_params, bitvec_params)?;
+            let e_dom =
+                subexpr_eval_domain(e, expected, ambient_bv256, value_params, bitvec_params)?;
             if t_dom.is_some_and(|d| d.is_nat) && !expected.is_some_and(|d| d.is_nat) {
                 if expr_mentions_ident_value(e, value_params) {
                     bail!("Lean rejects if-then-else with Nat-synthesizing `then` branch and typed `else` branch");
@@ -943,12 +991,17 @@ fn emit_cuda_expr_with_ctx(
             bail!("Lean rejects `-` on Nat");
         }
     }
-    let scalar_dom =
-        subexpr_eval_domain(expr, expected_dom, ambient_bv256, value_params, bitvec_params)?;
+    let scalar_dom = subexpr_eval_domain(
+        expr,
+        expected_dom,
+        ambient_bv256,
+        value_params,
+        bitvec_params,
+    )?;
     let coerce_nat_to_bv256 =
         outer_dom.is_none() && ambient_bv256 && scalar_dom.is_some_and(|d| d.is_nat);
-    let coerce_nat_to_bv_scalar = outer_dom.is_some_and(|d| d.is_bitvec)
-        && scalar_dom.is_some_and(|d| d.is_nat);
+    let coerce_nat_to_bv_scalar =
+        outer_dom.is_some_and(|d| d.is_bitvec) && scalar_dom.is_some_and(|d| d.is_nat);
     let wrap_out = |raw: String| -> String {
         if coerce_nat_to_bv256 {
             format!("u256_from_u64({})", raw)
@@ -987,7 +1040,13 @@ fn emit_cuda_expr_with_ctx(
         },
         LeanExpr::Number(n) => Ok(wrap_out(format!("{}ULL", n))),
         LeanExpr::Member(base, field) => {
-            let b = emit_cuda_expr_with_ctx(base, scalar_dom, ambient_bv256, value_params, bitvec_params)?;
+            let b = emit_cuda_expr_with_ctx(
+                base,
+                scalar_dom,
+                ambient_bv256,
+                value_params,
+                bitvec_params,
+            )?;
             let mapped = match field.as_str() {
                 "1" | "fst" => "fst",
                 "2" | "snd" => "snd",
@@ -1028,8 +1087,20 @@ fn emit_cuda_expr_with_ctx(
             }
             Ok(format!(
                 "make_u256_bool_pair({}, {})",
-                emit_cuda_expr_with_ctx(&items[0], scalar_dom, ambient_bv256, value_params, bitvec_params)?,
-                emit_cuda_expr_with_ctx(&items[1], scalar_dom, ambient_bv256, value_params, bitvec_params)?
+                emit_cuda_expr_with_ctx(
+                    &items[0],
+                    scalar_dom,
+                    ambient_bv256,
+                    value_params,
+                    bitvec_params
+                )?,
+                emit_cuda_expr_with_ctx(
+                    &items[1],
+                    scalar_dom,
+                    ambient_bv256,
+                    value_params,
+                    bitvec_params
+                )?
             ))
         }
         LeanExpr::IfThenElse(c, t, e) => {
@@ -1046,7 +1117,13 @@ fn emit_cuda_expr_with_ctx(
             )))
         }
         LeanExpr::Unary(op, inner) => {
-            let ic = emit_cuda_expr_with_ctx(inner, outer_dom, ambient_bv256, value_params, bitvec_params)?;
+            let ic = emit_cuda_expr_with_ctx(
+                inner,
+                outer_dom,
+                ambient_bv256,
+                value_params,
+                bitvec_params,
+            )?;
             match op.as_str() {
                 "~~~" => Ok(wrap_out(format!("lean_bitnot({})", ic))),
                 "!" | "¬" => Ok(format!("(!({}))", ic)),
@@ -1104,7 +1181,13 @@ fn emit_cuda_expr_with_ctx(
                 scalar_dom
             };
             let (l, r) = (
-                emit_cuda_expr_with_ctx(lhs, scalar_dom, ambient_bv256, value_params, bitvec_params)?,
+                emit_cuda_expr_with_ctx(
+                    lhs,
+                    scalar_dom,
+                    ambient_bv256,
+                    value_params,
+                    bitvec_params,
+                )?,
                 emit_cuda_expr_with_ctx(rhs, rhs_dom, ambient_bv256, value_params, bitvec_params)?,
             );
             let is_nat_dom = scalar_dom.is_some_and(|d| d.is_nat);
@@ -1280,20 +1363,34 @@ fn emit_cuda_expr_with_ctx(
                 ("mul", 2) => "lean_mul",
                 ("div", 2) if !is_bitvec_prefix => "lean_div",
                 ("udiv", 2) if is_bitvec_prefix => {
-                    if scalar_dom.is_none() && ambient_bv256 { "bv256_udiv" } else { "lean_div" }
+                    if scalar_dom.is_none() && ambient_bv256 {
+                        "bv256_udiv"
+                    } else {
+                        "lean_div"
+                    }
                 }
                 ("mod", 2) if !is_bitvec_prefix => "lean_mod",
                 ("umod", 2) if is_bitvec_prefix => {
-                    if scalar_dom.is_none() && ambient_bv256 { "bv256_umod" } else { "lean_mod" }
+                    if scalar_dom.is_none() && ambient_bv256 {
+                        "bv256_umod"
+                    } else {
+                        "lean_mod"
+                    }
                 }
                 ("addWithCarry", 2) => "u256_add_with_carry",
                 ("subWithBorrow", 2) => "u256_sub_with_borrow",
-                ("yul_min" | "min", 2) if prefix.is_none() || is_u256_fn_prefix(prefix.unwrap()) => {
+                ("yul_min" | "min", 2)
+                    if prefix.is_none() || is_u256_fn_prefix(prefix.unwrap()) =>
+                {
                     "yul_min"
                 }
                 ("shl", 2) if prefix.is_none() || is_u256_fn_prefix(prefix.unwrap()) => "lean_shl",
                 ("shiftLeft", 2) if prefix.is_none() || !is_u256_fn_prefix(prefix.unwrap()) => {
-                    if nat_shift && scalar_dom.is_some() { "lean_shl_nat" } else { "lean_shl" }
+                    if nat_shift && scalar_dom.is_some() {
+                        "lean_shl_nat"
+                    } else {
+                        "lean_shl"
+                    }
                 }
                 ("shr", 2) if prefix.is_none() || is_u256_fn_prefix(prefix.unwrap()) => "lean_shr",
                 ("shiftRight", 2)
@@ -1303,7 +1400,11 @@ fn emit_cuda_expr_with_ctx(
                     "lean_shr"
                 }
                 ("ushiftRight", 2) if is_bitvec_prefix => {
-                    if nat_shift && scalar_dom.is_some() { "lean_shr_nat" } else { "lean_shr" }
+                    if nat_shift && scalar_dom.is_some() {
+                        "lean_shr_nat"
+                    } else {
+                        "lean_shr"
+                    }
                 }
                 ("beq", 2) if prefix.is_none() || is_nat_or_bool_prefix => "lean_eq",
                 ("bitMux", 3) => "u256_bit_mux",
@@ -1487,7 +1588,8 @@ fn emit_cuda_rhs_for_param(
     value_params: &std::collections::HashSet<&str>,
     bitvec_params: &std::collections::HashSet<&str>,
 ) -> Result<String> {
-    let raw = emit_cuda_expr_with_ctx(expr, scalar_dom, ambient_bv256, value_params, bitvec_params)?;
+    let raw =
+        emit_cuda_expr_with_ctx(expr, scalar_dom, ambient_bv256, value_params, bitvec_params)?;
     if cuda_type == "u256" && matches!(expr, LeanExpr::Number(_)) {
         Ok(format!("u256_from_u64({})", raw))
     } else {
@@ -1503,6 +1605,12 @@ pub fn transpile_lean_theorem_to_cuda(
 ) -> Result<TranspiledCudaKernel> {
     let clean = strip_lean_comments(lean_src);
     let extracted = extract_lean_theorem(&clean, decl_name)?;
+    if !extracted.trusted_elab_context {
+        bail!(
+            "Untrusted elaboration context for `{}`: local/global instances, custom imports/defs/notations, or non-standard binders require kernel elaboration",
+            extracted.name
+        );
+    }
     if !extracted.instance_binders.is_empty() {
         bail!(
             "Instance binders (`[...]`) in `{}` are unsupported by CUDA fast-check transpilation",
@@ -1591,13 +1699,22 @@ pub fn transpile_lean_theorem_to_cuda(
         }
     }
     let emit = |expr: &LeanExpr| {
-        emit_cuda_expr_with_ctx(expr, scalar_dom, ambient_bv256, &value_params, &bitvec_params)
+        emit_cuda_expr_with_ctx(
+            expr,
+            scalar_dom,
+            ambient_bv256,
+            &value_params,
+            &bitvec_params,
+        )
     };
 
     for cond_expr in binder_cond_exprs {
         let mut hyp_vars = std::collections::HashSet::new();
         if !collect_expr_bound_vars(&cond_expr, &param_names, &mut hyp_vars) {
-            bail!("Unbound identifier in binder hypothesis of `{}`", extracted.name);
+            bail!(
+                "Unbound identifier in binder hypothesis of `{}`",
+                extracted.name
+            );
         }
         emit(&cond_expr)?;
         flatten_conjunctions(cond_expr, &mut raw_hyp_exprs);
@@ -1613,7 +1730,11 @@ pub fn transpile_lean_theorem_to_cuda(
         let pre_expr = parse_lean_expr_str(stripped)?;
         let mut pre_vars = std::collections::HashSet::new();
         if !collect_expr_bound_vars(&pre_expr, &param_names, &mut pre_vars) {
-            bail!("Unbound identifier in hypothesis `{}` of `{}`", stripped, extracted.name);
+            bail!(
+                "Unbound identifier in hypothesis `{}` of `{}`",
+                stripped,
+                extracted.name
+            );
         }
         flatten_conjunctions(pre_expr, &mut raw_hyp_exprs);
     }
@@ -1756,6 +1877,7 @@ pub fn transpile_lean_theorem_to_cuda(
         cuda_source,
         prop_str: extracted.prop_str,
         binder_hyps,
+        trusted_elab_context: extracted.trusted_elab_context,
     })
 }
 
@@ -2797,6 +2919,7 @@ fn extracted_decl_from_kernel(kernel: &TranspiledCudaKernel) -> ExtractedDecl {
             .collect(),
         instance_binders: Vec::new(),
         prop_str: kernel.prop_str.clone(),
+        trusted_elab_context: kernel.trusted_elab_context,
     }
 }
 
@@ -2993,7 +3116,7 @@ pub(crate) fn certify_checked_counterexample(
     lhs_value: &str,
     rhs_value: &str,
 ) -> (bool, String, serde_json::Value) {
-    if !decl.instance_binders.is_empty() {
+    if !decl.trusted_elab_context || !decl.instance_binders.is_empty() {
         return unavailable_cert("statement_not_evaluated");
     }
     let Some((env, scalar_dom, ambient_bv256)) = env_from_bindings(decl, bindings) else {
@@ -3278,7 +3401,9 @@ fn lower_lean_expr_to_lnir_scalar(
             "zero" | "Word256.zero" => Some(mk_strs(&["S_u64", "0"])),
             "one" | "Word256.one" => Some(mk_strs(&["S_u64", "1"])),
             "max" | "Word256.max" => Some(vec!["S_u64".to_string(), u64::MAX.to_string()]),
-            other => param_map.get(other).map(|idx| vec!["S_var".to_string(), idx.to_string()]),
+            other => param_map
+                .get(other)
+                .map(|idx| vec!["S_var".to_string(), idx.to_string()]),
         },
         LeanExpr::Number(num_str) => {
             let v = num_str
@@ -3293,7 +3418,9 @@ fn lower_lean_expr_to_lnir_scalar(
                 match (prefix.as_str(), field.as_str()) {
                     ("Word256", "zero") => return Some(mk_strs(&["S_u64", "0"])),
                     ("Word256", "one") => return Some(mk_strs(&["S_u64", "1"])),
-                    ("Word256", "max") => return Some(vec!["S_u64".to_string(), u64::MAX.to_string()]),
+                    ("Word256", "max") => {
+                        return Some(vec!["S_u64".to_string(), u64::MAX.to_string()])
+                    }
                     _ => {}
                 }
             }
@@ -3372,7 +3499,10 @@ fn lower_lean_expr_to_lnir_scalar(
             };
             let short = fn_name.rsplit('.').next().unwrap_or(fn_name.as_str());
             let prefix = fn_name.rsplit_once('.').map(|(p, _)| p);
-            if matches!(prefix, Some("BitVec" | "Nat" | "UInt8" | "UInt16" | "UInt32")) {
+            if matches!(
+                prefix,
+                Some("BitVec" | "Nat" | "UInt8" | "UInt16" | "UInt32")
+            ) {
                 return None;
             }
             match (short, args.as_slice()) {
@@ -3554,6 +3684,11 @@ pub fn lower_decl_to_lnir_wire(
     Some(all_tokens.join("|"))
 }
 
+pub(crate) fn stmt_src_has_trusted_elab_context(decl_name: &str, stmt_src: &str) -> bool {
+    extract_decl_from_stmt_src(decl_name, stmt_src)
+        .is_ok_and(|d| d.trusted_elab_context && d.instance_binders.is_empty())
+}
+
 fn extract_decl_from_stmt_src(
     decl_name: &str,
     stmt_src: &str,
@@ -3594,6 +3729,9 @@ fn extract_decl_from_stmt_src(
 /// when falsified.
 pub fn try_lnir_fast_reject(decl_name: &str, stmt_src: &str) -> Option<(String, Option<String>)> {
     let decl = extract_decl_from_stmt_src(decl_name, stmt_src).ok()?;
+    if !decl.trusted_elab_context {
+        return None;
+    }
 
     // Flatten value parameters and extract conclusion equality for `LNIR_WIRE_V1` lowering
     let mut flat_params = Vec::new();
@@ -4703,7 +4841,7 @@ pub fn run_fast_check_command(
             };
             let batch_items: Vec<(String, String)> = decls
                 .iter()
-                .filter(|d| d.instance_binders.is_empty())
+                .filter(|d| d.trusted_elab_context && d.instance_binders.is_empty())
                 .take(max_check)
                 .map(|d| {
                     let binders_prefix: String = d
@@ -5311,9 +5449,14 @@ fn eval_lean_expr_fast_ctx_inner(
     let outer_dom = expected_dom;
     if let LeanExpr::Unary(op, inner) = expr {
         if matches!(op.as_str(), "~~~" | "-") {
-            let inner_dom =
-                subexpr_eval_domain(inner, outer_dom, ambient_bv256, &value_params, bitvec_params)
-                    .ok()?;
+            let inner_dom = subexpr_eval_domain(
+                inner,
+                outer_dom,
+                ambient_bv256,
+                &value_params,
+                bitvec_params,
+            )
+            .ok()?;
             if inner_dom.is_some_and(|d| d.is_nat)
                 && !(op == "-"
                     && (outer_dom.is_some_and(|d| d.is_bitvec)
@@ -5326,10 +5469,19 @@ fn eval_lean_expr_fast_ctx_inner(
             return None;
         }
     }
-    let scalar_dom = subexpr_eval_domain(expr, expected_dom, ambient_bv256, &value_params, bitvec_params).ok()?;
+    let scalar_dom = subexpr_eval_domain(
+        expr,
+        expected_dom,
+        ambient_bv256,
+        &value_params,
+        bitvec_params,
+    )
+    .ok()?;
     let dom = scalar_dom.filter(|d| d.word_bits <= 64);
-    let coerce_nat_to_bv256 = outer_dom.is_none() && ambient_bv256 && scalar_dom.is_some_and(|d| d.is_nat);
-    let coerce_nat_to_bv_scalar = outer_dom.is_some_and(|d| d.is_bitvec) && scalar_dom.is_some_and(|d| d.is_nat);
+    let coerce_nat_to_bv256 =
+        outer_dom.is_none() && ambient_bv256 && scalar_dom.is_some_and(|d| d.is_nat);
+    let coerce_nat_to_bv_scalar =
+        outer_dom.is_some_and(|d| d.is_bitvec) && scalar_dom.is_some_and(|d| d.is_nat);
     let wrap_out = |v: FastVal| -> Option<FastVal> {
         if coerce_nat_to_bv256 {
             Some(FastVal::U256([v.as_u64()?, 0, 0, 0]))
@@ -5415,10 +5567,18 @@ fn eval_lean_expr_fast_ctx_inner(
                 is_nat: false,
                 is_bitvec: false,
             });
-            let w0 = eval_lean_expr_fast_ctx_inner(&items[0], env, u64_limb_dom, false, bitvec_params)?.as_u64()?;
-            let w1 = eval_lean_expr_fast_ctx_inner(&items[1], env, u64_limb_dom, false, bitvec_params)?.as_u64()?;
-            let w2 = eval_lean_expr_fast_ctx_inner(&items[2], env, u64_limb_dom, false, bitvec_params)?.as_u64()?;
-            let w3 = eval_lean_expr_fast_ctx_inner(&items[3], env, u64_limb_dom, false, bitvec_params)?.as_u64()?;
+            let w0 =
+                eval_lean_expr_fast_ctx_inner(&items[0], env, u64_limb_dom, false, bitvec_params)?
+                    .as_u64()?;
+            let w1 =
+                eval_lean_expr_fast_ctx_inner(&items[1], env, u64_limb_dom, false, bitvec_params)?
+                    .as_u64()?;
+            let w2 =
+                eval_lean_expr_fast_ctx_inner(&items[2], env, u64_limb_dom, false, bitvec_params)?
+                    .as_u64()?;
+            let w3 =
+                eval_lean_expr_fast_ctx_inner(&items[3], env, u64_limb_dom, false, bitvec_params)?
+                    .as_u64()?;
             Some(FastVal::U256([w0, w1, w2, w3]))
         }
         LeanExpr::Tuple(items) => {
@@ -6216,7 +6376,24 @@ fn eval_extracted_decl_in_memory(
     decl: &ExtractedDecl,
     n_states: u64,
 ) -> Option<(TranspiledFastCheckReport, String, String)> {
-    if !decl.instance_binders.is_empty() {
+    eval_extracted_decl_in_memory_inner(decl, n_states, false)
+}
+
+pub(crate) fn eval_extracted_decl_for_audit_spec(
+    decl: &ExtractedDecl,
+    n_states: u64,
+) -> Option<(TranspiledFastCheckReport, String, String)> {
+    eval_extracted_decl_in_memory_inner(decl, n_states, true)
+}
+
+fn eval_extracted_decl_in_memory_inner(
+    decl: &ExtractedDecl,
+    n_states: u64,
+    allow_untrusted_elab_context: bool,
+) -> Option<(TranspiledFastCheckReport, String, String)> {
+    if (!allow_untrusted_elab_context && !decl.trusted_elab_context)
+        || !decl.instance_binders.is_empty()
+    {
         return None;
     }
     let t0 = Instant::now();
@@ -6874,29 +7051,28 @@ pub fn evaluate_agent_step_value(
             }
         };
 
-        let target_shards: Vec<&crate::splitter::TheoremShard> =
-            match decl_filter.map(str::trim) {
-                Some(df) if !df.is_empty() && df != "auto" => {
-                    let matches: Vec<&crate::splitter::TheoremShard> = split
-                        .shards
-                        .iter()
-                        .filter(|s| {
-                            let qname = if s.qualified_name.is_empty() {
-                                s.name.as_str()
-                            } else {
-                                s.qualified_name.as_str()
-                            };
-                            audit_spec::decl_matches_requested_target(&s.name, qname, df)
-                        })
-                        .collect();
-                    if matches.len() == 1 {
-                        matches
-                    } else {
-                        Vec::new()
-                    }
+        let target_shards: Vec<&crate::splitter::TheoremShard> = match decl_filter.map(str::trim) {
+            Some(df) if !df.is_empty() && df != "auto" => {
+                let matches: Vec<&crate::splitter::TheoremShard> = split
+                    .shards
+                    .iter()
+                    .filter(|s| {
+                        let qname = if s.qualified_name.is_empty() {
+                            s.name.as_str()
+                        } else {
+                            s.qualified_name.as_str()
+                        };
+                        audit_spec::decl_matches_requested_target(&s.name, qname, df)
+                    })
+                    .collect();
+                if matches.len() == 1 {
+                    matches
+                } else {
+                    Vec::new()
                 }
-                _ => split.shards.iter().collect(),
-            };
+            }
+            _ => split.shards.iter().collect(),
+        };
 
         for ts in &target_shards {
             let ts_decl_id = if ts.qualified_name.is_empty() {
@@ -6986,6 +7162,24 @@ pub fn evaluate_agent_step_value(
                     );
                 }
             }
+            let shard_elab_trusted = decls
+                .iter()
+                .find(|d| {
+                    audit_spec::decl_matches_requested_target(
+                        &d.name,
+                        &d.qualified_name,
+                        ts_decl_id,
+                    )
+                })
+                .is_some_and(|d| d.trusted_elab_context && d.instance_binders.is_empty());
+            if !shard_elab_trusted {
+                certs.retain(|c| {
+                    !matches!(
+                        c,
+                        crate::accelerators::AcceleratorCertificate::CounterexampleFound { .. }
+                    )
+                });
+            }
             for c in &certs {
                 if let crate::accelerators::AcceleratorCertificate::CounterexampleFound {
                     witness_summary,
@@ -6998,7 +7192,7 @@ pub fn evaluate_agent_step_value(
                     let accelerator_name = accelerator_name.clone();
                     accelerator_certificates.extend(certs);
                     let (accel_certified, accel_version, _) =
-                        certify_statement_witness(ts_decl_id, &stmt_src, &witness_summary);
+                        certify_statement_witness(ts_decl_id, &src_text, &witness_summary);
                     let elapsed_ms =
                         (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
                     let w_pair = witness_pair_from_summary(&witness_summary);
@@ -8757,7 +8951,10 @@ theorem valid_second (x : UInt8) : x + 0 = x := by simp
                 "1",
             );
         assert!(!explicit_nat_count_cert);
-        assert_eq!(explicit_nat_count_details["reason"], "statement_not_evaluated");
+        assert_eq!(
+            explicit_nat_count_details["reason"],
+            "statement_not_evaluated"
+        );
 
         let (bv256_div_cert, bv256_div_ver, bv256_div_details) = certify_json_statement_witness(
             "bv256_div_zero",
@@ -8822,11 +9019,9 @@ theorem a (x : UInt8) : x + 0 = x := by simp
         assert!(
             try_lnir_fast_reject("buggy_u8_shift_loss", "(x : UInt8) : (x <<< 1) = x").is_some()
         );
-        assert!(try_lnir_fast_reject(
-            "bv256_div_zero_fast",
-            "(x : BitVec 256) : x / 0 = 0",
-        )
-        .is_none());
+        assert!(
+            try_lnir_fast_reject("bv256_div_zero_fast", "(x : BitVec 256) : x / 0 = 0",).is_none()
+        );
 
         // 4. Astra P1 edge-case regressions across Rust, CUDA transpilation, and `agent-step`:
         // - `BitVec 8` shifted by `Nat` count `>= 8` (`256`, `8`) yields `0` rather than wrapping mod 8.
@@ -8875,8 +9070,7 @@ theorem a (x : UInt8) : x + 0 = x := by simp
             "theorem ite_typed_then (x : BitVec 8) (h : x = 0) : ((if false then x else (1 <<< 8)) >>> 1) = x := by sorry\n";
         let k_ite_typed_then =
             transpile_lean_theorem_to_cuda(ite_typed_then, Some("ite_typed_then")).unwrap();
-        let r_ite_typed_then =
-            execute_transpiled_cuda_kernel(&k_ite_typed_then, 64, true).unwrap();
+        let r_ite_typed_then = execute_transpiled_cuda_kernel(&k_ite_typed_then, 64, true).unwrap();
         assert!(r_ite_typed_then.verified && r_ite_typed_then.violations == 0);
 
         let ite_mismatch =
@@ -8910,11 +9104,9 @@ theorem a (x : UInt8) : x + 0 = x := by simp
         );
         assert!(!ov_cert);
         assert_eq!(ov_details["reason"], "statement_not_evaluated");
-        let k_ov = transpile_lean_theorem_to_cuda(
-            bv256_overflow_shift,
-            Some("bv256_overflow_shift"),
-        )
-        .unwrap();
+        let k_ov =
+            transpile_lean_theorem_to_cuda(bv256_overflow_shift, Some("bv256_overflow_shift"))
+                .unwrap();
         let r_ov = execute_transpiled_cuda_kernel(&k_ov, 64, true).unwrap();
         assert!(r_ov.verified && r_ov.violations == 0 && r_ov.satisfied_preconditions == 0);
 
@@ -9039,10 +9231,8 @@ end N
             )
         );
         // `!x == y` parses as `!(x == y)` (`notation:max "!" b:40`), so `!n == 2` on `Nat` is valid!
-        let bang_eq_nat =
-            "theorem bang_eq_nat (n : Nat) (h : n = 1) : !n == 2 := by sorry\n";
-        let k_bang_eq =
-            transpile_lean_theorem_to_cuda(bang_eq_nat, Some("bang_eq_nat")).unwrap();
+        let bang_eq_nat = "theorem bang_eq_nat (n : Nat) (h : n = 1) : !n == 2 := by sorry\n";
+        let k_bang_eq = transpile_lean_theorem_to_cuda(bang_eq_nat, Some("bang_eq_nat")).unwrap();
         let r_bang_eq = execute_transpiled_cuda_kernel(&k_bang_eq, 64, true).unwrap();
         assert!(r_bang_eq.verified && r_bang_eq.violations == 0);
 
@@ -9061,10 +9251,7 @@ end N
             "theorem bv8_int_shift_rhs (x : BitVec 8) : (x <<< (-1)) = 0 := by sorry\n",
             "theorem bv8_int_cmp (x : BitVec 8) : (-1 == 255) → x = x := by sorry\n",
         ] {
-            let name = int_or_bad_thm
-                .split_whitespace()
-                .nth(1)
-                .unwrap();
+            let name = int_or_bad_thm.split_whitespace().nth(1).unwrap();
             assert!(
                 transpile_lean_theorem_to_cuda(int_or_bad_thm, Some(name)).is_err(),
                 "expected CUDA transpiler to fail closed on `{}`",
@@ -9074,7 +9261,11 @@ end N
         }
 
         // - Differential check against live Lean 4.35 (`lean --stdin`) on subtle unary/shift/boolean expressions.
-        if std::process::Command::new("lean").arg("--version").output().is_ok() {
+        if std::process::Command::new("lean")
+            .arg("--version")
+            .output()
+            .is_ok()
+        {
             let lean_probe = r#"
 def checks : List Bool := [
   ((- (1 : BitVec 8) >>> 1) == (0 : BitVec 8)),
@@ -9107,5 +9298,201 @@ def checks : List Bool := [
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_untrusted_elab_context_fails_closed_across_all_cex_and_fastcheck_paths() {
+        let contextual_cases: &[(&str, &str, &str)] = &[
+            (
+                "local_inst_in_section",
+                "section\nlocal instance : HAdd UInt8 UInt8 UInt8 where\n  hAdd a _ := a\ntheorem local_inst_in_section (x : UInt8) : x + 1 = x := by rfl\nend\n",
+                "x=0 => lhs=1 != rhs=0",
+            ),
+            (
+                "scoped_inst_reopened",
+                "namespace CtxNs\nscoped instance : HAdd UInt8 UInt8 UInt8 where\n  hAdd a _ := a\nend CtxNs\nnamespace CtxNs\ntheorem scoped_inst_reopened (x : UInt8) : x + 1 = x := by rfl\nend CtxNs\n",
+                "x=0 => lhs=1 != rhs=0",
+            ),
+            (
+                "global_inst_override",
+                "instance (priority := high) : HAdd UInt8 UInt8 UInt8 where\n  hAdd a _ := a\ntheorem global_inst_override (x : UInt8) : x + 1 = x := by rfl\n",
+                "x=0 => lhs=1 != rhs=0",
+            ),
+            (
+                "attr_local_inst",
+                "def keepLeft : HAdd UInt8 UInt8 UInt8 := ⟨fun a _ => a⟩\nsection\nattribute [local instance] keepLeft\ntheorem attr_local_inst (x : UInt8) : x + 1 = x := by rfl\nend\n",
+                "x=0 => lhs=1 != rhs=0",
+            ),
+            (
+                "midline_inst_after_proof",
+                "theorem helper : True := trivial local instance : HAdd UInt8 UInt8 UInt8 where hAdd a _ := a\ntheorem midline_inst_after_proof (x : UInt8) : x + 1 = x := by rfl\n",
+                "x=0 => lhs=1 != rhs=0",
+            ),
+            (
+                "local_notation_override",
+                "local macro_rules | `($a + $_b) => `($a)\ntheorem local_notation_override (x : UInt8) : x + 1 = x := by rfl\n",
+                "x=0 => lhs=1 != rhs=0",
+            ),
+            (
+                "section_variable_implicit",
+                "section\nvariable (h : False)\ninclude h in\ntheorem section_variable_implicit (x : UInt8) : x + 1 = x := False.elim h\nend\n",
+                "x=0 => lhs=1 != rhs=0",
+            ),
+            (
+                "typed_let_coercion",
+                "theorem typed_let_coercion (x : UInt8) : let y : UInt8 := 256; x + y = x := by\n  change x + 0 = x\n  exact UInt8.add_zero x\n",
+                "x=0 => lhs=0 != rhs=0",
+            ),
+            (
+                "default_binder_val",
+                "theorem default_binder_val (x : UInt8 := 0) : x = x := by rfl\n",
+                "x=0 => lhs=0 != rhs=1",
+            ),
+            (
+                "dup_binder_shadow",
+                "theorem dup_binder_shadow (x : UInt16) (x : UInt8) : x.toNat < 256 := by exact x.toBitVec.isLt\n",
+                "x=256 => lhs=0 != rhs=1",
+            ),
+            (
+                "custom_import_override",
+                "import Init\ntheorem custom_import_override (x : UInt8) : x + 1 = x := by sorry\n",
+                "x=0 => lhs=1 != rhs=0",
+            ),
+            (
+                "custom_open_override",
+                "open Nat\ntheorem custom_open_override (x : UInt8) : x + 1 = x := by sorry\n",
+                "x=0 => lhs=1 != rhs=0",
+            ),
+            (
+                "havei_in_proof",
+                "theorem havei_in_proof (x : UInt8) : x = x := by haveI : Inhabited UInt8 := ⟨0⟩; rfl\n",
+                "x=0 => lhs=1 != rhs=0",
+            ),
+        ];
+
+        // First 8 cases are genuinely valid theorems in Lean 4.35 (`0 sorry`); verify live with `lean --stdin` when available.
+        if std::process::Command::new("lean")
+            .arg("--version")
+            .output()
+            .is_ok()
+        {
+            for (name, src, _) in &contextual_cases[..8] {
+                let mut cmd = std::process::Command::new("lean");
+                cmd.arg("--stdin")
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+                if let Ok(mut child) = cmd.spawn() {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        use std::io::Write;
+                        let _ = stdin.write_all(src.as_bytes());
+                    }
+                    if let Ok(out) = child.wait_with_output() {
+                        assert!(
+                            out.status.success(),
+                            "expected contextual Lean 4.35 theorem `{}` to elaborate & kernel-check cleanly, stderr={}",
+                            name,
+                            String::from_utf8_lossy(&out.stderr)
+                        );
+                    }
+                }
+            }
+        }
+
+        let accel_reg = crate::accelerators::AcceleratorRegistry::from_config(
+            crate::accelerators::AcceleratorConfig::default(),
+        );
+        for &(name, src, witness) in contextual_cases {
+            let decls = audit_spec::extract_all_lean_theorems(src, Some(name));
+            assert!(
+                decls.iter().all(|d| !d.trusted_elab_context),
+                "expected `{}` to have trusted_elab_context=false",
+                name
+            );
+            assert!(
+                transpile_lean_theorem_to_cuda(src, Some(name)).is_err(),
+                "transpile_lean_theorem_to_cuda must fail closed on `{}`",
+                name
+            );
+            assert_eq!(
+                try_lnir_fast_reject(name, src),
+                None,
+                "try_lnir_fast_reject must return None on `{}`",
+                name
+            );
+            assert_eq!(
+                try_tpu_xla_fast_reject(name, src),
+                None,
+                "try_tpu_xla_fast_reject must return None on `{}`",
+                name
+            );
+            let (cert, _, details) = certify_statement_witness(name, src, witness);
+            assert!(
+                !cert,
+                "certify_statement_witness must fail closed on `{}`: {:?}",
+                name, details
+            );
+            for d in &decls {
+                assert!(
+                    eval_extracted_decl_in_memory(d, 64).is_none(),
+                    "eval_extracted_decl_in_memory must return None on `{}`",
+                    name
+                );
+            }
+            let certs = accel_reg.run_all(&crate::accelerators::AcceleratorInput {
+                decl_name: name.to_string(),
+                stmt_src: src.to_string(),
+                body_src: "by omega".to_string(),
+                imports_csv: String::new(),
+                available_constants: Vec::new(),
+                budget_ms: 25,
+            });
+            assert!(
+                !certs.iter().any(|c| matches!(
+                    c,
+                    crate::accelerators::AcceleratorCertificate::CounterexampleFound { .. }
+                )),
+                "accelerators must not emit CounterexampleFound on `{}`: {:?}",
+                name,
+                certs
+            );
+        }
+
+        // End-to-end `try_stateless_agent_step_cex` check on a file with `local instance` override:
+        let tmp_dir =
+            std::env::temp_dir().join(format!("turbo_ctx_override_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let lean_file = tmp_dir.join("CtxOverride.lean");
+        std::fs::write(
+            &lean_file,
+            "section\nlocal instance : HAdd UInt8 UInt8 UInt8 where\n  hAdd a _ := a\ntheorem local_inst_in_section (x : UInt8) : x + 1 = x := by rfl\nend\n",
+        )
+        .unwrap();
+        let stateless_cex = try_stateless_agent_step_cex(
+            &lean_file,
+            Some("local_inst_in_section"),
+            Some(&tmp_dir),
+            false,
+        );
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        assert!(
+            stateless_cex.is_none(),
+            "try_stateless_agent_step_cex must never counterexample-reject valid contextual theorem: {:?}",
+            stateless_cex
+        );
+
+        // Positive sanity check: canonical `lean/TurboLean/FastCheck.lean` keeps `trusted_elab_context = true` on all theorems.
+        let fastcheck_corpus = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../lean/TurboLean/FastCheck.lean"),
+        )
+        .unwrap();
+        let corpus_decls = audit_spec::extract_all_lean_theorems(&fastcheck_corpus, None);
+        assert!(!corpus_decls.is_empty());
+        assert!(
+            corpus_decls.iter().all(|d| d.trusted_elab_context),
+            "canonical FastCheck.lean theorems must remain trusted_elab_context=true"
+        );
     }
 }

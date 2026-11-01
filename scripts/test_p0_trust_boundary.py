@@ -694,6 +694,61 @@ class TestP0TrustBoundary(unittest.TestCase):
         with patch.object(fuzzer, "LEAN_NATIVE_FULL", Path("/nonexistent/frontend")):
             self.assertEqual(fuzzer.run_fuzzer(3)["status"], "incomplete_missing_engine")
 
+    def test_13_contextual_instance_and_notation_overrides_never_counterexample_reject(self) -> None:
+        turbo_bin = ROOT / "target" / "release" / "turbo-lean"
+        if not turbo_bin.exists():
+            return
+        with tempfile.TemporaryDirectory(prefix="p0_ctx_elab_") as tmp:
+            root = Path(tmp)
+            lean_file = root / "ContextualValid.lean"
+            lean_file.write_text(
+                "section\n"
+                "local instance : HAdd UInt8 UInt8 UInt8 where\n"
+                "  hAdd a _ := a\n"
+                "theorem local_inst_valid (x : UInt8) : x + 1 = x := by rfl\n"
+                "end\n",
+                encoding="utf-8",
+            )
+            step = subprocess.run(
+                [
+                    str(turbo_bin),
+                    "--json",
+                    "--cache-dir",
+                    str(root / "cache"),
+                    "agent-step",
+                    str(lean_file),
+                    "--decl",
+                    "local_inst_valid",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(step.returncode, 0, step.stderr)
+            payload = json.loads(step.stdout)
+            self.assertNotEqual(payload.get("status"), "counterexample_rejected", payload)
+            self.assertEqual(payload.get("status"), "theorem_verified", payload)
+            self.assertTrue(payload.get("verified"), payload)
+            self.assertFalse(
+                any(
+                    c.get("kind") == "counterexample_found"
+                    for c in payload.get("accelerator_certificates", [])
+                ),
+                payload,
+            )
+            fc = subprocess.run(
+                [
+                    str(turbo_bin),
+                    "--json",
+                    "fast-check",
+                    str(lean_file),
+                    "--decl",
+                    "local_inst_valid",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(fc.returncode, 0, fc.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
