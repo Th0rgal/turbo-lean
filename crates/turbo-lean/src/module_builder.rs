@@ -7145,6 +7145,34 @@ pub fn build_module_dag_with_trust(
         }
     }
     let mut shared_libs: Vec<SharedLibSpec> = Vec::new();
+    let tc_native_opt = if !requested_shared_libs.is_empty()
+        || !explicit_dynlib_mods.is_empty()
+        || nodes.values().any(|n| n.precompile_modules)
+    {
+        Some(query_toolchain_native_spec(&cfg.lean_bin)?)
+    } else {
+        None
+    };
+    let (sh_ext, sh_lib_prefix) = match &tc_native_opt {
+        Some(spec) => (
+            spec.shared_lib_ext(),
+            if spec.is_windows { "" } else { "lib" },
+        ),
+        None => (
+            if cfg!(target_os = "macos") {
+                "dylib"
+            } else if cfg!(target_os = "windows") {
+                "dll"
+            } else {
+                "so"
+            },
+            if cfg!(target_os = "windows") {
+                ""
+            } else {
+                "lib"
+            },
+        ),
+    };
     for (pkg_name, lib_name) in &requested_shared_libs {
         let Some(pkg) = cfg
             .dep_pkgs
@@ -7199,18 +7227,11 @@ pub fn build_module_dag_with_trust(
             continue;
         }
         let stem = lean_mk_module_initialization_stem(lib_name, Some(pkg_name));
-        let ext = if cfg!(target_os = "macos") {
-            "dylib"
-        } else if cfg!(target_os = "windows") {
-            "dll"
-        } else {
-            "so"
-        };
         let so_path = pkg
             .pkg_root
             .join(&pkg.build_dir)
             .join(&pkg.native_lib_dir)
-            .join(format!("lib{}.{}", stem, ext));
+            .join(format!("{sh_lib_prefix}{stem}.{sh_ext}"));
         let is_plugin = lib.roots.len() == 1
             && stem == lean_mk_module_initialization_stem(&lib.roots[0], Some(pkg_name));
         shared_libs.push(SharedLibSpec {
@@ -8014,14 +8035,14 @@ fn module_dynlib_so_path(node: &ModuleNode) -> Option<PathBuf> {
     } else {
         node.olean_path.parent()?.to_path_buf()
     };
-    let ext = if cfg!(target_os = "macos") {
+    let stem = lean_mk_module_initialization_stem(&node.module_name, Some(&node.pkg_name));
+    let ext = cached_toolchain_shared_lib_ext().unwrap_or(if cfg!(target_os = "macos") {
         "dylib"
     } else if cfg!(target_os = "windows") {
         "dll"
     } else {
         "so"
-    };
-    let stem = lean_mk_module_initialization_stem(&node.module_name, Some(&node.pkg_name));
+    });
     Some(base_dir.join(format!("{}.{}", stem, ext)))
 }
 
@@ -9216,19 +9237,23 @@ fn build_setup_json(
         }
     }
     if !dynlibs.is_empty() || !plugins.is_empty() {
-        let shared_ext = if cfg!(target_os = "macos") {
-            "dylib"
-        } else if cfg!(target_os = "windows") {
-            "dll"
-        } else {
-            "so"
+        let (shared_ext, needs_lake_shared) = match query_toolchain_native_spec(&cfg.lean_bin) {
+            Ok(spec) => (spec.shared_lib_ext(), spec.is_linux || spec.is_osx),
+            Err(_) => (
+                if cfg!(target_os = "macos") {
+                    "dylib"
+                } else if cfg!(target_os = "windows") {
+                    "dll"
+                } else {
+                    "so"
+                },
+                cfg!(target_os = "linux") || cfg!(target_os = "macos"),
+            ),
         };
         let lake_shared = cfg
             .toolchain_lib_lean
             .join(format!("libLake_shared.{}", shared_ext));
-        if (cfg!(target_os = "linux") || cfg!(target_os = "macos"))
-            && lake_shared.is_file()
-            && !plugins.iter().any(|p| p == &lake_shared)
+        if needs_lake_shared && lake_shared.is_file() && !plugins.iter().any(|p| p == &lake_shared)
         {
             plugins.insert(0, lake_shared);
         }
@@ -9393,7 +9418,157 @@ fn build_setup_json(
     }))
 }
 
-fn lake_cc_and_flags(cfg: &ProjectConfig) -> Result<(PathBuf, Vec<String>, Vec<String>, bool)> {
+#[derive(Debug, Clone)]
+struct ToolchainNativeSpec {
+    target: String,
+    is_windows: bool,
+    is_osx: bool,
+    is_linux: bool,
+    c_flags: Vec<String>,
+    internal_c_flags: Vec<String>,
+    link_shared_flags: Vec<String>,
+    internal_linker_flags: Vec<String>,
+}
+
+impl ToolchainNativeSpec {
+    fn shared_lib_ext(&self) -> &'static str {
+        if self.is_osx {
+            "dylib"
+        } else if self.is_windows {
+            "dll"
+        } else {
+            "so"
+        }
+    }
+}
+
+static TOOLCHAIN_NATIVE_CACHE: OnceLock<Mutex<HashMap<PathBuf, ToolchainNativeSpec>>> =
+    OnceLock::new();
+
+fn cached_toolchain_shared_lib_ext() -> Option<&'static str> {
+    let guard = TOOLCHAIN_NATIVE_CACHE.get()?.lock().ok()?;
+    guard
+        .values()
+        .next()
+        .map(ToolchainNativeSpec::shared_lib_ext)
+}
+
+fn query_toolchain_native_spec(lean_bin: &Path) -> Result<ToolchainNativeSpec> {
+    let canon_bin = lean_bin
+        .canonicalize()
+        .unwrap_or_else(|_| lean_bin.to_path_buf());
+    let cache = TOOLCHAIN_NATIVE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(spec) = guard.get(&canon_bin) {
+            return Ok(spec.clone());
+        }
+    }
+    const ROOT_SENTINEL: &str = "__TURBO_LEAN_SYSROOT_SENTINEL__";
+    let script = [
+        "import Lean.Compiler.FFI",
+        "def main : IO Unit := do",
+        "  IO.println s!\"TARGET\\t{System.Platform.target}\"",
+        "  IO.println s!\"IS_WINDOWS\\t{System.Platform.isWindows}\"",
+        "  IO.println s!\"IS_OSX\\t{System.Platform.isOSX}\"",
+        "  IO.println s!\"IS_LINUX\\t{System.Platform.isLinux}\"",
+        "  for f in Lean.Compiler.FFI.getCFlags'.push \"-Wno-unused-command-line-argument\" do",
+        "    IO.println s!\"CFLAG\\t{f}\"",
+        &format!("  for f in Lean.Compiler.FFI.getInternalCFlags \"{ROOT_SENTINEL}\" do"),
+        "    IO.println s!\"INT_CFLAG\\t{f}\"",
+        "  for f in Lean.Compiler.FFI.getLinkerFlags' (linkStatic := false) do",
+        "    IO.println s!\"LINK_SHARED\\t{f}\"",
+        &format!("  for f in Lean.Compiler.FFI.getInternalLinkerFlags \"{ROOT_SENTINEL}\" do"),
+        "    IO.println s!\"INT_LINK\\t{f}\"",
+        "",
+    ]
+    .join("\n");
+    let mut child = Command::new(&canon_bin)
+        .arg("--stdin")
+        .arg("--run")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "Failed to spawn `{}` to query Lean toolchain native C/linker flags",
+                canon_bin.display()
+            )
+        })?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        stdin.write_all(script.as_bytes()).with_context(|| {
+            format!(
+                "Failed to pipe native config query into `{}`",
+                canon_bin.display()
+            )
+        })?;
+    }
+    let out = child.wait_with_output().with_context(|| {
+        format!(
+            "Failed waiting for `{}` native config query",
+            canon_bin.display()
+        )
+    })?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "`{} --stdin --run` failed querying `Lean.Compiler.FFI` flags: {} {}",
+            canon_bin.display(),
+            String::from_utf8_lossy(&out.stderr).trim(),
+            String::from_utf8_lossy(&out.stdout).trim()
+        );
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut target = None;
+    let mut is_windows = None;
+    let mut is_osx = None;
+    let mut is_linux = None;
+    let mut c_flags = Vec::new();
+    let mut internal_c_flags = Vec::new();
+    let mut link_shared_flags = Vec::new();
+    let mut internal_linker_flags = Vec::new();
+    for line in stdout.lines() {
+        let Some((tag, val)) = line.split_once('\t') else {
+            continue;
+        };
+        match tag {
+            "TARGET" => target = Some(val.to_string()),
+            "IS_WINDOWS" => is_windows = Some(val == "true"),
+            "IS_OSX" => is_osx = Some(val == "true"),
+            "IS_LINUX" => is_linux = Some(val == "true"),
+            "CFLAG" => c_flags.push(val.to_string()),
+            "INT_CFLAG" => internal_c_flags.push(val.to_string()),
+            "LINK_SHARED" => link_shared_flags.push(val.to_string()),
+            "INT_LINK" => internal_linker_flags.push(val.to_string()),
+            _ => {}
+        }
+    }
+    let target = target.filter(|s| !s.is_empty()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Toolchain `{}` returned empty `System.Platform.target`",
+            canon_bin.display()
+        )
+    })?;
+    let spec = ToolchainNativeSpec {
+        target,
+        is_windows: is_windows.unwrap_or(cfg!(target_os = "windows")),
+        is_osx: is_osx.unwrap_or(cfg!(target_os = "macos")),
+        is_linux: is_linux.unwrap_or(cfg!(target_os = "linux")),
+        c_flags,
+        internal_c_flags,
+        link_shared_flags,
+        internal_linker_flags,
+    };
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(canon_bin, spec.clone());
+    }
+    Ok(spec)
+}
+
+fn lake_cc_and_flags(
+    cfg: &ProjectConfig,
+) -> Result<(PathBuf, Vec<String>, Vec<String>, ToolchainNativeSpec)> {
+    const ROOT_SENTINEL: &str = "__TURBO_LEAN_SYSROOT_SENTINEL__";
     let sysroot = cfg
         .lean_bin
         .parent()
@@ -9405,86 +9580,43 @@ fn lake_cc_and_flags(cfg: &ProjectConfig) -> Result<(PathBuf, Vec<String>, Vec<S
             )
         })?
         .to_path_buf();
-    let custom_cc = std::env::var("LEAN_CC").is_ok();
-    let cc = if custom_cc {
-        PathBuf::from(std::env::var("LEAN_CC").unwrap_or_default())
-    } else if sysroot.join("bin/clang").is_file() {
-        sysroot.join("bin/clang")
-    } else if let Ok(cc_env) = std::env::var("CC") {
-        PathBuf::from(cc_env)
+    let sysroot_str = sysroot.to_string_lossy();
+    let spec = query_toolchain_native_spec(&cfg.lean_bin)?;
+    let bundled_clang = if spec.is_windows {
+        sysroot.join("bin/clang.exe")
     } else {
-        PathBuf::from("cc")
+        sysroot.join("bin/clang")
     };
-    let mut cflags = vec![
-        "-fstack-clash-protection".to_string(),
-        "-ffp-contract=off".to_string(),
-        "-fdata-sections".to_string(),
-        "-ffunction-sections".to_string(),
-        "-fPIC".to_string(),
-        "-fvisibility=hidden".to_string(),
-        "-Wno-unused-command-line-argument".to_string(),
-    ];
+    let (cc, custom_cc) = if let Ok(lean_cc) = std::env::var("LEAN_CC") {
+        (PathBuf::from(lean_cc), true)
+    } else if bundled_clang.is_file() {
+        (bundled_clang, false)
+    } else if let Ok(cc_env) = std::env::var("CC") {
+        (PathBuf::from(cc_env), true)
+    } else {
+        (PathBuf::from("cc"), true)
+    };
+    let mut cflags = spec.c_flags.clone();
     if !custom_cc {
-        cflags.push("--sysroot".to_string());
-        cflags.push(sysroot.to_string_lossy().to_string());
-        cflags.push("-nostdinc".to_string());
-        cflags.push("-isystem".to_string());
-        cflags.push(sysroot.join("include/clang").to_string_lossy().to_string());
+        cflags.extend(
+            spec.internal_c_flags
+                .iter()
+                .map(|f| f.replace(ROOT_SENTINEL, &sysroot_str)),
+        );
     }
     let mut link_flags = vec![
         "-L".to_string(),
         sysroot.join("lib/lean").to_string_lossy().to_string(),
     ];
     if !custom_cc {
-        link_flags.extend([
-            "--sysroot".to_string(),
-            sysroot.to_string_lossy().to_string(),
-            "-L".to_string(),
-            sysroot.join("lib").to_string_lossy().to_string(),
-            "-L".to_string(),
-            sysroot.join("lib/glibc").to_string_lossy().to_string(),
-            "-lc".to_string(),
-            "-lc_nonshared".to_string(),
-            "-Wl,--as-needed".to_string(),
-            "-l:ld.so".to_string(),
-            "-Wl,--no-as-needed".to_string(),
-            "-lpthread_nonshared".to_string(),
-        ]);
+        link_flags.extend(
+            spec.internal_linker_flags
+                .iter()
+                .map(|f| f.replace(ROOT_SENTINEL, &sysroot_str)),
+        );
     }
-    link_flags.extend([
-        "-Wl,--as-needed".to_string(),
-        "-Wl,-Bstatic".to_string(),
-        "-lgmp".to_string(),
-        "-lunwind".to_string(),
-        "-luv".to_string(),
-        "-lssl".to_string(),
-        "-lcrypto".to_string(),
-        "-Wl,-Bdynamic".to_string(),
-        "-Wl,--no-as-needed".to_string(),
-        "-fuse-ld=lld".to_string(),
-        "-Wl,-Bstatic".to_string(),
-        "-lc++".to_string(),
-        "-lc++abi".to_string(),
-        "-Wl,-Bdynamic".to_string(),
-        "-Wl,--as-needed".to_string(),
-        "-lLake_shared".to_string(),
-        "-Wl,--no-as-needed".to_string(),
-        "-Wl,-Bsymbolic".to_string(),
-        "-Wl,--as-needed".to_string(),
-        "-lgmp".to_string(),
-        "-luv".to_string(),
-        "-lssl".to_string(),
-        "-lcrypto".to_string(),
-        "-lpthread".to_string(),
-        "-ldl".to_string(),
-        "-lrt".to_string(),
-        "-Wl,--no-as-needed".to_string(),
-        "-Wl,--gc-sections".to_string(),
-        "-lm".to_string(),
-        "-ldl".to_string(),
-        "-pthread".to_string(),
-    ]);
-    Ok((cc, cflags, link_flags, custom_cc))
+    link_flags.extend(spec.link_shared_flags.iter().cloned());
+    Ok((cc, cflags, link_flags, spec))
 }
 
 fn write_file_atomic(dst_p: &Path, content: &[u8]) -> Result<()> {
@@ -9560,7 +9692,7 @@ fn build_module_co_export(cfg: &ProjectConfig, node: &ModuleNode) -> Result<Path
         anyhow::bail!("`.c.o.export` path `{}` has no parent", co_path.display());
     };
     fs::create_dir_all(parent)?;
-    let (cc, cflags, _link_flags, _custom_cc) = lake_cc_and_flags(cfg)?;
+    let (cc, cflags, _link_flags, toolchain_native) = lake_cc_and_flags(cfg)?;
     let sysroot = cfg
         .lean_bin
         .parent()
@@ -9619,15 +9751,7 @@ fn build_module_co_export(cfg: &ProjectConfig, node: &ModuleNode) -> Result<Path
         .trim_start_matches('v');
     let lean_cap = format!("Lean {}, commit {}", ver_short, cfg.lean_githash);
     let lean_gh_h = lake_hash_bytes(cfg.lean_githash.as_bytes());
-    let platform = std::env::consts::ARCH.to_string()
-        + "-"
-        + if cfg!(target_os = "linux") {
-            "unknown-linux-gnu"
-        } else if cfg!(target_os = "macos") {
-            "apple-darwin"
-        } else {
-            std::env::consts::OS
-        };
+    let platform = toolchain_native.target.clone();
     let platform_h = lake_hash_bytes(platform.as_bytes());
     let trace_args = ["-O3", "-DNDEBUG", "-DLEAN_EXPORTING"];
     let trace_args_cap = format!("traceArgs: #[{}]", trace_args.join(", "));
@@ -9656,6 +9780,7 @@ fn build_module_co_export(cfg: &ProjectConfig, node: &ModuleNode) -> Result<Path
 
 fn build_shared_object(
     cfg: &ProjectConfig,
+    dag: &ModuleDag,
     so_path: &Path,
     link_objs: &[PathBuf],
     link_libs: &[PathBuf],
@@ -9664,43 +9789,106 @@ fn build_shared_object(
         anyhow::bail!("Shared object path `{}` has no parent", so_path.display());
     };
     fs::create_dir_all(parent)?;
-    let (cc, _cflags, link_flags, _custom_cc) = lake_cc_and_flags(cfg)?;
+    let (cc, _cflags, link_flags, toolchain_native) = lake_cc_and_flags(cfg)?;
     let mut rsp_args: Vec<String> = link_objs
         .iter()
         .map(|p| p.to_string_lossy().to_string())
         .collect();
+    if toolchain_native.is_windows {
+        let mut by_path: HashMap<PathBuf, &SharedLibSpec> = HashMap::new();
+        for sl in &dag.shared_libs {
+            by_path.insert(sl.path.clone(), sl);
+        }
+        let mut mod_by_dynlib: HashMap<PathBuf, &ModuleNode> = HashMap::new();
+        for n in dag.nodes.values() {
+            if let Some(so_p) = module_dynlib_so_path(n) {
+                mod_by_dynlib.insert(so_p, n);
+            }
+        }
+        let mut visited: HashSet<PathBuf> = HashSet::new();
+        let mut order: Vec<PathBuf> = Vec::new();
+        fn mk_link_order(
+            dag: &ModuleDag,
+            by_path: &HashMap<PathBuf, &SharedLibSpec>,
+            mod_by_dynlib: &HashMap<PathBuf, &ModuleNode>,
+            p: &Path,
+            visiting: &mut HashSet<PathBuf>,
+            visited: &mut HashSet<PathBuf>,
+            order: &mut Vec<PathBuf>,
+        ) -> Result<()> {
+            order.push(p.to_path_buf());
+            if visited.contains(p) {
+                return Ok(());
+            }
+            if !visiting.insert(p.to_path_buf()) {
+                anyhow::bail!("library dependency cycle involving `{}`", p.display());
+            }
+            visited.insert(p.to_path_buf());
+            let deps = if let Some(sl) = by_path.get(p) {
+                compute_shared_lib_link_libs(dag, sl)
+            } else if let Some(mn) = mod_by_dynlib.get(p) {
+                compute_module_dynlib_link_libs(dag, mn)
+            } else {
+                Vec::new()
+            };
+            for dep_p in deps {
+                mk_link_order(
+                    dag,
+                    by_path,
+                    mod_by_dynlib,
+                    &dep_p,
+                    visiting,
+                    visited,
+                    order,
+                )?;
+            }
+            visiting.remove(p);
+            Ok(())
+        }
+        for p in link_libs {
+            let mut visiting = HashSet::new();
+            mk_link_order(
+                dag,
+                &by_path,
+                &mod_by_dynlib,
+                p,
+                &mut visiting,
+                &mut visited,
+                &mut order,
+            )?;
+        }
+        for p in &order {
+            if let Some(dir) = p.parent() {
+                rsp_args.push(format!("-L{}", dir.display()));
+            }
+            if let Some(sl) = by_path.get(p) {
+                rsp_args.push(format!("-l{}", sl.stem));
+            } else if let Some(mn) = mod_by_dynlib.get(p) {
+                let stem = lean_mk_module_initialization_stem(&mn.module_name, Some(&mn.pkg_name));
+                rsp_args.push(format!("-l{}", stem));
+            } else if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                let name = if toolchain_native.is_windows {
+                    stem
+                } else {
+                    stem.strip_prefix("lib").unwrap_or(stem)
+                };
+                rsp_args.push(format!("-l{}", name));
+            }
+        }
+    }
     rsp_args.extend(link_flags);
     let rsp_path = PathBuf::from(format!("{}.rsp", so_path.display()));
     write_rsp_file(&rsp_path, &rsp_args)?;
+    let ext = toolchain_native.shared_lib_ext();
     let pid = std::process::id();
     let seq = crate::pack::next_tmp_id();
-    let tmp_so = parent.join(format!(".turbo_tmp_so_{}_{}.so", pid, seq));
+    let tmp_so = parent.join(format!(".turbo_tmp_so_{}_{}.{}", pid, seq, ext));
     let _ = fs::remove_file(&tmp_so);
     let mut cmd = Command::new(&cc);
     cmd.arg("-shared")
         .arg("-o")
         .arg(&tmp_so)
         .arg(format!("@{}", rsp_path.display()));
-    for p in link_libs {
-        if let Some(dir) = p.parent() {
-            cmd.arg("-L").arg(dir);
-            if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
-                cmd.arg(format!("-Wl,-rpath,{}", dir.display()));
-            }
-        }
-        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-            let l_arg = if let Some(stripped) = stem.strip_prefix("lib") {
-                format!("-l{}", stripped)
-            } else if let Some(fname) = p.file_name().and_then(|s| s.to_str()) {
-                format!("-l:{}", fname)
-            } else {
-                p.to_string_lossy().to_string()
-            };
-            cmd.arg(l_arg);
-        } else {
-            cmd.arg(p);
-        }
-    }
     let out = cmd.output().with_context(|| {
         let _ = fs::remove_file(&tmp_so);
         format!(
@@ -9758,23 +9946,8 @@ fn build_shared_object(
         .trim_start_matches('v');
     let lean_cap = format!("Lean {}, commit {}", ver_short, cfg.lean_githash);
     let lean_gh_h = lake_hash_bytes(cfg.lean_githash.as_bytes());
-    let platform = std::env::consts::ARCH.to_string()
-        + "-"
-        + if cfg!(target_os = "linux") {
-            "unknown-linux-gnu"
-        } else if cfg!(target_os = "macos") {
-            "apple-darwin"
-        } else {
-            std::env::consts::OS
-        };
+    let platform = toolchain_native.target.clone();
     let platform_h = lake_hash_bytes(platform.as_bytes());
-    let ext = if cfg!(target_os = "macos") {
-        "dylib"
-    } else if cfg!(target_os = "windows") {
-        "dll"
-    } else {
-        "so"
-    };
     let inputs = serde_json::json!([
         ["linkObjs", obj_entries],
         ["linkLibs", link_libs_json],
@@ -9815,7 +9988,7 @@ fn build_wave_native_artifacts(
             if let Some(so_path) = module_dynlib_so_path(node) {
                 let co_path = module_co_export_path(node);
                 let link_libs = compute_module_dynlib_link_libs(dag, node);
-                build_shared_object(cfg, &so_path, &[co_path], &link_libs)?;
+                build_shared_object(cfg, dag, &so_path, &[co_path], &link_libs)?;
             }
         }
     }
@@ -9844,7 +10017,7 @@ fn build_wave_native_artifacts(
             }
         }
         let link_libs = compute_shared_lib_link_libs(dag, sl);
-        build_shared_object(cfg, &sl.path, &link_objs, &link_libs)?;
+        build_shared_object(cfg, dag, &sl.path, &link_objs, &link_libs)?;
         built_shared_libs.insert(key);
     }
     Ok(())
@@ -13891,6 +14064,32 @@ globs = ["Down.+"]
                     "Pre/{m}.c.o.export must be materialized"
                 );
             }
+            let pre_cfg = resolve_project_config(&pre_proj).unwrap();
+            let tc_spec = query_toolchain_native_spec(&pre_cfg.lean_bin).unwrap();
+            assert!(!tc_spec.target.is_empty());
+            assert!(tc_spec
+                .c_flags
+                .iter()
+                .any(|f| f == "-Wno-unused-command-line-argument"));
+            let sh_ext = tc_spec.shared_lib_ext();
+            let native_facet_paths = [
+                ".lake/build/ir/Pre/Base.c.o.export".to_string(),
+                format!(".lake/build/lib/lean/ws9__pre_Pre_Base.{sh_ext}"),
+                format!(".lake/build/lib/libws9__pre_Pre.{sh_ext}"),
+            ];
+            let ours_native_traces: Vec<serde_json::Value> = native_facet_paths
+                .iter()
+                .map(|rel| {
+                    serde_json::from_slice(
+                        &fs::read(pre_proj.join(format!("{rel}.trace"))).unwrap(),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let ours_native_rsps: Vec<String> = native_facet_paths[1..]
+                .iter()
+                .map(|rel| fs::read_to_string(pre_proj.join(format!("{rel}.rsp"))).unwrap())
+                .collect();
             let pre_base_trace: serde_json::Value = serde_json::from_slice(
                 &fs::read(pre_proj.join(".lake/build/lib/lean/Pre/Base.trace")).unwrap(),
             )
@@ -13940,6 +14139,27 @@ globs = ["Down.+"]
             assert_eq!(pre_base_trace["outputs"], lake_pre_base_trace["outputs"]);
             assert_eq!(pre_top_trace["outputs"], lake_pre_top_trace["outputs"]);
             assert_eq!(down_use_trace["outputs"], lake_down_use_trace["outputs"]);
+            for (idx, rel) in native_facet_paths.iter().enumerate() {
+                let lake_trace: serde_json::Value = serde_json::from_slice(
+                    &fs::read(pre_proj.join(format!("{rel}.trace"))).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    ours_native_traces[idx]["depHash"], lake_trace["depHash"],
+                    "native facet depHash mismatch on {rel}"
+                );
+                assert_eq!(
+                    ours_native_traces[idx]["inputs"], lake_trace["inputs"],
+                    "native facet inputs mismatch on {rel}"
+                );
+            }
+            for (idx, rel) in native_facet_paths[1..].iter().enumerate() {
+                let lake_rsp = fs::read_to_string(pre_proj.join(format!("{rel}.rsp"))).unwrap();
+                assert_eq!(
+                    ours_native_rsps[idx], lake_rsp,
+                    "native shared-lib .rsp mismatch vs Lake on {rel}"
+                );
+            }
         }
         let _ = fs::remove_dir_all(&dir);
     }
