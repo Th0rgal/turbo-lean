@@ -224,7 +224,9 @@ def handleFastWorkerRequest? (engineName line : String) : Option String :=
       | none =>
         some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"invalid_lnir_wire\"}"
       | some m =>
-        if m.decls.any (·.assurance == .unsupported) then
+        if hasRpcBoolField line "canonical_benchmark" true || hasRpcBoolField line "fastcheck_sample" true then
+          some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"conflicting_input_selectors\"}"
+        else if m.decls.any (·.assurance == .unsupported) then
           some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"unsupported_assurance_level_decl\"}"
         else if let some dName := m.findRcAdtDecl? then
           some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"unsupported_rc_adt_decl:{escapeJsonWorker dName}\"}"
@@ -234,6 +236,8 @@ def handleFastWorkerRequest? (engineName line : String) : Option String :=
     | none =>
       if invalidRpcWire line then
         some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"invalid_lnir_wire\"}"
+      else if hasRpcBoolField line "canonical_benchmark" true && hasRpcBoolField line "fastcheck_sample" true then
+        some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"conflicting_input_selectors\"}"
       else if !hasRpcBoolField line "canonical_benchmark" true && !hasRpcBoolField line "fastcheck_sample" true then
         some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"explicit_input_wire_required\"}"
       else
@@ -252,6 +256,10 @@ def handleWorkerRequest (engineName : String) (cache : WorkerCache) (line : Stri
     let customModOpt := rawWireOpt.bind LNIRModule.fromWire?
     if invalidRpcWire line || (rawWireOpt.isSome && customModOpt.isNone) then
       s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"invalid_lnir_wire\"}"
+    else if (if rawWireOpt.isSome then 1 else 0) +
+        (if hasRpcBoolField line "canonical_benchmark" true then 1 else 0) +
+        (if hasRpcBoolField line "fastcheck_sample" true then 1 else 0) > 1 then
+      s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"conflicting_input_selectors\"}"
     else if (customModOpt.map (fun m => m.decls.any (·.assurance == .unsupported))).getD false then
       s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"unsupported_assurance_level_decl\"}"
     else if !["verify-certs", "validate-tv"].contains method &&

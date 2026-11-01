@@ -1023,11 +1023,24 @@ def probe_rc_drop (sel seed delta : UInt64) : UInt64 :=
             conflicts = [
                 (engines["full_bin"], ["emit-cabi-bindings", "--emit-header", str(conflict_h), "--lean", str(src), "--input", str(scalar_src)]),
                 (engines["full_bin"], ["emit-cabi-bindings", "--emit-header", str(conflict_h), str(src), "--lnir", str(scalar_wire)]),
+                (engines["full_bin"], ["emit-cabi-bindings", "--emit-header", str(conflict_h), "--lean", str(src), "--canonical-benchmark"]),
                 (engines["full_bin"], ["emit-cabi-bindings", "--emit-header", str(conflict_h), "--input", str(scalar_src), "--input", str(src)]),
                 (engines["full_bin"], ["compile-c-abi", "--emit-header", str(conflict_h), "--lean", str(src), "--input", str(scalar_src)]),
                 (engines["full_bin"], ["compile-static-lib", "--lnir", str(scalar_wire), str(src), "-o", str(conflict_h)]),
                 (engines["full_bin"], ["--c-abi", "--lnir", str(scalar_wire), "--input", str(src), "-o", str(conflict_h)]),
+                (engines["full_bin"], ["--emit-c-abi", "--lean", str(src), "--canonical-benchmark", "-o", str(conflict_h)]),
                 (engines["full_bin"], ["compile-llvm", "--lnir", str(scalar_wire), "--lean", str(src), "-o", str(conflict_h)]),
+                (engines["full_bin"], ["compile-mlir", "--lnir", str(scalar_wire), str(src), "-o", str(conflict_h)]),
+                (engines["full_bin"], ["compile-ptx", "--lean", str(src), "--canonical-benchmark", "-o", str(conflict_h)]),
+                (engines["full_bin"], ["compile-metal", "--lean", str(src), "--fastcheck-sample", "-o", str(conflict_h)]),
+                (engines["full_bin"], ["compile-fastcheck", "--lean", str(src), "--fastcheck-sample", "-o", str(conflict_h)]),
+                (engines["full_bin"], ["compile-hybrid", "--lnir", str(scalar_wire), "--input", str(src), "-o", str(conflict_h)]),
+                (engines["full_bin"], ["superopt", "--lnir", str(scalar_wire), "--canonical-benchmark", "-o", str(conflict_h)]),
+                (engines["full_bin"], ["plugins", "--lnir", str(scalar_wire), "--canonical-benchmark", "-o", str(conflict_h)]),
+                (engines["full_bin"], ["verify-certs", "--lnir", str(scalar_wire), "--input", str(src), "-o", str(conflict_h)]),
+                (engines["full_bin"], ["validate-tv", "--lnir", str(scalar_wire), "--input", str(src), "-o", str(conflict_h)]),
+                (engines["full_bin"], ["emit-lnir", "--lnir", str(scalar_wire), str(src), "-o", str(conflict_h)]),
+                (engines["full_bin"], ["eval-lnir", "--lnir", str(scalar_wire), str(src)]),
                 (engines["full_bin"], ["build-exe", str(src), "--input", str(scalar_src), "-o", str(conflict_h)]),
                 (engines["core_bin"], ["emit-cabi-bindings", "--signatures-only", "--emit-header", str(conflict_h),
                                        "--lean", str(scalar_src), str(src)]),
@@ -1039,6 +1052,18 @@ def probe_rc_drop (sel seed delta : UInt64) : UInt64 :=
                 self.assertIn("Conflicting input selectors", rej.stderr, cmd)
                 self.assertFalse(conflict_h.exists(), cmd)
                 self.assertEqual([p.name for p in tmp.iterdir() if p.name.startswith("conflict")], [], cmd)
+            w_rej = subprocess.run(
+                [engines["core_bin"], "worker"],
+                input=(
+                    '{"id":1,"method":"compile-llvm","canonical_benchmark":true,"fastcheck_sample":true}\n'
+                    '{"id":2,"method":"batch-fastcheck","canonical_benchmark":true,"fastcheck_sample":true}\n'
+                    '{"id":3,"method":"exit"}\n'
+                ),
+                capture_output=True, text=True, check=True,
+            )
+            w_rows = [json.loads(ln) for ln in w_rej.stdout.splitlines() if ln.strip()]
+            self.assertEqual(w_rows[0]["error"], "conflicting_input_selectors")
+            self.assertEqual(w_rows[1]["error"], "conflicting_input_selectors")
             # single-selector RC-ADT input is still rejected; single-selector scalar input still works
             for sel in (["--lean", str(src)], ["--input", str(src)], [str(src)]):
                 rej = subprocess.run([engines["full_bin"], "emit-cabi-bindings", "--emit-header", str(conflict_h), *sel],
@@ -1059,6 +1084,7 @@ def probe_rc_drop (sel seed delta : UInt64) : UInt64 :=
                 (["compile-c-abi", "--signatures-only", "--emit-header", str(tmp / "cs.h"), str(src)], tmp / "cs.h"),
                 (["compile-static-lib", str(src), "-o", str(tmp / "s.a"), "--emit-header", str(tmp / "s.h")], tmp / "s.a"),
                 (["compile-static-lib", str(SPEC_LEAN), "-o", str(tmp / "spec.a")], tmp / "spec.a"),
+                (["--c-abi", str(src), "-o", str(tmp / "cabi.c")], tmp / "cabi.c"),
             ]
             for cmd, out in core_rejects:
                 rej = subprocess.run([engines["core_bin"], *cmd], capture_output=True, text=True)

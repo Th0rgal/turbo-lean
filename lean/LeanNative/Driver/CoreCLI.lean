@@ -77,22 +77,26 @@ structure InputSel where
 /-- A `.lean` source to elaborate / extract signatures from (`--lnir` always parses LNIR wire/JSON). -/
 def InputSel.isLeanSource (s : InputSel) : Bool := s.flag != "--lnir" && s.path.endsWith ".lean"
 
-/-- Every input selector in `args`, in order (`"<positional>"` for a bare path). -/
+def moduleSelectorFlags : List String := ["--canonical-benchmark", "--canonical", "--fastcheck-sample", "--slot-regression"]
+
+/-- Every input selector in `args`, in order (`"<positional>"` for a bare path; explicit module-selector flags count too). -/
 def collectInputSelectors : List String → List (String × String)
   | [] => []
   | f :: v :: rest =>
     if ["--lnir", "--input", "--lean"].contains f then (f, v) :: collectInputSelectors rest
+    else if moduleSelectorFlags.contains f then (f, "") :: collectInputSelectors (v :: rest)
     else if valueTakingFlags.contains f || (f == "--opt" && v.startsWith "-O") then collectInputSelectors rest
     else if f.startsWith "-" then collectInputSelectors (v :: rest) else ("<positional>", f) :: collectInputSelectors (v :: rest)
-  | [a] => if a.startsWith "-" then [] else [("<positional>", a)]
+  | [a] => if moduleSelectorFlags.contains a then [(a, "")] else if a.startsWith "-" then [] else [("<positional>", a)]
 
-/-- Resolve the input ONCE. More than one selector (any mix of `--lnir` / `--input` / `--lean` / positional, including
-    a repeated one) is a hard error, so extraction and validation can never read different inputs. -/
+/-- Resolve the input ONCE; >1 selector (any mix of `--lnir` / `--input` / `--lean` / positional / module-flag) is a hard error. -/
 def resolveInput (args : List String) : IO InputSel := do
   match collectInputSelectors args with
   | [] => return {}
   | [(flag, path)] => return { flag, path }
-  | sels => throw <| IO.userError s!"[lean-native] Conflicting input selectors ({", ".intercalate (sels.map fun (f, p) => s!"{f} {p}")}): pass exactly one of --lnir / --input / --lean / <positional>"
+  | sels =>
+    let fmt := sels.map fun (f, p) => if p.isEmpty then f else s!"{f} {p}"
+    throw <| IO.userError s!"[lean-native] Conflicting input selectors ({", ".intercalate fmt}): pass exactly one of --lnir / --input / --lean / <positional>"
 
 structure CoreCLIOptions where
   inputPath : String := ""
@@ -194,10 +198,11 @@ def rejectLeanSourceWithoutFrontend (tag cmd : String) (elaborateHook? : Option 
   if elaborateHook?.isNone && sel.isLeanSource then
     throw <| IO.userError s!"[{tag}] {cmd}: cannot apply the Stage 1D (RC-ADT) gate to '{sel.path}' without the elaborating frontend; use full 'lean-native'"
 
-def runEmitCAbiBindings (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
+def runEmitCAbiBindings (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule))
+    (args : List String) (preloaded? : Option (InputSel × LNIRModule) := none) : IO UInt32 := do
   validateValueTakingFlags args
   -- one resolved input feeds BOTH signature extraction and the Stage 1D / A_L0 validation below
-  let sel ← resolveInput args
+  let sel ← match preloaded? with | some (s, _) => pure s | none => resolveInput args
   let leanPath := sel.path
   let hdrPath := findFlagValue args "--emit-header" (findFlagValue args "--header" "")
   let rsPath := findFlagValue args "--emit-rust" (findFlagValue args "--rust" "")
@@ -213,6 +218,7 @@ def runEmitCAbiBindings (tag : String) (elaborateHook? : Option (String → Targ
   -- bindings come only from `--signatures-only` (scalar exported signatures, recorded as ungated).
   if isLean && elaborateHook?.isNone && !sigOnly then
     throw <| IO.userError s!"[{tag}] Cannot apply the Stage 1D (RC-ADT) gate to '{leanPath}' without the elaborating frontend; use full 'lean-native', or pass --signatures-only for scalar exported-signature bindings"
+  let loadMod : IO LNIRModule := match preloaded? with | some (_, m) => pure m | none => loadInputModule elaborateHook? args (sel? := some sel)
   let (sigs, guards, srcLabel) ←
     if isLean && sigOnly then
       if !(← System.FilePath.pathExists leanPath) then throw <| IO.userError s!"[lean-native] Input file '{leanPath}' does not exist"
@@ -224,10 +230,10 @@ def runEmitCAbiBindings (tag : String) (elaborateHook? : Option (String → Targ
       let (s, g) := extractLeanSourceCAbiAndGuards (← readLeanSourceExpandingUmbrella leanPath)
       -- C4: (only reachable with the elaborating frontend) ingest first so a Stage 1D (RC-ADT) decl is a hard error
       -- before any prototype is emitted, even when the source signatures alone would have produced a header.
-      let m ← loadInputModule elaborateHook? args (sel? := some sel)
+      let m ← loadMod
       pure (if s.isEmpty then moduleToCAbiSigs (runDefaultPipeline m).1 else s, g, leanPath)
     else
-      let m ← loadInputModule elaborateHook? args (sel? := some sel)
+      let m ← loadMod
       pure (moduleToCAbiSigs (runDefaultPipeline m).1, [], if leanPath.isEmpty then m.moduleName else leanPath)
   let note? := if sigOnly then some signaturesOnlyMarker else none
   let hdrText := emitCAbiHeaderFromSigs sigs note?
@@ -249,22 +255,26 @@ def runEmitCAbiBindings (tag : String) (elaborateHook? : Option (String → Targ
 
 def runCompileMode (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   let opts ← parseCoreCLIOptions args
+  let sel ← resolveInput args
+  if opts.emitCABI then rejectLeanSourceWithoutFrontend tag "compile" elaborateHook? args
   let wasmSimd128 := hasFlag args "--wasm-simd128"
-  let baseMod ← loadInputModule elaborateHook? args opts.emitCABI
+  let baseMod ← loadInputModule elaborateHook? args opts.emitCABI (sel? := some sel)
   if hasTelemetryOptIn args then
     let telCfg ← TelemetryConfig.probe args
     let _ ← emitModuleTelemetryEvents telCfg .x86_64 false baseMod
   let (optMod, _) := if opts.isBaseline then (baseMod, []) else runDefaultPipeline baseMod
-  if !(findFlagValue args "--emit-header" (findFlagValue args "--emit-rust" (findFlagValue args "--emit-fixtures" ""))).isEmpty then
-    let _ ← runEmitCAbiBindings tag elaborateHook? args
+  if !opts.emitCABI && !opts.emitPTX && !opts.emitMetal then
+    if let some (dName, callee) := findUnsupportedLLVMCall? optMod then
+      throw <| IO.userError s!"[{tag}] Unsupported external or non-scalar call '{callee}' in '{dName}'"
+  if ["--emit-header", "--header", "--emit-rust", "--rust", "--emit-swift", "--swift",
+      "--emit-modulemap", "--modulemap", "--emit-fixtures", "--fixtures"].any (fun f => !(findFlagValue args f "").isEmpty) then
+    let _ ← runEmitCAbiBindings tag elaborateHook? args (preloaded? := some (sel, baseMod))
   if opts.emitCABI then
     writeOrPrint opts.outputPath (LeanNative.Backend.emitFastCheckCABI optMod)
       (some s!"[{tag}] Wrote Zero-Boxing C-ABI SIMD FastCheck & Routing kernel to {opts.outputPath}")
   else if opts.emitPTX then writeOrPrint opts.outputPath (emitPTXModule optMod opts.smArch)
   else if opts.emitMetal then writeOrPrint opts.outputPath (emitMetalModule optMod)
   else
-    if let some (dName, callee) := findUnsupportedLLVMCall? optMod then
-      throw <| IO.userError s!"[{tag}] Unsupported external or non-scalar call '{callee}' in '{dName}'"
     writeOrPrint opts.outputPath (if opts.isBaseline then emitLLVMBaseline optMod opts.arch none wasmSimd128 else emitLLVMOptimized optMod opts.arch none wasmSimd128)
 
 def runCompileLLVM (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
@@ -967,9 +977,9 @@ def dispatchSharedCommand (tag : String) (elaborateHook? : Option (String → Ta
        "validate-tv", "eval-lnir", "emit-lnir", "emit-cabi-bindings", "compile-c-abi",
        "--c-abi", "--emit-c-abi"].contains (args.headD "") || isCabiFallback
   let sel ← if readsInput then resolveInput effArgs else pure {}
-  if readsInput && sel.path.isEmpty &&
-      !(effArgs.any (["--canonical-benchmark", "--fastcheck-sample"].contains ·) ||
-        (args.head? == some "compile-llvm" && effArgs.contains "--slot-regression")) then
+  if readsInput && sel.flag == "--slot-regression" && args.head? != some "compile-llvm" then
+    throw <| IO.userError "[lean-native] --slot-regression is only supported by compile-llvm"
+  if readsInput && sel.flag.isEmpty && sel.path.isEmpty then
     throw <| IO.userError "[lean-native] Explicit input required (or --canonical-benchmark / --fastcheck-sample)"
   match args with
   | "audit-axioms" :: rest       => some <$> runAuditAxioms rest
@@ -988,8 +998,7 @@ def dispatchSharedCommand (tag : String) (elaborateHook? : Option (String → Ta
   | "compile-fastcheck" :: rest => some <$> runCompileFastCheck tag elaborateHook? rest
   | "compile-hybrid" :: rest    => some <$> runCompileHybrid tag elaborateHook? rest
   | "compile" :: rest           => some <$> runCompileMode tag elaborateHook? rest
-  | "--c-abi" :: _              => some <$> runCompileMode tag elaborateHook? args
-  | "--emit-c-abi" :: _         => some <$> runCompileMode tag elaborateHook? args
+  | "--c-abi" :: _ | "--emit-c-abi" :: _ => some <$> runCompileMode tag elaborateHook? args
   | "--self-test" :: _          => some <$> runCoreSelfTest tag
   | "superopt" :: rest          => some <$> runSuperopt elaborateHook? rest
   | "plugins" :: rest           => some <$> runPlugins elaborateHook? rest
@@ -1000,10 +1009,6 @@ def dispatchSharedCommand (tag : String) (elaborateHook? : Option (String → Ta
   | "validate-tv" :: rest       => some <$> runValidateTV elaborateHook? rest
   | "emit-lnir" :: rest         => some <$> runEmitLNIR tag elaborateHook? rest
   | "worker" :: _               => some <$> runWorker tag
-  | _                           =>
-    if hasFlag args "--c-abi" || hasFlag args "--emit-c-abi" then
-      some <$> runCompileMode tag elaborateHook? args
-    else
-      return none
+  | _ => if hasFlag args "--c-abi" || hasFlag args "--emit-c-abi" then some <$> runCompileMode tag elaborateHook? args else return none
 
 end LeanNative.Driver.CoreCLI
