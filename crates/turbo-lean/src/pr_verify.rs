@@ -157,7 +157,10 @@ pub(crate) fn fetch_git_blobs_batch(
     if repo_rels.is_empty() {
         return Ok(out_map);
     }
-    anyhow::ensure!(!base_ref.starts_with('-'), "Invalid git revision `{base_ref}`");
+    anyhow::ensure!(
+        !base_ref.starts_with('-'),
+        "Invalid git revision `{base_ref}`"
+    );
     let wanted: std::collections::HashSet<&str> = repo_rels.iter().map(String::as_str).collect();
     let tree = crate::trusted_tools::git(repo_root)?
         .arg("-C")
@@ -1118,16 +1121,18 @@ fn compute_source_only_import_digests(
         }
         let rel_slash = crate::module_builder::module_name_to_rel_slash(&mod_name);
         let resolved_src_and_pkg: Option<(PathBuf, Option<String>)> = if let Some(cfg) = cfg_opt {
-            if let Some(spec) =
-                crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, &mod_name)
-            {
+            if let Some(spec) = crate::module_builder::resolve_importable_module_in_package(
+                &cfg.root_pkg,
+                true,
+                &mod_name,
+            ) {
                 Some((spec.src_path, Some(spec.pkg_config_digest)))
             } else {
                 let mut dep_matches = Vec::new();
                 for dp in &cfg.dep_pkgs {
-                    if let Some(spec) =
-                        crate::module_builder::resolve_module_in_package(dp, false, &mod_name)
-                    {
+                    if let Some(spec) = crate::module_builder::resolve_importable_module_in_package(
+                        dp, false, &mod_name,
+                    ) {
                         dep_matches.push(spec);
                     }
                 }
@@ -2352,6 +2357,7 @@ fn resolve_untrusted_pr_project_config(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "pr-project".to_string());
     let root_pkg = crate::module_builder::PackageConfig {
+        base_name: pkg_name.clone(),
         name: pkg_name,
         pkg_root: canon_dir.to_path_buf(),
         config_file_kind: "bare".to_string(),
@@ -2365,6 +2371,7 @@ fn resolve_untrusted_pr_project_config(
         weak_lean_args: Vec::new(),
         lean_options: BTreeMap::new(),
         precompile_modules: false,
+        platform_independent: None,
         default_targets: Vec::new(),
         libs: Vec::new(),
         exes: Vec::new(),
@@ -4385,20 +4392,23 @@ pub fn run_pr_verify_command(
                 hdr.header_error.is_some()
                     || hdr.imports.iter().any(|m| {
                         let rel_slash = crate::module_builder::module_name_to_rel_slash(m);
-                        let in_pkg_or_project = crate::module_builder::resolve_module_in_package(
-                            &cfg.root_pkg,
-                            true,
-                            m,
-                        )
-                        .is_some()
-                            || cfg.dep_pkgs.iter().any(|dp| {
-                                crate::module_builder::resolve_module_in_package(dp, false, m)
-                                    .is_some()
-                            })
-                            || crate::lake_build::resolve_project_lean_source(
-                                &canon_dir, &rel_slash,
+                        let in_pkg_or_project =
+                            crate::module_builder::resolve_importable_module_in_package(
+                                &cfg.root_pkg,
+                                true,
+                                m,
                             )
-                            .is_some();
+                            .is_some()
+                                || cfg.dep_pkgs.iter().any(|dp| {
+                                    crate::module_builder::resolve_importable_module_in_package(
+                                        dp, false, m,
+                                    )
+                                    .is_some()
+                                })
+                                || crate::lake_build::resolve_project_lean_source(
+                                    &canon_dir, &rel_slash,
+                                )
+                                .is_some();
                         in_pkg_or_project
                             || !crate::module_builder::is_builtin_toolchain_module(
                                 &cfg.toolchain_lib_lean,
