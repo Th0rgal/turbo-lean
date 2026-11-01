@@ -999,26 +999,26 @@ fn ensure_blob_in_shared_cas(
     };
     let shared_dest = shared_dir.join(bh);
     if let Ok((mut f, meta)) = crate::db::open_regular_nofollow(&shared_dest) {
-        use std::os::unix::fs::PermissionsExt;
-        let mut buf = Vec::with_capacity(meta.len().min(64 * 1024 * 1024) as usize);
-        if f.read_to_end(&mut buf).is_ok()
-            && buf.len() as u64 == expected_len
-            && blake3::hash(&buf).to_hex().as_str() == bh
-        {
-            if (meta.permissions().mode() & 0o222) != 0 {
-                let mut perms = meta.permissions();
-                perms.set_mode(0o444);
-                let _ = f.set_permissions(perms);
-            }
-            let ok = crate::db::durability_barrier(&f).is_ok()
-                && crate::db::sync_dir(&shared_dir).is_ok();
-            for dir in &created {
-                if crate::db::sync_dir(dir).is_err() {
-                    return false;
+        #[cfg(unix)]
+        let owned = crate::db::is_store_owned_immutable_cas_inode(&f, &meta, bh);
+        #[cfg(not(unix))]
+        let owned = true;
+        if owned {
+            let mut buf = Vec::with_capacity(meta.len().min(64 * 1024 * 1024) as usize);
+            if f.read_to_end(&mut buf).is_ok()
+                && buf.len() as u64 == expected_len
+                && blake3::hash(&buf).to_hex().as_str() == bh
+            {
+                let ok = crate::db::durability_barrier(&f).is_ok()
+                    && crate::db::sync_dir(&shared_dir).is_ok();
+                for dir in &created {
+                    if crate::db::sync_dir(dir).is_err() {
+                        return false;
+                    }
                 }
-            }
-            if ok {
-                return true;
+                if ok {
+                    return true;
+                }
             }
         }
     }
@@ -1849,7 +1849,7 @@ pub fn prestage_blobs_from_shared_cas(
         let dest = store_blobs.join(prefix).join(&b.blob_hash);
         #[cfg(unix)]
         let inode = {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            use std::os::unix::fs::MetadataExt;
             let sync_created_parents = |dirs: &mut Vec<std::path::PathBuf>| {
                 dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
                 dirs.dedup();
@@ -1859,10 +1859,10 @@ pub fn prestage_blobs_from_shared_cas(
             };
             if let Ok((mut f, m)) = crate::db::open_regular_nofollow(&dest) {
                 let mut buf = Vec::with_capacity(m.len().min(64 * 1024 * 1024) as usize);
-                if f.read_to_end(&mut buf).is_ok()
+                if crate::db::is_store_owned_immutable_cas_inode(&f, &m, &b.blob_hash)
+                    && f.read_to_end(&mut buf).is_ok()
                     && buf.len() as u64 == b.size_bytes
                     && blake3::hash(&buf).to_hex().as_str() == b.blob_hash
-                    && (m.permissions().mode() & 0o222) == 0
                 {
                     let durable = crate::db::durability_barrier(&f).is_ok()
                         && crate::db::sync_dir(dest.parent().unwrap_or(&store_blobs)).is_ok();
@@ -1881,19 +1881,6 @@ pub fn prestage_blobs_from_shared_cas(
             }
             let shared_p = shared_blobs.join(prefix).join(&b.blob_hash);
             let shared_p_alt = shared_blobs_shm.join(prefix).join(&b.blob_hash);
-            let ensure_immutable = |p: &Path| {
-                if let Ok((f, m)) = crate::db::open_regular_nofollow(p) {
-                    if (m.permissions().mode() & 0o222) != 0 {
-                        let mut perms = m.permissions();
-                        perms.set_mode(0o444);
-                        let _ = f.set_permissions(perms);
-                    }
-                }
-            };
-            ensure_immutable(&shared_p);
-            if shared_p_alt != shared_p {
-                ensure_immutable(&shared_p_alt);
-            }
             let mut from_alt = false;
             let published_ino = match crate::db::publish_verified_durable_blob(
                 &shared_p,
@@ -2428,13 +2415,14 @@ pub fn import_pack_bytes_with_policy(
             #[cfg(unix)]
             let inode = {
                 use crate::db::{
-                    durability_barrier, open_regular_nofollow, sync_dir, write_blob_atomic,
+                    durability_barrier, is_store_owned_immutable_cas_inode, open_regular_nofollow,
+                    sync_dir, write_blob_atomic,
                 };
-                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                use std::os::unix::fs::MetadataExt;
                 let len = blob_bytes.len() as u64;
                 let existing_intact = (|| -> Option<(fs::File, fs::Metadata)> {
                     let (mut f, m) = open_regular_nofollow(&dest).ok()?;
-                    if m.len() != len || (m.permissions().mode() & 0o222) != 0 {
+                    if m.len() != len || !is_store_owned_immutable_cas_inode(&f, &m, &b.blob_hash) {
                         return None;
                     }
                     let mut buf = Vec::with_capacity(len.min(64 * 1024 * 1024) as usize);
@@ -5338,6 +5326,89 @@ pub(crate) mod tests {
             export_pack_filtered_with_mode(&store_src, true, &empty, &empty, false).is_err(),
             "export must reject symlinked CAS blob"
         );
+
+        // 4. Retained writable descriptor on shared-CAS source across `prestage_blobs_from_shared_cas`:
+        //    Even when a writer holds an already-open writable fd to the shared-CAS blob, mutates it
+        //    after verification (before rename) and again after `prestage_blobs_from_shared_cas`
+        //    returns, the imported destination store blob MUST remain intact on a private inode.
+        #[cfg(unix)]
+        {
+            use std::io::{Seek, Write};
+            use std::os::unix::fs::MetadataExt;
+            let iso_root =
+                std::env::temp_dir().join(format!("turbo_lean_pack_fd_iso_{}", next_tmp_id()));
+            let _ = fs::remove_dir_all(&iso_root);
+            let iso_payload = b"shared-cas-retained-fd-original-bytes".to_vec();
+            let iso_bh = blake3::hash(&iso_payload).to_hex().to_string();
+            let mut iso_mut1 = iso_payload.clone();
+            iso_mut1[0] ^= 0x33;
+            let mut iso_mut2 = iso_payload.clone();
+            iso_mut2[1] ^= 0x77;
+
+            let sp_iso = shared_cas_blobs_dir_for_store(&iso_root)
+                .join(&iso_bh[..2])
+                .join(&iso_bh);
+            fs::create_dir_all(sp_iso.parent().unwrap())?;
+            let _ = fs::remove_file(&sp_iso);
+            let shared_rw = std::sync::Arc::new(std::sync::Mutex::new(
+                fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .read(true)
+                    .write(true)
+                    .open(&sp_iso)?,
+            ));
+            shared_rw.lock().unwrap().write_all(&iso_payload)?;
+            let shared_ino = fs::metadata(&sp_iso)?.ino();
+
+            let rw_hook = std::sync::Arc::clone(&shared_rw);
+            let m1 = iso_mut1.clone();
+            crate::db::set_after_blob_verify_before_rename_hook(std::sync::Arc::new(
+                move |_s, _d| {
+                    if let Ok(mut f) = rw_hook.lock() {
+                        let _ = f.seek(std::io::SeekFrom::Start(0));
+                        let _ = f.write_all(&m1);
+                    }
+                },
+            ));
+            let iso_manifest = PackManifest {
+                format_version: 3,
+                host_arch: "linux-x86_64".to_string(),
+                created_at: 0,
+                actions: vec![],
+                blobs: vec![PackedBlob {
+                    blob_hash: iso_bh.clone(),
+                    kind: "olean".to_string(),
+                    size_bytes: iso_payload.len() as u64,
+                    portable: true,
+                    data_hex_or_base64: vec![],
+                }],
+                ed25519_pubkey: None,
+                ed25519_signature: None,
+            };
+            let staged = prestage_blobs_from_shared_cas(&iso_root, &iso_manifest);
+            crate::db::clear_after_blob_verify_before_rename_hook();
+            assert!(
+                staged.is_some(),
+                "prestage_blobs_from_shared_cas must succeed from verified snapshot"
+            );
+            let dst_blob = iso_root.join("blobs").join(&iso_bh[..2]).join(&iso_bh);
+            assert_ne!(fs::metadata(&dst_blob)?.ino(), shared_ino);
+            assert_eq!(fs::read(&dst_blob)?, iso_payload);
+
+            {
+                let mut f = shared_rw.lock().unwrap();
+                f.seek(std::io::SeekFrom::Start(0))?;
+                f.write_all(&iso_mut2)?;
+            }
+            assert_eq!(
+                fs::read(&dst_blob)?,
+                iso_payload,
+                "retained writable fd on shared CAS must never corrupt prestaged destination CAS blob"
+            );
+            let _ = fs::remove_file(&sp_iso);
+            let _ = fs::remove_dir_all(&iso_root);
+        }
 
         let _ = fs::remove_file(&sp_disk);
         let _ = fs::remove_file(&sp_shm);

@@ -2735,18 +2735,29 @@ impl TurboStore {
                     _ => false,
                 }
             } else {
-                match (fs::symlink_metadata(&src), fs::symlink_metadata(&dst)) {
-                    (Ok(src_meta), Ok(dst_meta)) if src_meta.is_file() && dst_meta.is_file() => {
+                match (open_regular_nofollow(&src), open_regular_nofollow(&dst)) {
+                    (Ok((src_f, src_meta)), Ok((mut dst_f, dst_meta))) => {
+                        let dst_owned =
+                            is_store_owned_immutable_cas_inode(&dst_f, &dst_meta, &out.blob_hash);
                         (src_meta.dev() == dst_meta.dev()
                             && src_meta.ino() == dst_meta.ino()
-                            && (dst_meta.permissions().mode() & 0o222) == 0)
+                            && dst_owned
+                            && is_store_owned_immutable_cas_inode(
+                                &src_f,
+                                &src_meta,
+                                &out.blob_hash,
+                            ))
                             || (src_meta.dev() != dst_meta.dev()
+                                && dst_owned
                                 && src_meta.len() == dst_meta.len()
-                                && (dst_meta.permissions().mode() & 0o222) == 0
-                                && read_regular_nofollow(&dst).is_some_and(|(b, _)| {
-                                    b.len() as u64 == out.size_bytes
+                                && {
+                                    let mut b = Vec::with_capacity(
+                                        dst_meta.len().min(64 * 1024 * 1024) as usize,
+                                    );
+                                    dst_f.read_to_end(&mut b).is_ok()
+                                        && b.len() as u64 == out.size_bytes
                                         && blake3::hash(&b).to_hex().as_str() == out.blob_hash
-                                }))
+                                })
                     }
                     _ => false,
                 }
@@ -2842,6 +2853,29 @@ impl TurboStore {
                     "UPDATE blobs SET inode = ?1, last_accessed = ?2 WHERE blob_hash = ?3",
                     params![meta.ino() as i64, now_unix(), blob_hash],
                 );
+            }
+        } else {
+            #[cfg(unix)]
+            if let Ok(meta) = f.metadata() {
+                if !is_store_owned_immutable_cas_inode(&f, &meta, blob_hash) {
+                    use std::io::Seek;
+                    let _pub_guard = acquire_cas_publication_guard(&self.root)?;
+                    if f.seek(std::io::SeekFrom::Start(0)).is_ok() {
+                        let mut raw = Vec::with_capacity(meta.len().min(64 * 1024 * 1024) as usize);
+                        if f.read_to_end(&mut raw).is_ok()
+                            && blake3::hash(&raw).to_hex().as_str() == blob_hash
+                        {
+                            drop(f);
+                            write_blob_atomic(&self.root, &src, blob_hash, &raw, true)?;
+                            if let Ok((_, new_meta)) = open_regular_nofollow(&src) {
+                                let _ = self.conn.execute(
+                                    "UPDATE blobs SET inode = ?1, last_accessed = ?2 WHERE blob_hash = ?3",
+                                    params![new_meta.ino() as i64, now_unix(), blob_hash],
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
         Ok(src)
@@ -3333,6 +3367,18 @@ impl TurboStore {
                             }
                         }
                         continue;
+                    }
+                    if fname_str.starts_with('.') && fname_str.ends_with(".stgtmp") {
+                        let age_secs = entry
+                            .metadata()
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                            .and_then(|t| t.elapsed().ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(120);
+                        if age_secs < 30 {
+                            continue;
+                        }
                     }
                     if fname_str.starts_with("git_head_tree_")
                         || fname_str.starts_with("project_stat_splits_")
@@ -4272,6 +4318,7 @@ fn open_unique_staging_file(dir: &Path, stem: &str, mode: u32) -> std::io::Resul
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let path = dir.join(format!("{stem}.{}.{seq}.{nanos}.tmp", std::process::id()));
         match OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
             .mode(mode)
@@ -4289,9 +4336,48 @@ fn open_unique_staging_file(dir: &Path, stem: &str, mode: u32) -> std::io::Resul
 }
 
 /// Stage into a unique temporary file `<stage_dir>/<stem>.<pid>.<seq>.<nanos>.tmp`, populate it via
-/// `populate`, `fsync` its bytes, run `publish` to install `dest` (`rename` or `link` + race
-/// resolution), `fsync` `dest`'s parent plus `created` ancestors, and unlink any leftover staging
-/// link on exit.
+/// `populate`, optionally stamp immutable CAS ownership + `chmod 0o444`, `fsync` its bytes, run
+/// `publish` to install `dest` (`rename` or `link` + race resolution), `fsync` `dest`'s parent plus
+/// `created` ancestors, and unlink any leftover staging link on exit.
+fn stage_and_publish_durable_ext<T, P, Pub>(
+    stage_dir: &Path,
+    stem: &str,
+    mode: u32,
+    immutable_cas_hash: Option<&str>,
+    dest: &Path,
+    created: &[PathBuf],
+    populate: P,
+    publish: Pub,
+) -> std::io::Result<T>
+where
+    P: FnOnce(&mut File) -> std::io::Result<()>,
+    Pub: FnOnce(&File, &Path, &Path) -> std::io::Result<T>,
+{
+    let initial_mode = if immutable_cas_hash.is_some() {
+        0o600
+    } else {
+        mode
+    };
+    let (mut f, staging) = open_unique_staging_file(stage_dir, stem, initial_mode)?;
+    let res = (|| -> std::io::Result<T> {
+        populate(&mut f)?;
+        #[cfg(unix)]
+        if let Some(hash) = immutable_cas_hash {
+            stamp_immutable_cas_inode(&f, hash);
+            let mut perms = f.metadata()?.permissions();
+            perms.set_mode(mode);
+            f.set_permissions(perms)?;
+        }
+        durability_barrier(&f)?;
+        let out = publish(&f, &staging, dest)?;
+        sync_published(dest, created)?;
+        Ok(out)
+    })();
+    drop(f);
+    let _ = fs::remove_file(&staging);
+    res
+}
+
 fn stage_and_publish_durable<T, P, Pub>(
     stage_dir: &Path,
     stem: &str,
@@ -4305,17 +4391,9 @@ where
     P: FnOnce(&mut File) -> std::io::Result<()>,
     Pub: FnOnce(&File, &Path, &Path) -> std::io::Result<T>,
 {
-    let (mut f, staging) = open_unique_staging_file(stage_dir, stem, mode)?;
-    let res = (|| -> std::io::Result<T> {
-        populate(&mut f)?;
-        durability_barrier(&f)?;
-        let out = publish(&f, &staging, dest)?;
-        sync_published(dest, created)?;
-        Ok(out)
-    })();
-    drop(f);
-    let _ = fs::remove_file(&staging);
-    res
+    stage_and_publish_durable_ext(
+        stage_dir, stem, mode, None, dest, created, populate, publish,
+    )
 }
 
 /// Stage into a private sibling file next to `dest`, populate it via `populate`, `fsync` its bytes,
@@ -4355,6 +4433,8 @@ type BeforeBlobInstallHook = std::sync::Arc<dyn Fn(&Path, &Path) + Send + Sync>;
 thread_local! {
     static BEFORE_BLOB_INSTALL_HOOK: std::cell::RefCell<Option<BeforeBlobInstallHook>> =
         const { std::cell::RefCell::new(None) };
+    static AFTER_BLOB_VERIFY_BEFORE_RENAME_HOOK: std::cell::RefCell<Option<BeforeBlobInstallHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -4365,6 +4445,16 @@ pub(crate) fn set_before_blob_install_hook(hook: BeforeBlobInstallHook) {
 #[cfg(test)]
 pub(crate) fn clear_before_blob_install_hook() {
     BEFORE_BLOB_INSTALL_HOOK.with(|h| *h.borrow_mut() = None);
+}
+
+#[cfg(test)]
+pub(crate) fn set_after_blob_verify_before_rename_hook(hook: BeforeBlobInstallHook) {
+    AFTER_BLOB_VERIFY_BEFORE_RENAME_HOOK.with(|h| *h.borrow_mut() = Some(hook));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_after_blob_verify_before_rename_hook() {
+    AFTER_BLOB_VERIFY_BEFORE_RENAME_HOOK.with(|h| *h.borrow_mut() = None);
 }
 
 /// Open `path` without following symlinks (`O_NOFOLLOW`) and verify the opened descriptor is a
@@ -4433,7 +4523,74 @@ pub(crate) fn link_regular_nofollow(src: &Path, dst: &Path) -> std::io::Result<(
     Ok(())
 }
 
-/// Allocate a unique non-existent path `<dir>/<stem>.<pid>.<seq>.<nanos>.tmp` for `linkat`.
+const IMMUTABLE_CAS_OWNER_XATTR: &[u8] = b"user.turbo_lean.cas_immutable\0";
+
+#[cfg(unix)]
+fn stamp_immutable_cas_inode(f: &File, expected_hash: &str) {
+    use std::os::unix::io::AsRawFd;
+    let val = expected_hash.as_bytes();
+    #[cfg(target_os = "linux")]
+    let _ = unsafe {
+        libc::fsetxattr(
+            f.as_raw_fd(),
+            IMMUTABLE_CAS_OWNER_XATTR.as_ptr().cast(),
+            val.as_ptr().cast(),
+            val.len(),
+            0,
+        )
+    };
+    #[cfg(target_os = "macos")]
+    let _ = unsafe {
+        libc::fsetxattr(
+            f.as_raw_fd(),
+            IMMUTABLE_CAS_OWNER_XATTR.as_ptr().cast(),
+            val.as_ptr().cast(),
+            val.len(),
+            0,
+            0,
+        )
+    };
+}
+
+#[cfg(unix)]
+pub(crate) fn is_store_owned_immutable_cas_inode(
+    f: &File,
+    meta: &fs::Metadata,
+    expected_hash: &str,
+) -> bool {
+    use std::os::unix::io::AsRawFd;
+    if !meta.is_file() || (meta.permissions().mode() & 0o222) != 0 {
+        return false;
+    }
+    let exp = expected_hash.as_bytes();
+    if exp.is_empty() || exp.len() > 128 {
+        return false;
+    }
+    let mut buf = [0u8; 128];
+    #[cfg(target_os = "linux")]
+    let n = unsafe {
+        libc::fgetxattr(
+            f.as_raw_fd(),
+            IMMUTABLE_CAS_OWNER_XATTR.as_ptr().cast(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    #[cfg(target_os = "macos")]
+    let n = unsafe {
+        libc::fgetxattr(
+            f.as_raw_fd(),
+            IMMUTABLE_CAS_OWNER_XATTR.as_ptr().cast(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            0,
+            0,
+        )
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let n: isize = -1;
+    n >= 0 && (n as usize) == exp.len() && &buf[..n as usize] == exp
+}
 fn reserve_unique_staging_path(dir: &Path, stem: &str) -> std::io::Result<PathBuf> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static LINK_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -4491,9 +4648,13 @@ pub(crate) fn publish_durable_link(
     })
 }
 
-/// Publish a CAS blob from `src` to `dest`, binding BLAKE3 digest + byte-length verification to the
-/// exact private staged inode/descriptor that is atomically published at `dest`. Returns the
-/// published destination inode.
+/// Publish a CAS blob from `src` to `dest`, binding BLAKE3 digest + byte-length verification to an
+/// isolated store-owned inode before atomic publication at `dest`. Only a previously stamped
+/// store-owned immutable CAS inode (`is_store_owned_immutable_cas_inode`, created exclusively via
+/// `O_CREAT | O_EXCL` with no external writable fd ever exposed) may use the same-device hardlink
+/// fast path; externally supplied or legacy inodes are snapshotted into a fresh `O_CREAT | O_EXCL`
+/// staging inode (via verified `FICLONE` or verified byte copy), stamped, `chmod 0o444`ed, fsynced,
+/// and atomically renamed onto `dest`. Returns the published destination inode.
 pub(crate) fn publish_verified_durable_blob(
     src: &Path,
     dest: &Path,
@@ -4510,17 +4671,21 @@ pub(crate) fn publish_verified_durable_blob(
         ".{}",
         dest.file_name().and_then(|s| s.to_str()).unwrap_or("blob")
     );
-    // 1. Same-device fast path: hardlink into a private sibling temp path first (`linkat(..., 0)`),
-    //    then open & verify the staged inode (`O_NOFOLLOW`, regular, immutable `0o444`, exact length
-    //    and BLAKE3 digest), sync it, and publish via `link_regular_nofollow` or atomic `rename`.
+    // 1. Same-device fast path ONLY when the staged hardlink resolves to a store-owned immutable
+    //    CAS inode (`user.turbo_lean.cas_immutable == expected_hash` and `(mode & 0o222) == 0`).
+    //    Mode `0o444` alone never authorizes hardlinking because `chmod` does not revoke pre-opened
+    //    writable descriptors on externally created inodes.
+    #[cfg(unix)]
     if let Ok(staged_link) = reserve_unique_staging_path(parent, &stem) {
         if link_regular_nofollow(src, &staged_link).is_ok() {
             let link_ok = (|| -> std::io::Result<i64> {
                 let (mut f, meta) = open_regular_nofollow(&staged_link)?;
-                if (meta.permissions().mode() & 0o222) != 0 || meta.len() != expected_len {
+                if !is_store_owned_immutable_cas_inode(&f, &meta, expected_hash)
+                    || meta.len() != expected_len
+                {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        "staged hardlink failed mode or length check",
+                        "staged hardlink is not a store-owned immutable CAS inode",
                     ));
                 }
                 let mut buf = Vec::with_capacity(expected_len.min(64 * 1024 * 1024) as usize);
@@ -4534,6 +4699,12 @@ pub(crate) fn publish_verified_durable_blob(
                     ));
                 }
                 durability_barrier(&f)?;
+                #[cfg(test)]
+                if let Some(hook) =
+                    AFTER_BLOB_VERIFY_BEFORE_RENAME_HOOK.with(|h| h.borrow().clone())
+                {
+                    hook(src, dest);
+                }
                 let ino = meta.ino() as i64;
                 drop(f);
                 fs::rename(&staged_link, dest)?;
@@ -4547,23 +4718,98 @@ pub(crate) fn publish_verified_durable_blob(
         }
     }
 
-    // 2. Cross-device or cold/mutable source fallback: verify bytes from an `O_NOFOLLOW` regular fd
-    //    and write the verified buffer into a fresh `O_CREAT | O_EXCL` `0o444` staging file, fsync,
-    //    and atomically rename onto `dest`.
-    let raw = read_cas_blob_verified(src, expected_hash, Some(expected_len)).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("CAS source {} failed digest verification", src.display()),
-        )
-    })?;
-    stage_and_publish_durable(
+    // 2. Snapshot into a fresh `O_CREAT | O_EXCL` store-owned staging inode: try `FICLONE` onto the
+    //    private staging inode and verify the independent cloned snapshot, or read + verify `src`
+    //    (`O_NOFOLLOW`, regular file, including `TLZ1` decompression) and write verified bytes.
+    let src_open = open_regular_nofollow(src).ok();
+    let mut raw_fallback: Option<Vec<u8>> = None;
+    let get_verified_raw = |cache: &mut Option<Vec<u8>>| -> std::io::Result<Vec<u8>> {
+        if let Some(b) = cache.take() {
+            return Ok(b);
+        }
+        read_cas_blob_verified(src, expected_hash, Some(expected_len)).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("CAS source {} failed digest verification", src.display()),
+            )
+        })
+    };
+    if src_open.is_none() {
+        raw_fallback = Some(get_verified_raw(&mut raw_fallback)?);
+    }
+    stage_and_publish_durable_ext(
         parent,
         &stem,
         0o444,
+        Some(expected_hash),
         dest,
         created,
-        |dst_file| dst_file.write_all(&raw),
+        |dst_file| {
+            #[cfg(target_os = "linux")]
+            if let Some((ref src_file, _)) = src_open {
+                use std::io::{Read, Seek};
+                use std::os::unix::io::AsRawFd;
+                const FICLONE: libc::c_ulong = 0x40049409;
+                if unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) } == 0
+                {
+                    // Read from the private `O_CREAT | O_EXCL` `dst_file` descriptor to verify the
+                    // independent CoW snapshot itself (immune to subsequent source fd writes).
+                    if dst_file.seek(std::io::SeekFrom::Start(0)).is_ok() {
+                        let mut cloned =
+                            Vec::with_capacity(expected_len.min(64 * 1024 * 1024) as usize);
+                        if dst_file.read_to_end(&mut cloned).is_ok()
+                            && cloned.len() as u64 == expected_len
+                            && blake3::hash(&cloned).to_hex().as_str() == expected_hash
+                        {
+                            return Ok(());
+                        }
+                    }
+                    dst_file.set_len(0)?;
+                    dst_file.seek(std::io::SeekFrom::Start(0))?;
+                }
+            }
+            let raw = if let Some((mut src_file, src_meta)) = src_open {
+                let mut disk_bytes =
+                    Vec::with_capacity(src_meta.len().min(64 * 1024 * 1024) as usize);
+                src_file.read_to_end(&mut disk_bytes)?;
+                if disk_bytes.len() as u64 == expected_len
+                    && blake3::hash(&disk_bytes).to_hex().as_str() == expected_hash
+                {
+                    disk_bytes
+                } else if disk_bytes.len() >= 12 && &disk_bytes[..4] == b"TLZ1" {
+                    let hdr_len = u64::from_le_bytes(disk_bytes[4..12].try_into().unwrap());
+                    let decomp = (hdr_len == expected_len)
+                        .then(|| decompress_tlz1(&disk_bytes))
+                        .flatten()
+                        .filter(|r| {
+                            r.len() as u64 == expected_len
+                                && blake3::hash(r).to_hex().as_str() == expected_hash
+                        });
+                    match decomp {
+                        Some(r) => r,
+                        None => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("CAS source {} failed digest verification", src.display()),
+                            ))
+                        }
+                    }
+                } else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("CAS source {} failed digest verification", src.display()),
+                    ));
+                }
+            } else {
+                get_verified_raw(&mut raw_fallback)?
+            };
+            dst_file.write_all(&raw)
+        },
         |f, staging, dst| {
+            #[cfg(test)]
+            if let Some(hook) = AFTER_BLOB_VERIFY_BEFORE_RENAME_HOOK.with(|h| h.borrow().clone()) {
+                hook(src, dst);
+            }
             let ino = f.metadata()?.ino() as i64;
             fs::rename(staging, dst)?;
             Ok(ino)
@@ -4677,6 +4923,10 @@ pub(crate) fn probe_blob_digest(path: &Path, expected_hash: &str, expected_len: 
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return BlobDisk::Missing,
         Err(_) => return BlobDisk::Torn,
     };
+    #[cfg(unix)]
+    if (meta.permissions().mode() & 0o222) != 0 {
+        return BlobDisk::Torn;
+    }
     let mut buf = Vec::with_capacity(meta.len().min(64 * 1024 * 1024) as usize);
     if f.read_to_end(&mut buf).is_err() {
         return BlobDisk::Torn;
@@ -4729,10 +4979,11 @@ pub(crate) fn write_blob_bytes_checked(
         None => Vec::new(),
     };
     created_dirs.extend(staging_dirs);
-    let ino = stage_and_publish_durable(
+    let ino = stage_and_publish_durable_ext(
         &staging_dir,
         hash,
         0o444,
+        Some(hash),
         dest,
         &created_dirs,
         |f| f.write_all(bytes),
@@ -4745,18 +4996,31 @@ pub(crate) fn write_blob_bytes_checked(
             match link_regular_nofollow(staging_path, dst) {
                 Ok(()) => Ok(staged_ino),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Lost a race (or a pre-fix writer left a partial/corrupt file): keep an
-                    // intact digest-verified blob (and still sync its bytes before `sync_published`
-                    // syncs its directory chain), otherwise replace it with ours.
+                    // Lost a race (or a pre-fix writer left a partial/corrupt/unstamped file): keep
+                    // only a store-owned immutable `0o444` digest-verified blob (and still sync its
+                    // bytes before `sync_published` syncs its directory chain), otherwise replace it
+                    // with our freshly staged private inode.
                     if let Ok((mut peer_f, m)) = open_regular_nofollow(dst) {
-                        let mut peer_buf =
-                            Vec::with_capacity(m.len().min(64 * 1024 * 1024) as usize);
-                        if peer_f.read_to_end(&mut peer_buf).is_ok()
-                            && verify_blob_payload_matches_hash(hash, &peer_buf)
-                                .is_ok_and(|l| l == expected_raw_len)
-                        {
-                            durability_barrier(&peer_f)?;
-                            return Ok(m.ino() as i64);
+                        let peer_owned = {
+                            #[cfg(unix)]
+                            {
+                                is_store_owned_immutable_cas_inode(&peer_f, &m, hash)
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                true
+                            }
+                        };
+                        if peer_owned {
+                            let mut peer_buf =
+                                Vec::with_capacity(m.len().min(64 * 1024 * 1024) as usize);
+                            if peer_f.read_to_end(&mut peer_buf).is_ok()
+                                && verify_blob_payload_matches_hash(hash, &peer_buf)
+                                    .is_ok_and(|l| l == expected_raw_len)
+                            {
+                                durability_barrier(&peer_f)?;
+                                return Ok(m.ino() as i64);
+                            }
                         }
                     }
                     fs::rename(staging_path, dst)?;
@@ -4810,8 +5074,19 @@ pub(crate) fn ensure_blob_file(
     let len = bytes.len() as u64;
     if !known_missing {
         if let Ok((mut f, meta)) = open_regular_nofollow(dest) {
+            let owned_immutable = {
+                #[cfg(unix)]
+                {
+                    is_store_owned_immutable_cas_inode(&f, &meta, hash)
+                }
+                #[cfg(not(unix))]
+                {
+                    true
+                }
+            };
             let mut buf = Vec::with_capacity(meta.len().min(64 * 1024 * 1024) as usize);
-            let verified = f.read_to_end(&mut buf).is_ok()
+            let verified = owned_immutable
+                && f.read_to_end(&mut buf).is_ok()
                 && ((buf.len() as u64 == len && blake3::hash(&buf).to_hex().as_str() == hash)
                     || (buf.len() >= 12
                         && &buf[..4] == b"TLZ1"
@@ -4985,22 +5260,37 @@ fn install_blob_to_path_checked(
         let install_res = (|| -> Result<&'static str> {
             #[cfg(target_os = "linux")]
             {
+                use std::io::Seek;
                 use std::os::unix::io::AsRawFd;
                 const FICLONE: libc::c_ulong = 0x40049409;
                 if unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) } == 0
                 {
-                    let mut cloned_buf = Vec::with_capacity(src_bytes.len());
-                    let (mut rf, _) = open_regular_nofollow(&tmp_dst)?;
-                    rf.read_to_end(&mut cloned_buf)?;
-                    if verify_bytes(&cloned_buf).is_ok() {
-                        fs::rename(&tmp_dst, dst)?;
-                        return Ok("reflink");
+                    if dst_file.seek(std::io::SeekFrom::Start(0)).is_ok() {
+                        let mut cloned_buf = Vec::with_capacity(src_bytes.len());
+                        if dst_file.read_to_end(&mut cloned_buf).is_ok()
+                            && verify_bytes(&cloned_buf).is_ok()
+                        {
+                            #[cfg(test)]
+                            if let Some(hook) =
+                                AFTER_BLOB_VERIFY_BEFORE_RENAME_HOOK.with(|h| h.borrow().clone())
+                            {
+                                hook(src, dst);
+                            }
+                            drop(dst_file);
+                            fs::rename(&tmp_dst, dst)?;
+                            return Ok("reflink");
+                        }
                     }
                     dst_file.set_len(0)?;
+                    dst_file.seek(std::io::SeekFrom::Start(0))?;
                 }
             }
             let _ = &src_file;
             dst_file.write_all(&src_bytes)?;
+            #[cfg(test)]
+            if let Some(hook) = AFTER_BLOB_VERIFY_BEFORE_RENAME_HOOK.with(|h| h.borrow().clone()) {
+                hook(src, dst);
+            }
             drop(dst_file);
             fs::rename(&tmp_dst, dst)?;
             Ok("copy")
@@ -5009,55 +5299,102 @@ fn install_blob_to_path_checked(
         return install_res;
     }
 
-    // 1. Try immutable hardlink (`linkat(..., 0)`, no symlink following) to a private staging path,
-    //    then open & verify the staged inode (`O_NOFOLLOW`, regular, immutable `0o444`, exact length
-    //    and BLAKE3 digest) BEFORE atomic rename onto `dst`.
+    // 1. Try immutable hardlink (`linkat(..., 0)`, no symlink following) to a private staging path
+    //    ONLY when the staged inode is a stamped store-owned immutable CAS inode (`0o444` +
+    //    `user.turbo_lean.cas_immutable` matching the verified digest). Externally supplied or
+    //    unstamped `0o444` files fall through to fresh-inode isolation so retained writable fds can
+    //    never mutate `dst` between verification and rename or after return.
     if let Ok(tmp_link) = reserve_unique_staging_path(parent, &stem) {
         if link_regular_nofollow(src, &tmp_link).is_ok() {
-            let hardlink_res = (|| -> Result<()> {
-                let (mut f, meta) = open_regular_nofollow(&tmp_link)?;
-                if (meta.permissions().mode() & 0o222) != 0 {
-                    anyhow::bail!(
-                        "Refusing to hardlink writable CAS inode into {}",
-                        dst.display()
-                    );
-                }
+            enum HardlinkAttempt {
+                Linked,
+                UnstampedFallback,
+                Corrupt(anyhow::Error),
+            }
+            let hardlink_res = (|| -> HardlinkAttempt {
+                let Ok((mut f, meta)) = open_regular_nofollow(&tmp_link) else {
+                    return HardlinkAttempt::UnstampedFallback;
+                };
                 if expected_len.is_some_and(|n| meta.len() != n) {
-                    anyhow::bail!("CAS blob changed while linking into {}", dst.display());
+                    return HardlinkAttempt::Corrupt(anyhow::anyhow!(
+                        "CAS blob changed while linking into {}",
+                        dst.display()
+                    ));
                 }
-                if expected_hash.is_some() {
-                    let mut b = Vec::with_capacity(meta.len().min(64 * 1024 * 1024) as usize);
-                    f.read_to_end(&mut b)?;
-                    verify_bytes(&b)?;
+                let mut b = Vec::with_capacity(meta.len().min(64 * 1024 * 1024) as usize);
+                if let Err(e) = f.read_to_end(&mut b) {
+                    return HardlinkAttempt::Corrupt(e.into());
+                }
+                if let Err(e) = verify_bytes(&b) {
+                    return HardlinkAttempt::Corrupt(e);
+                }
+                #[cfg(unix)]
+                {
+                    let computed;
+                    let hash_for_stamp = match expected_hash {
+                        Some(h) => h,
+                        None => {
+                            computed = blake3::hash(&b).to_hex().to_string();
+                            computed.as_str()
+                        }
+                    };
+                    if !is_store_owned_immutable_cas_inode(&f, &meta, hash_for_stamp) {
+                        return HardlinkAttempt::UnstampedFallback;
+                    }
+                }
+                #[cfg(not(unix))]
+                if (meta.permissions().mode() & 0o222) != 0 {
+                    return HardlinkAttempt::UnstampedFallback;
+                }
+                #[cfg(test)]
+                if let Some(hook) =
+                    AFTER_BLOB_VERIFY_BEFORE_RENAME_HOOK.with(|h| h.borrow().clone())
+                {
+                    hook(src, dst);
                 }
                 drop(f);
-                fs::rename(&tmp_link, dst)?;
-                Ok(())
+                match fs::rename(&tmp_link, dst) {
+                    Ok(()) => HardlinkAttempt::Linked,
+                    Err(_) => HardlinkAttempt::UnstampedFallback,
+                }
             })();
             let _ = fs::remove_file(&tmp_link);
             match hardlink_res {
-                Ok(()) => return Ok("hardlink"),
-                Err(e) if expected_hash.is_some() || expected_len.is_some() => return Err(e),
-                Err(_) => {}
+                HardlinkAttempt::Linked => return Ok("hardlink"),
+                HardlinkAttempt::Corrupt(e) => return Err(e),
+                HardlinkAttempt::UnstampedFallback => {}
             }
         }
     }
 
     // Read and verify the regular source descriptor once; never re-open `src` by pathname afterward.
-    let (src_bytes, src_file) = {
+    let (src_bytes, src_file, effective_hash) = {
         let (mut f, meta) = open_regular_nofollow(src)
             .with_context(|| format!("CAS source {} is not a regular file", src.display()))?;
         let mut b = Vec::with_capacity(meta.len().min(64 * 1024 * 1024) as usize);
         f.read_to_end(&mut b)?;
         verify_bytes(&b)?;
-        (b, f)
+        let h = match expected_hash {
+            Some(eh) => eh.to_string(),
+            None => blake3::hash(&b).to_hex().to_string(),
+        };
+        (b, f, h)
     };
 
-    // If hardlinking failed (e.g. EXDEV across filesystems) and `dst` already exists as a regular
-    // read-only `0o444` file with identical verified bytes, preserve `dst`'s existing inode & mtime.
+    // If hardlinking was unavailable (e.g. EXDEV across filesystems) and `dst` already exists as a
+    // stamped store-owned immutable `0o444` file with identical verified bytes, preserve `dst`.
     if let Ok((mut dst_f, dst_meta)) = open_regular_nofollow(dst) {
-        if dst_meta.len() == src_bytes.len() as u64 && (dst_meta.permissions().mode() & 0o222) == 0
-        {
+        let dst_owned = {
+            #[cfg(unix)]
+            {
+                is_store_owned_immutable_cas_inode(&dst_f, &dst_meta, &effective_hash)
+            }
+            #[cfg(not(unix))]
+            {
+                (dst_meta.permissions().mode() & 0o222) == 0
+            }
+        };
+        if dst_owned && dst_meta.len() == src_bytes.len() as u64 {
             let mut db = Vec::with_capacity(src_bytes.len());
             if dst_f.read_to_end(&mut db).is_ok() && db == src_bytes {
                 return Ok("hardlink");
@@ -5065,28 +5402,55 @@ fn install_blob_to_path_checked(
         }
     }
 
-    // 2. Stage into a fresh `O_CREAT | O_EXCL` `0o444` temp file (FICLONE from verified `src_file`
-    //    when on a CoW FS, otherwise write `src_bytes`) and atomically rename onto `dst`.
-    let (mut dst_file, tmp_dst) = open_unique_staging_file(parent, &stem, 0o444)?;
+    // 2. Stage into a fresh `O_CREAT | O_EXCL` temp file (FICLONE from verified `src_file` when on
+    //    a CoW FS and re-verified on the independent snapshot, otherwise write `src_bytes`), stamp
+    //    store-owned immutability + `chmod 0o444`, and atomically rename onto `dst`.
+    let (mut dst_file, tmp_dst) = open_unique_staging_file(parent, &stem, 0o600)?;
     let install_res = (|| -> Result<&'static str> {
+        let finalize_immutable = |f: &File| -> std::io::Result<()> {
+            #[cfg(unix)]
+            {
+                stamp_immutable_cas_inode(f, &effective_hash);
+                let mut perms = f.metadata()?.permissions();
+                perms.set_mode(0o444);
+                f.set_permissions(perms)?;
+            }
+            Ok(())
+        };
         #[cfg(target_os = "linux")]
         {
+            use std::io::Seek;
             use std::os::unix::io::AsRawFd;
             const FICLONE: libc::c_ulong = 0x40049409;
             if unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) } == 0 {
-                let mut cloned_buf = Vec::with_capacity(src_bytes.len());
-                let (mut rf, _) = open_regular_nofollow(&tmp_dst)?;
-                rf.read_to_end(&mut cloned_buf)?;
-                if verify_bytes(&cloned_buf).is_ok() {
-                    drop(dst_file);
-                    fs::rename(&tmp_dst, dst)?;
-                    return Ok("reflink");
+                if dst_file.seek(std::io::SeekFrom::Start(0)).is_ok() {
+                    let mut cloned_buf = Vec::with_capacity(src_bytes.len());
+                    if dst_file.read_to_end(&mut cloned_buf).is_ok()
+                        && verify_bytes(&cloned_buf).is_ok()
+                    {
+                        finalize_immutable(&dst_file)?;
+                        #[cfg(test)]
+                        if let Some(hook) =
+                            AFTER_BLOB_VERIFY_BEFORE_RENAME_HOOK.with(|h| h.borrow().clone())
+                        {
+                            hook(src, dst);
+                        }
+                        drop(dst_file);
+                        fs::rename(&tmp_dst, dst)?;
+                        return Ok("reflink");
+                    }
                 }
                 dst_file.set_len(0)?;
+                dst_file.seek(std::io::SeekFrom::Start(0))?;
             }
         }
         let _ = &src_file;
         dst_file.write_all(&src_bytes)?;
+        finalize_immutable(&dst_file)?;
+        #[cfg(test)]
+        if let Some(hook) = AFTER_BLOB_VERIFY_BEFORE_RENAME_HOOK.with(|h| h.borrow().clone()) {
+            hook(src, dst);
+        }
         drop(dst_file);
         fs::rename(&tmp_dst, dst)?;
         Ok("copy")
@@ -7167,6 +7531,145 @@ mod tests {
             "publish_verified_durable_blob must reject same-length replacement before staging"
         );
         assert!(!pub_dst.exists());
+
+        // 4. P1 retained-writable-descriptor isolation across verification-to-rename AND after return:
+        //    Hold an already-open writable descriptor on an externally supplied `0o444` source file
+        //    (and even forge `user.*` xattrs or test `ensure_blob_file` reuse), mutate same-length
+        //    bytes BOTH inside `AFTER_BLOB_VERIFY_BEFORE_RENAME_HOOK` (after verification, before
+        //    rename) AND again after successful return. Neither `publish_verified_durable_blob`,
+        //    `install_verified_blob_to_path`, nor `ensure_blob_file` may expose the destination to
+        //    mutations through that retained writable fd.
+        {
+            use std::io::{Seek, Write};
+            let orig_b = b"verified-immutable-payload-0001".to_vec();
+            let mut mutated_b1 = orig_b.clone();
+            mutated_b1[0] ^= 0x55;
+            let mut mutated_b2 = orig_b.clone();
+            mutated_b2[1] ^= 0xAA;
+            let orig_hash = blake3::hash(&orig_b).to_hex().to_string();
+
+            // 4a. `publish_verified_durable_blob`: external `0o444` source with retained writable fd.
+            let ext_src = dir.join("external_shared_src.olean");
+            let retained_fd = std::sync::Arc::new(std::sync::Mutex::new(
+                OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .read(true)
+                    .write(true)
+                    .open(&ext_src)?,
+            ));
+            retained_fd.lock().unwrap().write_all(&orig_b)?;
+            let mut ro_p = fs::metadata(&ext_src)?.permissions();
+            ro_p.set_mode(0o444);
+            fs::set_permissions(&ext_src, ro_p)?;
+
+            let fd_in_hook = std::sync::Arc::clone(&retained_fd);
+            let m1_for_hook = mutated_b1.clone();
+            set_after_blob_verify_before_rename_hook(std::sync::Arc::new(move |_s, _d| {
+                if let Ok(mut f) = fd_in_hook.lock() {
+                    let _ = f.seek(std::io::SeekFrom::Start(0));
+                    let _ = f.write_all(&m1_for_hook);
+                }
+            }));
+            let isolated_cas_dst = dir.join("isolated_cas_dst").join(&orig_hash);
+            fs::create_dir_all(isolated_cas_dst.parent().unwrap())?;
+            let pub_ino = publish_verified_durable_blob(
+                &ext_src,
+                &isolated_cas_dst,
+                &orig_hash,
+                orig_b.len() as u64,
+                &[],
+            )?;
+            clear_after_blob_verify_before_rename_hook();
+            assert_ne!(
+                pub_ino as u64,
+                fs::metadata(&ext_src)?.ino(),
+                "publish_verified_durable_blob must allocate an independent inode for external 0o444 sources"
+            );
+            assert_eq!(
+                fs::read(&isolated_cas_dst)?,
+                orig_b,
+                "mutation between verification and rename via retained writable fd must not affect published CAS blob"
+            );
+            {
+                let mut f = retained_fd.lock().unwrap();
+                f.seek(std::io::SeekFrom::Start(0))?;
+                f.write_all(&mutated_b2)?;
+            }
+            assert_eq!(
+                fs::read(&isolated_cas_dst)?,
+                orig_b,
+                "mutation after return via retained writable fd must not affect published CAS blob"
+            );
+
+            // 4b. `install_verified_blob_to_path`: external `0o444` source with retained writable fd
+            //     targeting a package/non-mutable destination path.
+            let ext_pkg_src = dir.join("external_pkg_src.olean");
+            let pkg_fd = std::sync::Arc::new(std::sync::Mutex::new(
+                OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .read(true)
+                    .write(true)
+                    .open(&ext_pkg_src)?,
+            ));
+            pkg_fd.lock().unwrap().write_all(&orig_b)?;
+            let mut ro_pkg = fs::metadata(&ext_pkg_src)?.permissions();
+            ro_pkg.set_mode(0o444);
+            fs::set_permissions(&ext_pkg_src, ro_pkg)?;
+
+            let pkg_fd_hook = std::sync::Arc::clone(&pkg_fd);
+            let m1_pkg = mutated_b1.clone();
+            set_after_blob_verify_before_rename_hook(std::sync::Arc::new(move |_s, _d| {
+                if let Ok(mut f) = pkg_fd_hook.lock() {
+                    let _ = f.seek(std::io::SeekFrom::Start(0));
+                    let _ = f.write_all(&m1_pkg);
+                }
+            }));
+            let pkg_dst =
+                dir.join("wt_pkg/.lake/packages/dep/.lake/build/lib/lean/Dep/Target.olean");
+            fs::create_dir_all(pkg_dst.parent().unwrap())?;
+            install_verified_blob_to_path(&ext_pkg_src, &pkg_dst, &orig_hash, orig_b.len() as u64)?;
+            clear_after_blob_verify_before_rename_hook();
+            assert_ne!(
+                fs::metadata(&pkg_dst)?.ino(),
+                fs::metadata(&ext_pkg_src)?.ino(),
+                "install_verified_blob_to_path must isolate unstamped 0o444 source into a fresh inode"
+            );
+            assert_eq!(fs::read(&pkg_dst)?, orig_b);
+            {
+                let mut f = pkg_fd.lock().unwrap();
+                f.seek(std::io::SeekFrom::Start(0))?;
+                f.write_all(&mutated_b2)?;
+            }
+            assert_eq!(
+                fs::read(&pkg_dst)?,
+                orig_b,
+                "post-install write through retained source fd must leave installed artifact intact"
+            );
+
+            // 4c. `ensure_blob_file`: pre-existing digest-matching unstamped/writable destination
+            //     with a retained writable fd must be replaced with a fresh store-owned inode.
+            let pre_dest = dir.join("blobs").join(&orig_hash[..2]).join(&orig_hash);
+            fs::create_dir_all(pre_dest.parent().unwrap())?;
+            let mut pre_rw = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&pre_dest)?;
+            pre_rw.write_all(&orig_b)?;
+            let pre_ino = pre_rw.metadata()?.ino();
+            let (ensured_ino, _) = ensure_blob_file(&dir, &pre_dest, &orig_hash, &orig_b, false)?;
+            assert_ne!(ensured_ino as u64, pre_ino);
+            pre_rw.seek(std::io::SeekFrom::Start(0))?;
+            pre_rw.write_all(&mutated_b2)?;
+            assert_eq!(
+                fs::read(&pre_dest)?,
+                orig_b,
+                "ensure_blob_file must replace externally writable/unstamped inode rather than reusing it"
+            );
+        }
 
         let _ = fs::remove_dir_all(&shm_root);
         let _ = fs::remove_dir_all(&dir);

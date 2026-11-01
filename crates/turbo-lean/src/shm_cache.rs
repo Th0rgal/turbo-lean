@@ -526,6 +526,10 @@ pub fn default_max_shm_bytes() -> u64 {
 }
 
 fn stage_unique_tmp_path(target: &Path) -> std::io::Result<PathBuf> {
+    stage_unique_tmp_path_ext(target, "tmp")
+}
+
+fn stage_unique_tmp_path_ext(target: &Path, ext: &str) -> std::io::Result<PathBuf> {
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
     if !parent.as_os_str().is_empty() && !parent.exists() {
         fs::create_dir_all(parent)?;
@@ -540,29 +544,32 @@ fn stage_unique_tmp_path(target: &Path) -> std::io::Result<PathBuf> {
         .unwrap_or_default()
         .as_nanos();
     Ok(parent.join(format!(
-        ".{}.{}.{}.{}.tmp",
+        ".{}.{}.{}.{}.{}",
         file_name,
         std::process::id(),
         seq,
-        nanos
+        nanos,
+        ext
     )))
 }
 
 /// Atomically write `bytes` to `target` by staging into a process+sequence-unique temporary file
 /// in `target.parent()` and invoking `fs::rename` over `target`.
 pub fn atomic_write_shm(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp_path = stage_unique_tmp_path(target)?;
-    let write_res = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&tmp_path)
-        .and_then(|mut f| f.write_all(bytes));
-    if let Err(e) = write_res {
+    let (mut tmp_f, tmp_path) = match open_unique_exclusive_tmp(target, 0o644) {
+        Ok(pair) => pair,
+        Err(e) => {
+            debug_log_cache_err("atomic_write_shm(open)", &e);
+            return Err(e);
+        }
+    };
+    if let Err(e) = tmp_f.write_all(bytes) {
+        drop(tmp_f);
         let _ = fs::remove_file(&tmp_path);
         debug_log_cache_err("atomic_write_shm(write)", &e);
         return Err(e);
     }
+    drop(tmp_f);
     if let Err(e) = fs::rename(&tmp_path, target) {
         let _ = fs::remove_file(&tmp_path);
         debug_log_cache_err("atomic_write_shm(rename)", &e);
@@ -578,12 +585,14 @@ pub struct StagedTempFile {
 
 impl StagedTempFile {
     pub fn write(path: PathBuf, bytes: impl AsRef<[u8]>) -> std::io::Result<Self> {
-        let g = Self::reserve(path)?;
-        g.overwrite(bytes.as_ref())?;
-        Ok(g)
+        Self::stage_with_lease(path, bytes.as_ref())
     }
 
     pub fn reserve(path: PathBuf) -> std::io::Result<Self> {
+        Self::stage_with_lease(path, &[])
+    }
+
+    fn stage_with_lease(path: PathBuf, bytes: &[u8]) -> std::io::Result<Self> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)?;
@@ -591,8 +600,7 @@ impl StagedTempFile {
         }
         let lock_path = staging_lease_lock_path(&path);
         let lease = acquire_staging_lease(&lock_path)?;
-        let f_res = open_staged_payload_nofollow(&path, true);
-        if let Err(e) = f_res {
+        if let Err(e) = replace_staged_payload_nofollow(&path, bytes) {
             drop(lease);
             let _ = reap_stale_lock_if_unheld(&lock_path);
             return Err(e);
@@ -604,8 +612,7 @@ impl StagedTempFile {
     }
 
     pub fn overwrite(&self, bytes: &[u8]) -> std::io::Result<()> {
-        let mut f = open_staged_payload_nofollow(&self.path, true)?;
-        f.write_all(bytes)
+        replace_staged_payload_nofollow(&self.path, bytes)
     }
 
     pub fn path(&self) -> &Path {
@@ -613,31 +620,83 @@ impl StagedTempFile {
     }
 }
 
-fn open_staged_payload_nofollow(path: &Path, truncate: bool) -> std::io::Result<fs::File> {
-    if let Ok(meta) = fs::symlink_metadata(path) {
-        if !meta.file_type().is_file() {
+fn replace_staged_payload_nofollow(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if !meta.file_type().is_file() => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("refusing non-regular staged target path {}", path.display()),
             ));
         }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
-    let mut opts = fs::OpenOptions::new();
-    opts.create(true).write(true).truncate(truncate);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut opts, libc::O_NOFOLLOW);
-    let f = opts.open(path)?;
-    #[cfg(unix)]
-    if !f.metadata()?.file_type().is_file() || !inode_matches_nofollow(&f, path) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "staged target path {} changed or is not a regular file",
-                path.display()
-            ),
-        ));
+    let (mut tmp_f, tmp_path) = open_unique_exclusive_tmp_ext(path, 0o600, "stgtmp")?;
+    let res = (|| -> std::io::Result<()> {
+        if !bytes.is_empty() {
+            tmp_f.write_all(bytes)?;
+        }
+        match fs::symlink_metadata(path) {
+            Ok(meta) if !meta.file_type().is_file() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("refusing non-regular staged target path {}", path.display()),
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        fs::rename(&tmp_path, path)?;
+        #[cfg(unix)]
+        if !inode_matches_nofollow(&tmp_f, path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "staged target path {} changed during atomic replacement",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(())
+    })();
+    drop(tmp_f);
+    let _ = fs::remove_file(&tmp_path);
+    res
+}
+
+fn open_unique_exclusive_tmp(target: &Path, mode: u32) -> std::io::Result<(fs::File, PathBuf)> {
+    open_unique_exclusive_tmp_ext(target, mode, "tmp")
+}
+
+fn open_unique_exclusive_tmp_ext(
+    target: &Path,
+    mode: u32,
+    ext: &str,
+) -> std::io::Result<(fs::File, PathBuf)> {
+    for _ in 0..16 {
+        let tmp_path = stage_unique_tmp_path_ext(target, ext)?;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(mode).custom_flags(libc::O_NOFOLLOW);
+        }
+        match opts.open(&tmp_path) {
+            Ok(f) => return Ok((f, tmp_path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
     }
-    Ok(f)
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "could not allocate unique exclusive staging file for {}",
+            target.display()
+        ),
+    ))
 }
 
 impl std::ops::Deref for StagedTempFile {
@@ -851,7 +910,7 @@ fn scan_evictable_shm_files(
             .file_name()
             .map(|n| n.to_string_lossy())
             .unwrap_or_default();
-        if (fname.starts_with('.') && fname.ends_with(".tmp"))
+        if (fname.starts_with('.') && (fname.ends_with(".tmp") || fname.ends_with(".stgtmp")))
             || fname == "zygote_daemon.json"
             || fname == "zygote_lru_registry.json"
             || path.to_string_lossy().contains("zygote_daemon_cas_")
@@ -1540,6 +1599,65 @@ mod tests {
         );
         assert_eq!(fs::read(&victim)?, b"untouched-victim-bytes");
         fs::remove_file(&sym_lock)?;
+
+        // 1c. Hardlinked payload & retained writable descriptor isolation (`P2` regression):
+        //     If a staging path `P` is a hardlink to an ordinary writable file `V` (and/or has a
+        //     pre-existing open writable descriptor), `StagedTempFile::reserve`, `write`, and
+        //     `overwrite` MUST allocate a fresh inode and atomically replace `P` instead of
+        //     truncating `V` in place, and subsequent writes through the retained fd must not
+        //     alter the staged payload.
+        {
+            use std::io::{Seek, Write};
+            use std::os::unix::fs::MetadataExt;
+            let hardlink_victim = root.join("ordinary_hardlinked_victim.lean");
+            let victim_orig = b"valuable-external-file-must-not-truncate".to_vec();
+            let mut retained_victim_fd = fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&hardlink_victim)?;
+            retained_victim_fd.write_all(&victim_orig)?;
+            let victim_ino = retained_victim_fd.metadata()?.ino();
+
+            let planted_hl_reserve = staging.join("planted_hardlink_reserve.lean");
+            fs::hard_link(&hardlink_victim, &planted_hl_reserve)?;
+            let reserved = StagedTempFile::reserve(planted_hl_reserve.clone())?;
+            assert_eq!(
+                fs::read(&hardlink_victim)?,
+                victim_orig,
+                "StagedTempFile::reserve must never truncate a hardlinked sibling file"
+            );
+            assert_ne!(
+                fs::metadata(reserved.path())?.ino(),
+                victim_ino,
+                "StagedTempFile::reserve must bind a fresh isolated payload inode"
+            );
+            assert_eq!(fs::read(reserved.path())?, b"");
+            reserved.overwrite(b"-- staged payload v1\n")?;
+            assert_eq!(
+                fs::read(&hardlink_victim)?,
+                victim_orig,
+                "StagedTempFile::overwrite must leave hardlinked sibling untouched"
+            );
+            retained_victim_fd.seek(std::io::SeekFrom::Start(0))?;
+            retained_victim_fd.write_all(b"external-writer-mutates-old-inode!!!!!!!")?;
+            assert_eq!(
+                fs::read(reserved.path())?,
+                b"-- staged payload v1\n",
+                "retained writable fd on replaced inode must never alter leased staged payload"
+            );
+            drop(reserved);
+
+            // Also verify `StagedTempFile::write` directly against a pre-existing hardlinked path.
+            fs::write(&hardlink_victim, &victim_orig)?;
+            let planted_hl_write = staging.join("planted_hardlink_write.lean");
+            fs::hard_link(&hardlink_victim, &planted_hl_write)?;
+            let written = StagedTempFile::write(planted_hl_write.clone(), b"-- direct write\n")?;
+            assert_eq!(fs::read(&hardlink_victim)?, victim_orig);
+            assert_eq!(fs::read(written.path())?, b"-- direct write\n");
+            drop(written);
+        }
 
         // 2. Multi-threaded stress race: writers repeatedly `reserve` + write + hold + verify
         //    against concurrent `reap_stale_lock_if_unheld`, `try_remove_unleased_staged_file`,

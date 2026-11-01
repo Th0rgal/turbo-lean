@@ -2898,10 +2898,24 @@ pub(crate) fn stage_lake_build_outputs(
             } else {
                 Vec::new()
             };
-            if !matches!(
-                crate::db::probe_blob_digest(&shared_p, &entry.blob_hash, entry.size_bytes),
-                crate::db::BlobDisk::Intact
-            ) {
+            let shared_intact = crate::db::open_regular_nofollow(&shared_p)
+                .ok()
+                .is_some_and(|(mut sf, sm)| {
+                    use std::io::Read;
+                    #[cfg(unix)]
+                    let owned =
+                        crate::db::is_store_owned_immutable_cas_inode(&sf, &sm, &entry.blob_hash);
+                    #[cfg(not(unix))]
+                    let owned = true;
+                    if !owned {
+                        return false;
+                    }
+                    let mut b = Vec::with_capacity(sm.len().min(64 * 1024 * 1024) as usize);
+                    sf.read_to_end(&mut b).is_ok()
+                        && b.len() as u64 == entry.size_bytes
+                        && blake3::hash(&b).to_hex().as_str() == entry.blob_hash
+                });
+            if !shared_intact {
                 let _ = crate::db::publish_verified_durable_blob(
                     dest_p,
                     &shared_p,
@@ -2920,11 +2934,14 @@ pub(crate) fn stage_lake_build_outputs(
                 .ok()
                 .and_then(|(mut f, m)| {
                     use std::io::Read;
+                    #[cfg(unix)]
+                    if !crate::db::is_store_owned_immutable_cas_inode(&f, &m, &entry.blob_hash) {
+                        return None;
+                    }
                     let mut buf = Vec::with_capacity(m.len().min(64 * 1024 * 1024) as usize);
                     if f.read_to_end(&mut buf).is_ok()
                         && buf.len() as u64 == entry.size_bytes
                         && blake3::hash(&buf).to_hex().as_str() == entry.blob_hash
-                        && (m.permissions().mode() & 0o222) == 0
                     {
                         crate::db::durability_barrier(&f).ok()?;
                         Some(m.ino() as i64)
@@ -3038,7 +3055,7 @@ pub fn dedup_worktree_packages(
         }));
     }
     #[cfg(unix)]
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::MetadataExt;
 
     let t0 = Instant::now();
     let lake_dir = project_dir.join(".lake");
@@ -3121,63 +3138,31 @@ pub fn dedup_worktree_packages(
                     let hash_hex = blake3::hash(&bytes).to_hex().to_string();
 
                     let shard_dir = pkg_cas_dir.join(&hash_hex[0..2]);
-                    let Ok(created) = crate::db::ensure_dir_tracking(&shard_dir, &store.root)
+                    let Ok(_created) = crate::db::ensure_dir_tracking(&shard_dir, &store.root)
                     else {
                         continue;
                     };
                     let cas_file = shard_dir.join(&hash_hex);
 
-                    let cas_ready = if let Ok((mut cas_f, cas_meta)) =
-                        crate::db::open_regular_nofollow(&cas_file)
-                    {
-                        let mut cas_buf =
-                            Vec::with_capacity(cas_meta.len().min(64 * 1024 * 1024) as usize);
-                        if cas_f.read_to_end(&mut cas_buf).is_ok()
-                            && cas_buf.len() as u64 == sz
-                            && blake3::hash(&cas_buf).to_hex().as_str() == hash_hex
-                        {
-                            #[cfg(unix)]
-                            if (cas_meta.permissions().mode() & 0o222) != 0 {
-                                let mut perms = cas_meta.permissions();
-                                perms.set_mode(0o444);
-                                let _ = cas_f.set_permissions(perms);
-                            }
-                            crate::db::durability_barrier(&cas_f).is_ok()
-                                && crate::db::sync_dir(&shard_dir).is_ok()
-                                && created.iter().all(|dir| crate::db::sync_dir(dir).is_ok())
-                                && crate::db::open_regular_nofollow(&cas_file)
-                                    .ok()
-                                    .map(|(_, m)| m)
-                                    .is_some()
-                        } else {
-                            crate::db::ensure_blob_file(
-                                &store.root,
-                                &cas_file,
-                                &hash_hex,
-                                &bytes,
-                                false,
-                            )
-                            .is_ok()
-                        }
-                    } else {
-                        crate::db::ensure_blob_file(
-                            &store.root,
-                            &cas_file,
-                            &hash_hex,
-                            &bytes,
-                            false,
-                        )
-                        .is_ok()
-                    };
+                    let cas_ready = crate::db::ensure_blob_file(
+                        &store.root,
+                        &cas_file,
+                        &hash_hex,
+                        &bytes,
+                        false,
+                    )
+                    .is_ok();
 
                     if cas_ready {
                         #[cfg(unix)]
                         let already_same_cas_inode = crate::db::open_regular_nofollow(&cas_file)
                             .ok()
-                            .is_some_and(|(_, cm)| {
+                            .is_some_and(|(cf, cm)| {
                                 cm.dev() == meta.dev()
                                     && cm.ino() == meta.ino()
-                                    && (cm.permissions().mode() & 0o222) == 0
+                                    && crate::db::is_store_owned_immutable_cas_inode(
+                                        &cf, &cm, &hash_hex,
+                                    )
                             });
                         #[cfg(not(unix))]
                         let already_same_cas_inode = false;
@@ -4268,6 +4253,39 @@ mod tests {
                 fs::metadata(&olean_f)?.ino(),
                 fs::metadata(&mutated_cas)?.ino()
             );
+
+            // Also verify `dedup_worktree_packages` isolates against a pre-existing unstamped
+            // `pkg_cas` inode that has a retained open writable descriptor: dedup must replace
+            // `pkg_cas` with a fresh store-owned inode so post-dedup writes to the retained fd
+            // cannot corrupt either `pkg_cas` or deduplicated package artifacts!
+            let leaked_bytes = vec![0x77u8; 640];
+            let leaked_hash = blake3::hash(&leaked_bytes).to_hex().to_string();
+            let leaked_cas = store
+                .root
+                .join("pkg_cas")
+                .join(&leaked_hash[..2])
+                .join(&leaked_hash);
+            fs::create_dir_all(leaked_cas.parent().unwrap())?;
+            let mut retained_cas_rw = fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&leaked_cas)?;
+            std::io::Write::write_all(&mut retained_cas_rw, &leaked_bytes)?;
+            let old_cas_ino = retained_cas_rw.metadata()?.ino();
+            let olean_g = pkg_dir.join("G.olean");
+            let olean_h = pkg_dir.join("H.olean");
+            fs::write(&olean_g, &leaked_bytes)?;
+            fs::write(&olean_h, &leaked_bytes)?;
+            dedup_worktree_packages(&store, &wt)?;
+            assert_ne!(fs::metadata(&leaked_cas)?.ino(), old_cas_ino);
+            retained_cas_rw.seek(std::io::SeekFrom::Start(0))?;
+            std::io::Write::write_all(&mut retained_cas_rw, &vec![0xEEu8; 640])?;
+            drop(retained_cas_rw);
+            assert_eq!(fs::read(&leaked_cas)?, leaked_bytes);
+            assert_eq!(fs::read(&olean_g)?, leaked_bytes);
+            assert_eq!(fs::read(&olean_h)?, leaked_bytes);
         }
 
         match saved_wt_env {
