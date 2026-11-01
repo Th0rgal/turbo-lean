@@ -11125,19 +11125,15 @@ lean_exe «demo-exe» where
                 "rejected root must not seed actions or shards"
             );
             if poisoned_root {
-                for decl in [Some("bad".to_string()), None] {
+                for (path, decl) in [
+                    (target.clone(), Some("bad".to_string())),
+                    (target.clone(), None),
+                    (tree.project.clone(), None),
+                ] {
                     let outcome = crate::check::evaluate_check_command_value(
-                        &mut store,
-                        target.clone(),
-                        decl,
-                        tree.project.clone(),
+                        &mut store, path, decl, tree.project.clone(),
                     );
-                    assert!(
-                        outcome
-                            .as_ref()
-                            .map_or(true, |value| value["verified"] != true),
-                        "poisoned own artifact accepted: {outcome:?}"
-                    );
+                    assert!(outcome.is_err(), "forged own artifact accepted: {outcome:?}");
                 }
             }
         }
