@@ -141,6 +141,235 @@ const WORKTREE_LEASES_DDL: &str = "
     CREATE INDEX IF NOT EXISTS idx_wfb_blob ON worktree_file_blobs(blob_hash);
 ";
 
+const KERNEL_REPLAYED_OLEANS_DDL: &str = "
+    CREATE TABLE IF NOT EXISTS kernel_replayed_oleans (
+        artifact_digest TEXT NOT NULL,
+        replay_version INTEGER NOT NULL,
+        toolchain_hash TEXT NOT NULL,
+        module_name TEXT NOT NULL DEFAULT '',
+        verified_at INTEGER NOT NULL,
+        PRIMARY KEY (artifact_digest, replay_version, toolchain_hash)
+    );
+";
+
+const KERNEL_REPLAYED_OLEANS_AUTH_DDL: &str = "
+    CREATE TABLE IF NOT EXISTS kernel_replayed_oleans_auth (
+        artifact_digest TEXT NOT NULL,
+        environment_digest TEXT NOT NULL,
+        replay_version INTEGER NOT NULL,
+        toolchain_hash TEXT NOT NULL,
+        module_name TEXT NOT NULL DEFAULT '',
+        replay_mac TEXT NOT NULL,
+        verified_at INTEGER NOT NULL,
+        PRIMARY KEY (artifact_digest, environment_digest, replay_version, toolchain_hash)
+    );
+";
+
+const VERIFIER_REPLAY_HMAC_KEY_FILENAME: &str = ".verifier_replay_hmac_key";
+
+fn canonical_or_lexical_path(p: &Path) -> PathBuf {
+    if let Ok(canon) = p.canonicalize() {
+        return canon;
+    }
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("/"))
+            .join(p)
+    };
+    let mut cur = abs.as_path();
+    let mut tail = Vec::new();
+    while let Some(name) = cur.file_name() {
+        if let Ok(canon_cur) = cur.canonicalize() {
+            let mut out = canon_cur;
+            for comp in tail.into_iter().rev() {
+                out.push(comp);
+            }
+            return out;
+        }
+        tail.push(name.to_os_string());
+        match cur.parent() {
+            Some(parent) => cur = parent,
+            None => break,
+        }
+    }
+    abs
+}
+
+fn path_is_inside_any_disallowed_root(candidate: &Path, disallowed_roots: &[PathBuf]) -> bool {
+    if disallowed_roots.is_empty() {
+        return false;
+    }
+    let mut cand_paths = vec![canonical_or_lexical_path(candidate)];
+    if let Ok(meta) = fs::symlink_metadata(candidate) {
+        if meta.file_type().is_symlink() {
+            // If symlink itself sits inside a disallowed root (or points into one), reject both.
+            let raw_parent = candidate
+                .parent()
+                .map(canonical_or_lexical_path)
+                .unwrap_or_else(|| candidate.to_path_buf());
+            if let Some(fname) = candidate.file_name() {
+                cand_paths.push(raw_parent.join(fname));
+            }
+        }
+    }
+    for root in disallowed_roots {
+        if root.as_os_str().is_empty() {
+            continue;
+        }
+        let canon_root = canonical_or_lexical_path(root);
+        if cand_paths.iter().any(|cp| cp.starts_with(&canon_root)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn compute_kernel_replay_mac(
+    key: &[u8; 32],
+    artifact_digest: &str,
+    environment_digest: &str,
+    replay_version: u32,
+    toolchain_hash: &str,
+) -> String {
+    let mut msg = Vec::with_capacity(
+        64 + artifact_digest.len() + environment_digest.len() + toolchain_hash.len(),
+    );
+    msg.extend_from_slice(b"turbo-lean-verifier-replay-mac-v1\n");
+    msg.extend_from_slice(&(artifact_digest.len() as u64).to_le_bytes());
+    msg.extend_from_slice(artifact_digest.as_bytes());
+    msg.extend_from_slice(&(environment_digest.len() as u64).to_le_bytes());
+    msg.extend_from_slice(environment_digest.as_bytes());
+    msg.extend_from_slice(&replay_version.to_le_bytes());
+    msg.extend_from_slice(&(toolchain_hash.len() as u64).to_le_bytes());
+    msg.extend_from_slice(toolchain_hash.as_bytes());
+    blake3::keyed_hash(key, &msg).to_hex().to_string()
+}
+
+fn fill_os_csprng_bytes(buf: &mut [u8]) -> Result<()> {
+    use std::io::Read;
+    let mut f = File::open("/dev/urandom")
+        .context("Failed to open `/dev/urandom` for verifier replay HMAC key generation")?;
+    f.read_exact(buf)
+        .context("Failed to read 32 CSPRNG bytes from `/dev/urandom`")?;
+    anyhow::ensure!(
+        buf.iter().any(|&b| b != 0),
+        "CSPRNG returned all-zero key from `/dev/urandom`"
+    );
+    Ok(())
+}
+
+fn read_verified_replay_hmac_key_file(
+    key_path: &Path,
+    disallowed_roots: &[PathBuf],
+) -> Option<[u8; 32]> {
+    if path_is_inside_any_disallowed_root(key_path, disallowed_roots) {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let sym_meta = fs::symlink_metadata(key_path).ok()?;
+        if sym_meta.file_type().is_symlink() || !sym_meta.file_type().is_file() {
+            return None;
+        }
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true).custom_flags(libc::O_NOFOLLOW);
+        let mut f = opts.open(key_path).ok()?;
+        let meta = f.metadata().ok()?;
+        let euid = unsafe { libc::geteuid() };
+        if !meta.file_type().is_file()
+            || meta.uid() != euid
+            || (meta.mode() & 0o077) != 0
+            || meta.len() != 32
+        {
+            return None;
+        }
+        let mut key = [0u8; 32];
+        f.read_exact(&mut key).ok()?;
+        if key.iter().all(|&b| b == 0) {
+            return None;
+        }
+        Some(key)
+    }
+    #[cfg(not(unix))]
+    {
+        let bytes = fs::read(key_path).ok()?;
+        if bytes.len() != 32 || bytes.iter().all(|&b| b == 0) {
+            return None;
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        Some(key)
+    }
+}
+
+fn get_or_create_verified_replay_hmac_key(
+    store_root: &Path,
+    disallowed_roots: &[PathBuf],
+) -> Option<[u8; 32]> {
+    let db_path = store_root.join("state.db");
+    let key_path = store_root.join(VERIFIER_REPLAY_HMAC_KEY_FILENAME);
+    if path_is_inside_any_disallowed_root(store_root, disallowed_roots)
+        || path_is_inside_any_disallowed_root(&db_path, disallowed_roots)
+        || path_is_inside_any_disallowed_root(&key_path, disallowed_roots)
+    {
+        return None;
+    }
+    if let Some(existing) = read_verified_replay_hmac_key_file(&key_path, disallowed_roots) {
+        return Some(existing);
+    }
+    let lock_path = store_root.join("locks/verifier_replay_hmac_key.lock");
+    let _lock = crate::shm_cache::acquire_flock(&lock_path, true, false).ok()??;
+    if let Some(existing) = read_verified_replay_hmac_key_file(&key_path, disallowed_roots) {
+        return Some(existing);
+    }
+    // Remove any corrupt/untrusted file at `key_path` only if it is not a directory, then atomically install 0600 key.
+    if let Ok(meta) = fs::symlink_metadata(&key_path) {
+        if meta.file_type().is_dir() {
+            return None;
+        }
+        let _ = fs::remove_file(&key_path);
+    }
+    let mut fresh_key = [0u8; 32];
+    fill_os_csprng_bytes(&mut fresh_key).ok()?;
+    let tmp_path = store_root.join(format!(
+        ".verifier_replay_hmac_key.tmp.{}.{}",
+        std::process::id(),
+        crate::pack::next_tmp_id()
+    ));
+    let wrote = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut f = opts.open(&tmp_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        f.write_all(&fresh_key)?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if wrote.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+        return None;
+    }
+    if fs::rename(&tmp_path, &key_path).is_err() {
+        let _ = fs::remove_file(&tmp_path);
+        return read_verified_replay_hmac_key_file(&key_path, disallowed_roots);
+    }
+    read_verified_replay_hmac_key_file(&key_path, disallowed_roots)
+}
+
 fn template_shm_path() -> (PathBuf, u32) {
     let shm_base = if Path::new("/dev/shm").is_dir() {
         PathBuf::from("/dev/shm")
@@ -149,7 +378,7 @@ fn template_shm_path() -> (PathBuf, u32) {
     };
     let uid = unsafe { libc::geteuid() };
     (
-        shm_base.join(format!("turbo_lean_template_state_v5_{}.db", uid)),
+        shm_base.join(format!("turbo_lean_template_state_v7_{}.db", uid)),
         uid,
     )
 }
@@ -296,11 +525,28 @@ impl TurboStore {
                 let uver: i64 = conn
                     .query_row("PRAGMA user_version", [], |r| r.get(0))
                     .unwrap_or(0);
-                if uver < 3 {
+                if uver < 2 {
                     conn.execute_batch(&format!(
-                        "{}\nDELETE FROM file_stat_cache; DELETE FROM file_split_cache; PRAGMA user_version = 3;",
+                        "{}\nPRAGMA user_version = 2;",
                         WORKTREE_LEASES_DDL
                     ))?;
+                }
+                if uver < 3 {
+                    conn.execute_batch(&format!(
+                        "{}\nPRAGMA user_version = 3;",
+                        KERNEL_REPLAYED_OLEANS_DDL
+                    ))?;
+                }
+                if uver < 4 {
+                    conn.execute_batch(&format!(
+                        "{}\nPRAGMA user_version = 4;",
+                        KERNEL_REPLAYED_OLEANS_AUTH_DDL
+                    ))?;
+                }
+                if uver < 5 {
+                    let _ = conn.execute("DELETE FROM file_stat_cache", []);
+                    let _ = conn.execute("DELETE FROM file_split_cache", []);
+                    conn.execute_batch("PRAGMA user_version = 5;")?;
                 }
             }
         } else {
@@ -336,6 +582,8 @@ impl TurboStore {
                      PRIMARY KEY (worktree_id, rel_path)
                  );
                  {}
+                 {}
+                 {}
                  CREATE TABLE IF NOT EXISTS inflight_leases (
                      action_key TEXT PRIMARY KEY, fencing_token INTEGER NOT NULL, worker_pid INTEGER NOT NULL,
                      boot_id TEXT NOT NULL, started_at INTEGER NOT NULL, waiter_count INTEGER NOT NULL DEFAULT 1
@@ -353,10 +601,12 @@ impl TurboStore {
                      path_key TEXT PRIMARY KEY, mtime_sec INTEGER NOT NULL, mtime_nsec INTEGER NOT NULL,
                      size_bytes INTEGER NOT NULL, split_key TEXT NOT NULL, updated_at INTEGER NOT NULL
                  );
-                 PRAGMA user_version = 3;
+                 PRAGMA user_version = 5;
                  COMMIT;
                  PRAGMA wal_checkpoint(TRUNCATE);",
-                WORKTREE_LEASES_DDL
+                WORKTREE_LEASES_DDL,
+                KERNEL_REPLAYED_OLEANS_DDL,
+                KERNEL_REPLAYED_OLEANS_AUTH_DDL
             ))?;
             if !template_path.exists() {
                 if let Some(shm_base) = template_path.parent() {
@@ -1442,10 +1692,15 @@ impl TurboStore {
             let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
                 return false;
             };
+            let version = |field: &str| val[field].as_u64().and_then(|v| u32::try_from(v).ok());
             val["decl"].as_str().is_some_and(|d| {
                 crate::splitter::canonicalize_lean_name(d)
                     == crate::splitter::canonicalize_lean_name(expected_decl)
             }) && val["kernel_type_hash"].as_str() == Some(expected_kernel_type_hash)
+                && crate::zygote::verifier_provenance_ok(
+                    version("scanner_version").unwrap_or(0),
+                    version("replay_version").unwrap_or(0),
+                )
         })
     }
 
@@ -2056,6 +2311,118 @@ impl TurboStore {
             params![action_key, checker_name, checker_version, axioms_json, signature, now],
         )?;
         Ok(())
+    }
+
+    pub(crate) fn is_store_outside_disallowed_roots(&self, disallowed_roots: &[PathBuf]) -> bool {
+        let db_path = self.root.join("state.db");
+        let key_path = self.root.join(VERIFIER_REPLAY_HMAC_KEY_FILENAME);
+        !path_is_inside_any_disallowed_root(&self.root, disallowed_roots)
+            && !path_is_inside_any_disallowed_root(&db_path, disallowed_roots)
+            && !path_is_inside_any_disallowed_root(&key_path, disallowed_roots)
+    }
+
+    pub(crate) fn record_kernel_replayed_olean(
+        &self,
+        artifact_digest: &str,
+        environment_digest: &str,
+        replay_version: u32,
+        toolchain_hash: &str,
+        module_name: &str,
+        disallowed_roots: &[PathBuf],
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !artifact_digest.is_empty()
+                && !environment_digest.is_empty()
+                && replay_version > 0
+                && !toolchain_hash.is_empty(),
+            "Refusing to record empty kernel-replay authority row (fail-closed)"
+        );
+        if !self.is_store_outside_disallowed_roots(disallowed_roots) {
+            // Checkout-local / project-writable stores are never granted replay authority;
+            // verification still succeeds, and subsequent runs will always re-run kernel replay.
+            return Ok(());
+        }
+        let Some(key) = get_or_create_verified_replay_hmac_key(&self.root, disallowed_roots) else {
+            return Ok(());
+        };
+        let replay_mac = compute_kernel_replay_mac(
+            &key,
+            artifact_digest,
+            environment_digest,
+            replay_version,
+            toolchain_hash,
+        );
+        let now = now_unix();
+        self.conn.execute(
+            "INSERT INTO kernel_replayed_oleans_auth (
+                artifact_digest, environment_digest, replay_version, toolchain_hash, module_name, replay_mac, verified_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(artifact_digest, environment_digest, replay_version, toolchain_hash) DO UPDATE SET
+                module_name = excluded.module_name,
+                replay_mac = excluded.replay_mac,
+                verified_at = excluded.verified_at",
+            params![
+                artifact_digest,
+                environment_digest,
+                i64::from(replay_version),
+                toolchain_hash,
+                module_name,
+                replay_mac,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn has_kernel_replayed_olean(
+        &self,
+        artifact_digest: &str,
+        environment_digest: &str,
+        replay_version: u32,
+        toolchain_hash: &str,
+        disallowed_roots: &[PathBuf],
+    ) -> bool {
+        if artifact_digest.is_empty()
+            || environment_digest.is_empty()
+            || replay_version == 0
+            || toolchain_hash.is_empty()
+            || !self.is_store_outside_disallowed_roots(disallowed_roots)
+        {
+            return false;
+        }
+        let key_path = self.root.join(VERIFIER_REPLAY_HMAC_KEY_FILENAME);
+        let Some(key) = read_verified_replay_hmac_key_file(&key_path, disallowed_roots) else {
+            return false;
+        };
+        let Ok(stored_mac) = self.conn.query_row(
+            "SELECT replay_mac FROM kernel_replayed_oleans_auth
+             WHERE artifact_digest = ?1 AND environment_digest = ?2 AND replay_version = ?3 AND toolchain_hash = ?4
+             LIMIT 1",
+            params![
+                artifact_digest,
+                environment_digest,
+                i64::from(replay_version),
+                toolchain_hash
+            ],
+            |r| r.get::<_, String>(0),
+        ) else {
+            return false;
+        };
+        let expected_mac = compute_kernel_replay_mac(
+            &key,
+            artifact_digest,
+            environment_digest,
+            replay_version,
+            toolchain_hash,
+        );
+        stored_mac.len() == expected_mac.len()
+            && stored_mac
+                .as_bytes()
+                .iter()
+                .zip(expected_mac.as_bytes().iter())
+                .fold(0u8, |acc, (&a, &b)| acc | (a ^ b))
+                == 0
     }
 
     /// Single-transaction publication of an ingested worktree build action:
@@ -4670,6 +5037,98 @@ mod tests {
             .conn
             .execute_batch("DROP TRIGGER temp.abort_inflight_test;")?;
 
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_kernel_replayed_oleans_table_and_v2_migration() -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_db_replay_authority_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let cache_dir = tmp_dir.join("cache");
+        fs::create_dir_all(&cache_dir)?;
+
+        // Simulate a v2 DB before `kernel_replayed_oleans` existed.
+        {
+            let conn = Connection::open(cache_dir.join("state.db"))?;
+            conn.execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 CREATE TABLE blobs (blob_hash TEXT PRIMARY KEY, size_bytes INTEGER NOT NULL, ref_count INTEGER NOT NULL DEFAULT 0, pin_level INTEGER NOT NULL DEFAULT 0, last_accessed INTEGER NOT NULL);
+                 PRAGMA user_version = 2;",
+            )?;
+        }
+
+        let store = TurboStore::open(Some(&cache_dir))?;
+        let uv: i64 = store
+            .conn
+            .query_row("PRAGMA user_version;", [], |r| r.get(0))?;
+        assert_eq!(uv, 5);
+        assert!(!store.has_kernel_replayed_olean("dig1", "env1", 2, "tc1", &[]));
+        assert!(store
+            .record_kernel_replayed_olean("", "env1", 2, "tc1", "M", &[])
+            .is_err());
+        assert!(store
+            .record_kernel_replayed_olean("dig1", "", 2, "tc1", "M", &[])
+            .is_err());
+        assert!(store
+            .record_kernel_replayed_olean("dig1", "env1", 0, "tc1", "M", &[])
+            .is_err());
+        assert!(store
+            .record_kernel_replayed_olean("dig1", "env1", 2, "", "M", &[])
+            .is_err());
+
+        store.record_kernel_replayed_olean("dig1", "env1", 2, "tc1", "Dep.Good", &[])?;
+        assert!(store.has_kernel_replayed_olean("dig1", "env1", 2, "tc1", &[]));
+        assert!(!store.has_kernel_replayed_olean("dig2", "env1", 2, "tc1", &[]));
+        assert!(!store.has_kernel_replayed_olean("dig1", "env2", 2, "tc1", &[]));
+        assert!(!store.has_kernel_replayed_olean("dig1", "env1", 1, "tc1", &[]));
+        assert!(!store.has_kernel_replayed_olean("dig1", "env1", 3, "tc1", &[]));
+        assert!(!store.has_kernel_replayed_olean("dig1", "env1", 2, "tc2", &[]));
+
+        // Raw SQLite row insertion into `kernel_replayed_oleans` OR `kernel_replayed_oleans_auth`
+        // without the secret `.verifier_replay_hmac_key` MAC is never accepted.
+        store.conn.execute(
+            "INSERT INTO kernel_replayed_oleans (artifact_digest, replay_version, toolchain_hash, module_name, verified_at)
+             VALUES ('raw_legacy_dig', 2, 'tc1', 'Forged', 1)",
+            [],
+        )?;
+        assert!(!store.has_kernel_replayed_olean("raw_legacy_dig", "env1", 2, "tc1", &[]));
+        store.conn.execute(
+            "INSERT INTO kernel_replayed_oleans_auth (artifact_digest, environment_digest, replay_version, toolchain_hash, module_name, replay_mac, verified_at)
+             VALUES ('raw_forged_dig', 'env1', 2, 'tc1', 'Forged', '0000000000000000000000000000000000000000000000000000000000000000', 1)",
+            [],
+        )?;
+        assert!(!store.has_kernel_replayed_olean("raw_forged_dig", "env1", 2, "tc1", &[]));
+
+        // Checkout-local / disallowed store root is never granted replay authority even with a valid MAC.
+        assert!(!store.has_kernel_replayed_olean(
+            "dig1",
+            "env1",
+            2,
+            "tc1",
+            std::slice::from_ref(&tmp_dir)
+        ));
+
+        let ro = TurboStore::open(Some(&cache_dir))?;
+        assert!(ro.has_kernel_replayed_olean("dig1", "env1", 2, "tc1", &[]));
+
+        // Permissive key mode (`0644`) or missing key invalidates MAC verification and forces replay.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let key_path = cache_dir.join(VERIFIER_REPLAY_HMAC_KEY_FILENAME);
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o644))?;
+            assert!(!ro.has_kernel_replayed_olean("dig1", "env1", 2, "tc1", &[]));
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
+            assert!(ro.has_kernel_replayed_olean("dig1", "env1", 2, "tc1", &[]));
+        }
+
+        drop(ro);
+        drop(store);
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }

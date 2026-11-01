@@ -9334,7 +9334,16 @@ pub fn evaluate_agent_step_value(
                     }
                 }
                 if all_attested {
-                    crate::lake_build::recheck_dependents_if_nonlocal(&canon_dir, &resolved_file)?;
+                    crate::module_builder::ensure_imported_oleans_replayed(
+                        store,
+                        &canon_dir,
+                        std::slice::from_ref(&resolved_file),
+                    )?;
+                    crate::lake_build::recheck_dependents_if_nonlocal(
+                        store,
+                        &canon_dir,
+                        &resolved_file,
+                    )?;
                     let elapsed_ms =
                         (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
                     let first_shard = target_shards[0];

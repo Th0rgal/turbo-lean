@@ -3,12 +3,14 @@
 
 use crate::db::{SingleflightOutcome, TurboStore};
 use crate::lake_build::{
-    are_all_project_oleans_up_to_date, compute_shard_key_with_args, detect_toolchain,
-    load_and_split_files_cached, load_and_split_files_with_hashes_cached,
-    load_project_stat_summary_cached, resolve_lake_env, resolve_lean_bin,
-    resolve_or_share_lake_env, resolve_prebuilt_module_import, resolve_remote_lean_path,
-    seed_project_theorem_shards, seed_project_theorem_shards_from_splits, stage_lake_build_outputs,
-    FileSplitsWithCacheHits, SourceFileSplit,
+    are_all_project_oleans_replayed_in_store, are_all_project_oleans_up_to_date,
+    compute_shard_key_with_args, detect_toolchain,
+    ensure_project_and_imported_oleans_replayed_in_store, load_and_split_files_cached,
+    load_and_split_files_with_hashes_cached, load_project_stat_summary_cached, resolve_lake_env,
+    resolve_lean_bin, resolve_or_share_lake_env, resolve_remote_lean_path,
+    resolve_replayed_prebuilt_module_import, seed_project_theorem_shards,
+    seed_project_theorem_shards_from_splits, stage_lake_build_outputs, FileSplitsWithCacheHits,
+    SourceFileSplit,
 };
 use crate::pack;
 use crate::splitter::{self, split_lean_source, split_lean_source_fast_no_cone};
@@ -325,8 +327,11 @@ fn git_head_tree_cache_paths(
     toolchain: &str,
 ) -> (PathBuf, PathBuf) {
     let mut h = blake3::Hasher::new();
-    // v10: cached entries embed `theorem-shard-v1` keys.
-    h.update(b"git-head-tree:v10:");
+    // v12: hygiene-checked entries embed `theorem-shard-v3` keys. The verifier provenance
+    // versions retire entries whose verdicts predate the current scanner/kernel replay.
+    h.update(b"git-head-tree:v13:");
+    h.update(&crate::zygote::ZYGOTE_SCANNER_VERSION.to_le_bytes());
+    h.update(&crate::zygote::ZYGOTE_REPLAY_VERSION.to_le_bytes());
     h.update(repo_root.to_string_lossy().as_bytes());
     h.update(b":");
     h.update(canon_dir.to_string_lossy().as_bytes());
@@ -1217,16 +1222,13 @@ fn compute_source_only_import_digests(
                 Err(_) => {}
             }
         } else if strict_untrusted {
-            let is_tc = cfg_opt
-                .map(|cfg| {
-                    crate::module_builder::is_builtin_toolchain_module(
-                        &cfg.toolchain_lib_lean,
-                        &mod_name,
-                    )
-                })
-                .unwrap_or_else(|| {
-                    crate::module_builder::is_builtin_toolchain_module(Path::new(""), &mod_name)
-                });
+            let is_tc = cfg_opt.is_some_and(|cfg| {
+                crate::module_builder::is_builtin_toolchain_module(
+                    &cfg.toolchain_lib_lean,
+                    Some(&cfg.lean_githash),
+                    &mod_name,
+                )
+            });
             if !is_tc {
                 anyhow::bail!(
                     "Unresolved non-toolchain import `{}` in untrusted verification (fail-closed)",
@@ -2431,6 +2433,7 @@ fn resolve_untrusted_pr_project_config(
 struct PrVerificationTrust<'a> {
     is_untrusted: bool,
     untrusted_cfg: Option<&'a crate::module_builder::ProjectConfig>,
+    extra_ro_olean_dirs: Vec<PathBuf>,
 }
 
 /// Kernel-audited fallback for a shard the zygote could not check (`run_audited_lean_shard`,
@@ -2447,6 +2450,7 @@ fn run_lean_temp_file(
     expected_types: &[(String, String)],
     lean_args: &[String],
 ) -> Result<std::process::Output> {
+    crate::module_builder::validate_lean_args(lean_args).context("PR/CI shard Lean options")?;
     if trust.is_untrusted {
         let cfg = trust.untrusted_cfg.ok_or_else(|| {
             anyhow::anyhow!(
@@ -2494,13 +2498,20 @@ fn run_lean_temp_file(
 
         let (base_lp, ld_library_path_env) =
             crate::module_builder::build_lean_search_path(cfg, true);
-        let compile_lean_path_env = base_lp.clone();
         crate::module_builder::validate_untrusted_sandbox_search_paths(
             cfg,
             tc_prefix,
-            &compile_lean_path_env,
+            &base_lp,
             &ld_library_path_env,
         )?;
+        let mut compile_lp_parts = Vec::with_capacity(trust.extra_ro_olean_dirs.len() + 1);
+        for dir in &trust.extra_ro_olean_dirs {
+            compile_lp_parts.push(dir.to_string_lossy().to_string());
+        }
+        if !base_lp.is_empty() {
+            compile_lp_parts.push(base_lp.clone());
+        }
+        let compile_lean_path_env = compile_lp_parts.join(":");
 
         let mut cmd = Command::new(&bwrap_path);
         cmd.args([
@@ -2544,6 +2555,9 @@ fn run_lean_temp_file(
                 cmd.arg("--ro-bind").arg(&dp.pkg_root).arg(&dp.pkg_root);
             }
         }
+        for dir in &trust.extra_ro_olean_dirs {
+            cmd.arg("--ro-bind").arg(dir).arg(dir);
+        }
         cmd.arg("--ro-bind").arg(&src_dir.path).arg(&src_dir.path);
         cmd.arg("--bind").arg(&out_dir.path).arg(&out_dir.path);
         cmd.arg("--chdir").arg(&cfg.root_pkg.pkg_root);
@@ -2585,11 +2599,14 @@ fn run_lean_temp_file(
         crate::check::freeze_private_dir(&out_dir.path)?;
         crate::check::stage_isolated_module_artifacts(&out_dir.path, &reader_dir.path, &mod_name)?;
         crate::check::freeze_private_dir(&reader_dir.path)?;
-        let reader_lean_path_env = if base_lp.is_empty() {
-            reader_dir.path.to_string_lossy().to_string()
-        } else {
-            format!("{}:{}", reader_dir.path.display(), base_lp)
-        };
+        let mut reader_lp_parts = vec![reader_dir.path.to_string_lossy().to_string()];
+        for dir in &trust.extra_ro_olean_dirs {
+            reader_lp_parts.push(dir.to_string_lossy().to_string());
+        }
+        if !base_lp.is_empty() {
+            reader_lp_parts.push(base_lp);
+        }
+        let reader_lean_path_env = reader_lp_parts.join(":");
         let mut stub_ok = Vec::new();
         for sh in crate::splitter::split_lean_source(src, &[]).shards {
             if crate::splitter::strip_lean_comments(&sh.proof_text).trim() == "sorry"
@@ -2598,12 +2615,14 @@ fn run_lean_temp_file(
                 stub_ok.push(sh.decl_name().to_string());
             }
         }
+        let mut audit_ro_binds = vec![reader_dir.path.clone()];
+        audit_ro_binds.extend(trust.extra_ro_olean_dirs.iter().cloned());
         crate::zygote::audit_compiled_shard_module_with_zygote(
             store,
             cfg,
             &mod_name,
             &reader_lean_path_env,
-            std::slice::from_ref(&reader_dir.path),
+            &audit_ro_binds,
             &stub_ok,
             audit,
             expected_types,
@@ -2715,10 +2734,16 @@ pub fn run_ci_verify_command(
     let toolchain = detect_toolchain(&canon_dir);
     let ci_axioms = splitter::allowed_axioms();
     let mut hasher = blake3::Hasher::new();
+    // v4: outputs must come from kernel-replayed modules (incl. dependencies); the verifier
+    // provenance versions retire outputs recorded before the replay or across later bumps.
     hasher.update(
         format!(
-            "turbo-lean-ci-build-v2\n{}\n{}\n{}\n",
-            toolchain, trust_domain, cfg.canonical_config_digest
+            "turbo-lean-ci-build-v4\n{}\n{}\n{}\n{}:{}\n",
+            toolchain,
+            trust_domain,
+            cfg.canonical_config_digest,
+            crate::zygote::ZYGOTE_SCANNER_VERSION,
+            crate::zygote::ZYGOTE_REPLAY_VERSION
         )
         .as_bytes(),
     );
@@ -2870,7 +2895,11 @@ pub fn run_ci_verify_command(
         store.get_cached_action(&action_key, &trust_domain)?
     {
         store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
-        audit_untrusted_materialized(store)?;
+        if is_untrusted {
+            audit_untrusted_materialized(store)?;
+        } else {
+            ensure_project_and_imported_oleans_replayed_in_store(store, &canon_dir, &file_hashes)?;
+        }
         store.record_attestation(
             &action_key,
             "turbo-lean-ci-gate",
@@ -2885,8 +2914,9 @@ pub fn run_ci_verify_command(
         };
         ("cache_hit(coalesced=false)".to_string(), resolved_env)
     } else {
-        let oleans_up_to_date =
-            !is_untrusted && are_all_project_oleans_up_to_date(&canon_dir, &file_hashes);
+        let oleans_up_to_date = !is_untrusted
+            && are_all_project_oleans_up_to_date(&canon_dir, &file_hashes)
+            && are_all_project_oleans_replayed_in_store(store, &canon_dir, &file_hashes);
         let mut singleflight_hit_status: Option<String> = None;
         let lease_opt = if oleans_up_to_date {
             None
@@ -2899,7 +2929,15 @@ pub fn run_ci_verify_command(
             )? {
                 SingleflightOutcome::CacheHit { outputs, coalesced } => {
                     store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
-                    audit_untrusted_materialized(store)?;
+                    if is_untrusted {
+                        audit_untrusted_materialized(store)?;
+                    } else {
+                        ensure_project_and_imported_oleans_replayed_in_store(
+                            store,
+                            &canon_dir,
+                            &file_hashes,
+                        )?;
+                    }
                     store.record_attestation(
                         &action_key,
                         "turbo-lean-ci-gate",
@@ -3671,8 +3709,20 @@ pub(crate) fn probe_lean_ro_bwrap_command(
                 cfg.toolchain_lib.display()
             )
         })?;
-    let (lean_path_env, ld_library_path_env) =
+    let (base_lean_path_env, ld_library_path_env) =
         crate::module_builder::build_lean_search_path(&cfg, require_sandbox);
+    // `ro_binds[0]` is the probe's source scratch directory (`src_scratch`); any subsequent
+    // `ro_binds` entries are extra read-only `.olean` overlay directories (such as standalone
+    // project modules) needed by the probe compiler.
+    let mut lp_parts: Vec<String> = ro_binds
+        .iter()
+        .skip(1)
+        .map(|d| d.to_string_lossy().to_string())
+        .collect();
+    if !base_lean_path_env.is_empty() {
+        lp_parts.push(base_lean_path_env.clone());
+    }
+    let lean_path_env = lp_parts.join(":");
     let mut command = Command::new(bwrap);
     command
         .args([
@@ -4282,7 +4332,189 @@ fn kernel_statement_changes(
     base: &str,
     scope: Option<&Path>,
 ) -> Result<Vec<String>> {
-    kernel_statement_changes_with_trust(project, base, scope, None)
+    let store_dir = std::env::temp_dir().join(format!(
+        "turbo-stmt-store-{}-{}",
+        std::process::id(),
+        pack::next_tmp_id()
+    ));
+    struct StoreDirGuard(PathBuf);
+    impl Drop for StoreDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _guard = StoreDirGuard(store_dir.clone());
+    let store = TurboStore::open(Some(&store_dir))?;
+    kernel_statement_changes_with_trust(&store, project, base, scope, None)
+}
+
+fn certify_head_statement_modules_and_replay(
+    store: &TurboStore,
+    head_project: &Path,
+    policy: &StatementPolicy,
+    is_untrusted: bool,
+) -> Result<()> {
+    let cfg = crate::module_builder::resolve_project_config_with_trust(head_project, true)?;
+    let lib_dir = head_project
+        .join(&cfg.root_pkg.build_dir)
+        .join(&cfg.root_pkg.lean_lib_dir);
+    let statement_modules = statement_source_modules(head_project, &cfg.root_pkg)?;
+    if statement_modules.is_empty() {
+        return Ok(());
+    }
+    let mut head_root_mods: Vec<(String, PathBuf)> = Vec::with_capacity(statement_modules.len());
+    for (mod_name, (source, root)) in &statement_modules {
+        let rel = source.strip_prefix(head_project)?.to_string_lossy();
+        let src_text = fs::read_to_string(source)?;
+        let split = splitter::split_lean_source(&src_text, &[]);
+        anyhow::ensure!(
+            !split.hygiene.has_checking_weakening,
+            "Soundness hygiene violation in {rel}: {:?}",
+            split.hygiene.disallowed_items_under(&policy.axioms)
+        );
+        anyhow::ensure!(
+            !split.hygiene.native_violation_under(&policy.axioms),
+            "[TurboLean.KernelGate] native_decide/bv_decide in {rel} requires the base project's axiom allowlist"
+        );
+        let mut disallowed = split.hygiene.disallowed_items_under(&policy.axioms);
+        if !policy.csimp.is_empty() {
+            disallowed.retain(|item| item.rsplit(": ").next() != Some("csimp"));
+        }
+        anyhow::ensure!(
+            disallowed.is_empty(),
+            "PR Hygiene & Axiom Gate FAILED on {rel}: {disallowed:?}"
+        );
+        let olean_path = lib_dir
+            .join(source.strip_prefix(root)?)
+            .with_extension("olean");
+        anyhow::ensure!(
+            olean_path.is_file(),
+            "No built .olean for {} after stock checking (statement pinning fails closed)",
+            source.display()
+        );
+        head_root_mods.push((mod_name.clone(), olean_path));
+    }
+
+    let (lean_path, _) = crate::module_builder::build_lean_search_path(&cfg, true);
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(&lean_path).collect();
+    if !cfg.toolchain_lib_lean.as_os_str().is_empty() && !dirs.contains(&cfg.toolchain_lib_lean) {
+        dirs.push(cfg.toolchain_lib_lean.clone());
+    }
+    let replay_lp = if cfg.toolchain_lib_lean.as_os_str().is_empty() {
+        lean_path.clone()
+    } else {
+        format!("{lean_path}:{}", cfg.toolchain_lib_lean.display())
+    };
+
+    let mut worklist: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (mod_name, olean_path) in &head_root_mods {
+        seen.insert(mod_name.clone());
+        let bytes = fs::read(olean_path)?;
+        let (imps, _) =
+            crate::module_builder::parse_olean_binary_imports(&bytes).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Failed to parse binary `.olean` header of `{}`: fail-closed",
+                    olean_path.display()
+                )
+            })?;
+        worklist.extend(imps.into_iter().map(|i| i.module));
+    }
+    let mut dep_mods: Vec<(String, PathBuf)> = Vec::new();
+    while let Some(m) = worklist.pop() {
+        if !seen.insert(m.clone()) {
+            continue;
+        }
+        let rel_olean = format!(
+            "{}.olean",
+            crate::module_builder::module_name_to_rel_slash(&m)
+        );
+        let path = dirs
+            .iter()
+            .map(|d| d.join(&rel_olean))
+            .find(|p| p.is_file())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Unresolvable binary import `{m}` required by head statement build along LEAN_PATH: fail-closed"
+                )
+            })?;
+        if crate::module_builder::is_verified_toolchain_olean_file(
+            &cfg.toolchain_lib_lean,
+            Some(&cfg.lean_githash),
+            &path,
+        ) {
+            continue;
+        }
+        let bytes = fs::read(&path)?;
+        let (imps, _) =
+            crate::module_builder::parse_olean_binary_imports(&bytes).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Failed to parse binary `.olean` header of imported `{m}` (`{}`): fail-closed",
+                    path.display()
+                )
+            })?;
+        worklist.extend(imps.into_iter().map(|i| i.module));
+        dep_mods.push((m, path));
+    }
+    for (m, path) in &dep_mods {
+        crate::module_builder::verify_imported_package_module_source_hygiene(
+            &cfg,
+            m,
+            path,
+            &policy.axioms,
+        )?;
+    }
+
+    if is_untrusted {
+        let mut all_mods: Vec<String> = dep_mods
+            .into_iter()
+            .chain(head_root_mods)
+            .map(|(m, _)| m)
+            .collect();
+        all_mods.sort();
+        all_mods.dedup();
+        let prev_ax = std::env::var(splitter::ALLOWED_AXIOMS_ENV).ok();
+        let prev_csimp = std::env::var("TURBO_LEAN_ALLOWED_CSIMP").ok();
+        struct PolicyEnvGuard(Option<String>, Option<String>);
+        impl Drop for PolicyEnvGuard {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => std::env::set_var(splitter::ALLOWED_AXIOMS_ENV, v),
+                    None => std::env::remove_var(splitter::ALLOWED_AXIOMS_ENV),
+                }
+                match &self.1 {
+                    Some(v) => std::env::set_var("TURBO_LEAN_ALLOWED_CSIMP", v),
+                    None => std::env::remove_var("TURBO_LEAN_ALLOWED_CSIMP"),
+                }
+            }
+        }
+        let _env_guard = PolicyEnvGuard(prev_ax, prev_csimp);
+        std::env::set_var(splitter::ALLOWED_AXIOMS_ENV, policy.axioms.join(","));
+        std::env::set_var("TURBO_LEAN_ALLOWED_CSIMP", policy.csimp.join(","));
+        crate::zygote::audit_compiled_modules_with_zygote(
+            store,
+            &cfg,
+            &all_mods,
+            &replay_lp,
+            &[],
+            true,
+        )
+        .context(
+            "Head statement build `.olean` failed untrusted in-kernel soundness & replay audit",
+        )?;
+    } else {
+        let mut pending = Vec::new();
+        for (m, path) in dep_mods.iter().chain(head_root_mods.iter()) {
+            if !crate::module_builder::is_olean_replayed_in_store(store, &cfg, &replay_lp, path) {
+                pending.push(m.clone());
+            }
+        }
+        if !pending.is_empty() {
+            crate::zygote::kernel_replay_modules_with_zygote(store, &cfg, &pending, &replay_lp)
+                .context("Head statement build `.olean` failed independent kernel replay")?;
+        }
+    }
+    Ok(())
 }
 
 fn ensure_statement_lake_project(project: &Path) -> Result<()> {
@@ -4306,6 +4538,7 @@ fn ensure_statement_lake_project(project: &Path) -> Result<()> {
 }
 
 fn kernel_statement_changes_with_trust(
+    store: &TurboStore,
     project: &Path,
     base: &str,
     scope: Option<&Path>,
@@ -4360,13 +4593,15 @@ fn kernel_statement_changes_with_trust(
         .as_ref()
         .map(|s| s.path.join(project.strip_prefix(&repo).unwrap()))
         .unwrap_or_else(|| project.to_path_buf());
+    let policy = StatementPolicy::at(project, base);
     stock_statement_build_with_trust(&base_project, is_untrusted)?;
     let before =
         built_kernel_statements_with_trust(&base_project, relative_scope.as_deref(), is_untrusted)?;
     stock_statement_build_with_trust(&head_project, is_untrusted)?;
+    certify_head_statement_modules_and_replay(store, &head_project, &policy, is_untrusted)?;
     let after =
         built_kernel_statement_report(&head_project, relative_scope.as_deref(), is_untrusted)?;
-    StatementPolicy::at(project, base).audit(&after)?;
+    policy.audit(&after)?;
     Ok(compare_kernel_statements(&before, &after.statements))
 }
 
@@ -4406,6 +4641,12 @@ pub fn run_pr_verify_command(
         .canonicalize()
         .unwrap_or_else(|_| project_dir.clone());
     let is_untrusted = mode == "untrusted";
+    if !is_untrusted
+        && (canon_dir.join("lakefile.lean").is_file() || canon_dir.join("lakefile.toml").is_file())
+    {
+        crate::module_builder::resolve_project_config(&canon_dir)
+            .context("PR static Lean option validation failed")?;
+    }
     let trust_domain = if is_untrusted {
         "untrusted:ci".to_string()
     } else {
@@ -4423,9 +4664,10 @@ pub fn run_pr_verify_command(
     } else {
         None
     };
-    let verification_trust = PrVerificationTrust {
+    let mut verification_trust = PrVerificationTrust {
         is_untrusted,
         untrusted_cfg: untrusted_pr_cfg.as_ref(),
+        extra_ro_olean_dirs: Vec::new(),
     };
 
     let (mut classification, shards_by_file, current_files, current_splits) =
@@ -4440,6 +4682,11 @@ pub fn run_pr_verify_command(
         )?;
 
     for (file, split) in &current_splits {
+        anyhow::ensure!(
+            !split.hygiene.has_checking_weakening,
+            "Soundness hygiene violation in {file}: {:?}",
+            split.hygiene.disallowed_items()
+        );
         anyhow::ensure!(!split.hygiene.native_violation(),
             "[TurboLean.KernelGate] native_decide/bv_decide in {file} requires the base project's axiom allowlist");
     }
@@ -4452,33 +4699,86 @@ pub fn run_pr_verify_command(
     let lake_t0 = Instant::now();
     let mut lake_rechecked_modules = 0usize;
     let mut untrusted_deps_built = false;
+    let mut standalone_overlays: Vec<crate::lake_build::StandaloneOleanOverlay> = Vec::new();
+    let mut trusted_replay_targets: Vec<PathBuf> = shards_by_file
+        .keys()
+        .chain(classification.modified_files.iter())
+        .chain(classification.altered_interface_files.iter())
+        .map(|f| canon_dir.join(f))
+        .collect();
+    let mut trusted_replay_mods: Vec<String> = Vec::new();
     if !classification.altered_interface_files.is_empty() {
         if is_untrusted {
-            lake_rechecked_modules = crate::lake_build::untrusted_recheck_dependents(
-                store,
-                &canon_dir,
-                &classification.altered_interface_files,
-                &trust_domain,
-                json,
-            )?;
-            untrusted_deps_built = true;
+            let (rechecked_count, built_all, overlay) =
+                crate::lake_build::untrusted_recheck_dependents(
+                    store,
+                    &canon_dir,
+                    &classification.altered_interface_files,
+                    &trust_domain,
+                    json,
+                )?;
+            lake_rechecked_modules = rechecked_count;
+            untrusted_deps_built = built_all;
+            if let Some(ov) = overlay {
+                verification_trust
+                    .extra_ro_olean_dirs
+                    .push(ov.olean_dir.clone());
+                standalone_overlays.push(ov);
+            }
         } else {
-            lake_rechecked_modules = crate::lake_build::lake_recheck_dependents(
-                &canon_dir,
-                &classification.altered_interface_files,
-                Some(&base),
-            )?;
-        }
-    } else if !is_untrusted {
-        let edited: Vec<PathBuf> = shards_by_file.keys().map(|f| canon_dir.join(f)).collect();
-        if crate::lake_build::worktree_auto_link_disabled(&canon_dir) {
-            crate::lake_build::ensure_project_imports_fresh_for_check(&canon_dir, &edited)?;
-        } else if crate::lake_build::has_lake_config(&canon_dir) {
-            let imports = crate::lake_build::project_imports_of(&canon_dir, &edited);
-            if !imports.is_empty() {
-                crate::lake_build::lake_build_modules(&canon_dir, &imports, Some(&base))?;
+            let (rechecked_count, rechecked_files, rechecked_mods, overlay) =
+                crate::lake_build::lake_recheck_dependents_with_store(
+                    Some(store),
+                    &canon_dir,
+                    &classification.altered_interface_files,
+                    Some(&base),
+                    true,
+                )?;
+            lake_rechecked_modules = rechecked_count;
+            trusted_replay_targets.extend(rechecked_files);
+            trusted_replay_mods.extend(rechecked_mods);
+            if let Some(ov) = overlay {
+                verification_trust
+                    .extra_ro_olean_dirs
+                    .push(ov.olean_dir.clone());
+                standalone_overlays.push(ov);
             }
         }
+    }
+    if !is_untrusted {
+        if crate::lake_build::worktree_auto_link_disabled(&canon_dir) {
+            crate::lake_build::ensure_project_imports_fresh_for_check(
+                &canon_dir,
+                &trusted_replay_targets,
+            )?;
+        } else if crate::lake_build::has_lake_config(&canon_dir) {
+            crate::lake_build::ensure_project_imports_fresh_for_check(
+                &canon_dir,
+                &trusted_replay_targets,
+            )?;
+            let lib_lean_dir = canon_dir.join(".lake/build/lib/lean");
+            let missing_imports: Vec<String> =
+                crate::lake_build::project_imports_of(&canon_dir, &trusted_replay_targets)
+                    .into_iter()
+                    .filter(|m| {
+                        let rel = crate::module_builder::module_name_to_rel_slash(m);
+                        !lib_lean_dir.join(format!("{}.olean", rel)).is_file()
+                    })
+                    .collect();
+            if !missing_imports.is_empty() {
+                crate::lake_build::lake_build_modules(&canon_dir, &missing_imports, Some(&base))?;
+            }
+        }
+        trusted_replay_targets.sort();
+        trusted_replay_targets.dedup();
+        trusted_replay_mods.sort();
+        trusted_replay_mods.dedup();
+        crate::lake_build::ensure_modules_and_imports_replayed(
+            store,
+            &canon_dir,
+            &trusted_replay_targets,
+            &trusted_replay_mods,
+        )?;
     }
     let lake_recheck_ms = lake_t0.elapsed().as_millis();
 
@@ -4508,6 +4808,7 @@ pub fn run_pr_verify_command(
                     in_pkg_or_project
                         || !crate::module_builder::is_builtin_toolchain_module(
                             &cfg.toolchain_lib_lean,
+                            Some(&cfg.lean_githash),
                             m,
                         )
                 })
@@ -4534,6 +4835,32 @@ pub fn run_pr_verify_command(
         }
     }
 
+    if !shards_by_file.is_empty() {
+        let shard_target_files: Vec<PathBuf> = shards_by_file
+            .keys()
+            .map(|rel_path| canon_dir.join(rel_path))
+            .collect();
+        if let Some(ov) = crate::lake_build::build_imported_standalone_modules_overlay(
+            store,
+            &canon_dir,
+            &shard_target_files,
+            is_untrusted,
+            &trust_domain,
+            json,
+            Some(&base),
+        )? {
+            if !verification_trust
+                .extra_ro_olean_dirs
+                .contains(&ov.olean_dir)
+            {
+                verification_trust
+                    .extra_ro_olean_dirs
+                    .push(ov.olean_dir.clone());
+            }
+            standalone_overlays.push(ov);
+        }
+    }
+
     // Per-shard names and canonical kernel types must be attested by Lean before
     // cache hits or verification can be attributed to them.
     let mut all_edited_keys = Vec::new();
@@ -4545,12 +4872,13 @@ pub fn run_pr_verify_command(
         let abs_file = canon_dir.join(&rel_path);
         let shard_refs: Vec<&splitter::TheoremShard> =
             file_shards.iter().map(|(_, sh, _)| sh).collect();
-        let attested = crate::check::confirm_file_decl_identities_with_budget(
+        let attested = crate::check::confirm_file_decl_identities_with_extra_dirs(
             src,
             &shard_refs,
             &canon_dir,
             &abs_file,
             is_untrusted,
+            &verification_trust.extra_ro_olean_dirs,
             None,
         )?;
         let mut attested_file_shards = Vec::with_capacity(file_shards.len());
@@ -4614,6 +4942,7 @@ pub fn run_pr_verify_command(
     let statement_digest_t0 = Instant::now();
     let source_statement_edit = !classification.statement_edited_theorems.is_empty();
     classification.statement_edited_theorems = kernel_statement_changes_with_trust(
+        store,
         &canon_dir,
         &base,
         scope.as_deref(),
@@ -4658,21 +4987,38 @@ pub fn run_pr_verify_command(
     }
 
     if !uncached_by_file.is_empty() {
+        let prepend_standalone_dirs = |lp: String, dirs: &[PathBuf]| -> String {
+            if dirs.is_empty() {
+                return lp;
+            }
+            let prefix = dirs
+                .iter()
+                .map(|d| d.to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+                .join(":");
+            if lp.is_empty() {
+                prefix
+            } else {
+                format!("{}:{}", prefix, lp)
+            }
+        };
         let fast_lib_dir = canon_dir.join(".lake/build/lib/lean");
         let fast_local_zygote_url = if !is_untrusted && remote_http.is_none() {
             let mut fast_ev = std::collections::HashMap::new();
-            if fast_lib_dir.exists() {
-                fast_ev.insert(
-                    "LEAN_PATH".to_string(),
+            if fast_lib_dir.exists() || !verification_trust.extra_ro_olean_dirs.is_empty() {
+                let lp = prepend_standalone_dirs(
                     resolve_remote_lean_path(&canon_dir, None),
+                    &verification_trust.extra_ro_olean_dirs,
                 );
+                fast_ev.insert("LEAN_PATH".to_string(), lp);
             }
             pack::ensure_local_zygote_daemon(store, &fast_ev)
         } else {
             None
         };
         let (mut env_vars, lean_bin, lean_path_str) = if let Some(ref cfg) = untrusted_pr_cfg {
-            let (lp, ldp) = crate::module_builder::build_lean_search_path(cfg, true);
+            let (base_lp, ldp) = crate::module_builder::build_lean_search_path(cfg, true);
+            let lp = prepend_standalone_dirs(base_lp, &verification_trust.extra_ro_olean_dirs);
             let mut ev = std::collections::HashMap::new();
             if !lp.is_empty() {
                 ev.insert("LEAN_PATH".to_string(), lp.clone());
@@ -4682,14 +5028,23 @@ pub fn run_pr_verify_command(
             }
             (ev, cfg.lean_bin.to_string_lossy().to_string(), lp)
         } else if fast_local_zygote_url.is_some() && fast_lib_dir.exists() {
-            let lp = resolve_remote_lean_path(&canon_dir, None);
+            let lp = prepend_standalone_dirs(
+                resolve_remote_lean_path(&canon_dir, None),
+                &verification_trust.extra_ro_olean_dirs,
+            );
             let mut fast_ev = std::collections::HashMap::new();
             fast_ev.insert("LEAN_PATH".to_string(), lp.clone());
             (fast_ev, resolve_lean_bin(&canon_dir)?, lp)
         } else {
-            let (ev, _) = resolve_lake_env(store, &canon_dir)?;
+            let (mut ev, _) = resolve_lake_env(store, &canon_dir)?;
             let lb = resolve_lean_bin(&canon_dir)?;
-            let lp = resolve_remote_lean_path(&canon_dir, Some(&ev));
+            let lp = prepend_standalone_dirs(
+                resolve_remote_lean_path(&canon_dir, Some(&ev)),
+                &verification_trust.extra_ro_olean_dirs,
+            );
+            if !verification_trust.extra_ro_olean_dirs.is_empty() {
+                ev.insert("LEAN_PATH".to_string(), lp.clone());
+            }
             (ev, lb, lp)
         };
 
@@ -4731,7 +5086,9 @@ pub fn run_pr_verify_command(
                     .iter()
                     .map(|(_, sh, _)| sh.decl_name().to_string())
                     .collect();
-                if let Some(mod_imp) = resolve_prebuilt_module_import(&canon_dir, &abs_file) {
+                if let Some(mod_imp) =
+                    resolve_replayed_prebuilt_module_import(store, &canon_dir, &abs_file)
+                {
                     let fast_ok = if let Some(sp) = current_splits.get(rel_path) {
                         splitter::can_use_fast_olean_import_with_split(sp, &uncached_names)
                     } else {
@@ -4929,7 +5286,8 @@ pub fn run_pr_verify_command(
 
                     let mut remote_ok = false;
                     if can_fast_olean {
-                        if let Some(mod_imp) = resolve_prebuilt_module_import(&canon_dir, &canon_lf)
+                        if let Some(mod_imp) =
+                            resolve_replayed_prebuilt_module_import(store, &canon_dir, &canon_lf)
                         {
                             let fast_src_opt = if let Some(sp) = current_splits.get(&rel_path) {
                                 splitter::build_fast_olean_shard_source_with_split(
@@ -5002,7 +5360,14 @@ pub fn run_pr_verify_command(
                         .or_else(|| pack::ensure_local_zygote_daemon(store, &env_vars))
                 };
                 if !is_untrusted && local_zygote_url.is_none() && env_vars.is_empty() {
-                    if let Ok((ev, _)) = resolve_lake_env(store, &canon_dir) {
+                    if let Ok((mut ev, _)) = resolve_lake_env(store, &canon_dir) {
+                        if !verification_trust.extra_ro_olean_dirs.is_empty() {
+                            let lp = prepend_standalone_dirs(
+                                resolve_remote_lean_path(&canon_dir, Some(&ev)),
+                                &verification_trust.extra_ro_olean_dirs,
+                            );
+                            ev.insert("LEAN_PATH".to_string(), lp);
+                        }
                         env_vars = ev;
                     }
                 }
@@ -5052,8 +5417,11 @@ pub fn run_pr_verify_command(
 
                     let mut verified_ok = false;
                     if can_fast_olean {
-                        if let Some(mod_imp) = resolve_prebuilt_module_import(&canon_dir, &abs_file)
-                        {
+                        if let Some(mod_imp) = resolve_replayed_prebuilt_module_import(
+                            worker_store,
+                            &canon_dir,
+                            &abs_file,
+                        ) {
                             let fast_src_opt = if let Some(sp) = current_splits.get(rel_path) {
                                 splitter::build_fast_olean_shard_source_with_split(
                                     &src,
@@ -5724,8 +6092,10 @@ mod pr_verify_tests {
         let cfg = crate::module_builder::resolve_project_config(&tree.project)?;
         hasher.update(
             format!(
-                "turbo-lean-ci-build-v2\n{toolchain}\nuntrusted:ci\n{}\n",
-                cfg.canonical_config_digest
+                "turbo-lean-ci-build-v4\n{toolchain}\nuntrusted:ci\n{}\n{}:{}\n",
+                cfg.canonical_config_digest,
+                crate::zygote::ZYGOTE_SCANNER_VERSION,
+                crate::zygote::ZYGOTE_REPLAY_VERSION
             )
             .as_bytes(),
         );
@@ -6622,6 +6992,91 @@ end Fixture
     }
 
     #[test]
+    fn test_shard_subprocess_revalidates_options_before_execution() -> Result<()> {
+        use crate::module_builder::option_cases::*;
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_shard_options_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        let mut cfg = resolve_untrusted_pr_project_config(&dir, "leanprover/lean4:v4.35.0")?;
+        let store = TurboStore::open(Some(&dir.join("cache")))?;
+        let mut failures = Vec::new();
+        for &(name, value) in ORIGINAL_OPTIONS.iter().chain(RESTRICTED_OPTIONS) {
+            for prefix in PREFIXES {
+                if original_case_allowed(name, value, prefix) {
+                    continue;
+                }
+                let key = format!("{prefix}{name}");
+                for field in FIELDS {
+                    cfg.root_pkg.more_lean_args.clear();
+                    cfg.root_pkg.weak_lean_args.clear();
+                    cfg.root_pkg.lean_options.clear();
+                    match *field {
+                        "moreLeanArgs" => {
+                            cfg.root_pkg.more_lean_args.push(format!("-D{key}={value}"))
+                        }
+                        "weakLeanArgs" => {
+                            cfg.root_pkg.weak_lean_args.push(format!("-D{key}={value}"))
+                        }
+                        _ => {
+                            cfg.root_pkg
+                                .lean_options
+                                .insert(key.clone(), value.to_string());
+                        }
+                    }
+                    // Deliberately bypass config parsing: the process boundary must gate too.
+                    let args: Vec<_> = cfg
+                        .root_pkg
+                        .weak_lean_args
+                        .iter()
+                        .chain(&cfg.root_pkg.more_lean_args)
+                        .cloned()
+                        .chain(
+                            cfg.root_pkg
+                                .lean_options
+                                .iter()
+                                .map(|(k, v)| format!("-D{k}={v}")),
+                        )
+                        .collect();
+                    for is_untrusted in [false, true] {
+                        let result = run_lean_temp_file(
+                            &store,
+                            "must-not-execute",
+                            "theorem good : True := True.intro",
+                            &dir,
+                            &Default::default(),
+                            &PrVerificationTrust {
+                                is_untrusted,
+                                untrusted_cfg: Some(&cfg),
+                                extra_ro_olean_dirs: Vec::new(),
+                            },
+                            &Default::default(),
+                            &[],
+                            &args,
+                        );
+                        match result {
+                            Err(error) if format!("{error:#}").contains(&key) => {}
+                            result => {
+                                failures.push(format!("{field}/{is_untrusted}/{key}: {result:?}"))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        fs::remove_dir_all(dir)?;
+        assert!(
+            failures.is_empty(),
+            "shard options were not rejected: {}",
+            failures.join("\n")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_pr_verify_classification_proof_vs_statement_and_hygiene() {
         let base_refl = "namespace Demo\ndef addOne (n : Nat) : Nat := n + 1\ntheorem thm_unchanged (n : Nat) : addOne n = n + 1 := by\n  rfl\ntheorem thm_edited (n : Nat) : addOne n = n + 1 := by\n  rfl\nend Demo\n";
         let cur_refl_proof_only = "namespace Demo\ndef addOne (n : Nat) : Nat := n + 1\ntheorem thm_unchanged (n : Nat) : addOne n = n + 1 := by\n  rfl\ntheorem thm_edited (n : Nat) : addOne n = n + 1 := by\n  unfold addOne\n  rfl\nend Demo\n";
@@ -6816,7 +7271,6 @@ end Fixture
             crate::module_builder::VerifiedDepModuleEntry {
                 src_blake3: blake3::hash(src_raw.as_bytes()).to_hex().to_string(),
                 olean_artifact_digest: art_dig,
-                kernel_audited: true,
             },
         );
         fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
@@ -7917,7 +8371,7 @@ end Fixture
         )?;
         let edits = crate::lake_build::nonlocal_edits(&a_file, "HEAD");
         assert_eq!(
-            crate::lake_build::lake_recheck_dependents(&dir, &edits, None)?,
+            crate::lake_build::lake_recheck_dependents(&dir, &edits, None)?.0,
             2
         );
         // Non-local edit introducing an unallowed axiom (`native_decide` hidden via macro) is rejected by Stage 1C in untrusted mode.
@@ -8132,6 +8586,189 @@ end Fixture
     }
 
     #[test]
+    fn test_trusted_pr_verify_interface_change_replays_dependent_consumer_imports() -> Result<()> {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_pr_verify_trusted_closure_replay_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let proj = dir.join("proj");
+        let dep_pkg = proj.join(".lake/packages/dep_pkg");
+        fs::create_dir_all(proj.join("P"))?;
+        fs::create_dir_all(dep_pkg.join("Dep"))?;
+        let toolchain = include_str!("../../../lean/lean-toolchain");
+        fs::write(proj.join("lean-toolchain"), toolchain)?;
+        fs::write(dep_pkg.join("lean-toolchain"), toolchain)?;
+        fs::write(dep_pkg.join("Dep/Bad.lean"), "import Init\n")?;
+        fs::write(
+            dep_pkg.join("lakefile.toml"),
+            "name = \"dep_pkg\"\n[[lean_lib]]\nname = \"Dep\"\nroots = [\"Dep.Bad\"]\n",
+        )?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            r#"{"version": "1.2.0", "packagesDir": ".lake/packages", "packages": [{"type": "path", "name": "dep_pkg", "dir": ".lake/packages/dep_pkg", "configFile": "lakefile.toml", "inherited": false}], "name": "proj", "lakeDir": ".lake", "fixedToolchain": false}"#,
+        )?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"proj\"\ndefaultTargets = [\"P\"]\n[[require]]\nname = \"dep_pkg\"\npath = \".lake/packages/dep_pkg\"\n[[lean_lib]]\nname = \"P\"\nglobs = [\"P.+\"]\n",
+        )?;
+        fs::write(proj.join("P/A.lean"), "def k : Nat := 1\n")?;
+        fs::write(
+            proj.join("P/B.lean"),
+            "import P.A\nimport Dep.Bad\ntheorem b_uses_dep : False := dep_forged_false\n",
+        )?;
+
+        let cfg = crate::module_builder::resolve_project_config(&proj)?;
+        let lake_bin = cfg.lean_bin.parent().expect("lean bin parent").join("lake");
+        let lake_dep = Command::new(&lake_bin)
+            .args(["build", "Dep.Bad"])
+            .current_dir(&dep_pkg)
+            .env("SANDBOXED_ALLOW_RAW_LAKE", "1")
+            .output()?;
+        anyhow::ensure!(
+            lake_dep.status.success(),
+            "lake build Dep.Bad: {} {}",
+            String::from_utf8_lossy(&lake_dep.stdout),
+            String::from_utf8_lossy(&lake_dep.stderr)
+        );
+
+        let maker_path = dir.join("Maker.lean");
+        fs::write(
+            &maker_path,
+            "import Lean\nopen Lean\ndef main (args : List String) : IO Unit := do\n  searchPathRef.set [System.FilePath.mk args[1]!]\n  let env ← importModules #[{ module := `Init }] {} 0\n  let env := env.setMainModule `Dep.Bad\n  let decl : Declaration := .thmDecl {\n    name := `dep_forged_false,\n    levelParams := [],\n    type := mkConst ``False,\n    value := mkConst ``True.intro\n  }\n  match env.addDeclCore 0 0 decl none false with\n  | Except.ok env2 => writeModule env2 args[0]! false\n  | Except.error _ => throw <| IO.userError \"addDecl failed\"\n",
+        )?;
+        let forged_olean = dir.join("Bad.forged.olean");
+        let compile_forged = Command::new(&cfg.lean_bin)
+            .arg("--run")
+            .arg(&maker_path)
+            .arg(&forged_olean)
+            .arg(&cfg.toolchain_lib_lean)
+            .env("LEAN_PATH", &cfg.toolchain_lib_lean)
+            .output()?;
+        anyhow::ensure!(
+            compile_forged.status.success(),
+            "Maker.lean failed: {} {}",
+            String::from_utf8_lossy(&compile_forged.stdout),
+            String::from_utf8_lossy(&compile_forged.stderr)
+        );
+        let dep_lib_lean = dep_pkg.join(".lake/build/lib/lean");
+        fs::copy(&forged_olean, dep_lib_lean.join("Dep/Bad.olean"))?;
+        let new_h =
+            crate::module_builder::lake_hash_bytes(&fs::read(dep_lib_lean.join("Dep/Bad.olean"))?);
+        fs::write(
+            dep_lib_lean.join("Dep/Bad.olean.hash"),
+            format!("{:016x}\n", new_h),
+        )?;
+        let dep_trace_path = dep_lib_lean.join("Dep/Bad.trace");
+        let mut dep_tv: serde_json::Value = serde_json::from_slice(&fs::read(&dep_trace_path)?)?;
+        dep_tv["outputs"]["o"][0] = serde_json::Value::String(format!("{:016x}.olean", new_h));
+        fs::write(&dep_trace_path, serde_json::to_vec(&dep_tv)?)?;
+
+        let lake_proj = Command::new(&lake_bin)
+            .args(["build", "P.A", "P.B"])
+            .current_dir(&proj)
+            .env("SANDBOXED_ALLOW_RAW_LAKE", "1")
+            .output()?;
+        anyhow::ensure!(
+            lake_proj.status.success(),
+            "lake build P.A P.B: {} {}",
+            String::from_utf8_lossy(&lake_proj.stdout),
+            String::from_utf8_lossy(&lake_proj.stderr)
+        );
+
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec![
+                "add",
+                "lean-toolchain",
+                "lakefile.toml",
+                "lake-manifest.json",
+                "P/A.lean",
+                "P/B.lean",
+            ],
+            vec!["commit", "-m", "base"],
+        ] {
+            let g = Command::new("git")
+                .args(&args)
+                .current_dir(&proj)
+                .output()?;
+            anyhow::ensure!(
+                g.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&g.stderr)
+            );
+        }
+
+        // Interface change in `P/A.lean` (zero theorem shards in `P/A.lean`, `P/B.lean` untouched
+        // in the diff): `lake_recheck_dependents` rebuilds `P.A` and consumer `P.B`, which imports
+        // the forged Lake-built dependency `Dep.Bad`. Trusted `pr-verify` MUST kernel-replay the
+        // closure's imported `.olean`s and reject `Dep.Bad` (`KernelReplay`), rather than skipping
+        // `ensure_imported_oleans_replayed` on the `altered_interface_files` branch.
+        fs::write(proj.join("P/A.lean"), "def k : Nat := 2\n")?;
+        let mut store = TurboStore::open(Some(&dir.join("cache")))?;
+        let pr_err = run_pr_verify_command(
+            &mut store,
+            true,
+            proj.clone(),
+            "HEAD".to_string(),
+            "trusted".to_string(),
+            false,
+            None,
+            None,
+            None,
+            None,
+            false,
+            1,
+            None,
+        )
+        .unwrap_err();
+        let err_msg = format!("{pr_err:#}");
+        assert!(
+            err_msg.contains("KernelReplay"),
+            "trusted pr-verify on interface change with forged consumer dependency must fail KernelReplay, got: {err_msg}"
+        );
+
+        // Also test when the interface change itself has a theorem shard AND imports `Dep.Bad`:
+        // `altered_interface_files` is non-empty, and trusted `pr-verify` must still reject via
+        // `KernelReplay` before shard cache or statement checks.
+        fs::write(
+            proj.join("P/A.lean"),
+            "import Dep.Bad\ndef k : Nat := 3\ntheorem a_thm : False := dep_forged_false\n",
+        )?;
+        let pr_err_direct = run_pr_verify_command(
+            &mut store,
+            true,
+            proj.clone(),
+            "HEAD".to_string(),
+            "trusted".to_string(),
+            false,
+            None,
+            None,
+            None,
+            None,
+            false,
+            1,
+            None,
+        )
+        .unwrap_err();
+        let err_direct_msg = format!("{pr_err_direct:#}");
+        assert!(
+            err_direct_msg.contains("KernelReplay"),
+            "trusted pr-verify on interface change directly importing forged dependency must fail KernelReplay, got: {err_direct_msg}"
+        );
+
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
     fn test_statement_hash_lean_and_zygote_worker_statement_v1_parity() -> Result<()> {
         let dir = std::env::temp_dir().join(format!(
             "turbo_stmt_v1_parity_{}_{}",
@@ -8278,6 +8915,136 @@ end ParityNs
     }
 
     #[test]
+    fn test_pr_verify_rejects_unchanged_non_default_zero_shard_forged_module_and_emits_no_receipt(
+    ) -> Result<()> {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_pr_verify_unchanged_nondefault_forged_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let proj = dir.join("proj");
+        fs::create_dir_all(&proj)?;
+        let toolchain = include_str!("../../../lean/lean-toolchain");
+        fs::write(proj.join("lean-toolchain"), toolchain)?;
+        fs::write(proj.join(".gitignore"), ".lake/\n")?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            concat!(
+                "name = \"proj\"\n",
+                "defaultTargets = [\"MainLib\"]\n",
+                "[[lean_lib]]\nname = \"MainLib\"\nroots = [\"MainLib\"]\n",
+                "[[lean_lib]]\nname = \"HiddenLib\"\nroots = [\"HiddenLib\"]\n",
+            ),
+        )?;
+        fs::write(
+            proj.join("MainLib.lean"),
+            "theorem main_ok : (1 : Nat) = 1 := rfl\n",
+        )?;
+        fs::write(
+            proj.join("HiddenLib.lean"),
+            concat!(
+                "import Lean\n",
+                "open Lean Elab Command in\n",
+                "elab \"forge_bad\" : command => do\n",
+                "  let d : Declaration := .defnDecl {\n",
+                "    name := `HiddenLib.forged_false,\n",
+                "    levelParams := [],\n",
+                "    type := mkConst ``False,\n",
+                "    value := mkConst ``True.intro,\n",
+                "    hints := .opaque,\n",
+                "    safety := .safe\n",
+                "  }\n",
+                "  liftCoreM do\n",
+                "    match (← getEnv).addDeclCore 0 0 d none false with\n",
+                "    | .ok env' => setEnv env'\n",
+                "    | .error _ => throwError \"addDeclCore failed\"\n",
+                "forge_bad\n",
+            ),
+        )?;
+        git_init_and_commit(&proj, "base with unchanged non-default 0-shard forged lib")?;
+        fs::write(
+            proj.join("MainLib.lean"),
+            "theorem main_ok : (1 : Nat) = 1 := by rfl\n",
+        )?;
+
+        let receipt_path = dir.join("receipt.json");
+        let mut store = TurboStore::open(Some(&dir.join("cache")))?;
+        let err = run_pr_verify_command(
+            &mut store,
+            true,
+            proj.clone(),
+            "HEAD".to_string(),
+            "trusted".to_string(),
+            false,
+            Some(receipt_path.clone()),
+            None,
+            None,
+            None,
+            false,
+            1,
+            None,
+        )
+        .unwrap_err();
+        let err_msg = format!("{err:#}");
+        assert!(
+            err_msg.contains("KernelReplay") || err_msg.contains("kernel replay"),
+            "trusted pr-verify must fail-closed on unchanged non-default 0-shard forged module, got: {err_msg}"
+        );
+        assert!(
+            !receipt_path.exists(),
+            "pr-verify must not emit a receipt when unchanged non-default module fails kernel replay"
+        );
+
+        fs::write(
+            proj.join("HiddenLib.lean"),
+            "set_option debug.skipKernelTC true\ndef bad_def : True := True.intro\n",
+        )?;
+        fs::write(
+            proj.join("MainLib.lean"),
+            "theorem main_ok : (1 : Nat) = 1 := rfl\n",
+        )?;
+        git_init_and_commit(&proj, "base with unchanged non-default skipKernelTC")?;
+        fs::write(
+            proj.join("MainLib.lean"),
+            "theorem main_ok : (1 : Nat) = 1 := by rfl\n",
+        )?;
+        let err_hyg = run_pr_verify_command(
+            &mut store,
+            true,
+            proj.clone(),
+            "HEAD".to_string(),
+            "trusted".to_string(),
+            false,
+            Some(receipt_path.clone()),
+            None,
+            None,
+            None,
+            false,
+            1,
+            None,
+        )
+        .unwrap_err();
+        let err_hyg_msg = format!("{err_hyg:#}");
+        assert!(
+            err_hyg_msg.contains("Soundness hygiene violation")
+                && err_hyg_msg.contains("HiddenLib.lean"),
+            "trusted pr-verify must fail-closed on unchanged non-default checking-weakening directive, got: {err_hyg_msg}"
+        );
+        assert!(
+            !receipt_path.exists(),
+            "pr-verify must not emit a receipt when unchanged non-default module fails source hygiene"
+        );
+
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
     fn test_pr_verify_and_check_reject_kernel_type_mismatch_fail_closed() -> Result<()> {
         let dir = std::env::temp_dir().join(format!(
             "turbo_kth_mismatch_{}_{}",
@@ -8297,14 +9064,6 @@ end ParityNs
         )?;
         fs::write(dir.join(".gitignore"), ".lake/\ncache/\n")?;
 
-        // Craft a file where an unclosed section `variable (x : Nat)` precedes a command that
-        // keeps `shard_source` / fast-olean / cached receipts under test:
-        // First test cached-receipt poisoning in both `check --decl` and `pr-verify`:
-        // Pre-seed CAS with the exact `shard_key` for `Demo.lean::thm` carrying a forged
-        // `kernel_type_hash` (simulating a shard/cached statement whose kernel type differs
-        // from the attested theorem statement), and verify that unattested / mismatched CAS
-        // receipts are invalidated rather than accepted, AND that `verify_zygote_reply_decl_types`
-        // / `verify_attested_decl_types` fail closed whenever elaborated `decl_types` differ.
         let base_src =
             "namespace Demo\ntheorem thm (n : Nat) : n = n := by\n  exact rfl\nend Demo\n";
         let edited_src = "namespace Demo\ntheorem thm (n : Nat) : n = n := by\n  rfl\nend Demo\n";
@@ -8391,7 +9150,7 @@ end ParityNs
             None,
             None,
             false,
-            0, // 0 means unlimited; test cap=0 below via poisoning check first
+            0,
             None,
         );
         cap_err?;
@@ -8419,6 +9178,256 @@ end ParityNs
         assert_eq!(ns_item.decl_name, "Outer.Inner.same_name");
 
         let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_pr_verify_standalone_dependents_and_sibling_imports_across_modes() -> Result<()> {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_pr_verify_standalone_and_sibling_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let proj = dir.join("proj");
+        fs::create_dir_all(proj.join("P"))?;
+        let toolchain = include_str!("../../../lean/lean-toolchain");
+        fs::write(proj.join("lean-toolchain"), toolchain)?;
+        fs::write(proj.join(".gitignore"), ".lake/\n")?;
+        // Library `P` uses submodules glob `P.*`, so root-level `Standalone.lean` is NOT a Lake target.
+        fs::write(
+            proj.join("lakefile.lean"),
+            concat!(
+                "import Lake\nopen Lake DSL\n",
+                "package «proj»\n",
+                "@[default_target]\n",
+                "lean_lib «P» where\n",
+                "  globs := #[.submodules `P]\n",
+            ),
+        )?;
+        fs::write(proj.join("P/A.lean"), "def k : Nat := 1\n")?;
+        fs::write(proj.join("P/C.lean"), "def c_val : Nat := 7\n")?;
+        fs::write(
+            proj.join("P/D.lean"),
+            "import P.C\ntheorem d_thm : c_val = 7 := by decide\n",
+        )?;
+        fs::write(
+            proj.join("Standalone.lean"),
+            "import P.A\ndef use_k : Nat := k + 1\ntheorem standalone_ok : use_k = 2 := rfl\n",
+        )?;
+        // Umbrella root `P.lean` is ALSO standalone (`globs := #[.submodules `P]`) and shares top-level
+        // module prefix `P` with target submodule `P/A.lean` (`SearchPath.findWithExt` prefix-pinning case).
+        fs::write(
+            proj.join("P.lean"),
+            "import P.A\nimport P.C\ndef root_sum : Nat := k + c_val\n",
+        )?;
+        git_init_and_commit(&proj, "base with standalone module and sibling modules")?;
+
+        let fake_bwrap =
+            crate::module_builder::ScopedTestBwrapOverride::write_fake_bwrap_script(&dir)?;
+        let _bwrap =
+            crate::module_builder::ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy());
+        let mut store = TurboStore::open(Some(&dir.join("cache")))?;
+
+        let run_mode = |store: &mut TurboStore, mode: &str| {
+            run_pr_verify_command(
+                store,
+                true,
+                proj.clone(),
+                "HEAD".to_string(),
+                mode.to_string(),
+                false,
+                None,
+                None,
+                None,
+                None,
+                false,
+                0,
+                None,
+            )
+        };
+
+        // 1. Non-local interface edit in `P/A.lean` (`k : Nat := 2`) breaks untouched `Standalone.lean`
+        // (`use_k = 2` fails `rfl`) while sibling `P/D.lean` has a local proof edit importing `P.C`.
+        // Both trusted and untrusted modes must reject because `Standalone.lean` is in the dependent closure.
+        fs::write(proj.join("P/A.lean"), "def k : Nat := 2\n")?;
+        fs::write(
+            proj.join("P/D.lean"),
+            "import P.C\ntheorem d_thm : c_val = 7 := rfl\n",
+        )?;
+        for mode in ["trusted", "untrusted"] {
+            let err = format!("{:#}", run_mode(&mut store, mode).unwrap_err());
+            assert!(
+                err.contains("Standalone") || err.contains("standalone_ok"),
+                "{mode} pr-verify must reject broken untouched standalone dependent: {err}"
+            );
+        }
+
+        // 2. Fix `Standalone.lean` so the closure is valid, while `P/A.lean` still has a non-local edit
+        // AND `P/D.lean` has a local proof edit importing unbuilt sibling `P.C` (outside `P.A`'s closure).
+        // Both modes must build `P.C` and pass cleanly!
+        let _ = fs::remove_dir_all(proj.join(".lake/build"));
+        fs::write(
+            proj.join("Standalone.lean"),
+            "import P.A\ndef use_k : Nat := k + 1\ntheorem standalone_ok : use_k = 3 := rfl\n",
+        )?;
+        for mode in ["untrusted", "trusted"] {
+            let _ = fs::remove_dir_all(proj.join(".lake/build"));
+            let mut fresh_store = TurboStore::open(Some(&dir.join(format!("cache_pass_{mode}"))))?;
+            run_mode(&mut fresh_store, mode).unwrap_or_else(|e| {
+                panic!(
+                    "{mode} pr-verify must build sibling import P.C alongside non-local edit in P/A.lean: {e:#}"
+                )
+            });
+        }
+
+        // 3. Direct 0-shard non-local broken edit in `Standalone.lean` alone (e.g. ill-typed `def` or forged `addDeclCore`)
+        // must be rejected in both trusted and untrusted modes even though `Standalone.lean` has 0 theorem shards.
+        fs::write(proj.join("P/A.lean"), "def k : Nat := 1\n")?;
+        fs::write(
+            proj.join("P/D.lean"),
+            "import P.C\ntheorem d_thm : c_val = 7 := by decide\n",
+        )?;
+        fs::write(
+            proj.join("Standalone.lean"),
+            "import P.A\ndef broken_standalone : Nat := \"not a nat\"\n",
+        )?;
+        for mode in ["trusted", "untrusted"] {
+            let err = format!("{:#}", run_mode(&mut store, mode).unwrap_err());
+            assert!(
+                err.contains("Standalone"),
+                "{mode} pr-verify must reject 0-shard broken standalone edit: {err}"
+            );
+        }
+
+        // Forged 0-shard standalone declaration via `addDeclCore` must be caught by kernel replay / audit.
+        fs::write(
+            proj.join("Standalone.lean"),
+            concat!(
+                "import Lean\nopen Lean Elab Command in\n",
+                "elab \"forge_standalone\" : command => do\n",
+                "  let d : Declaration := .defnDecl {\n",
+                "    name := `Standalone.forged_false,\n",
+                "    levelParams := [],\n",
+                "    type := mkConst ``False,\n",
+                "    value := mkConst ``True.intro,\n",
+                "    hints := .opaque,\n",
+                "    safety := .safe\n",
+                "  }\n",
+                "  liftCoreM do\n",
+                "    match (← getEnv).addDeclCore 0 0 d none false with\n",
+                "    | .ok env' => setEnv env'\n",
+                "    | .error _ => throwError \"addDeclCore failed\"\n",
+                "forge_standalone\n",
+            ),
+        )?;
+        for mode in ["trusted", "untrusted"] {
+            let err = format!("{:#}", run_mode(&mut store, mode).unwrap_err());
+            assert!(
+                err.contains("KernelReplay")
+                    || err.contains("kernel replay")
+                    || err.contains("forged_false"),
+                "{mode} pr-verify must reject 0-shard forged standalone module: {err}"
+            );
+        }
+
+        // 4. Standalone module `Consumer.lean` importing standalone root umbrella `P.lean` (`import P`)
+        // alongside target submodule `P/A.lean` (`P.olean` + `P/A.olean` prefix-pinning case).
+        fs::write(
+            proj.join("Standalone.lean"),
+            "import P.A\ndef use_k : Nat := k + 1\ntheorem standalone_ok : use_k = 2 := rfl\n",
+        )?;
+        fs::write(
+            proj.join("Consumer.lean"),
+            "import P\ntheorem consumer_thm : root_sum = 8 := rfl\n",
+        )?;
+        for mode in ["trusted", "untrusted"] {
+            let _ = fs::remove_dir_all(proj.join(".lake/build"));
+            let mut fresh_store =
+                TurboStore::open(Some(&dir.join(format!("cache_umbrella_{mode}"))))?;
+            run_mode(&mut fresh_store, mode).unwrap_or_else(|e| {
+                panic!(
+                    "{mode} pr-verify must resolve standalone umbrella `P.lean` alongside `P/A.lean` and `P/C.lean`: {e:#}"
+                )
+            });
+        }
+
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_optout_trusted_pr_verify_with_nonlocal_leaf_still_rejects_stale_sibling_import(
+    ) -> Result<()> {
+        use crate::worktree_test_support::{assert_stale_error, snapshot, LakeTree};
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tree = LakeTree::new(
+            "stale_pr_with_nonlocal",
+            &[
+                ("P/A.lean", "def a : Nat := 1\n"),
+                ("P/Middle.lean", "import P.A\ndef mid : Nat := a\n"),
+                (
+                    "P/Target.lean",
+                    "import P.Middle\ntheorem target : a = 1 := rfl\n",
+                ),
+                ("StandaloneLeaf.lean", "def leaf : Nat := 10\n"),
+            ],
+        )?;
+        // Restrict `P` to submodules `P.*` so `StandaloneLeaf.lean` is standalone (zero Lake targets in closure),
+        // ensuring `altered_interface_files` is non-empty without failing `lake_build_modules` first,
+        // and verify `ensure_project_imports_fresh_for_check` still catches stale `P.A` while preserving `.lake`.
+        fs::write(
+            tree.project.join("lakefile.lean"),
+            concat!(
+                "import Lake\nopen Lake DSL\n",
+                "package «p»\n",
+                "@[default_target]\n",
+                "lean_lib «P» where\n",
+                "  globs := #[.submodules `P]\n",
+            ),
+        )?;
+        tree.opt_out()?;
+        git_init_and_commit(&tree.project, "base")?;
+        tree.stale_import()?;
+        fs::write(
+            tree.project.join("StandaloneLeaf.lean"),
+            "def leaf : Nat := 11\n",
+        )?;
+        fs::write(
+            tree.project.join("P/Target.lean"),
+            "import P.Middle\ntheorem target : a = 1 := by\n  rfl\n",
+        )?;
+        tree.prepare_snapshot(".lake/build/lib/lean/P/A.olean")?;
+        let before = snapshot(&tree.project)?;
+        let mut store = TurboStore::open(Some(&tree.root.join("cache")))?;
+        let err = run_pr_verify_command(
+            &mut store,
+            true,
+            tree.project.clone(),
+            "HEAD".into(),
+            "trusted".into(),
+            false,
+            None,
+            None,
+            None,
+            None,
+            false,
+            0,
+            None,
+        )
+        .unwrap_err();
+        assert_stale_error(&err);
+        assert_eq!(snapshot(&tree.project)?, before);
         Ok(())
     }
 }

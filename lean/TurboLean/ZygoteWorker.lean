@@ -9,6 +9,7 @@
 import Lean.Elab.Frontend
 import Lean.Data.Json
 import Lean.Util.CollectAxioms
+import Lean.Replay
 import Lean.Compiler.ImplementedByAttr
 import Lean.Compiler.ExternAttr
 import Lean.Compiler.CSimpAttr
@@ -480,6 +481,39 @@ def collectNewDeclUsedConstants (beforeEnv afterEnv : Environment) : Array Strin
         out := out.push cs
   return out
 
+/-- Independent kernel replay. `IO.processCommands` honors source-level options such as
+    `set_option debug.skipKernelTC true` (or `set_option … in`), and these options persist in cached
+    prefix `Command.State`s. So every declaration added since `beforeEnv` is sent to the kernel again,
+    starting from `beforeEnv`'s kernel environment with checking forced on and ignoring all elaboration
+    options (`Kernel.Environment.replay` calls `addDeclCore` directly). Inductive types are re-added
+    and their constructors and recursors must match the regenerated ones exactly. The replay skips
+    `unsafe` declarations (`auditNewKernelDecls` rejects them) and `partial` ones (the kernel never
+    lets a safe declaration refer to them). Changing a constant that existed before the request also
+    fails the check. Returns the errors; an empty list means the replay succeeded. -/
+def kernelReplayNewDecls (beforeEnv afterEnv : Environment) : IO (List String) := do
+  let beforeMap := beforeEnv.constants.map₂
+  let afterMap := afterEnv.constants.map₂
+  let mut errs : List String := []
+  for (name, oldInfo) in beforeMap.toList do
+    match afterMap.find? name with
+    | some newInfo =>
+      if !(newInfo == oldInfo) then
+        errs := errs ++ [s!"[TurboLean.KernelReplay] declaration `{name}` from the checked prefix was replaced"]
+    | none =>
+      errs := errs ++ [s!"[TurboLean.KernelReplay] declaration `{name}` from the checked prefix is missing"]
+  let newConsts : Std.HashMap Name ConstantInfo := afterMap.foldl (fun acc name cinfo =>
+    if beforeMap.contains name then acc else acc.insert name cinfo) {}
+  for (name, _) in newConsts.toList do
+    if beforeEnv.contains name then
+      errs := errs ++ [s!"[TurboLean.KernelReplay] declaration `{name}` redeclares an imported constant"]
+  if !errs.isEmpty || newConsts.isEmpty then
+    return errs
+  try
+    let _ ← beforeEnv.toKernelEnv.replay newConsts
+    return []
+  catch e =>
+    return [s!"[TurboLean.KernelReplay] independent kernel re-check failed: {e}"]
+
 /-- 256-bit cryptographic BLAKE3 content digest over raw artifact bytes. -/
 def hashBytesBlake3Hex (bs : ByteArray) : String :=
   TurboLean.Blake3.blake3Bytes bs
@@ -570,6 +604,10 @@ def runCommandsFromState
   let mut declTypes : List (String × String) := []
   if allMessages.any isRuntimePanicText then
     errs := errs ++ [runtimePanicErr]
+  -- Primary gate: re-check every new declaration in the kernel, independently of the options the
+  -- elaborator ran under. Checkpoints are only cached after this passes, so prefix declarations are
+  -- covered by induction (each prefix/delta replay starts from an already replayed environment).
+  errs := errs ++ (← kernelReplayNewDecls baseState.env s.commandState.env)
   if !evalMode then
     let explicitStubToken := ":= " ++ forbiddenToken
     let allowSorryInKernel := allowStub && (code.splitOn explicitStubToken).length > 1
@@ -588,6 +626,8 @@ def runCommandsFromState
     for zero forbidden axioms (`sorryAx`, `reduceBool`, `trustCompiler`). -/
 def writeVerifiedModuleOlean (baseEnv finalEnv : Environment) (modName : Name) (oleanPath : System.FilePath) : IO Bool := do
   if modName.isAnonymous || finalEnv.mainModule != modName then
+    return false
+  if !(← kernelReplayNewDecls baseEnv finalEnv).isEmpty then
     return false
   let (clean, kErrs) ← auditNewKernelDecls baseEnv finalEnv false
   if !clean || !kErrs.isEmpty then
@@ -972,16 +1012,55 @@ def collectStubDecls (consts : Array ConstantInfo) (stubOk : Array String) :
         [s!"[TurboLean.KernelGate] prefix stub `{e}` is ambiguous: {hits.map (·.name)}"]
   return (out, violations)
 
+/-- Recheck the complete (most private) module data against only its imports, as in
+    LeanChecker.replayFromImports. Importing the target itself would trust its declarations
+    without checking their types. Both module and shard audits call this same gate. -/
+def replayAuditedModule (moduleName : Name) : IO Unit := do
+  let file ← findOLean moduleName
+  let mut files := #[file]
+  let server := OLeanLevel.server.adjustFileName file
+  if ← server.pathExists then
+    files := files.push server
+    let privateFile := OLeanLevel.private.adjustFileName file
+    if ← privateFile.pathExists then
+      files := files.push privateFile
+  let parts ← readModuleDataParts files
+  if h : parts.size = 0 then
+    throw <| IO.userError s!"missing module data for `{moduleName}`"
+  else
+  let mod := parts[0].1
+  let (_, imports) ← importModulesCore mod.imports |>.run
+  let base ← finalizeImport imports mod.imports {} 0 false false (isModule := true)
+  let mut constants := {}
+  let full := parts[parts.size - 1].1
+  for name in full.constNames, ci in full.constants do
+    if base.contains name then
+      throw <| IO.userError s!"`{moduleName}` redeclares imported constant `{name}`"
+    constants := constants.insert name ci
+  discard <| base.toKernelEnv.replay constants
+
 def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Name))
     (ffiAllow : Array (Name × Name × String) := #[])
     (patterns : List String := []) (csimpPatterns : List String := [])
-    (stubs : Std.HashSet Name := {}) : List String := Id.run do
+    (stubs : Std.HashSet Name := {}) : IO (List String) := do
   let csimpAllowed := fun name : Name => csimpPatterns.any (globMatch ·.toList name.toString.toList)
   let unsfTag := "un" ++ "safe"
   let mut violations : List String := []
   let mut targetIdxs : Std.HashMap ModuleIdx String := {}
   let mut allRoots : Array Name := #[]
-  for (_, nm) in targets do
+  for (rawStr, nm) in targets do
+    try
+      -- Compacted import regions are not reclaimed automatically. Isolate each replay so
+      -- repeated dependency imports cannot exhaust the auditor's 8 GiB sandbox limit.
+      -- The child only reads module data and kernel-replays; it never runs initializers.
+      let replay ← IO.Process.output {
+        cmd := (← IO.appPath).toString
+        args := #["--kernel-replay-module", nm.toString]
+      }
+      unless replay.exitCode == 0 do
+        throw <| IO.userError s!"kernel replay child exited {replay.exitCode}: {replay.stderr}"
+    catch e =>
+      violations := violations ++ [s!"[TurboLean.KernelReplay] independent kernel re-check of `{rawStr}` failed: {e}"]
     if let some modIdx := env.getModuleIdx? nm then
       if h : modIdx.toNat < env.header.moduleData.size then
         for cinfo in env.header.moduleData[modIdx.toNat].constants do
@@ -1156,12 +1235,12 @@ def auditShardModule (target : String × Name) (ffiAllow : Array (Name × Name �
         if rawNm != userNm && !(seen[rawNm]?.getD false) then
           seen := seen.insert rawNm true
           declTypes := declTypes ++ [(rawNm, h)]
-    return (stubViolations ++ auditImportedModulesInEnv env #[target] ffiAllow patterns csimpPatterns stubs,
+    return (stubViolations ++ (← auditImportedModulesInEnv env #[target] ffiAllow patterns csimpPatterns stubs),
       decls, declTypes)
   catch e =>
     return ([s!"[TurboLean.KernelGate] failed to import `{target.1}` for audit: {e}"], #[], [])
 
-partial def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name × Name × String) := #[]) : IO (List String) := do
+def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name × Name × String) := #[]) : IO (List String) := do
   if slice.isEmpty then
     return []
   let patterns := (((← IO.getEnv "TURBO_LEAN_ALLOWED_AXIOMS").getD "").splitOn ",").filterMap fun p =>
@@ -1179,50 +1258,36 @@ partial def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array 
     pure (Except.error (toString e))
   match batchRes with
   | .ok env =>
-    return auditImportedModulesInEnv env slice ffiAllow patterns csimpPatterns
+    auditImportedModulesInEnv env slice ffiAllow patterns csimpPatterns
   | .error errMsg =>
     if slice.size == 1 then
       let (rawStr, _) := slice[0]!
       return [s!"[TurboLean.KernelGate] failed to import `{rawStr}` for audit: {errMsg}"]
-    let missingIdx? : Option Nat := Id.run do
-      if (errMsg.splitOn "does not exist").length > 1 then
-        let parts := errMsg.splitOn "of module "
-        if parts.length > 1 then
-          let modPart := ((parts[1]!).splitOn " does not exist").headD ""
-          if !modPart.isEmpty then
-            return slice.findIdx? (fun (_, nm) => nm.toString == modPart)
-      return none
-    match missingIdx? with
-    | some idx =>
-      let (rawStr, _) := slice[idx]!
-      let without := (slice.extract 0 idx) ++ (slice.extract (idx + 1) slice.size)
-      let vRest ← auditModuleSlice without ffiAllow
-      return [s!"[TurboLean.KernelGate] failed to import `{rawStr}` for audit: {errMsg}"] ++ vRest
-    | none =>
-      let collideIdx? : Option Nat := Id.run do
-        let parts := errMsg.splitOn "import "
-        if parts.length > 1 then
-          let modPart := ((parts[1]!).splitOn " failed").headD ""
-          if !modPart.isEmpty then
-            return slice.findIdx? (fun (_, nm) => nm.toString == modPart)
-        return none
-      match collideIdx? with
-      | some idx =>
-        if idx > 0 then
-          let without := (slice.extract 0 idx) ++ (slice.extract (idx + 1) slice.size)
-          let vRest ← auditModuleSlice without ffiAllow
-          let vSingle ← auditModuleSlice #[slice[idx]!] ffiAllow
-          return vRest ++ vSingle
-        else
-          let mid := slice.size / 2
-          let v1 ← auditModuleSlice (slice.extract 0 mid) ffiAllow
-          let v2 ← auditModuleSlice (slice.extract mid slice.size) ffiAllow
-          return v1 ++ v2
-      | none =>
-        let mid := slice.size / 2
-        let v1 ← auditModuleSlice (slice.extract 0 mid) ffiAllow
-        let v2 ← auditModuleSlice (slice.extract mid slice.size) ffiAllow
-        return v1 ++ v2
+    -- Compacted `.olean` import regions are never unmapped within a single OS process; bisecting
+    -- `Lean.importModules` in-process would accumulate mappings across retries and exhaust the
+    -- untrusted 8 GiB `RLIMIT_DATA` cap. Spawn fresh OS child processes for each half instead.
+    let app := (← IO.appPath).toString
+    let ffiFlags : Array String := ffiAllow.map fun (m, d, sym) =>
+      s!"--ffi-allow={m}={d}={sym}"
+    let runSubSlice (sub : Array (String × Name)) : IO (List String) := do
+      let modFlags := sub.map (·.1)
+      let child ← IO.Process.output {
+        cmd := app
+        args := #["--audit-modules"] ++ ffiFlags ++ modFlags
+      }
+      if child.exitCode == 0 then
+        return []
+      let lastJson? := (child.stdout.splitOn "\n").reverse.find? fun l =>
+        let t := l.trimAscii.toString
+        t.startsWith "{" && t.endsWith "}"
+      let detail := (lastJson?.getD child.stdout).trimAscii.toString
+      let errTail := child.stderr.trimAscii.toString
+      let summary := if detail.isEmpty then errTail else if errTail.isEmpty then detail else s!"{detail} ({errTail})"
+      return [s!"[TurboLean.KernelGate] sub-batch audit failed (exit {child.exitCode}) on {modFlags.toList}: {summary}"]
+    let mid := slice.size / 2
+    let v1 ← runSubSlice (slice.extract 0 mid)
+    let v2 ← runSubSlice (slice.extract mid slice.size)
+    return v1 ++ v2
 
 def auditCompiledModules (modNames : List String) (ffiAllow : Array (Name × Name × String) := #[]) : IO (Bool × List String) := do
   let mut parsed : Array (String × Name) := #[]
@@ -1263,6 +1328,9 @@ def main (args : List String) : IO Unit := do
       dedupSp := dedupSp ++ [p]
   Lean.searchPathRef.set dedupSp
   match args with
+  | ["--kernel-replay-module", moduleName] =>
+    TurboLean.ZygoteWorker.replayAuditedModule (TurboLean.ZygoteWorker.parseModuleName moduleName)
+    return
   | "--audit-modules" :: modArgs =>
     let stdout ← IO.getStdout
     let (ffiArgs, rest) := modArgs.partition (·.startsWith "--ffi-allow=")

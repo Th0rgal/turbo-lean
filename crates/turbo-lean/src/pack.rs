@@ -2866,7 +2866,9 @@ pub fn offload_check_shards_batch_http(
                     "prefix_env_hash": item.prefix_env_hash,
                     "stmt_hash": item.stmt_hash,
                     "proof_hash": item.proof_hash,
-                    "verified_at": now
+                    "verified_at": now,
+                    "scanner_version": crate::zygote::ZYGOTE_SCANNER_VERSION,
+                    "replay_version": crate::zygote::ZYGOTE_REPLAY_VERSION
                 });
                 if let Some(ref ad) = args_digest_opt {
                     if let Some(map) = receipt_obj.as_object_mut() {
