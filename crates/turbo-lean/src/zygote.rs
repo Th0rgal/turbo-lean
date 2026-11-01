@@ -1480,6 +1480,30 @@ fn is_toolchain_builtin_module(mod_name: &str) -> bool {
         || mod_name.starts_with("Lake.")
 }
 
+pub(crate) fn is_sysroot_lib_lean_dir(dir: &Path) -> bool {
+    let check = |p: &Path| {
+        p.ends_with("lib/lean")
+            && p.parent().and_then(|lib| lib.parent()).is_some_and(|tc| {
+                tc.join("bin/lean").is_file() || tc.join("bin/lean.exe").is_file()
+            })
+    };
+    check(dir) || fs::canonicalize(dir).ok().is_some_and(|c| check(&c))
+}
+
+pub(crate) fn is_toolchain_dir_match(dir: &Path, toolchain_lib: Option<&Path>) -> bool {
+    match toolchain_lib {
+        Some(tc) => {
+            dir == tc
+                || is_sysroot_lib_lean_dir(dir)
+                || fs::canonicalize(dir).ok().is_some_and(|c| {
+                    let canon_tc = fs::canonicalize(tc).unwrap_or_else(|_| tc.to_path_buf());
+                    c == canon_tc || c.starts_with(&canon_tc)
+                })
+        }
+        None => is_sysroot_lib_lean_dir(dir),
+    }
+}
+
 fn is_resolved_toolchain_builtin(
     search_dirs: &[&Path],
     mod_name: &str,
@@ -1495,17 +1519,11 @@ fn is_resolved_toolchain_builtin(
     if let Some(tc) = toolchain_lib {
         return tc.join(&rel).is_file();
     }
-    let on_tc = |d: &Path| {
-        d.ends_with("lib/lean")
-            && d.parent()
-                .and_then(|lib| lib.parent())
-                .is_some_and(|tc| tc.join("bin/lean").exists())
-    };
-    !search_dirs.iter().copied().any(on_tc)
+    !search_dirs.iter().copied().any(is_sysroot_lib_lean_dir)
         || search_dirs
             .iter()
             .copied()
-            .filter(|d| on_tc(d))
+            .filter(|d| is_sysroot_lib_lean_dir(d))
             .any(|d| d.join(&rel).is_file())
 }
 
@@ -1524,17 +1542,8 @@ fn resolve_closure_module(
     let root = search_dirs
         .iter()
         .find(|d| d.join(pkg).is_dir() || d.join(format!("{pkg}.olean")).exists());
-    let on_toolchain = |d: &Path| match toolchain_lib {
-        Some(tc) => d == tc || fs::canonicalize(d).ok().is_some_and(|c| c.starts_with(tc)),
-        None => {
-            d.ends_with("lib/lean")
-                && d.parent()
-                    .and_then(|lib| lib.parent())
-                    .is_some_and(|tc| tc.join("bin/lean").exists())
-        }
-    };
     if is_resolved_toolchain_builtin(search_dirs, mod_name, toolchain_lib)
-        && root.is_none_or(|d| on_toolchain(d))
+        && root.is_none_or(|d| is_toolchain_dir_match(d, toolchain_lib))
     {
         return None;
     }
@@ -2533,6 +2542,13 @@ fn collect_closure_snapshots(root: &Path, keep: &str) {
 ///    immediately changes `pool_key` and spawns a fresh worker, without scanning 5,400+
 ///    immutable `.lake/packages/*` `.olean` files on every cold CLI invocation.
 pub fn compute_search_path_oleans_digest(effective_lean_path: &str) -> String {
+    compute_search_path_oleans_digest_with_toolchain(effective_lean_path, None)
+}
+
+fn compute_search_path_oleans_digest_with_toolchain(
+    effective_lean_path: &str,
+    toolchain_lib: Option<&Path>,
+) -> String {
     fn collect_oleans_rec(dir: &Path, depth: usize, out: &mut Vec<PathBuf>, max_files: usize) {
         if depth > 12 || out.len() >= max_files {
             return;
@@ -2558,11 +2574,11 @@ pub fn compute_search_path_oleans_digest(effective_lean_path: &str) -> String {
     let mut olean_files = Vec::new();
     for seg in effective_lean_path.split(':') {
         let s = seg.trim();
-        if s.is_empty() || s.contains("/toolchains/") {
+        if s.is_empty() {
             continue;
         }
         let dir = Path::new(s);
-        if !dir.is_dir() {
+        if !dir.is_dir() || is_toolchain_dir_match(dir, toolchain_lib) {
             continue;
         }
         if s.contains("/.lake/packages/") || s.contains("\\.lake\\packages\\") {
@@ -3947,14 +3963,6 @@ pub(crate) fn resolve_zygote_context(
         eff
     } else {
         let mut path_parts: Vec<String> = Vec::new();
-        let is_sysroot_lib_lean = |norm: &str| -> bool {
-            let p = Path::new(norm);
-            p.ends_with("lib/lean")
-                && p.parent()
-                    .and_then(|lib| lib.parent())
-                    .map(|tc| tc.join("bin/lean").exists())
-                    .unwrap_or(false)
-        };
         let mut add_part = |p: &str| {
             for seg in p.split(':') {
                 let s = seg.trim();
@@ -3962,7 +3970,7 @@ pub(crate) fn resolve_zygote_context(
                     let norm = fs::canonicalize(s)
                         .map(|c| c.to_string_lossy().to_string())
                         .unwrap_or_else(|_| s.to_string());
-                    if is_sysroot_lib_lean(&norm) {
+                    if is_sysroot_lib_lean_dir(Path::new(&norm)) {
                         continue;
                     }
                     if !path_parts.iter().any(|x| x == &norm) {
@@ -4009,8 +4017,9 @@ pub(crate) fn resolve_zygote_context(
     };
 
     let imports_csv = coalesce_proofkit_imports(raw_imports_csv, &effective_lean_path);
-    let search_path_digest = compute_search_path_oleans_digest(&effective_lean_path);
     let tc_lib = toolchain_lib_dir(lean_bin);
+    let search_path_digest =
+        compute_search_path_oleans_digest_with_toolchain(&effective_lean_path, tc_lib.as_deref());
     // Every cache below (worker env, warm pool, verdicts) is labelled with this snapshot's
     // digest, and is only populated once `rebind` proves the worker read these bytes.
     let mut closure = ClosureSnapshot::take(&imports_csv, &effective_lean_path, tc_lib.as_deref());
@@ -7819,6 +7828,41 @@ mod tests {
 
         fs::write(&local_olean, b"local-olean-v2-modified").unwrap();
         assert_ne!(sp_d2, compute_search_path_oleans_digest(&lp));
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_search_path_oleans_digest_uses_sysroot_identity_not_toolchains_substring() {
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_zygote_tc_id_{}", next_tmp_id()));
+        let user_tc_named_dir = tmp_dir.join("toolchains/custom_pkg/lib/lean");
+        let real_sysroot_root = tmp_dir.join("custom_sysroot");
+        let real_sysroot_bin = real_sysroot_root.join("bin");
+        let real_sysroot_lib = real_sysroot_root.join("lib/lean");
+        fs::create_dir_all(&user_tc_named_dir).unwrap();
+        fs::create_dir_all(&real_sysroot_bin).unwrap();
+        fs::create_dir_all(&real_sysroot_lib).unwrap();
+        fs::write(real_sysroot_bin.join("lean"), b"#!/bin/sh\n").unwrap();
+
+        let user_olean = user_tc_named_dir.join("UserMod.olean");
+        let sysroot_olean = real_sysroot_lib.join("Init.olean");
+        fs::write(&user_olean, b"user-v1").unwrap();
+        fs::write(&sysroot_olean, b"sysroot-v1").unwrap();
+
+        let lp = format!(
+            "{}:{}",
+            user_tc_named_dir.display(),
+            real_sysroot_lib.display()
+        );
+        let d1 = compute_search_path_oleans_digest(&lp);
+
+        fs::write(&sysroot_olean, b"sysroot-v2-ignored").unwrap();
+        let d2 = compute_search_path_oleans_digest(&lp);
+        assert_eq!(d1, d2);
+
+        fs::write(&user_olean, b"user-v2-tracked").unwrap();
+        let d3 = compute_search_path_oleans_digest(&lp);
+        assert_ne!(d2, d3);
+
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 

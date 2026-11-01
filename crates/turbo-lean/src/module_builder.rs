@@ -5096,10 +5096,12 @@ pub(crate) enum ImportSite {
 }
 
 fn trusted_lean_path_dirs(cfg: &ProjectConfig) -> Vec<PathBuf> {
+    let tc_opt = (!cfg.toolchain_lib_lean.as_os_str().is_empty())
+        .then_some(cfg.toolchain_lib_lean.as_path());
     std::env::var_os("LEAN_PATH")
         .map(|lp| {
             std::env::split_paths(&lp)
-                .filter(|p| p.is_dir() && *p != cfg.toolchain_lib_lean)
+                .filter(|p| p.is_dir() && !crate::zygote::is_toolchain_dir_match(p, tc_opt))
                 .collect()
         })
         .unwrap_or_default()
@@ -5644,58 +5646,11 @@ fn verify_lake_trace_options_and_args(spec: &DiscoveredModuleSpec, tv: &serde_js
 fn prebuilt_artifact_traces(
     olean_path: &Path,
 ) -> Option<(LakeModuleExportInfo, bool, serde_json::Value)> {
-    let olean_h = verify_and_hash_artifact_bytes(olean_path, true, true).ok()?;
-    let ilean_h =
-        verify_and_hash_artifact_bytes(&olean_path.with_extension("ilean"), true, true).ok()?;
     let srv_path = PathBuf::from(format!("{}.server", olean_path.display()));
-    let priv_path = PathBuf::from(format!("{}.private", olean_path.display()));
-    let ir_path = olean_path.with_extension("ir");
-    let ir_sig_path = PathBuf::from(format!("{}.sig", ir_path.display()));
     let is_mod = srv_path.is_file();
-    let arts_trace = lake_mix_hash(1723, olean_h);
-    let (meta_arts_trace, all_arts_trace, mod_comp_hashes) = if is_mod {
-        let srv_h = verify_and_hash_artifact_bytes(&srv_path, true, true).ok()?;
-        let priv_h = verify_and_hash_artifact_bytes(&priv_path, true, true).ok()?;
-        let ir_sig_h = verify_and_hash_artifact_bytes(&ir_sig_path, true, true).ok()?;
-        let ir_h = verify_and_hash_artifact_bytes(&ir_path, true, true).ok()?;
-        let meta_t = lake_mix_hash(lake_mix_hash(lake_mix_hash(1723, olean_h), ir_sig_h), ir_h);
-        let all_t = lake_mix_hash(
-            lake_mix_hash(
-                lake_mix_hash(lake_mix_hash(lake_mix_hash(1723, olean_h), srv_h), priv_h),
-                ir_sig_h,
-            ),
-            ir_h,
-        );
-        (meta_t, all_t, Some((srv_h, priv_h, ir_sig_h, ir_h)))
-    } else {
-        (arts_trace, arts_trace, None)
-    };
-    let trace_path = olean_path.with_extension("trace");
-    let tv: serde_json::Value = serde_json::from_slice(&fs::read(&trace_path).ok()?).ok()?;
-    let expected_o = format!("{:016x}.olean", olean_h);
-    let expected_i = format!("{:016x}.ilean", ilean_h);
-    let expected_dep_h = format!("{:016x}", lake_input_hash(&tv["inputs"]).ok()?);
-    if tv.get("schemaVersion").and_then(|v| v.as_str()) != Some("2025-09-10")
-        || tv.pointer("/outputs/m").and_then(|v| v.as_bool()) != Some(is_mod)
-        || tv.pointer("/outputs/o/0").and_then(|v| v.as_str()) != Some(expected_o.as_str())
-        || tv.pointer("/outputs/i").and_then(|v| v.as_str()) != Some(expected_i.as_str())
-        || tv.get("depHash").and_then(|v| v.as_str()) != Some(expected_dep_h.as_str())
-    {
-        return None;
-    }
-    if let Some((srv_h, priv_h, ir_sig_h, ir_h)) = mod_comp_hashes {
-        if tv.pointer("/outputs/o/1").and_then(|v| v.as_str())
-            != Some(format!("{:016x}.olean.server", srv_h).as_str())
-            || tv.pointer("/outputs/o/2").and_then(|v| v.as_str())
-                != Some(format!("{:016x}.olean.private", priv_h).as_str())
-            || tv.pointer("/outputs/rs").and_then(|v| v.as_str())
-                != Some(format!("{:016x}.ir.sig", ir_sig_h).as_str())
-            || tv.pointer("/outputs/r").and_then(|v| v.as_str())
-                != Some(format!("{:016x}.ir", ir_h).as_str())
-        {
-            return None;
-        }
-    }
+    let tv = verify_trace_outputs_against_artifacts(olean_path, is_mod, None).ok()?;
+    let (arts_trace, meta_arts_trace, all_arts_trace) =
+        compute_module_arts_traces(olean_path, is_mod, false).ok()?;
     Some((
         LakeModuleExportInfo {
             arts_trace,
@@ -5749,6 +5704,7 @@ fn prebuilt_closure_export_info(
     }
     let had_cycle_ancestor = !mod_visiting.is_empty() || pb_visiting.len() > 1;
     let mut local_pairs: Vec<(String, PathBuf)> = Vec::new();
+    let collect_pairs = pb_closure_opt.is_some();
     let res = (|| -> Option<LakeModuleExportInfo> {
         let (mut info, is_mod, tv) = prebuilt_artifact_traces(olean_path)?;
         let actual_imports_h = recorded_trace_imports_hash(&tv)?;
@@ -5774,7 +5730,9 @@ fn prebuilt_closure_export_info(
             let sub_exp = match site {
                 ImportSite::Toolchain => continue,
                 ImportSite::Prebuilt(sub_olean) => {
-                    local_pairs.push((sub_imp.module.clone(), sub_olean.clone()));
+                    if collect_pairs {
+                        local_pairs.push((sub_imp.module.clone(), sub_olean.clone()));
+                    }
                     prebuilt_closure_export_info(
                         cfg,
                         strict_policy,
@@ -5782,12 +5740,16 @@ fn prebuilt_closure_export_info(
                         cache,
                         mod_visiting,
                         pb_visiting,
-                        Some(&mut local_pairs),
+                        if collect_pairs {
+                            Some(&mut local_pairs)
+                        } else {
+                            None
+                        },
                     )?
                 }
                 ImportSite::Module(sub_spec) => {
-                    if pb_closure_opt.is_some() {
-                        return None;
+                    if collect_pairs {
+                        local_pairs.push((sub_imp.module.clone(), spec_olean_path(&sub_spec)));
                     }
                     lake_closure_export_info_inner(
                         cfg,
@@ -5796,6 +5758,11 @@ fn prebuilt_closure_export_info(
                         cache,
                         mod_visiting,
                         pb_visiting,
+                        if collect_pairs {
+                            Some(&mut local_pairs)
+                        } else {
+                            None
+                        },
                     )?
                 }
                 ImportSite::Unresolved => return None,
@@ -5891,7 +5858,15 @@ fn lake_closure_export_info(
     visiting: &mut HashSet<(String, String)>,
 ) -> Option<LakeModuleExportInfo> {
     let mut pb_visiting = HashSet::new();
-    lake_closure_export_info_inner(cfg, spec, strict_policy, cache, visiting, &mut pb_visiting)
+    lake_closure_export_info_inner(
+        cfg,
+        spec,
+        strict_policy,
+        cache,
+        visiting,
+        &mut pb_visiting,
+        None,
+    )
 }
 
 fn lake_closure_export_info_inner(
@@ -5901,6 +5876,7 @@ fn lake_closure_export_info_inner(
     cache: &mut LakeClosureCache,
     visiting: &mut HashSet<(String, String)>,
     pb_visiting: &mut HashSet<PathBuf>,
+    out_closure_opt: Option<&mut Vec<(String, PathBuf)>>,
 ) -> Option<LakeModuleExportInfo> {
     let visit_key = (spec.pkg_name.clone(), spec.module_name.clone());
     let memo_key = (
@@ -5908,13 +5884,17 @@ fn lake_closure_export_info_inner(
         spec.module_name.clone(),
         strict_policy,
     );
-    if let Some(cached) = cache.exp_memo.get(&memo_key) {
-        return *cached;
+    if out_closure_opt.is_none() {
+        if let Some(cached) = cache.exp_memo.get(&memo_key) {
+            return *cached;
+        }
     }
     if !visiting.insert(visit_key.clone()) {
         return None;
     }
     let had_cycle_ancestor = visiting.len() > 1 || !pb_visiting.is_empty();
+    let mut local_pairs: Vec<(String, PathBuf)> = Vec::new();
+    let collect_pairs = out_closure_opt.is_some();
     let res = (|| -> Option<LakeModuleExportInfo> {
         let olean_path = spec_olean_path(spec);
         let src_raw = fs::read_to_string(&spec.src_path).ok()?;
@@ -5933,29 +5913,8 @@ fn lake_closure_export_info_inner(
             spec.precompile_modules,
         )
         .ok()?;
-        let olean_h = verify_and_hash_artifact_bytes(&olean_path, false, false).ok()?;
-        let arts_trace = lake_mix_hash(1723, olean_h);
-        let (meta_arts_trace, all_arts_trace) = if is_mod {
-            let srv_path = PathBuf::from(format!("{}.server", olean_path.display()));
-            let priv_path = PathBuf::from(format!("{}.private", olean_path.display()));
-            let ir_path = olean_path.with_extension("ir");
-            let ir_sig_path = PathBuf::from(format!("{}.sig", ir_path.display()));
-            let srv_h = verify_and_hash_artifact_bytes(&srv_path, false, false).ok()?;
-            let priv_h = verify_and_hash_artifact_bytes(&priv_path, false, false).ok()?;
-            let ir_sig_h = verify_and_hash_artifact_bytes(&ir_sig_path, false, false).ok()?;
-            let ir_h = verify_and_hash_artifact_bytes(&ir_path, false, false).ok()?;
-            let meta_t = lake_mix_hash(lake_mix_hash(lake_mix_hash(1723, olean_h), ir_sig_h), ir_h);
-            let all_t = lake_mix_hash(
-                lake_mix_hash(
-                    lake_mix_hash(lake_mix_hash(lake_mix_hash(1723, olean_h), srv_h), priv_h),
-                    ir_sig_h,
-                ),
-                ir_h,
-            );
-            (meta_t, all_t)
-        } else {
-            (arts_trace, arts_trace)
-        };
+        let (arts_trace, meta_arts_trace, all_arts_trace) =
+            compute_module_arts_traces(&olean_path, is_mod, false).ok()?;
 
         let rel_src = spec_rel_src(spec);
         let cached_manifest =
@@ -6042,6 +6001,9 @@ fn lake_closure_export_info_inner(
                     } else if manifest_entry.is_some() {
                         return None;
                     }
+                    if collect_pairs {
+                        local_pairs.push((sub_imp.module.clone(), pb_olean.clone()));
+                    }
                     let sub_exp = prebuilt_closure_export_info(
                         cfg,
                         strict_policy,
@@ -6049,7 +6011,11 @@ fn lake_closure_export_info_inner(
                         cache,
                         visiting,
                         pb_visiting,
-                        None,
+                        if collect_pairs {
+                            Some(&mut local_pairs)
+                        } else {
+                            None
+                        },
                     )?;
                     for e in lake_import_trace_entries(is_mod, sub_imp, &sub_exp) {
                         import_entries.push(e);
@@ -6071,6 +6037,9 @@ fn lake_closure_export_info_inner(
                     } else if manifest_entry.is_some() {
                         return None;
                     }
+                    if collect_pairs {
+                        local_pairs.push((sub_imp.module.clone(), spec_olean_path(&sub_spec)));
+                    }
                     let sub_exp = lake_closure_export_info_inner(
                         cfg,
                         &sub_spec,
@@ -6078,6 +6047,11 @@ fn lake_closure_export_info_inner(
                         cache,
                         visiting,
                         pb_visiting,
+                        if collect_pairs {
+                            Some(&mut local_pairs)
+                        } else {
+                            None
+                        },
                     )?;
                     for e in lake_import_trace_entries(is_mod, sub_imp, &sub_exp) {
                         import_entries.push(e);
@@ -6158,8 +6132,13 @@ fn lake_closure_export_info_inner(
         })
     })();
     visiting.remove(&visit_key);
-    if res.is_some() || !had_cycle_ancestor {
-        cache.exp_memo.insert(memo_key, res);
+    if let Some(info) = res {
+        cache.exp_memo.insert(memo_key, Some(info));
+        if let Some(out_pairs) = out_closure_opt {
+            out_pairs.extend(local_pairs);
+        }
+    } else if out_closure_opt.is_none() && !had_cycle_ancestor {
+        cache.exp_memo.insert(memo_key, None);
     }
     res
 }
@@ -6286,33 +6265,59 @@ fn dep_pkg_import_pins_consistent(
     true
 }
 
-pub(crate) fn verify_module_lake_sidecars(
+fn compute_module_arts_traces(
     olean_path: &Path,
-    ir_dir_opt: Option<&Path>,
-    rel_slash: &str,
-    src_raw: &str,
+    is_mod: bool,
+    require_sidecars: bool,
+) -> Result<(u64, u64, u64)> {
+    let olean_h = verify_and_hash_artifact_bytes(olean_path, require_sidecars, require_sidecars)?;
+    let arts_trace = lake_mix_hash(1723, olean_h);
+    if !is_mod {
+        return Ok((arts_trace, arts_trace, arts_trace));
+    }
+    let srv_path = PathBuf::from(format!("{}.server", olean_path.display()));
+    let priv_path = PathBuf::from(format!("{}.private", olean_path.display()));
+    let ir_path = olean_path.with_extension("ir");
+    let ir_sig_path = PathBuf::from(format!("{}.sig", ir_path.display()));
+    let srv_h = verify_and_hash_artifact_bytes(&srv_path, require_sidecars, require_sidecars)?;
+    let priv_h = verify_and_hash_artifact_bytes(&priv_path, require_sidecars, require_sidecars)?;
+    let ir_sig_h =
+        verify_and_hash_artifact_bytes(&ir_sig_path, require_sidecars, require_sidecars)?;
+    let ir_h = verify_and_hash_artifact_bytes(&ir_path, require_sidecars, require_sidecars)?;
+    let meta_t = lake_mix_hash(lake_mix_hash(lake_mix_hash(1723, olean_h), ir_sig_h), ir_h);
+    let all_t = lake_mix_hash(
+        lake_mix_hash(
+            lake_mix_hash(lake_mix_hash(lake_mix_hash(1723, olean_h), srv_h), priv_h),
+            ir_sig_h,
+        ),
+        ir_h,
+    );
+    Ok((arts_trace, meta_t, all_t))
+}
+
+fn verify_trace_outputs_against_artifacts(
+    olean_path: &Path,
     is_module: bool,
-    needs_c: bool,
-) -> Result<()> {
+    c_req: Option<(&Path, bool)>,
+) -> Result<serde_json::Value> {
     let olean_h = verify_and_hash_artifact_bytes(olean_path, true, true)?;
-    let ilean_path = olean_path.with_extension("ilean");
-    let ilean_h = verify_and_hash_artifact_bytes(&ilean_path, true, true)?;
+    let ilean_h = verify_and_hash_artifact_bytes(&olean_path.with_extension("ilean"), true, true)?;
     let srv_path = PathBuf::from(format!("{}.server", olean_path.display()));
     let priv_path = PathBuf::from(format!("{}.private", olean_path.display()));
     let ir_path = olean_path.with_extension("ir");
     let ir_sig_path = PathBuf::from(format!("{}.sig", ir_path.display()));
     let mod_comp_hashes = if is_module {
-        let srv_h = verify_and_hash_artifact_bytes(&srv_path, true, true)?;
-        let priv_h = verify_and_hash_artifact_bytes(&priv_path, true, true)?;
-        let ir_sig_h = verify_and_hash_artifact_bytes(&ir_sig_path, true, true)?;
-        let ir_h = verify_and_hash_artifact_bytes(&ir_path, true, true)?;
-        Some((srv_h, priv_h, ir_sig_h, ir_h))
+        Some((
+            verify_and_hash_artifact_bytes(&srv_path, true, true)?,
+            verify_and_hash_artifact_bytes(&priv_path, true, true)?,
+            verify_and_hash_artifact_bytes(&ir_sig_path, true, true)?,
+            verify_and_hash_artifact_bytes(&ir_path, true, true)?,
+        ))
     } else {
         None
     };
-    let c_path_opt = ir_dir_opt.map(|d| d.join(format!("{}.c", rel_slash)));
-    let c_h_opt = match c_path_opt {
-        Some(ref cp) if cp.exists() || needs_c => {
+    let c_h_opt = match c_req {
+        Some((cp, needs_c)) if cp.exists() || needs_c => {
             Some(verify_and_hash_artifact_bytes(cp, true, true)?)
         }
         _ => None,
@@ -6371,11 +6376,28 @@ pub(crate) fn verify_module_lake_sidecars(
             );
         }
     }
+    Ok(tv)
+}
+
+pub(crate) fn verify_module_lake_sidecars(
+    olean_path: &Path,
+    ir_dir_opt: Option<&Path>,
+    rel_slash: &str,
+    src_raw: &str,
+    is_module: bool,
+    needs_c: bool,
+) -> Result<()> {
+    let c_path = ir_dir_opt.map(|d| d.join(format!("{}.c", rel_slash)));
+    let tv = verify_trace_outputs_against_artifacts(
+        olean_path,
+        is_module,
+        c_path.as_deref().map(|p| (p, needs_c)),
+    )?;
     let expected_src_h = format!("{:016x}", lake_hash_text(src_raw));
     if tv.pointer("/inputs/3/1").and_then(|v| v.as_str()) != Some(expected_src_h.as_str()) {
         anyhow::bail!(
             "Lake module trace `{}` recorded source hash does not match source",
-            trace_path.display()
+            olean_path.with_extension("trace").display()
         );
     }
     Ok(())
@@ -7822,12 +7844,7 @@ fn compute_lake_export_info(
         visiting.remove(mod_name);
         anyhow::bail!("Unresolved workspace/package import `{}`", mod_name);
     };
-    let olean_h = verify_and_hash_artifact_bytes(&olean_path, true, true)?;
-    let ilean_h = verify_and_hash_artifact_bytes(&olean_path.with_extension("ilean"), true, true)?;
     let srv_path = PathBuf::from(format!("{}.server", olean_path.display()));
-    let priv_path = PathBuf::from(format!("{}.private", olean_path.display()));
-    let ir_path = olean_path.with_extension("ir");
-    let ir_sig_path = PathBuf::from(format!("{}.sig", ir_path.display()));
     let dep_src_info = match src_opt {
         Some(ref sp) if sp.is_file() => {
             let raw = fs::read_to_string(sp)?;
@@ -7848,81 +7865,19 @@ fn compute_lake_export_info(
         .as_ref()
         .map(|(_, _, h)| h.is_module)
         .unwrap_or_else(|| srv_path.is_file());
-    let arts_trace = lake_mix_hash(1723, olean_h);
-    let (meta_arts_trace, all_arts_trace, mod_comp_hashes) = if is_mod {
-        let srv_h = verify_and_hash_artifact_bytes(&srv_path, true, true)?;
-        let priv_h = verify_and_hash_artifact_bytes(&priv_path, true, true)?;
-        let ir_sig_h = verify_and_hash_artifact_bytes(&ir_sig_path, true, true)?;
-        let ir_h = verify_and_hash_artifact_bytes(&ir_path, true, true)?;
-        let meta_t = lake_mix_hash(lake_mix_hash(lake_mix_hash(1723, olean_h), ir_sig_h), ir_h);
-        let all_t = lake_mix_hash(
-            lake_mix_hash(
-                lake_mix_hash(lake_mix_hash(lake_mix_hash(1723, olean_h), srv_h), priv_h),
-                ir_sig_h,
-            ),
-            ir_h,
-        );
-        (meta_t, all_t, Some((srv_h, priv_h, ir_sig_h, ir_h)))
-    } else {
-        (arts_trace, arts_trace, None)
-    };
-    let trace_path = olean_path.with_extension("trace");
-    let trace_val_opt: Option<serde_json::Value> = if trace_path.exists() {
-        let tb = fs::read(&trace_path)?;
-        let tv: serde_json::Value = serde_json::from_slice(&tb).map_err(|_| {
-            anyhow::anyhow!(
-                "Malformed JSON in dependency trace `{}`",
-                trace_path.display()
-            )
-        })?;
-        let expected_o = format!("{:016x}.olean", olean_h);
-        let expected_i = format!("{:016x}.ilean", ilean_h);
-        let expected_dep_h = format!("{:016x}", lake_input_hash(&tv["inputs"])?);
-        if tv.get("schemaVersion").and_then(|v| v.as_str()) != Some("2025-09-10")
-            || tv.pointer("/outputs/m").and_then(|v| v.as_bool()) != Some(is_mod)
-            || tv.pointer("/outputs/o/0").and_then(|v| v.as_str()) != Some(expected_o.as_str())
-            || tv.pointer("/outputs/i").and_then(|v| v.as_str()) != Some(expected_i.as_str())
-            || tv.get("depHash").and_then(|v| v.as_str()) != Some(expected_dep_h.as_str())
-        {
+    let tv = verify_trace_outputs_against_artifacts(&olean_path, is_mod, None)?;
+    let (arts_trace, meta_arts_trace, all_arts_trace) =
+        compute_module_arts_traces(&olean_path, is_mod, true)?;
+    if let Some((_, ref src_raw, _)) = dep_src_info {
+        let expected_src_h = format!("{:016x}", lake_hash_text(src_raw));
+        if tv.pointer("/inputs/3/1").and_then(|v| v.as_str()) != Some(expected_src_h.as_str()) {
             anyhow::bail!(
-                "Dependency trace `{}` failed integrity verification against artifacts",
-                trace_path.display()
+                "Dependency trace `{}` recorded source hash does not match `{}`",
+                olean_path.with_extension("trace").display(),
+                mod_name
             );
         }
-        if let Some((srv_h, priv_h, ir_sig_h, ir_h)) = mod_comp_hashes {
-            if tv.pointer("/outputs/o/1").and_then(|v| v.as_str())
-                != Some(format!("{:016x}.olean.server", srv_h).as_str())
-                || tv.pointer("/outputs/o/2").and_then(|v| v.as_str())
-                    != Some(format!("{:016x}.olean.private", priv_h).as_str())
-                || tv.pointer("/outputs/rs").and_then(|v| v.as_str())
-                    != Some(format!("{:016x}.ir.sig", ir_sig_h).as_str())
-                || tv.pointer("/outputs/r").and_then(|v| v.as_str())
-                    != Some(format!("{:016x}.ir", ir_h).as_str())
-            {
-                anyhow::bail!(
-                    "Dependency trace `{}` module companion outputs do not match artifacts",
-                    trace_path.display()
-                );
-            }
-        }
-        if let Some((_, ref src_raw, _)) = dep_src_info {
-            let expected_src_h = format!("{:016x}", lake_hash_text(src_raw));
-            if tv.pointer("/inputs/3/1").and_then(|v| v.as_str()) != Some(expected_src_h.as_str()) {
-                anyhow::bail!(
-                    "Dependency trace `{}` recorded source hash does not match `{}`",
-                    trace_path.display(),
-                    mod_name
-                );
-            }
-        }
-        Some(tv)
-    } else {
-        anyhow::bail!(
-            "Required dependency trace `{}` is missing for module `{}`",
-            trace_path.display(),
-            mod_name
-        );
-    };
+    }
     let mut trans_trace = 1723u64;
     let mut meta_trans_trace = 1723u64;
     let mut all_trans_trace = 1723u64;
@@ -7961,9 +7916,6 @@ fn compute_lake_export_info(
             );
         }
     } else {
-        let _ = trace_val_opt.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("Missing trace for source-less dependency `{}`", mod_name)
-        })?;
         let mut pb_cache = LakeClosureCache::default();
         let pb_info = prebuilt_olean_export_info(cfg, false, &olean_path, &mut pb_cache)
             .ok_or_else(|| {
@@ -15369,6 +15321,174 @@ roots = ["Fast"]
                 .is_err(),
                 "`build_project_modules_native` treated `Lean.ExternalB` as built-in and accepted stale artifact"
             );
+        }));
+
+        match prev_lp {
+            Some(v) => std::env::set_var("LEAN_PATH", v),
+            None => std::env::remove_var("LEAN_PATH"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[test]
+    fn test_prebuilt_import_over_source_backed_dependency_closure_fresh_and_stale() {
+        let _env_guard = native_build_env_guard();
+        let dir = make_temp_test_dir("prebuilt_over_source_dep");
+        let ext_dir = dir.join("toolchains").join("ext_pkg");
+        let proj_dir = dir.join("proj");
+        let dep_dir = proj_dir.join(".lake/packages/dep_pkg");
+        fs::create_dir_all(ext_dir.join("Ext")).unwrap();
+        fs::create_dir_all(dep_dir.join("Dep")).unwrap();
+        fs::create_dir_all(proj_dir.join("App")).unwrap();
+        for d in [&ext_dir, &dep_dir, &proj_dir] {
+            fs::write(d.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        }
+        fs::write(
+            dep_dir.join("lakefile.toml"),
+            "name = \"dep_pkg\"\ndefaultTargets = [\"Dep\"]\n[[lean_lib]]\nname = \"Dep\"\nglobs = [\"Dep.+\"]\n",
+        )
+        .unwrap();
+        fs::write(dep_dir.join("Dep/Base.lean"), "def baseVal : Nat := 7\n").unwrap();
+        fs::write(
+            dep_dir.join("Dep/Value.lean"),
+            "import Dep.Base\ndef depVal : Nat := baseVal\n",
+        )
+        .unwrap();
+
+        fs::write(
+            ext_dir.join("lakefile.toml"),
+            format!(
+                "name = \"ext_pkg\"\ndefaultTargets = [\"Ext\"]\n[[require]]\nname = \"dep_pkg\"\npath = {:?}\n[[lean_lib]]\nname = \"Ext\"\nglobs = [\"Ext.+\"]\n",
+                dep_dir.canonicalize().unwrap().to_string_lossy()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            ext_dir.join("Ext/Wrap.lean"),
+            "import Dep.Value\ndef wrapVal : Nat := depVal\n",
+        )
+        .unwrap();
+
+        let dep_lib_lean = dep_dir.canonicalize().unwrap().join(".lake/build/lib/lean");
+        fs::write(
+            ext_dir.join("lake-manifest.json"),
+            format!(
+                r#"{{"version": "1.2.0", "packagesDir": ".lake/packages", "packages": [{{"type": "path", "name": "dep_pkg", "dir": {:?}, "configFile": "lakefile.toml", "inherited": false}}], "name": "ext_pkg", "lakeDir": ".lake", "fixedToolchain": false}}"#,
+                dep_dir.canonicalize().unwrap().to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let prev_lp = std::env::var_os("LEAN_PATH");
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fs::write(
+                proj_dir.join("lake-manifest.json"),
+                r#"{"version": "1.2.0", "packagesDir": ".lake/packages", "packages": [{"type": "path", "name": "dep_pkg", "dir": ".lake/packages/dep_pkg", "configFile": "lakefile.toml", "inherited": false}], "name": "app_pkg", "lakeDir": ".lake", "fixedToolchain": false}"#,
+            )
+            .unwrap();
+            fs::write(
+                proj_dir.join("lakefile.toml"),
+                "name = \"app_pkg\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\nglobs = [\"App.+\"]\n",
+            )
+            .unwrap();
+            let use_file = proj_dir.join("App/Use.lean");
+            let use_src = "import Ext.Wrap\ntheorem wrap_ok : wrapVal = 7 := rfl\n";
+            fs::write(&use_file, use_src).unwrap();
+
+            let st_dep = std::process::Command::new("lake")
+                .args(["build", "Dep.Value"])
+                .current_dir(&dep_dir)
+                .status()
+                .unwrap();
+            assert!(st_dep.success(), "`lake build Dep.Value` failed");
+            let st_ext = std::process::Command::new("lake")
+                .args(["build", "Ext.Wrap"])
+                .current_dir(&ext_dir)
+                .status()
+                .unwrap();
+            assert!(st_ext.success(), "`lake build Ext.Wrap` failed");
+
+            let ext_lib_lean = ext_dir.canonicalize().unwrap().join(".lake/build/lib/lean");
+            std::env::set_var("LEAN_PATH", &ext_lib_lean);
+
+            let cfg = resolve_project_config_with_trust(&proj_dir, false).unwrap();
+            let dag = build_module_dag_with_trust(&cfg, &["App.Use".to_string()], false).unwrap();
+            let use_node = dag.nodes.get("App.Use").unwrap();
+            let ext_names: Vec<&str> = use_node
+                .external_olean_deps
+                .iter()
+                .map(|(m, _)| m.as_str())
+                .collect();
+            assert_eq!(ext_names, vec!["Dep.Base", "Dep.Value", "Ext.Wrap"]);
+
+            let mut store = TurboStore::open(Some(&dir.join(".turbo_store"))).unwrap();
+            let rep = build_project_modules_native(
+                &mut store,
+                &proj_dir,
+                &["App.Use".to_string()],
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap();
+            assert_eq!(rep.modules_compiled, 1);
+
+            let canon = proj_dir.canonicalize().unwrap();
+            let canon_use = use_file.canonicalize().unwrap();
+            assert!(crate::lake_build::is_file_verified_in_lake_build(
+                &canon, &canon_use, use_src
+            ));
+            assert_eq!(
+                crate::lake_build::ensure_project_imports_fresh_for_check(
+                    &canon,
+                    std::slice::from_ref(&canon_use),
+                )
+                .unwrap(),
+                0
+            );
+            let iface_before =
+                crate::lake_build::compute_imported_olean_interface_hashes(use_src, &canon, None);
+            assert!(iface_before.iter().any(|e| e.starts_with("Ext.Wrap:")));
+            assert!(iface_before.iter().any(|e| e.starts_with("Dep.Value:")));
+            assert!(iface_before.iter().any(|e| e.starts_with("Dep.Base:")));
+
+            fs::write(dep_dir.join("Dep/Base.lean"), "def baseVal : Nat := 99\n").unwrap();
+            let st_base = std::process::Command::new("lake")
+                .args(["build", "Dep.Base"])
+                .current_dir(&dep_dir)
+                .status()
+                .unwrap();
+            assert!(st_base.success(), "`lake build Dep.Base` failed");
+            assert!(ext_lib_lean.join("Ext/Wrap.trace").is_file());
+            assert!(dep_lib_lean.join("Dep/Value.trace").is_file());
+
+            let iface_after =
+                crate::lake_build::compute_imported_olean_interface_hashes(use_src, &canon, None);
+            assert_ne!(iface_before, iface_after);
+            assert!(!crate::lake_build::is_file_verified_in_lake_build(
+                &canon, &canon_use, use_src
+            ));
+            assert!(crate::lake_build::ensure_project_imports_fresh_for_check(
+                &canon,
+                std::slice::from_ref(&canon_use),
+            )
+            .is_err());
+            assert!(build_project_modules_native(
+                &mut store,
+                &proj_dir,
+                &["App.Use".to_string()],
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .is_err());
         }));
 
         match prev_lp {

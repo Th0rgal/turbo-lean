@@ -1062,26 +1062,34 @@ pub fn compute_imported_olean_interface_hashes(
         return Vec::new();
     }
 
+    let resolved_tc_lib: Option<PathBuf> = if !project_dir.as_os_str().is_empty() {
+        let tc = detect_toolchain(project_dir);
+        crate::module_builder::resolve_toolchain_compiler_with_trust(project_dir, &tc, true)
+            .ok()
+            .map(|(_, _, tc_lib_lean, _)| tc_lib_lean)
+    } else {
+        None
+    };
+
     let mut search_dirs: Vec<PathBuf> = Vec::new();
-    let lp_owned: Option<String> = lean_path
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("LEAN_PATH").ok().filter(|s| !s.is_empty()));
-    if let Some(ref lp) = lp_owned {
-        for part in lp.split(':') {
-            if !part.is_empty() && !part.contains("/toolchains/") {
-                let pb = PathBuf::from(part);
-                if pb.is_dir() && !search_dirs.contains(&pb) {
-                    search_dirs.push(pb);
+    let push_search_dir = |search_dirs: &mut Vec<PathBuf>, pb: PathBuf| {
+        if !pb.is_dir() || crate::zygote::is_toolchain_dir_match(&pb, resolved_tc_lib.as_deref()) {
+            return;
+        }
+        let canon_pb = fs::canonicalize(&pb).ok();
+        let already = search_dirs.iter().any(|existing| {
+            existing == &pb
+                || match (&canon_pb, fs::canonicalize(existing).ok()) {
+                    (Some(a), Some(b)) => a == &b,
+                    _ => false,
                 }
-            }
+        });
+        if !already {
+            search_dirs.push(pb);
         }
-    }
+    };
     if !project_dir.as_os_str().is_empty() {
-        let local_lib = project_dir.join(".lake/build/lib/lean");
-        if local_lib.is_dir() && !search_dirs.contains(&local_lib) {
-            search_dirs.push(local_lib);
-        }
+        push_search_dir(&mut search_dirs, project_dir.join(".lake/build/lib/lean"));
         let pkgs_dir = project_dir.join(".lake/packages");
         if let Ok(entries) = fs::read_dir(&pkgs_dir) {
             let mut pkg_libs = Vec::new();
@@ -1093,9 +1101,26 @@ pub fn compute_imported_olean_interface_hashes(
             }
             pkg_libs.sort();
             for p in pkg_libs {
-                if !search_dirs.contains(&p) {
-                    search_dirs.push(p);
-                }
+                push_search_dir(&mut search_dirs, p);
+            }
+        }
+        if let Ok((_, manifest_pkgs, _)) =
+            crate::module_builder::parse_lake_manifest(project_dir, false)
+        {
+            for mp in manifest_pkgs {
+                push_search_dir(&mut search_dirs, mp.dir.join(".lake/build/lib/lean"));
+            }
+        }
+    }
+    let lp_owned: Option<String> = lean_path
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("LEAN_PATH").ok().filter(|s| !s.is_empty()));
+    if let Some(ref lp) = lp_owned {
+        for part in lp.split(':') {
+            let trimmed = part.trim();
+            if !trimmed.is_empty() {
+                push_search_dir(&mut search_dirs, PathBuf::from(trimmed));
             }
         }
     }
@@ -3843,6 +3868,28 @@ mod tests {
                 && shard_v1.prefix_env_hash != shard_v2.prefix_env_hash
                 && key_v1 != key_v2
         );
+
+        let user_tc_dir = tmp_dir.join("toolchains/ext/lib/lean");
+        let sysroot_root = tmp_dir.join("fake_lean_prefix");
+        let sysroot_lib = sysroot_root.join("lib/lean");
+        fs::create_dir_all(user_tc_dir.join("UserPkg")).unwrap();
+        fs::create_dir_all(sysroot_root.join("bin")).unwrap();
+        fs::create_dir_all(sysroot_lib.join("Init")).unwrap();
+        fs::write(sysroot_root.join("bin/lean"), b"stub").unwrap();
+        let user_olean = user_tc_dir.join("UserPkg/Mod.olean");
+        fs::write(&user_olean, [0x11u8; 128]).unwrap();
+        fs::write(sysroot_lib.join("Init/Core.olean"), [0x22u8; 128]).unwrap();
+        let mixed_lp = format!("{}:{}", user_tc_dir.display(), sysroot_lib.display());
+        let mixed_src = "import UserPkg.Mod\nimport Init.Core\ntheorem t : True := trivial\n";
+        let mixed_h1 =
+            compute_imported_olean_interface_hashes(mixed_src, &tmp_dir, Some(&mixed_lp));
+        assert!(mixed_h1.iter().any(|e| e.starts_with("UserPkg.Mod:")));
+        assert!(!mixed_h1.iter().any(|e| e.starts_with("Init.Core:")));
+        fs::write(&user_olean, [0x33u8; 128]).unwrap();
+        let mixed_h2 =
+            compute_imported_olean_interface_hashes(mixed_src, &tmp_dir, Some(&mixed_lp));
+        assert_ne!(mixed_h1, mixed_h2);
+
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 
