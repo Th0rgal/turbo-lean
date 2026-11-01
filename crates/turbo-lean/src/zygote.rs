@@ -9498,7 +9498,7 @@ mod tests {
         ) {
             writeln!(
                 stdin,
-                "Lean\t{}\tstrict\t\t\t{}",
+                "Lean\t{}\tstrict\t\t\t{}\ttest-lean-closure",
                 hex_encode_bytes(src.as_bytes()),
                 hex_encode_bytes(arg.as_bytes())
             )
@@ -9514,7 +9514,7 @@ mod tests {
         let control = "theorem raw_control : True := True.intro";
         writeln!(
             stdin,
-            "Lean\t{}\tstrict\t\t\t",
+            "Lean\t{}\tstrict\t\t\t\ttest-lean-closure",
             hex_encode_bytes(control.as_bytes())
         )
         .unwrap();
@@ -9556,7 +9556,7 @@ mod tests {
             };
             writeln!(
                 stdin,
-                "Lean\t{}\t{mode}\t{key}\t{hex_prefix}\t",
+                "Lean\t{}\t{mode}\t{key}\t{hex_prefix}\t\ttest-lean-closure",
                 hex_encode_bytes(body.as_bytes())
             )
             .unwrap();
