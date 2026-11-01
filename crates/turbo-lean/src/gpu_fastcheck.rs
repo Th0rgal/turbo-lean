@@ -3265,7 +3265,7 @@ pub fn run_fast_check_command(
 
                 let mut st1_ok = false;
                 if let Some(ref fast_src) = cgen_fast_src {
-                    fs::write(&tmp_lean, fast_src)?;
+                    tmp_lean.overwrite(fast_src.as_bytes())?;
                     if let Ok(o) = Command::new(&lean_bin_path)
                         .arg(format!("--root={}", staging.display()))
                         .arg("-c")
@@ -3288,7 +3288,7 @@ pub fn run_fast_check_command(
                     let compile_target: &Path = if has_main {
                         &canon_file
                     } else {
-                        fs::write(&tmp_lean, &effective_src)?;
+                        tmp_lean.overwrite(effective_src.as_bytes())?;
                         &tmp_lean
                     };
                     let compile_dir = if has_main { &lean_dir } else { &staging };

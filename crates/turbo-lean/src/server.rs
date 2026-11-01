@@ -2224,7 +2224,7 @@ fn execute_fastcheck_payload_deferred(
 
                 let mut out1_ok = false;
                 if let Some(ref fast_src) = cgen_fast_src {
-                    fs::write(&tmp_lean, fast_src)?;
+                    tmp_lean.overwrite(fast_src.as_bytes())?;
                     if let Ok(o) = Command::new(&lean_bin)
                         .arg(format!("--root={}", staging.display()))
                         .arg("-c")
@@ -2238,7 +2238,7 @@ fn execute_fastcheck_payload_deferred(
                     }
                 }
                 if !out1_ok {
-                    fs::write(&tmp_lean, &src_text)?;
+                    tmp_lean.overwrite(src_text.as_bytes())?;
                     let out1 = Command::new(&lean_bin)
                         .arg(format!("--root={}", staging.display()))
                         .arg("-c")

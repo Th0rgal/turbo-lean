@@ -579,7 +579,7 @@ pub struct StagedTempFile {
 impl StagedTempFile {
     pub fn write(path: PathBuf, bytes: impl AsRef<[u8]>) -> std::io::Result<Self> {
         let g = Self::reserve(path)?;
-        fs::write(&g.path, bytes.as_ref())?;
+        g.overwrite(bytes.as_ref())?;
         Ok(g)
     }
 
@@ -589,16 +589,55 @@ impl StagedTempFile {
                 fs::create_dir_all(parent)?;
             }
         }
-        let lease = acquire_staging_lease(&staging_lease_lock_path(&path))?;
+        let lock_path = staging_lease_lock_path(&path);
+        let lease = acquire_staging_lease(&lock_path)?;
+        let f_res = open_staged_payload_nofollow(&path, true);
+        if let Err(e) = f_res {
+            drop(lease);
+            let _ = reap_stale_lock_if_unheld(&lock_path);
+            return Err(e);
+        }
         Ok(Self {
             path,
             _lease: lease,
         })
     }
 
+    pub fn overwrite(&self, bytes: &[u8]) -> std::io::Result<()> {
+        let mut f = open_staged_payload_nofollow(&self.path, true)?;
+        f.write_all(bytes)
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+fn open_staged_payload_nofollow(path: &Path, truncate: bool) -> std::io::Result<fs::File> {
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if !meta.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("refusing non-regular staged target path {}", path.display()),
+            ));
+        }
+    }
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(truncate);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut opts, libc::O_NOFOLLOW);
+    let f = opts.open(path)?;
+    #[cfg(unix)]
+    if !f.metadata()?.file_type().is_file() || !inode_matches_nofollow(&f, path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "staged target path {} changed or is not a regular file",
+                path.display()
+            ),
+        ));
+    }
+    Ok(f)
 }
 
 impl std::ops::Deref for StagedTempFile {
@@ -659,9 +698,32 @@ fn inode_matches_nofollow(f: &fs::File, path: &Path) -> bool {
     )
 }
 
+#[cfg(test)]
+type AfterSidecarOpenHook = std::rc::Rc<dyn Fn(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_SIDECAR_OPEN_HOOK: std::cell::RefCell<Option<AfterSidecarOpenHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn acquire_staging_lease(lock_path: &Path) -> std::io::Result<Option<FlockGuard>> {
     for attempt in 0..4096u32 {
-        let Some(guard) = acquire_flock(lock_path, false, false)? else {
+        if let Some(parent) = lock_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).read(true).write(true).truncate(false);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::custom_flags(&mut opts, libc::O_NOFOLLOW);
+        let f = opts.open(lock_path)?;
+        #[cfg(test)]
+        if let Some(hook) = AFTER_SIDECAR_OPEN_HOOK.with(|h| h.borrow().clone()) {
+            hook(lock_path);
+        }
+        let Some(guard) = flock_file(f, false, false)? else {
             continue;
         };
         #[cfg(unix)]
@@ -1413,32 +1475,71 @@ mod tests {
         let _ = crate::db::TurboStore::open(Some(&store_root))?;
 
         // 1. Deterministic step-by-step interleaving of the exact P2 #3 window:
-        //    writer opens `.lease.lock` BEFORE `flock(LOCK_SH)`, concurrent reaper acquires
-        //    `LOCK_EX` and unlinks the sidecar because `target` does not exist yet, and
-        //    `acquire_staging_lease` must detect the unlinked fd and re-bind to a live sidecar.
+        //    use `AFTER_SIDECAR_OPEN_HOOK` inside `acquire_staging_lease` so the production
+        //    acquisition function opens `.lease.lock`, a concurrent reaper acquires `LOCK_EX`
+        //    and unlinks the sidecar BEFORE `flock(LOCK_SH)` executes, and `acquire_staging_lease`
+        //    is forced through its retry branch (`!inode_matches_nofollow`) to re-bind to a live sidecar!
         let det_target = staging.join("deterministic_race.lean");
         let det_lock = staging_lease_lock_path(&det_target);
         fs::create_dir_all(&staging)?;
-        let pre_opened = fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&det_lock)?;
-        assert!(reap_stale_lock_if_unheld(&det_lock));
-        let stale_guard = flock_file(pre_opened, false, false)?.expect("flock on unlinked fd");
-        assert!(
-            !inode_matches_nofollow(&stale_guard.0, &det_lock),
-            "unlinked sidecar fd must fail pathname inode validation"
-        );
-        drop(stale_guard);
-
+        let retry_triggered = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let retry_counter = retry_triggered.clone();
+        AFTER_SIDECAR_OPEN_HOOK.with(|h| {
+            *h.borrow_mut() = Some(std::rc::Rc::new(move |lp| {
+                let c = retry_counter.get();
+                retry_counter.set(c + 1);
+                if c == 0 {
+                    assert!(
+                        reap_stale_lock_if_unheld(lp),
+                        "hook must unlink sidecar between open() and flock() on attempt 0"
+                    );
+                }
+            }));
+        });
         let leased = StagedTempFile::write(det_target.clone(), b"-- active staged source\n")?;
+        AFTER_SIDECAR_OPEN_HOOK.with(|h| *h.borrow_mut() = None);
+        assert_eq!(
+            retry_triggered.get(),
+            2,
+            "acquire_staging_lease must detect unlinked sidecar on attempt 0 and succeed on retry attempt 1"
+        );
         assert!(is_staging_lease_held(&det_target));
         assert!(!reap_stale_lock_if_unheld(&det_lock));
         assert!(!try_remove_unleased_staged_file(&det_target));
         drop(leased);
         assert!(!det_target.exists() && !det_lock.exists());
+
+        // 1b. Planted symlink protection on BOTH the staged payload target AND its `.lease.lock` sidecar:
+        //     `StagedTempFile::write` and `StagedTempFile::reserve` must reject symlinks without
+        //     modifying or truncating the symlink referent.
+        let victim = root.join("victim_outside_staging.txt");
+        fs::write(&victim, b"untouched-victim-bytes")?;
+        let sym_target = staging.join("planted_symlink.lean");
+        std::os::unix::fs::symlink(&victim, &sym_target)?;
+        assert!(
+            StagedTempFile::write(sym_target.clone(), b"attacker-overwrite").is_err(),
+            "StagedTempFile::write must refuse planted payload symlink"
+        );
+        assert!(
+            StagedTempFile::reserve(sym_target.clone()).is_err(),
+            "StagedTempFile::reserve must refuse planted payload symlink"
+        );
+        assert_eq!(
+            fs::read(&victim)?,
+            b"untouched-victim-bytes",
+            "planted payload symlink referent must remain untouched"
+        );
+        fs::remove_file(&sym_target)?;
+
+        let clean_target = staging.join("clean_with_sym_lock.lean");
+        let sym_lock = staging_lease_lock_path(&clean_target);
+        std::os::unix::fs::symlink(&victim, &sym_lock)?;
+        assert!(
+            StagedTempFile::reserve(clean_target.clone()).is_err(),
+            "StagedTempFile::reserve must refuse planted sidecar symlink"
+        );
+        assert_eq!(fs::read(&victim)?, b"untouched-victim-bytes");
+        fs::remove_file(&sym_lock)?;
 
         // 2. Multi-threaded stress race: writers repeatedly `reserve` + write + hold + verify
         //    against concurrent `reap_stale_lock_if_unheld`, `try_remove_unleased_staged_file`,
@@ -1465,7 +1566,7 @@ mod tests {
                         "writer {wi} iter {iter}: lease not discoverable right after reserve"
                     );
                     let payload = format!("-- writer {wi} iter {iter}\n");
-                    fs::write(g.path(), payload.as_bytes())?;
+                    g.overwrite(payload.as_bytes())?;
                     std::thread::yield_now();
                     anyhow::ensure!(
                         is_staging_lease_held(g.path()) && lock_p.exists(),

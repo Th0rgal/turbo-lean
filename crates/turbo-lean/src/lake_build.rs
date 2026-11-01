@@ -2850,17 +2850,6 @@ pub(crate) fn stage_lake_build_outputs(
     let mut seen_shared_prefix = [false; 256];
     let mut seen_blobs = std::collections::HashSet::with_capacity(entries.len());
     let mut reg_blobs = Vec::with_capacity(entries.len());
-    let dest_ino = |d: &Path| -> i64 {
-        #[cfg(unix)]
-        {
-            fs::metadata(d).map(|m| m.ino() as i64).unwrap_or(0)
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = d;
-            0
-        }
-    };
 
     for (entry, (path, _, _, _, _, _, mode, _cand_ino)) in entries.iter().zip(candidates.iter()) {
         // Never hardlink `.lake/build` artifacts into CAS or mark them read-only (`0o444`):
@@ -2909,38 +2898,68 @@ pub(crate) fn stage_lake_build_outputs(
             } else {
                 Vec::new()
             };
-            if !shared_p.exists() {
-                let _ = crate::db::publish_durable_link(dest_p, &shared_p, &shared_created);
+            if !matches!(
+                crate::db::probe_blob_digest(&shared_p, &entry.blob_hash, entry.size_bytes),
+                crate::db::BlobDisk::Intact
+            ) {
+                let _ = crate::db::publish_verified_durable_blob(
+                    dest_p,
+                    &shared_p,
+                    &entry.blob_hash,
+                    entry.size_bytes,
+                    &shared_created,
+                );
             } else {
                 for dir in &shared_created {
                     let _ = crate::db::sync_dir(dir);
                 }
             }
         };
-        let ino = if matches!(
-            crate::db::probe_blob_digest(&dest, &entry.blob_hash, entry.size_bytes),
-            crate::db::BlobDisk::Intact(_)
-        ) {
-            let f = fs::File::open(&dest)?;
-            crate::db::durability_barrier(&f)?;
+        let existing_dest_ino =
+            crate::db::open_regular_nofollow(&dest)
+                .ok()
+                .and_then(|(mut f, m)| {
+                    use std::io::Read;
+                    let mut buf = Vec::with_capacity(m.len().min(64 * 1024 * 1024) as usize);
+                    if f.read_to_end(&mut buf).is_ok()
+                        && buf.len() as u64 == entry.size_bytes
+                        && blake3::hash(&buf).to_hex().as_str() == entry.blob_hash
+                        && (m.permissions().mode() & 0o222) == 0
+                    {
+                        crate::db::durability_barrier(&f).ok()?;
+                        Some(m.ino() as i64)
+                    } else {
+                        None
+                    }
+                });
+        let ino = if let Some(d_ino) = existing_dest_ino {
             if let Some(parent) = dest.parent() {
                 crate::db::sync_dir(parent)?;
             }
             sync_shared(&dest);
-            dest_ino(&dest)
-        } else if (matches!(
-            crate::db::probe_blob_digest(&shared_p, &entry.blob_hash, entry.size_bytes),
-            crate::db::BlobDisk::Intact(_)
-        ) && crate::db::publish_durable_link(&shared_p, &dest, &[]).is_ok())
-            || (has_distinct_fallback
-                && matches!(
-                    crate::db::probe_blob_digest(&fallback_p, &entry.blob_hash, entry.size_bytes),
-                    crate::db::BlobDisk::Intact(_)
+            d_ino
+        } else if let Ok(published_ino) = crate::db::publish_verified_durable_blob(
+            &shared_p,
+            &dest,
+            &entry.blob_hash,
+            entry.size_bytes,
+            &[],
+        )
+        .or_else(|e| {
+            if has_distinct_fallback {
+                crate::db::publish_verified_durable_blob(
+                    &fallback_p,
+                    &dest,
+                    &entry.blob_hash,
+                    entry.size_bytes,
+                    &[],
                 )
-                && crate::db::publish_durable_link(&fallback_p, &dest, &[]).is_ok())
-        {
+            } else {
+                Err(e)
+            }
+        }) {
             sync_shared(&dest);
-            dest_ino(&dest)
+            published_ino
         } else {
             let bytes = match fs::read(path) {
                 Ok(b) => b,
@@ -3035,7 +3054,6 @@ pub fn dedup_worktree_packages(
     if lake_dir.is_dir() {
         let _pub_guard = crate::db::acquire_cas_publication_guard(&store.root)?;
         let mut stack = vec![lake_dir];
-        let mut seen_hash_cache: HashMap<(u64, u64), (String, u64)> = HashMap::new();
         while let Some(dir) = stack.pop() {
             let Ok(entries) = fs::read_dir(&dir) else {
                 continue;
@@ -3087,42 +3105,20 @@ pub fn dedup_worktree_packages(
                     || name.ends_with(".olean.server")
                     || name.ends_with(".ilean");
                 if is_dedup_ext && path.starts_with(&packages_dir) {
-                    let Ok(mut src_file) = fs::File::open(&path) else {
-                        continue;
-                    };
-                    let Ok(meta) = src_file.metadata() else {
+                    let Ok((mut src_file, meta)) = crate::db::open_regular_nofollow(&path) else {
                         continue;
                     };
                     if meta.len() == 0 {
                         continue;
                     }
-                    #[cfg(unix)]
-                    let file_ino = (meta.dev(), meta.ino());
-                    #[cfg(not(unix))]
-                    let file_ino = (0u64, 0u64);
-
-                    let mut read_bytes: Option<Vec<u8>> = None;
-                    let (hash_hex, sz) = if let Some((h, cached_sz)) =
-                        seen_hash_cache.get(&file_ino).filter(|(_, csz)| {
-                            #[cfg(unix)]
-                            let ro = (meta.permissions().mode() & 0o222) == 0;
-                            #[cfg(not(unix))]
-                            let ro = false;
-                            ro && *csz == meta.len()
-                        }) {
-                        (h.clone(), *cached_sz)
-                    } else {
-                        use std::io::Read;
-                        let mut bytes = Vec::with_capacity(meta.len() as usize);
-                        if src_file.read_to_end(&mut bytes).is_err() || bytes.is_empty() {
-                            continue;
-                        }
-                        let actual_sz = bytes.len() as u64;
-                        let h = blake3::hash(&bytes).to_hex().to_string();
-                        read_bytes = Some(bytes);
-                        (h, actual_sz)
-                    };
+                    use std::io::Read;
+                    let mut bytes = Vec::with_capacity(meta.len() as usize);
+                    if src_file.read_to_end(&mut bytes).is_err() || bytes.is_empty() {
+                        continue;
+                    }
                     drop(src_file);
+                    let sz = bytes.len() as u64;
+                    let hash_hex = blake3::hash(&bytes).to_hex().to_string();
 
                     let shard_dir = pkg_cas_dir.join(&hash_hex[0..2]);
                     let Ok(created) = crate::db::ensure_dir_tracking(&shard_dir, &store.root)
@@ -3131,59 +3127,40 @@ pub fn dedup_worktree_packages(
                     };
                     let cas_file = shard_dir.join(&hash_hex);
 
-                    if let crate::db::BlobDisk::Intact(cas_meta) =
-                        crate::db::probe_blob_digest(&cas_file, &hash_hex, sz)
+                    let cas_ready = if let Ok((mut cas_f, cas_meta)) =
+                        crate::db::open_regular_nofollow(&cas_file)
                     {
-                        let cas_durable = fs::File::open(&cas_file)
-                            .and_then(|f| crate::db::durability_barrier(&f))
-                            .is_ok()
-                            && crate::db::sync_dir(&shard_dir).is_ok()
-                            && created.iter().all(|dir| crate::db::sync_dir(dir).is_ok());
-                        #[cfg(unix)]
-                        let same_inode =
-                            cas_meta.dev() == meta.dev() && cas_meta.ino() == meta.ino();
-                        #[cfg(not(unix))]
-                        let same_inode = false;
-
-                        if cas_durable {
-                            if same_inode {
-                                #[cfg(unix)]
-                                if (cas_meta.permissions().mode() & 0o222) != 0 {
-                                    let mut perms = cas_meta.permissions();
-                                    perms.set_mode(0o444);
-                                    let _ = fs::set_permissions(&cas_file, perms);
-                                }
-                                if file_ino.1 != 0 {
-                                    seen_hash_cache.insert(file_ino, (hash_hex, sz));
-                                }
-                            } else if crate::db::try_reflink_or_hardlink(&cas_file, &path, Some(sz))
-                                .is_ok()
-                            {
-                                #[cfg(unix)]
-                                if let Ok(new_meta) = fs::metadata(&path) {
-                                    seen_hash_cache
-                                        .insert((new_meta.dev(), new_meta.ino()), (hash_hex, sz));
-                                }
-                                hardlinked_files += 1;
-                                deduped_bytes += sz;
+                        let mut cas_buf =
+                            Vec::with_capacity(cas_meta.len().min(64 * 1024 * 1024) as usize);
+                        if cas_f.read_to_end(&mut cas_buf).is_ok()
+                            && cas_buf.len() as u64 == sz
+                            && blake3::hash(&cas_buf).to_hex().as_str() == hash_hex
+                        {
+                            #[cfg(unix)]
+                            if (cas_meta.permissions().mode() & 0o222) != 0 {
+                                let mut perms = cas_meta.permissions();
+                                perms.set_mode(0o444);
+                                let _ = cas_f.set_permissions(perms);
                             }
+                            crate::db::durability_barrier(&cas_f).is_ok()
+                                && crate::db::sync_dir(&shard_dir).is_ok()
+                                && created.iter().all(|dir| crate::db::sync_dir(dir).is_ok())
+                                && crate::db::open_regular_nofollow(&cas_file)
+                                    .ok()
+                                    .map(|(_, m)| m)
+                                    .is_some()
+                        } else {
+                            crate::db::ensure_blob_file(
+                                &store.root,
+                                &cas_file,
+                                &hash_hex,
+                                &bytes,
+                                false,
+                            )
+                            .is_ok()
                         }
                     } else {
-                        let bytes = match read_bytes {
-                            Some(b) => b,
-                            None => {
-                                let Ok(b) = fs::read(&path) else {
-                                    continue;
-                                };
-                                if b.len() as u64 != sz
-                                    || blake3::hash(&b).to_hex().as_str() != hash_hex
-                                {
-                                    continue;
-                                }
-                                b
-                            }
-                        };
-                        if crate::db::ensure_blob_file(
+                        crate::db::ensure_blob_file(
                             &store.root,
                             &cas_file,
                             &hash_hex,
@@ -3191,15 +3168,28 @@ pub fn dedup_worktree_packages(
                             false,
                         )
                         .is_ok()
-                            && crate::db::try_reflink_or_hardlink(&cas_file, &path, Some(sz))
-                                .is_ok()
+                    };
+
+                    if cas_ready {
+                        #[cfg(unix)]
+                        let already_same_cas_inode = crate::db::open_regular_nofollow(&cas_file)
+                            .ok()
+                            .is_some_and(|(_, cm)| {
+                                cm.dev() == meta.dev()
+                                    && cm.ino() == meta.ino()
+                                    && (cm.permissions().mode() & 0o222) == 0
+                            });
+                        #[cfg(not(unix))]
+                        let already_same_cas_inode = false;
+
+                        if !already_same_cas_inode
+                            && crate::db::install_verified_blob_to_path(
+                                &cas_file, &path, &hash_hex, sz,
+                            )
+                            .is_ok()
                         {
-                            #[cfg(unix)]
-                            if let Ok(new_meta) = fs::metadata(&path) {
-                                seen_hash_cache
-                                    .insert((new_meta.dev(), new_meta.ino()), (hash_hex, sz));
-                            }
                             hardlinked_files += 1;
+                            deduped_bytes += sz;
                         }
                     }
                 }
@@ -4181,15 +4171,57 @@ mod tests {
         fs::write(&olean_a, &good_bytes)?;
         fs::write(&olean_b, &good_bytes)?;
 
-        // Also place two hardlinked writable files sharing an inode (`C.olean` and `D.olean`):
-        // if an external writer mutated the shared inode if it stayed writable, `seen_hash_cache`
-        // would have served a stale hash. Verify `dedup_worktree_packages` stages immutable `0o444`
-        // CAS bytes and links all matching package artifacts to the verified CAS inode.
-        let shared_bytes = vec![0x3Cu8; 768];
+        // Also place two hardlinked files sharing an inode (`C.olean` and `D.olean`), keep an
+        // already-open writable descriptor on `C.olean` BEFORE setting mode `0o444`, and mutate
+        // `C.olean` in-place (same byte length!) via that pre-opened writable fd. Permissions do
+        // not revoke an open writable fd: `dedup_worktree_packages` must never reuse a stale hash
+        // from `(dev, ino, len, 0o444)` alone, and must stage the true mutated bytes.
+        let orig_shared_bytes = vec![0x3Cu8; 768];
         let olean_c = pkg_dir.join("C.olean");
         let olean_d = pkg_dir.join("D.olean");
-        fs::write(&olean_c, &shared_bytes)?;
+        let mut pre_open_rw = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&olean_c)?;
+        std::io::Write::write_all(&mut pre_open_rw, &orig_shared_bytes)?;
         fs::hard_link(&olean_c, &olean_d)?;
+        #[cfg(unix)]
+        {
+            let mut ro = fs::metadata(&olean_c)?.permissions();
+            ro.set_mode(0o444);
+            fs::set_permissions(&olean_c, ro)?;
+        }
+        // First dedup pass records `orig_shared_bytes` into `pkg_cas`.
+        let rep0 = dedup_worktree_packages(&store, &wt)?;
+        assert_eq!(rep0["status"], "worktree_packages_deduped");
+        // Now mutate `pre_open_rw` (or re-create a hardlinked `0o444` pair with open writable fd)
+        // to prove a `0o444` hardlinked pair mutated via an open writable descriptor between or
+        // during dedup is hashed from live bytes rather than cached inode metadata.
+        let olean_e = pkg_dir.join("E.olean");
+        let olean_f = pkg_dir.join("F.olean");
+        let mut rw_ef = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&olean_e)?;
+        std::io::Write::write_all(&mut rw_ef, &orig_shared_bytes)?;
+        fs::hard_link(&olean_e, &olean_f)?;
+        #[cfg(unix)]
+        {
+            let mut ro = fs::metadata(&olean_e)?.permissions();
+            ro.set_mode(0o444);
+            fs::set_permissions(&olean_e, ro)?;
+        }
+        // Mutate same-length `0o444` inode through the already-open writable descriptor!
+        let mutated_shared_bytes = vec![0x99u8; 768];
+        use std::io::Seek;
+        rw_ef.seek(std::io::SeekFrom::Start(0))?;
+        std::io::Write::write_all(&mut rw_ef, &mutated_shared_bytes)?;
+        drop(rw_ef);
+        drop(pre_open_rw);
 
         let rep = dedup_worktree_packages(&store, &wt)?;
         assert_eq!(rep["status"], "worktree_packages_deduped");
@@ -4200,8 +4232,21 @@ mod tests {
         );
         assert_eq!(fs::read(&olean_a)?, good_bytes);
         assert_eq!(fs::read(&olean_b)?, good_bytes);
-        assert_eq!(fs::read(&olean_c)?, shared_bytes);
-        assert_eq!(fs::read(&olean_d)?, shared_bytes);
+        assert_eq!(fs::read(&olean_c)?, orig_shared_bytes);
+        assert_eq!(fs::read(&olean_d)?, orig_shared_bytes);
+        assert_eq!(
+            fs::read(&olean_e)?,
+            mutated_shared_bytes,
+            "0o444 inode mutated via open writable fd must hash actual bytes, never reuse orig_shared_bytes CAS blob"
+        );
+        assert_eq!(fs::read(&olean_f)?, mutated_shared_bytes);
+        let mutated_hash = blake3::hash(&mutated_shared_bytes).to_hex().to_string();
+        let mutated_cas = store
+            .root
+            .join("pkg_cas")
+            .join(&mutated_hash[..2])
+            .join(&mutated_hash);
+        assert_eq!(fs::read(&mutated_cas)?, mutated_shared_bytes);
         #[cfg(unix)]
         {
             assert_eq!(
@@ -4215,6 +4260,14 @@ mod tests {
             assert_eq!(fs::metadata(&cas_file)?.permissions().mode() & 0o222, 0);
             assert_eq!(fs::metadata(&olean_c)?.ino(), fs::metadata(&olean_d)?.ino());
             assert_eq!(fs::metadata(&olean_c)?.permissions().mode() & 0o222, 0);
+            assert_eq!(
+                fs::metadata(&olean_e)?.ino(),
+                fs::metadata(&mutated_cas)?.ino()
+            );
+            assert_eq!(
+                fs::metadata(&olean_f)?.ino(),
+                fs::metadata(&mutated_cas)?.ino()
+            );
         }
 
         match saved_wt_env {

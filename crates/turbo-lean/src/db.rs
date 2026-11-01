@@ -1098,7 +1098,7 @@ impl TurboStore {
                     let intact = *intact_cache.entry(blob_hash.clone()).or_insert_with(|| {
                         matches!(
                             probe_blob_digest(&self.blob_path(blob_hash), blob_hash, *sz as u64),
-                            BlobDisk::Intact(_)
+                            BlobDisk::Intact
                         )
                     });
                     if intact {
@@ -1134,7 +1134,7 @@ impl TurboStore {
                     let intact = *intact_cache.entry(blob_hash.clone()).or_insert_with(|| {
                         matches!(
                             probe_blob_digest(&self.blob_path(&blob_hash), &blob_hash, sz as u64),
-                            BlobDisk::Intact(_)
+                            BlobDisk::Intact
                         )
                     });
                     if intact {
@@ -1202,7 +1202,7 @@ impl TurboStore {
                     *intact_cache.entry(bh.clone()).or_insert_with(|| {
                         matches!(
                             probe_blob_digest(&self.blob_path(bh), bh, (*sz).max(0) as u64),
-                            BlobDisk::Intact(_)
+                            BlobDisk::Intact
                         )
                     })
                 })
@@ -1316,7 +1316,7 @@ impl TurboStore {
         match recorded {
             Some(sz) => matches!(
                 probe_blob_digest(&path, blob_hash, sz.max(0) as u64),
-                BlobDisk::Intact(_)
+                BlobDisk::Intact
             ),
             None => read_cas_blob_verified(&path, blob_hash, None).is_some(),
         }
@@ -1327,7 +1327,7 @@ impl TurboStore {
         entries.iter().all(|e| {
             matches!(
                 probe_blob_digest(&self.blob_path(&e.blob_hash), &e.blob_hash, e.size_bytes),
-                BlobDisk::Intact(_)
+                BlobDisk::Intact
             )
         })
     }
@@ -1735,7 +1735,7 @@ impl TurboStore {
         for (hash, _, size, _) in blobs {
             if !matches!(
                 probe_blob_digest(&self.blob_path(hash), hash, (*size).max(0) as u64),
-                BlobDisk::Intact(_)
+                BlobDisk::Intact
             ) {
                 anyhow::bail!(
                     "Refusing to register CAS blob {}: missing or torn on disk",
@@ -1836,7 +1836,7 @@ impl TurboStore {
                             &blob_hash,
                             sz.max(0) as u64
                         ),
-                        BlobDisk::Intact(_)
+                        BlobDisk::Intact
                     )
                 });
                 if intact {
@@ -1958,7 +1958,7 @@ impl TurboStore {
                     &row.blob_hash,
                     row.size as u64
                 ),
-                BlobDisk::Intact(_)
+                BlobDisk::Intact
             ) {
                 anyhow::bail!(
                     "Refusing to publish theorem shard {}: CAS blob {} missing or torn on disk",
@@ -2189,7 +2189,7 @@ impl TurboStore {
         for o in outputs {
             if !matches!(
                 probe_blob_digest(&self.blob_path(&o.blob_hash), &o.blob_hash, o.size_bytes),
-                BlobDisk::Intact(_)
+                BlobDisk::Intact
             ) {
                 anyhow::bail!(
                     "Refusing to publish action {}: CAS blob {} ({}) missing or torn on disk",
@@ -2459,7 +2459,7 @@ impl TurboStore {
         for (hash, _, size, _) in reg_blobs {
             if !matches!(
                 probe_blob_digest(&self.blob_path(hash), hash, (*size).max(0) as u64),
-                BlobDisk::Intact(_)
+                BlobDisk::Intact
             ) {
                 anyhow::bail!(
                     "Refusing to publish ingested action {}: staged CAS blob {} missing or torn on disk",
@@ -2471,7 +2471,7 @@ impl TurboStore {
         for o in outputs {
             if !matches!(
                 probe_blob_digest(&self.blob_path(&o.blob_hash), &o.blob_hash, o.size_bytes),
-                BlobDisk::Intact(_)
+                BlobDisk::Intact
             ) {
                 anyhow::bail!(
                     "Refusing to publish ingested action {}: CAS blob {} ({}) missing or torn on disk",
@@ -2706,7 +2706,7 @@ impl TurboStore {
             let src = self.ensure_blob_uncompressed(&out.blob_hash)?;
             if !matches!(
                 probe_blob_digest(&src, &out.blob_hash, out.size_bytes),
-                BlobDisk::Intact(_)
+                BlobDisk::Intact
             ) {
                 let _ = fs::remove_file(&src);
                 anyhow::bail!(
@@ -2718,8 +2718,8 @@ impl TurboStore {
             let dst_in_lake_build = is_non_package_lake_build_path(&dst);
 
             let already_valid_in_place = if dst_in_lake_build {
-                match (fs::metadata(&src), fs::metadata(&dst)) {
-                    (Ok(src_meta), Ok(dst_meta)) => {
+                match (fs::symlink_metadata(&src), fs::symlink_metadata(&dst)) {
+                    (Ok(src_meta), Ok(dst_meta)) if src_meta.is_file() && dst_meta.is_file() => {
                         let same_ino =
                             src_meta.dev() == dst_meta.dev() && src_meta.ino() == dst_meta.ino();
                         !same_ino
@@ -2727,19 +2727,26 @@ impl TurboStore {
                             && (dst_meta.permissions().mode() & 0o200) != 0
                             && src_meta.len() == dst_meta.len()
                             && existing_map.get(&out.rel_path) == Some(&out.blob_hash)
-                            && fs::read(&dst).ok().is_some_and(|b| {
-                                blake3::hash(&b).to_hex().as_str() == out.blob_hash
+                            && read_regular_nofollow(&dst).is_some_and(|(b, _)| {
+                                b.len() as u64 == out.size_bytes
+                                    && blake3::hash(&b).to_hex().as_str() == out.blob_hash
                             })
                     }
                     _ => false,
                 }
             } else {
-                match (fs::metadata(&src), fs::metadata(&dst)) {
-                    (Ok(src_meta), Ok(dst_meta)) => {
-                        (src_meta.dev() == dst_meta.dev() && src_meta.ino() == dst_meta.ino())
+                match (fs::symlink_metadata(&src), fs::symlink_metadata(&dst)) {
+                    (Ok(src_meta), Ok(dst_meta)) if src_meta.is_file() && dst_meta.is_file() => {
+                        (src_meta.dev() == dst_meta.dev()
+                            && src_meta.ino() == dst_meta.ino()
+                            && (dst_meta.permissions().mode() & 0o222) == 0)
                             || (src_meta.dev() != dst_meta.dev()
                                 && src_meta.len() == dst_meta.len()
-                                && (dst_meta.permissions().mode() & 0o222) == 0)
+                                && (dst_meta.permissions().mode() & 0o222) == 0
+                                && read_regular_nofollow(&dst).is_some_and(|(b, _)| {
+                                    b.len() as u64 == out.size_bytes
+                                        && blake3::hash(&b).to_hex().as_str() == out.blob_hash
+                                }))
                     }
                     _ => false,
                 }
@@ -2767,7 +2774,7 @@ impl TurboStore {
                 }
             }
 
-            let mode = try_reflink_or_hardlink(&src, &dst, Some(out.size_bytes))?;
+            let mode = install_verified_blob_to_path(&src, &dst, &out.blob_hash, out.size_bytes)?;
             if existing_map.get(&out.rel_path) != Some(&out.blob_hash) {
                 db_updates.push((&out.rel_path, &out.blob_hash, mode));
             }
@@ -2799,9 +2806,17 @@ impl TurboStore {
     /// atomically rewriting it back to raw `0o444` bytes in the Hot tier so it can be hardlinked.
     pub fn ensure_blob_uncompressed(&self, blob_hash: &str) -> Result<PathBuf> {
         let src = self.blob_path(blob_hash);
-        let mut f = match File::open(&src) {
-            Ok(file) => file,
-            Err(_) => return Ok(src),
+        let mut f = match open_regular_nofollow(&src) {
+            Ok((file, _)) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(src),
+            Err(e) => {
+                anyhow::bail!(
+                    "CAS blob {} at {} is not a regular file: {}",
+                    blob_hash,
+                    src.display(),
+                    e
+                );
+            }
         };
         let mut magic = [0u8; 4];
         if f.read_exact(&mut magic).is_ok() && &magic == b"TLZ1" {
@@ -2816,13 +2831,13 @@ impl TurboStore {
             else {
                 // A truncated or corrupt cold body passes the header-only probe; drop it so it
                 // self-heals, unless a concurrent promotion already replaced it.
-                if fs::metadata(&src).is_ok_and(|m| m.ino() == opened_ino) {
+                if fs::symlink_metadata(&src).is_ok_and(|m| m.is_file() && m.ino() == opened_ino) {
                     let _ = fs::remove_file(&src);
                 }
                 anyhow::bail!("Failed to decompress or verify TLZ1 blob {}", blob_hash);
             };
             write_blob_atomic(&self.root, &src, blob_hash, &raw, true)?;
-            if let Ok(meta) = fs::metadata(&src) {
+            if let Ok((_, meta)) = open_regular_nofollow(&src) {
                 let _ = self.conn.execute(
                     "UPDATE blobs SET inode = ?1, last_accessed = ?2 WHERE blob_hash = ?3",
                     params![meta.ino() as i64, now_unix(), blob_hash],
@@ -2833,7 +2848,7 @@ impl TurboStore {
     }
 
     /// Refuse to link a CAS blob whose bytes do not verify against `blob_hash`.
-    /// A torn or corrupt blob is unlinked so the next producer rewrites it.
+    /// A torn or corrupt regular blob is unlinked so the next producer rewrites it.
     fn verify_blob_before_link(&self, blob_hash: &str, src: &Path) -> Result<u64> {
         let recorded: Option<i64> = self
             .conn
@@ -2846,13 +2861,15 @@ impl TurboStore {
         let len = match recorded {
             Some(sz) => matches!(
                 probe_blob_digest(src, blob_hash, sz.max(0) as u64),
-                BlobDisk::Intact(_)
+                BlobDisk::Intact
             )
             .then_some(sz.max(0) as u64),
             None => read_cas_blob_verified(src, blob_hash, None).map(|b| b.len() as u64),
         };
         let Some(len) = len else {
-            let _ = fs::remove_file(src);
+            if fs::symlink_metadata(src).is_ok_and(|m| m.is_file()) {
+                let _ = fs::remove_file(src);
+            }
             anyhow::bail!(
                 "CAS blob {} is missing or torn; refusing to link",
                 blob_hash
@@ -2869,7 +2886,7 @@ impl TurboStore {
         if let Some(parent) = dest_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        try_reflink_or_hardlink(&src, dest_path, Some(len))
+        install_verified_blob_to_path(&src, dest_path, blob_hash, len)
     }
 
     /// Record an active worktree lease and its active file->blob mappings.
@@ -4331,39 +4348,227 @@ where
     )
 }
 
-/// Publish `src` at `dest` so the bytes are durable before the name exists: fsync `src` and
-/// hardlink when the two share a device, or stage into a private sibling file (reflink or copy,
-/// mode `0o444`, fsynced) and atomically rename into place otherwise. `created` are the ancestor
-/// directories to sync; they and the destination's parent are fsynced after the directory entry
-/// lands.
+#[cfg(test)]
+type BeforeBlobInstallHook = std::sync::Arc<dyn Fn(&Path, &Path) + Send + Sync>;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_BLOB_INSTALL_HOOK: std::cell::RefCell<Option<BeforeBlobInstallHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_before_blob_install_hook(hook: BeforeBlobInstallHook) {
+    BEFORE_BLOB_INSTALL_HOOK.with(|h| *h.borrow_mut() = Some(hook));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_before_blob_install_hook() {
+    BEFORE_BLOB_INSTALL_HOOK.with(|h| *h.borrow_mut() = None);
+}
+
+/// Open `path` without following symlinks (`O_NOFOLLOW`) and verify the opened descriptor is a
+/// regular file (`S_ISREG` / `meta.is_file()`).
+pub(crate) fn open_regular_nofollow(path: &Path) -> std::io::Result<(File, fs::Metadata)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let sym = fs::symlink_metadata(path)?;
+    if sym.file_type().is_symlink() || !sym.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    let f = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} opened descriptor is not a regular file", path.display()),
+        ));
+    }
+    Ok((f, meta))
+}
+
+/// Read all bytes from `path` only if it resolves directly (`O_NOFOLLOW`) to a regular file.
+pub(crate) fn read_regular_nofollow(path: &Path) -> Option<(Vec<u8>, fs::Metadata)> {
+    let (mut f, meta) = open_regular_nofollow(path).ok()?;
+    let mut buf = Vec::with_capacity(meta.len().min(64 * 1024 * 1024) as usize);
+    f.read_to_end(&mut buf).ok()?;
+    Some((buf, meta))
+}
+
+/// Create a hardlink at `dst` to `src` without following symlinks (`linkat(..., 0)`), rejecting
+/// non-regular source inodes.
+pub(crate) fn link_regular_nofollow(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let (_, meta) = open_regular_nofollow(src)?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to hardlink non-regular source",
+        ));
+    }
+    let src_c = CString::new(src.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL byte in source path")
+    })?;
+    let dst_c = CString::new(dst.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL byte in dest path")
+    })?;
+    if unsafe {
+        libc::linkat(
+            libc::AT_FDCWD,
+            src_c.as_ptr(),
+            libc::AT_FDCWD,
+            dst_c.as_ptr(),
+            0,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Allocate a unique non-existent path `<dir>/<stem>.<pid>.<seq>.<nanos>.tmp` for `linkat`.
+fn reserve_unique_staging_path(dir: &Path, stem: &str) -> std::io::Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LINK_SEQ: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..16u64 {
+        let nanos = next_staging_nanos();
+        let seq = LINK_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("{stem}.{}.{seq}.{nanos}.tmp", std::process::id()));
+        if fs::symlink_metadata(&path).is_err() {
+            return Ok(path);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate unique link staging path",
+    ))
+}
+
+fn clone_or_copy_from_open_file(mut src_file: &File, dst_file: &mut File) -> std::io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        const FICLONE: libc::c_ulong = 0x40049409;
+        if unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) } == 0 {
+            return Ok(true);
+        }
+    }
+    use std::io::Seek;
+    src_file.seek(std::io::SeekFrom::Start(0))?;
+    std::io::copy(&mut src_file, dst_file)?;
+    Ok(false)
+}
+
+/// Publish `src` at `dest` so the bytes are durable before the name exists: fsync `src` (`O_NOFOLLOW`,
+/// regular file) and hardlink via `linkat(..., 0)` when the two share a device, or stage into a
+/// private sibling file (reflink or copy from the open `src` descriptor, mode `0o444`, fsynced) and
+/// atomically rename into place otherwise.
 pub(crate) fn publish_durable_link(
     src: &Path,
     dest: &Path,
     created: &[PathBuf],
 ) -> std::io::Result<()> {
-    if File::open(src)
-        .and_then(|f| durability_barrier(&f))
-        .and_then(|()| fs::hard_link(src, dest))
-        .is_ok()
-    {
-        return sync_published(dest, created);
-    }
-    let mut src_file = File::open(src)?;
-    stage_and_rename_durable(dest, "blob", 0o444, created, |dst_file| {
-        let mut cloned = false;
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::io::AsRawFd;
-            const FICLONE: libc::c_ulong = 0x40049409;
-            if unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) } == 0 {
-                cloned = true;
+    let (src_file, src_meta) = open_regular_nofollow(src)?;
+    durability_barrier(&src_file)?;
+    if link_regular_nofollow(src, dest).is_ok() {
+        if let Ok((_, dst_meta)) = open_regular_nofollow(dest) {
+            if dst_meta.dev() == src_meta.dev() && dst_meta.ino() == src_meta.ino() {
+                return sync_published(dest, created);
             }
         }
-        if !cloned {
-            std::io::copy(&mut src_file, dst_file)?;
-        }
+        let _ = fs::remove_file(dest);
+    }
+    stage_and_rename_durable(dest, "blob", 0o444, created, |dst_file| {
+        let _ = clone_or_copy_from_open_file(&src_file, dst_file)?;
         Ok(())
     })
+}
+
+/// Publish a CAS blob from `src` to `dest`, binding BLAKE3 digest + byte-length verification to the
+/// exact private staged inode/descriptor that is atomically published at `dest`. Returns the
+/// published destination inode.
+pub(crate) fn publish_verified_durable_blob(
+    src: &Path,
+    dest: &Path,
+    expected_hash: &str,
+    expected_len: u64,
+    created: &[PathBuf],
+) -> std::io::Result<i64> {
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_BLOB_INSTALL_HOOK.with(|h| h.borrow().clone()) {
+        hook(src, dest);
+    }
+    let parent = dest.parent().unwrap_or(dest);
+    let stem = format!(
+        ".{}",
+        dest.file_name().and_then(|s| s.to_str()).unwrap_or("blob")
+    );
+    // 1. Same-device fast path: hardlink into a private sibling temp path first (`linkat(..., 0)`),
+    //    then open & verify the staged inode (`O_NOFOLLOW`, regular, immutable `0o444`, exact length
+    //    and BLAKE3 digest), sync it, and publish via `link_regular_nofollow` or atomic `rename`.
+    if let Ok(staged_link) = reserve_unique_staging_path(parent, &stem) {
+        if link_regular_nofollow(src, &staged_link).is_ok() {
+            let link_ok = (|| -> std::io::Result<i64> {
+                let (mut f, meta) = open_regular_nofollow(&staged_link)?;
+                if (meta.permissions().mode() & 0o222) != 0 || meta.len() != expected_len {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "staged hardlink failed mode or length check",
+                    ));
+                }
+                let mut buf = Vec::with_capacity(expected_len.min(64 * 1024 * 1024) as usize);
+                f.read_to_end(&mut buf)?;
+                if buf.len() as u64 != expected_len
+                    || blake3::hash(&buf).to_hex().as_str() != expected_hash
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "staged hardlink digest mismatch",
+                    ));
+                }
+                durability_barrier(&f)?;
+                let ino = meta.ino() as i64;
+                drop(f);
+                fs::rename(&staged_link, dest)?;
+                sync_published(dest, created)?;
+                Ok(ino)
+            })();
+            let _ = fs::remove_file(&staged_link);
+            if let Ok(ino) = link_ok {
+                return Ok(ino);
+            }
+        }
+    }
+
+    // 2. Cross-device or cold/mutable source fallback: verify bytes from an `O_NOFOLLOW` regular fd
+    //    and write the verified buffer into a fresh `O_CREAT | O_EXCL` `0o444` staging file, fsync,
+    //    and atomically rename onto `dest`.
+    let raw = read_cas_blob_verified(src, expected_hash, Some(expected_len)).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("CAS source {} failed digest verification", src.display()),
+        )
+    })?;
+    stage_and_publish_durable(
+        parent,
+        &stem,
+        0o444,
+        dest,
+        created,
+        |dst_file| dst_file.write_all(&raw),
+        |f, staging, dst| {
+            let ino = f.metadata()?.ino() as i64;
+            fs::rename(staging, dst)?;
+            Ok(ino)
+        },
+    )
 }
 
 /// Write `bytes` to `dest` through a unique staging file next to it: the file is fsynced before
@@ -4428,19 +4633,19 @@ pub(crate) fn ensure_dir_tracking(dir: &Path, stop_at: &Path) -> Result<Vec<Path
 /// On-disk state of a CAS blob file relative to its expected raw size.
 pub(crate) enum BlobDisk {
     Missing,
-    Intact(fs::Metadata),
+    Intact,
     /// Present but not the expected size (a partial write left by an older writer or a crash).
     Torn,
 }
 
-/// Read a CAS blob (raw or `TLZ1`-compressed) and verify its uncompressed length (when supplied)
-/// and BLAKE3 digest against `expected_hash`.
+/// Read a CAS blob (raw or `TLZ1`-compressed) from a regular non-symlink file and verify its
+/// uncompressed length (when supplied) and BLAKE3 digest against `expected_hash`.
 pub(crate) fn read_cas_blob_verified(
     path: &Path,
     expected_hash: &str,
     expected_len: Option<u64>,
 ) -> Option<Vec<u8>> {
-    let disk_bytes = fs::read(path).ok()?;
+    let (disk_bytes, _) = read_regular_nofollow(path)?;
     if let Some(exp) = expected_len {
         if disk_bytes.len() as u64 == exp
             && blake3::hash(&disk_bytes).to_hex().as_str() == expected_hash
@@ -4463,23 +4668,21 @@ pub(crate) fn read_cas_blob_verified(
     None
 }
 
-/// Classify the CAS file at `path` by verifying both its uncompressed length (`expected_len`) and
-/// its BLAKE3 digest (`expected_hash`), transparently decompressing cold `TLZ1` blobs.
+/// Classify the CAS file at `path` (`O_NOFOLLOW`, regular file only) by verifying both its
+/// uncompressed length (`expected_len`) and its BLAKE3 digest (`expected_hash`), transparently
+/// decompressing cold `TLZ1` blobs.
 pub(crate) fn probe_blob_digest(path: &Path, expected_hash: &str, expected_len: u64) -> BlobDisk {
-    let mut f = match File::open(path) {
-        Ok(file) => file,
+    let (mut f, meta) = match open_regular_nofollow(path) {
+        Ok(pair) => pair,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return BlobDisk::Missing,
         Err(_) => return BlobDisk::Torn,
-    };
-    let Ok(meta) = f.metadata() else {
-        return BlobDisk::Torn;
     };
     let mut buf = Vec::with_capacity(meta.len().min(64 * 1024 * 1024) as usize);
     if f.read_to_end(&mut buf).is_err() {
         return BlobDisk::Torn;
     }
     if buf.len() as u64 == expected_len && blake3::hash(&buf).to_hex().as_str() == expected_hash {
-        return BlobDisk::Intact(meta);
+        return BlobDisk::Intact;
     }
     if buf.len() >= 12 && &buf[..4] == b"TLZ1" {
         let hdr_len = u64::from_le_bytes(buf[4..12].try_into().unwrap());
@@ -4487,7 +4690,7 @@ pub(crate) fn probe_blob_digest(path: &Path, expected_hash: &str, expected_len: 
             && decompress_tlz1(&buf)
                 .is_some_and(|raw| blake3::hash(&raw).to_hex().as_str() == expected_hash)
         {
-            return BlobDisk::Intact(meta);
+            return BlobDisk::Intact;
         }
     }
     BlobDisk::Torn
@@ -4539,23 +4742,25 @@ pub(crate) fn write_blob_bytes_checked(
                 fs::rename(staging_path, dst)?;
                 return Ok(staged_ino);
             }
-            match fs::hard_link(staging_path, dst) {
+            match link_regular_nofollow(staging_path, dst) {
                 Ok(()) => Ok(staged_ino),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     // Lost a race (or a pre-fix writer left a partial/corrupt file): keep an
                     // intact digest-verified blob (and still sync its bytes before `sync_published`
                     // syncs its directory chain), otherwise replace it with ours.
-                    match probe_blob_digest(dst, hash, expected_raw_len) {
-                        BlobDisk::Intact(m) => {
-                            let peer_f = File::open(dst)?;
+                    if let Ok((mut peer_f, m)) = open_regular_nofollow(dst) {
+                        let mut peer_buf =
+                            Vec::with_capacity(m.len().min(64 * 1024 * 1024) as usize);
+                        if peer_f.read_to_end(&mut peer_buf).is_ok()
+                            && verify_blob_payload_matches_hash(hash, &peer_buf)
+                                .is_ok_and(|l| l == expected_raw_len)
+                        {
                             durability_barrier(&peer_f)?;
-                            Ok(m.ino() as i64)
-                        }
-                        _ => {
-                            fs::rename(staging_path, dst)?;
-                            Ok(staged_ino)
+                            return Ok(m.ino() as i64);
                         }
                     }
+                    fs::rename(staging_path, dst)?;
+                    Ok(staged_ino)
                 }
                 Err(e) => Err(e),
             }
@@ -4603,24 +4808,40 @@ pub(crate) fn ensure_blob_file(
         );
     }
     let len = bytes.len() as u64;
-    let state = if known_missing {
+    if !known_missing {
+        if let Ok((mut f, meta)) = open_regular_nofollow(dest) {
+            let mut buf = Vec::with_capacity(meta.len().min(64 * 1024 * 1024) as usize);
+            let verified = f.read_to_end(&mut buf).is_ok()
+                && ((buf.len() as u64 == len && blake3::hash(&buf).to_hex().as_str() == hash)
+                    || (buf.len() >= 12
+                        && &buf[..4] == b"TLZ1"
+                        && u64::from_le_bytes(buf[4..12].try_into().unwrap()) == len
+                        && decompress_tlz1(&buf)
+                            .is_some_and(|raw| blake3::hash(&raw).to_hex().as_str() == hash)));
+            if verified {
+                durability_barrier(&f)?;
+                if let Some(parent) = dest.parent() {
+                    let ancestors = ensure_dir_tracking(parent, store_root)?;
+                    sync_dir(parent)?;
+                    for dir in ancestors {
+                        sync_dir(&dir)?;
+                    }
+                }
+                return Ok((meta.ino() as i64, len as i64));
+            }
+            return Ok((
+                write_blob_atomic(store_root, dest, hash, bytes, true)?,
+                len as i64,
+            ));
+        }
+    }
+    let state = if known_missing || fs::symlink_metadata(dest).is_err() {
         BlobDisk::Missing
     } else {
-        probe_blob_digest(dest, hash, len)
+        BlobDisk::Torn
     };
     match state {
-        BlobDisk::Intact(meta) => {
-            let f = File::open(dest)?;
-            durability_barrier(&f)?;
-            if let Some(parent) = dest.parent() {
-                let ancestors = ensure_dir_tracking(parent, store_root)?;
-                sync_dir(parent)?;
-                for dir in ancestors {
-                    sync_dir(&dir)?;
-                }
-            }
-            Ok((meta.ino() as i64, len as i64))
-        }
+        BlobDisk::Intact => unreachable!(),
         BlobDisk::Missing => Ok((
             write_blob_atomic(store_root, dest, hash, bytes, false)?,
             len as i64,
@@ -4696,126 +4917,182 @@ pub(crate) fn is_non_package_lake_build_path(p: &Path) -> bool {
     false
 }
 
-/// Install `src` at `dst` (reflink/hardlink/copy via a private temp + atomic rename). With
-/// `expected_len`, the temp file must have exactly that length before it is renamed into place, so a
-/// blob that GC re-compressed after the caller's probe is never published.
+/// Install a CAS blob `src` at `dst`, binding BLAKE3 digest (`expected_hash`) and byte length
+/// (`expected_len`) verification to the exact private staged inode/descriptor before atomic rename.
+pub(crate) fn install_verified_blob_to_path(
+    src: &Path,
+    dst: &Path,
+    expected_hash: &str,
+    expected_len: u64,
+) -> Result<&'static str> {
+    install_blob_to_path_checked(src, dst, Some(expected_hash), Some(expected_len))
+}
+
+#[cfg(test)]
 pub(crate) fn try_reflink_or_hardlink(
     src: &Path,
     dst: &Path,
     expected_len: Option<u64>,
 ) -> Result<&'static str> {
-    let pid = std::process::id();
-    let tid = format!("{:?}", std::thread::current().id())
-        .chars()
-        .filter(|c| c.is_ascii_digit())
-        .collect::<String>();
+    install_blob_to_path_checked(src, dst, None, expected_len)
+}
+
+fn install_blob_to_path_checked(
+    src: &Path,
+    dst: &Path,
+    expected_hash: Option<&str>,
+    expected_len: Option<u64>,
+) -> Result<&'static str> {
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_BLOB_INSTALL_HOOK.with(|h| h.borrow().clone()) {
+        hook(src, dst);
+    }
+    let parent = dst.parent().unwrap_or_else(|| Path::new("."));
     let fname = dst
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "artifact".to_string());
-    let tmp_dst = dst.with_file_name(format!(".{}.tl_tmp.{}.{}", fname, pid, tid));
-    let _ = fs::remove_file(&tmp_dst);
-    let check_len = |tmp: &Path| -> Result<()> {
-        if expected_len.is_some_and(|n| fs::metadata(tmp).map_or(true, |m| m.len() != n)) {
-            let _ = fs::remove_file(tmp);
-            anyhow::bail!("CAS blob changed while linking into {}", dst.display());
-        }
-        Ok(())
-    };
+    let stem = format!(".{}.tl_tmp", fname);
     let is_mutable_sidecar = fname == ".turbo_verified_sources.json"
         || fname.ends_with(".trace")
         || fname.ends_with(".hash")
         || fname.ends_with(".c")
         || is_non_package_lake_build_path(dst);
+
+    let verify_bytes = |bytes: &[u8]| -> Result<()> {
+        if expected_len.is_some_and(|n| bytes.len() as u64 != n) {
+            anyhow::bail!("CAS blob changed while linking into {}", dst.display());
+        }
+        if expected_hash.is_some_and(|h| blake3::hash(bytes).to_hex().as_str() != h) {
+            anyhow::bail!(
+                "CAS blob digest mismatch while installing into {}",
+                dst.display()
+            );
+        }
+        Ok(())
+    };
+
     if is_mutable_sidecar {
+        let (src_bytes, src_file) = {
+            let (mut f, meta) = open_regular_nofollow(src)
+                .with_context(|| format!("CAS source {} is not a regular file", src.display()))?;
+            let mut b = Vec::with_capacity(meta.len().min(64 * 1024 * 1024) as usize);
+            f.read_to_end(&mut b)?;
+            verify_bytes(&b)?;
+            (b, f)
+        };
+        let (mut dst_file, tmp_dst) = open_unique_staging_file(parent, &stem, 0o644)?;
+        let install_res = (|| -> Result<&'static str> {
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::unix::io::AsRawFd;
+                const FICLONE: libc::c_ulong = 0x40049409;
+                if unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) } == 0
+                {
+                    let mut cloned_buf = Vec::with_capacity(src_bytes.len());
+                    let (mut rf, _) = open_regular_nofollow(&tmp_dst)?;
+                    rf.read_to_end(&mut cloned_buf)?;
+                    if verify_bytes(&cloned_buf).is_ok() {
+                        fs::rename(&tmp_dst, dst)?;
+                        return Ok("reflink");
+                    }
+                    dst_file.set_len(0)?;
+                }
+            }
+            let _ = &src_file;
+            dst_file.write_all(&src_bytes)?;
+            drop(dst_file);
+            fs::rename(&tmp_dst, dst)?;
+            Ok("copy")
+        })();
+        let _ = fs::remove_file(&tmp_dst);
+        return install_res;
+    }
+
+    // 1. Try immutable hardlink (`linkat(..., 0)`, no symlink following) to a private staging path,
+    //    then open & verify the staged inode (`O_NOFOLLOW`, regular, immutable `0o444`, exact length
+    //    and BLAKE3 digest) BEFORE atomic rename onto `dst`.
+    if let Ok(tmp_link) = reserve_unique_staging_path(parent, &stem) {
+        if link_regular_nofollow(src, &tmp_link).is_ok() {
+            let hardlink_res = (|| -> Result<()> {
+                let (mut f, meta) = open_regular_nofollow(&tmp_link)?;
+                if (meta.permissions().mode() & 0o222) != 0 {
+                    anyhow::bail!(
+                        "Refusing to hardlink writable CAS inode into {}",
+                        dst.display()
+                    );
+                }
+                if expected_len.is_some_and(|n| meta.len() != n) {
+                    anyhow::bail!("CAS blob changed while linking into {}", dst.display());
+                }
+                if expected_hash.is_some() {
+                    let mut b = Vec::with_capacity(meta.len().min(64 * 1024 * 1024) as usize);
+                    f.read_to_end(&mut b)?;
+                    verify_bytes(&b)?;
+                }
+                drop(f);
+                fs::rename(&tmp_link, dst)?;
+                Ok(())
+            })();
+            let _ = fs::remove_file(&tmp_link);
+            match hardlink_res {
+                Ok(()) => return Ok("hardlink"),
+                Err(e) if expected_hash.is_some() || expected_len.is_some() => return Err(e),
+                Err(_) => {}
+            }
+        }
+    }
+
+    // Read and verify the regular source descriptor once; never re-open `src` by pathname afterward.
+    let (src_bytes, src_file) = {
+        let (mut f, meta) = open_regular_nofollow(src)
+            .with_context(|| format!("CAS source {} is not a regular file", src.display()))?;
+        let mut b = Vec::with_capacity(meta.len().min(64 * 1024 * 1024) as usize);
+        f.read_to_end(&mut b)?;
+        verify_bytes(&b)?;
+        (b, f)
+    };
+
+    // If hardlinking failed (e.g. EXDEV across filesystems) and `dst` already exists as a regular
+    // read-only `0o444` file with identical verified bytes, preserve `dst`'s existing inode & mtime.
+    if let Ok((mut dst_f, dst_meta)) = open_regular_nofollow(dst) {
+        if dst_meta.len() == src_bytes.len() as u64 && (dst_meta.permissions().mode() & 0o222) == 0
+        {
+            let mut db = Vec::with_capacity(src_bytes.len());
+            if dst_f.read_to_end(&mut db).is_ok() && db == src_bytes {
+                return Ok("hardlink");
+            }
+        }
+    }
+
+    // 2. Stage into a fresh `O_CREAT | O_EXCL` `0o444` temp file (FICLONE from verified `src_file`
+    //    when on a CoW FS, otherwise write `src_bytes`) and atomically rename onto `dst`.
+    let (mut dst_file, tmp_dst) = open_unique_staging_file(parent, &stem, 0o444)?;
+    let install_res = (|| -> Result<&'static str> {
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::io::AsRawFd;
-            if let (Ok(src_file), Ok(dst_file)) = (File::open(src), File::create(&tmp_dst)) {
-                const FICLONE: libc::c_ulong = 0x40049409;
-                let ret =
-                    unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) };
-                if ret == 0 {
-                    let mut perms = dst_file.metadata()?.permissions();
-                    perms.set_mode(0o644);
-                    let _ = dst_file.set_permissions(perms);
+            const FICLONE: libc::c_ulong = 0x40049409;
+            if unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) } == 0 {
+                let mut cloned_buf = Vec::with_capacity(src_bytes.len());
+                let (mut rf, _) = open_regular_nofollow(&tmp_dst)?;
+                rf.read_to_end(&mut cloned_buf)?;
+                if verify_bytes(&cloned_buf).is_ok() {
                     drop(dst_file);
-                    check_len(&tmp_dst)?;
                     fs::rename(&tmp_dst, dst)?;
                     return Ok("reflink");
-                } else {
-                    drop(dst_file);
-                    let _ = fs::remove_file(&tmp_dst);
                 }
+                dst_file.set_len(0)?;
             }
         }
-        fs::copy(src, &tmp_dst)?;
-        #[cfg(unix)]
-        {
-            let mut perms = fs::metadata(&tmp_dst)?.permissions();
-            perms.set_mode(0o644);
-            let _ = fs::set_permissions(&tmp_dst, perms);
-        }
-        check_len(&tmp_dst)?;
+        let _ = &src_file;
+        dst_file.write_all(&src_bytes)?;
+        drop(dst_file);
         fs::rename(&tmp_dst, dst)?;
-        return Ok("copy");
-    }
-
-    // 1. Try immutable hardlink to process-private temp path + atomic rename
-    // (shares OS page-cache mmap Shared_Clean across all worktrees and never races on dst)
-    if fs::hard_link(src, &tmp_dst).is_ok() {
-        check_len(&tmp_dst)?;
-        if fs::rename(&tmp_dst, dst).is_ok() {
-            return Ok("hardlink");
-        }
-        let _ = fs::remove_file(&tmp_dst);
-    }
-
-    // If hardlinking failed (e.g. EXDEV across bind mounts) and `dst` already exists as a
-    // read-only 0o444 file with identical size and bytes, preserve `dst`'s existing inode & mtime!
-    if let (Ok(src_meta), Ok(dst_meta)) = (fs::metadata(src), fs::metadata(dst)) {
-        if src_meta.len() == dst_meta.len()
-            && expected_len.is_none_or(|n| src_meta.len() == n)
-            && (dst_meta.permissions().mode() & 0o222) == 0
-        {
-            if let (Ok(sb), Ok(db)) = (fs::read(src), fs::read(dst)) {
-                if sb == db {
-                    return Ok("hardlink");
-                }
-            }
-        }
-    }
-
-    // 2. Try FICLONE ioctl reflink on CoW filesystems (Btrfs / XFS) via temp path
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::io::AsRawFd;
-        if let (Ok(src_file), Ok(dst_file)) = (File::open(src), File::create(&tmp_dst)) {
-            const FICLONE: libc::c_ulong = 0x40049409;
-            let ret = unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) };
-            if ret == 0 {
-                let mut perms = dst_file.metadata()?.permissions();
-                perms.set_mode(0o444);
-                let _ = dst_file.set_permissions(perms);
-                drop(dst_file);
-                check_len(&tmp_dst)?;
-                fs::rename(&tmp_dst, dst)?;
-                return Ok("reflink");
-            } else {
-                drop(dst_file);
-                let _ = fs::remove_file(&tmp_dst);
-            }
-        }
-    }
-
-    // 3. Fallback to file copy across distinct filesystems via temp path + atomic rename
-    fs::copy(src, &tmp_dst)?;
-    let mut perms = fs::metadata(&tmp_dst)?.permissions();
-    perms.set_mode(0o444);
-    let _ = fs::set_permissions(&tmp_dst, perms);
-    check_len(&tmp_dst)?;
-    fs::rename(&tmp_dst, dst)?;
-    Ok("copy")
+        Ok("copy")
+    })();
+    let _ = fs::remove_file(&tmp_dst);
+    install_res
 }
 
 #[cfg(test)]
@@ -4985,7 +5262,7 @@ mod tests {
         assert!(fs::metadata(&path)?.len() < payload.len() as u64);
         assert!(matches!(
             probe_blob_digest(&path, &bh, payload.len() as u64),
-            BlobDisk::Intact(_)
+            BlobDisk::Intact
         ));
         let (_, sz) = ensure_blob_file(&dir, &path, &bh, &payload, false)?;
         assert_eq!(sz, payload.len() as i64);
@@ -6715,6 +6992,183 @@ mod tests {
             2
         );
 
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_cross_device_materialize_and_fd_bound_install_reject_symlinks_and_races() -> Result<()>
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let (dir, mut store) = tmp_store("cross_dev_and_fd_bound_install")?;
+        let tc = "leanprover/lean4:v4.35.0";
+
+        let valid_bytes = b"cross-device-and-fd-bound-olean-payload-".repeat(32);
+        let bh = store.store_immutable_blob(&valid_bytes, "olean", "trusted", 0)?;
+        let cas_path = store.blob_path(&bh);
+        let entry = BlobEntry {
+            blob_hash: bh.clone(),
+            kind: "olean".to_string(),
+            size_bytes: valid_bytes.len() as u64,
+            rel_path: "lib/lean/CrossDev.olean".to_string(),
+        };
+        let lease = match store.acquire_singleflight("act_xdev", tc, "olean", "trusted")? {
+            SingleflightOutcome::Leader(l) => l,
+            _ => panic!("expected leader"),
+        };
+        store.publish_action(&lease, std::slice::from_ref(&entry), 5, 0, 0, "trusted")?;
+        drop(lease);
+
+        // 1. P1 #1: Cross-filesystem (`st_dev` mismatch via `/dev/shm` vs `temp_dir()`) destination
+        //    with the EXACT same byte length and mode `0o444`, but corrupt bytes, MUST NOT be
+        //    accepted by `already_valid_in_place` in `materialize_into_worktree`.
+        let shm_root = PathBuf::from("/dev/shm").join(format!(
+            "turbo_lean_xdev_wt_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&shm_root);
+        let xdev_wt = if fs::create_dir_all(&shm_root).is_ok()
+            && fs::metadata(&shm_root)
+                .ok()
+                .zip(fs::metadata(&dir).ok())
+                .is_some_and(|(m1, m2)| m1.dev() != m2.dev())
+        {
+            shm_root.clone()
+        } else {
+            dir.join("fallback_wt")
+        };
+        let dst_rel = xdev_wt.join(&entry.rel_path);
+        fs::create_dir_all(dst_rel.parent().unwrap())?;
+        let mut corrupt_same_len = valid_bytes.clone();
+        corrupt_same_len[0] ^= 0xAA;
+        fs::write(&dst_rel, &corrupt_same_len)?;
+        let mut p444 = fs::metadata(&dst_rel)?.permissions();
+        p444.set_mode(0o444);
+        fs::set_permissions(&dst_rel, p444)?;
+        if xdev_wt == shm_root {
+            assert_ne!(
+                fs::metadata(&dst_rel)?.dev(),
+                fs::metadata(&cas_path)?.dev(),
+                "expected distinct st_dev between /dev/shm worktree and CAS store"
+            );
+        }
+
+        let n_mat =
+            store.materialize_into_worktree(&xdev_wt, "xdev_proj", std::slice::from_ref(&entry))?;
+        assert_eq!(n_mat, 1);
+        assert_eq!(
+            fs::read(&dst_rel)?,
+            valid_bytes,
+            "materialize_into_worktree must overwrite same-length 0o444 corrupt cross-device destination"
+        );
+        assert_eq!(
+            fs::symlink_metadata(&dst_rel)?.permissions().mode() & 0o222,
+            0
+        );
+
+        // Plant a symlink at the destination pointing at a valid-looking decoy file:
+        // `materialize_into_worktree` must replace the symlink with a regular file without
+        // mutating or trusting the symlink.
+        let decoy = dir.join("decoy_target.olean");
+        fs::write(&decoy, &corrupt_same_len)?;
+        let mut p_decoy = fs::metadata(&decoy)?.permissions();
+        p_decoy.set_mode(0o444);
+        fs::set_permissions(&decoy, p_decoy)?;
+        fs::remove_file(&dst_rel)?;
+        std::os::unix::fs::symlink(&decoy, &dst_rel)?;
+        store.materialize_into_worktree(&xdev_wt, "xdev_proj", std::slice::from_ref(&entry))?;
+        assert!(
+            fs::symlink_metadata(&dst_rel)?.file_type().is_file(),
+            "destination symlink must be replaced by a regular file"
+        );
+        assert_eq!(fs::read(&dst_rel)?, valid_bytes);
+        assert_eq!(fs::read(&decoy)?, corrupt_same_len);
+
+        // 2. P1 #2 (symlink rejection across CAS probes/reads/materialization):
+        //    Replace the CAS entry with a relative symlink pointing to an intact file; all CAS
+        //    digest probes, reads, and worktree materialization must reject the symlinked CAS entry.
+        let real_copy = dir.join("real_cas_copy.bin");
+        fs::write(&real_copy, &valid_bytes)?;
+        let mut p_real = fs::metadata(&real_copy)?.permissions();
+        p_real.set_mode(0o444);
+        fs::set_permissions(&real_copy, p_real)?;
+        fs::remove_file(&cas_path)?;
+        std::os::unix::fs::symlink(&real_copy, &cas_path)?;
+        assert!(matches!(
+            probe_blob_digest(&cas_path, &bh, valid_bytes.len() as u64),
+            BlobDisk::Torn
+        ));
+        assert!(read_cas_blob_verified(&cas_path, &bh, Some(valid_bytes.len() as u64)).is_none());
+        let sym_wt = dir.join("sym_wt");
+        assert!(
+            store
+                .materialize_into_worktree(&sym_wt, "xdev_proj", std::slice::from_ref(&entry))
+                .is_err(),
+            "symlinked CAS entry must never materialize into worktree"
+        );
+        assert!(
+            store.get_cached_action("act_xdev", "trusted")?.is_none(),
+            "symlinked CAS entry must never validate as a cache hit"
+        );
+        // Restore genuine regular CAS entry.
+        fs::remove_file(&cas_path)?;
+        ensure_blob_file(&dir, &cas_path, &bh, &valid_bytes, false)?;
+
+        // 3. P1 #2 (deterministic replacement between outer verification and blob install/publish):
+        //    Use `set_before_blob_install_hook` to swap `cas_path` with a same-length `0o444`
+        //    corrupted file right before `install_verified_blob_to_path` / `publish_verified_durable_blob`
+        //    stages the link. Both must fail closed without publishing corrupt bytes.
+        let race_dst = dir.join("race_wt/lib/lean/CrossDev.olean");
+        let corrupt_for_hook = corrupt_same_len.clone();
+        set_before_blob_install_hook(std::sync::Arc::new(move |src, _dst| {
+            let _ = fs::remove_file(src);
+            if fs::write(src, &corrupt_for_hook).is_ok() {
+                if let Ok(m) = fs::metadata(src) {
+                    let mut p = m.permissions();
+                    p.set_mode(0o444);
+                    let _ = fs::set_permissions(src, p);
+                }
+            }
+        }));
+        let mat_race_res = store.restore_blob_to_path(&bh, &race_dst);
+        clear_before_blob_install_hook();
+        assert!(
+            mat_race_res.is_err(),
+            "same-length replacement right before install must fail closed"
+        );
+        assert!(
+            !race_dst.exists(),
+            "corrupted replacement must never be installed at destination"
+        );
+
+        // Restore genuine CAS entry and test `publish_verified_durable_blob` under the same hook.
+        fs::remove_file(&cas_path)?;
+        ensure_blob_file(&dir, &cas_path, &bh, &valid_bytes, false)?;
+        let pub_dst = dir.join("shared_pub").join(&bh);
+        fs::create_dir_all(pub_dst.parent().unwrap())?;
+        let corrupt_for_pub = corrupt_same_len.clone();
+        set_before_blob_install_hook(std::sync::Arc::new(move |src, _dst| {
+            let _ = fs::remove_file(src);
+            if fs::write(src, &corrupt_for_pub).is_ok() {
+                if let Ok(m) = fs::metadata(src) {
+                    let mut p = m.permissions();
+                    p.set_mode(0o444);
+                    let _ = fs::set_permissions(src, p);
+                }
+            }
+        }));
+        let pub_race_res =
+            publish_verified_durable_blob(&cas_path, &pub_dst, &bh, valid_bytes.len() as u64, &[]);
+        clear_before_blob_install_hook();
+        assert!(
+            pub_race_res.is_err(),
+            "publish_verified_durable_blob must reject same-length replacement before staging"
+        );
+        assert!(!pub_dst.exists());
+
+        let _ = fs::remove_dir_all(&shm_root);
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }

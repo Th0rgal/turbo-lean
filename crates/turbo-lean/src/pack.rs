@@ -826,13 +826,18 @@ pub fn try_stateless_push_sync(
             if is_loopback { 1 } else { 0 }
         ));
         if !is_loopback || shared_cas_blobs_dir().exists() {
-            if let Ok(cached_bytes) = fs::read(&last_file) {
+            if let Some((cached_bytes, _)) = crate::db::read_regular_nofollow(&last_file) {
                 if cached_bytes.len() >= 24 {
                     let n_acts = read_u64_le_at(&cached_bytes, 0) as usize;
                     let n_blobs = read_u64_le_at(&cached_bytes, 8) as usize;
                     let raw_bytes = read_u64_le_at(&cached_bytes, 16);
                     let push_bytes = &cached_bytes[24..];
-                    if n_acts == dm.action_keys.len() && n_blobs == dm.blob_hashes.len() {
+                    if n_acts == dm.action_keys.len()
+                        && n_blobs == dm.blob_hashes.len()
+                        && verify_cached_pack_stream_integrity_at_root(
+                            store_root, push_bytes, n_acts, n_blobs, raw_bytes,
+                        )
+                    {
                         let pushed_pack_bytes =
                             if is_loopback && push_bytes.starts_with(b"TLPK\x00\x00\x00\x03") {
                                 (push_bytes.len() as u64) + raw_bytes
@@ -852,6 +857,8 @@ pub fn try_stateless_push_sync(
                                 None,
                             ));
                         }
+                    } else {
+                        let _ = fs::remove_file(&last_file);
                     }
                 }
             }
@@ -973,6 +980,7 @@ pub(crate) fn shared_cas_blobs_dir_for_store(store_root: &Path) -> std::path::Pa
 fn ensure_blob_in_shared_cas(
     store: &TurboStore,
     bh: &str,
+    expected_len: u64,
     shared_blobs: &Path,
     seen_prefix: &mut [bool; 256],
 ) -> bool {
@@ -990,22 +998,160 @@ fn ensure_blob_in_shared_cas(
         Vec::new()
     };
     let shared_dest = shared_dir.join(bh);
-    if shared_dest.exists() {
-        let ok = fs::File::open(&shared_dest)
-            .and_then(|f| crate::db::durability_barrier(&f))
-            .is_ok()
-            && crate::db::sync_dir(&shared_dir).is_ok();
-        for dir in &created {
-            if crate::db::sync_dir(dir).is_err() {
-                return false;
+    if let Ok((mut f, meta)) = crate::db::open_regular_nofollow(&shared_dest) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut buf = Vec::with_capacity(meta.len().min(64 * 1024 * 1024) as usize);
+        if f.read_to_end(&mut buf).is_ok()
+            && buf.len() as u64 == expected_len
+            && blake3::hash(&buf).to_hex().as_str() == bh
+        {
+            if (meta.permissions().mode() & 0o222) != 0 {
+                let mut perms = meta.permissions();
+                perms.set_mode(0o444);
+                let _ = f.set_permissions(perms);
+            }
+            let ok = crate::db::durability_barrier(&f).is_ok()
+                && crate::db::sync_dir(&shared_dir).is_ok();
+            for dir in &created {
+                if crate::db::sync_dir(dir).is_err() {
+                    return false;
+                }
+            }
+            if ok {
+                return true;
             }
         }
-        return ok;
     }
-    let src = store
-        .ensure_blob_uncompressed(bh)
-        .unwrap_or_else(|_| store.blob_path(bh));
-    crate::db::publish_durable_link(&src, &shared_dest, &created).is_ok()
+    let Ok(src) = store.ensure_blob_uncompressed(bh) else {
+        for dir in &created {
+            let _ = crate::db::sync_dir(dir);
+        }
+        return false;
+    };
+    let ok =
+        crate::db::publish_verified_durable_blob(&src, &shared_dest, bh, expected_len, &created)
+            .is_ok();
+    if !ok {
+        for dir in &created {
+            let _ = crate::db::sync_dir(dir);
+        }
+    }
+    ok
+}
+
+fn verify_cached_pack_stream_integrity_at_root(
+    store_root: &Path,
+    stream: &[u8],
+    expected_acts: usize,
+    expected_blobs: usize,
+    expected_raw_bytes: u64,
+) -> bool {
+    if stream.len() < 16 {
+        return false;
+    }
+    let magic = &stream[..8];
+    let is_v2 = magic == b"TLPK\x00\x00\x00\x02";
+    let is_v3 = magic == b"TLPK\x00\x00\x00\x03";
+    if !is_v2 && !is_v3 {
+        return false;
+    }
+    let hlen = read_u64_le_at(stream, 8) as usize;
+    if 16 + hlen > stream.len() {
+        return false;
+    }
+    let Ok(m) = serde_json::from_slice::<PackManifest>(&stream[16..16 + hlen]) else {
+        return false;
+    };
+    if m.actions.len() != expected_acts || m.blobs.len() != expected_blobs {
+        return false;
+    }
+    let store_blobs = store_root.join("blobs");
+    let mut sum_raw = 0u64;
+    if is_v2 {
+        let mut cursor = 16 + hlen;
+        for b in &m.blobs {
+            let prefix = if b.blob_hash.len() >= 2 {
+                &b.blob_hash[..2]
+            } else {
+                "00"
+            };
+            let sz = b.size_bytes as usize;
+            let Some(end) = cursor.checked_add(sz) else {
+                return false;
+            };
+            if end > stream.len() {
+                return false;
+            }
+            if blake3::hash(&stream[cursor..end]).to_hex().as_str() != b.blob_hash {
+                return false;
+            }
+            if !matches!(
+                crate::db::probe_blob_digest(
+                    &store_blobs.join(prefix).join(&b.blob_hash),
+                    &b.blob_hash,
+                    b.size_bytes
+                ),
+                crate::db::BlobDisk::Intact
+            ) {
+                return false;
+            }
+            sum_raw = sum_raw.saturating_add(b.size_bytes);
+            cursor = end;
+        }
+        cursor == stream.len() && sum_raw == expected_raw_bytes
+    } else {
+        if 16 + hlen != stream.len() {
+            return false;
+        }
+        let shared_blobs = shared_cas_blobs_dir_for_store(store_root);
+        let shared_shm = shared_cas_blobs_dir();
+        for b in &m.blobs {
+            if b.blob_hash.len() < 2 {
+                return false;
+            }
+            let prefix = &b.blob_hash[..2];
+            if !matches!(
+                crate::db::probe_blob_digest(
+                    &store_blobs.join(prefix).join(&b.blob_hash),
+                    &b.blob_hash,
+                    b.size_bytes
+                ),
+                crate::db::BlobDisk::Intact
+            ) {
+                return false;
+            }
+            let sp1 = shared_blobs.join(prefix).join(&b.blob_hash);
+            let sp2 = shared_shm.join(prefix).join(&b.blob_hash);
+            let in_shared = matches!(
+                crate::db::probe_blob_digest(&sp1, &b.blob_hash, b.size_bytes),
+                crate::db::BlobDisk::Intact
+            ) || matches!(
+                crate::db::probe_blob_digest(&sp2, &b.blob_hash, b.size_bytes),
+                crate::db::BlobDisk::Intact
+            );
+            if !in_shared {
+                return false;
+            }
+            sum_raw = sum_raw.saturating_add(b.size_bytes);
+        }
+        sum_raw == expected_raw_bytes
+    }
+}
+
+fn verify_cached_pack_stream_integrity(
+    store: &TurboStore,
+    stream: &[u8],
+    expected_acts: usize,
+    expected_blobs: usize,
+    expected_raw_bytes: u64,
+) -> bool {
+    verify_cached_pack_stream_integrity_at_root(
+        &store.root,
+        stream,
+        expected_acts,
+        expected_blobs,
+        expected_raw_bytes,
+    )
 }
 
 pub fn export_pack_filtered_bytes(
@@ -1077,51 +1223,61 @@ pub fn export_pack_filtered_with_mode_and_signing_key(
                     if header_only_shared_cas { 1 } else { 0 }
                 ));
                 if !header_only_shared_cas || shared_cas_blobs_dir().exists() {
-                    if let Ok(mut cached_bytes) = fs::read(&cache_file) {
+                    if let Some((mut cached_bytes, _)) =
+                        crate::db::read_regular_nofollow(&cache_file)
+                    {
                         if cached_bytes.len() >= 24 {
                             let n_acts = read_u64_le_at(&cached_bytes, 0) as usize;
                             let n_blobs = read_u64_le_at(&cached_bytes, 8) as usize;
                             let raw_bytes = read_u64_le_at(&cached_bytes, 16);
                             let stream = cached_bytes.split_off(24);
-                            if only_portable {
-                                let locks_dir = store.root.join("locks");
-                                if let Ok(created) =
-                                    crate::db::ensure_dir_tracking(&locks_dir, &store.root)
-                                {
-                                    let last_file = locks_dir.join(format!(
-                                        "last_full_export_{}.bin",
-                                        if header_only_shared_cas { 1 } else { 0 }
-                                    ));
-                                    if !last_file.exists() {
-                                        let _ = crate::db::publish_durable_link(
-                                            &cache_file,
-                                            &last_file,
-                                            &created,
-                                        );
-                                    } else {
-                                        for dir in &created {
-                                            let _ = crate::db::sync_dir(dir);
+                            if verify_cached_pack_stream_integrity(
+                                store, &stream, n_acts, n_blobs, raw_bytes,
+                            ) {
+                                if only_portable {
+                                    let locks_dir = store.root.join("locks");
+                                    if let Ok(created) =
+                                        crate::db::ensure_dir_tracking(&locks_dir, &store.root)
+                                    {
+                                        let last_file = locks_dir.join(format!(
+                                            "last_full_export_{}.bin",
+                                            if header_only_shared_cas { 1 } else { 0 }
+                                        ));
+                                        if !last_file.exists() {
+                                            let _ = crate::db::publish_durable_link(
+                                                &cache_file,
+                                                &last_file,
+                                                &created,
+                                            );
+                                        } else {
+                                            for dir in &created {
+                                                let _ = crate::db::sync_dir(dir);
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            if !store
-                                .root
-                                .join("locks")
-                                .join("cached_portable_manifest.json")
-                                .exists()
-                                && stream.len() >= 16
-                            {
-                                let hlen = read_u64_le_at(&stream, 8) as usize;
-                                if 16 + hlen <= stream.len() {
-                                    if let Ok(m) = serde_json::from_slice::<PackManifest>(
-                                        &stream[16..16 + hlen],
-                                    ) {
-                                        save_cached_portable_manifest_from_pack(&store.root, &m);
+                                if !store
+                                    .root
+                                    .join("locks")
+                                    .join("cached_portable_manifest.json")
+                                    .exists()
+                                    && stream.len() >= 16
+                                {
+                                    let hlen = read_u64_le_at(&stream, 8) as usize;
+                                    if 16 + hlen <= stream.len() {
+                                        if let Ok(m) = serde_json::from_slice::<PackManifest>(
+                                            &stream[16..16 + hlen],
+                                        ) {
+                                            save_cached_portable_manifest_from_pack(
+                                                &store.root,
+                                                &m,
+                                            );
+                                        }
                                     }
                                 }
+                                return Ok((n_acts, n_blobs, raw_bytes, stream));
                             }
-                            return Ok((n_acts, n_blobs, raw_bytes, stream));
+                            let _ = fs::remove_file(&cache_file);
                         }
                     }
                 }
@@ -1141,7 +1297,7 @@ pub fn export_pack_filtered_with_mode_and_signing_key(
             if let Some(s) = cf.to_str().and_then(|s| s.strip_suffix("_0.bin")) {
                 let v3_file = std::path::PathBuf::from(format!("{}_1.bin", s));
                 if shared_cas_blobs_dir().exists() {
-                    if let Ok(v3_cached) = fs::read(&v3_file) {
+                    if let Some((v3_cached, _)) = crate::db::read_regular_nofollow(&v3_file) {
                         if v3_cached.len() >= 40 && &v3_cached[24..32] == b"TLPK\x00\x00\x00\x03" {
                             let n_acts = read_u64_le_at(&v3_cached, 0) as usize;
                             let n_blobs = read_u64_le_at(&v3_cached, 8) as usize;
@@ -1159,20 +1315,34 @@ pub fn export_pack_filtered_with_mode_and_signing_key(
                                             all_ok = false;
                                             break;
                                         }
+                                        let store_p = store.blob_path(&b.blob_hash);
+                                        if !matches!(
+                                            crate::db::probe_blob_digest(
+                                                &store_p,
+                                                &b.blob_hash,
+                                                b.size_bytes
+                                            ),
+                                            crate::db::BlobDisk::Intact
+                                        ) {
+                                            all_ok = false;
+                                            break;
+                                        }
                                         let sp =
                                             shared_shm.join(&b.blob_hash[..2]).join(&b.blob_hash);
-                                        let p = if sp.exists() {
-                                            sp
-                                        } else {
-                                            store.blob_path(&b.blob_hash)
-                                        };
-                                        let start_l = payload.len();
-                                        if let Ok(mut f) = fs::File::open(&p) {
-                                            if f.read_to_end(&mut payload).is_ok()
-                                                && (payload.len() - start_l) as u64 == b.size_bytes
-                                            {
-                                                continue;
-                                            }
+                                        if let Some(raw) = crate::db::read_cas_blob_verified(
+                                            &sp,
+                                            &b.blob_hash,
+                                            Some(b.size_bytes),
+                                        )
+                                        .or_else(|| {
+                                            crate::db::read_cas_blob_verified(
+                                                &store_p,
+                                                &b.blob_hash,
+                                                Some(b.size_bytes),
+                                            )
+                                        }) {
+                                            payload.extend_from_slice(&raw);
+                                            continue;
                                         }
                                         all_ok = false;
                                         break;
@@ -1375,9 +1545,30 @@ pub fn export_pack_filtered_with_mode_and_signing_key(
 
     for (bh, kind, db_sz) in needed_blobs {
         if header_only_shared_cas {
-            let ok1 = ensure_blob_in_shared_cas(store, &bh, &shared_blobs, &mut seen_shared_prefix);
+            if !matches!(
+                crate::db::probe_blob_digest(&store.blob_path(&bh), &bh, db_sz),
+                crate::db::BlobDisk::Intact
+            ) {
+                anyhow::bail!(
+                    "Refusing to export CAS blob {}: missing, symlinked, or digest-corrupted on disk",
+                    bh
+                );
+            }
+            let ok1 = ensure_blob_in_shared_cas(
+                store,
+                &bh,
+                db_sz,
+                &shared_blobs,
+                &mut seen_shared_prefix,
+            );
             let ok2 = if shared_blobs != shared_blobs_shm {
-                ensure_blob_in_shared_cas(store, &bh, &shared_blobs_shm, &mut seen_shm_prefix)
+                ensure_blob_in_shared_cas(
+                    store,
+                    &bh,
+                    db_sz,
+                    &shared_blobs_shm,
+                    &mut seen_shm_prefix,
+                )
             } else {
                 ok1
             };
@@ -1394,39 +1585,34 @@ pub fn export_pack_filtered_with_mode_and_signing_key(
                 all_in_shared = false;
             }
         } else {
-            let p = store
-                .ensure_blob_uncompressed(&bh)
-                .unwrap_or_else(|_| store.blob_path(&bh));
-            if let Ok(mut f) = fs::File::open(&p) {
-                let start_len = payload_buf.len();
-                if f.read_to_end(&mut payload_buf).is_ok() {
-                    let sz = (payload_buf.len() - start_len) as u64;
-                    total_raw_bytes += sz;
-                    let _ = ensure_blob_in_shared_cas(
-                        store,
-                        &bh,
-                        &shared_blobs,
-                        &mut seen_shared_prefix,
-                    );
-                    if shared_blobs != shared_blobs_shm {
-                        let _ = ensure_blob_in_shared_cas(
-                            store,
-                            &bh,
-                            &shared_blobs_shm,
-                            &mut seen_shm_prefix,
-                        );
-                    }
-                    blobs.push(PackedBlob {
-                        blob_hash: bh,
-                        portable: is_portable_artifact(&kind, ""),
-                        kind,
-                        size_bytes: sz,
-                        data_hex_or_base64: Vec::new(),
-                    });
-                } else {
-                    payload_buf.truncate(start_len);
-                }
+            let p = store.ensure_blob_uncompressed(&bh)?;
+            let Some(raw) = crate::db::read_cas_blob_verified(&p, &bh, Some(db_sz)) else {
+                anyhow::bail!(
+                    "Refusing to export CAS blob {}: missing, symlinked, or digest-corrupted on disk",
+                    bh
+                );
+            };
+            let sz = raw.len() as u64;
+            payload_buf.extend_from_slice(&raw);
+            total_raw_bytes += sz;
+            let _ =
+                ensure_blob_in_shared_cas(store, &bh, sz, &shared_blobs, &mut seen_shared_prefix);
+            if shared_blobs != shared_blobs_shm {
+                let _ = ensure_blob_in_shared_cas(
+                    store,
+                    &bh,
+                    sz,
+                    &shared_blobs_shm,
+                    &mut seen_shm_prefix,
+                );
             }
+            blobs.push(PackedBlob {
+                blob_hash: bh,
+                portable: is_portable_artifact(&kind, ""),
+                kind,
+                size_bytes: sz,
+                data_hex_or_base64: Vec::new(),
+            });
         }
     }
 
@@ -1663,7 +1849,7 @@ pub fn prestage_blobs_from_shared_cas(
         let dest = store_blobs.join(prefix).join(&b.blob_hash);
         #[cfg(unix)]
         let inode = {
-            use std::os::unix::fs::MetadataExt;
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
             let sync_created_parents = |dirs: &mut Vec<std::path::PathBuf>| {
                 dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
                 dirs.dedup();
@@ -1671,105 +1857,85 @@ pub fn prestage_blobs_from_shared_cas(
                     let _ = crate::db::sync_dir(dir);
                 }
             };
-            if let crate::db::BlobDisk::Intact(m) =
-                crate::db::probe_blob_digest(&dest, &b.blob_hash, b.size_bytes)
-            {
-                let durable = fs::File::open(&dest)
-                    .and_then(|f| crate::db::durability_barrier(&f))
-                    .is_ok()
-                    && crate::db::sync_dir(dest.parent().unwrap_or(&store_blobs)).is_ok();
-                if !durable {
-                    sync_created_parents(&mut created_parents);
-                    return None;
+            if let Ok((mut f, m)) = crate::db::open_regular_nofollow(&dest) {
+                let mut buf = Vec::with_capacity(m.len().min(64 * 1024 * 1024) as usize);
+                if f.read_to_end(&mut buf).is_ok()
+                    && buf.len() as u64 == b.size_bytes
+                    && blake3::hash(&buf).to_hex().as_str() == b.blob_hash
+                    && (m.permissions().mode() & 0o222) == 0
+                {
+                    let durable = crate::db::durability_barrier(&f).is_ok()
+                        && crate::db::sync_dir(dest.parent().unwrap_or(&store_blobs)).is_ok();
+                    if !durable {
+                        sync_created_parents(&mut created_parents);
+                        return None;
+                    }
+                    staged_blobs.push((
+                        b.blob_hash.clone(),
+                        b.kind.clone(),
+                        b.size_bytes as i64,
+                        m.ino() as i64,
+                    ));
+                    continue;
                 }
-                staged_blobs.push((
-                    b.blob_hash.clone(),
-                    b.kind.clone(),
-                    b.size_bytes as i64,
-                    m.ino() as i64,
-                ));
-                continue;
             }
             let shared_p = shared_blobs.join(prefix).join(&b.blob_hash);
             let shared_p_alt = shared_blobs_shm.join(prefix).join(&b.blob_hash);
-            let shared_ok = matches!(
-                crate::db::probe_blob_digest(&shared_p, &b.blob_hash, b.size_bytes),
-                crate::db::BlobDisk::Intact(_)
-            );
-            let shared_alt_ok = matches!(
-                crate::db::probe_blob_digest(&shared_p_alt, &b.blob_hash, b.size_bytes),
-                crate::db::BlobDisk::Intact(_)
-            );
-            let link_res = if shared_ok {
-                fs::File::open(&shared_p)
-                    .and_then(|f| crate::db::durability_barrier(&f))
-                    .and_then(|()| fs::hard_link(&shared_p, &dest))
-                    .or_else(|e| {
-                        if shared_alt_ok {
-                            fs::File::open(&shared_p_alt)
-                                .and_then(|f| crate::db::durability_barrier(&f))
-                                .and_then(|()| fs::hard_link(&shared_p_alt, &dest))
-                        } else {
-                            Err(e)
-                        }
-                    })
-            } else if shared_alt_ok {
-                fs::File::open(&shared_p_alt)
-                    .and_then(|f| crate::db::durability_barrier(&f))
-                    .and_then(|()| fs::hard_link(&shared_p_alt, &dest))
-            } else {
+            let ensure_immutable = |p: &Path| {
+                if let Ok((f, m)) = crate::db::open_regular_nofollow(p) {
+                    if (m.permissions().mode() & 0o222) != 0 {
+                        let mut perms = m.permissions();
+                        perms.set_mode(0o444);
+                        let _ = f.set_permissions(perms);
+                    }
+                }
+            };
+            ensure_immutable(&shared_p);
+            if shared_p_alt != shared_p {
+                ensure_immutable(&shared_p_alt);
+            }
+            let mut from_alt = false;
+            let published_ino = match crate::db::publish_verified_durable_blob(
+                &shared_p,
+                &dest,
+                &b.blob_hash,
+                b.size_bytes,
+                &[],
+            ) {
+                Ok(ino) => Ok(ino),
+                Err(_) if shared_p_alt != shared_p => {
+                    from_alt = true;
+                    crate::db::publish_verified_durable_blob(
+                        &shared_p_alt,
+                        &dest,
+                        &b.blob_hash,
+                        b.size_bytes,
+                        &[],
+                    )
+                }
+                Err(e) => Err(e),
+            };
+            let Ok(ino) = published_ino else {
                 sync_created_parents(&mut created_parents);
                 return None;
             };
-            match link_res {
-                Ok(()) => {
-                    if crate::db::sync_dir(dest.parent().unwrap_or(&store_blobs)).is_err() {
-                        sync_created_parents(&mut created_parents);
-                        return None;
-                    }
-                    total_newly_written += 1;
-                    0i64
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    match crate::db::probe_blob_digest(&dest, &b.blob_hash, b.size_bytes) {
-                        crate::db::BlobDisk::Intact(m) => {
-                            let durable = fs::File::open(&dest)
-                                .and_then(|f| crate::db::durability_barrier(&f))
-                                .is_ok()
-                                && crate::db::sync_dir(dest.parent().unwrap_or(&store_blobs))
-                                    .is_ok();
-                            if !durable {
-                                sync_created_parents(&mut created_parents);
-                                return None;
-                            }
-                            m.ino() as i64
-                        }
-                        _ => {
-                            sync_created_parents(&mut created_parents);
-                            return None;
-                        }
-                    }
-                }
-                Err(_) => {
-                    let src_p = if shared_ok { &shared_p } else { &shared_p_alt };
-                    if crate::db::publish_durable_link(src_p, &dest, &[]).is_err() {
-                        sync_created_parents(&mut created_parents);
-                        return None;
-                    }
-                    if !shared_ok {
-                        let shared_parent = shared_p.parent().unwrap_or(&shared_blobs);
-                        let shared_stop = shared_blobs.parent().unwrap_or(&shared_blobs);
-                        if let Ok(shared_created) =
-                            crate::db::ensure_dir_tracking(shared_parent, shared_stop)
-                        {
-                            let _ =
-                                crate::db::publish_durable_link(&dest, &shared_p, &shared_created);
-                        }
-                    }
-                    total_newly_written += 1;
-                    0i64
+            if from_alt {
+                let shared_parent = shared_p.parent().unwrap_or(&shared_blobs);
+                let shared_stop = shared_blobs.parent().unwrap_or(&shared_blobs);
+                if let Ok(shared_created) =
+                    crate::db::ensure_dir_tracking(shared_parent, shared_stop)
+                {
+                    let _ = crate::db::publish_verified_durable_blob(
+                        &dest,
+                        &shared_p,
+                        &b.blob_hash,
+                        b.size_bytes,
+                        &shared_created,
+                    );
                 }
             }
+            total_newly_written += 1;
+            ino
         };
         #[cfg(not(unix))]
         let inode = {
@@ -1942,7 +2108,7 @@ pub(crate) fn finish_import_from_prestaged_shared_cas_inner(
     let missing_on_disk = staged_blobs.iter().any(|(bh, _, sz, _)| {
         !matches!(
             crate::db::probe_blob_digest(&store.blob_path(bh), bh, (*sz).max(0) as u64),
-            crate::db::BlobDisk::Intact(_)
+            crate::db::BlobDisk::Intact
         )
     }) || manifest.actions.iter().any(|a| {
         a.outputs.iter().any(|o| {
@@ -1952,7 +2118,7 @@ pub(crate) fn finish_import_from_prestaged_shared_cas_inner(
                     &o.blob_hash,
                     o.size_bytes
                 ),
-                crate::db::BlobDisk::Intact(_)
+                crate::db::BlobDisk::Intact
             )
         })
     });
@@ -1969,7 +2135,7 @@ pub(crate) fn finish_import_from_prestaged_shared_cas_inner(
                         &o.blob_hash,
                         o.size_bytes
                     ),
-                    crate::db::BlobDisk::Intact(_)
+                    crate::db::BlobDisk::Intact
                 ) {
                     anyhow::bail!(
                         "Refusing to publish prestaged pack import: output blob {} missing or torn on disk",
@@ -2262,21 +2428,34 @@ pub fn import_pack_bytes_with_policy(
             #[cfg(unix)]
             let inode = {
                 use crate::db::{
-                    durability_barrier, probe_blob_digest, sync_dir, write_blob_atomic, BlobDisk,
+                    durability_barrier, open_regular_nofollow, sync_dir, write_blob_atomic,
                 };
-                use std::os::unix::fs::MetadataExt;
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
                 let len = blob_bytes.len() as u64;
-                match probe_blob_digest(&dest, &b.blob_hash, len) {
-                    BlobDisk::Intact(m) => {
-                        let f = fs::File::open(&dest)?;
+                let existing_intact = (|| -> Option<(fs::File, fs::Metadata)> {
+                    let (mut f, m) = open_regular_nofollow(&dest).ok()?;
+                    if m.len() != len || (m.permissions().mode() & 0o222) != 0 {
+                        return None;
+                    }
+                    let mut buf = Vec::with_capacity(len.min(64 * 1024 * 1024) as usize);
+                    f.read_to_end(&mut buf).ok()?;
+                    if buf.len() as u64 != len
+                        || blake3::hash(&buf).to_hex().as_str() != b.blob_hash
+                    {
+                        return None;
+                    }
+                    Some((f, m))
+                })();
+                match existing_intact {
+                    Some((f, m)) => {
                         durability_barrier(&f)?;
                         if let Some(parent) = dest.parent() {
                             sync_dir(parent)?;
                         }
                         m.ino() as i64
                     }
-                    missing_or_torn => {
-                        let replace = matches!(missing_or_torn, BlobDisk::Torn);
+                    None => {
+                        let replace = fs::symlink_metadata(&dest).is_ok();
                         newly_written += 1;
                         write_blob_atomic(root_dir, &dest, &b.blob_hash, blob_bytes, replace)?
                     }
@@ -5030,6 +5209,139 @@ pub(crate) mod tests {
         let _ = fs::remove_dir_all(&root_crash);
         let _ = fs::remove_dir_all(&root_a);
         let _ = fs::remove_dir_all(&root_b);
+        let _ = fs::remove_dir_all(&root_dst);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_pack_export_and_shared_cas_fail_closed_on_corrupt_or_symlinked_blobs() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let _env_guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let root_src =
+            std::env::temp_dir().join(format!("turbo_lean_exp_int_src_{}", next_tmp_id()));
+        let root_dst =
+            std::env::temp_dir().join(format!("turbo_lean_exp_int_dst_{}", next_tmp_id()));
+        let _ = fs::remove_dir_all(&root_src);
+        let _ = fs::remove_dir_all(&root_dst);
+
+        let mut store_src = TurboStore::open(Some(&root_src))?;
+        let good_payload = b"verified-pack-export-olean-payload-".repeat(24);
+        let bh = store_src.store_immutable_blob(&good_payload, "olean", "trusted", 0)?;
+        if let SingleflightOutcome::Leader(l) =
+            store_src.acquire_singleflight("exp-int-act-1", "v4.35.0", "module_unit", "trusted")?
+        {
+            store_src.publish_action(
+                &l,
+                &[BlobEntry {
+                    blob_hash: bh.clone(),
+                    kind: "olean".into(),
+                    size_bytes: good_payload.len() as u64,
+                    rel_path: "build/lib/lean/ExpInt.olean".into(),
+                }],
+                1,
+                0,
+                0,
+                "trusted",
+            )?;
+        }
+
+        // 1. Seed a valid cached v3 header-only export and valid shared CAS entry, then corrupt
+        //    the shared CAS entry with same-length bytes AND corrupt the store CAS entry:
+        //    both v2 (`header_only_shared_cas = false`) and v3 (`header_only_shared_cas = true`)
+        //    exports MUST fail closed with `Err`, never returning a digest-mismatched payload or
+        //    cached pack stream.
+        let empty = std::collections::HashSet::new();
+        let (acts_v3, blobs_v3, _, _) =
+            export_pack_filtered_with_mode(&store_src, true, &empty, &empty, true)?;
+        assert_eq!((acts_v3, blobs_v3), (1, 1));
+        let (acts_v2, blobs_v2, _, _) =
+            export_pack_filtered_with_mode(&store_src, true, &empty, &empty, false)?;
+        assert_eq!((acts_v2, blobs_v2), (1, 1));
+
+        let mut corrupt_same_len = good_payload.clone();
+        corrupt_same_len[0] ^= 0xFF;
+        let shared_blobs = shared_cas_blobs_dir_for_store(&store_src.root);
+        let shared_shm = shared_cas_blobs_dir();
+        let sp_disk = shared_blobs.join(&bh[..2]).join(&bh);
+        let sp_shm = shared_shm.join(&bh[..2]).join(&bh);
+
+        // Corrupt shared CAS entries with same-length `0o444` bytes while keeping `store_src` intact:
+        // `ensure_blob_in_shared_cas` and v3-to-v2 fallback must detect the digest mismatch and heal
+        // or read from verified `store_src`, never emitting `corrupt_same_len`.
+        for sp in [&sp_disk, &sp_shm] {
+            if sp.exists() {
+                let _ = fs::remove_file(sp);
+                fs::write(sp, &corrupt_same_len)?;
+                let mut p = fs::metadata(sp)?.permissions();
+                p.set_mode(0o444);
+                fs::set_permissions(sp, p)?;
+            }
+        }
+        // Remove v2 cache so `export_pack_filtered_with_mode(..., false)` exercises the v3-to-v2
+        // conversion path (`v3_file` exists!).
+        for entry in fs::read_dir(store_src.root.join("locks"))?.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("pack_exp_v2_") || name.starts_with("last_full_export_") {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+        let (_, _, _, v2_healed_stream) =
+            export_pack_filtered_with_mode(&store_src, true, &empty, &empty, false)?;
+        let mut store_dst = TurboStore::open(Some(&root_dst))?;
+        let imp = import_pack_bytes_with_policy(
+            &mut store_dst,
+            &v2_healed_stream,
+            Some("trusted"),
+            None,
+            true,
+        )?;
+        assert_eq!(imp, (1, 1));
+        assert_eq!(fs::read(store_dst.blob_path(&bh))?, good_payload);
+
+        // Also verify `ensure_blob_in_shared_cas` healed `sp_disk` back to `good_payload`!
+        let mut seen = [false; 256];
+        assert!(ensure_blob_in_shared_cas(
+            &store_src,
+            &bh,
+            good_payload.len() as u64,
+            &shared_blobs,
+            &mut seen
+        ));
+        assert_eq!(fs::read(&sp_disk)?, good_payload);
+
+        // 2. Now corrupt `store_src`'s own raw CAS blob with same-length bytes (even with warm
+        //    `pack_exp_v2_*` and `pack_exp_v3_*` caches present!): both v2 and v3 exports must
+        //    invalidate the stale cache and fail closed with `Err` rather than exporting corrupt bytes
+        //    or silently dropping the blob from the pack.
+        let cas_p = store_src.blob_path(&bh);
+        fs::remove_file(&cas_p)?;
+        fs::write(&cas_p, &corrupt_same_len)?;
+        let mut p_cas = fs::metadata(&cas_p)?.permissions();
+        p_cas.set_mode(0o444);
+        fs::set_permissions(&cas_p, p_cas)?;
+        assert!(
+            export_pack_filtered_with_mode(&store_src, true, &empty, &empty, false).is_err(),
+            "v2 export must fail closed when raw CAS blob fails digest verification"
+        );
+        assert!(
+            export_pack_filtered_with_mode(&store_src, true, &empty, &empty, true).is_err(),
+            "v3 export must fail closed when raw CAS blob fails digest verification"
+        );
+
+        // 3. Plant a symlink at `cas_p` pointing to a valid file: export must still fail closed.
+        let valid_target = root_src.join("decoy_valid.olean");
+        fs::write(&valid_target, &good_payload)?;
+        fs::remove_file(&cas_p)?;
+        std::os::unix::fs::symlink(&valid_target, &cas_p)?;
+        assert!(
+            export_pack_filtered_with_mode(&store_src, true, &empty, &empty, false).is_err(),
+            "export must reject symlinked CAS blob"
+        );
+
+        let _ = fs::remove_file(&sp_disk);
+        let _ = fs::remove_file(&sp_shm);
+        let _ = fs::remove_dir_all(&root_src);
         let _ = fs::remove_dir_all(&root_dst);
         Ok(())
     }
