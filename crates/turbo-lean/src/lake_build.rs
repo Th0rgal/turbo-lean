@@ -137,9 +137,29 @@ pub(crate) fn merge_caller_lean_path(env_map: &mut HashMap<String, String>) {
     if let Ok(caller_lp) = std::env::var("LEAN_PATH") {
         let trimmed = caller_lp.trim();
         if !trimmed.is_empty() {
+            let tc_lib = env_map
+                .get("LEAN")
+                .map(PathBuf::from)
+                .and_then(|b| b.parent()?.parent().map(|r| r.join("lib/lean")));
             let entry = env_map.entry("LEAN_PATH".to_string()).or_default();
             let mut merged: Vec<String> = Vec::new();
-            for p in trimmed.split(':').chain(entry.split(':')) {
+            let mut tc_tail: Vec<String> = Vec::new();
+            for p in entry.split(':') {
+                let p_trim = p.trim();
+                if p_trim.is_empty() {
+                    continue;
+                }
+                if tc_lib.as_deref().is_some_and(|tc| {
+                    crate::zygote::is_toolchain_dir_match(Path::new(p_trim), Some(tc))
+                }) {
+                    if !tc_tail.iter().any(|e| e == p_trim) {
+                        tc_tail.push(p_trim.to_string());
+                    }
+                } else if !merged.iter().any(|e| e == p_trim) {
+                    merged.push(p_trim.to_string());
+                }
+            }
+            for p in trimmed.split(':').chain(tc_tail.iter().map(String::as_str)) {
                 let p_trim = p.trim();
                 if !p_trim.is_empty() && !merged.iter().any(|e| e == p_trim) {
                     merged.push(p_trim.to_string());
@@ -523,26 +543,56 @@ fn collect_project_lean_lib_dirs(project_dir: &Path) -> Vec<PathBuf> {
     if project_dir.as_os_str().is_empty() {
         return Vec::new();
     }
-    let mut dirs = vec![project_dir.join(".lake/build/lib/lean")];
-    if let Ok(entries) = fs::read_dir(project_dir.join(".lake/packages")) {
-        let mut pkg_libs: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path().join(".lake/build/lib/lean"))
-            .filter(|p| p.is_dir())
-            .collect();
-        pkg_libs.sort();
-        dirs.extend(pkg_libs);
-    }
-    if let Ok((_, manifest_pkgs, _)) =
+    let mut dirs = Vec::new();
+    let mut push = |p: PathBuf| {
+        if !dirs.contains(&p) {
+            dirs.push(p);
+        }
+    };
+    let root_pkg = crate::module_builder::resolve_package_config(project_dir, false).ok();
+    push(
+        root_pkg
+            .as_ref()
+            .map(|c| project_dir.join(&c.build_dir).join(&c.lean_lib_dir))
+            .unwrap_or_else(|| project_dir.join(".lake/build/lib/lean")),
+    );
+    push(project_dir.join(".lake/build/lib/lean"));
+    if let Ok((_, manifest_pkgs, manifest_hash_opt)) =
         crate::module_builder::parse_lake_manifest(project_dir, false)
     {
         for mp in manifest_pkgs {
-            dirs.push(
-                mp.dir
-                    .canonicalize()
-                    .unwrap_or(mp.dir)
-                    .join(".lake/build/lib/lean"),
-            );
+            let pkg_root = mp.dir.canonicalize().unwrap_or(mp.dir);
+            push(crate::module_builder::resolve_package_lean_lib_dir(
+                &pkg_root,
+                mp.config_file.as_deref(),
+            ));
+        }
+        if manifest_hash_opt.is_none() {
+            let pkgs_rel = root_pkg
+                .as_ref()
+                .map(|c| c.packages_dir.as_path())
+                .unwrap_or_else(|| Path::new(".lake/packages"));
+            if let Ok(entries) = fs::read_dir(project_dir.join(pkgs_rel)) {
+                let mut pkg_dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+                pkg_dirs.sort();
+                for pkg_dir in pkg_dirs {
+                    let lib = crate::module_builder::resolve_package_lean_lib_dir(&pkg_dir, None);
+                    if lib.is_dir() {
+                        push(lib);
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(entries) = fs::read_dir(project_dir.join(".lake/packages")) {
+        let mut pkg_libs: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| crate::module_builder::resolve_package_lean_lib_dir(&e.path(), None))
+            .filter(|p| p.is_dir())
+            .collect();
+        pkg_libs.sort();
+        for p in pkg_libs {
+            push(p);
         }
     }
     dirs
@@ -577,11 +627,11 @@ pub(crate) fn resolve_remote_lean_path(
             push_part(abs, require_exists);
         }
     };
-    if let Ok(caller_lp) = std::env::var("LEAN_PATH") {
-        push_lp(&caller_lp, true, &mut push_part);
-    }
     for dir in collect_project_lean_lib_dirs(canon_dir) {
         push_part(dir, true);
+    }
+    if let Ok(caller_lp) = std::env::var("LEAN_PATH") {
+        push_lp(&caller_lp, true, &mut push_part);
     }
     if let Some(lp) = env_vars.and_then(|e| e.get("LEAN_PATH")) {
         push_lp(lp, false, &mut push_part);
@@ -870,8 +920,8 @@ fn read_header_imports_from_file(path: &Path) -> Option<Vec<String>> {
 }
 
 /// Compute BLAKE3 content digests of all imported `.olean` modules (and project-local `.lean` sources) for `src`.
-/// Searches `lean_path` (or `LEAN_PATH`), `project_dir/.lake/build/lib/lean`, and
-/// `project_dir/.lake/packages/*/.lake/build/lib/lean`.
+/// Searches `project_dir/.lake/build/lib/lean`, `project_dir/.lake/packages/*/.lake/build/lib/lean`,
+/// and then `lean_path` (or `LEAN_PATH`).
 /// Returns a sorted `Vec<String>` of `"<ModName>:<blake3_hex>"`.
 pub fn compute_imported_olean_interface_hashes(
     src: &str,
@@ -926,15 +976,15 @@ pub fn compute_imported_olean_interface_hashes(
             );
         }
     };
+    for dir in collect_project_lean_lib_dirs(project_dir) {
+        push_search_dir(&mut search_dirs, dir);
+    }
     let lp_owned: Option<String> = lean_path
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .or_else(|| std::env::var("LEAN_PATH").ok().filter(|s| !s.is_empty()));
     if let Some(ref lp) = lp_owned {
         push_lean_path(&mut search_dirs, lp);
-    }
-    for dir in collect_project_lean_lib_dirs(project_dir) {
-        push_search_dir(&mut search_dirs, dir);
     }
 
     if search_dirs.is_empty() && project_dir.as_os_str().is_empty() {
@@ -2223,24 +2273,6 @@ fn ensure_project_imports_fresh_inner(
                         crate::module_builder::resolve_toolchain_compiler_with_trust(
                             canon_dir, &tc, true,
                         )
-                        .or_else(|_| {
-                            if worktree_auto_link_disabled(canon_dir) {
-                                let out = Command::new("lean")
-                                    .arg("--print-prefix")
-                                    .current_dir(canon_dir)
-                                    .output()?;
-                                anyhow::ensure!(
-                                    out.status.success(),
-                                    "`lean --print-prefix` failed: {}",
-                                    String::from_utf8_lossy(&out.stderr)
-                                );
-                                let p = PathBuf::from(String::from_utf8(out.stdout)?.trim());
-                                anyhow::ensure!(p.is_absolute() && p.join("lib/lean").is_dir());
-                                Ok((p.join("bin/lean"), String::new(), p.join("lib/lean"), p.join("lib")))
-                            } else {
-                                crate::module_builder::resolve_toolchain_compiler(canon_dir, &tc)
-                            }
-                        })
                         .with_context(|| {
                             format!(
                                 "Cannot verify standalone import `{mod_name}` without an installed Lean toolchain in {}",
@@ -3784,33 +3816,48 @@ mod tests {
         let local_lean_lib = tmp_dir.join(".lake/build/lib/lean");
         fs::create_dir_all(local_lean_lib.join("UserPkg")).unwrap();
         fs::write(local_lean_lib.join("UserPkg/Mod.olean"), [0x77u8; 128]).unwrap();
-        let explicit_lp_first =
-            compute_imported_olean_interface_hashes(mixed_src, &tmp_dir, Some(&mixed_lp));
-        assert!(explicit_lp_first.iter().any(|e| e
-            == &mixed_h2
-                .iter()
-                .find(|x| x.starts_with("UserPkg.Mod:"))
-                .unwrap()
-                .clone()));
         let project_first = compute_imported_olean_interface_hashes(mixed_src, &tmp_dir, None);
-        assert_ne!(project_first, explicit_lp_first);
+        assert_ne!(project_first, mixed_h2);
+        let project_user_mod = project_first
+            .iter()
+            .find(|x| x.starts_with("UserPkg.Mod:"))
+            .unwrap()
+            .clone();
+        assert!(!mixed_h2.contains(&project_user_mod));
+        let explicit_lp_with_project =
+            compute_imported_olean_interface_hashes(mixed_src, &tmp_dir, Some(&mixed_lp));
+        assert!(explicit_lp_with_project.contains(&project_user_mod));
 
         std::env::set_var("LEAN_PATH", &mixed_lp);
-        let caller_env_first = compute_imported_olean_interface_hashes(mixed_src, &tmp_dir, None);
-        assert_eq!(caller_env_first, explicit_lp_first);
+        let caller_env_with_project =
+            compute_imported_olean_interface_hashes(mixed_src, &tmp_dir, None);
+        assert_eq!(caller_env_with_project, explicit_lp_with_project);
         let remote_lp = resolve_remote_lean_path(&tmp_dir, None);
-        assert!(remote_lp.starts_with(user_tc_dir.to_string_lossy().as_ref()));
+        assert!(remote_lp.starts_with(local_lean_lib.to_string_lossy().as_ref()));
+        assert!(remote_lp.contains(user_tc_dir.to_string_lossy().as_ref()));
         assert_eq!(
             compute_imported_olean_interface_hashes(mixed_src, &tmp_dir, Some(&remote_lp)),
-            explicit_lp_first
+            explicit_lp_with_project
         );
         let mut lake_ev = HashMap::new();
         lake_ev.insert(
+            "LEAN".to_string(),
+            sysroot_root.join("bin/lean").to_string_lossy().to_string(),
+        );
+        lake_ev.insert(
             "LEAN_PATH".to_string(),
-            local_lean_lib.to_string_lossy().to_string(),
+            format!("{}:{}", local_lean_lib.display(), sysroot_lib.display()),
         );
         merge_caller_lean_path(&mut lake_ev);
-        assert!(lake_ev["LEAN_PATH"].starts_with(user_tc_dir.to_string_lossy().as_ref()));
+        assert_eq!(
+            lake_ev["LEAN_PATH"],
+            format!(
+                "{}:{}:{}",
+                local_lean_lib.display(),
+                user_tc_dir.display(),
+                sysroot_lib.display()
+            )
+        );
 
         let second_tc_root = tmp_dir.join("second_toolchain");
         let second_tc_lib = second_tc_root.join("lib/lean");
@@ -4404,6 +4451,240 @@ mod tests {
             None => std::env::remove_var("TURBO_LEAN_NO_WORKTREE_LINK"),
         }
         let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_workspace_olean_precedes_caller_lean_path_preventing_shadow_cas_poisoning() -> Result<()>
+    {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_lp = std::env::var_os("LEAN_PATH");
+        let root = std::env::temp_dir().join(format!(
+            "turbo_ws_precedes_caller_lp_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let ws = root.join("ws");
+        let shadow = root.join("shadow");
+        for (dir, val) in [(&ws, 1u32), (&shadow, 2u32)] {
+            fs::create_dir_all(dir.join("P"))?;
+            fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+            fs::write(
+                dir.join("lakefile.toml"),
+                "name = \"p\"\ndefaultTargets = [\"P\"]\n[[lean_lib]]\nname = \"P\"\nglobs = [\"P.+\"]\n",
+            )?;
+            fs::write(dir.join("P/A.lean"), format!("def k : Nat := {val}\n"))?;
+        }
+        fs::write(
+            ws.join("P/B.lean"),
+            "import P.A\ntheorem b_ok : k = 1 := rfl\n",
+        )?;
+        assert!(Command::new("lake")
+            .args(["build", "P.B"])
+            .current_dir(&ws)
+            .status()?
+            .success());
+        assert!(Command::new("lake")
+            .args(["build", "P.A"])
+            .current_dir(&shadow)
+            .status()?
+            .success());
+
+        let canon_ws = ws.canonicalize()?;
+        let shadow_lib = shadow.canonicalize()?.join(".lake/build/lib/lean");
+        let shadow_lp = shadow_lib.to_string_lossy().to_string();
+        let b_src = fs::read_to_string(canon_ws.join("P/B.lean"))?;
+
+        std::env::remove_var("LEAN_PATH");
+        let clean_hashes = compute_imported_olean_interface_hashes(&b_src, &canon_ws, None);
+        let shadow_only_hashes =
+            compute_imported_olean_interface_hashes(&b_src, Path::new(""), Some(&shadow_lp));
+        assert_ne!(clean_hashes, shadow_only_hashes);
+
+        // Caller `LEAN_PATH` carries incompatible `P/A.olean` (`k := 2`), while workspace `ws`
+        // has fresh `P/A.olean` (`k := 1`) and `P/B.olean`. Workspace `P/A.olean` must win
+        // everywhere (`compute_imported_olean_interface_hashes`, `resolve_remote_lean_path`,
+        // `resolve_lake_env`), and fast `.olean` certification in `ws` must NOT populate CAS
+        // under `shadow_only_hashes`.
+        std::env::set_var("LEAN_PATH", &shadow_lp);
+        assert_eq!(
+            compute_imported_olean_interface_hashes(&b_src, &canon_ws, None),
+            clean_hashes
+        );
+        assert_eq!(
+            compute_imported_olean_interface_hashes(&b_src, &canon_ws, Some(&shadow_lp)),
+            clean_hashes
+        );
+        let resolved_lp = resolve_remote_lean_path(&canon_ws, None);
+        assert!(resolved_lp.starts_with(
+            canon_ws
+                .join(".lake/build/lib/lean")
+                .to_string_lossy()
+                .as_ref()
+        ));
+
+        let mut store = TurboStore::open(Some(&root.join("cache")))?;
+        let (lake_ev, _) = resolve_lake_env(&store, &canon_ws)?;
+        assert!(lake_ev["LEAN_PATH"].starts_with(
+            canon_ws
+                .join(".lake/build/lib/lean")
+                .to_string_lossy()
+                .as_ref()
+        ));
+        crate::check::run_check_command(
+            &mut store,
+            false,
+            true,
+            canon_ws.join("P/B.lean"),
+            None,
+            canon_ws.clone(),
+            None,
+            false,
+            None,
+        )?;
+        let shadow_split = split_lean_source(&b_src, &shadow_only_hashes);
+        let shadow_key = compute_shard_key("leanprover/lean4:v4.35.0", &shadow_split.shards[0]);
+        assert!(
+            store.get_cached_action(&shadow_key, "trusted")?.is_none(),
+            "fast workspace `.olean` check poisoned CAS under shadowed caller `LEAN_PATH` digest"
+        );
+        let clean_split = split_lean_source(&b_src, &clean_hashes);
+        let clean_key = compute_shard_key("leanprover/lean4:v4.35.0", &clean_split.shards[0]);
+        assert!(store.get_cached_action(&clean_key, "trusted")?.is_some());
+
+        // When `P.A` is only on caller `LEAN_PATH = shadow_lp` (`k = 2`) in a project without
+        // workspace `P/A`, `theorem b_ok : k = 1 := rfl` must fail rather than hitting a poisoned CAS entry!
+        let consumer = root.join("consumer");
+        fs::create_dir_all(&consumer)?;
+        fs::write(
+            consumer.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )?;
+        fs::write(
+            consumer.join("lakefile.toml"),
+            "name = \"consumer\"\n[[lean_lib]]\nname = \"Use\"\n",
+        )?;
+        let consumer_b = consumer.join("Use.lean");
+        fs::write(&consumer_b, &b_src)?;
+        assert!(
+            crate::check::run_check_command(
+                &mut store, false, true, consumer_b, None, consumer, None, false, None,
+            )
+            .is_err(),
+            "consumer check with `LEAN_PATH` = shadow (`k = 2`) falsely succeeded"
+        );
+        // Also test uncached elaboration inside `ws` when `b_ok` is edited (`k + 0 = 1`):
+        // elaboration must resolve workspace `P/A.olean` (`k = 1`), not `shadow_lp` (`k = 2`).
+        fs::write(
+            canon_ws.join("P/B.lean"),
+            "import P.A\ntheorem b_edited : k + 0 = 1 := rfl\n",
+        )?;
+        crate::check::run_check_command(
+            &mut store,
+            false,
+            true,
+            canon_ws.join("P/B.lean"),
+            None,
+            canon_ws,
+            None,
+            false,
+            None,
+        )?;
+
+        match prev_lp {
+            Some(v) => std::env::set_var("LEAN_PATH", v),
+            None => std::env::remove_var("LEAN_PATH"),
+        }
+        drop(store);
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn test_optout_lakeless_nonroot_import_child() -> Result<()> {
+        let Some(root) = std::env::var_os("TURBO_TEST_LAKELESS_OPTOUT_ROOT").map(PathBuf::from)
+        else {
+            return Ok(());
+        };
+        let dir = root.join("lakeless").canonicalize()?;
+        let target = dir.join("Main.lean").canonicalize()?;
+        let err = ensure_project_imports_fresh_for_check(&dir, &[target]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Cannot verify standalone import `Ext.NonRoot`")
+                && msg.contains("fail-closed toolchain gate"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !root.join("ambient-lean-invoked").exists(),
+            "ensure_project_imports_fresh executed ambient PATH `lean`"
+        );
+        fs::write(root.join("done"), b"")?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_optout_lakeless_nonroot_import_never_executes_ambient_path_lean() -> Result<()> {
+        use crate::worktree_test_support::TestChild;
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "turbo_lakeless_optout_nopath_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let dir = root.join("lakeless");
+        let bin = root.join("path/bin");
+        let fake_prefix = root.join("fake_prefix");
+        fs::create_dir_all(&dir)?;
+        fs::create_dir_all(&bin)?;
+        fs::create_dir_all(fake_prefix.join("lib/lean/Ext"))?;
+        // Fake `.olean` that would have satisfied the old `Command::new("lean") --print-prefix` fallback!
+        fs::write(fake_prefix.join("lib/lean/Ext/NonRoot.olean"), [0x55u8; 64])?;
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v99.99.99\n")?;
+        fs::write(
+            dir.join("turbo-lean.toml"),
+            "[worktree]\nauto_link = false\n",
+        )?;
+        fs::write(
+            dir.join("Main.lean"),
+            "import Ext.NonRoot\ntheorem t : True := trivial\n",
+        )?;
+        let shim_lean = bin.join("lean");
+        fs::write(
+            &shim_lean,
+            format!(
+                "#!/bin/sh\nprintf invoked > '{}'\nprintf '%s\\n' '{}'\n",
+                root.join("ambient-lean-invoked").display(),
+                fake_prefix.display()
+            ),
+        )?;
+        fs::set_permissions(&shim_lean, fs::Permissions::from_mode(0o755))?;
+
+        let mut command =
+            TestChild::command("lake_build::tests::test_optout_lakeless_nonroot_import_child")?;
+        command
+            .env("TURBO_TEST_LAKELESS_OPTOUT_ROOT", &root)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("HOME", root.join("isolated/a/b/home"))
+            .env("ELAN_HOME", root.join("empty_elan"))
+            .env("TURBO_LEAN_HOME", root.join("cache"))
+            .env("TURBO_LEAN_STAGING_DIR", root.join("staging"))
+            .env_remove("LEAN_PATH");
+        let mut child = TestChild::spawn(&mut command)?;
+        child.finish(&root.join("done"))?;
+        assert!(
+            !root.join("ambient-lean-invoked").exists(),
+            "ambient PATH `lean` shim was executed"
+        );
+        let _ = fs::remove_dir_all(&root);
         Ok(())
     }
 }

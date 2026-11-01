@@ -4612,6 +4612,11 @@ fn package_config_path(pkg_root: &Path, config_file: Option<&str>) -> Result<Opt
         .map(|ext| pkg_root.join(&rel).with_extension(ext))
         .find(|p| p.is_file()))
 }
+pub(crate) fn resolve_package_lean_lib_dir(pkg_root: &Path, config_file: Option<&str>) -> PathBuf {
+    resolve_package_config_file(pkg_root, false, config_file)
+        .map(|cfg| pkg_root.join(cfg.build_dir).join(cfg.lean_lib_dir))
+        .unwrap_or_else(|_| pkg_root.join(".lake/build/lib/lean"))
+}
 fn resolve_package_config_file(
     pkg_root: &Path,
     is_root_pkg: bool,

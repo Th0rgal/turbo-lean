@@ -1562,9 +1562,7 @@ fn run(cli: Cli) -> Result<()> {
                 eprintln!("error: toolchain '{}' is not installed", toolchain);
                 std::process::exit(1);
             }
-            let explicit_lp: Option<String> = lean_path.or_else(|| std::env::var("LEAN_PATH").ok());
-
-            let (mut env_vars, lean_bin, req_lp) = if let Some(lp) = explicit_lp {
+            let (mut env_vars, lean_bin, req_lp) = if let Some(lp) = lean_path {
                 let (mut ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, &lp)?;
                 if lp.is_empty() {
                     ev.remove("LEAN_PATH");
@@ -1593,13 +1591,18 @@ fn run(cli: Cli) -> Result<()> {
                     let (_, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, &lp)?;
                     (ev, lb, lp)
                 } else {
-                    let (ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, "")?;
+                    let caller_lp = std::env::var("LEAN_PATH").unwrap_or_default();
+                    let (ev, lb) =
+                        pack::resolve_server_lean_env_and_bin(&store, &toolchain, &caller_lp)?;
                     let lp = ev.get("LEAN_PATH").cloned().unwrap_or_default();
                     (ev, lb, lp)
                 }
             } else {
-                let (ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, "")?;
-                (ev, lb, String::new())
+                let caller_lp = std::env::var("LEAN_PATH").unwrap_or_default();
+                let (ev, lb) =
+                    pack::resolve_server_lean_env_and_bin(&store, &toolchain, &caller_lp)?;
+                let lp = ev.get("LEAN_PATH").cloned().unwrap_or_default();
+                (ev, lb, lp)
             };
 
             for (k, v) in std::env::vars() {
