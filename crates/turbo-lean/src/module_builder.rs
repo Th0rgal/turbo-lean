@@ -6647,9 +6647,10 @@ pub(crate) fn lake_inputs_tag_from_digest(digest: &str) -> Option<String> {
 /// file. That is the over-invalidating side of the trade the project-wide rule asks for, and it is
 /// bounded to the overlap between two concurrent requests on the same project; the one-shot CLI
 /// path, where the figures above were measured, has a single window and is unaffected.
-static LAKE_INPUTS_TAG_MEMO: OnceLock<
-    Mutex<HashMap<PathBuf, (u64, Result<Option<String>, String>)>>,
-> = OnceLock::new();
+type LakeInputsTagMemoEntry = (u64, Result<Option<String>, String>);
+
+static LAKE_INPUTS_TAG_MEMO: OnceLock<Mutex<HashMap<PathBuf, LakeInputsTagMemoEntry>>> =
+    OnceLock::new();
 
 /// Counter for unique per-call nonces emitted when a non-`Result` caller asks for a Lake inputs
 /// tag on a workspace whose Lake inputs are unsupported or unresolvable, guaranteeing zero cross-run
