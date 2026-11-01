@@ -5059,15 +5059,43 @@ fn resolve_imported_olean(lean_path: &str, module: &str) -> Option<PathBuf> {
         .map(|d| d.join(format!("{rel}.olean")))
 }
 
-fn is_selected_toolchain_artifact(lib: &Path, githash: &str, artifact: &Path) -> bool {
+fn is_selected_toolchain_artifact(
+    lib: &Path,
+    githash: &str,
+    artifact: &Path,
+    module: &str,
+) -> bool {
     if lib.as_os_str().is_empty() || githash.len() != 40 {
         return false;
     }
-    let (Ok(lib), Ok(artifact)) = (lib.canonicalize(), artifact.canonicalize()) else {
+    let Ok(lib) = lib.canonicalize() else {
         return false;
     };
-    if !artifact.starts_with(lib) {
-        return false;
+    let expected = lib.join(format!("{}.olean", module_name_to_rel_slash(module)));
+    // Lean consumes adjacent parts at the *resolved spelling*, not at a symlink's target.
+    // Every present/absent part must match that module in the selected installation.
+    for ((_, actual), (_, selected)) in olean_artifact_paths(artifact)
+        .into_iter()
+        .zip(olean_artifact_paths(&expected))
+    {
+        match (
+            fs::symlink_metadata(&actual),
+            fs::symlink_metadata(&selected),
+        ) {
+            (Ok(_), Ok(_)) => {
+                let (Ok(actual), Ok(selected)) = (actual.canonicalize(), selected.canonicalize())
+                else {
+                    return false;
+                };
+                if !actual.starts_with(&lib) || actual != selected {
+                    return false;
+                }
+            }
+            (Err(a), Err(b))
+                if a.kind() == std::io::ErrorKind::NotFound
+                    && b.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return false,
+        }
     }
     // Lean's v2 olean header stores the compiler commit in bytes 40..80. Read only
     // the header: exemption still requires canonical containment in its installation.
@@ -5083,7 +5111,7 @@ fn is_selected_toolchain_artifact(lib: &Path, githash: &str, artifact: &Path) ->
 pub(crate) fn is_builtin_toolchain_module(cfg: &ProjectConfig, module: &str) -> bool {
     let (lean_path, _) = build_lean_search_path(cfg, false);
     resolve_imported_olean(&lean_path, module).is_some_and(|p| {
-        is_selected_toolchain_artifact(&cfg.toolchain_lib_lean, &cfg.lean_githash, &p)
+        is_selected_toolchain_artifact(&cfg.toolchain_lib_lean, &cfg.lean_githash, &p, module)
     })
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -8448,6 +8476,7 @@ fn audit_or_replay_modules(
 struct DependencyReplayRecord {
     module: String,
     artifact_digest: String,
+    environment_digest: String,
     replay_version: u32,
     toolchain: String,
     lean_githash: String,
@@ -8455,10 +8484,16 @@ struct DependencyReplayRecord {
 }
 
 impl DependencyReplayRecord {
-    fn new(cfg: &ProjectConfig, module: &str, artifact_digest: String) -> Result<Self> {
+    fn new(
+        cfg: &ProjectConfig,
+        module: &str,
+        artifact_digest: String,
+        environment_digest: &str,
+    ) -> Result<Self> {
         Ok(Self {
             module: module.to_string(),
             artifact_digest,
+            environment_digest: environment_digest.to_string(),
             replay_version: crate::zygote::ZYGOTE_REPLAY_VERSION,
             toolchain: cfg.toolchain.clone(),
             lean_githash: cfg.lean_githash.clone(),
@@ -8495,7 +8530,7 @@ fn resolve_dependency_artifacts(
         let path = resolve_imported_olean(lean_path, &m).with_context(|| {
             format!("Cannot resolve imported module `{m}` for kernel replay: fail-closed")
         })?;
-        let toolchain = is_selected_toolchain_artifact(tc_lib, githash, &path);
+        let toolchain = is_selected_toolchain_artifact(tc_lib, githash, &path, &m);
         let key = (
             path.canonicalize()
                 .with_context(|| format!("Missing imported artifact `{m}`: fail-closed"))?,
@@ -8561,13 +8596,16 @@ fn replay_resolved_artifacts(
     }
     // A user-selected checkout-local store is not a verifier-controlled authority. It may
     // receive ordinary CAS data, but replay must run on every use and no record is accepted.
-    let store_root = store.root.canonicalize()?;
+    let authority_paths = [
+        store.root.canonicalize()?,
+        store.root.join("state.db").canonicalize()?,
+    ];
     let controlled_store = std::iter::once(&cfg.root_pkg)
         .chain(&cfg.dep_pkgs)
         .all(|p| {
             p.pkg_root
                 .canonicalize()
-                .is_ok_and(|r| !store_root.starts_with(r))
+                .is_ok_and(|r| authority_paths.iter().all(|p| !p.starts_with(&r)))
         });
     if controlled_store {
         store.conn.execute_batch(
@@ -8576,13 +8614,23 @@ fn replay_resolved_artifacts(
         )",
         )?;
     }
+    // Kernel replay is relative to the resolved import environment. A valid child whose
+    // interface changes invalidates its parents' records even when their own bytes do not.
+    let mut environment: Vec<_> = imported
+        .iter()
+        .map(|(m, p, dig)| Ok((m.clone(), p.canonicalize()?, dig.clone())))
+        .collect::<Result<_>>()?;
+    environment.sort();
+    let environment_digest = blake3::hash(&serde_json::to_vec(&environment)?)
+        .to_hex()
+        .to_string();
     let mut pending = Vec::new();
     for (m, path, dig) in &imported {
         anyhow::ensure!(
             compute_olean_artifact_set_digest(path)? == *dig,
             "Imported artifact `{m}` changed while resolving its closure: fail-closed"
         );
-        let record = DependencyReplayRecord::new(cfg, m, dig.clone())?;
+        let record = DependencyReplayRecord::new(cfg, m, dig.clone(), &environment_digest)?;
         let key = record.key()?;
         let cached = if controlled_store {
             use rusqlite::OptionalExtension;
@@ -8823,12 +8871,12 @@ pub fn build_project_modules_native(
     }
     // Checkout manifests establish freshness, never replay provenance. Gate *all* external
     // artifacts and their transitive imports before compiling or restoring any consumer.
-    ensure_module_closure_replayed(
-        store,
-        &cfg,
-        dag.nodes.values().flat_map(|n| n.external_olean_deps.iter().map(|(m, _)| m.clone())).collect(),
-        &lean_path_env,
-    ).context("External dependency `.olean` failed independent kernel replay")?;
+    let import_roots = dag.nodes.values().map(|node| -> Result<Vec<String>> {
+        let header = parse_header_info(&fs::read_to_string(&node.src_path)?);
+        Ok(header.imports.into_iter().filter(|m| !dag.nodes.contains_key(m)).collect())
+    }).collect::<Result<Vec<_>>>()?.into_iter().flatten().collect();
+    ensure_module_closure_replayed(store, &cfg, import_roots, &lean_path_env)
+        .context("External dependency `.olean` failed independent kernel replay")?;
     // Execute topological waves
     for wave in &dag.waves {
         let mut misses_to_compile: Vec<(String, String)> = Vec::new();
@@ -10670,7 +10718,10 @@ lean_exe «demo-exe» where
             }
             for (_, artifact) in olean_artifact_paths(&cfg.toolchain_lib_lean.join("Std.olean")) {
                 if artifact.is_file() {
-                    std::os::unix::fs::symlink(&artifact, project_lib.join(artifact.file_name().unwrap()))?;
+                    std::os::unix::fs::symlink(
+                        &artifact,
+                        project_lib.join(artifact.file_name().unwrap()),
+                    )?;
                 }
             }
             tree.lake(&["build", "P.Target"])?;
@@ -10697,6 +10748,16 @@ lean_exe «demo-exe» where
                 format!("{err:#}").contains("KernelReplay"),
                 "{build_dir}: {err:#}"
             );
+            let private = project_lib.join("Std.olean.private");
+            let genuine_private = fs::read(&private)?;
+            fs::remove_file(&private)?;
+            fs::write(&private, &genuine_private)?;
+            assert!(
+                !is_builtin_toolchain_module(&cfg, "Std"),
+                "local companions cannot inherit the main file's exemption"
+            );
+            fs::remove_file(&private)?;
+            std::os::unix::fs::symlink(cfg.toolchain_lib_lean.join("Std.olean.private"), &private)?;
             // A genuine toolchain root must not hide a project copy reached only through
             // its transitive imports. Preserve the namespace layout without editing the installation.
             fs::create_dir_all(project_lib.join("Init"))?;
@@ -10721,6 +10782,35 @@ lean_exe «demo-exe» where
                 &cfg.lean_githash,
             )?;
             assert!(resolved.iter().any(|(m, _, _)| m == "Init.Classical"));
+            fs::write(
+                tree.project.join("P/Target.lean"),
+                "import Init\ntheorem target : True := trivial\n",
+            )?;
+            // Supply all root Init companions for Lean's multi-part import.
+            for (_, artifact) in olean_artifact_paths(&cfg.toolchain_lib_lean.join("Init.olean")) {
+                let destination = project_lib.join(artifact.file_name().unwrap());
+                if artifact.is_file() && !destination.exists() {
+                    std::os::unix::fs::symlink(artifact, destination)?;
+                }
+            }
+            build_project_modules_native(
+                &mut store,
+                &tree.project,
+                &["P.Target".into()],
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )?;
+            let visited: i64 = store.conn.query_row(
+                "SELECT count(*) FROM dependency_kernel_replays WHERE json_extract(record_json, '$.module') = 'Init.Classical'", [], |r| r.get(0),
+            )?;
+            assert!(
+                visited > 0,
+                "native gate must traverse genuine toolchain roots"
+            );
+
             // Even byte-identical copies in the project are not toolchain artifacts.
             let project_lib = tree.project.join(build_dir).join("lib/lean");
             fs::remove_file(project_lib.join("Std.olean"))?;
@@ -10737,7 +10827,8 @@ lean_exe «demo-exe» where
             assert!(!is_selected_toolchain_artifact(
                 &fake_lib,
                 &cfg.lean_githash,
-                &fake_lib.join("Std.olean")
+                &fake_lib.join("Std.olean"),
+                "Std",
             ));
         }
         Ok(())
@@ -10761,7 +10852,10 @@ lean_exe «demo-exe» where
             dep.join("lakefile.toml"),
             "name = \"dep\"\n[[lean_lib]]\nname = \"Dep\"\n",
         )?;
-        fs::write(dep.join("Dep/Bad.lean"), crate::worktree_test_support::FORGED_DEPENDENCY_SOURCE)?;
+        fs::write(
+            dep.join("Dep/Bad.lean"),
+            crate::worktree_test_support::FORGED_DEPENDENCY_SOURCE,
+        )?;
         fs::write(
             proj.join("lake-manifest.json"),
             r#"{"version": "1.2.0", "packagesDir": ".lake/packages", "packages": [{"type": "path", "name": "dep", "dir": ".lake/packages/dep", "configFile": "lakefile.toml", "inherited": false}], "name": "app", "lakeDir": ".lake", "fixedToolchain": false}"#,
@@ -10936,6 +11030,52 @@ lean_exe «demo-exe» where
             .write_all(b" ")?;
         assert_eq!(ensure_imported_oleans_replayed(&store, &proj, &targets)?, 1);
         assert_eq!(ensure_imported_oleans_replayed(&store, &proj, &targets)?, 0);
+        fs::write(
+            dep.join("Dep/Parent.lean"),
+            "import Dep.Bad\ntheorem parent : True := bad\n",
+        )?;
+        let lake = Command::new("lake")
+            .args(["build", "Dep.Parent"])
+            .current_dir(&proj)
+            .output()?;
+        anyhow::ensure!(
+            lake.status.success(),
+            "{}",
+            String::from_utf8_lossy(&lake.stderr)
+        );
+        fs::write(
+            &targets[0],
+            "import Dep.Parent\ntheorem target : True := parent\n",
+        )?;
+        assert_eq!(ensure_imported_oleans_replayed(&store, &proj, &targets)?, 2);
+        assert_eq!(ensure_imported_oleans_replayed(&store, &proj, &targets)?, 0);
+        let parent = dep.join(".lake/build/lib/lean/Dep/Parent.olean");
+        let parent_bytes = fs::read(&parent)?;
+        fs::write(
+            dep.join("Dep/Bad.lean"),
+            "theorem bad : False → True := fun _ => True.intro\n",
+        )?;
+        let lake = Command::new("lake")
+            .args(["build", "Dep.Bad"])
+            .current_dir(&proj)
+            .output()?;
+        anyhow::ensure!(
+            lake.status.success(),
+            "{}",
+            String::from_utf8_lossy(&lake.stderr)
+        );
+        assert_eq!(
+            fs::read(&parent)?,
+            parent_bytes,
+            "parent artifact must remain unchanged"
+        );
+        let err = ensure_imported_oleans_replayed(&store, &proj, &targets).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("KernelReplay"),
+            "changed environment: {err:#}"
+        );
+        // Restore the simple valid target for the store-boundary cases below.
+        fs::write(&targets[0], "import Dep.Bad\n")?;
         // A checkout-local database cannot certify its own artifacts.
         let local_store = TurboStore::open(Some(&proj.join(".turbo-store")))?;
         assert_eq!(
@@ -10944,6 +11084,21 @@ lean_exe «demo-exe» where
         );
         assert_eq!(
             ensure_imported_oleans_replayed(&local_store, &proj, &targets)?,
+            1
+        );
+        let linked_root = dir.join("linked-cache");
+        fs::create_dir_all(&linked_root)?;
+        std::os::unix::fs::symlink(
+            proj.join(".turbo-store/state.db"),
+            linked_root.join("state.db"),
+        )?;
+        let linked_store = TurboStore::open(Some(&linked_root))?;
+        assert_eq!(
+            ensure_imported_oleans_replayed(&linked_store, &proj, &targets)?,
+            1
+        );
+        assert_eq!(
+            ensure_imported_oleans_replayed(&linked_store, &proj, &targets)?,
             1
         );
         drop(store);
