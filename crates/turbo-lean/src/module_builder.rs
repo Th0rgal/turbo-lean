@@ -11191,6 +11191,12 @@ lean_exe «demo-exe» where
                 &target
             )
             .is_none());
+            if poisoned_root {
+                let err = crate::lake_build::lake_recheck_dependents(
+                    &store, &tree.project, &["P/Target.lean".to_string()], None,
+                ).unwrap_err();
+                assert!(format!("{err:#}").contains("Source") || format!("{err:#}").contains("KernelReplay"), "{err:#}");
+            }
             let receipt = tree.root.join("receipt.json");
             let err = crate::pr_verify::run_ci_verify_command(
                 &mut store,
@@ -11211,12 +11217,6 @@ lean_exe «demo-exe» where
                 "{diagnostic}"
             );
             assert!(!receipt.exists());
-            if poisoned_root {
-                let err = crate::lake_build::lake_recheck_dependents(
-                    &store, &tree.project, &["P/Target.lean".to_string()], None,
-                ).unwrap_err();
-                assert!(format!("{err:#}").contains("Source") || format!("{err:#}").contains("KernelReplay"), "{err:#}");
-            }
             let attestations: i64 =
                 store
                     .conn
