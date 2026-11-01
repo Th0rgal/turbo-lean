@@ -5038,39 +5038,49 @@ pub(crate) struct CachedPkgManifest {
     validated: Option<VerifiedDepManifest>,
 }
 
+#[derive(Default)]
+pub(crate) struct LakeClosureCache {
+    manifests: HashMap<(PathBuf, bool), CachedPkgManifest>,
+    exp_memo: HashMap<(String, String, bool), Option<LakeModuleExportInfo>>,
+    pb_exp_memo: HashMap<(PathBuf, bool), Option<LakeModuleExportInfo>>,
+    pinned_memo: HashSet<(String, String, String, bool)>,
+}
+
 fn load_cached_pkg_manifest<'a>(
-    manifests: &'a mut HashMap<PathBuf, CachedPkgManifest>,
+    manifests: &'a mut HashMap<(PathBuf, bool), CachedPkgManifest>,
     cfg: &ProjectConfig,
     spec: &DiscoveredModuleSpec,
     strict_policy: bool,
 ) -> Option<&'a CachedPkgManifest> {
-    let entry = manifests.entry(spec.pkg_root.clone()).or_insert_with(|| {
-        let raw = match fs::read(
-            spec.pkg_root
-                .join(".lake/build/.turbo_verified_sources.json"),
-        ) {
-            Ok(bytes) => {
-                Some(serde_json::from_slice::<VerifiedDepManifest>(&bytes).map_err(|_| ()))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(_) => Some(Err(())),
-        };
-        let validated = match raw.as_ref() {
-            Some(Ok(m))
-                if m.pkg_name == spec.pkg_name
-                    && m.toolchain == cfg.toolchain
-                    && m.lean_githash == cfg.lean_githash
-                    && m.pkg_config_digest == spec.pkg_config_digest
-                    && (!strict_policy
-                        || (m.workspace_config_digest == cfg.canonical_config_digest
-                            && m.allowed_axioms == crate::splitter::allowed_axioms())) =>
-            {
-                Some(m.clone())
-            }
-            _ => None,
-        };
-        CachedPkgManifest { raw, validated }
-    });
+    let entry = manifests
+        .entry((spec.pkg_root.clone(), strict_policy))
+        .or_insert_with(|| {
+            let raw = match fs::read(
+                spec.pkg_root
+                    .join(".lake/build/.turbo_verified_sources.json"),
+            ) {
+                Ok(bytes) => {
+                    Some(serde_json::from_slice::<VerifiedDepManifest>(&bytes).map_err(|_| ()))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(_) => Some(Err(())),
+            };
+            let validated = match raw.as_ref() {
+                Some(Ok(m))
+                    if m.pkg_name == spec.pkg_name
+                        && m.toolchain == cfg.toolchain
+                        && m.lean_githash == cfg.lean_githash
+                        && m.pkg_config_digest == spec.pkg_config_digest
+                        && (!strict_policy
+                            || (m.workspace_config_digest == cfg.canonical_config_digest
+                                && m.allowed_axioms == crate::splitter::allowed_axioms())) =>
+                {
+                    Some(m.clone())
+                }
+                _ => None,
+            };
+            CachedPkgManifest { raw, validated }
+        });
     if matches!(entry.raw, Some(Err(()))) {
         None
     } else {
@@ -5165,23 +5175,26 @@ pub(crate) fn import_pin_current(
     imp: &str,
     pin: Option<&str>,
 ) -> bool {
-    import_pin_current_with_policy(cfg, memo, imp, pin, true)
+    let mut cache = LakeClosureCache::default();
+    import_pin_current_with_policy(cfg, memo, &mut cache, imp, pin, true)
 }
 
 /// Elaboration-freshness counterpart of `import_pin_current`: accepts mixed turbo + Lake closures
 /// (without kernel-audit policy requirements) and never mutates the strict `DepImportMemo`.
 pub(crate) fn import_pin_fresh_for_build(
     cfg: &ProjectConfig,
+    cache: &mut LakeClosureCache,
     imp: &str,
     pin: Option<&str>,
 ) -> bool {
     let non_strict_memo = DepImportMemo::default();
-    import_pin_current_with_policy(cfg, &non_strict_memo, imp, pin, false)
+    import_pin_current_with_policy(cfg, &non_strict_memo, cache, imp, pin, false)
 }
 
 fn import_pin_current_with_policy(
     cfg: &ProjectConfig,
     memo: &DepImportMemo,
+    cache: &mut LakeClosureCache,
     imp: &str,
     pin: Option<&str>,
     strict_policy: bool,
@@ -5194,10 +5207,10 @@ fn import_pin_current_with_policy(
         (ImportSite::Toolchain, None) => true,
         (ImportSite::Prebuilt(olean), Some(pin)) => {
             olean_digest_is(cfg, &olean, pin)
-                && prebuilt_olean_export_info(cfg, strict_policy, &olean).is_some()
+                && prebuilt_olean_export_info(cfg, strict_policy, &olean, cache).is_some()
         }
         (ImportSite::Module(spec), Some(pin)) => {
-            dep_pkg_import_pins_consistent(cfg, memo, *spec, pin, strict_policy)
+            dep_pkg_import_pins_consistent(cfg, memo, cache, *spec, pin, strict_policy)
         }
         _ => false,
     }
@@ -5310,10 +5323,12 @@ pub(crate) fn forget_refreshed_dep_module(cfg: &ProjectConfig, imp: &str) {
         let rel = spec_rel_src(&spec);
         let is_root_imp = spec.pkg_root == root_key.0 && spec.module_name == root_key.1;
         let should_drop = manifest.modules.get(&rel).is_some_and(|entry| {
+            let mut cache = LakeClosureCache::default();
             is_root_imp
                 || !dep_pkg_import_pins_consistent(
                     cfg,
                     &DepImportMemo::default(),
+                    &mut cache,
                     spec.clone(),
                     &entry.olean_artifact_digest,
                     false,
@@ -5362,7 +5377,11 @@ pub(crate) fn dep_pkg_module_missing_olean(cfg: &ProjectConfig, imp: &str) -> bo
 /// Whether root-package module `imp`'s existing on-disk `.olean` is stale against its Lake
 /// `.trace` / sidecars and transitive import closure (when not already proven by a turbo manifest
 /// entry). A missing `.olean` returns `false` so `build_missing` policy stays with the caller.
-pub(crate) fn root_pkg_lake_module_stale(cfg: &ProjectConfig, imp: &str) -> bool {
+pub(crate) fn root_pkg_lake_module_stale(
+    cfg: &ProjectConfig,
+    cache: &mut LakeClosureCache,
+    imp: &str,
+) -> bool {
     let Some(spec) = resolve_module_in_package(&cfg.root_pkg, true, imp) else {
         return false;
     };
@@ -5373,18 +5392,8 @@ pub(crate) fn root_pkg_lake_module_stale(cfg: &ProjectConfig, imp: &str) -> bool
     if cfg.lean_bin.as_os_str().is_empty() {
         return true;
     }
-    let mut manifests = HashMap::new();
-    let mut exp_memo = HashMap::new();
     let mut visiting = HashSet::new();
-    lake_closure_export_info(
-        cfg,
-        &spec,
-        false,
-        &mut manifests,
-        &mut exp_memo,
-        &mut visiting,
-    )
-    .is_none()
+    lake_closure_export_info(cfg, &spec, false, cache, &mut visiting).is_none()
 }
 
 /// Whether dependency-package module `imp` may be stale before elaboration. A missing `.olean`
@@ -5393,37 +5402,39 @@ pub(crate) fn root_pkg_lake_module_stale(cfg: &ProjectConfig, imp: &str) -> bool
 /// `.olean` — whether recorded in `.turbo_verified_sources.json` or Lake-built without a manifest
 /// entry — must prove its own artifacts, source/options, and entire transitive import closure
 /// consistent, or fail closed (`true`).
-pub(crate) fn dep_pkg_module_stale(cfg: &ProjectConfig, memo: &DepImportMemo, imp: &str) -> bool {
+pub(crate) fn dep_pkg_module_stale(
+    cfg: &ProjectConfig,
+    memo: &DepImportMemo,
+    cache: &mut LakeClosureCache,
+    imp: &str,
+) -> bool {
     let spec = match resolve_import_site(cfg, imp) {
         ImportSite::Module(spec) => spec,
         ImportSite::Prebuilt(olean) => {
-            return prebuilt_olean_export_info(cfg, false, &olean).is_none()
+            return prebuilt_olean_export_info(cfg, false, &olean, cache).is_none()
         }
         // Two dependency packages own the name: no single closure is safe to elaborate against.
         ImportSite::Unresolved => return true,
         _ => return false,
     };
-    let manifest_opt = match fs::read(
-        spec.pkg_root
-            .join(".lake/build/.turbo_verified_sources.json"),
-    ) {
-        Ok(bytes) => match serde_json::from_slice::<VerifiedDepManifest>(&bytes) {
-            Ok(m) => Some(m),
-            Err(_) => return true,
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(_) => return true,
+    let Some(cached_manifest) = load_cached_pkg_manifest(&mut cache.manifests, cfg, &spec, false)
+    else {
+        return true;
     };
     let olean = spec_olean_path(&spec);
     let olean_present = fs::symlink_metadata(&olean).is_ok();
-    if let Some(entry) = manifest_opt
+    if let Some(entry) = cached_manifest
+        .raw
         .as_ref()
+        .and_then(|r| r.as_ref().ok())
         .and_then(|m| m.modules.get(&spec_rel_src(&spec)))
+        .cloned()
     {
         return cfg.lean_bin.as_os_str().is_empty()
             || !dep_pkg_import_pins_consistent(
                 cfg,
                 memo,
+                cache,
                 *spec,
                 &entry.olean_artifact_digest,
                 false,
@@ -5435,18 +5446,8 @@ pub(crate) fn dep_pkg_module_stale(cfg: &ProjectConfig, memo: &DepImportMemo, im
     if cfg.lean_bin.as_os_str().is_empty() {
         return true;
     }
-    let mut manifests = HashMap::new();
-    let mut exp_memo = HashMap::new();
     let mut visiting = HashSet::new();
-    lake_closure_export_info(
-        cfg,
-        &spec,
-        false,
-        &mut manifests,
-        &mut exp_memo,
-        &mut visiting,
-    )
-    .is_none()
+    lake_closure_export_info(cfg, &spec, false, cache, &mut visiting).is_none()
 }
 
 fn lake_import_trace_entries(
@@ -5731,22 +5732,22 @@ fn prebuilt_closure_export_info(
     cfg: &ProjectConfig,
     strict_policy: bool,
     olean_path: &Path,
-    manifests: &mut HashMap<PathBuf, CachedPkgManifest>,
-    mod_exp_memo: &mut HashMap<(String, String), LakeModuleExportInfo>,
+    cache: &mut LakeClosureCache,
     mod_visiting: &mut HashSet<(String, String)>,
-    pb_exp_memo: &mut HashMap<PathBuf, LakeModuleExportInfo>,
     pb_visiting: &mut HashSet<PathBuf>,
     pb_closure_opt: Option<&mut Vec<(String, PathBuf)>>,
 ) -> Option<LakeModuleExportInfo> {
-    let key = fs::canonicalize(olean_path).unwrap_or_else(|_| olean_path.to_path_buf());
+    let canon = fs::canonicalize(olean_path).unwrap_or_else(|_| olean_path.to_path_buf());
+    let memo_key = (canon.clone(), strict_policy);
     if pb_closure_opt.is_none() {
-        if let Some(info) = pb_exp_memo.get(&key) {
-            return Some(*info);
+        if let Some(cached) = cache.pb_exp_memo.get(&memo_key) {
+            return *cached;
         }
     }
-    if !pb_visiting.insert(key.clone()) {
+    if !pb_visiting.insert(canon.clone()) {
         return None;
     }
+    let had_cycle_ancestor = !mod_visiting.is_empty() || pb_visiting.len() > 1;
     let mut local_pairs: Vec<(String, PathBuf)> = Vec::new();
     let res = (|| -> Option<LakeModuleExportInfo> {
         let (mut info, is_mod, tv) = prebuilt_artifact_traces(olean_path)?;
@@ -5778,10 +5779,8 @@ fn prebuilt_closure_export_info(
                         cfg,
                         strict_policy,
                         &sub_olean,
-                        manifests,
-                        mod_exp_memo,
+                        cache,
                         mod_visiting,
-                        pb_exp_memo,
                         pb_visiting,
                         Some(&mut local_pairs),
                     )?
@@ -5794,10 +5793,8 @@ fn prebuilt_closure_export_info(
                         cfg,
                         &sub_spec,
                         strict_policy,
-                        manifests,
-                        mod_exp_memo,
+                        cache,
                         mod_visiting,
-                        pb_exp_memo,
                         pb_visiting,
                     )?
                 }
@@ -5829,12 +5826,14 @@ fn prebuilt_closure_export_info(
         info.legacy_trans_trace = legacy_trans_trace;
         Some(info)
     })();
-    pb_visiting.remove(&key);
+    pb_visiting.remove(&canon);
     if let Some(info) = res {
-        pb_exp_memo.insert(key, info);
+        cache.pb_exp_memo.insert(memo_key, Some(info));
         if let Some(out_pairs) = pb_closure_opt {
             out_pairs.extend(local_pairs);
         }
+    } else if pb_closure_opt.is_none() && !had_cycle_ancestor {
+        cache.pb_exp_memo.insert(memo_key, None);
     }
     res
 }
@@ -5843,20 +5842,16 @@ fn prebuilt_olean_export_info(
     cfg: &ProjectConfig,
     strict_policy: bool,
     olean_path: &Path,
+    cache: &mut LakeClosureCache,
 ) -> Option<LakeModuleExportInfo> {
-    let mut manifests = HashMap::new();
-    let mut mod_exp_memo = HashMap::new();
     let mut mod_visiting = HashSet::new();
-    let mut pb_exp_memo = HashMap::new();
     let mut pb_visiting = HashSet::new();
     prebuilt_closure_export_info(
         cfg,
         strict_policy,
         olean_path,
-        &mut manifests,
-        &mut mod_exp_memo,
+        cache,
         &mut mod_visiting,
-        &mut pb_exp_memo,
         &mut pb_visiting,
         None,
     )
@@ -5867,20 +5862,16 @@ fn collect_fresh_prebuilt_closure(
     imp: &str,
     olean_path: &Path,
 ) -> Option<Vec<(String, PathBuf)>> {
-    let mut manifests = HashMap::new();
-    let mut mod_exp_memo = HashMap::new();
+    let mut cache = LakeClosureCache::default();
     let mut mod_visiting = HashSet::new();
-    let mut pb_exp_memo = HashMap::new();
     let mut pb_visiting = HashSet::new();
     let mut pairs = vec![(imp.to_string(), olean_path.to_path_buf())];
     prebuilt_closure_export_info(
         cfg,
         false,
         olean_path,
-        &mut manifests,
-        &mut mod_exp_memo,
+        &mut cache,
         &mut mod_visiting,
-        &mut pb_exp_memo,
         &mut pb_visiting,
         Some(&mut pairs),
     )?;
@@ -5896,41 +5887,34 @@ fn lake_closure_export_info(
     cfg: &ProjectConfig,
     spec: &DiscoveredModuleSpec,
     strict_policy: bool,
-    manifests: &mut HashMap<PathBuf, CachedPkgManifest>,
-    exp_memo: &mut HashMap<(String, String), LakeModuleExportInfo>,
+    cache: &mut LakeClosureCache,
     visiting: &mut HashSet<(String, String)>,
 ) -> Option<LakeModuleExportInfo> {
-    let mut pb_exp_memo = HashMap::new();
     let mut pb_visiting = HashSet::new();
-    lake_closure_export_info_inner(
-        cfg,
-        spec,
-        strict_policy,
-        manifests,
-        exp_memo,
-        visiting,
-        &mut pb_exp_memo,
-        &mut pb_visiting,
-    )
+    lake_closure_export_info_inner(cfg, spec, strict_policy, cache, visiting, &mut pb_visiting)
 }
 
 fn lake_closure_export_info_inner(
     cfg: &ProjectConfig,
     spec: &DiscoveredModuleSpec,
     strict_policy: bool,
-    manifests: &mut HashMap<PathBuf, CachedPkgManifest>,
-    exp_memo: &mut HashMap<(String, String), LakeModuleExportInfo>,
+    cache: &mut LakeClosureCache,
     visiting: &mut HashSet<(String, String)>,
-    pb_exp_memo: &mut HashMap<PathBuf, LakeModuleExportInfo>,
     pb_visiting: &mut HashSet<PathBuf>,
 ) -> Option<LakeModuleExportInfo> {
-    let key = (spec.pkg_name.clone(), spec.module_name.clone());
-    if let Some(info) = exp_memo.get(&key) {
-        return Some(*info);
+    let visit_key = (spec.pkg_name.clone(), spec.module_name.clone());
+    let memo_key = (
+        spec.pkg_name.clone(),
+        spec.module_name.clone(),
+        strict_policy,
+    );
+    if let Some(cached) = cache.exp_memo.get(&memo_key) {
+        return *cached;
     }
-    if !visiting.insert(key.clone()) {
+    if !visiting.insert(visit_key.clone()) {
         return None;
     }
+    let had_cycle_ancestor = visiting.len() > 1 || !pb_visiting.is_empty();
     let res = (|| -> Option<LakeModuleExportInfo> {
         let olean_path = spec_olean_path(spec);
         let src_raw = fs::read_to_string(&spec.src_path).ok()?;
@@ -5974,7 +5958,8 @@ fn lake_closure_export_info_inner(
         };
 
         let rel_src = spec_rel_src(spec);
-        let cached_manifest = load_cached_pkg_manifest(manifests, cfg, spec, strict_policy)?;
+        let cached_manifest =
+            load_cached_pkg_manifest(&mut cache.manifests, cfg, spec, strict_policy)?;
         let raw_has_entry = matches!(
             cached_manifest.raw.as_ref(),
             Some(Ok(m)) if m.modules.contains_key(&rel_src)
@@ -6061,10 +6046,8 @@ fn lake_closure_export_info_inner(
                         cfg,
                         strict_policy,
                         &pb_olean,
-                        manifests,
-                        exp_memo,
+                        cache,
                         visiting,
-                        pb_exp_memo,
                         pb_visiting,
                         None,
                     )?;
@@ -6092,10 +6075,8 @@ fn lake_closure_export_info_inner(
                         cfg,
                         &sub_spec,
                         strict_policy,
-                        manifests,
-                        exp_memo,
+                        cache,
                         visiting,
-                        pb_exp_memo,
                         pb_visiting,
                     )?;
                     for e in lake_import_trace_entries(is_mod, sub_imp, &sub_exp) {
@@ -6176,9 +6157,9 @@ fn lake_closure_export_info_inner(
             legacy_trans_trace,
         })
     })();
-    visiting.remove(&key);
-    if let Some(info) = res {
-        exp_memo.insert(key, info);
+    visiting.remove(&visit_key);
+    if res.is_some() || !had_cycle_ancestor {
+        cache.exp_memo.insert(memo_key, res);
     }
     res
 }
@@ -6192,18 +6173,20 @@ fn lake_closure_export_info_inner(
 fn dep_pkg_import_pins_consistent(
     cfg: &ProjectConfig,
     memo: &DepImportMemo,
+    cache: &mut LakeClosureCache,
     spec: DiscoveredModuleSpec,
     pin: &str,
     strict_policy: bool,
 ) -> bool {
-    let mut manifests: HashMap<PathBuf, CachedPkgManifest> = HashMap::new();
-    let mut lake_exp_memo: HashMap<(String, String), LakeModuleExportInfo> = HashMap::new();
     let mut seen: HashMap<(String, String), String> = HashMap::new();
     let mut stack = vec![(spec, pin.to_string())];
     while let Some((cur, pin)) = stack.pop() {
         let key = (cur.pkg_name.clone(), cur.module_name.clone());
         let memo_key = (key.0.clone(), key.1.clone(), pin.clone());
-        if strict_policy && memo.0.lock().is_ok_and(|m| m.contains(&memo_key)) {
+        let cache_pin_key = (key.0.clone(), key.1.clone(), pin.clone(), strict_policy);
+        if cache.pinned_memo.contains(&cache_pin_key)
+            || (strict_policy && memo.0.lock().is_ok_and(|m| m.contains(&memo_key)))
+        {
             continue;
         }
         if let Some(prev) = seen.get(&key) {
@@ -6214,7 +6197,7 @@ fn dep_pkg_import_pins_consistent(
         }
         let rel_src = spec_rel_src(&cur);
         let Some(cached_manifest) =
-            load_cached_pkg_manifest(&mut manifests, cfg, &cur, strict_policy)
+            load_cached_pkg_manifest(&mut cache.manifests, cfg, &cur, strict_policy)
         else {
             return false;
         };
@@ -6233,16 +6216,7 @@ fn dep_pkg_import_pins_consistent(
                 return false;
             }
             let mut visiting = HashSet::new();
-            if lake_closure_export_info(
-                cfg,
-                &cur,
-                false,
-                &mut manifests,
-                &mut lake_exp_memo,
-                &mut visiting,
-            )
-            .is_none()
-            {
+            if lake_closure_export_info(cfg, &cur, false, cache, &mut visiting).is_none() {
                 return false;
             }
             seen.insert(key, pin);
@@ -6276,7 +6250,7 @@ fn dep_pkg_import_pins_consistent(
                     (ImportSite::Toolchain, None) => true,
                     (ImportSite::Prebuilt(o), Some(p)) => {
                         olean_digest_is(cfg, &o, p)
-                            && prebuilt_olean_export_info(cfg, strict_policy, &o).is_some()
+                            && prebuilt_olean_export_info(cfg, strict_policy, &o, cache).is_some()
                     }
                     (ImportSite::Module(sub), Some(p)) => {
                         stack.push((*sub, p.to_string()));
@@ -6295,6 +6269,11 @@ fn dep_pkg_import_pins_consistent(
             return false;
         }
         seen.insert(key, pin);
+    }
+    for ((pkg, module), pin) in &seen {
+        cache
+            .pinned_memo
+            .insert((pkg.clone(), module.clone(), pin.clone(), strict_policy));
     }
     if strict_policy {
         if let Ok(mut m) = memo.0.lock() {
@@ -6487,9 +6466,10 @@ fn is_dep_olean_fresh(
                     .is_ok_and(|dig| dig == pin)
             }
             (ImportSite::Prebuilt(olean), Some(pin)) => {
+                let mut cache = LakeClosureCache::default();
                 compute_olean_artifact_set_digest_with_policy(&olean, preserve)
                     .is_ok_and(|dig| dig == pin)
-                    && prebuilt_olean_export_info(cfg, false, &olean).is_some()
+                    && prebuilt_olean_export_info(cfg, false, &olean, &mut cache).is_some()
             }
             _ => false,
         }
@@ -7984,13 +7964,15 @@ fn compute_lake_export_info(
         let _ = trace_val_opt.as_ref().ok_or_else(|| {
             anyhow::anyhow!("Missing trace for source-less dependency `{}`", mod_name)
         })?;
-        let pb_info = prebuilt_olean_export_info(cfg, false, &olean_path).ok_or_else(|| {
-            anyhow::anyhow!(
+        let mut pb_cache = LakeClosureCache::default();
+        let pb_info = prebuilt_olean_export_info(cfg, false, &olean_path, &mut pb_cache)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
                 "Source-less dependency `{}` at {} failed transitive prebuilt trace verification",
                 mod_name,
                 olean_path.display()
             )
-        })?;
+            })?;
         visiting.remove(mod_name);
         memo.insert(mod_name.to_string(), pb_info);
         return Ok(pb_info);
@@ -10653,7 +10635,12 @@ lean_exe «demo-exe» where
         let own = dir.join("own-lakefile.lean");
         fs::write(&own, include_str!("../../../lean/lakefile.lean")).unwrap();
         let own_pkg = parse_lakefile_lean(&dir, &own, true).unwrap();
-        assert_eq!((own_pkg.libs.len(), own_pkg.exes.len()), (3, 4));
+        let own_src = include_str!("../../../lean/lakefile.lean");
+        let count = |kw: &str| own_src.lines().filter(|l| l.starts_with(kw)).count();
+        assert_eq!(
+            (own_pkg.libs.len(), own_pkg.exes.len()),
+            (count("lean_lib "), count("lean_exe "))
+        );
         // `Cache.+` / `MathlibTest.+` are submodule globs, not modules named `+`.
         let globs = |name: &str| {
             pkg.libs
@@ -12519,7 +12506,8 @@ lean_exe «demo-exe» where
         // `strict_policy = true` (`import_pin_current`) rejects the unaudited `App.R`.
         let cfg = resolve_project_config(&canon).unwrap();
         let memo = DepImportMemo::default();
-        assert!(!dep_pkg_module_stale(&cfg, &memo, "DepPkg.B"));
+        let mut cache = LakeClosureCache::default();
+        assert!(!dep_pkg_module_stale(&cfg, &memo, &mut cache, "DepPkg.B"));
         assert!(
             memo.0.lock().unwrap().is_empty(),
             "non-strict staleness check polluted `DepImportMemo`"

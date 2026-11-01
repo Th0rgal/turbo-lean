@@ -779,7 +779,8 @@ pub(crate) fn compute_shard_key_with_args(
     lean_args: &[String],
 ) -> String {
     let mut key_hasher = blake3::Hasher::new();
-    key_hasher.update(b"theorem-shard-v1:");
+    // v2: v1 receipts may come from Zygote replies vetted without the stderr panic scan.
+    key_hasher.update(b"theorem-shard-v2:");
     key_hasher.update(toolchain.as_bytes());
     key_hasher.update(b":");
     key_hasher.update(shard.prefix_env_hash.as_bytes());
@@ -1830,12 +1831,13 @@ fn entry_import_pins_fresh_for_build(
     manifest: &crate::module_builder::VerifiedDepManifest,
     entry: &crate::module_builder::VerifiedDepModuleEntry,
     imports: &[String],
+    cache: &mut crate::module_builder::LakeClosureCache,
 ) -> bool {
     let Some(cfg) = manifest.cfg.as_ref() else {
         return false;
     };
     crate::module_builder::verified_entry_imports_current(entry, imports, |imp, pin| {
-        crate::module_builder::import_pin_fresh_for_build(cfg, imp, pin)
+        crate::module_builder::import_pin_fresh_for_build(cfg, cache, imp, pin)
     })
 }
 
@@ -2423,6 +2425,7 @@ pub(crate) fn ensure_project_imports_fresh(
     // Dependency-package imports whose closure is not provably consistent (P0-4): Lean would
     // otherwise load them next to their rebuilt imports without re-checking. Their evidence
     // lives in their own package manifests, so it is inspected even without a root manifest.
+    let mut closure_cache = crate::module_builder::LakeClosureCache::default();
     let mut stale_dep_mods: HashSet<String> = HashSet::new();
     let dep_cfg = if non_root_imports.is_empty() {
         None
@@ -2435,7 +2438,7 @@ pub(crate) fn ensure_project_imports_fresh(
             .as_ref()
             .map_or(&fresh_memo, |m| &m.dep_import_memo);
         stale_dep_mods.extend(non_root_imports.into_iter().filter(|m| {
-            crate::module_builder::dep_pkg_module_stale(cfg, memo, m)
+            crate::module_builder::dep_pkg_module_stale(cfg, memo, &mut closure_cache, m)
                 || (build_missing && crate::module_builder::dep_pkg_module_missing_olean(cfg, m))
         }));
     }
@@ -2492,6 +2495,7 @@ pub(crate) fn ensure_project_imports_fresh(
                                 m,
                                 e,
                                 adj.get(mod_name).map_or(&[][..], Vec::as_slice),
+                                &mut closure_cache,
                             )))
                 }),
                 _ => false,
@@ -2499,7 +2503,7 @@ pub(crate) fn ensure_project_imports_fresh(
         let lake_root_stale = !has_manifest_entry
             && olean_meta.is_some()
             && root_cfg.as_ref().is_some_and(|cfg| {
-                crate::module_builder::root_pkg_lake_module_stale(cfg, mod_name)
+                crate::module_builder::root_pkg_lake_module_stale(cfg, &mut closure_cache, mod_name)
             });
         let mtime_stale = match (&olean_meta, &src_meta) {
             (Some(om), Some(sm)) => match (om.modified(), sm.modified()) {
