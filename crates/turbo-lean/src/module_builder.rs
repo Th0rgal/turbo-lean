@@ -66,9 +66,8 @@ pub struct InputTargetConfig {
     /// Why turbo-lean cannot read this dependency's input the way Lake does: an unknown field, or
     /// a `filter` that is not `.extension "<ext>"`. The root package fails closed at parse time
     /// instead (see `unsupported_lake_field`); for a dependency this is promoted onto
-    /// `PackageConfig::unsupported` by `finalize_package_config`, so building any of the
-    /// package's modules fails closed, and spelled into `workspace_lake_inputs_digest` so no key
-    /// derived from the inputs can collide with one from a version turbo-lean did understand.
+    /// `PackageConfig::unsupported` by `finalize_package_config` and fails closed (`Err`) in
+    /// `module_lake_input_digest`, `workspace_lake_inputs_digest`, and `try_project_lake_inputs_tag`.
     #[serde(default)]
     pub unsupported: Option<String>,
 }
@@ -4080,10 +4079,7 @@ pub fn parse_lakefile_lean(
                         match key {
                             "path" => {
                                 input.path =
-                                    checked_input_path(&parse_lean_path_literal(
-                                        key,
-                                        &val_accum,
-                                    )?)?
+                                    checked_input_path(&parse_lean_path_literal(key, &val_accum)?)?
                             }
                             "text" => input.text = parse_toml_bool(&val_accum)?,
                             "filter" if ext.is_some() => input.extension = ext,
@@ -4096,11 +4092,7 @@ pub fn parse_lakefile_lean(
                                     lean_path.display(),
                                     line_no
                                 );
-                                unsupported_lake_field(
-                                    &mut input.unsupported,
-                                    is_root_pkg,
-                                    why,
-                                )?;
+                                unsupported_lake_field(&mut input.unsupported, is_root_pkg, why)?;
                             }
                         }
                     }
@@ -4883,7 +4875,10 @@ pub fn resolve_package_config(pkg_root: &Path, is_root_pkg: bool) -> Result<Pack
 }
 /// The configuration file Lake loads for a package: `config_file` (a manifest `configFile`,
 /// default `lakefile`) as given if it has an extension, else its `.lean` before its `.toml`.
-fn package_config_path(pkg_root: &Path, config_file: Option<&str>) -> Result<Option<PathBuf>> {
+pub(crate) fn package_config_path(
+    pkg_root: &Path,
+    config_file: Option<&str>,
+) -> Result<Option<PathBuf>> {
     let rel = lake_rel_path("configFile", config_file.unwrap_or("lakefile"))?;
     if rel.extension().is_some() {
         return Ok(Some(pkg_root.join(rel)).filter(|p| p.is_file()));
@@ -5053,8 +5048,8 @@ pub(crate) struct DiscoveredModuleSpec {
     pkg_root: PathBuf,
     src_root: PathBuf,
     pub(crate) src_path: PathBuf,
-    build_lib_lean_dir: PathBuf,
-    build_ir_dir: PathBuf,
+    pub(crate) build_lib_lean_dir: PathBuf,
+    pub(crate) build_ir_dir: PathBuf,
     precompile_modules: bool,
     is_exe_target: bool,
     strong_args: Vec<String>,
@@ -5206,15 +5201,25 @@ fn expand_glob_in_dir(
 /// [`module_lake_input_digest`] folds the union: either attribution has to be covered, and building
 /// one library too many only costs time.
 pub(crate) fn input_bearing_libs_for_module(cfg: &ProjectConfig, mod_name: &str) -> Vec<String> {
-    if cfg.root_pkg.inputs.is_empty() {
-        return Vec::new();
+    let mut out = Vec::new();
+    if !cfg.root_pkg.inputs.is_empty() {
+        for lib in &cfg.root_pkg.libs {
+            if !lib.needs.is_empty() && lib_can_build_module(lib, mod_name) {
+                out.push(lib.name.clone());
+            }
+        }
     }
-    cfg.root_pkg
-        .libs
-        .iter()
-        .filter(|lib| !lib.needs.is_empty() && lib_can_build_module(lib, mod_name))
-        .map(|lib| lib.name.clone())
-        .collect()
+    for dp in &cfg.dep_pkgs {
+        if dp.inputs.is_empty() {
+            continue;
+        }
+        for lib in &dp.libs {
+            if !lib.needs.is_empty() && lib_can_build_module(lib, mod_name) {
+                out.push(format!("{}/{}", dp.name, lib.name));
+            }
+        }
+    }
+    out
 }
 
 /// Lake's `LeanLib.isBuildableModule`: one of the library's globs matches the module, or the
@@ -5550,7 +5555,7 @@ fn is_dep_olean_fresh(
     let verified_manifest_path = pkg_root.join(".lake/build/.turbo_verified_sources.json");
     let bytes = fs::read(&verified_manifest_path).ok()?;
     let manifest: VerifiedDepManifest = serde_json::from_slice(&bytes).ok()?;
-    let expected_lake_inputs = workspace_lake_inputs_digest(cfg);
+    let expected_lake_inputs = workspace_lake_inputs_digest(cfg).ok()?;
     if manifest.pkg_name != spec.pkg_name
         || manifest.toolchain != cfg.toolchain
         || manifest.lean_githash != cfg.lean_githash
@@ -6438,26 +6443,32 @@ fn package_by_name<'a>(cfg: &'a ProjectConfig, pkg_name: &str) -> Option<&'a Pac
 /// module outside every such library never has the input on its build path. It does mean a file
 /// that reads an input at elaboration time while sitting outside the `needs`-ing library's globs is
 /// not tracked -- the same blind spot a plain `lake build` has, not one introduced here.
-pub(crate) fn module_lake_input_digest(cfg: &ProjectConfig, node: &ModuleNode) -> String {
+pub(crate) fn module_lake_input_digest(cfg: &ProjectConfig, node: &ModuleNode) -> Result<String> {
     let Some(pkg) = package_by_name(cfg, &node.pkg_name).filter(|p| !p.inputs.is_empty()) else {
-        return String::new();
+        return Ok(String::new());
     };
+    for i in &pkg.inputs {
+        if let Some(ref why) = i.unsupported {
+            anyhow::bail!(
+                "Unsupported Lake input `{}` in package `{}`: {}: fail-closed static Lake config gate",
+                i.name,
+                pkg.name,
+                why
+            );
+        }
+    }
     let needed: BTreeSet<&str> = pkg
         .libs
         .iter()
         .filter(|lib| lib_can_build_module(lib, &node.module_name))
         .flat_map(|lib| lib.needs.iter().map(String::as_str))
         .collect();
-    pkg.inputs
+    Ok(pkg
+        .inputs
         .iter()
         .filter(|i| needed.contains(i.name.as_str()))
-        .map(|i| match &i.unsupported {
-            // Same reasoning as `workspace_lake_inputs_digest`: an input whose declaration was not
-            // understood must not be represented by a digest that claims it was.
-            Some(why) => format!("{}:unsupported:{}\n", i.name, why),
-            None => format!("{}:{}\n", i.name, i.blake3),
-        })
-        .collect()
+        .map(|i| format!("{}:{}\n", i.name, i.blake3))
+        .collect())
 }
 
 /// Content digest of every declarative Lake file input in the **workspace**: the root package and
@@ -6481,21 +6492,28 @@ pub(crate) fn module_lake_input_digest(cfg: &ProjectConfig, node: &ModuleNode) -
 /// string) and every such project's keys stay byte-identical.
 ///
 /// An input whose declaration this parser could not read like Lake
-/// ([`InputTargetConfig::unsupported`]) contributes its reason instead of pretending the digest
-/// answers for it. The reason is constant, so it does not thrash, but it cannot collide with the
-/// digest of a version of the same input that turbo-lean *did* understand -- and
-/// `finalize_package_config` has already made every module of that package fail closed.
-pub(crate) fn workspace_lake_inputs_digest(cfg: &ProjectConfig) -> String {
-    std::iter::once(&cfg.root_pkg)
+/// ([`InputTargetConfig::unsupported`]) fails closed (`Err`) rather than emitting a constant
+/// placeholder string: any deterministic string would compare equal across two runs with different
+/// underlying input bytes, turning cache consumers and manifest guards into false-green hits.
+pub(crate) fn workspace_lake_inputs_digest(cfg: &ProjectConfig) -> Result<String> {
+    let mut out = String::new();
+    for p in std::iter::once(&cfg.root_pkg)
         .chain(cfg.dep_pkgs.iter())
         .filter(|p| !p.inputs.is_empty())
-        .flat_map(|p| {
-            p.inputs.iter().map(move |i| match &i.unsupported {
-                Some(why) => format!("{}/{}:unsupported:{}\n", p.name, i.name, why),
-                None => format!("{}/{}:{}\n", p.name, i.name, i.blake3),
-            })
-        })
-        .collect()
+    {
+        for i in &p.inputs {
+            if let Some(ref why) = i.unsupported {
+                anyhow::bail!(
+                    "Unsupported Lake input `{}/{}`: {}: fail-closed static Lake config gate",
+                    p.name,
+                    i.name,
+                    why
+                );
+            }
+            out.push_str(&format!("{}/{}:{}\n", p.name, i.name, i.blake3));
+        }
+    }
+    Ok(out)
 }
 
 /// Every Lake config file a workspace resolve would read: the root package's, plus one per
@@ -6518,7 +6536,7 @@ pub(crate) fn workspace_lake_inputs_digest(cfg: &ProjectConfig) -> String {
 /// reporting the default `.lake/packages` layout for a workspace whose real layout nobody could
 /// read -- is exactly the silent stale hit this guards. Every `Err` here is one
 /// `resolve_project_config` raises too, so no workspace that resolves today starts failing.
-fn workspace_lake_config_candidates(project_dir: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn workspace_lake_config_candidates(project_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut out: Vec<PathBuf> = Vec::new();
     let root_config = package_config_path(project_dir, None)?;
     out.extend(root_config.clone());
@@ -6629,8 +6647,29 @@ pub(crate) fn lake_inputs_tag_from_digest(digest: &str) -> Option<String> {
 /// file. That is the over-invalidating side of the trade the project-wide rule asks for, and it is
 /// bounded to the overlap between two concurrent requests on the same project; the one-shot CLI
 /// path, where the figures above were measured, has a single window and is unaffected.
-static LAKE_INPUTS_TAG_MEMO: OnceLock<Mutex<HashMap<PathBuf, (u64, Option<String>)>>> =
-    OnceLock::new();
+static LAKE_INPUTS_TAG_MEMO: OnceLock<
+    Mutex<HashMap<PathBuf, (u64, Result<Option<String>, String>)>>,
+> = OnceLock::new();
+
+/// Counter for unique per-call nonces emitted when a non-`Result` caller asks for a Lake inputs
+/// tag on a workspace whose Lake inputs are unsupported or unresolvable, guaranteeing zero cross-run
+/// or cross-edit cache key collisions.
+static LAKE_INPUTS_UNRESOLVED_NONCE: AtomicU64 = AtomicU64::new(1);
+
+fn fresh_unresolved_lake_inputs_tag(err: &str) -> String {
+    let seq = LAKE_INPUTS_UNRESOLVED_NONCE.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut h = blake3::Hasher::new();
+    h.update(b"turbo-lean-unresolved-lake-inputs-nonce-v1:");
+    h.update(&std::process::id().to_le_bytes());
+    h.update(&seq.to_le_bytes());
+    h.update(&nanos.to_le_bytes());
+    h.update(err.as_bytes());
+    format!("\u{0}lake-inputs-uncacheable:{}", h.finalize().to_hex())
+}
 
 /// Current memo window. Bumped by [`reset_lake_inputs_tag_memo`] before it takes the memo lock, so
 /// a publication that observes the old value under that lock is necessarily one that started before
@@ -6651,10 +6690,14 @@ pub fn reset_lake_inputs_tag_memo() {
     }
 }
 
-/// Store `tag` for `project_dir` as a caller that entered in `window` computed it. `false` when the
+/// Store `res` for `project_dir` as a caller that entered in `window` computed it. `false` when the
 /// window has been superseded, i.e. another command or request reset the memo while this caller was
 /// reading input bytes -- those bytes answer for a window nobody is in any more.
-fn publish_lake_inputs_tag(project_dir: &Path, window: u64, tag: &Option<String>) -> bool {
+fn publish_lake_inputs_tag_result(
+    project_dir: &Path,
+    window: u64,
+    res: &Result<Option<String>, String>,
+) -> bool {
     let memo = LAKE_INPUTS_TAG_MEMO.get_or_init(|| Mutex::new(HashMap::new()));
     let Ok(mut g) = memo.lock() else {
         return false;
@@ -6666,38 +6709,55 @@ fn publish_lake_inputs_tag(project_dir: &Path, window: u64, tag: &Option<String>
     if g.len() >= 256 {
         g.clear();
     }
-    g.insert(project_dir.to_path_buf(), (window, tag.clone()));
+    g.insert(project_dir.to_path_buf(), (window, res.clone()));
     true
 }
 
-pub(crate) fn project_lake_inputs_tag(project_dir: &Path) -> Option<String> {
+#[cfg(test)]
+fn publish_lake_inputs_tag(project_dir: &Path, window: u64, tag: &Option<String>) -> bool {
+    publish_lake_inputs_tag_result(project_dir, window, &Ok(tag.clone()))
+}
+
+/// Fallible version of [`project_lake_inputs_tag`]: returns `Err` when the workspace may declare
+/// Lake file inputs (`input_dir` / `input_file`) or has an unparseable manifest/config, and either
+/// [`resolve_project_config`] or [`workspace_lake_inputs_digest`] fails (for instance on an
+/// unreadable input path, escaping symlink, non-regular file, or unsupported `filter` / field in a
+/// root or dependency package). Top-level commands call this to fail closed before consulting any
+/// content-addressed or `/dev/shm` cache.
+pub(crate) fn try_project_lake_inputs_tag(project_dir: &Path) -> Result<Option<String>> {
     if project_dir.as_os_str().is_empty() {
-        return None;
+        return Ok(None);
     }
     let memo = LAKE_INPUTS_TAG_MEMO.get_or_init(|| Mutex::new(HashMap::new()));
-    // Read *before* any input byte is, and re-checked by `publish_lake_inputs_tag` afterwards.
+    // Read *before* any input byte is, and re-checked by `publish_lake_inputs_tag_result` afterwards.
     let window = LAKE_INPUTS_TAG_MEMO_WINDOW.load(Ordering::SeqCst);
     if let Ok(g) = memo.lock() {
         if let Some((w, hit)) = g.get(project_dir) {
             if *w == window {
-                return hit.clone();
+                return hit.clone().map_err(|e| anyhow::anyhow!("{e}"));
             }
         }
     }
-    let tag = if workspace_may_declare_lake_inputs(project_dir) {
-        // A workspace whose config names inputs but will not resolve must not silently drop them:
-        // a `None` here would be indistinguishable from "declares none" and would restore the very
-        // stale hit this guards against.
-        let digest = match resolve_project_config(project_dir) {
-            Ok(cfg) => workspace_lake_inputs_digest(&cfg),
-            Err(e) => format!("unresolved:{e:#}"),
-        };
-        lake_inputs_tag_from_digest(&digest)
+    let res: Result<Option<String>, String> = if workspace_may_declare_lake_inputs(project_dir) {
+        resolve_project_config(project_dir)
+            .and_then(|cfg| workspace_lake_inputs_digest(&cfg))
+            .map(|digest| lake_inputs_tag_from_digest(&digest))
+            .map_err(|e| format!("{e:#}"))
     } else {
-        None
+        Ok(None)
     };
-    let _ = publish_lake_inputs_tag(project_dir, window, &tag);
-    tag
+    let _ = publish_lake_inputs_tag_result(project_dir, window, &res);
+    res.map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+pub(crate) fn project_lake_inputs_tag(project_dir: &Path) -> Option<String> {
+    match try_project_lake_inputs_tag(project_dir) {
+        Ok(tag) => tag,
+        // Never emit a deterministic tag for an unresolvable or unsupported workspace: two runs
+        // with different underlying input bytes would produce the same error string and collide on
+        // every shard, split, and zygote cache key. Each call gets a fresh unrepeatable nonce.
+        Err(e) => Some(fresh_unresolved_lake_inputs_tag(&e.to_string())),
+    }
 }
 
 /// Lake's `LeanLib.recBuildExtraDepTargets` mixes one trace entry per `needs` target into the
@@ -6857,7 +6917,7 @@ pub fn compute_module_cas_key(
     }
     update_lp(&mut h, b"src", node.src_blake3.as_bytes());
     // Declarative Lake file inputs the module may read during elaboration (`needs`).
-    let lake_inputs = module_lake_input_digest(cfg, node);
+    let lake_inputs = module_lake_input_digest(cfg, node)?;
     if !lake_inputs.is_empty() {
         update_lp(&mut h, b"lake_inputs", lake_inputs.as_bytes());
     }
@@ -9055,7 +9115,11 @@ pub(crate) fn record_verified_dep_source(
     // elaborated against the Lake file inputs currently on disk. Workspace-wide, matching
     // `lake_build::load_verified_project_manifest`: a module of this package imports dependency
     // modules whose own elaboration reads the dependency's inputs.
-    let lake_inputs_digest = workspace_lake_inputs_digest(cfg);
+    let Ok(lake_inputs_digest) = workspace_lake_inputs_digest(cfg) else {
+        // Never stamp a verified-sources manifest when any workspace Lake input is unsupported.
+        let _ = fs::remove_file(&manifest_path);
+        return;
+    };
     let mut manifest: VerifiedDepManifest = fs::read(&manifest_path)
         .ok()
         .and_then(|b| serde_json::from_slice::<VerifiedDepManifest>(&b).ok())
@@ -10200,7 +10264,7 @@ lean_lib Later where
             let mut h = blake3::Hasher::new();
             lake_build::update_with_lake_input_digests(&mut h, &dir).unwrap();
             (
-                workspace_lake_inputs_digest(&cfg),
+                workspace_lake_inputs_digest(&cfg).unwrap(),
                 h.finalize().to_hex().to_string(),
                 project_lake_inputs_tag(&dir),
             )
@@ -10224,11 +10288,17 @@ lean_lib Later where
         fs::remove_dir_all(dep_dir.join("Data")).unwrap();
         let err = resolve_project_config(&dir).unwrap_err().to_string();
         assert!(err.contains("Unreadable Lake input `depSources`"), "{err}");
-        // And that unresolvable workspace reads as "inputs changed" rather than "nothing to do".
+        // And that unresolvable workspace fails closed rather than emitting a deterministic tag.
         reset_lake_inputs_tag_memo();
         assert!(
-            project_lake_inputs_tag(&dir).is_some(),
-            "an unresolvable workspace that declares inputs must still carry a tag"
+            try_project_lake_inputs_tag(&dir).is_err(),
+            "an unresolvable workspace that declares inputs must fail closed"
+        );
+        let t_a = project_lake_inputs_tag(&dir);
+        let t_b = project_lake_inputs_tag(&dir);
+        assert!(
+            t_a.is_some() && t_b.is_some() && t_a != t_b,
+            "fallback tags on unresolved workspaces must be fresh nonces, never colliding: {t_a:?} vs {t_b:?}"
         );
         assert!(
             lake_build::update_with_lake_input_digests(&mut blake3::Hasher::new(), &dir).is_err(),
@@ -10348,7 +10418,9 @@ lean_lib Later where
             );
             let cfg = resolve_project_config(&dir).unwrap();
             assert!(
-                workspace_lake_inputs_digest(&cfg).contains("dep_pkg/depSources"),
+                workspace_lake_inputs_digest(&cfg)
+                    .unwrap()
+                    .contains("dep_pkg/depSources"),
                 "{tag}: the relocated dependency must be adopted and its input digested"
             );
             let f0 = folds(&dir);
@@ -10481,7 +10553,8 @@ lean_lib Later where
             })
             .collect();
         for (i, h) in handles.into_iter().enumerate() {
-            h.join().unwrap_or_else(|_| panic!("handler thread {i} panicked"));
+            h.join()
+                .unwrap_or_else(|_| panic!("handler thread {i} panicked"));
         }
         fs::remove_dir_all(dir).unwrap();
     }
@@ -10542,7 +10615,7 @@ lean_lib Later where
             ok.inputs[0].unsupported.is_none() && ok.unsupported.is_none(),
             "a recognised `filter` must stay supported"
         );
-        let ok_digest = workspace_digest();
+        let ok_digest = workspace_digest().expect("supported input digests cleanly");
         assert!(
             ok_digest.contains(&ok.inputs[0].blake3) && !ok_digest.contains("unsupported:"),
             "{ok_digest}"
@@ -10582,20 +10655,33 @@ lean_lib Later where
                 Some(why.as_str()),
                 "{extra}: an unread input must make every module of the package fail closed"
             );
-            // And it must reach the workspace digest, so no key derived from these inputs can
-            // equal one derived from a declaration that was understood.
-            let digest = workspace_digest();
+            // Both `workspace_lake_inputs_digest` and `try_project_lake_inputs_tag` must fail
+            // closed (`Err`) rather than emitting a constant placeholder string that would compare
+            // equal across edits to the underlying input bytes.
+            let digest_err = workspace_digest()
+                .expect_err("unsupported dependency input must fail closed")
+                .to_string();
             assert!(
-                digest.contains("dep_pkg/depSources:unsupported:") && digest != ok_digest,
-                "{extra}: {digest}"
+                digest_err.contains("Unsupported Lake input `dep_pkg/depSources`"),
+                "{extra}: {digest_err}"
             );
-            // The per-module digest is the same question asked of one module, and must agree.
             reset_lake_inputs_tag_memo();
-            assert_ne!(
-                project_lake_inputs_tag(&dir),
-                None,
-                "{extra}: the workspace still declares inputs"
+            let tag_err = try_project_lake_inputs_tag(&dir)
+                .expect_err("try_project_lake_inputs_tag must fail closed on unsupported dep input")
+                .to_string();
+            assert!(
+                tag_err.contains("Unsupported Lake input `dep_pkg/depSources`"),
+                "{extra}: {tag_err}"
             );
+            let fallback_1 = project_lake_inputs_tag(&dir);
+            fs::write(dep_dir.join("Data/other.txt"), "edited bytes").unwrap();
+            reset_lake_inputs_tag_memo();
+            let fallback_2 = project_lake_inputs_tag(&dir);
+            assert!(
+                fallback_1.is_some() && fallback_2.is_some() && fallback_1 != fallback_2,
+                "{extra}: non-Result fallback tags must never collide across edits: {fallback_1:?} vs {fallback_2:?}"
+            );
+            let _ = fs::remove_file(dep_dir.join("Data/other.txt"));
         }
         fs::remove_dir_all(dir).unwrap();
     }
@@ -13394,7 +13480,10 @@ roots = ["Fast"]
             let err = parse_lakefile_toml(&dir, &tf, is_root)
                 .unwrap_err()
                 .to_string();
-            assert!(err.contains("fail-closed") && err.contains("needs"), "{err}");
+            assert!(
+                err.contains("fail-closed") && err.contains("needs"),
+                "{err}"
+            );
         }
         // Lake reads a quoted key as the bare key, so a quoted `moreLeanArgs` applies.
         fs::write(
@@ -13725,7 +13814,10 @@ roots = ["Fast"]
             let err = parse_lakefile_lean(&dir, &lf, is_root)
                 .unwrap_err()
                 .to_string();
-            assert!(err.contains("fail-closed") && err.contains("`gen`"), "{err}");
+            assert!(
+                err.contains("fail-closed") && err.contains("`gen`"),
+                "{err}"
+            );
         }
         fs::write(
             &lf,

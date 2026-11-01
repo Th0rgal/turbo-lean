@@ -33,6 +33,7 @@ pub(crate) fn find_project_root(start: &Path) -> PathBuf {
         if dir.join("lean-toolchain").exists()
             || dir.join("lakefile.lean").exists()
             || dir.join("lakefile.toml").exists()
+            || dir.join("lake-manifest.json").exists()
         {
             return dir.to_path_buf();
         }
@@ -151,7 +152,11 @@ pub(crate) fn spawn_lake_env(project_dir: &Path) -> Result<HashMap<String, Strin
             "{diagnostic}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let prefix = PathBuf::from(String::from_utf8(output.stdout).with_context(|| diagnostic)?.trim());
+        let prefix = PathBuf::from(
+            String::from_utf8(output.stdout)
+                .with_context(|| diagnostic)?
+                .trim(),
+        );
         anyhow::ensure!(
             prefix.is_absolute()
                 && prefix.join("bin/lean").is_file()
@@ -540,12 +545,85 @@ pub(crate) fn auto_hardlink_worktree_oleans_from_main_repo(project_dir: &Path) -
     for cfg_name in ["lean-toolchain", "lake-manifest.json"] {
         let m_cfg = main_project_dir.join(cfg_name);
         let w_cfg = project_dir.join(cfg_name);
-        if m_cfg.is_file() && w_cfg.is_file() {
-            if fs::read(&m_cfg).ok() != fs::read(&w_cfg).ok() {
+        match (m_cfg.is_file(), w_cfg.is_file()) {
+            (true, true) => {
+                if fs::read(&m_cfg).ok() != fs::read(&w_cfg).ok() {
+                    return 0;
+                }
+            }
+            (false, false) => {}
+            _ => return 0,
+        }
+    }
+    let (Ok(m_cands), Ok(w_cands)) = (
+        crate::module_builder::workspace_lake_config_candidates(&main_project_dir),
+        crate::module_builder::workspace_lake_config_candidates(project_dir),
+    ) else {
+        return 0;
+    };
+    let rel_cands = |base: &Path, cands: &[PathBuf]| -> Option<Vec<(PathBuf, Vec<u8>)>> {
+        let canon_base = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
+        let mut out = Vec::with_capacity(cands.len());
+        for c in cands {
+            let canon_c = c.canonicalize().ok()?;
+            let rel = canon_c.strip_prefix(&canon_base).ok()?.to_path_buf();
+            let bytes = fs::read(&canon_c).ok()?;
+            out.push((rel, bytes));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Some(out)
+    };
+    match (
+        rel_cands(&main_project_dir, &m_cands),
+        rel_cands(project_dir, &w_cands),
+    ) {
+        (Some(mc), Some(wc)) if mc == wc => {}
+        _ => return 0,
+    }
+    let may_have_inputs =
+        crate::module_builder::workspace_may_declare_lake_inputs(&main_project_dir)
+            || crate::module_builder::workspace_may_declare_lake_inputs(project_dir);
+    let mut main_inputs_verified = true;
+    if may_have_inputs {
+        let (Ok(m_cfg), Ok(w_cfg)) = (
+            crate::module_builder::resolve_project_config(&main_project_dir),
+            crate::module_builder::resolve_project_config(project_dir),
+        ) else {
+            return 0;
+        };
+        let (Ok(m_dig), Ok(w_dig)) = (
+            crate::module_builder::workspace_lake_inputs_digest(&m_cfg),
+            crate::module_builder::workspace_lake_inputs_digest(&w_cfg),
+        ) else {
+            return 0;
+        };
+        if m_dig != w_dig || m_cfg.canonical_config_digest != w_cfg.canonical_config_digest {
+            return 0;
+        }
+        if !m_dig.is_empty() {
+            // Only link `.olean` artifacts from `main_project_dir` when its verified manifest
+            // proves those `.olean`s were built against `m_dig` (preventing stale `.olean`s from
+            // an un-rebuilt dirty main repo from being copied into a worktree with matching bytes).
+            main_inputs_verified = load_verified_project_manifest(&main_project_dir).is_some()
+                && m_cfg.dep_pkgs.iter().all(|dp| {
+                    let dp_build = dp.pkg_root.join(&dp.build_dir);
+                    if !dp_build.is_dir() {
+                        return true;
+                    }
+                    fs::read(dp_build.join(".turbo_verified_sources.json"))
+                        .ok()
+                        .and_then(|b| {
+                            serde_json::from_slice::<crate::module_builder::VerifiedDepManifest>(&b)
+                                .ok()
+                        })
+                        .is_some_and(|m| m.lake_inputs_digest == m_dig)
+                });
+            if !main_inputs_verified {
                 return 0;
             }
         }
     }
+    let _ = main_inputs_verified;
     let mut linked = 0usize;
     let src_pkgs = main_project_dir.join(".lake").join("packages");
     if src_pkgs.is_dir() {
@@ -837,6 +915,7 @@ pub(crate) fn infer_project_dir_from_lean_file(path: &Path) -> PathBuf {
     while let Some(dir) = cur {
         if dir.join("lakefile.lean").exists()
             || dir.join("lakefile.toml").exists()
+            || dir.join("lake-manifest.json").exists()
             || dir.join("lean-toolchain").exists()
             || dir.join(".lake").is_dir()
         {
@@ -1231,11 +1310,35 @@ pub(crate) fn load_project_stat_summary_cached(
     let valid_stats: Vec<(String, i64, i64, i64)> =
         file_stats.iter().filter_map(|s| s.clone()).collect();
 
+    let lake_inputs_tag = crate::module_builder::try_project_lake_inputs_tag(project_dir)?;
+    let cfg_candidates = crate::module_builder::workspace_lake_config_candidates(project_dir)?;
+
     let summary_path = if paths.len() <= 128 && valid_stats.len() == paths.len() {
-        let stat_hash = compute_stat_slice_hash(&valid_stats);
+        let mut key_h = blake3::Hasher::new();
+        key_h.update(b"project-stat-summary-v3\n");
+        key_h.update(compute_stat_slice_hash(&valid_stats).as_bytes());
+        key_h.update(b"\n");
+        if let Some(ref tag) = lake_inputs_tag {
+            key_h.update(tag.as_bytes());
+            key_h.update(b"\n");
+        }
+        for cand in &cfg_candidates {
+            if let Ok(bytes) = fs::read(cand) {
+                key_h.update(cand.to_string_lossy().as_bytes());
+                key_h.update(b":");
+                key_h.update(blake3::hash(&bytes).as_bytes());
+                key_h.update(b"\n");
+            }
+        }
+        if let Ok(bytes) = fs::read(project_dir.join("lake-manifest.json")) {
+            key_h.update(b"lake-manifest.json:");
+            key_h.update(blake3::hash(&bytes).as_bytes());
+            key_h.update(b"\n");
+        }
+        let stat_hash = key_h.finalize().to_hex().to_string();
         let p = store
             .fast_staging_dir()
-            .join(format!("project_stat_summary_v2_{}.json", &stat_hash[..24]));
+            .join(format!("project_stat_summary_v3_{}.json", &stat_hash[..24]));
         if let Ok(bytes) = fs::read(&p) {
             if let Ok(summary) = serde_json::from_slice::<ShmProjectStatSummary>(&bytes) {
                 if summary.total_files == paths.len() {
@@ -1314,8 +1417,9 @@ pub(crate) fn update_with_lake_input_digests(
             project_dir.display()
         )
     })?;
+    let digest = crate::module_builder::workspace_lake_inputs_digest(&cfg)?;
     hasher.update(b"lake-inputs-v2\n");
-    hasher.update(crate::module_builder::workspace_lake_inputs_digest(&cfg).as_bytes());
+    hasher.update(digest.as_bytes());
     Ok(())
 }
 
@@ -1341,12 +1445,22 @@ pub(crate) fn compute_project_interface_key_fast_summary(
     }
     hasher.update(b"\n");
 
-    for cfg_name in ["lakefile.toml", "lake-manifest.json"] {
+    for cfg_name in ["lakefile.toml", "lakefile.lean", "lake-manifest.json"] {
         if let Ok(bytes) = fs::read(project_dir.join(cfg_name)) {
             let cfg_hash = blake3::hash(&bytes);
             hasher.update(cfg_name.as_bytes());
             hasher.update(b":");
             hasher.update(cfg_hash.as_bytes());
+            hasher.update(b"\n");
+        }
+    }
+    for cand in crate::module_builder::workspace_lake_config_candidates(project_dir)? {
+        if let Ok(bytes) = fs::read(&cand) {
+            let rel = cand.strip_prefix(project_dir).unwrap_or(&cand);
+            hasher.update(b"cand:");
+            hasher.update(rel.to_string_lossy().as_bytes());
+            hasher.update(b":");
+            hasher.update(blake3::hash(&bytes).as_bytes());
             hasher.update(b"\n");
         }
     }
@@ -1795,6 +1909,7 @@ pub(crate) fn load_verified_project_manifest(
     let manifest: crate::module_builder::VerifiedDepManifest =
         serde_json::from_slice(&bytes).ok()?;
     let cfg = crate::module_builder::resolve_project_config(canon_dir).ok()?;
+    let expected_inputs = crate::module_builder::workspace_lake_inputs_digest(&cfg).ok()?;
     if manifest.pkg_name != cfg.root_pkg.name
         || manifest.toolchain != cfg.toolchain
         || manifest.lean_githash != cfg.lean_githash
@@ -1805,7 +1920,7 @@ pub(crate) fn load_verified_project_manifest(
         // workspace digest, not just the root package's: the manifest vouches for `.olean` files
         // whose modules import dependency modules, whose own elaboration reads the dependency's
         // inputs.
-        || manifest.lake_inputs_digest != crate::module_builder::workspace_lake_inputs_digest(&cfg)
+        || manifest.lake_inputs_digest != expected_inputs
         || manifest.workspace_config_digest != cfg.canonical_config_digest
         || manifest.allowed_axioms != crate::splitter::allowed_axioms()
     {
@@ -1830,13 +1945,17 @@ pub(crate) fn lake_inputs_changed_since_manifest(canon_dir: &Path) -> bool {
     // about. But a config that *exists* and will not resolve is a different answer: the inputs it
     // declares are unknown, and reporting "unchanged" there would accept every `.olean` the
     // manifest vouches for against bytes nobody looked at. That case fails closed.
-    if !has_lake_config(canon_dir) {
+    if !has_lake_config(canon_dir)
+        && !crate::module_builder::workspace_may_declare_lake_inputs(canon_dir)
+    {
         return false;
     }
     let Ok(cfg) = crate::module_builder::resolve_project_config(canon_dir) else {
         return true;
     };
-    let expected = crate::module_builder::workspace_lake_inputs_digest(&cfg);
+    let Ok(expected) = crate::module_builder::workspace_lake_inputs_digest(&cfg) else {
+        return true;
+    };
     if expected.is_empty() {
         return false;
     }
@@ -2241,7 +2360,9 @@ pub(crate) fn lake_refresh_targets(canon_dir: &Path, modules: &[String]) -> Vec<
     let Ok(cfg) = crate::module_builder::resolve_project_config(canon_dir) else {
         return modules.to_vec();
     };
-    if cfg.root_pkg.inputs.is_empty() {
+    let any_inputs =
+        !cfg.root_pkg.inputs.is_empty() || cfg.dep_pkgs.iter().any(|dp| !dp.inputs.is_empty());
+    if !any_inputs {
         return modules.to_vec();
     }
     let mut out: Vec<String> = Vec::new();
@@ -2258,8 +2379,23 @@ pub(crate) fn lake_refresh_targets(canon_dir: &Path, modules: &[String]) -> Vec<
     out
 }
 
-/// Inspect all transitive project-local imports of `target_files` in `canon_dir`.
-/// If any imported project-local module `<M>` has a stale `.olean` on disk (older than `<M>.lean`,
+struct DiscoveredImportMod {
+    mod_name: String,
+    imp_slash: String,
+    dep_src: PathBuf,
+    pkg_root: PathBuf,
+    build_dir: PathBuf,
+    lib_lean_dir: PathBuf,
+    ir_dir: PathBuf,
+    pkg_name: String,
+    pkg_config_digest: String,
+    is_root_pkg: bool,
+    pkg_has_inputs: bool,
+}
+
+/// Inspect all transitive workspace imports (root package and workspace dependencies) of
+/// `target_files` in `canon_dir`.
+/// If any imported module `<M>` has a stale `.olean` on disk (older than `<M>.lean`,
 /// older than one of its transitive dependencies, or mismatched against `.turbo_verified_sources.json`),
 /// bring it up to date with Lake when the project has a Lake config (failing if Lake cannot),
 /// or else purge the stale `.olean` artifacts, so `lean` / `ZygoteWorker` never elaborates against a stale `.olean`.
@@ -2268,10 +2404,43 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
     canon_dir: &Path,
     target_files: &[PathBuf],
 ) -> Result<usize> {
-    let lib_lean_dir = canon_dir.join(".lake/build/lib/lean");
-    if !lib_lean_dir.is_dir() {
+    // Fail closed immediately if the workspace may declare Lake file inputs (`input_dir` /
+    // `input_file`) or has an unparseable manifest/config that fails static resolution.
+    let _ = crate::module_builder::try_project_lake_inputs_tag(canon_dir)?;
+
+    let cfg_opt = if has_lake_config(canon_dir) {
+        crate::module_builder::resolve_project_config(canon_dir).ok()
+    } else {
+        None
+    };
+
+    let root_lib_lean_dir = cfg_opt
+        .as_ref()
+        .map(|cfg| {
+            cfg.root_pkg
+                .pkg_root
+                .join(&cfg.root_pkg.build_dir)
+                .join(&cfg.root_pkg.lean_lib_dir)
+        })
+        .unwrap_or_else(|| canon_dir.join(".lake/build/lib/lean"));
+    let any_dep_lib_lean_dir = cfg_opt.as_ref().is_some_and(|cfg| {
+        cfg.dep_pkgs.iter().any(|dp| {
+            dp.pkg_root
+                .join(&dp.build_dir)
+                .join(&dp.lean_lib_dir)
+                .is_dir()
+        })
+    }) || fs::read_dir(canon_dir.join(".lake/packages"))
+        .ok()
+        .is_some_and(|entries| {
+            entries
+                .flatten()
+                .any(|e| e.path().join(".lake/build/lib/lean").is_dir())
+        });
+    if !root_lib_lean_dir.is_dir() && !any_dep_lib_lean_dir {
         return Ok(0);
     }
+
     let manifest_path = verified_sources_manifest_path(canon_dir);
     let manifest_opt = load_verified_project_manifest(canon_dir);
     // A changed `needs`-ed Lake input is read during elaboration but moves none of the per-module
@@ -2279,13 +2448,11 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
     // `load_verified_project_manifest` has already discarded the one manifest that could have
     // reported the mismatch. So mark every imported module stale and let the refresh below hand
     // them to Lake, which tracks `needs` in its own traces.
-    let lake_inputs_stale = lake_inputs_changed_since_manifest(canon_dir);
-    // What the manifest entries would have to carry to vouch for an `.olean` right now. Empty for
-    // a workspace that declares no inputs, which is what makes every check below behave exactly as
-    // it did before this feature.
-    let expected_lake_inputs = crate::module_builder::resolve_project_config(canon_dir)
-        .map(|cfg| crate::module_builder::workspace_lake_inputs_digest(&cfg))
-        .unwrap_or_default();
+    let root_lake_inputs_stale = lake_inputs_changed_since_manifest(canon_dir);
+    let expected_lake_inputs = match &cfg_opt {
+        Some(cfg) => crate::module_builder::workspace_lake_inputs_digest(cfg)?,
+        None => String::new(),
+    };
     let has_lake_inputs = !expected_lake_inputs.is_empty();
 
     let mut worklist: Vec<String> = Vec::new();
@@ -2313,62 +2480,152 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
         return Ok(0);
     }
 
+    let resolve_workspace_import =
+        |mod_name: &str, imp_slash: &str| -> Option<DiscoveredImportMod> {
+            if let Some(ref cfg) = cfg_opt {
+                if let Some(spec) =
+                    crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, mod_name)
+                {
+                    return Some(DiscoveredImportMod {
+                        mod_name: mod_name.to_string(),
+                        imp_slash: imp_slash.to_string(),
+                        dep_src: spec.src_path,
+                        pkg_root: cfg.root_pkg.pkg_root.clone(),
+                        build_dir: cfg.root_pkg.pkg_root.join(&cfg.root_pkg.build_dir),
+                        lib_lean_dir: spec.build_lib_lean_dir,
+                        ir_dir: spec.build_ir_dir,
+                        pkg_name: cfg.root_pkg.name.clone(),
+                        pkg_config_digest: cfg.root_pkg.config_digest.clone(),
+                        is_root_pkg: true,
+                        pkg_has_inputs: !cfg.root_pkg.inputs.is_empty(),
+                    });
+                }
+                for dp in &cfg.dep_pkgs {
+                    if let Some(spec) =
+                        crate::module_builder::resolve_module_in_package(dp, false, mod_name)
+                    {
+                        return Some(DiscoveredImportMod {
+                            mod_name: mod_name.to_string(),
+                            imp_slash: imp_slash.to_string(),
+                            dep_src: spec.src_path,
+                            pkg_root: dp.pkg_root.clone(),
+                            build_dir: dp.pkg_root.join(&dp.build_dir),
+                            lib_lean_dir: spec.build_lib_lean_dir,
+                            ir_dir: spec.build_ir_dir,
+                            pkg_name: dp.name.clone(),
+                            pkg_config_digest: dp.config_digest.clone(),
+                            is_root_pkg: false,
+                            pkg_has_inputs: !dp.inputs.is_empty(),
+                        });
+                    }
+                }
+            }
+            resolve_project_lean_source(canon_dir, imp_slash).map(|dep_src| DiscoveredImportMod {
+                mod_name: mod_name.to_string(),
+                imp_slash: imp_slash.to_string(),
+                dep_src,
+                pkg_root: canon_dir.to_path_buf(),
+                build_dir: canon_dir.join(".lake/build"),
+                lib_lean_dir: root_lib_lean_dir.clone(),
+                ir_dir: canon_dir.join(".lake/build/ir"),
+                pkg_name: String::new(),
+                pkg_config_digest: String::new(),
+                is_root_pkg: true,
+                pkg_has_inputs: has_lake_inputs,
+            })
+        };
+
     let mut visited = HashSet::new();
-    let mut ordered_imports: Vec<(String, String, PathBuf)> = Vec::new();
+    let mut ordered_imports: Vec<DiscoveredImportMod> = Vec::new();
+    let mut mod_index: HashMap<String, usize> = HashMap::new();
     let mut adj: HashMap<String, Vec<String>> = HashMap::new();
     while let Some(mod_name) = worklist.pop() {
         if !visited.insert(mod_name.clone()) {
             continue;
         }
         let imp_slash = crate::module_builder::module_name_to_rel_slash(&mod_name);
-        if let Some(dep_src) = resolve_project_lean_source(canon_dir, &imp_slash) {
-            let sub_imps = read_header_imports_from_file(&dep_src).unwrap_or_default();
+        if let Some(info) = resolve_workspace_import(&mod_name, &imp_slash) {
+            let sub_imps = read_header_imports_from_file(&info.dep_src).unwrap_or_default();
             for sub_imp in &sub_imps {
                 if !visited.contains(sub_imp) {
                     worklist.push(sub_imp.clone());
                 }
             }
             adj.insert(mod_name.clone(), sub_imps);
-            ordered_imports.push((mod_name, imp_slash, dep_src));
+            mod_index.insert(mod_name, ordered_imports.len());
+            ordered_imports.push(info);
         }
     }
     if ordered_imports.is_empty() {
         return Ok(0);
     }
 
+    let mut dep_pkg_manifests: HashMap<
+        PathBuf,
+        Option<crate::module_builder::VerifiedDepManifest>,
+    > = HashMap::new();
+    let load_pkg_manifest =
+        |info: &DiscoveredImportMod,
+         cache: &mut HashMap<PathBuf, Option<crate::module_builder::VerifiedDepManifest>>|
+         -> Option<crate::module_builder::VerifiedDepManifest> {
+            if info.is_root_pkg {
+                return manifest_opt.clone();
+            }
+            if let Some(cached) = cache.get(&info.pkg_root) {
+                return cached.clone();
+            }
+            let loaded = cfg_opt.as_ref().and_then(|cfg| {
+                let bytes = fs::read(info.build_dir.join(".turbo_verified_sources.json")).ok()?;
+                let m: crate::module_builder::VerifiedDepManifest =
+                    serde_json::from_slice(&bytes).ok()?;
+                if m.pkg_name != info.pkg_name
+                    || m.toolchain != cfg.toolchain
+                    || m.lean_githash != cfg.lean_githash
+                    || m.pkg_config_digest != info.pkg_config_digest
+                    || m.lake_inputs_digest != expected_lake_inputs
+                    || m.workspace_config_digest != cfg.canonical_config_digest
+                    || m.allowed_axioms != crate::splitter::allowed_axioms()
+                {
+                    return None;
+                }
+                Some(m)
+            });
+            cache.insert(info.pkg_root.clone(), loaded.clone());
+            loaded
+        };
+
     let mut stale_mods: HashSet<String> = HashSet::new();
-    for (mod_name, imp_slash, dep_src) in &ordered_imports {
-        let dep_olean = lib_lean_dir.join(format!("{}.olean", imp_slash));
+    for info in &ordered_imports {
+        let dep_olean = info.lib_lean_dir.join(format!("{}.olean", info.imp_slash));
         let olean_meta = fs::metadata(&dep_olean).ok();
-        let src_meta = fs::metadata(dep_src).ok();
-        let dep_rel = dep_src
-            .strip_prefix(canon_dir)
-            .unwrap_or(dep_src)
+        let src_meta = fs::metadata(&info.dep_src).ok();
+        let dep_rel = info
+            .dep_src
+            .strip_prefix(&info.pkg_root)
+            .unwrap_or(&info.dep_src)
             .to_string_lossy()
             .replace('\\', "/");
-        let cur_hash = compute_cached_source_blake3(dep_src);
+        let cur_hash = compute_cached_source_blake3(&info.dep_src);
+        let pkg_manifest_opt = load_pkg_manifest(info, &mut dep_pkg_manifests);
 
-        let manifest_stale = match (&manifest_opt, &cur_hash) {
+        let pkg_inputs_stale = if info.is_root_pkg {
+            root_lake_inputs_stale
+        } else {
+            has_lake_inputs
+                && (info.pkg_has_inputs || pkg_manifest_opt.is_some())
+                && pkg_manifest_opt.is_none()
+        };
+
+        let manifest_stale = match (&pkg_manifest_opt, &cur_hash) {
             (Some(m), Some(ch)) => match m.modules.get(&dep_rel) {
                 Some(e) => {
-                    !e.kernel_audited
+                    (info.is_root_pkg && !e.kernel_audited)
                         || e.src_blake3 != *ch
-                        // The entry has to name the input bytes it was recorded against. Without
-                        // this, a run that rebuilt one library and re-stamped the manifest header
-                        // would leave the other library's entries looking fresh.
                         || e.lake_inputs_digest != expected_lake_inputs
                 }
-                // No entry means no record of what this `.olean` was elaborated against. For a
-                // workspace with Lake file inputs that is the whole signal: the source hash and
-                // every mtime below are unmoved by an input edit, and the lake-delegated refresh
-                // *deletes* the entries it hands to Lake, so "absent" is exactly the state a
-                // partial rebuild leaves behind. Treat it as stale and rebuild.
-                //
-                // Left as "fresh" for a workspace without inputs, where the mtime and source-hash
-                // checks below are a complete staleness signal and a module turbo-lean has simply
-                // never built is not evidence of anything.
                 None => has_lake_inputs,
             },
+            (None, _) => !info.is_root_pkg && info.pkg_has_inputs,
             _ => false,
         };
         let mtime_stale = match (&olean_meta, &src_meta) {
@@ -2377,7 +2634,9 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
                 _ => true,
             },
             (Some(_), None) => true,
-            (None, _) => false,
+            // For a workspace dependency whose build dir already exists (or declares inputs), a
+            // missing `.olean` on an imported module means Lake must build it before checking.
+            (None, _) => !info.is_root_pkg && (info.lib_lean_dir.is_dir() || info.pkg_has_inputs),
         };
         let trace_corrupt = if olean_meta.as_ref().is_some_and(|m| m.is_file()) {
             let trace_path = dep_olean.with_extension("trace");
@@ -2389,43 +2648,47 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
         } else {
             false
         };
-        if lake_inputs_stale || manifest_stale || mtime_stale || trace_corrupt {
-            stale_mods.insert(mod_name.clone());
+        if pkg_inputs_stale || manifest_stale || mtime_stale || trace_corrupt {
+            stale_mods.insert(info.mod_name.clone());
         }
     }
 
-    // Propagate staleness downstream across the imported project subgraph.
+    // Propagate staleness downstream across the imported workspace subgraph.
     let mut changed = !stale_mods.is_empty();
     while changed {
         changed = false;
-        for (mod_name, imp_slash, _) in &ordered_imports {
-            if stale_mods.contains(mod_name) {
+        for info in &ordered_imports {
+            if stale_mods.contains(&info.mod_name) {
                 continue;
             }
-            let dep_olean = lib_lean_dir.join(format!("{}.olean", imp_slash));
+            let dep_olean = info.lib_lean_dir.join(format!("{}.olean", info.imp_slash));
             let self_om = fs::metadata(&dep_olean).and_then(|m| m.modified()).ok();
-            if let Some(children) = adj.get(mod_name) {
+            if let Some(children) = adj.get(&info.mod_name) {
                 for ch in children {
                     if stale_mods.contains(ch) {
-                        stale_mods.insert(mod_name.clone());
+                        stale_mods.insert(info.mod_name.clone());
                         changed = true;
                         break;
                     }
-                    let ch_slash = crate::module_builder::module_name_to_rel_slash(ch);
-                    if let Some(ch_src) = resolve_project_lean_source(canon_dir, &ch_slash) {
-                        let ch_olean = lib_lean_dir.join(format!("{}.olean", ch_slash));
+                    if let Some(&ch_idx) = mod_index.get(ch) {
+                        let ch_info = &ordered_imports[ch_idx];
+                        let ch_olean = ch_info
+                            .lib_lean_dir
+                            .join(format!("{}.olean", ch_info.imp_slash));
                         let ch_om = fs::metadata(&ch_olean).and_then(|m| m.modified()).ok();
-                        let ch_sm = fs::metadata(&ch_src).and_then(|m| m.modified()).ok();
+                        let ch_sm = fs::metadata(&ch_info.dep_src)
+                            .and_then(|m| m.modified())
+                            .ok();
                         if let (Some(som), Some(com)) = (self_om, ch_om) {
                             if som < com {
-                                stale_mods.insert(mod_name.clone());
+                                stale_mods.insert(info.mod_name.clone());
                                 changed = true;
                                 break;
                             }
                         }
                         if let (Some(som), Some(csm)) = (self_om, ch_sm) {
                             if som < csm {
-                                stale_mods.insert(mod_name.clone());
+                                stale_mods.insert(info.mod_name.clone());
                                 changed = true;
                                 break;
                             }
@@ -2449,57 +2712,43 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
         );
     }
     if has_lake_config(canon_dir) {
-        // Lake owns `.lake/build` (whose files may be hard links into its artifact cache):
-        // let Lake bring the stale imports up to date instead of deleting or rewriting them.
-        // `lake_refresh_targets` substitutes the input-bearing library for any module Lake would
-        // otherwise rebuild under an attribution that drops the `needs`.
         lake_build_modules(canon_dir, &lake_refresh_targets(canon_dir, &targets), None)?;
         if let Some(mut manifest) = manifest_opt {
-            for (_, _, dep_src) in &ordered_imports {
-                if targets.iter().any(|t| {
-                    let s = crate::module_builder::module_name_to_rel_slash(t);
-                    resolve_project_lean_source(canon_dir, &s).as_ref() == Some(dep_src)
-                }) {
-                    let dep_rel = dep_src
+            for info in &ordered_imports {
+                if info.is_root_pkg && stale_mods.contains(&info.mod_name) {
+                    let dep_rel = info
+                        .dep_src
                         .strip_prefix(canon_dir)
-                        .unwrap_or(dep_src)
+                        .unwrap_or(&info.dep_src)
                         .to_string_lossy()
                         .replace('\\', "/");
                     manifest.modules.remove(&dep_rel);
                 }
             }
-            // Deliberately *not* re-stamping `manifest.lake_inputs_digest` here. Reaching this
-            // branch at all means `load_verified_project_manifest` accepted the manifest, which it
-            // only does when the recorded digest already equals the workspace digest (see its
-            // `lake_inputs_digest` check), so the assignment could only ever be a no-op -- and a
-            // no-op that would silently *clear* a recorded digest if the two resolves it compares
-            // ever disagreed.
-            //
-            // The cost is that the whole-manifest mismatch cannot be retired by this refresh: when
-            // an input really has changed, `load_verified_project_manifest` returns `None`, there
-            // is no manifest to stamp, and every later `check` recomputes
-            // `lake_inputs_changed_since_manifest() == true` and hands Lake the same target list
-            // again -- a full Lake refresh per `check` until a native build rewrites the manifest.
-            // Retiring that needs the per-entry `lake_inputs_digest` to be compared inside
-            // `verify_project_module_entry_and_sidecars` first; without it, re-stamping the
-            // whole-manifest field would let `are_all_project_oleans_up_to_date` and
-            // `is_file_and_imports_verified_in_manifest` vouch for entries this run never
-            // rebuilt, which is exactly the stale-`.olean` hit round 1 found.
             if let Ok(json_bytes) = serde_json::to_vec(&manifest) {
                 let _ = fs::write(&manifest_path, json_bytes);
             } else {
                 let _ = fs::remove_file(&manifest_path);
             }
         }
+        // Also invalidate stale module entries from any dependency package manifests so subsequent
+        // checks do not read outdated verified-source entries for rebuilt dependency modules.
+        for info in &ordered_imports {
+            if !info.is_root_pkg && stale_mods.contains(&info.mod_name) {
+                let dep_manifest_path = info.build_dir.join(".turbo_verified_sources.json");
+                let _ = fs::remove_file(dep_manifest_path);
+            }
+        }
         return Ok(targets.len());
     }
 
     if let Some(mut manifest) = manifest_opt {
-        for (mod_name, _, dep_src) in &ordered_imports {
-            if stale_mods.contains(mod_name) {
-                let dep_rel = dep_src
+        for info in &ordered_imports {
+            if info.is_root_pkg && stale_mods.contains(&info.mod_name) {
+                let dep_rel = info
+                    .dep_src
                     .strip_prefix(canon_dir)
-                    .unwrap_or(dep_src)
+                    .unwrap_or(&info.dep_src)
                     .to_string_lossy()
                     .replace('\\', "/");
                 manifest.modules.remove(&dep_rel);
@@ -2513,9 +2762,39 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
     } else {
         let _ = fs::remove_file(&manifest_path);
     }
-    for (mod_name, imp_slash, _) in &ordered_imports {
-        if stale_mods.contains(mod_name) {
-            remove_module_build_artifacts(canon_dir, imp_slash);
+    for info in &ordered_imports {
+        if stale_mods.contains(&info.mod_name) {
+            let _ = fs::remove_file(info.build_dir.join(".turbo_verified_sources.json"));
+            for suffix in [
+                ".olean",
+                ".olean.hash",
+                ".olean.server",
+                ".olean.server.hash",
+                ".olean.private",
+                ".olean.private.hash",
+                ".ilean",
+                ".ilean.hash",
+                ".ir",
+                ".ir.hash",
+                ".ir.sig",
+                ".ir.sig.hash",
+                ".trace",
+            ] {
+                let _ = fs::remove_file(
+                    info.lib_lean_dir
+                        .join(format!("{}{}", info.imp_slash, suffix)),
+                );
+            }
+            for suffix in [
+                ".c",
+                ".c.hash",
+                ".setup.json",
+                ".ilean",
+                ".ilean.hash",
+                ".trace",
+            ] {
+                let _ = fs::remove_file(info.ir_dir.join(format!("{}{}", info.imp_slash, suffix)));
+            }
         }
     }
     for t_slash in &target_rel_slashes {
@@ -2568,7 +2847,13 @@ pub(crate) fn lake_build_modules(
 }
 
 pub(crate) fn has_lake_config(canon_dir: &Path) -> bool {
-    canon_dir.join("lakefile.lean").is_file() || canon_dir.join("lakefile.toml").is_file()
+    canon_dir.join("lakefile.lean").is_file()
+        || canon_dir.join("lakefile.toml").is_file()
+        || canon_dir.join("lake-manifest.json").is_file()
+        || crate::module_builder::package_config_path(canon_dir, None)
+            .ok()
+            .flatten()
+            .is_some()
 }
 
 /// The files of `files` whose edit against git revision `rev` is not local, i.e. changes more than
@@ -2682,15 +2967,16 @@ pub(crate) fn dependent_closure_modules(
 pub(crate) fn recheck_dependents_if_nonlocal(canon_dir: &Path, target: &Path) -> Result<()> {
     let lake_root = target.canonicalize().ok().and_then(|f| {
         f.ancestors()
-            .find(|a| has_lake_config(a))
+            .find(|a| has_lake_config(a) || a.join("lake-manifest.json").is_file())
             .map(PathBuf::from)
     });
-    let dir = if has_lake_config(canon_dir) {
+    let dir = if has_lake_config(canon_dir) || canon_dir.join("lake-manifest.json").is_file() {
         canon_dir.to_path_buf()
     } else {
         lake_root.unwrap_or_else(|| canon_dir.to_path_buf())
     };
     let dir = dir.canonicalize().unwrap_or(dir);
+    let _ = crate::module_builder::try_project_lake_inputs_tag(&dir)?;
     let file = Some(dir.join(target))
         .filter(|f| f.exists())
         .unwrap_or_else(|| target.to_path_buf());
@@ -2706,6 +2992,38 @@ pub(crate) fn recheck_dependents_if_nonlocal(canon_dir: &Path, target: &Path) ->
             "[turbo-lean] Lake re-checked {} modules (0: all libraries)",
             n
         );
+    } else if lake_inputs_changed_since_manifest(&dir) {
+        if let Ok(cfg) = crate::module_builder::resolve_project_config(&dir) {
+            let mut input_libs: Vec<String> = Vec::new();
+            if !cfg.root_pkg.inputs.is_empty() {
+                input_libs.extend(
+                    cfg.root_pkg
+                        .libs
+                        .iter()
+                        .filter(|l| !l.needs.is_empty())
+                        .map(|l| l.name.clone()),
+                );
+            }
+            for dp in &cfg.dep_pkgs {
+                if !dp.inputs.is_empty() {
+                    input_libs.extend(
+                        dp.libs
+                            .iter()
+                            .filter(|l| !l.needs.is_empty())
+                            .map(|l| format!("{}/{}", dp.name, l.name)),
+                    );
+                }
+            }
+            input_libs.sort();
+            input_libs.dedup();
+            if !input_libs.is_empty() && has_lake_config(&dir) {
+                eprintln!(
+                    "[turbo-lean] Lake file inputs changed: re-checking input-bearing libraries ({}) with Lake",
+                    input_libs.join(", ")
+                );
+                lake_build_modules(&dir, &input_libs, None)?;
+            }
+        }
     }
     Ok(())
 }
@@ -2773,10 +3091,20 @@ pub(crate) fn untrusted_recheck_dependents(
 
 /// Project modules imported by `files` (Lake brings them up to date before per-theorem checks).
 pub(crate) fn project_imports_of(canon_dir: &Path, files: &[PathBuf]) -> Vec<String> {
+    let cfg_opt = crate::module_builder::resolve_project_config(canon_dir).ok();
     let mut mods: Vec<String> = files
         .iter()
         .flat_map(|f| read_header_imports_from_file(f).unwrap_or_default())
-        .filter(|m| resolve_project_lean_source(canon_dir, &m.replace('.', "/")).is_some())
+        .filter(|m| {
+            resolve_project_lean_source(canon_dir, &m.replace('.', "/")).is_some()
+                || cfg_opt.as_ref().is_some_and(|cfg| {
+                    crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, m)
+                        .is_some()
+                        || cfg.dep_pkgs.iter().any(|dp| {
+                            crate::module_builder::resolve_module_in_package(dp, false, m).is_some()
+                        })
+                })
+        })
         .collect();
     mods.sort();
     mods.dedup();
@@ -2798,6 +3126,7 @@ pub(crate) fn seed_project_theorem_shards_from_splits(
     let mut files_seeded = 0usize;
     let mut batch_items: Vec<(String, String, Vec<u8>, i64)> = Vec::new();
 
+    let _ = crate::module_builder::try_project_lake_inputs_tag(canon_dir)?;
     let pkg_cfg_opt = crate::module_builder::optional_package_config(canon_dir)?;
     for (lf, _src, split) in split_entries {
         if require_olean && resolve_prebuilt_module_import(canon_dir, lf).is_none() {
@@ -3783,7 +4112,7 @@ mod tests {
                 toolchain: cfg.toolchain.clone(),
                 lean_githash: cfg.lean_githash.clone(),
                 pkg_config_digest: cfg.root_pkg.config_digest.clone(),
-                lake_inputs_digest: crate::module_builder::workspace_lake_inputs_digest(&cfg),
+                lake_inputs_digest: crate::module_builder::workspace_lake_inputs_digest(&cfg)?,
                 workspace_config_digest: cfg.canonical_config_digest.clone(),
                 allowed_axioms: crate::splitter::allowed_axioms(),
                 modules: std::collections::BTreeMap::from([(
@@ -3794,7 +4123,7 @@ mod tests {
                         kernel_audited: true,
                         lake_inputs_digest: crate::module_builder::workspace_lake_inputs_digest(
                             &cfg,
-                        ),
+                        )?,
                     },
                 )]),
             };
@@ -3981,7 +4310,7 @@ mod tests {
                 pkg_config_digest: cfg.root_pkg.config_digest.clone(),
                 // Always the *current* digest: the point is that a current header must not vouch
                 // for an entry that is absent or was recorded against older bytes.
-                lake_inputs_digest: crate::module_builder::workspace_lake_inputs_digest(&cfg),
+                lake_inputs_digest: crate::module_builder::workspace_lake_inputs_digest(&cfg)?,
                 workspace_config_digest: cfg.canonical_config_digest.clone(),
                 allowed_axioms: crate::splitter::allowed_axioms(),
                 modules: entry
@@ -4010,12 +4339,13 @@ mod tests {
             lake_inputs_digest: inputs_digest,
         };
         let verdict = || {
+            crate::module_builder::reset_lake_inputs_tag_memo();
             ensure_project_imports_fresh_for_check(&proj, &[proj.join("Smoke/B.lean")])
                 .map_err(|e| e.to_string())
         };
         let current = crate::module_builder::workspace_lake_inputs_digest(
             &crate::module_builder::resolve_project_config(&proj)?,
-        );
+        )?;
         assert!(!current.is_empty(), "the fixture must declare inputs");
 
         // 1. A complete, current entry is fresh: this is not a blanket refusal.
@@ -4389,7 +4719,11 @@ mod tests {
             assert_eq!(fs::metadata(&wt_local)?.permissions().mode() & 0o777, 0o600);
         }
         for (path, bytes) in &main_lake_bytes {
-            assert_eq!(&fs::read(path)?, bytes, "opt-out must not copy or rewrite main `.lake`");
+            assert_eq!(
+                &fs::read(path)?,
+                bytes,
+                "opt-out must not copy or rewrite main `.lake`"
+            );
         }
         #[cfg(unix)]
         {
@@ -4426,6 +4760,150 @@ mod tests {
                 .join(".lake/build/.turbo_verified_sources.json")
                 .exists(),
             ".turbo_verified_sources.json must not be copied into worktree"
+        );
+
+        match saved_wt_env {
+            Some(v) => std::env::set_var("TURBO_LEAN_NO_WORKTREE_LINK", v),
+            None => std::env::remove_var("TURBO_LEAN_NO_WORKTREE_LINK"),
+        }
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_auto_hardlink_worktree_oleans_rejects_divergent_lake_inputs_manifest_and_config(
+    ) -> Result<()> {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let saved_wt_env = std::env::var("TURBO_LEAN_NO_WORKTREE_LINK").ok();
+        std::env::remove_var("TURBO_LEAN_NO_WORKTREE_LINK");
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_wt_lake_inputs_parity_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+
+        let main_repo = tmp_dir.join("main_repo");
+        fs::create_dir_all(main_repo.join("Smoke"))?;
+        fs::create_dir_all(main_repo.join("Data"))?;
+        fs::create_dir_all(main_repo.join(".lake/build/lib/lean/Smoke"))?;
+        fs::write(
+            main_repo.join("lean-toolchain"),
+            include_str!("../../../lean/lean-toolchain"),
+        )?;
+        let lakefile_lean = "import Lake\nopen Lake DSL\npackage demo\ninput_dir smokeSources where\n  path := \"Data\"\n  filter := .extension \"sol\"\n@[default_target]\nlean_lib Smoke where\n  globs := #[.one `Smoke.A]\n  needs := #[smokeSources]\n";
+        fs::write(main_repo.join("lakefile.lean"), lakefile_lean)?;
+        fs::write(main_repo.join("Smoke/A.lean"), "def a : Nat := 1\n")?;
+        fs::write(main_repo.join("Data/a.sol"), "contract A {}\n")?;
+        let manifest_v1 =
+            "{\"version\": 7, \"packagesDir\": \".lake/packages\", \"packages\": []}\n";
+        fs::write(main_repo.join("lake-manifest.json"), manifest_v1)?;
+        fs::write(
+            main_repo.join(".lake/build/lib/lean/Smoke/A.olean"),
+            b"smoke-a-olean-v1",
+        )?;
+
+        if crate::module_builder::resolve_project_config(&main_repo).is_err() {
+            match saved_wt_env {
+                Some(v) => std::env::set_var("TURBO_LEAN_NO_WORKTREE_LINK", v),
+                None => std::env::remove_var("TURBO_LEAN_NO_WORKTREE_LINK"),
+            }
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return Ok(());
+        }
+
+        let cfg = crate::module_builder::resolve_project_config(&main_repo)?;
+        let cur_inputs_digest = crate::module_builder::workspace_lake_inputs_digest(&cfg)?;
+        let write_main_verified_manifest = |inputs_digest: &str| -> Result<()> {
+            let m = crate::module_builder::VerifiedDepManifest {
+                pkg_name: cfg.root_pkg.name.clone(),
+                toolchain: cfg.toolchain.clone(),
+                lean_githash: cfg.lean_githash.clone(),
+                pkg_config_digest: cfg.root_pkg.config_digest.clone(),
+                lake_inputs_digest: inputs_digest.to_string(),
+                workspace_config_digest: cfg.canonical_config_digest.clone(),
+                allowed_axioms: crate::splitter::allowed_axioms(),
+                modules: std::collections::BTreeMap::from([(
+                    "Smoke/A.lean".to_string(),
+                    crate::module_builder::VerifiedDepModuleEntry {
+                        src_blake3: blake3::hash(b"def a : Nat := 1\n").to_hex().to_string(),
+                        olean_artifact_digest: "art".to_string(),
+                        kernel_audited: true,
+                        lake_inputs_digest: inputs_digest.to_string(),
+                    },
+                )]),
+            };
+            fs::write(
+                verified_sources_manifest_path(&main_repo),
+                serde_json::to_vec(&m)?,
+            )?;
+            Ok(())
+        };
+        write_main_verified_manifest(&cur_inputs_digest)?;
+
+        let make_wt = |name: &str| -> Result<PathBuf> {
+            let main_git = main_repo.join(".git/worktrees").join(name);
+            fs::create_dir_all(&main_git)?;
+            fs::write(main_git.join("commondir"), "../..\n")?;
+            let wt = tmp_dir.join(name);
+            let _ = fs::remove_dir_all(&wt);
+            fs::create_dir_all(wt.join("Smoke"))?;
+            fs::create_dir_all(wt.join("Data"))?;
+            fs::write(wt.join(".git"), format!("gitdir: {}\n", main_git.display()))?;
+            fs::write(
+                wt.join("lean-toolchain"),
+                include_str!("../../../lean/lean-toolchain"),
+            )?;
+            fs::write(wt.join("lakefile.lean"), lakefile_lean)?;
+            fs::write(wt.join("Smoke/A.lean"), "def a : Nat := 1\n")?;
+            fs::write(wt.join("Data/a.sol"), "contract A {}\n")?;
+            fs::write(wt.join("lake-manifest.json"), manifest_v1)?;
+            Ok(wt)
+        };
+
+        // 1. Identical inputs + manifest + config + verified manifest => copies Smoke/A.olean.
+        let wt_same = make_wt("wt_same")?;
+        crate::module_builder::reset_lake_inputs_tag_memo();
+        assert_eq!(auto_hardlink_worktree_oleans_from_main_repo(&wt_same), 1);
+        assert!(wt_same.join(".lake/build/lib/lean/Smoke/A.olean").exists());
+
+        // 2. Divergent matched `input_dir` file => must refuse copying `.olean`s.
+        let wt_input_diff = make_wt("wt_input_diff")?;
+        fs::write(wt_input_diff.join("Data/a.sol"), "contract AChanged {}\n")?;
+        crate::module_builder::reset_lake_inputs_tag_memo();
+        assert_eq!(
+            auto_hardlink_worktree_oleans_from_main_repo(&wt_input_diff),
+            0,
+            "divergent matched input_dir file must block worktree .olean copy"
+        );
+        assert!(!wt_input_diff
+            .join(".lake/build/lib/lean/Smoke/A.olean")
+            .exists());
+
+        // 3. Divergent `lake-manifest.json` => must refuse copying `.olean`s.
+        let wt_manifest_diff = make_wt("wt_manifest_diff")?;
+        fs::write(
+            wt_manifest_diff.join("lake-manifest.json"),
+            "{\"version\": 7, \"packagesDir\": \".lake/packages_alt\", \"packages\": []}\n",
+        )?;
+        crate::module_builder::reset_lake_inputs_tag_memo();
+        assert_eq!(
+            auto_hardlink_worktree_oleans_from_main_repo(&wt_manifest_diff),
+            0,
+            "divergent lake-manifest.json must block worktree .olean copy"
+        );
+
+        // 4. Stale main verified manifest (`lake_inputs_digest` mismatch) => must refuse copying.
+        write_main_verified_manifest("stale_digest_from_earlier_input")?;
+        let wt_stale_main = make_wt("wt_stale_main")?;
+        crate::module_builder::reset_lake_inputs_tag_memo();
+        assert_eq!(
+            auto_hardlink_worktree_oleans_from_main_repo(&wt_stale_main),
+            0,
+            "main repo with stale verified manifest must not seed worktree .olean files"
         );
 
         match saved_wt_env {

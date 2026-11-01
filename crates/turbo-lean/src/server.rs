@@ -117,6 +117,7 @@ pub fn is_safe_lean_env_key(key: &str) -> bool {
         "LEAN_STACK_SIZE_KB"
             | "TURBO_LEAN_ZYGOTE_MAX_CHECKPOINTS"
             | "TURBO_LEAN_CALLER_CWD"
+            | "TURBO_LEAN_PROJECT_DIR"
             | "LEAN_NATIVE_TELEMETRY"
             | "LEAN_NATIVE_TELEMETRY_DIR"
             | "SANDBOXED_TELEMETRY_BATCH_ONLY"
@@ -1012,6 +1013,66 @@ pub fn serve_cas_http_with_auth(
                     if let Some(ref c) = req.cwd {
                         env_vars.insert("TURBO_LEAN_CALLER_CWD".to_string(), c.clone());
                     }
+                    let eval_proj_opt = env_vars
+                        .get("TURBO_LEAN_PROJECT_DIR")
+                        .filter(|s| !s.is_empty())
+                        .map(std::path::PathBuf::from)
+                        .or_else(|| {
+                            req.file_name
+                                .as_deref()
+                                .filter(|s| !s.is_empty())
+                                .and_then(|f| {
+                                    let p = Path::new(f);
+                                    if p.is_absolute() {
+                                        Some(crate::lake_build::infer_project_dir_from_lean_file(p))
+                                    } else {
+                                        req.cwd.as_deref().map(|c| {
+                                            crate::lake_build::infer_project_dir_from_lean_file(
+                                                &Path::new(c).join(p),
+                                            )
+                                        })
+                                    }
+                                })
+                        })
+                        .or_else(|| {
+                            req.cwd
+                                .as_deref()
+                                .filter(|s| !s.is_empty())
+                                .map(Path::new)
+                                .filter(|p| crate::lake_build::has_lake_config(p))
+                                .map(crate::lake_build::find_project_root)
+                        });
+                    if let Some(ref proj_dir) = eval_proj_opt {
+                        if let Err(e) = crate::module_builder::try_project_lake_inputs_tag(proj_dir)
+                        {
+                            let msg = format!("{:#}", e);
+                            let _ = write_json_response(
+                                &mut stream,
+                                200,
+                                &serde_json::json!({
+                                    "ok": false,
+                                    "kernel_gate_active": false,
+                                    "import_ok": false,
+                                    "env_cache_hit": false,
+                                    "prefix_cache_hit": false,
+                                    "import_us": 0,
+                                    "prefix_us": 0,
+                                    "elab_us": 0,
+                                    "heartbeats": 0,
+                                    "stdout": "",
+                                    "messages": [msg.clone()],
+                                    "errors": [msg],
+                                    "timed_out": false,
+                                    "crashed": false,
+                                    "deterministic": true
+                                }),
+                            );
+                            return;
+                        }
+                        env_vars
+                            .entry("TURBO_LEAN_PROJECT_DIR".to_string())
+                            .or_insert_with(|| proj_dir.to_string_lossy().to_string());
+                    }
                     if !req.lean_path.is_empty() {
                         env_vars.insert("LEAN_PATH".to_string(), req.lean_path.clone());
                     } else {
@@ -1020,12 +1081,20 @@ pub fn serve_cas_http_with_auth(
                     if let Some(expected) = req.execution_identity.as_deref() {
                         let (imports, _) = crate::zygote::split_shard_for_zygote(src);
                         let actual = crate::zygote::resolve_zygote_context(
-                            tc, &req.lean_path, &env_vars, &lean_bin, &imports,
+                            tc,
+                            &req.lean_path,
+                            &env_vars,
+                            &lean_bin,
+                            &imports,
                         );
                         if expected != actual.identity {
-                            let _ = write_json_response(&mut stream, 409, &serde_json::json!({
-                                "ok": false, "error": "eval execution identity changed"
-                            }));
+                            let _ = write_json_response(
+                                &mut stream,
+                                409,
+                                &serde_json::json!({
+                                    "ok": false, "error": "eval execution identity changed"
+                                }),
+                            );
                             return;
                         }
                     }
@@ -2473,7 +2542,8 @@ mod bind_auth_tests {
         batch.coalesced_shard_source = source.into();
         batch.items[0].shard_key = batch_key;
         batch.lean_args = low;
-        let (second, _, hits) = execute_check_shards_batch_payload_deferred(&mut store, &batch, None)?;
+        let (second, _, hits) =
+            execute_check_shards_batch_payload_deferred(&mut store, &batch, None)?;
         assert_eq!(second.cache_hits, 0);
         assert!(hits.is_empty());
         // Partial hit: only the entry verified under the requested options may be pruned.

@@ -1447,27 +1447,57 @@ fn compute_imported_oleans_digest_inner(
 ///
 /// Empty -- and free, see `workspace_may_declare_lake_inputs` -- for every workspace that declares
 /// no inputs, including every toolchain entry on the path, which carries no Lake config.
-fn compute_lean_path_lake_inputs_digest(effective_lean_path: &str) -> String {
+fn compute_lean_path_lake_inputs_digest(
+    effective_lean_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+) -> (String, bool) {
     let mut tags: Vec<String> = Vec::new();
-    for part in effective_lean_path.split(':').filter(|p| !p.is_empty()) {
-        // Bounded: the deepest default layout is four components below the package root, and a
-        // custom `buildDir` / `leanLibDir` pair is not deeper in practice. Stopping at the nearest
-        // package root also keeps a dependency attributed to itself rather than to the workspace
-        // whose `.lake/packages` contains it.
-        for anc in Path::new(part).ancestors().take(8) {
-            if !crate::lake_build::has_lake_config(anc) {
-                continue;
-            }
-            if let Some(tag) = crate::module_builder::project_lake_inputs_tag(anc) {
+    let mut uncacheable = false;
+    let mut record_workspace =
+        |dir: &Path| match crate::module_builder::try_project_lake_inputs_tag(dir) {
+            Ok(Some(tag)) => {
                 if !tags.contains(&tag) {
                     tags.push(tag);
                 }
             }
+            Ok(None) => {}
+            Err(_) => {
+                uncacheable = true;
+                if let Some(tag) = crate::module_builder::project_lake_inputs_tag(dir) {
+                    tags.push(tag);
+                }
+            }
+        };
+    for part in effective_lean_path.split(':').filter(|p| !p.is_empty()) {
+        // Walk every ancestor without an arbitrary depth cap so deeply nested custom
+        // `buildDir` / `leanLibDir` layouts still resolve their enclosing package root.
+        for anc in Path::new(part).ancestors() {
+            if !crate::lake_build::has_lake_config(anc) {
+                continue;
+            }
+            record_workspace(anc);
             break;
         }
     }
+    if let Some(proj) = env_vars
+        .get("TURBO_LEAN_PROJECT_DIR")
+        .filter(|s| !s.is_empty())
+        .map(Path::new)
+        .or_else(|| {
+            env_vars
+                .get("TURBO_LEAN_CALLER_CWD")
+                .filter(|s| !s.is_empty())
+                .map(Path::new)
+                .filter(|p| crate::lake_build::has_lake_config(p))
+        })
+    {
+        let root = crate::lake_build::find_project_root(proj);
+        if crate::lake_build::has_lake_config(&root) {
+            record_workspace(&root);
+        }
+    }
     tags.sort();
-    tags.join(",")
+    (tags.join(","), uncacheable)
 }
 
 pub fn compute_search_path_oleans_digest(effective_lean_path: &str) -> String {
@@ -2820,6 +2850,7 @@ pub(crate) struct ResolvedZygoteContext {
     search_path_digest: String,
     host_closure_digest: String,
     toolchain_policy: String,
+    lake_inputs_uncacheable: bool,
     pub(crate) identity: String,
 }
 
@@ -2952,7 +2983,8 @@ pub(crate) fn resolve_zygote_context(
     // Declared Lake file inputs move no `.olean` byte, so they have to be named separately in both
     // the pool key (never hand back a worker warmed against older input bytes) and `olean_digest`
     // (which keys the verified-shard memo and the `warm_imports` / `warm_prefixes` match).
-    let lake_inputs_digest = compute_lean_path_lake_inputs_digest(&effective_lean_path);
+    let (lake_inputs_digest, lake_inputs_uncacheable) =
+        compute_lean_path_lake_inputs_digest(&effective_lean_path, env_vars);
     let pool_digest_tag = if lake_inputs_digest.is_empty() {
         search_path_digest.clone()
     } else {
@@ -2986,8 +3018,13 @@ pub(crate) fn resolve_zygote_context(
     .to_hex()
     .to_string();
     let identity = blake3::hash(
-        &serde_json::to_vec(&(&compiler_identity, &effective_lean_path, &imports_csv, &olean_digest))
-            .expect("execution identity serializes"),
+        &serde_json::to_vec(&(
+            &compiler_identity,
+            &effective_lean_path,
+            &imports_csv,
+            &olean_digest,
+        ))
+        .expect("execution identity serializes"),
     )
     .to_hex()
     .to_string();
@@ -2999,10 +3036,10 @@ pub(crate) fn resolve_zygote_context(
         search_path_digest: pool_digest_tag,
         host_closure_digest: host_closure_digest.to_string(),
         toolchain_policy,
+        lake_inputs_uncacheable,
         identity,
     }
 }
-
 
 #[allow(clippy::too_many_arguments)]
 fn eval_with_zygote_pool_inner(
@@ -3051,6 +3088,7 @@ fn eval_with_zygote_pool_inner(
     let pool_digest_tag = context.search_path_digest;
     let toolchain_policy = context.toolchain_policy;
     let olean_digest = context.olean_digest;
+    let lake_inputs_uncacheable = context.lake_inputs_uncacheable;
     let host_closure_digest = context.host_closure_digest.as_str();
     let pool_key = (
         toolchain_policy.clone(),
@@ -3071,16 +3109,17 @@ fn eval_with_zygote_pool_inner(
             std::collections::HashMap<(String, String, bool, String), ZygoteEvalReply>,
         >,
     > = std::sync::OnceLock::new();
-    let verified_cache_key = if !eval_mode && batch_fission_override.is_none() {
-        Some((
-            verified_cache_policy,
-            olean_digest.clone(),
-            allow_stub,
-            shard_source.to_string(),
-        ))
-    } else {
-        None
-    };
+    let verified_cache_key =
+        if !eval_mode && !lake_inputs_uncacheable && batch_fission_override.is_none() {
+            Some((
+                verified_cache_policy,
+                olean_digest.clone(),
+                allow_stub,
+                shard_source.to_string(),
+            ))
+        } else {
+            None
+        };
     if let Some(ref vkey) = verified_cache_key {
         let vcache = ZYGOTE_VERIFIED_SHARD_CACHE
             .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -3866,7 +3905,7 @@ fn eval_with_zygote_pool_inner(
                 .errors
                 .iter()
                 .any(|e| e == RUNTIME_PANIC_ERR || e.contains("importsCsv changed"));
-            if rep.import_ok && !unusable {
+            if rep.import_ok && !unusable && !lake_inputs_uncacheable {
                 w.warm_imports
                     .insert(imports_csv.clone(), olean_digest.clone());
                 if let Some(pk) = active_prefix_key {
@@ -4739,17 +4778,18 @@ pub fn try_stateless_eval_shm_cache(
     let proj_dir = project_dir
         .map(crate::lake_build::find_project_root)
         .unwrap_or_else(|| crate::lake_build::find_project_root(file));
+    if crate::lake_build::has_lake_config(&proj_dir) {
+        crate::module_builder::try_project_lake_inputs_tag(&proj_dir).ok()?;
+    }
+    let may_declare_inputs = crate::module_builder::workspace_may_declare_lake_inputs(&proj_dir);
     let explicit_lp: Option<String> = lean_path
         .map(str::to_string)
         .or_else(|| std::env::var("LEAN_PATH").ok());
     let req_lp = match explicit_lp {
         Some(lp) => lp,
-        None if !proj_dir.join("lakefile.lean").exists()
-            && !proj_dir.join("lakefile.toml").exists() =>
-        {
-            String::new()
-        }
-        None if !proj_dir.join(".lake/packages").is_dir()
+        None if !crate::lake_build::has_lake_config(&proj_dir) => String::new(),
+        None if !may_declare_inputs
+            && !proj_dir.join(".lake/packages").is_dir()
             && proj_dir.join(".lake/build/lib/lean").exists() =>
         {
             let canon_proj = proj_dir.canonicalize().unwrap_or_else(|_| proj_dir.clone());
@@ -4766,9 +4806,19 @@ pub fn try_stateless_eval_shm_cache(
     let file_display = file.to_string_lossy();
     let (lean_bin, _, _, _) =
         crate::module_builder::resolve_toolchain_compiler(&proj_dir, &toolchain).ok()?;
-    let env_vars = std::env::vars().collect();
+    let mut env_vars: std::collections::HashMap<String, String> = std::env::vars().collect();
+    if crate::lake_build::has_lake_config(&proj_dir) {
+        let canon_proj = proj_dir.canonicalize().unwrap_or_else(|_| proj_dir.clone());
+        env_vars.insert(
+            "TURBO_LEAN_PROJECT_DIR".to_string(),
+            canon_proj.to_string_lossy().to_string(),
+        );
+    }
     let (imports_csv, _) = split_shard_for_zygote(&source);
     let context = resolve_zygote_context(&toolchain, &req_lp, &env_vars, &lean_bin, &imports_csv);
+    if context.lake_inputs_uncacheable {
+        return None;
+    }
     let filename = compute_eval_shm_cache_filename(
         &context,
         &file_display,
@@ -4838,7 +4888,7 @@ pub fn try_local_zygote_eval_with_args(
             .ok()
             .map(|p| p.to_string_lossy().to_string())
     });
-    let eval_shm_file = if is_pure_eval_source(source) {
+    let eval_shm_file = if !context.lake_inputs_uncacheable && is_pure_eval_source(source) {
         let filename = compute_eval_shm_cache_filename(
             &context,
             file_name.unwrap_or(""),
@@ -5433,7 +5483,11 @@ mod tests {
                 )
                 .context("local eval must produce a reply")?;
                 assert!(reply.ok && reply.import_ok, "{reply:?}");
-                assert_eq!(reply.messages.concat().trim(), expected, "LEAN_PATH={name}: {reply:?}");
+                assert_eq!(
+                    reply.messages.concat().trim(),
+                    expected,
+                    "LEAN_PATH={name}: {reply:?}"
+                );
             }
             // Replacing an artifact at the same resolved path must also invalidate the reply.
             fs::copy(tree.root.join("A/Dep.olean"), tree.root.join("B/Dep.olean"))?;
@@ -6058,7 +6112,10 @@ mod tests {
         // Each read stands for a fresh command, which is what the memo window is scoped to.
         let digest = |path: &str| {
             crate::module_builder::reset_lake_inputs_tag_memo();
-            compute_lean_path_lake_inputs_digest(path)
+            let (d, uncacheable) =
+                compute_lean_path_lake_inputs_digest(path, &std::collections::HashMap::new());
+            assert!(!uncacheable, "supported Lake input must remain cacheable");
+            d
         };
         // No Lake config yet: nothing declared, so nothing is mixed in and every existing
         // project's pool key and `olean_digest` stay byte-identical.
@@ -6109,6 +6166,62 @@ mod tests {
         let bare = other.join("a/b/c/d/e/lib/lean");
         fs::create_dir_all(&bare).unwrap();
         assert_eq!(digest(&bare.to_string_lossy()), "");
+
+        // Deeply nested custom `buildDir` (> 8 ancestor levels) must still locate its enclosing
+        // package root rather than silently dropping Lake input digests.
+        let deep_lib = tmp_dir.join("a/b/c/d/e/f/g/h/i/j/lib/lean");
+        fs::create_dir_all(&deep_lib).unwrap();
+        assert_eq!(
+            digest(&deep_lib.to_string_lossy()),
+            d1,
+            "deeply nested buildDir (>8 levels) must still resolve package Lake inputs"
+        );
+
+        // Even with an empty LEAN_PATH, `TURBO_LEAN_PROJECT_DIR` must surface the caller
+        // workspace's Lake input digest to Zygote context resolution.
+        crate::module_builder::reset_lake_inputs_tag_memo();
+        let mut env_with_proj = std::collections::HashMap::new();
+        env_with_proj.insert(
+            "TURBO_LEAN_PROJECT_DIR".to_string(),
+            tmp_dir.to_string_lossy().to_string(),
+        );
+        let (d_proj, uncacheable_proj) = compute_lean_path_lake_inputs_digest("", &env_with_proj);
+        assert!(!uncacheable_proj);
+        assert_eq!(
+            d_proj, d1,
+            "empty LEAN_PATH with TURBO_LEAN_PROJECT_DIR must still include workspace Lake inputs"
+        );
+
+        // Unsupported `filter := .text` or missing `input_file` must mark the Zygote context
+        // uncacheable (`lake_inputs_uncacheable == true`) and emit fresh nonces so SHM/pool caches
+        // never replay stale verdicts.
+        fs::write(
+            tmp_dir.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage demo\ninput_dir smokeSources where\n  path := \"Data\"\n  filter := .text\n@[default_target]\nlean_lib Smoke where\n  globs := #[.submodules `Smoke]\n  needs := #[smokeSources]\n",
+        )
+        .unwrap();
+        crate::module_builder::reset_lake_inputs_tag_memo();
+        let (u1, bad1) = compute_lean_path_lake_inputs_digest("", &env_with_proj);
+        crate::module_builder::reset_lake_inputs_tag_memo();
+        let (u2, bad2) = compute_lean_path_lake_inputs_digest("", &env_with_proj);
+        assert!(
+            bad1 && bad2,
+            "unsupported filter must mark Zygote context uncacheable"
+        );
+        assert!(
+            !u1.is_empty() && !u2.is_empty() && u1 != u2,
+            "uncacheable workspaces must receive distinct per-call nonces: {u1} vs {u2}"
+        );
+        let cache_dir = tmp_dir.join("isolated_cache");
+        let eval_file = tmp_dir.join("SmokeEval.lean");
+        fs::write(&eval_file, "def x : Nat := 1\n").unwrap();
+        crate::module_builder::reset_lake_inputs_tag_memo();
+        assert!(
+            try_stateless_eval_shm_cache(&cache_dir, &eval_file, Some(&tmp_dir), Some(""))
+                .is_none(),
+            "try_stateless_eval_shm_cache must bail out on unsupported Lake input workspace"
+        );
+
         let _ = fs::remove_dir_all(&other);
         let _ = fs::remove_dir_all(&tmp_dir);
     }
@@ -7041,7 +7154,10 @@ mod tests {
             compute_eval_shm_cache_filename(&context, file_name, caller_cwd.as_deref(), &src, &[])
                 .unwrap();
         assert_ne!(v3_name, new_name, "the namespace bump must change the key");
-        assert_ne!(v4_name, new_name, "scanner namespace must change the #305 key");
+        assert_ne!(
+            v4_name, new_name,
+            "scanner namespace must change the #305 key"
+        );
         let dir = store.fast_staging_dir().join("eval_shm_cache");
         fs::create_dir_all(&dir).unwrap();
         // A pre-scanner (no `scanner_version`) false success, planted at the v3 and v4 keys

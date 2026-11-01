@@ -204,6 +204,7 @@ fn prepare_stateless_remote_file(file: &Path, project_dir: &Path) -> Option<Stat
     let canon_dir = project_dir
         .canonicalize()
         .unwrap_or_else(|_| project_dir.to_path_buf());
+    crate::module_builder::try_project_lake_inputs_tag(&canon_dir).ok()?;
     let resolved_file = if file == Path::new(".") {
         return None;
     } else if file.is_relative() && canon_dir.join(file).exists() {
@@ -667,6 +668,7 @@ fn run_check_command_inner(
     let canon_dir = project_dir
         .canonicalize()
         .unwrap_or_else(|_| project_dir.clone());
+    crate::module_builder::try_project_lake_inputs_tag(&canon_dir)?;
     let toolchain = detect_toolchain(&canon_dir);
     let resolved_file = if file == Path::new(".") {
         canon_dir.clone()
@@ -746,7 +748,7 @@ fn run_check_command_inner(
         known_modified_vs_head = c.known_modified;
         let cb3 = (!c.src_blake3.is_empty()).then_some(c.src_blake3);
         (c.prefix_src, cb3, c.split, 1usize)
-    } else if let Some((pref_src, fast_sp, 0)) = file_stat_tuple
+    } else if let Some((pref_src, fast_sp, 0, fast_deps)) = file_stat_tuple
         .filter(|(_, _, sz)| *sz > 64 * 1024)
         .and_then(|(_, _, sz)| {
             try_fast_split_single_file_from_path(
@@ -760,15 +762,13 @@ fn run_check_command_inner(
     {
         known_modified_vs_head = true;
         if let Some((ref st_path, _)) = st_paths_opt {
-            let dep_hashes =
-                compute_imported_olean_interface_hashes(&fast_sp.imports_header, &canon_dir, None);
             let entry = ShmCachedFileSplit {
                 split_key: String::new(),
                 src_blake3: String::new(),
                 split: compact_split_for_shm_cache(&fast_sp),
                 prefix_src: pref_src.clone(),
                 known_modified: true,
-                dep_hashes,
+                dep_hashes: fast_deps,
             };
             if let Ok(bytes) = serde_json::to_vec(&entry) {
                 let _ = crate::shm_cache::atomic_write_shm(st_path, &bytes);
@@ -804,6 +804,7 @@ fn run_check_command_inner(
             &canon_resolved_initial,
             &loaded_src,
             &toolchain,
+            &dep_hashes,
         ) {
             if fast_res.1 == 0 {
                 known_modified_vs_head = true;

@@ -31,9 +31,9 @@ pub mod remote_prebuild;
 pub mod server;
 pub mod shm_cache;
 mod splitter;
+pub mod verify;
 #[cfg(all(test, unix))]
 mod worktree_test_support;
-pub mod verify;
 pub mod zygote;
 
 pub use gpu_fastcheck::*;
@@ -605,9 +605,7 @@ fn run(cli: Cli) -> Result<()> {
             project_dir, base, ..
         } => (Some(project_dir.as_path()), Some(base.as_str())),
         Commands::CiVerify {
-            project_dir,
-            base,
-            ..
+            project_dir, base, ..
         } => match base {
             Some(base) => (Some(project_dir.as_path()), Some(base.as_str())),
             None => (None, None),
@@ -1563,12 +1561,16 @@ fn run(cli: Cli) -> Result<()> {
             let proj_dir = project_dir
                 .map(|p| lake_build::find_project_root(&p))
                 .unwrap_or_else(|| lake_build::find_project_root(&file));
+            if lake_build::has_lake_config(&proj_dir) {
+                module_builder::try_project_lake_inputs_tag(&proj_dir)?;
+            }
             let toolchain = lake_build::detect_toolchain(&proj_dir);
             if !server::is_toolchain_installed(&toolchain) {
                 eprintln!("error: toolchain '{}' is not installed", toolchain);
                 std::process::exit(1);
             }
             let explicit_lp: Option<String> = lean_path.or_else(|| std::env::var("LEAN_PATH").ok());
+            let may_declare_inputs = module_builder::workspace_may_declare_lake_inputs(&proj_dir);
 
             let (mut env_vars, lean_bin, req_lp) = if let Some(lp) = explicit_lp {
                 let (mut ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, &lp);
@@ -1578,7 +1580,8 @@ fn run(cli: Cli) -> Result<()> {
                     ev.insert("LEAN_PATH".to_string(), lp.clone());
                 }
                 (ev, lb, lp)
-            } else if !proj_dir.join(".lake/packages").is_dir()
+            } else if !may_declare_inputs
+                && !proj_dir.join(".lake/packages").is_dir()
                 && proj_dir.join(".lake/build/lib/lean").exists()
                 && zygote::has_active_local_zygote_daemon(&store)
             {
@@ -1587,13 +1590,16 @@ fn run(cli: Cli) -> Result<()> {
                 let mut ev = std::collections::HashMap::new();
                 ev.insert("LEAN_PATH".to_string(), lp.clone());
                 (ev, PathBuf::from("lean"), lp)
-            } else if proj_dir.join("lakefile.lean").exists()
-                || proj_dir.join("lakefile.toml").exists()
-            {
+            } else if lake_build::has_lake_config(&proj_dir) {
                 if let Ok((ev, _)) = lake_build::resolve_lake_env(&store, &proj_dir) {
                     let lp = ev.get("LEAN_PATH").cloned().unwrap_or_default();
                     let (_, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, &lp);
                     (ev, lb, lp)
+                } else if may_declare_inputs {
+                    anyhow::bail!(
+                        "Failed to resolve Lake environment for `{}` which declares Lake file inputs: fail-closed eval gate",
+                        proj_dir.display()
+                    );
                 } else {
                     let (ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, "");
                     let lp = ev.get("LEAN_PATH").cloned().unwrap_or_default();
@@ -1608,6 +1614,13 @@ fn run(cli: Cli) -> Result<()> {
                 if k != "LEAN_PATH" {
                     env_vars.entry(k).or_insert(v);
                 }
+            }
+            if lake_build::has_lake_config(&proj_dir) {
+                let canon_proj = proj_dir.canonicalize().unwrap_or_else(|_| proj_dir.clone());
+                env_vars.insert(
+                    "TURBO_LEAN_PROJECT_DIR".to_string(),
+                    canon_proj.to_string_lossy().to_string(),
+                );
             }
             if let Ok(cwd) = std::env::current_dir() {
                 env_vars.insert(

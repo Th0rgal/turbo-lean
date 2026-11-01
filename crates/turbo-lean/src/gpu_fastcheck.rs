@@ -4784,6 +4784,11 @@ pub fn evaluate_agent_step_value(
         let canon_resolved = resolved_file
             .canonicalize()
             .unwrap_or_else(|_| resolved_file.clone());
+        crate::module_builder::try_project_lake_inputs_tag(&canon_dir)?;
+        crate::lake_build::ensure_project_imports_fresh_for_check(
+            &canon_dir,
+            std::slice::from_ref(&canon_resolved),
+        )?;
         let st_path_opt = fs::metadata(&canon_resolved)
             .ok()
             .map(|m| crate::db::TurboStore::extract_file_stat_tuple(&m))
@@ -4797,6 +4802,13 @@ pub fn evaluate_agent_step_value(
             .as_ref()
             .and_then(|st_path| fs::read(st_path).ok())
             .and_then(|b| serde_json::from_slice::<crate::lake_build::ShmCachedFileSplit>(&b).ok())
+            .filter(|c| {
+                crate::lake_build::compute_imported_olean_interface_hashes(
+                    &c.split.imports_header,
+                    &canon_dir,
+                    None,
+                ) == c.dep_hashes
+            })
             .map(|c| c.split);
         let split = match st_split_opt {
             Some(sp) => sp,
