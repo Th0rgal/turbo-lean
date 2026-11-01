@@ -173,7 +173,7 @@ pub fn query_lean_native_core_worker(
         "eval-cex" => serde_json::json!({
             "declName": eval_decl_name,
             "certified": cabi_certified,
-            "overallAssurance": if cabi_certified { "VerifiedKernelProof" } else { "FallbackUnverified" },
+            "overallAssurance": if cabi_certified { "CertifiedFastCheckEval" } else { "FallbackUnverified" },
             "fallback": !cabi_certified,
             "falsePositives": u8::from(!cabi_certified),
             "certification": cex_details.get("certification").cloned().unwrap_or(serde_json::json!("unavailable")),
@@ -2998,8 +2998,13 @@ pub(crate) fn resolve_zygote_context(
     .to_hex()
     .to_string();
     let identity = blake3::hash(
-        &serde_json::to_vec(&(&compiler_identity, &effective_lean_path, &imports_csv, &olean_digest))
-            .expect("execution identity serializes"),
+        &serde_json::to_vec(&(
+            &compiler_identity,
+            &effective_lean_path,
+            &imports_csv,
+            &olean_digest,
+        ))
+        .expect("execution identity serializes"),
     )
     .to_hex()
     .to_string();
@@ -3014,7 +3019,6 @@ pub(crate) fn resolve_zygote_context(
         identity,
     }
 }
-
 
 #[allow(clippy::too_many_arguments)]
 fn eval_with_zygote_pool_inner(
@@ -5447,7 +5451,11 @@ mod tests {
                 )
                 .context("local eval must produce a reply")?;
                 assert!(reply.ok && reply.import_ok, "{reply:?}");
-                assert_eq!(reply.messages.concat().trim(), expected, "LEAN_PATH={name}: {reply:?}");
+                assert_eq!(
+                    reply.messages.concat().trim(),
+                    expected,
+                    "LEAN_PATH={name}: {reply:?}"
+                );
             }
             // Replacing an artifact at the same resolved path must also invalidate the reply.
             fs::copy(tree.root.join("A/Dep.olean"), tree.root.join("B/Dep.olean"))?;
@@ -7029,7 +7037,10 @@ mod tests {
             compute_eval_shm_cache_filename(&context, file_name, caller_cwd.as_deref(), &src, &[])
                 .unwrap();
         assert_ne!(v3_name, new_name, "the namespace bump must change the key");
-        assert_ne!(v4_name, new_name, "scanner namespace must change the #305 key");
+        assert_ne!(
+            v4_name, new_name,
+            "scanner namespace must change the #305 key"
+        );
         let dir = store.fast_staging_dir().join("eval_shm_cache");
         fs::create_dir_all(&dir).unwrap();
         // A pre-scanner (no `scanner_version`) false success, planted at the v3 and v4 keys
@@ -7502,5 +7513,40 @@ mod tests {
             rep_low_after
         );
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_eval_cex_assurance_is_certified_fastcheck_eval() {
+        let extra = serde_json::json!({
+            "decl": "bad_u64_add",
+            "stmt_src": "theorem bad_u64_add (a : UInt64) : a + 1 = a := by sorry",
+            "bindings": [["a", "0"]],
+            "lhs": "1",
+            "rhs": "0",
+        })
+        .to_string();
+        let certified = query_lean_native_core_worker("eval-cex", Some(&extra)).unwrap();
+        assert_eq!(certified["result"]["certified"], true);
+        assert_eq!(
+            certified["result"]["overallAssurance"],
+            "CertifiedFastCheckEval"
+        );
+        assert_eq!(certified["result"]["falsePositives"], 0);
+
+        let bogus_extra = serde_json::json!({
+            "decl": "good_u64_refl",
+            "stmt_src": "theorem good_u64_refl (a : UInt64) : a = a := by rfl",
+            "bindings": [["a", "0"]],
+            "lhs": "0",
+            "rhs": "1",
+        })
+        .to_string();
+        let uncertified = query_lean_native_core_worker("eval-cex", Some(&bogus_extra)).unwrap();
+        assert_eq!(uncertified["result"]["certified"], false);
+        assert_eq!(
+            uncertified["result"]["overallAssurance"],
+            "FallbackUnverified"
+        );
+        assert_eq!(uncertified["result"]["falsePositives"], 1);
     }
 }

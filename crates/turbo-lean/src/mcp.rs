@@ -1101,9 +1101,7 @@ impl StepVerdict {
             .and_then(|v| v.as_str())
             .unwrap_or(if compact_ok { "ok" } else { "error" })
             .to_string();
-        let is_cex = compact.get("kind").and_then(|v| v.as_str()) == Some("cex")
-            || status == "counterexample_rejected"
-            || status == "counterexample_found";
+        let is_cex = compact.get("kind").and_then(|v| v.as_str()) == Some("cex");
         let res = Self {
             ok: compact_ok,
             status,
@@ -1144,13 +1142,23 @@ pub fn compact_for_llm(verbose: &serde_json::Value) -> serde_json::Value {
         .unwrap_or(1.0);
     let verbose_bytes = serde_json::to_vec(verbose).map(|v| v.len()).unwrap_or(1680);
 
-    let is_cex = status == "counterexample_rejected"
-        || status == "counterexample_found"
-        || verbose
-            .get("violations")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0)
-            > 0;
+    let raw_violations = verbose
+        .get("violations")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let explicitly_uncertified = verbose
+        .get("lean_native_certified")
+        .and_then(|v| v.as_bool())
+        == Some(false);
+    let is_uncertified_violation = status == "uncertified_violation"
+        || (explicitly_uncertified
+            && (raw_violations > 0
+                || status == "counterexample_found"
+                || status == "counterexample_rejected"));
+    let is_cex = !is_uncertified_violation
+        && (status == "counterexample_rejected"
+            || status == "counterexample_found"
+            || raw_violations > 0);
     if is_cex {
         let witness = extract_compact_witness(verbose);
         let fix_hint_opt = verbose
@@ -1185,16 +1193,20 @@ pub fn compact_for_llm(verbose: &serde_json::Value) -> serde_json::Value {
         });
     }
 
-    let is_verified = verbose.get("verified").and_then(|v| v.as_bool()) == Some(true)
-        || matches!(
-            status,
-            "verified"
-                | "theorem_verified"
-                | "theorem_cache_hit"
-                | "all_shards_cached"
-                | "file_verified"
-                | "ok"
-        );
+    let explicitly_unverified = verbose.get("verified").and_then(|v| v.as_bool()) == Some(false)
+        || verbose.get("ok").and_then(|v| v.as_bool()) == Some(false);
+    let is_verified = !is_uncertified_violation
+        && !explicitly_unverified
+        && (verbose.get("verified").and_then(|v| v.as_bool()) == Some(true)
+            || matches!(
+                status,
+                "verified"
+                    | "theorem_verified"
+                    | "theorem_cache_hit"
+                    | "all_shards_cached"
+                    | "file_verified"
+                    | "ok"
+            ));
     if is_verified {
         let stage = if status.contains("cache") || status == "all_shards_cached" {
             "cas_hit"
@@ -1273,6 +1285,22 @@ pub fn execute_fast_check(
     let backend_pref = backend.unwrap_or("auto");
     let decl_name = decl.unwrap_or("fastcheck_decl");
 
+    let f_path_opt = file.filter(|s| !s.trim().is_empty()).map(Path::new);
+    let untrusted_guard_src =
+        "import Init\ntheorem _untrusted_context_guard : True := trivial".to_string();
+    let guard_stmt = |d_name: &str, s: &str, item_file: Option<&Path>| -> String {
+        if crate::gpu_fastcheck::stmt_src_has_trusted_elab_context_for_path(
+            d_name,
+            s,
+            item_file.or(f_path_opt),
+            project_dir,
+        ) {
+            s.to_string()
+        } else {
+            untrusted_guard_src.clone()
+        }
+    };
+
     let mut batch_pairs: Vec<(String, String)> = Vec::new();
     if let Some(arr) = items {
         for (idx, item) in arr.iter().enumerate() {
@@ -1282,15 +1310,24 @@ pub fn execute_fast_check(
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| format!("item_{}", idx));
+            let item_file = item
+                .get("file")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(Path::new);
             if let Some(s) = item.get("stmt_src").and_then(|v| v.as_str()) {
-                batch_pairs.push((d, s.to_string()));
+                let guarded = guard_stmt(&d, s, item_file);
+                batch_pairs.push((d, guarded));
             }
         }
     }
     let mut file_read_err: Option<String> = None;
     if batch_pairs.is_empty() {
         if let Some(stmt) = stmt_src.filter(|s| !s.trim().is_empty()) {
-            batch_pairs.push((decl_name.to_string(), stmt.to_string()));
+            batch_pairs.push((
+                decl_name.to_string(),
+                guard_stmt(decl_name, stmt, f_path_opt),
+            ));
         } else if let Some(f_str) = file.filter(|s| !s.trim().is_empty()) {
             let f_path = Path::new(f_str);
             match fs::read_to_string(f_path) {
@@ -1304,14 +1341,23 @@ pub fn execute_fast_check(
                         Some(f_path),
                         project_dir,
                     );
-                    if !decls.is_empty() && decls.iter().all(|d| !d.trusted_elab_context) {
-                        batch_pairs.push((
-                            decl_name.to_string(),
-                            "import Init\ntheorem _untrusted_context_guard : True := trivial"
-                                .to_string(),
-                        ));
+                    if decls.is_empty() {
+                        batch_pairs.push((decl_name.to_string(), untrusted_guard_src.clone()));
                     } else {
-                        batch_pairs.push((decl_name.to_string(), src_text));
+                        for d in decls {
+                            let decl_id = if d.qualified_name.is_empty() {
+                                d.name.clone()
+                            } else {
+                                d.qualified_name.clone()
+                            };
+                            let stmt_payload =
+                                if d.trusted_elab_context && d.instance_binders.is_empty() {
+                                    d.render_scoped_stmt_src()
+                                } else {
+                                    untrusted_guard_src.clone()
+                                };
+                            batch_pairs.push((decl_id, stmt_payload));
+                        }
                     }
                 }
                 Err(e) => {
@@ -2595,5 +2641,36 @@ mod tests {
         let compact = verdict.to_compact_json();
         assert_eq!(compact["ok"], true);
         assert_eq!(compact["fast_tactic"], "by simp only [eligible, Eligible]");
+    }
+
+    #[test]
+    fn test_uncertified_violation_verdict_is_consistent_non_cex_error() {
+        for verbose in [
+            serde_json::json!({
+                "status": "uncertified_violation",
+                "ok": false,
+                "verified": false,
+                "decl": "suspect_thm",
+                "violations": 3,
+                "lean_native_certified": false,
+                "error": "Candidate violation could not be certified locally"
+            }),
+            serde_json::json!({
+                "status": "ok",
+                "ok": true,
+                "verified": true,
+                "decl": "suspect_thm",
+                "violations": 1,
+                "lean_native_certified": false
+            }),
+        ] {
+            let verdict = StepVerdict::from_verbose(verbose);
+            assert!(!verdict.ok);
+            assert!(!verdict.is_cex);
+            assert_eq!(verdict.to_full_json()["ok"], false);
+            let compact = verdict.to_compact_json();
+            assert_eq!(compact["ok"], false);
+            assert_eq!(compact["kind"], "error");
+        }
     }
 }

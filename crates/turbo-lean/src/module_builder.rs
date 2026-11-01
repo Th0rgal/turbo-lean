@@ -4507,7 +4507,10 @@ pub fn resolve_package_config(pkg_root: &Path, is_root_pkg: bool) -> Result<Pack
 }
 /// The configuration file Lake loads for a package: `config_file` (a manifest `configFile`,
 /// default `lakefile`) as given if it has an extension, else its `.lean` before its `.toml`.
-fn package_config_path(pkg_root: &Path, config_file: Option<&str>) -> Result<Option<PathBuf>> {
+pub(crate) fn package_config_path(
+    pkg_root: &Path,
+    config_file: Option<&str>,
+) -> Result<Option<PathBuf>> {
     let rel = lake_rel_path("configFile", config_file.unwrap_or("lakefile"))?;
     if rel.extension().is_some() {
         return Ok(Some(pkg_root.join(rel)).filter(|p| p.is_file()));
@@ -4517,7 +4520,7 @@ fn package_config_path(pkg_root: &Path, config_file: Option<&str>) -> Result<Opt
         .map(|ext| pkg_root.join(&rel).with_extension(ext))
         .find(|p| p.is_file()))
 }
-fn resolve_package_config_file(
+pub(crate) fn resolve_package_config_file(
     pkg_root: &Path,
     is_root_pkg: bool,
     config_file: Option<&str>,

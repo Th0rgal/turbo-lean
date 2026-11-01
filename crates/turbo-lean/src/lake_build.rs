@@ -151,7 +151,11 @@ pub(crate) fn spawn_lake_env(project_dir: &Path) -> Result<HashMap<String, Strin
             "{diagnostic}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let prefix = PathBuf::from(String::from_utf8(output.stdout).with_context(|| diagnostic)?.trim());
+        let prefix = PathBuf::from(
+            String::from_utf8(output.stdout)
+                .with_context(|| diagnostic)?
+                .trim(),
+        );
         anyhow::ensure!(
             prefix.is_absolute()
                 && prefix.join("bin/lean").is_file()
@@ -956,6 +960,24 @@ pub(crate) fn resolve_project_lean_source(project_dir: &Path, rel_slash: &str) -
         return None;
     }
     let rel_file = format!("{}.lean", rel_slash);
+    if let Ok(Some(pkg)) = crate::module_builder::optional_package_config(project_dir) {
+        let pkg_src_base = project_dir.join(&pkg.src_dir);
+        let cand_base = pkg_src_base.join(&rel_file);
+        if cand_base.is_file() {
+            return Some(cand_base);
+        }
+        for sd in pkg
+            .libs
+            .iter()
+            .filter_map(|l| l.src_dir.as_ref())
+            .chain(pkg.exes.iter().filter_map(|e| e.src_dir.as_ref()))
+        {
+            let cand = pkg_src_base.join(sd).join(&rel_file);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
     let direct = project_dir.join(&rel_file);
     if direct.is_file() {
         return Some(direct);
@@ -1157,14 +1179,14 @@ pub(crate) struct ShmProjectStatSummary {
 }
 
 pub(crate) fn shm_file_splits_dir(store: &TurboStore) -> PathBuf {
-    let dir = store.fast_staging_dir().join("file_splits_v3");
+    let dir = store.fast_staging_dir().join("file_splits_v4");
     let _ = fs::create_dir_all(&dir);
     dir
 }
 
 pub(crate) fn compute_single_stat_hash(pk: &str, ms: i64, mn: i64, sz: i64) -> String {
     let mut h = blake3::Hasher::new();
-    h.update(b"single-stat-split:v3\n");
+    h.update(b"single-stat-split:v4\n");
     h.update(pk.as_bytes());
     h.update(b":");
     h.update(&ms.to_le_bytes());
@@ -1190,7 +1212,7 @@ pub(crate) fn compact_split_for_shm_cache(split: &splitter::SplitResult) -> spli
 
 pub(crate) fn compute_stat_slice_hash(stats: &[(String, i64, i64, i64)]) -> String {
     let mut h = blake3::Hasher::new();
-    h.update(b"project-stat-splits:v3\n");
+    h.update(b"project-stat-splits:v4\n");
     for (pk, ms, mn, sz) in stats {
         h.update(pk.as_bytes());
         h.update(b":");
@@ -1225,7 +1247,7 @@ pub(crate) fn load_project_stat_summary_cached(
         let stat_hash = compute_stat_slice_hash(&valid_stats);
         let p = store
             .fast_staging_dir()
-            .join(format!("project_stat_summary_v2_{}.json", &stat_hash[..24]));
+            .join(format!("project_stat_summary_v3_{}.json", &stat_hash[..24]));
         if let Ok(bytes) = fs::read(&p) {
             if let Ok(summary) = serde_json::from_slice::<ShmProjectStatSummary>(&bytes) {
                 if summary.total_files == paths.len() {
@@ -1363,7 +1385,7 @@ pub(crate) fn load_and_split_files_with_hashes_cached(
         let stat_hash = compute_stat_slice_hash(&valid_stats);
         let p = store
             .fast_staging_dir()
-            .join(format!("project_stat_splits_v3_{}.json", &stat_hash[..24]));
+            .join(format!("project_stat_splits_v4_{}.json", &stat_hash[..24]));
         if let Ok(bytes) = fs::read(&p) {
             if let Ok(cached_entries) = serde_json::from_slice::<Vec<ShmCachedFileSplit>>(&bytes) {
                 if cached_entries.len() == paths.len()
@@ -1538,13 +1560,13 @@ pub(crate) fn split_and_audit_with_hashes_cached(
 
     let shm_proj_path = if files.len() <= 128 {
         let mut ch = blake3::Hasher::new();
-        ch.update(b"project-content-splits:v3\n");
+        ch.update(b"project-content-splits:v4\n");
         for (_, fk) in &file_keys {
             ch.update(fk.as_bytes());
             ch.update(b"\n");
         }
         let p = store.fast_staging_dir().join(format!(
-            "project_splits_v3_{}.json",
+            "project_splits_v4_{}.json",
             &ch.finalize().to_hex()[..24]
         ));
         if let Ok(bytes) = fs::read(&p) {
@@ -1671,7 +1693,7 @@ pub(crate) fn split_and_audit_with_hashes_cached(
         let stat_hash = compute_stat_slice_hash(&valid_stats);
         let stat_p = store
             .fast_staging_dir()
-            .join(format!("project_stat_splits_v3_{}.json", &stat_hash[..24]));
+            .join(format!("project_stat_splits_v4_{}.json", &stat_hash[..24]));
         if !stat_p.exists() || !new_splits.is_empty() {
             let compacts: Vec<ShmCachedFileSplit> = results
                 .iter()
@@ -4000,7 +4022,11 @@ mod tests {
             assert_eq!(fs::metadata(&wt_local)?.permissions().mode() & 0o777, 0o600);
         }
         for (path, bytes) in &main_lake_bytes {
-            assert_eq!(&fs::read(path)?, bytes, "opt-out must not copy or rewrite main `.lake`");
+            assert_eq!(
+                &fs::read(path)?,
+                bytes,
+                "opt-out must not copy or rewrite main `.lake`"
+            );
         }
         #[cfg(unix)]
         {

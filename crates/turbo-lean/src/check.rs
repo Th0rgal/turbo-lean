@@ -52,7 +52,7 @@ fn cache_shm_stat_split(
         let st_path = shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
         let src_b3 = blake3::hash(active_src.as_bytes()).to_hex().to_string();
         let entry = ShmCachedFileSplit {
-            split_key: format!("file-split:v3:{}", src_b3),
+            split_key: format!("file-split:v4:{}", src_b3),
             src_blake3: src_b3,
             split: compact_split_for_shm_cache(split),
             prefix_src: String::new(),
@@ -718,8 +718,12 @@ fn run_check_command_inner(
         crate::shm_cache::read_shm_or_disk_spill(st_path, Some(&disk_spill_dir))
             .and_then(|bytes| serde_json::from_slice::<ShmCachedFileSplit>(&bytes).ok())
             .filter(|c| {
-                compute_imported_olean_interface_hashes(&c.split.imports_header, &canon_dir, None)
-                    == c.dep_hashes
+                c.split_key.starts_with("file-split:v4:")
+                    && compute_imported_olean_interface_hashes(
+                        &c.split.imports_header,
+                        &canon_dir,
+                        None,
+                    ) == c.dep_hashes
             })
     };
     let mut stat_cached_entry = st_paths_opt
@@ -761,7 +765,7 @@ fn run_check_command_inner(
             let dep_hashes =
                 compute_imported_olean_interface_hashes(&fast_sp.imports_header, &canon_dir, None);
             let entry = ShmCachedFileSplit {
-                split_key: String::new(),
+                split_key: "file-split:v4:partial".to_string(),
                 src_blake3: String::new(),
                 split: compact_split_for_shm_cache(&fast_sp),
                 prefix_src: pref_src.clone(),
@@ -783,7 +787,7 @@ fn run_check_command_inner(
             let src_b3 = blake3::hash(loaded_src.as_bytes()).to_hex().to_string();
             if let Some((ref st_path, _)) = st_paths_opt {
                 let entry = ShmCachedFileSplit {
-                    split_key: format!("file-split:v3:{}", src_b3),
+                    split_key: format!("file-split:v4:{}", src_b3),
                     src_blake3: src_b3.clone(),
                     split: compact_split_for_shm_cache(&sp),
                     prefix_src: String::new(),
@@ -820,9 +824,9 @@ fn run_check_command_inner(
                 }
                 let entry = ShmCachedFileSplit {
                     split_key: if src_b3.is_empty() {
-                        String::new()
+                        "file-split:v4:partial".to_string()
                     } else {
-                        format!("file-split:v3:{}", src_b3)
+                        format!("file-split:v4:{}", src_b3)
                     },
                     src_blake3: src_b3,
                     split: compact_split_for_shm_cache(&fast_res.0),
@@ -1527,11 +1531,12 @@ fn check_single_decl(
                     )
                     .and_then(|b| serde_json::from_slice::<ShmCachedFileSplit>(&b).ok())
                     .filter(|c| {
-                        compute_imported_olean_interface_hashes(
-                            &c.split.imports_header,
-                            canon_dir,
-                            None,
-                        ) == c.dep_hashes
+                        c.split_key.starts_with("file-split:v4:")
+                            && compute_imported_olean_interface_hashes(
+                                &c.split.imports_header,
+                                canon_dir,
+                                None,
+                            ) == c.dep_hashes
                     })
                     .map(|c| {
                         let cb3 = (!c.src_blake3.is_empty()).then_some(c.src_blake3);
@@ -1564,7 +1569,7 @@ fn check_single_decl(
                         let st_path =
                             shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
                         let entry = ShmCachedFileSplit {
-                            split_key: format!("file-split:v3:{}", sub_b3),
+                            split_key: format!("file-split:v4:{}", sub_b3),
                             src_blake3: sub_b3.clone(),
                             split: compact_split_for_shm_cache(&sub_split),
                             prefix_src: if sub_src.len() <= 64 * 1024 {

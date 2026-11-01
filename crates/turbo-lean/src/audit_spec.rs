@@ -2914,6 +2914,78 @@ fn canonical_allowlisted_module_blake3(mod_name: &str) -> Option<blake3::Hash> {
     Some(blake3::hash(canonical_src.as_bytes()))
 }
 
+fn package_module_ok(
+    pkg_dir: &Path,
+    config_file: Option<&str>,
+    rel_slash: &str,
+    rel_lean: &str,
+    rel_olean: &str,
+    expected_hash: blake3::Hash,
+) -> Option<bool> {
+    let cfg_opt = match crate::module_builder::package_config_path(pkg_dir, config_file) {
+        Ok(Some(_)) => {
+            match crate::module_builder::resolve_package_config_file(pkg_dir, false, config_file) {
+                Ok(cfg) => Some(cfg),
+                Err(_) => return None,
+            }
+        }
+        Ok(None) => None,
+        Err(_) => return None,
+    };
+    if cfg_opt.as_ref().is_some_and(|c| c.unsupported.is_some()) {
+        return None;
+    }
+
+    let mut lean_cands = Vec::new();
+    let mut push_unique = |p: PathBuf| {
+        if p.is_file() && !lean_cands.contains(&p) {
+            lean_cands.push(p);
+        }
+    };
+    if let Some(ref cfg) = cfg_opt {
+        let base = pkg_dir.join(&cfg.src_dir);
+        push_unique(base.join(rel_lean));
+        for sd in cfg
+            .libs
+            .iter()
+            .filter_map(|l| l.src_dir.as_ref())
+            .chain(cfg.exes.iter().filter_map(|e| e.src_dir.as_ref()))
+        {
+            push_unique(base.join(sd).join(rel_lean));
+        }
+    }
+    if let Some(resolved) = crate::lake_build::resolve_project_lean_source(pkg_dir, rel_slash) {
+        push_unique(resolved);
+    }
+
+    let mut verified_source = false;
+    for cand in lean_cands {
+        let Ok(bytes) = fs::read(&cand) else {
+            return None;
+        };
+        if blake3::hash(&bytes) != expected_hash {
+            return None;
+        }
+        verified_source = true;
+    }
+
+    let mut olean_cands = vec![pkg_dir.join(".lake/build/lib/lean").join(rel_olean)];
+    if let Some(ref cfg) = cfg_opt {
+        let custom_olean = pkg_dir
+            .join(&cfg.build_dir)
+            .join(&cfg.lean_lib_dir)
+            .join(rel_olean);
+        if !olean_cands.contains(&custom_olean) {
+            olean_cands.push(custom_olean);
+        }
+    }
+    if olean_cands.iter().any(|p| p.is_file()) && !verified_source {
+        return None;
+    }
+
+    Some(verified_source)
+}
+
 pub(crate) fn allowlisted_imports_match_canonical_in_dir(
     imported_modules: &[String],
     project_dir: Option<&Path>,
@@ -2935,51 +3007,54 @@ pub(crate) fn allowlisted_imports_match_canonical_in_dir(
         let rel_slash = crate::module_builder::module_name_to_rel_slash(&mod_name);
         let rel_lean = format!("{}.lean", rel_slash);
         let rel_olean = format!("{}.olean", rel_slash);
-        let mut verified_local_source = false;
 
         if let Some(proj) = project_dir.filter(|p| !p.as_os_str().is_empty()) {
-            let mut local_lean_cands = Vec::new();
-            if let Some(resolved) = crate::lake_build::resolve_project_lean_source(proj, &rel_slash)
+            if package_module_ok(proj, None, &rel_slash, &rel_lean, &rel_olean, expected_hash)
+                .is_none()
             {
-                local_lean_cands.push(resolved);
-            }
-            let pkgs_dir = proj.join(".lake/packages");
-            if let Ok(entries) = fs::read_dir(&pkgs_dir) {
-                for entry in entries.flatten() {
-                    if let Some(pkg_src) =
-                        crate::lake_build::resolve_project_lean_source(&entry.path(), &rel_slash)
-                    {
-                        local_lean_cands.push(pkg_src);
-                    }
-                }
-            }
-            for cand in local_lean_cands {
-                let Ok(bytes) = fs::read(&cand) else {
-                    return false;
-                };
-                if blake3::hash(&bytes) != expected_hash {
-                    return false;
-                }
-                verified_local_source = true;
-            }
-            let local_olean = proj.join(".lake/build/lib/lean").join(&rel_olean);
-            if local_olean.is_file() && !verified_local_source {
                 return false;
             }
-            if let Ok(entries) = fs::read_dir(&pkgs_dir) {
-                for entry in entries.flatten() {
-                    let pkg_olean = entry.path().join(".lake/build/lib/lean").join(&rel_olean);
-                    if pkg_olean.is_file() {
-                        let pkg_lean_ok = crate::lake_build::resolve_project_lean_source(
-                            &entry.path(),
-                            &rel_slash,
-                        )
-                        .and_then(|p| fs::read(p).ok())
-                        .is_some_and(|b| blake3::hash(&b) == expected_hash);
-                        if !pkg_lean_ok {
-                            return false;
-                        }
+            let root_cfg_opt = match crate::module_builder::optional_package_config(proj) {
+                Ok(cfg) => cfg,
+                Err(_) => return false,
+            };
+            let (manifest_pkgs_dir, manifest_entries, _) =
+                match crate::module_builder::parse_lake_manifest(proj, false) {
+                    Ok(m) => m,
+                    Err(_) => return false,
+                };
+            let mut dep_dirs: Vec<(PathBuf, Option<String>)> = Vec::new();
+            let mut push_dep = |d: PathBuf, cf: Option<String>| {
+                if d.is_dir() && !dep_dirs.iter().any(|(x, _)| x == &d) {
+                    dep_dirs.push((d, cf));
+                }
+            };
+            for mp in manifest_entries {
+                push_dep(mp.dir, mp.config_file);
+            }
+            let mut pkgs_roots = vec![proj.join(".lake/packages"), proj.join(&manifest_pkgs_dir)];
+            if let Some(ref rcfg) = root_cfg_opt {
+                pkgs_roots.push(proj.join(&rcfg.packages_dir));
+            }
+            for pkgs_dir in pkgs_roots {
+                if let Ok(entries) = fs::read_dir(&pkgs_dir) {
+                    for entry in entries.flatten() {
+                        push_dep(entry.path(), None);
                     }
+                }
+            }
+            for (dep_dir, dep_cfg) in dep_dirs {
+                if package_module_ok(
+                    &dep_dir,
+                    dep_cfg.as_deref(),
+                    &rel_slash,
+                    &rel_lean,
+                    &rel_olean,
+                    expected_hash,
+                )
+                .is_none()
+                {
+                    return false;
                 }
             }
         }
@@ -3000,14 +3075,16 @@ pub(crate) fn allowlisted_imports_match_canonical_in_dir(
                         return false;
                     }
                 } else if cand_olean.is_file() {
-                    let root_lean_ok = dir
-                        .ancestors()
-                        .take(5)
-                        .find_map(|anc| {
-                            crate::lake_build::resolve_project_lean_source(anc, &rel_slash)
-                        })
-                        .and_then(|p| fs::read(p).ok())
-                        .is_some_and(|b| blake3::hash(&b) == expected_hash);
+                    let root_lean_ok = dir.ancestors().take(5).any(|anc| {
+                        package_module_ok(
+                            anc,
+                            None,
+                            &rel_slash,
+                            &rel_lean,
+                            &rel_olean,
+                            expected_hash,
+                        ) == Some(true)
+                    });
                     if !root_lean_ok {
                         return false;
                     }
@@ -3029,6 +3106,11 @@ pub(crate) fn enforce_decl_import_integrity_for_path(
         .or_else(|| {
             file.filter(|f| f.exists() || f.parent().is_some_and(Path::exists))
                 .map(crate::lake_build::infer_project_dir_from_lean_file)
+        })
+        .or_else(|| {
+            std::env::current_dir().ok().map(|cwd| {
+                crate::lake_build::infer_project_dir_from_lean_file(&cwd.join("_probe.lean"))
+            })
         });
     for d in decls {
         if d.trusted_elab_context

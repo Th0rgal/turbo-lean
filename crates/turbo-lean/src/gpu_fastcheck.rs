@@ -190,10 +190,10 @@ fn is_ident_continue(c: char) -> bool {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExtractedDecl {
-    name: String,
-    qualified_name: String,
+    pub(crate) name: String,
+    pub(crate) qualified_name: String,
     binders: Vec<(Vec<String>, String)>,
-    instance_binders: Vec<String>,
+    pub(crate) instance_binders: Vec<String>,
     prop_str: String,
     pub(crate) trusted_elab_context: bool,
     scope: DeclScopeContext,
@@ -1562,7 +1562,9 @@ fn emit_cuda_expr_with_ctx(
                 .unwrap_or(fname.as_str())
                 .rsplit_once('.')
                 .map(|(p, _)| p);
-            if !cuda_fn_prefix_allowed(prefix, scalar_dom, ambient_bv256) {
+            if !(prefix == Some("Nat") && short == "beq" && args.len() == 2)
+                && !cuda_fn_prefix_allowed(prefix, scalar_dom, ambient_bv256)
+            {
                 bail!(
                     "Lean function `{}` does not match the scalar evaluation domain",
                     fname
@@ -1603,7 +1605,8 @@ fn emit_cuda_expr_with_ctx(
                         is_int: false,
                         is_bitvec: false,
                     })
-                } else if (short == "ofNat" && i == 0)
+                } else if prefix == Some("Nat")
+                    || (short == "ofNat" && i == 0)
                     || (short == "ofNat" && prefix == Some("BitVec") && i == 1)
                     || (matches!(
                         short,
@@ -1624,8 +1627,11 @@ fn emit_cuda_expr_with_ctx(
                     scope,
                 )?);
             }
+            let is_nat_call =
+                prefix == Some("Nat") || (prefix.is_none() && scalar_dom.is_some_and(|d| d.is_nat));
             if short == "succ" && matches!(prefix, None | Some("Nat")) && c_args.len() == 1 {
-                return Ok(wrap_out(format!("lean_add({}, 1ULL)", c_args[0])));
+                let fn_name = if is_nat_call { "nat_add" } else { "lean_add" };
+                return Ok(wrap_out(format!("{}({}, 1ULL)", fn_name, c_args[0])));
             }
             let is_bitvec_prefix = prefix == Some("BitVec");
             let is_nat_or_bool_prefix = matches!(prefix, Some("Nat" | "Bool"));
@@ -1697,20 +1703,62 @@ fn emit_cuda_expr_with_ctx(
                     "lean_bitnot"
                 }
                 ("not", 1) if is_bitvec_prefix => "lean_bitnot",
-                ("bitAnd" | "land", 2) if !is_bitvec_prefix => "lean_bitand",
+                ("bitAnd" | "land", 2) if !is_bitvec_prefix => {
+                    if is_nat_call {
+                        "nat_bitand"
+                    } else {
+                        "lean_bitand"
+                    }
+                }
                 ("and", 2) if is_bitvec_prefix => "lean_bitand",
-                ("bitOr" | "lor", 2) if !is_bitvec_prefix => "lean_bitor",
+                ("bitOr" | "lor", 2) if !is_bitvec_prefix => {
+                    if is_nat_call {
+                        "nat_bitor"
+                    } else {
+                        "lean_bitor"
+                    }
+                }
                 ("or", 2) if is_bitvec_prefix => "lean_bitor",
-                ("bitXor" | "xor", 2) => "lean_bitxor",
-                ("add", 2) => "lean_add",
-                ("sub", 2) => "lean_sub",
-                ("mul", 2) => "lean_mul",
+                ("bitXor" | "xor", 2) => {
+                    if is_nat_call {
+                        "nat_bitxor"
+                    } else {
+                        "lean_bitxor"
+                    }
+                }
+                ("add", 2) => {
+                    if is_nat_call {
+                        "nat_add"
+                    } else {
+                        "lean_add"
+                    }
+                }
+                ("sub", 2) => {
+                    if is_nat_call {
+                        "nat_sub"
+                    } else {
+                        "lean_sub"
+                    }
+                }
+                ("mul", 2) => {
+                    if is_nat_call {
+                        "nat_mul"
+                    } else {
+                        "lean_mul"
+                    }
+                }
                 ("addChecked", 2) if uint256_fn => "u256_add_checked_opt",
                 ("subChecked", 2) if uint256_fn => "u256_sub_checked_opt",
                 ("mulChecked", 2) if uint256_fn => "u256_mul_checked_opt",
                 ("div", 2) if uint256_fn => "u256_div_opt",
                 ("mod", 2) if uint256_fn => "u256_mod_opt",
-                ("div", 2) if !is_bitvec_prefix && !word256_fn && !uint256_fn => "lean_div",
+                ("div", 2) if !is_bitvec_prefix && !word256_fn && !uint256_fn => {
+                    if is_nat_call {
+                        "nat_div"
+                    } else {
+                        "lean_div"
+                    }
+                }
                 ("udiv", 2) if is_bitvec_prefix => {
                     if scalar_dom.is_none() && ambient_bv256 {
                         "bv256_udiv"
@@ -1718,7 +1766,13 @@ fn emit_cuda_expr_with_ctx(
                         "lean_div"
                     }
                 }
-                ("mod", 2) if !is_bitvec_prefix && !word256_fn && !uint256_fn => "lean_mod",
+                ("mod", 2) if !is_bitvec_prefix && !word256_fn && !uint256_fn => {
+                    if is_nat_call {
+                        "nat_mod"
+                    } else {
+                        "lean_mod"
+                    }
+                }
                 ("umod", 2) if is_bitvec_prefix => {
                     if scalar_dom.is_none() && ambient_bv256 {
                         "bv256_umod"
@@ -1734,7 +1788,9 @@ fn emit_cuda_expr_with_ctx(
                 ("lt", 2) if uint256_fn => "lean_lt",
                 ("le", 2) if uint256_fn => "lean_le",
                 ("shiftLeft", 2) if prefix.is_none() || !is_u256_fn_prefix(prefix.unwrap()) => {
-                    if nat_shift && scalar_dom.is_some() {
+                    if is_nat_call {
+                        "nat_shl"
+                    } else if nat_shift && scalar_dom.is_some() {
                         "lean_shl_nat"
                     } else {
                         "lean_shl"
@@ -1744,7 +1800,11 @@ fn emit_cuda_expr_with_ctx(
                     if !is_bitvec_prefix
                         && (prefix.is_none() || !is_u256_fn_prefix(prefix.unwrap())) =>
                 {
-                    "lean_shr"
+                    if is_nat_call {
+                        "nat_shr"
+                    } else {
+                        "lean_shr"
+                    }
                 }
                 ("ushiftRight", 2) if is_bitvec_prefix => {
                     if nat_shift && scalar_dom.is_some() {
@@ -1753,7 +1813,13 @@ fn emit_cuda_expr_with_ctx(
                         "lean_shr"
                     }
                 }
-                ("beq", 2) if prefix.is_none() || is_nat_or_bool_prefix => "lean_eq",
+                ("beq", 2) if prefix.is_none() || is_nat_or_bool_prefix => {
+                    if is_nat_call {
+                        "nat_eq"
+                    } else {
+                        "lean_eq"
+                    }
+                }
                 ("bitMux", 3) if word256_fn => "u256_bit_mux",
                 ("bitMaj", 3) if word256_fn => "u256_bit_maj",
                 ("bitParity", 3) if word256_fn => "u256_bit_parity",
@@ -1995,12 +2061,21 @@ pub fn transpile_lean_theorem_to_cuda(
     lean_src: &str,
     decl_name: Option<&str>,
 ) -> Result<TranspiledCudaKernel> {
+    transpile_lean_theorem_to_cuda_for_path(lean_src, decl_name, None, None)
+}
+
+pub(crate) fn transpile_lean_theorem_to_cuda_for_path(
+    lean_src: &str,
+    decl_name: Option<&str>,
+    file: Option<&Path>,
+    project_dir: Option<&Path>,
+) -> Result<TranspiledCudaKernel> {
     let clean = strip_lean_comments(lean_src);
     let mut extracted = extract_lean_theorem(&clean, decl_name)?;
     audit_spec::enforce_decl_import_integrity_for_path(
         std::slice::from_mut(&mut extracted),
-        None,
-        None,
+        file,
+        project_dir,
     );
     if !extracted.trusted_elab_context {
         bail!(
@@ -2637,8 +2712,16 @@ HD uint64_t lean_mul(uint64_t a, uint64_t b) {{
     return ((a & SCALAR_MASK) * (b & SCALAR_MASK)) & SCALAR_MASK;
 }}
 
-HD uint64_t lean_div(uint64_t a, uint64_t b) {{ uint64_t bm = b & SCALAR_MASK; return bm == 0 ? 0ULL : (((a & SCALAR_MASK) / bm) & SCALAR_MASK); }}
-HD uint64_t lean_mod(uint64_t a, uint64_t b) {{ uint64_t am = a & SCALAR_MASK, bm = b & SCALAR_MASK; return bm == 0 ? am : ((am % bm) & SCALAR_MASK); }}
+HD uint64_t lean_div(uint64_t a, uint64_t b) {{
+    if (IS_NAT) {{ return b == 0ULL ? 0ULL : (a / b); }}
+    uint64_t bm = b & SCALAR_MASK;
+    return bm == 0 ? 0ULL : (((a & SCALAR_MASK) / bm) & SCALAR_MASK);
+}}
+HD uint64_t lean_mod(uint64_t a, uint64_t b) {{
+    if (IS_NAT) {{ return b == 0ULL ? a : (a % b); }}
+    uint64_t am = a & SCALAR_MASK, bm = b & SCALAR_MASK;
+    return bm == 0 ? am : ((am % bm) & SCALAR_MASK);
+}}
 HD uint64_t nat_bitand(uint64_t a, uint64_t b) {{ return a & b; }}
 HD uint64_t nat_bitor(uint64_t a, uint64_t b) {{ return a | b; }}
 HD uint64_t nat_bitxor(uint64_t a, uint64_t b) {{ return a ^ b; }}
@@ -4355,13 +4438,31 @@ pub fn lower_decl_to_lnir_wire(
 }
 
 pub(crate) fn stmt_src_has_trusted_elab_context(decl_name: &str, stmt_src: &str) -> bool {
-    extract_decl_from_stmt_src(decl_name, stmt_src)
+    stmt_src_has_trusted_elab_context_for_path(decl_name, stmt_src, None, None)
+}
+
+pub(crate) fn stmt_src_has_trusted_elab_context_for_path(
+    decl_name: &str,
+    stmt_src: &str,
+    file: Option<&Path>,
+    project_dir: Option<&Path>,
+) -> bool {
+    extract_decl_from_stmt_src_for_path(decl_name, stmt_src, file, project_dir)
         .is_ok_and(|d| d.trusted_elab_context && d.instance_binders.is_empty())
 }
 
 fn extract_decl_from_stmt_src(
     decl_name: &str,
     stmt_src: &str,
+) -> Result<ExtractedDecl, &'static str> {
+    extract_decl_from_stmt_src_for_path(decl_name, stmt_src, None, None)
+}
+
+fn extract_decl_from_stmt_src_for_path(
+    decl_name: &str,
+    stmt_src: &str,
+    file: Option<&Path>,
+    project_dir: Option<&Path>,
 ) -> Result<ExtractedDecl, &'static str> {
     let trimmed_decl = decl_name.trim();
     let explicit_target = (!trimmed_decl.is_empty()
@@ -4376,7 +4477,11 @@ fn extract_decl_from_stmt_src(
         return Err("statement_required");
     }
     let clean = strip_lean_comments(s);
-    let mut decl = if !extract_all_lean_theorems(&clean, None).is_empty() {
+    let all_theorems = extract_all_lean_theorems(&clean, None);
+    let mut decl = if !all_theorems.is_empty() {
+        if explicit_target.is_none() && all_theorems.iter().any(|d| !d.trusted_elab_context) {
+            return Err("statement_not_evaluated");
+        }
         extract_lean_theorem(&clean, explicit_target).map_err(|_| "statement_not_evaluated")?
     } else {
         let clean_trim = clean.trim();
@@ -4394,7 +4499,11 @@ fn extract_decl_from_stmt_src(
                 .map_err(|_| "statement_not_evaluated")?
         }
     };
-    audit_spec::enforce_decl_import_integrity_for_path(std::slice::from_mut(&mut decl), None, None);
+    audit_spec::enforce_decl_import_integrity_for_path(
+        std::slice::from_mut(&mut decl),
+        file,
+        project_dir,
+    );
     Ok(decl)
 }
 
@@ -5269,7 +5378,7 @@ pub fn run_tpu_fast_check(json: bool, file: &Path, decl_filter: Option<&str>) ->
             );
         }
     }
-    let kernel = transpile_lean_theorem_to_cuda(&src_text, eff_filter)?;
+    let kernel = transpile_lean_theorem_to_cuda_for_path(&src_text, eff_filter, Some(file), None)?;
     let n_states = 262_144u64;
     let mut report = execute_transpiled_cuda_kernel(&kernel, n_states, false)?;
     let (certified, engine_ver, cert_details) =
@@ -5343,8 +5452,9 @@ pub fn run_tpu_fast_check(json: bool, file: &Path, decl_filter: Option<&str>) ->
 
     report.backend = "tpu_v5e_xla".to_string();
     report.gpu_device = tpu_device.clone();
-    if !certified {
-        report.verified = true;
+    let raw_violations = report.violations;
+    let uncertified_violation = !report.verified && !certified;
+    if uncertified_violation {
         report.violations = 0;
         report.counterexample = None;
     }
@@ -5357,6 +5467,11 @@ pub fn run_tpu_fast_check(json: bool, file: &Path, decl_filter: Option<&str>) ->
             "OK tpu_fastcheck decl={} states={} ms={:.1}",
             report.decl_name, report.n_states, elapsed_ms
         )
+    } else if uncertified_violation {
+        format!(
+            "UNCERTIFIED tpu_fastcheck decl={} raw_violations={} ms={:.1}",
+            report.decl_name, raw_violations, elapsed_ms
+        )
     } else {
         format!(
             "CEX tpu_fastcheck decl={} violations={} ms={:.1}",
@@ -5368,7 +5483,14 @@ pub fn run_tpu_fast_check(json: bool, file: &Path, decl_filter: Option<&str>) ->
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "status": if report.verified { "ok" } else { "counterexample_found" },
+                "status": if report.verified {
+                    "ok"
+                } else if uncertified_violation {
+                    "uncertified_violation"
+                } else {
+                    "counterexample_found"
+                },
+                "ok": report.verified,
                 "backend": "tpu_v5e_xla",
                 "tpu_device": tpu_device,
                 "tpu_xla_mlir_lowered": true,
@@ -5383,7 +5505,11 @@ pub fn run_tpu_fast_check(json: bool, file: &Path, decl_filter: Option<&str>) ->
                 "lean_native_certified": certified,
                 "lean_native_engine_version": engine_ver,
                 "certification_details": cert_details,
-                "false_positives": 0,
+                "false_positives": if uncertified_violation { raw_violations } else { 0 },
+                "error": uncertified_violation.then(|| format!(
+                    "Uncertified kernel violation on `{}` ({} raw violations failed in-process certification)",
+                    report.decl_name, raw_violations
+                )),
                 "compact_summary": compact_summary,
                 "elapsed_ms": elapsed_ms,
             }))?
@@ -5393,13 +5519,18 @@ pub fn run_tpu_fast_check(json: bool, file: &Path, decl_filter: Option<&str>) ->
             "[turbo-lean] TPU-XLA FAST-CHECK PASSED on `{}` ({} states in {:.3} ms, {:.2} M states/s, device={})",
             report.decl_name, report.n_states, report.kernel_ms, report.throughput_mstates_s, tpu_device
         );
+    } else if uncertified_violation {
+        println!(
+            "[turbo-lean] TPU-XLA FAST-CHECK UNCERTIFIED VIOLATION on `{}` ({} raw violations in {:.3} ms failed certification)",
+            report.decl_name, raw_violations, report.kernel_ms
+        );
     } else {
         println!(
             "[turbo-lean] TPU-XLA FAST-CHECK COUNTEREXAMPLE FOUND on `{}` ({} violations in {:.3} ms, certified={}): {:?}",
             report.decl_name, report.violations, report.kernel_ms, certified, report.counterexample
         );
     }
-    if !report.verified && certified {
+    if !report.verified {
         std::process::exit(1);
     }
     Ok(())
@@ -5444,15 +5575,17 @@ pub fn run_fast_check_command(
                 );
             }
         }
-        let kernel = transpile_lean_theorem_to_cuda(&src_text, decl_filter)?;
+        let kernel =
+            transpile_lean_theorem_to_cuda_for_path(&src_text, decl_filter, Some(&file), None)?;
         let n_states = if Path::new("/usr/local/cuda/bin/nvcc").exists() {
             10_000_000
         } else {
             100_000
         };
         let mut report = execute_transpiled_cuda_kernel(&kernel, n_states, true)?;
-        if !report.verified && !report.lean_native_certified {
-            report.verified = true;
+        let raw_violations = report.violations;
+        let uncertified_violation = !report.verified && !report.lean_native_certified;
+        if uncertified_violation {
             report.violations = 0;
             report.counterexample = None;
         }
@@ -5461,7 +5594,14 @@ pub fn run_fast_check_command(
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
-                    "status": if report.verified { "ok" } else { "counterexample_found" },
+                    "status": if report.verified {
+                        "ok"
+                    } else if uncertified_violation {
+                        "uncertified_violation"
+                    } else {
+                        "counterexample_found"
+                    },
+                    "ok": report.verified,
                     "transpiled_from_lean": true,
                     "decl_name": report.decl_name,
                     "backend": report.backend,
@@ -5474,6 +5614,11 @@ pub fn run_fast_check_command(
                     "counterexample": report.counterexample,
                     "lean_native_certified": report.lean_native_certified,
                     "lean_native_engine_version": report.lean_native_engine_version,
+                    "false_positives": if uncertified_violation { raw_violations } else { 0 },
+                    "error": uncertified_violation.then(|| format!(
+                        "Uncertified kernel violation on `{}` ({} raw violations failed in-process certification)",
+                        report.decl_name, raw_violations
+                    )),
                     "elapsed_ms": elapsed_ms,
                 }))?
             );
@@ -5481,6 +5626,11 @@ pub fn run_fast_check_command(
             println!(
                 "[turbo-lean] TRANSPILED FAST-CHECK PASSED on `{}` ({} states in {:.3} ms, {:.2} M states/s, backend={})",
                 report.decl_name, report.n_states, report.kernel_ms, report.throughput_mstates_s, report.backend
+            );
+        } else if uncertified_violation {
+            println!(
+                "[turbo-lean] TRANSPILED FAST-CHECK UNCERTIFIED VIOLATION on `{}` ({} raw violations in {:.3} ms failed certification)",
+                report.decl_name, raw_violations, report.kernel_ms
             );
         } else {
             println!(
@@ -7275,8 +7425,13 @@ fn eval_lean_expr_fast_ctx(
                 return wrap_out(res);
             }
             if let Some(p) = prefix {
-                if let Some(sd) = scalar_dom.or_else(|| (p == "Nat").then_some(nat_count_domain()))
-                {
+                let sd_opt = if p == "Nat" {
+                    (scalar_dom.is_none_or(|d| d.is_nat) || (short == "beq" && v_args.len() == 2))
+                        .then_some(nat_count_domain())
+                } else {
+                    scalar_dom
+                };
+                if let Some(sd) = sd_opt {
                     if scalar_domain_matches_fn_prefix(p, sd) {
                         return eval_scalar_fn_app(p, short, &v_args, sd).and_then(wrap_out);
                     }
@@ -8760,11 +8915,16 @@ pub fn evaluate_agent_step_value(
         let src_b3 = blake3::hash(src_text.as_bytes()).to_hex().to_string();
         let current_dep_hashes =
             crate::lake_build::compute_imported_olean_interface_hashes(&src_text, &canon_dir, None);
+        let expected_split_key = format!("file-split:v4:{}", src_b3);
         let st_split_opt = st_path_opt
             .as_ref()
             .and_then(|st_path| fs::read(st_path).ok())
             .and_then(|b| serde_json::from_slice::<crate::lake_build::ShmCachedFileSplit>(&b).ok())
-            .filter(|c| c.src_blake3 == src_b3 && c.dep_hashes == current_dep_hashes)
+            .filter(|c| {
+                c.split_key == expected_split_key
+                    && c.src_blake3 == src_b3
+                    && c.dep_hashes == current_dep_hashes
+            })
             .map(|c| c.split);
         let split = match st_split_opt {
             Some(sp) => sp,
@@ -8772,7 +8932,7 @@ pub fn evaluate_agent_step_value(
                 let sp = crate::splitter::split_lean_source(&src_text, &current_dep_hashes);
                 if let Some(ref st_path) = st_path_opt {
                     let entry = crate::lake_build::ShmCachedFileSplit {
-                        split_key: format!("file-split:v2:{}", src_b3),
+                        split_key: expected_split_key,
                         src_blake3: src_b3,
                         split: crate::lake_build::compact_split_for_shm_cache(&sp),
                         prefix_src: if src_text.len() <= 64 * 1024 {
@@ -11552,7 +11712,7 @@ theorem shadowed_false_cex (a : Word256) : a = Word256.zero := by sorry
         let st_path = crate::lake_build::shm_file_splits_dir(&store)
             .join(format!("st_{}.json", &st_hash[..24]));
         let stale_entry = crate::lake_build::ShmCachedFileSplit {
-            split_key: format!("file-split:v2:{}", src_b3),
+            split_key: format!("file-split:v4:{}", src_b3),
             src_blake3: src_b3.clone(),
             split: crate::lake_build::compact_split_for_shm_cache(&split_v1),
             prefix_src: src_text.to_string(),
@@ -11603,6 +11763,94 @@ theorem shadowed_false_cex (a : Word256) : a = Word256.zero := by sorry
             serde_json::from_slice(&fs::read(&st_path).unwrap()).unwrap();
         assert_eq!(refreshed.dep_hashes, dep_v2);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cuda_nat_helpers_unmasked_under_u8_mask_and_custom_srcdir_shadow() {
+        let u8_nat_src = "\
+theorem bv8_shl_nat_succ_unmasked (x : BitVec 8) : x <<< (Nat.succ 255) = 0 := by sorry
+theorem bv8_shl_nat_div_mod_unmasked (x : BitVec 8) : x <<< (Nat.div (Nat.add 512 4) 2 + Nat.mod 257 256) = 0 := by sorry
+theorem u8_and_nat_beq_unmasked (x : UInt8) : x = x ∧ Nat.beq (Nat.succ 255) 256 = true := by sorry
+theorem nat_succ_overflow_safe (n : Nat) : Nat.succ n > n := by sorry
+theorem nat_div_mod_identity (a b : Nat) : b * (Nat.div a b) + Nat.mod a b = a := by sorry
+";
+        for thm in [
+            "bv8_shl_nat_succ_unmasked",
+            "bv8_shl_nat_div_mod_unmasked",
+            "u8_and_nat_beq_unmasked",
+            "nat_succ_overflow_safe",
+            "nat_div_mod_identity",
+        ] {
+            let k = transpile_lean_theorem_to_cuda(u8_nat_src, Some(thm)).unwrap();
+            if thm.starts_with("bv8_") || thm.starts_with("u8_") {
+                assert!(k.cuda_source.contains("#define SCALAR_MASK (0xFFULL)"));
+                assert!(k.cuda_source.contains("nat_add("));
+            }
+            let r = execute_transpiled_cuda_kernel(&k, 64, false).unwrap();
+            assert!(
+                r.verified && r.violations == 0,
+                "expected `{}` to verify without SCALAR_MASK truncation, got {:?}",
+                thm,
+                r
+            );
+        }
+
+        // Custom `srcDir` shadow of allow-listed import must fail closed in CUDA + MCP batch:
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_lean_custom_srcdir_shadow_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src/TurboLean")).unwrap();
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            dir.join("lakefile.toml"),
+            "name = \"shadow_pkg\"\nsrcDir = \"src\"\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("src/TurboLean/FastCheck.lean"),
+            "structure Word256 where\n  w0 : UInt64\ndef Word256.zero : Word256 := ⟨1⟩\n",
+        )
+        .unwrap();
+        let spec_file = dir.join("src/Spec.lean");
+        let spec_src = "\
+import TurboLean.FastCheck
+open TurboLean.FastCheck
+theorem shadowed_in_srcdir (a : Word256) : a = Word256.zero := by sorry
+";
+        fs::write(&spec_file, spec_src).unwrap();
+        assert!(
+            transpile_lean_theorem_to_cuda_for_path(
+                spec_src,
+                Some("shadowed_in_srcdir"),
+                Some(&spec_file),
+                Some(&dir),
+            )
+            .is_err(),
+            "custom srcDir shadow of TurboLean.FastCheck must fail closed in CUDA transpiler"
+        );
+        let batch_items = vec![serde_json::json!({
+            "decl": "shadowed_in_srcdir",
+            "file": spec_file.to_str().unwrap(),
+            "stmt_src": spec_src,
+        })];
+        let batch_res = crate::mcp::execute_fast_check(
+            None,
+            None,
+            None,
+            Some(&batch_items),
+            Some("cpu"),
+            false,
+            Some(&dir),
+        );
+        assert_ne!(
+            batch_res["status"].as_str(),
+            Some("counterexample_found"),
+            "MCP batch items must fail closed on custom srcDir shadowed import: {}",
+            batch_res
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }
