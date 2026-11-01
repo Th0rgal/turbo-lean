@@ -17,3 +17,98 @@ Swap:          9.3Gi       305Mi       9.0Gi
    5464 root      0.0  0.0  3468 runuser
    6494 orbnode   0.0  0.0  4124 bash
 
+=== 2026-11-01T06:13:45Z [BEFORE-run1-pairs1] ===
+ 06:13:45 up 136 days, 22:54,  0 user,  load average: 1.55, 1.57, 1.14
+cgroup_mem_bytes=14186045440 / 64560824320
+               total        used        free      shared  buff/cache   available
+Mem:            62Gi       3.7Gi        15Gi       2.2Mi        43Gi        58Gi
+Swap:          9.3Gi       305Mi       9.0Gi
+    PID USER     %CPU %MEM   RSS COMMAND
+   6531 orbnode   3.1  0.7 481500 opencode
+   5465 orbnode   0.4  0.0 17960 sandboxed-node
+   6549 orbnode   0.0  0.0 15272 sandboxed-mcp
+    347 root      0.0  0.0  8344 ssh
+   6501 orbnode   0.0  0.0 14504 sandboxed-mcp
+      1 root      0.0  0.0  1824 sh
+     51 root      0.0  0.0  3484 bash
+    341 root      0.0  0.0  2952 sshd
+   5462 root      0.0  0.0  3612 bash
+   5464 root      0.0  0.0  3468 runuser
+   6494 orbnode   0.0  0.0  4124 bash
+
+=== 2026-11-01T06:13:47Z [AFTER-run1-pairs1] ===
+ 06:13:47 up 136 days, 22:54,  0 user,  load average: 1.50, 1.56, 1.14
+cgroup_mem_bytes=14185709568 / 64560824320
+               total        used        free      shared  buff/cache   available
+Mem:            62Gi       3.9Gi        15Gi       2.2Mi        43Gi        58Gi
+Swap:          9.3Gi       305Mi       9.0Gi
+    PID USER     %CPU %MEM   RSS COMMAND
+   6531 orbnode   3.1  0.7 480876 opencode
+   5465 orbnode   0.4  0.0 17940 sandboxed-node
+   6549 orbnode   0.0  0.0 15272 sandboxed-mcp
+    347 root      0.0  0.0  8344 ssh
+   6501 orbnode   0.0  0.0 14504 sandboxed-mcp
+      1 root      0.0  0.0  1824 sh
+     51 root      0.0  0.0  3484 bash
+    341 root      0.0  0.0  2952 sshd
+   5462 root      0.0  0.0  3612 bash
+   5464 root      0.0  0.0  3468 runuser
+   6494 orbnode   0.0  0.0  4124 bash
+
+=== 2026-11-01T06:18:16Z [BEFORE-pairs1] ===
+ 06:18:16 up 136 days, 22:58,  0 user,  load average: 1.48, 1.27, 1.10
+cgroup_mem_bytes=20310659072 / 64560824320
+               total        used        free      shared  buff/cache   available
+Mem:            62Gi       4.2Gi       9.6Gi       2.2Mi        49Gi        58Gi
+Swap:          9.3Gi       305Mi       9.0Gi
+    PID USER     %CPU %MEM   RSS COMMAND
+   6531 orbnode   2.3  0.7 460588 opencode
+   5465 orbnode   0.4  0.0 18148 sandboxed-node
+  10522 orbnode   0.0  0.0  3892 bash
+   6549 orbnode   0.0  0.0 15272 sandboxed-mcp
+    347 root      0.0  0.0  8344 ssh
+   6501 orbnode   0.0  0.0 14504 sandboxed-mcp
+      1 root      0.0  0.0  1824 sh
+     51 root      0.0  0.0  3484 bash
+    341 root      0.0  0.0  2952 sshd
+   5462 root      0.0  0.0  3612 bash
+   5464 root      0.0  0.0  3468 runuser
+
+=== 2026-11-01T06:26:22Z [DURING-20m] ===
+ 06:26:22 up 136 days, 23:06,  0 user,  load average: 175.72, 55.77, 22.03
+cgroup_mem_bytes=23123841024 / 64560824320
+               total        used        free      shared  buff/cache   available
+Mem:            62Gi        16Gi        28Gi       2.2Mi        18Gi        46Gi
+Swap:          9.3Gi       305Mi       9.0Gi
+    PID USER     %CPU %MEM   RSS COMMAND
+  20763 orbnode   518  3.7 2438884 lean
+  20756 orbnode   482  3.6 2412288 lean
+  20750 orbnode   269  3.0 1979632 lean
+  20752 orbnode   259  2.9 1928908 lean
+  20768 orbnode   257  2.9 1945472 lean
+  20753 orbnode   255  3.0 1987360 lean
+  20766 orbnode   251  2.9 1952804 lean
+  15765 orbnode   237  3.0 1980256 lean
+  21211 orbnode   221  3.2 2105948 lean
+  14284 orbnode  93.0  6.6 4382056 lean
+  19389 orbnode  75.8  6.3 4176468 lean
+
+=== 2026-11-01T06:46:22Z [DURING-20m] ===
+ 06:46:22 up 136 days, 23:26,  0 user,  load average: 275.79, 324.98, 262.97
+cgroup_mem_bytes=51327389696 / 64560824320
+               total        used        free      shared  buff/cache   available
+Mem:            62Gi        47Gi       9.8Gi       1.8Mi       6.2Gi        15Gi
+Swap:          9.3Gi       356Mi       9.0Gi
+    PID USER     %CPU %MEM   RSS COMMAND
+  20763 orbnode   505 13.3 8741484 lean
+  20756 orbnode   502 11.0 7280408 lean
+  21211 orbnode   351  9.1 6012592 lean
+  21573 orbnode   286  7.5 4977828 lean
+  20750 orbnode   216  6.1 4051380 lean
+  20753 orbnode   214  6.1 4059684 lean
+  20766 orbnode   193  7.6 5043184 lean
+  20768 orbnode   192  7.7 5069836 lean
+  20752 orbnode   190  7.6 5016944 lean
+  15765 orbnode  79.4  3.0 1985548 lean
+  14284 orbnode  37.5  3.2 2125904 lean
+
