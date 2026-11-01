@@ -1,6 +1,6 @@
 # clifv paired benchmark (A0e) — vast.ai dedicated VM (`rtx4090-a`), 2026-11-01
 
-Status: **running (`--scenarios cold,warm --pairs 1`)** — untimed `prime-lake: stock` in progress (`2152/4556` steps completed across 12 concurrent `lean` processes).
+Status: **running (`--scenarios cold,warm --pairs 1` at `LEAN_NUM_THREADS=6` / `TURBO_LEAN_JOBS=6`)** — untimed `prime-lake: stock` in progress after attempt 1 at 12 jobs hit cgroup OOM (`memory.max` = 60.13 GiB) at step `3470/4556`.
 
 ## Provenance
 
@@ -8,7 +8,9 @@ Status: **running (`--scenarios cold,warm --pairs 1`)** — untimed `prime-lake:
 - `turbo-lean` release binary SHA-256: `f027951c464151fe4ab751592f8101b1b9b5363e00382440f18163b482a72614` (`turbo-lean 0.1.0`, built with `rustc 1.99.1` and `leanprover/lean4:v4.35.0`)
 - `clifv` SHA: `5018b9509dc124154dbe08a5bd85862595d8eab7` (doc default `5018b95`, toolchain `leanprover/lean4:v4.34.1`)
 - Host: Vast.ai dedicated VM (`3fc010451603` / `rtx4090-a`), Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz, `nproc=28` (cgroup CPU quota `2687999/100000` = 26.88 cores), RAM 62 GiB (cgroup `memory.max` = 60.13 GiB), swap 9.3 GiB, kernel `Linux 6.17.0-35-generic #35~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC x86_64`, local disk overlay 120G (device 96; `/dev/shm` device 163).
-- Parallelism & memory cap (identical for both arms): `LEAN_NUM_THREADS=12`, `TURBO_LEAN_JOBS=12`, `TURBO_LEAN_MAX_MEMORY_MB=53248`. Peak cgroup memory observed so far: `59.12 GiB` (`63475531776` bytes at `2026-11-01T06:51:28Z`, 0 OOM events).
+- Parallelism & memory cap (identical for both arms):
+  - **Attempt 1 (`attempt1-j12-oom/`)**: `LEAN_NUM_THREADS=12`, `TURBO_LEAN_JOBS=12`, `TURBO_LEAN_MAX_MEMORY_MB=53248`. During untimed `prime-lake: stock`, 12 concurrent `StockCmp*DriverRuns` / `StockRotate*Witness` Lean processes reached cgroup `memory.max` (`64560812032` bytes / `60.13 GiB` at `2026-11-01T12:48:04Z`), triggering 6 kernel `oom_kill` events (`Lean exited with code 137` on steps `3470`, `3474`, `3484`, `3485`, `3490`, `3491` of `4556`). Cleanly terminated and preserved in `attempt1-j12-oom/`.
+  - **Attempt 2 (active)**: `LEAN_NUM_THREADS=6`, `TURBO_LEAN_JOBS=6`, `TURBO_LEAN_MAX_MEMORY_MB=53248` (both Lake and `lean` cap concurrent module elaborations and task-manager threads to 6). Cgroup baseline before Attempt 2: `oom 7`, `oom_kill 6`.
 - Telemetry & remote nodes: `TURBO_LEAN_TELEMETRY=off` (benchmark shell only); remote compute node env vars unset.
 - Note on GNU `time`: container base image lacked `/usr/bin/time` without root `apt-get install`; extracted Ubuntu Noble `time` (`1.9-0.2build1`) to `$HOME/.local/bin/time` and mapped `/usr/bin/time` in the Python runner via `sitecustomize.py` (stripping `PYTHONPATH` from child `Popen` environments so Lean/Lake/turbo-lean run in an unperturbed environment; verified 13/13 `scripts/test_bench_clifv.py` pass). Neither `scripts/bench_clifv.*` nor `docs/` were modified (`git status --porcelain --untracked-files=no` is empty).
 
