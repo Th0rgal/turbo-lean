@@ -1494,7 +1494,6 @@ pub(crate) fn is_toolchain_dir_match(dir: &Path, toolchain_lib: Option<&Path>) -
     match toolchain_lib {
         Some(tc) => {
             dir == tc
-                || is_sysroot_lib_lean_dir(dir)
                 || fs::canonicalize(dir).ok().is_some_and(|c| {
                     let canon_tc = fs::canonicalize(tc).unwrap_or_else(|_| tc.to_path_buf());
                     c == canon_tc || c.starts_with(&canon_tc)
@@ -3959,6 +3958,7 @@ pub(crate) fn resolve_zygote_context(
         .ok()
         .and_then(|g| g.get(&lp_cache_key).cloned());
 
+    let tc_lib = toolchain_lib_dir(lean_bin);
     let effective_lean_path = if let Some(eff) = cached_lp {
         eff
     } else {
@@ -3970,7 +3970,7 @@ pub(crate) fn resolve_zygote_context(
                     let norm = fs::canonicalize(s)
                         .map(|c| c.to_string_lossy().to_string())
                         .unwrap_or_else(|_| s.to_string());
-                    if is_sysroot_lib_lean_dir(Path::new(&norm)) {
+                    if is_toolchain_dir_match(Path::new(&norm), tc_lib.as_deref()) {
                         continue;
                     }
                     if !path_parts.iter().any(|x| x == &norm) {
@@ -3998,8 +3998,8 @@ pub(crate) fn resolve_zygote_context(
                 ));
             }
         }
-        if let Some(tc_lib_lean) = toolchain_lib_dir(lean_bin) {
-            let norm = fs::canonicalize(&tc_lib_lean)
+        if let Some(ref tc_lib_lean) = tc_lib {
+            let norm = fs::canonicalize(tc_lib_lean)
                 .map(|c| c.to_string_lossy().to_string())
                 .unwrap_or_else(|_| tc_lib_lean.to_string_lossy().to_string());
             if !path_parts.iter().any(|x| x == &norm) {
@@ -4017,7 +4017,6 @@ pub(crate) fn resolve_zygote_context(
     };
 
     let imports_csv = coalesce_proofkit_imports(raw_imports_csv, &effective_lean_path);
-    let tc_lib = toolchain_lib_dir(lean_bin);
     let search_path_digest =
         compute_search_path_oleans_digest_with_toolchain(&effective_lean_path, tc_lib.as_deref());
     // Every cache below (worker env, warm pool, verdicts) is labelled with this snapshot's
@@ -7862,6 +7861,21 @@ mod tests {
         fs::write(&user_olean, b"user-v2-tracked").unwrap();
         let d3 = compute_search_path_oleans_digest(&lp);
         assert_ne!(d2, d3);
+
+        let second_tc_root = tmp_dir.join("second_toolchain");
+        let second_tc_lib = second_tc_root.join("lib/lean");
+        fs::create_dir_all(second_tc_root.join("bin")).unwrap();
+        fs::create_dir_all(&second_tc_lib).unwrap();
+        fs::write(second_tc_root.join("bin/lean"), b"#!/bin/sh\n").unwrap();
+        let second_tc_olean = second_tc_lib.join("ExtraMod.olean");
+        fs::write(&second_tc_olean, b"extra-v1").unwrap();
+        let lp_two_tc = format!("{}:{}", second_tc_lib.display(), real_sysroot_lib.display());
+        let dt1 =
+            compute_search_path_oleans_digest_with_toolchain(&lp_two_tc, Some(&real_sysroot_lib));
+        fs::write(&second_tc_olean, b"extra-v2").unwrap();
+        let dt2 =
+            compute_search_path_oleans_digest_with_toolchain(&lp_two_tc, Some(&real_sysroot_lib));
+        assert_ne!(dt1, dt2);
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }

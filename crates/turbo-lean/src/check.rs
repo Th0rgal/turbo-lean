@@ -219,9 +219,7 @@ fn prepare_stateless_remote_file(file: &Path, project_dir: &Path) -> Option<Stat
     let active_src = fs::read_to_string(&resolved_file)
         .ok()
         .filter(|s| s.len() <= 64 * 1024)?;
-    let canon_file = resolved_file
-        .canonicalize()
-        .unwrap_or(resolved_file);
+    let canon_file = resolved_file.canonicalize().unwrap_or(resolved_file);
     crate::lake_build::ensure_project_imports_fresh_for_check(
         &canon_dir,
         std::slice::from_ref(&canon_file),
@@ -234,7 +232,11 @@ fn prepare_stateless_remote_file(file: &Path, project_dir: &Path) -> Option<Stat
         toolchain.clone()
     };
     let local_lean_path = resolve_remote_lean_path(&canon_dir, None);
-    let dep_hashes = compute_imported_olean_interface_hashes(&active_src, &canon_dir, None);
+    let dep_hashes = compute_imported_olean_interface_hashes(
+        &active_src,
+        &canon_dir,
+        (!local_lean_path.is_empty()).then_some(local_lean_path.as_str()),
+    );
     let split = splitter::split_lean_source_fast_no_cone(&active_src, &dep_hashes);
     Some((
         canon_dir,
@@ -4564,17 +4566,9 @@ but is expected to have type
         )
         .unwrap();
         fs::write(proj.join("P/A.lean"), "def k : Nat := 1\n").unwrap();
-        fs::write(
-            proj.join("P/B.lean"),
-            "import P.A\ndef m : Nat := k\n",
-        )
-        .unwrap();
+        fs::write(proj.join("P/B.lean"), "import P.A\ndef m : Nat := k\n").unwrap();
         let c_file = proj.join("P/C.lean");
-        fs::write(
-            &c_file,
-            "import P.B\ntheorem c_ok : m = 1 := rfl\n",
-        )
-        .unwrap();
+        fs::write(&c_file, "import P.B\ntheorem c_ok : m = 1 := rfl\n").unwrap();
         let run_lake = |args: &[&str]| {
             Command::new("lake")
                 .args(args)
