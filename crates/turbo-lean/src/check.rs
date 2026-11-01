@@ -1443,7 +1443,7 @@ pub(crate) fn compute_fission_store_key_with_args(
     let mut base = if allowed.len() > splitter::STANDARD_AXIOMS.len() {
         let ax_hash = blake3::hash(allowed.join(",").as_bytes()).to_hex();
         format!(
-            "fission:{}:{}:{}:ax:{}",
+            "fission-v2:{}:{}:{}:ax:{}",
             toolchain,
             prefix_env_hash,
             sub_shard_key,
@@ -1451,7 +1451,7 @@ pub(crate) fn compute_fission_store_key_with_args(
         )
     } else {
         format!(
-            "fission:{}:{}:{}",
+            "fission-v2:{}:{}:{}",
             toolchain, prefix_env_hash, sub_shard_key
         )
     };
