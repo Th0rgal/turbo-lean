@@ -671,6 +671,7 @@ fn submodule_only_filters_never_run_during_pr_verification() {
         }
         ok(&f.0, &["add", "."]);
         ok(&f.0, &["commit", "-qm", "base"]);
+        let pre_sub_base = ok(&f.0, &["rev-parse", "HEAD"]);
         ok(
             &f.0,
             &["submodule", "add", "-q", &sub.to_string_lossy(), "dep"],
@@ -760,6 +761,31 @@ fn submodule_only_filters_never_run_during_pr_verification() {
                     "{via_include} {dir} {base_ref}: filter ran"
                 );
             }
+        }
+
+        // Staged gitlink deletion: index and worktree lack `dep`, and `pre_sub_base` predates
+        // `dep`, so only checking `HEAD` catches the committed gitlink in change discovery.
+        ok(&f.0, &["update-index", "--force-remove", "dep"]);
+        fs::remove_dir_all(&dep).unwrap();
+        for base_ref in ["HEAD", base.as_str(), pre_sub_base.as_str()] {
+            let out = f.run(
+                "cache-staged-del",
+                &["pr-verify", "--project-dir", ".", "--base", base_ref],
+                false,
+            );
+            let diagnostic = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                diagnostic.contains("gitlinks"),
+                "staged deletion {base_ref}: {diagnostic}"
+            );
+            assert!(
+                !marker.exists(),
+                "{via_include} staged deletion {base_ref}: filter ran"
+            );
         }
     }
 }

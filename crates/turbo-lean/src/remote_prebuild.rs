@@ -201,6 +201,16 @@ fn working_tree_dirty_paths(project_dir: &Path, selected_sha: &str) -> Result<Ve
     }
     // Inspecting a submodule's dirty state runs Git inside it with the submodule's own config
     // (filters, includes). Never recurse; refuse gitlinks anywhere in the work tree instead.
+    let head = git(&["rev-parse", "HEAD"])?;
+    if !head.status.success() {
+        anyhow::bail!(
+            "`git rev-parse HEAD` failed: {}",
+            String::from_utf8_lossy(&head.stderr).trim()
+        );
+    }
+    let head = String::from_utf8_lossy(&head.stdout)
+        .trim()
+        .to_ascii_lowercase();
     let top = git(&["rev-parse", "--show-toplevel"])?;
     anyhow::ensure!(
         top.status.success(),
@@ -208,7 +218,16 @@ fn working_tree_dirty_paths(project_dir: &Path, selected_sha: &str) -> Result<Ve
         String::from_utf8_lossy(&top.stderr).trim()
     );
     let top = PathBuf::from(String::from_utf8_lossy(&top.stdout).trim());
-    crate::trusted_tools::reject_gitlinks(&top, &[], &top)?;
+    let mut revs = vec![head.as_str()];
+    if is_valid_commit_sha40(selected_sha)
+        && selected_sha != head
+        && git(&["cat-file", "-e", &format!("{selected_sha}^{{commit}}")])?
+            .status
+            .success()
+    {
+        revs.push(selected_sha);
+    }
+    crate::trusted_tools::reject_gitlinks(&top, &revs, &top)?;
     let out = git(&[
         "status",
         "--porcelain=v1",
@@ -223,16 +242,6 @@ fn working_tree_dirty_paths(project_dir: &Path, selected_sha: &str) -> Result<Ve
         );
     }
     let mut dirty = dirty_paths_from_porcelain(&out.stdout);
-    let head = git(&["rev-parse", "HEAD"])?;
-    if !head.status.success() {
-        anyhow::bail!(
-            "`git rev-parse HEAD` failed: {}",
-            String::from_utf8_lossy(&head.stderr).trim()
-        );
-    }
-    let head = String::from_utf8_lossy(&head.stdout)
-        .trim()
-        .to_ascii_lowercase();
     if !selected_sha.is_empty() && head != selected_sha {
         dirty.push(format!(
             "HEAD is {head} but the selected commit is {selected_sha}"
@@ -955,6 +964,50 @@ mod tests {
             assert!(
                 !marker.exists(),
                 "{via_include}: remote-prebuild ran the filter"
+            );
+
+            // Staged gitlink deletion (`--ignore-submodules=all` suppresses it in `git status`)
+            // with `.gitmodules` untouched and the directory removed from the work tree must
+            // still fail closed via `HEAD` inspection instead of contacting the coordinator.
+            git_ok(&repo, &["config", "--unset-all", "submodule.dep.ignore"]);
+            fs::write(repo.join("lake-manifest.json"), "{}\n")?;
+            git_ok(&repo, &["add", "lake-manifest.json"]);
+            git_ok(&repo, &["commit", "-qm", "manifest"]);
+            let head = git_out(&repo, &["rev-parse", "HEAD"]);
+            git_ok(&repo, &["update-index", "--force-remove", "dep"]);
+            fs::remove_dir_all(repo.join("dep"))?;
+            let err = working_tree_dirty_paths(&repo, &head)
+                .expect_err("staged gitlink deletion must fail closed");
+            assert!(
+                err.to_string().contains("gitlinks") && err.to_string().contains("dep"),
+                "{err:#}"
+            );
+            let coordinator = TcpListener::bind("127.0.0.1:0")?;
+            coordinator.set_nonblocking(true)?;
+            let coord_addr = coordinator.local_addr()?;
+            for use_allow_dirty in [false, true] {
+                run_remote_prebuild_command(
+                    true,
+                    &format!("http://{coord_addr}/v1/prebuilds"),
+                    &repo,
+                    Some("https://example.invalid/r.git".into()),
+                    Some(head.clone()),
+                    vec!["Demo".into()],
+                    None,
+                    None,
+                    None,
+                    1,
+                    10,
+                    use_allow_dirty,
+                )?;
+                let accept_err = coordinator
+                    .accept()
+                    .expect_err("staged gitlink deletion must be refused before HTTP POST");
+                assert_eq!(accept_err.kind(), std::io::ErrorKind::WouldBlock);
+            }
+            assert!(
+                !marker.exists(),
+                "{via_include}: staged deletion ran the filter"
             );
             let _ = fs::remove_dir_all(&root);
         }

@@ -1356,7 +1356,12 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
     let base_pkg_cfg = base_revision_package_config(store, &repo_root, canon_dir, base_ref)?;
     // Change discovery never enters submodules (their config and filters are unvetted), so a
     // gitlink's contents would silently read as unchanged: fail closed, like snapshots do.
-    crate::trusted_tools::reject_gitlinks(&repo_root, &[base_ref], canon_dir)?;
+    let revs: &[&str] = if base_ref == "HEAD" {
+        &["HEAD"]
+    } else {
+        &[base_ref, "HEAD"]
+    };
+    crate::trusted_tools::reject_gitlinks(&repo_root, revs, canon_dir)?;
     let resolve_base_lean_args = |rel: &str| -> Vec<String> {
         base_pkg_cfg
             .as_ref()
