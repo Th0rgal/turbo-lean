@@ -4284,6 +4284,7 @@ pub fn run_pr_verify_command(
                 crate::lake_build::lake_build_modules(&canon_dir, &imports, Some(&base))?;
             }
         }
+        crate::module_builder::ensure_imported_oleans_replayed(store, &canon_dir, &edited)?;
     }
     let lake_recheck_ms = lake_t0.elapsed().as_millis();
 

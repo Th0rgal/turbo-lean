@@ -8436,6 +8436,101 @@ fn audit_or_replay_modules(
     crate::zygote::kernel_replay_modules_with_zygote(store, cfg, &replay, lean_path_env)
 }
 
+/// `check` / trusted `pr-verify` gate: every non-toolchain `.olean` that `target_files`
+/// transitively import (project-local or dependency, however it was built) must carry current
+/// kernel-replay provenance (its package's verified-sources manifest or a store replay marker for
+/// the exact artifact digest) or be independently replayed now. Fails closed.
+pub(crate) fn ensure_imported_oleans_replayed(
+    store: &TurboStore,
+    canon_dir: &Path,
+    target_files: &[PathBuf],
+) -> Result<usize> {
+    let mut worklist: Vec<String> = target_files
+        .iter()
+        .filter_map(|f| fs::read_to_string(f).ok())
+        .flat_map(|s| parse_header_info(&s).imports)
+        .collect();
+    if worklist.is_empty() {
+        return Ok(0);
+    }
+    let cfg = resolve_project_config(canon_dir);
+    let tc_lib = cfg.as_ref().map(|c| c.toolchain_lib_lean.clone()).ok();
+    let lean_path = lake_build::resolve_remote_lean_path(canon_dir, None);
+    let dirs: Vec<PathBuf> = std::env::split_paths(&lean_path).collect();
+    let mut seen = HashSet::new();
+    let mut imported: Vec<(String, PathBuf)> = Vec::new();
+    while let Some(m) = worklist.pop() {
+        if !seen.insert(m.clone())
+            || is_builtin_toolchain_module(tc_lib.as_deref().unwrap_or(Path::new("")), &m)
+        {
+            continue;
+        }
+        let rel = format!("{}.olean", module_name_to_rel_slash(&m));
+        let Some(path) = dirs.iter().map(|d| d.join(&rel)).find(|p| p.is_file()) else {
+            continue;
+        };
+        if tc_lib.as_ref().is_some_and(|t| path.starts_with(t)) {
+            continue;
+        }
+        let bytes = fs::read(&path)?;
+        worklist.extend(
+            parse_olean_binary_imports(&bytes)
+                .map(|(imps, _)| imps.into_iter().map(|i| i.module))
+                .into_iter()
+                .flatten(),
+        );
+        imported.push((m, path));
+    }
+    if imported.is_empty() {
+        return Ok(0);
+    }
+    let cfg = cfg.context(
+        "Cannot kernel-replay imported `.olean`s without a resolvable project configuration: fail-closed",
+    )?;
+    let marker_dir = store.root.join("dep_replay");
+    let marker = |m: &str, dig: &str| {
+        let mut h = blake3::Hasher::new();
+        h.update(b"turbo-lean-dep-replay-v1\n");
+        h.update(&crate::zygote::ZYGOTE_REPLAY_VERSION.to_le_bytes());
+        for s in [cfg.lean_githash.as_str(), m, dig] {
+            update_hasher_lp(&mut h, s.as_bytes());
+        }
+        marker_dir.join(h.finalize().to_hex().as_str())
+    };
+    let mut pending = Vec::new();
+    for (m, path) in &imported {
+        let dig = compute_olean_artifact_set_digest(path)?;
+        let manifest_ok = infer_pkg_root_from_artifact_path(path)
+            .and_then(|r| fs::read(r.join(".lake/build/.turbo_verified_sources.json")).ok())
+            .and_then(|b| serde_json::from_slice::<VerifiedDepManifest>(&b).ok())
+            .is_some_and(|mf| {
+                mf.toolchain == cfg.toolchain
+                    && mf.lean_githash == cfg.lean_githash
+                    && mf.allowed_axioms == crate::splitter::allowed_axioms()
+                    && mf
+                        .modules
+                        .values()
+                        .any(|e| e.kernel_replayed() && e.olean_artifact_digest == dig)
+            });
+        if !manifest_ok && !marker(m, &dig).is_file() {
+            pending.push((m.clone(), dig));
+        }
+    }
+    let replay_lp = format!("{}:{}", lean_path, cfg.toolchain_lib_lean.display());
+    for (m, dig) in &pending {
+        crate::zygote::kernel_replay_modules_with_zygote(
+            store,
+            &cfg,
+            std::slice::from_ref(m),
+            &replay_lp,
+        )
+        .context("Imported `.olean` failed independent kernel replay")?;
+        let _ = fs::create_dir_all(&marker_dir);
+        let _ = fs::write(marker(m, dig), m.as_bytes());
+    }
+    Ok(pending.len())
+}
+
 pub(crate) fn record_verified_dep_source(
     cfg: &ProjectConfig,
     node: &ModuleNode,
@@ -10531,6 +10626,17 @@ lean_exe «demo-exe» where
             .nodes
             .contains_key("Dep.Bad"));
         assert_rejected(&build(&mut store), "stale manifest");
+        // 4. `check` imports the Lake-built dependency `.olean` directly: it must be replayed too.
+        let lake = Command::new("lake").args(["build", "Dep.Bad"]).current_dir(&proj).output()?;
+        anyhow::ensure!(lake.status.success(), "{}", String::from_utf8_lossy(&lake.stderr));
+        let err = crate::check::evaluate_check_command_value(
+            &mut store,
+            proj.join("App.lean"),
+            None,
+            proj.clone(),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("KernelReplay"), "check: {err:#}");
         drop(store);
         let _ = fs::remove_dir_all(&dir);
         Ok(())
