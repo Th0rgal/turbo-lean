@@ -518,3 +518,81 @@ fn conditional_worktree_filters_cannot_run_during_pr_verification() {
                 .is_none()
     );
 }
+
+// A partial clone's promised base blob is missing locally. Plain Git would lazily fetch it
+// over the repository's own `core.sshCommand`; pr-verify must fail closed instead, and never
+// run that command or the repository's credential helper.
+#[test]
+fn missing_promised_base_blob_fails_closed_without_running_repository_helpers() {
+    let f = Fixture(std::env::temp_dir().join(format!(
+        "turbo-promisor-{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+    )));
+    fs::create_dir_all(&f.0).unwrap();
+    let marker = f.0.join("shim-invoked");
+    let plain = |args: &[&str]| {
+        Command::new("/usr/bin/git")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &f.0)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .current_dir(&f.0)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    fs::write(f.0.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+    fs::write(f.0.join(".gitignore"), ".lake/\ncache/\ncache-staging/\n").unwrap();
+    fs::write(f.0.join("Demo.lean"), "theorem pinned : 1 + 1 = 2 := rfl\n").unwrap();
+    for args in [
+        &["init", "-q"][..],
+        &["add", "."],
+        &["-c", "user.name=T", "-c", "user.email=t@e", "commit", "-qm", "base"],
+    ] {
+        assert!(plain(args).status.success(), "{args:?}");
+    }
+    let oid = String::from_utf8(plain(&["rev-parse", "HEAD:Demo.lean"]).stdout).unwrap();
+    let oid = oid.trim();
+    fs::remove_file(f.0.join(".git/objects").join(&oid[..2]).join(&oid[2..])).unwrap();
+    let touch = format!("sh -c 'touch {}; exit 1' --", marker.display());
+    let helper = format!("!touch {} #", marker.display());
+    for (key, value) in [
+        ("remote.origin.url", "ssh://example.invalid/repo"),
+        ("remote.origin.promisor", "true"),
+        ("extensions.partialClone", "origin"),
+        ("core.sshCommand", touch.as_str()),
+        ("protocol.ssh.allow", "always"),
+        ("credential.helper", helper.as_str()),
+    ] {
+        assert!(plain(&["config", key, value]).status.success(), "{key}");
+    }
+    // Positive control: plain Git lazily fetches and runs the repository's ssh command.
+    assert!(!plain(&["cat-file", "-p", "HEAD:Demo.lean"]).status.success());
+    assert!(marker.exists(), "lazy-fetch control did not run sshCommand");
+    fs::remove_file(&marker).unwrap();
+
+    fs::write(
+        f.0.join("Demo.lean"),
+        "theorem pinned : 1 + 1 = 2 := by decide\n",
+    )
+    .unwrap();
+    for mode in ["trusted", "untrusted"] {
+        let out = f.run(
+            &format!("cache-{mode}"),
+            &["pr-verify", "--project-dir", ".", "--base", "HEAD", "--mode", mode],
+            false,
+        );
+        let diagnostic = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            diagnostic.contains("missing") || diagnostic.contains("bubblewrap"),
+            "{diagnostic}"
+        );
+        assert!(!marker.exists(), "{mode}: a repository Git helper ran");
+    }
+}
