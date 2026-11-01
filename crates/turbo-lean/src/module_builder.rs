@@ -8740,6 +8740,39 @@ pub(crate) fn ensure_imported_oleans_replayed(
     )?;
     replay_resolved_artifacts(store, &cfg, imported, &replay_lp)
 }
+/// Existing root artifacts need both independent closure replay and the full root policy
+/// audit before any source-freshness shortcut can certify their declarations.
+pub(crate) fn audit_existing_module_roots(
+    store: &TurboStore,
+    canon_dir: &Path,
+    modules: &[String],
+) -> Result<()> {
+    if modules.is_empty() {
+        return Ok(());
+    }
+    let cfg = resolve_project_config(canon_dir)?;
+    let lean_path = lake_build::resolve_remote_lean_path(canon_dir, None);
+    let lean_path = format!("{}:{}", lean_path, cfg.toolchain_lib_lean.display());
+    ensure_module_closure_replayed(store, &cfg, modules.to_vec(), &lean_path)?;
+    crate::zygote::audit_compiled_modules_with_zygote(store, &cfg, modules, &lean_path, &[], false)
+}
+
+pub(crate) fn audit_existing_project_artifacts(
+    store: &TurboStore,
+    canon_dir: &Path,
+    targets: &[String],
+) -> Result<()> {
+    let cfg = resolve_project_config(canon_dir)?;
+    let dag = build_module_dag(&cfg, targets)?;
+    let roots = dag
+        .nodes
+        .values()
+        .filter(|n| n.is_root_pkg)
+        .map(|n| n.module_name.clone())
+        .collect::<Vec<_>>();
+    audit_existing_module_roots(store, canon_dir, &roots)
+}
+
 pub(crate) fn record_verified_dep_source(
     cfg: &ProjectConfig,
     node: &ModuleNode,
@@ -10702,6 +10735,143 @@ lean_exe «demo-exe» where
                 caller_before,
                 "caller changed (prebuilt={prebuilt})"
             );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_root_freshness_manifests_cannot_authorize_ci_or_fast_checks() -> Result<()> {
+        use crate::worktree_test_support::{LakeTree, FORGED_DEPENDENCY_SOURCE};
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for poisoned_root in [false, true] {
+            let tree = LakeTree::new(
+                "root_replay",
+                &[("P/Target.lean", "theorem target : True := trivial\n")],
+            )?;
+            let target = tree.project.join("P/Target.lean");
+            if poisoned_root {
+                fs::write(
+                    &target,
+                    format!("{FORGED_DEPENDENCY_SOURCE}\ntheorem other : True := trivial\n"),
+                )?;
+                tree.lake(&["build", "P.Target"])?;
+                // The checkout can rewrite all freshness evidence around a poisoned artifact.
+                // Reuse the existing bad artifact while presenting ordinary, invalid proof source.
+                let source = "import Lean\ntheorem bad : False := by trivial\ntheorem other : True := trivial\n";
+                fs::write(&target, source)?;
+                let trace_path = tree.project.join(".lake/build/lib/lean/P/Target.trace");
+                let mut trace: serde_json::Value = serde_json::from_slice(&fs::read(&trace_path)?)?;
+                trace["inputs"][3][1] = format!("{:016x}", lake_hash_text(source)).into();
+                trace["depHash"] = format!("{:016x}", lake_input_hash(&trace["inputs"])?).into();
+                fs::write(trace_path, serde_json::to_vec(&trace)?)?;
+                fs::File::options()
+                    .write(true)
+                    .open(tree.project.join(".lake/build/lib/lean/P/Target.olean"))?
+                    .set_modified(std::time::SystemTime::now())?;
+            } else {
+                let dep = tree.project.join(".lake/packages/dep");
+                fs::create_dir_all(dep.join("Dep"))?;
+                fs::write(
+                    dep.join("lean-toolchain"),
+                    include_str!("../../../lean/lean-toolchain"),
+                )?;
+                fs::write(
+                    dep.join("lakefile.toml"),
+                    "name = \"dep\"\n[[lean_lib]]\nname = \"Dep\"\n",
+                )?;
+                fs::write(dep.join("Dep/Bad.lean"), FORGED_DEPENDENCY_SOURCE)?;
+                let config = tree.project.join("lakefile.toml");
+                let mut text = fs::read_to_string(&config)?;
+                text.push_str("\n[[require]]\nname = \"dep\"\npath = \".lake/packages/dep\"\n");
+                fs::write(config, text)?;
+                fs::write(&target, "import Dep.Bad\ntheorem target : False := bad\n")?;
+                tree.lake(&["update"])?;
+                tree.lake(&["build", "P.Target"])?;
+            }
+            let cfg = resolve_project_config(&tree.project)?;
+            let dag = build_module_dag(&cfg, &[])?;
+            let node = &dag.nodes["P.Target"];
+            let digest = compute_olean_artifact_set_digest(
+                &tree.project.join(".lake/build/lib/lean/P/Target.olean"),
+            )?;
+            record_verified_dep_source(&cfg, node, &digest);
+            let manifest_path = tree
+                .project
+                .join(".lake/build/.turbo_verified_sources.json");
+            let hashes = BTreeMap::from([("P/Target.lean".to_string(), node.src_blake3.clone())]);
+            let mut store = TurboStore::open(Some(&tree.root.join("cache")))?;
+            for version in [0, crate::zygote::ZYGOTE_REPLAY_VERSION] {
+                let mut manifest: VerifiedDepManifest =
+                    serde_json::from_slice(&fs::read(&manifest_path)?)?;
+                manifest
+                    .modules
+                    .get_mut("P/Target.lean")
+                    .unwrap()
+                    .replay_version = version;
+                fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
+                assert!(
+                    crate::lake_build::are_all_project_oleans_up_to_date(&tree.project, &hashes),
+                    "fixture must reach root freshness shortcut"
+                );
+                assert_eq!(
+                    crate::lake_build::fresh_prebuilt_module_import(&tree.project, &target)
+                        .as_deref(),
+                    Some("P.Target")
+                );
+                assert!(crate::lake_build::resolve_prebuilt_module_import(
+                    &store,
+                    &tree.project,
+                    &target
+                )
+                .is_none());
+                let receipt = tree.root.join("receipt.json");
+                let err = crate::pr_verify::run_ci_verify_command(
+                    &mut store,
+                    true,
+                    "trusted".into(),
+                    tree.project.clone(),
+                    Some(receipt.clone()),
+                    None,
+                    true,
+                    None,
+                )
+                .unwrap_err();
+                assert!(format!("{err:#}").contains("KernelReplay"), "{err:#}");
+                assert!(!receipt.exists());
+                let attestations: i64 =
+                    store
+                        .conn
+                        .query_row("SELECT count(*) FROM attestations", [], |r| r.get(0))?;
+                let completed: i64 = store.conn.query_row(
+                    "SELECT count(*) FROM actions WHERE status = 'completed'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                assert_eq!(attestations, 0, "rejected root must not be attested");
+                assert_eq!(
+                    completed, 0,
+                    "rejected root must not seed actions or shards"
+                );
+            }
+            if poisoned_root {
+                for decl in [Some("bad".to_string()), None] {
+                    let outcome = crate::check::evaluate_check_command_value(
+                        &mut store,
+                        target.clone(),
+                        decl,
+                        tree.project.clone(),
+                    );
+                    assert!(
+                        outcome
+                            .as_ref()
+                            .map_or(true, |value| value["verified"] != true),
+                        "poisoned own artifact accepted: {outcome:?}"
+                    );
+                }
+            }
         }
         Ok(())
     }

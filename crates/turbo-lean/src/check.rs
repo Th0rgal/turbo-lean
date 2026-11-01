@@ -299,7 +299,10 @@ pub fn try_stateless_remote_check(
     let fast_batch_src = if pruned_batch_src.is_some() || split.shards.len() <= 1 {
         None
     } else {
-        resolve_prebuilt_module_import(&canon_dir, &canon_file).and_then(|mod_imp| {
+        TurboStore::open(Some(cache_root))
+            .ok()
+            .and_then(|store| resolve_prebuilt_module_import(&store, &canon_dir, &canon_file))
+            .and_then(|mod_imp| {
             splitter::build_fast_olean_shard_source_with_split(
                 &active_src,
                 &split,
@@ -481,7 +484,10 @@ pub fn try_stateless_remote_single_decl_check(
     let fast_olean_src = if pruned_src.is_some() || split.shards.len() <= 1 {
         None
     } else {
-        resolve_prebuilt_module_import(&canon_dir, &canon_file).and_then(|mod_imp| {
+        TurboStore::open(Some(cache_root))
+            .ok()
+            .and_then(|store| resolve_prebuilt_module_import(&store, &canon_dir, &canon_file))
+            .and_then(|mod_imp| {
             splitter::build_fast_olean_shard_source_with_split(
                 &active_src,
                 &split,
@@ -1082,7 +1088,7 @@ fn check_directory(
             Some(_) => {}
         }
         let canon_lf = lf.canonicalize().unwrap_or_else(|_| lf.clone());
-        if let Some(mod_imp) = resolve_prebuilt_module_import(canon_dir, &canon_lf) {
+        if let Some(mod_imp) = resolve_prebuilt_module_import(store, canon_dir, &canon_lf) {
             if proj_build_verified {
                 cross_eligible.push((mod_imp, src.as_str(), file_uncached));
             } else {
@@ -1267,7 +1273,7 @@ fn check_directory(
 
                                 let mut batch_ok = false;
                                 if let Some(mod_imp) =
-                                    resolve_prebuilt_module_import(canon_ref, &canon_lf)
+                                    resolve_prebuilt_module_import(&worker_store, canon_ref, &canon_lf)
                                 {
                                     if let Some(fast_src) = splitter::build_fast_olean_shard_source(
                                         src,
@@ -1707,7 +1713,7 @@ fn check_single_decl(
         let fast_olean_src = if split.shards.len() <= 1 {
             None
         } else {
-            resolve_prebuilt_module_import(canon_dir, &canon_file).and_then(|mod_imp| {
+            resolve_prebuilt_module_import(store, canon_dir, &canon_file).and_then(|mod_imp| {
                 splitter::build_fast_olean_shard_source_with_split(
                     &active_src,
                     split,
@@ -1963,7 +1969,7 @@ fn check_single_decl(
                         }
                         is_file_verified_in_lake_build(canon_dir, &canon_file, &active_src)
                     });
-            let prebuilt_mod = resolve_prebuilt_module_import(canon_dir, &canon_file);
+            let prebuilt_mod = resolve_prebuilt_module_import(store, canon_dir, &canon_file);
             let mut verified_via_fast_olean = proj_build_verified && prebuilt_mod.is_some();
             let mut verified_via_zygote = verified_via_fast_olean;
             let mut zygote_env_cache_hit = verified_via_fast_olean;
@@ -3055,7 +3061,7 @@ fn check_single_file(
             let mut remote_resp = if split.shards.len() <= 1 {
                 None
             } else {
-                resolve_prebuilt_module_import(canon_dir, canon_resolved_initial)
+                resolve_prebuilt_module_import(store, canon_dir, canon_resolved_initial)
                     .and_then(|mod_imp| {
                         splitter::build_fast_olean_shard_source_with_split(
                             src,
@@ -3149,7 +3155,7 @@ fn check_single_file(
                 }
                 is_file_verified_in_lake_build(canon_dir, canon_resolved_initial, src)
             });
-    let prebuilt_batch_mod = resolve_prebuilt_module_import(canon_dir, canon_resolved_initial);
+    let prebuilt_batch_mod = resolve_prebuilt_module_import(store, canon_dir, canon_resolved_initial);
     let fast_verified_batch =
         use_parallel_shards && proj_build_verified && prebuilt_batch_mod.is_some();
 

@@ -1914,6 +1914,25 @@ pub(crate) fn collect_lean_files(root: &Path) -> Vec<PathBuf> {
 /// `.lake/build/lib/lean/<Module>.olean` exists on disk and its source + transitive project-local
 /// imports are not stale relative to the `.olean` on disk.
 pub(crate) fn resolve_prebuilt_module_import(
+    store: &TurboStore,
+    canon_project_dir: &Path,
+    canon_file: &Path,
+) -> Option<String> {
+    let module = fresh_prebuilt_module_import(canon_project_dir, canon_file)?;
+    // A writable freshness manifest cannot vouch for the target module itself. Reject the
+    // shortcut on replay/policy failure; callers can still check the complete source.
+    crate::module_builder::audit_existing_module_roots(
+        store,
+        canon_project_dir,
+        std::slice::from_ref(&module),
+    )
+    .ok()?;
+    Some(module)
+}
+
+/// Freshness evidence only. Never use this module name to import an artifact without the
+/// verifier gate in `resolve_prebuilt_module_import`.
+pub(crate) fn fresh_prebuilt_module_import(
     canon_project_dir: &Path,
     canon_file: &Path,
 ) -> Option<String> {
@@ -1932,7 +1951,7 @@ pub(crate) fn resolve_prebuilt_module_import(
             .join(".lake")
             .join("packages")
             .join(pkg_name);
-        return resolve_prebuilt_module_import(&pkg_root, canon_file);
+        return fresh_prebuilt_module_import(&pkg_root, canon_file);
     }
     let lib_lean_dir = canon_project_dir
         .join(".lake")
@@ -2527,7 +2546,7 @@ pub(crate) fn seed_project_theorem_shards_from_splits(
 
     let pkg_cfg_opt = crate::module_builder::optional_package_config(canon_dir)?;
     for (lf, _src, split) in split_entries {
-        if require_olean && resolve_prebuilt_module_import(canon_dir, lf).is_none() {
+        if require_olean && resolve_prebuilt_module_import(store, canon_dir, lf).is_none() {
             continue;
         }
         if split.shards.is_empty() {
@@ -2571,7 +2590,7 @@ pub(crate) fn seed_project_theorem_shards(
 ) -> Result<(usize, usize, usize)> {
     let lean_files: Vec<PathBuf> = collect_lean_files(canon_dir)
         .into_iter()
-        .filter(|lf| !require_olean || resolve_prebuilt_module_import(canon_dir, lf).is_some())
+        .filter(|lf| !require_olean || resolve_prebuilt_module_import(store, canon_dir, lf).is_some())
         .collect();
 
     let (split_entries, split_cache_hits) = load_and_split_files_cached(store, &lean_files)?;
@@ -3069,6 +3088,7 @@ pub fn run_build_command(
     match store.acquire_singleflight(&action_key, &toolchain, "module_full", &trust_domain)? {
         SingleflightOutcome::CacheHit { outputs, coalesced } => {
             let linked = store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
+            crate::module_builder::audit_existing_project_artifacts(store, &canon_dir, &targets)?;
             let seeded_shards = if seed_shards {
                 seed_project_theorem_shards(store, &canon_dir, &toolchain, &trust_domain, false)?.1
             } else {
@@ -3123,6 +3143,8 @@ pub fn run_build_command(
                     json_output,
                     Some(&file_hashes),
                 )?;
+            } else {
+                crate::module_builder::audit_existing_project_artifacts(store, &canon_dir, &targets)?;
             }
 
             let env_key = TurboStore::compute_lake_env_key(&canon_dir);

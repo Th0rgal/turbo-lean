@@ -2790,7 +2790,7 @@ pub fn run_ci_verify_command(
     // build; the trust domain alone is not evidence of sandbox execution.
     let mut bwrap_used: Option<bool> = None;
 
-    let audit_untrusted_materialized = |store_ref: &TurboStore| -> Result<()> {
+    let audit_materialized = |store_ref: &TurboStore| -> Result<()> {
         if let Some(ref mod_names) = untrusted_ci_mods {
             if !mod_names.is_empty() {
                 let (lp, _ldp) = crate::module_builder::build_lean_search_path(&cfg, true);
@@ -2808,6 +2808,8 @@ pub fn run_ci_verify_command(
                     return Err(err);
                 }
             }
+        } else {
+            crate::module_builder::audit_existing_project_artifacts(store_ref, &canon_dir, &[])?;
         }
         Ok(())
     };
@@ -2816,7 +2818,7 @@ pub fn run_ci_verify_command(
         store.get_cached_action(&action_key, &trust_domain)?
     {
         store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
-        audit_untrusted_materialized(store)?;
+        audit_materialized(store)?;
         store.record_attestation(
             &action_key,
             "turbo-lean-ci-gate",
@@ -2845,7 +2847,7 @@ pub fn run_ci_verify_command(
             )? {
                 SingleflightOutcome::CacheHit { outputs, coalesced } => {
                     store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
-                    audit_untrusted_materialized(store)?;
+                    audit_materialized(store)?;
                     store.record_attestation(
                         &action_key,
                         "turbo-lean-ci-gate",
@@ -2876,6 +2878,10 @@ pub fn run_ci_verify_command(
                 )
                 .context("CI native module build failed")?;
                 bwrap_used = Some(build_rep.bwrap_used);
+            }
+
+            if oleans_up_to_date {
+                crate::module_builder::audit_existing_project_artifacts(store, &canon_dir, &[])?;
             }
 
             let env_key = TurboStore::compute_lake_env_key(&canon_dir);
@@ -4506,7 +4512,7 @@ pub fn run_pr_verify_command(
                     .iter()
                     .map(|(_, sh)| sh.name.clone())
                     .collect();
-                if let Some(mod_imp) = resolve_prebuilt_module_import(&canon_dir, &abs_file) {
+                if let Some(mod_imp) = resolve_prebuilt_module_import(store, &canon_dir, &abs_file) {
                     let fast_ok = if let Some(sp) = current_splits.get(rel_path) {
                         splitter::can_use_fast_olean_import_with_split(sp, &uncached_names)
                     } else {
@@ -4676,7 +4682,7 @@ pub fn run_pr_verify_command(
 
                     let mut remote_ok = false;
                     if can_fast_olean {
-                        if let Some(mod_imp) = resolve_prebuilt_module_import(&canon_dir, &canon_lf)
+                        if let Some(mod_imp) = resolve_prebuilt_module_import(store, &canon_dir, &canon_lf)
                         {
                             let fast_src_opt = if let Some(sp) = current_splits.get(&rel_path) {
                                 splitter::build_fast_olean_shard_source_with_split(
@@ -4795,7 +4801,7 @@ pub fn run_pr_verify_command(
 
                     let mut verified_ok = false;
                     if can_fast_olean {
-                        if let Some(mod_imp) = resolve_prebuilt_module_import(&canon_dir, &abs_file)
+                        if let Some(mod_imp) = resolve_prebuilt_module_import(worker_store, &canon_dir, &abs_file)
                         {
                             let fast_src_opt = if let Some(sp) = current_splits.get(rel_path) {
                                 splitter::build_fast_olean_shard_source_with_split(
@@ -6736,7 +6742,7 @@ end Fixture
             bound_v1
         ));
         assert_eq!(
-            crate::lake_build::resolve_prebuilt_module_import(&proj_dir, &bound_file).as_deref(),
+            crate::lake_build::fresh_prebuilt_module_import(&proj_dir, &bound_file).as_deref(),
             Some("InitECandidate.Solver.GuestStepBound")
         );
 
@@ -6770,7 +6776,7 @@ end Fixture
             bound_v1
         ));
         assert!(
-            crate::lake_build::resolve_prebuilt_module_import(&proj_dir, &bound_file).is_none()
+            crate::lake_build::fresh_prebuilt_module_import(&proj_dir, &bound_file).is_none()
         );
 
         // 3. `are_all_project_oleans_up_to_date` must return `false` despite clean git status and `.trace` files!
