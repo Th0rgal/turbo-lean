@@ -1420,7 +1420,12 @@ pub fn prestage_blobs_from_shared_cas(
                     0i64
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    fs::metadata(&dest).map(|m| m.ino() as i64).unwrap_or(0)
+                    // Cold `TLZ1` blobs legitimately differ in length; a torn one is left for
+                    // the payload import to repair.
+                    match crate::db::probe_blob_file(&dest, b.size_bytes) {
+                        crate::db::BlobDisk::Intact(m) => m.ino() as i64,
+                        _ => return None,
+                    }
                 }
                 Err(_) => {
                     let src_p = if shared_p.exists() {
@@ -1813,11 +1818,12 @@ pub fn import_pack_bytes_with_policy(
 
     let process_chunk = |chunk: &[(&PackedBlob, &[u8])],
                          root_dir: &Path,
-                         staging_dir_ref: &Path,
+                         #[cfg_attr(unix, allow(unused_variables))] staging_dir_ref: &Path,
                          new_prefixes: &[bool; 256]|
      -> Result<(Vec<(String, String, i64, i64)>, usize)> {
         let mut local = Vec::with_capacity(chunk.len());
         let mut newly_written = 0usize;
+        #[cfg(not(unix))]
         let mut staging_ready = false;
         for &(b, blob_bytes) in chunk {
             // Re-verify BLAKE3 digest of every incoming blob (Zero-Trust transport rule!)
@@ -1837,53 +1843,23 @@ pub fn import_pack_bytes_with_policy(
             let p_idx = u8::from_str_radix(prefix, 16).unwrap_or(0) as usize;
             let dest = root_dir.join("blobs").join(prefix).join(&b.blob_hash);
 
-            // Zero-copy existing-blob skip + single-syscall create_new:
+            // Existing blobs are size-checked and torn ones rewritten; all writes are atomic.
             #[cfg(unix)]
             let inode = {
-                use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-                if !new_prefixes[p_idx] {
-                    if let Ok(m) = fs::metadata(&dest) {
-                        local.push((
-                            b.blob_hash.clone(),
-                            b.kind.clone(),
-                            blob_bytes.len() as i64,
-                            m.ino() as i64,
-                        ));
-                        continue;
-                    }
-                }
-                match fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o444)
-                    .open(&dest)
-                {
-                    Ok(mut f) => {
-                        f.write_all(blob_bytes)?;
+                use crate::db::{probe_blob_file, write_blob_atomic, BlobDisk};
+                use std::os::unix::fs::MetadataExt;
+                let len = blob_bytes.len() as u64;
+                let state = if new_prefixes[p_idx] {
+                    BlobDisk::Missing
+                } else {
+                    probe_blob_file(&dest, len)
+                };
+                match state {
+                    BlobDisk::Intact(m) => m.ino() as i64,
+                    missing_or_torn => {
+                        let replace = matches!(missing_or_torn, BlobDisk::Torn);
                         newly_written += 1;
-                        0i64
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                        fs::metadata(&dest).map(|m| m.ino() as i64).unwrap_or(0)
-                    }
-                    Err(_) => {
-                        if !staging_ready {
-                            fs::create_dir_all(staging_dir_ref)?;
-                            staging_ready = true;
-                        }
-                        let staging_path =
-                            staging_dir_ref.join(format!("{}.{}.tmp", b.blob_hash, next_tmp_id()));
-                        let mut f = fs::OpenOptions::new()
-                            .write(true)
-                            .create(true)
-                            .truncate(true)
-                            .mode(0o444)
-                            .open(&staging_path)?;
-                        f.write_all(blob_bytes)?;
-                        drop(f);
-                        fs::rename(&staging_path, &dest)?;
-                        newly_written += 1;
-                        0i64
+                        write_blob_atomic(root_dir, &dest, &b.blob_hash, blob_bytes, replace)?
                     }
                 }
             };
@@ -2822,8 +2798,8 @@ pub fn offload_check_shards_batch_http(
     } else {
         format!("{}/check-shards-batch", endpoint.trim_end_matches('/'))
     };
-    let filtered_args = crate::module_builder::filter_allowed_lean_args(lean_args);
-    let args_digest_opt = crate::module_builder::compute_lean_args_digest(&filtered_args);
+    let filtered_args = crate::module_builder::validate_effective_lean_args(lean_args)?;
+    let args_digest_opt = crate::module_builder::compute_lean_args_digest(&filtered_args)?;
     let req = CheckShardsBatchRequest {
         items: items.to_vec(),
         coalesced_shard_source: coalesced_shard_source.to_string(),
@@ -3832,6 +3808,40 @@ pub(crate) mod tests {
             "expected 400 on disallowed env_vars, got: {}",
             eval_env_err
         );
+
+        // Warm the empty-option eval path before trying arguments that filtering used to erase.
+        let eval_body = serde_json::json!({"source": "#eval 17305\n"});
+        for _ in 0..2 {
+            let reply: serde_json::Value =
+                serde_json::from_slice(&http_request_with_timeout_and_token(
+                    "POST",
+                    &format!("{}/eval", base),
+                    "application/json",
+                    &serde_json::to_vec(&eval_body)?,
+                    Some(30_000),
+                    Some(tok),
+                    || {},
+                )?)?;
+            assert_eq!(reply["ok"], true, "{reply}");
+        }
+        for invalid in ["--plugin=bad.so", "--json", "-q", " -DautoImplicit=false "] {
+            let body = serde_json::json!({"source": "#eval 17305\n", "lean_args": [invalid]});
+            let err = http_request_with_timeout_and_token(
+                "POST",
+                &format!("{}/eval", base),
+                "application/json",
+                &serde_json::to_vec(&body)?,
+                Some(2_000),
+                Some(tok),
+                || {},
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("400") && err.contains("Unsupported effective Lean compiler flag"),
+                "expected rejection before eval cache access: {err}"
+            );
+        }
 
         // 5. SHA-256 verification fails closed on mismatch
         let sha_err = http_request_full(

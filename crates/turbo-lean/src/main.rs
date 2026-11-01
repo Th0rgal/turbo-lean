@@ -1621,7 +1621,7 @@ fn run(cli: Cli) -> Result<()> {
                 });
 
             let file_lean_args =
-                module_builder::try_resolve_lean_args_for_path(&proj_dir, Some(&file));
+                module_builder::try_resolve_lean_args_for_path(&proj_dir, Some(&file))?;
             let filtered_file_lean_args = module_builder::filter_allowed_lean_args(&file_lean_args);
 
             let run_direct_lean = || -> Result<()> {

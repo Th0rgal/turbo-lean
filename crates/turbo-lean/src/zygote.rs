@@ -55,7 +55,15 @@ pub struct ZygoteEvalReply {
     pub stderr_tail: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_request: Option<String>,
+    /// `ZYGOTE_SCANNER_VERSION` when the host stderr panic scan vetted this reply; `0` for
+    /// replies from older hosts. Persisted eval replies without the current version are rejected.
+    #[serde(default)]
+    pub scanner_version: u32,
 }
+
+/// Version of the host-side reply vetting (`StderrScan` + `mark_runtime_panic`). Bump whenever
+/// a reply that an older host accepted could now be rejected, so persisted replies are not replayed.
+pub(crate) const ZYGOTE_SCANNER_VERSION: u32 = 1;
 
 /// In-process C-ABI dispatcher for `LeanNative` methods (`"ping"`, `"validate-tv"`,
 /// `"verify-certs"`, `"compile-fastcheck"`, `"eval-cex"`, `"compile-llvm"`, `"compile-ptx"`),
@@ -362,7 +370,17 @@ extern "C" fn cleanup_one_shot() {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Per-test-thread `TURBO_LEAN_NO_DAEMON` (the env var is process-global).
+    static TEST_NO_DAEMON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub(crate) fn daemon_disabled() -> bool {
+    #[cfg(test)]
+    if TEST_NO_DAEMON.with(|c| c.get()) {
+        return true;
+    }
     std::env::var("TURBO_LEAN_NO_DAEMON")
         .ok()
         .and_then(|value| crate::shm_cache::parse_relaxed_bool(&value))
@@ -1011,6 +1029,84 @@ pub(crate) fn shutdown_local_daemon(_lifecycle: &ExclusiveLifecycleLock) {
 
 const ZYGOTE_STDERR_TAIL_CAP: usize = 8192;
 
+/// Mirrors `TurboLean.ZygoteWorker.stderrReplyMark`: the worker writes it to stderr before each reply.
+const ZYGOTE_STDERR_REPLY_MARK: &str = "[TurboLean.ZygoteWorker] reply";
+
+/// How long the host waits, after reading a reply, for that reply's stderr mark.
+const ZYGOTE_STDERR_MARK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Byte-stream scan of a worker's whole stderr (the tail alone loses panics behind long
+/// backtraces or long unterminated lines): counts runtime-panic signatures and reply marks.
+#[derive(Default)]
+struct StderrScan {
+    state: std::sync::Mutex<StderrScanState>,
+    cv: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct StderrScanState {
+    panics: u64,
+    marks: u64,
+    /// Last `longest signature - 1` bytes, so a signature split across chunks is still seen.
+    overlap: Vec<u8>,
+}
+
+impl StderrScan {
+    /// Scans every byte of `chunk`; only matches ending inside `chunk` are new.
+    fn feed(&self, chunk: &[u8]) {
+        let Ok(mut g) = self.state.lock() else {
+            return;
+        };
+        let keep = g.overlap.len();
+        let mut buf = std::mem::take(&mut g.overlap);
+        buf.extend_from_slice(chunk);
+        let count = |pat: &str| {
+            let pat = pat.as_bytes();
+            buf.windows(pat.len())
+                .enumerate()
+                .filter(|(i, w)| *w == pat && i + pat.len() > keep)
+                .count() as u64
+        };
+        let marks = count(ZYGOTE_STDERR_REPLY_MARK);
+        g.panics += RUNTIME_PANIC_SIGNATURES
+            .iter()
+            .map(|s| count(s))
+            .sum::<u64>();
+        g.marks += marks;
+        let longest = RUNTIME_PANIC_SIGNATURES
+            .iter()
+            .chain([&ZYGOTE_STDERR_REPLY_MARK])
+            .map(|s| s.len())
+            .max()
+            .unwrap_or(1);
+        g.overlap = buf[buf.len().saturating_sub(longest - 1)..].to_vec();
+        drop(g);
+        if marks > 0 {
+            self.cv.notify_all();
+        }
+    }
+
+    fn snapshot(&self) -> (u64, u64) {
+        self.state
+            .lock()
+            .map(|g| (g.panics, g.marks))
+            .unwrap_or((u64::MAX, u64::MAX))
+    }
+
+    /// Whether the request since `before` must be treated as panicked: a runtime panic hit stderr,
+    /// or its reply mark did not arrive within `wait` (fail closed: an unseen mark means unseen
+    /// stderr, which may hold a panic).
+    fn panicked_since(&self, before: (u64, u64), wait: std::time::Duration) -> bool {
+        let Ok(g) = self.state.lock() else {
+            return true;
+        };
+        match self.cv.wait_timeout_while(g, wait, |s| s.marks <= before.1) {
+            Ok((g, _)) => g.marks <= before.1 || g.panics > before.0,
+            Err(_) => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct WorkerCrashDiagnostics {
     message: String,
@@ -1028,6 +1124,7 @@ pub struct ZygoteWorkerProcess {
     stdin: std::process::ChildStdin,
     stdout: BufReader<std::process::ChildStdout>,
     stderr_tail: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    stderr_scan: std::sync::Arc<StderrScan>,
     warm_prefixes: std::collections::HashSet<String>,
     warm_prefix_tree: Vec<(String, String)>,
     warm_imports: std::collections::HashMap<String, String>,
@@ -1052,27 +1149,91 @@ static ZYGOTE_POOL: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<(String, String, String), Vec<ZygoteWorkerProcess>>>,
 > = std::sync::OnceLock::new();
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct OleanFileStatSig {
+    dev: u64,
+    ino: u64,
+    mtime_sec: i64,
+    mtime_nsec: i64,
+    ctime_sec: i64,
+    ctime_nsec: i64,
+    size: u64,
+}
+
+impl OleanFileStatSig {
+    fn from_meta(meta: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Self {
+                dev: meta.dev(),
+                ino: meta.ino(),
+                mtime_sec: meta.mtime(),
+                mtime_nsec: meta.mtime_nsec(),
+                ctime_sec: meta.ctime(),
+                ctime_nsec: meta.ctime_nsec(),
+                size: meta.len(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let (ms, mn, sz) = TurboStore::extract_file_stat_tuple(meta);
+            Self {
+                dev: 0,
+                ino: 0,
+                mtime_sec: ms,
+                mtime_nsec: mn,
+                ctime_sec: 0,
+                ctime_nsec: 0,
+                size: sz as u64,
+            }
+        }
+    }
+
+    fn is_racily_clean(&self, now_ns: i128) -> bool {
+        #[cfg(unix)]
+        {
+            const GUARD_NS: i128 = 50_000_000;
+            let mtime_ns = (self.mtime_sec as i128) * 1_000_000_000 + (self.mtime_nsec as i128);
+            let ctime_ns = (self.ctime_sec as i128) * 1_000_000_000 + (self.ctime_nsec as i128);
+            mtime_ns <= now_ns - GUARD_NS && ctime_ns <= now_ns - GUARD_NS
+        }
+        #[cfg(not(unix))]
+        {
+            const GUARD_NS: i128 = 2_000_000_000;
+            let mtime_ns = (self.mtime_sec as i128) * 1_000_000_000 + (self.mtime_nsec as i128);
+            mtime_ns <= now_ns - GUARD_NS
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CachedOleanEntryDigest {
+    olean_stat: OleanFileStatSig,
+    companions_stat: [Option<OleanFileStatSig>; 5],
+    entry_bytes: Vec<u8>,
+    parsed_deps: Option<Vec<String>>,
+}
+
+static OLEAN_ENTRY_DIGEST_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, CachedOleanEntryDigest>>,
+> = std::sync::OnceLock::new();
+
+fn stat_companion_file(path: &Path) -> Result<Option<OleanFileStatSig>, ()> {
+    match fs::metadata(path) {
+        Ok(cm) if cm.is_file() => Ok(Some(OleanFileStatSig::from_meta(&cm))),
+        Ok(_) => Err(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
 fn digest_olean_path_entry(
     olean_path: &Path,
     meta: &fs::Metadata,
     hasher: &mut blake3::Hasher,
 ) -> Option<Vec<String>> {
-    let len = meta.len();
-    hasher.update(olean_path.to_string_lossy().as_bytes());
-    hasher.update(b":");
-    hasher.update(&len.to_le_bytes());
-
-    let olean_bytes = match fs::read(olean_path) {
-        Ok(b) => b,
-        Err(_) => {
-            hasher.update(b"unreadable;");
-            return None;
-        }
-    };
-    let parsed_deps = crate::module_builder::parse_olean_binary_imports(&olean_bytes)
-        .map(|(imps, _)| imps.into_iter().map(|i| i.module).collect::<Vec<String>>());
-    hasher.update(blake3::hash(&olean_bytes).to_hex().as_bytes());
-
+    let olean_stat = OleanFileStatSig::from_meta(meta);
     let companions = [
         (
             "srv",
@@ -1089,31 +1250,119 @@ fn digest_olean_path_entry(
             PathBuf::from(format!("{}.sig", olean_path.with_extension("ir").display())),
         ),
     ];
-    for (tag, comp_path) in companions {
-        hasher.update(b"|");
-        hasher.update(tag.as_bytes());
-        hasher.update(b":");
-        match fs::metadata(&comp_path) {
-            Ok(cm) if cm.is_file() => match fs::read(&comp_path) {
-                Ok(cb) => {
-                    hasher.update(blake3::hash(&cb).to_hex().as_bytes());
-                }
-                Err(_) => {
-                    hasher.update(b"err");
-                }
-            },
-            Ok(_) => {
-                hasher.update(b"nonfile");
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                hasher.update(b"0");
-            }
-            Err(_) => {
-                hasher.update(b"err");
+    let mut comp_stats: [Option<OleanFileStatSig>; 5] = Default::default();
+    let mut all_comp_stat_ok = true;
+    for (idx, (_, comp_path)) in companions.iter().enumerate() {
+        match stat_companion_file(comp_path) {
+            Ok(st) => comp_stats[idx] = st,
+            Err(()) => {
+                all_comp_stat_ok = false;
+                break;
             }
         }
     }
-    hasher.update(b";");
+
+    let cache_mutex = OLEAN_ENTRY_DIGEST_CACHE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if all_comp_stat_ok {
+        if let Ok(guard) = cache_mutex.lock() {
+            if let Some(hit) = guard.get(olean_path) {
+                if hit.olean_stat == olean_stat && hit.companions_stat == comp_stats {
+                    hasher.update(&hit.entry_bytes);
+                    return hit.parsed_deps.clone();
+                }
+            }
+        }
+    }
+
+    let pre_read_now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i128)
+        .unwrap_or(0);
+    let len = meta.len();
+    let mut entry_bytes = Vec::with_capacity(256);
+    entry_bytes.extend_from_slice(olean_path.to_string_lossy().as_bytes());
+    entry_bytes.push(b':');
+    entry_bytes.extend_from_slice(&len.to_le_bytes());
+
+    let olean_bytes = match fs::read(olean_path) {
+        Ok(b) => b,
+        Err(_) => {
+            entry_bytes.extend_from_slice(b"unreadable;");
+            hasher.update(&entry_bytes);
+            return None;
+        }
+    };
+    let parsed_deps = crate::module_builder::parse_olean_binary_imports(&olean_bytes)
+        .map(|(imps, _)| imps.into_iter().map(|i| i.module).collect::<Vec<String>>());
+    entry_bytes.extend_from_slice(blake3::hash(&olean_bytes).to_hex().as_bytes());
+
+    let mut cacheable = all_comp_stat_ok
+        && olean_stat.is_racily_clean(pre_read_now_ns)
+        && comp_stats
+            .iter()
+            .flatten()
+            .all(|s| s.is_racily_clean(pre_read_now_ns));
+    for (idx, (tag, comp_path)) in companions.iter().enumerate() {
+        entry_bytes.push(b'|');
+        entry_bytes.extend_from_slice(tag.as_bytes());
+        entry_bytes.push(b':');
+        match fs::metadata(comp_path) {
+            Ok(cm) if cm.is_file() => match fs::read(comp_path) {
+                Ok(cb) => {
+                    let pre_sig = OleanFileStatSig::from_meta(&cm);
+                    if comp_stats[idx] != Some(pre_sig) {
+                        cacheable = false;
+                    }
+                    match stat_companion_file(comp_path) {
+                        Ok(Some(post_sig)) if post_sig == pre_sig => {}
+                        _ => cacheable = false,
+                    }
+                    entry_bytes.extend_from_slice(blake3::hash(&cb).to_hex().as_bytes());
+                }
+                Err(_) => {
+                    cacheable = false;
+                    entry_bytes.extend_from_slice(b"err");
+                }
+            },
+            Ok(_) => {
+                cacheable = false;
+                entry_bytes.extend_from_slice(b"nonfile");
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if comp_stats[idx].is_some() {
+                    cacheable = false;
+                }
+                entry_bytes.extend_from_slice(b"0");
+            }
+            Err(_) => {
+                cacheable = false;
+                entry_bytes.extend_from_slice(b"err");
+            }
+        }
+    }
+    entry_bytes.push(b';');
+    hasher.update(&entry_bytes);
+
+    let post_olean_matches = fs::metadata(olean_path)
+        .map(|m| m.is_file() && OleanFileStatSig::from_meta(&m) == olean_stat)
+        .unwrap_or(false);
+    if cacheable && post_olean_matches {
+        if let Ok(mut guard) = cache_mutex.lock() {
+            if guard.len() >= 16384 {
+                guard.clear();
+            }
+            guard.insert(
+                olean_path.to_path_buf(),
+                CachedOleanEntryDigest {
+                    olean_stat,
+                    companions_stat: comp_stats,
+                    entry_bytes,
+                    parsed_deps: parsed_deps.clone(),
+                },
+            );
+        }
+    }
     parsed_deps
 }
 
@@ -1121,6 +1370,13 @@ fn digest_olean_path_entry(
 /// resolved `.olean` files and their companions (`.olean.server`, `.olean.private`, `.ilean`,
 /// `.ir`, `.ir.sig`) for `imports_csv` along `effective_lean_path`.
 pub fn compute_imported_oleans_digest(imports_csv: &str, effective_lean_path: &str) -> String {
+    compute_imported_oleans_digest_inner(imports_csv, effective_lean_path).0
+}
+
+fn compute_imported_oleans_digest_inner(
+    imports_csv: &str,
+    effective_lean_path: &str,
+) -> (String, bool) {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"turbo-zygote-olean-digest:v3:");
     hasher.update(effective_lean_path.as_bytes());
@@ -1146,17 +1402,18 @@ pub fn compute_imported_oleans_digest(imports_csv: &str, effective_lean_path: &s
     let mut ordered_mods: Vec<String> = Vec::new();
     let mut resolved_map: std::collections::HashMap<String, Option<PathBuf>> =
         std::collections::HashMap::new();
+    let mut closure_complete = true;
 
     while let Some(mod_name) = worklist.pop() {
         if !visited.insert(mod_name.clone()) {
             continue;
         }
         ordered_mods.push(mod_name.clone());
-        if mod_name == "Init"
+        let is_tc_builtin = mod_name == "Init"
             || mod_name.starts_with("Init.")
             || mod_name == "Lean"
-            || mod_name.starts_with("Lean.")
-        {
+            || mod_name.starts_with("Lean.");
+        if is_tc_builtin {
             let rel_olean = format!(
                 "{}.olean",
                 crate::module_builder::module_name_to_rel_slash(&mod_name)
@@ -1180,17 +1437,22 @@ pub fn compute_imported_oleans_digest(imports_csv: &str, effective_lean_path: &s
             .map(|d| d.join(&rel_olean))
             .find(|p| p.is_file());
         if let Some(ref olean_path) = found {
-            if let Ok(bytes) = fs::read(olean_path) {
-                if let Some((sub_imps, _)) =
-                    crate::module_builder::parse_olean_binary_imports(&bytes)
-                {
-                    for sub in sub_imps {
-                        if !visited.contains(&sub.module) {
-                            worklist.push(sub.module);
+            if let Ok(meta) = fs::metadata(olean_path) {
+                let mut sink = blake3::Hasher::new();
+                if let Some(sub_imps) = digest_olean_path_entry(olean_path, &meta, &mut sink) {
+                    for sub_mod in sub_imps {
+                        if !visited.contains(&sub_mod) {
+                            worklist.push(sub_mod);
                         }
                     }
+                } else {
+                    closure_complete = false;
                 }
+            } else {
+                closure_complete = false;
             }
+        } else if !is_tc_builtin {
+            closure_complete = false;
         }
         resolved_map.insert(mod_name, found);
     }
@@ -1203,8 +1465,11 @@ pub fn compute_imported_oleans_digest(imports_csv: &str, effective_lean_path: &s
         match resolved_map.get(&mod_name).and_then(|o| o.as_ref()) {
             Some(olean_path) => {
                 if let Ok(meta) = fs::metadata(olean_path) {
-                    let _ = digest_olean_path_entry(olean_path, &meta, &mut hasher);
+                    if digest_olean_path_entry(olean_path, &meta, &mut hasher).is_none() {
+                        closure_complete = false;
+                    }
                 } else {
+                    closure_complete = false;
                     hasher.update(b"unreadable;");
                 }
             }
@@ -1216,12 +1481,13 @@ pub fn compute_imported_oleans_digest(imports_csv: &str, effective_lean_path: &s
                 {
                     hasher.update(b"toolchain-builtin;");
                 } else {
+                    closure_complete = false;
                     hasher.update(b"missing;");
                 }
             }
         }
     }
-    hasher.finalize().to_hex().to_string()
+    (hasher.finalize().to_hex().to_string(), closure_complete)
 }
 
 /// Compute a deterministic BLAKE3 digest over all `.olean` files inside non-toolchain,
@@ -1470,19 +1736,20 @@ const RUNTIME_PANIC_ERR: &str =
 /// Mirrors `TurboLean.ZygoteWorker.isRuntimePanicText`: Lean panic output or `EnvExtension`
 /// corruption, not any mention of the word `PANIC`.
 fn is_runtime_panic_text(s: &str) -> bool {
-    [
-        "PANIC at ",
-        "INTERNAL PANIC",
-        "invalid environment extension",
-    ]
-    .iter()
-    .any(|m| s.contains(m))
+    RUNTIME_PANIC_SIGNATURES.iter().any(|m| s.contains(m))
 }
 
-/// Fails a reply whose worker hit a runtime panic; returns whether the worker must be discarded.
-fn mark_runtime_panic(rep: &mut ZygoteEvalReply) -> bool {
+const RUNTIME_PANIC_SIGNATURES: [&str; 3] = [
+    "PANIC at ",
+    "INTERNAL PANIC",
+    "invalid environment extension",
+];
+
+/// Fails a reply whose worker hit a runtime panic (reported, in its messages, or seen on the
+/// worker's stderr during the request); returns whether the worker must be discarded.
+fn mark_runtime_panic(rep: &mut ZygoteEvalReply, stderr_panic: bool) -> bool {
     let reported = rep.errors.iter().any(|e| e == RUNTIME_PANIC_ERR);
-    if !reported && !rep.messages.iter().any(|m| is_runtime_panic_text(m)) {
+    if !reported && !stderr_panic && !rep.messages.iter().any(|m| is_runtime_panic_text(m)) {
         return false;
     }
     rep.ok = false;
@@ -1747,6 +2014,14 @@ pub(crate) fn ensure_zygote_binary(
     lean_bin: &Path,
     env_vars: &std::collections::HashMap<String, String>,
 ) -> Result<std::path::PathBuf> {
+    ensure_zygote_binary_at(&store.root, lean_bin, env_vars)
+}
+
+fn ensure_zygote_binary_at(
+    store_root: &Path,
+    lean_bin: &Path,
+    env_vars: &std::collections::HashMap<String, String>,
+) -> Result<std::path::PathBuf> {
     let _lifecycle = lifecycle_lock(false)?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"turbo-zygote:v3:shared:");
@@ -1757,7 +2032,7 @@ pub(crate) fn ensure_zygote_binary(
     }
     hasher.update(ZYGOTE_WORKER_LEAN_SRC.as_bytes());
     let bin_name = format!("turbo_zygote_{}", &hasher.finalize().to_hex()[..16]);
-    let bin_dir = store.root.join("fastcheck_bins");
+    let bin_dir = store_root.join("fastcheck_bins");
     fs::create_dir_all(&bin_dir)?;
     let cached_bin = bin_dir.join(&bin_name);
     if cached_bin.exists() {
@@ -1872,6 +2147,9 @@ struct ZygoteAuditModulesReply {
     pub audited: Option<Vec<String>>,
     #[serde(default)]
     pub violations: Vec<String>,
+    /// `--shard` mode: the module's non-stub theorems, read from the kernel environment.
+    #[serde(default)]
+    pub decls: Option<Vec<String>>,
 }
 
 pub(crate) struct PinnedFfiPackage {
@@ -2162,7 +2440,14 @@ fn audit_compiled_module_batch(
         is_untrusted,
     )
     .context("Failed to execute in-kernel `.olean` soundness auditor (`--audit-modules`)")?;
+    parse_audit_modules_reply(&out, mod_names).map(drop)
+}
 
+/// The auditor's verdict on `mod_names`: its JSON reply when every module passed, else an error.
+fn parse_audit_modules_reply(
+    out: &std::process::Output,
+    mod_names: &[String],
+) -> Result<ZygoteAuditModulesReply> {
     let stdout_str = String::from_utf8_lossy(&out.stdout);
     let stderr_str = String::from_utf8_lossy(&out.stderr);
     let json_line = stdout_str
@@ -2180,7 +2465,7 @@ fn audit_compiled_module_batch(
                 && reply.violations.is_empty()
                 && reply.audited.as_deref() == Some(mod_names) =>
         {
-            Ok(())
+            Ok(reply)
         }
         Some(reply) => {
             let details = if reply.violations.is_empty() {
@@ -2209,6 +2494,177 @@ fn audit_compiled_module_batch(
             );
         }
     }
+}
+
+/// Plain-`lean` fallback for a shard the zygote could not check (unavailable or import failure):
+/// compile `source` to a scratch `.olean`, then accept it only on the kernel-level
+/// `--audit-modules --shard` verdict over the compiled module (axioms incl. `sorryAx`,
+/// extern/implemented_by, csimp, `unsafe`), never on output the shard itself controls. Only the
+/// source's `:= sorry` prefix stubs outside `audit` are exempt, by name and kernel value, and every
+/// `audit` theorem must be declared. A failed compile returns its non-success output; an audit
+/// rejection is an error.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_audited_lean_shard(
+    store: &TurboStore,
+    lean_bin: &Path,
+    env_vars: &std::collections::HashMap<String, String>,
+    cwd: Option<&Path>,
+    source: &str,
+    audit: &std::collections::HashSet<String>,
+    lean_args: &[String],
+    timeout_ms: Option<u64>,
+) -> Result<std::process::Output> {
+    let started = std::time::Instant::now();
+    let mod_name = format!("TurboAuditedShard_{}_{}", std::process::id(), next_tmp_id());
+    let tmp_dir = store.fast_staging_dir().join(&mod_name);
+    let _ = fs::remove_dir_all(&tmp_dir);
+    fs::create_dir_all(&tmp_dir)?;
+    struct TmpDirGuard(PathBuf);
+    impl Drop for TmpDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _guard = TmpDirGuard(tmp_dir.clone());
+    let lean_file = tmp_dir.join(format!("{}.lean", mod_name));
+    fs::write(&lean_file, source)?;
+    let mut cmd = Command::new(lean_bin);
+    cmd.args(crate::module_builder::filter_allowed_lean_args(lean_args))
+        .arg("-Ddebug.skipKernelTC=false")
+        .arg(&lean_file)
+        .arg("-R")
+        .arg(&tmp_dir)
+        .arg("-o")
+        .arg(tmp_dir.join(format!("{}.olean", mod_name)))
+        .envs(env_vars);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let out = match timeout_ms {
+        Some(_) => run_lean_command(&mut cmd, timeout_ms),
+        None => cmd.output().map_err(Into::into),
+    }
+    .context("Failed to execute `lean` on shard fallback")?;
+    if !out.status.success() {
+        return Ok(out);
+    }
+
+    let lean_path = env_vars
+        .get("LEAN_PATH")
+        .cloned()
+        .or_else(|| std::env::var("LEAN_PATH").ok())
+        .filter(|lp| !lp.is_empty())
+        .map_or_else(
+            || tmp_dir.display().to_string(),
+            |lp| format!("{}:{}", tmp_dir.display(), lp),
+        );
+    // A request budget bounds the whole fallback: compile, auditor preparation and audit.
+    let budget_left = |stage: &str| -> Result<Option<std::time::Duration>> {
+        timeout_ms
+            .map(|ms| {
+                let left = std::time::Duration::from_millis(ms).saturating_sub(started.elapsed());
+                anyhow::ensure!(!left.is_zero(), "Lean request timed out before {}", stage);
+                Ok(left)
+            })
+            .transpose()
+    };
+    let zygote_bin = match budget_left("the shard auditor was ready")? {
+        None => ensure_zygote_binary(store, lean_bin, env_vars)?,
+        // A cold auditor build may outlive the request; it still warms the cache in the background.
+        Some(left) => {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (root, lean, env) = (store.root.clone(), lean_bin.to_path_buf(), env_vars.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(ensure_zygote_binary_at(&root, &lean, &env));
+            });
+            rx.recv_timeout(left).map_err(|_| {
+                anyhow::anyhow!("Lean request timed out before the shard auditor was ready")
+            })??
+        }
+    };
+    let mut auditor = Command::new(zygote_bin);
+    auditor
+        .envs(env_vars)
+        .env("LEAN", lean_bin)
+        .env("LEAN_PATH", lean_path)
+        .args(["--audit-modules", "--shard"]);
+    // The auditor links `libleanshared` from the toolchain, which an elan-proxied `lean` does not
+    // put on the loader path.
+    let mut prefix_cmd = Command::new(lean_bin);
+    prefix_cmd.arg("--print-prefix").envs(env_vars);
+    if let Some(dir) = cwd {
+        prefix_cmd.current_dir(dir);
+    }
+    let prefix_out = match budget_left("the toolchain prefix query")? {
+        None => prefix_cmd.output().ok(),
+        Some(left) => run_lean_command(&mut prefix_cmd, Some(left.as_millis().max(1) as u64)).ok(),
+    };
+    if let Some(p) = prefix_out.filter(|p| p.status.success()) {
+        let prefix = PathBuf::from(String::from_utf8_lossy(&p.stdout).trim());
+        let mut ld = format!(
+            "{}:{}",
+            prefix.join("lib/lean").display(),
+            prefix.join("lib").display()
+        );
+        if let Some(prev) = env_vars
+            .get("LD_LIBRARY_PATH")
+            .cloned()
+            .or_else(|| std::env::var("LD_LIBRARY_PATH").ok())
+            .filter(|l| !l.is_empty())
+        {
+            ld = format!("{}:{}", ld, prev);
+        }
+        auditor.env("LD_LIBRARY_PATH", ld);
+    }
+    if !env_vars.contains_key(crate::splitter::ALLOWED_AXIOMS_ENV) {
+        auditor.env(
+            crate::splitter::ALLOWED_AXIOMS_ENV,
+            crate::splitter::extra_allowed_axiom_patterns().join(","),
+        );
+    }
+    for sh in crate::splitter::split_lean_source(source, &[]).shards {
+        if crate::splitter::strip_lean_comments(&sh.proof_text).trim() == "sorry"
+            && !crate::splitter::matches_uncached_or_fast_verify_name(&sh.name, audit)
+        {
+            auditor.arg(format!("--stub-ok={}", sh.name));
+        }
+    }
+    auditor.arg(&mod_name);
+    if let Some(dir) = cwd {
+        auditor.current_dir(dir);
+    }
+    let mut audit_timeout = std::time::Duration::from_secs(
+        std::env::var("TURBO_LEAN_AUDIT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(300),
+    );
+    if let Some(left) = budget_left("the shard audit")? {
+        audit_timeout = audit_timeout.min(left);
+    }
+    let audit_out =
+        crate::module_builder::run_command_with_timeout(&mut auditor, audit_timeout, false)
+            .context("Failed to execute in-kernel shard auditor (`--audit-modules --shard`)")?;
+    let decls = parse_audit_modules_reply(&audit_out, std::slice::from_ref(&mod_name))?
+        .decls
+        .unwrap_or_default();
+    let missing: Vec<&String> = audit
+        .iter()
+        .filter(|name| {
+            let one = std::collections::HashSet::from([(*name).clone()]);
+            !decls
+                .iter()
+                .any(|d| crate::splitter::matches_uncached_or_fast_verify_name(d, &one))
+        })
+        .collect();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "[TurboLean.KernelGate] audited theorem(s) {:?} missing from the compiled shard",
+            missing
+        );
+    }
+    Ok(out)
 }
 
 static ZYGOTE_LEAN_PATH_CACHE: std::sync::OnceLock<
@@ -2383,6 +2839,17 @@ pub fn eval_with_zygote_pool_opts_with_args(
     )
 }
 
+/// The cache and executor must agree on the final import search order and artifacts.
+pub(crate) struct ResolvedZygoteContext {
+    lean_path: String,
+    imports_csv: String,
+    olean_digest: String,
+    search_path_digest: String,
+    host_closure_digest: String,
+    toolchain_policy: String,
+    pub(crate) identity: String,
+}
+
 fn encode_lean_args_hex(lean_args: &[String]) -> String {
     let filtered = crate::module_builder::filter_allowed_lean_args(lean_args);
     if filtered.is_empty() {
@@ -2392,33 +2859,31 @@ fn encode_lean_args_hex(lean_args: &[String]) -> String {
     }
 }
 
+fn attach_host_closure_digest(req_line: &str, host_closure_digest: &str) -> String {
+    if host_closure_digest.is_empty() {
+        return req_line.to_string();
+    }
+    let trimmed = req_line.trim_end_matches('\n');
+    let cols = trimmed.split('\t').count();
+    let mut out = String::with_capacity(trimmed.len() + host_closure_digest.len() + 8);
+    out.push_str(trimmed);
+    for _ in cols..6 {
+        out.push('\t');
+    }
+    out.push('\t');
+    out.push_str(host_closure_digest);
+    out.push('\n');
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
-fn eval_with_zygote_pool_inner(
-    store: &TurboStore,
+pub(crate) fn resolve_zygote_context(
     toolchain: &str,
     req_lean_path: &str,
     env_vars: &std::collections::HashMap<String, String>,
     lean_bin: &Path,
-    shard_source: &str,
-    allow_stub: bool,
-    eval_mode: bool,
-    file_name: Option<&str>,
-    timeout_ms: Option<u64>,
-    batch_fission_override: Option<(String, String, String)>,
-    lean_args: &[String],
-) -> Result<ZygoteEvalReply> {
-    let request_started = std::time::Instant::now();
-    let default_timeout_ms = if eval_mode { 900_000 } else { 30_000 };
-    let effective_timeout_ms = timeout_ms.unwrap_or_else(|| {
-        std::env::var("TURBO_LEAN_TIMEOUT_MS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|&ms| ms > 0)
-            .unwrap_or(default_timeout_ms)
-    });
-    let deadline = request_started + std::time::Duration::from_millis(effective_timeout_ms);
-    let _lifecycle = lifecycle_lock(false)?;
-
+    raw_imports_csv: &str,
+) -> ResolvedZygoteContext {
     let env_lp = env_vars.get("LEAN_PATH").cloned().unwrap_or_default();
     let lp_cache_key = (
         req_lean_path.to_string(),
@@ -2502,14 +2967,15 @@ fn eval_with_zygote_pool_inner(
         eff
     };
 
-    let (raw_imports_csv, body_code) = if let Some((ref imp, _, _)) = batch_fission_override {
-        (imp.clone(), String::new())
-    } else {
-        split_shard_for_zygote(shard_source)
-    };
-    let imports_csv = coalesce_proofkit_imports(&raw_imports_csv, &effective_lean_path);
+    let imports_csv = coalesce_proofkit_imports(raw_imports_csv, &effective_lean_path);
     let search_path_digest = compute_search_path_oleans_digest(&effective_lean_path);
-    let imported_digest = compute_imported_oleans_digest(&imports_csv, &effective_lean_path);
+    let (imported_digest, closure_complete) =
+        compute_imported_oleans_digest_inner(&imports_csv, &effective_lean_path);
+    let host_closure_digest = if closure_complete {
+        imported_digest.as_str()
+    } else {
+        ""
+    };
     let pool_digest_tag = search_path_digest.clone();
     // Workers enforce the axiom policy they were spawned with: key them (and their replies) by it.
     let toolchain_policy = format!(
@@ -2520,15 +2986,89 @@ fn eval_with_zygote_pool_inner(
             .cloned()
             .unwrap_or_else(|| crate::splitter::allowed_axioms().join(","))
     );
+    let olean_digest = format!("{}:{}", search_path_digest, imported_digest);
+    let compiler_path = fs::canonicalize(lean_bin).unwrap_or_else(|_| lean_bin.to_path_buf());
+    let compiler_digest = fs::read(&compiler_path)
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+        .unwrap_or_default();
+    let compiler_identity = blake3::hash(
+        &serde_json::to_vec(&(&toolchain_policy, &compiler_path, compiler_digest))
+            .expect("compiler identity serializes"),
+    )
+    .to_hex()
+    .to_string();
+    let identity = blake3::hash(
+        &serde_json::to_vec(&(&compiler_identity, &effective_lean_path, &imports_csv, &olean_digest))
+            .expect("execution identity serializes"),
+    )
+    .to_hex()
+    .to_string();
+    let toolchain_policy = format!("{}#{}", toolchain_policy, compiler_identity);
+    ResolvedZygoteContext {
+        lean_path: effective_lean_path,
+        imports_csv,
+        olean_digest,
+        search_path_digest: pool_digest_tag,
+        host_closure_digest: host_closure_digest.to_string(),
+        toolchain_policy,
+        identity,
+    }
+}
+
+
+#[allow(clippy::too_many_arguments)]
+fn eval_with_zygote_pool_inner(
+    store: &TurboStore,
+    toolchain: &str,
+    req_lean_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    lean_bin: &Path,
+    shard_source: &str,
+    allow_stub: bool,
+    eval_mode: bool,
+    file_name: Option<&str>,
+    timeout_ms: Option<u64>,
+    batch_fission_override: Option<(String, String, String)>,
+    lean_args: &[String],
+) -> Result<ZygoteEvalReply> {
+    let request_started = std::time::Instant::now();
+    let default_timeout_ms = if eval_mode { 900_000 } else { 30_000 };
+    let effective_timeout_ms = timeout_ms.unwrap_or_else(|| {
+        std::env::var("TURBO_LEAN_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .unwrap_or(default_timeout_ms)
+    });
+    let deadline = request_started + std::time::Duration::from_millis(effective_timeout_ms);
+    let _lifecycle = lifecycle_lock(false)?;
+
+    // Validate the original arguments before encoding can discard unsupported flags.
+    let args_digest_opt = crate::module_builder::compute_lean_args_digest(lean_args)?;
+    let hex_opts = encode_lean_args_hex(lean_args);
+    let (raw_imports_csv, body_code) = if let Some((ref imp, _, _)) = batch_fission_override {
+        (imp.clone(), String::new())
+    } else {
+        split_shard_for_zygote(shard_source)
+    };
+    let context = resolve_zygote_context(
+        toolchain,
+        req_lean_path,
+        env_vars,
+        lean_bin,
+        &raw_imports_csv,
+    );
+    let effective_lean_path = context.lean_path;
+    let imports_csv = context.imports_csv;
+    let pool_digest_tag = context.search_path_digest;
+    let toolchain_policy = context.toolchain_policy;
+    let olean_digest = context.olean_digest;
+    let host_closure_digest = context.host_closure_digest.as_str();
     let pool_key = (
         toolchain_policy.clone(),
         effective_lean_path.clone(),
         format!("{}#{}", pool_digest_tag, imports_csv),
     );
-    let olean_digest = format!("{}:{}", search_path_digest, imported_digest);
-
-    let hex_opts = encode_lean_args_hex(lean_args);
-    let args_digest_opt = crate::module_builder::compute_lean_args_digest(lean_args);
     let verified_cache_policy = match &args_digest_opt {
         Some(ad) => format!("{}#opts:{}", toolchain_policy, ad),
         None => toolchain_policy.clone(),
@@ -2639,8 +3179,10 @@ fn eval_with_zygote_pool_inner(
                 .ok_or_else(|| anyhow::anyhow!("Missing Zygote stdout"))?,
         );
         let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stderr_scan = std::sync::Arc::new(StderrScan::default());
         if let Some(mut child_stderr) = child.stderr.take() {
             let tail_clone = stderr_tail.clone();
+            let scan_clone = stderr_scan.clone();
             std::thread::spawn(move || {
                 use std::io::Read;
                 let mut chunk = [0u8; 1024];
@@ -2648,6 +3190,7 @@ fn eval_with_zygote_pool_inner(
                     if n == 0 {
                         break;
                     }
+                    scan_clone.feed(&chunk[..n]);
                     if let Ok(mut g) = tail_clone.lock() {
                         g.extend_from_slice(&chunk[..n]);
                         if g.len() > ZYGOTE_STDERR_TAIL_CAP {
@@ -2664,6 +3207,7 @@ fn eval_with_zygote_pool_inner(
             stdin,
             stdout,
             stderr_tail,
+            stderr_scan,
             warm_prefixes: std::collections::HashSet::new(),
             warm_prefix_tree: Vec::new(),
             warm_imports: std::collections::HashMap::new(),
@@ -2733,6 +3277,7 @@ fn eval_with_zygote_pool_inner(
             }
             let pid = worker.child.id();
             let rss_before = measure_process_rss_mb(pid);
+            let scan_before = worker.stderr_scan.snapshot();
             if let Err(e) = worker
                 .stdin
                 .write_all(req_line.as_bytes())
@@ -2772,7 +3317,11 @@ fn eval_with_zygote_pool_inner(
                         let rss_after = measure_process_rss_mb(pid);
                         parsed.rss_delta_mb = (rss_after as i64) - (rss_before as i64);
                         parsed.peak_rss_mb = rss_after.max(rss_before);
-                        mark_runtime_panic(&mut parsed);
+                        let stderr_panic = worker
+                            .stderr_scan
+                            .panicked_since(scan_before, ZYGOTE_STDERR_MARK_WAIT);
+                        mark_runtime_panic(&mut parsed, stderr_panic);
+                        parsed.scanner_version = ZYGOTE_SCANNER_VERSION;
                         WorkerReqOutcome::Reply(parsed)
                     }
                     Err(e) => {
@@ -2945,7 +3494,7 @@ fn eval_with_zygote_pool_inner(
                 .iter()
                 .map(|blk| {
                     let hb = hex_encode_bytes(blk.as_bytes());
-                    if hex_opts.is_empty() {
+                    let base = if hex_opts.is_empty() {
                         if allow_stub {
                             format!("{}\t{}\tallow_stub\n", imports_csv, hb)
                         } else {
@@ -2954,7 +3503,8 @@ fn eval_with_zygote_pool_inner(
                     } else {
                         let mode_flag = if allow_stub { "allow_stub" } else { "strict" };
                         format!("{}\t{}\t{}\t\t\t{}\n", imports_csv, hb, mode_flag, hex_opts)
-                    }
+                    };
+                    attach_host_closure_digest(&base, host_closure_digest)
                 })
                 .collect();
 
@@ -3028,6 +3578,7 @@ fn eval_with_zygote_pool_inner(
             let rss_delta_mb: i64 = replies.iter().map(|r| r.rss_delta_mb).max().unwrap_or(0);
             let peak_rss_mb: u64 = replies.iter().map(|r| r.peak_rss_mb).max().unwrap_or(0);
             let subshards_verified: usize = replies.iter().map(|r| r.subshards_verified).sum();
+            let scanner_version = replies.iter().map(|r| r.scanner_version).min().unwrap_or(0);
             let mut stdout = String::new();
             let mut messages = Vec::new();
             let mut errors = Vec::new();
@@ -3061,6 +3612,7 @@ fn eval_with_zygote_pool_inner(
                 messages,
                 errors,
                 used_constants,
+                scanner_version,
                 timed_out: false,
                 crashed: false,
                 ..Default::default()
@@ -3186,6 +3738,7 @@ fn eval_with_zygote_pool_inner(
                 (rl, None, None)
             }
         };
+    let req_line = attach_host_closure_digest(&req_line, host_closure_digest);
 
     let mut worker = {
         let mut pool = pool_mutex
@@ -3929,16 +4482,43 @@ fn extract_http_error_detail(err: anyhow::Error) -> anyhow::Error {
     err
 }
 
+/// `/check-shard` error `code` for a shard the zygote could not import: unavailable, not rejected.
+pub(crate) const IMPORT_UNAVAILABLE_CODE: &str = "zygote_import_unavailable";
+
+/// The `/check-shard` error the daemon reports with `IMPORT_UNAVAILABLE_CODE`.
+#[derive(Debug)]
+pub(crate) struct ZygoteImportUnavailable(pub String);
+
+impl std::fmt::Display for ZygoteImportUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Zygote import unavailable for `{}`", self.0)
+    }
+}
+
+impl std::error::Error for ZygoteImportUnavailable {}
+
+/// `/check-shard` outcome: an expired daemon (no answer) or the structured
+/// `IMPORT_UNAVAILABLE_CODE` (never message text, which the shard's diagnostics can contain)
+/// means the zygote is unavailable (`Ok(None)`), so only then may an audited fallback run; any
+/// other error is a rejection, which is final.
 fn finish_check_shard_request(response: Result<Vec<u8>>) -> Result<Option<serde_json::Value>> {
     match response {
         Ok(bytes) => parse_check_shard_resp(&bytes),
         Err(err) if is_expired_daemon_transport_error(&err) => Ok(None),
         Err(err) => {
-            let err = extract_http_error_detail(err);
-            if err.to_string().contains("Zygote import unavailable") {
+            let unavailable = err
+                .to_string()
+                .split_once("): {")
+                .and_then(|(_, body)| {
+                    serde_json::from_str::<serde_json::Value>(&format!("{{{}", body)).ok()
+                })
+                .is_some_and(|v| {
+                    v.get("code").and_then(|c| c.as_str()) == Some(IMPORT_UNAVAILABLE_CODE)
+                });
+            if unavailable {
                 Ok(None)
             } else {
-                Err(err)
+                Err(extract_http_error_detail(err))
             }
         }
     }
@@ -4084,40 +4664,37 @@ pub(crate) fn coalesce_proofkit_imports(imports_csv: &str, lean_path: &str) -> S
 }
 
 fn compute_eval_shm_cache_filename(
-    toolchain: &str,
-    lean_path: &str,
+    context: &ResolvedZygoteContext,
     file_name: &str,
     caller_cwd: Option<&str>,
     source: &str,
     lean_args: &[String],
-) -> String {
-    let (imports_csv, _) = split_shard_for_zygote(source);
-    let imp_dig = compute_imported_oleans_digest(&imports_csv, lean_path);
-    let mut h = blake3::Hasher::new();
-    h.update(b"eval-shm:v3:");
-    h.update(toolchain.as_bytes());
-    h.update(b":");
-    h.update(lean_path.as_bytes());
-    h.update(b":");
-    h.update(imp_dig.as_bytes());
-    h.update(b":");
-    h.update(file_name.as_bytes());
-    h.update(b":");
-    h.update(caller_cwd.unwrap_or("").as_bytes());
-    h.update(b":");
-    h.update(source.as_bytes());
-    if let Some(ad) = crate::module_builder::compute_lean_args_digest(lean_args) {
-        h.update(b":opts:");
-        h.update(ad.as_bytes());
-    }
-    let key_hex = h.finalize().to_hex();
-    format!("ev_{}.json", &key_hex[..24])
+) -> Result<String> {
+    let args_digest = crate::module_builder::compute_lean_args_digest(lean_args)?;
+    // v5: v4 (and older) entries were vetted without the stderr panic scan and carry no
+    // `scanner_version`; the scanner version also separates namespaces across scanner bumps.
+    let bytes = serde_json::to_vec(&(
+        "eval-shm:v5",
+        ZYGOTE_SCANNER_VERSION,
+        &context.identity,
+        file_name,
+        caller_cwd,
+        source,
+        args_digest,
+    ))?;
+    let key_hex = blake3::hash(&bytes).to_hex().to_string();
+    Ok(format!("ev_{}.json", &key_hex[..24]))
 }
 
 /// Only successful, import-clean replies may be cached: failures (missing toolchain, import
 /// errors, ...) are environmental and must be re-evaluated rather than replayed forever.
+/// Only replies vetted by the current host scanner are cacheable.
 fn eval_reply_cacheable(rep: &ZygoteEvalReply) -> bool {
-    rep.ok && rep.import_ok && !rep.crashed && !rep.timed_out
+    rep.ok
+        && rep.import_ok
+        && !rep.crashed
+        && !rep.timed_out
+        && rep.scanner_version == ZYGOTE_SCANNER_VERSION
 }
 
 /// Write an eval reply into `eval_shm_cache/` and periodically enforce the `/dev/shm` quota.
@@ -4149,6 +4726,11 @@ fn write_eval_shm_cache(path: &Path, bytes: &[u8]) {
 fn read_cached_eval_shm_reply(path: &Path) -> Option<ZygoteEvalReply> {
     let bytes = fs::read(path).ok()?;
     let mut cached_rep: ZygoteEvalReply = serde_json::from_slice(&bytes).ok()?;
+    // Fail closed on entries without current provenance (older hosts, foreign writers).
+    if !eval_reply_cacheable(&cached_rep) {
+        let _ = fs::remove_file(path);
+        return None;
+    }
     cached_rep.env_cache_hit = true;
     cached_rep.prefix_cache_hit = true;
     cached_rep.import_us = 0;
@@ -4188,21 +4770,25 @@ pub fn try_stateless_eval_shm_cache(
         None => return None,
     };
     let toolchain = crate::lake_build::detect_toolchain(&proj_dir);
-    let resolved_lean_args = crate::module_builder::filter_allowed_lean_args(
-        crate::module_builder::try_resolve_lean_args_for_path(&proj_dir, Some(file)),
-    );
+    let resolved_lean_args =
+        crate::module_builder::try_resolve_lean_args_for_path(&proj_dir, Some(file)).ok()?;
     let caller_cwd = std::env::current_dir()
         .ok()
         .map(|p| p.to_string_lossy().to_string());
     let file_display = file.to_string_lossy();
+    let (lean_bin, _, _, _) =
+        crate::module_builder::resolve_toolchain_compiler(&proj_dir, &toolchain).ok()?;
+    let env_vars = std::env::vars().collect();
+    let (imports_csv, _) = split_shard_for_zygote(&source);
+    let context = resolve_zygote_context(&toolchain, &req_lp, &env_vars, &lean_bin, &imports_csv);
     let filename = compute_eval_shm_cache_filename(
-        &toolchain,
-        &req_lp,
+        &context,
         &file_display,
         caller_cwd.as_deref(),
         &source,
         &resolved_lean_args,
-    );
+    )
+    .ok()?;
     let base_staging =
         if Path::new("/dev/shm").is_dir() || std::env::var("TURBO_LEAN_STAGING_DIR").is_ok() {
             crate::shm_cache::staging_shm_dir()
@@ -4250,25 +4836,29 @@ pub fn try_local_zygote_eval_with_args(
     timeout_ms: u64,
     lean_args: &[String],
 ) -> Option<ZygoteEvalReply> {
-    let filtered_args = crate::module_builder::filter_allowed_lean_args(lean_args);
+    let filtered_args = crate::module_builder::validate_effective_lean_args(lean_args).ok()?;
+    let (imports_csv, _) = split_shard_for_zygote(source);
+    let context = resolve_zygote_context(toolchain, lean_path, env_vars, lean_bin, &imports_csv);
     let timeout_ms = if timeout_ms > 0 {
         timeout_ms
     } else {
         invocation_timeout_ms().unwrap_or(0)
     };
     let t0 = std::time::Instant::now();
-    let caller_cwd = std::env::current_dir()
-        .ok()
-        .map(|p| p.to_string_lossy().to_string());
+    let caller_cwd = env_vars.get("TURBO_LEAN_CALLER_CWD").cloned().or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string())
+    });
     let eval_shm_file = if is_pure_eval_source(source) {
         let filename = compute_eval_shm_cache_filename(
-            toolchain,
-            lean_path,
+            &context,
             file_name.unwrap_or(""),
             caller_cwd.as_deref(),
             source,
             &filtered_args,
-        );
+        )
+        .ok()?;
         let dir = store.fast_staging_dir().join("eval_shm_cache");
         let _ = fs::create_dir_all(&dir);
         let path = dir.join(filename);
@@ -4343,7 +4933,8 @@ pub fn try_local_zygote_eval_with_args(
     };
     let body = serde_json::to_vec(&serde_json::json!({
         "toolchain": toolchain,
-        "lean_path": lean_path,
+        "lean_path": context.lean_path,
+        "execution_identity": context.identity,
         "source": source,
         "file_name": file_name,
         "cwd": caller_cwd,
@@ -4405,7 +4996,9 @@ pub fn try_local_zygote_eval_with_args(
     if let Some(ref rep) = parsed {
         if eval_reply_cacheable(rep) {
             if let Some(ref path) = eval_shm_file {
-                write_eval_shm_cache(path, &resp_bytes);
+                if let Ok(bytes) = serde_json::to_vec(rep) {
+                    write_eval_shm_cache(path, &bytes);
+                }
             }
         }
     }
@@ -4415,6 +5008,152 @@ pub fn try_local_zygote_eval_with_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_finish_check_shard_request_rejection_is_final() {
+        let http = |e: &str| {
+            finish_check_shard_request(Err(anyhow::anyhow!(
+                "HTTP request POST http://127.0.0.1:1/check-shard failed (HTTP 500): {{\"status\":\"error\",\"error\":\"{}\"}}",
+                e
+            )))
+        };
+        let err = http("Remote `lean` shard verification failed for `t`").unwrap_err();
+        assert!(err
+            .to_string()
+            .starts_with("Remote `lean` shard verification failed"));
+        // Only the structured code means unavailable, never text the shard can put in a message.
+        assert!(http("Zygote import unavailable for `«Zygote import unavailable»`").is_err());
+        assert!(matches!(
+            finish_check_shard_request(Err(anyhow::anyhow!(
+                "HTTP request POST http://127.0.0.1:1/check-shard failed (HTTP 500): {{\"status\":\"error\",\"error\":\"x\",\"code\":\"{}\"}}",
+                IMPORT_UNAVAILABLE_CODE
+            ))),
+            Ok(None)
+        ));
+        assert!(matches!(
+            finish_check_shard_request(Err(std::io::Error::from(
+                std::io::ErrorKind::ConnectionRefused
+            )
+            .into())),
+            Ok(None)
+        ));
+    }
+
+    /// A user `macro_rules` that makes Lean 4.35's `#print axioms` report no axioms.
+    pub(crate) const PRINT_AXIOMS_SPOOF: &str = "macro_rules\n  | `(#print axioms $i:ident) => `(#eval IO.println s!\"'{$(Lean.quote i.getId.toString)}' does not depend on any axioms\")\n";
+
+    #[test]
+    fn test_audited_lean_shard_exempts_only_named_explicit_stubs() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_audited_shard_{}_{}",
+            std::process::id(),
+            next_tmp_id()
+        ));
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        let store = TurboStore::open(Some(&dir.join("store")))?;
+        let env = std::collections::HashMap::from([(
+            "ELAN_TOOLCHAIN".to_string(),
+            "leanprover/lean4:v4.35.0".to_string(),
+        )]);
+        let run = |src: &str| {
+            let audit = std::collections::HashSet::from(["tgt".to_string()]);
+            run_audited_lean_shard(
+                &store,
+                Path::new("lean"),
+                &env,
+                Some(&dir),
+                src,
+                &audit,
+                &[],
+                None,
+            )
+        };
+        let stubs = "namespace N\ntheorem s1 (n : Nat) {m : Nat} : n + m = m + n := sorry\ntheorem s2 : 1 = 1 := sorry\nend N\nnamespace M\ntheorem s2 : 2 = 2 := sorry\nend M\n";
+        // Host-named prefix stubs (binders, namespaces, a short name used twice) are exempt; the
+        // target is audited.
+        let ok = run(&format!(
+            "{}theorem N.tgt (a b : Nat) : a + b = b + a := N.s1 a\ntheorem other : 2 = 2 := M.s2\n",
+            stubs
+        ))?;
+        assert!(ok.status.success(), "{:?}", ok);
+        let reject = |src: String, why: &str, needle: &str| {
+            let err = run(&src).expect_err(why);
+            assert!(format!("{:#}", err).contains(needle), "{}: {:#}", why, err);
+        };
+        reject(
+            "theorem tgt : 1 = 1 := sorry\n".into(),
+            "an audited theorem is never a stub",
+            "disallowed axiom `sorryAx`",
+        );
+        reject(
+            format!(
+                "import Lean\n{}theorem Evil.s1 : False := by\n  run_tac do\n    let g ← Lean.Elab.Tactic.getMainGoal\n    g.assign (← Lean.Meta.mkSorry (← g.getType) false)\ntheorem tgt : False := Evil.s1\n",
+                stubs
+            ),
+            "a second explicit sorry matching a stub name is ambiguous",
+            "prefix stub `s1` is ambiguous",
+        );
+        reject(
+            "import Lean\nmacro_rules | `(term| sorry) => `(term| trivial)\ntheorem s1 : True := sorry\ntheorem Evil.s1 : False := by\n  run_tac do\n    let g ← Lean.Elab.Tactic.getMainGoal\n    g.assign (← Lean.Meta.mkSorry (← g.getType) false)\ntheorem tgt : False := Evil.s1\n".into(),
+            "a stub turned into a proof cannot lend its name to an injected sorry",
+            "prefix stub `s1` is ambiguous",
+        );
+        reject(
+            "theorem other : 1 = 1 := rfl\n".into(),
+            "the audited theorem must be declared",
+            "missing from the compiled shard",
+        );
+        // P0-3: the verdict never comes from shard-controlled output (`#print axioms` spoofed by a
+        // user macro), and `addDecl`-made axioms are seen in the kernel environment.
+        reject(
+            format!(
+                "import Lean\n{}theorem tgt : 1 = 1 := by\n  run_tac Lean.Elab.admitGoal (← Lean.Elab.Tactic.getMainGoal)\n",
+                PRINT_AXIOMS_SPOOF
+            ),
+            "a metaprogram sorry under a `#print axioms` spoof",
+            "disallowed axiom `sorryAx`",
+        );
+        reject(
+            "import Lean\nopen Lean in\n#eval show Elab.Command.CommandElabM Unit from Elab.Command.liftCoreM <| addDecl <| .axiomDecl { name := `hidden, levelParams := [], type := mkConst ``False, isUnsafe := false }\ntheorem tgt : 1 = 1 := (hidden).elim\n".into(),
+            "an `addDecl` axiom",
+            "`hidden`",
+        );
+        assert!(!run("theorem tgt : 1 = 2 := rfl\n")?.status.success());
+        // A request budget bounds the whole fallback; it never yields a late verdict.
+        let audit = std::collections::HashSet::from(["tgt".to_string()]);
+        let late = run_audited_lean_shard(
+            &store,
+            Path::new("lean"),
+            &env,
+            Some(&dir),
+            "theorem tgt : 1 = 1 := rfl\n",
+            &audit,
+            &[],
+            Some(1),
+        );
+        assert!(
+            !matches!(late, Ok(ref o) if o.status.success()),
+            "{:?}",
+            late
+        );
+        // Auditor preparation (a cold auditor build in a fresh store) stays within the budget.
+        let cold = TurboStore::open(Some(&dir.join("cold-store")))?;
+        let t0 = std::time::Instant::now();
+        let _ = run_audited_lean_shard(
+            &cold,
+            Path::new("lean"),
+            &env,
+            Some(&dir),
+            "theorem tgt : 1 = 1 := rfl\n",
+            &audit,
+            &[],
+            Some(3_000),
+        );
+        assert!(t0.elapsed() < std::time::Duration::from_secs(15));
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
 
     #[cfg(target_os = "linux")]
     fn open_test_lifecycle_process(
@@ -4655,6 +5394,150 @@ mod tests {
             .is_file()
             .then(|| crate::module_builder::resolve_project_config(&dir).ok())
             .flatten()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_eval_cache_tracks_environment_lean_path() -> Result<()> {
+        use crate::worktree_test_support::LakeTree;
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tree = LakeTree::new("eval_env_path", &[("P/A.lean", "def value : Nat := 0\n")])?;
+        let cfg = crate::module_builder::resolve_project_config(&tree.project)?;
+        for (name, value) in [("A", 17), ("B", 29)] {
+            let dir = tree.root.join(name);
+            fs::create_dir_all(&dir)?;
+            fs::write(
+                dir.join("Dep.lean"),
+                format!("def Dep.value : Nat := {value}\n"),
+            )?;
+            let out = Command::new(&cfg.lean_bin)
+                .current_dir(&dir)
+                .args(["-o", "Dep.olean", "Dep.lean"])
+                .output()?;
+            anyhow::ensure!(
+                out.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let store = TurboStore::open(Some(&tree.root.join("cache")))?;
+        let previous = std::env::var_os("TURBO_LEAN_NO_DAEMON");
+        std::env::set_var("TURBO_LEAN_NO_DAEMON", "1");
+        let result = (|| -> Result<()> {
+            let source = "import Dep\n#eval Dep.value\n";
+            let file = tree.project.join("Eval.lean").to_string_lossy().to_string();
+            for (name, expected) in [("A", "17"), ("A", "17"), ("B", "29"), ("B", "29")] {
+                let env = std::collections::HashMap::from([(
+                    "LEAN_PATH".into(),
+                    tree.root.join(name).to_string_lossy().to_string(),
+                )]);
+                let reply = try_local_zygote_eval_with_args(
+                    &store,
+                    &env,
+                    &cfg.lean_bin,
+                    &cfg.toolchain,
+                    "",
+                    source,
+                    Some(&file),
+                    60_000,
+                    &[],
+                )
+                .context("local eval must produce a reply")?;
+                assert!(reply.ok && reply.import_ok, "{reply:?}");
+                assert_eq!(reply.messages.concat().trim(), expected, "LEAN_PATH={name}: {reply:?}");
+            }
+            // Replacing an artifact at the same resolved path must also invalidate the reply.
+            fs::copy(tree.root.join("A/Dep.olean"), tree.root.join("B/Dep.olean"))?;
+            let env = std::collections::HashMap::from([(
+                "LEAN_PATH".into(),
+                tree.root.join("B").to_string_lossy().to_string(),
+            )]);
+            let reply = try_local_zygote_eval_with_args(
+                &store,
+                &env,
+                &cfg.lean_bin,
+                &cfg.toolchain,
+                "",
+                source,
+                Some(&file),
+                60_000,
+                &[],
+            )
+            .context("replaced import eval")?;
+            assert!(reply.ok && reply.import_ok, "{reply:?}");
+            assert_eq!(reply.messages.concat().trim(), "17", "{reply:?}");
+            Ok(())
+        })();
+        if let Some(value) = previous {
+            std::env::set_var("TURBO_LEAN_NO_DAEMON", value);
+        } else {
+            std::env::remove_var("TURBO_LEAN_NO_DAEMON");
+        }
+        result
+    }
+
+    #[test]
+    fn local_eval_rejects_invalid_args_before_empty_option_cache_hit() -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("turbo_eval_options_{}", crate::pack::next_tmp_id()));
+        let store = TurboStore::open(Some(&dir))?;
+        let source = "#eval 17305\n";
+        let file_name = dir.join("Cached.lean").to_string_lossy().to_string();
+        let cwd = std::env::current_dir()?.to_string_lossy().to_string();
+        let (imports_csv, _) = split_shard_for_zygote(source);
+        let context = resolve_zygote_context(
+            "test",
+            "",
+            &std::collections::HashMap::new(),
+            Path::new("/no-lean-needed"),
+            &imports_csv,
+        );
+        let filename =
+            compute_eval_shm_cache_filename(&context, &file_name, Some(&cwd), source, &[])?;
+        let cache_dir = store.fast_staging_dir().join("eval_shm_cache");
+        fs::create_dir_all(&cache_dir)?;
+        let path = cache_dir.join(filename);
+        let reply = ZygoteEvalReply {
+            ok: true,
+            import_ok: true,
+            scanner_version: ZYGOTE_SCANNER_VERSION,
+            stdout: "empty-option-cached-reply".into(),
+            ..Default::default()
+        };
+        let bytes = serde_json::to_vec(&reply)?;
+        fs::write(&path, &bytes)?;
+        let eval = |args: &[String]| {
+            try_local_zygote_eval_with_args(
+                &store,
+                &std::collections::HashMap::new(),
+                Path::new("/no-lean-needed"),
+                "test",
+                "",
+                source,
+                Some(&file_name),
+                1000,
+                args,
+            )
+        };
+        let cached = eval(&[]).expect("fixture must hit the empty-option cache");
+        assert!(cached.ok && cached.env_cache_hit && cached.prefix_cache_hit);
+        assert_eq!(cached.stdout, reply.stdout);
+        for invalid in ["--plugin=bad.so", "--json", "-q", " -DautoImplicit=false "] {
+            assert!(
+                eval(&[invalid.to_string()]).is_none(),
+                "invalid argument must not reuse cached reply: {invalid}"
+            );
+        }
+        assert_eq!(fs::read(&path)?, bytes);
+        fs::remove_file(path)?;
+        fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[test]
@@ -5187,10 +6070,51 @@ mod tests {
         let lp = tmp_dir.to_string_lossy().to_string();
         let d1 = compute_imported_oleans_digest("Foo.Bar", &lp);
         assert_eq!(d1, compute_imported_oleans_digest("Foo.Bar", &lp));
+        let sp1 = compute_search_path_oleans_digest(&lp);
+        assert_eq!(sp1, compute_search_path_oleans_digest(&lp));
 
-        fs::write(&olean_path, b"olean-version-2-modified").unwrap();
-        assert_ne!(d1, compute_imported_oleans_digest("Foo.Bar", &lp));
+        // Same-size overwrite as well as companion creation/modification must invalidate memoized digests.
+        fs::write(&olean_path, b"olean-version-2").unwrap();
+        let d2 = compute_imported_oleans_digest("Foo.Bar", &lp);
+        let sp2 = compute_search_path_oleans_digest(&lp);
+        assert_ne!(d1, d2);
+        assert_ne!(sp1, sp2);
+
+        let srv_path = PathBuf::from(format!("{}.server", olean_path.display()));
+        fs::write(&srv_path, b"server-companion-v1").unwrap();
+        let d3 = compute_imported_oleans_digest("Foo.Bar", &lp);
+        assert_ne!(d2, d3);
+
+        fs::write(&srv_path, b"server-companion-v2").unwrap();
+        let d4 = compute_imported_oleans_digest("Foo.Bar", &lp);
+        assert_ne!(d3, d4);
+
+        std::thread::sleep(std::time::Duration::from_millis(65));
+        let d4_warm_populate = compute_imported_oleans_digest("Foo.Bar", &lp);
+        assert_eq!(d4, d4_warm_populate);
+        assert_eq!(d4, compute_imported_oleans_digest("Foo.Bar", &lp));
+
+        fs::write(&olean_path, b"olean-version-3").unwrap();
+        let d5 = compute_imported_oleans_digest("Foo.Bar", &lp);
+        assert_ne!(d4, d5);
+
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_attach_host_closure_digest_protocol_columns() {
+        let r2 = attach_host_closure_digest("Init\t6162\n", "dig123");
+        assert_eq!(r2, "Init\t6162\t\t\t\t\tdig123\n");
+        assert_eq!(r2.trim_end_matches('\n').split('\t').nth(6), Some("dig123"));
+
+        let r5 = attach_host_closure_digest("Init\t6162\tstrict\tpk\t7072\n", "dig456");
+        assert_eq!(r5, "Init\t6162\tstrict\tpk\t7072\t\tdig456\n");
+        assert_eq!(r5.trim_end_matches('\n').split('\t').nth(6), Some("dig456"));
+
+        let r6 = attach_host_closure_digest("Init\t6162\tstrict\t\t\t6f70\n", "dig789");
+        assert_eq!(r6, "Init\t6162\tstrict\t\t\t6f70\tdig789\n");
+        assert_eq!(r6.trim_end_matches('\n').split('\t').nth(5), Some("6f70"));
+        assert_eq!(r6.trim_end_matches('\n').split('\t').nth(6), Some("dig789"));
     }
 
     #[test]
@@ -5392,9 +6316,15 @@ mod tests {
         let ok = ZygoteEvalReply {
             ok: true,
             import_ok: true,
+            scanner_version: ZYGOTE_SCANNER_VERSION,
             ..Default::default()
         };
         assert!(eval_reply_cacheable(&ok));
+        // Not vetted by the current stderr scanner (pre-upgrade host): never cached or replayed.
+        assert!(!eval_reply_cacheable(&ZygoteEvalReply {
+            scanner_version: 0,
+            ..ok.clone()
+        }));
         // e.g. "toolchain not installed": ok=false and import_ok=false
         assert!(!eval_reply_cacheable(&ZygoteEvalReply {
             ok: false,
@@ -5571,7 +6501,33 @@ mod tests {
         assert!(status_b.success());
 
         let lp_a = lib_a.to_string_lossy().to_string();
-        let dig1 = compute_imported_oleans_digest("DepB", &lp_a);
+        let (dig1, complete1) = compute_imported_oleans_digest_inner("DepB", &lp_a);
+        assert!(complete1);
+        let rep_warm_seed = eval_with_zygote_pool(
+            &store,
+            toolchain,
+            &lp_a,
+            &env_vars,
+            &lean_bin,
+            "import DepB\ntheorem t_warm_1 : midValue = 12 := rfl\n",
+            false,
+        )
+        .unwrap();
+        assert!(rep_warm_seed.ok && rep_warm_seed.import_ok);
+        let rep_warm_hit = eval_with_zygote_pool(
+            &store,
+            toolchain,
+            &lp_a,
+            &env_vars,
+            &lean_bin,
+            "import DepB\ntheorem t_warm_2 : midValue + 1 = 13 := rfl\n",
+            false,
+        )
+        .unwrap();
+        assert!(
+            rep_warm_hit.ok && rep_warm_hit.env_cache_hit,
+            "Zygote worker must hit env_cache via hostClosureDigest on second request"
+        );
 
         // Rebuild transitive leaf DepC with same-length source / different constant value without touching DepB.olean
         fs::write(&src_c1, "def depValue : Nat := 99\n").unwrap();
@@ -5589,6 +6545,20 @@ mod tests {
         assert_ne!(
             dig1, dig2,
             "compute_imported_oleans_digest must track transitive .olean dependencies (DepB -> DepC)"
+        );
+        let rep_after_dep_edit = eval_with_zygote_pool(
+            &store,
+            toolchain,
+            &lp_a,
+            &env_vars,
+            &lean_bin,
+            "import DepB\ntheorem t_after_edit : depValue = 99 := rfl\n",
+            false,
+        )
+        .unwrap();
+        assert!(
+            rep_after_dep_edit.ok && !rep_after_dep_edit.env_cache_hit,
+            "Zygote worker must miss env_cache and reload when transitive DepC.olean changes"
         );
 
         // Module visibility isolation: private import in `module` must be enforced, and `LEAN_PATH`
@@ -5924,53 +6894,71 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert!(mark_runtime_panic(&mut rep));
+        assert!(mark_runtime_panic(&mut rep, false));
         assert!(!rep.ok);
         assert_eq!(rep.errors, vec![RUNTIME_PANIC_ERR.to_string()]);
         // Idempotent, and ordinary output mentioning PANIC is not a runtime panic.
-        assert!(mark_runtime_panic(&mut rep) && rep.errors.len() == 1);
+        assert!(mark_runtime_panic(&mut rep, false) && rep.errors.len() == 1);
         let mut benign = ZygoteEvalReply {
             ok: true,
             messages: vec!["info: \"PANIC button pressed\"".to_string()],
             errors: vec!["unknown identifier 'runtime panic'".to_string()],
             ..Default::default()
         };
-        assert!(!mark_runtime_panic(&mut benign) && benign.ok);
+        assert!(!mark_runtime_panic(&mut benign, false) && benign.ok);
+        assert!(mark_runtime_panic(&mut benign, true) && !benign.ok);
 
         let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("panic_guard") else {
             return;
         };
         let lp = tmp_dir.to_string_lossy().to_string();
-        let panic_src = "import Lean\n#eval (panic! \"Lean.EnvExtension.modifyStateImpl\" : Nat)\n";
-        let live_rep = eval_with_zygote_pool_opts(
-            &store,
-            "leanprover/lean4:v4.35.0",
-            &lp,
-            &env_vars,
-            &lean_bin,
-            panic_src,
-            false,
-            true,
-            Some("PanicTest.lean"),
-            Some(30_000),
-        )
-        .unwrap();
-        if live_rep.messages.iter().any(|m| m.contains("PANIC"))
-            || live_rep.stdout.contains("PANIC")
-            || live_rep
-                .errors
-                .iter()
-                .any(|e| e.contains("PANIC") || e.contains("runtime panic"))
-        {
+        let tc = "leanprover/lean4:v4.35.0";
+        let idle_workers = || -> usize {
+            ZYGOTE_POOL
+                .get()
+                .and_then(|m| m.lock().ok())
+                .map(|g| {
+                    g.iter()
+                        .filter(|(k, _)| k.1.contains(&lp))
+                        .map(|(_, v)| v.len())
+                        .sum()
+                })
+                .unwrap_or(0)
+        };
+        // Panics reported as messages, printed only to stderr (`stderrAsMessages false`), and
+        // raised inside tactic elaboration (which `lean` itself only prints to stderr).
+        let tactic_boom = "import Lean\nopen Lean Elab Tactic\nelab \"boom\" : tactic => do\n  let n : Nat := panic! \"tacp\"\n  logInfo m!\"{n}\"\ntheorem c : True := by boom; trivial\n";
+        for (eval_mode, src) in [
+            (true, "import Lean\n#eval (panic! \"Lean.EnvExtension.modifyStateImpl\" : Nat)\n"),
+            (false, "#eval (panic! \"msg\" : Nat)\ntheorem p1 : True := trivial\n"),
+            (false, "set_option stderrAsMessages false\n#eval (panic! \"stderr only\" : Nat)\ntheorem p2 : True := trivial\n"),
+            // Stderr-only panic behind a long unterminated stderr line (> any line buffer).
+            (false, "set_option stderrAsMessages false\n#eval show IO Unit from do\n  let e ← IO.getStderr\n  e.putStr (String.ofList (List.replicate 10000 'x'))\n  e.flush\n  let n : Nat := panic! s!\"after long line {(← IO.monoNanosNow) % 1}\"\n  IO.println n\ntheorem p3 : True := trivial\n"),
+            (false, tactic_boom),
+            (true, tactic_boom),
+        ] {
+            let before = idle_workers();
+            let live_rep = eval_with_zygote_pool_opts(
+                &store, tc, &lp, &env_vars, &lean_bin, src, false, eval_mode,
+                Some("PanicTest.lean"), Some(60_000),
+            )
+            .unwrap();
             assert!(
-                !live_rep.ok,
-                "PANIC output must never return ok=true: {:?}",
-                live_rep
+                !live_rep.ok && live_rep.errors.iter().any(|e| e == RUNTIME_PANIC_ERR),
+                "panic must fail the request: {src:?} -> {live_rep:?}"
             );
+            assert!(idle_workers() <= before, "panicked worker returned to the pool: {src:?}");
+            // A panicked request is never cached: the same request panics again on a new worker.
+            let again = eval_with_zygote_pool_opts(
+                &store, tc, &lp, &env_vars, &lean_bin, src, false, eval_mode,
+                Some("PanicTest.lean"), Some(60_000),
+            )
+            .unwrap();
+            assert!(!again.ok, "panicked reply was cached: {src:?}");
         }
         let follow = eval_with_zygote_pool(
             &store,
-            "leanprover/lean4:v4.35.0",
+            tc,
             &lp,
             &env_vars,
             &lean_bin,
@@ -5983,6 +6971,384 @@ mod tests {
             "fresh/healthy worker must succeed after panic shard: {:?}",
             follow
         );
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// Upgrade path: replies cached by hosts without the stderr panic scan — main before #310
+    /// (`eval-shm:v3:`) and main with #305 (`eval-shm:v4`, resolved identity) — for a
+    /// stderr-only tactic panic followed by a successful theorem (`ok=true`) are never replayed.
+    #[test]
+    fn test_pre_scanner_eval_cache_entry_is_never_replayed() {
+        TEST_NO_DAEMON.with(|c| c.set(true));
+        let (tmp_dir, store, env_vars, lean_bin) =
+            open_test_zygote_env("eval_cache_upgrade").expect("Lean v4.35.0 toolchain required");
+        let tc = "leanprover/lean4:v4.35.0";
+        let lp = tmp_dir.to_string_lossy().to_string();
+        let src = format!(
+            "import Lean\nopen Lean Elab Tactic\n-- {}\nelab \"boom\" : tactic => do\n  let n : Nat := panic! \"tacp\"\n  logInfo m!\"{{n}}\"\ntheorem c : True := by boom; trivial\n",
+            next_tmp_id()
+        );
+        let file_name = "UpgradePanic.lean";
+        let caller_cwd = std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string());
+        let (imports_csv, _) = split_shard_for_zygote(&src);
+        // The exact v3 key of main before #310.
+        let v3_name = {
+            let mut h = blake3::Hasher::new();
+            h.update(b"eval-shm:v3:");
+            for part in [
+                tc,
+                &lp,
+                &compute_imported_oleans_digest(&imports_csv, &lp),
+                file_name,
+                caller_cwd.as_deref().unwrap_or(""),
+            ] {
+                h.update(part.as_bytes());
+                h.update(b":");
+            }
+            h.update(src.as_bytes());
+            format!("ev_{}.json", &h.finalize().to_hex()[..24])
+        };
+        let context = resolve_zygote_context(tc, &lp, &env_vars, &lean_bin, &imports_csv);
+        // The exact v4 key of main with #305 (resolved identity, no scanner version).
+        let v4_name = {
+            let args_digest = crate::module_builder::compute_lean_args_digest(&[]).unwrap();
+            let bytes = serde_json::to_vec(&(
+                "eval-shm:v4",
+                &context.identity,
+                file_name,
+                caller_cwd.as_deref(),
+                &src,
+                args_digest,
+            ))
+            .unwrap();
+            format!("ev_{}.json", &blake3::hash(&bytes).to_hex()[..24])
+        };
+        let new_name =
+            compute_eval_shm_cache_filename(&context, file_name, caller_cwd.as_deref(), &src, &[])
+                .unwrap();
+        assert_ne!(v3_name, new_name, "the namespace bump must change the key");
+        assert_ne!(v4_name, new_name, "scanner namespace must change the #305 key");
+        let dir = store.fast_staging_dir().join("eval_shm_cache");
+        fs::create_dir_all(&dir).unwrap();
+        // A pre-scanner (no `scanner_version`) false success, planted at the v3 and v4 keys
+        // and, as a foreign/unversioned writer would, at the new key.
+        let stale = br#"{"ok":true,"kernel_gate_active":false,"import_ok":true,"env_cache_hit":false,"prefix_cache_hit":false,"import_us":1,"prefix_us":0,"elab_us":1,"heartbeats":0,"proof_term_nodes":0,"rss_delta_mb":0,"peak_rss_mb":0,"subshards_verified":1,"stdout":"","messages":[],"errors":[],"used_constants":[],"timed_out":false,"crashed":false}"#;
+        for name in [&v3_name, &v4_name, &new_name] {
+            fs::write(dir.join(name), stale).unwrap();
+        }
+        assert!(read_cached_eval_shm_reply(&dir.join(&v3_name)).is_none());
+        assert!(read_cached_eval_shm_reply(&dir.join(&v4_name)).is_none());
+        fs::write(dir.join(&v4_name), stale).unwrap();
+        fs::write(dir.join(&new_name), stale).unwrap();
+
+        let rep = try_local_zygote_eval_with_args(
+            &store,
+            &env_vars,
+            &lean_bin,
+            tc,
+            &lp,
+            &src,
+            Some(file_name),
+            60_000,
+            &[],
+        )
+        .expect("worker must execute");
+        assert!(
+            !rep.ok && rep.errors.iter().any(|e| e == RUNTIME_PANIC_ERR),
+            "stale cached ok replayed: {rep:?}"
+        );
+        assert_eq!(rep.scanner_version, ZYGOTE_SCANNER_VERSION);
+        assert!(
+            !dir.join(&new_name).exists(),
+            "unversioned entry must be dropped"
+        );
+        // And a scanner-vetted failure is not cached either: the next call executes again.
+        let again = try_local_zygote_eval_with_args(
+            &store,
+            &env_vars,
+            &lean_bin,
+            tc,
+            &lp,
+            &src,
+            Some(file_name),
+            60_000,
+            &[],
+        )
+        .unwrap();
+        assert!(!again.ok && again.errors.iter().any(|e| e == RUNTIME_PANIC_ERR));
+        for name in [&v3_name, &v4_name] {
+            let _ = fs::remove_file(dir.join(name));
+        }
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_stderr_scan_sees_every_byte_and_fails_closed_without_reply_mark() {
+        let wait = std::time::Duration::from_millis(200);
+        let mark = format!("\n{ZYGOTE_STDERR_REPLY_MARK}\n");
+        // A panic after a long unterminated line, and signatures/marks split across any chunk size.
+        let long = format!("{}PANIC at boom{mark}", "x".repeat(100_000));
+        for chunk in [1, 7, 1024, long.len()] {
+            let scan = StderrScan::default();
+            let before = scan.snapshot();
+            long.as_bytes().chunks(chunk).for_each(|c| scan.feed(c));
+            assert_eq!(scan.snapshot(), (1, 1), "chunk={chunk}");
+            assert!(scan.panicked_since(before, wait), "chunk={chunk}");
+            // A clean request after it, with its mark, is clean; no double counting of the overlap.
+            let before = scan.snapshot();
+            format!("{}{mark}", "y".repeat(5000))
+                .as_bytes()
+                .chunks(chunk)
+                .for_each(|c| scan.feed(c));
+            assert_eq!(scan.snapshot(), (1, 2), "chunk={chunk}");
+            assert!(!scan.panicked_since(before, wait), "chunk={chunk}");
+        }
+        // Missing mark: fail closed even though no panic was seen.
+        let scan = std::sync::Arc::new(StderrScan::default());
+        let before = scan.snapshot();
+        scan.feed(b"ordinary output\n");
+        assert!(scan.panicked_since(before, wait));
+        // Delayed mark (after the wait): fail closed; a mark within the wait: clean.
+        for (delay, expect) in [(wait * 3, true), (wait / 4, false)] {
+            let before = scan.snapshot();
+            let s = scan.clone();
+            let m = mark.clone();
+            let t = std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                s.feed(m.as_bytes());
+            });
+            assert_eq!(scan.panicked_since(before, wait), expect, "delay={delay:?}");
+            t.join().unwrap();
+        }
+    }
+
+    /// Raw worker IPC against stock `lean`: the worker must never accept what `lean` rejects.
+    #[test]
+    fn test_zygote_worker_ipc_matches_stock_lean_boundary() {
+        // No silent skips: a missing toolchain or a worker that fails to compile fails the test.
+        let (tmp_dir, store, env_vars, lean_bin) =
+            open_test_zygote_env("ipc_boundary").expect("Lean v4.35.0 toolchain required");
+        let bin = ensure_zygote_binary(&store, &lean_bin, &env_vars)
+            .unwrap_or_else(|e| panic!("Zygote worker failed to compile: {e:#}"));
+        let tc_lib = lean_bin
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("lib/lean");
+        let hx = |s: &str| hex_encode_bytes(s.as_bytes());
+        let opts = |o: &[&str]| {
+            if o.is_empty() {
+                String::new()
+            } else {
+                hx(&o.join("\n"))
+            }
+        };
+        let session = |lines: &[String]| -> Vec<serde_json::Value> {
+            let mut child = Command::new(&bin)
+                .env("LEAN", &lean_bin)
+                .env("LEAN_PATH", &tc_lib)
+                .env("LEAN_NUM_THREADS", "4")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn zygote worker");
+            let mut stdin = child.stdin.take().unwrap();
+            let mut out = BufReader::new(child.stdout.take().unwrap());
+            let replies = lines
+                .iter()
+                .map(|l| {
+                    stdin.write_all(format!("{l}\n").as_bytes()).unwrap();
+                    stdin.flush().unwrap();
+                    let mut r = String::new();
+                    out.read_line(&mut r).unwrap();
+                    serde_json::from_str(r.trim()).expect("worker JSON reply")
+                })
+                .collect();
+            let _ = child.kill();
+            let _ = child.wait();
+            replies
+        };
+        let stock_ok = |body: &str, o: &[&str]| -> bool {
+            let f = tmp_dir.join(format!("Stock{}.lean", next_tmp_id()));
+            fs::write(&f, body).unwrap();
+            let mut c = Command::new(&lean_bin);
+            c.env("LEAN_PATH", &tc_lib).args(o).arg(&f);
+            c.output().unwrap().status.success()
+        };
+        let ok = |r: &serde_json::Value| r["ok"].as_bool() == Some(true);
+
+        // 1 + 2: option allowlist (with any number of `weak.` prefixes) and Lean's own value parsing.
+        let triv = "theorem t : True := trivial\n";
+        let sorry_thm = "theorem s : 1 = 2 := sorry\n";
+        for (body, o) in [
+            (triv, "-Ddebug.skipKernelTC=true"),
+            (triv, "-Dweak.debug.skipKernelTC=true"),
+            (triv, "-DstderrAsMessages=false"),
+            (triv, "-Ddebug.byAsSorry=true"),
+            (sorry_thm, "-Dweak.warn.sorry=false"),
+            (sorry_thm, "-Dweak.weak.warn.sorry=false"),
+            (triv, "-DmaxHeartbeats=garbage"),
+            (triv, "-DautoImplicit=maybe"),
+            (triv, "-Dlinter.auditUnregistered=true"),
+            (triv, "-Dpp.all=true"),
+        ] {
+            let r = &session(&[format!("Init\t{}\tstrict\t\t\t{}", hx(body), opts(&[o]))])[0];
+            assert!(!ok(r), "{o} must be rejected: {r}");
+            assert!(
+                r["errors"][0].as_str().unwrap_or("").contains(o),
+                "{o}: {r}"
+            );
+        }
+        for o in [
+            "-Dweak.linter.auditUnregistered=true",
+            "-DmaxHeartbeats=1000",
+            "-DautoImplicit=false",
+            "-Ddebug.skipKernelTC=false",
+            "-Dweak.warn.sorry=true",
+        ] {
+            let r = &session(&[format!("Init\t{}\tstrict\t\t\t{}", hx(triv), opts(&[o]))])[0];
+            assert!(ok(r) && stock_ok(triv, &[o]), "{o} must be accepted: {r}");
+            // Hardening forced after parsing: `sorry` is still rejected under any accepted option.
+            let r = &session(&[format!(
+                "Init\t{}\tstrict\t\t\t{}",
+                hx(sorry_thm),
+                opts(&[o])
+            )])[0];
+            assert!(!ok(r), "sorry accepted under {o}: {r}");
+        }
+        for o in [
+            "-DmaxHeartbeats=garbage",
+            "-DautoImplicit=maybe",
+            "-Dlinter.auditUnregistered=true",
+        ] {
+            assert!(!stock_ok(triv, &[o]), "stock lean must reject {o}");
+        }
+
+        // 3: a panicking race candidate fails the whole request and poisons the worker.
+        let panic_cand = "#eval (panic! \"boom\" : Nat)\ntheorem pz : True := trivial\n";
+        let good = "theorem good : 1 + 1 = 2 := rfl\n";
+        // (`[good, panic]` never runs the panic: the race stops at a cheap winner.)
+        for cands in [[panic_cand, good]] {
+            let pre = hx("def pre : Nat := 1\n");
+            let race = format!(
+                "Init\trace_candidates\tk1\t{pre}\t{},{}",
+                hx(cands[0]),
+                hx(cands[1])
+            );
+            let rs = session(&[race.clone(), format!("Init\t{}\tstrict", hx(good))]);
+            assert!(
+                !ok(&rs[0]) && rs[0]["winning_candidate_idx"].is_null(),
+                "{}",
+                rs[0]
+            );
+            assert!(
+                !ok(&rs[1]),
+                "worker must stay poisoned after a race panic: {}",
+                rs[1]
+            );
+        }
+        // 3: a prefix (or prefix delta) that panics only on its first run ends the request: the
+        // combined fallback, which would not panic again, never turns it into ok=true.
+        let first_run_panic = |tag: &str| {
+            let marker = tmp_dir.join(format!("first_run_{tag}_{}", next_tmp_id()));
+            format!(
+                "#eval show IO Unit from do\n  if (← System.FilePath.pathExists {:?}) then return\n  IO.FS.writeFile {:?} \"\"\n  let n : Nat := panic! s!\"first run only {{(← IO.monoNanosNow) % 1}}\"\n  IO.println n\ntheorem pre_{tag} : True := trivial\n",
+                marker.to_string_lossy(),
+                marker.to_string_lossy()
+            )
+        };
+        let tgt = "theorem tgt : 1 + 1 = 2 := rfl\n";
+        let panicked = |r: &serde_json::Value| {
+            !ok(r)
+                && r["errors"]
+                    .as_array()
+                    .is_some_and(|e| e.iter().any(|e| e.as_str() == Some(RUNTIME_PANIC_ERR)))
+        };
+        for mode in ["strict", "race_candidates", "batch_fission", "delta"] {
+            let seed = "def seed_base : Nat := 1\n";
+            let pre = if mode == "delta" {
+                format!("{seed}{}", first_run_panic(mode))
+            } else {
+                first_run_panic(mode)
+            };
+            let pad = |p: &str| format!("{}{tgt}", "\n".repeat(p.lines().count()));
+            let req = |p: &str, key: &str| match mode {
+                "race_candidates" | "batch_fission" => {
+                    format!("Init\t{mode}\t{key}\t{}\t{}", hx(p), hx(tgt))
+                }
+                _ => format!("Init\t{}\tstrict\t{key}\t{}", hx(&pad(p)), hx(p)),
+            };
+            let mut lines = Vec::new();
+            if mode == "delta" {
+                // Seeds the prefix tree so the panicking request runs as a delta on top of it.
+                lines.push(req(seed, "k_seed"));
+            }
+            lines.push(req(&pre, "k_panic"));
+            lines.push(format!("Init\t{}\tstrict", hx(tgt)));
+            let rs = session(&lines);
+            let (r, next) = (&rs[lines.len() - 2], &rs[lines.len() - 1]);
+            if mode == "delta" {
+                assert!(ok(&rs[0]), "seed prefix must succeed: {}", rs[0]);
+            }
+            assert!(panicked(r), "{mode}: first-run prefix panic masked: {r}");
+            if mode == "race_candidates" {
+                assert!(r["winning_candidate_idx"].is_null(), "{r}");
+            }
+            assert!(panicked(next), "{mode}: worker must stay poisoned: {next}");
+        }
+
+        // 3: the first request binds the worker even with an empty importsCsv.
+        let rs = session(&[
+            format!(",\t{}\tstrict", hx(triv)),
+            format!("Lean\t{}\tstrict", hx(triv)),
+        ]);
+        assert!(ok(&rs[0]) && !ok(&rs[1]), "{rs:?}");
+        assert!(rs[1]["errors"][0]
+            .as_str()
+            .unwrap()
+            .contains("importsCsv changed"));
+
+        // 4: a prefix checkpoint keeps the target's warningAsError policy (from -D or set_option).
+        let target = "def audit_unused (x : Nat) : Nat := 0\n";
+        assert!(!stock_ok(target, &["-DwarningAsError=true"]));
+        for (pre, o) in [
+            (
+                "theorem prior : True := sorry\n",
+                opts(&["-DwarningAsError=true"]),
+            ),
+            (
+                "set_option warningAsError true\ntheorem prior2 : True := trivial\n",
+                String::new(),
+            ),
+            (
+                "set_option warningAsError true\ntheorem prior3 : True := sorry\n",
+                String::new(),
+            ),
+        ] {
+            let body = format!("{}{}", "\n".repeat(pre.lines().count()), target);
+            let req = format!("Init\t{}\tstrict\tpk\t{}\t{}", hx(&body), hx(pre), o);
+            let rs = session(&[req.clone(), req]);
+            assert!(
+                !ok(&rs[0]) && !ok(&rs[1]),
+                "warningAsError lost through prefix {pre:?}: {rs:?}"
+            );
+            // Stubs in the prefix stay allowed for a clean target.
+            let clean = format!(
+                "{}theorem tgt : 1 + 1 = 2 := rfl\n",
+                "\n".repeat(pre.lines().count())
+            );
+            let r = &session(&[format!(
+                "Init\t{}\tstrict\tpk\t{}\t{}",
+                hx(&clean),
+                hx(pre),
+                o
+            )])[0];
+            assert!(ok(r), "stub prefix must not fail a clean target: {r}");
+        }
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 
@@ -6019,6 +7385,7 @@ mod tests {
                 stdin,
                 stdout,
                 stderr_tail,
+                stderr_scan: Default::default(),
                 warm_prefixes: std::collections::HashSet::new(),
                 warm_prefix_tree: Vec::new(),
                 warm_imports: std::collections::HashMap::new(),
