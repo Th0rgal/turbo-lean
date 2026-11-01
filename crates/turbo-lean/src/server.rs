@@ -1026,7 +1026,7 @@ pub fn serve_cas_http_with_auth(
                         crate::splitter::ALLOWED_AXIOMS_ENV.to_string(),
                         eval_allowed_csv,
                     );
-                    if let Some(expected) = req.execution_identity.as_deref() {
+                    let pre_resolved = if let Some(expected) = req.execution_identity.as_deref() {
                         let (imports, _) = crate::zygote::split_shard_for_zygote(src);
                         let actual = crate::zygote::resolve_zygote_context(
                             tc,
@@ -1045,8 +1045,11 @@ pub fn serve_cas_http_with_auth(
                             );
                             return;
                         }
-                    }
-                    match crate::zygote::eval_with_zygote_pool_opts_with_args(
+                        Some(actual)
+                    } else {
+                        None
+                    };
+                    match crate::zygote::eval_with_resolved_context_opts_with_args(
                         &req_store,
                         tc,
                         &req.lean_path,
@@ -1064,8 +1067,21 @@ pub fn serve_cas_http_with_auth(
                             request_started,
                         )),
                         &filtered_eval_args,
+                        pre_resolved.as_ref(),
                     ) {
-                        Ok(zreply) => {
+                        Ok((zreply, executed_binding, executed_identity)) => {
+                            if let Some(expected) = req.execution_identity.as_deref() {
+                                if executed_identity != expected {
+                                    let _ = write_json_response(
+                                        &mut stream,
+                                        409,
+                                        &serde_json::json!({
+                                            "ok": false, "error": "eval execution identity changed"
+                                        }),
+                                    );
+                                    return;
+                                }
+                            }
                             let mut deterministic = true;
                             if req.verify_determinism && !zreply.timed_out {
                                 let staging = req_store.fast_staging_dir();
@@ -1118,6 +1134,8 @@ pub fn serve_cas_http_with_auth(
                                     "timed_out": zreply.timed_out,
                                     "crashed": zreply.crashed,
                                     "scanner_version": zreply.scanner_version,
+                                    "executed_execution_identity": executed_identity,
+                                    "binding_ok": executed_binding == crate::zygote::ClosureBinding::Bound,
                                     "deterministic": deterministic
                                 }),
                             );
