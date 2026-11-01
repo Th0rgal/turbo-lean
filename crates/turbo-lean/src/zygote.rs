@@ -2586,13 +2586,19 @@ pub(crate) fn run_audited_lean_shard_at(
             crate::splitter::extra_allowed_axiom_patterns().join(","),
         );
     }
+    let parsed_shards = crate::splitter::split_lean_source(source, &[]).shards;
+    let fast_map = crate::splitter::FastVerifyMap::parse_and_validate(source, &parsed_shards)?;
+    for entry in fast_map.entries() {
+        auditor.arg(format!(
+            "--fast-map={}:{}",
+            hex_encode_bytes(entry.orig_rooted.as_bytes()),
+            hex_encode_bytes(entry.gen_rooted.as_bytes())
+        ));
+    }
     if allow_prefix_stubs {
-        for sh in crate::splitter::split_lean_source(source, &[]).shards {
+        for sh in &parsed_shards {
             if crate::splitter::strip_lean_comments(&sh.proof_text).trim() == "sorry"
-                && !crate::splitter::matches_uncached_or_fast_verify_name(
-                    sh.effective_name(),
-                    audit,
-                )
+                && !fast_map.shard_matches_targets(sh, audit)
             {
                 auditor.arg(format!("--stub-ok={}", sh.rooted_name()));
             }
@@ -2621,10 +2627,9 @@ pub(crate) fn run_audited_lean_shard_at(
     let missing: Vec<&String> = audit
         .iter()
         .filter(|name| {
-            let one = std::collections::HashSet::from([(*name).clone()]);
             !decls
                 .iter()
-                .any(|d| crate::splitter::matches_uncached_or_fast_verify_name(d, &one))
+                .any(|d| crate::splitter::decl_name_matches_target(d, name.as_str()))
         })
         .collect();
     if !missing.is_empty() {
@@ -2832,59 +2837,95 @@ fn encode_lean_args_hex(lean_args: &[String]) -> String {
     }
 }
 
+fn encode_fast_map_lines(entries: &[crate::splitter::FastVerifyEntry]) -> String {
+    entries
+        .iter()
+        .map(|e| format!("{}\t{}", e.orig_rooted, e.gen_rooted))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Worker mode flag for a stubbed (`allow_stub`) or strict check of `shard_source`. Named `stub_targets`
-/// (the declarations under check) travel as `allow_stub:<hex targets>:<hex stubs>`, with the stubs the
-/// host wrote (`… := sorry` declarations that are not targets). The worker exempts only those, by kernel
-/// value and name, never a target; with no named targets it exempts nothing in the final run.
-fn stub_mode_flag(allow_stub: bool, stub_targets: &[String], shard_source: &str) -> String {
-    match (allow_stub, stub_targets.is_empty()) {
-        (false, _) => "strict".to_string(),
-        (true, true) => "allow_stub".to_string(),
-        (true, false) => {
-            let targets: std::collections::HashSet<String> = stub_targets.iter().cloned().collect();
-            let stubs: Vec<String> = crate::splitter::split_lean_source(shard_source, &[])
-                .shards
-                .into_iter()
-                .filter(|sh| {
-                    crate::splitter::strip_lean_comments(&sh.proof_text).trim() == "sorry"
-                        && !crate::splitter::matches_uncached_or_fast_verify_name(
-                            sh.effective_name(),
-                            &targets,
-                        )
-                })
-                .map(|sh| sh.rooted_name())
-                .collect();
-            format!(
-                "allow_stub:{}:{}",
-                hex_encode_bytes(stub_targets.join("\n").as_bytes()),
-                hex_encode_bytes(stubs.join("\n").as_bytes())
-            )
-        }
+/// (the declarations under check) travel as `<allow_stub|strict>:<hex targets>:<hex stubs>[:<hex req>:<hex fast_map>]`,
+/// with the stubs the host wrote (`… := sorry` declarations that are not targets). The worker exempts only
+/// those, by kernel value and name, never a target; with no named targets it exempts nothing in the final run.
+fn stub_mode_flag(allow_stub: bool, stub_targets: &[String], shard_source: &str) -> Result<String> {
+    let shards = crate::splitter::split_lean_source(shard_source, &[]).shards;
+    let fast_map = crate::splitter::FastVerifyMap::parse_and_validate(shard_source, &shards)?;
+    let prefix = if allow_stub { "allow_stub" } else { "strict" };
+    if stub_targets.is_empty() && fast_map.is_empty() {
+        return Ok(prefix.to_string());
+    }
+    let targets: std::collections::HashSet<String> = stub_targets.iter().cloned().collect();
+    let stubs: Vec<String> = if allow_stub && !stub_targets.is_empty() {
+        shards
+            .iter()
+            .filter(|sh| {
+                crate::splitter::strip_lean_comments(&sh.proof_text).trim() == "sorry"
+                    && !fast_map.shard_matches_targets(sh, &targets)
+            })
+            .map(|sh| sh.rooted_name())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let targets_hex = hex_encode_bytes(stub_targets.join("\n").as_bytes());
+    let stubs_hex = hex_encode_bytes(stubs.join("\n").as_bytes());
+    if fast_map.is_empty() {
+        Ok(format!("{}:{}:{}", prefix, targets_hex, stubs_hex))
+    } else {
+        let fmap_hex = hex_encode_bytes(encode_fast_map_lines(fast_map.entries()).as_bytes());
+        Ok(format!(
+            "{}:{}:{}:{}:{}",
+            prefix, targets_hex, stubs_hex, targets_hex, fmap_hex
+        ))
     }
 }
 
 /// `stub_mode` for one cross-file block of a request: every target still counts for ownership (never
-/// exempt), but the block must declare only the targets its own text declares.
-fn block_stub_mode(stub_mode: &str, stub_targets: &[String], blk: &str) -> String {
-    if !stub_mode.starts_with("allow_stub:") {
-        return stub_mode.to_string();
-    }
+/// exempt), but the block must declare only the targets and fast-verify mappings its own text declares.
+fn block_stub_mode(stub_mode: &str, stub_targets: &[String], blk: &str) -> Result<String> {
     let shards = crate::splitter::split_lean_source(blk, &[]).shards;
+    let blk_map = crate::splitter::FastVerifyMap::parse_and_validate(blk, &shards)?;
+    if !stub_mode.starts_with("allow_stub:") && !stub_mode.starts_with("strict:") {
+        if blk_map.is_empty() {
+            return Ok(stub_mode.to_string());
+        }
+        let prefix = if stub_mode == "allow_stub" {
+            "allow_stub"
+        } else {
+            "strict"
+        };
+        let fmap_hex = hex_encode_bytes(encode_fast_map_lines(blk_map.entries()).as_bytes());
+        return Ok(format!("{}::::{}", prefix, fmap_hex));
+    }
+    let parts: Vec<&str> = stub_mode.split(':').collect();
+    let base_prefix = parts.first().copied().unwrap_or("strict");
+    let targets_hex = parts.get(1).copied().unwrap_or("");
+    let stubs_hex = parts.get(2).copied().unwrap_or("");
     let required: Vec<&str> = stub_targets
         .iter()
         .filter(|t| {
             let one = std::collections::HashSet::from([(*t).clone()]);
-            shards.iter().any(|sh| {
-                crate::splitter::matches_uncached_or_fast_verify_name(sh.effective_name(), &one)
-            })
+            shards
+                .iter()
+                .any(|sh| blk_map.shard_matches_targets(sh, &one))
         })
         .map(String::as_str)
         .collect();
-    format!(
-        "{}:{}",
-        stub_mode,
-        hex_encode_bytes(required.join("\n").as_bytes())
-    )
+    let req_hex = hex_encode_bytes(required.join("\n").as_bytes());
+    if blk_map.is_empty() {
+        Ok(format!(
+            "{}:{}:{}:{}",
+            base_prefix, targets_hex, stubs_hex, req_hex
+        ))
+    } else {
+        let fmap_hex = hex_encode_bytes(encode_fast_map_lines(blk_map.entries()).as_bytes());
+        Ok(format!(
+            "{}:{}:{}:{}:{}",
+            base_prefix, targets_hex, stubs_hex, req_hex, fmap_hex
+        ))
+    }
 }
 
 /// Check `shard_source` with its prefix `sorry` stubs admitted, but never the `sorryAx` of `stub_targets`.
@@ -3135,10 +3176,19 @@ fn eval_with_zygote_pool_inner(
     audit_all: bool,
 ) -> Result<ZygoteEvalReply> {
     let request_started = std::time::Instant::now();
-    let stub_mode = if audit_all {
+    let stub_mode = if eval_mode {
+        "eval".to_string()
+    } else if audit_all {
+        let shards = crate::splitter::split_lean_source(shard_source, &[]).shards;
+        let fmap = crate::splitter::FastVerifyMap::parse_and_validate(shard_source, &shards)?;
+        if !fmap.is_empty() {
+            anyhow::bail!(
+                "Fast-verify renamed declarations are forbidden in `strict_all` whole-file audits"
+            );
+        }
         "strict_all".to_string()
     } else {
-        stub_mode_flag(allow_stub, stub_targets, shard_source)
+        stub_mode_flag(allow_stub, stub_targets, shard_source)?
     };
     let default_timeout_ms = if eval_mode { 900_000 } else { 30_000 };
     let effective_timeout_ms = timeout_ms.unwrap_or_else(|| {
@@ -3600,9 +3650,9 @@ fn eval_with_zygote_pool_inner(
 
             let req_lines: Vec<String> = blocks
                 .iter()
-                .map(|blk| {
+                .map(|blk| -> Result<String> {
                     let hb = hex_encode_bytes(blk.as_bytes());
-                    let mode_flag = block_stub_mode(&stub_mode, stub_targets, blk);
+                    let mode_flag = block_stub_mode(&stub_mode, stub_targets, blk)?;
                     let base = if hex_opts.is_empty() {
                         if mode_flag != "strict" {
                             format!("{}\t{}\t{}\n", imports_csv, hb, mode_flag)
@@ -3612,9 +3662,9 @@ fn eval_with_zygote_pool_inner(
                     } else {
                         format!("{}\t{}\t{}\t\t\t{}\n", imports_csv, hb, mode_flag, hex_opts)
                     };
-                    attach_host_closure_digest(&base, host_closure_digest)
+                    Ok(attach_host_closure_digest(&base, host_closure_digest))
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
 
             let results: Vec<(ZygoteChild, WorkerReqOutcome)> = std::thread::scope(|s| {
                 let req_id_ref = request_identity.as_str();
@@ -4111,7 +4161,7 @@ fn encode_multi_decl_zygote_req(
     mode: &str,
     decl_sources: &[String],
     lean_args: &[String],
-) -> (String, String, String) {
+) -> Result<(String, String, String)> {
     let (imports_csv, prefix_body) = split_shard_for_zygote(prefix_source);
     let prefix_key = blake3::hash(prefix_body.as_bytes()).to_hex().to_string();
     let hex_prefix = hex_encode_bytes(prefix_body.as_bytes());
@@ -4123,7 +4173,15 @@ fn encode_multi_decl_zygote_req(
         } else {
             std::borrow::Cow::Owned(format!("{}{}", ns_prefix, s))
         };
-        for sh in crate::splitter::split_lean_source(&scoped, &[]).shards {
+        let sub_shards = crate::splitter::split_lean_source(&scoped, &[]).shards;
+        let sub_map = crate::splitter::FastVerifyMap::parse_and_validate(&scoped, &sub_shards)?;
+        if !sub_map.is_empty() {
+            anyhow::bail!(
+                "Fast-verify renamed declarations are forbidden in `{}` sub-shards",
+                mode
+            );
+        }
+        for sh in sub_shards {
             let rooted = sh.rooted_name();
             if !targets.contains(&rooted) {
                 targets.push(rooted);
@@ -4131,15 +4189,20 @@ fn encode_multi_decl_zygote_req(
         }
     }
     let target_set: std::collections::HashSet<String> = targets.iter().cloned().collect();
-    let stubs: Vec<String> = crate::splitter::split_lean_source(prefix_source, &[])
-        .shards
+    let prefix_shards = crate::splitter::split_lean_source(prefix_source, &[]).shards;
+    let prefix_map =
+        crate::splitter::FastVerifyMap::parse_and_validate(prefix_source, &prefix_shards)?;
+    if !prefix_map.is_empty() {
+        anyhow::bail!(
+            "Fast-verify renamed declarations are forbidden in `{}` prefix",
+            mode
+        );
+    }
+    let stubs: Vec<String> = prefix_shards
         .into_iter()
         .filter(|sh| {
             crate::splitter::strip_lean_comments(&sh.proof_text).trim() == "sorry"
-                && !crate::splitter::matches_uncached_or_fast_verify_name(
-                    sh.effective_name(),
-                    &target_set,
-                )
+                && !prefix_map.shard_matches_targets(&sh, &target_set)
         })
         .map(|sh| sh.rooted_name())
         .collect();
@@ -4174,7 +4237,7 @@ fn encode_multi_decl_zygote_req(
             imports_csv, mode_with_stubs, prefix_key, hex_prefix, hex_decls_csv, hex_opts
         )
     };
-    (imports_csv, prefix_key, req_line)
+    Ok((imports_csv, prefix_key, req_line))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4199,7 +4262,7 @@ pub fn eval_subshards_batch_via_zygote(
         });
     }
     let req_tuple =
-        encode_multi_decl_zygote_req(prefix_source, "batch_fission", sub_decl_sources, lean_args);
+        encode_multi_decl_zygote_req(prefix_source, "batch_fission", sub_decl_sources, lean_args)?;
     eval_with_zygote_pool_inner(
         store,
         toolchain,
@@ -4249,7 +4312,7 @@ pub fn eval_candidates_race_via_zygote(
         "race_candidates",
         candidate_decl_sources,
         lean_args,
-    );
+    )?;
     eval_with_zygote_pool_inner(
         store,
         toolchain,
@@ -7721,6 +7784,151 @@ mod tests {
             "warm prefix from high maxHeartbeats must not leak into low maxHeartbeats: {:?}",
             rep_low_after
         );
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_zygote_and_audited_fallback_enforce_fast_verify_kernel_statement_pinning() {
+        let Some((tmp_dir, store, mut env_vars, lean_bin)) = open_test_zygote_env("fast_map_pin")
+        else {
+            return;
+        };
+        let toolchain = "leanprover/lean4:v4.35.0";
+        let mod_lean = tmp_dir.join("FastPinMod.lean");
+        let mod_olean = tmp_dir.join("FastPinMod.olean");
+        let orig_mod_src =
+            "namespace a\ndef k : Nat := 7\ntheorem b : k = 7 := rfl\ntheorem other : 1 = 1 := rfl\nend a\n";
+        fs::write(&mod_lean, orig_mod_src).unwrap();
+        let status = std::process::Command::new(&lean_bin)
+            .envs(&env_vars)
+            .current_dir(&tmp_dir)
+            .arg(&mod_lean)
+            .arg("-o")
+            .arg(&mod_olean)
+            .status()
+            .unwrap();
+        assert!(status.success(), "failed to compile FastPinMod.lean");
+        let lp = tmp_dir.to_string_lossy().to_string();
+        env_vars.insert("LEAN_PATH".to_string(), lp.clone());
+
+        let uncached: std::collections::HashSet<String> =
+            ["_root_.a.b".to_string()].into_iter().collect();
+        let valid_fast =
+            crate::splitter::build_fast_olean_shard_source(orig_mod_src, "FastPinMod", &uncached)
+                .unwrap();
+
+        let rep_ok = eval_with_zygote_pool_for_targets(
+            &store,
+            toolchain,
+            &lp,
+            &env_vars,
+            &lean_bin,
+            &valid_fast,
+            &["_root_.a.b".to_string()],
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            rep_ok.ok,
+            "expected valid fast-verify shard to pass: {:?}",
+            rep_ok
+        );
+
+        let fallback_ok = run_audited_lean_shard(
+            &store,
+            &lean_bin,
+            &env_vars,
+            None,
+            &valid_fast,
+            &uncached,
+            &[],
+            None,
+        )
+        .unwrap();
+        assert!(fallback_ok.status.success());
+
+        // Forge a fast-verify directive whose expected_gen_stmt_hash matches a weakened statement
+        // (`True` instead of `k = 7`), verifying that the Lean kernel check rejects the mismatch
+        // against imported `_root_.a.b` in `FastPinMod.olean`.
+        let forged_body =
+            "import FastPinMod\nnamespace a\ntheorem _turbo_verify_0_b : True := trivial\nend a\n";
+        let forged_shards = crate::splitter::split_lean_source(forged_body, &[]).shards;
+        let forged_dir = crate::splitter::format_fast_verify_directive(
+            "_root_.a.b",
+            "_root_.a._turbo_verify_0_b",
+            &forged_shards[0].stmt_hash,
+        );
+        let forged_src = format!("{}\n{}", forged_dir, forged_body);
+
+        let rep_forged = eval_with_zygote_pool_for_targets(
+            &store,
+            toolchain,
+            &lp,
+            &env_vars,
+            &lean_bin,
+            &forged_src,
+            &["_root_.a.b".to_string()],
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            !rep_forged.ok,
+            "forged fast-verify statement must be rejected by kernel type check: {:?}",
+            rep_forged
+        );
+
+        let fallback_forged = run_audited_lean_shard(
+            &store,
+            &lean_bin,
+            &env_vars,
+            None,
+            &forged_src,
+            &uncached,
+            &[],
+            None,
+        );
+        match fallback_forged {
+            Ok(out) => assert!(
+                !out.status.success(),
+                "audited fallback must reject forged fast-verify statement"
+            ),
+            Err(e) => assert!(
+                format!("{:#}", e).contains("fast-verify kernel statement mismatch"),
+                "unexpected fallback error: {:#}",
+                e
+            ),
+        }
+
+        // Unmapped `_turbo_verify_0_a_b` must fail both zygote and audited fallback.
+        let unmapped = "import Init\ntheorem _turbo_verify_0_a_b : True := trivial\n";
+        assert!(eval_with_zygote_pool_for_targets(
+            &store,
+            toolchain,
+            &lp,
+            &env_vars,
+            &lean_bin,
+            unmapped,
+            &["_root_.a.b".to_string()],
+            None,
+            &[],
+        )
+        .is_err());
+        let bad_set: std::collections::HashSet<String> =
+            ["_root_.a.b".to_string()].into_iter().collect();
+        assert!(run_audited_lean_shard(
+            &store,
+            &lean_bin,
+            &env_vars,
+            None,
+            unmapped,
+            &bad_set,
+            &[],
+            None,
+        )
+        .is_err());
+
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 }

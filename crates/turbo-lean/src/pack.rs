@@ -3543,7 +3543,8 @@ pub(crate) mod tests {
             mk_item("batch_shard_key_1", "batch_thm_1", "p1", "s1", "pr1"),
             mk_item("batch_shard_key_3", "batch_thm_3", "p3", "s3", "pr3"),
         ];
-        let partial_fast_src = "theorem _turbo_verify_1_batch_thm_1 : 2 + 2 = 4 := rfl\ntheorem _turbo_verify_2_batch_thm_3 : 4 + 4 = 8 := rfl\n";
+        let partial_fast_src =
+            "theorem batch_thm_1 : 2 + 2 = 4 := rfl\ntheorem batch_thm_3 : 4 + 4 = 8 := rfl\n";
         let resp3 = offload_check_shards_batch_http(
             &mut store_client3,
             &endpoint,
@@ -3739,7 +3740,7 @@ pub(crate) mod tests {
         let req = CheckShardHttpRequest {
             decl: "__batch__".into(),
             shard_key: "shard_key_par_cross_1".into(),
-            shard_source: "import Init\n-- namespace _TurboCrossFileShard_0\n-- end _TurboCrossFileShard_0\ntheorem _turbo_verify_10000_par1 (a b : Nat) : a + b = b + a := Nat.add_comm a b\n-- namespace _TurboCrossFileShard_1\n-- end _TurboCrossFileShard_1\ntheorem _turbo_verify_20000_par2 (x : Nat) : x + 0 = x := rfl\n".into(),
+            shard_source: "import Init\n-- namespace _TurboCrossFileShard_0\n-- end _TurboCrossFileShard_0\ntheorem par1 (a b : Nat) : a + b = b + a := Nat.add_comm a b\n-- namespace _TurboCrossFileShard_1\n-- end _TurboCrossFileShard_1\ntheorem par2 (x : Nat) : x + 0 = x := rfl\n".into(),
             interface_hash: String::new(),
             prefix_env_hash: String::new(),
             stmt_hash: String::new(),

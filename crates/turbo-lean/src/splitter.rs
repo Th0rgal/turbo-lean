@@ -3086,12 +3086,252 @@ fn normalize_whitespace(s: &str) -> String {
 ///   line-preserving `:= sorry` so Lean skips re-elaborating them in 0 ms while registering their types.
 /// - All **uncached** theorems (`name ∈ uncached_names`) retain their full original proof bodies
 ///   at their exact original line numbers.
+pub const FAST_VERIFY_DIRECTIVE_PREFIX: &str = "-- @turbo_fast_verify ";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct FastVerifyEntry {
+    pub orig_rooted: String,
+    pub gen_rooted: String,
+    pub expected_gen_stmt_hash: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct FastVerifyMap {
+    entries: Vec<FastVerifyEntry>,
+    orig_to_gen: std::collections::HashMap<String, String>,
+    gen_to_orig: std::collections::HashMap<String, String>,
+}
+
+fn hex_encode_fast_verify_field(s: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = Vec::with_capacity(s.len() * 2);
+    for &b in s.as_bytes() {
+        out.push(HEX[(b >> 4) as usize]);
+        out.push(HEX[(b & 0x0f) as usize]);
+    }
+    String::from_utf8(out).unwrap_or_default()
+}
+
+fn hex_decode_fast_verify_field(hex: &str) -> anyhow::Result<String> {
+    if hex.is_empty() || hex.len() % 2 != 0 {
+        anyhow::bail!("Malformed hex field in fast-verify directive: `{}`", hex);
+    }
+    let bytes = hex.as_bytes();
+    let nibble = |b: u8| -> anyhow::Result<u8> {
+        match b {
+            b'0'..=b'9' => Ok(b - b'0'),
+            b'a'..=b'f' => Ok(b - b'a' + 10),
+            b'A'..=b'F' => Ok(b - b'A' + 10),
+            _ => anyhow::bail!("Invalid hex digit in fast-verify directive: `{}`", hex),
+        }
+    };
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut i = 0usize;
+    while i < bytes.len() {
+        out.push((nibble(bytes[i])? << 4) | nibble(bytes[i + 1])?);
+        i += 2;
+    }
+    String::from_utf8(out).map_err(|_| anyhow::anyhow!("Invalid UTF-8 in fast-verify directive"))
+}
+
+pub(crate) fn format_fast_verify_directive(
+    orig_rooted: &str,
+    gen_rooted: &str,
+    expected_gen_stmt_hash: &str,
+) -> String {
+    format!(
+        "{}{} {} {}",
+        FAST_VERIFY_DIRECTIVE_PREFIX,
+        hex_encode_fast_verify_field(orig_rooted),
+        hex_encode_fast_verify_field(gen_rooted),
+        expected_gen_stmt_hash
+    )
+}
+
+pub(crate) fn has_fast_verify_component(name: &str) -> bool {
+    let qname = name.strip_prefix("_root_.").unwrap_or(name);
+    host_name_components(qname)
+        .iter()
+        .any(|c| c.starts_with("_turbo_verify_"))
+}
+
+impl FastVerifyMap {
+    pub fn entries(&self) -> &[FastVerifyEntry] {
+        &self.entries
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn gen_for_orig(&self, orig_rooted: &str) -> Option<&str> {
+        self.orig_to_gen.get(orig_rooted).map(String::as_str)
+    }
+
+    pub fn orig_for_gen(&self, gen_rooted: &str) -> Option<&str> {
+        self.gen_to_orig.get(gen_rooted).map(String::as_str)
+    }
+
+    pub fn canonical_rooted_for_shard(&self, sh: &TheoremShard) -> String {
+        let r = sh.rooted_name();
+        self.orig_for_gen(&r).unwrap_or(&r).to_string()
+    }
+
+    pub fn shard_matches_targets(
+        &self,
+        sh: &TheoremShard,
+        targets: &std::collections::HashSet<String>,
+    ) -> bool {
+        let canon = self.canonical_rooted_for_shard(sh);
+        matches_uncached_name(&canon, targets)
+            || matches_uncached_name(sh.effective_name(), targets)
+    }
+
+    pub fn parse_and_validate(src: &str, shards: &[TheoremShard]) -> anyhow::Result<Self> {
+        let mut entries = Vec::new();
+        let mut orig_to_gen = std::collections::HashMap::new();
+        let mut gen_to_orig = std::collections::HashMap::new();
+
+        for line in src.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("-- @turbo_fast_verify") {
+                if !rest.starts_with(' ') {
+                    anyhow::bail!("Malformed fast-verify directive line: `{}`", trimmed);
+                }
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                if parts.len() != 3 {
+                    anyhow::bail!(
+                        "Malformed fast-verify directive (expected 3 fields): `{}`",
+                        trimmed
+                    );
+                }
+                let orig_rooted = hex_decode_fast_verify_field(parts[0])?;
+                let gen_rooted = hex_decode_fast_verify_field(parts[1])?;
+                let expected_gen_stmt_hash = parts[2].to_string();
+                if !orig_rooted.starts_with("_root_.")
+                    || orig_rooted.len() <= "_root_.".len()
+                    || has_fast_verify_component(&orig_rooted)
+                {
+                    anyhow::bail!(
+                        "Invalid fast-verify original target `{}` in directive",
+                        orig_rooted
+                    );
+                }
+                if !gen_rooted.starts_with("_root_.")
+                    || !has_fast_verify_component(&gen_rooted)
+                    || expected_gen_stmt_hash.is_empty()
+                    || !expected_gen_stmt_hash
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit())
+                {
+                    anyhow::bail!(
+                        "Invalid fast-verify generated target `{}` in directive",
+                        gen_rooted
+                    );
+                }
+                if orig_to_gen.contains_key(&orig_rooted) {
+                    anyhow::bail!(
+                        "Duplicate fast-verify original target `{}` in shard source",
+                        orig_rooted
+                    );
+                }
+                if gen_to_orig.contains_key(&gen_rooted) {
+                    anyhow::bail!(
+                        "Duplicate fast-verify generated declaration `{}` in shard source",
+                        gen_rooted
+                    );
+                }
+                orig_to_gen.insert(orig_rooted.clone(), gen_rooted.clone());
+                gen_to_orig.insert(gen_rooted.clone(), orig_rooted.clone());
+                entries.push(FastVerifyEntry {
+                    orig_rooted,
+                    gen_rooted,
+                    expected_gen_stmt_hash,
+                });
+            }
+        }
+
+        let mut shard_by_rooted: std::collections::HashMap<String, &TheoremShard> =
+            std::collections::HashMap::with_capacity(shards.len());
+        for sh in shards {
+            let rooted = sh.rooted_name();
+            if has_fast_verify_component(&rooted) && !gen_to_orig.contains_key(&rooted) {
+                anyhow::bail!(
+                    "Unmapped `_turbo_verify_` declaration `{}` in shard source",
+                    sh.effective_name()
+                );
+            }
+            if orig_to_gen.contains_key(&rooted) {
+                anyhow::bail!(
+                    "Fast-verify original target `{}` cannot also be declared directly in shard source",
+                    rooted
+                );
+            }
+            if shard_by_rooted.insert(rooted.clone(), sh).is_some()
+                && gen_to_orig.contains_key(&rooted)
+            {
+                anyhow::bail!(
+                    "Duplicate generated declaration `{}` in shard source",
+                    rooted
+                );
+            }
+        }
+
+        for entry in &entries {
+            let Some(gen_sh) = shard_by_rooted.get(&entry.gen_rooted) else {
+                anyhow::bail!(
+                    "Fast-verify directive references missing declaration `{}` (for `{}`)",
+                    entry.gen_rooted,
+                    entry.orig_rooted
+                );
+            };
+            if gen_sh.stmt_hash != entry.expected_gen_stmt_hash {
+                anyhow::bail!(
+                    "Fast-verify statement hash mismatch on `{}` (expected {}, got {})",
+                    entry.gen_rooted,
+                    entry.expected_gen_stmt_hash,
+                    gen_sh.stmt_hash
+                );
+            }
+            let prf_clean = strip_lean_comments(&gen_sh.proof_text);
+            if ["sorry", "admit", "sorryAx"]
+                .iter()
+                .any(|w| contains_word(&prf_clean, w))
+            {
+                anyhow::bail!(
+                    "Fast-verify generated declaration `{}` (for `{}`) contains sorry/admit",
+                    entry.gen_rooted,
+                    entry.orig_rooted
+                );
+            }
+        }
+
+        Ok(Self {
+            entries,
+            orig_to_gen,
+            gen_to_orig,
+        })
+    }
+}
+
 pub fn build_coalesced_shard_source(
     src: &str,
     uncached_names: &std::collections::HashSet<String>,
 ) -> String {
     let clean = strip_lean_comments(src);
     let spans = parse_command_spans(src, &clean);
+    let parsed_shards = split_lean_source_fast_no_cone(src, &[]).shards;
+    let fast_map = FastVerifyMap::parse_and_validate(src, &parsed_shards).ok();
+    let is_uncached = |qname: &str| -> bool {
+        if matches_uncached_name(qname, uncached_names) {
+            return true;
+        }
+        let rooted = format!("_root_.{}", qname.strip_prefix("_root_.").unwrap_or(qname));
+        fast_map
+            .as_ref()
+            .and_then(|m| m.orig_for_gen(&rooted))
+            .is_some_and(|orig| matches_uncached_name(orig, uncached_names))
+    };
 
     let mut chunks = Vec::with_capacity(spans.len());
     let mut scope_stack: Vec<ScopeFrame> = Vec::new();
@@ -3107,7 +3347,7 @@ pub fn build_coalesced_shard_source(
                 for sub in &inner_spans {
                     if let Some((_kind, name)) = classify_decl_header(sub.clean_text) {
                         let qname = qualified_decl_name(&name, &scope_stack);
-                        if !matches_uncached_or_fast_verify_name(&qname, uncached_names) {
+                        if !is_uncached(&qname) && !has_fast_verify_component(&qname) {
                             if let Some((sig_clean, proof_clean)) =
                                 split_at_top_level_assign(sub.clean_text)
                             {
@@ -3131,9 +3371,8 @@ pub fn build_coalesced_shard_source(
 
         if let Some((_kind, name)) = classify_decl_header(span.clean_text) {
             let qname = qualified_decl_name(&name, &scope_stack);
-            if !matches_uncached_or_fast_verify_name(&qname, uncached_names) {
-                let short = name.rsplit('.').next().unwrap_or(&name);
-                if short.starts_with("_turbo_verify_") {
+            if !is_uncached(&qname) {
+                if has_fast_verify_component(&qname) {
                     update_scope_stack_with_idx(&mut scope_stack, span.clean_text, s_idx);
                     continue;
                 }
@@ -3212,54 +3451,10 @@ fn matches_uncached_name(name: &str, uncached_names: &std::collections::HashSet<
             .any(|u| decl_name_matches_target(name, u.as_str()))
 }
 
-pub(crate) fn matches_uncached_or_fast_verify_name(
-    name: &str,
-    uncached_names: &std::collections::HashSet<String>,
-) -> bool {
-    matches_uncached_name(name, uncached_names)
-        || uncached_names
-            .iter()
-            .any(|u| resolve_fast_verify_rooted_target(name, u).is_some())
-}
-
-pub(crate) fn resolve_fast_verify_rooted_target(name: &str, target: &str) -> Option<String> {
-    let qname = name.strip_prefix("_root_.").unwrap_or(name);
-    let comps = host_name_components(qname);
-    let orig_safe = comps
-        .last()?
-        .strip_prefix("_turbo_verify_")?
-        .trim_start_matches(|c: char| c.is_ascii_digit())
-        .strip_prefix('_')?;
-    let ns_pre = &comps[..comps.len() - 1];
-    let (exact_root, tc) = parse_host_target(target);
-    if tc.is_empty() {
-        return None;
-    }
-    let at = |k: usize| -> Option<String> {
-        let req_ns = &ns_pre[k..];
-        if !tc.starts_with(req_ns) {
-            return None;
-        }
-        let rem = &tc[req_ns.len()..];
-        (!rem.is_empty() && orig_safe == sanitize_ident_for_fast_check(&rem.join("."))).then(|| {
-            let full: Vec<&str> = ns_pre
-                .iter()
-                .chain(rem.iter())
-                .map(String::as_str)
-                .collect();
-            format!("_root_.{}", full.join("."))
-        })
-    };
-    if exact_root {
-        at(0)
-    } else {
-        (0..=ns_pre.len()).find_map(at)
-    }
-}
-
-pub(crate) fn resolve_shard_rooted_targets(
+pub(crate) fn resolve_shard_rooted_targets_with_map(
     shards: &[TheoremShard],
     targets: &[String],
+    fast_map: &FastVerifyMap,
 ) -> anyhow::Result<Vec<String>> {
     targets
         .iter()
@@ -3268,18 +3463,18 @@ pub(crate) fn resolve_shard_rooted_targets(
             if t.is_empty() {
                 anyhow::bail!("Empty target declaration name in shard verification request");
             }
+            if has_fast_verify_component(t) {
+                anyhow::bail!(
+                    "Target declaration `{}` cannot directly name an internal `_turbo_verify_` declaration",
+                    t
+                );
+            }
             let mut hits: Vec<String> = Vec::new();
             for sh in shards {
-                let eff = sh.effective_name();
-                let base = eff.split("__turbo_check_").next().unwrap_or(eff);
-                let hit = if decl_name_matches_target(base, t) {
-                    Some(format!("_root_.{}", base))
-                } else {
-                    resolve_fast_verify_rooted_target(base, t)
-                };
-                if let Some(canon) = hit {
-                    if !hits.contains(&canon) {
-                        hits.push(canon);
+                let canon_rooted = fast_map.canonical_rooted_for_shard(sh);
+                if decl_name_matches_target(&canon_rooted, t) {
+                    if !hits.contains(&canon_rooted) {
+                        hits.push(canon_rooted);
                     }
                 }
             }
@@ -3294,6 +3489,16 @@ pub(crate) fn resolve_shard_rooted_targets(
             }
         })
         .collect()
+}
+
+pub(crate) fn resolve_shard_rooted_targets(
+    src: &str,
+    shards: &[TheoremShard],
+    targets: &[String],
+) -> anyhow::Result<(Vec<String>, FastVerifyMap)> {
+    let fast_map = FastVerifyMap::parse_and_validate(src, shards)?;
+    let resolved = resolve_shard_rooted_targets_with_map(shards, targets, &fast_map)?;
+    Ok((resolved, fast_map))
 }
 
 /// Returns true if `clean_text` is a scope or scoped-modifier command (`namespace`, `section`,
@@ -3441,6 +3646,8 @@ fn rename_decl_header_for_fast_check(
     clean_text: &str,
     decl_name: &str,
     idx: usize,
+    scope_stack: &[ScopeFrame],
+    indent_prefix: &str,
 ) -> Option<String> {
     let (sig_orig, proof_orig) = split_at_top_level_assign(orig_text)?;
     let (sig_clean, _) = split_at_top_level_assign(clean_text)?;
@@ -3473,7 +3680,7 @@ fn rename_decl_header_for_fast_check(
                     } else {
                         &sig_orig[..kw_pos]
                     };
-                    return Some(format!(
+                    let renamed_body = format!(
                         "{}{}{}{}{}{}",
                         prefix_orig,
                         &sig_orig[kw_pos..abs_name_start],
@@ -3481,7 +3688,20 @@ fn rename_decl_header_for_fast_check(
                         &sig_orig[abs_name_end..],
                         sep,
                         opt_proof
-                    ));
+                    );
+                    let renamed_clean = strip_lean_comments(&renamed_body);
+                    let (gen_sig_clean, _) = split_at_top_level_assign(&renamed_clean)?;
+                    let expected_gen_stmt_hash = hash_normalized_whitespace_hex(gen_sig_clean);
+                    let orig_rooted =
+                        format!("_root_.{}", qualified_decl_name(decl_name, scope_stack));
+                    let gen_rooted =
+                        format!("_root_.{}", qualified_decl_name(&replacement, scope_stack));
+                    let directive = format_fast_verify_directive(
+                        &orig_rooted,
+                        &gen_rooted,
+                        &expected_gen_stmt_hash,
+                    );
+                    return Some(format!("{}{}\n{}", indent_prefix, directive, renamed_body));
                 }
             }
         }
@@ -3669,11 +3889,15 @@ pub fn build_fast_olean_shard_source_with_split(
                             if split_at_top_level_assign(sub.clean_text).is_some() {
                                 let cur_idx = thm_idx;
                                 thm_idx += 1;
+                                let sub_indent = &sub.orig_text
+                                    [..sub.orig_text.len() - sub.orig_text.trim_start().len()];
                                 let renamed = rename_decl_header_for_fast_check(
                                     sub.orig_text,
                                     sub.clean_text,
                                     &name,
                                     cur_idx,
+                                    &scope_stack,
+                                    sub_indent,
                                 )?;
                                 inner_chunks.push(renamed);
                                 continue;
@@ -3708,6 +3932,8 @@ pub fn build_fast_olean_shard_source_with_split(
                         span.clean_text,
                         &name,
                         cur_idx,
+                        &scope_stack,
+                        "",
                     )?;
                     chunks.push(renamed);
                 } else {
@@ -4010,6 +4236,8 @@ pub fn build_cross_file_coalesced_shard(
                             span.clean_text,
                             &name,
                             cur_idx,
+                            &scope_stack,
+                            "",
                         ) {
                             block_chunks.push(renamed);
                         }
@@ -5654,8 +5882,69 @@ end MathlibEdgeCases
                 .lines()
                 .nth(target_shard.start_line - 1)
                 .map(str::trim),
-            src.lines().nth(target_shard.start_line - 1).map(str::trim)
+            src.lines()
+                .nth(target_shard.start_line - 1)
+                .map(|l| l.trim())
         );
+    }
+
+    #[test]
+    fn test_fast_verify_map_rejects_unmapped_synthetic_collisions_and_tampered_stmt() {
+        let unmapped = "import Init\ntheorem _turbo_verify_0_a_b : True := trivial\n";
+        let unmapped_shards = split_lean_source(unmapped, &[]).shards;
+        assert!(FastVerifyMap::parse_and_validate(unmapped, &unmapped_shards).is_err());
+        assert!(resolve_shard_rooted_targets(
+            unmapped,
+            &unmapped_shards,
+            &["_root_.a.b".to_string()]
+        )
+        .is_err());
+        assert!(resolve_shard_rooted_targets(
+            unmapped,
+            &unmapped_shards,
+            &["_root_.a_b".to_string()]
+        )
+        .is_err());
+
+        let src = "namespace a\ndef helper : Nat := 1\ntheorem b : helper = 1 := rfl\nend a\nnamespace x\ntheorem y : 1 = 1 := rfl\nend x\n";
+        let uncached: HashSet<String> = ["a.b".to_string()].into_iter().collect();
+        let fast_src = build_fast_olean_shard_source(src, "Pkg.Demo", &uncached)
+            .expect("expected fast olean shard");
+        let fast_shards = split_lean_source(&fast_src, &[]).shards;
+        let (resolved_ab, map) =
+            resolve_shard_rooted_targets(&fast_src, &fast_shards, &["a.b".to_string()])
+                .expect("expected exact mapped resolution for a.b");
+        assert_eq!(resolved_ab, vec!["_root_.a.b".to_string()]);
+        assert_eq!(
+            map.gen_for_orig("_root_.a.b"),
+            Some("_root_.a._turbo_verify_0_b")
+        );
+        assert!(
+            resolve_shard_rooted_targets(&fast_src, &fast_shards, &["_root_.a_b".to_string()])
+                .is_err()
+        );
+        assert!(resolve_shard_rooted_targets(
+            &fast_src,
+            &fast_shards,
+            &["_root_.a._turbo_verify_0_b".to_string()]
+        )
+        .is_err());
+
+        let tampered_stmt = fast_src.replace("helper = 1", "True");
+        let tampered_shards = split_lean_source(&tampered_stmt, &[]).shards;
+        assert!(FastVerifyMap::parse_and_validate(&tampered_stmt, &tampered_shards).is_err());
+
+        let tampered_sorry = fast_src.replace(":= rfl", ":= sorry");
+        let sorry_shards = split_lean_source(&tampered_sorry, &[]).shards;
+        assert!(FastVerifyMap::parse_and_validate(&tampered_sorry, &sorry_shards).is_err());
+
+        let first_dir = fast_src
+            .lines()
+            .find(|l| l.trim().starts_with(FAST_VERIFY_DIRECTIVE_PREFIX))
+            .unwrap();
+        let dup_dir = format!("{}\n{}", first_dir, fast_src);
+        let dup_shards = split_lean_source(&dup_dir, &[]).shards;
+        assert!(FastVerifyMap::parse_and_validate(&dup_dir, &dup_shards).is_err());
     }
 }
 

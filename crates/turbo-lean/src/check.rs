@@ -1130,27 +1130,16 @@ fn check_directory(
     };
     if cross_eligible.len() == uncached_files.len() {
         let cross_args = cross_shared_args.unwrap_or_default();
-        let cross_src = if proj_build_verified {
-            let mut s = String::new();
-            for (mod_imp, _, _) in &cross_eligible {
-                s.push_str("import ");
-                s.push_str(mod_imp);
-                s.push('\n');
-            }
-            s.push_str("#check Nat\n");
-            s
-        } else {
-            let shard_ref_vecs: Vec<Vec<&splitter::TheoremShard>> = cross_eligible
-                .iter()
-                .map(|(_, _, fu)| fu.iter().map(|(_, sh)| sh).collect())
-                .collect();
-            let cross_inputs: Vec<(&str, &str, &[&splitter::TheoremShard])> = cross_eligible
-                .iter()
-                .enumerate()
-                .map(|(i, (m, s, _))| (m.as_str(), *s, shard_ref_vecs[i].as_slice()))
-                .collect();
-            splitter::build_cross_file_coalesced_shard(&cross_inputs)
-        };
+        let shard_ref_vecs: Vec<Vec<&splitter::TheoremShard>> = cross_eligible
+            .iter()
+            .map(|(_, _, fu)| fu.iter().map(|(_, sh)| sh).collect())
+            .collect();
+        let cross_inputs: Vec<(&str, &str, &[&splitter::TheoremShard])> = cross_eligible
+            .iter()
+            .enumerate()
+            .map(|(i, (m, s, _))| (m.as_str(), *s, shard_ref_vecs[i].as_slice()))
+            .collect();
+        let cross_src = splitter::build_cross_file_coalesced_shard(&cross_inputs);
         if let Some(remote_url) = remote_http {
             let mut req_items = Vec::with_capacity(total_misses);
             for (_, _, file_uncached, _) in &uncached_files {
@@ -2309,9 +2298,7 @@ fn check_single_decl(
                 None
             } else {
                 prebuilt_mod.as_ref().and_then(|mod_imp| {
-                    if proj_build_verified {
-                        Some(format!("import {}\n#check Nat\n", mod_imp))
-                    } else if split.shards.len() > 1 {
+                    if split.shards.len() > 1 {
                         splitter::build_fast_olean_shard_source_with_split(
                             &active_src,
                             split,
@@ -3314,9 +3301,7 @@ fn check_single_file(
         let fast_batch_src = (!batch_succeeded)
             .then(|| {
                 prebuilt_batch_mod.as_ref().and_then(|mod_imp| {
-                    if proj_build_verified {
-                        Some(format!("import {}\n#check Nat\n", mod_imp))
-                    } else if split.shards.len() > 1 {
+                    if split.shards.len() > 1 {
                         splitter::build_fast_olean_shard_source_with_split(
                             src,
                             split,
