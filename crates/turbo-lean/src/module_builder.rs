@@ -5177,7 +5177,9 @@ fn import_pin_current_with_policy(
     };
     match (site, pin) {
         (ImportSite::Toolchain, None) => true,
-        (ImportSite::Prebuilt(olean), Some(pin)) => olean_digest_is(cfg, &olean, pin),
+        (ImportSite::Prebuilt(olean), Some(pin)) => {
+            olean_digest_is(cfg, &olean, pin) && prebuilt_olean_export_info(&olean).is_some()
+        }
         (ImportSite::Module(spec), Some(pin)) => {
             dep_pkg_import_pins_consistent(cfg, memo, *spec, pin, strict_policy)
         }
@@ -5378,6 +5380,7 @@ pub(crate) fn root_pkg_lake_module_stale(cfg: &ProjectConfig, imp: &str) -> bool
 pub(crate) fn dep_pkg_module_stale(cfg: &ProjectConfig, memo: &DepImportMemo, imp: &str) -> bool {
     let spec = match resolve_import_site(cfg, imp) {
         ImportSite::Module(spec) => spec,
+        ImportSite::Prebuilt(olean) => return prebuilt_olean_export_info(&olean).is_none(),
         // Two dependency packages own the name: no single closure is safe to elaborate against.
         ImportSite::Unresolved => return true,
         _ => return false,
@@ -6245,6 +6248,11 @@ fn is_dep_olean_fresh(
                 compute_olean_artifact_set_digest_with_policy(&spec_olean_path(&d), preserve)
                     .is_ok_and(|dig| dig == pin)
             }
+            (ImportSite::Prebuilt(olean), Some(pin)) => {
+                compute_olean_artifact_set_digest_with_policy(&olean, preserve)
+                    .is_ok_and(|dig| dig == pin)
+                    && prebuilt_olean_export_info(&olean).is_some()
+            }
             _ => false,
         }
     });
@@ -6730,6 +6738,12 @@ pub fn build_module_dag_with_trust(
                     }
                 }
                 if let Some(pb_path) = found_prebuilt {
+                    anyhow::ensure!(
+                        prebuilt_olean_export_info(&pb_path).is_some(),
+                        "Prebuilt import `{}` at {} lacks valid Lake `.trace` / `.hash` sidecars",
+                        imp,
+                        pb_path.display()
+                    );
                     external_olean_deps.push((imp.clone(), pb_path));
                     continue;
                 }
@@ -14558,5 +14572,181 @@ roots = ["Fast"]
         .unwrap();
         parse_lakefile_toml(&dir, &tf, false).unwrap();
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_direct_prebuilt_import_requires_valid_trace_and_hash_sidecars() {
+        use crate::worktree_test_support::snapshot;
+
+        let _env_guard = native_build_env_guard();
+        let dir = make_temp_test_dir("direct_prebuilt_sidecars");
+        let ext_dir = dir.join("ext_pkg");
+        let proj_dir = dir.join("proj");
+        fs::create_dir_all(ext_dir.join("ExtLib")).unwrap();
+        fs::create_dir_all(proj_dir.join("App")).unwrap();
+        for d in [&ext_dir, &proj_dir] {
+            fs::write(d.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        }
+        fs::write(
+            ext_dir.join("lakefile.toml"),
+            "name = \"ext_pkg\"\ndefaultTargets = [\"ExtLib\"]\n[[lean_lib]]\nname = \"ExtLib\"\nglobs = [\"ExtLib.+\"]\n",
+        )
+        .unwrap();
+        fs::write(ext_dir.join("ExtLib/Base.lean"), "def extVal : Nat := 7\n").unwrap();
+        let st = std::process::Command::new("lake")
+            .args(["build", "ExtLib.Base"])
+            .current_dir(&ext_dir)
+            .status()
+            .unwrap();
+        assert!(st.success(), "`lake build ExtLib.Base` failed");
+
+        fs::write(
+            proj_dir.join("lakefile.toml"),
+            "name = \"app_pkg\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\nglobs = [\"App.+\"]\n",
+        )
+        .unwrap();
+        let use_file = proj_dir.join("App/Use.lean");
+        let use_src = "import ExtLib.Base\ntheorem use_ok : extVal = 7 := rfl\n";
+        fs::write(&use_file, use_src).unwrap();
+
+        let ext_lib_lean = ext_dir
+            .canonicalize()
+            .unwrap()
+            .join(".lake/build/lib/lean");
+        let prev_lp = std::env::var_os("LEAN_PATH");
+        std::env::set_var("LEAN_PATH", &ext_lib_lean);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut store = TurboStore::open(Some(&dir.join(".turbo_store"))).unwrap();
+            build_project_modules_native(
+                &mut store,
+                &proj_dir,
+                &["App.Use".to_string()],
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap();
+
+            let canon = proj_dir.canonicalize().unwrap();
+            let canon_use = use_file.canonicalize().unwrap();
+            assert!(crate::lake_build::is_file_verified_in_lake_build(
+                &canon, &canon_use, use_src
+            ));
+            assert_eq!(
+                crate::lake_build::ensure_project_imports_fresh_for_check(
+                    &canon,
+                    std::slice::from_ref(&canon_use),
+                )
+                .unwrap(),
+                0
+            );
+
+            let ext_trace = ext_lib_lean.join("ExtLib/Base.trace");
+            let ext_hash = ext_lib_lean.join("ExtLib/Base.olean.hash");
+            for (sidecar, label) in [
+                (&ext_trace, "missing prebuilt .trace"),
+                (&ext_hash, "missing prebuilt .olean.hash"),
+            ] {
+                let saved = fs::read(sidecar).unwrap();
+                fs::remove_file(sidecar).unwrap();
+
+                assert!(
+                    !crate::lake_build::is_file_verified_in_lake_build(
+                        &canon, &canon_use, use_src
+                    ),
+                    "{label}: `is_file_verified_in_lake_build` accepted prebuilt import without sidecar"
+                );
+
+                fs::write(
+                    canon.join("turbo-lean.toml"),
+                    "[worktree]\nauto_link = false\n",
+                )
+                .unwrap();
+                let snap_proj = snapshot(&canon).unwrap();
+                let snap_ext = snapshot(&ext_dir.canonicalize().unwrap()).unwrap();
+                let opt_err = crate::lake_build::ensure_project_imports_fresh_for_check(
+                    &canon,
+                    std::slice::from_ref(&canon_use),
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(
+                    opt_err.contains("Worktree opt-out prevents refreshing stale imports")
+                        && opt_err.contains("ExtLib.Base"),
+                    "{label}: opt-out check missed stale direct prebuilt import: {opt_err}"
+                );
+                assert_eq!(
+                    snapshot(&canon).unwrap(),
+                    snap_proj,
+                    "{label}: opt-out mutated root `.lake`"
+                );
+                assert_eq!(
+                    snapshot(&ext_dir.canonicalize().unwrap()).unwrap(),
+                    snap_ext,
+                    "{label}: opt-out mutated external prebuilt `.lake`"
+                );
+                fs::remove_file(canon.join("turbo-lean.toml")).unwrap();
+
+                assert!(
+                    crate::lake_build::ensure_project_imports_fresh_for_check(
+                        &canon,
+                        std::slice::from_ref(&canon_use),
+                    )
+                    .is_err(),
+                    "{label}: non-opt-out check accepted unbuildable prebuilt import without sidecar"
+                );
+                assert!(
+                    build_project_modules_native(
+                        &mut store,
+                        &proj_dir,
+                        &["App.Use".to_string()],
+                        "trusted-internal",
+                        1,
+                        false,
+                        true,
+                        None,
+                    )
+                    .is_err(),
+                    "{label}: `build_project_modules_native` accepted prebuilt import without sidecar"
+                );
+
+                fs::write(sidecar, saved).unwrap();
+            }
+
+            assert_eq!(
+                crate::lake_build::ensure_project_imports_fresh_for_check(
+                    &canon,
+                    std::slice::from_ref(&canon_use),
+                )
+                .unwrap(),
+                0
+            );
+            build_project_modules_native(
+                &mut store,
+                &proj_dir,
+                &["App.Use".to_string()],
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap();
+            assert!(crate::lake_build::is_file_verified_in_lake_build(
+                &canon, &canon_use, use_src
+            ));
+        }));
+
+        match prev_lp {
+            Some(v) => std::env::set_var("LEAN_PATH", v),
+            None => std::env::remove_var("LEAN_PATH"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
     }
 }

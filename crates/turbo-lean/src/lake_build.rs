@@ -2365,12 +2365,9 @@ pub(crate) fn ensure_project_imports_fresh(
             adj.insert(mod_name.clone(), sub_imps);
             ordered_imports.push((mod_name, imp_slash, dep_src));
         } else if let Some(cfg) = root_cfg.as_ref() {
-            // Toolchain (and anything else) only after dependency ownership. Ambiguity is
-            // `Unresolved` and fails closed inside `dep_pkg_module_stale`'s callers via refresh.
-            if matches!(
+            if !matches!(
                 crate::module_builder::resolve_import_site(cfg, &mod_name),
-                crate::module_builder::ImportSite::Module(_)
-                    | crate::module_builder::ImportSite::Unresolved
+                crate::module_builder::ImportSite::Toolchain
             ) {
                 non_root_imports.push(mod_name);
             }
