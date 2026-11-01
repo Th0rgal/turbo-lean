@@ -5288,6 +5288,75 @@ mod pr_verify_tests {
             before_dep,
             "opt-out pr-verify mutated dep .lake"
         );
+        fs::write(&dep_manifest, &good)?;
+        fs::remove_file(&base_marker)?;
+        fs::write(
+            proj.join("turbo-lean.toml"),
+            format!(
+                "[lake]\nbuild_command = [\"sh\", \"-c\", \"touch '{}' && lake build \\\"$@\\\"\", \"sh\"]\n",
+                base_marker.display()
+            ),
+        )?;
+        fs::write(proj.join("custom_src/P/T.lean"), target)?;
+        crate::module_builder::build_project_modules_native(
+            &mut store,
+            &proj,
+            &[],
+            "trusted-internal",
+            1,
+            false,
+            true,
+            None,
+        )?;
+        let root_manifest = proj.join(".lake/build/.turbo_verified_sources.json");
+        let stale_root_manifest = fs::read(&root_manifest)?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            format!(
+                "name = \"p\"\nsrcDir = \"custom_src\"\nleanOptions = {{ autoImplicit = false }}\n[[require]]\nname = \"dep_pkg\"\npath = \"{}\"\n[[lean_lib]]\nname = \"P\"\nglobs = [\"P.+\"]\n",
+                dep.display()
+            ),
+        )?;
+        git_init_and_commit(&proj, "shift root leanOptions")?;
+        fs::write(&root_manifest, &stale_root_manifest)?;
+        fs::write(
+            proj.join("turbo-lean.toml"),
+            "[worktree]\nauto_link = false\n",
+        )?;
+        fs::write(
+            proj.join("custom_src/P/T.lean"),
+            target.replace("rfl", "exact Eq.refl _"),
+        )?;
+        let before_root_cfg = snapshot(&proj)?;
+        let err_root_cfg = pr(&mut store).unwrap_err().to_string();
+        assert!(
+            err_root_cfg.contains("Worktree opt-out prevents refreshing stale imports: P.Local"),
+            "{err_root_cfg}"
+        );
+        assert_eq!(
+            snapshot(&proj)?,
+            before_root_cfg,
+            "opt-out pr-verify mutated .lake on root config drift"
+        );
+        fs::write(
+            proj.join("turbo-lean.toml"),
+            format!(
+                "[lake]\nbuild_command = [\"sh\", \"-c\", \"touch '{}' && lake build \\\"$@\\\"\", \"sh\"]\n",
+                base_marker.display()
+            ),
+        )?;
+        pr(&mut store)?;
+        assert!(
+            base_marker.is_file(),
+            "linking-on pr-verify did not rebuild `P.Local` after root config drift"
+        );
+        let post_root: serde_json::Value = serde_json::from_slice(&fs::read(&root_manifest)?)?;
+        assert!(
+            post_root["modules"]
+                .get("custom_src/P/Local.lean")
+                .is_none(),
+            "linking-on pr-verify left stale-config root entry in place: {post_root}"
+        );
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }

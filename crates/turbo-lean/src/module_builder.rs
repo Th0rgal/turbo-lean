@@ -5034,6 +5034,16 @@ impl Clone for DepImportMemo {
     }
 }
 
+fn pkg_manifest_has_module_entry(pkg_root: &Path, rel_src: &str) -> Option<bool> {
+    match fs::read(pkg_root.join(".lake/build/.turbo_verified_sources.json")) {
+        Ok(bytes) => serde_json::from_slice::<VerifiedDepManifest>(&bytes)
+            .ok()
+            .map(|m| m.modules.contains_key(rel_src)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    }
+}
+
 /// Load `pkg_root`'s verified-sources manifest if it was written for this package, toolchain,
 /// configuration, and (when `strict_policy` is set) workspace and axiom policy.
 fn read_pkg_verified_manifest(
@@ -5228,25 +5238,73 @@ pub(crate) fn entry_artifacts_current(
 /// After Lake refreshed dependency-package module `imp`, drop its now-outdated verified-sources
 /// entry (or an unparseable manifest), so the module counts as Lake-managed from then on.
 pub(crate) fn forget_refreshed_dep_module(cfg: &ProjectConfig, imp: &str) {
-    let ImportSite::Module(spec) = resolve_import_site(cfg, imp) else {
+    let ImportSite::Module(root_spec) = resolve_import_site(cfg, imp) else {
         return;
     };
-    let path = spec
-        .pkg_root
-        .join(".lake/build/.turbo_verified_sources.json");
-    let Ok(bytes) = fs::read(&path) else {
-        return;
-    };
-    match serde_json::from_slice::<VerifiedDepManifest>(&bytes) {
-        Ok(mut manifest) => {
-            if manifest.modules.remove(&spec_rel_src(&spec)).is_some() {
-                if let Ok(json) = serde_json::to_vec(&manifest) {
-                    let _ = fs::write(&path, json);
+    let root_key = (root_spec.pkg_root.clone(), root_spec.module_name.clone());
+    let mut visited = HashSet::new();
+    let mut postorder: Vec<DiscoveredModuleSpec> = Vec::new();
+    let mut stack = vec![(*root_spec, false)];
+    while let Some((spec, expanded)) = stack.pop() {
+        let key = (spec.pkg_root.clone(), spec.module_name.clone());
+        if expanded {
+            postorder.push(spec);
+            continue;
+        }
+        if !visited.insert(key) {
+            continue;
+        }
+        let sub_imps = fs::read_to_string(&spec.src_path)
+            .ok()
+            .map(|s| parse_header_info(&s))
+            .filter(|h| h.header_error.is_none())
+            .map(|h| h.imports)
+            .unwrap_or_default();
+        stack.push((spec, true));
+        for sub in sub_imps {
+            let site = match resolve_module_in_package(&cfg.root_pkg, true, &sub) {
+                Some(rs) => ImportSite::Module(Box::new(rs)),
+                None => resolve_import_site(cfg, &sub),
+            };
+            if let ImportSite::Module(sub_spec) = site {
+                if !visited.contains(&(sub_spec.pkg_root.clone(), sub_spec.module_name.clone())) {
+                    stack.push((*sub_spec, false));
                 }
             }
         }
-        Err(_) => {
+    }
+    for spec in postorder {
+        let path = spec
+            .pkg_root
+            .join(".lake/build/.turbo_verified_sources.json");
+        let bytes = match fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                let _ = fs::remove_file(&path);
+                continue;
+            }
+        };
+        let Ok(mut manifest) = serde_json::from_slice::<VerifiedDepManifest>(&bytes) else {
             let _ = fs::remove_file(&path);
+            continue;
+        };
+        let rel = spec_rel_src(&spec);
+        let is_root_imp = spec.pkg_root == root_key.0 && spec.module_name == root_key.1;
+        let should_drop = manifest.modules.get(&rel).is_some_and(|entry| {
+            is_root_imp
+                || !dep_pkg_import_pins_consistent(
+                    cfg,
+                    &DepImportMemo::default(),
+                    spec.clone(),
+                    &entry.olean_artifact_digest,
+                    false,
+                )
+        });
+        if should_drop && manifest.modules.remove(&rel).is_some() {
+            if let Ok(json) = serde_json::to_vec(&manifest) {
+                let _ = fs::write(&path, json);
+            }
         }
     }
 }
@@ -5666,20 +5724,7 @@ fn lake_closure_export_info(
             (arts_trace, arts_trace)
         };
 
-        // Check whether this module has a valid turbo verified-sources entry; if the package has a
-        // corrupt/unreadable manifest file on disk, fail closed immediately.
-        let pkg_manifest_path = spec
-            .pkg_root
-            .join(".lake/build/.turbo_verified_sources.json");
-        match fs::read(&pkg_manifest_path) {
-            Ok(bytes) => {
-                if serde_json::from_slice::<VerifiedDepManifest>(&bytes).is_err() {
-                    return None;
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return None,
-        }
+        let raw_has_entry = pkg_manifest_has_module_entry(&spec.pkg_root, &spec_rel_src(spec))?;
         let manifest_entry = manifests
             .entry(spec.pkg_root.clone())
             .or_insert_with(|| {
@@ -5694,6 +5739,9 @@ fn lake_closure_export_info(
             .as_ref()
             .and_then(|m| m.modules.get(&spec_rel_src(spec)))
             .cloned();
+        if raw_has_entry && manifest_entry.is_none() {
+            return None;
+        }
 
         let has_valid_turbo_entry = if let Some(ref entry) = manifest_entry {
             if (strict_policy && spec.is_root_pkg && !entry.kernel_audited)
@@ -5907,18 +5955,10 @@ fn dep_pkg_import_pins_consistent(
             }
             continue;
         }
-        let pkg_manifest_path = cur
-            .pkg_root
-            .join(".lake/build/.turbo_verified_sources.json");
-        match fs::read(&pkg_manifest_path) {
-            Ok(bytes) => {
-                if serde_json::from_slice::<VerifiedDepManifest>(&bytes).is_err() {
-                    return false;
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return false,
-        }
+        let Some(raw_has_entry) = pkg_manifest_has_module_entry(&cur.pkg_root, &spec_rel_src(&cur))
+        else {
+            return false;
+        };
         let manifest = manifests.entry(cur.pkg_root.clone()).or_insert_with(|| {
             read_pkg_verified_manifest(
                 cfg,
@@ -5933,7 +5973,8 @@ fn dep_pkg_import_pins_consistent(
             .and_then(|m| m.modules.get(&spec_rel_src(&cur)))
             .cloned()
         else {
-            if strict_policy || !olean_digest_is(cfg, &spec_olean_path(&cur), &pin) {
+            if strict_policy || raw_has_entry || !olean_digest_is(cfg, &spec_olean_path(&cur), &pin)
+            {
                 return false;
             }
             let mut visiting = HashSet::new();
@@ -11759,8 +11800,13 @@ lean_exe «demo-exe» where
             "matching toolchain identity must stay fresh"
         );
         for (field, value) in [
+            ("pkg_name", "other_pkg"),
             ("toolchain", "leanprover/lean4:v4.24.0"),
             ("lean_githash", "0000000000000000000000000000000000000000"),
+            (
+                "pkg_config_digest",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            ),
         ] {
             let mut stale: serde_json::Value = serde_json::from_slice(&good).unwrap();
             stale[field] = serde_json::json!(value);
@@ -11771,9 +11817,94 @@ lean_exe «demo-exe» where
             );
             fs::write(&manifest_path, &good).unwrap();
         }
-        // Without a resolvable package config, `lean_githash` cannot be verified, so fail closed.
         let lakefile = canon.join("lakefile.toml");
         let saved_lakefile = fs::read(&lakefile).unwrap();
+        let saved_lf_mtime = fs::metadata(&lakefile).unwrap().modified().unwrap();
+        for extra_cfg in [
+            "leanOptions = { autoImplicit = false }\n",
+            "moreLeanArgs = [\"-DwarningAsError=true\"]\n",
+            "weakLeanArgs = [\"-DmaxSynthPendingDepth=4\"]\n",
+        ] {
+            build_project_modules_native(
+                &mut store,
+                &proj_dir,
+                &[],
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap();
+            let mut shifted = String::from_utf8(saved_lakefile.clone()).unwrap();
+            let lib_idx = shifted.find("[[lean_lib]]").unwrap();
+            shifted.insert_str(lib_idx, extra_cfg);
+            fs::write(&lakefile, shifted).unwrap();
+            fs::File::open(&lakefile)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(saved_lf_mtime))
+                .unwrap();
+            fs::write(
+                canon.join("turbo-lean.toml"),
+                "[worktree]\nauto_link = false\n",
+            )
+            .unwrap();
+            #[cfg(unix)]
+            let before_opt = crate::worktree_test_support::snapshot(&canon).unwrap();
+            let opt_err = crate::lake_build::ensure_project_imports_fresh_for_check(
+                &canon,
+                std::slice::from_ref(&c_file),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                opt_err.contains("Worktree opt-out prevents refreshing stale imports: App.B"),
+                "opt-out missed `{extra_cfg}` root config drift: {opt_err}"
+            );
+            #[cfg(unix)]
+            assert_eq!(
+                crate::worktree_test_support::snapshot(&canon).unwrap(),
+                before_opt,
+                "opt-out mutated `.lake` on `{extra_cfg}`"
+            );
+            fs::remove_file(canon.join("turbo-lean.toml")).unwrap();
+            assert_eq!(
+                crate::lake_build::ensure_project_imports_fresh_for_check(
+                    &canon,
+                    std::slice::from_ref(&c_file),
+                )
+                .unwrap(),
+                1
+            );
+            let post: serde_json::Value =
+                serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+            assert!(post["modules"].get("App/B.lean").is_none());
+            assert_eq!(
+                crate::lake_build::ensure_project_imports_fresh_for_check(
+                    &canon,
+                    std::slice::from_ref(&c_file),
+                )
+                .unwrap(),
+                0
+            );
+            fs::write(&lakefile, &saved_lakefile).unwrap();
+            fs::File::open(&lakefile)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(saved_lf_mtime))
+                .unwrap();
+        }
+        build_project_modules_native(
+            &mut store,
+            &proj_dir,
+            &[],
+            "trusted-internal",
+            1,
+            false,
+            true,
+            None,
+        )
+        .unwrap();
+        let good = fs::read(&manifest_path).unwrap();
         fs::remove_file(&lakefile).unwrap();
         let mut stale: serde_json::Value = serde_json::from_slice(&good).unwrap();
         stale["lean_githash"] = serde_json::json!("0000000000000000000000000000000000000000");
@@ -11857,6 +11988,60 @@ lean_exe «demo-exe» where
         assert!(
             !verified(),
             "`App.C` accepted through a dependency-to-root edge onto a rebuilt `App.X`"
+        );
+        fs::write(
+            canon.join("turbo-lean.toml"),
+            "[worktree]\nauto_link = false\n",
+        )
+        .unwrap();
+        let err_rebuilt = crate::lake_build::ensure_project_imports_fresh_for_check(
+            &canon,
+            std::slice::from_ref(&canon_c),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err_rebuilt.contains("Worktree opt-out prevents refreshing stale imports: DepPkg.B"),
+            "opt-out missed dep-to-root staleness after rebuilding `App.X`: {err_rebuilt}"
+        );
+        fs::remove_file(canon.join("turbo-lean.toml")).unwrap();
+        fs::write(proj_dir.join("App/X.lean"), x_src(3)).unwrap();
+        build(&[]);
+        assert!(verified());
+        let root_lf = canon.join("lakefile.toml");
+        let orig_lf = fs::read_to_string(&root_lf).unwrap();
+        let orig_lf_mtime = fs::metadata(&root_lf).unwrap().modified().unwrap();
+        let shifted_lf = orig_lf.replace(
+            "[[lean_lib]]",
+            "weakLeanArgs = [\"-DmaxSynthPendingDepth=4\"]\n[[lean_lib]]",
+        );
+        fs::write(&root_lf, shifted_lf).unwrap();
+        fs::File::open(&root_lf)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(orig_lf_mtime))
+            .unwrap();
+        fs::write(
+            canon.join("turbo-lean.toml"),
+            "[worktree]\nauto_link = false\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        let before_opt = crate::worktree_test_support::snapshot(&canon).unwrap();
+        let err_cfg = crate::lake_build::ensure_project_imports_fresh_for_check(
+            &canon,
+            std::slice::from_ref(&canon_c),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err_cfg.contains("Worktree opt-out prevents refreshing stale imports: DepPkg.B"),
+            "opt-out missed dep-to-root `weakLeanArgs` drift with preserved lakefile mtime: {err_cfg}"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            crate::worktree_test_support::snapshot(&canon).unwrap(),
+            before_opt,
+            "opt-out mutated `.lake` across dep-to-root config drift"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -12363,6 +12548,62 @@ lean_exe «demo-exe» where
             crate::lake_build::ensure_project_imports_fresh_for_check(
                 &canon,
                 std::slice::from_ref(&unbuilt_user),
+            )
+            .unwrap(),
+            0
+        );
+        fs::remove_file(dep_dir.join("DepPkg/Unbuilt.lean")).unwrap();
+        fs::remove_file(&unbuilt_user).unwrap();
+        fs::remove_file(canon.join("turbo-lean.toml")).unwrap();
+        build_project_modules_native(
+            &mut store,
+            &dep_dir,
+            &["DepPkg.B".to_string()],
+            "trusted-internal",
+            1,
+            false,
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(dep_turbo_manifest.is_file());
+        fs::write(
+            canon.join("turbo-lean.toml"),
+            "[worktree]\nauto_link = false\n",
+        )
+        .unwrap();
+        let dep_lf_weak = dep_lf_base.replace(
+            "[leanOptions]",
+            "weakLeanArgs = [\"-DwarningAsError=true\"]\n[leanOptions]",
+        );
+        fs::write(dep_dir.join("lakefile.toml"), dep_lf_weak).unwrap();
+        fs::File::open(dep_dir.join("lakefile.toml"))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old_lf_mtime))
+            .unwrap();
+        let err_dep_weak = crate::lake_build::ensure_project_imports_fresh_for_check(
+            &canon,
+            std::slice::from_ref(&direct_file),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err_dep_weak.contains("Worktree opt-out prevents refreshing stale imports: DepPkg.B"),
+            "retained dep turbo manifest missed `weakLeanArgs` drift with preserved mtime: {err_dep_weak}"
+        );
+        fs::remove_file(canon.join("turbo-lean.toml")).unwrap();
+        assert_eq!(
+            crate::lake_build::ensure_project_imports_fresh_for_check(
+                &canon,
+                std::slice::from_ref(&direct_file),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            crate::lake_build::ensure_project_imports_fresh_for_check(
+                &canon,
+                std::slice::from_ref(&direct_file),
             )
             .unwrap(),
             0

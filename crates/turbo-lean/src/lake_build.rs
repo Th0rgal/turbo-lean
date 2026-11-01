@@ -2469,8 +2469,10 @@ pub(crate) fn ensure_project_imports_fresh(
                 && match root_cfg.as_ref() {
                     Some(cfg) => {
                         cfg.lean_bin.as_os_str().is_empty()
+                            || m.pkg_name != cfg.root_pkg.name
                             || m.toolchain != cfg.toolchain
                             || m.lean_githash != cfg.lean_githash
+                            || m.pkg_config_digest != cfg.root_pkg.config_digest
                     }
                     None => true,
                 }
@@ -2588,11 +2590,6 @@ pub(crate) fn ensure_project_imports_fresh(
         // Lake owns `.lake/build` (whose files may be hard links into its artifact cache):
         // let Lake bring the stale imports up to date instead of deleting or rewriting them.
         lake_build_modules(canon_dir, &targets, rev)?;
-        if let Some(cfg) = dep_cfg.as_ref() {
-            for m in &stale_dep_mods {
-                crate::module_builder::forget_refreshed_dep_module(cfg, m);
-            }
-        }
         if let Some(mut manifest) = manifest_opt {
             for (mod_name, _, dep_src) in &ordered_imports {
                 if targets.contains(mod_name) {
@@ -2611,6 +2608,11 @@ pub(crate) fn ensure_project_imports_fresh(
             }
         } else if unusable_manifest {
             let _ = fs::remove_file(&manifest_path);
+        }
+        if let Some(cfg) = dep_cfg.as_ref() {
+            for m in &stale_dep_mods {
+                crate::module_builder::forget_refreshed_dep_module(cfg, m);
+            }
         }
         return Ok(targets.len());
     }
