@@ -82,6 +82,9 @@ pub struct LeanExeConfig {
     pub weak_lean_args: Vec<String>,
     pub lean_options: BTreeMap<String, String>,
     pub is_default_target: bool,
+    /// Names of package `input_file` / `input_dir` targets declared in `needs := #[...]`.
+    #[serde(default)]
+    pub needs: Vec<String>,
     #[serde(default)]
     pub unsupported: Option<String>,
 }
@@ -185,6 +188,8 @@ pub struct ModuleNode {
     pub has_prelude: bool,
     pub needs_c: bool,
     pub precompile_modules: bool,
+    #[serde(default)]
+    pub is_exe_target: bool,
     pub strong_args: Vec<String>,
     pub weak_args: Vec<String>,
     pub src_blake3: String,
@@ -2184,6 +2189,7 @@ fn parse_lakefile_toml_inner(
                             weak_lean_args: Vec::new(),
                             lean_options: BTreeMap::new(),
                             is_default_target: false,
+                            needs: Vec::new(),
                             unsupported: None,
                         });
                         section = Section::LeanExe(exe_idx);
@@ -2430,6 +2436,18 @@ fn parse_lakefile_toml_inner(
                         let tbl = parse_toml_lean_options_table(&val_accum)?;
                         exe.lean_options.extend(tbl);
                     }
+                    // As with `[[lean_lib]]`, a `needs` in TOML that names a target fails closed
+                    // for every package (including dependencies), because TOML `input_file` /
+                    // `input_dir` declarations are not parsed.
+                    "needs" if toml_needs_names_a_target(&val_accum) => unsupported_lake_field(
+                        &mut exe.unsupported,
+                        true,
+                        format!(
+                            "Unsupported `needs` on executable `{}` in {}",
+                            exe.name,
+                            location()
+                        ),
+                    )?,
                     other => check_lake_field(
                         &mut exe.unsupported,
                         is_root_pkg,
@@ -4194,6 +4212,9 @@ fn parse_lakefile_lean_inner(
                                     line_no,
                                 )?);
                             }
+                            "needs" => {
+                                exe.needs = parse_lean_bare_name_array_expr(&val_accum, key)?;
+                            }
                             other => check_lake_field(
                                 &mut exe.unsupported,
                                 is_root_pkg,
@@ -4372,6 +4393,7 @@ where
             weak_lean_args: Vec::new(),
             lean_options: BTreeMap::new(),
             is_default_target: is_def,
+            needs: Vec::new(),
             unsupported: None,
         });
         *current_block = T::lean_exe(idx);
@@ -4874,21 +4896,34 @@ fn finalize_package_config(
     // resolve, `try_resolve_lean_args_for_path`). Gating them on the root would let that resolve
     // silently keep a `needs` that names nothing, or pick the first of two same-named inputs, and
     // hand the result to code that decides whether an input changed.
-    let unknown_need = pkg.libs.iter().find_map(|l| {
-        let need = l
-            .needs
-            .iter()
-            .find(|n| !pkg.inputs.iter().any(|i| &i.name == *n))?;
-        Some((l.name.clone(), need.clone()))
-    });
-    if let Some((lib, need)) = unknown_need {
+    let unknown_need = pkg
+        .libs
+        .iter()
+        .find_map(|l| {
+            let need = l
+                .needs
+                .iter()
+                .find(|n| !pkg.inputs.iter().any(|i| &i.name == *n))?;
+            Some(("library", l.name.clone(), need.clone()))
+        })
+        .or_else(|| {
+            pkg.exes.iter().find_map(|e| {
+                let need = e
+                    .needs
+                    .iter()
+                    .find(|n| !pkg.inputs.iter().any(|i| &i.name == *n))?;
+                Some(("executable", e.name.clone(), need.clone()))
+            })
+        });
+    if let Some((kind, target_name, need)) = unknown_need {
         if is_root_pkg {
             let _ = c_abi::verify_static_lake_config(true, true, false, false);
         }
         anyhow::bail!(
-            "Unsupported `needs` entry `{}` on library `{}` in {} (not an `input_file` / `input_dir` of the package): fail-closed static Lake config gate",
+            "Unsupported `needs` entry `{}` on {} `{}` in {} (not an `input_file` / `input_dir` of the package): fail-closed static Lake config gate",
             need,
-            lib,
+            kind,
+            target_name,
             config_path.display()
         );
     }
@@ -5402,6 +5437,53 @@ pub(crate) fn input_bearing_libs_for_module(cfg: &ProjectConfig, mod_name: &str)
         for lib in &dp.libs {
             if !lib.needs.is_empty() && lib_can_build_module(lib, mod_name) {
                 out.push(format!("{}/{}", dp.name, lib.name));
+            }
+        }
+    }
+    out
+}
+
+/// Every `lean_exe` target (formatted as `@<pkg>/<exe>:exe`) whose root module is `mod_name`.
+///
+/// Passing `<Mod>` directly to `lake build` only refreshes `<Mod>.olean` and never relinks
+/// `.lake/build/bin/<exe>` (`+<Mod>:olean` does not link either, and `@<pkg>/<exe>:olean` is not a
+/// valid `lean_exe` facet). Returning `@<pkg>/<exe>:exe` ensures Lake both evaluates `<exe>`'s own
+/// `extraDep` (`needs`) trace and relinks the executable binary.
+pub(crate) fn exe_targets_for_module(cfg: &ProjectConfig, mod_name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for exe in &cfg.root_pkg.exes {
+        if exe.root == mod_name {
+            out.push(format!("@{}/{}:exe", cfg.root_pkg.name, exe.name));
+        }
+    }
+    for dp in &cfg.dep_pkgs {
+        for exe in &dp.exes {
+            if exe.root == mod_name {
+                out.push(format!("@{}/{}:exe", dp.name, exe.name));
+            }
+        }
+    }
+    out
+}
+
+/// Every input-bearing `lean_exe` target (`!exe.needs.is_empty()`, formatted as `@<pkg>/<exe>:exe`)
+/// whose root module is `mod_name`.
+pub(crate) fn input_bearing_exes_for_module(cfg: &ProjectConfig, mod_name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if !cfg.root_pkg.inputs.is_empty() {
+        for exe in &cfg.root_pkg.exes {
+            if !exe.needs.is_empty() && exe.root == mod_name {
+                out.push(format!("@{}/{}:exe", cfg.root_pkg.name, exe.name));
+            }
+        }
+    }
+    for dp in &cfg.dep_pkgs {
+        if dp.inputs.is_empty() {
+            continue;
+        }
+        for exe in &dp.exes {
+            if !exe.needs.is_empty() && exe.root == mod_name {
+                out.push(format!("@{}/{}:exe", dp.name, exe.name));
             }
         }
     }
@@ -5930,7 +6012,7 @@ pub fn build_module_dag_with_trust(
         if let Some(facet) = facet_opt {
             match facet {
                 "olean" | "ilean" | "lib" | "modules" | "default" | "leanArts" => {}
-                "c" | "static" => {
+                "c" | "static" | "exe" => {
                     force_c_for_target = true;
                 }
                 other => {
@@ -6297,6 +6379,7 @@ pub fn build_module_dag_with_trust(
                 has_prelude: header.has_prelude,
                 needs_c,
                 precompile_modules: spec.precompile_modules,
+                is_exe_target: spec.is_exe_target,
                 strong_args: spec.strong_args,
                 weak_args: spec.weak_args,
                 src_blake3,
@@ -6648,6 +6731,12 @@ pub(crate) fn module_lake_input_digest(cfg: &ProjectConfig, node: &ModuleNode) -
         .iter()
         .filter(|lib| lib_can_build_module(lib, &node.module_name))
         .flat_map(|lib| lib.needs.iter().map(String::as_str))
+        .chain(
+            pkg.exes
+                .iter()
+                .filter(|exe| exe.root == node.module_name)
+                .flat_map(|exe| exe.needs.iter().map(String::as_str)),
+        )
         .collect();
     Ok(pkg
         .inputs
@@ -6975,14 +7064,26 @@ fn lake_needs_trace_entries(cfg: &ProjectConfig, node: &ModuleNode) -> Vec<serde
     let Some(pkg) = package_by_name(cfg, &node.pkg_name) else {
         return Vec::new();
     };
-    let Some(lib) = pkg
-        .libs
-        .iter()
-        .find(|l| l.name == node.target_name && lib_can_build_module(l, &node.module_name))
-    else {
-        return Vec::new();
+    let needs: &[String] = if node.is_exe_target {
+        let Some(exe) = pkg
+            .exes
+            .iter()
+            .find(|e| e.name == node.target_name && e.root == node.module_name)
+        else {
+            return Vec::new();
+        };
+        &exe.needs
+    } else {
+        let Some(lib) = pkg
+            .libs
+            .iter()
+            .find(|l| l.name == node.target_name && lib_can_build_module(l, &node.module_name))
+        else {
+            return Vec::new();
+        };
+        &lib.needs
     };
-    lib.needs
+    needs
         .iter()
         .filter_map(|n| pkg.inputs.iter().find(|i| &i.name == n))
         .map(|i| serde_json::json!([pkg.pkg_root.join(&i.path).to_string_lossy(), i.lake_hash]))
@@ -10120,20 +10221,38 @@ lean_lib Later where
         assert_eq!(input.blake3.len(), 64);
         // Lake's own file hash of the input, for the `.trace` files written for Lake.
         assert_eq!(input.lake_hash.len(), 16);
-        // 5. `input_file` with `path` (and `needs` on it) works too, and tracks the file.
-        let file_lf = "import Lake\nopen Lake DSL\npackage demo\ninput_file spec where\n  path := \"spec.json\"\nlean_lib A where\n  needs := #[spec]\n";
+        // 5. `input_file` with `path` (and `needs` on `lean_lib` + `lean_exe`) works too, and tracks the file.
+        let file_lf = "import Lake\nopen Lake DSL\npackage demo\ninput_file spec where\n  path := \"spec.json\"\nlean_lib A where\n  needs := #[spec]\nlean_exe «my-driver» where\n  root := `Main\n  needs := #[spec]\n";
         fs::write(&lf, file_lf).unwrap();
         let pkg = parse_lakefile_lean(&dir, &lf, true).unwrap();
         assert_eq!(pkg.inputs[0].path, PathBuf::from("spec.json"));
         assert!(!pkg.inputs[0].is_dir && pkg.libs[0].needs == vec!["spec"]);
+        assert_eq!(pkg.exes[0].name, "my-driver");
+        assert_eq!(pkg.exes[0].needs, vec!["spec"]);
         fs::write(dir.join("spec.json"), "{\"v\":1}").unwrap();
         let edited = parse_lakefile_lean(&dir, &lf, true).unwrap();
         assert_ne!(pkg.inputs[0].blake3, edited.inputs[0].blake3);
         assert_ne!(pkg.inputs[0].lake_hash, edited.inputs[0].lake_hash);
         // The package digest deliberately does not move: it would invalidate every module of the
-        // package, while only the libraries that `needs` the input read it (see
+        // package, while only the targets that `needs` the input read it (see
         // `module_lake_input_digest`, exercised by the next test).
         assert_eq!(pkg.config_digest, edited.config_digest);
+        // Non-empty `needs` on `[[lean_exe]]` in `lakefile.toml` fails closed even for dependencies.
+        let toml_path = dir.join("lakefile.toml");
+        fs::write(
+            &toml_path,
+            "name = \"demo\"\n[[lean_exe]]\nname = \"drv\"\nroot = \"Main\"\nneeds = [\"spec\"]\n",
+        )
+        .unwrap();
+        let toml_err = parse_lakefile_toml(&dir, &toml_path, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            toml_err.contains("Unsupported `needs` on executable `drv`")
+                && toml_err.contains("fail-closed"),
+            "{toml_err}"
+        );
+        let _ = fs::remove_file(&toml_path);
         // 4. Everything beyond declarative file inputs still fails closed.
         let base = INPUT_DIR_LAKEFILE;
         let filter = "  filter := .extension \"sol\"\n";
@@ -10217,6 +10336,13 @@ lean_lib Later where
             (
                 file_lf.replace("needs := #[spec]", "needs := #[spec, other]"),
                 "`other`",
+            ),
+            (
+                file_lf.replace(
+                    "  root := `Main\n  needs := #[spec]\n",
+                    "  root := `Main\n  needs := #[spec, missingExeInput]\n",
+                ),
+                "executable `my-driver`",
             ),
         ] {
             fs::write(&lf, &bad).unwrap();
@@ -11091,10 +11217,15 @@ lean_lib Later where
         fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
         fs::write(
             proj.join("lakefile.lean"),
-            "import Lake\nopen Lake DSL\npackage demo\ninput_dir smokeSources where\n  path := \"Data\"\n  filter := .extension \"sol\"\n  text := true\ninput_file specFile where\n  path := \"spec.json\"\n@[default_target]\nlean_lib Smoke where\n  globs := #[.one `Smoke.A]\n  needs := #[smokeSources, specFile]\n",
+            "import Lake\nopen Lake DSL\npackage demo\ninput_dir smokeSources where\n  path := \"Data\"\n  filter := .extension \"sol\"\n  text := true\ninput_file specFile where\n  path := \"spec.json\"\n@[default_target]\nlean_lib Smoke where\n  globs := #[.one `Smoke.A]\n  needs := #[smokeSources, specFile]\nlean_exe drv where\n  root := `Driver\n  needs := #[smokeSources, specFile]\n",
         )
         .unwrap();
         fs::write(proj.join("Smoke/A.lean"), "def a : Nat := 1\n").unwrap();
+        fs::write(
+            proj.join("Driver.lean"),
+            "def main : IO Unit := IO.println \"ok\"\n",
+        )
+        .unwrap();
         fs::write(proj.join("Data/a.sol"), "contract A {}\n").unwrap();
         fs::write(proj.join("Data/sub/b.sol"), "contract B {}\n").unwrap();
         fs::write(proj.join("Data/notes.txt"), "ignored\n").unwrap();
@@ -11108,6 +11239,7 @@ lean_lib Later where
         }
         let mut store = TurboStore::open(Some(&dir.join(".turbo_store"))).unwrap();
         let trace_path = proj.join(".lake/build/lib/lean/Smoke/A.trace");
+        let exe_trace_path = proj.join(".lake/build/lib/lean/Driver.trace");
         let dep_hash = |p: &Path| -> serde_json::Value {
             serde_json::from_slice::<serde_json::Value>(&fs::read(p).unwrap()).unwrap()["depHash"]
                 .clone()
@@ -11115,7 +11247,7 @@ lean_lib Later where
         build_project_modules_native(
             &mut store,
             &proj,
-            &["Smoke:c".to_string()],
+            &["Smoke:c".to_string(), "@demo/drv:exe".to_string()],
             "trusted-internal",
             1,
             false,
@@ -11124,18 +11256,19 @@ lean_lib Later where
         )
         .unwrap();
         let native_dep_hash = dep_hash(&trace_path);
+        let native_exe_dep_hash = dep_hash(&exe_trace_path);
         assert!(
             Command::new(&lake_bin)
-                .args(["build", "--no-build"])
+                .args(["build", "--no-build", "Smoke", "+Driver:olean"])
                 .current_dir(&proj)
                 .status()
                 .unwrap()
                 .success(),
-            "`lake build --no-build` must accept artifacts of a library with `needs` inputs"
+            "`lake build --no-build` must accept artifacts of both `lean_lib` and `lean_exe` with `needs` inputs"
         );
         fs::remove_dir_all(proj.join(".lake/build")).unwrap();
         assert!(Command::new(&lake_bin)
-            .arg("build")
+            .args(["build", "Smoke", "@demo/drv:exe"])
             .current_dir(&proj)
             .status()
             .unwrap()
@@ -11145,13 +11278,18 @@ lean_lib Later where
             dep_hash(&trace_path),
             "native vs lake Smoke.A.trace depHash must match with `input_dir` / `input_file` needs"
         );
+        assert_eq!(
+            native_exe_dep_hash,
+            dep_hash(&exe_trace_path),
+            "native vs lake Driver.trace depHash must match for `lean_exe` with `needs`"
+        );
         // A changed matched input moves Lake's dep hash too, so the two stay in step.
         fs::write(proj.join("Data/sub/b.sol"), "contract B2 {}\n").unwrap();
         fs::remove_dir_all(proj.join(".lake/build")).unwrap();
         build_project_modules_native(
             &mut store,
             &proj,
-            &["Smoke:c".to_string()],
+            &["Smoke:c".to_string(), "@demo/drv:exe".to_string()],
             "trusted-internal",
             1,
             false,
@@ -11160,9 +11298,11 @@ lean_lib Later where
         )
         .unwrap();
         let edited_dep_hash = dep_hash(&trace_path);
+        let edited_exe_dep_hash = dep_hash(&exe_trace_path);
         assert_ne!(native_dep_hash, edited_dep_hash);
+        assert_ne!(native_exe_dep_hash, edited_exe_dep_hash);
         assert!(Command::new(&lake_bin)
-            .args(["build", "--no-build"])
+            .args(["build", "--no-build", "Smoke", "+Driver:olean"])
             .current_dir(&proj)
             .status()
             .unwrap()

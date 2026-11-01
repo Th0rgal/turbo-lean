@@ -4704,7 +4704,8 @@ fn stock_statement_build_with_trust(project: &Path, is_untrusted: bool) -> Resul
     let pkg = crate::module_builder::resolve_package_config(project, true)?;
     let lib_dir = project.join(&pkg.build_dir).join(&pkg.lean_lib_dir);
     let modules = statement_source_modules(project, &pkg)?;
-    let mut lake_targets = Vec::new();
+    let mut input_targets = Vec::new();
+    let mut olean_targets = Vec::new();
     let mut standalone = BTreeMap::new();
     for (name, (source, root)) in modules {
         let owned = pkg.libs.iter().any(|lib| {
@@ -4714,26 +4715,38 @@ fn stock_statement_build_with_trust(project: &Path, is_untrusted: bool) -> Resul
             lib_root == root && crate::module_builder::lib_can_build_module(lib, &name)
         }) || pkg.exes.iter().any(|exe| exe.root == name);
         if owned {
-            lake_targets.push(format!("+{name}:olean"));
             // `+<Mod>:olean` builds the module under Lake's own attribution (the last library that
-            // can build it), whose `extraDep` may carry none of the `needs` that names the input
-            // the module reads. Lake would then find its trace unchanged by an input edit and leave
-            // the stale `.olean` in place. Adding the input-bearing library makes Lake build it
-            // under that library's `extraDep`, which does carry the input.
+            // can build it, or the executable whose root it is), whose `extraDep` may carry none of
+            // the `needs` that names the input the module reads. Lake memoizes each module's build
+            // job under the *first* target that schedules it, so input-bearing library and
+            // executable targets must run **before** `+<Mod>:olean`!
             for lib in pkg
                 .libs
                 .iter()
                 .filter(|lib| !lib.needs.is_empty())
                 .filter(|lib| crate::module_builder::lib_can_build_module(lib, &name))
             {
-                if !lake_targets.contains(&lib.name) {
-                    lake_targets.push(lib.name.clone());
+                if !input_targets.contains(&lib.name) {
+                    input_targets.push(lib.name.clone());
                 }
             }
+            for exe in pkg
+                .exes
+                .iter()
+                .filter(|exe| !exe.needs.is_empty() && exe.root == name)
+            {
+                let exe_target = format!("@{}/{}:exe", pkg.name, exe.name);
+                if !input_targets.contains(&exe_target) {
+                    input_targets.push(exe_target);
+                }
+            }
+            olean_targets.push(format!("+{name}:olean"));
         } else {
             standalone.insert(name, (source, root));
         }
     }
+    let mut lake_targets = input_targets;
+    lake_targets.extend(olean_targets);
     // Ask Lake to refresh every registered module `.olean`, including non-default targets.
     if !lake_targets.is_empty() {
         let mut command = statement_lake_command(project, is_untrusted)?;
@@ -9855,6 +9868,336 @@ end Fixture
                     .is_err(),
                     "evaluate_agent_step_value(..., project_dir=None) must propagate Err on unsupported filter := .text"
                 );
+
+            Ok(())
+        })();
+
+        restore_env(&saved_staging, &saved_cache);
+        let _ = fs::remove_dir_all(&tmp_dir);
+        res
+    }
+
+    /// Round 6 regression suite for `lean_exe` targets with `input_dir` / `needs` and downstream
+    /// executable linking:
+    /// 1. Direct `needs` on `lean_exe` (`lean_exe «my-driver» where root := `Main; needs := #[smokeSources]`):
+    ///    - `turbo-lean build` + `lake build` links `.lake/build/bin/custom-driver` (`exeName`),
+    ///      producing `"len=13\n"`.
+    ///    - Editing `Data/a.sol` (13 -> 25 bytes) and running `turbo-lean check Other.lean`
+    ///      (an unrelated theorem module in the same package) triggers
+    ///      `recheck_dependents_if_nonlocal`, which rebuilds AND relinks `@my-pkg/my-driver:exe`
+    ///      so executing `.lake/build/bin/custom-driver` immediately prints `"len=25\n"`!
+    /// 2. Downstream `lean_exe` importing an input-bearing `lean_lib` (`Smoke.A`) AND sharing its
+    ///    root module with an input-bearing `lean_lib` (`SharedMainLib` with `needs := #[smokeSources]`
+    ///    vs `lean_exe «sub-exe»` without `needs`):
+    ///    - Input edit in `Data/a.sol` followed by `turbo-lean check` refreshes `SharedMainLib`
+    ///      **before** `@my-pkg/sub-exe:exe` (preventing Lake's job-memoization under an input-blind
+    ///      `extraDep`) and relinks `.lake/build/bin/sub-exe` so running it prints the updated length!
+    ///    - Nonlocal edit in `Smoke/A.lean` followed by `turbo-lean check Smoke/A.lean` relinks
+    ///      downstream `.lake/build/bin/sub-exe` so running it reflects the nonlocal change!
+    #[test]
+    fn test_round6_lean_exe_needs_and_downstream_relink_regressions() -> Result<()> {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_round6_exe_regressions_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir)?;
+
+        let repo_dir = tmp_dir.join("repo");
+        let cache_dir = tmp_dir.join("cache");
+        let staging_dir = tmp_dir.join("staging");
+        fs::create_dir_all(&repo_dir)?;
+        fs::create_dir_all(&cache_dir)?;
+        fs::create_dir_all(&staging_dir)?;
+
+        let saved_staging = std::env::var("TURBO_LEAN_FAST_STAGING_DIR").ok();
+        let saved_cache = std::env::var("TURBO_LEAN_CACHE_DIR").ok();
+        let restore_env = |st: &Option<String>, ca: &Option<String>| {
+            match st {
+                Some(v) => std::env::set_var("TURBO_LEAN_FAST_STAGING_DIR", v),
+                None => std::env::remove_var("TURBO_LEAN_FAST_STAGING_DIR"),
+            }
+            match ca {
+                Some(v) => std::env::set_var("TURBO_LEAN_CACHE_DIR", v),
+                None => std::env::remove_var("TURBO_LEAN_CACHE_DIR"),
+            }
+        };
+        std::env::set_var("TURBO_LEAN_FAST_STAGING_DIR", &staging_dir);
+        std::env::set_var("TURBO_LEAN_CACHE_DIR", &cache_dir);
+
+        let res = (|| -> Result<()> {
+            fs::create_dir_all(repo_dir.join("Data"))?;
+            fs::create_dir_all(repo_dir.join("Smoke"))?;
+            fs::write(
+                repo_dir.join("lean-toolchain"),
+                include_str!("../../../lean/lean-toolchain"),
+            )?;
+
+            // Hyphenated package name + hyphenated exe names + custom `exeName` + shared module
+            // between input-bearing `SharedMainLib` (`needs := #[smokeSources]`) and `sub-exe`
+            // (no `needs`, exercising the Lake job-memoization ordering hazard).
+            let lakefile = r#"import Lake
+open Lake DSL
+package «my-pkg»
+
+input_dir smokeSources where
+  path := "Data"
+  filter := .extension "sol"
+  text := true
+
+@[default_target]
+lean_lib Smoke where
+  globs := #[.one `Smoke.A]
+  needs := #[smokeSources]
+
+@[default_target]
+lean_lib Other where
+  globs := #[.one `Other]
+
+@[default_target]
+lean_lib SharedMainLib where
+  globs := #[.one `SubMain]
+  needs := #[smokeSources]
+
+@[default_target]
+lean_exe «my-driver» where
+  root := `DriverMain
+  exeName := "custom-driver"
+  needs := #[smokeSources]
+
+@[default_target]
+lean_exe «sub-exe» where
+  root := `SubMain
+"#;
+            fs::write(repo_dir.join("lakefile.lean"), lakefile)?;
+
+            let v1 = "contract A {}";
+            let v2 = "contract AMuchLongerName {}";
+            assert_ne!(v1.len(), v2.len());
+            fs::write(repo_dir.join("Data/a.sol"), v1)?;
+            fs::write(
+                repo_dir.join("Smoke/A.lean"),
+                "def solA : String := include_str \"..\" / \"Data\" / \"a.sol\"\n",
+            )?;
+            fs::write(
+                repo_dir.join("Other.lean"),
+                "theorem otherOk : 1 + 1 = 2 := by rfl\n",
+            )?;
+            fs::write(
+                repo_dir.join("DriverMain.lean"),
+                "def directSol : String := include_str \"Data\" / \"a.sol\"\ndef main : IO Unit := IO.println s!\"direct={directSol.length}\"\n",
+            )?;
+            fs::write(
+                repo_dir.join("SubMain.lean"),
+                "import Smoke.A\ndef sharedSol : String := include_str \"Data\" / \"a.sol\"\ndef main : IO Unit := IO.println s!\"lib={solA.length},shared={sharedSol.length}\"\n",
+            )?;
+
+            git_init_and_commit(&repo_dir, "base")?;
+            let canon_repo = repo_dir.canonicalize()?;
+            if crate::module_builder::resolve_project_config(&canon_repo).is_err() {
+                return Ok(());
+            }
+
+            // Initial Lake build to materialize `.lake/build/bin/custom-driver` and
+            // `.lake/build/bin/sub-exe`, followed by `turbo-lean build` to stamp
+            // `.turbo_verified_sources.json`.
+            crate::lake_build::lake_build_modules(
+                &canon_repo,
+                &[
+                    "Smoke".to_string(),
+                    "Other".to_string(),
+                    "SharedMainLib".to_string(),
+                    "@my-pkg/my-driver:exe".to_string(),
+                    "@my-pkg/sub-exe:exe".to_string(),
+                ],
+                None,
+            )?;
+
+            let mut store = TurboStore::open(Some(&cache_dir))?;
+            crate::module_builder::reset_lake_inputs_tag_memo();
+            crate::lake_build::run_build_command(
+                &mut store,
+                true,
+                Vec::new(),
+                canon_repo.clone(),
+                "trusted".to_string(),
+                0,
+                false,
+            )?;
+
+            let driver_bin = canon_repo.join(".lake/build/bin/custom-driver");
+            let sub_bin = canon_repo.join(".lake/build/bin/sub-exe");
+            assert!(driver_bin.is_file(), "custom-driver binary must exist");
+            assert!(sub_bin.is_file(), "sub-exe binary must exist");
+
+            let run_bin = |bin: &Path| -> Result<String> {
+                let out = std::process::Command::new(bin)
+                    .current_dir(&canon_repo)
+                    .output()?;
+                anyhow::ensure!(
+                    out.status.success(),
+                    "binary {} failed: {}",
+                    bin.display(),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            };
+
+            assert_eq!(run_bin(&driver_bin)?, format!("direct={}", v1.len()));
+            assert_eq!(
+                run_bin(&sub_bin)?,
+                format!("lib={},shared={}", v1.len(), v1.len())
+            );
+
+            // Case 1 & 2a: Edit `Data/a.sol` (`v1` -> `v2`) and run `turbo-lean check Other.lean`.
+            // Even though `Other.lean` does not import `Smoke.A` or `DriverMain`, the workspace
+            // Lake input changed since `.turbo_verified_sources.json`, so
+            // `recheck_dependents_if_nonlocal` must rebuild AND relink both `custom-driver`
+            // (direct `needs` on `lean_exe`) and `sub-exe` (downstream of `Smoke.A` + shared root
+            // with `SharedMainLib` ordered before `@my-pkg/sub-exe:exe`).
+            fs::write(canon_repo.join("Data/a.sol"), v2)?;
+            crate::check::run_check_command(
+                &mut store,
+                false,
+                true,
+                canon_repo.join("Other.lean"),
+                None,
+                canon_repo.clone(),
+                None,
+                false,
+                None,
+            )?;
+            assert_eq!(
+                run_bin(&driver_bin)?,
+                format!("direct={}", v2.len()),
+                "direct-needs lean_exe binary custom-driver must be relinked after input_dir edit"
+            );
+            assert_eq!(
+                run_bin(&sub_bin)?,
+                format!("lib={},shared={}", v2.len(), v2.len()),
+                "downstream + shared-root lean_exe binary sub-exe must be relinked with fresh SharedMainLib extraDep after input_dir edit"
+            );
+
+            // Commit the `v2` state and re-stamp `turbo-lean build`.
+            let run_git = |args: &[&str]| -> Result<()> {
+                let mut c = crate::trusted_tools::git(&canon_repo)?;
+                let out = c.args(args).current_dir(&canon_repo).output()?;
+                anyhow::ensure!(
+                    out.status.success(),
+                    "git {:?} failed: {}",
+                    args,
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                Ok(())
+            };
+            run_git(&["add", "-A"])?;
+            run_git(&["commit", "-m", "v2-state"])?;
+            crate::module_builder::reset_lake_inputs_tag_memo();
+            crate::lake_build::run_build_command(
+                &mut store,
+                true,
+                Vec::new(),
+                canon_repo.clone(),
+                "trusted".to_string(),
+                0,
+                false,
+            )?;
+
+            // Case 2b: Nonlocal edit in `Smoke/A.lean` (`solA := "hi"`) without touching `Data/a.sol`.
+            // Running `turbo-lean check Smoke/A.lean` must recheck reverse dependents via
+            // `lake_recheck_dependents` -> `lake_refresh_targets`, translating `SubMain` to
+            // `@my-pkg/sub-exe:exe` (after `SharedMainLib`) so `.lake/build/bin/sub-exe` is relinked!
+            fs::write(
+                canon_repo.join("Smoke/A.lean"),
+                "def solA : String := \"hi\"\n",
+            )?;
+            crate::check::run_check_command(
+                &mut store,
+                false,
+                true,
+                canon_repo.join("Smoke/A.lean"),
+                None,
+                canon_repo.clone(),
+                None,
+                false,
+                None,
+            )?;
+            assert_eq!(
+                run_bin(&sub_bin)?,
+                format!("lib=2,shared={}", v2.len()),
+                "downstream lean_exe binary sub-exe must be relinked after nonlocal edit in Smoke/A.lean"
+            );
+
+            // Case 3: Broken compilation inside `DriverMain.lean` after `Data/a.sol` edit causes
+            // `turbo-lean check Other.lean` to fail closed!
+            run_git(&["checkout", "--", "Smoke/A.lean"])?;
+            fs::write(
+                canon_repo.join("DriverMain.lean"),
+                format!(
+                    "def directSol : String := include_str \"Data\" / \"a.sol\"\ntheorem pinDriverLen : directSol.length = {} := by rfl\ndef main : IO Unit := IO.println s!\"direct={{directSol.length}}\"\n",
+                    v2.len()
+                ),
+            )?;
+            run_git(&["add", "-A"])?;
+            run_git(&["commit", "-m", "pin-driver-v2"])?;
+            crate::lake_build::lake_build_modules(
+                &canon_repo,
+                &["@my-pkg/my-driver:exe".to_string()],
+                None,
+            )?;
+            crate::module_builder::reset_lake_inputs_tag_memo();
+            crate::lake_build::run_build_command(
+                &mut store,
+                true,
+                Vec::new(),
+                canon_repo.clone(),
+                "trusted".to_string(),
+                0,
+                false,
+            )?;
+
+            // Mutate `Data/a.sol` back to `v1`, breaking `DriverMain.lean`'s `pinDriverLen`.
+            // Both `check Other.lean` and `pr-verify --base HEAD` must fail closed!
+            fs::write(canon_repo.join("Data/a.sol"), v1)?;
+            assert!(
+                crate::check::run_check_command(
+                    &mut store,
+                    false,
+                    true,
+                    canon_repo.join("Other.lean"),
+                    None,
+                    canon_repo.clone(),
+                    None,
+                    false,
+                    None,
+                )
+                .is_err(),
+                "check Other.lean must fail closed when input_dir edit breaks direct-needs lean_exe DriverMain"
+            );
+            assert!(
+                run_pr_verify_command(
+                    &mut store,
+                    true,
+                    canon_repo.clone(),
+                    "HEAD".to_string(),
+                    "trusted".to_string(),
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    0,
+                    None,
+                )
+                .is_err(),
+                "pr-verify --base HEAD must fail closed when input_dir edit breaks direct-needs lean_exe DriverMain"
+            );
 
             Ok(())
         })();

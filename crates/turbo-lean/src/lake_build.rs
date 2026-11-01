@@ -2202,40 +2202,63 @@ fn remove_module_build_artifacts(canon_dir: &Path, rel_slash: &str) {
 }
 
 /// Translate a list of stale modules into the targets to hand `lake build`, replacing any module
-/// that an input-bearing library can build by that library's name.
+/// that an input-bearing library can build by that library's name, and appending `@<pkg>/<exe>:exe`
+/// for any `lean_exe` whose root module is in `modules`.
 ///
-/// `lake build <Mod>` uses Lake's own attribution (the *last* `lean_lib` that can build `Mod`), and
-/// that library may not be the one whose `needs` names the input `Mod` reads. Lake would then
-/// compare a trace with no input entry in it, find it unchanged, and report `Mod` up to date -- so
-/// the "refresh" would leave the stale `.olean` exactly where it was and this function's callers
-/// would go on to check against it. `lake build <Lib>` builds `<Lib>`'s module list under `<Lib>`'s
-/// `extraDep`, which does carry the input, so Lake sees the change and rebuilds.
+/// `lake build <Mod>` uses Lake's own attribution (the *last* `lean_lib` that can build `Mod`, or
+/// the `lean_exe` whose root is `Mod`), and:
+/// 1. That attribution may not be the library whose `needs` names the input `Mod` reads. Lake would
+///    then compare a trace with no input entry in it, find it unchanged, and report `Mod` up to
+///    date -- leaving the stale `.olean` in place.
+/// 2. Passing `<Mod>` for a `lean_exe` root module only refreshes `<Mod>.olean` and leaves the
+///    compiled executable in `.lake/build/bin/<exe>` stale; `@<pkg>/<exe>:exe` both evaluates the
+///    executable's own `extraDep` (`needs`) trace and relinks the binary.
+///
+/// Ordering matters inside a single `lake build` invocation: Lake memoizes each module's build job
+/// under the *first* target that schedules it. Input-bearing library targets are therefore placed
+/// **before** plain module and `@<pkg>/<exe>:exe` targets so a shared module (or one imported by a
+/// non-input-bearing target) is never memoized under an input-blind `extraDep` first.
 ///
 /// Deleting the artifacts first would not be enough on its own: Lake can restore an `.olean` from
 /// its artifact cache keyed on that same input-blind trace.
 ///
-/// Returns `modules` unchanged (sorted, deduplicated) for every project without Lake file inputs.
+/// Returns `modules` unchanged for every project without Lake file inputs and without matching
+/// `lean_exe` roots.
 pub(crate) fn lake_refresh_targets(canon_dir: &Path, modules: &[String]) -> Vec<String> {
     let Ok(cfg) = crate::module_builder::resolve_project_config(canon_dir) else {
         return modules.to_vec();
     };
     let any_inputs =
         !cfg.root_pkg.inputs.is_empty() || cfg.dep_pkgs.iter().any(|dp| !dp.inputs.is_empty());
-    if !any_inputs {
+    let any_matching_exe = modules
+        .iter()
+        .any(|m| !crate::module_builder::exe_targets_for_module(&cfg, m).is_empty());
+    if !any_inputs && !any_matching_exe {
         return modules.to_vec();
     }
-    let mut out: Vec<String> = Vec::new();
+    let mut input_lib_targets: Vec<String> = Vec::new();
+    let mut other_targets: Vec<String> = Vec::new();
     for m in modules {
-        let libs = crate::module_builder::input_bearing_libs_for_module(&cfg, m);
-        if libs.is_empty() {
-            out.push(m.clone());
+        let libs = if any_inputs {
+            crate::module_builder::input_bearing_libs_for_module(&cfg, m)
         } else {
-            out.extend(libs);
+            Vec::new()
+        };
+        let exes = crate::module_builder::exe_targets_for_module(&cfg, m);
+        input_lib_targets.extend(libs.iter().cloned());
+        if libs.is_empty() && exes.is_empty() {
+            other_targets.push(m.clone());
+        } else {
+            other_targets.extend(exes);
         }
     }
-    out.sort();
-    out.dedup();
-    out
+    input_lib_targets.sort();
+    input_lib_targets.dedup();
+    other_targets.sort();
+    other_targets.dedup();
+    other_targets.retain(|t| !input_lib_targets.contains(t));
+    input_lib_targets.extend(other_targets);
+    input_lib_targets
 }
 
 struct DiscoveredImportMod {
@@ -2776,14 +2799,9 @@ pub(crate) fn dependent_closure_modules(
     let cfg = crate::module_builder::resolve_project_config_with_trust(canon_dir, is_untrusted)?;
     let mut seeds: Vec<String> = cfg.root_pkg.libs.iter().map(|l| l.name.clone()).collect();
     for exe in &cfg.root_pkg.exes {
-        let root_mod = exe.root.trim();
-        let target = if !root_mod.is_empty() {
-            root_mod.to_string()
-        } else {
-            exe.name.clone()
-        };
-        if !seeds.contains(&target) {
-            seeds.push(target);
+        let exe_target = format!("@{}/{}:exe", cfg.root_pkg.name, exe.name);
+        if !seeds.contains(&exe_target) {
+            seeds.push(exe_target);
         }
     }
     let closure = crate::module_builder::build_module_dag_with_trust(&cfg, &seeds, is_untrusted)
@@ -2867,6 +2885,7 @@ pub(crate) fn recheck_dependents_if_nonlocal(canon_dir: &Path, target: &Path) ->
     } else if lake_inputs_changed_since_manifest(&dir) {
         if let Ok(cfg) = crate::module_builder::resolve_project_config(&dir) {
             let mut input_libs: Vec<String> = Vec::new();
+            let mut input_exes: Vec<String> = Vec::new();
             if !cfg.root_pkg.inputs.is_empty() {
                 input_libs.extend(
                     cfg.root_pkg
@@ -2874,6 +2893,13 @@ pub(crate) fn recheck_dependents_if_nonlocal(canon_dir: &Path, target: &Path) ->
                         .iter()
                         .filter(|l| !l.needs.is_empty())
                         .map(|l| l.name.clone()),
+                );
+                input_exes.extend(
+                    cfg.root_pkg
+                        .exes
+                        .iter()
+                        .filter(|e| !e.needs.is_empty())
+                        .map(|e| format!("@{}/{}:exe", cfg.root_pkg.name, e.name)),
                 );
             }
             for dp in &cfg.dep_pkgs {
@@ -2884,29 +2910,36 @@ pub(crate) fn recheck_dependents_if_nonlocal(canon_dir: &Path, target: &Path) ->
                             .filter(|l| !l.needs.is_empty())
                             .map(|l| format!("{}/{}", dp.name, l.name)),
                     );
+                    input_exes.extend(
+                        dp.exes
+                            .iter()
+                            .filter(|e| !e.needs.is_empty())
+                            .map(|e| format!("@{}/{}:exe", dp.name, e.name)),
+                    );
                 }
             }
             input_libs.sort();
             input_libs.dedup();
-            if !input_libs.is_empty() && has_lake_config(&dir) {
+            input_exes.sort();
+            input_exes.dedup();
+            if (!input_libs.is_empty() || !input_exes.is_empty()) && has_lake_config(&dir) {
                 let mut seeds: Vec<String> =
                     cfg.root_pkg.libs.iter().map(|l| l.name.clone()).collect();
-                for exe in &cfg.root_pkg.exes {
-                    let root_mod = exe.root.trim();
-                    let exe_seed = if !root_mod.is_empty() {
-                        root_mod.to_string()
-                    } else {
-                        exe.name.clone()
-                    };
-                    if !seeds.contains(&exe_seed) {
-                        seeds.push(exe_seed);
-                    }
-                }
                 seeds.extend(input_libs.iter().cloned());
                 seeds.sort();
                 seeds.dedup();
+                let mut exe_seeds: Vec<String> = cfg
+                    .root_pkg
+                    .exes
+                    .iter()
+                    .map(|e| format!("@{}/{}:exe", cfg.root_pkg.name, e.name))
+                    .collect();
+                exe_seeds.extend(input_exes.iter().cloned());
+                exe_seeds.sort();
+                exe_seeds.dedup();
+                seeds.extend(exe_seeds);
 
-                let mut targets = input_libs.clone();
+                let mut ordered_targets = input_libs.clone();
                 if let Ok(dag) =
                     crate::module_builder::build_module_dag_with_trust(&cfg, &seeds, false)
                 {
@@ -2916,6 +2949,8 @@ pub(crate) fn recheck_dependents_if_nonlocal(canon_dir: &Path, target: &Path) ->
                         .filter(|m| {
                             !crate::module_builder::input_bearing_libs_for_module(&cfg, m)
                                 .is_empty()
+                                || !crate::module_builder::input_bearing_exes_for_module(&cfg, m)
+                                    .is_empty()
                         })
                         .cloned()
                         .collect();
@@ -2932,18 +2967,29 @@ pub(crate) fn recheck_dependents_if_nonlocal(canon_dir: &Path, target: &Path) ->
                         }
                     }
                     let closure_vec: Vec<String> = closure.into_iter().collect();
-                    targets.extend(lake_refresh_targets(&dir, &closure_vec));
+                    for t in lake_refresh_targets(&dir, &closure_vec) {
+                        if !ordered_targets.contains(&t) {
+                            ordered_targets.push(t);
+                        }
+                    }
+                    for t in input_exes {
+                        if !ordered_targets.contains(&t) {
+                            ordered_targets.push(t);
+                        }
+                    }
                 } else {
-                    targets.extend(seeds);
+                    for t in seeds {
+                        if !ordered_targets.contains(&t) {
+                            ordered_targets.push(t);
+                        }
+                    }
                 }
-                targets.sort();
-                targets.dedup();
 
                 eprintln!(
-                    "[turbo-lean] Lake file inputs changed: re-checking input-bearing libraries and dependents ({}) with Lake",
-                    targets.join(", ")
+                    "[turbo-lean] Lake file inputs changed: re-checking input-bearing targets and dependents ({}) with Lake",
+                    ordered_targets.join(", ")
                 );
-                lake_build_modules(&dir, &targets, None)?;
+                lake_build_modules(&dir, &ordered_targets, None)?;
                 let _ = fs::remove_file(verified_sources_manifest_path(&dir));
                 for dp in &cfg.dep_pkgs {
                     let _ = fs::remove_file(
@@ -4217,7 +4263,7 @@ mod tests {
                     "Other".to_string()
                 ]
             ),
-            vec!["Other".to_string(), "Smoke".to_string()]
+            vec!["Smoke".to_string(), "Other".to_string()]
         );
         // A project without inputs keeps the exact module list it had before.
         let plain = std::env::temp_dir().join(format!(
@@ -4232,10 +4278,15 @@ mod tests {
         )?;
         fs::write(
             plain.join("lakefile.toml"),
-            "name = \"plain\"\n[[lean_lib]]\nname = \"P\"\nglobs = [\"P.+\"]\n",
+            "name = \"plain\"\n[[lean_lib]]\nname = \"P\"\nglobs = [\"P.+\"]\n[[lean_exe]]\nname = \"runner\"\nroot = \"Main\"\n",
         )?;
         let mods = vec!["P.A".to_string(), "P.B".to_string()];
         assert_eq!(lake_refresh_targets(&plain, &mods), mods);
+        assert_eq!(
+            lake_refresh_targets(&plain, &["P.A".to_string(), "Main".to_string()]),
+            vec!["@plain/runner:exe".to_string(), "P.A".to_string()],
+            "a lean_exe root module must translate to @<pkg>/<exe>:exe so Lake relinks the binary"
+        );
         let _ = fs::remove_dir_all(&plain);
         let _ = fs::remove_dir_all(&proj);
         Ok(())
