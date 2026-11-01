@@ -2390,6 +2390,8 @@ pub(crate) fn recheck_dependents_if_nonlocal(canon_dir: &Path, target: &Path) ->
     } else {
         lake_root.unwrap_or_else(|| canon_dir.to_path_buf())
     };
+    // An empty project dir means the working directory (`current_dir("")` cannot spawn Lake).
+    let dir = Path::new(".").join(dir);
     let dir = dir.canonicalize().unwrap_or(dir);
     let file = Some(dir.join(target))
         .filter(|f| f.exists())
