@@ -1018,7 +1018,9 @@ pub(crate) fn shm_file_splits_dir(store: &TurboStore) -> PathBuf {
 
 pub(crate) fn compute_single_stat_hash(pk: &str, ms: i64, mn: i64, sz: i64) -> String {
     let mut h = blake3::Hasher::new();
-    h.update(b"single-stat-split:v3\n");
+    // v4 rebuilds legacy shards without qualified declaration identities.
+    // v9 invalidates declaration scopes computed before lossless dotted-component canonicalization.
+    h.update(b"single-stat-split:v9\n");
     h.update(pk.as_bytes());
     h.update(b":");
     h.update(&ms.to_le_bytes());
@@ -1044,7 +1046,7 @@ pub(crate) fn compact_split_for_shm_cache(split: &splitter::SplitResult) -> spli
 
 pub(crate) fn compute_stat_slice_hash(stats: &[(String, i64, i64, i64)]) -> String {
     let mut h = blake3::Hasher::new();
-    h.update(b"project-stat-splits:v3\n");
+    h.update(b"project-stat-splits:v7\n");
     for (pk, ms, mn, sz) in stats {
         h.update(pk.as_bytes());
         h.update(b":");
@@ -3353,7 +3355,10 @@ mod tests {
                 .env("PATH", &bin)
                 .env("HOME", tree.root.join("isolated/a/b/home"))
                 // Register the installed toolchain explicitly; verification never trusts PATH discovery.
-                .env("ELAN_HOME", lean.ancestors().nth(4).expect("installed Elan toolchain"))
+                .env(
+                    "ELAN_HOME",
+                    lean.ancestors().nth(4).expect("installed Elan toolchain"),
+                )
                 .env("TURBO_LEAN_HOME", tree.root.join("cache"))
                 .env("TURBO_LEAN_STAGING_DIR", tree.root.join("staging"))
                 .env("TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK", "0")
@@ -3915,7 +3920,11 @@ mod tests {
             assert_eq!(fs::metadata(&wt_local)?.permissions().mode() & 0o777, 0o600);
         }
         for (path, bytes) in &main_lake_bytes {
-            assert_eq!(&fs::read(path)?, bytes, "opt-out must not copy or rewrite main `.lake`");
+            assert_eq!(
+                &fs::read(path)?,
+                bytes,
+                "opt-out must not copy or rewrite main `.lake`"
+            );
         }
         #[cfg(unix)]
         {
