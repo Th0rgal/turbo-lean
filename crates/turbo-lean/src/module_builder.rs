@@ -12885,7 +12885,6 @@ roots = ["Fast"]
             ("extraDepTargets = [\"gen\"]\n", ""),
             ("someFutureKey = 1\n", ""),
             ("\"buildType\" = \"debug\"\n", ""),
-            ("", "needs = [\"gen\"]\n"),
             ("", "buildType = \"debug\"\n"),
             ("", "defaultFacets = [\"shared\"]\n"),
             ("", "extraDepTargets = [\"gen\"]\n"),
@@ -12900,6 +12899,18 @@ roots = ["Fast"]
             let pkg = parse_lakefile_toml(&dir, &tf, false).unwrap();
             let why = pkg.unsupported.clone().or(pkg.libs[0].unsupported.clone());
             assert!(why.is_some(), "dependency accepted `{src}`");
+        }
+        // A `needs` naming a target is stricter than `unsupported`: it fails closed for a
+        // dependency too. This parser reads no `input_file` / `input_dir` declarations out of
+        // TOML, so the named input is one nothing hashes, and recording it would leave the
+        // digest and staleness callers -- which only resolve the config -- vouching for a stale
+        // `.olean`. An empty `needs` still passes for every package (checked below).
+        fs::write(&tf, format!("name = \"d\"\n{lib}needs = [\"gen\"]\n")).unwrap();
+        for is_root in [true, false] {
+            let err = parse_lakefile_toml(&dir, &tf, is_root)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("fail-closed") && err.contains("needs"), "{err}");
         }
         // Lake reads a quoted key as the bare key, so a quoted `moreLeanArgs` applies.
         fs::write(
