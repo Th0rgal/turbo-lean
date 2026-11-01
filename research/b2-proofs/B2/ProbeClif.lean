@@ -80,7 +80,7 @@ theorem lnir_bitAnd_bool (b : Bool) :
 
 def BothVisible : Prop :=
   ∀ (code : LNIRCode) (env : Clif.Env) (p : Clif.Program) (cs : Clif.State) (fuel : Nat),
-    (∃ v st', evalCode fuel VarEnv.empty ⟨[], 0, [], []⟩ code = .ok (v, st')) →
+    (∃ v st', evalCode fuel VarEnv.empty ⟨[], 0, [], [], []⟩ code = .ok (v, st')) →
     ∃ vals m, Clif.runLoop env p fuel cs = .returned vals m
 
 end B2.Probe

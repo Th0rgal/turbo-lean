@@ -64,6 +64,6 @@ def entryEnv (d : LNIRDecl) (vs : List Val) : VarEnv :=
   (d.params.zip vs).foldl (fun env (p, v) => env.bind p.id v) VarEnv.empty
 
 /-- Empty LNIR heap (F₆₄ never touches it). -/
-def emptyHeap : HeapState := ⟨[], 0, [], []⟩
+def emptyHeap : HeapState := ⟨[], 0, [], [], []⟩
 
 end B2
