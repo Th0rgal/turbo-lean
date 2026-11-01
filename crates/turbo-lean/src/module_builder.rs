@@ -107,6 +107,12 @@ pub struct LeanLibConfig {
     pub precompile_modules: Option<bool>,
     pub default_facets: Vec<String>,
     pub is_default_target: bool,
+    /// Why turbo-lean cannot build this dependency target like Lake (see `PackageConfig`).
+    #[serde(default)]
+    pub unsupported: Option<String>,
+    /// Native-compilation setting turbo-lean does not mirror; fails closed when native precompile/facets run.
+    #[serde(default)]
+    pub native_unsupported: Option<String>,
 }
 /// Static configuration of a `lean_exe` target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +125,8 @@ pub struct LeanExeConfig {
     pub weak_lean_args: Vec<String>,
     pub lean_options: LeanOptionsMap,
     pub is_default_target: bool,
+    #[serde(default)]
+    pub unsupported: Option<String>,
 }
 /// Static representation of an `extern_lib` declaration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +156,7 @@ pub struct PackageConfig {
     pub src_dir: PathBuf,
     pub build_dir: PathBuf,
     pub lean_lib_dir: PathBuf,
+    pub native_lib_dir: PathBuf,
     pub ir_dir: PathBuf,
     pub packages_dir: PathBuf,
     pub more_lean_args: Vec<String>,
@@ -160,6 +169,13 @@ pub struct PackageConfig {
     pub extern_libs: Vec<ExternLibConfig>,
     pub custom_targets: Vec<String>,
     pub config_digest: String,
+    /// Why turbo-lean cannot build this dependency's modules like Lake (a compile-affecting
+    /// setting it does not mirror). A root package fails to parse instead; a dependency can
+    /// still be used through Lake's own fresh build outputs.
+    #[serde(default)]
+    pub unsupported: Option<String>,
+    #[serde(default)]
+    pub native_unsupported: Option<String>,
 }
 /// Resolved workspace configuration combining root package, `lean-toolchain`, `lake-manifest.json`,
 /// and dependency packages.
@@ -205,6 +221,7 @@ pub struct ModuleNode {
     pub src_root: PathBuf,
     pub src_path: PathBuf,
     pub build_lib_lean_dir: PathBuf,
+    pub build_native_lib_dir: PathBuf,
     pub build_ir_dir: PathBuf,
     pub olean_path: PathBuf,
     pub ilean_path: PathBuf,
@@ -212,7 +229,13 @@ pub struct ModuleNode {
     pub is_module: bool,
     pub has_prelude: bool,
     pub needs_c: bool,
+    pub needs_co_export: bool,
+    pub needs_dynlib: bool,
     pub precompile_modules: bool,
+    #[serde(default)]
+    pub is_exe_target: bool,
+    #[serde(default)]
+    pub import_specs: Vec<ParsedImport>,
     #[serde(default)]
     pub lean_options: LeanOptionsMap,
     pub strong_args: Vec<String>,
@@ -223,6 +246,17 @@ pub struct ModuleNode {
     pub expected_all_deps: Vec<String>,
     pub extern_lib_digests: Vec<String>,
     pub pkg_config_digest: String,
+    #[serde(default)]
+    pub native_unsupported: Option<String>,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SharedLibSpec {
+    pub pkg_name: String,
+    pub lib_name: String,
+    pub stem: String,
+    pub path: PathBuf,
+    pub is_plugin: bool,
+    pub local_modules: Vec<String>,
 }
 /// Deterministic Module DAG with topological waves.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,6 +265,8 @@ pub struct ModuleDag {
     pub topological_order: Vec<String>,
     pub waves: Vec<Vec<String>>,
     pub root_modules: Vec<String>,
+    #[serde(default)]
+    pub shared_libs: Vec<SharedLibSpec>,
 }
 /// Summary report returned by `build_project_modules_native`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1429,9 +1465,12 @@ pub fn resolve_toolchain_compiler_with_trust(
     }
     Ok((canon_bin, githash, lib_lean, lib))
 }
-/// Parse `lake-manifest.json` in `project_dir` if present.
+/// Parse `lake-manifest.json` in `project_dir` if present. `packagesDir`, package names and
+/// `subDir` must stay inside the workspace; so must a `path` dependency's `dir` when
+/// `is_untrusted` (a trusted workspace may point one at a sibling checkout, as Lake allows).
 pub fn parse_lake_manifest(
     project_dir: &Path,
+    is_untrusted: bool,
 ) -> Result<(PathBuf, Vec<ManifestPackageEntry>, Option<String>)> {
     let manifest_path = project_dir.join("lake-manifest.json");
     if !manifest_path.is_file() {
@@ -1446,7 +1485,7 @@ pub fn parse_lake_manifest(
         .get("packagesDir")
         .and_then(|v| v.as_str())
         .unwrap_or(".lake/packages");
-    let packages_dir = PathBuf::from(packages_dir_str);
+    let packages_dir = lake_rel_path("packagesDir", packages_dir_str)?;
     let mut entries = Vec::new();
     if let Some(pkgs) = val.get("packages").and_then(|v| v.as_array()) {
         for pkg in pkgs {
@@ -1454,6 +1493,14 @@ pub fn parse_lake_manifest(
             let name = clean_lake_ident(raw_name);
             if name.is_empty() {
                 continue;
+            }
+            // The name is a directory under `packagesDir`.
+            if name.contains('/') || name == "." || name == ".." {
+                anyhow::bail!(
+                    "Unsupported package name `{}` in {}: fail-closed static Lake config gate",
+                    name,
+                    manifest_path.display()
+                );
             }
             let pkg_type = pkg
                 .get("type")
@@ -1463,9 +1510,14 @@ pub fn parse_lake_manifest(
             let sub_dir = pkg
                 .get("subDir")
                 .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty());
+                .filter(|s| !s.is_empty())
+                .map(|sd| lake_rel_path("subDir", sd))
+                .transpose()?;
             let base_dir = if pkg_type == "path" {
                 if let Some(d) = pkg.get("dir").and_then(|v| v.as_str()) {
+                    if is_untrusted {
+                        lake_rel_path("dir", d)?;
+                    }
                     project_dir.join(d)
                 } else {
                     project_dir.join(&packages_dir).join(&name)
@@ -1566,6 +1618,7 @@ fn compute_package_config_digest(pkg: &PackageConfig, raw_config_hash: &str) -> 
     update_hasher_lp(&mut h, pkg.src_dir.to_string_lossy().as_bytes());
     update_hasher_lp(&mut h, pkg.build_dir.to_string_lossy().as_bytes());
     update_hasher_lp(&mut h, pkg.lean_lib_dir.to_string_lossy().as_bytes());
+    update_hasher_lp(&mut h, pkg.native_lib_dir.to_string_lossy().as_bytes());
     update_hasher_lp(&mut h, pkg.ir_dir.to_string_lossy().as_bytes());
     update_hasher_lp(&mut h, pkg.packages_dir.to_string_lossy().as_bytes());
     h.update(&[u8::from(pkg.precompile_modules)]);
@@ -1827,7 +1880,50 @@ fn parse_toml_string_array(val: &str) -> Result<Vec<String>> {
     }
     Ok(out)
 }
+/// Validate a TOML value recursively for inline-table duplicate/conflicting keys,
+/// mirroring `Lake.Toml.elabInlineTable` (`Lake/Toml/Elab/Value.lean:211-234`).
+fn validate_toml_value_keys(val: &str) -> Result<()> {
+    let s = val.trim();
+    if s.starts_with('{') && s.ends_with('}') {
+        let mut dict: BTreeMap<Vec<String>, bool> = BTreeMap::new(); // true = static value, false = partial table
+        for entry in split_top_level_comma(&s[1..s.len() - 1])? {
+            let Some((k, v)) = entry.split_once('=') else {
+                anyhow::bail!("Invalid inline table entry `{}`", entry);
+            };
+            let ks = split_toml_dotted_key(k)?;
+            let mut cur = Vec::with_capacity(ks.len());
+            for seg in &ks[..ks.len() - 1] {
+                cur.push(seg.clone());
+                if let Some(&is_static) = dict.get(&cur) {
+                    if is_static {
+                        anyhow::bail!(
+                            "cannot redefine key `{}` in TOML inline table",
+                            cur.join(".")
+                        );
+                    }
+                } else {
+                    dict.insert(cur.clone(), false);
+                }
+            }
+            cur.push(ks[ks.len() - 1].clone());
+            if dict.contains_key(&cur) {
+                anyhow::bail!(
+                    "cannot redefine key `{}` in TOML inline table",
+                    cur.join(".")
+                );
+            }
+            validate_toml_value_keys(v)?;
+            dict.insert(cur, true);
+        }
+    } else if s.starts_with('[') && s.ends_with(']') {
+        for item in split_top_level_comma(&s[1..s.len() - 1])? {
+            validate_toml_value_keys(&item)?;
+        }
+    }
+    Ok(())
+}
 fn parse_toml_inline_table(val: &str) -> Result<BTreeMap<String, String>> {
+    validate_toml_value_keys(val)?;
     let s = val.trim();
     if !s.starts_with('{') || !s.ends_with('}') {
         anyhow::bail!("Expected TOML inline table `{{...}}`, found `{}`", val);
@@ -1839,7 +1935,8 @@ fn parse_toml_inline_table(val: &str) -> Result<BTreeMap<String, String>> {
         let Some((k, v)) = entry.split_once('=') else {
             anyhow::bail!("Invalid inline table entry `{}`", entry);
         };
-        let key = clean_lake_ident(k);
+        let ks = split_toml_dotted_key(k)?;
+        let key = ks.join(".");
         let v_trim = v.trim();
         let val_str = if (v_trim.starts_with('"') && v_trim.ends_with('"'))
             || (v_trim.starts_with('\'') && v_trim.ends_with('\''))
@@ -1986,6 +2083,7 @@ fn parse_toml_lean_option_value(raw: &str, key_ctx: &str) -> Result<LeanOptionVa
 }
 
 /// Insert one or more TOML `leanOptions` entries under `prefix` (handling nested inline tables `{...}`).
+/// Duplicate keys are rejected, matching Lake `KeyTy` / `elabInlineTable` elaboration.
 fn insert_toml_lean_option_entry(
     map: &mut LeanOptionsMap,
     prefix: &[String],
@@ -1998,6 +2096,7 @@ fn insert_toml_lean_option_entry(
     full_segs.extend(key_segs);
     let v = raw_val.trim();
     if v.starts_with('{') && v.ends_with('}') {
+        validate_toml_value_keys(v)?;
         for entry in split_top_level_comma(&v[1..v.len() - 1])? {
             let Some((k, sub_v)) = entry.split_once('=') else {
                 anyhow::bail!("Invalid inline table entry `{}`", entry);
@@ -2007,6 +2106,12 @@ fn insert_toml_lean_option_entry(
         return Ok(());
     }
     let name = LeanName(full_segs.into_iter().map(LeanNamePart::Str).collect());
+    if map.contains_key(&name) {
+        anyhow::bail!(
+            "cannot redefine `leanOptions` key `{}` in lakefile.toml",
+            name.to_lean_string()
+        );
+    }
     let val = parse_toml_lean_option_value(v, &name.to_lean_string())?;
     map.insert(name, val);
     Ok(())
@@ -2014,6 +2119,7 @@ fn insert_toml_lean_option_entry(
 
 /// Parse `leanOptions = { ... }` or `leanOptions = [ ... ]` (`Lake/Load/Toml.lean:116-140`).
 fn parse_toml_lean_options_value(val: &str, prefix: &[String]) -> Result<LeanOptionsMap> {
+    validate_toml_value_keys(val)?;
     let s = val.trim();
     if s.starts_with('{') && s.ends_with('}') {
         let mut map = LeanOptionsMap::new();
@@ -2063,10 +2169,22 @@ fn parse_toml_lean_options_value(val: &str, prefix: &[String]) -> Result<LeanOpt
                     }
                     match fk_segs[0].as_str() {
                         "name" => {
+                            if name_opt.is_some() {
+                                anyhow::bail!(
+                                    "Duplicate field `name` in TOML `leanOptions` record `{}`",
+                                    t
+                                );
+                            }
                             let ns = parse_toml_string(fv)?;
                             name_opt = Some(LeanName::from_str_to_name(&ns)?);
                         }
                         "value" => {
+                            if val_raw_opt.is_some() {
+                                anyhow::bail!(
+                                    "Duplicate field `value` in TOML `leanOptions` record `{}`",
+                                    t
+                                );
+                            }
                             val_raw_opt = Some(fv.trim().to_string());
                         }
                         other => {
@@ -2179,6 +2297,313 @@ fn parse_toml_globs(val: &str) -> Result<Vec<GlobSpec>> {
     }
     Ok(out)
 }
+/// A lakefile or manifest directory field, which must stay relative to its package: an absolute
+/// path or `..` would point builds (and their writes) outside it.
+fn lake_rel_path(field: &str, raw: &str) -> Result<PathBuf> {
+    let p = PathBuf::from(raw);
+    if p.components().any(|c| {
+        !matches!(
+            c,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    }) {
+        let _ = c_abi::verify_static_lake_config(true, true, false, false);
+        anyhow::bail!(
+            "Unsupported path `{}` for `{}`: must be relative and free of `..`: fail-closed static Lake config gate",
+            raw,
+            field
+        );
+    }
+    Ok(p)
+}
+/// The lakefile scope a field belongs to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LakeScope {
+    Package,
+    Lib,
+    Exe,
+}
+/// How a Lake 4.35 field that turbo-lean does not read itself affects the build.
+enum LakeField {
+    /// Metadata, server, linker and native-library settings: no effect on a module's
+    /// `.olean`/`.ilean`/`.c` or on the trace turbo-lean writes for it.
+    Passive,
+    /// A compile-affecting value turbo-lean does not mirror.
+    Unsupported,
+    Unknown,
+}
+/// Classify a field by `scope`, `key` and its raw value (`lakefile.toml` or `lakefile.lean`
+/// syntax). Compile-affecting fields pass only at the value turbo-lean builds with.
+fn classify_lake_field(scope: LakeScope, key: &str, val: &str) -> LakeField {
+    use LakeScope::*;
+    let v = val.trim();
+    let only_if = |ok: bool| {
+        if ok {
+            LakeField::Passive
+        } else {
+            LakeField::Unsupported
+        }
+    };
+    // An enum value passes only as a TOML string (decoded like Lake's `ofString?`) or as a Lean
+    // `.ctor` naming a real constructor: a qualified name (`Backend.default`) or a non-constructor
+    // (`.C`) can name a lakefile's own helper, and any other expression is evaluated by Lake.
+    let toml_str = v
+        .starts_with(['"', '\''])
+        .then(|| parse_toml_string(v).ok())
+        .flatten();
+    let dot_ctor = v.strip_prefix('.');
+    let enum_is = |toml_ok: &dyn Fn(&str) -> bool, ctors: &[&str]| match (&toml_str, dot_ctor) {
+        (Some(t), _) => toml_ok(t),
+        (None, Some(c)) => ctors.contains(&c),
+        _ => false,
+    };
+    const BUILD_TYPES: [&str; 3] = ["release", "relWithDebInfo", "minSizeRel"];
+    // `[ ]` and multi-line empty arrays too (comments are already stripped).
+    let compact: String = v.chars().filter(|c| !c.is_whitespace()).collect();
+    let empty_array = matches!(compact.as_str(), "[]" | "#[]");
+    match (scope, key) {
+        (
+            _,
+            "moreLeancArgs"
+            | "weakLeancArgs"
+            | "moreLinkObjs"
+            | "moreLinkLibs"
+            | "moreLinkArgs"
+            | "weakLinkArgs"
+            | "moreServerOptions"
+            | "requiresModuleSystem"
+            | "allowNonModules",
+        ) => LakeField::Passive,
+        // Only `debug` adds an option (`debugAssertions`) to `lean`; the rest are `leanc` flags.
+        (_, "buildType") => only_if(enum_is(
+            &|t| {
+                // Lake's TOML decoder decapitalizes the string.
+                let mut cs = t.chars();
+                let lower: String = cs
+                    .next()
+                    .map(|c| c.to_ascii_lowercase())
+                    .into_iter()
+                    .chain(cs)
+                    .collect();
+                BUILD_TYPES.contains(&lower.as_str())
+            },
+            &BUILD_TYPES,
+        )),
+        (_, "backend") => only_if(enum_is(
+            &|t| matches!(t, "c" | "default"),
+            &["c", "default"],
+        )),
+        // `true` drops platform-dependent inputs (none here) from the trace; `false` adds the
+        // platform, which turbo-lean's trace does not.
+        (_, "platformIndependent") => only_if(matches!(v, "true" | "some true")),
+        (_, "precompileImports") => only_if(v == "false"),
+        (_, "dynlibs" | "plugins") => only_if(empty_array),
+        (_, "extraDepTargets") => only_if(empty_array),
+        (Lib | Exe, "needs") => only_if(empty_array),
+        (
+            Package,
+            "version"
+            | "versionTags"
+            | "description"
+            | "keywords"
+            | "homepage"
+            | "license"
+            | "licenseFiles"
+            | "readmeFile"
+            | "reservoir"
+            | "testDriver"
+            | "testRunner"
+            | "testDriverArgs"
+            | "lintDriver"
+            | "lintDriverArgs"
+            | "releaseRepo"
+            | "releaseRepo?"
+            | "buildArchive"
+            | "buildArchive?"
+            | "preferReleaseBuild"
+            | "moreServerArgs"
+            | "moreGlobalServerArgs"
+            | "fixedToolchain"
+            | "restoreAllArtifacts"
+            | "restoreAllArtifacts?"
+            | "enableArtifactCache"
+            | "enableArtifactCache?"
+            | "libPrefixOnWindows"
+            | "allowImportAll"
+            | "builtinLint"
+            | "builtinLint?"
+            | "checks",
+        ) => LakeField::Passive,
+        (Package, "bootstrap") => only_if(v == "false"),
+        (Lib, "libName" | "libPrefixOnWindows" | "allowImportAll") => LakeField::Passive,
+        (Exe, "exeName") => LakeField::Passive,
+        _ => LakeField::Unknown,
+    }
+}
+/// A field turbo-lean cannot build like Lake: the root package fails closed now; a dependency
+/// records `why` in `slot`, so only building one of its modules fails closed.
+fn unsupported_lake_field(slot: &mut Option<String>, is_root_pkg: bool, why: String) -> Result<()> {
+    if is_root_pkg && !c_abi::verify_static_lake_config(true, true, false, false) {
+        anyhow::bail!("{}: fail-closed static Lake config gate", why);
+    }
+    slot.get_or_insert(why);
+    Ok(())
+}
+/// Handle a field the parser does not read: pass it, or fail closed via
+/// `unsupported_lake_field`.
+fn check_lake_field(
+    slot: &mut Option<String>,
+    is_root_pkg: bool,
+    scope: LakeScope,
+    key: &str,
+    val: &str,
+    location: impl FnOnce() -> String,
+) -> Result<()> {
+    let (what, passive) = match classify_lake_field(scope, key, val) {
+        LakeField::Passive => ("", true),
+        LakeField::Unsupported => ("Unsupported value for", false),
+        LakeField::Unknown => ("Unsupported", false),
+    };
+    if c_abi::verify_static_lake_config(true, !passive, false, false) {
+        return Ok(());
+    }
+    let scope_name = match scope {
+        LakeScope::Package => "package",
+        LakeScope::Lib => "lean_lib",
+        LakeScope::Exe => "lean_exe",
+    };
+    unsupported_lake_field(
+        slot,
+        is_root_pkg,
+        format!("{} {} field `{}` in {}", what, scope_name, key, location()),
+    )
+}
+/// Check whether a passive field becomes unsupported when native C/shared precompilation runs.
+fn classify_native_unsupported_field(
+    scope: LakeScope,
+    key: &str,
+    val: &str,
+    location: &dyn Fn() -> String,
+) -> Option<String> {
+    let v = val.trim();
+    let compact: String = v.chars().filter(|c| !c.is_whitespace()).collect();
+    let empty_array = matches!(compact.as_str(), "[]" | "#[]");
+    let toml_str = v
+        .starts_with(['"', '\''])
+        .then(|| parse_toml_string(v).ok())
+        .flatten();
+    let dot_ctor = v.strip_prefix('.');
+    match (scope, key) {
+        (
+            _,
+            "moreLeancArgs" | "weakLeancArgs" | "moreLinkObjs" | "moreLinkLibs" | "moreLinkArgs"
+            | "weakLinkArgs",
+        ) if !empty_array => Some(format!(
+            "Non-empty native compiler/linker field `{}` in {}",
+            key,
+            location()
+        )),
+        (_, "buildType") => {
+            let is_release = match (&toml_str, dot_ctor) {
+                (Some(t), _) => t.eq_ignore_ascii_case("release"),
+                (None, Some(c)) => c == "release",
+                _ => false,
+            };
+            if is_release {
+                None
+            } else {
+                Some(format!(
+                    "Non-release `buildType` (`{}`) for native precompilation in {}",
+                    v,
+                    location()
+                ))
+            }
+        }
+        (LakeScope::Lib, "libName") => Some(format!(
+            "Custom `libName` (`{}`) for native precompilation in {}",
+            v,
+            location()
+        )),
+        (_, "libPrefixOnWindows") if v != "false" => Some(format!(
+            "Non-default `libPrefixOnWindows` (`{}`) for native precompilation in {}",
+            v,
+            location()
+        )),
+        _ => None,
+    }
+}
+/// `precompileLibrary` fails closed everywhere; `precompileModules` parses as a boolean and is
+/// built natively in trusted mode (and rejected in untrusted mode).
+fn lake_precompile(key: &str, val: &str, location: &dyn Fn() -> String) -> Result<bool> {
+    let on = parse_toml_bool(val)?;
+    if key == "precompileLibrary" && !c_abi::verify_static_lake_config(true, on, false, false) {
+        anyhow::bail!(
+            "Unsupported `{} = true` in {}: Lake loads precompiled shared libraries turbo-lean does not build: fail-closed static Lake config gate",
+            key,
+            location()
+        );
+    }
+    Ok(on)
+}
+/// A token that starts a Lean or Lake command (`#eval`, `def`, `package`, ...).
+fn is_lean_command_token(t: &str) -> bool {
+    (t.starts_with('#') && t.len() > 1)
+        || matches!(
+            t,
+            "package"
+                | "lean_lib"
+                | "lean_exe"
+                | "target"
+                | "extern_lib"
+                | "require"
+                | "input_file"
+                | "input_dir"
+                | "post_update"
+                | "script"
+                | "lean_script"
+                | "import"
+                | "open"
+                | "def"
+                | "abbrev"
+                | "theorem"
+                | "instance"
+                | "structure"
+                | "inductive"
+                | "class"
+                | "axiom"
+                | "opaque"
+                | "example"
+                | "mutual"
+                | "deriving"
+                | "attribute"
+                | "set_option"
+                | "namespace"
+                | "section"
+                | "end"
+                | "universe"
+                | "variable"
+                | "include"
+                | "omit"
+                | "export"
+                | "notation"
+                | "infix"
+                | "infixl"
+                | "infixr"
+                | "prefix"
+                | "postfix"
+                | "syntax"
+                | "macro"
+                | "macro_rules"
+                | "elab"
+                | "elab_rules"
+                | "initialize"
+                | "builtin_initialize"
+                | "meta"
+                | "run_cmd"
+                | "run_elab"
+                | "run_meta"
+        )
+}
 /// Parse a static `lakefile.toml` file into `PackageConfig`.
 /// Fails closed if unsupported dynamic targets, plugins, or facets are configured.
 pub fn parse_lakefile_toml(
@@ -2207,6 +2632,7 @@ pub fn parse_lakefile_toml(
         src_dir: PathBuf::from("."),
         build_dir: PathBuf::from(".lake/build"),
         lean_lib_dir: PathBuf::from("lib/lean"),
+        native_lib_dir: PathBuf::from("lib"),
         ir_dir: PathBuf::from("ir"),
         packages_dir: PathBuf::from(".lake/packages"),
         more_lean_args: Vec::new(),
@@ -2219,6 +2645,8 @@ pub fn parse_lakefile_toml(
         extern_libs: Vec::new(),
         custom_targets: Vec::new(),
         config_digest: String::new(),
+        unsupported: None,
+        native_unsupported: None,
     };
     #[derive(Clone, PartialEq, Eq)]
     enum Section {
@@ -2232,6 +2660,181 @@ pub fn parse_lakefile_toml(
         ExternLib(usize),
     }
     let mut section = Section::Top;
+    // Lake TOML `KeyTy` state (`Lake/Toml/Elab/Expression.lean`): redefining a key, or using a
+    // key as both a value and a table/array/dotted prefix, is an elaboration error.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum KeyTy {
+        Value,
+        StdTable,
+        Array,
+        DottedPrefix,
+        HeaderPrefix,
+    }
+    impl KeyTy {
+        fn label(self) -> &'static str {
+            match self {
+                KeyTy::Value => "value",
+                KeyTy::StdTable => "table",
+                KeyTy::Array => "array",
+                KeyTy::DottedPrefix => "dotted",
+                KeyTy::HeaderPrefix => "header",
+            }
+        }
+    }
+    #[derive(Clone)]
+    struct TomlElabState {
+        key_tys: BTreeMap<Vec<String>, KeyTy>,
+        arr_key_tys: BTreeMap<Vec<String>, BTreeMap<Vec<String>, KeyTy>>,
+        arr_parents: BTreeMap<Vec<String>, Vec<String>>,
+        curr_arr_key: Vec<String>,
+        curr_key: Vec<String>,
+    }
+    impl TomlElabState {
+        fn new() -> Self {
+            Self {
+                key_tys: BTreeMap::new(),
+                arr_key_tys: BTreeMap::new(),
+                arr_parents: BTreeMap::new(),
+                curr_arr_key: Vec::new(),
+                curr_key: Vec::new(),
+            }
+        }
+        fn elab_header_keys(
+            &mut self,
+            prefix_segs: &[String],
+        ) -> std::result::Result<Vec<String>, String> {
+            self.arr_key_tys
+                .insert(self.curr_arr_key.clone(), self.key_tys.clone());
+            self.curr_arr_key.clear();
+            self.key_tys = self
+                .arr_key_tys
+                .get(&Vec::<String>::new())
+                .cloned()
+                .unwrap_or_default();
+            let mut k = Vec::new();
+            for seg in prefix_segs {
+                k.push(seg.clone());
+                if let Some(&ty) = self.key_tys.get(&k) {
+                    match ty {
+                        KeyTy::Array => {
+                            let arr_map = self
+                                .arr_key_tys
+                                .get(&k)
+                                .cloned()
+                                .ok_or_else(|| format!("bad array key `{}`", k.join(".")))?;
+                            self.key_tys = arr_map;
+                            self.curr_arr_key = k.clone();
+                        }
+                        KeyTy::StdTable | KeyTy::HeaderPrefix | KeyTy::DottedPrefix => {}
+                        _ => {
+                            return Err(format!(
+                                "cannot redefine {} key `{}`",
+                                ty.label(),
+                                k.join(".")
+                            ));
+                        }
+                    }
+                } else {
+                    self.key_tys.insert(k.clone(), KeyTy::HeaderPrefix);
+                }
+            }
+            Ok(k)
+        }
+        fn elab_std_table(&mut self, segs: &[String]) -> std::result::Result<(), String> {
+            if segs.is_empty() {
+                return Err("empty table header".to_string());
+            }
+            let mut k = self.elab_header_keys(&segs[..segs.len() - 1])?;
+            k.push(segs[segs.len() - 1].clone());
+            if let Some(&ty) = self.key_tys.get(&k) {
+                if ty != KeyTy::HeaderPrefix {
+                    return Err(format!(
+                        "cannot redefine {} key `{}`",
+                        ty.label(),
+                        k.join(".")
+                    ));
+                }
+            }
+            self.curr_key = k.clone();
+            self.key_tys.insert(k, KeyTy::StdTable);
+            Ok(())
+        }
+        fn elab_array_table(&mut self, segs: &[String]) -> std::result::Result<(), String> {
+            if segs.is_empty() {
+                return Err("empty array table header".to_string());
+            }
+            let mut k = self.elab_header_keys(&segs[..segs.len() - 1])?;
+            k.push(segs[segs.len() - 1].clone());
+            if let Some(&ty) = self.key_tys.get(&k) {
+                if ty == KeyTy::Array {
+                    let parent = self
+                        .arr_parents
+                        .get(&k)
+                        .and_then(|p| self.arr_key_tys.get(p))
+                        .cloned()
+                        .ok_or_else(|| format!("bad array key `{}`", k.join(".")))?;
+                    self.key_tys = parent;
+                    self.curr_key = k.clone();
+                    self.curr_arr_key = k;
+                } else {
+                    return Err(format!(
+                        "cannot redefine {} key `{}`",
+                        ty.label(),
+                        k.join(".")
+                    ));
+                }
+            } else {
+                self.key_tys.insert(k.clone(), KeyTy::Array);
+                self.arr_key_tys
+                    .insert(self.curr_arr_key.clone(), self.key_tys.clone());
+                self.arr_parents
+                    .insert(k.clone(), self.curr_arr_key.clone());
+                self.curr_key = k.clone();
+                self.curr_arr_key = k;
+            }
+            Ok(())
+        }
+        fn elab_keyval(&mut self, segs: &[String]) -> std::result::Result<(), String> {
+            if segs.is_empty() {
+                return Err("empty key".to_string());
+            }
+            let mut k = self.curr_key.clone();
+            for seg in &segs[..segs.len() - 1] {
+                k.push(seg.clone());
+                if let Some(&ty) = self.key_tys.get(&k) {
+                    if ty != KeyTy::DottedPrefix {
+                        return Err(format!(
+                            "cannot redefine {} key `{}`",
+                            ty.label(),
+                            k.join(".")
+                        ));
+                    }
+                } else {
+                    self.key_tys.insert(k.clone(), KeyTy::DottedPrefix);
+                }
+            }
+            k.push(segs[segs.len() - 1].clone());
+            if let Some(&ty) = self.key_tys.get(&k) {
+                return Err(format!(
+                    "cannot redefine {} key `{}`",
+                    ty.label(),
+                    k.join(".")
+                ));
+            }
+            self.key_tys.insert(k, KeyTy::Value);
+            Ok(())
+        }
+    }
+    let mut toml_elab = TomlElabState::new();
+    let key_err = |line_no: usize, msg: String| -> anyhow::Error {
+        let _ = c_abi::verify_static_lake_config(true, true, false, false);
+        anyhow::anyhow!(
+            "{} in {} at line {}: fail-closed static Lake config gate",
+            msg,
+            toml_path.display(),
+            line_no
+        )
+    };
     let lines: Vec<&str> = raw.lines().collect();
     let mut idx = 0usize;
     while idx < lines.len() {
@@ -2244,9 +2847,14 @@ pub fn parse_lakefile_toml(
         if stripped.starts_with('[') && stripped.ends_with(']') {
             if stripped.starts_with("[[") && stripped.ends_with("]]") {
                 let sec_name = stripped[2..stripped.len() - 2].trim();
-                match sec_name {
-                    "require" => section = Section::Require,
-                    "lean_lib" => {
+                let sec_segs =
+                    split_toml_dotted_key(sec_name).map_err(|e| key_err(line_no, e.to_string()))?;
+                toml_elab
+                    .elab_array_table(&sec_segs)
+                    .map_err(|e| key_err(line_no, e))?;
+                match sec_segs.as_slice() {
+                    [head] if head == "require" => section = Section::Require,
+                    [head] if head == "lean_lib" => {
                         let lib_idx = pkg.libs.len();
                         pkg.libs.push(LeanLibConfig {
                             name: String::new(),
@@ -2259,10 +2867,12 @@ pub fn parse_lakefile_toml(
                             precompile_modules: None,
                             default_facets: Vec::new(),
                             is_default_target: false,
+                            unsupported: None,
+                            native_unsupported: None,
                         });
                         section = Section::LeanLib(lib_idx);
                     }
-                    "lean_exe" => {
+                    [head] if head == "lean_exe" => {
                         let exe_idx = pkg.exes.len();
                         pkg.exes.push(LeanExeConfig {
                             name: String::new(),
@@ -2273,10 +2883,11 @@ pub fn parse_lakefile_toml(
                             weak_lean_args: Vec::new(),
                             lean_options: BTreeMap::new(),
                             is_default_target: false,
+                            unsupported: None,
                         });
                         section = Section::LeanExe(exe_idx);
                     }
-                    "extern_lib" => {
+                    [head] if head == "extern_lib" => {
                         let ext_idx = pkg.extern_libs.len();
                         pkg.extern_libs.push(ExternLibConfig {
                             name: String::new(),
@@ -2286,11 +2897,11 @@ pub fn parse_lakefile_toml(
                         });
                         section = Section::ExternLib(ext_idx);
                     }
-                    other => {
+                    _ => {
                         let _ = c_abi::verify_static_lake_config(true, true, false, false);
                         anyhow::bail!(
                             "Unsupported table array `[[{}]]` in {} at line {}: fail-closed static Lake config gate",
-                            other,
+                            sec_name,
                             toml_path.display(),
                             line_no
                         );
@@ -2298,7 +2909,11 @@ pub fn parse_lakefile_toml(
                 }
             } else {
                 let sec_name = stripped[1..stripped.len() - 1].trim();
-                let sec_segs = split_toml_dotted_key(sec_name).unwrap_or_default();
+                let sec_segs =
+                    split_toml_dotted_key(sec_name).map_err(|e| key_err(line_no, e.to_string()))?;
+                toml_elab
+                    .elab_std_table(&sec_segs)
+                    .map_err(|e| key_err(line_no, e))?;
                 match sec_segs.as_slice() {
                     [head, rest @ ..] if head == "leanOptions" => {
                         section = Section::LeanOptions(rest.to_vec());
@@ -2334,7 +2949,14 @@ pub fn parse_lakefile_toml(
                 stripped
             );
         };
-        let key = raw_key.trim();
+        let key_segs =
+            split_toml_dotted_key(raw_key).map_err(|e| key_err(line_no, e.to_string()))?;
+        let key_owned = if key_segs.len() == 1 {
+            key_segs[0].clone()
+        } else {
+            key_segs.join(".")
+        };
+        let key = key_owned.as_str();
         let mut val_accum = raw_val_start.trim().to_string();
         // Handle multi-line array `[...]` or inline table `{...}`
         while (val_accum.starts_with('[') || val_accum.starts_with('{'))
@@ -2355,50 +2977,59 @@ pub fn parse_lakefile_toml(
                 val_accum.push_str(next_part);
             }
         }
+        toml_elab
+            .elab_keyval(&key_segs)
+            .map_err(|e| key_err(line_no, e))?;
+        validate_toml_value_keys(&val_accum).map_err(|e| key_err(line_no, e.to_string()))?;
         let try_insert_dotted_lean_options =
-            |map: &mut LeanOptionsMap, raw_k: &str, raw_v: &str| -> Result<bool> {
-                if let Ok(segs) = split_toml_dotted_key(raw_k) {
-                    if segs.len() >= 2 && segs[0] == "leanOptions" {
-                        let last_idx = segs.len() - 1;
-                        let prefix = &segs[1..last_idx];
-                        let v_trim = raw_v.trim();
-                        if v_trim.starts_with('{') && v_trim.ends_with('}') {
-                            let mut sub_prefix = segs[1..].to_vec();
-                            let tbl = parse_toml_lean_options_value(v_trim, &sub_prefix)?;
-                            sub_prefix.clear();
-                            map.extend(tbl);
-                        } else {
-                            let name = LeanName(
-                                segs[1..].iter().cloned().map(LeanNamePart::Str).collect(),
-                            );
-                            let val = parse_toml_lean_option_value(v_trim, &name.to_lean_string())?;
-                            map.insert(name, val);
-                            let _ = prefix;
+            |map: &mut LeanOptionsMap, segs: &[String], raw_v: &str| -> Result<bool> {
+                if segs.len() >= 2 && segs[0] == "leanOptions" {
+                    let v_trim = raw_v.trim();
+                    if v_trim.starts_with('{') && v_trim.ends_with('}') {
+                        let tbl = parse_toml_lean_options_value(v_trim, &segs[1..])?;
+                        for (k, v) in tbl {
+                            if map.contains_key(&k) {
+                                anyhow::bail!(
+                                    "cannot redefine `leanOptions` key `{}` in lakefile.toml",
+                                    k.to_lean_string()
+                                );
+                            }
+                            map.insert(k, v);
                         }
-                        return Ok(true);
+                    } else {
+                        let name =
+                            LeanName(segs[1..].iter().cloned().map(LeanNamePart::Str).collect());
+                        if map.contains_key(&name) {
+                            anyhow::bail!(
+                                "cannot redefine `leanOptions` key `{}` in lakefile.toml",
+                                name.to_lean_string()
+                            );
+                        }
+                        let val = parse_toml_lean_option_value(v_trim, &name.to_lean_string())?;
+                        map.insert(name, val);
                     }
+                    return Ok(true);
                 }
                 Ok(false)
             };
+        let toml_path_field =
+            || -> Result<PathBuf> { lake_rel_path(key, &parse_toml_string(&val_accum)?) };
+        let location = || format!("{} at line {}", toml_path.display(), line_no);
         match &section {
             Section::Top => {
-                if try_insert_dotted_lean_options(&mut pkg.lean_options, key, &val_accum)? {
+                if try_insert_dotted_lean_options(&mut pkg.lean_options, &key_segs, &val_accum)? {
                     continue;
                 }
                 match key {
                     "name" => pkg.name = clean_lake_ident(&parse_toml_string(&val_accum)?),
-                    "version" | "versionTags" | "description" | "keywords" | "homepage"
-                    | "license" | "licenseFiles" | "readmeFile" | "reservoir" | "testDriver"
-                    | "testDriverArgs" | "lintDriver" | "lintDriverArgs" | "releaseRepo"
-                    | "buildArchive" | "preferReleaseBuild" => {}
-                    "srcDir" => pkg.src_dir = PathBuf::from(parse_toml_string(&val_accum)?),
-                    "buildDir" => pkg.build_dir = PathBuf::from(parse_toml_string(&val_accum)?),
-                    "leanLibDir" => {
-                        pkg.lean_lib_dir = PathBuf::from(parse_toml_string(&val_accum)?)
-                    }
-                    "irDir" => pkg.ir_dir = PathBuf::from(parse_toml_string(&val_accum)?),
-                    "packagesDir" => {
-                        pkg.packages_dir = PathBuf::from(parse_toml_string(&val_accum)?)
+                    "srcDir" => pkg.src_dir = toml_path_field()?,
+                    "buildDir" => pkg.build_dir = toml_path_field()?,
+                    "leanLibDir" => pkg.lean_lib_dir = toml_path_field()?,
+                    "nativeLibDir" => pkg.native_lib_dir = toml_path_field()?,
+                    "irDir" => pkg.ir_dir = toml_path_field()?,
+                    "packagesDir" => pkg.packages_dir = toml_path_field()?,
+                    "binDir" => {
+                        toml_path_field()?;
                     }
                     "defaultTargets" => {
                         pkg.default_targets = parse_toml_string_array(&val_accum)?
@@ -2408,39 +3039,35 @@ pub fn parse_lakefile_toml(
                     }
                     "moreLeanArgs" => pkg.more_lean_args = parse_toml_string_array(&val_accum)?,
                     "weakLeanArgs" => pkg.weak_lean_args = parse_toml_string_array(&val_accum)?,
-                    "precompileModules" => pkg.precompile_modules = parse_toml_bool(&val_accum)?,
+                    "precompileModules" => {
+                        pkg.precompile_modules = lake_precompile(key, &val_accum, &location)?
+                    }
                     "leanOptions" => {
                         let tbl = parse_toml_lean_options_value(&val_accum, &[])?;
                         pkg.lean_options.extend(tbl);
                     }
-                    "dynlibs" | "plugins" | "needs" => {
-                        let arr = parse_toml_string_array(&val_accum)
-                            .unwrap_or_else(|_| vec![val_accum.clone()]);
-                        if !arr.is_empty() && is_root_pkg {
-                            let _ = c_abi::verify_static_lake_config(true, true, false, false);
-                            anyhow::bail!(
-                                "Unsupported dynamic setting `{}` in {} at line {}",
-                                key,
-                                toml_path.display(),
-                                line_no
-                            );
-                        }
-                    }
                     other => {
-                        if is_root_pkg {
-                            let _ = c_abi::verify_static_lake_config(true, true, false, false);
-                            anyhow::bail!(
-                                "Unsupported top-level key `{}` in {} at line {}: fail-closed static Lake config gate",
-                                other,
-                                toml_path.display(),
-                                line_no
-                            );
+                        if let Some(nwhy) = classify_native_unsupported_field(
+                            LakeScope::Package,
+                            other,
+                            &val_accum,
+                            &location,
+                        ) {
+                            pkg.native_unsupported.get_or_insert(nwhy);
                         }
+                        check_lake_field(
+                            &mut pkg.unsupported,
+                            is_root_pkg,
+                            LakeScope::Package,
+                            other,
+                            &val_accum,
+                            location,
+                        )?;
                     }
                 }
             }
             Section::LeanOptions(prefix) => {
-                insert_toml_lean_option_entry(&mut pkg.lean_options, prefix, key, &val_accum)?;
+                insert_toml_lean_option_entry(&mut pkg.lean_options, prefix, raw_key, &val_accum)?;
             }
             Section::Require => {
                 // Handled via lake-manifest.json and .lake/packages discovery
@@ -2448,12 +3075,12 @@ pub fn parse_lakefile_toml(
             Section::LeanLib(i) => {
                 let i = *i;
                 let lib = &mut pkg.libs[i];
-                if try_insert_dotted_lean_options(&mut lib.lean_options, key, &val_accum)? {
+                if try_insert_dotted_lean_options(&mut lib.lean_options, &key_segs, &val_accum)? {
                     continue;
                 }
                 match key {
                     "name" => lib.name = clean_lake_ident(&parse_toml_string(&val_accum)?),
-                    "srcDir" => lib.src_dir = Some(PathBuf::from(parse_toml_string(&val_accum)?)),
+                    "srcDir" => lib.src_dir = Some(toml_path_field()?),
                     "roots" => {
                         lib.roots = parse_toml_string_array(&val_accum)?
                             .into_iter()
@@ -2467,12 +3094,18 @@ pub fn parse_lakefile_toml(
                     "moreLeanArgs" => lib.more_lean_args = parse_toml_string_array(&val_accum)?,
                     "weakLeanArgs" => lib.weak_lean_args = parse_toml_string_array(&val_accum)?,
                     "precompileModules" => {
-                        lib.precompile_modules = Some(parse_toml_bool(&val_accum)?)
+                        lib.precompile_modules = Some(lake_precompile(key, &val_accum, &location)?)
+                    }
+                    "precompileLibrary" => {
+                        lake_precompile(key, &val_accum, &location)?;
                     }
                     "leanOptions" => {
                         let tbl = parse_toml_lean_options_value(&val_accum, &[])?;
                         lib.lean_options.extend(tbl);
                     }
+                    // Lake's TOML decoder excludes `nativeFacets` (`Load/Toml.lean`), so it has
+                    // no effect in a lakefile.toml.
+                    "nativeFacets" => {}
                     "defaultFacets" => {
                         let facets = parse_toml_string_array(&val_accum)?;
                         for f in &facets {
@@ -2483,45 +3116,42 @@ pub fn parse_lakefile_toml(
                                     | "ilean"
                                     | "c"
                                     | "static"
+                                    | "shared"
                                     | "default"
                                     | "modules"
-                            ) && is_root_pkg
-                            {
+                            ) {
                                 let _ = c_abi::verify_static_lake_config(true, false, false, true);
-                                anyhow::bail!(
-                                    "Unsupported defaultFacet `{}` on library `{}` in {}",
-                                    f,
-                                    lib.name,
-                                    toml_path.display()
-                                );
+                                unsupported_lake_field(
+                                    &mut lib.unsupported,
+                                    is_root_pkg,
+                                    format!(
+                                        "Unsupported defaultFacet `{}` on library `{}` in {}",
+                                        f,
+                                        lib.name,
+                                        toml_path.display()
+                                    ),
+                                )?;
                             }
                         }
                         lib.default_facets = facets;
                     }
-                    "dynlibs" | "plugins" | "needs" | "nativeFacets" => {
-                        let arr = parse_toml_string_array(&val_accum)
-                            .unwrap_or_else(|_| vec![val_accum.clone()]);
-                        if !arr.is_empty() && is_root_pkg {
-                            let _ = c_abi::verify_static_lake_config(true, true, false, false);
-                            anyhow::bail!(
-                                "Unsupported dynamic library setting `{}` on `{}` in {}",
-                                key,
-                                lib.name,
-                                toml_path.display()
-                            );
-                        }
-                    }
-                    "libName" | "extraDepTargets" if !is_root_pkg => {}
                     other => {
-                        if is_root_pkg {
-                            let _ = c_abi::verify_static_lake_config(true, true, false, false);
-                            anyhow::bail!(
-                                "Unsupported `[[lean_lib]]` key `{}` in {} at line {}",
-                                other,
-                                toml_path.display(),
-                                line_no
-                            );
+                        if let Some(nwhy) = classify_native_unsupported_field(
+                            LakeScope::Lib,
+                            other,
+                            &val_accum,
+                            &location,
+                        ) {
+                            lib.native_unsupported.get_or_insert(nwhy);
                         }
+                        check_lake_field(
+                            &mut lib.unsupported,
+                            is_root_pkg,
+                            LakeScope::Lib,
+                            other,
+                            &val_accum,
+                            location,
+                        )?;
                     }
                 }
             }
@@ -2529,45 +3159,43 @@ pub fn parse_lakefile_toml(
                 insert_toml_lean_option_entry(
                     &mut pkg.libs[*i].lean_options,
                     prefix,
-                    key,
+                    raw_key,
                     &val_accum,
                 )?;
             }
             Section::LeanExe(i) => {
                 let exe = &mut pkg.exes[*i];
-                if try_insert_dotted_lean_options(&mut exe.lean_options, key, &val_accum)? {
+                if try_insert_dotted_lean_options(&mut exe.lean_options, &key_segs, &val_accum)? {
                     continue;
                 }
                 match key {
                     "name" => exe.name = clean_lake_ident(&parse_toml_string(&val_accum)?),
-                    "srcDir" => exe.src_dir = Some(PathBuf::from(parse_toml_string(&val_accum)?)),
+                    "srcDir" => exe.src_dir = Some(toml_path_field()?),
                     "root" => exe.root = clean_lake_ident(&parse_toml_string(&val_accum)?),
                     "supportInterpreter" => exe.support_interpreter = parse_toml_bool(&val_accum)?,
+                    // Excluded by Lake's TOML decoder, as for `[[lean_lib]]`.
+                    "nativeFacets" => {}
                     "moreLeanArgs" => exe.more_lean_args = parse_toml_string_array(&val_accum)?,
                     "weakLeanArgs" => exe.weak_lean_args = parse_toml_string_array(&val_accum)?,
                     "leanOptions" => {
                         let tbl = parse_toml_lean_options_value(&val_accum, &[])?;
                         exe.lean_options.extend(tbl);
                     }
-                    "exeName" | "moreLinkArgs" | "moreLinkObjs" | "moreLinkLibs" => {}
-                    other => {
-                        if is_root_pkg {
-                            let _ = c_abi::verify_static_lake_config(true, true, false, false);
-                            anyhow::bail!(
-                                "Unsupported `[[lean_exe]]` key `{}` in {} at line {}",
-                                other,
-                                toml_path.display(),
-                                line_no
-                            );
-                        }
-                    }
+                    other => check_lake_field(
+                        &mut exe.unsupported,
+                        is_root_pkg,
+                        LakeScope::Exe,
+                        other,
+                        &val_accum,
+                        location,
+                    )?,
                 }
             }
             Section::LeanExeOptions(i, prefix) => {
                 insert_toml_lean_option_entry(
                     &mut pkg.exes[*i].lean_options,
                     prefix,
-                    key,
+                    raw_key,
                     &val_accum,
                 )?;
             }
@@ -2576,7 +3204,7 @@ pub fn parse_lakefile_toml(
                 match key {
                     "name" => ext.name = clean_lake_ident(&parse_toml_string(&val_accum)?),
                     "path" => {
-                        let p = pkg_root.join(parse_toml_string(&val_accum)?);
+                        let p = pkg_root.join(toml_path_field()?);
                         if p.is_file() {
                             if let Ok(b) = fs::read(&p) {
                                 ext.static_artifact_blake3 =
@@ -2585,7 +3213,11 @@ pub fn parse_lakefile_toml(
                             }
                         }
                     }
-                    _ => {}
+                    other => unsupported_lake_field(
+                        &mut pkg.unsupported,
+                        is_root_pkg,
+                        format!("Unsupported extern_lib field `{}` in {}", other, location()),
+                    )?,
                 }
             }
         }
@@ -3723,11 +4355,11 @@ fn resolve_lean_options_in(
     }
     parse_lean_options_expr(s)
 }
-fn parse_lean_path_literal(expr: &str) -> Result<PathBuf> {
+fn parse_lean_path_literal(field: &str, expr: &str) -> Result<PathBuf> {
     // Only a string literal: `FilePath.mk "..."` can be shadowed by the lakefile itself.
     let s = expr.trim();
     if s.starts_with('"') {
-        return Ok(PathBuf::from(plain_string_literal(s)?));
+        return lake_rel_path(field, &plain_string_literal(s)?);
     }
     anyhow::bail!(
         "Unsupported non-literal path expression `{}` in lakefile.lean",
@@ -3774,44 +4406,102 @@ pub fn parse_lakefile_lean(
             lean_path.display()
         );
     }
-    // 1. Fail-closed scan for dynamic metaprogramming or script hooks (root package only)
-    if is_root_pkg {
-        for (idx, line) in clean.lines().enumerate() {
-            let ln = idx + 1;
-            let t = line.trim();
-            if t.is_empty() {
+    // 1. Fail-closed scan for dynamic metaprogramming or script hooks. A dependency's
+    //    `post_update`/`script` hooks never run during a build, so they (and processes their
+    //    bodies spawn) only matter for the root; anything else marks the dependency unbuildable.
+    let mut pkg_unsupported: Option<String> = None;
+    let mut in_hook_body = false;
+    for (idx, line) in clean.lines().enumerate() {
+        let ln = idx + 1;
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let is_hook = |w: &str| matches!(w, "script " | "lean_script " | "post_update");
+        if !line.starts_with(char::is_whitespace) {
+            in_hook_body = ["script ", "lean_script ", "post_update"]
+                .iter()
+                .any(|h| t.starts_with(h));
+        }
+        for forbidden in [
+            "meta if ",
+            "meta if(",
+            "run_cmd",
+            "run_elab",
+            "run_meta",
+            "#eval",
+            "elab ",
+            "elab_rules",
+            "macro ",
+            "macro_rules",
+            "script ",
+            "lean_script ",
+            "post_update",
+            "input_file",
+            "input_dir",
+            "needs :=",
+            "IO.Process",
+            "System.Process",
+        ] {
+            // A dependency's `needs` is classified per target below.
+            let in_hook_ok = is_hook(forbidden)
+                || forbidden == "needs :="
+                || (in_hook_body && matches!(forbidden, "IO.Process" | "System.Process"));
+            if !is_root_pkg && in_hook_ok {
                 continue;
             }
-            for forbidden in [
-                "meta if ",
-                "meta if(",
-                "run_cmd",
-                "#eval",
-                "elab ",
-                "elab_rules",
-                "macro ",
-                "macro_rules",
-                "script ",
-                "lean_script ",
-                "post_update",
-                "input_file",
-                "input_dir",
-                "needs :=",
-                "dynlibs :=",
-                "plugins :=",
-                "IO.Process",
-                "System.Process",
-            ] {
-                if t.starts_with(forbidden) || t.contains(&format!(" {}", forbidden)) {
-                    let _ = c_abi::verify_static_lake_config(true, true, false, false);
-                    anyhow::bail!(
-                    "Unsupported dynamic Lake construct `{}` in {} at line {}: fail-closed static Lake config gate",
-                    forbidden.trim(),
-                    lean_path.display(),
-                    ln
-                );
-                }
+            if t.starts_with(forbidden) || t.contains(&format!(" {}", forbidden)) {
+                unsupported_lake_field(
+                    &mut pkg_unsupported,
+                    is_root_pkg,
+                    format!(
+                        "Unsupported dynamic Lake construct `{}` in {} at line {}",
+                        forbidden.trim(),
+                        lean_path.display(),
+                        ln
+                    ),
+                )?;
             }
+        }
+    }
+    // 2. Lean commands may share a line or start at any column, so a command hidden after a
+    //    declaration's keyword or inside a body the reader skips (helpers, hooks, `require`,
+    //    field values) would configure Lake behind the parser's back.
+    for (idx, (line, toks)) in clean.lines().zip(lean_tokens_by_line(&clean)).enumerate() {
+        let mut cmds = toks.iter().filter(|t| is_lean_command_token(t));
+        let hidden = if line.starts_with(char::is_whitespace) {
+            cmds.next()
+        } else {
+            // A column-0 line may start one command (after an attribute and modifiers); a
+            // command anywhere else on it (e.g. after a helper term's closing `]`) is hidden.
+            let lead = line.trim_start();
+            let lead = match lead.strip_prefix("@[") {
+                Some(rest) => rest.find(']').map_or("", |e| rest[e + 1..].trim_start()),
+                None => lead,
+            };
+            let lead_word = lead
+                .split_whitespace()
+                .find(|w| {
+                    !matches!(
+                        *w,
+                        "private" | "protected" | "noncomputable" | "partial" | "unsafe" | "nonrec"
+                    )
+                })
+                .unwrap_or("");
+            let first = cmds.next();
+            cmds.next().or(first.filter(|c| **c != lead_word))
+        };
+        if let Some(cmd) = hidden {
+            unsupported_lake_field(
+                &mut pkg_unsupported,
+                is_root_pkg,
+                format!(
+                    "Unsupported embedded command `{}` in {} at line {}",
+                    cmd,
+                    lean_path.display(),
+                    idx + 1
+                ),
+            )?;
         }
     }
     let mut pkg = PackageConfig {
@@ -3824,6 +4514,7 @@ pub fn parse_lakefile_lean(
         src_dir: PathBuf::from("."),
         build_dir: PathBuf::from(".lake/build"),
         lean_lib_dir: PathBuf::from("lib/lean"),
+        native_lib_dir: PathBuf::from("lib"),
         ir_dir: PathBuf::from("ir"),
         packages_dir: PathBuf::from(".lake/packages"),
         more_lean_args: Vec::new(),
@@ -3836,6 +4527,8 @@ pub fn parse_lakefile_lean(
         extern_libs: Vec::new(),
         custom_targets: Vec::new(),
         config_digest: String::new(),
+        unsupported: pkg_unsupported,
+        native_unsupported: None,
     };
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum DeclBlock {
@@ -3916,6 +4609,13 @@ pub fn parse_lakefile_lean(
         }
         if indent == 0 {
             block_keys.clear();
+            // A helper's term (e.g. Mathlib's `abbrev ... := #[` ... `]`) continues on a
+            // column-0 closing-bracket or `++` line; no command starts that way.
+            if current_block == DeclBlock::CustomDoBlock
+                && (trimmed.starts_with("++") || trimmed.starts_with([']', ')', '}', '⟩']))
+            {
+                continue;
+            }
             // `@[test_driver]` / `@[lint_driver]` mark a target like `@[default_target]` does,
             // without making it a default target.
             let (attr, is_default) = if trimmed.starts_with("@[default_target]") {
@@ -3963,15 +4663,21 @@ pub fn parse_lakefile_lean(
             DeclBlock::None | DeclBlock::Require | DeclBlock::CustomDoBlock => continue,
             DeclBlock::Package | DeclBlock::LeanLib(_) | DeclBlock::LeanExe(_) => {
                 let Some((k_raw, v_start)) = trimmed.split_once(":=") else {
-                    if is_root_pkg {
-                        let _ = c_abi::verify_static_lake_config(true, true, false, false);
-                        anyhow::bail!(
+                    let slot = match current_block {
+                        DeclBlock::LeanLib(idx) => &mut pkg.libs[idx].unsupported,
+                        DeclBlock::LeanExe(idx) => &mut pkg.exes[idx].unsupported,
+                        _ => &mut pkg.unsupported,
+                    };
+                    unsupported_lake_field(
+                        slot,
+                        is_root_pkg,
+                        format!(
                             "Unsupported statement `{}` inside declaration block in {} at line {}",
                             trimmed,
                             lean_path.display(),
                             line_no
-                        );
-                    }
+                        ),
+                    )?;
                     continue;
                 };
                 let key = k_raw.trim();
@@ -3979,7 +4685,6 @@ pub fn parse_lakefile_lean(
                 // options through the parent structure; never skip them silently.
                 if key.starts_with("to") && key[2..].starts_with(|c: char| c.is_ascii_uppercase())
                     || key.contains('.')
-                    || matches!(key, "dynlibs" | "plugins")
                 {
                     anyhow::bail!(
                         "Unsupported field `{}` in {} at line {}: fail-closed static Lake config gate",
@@ -4039,31 +4744,24 @@ pub fn parse_lakefile_lean(
                         line_no
                     );
                 }
+                let location = || format!("{} at line {}", lean_path.display(), line_no);
                 match current_block {
                     DeclBlock::Package => match key {
-                        "version"
-                        | "versionTags"
-                        | "description"
-                        | "keywords"
-                        | "homepage"
-                        | "license"
-                        | "licenseFiles"
-                        | "readmeFile"
-                        | "reservoir"
-                        | "testDriver"
-                        | "testDriverArgs"
-                        | "lintDriver"
-                        | "lintDriverArgs"
-                        | "releaseRepo"
-                        | "buildArchive"
-                        | "preferReleaseBuild"
-                        | "moreLinkArgs"
-                        | "moreGlobalServerArgs" => {}
-                        "srcDir" => pkg.src_dir = parse_lean_path_literal(&val_accum)?,
-                        "buildDir" => pkg.build_dir = parse_lean_path_literal(&val_accum)?,
-                        "leanLibDir" => pkg.lean_lib_dir = parse_lean_path_literal(&val_accum)?,
-                        "irDir" => pkg.ir_dir = parse_lean_path_literal(&val_accum)?,
-                        "packagesDir" => pkg.packages_dir = parse_lean_path_literal(&val_accum)?,
+                        "binDir" => {
+                            parse_lean_path_literal(key, &val_accum)?;
+                        }
+                        "nativeLibDir" => {
+                            pkg.native_lib_dir = parse_lean_path_literal(key, &val_accum)?
+                        }
+                        "srcDir" => pkg.src_dir = parse_lean_path_literal(key, &val_accum)?,
+                        "buildDir" => pkg.build_dir = parse_lean_path_literal(key, &val_accum)?,
+                        "leanLibDir" => {
+                            pkg.lean_lib_dir = parse_lean_path_literal(key, &val_accum)?
+                        }
+                        "irDir" => pkg.ir_dir = parse_lean_path_literal(key, &val_accum)?,
+                        "packagesDir" => {
+                            pkg.packages_dir = parse_lean_path_literal(key, &val_accum)?
+                        }
                         "defaultTargets" => {
                             pkg.default_targets = parse_lean_ident_array_expr(&val_accum)?;
                         }
@@ -4074,7 +4772,7 @@ pub fn parse_lakefile_lean(
                             pkg.weak_lean_args = parse_lean_string_array_expr(&val_accum)?;
                         }
                         "precompileModules" => {
-                            pkg.precompile_modules = parse_toml_bool(&val_accum)?;
+                            pkg.precompile_modules = lake_precompile(key, &val_accum, &location)?;
                         }
                         "leanOptions" => {
                             pkg.lean_options.extend(resolve_lean_options_expr(
@@ -4084,21 +4782,30 @@ pub fn parse_lakefile_lean(
                             )?);
                         }
                         other => {
-                            if is_root_pkg {
-                                let _ = c_abi::verify_static_lake_config(true, true, false, false);
-                                anyhow::bail!(
-                                    "Unsupported package field `{}` in {} at line {}: fail-closed static Lake config gate",
-                                    other,
-                                    lean_path.display(),
-                                    line_no
-                                );
+                            if let Some(nwhy) = classify_native_unsupported_field(
+                                LakeScope::Package,
+                                other,
+                                &val_accum,
+                                &location,
+                            ) {
+                                pkg.native_unsupported.get_or_insert(nwhy);
                             }
+                            check_lake_field(
+                                &mut pkg.unsupported,
+                                is_root_pkg,
+                                LakeScope::Package,
+                                other,
+                                &val_accum,
+                                location,
+                            )?;
                         }
                     },
                     DeclBlock::LeanLib(lib_idx) => {
                         let lib = &mut pkg.libs[lib_idx];
                         match key {
-                            "srcDir" => lib.src_dir = Some(parse_lean_path_literal(&val_accum)?),
+                            "srcDir" => {
+                                lib.src_dir = Some(parse_lean_path_literal(key, &val_accum)?)
+                            }
                             "roots" => {
                                 lib.roots = parse_lean_ident_array_expr(&val_accum)?;
                                 if lib.roots.is_empty() {
@@ -4115,7 +4822,11 @@ pub fn parse_lakefile_lean(
                                 lib.weak_lean_args = parse_lean_string_array_expr(&val_accum)?;
                             }
                             "precompileModules" => {
-                                lib.precompile_modules = Some(parse_toml_bool(&val_accum)?);
+                                lib.precompile_modules =
+                                    Some(lake_precompile(key, &val_accum, &location)?);
+                            }
+                            "precompileLibrary" => {
+                                lake_precompile(key, &val_accum, &location)?;
                             }
                             "leanOptions" => {
                                 lib.lean_options.extend(resolve_lean_options_expr(
@@ -4136,42 +4847,54 @@ pub fn parse_lakefile_lean(
                                             | "c"
                                             | "static"
                                             | "LeanLib.staticFacet"
+                                            | "shared"
+                                            | "LeanLib.sharedFacet"
                                             | "default"
                                             | "modules"
-                                    ) && is_root_pkg
-                                    {
+                                    ) {
                                         let _ = c_abi::verify_static_lake_config(
                                             true, false, false, true,
                                         );
-                                        anyhow::bail!(
-                                            "Unsupported defaultFacet `{}` on library `{}` in {}",
-                                            f,
-                                            lib.name,
-                                            lean_path.display()
-                                        );
+                                        unsupported_lake_field(
+                                            &mut lib.unsupported,
+                                            is_root_pkg,
+                                            format!(
+                                                "Unsupported defaultFacet `{}` on library `{}` in {}",
+                                                f,
+                                                lib.name,
+                                                lean_path.display()
+                                            ),
+                                        )?;
                                     }
                                 }
                                 lib.default_facets = facets;
                             }
-                            "libName" | "moreLinkArgs" => {}
                             other => {
-                                if is_root_pkg {
-                                    let _ =
-                                        c_abi::verify_static_lake_config(true, true, false, false);
-                                    anyhow::bail!(
-                                        "Unsupported `lean_lib` field `{}` in {} at line {}: fail-closed static Lake config gate",
-                                        other,
-                                        lean_path.display(),
-                                        line_no
-                                    );
+                                if let Some(nwhy) = classify_native_unsupported_field(
+                                    LakeScope::Lib,
+                                    other,
+                                    &val_accum,
+                                    &location,
+                                ) {
+                                    lib.native_unsupported.get_or_insert(nwhy);
                                 }
+                                check_lake_field(
+                                    &mut lib.unsupported,
+                                    is_root_pkg,
+                                    LakeScope::Lib,
+                                    other,
+                                    &val_accum,
+                                    location,
+                                )?;
                             }
                         }
                     }
                     DeclBlock::LeanExe(exe_idx) => {
                         let exe = &mut pkg.exes[exe_idx];
                         match key {
-                            "srcDir" => exe.src_dir = Some(parse_lean_path_literal(&val_accum)?),
+                            "srcDir" => {
+                                exe.src_dir = Some(parse_lean_path_literal(key, &val_accum)?)
+                            }
                             "root" => exe.root = lake_name_literal(&val_accum, "root")?,
                             "supportInterpreter" => {
                                 exe.support_interpreter = parse_toml_bool(&val_accum)?;
@@ -4189,19 +4912,14 @@ pub fn parse_lakefile_lean(
                                     line_no,
                                 )?);
                             }
-                            "exeName" | "moreLinkArgs" | "moreLinkObjs" | "moreLinkLibs" => {}
-                            other => {
-                                if is_root_pkg {
-                                    let _ =
-                                        c_abi::verify_static_lake_config(true, true, false, false);
-                                    anyhow::bail!(
-                                        "Unsupported `lean_exe` field `{}` in {} at line {}: fail-closed static Lake config gate",
-                                        other,
-                                        lean_path.display(),
-                                        line_no
-                                    );
-                                }
-                            }
+                            other => check_lake_field(
+                                &mut exe.unsupported,
+                                is_root_pkg,
+                                LakeScope::Exe,
+                                other,
+                                &val_accum,
+                                location,
+                            )?,
                         }
                     }
                     _ => {}
@@ -4229,7 +4947,25 @@ where
 {
     let is_def = *pending_default_target;
     *pending_default_target = false;
-    if trimmed.starts_with("import ") || trimmed.starts_with("open ") {
+    if let Some(mods) = trimmed.strip_prefix("import ") {
+        // Another import could bring syntax or elaborators that change what the declarations
+        // read here mean to Lake.
+        if mods.split_whitespace().any(|m| m != "Lake") {
+            unsupported_lake_field(
+                &mut pkg.unsupported,
+                is_root_pkg,
+                format!(
+                    "Unsupported lakefile import `{}` in {} at line {}",
+                    trimmed,
+                    lean_path.display(),
+                    line_no
+                ),
+            )?;
+        }
+        *current_block = T::none();
+        return Ok(());
+    }
+    if trimmed.starts_with("open ") {
         *current_block = T::none();
         return Ok(());
     }
@@ -4295,6 +5031,8 @@ where
             precompile_modules: None,
             default_facets: Vec::new(),
             is_default_target: is_def,
+            unsupported: None,
+            native_unsupported: None,
         });
         *current_block = T::lean_lib(idx);
         return Ok(());
@@ -4312,6 +5050,7 @@ where
             weak_lean_args: Vec::new(),
             lean_options: BTreeMap::new(),
             is_default_target: is_def,
+            unsupported: None,
         });
         *current_block = T::lean_exe(idx);
         return Ok(());
@@ -4339,7 +5078,23 @@ where
         *current_block = T::custom_do();
         return Ok(());
     }
-    if is_root_pkg {
+    // A dependency may define helpers (only literal field values are read, so a helper cannot
+    // reach the config) and update/script hooks; any other command could change what Lake builds.
+    let inert_dep_decl = ["abbrev ", "def ", "nonrec def ", "post_update ", "script "]
+        .iter()
+        .any(|kw| trimmed.starts_with(kw));
+    if !inert_dep_decl {
+        unsupported_lake_field(
+            &mut pkg.unsupported,
+            is_root_pkg,
+            format!(
+                "Unsupported top-level declaration `{}` in {} at line {}",
+                trimmed,
+                lean_path.display(),
+                line_no
+            ),
+        )?;
+    } else if is_root_pkg {
         let _ = c_abi::verify_static_lake_config(true, true, false, false);
         anyhow::bail!(
             "Unsupported top-level declaration `{}` in {} at line {}: fail-closed static Lake config gate",
@@ -4779,17 +5534,39 @@ fn finalize_package_config(
 
 /// Resolve a single package's static configuration (`lakefile.toml` or `lakefile.lean`).
 pub fn resolve_package_config(pkg_root: &Path, is_root_pkg: bool) -> Result<PackageConfig> {
-    let toml_path = pkg_root.join("lakefile.toml");
-    let lean_path = pkg_root.join("lakefile.lean");
-    if toml_path.is_file() {
-        return parse_lakefile_toml(pkg_root, &toml_path, is_root_pkg);
+    resolve_package_config_file(pkg_root, is_root_pkg, None)
+}
+/// The configuration file Lake loads for a package: `config_file` (a manifest `configFile`,
+/// default `lakefile`) as given if it has an extension, else its `.lean` before its `.toml`.
+fn package_config_path(pkg_root: &Path, config_file: Option<&str>) -> Result<Option<PathBuf>> {
+    let rel = lake_rel_path("configFile", config_file.unwrap_or("lakefile"))?;
+    if rel.extension().is_some() {
+        return Ok(Some(pkg_root.join(rel)).filter(|p| p.is_file()));
     }
-    if lean_path.is_file() {
-        return parse_lakefile_lean(pkg_root, &lean_path, is_root_pkg);
+    Ok(["lean", "toml"]
+        .iter()
+        .map(|ext| pkg_root.join(&rel).with_extension(ext))
+        .find(|p| p.is_file()))
+}
+fn resolve_package_config_file(
+    pkg_root: &Path,
+    is_root_pkg: bool,
+    config_file: Option<&str>,
+) -> Result<PackageConfig> {
+    let path = package_config_path(pkg_root, config_file)?;
+    match path
+        .as_ref()
+        .and_then(|p| p.extension())
+        .and_then(|e| e.to_str())
+    {
+        Some("lean") => return parse_lakefile_lean(pkg_root, path.as_ref().unwrap(), is_root_pkg),
+        Some("toml") => return parse_lakefile_toml(pkg_root, path.as_ref().unwrap(), is_root_pkg),
+        _ => {}
     }
     let _ = c_abi::verify_static_lake_config(false, false, false, false);
     anyhow::bail!(
-        "No static Lake configuration (`lakefile.toml` or `lakefile.lean`) found in {}: fail-closed static Lake config gate",
+        "No static Lake configuration (`{}.lean` or `.toml`) found in {}: fail-closed static Lake config gate",
+        config_file.unwrap_or("lakefile"),
         pkg_root.display()
     )
 }
@@ -4831,13 +5608,13 @@ pub fn resolve_project_config_with_trust(
         };
     let root_pkg = resolve_package_config(&canon_dir, true)?;
     let (manifest_pkgs_dir, manifest_packages, manifest_hash_opt) =
-        parse_lake_manifest(&canon_dir)?;
-    let mut dep_dirs: Vec<PathBuf> = Vec::new();
+        parse_lake_manifest(&canon_dir, is_untrusted)?;
+    let mut dep_dirs: Vec<(PathBuf, Option<&str>)> = Vec::new();
     let mut seen_dep_dirs: HashSet<PathBuf> = HashSet::new();
     for mp in &manifest_packages {
         let d = mp.dir.canonicalize().unwrap_or_else(|_| mp.dir.clone());
         if d.is_dir() && seen_dep_dirs.insert(d.clone()) {
-            dep_dirs.push(d);
+            dep_dirs.push((d, mp.config_file.as_deref()));
         }
     }
     if manifest_hash_opt.is_none() {
@@ -4853,17 +5630,52 @@ pub fn resolve_project_config_with_trust(
                 for p in extra {
                     let d = p.canonicalize().unwrap_or(p);
                     if seen_dep_dirs.insert(d.clone()) {
-                        dep_dirs.push(d);
+                        dep_dirs.push((d, None));
                     }
                 }
             }
         }
     }
     let mut dep_pkgs = Vec::new();
-    for dep_dir in dep_dirs {
-        if dep_dir.join("lakefile.toml").is_file() || dep_dir.join("lakefile.lean").is_file() {
-            let dep_cfg = resolve_package_config(&dep_dir, false)?;
+    // An untrusted workspace must not adopt (and later publish into) a package elsewhere on
+    // the host, whether through the manifest or a symlink.
+    let package_roots = untrusted_package_roots(&canon_dir);
+    for (dep_dir, config_file) in dep_dirs {
+        if is_untrusted && !package_roots.iter().any(|r| dep_dir.starts_with(r)) {
+            anyhow::bail!(
+                "Dependency package `{}` resolves outside the workspace `{}`: fail-closed build path gate",
+                dep_dir.display(),
+                canon_dir.display()
+            );
+        }
+        if package_config_path(&dep_dir, config_file)?.is_some() {
+            let dep_cfg = resolve_package_config_file(&dep_dir, false, config_file)?;
             dep_pkgs.push(dep_cfg);
+        }
+    }
+    if is_untrusted {
+        for pkg in std::iter::once(&root_pkg).chain(dep_pkgs.iter()) {
+            let pkg_has_precompile = pkg.precompile_modules
+                || pkg.libs.iter().any(|l| l.precompile_modules == Some(true));
+            if !c_abi::verify_static_lake_config(true, pkg_has_precompile, false, false) {
+                anyhow::bail!(
+                    "Untrusted verification rejects `precompileModules = true` in package `{}`: native code execution and dlopen plugins are forbidden in untrusted mode: fail-closed static Lake config gate",
+                    pkg.name
+                );
+            }
+            for lib in &pkg.libs {
+                for f in &lib.default_facets {
+                    if matches!(f.as_str(), "shared" | "LeanLib.sharedFacet") {
+                        let _ = c_abi::verify_static_lake_config(true, false, false, true);
+                        anyhow::bail!(
+                            "Untrusted verification rejects native `defaultFacets` entry `{}` on library `{}` in `{}`: fail-closed static Lake config gate",
+                            f,
+                            lib.name,
+                            pkg.name
+                        );
+                    }
+                }
+            }
         }
     }
     let mut ch = blake3::Hasher::new();
@@ -4921,14 +5733,19 @@ pub(crate) struct DiscoveredModuleSpec {
     src_root: PathBuf,
     pub(crate) src_path: PathBuf,
     build_lib_lean_dir: PathBuf,
+    build_native_lib_dir: PathBuf,
     build_ir_dir: PathBuf,
     precompile_modules: bool,
+    emit_c_default: bool,
     is_exe_target: bool,
     lean_options: LeanOptionsMap,
     strong_args: Vec<String>,
     weak_args: Vec<String>,
     extern_lib_digests: Vec<String>,
     pub(crate) pkg_config_digest: String,
+    /// Set when turbo-lean cannot build the module like Lake (`PackageConfig::unsupported`).
+    unsupported: Option<String>,
+    native_unsupported: Option<String>,
 }
 fn compose_effective_args(
     pkg: &PackageConfig,
@@ -5061,6 +5878,7 @@ pub(crate) fn resolve_module_in_package(
     let pkg_src_base = pkg.pkg_root.join(&pkg.src_dir);
     let build_base = pkg.pkg_root.join(&pkg.build_dir);
     let build_lib_lean_dir = build_base.join(&pkg.lean_lib_dir);
+    let build_native_lib_dir = build_base.join(&pkg.native_lib_dir);
     let build_ir_dir = build_base.join(&pkg.ir_dir);
     let extern_digests: Vec<String> = pkg
         .extern_libs
@@ -5097,14 +5915,18 @@ pub(crate) fn resolve_module_in_package(
                     src_root: exe_src,
                     src_path: cand,
                     build_lib_lean_dir,
+                    build_native_lib_dir,
                     build_ir_dir,
                     precompile_modules: pkg.precompile_modules,
+                    emit_c_default: pkg.precompile_modules,
                     is_exe_target: true,
                     lean_options,
                     strong_args,
                     weak_args,
                     extern_lib_digests: extern_digests,
                     pkg_config_digest: pkg.config_digest.clone(),
+                    unsupported: pkg.unsupported.clone().or_else(|| exe.unsupported.clone()),
+                    native_unsupported: pkg.native_unsupported.clone(),
                 });
             }
         }
@@ -5140,12 +5962,17 @@ pub(crate) fn resolve_module_in_package(
                     &lib.more_lean_args,
                     &lib.weak_lean_args,
                 );
-                let precompile = (pkg.precompile_modules
-                    || lib.precompile_modules.unwrap_or(false))
-                    || lib
-                        .default_facets
-                        .iter()
-                        .any(|f| f == "c" || f == "static" || f == "LeanLib.staticFacet");
+                let precompile = pkg.precompile_modules || lib.precompile_modules.unwrap_or(false);
+                let emit_c_default = precompile
+                    || lib.default_facets.iter().any(|f| {
+                        matches!(
+                            f.as_str(),
+                            "c" | "static"
+                                | "LeanLib.staticFacet"
+                                | "shared"
+                                | "LeanLib.sharedFacet"
+                        )
+                    });
                 return Some(DiscoveredModuleSpec {
                     module_name: mod_name.to_string(),
                     pkg_name: pkg.name.clone(),
@@ -5155,14 +5982,21 @@ pub(crate) fn resolve_module_in_package(
                     src_root: lib_src,
                     src_path: cand,
                     build_lib_lean_dir,
+                    build_native_lib_dir,
                     build_ir_dir,
                     precompile_modules: precompile,
+                    emit_c_default,
                     is_exe_target: false,
                     lean_options,
                     strong_args,
                     weak_args,
                     extern_lib_digests: extern_digests,
                     pkg_config_digest: pkg.config_digest.clone(),
+                    unsupported: pkg.unsupported.clone().or_else(|| lib.unsupported.clone()),
+                    native_unsupported: pkg
+                        .native_unsupported
+                        .clone()
+                        .or_else(|| lib.native_unsupported.clone()),
                 });
             }
         }
@@ -5181,14 +6015,18 @@ pub(crate) fn resolve_module_in_package(
             src_root: pkg_src_base,
             src_path: cand,
             build_lib_lean_dir,
+            build_native_lib_dir,
             build_ir_dir,
             precompile_modules: pkg.precompile_modules,
+            emit_c_default: pkg.precompile_modules,
             is_exe_target: false,
             lean_options,
             strong_args,
             weak_args,
             extern_lib_digests: extern_digests,
             pkg_config_digest: pkg.config_digest.clone(),
+            unsupported: pkg.unsupported.clone(),
+            native_unsupported: pkg.native_unsupported.clone(),
         });
     }
     None
@@ -5422,7 +6260,7 @@ fn is_dep_olean_fresh(
         &rel_slash,
         src_content,
         is_module,
-        spec.precompile_modules || spec.is_exe_target,
+        spec.emit_c_default || spec.is_exe_target,
     )
     .is_err()
     {
@@ -5440,7 +6278,11 @@ fn is_dep_olean_fresh(
 fn collect_fresh_dep_pkg_closure(
     cfg: &ProjectConfig,
     initial_spec: &DiscoveredModuleSpec,
+    importer_needs_import_dynlibs: bool,
 ) -> Result<Option<Vec<(String, PathBuf)>>> {
+    if initial_spec.precompile_modules || importer_needs_import_dynlibs {
+        return Ok(None);
+    }
     let mut visited: HashSet<(String, String)> = HashSet::new();
     let mut queue: VecDeque<(DiscoveredModuleSpec, Option<std::time::SystemTime>)> =
         VecDeque::new();
@@ -5488,6 +6330,9 @@ fn collect_fresh_dep_pkg_closure(
                 );
             }
             if let Some(sub_spec) = matches.into_iter().next() {
+                if sub_spec.precompile_modules {
+                    return Ok(None);
+                }
                 let key = (sub_spec.pkg_name.clone(), sub_spec.module_name.clone());
                 if visited.insert(key) {
                     queue.push_back((sub_spec, Some(cur_olean_mtime)));
@@ -5508,6 +6353,126 @@ fn collect_fresh_dep_pkg_closure(
     Ok(Some(olean_pairs))
 }
 
+pub fn lean_string_mangle(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for ch in s.chars() {
+        let code = ch as u32;
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+        } else if ch == '_' {
+            out.push_str("__");
+        } else if code < 0x100 {
+            out.push_str(&format!("_x{:02x}", code));
+        } else if code < 0x10000 {
+            out.push_str(&format!("_u{:04x}", code));
+        } else {
+            out.push_str(&format!("_U{:08x}", code));
+        }
+    }
+    out
+}
+
+fn check_lower_hex_prefix(s: &str, n: usize) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() >= n
+        && bytes[..n]
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+}
+
+fn lean_check_disambiguation(mangled: &str) -> bool {
+    let rest = mangled.trim_start_matches('_');
+    match rest.as_bytes().first().copied() {
+        None => true,
+        Some(b'x') => check_lower_hex_prefix(&rest[1..], 2),
+        Some(b'u') => check_lower_hex_prefix(&rest[1..], 4),
+        Some(b'U') => check_lower_hex_prefix(&rest[1..], 8),
+        Some(b) => b.is_ascii_digit(),
+    }
+}
+
+pub fn lean_name_mangle(name: &LeanName, pre: &str) -> String {
+    let mut out = String::from(pre);
+    let mut prev_part: Option<&LeanNamePart> = None;
+    for part in &name.0 {
+        match part {
+            LeanNamePart::Str(s) => {
+                let m = lean_string_mangle(s);
+                match prev_part {
+                    None => {
+                        if lean_check_disambiguation(&m) {
+                            out.push_str("00");
+                        }
+                        out.push_str(&m);
+                    }
+                    Some(prev) => {
+                        let prev_ends_underscore =
+                            matches!(prev, LeanNamePart::Str(ps) if ps.ends_with('_'));
+                        if prev_ends_underscore || lean_check_disambiguation(&m) {
+                            out.push_str("_00");
+                        } else {
+                            out.push('_');
+                        }
+                        out.push_str(&m);
+                    }
+                }
+            }
+            LeanNamePart::Num(n) => {
+                if prev_part.is_some() {
+                    out.push('_');
+                }
+                out.push_str(&n.to_string());
+                out.push('_');
+            }
+        }
+        prev_part = Some(part);
+    }
+    out
+}
+
+pub fn lean_mk_module_initialization_stem(mod_or_lib_name: &str, pkg_name: Option<&str>) -> String {
+    let parsed = LeanName::from_str_to_name(mod_or_lib_name).unwrap_or_else(|_| {
+        LeanName(
+            mod_or_lib_name
+                .split('.')
+                .filter(|p| !p.is_empty())
+                .map(|p| LeanNamePart::Str(clean_lake_ident(p)))
+                .collect(),
+        )
+    });
+    let pre = match pkg_name {
+        Some(pkg) if !pkg.is_empty() => format!("{}_", lean_string_mangle(pkg)),
+        _ => String::new(),
+    };
+    lean_name_mangle(&parsed, &pre)
+}
+
+fn expand_lib_configured_modules(
+    pkg: &PackageConfig,
+    lib: &LeanLibConfig,
+) -> Result<Vec<(String, PathBuf)>> {
+    let pkg_src_base = pkg.pkg_root.join(&pkg.src_dir);
+    let lib_src = match &lib.src_dir {
+        Some(sd) => pkg_src_base.join(sd),
+        None => pkg_src_base,
+    };
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    let globs_cow: Vec<GlobSpec> = if lib.globs.is_empty() {
+        lib.roots.iter().cloned().map(GlobSpec::One).collect()
+    } else {
+        lib.globs.clone()
+    };
+    for g in &globs_cow {
+        for (m_name, m_path) in expand_glob_in_dir(&lib_src, g, true)? {
+            if seen.insert(m_name.clone()) {
+                out.push((m_name, m_path));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Build the deterministic module dependency DAG for `cfg` and requested `targets` (trusted mode).
 pub fn build_module_dag(cfg: &ProjectConfig, targets: &[String]) -> Result<ModuleDag> {
     build_module_dag_with_trust(cfg, targets, false)
@@ -5524,6 +6489,9 @@ pub fn build_module_dag_with_trust(
 ) -> Result<ModuleDag> {
     let root_pkg = &cfg.root_pkg;
     let mut initial_specs: Vec<(DiscoveredModuleSpec, bool)> = Vec::new();
+    let mut requested_shared_libs: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut explicit_co_export_mods: HashSet<String> = HashSet::new();
+    let mut explicit_dynlib_mods: HashSet<String> = HashSet::new();
     let global_emit_c = ["TURBO_LEAN_EMIT_C", "TURBO_LEAN_LAKE_COMPAT"]
         .into_iter()
         .any(|k| {
@@ -5561,11 +6529,52 @@ pub fn build_module_dag_with_trust(
             None => (t, None),
         };
         let mut force_c_for_target = global_emit_c;
+        let mut force_co_export_for_target = false;
+        let mut force_dynlib_for_target = false;
+        let mut force_shared_for_target = false;
         if let Some(facet) = facet_opt {
             match facet {
                 "olean" | "ilean" | "lib" | "modules" | "default" | "leanArts" => {}
-                "c" | "static" => {
+                "c" | "static" | "LeanLib.staticFacet" => {
                     force_c_for_target = true;
+                }
+                "o.export" | "c.o.export" => {
+                    if is_untrusted {
+                        let _ = c_abi::verify_static_lake_config(true, false, false, true);
+                        anyhow::bail!(
+                            "Unsupported target facet `:{}` in untrusted target `{}`: fail-closed static Lake config gate",
+                            facet,
+                            raw_target
+                        );
+                    }
+                    force_c_for_target = true;
+                    force_co_export_for_target = true;
+                }
+                "dynlib" => {
+                    if is_untrusted {
+                        let _ = c_abi::verify_static_lake_config(true, false, false, true);
+                        anyhow::bail!(
+                            "Unsupported target facet `:{}` in untrusted target `{}`: fail-closed static Lake config gate",
+                            facet,
+                            raw_target
+                        );
+                    }
+                    force_c_for_target = true;
+                    force_co_export_for_target = true;
+                    force_dynlib_for_target = true;
+                }
+                "shared" | "LeanLib.sharedFacet" => {
+                    if is_untrusted {
+                        let _ = c_abi::verify_static_lake_config(true, false, false, true);
+                        anyhow::bail!(
+                            "Unsupported target facet `:{}` in untrusted target `{}`: fail-closed static Lake config gate",
+                            facet,
+                            raw_target
+                        );
+                    }
+                    force_c_for_target = true;
+                    force_co_export_for_target = true;
+                    force_shared_for_target = true;
                 }
                 other => {
                     let _ = c_abi::verify_static_lake_config(true, false, false, true);
@@ -5618,6 +6627,7 @@ pub fn build_module_dag_with_trust(
                 };
                 let build_base = target_pkg.pkg_root.join(&target_pkg.build_dir);
                 let build_lib_lean_dir = build_base.join(&target_pkg.lean_lib_dir);
+                let build_native_lib_dir = build_base.join(&target_pkg.native_lib_dir);
                 let build_ir_dir = build_base.join(&target_pkg.ir_dir);
                 let (lean_options, strong_args, weak_args) = compose_effective_args(
                     target_pkg,
@@ -5625,12 +6635,23 @@ pub fn build_module_dag_with_trust(
                     &lib.more_lean_args,
                     &lib.weak_lean_args,
                 );
-                let precompile = (target_pkg.precompile_modules
-                    || lib.precompile_modules.unwrap_or(false))
+                let precompile =
+                    target_pkg.precompile_modules || lib.precompile_modules.unwrap_or(false);
+                let lib_shared_default = lib
+                    .default_facets
+                    .iter()
+                    .any(|f| matches!(f.as_str(), "shared" | "LeanLib.sharedFacet"));
+                let emit_c_default = precompile
+                    || lib_shared_default
                     || lib
                         .default_facets
                         .iter()
-                        .any(|f| f == "c" || f == "static" || f == "LeanLib.staticFacet");
+                        .any(|f| matches!(f.as_str(), "c" | "static" | "LeanLib.staticFacet"));
+                if force_shared_for_target
+                    || (facet_opt.is_none() && (precompile || lib_shared_default))
+                {
+                    requested_shared_libs.insert((target_pkg.name.clone(), lib.name.clone()));
+                }
                 let extern_digests: Vec<String> = target_pkg
                     .extern_libs
                     .iter()
@@ -5640,31 +6661,44 @@ pub fn build_module_dag_with_trust(
                             .map(|h| format!("{}:{}", e.name, h))
                     })
                     .collect();
-                for g in &lib.globs {
-                    let expanded = expand_glob_in_dir(&lib_src, g, true)?;
-                    for (m_name, m_path) in expanded {
-                        initial_specs.push((
-                            DiscoveredModuleSpec {
-                                module_name: m_name,
-                                pkg_name: target_pkg.name.clone(),
-                                target_name: lib.name.clone(),
-                                is_root_pkg: target_is_root,
-                                pkg_root: target_pkg.pkg_root.clone(),
-                                src_root: lib_src.clone(),
-                                src_path: m_path,
-                                build_lib_lean_dir: build_lib_lean_dir.clone(),
-                                build_ir_dir: build_ir_dir.clone(),
-                                precompile_modules: precompile,
-                                is_exe_target: false,
-                                lean_options: lean_options.clone(),
-                                strong_args: strong_args.clone(),
-                                weak_args: weak_args.clone(),
-                                extern_lib_digests: extern_digests.clone(),
-                                pkg_config_digest: target_pkg.config_digest.clone(),
-                            },
-                            force_c_for_target || precompile,
-                        ));
+                for (m_name, m_path) in expand_lib_configured_modules(target_pkg, lib)? {
+                    if force_co_export_for_target {
+                        explicit_co_export_mods.insert(m_name.clone());
                     }
+                    if force_dynlib_for_target {
+                        explicit_dynlib_mods.insert(m_name.clone());
+                    }
+                    initial_specs.push((
+                        DiscoveredModuleSpec {
+                            module_name: m_name,
+                            pkg_name: target_pkg.name.clone(),
+                            target_name: lib.name.clone(),
+                            is_root_pkg: target_is_root,
+                            pkg_root: target_pkg.pkg_root.clone(),
+                            src_root: lib_src.clone(),
+                            src_path: m_path,
+                            build_lib_lean_dir: build_lib_lean_dir.clone(),
+                            build_native_lib_dir: build_native_lib_dir.clone(),
+                            build_ir_dir: build_ir_dir.clone(),
+                            precompile_modules: precompile,
+                            emit_c_default,
+                            is_exe_target: false,
+                            lean_options: lean_options.clone(),
+                            strong_args: strong_args.clone(),
+                            weak_args: weak_args.clone(),
+                            extern_lib_digests: extern_digests.clone(),
+                            pkg_config_digest: target_pkg.config_digest.clone(),
+                            unsupported: target_pkg
+                                .unsupported
+                                .clone()
+                                .or_else(|| lib.unsupported.clone()),
+                            native_unsupported: target_pkg
+                                .native_unsupported
+                                .clone()
+                                .or_else(|| lib.native_unsupported.clone()),
+                        },
+                        force_c_for_target || emit_c_default,
+                    ));
                 }
             }
         }
@@ -5677,8 +6711,13 @@ pub fn build_module_dag_with_trust(
                     // Note: `turbo-lean build` is a module builder; when a `lean_exe` is in defaultTargets
                     // (not explicitly requested by name), we compile its root module and dependencies
                     // and emit `.c` if `targets` explicitly requested the exe or `force_c_for_target`.
-                    let emit_c =
-                        force_c_for_target || !targets.is_empty() || spec.precompile_modules;
+                    if force_co_export_for_target {
+                        explicit_co_export_mods.insert(spec.module_name.clone());
+                    }
+                    if force_dynlib_for_target {
+                        explicit_dynlib_mods.insert(spec.module_name.clone());
+                    }
+                    let emit_c = force_c_for_target || !targets.is_empty() || spec.emit_c_default;
                     initial_specs.push((spec, emit_c));
                 } else {
                     anyhow::bail!(
@@ -5693,7 +6732,16 @@ pub fn build_module_dag_with_trust(
         // 3. Match against a specific module name (e.g. `TurboLean.Spec`)
         if !matched {
             if let Some(spec) = resolve_module_in_package(target_pkg, target_is_root, &item_name) {
-                let emit_c = force_c_for_target || spec.precompile_modules || spec.is_exe_target;
+                if force_co_export_for_target {
+                    explicit_co_export_mods.insert(spec.module_name.clone());
+                }
+                if force_dynlib_for_target {
+                    explicit_dynlib_mods.insert(spec.module_name.clone());
+                }
+                if force_shared_for_target && !spec.is_exe_target {
+                    requested_shared_libs.insert((spec.pkg_name.clone(), spec.target_name.clone()));
+                }
+                let emit_c = force_c_for_target || spec.emit_c_default || spec.is_exe_target;
                 initial_specs.push((spec, emit_c));
                 matched = true;
             }
@@ -5733,14 +6781,18 @@ pub fn build_module_dag_with_trust(
                             src_root: src_root.clone(),
                             src_path: f,
                             build_lib_lean_dir: build_base.join(&root_pkg.lean_lib_dir),
+                            build_native_lib_dir: build_base.join(&root_pkg.native_lib_dir),
                             build_ir_dir: build_base.join(&root_pkg.ir_dir),
                             precompile_modules: root_pkg.precompile_modules,
+                            emit_c_default: root_pkg.precompile_modules,
                             is_exe_target: false,
                             lean_options: lean_options.clone(),
                             strong_args: strong_args.clone(),
                             weak_args: weak_args.clone(),
                             extern_lib_digests: Vec::new(),
                             pkg_config_digest: root_pkg.config_digest.clone(),
+                            unsupported: root_pkg.unsupported.clone(),
+                            native_unsupported: root_pkg.native_unsupported.clone(),
                         },
                         global_emit_c || root_pkg.precompile_modules,
                     ));
@@ -5769,10 +6821,53 @@ pub fn build_module_dag_with_trust(
         worklist.push_back((spec, need_c));
     }
     root_modules.sort();
-    while let Some((spec, requested_c)) = worklist.pop_front() {
-        if let Some(existing) = nodes.get_mut(&spec.module_name) {
-            if existing.pkg_name != spec.pkg_name || existing.src_path != spec.src_path {
-                anyhow::bail!(
+    let mut expanded_shared_libs: HashSet<(String, String)> = HashSet::new();
+    let enqueue_shared_lib_mods = |pkg_name: &str,
+                                   lib_name: &str,
+                                   is_root: bool,
+                                   expanded: &mut HashSet<(String, String)>,
+                                   req_shared: &mut BTreeSet<(String, String)>,
+                                   wl: &mut VecDeque<(DiscoveredModuleSpec, bool)>|
+     -> Result<()> {
+        let key = (pkg_name.to_string(), lib_name.to_string());
+        req_shared.insert(key.clone());
+        if !expanded.insert(key) {
+            return Ok(());
+        }
+        let Some(pkg) = cfg
+            .dep_pkgs
+            .iter()
+            .chain(std::iter::once(&cfg.root_pkg))
+            .find(|p| p.name == pkg_name)
+        else {
+            return Ok(());
+        };
+        let Some(lib) = pkg.libs.iter().find(|l| l.name == lib_name) else {
+            return Ok(());
+        };
+        for (m_name, _) in expand_lib_configured_modules(pkg, lib)? {
+            if let Some(lspec) = resolve_module_in_package(pkg, is_root, &m_name) {
+                wl.push_back((lspec, true));
+            }
+        }
+        Ok(())
+    };
+    for (pkg_name, lib_name) in requested_shared_libs.clone() {
+        let is_root = pkg_name == root_pkg.name;
+        enqueue_shared_lib_mods(
+            &pkg_name,
+            &lib_name,
+            is_root,
+            &mut expanded_shared_libs,
+            &mut requested_shared_libs,
+            &mut worklist,
+        )?;
+    }
+    loop {
+        while let Some((spec, requested_c)) = worklist.pop_front() {
+            if let Some(existing) = nodes.get_mut(&spec.module_name) {
+                if existing.pkg_name != spec.pkg_name || existing.src_path != spec.src_path {
+                    anyhow::bail!(
                     "Ambiguous module `{}` resolved in multiple packages or paths (`{}` at {} vs `{}` at {})",
                     spec.module_name,
                     existing.pkg_name,
@@ -5780,153 +6875,408 @@ pub fn build_module_dag_with_trust(
                     spec.pkg_name,
                     spec.src_path.display()
                 );
-            }
-            if requested_c && !existing.needs_c {
-                existing.needs_c = true;
-            }
-            continue;
-        }
-        let src = fs::read_to_string(&spec.src_path).with_context(|| {
-            format!(
-                "Failed to read module `{}` at {}",
-                spec.module_name,
-                spec.src_path.display()
-            )
-        })?;
-        let src_blake3 = blake3::hash(src.as_bytes()).to_hex().to_string();
-        let header = parse_header_info(&src);
-        if let Some(ref herr) = header.header_error {
-            anyhow::bail!(
-                "Invalid module header in `{}` ({}): {}",
-                spec.module_name,
-                spec.src_path.display(),
-                herr
-            );
-        }
-        let needs_c =
-            requested_c || spec.precompile_modules || header.has_c_export || global_emit_c;
-        let mut direct_dag_deps = Vec::new();
-        let mut external_olean_deps = Vec::new();
-        for imp in &header.imports {
-            if imp == &spec.module_name {
-                anyhow::bail!(
-                    "Module import cycle detected: {} -> {}",
-                    spec.module_name,
-                    imp
-                );
-            }
-            // 1. Check if `imp` resolves in root package
-            if let Some(dep_spec) = resolve_module_in_package(root_pkg, true, imp) {
-                direct_dag_deps.push(imp.clone());
-                worklist.push_back((dep_spec, needs_c && spec.precompile_modules));
+                }
+                if requested_c && !existing.needs_c {
+                    existing.needs_c = true;
+                }
+                if spec.precompile_modules {
+                    existing.precompile_modules = true;
+                }
                 continue;
             }
-            // 2. Check if `imp` resolves in any dependency package (failing closed on ambiguity)
-            let mut dep_matches = Vec::new();
-            for dep_pkg in &cfg.dep_pkgs {
-                if let Some(dep_spec) = resolve_module_in_package(dep_pkg, false, imp) {
-                    dep_matches.push(dep_spec);
-                }
-            }
-            if dep_matches.len() > 1 {
-                let pkg_names: Vec<String> =
-                    dep_matches.iter().map(|m| m.pkg_name.clone()).collect();
+            // Every DAG node is compiled or restored and published with a Lake trace, which must
+            // not happen for a module Lake would build differently.
+            if let Some(why) = &spec.unsupported {
+                let _ = c_abi::verify_static_lake_config(true, true, false, false);
                 anyhow::bail!(
+                "Cannot build module `{}` of package `{}` like Lake ({}): fail-closed static Lake config gate",
+                spec.module_name,
+                spec.pkg_name,
+                why
+            );
+            }
+            let src = fs::read_to_string(&spec.src_path).with_context(|| {
+                format!(
+                    "Failed to read module `{}` at {}",
+                    spec.module_name,
+                    spec.src_path.display()
+                )
+            })?;
+            let src_blake3 = blake3::hash(src.as_bytes()).to_hex().to_string();
+            let header = parse_header_info(&src);
+            if let Some(ref herr) = header.header_error {
+                anyhow::bail!(
+                    "Invalid module header in `{}` ({}): {}",
+                    spec.module_name,
+                    spec.src_path.display(),
+                    herr
+                );
+            }
+            let needs_c =
+                requested_c || spec.emit_c_default || header.has_c_export || global_emit_c;
+            let native_why = spec.native_unsupported.as_ref().filter(|_| {
+                !is_untrusted
+                    && (needs_c
+                        || explicit_co_export_mods.contains(&spec.module_name)
+                        || explicit_dynlib_mods.contains(&spec.module_name))
+            });
+            if let Some(why) = native_why {
+                let _ = c_abi::verify_static_lake_config(true, true, false, false);
+                anyhow::bail!(
+                "Cannot build module `{}` of package `{}` like Lake ({}): fail-closed static Lake config gate",
+                spec.module_name,
+                spec.pkg_name,
+                why
+            );
+            }
+            let mut direct_dag_deps = Vec::new();
+            let mut external_olean_deps = Vec::new();
+            for imp in &header.imports {
+                if imp == &spec.module_name {
+                    anyhow::bail!(
+                        "Module import cycle detected: {} -> {}",
+                        spec.module_name,
+                        imp
+                    );
+                }
+                // 1. Check if `imp` resolves in root package
+                if let Some(dep_spec) = resolve_module_in_package(root_pkg, true, imp) {
+                    if !dep_spec.is_exe_target
+                        && (dep_spec.pkg_name != spec.pkg_name
+                            || dep_spec.target_name != spec.target_name)
+                        && (spec.precompile_modules || dep_spec.precompile_modules)
+                    {
+                        enqueue_shared_lib_mods(
+                            &dep_spec.pkg_name,
+                            &dep_spec.target_name,
+                            true,
+                            &mut expanded_shared_libs,
+                            &mut requested_shared_libs,
+                            &mut worklist,
+                        )?;
+                    }
+                    direct_dag_deps.push(imp.clone());
+                    worklist.push_back((dep_spec, spec.precompile_modules));
+                    continue;
+                }
+                // 2. Check if `imp` resolves in any dependency package (failing closed on ambiguity)
+                let mut dep_matches = Vec::new();
+                for dep_pkg in &cfg.dep_pkgs {
+                    if let Some(dep_spec) = resolve_module_in_package(dep_pkg, false, imp) {
+                        dep_matches.push(dep_spec);
+                    }
+                }
+                if dep_matches.len() > 1 {
+                    let pkg_names: Vec<String> =
+                        dep_matches.iter().map(|m| m.pkg_name.clone()).collect();
+                    anyhow::bail!(
                     "Ambiguous module import `{}` (imported by `{}`) resolved in multiple dependency packages: {:?}",
                     imp,
                     spec.module_name,
                     pkg_names
                 );
-            }
-            if let Some(dep_spec) = dep_matches.into_iter().next() {
+                }
+                if let Some(dep_spec) = dep_matches.into_iter().next() {
+                    if !is_untrusted {
+                        if let Some(fresh_closure) = collect_fresh_dep_pkg_closure(
+                            cfg,
+                            &dep_spec,
+                            spec.precompile_modules || dep_spec.precompile_modules,
+                        )? {
+                            external_olean_deps.extend(fresh_closure);
+                            continue;
+                        }
+                    }
+                    if !dep_spec.is_exe_target
+                        && (spec.precompile_modules || dep_spec.precompile_modules)
+                    {
+                        enqueue_shared_lib_mods(
+                            &dep_spec.pkg_name,
+                            &dep_spec.target_name,
+                            false,
+                            &mut expanded_shared_libs,
+                            &mut requested_shared_libs,
+                            &mut worklist,
+                        )?;
+                    }
+                    direct_dag_deps.push(imp.clone());
+                    worklist.push_back((
+                        dep_spec.clone(),
+                        spec.precompile_modules || dep_spec.precompile_modules,
+                    ));
+                    continue;
+                }
+                // 3. Check if `imp` is a built-in toolchain module (`Init.*`, `Std.*`, `Lean.*`, `Lake.*`)
+                if is_builtin_toolchain_module(&cfg.toolchain_lib_lean, imp) {
+                    continue;
+                }
+                // 4. In trusted mode only, check if `imp` exists as a prebuilt `.olean` in `.lake/packages/*/.lake/build/lib/lean` or `LEAN_PATH`
                 if !is_untrusted {
-                    if let Some(fresh_closure) = collect_fresh_dep_pkg_closure(cfg, &dep_spec)? {
-                        external_olean_deps.extend(fresh_closure);
-                        continue;
-                    }
-                }
-                direct_dag_deps.push(imp.clone());
-                worklist.push_back((dep_spec, false));
-                continue;
-            }
-            // 3. Check if `imp` is a built-in toolchain module (`Init.*`, `Std.*`, `Lean.*`, `Lake.*`)
-            if is_builtin_toolchain_module(&cfg.toolchain_lib_lean, imp) {
-                continue;
-            }
-            // 4. In trusted mode only, check if `imp` exists as a prebuilt `.olean` in `.lake/packages/*/.lake/build/lib/lean` or `LEAN_PATH`
-            if !is_untrusted {
-                let rel_slash = module_name_to_rel_slash(imp);
-                let mut found_prebuilt: Option<PathBuf> = None;
-                for dp in &cfg.dep_pkgs {
-                    let cand = dp
-                        .pkg_root
-                        .join(&dp.build_dir)
-                        .join(&dp.lean_lib_dir)
-                        .join(format!("{}.olean", rel_slash));
-                    if cand.is_file() {
-                        found_prebuilt = Some(cand);
-                        break;
-                    }
-                }
-                if found_prebuilt.is_none() {
-                    for dir in &external_lean_path_dirs {
-                        let cand = dir.join(format!("{}.olean", rel_slash));
+                    let rel_slash = module_name_to_rel_slash(imp);
+                    let mut found_prebuilt: Option<PathBuf> = None;
+                    for dp in &cfg.dep_pkgs {
+                        let cand = dp
+                            .pkg_root
+                            .join(&dp.build_dir)
+                            .join(&dp.lean_lib_dir)
+                            .join(format!("{}.olean", rel_slash));
                         if cand.is_file() {
                             found_prebuilt = Some(cand);
                             break;
                         }
                     }
+                    if found_prebuilt.is_none() {
+                        for dir in &external_lean_path_dirs {
+                            let cand = dir.join(format!("{}.olean", rel_slash));
+                            if cand.is_file() {
+                                found_prebuilt = Some(cand);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(pb_path) = found_prebuilt {
+                        external_olean_deps.push((imp.clone(), pb_path));
+                        continue;
+                    }
                 }
-                if let Some(pb_path) = found_prebuilt {
-                    external_olean_deps.push((imp.clone(), pb_path));
-                    continue;
-                }
-            }
-            anyhow::bail!(
+                anyhow::bail!(
                 "Missing module `{}` imported by `{}` ({}): not found in project sources, package dependencies, or toolchain `{}`",
                 imp,
                 spec.module_name,
                 spec.src_path.display(),
                 cfg.toolchain
             );
+            }
+            direct_dag_deps.sort();
+            direct_dag_deps.dedup();
+            external_olean_deps.sort_by(|a, b| a.0.cmp(&b.0));
+            external_olean_deps.dedup_by(|a, b| a.0 == b.0);
+            let rel_slash = module_name_to_rel_slash(&spec.module_name);
+            let olean_path = spec.build_lib_lean_dir.join(format!("{}.olean", rel_slash));
+            let ilean_path = spec.build_lib_lean_dir.join(format!("{}.ilean", rel_slash));
+            let c_path = spec.build_ir_dir.join(format!("{}.c", rel_slash));
+            nodes.insert(
+                spec.module_name.clone(),
+                ModuleNode {
+                    module_name: spec.module_name.clone(),
+                    pkg_name: spec.pkg_name,
+                    target_name: spec.target_name,
+                    is_root_pkg: spec.is_root_pkg,
+                    pkg_root: spec.pkg_root,
+                    src_root: spec.src_root,
+                    src_path: spec.src_path,
+                    build_lib_lean_dir: spec.build_lib_lean_dir,
+                    build_native_lib_dir: spec.build_native_lib_dir,
+                    build_ir_dir: spec.build_ir_dir,
+                    olean_path,
+                    ilean_path,
+                    c_path,
+                    is_module: header.is_module,
+                    has_prelude: header.has_prelude,
+                    needs_c,
+                    needs_co_export: false,
+                    needs_dynlib: false,
+                    precompile_modules: spec.precompile_modules,
+                    is_exe_target: spec.is_exe_target,
+                    lean_options: spec.lean_options,
+                    strong_args: spec.strong_args,
+                    weak_args: spec.weak_args,
+                    src_blake3,
+                    direct_dag_deps,
+                    external_olean_deps,
+                    expected_all_deps: Vec::new(),
+                    extern_lib_digests: spec.extern_lib_digests,
+                    pkg_config_digest: spec.pkg_config_digest,
+                    import_specs: header.import_specs,
+                    native_unsupported: spec.native_unsupported,
+                },
+            );
         }
-        direct_dag_deps.sort();
-        direct_dag_deps.dedup();
-        external_olean_deps.sort_by(|a, b| a.0.cmp(&b.0));
-        external_olean_deps.dedup_by(|a, b| a.0 == b.0);
-        let rel_slash = module_name_to_rel_slash(&spec.module_name);
-        let olean_path = spec.build_lib_lean_dir.join(format!("{}.olean", rel_slash));
-        let ilean_path = spec.build_lib_lean_dir.join(format!("{}.ilean", rel_slash));
-        let c_path = spec.build_ir_dir.join(format!("{}.c", rel_slash));
-        nodes.insert(
-            spec.module_name.clone(),
-            ModuleNode {
-                module_name: spec.module_name,
-                pkg_name: spec.pkg_name,
-                target_name: spec.target_name,
-                is_root_pkg: spec.is_root_pkg,
-                pkg_root: spec.pkg_root,
-                src_root: spec.src_root,
-                src_path: spec.src_path,
-                build_lib_lean_dir: spec.build_lib_lean_dir,
-                build_ir_dir: spec.build_ir_dir,
-                olean_path,
-                ilean_path,
-                c_path,
-                is_module: header.is_module,
-                has_prelude: header.has_prelude,
-                needs_c,
-                precompile_modules: spec.precompile_modules,
-                lean_options: spec.lean_options,
-                strong_args: spec.strong_args,
-                weak_args: spec.weak_args,
-                src_blake3,
-                direct_dag_deps,
-                external_olean_deps,
-                expected_all_deps: Vec::new(),
-                extern_lib_digests: spec.extern_lib_digests,
-                pkg_config_digest: spec.pkg_config_digest,
-            },
+        let mut discovered_new_shared = false;
+        let snapshot_nodes: Vec<(String, String, String, bool, Vec<String>)> = nodes
+            .values()
+            .map(|n| {
+                (
+                    n.module_name.clone(),
+                    n.pkg_name.clone(),
+                    n.target_name.clone(),
+                    n.precompile_modules,
+                    n.direct_dag_deps.clone(),
+                )
+            })
+            .collect();
+        // Any module transitively reachable from a `precompile_modules` node in `nodes`
+        // whose library differs from that importer's library causes that library's shared `.so`
+        // (and any cross-library imports of `requested_shared_libs` local modules) to be built by Lake.
+        for (_, imp_pkg, imp_target, imp_precomp, imp_deps) in &snapshot_nodes {
+            let importer_is_in_shared =
+                requested_shared_libs.contains(&(imp_pkg.clone(), imp_target.clone()));
+            let mut visited_t: HashSet<String> = HashSet::new();
+            let mut stack_t: Vec<String> = imp_deps.clone();
+            while let Some(dm) = stack_t.pop() {
+                if !visited_t.insert(dm.clone()) {
+                    continue;
+                }
+                if let Some(dn) = nodes.get(&dm) {
+                    if !dn.is_exe_target
+                        && (dn.pkg_name != *imp_pkg || dn.target_name != *imp_target)
+                        && (*imp_precomp || importer_is_in_shared || dn.precompile_modules)
+                    {
+                        let key = (dn.pkg_name.clone(), dn.target_name.clone());
+                        if !expanded_shared_libs.contains(&key) {
+                            let is_root = dn.pkg_name == root_pkg.name;
+                            enqueue_shared_lib_mods(
+                                &dn.pkg_name,
+                                &dn.target_name,
+                                is_root,
+                                &mut expanded_shared_libs,
+                                &mut requested_shared_libs,
+                                &mut worklist,
+                            )?;
+                            discovered_new_shared = true;
+                        }
+                    }
+                    stack_t.extend(dn.direct_dag_deps.iter().cloned());
+                }
+            }
+        }
+        if !discovered_new_shared && worklist.is_empty() {
+            break;
+        }
+    }
+    let mut shared_libs: Vec<SharedLibSpec> = Vec::new();
+    for (pkg_name, lib_name) in &requested_shared_libs {
+        let Some(pkg) = cfg
+            .dep_pkgs
+            .iter()
+            .chain(std::iter::once(&cfg.root_pkg))
+            .find(|p| &p.name == pkg_name)
+        else {
+            continue;
+        };
+        let Some(lib) = pkg.libs.iter().find(|l| &l.name == lib_name) else {
+            continue;
+        };
+        let mut local_modules = Vec::new();
+        let mut visited_local = HashSet::new();
+        fn rec_collect_local(
+            m: &str,
+            pkg_name: &str,
+            lib_name: &str,
+            nodes: &BTreeMap<String, ModuleNode>,
+            visited: &mut HashSet<String>,
+            out: &mut Vec<String>,
+        ) {
+            if !visited.insert(m.to_string()) {
+                return;
+            }
+            let Some(node) = nodes.get(m) else {
+                return;
+            };
+            if node.pkg_name != pkg_name || node.target_name != lib_name {
+                return;
+            }
+            for imp in &node.import_specs {
+                if let Some(dn) = nodes.get(&imp.module) {
+                    if dn.pkg_name == pkg_name && dn.target_name == lib_name {
+                        rec_collect_local(&imp.module, pkg_name, lib_name, nodes, visited, out);
+                    }
+                }
+            }
+            out.push(m.to_string());
+        }
+        for (m, _) in expand_lib_configured_modules(pkg, lib)? {
+            rec_collect_local(
+                &m,
+                pkg_name,
+                lib_name,
+                &nodes,
+                &mut visited_local,
+                &mut local_modules,
+            );
+        }
+        if local_modules.is_empty() {
+            continue;
+        }
+        let stem = lean_mk_module_initialization_stem(lib_name, Some(pkg_name));
+        let ext = if cfg!(target_os = "macos") {
+            "dylib"
+        } else if cfg!(target_os = "windows") {
+            "dll"
+        } else {
+            "so"
+        };
+        let so_path = pkg
+            .pkg_root
+            .join(&pkg.build_dir)
+            .join(&pkg.native_lib_dir)
+            .join(format!("lib{}.{}", stem, ext));
+        let is_plugin = lib.roots.len() == 1
+            && stem == lean_mk_module_initialization_stem(&lib.roots[0], Some(pkg_name));
+        shared_libs.push(SharedLibSpec {
+            pkg_name: pkg_name.clone(),
+            lib_name: lib_name.clone(),
+            stem,
+            path: so_path,
+            is_plugin,
+            local_modules,
+        });
+    }
+    let mut precompiled_by_lib: BTreeMap<(String, String), HashSet<String>> = BTreeMap::new();
+    for other in nodes.values() {
+        if !other.is_exe_target && other.precompile_modules {
+            let mut visited_trans: HashSet<String> = HashSet::new();
+            let mut stack: Vec<String> = other
+                .import_specs
+                .iter()
+                .filter(|imp| imp.module != other.module_name)
+                .map(|imp| imp.module.clone())
+                .collect();
+            let entry = precompiled_by_lib
+                .entry((other.pkg_name.clone(), other.target_name.clone()))
+                .or_default();
+            while let Some(cur_m) = stack.pop() {
+                if !visited_trans.insert(cur_m.clone()) {
+                    continue;
+                }
+                if let Some(dn) = nodes.get(&cur_m) {
+                    if !dn.is_exe_target
+                        && dn.pkg_name == other.pkg_name
+                        && dn.target_name == other.target_name
+                    {
+                        entry.insert(cur_m.clone());
+                    }
+                    for sub_imp in &dn.import_specs {
+                        if sub_imp.module != cur_m {
+                            stack.push(sub_imp.module.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for node in nodes.values_mut() {
+        let explicit_co = explicit_co_export_mods.contains(&node.module_name);
+        let explicit_dy = explicit_dynlib_mods.contains(&node.module_name);
+        let in_shared_lib = shared_libs
+            .iter()
+            .any(|s| s.local_modules.iter().any(|m| m == &node.module_name));
+        let imported_by_same_lib_precompiled = !node.is_exe_target
+            && node.precompile_modules
+            && precompiled_by_lib
+                .get(&(node.pkg_name.clone(), node.target_name.clone()))
+                .is_some_and(|s| s.contains(&node.module_name));
+        node.needs_dynlib = explicit_dy || imported_by_same_lib_precompiled;
+        node.needs_co_export = explicit_co || in_shared_lib || node.needs_dynlib;
+        if node.needs_co_export {
+            node.needs_c = true;
+        }
+    }
+    let mut shared_local_map: HashMap<(String, String), Vec<String>> = HashMap::new();
+    for s in &shared_libs {
+        shared_local_map.insert(
+            (s.pkg_name.clone(), s.lib_name.clone()),
+            s.local_modules.clone(),
         );
     }
     // 3-color DFS cycle detection with exact cycle path reconstruction
@@ -5996,6 +7346,53 @@ pub fn build_module_dag_with_trust(
         for d in &node.direct_dag_deps {
             if nodes.contains_key(d) {
                 dependents.entry(d.clone()).or_default().push(m.clone());
+            }
+        }
+    }
+    for list in dependents.values_mut() {
+        list.sort();
+        list.dedup();
+    }
+    for m in nodes.keys().cloned().collect::<Vec<_>>() {
+        let Some(node) = nodes.get(&m).cloned() else {
+            continue;
+        };
+        let node_in_shared =
+            shared_local_map.contains_key(&(node.pkg_name.clone(), node.target_name.clone()));
+        let mut visited_t: HashSet<String> = HashSet::new();
+        let mut stack_t: Vec<String> = node.direct_dag_deps.clone();
+        while let Some(dep_mod) = stack_t.pop() {
+            if !visited_t.insert(dep_mod.clone()) {
+                continue;
+            }
+            let Some(dn) = nodes.get(&dep_mod) else {
+                continue;
+            };
+            stack_t.extend(dn.direct_dag_deps.iter().cloned());
+            if dn.pkg_name == node.pkg_name && dn.target_name == node.target_name {
+                continue;
+            }
+            if !(node.precompile_modules || dn.precompile_modules || node_in_shared)
+                || dn.is_exe_target
+            {
+                continue;
+            }
+            let Some(locals) = shared_local_map.get(&(dn.pkg_name.clone(), dn.target_name.clone()))
+            else {
+                continue;
+            };
+            for local in locals {
+                if local == &m || !nodes.contains_key(local) {
+                    continue;
+                }
+                let already = dependents
+                    .get(local)
+                    .is_some_and(|list| list.iter().any(|c| c == &m));
+                if !already {
+                    *in_degree.entry(m.clone()).or_insert(0) += 1;
+                    *total_deps.entry(m.clone()).or_insert(0) += 1;
+                    dependents.entry(local.clone()).or_default().push(m.clone());
+                }
             }
         }
     }
@@ -6107,6 +7504,45 @@ pub fn build_module_dag_with_trust(
             }
         }
     }
+    if is_untrusted {
+        if let Some(sl) = shared_libs.first() {
+            let _ = c_abi::verify_static_lake_config(true, true, false, false);
+            anyhow::bail!(
+                "Refusing to precompile/load native shared library `{}` (`{}:{}`) in untrusted mode: fail-closed untrusted native code gate",
+                sl.path.display(),
+                sl.pkg_name,
+                sl.lib_name
+            );
+        }
+        for m in &topological_order {
+            if let Some(node) = nodes.get(m) {
+                if node.precompile_modules || node.needs_co_export || node.needs_dynlib {
+                    let _ = c_abi::verify_static_lake_config(true, true, false, false);
+                    anyhow::bail!(
+                        "Refusing `precompileModules` / native dynlib build for module `{}` (`{}`) in untrusted mode: fail-closed untrusted native code gate",
+                        node.module_name,
+                        node.pkg_name
+                    );
+                }
+            }
+        }
+    } else {
+        for m in &topological_order {
+            if let Some(node) = nodes.get(m) {
+                if node.needs_c || node.needs_co_export || node.needs_dynlib {
+                    if let Some(ref why) = node.native_unsupported {
+                        let _ = c_abi::verify_static_lake_config(true, true, false, false);
+                        anyhow::bail!(
+                            "Cannot build module `{}` of package `{}` like Lake ({}): fail-closed static Lake config gate",
+                            node.module_name,
+                            node.pkg_name,
+                            why
+                        );
+                    }
+                }
+            }
+        }
+    }
     let mut all_deps_by_mod: HashMap<String, BTreeSet<String>> =
         HashMap::with_capacity(topological_order.len());
     for m in &topological_order {
@@ -6134,6 +7570,7 @@ pub fn build_module_dag_with_trust(
         topological_order,
         waves,
         root_modules,
+        shared_libs,
     })
 }
 fn update_lp(h: &mut blake3::Hasher, tag: &[u8], data: &[u8]) {
@@ -6264,6 +7701,16 @@ pub fn compute_module_cas_key(
     dep_olean_digests: &[(String, String)],
     needs_c_override: bool,
 ) -> Result<String> {
+    compute_module_cas_key_with_dynlibs(cfg, node, dep_olean_digests, needs_c_override, &[])
+}
+
+pub fn compute_module_cas_key_with_dynlibs(
+    cfg: &ProjectConfig,
+    node: &ModuleNode,
+    dep_olean_digests: &[(String, String)],
+    needs_c_override: bool,
+    import_dynlib_digests: &[(String, String)],
+) -> Result<String> {
     let toolchain_valid =
         !cfg.toolchain.is_empty() && !cfg.lean_githash.is_empty() && cfg.lean_bin.is_file();
     let args_valid = node
@@ -6376,6 +7823,13 @@ pub fn compute_module_cas_key(
     for ext in &node.extern_lib_digests {
         update_lp(&mut h, b"ext_lib", ext.as_bytes());
     }
+    if !import_dynlib_digests.is_empty() {
+        h.update(&(import_dynlib_digests.len() as u64).to_le_bytes());
+        for (dyn_tag, dyn_hash) in import_dynlib_digests {
+            update_lp(&mut h, b"imp_dynlib_tag", dyn_tag.as_bytes());
+            update_lp(&mut h, b"imp_dynlib_hash", dyn_hash.as_bytes());
+        }
+    }
     let allowed = crate::splitter::allowed_axioms();
     if allowed.len() > crate::splitter::STANDARD_AXIOMS.len() {
         update_lp(&mut h, b"axioms", allowed.join(",").as_bytes());
@@ -6385,29 +7839,28 @@ pub fn compute_module_cas_key(
 pub(crate) fn build_lean_search_path(cfg: &ProjectConfig, is_untrusted: bool) -> (String, String) {
     let mut lp_parts = Vec::new();
     let mut ld_parts = Vec::new();
-    let root_lib_lean = cfg
-        .root_pkg
-        .pkg_root
-        .join(&cfg.root_pkg.build_dir)
-        .join(&cfg.root_pkg.lean_lib_dir);
-    let root_lib = cfg
-        .root_pkg
-        .pkg_root
-        .join(&cfg.root_pkg.build_dir)
-        .join("lib");
-    lp_parts.push(root_lib_lean.to_string_lossy().to_string());
-    ld_parts.push(root_lib.to_string_lossy().to_string());
+    let push_unique = |vec: &mut Vec<String>, s: String| {
+        if !s.is_empty() && !vec.contains(&s) {
+            vec.push(s);
+        }
+    };
+    let root_build = cfg.root_pkg.pkg_root.join(&cfg.root_pkg.build_dir);
+    let root_lib_lean = root_build.join(&cfg.root_pkg.lean_lib_dir);
+    let root_native_lib = root_build.join(&cfg.root_pkg.native_lib_dir);
+    let root_lib = root_build.join("lib");
+    push_unique(&mut lp_parts, root_lib_lean.to_string_lossy().to_string());
+    push_unique(&mut ld_parts, root_native_lib.to_string_lossy().to_string());
+    push_unique(&mut ld_parts, root_lib.to_string_lossy().to_string());
+    push_unique(&mut ld_parts, root_lib_lean.to_string_lossy().to_string());
     for dp in &cfg.dep_pkgs {
-        let dep_lib_lean = dp.pkg_root.join(&dp.build_dir).join(&dp.lean_lib_dir);
-        let dep_lib = dp.pkg_root.join(&dp.build_dir).join("lib");
-        let s = dep_lib_lean.to_string_lossy().to_string();
-        if !lp_parts.contains(&s) {
-            lp_parts.push(s);
-        }
-        let lds = dep_lib.to_string_lossy().to_string();
-        if !ld_parts.contains(&lds) {
-            ld_parts.push(lds);
-        }
+        let dep_build = dp.pkg_root.join(&dp.build_dir);
+        let dep_lib_lean = dep_build.join(&dp.lean_lib_dir);
+        let dep_native_lib = dep_build.join(&dp.native_lib_dir);
+        let dep_lib = dep_build.join("lib");
+        push_unique(&mut lp_parts, dep_lib_lean.to_string_lossy().to_string());
+        push_unique(&mut ld_parts, dep_native_lib.to_string_lossy().to_string());
+        push_unique(&mut ld_parts, dep_lib.to_string_lossy().to_string());
+        push_unique(&mut ld_parts, dep_lib_lean.to_string_lossy().to_string());
     }
     if !is_untrusted {
         if let Ok(caller_lp) = std::env::var("LEAN_PATH") {
@@ -6508,6 +7961,9 @@ fn validate_materialized_module_artifacts(node: &ModuleNode, preserve_lake: bool
     let ir_sig_path = PathBuf::from(format!("{}.sig", ir_path.display()));
     let ltar_path = node.c_path.with_extension("ltar");
     let bc_path = node.c_path.with_extension("bc");
+    let ltar_hash_path = PathBuf::from(format!("{}.hash", ltar_path.display()));
+    let bc_hash_path = PathBuf::from(format!("{}.hash", bc_path.display()));
+    let path_exists_any = |p: &Path| fs::symlink_metadata(p).is_ok();
     if !has_no_symlink_at(&srv_path)
         || !has_no_symlink_at(&priv_path)
         || !has_no_symlink_at(&ir_path)
@@ -6515,7 +7971,13 @@ fn validate_materialized_module_artifacts(node: &ModuleNode, preserve_lake: bool
         || !has_no_symlink_at(&node.c_path)
         || !has_no_symlink_at(&ltar_path)
         || !has_no_symlink_at(&bc_path)
-        || (!preserve_lake && (ltar_path.exists() || bc_path.exists()))
+        || !has_no_symlink_at(&ltar_hash_path)
+        || !has_no_symlink_at(&bc_hash_path)
+        || (!preserve_lake
+            && (path_exists_any(&ltar_path)
+                || path_exists_any(&bc_path)
+                || path_exists_any(&ltar_hash_path)
+                || path_exists_any(&bc_hash_path)))
     {
         return false;
     }
@@ -6535,6 +7997,34 @@ fn validate_materialized_module_artifacts(node: &ModuleNode, preserve_lake: bool
     )
 }
 
+fn module_co_export_path(node: &ModuleNode) -> PathBuf {
+    PathBuf::from(format!("{}.o.export", node.c_path.display()))
+}
+
+fn module_setup_json_path(node: &ModuleNode) -> PathBuf {
+    node.c_path.with_extension("setup.json")
+}
+
+fn module_dynlib_so_path(node: &ModuleNode) -> Option<PathBuf> {
+    let rel_slash = module_name_to_rel_slash(&node.module_name);
+    let suffix = format!("{}.olean", rel_slash);
+    let olean_str = node.olean_path.to_string_lossy();
+    let base_dir = if let Some(prefix) = olean_str.strip_suffix(&suffix) {
+        PathBuf::from(prefix.trim_end_matches('/'))
+    } else {
+        node.olean_path.parent()?.to_path_buf()
+    };
+    let ext = if cfg!(target_os = "macos") {
+        "dylib"
+    } else if cfg!(target_os = "windows") {
+        "dll"
+    } else {
+        "so"
+    };
+    let stem = lean_mk_module_initialization_stem(&node.module_name, Some(&node.pkg_name));
+    Some(base_dir.join(format!("{}.{}", stem, ext)))
+}
+
 fn wipe_existing_module_artifacts(node: &ModuleNode) {
     let srv_path = PathBuf::from(format!("{}.server", node.olean_path.display()));
     let priv_path = PathBuf::from(format!("{}.private", node.olean_path.display()));
@@ -6542,6 +8032,8 @@ fn wipe_existing_module_artifacts(node: &ModuleNode) {
     let ir_sig_path = PathBuf::from(format!("{}.sig", ir_path.display()));
     let ltar_path = node.c_path.with_extension("ltar");
     let bc_path = node.c_path.with_extension("bc");
+    let co_export_path = module_co_export_path(node);
+    let setup_path = module_setup_json_path(node);
     for p in [
         &node.olean_path,
         &node.ilean_path,
@@ -6552,10 +8044,19 @@ fn wipe_existing_module_artifacts(node: &ModuleNode) {
         &node.c_path,
         &ltar_path,
         &bc_path,
+        &co_export_path,
     ] {
         let _ = fs::remove_file(p);
         let _ = fs::remove_file(format!("{}.hash", p.display()));
+        let _ = fs::remove_file(format!("{}.trace", p.display()));
     }
+    if let Some(so_path) = module_dynlib_so_path(node) {
+        let _ = fs::remove_file(&so_path);
+        let _ = fs::remove_file(format!("{}.hash", so_path.display()));
+        let _ = fs::remove_file(format!("{}.trace", so_path.display()));
+        let _ = fs::remove_file(format!("{}.rsp", so_path.display()));
+    }
+    let _ = fs::remove_file(&setup_path);
     let _ = fs::remove_file(node.olean_path.with_extension("trace"));
 }
 
@@ -7149,6 +8650,27 @@ pub fn write_lake_module_hashes_and_trace(
     } else {
         format!("Module.leanArgs: #[{}]", lean_args.join(", "))
     };
+    let import_dynlib_paths = compute_module_raw_import_dynlibs(dag, node);
+    let mut import_dynlib_entries = Vec::with_capacity(import_dynlib_paths.len());
+    for p in &import_dynlib_paths {
+        match verify_and_hash_artifact_bytes(p, false, false) {
+            Ok(h) => {
+                import_dynlib_entries.push(serde_json::json!([
+                    p.to_string_lossy(),
+                    format!("{:016x}", h)
+                ]));
+            }
+            Err(_) => {
+                dep_trace_fresh = false;
+                break;
+            }
+        }
+    }
+    let import_dynlibs_json = if import_dynlib_entries.is_empty() {
+        serde_json::Value::String("00000000000006bb".to_string())
+    } else {
+        serde_json::Value::Array(import_dynlib_entries)
+    };
     let inputs = serde_json::json!([
         [
             "deps",
@@ -7163,7 +8685,7 @@ pub fn write_lake_module_hashes_and_trace(
         [
             "libs",
             [
-                ["import dynlibs", "00000000000006bb"],
+                ["import dynlibs", import_dynlibs_json],
                 ["package external libraries", "00000000000006bb"],
                 ["module dynlibs", "00000000000006bb"],
                 ["module plugins", "00000000000006bb"]
@@ -7300,12 +8822,6 @@ pub fn write_lake_module_hashes_and_trace(
             format!("{:016x}", ilean_h).into_bytes(),
         ),
     ];
-    for stale_ir in [
-        node.c_path.with_extension("ltar"),
-        node.c_path.with_extension("bc"),
-    ] {
-        let _ = fs::remove_file(format!("{}.hash", stale_ir.display()));
-    }
     let c_h_opt = match c_h_res {
         Some(Ok(ch)) => {
             sidecar_writes.push((
@@ -7395,7 +8911,7 @@ pub fn write_lake_module_hashes_and_trace(
         let tmp_p = parent.join(format!(".turbo_stage_sidecar_{}_{}_{}", pid, seq, fname));
         let write_res: Result<()> = (|| {
             use std::io::Write;
-            let mut f = fs::File::create(&tmp_p)?;
+            let mut f = create_fresh_file(&tmp_p)?;
             f.write_all(&content)?;
             #[cfg(unix)]
             {
@@ -7432,6 +8948,908 @@ pub fn write_lake_module_hashes_and_trace(
     Ok(())
 }
 
+fn compute_module_raw_import_dynlibs(dag: &ModuleDag, node: &ModuleNode) -> Vec<PathBuf> {
+    let imps = if node.precompile_modules {
+        compute_ordered_trans_imports(dag, node)
+    } else {
+        compute_ordered_precompile_imports(dag, node)
+    };
+    let mut out = Vec::new();
+    let mut visited_libs: HashSet<(String, String)> = HashSet::new();
+    for imp_name in imps {
+        let Some(dn) = dag.nodes.get(&imp_name) else {
+            continue;
+        };
+        if dn.is_exe_target {
+            continue;
+        }
+        let key = (dn.pkg_name.clone(), dn.target_name.clone());
+        let same_lib = dn.pkg_name == node.pkg_name && dn.target_name == node.target_name;
+        if same_lib && !node.is_exe_target {
+            if node.precompile_modules {
+                if let Some(so_p) = module_dynlib_so_path(dn) {
+                    out.push(so_p);
+                }
+            }
+        } else if (node.precompile_modules || dn.precompile_modules) && visited_libs.insert(key) {
+            if let Some(sl) = dag
+                .shared_libs
+                .iter()
+                .find(|s| s.pkg_name == dn.pkg_name && s.lib_name == dn.target_name)
+            {
+                out.push(sl.path.clone());
+            }
+        }
+    }
+    out
+}
+
+fn compute_ordered_trans_imports(dag: &ModuleDag, node: &ModuleNode) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    fn walk(dag: &ModuleDag, cur: &str, out: &mut Vec<String>, seen: &mut HashSet<String>) {
+        if !seen.insert(cur.to_string()) {
+            return;
+        }
+        let Some(dn) = dag.nodes.get(cur) else {
+            return;
+        };
+        for imp in &dn.direct_dag_deps {
+            walk(dag, imp, out, seen);
+        }
+        out.push(cur.to_string());
+    }
+    for imp in &node.direct_dag_deps {
+        walk(dag, imp, &mut out, &mut seen);
+    }
+    out
+}
+
+fn compute_ordered_precompile_imports(dag: &ModuleDag, node: &ModuleNode) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    fn walk(dag: &ModuleDag, cur: &str, out: &mut Vec<String>, seen: &mut HashSet<String>) {
+        if !seen.insert(cur.to_string()) {
+            return;
+        }
+        let Some(dn) = dag.nodes.get(cur) else {
+            return;
+        };
+        for imp in &dn.direct_dag_deps {
+            walk(dag, imp, out, seen);
+        }
+        if dn.precompile_modules {
+            out.push(cur.to_string());
+        }
+    }
+    for imp in &node.direct_dag_deps {
+        walk(dag, imp, &mut out, &mut seen);
+    }
+    out
+}
+
+fn compute_module_dynlib_link_libs(dag: &ModuleDag, node: &ModuleNode) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen_direct: HashSet<String> = HashSet::new();
+    let mut visited_libs: HashSet<(String, String)> = HashSet::new();
+    for imp in &node.import_specs {
+        if imp.module == node.module_name || !seen_direct.insert(imp.module.clone()) {
+            continue;
+        }
+        let Some(dn) = dag.nodes.get(&imp.module) else {
+            continue;
+        };
+        if dn.is_exe_target {
+            continue;
+        }
+        if dn.pkg_name == node.pkg_name && dn.target_name == node.target_name && !node.is_exe_target
+        {
+            if let Some(so_p) = module_dynlib_so_path(dn) {
+                out.push(so_p);
+            }
+        } else if visited_libs.insert((dn.pkg_name.clone(), dn.target_name.clone())) {
+            if let Some(sl) = dag
+                .shared_libs
+                .iter()
+                .find(|s| s.pkg_name == dn.pkg_name && s.lib_name == dn.target_name)
+            {
+                out.push(sl.path.clone());
+            }
+        }
+    }
+    out
+}
+
+fn compute_shared_lib_link_libs(dag: &ModuleDag, sl: &SharedLibSpec) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut visited_libs: HashSet<(String, String)> = HashSet::new();
+    visited_libs.insert((sl.pkg_name.clone(), sl.lib_name.clone()));
+    let mut seen_imps: HashSet<String> = HashSet::new();
+    let mut ordered_imps = Vec::new();
+    for local_mod in &sl.local_modules {
+        let Some(local_node) = dag.nodes.get(local_mod) else {
+            continue;
+        };
+        for imp in compute_ordered_trans_imports(dag, local_node) {
+            if seen_imps.insert(imp.clone()) {
+                ordered_imps.push(imp);
+            }
+        }
+    }
+    for imp_mod in ordered_imps {
+        let Some(dn) = dag.nodes.get(&imp_mod) else {
+            continue;
+        };
+        if dn.is_exe_target {
+            continue;
+        }
+        if visited_libs.insert((dn.pkg_name.clone(), dn.target_name.clone())) {
+            if let Some(dep_sl) = dag
+                .shared_libs
+                .iter()
+                .find(|s| s.pkg_name == dn.pkg_name && s.lib_name == dn.target_name)
+            {
+                out.push(dep_sl.path.clone());
+            }
+        }
+    }
+    out
+}
+
+fn mk_load_order_paths(dag: &ModuleDag, paths: &[PathBuf]) -> Vec<(PathBuf, bool)> {
+    let mut by_path: HashMap<PathBuf, &SharedLibSpec> = HashMap::new();
+    for sl in &dag.shared_libs {
+        by_path.insert(sl.path.clone(), sl);
+    }
+    let mut mod_by_dynlib: HashMap<PathBuf, &ModuleNode> = HashMap::new();
+    for n in dag.nodes.values() {
+        if let Some(so_p) = module_dynlib_so_path(n) {
+            mod_by_dynlib.insert(so_p, n);
+        }
+    }
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    let mut order = Vec::new();
+    fn go(
+        dag: &ModuleDag,
+        by_path: &HashMap<PathBuf, &SharedLibSpec>,
+        mod_by_dynlib: &HashMap<PathBuf, &ModuleNode>,
+        p: &Path,
+        visiting: &mut HashSet<PathBuf>,
+        visited: &mut HashSet<PathBuf>,
+        order: &mut Vec<(PathBuf, bool)>,
+    ) {
+        if visited.contains(p) {
+            return;
+        }
+        if !visiting.insert(p.to_path_buf()) {
+            return;
+        }
+        if let Some(sl) = by_path.get(p) {
+            for dep_p in compute_shared_lib_link_libs(dag, sl) {
+                go(
+                    dag,
+                    by_path,
+                    mod_by_dynlib,
+                    &dep_p,
+                    visiting,
+                    visited,
+                    order,
+                );
+            }
+            order.push((sl.path.clone(), sl.is_plugin));
+        } else if let Some(mn) = mod_by_dynlib.get(p) {
+            for dep_p in compute_module_dynlib_link_libs(dag, mn) {
+                go(
+                    dag,
+                    by_path,
+                    mod_by_dynlib,
+                    &dep_p,
+                    visiting,
+                    visited,
+                    order,
+                );
+            }
+            order.push((p.to_path_buf(), true));
+        } else {
+            order.push((p.to_path_buf(), true));
+        }
+        visiting.remove(p);
+        visited.insert(p.to_path_buf());
+    }
+    let mut visiting = HashSet::new();
+    for p in paths {
+        go(
+            dag,
+            &by_path,
+            &mod_by_dynlib,
+            p,
+            &mut visiting,
+            &mut visited,
+            &mut order,
+        );
+    }
+    order
+}
+
+fn compute_module_setup_load_order(
+    dag: &ModuleDag,
+    node: &ModuleNode,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let raw = compute_module_raw_import_dynlibs(dag, node);
+    let ordered = mk_load_order_paths(dag, &raw);
+    let mut dynlibs = Vec::new();
+    let mut plugins = Vec::new();
+    for (p, is_plugin) in ordered {
+        if is_plugin {
+            plugins.push(p);
+        } else {
+            dynlibs.push(p);
+        }
+    }
+    (dynlibs, plugins)
+}
+
+fn build_setup_json(
+    cfg: &ProjectConfig,
+    dag: &ModuleDag,
+    node: &ModuleNode,
+    import_dynlib_paths: Option<&[PathBuf]>,
+    import_plugin_paths: Option<&[PathBuf]>,
+) -> Result<serde_json::Value> {
+    let mut setup_options = serde_json::Map::new();
+    for (k, v) in &node.lean_options {
+        setup_options.insert(k.to_lean_string(), v.to_json_value());
+    }
+    let (mut dynlibs, mut plugins) = compute_module_setup_load_order(dag, node);
+    if let Some(paths) = import_dynlib_paths {
+        for p in paths {
+            if !dynlibs.contains(p) && !plugins.contains(p) {
+                dynlibs.push(p.clone());
+            }
+        }
+    }
+    if let Some(paths) = import_plugin_paths {
+        for p in paths {
+            if !plugins.contains(p) {
+                plugins.push(p.clone());
+            }
+        }
+    }
+    if !dynlibs.is_empty() || !plugins.is_empty() {
+        let shared_ext = if cfg!(target_os = "macos") {
+            "dylib"
+        } else if cfg!(target_os = "windows") {
+            "dll"
+        } else {
+            "so"
+        };
+        let lake_shared = cfg
+            .toolchain_lib_lean
+            .join(format!("libLake_shared.{}", shared_ext));
+        if (cfg!(target_os = "linux") || cfg!(target_os = "macos"))
+            && lake_shared.is_file()
+            && !plugins.iter().any(|p| p == &lake_shared)
+        {
+            plugins.insert(0, lake_shared);
+        }
+    }
+    let non_module = !node.is_module;
+    let resolve_mod_info = |m: &str| -> Option<(PathBuf, bool, Vec<ParsedImport>)> {
+        if let Some(dn) = dag.nodes.get(m) {
+            return Some((dn.olean_path.clone(), dn.is_module, dn.import_specs.clone()));
+        }
+        let olean_p = node
+            .external_olean_deps
+            .iter()
+            .find(|(em, _)| em == m)
+            .map(|(_, p)| p.clone())
+            .or_else(|| {
+                resolve_module_in_package(&cfg.root_pkg, true, m)
+                    .or_else(|| {
+                        cfg.dep_pkgs
+                            .iter()
+                            .find_map(|dp| resolve_module_in_package(dp, false, m))
+                    })
+                    .map(|sp| {
+                        sp.build_lib_lean_dir
+                            .join(format!("{}.olean", module_name_to_rel_slash(m)))
+                    })
+            })?;
+        let src_opt = resolve_module_in_package(&cfg.root_pkg, true, m)
+            .or_else(|| {
+                cfg.dep_pkgs
+                    .iter()
+                    .find_map(|dp| resolve_module_in_package(dp, false, m))
+            })
+            .map(|sp| sp.src_path);
+        let (is_mod, specs) = match src_opt {
+            Some(sp) if sp.is_file() => {
+                let raw = fs::read_to_string(&sp).unwrap_or_default();
+                let hdr = parse_header_info(&raw);
+                (hdr.is_module, hdr.import_specs)
+            }
+            _ => (
+                PathBuf::from(format!("{}.server", olean_p.display())).is_file(),
+                Vec::new(),
+            ),
+        };
+        Some((olean_p, is_mod, specs))
+    };
+    let make_arts = |olean_p: &Path, is_mod: bool, want_all: bool| -> serde_json::Value {
+        let olean = olean_p.to_string_lossy().to_string();
+        if !is_mod {
+            serde_json::json!([[olean]])
+        } else if want_all {
+            let ir_p = olean_p.with_extension("ir");
+            serde_json::json!([
+                [
+                    olean,
+                    format!("{}.server", olean_p.display()),
+                    format!("{}.private", olean_p.display())
+                ],
+                [format!("{}.sig", ir_p.display()), ir_p.to_string_lossy()]
+            ])
+        } else {
+            let ir_p = olean_p.with_extension("ir");
+            serde_json::json!([
+                [olean, format!("{}.server", olean_p.display())],
+                [format!("{}.sig", ir_p.display()), ir_p.to_string_lossy()]
+            ])
+        }
+    };
+    let mut import_arts = serde_json::Map::new();
+    let mut is_mod_map: HashMap<String, bool> = HashMap::new();
+    let mut has_priv_map: HashMap<String, bool> = HashMap::new();
+    let mut walk_stack: Vec<(String, bool, bool)> = Vec::new();
+    for imp in &node.import_specs {
+        if imp.module == node.module_name {
+            continue;
+        }
+        let Some((olean_p, is_mod, _)) = resolve_mod_info(&imp.module) else {
+            continue;
+        };
+        let want_all = non_module || imp.import_all;
+        let prev_priv = has_priv_map.get(&imp.module).copied().unwrap_or(false);
+        let final_all = want_all || prev_priv;
+        if !import_arts.contains_key(&imp.module) || final_all {
+            import_arts.insert(imp.module.clone(), make_arts(&olean_p, is_mod, final_all));
+            is_mod_map.insert(imp.module.clone(), is_mod);
+            has_priv_map.insert(imp.module.clone(), is_mod && final_all);
+        }
+    }
+    for imp in node.import_specs.iter().rev() {
+        if imp.module == node.module_name {
+            continue;
+        }
+        let Some((_, dep_is_mod, sub_specs)) = resolve_mod_info(&imp.module) else {
+            continue;
+        };
+        let imp_all = non_module || imp.import_all;
+        for sub in sub_specs.iter().rev() {
+            if sub.module == imp.module {
+                continue;
+            }
+            let reachable = imp_all || sub.is_exported;
+            let c_all = non_module || (imp_all && (!dep_is_mod || sub.import_all));
+            let c_meta = imp.is_meta || (reachable && sub.is_meta);
+            if reachable || c_meta {
+                walk_stack.push((sub.module.clone(), c_all, c_meta));
+            }
+        }
+    }
+    let mut all_visited: HashSet<String> = HashSet::new();
+    let mut meta_visited: HashSet<String> = HashSet::new();
+    while let Some((cur, import_all, needs_meta)) = walk_stack.pop() {
+        let Some((olean_p, is_mod, sub_specs)) = resolve_mod_info(&cur) else {
+            continue;
+        };
+        let do_all = import_all && !all_visited.contains(&cur);
+        let do_meta = needs_meta && !meta_visited.contains(&cur);
+        if import_arts.contains_key(&cur) {
+            let ex_mod = is_mod_map.get(&cur).copied().unwrap_or(false);
+            if !(ex_mod && (do_all || do_meta)) {
+                continue;
+            }
+        }
+        if import_all {
+            all_visited.insert(cur.clone());
+        }
+        if needs_meta {
+            meta_visited.insert(cur.clone());
+        }
+        let want_all =
+            all_visited.contains(&cur) || has_priv_map.get(&cur).copied().unwrap_or(false);
+        import_arts.insert(cur.clone(), make_arts(&olean_p, is_mod, want_all));
+        is_mod_map.insert(cur.clone(), is_mod);
+        has_priv_map.insert(cur.clone(), is_mod && want_all);
+        for sub in sub_specs.iter().rev() {
+            if sub.module == cur {
+                continue;
+            }
+            let reachable = import_all || sub.is_exported;
+            let child_import_all = non_module || (import_all && (!is_mod || sub.import_all));
+            let child_needs_meta = needs_meta || (reachable && sub.is_meta);
+            if reachable || child_needs_meta {
+                walk_stack.push((sub.module.clone(), child_import_all, child_needs_meta));
+            }
+        }
+    }
+    let dynlibs_json: Vec<String> = dynlibs
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+    let plugins_json: Vec<serde_json::Value> = plugins
+        .iter()
+        .map(|p| serde_json::json!({"path": p.to_string_lossy()}))
+        .collect();
+    Ok(serde_json::json!({
+        "name": node.module_name,
+        "package": node.pkg_name,
+        "isModule": node.is_module,
+        "options": setup_options,
+        "importArts": import_arts,
+        "dynlibs": dynlibs_json,
+        "plugins": plugins_json
+    }))
+}
+
+fn lake_cc_and_flags(cfg: &ProjectConfig) -> Result<(PathBuf, Vec<String>, Vec<String>, bool)> {
+    let sysroot = cfg
+        .lean_bin
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cannot derive Lean sysroot from `{}`",
+                cfg.lean_bin.display()
+            )
+        })?
+        .to_path_buf();
+    let custom_cc = std::env::var("LEAN_CC").is_ok();
+    let cc = if custom_cc {
+        PathBuf::from(std::env::var("LEAN_CC").unwrap_or_default())
+    } else if sysroot.join("bin/clang").is_file() {
+        sysroot.join("bin/clang")
+    } else if let Ok(cc_env) = std::env::var("CC") {
+        PathBuf::from(cc_env)
+    } else {
+        PathBuf::from("cc")
+    };
+    let mut cflags = vec![
+        "-fstack-clash-protection".to_string(),
+        "-ffp-contract=off".to_string(),
+        "-fdata-sections".to_string(),
+        "-ffunction-sections".to_string(),
+        "-fPIC".to_string(),
+        "-fvisibility=hidden".to_string(),
+        "-Wno-unused-command-line-argument".to_string(),
+    ];
+    if !custom_cc {
+        cflags.push("--sysroot".to_string());
+        cflags.push(sysroot.to_string_lossy().to_string());
+        cflags.push("-nostdinc".to_string());
+        cflags.push("-isystem".to_string());
+        cflags.push(sysroot.join("include/clang").to_string_lossy().to_string());
+    }
+    let mut link_flags = vec![
+        "-L".to_string(),
+        sysroot.join("lib/lean").to_string_lossy().to_string(),
+    ];
+    if !custom_cc {
+        link_flags.extend([
+            "--sysroot".to_string(),
+            sysroot.to_string_lossy().to_string(),
+            "-L".to_string(),
+            sysroot.join("lib").to_string_lossy().to_string(),
+            "-L".to_string(),
+            sysroot.join("lib/glibc").to_string_lossy().to_string(),
+            "-lc".to_string(),
+            "-lc_nonshared".to_string(),
+            "-Wl,--as-needed".to_string(),
+            "-l:ld.so".to_string(),
+            "-Wl,--no-as-needed".to_string(),
+            "-lpthread_nonshared".to_string(),
+        ]);
+    }
+    link_flags.extend([
+        "-Wl,--as-needed".to_string(),
+        "-Wl,-Bstatic".to_string(),
+        "-lgmp".to_string(),
+        "-lunwind".to_string(),
+        "-luv".to_string(),
+        "-lssl".to_string(),
+        "-lcrypto".to_string(),
+        "-Wl,-Bdynamic".to_string(),
+        "-Wl,--no-as-needed".to_string(),
+        "-fuse-ld=lld".to_string(),
+        "-Wl,-Bstatic".to_string(),
+        "-lc++".to_string(),
+        "-lc++abi".to_string(),
+        "-Wl,-Bdynamic".to_string(),
+        "-Wl,--as-needed".to_string(),
+        "-lLake_shared".to_string(),
+        "-Wl,--no-as-needed".to_string(),
+        "-Wl,-Bsymbolic".to_string(),
+        "-Wl,--as-needed".to_string(),
+        "-lgmp".to_string(),
+        "-luv".to_string(),
+        "-lssl".to_string(),
+        "-lcrypto".to_string(),
+        "-lpthread".to_string(),
+        "-ldl".to_string(),
+        "-lrt".to_string(),
+        "-Wl,--no-as-needed".to_string(),
+        "-Wl,--gc-sections".to_string(),
+        "-lm".to_string(),
+        "-ldl".to_string(),
+        "-pthread".to_string(),
+    ]);
+    Ok((cc, cflags, link_flags, custom_cc))
+}
+
+fn write_file_atomic(dst_p: &Path, content: &[u8]) -> Result<()> {
+    let Some(parent) = dst_p.parent() else {
+        anyhow::bail!("Destination `{}` has no parent", dst_p.display());
+    };
+    fs::create_dir_all(parent)?;
+    let pid = std::process::id();
+    let seq = crate::pack::next_tmp_id();
+    let fname = dst_p
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("native_out");
+    let tmp_p = parent.join(format!(".turbo_stage_native_{}_{}_{}", pid, seq, fname));
+    let res: Result<()> = (|| {
+        use std::io::Write;
+        let mut f = create_fresh_file(&tmp_p)?;
+        f.write_all(content)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(fs::Permissions::from_mode(0o644))?;
+        }
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = res {
+        let _ = fs::remove_file(&tmp_p);
+        return Err(e);
+    }
+    fs::rename(&tmp_p, dst_p).with_context(|| {
+        let _ = fs::remove_file(&tmp_p);
+        format!(
+            "Failed to atomically commit `{}` -> `{}`",
+            tmp_p.display(),
+            dst_p.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn write_rsp_file(rsp_path: &Path, args: &[String]) -> Result<()> {
+    let mut body = String::new();
+    for arg in args {
+        let escaped = arg.replace('\\', "\\\\").replace('"', "\\\"");
+        body.push('"');
+        body.push_str(&escaped);
+        body.push_str("\"\n");
+    }
+    write_file_atomic(rsp_path, body.as_bytes())
+}
+
+fn write_native_facet_trace(
+    trace_path: &Path,
+    outputs: serde_json::Value,
+    inputs: serde_json::Value,
+) -> Result<()> {
+    let dep_hash = lake_input_hash(&inputs)?;
+    let trace = serde_json::json!({
+        "synthetic": false,
+        "schemaVersion": "2025-09-10",
+        "outputs": outputs,
+        "log": [],
+        "inputs": inputs,
+        "depHash": format!("{:016x}", dep_hash)
+    });
+    write_file_atomic(trace_path, &serde_json::to_vec(&trace)?)
+}
+
+fn build_module_co_export(cfg: &ProjectConfig, node: &ModuleNode) -> Result<PathBuf> {
+    let co_path = module_co_export_path(node);
+    let Some(parent) = co_path.parent() else {
+        anyhow::bail!("`.c.o.export` path `{}` has no parent", co_path.display());
+    };
+    fs::create_dir_all(parent)?;
+    let (cc, cflags, _link_flags, _custom_cc) = lake_cc_and_flags(cfg)?;
+    let sysroot = cfg
+        .lean_bin
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| anyhow::anyhow!("Cannot derive Lean sysroot"))?;
+    let pid = std::process::id();
+    let seq = crate::pack::next_tmp_id();
+    let tmp_co = parent.join(format!(".turbo_tmp_co_{}_{}.o", pid, seq));
+    let _ = fs::remove_file(&tmp_co);
+    let mut cmd = Command::new(&cc);
+    cmd.arg("-c")
+        .arg("-o")
+        .arg(&tmp_co)
+        .arg(&node.c_path)
+        .arg("-I")
+        .arg(sysroot.join("include"));
+    for flag in &cflags {
+        cmd.arg(flag);
+    }
+    cmd.arg("-O3").arg("-DNDEBUG").arg("-DLEAN_EXPORTING");
+    let out = cmd.output().with_context(|| {
+        let _ = fs::remove_file(&tmp_co);
+        format!(
+            "Failed to spawn clang for `.c.o.export` of `{}`",
+            node.module_name
+        )
+    })?;
+    if !out.status.success() {
+        let _ = fs::remove_file(&tmp_co);
+        anyhow::bail!(
+            "clang failed building `.c.o.export` for `{}`: {}",
+            node.module_name,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let co_bytes = fs::read(&tmp_co).with_context(|| {
+        let _ = fs::remove_file(&tmp_co);
+        format!("Failed to read staged `{}`", tmp_co.display())
+    })?;
+    fs::rename(&tmp_co, &co_path).with_context(|| {
+        let _ = fs::remove_file(&tmp_co);
+        format!("Failed to commit `{}`", co_path.display())
+    })?;
+    let co_h = lake_hash_bytes(&co_bytes);
+    write_file_atomic(
+        &PathBuf::from(format!("{}.hash", co_path.display())),
+        format!("{:016x}", co_h).as_bytes(),
+    )?;
+    let c_bytes = fs::read(&node.c_path)?;
+    let c_h = lake_hash_bytes(&c_bytes);
+    let ver_short = cfg
+        .toolchain
+        .rsplit(':')
+        .next()
+        .unwrap_or(&cfg.toolchain)
+        .trim_start_matches('v');
+    let lean_cap = format!("Lean {}, commit {}", ver_short, cfg.lean_githash);
+    let lean_gh_h = lake_hash_bytes(cfg.lean_githash.as_bytes());
+    let platform = std::env::consts::ARCH.to_string()
+        + "-"
+        + if cfg!(target_os = "linux") {
+            "unknown-linux-gnu"
+        } else if cfg!(target_os = "macos") {
+            "apple-darwin"
+        } else {
+            std::env::consts::OS
+        };
+    let platform_h = lake_hash_bytes(platform.as_bytes());
+    let trace_args = ["-O3", "-DNDEBUG", "-DLEAN_EXPORTING"];
+    let trace_args_cap = format!("traceArgs: #[{}]", trace_args.join(", "));
+    let trace_args_h = trace_args.iter().fold(1723u64, |acc, a| {
+        lake_mix_hash(acc, lake_hash_bytes(a.as_bytes()))
+    });
+    let inputs = serde_json::json!([
+        [
+            format!("{}:c", node.module_name),
+            [
+                [node.c_path.to_string_lossy(), format!("{:016x}", c_h)],
+                [lean_cap, format!("{:016x}", lean_gh_h)]
+            ]
+        ],
+        [lean_cap, format!("{:016x}", lean_gh_h)],
+        [trace_args_cap, format!("{:016x}", trace_args_h)],
+        [platform, format!("{:016x}", platform_h)]
+    ]);
+    write_native_facet_trace(
+        &PathBuf::from(format!("{}.trace", co_path.display())),
+        serde_json::json!(format!("{:016x}.o", co_h)),
+        inputs,
+    )?;
+    Ok(co_path)
+}
+
+fn build_shared_object(
+    cfg: &ProjectConfig,
+    so_path: &Path,
+    link_objs: &[PathBuf],
+    link_libs: &[PathBuf],
+) -> Result<()> {
+    let Some(parent) = so_path.parent() else {
+        anyhow::bail!("Shared object path `{}` has no parent", so_path.display());
+    };
+    fs::create_dir_all(parent)?;
+    let (cc, _cflags, link_flags, _custom_cc) = lake_cc_and_flags(cfg)?;
+    let mut rsp_args: Vec<String> = link_objs
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+    rsp_args.extend(link_flags);
+    let rsp_path = PathBuf::from(format!("{}.rsp", so_path.display()));
+    write_rsp_file(&rsp_path, &rsp_args)?;
+    let pid = std::process::id();
+    let seq = crate::pack::next_tmp_id();
+    let tmp_so = parent.join(format!(".turbo_tmp_so_{}_{}.so", pid, seq));
+    let _ = fs::remove_file(&tmp_so);
+    let mut cmd = Command::new(&cc);
+    cmd.arg("-shared")
+        .arg("-o")
+        .arg(&tmp_so)
+        .arg(format!("@{}", rsp_path.display()));
+    for p in link_libs {
+        if let Some(dir) = p.parent() {
+            cmd.arg("-L").arg(dir);
+            if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
+                cmd.arg(format!("-Wl,-rpath,{}", dir.display()));
+            }
+        }
+        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+            let l_arg = if let Some(stripped) = stem.strip_prefix("lib") {
+                format!("-l{}", stripped)
+            } else if let Some(fname) = p.file_name().and_then(|s| s.to_str()) {
+                format!("-l:{}", fname)
+            } else {
+                p.to_string_lossy().to_string()
+            };
+            cmd.arg(l_arg);
+        } else {
+            cmd.arg(p);
+        }
+    }
+    let out = cmd.output().with_context(|| {
+        let _ = fs::remove_file(&tmp_so);
+        format!(
+            "Failed to spawn clang for shared library `{}`",
+            so_path.display()
+        )
+    })?;
+    if !out.status.success() {
+        let _ = fs::remove_file(&tmp_so);
+        anyhow::bail!(
+            "clang failed linking `{}`: {}",
+            so_path.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let so_bytes = fs::read(&tmp_so).with_context(|| {
+        let _ = fs::remove_file(&tmp_so);
+        format!("Failed to read staged `{}`", tmp_so.display())
+    })?;
+    fs::rename(&tmp_so, so_path).with_context(|| {
+        let _ = fs::remove_file(&tmp_so);
+        format!("Failed to commit `{}`", so_path.display())
+    })?;
+    let so_h = lake_hash_bytes(&so_bytes);
+    write_file_atomic(
+        &PathBuf::from(format!("{}.hash", so_path.display())),
+        format!("{:016x}", so_h).as_bytes(),
+    )?;
+    let mut obj_entries = Vec::new();
+    for p in link_objs {
+        let h = verify_and_hash_artifact_bytes(p, true, true)?;
+        obj_entries.push(serde_json::json!([
+            p.to_string_lossy(),
+            format!("{:016x}", h)
+        ]));
+    }
+    let mut lib_entries: Vec<serde_json::Value> = Vec::new();
+    for p in link_libs {
+        let h = verify_and_hash_artifact_bytes(p, true, true)?;
+        lib_entries.push(serde_json::json!([
+            p.to_string_lossy(),
+            format!("{:016x}", h)
+        ]));
+    }
+    let link_libs_json = if lib_entries.is_empty() {
+        serde_json::Value::String("00000000000006bb".to_string())
+    } else {
+        serde_json::Value::Array(lib_entries)
+    };
+    let ver_short = cfg
+        .toolchain
+        .rsplit(':')
+        .next()
+        .unwrap_or(&cfg.toolchain)
+        .trim_start_matches('v');
+    let lean_cap = format!("Lean {}, commit {}", ver_short, cfg.lean_githash);
+    let lean_gh_h = lake_hash_bytes(cfg.lean_githash.as_bytes());
+    let platform = std::env::consts::ARCH.to_string()
+        + "-"
+        + if cfg!(target_os = "linux") {
+            "unknown-linux-gnu"
+        } else if cfg!(target_os = "macos") {
+            "apple-darwin"
+        } else {
+            std::env::consts::OS
+        };
+    let platform_h = lake_hash_bytes(platform.as_bytes());
+    let ext = if cfg!(target_os = "macos") {
+        "dylib"
+    } else if cfg!(target_os = "windows") {
+        "dll"
+    } else {
+        "so"
+    };
+    let inputs = serde_json::json!([
+        ["linkObjs", obj_entries],
+        ["linkLibs", link_libs_json],
+        ["traceArgs: #[]", "00000000000006bb"],
+        [lean_cap, format!("{:016x}", lean_gh_h)],
+        [platform, format!("{:016x}", platform_h)]
+    ]);
+    write_native_facet_trace(
+        &PathBuf::from(format!("{}.trace", so_path.display())),
+        serde_json::json!(format!("{:016x}.{}", so_h, ext)),
+        inputs,
+    )?;
+    Ok(())
+}
+
+fn build_wave_native_artifacts(
+    cfg: &ProjectConfig,
+    dag: &ModuleDag,
+    wave: &[String],
+    preserve_project: bool,
+    completed_mods: &HashSet<String>,
+    built_shared_libs: &mut HashSet<(String, String)>,
+) -> Result<()> {
+    if preserve_project {
+        return Ok(());
+    }
+    for mod_name in wave {
+        let Some(node) = dag.nodes.get(mod_name) else {
+            continue;
+        };
+        if crate::lake_build::worktree_auto_link_disabled(&node.pkg_root) {
+            continue;
+        }
+        if node.needs_co_export {
+            build_module_co_export(cfg, node)?;
+        }
+        if node.needs_dynlib {
+            if let Some(so_path) = module_dynlib_so_path(node) {
+                let co_path = module_co_export_path(node);
+                let link_libs = compute_module_dynlib_link_libs(dag, node);
+                build_shared_object(cfg, &so_path, &[co_path], &link_libs)?;
+            }
+        }
+    }
+    for sl in &dag.shared_libs {
+        let key = (sl.pkg_name.clone(), sl.lib_name.clone());
+        if built_shared_libs.contains(&key) {
+            continue;
+        }
+        if !sl.local_modules.iter().all(|m| completed_mods.contains(m)) {
+            continue;
+        }
+        let Some(pkg) = std::iter::once(&cfg.root_pkg)
+            .chain(&cfg.dep_pkgs)
+            .find(|p| p.name == sl.pkg_name)
+        else {
+            continue;
+        };
+        if crate::lake_build::worktree_auto_link_disabled(&pkg.pkg_root) {
+            built_shared_libs.insert(key);
+            continue;
+        }
+        let mut link_objs = Vec::with_capacity(sl.local_modules.len());
+        for m in &sl.local_modules {
+            if let Some(mn) = dag.nodes.get(m) {
+                link_objs.push(module_co_export_path(mn));
+            }
+        }
+        let link_libs = compute_shared_lib_link_libs(dag, sl);
+        build_shared_object(cfg, &sl.path, &link_objs, &link_libs)?;
+        built_shared_libs.insert(key);
+    }
+    Ok(())
+}
+
 static PUBLISH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn acquire_publish_flock_mode(
@@ -7460,6 +9878,14 @@ struct BackupRecord {
     backup_file: Option<(PathBuf, blake3::Hash, u64)>,
 }
 
+/// Create a staging/backup file at a predictable path without following anything already
+/// there: a planted symlink is removed (not its target), then the file is created exclusively.
+fn create_fresh_file(p: &Path) -> std::io::Result<fs::File> {
+    if fs::symlink_metadata(p).is_ok() {
+        fs::remove_file(p)?;
+    }
+    fs::OpenOptions::new().write(true).create_new(true).open(p)
+}
 fn sync_parent_dir(p: &Path) -> Result<()> {
     #[cfg(unix)]
     if let Some(parent) = p.parent() {
@@ -7499,7 +9925,7 @@ fn write_verified_copy_or_link(
         || (try_hard_link && fs::hard_link(src_p, target_p).is_ok());
     if !linked_or_renamed {
         use std::io::Write;
-        let mut f = fs::File::create(target_p)
+        let mut f = create_fresh_file(target_p)
             .with_context(|| format!("Failed to create `{}`", target_p.display()))?;
         f.write_all(&src_bytes)
             .with_context(|| format!("Failed to write `{}`", target_p.display()))?;
@@ -7665,9 +10091,13 @@ fn publish_module_artifacts_atomic(
     let dst_ir_sig = PathBuf::from(format!("{}.sig", dst_ir.display()));
     let dst_ltar = node.c_path.with_extension("ltar");
     let dst_bc = node.c_path.with_extension("bc");
+    let dst_ltar_hash = PathBuf::from(format!("{}.hash", dst_ltar.display()));
+    let dst_bc_hash = PathBuf::from(format!("{}.hash", dst_bc.display()));
     let tmp_ltar = tmp_c.with_extension("ltar");
     let tmp_bc = tmp_c.with_extension("bc");
-    let pairs: [(&Path, &Path, bool); 9] = [
+    let tmp_ltar_hash = PathBuf::from(format!("{}.hash", tmp_ltar.display()));
+    let tmp_bc_hash = PathBuf::from(format!("{}.hash", tmp_bc.display()));
+    let pairs: [(&Path, &Path, bool); 11] = [
         (tmp_olean, &node.olean_path, true),
         (tmp_ilean, &node.ilean_path, true),
         (tmp_srv, &dst_srv, node.is_module),
@@ -7676,7 +10106,9 @@ fn publish_module_artifacts_atomic(
         (tmp_ir_sig, &dst_ir_sig, node.is_module),
         (tmp_c, &node.c_path, node.needs_c),
         (&tmp_ltar, &dst_ltar, false),
+        (&tmp_ltar_hash, &dst_ltar_hash, false),
         (&tmp_bc, &dst_bc, false),
+        (&tmp_bc_hash, &dst_bc_hash, false),
     ];
     let pid = std::process::id();
     let seq = crate::pack::next_tmp_id();
@@ -7842,8 +10274,6 @@ fn publish_module_artifacts_atomic(
             }
         }
     }
-    let _ = fs::remove_file(format!("{}.hash", dst_ltar.display()));
-    let _ = fs::remove_file(format!("{}.hash", dst_bc.display()));
     Ok(())
 }
 
@@ -8064,7 +10494,8 @@ fn canonicalize_path_with_missing_tail(p: &Path) -> Result<PathBuf> {
     }
     let mut cur = p;
     let mut tail_names: Vec<std::ffi::OsString> = Vec::new();
-    while !cur.exists() {
+    // A dangling symlink is not a missing tail: canonicalizing it below fails closed.
+    while fs::symlink_metadata(cur).is_err() {
         let fname = cur.file_name().ok_or_else(|| {
             anyhow::anyhow!("Cannot resolve non-existent root path `{}`", p.display())
         })?;
@@ -8084,6 +10515,82 @@ fn canonicalize_path_with_missing_tail(p: &Path) -> Result<PathBuf> {
         canon.push(name);
     }
     Ok(canon)
+}
+
+/// Roots an untrusted build may use as package roots: the checkout, plus directories the
+/// operator lists in `TURBO_LEAN_TRUSTED_PACKAGES_DIR` (e.g. a shared `.lake/packages` cache).
+fn untrusted_package_roots(canon_dir: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![canon_dir.to_path_buf()];
+    if let Some(v) = std::env::var_os("TURBO_LEAN_TRUSTED_PACKAGES_DIR") {
+        roots.extend(
+            std::env::split_paths(&v)
+                .filter(|p| p.is_absolute())
+                .filter_map(|p| p.canonicalize().ok()),
+        );
+    }
+    roots
+}
+
+/// Fail closed unless every directory a native build writes to (package build directories and
+/// each module's artifact directories) lies inside its package root. Untrusted builds also
+/// resolve symlinks and require each package root inside the checkout or a trusted packages dir.
+fn validate_build_write_dirs(
+    cfg: &ProjectConfig,
+    dag: &ModuleDag,
+    canon_dir: &Path,
+    is_untrusted: bool,
+) -> Result<()> {
+    let roots = untrusted_package_roots(canon_dir);
+    let check = |pkg_root: &Path, dir: &Path| -> Result<()> {
+        let lexical_ok = dir.starts_with(pkg_root)
+            && !dir
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir));
+        let canonical_ok = !is_untrusted
+            || (|| -> Result<bool> {
+                let canon_root = pkg_root.canonicalize()?;
+                Ok(roots.iter().any(|r| canon_root.starts_with(r))
+                    && canonicalize_path_with_missing_tail(dir)?.starts_with(&canon_root))
+            })()
+            .unwrap_or(false);
+        if !(lexical_ok && canonical_ok) {
+            anyhow::bail!(
+                "Refusing to write build outputs to `{}`: outside package `{}`: fail-closed build path gate",
+                dir.display(),
+                pkg_root.display()
+            );
+        }
+        Ok(())
+    };
+    for pkg in std::iter::once(&cfg.root_pkg).chain(&cfg.dep_pkgs) {
+        let build = pkg.pkg_root.join(&pkg.build_dir);
+        for dir in [
+            build.join(&pkg.lean_lib_dir),
+            build.join(&pkg.native_lib_dir),
+            build.join(&pkg.ir_dir),
+            pkg.pkg_root.join(".lake/build"),
+        ] {
+            check(&pkg.pkg_root, &dir)?;
+        }
+    }
+    for sl in &dag.shared_libs {
+        if let Some(pkg) = std::iter::once(&cfg.root_pkg)
+            .chain(&cfg.dep_pkgs)
+            .find(|p| p.name == sl.pkg_name)
+        {
+            check(&pkg.pkg_root, sl.path.parent().unwrap_or(&sl.path))?;
+        }
+    }
+    for node in dag.nodes.values() {
+        check(&node.pkg_root, &node.pkg_root.join(".lake/build"))?;
+        for p in [&node.olean_path, &node.ilean_path, &node.c_path] {
+            check(&node.pkg_root, p.parent().unwrap_or(p))?;
+        }
+        if let Some(so_p) = module_dynlib_so_path(node) {
+            check(&node.pkg_root, so_p.parent().unwrap_or(&so_p))?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_untrusted_sandbox_search_paths(
@@ -8261,13 +10768,16 @@ fn build_module_compile_command(
 
 type ModuleCompileOutput = (i64, String, String);
 
+#[allow(clippy::too_many_arguments)]
 fn compile_single_module_direct(
     cfg: &ProjectConfig,
+    dag: &ModuleDag,
     node: &ModuleNode,
     lean_path_env: &str,
     ld_library_path_env: &str,
     is_untrusted: bool,
     bwrap_bin: Option<&Path>,
+    preserve_lake: bool,
 ) -> Result<ModuleCompileOutput> {
     let t0 = Instant::now();
     let pid = std::process::id();
@@ -8291,25 +10801,12 @@ fn compile_single_module_direct(
     if let Some(parent) = tmp_olean.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut setup_options = serde_json::Map::new();
-    for (k, v) in &node.lean_options {
-        setup_options.insert(k.to_lean_string(), v.to_json_value());
+    let setup_json = build_setup_json(cfg, dag, node, None, None)?;
+    let setup_bytes = serde_json::to_vec(&setup_json)?;
+    fs::write(&tmp_setup, &setup_bytes)?;
+    if !preserve_lake {
+        write_file_atomic(&module_setup_json_path(node), &setup_bytes)?;
     }
-    setup_options.insert("warn.sorry".to_string(), serde_json::Value::Bool(true));
-    setup_options.insert(
-        "debug.skipKernelTC".to_string(),
-        serde_json::Value::Bool(false),
-    );
-    let setup_json = serde_json::json!({
-        "name": node.module_name,
-        "package": node.pkg_name,
-        "isModule": node.is_module,
-        "options": setup_options,
-        "importArts": {},
-        "dynlibs": [],
-        "plugins": []
-    });
-    fs::write(&tmp_setup, serde_json::to_vec(&setup_json)?)?;
     let mut cmd = build_module_compile_command(
         cfg,
         node,
@@ -8410,6 +10907,19 @@ fn compile_single_module_direct(
     let expected_dig = compute_olean_artifact_set_digest(&node.olean_path)?;
     let dur_ms = t0.elapsed().as_millis() as i64;
     Ok((dur_ms, stdout_str, expected_dig))
+}
+
+/// Whether every cached file output of a module lands on one of `node`'s artifact paths.
+fn cas_outputs_bound_to_node(outputs: &[BlobEntry], target_root: &Path, node: &ModuleNode) -> bool {
+    let expected: Vec<PathBuf> = olean_artifact_paths(&node.olean_path)
+        .into_iter()
+        .map(|(_, p)| p)
+        .chain([node.c_path.clone()])
+        .collect();
+    outputs
+        .iter()
+        .filter(|o| !o.rel_path.starts_with("thm:"))
+        .all(|o| expected.contains(&target_root.join(&o.rel_path)))
 }
 
 fn store_module_artifacts_in_cas(
@@ -8520,7 +11030,7 @@ pub(crate) fn record_verified_dep_source(
         ));
         let write_ok = (|| -> std::io::Result<()> {
             use std::io::Write;
-            let mut f = fs::File::create(&tmp_path)?;
+            let mut f = create_fresh_file(&tmp_path)?;
             f.write_all(&json_bytes)?;
             f.sync_all()?;
             Ok(())
@@ -8557,6 +11067,7 @@ pub fn build_project_modules_native(
         .unwrap_or_else(|| "lean-project".to_string());
     let cfg = resolve_project_config_with_trust(&canon_dir, is_untrusted)?;
     let dag = build_module_dag_with_trust(&cfg, targets, is_untrusted)?;
+    validate_build_write_dirs(&cfg, &dag, &canon_dir, is_untrusted)?;
     let preserve_project = crate::lake_build::worktree_auto_link_disabled(&canon_dir);
     let mut report = NativeBuildReport {
         modules_total: dag.nodes.len(),
@@ -8576,6 +11087,7 @@ pub fn build_project_modules_native(
     for pkg in std::iter::once(&cfg.root_pkg).chain(&cfg.dep_pkgs) {
         if !preserve_project && !crate::lake_build::worktree_auto_link_disabled(&pkg.pkg_root) {
             fs::create_dir_all(pkg.pkg_root.join(&pkg.build_dir).join(&pkg.lean_lib_dir))?;
+            fs::create_dir_all(pkg.pkg_root.join(&pkg.build_dir).join(&pkg.native_lib_dir))?;
             fs::create_dir_all(pkg.pkg_root.join(&pkg.build_dir).join(&pkg.ir_dir))?;
         }
     }
@@ -8621,6 +11133,8 @@ pub fn build_project_modules_native(
         }
     }
     // Execute topological waves
+    let mut completed_mods: HashSet<String> = HashSet::new();
+    let mut built_shared_libs: HashSet<(String, String)> = HashSet::new();
     for wave in &dag.waves {
         let mut misses_to_compile: Vec<(String, String)> = Vec::new();
         for mod_name in wave {
@@ -8677,24 +11191,58 @@ pub fn build_project_modules_native(
                 }
             }
             let dep_digests_vec: Vec<(String, String)> = dep_digests_map.into_iter().collect();
-            let mod_key = compute_module_cas_key(&cfg, node, &dep_digests_vec, node.needs_c)?;
+            let raw_imp_dynlibs = compute_module_raw_import_dynlibs(&dag, node);
+            let mut dynlib_digests: Vec<(String, String)> =
+                Vec::with_capacity(raw_imp_dynlibs.len());
+            for dp in &raw_imp_dynlibs {
+                let bytes = fs::read(dp).with_context(|| {
+                    format!(
+                        "Failed to read imported precompiled shared library `{}` for `{}`",
+                        dp.display(),
+                        mod_name
+                    )
+                })?;
+                let tag = dp
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("dynlib")
+                    .to_string();
+                dynlib_digests.push((tag, blake3::hash(&bytes).to_hex().to_string()));
+            }
+            let mod_key = compute_module_cas_key_with_dynlibs(
+                &cfg,
+                node,
+                &dep_digests_vec,
+                node.needs_c,
+                &dynlib_digests,
+            )?;
             // Check per-module CAS in TurboStore (`module_unit`), or fallback key with `needs_c=true` when `node.needs_c=false`.
             // Use `get_cached_action` (read-only lookup) so probing `c_key` or failing compilation does not leave an unreleased Singleflight lease.
             let mut cas_hit_outputs: Option<Vec<BlobEntry>> = None;
             if let Some(outputs) = store.get_cached_action(&mod_key, trust_domain)? {
                 cas_hit_outputs = Some(outputs);
             } else if !node.needs_c {
-                let c_key = compute_module_cas_key(&cfg, node, &dep_digests_vec, true)?;
+                let c_key = compute_module_cas_key_with_dynlibs(
+                    &cfg,
+                    node,
+                    &dep_digests_vec,
+                    true,
+                    &dynlib_digests,
+                )?;
                 if let Some(outputs) = store.get_cached_action(&c_key, trust_domain)? {
                     cas_hit_outputs = Some(outputs);
                 }
             }
+            let target_root = if node.pkg_root.starts_with(&canon_dir) {
+                &canon_dir
+            } else {
+                &node.pkg_root
+            };
+            // Recorded output paths come from whichever checkout stored the entry and are not
+            // part of the key: restore only onto this node's own (preflighted) artifact paths.
+            let cas_hit_outputs =
+                cas_hit_outputs.filter(|o| cas_outputs_bound_to_node(o, target_root, node));
             if let Some(outputs) = cas_hit_outputs {
-                let target_root = if node.pkg_root.starts_with(&canon_dir) {
-                    &canon_dir
-                } else {
-                    &node.pkg_root
-                };
                 // The invocation's project policy also covers external package roots.
                 // Keep cache-hit validation/auditing, but do not erase artifacts or
                 // regenerate Lake sidecars when automatic materialization is disabled.
@@ -8788,6 +11336,10 @@ pub fn build_project_modules_native(
                         if !is_untrusted {
                             record_verified_dep_source(&cfg, node, &dig, node.is_root_pkg);
                         }
+                        write_file_atomic(
+                            &module_setup_json_path(node),
+                            &serde_json::to_vec(&build_setup_json(&cfg, &dag, node, None, None)?)?,
+                        )?;
                     }
                     olean_digests.insert(mod_name.clone(), dig);
                     report.modules_cached += 1;
@@ -8802,6 +11354,19 @@ pub fn build_project_modules_native(
             misses_to_compile.push((mod_name.clone(), mod_key));
         }
         if misses_to_compile.is_empty() {
+            for mod_name in wave {
+                completed_mods.insert(mod_name.clone());
+            }
+            if !is_untrusted {
+                build_wave_native_artifacts(
+                    &cfg,
+                    &dag,
+                    wave,
+                    preserve_project,
+                    &completed_mods,
+                    &mut built_shared_libs,
+                )?;
+            }
             continue;
         }
         if !cfg.lean_bin.is_file() {
@@ -8834,11 +11399,14 @@ pub fn build_project_modules_native(
                     let node = dag_ref.nodes.get(mod_name).expect("node in dag");
                     let res = compile_single_module_direct(
                         cfg_ref,
+                        dag_ref,
                         node,
                         lp_ref,
                         ld_ref,
                         is_untrusted,
                         bwrap_ref,
+                        preserve_project
+                            || crate::lake_build::worktree_auto_link_disabled(&node.pkg_root),
                     );
                     (i, res)
                 })
@@ -8861,11 +11429,16 @@ pub fn build_project_modules_native(
                             let node = dag_ref.nodes.get(mod_name).expect("node in dag");
                             let res = compile_single_module_direct(
                                 cfg_ref,
+                                dag_ref,
                                 node,
                                 lp_ref,
                                 ld_ref,
                                 is_untrusted,
                                 bwrap_ref,
+                                preserve_project
+                                    || crate::lake_build::worktree_auto_link_disabled(
+                                        &node.pkg_root,
+                                    ),
                             );
                             local.push((i, res));
                         }
@@ -8988,6 +11561,19 @@ pub fn build_project_modules_native(
             olean_digests.insert(mod_name.clone(), dig);
             report.modules_compiled += 1;
             report.compiled_modules.push(mod_name.clone());
+        }
+        for mod_name in wave {
+            completed_mods.insert(mod_name.clone());
+        }
+        if !is_untrusted {
+            build_wave_native_artifacts(
+                &cfg,
+                &dag,
+                wave,
+                preserve_project,
+                &completed_mods,
+                &mut built_shared_libs,
+            )?;
         }
     }
     Ok(report)
@@ -9483,7 +12069,12 @@ lean_exe «demo-exe» where
         let own = dir.join("own-lakefile.lean");
         fs::write(&own, include_str!("../../../lean/lakefile.lean")).unwrap();
         let own_pkg = parse_lakefile_lean(&dir, &own, true).unwrap();
-        assert_eq!((own_pkg.libs.len(), own_pkg.exes.len()), (3, 4));
+        let own_src = include_str!("../../../lean/lakefile.lean");
+        let count = |kw: &str| own_src.lines().filter(|l| l.starts_with(kw)).count();
+        assert_eq!(
+            (own_pkg.libs.len(), own_pkg.exes.len()),
+            (count("lean_lib "), count("lean_exe "))
+        );
         // `Cache.+` / `MathlibTest.+` are submodule globs, not modules named `+`.
         let globs = |name: &str| {
             pkg.libs
@@ -11208,9 +13799,11 @@ globs = ["Opt.+"]
             );
 
             // (c) `pkg.precompileModules = true` + `lib.precompileModules = false` -> Lake's `LeanLib.precompileModules` is `self.pkg.precompileModules || self.config.precompileModules` (`true`),
-            // propagating `needs_c` upstream across a diamond DAG (`Pre.Base` <- `Pre.Left`/`Pre.Right` <- `Pre.Top`), and matching `lake build` bit-for-bit on `Pre.Base`.
+            // propagating `needs_c`, `.c.o.export`, module `.so` dynlibs, and library shared object `libws9__pre_Pre.so` across a diamond DAG (`Pre.Base` <- `Pre.Left`/`Pre.Right` <- `Pre.Top`)
+            // and downstream library `Down` (`Down.Use`), so full `lake build --no-build` exits 0!
             let pre_proj = dir.join("ws9_pre_proj");
             fs::create_dir_all(pre_proj.join("Pre")).unwrap();
+            fs::create_dir_all(pre_proj.join("Down")).unwrap();
             fs::write(
                 pre_proj.join("lean-toolchain"),
                 "leanprover/lean4:v4.35.0\n",
@@ -11220,7 +13813,7 @@ globs = ["Opt.+"]
                 pre_proj.join("lakefile.toml"),
                 r#"name = "ws9_pre"
 precompileModules = true
-defaultTargets = ["Pre"]
+defaultTargets = ["Pre", "Down"]
 [leanOptions]
 autoImplicit = false
 weak.linter."unused-vars" = false
@@ -11228,7 +13821,12 @@ weak.linter."0" = true
 [[lean_lib]]
 name = "Pre"
 precompileModules = false
+roots = ["Pre.Top"]
 globs = ["Pre.+"]
+[[lean_lib]]
+name = "Down"
+roots = ["Down.Use"]
+globs = ["Down.+"]
 "#,
             )
             .unwrap();
@@ -11248,6 +13846,28 @@ globs = ["Pre.+"]
                 "import Pre.Left\nimport Pre.Right\ndef top : Nat := left + right\n",
             )
             .unwrap();
+            fs::write(
+                pre_proj.join("Down/Use.lean"),
+                "import Pre.Top\ndef useTop : Nat := top + 10\n",
+            )
+            .unwrap();
+            // Untrusted mode must fail closed before running clang or loading native dynlibs.
+            let err_untrusted_pre = build_project_modules_native(
+                &mut store,
+                &pre_proj,
+                &[],
+                "untrusted:pr",
+                1,
+                true,
+                true,
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err_untrusted_pre.contains("fail-closed"),
+                "expected untrusted rejection for precompileModules, got: {err_untrusted_pre}"
+            );
             build_project_modules_native(
                 &mut store,
                 &pre_proj,
@@ -11264,25 +13884,41 @@ globs = ["Pre.+"]
                     pre_proj.join(format!(".lake/build/ir/Pre/{m}.c")).is_file(),
                     "Pre/{m}.c must be materialized when pkg.precompileModules = true even if lib.precompileModules = false"
                 );
+                assert!(
+                    pre_proj
+                        .join(format!(".lake/build/ir/Pre/{m}.c.o.export"))
+                        .is_file(),
+                    "Pre/{m}.c.o.export must be materialized"
+                );
             }
             let pre_base_trace: serde_json::Value = serde_json::from_slice(
                 &fs::read(pre_proj.join(".lake/build/lib/lean/Pre/Base.trace")).unwrap(),
             )
             .unwrap();
-            // `Pre.Base` has no same-lib imports (`impLibs` is empty), so `Pre.Base:c` and `Pre.Base:olean` are 100% up-to-date!
-            let pre_base_only = Command::new(&lake_bin)
-                .args(["build", "Pre.Base:c", "Pre.Base:olean", "--no-build"])
+            let pre_top_trace: serde_json::Value = serde_json::from_slice(
+                &fs::read(pre_proj.join(".lake/build/lib/lean/Pre/Top.trace")).unwrap(),
+            )
+            .unwrap();
+            let down_use_trace: serde_json::Value = serde_json::from_slice(
+                &fs::read(pre_proj.join(".lake/build/lib/lean/Down/Use.trace")).unwrap(),
+            )
+            .unwrap();
+            // Full `lake build --no-build` across all default targets (`Pre`, `Pre:shared`, `Down`, `Down:shared`, module dynlibs, and module oleans) must exit 0!
+            let full_pre_no_build = Command::new(&lake_bin)
+                .args(["build", "--no-build"])
+                .env("SANDBOXED_ALLOW_RAW_LAKE", "1")
                 .env("LAKE_CACHE_DIR", &lake_cache)
                 .current_dir(&pre_proj)
                 .status()
                 .unwrap();
             assert!(
-                pre_base_only.success(),
-                "`lake build Pre.Base:c Pre.Base:olean --no-build` must succeed when pkg.precompileModules = true"
+                full_pre_no_build.success(),
+                "`lake build --no-build` must exit 0 on precompileModules diamond + downstream library"
             );
             fs::remove_dir_all(pre_proj.join(".lake/build")).unwrap();
             let clean_pre_lake = Command::new(&lake_bin)
                 .arg("build")
+                .env("SANDBOXED_ALLOW_RAW_LAKE", "1")
                 .env("LAKE_CACHE_DIR", &lake_cache)
                 .current_dir(&pre_proj)
                 .status()
@@ -11292,8 +13928,18 @@ globs = ["Pre.+"]
                 &fs::read(pre_proj.join(".lake/build/lib/lean/Pre/Base.trace")).unwrap(),
             )
             .unwrap();
+            let lake_pre_top_trace: serde_json::Value = serde_json::from_slice(
+                &fs::read(pre_proj.join(".lake/build/lib/lean/Pre/Top.trace")).unwrap(),
+            )
+            .unwrap();
+            let lake_down_use_trace: serde_json::Value = serde_json::from_slice(
+                &fs::read(pre_proj.join(".lake/build/lib/lean/Down/Use.trace")).unwrap(),
+            )
+            .unwrap();
             assert_eq!(pre_base_trace["depHash"], lake_pre_base_trace["depHash"]);
             assert_eq!(pre_base_trace["outputs"], lake_pre_base_trace["outputs"]);
+            assert_eq!(pre_top_trace["outputs"], lake_pre_top_trace["outputs"]);
+            assert_eq!(down_use_trace["outputs"], lake_down_use_trace["outputs"]);
         }
         let _ = fs::remove_dir_all(&dir);
     }
@@ -11515,6 +14161,10 @@ globs = ["Pre.+"]
 
     #[test]
     fn test_adversarial_cas_key_dep_digest_validation_and_ambiguous_or_same_mtime_deps() {
+        // Other tests toggle `TURBO_LEAN_NO_WORKTREE_LINK` under the env lock.
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _bwrap_guard = BWRAP_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -11911,6 +14561,60 @@ globs = ["Pre.+"]
         fs::write(&main_untrusted.olean_path, &orig_olean_bytes).unwrap();
         fs::write(&main_untrusted.ilean_path, &orig_ilean_bytes).unwrap();
 
+        // 10b. Stale `.ltar`, `.ltar.hash`, `.bc`, and `.bc.hash` cleanup is transactional inside
+        // `publish_module_artifacts_atomic`: when all are regular files, publication removes all four;
+        // when Phase 2b fails (e.g. a non-empty directory at `Main.bc.hash`), publication fails and
+        // rolls back pre-existing `.olean`, `.ilean`, `.ltar`, and `.ltar.hash` cleanly.
+        let dst_ltar = main_untrusted.c_path.with_extension("ltar");
+        let dst_ltar_hash = PathBuf::from(format!("{}.hash", dst_ltar.display()));
+        let dst_bc = main_untrusted.c_path.with_extension("bc");
+        let dst_bc_hash = PathBuf::from(format!("{}.hash", dst_bc.display()));
+        fs::create_dir_all(dst_ltar.parent().unwrap()).unwrap();
+        fs::write(&dst_ltar, b"stale_ltar_bytes").unwrap();
+        fs::write(&dst_ltar_hash, b"0123456789abcdef").unwrap();
+        fs::create_dir_all(dst_bc_hash.join("blocker_subfile")).unwrap();
+        let bad_tmp3 = proj_dir.join(".lake/build/.turbo_bad_pub_tmp3");
+        fs::create_dir_all(bad_tmp3.join("App")).unwrap();
+        fs::write(bad_tmp3.join("App/Main.olean"), b"corrupt_phase2b_olean").unwrap();
+        fs::write(bad_tmp3.join("App/Main.ilean"), b"corrupt_phase2b_ilean").unwrap();
+        let phase2b_err = pub_from_tmp(&bad_tmp3).unwrap_err();
+        let phase2b_msg = format!("{:#}", phase2b_err);
+        assert!(
+            phase2b_msg.contains("Failed to remove stale companion artifact"),
+            "unexpected error: {}",
+            phase2b_msg
+        );
+        assert_eq!(
+            fs::read(&main_untrusted.olean_path).unwrap(),
+            orig_olean_bytes
+        );
+        assert_eq!(
+            fs::read(&main_untrusted.ilean_path).unwrap(),
+            orig_ilean_bytes
+        );
+        assert_eq!(fs::read(&dst_ltar).unwrap(), b"stale_ltar_bytes");
+        assert_eq!(fs::read(&dst_ltar_hash).unwrap(), b"0123456789abcdef");
+        assert!(!validate_materialized_module_artifacts(
+            main_untrusted,
+            false
+        ));
+        let _ = fs::remove_dir_all(&dst_bc_hash);
+        fs::write(&dst_bc, b"stale_bc_bytes").unwrap();
+        fs::write(&dst_bc_hash, b"fedcba9876543210").unwrap();
+        let good_tmp3 = proj_dir.join(".lake/build/.turbo_good_pub_tmp3");
+        fs::create_dir_all(good_tmp3.join("App")).unwrap();
+        fs::write(good_tmp3.join("App/Main.olean"), &orig_olean_bytes).unwrap();
+        fs::write(good_tmp3.join("App/Main.ilean"), &orig_ilean_bytes).unwrap();
+        pub_from_tmp(&good_tmp3).unwrap();
+        assert!(!dst_ltar.exists());
+        assert!(!dst_ltar_hash.exists());
+        assert!(!dst_bc.exists());
+        assert!(!dst_bc_hash.exists());
+        assert!(validate_materialized_module_artifacts(
+            main_untrusted,
+            false
+        ));
+
         // 11. Verify Lake `.hash` and `.trace` sidecars + bit-exact Lake MurmurHash64A parity
         assert_eq!(
             format!("{:016x}", lake_hash_text("-DautoImplicit=false")),
@@ -12140,5 +14844,709 @@ roots = ["Fast"]
             fast_args
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn test_lakefile_and_manifest_path_fields_reject_escapes() {
+        // P0-5: `irDir = "/abs"` (or `..`) in any package used to send `.c` writes and stale
+        // deletes anywhere on the host.
+        let dir = make_temp_test_dir("path_escape");
+        let tf = dir.join("lakefile.toml");
+        let lf = dir.join("lakefile.lean");
+        for (field, lean_block) in [
+            ("srcDir", "package p where\n  srcDir := {v}\n"),
+            ("buildDir", "package p where\n  buildDir := {v}\n"),
+            ("leanLibDir", "package p where\n  leanLibDir := {v}\n"),
+            ("irDir", "package p where\n  irDir := {v}\n"),
+            ("packagesDir", "package p where\n  packagesDir := {v}\n"),
+            ("nativeLibDir", "package p where\n  nativeLibDir := {v}\n"),
+            ("srcDir", "package p\nlean_lib A where\n  srcDir := {v}\n"),
+        ] {
+            for bad in ["/tmp/turbo-evil", "../sibling", "src/../../up"] {
+                for is_root in [true, false] {
+                    let toml = if lean_block.contains("lean_lib") {
+                        format!("name = \"p\"\n[[lean_lib]]\nname = \"A\"\n{field} = \"{bad}\"\n")
+                    } else {
+                        format!("name = \"p\"\n{field} = \"{bad}\"\n")
+                    };
+                    fs::write(&tf, toml).unwrap();
+                    let err = parse_lakefile_toml(&dir, &tf, is_root)
+                        .unwrap_err()
+                        .to_string();
+                    assert!(
+                        err.contains(field) && err.contains("relative"),
+                        "{field}={bad}: {err}"
+                    );
+                    let lean = format!(
+                        "import Lake\nopen Lake DSL\n{}",
+                        lean_block.replace("{v}", &format!("\"{bad}\""))
+                    );
+                    fs::write(&lf, lean).unwrap();
+                    let err = parse_lakefile_lean(&dir, &lf, is_root)
+                        .unwrap_err()
+                        .to_string();
+                    assert!(
+                        err.contains(field) && err.contains("relative"),
+                        "{field}={bad}: {err}"
+                    );
+                }
+            }
+        }
+        // Package-relative paths keep working.
+        fs::write(
+            &tf,
+            "name = \"p\"\nsrcDir = \"./src\"\nbuildDir = \"out/build\"\n",
+        )
+        .unwrap();
+        let pkg = parse_lakefile_toml(&dir, &tf, true).unwrap();
+        assert_eq!(pkg.build_dir, PathBuf::from("out/build"));
+        fs::remove_file(&tf).unwrap();
+        fs::remove_file(&lf).unwrap();
+
+        let manifest = |pkgs_dir: &str, pkg: serde_json::Value| {
+            let m = serde_json::json!({"version": "1.1.0", "packagesDir": pkgs_dir,
+                "packages": [pkg]});
+            fs::write(dir.join("lake-manifest.json"), m.to_string()).unwrap();
+        };
+        let git = |name: &str| serde_json::json!({"type": "git", "name": name, "rev": "0"});
+        manifest("/tmp/turbo-evil", git("dep"));
+        assert!(parse_lake_manifest(&dir, false).is_err());
+        manifest("../up", git("dep"));
+        assert!(parse_lake_manifest(&dir, false).is_err());
+        manifest(".lake/packages", git("../../escape"));
+        assert!(parse_lake_manifest(&dir, false).is_err());
+        let mut sub = git("dep");
+        sub["subDir"] = "../../escape".into();
+        manifest(".lake/packages", sub);
+        assert!(parse_lake_manifest(&dir, false).is_err());
+        // A `path` dependency on another host project: untrusted builds would publish into it.
+        for d in ["../other-project", "/home/victim/project"] {
+            manifest(
+                ".lake/packages",
+                serde_json::json!({"type": "path", "name": "dep", "dir": d}),
+            );
+            let err = parse_lake_manifest(&dir, true).unwrap_err().to_string();
+            assert!(err.contains("`dir`"), "{err}");
+            // A trusted workspace may still use a sibling checkout, as Lake does.
+            let (_, entries, _) = parse_lake_manifest(&dir, false).unwrap();
+            assert_eq!(entries[0].dir, dir.join(d));
+        }
+        manifest(".lake/packages", git("dep"));
+        let (pkgs_dir, entries, _) = parse_lake_manifest(&dir, true).unwrap();
+        assert_eq!(pkgs_dir, PathBuf::from(".lake/packages"));
+        assert_eq!(entries[0].dir, dir.join(".lake/packages/dep"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_untrusted_build_never_writes_outside_the_checkout() {
+        // P0-5: a symlinked build directory or a dependency that resolves elsewhere on the host
+        // must fail before the first filesystem write.
+        let root = make_temp_test_dir("write_escape");
+        let proj = root.join("proj");
+        let outside = root.join("outside");
+        fs::create_dir_all(proj.join("P")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"p\"\n[[lean_lib]]\nname = \"P\"\nglobs = [\"P.+\"]\n",
+        )
+        .unwrap();
+        fs::write(proj.join("P/A.lean"), "def a : Nat := 1\n").unwrap();
+        if resolve_project_config_with_trust(&proj, true).is_err() {
+            eprintln!("skipping: no Lean v4.35.0 toolchain on this host");
+            return;
+        }
+        std::os::unix::fs::symlink(&outside, proj.join(".lake")).unwrap();
+        let mut store = TurboStore::open(Some(&root.join("store"))).unwrap();
+        let err = build_project_modules_native(
+            &mut store,
+            &proj,
+            &[],
+            "untrusted:pr",
+            1,
+            true,
+            true,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("fail-closed build path gate"), "{err}");
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0, "wrote outside");
+        // A trusted build keeps following the user's own symlinks.
+        let cfg = resolve_project_config(&proj).unwrap();
+        let dag = build_module_dag(&cfg, &[]).unwrap();
+        let canon = proj.canonicalize().unwrap();
+        validate_build_write_dirs(&cfg, &dag, &canon, false).unwrap();
+        assert!(validate_build_write_dirs(&cfg, &dag, &canon, true).is_err());
+        fs::remove_file(proj.join(".lake")).unwrap();
+
+        // A dependency symlinked to another project on the host.
+        let other = root.join("other");
+        fs::create_dir_all(other.join("Q")).unwrap();
+        fs::write(
+            other.join("lakefile.toml"),
+            "name = \"q\"\n[[lean_lib]]\nname = \"Q\"\n",
+        )
+        .unwrap();
+        fs::write(other.join("Q.lean"), "def q : Nat := 1\n").unwrap();
+        fs::create_dir_all(proj.join(".lake/packages")).unwrap();
+        std::os::unix::fs::symlink(&other, proj.join(".lake/packages/q")).unwrap();
+        let err = resolve_project_config_with_trust(&proj, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("outside the workspace"), "{err}");
+        resolve_project_config_with_trust(&proj, false).unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_dependency_lakefile_compile_affecting_config_fails_closed() {
+        // P0-6: a dependency's compile-affecting settings used to be skipped silently, so its
+        // modules were built differently from Lake yet published with a Lake trace.
+        let dir = make_temp_test_dir("dep_fail_closed");
+        let tf = dir.join("lakefile.toml");
+        let lib = "[[lean_lib]]\nname = \"A\"\n";
+        for (top, lib_extra) in [
+            ("buildType = \"debug\"\n", ""),
+            ("buildType = \"Debug\"\n", ""),
+            ("plugins = [\"evil\"]\n", ""),
+            ("dynlibs = [\"evil\"]\n", ""),
+            ("precompileImports = true\n", ""),
+            ("platformIndependent = false\n", ""),
+            ("backend = \"llvm\"\n", ""),
+            ("extraDepTargets = [\"gen\"]\n", ""),
+            ("someFutureKey = 1\n", ""),
+            ("\"buildType\" = \"debug\"\n", ""),
+            ("", "needs = [\"gen\"]\n"),
+            ("", "buildType = \"debug\"\n"),
+            ("", "defaultFacets = [\"customFacet\"]\n"),
+            ("", "extraDepTargets = [\"gen\"]\n"),
+            ("", "someFutureKey = 1\n"),
+        ] {
+            let src = format!("name = \"d\"\n{top}{lib}{lib_extra}");
+            fs::write(&tf, &src).unwrap();
+            let err = parse_lakefile_toml(&dir, &tf, true)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("fail-closed"), "{src}: {err}");
+            let pkg = parse_lakefile_toml(&dir, &tf, false).unwrap();
+            let why = pkg.unsupported.clone().or(pkg.libs[0].unsupported.clone());
+            assert!(why.is_some(), "dependency accepted `{src}`");
+        }
+        // Lake reads a quoted key as the bare key, so a quoted `moreLeanArgs` applies.
+        fs::write(
+            &tf,
+            format!("name = \"d\"\n\"moreLeanArgs\" = [\"-DautoImplicit=false\"]\n{lib}"),
+        )
+        .unwrap();
+        for is_root in [true, false] {
+            let pkg = parse_lakefile_toml(&dir, &tf, is_root).unwrap();
+            assert_eq!(pkg.more_lean_args, vec!["-DautoImplicit=false".to_string()]);
+        }
+        fs::write(
+            &tf,
+            format!("name = \"d\"\n'moreLeanArgs' = [\"--plugin=x.so\"]\n{lib}"),
+        )
+        .unwrap();
+        assert!(parse_lakefile_toml(&dir, &tf, false).is_err());
+        // Settings Lake builds identically with (and metadata) pass for every package.
+        fs::write(
+            &tf,
+            format!(
+                "name = \"d\"\nplatformIndependent = true\nbuildType = \"release\"\n\
+                 precompileImports = false\ntestRunner = \"T\"\nfixedToolchain = true\n\
+                 moreLinkArgs = [\"-lfoo\"]\n{lib}needs = []\nlibName = \"a\"\n"
+            ),
+        )
+        .unwrap();
+        for is_root in [true, false] {
+            let pkg = parse_lakefile_toml(&dir, &tf, is_root).unwrap();
+            assert!(pkg.unsupported.is_none() && pkg.libs[0].unsupported.is_none());
+        }
+        fs::remove_file(&tf).unwrap();
+
+        let lf = dir.join("lakefile.lean");
+        let head = "import Lake\nopen Lake DSL\n";
+        for body in [
+            "package d where\n  buildType := .debug\nlean_lib A\n",
+            "package d where\n  buildType := BuildType.debug\nlean_lib A\n",
+            "package d where\n  precompileImports := true\nlean_lib A\n",
+            "package d where\n  platformIndependent := false\nlean_lib A\n",
+            "package d where\n  bootstrap := true\nlean_lib A\n",
+            "package d where\n  someFutureKey := 1\nlean_lib A\n",
+            "package d\nlean_lib A where\n  needs := #[gen]\n",
+            "package d\nlean_lib A where\n  extraDepTargets := #[`gen]\n",
+            "package d\nlean_lib A where\n  defaultFacets := #[LeanLib.customFacet]\n",
+            "package d\nlean_lib A where\n  someFutureKey := 1\n",
+            "package d\nmeta if true then\n  lean_lib B\nlean_lib A\n",
+            "package d\n#eval IO.println \"x\"\nlean_lib A\n",
+            "package d\nset_option autoImplicit false\nlean_lib A\n",
+            "package d\ninput_file gen where\n  path := \"x\"\nlean_lib A\n",
+        ] {
+            let src = format!("{head}{body}");
+            fs::write(&lf, &src).unwrap();
+            let err = parse_lakefile_lean(&dir, &lf, true)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("fail-closed"), "{src}: {err}");
+            // Syntax the reader cannot follow (e.g. `.debug`) fails to parse for any package.
+            match parse_lakefile_lean(&dir, &lf, false) {
+                Ok(pkg) => {
+                    let why = pkg.unsupported.clone().or(pkg.libs[0].unsupported.clone());
+                    assert!(why.is_some(), "dependency accepted `{src}`");
+                }
+                Err(e) => eprintln!("dependency rejected `{src}`: {e}"),
+            }
+        }
+        // A dependency's update hook may spawn processes; it never runs during a build.
+        fs::write(
+            &lf,
+            format!(
+                "{head}package d where\n  platformIndependent := true\n  fixedToolchain := true\n\
+                 lean_lib A\npost_update pkg do\n  let _ ← IO.Process.getCurrentDir\n"
+            ),
+        )
+        .unwrap();
+        let pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
+        assert!(pkg.unsupported.is_none() && pkg.libs[0].unsupported.is_none());
+        assert!(parse_lakefile_lean(&dir, &lf, true).is_err());
+        // Mathlib as a dependency stays buildable.
+        fs::write(
+            &lf,
+            include_str!("../tests/fixtures/mathlib-0df444a3-lakefile.lean"),
+        )
+        .unwrap();
+        let pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
+        assert_eq!(pkg.unsupported, None);
+        assert!(pkg.libs.iter().all(|l| l.unsupported.is_none()));
+        assert!(pkg.exes.iter().all(|e| e.unsupported.is_none()));
+        let _ = fs::remove_dir_all(&dir);
+
+        // Building (not reusing) a module of such a dependency fails closed.
+        let proj = make_temp_test_dir("dep_fail_closed_dag");
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"app\"\n[[lean_lib]]\nname = \"App\"\n",
+        )
+        .unwrap();
+        fs::write(proj.join("App.lean"), "import Dep\ndef app : Nat := 1\n").unwrap();
+        let dep = proj.join(".lake/packages/dep");
+        fs::create_dir_all(&dep).unwrap();
+        fs::write(
+            dep.join("lakefile.toml"),
+            "name = \"dep\"\nbuildType = \"debug\"\n[[lean_lib]]\nname = \"Dep\"\n",
+        )
+        .unwrap();
+        fs::write(dep.join("Dep.lean"), "def dep : Nat := 1\n").unwrap();
+        let cfg = resolve_project_config(&proj).unwrap();
+        let err = build_module_dag_with_trust(&cfg, &[], true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`Dep`") && err.contains("buildType") && err.contains("fail-closed"),
+            "{err}"
+        );
+        fs::write(
+            dep.join("lakefile.toml"),
+            "name = \"dep\"\nbuildType = \"release\"\n[[lean_lib]]\nname = \"Dep\"\n",
+        )
+        .unwrap();
+        let cfg = resolve_project_config(&proj).unwrap();
+        build_module_dag_with_trust(&cfg, &[], true).unwrap();
+        // `precompileModules = true` on a dependency is supported in trusted mode, and rejected in untrusted mode.
+        fs::write(
+            dep.join("lakefile.toml"),
+            "name = \"dep\"\n[[lean_lib]]\nname = \"Dep\"\nprecompileModules = true\n",
+        )
+        .unwrap();
+        let cfg = resolve_project_config(&proj).unwrap();
+        build_module_dag_with_trust(&cfg, &[], false).unwrap();
+        let err_sh = build_module_dag_with_trust(&cfg, &[], true)
+            .unwrap_err()
+            .to_string();
+        assert!(err_sh.contains("fail-closed"), "{err_sh}");
+        // `defaultFacets = ["shared"]` on the root library is supported in trusted mode, and rejected in untrusted mode.
+        fs::write(
+            dep.join("lakefile.toml"),
+            "name = \"dep\"\n[[lean_lib]]\nname = \"Dep\"\n",
+        )
+        .unwrap();
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"app\"\n[[lean_lib]]\nname = \"App\"\ndefaultFacets = [\"shared\"]\n",
+        )
+        .unwrap();
+        let cfg = resolve_project_config(&proj).unwrap();
+        build_module_dag_with_trust(&cfg, &[], false).unwrap();
+        let err_root_sh = build_module_dag_with_trust(&cfg, &[], true)
+            .unwrap_err()
+            .to_string();
+        assert!(err_root_sh.contains("fail-closed"), "{err_root_sh}");
+        let _ = fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn test_lake_config_file_choice_precompile_and_enum_literals_follow_lake() {
+        let dir = make_temp_test_dir("lake_config_choice");
+        let toml = "name = \"t\"\n[[lean_lib]]\nname = \"FromToml\"\n";
+        let lean = "import Lake\nopen Lake DSL\npackage t\nlean_lib FromLean\n";
+        // Lake loads `lakefile.lean` when both are present.
+        fs::write(dir.join("lakefile.toml"), toml).unwrap();
+        fs::write(dir.join("lakefile.lean"), lean).unwrap();
+        let pkg = resolve_package_config(&dir, false).unwrap();
+        assert_eq!(pkg.libs[0].name, "FromLean");
+        // ... and a manifest `configFile`, with or without an extension.
+        fs::create_dir_all(dir.join("cfg")).unwrap();
+        fs::write(dir.join("cfg/custom.toml"), toml).unwrap();
+        for cfg in ["cfg/custom", "cfg/custom.toml"] {
+            let pkg = resolve_package_config_file(&dir, false, Some(cfg)).unwrap();
+            assert_eq!(pkg.libs[0].name, "FromToml", "{cfg}");
+        }
+        assert!(resolve_package_config_file(&dir, false, Some("../x")).is_err());
+        assert!(resolve_package_config_file(&dir, false, Some("missing")).is_err());
+
+        // `precompileModules = true` parses cleanly in static Lake configs for trusted native
+        // builds, and is rejected at the untrusted DAG gate (`build_module_dag_with_trust`).
+        for (file, src, pkg_flag, lib_flag) in [
+            ("lakefile.toml", "name = \"t\"\nprecompileModules = true\n", true, None),
+            (
+                "lakefile.toml",
+                "name = \"t\"\n[[lean_lib]]\nname = \"A\"\nprecompileModules = true\n",
+                false,
+                Some(true),
+            ),
+            (
+                "lakefile.lean",
+                "import Lake\nopen Lake DSL\npackage t where\n  precompileModules := true\n",
+                true,
+                None,
+            ),
+            (
+                "lakefile.lean",
+                "import Lake\nopen Lake DSL\npackage t\nlean_lib A where\n  precompileModules := true\n",
+                false,
+                Some(true),
+            ),
+        ] {
+            let f = dir.join(file);
+            fs::write(&f, src).unwrap();
+            for is_root in [true, false] {
+                let pkg = if file.ends_with("toml") {
+                    parse_lakefile_toml(&dir, &f, is_root)
+                } else {
+                    parse_lakefile_lean(&dir, &f, is_root)
+                }
+                .unwrap();
+                assert_eq!(pkg.precompile_modules, pkg_flag, "{src}");
+                assert_eq!(
+                    pkg.libs.first().and_then(|l| l.precompile_modules),
+                    lib_flag,
+                    "{src}"
+                );
+            }
+        }
+        // Only a plain enum literal can pass: Lake evaluates any other expression.
+        for v in [
+            "if true then .llvm else .default",
+            "match x with | _ => .c",
+            "(.c)",
+            "\"llvm\"",
+            "Backend.default",
+            "Lake.Backend.c",
+            ".C",
+            ".Default",
+            "\"C\"",
+        ] {
+            assert!(
+                matches!(
+                    classify_lake_field(LakeScope::Package, "backend", v),
+                    LakeField::Unsupported
+                ),
+                "{v}"
+            );
+        }
+        for v in [".c", ".default", "\"c\""] {
+            assert!(matches!(
+                classify_lake_field(LakeScope::Lib, "backend", v),
+                LakeField::Passive
+            ));
+        }
+        for (v, ok) in [
+            ("\"Release\"", true),
+            ("\"minSizeRel\"", true),
+            (".relWithDebInfo", true),
+            (".Release", false),
+            (".debug", false),
+            ("\"debug\"", false),
+        ] {
+            assert_eq!(
+                matches!(
+                    classify_lake_field(LakeScope::Package, "buildType", v),
+                    LakeField::Passive
+                ),
+                ok,
+                "{v}"
+            );
+        }
+        // A dependency's own helper can shadow a non-constructor enum name.
+        let lf = dir.join("lakefile.lean");
+        fs::write(
+            &lf,
+            "import Lake\nopen Lake DSL\ndef Lake.Backend.C : Lake.Backend := .llvm\npackage t where\n  backend := .C\nlean_lib A\n",
+        )
+        .unwrap();
+        assert!(parse_lakefile_lean(&dir, &lf, false)
+            .unwrap()
+            .unsupported
+            .is_some());
+        // ... or a qualified enum name.
+        let lf = dir.join("lakefile.lean");
+        fs::write(
+            &lf,
+            "import Lake\nopen Lake DSL\ndef Backend.default : Lake.Backend := .llvm\npackage t where\n  backend := Backend.default\nlean_lib A\n",
+        )
+        .unwrap();
+        let pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
+        assert!(pkg.unsupported.is_some());
+        // A command hidden after a helper on the same line, or indented inside a body the reader
+        // skips, still configures Lake.
+        for body in [
+            "def helper := 0 package t where\n  precompileModules := true\nlean_lib A\n",
+            "package t\ndef helper := 0\n  lean_lib Hidden where\n    moreLeanArgs := #[\"-DautoImplicit=false\"]\nlean_lib A\n",
+            "package t\npost_update pkg do\n  pure ()\n  set_option maxHeartbeats 1\nlean_lib A\n",
+            "package t\nrequire foo from git\n  \"https://x\" @ \"main\" lean_lib Hidden\nlean_lib A\n",
+            "package t where\n  moreLinkArgs := #[]\n    lean_exe Hidden\nlean_lib A\n",
+            "package t\nlean_lib A\ndef helper := #[0\n] lean_lib Hidden where\n  roots := #[`A]\n  precompileModules := true\n",
+            "package t\nlean_lib A\nabbrev x := 1\nfoo lean_exe Hidden\n",
+        ] {
+            fs::write(&lf, format!("import Lake\nopen Lake DSL\n{body}")).unwrap();
+            assert!(parse_lakefile_lean(&dir, &lf, true).is_err(), "{body}");
+            // Otherwise rejected outright by another guard.
+            if let Ok(pkg) = parse_lakefile_lean(&dir, &lf, false) {
+                assert!(pkg.unsupported.is_some(), "{body}");
+            }
+        }
+        // Empty `plugins`/`dynlibs` change nothing; non-empty ones fail closed.
+        for (field, ok) in [
+            ("plugins := #[]", true),
+            ("dynlibs := #[]", true),
+            ("plugins := #[p]", false),
+        ] {
+            fs::write(
+                &lf,
+                format!("import Lake\nopen Lake DSL\npackage t\nlean_lib A where\n  {field}\n"),
+            )
+            .unwrap();
+            assert_eq!(parse_lakefile_lean(&dir, &lf, true).is_ok(), ok, "{field}");
+            let pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
+            assert_eq!(pkg.libs[0].unsupported.is_none(), ok, "{field}");
+        }
+        // Lake's TOML decoder ignores `nativeFacets`.
+        let tf = dir.join("lakefile.toml");
+        fs::write(
+            &tf,
+            "name = \"t\"\n[[lean_lib]]\nname = \"A\"\nnativeFacets = []\n[[lean_exe]]\nname = \"e\"\nnativeFacets = []\n",
+        )
+        .unwrap();
+        let pkg = parse_lakefile_toml(&dir, &tf, false).unwrap();
+        assert!(pkg.libs[0].unsupported.is_none() && pkg.exes[0].unsupported.is_none());
+        // Empty arrays pass however they are spelled.
+        fs::write(
+            &tf,
+            "name = \"t\"\n[[lean_lib]]\nname = \"A\"\nplugins = [ ]\ndynlibs = [\n]\n",
+        )
+        .unwrap();
+        assert!(parse_lakefile_toml(&dir, &tf, true).is_ok());
+        assert!(parse_lakefile_toml(&dir, &tf, true).is_ok());
+        fs::remove_file(&tf).unwrap();
+        // Imports beyond `Lake` could change how the lakefile elaborates.
+        for imp in ["import Lake Foo", "import Mathlib"] {
+            fs::write(
+                &lf,
+                format!("{imp}\nopen Lake DSL\npackage t\nlean_lib A\n"),
+            )
+            .unwrap();
+            assert!(parse_lakefile_lean(&dir, &lf, true).is_err(), "{imp}");
+            assert!(
+                parse_lakefile_lean(&dir, &lf, false)
+                    .unwrap()
+                    .unsupported
+                    .is_some(),
+                "{imp}"
+            );
+        }
+        // A dependency's `needs` only marks the target that sets it.
+        let lf = dir.join("lakefile.lean");
+        fs::write(
+            &lf,
+            "import Lake\nopen Lake DSL\npackage t\nlean_lib A where\n  needs := #[gen]\nlean_lib B where\n  needs := #[]\n",
+        )
+        .unwrap();
+        let pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
+        assert!(pkg.unsupported.is_none() && pkg.libs[1].unsupported.is_none());
+        assert!(pkg.libs[0].unsupported.is_some());
+        assert!(parse_lakefile_lean(&dir, &lf, true).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_planted_lock_symlink_and_foreign_cas_paths_never_write_outside() {
+        let root = make_temp_test_dir("lock_cas_escape");
+        let proj = root.join("proj");
+        let outside = root.join("outside");
+        fs::create_dir_all(proj.join(".lake/build")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        // A checked-in `.turbo_publish.lock` symlink must not create a file elsewhere.
+        let lock = proj.join(".lake/build/.turbo_publish.lock");
+        std::os::unix::fs::symlink(outside.join("created"), &lock).unwrap();
+        assert!(crate::shm_cache::acquire_flock(&lock, true, false).is_err());
+        assert!(acquire_publish_flock_mode(&proj, true, false).is_err());
+        assert!(!outside.join("created").exists());
+        // Predictable staging names (`.turbo_stage_sidecar_*`, backups, manifest tmp files)
+        // replace a planted symlink instead of writing through it.
+        let stage = proj.join(".lake/build/.turbo_stage_sidecar_1_1_P.olean.hash");
+        std::os::unix::fs::symlink(outside.join("staged"), &stage).unwrap();
+        fs::write(outside.join("victim"), b"keep").unwrap();
+        let stage2 = proj.join(".lake/build/.turbo_backup_1_1_P.olean");
+        std::os::unix::fs::symlink(outside.join("victim"), &stage2).unwrap();
+        for p in [&stage, &stage2] {
+            use std::io::Write;
+            create_fresh_file(p).unwrap().write_all(b"x").unwrap();
+            assert!(!fs::symlink_metadata(p).unwrap().file_type().is_symlink());
+        }
+        assert!(!outside.join("staged").exists());
+        assert_eq!(fs::read(outside.join("victim")).unwrap(), b"keep");
+
+        // A cache entry restores only onto the node's own artifact paths.
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"p\"\n[[lean_lib]]\nname = \"P\"\n",
+        )
+        .unwrap();
+        fs::write(proj.join("P.lean"), "def p : Nat := 1\n").unwrap();
+        fs::remove_file(&lock).unwrap();
+        let cfg = resolve_project_config(&proj).unwrap();
+        let dag = build_module_dag(&cfg, &[]).unwrap();
+        let node = &dag.nodes["P"];
+        let canon = proj.canonicalize().unwrap();
+        let entry = |rel: &str| BlobEntry {
+            blob_hash: "00".into(),
+            kind: "olean".into(),
+            size_bytes: 1,
+            rel_path: rel.into(),
+        };
+        let own = node
+            .olean_path
+            .strip_prefix(&canon)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let ilean = node
+            .ilean_path
+            .strip_prefix(&canon)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(cas_outputs_bound_to_node(
+            &[entry(&own), entry(&ilean), entry("thm:x")],
+            &canon,
+            node
+        ));
+        for foreign in [
+            "vendor/old/.lake/build/lib/lean/P.olean",
+            ".lake/build/lib/lean/../../../../outside/P.olean",
+            outside.join("P.olean").to_str().unwrap(),
+        ] {
+            assert!(
+                !cas_outputs_bound_to_node(&[entry(&own), entry(foreign)], &canon, node),
+                "{foreign}"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn test_precompile_library_fails_closed_everywhere() {
+        // Lake's `LeanLib.shouldPrecompile` also covers `precompileLibrary`: importers load it.
+        let dir = make_temp_test_dir("precompile_library");
+        let tf = dir.join("lakefile.toml");
+        let lf = dir.join("lakefile.lean");
+        fs::write(
+            &tf,
+            "name = \"t\"\n[[lean_lib]]\nname = \"A\"\nprecompileLibrary = true\n",
+        )
+        .unwrap();
+        fs::write(
+            &lf,
+            "import Lake\nopen Lake DSL\npackage t\nlean_lib A where\n  precompileLibrary := true\n",
+        )
+        .unwrap();
+        for is_root in [true, false] {
+            let e = parse_lakefile_toml(&dir, &tf, is_root)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("precompileLibrary"), "{e}");
+            let e = parse_lakefile_lean(&dir, &lf, is_root)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("precompileLibrary"), "{e}");
+        }
+        fs::write(
+            &tf,
+            "name = \"t\"\n[[lean_lib]]\nname = \"A\"\nprecompileLibrary = false\n",
+        )
+        .unwrap();
+        parse_lakefile_toml(&dir, &tf, false).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_toml_key_ty_redefinition_and_prefix_conflicts_fail_closed() {
+        let dir = make_temp_test_dir("toml_key_ty");
+        let tf = dir.join("lakefile.toml");
+        for bad in [
+            "name = \"t\"\nname = \"t2\"\n",
+            "name = \"t\"\n[leanOptions]\nautoImplicit = false\nautoImplicit = true\n",
+            "name = \"t\"\nleanOptions.autoImplicit = false\n[leanOptions]\npp.all = true\n",
+            "name = \"t\"\n[leanOptions]\npp = true\npp.all = false\n",
+            "name = \"t\"\n[leanOptions]\npp.all = false\npp = true\n",
+            "name = \"t\"\nleanOptions = {}\n[[leanOptions]]\nautoImplicit = false\n",
+            "name = \"t\"\n[[lean_lib]]\nname = \"A\"\n[lean_lib]\nname = \"B\"\n",
+            "name = \"t\"\n[[lean_lib]]\nname = \"A\"\nname = \"B\"\n",
+        ] {
+            fs::write(&tf, bad).unwrap();
+            for is_root in [true, false] {
+                let err = parse_lakefile_toml(&dir, &tf, is_root)
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("cannot redefine"), "{bad}: {err}");
+            }
+        }
+        // Valid nested array-of-tables + subtable (`[[lean_lib]]` followed by `[lean_lib.leanOptions]`)
+        // and multiple `[[lean_lib]]` elements with independent keys must elaborate cleanly.
+        let valid = r#"name = "t"
+[leanOptions.pp.unicode]
+fun = true
+[leanOptions]
+autoImplicit = false
+[[lean_lib]]
+name = "A"
+[lean_lib.leanOptions]
+autoImplicit = true
+[[lean_lib]]
+name = "B"
+[lean_lib.leanOptions]
+autoImplicit = false
+"#;
+        fs::write(&tf, valid).unwrap();
+        let pkg = parse_lakefile_toml(&dir, &tf, true).unwrap();
+        assert_eq!(pkg.libs.len(), 2);
+        assert_eq!(pkg.libs[0].name, "A");
+        assert_eq!(pkg.libs[1].name, "B");
+        let _ = fs::remove_dir_all(&dir);
     }
 }
