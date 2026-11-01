@@ -199,12 +199,22 @@ fn working_tree_dirty_paths(project_dir: &Path, selected_sha: &str) -> Result<Ve
     if String::from_utf8_lossy(&probe.stdout).trim() != "true" {
         return Ok(Vec::new());
     }
+    // Inspecting a submodule's dirty state runs Git inside it with the submodule's own config
+    // (filters, includes). Never recurse; refuse gitlinks anywhere in the work tree instead.
+    let top = git(&["rev-parse", "--show-toplevel"])?;
+    anyhow::ensure!(
+        top.status.success(),
+        "`git rev-parse --show-toplevel` failed: {}",
+        String::from_utf8_lossy(&top.stderr).trim()
+    );
+    let top = PathBuf::from(String::from_utf8_lossy(&top.stdout).trim());
+    crate::trusted_tools::reject_gitlinks(&top, &[], &top)?;
     let out = git(&[
         "status",
         "--porcelain=v1",
         "-z",
         "--untracked-files=all",
-        "--ignore-submodules=none",
+        crate::trusted_tools::NO_SUBMODULES,
     ])?;
     if !out.status.success() {
         anyhow::bail!(
@@ -878,34 +888,76 @@ mod tests {
         let mismatch = working_tree_dirty_paths(&tmp, &other)?;
         assert_eq!(mismatch.len(), 1);
         assert!(mismatch[0].contains(&head) && mismatch[0].contains(&other));
-        // Dirty submodules stay visible even when the repo config hides them.
-        let sub = std::env::temp_dir().join(format!("turbo_lean_rp_sub_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&sub);
-        fs::create_dir_all(&sub)?;
-        git_ok(&sub, &["init", "-q"]);
-        fs::write(sub.join("S.lean"), "def s := 1\n")?;
-        git_ok(&sub, &["add", "."]);
-        git_ok(&sub, &["commit", "-q", "-m", "sub"]);
-        git_ok(
-            &tmp,
-            &[
-                "-c",
-                "protocol.file.allow=always",
-                "submodule",
-                "add",
-                "-q",
-                sub.to_str().unwrap(),
-                "dep",
-            ],
-        );
-        git_ok(&tmp, &["commit", "-q", "-m", "add dep"]);
-        git_ok(&tmp, &["config", "submodule.dep.ignore", "all"]);
-        let head = git_out(&tmp, &["rev-parse", "HEAD"]);
-        assert!(working_tree_dirty_paths(&tmp, &head)?.is_empty());
-        fs::write(tmp.join("dep").join("S.lean"), "def s := 2\n")?;
-        assert_eq!(working_tree_dirty_paths(&tmp, &head)?, ["dep"]);
         let _ = fs::remove_dir_all(&tmp);
-        let _ = fs::remove_dir_all(&sub);
+        Ok(())
+    }
+
+    /// A submodule's dirty state can only be read by running Git inside it, with the
+    /// submodule's own (unvetted) config. Its filter must never run: gitlinks are refused,
+    /// clean or dirty, whatever the repository's `submodule.<name>.ignore` says.
+    #[test]
+    fn submodules_are_refused_without_running_their_filters() -> Result<()> {
+        use crate::trusted_tools::{restat_submodule_file, submodule_filter_fixture};
+        for via_include in [false, true] {
+            let root = std::env::temp_dir().join(format!(
+                "turbo_lean_rp_sub_{}_{}",
+                std::process::id(),
+                crate::pack::next_tmp_id()
+            ));
+            let repo = submodule_filter_fixture(&root, via_include)?;
+            let marker = root.join("marker");
+            // Positive control: plain `git status` runs the submodule-only clean filter.
+            restat_submodule_file(&repo)?;
+            let control = Command::new("/usr/bin/git")
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", &root)
+                .args(["status", "--porcelain"])
+                .current_dir(&repo)
+                .output()?;
+            assert!(control.status.success());
+            assert!(
+                marker.exists(),
+                "{via_include}: control did not run the filter"
+            );
+            fs::remove_file(&marker)?;
+            let head = git_out(&repo, &["rev-parse", "HEAD"]);
+            for ignore in ["", "all", "none"] {
+                if !ignore.is_empty() {
+                    git_ok(&repo, &["config", "submodule.dep.ignore", ignore]);
+                }
+                for dir in [repo.clone(), repo.join("dep")] {
+                    restat_submodule_file(&repo)?;
+                    let refused = working_tree_dirty_paths(&dir, &head);
+                    assert!(!marker.exists(), "{via_include} {ignore}: filter ran");
+                    if dir == repo {
+                        let err = refused.expect_err("gitlink must be refused");
+                        assert!(err.to_string().contains("gitlinks"), "{err:#}");
+                    }
+                }
+            }
+            // The whole command path reports the refusal as its fallback reason.
+            restat_submodule_file(&repo)?;
+            run_remote_prebuild_command(
+                true,
+                "http://127.0.0.1:9/v1/prebuilds",
+                &repo,
+                Some("https://example.invalid/r.git".into()),
+                Some(head.clone()),
+                vec!["Demo".into()],
+                None,
+                None,
+                None,
+                1,
+                10,
+                false,
+            )?;
+            assert!(
+                !marker.exists(),
+                "{via_include}: remote-prebuild ran the filter"
+            );
+            let _ = fs::remove_dir_all(&root);
+        }
         Ok(())
     }
 
