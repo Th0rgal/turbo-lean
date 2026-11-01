@@ -6314,6 +6314,12 @@ mod tests {
         fs::create_dir_all(&dir)?;
         fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
         let store = TurboStore::open(Some(&dir.join("store")))?;
+        // Verifier commands take only absolute, installed toolchain executables.
+        let lean = crate::module_builder::ToolchainExecutables::resolve(
+            &dir,
+            "leanprover/lean4:v4.35.0",
+        )?
+        .lean;
         let env = std::collections::HashMap::from([(
             "ELAN_TOOLCHAIN".to_string(),
             "leanprover/lean4:v4.35.0".to_string(),
@@ -6322,7 +6328,7 @@ mod tests {
             let audit = std::collections::HashSet::from(["tgt".to_string()]);
             run_audited_lean_shard(
                 &store,
-                Path::new("lean"),
+                &lean,
                 &env,
                 Some(&dir),
                 src,
@@ -6386,7 +6392,7 @@ mod tests {
         let audit = std::collections::HashSet::from(["tgt".to_string()]);
         let late = run_audited_lean_shard(
             &store,
-            Path::new("lean"),
+            &lean,
             &env,
             Some(&dir),
             "theorem tgt : 1 = 1 := rfl\n",
@@ -6404,7 +6410,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         let _ = run_audited_lean_shard(
             &cold,
-            Path::new("lean"),
+            &lean,
             &env,
             Some(&dir),
             "theorem tgt : 1 = 1 := rfl\n",
