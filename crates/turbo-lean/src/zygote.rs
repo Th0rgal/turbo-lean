@@ -1244,33 +1244,43 @@ fn compute_imported_oleans_digest_inner(
             continue;
         }
         ordered_mods.push(mod_name.clone());
-        let is_tc_builtin = mod_name == "Init"
-            || mod_name.starts_with("Init.")
-            || mod_name == "Lean"
-            || mod_name.starts_with("Lean.");
-        if is_tc_builtin {
-            let rel_olean = format!(
-                "{}.olean",
-                crate::module_builder::module_name_to_rel_slash(&mod_name)
-            );
-            let non_tc_hit = search_dirs
-                .iter()
-                .filter(|d| !d.to_string_lossy().contains("/toolchains/"))
-                .map(|d| d.join(&rel_olean))
-                .find(|p| p.is_file());
-            if non_tc_hit.is_none() {
-                resolved_map.insert(mod_name, None);
-                continue;
-            }
-        }
         let rel_olean = format!(
             "{}.olean",
             crate::module_builder::module_name_to_rel_slash(&mod_name)
         );
-        let found = search_dirs
+        let non_tc_hit = search_dirs
             .iter()
+            .filter(|d| !d.to_string_lossy().contains("/toolchains/"))
             .map(|d| d.join(&rel_olean))
             .find(|p| p.is_file());
+        let has_tc_dir = search_dirs
+            .iter()
+            .any(|d| d.to_string_lossy().contains("/toolchains/"));
+        let tc_hit = search_dirs
+            .iter()
+            .filter(|d| d.to_string_lossy().contains("/toolchains/"))
+            .map(|d| d.join(&rel_olean))
+            .any(|p| p.is_file());
+        let is_tc_builtin = (mod_name == "Init"
+            || mod_name.starts_with("Init.")
+            || mod_name == "Std"
+            || mod_name.starts_with("Std.")
+            || mod_name == "Lean"
+            || mod_name.starts_with("Lean.")
+            || mod_name == "Lake"
+            || mod_name.starts_with("Lake."))
+            && non_tc_hit.is_none()
+            && (!has_tc_dir || tc_hit);
+        if is_tc_builtin {
+            resolved_map.insert(mod_name, None);
+            continue;
+        }
+        let found = non_tc_hit.or_else(|| {
+            search_dirs
+                .iter()
+                .map(|d| d.join(&rel_olean))
+                .find(|p| p.is_file())
+        });
         if let Some(ref olean_path) = found {
             if let Ok(meta) = fs::metadata(olean_path) {
                 let mut sink = blake3::Hasher::new();
@@ -1309,12 +1319,35 @@ fn compute_imported_oleans_digest_inner(
                 }
             }
             None => {
-                if mod_name == "Init"
-                    || mod_name.starts_with("Init.")
-                    || mod_name == "Lean"
-                    || mod_name.starts_with("Lean.")
+                let has_tc_dir = search_dirs
+                    .iter()
+                    .any(|d| d.to_string_lossy().contains("/toolchains/"));
+                if !has_tc_dir
+                    && (mod_name == "Init"
+                        || mod_name.starts_with("Init.")
+                        || mod_name == "Std"
+                        || mod_name.starts_with("Std.")
+                        || mod_name == "Lean"
+                        || mod_name.starts_with("Lean.")
+                        || mod_name == "Lake"
+                        || mod_name.starts_with("Lake."))
                 {
                     hasher.update(b"toolchain-builtin;");
+                } else if has_tc_dir {
+                    let rel_olean = format!(
+                        "{}.olean",
+                        crate::module_builder::module_name_to_rel_slash(&mod_name)
+                    );
+                    if search_dirs
+                        .iter()
+                        .filter(|d| d.to_string_lossy().contains("/toolchains/"))
+                        .any(|d| d.join(&rel_olean).is_file())
+                    {
+                        hasher.update(b"toolchain-builtin;");
+                    } else {
+                        closure_complete = false;
+                        hasher.update(b"missing;");
+                    }
                 } else {
                     closure_complete = false;
                     hasher.update(b"missing;");

@@ -1148,13 +1148,14 @@ pub fn compute_imported_olean_interface_hashes(
             _ => {}
         }
         for sub_mod in olean_sub_mods {
-            if !visited.contains(&sub_mod)
-                && sub_mod != "Init"
-                && !sub_mod.starts_with("Init.")
-                && sub_mod != "Lean"
-                && !sub_mod.starts_with("Lean.")
-            {
-                worklist.push(sub_mod);
+            if !visited.contains(&sub_mod) {
+                let rel_sub = format!(
+                    "{}.olean",
+                    crate::module_builder::module_name_to_rel_slash(&sub_mod)
+                );
+                if search_dirs.iter().any(|d| d.join(&rel_sub).is_file()) {
+                    worklist.push(sub_mod);
+                }
             }
         }
         if let Some(ref sub_lean) = sub_lean_opt {
