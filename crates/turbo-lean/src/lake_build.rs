@@ -509,34 +509,37 @@ pub(crate) fn resolve_remote_lean_path(
     canon_dir: &Path,
     env_vars: Option<&HashMap<String, String>>,
 ) -> String {
-    let mut parts = Vec::new();
-    let local_lib = canon_dir
-        .join(".lake")
-        .join("build")
-        .join("lib")
-        .join("lean");
-    if local_lib.exists() {
-        parts.push(local_lib.to_string_lossy().to_string());
-    }
-    let pkgs_dir = canon_dir.join(".lake").join("packages");
-    if let Ok(entries) = fs::read_dir(&pkgs_dir) {
-        let mut pkg_libs = Vec::new();
-        for entry in entries.flatten() {
-            let pkg_lib = entry
-                .path()
-                .join(".lake")
-                .join("build")
-                .join("lib")
-                .join("lean");
-            if pkg_lib.exists() {
-                pkg_libs.push(pkg_lib.to_string_lossy().to_string());
-            }
+    // Resolve static package layout without invoking Lake or the compiler: toolchain
+    // discovery's zero-compiler fallback also calls this function.
+    let library_dir = |root: &Path| {
+        crate::module_builder::resolve_package_config(root, root == canon_dir)
+            .map(|p| root.join(p.build_dir).join(p.lean_lib_dir))
+            .unwrap_or_else(|_| root.join(".lake/build/lib/lean"))
+    };
+    let mut parts = vec![library_dir(canon_dir).to_string_lossy().to_string()];
+    let manifest = crate::module_builder::parse_lake_manifest(canon_dir, false).ok();
+    let packages_dir = manifest
+        .as_ref()
+        .map(|(dir, _, _)| dir.clone())
+        .unwrap_or_else(|| PathBuf::from(".lake/packages"));
+    let mut package_roots: Vec<PathBuf> = manifest
+        .as_ref()
+        .map(|(_, packages, _)| packages.iter().map(|p| p.dir.clone()).collect())
+        .unwrap_or_default();
+    if package_roots.is_empty() {
+        if let Ok(entries) = fs::read_dir(canon_dir.join(packages_dir)) {
+            package_roots = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect();
+            package_roots.sort();
         }
-        pkg_libs.sort();
-        for p in pkg_libs {
-            if !parts.contains(&p) {
-                parts.push(p);
-            }
+    }
+    for root in package_roots {
+        let dir = library_dir(&root).to_string_lossy().to_string();
+        if !parts.contains(&dir) {
+            parts.push(dir);
         }
     }
     if let Some(env) = env_vars {

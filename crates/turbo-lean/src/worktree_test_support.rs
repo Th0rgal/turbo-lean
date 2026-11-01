@@ -5,6 +5,9 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Existing regression fixture: elaboration succeeds, independent kernel replay must reject.
+pub(crate) const FORGED_DEPENDENCY_SOURCE: &str = "import Lean\nopen Lean Elab Command Term\nelab \"forge_bad\" : command => liftTermElabM do\n  withOptions (fun o => o.setBool `debug.skipKernelTC true) do\n    Lean.addDecl <| .thmDecl {name := `bad, levelParams := [], type := mkConst ``False, value := mkConst ``True.intro}\nforge_bad\n";
+
 pub(crate) struct LakeTree {
     pub root: PathBuf,
     pub project: PathBuf,

@@ -5047,22 +5047,44 @@ pub(crate) fn resolve_module_in_package(
     }
     None
 }
-pub(crate) fn is_builtin_toolchain_module(toolchain_lib_lean: &Path, mod_name: &str) -> bool {
-    if mod_name == "Init"
-        || mod_name.starts_with("Init.")
-        || mod_name == "Std"
-        || mod_name.starts_with("Std.")
-        || mod_name == "Lean"
-        || mod_name.starts_with("Lean.")
-        || mod_name == "Lake"
-        || mod_name.starts_with("Lake.")
-    {
-        return true;
+/// Resolve using the consumer's search order before deciding whether an artifact belongs to
+/// the selected toolchain. A module name (including `Init`/`Std`/`Lean`/`Lake`) grants no trust.
+fn resolve_imported_olean(lean_path: &str, module: &str) -> Option<PathBuf> {
+    let rel = module_name_to_rel_slash(module);
+    let root = rel.split('/').next()?;
+    // Match Lean.SearchPath.findWithExt: the *root namespace* selects the directory.
+    // A missing submodule in that directory must not fall through to another installation.
+    std::env::split_paths(lean_path)
+        .find(|d| d.join(root).is_dir() || d.join(root).with_extension("olean").exists())
+        .map(|d| d.join(format!("{rel}.olean")))
+}
+
+fn is_selected_toolchain_artifact(lib: &Path, githash: &str, artifact: &Path) -> bool {
+    if lib.as_os_str().is_empty() || githash.len() != 40 {
+        return false;
     }
-    let rel_slash = module_name_to_rel_slash(mod_name);
-    toolchain_lib_lean
-        .join(format!("{}.olean", rel_slash))
-        .is_file()
+    let (Ok(lib), Ok(artifact)) = (lib.canonicalize(), artifact.canonicalize()) else {
+        return false;
+    };
+    if !artifact.starts_with(lib) {
+        return false;
+    }
+    // Lean's v2 olean header stores the compiler commit in bytes 40..80. Read only
+    // the header: exemption still requires canonical containment in its installation.
+    use std::io::Read;
+    let mut header = [0u8; 80];
+    fs::File::open(artifact)
+        .and_then(|mut f| f.read_exact(&mut header))
+        .is_ok()
+        && &header[..6] == b"olean\x02"
+        && &header[40..80] == githash.as_bytes()
+}
+
+pub(crate) fn is_builtin_toolchain_module(cfg: &ProjectConfig, module: &str) -> bool {
+    let (lean_path, _) = build_lean_search_path(cfg, false);
+    resolve_imported_olean(&lean_path, module).is_some_and(|p| {
+        is_selected_toolchain_artifact(&cfg.toolchain_lib_lean, &cfg.lean_githash, &p)
+    })
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub(crate) struct VerifiedDepModuleEntry {
@@ -5336,7 +5358,7 @@ fn collect_fresh_dep_pkg_closure(
             if resolve_module_in_package(&cfg.root_pkg, true, &imp).is_some() {
                 return Ok(None);
             }
-            if is_builtin_toolchain_module(&cfg.toolchain_lib_lean, &imp) {
+            if is_builtin_toolchain_module(cfg, &imp) {
                 continue;
             }
             // Unresolved import inside dependency closure: force native DAG traversal so
@@ -5705,7 +5727,7 @@ pub fn build_module_dag_with_trust(
                 continue;
             }
             // 3. Check if `imp` is a built-in toolchain module (`Init.*`, `Std.*`, `Lean.*`, `Lake.*`)
-            if is_builtin_toolchain_module(&cfg.toolchain_lib_lean, imp) {
+            if is_builtin_toolchain_module(cfg, imp) {
                 continue;
             }
             // 4. In trusted mode only, check if `imp` exists as a prebuilt `.olean` in `.lake/packages/*/.lake/build/lib/lean` or `LEAN_PATH`
@@ -6692,7 +6714,7 @@ fn compute_lake_export_info(
                     .iter()
                     .any(|dp| resolve_module_in_package(dp, false, &sub_imp.module).is_some());
             if !is_ws_or_pkg
-                && is_builtin_toolchain_module(&cfg.toolchain_lib_lean, &sub_imp.module)
+                && is_builtin_toolchain_module(cfg, &sub_imp.module)
             {
                 continue;
             }
@@ -6867,7 +6889,7 @@ pub fn write_lake_module_hashes_and_trace(
                     .iter()
                     .any(|dp| resolve_module_in_package(dp, false, &imp.module).is_some());
             if !is_ws_or_pkg {
-                if is_builtin_toolchain_module(&cfg.toolchain_lib_lean, &imp.module) {
+                if is_builtin_toolchain_module(cfg, &imp.module) {
                     continue;
                 }
                 dep_trace_fresh = false;
@@ -8452,40 +8474,88 @@ impl DependencyReplayRecord {
     }
 }
 
-/// Replay every non-toolchain artifact in the resolved dependency closure, even on a warm hit:
-/// a parent record never vouches for its imports. Missing/malformed imports fail closed.
-fn ensure_module_closure_replayed(
-    store: &TurboStore,
-    cfg: &ProjectConfig,
+/// Resolve the complete import graph, including imports of genuine toolchain modules:
+/// their imports can themselves be shadowed by project artifacts. Only trusted installation
+/// metadata is cached; each imported name is resolved anew in the consumer's search path.
+fn resolve_dependency_artifacts(
     mut worklist: Vec<String>,
     lean_path: &str,
-) -> Result<usize> {
-    let dirs: Vec<PathBuf> = std::env::split_paths(lean_path).collect();
+    tc_lib: &Path,
+    githash: &str,
+) -> Result<Vec<(String, PathBuf, String)>> {
+    type ToolchainImports = HashMap<(PathBuf, String), Vec<String>>;
+    static TC_IMPORTS: OnceLock<Mutex<ToolchainImports>> = OnceLock::new();
+    let cache = TC_IMPORTS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut seen = HashSet::new();
     let mut imported = Vec::new();
     while let Some(m) = worklist.pop() {
-        if !seen.insert(m.clone()) || is_builtin_toolchain_module(&cfg.toolchain_lib_lean, &m) {
+        if !seen.insert(m.clone()) {
             continue;
         }
-        let rel = format!("{}.olean", module_name_to_rel_slash(&m));
-        let path = dirs
-            .iter()
-            .map(|d| d.join(&rel))
-            .find(|p| p.is_file())
-            .with_context(|| {
-                format!("Cannot resolve imported module `{m}` for kernel replay: fail-closed")
-            })?;
-        if path.starts_with(&cfg.toolchain_lib_lean) {
-            continue;
-        }
-        let dig = compute_olean_artifact_set_digest(&path)?;
-        let bytes = fs::read(&path)?;
-        let (imports, _) = parse_olean_binary_imports(&bytes).with_context(|| {
-            format!("Cannot parse imports of `{m}` for kernel replay: fail-closed")
+        let path = resolve_imported_olean(lean_path, &m).with_context(|| {
+            format!("Cannot resolve imported module `{m}` for kernel replay: fail-closed")
         })?;
-        worklist.extend(imports.into_iter().map(|i| i.module));
-        imported.push((m, path, dig));
+        let toolchain = is_selected_toolchain_artifact(tc_lib, githash, &path);
+        let key = (
+            path.canonicalize()
+                .with_context(|| format!("Missing imported artifact `{m}`: fail-closed"))?,
+            githash.to_string(),
+        );
+        let cached = if toolchain {
+            cache.lock().ok().and_then(|c| c.get(&key).cloned())
+        } else {
+            None
+        };
+        let dig = if toolchain {
+            None
+        } else {
+            Some(compute_olean_artifact_set_digest(&path)?)
+        };
+        let imports = if let Some(imports) = cached {
+            imports
+        } else {
+            let bytes = fs::read(&path)?;
+            let (imports, _) = parse_olean_binary_imports(&bytes).with_context(|| {
+                format!("Cannot parse imports of `{m}` for kernel replay: fail-closed")
+            })?;
+            let imports: Vec<String> = imports.into_iter().map(|i| i.module).collect();
+            if toolchain {
+                if let Ok(mut c) = cache.lock() {
+                    c.insert(key, imports.clone());
+                }
+            }
+            imports
+        };
+        worklist.extend(imports);
+        if let Some(dig) = dig {
+            imported.push((m, path, dig));
+        }
     }
+    Ok(imported)
+}
+
+/// A parent record never vouches for its imports. Missing/malformed imports fail closed.
+fn ensure_module_closure_replayed(
+    store: &TurboStore,
+    cfg: &ProjectConfig,
+    imports: Vec<String>,
+    lean_path: &str,
+) -> Result<usize> {
+    let imported = resolve_dependency_artifacts(
+        imports,
+        lean_path,
+        &cfg.toolchain_lib_lean,
+        &cfg.lean_githash,
+    )?;
+    replay_resolved_artifacts(store, cfg, imported, lean_path)
+}
+
+fn replay_resolved_artifacts(
+    store: &TurboStore,
+    cfg: &ProjectConfig,
+    imported: Vec<(String, PathBuf, String)>,
+    lean_path: &str,
+) -> Result<usize> {
     if imported.is_empty() {
         return Ok(0);
     }
@@ -8578,12 +8648,25 @@ pub(crate) fn ensure_imported_oleans_replayed(
     if imports.is_empty() {
         return Ok(0);
     }
-    let cfg = resolve_project_config(canon_dir).context(
+    let cfg = resolve_project_config(canon_dir);
+    let (tc_lib, githash) = match &cfg {
+        Ok(c) => (c.toolchain_lib_lean.clone(), c.lean_githash.clone()),
+        Err(_) => {
+            let (_, gh, lib, _) =
+                resolve_toolchain_compiler(canon_dir, &lake_build::detect_toolchain(canon_dir))?;
+            (lib, gh)
+        }
+    };
+    let lean_path = lake_build::resolve_remote_lean_path(canon_dir, None);
+    let replay_lp = format!("{}:{}", lean_path, tc_lib.display());
+    let imported = resolve_dependency_artifacts(imports, &replay_lp, &tc_lib, &githash)?;
+    if imported.is_empty() {
+        return Ok(0);
+    }
+    let cfg = cfg.context(
         "Cannot kernel-replay imported `.olean`s without a resolvable project configuration: fail-closed",
     )?;
-    let lean_path = lake_build::resolve_remote_lean_path(canon_dir, None);
-    let replay_lp = format!("{}:{}", lean_path, cfg.toolchain_lib_lean.display());
-    ensure_module_closure_replayed(store, &cfg, imports, &replay_lp)
+    replay_resolved_artifacts(store, &cfg, imported, &replay_lp)
 }
 pub(crate) fn record_verified_dep_source(
     cfg: &ProjectConfig,
@@ -10551,6 +10634,115 @@ lean_exe «demo-exe» where
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_project_owned_toolchain_names_require_replay() -> Result<()> {
+        use crate::worktree_test_support::{LakeTree, FORGED_DEPENDENCY_SOURCE};
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for build_dir in [".lake/build", "custom-build"] {
+            let tree = LakeTree::new(
+                "toolchain_shadow",
+                &[("P/Target.lean", "theorem target : True := trivial\n")],
+            )?;
+            fs::write(tree.project.join("lakefile.toml"), format!(
+                "name = \"fixture\"\nbuildDir = \"{build_dir}\"\n[[lean_lib]]\nname = \"P\"\nglobs = [\"P.+\"]\n[[lean_lib]]\nname = \"Std\"\nglobs = [\"Std.+\"]\n"
+            ))?;
+            fs::create_dir_all(tree.project.join("Std"))?;
+            fs::write(
+                tree.project.join("Std/Forge.lean"),
+                FORGED_DEPENDENCY_SOURCE,
+            )?;
+            fs::write(
+                tree.project.join("P/Target.lean"),
+                "import Std.Forge\ntheorem target : False := bad\n",
+            )?;
+            let cfg = resolve_project_config(&tree.project)?;
+            let project_lib = tree.project.join(build_dir).join("lib/lean");
+            fs::create_dir_all(project_lib.join("Std"))?;
+            for child in fs::read_dir(cfg.toolchain_lib_lean.join("Std"))? {
+                let child = child?;
+                std::os::unix::fs::symlink(
+                    child.path(),
+                    project_lib.join("Std").join(child.file_name()),
+                )?;
+            }
+            for (_, artifact) in olean_artifact_paths(&cfg.toolchain_lib_lean.join("Std.olean")) {
+                if artifact.is_file() {
+                    std::os::unix::fs::symlink(&artifact, project_lib.join(artifact.file_name().unwrap()))?;
+                }
+            }
+            tree.lake(&["build", "P.Target"])?;
+            let cfg = resolve_project_config(&tree.project)?;
+            assert!(!is_builtin_toolchain_module(&cfg, "Std.Forge"));
+            for module in ["Init", "Std", "Lean", "Lake"] {
+                assert!(
+                    is_builtin_toolchain_module(&cfg, module),
+                    "genuine {module} should remain exempt"
+                );
+            }
+            let mut wrong_identity = cfg.clone();
+            wrong_identity.lean_githash = "0".repeat(40);
+            assert!(!is_builtin_toolchain_module(&wrong_identity, "Std"));
+            let mut store = TurboStore::open(Some(&tree.root.join("cache")))?;
+            let err = crate::check::evaluate_check_command_value(
+                &mut store,
+                tree.project.join("P/Target.lean"),
+                None,
+                tree.project.clone(),
+            )
+            .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("KernelReplay"),
+                "{build_dir}: {err:#}"
+            );
+            // A genuine toolchain root must not hide a project copy reached only through
+            // its transitive imports. Preserve the namespace layout without editing the installation.
+            fs::create_dir_all(project_lib.join("Init"))?;
+            for child in fs::read_dir(cfg.toolchain_lib_lean.join("Init"))? {
+                let child = child?;
+                let destination = project_lib.join("Init").join(child.file_name());
+                if child.file_name() == "Classical.olean" {
+                    fs::copy(child.path(), destination)?;
+                } else {
+                    std::os::unix::fs::symlink(child.path(), destination)?;
+                }
+            }
+            std::os::unix::fs::symlink(
+                cfg.toolchain_lib_lean.join("Init.olean"),
+                project_lib.join("Init.olean"),
+            )?;
+            let (lp, _) = build_lean_search_path(&cfg, false);
+            let resolved = resolve_dependency_artifacts(
+                vec!["Init".into()],
+                &lp,
+                &cfg.toolchain_lib_lean,
+                &cfg.lean_githash,
+            )?;
+            assert!(resolved.iter().any(|(m, _, _)| m == "Init.Classical"));
+            // Even byte-identical copies in the project are not toolchain artifacts.
+            let project_lib = tree.project.join(build_dir).join("lib/lean");
+            fs::remove_file(project_lib.join("Std.olean"))?;
+            fs::copy(
+                cfg.toolchain_lib_lean.join("Std.olean"),
+                project_lib.join("Std.olean"),
+            )?;
+            assert!(!is_builtin_toolchain_module(&cfg, "Std"));
+            // Canonical containment prevents a symlink inside a purported toolchain lib from
+            // blessing an artifact outside that installation.
+            let fake_lib = tree.root.join("fake-toolchain/lib/lean");
+            fs::create_dir_all(&fake_lib)?;
+            std::os::unix::fs::symlink(project_lib.join("Std.olean"), fake_lib.join("Std.olean"))?;
+            assert!(!is_selected_toolchain_artifact(
+                &fake_lib,
+                &cfg.lean_githash,
+                &fake_lib.join("Std.olean")
+            ));
+        }
+        Ok(())
+    }
+
     /// Astra r4: a trusted dependency module forging a theorem with `debug.skipKernelTC` must
     /// not be importable on the fresh-build, CAS-restore, or stale-manifest paths.
     #[cfg(unix)]
@@ -10569,7 +10761,7 @@ lean_exe «demo-exe» where
             dep.join("lakefile.toml"),
             "name = \"dep\"\n[[lean_lib]]\nname = \"Dep\"\n",
         )?;
-        fs::write(dep.join("Dep/Bad.lean"), "import Lean\nopen Lean Elab Command Term\nelab \"forge_bad\" : command => liftTermElabM do\n  withOptions (fun o => o.setBool `debug.skipKernelTC true) do\n    Lean.addDecl <| .thmDecl {name := `bad, levelParams := [], type := mkConst ``False, value := mkConst ``True.intro}\nforge_bad\n")?;
+        fs::write(dep.join("Dep/Bad.lean"), crate::worktree_test_support::FORGED_DEPENDENCY_SOURCE)?;
         fs::write(
             proj.join("lake-manifest.json"),
             r#"{"version": "1.2.0", "packagesDir": ".lake/packages", "packages": [{"type": "path", "name": "dep", "dir": ".lake/packages/dep", "configFile": "lakefile.toml", "inherited": false}], "name": "app", "lakeDir": ".lake", "fixedToolchain": false}"#,
