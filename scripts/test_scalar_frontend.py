@@ -1,6 +1,7 @@
 """Actual stock-Lean/LNIR/LLVM execution; no Python result oracle."""
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -8,6 +9,8 @@ import unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fuzz_lcnf_conformance as fuzzer
+
+SPEC_LEAN = fuzzer.ROOT / "lean" / "LeanNative" / "Spec.lean"
 
 
 def _requested_sanitizers() -> tuple[bool, bool]:
@@ -1008,6 +1011,44 @@ def probe_rc_drop (sel seed delta : UInt64) : UInt64 :=
                                      else [engines["full_bin"], *cmd, str(src), "-o", str(out)], capture_output=True, text=True)
                 self.assertNotEqual(rej.returncode, 0, f"{cmd[0]} must fail closed without --allow-rc-adt")
                 self.assertFalse(out.exists())
+            # P-cert C4 (core binary, no elaboration hook): a `.lean` source is a hard error for emit-cabi-bindings
+            # (unless --signatures-only), compile-c-abi and compile-static-lib, and nothing is written.
+            core_rejects = [
+                (["emit-cabi-bindings", "--emit-header", str(tmp / "c.h"), str(src)], tmp / "c.h"),
+                (["compile-c-abi", "--emit-header", str(tmp / "cc.h"), str(src)], tmp / "cc.h"),
+                (["compile-c-abi", "--signatures-only", "--emit-header", str(tmp / "cs.h"), str(src)], tmp / "cs.h"),
+                (["compile-static-lib", str(src), "-o", str(tmp / "s.a"), "--emit-header", str(tmp / "s.h")], tmp / "s.a"),
+                (["compile-static-lib", str(SPEC_LEAN), "-o", str(tmp / "spec.a")], tmp / "spec.a"),
+            ]
+            for cmd, out in core_rejects:
+                rej = subprocess.run([engines["core_bin"], *cmd], capture_output=True, text=True)
+                self.assertNotEqual(rej.returncode, 0, f"core {cmd[:2]} must reject a .lean source: {rej.stdout}")
+                self.assertFalse(out.exists(), cmd)
+            self.assertFalse((tmp / "s.h").exists())
+            # --signatures-only: exported signatures only, no helper/RC-ADT runtime prototypes, provenance recorded
+            sig_h, sig_fix = tmp / "sig.h", tmp / "sig.json"
+            subprocess.run([engines["core_bin"], "emit-cabi-bindings", "--signatures-only", "--emit-header", str(sig_h),
+                            "--emit-fixtures", str(sig_fix), str(src)], check=True, capture_output=True, text=True)
+            protos = re.findall(r"^\w+ (\w+)\(.*\);$", sig_h.read_text(encoding="utf-8"), re.M)
+            self.assertEqual(protos, ["probe_rc_reuse", "probe_rc_alias", "probe_rc_drop"])
+            self.assertIn("signatures-only: no Stage1D gate applied", sig_h.read_text(encoding="utf-8"))
+            self.assertEqual(json.loads(sig_fix.read_text(encoding="utf-8"))["provenance"],
+                             "signatures-only: no Stage1D gate applied")
+            # ... and fails closed (nothing written) when any exported signature is non-scalar
+            nonscalar = tmp / "NonScalarExport.lean"
+            nonscalar.write_text(lean_src + "\n@[export probe_rc_mk]\ndef probe_rc_mk (seed : UInt64) : RcPacket := .empty\n",
+                                 encoding="utf-8")
+            for extra in ([], ["--emit-header", str(tmp / "ns.h")]):
+                rej = subprocess.run([engines["core_bin"], "emit-cabi-bindings", "--signatures-only", *extra, str(nonscalar)],
+                                     capture_output=True, text=True)
+                self.assertNotEqual(rej.returncode, 0, "--signatures-only must reject a non-scalar exported signature")
+                self.assertIn("non-scalar", rej.stderr)
+                self.assertEqual(rej.stdout, "")
+            self.assertFalse((tmp / "ns.h").exists())
+            # the full binary applies the Stage 1D gate itself and refuses --signatures-only
+            rej = subprocess.run([engines["full_bin"], "emit-cabi-bindings", "--signatures-only", str(src)],
+                                 capture_output=True, text=True)
+            self.assertNotEqual(rej.returncode, 0)
             res = subprocess.run(
                 [engines["full_bin"], "emit-lnir", "--wire", "--allow-rc-adt", str(src), "-o", str(wire)],
                 capture_output=True, text=True,

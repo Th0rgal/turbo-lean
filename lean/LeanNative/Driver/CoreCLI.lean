@@ -171,6 +171,14 @@ private def writeOrPrint (outPath text : String) (msg? : Option String := none) 
 private def writeAndPrintJsonOrSummary (outPath jsonText summaryText : String) (jsonFlag : Bool) : IO Unit := do
   if !outPath.isEmpty then writeTextAtomic outPath jsonText
   IO.println (if jsonFlag then jsonText else summaryText)
+/-- P-cert C4: `compile-c-abi` / `compile-static-lib` / the `--c-abi` compile modes cannot gate a `.lean` source for
+    Stage 1D (RC-ADT) without the elaborating frontend; hard error before any output is written. -/
+def rejectLeanSourceWithoutFrontend (tag cmd : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule))
+    (args : List String) : IO Unit := do
+  let src := findFlagValue args "--lean" (findFlagValue args "--input" (findFirstPositional args))
+  if elaborateHook?.isNone && src.endsWith ".lean" then
+    throw <| IO.userError s!"[{tag}] {cmd}: cannot apply the Stage 1D (RC-ADT) gate to '{src}' without the elaborating frontend; use full 'lean-native'"
+
 def runEmitCAbiBindings (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   validateValueTakingFlags args
   let leanPath := findFlagValue args "--lean" (findFlagValue args "--input" (findFirstPositional args))
@@ -181,34 +189,45 @@ def runEmitCAbiBindings (tag : String) (elaborateHook? : Option (String → Targ
   let fixPath := findFlagValue args "--emit-fixtures" (findFlagValue args "--fixtures" "")
   let outPath := findFlagValue args "-o" ""
   let jsonFlag := hasFlag args "--json"
+  let sigOnly := hasFlag args "--signatures-only"
+  let isLean := !leanPath.isEmpty && leanPath.endsWith ".lean"
+  if sigOnly && !isLean then throw <| IO.userError s!"[{tag}] --signatures-only requires a .lean source input"
+  -- P-cert C4: without the elaborating frontend a `.lean` source cannot pass the Stage 1D (RC-ADT) gate, so
+  -- bindings come only from `--signatures-only` (scalar exported signatures, recorded as ungated).
+  if isLean && elaborateHook?.isNone && !sigOnly then
+    throw <| IO.userError s!"[{tag}] Cannot apply the Stage 1D (RC-ADT) gate to '{leanPath}' without the elaborating frontend; use full 'lean-native', or pass --signatures-only for scalar exported-signature bindings"
   let (sigs, guards, srcLabel) ←
-    if !leanPath.isEmpty && leanPath.endsWith ".lean" then
+    if isLean && sigOnly then
+      if !(← System.FilePath.pathExists leanPath) then throw <| IO.userError s!"[lean-native] Input file '{leanPath}' does not exist"
+      match extractSignaturesOnlyCAbi (← readLeanSourceExpandingUmbrella leanPath) with
+      | .ok (s, g) => pure (s, g, leanPath)
+      | .error e => throw <| IO.userError s!"[{tag}] --signatures-only: {e} in '{leanPath}'"
+    else if isLean then
       if !(← System.FilePath.pathExists leanPath) then throw <| IO.userError s!"[lean-native] Input file '{leanPath}' does not exist"
       let (s, g) := extractLeanSourceCAbiAndGuards (← readLeanSourceExpandingUmbrella leanPath)
-      -- C4: with the elaborating frontend, ingest first so a Stage 1D (RC-ADT) decl is a hard error before any
-      -- prototype is emitted, even when the source signatures alone would have produced a header.
-      if !s.isEmpty && elaborateHook?.isSome then
-        let _ ← loadInputModule elaborateHook? args
-      if !s.isEmpty then pure (s, g, leanPath)
-      else let m ← loadInputModule elaborateHook? args; pure (moduleToCAbiSigs (runDefaultPipeline m).1, g, leanPath)
+      -- C4: (only reachable with the elaborating frontend) ingest first so a Stage 1D (RC-ADT) decl is a hard error
+      -- before any prototype is emitted, even when the source signatures alone would have produced a header.
+      let m ← loadInputModule elaborateHook? args
+      pure (if s.isEmpty then moduleToCAbiSigs (runDefaultPipeline m).1 else s, g, leanPath)
     else
       let m ← loadInputModule elaborateHook? args
       pure (moduleToCAbiSigs (runDefaultPipeline m).1, [], if leanPath.isEmpty then m.moduleName else leanPath)
-  let hdrText := emitCAbiHeaderFromSigs sigs
-  let rsText := emitCAbiRustFromSigs sigs
-  let swiftText := emitCAbiSwiftFromSigs sigs
-  let fixText := emitGuardFixturesJson srcLabel sigs guards
+  let note? := if sigOnly then some signaturesOnlyMarker else none
+  let hdrText := emitCAbiHeaderFromSigs sigs note?
+  let rsText := emitCAbiRustFromSigs sigs note?
+  let swiftText := emitCAbiSwiftFromSigs sigs (note? := note?)
+  let fixText := emitGuardFixturesJson srcLabel sigs guards note?
   if !hdrPath.isEmpty then writeTextAtomic hdrPath hdrText
   if !rsPath.isEmpty then writeTextAtomic rsPath rsText
   if !swiftPath.isEmpty then writeTextAtomic swiftPath swiftText
   if !modMapPath.isEmpty then
     let hdrBase := if hdrPath.isEmpty then "turbo_lean_cabi.h" else ((System.FilePath.mk hdrPath).fileName.getD "turbo_lean_cabi.h")
-    writeTextAtomic modMapPath (emitModuleMap "TurboLeanCABI" hdrBase)
+    writeTextAtomic modMapPath (emitModuleMap "TurboLeanCABI" hdrBase note?)
   if !fixPath.isEmpty then writeTextAtomic fixPath fixText
   if !outPath.isEmpty then writeTextAtomic outPath (if jsonFlag then fixText else hdrText)
   if jsonFlag || (hdrPath.isEmpty && rsPath.isEmpty && swiftPath.isEmpty && modMapPath.isEmpty && fixPath.isEmpty && outPath.isEmpty) then
     IO.print fixText
-  else IO.println s!"[{tag}] Emitted C-ABI bindings (exports={sigs.length}, guards={guards.length}, header={hdrPath}, rust={rsPath}, swift={swiftPath}, fixtures={fixPath})"
+  else IO.println s!"[{tag}] Emitted C-ABI bindings (exports={sigs.length}, guards={guards.length}, header={hdrPath}, rust={rsPath}, swift={swiftPath}, fixtures={fixPath}{if sigOnly then s!", {signaturesOnlyMarker}" else ""})"
   return 0
 
 def runCompileMode (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
@@ -270,6 +289,7 @@ def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → Targ
   for dest in destinations do
     if ← (System.FilePath.mk dest).isDir then throw <| IO.userError s!"[{tag}] Output destination is a directory: {dest}"
   let posPath := findFirstPositional args
+  rejectLeanSourceWithoutFrontend tag "compile-static-lib" elaborateHook? args
   let baseMod ← loadInputModule elaborateHook? args
   let (optMod, _) := runDefaultPipeline baseMod
   if let some (dName, callee) := findUnsupportedLLVMCall? optMod then
@@ -735,18 +755,23 @@ def runCoreSelfTest (tag : String) : IO UInt32 := do
       pure false
   let gpuHeadroomOk := gpuHeadroomOk && sve2AsmOk
   let specRaw ← if ← System.FilePath.pathExists "LeanNative/Spec.lean" then IO.FS.readFile "LeanNative/Spec.lean" else pure ""
-  let (specSigs, specGuards) := extractLeanSourceCAbiAndGuards specRaw
+  -- P-cert C4: the core binary has no elaborating frontend, so Spec.lean bindings use the `--signatures-only` path
+  -- (scalar exported signatures only, fail closed otherwise); a rejected Spec.lean fails this check.
+  let (specOk, specSigs, specGuards) := if specRaw.isEmpty then (true, [], []) else
+    match extractSignaturesOnlyCAbi specRaw with | .ok (s, g) => (true, s, g) | .error _ => (false, [], [])
+  let specNote? := if specRaw.isEmpty then none else some signaturesOnlyMarker
   let activeSigs := if specSigs.isEmpty then moduleToCAbiSigs optMod else specSigs
-  let cabiGenHdr := emitCAbiHeaderFromSigs activeSigs
-  let cabiGenRs := emitCAbiRustFromSigs activeSigs
-  let cabiGenSw := emitCAbiSwiftFromSigs activeSigs
-  let cabiGenFix := emitGuardFixturesJson "LeanNative/Spec.lean" specSigs specGuards
-  let cabiGenOk := (cabiGenHdr.splitOn "extern \"C\"").length > 1 && (cabiGenRs.splitOn "extern \"C\"").length > 1 &&
+  let cabiGenHdr := emitCAbiHeaderFromSigs activeSigs specNote?
+  let cabiGenRs := emitCAbiRustFromSigs activeSigs specNote?
+  let cabiGenSw := emitCAbiSwiftFromSigs activeSigs (note? := specNote?)
+  let cabiGenFix := emitGuardFixturesJson "LeanNative/Spec.lean" specSigs specGuards specNote?
+  let cabiGenOk := specOk && (cabiGenHdr.splitOn "extern \"C\"").length > 1 && (cabiGenRs.splitOn "extern \"C\"").length > 1 &&
     (cabiGenSw.splitOn "@_silgen_name").length > 1 &&
     !activeSigs.isEmpty && activeSigs.all (fun sig =>
       (cabiGenRs.splitOn s!"pub unsafe fn {sig.cSymbol}(").length == 2 &&
       (cabiGenRs.splitOn s!"c_abi::{sig.cSymbol}(").length == 2) &&
-    (specRaw.isEmpty || (!specSigs.isEmpty && !specGuards.isEmpty && (cabiGenFix.splitOn "leannative_verify_cabi_slice_io").length > 1))
+    (specRaw.isEmpty || (!specSigs.isEmpty && !specGuards.isEmpty && (cabiGenFix.splitOn "leannative_verify_cabi_slice_io").length > 1 &&
+      (cabiGenFix.splitOn signaturesOnlyMarker).length > 1))
   let axiomReport := verifiedAxiomAuditReport
   let axiomOk := axiomReport.passed && axiomReport.forbiddenAxiomsFound.isEmpty && axiomReport.theoremsAudited >= 185 && cabiGenOk
   let sAx := "sor" ++ "ryAx"
@@ -785,6 +810,13 @@ def printCoreUsage (tag : String) (hasFrontend : Bool) : IO Unit := do
     "  compile-llvm       Emit baseline or optimized LLVM 18 IR (--input <file>, --arch <target>, --baseline, -o <path>)",
     "  compile-clif       Emit F64 CLIF (--input <file>, --decl <name>, -o <path>)",
     "  compile-static-lib Emit C-ABI static library (.a) + C header (.h) (--input <file>, -o <lib.a>, --header <lib.h>)",
+    "  emit-cabi-bindings Emit C/Rust/Swift/modulemap/fixture bindings (--emit-header|--emit-rust|--emit-swift|--emit-modulemap|--emit-fixtures <path>)"] ++
+    (if hasFrontend then [] else [
+    "                     A .lean input needs the full 'lean-native' frontend (Stage 1D RC-ADT gate); here it is a hard error unless",
+    "                     --signatures-only: bindings from exported source signatures only, no helper/RC-ADT runtime prototypes,",
+    "                     fails closed on any non-scalar exported signature, and records 'signatures-only: no Stage1D gate applied'.",
+    "                     compile-c-abi / compile-static-lib reject .lean inputs here (use lean-native or --lnir)."]) ++ [
+    "  compile-c-abi      Alias of emit-cabi-bindings (no --signatures-only)",
     "  compile-mlir       Emit GPU MLIR module (--input <file>, -o <path>)",
     "  compile-ptx        Emit NVIDIA PTX 8.0 assembly (--input <file>, --sm sm_90, --fastcheck, -o <path>)",
     "  compile-metal      Emit Apple Metal Shading Language 3.0 (--input <file>, --fastcheck, -o <path>)",
@@ -906,6 +938,8 @@ def dispatchSharedCommand (tag : String) (elaborateHook? : Option (String → Ta
   let isCabiFallback := !(args.headD "").startsWith "compile" && (hasFlag args "--c-abi" || hasFlag args "--emit-c-abi")
   if hasFlag args "--allow-rc-adt" && (!(rcAdtSupportedCommands.contains (args.headD "")) || isCabiFallback) then
     throw <| IO.userError "[lean-native] --allow-rc-adt is only supported by emit-lnir, eval-lnir, validate-tv, and verify-certs"
+  if hasFlag args "--signatures-only" && (args.head? != some "emit-cabi-bindings" || elaborateHook?.isSome) then
+    throw <| IO.userError "[lean-native] --signatures-only is only supported by lean-native-core emit-cabi-bindings (the full frontend applies the Stage 1D gate)"
   if args.head? != some "eval-lnir" && (args.contains "--args" || args.contains "--cases-file") then
     throw <| IO.userError "[lean-native] --args / --cases-file are only supported by eval-lnir"
   let rest := args.drop 1
@@ -926,7 +960,9 @@ def dispatchSharedCommand (tag : String) (elaborateHook? : Option (String → Ta
   | "compile-clif" :: rest       => some <$> runCompileClif elaborateHook? rest
   | "compile-static-lib" :: rest => some <$> runCompileStaticLib tag elaborateHook? rest
   | "emit-cabi-bindings" :: rest => some <$> runEmitCAbiBindings tag elaborateHook? rest
-  | "compile-c-abi" :: rest      => some <$> runEmitCAbiBindings tag elaborateHook? rest
+  | "compile-c-abi" :: rest      => do
+    rejectLeanSourceWithoutFrontend tag "compile-c-abi" elaborateHook? rest
+    some <$> runEmitCAbiBindings tag elaborateHook? rest
   | "compile-mlir" :: rest       => some <$> runCompileMLIR tag elaborateHook? rest
   | "compile-ptx" :: rest       => some <$> runCompilePTX tag elaborateHook? rest
   | "compile-metal" :: rest     => some <$> runCompileMetal tag elaborateHook? rest
