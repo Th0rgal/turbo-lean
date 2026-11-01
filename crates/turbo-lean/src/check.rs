@@ -303,13 +303,13 @@ pub fn try_stateless_remote_check(
             .ok()
             .and_then(|store| resolve_prebuilt_module_import(&store, &canon_dir, &canon_file))
             .and_then(|mod_imp| {
-            splitter::build_fast_olean_shard_source_with_split(
-                &active_src,
-                &split,
-                &mod_imp,
-                &uncached_names,
-            )
-        })
+                splitter::build_fast_olean_shard_source_with_split(
+                    &active_src,
+                    &split,
+                    &mod_imp,
+                    &uncached_names,
+                )
+            })
     };
     let Some(batch_src) = pruned_batch_src.or(fast_batch_src) else {
         return Ok(false);

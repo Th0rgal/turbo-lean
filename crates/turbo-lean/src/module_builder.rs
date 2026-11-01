@@ -8513,7 +8513,7 @@ impl DependencyReplayRecord {
 /// their imports can themselves be shadowed by project artifacts. Only trusted installation
 /// metadata is cached; each imported name is resolved anew in the consumer's search path.
 fn resolve_dependency_artifacts(
-    mut worklist: Vec<String>,
+    roots: Vec<String>,
     lean_path: &str,
     tc_lib: &Path,
     githash: &str,
@@ -8522,16 +8522,24 @@ fn resolve_dependency_artifacts(
     type ToolchainImports = HashMap<(PathBuf, String), Vec<String>>;
     static TC_IMPORTS: OnceLock<Mutex<ToolchainImports>> = OnceLock::new();
     let cache = TC_IMPORTS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut seen = HashSet::new();
+    // A call-local classification avoids checking shared toolchain children once for
+    // every parent. Stronger toolchain-only edges must be checked even after visitation.
+    let mut worklist: Vec<_> = roots.into_iter().map(|m| (m, false)).collect();
+    let mut seen = HashMap::new();
     let mut imported = Vec::new();
-    while let Some(m) = worklist.pop() {
-        if !seen.insert(m.clone()) {
+    while let Some((m, must_be_toolchain)) = worklist.pop() {
+        if let Some(&toolchain) = seen.get(&m) {
+            anyhow::ensure!(!must_be_toolchain || toolchain,
+                "Toolchain dependency `{m}` resolves outside the selected installation: fail-closed shadowed toolchain environment");
             continue;
         }
         let path = resolve_imported_olean(lean_path, &m).with_context(|| {
             format!("Cannot resolve imported module `{m}` for kernel replay: fail-closed")
         })?;
         let toolchain = is_selected_toolchain_artifact(tc_lib, githash, &path, &m);
+        anyhow::ensure!(!must_be_toolchain || toolchain,
+            "Toolchain dependency `{m}` resolves outside the selected installation: fail-closed shadowed toolchain environment");
+        seen.insert(m.clone(), toolchain);
         let key = (
             path.canonicalize()
                 .with_context(|| format!("Missing imported artifact `{m}`: fail-closed"))?,
@@ -8565,19 +8573,8 @@ fn resolve_dependency_artifacts(
             }
             imports
         };
-        // Installed declarations are valid in the installation's own import environment.
-        // A project override of any dependency revokes that premise even if the override
-        // independently replays. Reject such toolchain environments rather than exempting
-        // parents that have never been checked against the changed interface.
-        if toolchain {
-            for child in &imports {
-                let selected = resolve_imported_olean(lean_path, child)
-                    .is_some_and(|p| is_selected_toolchain_artifact(tc_lib, githash, &p, child));
-                anyhow::ensure!(selected,
-                    "Toolchain module `{m}` resolves dependency `{child}` outside the selected installation: fail-closed shadowed toolchain environment");
-            }
-        }
-        worklist.extend(imports);
+        // Installed declarations are valid only in their installation's environment.
+        worklist.extend(imports.into_iter().map(|child| (child, toolchain)));
         if let Some(dig) = dig {
             imported.push((m, path, dig));
         }
@@ -10977,15 +10974,20 @@ lean_exe «demo-exe» where
                 }
             }
             let (lp, _) = build_lean_search_path(&cfg, false);
-            let err = resolve_dependency_artifacts(
+            for roots in [
                 vec!["Init".into()],
-                &lp,
-                &cfg.toolchain_lib_lean,
-                &cfg.lean_githash,
-                false,
-            )
-            .unwrap_err();
-            assert!(format!("{err:#}").contains("Init.Classical"), "{err:#}");
+                vec!["Init".into(), "Init.Classical".into()],
+            ] {
+                let err = resolve_dependency_artifacts(
+                    roots,
+                    &lp,
+                    &cfg.toolchain_lib_lean,
+                    &cfg.lean_githash,
+                    false,
+                )
+                .unwrap_err();
+                assert!(format!("{err:#}").contains("Init.Classical"), "{err:#}");
+            }
             fs::write(
                 tree.project.join("P/Target.lean"),
                 "import Init\ntheorem target : True := trivial\n",
