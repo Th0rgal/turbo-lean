@@ -9924,7 +9924,7 @@ fn build_shared_object(
         let mut cmd = Command::new(&cc);
         cmd.arg("-shared");
         if toolchain_native.is_osx {
-            cmd.arg(format!("-Wl,-install_name,{}", so_path.display()));
+            cmd.arg("-install_name").arg(so_path);
         }
         cmd.arg("-o")
             .arg(&tmp_so)
@@ -14012,7 +14012,7 @@ globs = ["Opt.+"]
             // (c) `pkg.precompileModules = true` + `lib.precompileModules = false` -> Lake's `LeanLib.precompileModules` is `self.pkg.precompileModules || self.config.precompileModules` (`true`),
             // propagating `needs_c`, `.c.o.export`, module `.so` dynlibs, and library shared object `libws9__pre_Pre.so` across a diamond DAG (`Pre.Base` <- `Pre.Left`/`Pre.Right` <- `Pre.Top`)
             // and downstream library `Down` (`Down.Use`), so full `lake build --no-build` exits 0!
-            let pre_proj = dir.join("ws9_pre_proj");
+            let pre_proj = dir.join("ws9_pre,proj");
             fs::create_dir_all(pre_proj.join("Pre")).unwrap();
             fs::create_dir_all(pre_proj.join("Down")).unwrap();
             fs::write(
