@@ -8624,6 +8624,12 @@ fn resolved_environment_digest(imported: &[(String, PathBuf, String)]) -> Result
         .to_string())
 }
 
+// Source compilation performed in this verifier process remains evidence even when the
+// selected store is checkout-local. Never persist or accept project-writable source records.
+// Dependency replay authority remains separate and still replays every checkout-local use.
+type SourceCompilationMemory = HashMap<(PathBuf, PathBuf), String>;
+static SOURCE_COMPILATION_MEMORY: OnceLock<Mutex<SourceCompilationMemory>> = OnceLock::new();
+
 /// Unlike replay authority, this record establishes compilation from these exact source
 /// bytes. Only native compilation followed by the root kernel/policy audit may write it.
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
@@ -8677,16 +8683,20 @@ pub(crate) fn source_compilation_authorized(store: &TurboStore, root: &Path, fil
 fn source_compilation_authorized_with_trust(store: &TurboStore, root: &Path, file: &Path, is_untrusted: bool) -> bool {
     let lookup = || -> Result<bool> {
         let cfg = resolve_project_config_with_trust(root, is_untrusted)?;
-        if !verifier_controls_store(store, &cfg)? {
-            return Ok(false);
-        }
-        let path = serde_json::to_string(&file.canonicalize()?)?;
+        let source_path = file.canonicalize()?;
+        let path = serde_json::to_string(&source_path)?;
         let key = blake3::hash(path.as_bytes()).to_hex().to_string();
-        let actual: String = store.conn.query_row(
-            "SELECT record_json FROM source_kernel_compilations WHERE compilation_key = ?1",
-            [&key],
-            |r| r.get(0),
-        )?;
+        let actual: String = if verifier_controls_store(store, &cfg)? {
+            store.conn.query_row(
+                "SELECT record_json FROM source_kernel_compilations WHERE compilation_key = ?1",
+                [&key], |r| r.get(0),
+            )?
+        } else {
+            SOURCE_COMPILATION_MEMORY.get_or_init(|| Mutex::new(HashMap::new()))
+                .lock().map_err(|_| anyhow::anyhow!("Source provenance memory poisoned"))?
+                .get(&(store.root.canonicalize()?, source_path)).cloned()
+                .context("No source compilation in this verifier process")?
+        };
         let actual: SourceCompilationRecord = serde_json::from_str(&actual)?;
         Ok(actual == SourceCompilationRecord::new(&cfg, file, &actual.replay.module, is_untrusted)?)
     };
@@ -8729,9 +8739,7 @@ fn record_source_compilation(
     digest: &str,
     is_untrusted: bool,
 ) -> Result<()> {
-    if !node.is_root_pkg || !verifier_controls_store(store, cfg)? {
-        return Ok(());
-    }
+    if !node.is_root_pkg { return Ok(()); }
     let record = SourceCompilationRecord::new(cfg, &node.src_path, &node.module_name, is_untrusted)?;
     anyhow::ensure!(
         record.source_digest == node.src_blake3 && record.replay.artifact_digest == digest,
@@ -8741,14 +8749,20 @@ fn record_source_compilation(
     let json = serde_json::to_string(&record)?;
     let path = serde_json::to_string(&record.source_path)?;
     let key = blake3::hash(path.as_bytes()).to_hex().to_string();
-    store.conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS source_kernel_compilations (
-        compilation_key TEXT PRIMARY KEY, record_json TEXT NOT NULL)",
-    )?;
-    store.conn.execute(
-        "INSERT OR REPLACE INTO source_kernel_compilations VALUES (?1, ?2)",
-        rusqlite::params![key, json],
-    )?;
+    if verifier_controls_store(store, cfg)? {
+        store.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS source_kernel_compilations (
+            compilation_key TEXT PRIMARY KEY, record_json TEXT NOT NULL)",
+        )?;
+        store.conn.execute(
+            "INSERT OR REPLACE INTO source_kernel_compilations VALUES (?1, ?2)",
+            rusqlite::params![key, json],
+        )?;
+    } else {
+        SOURCE_COMPILATION_MEMORY.get_or_init(|| Mutex::new(HashMap::new()))
+            .lock().map_err(|_| anyhow::anyhow!("Source provenance memory poisoned"))?
+            .insert((store.root.canonicalize()?, record.source_path), json);
+    }
     Ok(())
 }
 
@@ -11009,6 +11023,24 @@ lean_exe «demo-exe» where
             &tree.project,
             &target
         ));
+        // Checkout-local stores cannot persist authority. A sandboxed compile is
+        // nevertheless authoritative within this verifier process, with full revalidation.
+        let mut local = TurboStore::open(Some(&tree.project.join(".source-cache")))?;
+        let build = |store: &mut TurboStore| build_project_modules_native(
+            store, &tree.project, &[], "untrusted:fixture", 1, true, true, None,
+        );
+        assert_eq!(build(&mut local)?.modules_compiled, 1);
+        require_source_compilations(&local, &tree.project, std::slice::from_ref(&target), true)?;
+        let tables: i64 = local.conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'source_kernel_compilations'", [], |r| r.get(0),
+        )?;
+        assert_eq!(tables, 0, "checkout-local compilation authority must not persist");
+        SOURCE_COMPILATION_MEMORY.get().unwrap().lock().unwrap()
+            .remove(&(local.root.canonicalize()?, target.canonicalize()?));
+        assert!(!source_compilation_authorized_with_trust(&local, &tree.project, &target, true));
+        assert!(require_source_compilations(&local, &tree.project, std::slice::from_ref(&target), true).is_err());
+        assert_eq!(build(&mut local)?.modules_compiled, 1, "cold untrusted module-unit cache must recompile in bwrap");
+        require_source_compilations(&local, &tree.project, std::slice::from_ref(&target), true)?;
         Ok(())
     }
 
