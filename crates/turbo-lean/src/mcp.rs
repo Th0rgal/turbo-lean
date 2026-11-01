@@ -1956,6 +1956,7 @@ pub fn handle_mcp_jsonrpc_request(
 /// Read the next JSON-RPC 2.0 message from `reader`, supporting both:
 /// 1. `Content-Length: <N>\r\n\r\n<payload>` framed MCP messages, and
 /// 2. Newline-delimited JSON-RPC 2.0 lines (`{...}\n`).
+///
 /// Returns `Ok(Some((request_value, was_content_length_framed)))` or `Ok(None)` on EOF.
 pub fn read_next_mcp_message<R: BufRead>(
     reader: &mut R,

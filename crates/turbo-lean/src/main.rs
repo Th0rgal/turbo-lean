@@ -574,10 +574,10 @@ fn run(cli: Cli) -> Result<()> {
         } else if pol.mode == "local" {
             std::env::set_var("TURBO_LEAN_TELEMETRY", "local");
         }
-    } else if !is_telemetry_cmd {
-        if !mcp::resolve_telemetry_policy_with_trust(tel_dir, trust_proj_toml).enabled {
-            std::env::set_var("LEAN_NATIVE_TELEMETRY", "off");
-        }
+    } else if !is_telemetry_cmd
+        && !mcp::resolve_telemetry_policy_with_trust(tel_dir, trust_proj_toml).enabled
+    {
+        std::env::set_var("LEAN_NATIVE_TELEMETRY", "off");
     }
 
     if let Commands::Telemetry {
@@ -614,11 +614,11 @@ fn run(cli: Cli) -> Result<()> {
             project_dir, base, ..
         } => (Some(project_dir.as_path()), Some(base.as_str())),
         Commands::CiVerify {
-            project_dir, base, ..
-        } => match base {
-            Some(base) => (Some(project_dir.as_path()), Some(base.as_str())),
-            None => (None, None),
-        },
+            project_dir,
+            base: Some(base),
+            ..
+        } => (Some(project_dir.as_path()), Some(base.as_str())),
+        Commands::CiVerify { base: None, .. } => (None, None),
         Commands::Check { project_dir, .. }
         | Commands::Build { project_dir, .. }
         | Commands::SeedShards { project_dir, .. } => (Some(project_dir.as_path()), None),
@@ -936,6 +936,7 @@ fn run(cli: Cli) -> Result<()> {
         None;
     let mut prefetched_manifest: Option<std::thread::JoinHandle<Option<pack::DeltaManifest>>> =
         None;
+    #[allow(clippy::type_complexity)]
     let mut prefetched_import: Option<
         std::thread::JoinHandle<
             Option<(pack::PackManifest, Vec<(String, String, i64, i64)>, usize)>,
@@ -1053,34 +1054,33 @@ fn run(cli: Cli) -> Result<()> {
                         .join("locks")
                         .join("cached_portable_manifest.json")
                         .exists())
+                && pack::try_stateless_noop_pull_sync(&resolved_cache_root, &base)
             {
-                if pack::try_stateless_noop_pull_sync(&resolved_cache_root, &base) {
-                    if cli.json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "status": "synced",
-                                "mode": "bidirectional",
-                                "remote": remote,
-                                "pulled_actions": 0,
-                                "pulled_blobs": 0,
-                                "pulled_pack_bytes": 0,
-                                "pushed_actions": 0,
-                                "pushed_blobs": 0,
-                                "pushed_raw_bytes": 0,
-                                "pushed_pack_bytes": 0,
-                                "delta_push_noop": true,
-                                "elapsed_ms": 0
-                            }))?
-                        );
-                    } else {
-                        println!(
-                            "[turbo-lean] Synced with {} in 0 ms: pulled 0 actions (0 blobs), pushed 0 actions (0 blobs)",
-                            remote
-                        );
-                    }
-                    return Ok(());
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "status": "synced",
+                            "mode": "bidirectional",
+                            "remote": remote,
+                            "pulled_actions": 0,
+                            "pulled_blobs": 0,
+                            "pulled_pack_bytes": 0,
+                            "pushed_actions": 0,
+                            "pushed_blobs": 0,
+                            "pushed_raw_bytes": 0,
+                            "pushed_pack_bytes": 0,
+                            "delta_push_noop": true,
+                            "elapsed_ms": 0
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "[turbo-lean] Synced with {} in 0 ms: pulled 0 actions (0 blobs), pushed 0 actions (0 blobs)",
+                        remote
+                    );
                 }
+                return Ok(());
             }
             if !push && !db_warm_on_open && !has_expected_sha {
                 if let Some((pulled, pulled_bytes)) = pack::try_stateless_cold_pull_sync_with_domain(
@@ -1646,19 +1646,23 @@ fn run(cli: Cli) -> Result<()> {
                 module_builder::try_resolve_lean_args_for_path(&proj_dir, Some(&file))?;
             let filtered_file_lean_args = module_builder::filter_allowed_lean_args(&file_lean_args);
 
+            let file_audit = splitter::split_lean_source(&source, &[])
+                .shards
+                .into_iter()
+                .map(|sh| sh.name)
+                .collect();
             let run_direct_lean = || -> Result<()> {
                 use std::io::Write;
-                let mut cmd = std::process::Command::new(&lean_bin);
-                for arg in &filtered_file_lean_args {
-                    cmd.arg(arg);
-                }
-                cmd.arg(&file).envs(&env_vars);
-                if !req_lp.is_empty() {
-                    cmd.env("LEAN_PATH", &req_lp);
-                } else {
-                    cmd.env_remove("LEAN_PATH");
-                }
-                let out = cmd.output()?;
+                let out = zygote::run_audited_lean_shard(
+                    &store,
+                    &lean_bin,
+                    &env_vars,
+                    Some(&proj_dir),
+                    &source,
+                    &file_audit,
+                    &file_lean_args,
+                    Some(timeout_ms),
+                )?;
                 std::io::stdout().write_all(&out.stdout)?;
                 std::io::stderr().write_all(&out.stderr)?;
                 std::io::stdout().flush()?;
@@ -1750,17 +1754,16 @@ fn run(cli: Cli) -> Result<()> {
             let check_det = verify_determinism
                 || std::env::var("TURBO_LEAN_VERIFY_DETERMINISM").as_deref() == Ok("1");
             if check_det {
-                let mut cmd = std::process::Command::new(&lean_bin);
-                for arg in &filtered_file_lean_args {
-                    cmd.arg(arg);
-                }
-                cmd.arg(&file).envs(&env_vars);
-                if !req_lp.is_empty() {
-                    cmd.env("LEAN_PATH", &req_lp);
-                } else {
-                    cmd.env_remove("LEAN_PATH");
-                }
-                let lean_out = cmd.output()?;
+                let lean_out = zygote::run_audited_lean_shard(
+                    &store,
+                    &lean_bin,
+                    &env_vars,
+                    Some(&proj_dir),
+                    &source,
+                    &file_audit,
+                    &file_lean_args,
+                    Some(timeout_ms),
+                )?;
                 let lean_ok = lean_out.status.success();
                 if reply.ok != lean_ok
                     || rendered_stdout.as_bytes() != lean_out.stdout.as_slice()

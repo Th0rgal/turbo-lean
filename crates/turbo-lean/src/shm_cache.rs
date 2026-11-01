@@ -768,7 +768,7 @@ pub(crate) fn parse_macos_vm_stat_budget_mb(vm_stat_out: &str) -> Option<u64> {
         }
         for key in ["Pages free:", "Pages inactive:", "Pages speculative:"] {
             if let Some(rest) = line.trim().strip_prefix(key) {
-                if let Some(pages) = rest.trim().trim_end_matches('.').parse::<u64>().ok() {
+                if let Ok(pages) = rest.trim().trim_end_matches('.').parse::<u64>() {
                     free_pages = free_pages.saturating_add(pages);
                     found_any = true;
                 }

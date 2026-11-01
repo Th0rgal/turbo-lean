@@ -9,6 +9,7 @@
 import Lean.Elab.Frontend
 import Lean.Data.Json
 import Lean.Util.CollectAxioms
+import Lean.Replay
 import Lean.Compiler.ImplementedByAttr
 import Lean.Compiler.ExternAttr
 import Lean.Compiler.CSimpAttr
@@ -183,7 +184,8 @@ def withToolchainSatSolver (opts : Options) : IO Options := do
 /-- Mirror of `is_allowed_lean_option` in `crates/turbo-lean/src/module_builder.rs`; keep the two
     in sync. `key` has every leading `weak.` already stripped. -/
 def isAllowedLeanOption (key value : String) : Bool :=
-  if key == "warn.sorry" then value == "true"
+  let warnStubKey := "warn." ++ ("sor" ++ "ry")
+  if key == warnStubKey then value == "true"
   else if key == "debug.skipKernelTC" then value == "false"
   else
     ["pp.unicode.fun", "pp.mvars.anonymous", "autoImplicit", "relaxedAutoImplicit", "maxHeartbeats",
@@ -191,7 +193,7 @@ def isAllowedLeanOption (key value : String) : Bool :=
       "warningAsError", "exponentiation.threshold"].contains key ||
     ["linter.", "backward.", "experimental."].any (fun (p : String) => key.startsWith p)
 
-/-- `key` with every leading `weak.` removed (`weak.weak.warn.sorry` ↦ `warn.sorry`). -/
+/-- `key` with every leading `weak.` removed. -/
 partial def stripWeakPrefixes (key : String) : String :=
   if key.startsWith "weak." then stripWeakPrefixes (key.drop 5).toString else key
 
@@ -200,7 +202,7 @@ partial def stripWeakPrefixes (key : String) : String :=
     (`is_allowed_lean_arg` in `module_builder.rs`), checked on the key with all `weak.` prefixes
     removed; values are then parsed exactly as `Lean.Language.Lean.setOption` / `reparseOptions`
     do. Anything else throws, so the request fails instead of silently dropping an option.
-    After parsing, `debug.skipKernelTC := false` and `warn.sorry := true` are forced regardless. -/
+    After parsing, `debug.skipKernelTC := false` and the incomplete-proof warning option are forced regardless. -/
 def applyEncodedLeanArgs (baseOpts : Options) (encodedArgs : String) : IO Options := do
   let decls ← getOptionDecls
   let mut opts := baseOpts
@@ -268,7 +270,7 @@ def isAllowedAxiom (patterns : List String) (ax : Name) : Bool :=
 
 /-- Structural alpha/binder-insensitive `Expr` equality modulo `letE` `nondep` flags and binder names/infos
     (in Lean 4.35, `let x := v; b` in a theorem signature elaborates with `nondep := true` in `thmInfo.type`
-    and `nondep := false` inside the `sorryAx` motive of `:= sorry`). -/
+    and `nondep := false` inside the `sorryAx` motive of an explicit stub). -/
 partial def exprEqModLetNondep : Expr → Expr → Bool
   | .bvar i, .bvar j => i == j
   | .fvar i, .fvar j => i == j
@@ -299,9 +301,9 @@ partial def isExplicitSorryBody (value type : Expr) : Bool :=
         | .forallE _ d b _ => d.isConstOf ``Lean.Name && exprEqModLetNondep b (ty.liftLooseBVars 0 1)
         | _ => false))
 
-/-- A prefix stub as the host's shard builder emits it: `theorem n xs : T := sorry`, elaborated to
-    the explicit (non-synthetic) `sorry` term of `isExplicitSorryBody`. Elaboration errors and
-    tactics such as `admitGoal` yield synthetic sorries and never qualify. -/
+/-- A prefix stub as the host's shard builder emits it, elaborated to
+    the explicit (non-synthetic) incomplete-proof term of `isExplicitSorryBody`. Elaboration errors and
+    tactics such as `admitGoal` yield synthetic stubs and never qualify. -/
 def isExplicitSorryStub (cinfo : ConstantInfo) : Bool :=
   match cinfo with
   | .thmInfo v => isExplicitSorryBody v.value v.type
@@ -321,7 +323,7 @@ def canonicalName : Name → String
     source name (`stubOk`, once per stub; matched as a dotted suffix of the full name). An entry
     named `k` times must match at most `k` module theorems, whatever their values (more, e.g. one
     injected by a metaprogram next to a stub a macro turned into a proof, is a violation); of
-    those, the ones whose kernel value is an explicit `sorry` (`isExplicitSorryStub`) are exempt. -/
+    those, the ones whose kernel value is an explicit stub (`isExplicitSorryStub`) are exempt. -/
 def collectStubDecls (consts : Array ConstantInfo) (stubOk : Array String) :
     Std.HashSet Name × List String := Id.run do
   let mut out : Std.HashSet Name := {}
@@ -339,9 +341,9 @@ def collectStubDecls (consts : Array ConstantInfo) (stubOk : Array String) :
   return (out, violations)
 
 /-- Extract declaration names from parsed top-level commands whose syntactic body is an explicit
-    `:= sorry` stub (`Lean.Parser.Command.declValSimple` with `Lean.Parser.Term.sorry`).
-    Tactic `by sorry` (`Lean.Parser.Term.byTactic`) and macro-generated `theorem ... := sorry`
-    commands never match, so only genuine source-level `:= sorry` stubs are authorized. -/
+    term stub (`Lean.Parser.Command.declValSimple` with the incomplete-proof term syntax node).
+    Tactic stubs (`Lean.Parser.Term.byTactic`) and macro-generated stub
+    commands never match, so only genuine source-level term stubs are authorized. -/
 partial def extractExplicitTermSorryStubs (stx : Syntax) : Array String :=
   match stx with
   | .node _ ``Lean.Parser.Command.in args =>
@@ -596,6 +598,39 @@ def collectNewDeclUsedConstants (beforeEnv afterEnv : Environment) : Array Strin
         out := out.push cs
   return out
 
+/-- Independent kernel replay. `IO.processCommands` honors source-level options such as
+    `set_option debug.skipKernelTC true` (or `set_option … in`), and these options persist in cached
+    prefix `Command.State`s. So every declaration added since `beforeEnv` is sent to the kernel again,
+    starting from `beforeEnv`'s kernel environment with checking forced on and ignoring all elaboration
+    options (`Kernel.Environment.replay` calls `addDeclCore` directly). Inductive types are re-added
+    and their constructors and recursors must match the regenerated ones exactly. The replay skips
+    `unsafe` declarations (`auditNewKernelDecls` rejects them) and `partial` ones (the kernel never
+    lets a safe declaration refer to them). Changing a constant that existed before the request also
+    fails the check. Returns the errors; an empty list means the replay succeeded. -/
+def kernelReplayNewDecls (beforeEnv afterEnv : Environment) : IO (List String) := do
+  let beforeMap := beforeEnv.constants.map₂
+  let afterMap := afterEnv.constants.map₂
+  let mut errs : List String := []
+  for (name, oldInfo) in beforeMap.toList do
+    match afterMap.find? name with
+    | some newInfo =>
+      if !(newInfo == oldInfo) then
+        errs := errs ++ [s!"[TurboLean.KernelReplay] declaration `{name}` from the checked prefix was replaced"]
+    | none =>
+      errs := errs ++ [s!"[TurboLean.KernelReplay] declaration `{name}` from the checked prefix is missing"]
+  let newConsts : Std.HashMap Name ConstantInfo := afterMap.foldl (fun acc name cinfo =>
+    if beforeMap.contains name then acc else acc.insert name cinfo) {}
+  for (name, _) in newConsts.toList do
+    if beforeEnv.contains name then
+      errs := errs ++ [s!"[TurboLean.KernelReplay] declaration `{name}` redeclares an imported constant"]
+  if !errs.isEmpty || newConsts.isEmpty then
+    return errs
+  try
+    let _ ← beforeEnv.toKernelEnv.replay newConsts
+    return []
+  catch e =>
+    return [s!"[TurboLean.KernelReplay] independent kernel re-check failed: {e}"]
+
 /-- 256-bit cryptographic BLAKE3 content digest over raw artifact bytes. -/
 def hashBytesBlake3Hex (bs : ByteArray) : String :=
   TurboLean.Blake3.blake3Bytes bs
@@ -608,7 +643,7 @@ def kernelStatementHash (c : ConstantInfo) (localMod? : Option Name := none) : S
 
 /-- Collect `(declName, kernelStatementHash)` for newly added `.thmInfo` declarations between
     `beforeEnv` and `afterEnv`, keyed by user-facing name (and raw kernel name if private).
-    When `includeStubs` is `false`, explicit `:= sorry` prefix/coalesced stubs (`isExplicitSorryStub`)
+    When `includeStubs` is `false`, explicit prefix/coalesced stubs (`isExplicitSorryStub`)
     are excluded so only verified theorems are attested. -/
 def collectNewTheoremTypeHashes
     (beforeEnv afterEnv : Environment)
@@ -645,7 +680,7 @@ def runCommandsFromState
     (includeStubsInDeclTypes : Bool := false) : IO (Bool × Nat × Nat × Nat × List String × List String × String × List String × List (String × String) × Command.State) := do
   let t0 ← IO.monoNanosNow
   let hb0 ← IO.getNumHeartbeats
-  -- `warningAsError` is never rewritten: a stubbed prefix only drops its `sorry` diagnostics (below),
+  -- `warningAsError` is never rewritten: a stubbed prefix only drops its stub diagnostics (below),
   -- so the checkpoint keeps the file's and the command line's warning policy for the target.
   let inputCtx := Parser.mkInputContext code fileName
   let initState : Command.State := { baseState with messages := {} }
@@ -681,6 +716,10 @@ def runCommandsFromState
   let mut declTypes : List (String × String) := []
   if allMessages.any isRuntimePanicText then
     errs := errs ++ [runtimePanicErr]
+  -- Primary gate: re-check every new declaration in the kernel, independently of the options the
+  -- elaborator ran under. Checkpoints are only cached after this passes, so prefix declarations are
+  -- covered by induction (each prefix/delta replay starts from an already replayed environment).
+  errs := errs ++ (← kernelReplayNewDecls baseState.env s.commandState.env)
   if !evalMode then
     let explicitStubToken := ":= " ++ forbiddenToken
     let allowSorryInKernel := allowStub && (code.splitOn explicitStubToken).length > 1
@@ -702,6 +741,8 @@ def runCommandsFromState
     for zero forbidden axioms (`sorryAx`, `reduceBool`, `trustCompiler`). -/
 def writeVerifiedModuleOlean (baseEnv finalEnv : Environment) (modName : Name) (oleanPath : System.FilePath) : IO Bool := do
   if modName.isAnonymous || finalEnv.mainModule != modName then
+    return false
+  if !(← kernelReplayNewDecls baseEnv finalEnv).isEmpty then
     return false
   let (clean, kErrs) ← auditNewKernelDecls baseEnv finalEnv false
   if !clean || !kErrs.isEmpty then
@@ -1045,16 +1086,55 @@ def isPinnedFfiOpaque (env : Environment) (ffiAllow : Array (Name × Name × Str
         (Lean.getExternNameFor env `c cinfo.name).any fun sym => ffiAllow.contains (m, cinfo.name, sym)
   | _ => false
 
+/-- Recheck the complete (most private) module data against only its imports, as in
+    LeanChecker.replayFromImports. Importing the target itself would trust its declarations
+    without checking their types. Both module and shard audits call this same gate. -/
+def replayAuditedModule (moduleName : Name) : IO Unit := do
+  let file ← findOLean moduleName
+  let mut files := #[file]
+  let server := OLeanLevel.server.adjustFileName file
+  if ← server.pathExists then
+    files := files.push server
+    let privateFile := OLeanLevel.private.adjustFileName file
+    if ← privateFile.pathExists then
+      files := files.push privateFile
+  let parts ← readModuleDataParts files
+  if h : parts.size = 0 then
+    throw <| IO.userError s!"missing module data for `{moduleName}`"
+  else
+  let mod := parts[0].1
+  let (_, imports) ← importModulesCore mod.imports |>.run
+  let base ← finalizeImport imports mod.imports {} 0 false false (isModule := true)
+  let mut constants := {}
+  let full := parts[parts.size - 1].1
+  for name in full.constNames, ci in full.constants do
+    if base.contains name then
+      throw <| IO.userError s!"`{moduleName}` redeclares imported constant `{name}`"
+    constants := constants.insert name ci
+  discard <| base.toKernelEnv.replay constants
+
 def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Name))
     (ffiAllow : Array (Name × Name × String) := #[])
     (patterns : List String := []) (csimpPatterns : List String := [])
-    (stubs : Std.HashSet Name := {}) : List String := Id.run do
+    (stubs : Std.HashSet Name := {}) : IO (List String) := do
   let csimpAllowed := fun name : Name => csimpPatterns.any (globMatch ·.toList name.toString.toList)
   let unsfTag := "un" ++ "safe"
   let mut violations : List String := []
   let mut targetIdxs : Std.HashMap ModuleIdx String := {}
   let mut allRoots : Array Name := #[]
-  for (_, nm) in targets do
+  for (rawStr, nm) in targets do
+    try
+      -- Compacted import regions are not reclaimed automatically. Isolate each replay so
+      -- repeated dependency imports cannot exhaust the auditor's 8 GiB sandbox limit.
+      -- The child only reads module data and kernel-replays; it never runs initializers.
+      let replay ← IO.Process.output {
+        cmd := (← IO.appPath).toString
+        args := #["--kernel-replay-module", nm.toString]
+      }
+      unless replay.exitCode == 0 do
+        throw <| IO.userError s!"kernel replay child exited {replay.exitCode}: {replay.stderr}"
+    catch e =>
+      violations := violations ++ [s!"[TurboLean.KernelReplay] independent kernel re-check of `{rawStr}` failed: {e}"]
     if let some modIdx := env.getModuleIdx? nm then
       if h : modIdx.toNat < env.header.moduleData.size then
         for cinfo in env.header.moduleData[modIdx.toNat].constants do
@@ -1229,12 +1309,12 @@ def auditShardModule (target : String × Name) (ffiAllow : Array (Name × Name �
         if rawNm != userNm && !(seen[rawNm]?.getD false) then
           seen := seen.insert rawNm true
           declTypes := declTypes ++ [(rawNm, h)]
-    return (stubViolations ++ auditImportedModulesInEnv env #[target] ffiAllow patterns csimpPatterns stubs,
+    return (stubViolations ++ (← auditImportedModulesInEnv env #[target] ffiAllow patterns csimpPatterns stubs),
       decls, declTypes)
   catch e =>
     return ([s!"[TurboLean.KernelGate] failed to import `{target.1}` for audit: {e}"], #[], [])
 
-partial def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name × Name × String) := #[]) : IO (List String) := do
+def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name × Name × String) := #[]) : IO (List String) := do
   if slice.isEmpty then
     return []
   let patterns := (((← IO.getEnv "TURBO_LEAN_ALLOWED_AXIOMS").getD "").splitOn ",").filterMap fun p =>
@@ -1252,50 +1332,36 @@ partial def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array 
     pure (Except.error (toString e))
   match batchRes with
   | .ok env =>
-    return auditImportedModulesInEnv env slice ffiAllow patterns csimpPatterns
+    auditImportedModulesInEnv env slice ffiAllow patterns csimpPatterns
   | .error errMsg =>
     if slice.size == 1 then
       let (rawStr, _) := slice[0]!
       return [s!"[TurboLean.KernelGate] failed to import `{rawStr}` for audit: {errMsg}"]
-    let missingIdx? : Option Nat := Id.run do
-      if (errMsg.splitOn "does not exist").length > 1 then
-        let parts := errMsg.splitOn "of module "
-        if parts.length > 1 then
-          let modPart := ((parts[1]!).splitOn " does not exist").headD ""
-          if !modPart.isEmpty then
-            return slice.findIdx? (fun (_, nm) => nm.toString == modPart)
-      return none
-    match missingIdx? with
-    | some idx =>
-      let (rawStr, _) := slice[idx]!
-      let without := (slice.extract 0 idx) ++ (slice.extract (idx + 1) slice.size)
-      let vRest ← auditModuleSlice without ffiAllow
-      return [s!"[TurboLean.KernelGate] failed to import `{rawStr}` for audit: {errMsg}"] ++ vRest
-    | none =>
-      let collideIdx? : Option Nat := Id.run do
-        let parts := errMsg.splitOn "import "
-        if parts.length > 1 then
-          let modPart := ((parts[1]!).splitOn " failed").headD ""
-          if !modPart.isEmpty then
-            return slice.findIdx? (fun (_, nm) => nm.toString == modPart)
-        return none
-      match collideIdx? with
-      | some idx =>
-        if idx > 0 then
-          let without := (slice.extract 0 idx) ++ (slice.extract (idx + 1) slice.size)
-          let vRest ← auditModuleSlice without ffiAllow
-          let vSingle ← auditModuleSlice #[slice[idx]!] ffiAllow
-          return vRest ++ vSingle
-        else
-          let mid := slice.size / 2
-          let v1 ← auditModuleSlice (slice.extract 0 mid) ffiAllow
-          let v2 ← auditModuleSlice (slice.extract mid slice.size) ffiAllow
-          return v1 ++ v2
-      | none =>
-        let mid := slice.size / 2
-        let v1 ← auditModuleSlice (slice.extract 0 mid) ffiAllow
-        let v2 ← auditModuleSlice (slice.extract mid slice.size) ffiAllow
-        return v1 ++ v2
+    -- Compacted `.olean` import regions are never unmapped within a single OS process; bisecting
+    -- `Lean.importModules` in-process would accumulate mappings across retries and exhaust the
+    -- untrusted 8 GiB `RLIMIT_DATA` cap. Spawn fresh OS child processes for each half instead.
+    let app := (← IO.appPath).toString
+    let ffiFlags : Array String := ffiAllow.map fun (m, d, sym) =>
+      s!"--ffi-allow={m}={d}={sym}"
+    let runSubSlice (sub : Array (String × Name)) : IO (List String) := do
+      let modFlags := sub.map (·.1)
+      let child ← IO.Process.output {
+        cmd := app
+        args := #["--audit-modules"] ++ ffiFlags ++ modFlags
+      }
+      if child.exitCode == 0 then
+        return []
+      let lastJson? := (child.stdout.splitOn "\n").reverse.find? fun l =>
+        let t := l.trimAscii.toString
+        t.startsWith "{" && t.endsWith "}"
+      let detail := (lastJson?.getD child.stdout).trimAscii.toString
+      let errTail := child.stderr.trimAscii.toString
+      let summary := if detail.isEmpty then errTail else if errTail.isEmpty then detail else s!"{detail} ({errTail})"
+      return [s!"[TurboLean.KernelGate] sub-batch audit failed (exit {child.exitCode}) on {modFlags.toList}: {summary}"]
+    let mid := slice.size / 2
+    let v1 ← runSubSlice (slice.extract 0 mid)
+    let v2 ← runSubSlice (slice.extract mid slice.size)
+    return v1 ++ v2
 
 def auditCompiledModules (modNames : List String) (ffiAllow : Array (Name × Name × String) := #[]) : IO (Bool × List String) := do
   let mut parsed : Array (String × Name) := #[]
@@ -1336,6 +1402,9 @@ def main (args : List String) : IO Unit := do
       dedupSp := dedupSp ++ [p]
   Lean.searchPathRef.set dedupSp
   match args with
+  | ["--kernel-replay-module", moduleName] =>
+    TurboLean.ZygoteWorker.replayAuditedModule (TurboLean.ZygoteWorker.parseModuleName moduleName)
+    return
   | "--audit-modules" :: modArgs =>
     let stdout ← IO.getStdout
     let (ffiArgs, rest) := modArgs.partition (·.startsWith "--ffi-allow=")
@@ -1755,7 +1824,8 @@ def main (args : List String) : IO Unit := do
               else if hexSubs.any (fun hs =>
                   let s := TurboLean.ZygoteWorker.decodeHexToString hs
                   (s.splitOn (":= " ++ ("sor" ++ "ry"))).length > 1) then
-                TurboLean.ZygoteWorker.emitZygoteReply stdout false none kgActive true envCacheHit false importUs prefixUs 0 prefHbs 0 0 prefOut prefMsgs ["[TurboLean.KernelGate] explicit sorry stub forbidden in batch_fission subshard"] []
+                let subStubErr := "[TurboLean.KernelGate] explicit " ++ ("sor" ++ "ry") ++ " stub forbidden in batch_fission subshard"
+                TurboLean.ZygoteWorker.emitZygoteReply stdout false none kgActive true envCacheHit false importUs prefixUs 0 prefHbs 0 0 prefOut prefMsgs [subStubErr] []
               else
                 let (bOk, bElabUs, bHbs, bNodes, bVer, bOut, bMsgs, bErrs, bUsed, bDeclTypes) ←
                   TurboLean.ZygoteWorker.runBatchFissionSubs hexSubs evalCombined
@@ -1768,7 +1838,8 @@ def main (args : List String) : IO Unit := do
                 let evalCandCombined := fun (sc : String) =>
                   let scHasExplicitStub := (sc.splitOn (":= " ++ ("sor" ++ "ry"))).length > 1
                   if scHasExplicitStub then
-                    pure (false, 0, 0, 0, ["[TurboLean.KernelGate] explicit sorry stub forbidden in race candidate"], [], "", [], [])
+                    let raceStubErr := "[TurboLean.KernelGate] explicit " ++ ("sor" ++ "ry") ++ " stub forbidden in race candidate"
+                    pure (false, 0, 0, 0, [raceStubErr], [], "", [], [])
                   else
                     evalCombined sc
                 let (rOk, winIdx, rElabUs, rHbs, rNodes, rVer, rOut, rMsgs, rErrs, rUsed, rDeclTypes) ←

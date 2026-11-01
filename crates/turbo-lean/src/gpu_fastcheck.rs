@@ -2922,6 +2922,7 @@ pub fn run_tpu_fast_check(json: bool, file: &Path, decl_filter: Option<&str>) ->
 }
 
 /// Execute `turbo-lean fast-check` with unified `--backend auto|cpu|gpu|tpu` routing.
+#[allow(clippy::too_many_arguments)]
 pub fn run_fast_check_command(
     store: &crate::db::TurboStore,
     json: bool,
@@ -3832,7 +3833,7 @@ fn eval_lean_expr_fast_with_domain(
                     let la = l.as_u64()?;
                     let rb = r.as_u64()?;
                     match op.as_str() {
-                        "/" => Some(FastVal::U64(if rb == 0 { 0 } else { dom.mask(la / rb) })),
+                        "/" => Some(FastVal::U64(la.checked_div(rb).map_or(0, |q| dom.mask(q)))),
                         "%" => Some(FastVal::U64(if rb == 0 {
                             dom.mask(la)
                         } else {
@@ -4505,6 +4506,7 @@ fn resolve_agent_step_env_and_paths(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_eval_decl_stage1_cex_json(
     d: &ExtractedDecl,
     file: &Path,
@@ -4937,7 +4939,7 @@ pub fn evaluate_agent_step_value(
                 let sp = crate::splitter::split_lean_source(&src_text, &dep_hashes);
                 if let Some(ref st_path) = st_path_opt {
                     let entry = crate::lake_build::ShmCachedFileSplit {
-                        split_key: format!("file-split:v10:{}", src_b3),
+                        split_key: format!("file-split:v11:{}", src_b3),
                         src_blake3: src_b3,
                         split: crate::lake_build::compact_split_for_shm_cache(&sp),
                         prefix_src: if src_text.len() <= 64 * 1024 {
@@ -5168,7 +5170,16 @@ pub fn evaluate_agent_step_value(
                     }
                 }
                 if all_attested {
-                    crate::lake_build::recheck_dependents_if_nonlocal(&canon_dir, &resolved_file)?;
+                    crate::module_builder::ensure_imported_oleans_replayed(
+                        store,
+                        &canon_dir,
+                        std::slice::from_ref(&resolved_file),
+                    )?;
+                    crate::lake_build::recheck_dependents_if_nonlocal(
+                        store,
+                        &canon_dir,
+                        &resolved_file,
+                    )?;
                     let elapsed_ms =
                         (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
                     let first_shard = target_shards[0];
@@ -5802,7 +5813,7 @@ theorem masked_trivial (x : Nat) : AlwaysTrue x := by trivial
         assert_eq!(rep_unf["ok"].as_bool(), Some(false));
         assert_eq!(rep_unf["vacuous_specs"].as_u64(), Some(1));
         assert_eq!(rep_unf["trivial_specs"].as_u64(), Some(1));
-        assert_eq!(rep_unf["specs"][0]["pos_witness"].as_str().is_some(), true);
+        assert!(rep_unf["specs"][0]["pos_witness"].as_str().is_some());
         assert_eq!(
             rep_unf["specs"][1]["neg_witness"].as_str(),
             Some("none(tautological_postcondition)")
