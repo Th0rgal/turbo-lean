@@ -19,7 +19,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
-use walkdir::WalkDir;
 /// Glob specification for a `lean_lib` target (`Glob.one`, `Glob.submodules`, `Glob.andSubmodules`).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum GlobSpec {
@@ -6092,6 +6091,31 @@ fn compose_effective_args(
     }
     (merged_opts, strong, weak)
 }
+fn for_each_module_in_dir(
+    dir: &Path,
+    src_root: &Path,
+    out: &mut Vec<(String, PathBuf)>,
+) -> Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            for_each_module_in_dir(&path, src_root, out)?;
+        } else if path.extension().and_then(|s| s.to_str()) == Some("lean") {
+            if let Ok(rel) = path.strip_prefix(src_root) {
+                let mod_name = format_lean_module_name_from_parts(
+                    rel.with_extension("")
+                        .components()
+                        .filter_map(|c| c.as_os_str().to_str()),
+                );
+                if !mod_name.is_empty() {
+                    out.push((mod_name, path));
+                }
+            }
+        }
+    }
+    Ok(())
+}
 fn expand_glob_in_dir(
     src_root: &Path,
     glob: &GlobSpec,
@@ -6116,28 +6140,7 @@ fn expand_glob_in_dir(
             let rel_slash = module_name_to_rel_slash(prefix);
             let sub_dir = src_root.join(&rel_slash);
             if sub_dir.is_dir() {
-                let mut files: Vec<PathBuf> = WalkDir::new(&sub_dir)
-                    .into_iter()
-                    .flatten()
-                    .filter(|e| {
-                        e.file_type().is_file()
-                            && e.path().extension().and_then(|s| s.to_str()) == Some("lean")
-                    })
-                    .map(|e| e.path().to_path_buf())
-                    .collect();
-                files.sort();
-                for f in files {
-                    if let Ok(rel) = f.strip_prefix(src_root) {
-                        let mod_name = format_lean_module_name_from_parts(
-                            rel.with_extension("")
-                                .components()
-                                .filter_map(|c| c.as_os_str().to_str()),
-                        );
-                        if !mod_name.is_empty() {
-                            out.push((mod_name, f));
-                        }
-                    }
-                }
+                for_each_module_in_dir(&sub_dir, src_root, &mut out)?;
             } else if require_exists {
                 anyhow::bail!(
                     "Submodules directory for glob `{}.+` not found at `{}`",
@@ -6154,28 +6157,7 @@ fn expand_glob_in_dir(
                 out.push((prefix.clone(), root_file));
             }
             if sub_dir.is_dir() {
-                let mut files: Vec<PathBuf> = WalkDir::new(&sub_dir)
-                    .into_iter()
-                    .flatten()
-                    .filter(|e| {
-                        e.file_type().is_file()
-                            && e.path().extension().and_then(|s| s.to_str()) == Some("lean")
-                    })
-                    .map(|e| e.path().to_path_buf())
-                    .collect();
-                files.sort();
-                for f in files {
-                    if let Ok(rel) = f.strip_prefix(src_root) {
-                        let mod_name = format_lean_module_name_from_parts(
-                            rel.with_extension("")
-                                .components()
-                                .filter_map(|c| c.as_os_str().to_str()),
-                        );
-                        if !mod_name.is_empty() {
-                            out.push((mod_name, f));
-                        }
-                    }
-                }
+                for_each_module_in_dir(&sub_dir, src_root, &mut out)?;
             }
             if out.is_empty() && require_exists {
                 anyhow::bail!(
@@ -7577,8 +7559,7 @@ pub fn build_module_dag_with_trust(
                 // 1. Check if `imp` resolves in root package (`findModule?`, not exe roots)
                 if let Some(dep_spec) = resolve_importable_module_in_package(root_pkg, true, imp) {
                     if !dep_spec.is_exe_target
-                        && (dep_spec.pkg_root != spec.pkg_root
-                            || dep_spec.target_name != spec.target_name)
+                        && dep_spec.target_name != spec.target_name
                         && (spec.precompile_modules || dep_spec.precompile_modules)
                     {
                         enqueue_shared_lib_mods(
@@ -7616,6 +7597,9 @@ pub fn build_module_dag_with_trust(
                     let importer_in_shared = !spec.is_exe_target
                         && requested_shared_libs
                             .contains(&(spec.pkg_root.clone(), spec.target_name.clone()));
+                    let same_lib_name = !spec.is_exe_target
+                        && !dep_spec.is_exe_target
+                        && dep_spec.target_name == spec.target_name;
                     let importer_needs_dep_dynlib = spec.precompile_modules
                         || dep_spec.precompile_modules
                         || importer_in_shared
@@ -7630,7 +7614,7 @@ pub fn build_module_dag_with_trust(
                             continue;
                         }
                     }
-                    if !dep_spec.is_exe_target && importer_needs_dep_dynlib {
+                    if !dep_spec.is_exe_target && !same_lib_name && importer_needs_dep_dynlib {
                         enqueue_shared_lib_mods(
                             &dep_spec.pkg_root,
                             &dep_spec.target_name,
@@ -7741,7 +7725,7 @@ pub fn build_module_dag_with_trust(
             for dep in &node.direct_dag_deps {
                 if let Some(dn) = nodes.get(dep) {
                     if !dn.is_exe_target
-                        && dn.pkg_root == node.pkg_root
+                        && !node.is_exe_target
                         && dn.target_name == node.target_name
                         && explicit_dynlib_mods.insert(dep.clone())
                     {
@@ -7763,7 +7747,9 @@ pub fn build_module_dag_with_trust(
                     if let Some(ds) = dep_spec_opt {
                         let is_direct = node.import_specs.iter().any(|is| &is.module == ext_m);
                         if is_direct {
-                            if !ds.is_exe_target {
+                            if !ds.is_exe_target
+                                && (node.is_exe_target || ds.target_name != node.target_name)
+                            {
                                 enqueue_shared_lib_mods(
                                     &ds.pkg_root,
                                     &ds.target_name,
@@ -7771,6 +7757,9 @@ pub fn build_module_dag_with_trust(
                                     &mut requested_shared_libs,
                                     &mut worklist,
                                 )?;
+                            } else if !ds.is_exe_target {
+                                explicit_dynlib_mods.insert(ext_m.clone());
+                                native_stack.push(ext_m.clone());
                             }
                             promoted_direct.push(ext_m.clone());
                             worklist.push_back((ds, true));
@@ -7818,7 +7807,9 @@ pub fn build_module_dag_with_trust(
                     }
                 }
                 if let Some(ds) = dep_spec_opt {
-                    if !ds.is_exe_target {
+                    if !ds.is_exe_target
+                        && (node.is_exe_target || ds.target_name != node.target_name)
+                    {
                         enqueue_shared_lib_mods(
                             &ds.pkg_root,
                             &ds.target_name,
@@ -7880,7 +7871,9 @@ pub fn build_module_dag_with_trust(
                 }
                 if let Some(ds) = dep_spec_opt {
                     if ds.precompile_modules {
-                        if !ds.is_exe_target {
+                        if !ds.is_exe_target
+                            && (node.is_exe_target || ds.target_name != node.target_name)
+                        {
                             enqueue_shared_lib_mods(
                                 &ds.pkg_root,
                                 &ds.target_name,
@@ -7931,15 +7924,14 @@ pub fn build_module_dag_with_trust(
         // whose library differs from that importer's library causes that library's shared `.so`
         // (and any cross-library imports of `requested_shared_libs` local modules) to be built by Lake.
         for (imp_mod, imp_root, imp_target, imp_precomp, imp_deps) in &snapshot_nodes {
+            let imp_is_exe = nodes.get(imp_mod).is_some_and(|n| n.is_exe_target);
             let explicit_dynlib = explicit_dynlib_mods.contains(imp_mod);
             let importer_is_in_shared =
                 requested_shared_libs.contains(&(imp_root.clone(), imp_target.clone()));
             if explicit_dynlib {
                 for dm in imp_deps {
                     if let Some(dn) = nodes.get(dm) {
-                        if !dn.is_exe_target
-                            && (dn.pkg_root != *imp_root || dn.target_name != *imp_target)
-                        {
+                        if !dn.is_exe_target && (imp_is_exe || dn.target_name != *imp_target) {
                             let key = (dn.pkg_root.clone(), dn.target_name.clone());
                             if !expanded_shared_libs.contains(&key) {
                                 enqueue_shared_lib_mods(
@@ -7962,26 +7954,35 @@ pub fn build_module_dag_with_trust(
                     continue;
                 }
                 if let Some(dn) = nodes.get(&dm) {
-                    if !dn.is_exe_target
-                        && (dn.pkg_root != *imp_root || dn.target_name != *imp_target)
-                        && (*imp_precomp
+                    if !dn.is_exe_target && (imp_is_exe || dn.target_name != *imp_target) {
+                        if *imp_precomp
                             || importer_is_in_shared
                             || explicit_dynlib
-                            || dn.precompile_modules)
-                    {
-                        let key = (dn.pkg_root.clone(), dn.target_name.clone());
-                        if !expanded_shared_libs.contains(&key) {
-                            enqueue_shared_lib_mods(
-                                &dn.pkg_root,
-                                &dn.target_name,
-                                &mut expanded_shared_libs,
-                                &mut requested_shared_libs,
-                                &mut worklist,
-                            )?;
-                            discovered_new_shared = true;
+                            || dn.precompile_modules
+                        {
+                            let key = (dn.pkg_root.clone(), dn.target_name.clone());
+                            if !expanded_shared_libs.contains(&key) {
+                                enqueue_shared_lib_mods(
+                                    &dn.pkg_root,
+                                    &dn.target_name,
+                                    &mut expanded_shared_libs,
+                                    &mut requested_shared_libs,
+                                    &mut worklist,
+                                )?;
+                                discovered_new_shared = true;
+                            }
+                        }
+                    } else if !dn.is_exe_target && importer_is_in_shared {
+                        if let Some(dn_mut) = nodes.get_mut(&dm) {
+                            if !dn_mut.needs_c {
+                                dn_mut.needs_c = true;
+                                discovered_new_shared = true;
+                            }
                         }
                     }
-                    stack_t.extend(dn.direct_dag_deps.iter().cloned());
+                    if let Some(dn_ref) = nodes.get(&dm) {
+                        stack_t.extend(dn_ref.direct_dag_deps.iter().cloned());
+                    }
                 }
             }
         }
@@ -8034,7 +8035,6 @@ pub fn build_module_dag_with_trust(
         let mut visited_local = HashSet::new();
         fn rec_collect_local(
             m: &str,
-            pkg_root: &Path,
             lib_name: &str,
             nodes: &BTreeMap<String, ModuleNode>,
             visited: &mut HashSet<String>,
@@ -8046,27 +8046,20 @@ pub fn build_module_dag_with_trust(
             let Some(node) = nodes.get(m) else {
                 return;
             };
-            if node.pkg_root != pkg_root || node.target_name != lib_name {
+            if node.is_exe_target || node.target_name != lib_name {
                 return;
             }
             for imp in &node.import_specs {
                 if let Some(dn) = nodes.get(&imp.module) {
-                    if dn.pkg_root == pkg_root && dn.target_name == lib_name {
-                        rec_collect_local(&imp.module, pkg_root, lib_name, nodes, visited, out);
+                    if !dn.is_exe_target && dn.target_name == lib_name {
+                        rec_collect_local(&imp.module, lib_name, nodes, visited, out);
                     }
                 }
             }
             out.push(m.to_string());
         }
         for (m, _) in expand_lib_configured_modules(pkg, lib)? {
-            rec_collect_local(
-                &m,
-                pkg_root,
-                lib_name,
-                &nodes,
-                &mut visited_local,
-                &mut local_modules,
-            );
+            rec_collect_local(&m, lib_name, &nodes, &mut visited_local, &mut local_modules);
         }
         if local_modules.is_empty() {
             continue;
@@ -8090,7 +8083,7 @@ pub fn build_module_dag_with_trust(
             local_modules,
         });
     }
-    let mut precompiled_by_lib: BTreeMap<(PathBuf, String), HashSet<String>> = BTreeMap::new();
+    let mut precompiled_by_lib: BTreeMap<String, HashSet<String>> = BTreeMap::new();
     for other in nodes.values() {
         if !other.is_exe_target && other.precompile_modules {
             let mut visited_trans: HashSet<String> = HashSet::new();
@@ -8101,17 +8094,14 @@ pub fn build_module_dag_with_trust(
                 .map(|imp| imp.module.clone())
                 .collect();
             let entry = precompiled_by_lib
-                .entry((other.pkg_root.clone(), other.target_name.clone()))
+                .entry(other.target_name.clone())
                 .or_default();
             while let Some(cur_m) = stack.pop() {
                 if !visited_trans.insert(cur_m.clone()) {
                     continue;
                 }
                 if let Some(dn) = nodes.get(&cur_m) {
-                    if !dn.is_exe_target
-                        && dn.pkg_root == other.pkg_root
-                        && dn.target_name == other.target_name
-                    {
+                    if !dn.is_exe_target && dn.target_name == other.target_name {
                         entry.insert(cur_m.clone());
                     }
                     for sub_imp in &dn.import_specs {
@@ -8130,9 +8120,8 @@ pub fn build_module_dag_with_trust(
             .iter()
             .any(|s| s.local_modules.iter().any(|m| m == &node.module_name));
         let imported_by_same_lib_precompiled = !node.is_exe_target
-            && node.precompile_modules
             && precompiled_by_lib
-                .get(&(node.pkg_root.clone(), node.target_name.clone()))
+                .get(&node.target_name)
                 .is_some_and(|s| s.contains(&node.module_name));
         node.needs_dynlib = explicit_dy || imported_by_same_lib_precompiled;
         node.needs_co_export = explicit_co || in_shared_lib || node.needs_dynlib;
@@ -8225,8 +8214,9 @@ pub fn build_module_dag_with_trust(
         let Some(node) = nodes.get(&m).cloned() else {
             continue;
         };
-        let node_in_shared =
-            shared_local_map.contains_key(&(node.pkg_root.clone(), node.target_name.clone()));
+        let node_in_shared = shared_libs
+            .iter()
+            .any(|s| s.local_modules.iter().any(|lm| lm == &m));
         let mut visited_t: HashSet<String> = HashSet::new();
         let mut stack_t: Vec<String> = node.direct_dag_deps.clone();
         while let Some(dep_mod) = stack_t.pop() {
@@ -8237,7 +8227,7 @@ pub fn build_module_dag_with_trust(
                 continue;
             };
             stack_t.extend(dn.direct_dag_deps.iter().cloned());
-            if dn.pkg_root == node.pkg_root && dn.target_name == node.target_name {
+            if !node.is_exe_target && !dn.is_exe_target && dn.target_name == node.target_name {
                 continue;
             }
             let is_direct_dep = node.direct_dag_deps.iter().any(|d| d == &dep_mod);
@@ -9949,7 +9939,7 @@ fn compute_module_raw_import_dynlibs(dag: &ModuleDag, node: &ModuleNode) -> Vec<
         if visited_libs.contains(&dn.target_name) {
             continue;
         }
-        if dn.target_name == node.target_name {
+        if !node.is_exe_target && dn.target_name == node.target_name {
             if node.precompile_modules {
                 if let Some(so_p) = module_dynlib_so_path(dn) {
                     out.push(so_p);
@@ -10062,7 +10052,7 @@ fn compute_module_dynlib_link_libs(dag: &ModuleDag, node: &ModuleNode) -> Vec<Pa
         if visited_libs.contains(&dn.target_name) {
             continue;
         }
-        if dn.target_name == node.target_name {
+        if !node.is_exe_target && dn.target_name == node.target_name {
             if let Some(so_p) = module_dynlib_so_path(dn) {
                 out.push(so_p);
             }
@@ -10127,21 +10117,35 @@ fn mk_load_order_paths(dag: &ModuleDag, paths: &[PathBuf]) -> Vec<(PathBuf, bool
             mod_by_dynlib.insert(so_p, n);
         }
     }
-    let mut visited: HashSet<PathBuf> = HashSet::new();
+    let dynlib_name = |p: &Path| -> String {
+        if let Some(sl) = by_path.get(p) {
+            sl.stem.clone()
+        } else if let Some(mn) = mod_by_dynlib.get(p) {
+            lean_mk_module_initialization_stem(&mn.module_name, Some(&mn.pkg_name))
+        } else {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string()
+        }
+    };
+    let mut visited: HashSet<String> = HashSet::new();
     let mut order = Vec::new();
     fn go(
         dag: &ModuleDag,
         by_path: &HashMap<PathBuf, &SharedLibSpec>,
         mod_by_dynlib: &HashMap<PathBuf, &ModuleNode>,
+        dynlib_name: &dyn Fn(&Path) -> String,
         p: &Path,
-        visiting: &mut HashSet<PathBuf>,
-        visited: &mut HashSet<PathBuf>,
+        visiting: &mut HashSet<String>,
+        visited: &mut HashSet<String>,
         order: &mut Vec<(PathBuf, bool)>,
     ) {
-        if visited.contains(p) {
+        let name = dynlib_name(p);
+        if visited.contains(&name) {
             return;
         }
-        if !visiting.insert(p.to_path_buf()) {
+        if !visiting.insert(name.clone()) {
             return;
         }
         if let Some(sl) = by_path.get(p) {
@@ -10150,6 +10154,7 @@ fn mk_load_order_paths(dag: &ModuleDag, paths: &[PathBuf]) -> Vec<(PathBuf, bool
                     dag,
                     by_path,
                     mod_by_dynlib,
+                    dynlib_name,
                     &dep_p,
                     visiting,
                     visited,
@@ -10163,6 +10168,7 @@ fn mk_load_order_paths(dag: &ModuleDag, paths: &[PathBuf]) -> Vec<(PathBuf, bool
                     dag,
                     by_path,
                     mod_by_dynlib,
+                    dynlib_name,
                     &dep_p,
                     visiting,
                     visited,
@@ -10173,8 +10179,8 @@ fn mk_load_order_paths(dag: &ModuleDag, paths: &[PathBuf]) -> Vec<(PathBuf, bool
         } else {
             order.push((p.to_path_buf(), true));
         }
-        visiting.remove(p);
-        visited.insert(p.to_path_buf());
+        visiting.remove(&name);
+        visited.insert(name);
     }
     let mut visiting = HashSet::new();
     for p in paths {
@@ -10182,6 +10188,7 @@ fn mk_load_order_paths(dag: &ModuleDag, paths: &[PathBuf]) -> Vec<(PathBuf, bool
             dag,
             &by_path,
             &mod_by_dynlib,
+            &dynlib_name,
             p,
             &mut visiting,
             &mut visited,
@@ -17803,6 +17810,111 @@ root = "Main"
         assert!(
             build_module_dag(&dup_ext_cfg, &["+RootMod:dynlib".into()]).is_ok(),
             "root sharing `origName` with `extern_lib` dep must not be spuriously rejected when root has no `extern_lib`"
+        );
+
+        let samelib_base = dir.join("samelib_proj");
+        let samelib_dep = samelib_base.join("dep");
+        let samelib_root = samelib_base.join("root");
+        fs::create_dir_all(samelib_dep.join("Dep")).unwrap();
+        fs::create_dir_all(samelib_root.join("App")).unwrap();
+        for p in [&samelib_dep, &samelib_root] {
+            fs::write(p.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        }
+        fs::write(
+            samelib_dep.join("lakefile.toml"),
+            "name = \"dep_pkg\"\n[[lean_lib]]\nname = \"Foo\"\nprecompileModules = true\nroots = [\"Dep.Base\", \"Dep.Mid\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            samelib_dep.join("Dep/Base.lean"),
+            "def depVal : Nat := 41\n",
+        )
+        .unwrap();
+        fs::write(
+            samelib_dep.join("Dep/Mid.lean"),
+            "import Dep.Base\ndef midVal : Nat := depVal + 1\n",
+        )
+        .unwrap();
+        fs::write(
+            samelib_root.join("lakefile.toml"),
+            "name = \"root_pkg\"\n[[require]]\nname = \"dep_pkg\"\npath = \"../dep\"\n[[lean_lib]]\nname = \"Foo\"\nprecompileModules = true\nroots = [\"App.Main\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            samelib_root.join("lake-manifest.json"),
+            r#"{
+  "version": "1.1.0",
+  "packagesDir": ".lake/packages",
+  "packages": [
+    {"type": "path", "scope": "", "name": "dep_pkg", "inherited": false, "dir": "../dep", "configFile": "lakefile.toml"}
+  ]
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            samelib_root.join("App/Main.lean"),
+            "import Dep.Mid\ndef appVal : Nat := midVal + 1\n",
+        )
+        .unwrap();
+        let samelib_summary = build_project_modules_native(
+            &mut store,
+            &samelib_root,
+            &["Foo".into(), "Foo:shared".into()],
+            "trusted-internal",
+            2,
+            false,
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(samelib_summary.modules_total, 3);
+        let samelib_no_build = Command::new(&lake_bin)
+            .args(["build", "--no-build", "Foo", "Foo:shared"])
+            .env("SANDBOXED_ALLOW_RAW_LAKE", "1")
+            .env("LAKE_CACHE_DIR", &lake_cache)
+            .current_dir(&samelib_root)
+            .output()
+            .unwrap();
+        assert!(
+            samelib_no_build.status.success(),
+            "`lake build --no-build Foo Foo:shared` failed on cross-package same-name `lean_lib`:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&samelib_no_build.stdout),
+            String::from_utf8_lossy(&samelib_no_build.stderr)
+        );
+        let ours_samelib_main_trace: serde_json::Value = serde_json::from_slice(
+            &fs::read(samelib_root.join(".lake/build/lib/lean/App/Main.trace")).unwrap(),
+        )
+        .unwrap();
+        let ours_samelib_shared_trace: serde_json::Value = serde_json::from_slice(
+            &fs::read(samelib_root.join(".lake/build/lib/libroot__pkg_Foo.so.trace")).unwrap(),
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(samelib_dep.join(".lake/build"));
+        let _ = fs::remove_dir_all(samelib_root.join(".lake/build"));
+        let clean_samelib = Command::new(&lake_bin)
+            .args(["build", "Foo", "Foo:shared"])
+            .env("SANDBOXED_ALLOW_RAW_LAKE", "1")
+            .env("LAKE_CACHE_DIR", &lake_cache)
+            .current_dir(&samelib_root)
+            .status()
+            .unwrap();
+        assert!(clean_samelib.success());
+        let lake_samelib_main_trace: serde_json::Value = serde_json::from_slice(
+            &fs::read(samelib_root.join(".lake/build/lib/lean/App/Main.trace")).unwrap(),
+        )
+        .unwrap();
+        let lake_samelib_shared_trace: serde_json::Value = serde_json::from_slice(
+            &fs::read(samelib_root.join(".lake/build/lib/libroot__pkg_Foo.so.trace")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            ours_samelib_main_trace["depHash"],
+            lake_samelib_main_trace["depHash"]
+        );
+        assert_eq!(
+            ours_samelib_shared_trace["depHash"],
+            lake_samelib_shared_trace["depHash"]
         );
 
         let _ = fs::remove_dir_all(&dir);
