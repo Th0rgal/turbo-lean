@@ -274,24 +274,50 @@ fn source_has_no_untrusted_elab_tokens(
                     if !allow_imports {
                         return false;
                     }
-                    while next_k < n && chars[next_k].is_whitespace() {
-                        next_k += 1;
+                    let mut p = k;
+                    while p > 0 && chars[p - 1] != '\n' {
+                        p -= 1;
+                        if !chars[p].is_whitespace() {
+                            return false;
+                        }
                     }
-                    let Some((path, after_path)) = dotted_at(next_k) else {
-                        return false;
-                    };
-                    if !matches!(
-                        path.as_str(),
-                        "LeanNative.Backend.FastCheck" | "TurboLean.FastCheck"
-                    ) {
+                    let mut saw_module = false;
+                    let mut cur = next_k;
+                    loop {
+                        while cur < n && chars[cur] != '\n' && chars[cur].is_whitespace() {
+                            cur += 1;
+                        }
+                        if cur >= n || chars[cur] == '\n' {
+                            break;
+                        }
+                        let Some((path, after_path)) = dotted_at(cur) else {
+                            return false;
+                        };
+                        if !matches!(
+                            path.as_str(),
+                            "LeanNative.Backend.FastCheck" | "TurboLean.FastCheck"
+                        ) {
+                            return false;
+                        }
+                        saw_module = true;
+                        cur = after_path;
+                    }
+                    if !saw_module {
                         return false;
                     }
-                    k = after_path;
+                    k = cur;
                     continue;
                 }
                 "open" => {
-                    while next_k < n && chars[next_k].is_whitespace() {
+                    while next_k < n && chars[next_k] != '\n' && chars[next_k].is_whitespace() {
                         next_k += 1;
+                    }
+                    let mut p = k;
+                    while p > 0 && chars[p - 1] != '\n' {
+                        p -= 1;
+                        if !chars[p].is_whitespace() {
+                            return false;
+                        }
                     }
                     let Some((path, after_path)) = dotted_at(next_k) else {
                         return false;
@@ -313,7 +339,14 @@ fn source_has_no_untrusted_elab_tokens(
                     continue;
                 }
                 "abbrev" => {
-                    while next_k < n && chars[next_k].is_whitespace() {
+                    let mut p = k;
+                    while p > 0 && chars[p - 1] != '\n' {
+                        p -= 1;
+                        if !chars[p].is_whitespace() {
+                            return false;
+                        }
+                    }
+                    while next_k < n && chars[next_k] != '\n' && chars[next_k].is_whitespace() {
                         next_k += 1;
                     }
                     let Some((name, after_name)) = ident_at(next_k) else {
@@ -323,14 +356,14 @@ fn source_has_no_untrusted_elab_tokens(
                         return false;
                     }
                     next_k = after_name;
-                    while next_k < n && chars[next_k].is_whitespace() {
+                    while next_k < n && chars[next_k] != '\n' && chars[next_k].is_whitespace() {
                         next_k += 1;
                     }
                     if chars.get(next_k) != Some(&':') || chars.get(next_k + 1) != Some(&'=') {
                         return false;
                     }
                     next_k += 2;
-                    while next_k < n && chars[next_k].is_whitespace() {
+                    while next_k < n && chars[next_k] != '\n' && chars[next_k].is_whitespace() {
                         next_k += 1;
                     }
                     let Some((rhs, after_rhs)) = dotted_at(next_k) else {
@@ -339,11 +372,25 @@ fn source_has_no_untrusted_elab_tokens(
                     if rhs != "LeanNative.Backend.FastCheck.Word256" {
                         return false;
                     }
+                    let mut p = after_rhs;
+                    while p < n && chars[p] != '\n' && chars[p].is_whitespace() {
+                        p += 1;
+                    }
+                    if p < n && chars[p] != '\n' {
+                        return false;
+                    }
                     k = after_rhs;
                     continue;
                 }
                 "set_option" => {
-                    while next_k < n && chars[next_k].is_whitespace() {
+                    let mut p = k;
+                    while p > 0 && chars[p - 1] != '\n' {
+                        p -= 1;
+                        if !chars[p].is_whitespace() {
+                            return false;
+                        }
+                    }
+                    while next_k < n && chars[next_k] != '\n' && chars[next_k].is_whitespace() {
                         next_k += 1;
                     }
                     let Some((opt, after_opt)) = ident_at(next_k) else {
@@ -353,14 +400,68 @@ fn source_has_no_untrusted_elab_tokens(
                         return false;
                     }
                     next_k = after_opt;
-                    while next_k < n && chars[next_k].is_whitespace() {
+                    while next_k < n && chars[next_k] != '\n' && chars[next_k].is_whitespace() {
                         next_k += 1;
                     }
                     let d0 = next_k;
                     while next_k < n && chars[next_k].is_ascii_digit() {
                         next_k += 1;
                     }
-                    if next_k == d0 {
+                    if next_k == d0 || (next_k < n && is_ident_continue(chars[next_k])) {
+                        return false;
+                    }
+                    let mut p = next_k;
+                    while p < n && chars[p] != '\n' && chars[p].is_whitespace() {
+                        p += 1;
+                    }
+                    if p < n && chars[p] != '\n' {
+                        let Some((in_kw, after_in)) = ident_at(p) else {
+                            return false;
+                        };
+                        if in_kw != "in" {
+                            return false;
+                        }
+                        let mut q = after_in;
+                        while q < n && chars[q] != '\n' && chars[q].is_whitespace() {
+                            q += 1;
+                        }
+                        if q < n && chars[q] != '\n' {
+                            return false;
+                        }
+                        next_k = after_in;
+                    }
+                    k = next_k;
+                    continue;
+                }
+                "namespace" | "section" => {
+                    let mut p = k;
+                    while p > 0 && chars[p - 1] != '\n' {
+                        p -= 1;
+                        if !chars[p].is_whitespace() {
+                            return false;
+                        }
+                    }
+                    while next_k < n && chars[next_k] != '\n' && chars[next_k].is_whitespace() {
+                        next_k += 1;
+                    }
+                    if next_k < n && chars[next_k] != '\n' {
+                        if word == "namespace" {
+                            let Some((_, after_ns)) = dotted_at(next_k) else {
+                                return false;
+                            };
+                            next_k = after_ns;
+                        } else if let Some((_, after_sec)) = dotted_at(next_k) {
+                            next_k = after_sec;
+                        } else {
+                            return false;
+                        }
+                        while next_k < n && chars[next_k] != '\n' && chars[next_k].is_whitespace() {
+                            next_k += 1;
+                        }
+                        if next_k < n && chars[next_k] != '\n' {
+                            return false;
+                        }
+                    } else if word == "namespace" {
                         return false;
                     }
                     k = next_k;
@@ -372,8 +473,8 @@ fn source_has_no_untrusted_elab_tokens(
                 | "include" | "omit" | "mutual" | "opaque" | "axiom" | "constant" | "structure"
                 | "class" | "inductive" | "coinductive" | "deriving" | "def" | "example"
                 | "initialize" | "builtin_initialize" | "register_option"
-                | "declare_syntax_cat" | "unif_hint" | " unsafe" | "unsafe" | "partial"
-                | "meta" | "haveI" | "letI" => {
+                | "declare_syntax_cat" | "unif_hint" | "unsafe" | "partial" | "meta" | "haveI"
+                | "letI" | "module" | "prelude" => {
                     return false;
                 }
                 _ => {

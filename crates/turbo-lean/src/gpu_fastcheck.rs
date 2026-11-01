@@ -9359,6 +9359,16 @@ def checks : List Bool := [
                 "x=0 => lhs=1 != rhs=0",
             ),
             (
+                "multi_import_override",
+                "import LeanNative.Backend.FastCheck CustomBadMod\ntheorem multi_import_override (x : UInt8) : x + 1 = x := by sorry\n",
+                "x=0 => lhs=1 != rhs=0",
+            ),
+            (
+                "multiline_import_override",
+                "import\nCustomBadMod\ntheorem multiline_import_override (x : UInt8) : x + 1 = x := by sorry\n",
+                "x=0 => lhs=1 != rhs=0",
+            ),
+            (
                 "custom_open_override",
                 "open Nat\ntheorem custom_open_override (x : UInt8) : x + 1 = x := by sorry\n",
                 "x=0 => lhs=1 != rhs=0",
