@@ -1347,8 +1347,17 @@ pub(crate) fn load_and_classify_pr_from_git(
 ///
 /// One thing it cannot see: a symlink under `path` whose target lives outside the repository. Such
 /// a symlink now fails the config resolve outright (`hash_input_target` refuses an input symlink
-/// that leaves the package root), so there is no longer a case where this returns `false` for a
-/// changed input whose bytes the digests did pick up.
+/// Return `true` when any file matching any package's `input_file` / `input_dir` has changed
+/// (added, deleted, or modified — including git-ignored or untracked files on disk, symlinks, or
+/// packages outside the git repository) relative to `base_ref`.
+///
+/// Reconstructs the `--base` tree per input via `git ls-tree -r -t -z --full-tree <base_ref> -- <path>`
+/// and compares matched blob contents directly against the current on-disk tree via a single batched
+/// `git cat-file --batch`, rejecting symlinks (`120000`) and non-blobs (`040000` is traversed only
+/// for `input_dir` trees; `160000` submodules fail closed) before applying `filter := .extension ...`.
+/// Every failure mode conservatively returns `true` (forcing re-verification), and `try_project_lake_inputs_tag`
+/// additionally fails closed (`Err`) on out-of-package symlinks so there is no case where this
+/// returns `false` for a changed input whose bytes Lake would read.
 fn lake_input_files_changed_since_base(
     repo_root: &Path,
     _proj_prefix: &str,
@@ -1483,7 +1492,8 @@ fn lake_input_files_changed_since_base(
 
             let inp_repo_rel =
                 join_proj_prefix(&pkg_prefix, &inp.path.to_string_lossy().replace('\\', "/"));
-            if base_ref.starts_with('-') {
+            let inp_repo_norm = inp_repo_rel.trim_matches('/');
+            if inp_repo_norm.is_empty() || base_ref.starts_with('-') {
                 return true;
             }
             let Ok(ls_out) = crate::trusted_tools::git(&canon_repo_root).and_then(|mut git| {
@@ -1492,11 +1502,12 @@ fn lake_input_files_changed_since_base(
                     .args([
                         "ls-tree",
                         "-r",
+                        "-t",
                         "-z",
                         "--full-tree",
                         base_ref,
                         "--",
-                        &inp_repo_rel,
+                        inp_repo_norm,
                     ])
                     .output()
                     .map_err(Into::into)
@@ -1506,6 +1517,8 @@ fn lake_input_files_changed_since_base(
             if !ls_out.status.success() {
                 return true;
             }
+            let inp_dir_prefix = format!("{inp_repo_norm}/");
+            let mut saw_dir_tree = false;
             let mut base_rel_paths = std::collections::BTreeSet::new();
             for rec in ls_out.stdout.split(|&b| b == 0).filter(|r| !r.is_empty()) {
                 let Some(tab_pos) = rec.iter().position(|&b| b == b'\t') else {
@@ -1526,7 +1539,37 @@ fn lake_input_files_changed_since_base(
                 if mode == "160000" || obj_type == "commit" {
                     return true;
                 }
-                if inp.is_dir {
+                let is_ancestor = inp_repo_norm
+                    .strip_prefix(path_str)
+                    .is_some_and(|rest| rest.starts_with('/'));
+                if is_ancestor {
+                    if mode == "120000" || obj_type != "tree" {
+                        return true;
+                    }
+                    continue;
+                }
+                if path_str == inp_repo_norm {
+                    if inp.is_dir {
+                        if mode == "120000" || obj_type != "tree" {
+                            return true;
+                        }
+                        saw_dir_tree = true;
+                        continue;
+                    }
+                    if mode == "120000" || obj_type != "blob" {
+                        return true;
+                    }
+                    base_rel_paths.insert(path_str.to_string());
+                    base_blobs_to_check.insert(path_str.to_string(), oid.to_string());
+                    continue;
+                }
+                if inp.is_dir && path_str.starts_with(&inp_dir_prefix) {
+                    if mode == "040000" && obj_type == "tree" {
+                        continue;
+                    }
+                    if mode == "120000" || obj_type != "blob" {
+                        return true;
+                    }
                     let ext = Path::new(path_str).extension();
                     if !inp
                         .extension
@@ -1535,16 +1578,11 @@ fn lake_input_files_changed_since_base(
                     {
                         continue;
                     }
-                } else if path_str != inp_repo_rel {
-                    continue;
+                    base_rel_paths.insert(path_str.to_string());
+                    base_blobs_to_check.insert(path_str.to_string(), oid.to_string());
                 }
-                if mode == "120000" || obj_type != "blob" {
-                    return true;
-                }
-                base_rel_paths.insert(path_str.to_string());
-                base_blobs_to_check.insert(path_str.to_string(), oid.to_string());
             }
-            if cur_rel_paths != base_rel_paths {
+            if (inp.is_dir && !saw_dir_tree) || cur_rel_paths != base_rel_paths {
                 return true;
             }
         }
@@ -1704,6 +1742,10 @@ fn hash_package_inputs_from_git_tree(
         }
         let inp_rel_str = inp.path.to_string_lossy().replace('\\', "/");
         let inp_repo_rel = join_proj_prefix(&pkg_prefix, &inp_rel_str);
+        let inp_repo_norm = inp_repo_rel.trim_matches('/');
+        if inp_repo_norm.is_empty() {
+            return None;
+        }
         let ls_out = crate::trusted_tools::git(canon_repo_root)
             .and_then(|mut git| {
                 git.arg("-C")
@@ -1711,11 +1753,12 @@ fn hash_package_inputs_from_git_tree(
                     .args([
                         "ls-tree",
                         "-r",
+                        "-t",
                         "-z",
                         "--full-tree",
                         sha,
                         "--",
-                        &inp_repo_rel,
+                        inp_repo_norm,
                     ])
                     .output()
                     .map_err(Into::into)
@@ -1724,8 +1767,9 @@ fn hash_package_inputs_from_git_tree(
         if !ls_out.status.success() {
             return None;
         }
+        let inp_dir_prefix = format!("{inp_repo_norm}/");
         let mut matched: Vec<(String, String)> = Vec::new();
-        let mut saw_any_under_dir = false;
+        let mut saw_dir_tree = false;
         for rec in ls_out.stdout.split(|&b| b == 0).filter(|r| !r.is_empty()) {
             let tab_pos = rec.iter().position(|&b| b == b'\t')?;
             let meta_str = std::str::from_utf8(&rec[..tab_pos]).ok()?;
@@ -1735,32 +1779,23 @@ fn hash_package_inputs_from_git_tree(
             if mode == "160000" || obj_type == "commit" {
                 return None;
             }
-            if inp.is_dir {
-                let Some(pkg_rel) = (if pkg_prefix.is_empty() {
-                    Some(path_str)
-                } else {
-                    path_str.strip_prefix(&format!("{}/", pkg_prefix.trim_end_matches('/')))
-                }) else {
-                    continue;
-                };
-                if !pkg_rel.starts_with(&format!("{}/", inp_rel_str.trim_end_matches('/'))) {
-                    continue;
-                }
-                saw_any_under_dir = true;
-                let ext = Path::new(path_str).extension();
-                if !inp
-                    .extension
-                    .as_deref()
-                    .is_none_or(|x| ext == Some(x.as_ref()))
-                {
-                    continue;
-                }
-                if mode == "120000" || obj_type != "blob" {
+            let is_ancestor = inp_repo_norm
+                .strip_prefix(path_str)
+                .is_some_and(|rest| rest.starts_with('/'));
+            if is_ancestor {
+                if mode == "120000" || obj_type != "tree" {
                     return None;
                 }
-                oids_to_fetch.insert(oid.to_string());
-                matched.push((pkg_rel.to_string(), oid.to_string()));
-            } else if path_str == inp_repo_rel {
+                continue;
+            }
+            if path_str == inp_repo_norm {
+                if inp.is_dir {
+                    if mode == "120000" || obj_type != "tree" {
+                        return None;
+                    }
+                    saw_dir_tree = true;
+                    continue;
+                }
                 if mode == "120000" || obj_type != "blob" {
                     return None;
                 }
@@ -1773,35 +1808,37 @@ fn hash_package_inputs_from_git_tree(
                 };
                 oids_to_fetch.insert(oid.to_string());
                 matched.push((pkg_rel, oid.to_string()));
+                continue;
+            }
+            if inp.is_dir && path_str.starts_with(&inp_dir_prefix) {
+                if mode == "040000" && obj_type == "tree" {
+                    continue;
+                }
+                if mode == "120000" || obj_type != "blob" {
+                    return None;
+                }
+                let pkg_rel = if pkg_prefix.is_empty() {
+                    path_str
+                } else {
+                    path_str.strip_prefix(&format!("{}/", pkg_prefix.trim_end_matches('/')))?
+                };
+                let ext = Path::new(path_str).extension();
+                if !inp
+                    .extension
+                    .as_deref()
+                    .is_none_or(|x| ext == Some(x.as_ref()))
+                {
+                    continue;
+                }
+                oids_to_fetch.insert(oid.to_string());
+                matched.push((pkg_rel.to_string(), oid.to_string()));
             }
         }
         if !inp.is_dir && matched.len() != 1 {
             return None;
         }
-        if inp.is_dir && !saw_any_under_dir {
-            // An empty directory cannot exist in Git's tree without a tracked entry; verify
-            // whether the directory existed as a tree object in `sha` (`ls-tree -d`) rather than
-            // conflating a missing directory with an empty one.
-            let dir_out = crate::trusted_tools::git(canon_repo_root)
-                .and_then(|mut git| {
-                    git.arg("-C")
-                        .arg(canon_repo_root)
-                        .args([
-                            "ls-tree",
-                            "-d",
-                            "-z",
-                            "--full-tree",
-                            sha,
-                            "--",
-                            &inp_repo_rel,
-                        ])
-                        .output()
-                        .map_err(Into::into)
-                })
-                .ok()?;
-            if !dir_out.status.success() || dir_out.stdout.is_empty() {
-                return None;
-            }
+        if inp.is_dir && !saw_dir_tree {
+            return None;
         }
         matched.sort_by(|(a, _), (b, _)| a.as_bytes().cmp(b.as_bytes()));
         per_input_files.push(matched);
@@ -8235,6 +8272,201 @@ end Fixture
             ),
             "external out-of-repo path dependency with Lake inputs must conservatively report changed against base_ref"
         );
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_base_lake_input_symlinks_fail_closed_before_extension_filter() -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_base_input_symlinks_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
+        let tc = "leanprover/lean4:v4.35.0";
+
+        // 1. Symlinked subdirectory `Data/sub -> ../Shared` inside `input_dir` with
+        //    `filter := .extension "sol"` in `base_ref`, replaced by empty `Data/.keep` in PR HEAD.
+        let repo1 = tmp_dir.join("repo_sub_symlink");
+        fs::create_dir_all(repo1.join("Smoke"))?;
+        fs::create_dir_all(repo1.join("Shared"))?;
+        fs::create_dir_all(repo1.join("Data"))?;
+        let lf_sub = "import Lake\nopen Lake DSL\npackage demo\ninput_dir smokeSources where\n  path := \"Data\"\n  filter := .extension \"sol\"\n@[default_target]\nlean_lib Smoke where\n  globs := #[.one `Smoke.A]\n  needs := #[smokeSources]\n";
+        fs::write(repo1.join("lakefile.lean"), lf_sub)?;
+        fs::write(
+            repo1.join("Smoke/A.lean"),
+            "theorem t_a : 1 + 1 = 2 := by\n  rfl\n",
+        )?;
+        fs::write(repo1.join("Shared/A.sol"), "contract A {}\n")?;
+        std::os::unix::fs::symlink("../Shared", repo1.join("Data/sub"))?;
+        git_init_and_commit(&repo1, "base with symlinked subdir")?;
+        let canon1 = fs::canonicalize(&repo1)?;
+        let base1 = resolve_git_commit_sha(&canon1, "HEAD")?;
+
+        fs::remove_file(canon1.join("Data/sub"))?;
+        fs::write(canon1.join("Data/.keep"), "")?;
+        git_commit_all(&canon1, "pr replaces symlinked subdir with .keep")?;
+        crate::module_builder::reset_lake_inputs_tag_memo();
+
+        let cur_cfg1 = crate::module_builder::resolve_project_config(&canon1)?;
+        assert!(
+            lake_input_files_changed_since_base(
+                &canon1,
+                "",
+                &cur_cfg1.root_pkg,
+                &cur_cfg1.dep_pkgs,
+                &base1,
+            ),
+            "removing Data/sub -> ../Shared must report changed even when Data/sub lacks .sol extension"
+        );
+        let mut base_pkg1 = parse_staged_base_package_config(&store, &canon1, lf_sub, false, true)?;
+        assert!(
+            hash_package_inputs_from_git_tree(&canon1, &base1, &mut base_pkg1).is_none(),
+            "hash_package_inputs_from_git_tree must fail closed on symlinked subdir Data/sub"
+        );
+        let base_tag1 = resolve_base_lake_inputs_tag(
+            &store,
+            &canon1,
+            &canon1,
+            &base1,
+            Some(&base_pkg1),
+            &cur_cfg1.dep_pkgs,
+            false,
+        )?
+        .expect("base lake inputs tag");
+        assert!(
+            base_tag1.starts_with("\u{0}lake-inputs-uncacheable:"),
+            "resolve_base_lake_inputs_tag must return uncacheable sentinel, got {base_tag1:?}"
+        );
+        let cur_tag1 = crate::module_builder::try_project_lake_inputs_tag(&canon1)?
+            .expect("current empty Data/.keep still produces a concrete lake_inputs tag");
+        assert_ne!(base_tag1, cur_tag1);
+        let (classified1, _, _, _) = load_and_classify_pr_from_git(&store, &canon1, &base1, tc)?;
+        assert_eq!(classified1.modified_files, vec!["Smoke/A.lean"]);
+
+        // 2. `Data` itself being a symlink in `base_ref` (`Data -> Shared`), replaced by real
+        //    `Data/.keep` in PR HEAD.
+        let repo2 = tmp_dir.join("repo_direct_symlink");
+        fs::create_dir_all(repo2.join("Smoke"))?;
+        fs::create_dir_all(repo2.join("Shared"))?;
+        fs::write(repo2.join("lakefile.lean"), lf_sub)?;
+        fs::write(
+            repo2.join("Smoke/A.lean"),
+            "theorem t_a : 1 + 1 = 2 := by\n  rfl\n",
+        )?;
+        fs::write(repo2.join("Shared/A.sol"), "contract A {}\n")?;
+        std::os::unix::fs::symlink("Shared", repo2.join("Data"))?;
+        git_init_and_commit(&repo2, "base with symlinked Data")?;
+        let canon2 = fs::canonicalize(&repo2)?;
+        let base2 = resolve_git_commit_sha(&canon2, "HEAD")?;
+
+        fs::remove_file(canon2.join("Data"))?;
+        fs::create_dir_all(canon2.join("Data"))?;
+        fs::write(canon2.join("Data/.keep"), "")?;
+        git_commit_all(&canon2, "pr replaces symlink Data with real dir")?;
+        crate::module_builder::reset_lake_inputs_tag_memo();
+
+        let cur_cfg2 = crate::module_builder::resolve_project_config(&canon2)?;
+        assert!(
+            lake_input_files_changed_since_base(
+                &canon2,
+                "",
+                &cur_cfg2.root_pkg,
+                &cur_cfg2.dep_pkgs,
+                &base2,
+            ),
+            "replacing symlink Data -> Shared with real empty Data/.keep must report changed"
+        );
+        let mut base_pkg2 = parse_staged_base_package_config(&store, &canon2, lf_sub, false, true)?;
+        assert!(
+            hash_package_inputs_from_git_tree(&canon2, &base2, &mut base_pkg2).is_none(),
+            "hash_package_inputs_from_git_tree must fail closed when input_dir root Data is a symlink"
+        );
+        let base_tag2 = resolve_base_lake_inputs_tag(
+            &store,
+            &canon2,
+            &canon2,
+            &base2,
+            Some(&base_pkg2),
+            &cur_cfg2.dep_pkgs,
+            false,
+        )?
+        .expect("base lake inputs tag");
+        assert!(
+            base_tag2.starts_with("\u{0}lake-inputs-uncacheable:"),
+            "got {base_tag2:?}"
+        );
+
+        // 3. Ancestor directory of both `input_dir` (`Anc/Sub`) and `input_file` (`Anc/spec.sol`)
+        //    being a symlink (`Anc -> SharedParent`) in `base_ref`, replaced by real directory in PR HEAD.
+        let repo3 = tmp_dir.join("repo_ancestor_symlink");
+        fs::create_dir_all(repo3.join("Smoke"))?;
+        fs::create_dir_all(repo3.join("SharedParent/Sub"))?;
+        let lf_anc = "import Lake\nopen Lake DSL\npackage demo\ninput_dir dirInAnc where\n  path := \"Anc/Sub\"\n  filter := .extension \"sol\"\ninput_file fileInAnc where\n  path := \"Anc/spec.sol\"\n@[default_target]\nlean_lib Smoke where\n  globs := #[.one `Smoke.A]\n  needs := #[dirInAnc, fileInAnc]\n";
+        fs::write(repo3.join("lakefile.lean"), lf_anc)?;
+        fs::write(
+            repo3.join("Smoke/A.lean"),
+            "theorem t_a : 1 + 1 = 2 := by\n  rfl\n",
+        )?;
+        fs::write(repo3.join("SharedParent/Sub/A.sol"), "contract A {}\n")?;
+        fs::write(repo3.join("SharedParent/spec.sol"), "contract Spec {}\n")?;
+        std::os::unix::fs::symlink("SharedParent", repo3.join("Anc"))?;
+        git_init_and_commit(&repo3, "base with symlinked ancestor Anc")?;
+        let canon3 = fs::canonicalize(&repo3)?;
+        let base3 = resolve_git_commit_sha(&canon3, "HEAD")?;
+
+        fs::remove_file(canon3.join("Anc"))?;
+        fs::create_dir_all(canon3.join("Anc/Sub"))?;
+        fs::write(canon3.join("Anc/Sub/.keep"), "")?;
+        fs::write(canon3.join("Anc/spec.sol"), "contract Spec {}\n")?;
+        git_commit_all(&canon3, "pr materializes real Anc directory")?;
+        crate::module_builder::reset_lake_inputs_tag_memo();
+
+        let cur_cfg3 = crate::module_builder::resolve_project_config(&canon3)?;
+        assert!(
+            lake_input_files_changed_since_base(
+                &canon3,
+                "",
+                &cur_cfg3.root_pkg,
+                &cur_cfg3.dep_pkgs,
+                &base3,
+            ),
+            "symlinked ancestor Anc in base_ref must report changed"
+        );
+        for (only_lf, label) in [
+            (
+                "import Lake\nopen Lake DSL\npackage demo\ninput_dir dirInAnc where\n  path := \"Anc/Sub\"\n  filter := .extension \"sol\"\nlean_lib Smoke where\n  needs := #[dirInAnc]\n",
+                "input_dir under symlinked ancestor",
+            ),
+            (
+                "import Lake\nopen Lake DSL\npackage demo\ninput_file fileInAnc where\n  path := \"Anc/spec.sol\"\nlean_lib Smoke where\n  needs := #[fileInAnc]\n",
+                "input_file under symlinked ancestor",
+            ),
+        ] {
+            let mut single_base_pkg =
+                parse_staged_base_package_config(&store, &canon3, only_lf, false, true)?;
+            assert!(
+                hash_package_inputs_from_git_tree(&canon3, &base3, &mut single_base_pkg).is_none(),
+                "{label} must fail closed in hash_package_inputs_from_git_tree"
+            );
+            fs::write(canon3.join("lakefile.lean"), only_lf)?;
+            crate::module_builder::reset_lake_inputs_tag_memo();
+            let resolved_single = crate::module_builder::resolve_project_config(&canon3)?;
+            assert!(
+                lake_input_files_changed_since_base(
+                    &canon3,
+                    "",
+                    &resolved_single.root_pkg,
+                    &[],
+                    &base3,
+                ),
+                "{label} must report changed in lake_input_files_changed_since_base"
+            );
+        }
 
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())

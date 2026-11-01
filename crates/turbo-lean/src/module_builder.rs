@@ -2924,6 +2924,9 @@ struct LakefileBindings {
     /// name -> (body, first line, last line) of the declaration (1-based, comment-stripped).
     defs: BTreeMap<String, (String, usize, usize)>,
     rejected: std::collections::BTreeSet<String>,
+    /// Names bound by any `abbrev` / `def` (including parameterised, modified or duplicate ones),
+    /// so `input_file` / `input_dir` collisions with value declarations fail closed.
+    value_decls: std::collections::BTreeSet<String>,
     /// The lakefile is not plain (`lakefile_is_plain`): scopes, `where`, `open` or notation could
     /// change what an option expression denotes (even a literal one), so none is resolved.
     scoped: bool,
@@ -2931,12 +2934,14 @@ struct LakefileBindings {
 
 /// Column-0 commands a "plain" Lake configuration may contain for its identifiers to be
 /// resolved statically (Lake's own DSL plus option bindings; `post_update` hooks are blocks).
-const PLAIN_LAKEFILE_COMMANDS: [&str; 8] = [
+const PLAIN_LAKEFILE_COMMANDS: [&str; 10] = [
     "import ",
     "require ",
     "package ",
     "lean_lib ",
     "lean_exe ",
+    "input_file ",
+    "input_dir ",
     "abbrev ",
     "def ",
     "post_update ",
@@ -3212,8 +3217,10 @@ fn lakefile_lexical_guard(
                 .map_or(head, str::trim_start);
             let in_name_literal = matches!(prev, Some('`' | '.'));
             if !in_name_literal
-                && (!matches!(head, "package" | "lean_lib" | "lean_exe" | "require")
-                    || !pre.ends_with(char::is_whitespace))
+                && (!matches!(
+                    head,
+                    "package" | "lean_lib" | "lean_exe" | "input_file" | "input_dir" | "require"
+                ) || !pre.ends_with(char::is_whitespace))
             {
                 return Err("`«»` outside a target name".into());
             }
@@ -3370,7 +3377,10 @@ fn lakefile_is_plain(clean: &str) -> bool {
             return tokens.is_empty();
         }
         let indented = line.starts_with(char::is_whitespace);
-        let header = matches!(tokens.first(), Some(&("package" | "lean_lib" | "lean_exe")));
+        let header = matches!(
+            tokens.first(),
+            Some(&("package" | "lean_lib" | "lean_exe" | "input_file" | "input_dir"))
+        );
         let open_line = matches!(t, "open Lake DSL" | "open System Lake DSL" | "open Lake");
         let keywords_ok = tokens.iter().enumerate().all(|(i, tok)| {
             !(BINDING_COMMANDS.contains(tok) || tok.starts_with('#'))
@@ -3383,6 +3393,8 @@ fn lakefile_is_plain(clean: &str) -> bool {
                             | "package"
                             | "lean_lib"
                             | "lean_exe"
+                            | "input_file"
+                            | "input_dir"
                             | "require"
                             | "post_update"
                     ))
@@ -3433,6 +3445,37 @@ fn collect_lakefile_abbrevs(clean: &str) -> LakefileBindings {
             attr_pending = modified;
             continue;
         }
+        // Lake target commands (`lean_lib`, `lean_exe`, `input_file`, `input_dir`, `extern_lib`,
+        // `target`, `script`, `lean_script`) bind Lean identifiers in the lakefile namespace.
+        // Reject any `abbrev`/`def` sharing a name with such a target so option resolution fails
+        // closed on collisions in either declaration order.
+        if let Some(target_rest) = [
+            "lean_lib ",
+            "lean_exe ",
+            "input_file ",
+            "input_dir ",
+            "extern_lib ",
+            "target ",
+            "script ",
+            "lean_script ",
+        ]
+        .iter()
+        .find_map(|kw| decl.strip_prefix(kw))
+        {
+            let target_raw = target_rest.split_whitespace().next().unwrap_or("");
+            let target_name = clean_lake_ident(target_raw.trim_end_matches('.'));
+            if !target_name.is_empty() {
+                out.defs.remove(&target_name);
+                if target_name.contains('.') {
+                    if let Some(last) = target_name.rsplit('.').next() {
+                        out.defs.remove(last);
+                        out.rejected.insert(last.to_string());
+                    }
+                }
+                out.rejected.insert(target_name);
+            }
+            continue;
+        }
         let Some(rest) = decl
             .strip_prefix("abbrev ")
             .or_else(|| decl.strip_prefix("def "))
@@ -3447,6 +3490,7 @@ fn collect_lakefile_abbrevs(clean: &str) -> LakefileBindings {
         if name.is_empty() {
             continue;
         }
+        out.value_decls.insert(name.clone());
         let header = rest[raw_name.len()..].trim_start();
         let body_start = match header.split_once(":=") {
             Some((ty, body)) if ty.trim().is_empty() || ty.starts_with(':') => Some(body),
@@ -3701,16 +3745,21 @@ fn parse_lakefile_lean_inner(
     }
     let clean = flat;
     let lean_option_bindings = collect_lakefile_abbrevs(&clean);
-    // In a non-plain lakefile a `leanOptions` field can hide behind `;`, `where` or notation,
-    // so its mere presence fails closed (rather than parsing to fewer options than Lake sets).
+    // In a non-plain lakefile a `leanOptions` field or `needs` target reference can hide behind
+    // `;`, `where`, `namespace` or notation, so its mere presence fails closed (rather than
+    // parsing to fewer options or a shadowed input target).
     if lean_option_bindings.scoped
         && lean_tokens_by_line(&clean).iter().any(|l| {
-            l.iter()
-                .any(|t| matches!(*t, "leanOptions" | "moreLeanArgs" | "weakLeanArgs"))
+            l.iter().any(|t| {
+                matches!(
+                    *t,
+                    "leanOptions" | "moreLeanArgs" | "weakLeanArgs" | "needs"
+                )
+            })
         })
     {
         anyhow::bail!(
-            "Unsupported `leanOptions` in {}: lakefile.lean is not plain (scopes, where, open, `;`, notation or metaprogramming)",
+            "Unsupported `leanOptions` / `needs` in {}: lakefile.lean is not plain (scopes, where, open, `;`, notation or metaprogramming)",
             lean_path.display()
         );
     }
@@ -4145,7 +4194,25 @@ fn parse_lakefile_lean_inner(
                                 )?);
                             }
                             "needs" => {
-                                lib.needs = parse_lean_bare_name_array_expr(&val_accum, key)?;
+                                let needs = parse_lean_bare_name_array_expr(&val_accum, key)?;
+                                if let Some(missing) = needs
+                                    .iter()
+                                    .find(|n| !pkg.inputs.iter().any(|i| &i.name == *n))
+                                {
+                                    if is_root_pkg {
+                                        let _ = c_abi::verify_static_lake_config(
+                                            true, true, false, false,
+                                        );
+                                    }
+                                    anyhow::bail!(
+                                        "Unsupported `needs` entry `{}` on library `{}` in {} at line {} (not a previously declared `input_file` / `input_dir` of the package): fail-closed static Lake config gate",
+                                        missing,
+                                        lib.name,
+                                        lean_path.display(),
+                                        line_no
+                                    );
+                                }
+                                lib.needs = needs;
                             }
                             "defaultFacets" => {
                                 let facets = parse_lean_bare_name_array_expr(&val_accum, key)?;
@@ -4213,7 +4280,25 @@ fn parse_lakefile_lean_inner(
                                 )?);
                             }
                             "needs" => {
-                                exe.needs = parse_lean_bare_name_array_expr(&val_accum, key)?;
+                                let needs = parse_lean_bare_name_array_expr(&val_accum, key)?;
+                                if let Some(missing) = needs
+                                    .iter()
+                                    .find(|n| !pkg.inputs.iter().any(|i| &i.name == *n))
+                                {
+                                    if is_root_pkg {
+                                        let _ = c_abi::verify_static_lake_config(
+                                            true, true, false, false,
+                                        );
+                                    }
+                                    anyhow::bail!(
+                                        "Unsupported `needs` entry `{}` on executable `{}` in {} at line {} (not a previously declared `input_file` / `input_dir` of the package): fail-closed static Lake config gate",
+                                        missing,
+                                        exe.name,
+                                        lean_path.display(),
+                                        line_no
+                                    );
+                                }
+                                exe.needs = needs;
                             }
                             other => check_lake_field(
                                 &mut exe.unsupported,
@@ -4264,6 +4349,20 @@ fn parse_lakefile_lean_inner(
         }
     }
     check_empty_roots(&pkg, &empty_roots)?;
+    if let Some(inp) = pkg
+        .inputs
+        .iter()
+        .find(|i| lean_option_bindings.value_decls.contains(&i.name))
+    {
+        if is_root_pkg {
+            let _ = c_abi::verify_static_lake_config(true, true, false, false);
+        }
+        anyhow::bail!(
+            "Conflicting `abbrev`/`def` and Lake input target `{}` in {}: fail-closed static Lake config gate",
+            inp.name,
+            lean_path.display()
+        );
+    }
     finalize_package_config(
         &mut pkg,
         is_root_pkg,
@@ -12240,6 +12339,148 @@ lean_exe «demo-exe» where
             opts(&parse(&lib("#[⟨`linter.s, \"a\\\\b \\\"c\\\"\"⟩]", "")).unwrap()),
             BTreeMap::from([("linter.s".to_string(), "a\\b \"c\"".to_string())])
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_plain_lakefile_supports_input_dir_and_input_file_with_lean_options() {
+        let dir = make_temp_test_dir("plain_input_targets_with_options");
+        fs::create_dir_all(dir.join("Data")).unwrap();
+        fs::create_dir_all(dir.join("Smoke")).unwrap();
+        fs::write(dir.join("Data/a.sol"), "contract A {}\n").unwrap();
+        fs::write(dir.join("spec.json"), "{}\n").unwrap();
+        fs::write(dir.join("Smoke/A.lean"), "def a : Nat := 1\n").unwrap();
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        let lf = dir.join("lakefile.lean");
+
+        // 1. Root package combining `leanOptions`, `moreLeanArgs`, `weakLeanArgs` AND
+        //    `input_dir` / `input_file` / `needs` (including guillemet and inline `@[default_target]`).
+        let root_src = "\
+import Lake
+open Lake DSL
+
+package demo where
+  leanOptions := #[⟨`autoImplicit, false⟩]
+  moreLeanArgs := #[\"-DrelaxedAutoImplicit=false\"]
+  weakLeanArgs := #[\"-Dweak.linter.unusedVariables=false\"]
+
+input_dir smokeSources where
+  path := \"Data\"
+  filter := .extension \"sol\"
+
+@[default_target]
+input_file specFile where
+  path := \"spec.json\"
+  text := true
+
+@[default_target]
+lean_lib Smoke where
+  globs := #[.one `Smoke.A]
+  leanOptions := #[⟨`pp.unicode.fun, true⟩]
+  needs := #[smokeSources, specFile]
+";
+        assert!(lakefile_is_plain(root_src));
+        fs::write(&lf, root_src).unwrap();
+        for is_root in [true, false] {
+            let pkg = parse_lakefile_lean(&dir, &lf, is_root).unwrap();
+            assert!(pkg.unsupported.is_none());
+            assert_eq!(
+                pkg.lean_options,
+                BTreeMap::from([("autoImplicit".to_string(), "false".to_string())])
+            );
+            assert_eq!(pkg.more_lean_args, vec!["-DrelaxedAutoImplicit=false"]);
+            assert_eq!(
+                pkg.weak_lean_args,
+                vec!["-Dweak.linter.unusedVariables=false"]
+            );
+            assert_eq!(pkg.inputs.len(), 2);
+            assert_eq!(pkg.inputs[0].name, "smokeSources");
+            assert_eq!(pkg.inputs[1].name, "specFile");
+            assert_eq!(pkg.libs[0].needs, vec!["smokeSources", "specFile"]);
+            assert_eq!(
+                pkg.libs[0].lean_options,
+                BTreeMap::from([("pp.unicode.fun".to_string(), "true".to_string())])
+            );
+        }
+        let cfg = resolve_project_config(&dir).unwrap();
+        let dag = build_module_dag(&cfg, &[]).unwrap();
+        assert!(dag.nodes.contains_key("Smoke.A"));
+
+        // 2. Dependency package combining `abbrev` option bindings with `input_dir` / `input_file` / `needs`.
+        let dep_src = "\
+import Lake
+open Lake DSL
+
+abbrev sharedOpts : Array LeanOption := #[
+  ⟨`autoImplicit, false⟩,
+  ⟨`pp.unicode.fun, true⟩
+]
+
+package dep where
+  leanOptions := sharedOpts
+
+input_dir smokeSources where
+  path := \"Data\"
+  filter := .extension \"sol\"
+
+lean_lib Smoke where
+  globs := #[.one `Smoke.A]
+  leanOptions := sharedOpts.map fun s ↦ { s with name := `weak ++ s.name }
+  needs := #[smokeSources]
+";
+        assert!(lakefile_is_plain(dep_src));
+        fs::write(&lf, dep_src).unwrap();
+        let dep_pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
+        assert!(dep_pkg.unsupported.is_none());
+        assert_eq!(
+            dep_pkg.lean_options,
+            BTreeMap::from([
+                ("autoImplicit".to_string(), "false".to_string()),
+                ("pp.unicode.fun".to_string(), "true".to_string()),
+            ])
+        );
+        assert_eq!(
+            dep_pkg.libs[0].lean_options,
+            BTreeMap::from([
+                ("weak.autoImplicit".to_string(), "false".to_string()),
+                ("weak.pp.unicode.fun".to_string(), "true".to_string()),
+            ])
+        );
+        assert_eq!(dep_pkg.libs[0].needs, vec!["smokeSources"]);
+
+        // 3. Mid-line, indented, or inline-attributed `input_dir` / `input_file` smuggling remains non-plain & rejected.
+        for smuggled in [
+            "import Lake\nopen Lake DSL\nabbrev opts : Array LeanOption := #[] input_dir hid where\npackage demo\nlean_lib Smoke where\n  leanOptions := opts\n",
+            "import Lake\nopen Lake DSL\npackage demo\ndef junk : Nat := 0\n  input_file hid where\nlean_lib Smoke where\n  leanOptions := #[⟨`autoImplicit, false⟩]\n",
+            "import Lake\nopen Lake DSL\npackage demo\n@[default_target] input_file hid where\n  path := \"spec.json\"\nlean_lib Smoke where\n  leanOptions := #[⟨`autoImplicit, false⟩]\n",
+            "import Lake\nopen Lake DSL\npackage demo\n@[default_target] abbrev opts : Array LeanOption := #[⟨`autoImplicit, false⟩]\nlean_lib Smoke where\n  leanOptions := opts\n",
+        ] {
+            assert!(!lakefile_is_plain(smuggled), "{smuggled}");
+            fs::write(&lf, smuggled).unwrap();
+            assert!(parse_lakefile_lean(&dir, &lf, true).is_err(), "{smuggled}");
+            assert!(parse_lakefile_lean(&dir, &lf, false).is_err(), "{smuggled}");
+        }
+
+        // 4. Shadowing / duplicate identifier collisions between `abbrev`/`def` and `input_dir`,
+        //    `input_file`, or `lean_lib` (in either order), as well as scoped `needs` shadowing or
+        //    forward `needs` references, fail closed.
+        for shadowed in [
+            "import Lake\nopen Lake DSL\nabbrev opts : Array LeanOption := #[⟨`autoImplicit, false⟩]\npackage demo\ninput_dir opts where\n  path := \"Data\"\nlean_lib Smoke where\n  leanOptions := opts\n",
+            "import Lake\nopen Lake DSL\npackage demo\ninput_file opts where\n  path := \"spec.json\"\nabbrev opts : Array LeanOption := #[⟨`autoImplicit, false⟩]\nlean_lib Smoke where\n  leanOptions := opts\n",
+            "import Lake\nopen Lake DSL\nabbrev Smoke : Array LeanOption := #[⟨`autoImplicit, false⟩]\npackage demo\nlean_lib Smoke where\n  leanOptions := Smoke\n",
+            "import Lake\nopen Lake DSL\npackage demo\nabbrev smokeSources : Nat := 1\ninput_dir smokeSources where\n  path := \"Data\"\nlean_lib Smoke where\n  needs := #[smokeSources]\n",
+            "import Lake\nopen Lake DSL\npackage demo\ninput_dir smokeSources where\n  path := \"Data\"\ninput_dir otherSources where\n  path := \"Data\"\nnamespace N\nabbrev smokeSources := otherSources\nlean_lib Smoke where\n  needs := #[smokeSources]\nend N\n",
+            "import Lake\nopen Lake DSL\npackage demo\nlean_lib Smoke where\n  needs := #[smokeSources]\ninput_dir smokeSources where\n  path := \"Data\"\n",
+        ] {
+            fs::write(&lf, shadowed).unwrap();
+            for is_root in [true, false] {
+                assert!(
+                    parse_lakefile_lean(&dir, &lf, is_root).is_err(),
+                    "is_root={is_root}: {shadowed}"
+                );
+            }
+        }
+
         let _ = fs::remove_dir_all(&dir);
     }
 
