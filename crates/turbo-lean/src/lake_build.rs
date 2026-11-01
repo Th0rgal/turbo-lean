@@ -1636,7 +1636,7 @@ fn verify_project_module_entry_and_sidecars(
     let Some(entry) = manifest.modules.get(rel_src) else {
         return false;
     };
-    if !entry.kernel_replayed() || entry.src_blake3 != expected_src_blake3 {
+    if entry.src_blake3 != expected_src_blake3 {
         return false;
     }
     let olean_path = resolve_project_olean_for_rel_path(canon_dir, rel_src);
@@ -2084,7 +2084,7 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
             (Some(m), Some(ch)) => m
                 .modules
                 .get(&dep_rel)
-                .is_some_and(|e| !e.kernel_replayed() || e.src_blake3 != *ch),
+                .is_some_and(|e| e.src_blake3 != *ch),
             _ => false,
         };
         let mtime_stale = match (&olean_meta, &src_meta) {
