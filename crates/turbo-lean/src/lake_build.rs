@@ -738,8 +738,8 @@ pub(crate) fn compute_shard_key_with_args(
     lean_args: &[String],
 ) -> String {
     let mut key_hasher = blake3::Hasher::new();
-    // v3: invalidates receipts written before the `sorry` target gates (v2 was the stderr panic scan).
-    key_hasher.update(b"theorem-shard-v3:");
+    // v5: invalidates receipts written before literal/layout-preserving content normalization.
+    key_hasher.update(b"theorem-shard-v5:");
     key_hasher.update(toolchain.as_bytes());
     key_hasher.update(b":");
     key_hasher.update(shard.prefix_env_hash.as_bytes());
@@ -1157,14 +1157,14 @@ pub(crate) struct ShmProjectStatSummary {
 }
 
 pub(crate) fn shm_file_splits_dir(store: &TurboStore) -> PathBuf {
-    let dir = store.fast_staging_dir().join("file_splits_v3");
+    let dir = store.fast_staging_dir().join("file_splits_v5");
     let _ = fs::create_dir_all(&dir);
     dir
 }
 
 pub(crate) fn compute_single_stat_hash(pk: &str, ms: i64, mn: i64, sz: i64) -> String {
     let mut h = blake3::Hasher::new();
-    h.update(b"single-stat-split:v3\n");
+    h.update(b"single-stat-split:v5\n");
     h.update(pk.as_bytes());
     h.update(b":");
     h.update(&ms.to_le_bytes());
@@ -1190,7 +1190,7 @@ pub(crate) fn compact_split_for_shm_cache(split: &splitter::SplitResult) -> spli
 
 pub(crate) fn compute_stat_slice_hash(stats: &[(String, i64, i64, i64)]) -> String {
     let mut h = blake3::Hasher::new();
-    h.update(b"project-stat-splits:v3\n");
+    h.update(b"project-stat-splits:v5\n");
     for (pk, ms, mn, sz) in stats {
         h.update(pk.as_bytes());
         h.update(b":");
@@ -1225,7 +1225,7 @@ pub(crate) fn load_project_stat_summary_cached(
         let stat_hash = compute_stat_slice_hash(&valid_stats);
         let p = store
             .fast_staging_dir()
-            .join(format!("project_stat_summary_v2_{}.json", &stat_hash[..24]));
+            .join(format!("project_stat_summary_v4_{}.json", &stat_hash[..24]));
         if let Ok(bytes) = fs::read(&p) {
             if let Ok(summary) = serde_json::from_slice::<ShmProjectStatSummary>(&bytes) {
                 if summary.total_files == paths.len() {
@@ -1288,7 +1288,7 @@ pub(crate) fn compute_project_interface_key_fast_summary(
     trust_domain: &str,
 ) -> Result<(String, String, BTreeMap<String, String>)> {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"turbo-lean-build-v1\n");
+    hasher.update(b"turbo-lean-build-v3\n");
     hasher.update(toolchain.as_bytes());
     hasher.update(b"\n");
     hasher.update(trust_domain.as_bytes());
@@ -1363,7 +1363,7 @@ pub(crate) fn load_and_split_files_with_hashes_cached(
         let stat_hash = compute_stat_slice_hash(&valid_stats);
         let p = store
             .fast_staging_dir()
-            .join(format!("project_stat_splits_v3_{}.json", &stat_hash[..24]));
+            .join(format!("project_stat_splits_v5_{}.json", &stat_hash[..24]));
         if let Ok(bytes) = fs::read(&p) {
             if let Ok(cached_entries) = serde_json::from_slice::<Vec<ShmCachedFileSplit>>(&bytes) {
                 if cached_entries.len() == paths.len()
@@ -1538,13 +1538,13 @@ pub(crate) fn split_and_audit_with_hashes_cached(
 
     let shm_proj_path = if files.len() <= 128 {
         let mut ch = blake3::Hasher::new();
-        ch.update(b"project-content-splits:v3\n");
+        ch.update(b"project-content-splits:v5\n");
         for (_, fk) in &file_keys {
             ch.update(fk.as_bytes());
             ch.update(b"\n");
         }
         let p = store.fast_staging_dir().join(format!(
-            "project_splits_v3_{}.json",
+            "project_splits_v5_{}.json",
             &ch.finalize().to_hex()[..24]
         ));
         if let Ok(bytes) = fs::read(&p) {
@@ -1671,7 +1671,7 @@ pub(crate) fn split_and_audit_with_hashes_cached(
         let stat_hash = compute_stat_slice_hash(&valid_stats);
         let stat_p = store
             .fast_staging_dir()
-            .join(format!("project_stat_splits_v3_{}.json", &stat_hash[..24]));
+            .join(format!("project_stat_splits_v5_{}.json", &stat_hash[..24]));
         if !stat_p.exists() || !new_splits.is_empty() {
             let compacts: Vec<ShmCachedFileSplit> = results
                 .iter()

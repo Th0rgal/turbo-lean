@@ -1399,7 +1399,7 @@ fn toolchain_dir_candidates(toolchain: &str) -> (String, String, String) {
 /// Store key of a receipt this server publishes for a caller-supplied shard key. The epoch makes
 /// receipts written before canonical rooted target + server-computed content binding unreachable.
 fn server_receipt_key(shard_key: &str) -> String {
-    format!("srv-v5:{}", shard_key)
+    format!("srv-v6:{}", shard_key)
 }
 
 /// Pin the request's toolchain for an elan-proxied `lean` unless the environment already does.
@@ -1617,7 +1617,7 @@ fn hash_framed_slice(h: &mut blake3::Hasher, items: &[String]) {
 fn context_bound_http_key(key: &str, ctx: &HttpShardReceiptContext) -> String {
     let base = server_receipt_key(key);
     let mut h = blake3::Hasher::new();
-    h.update(b"http-shard-context-v5:");
+    h.update(b"http-shard-context-v6:");
     hash_framed_str(&mut h, &base);
     hash_framed_str(&mut h, &ctx.lean_args_digest);
     hash_framed_slice(&mut h, &ctx.allowed_axioms);
@@ -1635,7 +1635,7 @@ fn context_bound_receipt(
     if !receipt.is_object() {
         anyhow::bail!("HTTP shard receipt must serialize as a JSON object");
     }
-    receipt["receipt_schema"] = serde_json::Value::String("srv-v5".to_string());
+    receipt["receipt_schema"] = serde_json::Value::String("srv-v6".to_string());
     receipt["lean_args_digest"] = serde_json::Value::String(ctx.lean_args_digest.clone());
     receipt["allowed_axioms"] = serde_json::json!(ctx.allowed_axioms);
     receipt["target_context"] = serde_json::json!(ctx.target_context);
@@ -1661,7 +1661,7 @@ fn receipt_matches_http_context(
             })
             .unwrap_or(false)
     };
-    receipt["receipt_schema"].as_str() == Some("srv-v5")
+    receipt["receipt_schema"].as_str() == Some("srv-v6")
         && receipt["lean_args_digest"].as_str() == Some(ctx.lean_args_digest.as_str())
         && str_vec_eq(&receipt["allowed_axioms"], &ctx.allowed_axioms)
         && str_vec_eq(&receipt["target_context"], &ctx.target_context)
@@ -2806,7 +2806,7 @@ mod bind_auth_tests {
         assert_eq!(entries.len(), 1);
         batch.lean_args = vec!["--plugin=unsafe.so".into()];
         assert!(execute_check_shards_batch_payload_deferred(&mut store, &batch, None).is_err());
-        assert_eq!(server_receipt_key("legacy-key"), "srv-v5:legacy-key");
+        assert_eq!(server_receipt_key("legacy-key"), "srv-v6:legacy-key");
         let _ = entries;
         let _ = std::fs::remove_dir_all(dir);
         Ok(())
@@ -2839,9 +2839,19 @@ mod bind_auth_tests {
             "toolchain_policy": matching.toolchain_policy,
             "import_context": matching.import_context
         });
+        let v5_receipt = serde_json::json!({
+            "receipt_schema": "srv-v5",
+            "lean_args_digest": matching.lean_args_digest,
+            "allowed_axioms": matching.allowed_axioms,
+            "target_context": matching.target_context,
+            "target_content_digests": matching.target_content_digests,
+            "toolchain_policy": matching.toolchain_policy,
+            "import_context": matching.import_context
+        });
         let entries = [
             ("legacy", br#"{"decl":"unknown-context"}"#.to_vec()),
             ("srv_v4", serde_json::to_vec(&mut v4_receipt)?),
+            ("srv_v5", serde_json::to_vec(&v5_receipt)?),
             (
                 "matching",
                 context_bound_receipt(serde_json::json!({}), &matching)?,
@@ -3518,6 +3528,117 @@ mod bind_auth_tests {
         assert!(
             execute_check_shards_batch_payload_deferred(&mut store, &unmapped_batch, None).is_err()
         );
+
+        // Literal whitespace, char literal, and layout edits must miss warm cache across
+        // single /check-shard, all-hit /check-shard-batch, and partial-hit /check-shard-batch.
+        let mut lit_single = CheckShardHttpRequest {
+            decl: "t_lit".into(),
+            shard_key: "reused-lit-single-key".into(),
+            shard_source: "import Init\ntheorem t_lit : \"a b\" = \"a b\" := rfl\n".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            execute_check_shard_payload(&mut store, &lit_single)?["status"],
+            "remote_theorem_verified"
+        );
+        assert_eq!(
+            execute_check_shard_payload(&mut store, &lit_single)?["status"],
+            "remote_theorem_cache_hit"
+        );
+        lit_single.shard_source = "import Init\ntheorem t_lit : \"a  b\" = \"a b\" := rfl\n".into();
+        assert!(execute_check_shard_payload(&mut store, &lit_single).is_err());
+
+        let mut char_single = CheckShardHttpRequest {
+            decl: "t_char".into(),
+            shard_key: "reused-char-single-key".into(),
+            shard_source: "import Init\ntheorem t_char : ' ' = ' ' := rfl\n".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            execute_check_shard_payload(&mut store, &char_single)?["status"],
+            "remote_theorem_verified"
+        );
+        char_single.shard_source = "import Init\ntheorem t_char : '\t' = ' ' := rfl\n".into();
+        assert!(execute_check_shard_payload(&mut store, &char_single).is_err());
+
+        let mut layout_single = CheckShardHttpRequest {
+            decl: "t_layout".into(),
+            shard_key: "reused-layout-single-key".into(),
+            shard_source: "import Init\ntheorem t_layout : True := by\n  skip\n  trivial\n".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            execute_check_shard_payload(&mut store, &layout_single)?["status"],
+            "remote_theorem_verified"
+        );
+        layout_single.shard_source =
+            "import Init\ntheorem t_layout : True := by skip trivial\n".into();
+        assert!(execute_check_shard_payload(&mut store, &layout_single).is_err());
+
+        let lit_batch_ok = CheckShardsBatchRequest {
+            items: vec![
+                crate::pack::CheckShardBatchItem {
+                    shard_key: "lit-bk1".into(),
+                    decl_name: "lb1".into(),
+                    ..Default::default()
+                },
+                crate::pack::CheckShardBatchItem {
+                    shard_key: "lit-bk2".into(),
+                    decl_name: "lb2".into(),
+                    ..Default::default()
+                },
+            ],
+            coalesced_shard_source:
+                "import Init\ntheorem lb1 : ' ' = ' ' := rfl\ntheorem lb2 : \"a b\" = \"a b\" := rfl\n"
+                    .into(),
+            ..Default::default()
+        };
+        let (lb_first, lb_pub, _) =
+            execute_check_shards_batch_payload_deferred(&mut store, &lit_batch_ok, None)?;
+        assert!(lb_first.ok && lb_first.verified_count == 2 && lb_first.cache_hits == 0);
+        publish_batch(&mut store, lb_pub);
+        let (lb_warm, _, _) =
+            execute_check_shards_batch_payload_deferred(&mut store, &lit_batch_ok, None)?;
+        assert!(lb_warm.ok && lb_warm.cache_hits == 2);
+
+        // All-hit batch: mutating string literal whitespace in `lb2` must miss cache and fail (`lb1` hits, `lb2` misses).
+        let mut lit_batch_all_attack = lit_batch_ok.clone();
+        lit_batch_all_attack.coalesced_shard_source =
+            "import Init\ntheorem lb1 : ' ' = ' ' := rfl\ntheorem lb2 : \"a  b\" = \"a b\" := rfl\n"
+                .into();
+        match execute_check_shards_batch_payload_deferred(&mut store, &lit_batch_all_attack, None) {
+            Ok((resp, _, _)) => assert!(!resp.ok && resp.cache_hits == 1),
+            Err(_) => {}
+        }
+
+        // Partial-hit batch: mutating `lb1` char literal while adding `lb3` depending on `lb1`
+        // must NOT treat `lb1` as a warm hit or stub it out with `sorry` to verify `lb3`.
+        let lit_batch_partial_attack = CheckShardsBatchRequest {
+            items: vec![
+                crate::pack::CheckShardBatchItem {
+                    shard_key: "lit-bk1".into(),
+                    decl_name: "lb1".into(),
+                    ..Default::default()
+                },
+                crate::pack::CheckShardBatchItem {
+                    shard_key: "lit-bk3".into(),
+                    decl_name: "lb3".into(),
+                    ..Default::default()
+                },
+            ],
+            coalesced_shard_source:
+                "import Init\ntheorem lb1 : '\t' = ' ' := rfl\ntheorem lb3 : '\t' = ' ' := lb1\n"
+                    .into(),
+            ..Default::default()
+        };
+        match execute_check_shards_batch_payload_deferred(
+            &mut store,
+            &lit_batch_partial_attack,
+            None,
+        ) {
+            Ok((resp, _, _)) => assert!(!resp.ok && resp.cache_hits == 0),
+            Err(_) => {}
+        }
 
         let _ = std::fs::remove_dir_all(dir);
         Ok(())

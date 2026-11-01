@@ -53,7 +53,7 @@ fn cache_shm_stat_split(
         let st_path = shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
         let src_b3 = blake3::hash(active_src.as_bytes()).to_hex().to_string();
         let entry = ShmCachedFileSplit {
-            split_key: format!("file-split:v3:{}", src_b3),
+            split_key: format!("file-split:v5:{}", src_b3),
             src_blake3: src_b3,
             split: compact_split_for_shm_cache(split),
             prefix_src: String::new(),
@@ -789,7 +789,7 @@ fn run_check_command_inner(
             let src_b3 = blake3::hash(loaded_src.as_bytes()).to_hex().to_string();
             if let Some((ref st_path, _)) = st_paths_opt {
                 let entry = ShmCachedFileSplit {
-                    split_key: format!("file-split:v3:{}", src_b3),
+                    split_key: format!("file-split:v5:{}", src_b3),
                     src_blake3: src_b3.clone(),
                     split: compact_split_for_shm_cache(&sp),
                     prefix_src: String::new(),
@@ -828,7 +828,7 @@ fn run_check_command_inner(
                     split_key: if src_b3.is_empty() {
                         String::new()
                     } else {
-                        format!("file-split:v3:{}", src_b3)
+                        format!("file-split:v5:{}", src_b3)
                     },
                     src_blake3: src_b3,
                     split: compact_split_for_shm_cache(&fast_res.0),
@@ -1506,7 +1506,7 @@ pub(crate) fn compute_fission_store_key_with_args(
     let mut base = if allowed.len() > splitter::STANDARD_AXIOMS.len() {
         let ax_hash = blake3::hash(allowed.join(",").as_bytes()).to_hex();
         format!(
-            "fission-v3:{}:{}:{}:ax:{}",
+            "fission-v5:{}:{}:{}:ax:{}",
             toolchain,
             prefix_env_hash,
             sub_shard_key,
@@ -1514,7 +1514,7 @@ pub(crate) fn compute_fission_store_key_with_args(
         )
     } else {
         format!(
-            "fission-v3:{}:{}:{}",
+            "fission-v5:{}:{}:{}",
             toolchain, prefix_env_hash, sub_shard_key
         )
     };
@@ -1643,7 +1643,7 @@ fn check_single_decl(
                         let st_path =
                             shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
                         let entry = ShmCachedFileSplit {
-                            split_key: format!("file-split:v3:{}", sub_b3),
+                            split_key: format!("file-split:v5:{}", sub_b3),
                             src_blake3: sub_b3.clone(),
                             split: compact_split_for_shm_cache(&sub_split),
                             prefix_src: if sub_src.len() <= 64 * 1024 {
@@ -4692,5 +4692,79 @@ but is expected to have type
             &["-DmaxHeartbeats=4000000".to_string()],
         );
         assert_ne!(f_bare, f_hb);
+    }
+
+    #[test]
+    fn literal_and_layout_edits_miss_warm_check_and_agent_step_caches() -> Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("turbo_check_lit_layout_{}", pack::next_tmp_id()));
+        let project = dir.join("project");
+        fs::create_dir_all(&project)?;
+        fs::write(project.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        let file = project.join("Lit.lean");
+        let valid_src = "theorem t_str : \"a b\" = \"a b\" := rfl\ntheorem t_chr : ' ' = ' ' := rfl\ntheorem t_lay : True := by\n  skip\n  trivial\n";
+        fs::write(&file, valid_src)?;
+
+        let mut store = TurboStore::open(Some(&dir.join("store")))?;
+        let first_check =
+            evaluate_check_command_value(&mut store, file.clone(), None, project.clone())?;
+        assert_eq!(first_check["status"], "file_verified");
+        let warm_check =
+            evaluate_check_command_value(&mut store, file.clone(), None, project.clone())?;
+        assert_eq!(warm_check["status"], "all_shards_cached");
+        assert_eq!(warm_check["shard_hits"], 3);
+
+        let warm_step = crate::gpu_fastcheck::evaluate_agent_step_value(
+            &mut store,
+            &file,
+            Some("t_str"),
+            Some(&project),
+            false,
+            false,
+        )?;
+        assert_eq!(warm_step["verified"], true);
+        assert_eq!(warm_step["status"], "theorem_cache_hit");
+
+        for (bad_src, decl) in [
+            (
+                "theorem t_str : \"a  b\" = \"a b\" := rfl\ntheorem t_chr : ' ' = ' ' := rfl\ntheorem t_lay : True := by\n  skip\n  trivial\n",
+                "t_str",
+            ),
+            (
+                "theorem t_str : \"a b\" = \"a b\" := rfl\ntheorem t_chr : '\t' = ' ' := rfl\ntheorem t_lay : True := by\n  skip\n  trivial\n",
+                "t_chr",
+            ),
+            (
+                "theorem t_str : \"a b\" = \"a b\" := rfl\ntheorem t_chr : ' ' = ' ' := rfl\ntheorem t_lay : True := by skip trivial\n",
+                "t_lay",
+            ),
+        ] {
+            fs::write(&file, bad_src)?;
+            assert!(
+                evaluate_check_command_value(
+                    &mut store,
+                    file.clone(),
+                    Some(decl.to_string()),
+                    project.clone(),
+                )
+                .is_err(),
+                "expected check failure for {decl}"
+            );
+            assert!(
+                crate::gpu_fastcheck::evaluate_agent_step_value(
+                    &mut store,
+                    &file,
+                    Some(decl),
+                    Some(&project),
+                    false,
+                    false,
+                )
+                .is_err(),
+                "expected agent-step failure for {decl}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
     }
 }

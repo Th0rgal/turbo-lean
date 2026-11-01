@@ -315,8 +315,8 @@ fn git_head_tree_cache_paths(
     toolchain: &str,
 ) -> (PathBuf, PathBuf) {
     let mut h = blake3::Hasher::new();
-    // v11: cached entries embed `theorem-shard-v2` keys.
-    h.update(b"git-head-tree:v11:");
+    // v13: cached entries embed `theorem-shard-v5` keys and literal/layout-preserving split hashes.
+    h.update(b"git-head-tree:v13:");
     h.update(repo_root.to_string_lossy().as_bytes());
     h.update(b":");
     h.update(canon_dir.to_string_lossy().as_bytes());
@@ -346,8 +346,8 @@ fn git_head_tree_cache_paths(
     let short_key = &key_hex[..24];
     let staging = store.fast_staging_dir();
     (
-        staging.join(format!("git_head_tree_v10_{}.json", short_key)),
-        staging.join(format!("git_head_tree_stats_v10_{}.json", short_key)),
+        staging.join(format!("git_head_tree_v12_{}.json", short_key)),
+        staging.join(format!("git_head_tree_stats_v12_{}.json", short_key)),
     )
 }
 
@@ -6250,6 +6250,26 @@ end Fixture
                 && changed_files.len() == 1
                 && changed_files["Demo/A.lean"].len() < 512
         );
+
+        // Literal whitespace edit inside theorem statement must classify as statement edit + interface drift.
+        fs::write(
+            &canon_dir.join("Demo/B.lean"),
+            "namespace Demo\ntheorem t_b : \"a b\" = \"a b\" := by\n  rfl\nend Demo\n",
+        )?;
+        git_init_and_commit(&repo_dir, "add string theorem")?;
+        let (splits2, _) = load_and_split_files_cached(&store, &lean_paths)?;
+        warm_git_head_tree_cache(&store, &canon_dir, &lean_paths, tc, Some(&splits2));
+        fs::write(
+            &canon_dir.join("Demo/B.lean"),
+            "namespace Demo\ntheorem t_b : \"a  b\" = \"a b\" := by\n  rfl\nend Demo\n",
+        )?;
+        let (cls_lit, to_verify_lit, _, _) =
+            load_and_classify_pr_from_git(&store, &canon_dir, "HEAD", tc)?;
+        assert!(cls_lit.interface_drift);
+        assert_eq!(cls_lit.statement_edited_theorems, vec!["Demo/B.lean::t_b"]);
+        assert_eq!(to_verify_lit["Demo/B.lean"].len(), 1);
+        assert!(!to_verify_lit["Demo/B.lean"][0].2);
+
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
