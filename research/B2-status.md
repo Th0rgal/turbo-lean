@@ -101,9 +101,19 @@ successful compilation nor the desired machine outcome is assumed.
 The theorem concludes `ArmRet`, `ValRel`, and the exact x0 bits. It does
 not establish frontend correctness, loader correctness, or hardware execution.
 
-The compiler's Types/AST/Codec/Value/Eval files are unchanged relative to
-both the requested `4966384` source baseline and branch baseline `5508b9f`.
-The existing evaluator and benchmark were not altered to fit this proof.
+The vendored Types/AST/Codec/Value/Eval/Clif files are byte-identical to
+`main` `0212d86`. Value/Eval were re-vendored after #280 (`ac8b089`) added
+the fifth `HeapState` field `heapObjs : List HeapObj := []`; Collatz is
+scalar-only, so the proofs carry that field unchanged (the empty heap is
+now `⟨[], 0, [], [], []⟩`). The existing evaluator and benchmark were not
+altered to fit this proof.
+
+## Maintenance
+
+Any PR that changes a vendored compiler source (the files listed in
+`scripts/check_b2_source_identity.py`) must re-vendor it byte-identically
+into `research/b2-proofs/vendor/LeanNative/`, repair the B2 proofs, and keep
+`.github/workflows/b2.yml` green. Never weaken the identity check to pass.
 
 Unrelated native-decided witnesses in the pinned clifv imports are outside
 the claimed B2 result closures. Each claimed result is checked transitively
