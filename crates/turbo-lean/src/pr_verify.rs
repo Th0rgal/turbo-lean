@@ -2638,8 +2638,12 @@ pub fn run_ci_verify_command(
     // effective options and lakefile contents, including dependency configuration.
     let cfg = crate::module_builder::resolve_project_config_with_trust(&canon_dir, is_untrusted)
         .context("CI static Lake config validation failed")?;
+    // CI certifies all collected project sources, including non-default libraries.
+    // Build their dependency closure before full-source checks need their imports.
+    let ci_targets: Vec<String> = cfg.root_pkg.libs.iter().map(|l| l.name.clone())
+        .chain(cfg.root_pkg.exes.iter().map(|e| e.name.clone())).collect();
     let untrusted_ci_mods = if is_untrusted {
-        let dag = crate::module_builder::build_module_dag_with_trust(&cfg, &[], true)
+        let dag = crate::module_builder::build_module_dag_with_trust(&cfg, &ci_targets, true)
             .context("Untrusted CI static module DAG validation failed")?;
         Some(dag.nodes.keys().cloned().collect::<Vec<String>>())
     } else {
@@ -2878,7 +2882,7 @@ pub fn run_ci_verify_command(
                 let build_rep = crate::module_builder::build_project_modules_native(
                     store,
                     &canon_dir,
-                    &[],
+                    &ci_targets,
                     &trust_domain,
                     1,
                     is_untrusted,
@@ -5496,6 +5500,28 @@ mod pr_verify_tests {
         .unwrap_err();
         assert_stale_error(&err);
         assert_eq!(snapshot(&tree.project)?, before);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_ci_builds_nondefault_library_import_closure() -> Result<()> {
+        use crate::worktree_test_support::LakeTree;
+        let _guard = crate::pack::tests::env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tree = LakeTree::new("ci_nondefault", &[("P/A.lean", "def a : Nat := 1\n")])?;
+        let config = tree.project.join("lakefile.toml");
+        let mut text = fs::read_to_string(&config)?;
+        text.push_str("\n[[lean_lib]]\nname = \"Q\"\nglobs = [\"Q.+\"]\n");
+        fs::write(config, text)?;
+        fs::create_dir_all(tree.project.join("Q"))?;
+        fs::write(tree.project.join("Q/Helper.lean"), "def helper : Nat := 1\n")?;
+        fs::write(tree.project.join("Q/Use.lean"), "import Q.Helper\ntheorem use_helper : helper = 1 := rfl\n")?;
+        assert!(!tree.project.join(".lake/build/lib/lean/Q/Helper.olean").exists());
+        let mut store = TurboStore::open(Some(&tree.root.join("cache")))?;
+        run_ci_verify_command(&mut store, true, "trusted".into(), tree.project.clone(), None, None, false, None)?;
+        assert!(crate::module_builder::source_compilation_authorized(
+            &store, &tree.project, &tree.project.join("Q/Use.lean"),
+        ));
         Ok(())
     }
 
