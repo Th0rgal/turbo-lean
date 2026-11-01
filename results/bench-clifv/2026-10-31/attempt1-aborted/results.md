@@ -1,0 +1,48 @@
+# clifv paired benchmark
+
+Status: aborted. Telemetry: off.
+
+A = stock `lake build FV`; B = `turbo-lean --no-daemon build FV`. Order: ABAB….
+Ratio = arithmetic mean of paired stock/turbo wall times; values > 1 favor turbo.
+CPU and RSS cover the timed command and waited-for children; detached daemons may be excluded.
+
+## Provenance
+
+```json
+{
+  "hostname": "uruk",
+  "platform": "Linux uruk 6.8.0-147-generic #147-Ubuntu SMP PREEMPT_DYNAMIC Thu Sep 24 11:33:16 UTC 2026 x86_64",
+  "nproc": 8,
+  "mem_total_kib": 65625040,
+  "load_before": [
+    11.0615234375,
+    14.72802734375,
+    14.4443359375
+  ],
+  "load_after": [
+    12.72216796875,
+    19.7548828125,
+    17.8876953125
+  ],
+  "LEAN_NUM_THREADS": null,
+  "started_utc": "2026-10-31T22:04:31.448921+00:00",
+  "clifv_sha": "5018b9509dc124154dbe08a5bd85862595d8eab7",
+  "turbo_lean_sha": "509587fc23bc1d84167ff579e1242caa76277e50",
+  "toolchain": "leanprover/lean4:v4.34.1",
+  "turbo_binary": "/var/lib/sandboxed-node/work/88fd3dc8-2d05-4816-9c09-40950a5c391a/repo/target/release/turbo-lean",
+  "turbo_binary_sha256": "b4dc0796a75db844ac5740e4c47486e6b157b4e17e5819b7aafc8167a8a51b7b",
+  "turbo_version": "turbo-lean 0.1.0",
+  "lean_version": "Lean (version 4.34.1, x86_64-unknown-linux-gnu, commit 5045d0056413266e57c625dcd7c365b10e377c52, Release)",
+  "environment_overrides": {
+    "TURBO_LEAN_TELEMETRY": "off",
+    "TURBO_LEAN_HOME": "/var/lib/sandboxed-node/work/88fd3dc8-2d05-4816-9c09-40950a5c391a/bench/work/turbo-cache",
+    "TURBO_LEAN_STAGING_DIR": "/dev/shm/bench-clifv-995-d3rz44fg",
+    "TURBO_LEAN_NO_DAEMON": "1",
+    "TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK": "0",
+    "TMPDIR": "/var/lib/sandboxed-node/work/88fd3dc8-2d05-4816-9c09-40950a5c391a/bench/work/tmp",
+    "ELAN_TOOLCHAIN": "leanprover/lean4:v4.34.1"
+  },
+  "daemon_stop": "command + owned-worker cleanup"
+}
+```
+

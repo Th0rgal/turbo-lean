@@ -28,3 +28,18 @@ sandbox+ 2459332  4.1  0.7 11372616 501160 ?     Sl   23:00   0:09 opencode run 
 sandbox+ 2446730  2.0  0.7 11368580 472332 ?     Rl   22:49   0:18 opencode run --format json --thinking --model builtin/anthropic/claude-opus-5-5
 sandbox+ 2446352  2.0  0.7 11438216 503136 ?     Sl   22:49   0:19 opencode run --format json --thinking --model builtin/anthropic/claude-opus-5-5
 
+=== 2026-11-01T00:00:13Z [DURING-run2-start]
+ 01:00:13 up 9 days, 22:31,  5 users,  load average: 5.58, 5.37, 5.35
+Mem:           64086        7084        7390         297       50624       57002
+USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+sandbox+ 2597926  348  2.1 2545804 1392036 ?     SNl  00:59   2:17 /var/lib/sandboxed-node/work/d68fe3ea-3eb0-4108-96b5-666d4a9b9b99/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc --crate-name turbo_lean --edition=2021 crates/turbo-lean
+sandbox+ 2598634  150  0.0  20720 12172 ?        R    01:00   0:00 python3 /var/lib/sandboxed-node/work/88fd3dc8-2d05-4816-9c09-40950a5c391a/repo/scripts/bench_clifv.py --turbo /var/lib/sandboxed-node/work/88fd3dc8-2d05-4816-9c09-40950a5c391a/repo/ta
+root     2598558  102  0.0   5972  2456 ?        RN   01:00   0:00 du -sxB1 /srv/verity-ci-cache
+sandbox+ 2598265 98.3  0.0      0     0 ?        Zl   00:59   0:14 [rustup-init] <defunct>
+sandbox+ 2598517 94.4  0.6 6953956 434380 ?      Sl   01:00   0:05 opencode run --format json --thinking --session ses_e6ceb2b35ffe3h6jYKk2hXFREc --model builtin/google/gemini-4-carbon-eap
+sandbox+ 2598040 93.5  9.1 20382684 6033248 ?    SNl  00:59   0:31 /var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.33.1/bin/lean -M 6144 -R /var/lib/sandboxed-node/work/80755c46-afc0-4eef-8105-2b5bf028b12d/evm-fast-pilot -o /var
+sandbox+ 2237837 53.1  0.2 776500 149772 ?       Sl   Oct31 185:40 codex -c mcp_servers.sandboxed.command="/usr/local/bin/sandboxed-mcp" -c mcp_servers.sandboxed.args=["--api-url","https://agent-backend.thomas.md","--token-file","/var/lib/sandboxed-n
+sandbox+ 2598583 21.7  0.0   6124  2036 ?        S    01:00   0:00 timeout --signal=TERM --kill-after=5s 86252.25088334084 bash -lc exec /var/lib/sandboxed-node/work/88fd3dc8-2d05-4816-9c09-40950a5c391a/meta/run2.sh > /var/lib/sandboxed-node/work/88f
+sandbox+ 2598584 19.0  0.0   6124  2036 ?        S    01:00   0:00 timeout --signal=TERM --kill-after=5s 86253.25945353508 bash -lc exec /var/lib/sandboxed-node/work/88fd3dc8-2d05-4816-9c09-40950a5c391a/meta/loadloop2.sh
+sandbox+ 2440045 18.0  0.0      0     0 ?        ZN   Oct31  28:08 [lean] <defunct>
+
