@@ -11192,6 +11192,251 @@ lean_exe «demo-exe» where
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_config_resolution_failure_fails_closed_for_stale_dep_and_preserves_optout_lake_tree() {
+        use crate::worktree_test_support::snapshot;
+        let _env_guard = native_build_env_guard();
+        let dir = make_temp_test_dir("cfg_fail_stale_dep");
+        let proj_dir = dir.join("proj");
+        let dep_dir = proj_dir.join(".lake/packages/dep_pkg");
+        fs::create_dir_all(dep_dir.join("DepPkg")).unwrap();
+        fs::create_dir_all(proj_dir.join("App")).unwrap();
+        for d in [&proj_dir, &dep_dir] {
+            fs::write(d.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        }
+        let dep_lakefile = dep_dir.join("lakefile.toml");
+        let valid_dep_lf =
+            "name = \"dep_pkg\"\n[[lean_lib]]\nname = \"DepPkg\"\nglobs = [\"DepPkg.+\"]\n";
+        fs::write(&dep_lakefile, valid_dep_lf).unwrap();
+        let a_src = |v: u32| format!("namespace DepPkg\ndef g : Nat := {v}\nend DepPkg\n");
+        fs::write(dep_dir.join("DepPkg/A.lean"), a_src(3)).unwrap();
+        fs::write(
+            dep_dir.join("DepPkg/B.lean"),
+            "import DepPkg.A\nnamespace DepPkg\ndef h : Nat := g\nend DepPkg\n",
+        )
+        .unwrap();
+        let manifest_path_json = proj_dir.join("lake-manifest.json");
+        let valid_manifest_json = r#"{"version": "1.2.0", "packagesDir": ".lake/packages", "packages": [{"type": "path", "name": "dep_pkg", "dir": ".lake/packages/dep_pkg", "configFile": "lakefile.toml", "inherited": false}], "name": "app_pkg", "lakeDir": ".lake", "fixedToolchain": false}"#;
+        fs::write(&manifest_path_json, valid_manifest_json).unwrap();
+        let root_lakefile = proj_dir.join("lakefile.toml");
+        let valid_root_lf = "name = \"app_pkg\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\nglobs = [\"App.+\"]\n";
+        fs::write(&root_lakefile, valid_root_lf).unwrap();
+        let c_file = proj_dir.join("App/C.lean");
+        fs::write(
+            &c_file,
+            "import DepPkg.B\nnamespace App\ntheorem h_eq : DepPkg.h = 3 := rfl\nend App\n",
+        )
+        .unwrap();
+        let mut store = TurboStore::open(Some(&dir.join(".turbo_store"))).unwrap();
+        assert_eq!(
+            build_project_modules_native(
+                &mut store,
+                &proj_dir,
+                &[],
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap()
+            .modules_compiled,
+            3
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(dep_dir.join("DepPkg/A.lean"), a_src(4)).unwrap();
+        assert_eq!(
+            build_project_modules_native(
+                &mut store,
+                &dep_dir,
+                &["DepPkg.A".to_string()],
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap()
+            .compiled_modules,
+            vec!["DepPkg.A".to_string()]
+        );
+        let canon = proj_dir.canonicalize().unwrap();
+        let canon_c = c_file.canonicalize().unwrap();
+        let root_manifest_path = crate::lake_build::verified_sources_manifest_path(&canon);
+        let saved_root_manifest = fs::read(&root_manifest_path).unwrap();
+        for with_root_manifest in [true, false] {
+            for opt_out in [false, true] {
+                if with_root_manifest {
+                    fs::write(&root_manifest_path, &saved_root_manifest).unwrap();
+                } else {
+                    let _ = fs::remove_file(&root_manifest_path);
+                }
+                if opt_out {
+                    fs::write(
+                        canon.join("turbo-lean.toml"),
+                        "[worktree]\nauto_link = false\n",
+                    )
+                    .unwrap();
+                } else {
+                    let _ = fs::remove_file(canon.join("turbo-lean.toml"));
+                }
+                for kind in ["dep_lakefile", "lake_manifest", "missing_root_lakefile"] {
+                    match kind {
+                        "dep_lakefile" => fs::write(&dep_lakefile, "name = [\n").unwrap(),
+                        "lake_manifest" => fs::write(&manifest_path_json, "{corrupt").unwrap(),
+                        _ => fs::remove_file(&root_lakefile).unwrap(),
+                    }
+                    let before = opt_out.then(|| snapshot(&canon).unwrap());
+                    let err = crate::lake_build::ensure_project_imports_fresh_for_check(
+                        &canon,
+                        std::slice::from_ref(&canon_c),
+                    )
+                    .unwrap_err();
+                    assert!(
+                        format!("{err:#}").contains("Failed to resolve Lean options"),
+                        "unexpected error ({kind}, manifest={with_root_manifest}, opt_out={opt_out}): {err:#}"
+                    );
+                    if let Some(before) = before {
+                        assert_eq!(
+                            snapshot(&canon).unwrap(),
+                            before,
+                            ".lake mutated ({kind}, manifest={with_root_manifest})"
+                        );
+                    }
+                    fs::write(&dep_lakefile, valid_dep_lf).unwrap();
+                    fs::write(&manifest_path_json, valid_manifest_json).unwrap();
+                    fs::write(&root_lakefile, valid_root_lf).unwrap();
+                }
+            }
+        }
+        // Even a genuinely Lake-less directory (no lakefile, no manifest, no `.lake/packages`)
+        // must fail closed on non-root/non-toolchain imports (including under `Lean.*`).
+        let lakeless = dir.join("lakeless");
+        fs::create_dir_all(&lakeless).unwrap();
+        fs::write(
+            lakeless.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )
+        .unwrap();
+        let canon_ll = lakeless.canonicalize().unwrap();
+        for imp in ["DepPkg.B", "Lean.NonexistentUserShadowMod"] {
+            let f = canon_ll.join("Main.lean");
+            fs::write(&f, format!("import {imp}\n")).unwrap();
+            let err = crate::lake_build::ensure_project_imports_fresh_for_check(&canon_ll, &[f])
+                .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("Unresolved non-root import"),
+                "Lake-less import `{imp}` did not fail closed: {err:#}"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_allowed_axioms_shift_retains_siblings_without_kernel_audit_and_strict_memo_separates() {
+        let _env_guard = native_build_env_guard();
+        let dir = make_temp_test_dir("axiom_shift_memo");
+        let proj_dir = dir.join("proj");
+        let dep_dir = proj_dir.join(".lake/packages/dep_pkg");
+        fs::create_dir_all(dep_dir.join("DepPkg")).unwrap();
+        fs::create_dir_all(proj_dir.join("App")).unwrap();
+        for d in [&proj_dir, &dep_dir] {
+            fs::write(d.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        }
+        fs::write(
+            dep_dir.join("lakefile.toml"),
+            "name = \"dep_pkg\"\n[[lean_lib]]\nname = \"DepPkg\"\nglobs = [\"DepPkg.+\"]\n",
+        )
+        .unwrap();
+        fs::write(dep_dir.join("DepPkg/A.lean"), "def depA : Nat := 1\n").unwrap();
+        fs::write(
+            dep_dir.join("DepPkg/B.lean"),
+            "import App.R\ndef depB : Nat := rootR\n",
+        )
+        .unwrap();
+        fs::write(
+            proj_dir.join("lake-manifest.json"),
+            r#"{"version": "1.2.0", "packagesDir": ".lake/packages", "packages": [{"type": "path", "name": "dep_pkg", "dir": ".lake/packages/dep_pkg", "configFile": "lakefile.toml", "inherited": false}], "name": "app_pkg", "lakeDir": ".lake", "fixedToolchain": false}"#,
+        )
+        .unwrap();
+        fs::write(
+            proj_dir.join("lakefile.toml"),
+            "name = \"app_pkg\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\nglobs = [\"App.+\"]\n",
+        )
+        .unwrap();
+        fs::write(proj_dir.join("App/R.lean"), "def rootR : Nat := 1\n").unwrap();
+        fs::write(proj_dir.join("App/S.lean"), "def rootS : Nat := 2\n").unwrap();
+        fs::write(
+            proj_dir.join("App/T.lean"),
+            "import DepPkg.B\ndef rootT : Nat := depB\n",
+        )
+        .unwrap();
+        let mut store = TurboStore::open(Some(&dir.join(".turbo_store"))).unwrap();
+        std::env::set_var(crate::splitter::ALLOWED_AXIOMS_ENV, "Custom.Ax");
+        build_project_modules_native(
+            &mut store,
+            &proj_dir,
+            &[],
+            "trusted-internal",
+            1,
+            false,
+            true,
+            None,
+        )
+        .unwrap();
+        std::env::remove_var(crate::splitter::ALLOWED_AXIOMS_ENV);
+        // Rebuild only `App.S` under strict default axioms: `App/R.lean` must stay in the
+        // manifest with `kernel_audited == false` rather than retaining the lax audit bit or
+        // being dropped as Lake-managed.
+        fs::write(proj_dir.join("App/S.lean"), "def rootS : Nat := 3\n").unwrap();
+        build_project_modules_native(
+            &mut store,
+            &proj_dir,
+            &["App.S".to_string()],
+            "trusted-internal",
+            1,
+            false,
+            true,
+            None,
+        )
+        .unwrap();
+        let canon = proj_dir.canonicalize().unwrap();
+        let root_manifest_bytes =
+            fs::read(crate::lake_build::verified_sources_manifest_path(&canon)).unwrap();
+        let root_manifest: VerifiedDepManifest =
+            serde_json::from_slice(&root_manifest_bytes).unwrap();
+        assert_eq!(
+            root_manifest.allowed_axioms,
+            crate::splitter::allowed_axioms()
+        );
+        assert!(
+            !root_manifest.modules["App/R.lean"].kernel_audited,
+            "retained sibling kept `kernel_audited` across `allowed_axioms` shift"
+        );
+        assert!(root_manifest.modules["App/S.lean"].kernel_audited);
+        // `strict_policy = false` (`dep_pkg_module_stale`) accepts `DepPkg.B -> App.R` because
+        // `App.R`'s artifact bytes are current, and must NOT insert into `memo` so a subsequent
+        // `strict_policy = true` (`import_pin_current`) rejects the unaudited `App.R`.
+        let cfg = resolve_project_config(&canon).unwrap();
+        let memo = DepImportMemo::default();
+        assert!(!dep_pkg_module_stale(&cfg, &memo, "DepPkg.B"));
+        assert!(
+            memo.0.lock().unwrap().is_empty(),
+            "non-strict staleness check polluted `DepImportMemo`"
+        );
+        let dep_manifest: VerifiedDepManifest = serde_json::from_slice(
+            &fs::read(dep_dir.join(".lake/build/.turbo_verified_sources.json")).unwrap(),
+        )
+        .unwrap();
+        let dep_b_pin = &dep_manifest.modules["DepPkg/B.lean"].olean_artifact_digest;
+        assert!(
+            !import_pin_current(&cfg, &memo, "DepPkg.B", Some(dep_b_pin)),
+            "`import_pin_current` accepted unaudited `App.R` via non-strict memo"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_native_module_builder_cas_partial_invalidation_lazy_c_and_lake_differential() {
         let _env_guard = native_build_env_guard();

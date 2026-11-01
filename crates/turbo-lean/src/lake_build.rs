@@ -2225,23 +2225,27 @@ pub(crate) fn ensure_project_imports_fresh(
     // Pins and artifact digests describe disk whatever policy they were recorded under, so only
     // the schema has to match here. A manifest that exists but does not parse (legacy schema,
     // corruption) gives no evidence: every built import is refreshed and the file dropped.
-    let (manifest_opt, unusable_manifest) = match fs::read(&manifest_path) {
+    let (mut manifest_opt, unusable_manifest) = match fs::read(&manifest_path) {
         Ok(bytes) => {
             match serde_json::from_slice::<crate::module_builder::VerifiedDepManifest>(&bytes) {
-                Ok(mut m) => {
-                    m.cfg = crate::module_builder::resolve_project_config(canon_dir).ok();
-                    (Some(m), false)
-                }
+                Ok(m) => (Some(m), false),
                 Err(_) => (None, true),
             }
         }
-        Err(_) => (None, false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, false),
+        Err(_) => (None, true),
     };
 
     let mut worklist: Vec<String> = Vec::new();
     let mut target_rel_slashes: Vec<String> = Vec::new();
     for tf in target_files {
-        if let Some(imps) = read_header_imports_from_file(tf) {
+        if tf.try_exists()? || fs::symlink_metadata(tf).is_ok() {
+            let imps = read_header_imports_from_file(tf).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Unparseable or unreadable import header in `{}`: fail-closed import freshness gate",
+                    tf.display()
+                )
+            })?;
             worklist.extend(imps);
         }
         if let Ok(rel) = tf.strip_prefix(canon_dir) {
@@ -2263,17 +2267,56 @@ pub(crate) fn ensure_project_imports_fresh(
         return Ok(0);
     }
 
+    // Ownership matches build order (root, then dependency packages, ambiguity fail-closed, then
+    // toolchain). A name in `Init`/`Std`/`Lean`/`Lake` is not reserved: skip it only once it
+    // actually resolves as a toolchain module. A present Lake config (or non-empty
+    // `lake-manifest.json` / `.lake/packages/*`) that fails to resolve is not "no config":
+    // dependency ownership cannot be established, so fail closed before any cache lookup or
+    // `.lake` write. Standalone directories keep the legacy filesystem lookup only when every
+    // non-root import resolves in the active toolchain's `lib/lean`.
+    let has_dep_packages = (canon_dir.join("lake-manifest.json").try_exists()? && {
+        let (_, pkgs, _) = crate::module_builder::parse_lake_manifest(canon_dir, false)
+            .with_context(|| {
+                format!(
+                    "Failed to resolve Lean options and workspace configuration in {}",
+                    canon_dir.display()
+                )
+            })?;
+        !pkgs.is_empty()
+    }) || (canon_dir.join(".lake/packages").try_exists()?
+        && fs::read_dir(canon_dir.join(".lake/packages"))
+            .with_context(|| {
+                format!(
+                    "Failed to read dependency packages in {}",
+                    canon_dir.display()
+                )
+            })?
+            .next()
+            .is_some());
+    let has_workspace_cfg = canon_dir.join("lakefile.lean").try_exists()?
+        || canon_dir.join("lakefile.toml").try_exists()?
+        || has_dep_packages;
+    let root_cfg = if has_workspace_cfg {
+        Some(
+            crate::module_builder::resolve_project_config(canon_dir).with_context(|| {
+                format!(
+                    "Failed to resolve Lean options and workspace configuration in {}",
+                    canon_dir.display()
+                )
+            })?,
+        )
+    } else {
+        None
+    };
+    if let Some(m) = manifest_opt.as_mut() {
+        m.cfg = root_cfg.clone();
+    }
+
     let mut visited = HashSet::new();
     let mut ordered_imports: Vec<(String, String, PathBuf)> = Vec::new();
     let mut adj: HashMap<String, Vec<String>> = HashMap::new();
     let mut non_root_imports: Vec<String> = Vec::new();
-    // Ownership matches build order (root, then dependency packages, ambiguity fail-closed, then
-    // toolchain). A name in `Init`/`Std`/`Lean`/`Lake` is not reserved: skip it only once it
-    // actually resolves as a toolchain module. Config comes from the manifest when one loaded.
-    let root_cfg = manifest_opt
-        .as_ref()
-        .and_then(|m| m.cfg.clone())
-        .or_else(|| crate::module_builder::resolve_project_config(canon_dir).ok());
+    let mut standalone_tc_lib_lean: Option<PathBuf> = None;
     let mut olean_of: HashMap<String, PathBuf> = HashMap::new();
     while let Some(mod_name) = worklist.pop() {
         if !visited.insert(mod_name.clone()) {
@@ -2287,7 +2330,12 @@ pub(crate) fn ensure_project_imports_fresh(
         };
         if let Some((dep_src, olean)) = root_paths {
             olean_of.insert(mod_name.clone(), olean);
-            let sub_imps = read_header_imports_from_file(&dep_src).unwrap_or_default();
+            let sub_imps = read_header_imports_from_file(&dep_src).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Unparseable or unreadable import header in `{}`: fail-closed import freshness gate",
+                    dep_src.display()
+                )
+            })?;
             for sub_imp in &sub_imps {
                 if !visited.contains(sub_imp) {
                     worklist.push(sub_imp.clone());
@@ -2295,16 +2343,62 @@ pub(crate) fn ensure_project_imports_fresh(
             }
             adj.insert(mod_name.clone(), sub_imps);
             ordered_imports.push((mod_name, imp_slash, dep_src));
-        } else if root_cfg.as_ref().is_some_and(|cfg| {
+        } else if let Some(cfg) = root_cfg.as_ref() {
             // Toolchain (and anything else) only after dependency ownership. Ambiguity is
             // `Unresolved` and fails closed inside `dep_pkg_module_stale`'s callers via refresh.
-            matches!(
+            if matches!(
                 crate::module_builder::resolve_import_site(cfg, &mod_name),
                 crate::module_builder::ImportSite::Module(_)
                     | crate::module_builder::ImportSite::Unresolved
-            )
-        }) {
-            non_root_imports.push(mod_name);
+            ) {
+                non_root_imports.push(mod_name);
+            }
+        } else {
+            let tc_lib = match standalone_tc_lib_lean.as_ref() {
+                Some(tc_lib) => tc_lib,
+                None => {
+                    let tc = detect_toolchain(canon_dir);
+                    let (_, _, tc_lib, _) =
+                        crate::module_builder::resolve_toolchain_compiler_with_trust(
+                            canon_dir, &tc, true,
+                        )
+                        .or_else(|_| {
+                            if worktree_auto_link_disabled(canon_dir) {
+                                let out = Command::new("lean")
+                                    .arg("--print-prefix")
+                                    .current_dir(canon_dir)
+                                    .output()?;
+                                anyhow::ensure!(
+                                    out.status.success(),
+                                    "`lean --print-prefix` failed: {}",
+                                    String::from_utf8_lossy(&out.stderr)
+                                );
+                                let p = PathBuf::from(String::from_utf8(out.stdout)?.trim());
+                                anyhow::ensure!(p.is_absolute() && p.join("lib/lean").is_dir());
+                                Ok((p.join("bin/lean"), String::new(), p.join("lib/lean"), p.join("lib")))
+                            } else {
+                                crate::module_builder::resolve_toolchain_compiler(canon_dir, &tc)
+                            }
+                        })
+                        .with_context(|| {
+                            format!(
+                                "Cannot verify standalone import `{mod_name}` without an installed Lean toolchain in {}",
+                                canon_dir.display()
+                            )
+                        })?;
+                    standalone_tc_lib_lean.insert(tc_lib)
+                }
+            };
+            anyhow::ensure!(
+                tc_lib
+                    .join(format!(
+                        "{}.olean",
+                        crate::module_builder::module_name_to_rel_slash(&mod_name)
+                    ))
+                    .is_file(),
+                "Unresolved non-root import `{mod_name}` in Lake-less directory {}: fail-closed import freshness gate",
+                canon_dir.display()
+            );
         }
     }
     // Dependency-package imports whose closure is not provably consistent (P0-4): Lean would
