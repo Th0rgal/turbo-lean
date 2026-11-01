@@ -1342,11 +1342,14 @@ fn check_directory(
                                         Some(crate::zygote::remaining_timeout_ms(None, *t0)),
                                     )?;
                                     if !out.status.success() {
-                                        let stderr = String::from_utf8_lossy(&out.stderr);
-                                        let stdout = String::from_utf8_lossy(&out.stdout);
+                                        let lf_display = lf.display().to_string();
+                                        let stderr = String::from_utf8_lossy(&out.stderr)
+                                            .replace("<audited-shard>", &lf_display);
+                                        let stdout = String::from_utf8_lossy(&out.stdout)
+                                            .replace("<audited-shard>", &lf_display);
                                         anyhow::bail!(
                                             "Directory check failed in {}:\n{}\n{}",
-                                            lf.display(),
+                                            lf_display,
                                             stdout,
                                             stderr
                                         );
@@ -3615,16 +3618,19 @@ fn check_single_file(
             )
             .context("Failed to audit Lean file")?;
             if !out.status.success() {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr)
+                    .replace("<audited-shard>", &orig_display);
+                let stdout = String::from_utf8_lossy(&out.stdout)
+                    .replace("<audited-shard>", &orig_display);
                 anyhow::bail!(
                     "Check failed for {}:\n{}\n{}",
-                    file.display(),
+                    orig_display,
                     stdout,
                     stderr
                 );
             }
-            eval_stdout_text = String::from_utf8_lossy(&out.stdout).to_string();
+            eval_stdout_text = String::from_utf8_lossy(&out.stdout)
+                .replace("<audited-shard>", &orig_display);
         }
         if emit_stdout && !json_output {
             if !eval_stdout_text.is_empty() {

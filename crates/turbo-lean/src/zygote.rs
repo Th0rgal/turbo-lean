@@ -3594,11 +3594,14 @@ pub(crate) fn run_audited_lean_shard(
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
-    let out = match timeout_ms {
+    let mut out = match timeout_ms {
         Some(_) => run_lean_command(&mut cmd, timeout_ms),
         None => cmd.output().map_err(Into::into),
     }
     .context("Failed to execute `lean` on shard fallback")?;
+    let lean_display = lean_file.to_string_lossy();
+    out.stdout = String::from_utf8_lossy(&out.stdout).replace(lean_display.as_ref(), "<audited-shard>").into_bytes();
+    out.stderr = String::from_utf8_lossy(&out.stderr).replace(lean_display.as_ref(), "<audited-shard>").into_bytes();
     if !out.status.success() {
         return Ok(out);
     }
@@ -6640,7 +6643,14 @@ mod tests {
             "source-level options cannot weaken the artifact audit",
             "independent kernel re-check",
         );
-        assert!(!run("theorem tgt : 1 = 2 := rfl\n")?.status.success());
+        let failed = run("theorem tgt : 1 = 2 := rfl\n")?;
+        assert!(!failed.status.success());
+        let failed_diag = format!(
+            "{}{}",
+            String::from_utf8_lossy(&failed.stdout),
+            String::from_utf8_lossy(&failed.stderr)
+        );
+        assert!(failed_diag.contains("<audited-shard>") && !failed_diag.contains("TurboAuditedShard_"), "{failed_diag}");
         // A request budget bounds the whole fallback; it never yields a late verdict.
         let audit = std::collections::HashSet::from(["tgt".to_string()]);
         let late = run_audited_lean_shard(

@@ -1632,6 +1632,7 @@ fn run(cli: Cli) -> Result<()> {
                 .into_iter()
                 .map(|sh| sh.name)
                 .collect();
+            let file_display = file.to_string_lossy().to_string();
             let run_direct_lean = || -> Result<()> {
                 use std::io::Write;
                 let out = zygote::run_audited_lean_shard(
@@ -1644,8 +1645,10 @@ fn run(cli: Cli) -> Result<()> {
                     &file_lean_args,
                     Some(timeout_ms),
                 )?;
-                std::io::stdout().write_all(&out.stdout)?;
-                std::io::stderr().write_all(&out.stderr)?;
+                let stdout = String::from_utf8_lossy(&out.stdout).replace("<audited-shard>", &file_display);
+                let stderr = String::from_utf8_lossy(&out.stderr).replace("<audited-shard>", &file_display);
+                std::io::stdout().write_all(stdout.as_bytes())?;
+                std::io::stderr().write_all(stderr.as_bytes())?;
                 std::io::stdout().flush()?;
                 std::io::stderr().flush()?;
                 #[cfg(unix)]
@@ -1664,7 +1667,6 @@ fn run(cli: Cli) -> Result<()> {
                 run_direct_lean()?;
             }
 
-            let file_display = file.to_string_lossy().to_string();
             let reply = if let Some(daemon_rep) = zygote::try_local_zygote_eval_with_args(
                 &store,
                 &env_vars,
@@ -1746,8 +1748,10 @@ fn run(cli: Cli) -> Result<()> {
                     Some(timeout_ms),
                 )?;
                 let lean_ok = lean_out.status.success();
+                let lean_stdout = String::from_utf8_lossy(&lean_out.stdout)
+                    .replace("<audited-shard>", &file_display);
                 if reply.ok != lean_ok
-                    || rendered_stdout.as_bytes() != lean_out.stdout.as_slice()
+                    || rendered_stdout != lean_stdout
                     || !lean_out.stderr.is_empty()
                 {
                     eprintln!(

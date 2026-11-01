@@ -1135,6 +1135,7 @@ pub fn serve_cas_http_with_auth(
                                     "timed_out": zreply.timed_out,
                                     "crashed": zreply.crashed,
                                     "scanner_version": zreply.scanner_version,
+                                    "replay_version": zreply.replay_version,
                                     "executed_execution_identity": executed_identity,
                                     "binding_ok": executed_binding == crate::zygote::ClosureBinding::Bound,
                                     "deterministic": deterministic

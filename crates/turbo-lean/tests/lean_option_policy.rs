@@ -70,6 +70,16 @@ fn real_binary_rejects_weakening_options_and_kernel_bypass_fixture() {
     );
 
     rejected(turbo(&project, &["build"]), "debug.skipKernelTC");
+    let eval_without_project_dir = Command::new(env!("CARGO_BIN_EXE_turbo-lean"))
+        .args(["--json", "--cache-dir"])
+        .arg(project.join("cache"))
+        .args(["eval", "Bad.lean"])
+        .current_dir(&project)
+        .env("TURBO_LEAN_NO_DAEMON", "1")
+        .env("LEAN_NUM_THREADS", "4")
+        .output()
+        .unwrap();
+    rejected(eval_without_project_dir, "debug.skipKernelTC");
     fs::write(
         project.join("Bad.lean"),
         "theorem good : True := True.intro\n",
