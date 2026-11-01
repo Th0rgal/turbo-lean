@@ -161,10 +161,11 @@ pub fn derive_telemetry_project_id(dir: Option<&Path>) -> String {
         .unwrap_or_else(|| PathBuf::from("."));
     let canon = work_dir.canonicalize().unwrap_or(work_dir);
     let mut ident = canon.display().to_string();
-    if let Ok(out) = std::process::Command::new("git")
-        .args(["-C", &ident, "config", "--get", "remote.origin.url"])
-        .output()
-    {
+    if let Ok(out) = crate::trusted_tools::git(&canon).and_then(|mut git| {
+        git.args(["-C", &ident, "config", "--get", "remote.origin.url"])
+            .output()
+            .map_err(Into::into)
+    }) {
         if out.status.success() {
             let rem = String::from_utf8_lossy(&out.stdout)
                 .trim()
@@ -1362,7 +1363,7 @@ pub fn execute_fast_check(
 }
 
 fn resolve_cli_bin() -> PathBuf {
-    let mut cli_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("turbo-lean"));
+    let mut cli_bin = std::env::current_exe().unwrap_or_default();
     if cli_bin.file_name().and_then(|s| s.to_str()) != Some("turbo-lean") {
         if let Some(parent_bin) = cli_bin
             .parent()

@@ -81,6 +81,25 @@ def isBorrowedReadOnlyIn (objVar : VarId) : LNIRCode → Bool
   | .ret v => v != objVar
   | .unreachable => true
 
+/-- Alias-insensitive RC neutrality: `code` contains no operation that can observe or change a reference count
+    of an object other than through `objVar`'s own matching `decRef`. Variables are not alias-tracked (a field
+    loaded from another object, a call argument or a tuple projection may be the same heap object as `objVar`),
+    so any `isExclusive`, ensure-exclusive/in-place update, call, or `decRef` of a different variable blocks
+    eliding an `incRef objVar`/`decRef objVar` pair (P-cert C2: the elided pair changes an observed
+    `isExclusive` from `false` to `true`). -/
+def isRcNeutralExcept (objVar : VarId) : LNIRCode → Bool
+  | .letBind _ _ (.isExclusive _) _ | .letBind _ _ (.sarrayEnsureExclusive _ _) _
+  | .letBind _ _ (.sarraySet _ _ _ _) _ | .letBind _ _ (.storageStore _ _ _) _
+  | .letBind _ _ (.call _ _ _ _) _ => false
+  | .letBind _ _ _ k => isRcNeutralExcept objVar k
+  | .rawStore _ _ _ _ k => isRcNeutralExcept objVar k
+  | .incRef _ _ k => isRcNeutralExcept objVar k
+  | .decRef v _ k => v == objVar && isRcNeutralExcept objVar k
+  | .ite _ t e => isRcNeutralExcept objVar t && isRcNeutralExcept objVar e
+  | .seqFor _ _ _ _ _ _ s k => isRcNeutralExcept objVar s && isRcNeutralExcept objVar k
+  | .parFor _ _ _ _ _ k => isRcNeutralExcept objVar k
+  | .ret _ | .unreachable => true
+
 /-- Remove matching `decRef objVar count` from `code` if present along the continuation spine. -/
 def removeMatchingDecRef (objVar : VarId) (count : Nat) : LNIRCode → Option LNIRCode
   | .decRef v c k =>
@@ -144,7 +163,7 @@ def optimizeCodeLoopVectorize (inLoop : Bool) (code : LNIRCode) : LNIRCode × Na
   match code with
   | .incRef objVar count k =>
     let (k', vecCount) := optimizeCodeLoopVectorize inLoop k
-    if isBorrowedReadOnlyIn objVar k' then
+    if isBorrowedReadOnlyIn objVar k' && isRcNeutralExcept objVar k' then
       match removeMatchingDecRef objVar count k' with
       | some kWithoutDec => (kWithoutDec, vecCount + 1)
       | none => (.incRef objVar count k', vecCount)
@@ -307,5 +326,26 @@ private def boxScalarExclusivityCodeReg : LNIRCode :=
 #guard isBorrowedReadOnlyIn 0 (.seqFor 1 2 0 4 5 .i64 (.ret 4) (.ret 4)) == false
 #guard isBorrowedReadOnlyIn 0 (.seqFor 1 2 3 4 0 .i64 (.ret 4) (.ret 4)) == false
 #guard isBorrowedReadOnlyIn 0 (.parFor 1 2 [0] .i64 (.mapScaleAdd 1 0) (.ret 3)) == false
+
+/-! P-cert C2 proposer alias regressions: `x2 := ctorGetObj x1 0` may be the same object as `x0`, so dropping
+    `incRef 0 1 … decRef 0 1` changes an observed exclusivity (or a release through the alias) and must not be
+    proposed. The pass-level SymbolicTV gate already rejected these; the proposer itself is now fail-closed. -/
+private def heapFieldAliasExclusivityCodeReg : LNIRCode :=
+  .incRef 0 1 (.letBind 2 .objPtr (.ctorGetObj 1 0) (.letBind 3 .i1 (.isExclusive 2) (.decRef 0 1 (.ret 3))))
+
+private def callAliasCodeReg : LNIRCode :=
+  .incRef 0 1 (.letBind 3 .i1 (.call "f" [1] .i1) (.decRef 0 1 (.ret 3)))
+
+private def aliasDecRefCodeReg : LNIRCode :=
+  .incRef 0 1 (.letBind 2 .objPtr (.ctorGetObj 1 0)
+    (.decRef 2 1 (.letBind 4 .i64 (.scalar (.constU64 7)) (.decRef 0 1 (.ret 4)))))
+
+private def readOnlyPairCodeReg : LNIRCode :=
+  .incRef 0 1 (.letBind 4 .i64 (.scalar (.constU64 7)) (.decRef 0 1 (.ret 4)))
+
+#guard (optimizeCodeLoopVectorize false heapFieldAliasExclusivityCodeReg).1 == heapFieldAliasExclusivityCodeReg
+#guard (optimizeCodeLoopVectorize false callAliasCodeReg).1 == callAliasCodeReg
+#guard (optimizeCodeLoopVectorize false aliasDecRefCodeReg).1 == aliasDecRefCodeReg
+#guard (optimizeCodeLoopVectorize false readOnlyPairCodeReg).1 == .letBind 4 .i64 (.scalar (.constU64 7)) (.ret 4)
 
 end LeanNative.Transform

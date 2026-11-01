@@ -979,23 +979,6 @@ pub fn resolve_toolchain_compiler_with_trust(
             let c = cand.canonicalize().unwrap_or_else(|_| cand.clone());
             !c.starts_with(&canon_proj)
         })
-        .or_else(|| {
-            // Never execute `spawn_lake_env` on untrusted projects or when strict toolchain mode is active
-            if strict_tc {
-                None
-            } else {
-                lake_build::spawn_lake_env(project_dir)
-                    .ok()
-                    .map(|env| PathBuf::from(lake_build::lean_bin_from_env(&env)))
-                    .filter(|p| {
-                        p.is_file()
-                            && !p
-                                .canonicalize()
-                                .unwrap_or_else(|_| p.clone())
-                                .starts_with(&canon_proj)
-                    })
-            }
-        })
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "Could not locate installed `lean` compiler binary matching toolchain `{}` for {}: fail-closed toolchain gate",
@@ -1023,6 +1006,7 @@ pub fn resolve_toolchain_compiler_with_trust(
         }
     }
     let githash_out = Command::new(&canon_bin)
+        .env("PATH", "/usr/bin:/bin")
         .arg("--githash")
         .output()
         .context("Failed to execute `lean --githash`")?;
@@ -1082,6 +1066,7 @@ pub fn resolve_toolchain_compiler_with_trust(
             .unwrap_or(false)
         {
             let ver_out = Command::new(&canon_bin)
+                .env("PATH", "/usr/bin:/bin")
                 .arg("--version")
                 .output()
                 .context("Failed to execute `lean --version` for toolchain verification")?;
@@ -1111,6 +1096,7 @@ pub fn resolve_toolchain_compiler_with_trust(
         .filter(|p| p.join("lib/lean").is_dir())
         .or_else(|| {
             let out = Command::new(&canon_bin)
+        .env("PATH", "/usr/bin:/bin")
                 .arg("--print-prefix")
                 .output()
                 .ok()?;
@@ -1141,6 +1127,111 @@ pub fn resolve_toolchain_compiler_with_trust(
     }
     Ok((canon_bin, githash, lib_lean, lib))
 }
+/// Absolute verifier tools from one installed toolchain. Never derive these from Lake's
+/// environment: Lake prepends project executable directories to PATH.
+#[derive(Clone, Debug)]
+pub(crate) struct ToolchainExecutables {
+    pub lean: PathBuf,
+    pub lake: PathBuf,
+    pub leanc: PathBuf,
+}
+
+impl ToolchainExecutables {
+    pub fn resolve(project: &Path, toolchain: &str) -> Result<Self> {
+        let project = lake_build::find_project_root(project);
+        let (lean, _, _, _) = resolve_toolchain_compiler_with_trust(&project, toolchain, true)?;
+        let tools = Self::from_lean(&lean)?;
+        let project = project.canonicalize()?;
+        for tool in [&tools.lean, &tools.lake, &tools.leanc] {
+            anyhow::ensure!(
+                !tool.starts_with(&project),
+                "Verifier executable `{}` is inside project: fail-closed toolchain gate",
+                tool.display()
+            );
+        }
+        Ok(tools)
+    }
+
+    pub fn from_lean(lean: &Path) -> Result<Self> {
+        anyhow::ensure!(
+            lean.is_absolute(),
+            "Verifier compiler `{}` must be absolute: fail-closed toolchain gate",
+            lean.display()
+        );
+        let lean = lean.canonicalize().with_context(|| {
+            format!(
+                "Missing verifier compiler `{}`: fail-closed toolchain gate",
+                lean.display()
+            )
+        })?;
+        let bin = lean
+            .parent()
+            .context("Missing verifier toolchain bin directory")?;
+        let sibling = |name: &str| -> Result<PathBuf> {
+            let path = bin.join(name);
+            let canonical = path.canonicalize().with_context(|| {
+                format!(
+                    "Missing required toolchain sibling `{}`: fail-closed toolchain gate",
+                    path.display()
+                )
+            })?;
+            anyhow::ensure!(
+                canonical.is_file() && canonical.parent() == Some(bin),
+                "Invalid toolchain sibling `{}`: fail-closed toolchain gate",
+                path.display()
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                anyhow::ensure!(
+                    canonical.metadata()?.permissions().mode() & 0o111 != 0,
+                    "Toolchain sibling `{}` is not executable: fail-closed toolchain gate",
+                    path.display()
+                );
+            }
+            Ok(canonical)
+        };
+        Ok(Self {
+            lake: sibling("lake")?,
+            leanc: sibling("leanc")?,
+            lean,
+        })
+    }
+
+    pub fn path(&self) -> String {
+        verifier_path(&self.lean)
+    }
+
+    pub fn apply_env(&self, env: &mut HashMap<String, String>) {
+        env.insert("PATH".into(), self.path());
+        for (name, path) in [
+            ("LEAN", &self.lean),
+            ("LAKE", &self.lake),
+            ("LEANC", &self.leanc),
+        ] {
+            env.insert(name.into(), path.to_string_lossy().into_owned());
+        }
+    }
+}
+
+/// Only the resolved toolchain and fixed system utilities, never caller/project bins.
+pub(crate) fn verifier_path(lean: &Path) -> String {
+    match lean.parent().filter(|p| p.is_absolute()) {
+        Some(bin) => format!("{}:/usr/bin:/bin", bin.display()),
+        None => "/usr/bin:/bin".into(),
+    }
+}
+
+/// Revalidate toolchain siblings and replace executable overrides after supplied envs.
+pub(crate) fn verifier_command(lean: &Path, env: &HashMap<String, String>) -> Result<Command> {
+    let tools = ToolchainExecutables::from_lean(lean)?;
+    let mut env = env.clone();
+    tools.apply_env(&mut env);
+    let mut command = Command::new(&tools.lean);
+    command.envs(env);
+    Ok(command)
+}
+
 /// Parse `lake-manifest.json` in `project_dir` if present. `packagesDir`, package names and
 /// `subDir` must stay inside the workspace; so must a `path` dependency's `dir` when
 /// `is_untrusted` (a trusted workspace may point one at a sibling checkout, as Lake allows).
@@ -4559,7 +4650,7 @@ pub fn resolve_project_config_with_trust(
         .unwrap_or_else(|_| project_dir.to_path_buf());
     let toolchain = lake_build::detect_toolchain(&canon_dir);
     let (lean_bin, lean_githash, toolchain_lib_lean, toolchain_lib) =
-        match resolve_toolchain_compiler_with_trust(&canon_dir, &toolchain, is_untrusted) {
+        match resolve_toolchain_compiler_with_trust(&canon_dir, &toolchain, true) {
             Ok(resolved) => resolved,
             Err(e) => {
                 let strict_tc = is_untrusted
@@ -4579,6 +4670,9 @@ pub fn resolve_project_config_with_trust(
                 )
             }
         };
+    if lean_bin.is_absolute() {
+        ToolchainExecutables::from_lean(&lean_bin)?;
+    }
     let root_pkg = resolve_package_config(&canon_dir, true)?;
     let (manifest_pkgs_dir, manifest_packages, manifest_hash_opt) =
         parse_lake_manifest(&canon_dir, is_untrusted)?;
@@ -8944,7 +9038,7 @@ impl Drop for ScopedTestBwrapOverride {
     }
 }
 
-pub(crate) fn probe_bwrap_sandbox() -> Option<PathBuf> {
+pub(crate) fn probe_bwrap_sandbox(project: &Path) -> Option<PathBuf> {
     #[cfg(test)]
     if let Some(test_bwrap) = TEST_BWRAP_BIN_OVERRIDE
         .with(|cell| cell.borrow().clone())
@@ -8960,13 +9054,17 @@ pub(crate) fn probe_bwrap_sandbox() -> Option<PathBuf> {
         }
         return None;
     }
-    let candidates = [
-        PathBuf::from("/usr/bin/bwrap"),
-        PathBuf::from("/bin/bwrap"),
-        PathBuf::from("bwrap"),
-    ];
-    for cand in candidates {
+    probe_bwrap_candidates(project, &["/usr/bin/bwrap", "/bin/bwrap"])
+}
+
+fn probe_bwrap_candidates(project: &Path, candidates: &[&str]) -> Option<PathBuf> {
+    for candidate in candidates {
+        let Ok(cand) = crate::trusted_tools::system_executable(Path::new(candidate), project)
+        else {
+            continue;
+        };
         let mut probe = Command::new(&cand);
+        probe.env_clear().env("PATH", "/usr/bin:/bin");
         probe.args([
             "--unshare-all",
             "--new-session",
@@ -8989,7 +9087,7 @@ pub(crate) fn probe_bwrap_sandbox() -> Option<PathBuf> {
             }
         }
         if probe
-            .arg("true")
+            .arg("/usr/bin/true")
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
@@ -8998,6 +9096,36 @@ pub(crate) fn probe_bwrap_sandbox() -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+#[test]
+fn unusable_system_sandbox_never_falls_back_to_project_bwrap() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let root = std::env::temp_dir().join(format!(
+        "turbo-bwrap-shim-{}-{}",
+        std::process::id(),
+        crate::pack::next_tmp_id()
+    ));
+    fs::create_dir_all(&root)?;
+    let shim = root.join("bwrap");
+    let marker = root.join("executed");
+    fs::write(
+        &shim,
+        format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+    )?;
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755))?;
+    assert!(Command::new(&shim).status()?.success());
+    fs::remove_file(&marker)?;
+    // An absolute, executable system candidate fails its probe; neither a bare
+    // PATH fallback nor an absolute checkout shim may replace it.
+    assert!(
+        probe_bwrap_candidates(&root, &["/usr/bin/false", "bwrap", shim.to_str().unwrap()])
+            .is_none()
+    );
+    assert!(!marker.exists());
+    fs::remove_dir_all(root)?;
+    Ok(())
 }
 
 fn canonicalize_path_with_missing_tail(p: &Path) -> Result<PathBuf> {
@@ -9238,6 +9366,7 @@ fn build_module_compile_command(
     } else {
         let mut c = Command::new(&cfg.lean_bin);
         c.current_dir(&node.pkg_root)
+            .env("PATH", verifier_path(&cfg.lean_bin))
             .env("LEAN_PATH", lean_path_env)
             .env("LD_LIBRARY_PATH", ld_library_path_env)
             .env("LEAN_STACK_SIZE_KB", &stack_kb);
@@ -9676,7 +9805,7 @@ pub fn build_project_modules_native(
     }
     let (lean_path_env, ld_library_path_env) = build_lean_search_path(&cfg, is_untrusted);
     let bwrap_bin = if is_untrusted {
-        probe_bwrap_sandbox()
+        probe_bwrap_sandbox(&canon_dir)
     } else {
         None
     };
