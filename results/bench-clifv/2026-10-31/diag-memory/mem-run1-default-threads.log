@@ -1,0 +1,22 @@
+cg=/sys/fs/cgroup/user.slice/user-995.slice/user@995.service/app.slice/sandboxed-node-2944b6e11730120f5a3a8bb5baaa2a47-job-8f56fce566de5f3fa344614f0521a400.scope max=17179869184 LEAN_NUM_THREADS=unset
+02:37:03 cur=2MiB peak=5MiB nlean=0 low 0 high 0 max 0 oom 0 oom_kill 0 oom_group_kill 0 
+02:37:14 cur=2214MiB peak=2223MiB nlean=8 low 0 high 0 max 0 oom 0 oom_kill 0 oom_group_kill 0 
+02:37:24 cur=3348MiB peak=3348MiB nlean=8 low 0 high 0 max 0 oom 0 oom_kill 0 oom_group_kill 0 
+02:37:34 cur=3213MiB peak=3496MiB nlean=8 low 0 high 0 max 0 oom 0 oom_kill 0 oom_group_kill 0 
+02:37:44 cur=3752MiB peak=3764MiB nlean=8 low 0 high 0 max 0 oom 0 oom_kill 0 oom_group_kill 0 
+02:37:54 cur=4576MiB peak=4578MiB nlean=8 low 0 high 0 max 0 oom 0 oom_kill 0 oom_group_kill 0 
+02:38:04 cur=5132MiB peak=5148MiB nlean=8 low 0 high 0 max 0 oom 0 oom_kill 0 oom_group_kill 0 
+02:38:15 cur=6176MiB peak=6181MiB nlean=8 low 0 high 0 max 0 oom 0 oom_kill 0 oom_group_kill 0 
+02:38:25 cur=7786MiB peak=7786MiB nlean=8 low 0 high 0 max 0 oom 0 oom_kill 0 oom_group_kill 0 
+02:38:35 cur=9692MiB peak=9692MiB nlean=8 low 0 high 0 max 0 oom 0 oom_kill 0 oom_group_kill 0 
+02:38:45 cur=11333MiB peak=11335MiB nlean=8 low 0 high 0 max 0 oom 0 oom_kill 0 oom_group_kill 0 
+02:38:55 cur=12933MiB peak=12934MiB nlean=8 low 0 high 0 max 0 oom 0 oom_kill 0 oom_group_kill 0 
+02:39:05 cur=14745MiB peak=14747MiB nlean=8 low 0 high 550 max 0 oom 0 oom_kill 0 oom_group_kill 0 
+02:39:16 cur=14745MiB peak=14749MiB nlean=8 low 0 high 2983 max 0 oom 0 oom_kill 0 oom_group_kill 0 
+02:39:26 cur=14745MiB peak=14751MiB nlean=8 low 0 high 12400 max 0 oom 0 oom_kill 0 oom_group_kill 0 
+02:39:36 cur=14745MiB peak=14752MiB nlean=8 low 0 high 26799 max 0 oom 0 oom_kill 0 oom_group_kill 0 
+02:39:47 cur=14745MiB peak=14752MiB nlean=8 low 0 high 43755 max 0 oom 0 oom_kill 0 oom_group_kill 0 
+02:39:57 cur=14748MiB peak=14753MiB nlean=8 low 0 high 58462 max 0 oom 0 oom_kill 0 oom_group_kill 0 
+02:40:07 cur=14747MiB peak=14754MiB nlean=8 low 0 high 73033 max 0 oom 0 oom_kill 0 oom_group_kill 0 
+02:40:18 cur=14746MiB peak=14754MiB nlean=8 low 0 high 88013 max 0 oom 0 oom_kill 0 oom_group_kill 0 
+02:40:28 cur=14745MiB peak=14754MiB nlean=8 low 0 high 102612 max 0 oom 0 oom_kill 0 oom_group_kill 0 

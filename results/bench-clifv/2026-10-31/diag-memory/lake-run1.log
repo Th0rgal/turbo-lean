@@ -1,0 +1,94 @@
+⚠ [44/232] Replayed FV.Clif.Run
+warning: FV/Clif/Run.lean:475:64: `if_true` has been deprecated: Use `ite_true` instead
+⚠ [108/232] Replayed FV.Arm.BitVec
+warning: FV/Arm/BitVec.lean:1026:2: `[deprecated]` attribute should specify the date or library version at which the deprecation was introduced, using `(since := "...")`
+⚠ [183/310] Replayed FV.Backend.Proof.AbiClass
+warning: FV/Backend/Proof/AbiClass.lean:373:10: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/AbiClass.lean:375:12: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/AbiClass.lean:375:23: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/AbiClass.lean:377:12: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/AbiClass.lean:377:23: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/AbiClass.lean:378:10: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/AbiClass.lean:378:20: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/AbiClass.lean:393:31: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/AbiClass.lean:397:31: `if_pos` has been deprecated: Use `ite_eq_left` instead
+✔ [186/4556] Built FV.Backend.Lowering.StockPrologue (3.5s)
+✔ [187/4556] Built FV.Backend.Lowering.StockScalarAdd (3.4s)
+✔ [188/4556] Built FV.Backend.ABIReadOnly (3.9s)
+✔ [208/4556] Built FV.Compile.SubsetTFIn (4.1s)
+⚠ [211/4556] Replayed FV.Backend.Proof.IselMemArm
+warning: FV/Backend/Proof/IselMemArm.lean:104:8: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselMemArm.lean:110:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselMemArm.lean:110:20: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselMemArm.lean:111:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselMemArm.lean:116:8: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselMemArm.lean:120:10: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselMemArm.lean:121:10: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselMemArm.lean:121:64: `if_pos` has been deprecated: Use `ite_eq_left` instead
+✔ [215/4556] Built FV.Backend.RegallocPerEdgeSpill (5.8s)
+✔ [217/4556] Built FV.Backend.Proof.SpillLocal (7.3s)
+✔ [219/4556] Built FV.Backend.Proof.DeadCleanupStructure (8.3s)
+✔ [224/4556] Built FV.Backend.Proof.PerEdgeVCodeSem (10s)
+✔ [227/4556] Built FV.Backend.Proof.RegallocState (18s)
+✔ [230/4556] Built FV.Backend.Proof.RelocProvDefs (8.7s)
+✔ [233/4556] Built FV.Backend.Regalloc (17s)
+✔ [236/4556] Built FV.Backend.Proof.EncodeBase (21s)
+✔ [238/4556] Built FV.Backend.Obj (21s)
+✔ [263/4556] Built FV.E2E.StockProductionFixtures (2.4s)
+✔ [264/4556] Built FV.E2E.StockNarrowFixtures (3.0s)
+✔ [265/4556] Built FV.E2E.StockLogicalFixtures (1.9s)
+✔ [271/4556] Built FV.E2E.StockNotFixtures (3.1s)
+ℹ [272/4556] Built FV.Backend.Proof.StockD0Source (4.2s)
+info: FV/Backend/Proof/StockD0Source.lean:92:0: 'Backend.Stock.D0.source_entry' depends on axioms: [propext, Quot.sound]
+info: FV/Backend/Proof/StockD0Source.lean:93:0: 'Backend.Stock.D0.source_return' depends on axioms: [propext]
+info: FV/Backend/Proof/StockD0Source.lean:94:0: 'Backend.Stock.D0.dirty_machine_bits' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: FV/Backend/Proof/StockD0Source.lean:95:0: 'Backend.Stock.D0.source_memory_roundtrip' depends on axioms: [propext, Quot.sound]
+info: FV/Backend/Proof/StockD0Source.lean:96:0: 'Backend.Stock.D0.source_complete_witness' depends on axioms: [propext, Classical.choice, Quot.sound]
+✔ [273/4556] Built FV.E2E.StockScalarFixtures (5.7s)
+✔ [274/4556] Built FV.Backend.Proof.StockPrologueAllSource (7.4s)
+✔ [275/4556] Built FV.Backend.Proof.StockScalarAddSource (7.9s)
+✔ [276/4556] Built FV.Backend.ABIReadFlags (2.6s)
+✔ [278/4556] Built FV.Backend.Lowering.StockProduction (3.1s)
+✔ [282/4556] Built FV.Backend.Proof.StockProjection (16s)
+ℹ [289/4556] Built FV.Backend.Proof.StockD0Edges (32s)
+info: FV/Backend/Proof/StockD0Edges.lean:12:0: '_private.FV.Backend.Proof.StockD0Edges.0.Backend.Stock.D0.collect_empty' depends on axioms: [propext]
+info: FV/Backend/Proof/StockD0Edges.lean:25:0: '_private.FV.Backend.Proof.StockD0Edges.0.Backend.Stock.D0.core_empty_outgoing' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+info: FV/Backend/Proof/StockD0Edges.lean:32:0: '_private.FV.Backend.Proof.StockD0Edges.0.Backend.Stock.D0.source_order' depends on axioms: [propext, Quot.sound]
+info: FV/Backend/Proof/StockD0Edges.lean:56:0: '_private.FV.Backend.Proof.StockD0Edges.0.Backend.Stock.D0.node_empty_outgoing' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+info: FV/Backend/Proof/StockD0Edges.lean:90:0: 'Backend.Stock.D0.stock_edges_empty' depends on axioms: [propext, Classical.choice, Quot.sound]
+⚠ [290/4556] Replayed FV.Opt.Proof.SemFacts
+warning: FV/Opt/Proof/SemFacts.lean:273:72: `dif_pos` has been deprecated: Use `dite_eq_left` instead
+⚠ [293/4556] Replayed FV.Opt.Proof.LegalMem
+warning: FV/Opt/Proof/LegalMem.lean:145:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalMem.lean:145:19: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalMem.lean:146:52: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalMem.lean:148:8: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalMem.lean:150:10: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalMem.lean:150:21: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalMem.lean:151:54: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalMem.lean:152:10: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalMem.lean:152:21: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalMem.lean:161:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalMem.lean:166:12: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalMem.lean:167:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalMem.lean:168:6: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalMem.lean:169:24: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalMem.lean:169:24: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalMem.lean:172:8: `if_neg` has been deprecated: Use `ite_eq_right` instead
+✔ [299/4556] Built FV.Backend.Proof.PerEdgePrepareUnsplitGraph (5.1s)
+✔ [300/4556] Built FV.Backend.Proof.StockForwardRpo (5.6s)
+✔ [301/4556] Built FV.Backend.Proof.StockSourceOrder (17s)
+✔ [302/4556] Built FV.Compile.SubsetTFArgs (2.5s)
+⚠ [303/4556] Built FV.Backend.Proof.PerEdgeSpillHomes (2.5s)
+warning: FV/Backend/Proof/PerEdgeSpillHomes.lean:43:8: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/PerEdgeSpillHomes.lean:89:8: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/PerEdgeSpillHomes.lean:100:59: `if_pos` has been deprecated: Use `ite_eq_left` instead
+✔ [304/4556] Built FV.Backend.Proof.SpillStep4Homes (2.7s)
+✔ [305/4556] Built FV.Backend.Proof.SpillLocalCheck (9.6s)
+✔ [306/4556] Built FV.Backend.Proof.SpillEdgesPrep (14s)
+✔ [307/4556] Built FV.Backend.Proof.DeadCleanupPositions (1.6s)
+✔ [308/4556] Built FV.Backend.Proof.DeadCleanupLive (6.5s)

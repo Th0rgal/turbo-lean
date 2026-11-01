@@ -1,0 +1,138 @@
+⚠ [10/857] Replayed FV.Clif.Run
+warning: FV/Clif/Run.lean:475:64: `if_true` has been deprecated: Use `ite_true` instead
+⚠ [103/857] Replayed FV.Arm.BitVec
+warning: FV/Arm/BitVec.lean:1026:2: `[deprecated]` attribute should specify the date or library version at which the deprecation was introduced, using `(since := "...")`
+⚠ [170/857] Replayed FV.Backend.Proof.AbiClass
+warning: FV/Backend/Proof/AbiClass.lean:373:10: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/AbiClass.lean:375:12: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/AbiClass.lean:375:23: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/AbiClass.lean:377:12: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/AbiClass.lean:377:23: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/AbiClass.lean:378:10: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/AbiClass.lean:378:20: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/AbiClass.lean:393:31: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/AbiClass.lean:397:31: `if_pos` has been deprecated: Use `ite_eq_left` instead
+⚠ [190/857] Replayed FV.Opt.Proof.SemFacts
+warning: FV/Opt/Proof/SemFacts.lean:273:72: `dif_pos` has been deprecated: Use `dite_eq_left` instead
+⚠ [191/857] Replayed FV.Backend.Proof.IselMemArm
+warning: FV/Backend/Proof/IselMemArm.lean:104:8: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselMemArm.lean:110:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselMemArm.lean:110:20: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselMemArm.lean:111:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselMemArm.lean:116:8: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselMemArm.lean:120:10: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselMemArm.lean:121:10: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselMemArm.lean:121:64: `if_pos` has been deprecated: Use `ite_eq_left` instead
+✔ [212/4556] Built FV.Backend.Proof.IselFlowTabF (155s)
+⚠ [234/4556] Replayed FV.Opt.Proof.LegalMem
+warning: FV/Opt/Proof/LegalMem.lean:145:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalMem.lean:145:19: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalMem.lean:146:52: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalMem.lean:148:8: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalMem.lean:150:10: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalMem.lean:150:21: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalMem.lean:151:54: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalMem.lean:152:10: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalMem.lean:152:21: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalMem.lean:161:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalMem.lean:166:12: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalMem.lean:167:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalMem.lean:168:6: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalMem.lean:169:24: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalMem.lean:169:24: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalMem.lean:172:8: `if_neg` has been deprecated: Use `ite_eq_right` instead
+✔ [277/4556] Built FV.Backend.Proof.IselOutBoundExt (5.3s)
+✔ [281/4556] Built FV.Backend.Proof.IselFlowTabT (170s)
+✔ [291/4556] Built FV.Backend.Proof.IselFlowData (10s)
+✔ [303/4556] Built FV.Backend.Proof.StockConditionalRankedFixture (102s)
+⚠ [305/4556] Replayed FV.Front.RenameStep
+warning: FV/Front/RenameStep.lean:254:32: `if_true` has been deprecated: Use `ite_true` instead
+warning: FV/Front/RenameStep.lean:255:52: `if_false` has been deprecated: Use `ite_false` instead
+⚠ [311/4556] Replayed FV.Opt.Proof.LegalExt
+warning: FV/Opt/Proof/LegalExt.lean:77:10: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalExt.lean:80:12: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalExt.lean:81:10: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalExt.lean:83:12: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalExt.lean:84:10: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalExt.lean:115:10: `if_neg` has been deprecated: Use `ite_eq_right` instead
+⚠ [318/4556] Replayed FV.Opt.Proof.SimpGraph
+warning: FV/Opt/Proof/SimpGraph.lean:382:40: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/SimpGraph.lean:530:26: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/SimpGraph.lean:578:26: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/SimpGraph.lean:585:39: `if_neg` has been deprecated: Use `ite_eq_right` instead
+✔ [334/4556] Built FV.Backend.Proof.IselPrgPat (22s)
+✔ [341/4556] Built FV.Backend.Proof.StockScan (50s)
+✔ [345/4556] Built FV.Backend.Proof.RelocProvTab (180s)
+ℹ [346/4556] Replayed FV.Backend.Proof.StockD0Edges
+info: FV/Backend/Proof/StockD0Edges.lean:12:0: '_private.FV.Backend.Proof.StockD0Edges.0.Backend.Stock.D0.collect_empty' depends on axioms: [propext]
+info: FV/Backend/Proof/StockD0Edges.lean:25:0: '_private.FV.Backend.Proof.StockD0Edges.0.Backend.Stock.D0.core_empty_outgoing' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+info: FV/Backend/Proof/StockD0Edges.lean:32:0: '_private.FV.Backend.Proof.StockD0Edges.0.Backend.Stock.D0.source_order' depends on axioms: [propext, Quot.sound]
+info: FV/Backend/Proof/StockD0Edges.lean:56:0: '_private.FV.Backend.Proof.StockD0Edges.0.Backend.Stock.D0.node_empty_outgoing' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+info: FV/Backend/Proof/StockD0Edges.lean:90:0: 'Backend.Stock.D0.stock_edges_empty' depends on axioms: [propext, Classical.choice, Quot.sound]
+ℹ [347/4556] Replayed FV.Backend.Proof.StockD0Source
+info: FV/Backend/Proof/StockD0Source.lean:92:0: 'Backend.Stock.D0.source_entry' depends on axioms: [propext, Quot.sound]
+info: FV/Backend/Proof/StockD0Source.lean:93:0: 'Backend.Stock.D0.source_return' depends on axioms: [propext]
+info: FV/Backend/Proof/StockD0Source.lean:94:0: 'Backend.Stock.D0.dirty_machine_bits' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: FV/Backend/Proof/StockD0Source.lean:95:0: 'Backend.Stock.D0.source_memory_roundtrip' depends on axioms: [propext, Quot.sound]
+info: FV/Backend/Proof/StockD0Source.lean:96:0: 'Backend.Stock.D0.source_complete_witness' depends on axioms: [propext, Classical.choice, Quot.sound]
+⚠ [361/4556] Replayed FV.E2E.LinkPlace
+warning: FV/E2E/LinkPlace.lean:98:36: `if_true` has been deprecated: Use `ite_true` instead
+⚠ [370/4556] Replayed FV.Link.Ld.WriteProof
+warning: FV/Link/Ld/WriteProof.lean:158:35: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Link/Ld/WriteProof.lean:165:35: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Link/Ld/WriteProof.lean:337:30: `if_neg` has been deprecated: Use `ite_eq_right` instead
+⚠ [371/4556] Built FV.Opt.Proof.LegalShift (135s)
+warning: FV/Opt/Proof/LegalShift.lean:64:10: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalShift.lean:64:20: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalShift.lean:65:10: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalShift.lean:65:20: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalShift.lean:90:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalShift.lean:90:18: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalShift.lean:92:8: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalShift.lean:92:18: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalShift.lean:99:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalShift.lean:99:18: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalShift.lean:101:8: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalShift.lean:101:18: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalShift.lean:122:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalShift.lean:123:8: `if_neg` has been deprecated: Use `ite_eq_right` instead
+✔ [374/4556] Built FV.Opt.Proof.RuleEmbed (33s)
+⚠ [377/4556] Replayed FV.Opt.Proof.SimpMat
+warning: FV/Opt/Proof/SimpMat.lean:173:45: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/SimpMat.lean:175:31: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/SimpMat.lean:183:28: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/SimpMat.lean:189:30: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/SimpMat.lean:191:31: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/SimpMat.lean:253:40: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/SimpMat.lean:267:30: `if_pos` has been deprecated: Use `ite_eq_left` instead
+✔ [388/4556] Built FV.Backend.Proof.IselPrgPC (9.9s)
+✔ [389/4556] Built FV.Backend.Proof.RelocProvExt (10s)
+⚠ [390/4556] Built FV.Backend.Proof.UnwindTables (6.9s)
+warning: FV/Backend/Proof/UnwindTables.lean:44:10: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/UnwindTables.lean:81:10: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/UnwindTables.lean:118:12: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/UnwindTables.lean:118:31: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/UnwindTables.lean:149:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/UnwindTables.lean:301:6: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/UnwindTables.lean:651:10: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/UnwindTables.lean:769:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/UnwindTables.lean:771:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+✔ [391/4556] Built FV.Backend.Proof.EncodeRES (1.0s)
+✔ [392/4556] Built FV.Backend.Proof.EncodeLDST (11s)
+✔ [393/4556] Built FV.Backend.Proof.EncodeDPSFP (31s)
+✔ [394/4556] Built FV.Backend.Proof.EncodeDPR (29s)
+✔ [395/4556] Built FV.Backend.Proof.EncodeBR (24s)
+✔ [396/4556] Built FV.Backend.Proof.EncodeDPI (8.2s)
+✔ [397/4556] Built FV.Backend.Proof.StockBackwardSuffixSplit (3.5s)
+✔ [398/4556] Built FV.Backend.Proof.StockForwardSourceOrder (1.9s)
+✔ [399/4556] Built FV.Backend.Proof.StockBlockScan (1.4s)
+✔ [400/4556] Built FV.Backend.Proof.StockPureHelperTransport (773ms)
+✔ [401/4556] Built FV.E2E.StockMulFixtures (387ms)
+✔ [402/4556] Built FV.E2E.StockConditionalCfgFixtures (498ms)
+✔ [403/4556] Built FV.E2E.StockCfgFixtures (483ms)
+✔ [404/4556] Built FV.E2E.StockMaskFixtures (480ms)
+✔ [405/4556] Built FV.E2E.StockDivFixtures (421ms)

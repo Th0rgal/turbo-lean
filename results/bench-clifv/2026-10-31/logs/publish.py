@@ -7,7 +7,7 @@ import json, re, shutil, statistics, subprocess, sys, datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-RUN = ROOT / "bench2"
+RUN = ROOT / "bench3"
 RES = RUN / "results"
 PUB = ROOT / "pub"
 DATE = "2026-10-31"
@@ -21,18 +21,17 @@ if (RES / "logs").exists():
 for extra in ("runner.log", "start.txt", "exit.txt"):
     if (RUN / extra).exists() and (DEST / "logs").exists():
         shutil.copy2(RUN / extra, DEST / "logs" / extra)
-# Attempt 1 (aborted, no pairs) is archived verbatim for provenance.
-A1 = DEST / "attempt1-aborted"
-if (ROOT / "bench" / "results").exists():
-    shutil.copytree(ROOT / "bench" / "results", A1, dirs_exist_ok=True)
-    shutil.copy2(ROOT / "bench" / "runner.log", A1 / "runner.log")
-    shutil.copy2(ROOT / "meta" / "run.sh", A1 / "run.sh")
-    shutil.copy2(ROOT / "meta" / "run2.sh", DEST / "logs" / "run2.sh")
-shutil.copy2(ROOT / "meta" / "load.log", DEST / "load.log")
-if (ROOT / "meta" / "cargo_build.log").exists():
-    (DEST / "logs").mkdir(exist_ok=True)
-    shutil.copy2(ROOT / "meta" / "cargo_build.log", DEST / "logs" / "turbo-lean-cargo-build.log")
-    shutil.copy2(ROOT / "meta" / "run.sh", DEST / "logs" / "run.sh")
+# Attempts 1 and 2 (aborted in the untimed stock prime, no pairs) are archived verbatim.
+for n, d, runsh in ((1, "bench", "run.sh"), (2, "bench2", "run2.sh")):
+    src = ROOT / d / "results"
+    if src.exists():
+        dst = DEST / f"attempt{n}-aborted"
+        shutil.copytree(src, dst, dirs_exist_ok=True)
+        shutil.copy2(ROOT / d / "runner.log", dst / "runner.log")
+        shutil.copy2(ROOT / "meta" / runsh, dst / runsh)
+shutil.copy2(ROOT / "meta" / "run3.sh", DEST / "logs" / "run3.sh") if (DEST / "logs").exists() else None
+if (ROOT / "diag").exists():
+    shutil.copytree(ROOT / "diag", DEST / "diag-memory", dirs_exist_ok=True)
 
 report = None
 schema_status = "no results.json yet (the runner writes it only after the first complete pair)"
@@ -150,13 +149,27 @@ if loads:
               f"on an {facts['nproc']}-thread host. Other tenants' Lean builds, rustc and agent processes were running "
               "throughout (see load.log); the host was **not idle** as BENCH_CLIFV.md requires."]
 lines.append("")
-lines += ["## Attempt 1 (aborted, no measurements)", "",
-          "The first runner invocation started 2026-10-31T22:04:31Z (`attempt1-aborted/`). It was killed by a signal "
-          "while still in the untimed stock `lake build FV` prime, at module 288/4556, about 11 minutes in; the runner "
-          "logged `bench_clifv: interrupted` and wrote `status: aborted` with zero pairs. I did not send the signal. The "
-          "detached `nohup setsid` process (and the load sampler) apparently did not survive the end of the agent "
-          "turn on this node. Attempt 2 is identical (same binary, SHAs and flags) but runs as a durable node workspace "
-          "job with fresh work/output dirs (`logs/run2.sh`). Attempt 1 contributes no numbers.", ""]
+lines += ["## Aborted attempts 1 and 2 (no measurements) and the memory limit", "",
+          "Attempt 1 (2026-10-31T22:04Z, `attempt1-aborted/`) and attempt 2 (2026-11-01T00:00Z, "
+          "`attempt2-aborted/`) used identical flags with default parallelism (LEAN_NUM_THREADS unset, "
+          "lake default = 8 jobs). Both died about 11-12 minutes in, while still in the **untimed** stock "
+          "`lake build FV` prime, at modules 288/4556 and 375/4556. Attempt 1 logged `bench_clifv: "
+          "interrupted`, i.e. it got a signal. Attempt 2 ran as a durable node job; the node later reported it "
+          "`failed` with the whole process tree gone and no exit file. Neither run produced a pair.", "",
+          "Cause found (`diag-memory/`, diagnostics only, outside the experiment): this node runs every job "
+          "in a systemd scope with `memory.max` = 16 GiB, `memory.high` about 14.4 GiB and swap 0 "
+          "(`SANDBOXED_NODE_JOB_MEMORY_BYTES=17179869184`). Resuming the same stock prime with default "
+          "parallelism (8 concurrent `lean` processes) hit the 14.4 GiB `memory.high` throttle within "
+          "2 minutes. `memory.events` showed `high` rising to more than 100k, and the build stalled at "
+          "14.7 GiB. The node agent binary contains the message \"a child process also exceeded this job's "
+          "memory budget\". The node agent killing over-budget jobs is the most likely cause of both "
+          "aborts; this is inferred, since the kernel/journal logs are not readable from here. clifv modules reach 1-6 GiB RSS each. With `LEAN_NUM_THREADS=4` (4 lean procs) the "
+          "cgroup peak was still 14.6 GiB, i.e. at the throttle line.", "",
+          "**Attempt 3 (this report)** therefore exports `LEAN_NUM_THREADS=3 TURBO_LEAN_JOBS=3 "
+          "TURBO_LEAN_MAX_MEMORY_MB=14336` for **both arms** (`logs/run3.sh`). The runner records "
+          "LEAN_NUM_THREADS. Lake's module-job parallelism follows LEAN_NUM_THREADS (observed: 4 "
+          "concurrent `lean` processes with LEAN_NUM_THREADS=4 vs 8 unset); turbo-lean's follows TURBO_LEAN_JOBS. These are not stock 8-thread numbers: they "
+          "measure a 3-way-parallel build under a 16 GiB cap.", ""]
 lines += ["## Interpretation", "", (facts.get("interpretation") or
           "Pending completion. No speedup claim is made in this file unless the runner's ratio gate allows one."), ""]
 (DEST / "README.md").write_text("\n".join(lines))
