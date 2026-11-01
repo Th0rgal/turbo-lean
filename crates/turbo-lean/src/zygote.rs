@@ -6553,7 +6553,12 @@ mod tests {
             ),
             ("LEAN_PATH".to_string(), dir.display().to_string()),
         ]);
-        let prefix = Command::new("lean")
+        let lean = crate::module_builder::ToolchainExecutables::resolve(
+            &dir,
+            "leanprover/lean4:v4.35.0",
+        )?
+        .lean;
+        let prefix = Command::new(&lean)
             .arg("--print-prefix")
             .envs(&env)
             .output()?;
@@ -6563,7 +6568,7 @@ mod tests {
             "LD_LIBRARY_PATH".into(),
             format!("{prefix}/lib/lean:{prefix}/lib"),
         );
-        let auditor = ensure_zygote_binary(&store, Path::new("lean"), &env)?;
+        let auditor = ensure_zygote_binary(&store, &lean, &env)?;
         let bad = include_str!("../tests/fixtures/weakening-options/Bad.lean").replace(
             "import Lean\n",
             "import Lean\nset_option debug.skipKernelTC true\n",
@@ -6583,7 +6588,7 @@ mod tests {
             let file = dir.join(format!("{module}.lean"));
             let olean = file.with_extension("olean");
             fs::write(&file, source)?;
-            let compiled = Command::new("lean")
+            let compiled = Command::new(&lean)
                 .envs(&env)
                 .arg("-Ddebug.skipKernelTC=false")
                 .arg("-R")
@@ -6625,7 +6630,7 @@ mod tests {
                 &file,
                 format!("import Lean\ntheorem good{module} : True := True.intro\n"),
             )?;
-            let compiled = Command::new("lean")
+            let compiled = Command::new(&lean)
                 .envs(&env)
                 .arg("-R")
                 .arg(&dir)

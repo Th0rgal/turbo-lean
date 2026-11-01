@@ -8751,6 +8751,88 @@ pub(crate) fn verify_imported_package_module_source_hygiene(
     }
     let Some(spec) = specs.into_iter().next() else {
         if belongs_to_pkg {
+            // Standalone root-package `.lean` files outside Lake library/exe globs (e.g.
+            // `TurboLean.lean` alongside `TurboLean.+`, or auxiliary scripts compiled by
+            // `stock_statement_build`) still resolve unambiguously under a root-package source dir.
+            let canon_root_lib = cfg
+                .root_pkg
+                .pkg_root
+                .join(&cfg.root_pkg.build_dir)
+                .join(&cfg.root_pkg.lean_lib_dir)
+                .canonicalize()
+                .unwrap_or_else(|_| {
+                    cfg.root_pkg
+                        .pkg_root
+                        .join(&cfg.root_pkg.build_dir)
+                        .join(&cfg.root_pkg.lean_lib_dir)
+                });
+            let canon_root_pkg = cfg
+                .root_pkg
+                .pkg_root
+                .canonicalize()
+                .unwrap_or_else(|_| cfg.root_pkg.pkg_root.clone());
+            let canon_packages = cfg
+                .root_pkg
+                .pkg_root
+                .join(&cfg.root_pkg.packages_dir)
+                .canonicalize()
+                .unwrap_or_else(|_| cfg.root_pkg.pkg_root.join(&cfg.root_pkg.packages_dir));
+            if canon_olean.starts_with(&canon_root_lib)
+                || (canon_olean.starts_with(&canon_root_pkg)
+                    && !canon_olean.starts_with(&canon_packages))
+            {
+                let rel_slash = module_name_to_rel_slash(mod_name);
+                let base = cfg.root_pkg.pkg_root.join(&cfg.root_pkg.src_dir);
+                let mut roots = vec![base.clone()];
+                roots.extend(
+                    cfg.root_pkg
+                        .libs
+                        .iter()
+                        .filter_map(|l| l.src_dir.as_ref())
+                        .map(|d| base.join(d)),
+                );
+                roots.extend(
+                    cfg.root_pkg
+                        .exes
+                        .iter()
+                        .filter_map(|e| e.src_dir.as_ref())
+                        .map(|d| base.join(d)),
+                );
+                roots.sort();
+                roots.dedup();
+                let cands: Vec<PathBuf> = roots
+                    .into_iter()
+                    .map(|r| r.join(format!("{rel_slash}.lean")))
+                    .filter(|p| p.is_file())
+                    .collect();
+                if cands.len() == 1 {
+                    let standalone_src = &cands[0];
+                    let src = fs::read_to_string(standalone_src).with_context(|| {
+                        format!(
+                            "Failed to read `.lean` source `{}` for imported module `{mod_name}`: fail-closed",
+                            standalone_src.display()
+                        )
+                    })?;
+                    let hygiene = splitter::audit_hygiene(&splitter::strip_lean_comments(&src));
+                    anyhow::ensure!(
+                        !hygiene.has_checking_weakening,
+                        "Soundness hygiene violation in imported module `{mod_name}` ({}): {:?}",
+                        standalone_src.display(),
+                        hygiene.disallowed_items_under(allowed_axioms)
+                    );
+                    anyhow::ensure!(
+                        !hygiene.native_violation_under(allowed_axioms),
+                        "[TurboLean.KernelGate] native_decide/bv_decide in imported module `{mod_name}` ({}) is not admitted by the project's axiom allowlist",
+                        standalone_src.display()
+                    );
+                    anyhow::ensure!(
+                        !hygiene.has_trust_compiler,
+                        "Soundness hygiene violation (trustCompiler) in imported module `{mod_name}` ({})",
+                        standalone_src.display()
+                    );
+                    return Ok(());
+                }
+            }
             anyhow::bail!(
                 "Workspace/dependency `.olean` `{}` for imported module `{mod_name}` has no resolvable `.lean` source in project or dependency packages: fail-closed",
                 olean_path.display()

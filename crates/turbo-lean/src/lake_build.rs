@@ -2692,6 +2692,7 @@ pub(crate) fn lake_recheck_dependents(
             lake_build_modules(canon_dir, &mods, rev)?;
             Ok((mods.len(), files, mods))
         }
+        (Some(_), Some(_)) => Ok((0, Vec::new(), Vec::new())),
         _ => {
             lake_build_modules(canon_dir, &libs, rev)?;
             let files = collect_project_lean_files(canon_dir, false, None);
@@ -2739,7 +2740,8 @@ pub(crate) fn untrusted_recheck_dependents(
             let n = mods.len();
             (mods, n)
         }
-        _ => (libs, 0),
+        Some(_) => return Ok(0),
+        None => (libs, 0),
     };
     crate::module_builder::build_project_modules_native(
         store,
