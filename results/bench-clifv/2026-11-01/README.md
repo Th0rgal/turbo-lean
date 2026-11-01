@@ -1,6 +1,6 @@
 # clifv paired benchmark (A0e) — vast.ai dedicated VM (`rtx4090-a`), 2026-11-01
 
-Status: **running / approaching 720-min managed-VM hard lifetime cap (`2026-11-01T17:45:42Z`)** — Attempt 2 (`--scenarios cold,warm --pairs 1` at `LEAN_NUM_THREADS=6` / `TURBO_LEAN_JOBS=6`) is in untimed `prime-lake: stock` (`989/4556` steps completed, **0 OOMs** in Attempt 2) after Attempt 1 (`LEAN_NUM_THREADS=12` / `TURBO_LEAN_JOBS=12`) hit the 60.13 GiB cgroup limit at step `3470/4556`. **No complete timed pair was reached; result is INCONCLUSIVE (0 pairs, speedup claim disallowed).**
+Status: **stopped at 720-min managed-VM hard lifetime cap (`2026-11-01T17:45:42Z`)** — Attempt 2 (`--scenarios cold,warm --pairs 1` at `LEAN_NUM_THREADS=6` / `TURBO_LEAN_JOBS=6`) reached `1104/4556` steps (`1038` modules built, **0 OOMs** in Attempt 2) in untimed `prime-lake: stock` after Attempt 1 (`LEAN_NUM_THREADS=12` / `TURBO_LEAN_JOBS=12`) hit the 60.13 GiB cgroup limit at step `3470/4556`. **No complete timed pair was reached; result is INCONCLUSIVE (0 pairs, speedup claim disallowed).**
 
 ## Provenance
 
