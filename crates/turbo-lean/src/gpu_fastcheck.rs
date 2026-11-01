@@ -4905,7 +4905,7 @@ pub fn evaluate_agent_step_value(
                 let sp = crate::splitter::split_lean_source(&src_text, &dep_hashes);
                 if let Some(ref st_path) = st_path_opt {
                     let entry = crate::lake_build::ShmCachedFileSplit {
-                        split_key: format!("file-split:v10:{}", src_b3),
+                        split_key: format!("file-split:v11:{}", src_b3),
                         src_blake3: src_b3,
                         split: crate::lake_build::compact_split_for_shm_cache(&sp),
                         prefix_src: if src_text.len() <= 64 * 1024 {
@@ -5136,7 +5136,16 @@ pub fn evaluate_agent_step_value(
                     }
                 }
                 if all_attested {
-                    crate::lake_build::recheck_dependents_if_nonlocal(&canon_dir, &resolved_file)?;
+                    crate::module_builder::ensure_imported_oleans_replayed(
+                        store,
+                        &canon_dir,
+                        std::slice::from_ref(&resolved_file),
+                    )?;
+                    crate::lake_build::recheck_dependents_if_nonlocal(
+                        store,
+                        &canon_dir,
+                        &resolved_file,
+                    )?;
                     let elapsed_ms =
                         (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
                     let first_shard = target_shards[0];
