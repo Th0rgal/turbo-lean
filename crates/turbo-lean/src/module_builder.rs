@@ -11062,6 +11062,38 @@ lean_exe «demo-exe» where
 
     #[cfg(unix)]
     #[test]
+    fn test_untrusted_ci_cold_full_cache_recompiles_source() -> Result<()> {
+        use crate::worktree_test_support::LakeTree;
+        let _guard = crate::pack::tests::env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tree = LakeTree::new("cold_ci", &[("P/A.lean", "theorem a : True := trivial\n")])?;
+        let mut store = TurboStore::open(Some(&tree.project.join(".source-cache")))?;
+        let run = |store: &mut TurboStore| crate::pr_verify::run_ci_verify_command(
+            store, true, "untrusted".into(), tree.project.clone(), None, None, false, None,
+        );
+        match run(&mut store) {
+            Ok(_) => {
+                let count: i64 = store.conn.query_row(
+                    "SELECT count(*) FROM actions WHERE kind = 'module_full' AND status = 'completed'",
+                    [], |r| r.get(0),
+                )?;
+                assert!(count > 0, "fixture must publish a full-project cache entry");
+                let target = tree.project.join("P/A.lean");
+                SOURCE_COMPILATION_MEMORY.get().unwrap().lock().unwrap()
+                    .remove(&(store.root.canonicalize()?, target.canonicalize()?));
+                assert!(!source_compilation_authorized_with_trust(&store, &tree.project, &target, true));
+                run(&mut store)?;
+                require_source_compilations(&store, &tree.project, &[target], true)?;
+            }
+            Err(err) => {
+                assert!(probe_bwrap_sandbox().is_none(), "{err:#}");
+                assert!(format!("{err:#}").contains("fail-closed sandbox gate"), "{err:#}");
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn test_root_freshness_manifests_cannot_authorize_ci_or_fast_checks() -> Result<()> {
         use crate::worktree_test_support::{LakeTree, FORGED_DEPENDENCY_SOURCE};
         let _guard = crate::pack::tests::env_test_lock()

@@ -2814,8 +2814,15 @@ pub fn run_ci_verify_command(
         crate::module_builder::require_source_compilations(store_ref, &canon_dir, &lean_paths, is_untrusted)
     };
 
+    // Cached artifacts do not attest to compilation of this checkout's source.
+    // A cold untrusted verifier must compile inside bwrap rather than accept a
+    // module_full hit (including a singleflight hit) and then fail its source gate.
+    let allow_full_cache = !is_untrusted
+        || crate::module_builder::require_source_compilations(
+            store, &canon_dir, &lean_paths, true,
+        ).is_ok();
     let (build_status, _resolved_env_opt) = if let Some(outputs) =
-        store.get_cached_action(&action_key, &trust_domain)?
+        store.get_cached_action(&action_key, &trust_domain)?.filter(|_| allow_full_cache)
     {
         store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
         audit_materialized(store)?;
@@ -2838,7 +2845,7 @@ pub fn run_ci_verify_command(
             && crate::module_builder::require_source_compilations(store, &canon_dir, &lean_paths, is_untrusted)
                 .is_ok();
         let mut singleflight_hit_status: Option<String> = None;
-        let lease_opt = if oleans_up_to_date {
+        let lease_opt = if oleans_up_to_date || !allow_full_cache {
             None
         } else {
             match store.acquire_singleflight(
