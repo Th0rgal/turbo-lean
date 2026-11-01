@@ -265,4 +265,148 @@ def buildExeGateContract : Bool :=
 -- REGRESSION(build_exe_llvm_gate_fail_closed)
 #guard buildExeGateContract
 
+/-! ## C1.1 / C4.2 SymbolicTV write-space separation (`objFields` vs `scalarFields` vs `ctorTag`) -/
+
+/-- Guard an external `.objPtr` parameter (`id = 0`) with `isExclusive` and rare `x == 999` (`id = 1`)
+    so concrete sampling hits the defined exclusive path on small seeds while `999` exercises the
+    in-place mutation path symbolically without returning the mutated object. -/
+def extRareExclGuard (mutBody : LNIRCode) : LNIRCode :=
+  .letBind 10 .i1 (.isExclusive 0)
+    (.ite 10
+      (.letBind 11 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+        (.ite 11 mutBody retZero))
+      retZero)
+
+def objAndScalarSlot0Decl (dropFirst : Bool) (scalarFirst : Bool) : LNIRDecl :=
+  let writeObj : LNIRCode → LNIRCode := fun k =>
+    .letBind 13 .unit (.call "lean_native_ctor_set" [0, 12, 2] .unit) k
+  let writeScalar : LNIRCode → LNIRCode := fun k =>
+    .letBind 14 .unit (.call "lean_native_ctor_set_scalar" [0, 12, 3] .unit) k
+  let mutSeq : LNIRCode :=
+    if scalarFirst then
+      if dropFirst then writeObj retZero else writeScalar (writeObj retZero)
+    else
+      if dropFirst then writeScalar retZero else writeObj (writeScalar retZero)
+  { name := "ctor_write_spaces"
+    params := [ { id := 0, name := "o", ty := .objPtr }
+              , { id := 1, name := "x", ty := .i64 }
+              , { id := 2, name := "child", ty := .objPtr }
+              , { id := 3, name := "sc", ty := .i64 } ]
+    retTy := .i64
+    body := .letBind 12 .i64 (.scalar (.constU64 0)) (extRareExclGuard mutSeq) }
+
+/-- C1.1/C4.2: `ctor_set` on object slot `0` and `ctor_set_scalar` on scalar slot `0` mutate disjoint
+    index spaces; dropping either write in either order must fail `memWritesEquiv`, while commuting the
+    two independent slot-`0` writes on the same exclusive object must validate! -/
+def ctorWriteSpaceSeparationContract : Bool :=
+  let bothObjThenSc := objAndScalarSlot0Decl false false
+  let onlySc := objAndScalarSlot0Decl true false
+  let bothScThenObj := objAndScalarSlot0Decl false true
+  let onlyObj := objAndScalarSlot0Decl true true
+  let rDropObj := validateTranslationDecl bothObjThenSc onlySc
+  let rDropSc := validateTranslationDecl bothScThenObj onlyObj
+  let rCommute := validateTranslationDecl bothObjThenSc bothScThenObj
+  !rDropObj.memWritesEquiv && !rDropObj.passed &&
+  !rDropSc.memWritesEquiv && !rDropSc.passed &&
+  rCommute.memWritesEquiv && rCommute.passed
+
+-- REGRESSION(symtv_ctor_obj_vs_scalar_write_space_disjoint)
+#guard ctorWriteSpaceSeparationContract
+
+def setTagSideEffectDecl (tagVal : UInt64) (doSetTag : Bool) (requireExcl : Bool := true) : LNIRDecl :=
+  let tagWrite : LNIRCode :=
+    .letBind 12 .i64 (.scalar (.constU64 tagVal))
+      (.letBind 13 .unit (.call "lean_native_ctor_set_tag" [0, 12] .unit) retZero)
+  let body : LNIRCode :=
+    if !doSetTag then
+      if requireExcl then extRareExclGuard retZero else retZero
+    else if requireExcl then
+      extRareExclGuard tagWrite
+    else
+      .letBind 11 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999))) (.ite 11 tagWrite retZero)
+  { name := "ctor_set_tag_tv"
+    params := [{ id := 0, name := "o", ty := .objPtr }, { id := 1, name := "x", ty := .i64 }]
+    retTy := .i64
+    body := body }
+
+def setTagThenReadDecl (useConst : Bool) : LNIRDecl :=
+  { name := "ctor_set_tag_read"
+    params := [{ id := 0, name := "x", ty := .i64 }]
+    retTy := .i64
+    body :=
+      .letBind 1 .objPtr (.allocCtor 2 [] [0])
+        (.letBind 2 .i64 (.scalar (.constU64 7))
+          (.letBind 3 .unit (.call "lean_native_ctor_set_tag" [1, 2] .unit)
+            (.letBind 4 .i64 (if useConst then .scalar (.constU64 7) else .call "lean_native_ctor_tag" [1] .i64)
+              (.letBind 5 .i64 (.ctorGetScalar 1 0 .i64)
+                (.letBind 6 .i64 (.scalar (.binOp .add (.var 4) (.var 5)))
+                  (.decRef 1 1 (.ret 6))))))) }
+
+/-- C4.2: `lean_native_ctor_set_tag` is modeled in `SymbolicTV` without `symUnsupported`, distinguishes
+    unreturned tag mutations via `.ctorTag` write space, rejects unguarded non-exclusive target `setTag`
+    (`ubRefines = false`), and folds subsequent `lean_native_ctor_tag` reads while preserving fields. -/
+def symtvSetTagContract : Bool :=
+  let set7 := setTagSideEffectDecl 7 true true
+  let set9 := setTagSideEffectDecl 9 true true
+  let noop := setTagSideEffectDecl 7 false true
+  let unguardedSet7 := setTagSideEffectDecl 7 true false
+  let plainNoop := setTagSideEffectDecl 7 false false
+  let rSame := validateTranslationDecl set7 set7
+  let rDrop := validateTranslationDecl set7 noop
+  let rDiffTag := validateTranslationDecl set7 set9
+  let rExcl := validateTranslationDecl plainNoop unguardedSet7
+  let rFold := validateTranslationDecl (setTagThenReadDecl false) (setTagThenReadDecl true)
+  rSame.passed &&
+  !rDrop.memWritesEquiv && !rDrop.passed &&
+  !rDiffTag.memWritesEquiv && !rDiffTag.passed &&
+  !rExcl.ubRefines && !rExcl.passed &&
+  rFold.passed
+
+-- REGRESSION(symtv_ctor_set_tag_modeled_and_tracked)
+#guard symtvSetTagContract
+
+def nullarySetTagDecl : LNIRDecl :=
+  { name := "nullary_set_tag"
+    params := [{ id := 0, name := "x", ty := .i64 }]
+    retTy := .i64
+    body :=
+      .letBind 1 .objPtr (.allocCtor 0 [] [])
+        (.letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+          (.ite 2
+            (.letBind 3 .i64 (.scalar (.constU64 5))
+              (.letBind 4 .unit (.call "lean_native_ctor_set_tag" [1, 3] .unit) retZero))
+            retZero)) }
+
+def symtvNullarySetTagIsUB : Bool :=
+  let noop : LNIRDecl := { nullarySetTagDecl with body := retZero }
+  let r := validateTranslationDecl noop nullarySetTagDecl
+  !r.ubRefines && !r.passed
+
+-- REGRESSION(symtv_nullary_ctor_set_tag_ub)
+#guard symtvNullarySetTagIsUB
+
+def extSetTagInBranchDecl (tagVal : UInt64) : LNIRDecl :=
+  { name := "ext_set_tag_branch"
+    params := [{ id := 0, name := "o", ty := .objPtr }, { id := 1, name := "c", ty := .i64 }]
+    retTy := .i64
+    body :=
+      .letBind 2 .i1 (.isExclusive 0)
+        (.ite 2
+          (.letBind 3 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 1)))
+            (.ite 3
+              (.letBind 4 .i64 (.scalar (.constU64 tagVal))
+                (.letBind 5 .unit (.call "lean_native_ctor_set_tag" [0, 4] .unit) retZero))
+              retZero))
+          retZero) }
+
+def symtvExtBranchSetTagTracked : Bool :=
+  let d1 := extSetTagInBranchDecl 3
+  let d2 := extSetTagInBranchDecl 4
+  let rDiff := validateTranslationDecl d1 d2
+  let rSame := validateTranslationDecl d1 d1
+  !rDiff.memWritesEquiv && !rDiff.passed && rSame.passed
+
+-- REGRESSION(symtv_ext_branch_ctor_set_tag_tracked)
+#guard symtvExtBranchSetTagTracked
+
 end LeanNative.Tests.HeapObj5b
