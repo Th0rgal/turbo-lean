@@ -143,85 +143,91 @@ pub(crate) fn resolve_git_head_sha(repo_root: &Path, base_ref: &str) -> Option<S
     }
 }
 
+/// Contents at `base_ref` of each path in `repo_rels` present in that revision's tree.
+/// Paths are resolved to object ids from the tree first, so an absent path (new file) is
+/// distinguishable from a missing object (e.g. a promised blob in a partial clone, which
+/// the trusted Git wrapper never lazily fetches): the latter is a hard error.
 pub(crate) fn fetch_git_blobs_batch(
     repo_root: &Path,
     base_ref: &str,
     repo_rels: &[String],
 ) -> Result<std::collections::HashMap<String, String>> {
+    use std::io::{BufRead, BufReader, Read, Write};
     let mut out_map = std::collections::HashMap::with_capacity(repo_rels.len());
     if repo_rels.is_empty() {
         return Ok(out_map);
     }
-    if repo_rels.len() == 1 {
-        let repo_rel = &repo_rels[0];
-        let show_out = crate::trusted_tools::git(repo_root)?
-            .args([
-                "-C",
-                &repo_root.to_string_lossy(),
-                "show",
-                &format!("{}:{}", base_ref, repo_rel),
-            ])
-            .output()
-            .context("Failed to execute `git show`")?;
-        if show_out.status.success() {
-            out_map.insert(
-                repo_rel.clone(),
-                String::from_utf8_lossy(&show_out.stdout).to_string(),
-            );
+    anyhow::ensure!(!base_ref.starts_with('-'), "Invalid git revision `{base_ref}`");
+    let wanted: std::collections::HashSet<&str> = repo_rels.iter().map(String::as_str).collect();
+    let tree = crate::trusted_tools::git(repo_root)?
+        .arg("-C")
+        .arg(repo_root)
+        .args(["ls-tree", "-r", "-z", "--full-tree", base_ref, "--"])
+        .output()
+        .context("Failed to execute `git ls-tree`")?;
+    anyhow::ensure!(
+        tree.status.success(),
+        "Cannot read Git tree at `{base_ref}`: {}",
+        String::from_utf8_lossy(&tree.stderr).trim()
+    );
+    let mut blobs = Vec::new();
+    for entry in tree.stdout.split(|&b| b == 0).filter(|e| !e.is_empty()) {
+        let Some(tab) = entry.iter().position(|&b| b == b'\t') else {
+            anyhow::bail!("Invalid Git tree entry at `{base_ref}`");
+        };
+        let path = String::from_utf8_lossy(&entry[tab + 1..]);
+        if !wanted.contains(path.as_ref()) {
+            continue;
         }
+        let header = std::str::from_utf8(&entry[..tab])?;
+        let fields: Vec<_> = header.split(' ').collect();
+        anyhow::ensure!(fields.len() == 3, "Invalid Git tree header: {header}");
+        if fields[1] == "blob" {
+            blobs.push((path.into_owned(), fields[2].to_owned()));
+        }
+    }
+    if blobs.is_empty() {
         return Ok(out_map);
     }
-
     let mut git = crate::trusted_tools::git(repo_root)?;
     let mut child = git
-        .args(["-C", &repo_root.to_string_lossy(), "cat-file", "--batch"])
+        .arg("-C")
+        .arg(repo_root)
+        .args(["cat-file", "--batch"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
         .context("Failed to spawn `git cat-file --batch`")?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        let mut req_buf = String::new();
-        for r in repo_rels {
-            req_buf.push_str(base_ref);
-            req_buf.push(':');
-            req_buf.push_str(r);
-            req_buf.push('\n');
+    let mut input = child.stdin.take().context("Missing Git batch stdin")?;
+    let request: String = blobs.iter().map(|(_, oid)| format!("{oid}\n")).collect();
+    let writer = std::thread::spawn(move || input.write_all(request.as_bytes()));
+    let result = (|| -> Result<()> {
+        let mut output = BufReader::new(child.stdout.take().context("Missing Git batch stdout")?);
+        for (path, oid) in &blobs {
+            let mut header = String::new();
+            output.read_line(&mut header)?;
+            let fields: Vec<_> = header.trim_end().split(' ').collect();
+            anyhow::ensure!(
+                fields.len() == 3 && fields[0] == oid && fields[1] == "blob",
+                "Git object {oid} for `{path}` at `{base_ref}` is missing or invalid \
+                 (lazy fetching is disabled): fail-closed"
+            );
+            let size: usize = fields[2].parse()?;
+            let mut bytes = vec![0; size + 1];
+            output.read_exact(&mut bytes)?;
+            anyhow::ensure!(bytes.pop() == Some(b'\n'), "Invalid Git batch terminator");
+            out_map.insert(path.clone(), String::from_utf8_lossy(&bytes).into_owned());
         }
-        let _ = stdin.write_all(req_buf.as_bytes());
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = child.kill();
     }
-
-    let out = child
-        .wait_with_output()
-        .context("Failed waiting on `git cat-file --batch`")?;
-    if out.status.success() {
-        let bytes = &out.stdout;
-        let mut pos = 0usize;
-        for repo_rel in repo_rels {
-            let Some(nl_rel) = bytes[pos..].iter().position(|&b| b == b'\n') else {
-                break;
-            };
-            let header = String::from_utf8_lossy(&bytes[pos..pos + nl_rel]);
-            pos += nl_rel + 1;
-            let parts: Vec<&str> = header.split_whitespace().collect();
-            if parts.len() >= 3 && parts[1] == "blob" {
-                if let Ok(sz) = parts[2].parse::<usize>() {
-                    if pos + sz <= bytes.len() {
-                        let content = String::from_utf8_lossy(&bytes[pos..pos + sz]).to_string();
-                        out_map.insert(repo_rel.clone(), content);
-                        pos += sz;
-                        if pos < bytes.len() && bytes[pos] == b'\n' {
-                            pos += 1;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-            }
-        }
-    }
+    let status = child.wait()?;
+    let _ = writer.join();
+    result?;
+    anyhow::ensure!(status.success(), "Git batch object read failed");
     Ok(out_map)
 }
 
@@ -1279,7 +1285,7 @@ fn base_revision_package_config(
     let sha = match resolve_git_head_sha(repo_root, base_ref) {
         Some(sha) => sha,
         None => {
-            let out = Command::new("git")
+            let out = crate::trusted_tools::git(repo_root)?
                 .arg("-C")
                 .arg(repo_root)
                 .args(["rev-parse", "--verify", "--end-of-options"])
@@ -1762,6 +1768,8 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                         "-C",
                         &repo_ref.to_string_lossy(),
                         "diff",
+                        "--no-ext-diff",
+                        "--no-textconv",
                         "--name-only",
                         base_ref,
                         "--",
@@ -3103,7 +3111,12 @@ struct StatementPolicy {
 
 impl StatementPolicy {
     fn at(project: &Path, base: &str) -> Self {
-        let config = splitter::read_project_config(project, Some(base)).unwrap_or_default();
+        // An unreadable base config falls back to the restrictive default; the CLI has already
+        // rejected it while loading the same policy at startup.
+        let config = splitter::read_project_config(project, Some(base))
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         Self {
             axioms: splitter::allowed_axioms_with_extra(
                 &crate::accelerators::toml_string_array(&config, "axioms", "allow")
@@ -3613,10 +3626,21 @@ fn seed_statement_dependencies(
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
+        // Local object copy only: a canonical absolute directory (never a URL or remote
+        // helper), with every transport but `file` still disabled by the trusted wrapper.
+        let source = dep.pkg_root.canonicalize()?;
+        anyhow::ensure!(
+            source.is_absolute() && source.is_dir(),
+            "Statement dependency {} is not a local directory",
+            dep.name
+        );
         let out = crate::trusted_tools::git(project)?
-            .args(["clone", "--quiet", "--no-hardlinks", "--no-checkout"])
-            .arg(&dep.pkg_root)
+            .args(["-c", "protocol.file.allow=always", "clone", "--local"])
+            .args(["--quiet", "--no-hardlinks", "--no-checkout", "--template="])
+            .arg("--")
+            .arg(&source)
             .arg(&target)
+            .current_dir("/")
             .output()?;
         anyhow::ensure!(
             out.status.success(),

@@ -2279,7 +2279,8 @@ pub(crate) fn nonlocal_edits(files: &[PathBuf], rev: &str) -> Vec<String> {
         let base = git
             .arg("-C")
             .arg(f.parent().unwrap_or(Path::new(".")))
-            .args(["show", &format!("{}:./{}", rev, name)])
+            .args(["show", "--no-textconv", "--no-ext-diff"])
+            .arg(format!("{}:./{}", rev, name))
             .output()
             .ok()
             .filter(|o| o.status.success())

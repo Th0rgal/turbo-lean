@@ -110,18 +110,55 @@ impl DerefMut for GitCommand {
     }
 }
 
+/// Oldest Git that honors `GIT_NO_LAZY_FETCH`. Older Git silently fetches missing objects of a
+/// partial clone, running repository-configured transports and credential helpers on the host.
+const MIN_GIT: (u32, u32) = (2, 46);
+
+fn parse_git_version(out: &str) -> Option<(u32, u32)> {
+    let mut parts = out.trim().strip_prefix("git version ")?.split('.');
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+}
+
+fn checked_git(path: PathBuf) -> Result<PathBuf> {
+    let out = Command::new(&path)
+        .arg("version")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .current_dir("/")
+        .output()
+        .with_context(|| format!("Cannot run {}", path.display()))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let version = parse_git_version(&text)
+        .with_context(|| format!("Unrecognized Git version from {}", path.display()))?;
+    anyhow::ensure!(
+        version >= MIN_GIT,
+        "{} is {}; verification requires Git >= {}.{} (GIT_NO_LAZY_FETCH): fail-closed. \
+         Install a newer Git or set TURBO_LEAN_GIT to one",
+        path.display(),
+        text.trim(),
+        MIN_GIT.0,
+        MIN_GIT.1
+    );
+    Ok(path)
+}
+
 /// Resolve once per process, then validate against every project (including
 /// dependency checkouts). No inherited GIT_*, loader, shell or config environment.
+/// Repository-local config and includes stay readable, so every key that can run a
+/// program or reach the network is overridden on the command line, and lazy fetching
+/// of missing partial-clone objects is disabled: a missing object is an error.
 pub(crate) fn git(project: &Path) -> Result<GitCommand> {
     static GIT: OnceLock<std::result::Result<PathBuf, String>> = OnceLock::new();
     let program = GIT.get_or_init(|| {
         (|| -> Result<PathBuf> {
             if let Some(path) = std::env::var_os("TURBO_LEAN_GIT") {
-                return outside_checkout(Path::new(&path), project);
+                return checked_git(outside_checkout(Path::new(&path), project)?);
             }
-            SYSTEM_BINS.iter().find_map(|dir| system_executable(&Path::new(dir).join("git"), project).ok())
-                .context("No trusted system Git; set TURBO_LEAN_GIT to an absolute executable outside all checkouts")
-        })().map_err(|e| e.to_string())
+            checked_git(SYSTEM_BINS.iter().find_map(|dir| system_executable(&Path::new(dir).join("git"), project).ok())
+                .context("No trusted system Git; set TURBO_LEAN_GIT to an absolute executable outside all checkouts")?)
+        })().map_err(|e| format!("{e:#}"))
     }).as_ref().map_err(|e| anyhow::anyhow!("Trusted Git unavailable: {e}"))?;
     let program = outside_checkout(program, project)?;
     let home = PrivateHome::new()?;
@@ -137,20 +174,25 @@ pub(crate) fn git(project: &Path) -> Result<GitCommand> {
             .env("GIT_ATTR_NOSYSTEM", "1")
             .env("GIT_NO_REPLACE_OBJECTS", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_NO_LAZY_FETCH", "1")
             .env("GIT_OPTIONAL_LOCKS", "0")
             .env("LC_ALL", "C")
-            .args([
-                "-c",
-                "core.fsmonitor=",
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                "diff.external=",
-                "-c",
-                "core.pager=cat",
-                "-c",
-                "core.attributesFile=/dev/null",
-            ]);
+            .env_remove("GIT_ASKPASS")
+            .env_remove("SSH_ASKPASS");
+        for config in [
+            "core.fsmonitor=",
+            "core.hooksPath=/dev/null",
+            "core.sshCommand=false",
+            "core.askPass=",
+            "credential.helper=",
+            "protocol.allow=never",
+            "diff.external=",
+            "log.showSignature=false",
+            "core.pager=cat",
+            "core.attributesFile=/dev/null",
+        ] {
+            command.args(["-c", config]);
+        }
         command
     };
     let mut command = prepare();

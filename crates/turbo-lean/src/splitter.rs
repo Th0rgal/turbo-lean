@@ -97,21 +97,43 @@ pub fn axiom_allowed_under(ax: &str, allowed: &[String]) -> bool {
 }
 
 /// Text of the nearest `turbo-lean.toml` at or above `dir`, read at git revision `rev` when given
-/// (pr-verify uses `--base`, so a PR cannot change the policy it is checked under).
-pub fn read_project_config(dir: &std::path::Path, rev: Option<&str>) -> Option<String> {
+/// (pr-verify uses `--base`, so a PR cannot change the policy it is checked under). A config the
+/// revision's tree names but whose blob is unreadable (e.g. a promised object of a partial clone,
+/// never lazily fetched) is an error, never a silently absent policy.
+pub fn read_project_config(
+    dir: &std::path::Path,
+    rev: Option<&str>,
+) -> anyhow::Result<Option<String>> {
     let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-    dir.ancestors().find_map(|a| match rev {
-        Some(r) => crate::trusted_tools::git(&dir)
-            .ok()?
-            .arg("-C")
-            .arg(a)
-            .args(["show", &format!("{}:./turbo-lean.toml", r)])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned()),
-        None => std::fs::read_to_string(a.join("turbo-lean.toml")).ok(),
-    })
+    let Some(rev) = rev else {
+        return Ok(dir
+            .ancestors()
+            .find_map(|a| std::fs::read_to_string(a.join("turbo-lean.toml")).ok()));
+    };
+    anyhow::ensure!(!rev.starts_with('-'), "Invalid git revision `{rev}`");
+    let spec = format!("{rev}:./turbo-lean.toml");
+    for a in dir.ancestors() {
+        let git = |args: &[&str]| -> anyhow::Result<std::process::Output> {
+            Ok(crate::trusted_tools::git(&dir)?
+                .arg("-C")
+                .arg(a)
+                .args(args)
+                .output()?)
+        };
+        let shown = git(&["show", "--no-textconv", "--no-ext-diff", &spec])?;
+        if shown.status.success() {
+            return Ok(Some(String::from_utf8_lossy(&shown.stdout).into_owned()));
+        }
+        // Present in the tree but unreadable: fail closed.
+        let named = git(&["rev-parse", "--verify", "-q", "--end-of-options", &spec])?;
+        anyhow::ensure!(
+            !named.status.success(),
+            "Cannot read `{spec}` in {}: {}",
+            a.display(),
+            String::from_utf8_lossy(&shown.stderr).trim()
+        );
+    }
+    Ok(None)
 }
 
 /// Kind of a hygiene item (`"L12: bv_decide"` -> `"bv_decide"`).
@@ -4634,6 +4656,7 @@ mod tests {
         std::fs::write(repo.join("turbo-lean.toml"), "[audit_spec]\nallow = [\"x\"]\n[axioms]\nallow = [\n  \"A.*\", # comment\n  \"B\",\n]\n").unwrap();
         let allow = |rev| {
             read_project_config(&repo.join("sub"), rev)
+                .unwrap()
                 .and_then(|t| crate::accelerators::toml_string_array(&t, "axioms", "allow"))
         };
         assert_eq!(allow(None).unwrap(), ["A.*", "B"]);
@@ -4643,7 +4666,7 @@ mod tests {
             "[zygote]\ntimeout_secs = 900\n",
         )
         .unwrap();
-        let cfg = read_project_config(&repo, None).unwrap();
+        let cfg = read_project_config(&repo, None).unwrap().unwrap();
         assert_eq!(
             crate::accelerators::toml_value(&cfg, "zygote", "timeout_secs").unwrap(),
             "900"

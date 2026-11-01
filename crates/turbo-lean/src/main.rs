@@ -651,7 +651,7 @@ fn run(cli: Cli) -> Result<()> {
         std::env::remove_var("TURBO_LEAN_ALLOWED_CSIMP_FROM_CONFIG");
     }
     if let Some(dir) = dir {
-        let config = splitter::read_project_config(dir, rev).unwrap_or_default();
+        let config = splitter::read_project_config(dir, rev)?.unwrap_or_default();
         if rev.is_some()
             || std::env::var_os("TURBO_LEAN_ALLOWED_CSIMP").is_none()
             || csimp_from_config
