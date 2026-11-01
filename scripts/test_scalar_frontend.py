@@ -1011,6 +1011,46 @@ def probe_rc_drop (sel seed delta : UInt64) : UInt64 :=
                                      else [engines["full_bin"], *cmd, str(src), "-o", str(out)], capture_output=True, text=True)
                 self.assertNotEqual(rej.returncode, 0, f"{cmd[0]} must fail closed without --allow-rc-adt")
                 self.assertFalse(out.exists())
+            # Input is resolved ONCE: extraction and the Stage 1D gate must never read different inputs, so any
+            # mix of --lean / --input / --lnir / positional is a selector-conflict hard error that writes nothing.
+            scalar_src = tmp / "ScalarOnly.lean"
+            scalar_src.write_text("@[export scalar_only_add]\ndef scalar_only_add (a b : UInt64) : UInt64 := a + b\n",
+                                  encoding="utf-8")
+            scalar_wire = tmp / "scalar_only.lnir"
+            subprocess.run([engines["full_bin"], "emit-lnir", "--wire", str(scalar_src), "-o", str(scalar_wire)],
+                           check=True, capture_output=True, text=True)
+            conflict_h = tmp / "conflict.h"
+            conflicts = [
+                (engines["full_bin"], ["emit-cabi-bindings", "--emit-header", str(conflict_h), "--lean", str(src), "--input", str(scalar_src)]),
+                (engines["full_bin"], ["emit-cabi-bindings", "--emit-header", str(conflict_h), str(src), "--lnir", str(scalar_wire)]),
+                (engines["full_bin"], ["emit-cabi-bindings", "--emit-header", str(conflict_h), "--input", str(scalar_src), "--input", str(src)]),
+                (engines["full_bin"], ["compile-c-abi", "--emit-header", str(conflict_h), "--lean", str(src), "--input", str(scalar_src)]),
+                (engines["full_bin"], ["compile-static-lib", "--lnir", str(scalar_wire), str(src), "-o", str(conflict_h)]),
+                (engines["full_bin"], ["--c-abi", "--lnir", str(scalar_wire), "--input", str(src), "-o", str(conflict_h)]),
+                (engines["full_bin"], ["compile-llvm", "--lnir", str(scalar_wire), "--lean", str(src), "-o", str(conflict_h)]),
+                (engines["full_bin"], ["build-exe", str(src), "--input", str(scalar_src), "-o", str(conflict_h)]),
+                (engines["core_bin"], ["emit-cabi-bindings", "--signatures-only", "--emit-header", str(conflict_h),
+                                       "--lean", str(scalar_src), str(src)]),
+                (engines["core_bin"], ["compile-static-lib", "--lnir", str(scalar_wire), "--input", str(src), "-o", str(conflict_h)]),
+            ]
+            for binary, cmd in conflicts:
+                rej = subprocess.run([binary, *cmd], capture_output=True, text=True)
+                self.assertNotEqual(rej.returncode, 0, f"{cmd} must reject conflicting input selectors: {rej.stdout}")
+                self.assertIn("Conflicting input selectors", rej.stderr, cmd)
+                self.assertFalse(conflict_h.exists(), cmd)
+                self.assertEqual([p.name for p in tmp.iterdir() if p.name.startswith("conflict")], [], cmd)
+            # single-selector RC-ADT input is still rejected; single-selector scalar input still works
+            for sel in (["--lean", str(src)], ["--input", str(src)], [str(src)]):
+                rej = subprocess.run([engines["full_bin"], "emit-cabi-bindings", "--emit-header", str(conflict_h), *sel],
+                                     capture_output=True, text=True)
+                self.assertNotEqual(rej.returncode, 0, f"RC-ADT {sel} must be rejected")
+                self.assertFalse(conflict_h.exists(), sel)
+            for sel in (["--lean", str(scalar_src)], ["--input", str(scalar_src)], [str(scalar_src)], ["--lnir", str(scalar_wire)]):
+                ok = subprocess.run([engines["full_bin"], "emit-cabi-bindings", "--emit-header", str(conflict_h), *sel],
+                                    capture_output=True, text=True)
+                self.assertEqual(ok.returncode, 0, f"{sel}: {ok.stdout}{ok.stderr}")
+                self.assertIn("scalar_only_add(", conflict_h.read_text(encoding="utf-8"), sel)
+                conflict_h.unlink()
             # P-cert C4 (core binary, no elaboration hook): a `.lean` source is a hard error for emit-cabi-bindings
             # (unless --signatures-only), compile-c-abi and compile-static-lib, and nothing is written.
             core_rejects = [

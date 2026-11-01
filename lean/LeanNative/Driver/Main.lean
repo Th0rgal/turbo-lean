@@ -18,9 +18,10 @@ def frontendHook (allowRcAdt : Bool := false) : Option (String → TargetArch �
   some (fun path arch => ingestLeanSourceFile path path arch allowRcAdt)
 
 def runBuildExe (args : List String) : IO UInt32 := do
-  let inFile :=
-    let explicit := findFlagValue args "--input" ""
-    if !explicit.isEmpty then explicit else findFirstPositional args
+  -- one resolved input (conflicting selectors are a hard error); `--lnir` is not a `.lean` source
+  let sel ← resolveInput args
+  let inFile := sel.path
+  if sel.flag == "--lnir" then throw <| IO.userError "[lean-native] build-exe: --lnir is unsupported; pass a <file.lean> source"
   if inFile.isEmpty then
     IO.eprintln "[lean-native] Error: build-exe requires a <file.lean> input path"
     return 1

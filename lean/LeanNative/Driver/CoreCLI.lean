@@ -68,14 +68,31 @@ def validateValueTakingFlags : List String → IO Unit
       else validateValueTakingFlags rest
     else validateValueTakingFlags (v :: rest)
 
-def findFirstPositional : List String → String
-  | [] => ""
-  | "--input" :: v :: _ | "--lnir" :: v :: _ => v
-  | flag :: v :: rest =>
-    if valueTakingFlags.contains flag then findFirstPositional rest
-    else if flag == "--opt" && v.startsWith "-O" then findFirstPositional rest
-    else if flag.startsWith "-" then findFirstPositional (v :: rest) else flag
-  | [a] => if a.startsWith "-" then "" else a
+/-- The single input selected by `--lnir`, `--input`, `--lean` or a positional path (`flag = ""`: none given). -/
+structure InputSel where
+  flag : String := ""
+  path : String := ""
+  deriving Repr, Inhabited, BEq
+
+/-- A `.lean` source to elaborate / extract signatures from (`--lnir` always parses LNIR wire/JSON). -/
+def InputSel.isLeanSource (s : InputSel) : Bool := s.flag != "--lnir" && s.path.endsWith ".lean"
+
+/-- Every input selector in `args`, in order (`"<positional>"` for a bare path). -/
+def collectInputSelectors : List String → List (String × String)
+  | [] => []
+  | f :: v :: rest =>
+    if ["--lnir", "--input", "--lean"].contains f then (f, v) :: collectInputSelectors rest
+    else if valueTakingFlags.contains f || (f == "--opt" && v.startsWith "-O") then collectInputSelectors rest
+    else if f.startsWith "-" then collectInputSelectors (v :: rest) else ("<positional>", f) :: collectInputSelectors (v :: rest)
+  | [a] => if a.startsWith "-" then [] else [("<positional>", a)]
+
+/-- Resolve the input ONCE. More than one selector (any mix of `--lnir` / `--input` / `--lean` / positional, including
+    a repeated one) is a hard error, so extraction and validation can never read different inputs. -/
+def resolveInput (args : List String) : IO InputSel := do
+  match collectInputSelectors args with
+  | [] => return {}
+  | [(flag, path)] => return { flag, path }
+  | sels => throw <| IO.userError s!"[lean-native] Conflicting input selectors ({", ".intercalate (sels.map fun (f, p) => s!"{f} {p}")}): pass exactly one of --lnir / --input / --lean / <positional>"
 
 structure CoreCLIOptions where
   inputPath : String := ""
@@ -93,11 +110,10 @@ structure CoreCLIOptions where
 
 def parseCoreCLIOptions (args : List String) : IO CoreCLIOptions := do
   validateValueTakingFlags args
-  let inPos := findFirstPositional args
-  let inExp := findFlagValue args "--input" (findFlagValue args "--lnir" "")
+  let sel ← resolveInput args
   let arch ← parseTargetArchIO (findFlagValue args "--arch" (findFlagValue args "--target" "x86_64"))
   return {
-    inputPath := if !inExp.isEmpty then inExp else inPos, outputPath := findFlagValue args "-o" "", arch := arch,
+    inputPath := sel.path, outputPath := findFlagValue args "-o" "", arch := arch,
     emitCABI := hasFlag args "--c-abi" || hasFlag args "--emit-c-abi",
     emitLLVM := hasFlag args "--emit-llvm" || hasFlag args "--llvm",
     emitPTX := hasFlag args "--emit-ptx" || hasFlag args "--ptx",
@@ -106,10 +122,11 @@ def parseCoreCLIOptions (args : List String) : IO CoreCLIOptions := do
     numSamples := (findFlagValue args "--samples" "4096").toNat?.getD 4096,
     useConstraintProp := !(hasFlag args "--no-constraint-prop") }
 
-/-- Load an `LNIRModule` from `--lnir <path>`, `--input <path>`, or positional argument, using `elaborateHook?` for `.lean`
+/-- Load an `LNIRModule` from the single resolved input (`sel?`, else `resolveInput args`), using `elaborateHook?` for `.lean`
     sources when running inside the full `lean-native` frontend. Fail-closed on missing files or `.unsupported` (`A_L0`) decls. -/
 def loadInputModule (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String)
-    (defaultFastCheck : Bool := false) (allowUnsupported : Bool := false) (allowRcAdt : Bool := false) : IO LNIRModule := do
+    (defaultFastCheck : Bool := false) (allowUnsupported : Bool := false) (allowRcAdt : Bool := false)
+    (sel? : Option InputSel := none) : IO LNIRModule := do
   validateValueTakingFlags args
   let rawArch := findFlagValue args "--arch" (findFlagValue args "--target" "x86_64")
   let arch := (parseTargetArch? rawArch).getD .x86_64
@@ -131,11 +148,9 @@ def loadInputModule (elaborateHook? : Option (String → TargetArch → IO LNIRM
       if mod.decls.isEmpty then throw <| IO.userError s!"[lean-native] Failed to extract any LNIR declarations from '{path}'"
       checkSupported mod
     | none => throw <| IO.userError s!"[lean-native] Failed to parse LNIR wire/JSON module from '{path}'"
-  let lnirFile := findFlagValue args "--lnir" ""
-  if !lnirFile.isEmpty then return (← parseWireOrJsonFile lnirFile)
-  let inFileExplicit := findFlagValue args "--input" (findFlagValue args "--lean" "")
-  let inFilePos := findFirstPositional args
-  let inFile := if !inFileExplicit.isEmpty then inFileExplicit else inFilePos
+  let sel ← match sel? with | some s => pure s | none => resolveInput args
+  if sel.flag == "--lnir" then return (← parseWireOrJsonFile sel.path)
+  let inFile := sel.path
   if inFile.isEmpty then return defaultMod
   else if inFile == "canonical" || inFile == "benchmarks" then return mkCanonicalBenchmarkModule
   else if inFile == "fastcheck" || inFile == "fastcheck-sample" then return mkFastCheckSampleModule
@@ -175,13 +190,15 @@ private def writeAndPrintJsonOrSummary (outPath jsonText summaryText : String) (
     Stage 1D (RC-ADT) without the elaborating frontend; hard error before any output is written. -/
 def rejectLeanSourceWithoutFrontend (tag cmd : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule))
     (args : List String) : IO Unit := do
-  let src := findFlagValue args "--lean" (findFlagValue args "--input" (findFirstPositional args))
-  if elaborateHook?.isNone && src.endsWith ".lean" then
-    throw <| IO.userError s!"[{tag}] {cmd}: cannot apply the Stage 1D (RC-ADT) gate to '{src}' without the elaborating frontend; use full 'lean-native'"
+  let sel ← resolveInput args
+  if elaborateHook?.isNone && sel.isLeanSource then
+    throw <| IO.userError s!"[{tag}] {cmd}: cannot apply the Stage 1D (RC-ADT) gate to '{sel.path}' without the elaborating frontend; use full 'lean-native'"
 
 def runEmitCAbiBindings (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   validateValueTakingFlags args
-  let leanPath := findFlagValue args "--lean" (findFlagValue args "--input" (findFirstPositional args))
+  -- one resolved input feeds BOTH signature extraction and the Stage 1D / A_L0 validation below
+  let sel ← resolveInput args
+  let leanPath := sel.path
   let hdrPath := findFlagValue args "--emit-header" (findFlagValue args "--header" "")
   let rsPath := findFlagValue args "--emit-rust" (findFlagValue args "--rust" "")
   let swiftPath := findFlagValue args "--emit-swift" (findFlagValue args "--swift" "")
@@ -190,7 +207,7 @@ def runEmitCAbiBindings (tag : String) (elaborateHook? : Option (String → Targ
   let outPath := findFlagValue args "-o" ""
   let jsonFlag := hasFlag args "--json"
   let sigOnly := hasFlag args "--signatures-only"
-  let isLean := !leanPath.isEmpty && leanPath.endsWith ".lean"
+  let isLean := sel.isLeanSource
   if sigOnly && !isLean then throw <| IO.userError s!"[{tag}] --signatures-only requires a .lean source input"
   -- P-cert C4: without the elaborating frontend a `.lean` source cannot pass the Stage 1D (RC-ADT) gate, so
   -- bindings come only from `--signatures-only` (scalar exported signatures, recorded as ungated).
@@ -207,10 +224,10 @@ def runEmitCAbiBindings (tag : String) (elaborateHook? : Option (String → Targ
       let (s, g) := extractLeanSourceCAbiAndGuards (← readLeanSourceExpandingUmbrella leanPath)
       -- C4: (only reachable with the elaborating frontend) ingest first so a Stage 1D (RC-ADT) decl is a hard error
       -- before any prototype is emitted, even when the source signatures alone would have produced a header.
-      let m ← loadInputModule elaborateHook? args
+      let m ← loadInputModule elaborateHook? args (sel? := some sel)
       pure (if s.isEmpty then moduleToCAbiSigs (runDefaultPipeline m).1 else s, g, leanPath)
     else
-      let m ← loadInputModule elaborateHook? args
+      let m ← loadInputModule elaborateHook? args (sel? := some sel)
       pure (moduleToCAbiSigs (runDefaultPipeline m).1, [], if leanPath.isEmpty then m.moduleName else leanPath)
   let note? := if sigOnly then some signaturesOnlyMarker else none
   let hdrText := emitCAbiHeaderFromSigs sigs note?
@@ -288,15 +305,15 @@ def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → Targ
   if destinations.eraseDups.length != destinations.length then throw <| IO.userError s!"[{tag}] Output paths must be distinct"
   for dest in destinations do
     if ← (System.FilePath.mk dest).isDir then throw <| IO.userError s!"[{tag}] Output destination is a directory: {dest}"
-  let posPath := findFirstPositional args
+  let sel ← resolveInput args
   rejectLeanSourceWithoutFrontend tag "compile-static-lib" elaborateHook? args
-  let baseMod ← loadInputModule elaborateHook? args
+  let baseMod ← loadInputModule elaborateHook? args (sel? := some sel)
   let (optMod, _) := runDefaultPipeline baseMod
   if let some (dName, callee) := findUnsupportedLLVMCall? optMod then
     throw <| IO.userError s!"[{tag}] Unsupported external or non-scalar call '{callee}' in '{dName}'"
   let (sigs, guards) ←
-    if posPath.endsWith ".lean" then
-      let src ← readLeanSourceExpandingUmbrella posPath
+    if sel.isLeanSource then
+      let src ← readLeanSourceExpandingUmbrella sel.path
       let (srcSigs, srcGuards) := extractLeanSourceCAbiAndGuards src
       pure (if srcSigs.isEmpty then moduleToCAbiSigs optMod else srcSigs, srcGuards)
     else pure (moduleToCAbiSigs optMod, [])
@@ -944,11 +961,13 @@ def dispatchSharedCommand (tag : String) (elaborateHook? : Option (String → Ta
     throw <| IO.userError "[lean-native] --args / --cases-file are only supported by eval-lnir"
   let rest := args.drop 1
   let effArgs := if args.head? == some "--c-abi" || args.head? == some "--emit-c-abi" || isCabiFallback then args else rest
-  if (["compile", "compile-clif", "compile-llvm", "compile-static-lib", "compile-mlir", "compile-ptx", "compile-metal",
+  -- every input-reading command resolves its input once, up front: conflicting selectors are a hard error here
+  let readsInput := ["compile", "compile-clif", "compile-llvm", "compile-static-lib", "compile-mlir", "compile-ptx", "compile-metal",
        "compile-hybrid", "compile-fastcheck", "superopt", "plugins", "telemetry", "verify-certs",
        "validate-tv", "eval-lnir", "emit-lnir", "emit-cabi-bindings", "compile-c-abi",
-       "--c-abi", "--emit-c-abi"].contains (args.headD "") || isCabiFallback) &&
-      (findFirstPositional effArgs).isEmpty && (findFlagValue effArgs "--lean" "").isEmpty &&
+       "--c-abi", "--emit-c-abi"].contains (args.headD "") || isCabiFallback
+  let sel ← if readsInput then resolveInput effArgs else pure {}
+  if readsInput && sel.path.isEmpty &&
       !(effArgs.any (["--canonical-benchmark", "--fastcheck-sample"].contains ·) ||
         (args.head? == some "compile-llvm" && effArgs.contains "--slot-regression")) then
     throw <| IO.userError "[lean-native] Explicit input required (or --canonical-benchmark / --fastcheck-sample)"
