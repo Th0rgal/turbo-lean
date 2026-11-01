@@ -160,7 +160,56 @@ theorem lookupSlot_writeSlot_ne (m : StorageMapBuffer) (slot1 slot2 val : UInt25
 
 end StorageMapBuffer
 
-/-- Abstract heap state tracking contiguous scalar array buffers, EVM storage maps, allocation IDs, and reference counts.
+/-- Model of a heap-allocated constructor object (`lean_ctor_object`) in Stage 1D. -/
+structure HeapObj where
+  id     : Nat
+  tag    : Nat
+  fields : List Val
+  deriving Repr, Inhabited, BEq
+
+namespace HeapObj
+
+mutual
+  def decEqVal : (a b : Val) → Decidable (a = b)
+    | .u64 x, .u64 y => if h : x = y then isTrue (h ▸ rfl) else isFalse (by intro heq; injection heq; contradiction)
+    | .u256 x, .u256 y => if h : x = y then isTrue (h ▸ rfl) else isFalse (by intro heq; injection heq; contradiction)
+    | .bool x, .bool y => if h : x = y then isTrue (h ▸ rfl) else isFalse (by intro heq; injection heq; contradiction)
+    | .tuple xs, .tuple ys =>
+      match decEqValList xs ys with
+      | isTrue h => isTrue (h ▸ rfl)
+      | isFalse h => isFalse (by intro heq; injection heq with hxy; exact h hxy)
+    | .objPtr x, .objPtr y => if h : x = y then isTrue (h ▸ rfl) else isFalse (by intro heq; injection heq; contradiction)
+    | .sarrayId x, .sarrayId y => if h : x = y then isTrue (h ▸ rfl) else isFalse (by intro heq; injection heq; contradiction)
+    | .rawPtrId x, .rawPtrId y => if h : x = y then isTrue (h ▸ rfl) else isFalse (by intro heq; injection heq; contradiction)
+    | .storageMapId x, .storageMapId y => if h : x = y then isTrue (h ▸ rfl) else isFalse (by intro heq; injection heq; contradiction)
+    | .unit, .unit => isTrue rfl
+    | .u64 _, .u256 _ | .u64 _, .bool _ | .u64 _, .tuple _ | .u64 _, .objPtr _ | .u64 _, .sarrayId _ | .u64 _, .rawPtrId _ | .u64 _, .storageMapId _ | .u64 _, .unit
+    | .u256 _, .u64 _ | .u256 _, .bool _ | .u256 _, .tuple _ | .u256 _, .objPtr _ | .u256 _, .sarrayId _ | .u256 _, .rawPtrId _ | .u256 _, .storageMapId _ | .u256 _, .unit
+    | .bool _, .u64 _ | .bool _, .u256 _ | .bool _, .tuple _ | .bool _, .objPtr _ | .bool _, .sarrayId _ | .bool _, .rawPtrId _ | .bool _, .storageMapId _ | .bool _, .unit
+    | .tuple _, .u64 _ | .tuple _, .u256 _ | .tuple _, .bool _ | .tuple _, .objPtr _ | .tuple _, .sarrayId _ | .tuple _, .rawPtrId _ | .tuple _, .storageMapId _ | .tuple _, .unit
+    | .objPtr _, .u64 _ | .objPtr _, .u256 _ | .objPtr _, .bool _ | .objPtr _, .tuple _ | .objPtr _, .sarrayId _ | .objPtr _, .rawPtrId _ | .objPtr _, .storageMapId _ | .objPtr _, .unit
+    | .sarrayId _, .u64 _ | .sarrayId _, .u256 _ | .sarrayId _, .bool _ | .sarrayId _, .tuple _ | .sarrayId _, .objPtr _ | .sarrayId _, .rawPtrId _ | .sarrayId _, .storageMapId _ | .sarrayId _, .unit
+    | .rawPtrId _, .u64 _ | .rawPtrId _, .u256 _ | .rawPtrId _, .bool _ | .rawPtrId _, .tuple _ | .rawPtrId _, .objPtr _ | .rawPtrId _, .sarrayId _ | .rawPtrId _, .storageMapId _ | .rawPtrId _, .unit
+    | .storageMapId _, .u64 _ | .storageMapId _, .u256 _ | .storageMapId _, .bool _ | .storageMapId _, .tuple _ | .storageMapId _, .objPtr _ | .storageMapId _, .sarrayId _ | .storageMapId _, .rawPtrId _ | .storageMapId _, .unit
+    | .unit, .u64 _ | .unit, .u256 _ | .unit, .bool _ | .unit, .tuple _ | .unit, .objPtr _ | .unit, .sarrayId _ | .unit, .rawPtrId _ | .unit, .storageMapId _ =>
+      isFalse (by intro h; cases h)
+
+  def decEqValList : (xs ys : List Val) → Decidable (xs = ys)
+    | [], [] => isTrue rfl
+    | [], _ :: _ | _ :: _, [] => isFalse (by intro h; cases h)
+    | x :: xs, y :: ys =>
+      match decEqVal x y, decEqValList xs ys with
+      | isTrue h1, isTrue h2 => isTrue (by rw [h1, h2])
+      | isFalse h1, _ => isFalse (by intro h; injection h with hx _; exact h1 hx)
+      | _, isFalse h2 => isFalse (by intro h; injection h with _ hxs; exact h2 hxs)
+end
+
+end HeapObj
+
+instance : DecidableEq Val := HeapObj.decEqVal
+deriving instance DecidableEq for HeapObj
+
+/-- Abstract heap state tracking contiguous scalar array buffers, EVM storage maps, heap objects, allocation IDs, and reference counts.
     `refCounts` stores `(isObj, id, rc)` where `isObj = false` tracks `.sarrayId` buffers with `rc ≥ 3`
     (`rc = 1` and `rc = 2` are represented canonically by `buf.exclusive = true` and `buf.exclusive = false`
     with no entry in `refCounts`), and `isObj = true` tracks `.objPtr` heap objects in a disjoint key space. -/
@@ -169,6 +218,7 @@ structure HeapState where
   nextId      : Nat
   storageMaps : List StorageMapBuffer := []
   refCounts   : List (Bool × Nat × Nat) := []
+  heapObjs    : List HeapObj := []
   deriving Repr, DecidableEq, Inhabited, BEq
 
 namespace HeapState
@@ -253,6 +303,35 @@ def allocObj (st : HeapState) (objId : Nat) : HeapState :=
   let refs' := st.refCounts.filter (fun (isObj, id, _) => !isObj || id != objId)
   { st with refCounts := (true, objId, 1) :: refs' }
 
+/-- Look up a heap-allocated constructor object by `objId`. -/
+def findHeapObj (st : HeapState) (objId : Nat) : Option HeapObj :=
+  st.heapObjs.find? (fun o => o.id == objId)
+
+/-- Allocate a fresh heap constructor object with tag `tag`, fields `fields`, and initial `rc = 1`. -/
+def allocHeapCtor (st : HeapState) (tag : Nat) (fields : List Val) : Nat × HeapState :=
+  let objId := st.nextId + 1
+  let refs' := st.refCounts.filter (fun (isObj, id, _) => !isObj || id != objId)
+  let objs' := st.heapObjs.filter (fun o => o.id != objId)
+  (objId, { st with
+    nextId := objId
+    refCounts := (true, objId, 1) :: refs'
+    heapObjs := { id := objId, tag := tag, fields := fields } :: objs' })
+
+/-- Overwrite field `idx` in-place on an exclusive (`rc == 1`) heap constructor object (`Code.oset`). -/
+def writeHeapObjFieldExclusive (st : HeapState) (objId idx : Nat) (val : Val) : Except UBError HeapState :=
+  let rc := st.getObjRefCount objId
+  if rc == 0 then .error (.useAfterFree objId)
+  else if rc != 1 then .error (.nonExclusiveWrite objId)
+  else match st.findHeapObj objId with
+    | none => .error (.useAfterFree objId)
+    | some obj =>
+      if idx < obj.fields.length then
+        .ok { st with
+          heapObjs := st.heapObjs.map (fun o =>
+            if o.id == objId then { o with fields := o.fields.set idx val } else o) }
+      else
+        .error (.outOfBounds idx obj.fields.length)
+
 /-- Increment the reference count of `.objPtr objId` by `count`, failing with `useAfterFree` if unknown or freed (`rc = 0`). -/
 def incRefObj (st : HeapState) (objId count : Nat) : Except UBError HeapState :=
   let rc := st.getObjRefCount objId
@@ -263,18 +342,38 @@ def incRefObj (st : HeapState) (objId count : Nat) : Except UBError HeapState :=
     let refs' := st.refCounts.filter (fun (isObj, id, _) => !isObj || id != objId)
     .ok { st with refCounts := (true, objId, rc') :: refs' }
 
-/-- Decrement the reference count of `.objPtr objId` by `count`, removing the entry when freed (`rc' = 0`). -/
-def decRefObj (st : HeapState) (objId count : Nat) : Except UBError HeapState :=
-  let rc := st.getObjRefCount objId
-  if rc == 0 || count > rc then .error (.useAfterFree objId)
-  else if count == 0 then .ok st
-  else
-    let rc' := rc - count
-    let refs' := st.refCounts.filter (fun (isObj, id, _) => !isObj || id != objId)
-    if rc' == 0 then
-      .ok { st with refCounts := refs' }
+/-- Fuel-bounded recursive decrement of `.objPtr objId` and its child references when `rc' == 0`. -/
+def decRefObjFuel : Nat → HeapState → Nat → Nat → Except UBError HeapState
+  | 0, st, _, _ => .ok st
+  | fuel + 1, st, objId, count =>
+    let rc := st.getObjRefCount objId
+    if rc == 0 || count > rc then .error (.useAfterFree objId)
+    else if count == 0 then .ok st
     else
-      .ok { st with refCounts := (true, objId, rc') :: refs' }
+      let rc' := rc - count
+      let refs' := st.refCounts.filter (fun (isObj, id, _) => !isObj || id != objId)
+      if rc' == 0 then
+        let children : List Val :=
+          match st.findHeapObj objId with
+          | some obj => obj.fields
+          | none => []
+        let st1 : HeapState := { st with
+          refCounts := refs'
+          heapObjs := st.heapObjs.filter (fun o => o.id != objId) }
+        children.foldl (fun acc v =>
+          match acc with
+          | .error err => .error err
+          | .ok cur =>
+            match v with
+            | .objPtr childId => decRefObjFuel fuel cur childId 1
+            | .sarrayId bufId => cur.decRefBuf bufId 1
+            | _ => .ok cur) (.ok st1)
+      else
+        .ok { st with refCounts := (true, objId, rc') :: refs' }
+
+/-- Decrement the reference count of `.objPtr objId` by `count`, freeing the object and dropping children when `rc' = 0`. -/
+def decRefObj (st : HeapState) (objId count : Nat) : Except UBError HeapState :=
+  decRefObjFuel (st.heapObjs.length + 1) st objId count
 
 /-- Evaluate an `incRef` instruction on variable `objVar` in `env`. -/
 def evalIncRef (st : HeapState) (env : VarEnv) (objVar : VarId) (count : Nat) : Except UBError HeapState :=
@@ -299,9 +398,9 @@ theorem incRefObj_decRefObj_cancel (bufs : List ArrayBuffer) (nid objId count : 
      | .ok st1 => st1.decRefObj objId count
      | .error e => .error e) = .ok st := by
   cases count with
-  | zero => simp [incRefObj, decRefObj, getObjRefCount]
+  | zero => simp [incRefObj, decRefObj, decRefObjFuel, getObjRefCount]
   | succ c =>
-    simp [incRefObj, decRefObj, getObjRefCount, Nat.add_sub_cancel 1 (c + 1)]
+    simp [incRefObj, decRefObj, decRefObjFuel, getObjRefCount, Nat.add_sub_cancel 1 (c + 1)]
 
 @[simp]
 theorem decRefBuf_one_frees_buffer (bufId nextId : Nat) (data : Array UInt64) :
