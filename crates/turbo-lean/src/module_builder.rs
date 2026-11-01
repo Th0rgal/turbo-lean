@@ -8517,6 +8517,7 @@ fn resolve_dependency_artifacts(
     lean_path: &str,
     tc_lib: &Path,
     githash: &str,
+    preserve_caller: bool,
 ) -> Result<Vec<(String, PathBuf, String)>> {
     type ToolchainImports = HashMap<(PathBuf, String), Vec<String>>;
     static TC_IMPORTS: OnceLock<Mutex<ToolchainImports>> = OnceLock::new();
@@ -8544,7 +8545,10 @@ fn resolve_dependency_artifacts(
         let dig = if toolchain {
             None
         } else {
-            Some(compute_olean_artifact_set_digest(&path)?)
+            Some(compute_olean_artifact_set_digest_with_policy(
+                &path,
+                preserve_caller,
+            )?)
         };
         let imports = if let Some(imports) = cached {
             imports
@@ -8561,6 +8565,18 @@ fn resolve_dependency_artifacts(
             }
             imports
         };
+        // Installed declarations are valid in the installation's own import environment.
+        // A project override of any dependency revokes that premise even if the override
+        // independently replays. Reject such toolchain environments rather than exempting
+        // parents that have never been checked against the changed interface.
+        if toolchain {
+            for child in &imports {
+                let selected = resolve_imported_olean(lean_path, child)
+                    .is_some_and(|p| is_selected_toolchain_artifact(tc_lib, githash, &p, child));
+                anyhow::ensure!(selected,
+                    "Toolchain module `{m}` resolves dependency `{child}` outside the selected installation: fail-closed shadowed toolchain environment");
+            }
+        }
         worklist.extend(imports);
         if let Some(dig) = dig {
             imported.push((m, path, dig));
@@ -8581,6 +8597,7 @@ fn ensure_module_closure_replayed(
         lean_path,
         &cfg.toolchain_lib_lean,
         &cfg.lean_githash,
+        crate::lake_build::worktree_auto_link_disabled(&cfg.root_pkg.pkg_root),
     )?;
     replay_resolved_artifacts(store, cfg, imported, lean_path)
 }
@@ -8596,6 +8613,7 @@ fn replay_resolved_artifacts(
     }
     // A user-selected checkout-local store is not a verifier-controlled authority. It may
     // receive ordinary CAS data, but replay must run on every use and no record is accepted.
+    let preserve_caller = crate::lake_build::worktree_auto_link_disabled(&cfg.root_pkg.pkg_root);
     let authority_paths = [
         store.root.canonicalize()?,
         store.root.join("state.db").canonicalize()?,
@@ -8627,7 +8645,7 @@ fn replay_resolved_artifacts(
     let mut pending = Vec::new();
     for (m, path, dig) in &imported {
         anyhow::ensure!(
-            compute_olean_artifact_set_digest(path)? == *dig,
+            compute_olean_artifact_set_digest_with_policy(path, preserve_caller)? == *dig,
             "Imported artifact `{m}` changed while resolving its closure: fail-closed"
         );
         let record = DependencyReplayRecord::new(cfg, m, dig.clone(), &environment_digest)?;
@@ -8661,7 +8679,7 @@ fn replay_resolved_artifacts(
     // publish authority for artifacts changed during another module's replay.
     for (m, path, dig) in &imported {
         anyhow::ensure!(
-            compute_olean_artifact_set_digest(path)? == *dig,
+            compute_olean_artifact_set_digest_with_policy(path, preserve_caller)? == *dig,
             "Imported artifact `{m}` changed during kernel replay: fail-closed"
         );
     }
@@ -8707,7 +8725,13 @@ pub(crate) fn ensure_imported_oleans_replayed(
     };
     let lean_path = lake_build::resolve_remote_lean_path(canon_dir, None);
     let replay_lp = format!("{}:{}", lean_path, tc_lib.display());
-    let imported = resolve_dependency_artifacts(imports, &replay_lp, &tc_lib, &githash)?;
+    let imported = resolve_dependency_artifacts(
+        imports,
+        &replay_lp,
+        &tc_lib,
+        &githash,
+        crate::lake_build::worktree_auto_link_disabled(canon_dir),
+    )?;
     if imported.is_empty() {
         return Ok(0);
     }
@@ -10774,26 +10798,29 @@ lean_exe «demo-exe» where
                 cfg.toolchain_lib_lean.join("Init.olean"),
                 project_lib.join("Init.olean"),
             )?;
-            let (lp, _) = build_lean_search_path(&cfg, false);
-            let resolved = resolve_dependency_artifacts(
-                vec!["Init".into()],
-                &lp,
-                &cfg.toolchain_lib_lean,
-                &cfg.lean_githash,
-            )?;
-            assert!(resolved.iter().any(|(m, _, _)| m == "Init.Classical"));
-            fs::write(
-                tree.project.join("P/Target.lean"),
-                "import Init\ntheorem target : True := trivial\n",
-            )?;
-            // Supply all root Init companions for Lean's multi-part import.
+            // Supply all root Init companions so this is an import-environment failure,
+            // rather than a missing-companion error.
             for (_, artifact) in olean_artifact_paths(&cfg.toolchain_lib_lean.join("Init.olean")) {
                 let destination = project_lib.join(artifact.file_name().unwrap());
                 if artifact.is_file() && !destination.exists() {
                     std::os::unix::fs::symlink(artifact, destination)?;
                 }
             }
-            build_project_modules_native(
+            let (lp, _) = build_lean_search_path(&cfg, false);
+            let err = resolve_dependency_artifacts(
+                vec!["Init".into()],
+                &lp,
+                &cfg.toolchain_lib_lean,
+                &cfg.lean_githash,
+                false,
+            )
+            .unwrap_err();
+            assert!(format!("{err:#}").contains("Init.Classical"), "{err:#}");
+            fs::write(
+                tree.project.join("P/Target.lean"),
+                "import Init\ntheorem target : True := trivial\n",
+            )?;
+            let err = build_project_modules_native(
                 &mut store,
                 &tree.project,
                 &["P.Target".into()],
@@ -10802,15 +10829,12 @@ lean_exe «demo-exe» where
                 false,
                 true,
                 None,
-            )?;
-            let visited: i64 = store.conn.query_row(
-                "SELECT count(*) FROM dependency_kernel_replays WHERE json_extract(record_json, '$.module') = 'Init.Classical'", [], |r| r.get(0),
-            )?;
+            )
+            .unwrap_err();
             assert!(
-                visited > 0,
-                "native gate must traverse genuine toolchain roots"
+                format!("{err:#}").contains("Init.Classical"),
+                "native traversal must reject the shadowed environment: {err:#}"
             );
-
             // Even byte-identical copies in the project are not toolchain artifacts.
             let project_lib = tree.project.join(build_dir).join("lib/lean");
             fs::remove_file(project_lib.join("Std.olean"))?;
