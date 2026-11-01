@@ -80,6 +80,20 @@ fn checked(command: &mut Command) -> Output {
     out
 }
 
+fn sandbox_available() -> bool {
+    Command::new("/usr/bin/bwrap")
+        .args([
+            "--unshare-all",
+            "--ro-bind",
+            "/",
+            "/",
+            "--",
+            "/usr/bin/true",
+        ])
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
 #[test]
 fn project_toolchain_names_cannot_substitute_verifiers_or_prewarm_helpers() {
     let f = Fixture(std::env::temp_dir().join(format!(
@@ -219,17 +233,7 @@ fn project_toolchain_names_cannot_substitute_verifiers_or_prewarm_helpers() {
         ],
         true,
     );
-    let sandbox_available = Command::new("/usr/bin/bwrap")
-        .args([
-            "--unshare-all",
-            "--ro-bind",
-            "/",
-            "/",
-            "--",
-            "/usr/bin/true",
-        ])
-        .output()
-        .is_ok_and(|out| out.status.success());
+    let sandbox_available = sandbox_available();
     for mode in ["trusted", "untrusted"] {
         let success = mode == "trusted" || sandbox_available;
         for (cache, args) in [
@@ -607,9 +611,11 @@ fn missing_promised_base_blob_fails_closed_without_running_repository_helpers() 
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
+        // Only a host without a working sandbox may reject untrusted mode earlier.
+        let gated = mode == "untrusted" && !sandbox_available();
         assert!(
-            diagnostic.contains("missing") || diagnostic.contains("bubblewrap"),
-            "{diagnostic}"
+            diagnostic.contains(if gated { "bubblewrap" } else { "is missing" }),
+            "{mode}: {diagnostic}"
         );
         assert!(!marker.exists(), "{mode}: a repository Git helper ran");
     }
