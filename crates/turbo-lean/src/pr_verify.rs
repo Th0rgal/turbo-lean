@@ -4269,6 +4269,13 @@ pub fn run_pr_verify_command(
     let lake_t0 = Instant::now();
     let mut lake_rechecked_modules = 0usize;
     let mut untrusted_deps_built = false;
+    let mut trusted_replay_targets: Vec<PathBuf> = shards_by_file
+        .keys()
+        .chain(classification.modified_files.iter())
+        .chain(classification.altered_interface_files.iter())
+        .map(|f| canon_dir.join(f))
+        .collect();
+    let mut trusted_replay_mods: Vec<String> = Vec::new();
     if !classification.altered_interface_files.is_empty() {
         if is_untrusted {
             lake_rechecked_modules = crate::lake_build::untrusted_recheck_dependents(
@@ -4280,23 +4287,40 @@ pub fn run_pr_verify_command(
             )?;
             untrusted_deps_built = true;
         } else {
-            lake_rechecked_modules = crate::lake_build::lake_recheck_dependents(
-                &canon_dir,
-                &classification.altered_interface_files,
-                Some(&base),
-            )?;
+            let (rechecked_count, rechecked_files, rechecked_mods) =
+                crate::lake_build::lake_recheck_dependents(
+                    &canon_dir,
+                    &classification.altered_interface_files,
+                    Some(&base),
+                )?;
+            lake_rechecked_modules = rechecked_count;
+            trusted_replay_targets.extend(rechecked_files);
+            trusted_replay_mods.extend(rechecked_mods);
         }
     } else if !is_untrusted {
-        let edited: Vec<PathBuf> = shards_by_file.keys().map(|f| canon_dir.join(f)).collect();
         if crate::lake_build::worktree_auto_link_disabled(&canon_dir) {
-            crate::lake_build::ensure_project_imports_fresh_for_check(&canon_dir, &edited)?;
+            crate::lake_build::ensure_project_imports_fresh_for_check(
+                &canon_dir,
+                &trusted_replay_targets,
+            )?;
         } else if crate::lake_build::has_lake_config(&canon_dir) {
-            let imports = crate::lake_build::project_imports_of(&canon_dir, &edited);
+            let imports = crate::lake_build::project_imports_of(&canon_dir, &trusted_replay_targets);
             if !imports.is_empty() {
                 crate::lake_build::lake_build_modules(&canon_dir, &imports, Some(&base))?;
             }
         }
-        crate::module_builder::ensure_imported_oleans_replayed(store, &canon_dir, &edited)?;
+    }
+    if !is_untrusted {
+        trusted_replay_targets.sort();
+        trusted_replay_targets.dedup();
+        trusted_replay_mods.sort();
+        trusted_replay_mods.dedup();
+        crate::lake_build::ensure_modules_and_imports_replayed(
+            store,
+            &canon_dir,
+            &trusted_replay_targets,
+            &trusted_replay_mods,
+        )?;
     }
     let lake_recheck_ms = lake_t0.elapsed().as_millis();
 
@@ -7579,7 +7603,7 @@ end Fixture
         )?;
         let edits = crate::lake_build::nonlocal_edits(&a_file, "HEAD");
         assert_eq!(
-            crate::lake_build::lake_recheck_dependents(&dir, &edits, None)?,
+            crate::lake_build::lake_recheck_dependents(&dir, &edits, None)?.0,
             2
         );
         // Non-local edit introducing an unallowed axiom (`native_decide` hidden via macro) is rejected by Stage 1C in untrusted mode.
@@ -7782,6 +7806,188 @@ end Fixture
         assert!(d_local[0].starts_with("Lean.Local:pkg="));
 
         let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_trusted_pr_verify_interface_change_replays_dependent_consumer_imports() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_pr_verify_trusted_closure_replay_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let proj = dir.join("proj");
+        let dep_pkg = proj.join(".lake/packages/dep_pkg");
+        fs::create_dir_all(proj.join("P"))?;
+        fs::create_dir_all(dep_pkg.join("Dep"))?;
+        let toolchain = include_str!("../../../lean/lean-toolchain");
+        fs::write(proj.join("lean-toolchain"), toolchain)?;
+        fs::write(dep_pkg.join("lean-toolchain"), toolchain)?;
+        fs::write(dep_pkg.join("Dep/Bad.lean"), "import Init\n")?;
+        fs::write(
+            dep_pkg.join("lakefile.toml"),
+            "name = \"dep_pkg\"\n[[lean_lib]]\nname = \"Dep\"\nroots = [\"Dep.Bad\"]\n",
+        )?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            r#"{"version": "1.2.0", "packagesDir": ".lake/packages", "packages": [{"type": "path", "name": "dep_pkg", "dir": ".lake/packages/dep_pkg", "configFile": "lakefile.toml", "inherited": false}], "name": "proj", "lakeDir": ".lake", "fixedToolchain": false}"#,
+        )?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"proj\"\ndefaultTargets = [\"P\"]\n[[require]]\nname = \"dep_pkg\"\npath = \".lake/packages/dep_pkg\"\n[[lean_lib]]\nname = \"P\"\nglobs = [\"P.+\"]\n",
+        )?;
+        fs::write(proj.join("P/A.lean"), "def k : Nat := 1\n")?;
+        fs::write(
+            proj.join("P/B.lean"),
+            "import P.A\nimport Dep.Bad\ntheorem b_uses_dep : False := dep_forged_false\n",
+        )?;
+
+        let cfg = crate::module_builder::resolve_project_config(&proj)?;
+        let lake_bin = cfg
+            .lean_bin
+            .parent()
+            .expect("lean bin parent")
+            .join("lake");
+        let lake_dep = Command::new(&lake_bin)
+            .args(["build", "Dep.Bad"])
+            .current_dir(&dep_pkg)
+            .env("SANDBOXED_ALLOW_RAW_LAKE", "1")
+            .output()?;
+        anyhow::ensure!(
+            lake_dep.status.success(),
+            "lake build Dep.Bad: {} {}",
+            String::from_utf8_lossy(&lake_dep.stdout),
+            String::from_utf8_lossy(&lake_dep.stderr)
+        );
+
+        let maker_path = dir.join("Maker.lean");
+        fs::write(
+            &maker_path,
+            "import Lean\nopen Lean\ndef main (args : List String) : IO Unit := do\n  searchPathRef.set [System.FilePath.mk args[1]!]\n  let env ← importModules #[{ module := `Init }] {} 0\n  let env := env.setMainModule `Dep.Bad\n  let decl : Declaration := .thmDecl {\n    name := `dep_forged_false,\n    levelParams := [],\n    type := mkConst ``False,\n    value := mkConst ``True.intro\n  }\n  match env.addDeclCore 0 0 decl none false with\n  | Except.ok env2 => writeModule env2 args[0]! false\n  | Except.error _ => throw <| IO.userError \"addDecl failed\"\n",
+        )?;
+        let forged_olean = dir.join("Bad.forged.olean");
+        let compile_forged = Command::new(&cfg.lean_bin)
+            .arg("--run")
+            .arg(&maker_path)
+            .arg(&forged_olean)
+            .arg(&cfg.toolchain_lib_lean)
+            .env("LEAN_PATH", &cfg.toolchain_lib_lean)
+            .output()?;
+        anyhow::ensure!(
+            compile_forged.status.success(),
+            "Maker.lean failed: {} {}",
+            String::from_utf8_lossy(&compile_forged.stdout),
+            String::from_utf8_lossy(&compile_forged.stderr)
+        );
+        let dep_lib_lean = dep_pkg.join(".lake/build/lib/lean");
+        fs::copy(&forged_olean, dep_lib_lean.join("Dep/Bad.olean"))?;
+        let new_h = crate::module_builder::lake_hash_bytes(&fs::read(
+            dep_lib_lean.join("Dep/Bad.olean"),
+        )?);
+        fs::write(
+            dep_lib_lean.join("Dep/Bad.olean.hash"),
+            format!("{:016x}\n", new_h),
+        )?;
+        let dep_trace_path = dep_lib_lean.join("Dep/Bad.trace");
+        let mut dep_tv: serde_json::Value = serde_json::from_slice(&fs::read(&dep_trace_path)?)?;
+        dep_tv["outputs"]["o"][0] = serde_json::Value::String(format!("{:016x}.olean", new_h));
+        fs::write(&dep_trace_path, serde_json::to_vec(&dep_tv)?)?;
+
+        let lake_proj = Command::new(&lake_bin)
+            .args(["build", "P.A", "P.B"])
+            .current_dir(&proj)
+            .env("SANDBOXED_ALLOW_RAW_LAKE", "1")
+            .output()?;
+        anyhow::ensure!(
+            lake_proj.status.success(),
+            "lake build P.A P.B: {} {}",
+            String::from_utf8_lossy(&lake_proj.stdout),
+            String::from_utf8_lossy(&lake_proj.stderr)
+        );
+
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec![
+                "add",
+                "lean-toolchain",
+                "lakefile.toml",
+                "lake-manifest.json",
+                "P/A.lean",
+                "P/B.lean",
+            ],
+            vec!["commit", "-m", "base"],
+        ] {
+            let g = Command::new("git").args(&args).current_dir(&proj).output()?;
+            anyhow::ensure!(
+                g.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&g.stderr)
+            );
+        }
+
+        // Interface change in `P/A.lean` (zero theorem shards in `P/A.lean`, `P/B.lean` untouched
+        // in the diff): `lake_recheck_dependents` rebuilds `P.A` and consumer `P.B`, which imports
+        // the forged Lake-built dependency `Dep.Bad`. Trusted `pr-verify` MUST kernel-replay the
+        // closure's imported `.olean`s and reject `Dep.Bad` (`KernelReplay`), rather than skipping
+        // `ensure_imported_oleans_replayed` on the `altered_interface_files` branch.
+        fs::write(proj.join("P/A.lean"), "def k : Nat := 2\n")?;
+        let mut store = TurboStore::open(Some(&dir.join("cache")))?;
+        let pr_err = run_pr_verify_command(
+            &mut store,
+            true,
+            proj.clone(),
+            "HEAD".to_string(),
+            "trusted".to_string(),
+            false,
+            None,
+            None,
+            None,
+            None,
+            false,
+            1,
+            None,
+        )
+        .unwrap_err();
+        let err_msg = format!("{pr_err:#}");
+        assert!(
+            err_msg.contains("KernelReplay"),
+            "trusted pr-verify on interface change with forged consumer dependency must fail KernelReplay, got: {err_msg}"
+        );
+
+        // Also test when the interface change itself has a theorem shard AND imports `Dep.Bad`:
+        // `altered_interface_files` is non-empty, and trusted `pr-verify` must still reject via
+        // `KernelReplay` before shard cache or statement checks.
+        fs::write(
+            proj.join("P/A.lean"),
+            "import Dep.Bad\ndef k : Nat := 3\ntheorem a_thm : False := dep_forged_false\n",
+        )?;
+        let pr_err_direct = run_pr_verify_command(
+            &mut store,
+            true,
+            proj.clone(),
+            "HEAD".to_string(),
+            "trusted".to_string(),
+            false,
+            None,
+            None,
+            None,
+            None,
+            false,
+            1,
+            None,
+        )
+        .unwrap_err();
+        let err_direct_msg = format!("{pr_err_direct:#}");
+        assert!(
+            err_direct_msg.contains("KernelReplay"),
+            "trusted pr-verify on interface change directly importing forged dependency must fail KernelReplay, got: {err_direct_msg}"
+        );
+
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
 }

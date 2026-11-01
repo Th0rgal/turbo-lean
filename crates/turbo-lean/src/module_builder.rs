@@ -8597,10 +8597,20 @@ pub(crate) fn ensure_imported_oleans_replayed(
     canon_dir: &Path,
     target_files: &[PathBuf],
 ) -> Result<usize> {
+    ensure_imported_oleans_replayed_with_roots(store, canon_dir, target_files, &[])
+}
+
+pub(crate) fn ensure_imported_oleans_replayed_with_roots(
+    store: &TurboStore,
+    canon_dir: &Path,
+    target_files: &[PathBuf],
+    root_modules: &[String],
+) -> Result<usize> {
     let mut worklist: Vec<String> = target_files
         .iter()
         .filter_map(|f| fs::read_to_string(f).ok())
         .flat_map(|s| parse_header_info(&s).imports)
+        .chain(root_modules.iter().cloned())
         .collect();
     if worklist.is_empty() {
         return Ok(0);

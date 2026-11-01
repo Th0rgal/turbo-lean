@@ -2552,7 +2552,7 @@ pub(crate) fn dependent_closure_modules(
     canon_dir: &Path,
     edits: &[String],
     is_untrusted: bool,
-) -> Result<(Vec<String>, Option<Vec<String>>)> {
+) -> Result<(Vec<String>, Option<Vec<String>>, Option<Vec<PathBuf>>)> {
     let cfg = crate::module_builder::resolve_project_config_with_trust(canon_dir, is_untrusted)?;
     let mut seeds: Vec<String> = cfg.root_pkg.libs.iter().map(|l| l.name.clone()).collect();
     for exe in &cfg.root_pkg.exes {
@@ -2605,16 +2605,28 @@ pub(crate) fn dependent_closure_modules(
                     }
                 }
             }
-            closure.into_iter().collect::<Vec<_>>()
+            let files: Vec<PathBuf> = closure
+                .iter()
+                .filter_map(|m| dag.nodes.get(m).map(|n| n.src_path.clone()))
+                .collect();
+            (closure.into_iter().collect::<Vec<_>>(), files)
         });
-    Ok((seeds, closure))
+    let (closure_mods, closure_files) = match closure {
+        Some((m, f)) => (Some(m), Some(f)),
+        None => (None, None),
+    };
+    Ok((seeds, closure_mods, closure_files))
 }
 
 /// After a non-local edit, re-check with Lake the edited modules and every project module that
 /// imports them, directly or not (Lake replays unchanged imports from its build or artifact
 /// cache). Without a module graph it re-checks every `lean_lib`; without a Lake config it
 /// refuses to pass. Returns the number of modules re-checked (0: all libraries).
-pub(crate) fn recheck_dependents_if_nonlocal(canon_dir: &Path, target: &Path) -> Result<()> {
+pub(crate) fn recheck_dependents_if_nonlocal(
+    store: &TurboStore,
+    canon_dir: &Path,
+    target: &Path,
+) -> Result<()> {
     let lake_root = target.canonicalize().ok().and_then(|f| {
         f.ancestors()
             .find(|a| has_lake_config(a))
@@ -2638,7 +2650,8 @@ pub(crate) fn recheck_dependents_if_nonlocal(canon_dir: &Path, target: &Path) ->
             "[turbo-lean] non-local edit in {}: re-checking dependents with Lake",
             edits.join(", ")
         );
-        let n = lake_recheck_dependents(&dir, &edits, None)?;
+        let (n, rechecked_files, rechecked_mods) = lake_recheck_dependents(&dir, &edits, None)?;
+        ensure_modules_and_imports_replayed(store, &dir, &rechecked_files, &rechecked_mods)?;
         eprintln!(
             "[turbo-lean] Lake re-checked {} modules (0: all libraries)",
             n
@@ -2651,7 +2664,7 @@ pub(crate) fn lake_recheck_dependents(
     canon_dir: &Path,
     edits: &[String],
     rev: Option<&str>,
-) -> Result<usize> {
+) -> Result<(usize, Vec<PathBuf>, Vec<String>)> {
     if !has_lake_config(canon_dir) {
         anyhow::bail!(
             "non-local edit in {} needs its dependents re-checked, but {} has no Lake config: refusing to pass",
@@ -2659,14 +2672,37 @@ pub(crate) fn lake_recheck_dependents(
             canon_dir.display()
         );
     }
-    let (libs, closure) = dependent_closure_modules(canon_dir, edits, false)?;
-    match closure {
-        Some(mods) if !mods.is_empty() => {
+    let (libs, closure, closure_files) = dependent_closure_modules(canon_dir, edits, false)?;
+    match (closure, closure_files) {
+        (Some(mods), Some(files)) if !mods.is_empty() => {
             lake_build_modules(canon_dir, &mods, rev)?;
-            Ok(mods.len())
+            Ok((mods.len(), files, mods))
         }
-        _ => lake_build_modules(canon_dir, &libs, rev).map(|_| 0),
+        _ => {
+            lake_build_modules(canon_dir, &libs, rev)?;
+            let files = collect_project_lean_files(canon_dir, false, None);
+            let fallback_mods: Vec<String> = files
+                .iter()
+                .filter_map(|f| f.strip_prefix(canon_dir).ok())
+                .map(|r| r.with_extension("").to_string_lossy().replace('/', "."))
+                .collect();
+            Ok((0, files, fallback_mods))
+        }
     }
+}
+
+pub(crate) fn ensure_modules_and_imports_replayed(
+    store: &TurboStore,
+    canon_dir: &Path,
+    target_files: &[PathBuf],
+    module_names: &[String],
+) -> Result<usize> {
+    crate::module_builder::ensure_imported_oleans_replayed_with_roots(
+        store,
+        canon_dir,
+        target_files,
+        module_names,
+    )
 }
 
 pub(crate) fn untrusted_recheck_dependents(
@@ -2683,7 +2719,7 @@ pub(crate) fn untrusted_recheck_dependents(
             canon_dir.display()
         );
     }
-    let (libs, closure) = dependent_closure_modules(canon_dir, edits, true)?;
+    let (libs, closure, _) = dependent_closure_modules(canon_dir, edits, true)?;
     let (targets, count) = match closure {
         Some(mods) if !mods.is_empty() => {
             let n = mods.len();
