@@ -485,13 +485,16 @@ pub(crate) fn acquire_deferred_pack_lock(store_root: &Path) -> Result<DeferredPa
     {
         use std::os::unix::io::AsRawFd;
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error()).context("flock(LOCK_EX) deferred_pack.lock");
+            return Err(std::io::Error::last_os_error())
+                .context("flock(LOCK_EX) deferred_pack.lock");
         }
     }
     Ok(DeferredPackLockGuard { file })
 }
 
-pub(crate) fn list_pending_deferred_pack_files(locks_dir: &Path) -> Result<Vec<std::path::PathBuf>> {
+pub(crate) fn list_pending_deferred_pack_files(
+    locks_dir: &Path,
+) -> Result<Vec<std::path::PathBuf>> {
     let entries = match fs::read_dir(locks_dir) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1032,6 +1035,7 @@ pub fn export_pack_filtered_with_mode_and_signing_key(
     header_only_shared_cas: bool,
     signing_key: Option<&str>,
 ) -> Result<(usize, usize, u64, Vec<u8>)> {
+    let _pub_guard = crate::db::acquire_cas_publication_guard(&store.root)?;
     let signing_key_env = signing_key
         .map(|s| s.to_string())
         .or_else(|| std::env::var("TURBO_LEAN_PACK_SIGNING_KEY").ok())
@@ -1189,11 +1193,13 @@ pub fn export_pack_filtered_with_mode_and_signing_key(
                                                 &locks_dir,
                                                 &store.root,
                                             ) {
-                                                let last_0 = locks_dir.join("last_full_export_0.bin");
+                                                let last_0 =
+                                                    locks_dir.join("last_full_export_0.bin");
                                                 let _ = crate::db::write_bytes_durable(
                                                     &last_0, &cache_buf, &created,
                                                 );
-                                                let last_1 = locks_dir.join("last_full_export_1.bin");
+                                                let last_1 =
+                                                    locks_dir.join("last_full_export_1.bin");
                                                 if !last_1.exists() {
                                                     let _ = crate::db::publish_durable_link(
                                                         &v3_file, &last_1, &created,
@@ -1493,8 +1499,7 @@ pub fn export_pack_filtered_with_mode_and_signing_key(
                                 crate::db::ensure_dir_tracking(&locks_dir, &store.root)
                             {
                                 let last_v3 = locks_dir.join("last_full_export_1.bin");
-                                let _ =
-                                    crate::db::write_bytes_durable(&last_v3, &v3_buf, &created);
+                                let _ = crate::db::write_bytes_durable(&last_v3, &v3_buf, &created);
                             }
                         }
                     }
@@ -1532,6 +1537,7 @@ pub fn export_pack_filtered_with_signing_key(
     exclude_blobs: &HashSet<String>,
     signing_key: Option<&str>,
 ) -> Result<(usize, usize, u64)> {
+    let _pub_guard = crate::db::acquire_cas_publication_guard(&store.root)?;
     let (n_acts, n_blobs, total_raw_bytes, pack_stream) =
         export_pack_filtered_with_mode_and_signing_key(
             store,
@@ -2107,6 +2113,7 @@ pub fn import_pack_bytes_with_policy(
     trusted_pubkey: Option<&str>,
     allow_unattested_trusted: bool,
 ) -> Result<(usize, usize)> {
+    let _pub_guard = crate::db::acquire_cas_publication_guard(&store.root)?;
     let is_uncompressed = input_bytes.starts_with(b"TLPK\x00\x00\x00\x02")
         || input_bytes.starts_with(b"TLPK\x00\x00\x00\x03")
         || input_bytes.first().copied() == Some(b'{');
@@ -2155,7 +2162,6 @@ pub fn import_pack_bytes_with_policy(
         allow_unattested_trusted,
     )?;
 
-    let _pub_guard = crate::db::acquire_cas_publication_guard(&store.root)?;
     let expected_payload: usize = manifest.blobs.iter().map(|b| b.size_bytes as usize).sum();
     if is_v3_header_only || (!payload_region.is_empty() && payload_region.len() == expected_payload)
     {
@@ -3012,7 +3018,11 @@ fn http_request_with_resolved_token(
     let mut reader = BufReader::new(stream);
     let mut status_line = String::with_capacity(64);
     if reader.read_line(&mut status_line)? == 0 {
-        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "EOF before HTTP response").into());
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "EOF before HTTP response",
+        )
+        .into());
     }
     let mut content_len: Option<usize> = None;
     let mut header_sha256: Option<String> = None;
@@ -4653,10 +4663,8 @@ pub(crate) mod tests {
     fn test_deferred_pack_spool_multi_pack_crash_claim_and_failed_replay_preservation() -> Result<()>
     {
         let _env_guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let root_a =
-            std::env::temp_dir().join(format!("turbo_lean_def_src_a_{}", next_tmp_id()));
-        let root_b =
-            std::env::temp_dir().join(format!("turbo_lean_def_src_b_{}", next_tmp_id()));
+        let root_a = std::env::temp_dir().join(format!("turbo_lean_def_src_a_{}", next_tmp_id()));
+        let root_b = std::env::temp_dir().join(format!("turbo_lean_def_src_b_{}", next_tmp_id()));
         let root_dst =
             std::env::temp_dir().join(format!("turbo_lean_def_spool_dst_{}", next_tmp_id()));
         let _ = fs::remove_dir_all(&root_a);
@@ -4711,16 +4719,34 @@ pub(crate) mod tests {
 
         // 1. Multiple sequential cold imports before any `TurboStore::open` must preserve BOTH
         //    spooled records without overwriting the earlier record.
-        assert!(try_stateless_cold_import_with_domain(&root_dst, &pack_a, Some("trusted"), None, true).is_some());
-        assert!(try_stateless_cold_import_with_domain(&root_dst, &pack_b, Some("trusted"), None, true).is_some());
+        assert!(try_stateless_cold_import_with_domain(
+            &root_dst,
+            &pack_a,
+            Some("trusted"),
+            None,
+            true
+        )
+        .is_some());
+        assert!(try_stateless_cold_import_with_domain(
+            &root_dst,
+            &pack_b,
+            Some("trusted"),
+            None,
+            true
+        )
+        .is_some());
         assert_eq!(
             list_pending_deferred_pack_files(&root_dst.join("locks"))?.len(),
             2
         );
 
         let opened = TurboStore::open(Some(&root_dst))?;
-        assert!(opened.get_cached_action("def-act-alpha", "trusted")?.is_some());
-        assert!(opened.get_cached_action("def-act-bravo", "trusted")?.is_some());
+        assert!(opened
+            .get_cached_action("def-act-alpha", "trusted")?
+            .is_some());
+        assert!(opened
+            .get_cached_action("def-act-bravo", "trusted")?
+            .is_some());
         assert!(list_pending_deferred_pack_files(&root_dst.join("locks"))?.is_empty());
         drop(opened);
 
@@ -4783,10 +4809,14 @@ pub(crate) mod tests {
         fs::write(&orphan_claim_path, &claim_v4)?;
 
         // Stage a newer valid pack (`pack_b`) while the crashed `.claim.` file is present.
-        assert!(
-            try_stateless_cold_import_with_domain(&root_crash, &pack_b, Some("trusted"), None, true)
-                .is_some()
-        );
+        assert!(try_stateless_cold_import_with_domain(
+            &root_crash,
+            &pack_b,
+            Some("trusted"),
+            None,
+            true
+        )
+        .is_some());
         assert_eq!(
             list_pending_deferred_pack_files(&root_crash.join("locks"))?.len(),
             2
@@ -4826,14 +4856,22 @@ pub(crate) mod tests {
         // 3. Concurrent `TurboStore::open` deferred-pack replay vs `run_gc` + `stage_deferred_pack_record`
         //    must follow uniform lock order (`gc_publish.lock` -> `deferred_pack.lock`) without deadlocking,
         //    and cold stateless import into a previously nonexistent store directory must succeed cleanly.
-        let root_nonexistent = root_dst.join("nonexistent_parent").join("cold_target_store");
+        let root_nonexistent = root_dst
+            .join("nonexistent_parent")
+            .join("cold_target_store");
         assert!(!root_nonexistent.exists());
-        assert!(
-            try_stateless_cold_import_with_domain(&root_nonexistent, &pack_a, Some("trusted"), None, true)
-                .is_some()
-        );
+        assert!(try_stateless_cold_import_with_domain(
+            &root_nonexistent,
+            &pack_a,
+            Some("trusted"),
+            None,
+            true
+        )
+        .is_some());
         let mut gc_peer = TurboStore::open(Some(&root_nonexistent))?;
-        assert!(gc_peer.get_cached_action("def-act-alpha", "trusted")?.is_some());
+        assert!(gc_peer
+            .get_cached_action("def-act-alpha", "trusted")?
+            .is_some());
 
         let (_, _, hdr_b) = read_pack_header_from_file(&pack_b).unwrap();
         let mut v3_b = Vec::with_capacity(16 + hdr_b.len());
@@ -4842,12 +4880,20 @@ pub(crate) mod tests {
         v3_b.extend_from_slice(&hdr_b);
 
         for _ in 0..8 {
-            assert!(stage_deferred_pack_record(&root_nonexistent, "trusted", &v3_b));
+            assert!(stage_deferred_pack_record(
+                &root_nonexistent,
+                "trusted",
+                &v3_b
+            ));
             let r_open = root_nonexistent.clone();
             let h_open = std::thread::spawn(move || TurboStore::open(Some(&r_open)));
             let _ = gc_peer.run_gc(u64::MAX, 7 * 86400, true)?;
-            let s_open = h_open.join().expect("open replay thread must not panic/deadlock")?;
-            assert!(s_open.get_cached_action("def-act-bravo", "trusted")?.is_some());
+            let s_open = h_open
+                .join()
+                .expect("open replay thread must not panic/deadlock")?;
+            assert!(s_open
+                .get_cached_action("def-act-bravo", "trusted")?
+                .is_some());
         }
         drop(gc_peer);
 
@@ -4859,10 +4905,7 @@ pub(crate) mod tests {
     }
 }
 
-pub type PrefetchedExportItem = (
-    Vec<u8>,
-    Option<PrefetchedPackPrestage>,
-);
+pub type PrefetchedExportItem = (Vec<u8>, Option<PrefetchedPackPrestage>);
 
 /// Execute `turbo-lean export`.
 pub fn run_export_command(
@@ -5035,34 +5078,33 @@ pub fn run_sync_command(
                 Ok(Ok((pack_bytes, prestaged_opt))) => {
                     verify_optional_sha256(&pack_bytes, None, sha_opt, &remote)?;
                     if !pack_bytes.is_empty() {
-                        pulled =
-                            if let Some((manifest, staged_blobs, newly_written, pub_guard)) =
-                                prestaged_opt
-                            {
-                                let td = resolve_pack_import_trust_domain(
-                                    &manifest,
-                                    req_td,
-                                    pk_opt,
-                                    allow_unattested_trusted,
-                                )?;
-                                let res = finish_import_from_prestaged_shared_cas_with_domain(
-                                    store,
-                                    &manifest,
-                                    &staged_blobs,
-                                    newly_written,
-                                    td,
-                                )?;
-                                drop(pub_guard);
-                                res
-                            } else {
-                                import_pack_bytes_with_policy(
-                                    store,
-                                    &pack_bytes,
-                                    req_td,
-                                    pk_opt,
-                                    allow_unattested_trusted,
-                                )?
-                            };
+                        pulled = if let Some((manifest, staged_blobs, newly_written, pub_guard)) =
+                            prestaged_opt
+                        {
+                            let td = resolve_pack_import_trust_domain(
+                                &manifest,
+                                req_td,
+                                pk_opt,
+                                allow_unattested_trusted,
+                            )?;
+                            let res = finish_import_from_prestaged_shared_cas_with_domain(
+                                store,
+                                &manifest,
+                                &staged_blobs,
+                                newly_written,
+                                td,
+                            )?;
+                            drop(pub_guard);
+                            res
+                        } else {
+                            import_pack_bytes_with_policy(
+                                store,
+                                &pack_bytes,
+                                req_td,
+                                pk_opt,
+                                allow_unattested_trusted,
+                            )?
+                        };
                         if pulled.0 > 0 || pulled.1 > 0 {
                             pulled_bytes = pack_bytes.len() as u64;
                         }

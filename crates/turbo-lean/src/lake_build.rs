@@ -151,7 +151,11 @@ pub(crate) fn spawn_lake_env(project_dir: &Path) -> Result<HashMap<String, Strin
             "{diagnostic}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let prefix = PathBuf::from(String::from_utf8(output.stdout).with_context(|| diagnostic)?.trim());
+        let prefix = PathBuf::from(
+            String::from_utf8(output.stdout)
+                .with_context(|| diagnostic)?
+                .trim(),
+        );
         anyhow::ensure!(
             prefix.is_absolute()
                 && prefix.join("bin/lean").is_file()
@@ -3029,6 +3033,7 @@ pub fn dedup_worktree_packages(
     let mut deduped_bytes = 0u64;
 
     if lake_dir.is_dir() {
+        let _pub_guard = crate::db::acquire_cas_publication_guard(&store.root)?;
         let mut stack = vec![lake_dir];
         let mut seen_hash_cache: HashMap<(u64, u64), String> = HashMap::new();
         while let Some(dir) = stack.pop() {
@@ -4063,7 +4068,11 @@ mod tests {
             assert_eq!(fs::metadata(&wt_local)?.permissions().mode() & 0o777, 0o600);
         }
         for (path, bytes) in &main_lake_bytes {
-            assert_eq!(&fs::read(path)?, bytes, "opt-out must not copy or rewrite main `.lake`");
+            assert_eq!(
+                &fs::read(path)?,
+                bytes,
+                "opt-out must not copy or rewrite main `.lake`"
+            );
         }
         #[cfg(unix)]
         {

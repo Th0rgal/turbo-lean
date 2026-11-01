@@ -130,23 +130,73 @@ impl Drop for CasExclusiveGcGuard {
 
 const STORE_TREE_DURABLE_MARKER: &str = "store_tree_durable.v1";
 
+fn same_dir_inode(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(ma), Ok(mb)) = (fs::metadata(a), fs::metadata(b)) {
+            return ma.dev() == mb.dev() && ma.ino() == mb.ino();
+        }
+    }
+    a == b
+}
+
+/// Find the deepest pre-existing canonical directory along `raw_locks` using real OS traversal on
+/// every existing prefix (handling symlinks, relative paths, and `..`). When a missing component is
+/// encountered (even if followed by `..`, which `fs::create_dir_all` creates component-by-component
+/// on Unix), the deepest existing canonical directory reached before that missing component is the
+/// exact pre-existing parent directory into which the highest newly created entry is linked.
+fn deepest_preexisting_boundary_for_locks(raw_locks: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
+    let mut cur = PathBuf::new();
+    let mut deepest: Option<PathBuf> = None;
+    let mut saw_missing = false;
+    let mut missing_prefixes = Vec::new();
+    for comp in raw_locks.components() {
+        cur.push(comp);
+        if saw_missing {
+            missing_prefixes.push(cur.clone());
+            continue;
+        }
+        match fs::metadata(&cur) {
+            Ok(_) => {
+                deepest = Some(fs::canonicalize(&cur)?);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                saw_missing = true;
+                missing_prefixes.push(cur.clone());
+            }
+            // If an existing upper ancestor is traverse-only (e.g., `0111` or unusual FS returning
+            // `PermissionDenied` on `stat("/")` while allowing `+x` traversal into a writable child),
+            // continue probing deeper prefixes until we reach the writable existing workspace boundary.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let boundary = deepest
+        .ok_or_else(|| anyhow::anyhow!("no existing ancestor for {}", raw_locks.display()))?;
+    Ok((boundary, missing_prefixes))
+}
+
 /// Ensure `<store_root>/locks` exists using real OS path traversal (`fs::create_dir_all` +
-/// `fs::canonicalize` on the created directory) and durably persist `store_root`,
-/// `<store_root>/locks`, and every ancestor directory above `store_root` (including `.` for
-/// relative `--cache-dir` roots, symlinked prefixes, and missing intermediate components followed
-/// by `..`) before returning the canonical `<store_root>/locks` path.
+/// `fs::canonicalize` on the created directory) and durably persist `<store_root>/locks`,
+/// `store_root`, every newly created intermediate directory, and the immediate pre-existing parent
+/// directory naming the highest newly created entry (including `.` for relative `--cache-dir`
+/// roots and symlinked prefixes) before returning the canonical `<store_root>/locks` path.
 ///
-/// Concurrency & crash invariant:
+/// Concurrency, permission & crash invariants:
 /// - Never lexically strip `..` or `file_name()` on unresolved prefixes: `fs::create_dir_all` on
-///   `store_root.join("locks")` performs real OS component-by-component traversal (failing with
-///   `ENOENT` on `/existing/missing/../cache`, matching `TurboStore::open`, and creating any
-///   missing intermediate directories along valid symlinked or relative paths), after which
-///   `fs::canonicalize` yields the exact canonical `locks/` directory inode.
-/// - Mere filesystem existence of `locks/` does NOT prove a racing peer finished syncing the
-///   parent directories naming `store_root`. We gate the fast path on a durable marker file
-///   `<store_root>/locks/store_tree_durable.v1` published ONLY after every ancestor directory
-///   barrier bottom-up (`store_root` -> `store_root.parent()` -> ... -> `/`) succeeds. Any barrier
-///   failure propagates immediately without writing the marker.
+///   `raw_locks` performs real OS component-by-component creation (including any missing
+///   intermediate followed by `..`, which is synced before walking canonical `abs_locks` ancestors),
+///   after which `fs::canonicalize` yields the exact canonical `locks/` directory inode.
+/// - Pre-existing upper host directories above the store's pre-existing parent (e.g., `/home`,
+///   `/Users/<admin>`, `/var/lib/...` with mode `0711` execute-only search permissions, or a
+///   read-only `/` root mount) were NOT modified to link this store and may forbid `O_RDONLY`
+///   directory opens (`EACCES`) or `fsync` (`EROFS`/`EINVAL`). Stopping the bottom-up barrier at
+///   the deepest pre-existing ancestor (floored at `abs_store.parent()` so racing peers that
+///   observe already-created `store_root/locks` without `store_tree_durable.v1` still sync the
+///   store's parent; and extending higher only while lower ancestors remain writable/syncable when
+///   `locks/` already existed) avoids touching unrelated upper host directories while failing
+///   closed on any required directory barrier before writing `store_tree_durable.v1`.
 pub(crate) fn ensure_store_locks_dir_durable(store_root: &Path) -> Result<PathBuf> {
     let raw_locks = if store_root.is_absolute() {
         store_root.join("locks")
@@ -156,20 +206,83 @@ pub(crate) fn ensure_store_locks_dir_durable(store_root: &Path) -> Result<PathBu
     if raw_locks.join(STORE_TREE_DURABLE_MARKER).exists() {
         return Ok(fs::canonicalize(&raw_locks)?);
     }
+    let (pre_existing_boundary, missing_prefixes) =
+        deepest_preexisting_boundary_for_locks(&raw_locks)?;
+    let locks_preexisted = raw_locks.exists();
     fs::create_dir_all(&raw_locks)?;
     let abs_locks = fs::canonicalize(&raw_locks)?;
     let abs_marker = abs_locks.join(STORE_TREE_DURABLE_MARKER);
     if abs_marker.exists() {
         return Ok(abs_locks);
     }
+    sync_dir(&abs_locks)?;
+    let abs_store = abs_locks.parent().unwrap_or(&abs_locks);
+    let required_stop = if same_dir_inode(&pre_existing_boundary, &abs_locks)
+        || same_dir_inode(&pre_existing_boundary, abs_store)
+    {
+        abs_store.parent().unwrap_or(abs_store).to_path_buf()
+    } else {
+        pre_existing_boundary
+    };
+    let mut synced_dirs = vec![abs_locks.clone()];
+    for mp in missing_prefixes.iter().rev() {
+        let canon = fs::canonicalize(mp)?;
+        if !same_dir_inode(&canon, &required_stop)
+            && !synced_dirs.iter().any(|d| same_dir_inode(d, &canon))
+        {
+            sync_dir(&canon)?;
+            synced_dirs.push(canon);
+        }
+    }
+
+    let mut reached_required_stop = false;
     let mut anc = abs_locks.parent();
     while let Some(p) = anc {
         if p.as_os_str().is_empty() {
             break;
         }
-        sync_dir(p)?;
-        if p.parent().is_none() {
-            break;
+        if !reached_required_stop {
+            if !synced_dirs.iter().any(|d| same_dir_inode(d, p)) {
+                sync_dir(p)?;
+                synced_dirs.push(p.to_path_buf());
+            }
+            if same_dir_inode(p, &required_stop) || p.parent().is_none() {
+                reached_required_stop = true;
+                if !locks_preexisted {
+                    break;
+                }
+            }
+        } else {
+            // Racing-peer recovery (`locks_preexisted && !abs_marker.exists()`): a concurrent peer
+            // may have created an intermediate parent directory right before our scan without yet
+            // syncing the outer directory naming it. Sync upward opportunistically, stopping cleanly
+            // if we reach a pre-existing `0711` / read-only host boundary (`EACCES`/`EROFS`/`EINVAL`).
+            if !synced_dirs.iter().any(|d| same_dir_inode(d, p)) {
+                match sync_dir(p) {
+                    Ok(()) => {
+                        synced_dirs.push(p.to_path_buf());
+                    }
+                    Err(e) => {
+                        let stop_host_boundary =
+                            e.downcast_ref::<std::io::Error>().is_some_and(|ioe| {
+                                matches!(ioe.kind(), std::io::ErrorKind::PermissionDenied)
+                                    || matches!(
+                                        ioe.raw_os_error(),
+                                        Some(
+                                            libc::EACCES | libc::EPERM | libc::EROFS | libc::EINVAL
+                                        )
+                                    )
+                            });
+                        if stop_host_boundary {
+                            break;
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            if p.parent().is_none() {
+                break;
+            }
         }
         anc = p.parent();
     }
@@ -357,15 +470,15 @@ impl TurboStore {
         let mut from_template = false;
         let (template_path, uid) = template_shm_path();
         if !db_warm {
-            fs::create_dir_all(&root)?;
-            for sub in ["blobs", "staging", "locks"] {
+            ensure_store_locks_dir_durable(&root)?;
+            for sub in ["blobs", "staging"] {
                 match fs::create_dir(root.join(sub)) {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
                     Err(e) => return Err(e.into()),
                 }
             }
-            ensure_store_locks_dir_durable(&root)?;
+            sync_dir(&root)?;
             if template_path.exists() {
                 let tmp_db = root.join(format!(
                     "state.db.init.{}.{}",
@@ -1885,6 +1998,7 @@ impl TurboStore {
     }
 
     pub fn write_singleflight_done(&self, action_key: &str, outputs: &[BlobEntry]) -> Result<()> {
+        let _pub_guard = acquire_cas_publication_guard(&self.root)?;
         let locks = self.root.join("locks");
         let done_path = locks.join(format!("{}.done", action_key));
         let bytes = serde_json::to_vec(outputs)?;
@@ -2523,6 +2637,7 @@ impl TurboStore {
         };
         let mut magic = [0u8; 4];
         if f.read_exact(&mut magic).is_ok() && &magic == b"TLZ1" {
+            let _pub_guard = acquire_cas_publication_guard(&self.root)?;
             // Read the inode we sniffed (not the path again): a racing promotion swaps the path.
             let opened_ino = f.metadata()?.ino();
             let mut compressed = magic.to_vec();
@@ -2896,43 +3011,7 @@ impl TurboStore {
         let mut evicted_actions = 0usize;
         let mut unlinked_blobs = 0usize;
 
-        // 0. Clean orphaned temporary files in `<store>/staging` and `/dev/shm/turbo-lean-staging`
-        for st_dir in [self.root.join("staging"), self.fast_staging_dir()] {
-            if let Ok(entries) = fs::read_dir(&st_dir) {
-                for entry in entries.flatten() {
-                    let fname = entry.file_name();
-                    let fname_str = fname.to_string_lossy();
-                    if fname_str.starts_with("git_head_tree_")
-                        || fname_str.starts_with("project_stat_splits_")
-                        || fname_str.starts_with("project_splits_")
-                        || fname_str.starts_with("lake_env_v1_")
-                        || fname_str.starts_with("zygote_daemon.")
-                        || fname_str == "zygote_lru_registry.json"
-                    {
-                        continue;
-                    }
-                    if let Ok(meta) = entry.metadata() {
-                        if meta.is_file() {
-                            let age_secs = meta
-                                .modified()
-                                .ok()
-                                .and_then(|t| t.elapsed().ok())
-                                .map(|d| d.as_secs())
-                                .unwrap_or(120);
-                            if age_secs >= 30 || max_reclaimable_bytes == 0 {
-                                let sz = meta.len();
-                                if fs::remove_file(entry.path()).is_ok() {
-                                    cleaned_staging_files += 1;
-                                    freed_bytes += sz;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 0a. Bound the nested `/dev/shm` eval reply cache (the flat scan above skips subdirs)
+        // 0a. Bound the nested `/dev/shm` eval reply cache (the flat scan skips subdirs)
         if let Ok((n, b)) = crate::shm_cache::enforce_shm_quota_lru(
             &self.fast_staging_dir().join("eval_shm_cache"),
             0,
@@ -3014,10 +3093,10 @@ impl TurboStore {
             }
         }
 
-        // Step A (Immediate Supersession Eviction):
-        // Always evict any blob in `blobs` with `pin_level < 0` that is not referenced in
-        // `worktree_file_blobs` of any active lease (`now - last_seen <= 7200`), even before
-        // checking `max_reclaimable_bytes`!
+        // Acquire exclusive `gc_publish.lock` BEFORE sweeping `<store>/staging` or `fast_staging_dir()`,
+        // so active publishers holding `CasPublicationGuard` (`LOCK_SH`) never have in-flight `.tmp`
+        // or `import_*.tlpack.zst` / `export_*.tlpack.raw` files unlinked between write/fsync and
+        // `hard_link`/`rename`.
         let Some(gc_guard) = try_acquire_cas_gc_guard(&self.root)? else {
             let reaped_zygote_workers = if cfg!(test) || max_reclaimable_bytes > 0 {
                 0
@@ -3038,6 +3117,57 @@ impl TurboStore {
                 reaped_zygote_workers,
             });
         };
+
+        // 0. Clean orphaned temporary files in `<store>/staging` (under `CasExclusiveGcGuard`) and
+        //    stale files in shared `/dev/shm/turbo-lean-staging-<uid>` (`age_secs >= 30` when shared
+        //    outside `self.root` so `run_gc(0, ...)` on one store cannot delete another store's or
+        //    live command's fresh 0-second temporary files in `/dev/shm`).
+        let store_staging = self.root.join("staging");
+        let fast_staging = self.fast_staging_dir();
+        let sweep_dirs: &[(&Path, bool)] = if same_dir_inode(&store_staging, &fast_staging) {
+            &[(&store_staging, true)]
+        } else {
+            &[(&store_staging, true), (&fast_staging, false)]
+        };
+        for &(st_dir, is_store_owned) in sweep_dirs {
+            if let Ok(entries) = fs::read_dir(st_dir) {
+                for entry in entries.flatten() {
+                    let fname = entry.file_name();
+                    let fname_str = fname.to_string_lossy();
+                    if fname_str.starts_with("git_head_tree_")
+                        || fname_str.starts_with("project_stat_splits_")
+                        || fname_str.starts_with("project_splits_")
+                        || fname_str.starts_with("lake_env_v1_")
+                        || fname_str.starts_with("zygote_daemon.")
+                        || fname_str == "zygote_lru_registry.json"
+                    {
+                        continue;
+                    }
+                    if let Ok(meta) = entry.metadata() {
+                        if meta.is_file() {
+                            let age_secs = meta
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.elapsed().ok())
+                                .map(|d| d.as_secs())
+                                .unwrap_or(120);
+                            if age_secs >= 30 || (is_store_owned && max_reclaimable_bytes == 0) {
+                                let sz = meta.len();
+                                if fs::remove_file(entry.path()).is_ok() {
+                                    cleaned_staging_files += 1;
+                                    freed_bytes += sz;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Step A (Immediate Supersession Eviction):
+        // Always evict any blob in `blobs` with `pin_level < 0` that is not referenced in
+        // `worktree_file_blobs` of any active lease (`now - last_seen <= 7200`), even before
+        // checking `max_reclaimable_bytes`!
         crate::pack::replay_pending_deferred_packs_inner(self, true)?;
         let superseded_blobs: Vec<(String, u64)> = {
             let mut stmt = self.conn.prepare(
@@ -4028,6 +4158,101 @@ pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Allocate a unique staging file `<dir>/<stem>.<pid>.<seq>.<nanos>.tmp` with `O_CREAT | O_EXCL`
+/// (`create_new(true)`), retrying up to 8 times if a crashed predecessor with a recycled PID left
+/// a colliding filename on disk.
+fn open_unique_staging_file(dir: &Path, stem: &str, mode: u32) -> std::io::Result<(File, PathBuf)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    for _attempt in 0..8u64 {
+        let nanos = next_staging_nanos();
+        #[cfg(test)]
+        let seq = if STAGING_NANOS_HOOK.with(|h| h.borrow().is_some()) {
+            _attempt
+        } else {
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        };
+        #[cfg(not(test))]
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("{stem}.{}.{seq}.{nanos}.tmp", std::process::id()));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&path)
+        {
+            Ok(file) => return Ok((file, path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique staging file",
+    ))
+}
+
+/// Stage into a unique temporary file `<stage_dir>/<stem>.<pid>.<seq>.<nanos>.tmp`, populate it via
+/// `populate`, `fsync` its bytes, run `publish` to install `dest` (`rename` or `link` + race
+/// resolution), `fsync` `dest`'s parent plus `created` ancestors, and unlink any leftover staging
+/// link on exit.
+fn stage_and_publish_durable<T, P, Pub>(
+    stage_dir: &Path,
+    stem: &str,
+    mode: u32,
+    dest: &Path,
+    created: &[PathBuf],
+    populate: P,
+    publish: Pub,
+) -> std::io::Result<T>
+where
+    P: FnOnce(&mut File) -> std::io::Result<()>,
+    Pub: FnOnce(&File, &Path, &Path) -> std::io::Result<T>,
+{
+    let (mut f, staging) = open_unique_staging_file(stage_dir, stem, mode)?;
+    let res = (|| -> std::io::Result<T> {
+        populate(&mut f)?;
+        durability_barrier(&f)?;
+        let out = publish(&f, &staging, dest)?;
+        sync_published(dest, created)?;
+        Ok(out)
+    })();
+    drop(f);
+    let _ = fs::remove_file(&staging);
+    res
+}
+
+/// Stage into a private sibling file next to `dest`, populate it via `populate`, `fsync` its bytes,
+/// atomically `rename` it onto `dest`, and `fsync` `dest`'s parent plus `created` ancestors.
+fn stage_and_rename_durable<F>(
+    dest: &Path,
+    default_name: &str,
+    mode: u32,
+    created: &[PathBuf],
+    populate: F,
+) -> std::io::Result<()>
+where
+    F: FnOnce(&mut File) -> std::io::Result<()>,
+{
+    let parent = dest.parent().unwrap_or(dest);
+    let stem = format!(
+        ".{}",
+        dest.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(default_name)
+    );
+    stage_and_publish_durable(
+        parent,
+        &stem,
+        mode,
+        dest,
+        created,
+        populate,
+        |_f, staging, dst| fs::rename(staging, dst),
+    )
+}
+
 /// Publish `src` at `dest` so the bytes are durable before the name exists: fsync `src` and
 /// hardlink when the two share a device, or stage into a private sibling file (reflink or copy,
 /// mode `0o444`, fsynced) and atomically rename into place otherwise. `created` are the ancestor
@@ -4038,9 +4263,6 @@ pub(crate) fn publish_durable_link(
     dest: &Path,
     created: &[PathBuf],
 ) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
     if File::open(src)
         .and_then(|f| durability_barrier(&f))
         .and_then(|()| fs::hard_link(src, dest))
@@ -4048,41 +4270,8 @@ pub(crate) fn publish_durable_link(
     {
         return sync_published(dest, created);
     }
-    let parent = dest.parent().unwrap_or(dest);
-    let mut dst_file = None;
-    let mut staging = None;
-    for _ in 0..8 {
-        let nanos = next_staging_nanos();
-        let path = parent.join(format!(
-            ".{}.{}.{}.{}.tmp",
-            dest.file_name().and_then(|s| s.to_str()).unwrap_or("blob"),
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed),
-            nanos
-        ));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o444)
-            .open(&path)
-        {
-            Ok(f) => {
-                dst_file = Some(f);
-                staging = Some(path);
-                break;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    let (mut dst_file, staging) = dst_file.zip(staging).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "could not allocate a unique staging file",
-        )
-    })?;
     let mut src_file = File::open(src)?;
-    let res = (|| -> std::io::Result<()> {
+    stage_and_rename_durable(dest, "blob", 0o444, created, |dst_file| {
         let mut cloned = false;
         #[cfg(target_os = "linux")]
         {
@@ -4093,17 +4282,10 @@ pub(crate) fn publish_durable_link(
             }
         }
         if !cloned {
-            std::io::copy(&mut src_file, &mut dst_file)?;
+            std::io::copy(&mut src_file, dst_file)?;
         }
-        durability_barrier(&dst_file)?;
-        fs::rename(&staging, dest)?;
-        sync_published(dest, created)
-    })();
-    drop(dst_file);
-    if res.is_err() {
-        let _ = fs::remove_file(&staging);
-    }
-    res
+        Ok(())
+    })
 }
 
 /// Write `bytes` to `dest` through a unique staging file next to it: the file is fsynced before
@@ -4114,53 +4296,7 @@ pub(crate) fn write_bytes_durable(
     bytes: &[u8],
     created: &[PathBuf],
 ) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let parent = dest.parent().unwrap_or(dest);
-    let mut f = None;
-    let mut staging = None;
-    for _ in 0..8 {
-        let nanos = next_staging_nanos();
-        let path = parent.join(format!(
-            ".{}.{}.{}.{}.tmp",
-            dest.file_name().and_then(|s| s.to_str()).unwrap_or("file"),
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed),
-            nanos
-        ));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o644)
-            .open(&path)
-        {
-            Ok(file) => {
-                f = Some(file);
-                staging = Some(path);
-                break;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    let (mut f, staging) = f.zip(staging).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "could not allocate a unique staging file",
-        )
-    })?;
-    let res = (|| -> std::io::Result<()> {
-        f.write_all(bytes)?;
-        durability_barrier(&f)?;
-        fs::rename(&staging, dest)?;
-        sync_published(dest, created)
-    })();
-    drop(f);
-    if res.is_err() {
-        let _ = fs::remove_file(&staging);
-    }
-    res
+    stage_and_rename_durable(dest, "file", 0o644, created, |f| f.write_all(bytes))
 }
 
 fn sync_published(dest: &Path, created: &[PathBuf]) -> std::io::Result<()> {
@@ -4252,95 +4388,50 @@ pub(crate) fn write_blob_atomic(
     bytes: &[u8],
     replace: bool,
 ) -> Result<i64> {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
     let staging_dir = store_root.join("staging");
-    let mut staging_dirs = ensure_dir_tracking(&staging_dir, store_root)?;
-    let mut dest_dirs = match dest.parent() {
+    let staging_dirs = ensure_dir_tracking(&staging_dir, store_root)?;
+    let mut created_dirs = match dest.parent() {
         Some(parent) => ensure_dir_tracking(parent, store_root)?,
         None => Vec::new(),
     };
-    let open_unique = || -> std::io::Result<(File, PathBuf)> {
-        for _ in 0..8 {
-            let nanos = next_staging_nanos();
-            // pid + per-process sequence + monotonic clock, retried on collision: a leftover of a
-            // crashed process whose pid was recycled cannot make the write fail.
-            let staging_path = staging_dir.join(format!(
-                "{}.{}.{}.{}.tmp",
-                hash,
-                std::process::id(),
-                SEQ.fetch_add(1, Ordering::Relaxed),
-                nanos
-            ));
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o444)
-                .open(&staging_path)
-            {
-                Ok(f) => return Ok((f, staging_path)),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e),
+    created_dirs.extend(staging_dirs);
+    let ino = stage_and_publish_durable(
+        &staging_dir,
+        hash,
+        0o444,
+        dest,
+        &created_dirs,
+        |f| f.write_all(bytes),
+        |f, staging_path, dst| {
+            let staged_ino = f.metadata()?.ino() as i64;
+            if replace {
+                fs::rename(staging_path, dst)?;
+                return Ok(staged_ino);
             }
-        }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "could not allocate a unique staging file",
-        ))
-    };
-    let (mut f, staging_path) = open_unique()?;
-    let res = (|| -> Result<i64> {
-        f.write_all(bytes)?;
-        let ino = f.metadata()?.ino() as i64;
-        // Bytes, then the directory entry: a crash cannot publish a short file.
-        durability_barrier(&f)?;
-        if replace {
-            fs::rename(&staging_path, dest)?;
-        } else {
-            match fs::hard_link(&staging_path, dest) {
-                Ok(()) => {}
+            match fs::hard_link(staging_path, dst) {
+                Ok(()) => Ok(staged_ino),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     // Lost a race (or a pre-fix writer left a partial file): keep a complete
-                    // blob (and still sync its bytes + directory chain in case the winner has not
-                    // finished its barriers yet), otherwise replace it with ours.
-                    match probe_blob_file(dest, bytes.len() as u64) {
+                    // blob (and still sync its bytes before `sync_published` syncs its directory
+                    // chain in case the winner has not finished its barriers yet), otherwise
+                    // replace it with ours.
+                    match probe_blob_file(dst, bytes.len() as u64) {
                         BlobDisk::Intact(m) => {
-                            let peer_f = File::open(dest)?;
+                            let peer_f = File::open(dst)?;
                             durability_barrier(&peer_f)?;
-                            if let Some(parent) = dest.parent() {
-                                sync_dir(parent)?;
-                            }
-                            for dir in dest_dirs.drain(..) {
-                                sync_dir(&dir)?;
-                            }
-                            for dir in staging_dirs.drain(..) {
-                                sync_dir(&dir)?;
-                            }
-                            return Ok(m.ino() as i64);
+                            Ok(m.ino() as i64)
                         }
-                        _ => fs::rename(&staging_path, dest)?,
+                        _ => {
+                            fs::rename(staging_path, dst)?;
+                            Ok(staged_ino)
+                        }
                     }
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => Err(e),
             }
-        }
-        if let Some(parent) = dest.parent() {
-            sync_dir(parent)?;
-        }
-        for dir in dest_dirs.drain(..) {
-            sync_dir(&dir)?;
-        }
-        for dir in staging_dirs.drain(..) {
-            sync_dir(&dir)?;
-        }
-        Ok(ino)
-    })();
-    drop(f);
-    if !replace || res.is_err() {
-        let _ = fs::remove_file(&staging_path);
-    }
-    res
+        },
+    )?;
+    Ok(ino)
 }
 
 /// Ensure `dest` holds a complete, crash-durable copy of `bytes`: write it when missing, rewrite
@@ -4391,6 +4482,7 @@ pub fn prestage_theorem_shard_blobs_at(
     if items.is_empty() {
         return Ok(());
     }
+    let _pub_guard = acquire_cas_publication_guard(store_root)?;
     let mut seen_blobs = std::collections::HashSet::with_capacity(items.len());
     let mut seen_prefix = [false; 256];
     let mut created_parents = std::collections::HashSet::new();
@@ -5449,11 +5541,15 @@ mod tests {
         };
         store.write_singleflight_done("durable_act", &[entry])?;
         let evs = take_log();
-        assert!(
-            evs.first().is_some_and(|s| s.starts_with("file:")),
-            "{evs:?}"
-        );
-        assert!(evs.iter().any(|s| s == "dir:locks"), "{evs:?}");
+        let done_pos = evs
+            .iter()
+            .position(|s| s.starts_with("file:durable_act."))
+            .expect(".done staging file synced before rename");
+        let locks_after_done = evs[done_pos..]
+            .iter()
+            .position(|s| s == "dir:locks")
+            .expect("locks synced after .done rename");
+        assert!(locks_after_done > 0, "{evs:?}");
 
         assert!(crate::pack::stage_deferred_pack_record(
             &fresh_root,
@@ -5501,7 +5597,10 @@ mod tests {
             p_store < p_parent && p_parent < p_outer,
             "expected bottom-up ancestor sync brand_new_store -> missing_cold_parent -> outer dir, got {evs:?}"
         );
-        assert!(cold_store_root.join("locks").join(STORE_TREE_DURABLE_MARKER).exists());
+        assert!(cold_store_root
+            .join("locks")
+            .join(STORE_TREE_DURABLE_MARKER)
+            .exists());
 
         // Racing peer case: if a concurrent process already created `raced_parent/raced_store/locks`
         // on disk via `create_dir_all` (without yet completing parent-directory fsyncs or writing
@@ -5530,7 +5629,10 @@ mod tests {
             r_store < r_parent && r_parent < r_outer,
             "expected bottom-up ancestor sync on raced pre-created dirs, got {evs:?}"
         );
-        assert!(raced_store.join("locks").join(STORE_TREE_DURABLE_MARKER).exists());
+        assert!(raced_store
+            .join("locks")
+            .join(STORE_TREE_DURABLE_MARKER)
+            .exists());
 
         // Relative `--cache-dir` store roots (whose lexical `Path::parent()` is `Some("")`) must
         // resolve against `current_dir()` and durably sync the current working directory naming the
@@ -5637,6 +5739,13 @@ mod tests {
             .join("target_cache");
         let _ = take_log();
         let cold_dd_locks = ensure_store_locks_dir_durable(&missing_dotdot_root)?;
+        let evs_dd = take_log();
+        assert!(
+            evs_dd.iter().any(|s| s == "dir:missing_intermediate")
+                && evs_dd.iter().any(|s| s == "dir:target_cache")
+                && evs_dd.iter().any(|s| s == "dir:dotdot_existing"),
+            "missing intermediate followed by `..` must sync missing_intermediate + target_cache + dotdot_existing: {evs_dd:?}"
+        );
         let warm_dd_locks = ensure_store_locks_dir_durable(&dotdot_base.join("target_cache"))?;
         assert_eq!(cold_dd_locks, warm_dd_locks);
         assert!(
@@ -5654,6 +5763,87 @@ mod tests {
             );
         }
         let _ = take_log();
+
+        // Standard multi-user execute-only (`0111` for owner / `0711` for other users) upper host
+        // ancestor above a writable workspace directory: cold store initialization (`TurboStore::open`
+        // and `acquire_cas_publication_guard`) must succeed without trying `O_RDONLY` `File::open`
+        // on the execute-only outer ancestor, while still syncing `locks/`, the newly created store
+        // chain, and the immediate writable parent directory.
+        #[cfg(unix)]
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            let exec_only_outer = dir.join("exec_only_0711_host_anc");
+            let writable_ws = exec_only_outer.join("user_workspace");
+            fs::create_dir_all(&writable_ws)?;
+            fs::set_permissions(&exec_only_outer, fs::Permissions::from_mode(0o111))?;
+            assert!(
+                File::open(&exec_only_outer).is_err(),
+                "execute-only directory must reject O_RDONLY File::open for non-root user"
+            );
+            let _ = take_log();
+            let cold_under_0711 = writable_ws.join("nested_new").join("cold_store_ok");
+            let init_res = (|| -> Result<Vec<String>> {
+                let opened = TurboStore::open(Some(&cold_under_0711))?;
+                let _g = acquire_cas_publication_guard(&opened.root)?;
+                let mut logs = take_log();
+                // Racing-peer recovery (`locks/` pre-created without `store_tree_durable.v1`)
+                // under the same `0711` outer ancestor must also succeed cleanly.
+                let raced_under_0711 = writable_ws.join("raced_mid").join("raced_store_ok");
+                fs::create_dir_all(raced_under_0711.join("locks"))?;
+                let _ = take_log();
+                let _rg = acquire_cas_publication_guard(&raced_under_0711)?;
+                let raced_logs = take_log();
+                assert!(
+                    raced_under_0711
+                        .join("locks")
+                        .join(STORE_TREE_DURABLE_MARKER)
+                        .exists(),
+                    "raced store under 0711 upper ancestor must durably initialize"
+                );
+                assert!(
+                    raced_logs.iter().any(|s| s == "dir:raced_store_ok")
+                        && raced_logs.iter().any(|s| s == "dir:raced_mid")
+                        && raced_logs.iter().any(|s| s == "dir:user_workspace")
+                        && !raced_logs.iter().any(|s| s == "dir:exec_only_0711_host_anc"),
+                    "raced recovery must sync through user_workspace and stop cleanly at 0711 boundary: {raced_logs:?}"
+                );
+                logs.shrink_to_fit();
+                Ok(logs)
+            })();
+            let _ = fs::set_permissions(&exec_only_outer, fs::Permissions::from_mode(0o755));
+            let evs_0711 = init_res?;
+            assert!(
+                cold_under_0711
+                    .join("locks")
+                    .join(STORE_TREE_DURABLE_MARKER)
+                    .exists(),
+                "cold store under 0711 upper ancestor must durably initialize"
+            );
+            let p_locks = evs_0711
+                .iter()
+                .position(|s| s == "dir:locks")
+                .expect("locks/ synced");
+            let p_store = evs_0711
+                .iter()
+                .position(|s| s == "dir:cold_store_ok")
+                .expect("cold_store_ok synced");
+            let p_nested = evs_0711
+                .iter()
+                .position(|s| s == "dir:nested_new")
+                .expect("nested_new synced");
+            let p_ws = evs_0711
+                .iter()
+                .position(|s| s == "dir:user_workspace")
+                .expect("writable parent user_workspace synced");
+            assert!(
+                p_locks < p_store && p_store < p_nested && p_nested < p_ws,
+                "expected locks -> cold_store_ok -> nested_new -> user_workspace order, got {evs_0711:?}"
+            );
+            assert!(
+                !evs_0711.iter().any(|s| s == "dir:exec_only_0711_host_anc"),
+                "must not walk above pre-existing parent into 0711 host ancestor: {evs_0711:?}"
+            );
+        }
 
         let created = ensure_dir_tracking(&fresh_root.join("nested/stamp_dir"), &fresh_root)?;
         write_bytes_durable(
@@ -6031,11 +6221,13 @@ mod tests {
         let stage_race_dir = dir.join("stage_race_store");
         let mut pub_store = TurboStore::open(Some(&stage_race_dir))?;
         let mut conc_gc = TurboStore::open(Some(&stage_race_dir))?;
-        let evict_seed = pub_store.store_immutable_blob(&vec![b'e'; 1024], "olean", "trusted", 0)?;
-        let l_seed = match pub_store.acquire_singleflight("seed_evict_act", tc, "olean", "trusted")? {
-            SingleflightOutcome::Leader(l) => l,
-            _ => panic!("expected leader"),
-        };
+        let evict_seed =
+            pub_store.store_immutable_blob(&vec![b'e'; 1024], "olean", "trusted", 0)?;
+        let l_seed =
+            match pub_store.acquire_singleflight("seed_evict_act", tc, "olean", "trusted")? {
+                SingleflightOutcome::Leader(l) => l,
+                _ => panic!("expected leader"),
+            };
         pub_store.publish_action(
             &l_seed,
             &[BlobEntry {
@@ -6069,28 +6261,83 @@ mod tests {
         // `staged_bh` is in `blobs` with zero `action_outputs` rows right now; without
         // `CasPublicationGuard` vs `try_acquire_cas_gc_guard`, `conc_gc.run_gc(0, ...)` would
         // evict `seed_evict_act` and then sweep `staged_bh` as an unreferenced orphan.
+        // Likewise, active 0-second `.tmp` staging files in `<store>/staging` and shared
+        // `fast_staging_dir()` (`import_*.tlpack.zst`) MUST NOT be unlinked by `run_gc(0, ...)`
+        // while `CasPublicationGuard` is held.
+        let active_store_tmp = pub_store.root.join("staging").join("inflight_publish.tmp");
+        fs::create_dir_all(active_store_tmp.parent().unwrap())?;
+        fs::write(&active_store_tmp, b"in-flight-cas-staging-payload")?;
+        let active_fast_tmp = pub_store.fast_staging_dir().join(format!(
+            "import_test_{}_{}.tlpack.zst",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        fs::write(&active_fast_tmp, b"in-flight-pack-import-zst")?;
+
         let rep_while_publishing = conc_gc.run_gc(0, 7 * 86400, true)?;
         assert_eq!(rep_while_publishing.evicted_actions, 0);
         assert_eq!(rep_while_publishing.unlinked_blobs, 0);
         assert!(pub_store.blob_path(&staged_bh).exists());
+        assert!(
+            active_store_tmp.exists(),
+            "run_gc(0) must not unlink active <store>/staging/*.tmp while CasPublicationGuard is held"
+        );
+        assert!(
+            active_fast_tmp.exists(),
+            "run_gc(0) must not unlink active fast_staging_dir() temp file while CasPublicationGuard is held"
+        );
 
-        let l_staged = match pub_store.acquire_singleflight("staged_pub_act", tc, "olean", "trusted")? {
-            SingleflightOutcome::Leader(l) => l,
-            _ => panic!("expected leader"),
-        };
-        pub_store.publish_action(&l_staged, std::slice::from_ref(&staged_entry), 10, 0, 0, "trusted")?;
+        let l_staged =
+            match pub_store.acquire_singleflight("staged_pub_act", tc, "olean", "trusted")? {
+                SingleflightOutcome::Leader(l) => l,
+                _ => panic!("expected leader"),
+            };
+        pub_store.publish_action(
+            &l_staged,
+            std::slice::from_ref(&staged_entry),
+            10,
+            0,
+            0,
+            "trusted",
+        )?;
         drop(l_staged);
         drop(pub_guard);
         assert!(pub_store.blob_path(&staged_bh).exists());
-        assert!(pub_store.get_cached_action("staged_pub_act", "trusted")?.is_some());
+        assert!(pub_store
+            .get_cached_action("staged_pub_act", "trusted")?
+            .is_some());
+
+        // Once `CasPublicationGuard` is released, `run_gc(0, ...)` acquires `CasExclusiveGcGuard`
+        // and reaps orphaned `<store>/staging/*.tmp` files, while leaving fresh (<30s) files in a
+        // shared `/dev/shm` `fast_staging_dir()` untouched so cross-store processes cannot break each other.
+        let shared_fast_separate = !same_dir_inode(
+            &pub_store.root.join("staging"),
+            &pub_store.fast_staging_dir(),
+        );
+        let rep_after_drop = conc_gc.run_gc(0, 7 * 86400, true)?;
+        assert!(
+            !active_store_tmp.exists(),
+            "run_gc(0) must reap orphaned <store>/staging/*.tmp once CasExclusiveGcGuard is acquired"
+        );
+        assert!(rep_after_drop.cleaned_staging_files >= 1);
+        if shared_fast_separate {
+            assert!(
+                active_fast_tmp.exists(),
+                "run_gc(0) on one store must not reap 0-second files in shared /dev/shm fast_staging_dir"
+            );
+        }
+        let _ = fs::remove_file(&active_fast_tmp);
 
         // Fail-closed publish check: if a staged blob file is missing on disk before `publish_action`,
         // `publish_action` must return `Err` and leave no completed action row in SQLite.
-        let missing_bh = blake3::hash(b"missing-on-disk-payload").to_hex().to_string();
-        let l_missing = match pub_store.acquire_singleflight("missing_blob_act", tc, "olean", "trusted")? {
-            SingleflightOutcome::Leader(l) => l,
-            _ => panic!("expected leader"),
-        };
+        let missing_bh = blake3::hash(b"missing-on-disk-payload")
+            .to_hex()
+            .to_string();
+        let l_missing =
+            match pub_store.acquire_singleflight("missing_blob_act", tc, "olean", "trusted")? {
+                SingleflightOutcome::Leader(l) => l,
+                _ => panic!("expected leader"),
+            };
         let missing_res = pub_store.publish_action(
             &l_missing,
             &[BlobEntry {
@@ -6106,7 +6353,9 @@ mod tests {
         );
         assert!(missing_res.is_err());
         drop(l_missing);
-        assert!(pub_store.get_cached_action("missing_blob_act", "trusted")?.is_none());
+        assert!(pub_store
+            .get_cached_action("missing_blob_act", "trusted")?
+            .is_none());
 
         // 6. Fail-closed GC on SQLite error: if a reachability query encounters a SQLite error
         //    (e.g., corrupted/dropped `worktree_leases` table), `run_gc` must return `Err` and
@@ -6116,7 +6365,9 @@ mod tests {
         let live_bytes = vec![b'z'; 1024];
         let live_bh = err_store.store_immutable_blob(&live_bytes, "olean", "trusted", -1)?;
         assert!(err_store.blob_path(&live_bh).exists());
-        err_store.conn.execute_batch("DROP TABLE worktree_leases;")?;
+        err_store
+            .conn
+            .execute_batch("DROP TABLE worktree_leases;")?;
         assert!(err_store.run_gc(0, 7 * 86400, true).is_err());
         assert!(
             err_store.blob_path(&live_bh).exists(),
