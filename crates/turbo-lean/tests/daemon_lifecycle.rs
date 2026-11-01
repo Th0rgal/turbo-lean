@@ -536,22 +536,28 @@ fn unavailable_zygote_fallback_obeys_check_timeout_and_reaps_lean() {
     let marker = f.root.join("import-unavailable");
     // Inject an import-unavailable reply at the worker protocol boundary. Stock Lean
     // still checks the real slow source below; never modify a shared cached inode.
-    for entry in fs::read_dir(f.root.join("cas/fastcheck_bins"))
+    let bins: Vec<_> = fs::read_dir(f.root.join("cas/fastcheck_bins"))
         .unwrap()
         .flatten()
-    {
+        .collect();
+    for entry in bins {
         if entry
             .file_name()
             .to_string_lossy()
             .starts_with("turbo_zygote_")
         {
             let tmp = entry.path().with_extension("replacement");
+            // Only the worker protocol is unavailable: trusted `.olean` reader modes
+            // (identity readout, audits) still run the real binary.
+            let real = entry.path().with_extension("real");
+            fs::rename(entry.path(), &real).unwrap();
             fs::write(&tmp, format!(r#"#!/bin/sh
+case "$1" in --*) exec '{}' "$@";; esac
 while IFS= read -r request; do
   echo unavailable >> '{}'
   echo '{{"ok":false,"import_ok":false,"env_cache_hit":false,"import_us":0,"elab_us":0,"errors":["import unavailable"]}}'
 done
-"#, marker.display())).unwrap();
+"#, real.display(), marker.display())).unwrap();
             fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).unwrap();
             fs::rename(tmp, entry.path()).unwrap();
             replaced += 1;
@@ -559,9 +565,12 @@ done
     }
     assert!(replaced > 0, "seed did not cache a worker");
     for decl in [false, true] {
-        fs::write(f.root.join("Fallback.lean"), "import Lean\nset_option maxRecDepth 10000000\nset_option maxHeartbeats 0\ntheorem fallback_slow : (List.range 1000000).length = 1000000 := by decide\n").unwrap();
+        // Allow environment discovery and declaration identity elaboration to
+        // reach the injected worker, then deterministically outlast the budget
+        // inside the stock Lean fallback rather than relying on proof speed.
+        fs::write(f.root.join("Fallback.lean"), "import Lean\ntheorem fallback_slow : True := by\n  run_tac do IO.sleep 30000\n  trivial\n").unwrap();
         let mut cmd = f.check("Fallback.lean");
-        cmd.args(["--timeout", "1", "--no-daemon"]);
+        cmd.args(["--timeout", "5", "--no-daemon"]);
         if decl {
             cmd.args(["--decl", "fallback_slow"]);
         }
@@ -573,12 +582,12 @@ done
             "{text}"
         );
         assert!(
-            start.elapsed() < Duration::from_secs(10),
+            start.elapsed() < Duration::from_secs(15),
             "fallback exceeded bound: {text}"
         );
         f.wait_for(Duration::from_secs(3), || f.pids().is_empty());
         evidence(format!(
-            "import-unavailable fallback --timeout 1 (decl={decl}): {:?}, 0 Lean PIDs",
+            "import-unavailable fallback --timeout 5 (decl={decl}): {:?}, 0 Lean PIDs",
             start.elapsed()
         ));
     }
@@ -782,4 +791,102 @@ fn no_daemon_env_uses_relaxed_booleans() {
             i < 2
         ));
     }
+}
+
+#[test]
+fn decl_identity_probe_and_reader_share_timeout_budget() {
+    use std::os::unix::fs::PermissionsExt;
+    let _serial = LIFECYCLE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new();
+    // 1. Probe compilation itself must obey `check --timeout` / `TURBO_LEAN_AUDIT_TIMEOUT_SECS`.
+    fs::write(
+        f.root.join("SlowProbe.lean"),
+        "import Lean\nopen Lean Elab Command in\n#eval show CommandElabM Unit from do IO.sleep 30000\ntheorem slow_probe : True := by trivial\n",
+    )
+    .unwrap();
+    let mut probe_cmd = f.check("SlowProbe.lean");
+    probe_cmd.args(["--decl", "slow_probe", "--timeout", "2", "--no-daemon"]);
+    let t_probe = Instant::now();
+    let out_probe = f.run(probe_cmd);
+    let text_probe = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out_probe.stdout),
+        String::from_utf8_lossy(&out_probe.stderr)
+    );
+    assert!(
+        !out_probe.status.success() && text_probe.contains("timed out"),
+        "{text_probe}"
+    );
+    assert!(
+        t_probe.elapsed() < Duration::from_secs(12),
+        "probe compile exceeded --timeout 2: {:?} {text_probe}",
+        t_probe.elapsed()
+    );
+    f.wait_for(Duration::from_secs(3), || f.pids().is_empty());
+
+    // 2. Seed the cached worker binary, then replace `--decl-identity` with a hung reader and
+    // verify `TURBO_LEAN_AUDIT_TIMEOUT_SECS=2` terminates it fail-closed even without `--timeout`.
+    fs::write(
+        f.root.join("SeedId.lean"),
+        "import Lean\ntheorem seed_id : True := by trivial\n",
+    )
+    .unwrap();
+    let mut seed = f.check("SeedId.lean");
+    seed.args(["--decl", "seed_id", "--no-daemon"]);
+    assert!(f.run(seed).status.success(), "seed_id check failed");
+
+    let mut wrapped = 0;
+    let bins: Vec<_> = fs::read_dir(f.root.join("cas/fastcheck_bins"))
+        .unwrap()
+        .flatten()
+        .collect();
+    for entry in bins {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("turbo_zygote_") && entry.path().is_file() {
+            let real = entry.path().with_extension("real_id");
+            fs::rename(entry.path(), &real).unwrap();
+            let tmp = entry.path().with_extension("wrap_id");
+            fs::write(
+                &tmp,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = \"--decl-identity\" ]; then sleep 30; exit 1; fi\nexec '{}' \"$@\"\n",
+                    real.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::rename(tmp, entry.path()).unwrap();
+            wrapped += 1;
+        }
+    }
+    assert!(wrapped > 0, "no cached zygote worker found");
+
+    fs::write(
+        f.root.join("HungReader.lean"),
+        "import Lean\ntheorem hung_reader : True := by trivial\n",
+    )
+    .unwrap();
+    let mut reader_cmd = f.check("HungReader.lean");
+    reader_cmd
+        .args(["--decl", "hung_reader", "--no-daemon"])
+        .env("TURBO_LEAN_AUDIT_TIMEOUT_SECS", "2");
+    let t_reader = Instant::now();
+    let out_reader = f.run(reader_cmd);
+    let text_reader = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out_reader.stdout),
+        String::from_utf8_lossy(&out_reader.stderr)
+    );
+    assert!(
+        !out_reader.status.success() && text_reader.contains("timed out"),
+        "{text_reader}"
+    );
+    assert!(
+        t_reader.elapsed() < Duration::from_secs(12),
+        "--decl-identity reader exceeded TURBO_LEAN_AUDIT_TIMEOUT_SECS=2: {:?} {text_reader}",
+        t_reader.elapsed()
+    );
+    f.wait_for(Duration::from_secs(3), || f.pids().is_empty());
 }

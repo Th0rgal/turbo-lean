@@ -8,6 +8,8 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const BLAKE3_LEAN_SRC: &str = include_str!("../../../lean/TurboLean/Blake3.lean");
+const STATEMENT_HASH_LEAN_SRC: &str = include_str!("../../../lean/TurboLean/StatementHash.lean");
 const ZYGOTE_WORKER_LEAN_SRC: &str = include_str!("../../../lean/TurboLean/ZygoteWorker.lean");
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -59,11 +61,16 @@ pub struct ZygoteEvalReply {
     /// replies from older hosts. Persisted eval replies without the current version are rejected.
     #[serde(default)]
     pub scanner_version: u32,
+    /// Newly elaborated theorem declarations mapped to their canonical `statement-v1` BLAKE3
+    /// kernel type hash (`TurboLean.StatementHash` / `ZygoteWorker.kernelStatementHash`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub decl_types: std::collections::BTreeMap<String, String>,
 }
 
-/// Version of the host-side reply vetting (`StderrScan` + `mark_runtime_panic`). Bump whenever
-/// a reply that an older host accepted could now be rejected, so persisted replies are not replayed.
-pub(crate) const ZYGOTE_SCANNER_VERSION: u32 = 1;
+/// Version of the host-side reply vetting (`StderrScan` + `mark_runtime_panic` + `decl_types`).
+/// Bump whenever a reply that an older host accepted could now be rejected, so persisted replies
+/// are not replayed.
+pub(crate) const ZYGOTE_SCANNER_VERSION: u32 = 3;
 
 /// In-process C-ABI dispatcher for `LeanNative` methods (`"ping"`, `"validate-tv"`,
 /// `"verify-certs"`, `"compile-fastcheck"`, `"eval-cex"`, `"compile-llvm"`, `"compile-ptx"`),
@@ -392,7 +399,9 @@ fn owned_lifecycle_process(pid: u32, staging: Option<&Path>, parent: Option<u32>
     let args = fs::read(proc.join("cmdline")).unwrap_or_default();
     let env = fs::read(proc.join("environ")).unwrap_or_default();
     let worker = (name.starts_with("turbo_zygote_") || name == "turbo-zygote")
-        && !args.split(|b| *b == 0).any(|arg| arg == b"--audit-modules");
+        && !args
+            .split(|b| *b == 0)
+            .any(|arg| arg == b"--audit-modules" || arg == b"--decl-identity");
     let server = name.trim_end_matches(" (deleted)") == "turbo-lean"
         && is_serve_command(&args)
         && env.split(|b| *b == 0).any(|v| v == b"TURBO_LEAN_DAEMON=1");
@@ -716,8 +725,10 @@ fn portable_process_alive(pid: u32) -> bool {
     // A zombie cannot use staging. On any ps failure retain it conservatively.
     crate::trusted_tools::system_command("ps")
         .and_then(|mut command| {
-            command.args(["-p", &pid.to_string(), "-o", "stat="])
-                .output().map_err(Into::into)
+            command
+                .args(["-p", &pid.to_string(), "-o", "stat="])
+                .output()
+                .map_err(Into::into)
         })
         .map(|out| {
             !out.status.success()
@@ -1153,7 +1164,10 @@ impl OleanFileStatSig {
             if let Some(g) = digest_test_hooks::FORCED_TS_GRANULARITY_NS.with(|c| c.get()) {
                 let trunc = |sec: i64, nsec: i64| {
                     let ns = ((sec as i128) * 1_000_000_000 + nsec as i128).div_euclid(g) * g;
-                    (ns.div_euclid(1_000_000_000) as i64, ns.rem_euclid(1_000_000_000) as i64)
+                    (
+                        ns.div_euclid(1_000_000_000) as i64,
+                        ns.rem_euclid(1_000_000_000) as i64,
+                    )
                 };
                 (sig.mtime_sec, sig.mtime_nsec) = trunc(sig.mtime_sec, sig.mtime_nsec);
                 (sig.ctime_sec, sig.ctime_nsec) = trunc(sig.ctime_sec, sig.ctime_nsec);
@@ -1216,7 +1230,12 @@ fn dev_records_subsecond_timestamps(sig: &OleanFileStatSig) -> bool {
     // A stored non-zero nanosecond field is only possible on a sub-second filesystem.
     let sampled = sig.ctime_nsec != 0 || sig.mtime_nsec != 0;
     if !sampled {
-        if let Some(&known) = cache.lock().ok().and_then(|g| g.get(&sig.dev).copied()).as_ref() {
+        if let Some(&known) = cache
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&sig.dev).copied())
+            .as_ref()
+        {
             return known;
         }
     }
@@ -1241,8 +1260,9 @@ fn probe_subsecond_ctime(dev: u64) -> bool {
 /// never next to the `.olean`s: that would move `LEAN_PATH` directory mtimes, which
 /// `compute_search_path_oleans_digest` hashes for package directories.
 fn probe_ctime_fence(dev: u64) -> Option<i128> {
-    probe_ctime_in(&std::env::temp_dir())
-        .filter(|_| fs::metadata(std::env::temp_dir()).is_ok_and(|m| OleanFileStatSig::from_meta(&m).dev == dev))
+    probe_ctime_in(&std::env::temp_dir()).filter(|_| {
+        fs::metadata(std::env::temp_dir()).is_ok_and(|m| OleanFileStatSig::from_meta(&m).dev == dev)
+    })
 }
 
 /// Create and remove a scratch file in `dir` and return its `ctime`.
@@ -1481,13 +1501,11 @@ fn resolve_closure_module(
 ) -> Option<PathBuf> {
     let rel = crate::module_builder::module_name_to_rel_slash(mod_name);
     let pkg = rel.split('/').next().unwrap_or_default();
-    let root = search_dirs.iter().find(|d| {
-        d.join(pkg).is_dir() || d.join(format!("{pkg}.olean")).exists()
-    });
+    let root = search_dirs
+        .iter()
+        .find(|d| d.join(pkg).is_dir() || d.join(format!("{pkg}.olean")).exists());
     let on_toolchain = |d: &Path| match toolchain_lib {
-        Some(tc) => {
-            d == tc || fs::canonicalize(d).ok().is_some_and(|c| c.starts_with(tc))
-        }
+        Some(tc) => d == tc || fs::canonicalize(d).ok().is_some_and(|c| c.starts_with(tc)),
         None => {
             d.ends_with("lib/lean")
                 && d.parent()
@@ -1581,14 +1599,7 @@ fn fstatat_dir_sig(
         std::ffi::CString::new(rel.as_os_str().as_bytes()).ok()?
     };
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let rc = unsafe {
-        libc::fstatat(
-            dir_fd,
-            c_rel.as_ptr(),
-            &mut st,
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
+    let rc = unsafe { libc::fstatat(dir_fd, c_rel.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
     if rc != 0 {
         return None;
     }
@@ -1782,7 +1793,11 @@ impl ClosureSnapshot {
         // coarse clock, so a file written just before the snapshot may share the probe's tick
         // (then a same-tick rewrite would keep its tuple); re-probe briefly until it does not.
         let mut newest: std::collections::HashMap<u64, i128> = std::collections::HashMap::new();
-        for s in entries.values().flatten().flat_map(|(_, e)| e.stats.iter().flatten()) {
+        for s in entries
+            .values()
+            .flatten()
+            .flat_map(|(_, e)| e.stats.iter().flatten())
+        {
             let n = newest.entry(s.dev).or_insert(i128::MIN);
             *n = (*n).max(s.ctime_ns());
         }
@@ -1903,7 +1918,12 @@ impl ClosureSnapshot {
                 return ClosureBinding::Changed;
             }
         }
-        let stats = || self.entries.values().flatten().flat_map(|(_, e)| e.stats.iter().flatten());
+        let stats = || {
+            self.entries
+                .values()
+                .flatten()
+                .flat_map(|(_, e)| e.stats.iter().flatten())
+        };
         // Written after the probe: whatever the work read, it may not be these bytes.
         if stats().any(|s| self.fences.get(&s.dev).is_some_and(|&f| s.ctime_ns() > f)) {
             return ClosureBinding::Changed;
@@ -2048,7 +2068,13 @@ fn stat_snapshot_ancestors(dir: &Path) -> Result<Vec<SnapshotAncestorSig>, Snaps
         }
         let sig = OleanFileStatSig::from_meta(&meta);
         let subsec = dev_records_subsecond_timestamps(&sig);
-        out.push((p.to_path_buf(), meta.dev(), meta.ino(), sig.ctime_ns(), subsec));
+        out.push((
+            p.to_path_buf(),
+            meta.dev(),
+            meta.ino(),
+            sig.ctime_ns(),
+            subsec,
+        ));
         cur = p.parent();
     }
     Ok(out)
@@ -2095,7 +2121,10 @@ fn open_pinned_snapshot_dir(
 
 /// Collect every directory in `dir` (post-order: children before parents, ending at `dir`),
 /// rejecting symlinks or non-directory entries.
-fn collect_snapshot_dirs_postorder(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), SnapshotError> {
+fn collect_snapshot_dirs_postorder(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), SnapshotError> {
     let meta = fs::symlink_metadata(dir)?;
     if !meta.is_dir() {
         return Err(SnapshotError::Changed);
@@ -2314,7 +2343,10 @@ fn materialize_closure(
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::DirBuilderExt;
-                    fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+                    fs::DirBuilder::new()
+                        .recursive(true)
+                        .mode(0o700)
+                        .create(parent)?;
                 }
                 #[cfg(not(unix))]
                 fs::create_dir_all(parent)?;
@@ -2335,16 +2367,15 @@ fn materialize_closure(
             verify(&dir)
         }
     };
-    let (verified_dirs, verified_files) = match verified_files
-        .and_then(|vf| seal_and_stat_snapshot_dirs(&dir).map(|vd| (vd, vf)))
-    {
-        Ok(pair) => pair,
-        Err(e) => {
-            // A source changed between the scan and the link/copy: this name is not ours.
-            purge_snapshot_dir(&dir);
-            return Err(e);
-        }
-    };
+    let (verified_dirs, verified_files) =
+        match verified_files.and_then(|vf| seal_and_stat_snapshot_dirs(&dir).map(|vd| (vd, vf))) {
+            Ok(pair) => pair,
+            Err(e) => {
+                // A source changed between the scan and the link/copy: this name is not ours.
+                purge_snapshot_dir(&dir);
+                return Err(e);
+            }
+        };
     mark_closure_snapshot_used_in(&root, &label)?;
     collect_closure_snapshots(&root, &label);
     finish(verified_dirs, verified_files)
@@ -2435,10 +2466,7 @@ fn collect_closure_snapshots(root: &Path, keep: &str) {
             if idle(&path) > 6 * CLOSURE_SNAPSHOT_MIN_IDLE {
                 purge_snapshot_dir(&path);
             }
-        } else if name != keep
-            && name != CLOSURE_BLOB_DIR
-            && name != CLOSURE_SNAPSHOT_USAGE_DIR
-        {
+        } else if name != keep && name != CLOSURE_BLOB_DIR && name != CLOSURE_SNAPSHOT_USAGE_DIR {
             let marker = usage_dir.join(&name);
             let age = if marker.exists() {
                 idle(&marker)
@@ -2461,7 +2489,11 @@ fn collect_closure_snapshots(root: &Path, keep: &str) {
     }
     // Blobs no snapshot links any more (link count 1), once idle.
     #[cfg(unix)]
-    for e in fs::read_dir(root.join(CLOSURE_BLOB_DIR)).into_iter().flatten().flatten() {
+    for e in fs::read_dir(root.join(CLOSURE_BLOB_DIR))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
         use std::os::unix::fs::MetadataExt;
         let unreferenced = e.metadata().is_ok_and(|m| m.nlink() == 1);
         if unreferenced && idle(&e.path()) > CLOSURE_SNAPSHOT_MIN_IDLE {
@@ -2625,10 +2657,15 @@ pub fn split_body_into_prefix_and_decl(body_code: &str) -> Option<(String, Strin
         return None;
     }
     let mut last_thm_idx: Option<usize> = None;
+    let mut cur_mutual_start: Option<usize> = None;
     for (idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("theorem ") || trimmed.starts_with("lemma ") {
-            last_thm_idx = Some(idx);
+        let trimmed = line.split("--").next().unwrap_or(line).trim();
+        if cur_mutual_start.is_none() && (trimmed == "mutual" || trimmed.starts_with("mutual ")) {
+            cur_mutual_start = Some(idx);
+        } else if cur_mutual_start.is_some() && (trimmed == "end" || trimmed.starts_with("end ")) {
+            cur_mutual_start = None;
+        } else if trimmed.starts_with("theorem ") || trimmed.starts_with("lemma ") {
+            last_thm_idx = Some(cur_mutual_start.unwrap_or(idx));
         }
     }
     let split_idx = last_thm_idx?;
@@ -3068,7 +3105,7 @@ pub(crate) fn ensure_zygote_binary(
     ensure_zygote_binary_at(&store.root, lean_bin, env_vars)
 }
 
-fn ensure_zygote_binary_at(
+pub(crate) fn ensure_zygote_binary_at(
     store_root: &Path,
     lean_bin: &Path,
     env_vars: &std::collections::HashMap<String, String>,
@@ -3088,6 +3125,8 @@ fn ensure_zygote_binary_at(
     if let Some(tc) = env_vars.get("ELAN_TOOLCHAIN") {
         hasher.update(tc.as_bytes());
     }
+    hasher.update(BLAKE3_LEAN_SRC.as_bytes());
+    hasher.update(STATEMENT_HASH_LEAN_SRC.as_bytes());
     hasher.update(ZYGOTE_WORKER_LEAN_SRC.as_bytes());
     let bin_name = format!("turbo_zygote_{}", &hasher.finalize().to_hex()[..16]);
     let bin_dir = store_root.join("fastcheck_bins");
@@ -3123,51 +3162,93 @@ fn ensure_zygote_binary_at(
     }
 
     let tmp_id = next_tmp_id();
-    // Compile embedded ZygoteWorker.lean via `lean -c` + `leanc -O3 -lleanshared -Wl,-rpath,<sysroot>/lib/lean`
-
-    let tmp_lean = bin_dir.join(format!("ZygoteWorker_{}.lean", tmp_id));
-    let tmp_c = bin_dir.join(format!("ZygoteWorker_{}.c", tmp_id));
-    let tmp_bin = bin_dir.join(format!(".{}.{}.tmp", bin_name, tmp_id));
-    fs::write(&tmp_lean, ZYGOTE_WORKER_LEAN_SRC)?;
-
-    let out1 = Command::new(lean_bin)
-        .arg(format!("--root={}", bin_dir.display()))
-        .arg("-c")
-        .arg(&tmp_c)
-        .arg(&tmp_lean)
-        .current_dir(&bin_dir)
-        .envs(env_vars)
-        .output()
-        .context("Failed to compile ZygoteWorker.lean to C")?;
-    let _ = fs::remove_file(&tmp_lean);
-    if !out1.status.success() {
-        anyhow::bail!(
-            "`lean -c` failed on ZygoteWorker.lean:\n{}",
-            String::from_utf8_lossy(&out1.stderr)
-        );
+    // Compile embedded TurboLean/{Blake3,StatementHash,ZygoteWorker}.lean via `lean -c` + `leanc -O3 -lleanshared -Wl,-rpath,<sysroot>/lib/lean`
+    let scratch_dir = bin_dir.join(format!(".zygote_build_{}", tmp_id));
+    struct ScratchGuard(PathBuf);
+    impl Drop for ScratchGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
+    let _scratch_guard = ScratchGuard(scratch_dir.clone());
+    let scratch_pkg = scratch_dir.join("TurboLean");
+    fs::create_dir_all(&scratch_pkg)?;
+    let tmp_bin = bin_dir.join(format!(".{}.{}.tmp", bin_name, tmp_id));
 
-    let mut link_cmd = Command::new(&leanc_bin);
-    link_cmd
-        .arg("-O3")
-        .arg(&tmp_c)
-        .arg("-lleanshared")
-        .arg("-o")
-        .arg(&tmp_bin)
-        .current_dir(&bin_dir)
-        .envs(env_vars);
-    if let Some(tc_lib_lean) = lean_bin
+    let tc_lib_lean = lean_bin
         .parent()
         .and_then(|b| b.parent())
         .map(|tc| tc.join("lib").join("lean"))
-        .filter(|p| p.exists())
-    {
+        .filter(|p| p.exists());
+    let mut compile_env = env_vars.clone();
+    let base_lp = compile_env
+        .get("LEAN_PATH")
+        .cloned()
+        .or_else(|| {
+            tc_lib_lean
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+        })
+        .unwrap_or_default();
+    let scratch_lp = if base_lp.is_empty() {
+        scratch_dir.to_string_lossy().to_string()
+    } else {
+        format!("{}:{}", scratch_dir.display(), base_lp)
+    };
+    compile_env.insert("LEAN_PATH".to_string(), scratch_lp);
+
+    let mut c_files = Vec::with_capacity(3);
+    for (stem, src, emit_olean) in [
+        ("Blake3", BLAKE3_LEAN_SRC, true),
+        ("StatementHash", STATEMENT_HASH_LEAN_SRC, true),
+        ("ZygoteWorker", ZYGOTE_WORKER_LEAN_SRC, false),
+    ] {
+        let lean_file = if emit_olean {
+            scratch_pkg.join(format!("{stem}.lean"))
+        } else {
+            scratch_dir.join(format!("ZygoteWorker_{tmp_id}.lean"))
+        };
+        let c_file = scratch_dir.join(format!("{stem}_{tmp_id}.c"));
+        fs::write(&lean_file, src)?;
+        let mut cmd = Command::new(lean_bin);
+        cmd.arg(format!("--root={}", scratch_dir.display()));
+        if emit_olean {
+            cmd.arg("-o").arg(scratch_pkg.join(format!("{stem}.olean")));
+        }
+        let out = cmd
+            .arg("-c")
+            .arg(&c_file)
+            .arg(&lean_file)
+            .current_dir(&scratch_dir)
+            .envs(&compile_env)
+            .output()
+            .with_context(|| format!("Failed to compile {stem}.lean to C"))?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "`lean -c` failed on {stem}.lean:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        c_files.push(c_file);
+    }
+
+    let mut link_cmd = Command::new(leanc_bin);
+    link_cmd.arg("-O3");
+    for c_file in &c_files {
+        link_cmd.arg(c_file);
+    }
+    link_cmd
+        .arg("-lleanshared")
+        .arg("-o")
+        .arg(&tmp_bin)
+        .current_dir(&scratch_dir)
+        .envs(&compile_env);
+    if let Some(tc_lib_lean) = tc_lib_lean {
         link_cmd.arg(format!("-Wl,-rpath,{}", tc_lib_lean.display()));
     }
     let out2 = link_cmd
         .output()
         .context("Failed to link ZygoteWorker binary via `leanc -O3 -lleanshared`")?;
-    let _ = fs::remove_file(&tmp_c);
     if !out2.status.success() {
         let _ = fs::remove_file(&tmp_bin);
         anyhow::bail!(
@@ -3204,6 +3285,51 @@ struct ZygoteAuditModulesReply {
     /// `--shard` mode: the module's non-stub theorems, read from the kernel environment.
     #[serde(default)]
     pub decls: Option<Vec<String>>,
+    /// `--shard` mode: newly declared non-stub theorems mapped to `statement-v1` kernel type hash.
+    #[serde(default)]
+    pub decl_types: Option<std::collections::BTreeMap<String, String>>,
+}
+
+/// Verify that every expected `(decl_name, expected_kernel_type_hash)` pair was elaborated in the
+/// kernel environment (matching exact declaration name or namespace-scoped `_turbo_verify_<n>_`
+/// fast-verify wrapper) AND its canonical `statement-v1` kernel type hash matches `expected_hash`.
+pub(crate) fn verify_attested_decl_types(
+    got_decl_types: &std::collections::BTreeMap<String, String>,
+    expected: &[(String, String)],
+) -> Result<()> {
+    for (exp_name, exp_hash) in expected {
+        let mut saw_name = false;
+        let mut matched_hash = false;
+        let mut mismatched_got = None;
+        for (got_name, got_hash) in got_decl_types {
+            if crate::splitter::matches_attested_decl_or_fast_verify(got_name, exp_name) {
+                saw_name = true;
+                if got_hash == exp_hash {
+                    matched_hash = true;
+                    break;
+                }
+                mismatched_got = Some((got_name.as_str(), got_hash.as_str()));
+            }
+        }
+        if !saw_name {
+            anyhow::bail!(
+                "[TurboLean.KernelGate] attested theorem `{}` missing from elaborated kernel environment (got {:?})",
+                exp_name,
+                got_decl_types.keys().collect::<Vec<_>>()
+            );
+        }
+        if !matched_hash {
+            let (got_name, got_hash) = mismatched_got.unwrap_or(("", ""));
+            anyhow::bail!(
+                "[TurboLean.KernelGate] kernel statement type mismatch for `{}` (elaborated as `{}` with hash `{}`, expected attested hash `{}`)",
+                exp_name,
+                got_name,
+                got_hash,
+                exp_hash
+            );
+        }
+    }
+    Ok(())
 }
 
 pub(crate) struct PinnedFfiPackage {
@@ -3327,7 +3453,7 @@ pub(crate) fn audit_compiled_modules_with_zygote(
     Ok(())
 }
 
-fn build_auditor_bootstrap_env(
+pub(crate) fn build_auditor_bootstrap_env(
     cfg: &crate::module_builder::ProjectConfig,
 ) -> std::collections::HashMap<String, String> {
     let mut bootstrap_env = std::collections::HashMap::new();
@@ -3369,12 +3495,41 @@ fn audit_compiled_module_batch(
     if mod_names.is_empty() || mod_names.iter().any(|m| m.trim().is_empty()) {
         anyhow::bail!("In-kernel `.olean` audit received an empty module name: fail-closed");
     }
+    let (mut cmd, timeout) = kernel_reader_command(
+        &store.root,
+        cfg,
+        lean_path_env,
+        extra_ro_binds,
+        is_untrusted,
+    )?;
+    cmd.arg("--audit-modules");
+    for a in pinned_ffi_allow_args(cfg, mod_names) {
+        cmd.arg(a);
+    }
+    for m in mod_names {
+        cmd.arg(m);
+    }
+
+    let out = crate::module_builder::run_command_with_timeout(&mut cmd, timeout, is_untrusted)
+        .context("Failed to execute in-kernel `.olean` soundness auditor (`--audit-modules`)")?;
+    parse_audit_modules_reply(&out, mod_names).map(drop)
+}
+
+/// The audited `.olean` reader process (the zygote binary with initializers disabled; sandboxed
+/// for untrusted inputs), shared by module audits and declaration-identity readout.
+pub(crate) fn kernel_reader_command(
+    store_root: &Path,
+    cfg: &crate::module_builder::ProjectConfig,
+    lean_path_env: &str,
+    extra_ro_binds: &[PathBuf],
+    is_untrusted: bool,
+) -> Result<(Command, std::time::Duration)> {
     let bootstrap_env = build_auditor_bootstrap_env(cfg);
     let auditor_ld_library_path = bootstrap_env
         .get("LD_LIBRARY_PATH")
         .map(String::as_str)
         .unwrap_or("");
-    let zygote_bin = ensure_zygote_binary(store, &cfg.lean_bin, &bootstrap_env)?;
+    let zygote_bin = ensure_zygote_binary_at(store_root, &cfg.lean_bin, &bootstrap_env)?;
     let canon_zygote = zygote_bin.canonicalize().unwrap_or(zygote_bin);
 
     let stack_kb = if is_untrusted {
@@ -3382,14 +3537,11 @@ fn audit_compiled_module_batch(
     } else {
         std::env::var("LEAN_STACK_SIZE_KB").unwrap_or_else(|_| "262144".to_string())
     };
-    let timeout_secs = std::env::var("TURBO_LEAN_AUDIT_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(if is_untrusted { 120 } else { 300 });
+    let timeout_ms = audit_timeout_ms(is_untrusted);
 
-    let mut cmd = if is_untrusted {
-        let bwrap_path = crate::module_builder::probe_bwrap_sandbox(&cfg.root_pkg.pkg_root).ok_or_else(|| {
+    let cmd = if is_untrusted {
+        let bwrap_path = crate::module_builder::probe_bwrap_sandbox(&cfg.root_pkg.pkg_root)
+            .ok_or_else(|| {
             anyhow::anyhow!(
                 "Untrusted kernel `.olean` audit requires a working bubblewrap (`bwrap`) sandbox: fail-closed sandbox gate"
             )
@@ -3484,22 +3636,7 @@ fn audit_compiled_module_batch(
             .env("LEAN_STACK_SIZE_KB", &stack_kb);
         c
     };
-
-    cmd.arg("--audit-modules");
-    for a in pinned_ffi_allow_args(cfg, mod_names) {
-        cmd.arg(a);
-    }
-    for m in mod_names {
-        cmd.arg(m);
-    }
-
-    let out = crate::module_builder::run_command_with_timeout(
-        &mut cmd,
-        std::time::Duration::from_secs(timeout_secs),
-        is_untrusted,
-    )
-    .context("Failed to execute in-kernel `.olean` soundness auditor (`--audit-modules`)")?;
-    parse_audit_modules_reply(&out, mod_names).map(drop)
+    Ok((cmd, std::time::Duration::from_millis(timeout_ms)))
 }
 
 /// The auditor's verdict on `mod_names`: its JSON reply when every module passed, else an error.
@@ -3573,40 +3710,105 @@ pub(crate) fn run_audited_lean_shard(
     lean_args: &[String],
     timeout_ms: Option<u64>,
 ) -> Result<std::process::Output> {
+    run_audited_lean_shard_with_types(
+        store,
+        lean_bin,
+        env_vars,
+        cwd,
+        source,
+        audit,
+        &[],
+        lean_args,
+        timeout_ms,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_audited_lean_shard_with_types(
+    store: &TurboStore,
+    lean_bin: &Path,
+    env_vars: &std::collections::HashMap<String, String>,
+    cwd: Option<&Path>,
+    source: &str,
+    audit: &std::collections::HashSet<String>,
+    expected_types: &[(String, String)],
+    lean_args: &[String],
+    timeout_ms: Option<u64>,
+) -> Result<std::process::Output> {
+    run_audited_lean_shard_with_types_report(
+        store,
+        lean_bin,
+        env_vars,
+        cwd,
+        source,
+        audit,
+        expected_types,
+        lean_args,
+        timeout_ms,
+    )
+    .map(|(out, _)| out)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_audited_lean_shard_with_types_report(
+    store: &TurboStore,
+    lean_bin: &Path,
+    env_vars: &std::collections::HashMap<String, String>,
+    cwd: Option<&Path>,
+    source: &str,
+    audit: &std::collections::HashSet<String>,
+    expected_types: &[(String, String)],
+    lean_args: &[String],
+    timeout_ms: Option<u64>,
+) -> Result<(
+    std::process::Output,
+    std::collections::BTreeMap<String, String>,
+)> {
     let started = std::time::Instant::now();
-    let mod_name = format!("TurboAuditedShard_{}_{}", std::process::id(), next_tmp_id());
-    let tmp_dir = store.fast_staging_dir().join(&mod_name);
-    let _ = fs::remove_dir_all(&tmp_dir);
-    fs::create_dir_all(&tmp_dir)?;
-    struct TmpDirGuard(PathBuf);
-    impl Drop for TmpDirGuard {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-    let _guard = TmpDirGuard(tmp_dir.clone());
-    let lean_file = tmp_dir.join(format!("{}.lean", mod_name));
-    fs::write(&lean_file, source)?;
+    let nonce = format!("{}_{}", std::process::id(), next_tmp_id());
+    let mod_name = format!("TurboAuditedShard_{}", nonce);
+    let src_dir = crate::check::PrivateScratchDir::create_with_nonce(
+        &store.fast_staging_dir(),
+        "turbo_audited_src",
+        nonce.clone(),
+    )?;
+    let out_dir = crate::check::PrivateScratchDir::create_with_nonce(
+        &store.fast_staging_dir(),
+        "turbo_audited_out",
+        nonce.clone(),
+    )?;
+    let reader_dir = crate::check::PrivateScratchDir::create_with_nonce(
+        &store.fast_staging_dir(),
+        "turbo_audited_rdr",
+        nonce.clone(),
+    )?;
+    let lean_file = src_dir.path.join(format!("{}.lean", mod_name));
+    crate::check::create_readonly_private_file(&lean_file, source.as_bytes())?;
+    crate::check::freeze_private_dir(&src_dir.path)?;
+    let out_olean = out_dir.path.join(format!("{}.olean", mod_name));
+    let nonce_env_val = format!("shard_{}", nonce);
     // Pinned toolchain executables replace any PATH/LEAN/LAKE/LEANC overrides in `env_vars`.
     let mut cmd = crate::module_builder::verifier_command(lean_bin, env_vars)?;
     cmd.args(crate::module_builder::filter_allowed_lean_args(lean_args))
         .arg("-Ddebug.skipKernelTC=false")
         .arg(&lean_file)
         .arg("-R")
-        .arg(&tmp_dir)
+        .arg(&src_dir.path)
         .arg("-o")
-        .arg(tmp_dir.join(format!("{}.olean", mod_name)));
+        .arg(&out_olean)
+        .env("TURBO_LEAN_PROBE_NONCE", &nonce_env_val);
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
-    let out = match timeout_ms {
-        Some(_) => run_lean_command(&mut cmd, timeout_ms),
-        None => cmd.output().map_err(Into::into),
-    }
-    .context("Failed to execute `lean` on shard fallback")?;
+    let out_res = run_lean_command(&mut cmd, timeout_ms);
+    reap_processes_with_nonce(&nonce_env_val);
+    let out = out_res.context("Failed to execute `lean` on shard fallback")?;
     if !out.status.success() {
-        return Ok(out);
+        return Ok((out, std::collections::BTreeMap::new()));
     }
+    crate::check::freeze_private_dir(&out_dir.path)?;
+    crate::check::stage_isolated_module_artifacts(&out_dir.path, &reader_dir.path, &mod_name)?;
+    crate::check::freeze_private_dir(&reader_dir.path)?;
 
     let lean_path = env_vars
         .get("LEAN_PATH")
@@ -3614,8 +3816,8 @@ pub(crate) fn run_audited_lean_shard(
         .or_else(|| std::env::var("LEAN_PATH").ok())
         .filter(|lp| !lp.is_empty())
         .map_or_else(
-            || tmp_dir.display().to_string(),
-            |lp| format!("{}:{}", tmp_dir.display(), lp),
+            || reader_dir.path.display().to_string(),
+            |lp| format!("{}:{}", reader_dir.path.display(), lp),
         );
     // A request budget bounds the whole fallback: compile, auditor preparation and audit.
     let budget_left = |stage: &str| -> Result<Option<std::time::Duration>> {
@@ -3684,31 +3886,24 @@ pub(crate) fn run_audited_lean_shard(
     }
     for sh in crate::splitter::split_lean_source(source, &[]).shards {
         if crate::splitter::strip_lean_comments(&sh.proof_text).trim() == "sorry"
-            && !crate::splitter::matches_uncached_or_fast_verify_name(&sh.name, audit)
+            && !crate::splitter::matches_uncached_or_fast_verify_name(sh.decl_name(), audit)
         {
-            auditor.arg(format!("--stub-ok={}", sh.name));
+            auditor.arg(format!("--stub-ok={}", sh.decl_name()));
         }
     }
     auditor.arg(&mod_name);
     if let Some(dir) = cwd {
         auditor.current_dir(dir);
     }
-    let mut audit_timeout = std::time::Duration::from_secs(
-        std::env::var("TURBO_LEAN_AUDIT_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .filter(|&v| v > 0)
-            .unwrap_or(300),
-    );
+    let mut audit_timeout = std::time::Duration::from_millis(audit_timeout_ms(false));
     if let Some(left) = budget_left("the shard audit")? {
         audit_timeout = audit_timeout.min(left);
     }
     let audit_out =
         crate::module_builder::run_command_with_timeout(&mut auditor, audit_timeout, false)
             .context("Failed to execute in-kernel shard auditor (`--audit-modules --shard`)")?;
-    let decls = parse_audit_modules_reply(&audit_out, std::slice::from_ref(&mod_name))?
-        .decls
-        .unwrap_or_default();
+    let parsed_reply = parse_audit_modules_reply(&audit_out, std::slice::from_ref(&mod_name))?;
+    let decls = parsed_reply.decls.unwrap_or_default();
     let missing: Vec<&String> = audit
         .iter()
         .filter(|name| {
@@ -3724,11 +3919,146 @@ pub(crate) fn run_audited_lean_shard(
             missing
         );
     }
-    Ok(out)
+    let decl_types = parsed_reply.decl_types.unwrap_or_default();
+    if !expected_types.is_empty() {
+        verify_attested_decl_types(&decl_types, expected_types)?;
+    }
+    Ok((out, decl_types))
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn audit_compiled_shard_module_with_zygote(
+    store: &TurboStore,
+    cfg: &crate::module_builder::ProjectConfig,
+    mod_name: &str,
+    lean_path_env: &str,
+    extra_ro_binds: &[PathBuf],
+    stub_ok: &[String],
+    audit: &std::collections::HashSet<String>,
+    expected_types: &[(String, String)],
+    is_untrusted: bool,
+) -> Result<()> {
+    anyhow::ensure!(
+        !mod_name.trim().is_empty(),
+        "In-kernel `.olean` shard audit received an empty module name: fail-closed"
+    );
+    let mod_names = vec![mod_name.to_string()];
+    let (mut cmd, timeout) = kernel_reader_command(
+        &store.root,
+        cfg,
+        lean_path_env,
+        extra_ro_binds,
+        is_untrusted,
+    )?;
+    cmd.args(["--audit-modules", "--shard"]);
+    for a in pinned_ffi_allow_args(cfg, &mod_names) {
+        cmd.arg(a);
+    }
+    for stub in stub_ok {
+        cmd.arg(format!("--stub-ok={stub}"));
+    }
+    cmd.arg(mod_name);
+    let out = crate::module_builder::run_command_with_timeout(&mut cmd, timeout, is_untrusted)
+        .context(
+            "Failed to execute in-kernel `.olean` shard auditor (`--audit-modules --shard`)",
+        )?;
+    let parsed_reply = parse_audit_modules_reply(&out, &mod_names)?;
+    let decls = parsed_reply.decls.unwrap_or_default();
+    let missing: Vec<&String> = audit
+        .iter()
+        .filter(|name| {
+            let one = std::collections::HashSet::from([(*name).clone()]);
+            !decls
+                .iter()
+                .any(|d| crate::splitter::matches_uncached_or_fast_verify_name(d, &one))
+        })
+        .collect();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "[TurboLean.KernelGate] audited theorem(s) {:?} missing from compiled module `{}`",
+            missing,
+            mod_name
+        );
+    }
+    if !expected_types.is_empty() {
+        verify_attested_decl_types(&parsed_reply.decl_types.unwrap_or_default(), expected_types)?;
+    }
+    Ok(())
+}
+
+/// Kill any remaining owned process whose `/proc/<pid>/environ` carries exact
+/// `TURBO_LEAN_PROBE_NONCE=<nonce>` using PID-reuse-safe `pidfd_open` + `pidfd_send_signal(SIGKILL)`.
+pub(crate) fn reap_processes_with_nonce(nonce: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::fs::MetadataExt;
+        let expected = format!("TURBO_LEAN_PROBE_NONCE={nonce}");
+        let euid = unsafe { libc::geteuid() };
+        let my_pid = std::process::id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let mut held: Vec<std::os::fd::OwnedFd> = Vec::new();
+            for entry in fs::read_dir("/proc").into_iter().flatten().flatten() {
+                let Some(pid) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|s| s.parse::<u32>().ok())
+                else {
+                    continue;
+                };
+                if pid == my_pid {
+                    continue;
+                }
+                if fs::metadata(entry.path()).map(|m| m.uid()).ok() != Some(euid) {
+                    continue;
+                }
+                let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+                if fd < 0 {
+                    continue;
+                }
+                let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) };
+                let has_nonce = fs::read(entry.path().join("environ"))
+                    .unwrap_or_default()
+                    .split(|b| *b == 0)
+                    .any(|v| v == expected.as_bytes());
+                if !has_nonce {
+                    continue;
+                }
+                let is_zombie = fs::read_to_string(entry.path().join("stat"))
+                    .ok()
+                    .and_then(|st| st.rsplit_once(") ").map(|(_, rest)| rest.starts_with('Z')))
+                    .unwrap_or(false);
+                if is_zombie {
+                    continue;
+                }
+                let _ = unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        pidfd.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    )
+                };
+                held.push(pidfd);
+            }
+            if held.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = nonce;
+    }
+}
+
+type ZygoteLeanPathKey = (String, String, std::path::PathBuf);
+
 static ZYGOTE_LEAN_PATH_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<(String, String, std::path::PathBuf), String>>,
+    std::sync::Mutex<std::collections::HashMap<ZygoteLeanPathKey, String>>,
 > = std::sync::OnceLock::new();
 
 fn read_line_with_timeout(
@@ -4427,9 +4757,7 @@ fn eval_with_zygote_pool_attempt(
                 }
                 if let Some(fd) = inherit_fd {
                     let flags = libc::fcntl(fd, libc::F_GETFD);
-                    if flags < 0
-                        || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
-                    {
+                    if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
                         return Err(std::io::Error::last_os_error());
                     }
                 }
@@ -4889,10 +5217,12 @@ fn eval_with_zygote_pool_attempt(
             let mut messages = Vec::new();
             let mut errors = Vec::new();
             let mut used_constants = Vec::new();
+            let mut decl_types = std::collections::BTreeMap::new();
             for r in replies {
                 stdout.push_str(&r.stdout);
                 messages.extend(r.messages);
                 errors.extend(r.errors);
+                decl_types.extend(r.decl_types);
                 for c in r.used_constants {
                     if used_constants.len() < 32 && !used_constants.contains(&c) {
                         used_constants.push(c);
@@ -4918,6 +5248,7 @@ fn eval_with_zygote_pool_attempt(
                 messages,
                 errors,
                 used_constants,
+                decl_types,
                 scanner_version,
                 timed_out: false,
                 crashed: false,
@@ -4941,11 +5272,15 @@ fn eval_with_zygote_pool_attempt(
 
     let (req_line, active_prefix_key, active_prefix_code) =
         if let Some((_, pk, rl)) = batch_fission_override {
-            let warm_pk = match &args_digest_opt {
-                Some(ad) => format!("{}:opts:{}", pk, ad),
-                None => pk,
+            let warm_pk = if pk.is_empty() {
+                None
+            } else {
+                Some(match &args_digest_opt {
+                    Some(ad) => format!("{}:opts:{}", pk, ad),
+                    None => pk,
+                })
             };
-            (rl, Some(warm_pk), None)
+            (rl, warm_pk, None)
         } else if !eval_mode {
             if let Some((prefix_code, decl_code, prefix_key)) =
                 split_body_into_prefix_and_decl(&body_code)
@@ -5275,8 +5610,65 @@ fn eval_with_zygote_pool_attempt(
     }
 }
 
-/// Evaluate a single sub-shard (`prefix_source` + `sub_decl_source`) via the memory-governed
-/// `ZygotePool` with automatic `Command.State` prefix checkpoint reuse and RSS watermark recycling.
+/// Evaluate a single stubbed declaration signature (`allow_stub = true`) on top of `prefix_source`
+/// so cut-fission can verify `decl_types` matches `expected_kernel_type_hash` in the prefix context.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn probe_stub_decl_types_via_zygote(
+    store: &TurboStore,
+    toolchain: &str,
+    req_lean_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    lean_bin: &Path,
+    prefix_source: &str,
+    stub_decl_source: &str,
+    lean_args: &[String],
+) -> Result<ZygoteEvalReply> {
+    let (imports_csv, prefix_body) = split_shard_for_zygote(prefix_source);
+    let mut decl = stub_decl_source.trim_end().to_string();
+    decl.push('\n');
+    let hex_decl = hex_encode_bytes(decl.as_bytes());
+    let hex_opts = encode_lean_args_hex(lean_args);
+    let (prefix_key, req_line) = if prefix_body.trim().is_empty() {
+        let rl = if hex_opts.is_empty() {
+            format!("{}\t{}\tprobe_stub\n", imports_csv, hex_decl)
+        } else {
+            format!(
+                "{}\t{}\tprobe_stub\t\t\t{}\n",
+                imports_csv, hex_decl, hex_opts
+            )
+        };
+        (String::new(), rl)
+    } else {
+        let pk = blake3::hash(prefix_body.as_bytes()).to_hex().to_string();
+        let hex_prefix = hex_encode_bytes(prefix_body.as_bytes());
+        let rl = if hex_opts.is_empty() {
+            format!(
+                "{}\t{}\tprobe_stub\t{}\t{}\n",
+                imports_csv, hex_decl, pk, hex_prefix
+            )
+        } else {
+            format!(
+                "{}\t{}\tprobe_stub\t{}\t{}\t{}\n",
+                imports_csv, hex_decl, pk, hex_prefix, hex_opts
+            )
+        };
+        (pk, rl)
+    };
+    eval_with_zygote_pool_inner(
+        store,
+        toolchain,
+        req_lean_path,
+        env_vars,
+        lean_bin,
+        "",
+        true,
+        false,
+        None,
+        None,
+        Some((imports_csv, prefix_key, req_line)),
+        lean_args,
+    )
+}
 #[allow(clippy::too_many_arguments)]
 pub fn eval_shard_via_zygote(
     store: &TurboStore,
@@ -5488,6 +5880,34 @@ pub(crate) fn invocation_timeout_ms() -> Option<u64> {
         .trim()
         .parse()
         .ok()
+}
+
+/// Per-audit / `.olean`-reader budget in milliseconds (`TURBO_LEAN_AUDIT_TIMEOUT_SECS`,
+/// defaulting to 120 s in untrusted mode and 300 s in trusted mode).
+pub(crate) fn audit_timeout_ms(is_untrusted: bool) -> u64 {
+    std::env::var("TURBO_LEAN_AUDIT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(if is_untrusted { 120 } else { 300 })
+        .saturating_mul(1000)
+}
+
+/// Effective `.olean` declaration-identity reader budget in milliseconds: aligns with
+/// `audit_timeout_ms(is_untrusted)`, capped by any explicit request timeout (`TURBO_LEAN_TIMEOUT_MS`)
+/// and any remaining wall-clock budget since `started`.
+pub(crate) fn decl_identity_reader_budget_ms(
+    is_untrusted: bool,
+    started: Option<std::time::Instant>,
+) -> u64 {
+    let audit_ms = audit_timeout_ms(is_untrusted);
+    let cap_ms = invocation_timeout_ms()
+        .filter(|ms| *ms > 0)
+        .map_or(audit_ms, |ms| ms.min(audit_ms));
+    match started {
+        Some(t0) => remaining_timeout_ms(Some(cap_ms), t0),
+        None => cap_ms,
+    }
 }
 
 /// Share the request budget across worker attempts and a stock-Lean fallback.
@@ -6015,10 +6435,9 @@ fn compute_eval_shm_cache_filename(
     lean_args: &[String],
 ) -> Result<String> {
     let args_digest = crate::module_builder::compute_lean_args_digest(lean_args)?;
-    // v5: v4 (and older) entries were vetted without the stderr panic scan and carry no
-    // `scanner_version`; the scanner version also separates namespaces across scanner bumps.
+    // v6: includes `decl_types` kernel statement hashes from ZygoteWorker.
     let bytes = serde_json::to_vec(&(
-        "eval-shm:v5",
+        "eval-shm:v6",
         ZYGOTE_SCANNER_VERSION,
         &context.identity,
         file_name,
@@ -6429,27 +6848,16 @@ mod tests {
         fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
         let store = TurboStore::open(Some(&dir.join("store")))?;
         // Verifier commands take only absolute, installed toolchain executables.
-        let lean = crate::module_builder::ToolchainExecutables::resolve(
-            &dir,
-            "leanprover/lean4:v4.35.0",
-        )?
-        .lean;
+        let lean =
+            crate::module_builder::ToolchainExecutables::resolve(&dir, "leanprover/lean4:v4.35.0")?
+                .lean;
         let env = std::collections::HashMap::from([(
             "ELAN_TOOLCHAIN".to_string(),
             "leanprover/lean4:v4.35.0".to_string(),
         )]);
         let run = |src: &str| {
             let audit = std::collections::HashSet::from(["tgt".to_string()]);
-            run_audited_lean_shard(
-                &store,
-                &lean,
-                &env,
-                Some(&dir),
-                src,
-                &audit,
-                &[],
-                None,
-            )
+            run_audited_lean_shard(&store, &lean, &env, Some(&dir), src, &audit, &[], None)
         };
         let stubs = "namespace N\ntheorem s1 (n : Nat) {m : Nat} : n + m = m + n := sorry\ntheorem s2 : 1 = 1 := sorry\nend N\nnamespace M\ntheorem s2 : 2 = 2 := sorry\nend M\n";
         // Host-named prefix stubs (binders, namespaces, a short name used twice) are exempt; the
@@ -6473,8 +6881,16 @@ mod tests {
                 "import Lean\n{}theorem Evil.s1 : False := by\n  run_tac do\n    let g ← Lean.Elab.Tactic.getMainGoal\n    g.assign (← Lean.Meta.mkSorry (← g.getType) false)\ntheorem tgt : False := Evil.s1\n",
                 stubs
             ),
-            "a second explicit sorry matching a stub name is ambiguous",
-            "prefix stub `s1` is ambiguous",
+            "a second explicit sorry outside the qualified stub's namespace is still audited and rejected",
+            "disallowed axiom `sorryAx`",
+        );
+        reject(
+            format!(
+                "import Lean\n{}theorem Evil.N.s1 : False := by\n  run_tac do\n    let g ← Lean.Elab.Tactic.getMainGoal\n    g.assign (← Lean.Meta.mkSorry (← g.getType) false)\ntheorem tgt : False := Evil.N.s1\n",
+                stubs
+            ),
+            "a second explicit sorry matching a qualified stub suffix is ambiguous",
+            "prefix stub `N.s1` is ambiguous",
         );
         reject(
             "import Lean\nmacro_rules | `(term| sorry) => `(term| trivial)\ntheorem s1 : True := sorry\ntheorem Evil.s1 : False := by\n  run_tac do\n    let g ← Lean.Elab.Tactic.getMainGoal\n    g.assign (← Lean.Meta.mkSorry (← g.getType) false)\ntheorem tgt : False := Evil.s1\n".into(),
@@ -6827,7 +7243,11 @@ mod tests {
                 )
                 .context("local eval must produce a reply")?;
                 assert!(reply.ok && reply.import_ok, "{reply:?}");
-                assert_eq!(reply.messages.concat().trim(), expected, "LEAN_PATH={name}: {reply:?}");
+                assert_eq!(
+                    reply.messages.concat().trim(),
+                    expected,
+                    "LEAN_PATH={name}: {reply:?}"
+                );
             }
             // Replacing an artifact at the same resolved path must also invalidate the reply.
             fs::copy(tree.root.join("A/Dep.olean"), tree.root.join("B/Dep.olean"))?;
@@ -7311,6 +7731,15 @@ mod tests {
         let err = run_lean_command(&mut Command::new("must-not-be-spawned"), Some(remaining))
             .unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
+
+        assert_eq!(audit_timeout_ms(true), 120_000);
+        assert_eq!(audit_timeout_ms(false), 300_000);
+        let expired_audit = std::time::Instant::now() - std::time::Duration::from_secs(301);
+        assert_eq!(decl_identity_reader_budget_ms(true, Some(expired_audit)), 0);
+        assert_eq!(
+            decl_identity_reader_budget_ms(false, Some(expired_audit)),
+            0
+        );
     }
 
     #[test]
@@ -7626,7 +8055,10 @@ mod tests {
         fs::write(&olean, &a).unwrap();
         let shm = tmp_dir.join("ev_test.json");
         write_eval_shm_cache(&shm, &snap, b"{}");
-        assert!(!shm.exists(), "eval shm reply cached under a stale closure digest");
+        assert!(
+            !shm.exists(),
+            "eval shm reply cached under a stale closure digest"
+        );
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 
@@ -7655,7 +8087,10 @@ mod tests {
         if sig1 == sig2 {
             eprintln!("coarse-granularity test: identical stat tuples across the rewrite");
         }
-        assert_ne!(d1, d2, "a same-length rewrite within one coarse tick must re-hash");
+        assert_ne!(
+            d1, d2,
+            "a same-length rewrite within one coarse tick must re-hash"
+        );
         assert_ne!(snap.rebind(), ClosureBinding::Bound);
         let _ = fs::remove_dir_all(&tmp_dir);
     }
@@ -7699,14 +8134,24 @@ mod tests {
                 use std::os::unix::fs::MetadataExt;
                 let m = fs::metadata(p).unwrap();
                 assert_eq!((m.dev(), m.ino()), (*dev, *ino));
-                assert_eq!(e.hash, hash(&fs::read(p).unwrap()), "poisoned memo entry for {p:?}");
+                assert_eq!(
+                    e.hash,
+                    hash(&fs::read(p).unwrap()),
+                    "poisoned memo entry for {p:?}"
+                );
             }
         }
         // The switch is observed through the memo: B is served B's digest, A is served A's.
         retarget(dir_b.clone())();
-        assert_eq!(read_file_digest(&path).unwrap().unwrap().hash, hash(b"olean-content-B"));
+        assert_eq!(
+            read_file_digest(&path).unwrap().unwrap().hash,
+            hash(b"olean-content-B")
+        );
         retarget(dir_a.clone())();
-        assert_eq!(read_file_digest(&path).unwrap().unwrap().hash, hash(b"olean-content-A"));
+        assert_eq!(
+            read_file_digest(&path).unwrap().unwrap().hash,
+            hash(b"olean-content-A")
+        );
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 
@@ -7725,8 +8170,7 @@ mod tests {
         let lp = lib.to_string_lossy().to_string();
         let digest_a = compute_imported_oleans_digest("Swap", &lp);
         let run = |src: &str| {
-            eval_with_zygote_pool(&store, toolchain, &lp, &env_vars, &lean_bin, src, false)
-                .unwrap()
+            eval_with_zygote_pool(&store, toolchain, &lp, &env_vars, &lean_bin, src, false).unwrap()
         };
         let wrong = "import Swap\ntheorem swap_two : swapVal = 2 := rfl\n";
 
@@ -7756,7 +8200,10 @@ mod tests {
         );
         // Neither the verdict nor the env computed on B may be served under D(A).
         let rep2 = run(wrong);
-        assert!(!rep2.ok, "verdict computed on B served under D(A): {rep2:?}");
+        assert!(
+            !rep2.ok,
+            "verdict computed on B served under D(A): {rep2:?}"
+        );
         let rep3 = run("import Swap\ntheorem swap_two' : swapVal = 2 := rfl\n");
         assert!(!rep3.ok, "env imported from B served under D(A): {rep3:?}");
         let rep4 = run("import Swap\ntheorem swap_one : swapVal = 1 := rfl\n");
@@ -7810,10 +8257,23 @@ mod tests {
         let a = compile_test_olean(&lean_bin, &lib2, "Priv", "def privVal : Nat := 1\n");
         fs::write(lib2.join("Priv.olean"), &a).unwrap();
         let lp = format!("{}:{}", lib1.display(), lib2.display());
-        let ctx = resolve_zygote_context("leanprover/lean4:v4.35.0", &lp, &env_vars, &lean_bin, "Priv");
-        let snap = ctx.closure.materialized.as_ref().expect("closure materialized");
+        let ctx = resolve_zygote_context(
+            "leanprover/lean4:v4.35.0",
+            &lp,
+            &env_vars,
+            &lean_bin,
+            "Priv",
+        );
+        let snap = ctx
+            .closure
+            .materialized
+            .as_ref()
+            .expect("closure materialized");
         let tc = fs::canonicalize(toolchain_lib_dir(&lean_bin).unwrap()).unwrap();
-        assert_eq!(ctx.worker_lean_path, format!("{}:{}", snap.dir.display(), tc.display()));
+        assert_eq!(
+            ctx.worker_lean_path,
+            format!("{}:{}", snap.dir.display(), tc.display())
+        );
         assert!(snap.dir.starts_with(closure_snapshot_root()));
         use std::os::unix::fs::MetadataExt;
         let (src, copy) = (
@@ -7825,7 +8285,11 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let dir_mode = fs::symlink_metadata(&snap.dir).unwrap().permissions().mode() & 0o777;
+            let dir_mode = fs::symlink_metadata(&snap.dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
             assert_eq!(dir_mode, 0o500, "snapshot root must be sealed 0o500");
         }
         assert_eq!(ctx.closure.binding(), ClosureBinding::Bound);
@@ -7843,7 +8307,13 @@ mod tests {
         fs::write(&blob, b"tampered").unwrap();
         assert_eq!(ctx.closure.binding(), ClosureBinding::Changed);
         // ...and the tampered snapshot is rebuilt from the source on next use.
-        let ctx2 = resolve_zygote_context("leanprover/lean4:v4.35.0", &lp, &env_vars, &lean_bin, "Priv");
+        let ctx2 = resolve_zygote_context(
+            "leanprover/lean4:v4.35.0",
+            &lp,
+            &env_vars,
+            &lean_bin,
+            "Priv",
+        );
         assert_eq!(ctx2.closure.label(), ctx.closure.label());
         assert_eq!(fs::read(snap.dir.join("Priv.olean")).unwrap(), a);
         let _ = fs::remove_dir_all(&tmp_dir);
@@ -7871,7 +8341,9 @@ mod tests {
         };
         let digest_a = compute_imported_oleans_digest("Shd", &lp);
         let (put, b_bytes) = (shadow.clone(), b.clone());
-        digest_test_hooks::set("after_closure_snapshot", move || fs::write(&put, &b_bytes).unwrap());
+        digest_test_hooks::set("after_closure_snapshot", move || {
+            fs::write(&put, &b_bytes).unwrap()
+        });
         let (del, replies) = (shadow.clone(), std::rc::Rc::new(std::cell::Cell::new(0)));
         let seen = replies.clone();
         digest_test_hooks::set("after_worker_reply", move || {
@@ -7887,7 +8359,10 @@ mod tests {
         assert!(replies.get() <= 1, "{rep1:?}");
         assert_eq!(compute_imported_oleans_digest("Shd", &lp), digest_a);
         assert!(!rep1.ok, "worker imported the shadow: {rep1:?}");
-        assert!(!run(wrong).ok, "verdict computed on the shadow served under D(A)");
+        assert!(
+            !run(wrong).ok,
+            "verdict computed on the shadow served under D(A)"
+        );
         assert!(run("import Shd\ntheorem shd_one : shdVal = 1 := rfl\n").ok);
         // Once the shadow is really there when the closure is resolved, it is what is imported.
         fs::write(&shadow, &b).unwrap();
@@ -7937,8 +8412,14 @@ mod tests {
         let wrong = "import Sym\ntheorem sym_two : symVal = 2 := rfl\n";
         let rep1 = run(wrong);
         digest_test_hooks::clear();
-        assert!(replies.get() <= 1, "the worker must not have seen the retarget: {rep1:?}");
-        assert!(!rep1.ok, "worker imported through the retargeted symlink: {rep1:?}");
+        assert!(
+            replies.get() <= 1,
+            "the worker must not have seen the retarget: {rep1:?}"
+        );
+        assert!(
+            !rep1.ok,
+            "worker imported through the retargeted symlink: {rep1:?}"
+        );
         assert!(!run(wrong).ok, "verdict computed on B served under D(A)");
         assert!(run("import Sym\ntheorem sym_one : symVal = 1 := rfl\n").ok);
         let _ = fs::remove_dir_all(&tmp_dir);
@@ -8873,7 +9354,10 @@ mod tests {
             compute_eval_shm_cache_filename(&context, file_name, caller_cwd.as_deref(), &src, &[])
                 .unwrap();
         assert_ne!(v3_name, new_name, "the namespace bump must change the key");
-        assert_ne!(v4_name, new_name, "scanner namespace must change the #305 key");
+        assert_ne!(
+            v4_name, new_name,
+            "scanner namespace must change the #305 key"
+        );
         let dir = store.fast_staging_dir().join("eval_shm_cache");
         fs::create_dir_all(&dir).unwrap();
         // A pre-scanner (no `scanner_version`) false success, planted at the v3 and v4 keys
@@ -9364,10 +9848,7 @@ mod tests {
         let olean = lib.join("EvSwap.olean");
         fs::write(&olean, &a).unwrap();
         let lp = lib.to_string_lossy().to_string();
-        let src = format!(
-            "import EvSwap\n-- {}\n#eval evSwapVal\n",
-            next_tmp_id()
-        );
+        let src = format!("import EvSwap\n-- {}\n#eval evSwapVal\n", next_tmp_id());
         let file_name = "EvalAba.lean";
         let caller_cwd = std::env::current_dir()
             .ok()
@@ -9554,18 +10035,25 @@ mod tests {
             .expect("closure materialized");
         let snap_dir = snap.dir.clone();
         let snap_pkg = snap_dir.join("Pkg");
-        let leaf_a_before = OleanFileStatSig::from_meta(
-            &fs::symlink_metadata(snap_pkg.join("Mod.olean")).unwrap(),
-        );
+        let leaf_a_before =
+            OleanFileStatSig::from_meta(&fs::symlink_metadata(snap_pkg.join("Mod.olean")).unwrap());
 
         // Normal snapshot creation must seal both the snapshot root and subdirectories `0o500`
         // and store last-used metadata outside the snapshot tree.
         assert_eq!(
-            fs::symlink_metadata(&snap_dir).unwrap().permissions().mode() & 0o777,
+            fs::symlink_metadata(&snap_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
             0o500
         );
         assert_eq!(
-            fs::symlink_metadata(&snap_pkg).unwrap().permissions().mode() & 0o777,
+            fs::symlink_metadata(&snap_pkg)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
             0o500
         );
         assert!(
@@ -9609,9 +10097,8 @@ mod tests {
         fs::rename(&snap_pkg, &stage_b).unwrap();
         fs::rename(&in_place_bak, &snap_pkg).unwrap();
         fs::set_permissions(&snap_dir, fs::Permissions::from_mode(0o500)).unwrap();
-        let leaf_a_after = OleanFileStatSig::from_meta(
-            &fs::symlink_metadata(snap_pkg.join("Mod.olean")).unwrap(),
-        );
+        let leaf_a_after =
+            OleanFileStatSig::from_meta(&fs::symlink_metadata(snap_pkg.join("Mod.olean")).unwrap());
         assert_eq!(
             leaf_a_before, leaf_a_after,
             "leaf file stat tuple must be identical across directory ABA swap"
@@ -9625,31 +10112,17 @@ mod tests {
         // Re-resolve cleanly so `snap_dir` has fresh verified directory stats & fence.
         purge_snapshot_dir(&snap_dir);
         let ctx_clean = resolve_zygote_context(tc, &lp, &env_vars, &lean_bin, "Pkg.Mod");
-        let snap_dir = ctx_clean
-            .closure
-            .materialized
-            .as_ref()
-            .unwrap()
-            .dir
-            .clone();
+        let snap_dir = ctx_clean.closure.materialized.as_ref().unwrap().dir.clone();
         let file_name = "dir_aba_eval.lean";
         let src = "import Pkg.Mod\n#eval pkgVal\n";
-        let caller_cwd = env_vars
-            .get("TURBO_LEAN_CALLER_CWD")
-            .cloned()
-            .or_else(|| {
-                std::env::current_dir()
-                    .ok()
-                    .map(|p| p.to_string_lossy().to_string())
-            });
-        let cache_name_a = compute_eval_shm_cache_filename(
-            &ctx_clean,
-            file_name,
-            caller_cwd.as_deref(),
-            src,
-            &[],
-        )
-        .unwrap();
+        let caller_cwd = env_vars.get("TURBO_LEAN_CALLER_CWD").cloned().or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string())
+        });
+        let cache_name_a =
+            compute_eval_shm_cache_filename(&ctx_clean, file_name, caller_cwd.as_deref(), src, &[])
+                .unwrap();
         let cache_path_a = store
             .fast_staging_dir()
             .join("eval_shm_cache")
@@ -9678,11 +10151,7 @@ mod tests {
                 fs::rename(&sb1, sd1.join("Pkg")).unwrap();
             }
         });
-        let (sd2, sb2, act2) = (
-            snap_dir.clone(),
-            stage_b.clone(),
-            swapped_active.clone(),
-        );
+        let (sd2, sb2, act2) = (snap_dir.clone(), stage_b.clone(), swapped_active.clone());
         digest_test_hooks::set("after_worker_reply", move || {
             if act2.replace(false) {
                 fs::rename(sd2.join("Pkg"), &sb2).unwrap();
@@ -9792,8 +10261,7 @@ mod tests {
     fn test_materialized_closure_ancestor_directory_aba_swap_never_poisons_caches() {
         use std::os::unix::fs::PermissionsExt;
 
-        let Some((tmp_dir, store, env_vars, lean_bin)) =
-            open_test_zygote_env("ancestor_dir_aba")
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("ancestor_dir_aba")
         else {
             return;
         };
@@ -9810,7 +10278,8 @@ mod tests {
         // 1. Verify `ensure_private_dir` creates missing nested parent components under
         // `closure_cache_base()` with mode `0o700` from birth (never world/group-traversable).
         let private_cache_base = tmp_dir.join("nested_missing/parent_dir/turbo-lean-cache");
-        TEST_CLOSURE_SNAPSHOT_CACHE_BASE.with(|c| *c.borrow_mut() = Some(private_cache_base.clone()));
+        TEST_CLOSURE_SNAPSHOT_CACHE_BASE
+            .with(|c| *c.borrow_mut() = Some(private_cache_base.clone()));
         let snap_root = ensure_private_dir(&closure_snapshot_root()).unwrap();
         assert_eq!(
             fs::symlink_metadata(&private_cache_base)
@@ -9878,11 +10347,14 @@ mod tests {
             .permissions();
         ro_perms.set_readonly(true);
         fs::set_permissions(fake_label_dir.join("Pkg/Mod.olean"), ro_perms).unwrap();
-        fs::set_permissions(fake_label_dir.join("Pkg"), fs::Permissions::from_mode(0o500)).unwrap();
+        fs::set_permissions(
+            fake_label_dir.join("Pkg"),
+            fs::Permissions::from_mode(0o500),
+        )
+        .unwrap();
         fs::set_permissions(&fake_label_dir, fs::Permissions::from_mode(0o500)).unwrap();
 
-        let dir_sig_before =
-            OleanFileStatSig::from_meta(&fs::symlink_metadata(&snap_dir).unwrap());
+        let dir_sig_before = OleanFileStatSig::from_meta(&fs::symlink_metadata(&snap_dir).unwrap());
         let leaf_sig_before = OleanFileStatSig::from_meta(
             &fs::symlink_metadata(snap_dir.join("Pkg/Mod.olean")).unwrap(),
         );
@@ -9980,28 +10452,22 @@ mod tests {
         // before `binding()`.
         if let Some(pool) = ZYGOTE_POOL.get() {
             if let Ok(mut guard) = pool.lock() {
-                guard.retain(|(_, lp_key, _), _| !lp_key.starts_with(&snap_dir.to_string_lossy().to_string()));
+                guard.retain(|(_, lp_key, _), _| {
+                    !lp_key.starts_with(&snap_dir.to_string_lossy().to_string())
+                });
             }
         }
         let ctx_eval = resolve_zygote_context(tc, &lp, &env_vars, &lean_bin, "Pkg.Mod");
         let file_name = "ancestor_dir_aba_eval.lean";
         let src = "import Pkg.Mod\n#eval pkgVal\n";
-        let caller_cwd = env_vars
-            .get("TURBO_LEAN_CALLER_CWD")
-            .cloned()
-            .or_else(|| {
-                std::env::current_dir()
-                    .ok()
-                    .map(|p| p.to_string_lossy().to_string())
-            });
-        let cache_name_a = compute_eval_shm_cache_filename(
-            &ctx_eval,
-            file_name,
-            caller_cwd.as_deref(),
-            src,
-            &[],
-        )
-        .unwrap();
+        let caller_cwd = env_vars.get("TURBO_LEAN_CALLER_CWD").cloned().or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string())
+        });
+        let cache_name_a =
+            compute_eval_shm_cache_filename(&ctx_eval, file_name, caller_cwd.as_deref(), src, &[])
+                .unwrap();
         let cache_path_a = store
             .fast_staging_dir()
             .join("eval_shm_cache")
@@ -10068,7 +10534,9 @@ mod tests {
         let _ = fs::remove_file(&cache_path_a);
         if let Some(pool) = ZYGOTE_POOL.get() {
             if let Ok(mut guard) = pool.lock() {
-                guard.retain(|(_, lp_key, _), _| !lp_key.starts_with(&snap_dir.to_string_lossy().to_string()));
+                guard.retain(|(_, lp_key, _), _| {
+                    !lp_key.starts_with(&snap_dir.to_string_lossy().to_string())
+                });
             }
         }
         purge_snapshot_dir(&fake_label_dir);
@@ -10282,6 +10750,78 @@ mod tests {
         let _ = fs::remove_file(&cache_path2);
         let _ = fs::remove_file(&state_file);
         let _ = fs::remove_file(store.root.join("zygote_daemon.json"));
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_zygote_coalesced_batch_attests_only_non_stub_theorems_and_blocks_prefix_sorry() {
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("coal_decl_types")
+        else {
+            return;
+        };
+        let toolchain = "leanprover/lean4:v4.35.0";
+
+        let clean_coalesced = "\
+set_option warn.sorry false in
+theorem cached_stub : True := sorry
+
+theorem uncached_first : 1 + 1 = 2 := rfl
+
+theorem uncached_second : 2 + 2 = 4 := rfl
+";
+        let rep_ok = eval_with_zygote_pool_opts(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            clean_coalesced,
+            true,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(rep_ok.ok && rep_ok.kernel_gate_active, "{rep_ok:?}");
+        assert!(
+            !rep_ok.decl_types.contains_key("cached_stub"),
+            "explicit sorry stub in prefix must not be attested as a verified theorem: {:?}",
+            rep_ok.decl_types
+        );
+        assert!(
+            rep_ok.decl_types.contains_key("uncached_first")
+                && rep_ok.decl_types.contains_key("uncached_second"),
+            "all non-stub theorems across prefix and body must be attested: {:?}",
+            rep_ok.decl_types
+        );
+
+        let sneaky_coalesced = "\
+set_option warn.sorry false in
+theorem cached_stub : True := sorry
+
+theorem sneaky_in_prefix : 1 = 2 := by sorry
+
+theorem uncached_tail : 2 + 2 = 4 := rfl
+";
+        let rep_bad = eval_with_zygote_pool_opts(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            sneaky_coalesced,
+            true,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !rep_bad.ok,
+            "tactic sorry inside non-stub theorem in prefix must be rejected even with allow_stub: {rep_bad:?}"
+        );
+        assert!(rep_bad.errors.join("\n").contains("sorryAx"));
+
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 }

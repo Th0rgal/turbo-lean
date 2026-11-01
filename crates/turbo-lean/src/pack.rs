@@ -255,6 +255,8 @@ pub struct CheckShardHttpRequest {
     pub allowed_axioms: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lean_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_kernel_type_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -269,6 +271,8 @@ pub struct CheckShardBatchItem {
     pub stmt_hash: String,
     #[serde(default)]
     pub proof_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_kernel_type_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -299,6 +303,8 @@ pub struct CheckShardsBatchResponse {
     pub stdout: String,
     pub stderr: String,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub verified_decl_types: std::collections::BTreeMap<String, String>,
 }
 
 pub fn is_portable_artifact(kind: &str, rel_path: &str) -> bool {
@@ -2857,6 +2863,14 @@ pub fn offload_check_shards_batch_http(
                         );
                     }
                 }
+                if let Some(ref kth) = item.expected_kernel_type_hash {
+                    if let Some(map) = receipt_obj.as_object_mut() {
+                        map.insert(
+                            "kernel_type_hash".to_string(),
+                            serde_json::Value::String(kth.clone()),
+                        );
+                    }
+                }
                 let receipt = serde_json::to_vec(&receipt_obj).ok()?;
                 Some((
                     item.shard_key.clone(),
@@ -2899,6 +2913,30 @@ pub fn offload_check_shards_batch_http(
             return Err(e.into());
         }
     };
+
+    if resp.ok {
+        let expected_types: Vec<(String, String)> = items
+            .iter()
+            .filter_map(|item| {
+                item.expected_kernel_type_hash
+                    .as_ref()
+                    .map(|kth| (item.decl_name.clone(), kth.clone()))
+            })
+            .collect();
+        if !expected_types.is_empty() {
+            if let Err(e) = crate::zygote::verify_attested_decl_types(
+                &resp.verified_decl_types,
+                &expected_types,
+            ) {
+                if inflight_tx_begun {
+                    store.rollback_inflight_publish();
+                }
+                return Err(e.context(format!(
+                    "Remote batch coordinator `{url}` did not attest expected kernel statement types"
+                )));
+            }
+        }
+    }
 
     if resp.ok && !items.is_empty() {
         if inflight_tx_begun {
@@ -3452,6 +3490,7 @@ pub(crate) mod tests {
             prefix_env_hash: "prefix_1".into(),
             stmt_hash: "stmt_1".into(),
             proof_hash: "proof_1".into(),
+            expected_kernel_type_hash: None,
             toolchain: "leanprover/lean4:v4.35.0".into(),
             lean_path: String::new(),
             skip_cas_lock: false,
@@ -3484,6 +3523,7 @@ pub(crate) mod tests {
             prefix_env_hash: "prefix_bv".into(),
             stmt_hash: "stmt_bv".into(),
             proof_hash: "proof_bv".into(),
+            expected_kernel_type_hash: None,
             toolchain: "leanprover/lean4:v4.35.0".into(),
             lean_path: String::new(),
             skip_cas_lock: false,
@@ -3509,7 +3549,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    fn spawn_authed_test_server(dir_server: &Path, token: &str) -> Result<String> {
+    pub(crate) fn spawn_authed_test_server(dir_server: &Path, token: &str) -> Result<String> {
         let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
         let (srv_dir, addr, tok) = (
             dir_server.to_path_buf(),
@@ -3551,6 +3591,7 @@ pub(crate) mod tests {
             prefix_env_hash: p.into(),
             stmt_hash: s.into(),
             proof_hash: pr.into(),
+            expected_kernel_type_hash: None,
         };
         let items = vec![
             mk_item("batch_shard_key_1", "batch_thm_1", "p1", "s1", "pr1"),
@@ -3648,6 +3689,145 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_remote_batch_and_single_shard_reject_unattested_or_mismatched_coordinator() -> Result<()>
+    {
+        let _env_guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir_server = std::env::temp_dir().join(format!("turbo_lean_att_srv_{}", next_tmp_id()));
+        let dir_client = std::env::temp_dir().join(format!("turbo_lean_att_cli_{}", next_tmp_id()));
+        let _ = fs::remove_dir_all(&dir_server);
+        let _ = fs::remove_dir_all(&dir_client);
+        let _ = TurboStore::open(Some(&dir_server))?;
+        let mut store_client = TurboStore::open(Some(&dir_client))?;
+
+        let tok = "test-att-batch-token";
+        std::env::set_var("TURBO_LEAN_API_TOKEN", tok);
+        let _clear = ScopedEnvClear(&["TURBO_LEAN_API_TOKEN"]);
+        let endpoint = format!("http://{}", spawn_authed_test_server(&dir_server, tok)?);
+
+        // 1) Mock an older coordinator that returns `ok: true` WITHOUT `verified_decl_types`.
+        let fake_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let fake_addr = fake_listener.local_addr()?;
+        let fake_handle = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut sock, _)) = fake_listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf);
+                let body = r#"{"ok":true,"verified_count":1,"cache_hits":0,"elapsed_ms":1.0,"exit_code":0,"stdout":"","stderr":"","error":null}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes());
+            }
+        });
+        let unattested_items = vec![CheckShardBatchItem {
+            shard_key: "unattested_remote_key".into(),
+            decl_name: "Ns.thm".into(),
+            prefix_env_hash: "p".into(),
+            stmt_hash: "s".into(),
+            proof_hash: "pr".into(),
+            expected_kernel_type_hash: Some("a".repeat(64)),
+        }];
+        let err = offload_check_shards_batch_http(
+            &mut store_client,
+            &format!("http://{fake_addr}"),
+            &unattested_items,
+            "namespace Ns\ntheorem thm : 2 + 2 = 4 := rfl\nend Ns\n",
+            "trusted",
+            include_str!("../../../lean/lean-toolchain").trim(),
+            "",
+            &[],
+        )
+        .unwrap_err();
+        let _ = fake_handle.join();
+        assert!(
+            format!("{err:#}").contains("did not attest expected kernel statement types"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            store_client
+                .batch_get_theorem_shards(&["unattested_remote_key".to_string()], "trusted")?
+                .is_empty(),
+            "local CAS must roll back inflight publish when remote coordinator omits verified_decl_types"
+        );
+
+        // 2) Real coordinator returns `verified_decl_types` for namespaced declarations on both cold verify and warm cache hit.
+        let ns_src = "namespace Ns\ntheorem thm : 2 + 2 = 4 := rfl\nend Ns\n";
+        let probe_items = vec![CheckShardBatchItem {
+            shard_key: "real_ns_probe".into(),
+            decl_name: "Ns.thm".into(),
+            prefix_env_hash: "p".into(),
+            stmt_hash: "s".into(),
+            proof_hash: "pr".into(),
+            expected_kernel_type_hash: None,
+        }];
+        let probe_resp = offload_check_shards_batch_http(
+            &mut store_client,
+            &endpoint,
+            &probe_items,
+            ns_src,
+            "trusted",
+            include_str!("../../../lean/lean-toolchain").trim(),
+            "",
+            &[],
+        )?;
+        let real_kth = probe_resp
+            .verified_decl_types
+            .get("Ns.thm")
+            .cloned()
+            .expect("real coordinator reports verified_decl_types for Ns.thm");
+
+        let attested_items = vec![CheckShardBatchItem {
+            shard_key: "real_ns_attested".into(),
+            decl_name: "Ns.thm".into(),
+            prefix_env_hash: "p".into(),
+            stmt_hash: "s".into(),
+            proof_hash: "pr".into(),
+            expected_kernel_type_hash: Some(real_kth.clone()),
+        }];
+        let cold_att = offload_check_shards_batch_http(
+            &mut store_client,
+            &endpoint,
+            &attested_items,
+            ns_src,
+            "trusted",
+            include_str!("../../../lean/lean-toolchain").trim(),
+            "",
+            &[],
+        )?;
+        assert!(cold_att.ok && cold_att.verified_count == 1);
+        assert!(store_client.has_attested_decl_receipt(
+            "real_ns_attested",
+            "trusted",
+            "Ns.thm",
+            &real_kth
+        ));
+
+        let dir_client2 =
+            std::env::temp_dir().join(format!("turbo_lean_att_cli2_{}", next_tmp_id()));
+        let mut store_client2 = TurboStore::open(Some(&dir_client2))?;
+        let warm_att = offload_check_shards_batch_http(
+            &mut store_client2,
+            &endpoint,
+            &attested_items,
+            ns_src,
+            "trusted",
+            include_str!("../../../lean/lean-toolchain").trim(),
+            "",
+            &[],
+        )?;
+        assert!(warm_att.ok && warm_att.cache_hits == 1);
+        assert_eq!(warm_att.verified_decl_types.get("Ns.thm"), Some(&real_kth));
+
+        std::env::remove_var("TURBO_LEAN_API_TOKEN");
+        for d in [&dir_server, &dir_client, &dir_client2] {
+            let _ = fs::remove_dir_all(d);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_zygote_worker_in_memory_env_reuse() -> Result<()> {
         let _env_guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir_server =
@@ -3667,6 +3847,7 @@ pub(crate) mod tests {
             prefix_env_hash: "prefix_z".into(),
             stmt_hash: stmt.into(),
             proof_hash: proof.into(),
+            expected_kernel_type_hash: None,
             toolchain: "leanprover/lean4:v4.35.0".into(),
             lean_path: iso_lp_str.clone(),
             skip_cas_lock: false,
@@ -3793,6 +3974,7 @@ pub(crate) mod tests {
             prefix_env_hash: String::new(),
             stmt_hash: String::new(),
             proof_hash: String::new(),
+            expected_kernel_type_hash: None,
             toolchain: "leanprover/lean4:v4.35.0".into(),
             lean_path: iso_lp.to_string_lossy().to_string(),
             skip_cas_lock: true,
