@@ -3836,7 +3836,11 @@ mod tests {
         assert_eq!(
             lake_refresh_targets(
                 &proj,
-                &["Smoke.A".to_string(), "Smoke.Shared".to_string(), "Other".to_string()]
+                &[
+                    "Smoke.A".to_string(),
+                    "Smoke.Shared".to_string(),
+                    "Other".to_string()
+                ]
             ),
             vec!["Other".to_string(), "Smoke".to_string()]
         );
@@ -3888,7 +3892,10 @@ mod tests {
             proj.join("Smoke/B.lean"),
             "import Smoke.A\ntheorem b : a = 1 := rfl\n",
         )?;
-        fs::write(proj.join("turbo-lean.toml"), "[worktree]\nauto_link = false\n")?;
+        fs::write(
+            proj.join("turbo-lean.toml"),
+            "[worktree]\nauto_link = false\n",
+        )?;
         // A plausible warm `.lake/build`: the `.olean` exists and is newer than its source, so
         // every mtime check below reports fresh and only the manifest can object.
         let olean = proj.join(".lake/build/lib/lean/Smoke/A.olean");
@@ -3899,7 +3906,8 @@ mod tests {
             .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))?;
 
         let a_src = fs::read_to_string(proj.join("Smoke/A.lean"))?;
-        let write_manifest = |entry: Option<crate::module_builder::VerifiedDepModuleEntry>| -> Result<()> {
+        type Entry = crate::module_builder::VerifiedDepModuleEntry;
+        let write_manifest = |entry: Option<Entry>| -> Result<()> {
             let cfg = crate::module_builder::resolve_project_config(&proj)?;
             let manifest = crate::module_builder::VerifiedDepManifest {
                 pkg_name: cfg.root_pkg.name.clone(),
@@ -3929,7 +3937,7 @@ mod tests {
             );
             Ok(())
         };
-        let fresh_entry = |inputs_digest: String| crate::module_builder::VerifiedDepModuleEntry {
+        let fresh_entry = |inputs_digest: String| Entry {
             src_blake3: blake3::hash(a_src.as_bytes()).to_hex().to_string(),
             olean_artifact_digest: String::new(),
             kernel_audited: true,
@@ -3955,7 +3963,8 @@ mod tests {
 
         // 3. Entry absent entirely, which is what a partial rebuild leaves behind.
         write_manifest(None)?;
-        let err = verdict().expect_err("an absent entry must be stale for an input-bearing package");
+        let err =
+            verdict().expect_err("an absent entry must be stale for an input-bearing package");
         assert!(err.contains("Smoke.A"), "{err}");
 
         // 4. The same absent entry stays *fresh* once the package declares no inputs: there the

@@ -4119,8 +4119,8 @@ fn checked_input_path(path: &Path) -> Result<PathBuf> {
 /// Both are deliberately stricter than Lake: they can only reject a configuration, never accept one
 /// Lake would reject, and neither can trigger for an input made of ordinary files.
 fn check_input_file_is_contained_regular_file(canon_pkg_root: &Path, path: &Path) -> Result<()> {
-    let meta = fs::symlink_metadata(path)
-        .with_context(|| format!("Failed to stat {}", path.display()))?;
+    let meta =
+        fs::symlink_metadata(path).with_context(|| format!("Failed to stat {}", path.display()))?;
     let resolved = if meta.file_type().is_symlink() {
         let target = fs::canonicalize(path).with_context(|| {
             format!(
@@ -4135,8 +4135,7 @@ fn check_input_file_is_contained_regular_file(canon_pkg_root: &Path, path: &Path
             target.display(),
             canon_pkg_root.display()
         );
-        fs::metadata(&target)
-            .with_context(|| format!("Failed to stat {}", target.display()))?
+        fs::metadata(&target).with_context(|| format!("Failed to stat {}", target.display()))?
     } else {
         meta
     };
@@ -6034,8 +6033,28 @@ pub(crate) fn project_lake_inputs_tag(project_dir: &Path) -> Option<String> {
 
 /// Lake's `LeanLib.recBuildExtraDepTargets` mixes one trace entry per `needs` target into the
 /// library's `extraDep` job, in declaration order, captioned with the input's resolved path.
-/// Unlike the cache key above this follows Lake's single attribution (`node.target_name`), because
-/// the `.trace` file has to reproduce what Lake computes for that library bit-for-bit.
+/// Unlike the cache key above this follows a single attribution (`node.target_name`), because the
+/// `.trace` file has to reproduce one specific Lake computation bit-for-bit.
+///
+/// That attribution is `build_module_dag`'s -- the **first** library whose globs select the module,
+/// because it expands them in declaration order -- while `lake build <Mod>` would use Lake's
+/// `findModule?`, the **last** one. Deliberately left divergent, because for a module two libraries
+/// select, both choices are sound and neither is "right":
+///
+/// - Lake has no single answer to reproduce. `lake build <Mod>` uses the last library, `lake build
+///   <Lib>` uses `<Lib>`, and a bare `lake build` walks each default target separately -- so the
+///   same module legitimately has different `extraDep` traces depending on what was asked for.
+/// - Every mismatch fails safe. Writing *fewer* input entries than Lake expects, or *more*, both
+///   make Lake's recomputed trace differ from the file and rebuild the module. The only way to get
+///   a "nothing to do" out of Lake is to match exactly, which is correct at the moment this is
+///   written: the module was just elaborated natively against the bytes being recorded.
+/// - What is *not* safe is a later input edit that Lake's own attribution cannot see, and that is
+///   not a trace-writing problem. `lake_build::lake_refresh_targets` handles it by asking Lake for
+///   the input-bearing library instead of the module.
+///
+/// Changing it would also risk the `lake build --no-build` parity this was verified against, for no
+/// soundness gain. `test_lake_input_dir_needs_trace_differential_against_lake` pins the bytes, and
+/// `test_lake_input_digest_reaches_module_and_project_keys` pins both attributions explicitly.
 fn lake_needs_trace_entries(cfg: &ProjectConfig, node: &ModuleNode) -> Vec<serde_json::Value> {
     let Some(pkg) = package_by_name(cfg, &node.pkg_name) else {
         return Vec::new();
@@ -9250,14 +9269,24 @@ lean_lib Later where
 
     /// Every content-derived cache key a `check` consults must move when a matched input is edited.
     ///
-    /// The per-module CAS key already did (previous test), but `check` does not always compute one:
-    /// it splits the file, looks the split up by `compute_file_split_key_with_deps`, and looks each
-    /// theorem up by `compute_shard_key_with_args` / `compute_fission_store_key_with_args`, all of
-    /// which are derived from the `.lean` bytes and the digests of what the file *imports*. An
-    /// `input_dir` file is neither, so `check` reported `all_shards_cached` and exited 0 against a
-    /// now-false `rfl`. `compute_imported_olean_interface_hashes` carries the inputs as one extra
-    /// dependency entry, which is what moves all four at once -- including for a file with no
-    /// imports at all, where that function used to return early with an empty list.
+    /// The per-module CAS key already did, but `check` does not always compute one: it splits the
+    /// file, looks the split up by `compute_file_split_key_with_deps`, and looks each theorem up by
+    /// `compute_shard_key_with_args` / `compute_fission_store_key_with_args`, all of which are
+    /// derived from the `.lean` bytes and the digests of what the file *imports*. An `input_dir`
+    /// file is neither, so all four were blind to it. `compute_imported_olean_interface_hashes`
+    /// carries the inputs as one extra dependency entry, which is what moves all four at once --
+    /// including for a file with no imports at all, where that function used to return early with
+    /// an empty list.
+    ///
+    /// Asserted at the level of the keys rather than end to end on purpose. A theorem *shard* is
+    /// elaborated from a relocated input context, where `include_str` -- the only way a proof can
+    /// read a declared input -- fails outright with "cannot compute parent directory", so no shard
+    /// that reads an input can be elaborated, let alone cached, and the "edit the `.sol`, get a
+    /// green cached shard" shape is not reachable through this path today. What is reachable is a
+    /// stale `.olean` (covered end to end by
+    /// `pr_verify::tests::test_warm_build_dir_rejects_oleans_stale_against_edited_lake_input`),
+    /// whose digest these same keys already depend on. Folding the inputs in here keeps that
+    /// independent of the `.olean` freshness logic being right.
     #[test]
     fn test_lake_input_digest_reaches_shard_split_and_fission_keys() {
         let dir = make_temp_test_dir("input_shard_keys");
@@ -9477,7 +9506,11 @@ lean_lib Later where
             "{err}"
         );
         fs::remove_file(proj.join("Data/escape.sol")).unwrap();
-        assert_eq!(digest(), with_inside_link, "removing it restores the digest");
+        assert_eq!(
+            digest(),
+            with_inside_link,
+            "removing it restores the digest"
+        );
 
         // 3. A dangling symlink fails closed too, rather than being skipped.
         std::os::unix::fs::symlink("nowhere.sol", proj.join("Data/dangling.sol")).unwrap();
@@ -9512,12 +9545,10 @@ lean_lib Later where
         let err = resolve().unwrap_err().to_string();
         assert!(err.contains("outside the package root"), "{err}");
         fs::remove_file(proj.join("spec.json")).unwrap();
-        assert!(
-            std::process::Command::new("mkfifo")
-                .arg(proj.join("spec.json"))
-                .status()
-                .is_ok_and(|s| s.success())
-        );
+        assert!(std::process::Command::new("mkfifo")
+            .arg(proj.join("spec.json"))
+            .status()
+            .is_ok_and(|s| s.success()));
         let err = resolve().unwrap_err().to_string();
         assert!(err.contains("is not a regular file"), "{err}");
         fs::remove_dir_all(dir).unwrap();

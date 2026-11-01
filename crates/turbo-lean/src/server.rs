@@ -1346,6 +1346,16 @@ fn execute_check_shard_payload_deferred_with_domain(
         anyhow::bail!("Missing shard_key or shard_source in /check-shard request");
     }
 
+    // The Lake file inputs a shard's project declares reach this cache through `req.shard_key`,
+    // which the client derives from `prefix_env_hash` -- and that now folds in
+    // `module_builder::project_lake_inputs_tag`. The server deliberately does not re-derive it: it
+    // has the shard source and nothing else, no checkout and no lakefile, so it cannot know what
+    // the requester declared. It is a content-addressed store keyed by whatever the requester
+    // computed, and a requester whose inputs changed presents a different key here.
+    //
+    // The converse also holds for the elaboration below: a shard that reads a declared input
+    // cannot be verified remotely at all, because the file is not on this host -- `include_str`
+    // fails to resolve rather than silently reading different bytes.
     if !req.skip_cas_lock && store.has_cached_action_readonly(&req.shard_key, trust_domain)? {
         return Ok((
             serde_json::json!({
