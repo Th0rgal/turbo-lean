@@ -576,6 +576,39 @@ pub fn compute_imported_oleans_digest(imports_csv: &str, effective_lean_path: &s
 /// 2. Any in-place modification or rebuild of any local `.olean` on `LEAN_PATH`
 ///    immediately changes `pool_key` and spawns a fresh worker, without scanning 5,400+
 ///    immutable `.lake/packages/*` `.olean` files on every cold CLI invocation.
+/// Digest of the declarative Lake file inputs of every package whose build directory is on the
+/// worker's search path.
+///
+/// A zygote worker is reused on the strength of `olean_digest` and the pool key: the toolchain, the
+/// search path, and the content of the `.olean` files it imported. An `input_dir` file is none of
+/// those -- it is read while a module elaborates and leaves every `.olean` byte untouched -- so a
+/// warm worker, its replayed `warm_prefixes`, and the in-process verified-shard memo all survived
+/// an input edit and answered from the old bytes. Folding this into `olean_digest` retires all
+/// three at once: the memo key contains it, `warm_imports` is compared against it before a worker
+/// is reused, and prefix reuse requires that same `warm_imports` match.
+///
+/// Package roots are recovered from the search path (`<pkg_root>/.lake/build/lib/lean`), which is
+/// the only project location this function is given. Empty -- and free, see
+/// `workspace_may_declare_lake_inputs` -- for every workspace that declares no inputs.
+fn compute_lean_path_lake_inputs_digest(effective_lean_path: &str) -> String {
+    let mut tags: Vec<String> = Vec::new();
+    for part in effective_lean_path.split(':').filter(|p| !p.is_empty()) {
+        if !Path::new(part).ends_with(".lake/build/lib/lean") {
+            continue;
+        }
+        let Some(pkg_root) = Path::new(part).ancestors().nth(4) else {
+            continue;
+        };
+        if let Some(tag) = crate::module_builder::project_lake_inputs_tag(pkg_root) {
+            if !tags.contains(&tag) {
+                tags.push(tag);
+            }
+        }
+    }
+    tags.sort();
+    tags.join(",")
+}
+
 pub fn compute_search_path_oleans_digest(effective_lean_path: &str) -> String {
     fn collect_oleans_rec(dir: &Path, depth: usize, out: &mut Vec<PathBuf>, max_files: usize) {
         if depth > 12 || out.len() >= max_files {
@@ -1786,7 +1819,15 @@ fn eval_with_zygote_pool_inner(
     let imports_csv = coalesce_proofkit_imports(&raw_imports_csv, &effective_lean_path);
     let search_path_digest = compute_search_path_oleans_digest(&effective_lean_path);
     let imported_digest = compute_imported_oleans_digest(&imports_csv, &effective_lean_path);
-    let pool_digest_tag = search_path_digest.clone();
+    // Declared Lake file inputs move no `.olean` byte, so they have to be named separately in both
+    // the pool key (never hand back a worker warmed against older input bytes) and `olean_digest`
+    // (which keys the verified-shard memo and the `warm_imports` / `warm_prefixes` match).
+    let lake_inputs_digest = compute_lean_path_lake_inputs_digest(&effective_lean_path);
+    let pool_digest_tag = if lake_inputs_digest.is_empty() {
+        search_path_digest.clone()
+    } else {
+        format!("{}#inputs:{}", search_path_digest, lake_inputs_digest)
+    };
     // Workers enforce the axiom policy they were spawned with: key them (and their replies) by it.
     let toolchain_policy = format!(
         "{}#{}",
@@ -1801,7 +1842,14 @@ fn eval_with_zygote_pool_inner(
         effective_lean_path.clone(),
         format!("{}#{}", pool_digest_tag, imports_csv),
     );
-    let olean_digest = format!("{}:{}", search_path_digest, imported_digest);
+    let olean_digest = if lake_inputs_digest.is_empty() {
+        format!("{}:{}", search_path_digest, imported_digest)
+    } else {
+        format!(
+            "{}:{}#inputs:{}",
+            search_path_digest, imported_digest, lake_inputs_digest
+        )
+    };
 
     let hex_opts = encode_lean_args_hex(lean_args);
     let args_digest_opt = crate::module_builder::compute_lean_args_digest(lean_args);
@@ -4046,6 +4094,58 @@ mod tests {
 
         fs::write(&olean_path, b"olean-version-2-modified").unwrap();
         assert_ne!(d1, compute_imported_oleans_digest("Foo.Bar", &lp));
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// A warm worker is handed back on the strength of the pool key and `olean_digest`, and the
+    /// in-process verified-shard memo is keyed on `olean_digest` too. A `needs`-ed `input_dir` file
+    /// is read while a module elaborates and moves no `.olean` byte, so without this component an
+    /// edited input left every one of them matching and the worker answered from the old bytes.
+    #[test]
+    fn test_zygote_lake_inputs_digest_tracks_declared_input_contents() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_zygote_lake_inputs_{}_{}",
+            std::process::id(),
+            next_tmp_id()
+        ));
+        let lib = tmp_dir.join(".lake/build/lib/lean");
+        fs::create_dir_all(&lib).unwrap();
+        fs::create_dir_all(tmp_dir.join("Data")).unwrap();
+        fs::write(
+            tmp_dir.join("lean-toolchain"),
+            include_str!("../../../lean/lean-toolchain"),
+        )
+        .unwrap();
+        let lp = lib.to_string_lossy().to_string();
+        // No Lake config yet: nothing declared, so nothing is mixed in and every existing
+        // project's pool key and `olean_digest` stay byte-identical.
+        assert_eq!(compute_lean_path_lake_inputs_digest(&lp), "");
+
+        fs::write(
+            tmp_dir.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage demo\ninput_dir smokeSources where\n  path := \"Data\"\n  filter := .extension \"sol\"\n@[default_target]\nlean_lib Smoke where\n  globs := #[.submodules `Smoke]\n  needs := #[smokeSources]\n",
+        )
+        .unwrap();
+        fs::write(tmp_dir.join("Data/a.sol"), "contract A {}").unwrap();
+        let d1 = compute_lean_path_lake_inputs_digest(&lp);
+        assert!(!d1.is_empty(), "a declared input must reach the worker key");
+        assert_eq!(d1, compute_lean_path_lake_inputs_digest(&lp), "stable");
+
+        // A matched edit moves it; an unmatched file does not.
+        fs::write(tmp_dir.join("Data/a.sol"), "contract ALongerName {}").unwrap();
+        let d2 = compute_lean_path_lake_inputs_digest(&lp);
+        assert_ne!(d1, d2, "editing a matched input must retire warm workers");
+        fs::write(tmp_dir.join("Data/notes.txt"), "notes").unwrap();
+        assert_eq!(d2, compute_lean_path_lake_inputs_digest(&lp));
+        // Restoring the bytes restores the digest, so a warm worker is reusable again.
+        fs::write(tmp_dir.join("Data/a.sol"), "contract A {}").unwrap();
+        assert_eq!(d1, compute_lean_path_lake_inputs_digest(&lp));
+
+        // A search-path entry that is not a package build directory is ignored.
+        assert_eq!(
+            compute_lean_path_lake_inputs_digest(&tmp_dir.to_string_lossy()),
+            ""
+        );
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 

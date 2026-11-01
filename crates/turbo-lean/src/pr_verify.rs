@@ -1183,6 +1183,16 @@ fn compute_source_only_import_digests(
     cfg_opt: Option<&crate::module_builder::ProjectConfig>,
     strict_untrusted: bool,
 ) -> Result<Vec<String>> {
+    // Same synthetic entry `compute_imported_olean_interface_hashes` adds on the trusted path, so
+    // an untrusted re-verification cannot reuse a split or a shard computed against older input
+    // bytes either. Taken from the already-resolved config when there is one, which keeps the
+    // untrusted mode's "never trust a stat, re-read the bytes" rule intact.
+    let lake_inputs_tag = match cfg_opt {
+        Some(cfg) => crate::module_builder::lake_inputs_tag_from_digest(
+            &crate::module_builder::workspace_lake_inputs_digest(cfg),
+        ),
+        None => crate::module_builder::project_lake_inputs_tag(project_dir),
+    };
     if project_dir.as_os_str().is_empty() && cfg_opt.is_none() {
         return Ok(Vec::new());
     }
@@ -1194,10 +1204,10 @@ fn compute_source_only_import_digests(
                 err
             );
         }
-        return Ok(Vec::new());
+        return Ok(lake_inputs_tag.into_iter().collect());
     }
     if hdr.imports.is_empty() {
-        return Ok(Vec::new());
+        return Ok(lake_inputs_tag.into_iter().collect());
     }
     let mut worklist = hdr.imports;
     let mut visited = std::collections::HashSet::new();
@@ -1320,6 +1330,7 @@ fn compute_source_only_import_digests(
             }
         }
     }
+    out.extend(lake_inputs_tag);
     out.sort();
     Ok(out)
 }
@@ -1379,25 +1390,41 @@ pub(crate) fn load_and_classify_pr_from_git(
 ///   [`crate::module_builder::module_lake_input_digest`] already do that precisely for the cache
 ///   keys, so the only cost of being coarse here is re-splitting some unaffected files.
 ///
-/// One thing it cannot see: a symlink under `path` whose target lives outside the repository. Git
-/// reports nothing for such a path, so this returns `false` even when the target's bytes changed.
-/// The content hashes behind [`crate::module_builder::compute_module_cas_key`] do follow the link
-/// (as Lake does) and still invalidate the affected modules, so the consequence is a missed
-/// *re-split*, not a stale `.olean`.
+/// One thing it cannot see: a symlink under `path` whose target lives outside the repository. Such
+/// a symlink now fails the config resolve outright (`hash_input_target` refuses an input symlink
+/// that leaves the package root), so there is no longer a case where this returns `false` for a
+/// changed input whose bytes the digests did pick up.
 fn lake_input_files_changed_since_base(
     repo_root: &Path,
     proj_prefix: &str,
     pkg: &crate::module_builder::PackageConfig,
+    dep_pkgs: &[crate::module_builder::PackageConfig],
     base_ref: &str,
 ) -> bool {
-    if pkg.inputs.is_empty() {
+    // Dependency packages too: a vendored `.lake/packages/<dep>` is part of the same repository,
+    // its `input_dir` is read while its modules elaborate, and nothing else in this classifier
+    // looks at non-`.lean` files. Each package's `path` is relative to *its* own root, so the
+    // prefix is rebuilt per package rather than shared.
+    let paths: Vec<String> = std::iter::once(pkg)
+        .chain(dep_pkgs)
+        .flat_map(|p| {
+            let prefix = match p.pkg_root.strip_prefix(repo_root) {
+                Ok(rel) if !rel.as_os_str().is_empty() => {
+                    rel.to_string_lossy().replace('\\', "/")
+                }
+                _ => proj_prefix.to_string(),
+            };
+            p.inputs
+                .iter()
+                .map(move |i| {
+                    join_proj_prefix(&prefix, &i.path.to_string_lossy().replace('\\', "/"))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    if paths.is_empty() {
         return false;
     }
-    let paths: Vec<String> = pkg
-        .inputs
-        .iter()
-        .map(|i| join_proj_prefix(proj_prefix, &i.path.to_string_lossy().replace('\\', "/")))
-        .collect();
     let unchanged = |args: &[&str]| -> bool {
         Command::new("git")
             .args(["--no-optional-locks", "-C", &repo_root.to_string_lossy()])
@@ -1475,12 +1502,29 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
     // A changed declarative Lake file input (`input_file` / `input_dir` reached through a
     // library's `needs`) is read during elaboration just like a source file, but it is not a
     // `.lean` file, so the diff below would ignore it. Treat it like a lakefile edit instead.
+    // Resolved as a whole workspace so a dependency package's inputs are covered too.
+    let owned_project_cfg = if is_untrusted || owned_pkg_cfg.is_none() {
+        None
+    } else {
+        crate::module_builder::resolve_project_config(canon_dir).ok()
+    };
     let lake_inputs_changed = untrusted_cfg
-        .map(|c| &c.root_pkg)
-        .or(owned_pkg_cfg.as_ref())
-        .is_some_and(|pkg| {
-            lake_input_files_changed_since_base(&repo_root, &proj_prefix, pkg, base_ref)
-        });
+        .or(owned_project_cfg.as_ref())
+        .is_some_and(|cfg| {
+            lake_input_files_changed_since_base(
+                &repo_root,
+                &proj_prefix,
+                &cfg.root_pkg,
+                &cfg.dep_pkgs,
+                base_ref,
+            )
+        })
+        // A root package that resolves standalone but whose workspace does not must not read as
+        // "no inputs changed": fail closed and re-verify.
+        || (owned_project_cfg.is_none()
+            && owned_pkg_cfg
+                .as_ref()
+                .is_some_and(|pkg| !pkg.inputs.is_empty()));
     let reconfigured = |rel: &str| -> bool {
         rel != "lakefile.lean"
             && (lake_inputs_changed
@@ -3725,20 +3769,25 @@ fn stock_statement_build_with_trust(project: &Path, is_untrusted: bool) -> Resul
             let lib_root = project
                 .join(&pkg.src_dir)
                 .join(lib.src_dir.as_deref().unwrap_or(Path::new("")));
-            lib_root == root
-                && lib.globs.iter().any(|glob| {
-                    use crate::module_builder::GlobSpec;
-                    match glob {
-                        GlobSpec::One(n) => name == *n,
-                        GlobSpec::Submodules(n) => name.starts_with(&format!("{n}.")),
-                        GlobSpec::AndSubmodules(n) => {
-                            name == *n || name.starts_with(&format!("{n}."))
-                        }
-                    }
-                })
+            lib_root == root && crate::module_builder::lib_can_build_module(lib, &name)
         }) || pkg.exes.iter().any(|exe| exe.root == name);
         if owned {
             lake_targets.push(format!("+{name}"));
+            // `+<Mod>` builds the module under Lake's own attribution (the last library that can
+            // build it), whose `extraDep` may carry none of the `needs` that names the input the
+            // module reads. Lake would then find its trace unchanged by an input edit and leave the
+            // stale `.olean` in place. Adding the input-bearing library makes Lake build it under
+            // that library's `extraDep`, which does carry the input.
+            for lib in pkg
+                .libs
+                .iter()
+                .filter(|lib| !lib.needs.is_empty())
+                .filter(|lib| crate::module_builder::lib_can_build_module(lib, &name))
+            {
+                if !lake_targets.contains(&lib.name) {
+                    lake_targets.push(lib.name.clone());
+                }
+            }
         } else {
             standalone.insert(name, (source, root));
         }
@@ -4136,7 +4185,10 @@ pub fn run_pr_verify_command(
         } else if crate::lake_build::has_lake_config(&canon_dir) {
             let imports = crate::lake_build::project_imports_of(&canon_dir, &edited);
             if !imports.is_empty() {
-                crate::lake_build::lake_build_modules(&canon_dir, &imports, Some(&base))?;
+                // Ask for the input-bearing library rather than the module where Lake's
+                // attribution would drop the `needs` and report the module up to date.
+                let targets = crate::lake_build::lake_refresh_targets(&canon_dir, &imports);
+                crate::lake_build::lake_build_modules(&canon_dir, &targets, Some(&base))?;
             }
         }
     }
@@ -5996,9 +6048,7 @@ end Fixture
                 toolchain: cfg.toolchain.clone(),
                 lean_githash: cfg.lean_githash.clone(),
                 pkg_config_digest: cfg.root_pkg.config_digest.clone(),
-                lake_inputs_digest: crate::module_builder::package_lake_inputs_digest(
-                    &cfg.root_pkg,
-                ),
+                lake_inputs_digest: crate::module_builder::workspace_lake_inputs_digest(&cfg),
                 allowed_axioms: crate::splitter::allowed_axioms(),
                 modules: BTreeMap::new(),
             });
@@ -6008,6 +6058,7 @@ end Fixture
                 src_blake3: blake3::hash(src_raw.as_bytes()).to_hex().to_string(),
                 olean_artifact_digest: art_dig,
                 kernel_audited: true,
+                lake_inputs_digest: crate::module_builder::workspace_lake_inputs_digest(&cfg),
             },
         );
         fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
@@ -7130,7 +7181,7 @@ end Fixture
         let olean_a = canon_repo.join(".lake/build/lib/lean/Smoke/A.olean");
         let inputs_digest = || -> String {
             crate::module_builder::resolve_project_config(&canon_repo)
-                .map(|cfg| crate::module_builder::package_lake_inputs_digest(&cfg.root_pkg))
+                .map(|cfg| crate::module_builder::workspace_lake_inputs_digest(&cfg))
                 .unwrap_or_default()
         };
         let manifest_inputs_digest = || -> Option<String> {
@@ -7290,6 +7341,130 @@ end Fixture
             Some(inputs_digest()),
             "the manifest must now pin the new input contents"
         );
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    /// The exact round-2 repro: `check` a module that reads a Lake file input, edit the input so the
+    /// module's `rfl` becomes false, and `check` the same module again.
+    ///
+    /// Independent of the warm-`.olean` test above, and of `ensure_project_imports_fresh_for_check`
+    /// in particular: the module checked here imports nothing project-local, so that function
+    /// returns `Ok(0)` without inspecting anything (asserted below). What is left is the chain of
+    /// content-derived caches -- the `/dev/shm` and store file splits keyed by
+    /// `compute_file_split_key_with_deps`, the theorem shards keyed by `compute_shard_key_with_args`
+    /// through `prefix_env_hash`, the proof-fission entries keyed by
+    /// `compute_fission_store_key_with_args`, and the zygote worker pool and its in-process
+    /// verified-shard memo keyed by `olean_digest`. Every one of them was derived from the `.lean`
+    /// bytes and the digests of the module's imports, so none of them moved and the second `check`
+    /// reported `all_shards_cached` and exited 0 on a theorem that is now false.
+    #[test]
+    fn test_warm_shard_cache_rejects_theorems_stale_against_edited_lake_input() -> Result<()> {
+        // Drives `check` end to end, so it reads process-global state (the worktree opt-out env
+        // var, the zygote pool). Serialize with the other env-mutating tests.
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Keep the check in-process. The caches under test here are the store / `/dev/shm` ones,
+        // and routing the `include_str` shard to a spawned zygote daemon instead makes the test
+        // depend on that daemon still being alive between two back-to-back checks. The worker-pool
+        // and memo keys this would otherwise exercise are pinned directly by
+        // `zygote::tests::test_zygote_lake_inputs_digest_tracks_declared_input_contents`.
+        struct NoDaemon(Option<String>);
+        impl Drop for NoDaemon {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("TURBO_LEAN_NO_DAEMON", v),
+                    None => std::env::remove_var("TURBO_LEAN_NO_DAEMON"),
+                }
+            }
+        }
+        let _no_daemon = NoDaemon(std::env::var("TURBO_LEAN_NO_DAEMON").ok());
+        std::env::set_var("TURBO_LEAN_NO_DAEMON", "1");
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_warm_shard_input_test_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let repo_dir = tmp_dir.join("repo");
+        fs::create_dir_all(repo_dir.join("Smoke"))?;
+        fs::create_dir_all(repo_dir.join("Data"))?;
+        fs::write(
+            repo_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )?;
+        fs::write(
+            repo_dir.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage demo\ninput_dir smokeSources where\n  path := \"Data\"\n  filter := .extension \"sol\"\n  text := true\n@[default_target]\nlean_lib Smoke where\n  globs := #[.one `Smoke.A]\n  needs := #[smokeSources]\n",
+        )?;
+        let v1 = "contract A {}\n";
+        let v2 = "contract AMuchLongerName {}\n";
+        assert_ne!(v1.len(), v2.len(), "the pinned length must actually move");
+        fs::write(repo_dir.join("Data/a.sol"), v1)?;
+
+        if crate::module_builder::resolve_project_config(&repo_dir).is_err() {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return Ok(());
+        }
+        let canon_repo = fs::canonicalize(&repo_dir)?;
+        // No project-local import, so the import-freshness path cannot be what catches the edit.
+        // The path is absolute because a theorem shard is elaborated from a staging directory, so a
+        // path relative to the source file would not resolve there.
+        let sol_path = canon_repo.join("Data/a.sol");
+        let a_src = |n: usize| {
+            format!(
+                "def solText : String := include_str \"{}\"\ntheorem solLen : solText.length = {n} := by rfl\n",
+                sol_path.display()
+            )
+        };
+        fs::write(canon_repo.join("Smoke/A.lean"), a_src(v1.len()))?;
+        git_init_and_commit(&repo_dir, "base")?;
+        let mut store = TurboStore::open(Some(&tmp_dir.join("store")))?;
+        let check_a = |st: &mut TurboStore| {
+            crate::check::run_check_command(
+                st,
+                false,
+                true,
+                canon_repo.join("Smoke/A.lean"),
+                None,
+                canon_repo.clone(),
+                None,
+                false,
+                None,
+            )
+        };
+
+        // 1. Cold check, then a warm one: the second populates and then consults every cache above.
+        check_a(&mut store).expect("a tree consistent with the input must check green");
+        check_a(&mut store).expect("a warm re-check of an unchanged tree must stay green");
+
+        // 2. Edit the input so the pinned length is wrong, leaving `.lake/build` fully populated.
+        fs::write(&sol_path, v2)?;
+        assert_eq!(
+            crate::lake_build::ensure_project_imports_fresh_for_check(
+                &canon_repo,
+                &[canon_repo.join("Smoke/A.lean")]
+            )
+            .ok(),
+            Some(0),
+            "this module imports nothing project-local, so the import-freshness path is inert \
+             here: whatever rejects the edit below has to be the content-derived cache keys"
+        );
+
+        // 3. The theorem is now false, so the check must not pass -- and must not report the
+        // shards as cached.
+        check_a(&mut store)
+            .expect_err("check accepted a cached shard elaborated against the old input bytes");
+
+        // 4. Content-driven, not a blanket refusal: the original bytes check green again, and
+        // re-pinning the length to the new bytes checks green too.
+        fs::write(&sol_path, v1)?;
+        check_a(&mut store).expect("restoring the original input bytes must re-check green");
+        fs::write(canon_repo.join("Smoke/A.lean"), a_src(v2.len()))?;
+        fs::write(&sol_path, v2)?;
+        check_a(&mut store).expect("a tree re-pinned to the new input bytes must check green");
 
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
