@@ -9442,8 +9442,11 @@ impl ToolchainNativeSpec {
     }
 }
 
-static TOOLCHAIN_NATIVE_CACHE: OnceLock<Mutex<HashMap<PathBuf, ToolchainNativeSpec>>> =
-    OnceLock::new();
+type ToolchainNativeCacheKey = (PathBuf, u64, Option<std::time::SystemTime>);
+
+static TOOLCHAIN_NATIVE_CACHE: OnceLock<
+    Mutex<HashMap<ToolchainNativeCacheKey, ToolchainNativeSpec>>,
+> = OnceLock::new();
 
 fn cached_toolchain_shared_lib_ext() -> Option<&'static str> {
     let guard = TOOLCHAIN_NATIVE_CACHE.get()?.lock().ok()?;
@@ -9457,9 +9460,13 @@ fn query_toolchain_native_spec(lean_bin: &Path) -> Result<ToolchainNativeSpec> {
     let canon_bin = lean_bin
         .canonicalize()
         .unwrap_or_else(|_| lean_bin.to_path_buf());
+    let (bin_len, bin_mtime) = fs::metadata(&canon_bin)
+        .map(|m| (m.len(), m.modified().ok()))
+        .unwrap_or((0, None));
+    let cache_key = (canon_bin.clone(), bin_len, bin_mtime);
     let cache = TOOLCHAIN_NATIVE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(guard) = cache.lock() {
-        if let Some(spec) = guard.get(&canon_bin) {
+        if let Some(spec) = guard.get(&cache_key) {
             return Ok(spec.clone());
         }
     }
@@ -9482,19 +9489,23 @@ fn query_toolchain_native_spec(lean_bin: &Path) -> Result<ToolchainNativeSpec> {
         "",
     ]
     .join("\n");
-    let mut child = Command::new(&canon_bin)
+    let mut query_cmd = Command::new(&canon_bin);
+    scrub_untrusted_env(&mut query_cmd);
+    query_cmd
+        .env_remove("LEAN_PATH")
+        .env_remove("LEAN_SRC_PATH")
+        .env_remove("LEAN_SYSROOT")
         .arg("--stdin")
         .arg("--run")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .with_context(|| {
-            format!(
-                "Failed to spawn `{}` to query Lean toolchain native C/linker flags",
-                canon_bin.display()
-            )
-        })?;
+        .stderr(std::process::Stdio::piped());
+    let mut child = query_cmd.spawn().with_context(|| {
+        format!(
+            "Failed to spawn `{}` to query Lean toolchain native C/linker flags",
+            canon_bin.display()
+        )
+    })?;
     if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write;
         stdin.write_all(script.as_bytes()).with_context(|| {
@@ -9560,7 +9571,7 @@ fn query_toolchain_native_spec(lean_bin: &Path) -> Result<ToolchainNativeSpec> {
         internal_linker_flags,
     };
     if let Ok(mut guard) = cache.lock() {
-        guard.insert(canon_bin, spec.clone());
+        guard.insert(cache_key, spec.clone());
     }
     Ok(spec)
 }
@@ -9880,38 +9891,50 @@ fn build_shared_object(
     let rsp_path = PathBuf::from(format!("{}.rsp", so_path.display()));
     write_rsp_file(&rsp_path, &rsp_args)?;
     let ext = toolchain_native.shared_lib_ext();
+    let Some(so_fname) = so_path.file_name() else {
+        anyhow::bail!(
+            "Shared object path `{}` has no file name",
+            so_path.display()
+        );
+    };
     let pid = std::process::id();
     let seq = crate::pack::next_tmp_id();
-    let tmp_so = parent.join(format!(".turbo_tmp_so_{}_{}.{}", pid, seq, ext));
-    let _ = fs::remove_file(&tmp_so);
-    let mut cmd = Command::new(&cc);
-    cmd.arg("-shared")
-        .arg("-o")
-        .arg(&tmp_so)
-        .arg(format!("@{}", rsp_path.display()));
-    let out = cmd.output().with_context(|| {
-        let _ = fs::remove_file(&tmp_so);
+    let tmp_dir = parent.join(format!(".turbo_tmp_so_dir_{}_{}", pid, seq));
+    fs::create_dir(&tmp_dir).with_context(|| {
         format!(
-            "Failed to spawn clang for shared library `{}`",
+            "Failed to create private staging directory `{}` for `{}`",
+            tmp_dir.display(),
             so_path.display()
         )
     })?;
-    if !out.status.success() {
-        let _ = fs::remove_file(&tmp_so);
-        anyhow::bail!(
-            "clang failed linking `{}`: {}",
-            so_path.display(),
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    let so_bytes = fs::read(&tmp_so).with_context(|| {
-        let _ = fs::remove_file(&tmp_so);
-        format!("Failed to read staged `{}`", tmp_so.display())
-    })?;
-    fs::rename(&tmp_so, so_path).with_context(|| {
-        let _ = fs::remove_file(&tmp_so);
-        format!("Failed to commit `{}`", so_path.display())
-    })?;
+    let tmp_so = tmp_dir.join(so_fname);
+    let link_res: Result<Vec<u8>> = (|| {
+        let mut cmd = Command::new(&cc);
+        cmd.arg("-shared")
+            .arg("-o")
+            .arg(&tmp_so)
+            .arg(format!("@{}", rsp_path.display()));
+        let out = cmd.output().with_context(|| {
+            format!(
+                "Failed to spawn clang for shared library `{}`",
+                so_path.display()
+            )
+        })?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "clang failed linking `{}`: {}",
+                so_path.display(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let so_bytes = fs::read(&tmp_so)
+            .with_context(|| format!("Failed to read staged `{}`", tmp_so.display()))?;
+        fs::rename(&tmp_so, so_path)
+            .with_context(|| format!("Failed to commit `{}`", so_path.display()))?;
+        Ok(so_bytes)
+    })();
+    let _ = fs::remove_dir_all(&tmp_dir);
+    let so_bytes = link_res?;
     let so_h = lake_hash_bytes(&so_bytes);
     write_file_atomic(
         &PathBuf::from(format!("{}.hash", so_path.display())),
@@ -14077,6 +14100,15 @@ globs = ["Down.+"]
                 format!(".lake/build/lib/lean/ws9__pre_Pre_Base.{sh_ext}"),
                 format!(".lake/build/lib/libws9__pre_Pre.{sh_ext}"),
             ];
+            for rel in &native_facet_paths[1..] {
+                let bytes = fs::read(pre_proj.join(rel)).unwrap();
+                assert!(
+                    !bytes
+                        .windows(b".turbo_tmp_".len())
+                        .any(|w| w == b".turbo_tmp_"),
+                    "shared library `{rel}` must be linked with its final basename without embedding temporary staging paths"
+                );
+            }
             let ours_native_traces: Vec<serde_json::Value> = native_facet_paths
                 .iter()
                 .map(|rel| {
