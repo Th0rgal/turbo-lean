@@ -1174,7 +1174,7 @@ impl OleanFileStatSig {
     }
 }
 
-/// Stat-tuple trust rule for `OLEAN_ENTRY_DIGEST_CACHE`.
+/// Stat-tuple trust rule for `FILE_DIGEST_MEMO`.
 ///
 /// A memoized entry digest is reused on a matching `(dev, ino, mtime, ctime, size)` tuple only
 /// if any later rewrite must change that tuple. Every write sets `ctime` to the kernel clock
@@ -1254,30 +1254,128 @@ fn probe_ctime_fence(dev: u64) -> Option<i128> {
     (sig.dev == dev).then(|| sig.ctime_ns())
 }
 
+/// A memoized file digest: valid only for the opened object `(canonical path, dev, ino)` it was
+/// read through, and only while that object's `fstat` tuple is `sig`.
 #[derive(Clone)]
-struct CachedOleanEntryDigest {
-    olean_stat: OleanFileStatSig,
-    companions_stat: [Option<OleanFileStatSig>; 5],
-    entry_bytes: Vec<u8>,
-    parsed_deps: Option<Vec<String>>,
+struct CachedFileDigest {
+    sig: OleanFileStatSig,
+    hash: String,
+    deps: Option<Vec<String>>,
 }
 
-static OLEAN_ENTRY_DIGEST_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<PathBuf, CachedOleanEntryDigest>>,
+type FileDigestKey = (PathBuf, u64, u64);
+
+static FILE_DIGEST_MEMO: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<FileDigestKey, CachedFileDigest>>,
 > = std::sync::OnceLock::new();
 
-fn stat_companion_file(path: &Path) -> Result<Option<OleanFileStatSig>, ()> {
-    match fs::metadata(path) {
-        Ok(cm) if cm.is_file() => Ok(Some(OleanFileStatSig::from_meta(&cm))),
-        Ok(_) => Err(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(()),
+/// One file's content digest, read through a single open handle.
+struct FileRead {
+    /// `fstat` of the opened object before reading.
+    sig: OleanFileStatSig,
+    hash: String,
+    /// Direct imports parsed from the same bytes (`.olean` only; `None` if unparseable).
+    deps: Option<Vec<String>>,
+    /// `fstat` was identical before and after the read.
+    stable: bool,
+}
+
+/// Digest a file through one open handle: canonicalize, open once, `fstat`, read, `fstat`
+/// again. Nothing ever follows the pathname a second time, so a symlink or directory switched
+/// mid-read cannot pair one object's stat tuple with another object's bytes. The memo is keyed
+/// by the canonical path plus the opened object's `(dev, ino)` and filled only when both
+/// `fstat` tuples are identical and the trust rule (`STAT_TRUST_WINDOW_NS`) holds.
+///
+/// `Ok(None)`: no such file. `Err`: not a regular file, or unreadable.
+fn read_file_digest(path: &Path) -> Result<Option<FileRead>, ()> {
+    use std::io::Read;
+    let not_found = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    let canon = match fs::canonicalize(path) {
+        Ok(c) => c,
+        Err(e) if not_found(&e) => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    let mut file = match fs::File::open(&canon) {
+        Ok(f) => f,
+        Err(e) if not_found(&e) => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    let pre_meta = file.metadata().map_err(drop)?;
+    if !pre_meta.is_file() {
+        return Err(());
     }
+    let pre = OleanFileStatSig::from_meta(&pre_meta);
+    let parse_deps = canon.extension().is_some_and(|e| e == "olean");
+    let key = (canon, pre.dev, pre.ino);
+    let trusted = dev_records_subsecond_timestamps(&pre);
+    let memo = FILE_DIGEST_MEMO.get_or_init(Default::default);
+    if trusted {
+        if let Some(hit) = memo.lock().ok().and_then(|g| g.get(&key).cloned()) {
+            if hit.sig == pre {
+                return Ok(Some(FileRead {
+                    sig: pre,
+                    hash: hit.hash,
+                    deps: hit.deps,
+                    stable: true,
+                }));
+            }
+        }
+    }
+    let read_started_ns = wall_clock_ns();
+    run_digest_test_hook("file_digest_after_stat");
+    let mut bytes = Vec::with_capacity(pre.size as usize);
+    file.read_to_end(&mut bytes).map_err(drop)?;
+    run_digest_test_hook("file_digest_after_read");
+    let post = OleanFileStatSig::from_meta(&file.metadata().map_err(drop)?);
+    let hash = blake3::hash(&bytes).to_hex().to_string();
+    let deps = parse_deps
+        .then(|| crate::module_builder::parse_olean_binary_imports(&bytes))
+        .flatten()
+        .map(|(imps, _)| imps.into_iter().map(|i| i.module).collect::<Vec<String>>());
+    let stable = post == pre;
+    if stable
+        && trusted
+        && read_started_ns > 0
+        && pre.ctime_ns() < read_started_ns - STAT_TRUST_WINDOW_NS
+    {
+        if let Ok(mut g) = memo.lock() {
+            if g.len() >= 65536 {
+                g.clear();
+            }
+            g.insert(
+                key,
+                CachedFileDigest {
+                    sig: pre,
+                    hash: hash.clone(),
+                    deps: deps.clone(),
+                },
+            );
+        }
+    }
+    Ok(Some(FileRead {
+        sig: pre,
+        hash,
+        deps,
+        stable,
+    }))
+}
+
+/// The companions Lean may load next to `<mod>.olean`, as `(tag, path)`.
+fn olean_companion_paths(olean_path: &Path) -> [(&'static str, PathBuf); 5] {
+    let suffixed = |p: &Path, sfx: &str| PathBuf::from(format!("{}{}", p.display(), sfx));
+    let ir = olean_path.with_extension("ir");
+    [
+        ("srv", suffixed(olean_path, ".server")),
+        ("priv", suffixed(olean_path, ".private")),
+        ("ilean", olean_path.with_extension("ilean")),
+        ("ir_sig", suffixed(&ir, ".sig")),
+        ("ir", ir),
+    ]
 }
 
 /// Canonical digest bytes of one `.olean` and its companions, the stat tuples they were read
-/// under, and its parsed direct imports (`None` when unreadable/unparseable, so the closure
-/// cannot be proven complete).
+/// under, and its parsed direct imports (`None` when unreadable, unparseable or modified while
+/// read, so the closure cannot be proven complete).
 #[derive(PartialEq, Eq)]
 struct OleanEntryDigest {
     bytes: Vec<u8>,
@@ -1286,157 +1384,43 @@ struct OleanEntryDigest {
 }
 
 fn digest_olean_path_entry(olean_path: &Path) -> OleanEntryDigest {
-    let mut entry_bytes = Vec::with_capacity(256);
-    entry_bytes.extend_from_slice(olean_path.to_string_lossy().as_bytes());
-    entry_bytes.push(b':');
-    let olean_stat = match fs::metadata(olean_path) {
-        Ok(m) if m.is_file() => OleanFileStatSig::from_meta(&m),
-        _ => {
-            entry_bytes.extend_from_slice(b"unreadable;");
-            return OleanEntryDigest {
-                bytes: entry_bytes,
-                stats: Default::default(),
-                deps: None,
-            };
-        }
-    };
-    let companions = [
-        (
-            "srv",
-            PathBuf::from(format!("{}.server", olean_path.display())),
-        ),
-        (
-            "priv",
-            PathBuf::from(format!("{}.private", olean_path.display())),
-        ),
-        ("ilean", olean_path.with_extension("ilean")),
-        ("ir", olean_path.with_extension("ir")),
-        (
-            "ir_sig",
-            PathBuf::from(format!("{}.sig", olean_path.with_extension("ir").display())),
-        ),
-    ];
-    let mut comp_stats: [Option<OleanFileStatSig>; 5] = Default::default();
-    let mut all_comp_stat_ok = true;
-    for (idx, (_, comp_path)) in companions.iter().enumerate() {
-        match stat_companion_file(comp_path) {
-            Ok(st) => comp_stats[idx] = st,
-            Err(()) => {
-                all_comp_stat_ok = false;
-                break;
-            }
-        }
-    }
+    let mut bytes = Vec::with_capacity(512);
+    bytes.extend_from_slice(olean_path.to_string_lossy().as_bytes());
+    bytes.push(b':');
     let mut stats: [Option<OleanFileStatSig>; 6] = Default::default();
-    stats[0] = Some(olean_stat);
-    stats[1..].copy_from_slice(&comp_stats);
-    let stat_trusted = all_comp_stat_ok
-        && stats.iter().flatten().all(dev_records_subsecond_timestamps);
-
-    let cache_mutex = OLEAN_ENTRY_DIGEST_CACHE
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    if stat_trusted {
-        if let Ok(guard) = cache_mutex.lock() {
-            if let Some(hit) = guard.get(olean_path) {
-                if hit.olean_stat == olean_stat && hit.companions_stat == comp_stats {
-                    return OleanEntryDigest {
-                        bytes: hit.entry_bytes.clone(),
-                        stats,
-                        deps: hit.parsed_deps.clone(),
-                    };
-                }
-            }
-        }
-    }
-
-    let pre_read_now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i128)
-        .unwrap_or(0);
-    entry_bytes.extend_from_slice(&olean_stat.size.to_le_bytes());
-
-    let olean_bytes = match fs::read(olean_path) {
-        Ok(b) => b,
-        Err(_) => {
-            entry_bytes.extend_from_slice(b"unreadable;");
-            return OleanEntryDigest {
-                bytes: entry_bytes,
-                stats,
-                deps: None,
-            };
-        }
+    let Ok(Some(main)) = read_file_digest(olean_path) else {
+        bytes.extend_from_slice(b"unreadable;");
+        return OleanEntryDigest {
+            bytes,
+            stats,
+            deps: None,
+        };
     };
-    let parsed_deps = crate::module_builder::parse_olean_binary_imports(&olean_bytes)
-        .map(|(imps, _)| imps.into_iter().map(|i| i.module).collect::<Vec<String>>());
-    entry_bytes.extend_from_slice(blake3::hash(&olean_bytes).to_hex().as_bytes());
-
-    let trust_cutoff_ns = pre_read_now_ns - STAT_TRUST_WINDOW_NS;
-    let mut cacheable = stat_trusted
-        && pre_read_now_ns > 0
-        && stats.iter().flatten().all(|s| s.ctime_ns() < trust_cutoff_ns);
-    for (idx, (tag, comp_path)) in companions.iter().enumerate() {
-        entry_bytes.push(b'|');
-        entry_bytes.extend_from_slice(tag.as_bytes());
-        entry_bytes.push(b':');
-        match fs::metadata(comp_path) {
-            Ok(cm) if cm.is_file() => match fs::read(comp_path) {
-                Ok(cb) => {
-                    let pre_sig = OleanFileStatSig::from_meta(&cm);
-                    if comp_stats[idx] != Some(pre_sig) {
-                        cacheable = false;
-                    }
-                    match stat_companion_file(comp_path) {
-                        Ok(Some(post_sig)) if post_sig == pre_sig => {}
-                        _ => cacheable = false,
-                    }
-                    entry_bytes.extend_from_slice(blake3::hash(&cb).to_hex().as_bytes());
-                }
-                Err(_) => {
-                    cacheable = false;
-                    entry_bytes.extend_from_slice(b"err");
-                }
-            },
-            Ok(_) => {
-                cacheable = false;
-                entry_bytes.extend_from_slice(b"nonfile");
+    stats[0] = Some(main.sig);
+    bytes.extend_from_slice(main.hash.as_bytes());
+    let mut stable = main.stable;
+    for (idx, (tag, comp)) in olean_companion_paths(olean_path).iter().enumerate() {
+        bytes.push(b'|');
+        bytes.extend_from_slice(tag.as_bytes());
+        bytes.push(b':');
+        match read_file_digest(comp) {
+            Ok(Some(r)) => {
+                stats[idx + 1] = Some(r.sig);
+                stable &= r.stable;
+                bytes.extend_from_slice(r.hash.as_bytes());
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if comp_stats[idx].is_some() {
-                    cacheable = false;
-                }
-                entry_bytes.extend_from_slice(b"0");
-            }
-            Err(_) => {
-                cacheable = false;
-                entry_bytes.extend_from_slice(b"err");
+            Ok(None) => bytes.push(b'0'),
+            Err(()) => {
+                stable = false;
+                bytes.extend_from_slice(b"err");
             }
         }
     }
-    entry_bytes.push(b';');
-
-    let post_olean_matches = fs::metadata(olean_path)
-        .map(|m| m.is_file() && OleanFileStatSig::from_meta(&m) == olean_stat)
-        .unwrap_or(false);
-    if cacheable && post_olean_matches {
-        if let Ok(mut guard) = cache_mutex.lock() {
-            if guard.len() >= 16384 {
-                guard.clear();
-            }
-            guard.insert(
-                olean_path.to_path_buf(),
-                CachedOleanEntryDigest {
-                    olean_stat,
-                    companions_stat: comp_stats,
-                    entry_bytes: entry_bytes.clone(),
-                    parsed_deps: parsed_deps.clone(),
-                },
-            );
-        }
-    }
+    bytes.push(b';');
     OleanEntryDigest {
-        bytes: entry_bytes,
+        bytes,
         stats,
-        deps: parsed_deps,
+        deps: main.deps.filter(|_| stable),
     }
 }
 
@@ -6392,6 +6376,56 @@ mod tests {
         }
         assert_ne!(d1, d2, "a same-length rewrite within one coarse tick must re-hash");
         assert_ne!(snap.rebind(), ClosureBinding::Bound);
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// A symlinked directory switched A -> B between the `fstat` and the read, and B -> A
+    /// after it: the memo must never pair A's stat tuple with B's bytes.
+    #[cfg(unix)]
+    #[test]
+    fn test_file_digest_memo_symlink_switch_between_stat_and_read_is_not_poisoned() {
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_zygote_memo_aba_{}", next_tmp_id()));
+        let (dir_a, dir_b, link) = (tmp_dir.join("A"), tmp_dir.join("B"), tmp_dir.join("lib"));
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+        fs::write(dir_a.join("Foo.olean"), b"olean-content-A").unwrap();
+        fs::write(dir_b.join("Foo.olean"), b"olean-content-B").unwrap();
+        std::os::unix::fs::symlink(&dir_a, &link).unwrap();
+        // Old enough for the trust rule, so a stable read is memoized.
+        std::thread::sleep(std::time::Duration::from_millis(2200));
+        let retarget = |to: PathBuf| {
+            let link = link.clone();
+            move || {
+                let tmp = link.with_extension("swap");
+                let _ = fs::remove_file(&tmp);
+                std::os::unix::fs::symlink(&to, &tmp).unwrap();
+                fs::rename(&tmp, &link).unwrap();
+            }
+        };
+        let path = link.join("Foo.olean");
+        let hash = |b: &[u8]| blake3::hash(b).to_hex().to_string();
+        // A -> B between the `fstat` and the read, B -> A before the closing `fstat`.
+        for _ in 0..2 {
+            digest_test_hooks::set("file_digest_after_stat", retarget(dir_b.clone()));
+            digest_test_hooks::set("file_digest_after_read", retarget(dir_a.clone()));
+            let r = read_file_digest(&path).unwrap().unwrap();
+            digest_test_hooks::clear();
+            // The digest is of the one object that was opened and `fstat`ed: A.
+            assert_eq!(r.hash, hash(b"olean-content-A"));
+            // Every memo entry describes the object it is keyed by.
+            let memo = FILE_DIGEST_MEMO.get().unwrap().lock().unwrap();
+            for ((p, dev, ino), e) in memo.iter().filter(|(k, _)| k.0.starts_with(&tmp_dir)) {
+                use std::os::unix::fs::MetadataExt;
+                let m = fs::metadata(p).unwrap();
+                assert_eq!((m.dev(), m.ino()), (*dev, *ino));
+                assert_eq!(e.hash, hash(&fs::read(p).unwrap()), "poisoned memo entry for {p:?}");
+            }
+        }
+        // The switch is observed through the memo: B is served B's digest, A is served A's.
+        retarget(dir_b.clone())();
+        assert_eq!(read_file_digest(&path).unwrap().unwrap().hash, hash(b"olean-content-B"));
+        retarget(dir_a.clone())();
+        assert_eq!(read_file_digest(&path).unwrap().unwrap().hash, hash(b"olean-content-A"));
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 
