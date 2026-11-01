@@ -2354,6 +2354,7 @@ fn resolve_untrusted_pr_project_config(
         config_digest: String::new(),
         unsupported: None,
         native_unsupported: None,
+        link_unsupported: None,
     };
     Ok(crate::module_builder::ProjectConfig {
         toolchain: toolchain.to_string(),

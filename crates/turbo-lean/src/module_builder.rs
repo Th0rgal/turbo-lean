@@ -110,9 +110,12 @@ pub struct LeanLibConfig {
     /// Why turbo-lean cannot build this dependency target like Lake (see `PackageConfig`).
     #[serde(default)]
     pub unsupported: Option<String>,
-    /// Native-compilation setting turbo-lean does not mirror; fails closed when native precompile/facets run.
+    /// Native C-compilation setting (`buildType`, `moreLeancArgs`, `weakLeancArgs`) turbo-lean does not mirror.
     #[serde(default)]
     pub native_unsupported: Option<String>,
+    /// Shared/dynlib linker setting (`moreLinkObjs`, `moreLinkLibs`, `moreLinkArgs`, `weakLinkArgs`, `libName`, `libPrefixOnWindows`).
+    #[serde(default)]
+    pub link_unsupported: Option<String>,
 }
 /// Static configuration of a `lean_exe` target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,6 +130,10 @@ pub struct LeanExeConfig {
     pub is_default_target: bool,
     #[serde(default)]
     pub unsupported: Option<String>,
+    #[serde(default)]
+    pub native_unsupported: Option<String>,
+    #[serde(default)]
+    pub link_unsupported: Option<String>,
 }
 /// Static representation of an `extern_lib` declaration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,6 +183,8 @@ pub struct PackageConfig {
     pub unsupported: Option<String>,
     #[serde(default)]
     pub native_unsupported: Option<String>,
+    #[serde(default)]
+    pub link_unsupported: Option<String>,
 }
 /// Resolved workspace configuration combining root package, `lean-toolchain`, `lake-manifest.json`,
 /// and dependency packages.
@@ -248,6 +257,8 @@ pub struct ModuleNode {
     pub pkg_config_digest: String,
     #[serde(default)]
     pub native_unsupported: Option<String>,
+    #[serde(default)]
+    pub link_unsupported: Option<String>,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SharedLibSpec {
@@ -2478,13 +2489,13 @@ fn check_lake_field(
         format!("{} {} field `{}` in {}", what, scope_name, key, location()),
     )
 }
-/// Check whether a passive field becomes unsupported when native C/shared precompilation runs.
+/// Check whether a passive field becomes unsupported for C object compilation vs shared/dynlib linking.
 fn classify_native_unsupported_field(
     scope: LakeScope,
     key: &str,
     val: &str,
     location: &dyn Fn() -> String,
-) -> Option<String> {
+) -> (Option<String>, Option<String>) {
     let v = val.trim();
     let compact: String = v.chars().filter(|c| !c.is_whitespace()).collect();
     let empty_array = matches!(compact.as_str(), "[]" | "#[]");
@@ -2494,15 +2505,22 @@ fn classify_native_unsupported_field(
         .flatten();
     let dot_ctor = v.strip_prefix('.');
     match (scope, key) {
-        (
-            _,
-            "moreLeancArgs" | "weakLeancArgs" | "moreLinkObjs" | "moreLinkLibs" | "moreLinkArgs"
-            | "weakLinkArgs",
-        ) if !empty_array => Some(format!(
-            "Non-empty native compiler/linker field `{}` in {}",
-            key,
-            location()
-        )),
+        (_, "moreLeancArgs" | "weakLeancArgs") if !empty_array => (
+            Some(format!(
+                "Non-empty native compiler field `{}` in {}",
+                key,
+                location()
+            )),
+            None,
+        ),
+        (_, "moreLinkObjs" | "moreLinkLibs" | "moreLinkArgs" | "weakLinkArgs") if !empty_array => (
+            None,
+            Some(format!(
+                "Non-empty native linker field `{}` in {}",
+                key,
+                location()
+            )),
+        ),
         (_, "buildType") => {
             let is_release = match (&toml_str, dot_ctor) {
                 (Some(t), _) => t.eq_ignore_ascii_case("release"),
@@ -2510,26 +2528,35 @@ fn classify_native_unsupported_field(
                 _ => false,
             };
             if is_release {
-                None
+                (None, None)
             } else {
-                Some(format!(
-                    "Non-release `buildType` (`{}`) for native precompilation in {}",
-                    v,
-                    location()
-                ))
+                (
+                    Some(format!(
+                        "Non-release `buildType` (`{}`) for native precompilation in {}",
+                        v,
+                        location()
+                    )),
+                    None,
+                )
             }
         }
-        (LakeScope::Lib, "libName") => Some(format!(
-            "Custom `libName` (`{}`) for native precompilation in {}",
-            v,
-            location()
-        )),
-        (_, "libPrefixOnWindows") if v != "false" => Some(format!(
-            "Non-default `libPrefixOnWindows` (`{}`) for native precompilation in {}",
-            v,
-            location()
-        )),
-        _ => None,
+        (LakeScope::Lib, "libName") => (
+            None,
+            Some(format!(
+                "Custom `libName` (`{}`) for native precompilation in {}",
+                v,
+                location()
+            )),
+        ),
+        (_, "libPrefixOnWindows") if v != "false" => (
+            None,
+            Some(format!(
+                "Non-default `libPrefixOnWindows` (`{}`) for native precompilation in {}",
+                v,
+                location()
+            )),
+        ),
+        _ => (None, None),
     }
 }
 /// `precompileLibrary` fails closed everywhere; `precompileModules` parses as a boolean and is
@@ -2647,6 +2674,7 @@ pub fn parse_lakefile_toml(
         config_digest: String::new(),
         unsupported: None,
         native_unsupported: None,
+        link_unsupported: None,
     };
     #[derive(Clone, PartialEq, Eq)]
     enum Section {
@@ -2869,6 +2897,7 @@ pub fn parse_lakefile_toml(
                             is_default_target: false,
                             unsupported: None,
                             native_unsupported: None,
+                            link_unsupported: None,
                         });
                         section = Section::LeanLib(lib_idx);
                     }
@@ -2884,6 +2913,8 @@ pub fn parse_lakefile_toml(
                             lean_options: BTreeMap::new(),
                             is_default_target: false,
                             unsupported: None,
+                            native_unsupported: None,
+                            link_unsupported: None,
                         });
                         section = Section::LeanExe(exe_idx);
                     }
@@ -3047,13 +3078,17 @@ pub fn parse_lakefile_toml(
                         pkg.lean_options.extend(tbl);
                     }
                     other => {
-                        if let Some(nwhy) = classify_native_unsupported_field(
+                        let (c_why, l_why) = classify_native_unsupported_field(
                             LakeScope::Package,
                             other,
                             &val_accum,
                             &location,
-                        ) {
+                        );
+                        if let Some(nwhy) = c_why {
                             pkg.native_unsupported.get_or_insert(nwhy);
+                        }
+                        if let Some(lwhy) = l_why {
+                            pkg.link_unsupported.get_or_insert(lwhy);
                         }
                         check_lake_field(
                             &mut pkg.unsupported,
@@ -3136,13 +3171,17 @@ pub fn parse_lakefile_toml(
                         lib.default_facets = facets;
                     }
                     other => {
-                        if let Some(nwhy) = classify_native_unsupported_field(
+                        let (c_why, l_why) = classify_native_unsupported_field(
                             LakeScope::Lib,
                             other,
                             &val_accum,
                             &location,
-                        ) {
+                        );
+                        if let Some(nwhy) = c_why {
                             lib.native_unsupported.get_or_insert(nwhy);
+                        }
+                        if let Some(lwhy) = l_why {
+                            lib.link_unsupported.get_or_insert(lwhy);
                         }
                         check_lake_field(
                             &mut lib.unsupported,
@@ -3181,14 +3220,28 @@ pub fn parse_lakefile_toml(
                         let tbl = parse_toml_lean_options_value(&val_accum, &[])?;
                         exe.lean_options.extend(tbl);
                     }
-                    other => check_lake_field(
-                        &mut exe.unsupported,
-                        is_root_pkg,
-                        LakeScope::Exe,
-                        other,
-                        &val_accum,
-                        location,
-                    )?,
+                    other => {
+                        let (c_why, l_why) = classify_native_unsupported_field(
+                            LakeScope::Exe,
+                            other,
+                            &val_accum,
+                            &location,
+                        );
+                        if let Some(nwhy) = c_why {
+                            exe.native_unsupported.get_or_insert(nwhy);
+                        }
+                        if let Some(lwhy) = l_why {
+                            exe.link_unsupported.get_or_insert(lwhy);
+                        }
+                        check_lake_field(
+                            &mut exe.unsupported,
+                            is_root_pkg,
+                            LakeScope::Exe,
+                            other,
+                            &val_accum,
+                            location,
+                        )?;
+                    }
                 }
             }
             Section::LeanExeOptions(i, prefix) => {
@@ -4529,6 +4582,7 @@ pub fn parse_lakefile_lean(
         config_digest: String::new(),
         unsupported: pkg_unsupported,
         native_unsupported: None,
+        link_unsupported: None,
     };
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum DeclBlock {
@@ -4782,13 +4836,17 @@ pub fn parse_lakefile_lean(
                             )?);
                         }
                         other => {
-                            if let Some(nwhy) = classify_native_unsupported_field(
+                            let (c_why, l_why) = classify_native_unsupported_field(
                                 LakeScope::Package,
                                 other,
                                 &val_accum,
                                 &location,
-                            ) {
+                            );
+                            if let Some(nwhy) = c_why {
                                 pkg.native_unsupported.get_or_insert(nwhy);
+                            }
+                            if let Some(lwhy) = l_why {
+                                pkg.link_unsupported.get_or_insert(lwhy);
                             }
                             check_lake_field(
                                 &mut pkg.unsupported,
@@ -4870,13 +4928,17 @@ pub fn parse_lakefile_lean(
                                 lib.default_facets = facets;
                             }
                             other => {
-                                if let Some(nwhy) = classify_native_unsupported_field(
+                                let (c_why, l_why) = classify_native_unsupported_field(
                                     LakeScope::Lib,
                                     other,
                                     &val_accum,
                                     &location,
-                                ) {
+                                );
+                                if let Some(nwhy) = c_why {
                                     lib.native_unsupported.get_or_insert(nwhy);
+                                }
+                                if let Some(lwhy) = l_why {
+                                    lib.link_unsupported.get_or_insert(lwhy);
                                 }
                                 check_lake_field(
                                     &mut lib.unsupported,
@@ -4912,14 +4974,28 @@ pub fn parse_lakefile_lean(
                                     line_no,
                                 )?);
                             }
-                            other => check_lake_field(
-                                &mut exe.unsupported,
-                                is_root_pkg,
-                                LakeScope::Exe,
-                                other,
-                                &val_accum,
-                                location,
-                            )?,
+                            other => {
+                                let (c_why, l_why) = classify_native_unsupported_field(
+                                    LakeScope::Exe,
+                                    other,
+                                    &val_accum,
+                                    &location,
+                                );
+                                if let Some(nwhy) = c_why {
+                                    exe.native_unsupported.get_or_insert(nwhy);
+                                }
+                                if let Some(lwhy) = l_why {
+                                    exe.link_unsupported.get_or_insert(lwhy);
+                                }
+                                check_lake_field(
+                                    &mut exe.unsupported,
+                                    is_root_pkg,
+                                    LakeScope::Exe,
+                                    other,
+                                    &val_accum,
+                                    location,
+                                )?;
+                            }
                         }
                     }
                     _ => {}
@@ -5033,6 +5109,7 @@ where
             is_default_target: is_def,
             unsupported: None,
             native_unsupported: None,
+            link_unsupported: None,
         });
         *current_block = T::lean_lib(idx);
         return Ok(());
@@ -5051,6 +5128,8 @@ where
             lean_options: BTreeMap::new(),
             is_default_target: is_def,
             unsupported: None,
+            native_unsupported: None,
+            link_unsupported: None,
         });
         *current_block = T::lean_exe(idx);
         return Ok(());
@@ -5746,6 +5825,7 @@ pub(crate) struct DiscoveredModuleSpec {
     /// Set when turbo-lean cannot build the module like Lake (`PackageConfig::unsupported`).
     unsupported: Option<String>,
     native_unsupported: Option<String>,
+    link_unsupported: Option<String>,
 }
 fn compose_effective_args(
     pkg: &PackageConfig,
@@ -5926,7 +6006,14 @@ pub(crate) fn resolve_module_in_package(
                     extern_lib_digests: extern_digests,
                     pkg_config_digest: pkg.config_digest.clone(),
                     unsupported: pkg.unsupported.clone().or_else(|| exe.unsupported.clone()),
-                    native_unsupported: pkg.native_unsupported.clone(),
+                    native_unsupported: pkg
+                        .native_unsupported
+                        .clone()
+                        .or_else(|| exe.native_unsupported.clone()),
+                    link_unsupported: pkg
+                        .link_unsupported
+                        .clone()
+                        .or_else(|| exe.link_unsupported.clone()),
                 });
             }
         }
@@ -5997,6 +6084,10 @@ pub(crate) fn resolve_module_in_package(
                         .native_unsupported
                         .clone()
                         .or_else(|| lib.native_unsupported.clone()),
+                    link_unsupported: pkg
+                        .link_unsupported
+                        .clone()
+                        .or_else(|| lib.link_unsupported.clone()),
                 });
             }
         }
@@ -6027,6 +6118,7 @@ pub(crate) fn resolve_module_in_package(
             pkg_config_digest: pkg.config_digest.clone(),
             unsupported: pkg.unsupported.clone(),
             native_unsupported: pkg.native_unsupported.clone(),
+            link_unsupported: pkg.link_unsupported.clone(),
         });
     }
     None
@@ -6587,8 +6679,19 @@ pub fn build_module_dag_with_trust(
             }
         }
         // Check if target_base has `<pkg>/<target>` prefix
+        let mut explicit_pkg_item_mod = false;
         let (pkg_filter, item_name) = match target_base.split_once('/') {
-            Some((p, item)) => (Some(clean_lake_ident(p)), clean_lake_ident(item)),
+            Some((p, item)) => {
+                let item_trimmed = item.trim();
+                let item_body = match item_trimmed.strip_prefix('+') {
+                    Some(rest) => {
+                        explicit_pkg_item_mod = true;
+                        rest
+                    }
+                    None => item_trimmed,
+                };
+                (Some(clean_lake_ident(p)), clean_lake_ident(item_body))
+            }
             None => (None, clean_lake_ident(target_base)),
         };
         let target_pkg = if let Some(ref pf) = pkg_filter {
@@ -6605,7 +6708,7 @@ pub fn build_module_dag_with_trust(
         let target_is_root = target_pkg.pkg_root == root_pkg.pkg_root;
         let explicit_module = raw_target.trim_start().starts_with('+')
             || raw_target.trim_start().starts_with("@+")
-            || target_base.contains('+');
+            || explicit_pkg_item_mod;
         if target_pkg.custom_targets.iter().any(|ct| ct == &item_name)
             || target_pkg.extern_libs.iter().any(|el| {
                 el.name == item_name && el.is_dynamic_recipe && el.static_artifact_path.is_none()
@@ -6709,6 +6812,10 @@ pub fn build_module_dag_with_trust(
                                 .native_unsupported
                                 .clone()
                                 .or_else(|| lib.native_unsupported.clone()),
+                            link_unsupported: target_pkg
+                                .link_unsupported
+                                .clone()
+                                .or_else(|| lib.link_unsupported.clone()),
                         },
                         force_c_for_target || emit_c_default,
                     ));
@@ -6716,11 +6823,12 @@ pub fn build_module_dag_with_trust(
             }
         }
         // 2. Match against lean_exe targets. Lake's LeanExe facets are only `default` and `exe`
-        // (`LeanExe.initFacetConfigs`). Named exe roots still accept module facets (`+root:dynlib`).
+        // (`LeanExe.initFacetConfigs`); `:exe` links a native binary turbo-lean does not produce,
+        // and `default` only succeeds when it stays at module-level preparation (`facet_opt == Some("default")` or `None`).
         for exe in &target_pkg.exes {
             if exe.name == item_name && !explicit_module {
                 matched = true;
-                if facet_opt.is_some_and(|f| !matches!(f, "default" | "exe")) {
+                if facet_opt.is_some_and(|f| f != "default") {
                     let _ = c_abi::verify_static_lake_config(true, false, false, true);
                     anyhow::bail!(
                         "Unsupported target facet `:{}` on lean_exe `{}`: fail-closed static Lake config gate",
@@ -6824,6 +6932,7 @@ pub fn build_module_dag_with_trust(
                             pkg_config_digest: root_pkg.config_digest.clone(),
                             unsupported: root_pkg.unsupported.clone(),
                             native_unsupported: root_pkg.native_unsupported.clone(),
+                            link_unsupported: root_pkg.link_unsupported.clone(),
                         },
                         global_emit_c || root_pkg.precompile_modules,
                     ));
@@ -6945,12 +7054,19 @@ pub fn build_module_dag_with_trust(
             }
             let needs_c =
                 requested_c || spec.emit_c_default || header.has_c_export || global_emit_c;
-            let native_why = spec.native_unsupported.as_ref().filter(|_| {
-                !is_untrusted
-                    && (needs_c
+            let native_why = if !is_untrusted {
+                let c_obj_why = spec.native_unsupported.as_ref().filter(|_| {
+                    spec.precompile_modules
                         || explicit_co_export_mods.contains(&spec.module_name)
-                        || explicit_dynlib_mods.contains(&spec.module_name))
-            });
+                        || explicit_dynlib_mods.contains(&spec.module_name)
+                });
+                let link_why = spec.link_unsupported.as_ref().filter(|_| {
+                    spec.precompile_modules || explicit_dynlib_mods.contains(&spec.module_name)
+                });
+                c_obj_why.or(link_why)
+            } else {
+                None
+            };
             if let Some(why) = native_why {
                 let _ = c_abi::verify_static_lake_config(true, true, false, false);
                 anyhow::bail!(
@@ -7008,8 +7124,12 @@ pub fn build_module_dag_with_trust(
                 );
                 }
                 if let Some(dep_spec) = dep_matches.into_iter().next() {
+                    let importer_in_shared = !spec.is_exe_target
+                        && requested_shared_libs
+                            .contains(&(spec.pkg_name.clone(), spec.target_name.clone()));
                     let importer_needs_dep_dynlib = spec.precompile_modules
                         || dep_spec.precompile_modules
+                        || importer_in_shared
                         || explicit_dynlib_mods.contains(&spec.module_name);
                     if !is_untrusted {
                         if let Some(fresh_closure) = collect_fresh_dep_pkg_closure(
@@ -7118,6 +7238,7 @@ pub fn build_module_dag_with_trust(
                     pkg_config_digest: spec.pkg_config_digest,
                     import_specs: header.import_specs,
                     native_unsupported: spec.native_unsupported,
+                    link_unsupported: spec.link_unsupported,
                 },
             );
         }
@@ -7181,6 +7302,60 @@ pub fn build_module_dag_with_trust(
                     }
                     n_mut.external_olean_deps = kept_external;
                 }
+            }
+        }
+        let shared_promo_mods: Vec<String> = nodes
+            .values()
+            .filter(|n| {
+                !n.external_olean_deps.is_empty()
+                    && (n.precompile_modules
+                        || (!n.is_exe_target
+                            && requested_shared_libs
+                                .contains(&(n.pkg_name.clone(), n.target_name.clone()))))
+            })
+            .map(|n| n.module_name.clone())
+            .collect();
+        for sm in shared_promo_mods {
+            let Some(node) = nodes.get(&sm) else {
+                continue;
+            };
+            let mut promoted_direct: Vec<String> = Vec::new();
+            let mut kept_external: Vec<(String, PathBuf)> = Vec::new();
+            for (ext_m, ext_p) in &node.external_olean_deps {
+                let mut dep_spec_opt = None;
+                for dp in &cfg.dep_pkgs {
+                    if let Some(ds) = resolve_module_in_package(dp, false, ext_m) {
+                        dep_spec_opt = Some(ds);
+                        break;
+                    }
+                }
+                if let Some(ds) = dep_spec_opt {
+                    if !ds.is_exe_target {
+                        enqueue_shared_lib_mods(
+                            &ds.pkg_name,
+                            &ds.target_name,
+                            false,
+                            &mut expanded_shared_libs,
+                            &mut requested_shared_libs,
+                            &mut worklist,
+                        )?;
+                    }
+                    if node.import_specs.iter().any(|is| &is.module == ext_m) {
+                        promoted_direct.push(ext_m.clone());
+                    }
+                    worklist.push_back((ds, true));
+                    promoted_ext_deps = true;
+                } else {
+                    kept_external.push((ext_m.clone(), ext_p.clone()));
+                }
+            }
+            if let Some(n_mut) = nodes.get_mut(&sm) {
+                for dm in promoted_direct {
+                    if !n_mut.direct_dag_deps.contains(&dm) {
+                        n_mut.direct_dag_deps.push(dm);
+                    }
+                }
+                n_mut.external_olean_deps = kept_external;
             }
         }
         let mut discovered_new_shared = promoted_ext_deps;
@@ -7675,12 +7850,16 @@ pub fn build_module_dag_with_trust(
                 .chain(&cfg.dep_pkgs)
                 .find(|p| &p.name == pkg_name)
             {
-                let lib_why = pkg
-                    .libs
-                    .iter()
-                    .find(|l| &l.name == lib_name)
-                    .and_then(|l| l.native_unsupported.as_deref());
-                if let Some(why) = pkg.native_unsupported.as_deref().or(lib_why) {
+                let lib_cfg = pkg.libs.iter().find(|l| &l.name == lib_name);
+                let lib_c_why = lib_cfg.and_then(|l| l.native_unsupported.as_deref());
+                let lib_link_why = lib_cfg.and_then(|l| l.link_unsupported.as_deref());
+                if let Some(why) = pkg
+                    .native_unsupported
+                    .as_deref()
+                    .or(lib_c_why)
+                    .or(pkg.link_unsupported.as_deref())
+                    .or(lib_link_why)
+                {
                     let _ = c_abi::verify_static_lake_config(true, true, false, false);
                     anyhow::bail!(
                         "Cannot build shared library `{}` of package `{}` like Lake ({}): fail-closed static Lake config gate",
@@ -7702,7 +7881,7 @@ pub fn build_module_dag_with_trust(
         }
         for m in &topological_order {
             if let Some(node) = nodes.get(m) {
-                if node.needs_c || node.needs_co_export || node.needs_dynlib {
+                if node.precompile_modules || node.needs_co_export || node.needs_dynlib {
                     if let Some(ref why) = node.native_unsupported {
                         let _ = c_abi::verify_static_lake_config(true, true, false, false);
                         anyhow::bail!(
@@ -7714,6 +7893,15 @@ pub fn build_module_dag_with_trust(
                     }
                 }
                 if node.precompile_modules || node.needs_dynlib {
+                    if let Some(ref why) = node.link_unsupported {
+                        let _ = c_abi::verify_static_lake_config(true, true, false, false);
+                        anyhow::bail!(
+                            "Cannot build module `{}` of package `{}` like Lake ({}): fail-closed static Lake config gate",
+                            node.module_name,
+                            node.pkg_name,
+                            why
+                        );
+                    }
                     if let Some(pkg) = std::iter::once(&cfg.root_pkg)
                         .chain(&cfg.dep_pkgs)
                         .find(|p| p.name == node.pkg_name)
@@ -14510,6 +14698,186 @@ globs = ["Demo.+"]
                 err_exe.contains("lean_exe") && err_exe.contains("fail-closed"),
                 "expected lean_exe facet rejection, got: {err_exe}"
             );
+            let err_exe_bin = build_project_modules_native(
+                &mut store,
+                &bad_exe,
+                &["main:exe".to_string()],
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err_exe_bin.contains("fail-closed"),
+                "expected `main:exe` rejection, got: {err_exe_bin}"
+            );
+
+            // 5. Package-qualified `+` module syntax (`ws9_chain/+App.Top:dynlib`) + 3-package
+            // pre-existing fresh external `.olean` chain (`App.Top -> DepB.Mid -> DepC.Leaf`) with `precompileModules = false`:
+            let chain_proj = dir.join("ws9_chain");
+            let dep_b = chain_proj.join(".lake/packages/depb");
+            let dep_c = chain_proj.join(".lake/packages/depc");
+            fs::create_dir_all(chain_proj.join("App")).unwrap();
+            fs::create_dir_all(dep_b.join("DepB")).unwrap();
+            fs::create_dir_all(dep_c.join("DepC")).unwrap();
+            fs::write(
+                chain_proj.join("lean-toolchain"),
+                "leanprover/lean4:v4.35.0\n",
+            )
+            .unwrap();
+            fs::write(
+                dep_c.join("lakefile.toml"),
+                "name = \"depc\"\n[[lean_lib]]\nname = \"DepC\"\nglobs = [\"DepC.+\"]\n",
+            )
+            .unwrap();
+            fs::write(dep_c.join("DepC/Leaf.lean"), "def leafVal : Nat := 13\n").unwrap();
+            fs::write(
+                dep_b.join("lakefile.toml"),
+                "name = \"depb\"\n[[require]]\nname = \"depc\"\npath = \"../depc\"\n[[lean_lib]]\nname = \"DepB\"\nglobs = [\"DepB.+\"]\n",
+            )
+            .unwrap();
+            fs::write(
+                dep_b.join("DepB/Mid.lean"),
+                "import DepC.Leaf\ndef midVal : Nat := leafVal + 5\n",
+            )
+            .unwrap();
+            fs::write(
+                chain_proj.join("lakefile.toml"),
+                "name = \"ws9_chain\"\n[[require]]\nname = \"depb\"\npath = \".lake/packages/depb\"\n[[lean_lib]]\nname = \"App\"\nglobs = [\"App.+\"]\n",
+            )
+            .unwrap();
+            fs::write(
+                chain_proj.join("App/Top.lean"),
+                "import DepB.Mid\ndef topVal : Nat := midVal * 2\n",
+            )
+            .unwrap();
+            // Pre-populate fresh `.olean`s ONLY (no `:shared` libs yet) in `depb` and `depc` via Lake:
+            let pre_olean_status = Command::new(&lake_bin)
+                .args(["build", "depc/+DepC.Leaf:olean", "depb/+DepB.Mid:olean"])
+                .env("SANDBOXED_ALLOW_RAW_LAKE", "1")
+                .env("LAKE_CACHE_DIR", &lake_cache)
+                .current_dir(&chain_proj)
+                .status()
+                .unwrap();
+            assert!(pre_olean_status.success());
+            assert!(!dep_c
+                .join(format!(".lake/build/lib/{sh_prefix}depc_DepC.{sh_ext}"))
+                .exists());
+            assert!(!dep_b
+                .join(format!(".lake/build/lib/{sh_prefix}depb_DepB.{sh_ext}"))
+                .exists());
+            // Build `ws9_chain/+App.Top:dynlib` via turbo-lean; both `depb_DepB` and transitive `depc_DepC` `:shared` must be materialized!
+            build_project_modules_native(
+                &mut store,
+                &chain_proj,
+                &["ws9_chain/+App.Top:dynlib".to_string()],
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap();
+            assert!(dep_c
+                .join(format!(".lake/build/lib/{sh_prefix}depc_DepC.{sh_ext}"))
+                .is_file());
+            assert!(dep_b
+                .join(format!(".lake/build/lib/{sh_prefix}depb_DepB.{sh_ext}"))
+                .is_file());
+            let chain_no_build = Command::new(&lake_bin)
+                .args(["build", "ws9_chain/+App.Top:dynlib", "--no-build"])
+                .env("SANDBOXED_ALLOW_RAW_LAKE", "1")
+                .env("LAKE_CACHE_DIR", &lake_cache)
+                .current_dir(&chain_proj)
+                .status()
+                .unwrap();
+            assert!(
+                chain_no_build.success(),
+                "`lake build ws9_chain/+App.Top:dynlib --no-build` must exit 0 after 3-package fresh external olean promotion"
+            );
+
+            // 6. Compiler vs linker native config gate split:
+            let gate_proj = dir.join("ws9_gate_split");
+            fs::create_dir_all(gate_proj.join("G")).unwrap();
+            fs::write(
+                gate_proj.join("lean-toolchain"),
+                "leanprover/lean4:v4.35.0\n",
+            )
+            .unwrap();
+            fs::write(gate_proj.join("G/Mod.lean"), "def gMod : Nat := 7\n").unwrap();
+            // Linker/libName flags allow `:c` and `:c.o.export` (`leanc -c`), but reject `:dynlib` and `:shared`:
+            fs::write(
+                gate_proj.join("lakefile.toml"),
+                "name = \"ws9_gate\"\nmoreLinkArgs = [\"-lm\"]\n[[lean_lib]]\nname = \"G\"\nlibName = \"custom_g\"\nglobs = [\"G.+\"]\n",
+            )
+            .unwrap();
+            build_project_modules_native(
+                &mut store,
+                &gate_proj,
+                &["+G.Mod:c".to_string(), "+G.Mod:c.o.export".to_string()],
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap();
+            for bad_link_tgt in ["+G.Mod:dynlib", "G:shared"] {
+                let err = build_project_modules_native(
+                    &mut store,
+                    &gate_proj,
+                    &[bad_link_tgt.to_string()],
+                    "trusted-internal",
+                    1,
+                    false,
+                    true,
+                    None,
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(
+                    err.contains("fail-closed"),
+                    "expected `{bad_link_tgt}` to fail closed on custom linker/libName settings, got: {err}"
+                );
+            }
+            // C-compiler flags (`moreLeancArgs`) still allow `:c` (`lean --c`), while rejecting `:c.o.export`, `:dynlib`, and `:shared`:
+            fs::write(
+                gate_proj.join("lakefile.toml"),
+                "name = \"ws9_gate\"\nmoreLeancArgs = [\"-DFOO=1\"]\n[[lean_lib]]\nname = \"G\"\nglobs = [\"G.+\"]\n",
+            )
+            .unwrap();
+            build_project_modules_native(
+                &mut store,
+                &gate_proj,
+                &["+G.Mod:c".to_string()],
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap();
+            for bad_c_tgt in ["+G.Mod:c.o.export", "+G.Mod:dynlib", "G:shared"] {
+                let err = build_project_modules_native(
+                    &mut store,
+                    &gate_proj,
+                    &[bad_c_tgt.to_string()],
+                    "trusted-internal",
+                    1,
+                    false,
+                    true,
+                    None,
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(
+                    err.contains("fail-closed"),
+                    "expected `{bad_c_tgt}` to fail closed on custom leanc settings, got: {err}"
+                );
+            }
         }
         let _ = fs::remove_dir_all(&dir);
     }
