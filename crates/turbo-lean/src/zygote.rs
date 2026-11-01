@@ -3646,11 +3646,12 @@ pub(crate) fn run_audited_lean_shard(
             })??
         }
     };
+    let tools = crate::module_builder::ToolchainExecutables::from_lean(lean_bin)?;
+    let mut auditor_env = env_vars.clone();
+    tools.apply_env(&mut auditor_env);
     let mut auditor = Command::new(zygote_bin);
     auditor
-        .envs(env_vars)
-        .env("PATH", crate::module_builder::verifier_path(lean_bin))
-        .env("LEAN", lean_bin)
+        .envs(&auditor_env)
         .env("LEAN_PATH", lean_path)
         .args(["--audit-modules", "--shard"]);
     // The auditor links `libleanshared` from the toolchain, which an elan-proxied `lean` does not

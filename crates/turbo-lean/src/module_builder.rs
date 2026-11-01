@@ -11118,7 +11118,7 @@ lean_exe «demo-exe» where
                 require_source_compilations(&local, &tree.project, std::slice::from_ref(&target), true)?;
             }
             Err(err) => {
-                assert!(probe_bwrap_sandbox().is_none(), "{err:#}");
+                assert!(probe_bwrap_sandbox(&tree.project).is_none(), "{err:#}");
                 assert!(format!("{err:#}").contains("fail-closed sandbox gate"), "{err:#}");
                 assert!(!source_compilation_authorized_with_trust(&local, &tree.project, &target, true));
                 assert!(require_source_compilations(&local, &tree.project, std::slice::from_ref(&target), true).is_err());
@@ -11152,7 +11152,7 @@ lean_exe «demo-exe» where
                 require_source_compilations(&store, &tree.project, &[target], true)?;
             }
             Err(err) => {
-                assert!(probe_bwrap_sandbox().is_none(), "{err:#}");
+                assert!(probe_bwrap_sandbox(&tree.project).is_none(), "{err:#}");
                 assert!(format!("{err:#}").contains("fail-closed sandbox gate"), "{err:#}");
             }
         }
