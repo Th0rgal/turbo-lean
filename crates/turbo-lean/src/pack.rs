@@ -3324,6 +3324,12 @@ pub(crate) mod tests {
 
         // Permissive server (`*`) must still enforce a strict caller's `allowed_axioms = Some(vec![])`
         // and reject a `bv_decide` shard instead of admitting or caching it under the strict policy.
+        // `TURBO_LEAN_ALLOWED_AXIOMS` is otherwise mutated under `BWRAP_TEST_ENV_LOCK` (`check`,
+        // `mcp`, `zygote`). Take it here too, after the `env_test_lock` held above, so the axiom
+        // policy has a single owning lock and no key-reading test can observe a half-applied one.
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let prev_allow = std::env::var(crate::splitter::ALLOWED_AXIOMS_ENV).ok();
         std::env::set_var(crate::splitter::ALLOWED_AXIOMS_ENV, "*");
         let strict_bv_req = CheckShardHttpRequest {

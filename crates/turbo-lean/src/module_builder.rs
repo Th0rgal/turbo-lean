@@ -4111,7 +4111,9 @@ fn checked_input_path(path: &Path) -> Result<PathBuf> {
 ///   but a symlink *inside* the tree can point anywhere. Lake would follow it; following it here
 ///   would hash bytes that no diff of the repository can report as changed, so the pr-verify
 ///   classifier could call a changed input "unchanged". Resolving to outside `pkg_root` is refused
-///   rather than silently trusted.
+///   rather than silently trusted. Every path is canonicalized, not just one whose leaf is a
+///   symlink: a symlinked *directory* above the leaf escapes just as effectively, and `follow_links`
+///   descent hides it, because the entry's own file type is then an ordinary file.
 /// - **Non-regular files.** A FIFO, socket, or device node matching the filter cannot be hashed
 ///   reproducibly, and `fs::read` on a FIFO blocks forever. Lake quietly skips them, which would
 ///   let an input "contain" a file whose bytes are never in any digest. They are refused instead.
@@ -4119,28 +4121,23 @@ fn checked_input_path(path: &Path) -> Result<PathBuf> {
 /// Both are deliberately stricter than Lake: they can only reject a configuration, never accept one
 /// Lake would reject, and neither can trigger for an input made of ordinary files.
 fn check_input_file_is_contained_regular_file(canon_pkg_root: &Path, path: &Path) -> Result<()> {
-    let meta =
-        fs::symlink_metadata(path).with_context(|| format!("Failed to stat {}", path.display()))?;
-    let resolved = if meta.file_type().is_symlink() {
-        let target = fs::canonicalize(path).with_context(|| {
-            format!(
-                "Lake input symlink `{}` does not resolve: fail-closed static Lake config gate",
-                path.display()
-            )
-        })?;
-        anyhow::ensure!(
-            target.starts_with(canon_pkg_root),
-            "Lake input symlink `{}` resolves to `{}`, outside the package root `{}`: fail-closed static Lake config gate",
-            path.display(),
-            target.display(),
-            canon_pkg_root.display()
-        );
-        fs::metadata(&target).with_context(|| format!("Failed to stat {}", target.display()))?
-    } else {
-        meta
-    };
+    let target = fs::canonicalize(path).with_context(|| {
+        format!(
+            "Lake input `{}` does not resolve: fail-closed static Lake config gate",
+            path.display()
+        )
+    })?;
     anyhow::ensure!(
-        resolved.file_type().is_file(),
+        target.starts_with(canon_pkg_root),
+        "Lake input `{}` resolves to `{}`, outside the package root `{}`: fail-closed static Lake config gate",
+        path.display(),
+        target.display(),
+        canon_pkg_root.display()
+    );
+    let meta =
+        fs::metadata(&target).with_context(|| format!("Failed to stat {}", target.display()))?;
+    anyhow::ensure!(
+        meta.file_type().is_file(),
         "Lake input `{}` is not a regular file: fail-closed static Lake config gate",
         path.display()
     );
@@ -9225,6 +9222,18 @@ lean_lib Later where
     }
     #[test]
     fn test_lake_input_digest_reaches_module_and_project_keys() {
+        // `compute_module_cas_key` and `compute_shard_key_with_args` fold in
+        // `splitter::allowed_axioms()`, which several tests set and restore process-wide -- some
+        // under `env_test_lock` (`pack::test_check_shard_http_offload_and_cache_hit`) and some
+        // under `BWRAP_TEST_ENV_LOCK` (`check`, `mcp`, `zygote`). A key read between two such
+        // mutations moves for a reason that has nothing to do with the inputs under test, so both
+        // locks are held, `env_test_lock` first as everywhere else.
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _bwrap_guard = BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = make_temp_test_dir("input_keys");
         fs::create_dir_all(dir.join("Smoke/sub")).unwrap();
         fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
@@ -9329,8 +9338,12 @@ lean_lib Later where
     /// independent of the `.olean` freshness logic being right.
     #[test]
     fn test_lake_input_digest_reaches_shard_split_and_fission_keys() {
-        // Drives the process-global Lake-input memo window.
+        // Drives the process-global Lake-input memo window, and the shard key below folds in
+        // `splitter::allowed_axioms()`, which other tests mutate under either lock.
         let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _bwrap_guard = BWRAP_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let dir = make_temp_test_dir("input_shard_keys");
@@ -9568,6 +9581,20 @@ lean_lib Later where
         std::os::unix::fs::symlink("nowhere.sol", proj.join("Data/dangling.sol")).unwrap();
         assert!(resolve().is_err(), "a dangling input symlink must fail");
         fs::remove_file(proj.join("Data/dangling.sol")).unwrap();
+
+        // 3b. A symlinked *directory* escapes just as effectively, and this is the case a
+        // leaf-only check misses: `follow_links` descends through it, so the entry it yields is an
+        // ordinary file and its own metadata says nothing about the escape.
+        fs::create_dir_all(dir.join("outside_dir")).unwrap();
+        fs::write(dir.join("outside_dir/x.sol"), "contract X {}").unwrap();
+        std::os::unix::fs::symlink(dir.join("outside_dir"), proj.join("Data/linked_dir")).unwrap();
+        let err = resolve().unwrap_err().to_string();
+        assert!(
+            err.contains("outside the package root") && err.contains("x.sol"),
+            "{err}"
+        );
+        fs::remove_file(proj.join("Data/linked_dir")).unwrap();
+        assert_eq!(digest(), with_inside_link);
 
         // 4. A non-regular file matching the filter fails closed. Reading it would block forever.
         let fifo = proj.join("Data/pipe.sol");
