@@ -412,10 +412,10 @@ impl TurboStore {
     }
 
     /// Compute the deterministic BLAKE3 cache key for `file_split_cache` from an existing
-    /// hex-encoded BLAKE3 digest of the raw file bytes (`BLAKE3("file-split:v6:" + src_blake3_hex)`).
+    /// hex-encoded BLAKE3 digest of the raw file bytes (`BLAKE3("file-split:v10:" + src_blake3_hex)`).
     pub fn compute_file_split_key_from_src_hash(src_blake3_hex: &str) -> String {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"file-split:v6:");
+        hasher.update(b"file-split:v10:");
         hasher.update(src_blake3_hex.as_bytes());
         hasher.finalize().to_hex().to_string()
     }
@@ -1408,6 +1408,56 @@ impl TurboStore {
                 |_| Ok(()),
             )
             .is_ok()
+    }
+
+    /// Verify that a cached theorem-shard action in `trust_domain` has an intact receipt blob
+    /// whose `"decl"` AND `"kernel_type_hash"` match the freshly attested probe values.
+    pub fn has_attested_decl_receipt(
+        &self,
+        action_key: &str,
+        trust_domain: &str,
+        expected_decl: &str,
+        expected_kernel_type_hash: &str,
+    ) -> bool {
+        let Ok(Some(entries)) = self.get_cached_action_no_hit_bump(action_key, trust_domain) else {
+            return false;
+        };
+        self.outputs_have_attested_decl_receipt(&entries, expected_decl, expected_kernel_type_hash)
+    }
+
+    pub fn outputs_have_attested_decl_receipt(
+        &self,
+        entries: &[BlobEntry],
+        expected_decl: &str,
+        expected_kernel_type_hash: &str,
+    ) -> bool {
+        entries.iter().any(|entry| {
+            let Ok(bytes) = fs::read(self.blob_path(&entry.blob_hash)) else {
+                return false;
+            };
+            let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                return false;
+            };
+            val["decl"].as_str().is_some_and(|d| {
+                crate::splitter::canonicalize_lean_name(d)
+                    == crate::splitter::canonicalize_lean_name(expected_decl)
+            }) && val["kernel_type_hash"].as_str() == Some(expected_kernel_type_hash)
+        })
+    }
+
+    /// Evict an unattested or stale cached action and its `.done` marker so singleflight can
+    /// re-acquire leader ownership and publish an attested receipt.
+    pub fn invalidate_action_for_reattestation(&self, action_key: &str) -> Result<()> {
+        let _ = fs::remove_file(self.root.join("locks").join(format!("{}.done", action_key)));
+        self.conn.execute(
+            "DELETE FROM action_outputs WHERE action_key = ?1",
+            params![action_key],
+        )?;
+        self.conn.execute(
+            "DELETE FROM actions WHERE action_key = ?1",
+            params![action_key],
+        )?;
+        Ok(())
     }
 
     pub fn has_cached_action_readonly(&self, action_key: &str, trust_domain: &str) -> Result<bool> {
