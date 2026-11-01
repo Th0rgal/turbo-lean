@@ -201,13 +201,17 @@ type StatelessRemoteInit = (
     splitter::SplitResult,
 );
 
-fn prepare_stateless_remote_file(file: &Path, project_dir: &Path) -> Option<StatelessRemoteInit> {
+fn prepare_stateless_remote_file(
+    file: &Path,
+    project_dir: &Path,
+) -> Result<Option<StatelessRemoteInit>> {
+    crate::module_builder::reset_lake_inputs_tag_memo();
     let canon_dir = project_dir
         .canonicalize()
         .unwrap_or_else(|_| project_dir.to_path_buf());
-    crate::module_builder::try_project_lake_inputs_tag(&canon_dir).ok()?;
+    crate::module_builder::try_project_lake_inputs_tag(&canon_dir)?;
     let resolved_file = if file == Path::new(".") {
-        return None;
+        return Ok(None);
     } else if file.is_relative() && canon_dir.join(file).exists() {
         canon_dir.join(file)
     } else if file.exists() {
@@ -216,14 +220,22 @@ fn prepare_stateless_remote_file(file: &Path, project_dir: &Path) -> Option<Stat
         canon_dir.join(file)
     };
     if resolved_file.is_dir() || !resolved_file.exists() {
-        return None;
+        return Ok(None);
     }
-    let active_src = fs::read_to_string(&resolved_file)
-        .ok()
-        .filter(|s| s.len() <= 64 * 1024)?;
-    let canon_file = resolved_file
-        .canonicalize()
-        .unwrap_or_else(|_| resolved_file);
+    let Ok(active_src) = fs::read_to_string(&resolved_file) else {
+        return Ok(None);
+    };
+    if active_src.len() > 64 * 1024 {
+        return Ok(None);
+    }
+    let canon_file = match resolved_file.canonicalize() {
+        Ok(p) => p,
+        Err(_) => resolved_file,
+    };
+    crate::lake_build::ensure_project_imports_fresh_for_check(
+        &canon_dir,
+        std::slice::from_ref(&canon_file),
+    )?;
     let toolchain = detect_toolchain(&canon_dir);
     let effective_tc = if toolchain.is_empty() || toolchain == "unknown" {
         "leanprover/lean4:v4.35.0".to_string()
@@ -233,7 +245,7 @@ fn prepare_stateless_remote_file(file: &Path, project_dir: &Path) -> Option<Stat
     let local_lean_path = resolve_remote_lean_path(&canon_dir, None);
     let dep_hashes = compute_imported_olean_interface_hashes(&active_src, &canon_dir, None);
     let split = splitter::split_lean_source_fast_no_cone(&active_src, &dep_hashes);
-    Some((
+    Ok(Some((
         canon_dir,
         canon_file,
         active_src,
@@ -242,7 +254,7 @@ fn prepare_stateless_remote_file(file: &Path, project_dir: &Path) -> Option<Stat
         local_lean_path,
         dep_hashes,
         split,
-    ))
+    )))
 }
 
 fn rollback_inflight(store_opt: &Option<TurboStore>, inflight_tx_open: bool) {
@@ -282,7 +294,7 @@ pub fn try_stateless_remote_check(
         local_lean_path,
         dep_hashes,
         split,
-    )) = prepare_stateless_remote_file(file, project_dir)
+    )) = prepare_stateless_remote_file(file, project_dir)?
     else {
         return Ok(false);
     };
@@ -459,7 +471,7 @@ pub fn try_stateless_remote_single_decl_check(
         local_lean_path,
         dep_hashes,
         split,
-    )) = prepare_stateless_remote_file(file, project_dir)
+    )) = prepare_stateless_remote_file(file, project_dir)?
     else {
         return Ok(false);
     };
@@ -1032,6 +1044,7 @@ fn check_directory(
             );
             pack::warm_local_zygote_daemon_nonblocking(store, &fast_ev);
         }
+        crate::lake_build::recheck_dependents_if_nonlocal(canon_dir, resolved_file)?;
         return Ok(out_json);
     }
 
@@ -1304,9 +1317,7 @@ fn check_directory(
                                                 cmd.arg(arg);
                                             }
                                             let out = crate::zygote::run_lean_command(
-                                                cmd.arg(&tmp_batch)
-                                                    .current_dir(canon_ref)
-                                                    ,
+                                                cmd.arg(&tmp_batch).current_dir(canon_ref),
                                                 Some(crate::zygote::remaining_timeout_ms(
                                                     None, *t0,
                                                 )),
@@ -2687,7 +2698,6 @@ fn check_single_decl(
                     let out = crate::zygote::run_lean_command(
                         cmd.arg(&tmp_shard)
                             .current_dir(canon_dir)
-                            
                             .env("LEAN_STACK_SIZE_KB", default_stack),
                         Some(crate::zygote::remaining_timeout_ms(None, *t0)),
                     )
@@ -3303,9 +3313,7 @@ fn check_single_file(
                         cmd.arg(arg);
                     }
                     let batch_out = crate::zygote::run_lean_command(
-                        cmd.arg(&tmp_coalesced)
-                            .current_dir(canon_dir)
-                            ,
+                        cmd.arg(&tmp_coalesced).current_dir(canon_dir),
                         Some(crate::zygote::remaining_timeout_ms(None, *t0)),
                     )
                     .context("Failed to execute `lean` on coalesced shard batch")?;
@@ -3651,9 +3659,7 @@ fn check_single_file(
                 cmd.arg(arg);
             }
             let out = crate::zygote::run_lean_command(
-                cmd.arg(canon_resolved_initial)
-                    .current_dir(canon_dir)
-                    ,
+                cmd.arg(canon_resolved_initial).current_dir(canon_dir),
                 Some(crate::zygote::remaining_timeout_ms(None, *t0)),
             )
             .context("Failed to execute `lean`")?;

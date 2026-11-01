@@ -1270,7 +1270,16 @@ pub fn parse_lake_manifest(
     }
     let raw = fs::read_to_string(&manifest_path)
         .with_context(|| format!("Failed to read {}", manifest_path.display()))?;
-    let val: serde_json::Value = serde_json::from_str(&raw)
+    parse_lake_manifest_str(project_dir, &manifest_path, &raw, is_untrusted)
+}
+
+pub(crate) fn parse_lake_manifest_str(
+    project_dir: &Path,
+    manifest_path: &Path,
+    raw: &str,
+    is_untrusted: bool,
+) -> Result<(PathBuf, Vec<ManifestPackageEntry>, Option<String>)> {
+    let val: serde_json::Value = serde_json::from_str(raw)
         .with_context(|| format!("Invalid JSON in {}", manifest_path.display()))?;
     let manifest_hash = blake3::hash(raw.as_bytes()).to_hex().to_string();
     let packages_dir_str = val
@@ -2067,6 +2076,23 @@ pub fn parse_lakefile_toml(
     toml_path: &Path,
     is_root_pkg: bool,
 ) -> Result<PackageConfig> {
+    parse_lakefile_toml_inner(pkg_root, toml_path, is_root_pkg, true)
+}
+
+pub(crate) fn parse_lakefile_toml_without_disk_inputs(
+    pkg_root: &Path,
+    toml_path: &Path,
+    is_root_pkg: bool,
+) -> Result<PackageConfig> {
+    parse_lakefile_toml_inner(pkg_root, toml_path, is_root_pkg, false)
+}
+
+fn parse_lakefile_toml_inner(
+    pkg_root: &Path,
+    toml_path: &Path,
+    is_root_pkg: bool,
+    hash_inputs_from_disk: bool,
+) -> Result<PackageConfig> {
     let raw = fs::read_to_string(toml_path)
         .with_context(|| format!("Failed to read {}", toml_path.display()))?;
     // The line-based reader below does not model multi-line TOML strings.
@@ -2441,7 +2467,14 @@ pub fn parse_lakefile_toml(
         }
     }
     check_empty_roots(&pkg, &empty_roots)?;
-    finalize_package_config(&mut pkg, is_root_pkg, toml_path, &raw_hash, &empty_roots)?;
+    finalize_package_config(
+        &mut pkg,
+        is_root_pkg,
+        toml_path,
+        &raw_hash,
+        &empty_roots,
+        hash_inputs_from_disk,
+    )?;
     Ok(pkg)
 }
 fn parse_lean_string_array_expr(expr: &str) -> Result<Vec<String>> {
@@ -3614,6 +3647,23 @@ pub fn parse_lakefile_lean(
     lean_path: &Path,
     is_root_pkg: bool,
 ) -> Result<PackageConfig> {
+    parse_lakefile_lean_inner(pkg_root, lean_path, is_root_pkg, true)
+}
+
+pub(crate) fn parse_lakefile_lean_without_disk_inputs(
+    pkg_root: &Path,
+    lean_path: &Path,
+    is_root_pkg: bool,
+) -> Result<PackageConfig> {
+    parse_lakefile_lean_inner(pkg_root, lean_path, is_root_pkg, false)
+}
+
+fn parse_lakefile_lean_inner(
+    pkg_root: &Path,
+    lean_path: &Path,
+    is_root_pkg: bool,
+    hash_inputs_from_disk: bool,
+) -> Result<PackageConfig> {
     let raw = fs::read_to_string(lean_path)
         .with_context(|| format!("Failed to read {}", lean_path.display()))?;
     let raw_hash = blake3::hash(raw.as_bytes()).to_hex().to_string();
@@ -4193,7 +4243,14 @@ pub fn parse_lakefile_lean(
         }
     }
     check_empty_roots(&pkg, &empty_roots)?;
-    finalize_package_config(&mut pkg, is_root_pkg, lean_path, &raw_hash, &empty_roots)?;
+    finalize_package_config(
+        &mut pkg,
+        is_root_pkg,
+        lean_path,
+        &raw_hash,
+        &empty_roots,
+        hash_inputs_from_disk,
+    )?;
     Ok(pkg)
 }
 #[allow(clippy::too_many_arguments)]
@@ -4737,33 +4794,53 @@ fn hash_input_target(pkg_root: &Path, input: &InputTargetConfig) -> Result<(Stri
     } else {
         check_input_file_is_contained_regular_file(&canon_pkg_root, &root)?;
     }
+    let mut file_entries = Vec::with_capacity(files.len());
+    for f in &files {
+        let bytes = fs::read(f).with_context(|| format!("Failed to read {}", f.display()))?;
+        let rel = f
+            .strip_prefix(pkg_root)
+            .unwrap_or(f)
+            .as_os_str()
+            .as_encoded_bytes();
+        file_entries.push((rel, bytes));
+    }
+    hash_input_target_entries(
+        input,
+        file_entries
+            .iter()
+            .map(|(rel, bytes)| (*rel, bytes.as_slice())),
+    )
+}
+
+pub(crate) fn hash_input_target_entries<'a, I>(
+    input: &InputTargetConfig,
+    entries: I,
+) -> Result<(String, String)>
+where
+    I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
+{
     let mut h = blake3::Hasher::new();
     h.update(b"turbo-lean-lake-input-v1\n");
     let mut lake = LAKE_NIL_HASH;
-    for f in &files {
-        let bytes = fs::read(f).with_context(|| format!("Failed to read {}", f.display()))?;
-        let file_hash =
-            if input.text {
-                // Lake reads a text input with `IO.FS.readFile`, which rejects non-UTF-8 bytes.
-                lake_hash_text(std::str::from_utf8(&bytes).with_context(|| {
-                    format!("`{}` is not the UTF-8 text Lake expects", f.display())
-                })?)
-            } else {
-                lake_hash_bytes(&bytes)
-            };
+    for (rel_path, bytes) in entries {
+        let file_hash = if input.text {
+            // Lake reads a text input with `IO.FS.readFile`, which rejects non-UTF-8 bytes.
+            lake_hash_text(std::str::from_utf8(bytes).with_context(|| {
+                format!(
+                    "`{}` is not the UTF-8 text Lake expects",
+                    String::from_utf8_lossy(rel_path)
+                )
+            })?)
+        } else {
+            lake_hash_bytes(bytes)
+        };
         lake = if input.is_dir {
             lake_mix_hash(lake, file_hash)
         } else {
             file_hash
         };
-        update_hasher_lp(
-            &mut h,
-            f.strip_prefix(pkg_root)
-                .unwrap_or(f)
-                .as_os_str()
-                .as_encoded_bytes(),
-        );
-        update_hasher_lp(&mut h, &bytes);
+        update_hasher_lp(&mut h, rel_path);
+        update_hasher_lp(&mut h, bytes);
     }
     Ok((h.finalize().to_hex().to_string(), format!("{lake:016x}")))
 }
@@ -4774,6 +4851,7 @@ fn finalize_package_config(
     config_path: &Path,
     raw_hash: &str,
     explicit_empty_roots: &BTreeSet<usize>,
+    hash_inputs_from_disk: bool,
 ) -> Result<()> {
     for (i, lib) in pkg.libs.iter_mut().enumerate() {
         // Lake's default `roots` is `#[name]`; an explicit `roots = []` stays empty.
@@ -4841,6 +4919,20 @@ fn finalize_package_config(
     }
     let pkg_root = pkg.pkg_root.clone();
     for input in &mut pkg.inputs {
+        if !hash_inputs_from_disk {
+            checked_input_path(&input.path).map_err(|e| {
+                if is_root_pkg {
+                    let _ = c_abi::verify_static_lake_config(true, true, false, false);
+                }
+                anyhow::anyhow!(
+                    "Unreadable Lake input `{}` in {}: {:#}: fail-closed static Lake config gate",
+                    input.name,
+                    config_path.display(),
+                    e
+                )
+            })?;
+            continue;
+        }
         // Dependency packages fail closed here too. A constant placeholder would make every
         // consumer of this digest -- `module_lake_input_digest`, the manifest guard, the
         // `build` / `ci-verify` action keys -- compare equal across two different sets of input
@@ -6751,7 +6843,7 @@ static LAKE_INPUTS_TAG_MEMO: OnceLock<Mutex<HashMap<PathBuf, LakeInputsTagMemoEn
 /// or cross-edit cache key collisions.
 static LAKE_INPUTS_UNRESOLVED_NONCE: AtomicU64 = AtomicU64::new(1);
 
-fn fresh_unresolved_lake_inputs_tag(err: &str) -> String {
+pub(crate) fn fresh_unresolved_lake_inputs_tag(err: &str) -> String {
     let seq = LAKE_INPUTS_UNRESOLVED_NONCE.fetch_add(1, Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

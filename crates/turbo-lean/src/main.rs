@@ -599,6 +599,14 @@ fn run(cli: Cli) -> Result<()> {
         } => Some(lake_build::find_project_root(
             project_dir.as_deref().unwrap_or(file),
         )),
+        Commands::AgentStep {
+            project_dir, file, ..
+        } => Some(
+            project_dir
+                .as_ref()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| lake_build::find_project_root(file)),
+        ),
         _ => None,
     };
     let (dir, rev) = match &cli.command {
@@ -614,16 +622,7 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Check { project_dir, .. }
         | Commands::Build { project_dir, .. }
         | Commands::SeedShards { project_dir, .. } => (Some(project_dir.as_path()), None),
-        Commands::AgentStep {
-            project_dir, file, ..
-        } => {
-            let file_dir = file.parent().filter(|p| !p.as_os_str().is_empty());
-            (
-                Some(project_dir.as_deref().or(file_dir).unwrap_or(here)),
-                None,
-            )
-        }
-        Commands::Eval { .. } => (eval_project_root.as_deref(), None),
+        Commands::AgentStep { .. } | Commands::Eval { .. } => (eval_project_root.as_deref(), None),
         Commands::Mcp { project_dir } => (Some(project_dir.as_deref().unwrap_or(here)), None),
         _ => (None, None),
     };

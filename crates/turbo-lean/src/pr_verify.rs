@@ -157,7 +157,10 @@ pub(crate) fn fetch_git_blobs_batch(
     if repo_rels.is_empty() {
         return Ok(out_map);
     }
-    anyhow::ensure!(!base_ref.starts_with('-'), "Invalid git revision `{base_ref}`");
+    anyhow::ensure!(
+        !base_ref.starts_with('-'),
+        "Invalid git revision `{base_ref}`"
+    );
     let wanted: std::collections::HashSet<&str> = repo_rels.iter().map(String::as_str).collect();
     let tree = crate::trusted_tools::git(repo_root)?
         .arg("-C")
@@ -1114,17 +1117,36 @@ fn compute_source_only_import_digests(
     cfg_opt: Option<&crate::module_builder::ProjectConfig>,
     strict_untrusted: bool,
 ) -> Result<Vec<String>> {
+    compute_source_only_import_digests_with_tag_override(
+        src,
+        project_dir,
+        cfg_opt,
+        strict_untrusted,
+        None,
+    )
+}
+
+fn compute_source_only_import_digests_with_tag_override(
+    src: &str,
+    project_dir: &Path,
+    cfg_opt: Option<&crate::module_builder::ProjectConfig>,
+    strict_untrusted: bool,
+    tag_override: Option<Option<String>>,
+) -> Result<Vec<String>> {
     // Same synthetic entry `compute_imported_olean_interface_hashes` adds on the trusted path, so
     // an untrusted re-verification cannot reuse a split or a shard computed against older input
     // bytes either. Taken from the already-resolved config when there is one, which keeps the
     // untrusted mode's "never trust a stat, re-read the bytes" rule intact -- and, deliberately,
     // bypasses `project_lake_inputs_tag`'s per-command memo entirely: untrusted verification reads
     // its digests out of the config this run resolved, never out of a cache.
-    let lake_inputs_tag = match cfg_opt {
-        Some(cfg) => crate::module_builder::lake_inputs_tag_from_digest(
-            &crate::module_builder::workspace_lake_inputs_digest(cfg)?,
-        ),
-        None => crate::module_builder::try_project_lake_inputs_tag(project_dir)?,
+    let lake_inputs_tag = match tag_override {
+        Some(tag) => tag,
+        None => match cfg_opt {
+            Some(cfg) => crate::module_builder::lake_inputs_tag_from_digest(
+                &crate::module_builder::workspace_lake_inputs_digest(cfg)?,
+            ),
+            None => crate::module_builder::try_project_lake_inputs_tag(project_dir)?,
+        },
     };
     if project_dir.as_os_str().is_empty() && cfg_opt.is_none() {
         return Ok(Vec::new());
@@ -1599,7 +1621,442 @@ fn lake_input_files_changed_since_base(
     false
 }
 
-/// Parse the base revision's config without executing Lake or using worktree options.
+fn resolve_git_commit_sha(repo_root: &Path, base_ref: &str) -> Result<String> {
+    if let Some(sha) = resolve_git_head_sha(repo_root, base_ref) {
+        return Ok(sha);
+    }
+    let out = crate::trusted_tools::git(repo_root)?
+        .arg("-C")
+        .arg(repo_root)
+        .args(["rev-parse", "--verify", "--end-of-options"])
+        .arg(format!("{base_ref}^{{commit}}"))
+        .output()
+        .context("Failed to resolve Git base revision")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "Invalid git base ref `{base_ref}`: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    Ok(String::from_utf8(out.stdout)?.trim().to_string())
+}
+
+fn parse_staged_base_package_config(
+    store: &TurboStore,
+    pkg_root: &Path,
+    raw: &str,
+    is_toml: bool,
+    is_root_pkg: bool,
+) -> Result<crate::module_builder::PackageConfig> {
+    let staged = store.fast_staging_dir().join(format!(
+        "base-lakefile-{}-{}",
+        std::process::id(),
+        crate::pack::next_tmp_id()
+    ));
+    fs::write(&staged, raw)?;
+    let result = if is_toml {
+        crate::module_builder::parse_lakefile_toml_without_disk_inputs(
+            pkg_root,
+            &staged,
+            is_root_pkg,
+        )
+    } else {
+        crate::module_builder::parse_lakefile_lean_without_disk_inputs(
+            pkg_root,
+            &staged,
+            is_root_pkg,
+        )
+    };
+    let _ = fs::remove_file(&staged);
+    result
+}
+
+fn hash_package_inputs_from_git_tree(
+    canon_repo_root: &Path,
+    sha: &str,
+    pkg: &mut crate::module_builder::PackageConfig,
+) -> Option<()> {
+    if pkg.unsupported.is_some() || pkg.inputs.iter().any(|i| i.unsupported.is_some()) {
+        return None;
+    }
+    if pkg.inputs.is_empty() {
+        return Some(());
+    }
+    let pkg_repo_rel = pkg.pkg_root.strip_prefix(canon_repo_root).ok()?;
+    if pkg_repo_rel
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let pkg_prefix = pkg_repo_rel.to_string_lossy().replace('\\', "/");
+
+    let mut oids_to_fetch: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut per_input_files: Vec<Vec<(String, String)>> = Vec::with_capacity(pkg.inputs.len());
+
+    for inp in &pkg.inputs {
+        if inp.path.is_absolute()
+            || inp
+                .path
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return None;
+        }
+        let inp_rel_str = inp.path.to_string_lossy().replace('\\', "/");
+        let inp_repo_rel = join_proj_prefix(&pkg_prefix, &inp_rel_str);
+        let ls_out = crate::trusted_tools::git(canon_repo_root)
+            .and_then(|mut git| {
+                git.arg("-C")
+                    .arg(canon_repo_root)
+                    .args([
+                        "ls-tree",
+                        "-r",
+                        "-z",
+                        "--full-tree",
+                        sha,
+                        "--",
+                        &inp_repo_rel,
+                    ])
+                    .output()
+                    .map_err(Into::into)
+            })
+            .ok()?;
+        if !ls_out.status.success() {
+            return None;
+        }
+        let mut matched: Vec<(String, String)> = Vec::new();
+        let mut saw_any_under_dir = false;
+        for rec in ls_out.stdout.split(|&b| b == 0).filter(|r| !r.is_empty()) {
+            let tab_pos = rec.iter().position(|&b| b == b'\t')?;
+            let meta_str = std::str::from_utf8(&rec[..tab_pos]).ok()?;
+            let path_str = std::str::from_utf8(&rec[tab_pos + 1..]).ok()?;
+            let mut parts = meta_str.split_whitespace();
+            let (mode, obj_type, oid) = (parts.next()?, parts.next()?, parts.next()?);
+            if mode == "160000" || obj_type == "commit" {
+                return None;
+            }
+            if inp.is_dir {
+                let Some(pkg_rel) = (if pkg_prefix.is_empty() {
+                    Some(path_str)
+                } else {
+                    path_str.strip_prefix(&format!("{}/", pkg_prefix.trim_end_matches('/')))
+                }) else {
+                    continue;
+                };
+                if !pkg_rel.starts_with(&format!("{}/", inp_rel_str.trim_end_matches('/'))) {
+                    continue;
+                }
+                saw_any_under_dir = true;
+                let ext = Path::new(path_str).extension();
+                if !inp
+                    .extension
+                    .as_deref()
+                    .is_none_or(|x| ext == Some(x.as_ref()))
+                {
+                    continue;
+                }
+                if mode == "120000" || obj_type != "blob" {
+                    return None;
+                }
+                oids_to_fetch.insert(oid.to_string());
+                matched.push((pkg_rel.to_string(), oid.to_string()));
+            } else if path_str == inp_repo_rel {
+                if mode == "120000" || obj_type != "blob" {
+                    return None;
+                }
+                let pkg_rel = if pkg_prefix.is_empty() {
+                    path_str.to_string()
+                } else {
+                    path_str
+                        .strip_prefix(&format!("{}/", pkg_prefix.trim_end_matches('/')))?
+                        .to_string()
+                };
+                oids_to_fetch.insert(oid.to_string());
+                matched.push((pkg_rel, oid.to_string()));
+            }
+        }
+        if !inp.is_dir && matched.len() != 1 {
+            return None;
+        }
+        if inp.is_dir && !saw_any_under_dir {
+            // An empty directory cannot exist in Git's tree without a tracked entry; verify
+            // whether the directory existed as a tree object in `sha` (`ls-tree -d`) rather than
+            // conflating a missing directory with an empty one.
+            let dir_out = crate::trusted_tools::git(canon_repo_root)
+                .and_then(|mut git| {
+                    git.arg("-C")
+                        .arg(canon_repo_root)
+                        .args([
+                            "ls-tree",
+                            "-d",
+                            "-z",
+                            "--full-tree",
+                            sha,
+                            "--",
+                            &inp_repo_rel,
+                        ])
+                        .output()
+                        .map_err(Into::into)
+                })
+                .ok()?;
+            if !dir_out.status.success() || dir_out.stdout.is_empty() {
+                return None;
+            }
+        }
+        matched.sort_by(|(a, _), (b, _)| a.as_bytes().cmp(b.as_bytes()));
+        per_input_files.push(matched);
+    }
+
+    let mut blob_by_oid: std::collections::HashMap<String, Vec<u8>> =
+        std::collections::HashMap::with_capacity(oids_to_fetch.len());
+    if !oids_to_fetch.is_empty() {
+        let mut git_cmd = crate::trusted_tools::git(canon_repo_root).ok()?;
+        let mut child = git_cmd
+            .arg("-C")
+            .arg(canon_repo_root)
+            .args(["cat-file", "--batch"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let ordered_oids: Vec<&String> = oids_to_fetch.iter().collect();
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            let mut req_buf = String::new();
+            for oid in &ordered_oids {
+                req_buf.push_str(oid);
+                req_buf.push('\n');
+            }
+            stdin.write_all(req_buf.as_bytes()).ok()?;
+        }
+        let out = child.wait_with_output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let bytes = &out.stdout;
+        let mut pos = 0usize;
+        for oid in ordered_oids {
+            let nl_rel = bytes[pos..].iter().position(|&b| b == b'\n')?;
+            let header = std::str::from_utf8(&bytes[pos..pos + nl_rel]).ok()?;
+            pos += nl_rel + 1;
+            let parts: Vec<&str> = header.split_whitespace().collect();
+            if parts.len() < 3 || parts[1] != "blob" {
+                return None;
+            }
+            let sz = parts[2].parse::<usize>().ok()?;
+            if pos + sz > bytes.len() {
+                return None;
+            }
+            blob_by_oid.insert(oid.clone(), bytes[pos..pos + sz].to_vec());
+            pos += sz;
+            if pos < bytes.len() && bytes[pos] == b'\n' {
+                pos += 1;
+            }
+        }
+    }
+
+    for (inp, files) in pkg.inputs.iter_mut().zip(per_input_files.iter()) {
+        let mut entry_refs: Vec<(&[u8], &[u8])> = Vec::with_capacity(files.len());
+        for (pkg_rel, oid) in files {
+            let b = blob_by_oid.get(oid)?;
+            entry_refs.push((pkg_rel.as_bytes(), b.as_slice()));
+        }
+        let (blake3, lake_hash) =
+            crate::module_builder::hash_input_target_entries(inp, entry_refs).ok()?;
+        inp.blake3 = blake3;
+        inp.lake_hash = lake_hash;
+    }
+    Some(())
+}
+
+/// Resolve the `--base` revision's workspace Lake-inputs tag purely from Git (`base_ref`) for
+/// tracked packages (and materialized `.lake/packages` git dependencies pinned at the exact same
+/// `rev` in both `--base` and current `lake-manifest.json`), never substituting working-tree input
+/// bytes for `--base` inputs. When any `--base` package or input cannot be reconstructed cleanly
+/// from Git, falls back to a fresh uncacheable sentinel tag so `base_split` keys cannot collide
+/// with `cur_split` keys.
+fn resolve_base_lake_inputs_tag(
+    store: &TurboStore,
+    repo_root: &Path,
+    canon_dir: &Path,
+    base_ref: &str,
+    base_pkg_cfg: Option<&crate::module_builder::PackageConfig>,
+    cur_dep_pkgs: &[crate::module_builder::PackageConfig],
+    is_untrusted: bool,
+) -> Result<Option<String>> {
+    let Some(mut root_pkg) = base_pkg_cfg.cloned() else {
+        return Ok(None);
+    };
+    let Ok(canon_repo_root) = fs::canonicalize(repo_root) else {
+        return Ok(Some(
+            crate::module_builder::fresh_unresolved_lake_inputs_tag(
+                "base-repo-root-uncanonicalizable",
+            ),
+        ));
+    };
+    let sha = resolve_git_commit_sha(&canon_repo_root, base_ref)?;
+    let prefix = rel_path_from_dir(canon_dir, &canon_repo_root);
+    let manifest_repo_rel = join_proj_prefix(&prefix, "lake-manifest.json");
+    let mut blobs = fetch_git_blobs_batch(
+        &canon_repo_root,
+        &sha,
+        std::slice::from_ref(&manifest_repo_rel),
+    )?;
+    let base_manifest_opt = if let Some(raw_manifest) = blobs.remove(&manifest_repo_rel) {
+        Some(
+            crate::module_builder::parse_lake_manifest_str(
+                canon_dir,
+                &canon_dir.join("lake-manifest.json"),
+                &raw_manifest,
+                is_untrusted,
+            )
+            .with_context(|| {
+                format!("Failed to parse base Lake manifest at {base_ref}:{manifest_repo_rel}")
+            })?,
+        )
+    } else {
+        None
+    };
+
+    if hash_package_inputs_from_git_tree(&canon_repo_root, &sha, &mut root_pkg).is_none() {
+        return Ok(Some(
+            crate::module_builder::fresh_unresolved_lake_inputs_tag(
+                "base-root-inputs-unresolvable",
+            ),
+        ));
+    }
+
+    let cur_manifest_revs: std::collections::HashMap<String, Option<String>> =
+        crate::module_builder::parse_lake_manifest(canon_dir, is_untrusted)
+            .map(|(_, entries, _)| entries.into_iter().map(|e| (e.name, e.rev)).collect())
+            .unwrap_or_default();
+
+    let mut base_dep_pkgs: Vec<crate::module_builder::PackageConfig> = Vec::new();
+    if let Some((_, manifest_packages, _)) = base_manifest_opt {
+        for mp in manifest_packages {
+            let in_repo = mp.dir.starts_with(&canon_repo_root)
+                && mp
+                    .dir
+                    .strip_prefix(&canon_repo_root)
+                    .ok()
+                    .is_some_and(|rel| {
+                        !rel.components().any(|c| {
+                            matches!(c, std::path::Component::ParentDir) || c.as_os_str() == ".lake"
+                        })
+                    });
+            if in_repo {
+                let dep_prefix = rel_path_from_dir(&mp.dir, &canon_repo_root);
+                let cfg_rel = mp.config_file.as_deref().unwrap_or("lakefile");
+                let cand_paths: Vec<(String, bool)> = if Path::new(cfg_rel).extension().is_some() {
+                    let is_toml =
+                        Path::new(cfg_rel).extension().and_then(|e| e.to_str()) == Some("toml");
+                    vec![(join_proj_prefix(&dep_prefix, cfg_rel), is_toml)]
+                } else {
+                    vec![
+                        (
+                            join_proj_prefix(&dep_prefix, &format!("{cfg_rel}.lean")),
+                            false,
+                        ),
+                        (
+                            join_proj_prefix(&dep_prefix, &format!("{cfg_rel}.toml")),
+                            true,
+                        ),
+                    ]
+                };
+                let fetch_keys: Vec<String> = cand_paths.iter().map(|(p, _)| p.clone()).collect();
+                let mut dep_blobs = fetch_git_blobs_batch(&canon_repo_root, &sha, &fetch_keys)?;
+                let mut parsed_dep = None;
+                for (cand_p, is_toml) in cand_paths {
+                    if let Some(raw_dep) = dep_blobs.remove(&cand_p) {
+                        let mut dep_cfg =
+                            parse_staged_base_package_config(store, &mp.dir, &raw_dep, is_toml, false)
+                                .with_context(|| {
+                                    format!(
+                                        "Failed to parse base dependency Lake config at {base_ref}:{cand_p}"
+                                    )
+                                })?;
+                        if hash_package_inputs_from_git_tree(&canon_repo_root, &sha, &mut dep_cfg)
+                            .is_none()
+                        {
+                            return Ok(Some(
+                                crate::module_builder::fresh_unresolved_lake_inputs_tag(
+                                    "base-dep-inputs-unresolvable",
+                                ),
+                            ));
+                        }
+                        parsed_dep = Some(dep_cfg);
+                        break;
+                    }
+                }
+                if let Some(dep_cfg) = parsed_dep {
+                    base_dep_pkgs.push(dep_cfg);
+                } else {
+                    return Ok(Some(
+                        crate::module_builder::fresh_unresolved_lake_inputs_tag(
+                            "base-in-repo-dep-missing-config",
+                        ),
+                    ));
+                }
+            } else if mp.pkg_type != "path"
+                && mp.rev.is_some()
+                && cur_manifest_revs.get(&mp.name) == Some(&mp.rev)
+            {
+                if let Some(cur_dep) = cur_dep_pkgs.iter().find(|d| d.name == mp.name) {
+                    if cur_dep.unsupported.is_some()
+                        || cur_dep.inputs.iter().any(|i| i.unsupported.is_some())
+                    {
+                        return Ok(Some(
+                            crate::module_builder::fresh_unresolved_lake_inputs_tag(
+                                "base-git-dep-unsupported-inputs",
+                            ),
+                        ));
+                    }
+                    base_dep_pkgs.push(cur_dep.clone());
+                } else if !cur_dep_pkgs.is_empty() {
+                    return Ok(Some(
+                        crate::module_builder::fresh_unresolved_lake_inputs_tag(
+                            "base-git-dep-not-materialized",
+                        ),
+                    ));
+                }
+            } else {
+                return Ok(Some(
+                    crate::module_builder::fresh_unresolved_lake_inputs_tag(
+                        "base-external-dep-unpinned",
+                    ),
+                ));
+            }
+        }
+    } else if !cur_dep_pkgs.is_empty() && cur_dep_pkgs.iter().any(|d| !d.inputs.is_empty()) {
+        return Ok(Some(
+            crate::module_builder::fresh_unresolved_lake_inputs_tag(
+                "base-no-manifest-with-dep-inputs",
+            ),
+        ));
+    }
+
+    let mut digest = String::new();
+    for p in std::iter::once(&root_pkg)
+        .chain(base_dep_pkgs.iter())
+        .filter(|p| !p.inputs.is_empty())
+    {
+        for i in &p.inputs {
+            if let Some(ref why) = i.unsupported {
+                anyhow::bail!(
+                    "Unsupported base Lake input `{}/{}` at {base_ref}: {}: fail-closed static Lake config gate",
+                    p.name,
+                    i.name,
+                    why
+                );
+            }
+            digest.push_str(&format!("{}/{}:{}\n", p.name, i.name, i.blake3));
+        }
+    }
+    Ok(crate::module_builder::lake_inputs_tag_from_digest(&digest))
+}
+
+/// Parse the base revision's config without executing Lake or using worktree options/inputs.
 /// The parser roots module paths at the project, while config bytes come only from Git.
 fn base_revision_package_config(
     store: &TurboStore,
@@ -1607,45 +2064,18 @@ fn base_revision_package_config(
     canon_dir: &Path,
     base_ref: &str,
 ) -> Result<Option<crate::module_builder::PackageConfig>> {
-    let sha = match resolve_git_head_sha(repo_root, base_ref) {
-        Some(sha) => sha,
-        None => {
-            let out = crate::trusted_tools::git(repo_root)?
-                .arg("-C")
-                .arg(repo_root)
-                .args(["rev-parse", "--verify", "--end-of-options"])
-                .arg(format!("{base_ref}^{{commit}}"))
-                .output()
-                .context("Failed to resolve Git base revision")?;
-            anyhow::ensure!(
-                out.status.success(),
-                "Invalid git base ref `{base_ref}`: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-            String::from_utf8(out.stdout)?.trim().to_string()
-        }
-    };
+    let sha = resolve_git_commit_sha(repo_root, base_ref)?;
     let prefix = rel_path_from_dir(canon_dir, repo_root);
-    let paths: Vec<_> = ["lakefile.toml", "lakefile.lean"]
+    // Match Lake's precedence (`package_config_path`): `lakefile.lean` takes precedence over `lakefile.toml`.
+    let paths: Vec<(_, bool)> = [("lakefile.lean", false), ("lakefile.toml", true)]
         .iter()
-        .map(|name| join_proj_prefix(&prefix, name))
+        .map(|(name, is_toml)| (join_proj_prefix(&prefix, name), *is_toml))
         .collect();
-    let mut blobs = fetch_git_blobs_batch(repo_root, &sha, &paths)?;
-    for (index, path) in paths.iter().enumerate() {
-        if let Some(raw) = blobs.remove(path) {
-            let staged = store.fast_staging_dir().join(format!(
-                "base-lakefile-{}-{}",
-                std::process::id(),
-                crate::pack::next_tmp_id()
-            ));
-            fs::write(&staged, raw)?;
-            let result = if index == 0 {
-                crate::module_builder::parse_lakefile_toml(canon_dir, &staged, false)
-            } else {
-                crate::module_builder::parse_lakefile_lean(canon_dir, &staged, false)
-            };
-            let _ = fs::remove_file(&staged);
-            return result
+    let fetch_keys: Vec<String> = paths.iter().map(|(p, _)| p.clone()).collect();
+    let mut blobs = fetch_git_blobs_batch(repo_root, &sha, &fetch_keys)?;
+    for (path, is_toml) in paths {
+        if let Some(raw) = blobs.remove(&path) {
+            return parse_staged_base_package_config(store, canon_dir, &raw, is_toml, false)
                 .with_context(|| {
                     format!("Failed to resolve base Lean options at {base_ref}:{path}")
                 })
@@ -1720,23 +2150,49 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
     } else {
         crate::module_builder::resolve_project_config(canon_dir).ok()
     };
-    let lake_inputs_changed = untrusted_cfg
+    let cur_dep_pkgs: &[crate::module_builder::PackageConfig] = untrusted_cfg
         .or(owned_project_cfg.as_ref())
-        .is_some_and(|cfg| {
-            lake_input_files_changed_since_base(
-                &repo_root,
-                &proj_prefix,
-                &cfg.root_pkg,
-                &cfg.dep_pkgs,
-                base_ref,
-            )
-        })
+        .map(|cfg| cfg.dep_pkgs.as_slice())
+        .unwrap_or(&[]);
+    let mut base_lake_inputs_tag = resolve_base_lake_inputs_tag(
+        store,
+        &repo_root,
+        canon_dir,
+        base_ref,
+        base_pkg_cfg.as_ref(),
+        cur_dep_pkgs,
+        is_untrusted,
+    )?;
+    let cur_lake_inputs_tag = match untrusted_cfg.or(owned_project_cfg.as_ref()) {
+        Some(cfg) => crate::module_builder::lake_inputs_tag_from_digest(
+            &crate::module_builder::workspace_lake_inputs_digest(cfg)?,
+        ),
+        None if !is_untrusted => crate::module_builder::try_project_lake_inputs_tag(canon_dir)?,
+        None => None,
+    };
+    let lake_inputs_changed = base_lake_inputs_tag != cur_lake_inputs_tag
+        || untrusted_cfg
+            .or(owned_project_cfg.as_ref())
+            .is_some_and(|cfg| {
+                lake_input_files_changed_since_base(
+                    &repo_root,
+                    &proj_prefix,
+                    &cfg.root_pkg,
+                    &cfg.dep_pkgs,
+                    base_ref,
+                )
+            })
         || (!is_untrusted
             && owned_project_cfg.is_none()
             && (owned_pkg_cfg
                 .as_ref()
                 .is_some_and(|pkg| !pkg.inputs.is_empty())
                 || crate::module_builder::workspace_may_declare_lake_inputs(canon_dir)));
+    if lake_inputs_changed && base_lake_inputs_tag == cur_lake_inputs_tag {
+        base_lake_inputs_tag = Some(crate::module_builder::fresh_unresolved_lake_inputs_tag(
+            "base-lake-inputs-changed-conservative",
+        ));
+    }
 
     // A changed input reconfigures *every* module (the deliberate over-approximation documented
     // on `lake_input_files_changed_since_base`), so it widens this set instead of filtering it.
@@ -2302,9 +2758,13 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                 let rel = rel_path_from_dir(p, canon_dir);
                 let repo_rel = join_proj_prefix(&proj_prefix, &rel);
                 if let Some(bs) = fetched_blobs.get(&repo_rel) {
-                    let dep_hashes = crate::lake_build::compute_imported_olean_interface_hashes(
-                        bs, canon_dir, None,
-                    );
+                    let dep_hashes =
+                        crate::lake_build::compute_imported_olean_interface_hashes_with_tag(
+                            bs,
+                            canon_dir,
+                            None,
+                            base_lake_inputs_tag.clone(),
+                        );
                     let sp = split_lean_source(bs, &dep_hashes);
                     let head_stat = if !changed_repo_paths.contains(&repo_rel) {
                         stable_file_stat_for_head(p)
@@ -2370,7 +2830,12 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
             } = entry
             {
                 let dep_hashes =
-                    crate::lake_build::compute_imported_olean_interface_hashes(bs, canon_dir, None);
+                    crate::lake_build::compute_imported_olean_interface_hashes_with_tag(
+                        bs,
+                        canon_dir,
+                        None,
+                        base_lake_inputs_tag.clone(),
+                    );
                 let sb = blake3::hash(bs.as_bytes()).to_hex().to_string();
                 base_split_keys.push(crate::lake_build::compute_file_split_key_with_deps(
                     &sb,
@@ -2387,33 +2852,44 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
         std::collections::HashMap::new()
     };
 
-    let mut resolve_cached_or_split =
-        |src: &str, strict_untrusted_imports: bool| -> Result<splitter::SplitResult> {
-            if is_untrusted {
-                let dep_hashes = compute_source_only_import_digests(
-                    src,
-                    canon_dir,
-                    untrusted_cfg,
-                    strict_untrusted_imports,
-                )?;
-                return Ok(split_lean_source(src, &dep_hashes));
-            }
-            let dep_hashes =
-                crate::lake_build::compute_imported_olean_interface_hashes(src, canon_dir, None);
-            let sb = blake3::hash(src.as_bytes()).to_hex().to_string();
-            let fk = crate::lake_build::compute_file_split_key_with_deps(&sb, &dep_hashes);
-            if let Some(sp) = cached_base_splits.remove(&fk) {
+    let mut resolve_cached_or_split = |src: &str,
+                                       strict_untrusted_imports: bool,
+                                       is_base_src: bool|
+     -> Result<splitter::SplitResult> {
+        if is_untrusted {
+            let dep_hashes = compute_source_only_import_digests_with_tag_override(
+                src,
+                canon_dir,
+                untrusted_cfg,
+                strict_untrusted_imports,
+                is_base_src.then(|| base_lake_inputs_tag.clone()),
+            )?;
+            return Ok(split_lean_source(src, &dep_hashes));
+        }
+        let dep_hashes = if is_base_src {
+            crate::lake_build::compute_imported_olean_interface_hashes_with_tag(
+                src,
+                canon_dir,
+                None,
+                base_lake_inputs_tag.clone(),
+            )
+        } else {
+            crate::lake_build::compute_imported_olean_interface_hashes(src, canon_dir, None)
+        };
+        let sb = blake3::hash(src.as_bytes()).to_hex().to_string();
+        let fk = crate::lake_build::compute_file_split_key_with_deps(&sb, &dep_hashes);
+        if let Some(sp) = cached_base_splits.remove(&fk) {
+            return Ok(sp);
+        }
+        if let Ok(mut map) = store.batch_get_file_splits(std::slice::from_ref(&fk)) {
+            if let Some(sp) = map.remove(&fk) {
                 return Ok(sp);
             }
-            if let Ok(mut map) = store.batch_get_file_splits(std::slice::from_ref(&fk)) {
-                if let Some(sp) = map.remove(&fk) {
-                    return Ok(sp);
-                }
-            }
-            let sp = split_lean_source(src, &dep_hashes);
-            let _ = store.batch_put_file_splits(&[(fk, &sp)]);
-            Ok(sp)
-        };
+        }
+        let sp = split_lean_source(src, &dep_hashes);
+        let _ = store.batch_put_file_splits(&[(fk, &sp)]);
+        Ok(sp)
+    };
 
     let mut accum = PrClassificationAccum::new(toolchain, current_files_count);
     for rel_path in all_paths {
@@ -2431,7 +2907,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
             } if base_src == cur_src && !option_changed_paths.contains(&rel_path) => {
                 let split = match cur_split {
                     Some(sp) => sp,
-                    None => resolve_cached_or_split(&cur_src, true)?,
+                    None => resolve_cached_or_split(&cur_src, true, false)?,
                 };
                 accum.record_unchanged(rel_path, split.interface_hash, &split.shards);
             }
@@ -2444,10 +2920,10 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                 let base_lean_args = resolve_base_lean_args(&rel_path);
                 let cur_split = match cur_split {
                     Some(sp) => sp,
-                    None => resolve_cached_or_split(&cur_src, true)?,
+                    None => resolve_cached_or_split(&cur_src, true, false)?,
                 };
                 changed_current_splits.insert(rel_path.clone(), cur_split.clone());
-                let base_split = resolve_cached_or_split(&base_src, false)?;
+                let base_split = resolve_cached_or_split(&base_src, false, true)?;
                 accum.record_modified(
                     rel_path,
                     &base_split.interface_hash,
@@ -2466,7 +2942,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                 let file_lean_args = resolve_rel_lean_args(&rel_path);
                 let cur_split = match cur_split {
                     Some(sp) => sp,
-                    None => resolve_cached_or_split(&cur_src, true)?,
+                    None => resolve_cached_or_split(&cur_src, true, false)?,
                 };
                 changed_current_splits.insert(rel_path.clone(), cur_split.clone());
                 accum.record_added(rel_path, cur_split, &file_lean_args);
@@ -2476,7 +2952,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                 cur_src: None,
                 cur_split: _,
             } => {
-                let base_split = resolve_cached_or_split(&base_src, false)?;
+                let base_split = resolve_cached_or_split(&base_src, false, true)?;
                 accum.record_deleted(rel_path, &base_split.interface_hash, &base_split.shards);
             }
             PrFileEntry::Changed {
@@ -9030,6 +9506,355 @@ end Fixture
                     }
                 }
             }
+
+            Ok(())
+        })();
+
+        restore_env(&saved_staging, &saved_cache);
+        let _ = fs::remove_dir_all(&tmp_dir);
+        res
+    }
+
+    /// Round-5 regression suite covering:
+    /// - Finding 1 ([P0]): `try_stateless_remote_check` refreshes stale imported `.olean`s on
+    ///   Lake `input_dir` edits and fails closed (`Err`) on unsupported/missing Lake inputs.
+    /// - Finding 2 ([P1]): `check` refreshes reverse dependents (`Downstream` `.olean`) after
+    ///   an `input_dir` edit and after a directory-scoped `check <subdir>` nonlocal edit.
+    /// - Finding 3 ([P1]): `evaluate_agent_step_value(..., project_dir = None)` walks up via
+    ///   `find_project_root` from nested `Smoke/B.lean`, refreshes stale `Smoke.A`, and fails closed.
+    /// - Finding 4 ([P2]): `pr-verify --base` resolves historical `input_file` / `input_dir`
+    ///   from git at `--base` (including when a base `input_file` was deleted/renamed in HEAD
+    ///   and when an `input_dir` edit leaves `.lean` sources byte-identical).
+    #[test]
+    fn test_round5_stateless_remote_reverse_deps_nested_agent_step_and_base_inputs() -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let saved_staging = std::env::var("TURBO_LEAN_STAGING_DIR").ok();
+        let saved_cache = std::env::var("TURBO_LEAN_CACHE_DIR").ok();
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_round5_lake_inputs_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let staging_dir = tmp_dir.join("staging");
+        let cache_dir = tmp_dir.join("store");
+        let remote_srv_dir = tmp_dir.join("remote_srv");
+        fs::create_dir_all(&staging_dir)?;
+        std::env::set_var("TURBO_LEAN_STAGING_DIR", &staging_dir);
+        std::env::set_var("TURBO_LEAN_CACHE_DIR", &cache_dir);
+
+        let restore_env = |saved_staging: &Option<String>, saved_cache: &Option<String>| {
+            match saved_staging {
+                Some(v) => std::env::set_var("TURBO_LEAN_STAGING_DIR", v),
+                None => std::env::remove_var("TURBO_LEAN_STAGING_DIR"),
+            }
+            match saved_cache {
+                Some(v) => std::env::set_var("TURBO_LEAN_CACHE_DIR", v),
+                None => std::env::remove_var("TURBO_LEAN_CACHE_DIR"),
+            }
+        };
+
+        let res = (|| -> Result<()> {
+            let repo_dir = tmp_dir.join("repo");
+            fs::create_dir_all(repo_dir.join("Smoke"))?;
+            fs::create_dir_all(repo_dir.join("Data"))?;
+            fs::write(
+                repo_dir.join("lean-toolchain"),
+                include_str!("../../../lean/lean-toolchain"),
+            )?;
+
+            let split_lib_lakefile = "import Lake\nopen Lake DSL\npackage demo\ninput_dir smokeSources where\n  path := \"Data\"\n  filter := .extension \"sol\"\n  text := true\n@[default_target]\nlean_lib Smoke where\n  globs := #[.one `Smoke.A]\n  needs := #[smokeSources]\n@[default_target]\nlean_lib Downstream where\n  globs := #[.one `Smoke.B]\n";
+            fs::write(repo_dir.join("lakefile.lean"), split_lib_lakefile)?;
+
+            let v1 = "contract A {}\n";
+            let v2 = "contract AMuchLonger {}\n";
+            fs::write(repo_dir.join("Data/a.sol"), v1)?;
+            fs::write(
+                repo_dir.join("Smoke/A.lean"),
+                "def solText : String := include_str \"../Data/a.sol\"\n",
+            )?;
+            fs::write(
+                    repo_dir.join("Smoke/B.lean"),
+                    format!(
+                        "import Smoke.A\ntheorem useLen1 : solText.length = {} := by rfl\ntheorem useLen2 : solText.length + 0 = {} := by rfl\n",
+                        v1.len(),
+                        v1.len()
+                    ),
+                )?;
+
+            if crate::module_builder::resolve_project_config(&repo_dir).is_err() {
+                return Ok(());
+            }
+
+            git_init_and_commit(&repo_dir, "base")?;
+            let canon_repo = fs::canonicalize(&repo_dir)?;
+            let mut store = TurboStore::open(Some(&cache_dir))?;
+            let _ = TurboStore::open(Some(&remote_srv_dir))?;
+            let remote_url = format!(
+                "http://{}",
+                crate::pack::tests::spawn_test_server(&remote_srv_dir)?
+            );
+
+            // Warm build on v1.
+            crate::module_builder::reset_lake_inputs_tag_memo();
+            crate::lake_build::run_build_command(
+                &mut store,
+                true,
+                Vec::new(),
+                canon_repo.clone(),
+                "trusted".to_string(),
+                0,
+                false,
+            )?;
+            let file_a = canon_repo.join("Smoke/A.lean");
+            let file_b = canon_repo.join("Smoke/B.lean");
+            let olean_b = canon_repo.join(".lake/build/lib/lean/Smoke/B.olean");
+            assert!(
+                olean_b.is_file(),
+                "Smoke/B.olean must exist after initial build"
+            );
+
+            // Warm stateless remote check on v1.
+            let remote_v1_ok = crate::check::try_stateless_remote_check(
+                &cache_dir,
+                true,
+                &file_b,
+                None,
+                &canon_repo,
+                Some(2),
+                &remote_url,
+            )?;
+            assert!(
+                remote_v1_ok,
+                "try_stateless_remote_check should verify eligible file on consistent v1 inputs"
+            );
+
+            // Finding 1 ([P0]) & Finding 3 ([P1]): Edit `Data/a.sol` -> `v2` while `Smoke/B.lean`
+            // still expects `v1.len()`.
+            // - `try_stateless_remote_check` must refresh `Smoke.A` and NOT return `Ok(true)`!
+            // - `evaluate_agent_step_value(..., None, ...)` (omitted `--project-dir` on nested
+            //   `Smoke/B.lean`) must discover `canon_repo`, refresh `Smoke.A`, and reject!
+            fs::write(canon_repo.join("Data/a.sol"), v2)?;
+            let remote_v2_res = crate::check::try_stateless_remote_check(
+                &cache_dir,
+                true,
+                &file_b,
+                None,
+                &canon_repo,
+                Some(2),
+                &remote_url,
+            );
+            assert!(
+                    !matches!(remote_v2_res, Ok(true)),
+                    "try_stateless_remote_check must never report false green against stale Smoke/A.olean after input_dir edit: {remote_v2_res:?}"
+                );
+            let remote_single_v2_res = crate::check::try_stateless_remote_check(
+                &cache_dir,
+                true,
+                &file_b,
+                Some("useLen1"),
+                &canon_repo,
+                Some(1),
+                &remote_url,
+            );
+            assert!(
+                    !matches!(remote_single_v2_res, Ok(true)),
+                    "try_stateless_remote_check (--decl) must never report false green after input_dir edit: {remote_single_v2_res:?}"
+                );
+
+            let nested_step_res = crate::gpu_fastcheck::evaluate_agent_step_value(
+                &mut store, &file_b, None, None, false, false,
+            );
+            let nested_step_green = nested_step_res
+                .as_ref()
+                .is_ok_and(|v| v["verified"] == serde_json::json!(true));
+            assert!(
+                    !nested_step_green,
+                    "agent-step with project_dir=None on nested Smoke/B.lean must walk up to project root, refresh Smoke.A, and reject stale theorem: {nested_step_res:?}"
+                );
+
+            // Finding 2a ([P1]): Update `Smoke/B.lean` to match `v2.len()`, then run
+            // `check Smoke/A.lean`. Because `Data/a.sol` changed since the build manifest,
+            // `recheck_dependents_if_nonlocal` must rebuild reverse dependent `Smoke/B.olean`!
+            let olean_b_v1_bytes = fs::read(&olean_b)?;
+            fs::write(
+                    &file_b,
+                    format!(
+                        "import Smoke.A\ntheorem useLen1 : solText.length = {} := by rfl\ntheorem useLen2 : solText.length + 0 = {} := by rfl\n",
+                        v2.len(),
+                        v2.len()
+                    ),
+                )?;
+            crate::check::run_check_command(
+                &mut store,
+                false,
+                true,
+                file_a.clone(),
+                None,
+                canon_repo.clone(),
+                None,
+                false,
+                None,
+            )?;
+            assert_ne!(
+                    fs::read(&olean_b)?,
+                    olean_b_v1_bytes,
+                    "checking Smoke/A.lean after input_dir edit must rebuild reverse-dependent Smoke/B.olean"
+                );
+
+            // Finding 2b ([P1]): Commit the consistent `v2` state, build warm, then make a
+            // nonlocal declaration edit in `Smoke/A.lean` that breaks `Smoke/B.lean`, and run
+            // directory-scoped `check Smoke` (only `Smoke/A.lean` is inside `Smoke/` if we move
+            // `B` to `Other/C.lean`).
+            fs::create_dir_all(canon_repo.join("Other"))?;
+            fs::write(
+                canon_repo.join("Other/C.lean"),
+                format!(
+                    "import Smoke.A\ntheorem downstreamC : solText.length = {} := by rfl\n",
+                    v2.len()
+                ),
+            )?;
+            let subdir_lakefile = "import Lake\nopen Lake DSL\npackage demo\ninput_dir smokeSources where\n  path := \"Data\"\n  filter := .extension \"sol\"\n  text := true\n@[default_target]\nlean_lib Smoke where\n  globs := #[.one `Smoke.A]\n  needs := #[smokeSources]\n@[default_target]\nlean_lib Downstream where\n  globs := #[.one `Smoke.B, .one `Other.C]\n";
+            fs::write(canon_repo.join("lakefile.lean"), subdir_lakefile)?;
+            let git_bin = crate::trusted_tools::git(&canon_repo)?;
+            let _ = git_bin;
+            let run_git = |args: &[&str]| -> Result<()> {
+                let mut c = crate::trusted_tools::git(&canon_repo)?;
+                let out = c.args(args).current_dir(&canon_repo).output()?;
+                anyhow::ensure!(
+                    out.status.success(),
+                    "git {:?} failed: {}",
+                    args,
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                Ok(())
+            };
+            run_git(&["add", "-A"])?;
+            run_git(&["commit", "-m", "v2-with-other-c"])?;
+            crate::module_builder::reset_lake_inputs_tag_memo();
+            crate::lake_build::run_build_command(
+                &mut store,
+                true,
+                Vec::new(),
+                canon_repo.clone(),
+                "trusted".to_string(),
+                0,
+                false,
+            )?;
+
+            // Nonlocal edit in `Smoke/A.lean` (redefines `solText` to `"x"`), breaking `Other/C.lean`.
+            // Directory-scoped `check Smoke` must invoke `recheck_dependents_if_nonlocal` and fail!
+            fs::write(&file_a, "def solText : String := \"x\"\n")?;
+            assert!(
+                    crate::check::run_check_command(
+                        &mut store,
+                        false,
+                        true,
+                        canon_repo.join("Smoke"),
+                        None,
+                        canon_repo.clone(),
+                        None,
+                        false,
+                        None,
+                    )
+                    .is_err(),
+                    "directory-scoped `check Smoke` must recheck reverse dependents (Other/C.lean) on nonlocal edit in Smoke/A.lean"
+                );
+            // Restore `Smoke/A.lean` to HEAD.
+            run_git(&["checkout", "--", "Smoke/A.lean"])?;
+
+            // Finding 4 ([P2]) Case A: Pure `Data/a.sol` edit (`v2` -> `v1`) with `.lean` files
+            // untouched since HEAD (`v2`). `pr-verify --base HEAD` must fail closed because
+            // `Smoke/B.lean` & `Other/C.lean` assert `v2.len()`, not `v1.len()`!
+            fs::write(canon_repo.join("Data/a.sol"), v1)?;
+            assert!(
+                    run_pr_verify_command(
+                        &mut store,
+                        true,
+                        canon_repo.clone(),
+                        "HEAD".to_string(),
+                        "trusted".to_string(),
+                        false,
+                        None,
+                        None,
+                        None,
+                        None,
+                        false,
+                        0,
+                        None,
+                    )
+                    .is_err(),
+                    "pr-verify --base HEAD must re-verify unchanged .lean files and fail when Data/a.sol edit breaks theorem"
+                );
+
+            // Finding 4 ([P2]) Case B: Base commit declares `input_file oldInput` (`Data/old.sol`),
+            // and PR commit renames it to `input_file newInput` (`Data/new.sol`) and deletes
+            // `Data/old.sol` from the working tree! `pr-verify --base HEAD~1` must read `Data/old.sol`
+            // from `--base`'s git tree instead of failing with missing `Data/old.sol` on disk!
+            fs::write(canon_repo.join("Data/a.sol"), v2)?;
+            fs::write(canon_repo.join("Data/old.sol"), "old_payload\n")?;
+            let base_input_file_lakefile = "import Lake\nopen Lake DSL\npackage demo\ninput_dir smokeSources where\n  path := \"Data\"\n  filter := .extension \"sol\"\n  text := true\ninput_file oldInput where\n  path := \"Data/old.sol\"\n  text := true\n@[default_target]\nlean_lib Smoke where\n  globs := #[.one `Smoke.A]\n  needs := #[smokeSources, oldInput]\n@[default_target]\nlean_lib Downstream where\n  globs := #[.one `Smoke.B, .one `Other.C]\n";
+            fs::write(canon_repo.join("lakefile.lean"), base_input_file_lakefile)?;
+            run_git(&["add", "-A"])?;
+            run_git(&["commit", "-m", "base-with-old-input-file"])?;
+
+            fs::remove_file(canon_repo.join("Data/old.sol"))?;
+            fs::write(canon_repo.join("Data/new.sol"), "new_payload\n")?;
+            let head_input_file_lakefile = "import Lake\nopen Lake DSL\npackage demo\ninput_dir smokeSources where\n  path := \"Data\"\n  filter := .extension \"sol\"\n  text := true\ninput_file newInput where\n  path := \"Data/new.sol\"\n  text := true\n@[default_target]\nlean_lib Smoke where\n  globs := #[.one `Smoke.A]\n  needs := #[smokeSources, newInput]\n@[default_target]\nlean_lib Downstream where\n  globs := #[.one `Smoke.B, .one `Other.C]\n";
+            fs::write(canon_repo.join("lakefile.lean"), head_input_file_lakefile)?;
+            run_git(&["add", "-A"])?;
+            run_git(&["commit", "-m", "rename-old-input-file-to-new"])?;
+
+            run_pr_verify_command(
+                &mut store,
+                true,
+                canon_repo.clone(),
+                "HEAD~1".to_string(),
+                "trusted".to_string(),
+                false,
+                None,
+                None,
+                None,
+                None,
+                false,
+                0,
+                None,
+            )
+            .context(
+                "pr-verify --base HEAD~1 must resolve deleted base input_file from git tree",
+            )?;
+
+            // Finding 1 ([P0]) & Finding 3 ([P1]) fail-closed check on unsupported Lake input:
+            let bad_lakefile = "import Lake\nopen Lake DSL\npackage demo\ninput_dir smokeSources where\n  path := \"Data\"\n  filter := .text\n@[default_target]\nlean_lib Smoke where\n  globs := #[.one `Smoke.A]\n  needs := #[smokeSources]\n";
+            fs::write(canon_repo.join("lakefile.lean"), bad_lakefile)?;
+            assert!(
+                crate::check::try_stateless_remote_check(
+                    &cache_dir,
+                    true,
+                    &file_b,
+                    None,
+                    &canon_repo,
+                    Some(2),
+                    &remote_url,
+                )
+                .is_err(),
+                "try_stateless_remote_check must propagate Err on unsupported filter := .text"
+            );
+            assert!(
+                    crate::gpu_fastcheck::evaluate_agent_step_value(
+                        &mut store,
+                        &file_b,
+                        None,
+                        None,
+                        false,
+                        false,
+                    )
+                    .is_err(),
+                    "evaluate_agent_step_value(..., project_dir=None) must propagate Err on unsupported filter := .text"
+                );
 
             Ok(())
         })();

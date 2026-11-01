@@ -951,6 +951,15 @@ pub fn compute_imported_olean_interface_hashes(
     lean_path: Option<&str>,
 ) -> Vec<String> {
     let lake_inputs_tag = crate::module_builder::project_lake_inputs_tag(project_dir);
+    compute_imported_olean_interface_hashes_with_tag(src, project_dir, lean_path, lake_inputs_tag)
+}
+
+pub(crate) fn compute_imported_olean_interface_hashes_with_tag(
+    src: &str,
+    project_dir: &Path,
+    lean_path: Option<&str>,
+    lake_inputs_tag: Option<String>,
+) -> Vec<String> {
     let mut worklist = parse_header_imports(src);
     if worklist.is_empty() {
         return lake_inputs_tag.into_iter().collect();
@@ -2880,11 +2889,69 @@ pub(crate) fn recheck_dependents_if_nonlocal(canon_dir: &Path, target: &Path) ->
             input_libs.sort();
             input_libs.dedup();
             if !input_libs.is_empty() && has_lake_config(&dir) {
+                let mut seeds: Vec<String> =
+                    cfg.root_pkg.libs.iter().map(|l| l.name.clone()).collect();
+                for exe in &cfg.root_pkg.exes {
+                    let root_mod = exe.root.trim();
+                    let exe_seed = if !root_mod.is_empty() {
+                        root_mod.to_string()
+                    } else {
+                        exe.name.clone()
+                    };
+                    if !seeds.contains(&exe_seed) {
+                        seeds.push(exe_seed);
+                    }
+                }
+                seeds.extend(input_libs.iter().cloned());
+                seeds.sort();
+                seeds.dedup();
+
+                let mut targets = input_libs.clone();
+                if let Ok(dag) =
+                    crate::module_builder::build_module_dag_with_trust(&cfg, &seeds, false)
+                {
+                    let mut closure: std::collections::BTreeSet<String> = dag
+                        .nodes
+                        .keys()
+                        .filter(|m| {
+                            !crate::module_builder::input_bearing_libs_for_module(&cfg, m)
+                                .is_empty()
+                        })
+                        .cloned()
+                        .collect();
+                    let mut changed = !closure.is_empty();
+                    while changed {
+                        changed = false;
+                        for (m, n) in &dag.nodes {
+                            if !closure.contains(m)
+                                && n.direct_dag_deps.iter().any(|d| closure.contains(d))
+                            {
+                                closure.insert(m.clone());
+                                changed = true;
+                            }
+                        }
+                    }
+                    let closure_vec: Vec<String> = closure.into_iter().collect();
+                    targets.extend(lake_refresh_targets(&dir, &closure_vec));
+                } else {
+                    targets.extend(seeds);
+                }
+                targets.sort();
+                targets.dedup();
+
                 eprintln!(
-                    "[turbo-lean] Lake file inputs changed: re-checking input-bearing libraries ({}) with Lake",
-                    input_libs.join(", ")
+                    "[turbo-lean] Lake file inputs changed: re-checking input-bearing libraries and dependents ({}) with Lake",
+                    targets.join(", ")
                 );
-                lake_build_modules(&dir, &input_libs, None)?;
+                lake_build_modules(&dir, &targets, None)?;
+                let _ = fs::remove_file(verified_sources_manifest_path(&dir));
+                for dp in &cfg.dep_pkgs {
+                    let _ = fs::remove_file(
+                        dp.pkg_root
+                            .join(&dp.build_dir)
+                            .join(".turbo_verified_sources.json"),
+                    );
+                }
             }
         }
     }
@@ -3848,7 +3915,10 @@ mod tests {
                 .env("PATH", &bin)
                 .env("HOME", tree.root.join("isolated/a/b/home"))
                 // Register the installed toolchain explicitly; verification never trusts PATH discovery.
-                .env("ELAN_HOME", lean.ancestors().nth(4).expect("installed Elan toolchain"))
+                .env(
+                    "ELAN_HOME",
+                    lean.ancestors().nth(4).expect("installed Elan toolchain"),
+                )
                 .env("TURBO_LEAN_HOME", tree.root.join("cache"))
                 .env("TURBO_LEAN_STAGING_DIR", tree.root.join("staging"))
                 .env("TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK", "0")

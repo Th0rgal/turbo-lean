@@ -4484,24 +4484,13 @@ fn resolve_agent_step_env_and_paths(
         .and_then(|s| s.parse().ok());
     let effective_low_memory = low_memory || max_memory_mb.is_some_and(|m| m <= 2048);
 
-    let inferred_proj_dir = project_dir.map(Path::to_path_buf).unwrap_or_else(|| {
-        let start_dir = if file.is_dir() {
-            file.to_path_buf()
-        } else {
-            file.parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf()
-        };
-        let canon_start = start_dir.canonicalize().unwrap_or(start_dir);
-        canon_start
-            .ancestors()
-            .find(|p| p.join("lean-toolchain").exists() || p.join("lakefile.lean").exists())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."))
-    });
-    let canon_dir = inferred_proj_dir
-        .canonicalize()
-        .unwrap_or_else(|_| inferred_proj_dir);
+    let inferred_proj_dir = project_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| crate::lake_build::find_project_root(file));
+    let canon_dir = match inferred_proj_dir.canonicalize() {
+        Ok(p) => p,
+        Err(_) => inferred_proj_dir,
+    };
     let resolved_file = if file.exists() {
         file.to_path_buf()
     } else if canon_dir.join(file).exists() {
@@ -4714,6 +4703,7 @@ pub fn evaluate_agent_step_value(
     use_tpu: bool,
 ) -> Result<serde_json::Value> {
     let t0 = Instant::now();
+    crate::module_builder::reset_lake_inputs_tag_memo();
     let (max_memory_mb, effective_low_memory, canon_dir, resolved_file) =
         resolve_agent_step_env_and_paths(file, project_dir, low_memory, use_tpu);
 

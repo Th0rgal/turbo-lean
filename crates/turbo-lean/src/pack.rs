@@ -2605,7 +2605,11 @@ fn http_request_with_resolved_token(
     let mut reader = BufReader::new(stream);
     let mut status_line = String::with_capacity(64);
     if reader.read_line(&mut status_line)? == 0 {
-        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "EOF before HTTP response").into());
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "EOF before HTTP response",
+        )
+        .into());
     }
     let mut content_len: Option<usize> = None;
     let mut header_sha256: Option<String> = None;
@@ -3337,7 +3341,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    fn spawn_test_server(dir_server: &Path) -> Result<String> {
+    pub(crate) fn spawn_test_server(dir_server: &Path) -> Result<String> {
         let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
         let (srv_dir, addr) = (dir_server.to_path_buf(), format!("127.0.0.1:{}", port));
         let addr_clone = addr.clone();
