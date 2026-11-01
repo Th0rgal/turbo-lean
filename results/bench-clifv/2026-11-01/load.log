@@ -644,3 +644,22 @@ Swap:          9.3Gi       384Mi       8.9Gi
   97870 orbnode   1.3  0.2 157356 lake
     347 root      0.9  0.0  2536 ssh
 
+=== 2026-11-01T15:52:28Z [DURING-20m] ===
+ 15:52:28 up 137 days,  8:33,  0 user,  load average: 8.01, 8.65, 8.45
+cgroup_mem_bytes=27892547584 / 64560824320
+               total        used        free      shared  buff/cache   available
+Mem:            62Gi        18Gi        33Gi       472Ki        10Gi        43Gi
+Swap:          9.3Gi       384Mi       8.9Gi
+    PID USER     %CPU %MEM   RSS COMMAND
+ 134192 orbnode   325  3.4 2266776 lean
+ 114678 orbnode   119  6.6 4338348 lean
+ 133611 orbnode   119  3.5 2336080 lean
+ 130442 orbnode   100  8.1 5323976 lean
+ 124372 orbnode   100  6.8 4472816 lean
+ 133010 orbnode   100  7.1 4713436 lean
+   5465 orbnode  14.3  0.0 25260 sandboxed-node
+   6531 orbnode   5.1  0.6 400368 opencode
+   6549 orbnode   2.8  0.0 13984 sandboxed-mcp
+  97870 orbnode   1.3  0.2 159376 lake
+    347 root      0.8  0.0  2536 ssh
+
