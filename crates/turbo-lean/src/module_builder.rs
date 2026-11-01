@@ -7092,6 +7092,24 @@ pub fn build_module_dag_with_trust(
                 },
             );
         }
+        let mut native_stack: Vec<String> = explicit_dynlib_mods.iter().cloned().collect();
+        while let Some(m) = native_stack.pop() {
+            let Some(node) = nodes.get(&m) else {
+                continue;
+            };
+            for dep in &node.direct_dag_deps {
+                if let Some(dn) = nodes.get(dep) {
+                    if !dn.is_exe_target
+                        && !node.is_exe_target
+                        && dn.pkg_name == node.pkg_name
+                        && dn.target_name == node.target_name
+                        && explicit_dynlib_mods.insert(dep.clone())
+                    {
+                        native_stack.push(dep.clone());
+                    }
+                }
+            }
+        }
         let mut discovered_new_shared = false;
         let snapshot_nodes: Vec<(String, String, String, bool, Vec<String>)> = nodes
             .values()
@@ -7108,9 +7126,33 @@ pub fn build_module_dag_with_trust(
         // Any module transitively reachable from a `precompile_modules` node in `nodes`
         // whose library differs from that importer's library causes that library's shared `.so`
         // (and any cross-library imports of `requested_shared_libs` local modules) to be built by Lake.
-        for (_, imp_pkg, imp_target, imp_precomp, imp_deps) in &snapshot_nodes {
+        for (imp_mod, imp_pkg, imp_target, imp_precomp, imp_deps) in &snapshot_nodes {
+            let explicit_dynlib = explicit_dynlib_mods.contains(imp_mod);
             let importer_is_in_shared =
                 requested_shared_libs.contains(&(imp_pkg.clone(), imp_target.clone()));
+            if explicit_dynlib {
+                for dm in imp_deps {
+                    if let Some(dn) = nodes.get(dm) {
+                        if !dn.is_exe_target
+                            && (dn.pkg_name != *imp_pkg || dn.target_name != *imp_target)
+                        {
+                            let key = (dn.pkg_name.clone(), dn.target_name.clone());
+                            if !expanded_shared_libs.contains(&key) {
+                                let is_root = dn.pkg_name == root_pkg.name;
+                                enqueue_shared_lib_mods(
+                                    &dn.pkg_name,
+                                    &dn.target_name,
+                                    is_root,
+                                    &mut expanded_shared_libs,
+                                    &mut requested_shared_libs,
+                                    &mut worklist,
+                                )?;
+                                discovered_new_shared = true;
+                            }
+                        }
+                    }
+                }
+            }
             let mut visited_t: HashSet<String> = HashSet::new();
             let mut stack_t: Vec<String> = imp_deps.clone();
             while let Some(dm) = stack_t.pop() {
@@ -7393,7 +7435,11 @@ pub fn build_module_dag_with_trust(
             if dn.pkg_name == node.pkg_name && dn.target_name == node.target_name {
                 continue;
             }
-            if !(node.precompile_modules || dn.precompile_modules || node_in_shared)
+            let is_direct_dep = node.direct_dag_deps.iter().any(|d| d == &dep_mod);
+            if !(node.precompile_modules
+                || dn.precompile_modules
+                || node_in_shared
+                || (node.needs_dynlib && is_direct_dep))
                 || dn.is_exe_target
             {
                 continue;
@@ -14205,6 +14251,116 @@ globs = ["Down.+"]
                 assert_eq!(
                     ours_native_rsps[idx], lake_rsp,
                     "native shared-lib .rsp mismatch vs Lake on {rel}"
+                );
+            }
+
+            let dyn_proj = dir.join("ws9_explicit_dynlib");
+            fs::create_dir_all(dyn_proj.join("Supp")).unwrap();
+            fs::create_dir_all(dyn_proj.join("Demo")).unwrap();
+            fs::write(
+                dyn_proj.join("lean-toolchain"),
+                "leanprover/lean4:v4.35.0\n",
+            )
+            .unwrap();
+            fs::write(
+                dyn_proj.join("lakefile.toml"),
+                r#"name = "ws9_dyn"
+precompileModules = false
+defaultTargets = ["Demo"]
+[[lean_lib]]
+name = "Supp"
+roots = ["Supp.Core", "Supp.Extra"]
+globs = ["Supp.+"]
+[[lean_lib]]
+name = "Demo"
+roots = ["Demo.Top"]
+globs = ["Demo.+"]
+"#,
+            )
+            .unwrap();
+            fs::write(dyn_proj.join("Supp/Core.lean"), "def suppCore : Nat := 5\n").unwrap();
+            fs::write(
+                dyn_proj.join("Supp/Extra.lean"),
+                "import Supp.Core\ndef suppExtra : Nat := suppCore + 1\n",
+            )
+            .unwrap();
+            fs::write(
+                dyn_proj.join("Demo/Base.lean"),
+                "def demoBase : Nat := 11\n",
+            )
+            .unwrap();
+            fs::write(
+                dyn_proj.join("Demo/Top.lean"),
+                "import Supp.Core\nimport Demo.Base\ndef demoTop : Nat := suppCore + demoBase\n",
+            )
+            .unwrap();
+            build_project_modules_native(
+                &mut store,
+                &dyn_proj,
+                &["+Demo.Top:dynlib".to_string()],
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap();
+            let sh_prefix = if tc_spec.is_windows { "" } else { "lib" };
+            let dyn_facet_paths = [
+                format!(".lake/build/lib/{sh_prefix}ws9__dyn_Supp.{sh_ext}"),
+                format!(".lake/build/lib/lean/ws9__dyn_Demo_Base.{sh_ext}"),
+                format!(".lake/build/lib/lean/ws9__dyn_Demo_Top.{sh_ext}"),
+            ];
+            let ours_dyn_traces: Vec<serde_json::Value> = dyn_facet_paths
+                .iter()
+                .map(|rel| {
+                    serde_json::from_slice(
+                        &fs::read(dyn_proj.join(format!("{rel}.trace"))).unwrap(),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let ours_dyn_rsps: Vec<String> = dyn_facet_paths
+                .iter()
+                .map(|rel| fs::read_to_string(dyn_proj.join(format!("{rel}.rsp"))).unwrap())
+                .collect();
+            let dyn_no_build = Command::new(&lake_bin)
+                .args(["build", "+Demo.Top:dynlib", "--no-build"])
+                .env("SANDBOXED_ALLOW_RAW_LAKE", "1")
+                .env("LAKE_CACHE_DIR", &lake_cache)
+                .current_dir(&dyn_proj)
+                .status()
+                .unwrap();
+            assert!(
+                dyn_no_build.success(),
+                "`lake build +Demo.Top:dynlib --no-build` must exit 0 on clean build with precompileModules = false"
+            );
+            fs::remove_dir_all(dyn_proj.join(".lake/build")).unwrap();
+            let clean_dyn_lake = Command::new(&lake_bin)
+                .args(["build", "+Demo.Top:dynlib"])
+                .env("SANDBOXED_ALLOW_RAW_LAKE", "1")
+                .env("LAKE_CACHE_DIR", &lake_cache)
+                .current_dir(&dyn_proj)
+                .status()
+                .unwrap();
+            assert!(clean_dyn_lake.success());
+            for (idx, rel) in dyn_facet_paths.iter().enumerate() {
+                let lake_trace: serde_json::Value = serde_json::from_slice(
+                    &fs::read(dyn_proj.join(format!("{rel}.trace"))).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    ours_dyn_traces[idx]["depHash"], lake_trace["depHash"],
+                    "explicit :dynlib depHash mismatch on {rel}"
+                );
+                assert_eq!(
+                    ours_dyn_traces[idx]["inputs"], lake_trace["inputs"],
+                    "explicit :dynlib inputs mismatch on {rel}"
+                );
+                let lake_rsp = fs::read_to_string(dyn_proj.join(format!("{rel}.rsp"))).unwrap();
+                assert_eq!(
+                    ours_dyn_rsps[idx], lake_rsp,
+                    "explicit :dynlib .rsp mismatch vs Lake on {rel}"
                 );
             }
         }
