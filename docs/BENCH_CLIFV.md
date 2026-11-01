@@ -175,3 +175,24 @@ python3 scripts/test_bench_clifv.py
 
 The self-test establishes runner/report behavior. Actual performance claims
 require a real pinned clifv run; this PR does not publish measurements.
+
+## Running it on Orb nodes
+
+Static Orb fleet nodes run missions and durable jobs inside cgroup memory caps
+(typically ~8 GiB per mission unless raised; even a 16 GiB job cap with
+`memory.high ≈ 14.4 GiB` and `swap = 0` throttled and aborted default
+8-process `lake build FV` primes on `clifv`, whose heavy modules reach 1–6 GiB
+RSS each). When running `scripts/bench_clifv.sh` on a capped node:
+
+- Bound parallelism by **available cgroup RAM**, not `nproc`: set both
+  `LEAN_NUM_THREADS` (controls Lake's concurrent `lean` jobs in Arm A and Arm B)
+  and `TURBO_LEAN_JOBS` / `TURBO_LEAN_MAX_MEMORY_MB` (controls `turbo-lean`
+  concurrency and memory governor in Arm B) identically before invoking the
+  runner (for example `LEAN_NUM_THREADS=3 TURBO_LEAN_JOBS=3
+  TURBO_LEAN_MAX_MEMORY_MB=14336` under a 16 GiB cap).
+- Unset node-injected remote-execution variables (`TURBO_LEAN_COMPUTE_NODES`,
+  `LEAN_NATIVE_COLAB_API_URL`, `LEAN_NATIVE_COLAB_TOKEN`) so Arm B executes
+  strictly locally on the benchmark host.
+- Shared multi-tenant nodes violate the idle-host requirement above; record
+  concurrent load snapshots alongside any diagnostic run, and rely on the 10%
+  CV gate to withhold ratios from noisy runs.
