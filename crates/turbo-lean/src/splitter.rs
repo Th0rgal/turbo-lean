@@ -574,8 +574,7 @@ fn scan_lean_block_comment_end(src: &str, start: usize) -> Option<(usize, bool)>
     if start + 1 >= bytes.len() || bytes[start] != b'/' || bytes[start + 1] != b'-' {
         return None;
     }
-    let is_doc = matches!(bytes.get(start + 2), Some(b'-' | b'!'))
-        && !matches!(bytes.get(start + 3), Some(b'-' | b'/'));
+    let is_doc = matches!(bytes.get(start + 2), Some(b'-' | b'!'));
     let mut i = start + if is_doc { 3 } else { 2 };
     let mut depth = 1usize;
     while i < bytes.len() && depth > 0 {
@@ -7153,10 +7152,49 @@ end MathlibEdgeCases
 
         let slash3_a = split_lean_source("/--- box a -/\ntheorem dt : True := trivial\n", &[]);
         let slash3_b = split_lean_source("/--- box b -/\ntheorem dt : True := trivial\n", &[]);
-        assert_eq!(
+        assert_ne!(
             slash3_a.shards[0].stmt_hash, slash3_b.shards[0].stmt_hash,
-            "`/--- ... -/` is a regular block comment in Lean 4, not a docstring"
+            "`/--- ... -/` is a 3-byte `/--` docstring opener in Lean 4"
         );
+
+        let doc_slash_a = split_lean_source("/--/ alpha -/\ntheorem dt : True := trivial\n", &[]);
+        let doc_slash_b = split_lean_source("/--/ beta -/\ntheorem dt : True := trivial\n", &[]);
+        assert_ne!(
+            doc_slash_a.shards[0].stmt_hash,
+            doc_slash_b.shards[0].stmt_hash
+        );
+
+        let doc_empty = split_lean_source("/---/\ntheorem dt : True := trivial\n", &[]);
+        assert_ne!(doc_empty.shards[0].stmt_hash, doc_none.shards[0].stmt_hash);
+
+        let doc_four_a = split_lean_source("/----\n alpha -/\ntheorem dt : True := trivial\n", &[]);
+        let doc_four_b = split_lean_source("/----\n beta -/\ntheorem dt : True := trivial\n", &[]);
+        assert_ne!(
+            doc_four_a.shards[0].stmt_hash,
+            doc_four_b.shards[0].stmt_hash
+        );
+
+        let mdoc_dash_a = split_lean_source("/-!- mod a -/\ntheorem dt : True := trivial\n", &[]);
+        let mdoc_dash_b = split_lean_source("/-!- mod b -/\ntheorem dt : True := trivial\n", &[]);
+        assert_ne!(
+            mdoc_dash_a.shards[0].prefix_env_hash,
+            mdoc_dash_b.shards[0].prefix_env_hash
+        );
+
+        let mdoc_slash_a = split_lean_source("/-!/ mod a -/\ntheorem dt : True := trivial\n", &[]);
+        let mdoc_slash_b = split_lean_source("/-!/ mod b -/\ntheorem dt : True := trivial\n", &[]);
+        assert_ne!(
+            mdoc_slash_a.shards[0].prefix_env_hash,
+            mdoc_slash_b.shards[0].prefix_env_hash
+        );
+
+        let doc_nested = split_lean_source(
+            "/--/- inner -/ theorem fake : False := sorry -/\ntheorem real_thm : True := trivial\n",
+            &[],
+        );
+        assert_eq!(doc_nested.shards.len(), 1);
+        assert_eq!(doc_nested.shards[0].name, "real_thm");
+        assert!(doc_nested.hygiene.is_clean_for_certification());
 
         let doc_fast_targets: std::collections::HashSet<String> =
             ["_root_.dt".to_string()].into_iter().collect();

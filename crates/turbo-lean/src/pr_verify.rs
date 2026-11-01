@@ -325,8 +325,8 @@ fn git_head_tree_cache_paths(
     toolchain: &str,
 ) -> (PathBuf, PathBuf) {
     let mut h = blake3::Hasher::new();
-    // v14: cached entries embed `theorem-shard-v6` keys and docstring/raw-string/guillemet split hashes.
-    h.update(b"git-head-tree:v14:");
+    // v15: cached entries embed `theorem-shard-v7` keys and 3-byte docstring/module-doc split hashes.
+    h.update(b"git-head-tree:v15:");
     h.update(repo_root.to_string_lossy().as_bytes());
     h.update(b":");
     h.update(canon_dir.to_string_lossy().as_bytes());
@@ -356,8 +356,8 @@ fn git_head_tree_cache_paths(
     let short_key = &key_hex[..24];
     let staging = store.fast_staging_dir();
     (
-        staging.join(format!("git_head_tree_v13_{}.json", short_key)),
-        staging.join(format!("git_head_tree_stats_v13_{}.json", short_key)),
+        staging.join(format!("git_head_tree_v15_{}.json", short_key)),
+        staging.join(format!("git_head_tree_stats_v15_{}.json", short_key)),
     )
 }
 

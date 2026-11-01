@@ -615,4 +615,115 @@ theorem verify_doc : True := doc_contains_first
         String::from_utf8_lossy(&bad_doc.stdout),
         String::from_utf8_lossy(&bad_doc.stderr)
     );
+
+    // 3. Round 10: 3-byte `/--` and `/-!` docstring/module-doc openers regardless of byte 4:
+    //    `/--- ... -/`, `/--/ ... -/`, `/--/- ... -/ ... -/` (sorry inside nested comment is not a live decl),
+    //    and `/-!- ... -/`.
+    for daemon in [false, true] {
+        let p_doc = Project::new(daemon);
+        let doc_edge_file = p_doc.0.join("DocEdge.lean");
+        fs::write(
+            &doc_edge_file,
+            r#"import Lean
+
+/-!- mod alpha -/
+
+/--- dash alpha -/
+theorem dash_doc : True := trivial
+
+/--/ slash alpha -/
+theorem slash_doc : True := trivial
+
+/--/- inner -/ theorem fake : False := sorry -/
+theorem after_nested : True := trivial
+
+open Lean Elab Term in
+elab "verify_edge_docs" : term => do
+  let env ← getEnv
+  let modDocs := (getMainModuleDoc env).toArray.map (·.doc)
+  if !modDocs.any (fun d => (d.splitOn "mod alpha").length >= 2) then
+    throwError s!"unexpected modDocs: {repr modDocs}"
+  let some d1 ← findDocString? env ``dash_doc | throwError "missing dash_doc docstring"
+  if (d1.splitOn "dash alpha").length < 2 then
+    throwError s!"unexpected dash_doc docstring: {d1}"
+  let some d2 ← findDocString? env ``slash_doc | throwError "missing slash_doc docstring"
+  if (d2.splitOn "slash alpha").length < 2 then
+    throwError s!"unexpected slash_doc docstring: {d2}"
+  if env.contains `fake then
+    throwError "nested comment `fake` leaked as live decl"
+  return mkConst ``True.intro
+
+theorem check_all_edge_docs : True := verify_edge_docs
+"#,
+        )
+        .unwrap();
+
+        let ok_edge_decl = p_doc.check("DocEdge.lean", "after_nested", daemon);
+        assert!(
+            ok_edge_decl.status.success()
+                && matches!(
+                    status(&ok_edge_decl).as_str(),
+                    "theorem_verified" | "theorem_cache_hit"
+                ),
+            "DocEdge.lean --decl after_nested (daemon={daemon}) must verify cleanly:\n{}{}",
+            String::from_utf8_lossy(&ok_edge_decl.stdout),
+            String::from_utf8_lossy(&ok_edge_decl.stderr)
+        );
+        assert_rejected(&p_doc, "DocEdge.lean", "fake", daemon);
+
+        let ok_edge_file = p_doc.run(&["check", "DocEdge.lean"], daemon);
+        assert!(
+            ok_edge_file.status.success()
+                && matches!(
+                    status(&ok_edge_file).as_str(),
+                    "file_verified" | "file_cache_hit"
+                ),
+            "DocEdge.lean whole-file check (daemon={daemon}) must verify cleanly:\n{}{}",
+            String::from_utf8_lossy(&ok_edge_file.stdout),
+            String::from_utf8_lossy(&ok_edge_file.stderr)
+        );
+
+        // Mutate `/--- dash alpha -/` -> `/--- dash beta -/`: must invalidate `check_all_edge_docs` CAS!
+        let base_edge = fs::read_to_string(&doc_edge_file).unwrap();
+        fs::write(
+            &doc_edge_file,
+            base_edge.replace("/--- dash alpha -/", "/--- dash beta -/"),
+        )
+        .unwrap();
+        let bad_dash = p_doc.run(&["check", "DocEdge.lean"], daemon);
+        assert!(
+            !bad_dash.status.success(),
+            "mutated `/--- ... -/` docstring (daemon={daemon}) must invalidate downstream CAS:\n{}{}",
+            String::from_utf8_lossy(&bad_dash.stdout),
+            String::from_utf8_lossy(&bad_dash.stderr)
+        );
+
+        // Mutate `/--/ slash alpha -/` -> `/--/ slash beta -/`: must invalidate `check_all_edge_docs` CAS!
+        fs::write(
+            &doc_edge_file,
+            base_edge.replace("/--/ slash alpha -/", "/--/ slash beta -/"),
+        )
+        .unwrap();
+        let bad_slash = p_doc.run(&["check", "DocEdge.lean"], daemon);
+        assert!(
+            !bad_slash.status.success(),
+            "mutated `/--/ ... -/` docstring (daemon={daemon}) must invalidate downstream CAS:\n{}{}",
+            String::from_utf8_lossy(&bad_slash.stdout),
+            String::from_utf8_lossy(&bad_slash.stderr)
+        );
+
+        // Mutate `/-!- mod alpha -/` -> `/-!- mod beta -/`: must invalidate `check_all_edge_docs` CAS!
+        fs::write(
+            &doc_edge_file,
+            base_edge.replace("/-!- mod alpha -/", "/-!- mod beta -/"),
+        )
+        .unwrap();
+        let bad_mod = p_doc.run(&["check", "DocEdge.lean"], daemon);
+        assert!(
+            !bad_mod.status.success(),
+            "mutated `/-!- ... -/` module doc (daemon={daemon}) must invalidate downstream CAS:\n{}{}",
+            String::from_utf8_lossy(&bad_mod.stdout),
+            String::from_utf8_lossy(&bad_mod.stderr)
+        );
+    }
 }

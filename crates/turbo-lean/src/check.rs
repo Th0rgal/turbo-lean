@@ -53,7 +53,7 @@ fn cache_shm_stat_split(
         let st_path = shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
         let src_b3 = blake3::hash(active_src.as_bytes()).to_hex().to_string();
         let entry = ShmCachedFileSplit {
-            split_key: format!("file-split:v6:{}", src_b3),
+            split_key: format!("file-split:v7:{}", src_b3),
             src_blake3: src_b3,
             split: compact_split_for_shm_cache(split),
             prefix_src: String::new(),
@@ -789,7 +789,7 @@ fn run_check_command_inner(
             let src_b3 = blake3::hash(loaded_src.as_bytes()).to_hex().to_string();
             if let Some((ref st_path, _)) = st_paths_opt {
                 let entry = ShmCachedFileSplit {
-                    split_key: format!("file-split:v6:{}", src_b3),
+                    split_key: format!("file-split:v7:{}", src_b3),
                     src_blake3: src_b3.clone(),
                     split: compact_split_for_shm_cache(&sp),
                     prefix_src: String::new(),
@@ -828,7 +828,7 @@ fn run_check_command_inner(
                     split_key: if src_b3.is_empty() {
                         String::new()
                     } else {
-                        format!("file-split:v6:{}", src_b3)
+                        format!("file-split:v7:{}", src_b3)
                     },
                     src_blake3: src_b3,
                     split: compact_split_for_shm_cache(&fast_res.0),
@@ -1508,7 +1508,7 @@ pub(crate) fn compute_fission_store_key_with_args(
     let mut base = if allowed.len() > splitter::STANDARD_AXIOMS.len() {
         let ax_hash = blake3::hash(allowed.join(",").as_bytes()).to_hex();
         format!(
-            "fission-v6:{}:{}:{}:ax:{}",
+            "fission-v7:{}:{}:{}:ax:{}",
             toolchain,
             prefix_env_hash,
             sub_shard_key,
@@ -1516,7 +1516,7 @@ pub(crate) fn compute_fission_store_key_with_args(
         )
     } else {
         format!(
-            "fission-v6:{}:{}:{}",
+            "fission-v7:{}:{}:{}",
             toolchain, prefix_env_hash, sub_shard_key
         )
     };
@@ -1645,7 +1645,7 @@ fn check_single_decl(
                         let st_path =
                             shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
                         let entry = ShmCachedFileSplit {
-                            split_key: format!("file-split:v6:{}", sub_b3),
+                            split_key: format!("file-split:v7:{}", sub_b3),
                             src_blake3: sub_b3.clone(),
                             split: compact_split_for_shm_cache(&sub_split),
                             prefix_src: if sub_src.len() <= 64 * 1024 {
