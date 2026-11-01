@@ -2547,13 +2547,17 @@ pub(crate) fn seed_project_theorem_shards_from_splits(
     let mut files_seeded = 0usize;
     let mut batch_items: Vec<(String, String, Vec<u8>, i64)> = Vec::new();
 
+    let seedable = |split: &splitter::SplitResult, shard: &splitter::TheoremShard| {
+        !split.hygiene.has_sorry
+            || !splitter::audit_hygiene(&splitter::strip_lean_comments(&shard.proof_text)).has_sorry
+    };
     let pkg_cfg_opt = crate::module_builder::optional_package_config(canon_dir)?;
     crate::module_builder::require_source_compilations(
         store,
         canon_dir,
         &split_entries
             .iter()
-            .filter(|(_, _, sp)| !sp.shards.is_empty())
+            .filter(|(_, _, sp)| sp.shards.iter().any(|sh| seedable(sp, sh)))
             .map(|(p, _, _)| p.clone())
             .collect::<Vec<_>>(),
         trust_domain == "untrusted",
@@ -2569,15 +2573,9 @@ pub(crate) fn seed_project_theorem_shards_from_splits(
             .as_ref()
             .map(|pkg| crate::module_builder::resolve_file_lean_args_in_package(pkg, lf))
             .unwrap_or_default();
-        let file_has_sorry = split.hygiene.has_sorry;
         let mut file_had_clean_shard = false;
         for shard in &split.shards {
-            if file_has_sorry
-                && splitter::audit_hygiene(&splitter::strip_lean_comments(&shard.proof_text))
-                    .has_sorry
-            {
-                continue;
-            }
+            if !seedable(split, shard) { continue; }
             file_had_clean_shard = true;
             let shard_key = compute_shard_key_with_args(toolchain, shard, &file_lean_args);
             batch_items.push((shard_key, shard.name.clone(), shared_receipt.clone(), 1i64));
