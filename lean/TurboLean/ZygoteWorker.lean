@@ -260,10 +260,9 @@ def isAllowedAxiom (patterns : List String) (ax : Name) : Bool :=
 
 /-- Collect transitive kernel axioms reachable from `rootName` in `afterEnv`,
     without traversing into the stubbed proof bodies (`v.value`) of `.thmInfo` declarations
-    that were already present in `beforeEnv.constants.map₂`, nor into the values of `opaqueStub` declarations. -/
-def collectNewDeclAxioms (beforeEnv afterEnv : Environment) (rootName : Name)
+    that `opaqueStub` marks opaque. -/
+def collectDeclAxioms (beforeMap : Lean.PHashMap Name ConstantInfo) (afterEnv : Environment) (rootName : Name)
     (opaqueStub : Name → Bool := fun _ => false) : Array Name := Id.run do
-  let beforeMap := beforeEnv.constants.map₂
   let afterMap := afterEnv.constants.map₂
   let mut todo : Array Name := #[rootName]
   let mut visited : Std.HashMap Name Bool := {}
@@ -333,16 +332,25 @@ def collectNewDeclAxioms (beforeEnv afterEnv : Environment) (rootName : Name)
           axioms := axioms.push ax
   return axioms
 
-/-- Whether `n` is a `sorry` stub theorem in `env`: its kernel value is `fun xs => sorryAx ..` (what the
-    host's `theorem t : T := sorry` prefix stubs elaborate to). Definitions never count: the host does not
-    stub them, and their values are computationally relevant. -/
-def isSorryStubDecl (env : Environment) (n : Name) : Bool :=
-  let rec peel : Expr → Expr
-    | .lam _ _ b _ => peel b
-    | .mdata _ b => peel b
-    | e => e
-  match env.find? n with
-  | some (.thmInfo v) => (peel v.value).isAppOf (Name.mkSimple ("sor" ++ "ryAx"))
+/-- `value` is `fun xs => sorryAx (Name → body) false label` (or legacy `sorryAx body false`) for
+    `type = ∀ xs, body`, binder domains matching. -/
+partial def isExplicitSorryBody (value type : Expr) : Bool :=
+  match value, type with
+  | .lam _ d b _, .forallE _ d' b' _ => d == d' && isExplicitSorryBody b b'
+  | v, ty =>
+    let args := v.getAppArgs
+    v.getAppFn.isConstOf (Name.mkSimple ("sor" ++ "ryAx")) && args.size ≥ 2 &&
+      args[1]!.isConstOf ``Bool.false &&
+      ((args.size == 2 && args[0]! == ty) || (args.size == 3 && match args[0]! with
+        | .forallE _ d b _ => d.isConstOf ``Lean.Name && b == ty.liftLooseBVars 0 1
+        | _ => false))
+
+/-- A prefix stub as the host's shard builder emits it: `theorem n xs : T := sorry`, elaborated to
+    the explicit (non-synthetic) `sorry` term of `isExplicitSorryBody`. Elaboration errors and
+    tactics such as `admitGoal` yield synthetic sorries and never qualify; definitions never qualify. -/
+def isExplicitSorryStub (cinfo : ConstantInfo) : Bool :=
+  match cinfo with
+  | .thmInfo v => isExplicitSorryBody v.value v.type
   | _ => false
 
 /-- Unescaped components of a host declaration name (`.`-separated, `«…»` quoting). -/
@@ -396,22 +404,54 @@ def ownedByTarget (targets : List String) (n : Name) : Bool :=
         let pre := comps.take (i + 1)
         if exactRoot then pre == tc else tc.isSuffixOf pre)
 
-/-- Whether `n` is one of the host's prefix `stubs` (the declarations it replaced by `:= sorry`). -/
-def isHostStub (stubs : List String) (n : Name) : Bool :=
-  let comps := userNameComponents n
-  stubs.any fun s =>
-    let (exactRoot, sc) := parseHostTarget s
-    !sc.isEmpty && (if exactRoot then sc == comps else sc.isSuffixOf comps)
+/-- Kernel declarations of `consts` matching parsed host stub `(exactRoot, sc)`. -/
+def stubNameHits (consts : Array ConstantInfo) (exactRoot : Bool) (sc : List String) : Array ConstantInfo :=
+  consts.filter fun c =>
+    c.isTheorem &&
+      let comps := userNameComponents c.name
+      !sc.isEmpty && (if exactRoot then comps == sc else sc.isSuffixOf comps)
 
-/-- Per-declaration `sorryAx` exemption for stubbed elaboration (`allowStub`), never by source text: only a
-    `sorry` stub theorem by kernel value is exempt (and its value opaque to the transitive audit). In a final
-    run (the one elaborating the checked declarations) it must also be one of the host-listed `stubs` and
-    owned by no host-named target, so without listed stubs nothing is exempt. A prefix-checkpoint run never
-    holds the checked declarations, and the final run re-validates its stubs (`unexemptPrefixStub`). -/
-def stubSorryExemption (afterEnv : Environment) (allowStub finalRun : Bool)
-    (stubs targets : List String) : Name → Bool :=
-  fun n => allowStub && isSorryStubDecl afterEnv n &&
-    (!finalRun || (isHostStub stubs n && !ownedByTarget targets n))
+/-- A host stub list (`stubs`, each entry once per source stub) resolved to kernel names, with the
+    cardinality check of `collectStubDecls`: an entry named `k` times may match at most `k` theorems.
+    More (a metaprogram injecting another theorem under the same user name) is a violation and exempts
+    nothing for that ambiguous stub name. -/
+def resolveStubNames (consts : Array ConstantInfo) (stubs : List String) : Std.HashSet Name × List String := Id.run do
+  let mut out : Std.HashSet Name := {}
+  let mut violations : List String := []
+  let mut counts : Std.HashMap (Bool × List String) (Nat × String) := {}
+  for e in stubs do
+    let key := parseHostTarget e
+    let (k, repr) := counts[key]?.getD (0, e)
+    counts := counts.insert key (k + 1, repr)
+  for ((exactRoot, ec), (k, repr)) in counts.toArray do
+    let hits := stubNameHits consts exactRoot ec
+    if hits.size ≤ k then
+      out := hits.foldl (·.insert ·.name) out
+    else
+      violations := violations ++
+        [s!"[TurboLean.KernelGate] prefix stub `{repr}` is ambiguous: {hits.map (·.name)}"]
+  return (out, violations)
+
+/-- Kernel names newly elaborated in `env` (`map₂`) exempt from the `sorryAx` gate: host stubs (`stubs`)
+    whose value is an explicit `sorry` (`isExplicitSorryStub`), never a host target. `violations` is
+    non-empty when any stub name is ambiguous (which exempts nothing at all). -/
+def stubExemptSet (env : Environment) (stubs targets : List String) : Std.HashSet Name × List String :=
+  let consts := env.constants.map₂.foldl (fun acc _ c => acc.push c) #[]
+  let (named, violations) := resolveStubNames consts stubs
+  if !violations.isEmpty then ({}, violations)
+  else
+    let exempt := named.fold (init := ({} : Std.HashSet Name)) fun acc n =>
+      if !ownedByTarget targets n && (env.find? n).any isExplicitSorryStub then acc.insert n else acc
+    (exempt, [])
+
+/-- Whether the stubbed prefix checkpoint `prefixEnv` holds any `sorryAx`-dependent declaration
+    that this final run does not exempt (a checkpoint is shared by requests with other stubs and targets). -/
+def unexemptPrefixStub (prefixEnv : Environment) (stubs targets : List String) : Bool :=
+  let sorryAxName := Name.mkSimple ("sor" ++ "ryAx")
+  let (exempt, violations) := stubExemptSet prefixEnv stubs targets
+  !violations.isEmpty || prefixEnv.constants.map₂.foldl (fun acc n _ =>
+    acc || (!exempt.contains n &&
+      (collectDeclAxioms {} prefixEnv n exempt.contains).contains sorryAxName)) false
 
 /-- Whether `env` declares host name `t` or its fast-olean rename `_turbo_verify_<i>_<sanitized t>`. -/
 def declaresHostName (env : Environment) (t : String) : Bool :=
@@ -420,12 +460,6 @@ def declaresHostName (env : Environment) (t : String) : Bool :=
     let comps := userNameComponents n
     (if exactRoot then comps == tc else tc.isSuffixOf comps) ||
       fastVerifyMatchesTarget comps exactRoot tc) false
-
-/-- Whether the stubbed prefix checkpoint `prefixEnv` holds a `sorry` stub theorem that this final run
-    does not exempt (a checkpoint is shared by requests with other stubs and targets). -/
-def unexemptPrefixStub (prefixEnv : Environment) (stubs targets : List String) : Bool :=
-  prefixEnv.constants.map₂.foldl (fun acc n _ =>
-    acc || (isSorryStubDecl prefixEnv n && !stubSorryExemption prefixEnv true true stubs targets n)) false
 
 /-- In-kernel soundness gate auditing all newly added declarations in `afterEnv.constants.map₂`
     (relative to `beforeEnv.constants.map₂`) for unapproved axioms, compiler-trusted evaluation,
@@ -463,7 +497,7 @@ def auditNewKernelDecls
     let csimpSt := Lean.Compiler.CSimp.ext.getState afterEnv
     if csimpSt.thmNames.contains name || csimpSt.map.contains name then
       violations := violations ++ [s!"[TurboLean.KernelGate] csimp replacement bypass on `{name}` is forbidden"]
-    let axs := collectNewDeclAxioms beforeEnv afterEnv name stubExempt
+    let axs := collectDeclAxioms beforeMap afterEnv name stubExempt
     for ax in axs do
       if !isAllowedAxiom patterns ax then
         if !(stubExempt name && ax == sorryAxName) then
@@ -570,9 +604,10 @@ def collectNewDeclUsedConstants (beforeEnv afterEnv : Environment) : Array Strin
   return out
 
 /-- Elaborate and kernel-typecheck `code` starting from an immutable `baseState : Command.State`
-    without mutating `baseState`. With `allowStub`, `sorry` stubs are exempt from the `sorryAx` gate (in a
-    `finalRun`, only the host-listed `stubs` that no `stubTargets` owns; see `stubSorryExemption`), and a
-    `finalRun` also rejects a checkpoint stub it does not exempt (`unexemptPrefixStub`).
+    without mutating `baseState`. With `allowStub`, host-listed `sorry` stubs are exempt from the `sorryAx`
+    gate (in a `finalRun`, only the kernel names `stubExemptSet` resolves the host `stubs` to, never a
+    `stubTargets` declaration, and never when a stub name is ambiguous), and a `finalRun` also rejects a
+    checkpoint stub it does not exempt (`unexemptPrefixStub`).
     Returns `(ok, elapsed_us, heartbeats, proof_term_nodes, error_messages, all_messages, captured_stdout, used_constants, next_clean_state)`. -/
 def runCommandsFromState
     (baseState : Command.State)
@@ -623,9 +658,14 @@ def runCommandsFromState
   if allMessages.any isRuntimePanicText then
     errs := errs ++ [runtimePanicErr]
   if !evalMode then
-    let stubExempt := stubSorryExemption s.commandState.env allowStub finalRun stubs stubTargets
+    let (exempt, stubViolations) :=
+      if allowStub && finalRun then stubExemptSet s.commandState.env stubs stubTargets else ({}, [])
+    let stubExempt := fun (n : Name) =>
+      allowStub && (if finalRun then exempt.contains n else (s.commandState.env.find? n).any isExplicitSorryStub)
     let (_, kernelErrs) ← auditNewKernelDecls baseState.env s.commandState.env stubExempt
     errs := errs ++ kernelErrs
+    if finalRun && allowStub && !stubViolations.isEmpty then
+      errs := errs ++ stubViolations
     if finalRun && (allowStub || strictPrefix) &&
         unexemptPrefixStub baseState.env (if allowStub then stubs else []) stubTargets then
       errs := errs ++ ["[TurboLean.KernelGate] stubbed prefix holds a `sorry` theorem this check does not exempt"]
@@ -999,27 +1039,6 @@ def isWhitelistedInitExecBridge (env : Environment) (modIdx : ModuleIdx) (declNa
       | _, _ => false
     | none => false
 
-/-- `value` is `fun xs => sorryAx (Name → body) false label` (or legacy `sorryAx body false`) for
-    `type = ∀ xs, body`, binder domains matching. -/
-partial def isExplicitSorryBody (value type : Expr) : Bool :=
-  match value, type with
-  | .lam _ d b _, .forallE _ d' b' _ => d == d' && isExplicitSorryBody b b'
-  | v, ty =>
-    let args := v.getAppArgs
-    v.getAppFn.isConstOf (Name.mkSimple ("sor" ++ "ryAx")) && args.size ≥ 2 &&
-      args[1]!.isConstOf ``Bool.false &&
-      ((args.size == 2 && args[0]! == ty) || (args.size == 3 && match args[0]! with
-        | .forallE _ d b _ => d.isConstOf ``Lean.Name && b == ty.liftLooseBVars 0 1
-        | _ => false))
-
-/-- A prefix stub as the host's shard builder emits it: `theorem n xs : T := sorry`, elaborated to
-    the explicit (non-synthetic) `sorry` term of `isExplicitSorryBody`. Elaboration errors and
-    tactics such as `admitGoal` yield synthetic sorries and never qualify. -/
-def isExplicitSorryStub (cinfo : ConstantInfo) : Bool :=
-  match cinfo with
-  | .thmInfo v => isExplicitSorryBody v.value v.type
-  | _ => false
-
 /-- Forbidden axioms reachable from each root; the values of `opaqueStubs` (validated prefix stubs,
     whose proofs are verified separately) are not traversed. -/
 def collectForbiddenAxiomsByDecl (env : Environment) (roots : Array Name) (patterns : List String := [])
@@ -1152,30 +1171,16 @@ def isPinnedFfiOpaque (env : Environment) (ffiAllow : Array (Name × Name × Str
   | _ => false
 
 /-- Validated prefix stubs of a compiled shard module (`consts`): the host names each stub by its
-    source name (`stubOk`, once per stub; matched by unescaped name-component suffix). An entry
-    named `k` times must match at most `k` module theorems, whatever their values (more, e.g. one
-    injected by a metaprogram next to a stub a macro turned into a proof, is a violation); of
-    those, the ones whose kernel value is an explicit `sorry` (`isExplicitSorryStub`) are exempt. -/
+    source name (`stubOk`, once per stub; matched by unescaped name-component suffix, `resolveStubNames`).
+    An entry named `k` times must match at most `k` module theorems, whatever their values (more, e.g. one
+    injected by a metaprogram next to a stub a macro turned into a proof, is a violation); of those, the
+    ones whose kernel value is an explicit `sorry` (`isExplicitSorryStub`) are exempt. -/
 def collectStubDecls (consts : Array ConstantInfo) (stubOk : Array String) :
-    Std.HashSet Name × List String := Id.run do
-  let mut out : Std.HashSet Name := {}
-  let mut violations : List String := []
-  let mut normCounts : Std.HashMap (Bool × List String) (Nat × String) := {}
-  for e in stubOk do
-    let key := parseHostTarget e
-    let (k, repr) := normCounts[key]?.getD (0, e)
-    normCounts := normCounts.insert key (k + 1, repr)
-  for ((exactRoot, ec), (k, repr)) in normCounts.toArray do
-    let hits := consts.filter fun c =>
-      c.isTheorem &&
-        let comps := userNameComponents c.name
-        if exactRoot then comps == ec else ec.isSuffixOf comps
-    if hits.size ≤ k then
-      out := (hits.filter isExplicitSorryStub).foldl (·.insert ·.name) out
-    else
-      violations := violations ++
-        [s!"[TurboLean.KernelGate] prefix stub `{repr}` is ambiguous: {hits.map (·.name)}"]
-  return (out, violations)
+    Std.HashSet Name × List String :=
+  let (named, violations) := resolveStubNames consts stubOk.toList
+  let out := named.fold (init := ({} : Std.HashSet Name)) fun acc n =>
+    if consts.any fun c => c.name == n && isExplicitSorryStub c then acc.insert n else acc
+  (out, violations)
 
 def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Name))
     (ffiAllow : Array (Name × Name × String) := #[])

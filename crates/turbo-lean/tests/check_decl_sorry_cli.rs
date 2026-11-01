@@ -125,6 +125,24 @@ impl Project {
              end B\n",
         )
         .unwrap();
+        // A `sorryAx` theorem injected under a colliding `userNameComponents` identity (`N.1` vs `N.«1»`):
+        // live zygote + daemon and `--no-daemon` must reject the ambiguous stub identity.
+        fs::write(
+            root.join("S.lean"),
+            "import Lean\n\
+             namespace N\n\
+             local macro_rules | `(term| sorry) => `(term| trivial)\n\
+             theorem «1» : True := rfl\n\
+             end N\n\
+             open Lean Elab Command in\n\
+             elab \"inject\" : command => liftCoreM do\n\
+               addDecl <| .thmDecl { name := Name.mkNum `N 1, levelParams := [], type := mkConst ``False, value := mkApp2 (mkConst ``sorryAx [0]) (mkConst ``False) (mkConst ``Bool.false) }\n\
+             inject\n\
+             theorem tgt : False := by\n\
+               run_tac do\n\
+                 (← Lean.Elab.Tactic.getMainGoal).assign (Lean.mkConst (Lean.Name.mkNum `N 1))\n",
+        )
+        .unwrap();
         Self(root)
     }
 
@@ -281,9 +299,10 @@ fn check_decl_rejects_sorry_target_and_keeps_prefix_stubs() {
         assert_rejected(&p, "R.lean", "same", daemon);
         assert_rejected(&p, "R.lean", "B.same", daemon);
         assert_rejected(&p, "R.lean", "_root_.B.same", daemon);
+        assert_rejected(&p, "S.lean", "tgt", daemon);
         for target in [
             "H.lean", "I.lean", "L.lean", "M.lean", "K.lean", "J.lean", "N.lean", "Q.lean",
-            "R.lean", "F.lean", "G.lean", ".",
+            "R.lean", "S.lean", "F.lean", "G.lean", ".",
         ] {
             let out = p.run(&["check", target], daemon);
             assert!(

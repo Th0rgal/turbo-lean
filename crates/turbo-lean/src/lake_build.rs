@@ -738,8 +738,8 @@ pub(crate) fn compute_shard_key_with_args(
     lean_args: &[String],
 ) -> String {
     let mut key_hasher = blake3::Hasher::new();
-    // v2: invalidates receipts written before the `sorry` target gates and stderr panic scan.
-    key_hasher.update(b"theorem-shard-v2:");
+    // v3: invalidates receipts written before the `sorry` target gates (v2 was the stderr panic scan).
+    key_hasher.update(b"theorem-shard-v3:");
     key_hasher.update(toolchain.as_bytes());
     key_hasher.update(b":");
     key_hasher.update(shard.prefix_env_hash.as_bytes());

@@ -6255,6 +6255,63 @@ mod tests {
             eval_with_zygote_pool(&store, toolchain, "", &env_vars, &lean_bin, &shard3, true)
                 .unwrap();
         assert!(rep3.ok && rep3.env_cache_hit);
+
+        // Live worker rejects an ambiguous stub name (a second `sorryAx` theorem injected under a
+        // colliding `userNameComponents` identity `N.1`), both via a cached prefix checkpoint and in a single block.
+        let ambig_prefix = "import Lean\nnamespace N\nlocal macro_rules | `(term| sorry) => `(term| trivial)\ntheorem «1» : True := sorry\nend N\nopen Lean Elab Command in\nelab \"inject\" : command => liftCoreM do\n  addDecl <| .thmDecl { name := Name.mkNum `N 1, levelParams := [], type := mkConst ``False, value := mkApp2 (mkConst ``sorryAx [0]) (mkConst ``False) (mkConst ``Bool.false) }\ninject\n";
+        let ambig_ckpt = format!(
+            "{}theorem _root_.tgt : False := by\n  run_tac do\n    (← Lean.Elab.Tactic.getMainGoal).assign (Lean.mkConst (Lean.Name.mkNum `N 1))\n",
+            ambig_prefix
+        );
+        for run in 0..2 {
+            let rep = eval_with_zygote_pool_for_targets(
+                &store,
+                toolchain,
+                "Lean",
+                &env_vars,
+                &lean_bin,
+                &ambig_ckpt,
+                &["_root_.tgt".to_string()],
+                None,
+                &[],
+            )
+            .unwrap();
+            assert!(!rep.ok, "ambiguous prefix stub must fail: {:?}", rep);
+            if run == 1 {
+                assert!(rep.prefix_cache_hit, "expected warm prefix hit: {:?}", rep);
+            }
+            assert!(
+                rep.errors
+                    .iter()
+                    .any(|e| e.contains("prefix stub `_root_.N.«1»` is ambiguous")),
+                "unexpected live-worker errors: {:?}",
+                rep.errors
+            );
+        }
+        let ambig_final = "import Lean\n/- no-prefix-split -/\n".to_string()
+            + ambig_ckpt.strip_prefix("import Lean\n").unwrap();
+        let rep_final = eval_with_zygote_pool_for_targets(
+            &store,
+            toolchain,
+            "Lean",
+            &env_vars,
+            &lean_bin,
+            &ambig_final,
+            &["_root_.tgt".to_string()],
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            !rep_final.ok
+                && !rep_final.prefix_cache_hit
+                && rep_final
+                    .errors
+                    .iter()
+                    .any(|e| e.contains("prefix stub `_root_.N.«1»` is ambiguous")),
+            "ambiguous final-run stub must fail: {:?}",
+            rep_final
+        );
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 
@@ -7099,7 +7156,10 @@ mod tests {
             compute_eval_shm_cache_filename(&context, file_name, caller_cwd.as_deref(), &src, &[])
                 .unwrap();
         assert_ne!(v3_name, new_name, "the namespace bump must change the key");
-        assert_ne!(v4_name, new_name, "scanner namespace must change the #305 key");
+        assert_ne!(
+            v4_name, new_name,
+            "scanner namespace must change the #305 key"
+        );
         let dir = store.fast_staging_dir().join("eval_shm_cache");
         fs::create_dir_all(&dir).unwrap();
         // A pre-scanner (no `scanner_version`) false success, planted at the v3 and v4 keys

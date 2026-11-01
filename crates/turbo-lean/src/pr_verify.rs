@@ -315,8 +315,8 @@ fn git_head_tree_cache_paths(
     toolchain: &str,
 ) -> (PathBuf, PathBuf) {
     let mut h = blake3::Hasher::new();
-    // v10: cached entries embed `theorem-shard-v1` keys.
-    h.update(b"git-head-tree:v10:");
+    // v11: cached entries embed `theorem-shard-v2` keys.
+    h.update(b"git-head-tree:v11:");
     h.update(repo_root.to_string_lossy().as_bytes());
     h.update(b":");
     h.update(canon_dir.to_string_lossy().as_bytes());
