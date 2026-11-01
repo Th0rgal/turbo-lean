@@ -372,6 +372,8 @@ fn owned_lifecycle_process(pid: u32, staging: Option<&Path>, parent: Option<u32>
     let args = fs::read(proc.join("cmdline")).unwrap_or_default();
     let env = fs::read(proc.join("environ")).unwrap_or_default();
     let worker = (name.starts_with("turbo_zygote_") || name == "turbo-zygote")
+        && !args.is_empty()
+        && !env.is_empty()
         && !args.split(|b| *b == 0).any(|arg| arg == b"--audit-modules");
     let server = name.trim_end_matches(" (deleted)") == "turbo-lean"
         && is_serve_command(&args)
@@ -2830,8 +2832,13 @@ pub(crate) fn resolve_zygote_context(
     .to_hex()
     .to_string();
     let identity = blake3::hash(
-        &serde_json::to_vec(&(&compiler_identity, &effective_lean_path, &imports_csv, &olean_digest))
-            .expect("execution identity serializes"),
+        &serde_json::to_vec(&(
+            &compiler_identity,
+            &effective_lean_path,
+            &imports_csv,
+            &olean_digest,
+        ))
+        .expect("execution identity serializes"),
     )
     .to_hex()
     .to_string();
@@ -2846,7 +2853,6 @@ pub(crate) fn resolve_zygote_context(
         identity,
     }
 }
-
 
 #[allow(clippy::too_many_arguments)]
 fn eval_with_zygote_pool_inner(
@@ -5251,7 +5257,11 @@ mod tests {
                 )
                 .context("local eval must produce a reply")?;
                 assert!(reply.ok && reply.import_ok, "{reply:?}");
-                assert_eq!(reply.messages.concat().trim(), expected, "LEAN_PATH={name}: {reply:?}");
+                assert_eq!(
+                    reply.messages.concat().trim(),
+                    expected,
+                    "LEAN_PATH={name}: {reply:?}"
+                );
             }
             // Replacing an artifact at the same resolved path must also invalidate the reply.
             fs::copy(tree.root.join("A/Dep.olean"), tree.root.join("B/Dep.olean"))?;

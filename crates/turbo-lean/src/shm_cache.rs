@@ -433,11 +433,15 @@ pub fn user_config_toml_path() -> PathBuf {
 /// Locate the nearest `turbo-lean.toml` or `.turbo-lean.toml` walking upward from `start_dir` (or CWD).
 pub fn find_nearest_project_toml(start_dir: Option<&Path>) -> Option<PathBuf> {
     let dir = start_dir
+        .filter(|p| !p.as_os_str().is_empty())
         .map(|p| {
             if p.is_dir() {
                 p.to_path_buf()
             } else {
-                p.parent().unwrap_or_else(|| Path::new(".")).to_path_buf()
+                p.parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf()
             }
         })
         .or_else(|| std::env::current_dir().ok())?;
@@ -486,8 +490,13 @@ where
     let dir = start_dir.map(|p| {
         if p.is_dir() {
             p.to_path_buf()
+        } else if p.as_os_str().is_empty() {
+            PathBuf::from(".")
         } else {
-            p.parent().unwrap_or_else(|| Path::new(".")).to_path_buf()
+            p.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
         }
     })?;
     for rel in extra_project_rels {

@@ -151,7 +151,11 @@ pub(crate) fn spawn_lake_env(project_dir: &Path) -> Result<HashMap<String, Strin
             "{diagnostic}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let prefix = PathBuf::from(String::from_utf8(output.stdout).with_context(|| diagnostic)?.trim());
+        let prefix = PathBuf::from(
+            String::from_utf8(output.stdout)
+                .with_context(|| diagnostic)?
+                .trim(),
+        );
         anyhow::ensure!(
             prefix.is_absolute()
                 && prefix.join("bin/lean").is_file()
@@ -865,11 +869,16 @@ pub(crate) fn parse_header_imports(src: &str) -> Vec<String> {
 }
 
 pub(crate) fn infer_project_dir_from_lean_file(path: &Path) -> PathBuf {
-    let mut cur = if path.is_file() {
+    let start_dir = if path.is_file() {
         path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+    } else if path.as_os_str().is_empty() {
+        Path::new(".")
     } else {
-        Some(path)
+        path
     };
+    let mut cur = Some(start_dir);
     while let Some(dir) = cur {
         if dir.join("lakefile.lean").exists()
             || dir.join("lakefile.toml").exists()
@@ -878,11 +887,9 @@ pub(crate) fn infer_project_dir_from_lean_file(path: &Path) -> PathBuf {
         {
             return dir.to_path_buf();
         }
-        cur = dir.parent();
+        cur = dir.parent().filter(|p| !p.as_os_str().is_empty());
     }
-    path.parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."))
+    start_dir.to_path_buf()
 }
 
 fn compute_single_olean_digest_and_imports(olean_path: &Path) -> Option<(String, Vec<String>)> {
@@ -1818,6 +1825,19 @@ fn entry_import_pins_current(
     })
 }
 
+fn entry_import_pins_fresh_for_build(
+    manifest: &crate::module_builder::VerifiedDepManifest,
+    entry: &crate::module_builder::VerifiedDepModuleEntry,
+    imports: &[String],
+) -> bool {
+    let Some(cfg) = manifest.cfg.as_ref() else {
+        return false;
+    };
+    crate::module_builder::verified_entry_imports_current(entry, imports, |imp, pin| {
+        crate::module_builder::import_pin_fresh_for_build(cfg, imp, pin)
+    })
+}
+
 fn verify_project_module_entry_and_sidecars(
     canon_dir: &Path,
     rel_src: &str,
@@ -1834,7 +1854,8 @@ fn verify_project_module_entry_and_sidecars(
     if !olean_path.is_file() {
         return false;
     }
-    let Ok(actual_art_dig) = crate::module_builder::compute_olean_artifact_set_digest(&olean_path)
+    let Ok(actual_art_dig) =
+        crate::module_builder::compute_olean_artifact_set_digest_with_policy(&olean_path, true)
     else {
         return false;
     };
@@ -2454,15 +2475,17 @@ pub(crate) fn ensure_project_imports_fresh(
                     None => true,
                 }
         });
+        let has_manifest_entry = manifest_opt
+            .as_ref()
+            .is_some_and(|m| m.modules.contains_key(&dep_rel));
         let manifest_stale = identity_stale
             || match (&manifest_opt, &cur_hash) {
                 (Some(m), Some(ch)) => m.modules.get(&dep_rel).is_some_and(|e| {
-                    !e.kernel_audited
-                        || e.src_blake3 != *ch
+                    e.src_blake3 != *ch
                         || (olean_meta.is_some()
                             && !(m.cfg.as_ref().is_some_and(|cfg| {
                                 crate::module_builder::entry_artifacts_current(cfg, &dep_olean, e)
-                            }) && entry_import_pins_current(
+                            }) && entry_import_pins_fresh_for_build(
                                 m,
                                 e,
                                 adj.get(mod_name).map_or(&[][..], Vec::as_slice),
@@ -2470,6 +2493,11 @@ pub(crate) fn ensure_project_imports_fresh(
                 }),
                 _ => false,
             };
+        let lake_root_stale = !has_manifest_entry
+            && olean_meta.is_some()
+            && root_cfg.as_ref().is_some_and(|cfg| {
+                crate::module_builder::root_pkg_lake_module_stale(cfg, mod_name)
+            });
         let mtime_stale = match (&olean_meta, &src_meta) {
             (Some(om), Some(sm)) => match (om.modified(), sm.modified()) {
                 (Ok(ot), Ok(st)) => ot < st,
@@ -2489,6 +2517,7 @@ pub(crate) fn ensure_project_imports_fresh(
             false
         };
         if manifest_stale
+            || lake_root_stale
             || mtime_stale
             || trace_corrupt
             || (unusable_manifest && olean_meta.is_some())
@@ -4263,7 +4292,11 @@ mod tests {
             assert_eq!(fs::metadata(&wt_local)?.permissions().mode() & 0o777, 0o600);
         }
         for (path, bytes) in &main_lake_bytes {
-            assert_eq!(&fs::read(path)?, bytes, "opt-out must not copy or rewrite main `.lake`");
+            assert_eq!(
+                &fs::read(path)?,
+                bytes,
+                "opt-out must not copy or rewrite main `.lake`"
+            );
         }
         #[cfg(unix)]
         {

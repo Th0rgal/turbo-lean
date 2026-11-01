@@ -31,9 +31,9 @@ pub mod remote_prebuild;
 pub mod server;
 pub mod shm_cache;
 mod splitter;
+pub mod verify;
 #[cfg(all(test, unix))]
 mod worktree_test_support;
-pub mod verify;
 pub mod zygote;
 
 pub use gpu_fastcheck::*;
@@ -534,7 +534,15 @@ fn run(cli: Cli) -> Result<()> {
         }
         | Commands::Eval {
             project_dir, file, ..
-        } => (project_dir.as_deref().or_else(|| file.parent()), true),
+        } => (
+            Some(
+                project_dir
+                    .as_deref()
+                    .or_else(|| file.parent().filter(|p| !p.as_os_str().is_empty()))
+                    .unwrap_or(std::path::Path::new(".")),
+            ),
+            true,
+        ),
         Commands::Mcp { project_dir }
         | Commands::Accelerators { project_dir }
         | Commands::Gc { project_dir, .. } => (project_dir.as_deref(), true),
@@ -605,9 +613,7 @@ fn run(cli: Cli) -> Result<()> {
             project_dir, base, ..
         } => (Some(project_dir.as_path()), Some(base.as_str())),
         Commands::CiVerify {
-            project_dir,
-            base,
-            ..
+            project_dir, base, ..
         } => match base {
             Some(base) => (Some(project_dir.as_path()), Some(base.as_str())),
             None => (None, None),
