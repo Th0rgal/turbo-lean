@@ -1299,3 +1299,167 @@ warning: FV/E2E/Pair.lean:165:16: `if_neg` has been deprecated: Use `ite_eq_righ
 ✔ [987/4556] Built FV.Opt.Proof.RuleSkeleton2 (960s)
 ✔ [988/4556] Built FV.Backend.Proof.LowerTotalDefs (1.4s)
 ✔ [989/4556] Built FV.Backend.Proof.StockConditionalEmptyTrapSource (51s)
+✔ [990/4556] Built FV.Backend.Proof.LowerLoopRun (88s)
+✔ [991/4556] Built FV.Backend.Proof.StockDFG (2.3s)
+✔ [992/4556] Built FV.Backend.Proof.StockCtorFlow (8.1s)
+✔ [993/4556] Built FV.Backend.Proof.StockPureSourceColors (1.6s)
+ℹ [994/4556] Built FV.Backend.Proof.StockD0Code (239s)
+info: FV/Backend/Proof/StockD0Code.lean:86:0: 'Backend.Stock.D0.erased_code' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: FV/Backend/Proof/StockD0Code.lean:87:0: 'Backend.Stock.D0.normalized_eq_legacy' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: FV/Backend/Proof/StockD0Code.lean:88:0: 'Backend.Stock.D0.eligible_sound' depends on axioms: [propext, Quot.sound]
+✔ [995/4556] Built FV.Backend.Proof.StockFloatCheckDomain (1.5s)
+✔ [996/4556] Built FV.Backend.Proof.RelocProvModel (17s)
+✔ [997/4556] Built FV.Backend.Proof.LowerTotalCtx (5.0s)
+✔ [998/4556] Built FV.Backend.Proof.LowerDecide (1.8s)
+✔ [999/4556] Built FV.Backend.Proof.LowerLoopCtxT (2.5s)
+✔ [1000/4556] Built FV.Opt.Proof.RuleSkeleton4 (1199s)
+✔ [1001/4556] Built FV.Backend.Proof.StockNoLoadSink (71s)
+✔ [1002/4556] Built FV.Backend.Proof.StockPureUnsunk (60s)
+✔ [1003/4556] Built FV.Backend.Proof.StockCmpNarrowFlags (1.6s)
+✔ [1004/4556] Built FV.Backend.Proof.StockSingleDivSourceTrap (1.5s)
+✔ [1005/4556] Built FV.E2E.SizeDefs (1.6s)
+✔ [1006/4556] Built FV.Backend.Proof.IselSzTDefs (2.5s)
+✔ [1007/4556] Built FV.Backend.Proof.IselSzSound (4.1s)
+✔ [1008/4556] Built FV.Backend.Proof.IselShpRoot (1.6s)
+✔ [1009/4556] Built FV.Backend.Proof.IselCovData (2.0s)
+✔ [1010/4556] Built FV.Backend.Proof.IselFamAluBShiftTerms (48s)
+✔ [1011/4556] Built FV.Backend.Proof.IselEmitChk (11s)
+✔ [1012/4556] Built FV.Backend.Proof.StockDriverBounds (270s)
+✔ [1013/4556] Built FV.Backend.Proof.IselCovTFns (1.9s)
+✔ [1014/4556] Built FV.Backend.Proof.StockBranchArgumentShape (2.1s)
+✔ [1015/4556] Built FV.E2E.RegLevelDriverSem (3.3s)
+⚠ [1016/4556] Built FV.Backend.Proof.IselMemBase (3.2s)
+warning: FV/Backend/Proof/IselMemBase.lean:59:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselMemBase.lean:60:8: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselMemBase.lean:124:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselMemBase.lean:125:8: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselMemBase.lean:136:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselMemBase.lean:137:8: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselMemBase.lean:150:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselMemBase.lean:153:8: `if_neg` has been deprecated: Use `ite_eq_right` instead
+✔ [1017/4556] Built FV.Backend.Proof.StockBranchArgumentDemand (1.0s)
+⚠ [1018/4556] Built FV.Backend.Proof.IselCtlCallRules (49s)
+warning: FV/Backend/Proof/IselCtlCallRules.lean:927:12: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCtlCallRules.lean:1081:11: `if_pos` has been deprecated: Use `ite_eq_left` instead
+⚠ [1019/4556] Built FV.E2E.RegLevelPush (9.5s)
+warning: FV/E2E/RegLevelPush.lean:688:12: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/E2E/RegLevelPush.lean:690:12: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/E2E/RegLevelPush.lean:1017:12: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/E2E/RegLevelPush.lean:1022:12: `if_neg` has been deprecated: Use `ite_eq_right` instead
+✔ [1020/4556] Built FV.Backend.Proof.DeadCleanupCorrect (1.7s)
+⚠ [1021/4556] Built FV.E2E.TailLoopSim (3.2s)
+warning: FV/E2E/TailLoopSim.lean:110:39: `if_true` has been deprecated: Use `ite_true` instead
+warning: FV/E2E/TailLoopSim.lean:286:54: `if_true` has been deprecated: Use `ite_true` instead
+warning: FV/E2E/TailLoopSim.lean:1004:81: `if_true` has been deprecated: Use `ite_true` instead
+warning: FV/E2E/TailLoopSim.lean:1113:21: `if_true` has been deprecated: Use `ite_true` instead
+warning: FV/E2E/TailLoopSim.lean:1115:21: `if_true` has been deprecated: Use `ite_true` instead
+warning: FV/E2E/TailLoopSim.lean:1126:39: `if_false` has been deprecated: Use `ite_false` instead
+warning: FV/E2E/TailLoopSim.lean:1145:39: `if_false` has been deprecated: Use `ite_false` instead
+warning: FV/E2E/TailLoopSim.lean:1252:48: `if_false` has been deprecated: Use `ite_false` instead
+warning: FV/E2E/TailLoopSim.lean:1256:48: `if_false` has been deprecated: Use `ite_false` instead
+⚠ [1022/4556] Built FV.Unw.Model (2.3s)
+warning: FV/Unw/Model.lean:177:8: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Unw/Model.lean:191:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Unw/Model.lean:191:20: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Unw/Model.lean:191:39: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Unw/Model.lean:196:8: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Unw/Model.lean:234:20: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Unw/Model.lean:235:10: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Unw/Model.lean:248:20: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Unw/Model.lean:249:10: `if_neg` has been deprecated: Use `ite_eq_right` instead
+✔ [1023/4556] Built FV.E2E.MemTrapStatement (1.5s)
+✔ [1024/4556] Built FV.E2E.Compose (1.5s)
+✔ [1025/4556] Built FV.E2E.RegLevelSim (3.3s)
+✔ [1026/4556] Built FV.Backend.Proof.LowerSimSkip (3.5s)
+✔ [1027/4556] Built FV.Concurrency.IselRetT (3.3s)
+✔ [1028/4556] Built FV.E2E.PairEntry (3.5s)
+✔ [1029/4556] Built FV.Backend.Proof.StockPreparedSemantics (1.3s)
+✔ [1030/4556] Built FV.Backend.Proof.PerEdgePrepareSound (3.0s)
+✔ [1031/4556] Built FV.E2E.PrepareSoundW (1.0s)
+✔ [1032/4556] Built FV.Backend.Proof.PrepareDirect (1.3s)
+✔ [1033/4556] Built FV.Backend.Proof.StockAliasScanEntries (70s)
+✔ [1034/4556] Built FV.Backend.Proof.LowerCertBase (2.3s)
+✔ [1035/4556] Built FV.Backend.Proof.LowerLoopSim (3.2s)
+✔ [1036/4556] Built FV.Backend.Proof.StockRecordContext (1.9s)
+✔ [1037/4556] Built FV.Backend.Proof.StockImm (8.2s)
+✔ [1038/4556] Built FV.Backend.Proof.StockTermAvailability (1.4s)
+✔ [1039/4556] Built FV.Backend.Proof.StockBodyScanOrigin (2.1s)
+✔ [1040/4556] Built FV.Backend.Proof.StockSourceSSA (1.0s)
+✔ [1041/4556] Built FV.Backend.Proof.StockBlockRanges (1.8s)
+✔ [1042/4556] Built FV.Backend.Proof.StockPatternSource (33s)
+✔ [1043/4556] Built FV.Backend.Proof.StockSourceView (32s)
+ℹ [1044/4556] Built FV.Backend.Proof.StockD0Dispatch (1.4s)
+info: FV/Backend/Proof/StockD0Dispatch.lean:47:0: 'Backend.Stock.D0.defaultLower_eq_legacy' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: FV/Backend/Proof/StockD0Dispatch.lean:48:0: 'Backend.Stock.D0.failed_stock_falls_back' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: FV/Backend/Proof/StockD0Dispatch.lean:49:0: 'Backend.Stock.D0.selectWith_eq_original' depends on axioms: [propext, Classical.choice, Quot.sound]
+✔ [1045/4556] Built FV.Backend.Proof.LowerTotal (30s)
+✔ [1046/4556] Built FV.Backend.Proof.StockReservedFlow (8.6s)
+✔ [1047/4556] Built FV.Backend.Proof.StockMappedFlow (2.0s)
+✔ [1048/4556] Built FV.Backend.Proof.StockTermContractWitness (70s)
+✔ [1049/4556] Built FV.Backend.Proof.StockPerEdgeM6DivergenceWitness (68s)
+✔ [1050/4556] Built FV.Backend.Proof.StockPerSuccessorWitness (86s)
+✔ [1051/4556] Built FV.Backend.StockArithmeticCheck (1.4s)
+✔ [1052/4556] Built FV.Backend.Proof.StockPrologueDomain (2.1s)
+✔ [1053/4556] Built FV.Backend.Proof.StockPrologueAllDomain (3.8s)
+✔ [1054/4556] Built FV.Backend.Proof.StockScalarAddDomain (2.9s)
+✔ [1055/4556] Built FV.Backend.Proof.StockConditionalEmptyFixture (45s)
+✔ [1056/4556] Built FV.Backend.Proof.StockConditionalEmptyTrapFixture (2.3s)
+✔ [1057/4556] Built FV.Backend.Proof.StockConditionalTrapFixture (42s)
+✔ [1058/4556] Built FV.Backend.Proof.StockInheritedFixture (53s)
+✔ [1059/4556] Built FV.Backend.Proof.IselCovTab (1280s)
+✔ [1060/4556] Built FV.Backend.Proof.InstScopeTF (1.4s)
+✔ [1061/4556] Built FV.Backend.Proof.DriverCheckTy (5.1s)
+✔ [1062/4556] Built FV.Opt.Proof.RuleAll (19s)
+✔ [1063/4556] Built FV.Backend.Proof.StockNoLoadSinkWitness (2.7s)
+✔ [1064/4556] Built FV.Backend.Proof.StockSinkRuleRhsWitness (2.1s)
+✔ [1065/4556] Built FV.Backend.Proof.StockNoLoadScan (2.5s)
+✔ [1066/4556] Built FV.Backend.Proof.IselExclT (74s)
+✔ [1067/4556] Built FV.E2E.SizeVC (7.9s)
+✔ [1068/4556] Built FV.Backend.Proof.IselSzTChunk (1.5s)
+✔ [1069/4556] Built FV.Backend.Proof.IselSzTSound (3.9s)
+✔ [1070/4556] Built FV.Backend.Proof.IselCovExt (19s)
+✔ [1071/4556] Built FV.Backend.Proof.StockPureDriverUnsunk (64s)
+✔ [1072/4556] Built FV.Backend.Proof.IselShpTFns (1.9s)
+✔ [1073/4556] Built FV.Backend.Proof.IselEmitTFns (3.0s)
+✔ [1074/4556] Built FV.Backend.Proof.IselShpTab (959s)
+✔ [1075/4556] Built FV.Backend.Proof.IselFamAluBShift (16s)
+✔ [1076/4556] Built FV.E2E.VCodeSemIDriverWitness (1.4s)
+✔ [1077/4556] Built FV.E2E.ExtSemGuard (1.5s)
+✔ [1078/4556] Built FV.E2E.UnwindSem (3.1s)
+✔ [1079/4556] Built FV.Backend.Proof.IselMemAmode (9.7s)
+✔ [1080/4556] Built FV.Backend.Proof.IselMemAddr (12s)
+✔ [1081/4556] Built FV.Backend.Proof.StockBranchArgumentDemandWitness (1.6s)
+✔ [1082/4556] Built FV.Backend.Proof.IselCovTTabData (58s)
+✔ [1083/4556] Built FV.Backend.Proof.IselCtlCallInd (23s)
+✔ [1084/4556] Built FV.Backend.Proof.StockOutgoingShape (57s)
+✔ [1085/4556] Built FV.Backend.Proof.SpillCtlFormsT (1.7s)
+✔ [1086/4556] Built FV.E2E.SpillCheckAllocFix (2.7s)
+✔ [1087/4556] Built FV.Backend.Proof.SpillInstCheck (1.9s)
+✔ [1088/4556] Built FV.E2E.ABIReadOnlyCheck (1.7s)
+✔ [1089/4556] Built FV.Backend.Proof.DeadCleanupWitness (1.6s)
+✔ [1090/4556] Built FV.Backend.Proof.DeadCleanupPrepare (1.6s)
+⚠ [1091/4556] Built FV.E2E.RegLevelUnwind (1.0s)
+warning: FV/E2E/RegLevelUnwind.lean:88:10: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/E2E/RegLevelUnwind.lean:88:22: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/E2E/RegLevelUnwind.lean:126:14: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/E2E/RegLevelUnwind.lean:126:26: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/E2E/RegLevelUnwind.lean:135:23: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/E2E/RegLevelUnwind.lean:135:42: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/E2E/RegLevelUnwind.lean:141:10: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/E2E/RegLevelUnwind.lean:141:29: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/E2E/RegLevelUnwind.lean:294:18: `if_neg` has been deprecated: Use `ite_eq_right` instead
+✔ [1092/4556] Built FV.Unw.EhFrame (1.8s)
+⚠ [1093/4556] Built FV.E2E.Main (1.8s)
+warning: FV/E2E/Main.lean:80:12: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/E2E/Main.lean:86:12: `if_neg` has been deprecated: Use `ite_eq_right` instead
+✔ [1094/4556] Built FV.E2E.RegLevelMove (6.7s)
+✔ [1095/4556] Built FV.Backend.Proof.StockPrepareComplete (4.1s)
+✔ [1096/4556] Built FV.Backend.Proof.PerEdgePrepareJump (1.7s)
+✔ [1097/4556] Built FV.Backend.Proof.PerEdgePrepSplitWitness (1.7s)
+✔ [1098/4556] Built FV.E2E.PrepDirect (1.4s)
+✔ [1099/4556] Built FV.Backend.Proof.SpillLocalForms (32s)
+✔ [1100/4556] Built FV.Backend.Proof.StockParameterMetadata (1.4s)
+✔ [1101/4556] Built FV.Backend.Proof.StockAvailableProvenance (2.7s)
+✔ [1102/4556] Built FV.Backend.Proof.StockSourceStatementFamily (1.9s)
+✔ [1103/4556] Built FV.Backend.Proof.StockTwoBlockShape (2.3s)
+✔ [1104/4556] Built FV.Backend.Proof.StockDivImmFrame (1.4s)
