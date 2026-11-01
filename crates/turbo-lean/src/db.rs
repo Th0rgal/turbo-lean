@@ -130,85 +130,83 @@ impl Drop for CasExclusiveGcGuard {
 
 const STORE_TREE_DURABLE_MARKER: &str = "store_tree_durable.v1";
 
-fn resolve_store_root_abs(store_root: &Path) -> Result<PathBuf> {
+/// Resolve `path` using real filesystem semantics (canonicalizing the longest existing prefix so
+/// symlinks followed by `..` resolve identically to OS path traversal, then joining any not-yet-
+/// created suffix components).
+fn resolve_store_root_real(store_root: &Path) -> Result<PathBuf> {
     let raw = if store_root.is_absolute() {
         store_root.to_path_buf()
     } else {
         std::env::current_dir()?.join(store_root)
     };
-    let mut normalized = PathBuf::new();
-    for comp in raw.components() {
-        match comp {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                let _ = normalized.pop();
+    let mut missing_tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = raw.as_path();
+    loop {
+        if let Ok(canon) = fs::canonicalize(cur) {
+            let mut resolved = canon;
+            for part in missing_tail.into_iter().rev() {
+                if part == "." {
+                    continue;
+                } else if part == ".." {
+                    let _ = resolved.pop();
+                } else {
+                    resolved.push(part);
+                }
             }
-            other => normalized.push(other.as_os_str()),
+            return Ok(resolved);
         }
+        let Some(name) = cur.file_name() else {
+            return Ok(cur.to_path_buf());
+        };
+        missing_tail.push(name.to_os_string());
+        let Some(parent) = cur.parent() else {
+            return Ok(raw);
+        };
+        cur = parent;
     }
-    Ok(normalized)
 }
 
 /// Ensure `<store_root>/locks` exists and durably persist `store_root`, `<store_root>/locks`, and
-/// every ancestor directory above `store_root` (including `.` for relative `--cache-dir` roots)
-/// before returning.
+/// every ancestor directory above `store_root` (including `.` for relative `--cache-dir` roots and
+/// symlinked prefixes) before returning the canonical `<store_root>/locks` path.
 ///
 /// Concurrency & crash invariant:
 /// Mere filesystem existence of `locks/` does NOT prove a racing peer finished syncing the parent
 /// directories naming `store_root`. We therefore gate the fast path on a durable marker file
-/// `<store_root>/locks/store_tree_durable.v1` published ONLY after syncing the full ancestor chain
-/// bottom-up (`store_root` -> `store_root.parent()` -> ... -> `/`). If a peer created `locks/` and
-/// paused/crashed before writing the marker, any concurrent caller observing `!marker.exists()`
-/// independently performs the full bottom-up ancestor barrier before returning or publishing.
+/// `<store_root>/locks/store_tree_durable.v1` published ONLY after every ancestor directory barrier
+/// bottom-up (`store_root` -> `store_root.parent()` -> ... -> `/`) succeeds. Any barrier failure
+/// propagates immediately without writing the marker.
 pub(crate) fn ensure_store_locks_dir_durable(store_root: &Path) -> Result<PathBuf> {
-    let locks_dir = store_root.join("locks");
-    let marker_path = locks_dir.join(STORE_TREE_DURABLE_MARKER);
-    if marker_path.exists() {
-        return Ok(locks_dir);
+    let probe_locks = store_root.join("locks");
+    if probe_locks.join(STORE_TREE_DURABLE_MARKER).exists() {
+        return Ok(fs::canonicalize(&probe_locks).unwrap_or(probe_locks));
     }
-    let abs_root = resolve_store_root_abs(store_root)?;
-    let abs_locks = abs_root.join("locks");
-    let mut to_create = Vec::new();
-    let mut cur = Some(abs_locks.as_path());
-    while let Some(p) = cur {
-        if p.as_os_str().is_empty() || p.exists() {
-            break;
-        }
-        to_create.push(p.to_path_buf());
-        cur = p.parent();
+    let pre_resolved_root = resolve_store_root_real(store_root)?;
+    let pre_locks = pre_resolved_root.join("locks");
+    if pre_locks.join(STORE_TREE_DURABLE_MARKER).exists() {
+        return Ok(fs::canonicalize(&pre_locks).unwrap_or(pre_locks));
     }
-    for p in to_create.iter().rev() {
-        match fs::create_dir(p) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e.into()),
-        }
+    fs::create_dir_all(&pre_locks)?;
+    let abs_locks = fs::canonicalize(&pre_locks)?;
+    let abs_marker = abs_locks.join(STORE_TREE_DURABLE_MARKER);
+    if abs_marker.exists() {
+        return Ok(abs_locks);
     }
     let mut anc = abs_locks.parent();
     while let Some(p) = anc {
         if p.as_os_str().is_empty() {
             break;
         }
-        if let Err(e) = sync_dir(p) {
-            let transient_perm = matches!(
-                e.downcast_ref::<std::io::Error>().map(|ioe| ioe.kind()),
-                Some(std::io::ErrorKind::PermissionDenied)
-            ) && p != abs_root
-                && Some(p) != abs_root.parent();
-            if !transient_perm {
-                return Err(e);
-            }
-        }
+        sync_dir(p)?;
         if p.parent().is_none() {
             break;
         }
         anc = p.parent();
     }
-    let abs_marker = abs_locks.join(STORE_TREE_DURABLE_MARKER);
     if !abs_marker.exists() {
         write_bytes_durable(&abs_marker, b"1\n", &[])?;
     }
-    Ok(locks_dir)
+    Ok(abs_locks)
 }
 
 fn open_gc_publish_lock_file(store_root: &Path) -> Result<File> {
@@ -5589,6 +5587,72 @@ mod tests {
             rel_store_pos < rel_cwd_pos,
             "expected relative store root -> current directory sync order, got {evs:?}"
         );
+
+        // Symlink followed by `..` (`/dir/ws_parent/link_to_vol/../sym_cache`): OS traversal resolves
+        // `link_to_vol/..` to `vol_root`, NOT `ws_parent`. Initialization must create and sync
+        // `vol_root/sym_cache` (and `vol_root`), leaving `ws_parent/sym_cache` untouched.
+        let ws_parent = dir.join("ws_parent");
+        let vol_project = dir.join("vol_root").join("project");
+        fs::create_dir_all(&ws_parent)?;
+        fs::create_dir_all(&vol_project)?;
+        std::os::unix::fs::symlink(&vol_project, ws_parent.join("link_to_vol"))?;
+        let sym_dotdot_root = ws_parent.join("link_to_vol").join("..").join("sym_cache");
+        let _ = take_log();
+        let sym_guard = acquire_cas_publication_guard(&sym_dotdot_root)?;
+        drop(sym_guard);
+        let evs = take_log();
+        assert!(
+            dir.join("vol_root")
+                .join("sym_cache")
+                .join("locks")
+                .join(STORE_TREE_DURABLE_MARKER)
+                .exists(),
+            "marker must be written in real resolved target store"
+        );
+        assert!(
+            !ws_parent.join("sym_cache").exists(),
+            "lexical `..` must not create sibling store under symlink's lexical parent"
+        );
+        let sym_store_pos = evs
+            .iter()
+            .position(|s| s == "dir:sym_cache")
+            .expect("real sym_cache synced");
+        let vol_root_pos = evs
+            .iter()
+            .position(|s| s == "dir:vol_root")
+            .expect("real vol_root parent synced");
+        assert!(sym_store_pos < vol_root_pos, "{evs:?}");
+
+        // Fail-closed ancestor barrier: if an ancestor directory barrier fails (e.g., `PermissionDenied`
+        // on an upper ancestor), `ensure_store_locks_dir_durable` must return `Err` and MUST NOT
+        // write `store_tree_durable.v1`.
+        let denied_anc = dir.join("denied_ancestor");
+        let denied_store = denied_anc.join("job_dir").join("store_under_denied");
+        DURABILITY_HOOK.with(|h| {
+            *h.borrow_mut() = Some(std::sync::Arc::new(move |f| {
+                use std::os::unix::io::AsRawFd;
+                let fname = fs::read_link(format!("/proc/self/fd/{}", f.as_raw_fd()))
+                    .ok()
+                    .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+                    .unwrap_or_default();
+                if fname == "denied_ancestor" {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "simulated execute-only ancestor open/fsync failure",
+                    ));
+                }
+                Ok(())
+            }));
+        });
+        assert!(acquire_cas_publication_guard(&denied_store).is_err());
+        assert!(
+            !denied_store
+                .join("locks")
+                .join(STORE_TREE_DURABLE_MARKER)
+                .exists(),
+            "failed ancestor barrier must never publish store_tree_durable.v1"
+        );
+        set_durability_recorder(log.clone());
 
         let created = ensure_dir_tracking(&fresh_root.join("nested/stamp_dir"), &fresh_root)?;
         write_bytes_durable(

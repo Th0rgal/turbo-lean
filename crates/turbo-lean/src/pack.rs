@@ -607,10 +607,11 @@ fn stage_deferred_pack_record_locked(store_root: &Path, td: &str, v3_bytes: &[u8
     let Ok(locks_dir) = crate::db::ensure_store_locks_dir_durable(store_root) else {
         return false;
     };
-    let Ok(created) = crate::db::ensure_dir_tracking(&locks_dir, store_root) else {
+    let canonical_root = locks_dir.parent().unwrap_or(store_root);
+    let Ok(created) = crate::db::ensure_dir_tracking(&locks_dir, canonical_root) else {
         return false;
     };
-    let Ok(_def_lock) = acquire_deferred_pack_lock(store_root) else {
+    let Ok(_def_lock) = acquire_deferred_pack_lock(canonical_root) else {
         for dir in &created {
             let _ = crate::db::sync_dir(dir);
         }
