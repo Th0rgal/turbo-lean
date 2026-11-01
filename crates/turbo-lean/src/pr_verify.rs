@@ -4092,7 +4092,7 @@ fn kernel_statement_changes(
     base: &str,
     scope: Option<&Path>,
 ) -> Result<Vec<String>> {
-    kernel_statement_changes_with_trust(project, base, scope, None)
+    kernel_statement_changes_with_trust(&TurboStore::open(None)?, project, base, scope, None)
 }
 
 fn ensure_statement_lake_project(project: &Path) -> Result<()> {
@@ -4116,6 +4116,7 @@ fn ensure_statement_lake_project(project: &Path) -> Result<()> {
 }
 
 fn kernel_statement_changes_with_trust(
+    store: &TurboStore,
     project: &Path,
     base: &str,
     scope: Option<&Path>,
@@ -4174,6 +4175,19 @@ fn kernel_statement_changes_with_trust(
     let before =
         built_kernel_statements_with_trust(&base_project, relative_scope.as_deref(), is_untrusted)?;
     stock_statement_build_with_trust(&head_project, is_untrusted)?;
+    if !is_untrusted {
+        // This build can add non-default modules outside the edited dependency cone.
+        // Certify every report input, even unchanged sources with no theorem shards.
+        let pkg = crate::module_builder::resolve_package_config(&head_project, true)?;
+        let modules = statement_source_modules(&head_project, &pkg)?;
+        let roots = modules.keys().cloned().collect::<Vec<_>>();
+        let sources = modules
+            .into_values()
+            .map(|(source, _)| source)
+            .collect::<Vec<_>>();
+        crate::module_builder::audit_existing_module_roots(store, &head_project, &roots)?;
+        crate::module_builder::require_source_compilations(store, &head_project, &sources, false)?;
+    }
     let after =
         built_kernel_statement_report(&head_project, relative_scope.as_deref(), is_untrusted)?;
     StatementPolicy::at(project, base).audit(&after)?;
@@ -4362,6 +4376,7 @@ pub fn run_pr_verify_command(
     let statement_digest_t0 = Instant::now();
     let source_statement_edit = !classification.statement_edited_theorems.is_empty();
     classification.statement_edited_theorems = kernel_statement_changes_with_trust(
+        store,
         &canon_dir,
         &base,
         scope.as_deref(),
@@ -5461,6 +5476,60 @@ mod pr_verify_tests {
             !receipt.exists(),
             "rejected dependency must not produce a verification receipt"
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_trusted_pr_rejects_unchanged_nondefault_forged_statement_module() -> Result<()> {
+        use crate::worktree_test_support::{LakeTree, FORGED_DEPENDENCY_SOURCE};
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tree = LakeTree::new(
+            "nondefault_forgery",
+            &[("P/A.lean", "theorem a : True := by trivial\n")],
+        )?;
+        let config = tree.project.join("lakefile.toml");
+        let mut text = fs::read_to_string(&config)?;
+        text.push_str("\n[[lean_lib]]\nname = \"Hidden\"\nglobs = [\"Hidden.+\"]\n");
+        fs::write(config, text)?;
+        fs::create_dir_all(tree.project.join("Hidden"))?;
+        let hidden = tree.project.join("Hidden/Bad.lean");
+        fs::write(&hidden, FORGED_DEPENDENCY_SOURCE)?;
+        assert!(split_lean_source(FORGED_DEPENDENCY_SOURCE, &[])
+            .shards
+            .is_empty());
+        tree.lake(&["build", "Hidden"])?;
+        git_init_and_commit(&tree.project, "base")?;
+        fs::write(
+            tree.project.join("P/A.lean"),
+            "theorem a : True := by exact True.intro\n",
+        )?;
+        let mut store = TurboStore::open(Some(&tree.root.join("cache")))?;
+        let receipt = tree.root.join("receipt.json");
+        let err = run_pr_verify_command(
+            &mut store,
+            true,
+            tree.project.clone(),
+            "HEAD".into(),
+            "trusted".into(),
+            false,
+            Some(receipt.clone()),
+            None,
+            None,
+            Some(PathBuf::from("P/A.lean")),
+            false,
+            0,
+            None,
+        )
+        .unwrap_err();
+        let error = format!("{err:#}");
+        assert!(
+            error.contains("KernelReplay") && error.contains("Hidden.Bad"),
+            "{error}"
+        );
+        assert!(!receipt.exists());
         Ok(())
     }
 

@@ -8717,8 +8717,13 @@ pub(crate) fn require_source_compilations(
         // Check the full source now, including files outside the default target closure.
         let source = fs::read_to_string(file)?;
         let split = crate::splitter::split_lean_source(&source, &[]);
-        anyhow::ensure!(split.hygiene.is_clean_for_certification(),
-            "Source hygiene violation in {}: {:?}", file.display(), split.hygiene.disallowed_items());
+        let mut blocked = split.hygiene.disallowed_items();
+        // Exact csimp permissions are checked against the compiled declarations below.
+        if std::env::var("TURBO_LEAN_ALLOWED_CSIMP").is_ok_and(|s| !s.trim().is_empty()) {
+            blocked.retain(|item| item.rsplit(": ").next() != Some("csimp"));
+        }
+        anyhow::ensure!(blocked.is_empty(),
+            "Source hygiene violation in {}: {:?}", file.display(), blocked);
         ensure_imported_oleans_replayed(store, root, std::slice::from_ref(file))?;
         let (lean, _, lib, _) = resolve_toolchain_compiler(root, &lake_build::detect_toolchain(root))?;
         let lp = format!("{}:{}", lake_build::resolve_remote_lean_path(root, None), lib.display());
