@@ -13216,17 +13216,44 @@ roots = ["Fast"]
                 "{imp}"
             );
         }
-        // A dependency's `needs` only marks the target that sets it.
+        // An unsupported field only marks the target that sets it, for a dependency.
         let lf = dir.join("lakefile.lean");
         fs::write(
             &lf,
-            "import Lake\nopen Lake DSL\npackage t\nlean_lib A where\n  needs := #[gen]\nlean_lib B where\n  needs := #[]\n",
+            "import Lake\nopen Lake DSL\npackage t\nlean_lib A where\n  someFutureKey := 1\nlean_lib B where\n  needs := #[]\n",
         )
         .unwrap();
         let pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
         assert!(pkg.unsupported.is_none() && pkg.libs[1].unsupported.is_none());
         assert!(pkg.libs[0].unsupported.is_some());
         assert!(parse_lakefile_lean(&dir, &lf, true).is_err());
+        // `needs` is no longer one of those fields: it is read (into `lib.needs`) and folded into
+        // every cache key, so a `needs` naming a declared input is simply supported, while one
+        // naming nothing fails closed for *every* package rather than marking its target. The
+        // declaration is what the digests key on, so a dependency resolve that silently kept a
+        // `needs` pointing at no input would hand "unchanged" to code deciding staleness.
+        fs::write(
+            &lf,
+            "import Lake\nopen Lake DSL\npackage t\nlean_lib A where\n  needs := #[gen]\n",
+        )
+        .unwrap();
+        for is_root in [true, false] {
+            let err = parse_lakefile_lean(&dir, &lf, is_root)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("fail-closed") && err.contains("`gen`"), "{err}");
+        }
+        fs::write(
+            &lf,
+            "import Lake\nopen Lake DSL\npackage t\ninput_file gen where\n  path := \"g.txt\"\nlean_lib A where\n  needs := #[gen]\n",
+        )
+        .unwrap();
+        fs::write(dir.join("g.txt"), "g\n").unwrap();
+        for is_root in [true, false] {
+            let pkg = parse_lakefile_lean(&dir, &lf, is_root).unwrap();
+            assert!(pkg.unsupported.is_none() && pkg.libs[0].unsupported.is_none());
+            assert_eq!(pkg.libs[0].needs, vec!["gen".to_string()]);
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
