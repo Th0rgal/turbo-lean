@@ -324,7 +324,10 @@ fn source_has_no_untrusted_elab_tokens(
                         };
                         if !matches!(
                             path.as_str(),
-                            "LeanNative.Backend.FastCheck" | "TurboLean.FastCheck"
+                            "LeanNative.Backend.FastCheck"
+                                | "TurboLean.FastCheck"
+                                | "LeanNative.IR.Types"
+                                | "TurboLean.Reflection"
                         ) {
                             return false;
                         }
@@ -348,23 +351,40 @@ fn source_has_no_untrusted_elab_tokens(
                             return false;
                         }
                     }
-                    let Some((path, after_path)) = dotted_at(next_k) else {
-                        return false;
-                    };
-                    if !matches!(
-                        path.as_str(),
-                        "LeanNative.Backend.FastCheck" | "TurboLean.FastCheck"
-                    ) {
+                    let mut cur = next_k;
+                    let mut saw_ns = false;
+                    loop {
+                        while cur < n && chars[cur] != '\n' && chars[cur].is_whitespace() {
+                            cur += 1;
+                        }
+                        if cur >= n || chars[cur] == '\n' {
+                            break;
+                        }
+                        if let Some((kw, after_kw)) = ident_at(cur) {
+                            if kw == "in" && saw_ns {
+                                cur = after_kw;
+                                break;
+                            }
+                        }
+                        let Some((path, after_path)) = dotted_at(cur) else {
+                            return false;
+                        };
+                        if !matches!(
+                            path.as_str(),
+                            "LeanNative.Backend.FastCheck"
+                                | "TurboLean.FastCheck"
+                                | "LeanNative.IR"
+                                | "TurboLean.Reflection"
+                        ) {
+                            return false;
+                        }
+                        saw_ns = true;
+                        cur = after_path;
+                    }
+                    if !saw_ns {
                         return false;
                     }
-                    let mut p = after_path;
-                    while p < n && chars[p] != '\n' && chars[p].is_whitespace() {
-                        p += 1;
-                    }
-                    if p < n && chars[p] != '\n' {
-                        return false;
-                    }
-                    k = after_path;
+                    k = cur;
                     continue;
                 }
                 "abbrev" => {
@@ -517,6 +537,193 @@ fn source_has_no_untrusted_elab_tokens(
     true
 }
 
+fn is_reserved_shadow_ident(name: &str) -> bool {
+    matches!(
+        name,
+        "Word256"
+            | "UInt256"
+            | "Uint256"
+            | "EVMWord"
+            | "BitVec"
+            | "Nat"
+            | "Bool"
+            | "Int"
+            | "UInt8"
+            | "UInt16"
+            | "UInt32"
+            | "UInt64"
+            | "USize"
+            | "Option"
+            | "Prod"
+            | "StorageKey"
+            | "ContractState"
+            | "True"
+            | "False"
+            | "true"
+            | "false"
+            | "some"
+            | "none"
+            | "zero"
+            | "one"
+            | "max"
+            | "maxU64"
+            | "maxU128"
+            | "twoPow255"
+            | "getStorage"
+            | "setStorage"
+            | "fastBeq"
+            | "decide"
+    )
+}
+
+struct FileScopeScan {
+    scope: DeclScopeContext,
+    trusted_shadow_ok: bool,
+}
+
+fn scan_file_scope_context(
+    chars: &[char],
+    skip_at: &impl Fn(usize) -> Option<usize>,
+) -> FileScopeScan {
+    let n = chars.len();
+    let ident_at = |idx: usize| -> Option<(String, usize)> {
+        if idx >= n || !is_ident_start(chars[idx]) {
+            return None;
+        }
+        let mut j = idx + 1;
+        while j < n && is_ident_continue(chars[j]) {
+            j += 1;
+        }
+        Some((chars[idx..j].iter().collect(), j))
+    };
+    let dotted_at = |idx: usize| -> Option<(String, usize)> {
+        let mut j = idx;
+        let mut out = String::new();
+        loop {
+            let (seg, next) = ident_at(j)?;
+            out.push_str(&seg);
+            j = next;
+            if j < n && chars[j] == '.' {
+                out.push('.');
+                j += 1;
+                continue;
+            }
+            return Some((out, j));
+        }
+    };
+    let mut scope = DeclScopeContext::default();
+    let mut trusted_shadow_ok = true;
+    let mut k = 0usize;
+    while k < n {
+        if let Some(end) = skip_at(k) {
+            k = end;
+            continue;
+        }
+        if chars[k].is_whitespace() {
+            k += 1;
+            continue;
+        }
+        if !is_ident_start(chars[k]) || (k > 0 && chars[k - 1] == '.') {
+            k += 1;
+            continue;
+        }
+        let Some((word, mut next_k)) = ident_at(k) else {
+            k += 1;
+            continue;
+        };
+        let line_head = {
+            let mut p = k;
+            let mut ok = true;
+            while p > 0 && chars[p - 1] != '\n' {
+                p -= 1;
+                if !chars[p].is_whitespace() {
+                    ok = false;
+                    break;
+                }
+            }
+            ok
+        };
+        if !line_head {
+            k = next_k;
+            continue;
+        }
+        match word.as_str() {
+            "import" => {
+                scope.has_explicit_imports = true;
+                let mut cur = next_k;
+                loop {
+                    while cur < n && chars[cur] != '\n' && chars[cur].is_whitespace() {
+                        cur += 1;
+                    }
+                    if cur >= n || chars[cur] == '\n' {
+                        break;
+                    }
+                    let Some((path, after_path)) = dotted_at(cur) else {
+                        break;
+                    };
+                    if !scope.imported_modules.iter().any(|m| m == &path) {
+                        scope.imported_modules.push(path);
+                    }
+                    cur = after_path;
+                }
+                k = cur;
+            }
+            "open" => {
+                k = next_k;
+            }
+            "abbrev" => {
+                while next_k < n && chars[next_k] != '\n' && chars[next_k].is_whitespace() {
+                    next_k += 1;
+                }
+                let Some((name, after_name)) = dotted_at(next_k) else {
+                    k = next_k;
+                    continue;
+                };
+                let mut cur = after_name;
+                while cur < n && chars[cur] != '\n' && chars[cur].is_whitespace() {
+                    cur += 1;
+                }
+                if chars.get(cur) == Some(&':') && chars.get(cur + 1) == Some(&'=') {
+                    cur += 2;
+                    while cur < n && chars[cur] != '\n' && chars[cur].is_whitespace() {
+                        cur += 1;
+                    }
+                    if let Some((rhs, _)) = dotted_at(cur) {
+                        if name == "Word256" && rhs == "LeanNative.Backend.FastCheck.Word256" {
+                            scope.has_word256_abbrev = true;
+                        } else if name.split('.').any(is_reserved_shadow_ident) {
+                            trusted_shadow_ok = false;
+                        }
+                    }
+                } else if name.split('.').any(is_reserved_shadow_ident) {
+                    trusted_shadow_ok = false;
+                }
+                k = after_name;
+            }
+            "def" | "theorem" | "lemma" | "inductive" | "structure" => {
+                while next_k < n && chars[next_k] != '\n' && chars[next_k].is_whitespace() {
+                    next_k += 1;
+                }
+                if let Some((name, after)) = dotted_at(next_k) {
+                    if name.split('.').any(is_reserved_shadow_ident) {
+                        trusted_shadow_ok = false;
+                    }
+                    k = after;
+                } else {
+                    k = next_k;
+                }
+            }
+            _ => {
+                k = next_k;
+            }
+        }
+    }
+    FileScopeScan {
+        scope,
+        trusted_shadow_ok,
+    }
+}
+
 pub(super) fn extract_all_lean_theorems(
     clean_src: &str,
     target_name: Option<&str>,
@@ -630,8 +837,11 @@ pub(super) fn extract_all_lean_theorems(
     let n = chars.len();
     let mut i = 0;
     let mut scope_stack: Vec<(LexScopeKind, String)> = Vec::new();
+    let mut open_stack: Vec<(usize, String)> = Vec::new();
+    let mut transient_opens: Vec<String> = Vec::new();
     let mut all_decls: Vec<ExtractedDecl> = Vec::new();
     let file_elab_trusted = source_has_no_untrusted_elab_tokens(&chars, &skip_at);
+    let mut file_scope = scan_file_scope_context(&chars, &skip_at);
 
     while i < n {
         if let Some(end) = skip_at(i) {
@@ -655,14 +865,19 @@ pub(super) fn extract_all_lean_theorems(
             if is_line_command_head(start) {
                 match word.as_str() {
                     "namespace" => {
+                        transient_opens.clear();
                         let (ns_name, next_i) = read_dotted_ident(i, n);
                         i = next_i;
                         for seg in ns_name.split('.').filter(|s| !s.is_empty()) {
                             scope_stack.push((LexScopeKind::Namespace, seg.to_string()));
+                            if is_reserved_shadow_ident(seg) {
+                                file_scope.trusted_shadow_ok = false;
+                            }
                         }
                         continue;
                     }
                     "section" => {
+                        transient_opens.clear();
                         let (sec_name, next_i) = read_dotted_ident(i, n);
                         i = next_i;
                         if sec_name.is_empty() {
@@ -675,10 +890,12 @@ pub(super) fn extract_all_lean_theorems(
                         continue;
                     }
                     "mutual" => {
+                        transient_opens.clear();
                         scope_stack.push((LexScopeKind::Mutual, String::new()));
                         continue;
                     }
                     "end" => {
+                        transient_opens.clear();
                         let (end_name, next_i) = read_dotted_ident(i, n);
                         i = next_i;
                         if end_name.is_empty() {
@@ -694,9 +911,71 @@ pub(super) fn extract_all_lean_theorems(
                                 }
                             }
                         }
+                        let depth_now = scope_stack.len();
+                        open_stack.retain(|(d, _)| *d <= depth_now);
                         continue;
                     }
-                    _ => {}
+                    "open" => {
+                        let mut cur = i;
+                        let mut parsed_ns = Vec::new();
+                        let mut has_in = false;
+                        loop {
+                            while cur < n && chars[cur] != '\n' && chars[cur].is_whitespace() {
+                                cur += 1;
+                            }
+                            if cur >= n || chars[cur] == '\n' {
+                                break;
+                            }
+                            let (tok, after_tok) = read_dotted_ident(cur, n);
+                            if tok.is_empty() {
+                                break;
+                            }
+                            if tok == "in" && !parsed_ns.is_empty() {
+                                has_in = true;
+                                cur = after_tok;
+                                break;
+                            }
+                            parsed_ns.push(tok);
+                            cur = after_tok;
+                        }
+                        if has_in {
+                            for ns in parsed_ns {
+                                if !transient_opens.contains(&ns) {
+                                    transient_opens.push(ns);
+                                }
+                            }
+                        } else {
+                            transient_opens.clear();
+                            let d = scope_stack.len();
+                            for ns in parsed_ns {
+                                if !open_stack.iter().any(|(_, existing)| existing == &ns) {
+                                    open_stack.push((d, ns));
+                                }
+                            }
+                        }
+                        i = cur;
+                        continue;
+                    }
+                    "import" | "set_option" => {}
+                    _ => {
+                        if !matches!(
+                            word.as_str(),
+                            "theorem"
+                                | "lemma"
+                                | "noncomputable"
+                                | "private"
+                                | "protected"
+                                | "scoped"
+                                | "local"
+                                | "unsafe"
+                                | "partial"
+                                | "nonrec"
+                                | "public"
+                                | "meta"
+                        ) {
+                            transient_opens.clear();
+                        }
+                    }
                 }
             }
             if (word == "theorem" || word == "lemma") && is_line_command_head(start) {
@@ -819,7 +1098,9 @@ pub(super) fn extract_all_lean_theorems(
                                     header_trusted = false;
                                 }
                                 for v in &var_names {
-                                    if seen_names.iter().any(|s| s == v) {
+                                    if seen_names.iter().any(|s| s == v)
+                                        || is_reserved_shadow_ident(v)
+                                    {
                                         header_trusted = false;
                                     }
                                     seen_names.push(v.clone());
@@ -923,7 +1204,46 @@ pub(super) fn extract_all_lean_theorems(
                 }
                 let prop_str: String = chars[stmt_start..stmt_end].iter().collect();
                 let (trimmed, let_ok) = inline_stmt_let_bindings_checked(prop_str.trim());
+                let abbrev_valid = !file_scope.scope.has_word256_abbrev
+                    || (file_scope.scope.has_explicit_imports
+                        && file_scope.scope.imported_modules.iter().any(|m| {
+                            matches!(
+                                m.as_str(),
+                                "LeanNative.Backend.FastCheck" | "TurboLean.FastCheck"
+                            )
+                        }));
+                let decl_name_shadow = decl_name.split('.').any(is_reserved_shadow_ident)
+                    || qualified_name.split('.').any(is_reserved_shadow_ident);
+                let mut open_namespaces: Vec<String> =
+                    open_stack.iter().map(|(_, ns)| ns.clone()).collect();
+                for ns in std::mem::take(&mut transient_opens) {
+                    if !open_namespaces.contains(&ns) {
+                        open_namespaces.push(ns);
+                    }
+                }
+                let mut enclosing_namespaces: Vec<String> = Vec::new();
+                let ns_segs: Vec<&str> = scope_stack
+                    .iter()
+                    .filter(|(k, _)| *k == LexScopeKind::Namespace)
+                    .map(|(_, s)| s.as_str())
+                    .collect();
+                for len in 1..=ns_segs.len() {
+                    let prefix = ns_segs[..len].join(".");
+                    if !enclosing_namespaces.contains(&prefix) {
+                        enclosing_namespaces.push(prefix);
+                    }
+                }
+                let decl_scope = DeclScopeContext {
+                    has_explicit_imports: file_scope.scope.has_explicit_imports,
+                    imported_modules: file_scope.scope.imported_modules.clone(),
+                    open_namespaces,
+                    enclosing_namespaces,
+                    has_word256_abbrev: file_scope.scope.has_word256_abbrev,
+                };
                 let decl_trusted = file_elab_trusted
+                    && file_scope.trusted_shadow_ok
+                    && abbrev_valid
+                    && !decl_name_shadow
                     && header_trusted
                     && let_ok
                     && !trimmed.contains(';')
@@ -937,6 +1257,7 @@ pub(super) fn extract_all_lean_theorems(
                         instance_binders,
                         prop_str: trimmed,
                         trusted_elab_context: decl_trusted,
+                        scope: decl_scope,
                     });
                 }
             }
@@ -1633,10 +1954,12 @@ pub(super) fn is_syntactically_contradictory_hyp(hyp: &str) -> bool {
             return true;
         }
         if !is_ne {
-            // Detect `a = Word256.add a Word256.one` or `a = a + 1`
+            // Detect `a = Word256.add a Word256.one`, `a = UInt256.add a UInt256.one`, or `a = a + 1`
             if r == format!("Word256.add {} Word256.one", l)
+                || r == format!("UInt256.add {} UInt256.one", l)
                 || r == format!("{} + 1", l)
                 || l == format!("Word256.add {} Word256.one", r)
+                || l == format!("UInt256.add {} UInt256.one", r)
                 || l == format!("{} + 1", r)
             {
                 return true;

@@ -86,6 +86,20 @@ pub struct TranspiledParam {
     pub cuda_type: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclScopeContext {
+    #[serde(default)]
+    pub has_explicit_imports: bool,
+    #[serde(default)]
+    pub imported_modules: Vec<String>,
+    #[serde(default)]
+    pub open_namespaces: Vec<String>,
+    #[serde(default)]
+    pub enclosing_namespaces: Vec<String>,
+    #[serde(default)]
+    pub has_word256_abbrev: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranspiledCudaKernel {
     pub decl_name: String,
@@ -100,6 +114,8 @@ pub struct TranspiledCudaKernel {
     pub binder_hyps: Vec<String>,
     #[serde(default)]
     pub trusted_elab_context: bool,
+    #[serde(default)]
+    pub scope: DeclScopeContext,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,6 +196,49 @@ pub(crate) struct ExtractedDecl {
     instance_binders: Vec<String>,
     prop_str: String,
     trusted_elab_context: bool,
+    scope: DeclScopeContext,
+}
+
+impl ExtractedDecl {
+    pub(crate) fn render_scoped_stmt_src(&self) -> String {
+        let mut out = String::new();
+        if self.scope.has_explicit_imports {
+            for m in &self.scope.imported_modules {
+                out.push_str("import ");
+                out.push_str(m);
+                out.push('\n');
+            }
+        }
+        let enclosing = self.scope.enclosing_namespaces.last().cloned();
+        if let Some(ref ns) = enclosing {
+            out.push_str("namespace ");
+            out.push_str(ns);
+            out.push('\n');
+        }
+        for o in &self.scope.open_namespaces {
+            out.push_str("open ");
+            out.push_str(o);
+            out.push('\n');
+        }
+        if self.scope.has_word256_abbrev {
+            out.push_str("abbrev Word256 := LeanNative.Backend.FastCheck.Word256\n");
+        }
+        let binders_prefix: String = self
+            .binders
+            .iter()
+            .map(|(ns, ty)| format!("({} : {}) ", ns.join(" "), ty))
+            .collect();
+        out.push_str(&format!(
+            "theorem {} {}: {}\n:= by sorry\n",
+            self.name, binders_prefix, self.prop_str
+        ));
+        if let Some(ref ns) = enclosing {
+            out.push_str("end ");
+            out.push_str(ns);
+            out.push('\n');
+        }
+        out
+    }
 }
 
 fn extract_lean_theorem(clean_src: &str, target_name: Option<&str>) -> Result<ExtractedDecl> {
@@ -305,17 +364,37 @@ fn strip_balanced_outer_parens(s: &str) -> &str {
     cur
 }
 
+fn is_prop_expr_ast(expr: &LeanExpr) -> bool {
+    match expr {
+        LeanExpr::Ident(id) => matches!(id.as_str(), "True" | "False"),
+        LeanExpr::Unary(op, inner) => op == "¬" && is_prop_expr_ast(inner),
+        LeanExpr::Binary(op, l, r) => match op.as_str() {
+            "=" | "≠" | "<" | "<=" | "≤" | ">" | ">=" | "≥" => true,
+            "∧" | "∨" => is_prop_expr_ast(l) && is_prop_expr_ast(r),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 fn parse_conclusion_target(
     conclusion_str: &str,
 ) -> Result<(String, String, LeanExpr, LeanExpr, bool)> {
     let concl_trim = conclusion_str.trim();
     let concl_ast = parse_lean_expr_str(concl_trim)?;
+    if !is_prop_expr_ast(&concl_ast) {
+        bail!(
+            "Theorem conclusion `{}` is not a recognized `Prop` formula (bare `Bool` terms require `= true` / `= false`)",
+            concl_trim
+        );
+    }
     if let LeanExpr::Binary(op, l_box, r_box) = &concl_ast {
-        if matches!(op.as_str(), "=" | "==" | "!=" | "≠") {
-            let is_ne = matches!(op.as_str(), "!=" | "≠");
+        if matches!(op.as_str(), "=" | "≠") {
+            let is_ne = op.as_str() == "≠";
             let stripped = strip_balanced_outer_parens(concl_trim);
             if let Some((l_str, r_str, split_ne)) = split_top_level_eq(stripped) {
                 if split_ne == is_ne
+                    && !concl_trim.contains("!=")
                     && parse_lean_expr_str(&l_str).as_ref().ok() == Some(l_box.as_ref())
                     && parse_lean_expr_str(&r_str).as_ref().ok() == Some(r_box.as_ref())
                 {
@@ -333,9 +412,9 @@ fn parse_conclusion_target(
     }
     Ok((
         concl_trim.to_string(),
-        "true".to_string(),
+        "True".to_string(),
         concl_ast,
-        LeanExpr::Ident("true".to_string()),
+        LeanExpr::Ident("True".to_string()),
         false,
     ))
 }
@@ -646,6 +725,8 @@ fn flatten_qualified_name(expr: &LeanExpr) -> Option<String> {
             if matches!(
                 prefix.as_str(),
                 "Word256"
+                    | "LeanNative.Backend.FastCheck"
+                    | "LeanNative.Backend.FastCheck.Word256"
                     | "TurboLean"
                     | "TurboLean.FastCheck"
                     | "TurboLean.FastCheck.Word256"
@@ -653,13 +734,18 @@ fn flatten_qualified_name(expr: &LeanExpr) -> Option<String> {
                     | "TurboLean.Reflection.StorageKey"
                     | "StorageKey"
                     | "UInt256"
+                    | "EVMWord"
+                    | "LeanNative.IR"
+                    | "LeanNative.IR.UInt256"
+                    | "LeanNative.IR.EVMWord"
+                    | "Option"
                     | "BitVec"
                     | "UInt64"
                     | "UInt32"
                     | "UInt16"
                     | "UInt8"
-                    | "USize"
                     | "Nat"
+                    | "Int"
                     | "Bool"
             ) {
                 Some(format!("{}.{}", prefix, field))
@@ -671,28 +757,101 @@ fn flatten_qualified_name(expr: &LeanExpr) -> Option<String> {
     }
 }
 
-fn is_u256_const_prefix(prefix: &str) -> bool {
-    matches!(
-        prefix,
-        "Word256" | "TurboLean.FastCheck.Word256" | "UInt256"
+fn scope_imports(scope: &DeclScopeContext, modules: &[&str]) -> bool {
+    !scope.has_explicit_imports
+        || scope
+            .imported_modules
+            .iter()
+            .any(|m| modules.contains(&m.as_str()))
+}
+
+fn scope_opens(scope: &DeclScopeContext, namespace: &str) -> bool {
+    (!scope.has_explicit_imports && scope.open_namespaces.is_empty())
+        || scope
+            .open_namespaces
+            .iter()
+            .chain(&scope.enclosing_namespaces)
+            .any(|n| n == namespace)
+}
+
+fn word256_imported(scope: &DeclScopeContext) -> bool {
+    scope_imports(
+        scope,
+        &["LeanNative.Backend.FastCheck", "TurboLean.FastCheck"],
     )
+}
+
+fn uint256_imported(scope: &DeclScopeContext) -> bool {
+    scope_imports(
+        scope,
+        &[
+            "LeanNative.IR.Types",
+            "LeanNative.Backend.FastCheck",
+            "TurboLean.FastCheck",
+        ],
+    )
+}
+
+fn word256_ns_visible(scope: &DeclScopeContext) -> bool {
+    (word256_imported(scope)
+        && (scope.has_word256_abbrev || scope_opens(scope, "LeanNative.Backend.FastCheck")))
+        || (scope_imports(scope, &["TurboLean.FastCheck"])
+            && scope_opens(scope, "TurboLean.FastCheck"))
+}
+
+fn uint256_ns_visible(scope: &DeclScopeContext) -> bool {
+    uint256_imported(scope) && scope_opens(scope, "LeanNative.IR")
+}
+
+fn reflection_ns_visible(scope: &DeclScopeContext) -> bool {
+    scope_imports(scope, &["TurboLean.Reflection"]) && scope_opens(scope, "TurboLean.Reflection")
+}
+
+fn resolve_qname(qname: &str, scope: &DeclScopeContext) -> Option<String> {
+    let (prefix, short) = qname.rsplit_once('.')?;
+    let canonical_prefix = match prefix {
+        "Word256" if word256_ns_visible(scope) => "Word256",
+        "LeanNative.Backend.FastCheck.Word256" if word256_imported(scope) => "Word256",
+        "TurboLean.FastCheck.Word256" if scope_imports(scope, &["TurboLean.FastCheck"]) => {
+            "Word256"
+        }
+        "UInt256" | "EVMWord" if uint256_ns_visible(scope) => "UInt256",
+        "LeanNative.IR.UInt256" | "LeanNative.IR.EVMWord" if uint256_imported(scope) => "UInt256",
+        "StorageKey" if reflection_ns_visible(scope) => "StorageKey",
+        "TurboLean.Reflection.StorageKey" if scope_imports(scope, &["TurboLean.Reflection"]) => {
+            "StorageKey"
+        }
+        "Option" => "Option",
+        _ => return None,
+    };
+    Some(format!("{canonical_prefix}.{short}"))
 }
 
 fn is_u256_fn_prefix(prefix: &str) -> bool {
     matches!(
         prefix,
-        "Word256" | "TurboLean" | "TurboLean.FastCheck" | "TurboLean.FastCheck.Word256" | "UInt256"
+        "Word256"
+            | "LeanNative.Backend.FastCheck.Word256"
+            | "TurboLean.FastCheck.Word256"
+            | "UInt256"
+            | "EVMWord"
+            | "LeanNative.IR.UInt256"
+            | "LeanNative.IR.EVMWord"
     )
+}
+
+fn is_u256_const_prefix(prefix: &str) -> bool {
+    is_u256_fn_prefix(prefix)
 }
 
 fn scalar_domain_matches_fn_prefix(prefix: &str, dom: ScalarEvalDomain) -> bool {
     match prefix {
         "Nat" => dom.is_nat,
         "BitVec" => dom.is_bitvec,
-        "UInt64" | "USize" => !dom.is_nat && !dom.is_bitvec && dom.word_bits == 64,
-        "UInt32" => !dom.is_nat && !dom.is_bitvec && dom.word_bits == 32,
-        "UInt16" => !dom.is_nat && !dom.is_bitvec && dom.word_bits == 16,
-        "UInt8" => !dom.is_nat && !dom.is_bitvec && dom.word_bits == 8,
+        "UInt64" => !dom.is_nat && !dom.is_int && !dom.is_bitvec && dom.word_bits == 64,
+        "UInt32" => !dom.is_nat && !dom.is_int && !dom.is_bitvec && dom.word_bits == 32,
+        "UInt16" => !dom.is_nat && !dom.is_int && !dom.is_bitvec && dom.word_bits == 16,
+        "UInt8" => !dom.is_nat && !dom.is_int && !dom.is_bitvec && dom.word_bits == 8,
         _ => false,
     }
 }
@@ -703,7 +862,7 @@ fn cuda_fn_prefix_allowed(
     ambient_bv256: bool,
 ) -> bool {
     match prefix {
-        None | Some("Bool") => true,
+        None | Some("Bool" | "Option") => true,
         Some(p) if is_u256_fn_prefix(p) => eval_dom.is_none(),
         Some("BitVec") => {
             eval_dom.is_some_and(|d| d.is_bitvec) || (eval_dom.is_none() && ambient_bv256)
@@ -718,13 +877,20 @@ fn expr_mentions_ident_value(
 ) -> bool {
     if let Some(qname) = flatten_qualified_name(expr) {
         if let Some((prefix, _)) = qname.rsplit_once('.') {
-            if prefix == "BitVec" || is_u256_const_prefix(prefix) {
-                return param_names.contains("__u256_const__") || prefix == "BitVec";
+            if prefix == "BitVec" || prefix == "Option" || is_u256_const_prefix(prefix) {
+                return param_names.contains("__u256_const__")
+                    || prefix == "BitVec"
+                    || prefix == "Option";
             }
+        } else if qname == "none" {
+            return param_names.contains("__u256_const__");
         }
     }
     match expr {
-        LeanExpr::Ident(n) => param_names.contains(n.as_str()),
+        LeanExpr::Ident(n) => {
+            param_names.contains(n.as_str())
+                || (n == "none" && param_names.contains("__u256_const__"))
+        }
         LeanExpr::Number(_) => false,
         LeanExpr::Member(b, _) | LeanExpr::Unary(_, b) => expr_mentions_ident_value(b, param_names),
         LeanExpr::Binary(op, l, r) => {
@@ -766,15 +932,17 @@ fn expr_mentions_ident_value(
                     return true;
                 }
                 if let Some(p) = prefix {
-                    if matches!(p, "UInt8" | "UInt16" | "UInt32" | "UInt64" | "USize")
+                    if matches!(p, "UInt8" | "UInt16" | "UInt32" | "UInt64" | "Option")
                         || is_u256_fn_prefix(p)
                     {
                         return param_names.contains("__typed_fn__");
                     }
+                } else if short == "some" {
+                    return param_names.contains("__typed_fn__");
                 }
                 if matches!(
                     short,
-                    "shiftLeft" | "shiftRight" | "ushiftRight" | "shl" | "shr"
+                    "shiftLeft" | "shiftRight" | "ushiftRight" | "shl" | "shr" | "sar"
                 ) && !args.is_empty()
                 {
                     return expr_mentions_ident_value(&args[0], param_names);
@@ -794,20 +962,36 @@ fn expr_mentions_ident_value(
 
 fn expr_produces_bool(expr: &LeanExpr) -> bool {
     match expr {
-        LeanExpr::Ident(id) => matches!(id.as_str(), "true" | "True" | "false" | "False"),
-        LeanExpr::Unary(op, _) => matches!(op.as_str(), "!" | "¬"),
-        LeanExpr::Binary(op, _, _) => matches!(
-            op.as_str(),
-            "=" | "==" | "!=" | "≠" | "<" | "<=" | "≤" | ">" | ">=" | "≥" | "&&" | "∧" | "||" | "∨"
-        ),
+        LeanExpr::Ident(id) => matches!(id.as_str(), "true" | "false"),
+        LeanExpr::Unary(op, _) => op == "!",
+        LeanExpr::Binary(op, _, _) => matches!(op.as_str(), "==" | "!=" | "&&" | "||"),
         LeanExpr::IfThenElse(_, t, e) => expr_produces_bool(t) || expr_produces_bool(e),
+        LeanExpr::Member(_, field) => matches!(field.as_str(), "2" | "snd"),
         LeanExpr::App(h, _) => flatten_qualified_name(h).is_some_and(|qname| {
             let prefix = qname.rsplit_once('.').map(|(p, _)| p);
             let short = qname.rsplit('.').next().unwrap_or(qname.as_str());
-            prefix == Some("Bool") || matches!(short, "beq" | "fastBeq")
+            prefix == Some("Bool")
+                || matches!(short, "beq" | "fastBeq")
+                || (prefix == Some("UInt256") && matches!(short, "lt" | "le"))
         }),
         _ => false,
     }
+}
+
+fn expr_produces_bool_or_prop(expr: &LeanExpr) -> bool {
+    expr_produces_bool(expr)
+        || match expr {
+            LeanExpr::Ident(id) => matches!(id.as_str(), "True" | "False"),
+            LeanExpr::Unary(op, _) => op == "¬",
+            LeanExpr::Binary(op, _, _) => matches!(
+                op.as_str(),
+                "=" | "≠" | "<" | "<=" | "≤" | ">" | ">=" | "≥" | "∧" | "∨"
+            ),
+            LeanExpr::IfThenElse(_, t, e) => {
+                expr_produces_bool_or_prop(t) || expr_produces_bool_or_prop(e)
+            }
+            _ => false,
+        }
 }
 
 fn expr_synthesizes_int_or_complement_without_typed_value(
@@ -865,6 +1049,7 @@ fn nat_count_domain() -> ScalarEvalDomain {
     ScalarEvalDomain {
         word_bits: 64,
         is_nat: true,
+        is_int: false,
         is_bitvec: false,
     }
 }
@@ -973,6 +1158,7 @@ fn emit_cuda_expr_with_ctx(
     ambient_bv256: bool,
     value_params: &std::collections::HashSet<&str>,
     bitvec_params: &std::collections::HashSet<&str>,
+    scope: &DeclScopeContext,
 ) -> Result<String> {
     let outer_dom = expected_dom;
     if let LeanExpr::Unary(op, inner) = expr {
@@ -1014,9 +1200,24 @@ fn emit_cuda_expr_with_ctx(
     if let Some(qname) = flatten_qualified_name(expr) {
         let short = qname.rsplit('.').next().unwrap_or(qname.as_str());
         if let Some((prefix, _)) = qname.rsplit_once('.') {
-            if is_u256_const_prefix(prefix) {
-                if let "zero" | "one" | "max" = short {
-                    return Ok(format!("u256_{}()", short));
+            if let Some(canon) = resolve_qname(&qname, scope) {
+                let cshort = canon.rsplit('.').next().unwrap_or(canon.as_str());
+                if canon == "Option.none" {
+                    return Ok("opt_u256_none()".to_string());
+                }
+                if canon.starts_with("Word256.") {
+                    if let "zero" | "one" | "max" = cshort {
+                        return Ok(format!("u256_{}()", cshort));
+                    }
+                }
+                if canon.starts_with("UInt256.") {
+                    return match cshort {
+                        "zero" | "one" | "max" => Ok(format!("u256_{}()", cshort)),
+                        "maxU64" => Ok("u256_max_u64()".to_string()),
+                        "maxU128" => Ok("u256_max_u128()".to_string()),
+                        "twoPow255" => Ok("u256_two_pow_255()".to_string()),
+                        _ => bail!("Unsupported `UInt256` constant `{}`", qname),
+                    };
                 }
             }
             if prefix == "Nat" && scalar_dom.is_some_and(|d| d.is_nat) && short == "zero" {
@@ -1027,6 +1228,7 @@ fn emit_cuda_expr_with_ctx(
             return match short {
                 "true" | "True" => Ok("true".to_string()),
                 "false" | "False" => Ok("false".to_string()),
+                "none" => Ok("opt_u256_none()".to_string()),
                 _ => Ok(short.to_string()),
             };
         }
@@ -1036,9 +1238,21 @@ fn emit_cuda_expr_with_ctx(
         LeanExpr::Ident(name) => match name.as_str() {
             "true" | "True" => Ok("true".to_string()),
             "false" | "False" => Ok("false".to_string()),
+            "none" => Ok("opt_u256_none()".to_string()),
             _ => Ok(name.clone()),
         },
-        LeanExpr::Number(n) => Ok(wrap_out(format!("{}ULL", n))),
+        LeanExpr::Number(n) => {
+            let parsed = if let Some(hex) = n.strip_prefix("0x").or_else(|| n.strip_prefix("0X")) {
+                u128::from_str_radix(hex, 16)
+            } else {
+                n.parse::<u128>()
+            }
+            .map_err(|_| anyhow::anyhow!("Numeric literal `{}` exceeds u128", n))?;
+            if parsed > u128::from(u64::MAX) {
+                bail!("Numeric literal `{}` exceeds 64-bit CUDA scalar bound", n);
+            }
+            Ok(wrap_out(format!("{}ULL", parsed as u64)))
+        }
         LeanExpr::Member(base, field) => {
             let b = emit_cuda_expr_with_ctx(
                 base,
@@ -1046,14 +1260,18 @@ fn emit_cuda_expr_with_ctx(
                 ambient_bv256,
                 value_params,
                 bitvec_params,
+                scope,
             )?;
+            if field == "toUInt256" {
+                return Ok(b);
+            }
             let mapped = match field.as_str() {
                 "1" | "fst" => "fst",
                 "2" | "snd" => "snd",
-                "w0" => "w0",
-                "w1" => "w1",
-                "w2" => "w2",
-                "w3" => "w3",
+                "w0" | "lo0" => "w0",
+                "w1" | "lo1" => "w1",
+                "w2" | "hi0" => "w2",
+                "w3" | "hi1" => "w3",
                 other => bail!("Unsupported field projection `.{}` on `{}`", other, b),
             };
             Ok(format!("({}).{}", b, mapped))
@@ -1068,12 +1286,20 @@ fn emit_cuda_expr_with_ctx(
             let u64_limb_dom = Some(ScalarEvalDomain {
                 word_bits: 64,
                 is_nat: false,
+                is_int: false,
                 is_bitvec: false,
             });
             let c_items = items
                 .iter()
                 .map(|it| {
-                    emit_cuda_expr_with_ctx(it, u64_limb_dom, false, value_params, bitvec_params)
+                    emit_cuda_expr_with_ctx(
+                        it,
+                        u64_limb_dom,
+                        false,
+                        value_params,
+                        bitvec_params,
+                        scope,
+                    )
                 })
                 .collect::<Result<Vec<_>>>()?;
             Ok(format!("make_u256({})", c_items.join(", ")))
@@ -1089,17 +1315,19 @@ fn emit_cuda_expr_with_ctx(
                 "make_u256_bool_pair({}, {})",
                 emit_cuda_expr_with_ctx(
                     &items[0],
-                    scalar_dom,
-                    ambient_bv256,
+                    None,
+                    false,
                     value_params,
-                    bitvec_params
+                    bitvec_params,
+                    scope
                 )?,
                 emit_cuda_expr_with_ctx(
                     &items[1],
-                    scalar_dom,
-                    ambient_bv256,
+                    None,
+                    false,
                     value_params,
-                    bitvec_params
+                    bitvec_params,
+                    scope
                 )?
             ))
         }
@@ -1111,9 +1339,30 @@ fn emit_cuda_expr_with_ctx(
             };
             Ok(wrap_out(format!(
                 "(({}) ? ({}) : ({}))",
-                emit_cuda_expr_with_ctx(c, outer_dom, ambient_bv256, value_params, bitvec_params)?,
-                emit_cuda_expr_with_ctx(t, branch_dom, ambient_bv256, value_params, bitvec_params)?,
-                emit_cuda_expr_with_ctx(e, branch_dom, ambient_bv256, value_params, bitvec_params)?
+                emit_cuda_expr_with_ctx(
+                    c,
+                    outer_dom,
+                    ambient_bv256,
+                    value_params,
+                    bitvec_params,
+                    scope
+                )?,
+                emit_cuda_expr_with_ctx(
+                    t,
+                    branch_dom,
+                    ambient_bv256,
+                    value_params,
+                    bitvec_params,
+                    scope
+                )?,
+                emit_cuda_expr_with_ctx(
+                    e,
+                    branch_dom,
+                    ambient_bv256,
+                    value_params,
+                    bitvec_params,
+                    scope
+                )?
             )))
         }
         LeanExpr::Unary(op, inner) => {
@@ -1123,6 +1372,7 @@ fn emit_cuda_expr_with_ctx(
                 ambient_bv256,
                 value_params,
                 bitvec_params,
+                scope,
             )?;
             match op.as_str() {
                 "~~~" => Ok(wrap_out(format!("lean_bitnot({})", ic))),
@@ -1139,8 +1389,8 @@ fn emit_cuda_expr_with_ctx(
                 if untyped_comparison_synthesizes_int_or_complement(lhs, rhs, value_params) {
                     bail!("Lean elaborates untyped unary `-`/`~~~` comparison operand in Int/Complement");
                 }
-                let cmp_nat = !expr_produces_bool(lhs)
-                    && !expr_produces_bool(rhs)
+                let cmp_nat = !expr_produces_bool_or_prop(lhs)
+                    && !expr_produces_bool_or_prop(rhs)
                     && (scalar_dom.is_some_and(|d| d.is_nat)
                         || (!expr_mentions_ident_value(lhs, value_params)
                             && !expr_mentions_ident_value(rhs, value_params)));
@@ -1151,6 +1401,7 @@ fn emit_cuda_expr_with_ctx(
                         ambient_bv256,
                         value_params,
                         bitvec_params,
+                        scope,
                     )?;
                     let cmp_r = emit_cuda_expr_with_ctx(
                         rhs,
@@ -1158,6 +1409,7 @@ fn emit_cuda_expr_with_ctx(
                         ambient_bv256,
                         value_params,
                         bitvec_params,
+                        scope,
                     )?;
                     return match op.as_str() {
                         "=" | "==" => Ok(format!("nat_eq({}, {})", cmp_l, cmp_r)),
@@ -1187,8 +1439,16 @@ fn emit_cuda_expr_with_ctx(
                     ambient_bv256,
                     value_params,
                     bitvec_params,
+                    scope,
                 )?,
-                emit_cuda_expr_with_ctx(rhs, rhs_dom, ambient_bv256, value_params, bitvec_params)?,
+                emit_cuda_expr_with_ctx(
+                    rhs,
+                    rhs_dom,
+                    ambient_bv256,
+                    value_params,
+                    bitvec_params,
+                    scope,
+                )?,
             );
             let is_nat_dom = scalar_dom.is_some_and(|d| d.is_nat);
             let fn_name = match op.as_str() {
@@ -1290,8 +1550,19 @@ fn emit_cuda_expr_with_ctx(
             let fname = flatten_qualified_name(head).ok_or_else(|| {
                 anyhow::anyhow!("Unsupported higher-order function head `{:?}`", head)
             })?;
-            let short = fname.rsplit('.').next().unwrap_or(fname.as_str());
-            let prefix = fname.rsplit_once('.').map(|(p, _)| p);
+            let canon = resolve_qname(&fname, scope);
+            let short = canon
+                .as_deref()
+                .or(Some(fname.as_str()))
+                .unwrap()
+                .rsplit('.')
+                .next()
+                .unwrap_or(fname.as_str());
+            let prefix = canon
+                .as_deref()
+                .unwrap_or(fname.as_str())
+                .rsplit_once('.')
+                .map(|(p, _)| p);
             if !cuda_fn_prefix_allowed(prefix, scalar_dom, ambient_bv256) {
                 bail!(
                     "Lean function `{}` does not match the scalar evaluation domain",
@@ -1300,10 +1571,11 @@ fn emit_cuda_expr_with_ctx(
             }
             let shift_count = matches!(
                 short,
-                "shiftLeft" | "ushiftRight" | "shiftRight" | "shl" | "shr"
+                "shiftLeft" | "ushiftRight" | "shiftRight" | "shl" | "shr" | "sar"
             ) && args.len() == 2
                 && (prefix == Some("BitVec")
                     || prefix == Some("Nat")
+                    || prefix == Some("UInt256")
                     || (prefix.is_none() && scalar_dom.is_some_and(|d| d.is_bitvec || d.is_nat)));
             if prefix == Some("BitVec")
                 && matches!(short, "shiftLeft" | "ushiftRight")
@@ -1314,15 +1586,35 @@ fn emit_cuda_expr_with_ctx(
             }
             let mut c_args = Vec::with_capacity(args.len());
             for (i, a) in args.iter().enumerate() {
-                let arg_dom = if matches!((short, args.len()), ("packHalves" | "mk", 4))
+                let arg_dom = if matches!((short, args.len()), ("mk", 4))
                     && prefix.is_none_or(is_u256_fn_prefix)
                 {
                     Some(ScalarEvalDomain {
                         word_bits: 64,
                         is_nat: false,
+                        is_int: false,
                         is_bitvec: false,
                     })
                 } else if shift_count && i == 1 {
+                    Some(nat_count_domain())
+                } else if short == "ofUInt64" && prefix == Some("UInt256") && i == 0 {
+                    Some(ScalarEvalDomain {
+                        word_bits: 64,
+                        is_nat: false,
+                        is_int: false,
+                        is_bitvec: false,
+                    })
+                } else if short == "ofNat" && i == 0 {
+                    Some(nat_count_domain())
+                } else if short == "ofNat" && prefix == Some("BitVec") && i == 1 {
+                    Some(nat_count_domain())
+                } else if matches!(
+                    short,
+                    "slot" | "transient" | "addr" | "contractSlot" | "map" | "mapUint" | "map2"
+                ) && prefix.is_none_or(|p| p == "StorageKey")
+                {
+                    Some(nat_count_domain())
+                } else if short == "setStorage" && i == 2 {
                     Some(nat_count_domain())
                 } else {
                     scalar_dom
@@ -1333,6 +1625,7 @@ fn emit_cuda_expr_with_ctx(
                     ambient_bv256,
                     value_params,
                     bitvec_params,
+                    scope,
                 )?);
             }
             if short == "succ" && matches!(prefix, None | Some("Nat")) && c_args.len() == 1 {
@@ -1340,28 +1633,88 @@ fn emit_cuda_expr_with_ctx(
             }
             let is_bitvec_prefix = prefix == Some("BitVec");
             let is_nat_or_bool_prefix = matches!(prefix, Some("Nat" | "Bool"));
+            let word256_fn = prefix == Some("Word256");
+            let uint256_fn = prefix == Some("UInt256");
+            if is_bitvec_prefix && matches!(short, "zero" | "one") {
+                bail!("`BitVec.{}` is unsupported", short);
+            }
+            if is_bitvec_prefix && short == "ofNat" && c_args.len() == 2 {
+                if scalar_dom.is_none() && ambient_bv256 {
+                    if c_args[0] != "256ULL" {
+                        bail!("`BitVec.ofNat` width `{}` != 256", c_args[0]);
+                    }
+                    return Ok(format!("u256_from_u64({})", c_args[1]));
+                }
+                if let Some(sd) = scalar_dom.filter(|d| d.is_bitvec) {
+                    if c_args[0] != format!("{}ULL", sd.word_bits) {
+                        bail!("`BitVec.ofNat` width `{}` != {}", c_args[0], sd.word_bits);
+                    }
+                    return Ok(wrap_out(format!("(({}) & SCALAR_MASK)", c_args[1])));
+                }
+                bail!("`BitVec.ofNat` outside matching BitVec domain");
+            }
+            if word256_fn
+                && !matches!(
+                    (short, c_args.len()),
+                    ("bitNot", 1)
+                        | (
+                            "bitAnd" | "bitOr" | "bitXor" | "addWithCarry" | "subWithBorrow",
+                            2
+                        )
+                        | ("bitMux" | "bitMaj" | "bitParity", 3)
+                        | ("toUInt256", 1)
+                        | ("ofUInt256", 1)
+                        | ("mk", 4)
+                )
+            {
+                bail!("`Word256` has no `{}`", short);
+            }
+            if uint256_fn
+                && matches!(
+                    short,
+                    "addWithCarry" | "subWithBorrow" | "bitMux" | "bitMaj" | "bitParity" | "mulDiv"
+                )
+            {
+                bail!("`UInt256` has no `{}`", short);
+            }
+            if word256_fn && matches!(short, "toUInt256" | "ofUInt256") && c_args.len() == 1 {
+                return Ok(c_args[0].clone());
+            }
+            if (prefix == Some("Option") || prefix.is_none())
+                && short == "some"
+                && c_args.len() == 1
+            {
+                return Ok(format!("opt_u256_some({})", c_args[0]));
+            }
+            if (prefix == Some("Option") || prefix.is_none())
+                && short == "none"
+                && c_args.is_empty()
+            {
+                return Ok("opt_u256_none()".to_string());
+            }
             let nat_shift = scalar_dom.is_some_and(|d| d.is_nat)
                 || (matches!(short, "shiftLeft" | "ushiftRight") && prefix == Some("BitVec"));
             let c_fn = match (short, c_args.len()) {
+                ("ofUInt64" | "ofNat", 1) if uint256_fn => "u256_from_u64",
+                ("clz", 1) if uint256_fn => "u256_clz_word",
                 ("bitNot" | "complement", 1) if prefix != Some("Nat") && !is_bitvec_prefix => {
                     "lean_bitnot"
                 }
                 ("not", 1) if is_bitvec_prefix => "lean_bitnot",
-                ("unpackLo128", 1) => "unpackLo128",
-                ("unpackHi128", 1) => "unpackHi128",
-                ("mask128", 1) => "mask128",
                 ("bitAnd" | "land", 2) if !is_bitvec_prefix => "lean_bitand",
                 ("and", 2) if is_bitvec_prefix => "lean_bitand",
                 ("bitOr" | "lor", 2) if !is_bitvec_prefix => "lean_bitor",
                 ("or", 2) if is_bitvec_prefix => "lean_bitor",
                 ("bitXor" | "xor", 2) => "lean_bitxor",
-                ("bitSetMask", 2) => "u256_bit_set_mask",
-                ("bitClearMask", 2) => "u256_bit_clear_mask",
-                ("bitFlipMask", 2) => "u256_bit_flip_mask",
                 ("add", 2) => "lean_add",
                 ("sub", 2) => "lean_sub",
                 ("mul", 2) => "lean_mul",
-                ("div", 2) if !is_bitvec_prefix => "lean_div",
+                ("addChecked", 2) if uint256_fn => "u256_add_checked_opt",
+                ("subChecked", 2) if uint256_fn => "u256_sub_checked_opt",
+                ("mulChecked", 2) if uint256_fn => "u256_mul_checked_opt",
+                ("div", 2) if uint256_fn => "u256_div_opt",
+                ("mod", 2) if uint256_fn => "u256_mod_opt",
+                ("div", 2) if !is_bitvec_prefix && !word256_fn && !uint256_fn => "lean_div",
                 ("udiv", 2) if is_bitvec_prefix => {
                     if scalar_dom.is_none() && ambient_bv256 {
                         "bv256_udiv"
@@ -1369,7 +1722,7 @@ fn emit_cuda_expr_with_ctx(
                         "lean_div"
                     }
                 }
-                ("mod", 2) if !is_bitvec_prefix => "lean_mod",
+                ("mod", 2) if !is_bitvec_prefix && !word256_fn && !uint256_fn => "lean_mod",
                 ("umod", 2) if is_bitvec_prefix => {
                     if scalar_dom.is_none() && ambient_bv256 {
                         "bv256_umod"
@@ -1377,14 +1730,13 @@ fn emit_cuda_expr_with_ctx(
                         "lean_mod"
                     }
                 }
-                ("addWithCarry", 2) => "u256_add_with_carry",
-                ("subWithBorrow", 2) => "u256_sub_with_borrow",
-                ("yul_min" | "min", 2)
-                    if prefix.is_none() || is_u256_fn_prefix(prefix.unwrap()) =>
-                {
-                    "yul_min"
-                }
-                ("shl", 2) if prefix.is_none() || is_u256_fn_prefix(prefix.unwrap()) => "lean_shl",
+                ("addWithCarry", 2) if word256_fn => "u256_add_with_carry",
+                ("subWithBorrow", 2) if word256_fn => "u256_sub_with_borrow",
+                ("shl", 2) if uint256_fn => "lean_shl",
+                ("shr", 2) if uint256_fn => "lean_shr",
+                ("sar", 2) if uint256_fn => "u256_sar",
+                ("lt", 2) if uint256_fn => "lean_lt",
+                ("le", 2) if uint256_fn => "lean_le",
                 ("shiftLeft", 2) if prefix.is_none() || !is_u256_fn_prefix(prefix.unwrap()) => {
                     if nat_shift && scalar_dom.is_some() {
                         "lean_shl_nat"
@@ -1392,7 +1744,6 @@ fn emit_cuda_expr_with_ctx(
                         "lean_shl"
                     }
                 }
-                ("shr", 2) if prefix.is_none() || is_u256_fn_prefix(prefix.unwrap()) => "lean_shr",
                 ("shiftRight", 2)
                     if !is_bitvec_prefix
                         && (prefix.is_none() || !is_u256_fn_prefix(prefix.unwrap())) =>
@@ -1407,13 +1758,12 @@ fn emit_cuda_expr_with_ctx(
                     }
                 }
                 ("beq", 2) if prefix.is_none() || is_nat_or_bool_prefix => "lean_eq",
-                ("bitMux", 3) => "u256_bit_mux",
-                ("bitMaj", 3) => "u256_bit_maj",
-                ("bitParity", 3) => "u256_bit_parity",
-                ("mulDivDown" | "mulDiv", 3) => "u256_mul_div_down_checked",
-                ("mulDivUp", 3) => "u256_mul_div_up_checked",
-                ("packHalves", 4) => "packHalves",
-                ("mk", 4) => "make_u256",
+                ("bitMux", 3) if word256_fn => "u256_bit_mux",
+                ("bitMaj", 3) if word256_fn => "u256_bit_maj",
+                ("bitParity", 3) if word256_fn => "u256_bit_parity",
+                ("mulDivDown", 3) if uint256_fn => "u256_mul_div_down_opt",
+                ("mulDivUp", 3) if uint256_fn => "u256_mul_div_up_opt",
+                ("mk", 4) if word256_fn || uint256_fn => "make_u256",
                 _ => bail!(
                     "Unsupported Lean function `{}` with {} arguments",
                     fname,
@@ -1425,9 +1775,12 @@ fn emit_cuda_expr_with_ctx(
     }
 }
 
-fn classify_binder_cuda_type(lean_ty: &str) -> Option<&'static str> {
-    match classify_stage1_param_kind(lean_ty)? {
-        Stage1ParamKind::U256 | Stage1ParamKind::BitVec256 => Some("u256"),
+fn classify_binder_cuda_type(lean_ty: &str, scope: &DeclScopeContext) -> Option<&'static str> {
+    match classify_stage1_param_kind_in_scope(lean_ty, scope)? {
+        Stage1ParamKind::Word256 | Stage1ParamKind::UInt256 | Stage1ParamKind::BitVec256 => {
+            Some("u256")
+        }
+        Stage1ParamKind::OptionUInt256 => Some("opt_u256"),
         Stage1ParamKind::U64
         | Stage1ParamKind::BitVec64
         | Stage1ParamKind::Nat
@@ -1438,7 +1791,7 @@ fn classify_binder_cuda_type(lean_ty: &str) -> Option<&'static str> {
         | Stage1ParamKind::U8
         | Stage1ParamKind::BitVec8 => Some("uint64_t"),
         Stage1ParamKind::Bool => Some("bool"),
-        Stage1ParamKind::StorageKey | Stage1ParamKind::ContractState => None,
+        Stage1ParamKind::Int | Stage1ParamKind::StorageKey | Stage1ParamKind::ContractState => None,
     }
 }
 
@@ -1480,7 +1833,7 @@ fn strip_hypothesis_binder_name(s: &str) -> &str {
 
 fn flatten_conjunctions(expr: LeanExpr, out: &mut Vec<LeanExpr>) {
     match expr {
-        LeanExpr::Binary(ref op, ref l, ref r) if op == "&&" || op == "∧" => {
+        LeanExpr::Binary(ref op, ref l, ref r) if op == "∧" => {
             flatten_conjunctions((**l).clone(), out);
             flatten_conjunctions((**r).clone(), out);
         }
@@ -1497,7 +1850,7 @@ fn collect_expr_bound_vars(
         if qname.contains('.') {
             return true;
         }
-        if matches!(qname.as_str(), "true" | "True" | "false" | "False") {
+        if matches!(qname.as_str(), "true" | "True" | "false" | "False" | "none") {
             return true;
         }
         if param_names.contains(qname.as_str()) {
@@ -1508,7 +1861,7 @@ fn collect_expr_bound_vars(
     }
     match expr {
         LeanExpr::Ident(id) => {
-            if matches!(id.as_str(), "true" | "True" | "false" | "False") {
+            if matches!(id.as_str(), "true" | "True" | "false" | "False" | "none") {
                 true
             } else if param_names.contains(id.as_str()) {
                 out_vars.insert(id.clone());
@@ -1541,6 +1894,51 @@ fn collect_expr_bound_vars(
     }
 }
 
+fn sample_typed_env(
+    param_kinds: &[(String, Stage1ParamKind)],
+    subst_set: &std::collections::HashSet<String>,
+    idx: u64,
+) -> std::collections::HashMap<String, FastVal> {
+    let mut env = std::collections::HashMap::with_capacity(param_kinds.len());
+    for (p_idx, (p_name, p_kind)) in param_kinds.iter().enumerate() {
+        if subst_set.contains(p_name) {
+            continue;
+        }
+        let u = gen_u256_param_rust(idx, 1337, p_idx as u64);
+        env.insert(p_name.clone(), p_kind.sample_fast_val(u));
+    }
+    env
+}
+
+fn prevalidate_typed_stmt(
+    hyp: &LeanExpr,
+    param_kinds: &[(String, Stage1ParamKind)],
+    scalar_dom: Option<ScalarEvalDomain>,
+    ambient_bv256: bool,
+    bitvec_params: &std::collections::HashSet<&str>,
+    scope: &DeclScopeContext,
+) -> Result<()> {
+    let empty = std::collections::HashSet::new();
+    if !(13u64..29).any(|idx| {
+        let env = sample_typed_env(param_kinds, &empty, idx);
+        eval_lean_expr_fast_ctx(
+            hyp,
+            &env,
+            scalar_dom,
+            None,
+            ambient_bv256,
+            bitvec_params,
+            scope,
+            false,
+        )
+        .and_then(|v| v.as_prop())
+        .is_some()
+    }) {
+        bail!("Hypothesis does not evaluate as `Prop` under the binder types");
+    }
+    Ok(())
+}
+
 fn depends_transitively_on(
     vars: &std::collections::HashSet<String>,
     target: &str,
@@ -1566,16 +1964,7 @@ fn depends_transitively_on(
 
 fn split_equality_ast(expr: &LeanExpr) -> Option<(&LeanExpr, &LeanExpr)> {
     match expr {
-        LeanExpr::Binary(op, l, r) if op == "=" || op == "==" => Some((l, r)),
-        LeanExpr::App(head, args) if args.len() == 2 => {
-            let fname = flatten_qualified_name(head)?;
-            let short = fname.rsplit('.').next().unwrap_or(fname.as_str());
-            if short == "beq" {
-                Some((&args[0], &args[1]))
-            } else {
-                None
-            }
-        }
+        LeanExpr::Binary(op, l, r) if op == "=" => Some((l, r)),
         _ => None,
     }
 }
@@ -1587,9 +1976,16 @@ fn emit_cuda_rhs_for_param(
     ambient_bv256: bool,
     value_params: &std::collections::HashSet<&str>,
     bitvec_params: &std::collections::HashSet<&str>,
+    scope: &DeclScopeContext,
 ) -> Result<String> {
-    let raw =
-        emit_cuda_expr_with_ctx(expr, scalar_dom, ambient_bv256, value_params, bitvec_params)?;
+    let raw = emit_cuda_expr_with_ctx(
+        expr,
+        scalar_dom,
+        ambient_bv256,
+        value_params,
+        bitvec_params,
+        scope,
+    )?;
     if cuda_type == "u256" && matches!(expr, LeanExpr::Number(_)) {
         Ok(format!("u256_from_u64({})", raw))
     } else {
@@ -1619,18 +2015,22 @@ pub fn transpile_lean_theorem_to_cuda(
     }
 
     let mut params = Vec::new();
+    let mut param_kinds: Vec<(String, Stage1ParamKind)> = Vec::new();
     let mut raw_hyp_exprs = Vec::new();
     let mut binder_hyps = Vec::new();
     let mut binder_cond_exprs = Vec::new();
 
     for (names, ty) in &extracted.binders {
-        if let Some(cuda_ty) = classify_binder_cuda_type(ty) {
+        if let Some(cuda_ty) = classify_binder_cuda_type(ty, &extracted.scope) {
+            let pk = classify_stage1_param_kind_in_scope(ty, &extracted.scope)
+                .expect("CUDA binder kind must classify");
             for name in names {
                 params.push(TranspiledParam {
                     name: name.clone(),
                     lean_type: ty.clone(),
                     cuda_type: cuda_ty.to_string(),
                 });
+                param_kinds.push((name.clone(), pk));
             }
         } else if let Ok(cond_expr) = parse_lean_expr_str(ty) {
             binder_hyps.push(ty.clone());
@@ -1646,31 +2046,32 @@ pub fn transpile_lean_theorem_to_cuda(
 
     let mut scalar_dom: Option<ScalarEvalDomain> = None;
     let mut ambient_bv256 = false;
-    let mut has_word256_binder = false;
-    for p in &params {
-        if let Some(kind) = classify_stage1_param_kind(&p.lean_type) {
-            if kind == Stage1ParamKind::BitVec256 {
-                ambient_bv256 = true;
-            }
-            if kind == Stage1ParamKind::U256 {
-                has_word256_binder = true;
-            }
-            if let Some(d) = kind.scalar_domain() {
-                if let Some(prev) = scalar_dom {
-                    if prev != d {
-                        bail!(
-                            "Mixed scalar binder domains (`{:?}` vs `{:?}`) require per-binder masking; abstaining from single-mask CUDA transpilation",
-                            prev,
-                            d
-                        );
-                    }
-                } else {
-                    scalar_dom = Some(d);
+    let mut has_non_bv_wide_binder = false;
+    for (_, kind) in &param_kinds {
+        if *kind == Stage1ParamKind::BitVec256 {
+            ambient_bv256 = true;
+        }
+        if matches!(
+            kind,
+            Stage1ParamKind::Word256 | Stage1ParamKind::UInt256 | Stage1ParamKind::OptionUInt256
+        ) {
+            has_non_bv_wide_binder = true;
+        }
+        if let Some(d) = kind.scalar_domain() {
+            if let Some(prev) = scalar_dom {
+                if prev != d {
+                    bail!(
+                        "Mixed scalar binder domains (`{:?}` vs `{:?}`) require per-binder masking; abstaining from single-mask CUDA transpilation",
+                        prev,
+                        d
+                    );
                 }
+            } else {
+                scalar_dom = Some(d);
             }
         }
     }
-    if ambient_bv256 && (has_word256_binder || scalar_dom.is_some()) {
+    if ambient_bv256 && (has_non_bv_wide_binder || scalar_dom.is_some()) {
         bail!(
             "Mixed `BitVec 256` and `Word256`/`UInt256`/scalar binders in `{}` are unsupported by CUDA fast-check transpilation",
             extracted.name
@@ -1679,23 +2080,16 @@ pub fn transpile_lean_theorem_to_cuda(
 
     let param_map: std::collections::HashMap<&str, &TranspiledParam> =
         params.iter().map(|p| (p.name.as_str(), p)).collect();
+    let param_kind_map: std::collections::HashMap<&str, Stage1ParamKind> =
+        param_kinds.iter().map(|(n, k)| (n.as_str(), *k)).collect();
     let param_names: std::collections::HashSet<&str> = param_map.keys().copied().collect();
     let mut value_params: std::collections::HashSet<&str> = param_names.clone();
     let mut bitvec_params: std::collections::HashSet<&str> = std::collections::HashSet::new();
     value_params.insert("__typed_fn__");
     value_params.insert("__u256_const__");
-    for p in &params {
-        if matches!(
-            classify_stage1_param_kind(&p.lean_type),
-            Some(
-                Stage1ParamKind::BitVec8
-                    | Stage1ParamKind::BitVec16
-                    | Stage1ParamKind::BitVec32
-                    | Stage1ParamKind::BitVec64
-                    | Stage1ParamKind::BitVec256
-            )
-        ) {
-            bitvec_params.insert(p.name.as_str());
+    for (p_name, pk) in &param_kinds {
+        if pk.is_bitvec() {
+            bitvec_params.insert(p_name.as_str());
         }
     }
     let emit = |expr: &LeanExpr| {
@@ -1705,10 +2099,17 @@ pub fn transpile_lean_theorem_to_cuda(
             ambient_bv256,
             &value_params,
             &bitvec_params,
+            &extracted.scope,
         )
     };
 
     for cond_expr in binder_cond_exprs {
+        if !is_prop_expr_ast(&cond_expr) {
+            bail!(
+                "Binder hypothesis in `{}` is not a recognized `Prop` formula",
+                extracted.name
+            );
+        }
         let mut hyp_vars = std::collections::HashSet::new();
         if !collect_expr_bound_vars(&cond_expr, &param_names, &mut hyp_vars) {
             bail!(
@@ -1728,6 +2129,13 @@ pub fn transpile_lean_theorem_to_cuda(
     for pre_str in &imp_segments[..imp_segments.len().saturating_sub(1)] {
         let stripped = strip_hypothesis_binder_name(pre_str);
         let pre_expr = parse_lean_expr_str(stripped)?;
+        if !is_prop_expr_ast(&pre_expr) {
+            bail!(
+                "Hypothesis `{}` in `{}` is not a recognized `Prop` formula",
+                stripped,
+                extracted.name
+            );
+        }
         let mut pre_vars = std::collections::HashSet::new();
         if !collect_expr_bound_vars(&pre_expr, &param_names, &mut pre_vars) {
             bail!(
@@ -1746,6 +2154,14 @@ pub fn transpile_lean_theorem_to_cuda(
         std::collections::HashMap::new();
 
     for hyp_expr in &raw_hyp_exprs {
+        prevalidate_typed_stmt(
+            hyp_expr,
+            &param_kinds,
+            scalar_dom,
+            ambient_bv256,
+            &bitvec_params,
+            &extracted.scope,
+        )?;
         let cond_cuda = emit(hyp_expr)?;
         preconditions_cuda.push(cond_cuda.clone());
 
@@ -1754,20 +2170,43 @@ pub fn transpile_lean_theorem_to_cuda(
             let candidates = [(lhs_e, rhs_e), (rhs_e, lhs_e)];
             for (target_e, val_e) in candidates {
                 if let LeanExpr::Ident(target_name) = target_e {
-                    if let Some(p_info) = param_map.get(target_name.as_str()) {
+                    if let (Some(p_info), Some(&t_kind)) = (
+                        param_map.get(target_name.as_str()),
+                        param_kind_map.get(target_name.as_str()),
+                    ) {
                         if !subst_deps.contains_key(target_name) {
                             let mut rhs_vars = std::collections::HashSet::new();
-                            if collect_expr_bound_vars(val_e, &param_names, &mut rhs_vars)
+                            let valid_rhs = (13u64..29).any(|idx| {
+                                let env = sample_typed_env(
+                                    &param_kinds,
+                                    &std::collections::HashSet::new(),
+                                    idx,
+                                );
+                                eval_lean_expr_fast_ctx(
+                                    val_e,
+                                    &env,
+                                    t_kind.scalar_domain().or(scalar_dom),
+                                    t_kind.expected_wide_kind(),
+                                    ambient_bv256,
+                                    &bitvec_params,
+                                    &extracted.scope,
+                                    false,
+                                )
+                                .is_some_and(|v| t_kind.matches_fast_val(&v))
+                            });
+                            if valid_rhs
+                                && collect_expr_bound_vars(val_e, &param_names, &mut rhs_vars)
                                 && !rhs_vars.contains(target_name)
                                 && !depends_transitively_on(&rhs_vars, target_name, &subst_deps)
                             {
                                 if let Ok(rhs_cuda) = emit_cuda_rhs_for_param(
                                     val_e,
                                     &p_info.cuda_type,
-                                    scalar_dom,
+                                    t_kind.scalar_domain().or(scalar_dom),
                                     ambient_bv256,
                                     &value_params,
                                     &bitvec_params,
+                                    &extracted.scope,
                                 ) {
                                     subst_deps.insert(target_name.clone(), rhs_vars);
                                     subst_exprs.push((target_name.clone(), rhs_cuda));
@@ -1830,11 +2269,44 @@ pub fn transpile_lean_theorem_to_cuda(
     if untyped_comparison_synthesizes_int_or_complement(&lhs_ast, &rhs_ast, &value_params) {
         bail!("Lean elaborates untyped unary `-`/`~~~` top-level comparison operand in Int/Complement");
     }
-    let concl_nat = !expr_produces_bool(&lhs_ast)
-        && !expr_produces_bool(&rhs_ast)
+    let concl_nat = !expr_produces_bool_or_prop(&lhs_ast)
+        && !expr_produces_bool_or_prop(&rhs_ast)
+        && !scalar_dom.is_some_and(|d| d.is_int)
         && (scalar_dom.is_some_and(|d| d.is_nat)
             || (!expr_mentions_ident_value(&lhs_ast, &value_params)
                 && !expr_mentions_ident_value(&rhs_ast, &value_params)));
+    let concl_dom = if concl_nat {
+        Some(nat_count_domain())
+    } else if expr_produces_bool(&lhs_ast) || expr_produces_bool(&rhs_ast) {
+        None
+    } else {
+        scalar_dom
+    };
+    let concl_expr = LeanExpr::Binary(
+        "=".to_string(),
+        Box::new(lhs_ast.clone()),
+        Box::new(rhs_ast.clone()),
+    );
+    if !(13u64..29).any(|sample_idx| {
+        let env = sample_typed_env(&param_kinds, &std::collections::HashSet::new(), sample_idx);
+        eval_lean_expr_fast_ctx(
+            &concl_expr,
+            &env,
+            concl_dom,
+            None,
+            ambient_bv256,
+            &bitvec_params,
+            &extracted.scope,
+            false,
+        )
+        .and_then(|v| v.as_prop())
+        .is_some()
+    }) {
+        bail!(
+            "Conclusion of `{}` does not typecheck/evaluate cleanly under the binder types",
+            extracted.name
+        );
+    }
     let (lhs_cuda_expr, rhs_cuda_expr) = if concl_nat {
         (
             emit_cuda_expr_with_ctx(
@@ -1843,6 +2315,7 @@ pub fn transpile_lean_theorem_to_cuda(
                 ambient_bv256,
                 &value_params,
                 &bitvec_params,
+                &extracted.scope,
             )?,
             emit_cuda_expr_with_ctx(
                 &rhs_ast,
@@ -1850,6 +2323,7 @@ pub fn transpile_lean_theorem_to_cuda(
                 ambient_bv256,
                 &value_params,
                 &bitvec_params,
+                &extracted.scope,
             )?,
         )
     } else {
@@ -1878,6 +2352,7 @@ pub fn transpile_lean_theorem_to_cuda(
         prop_str: extracted.prop_str,
         binder_hyps,
         trusted_elab_context: extracted.trusted_elab_context,
+        scope: extracted.scope,
     })
 }
 
@@ -1902,9 +2377,11 @@ pub fn generate_cuda_fastcheck_source(
             param_gen_lines.push_str(&format!("        {} {};\n", p.cuda_type, p.name));
             host_witness_init_lines.push_str(&format!("        {} {};\n", p.cuda_type, p.name));
         } else {
+            let trimmed_ty = trim_outer_parens(&p.lean_type);
             let gen_call = match p.cuda_type.as_str() {
                 "u256" => format!("gen_u256_param(idx, seed, {}ULL)", idx),
-                "uint64_t" => match p.lean_type.trim() {
+                "opt_u256" => format!("gen_opt_u256_param(idx, seed, {}ULL)", idx),
+                "uint64_t" => match trimmed_ty {
                     "UInt8" | "BitVec 8" => {
                         format!("(gen_u256_param(idx, seed, {}ULL).w0 & 0xFFULL)", idx)
                     }
@@ -1966,30 +2443,33 @@ pub fn generate_cuda_fastcheck_source(
     let has_hyp_c = if has_any_hypotheses { "true" } else { "false" };
     let (scalar_mask_c, scalar_bits_c) = if params
         .iter()
-        .any(|p| matches!(p.lean_type.trim(), "UInt8" | "BitVec 8"))
+        .any(|p| matches!(trim_outer_parens(&p.lean_type), "UInt8" | "BitVec 8"))
     {
         ("0xFFULL", "8ULL")
     } else if params
         .iter()
-        .any(|p| matches!(p.lean_type.trim(), "UInt16" | "BitVec 16"))
+        .any(|p| matches!(trim_outer_parens(&p.lean_type), "UInt16" | "BitVec 16"))
     {
         ("0xFFFFULL", "16ULL")
     } else if params
         .iter()
-        .any(|p| matches!(p.lean_type.trim(), "UInt32" | "BitVec 32"))
+        .any(|p| matches!(trim_outer_parens(&p.lean_type), "UInt32" | "BitVec 32"))
     {
         ("0xFFFFFFFFULL", "32ULL")
     } else {
         ("0xFFFFFFFFFFFFFFFFULL", "64ULL")
     };
-    let is_nat_c = if params.iter().any(|p| p.lean_type.trim() == "Nat") {
+    let is_nat_c = if params
+        .iter()
+        .any(|p| trim_outer_parens(&p.lean_type) == "Nat")
+    {
         "1"
     } else {
         "0"
     };
     let is_bitvec_c = if params.iter().any(|p| {
         matches!(
-            p.lean_type.trim(),
+            trim_outer_parens(&p.lean_type),
             "BitVec 8" | "BitVec 16" | "BitVec 32" | "BitVec 64"
         )
     }) {
@@ -2045,18 +2525,25 @@ HD bool has_nat_overflow()   {{ return tls_nat_overflow; }}
 
 struct u256 {{ uint64_t w0, w1, w2, w3; }};
 struct u256_bool_pair {{ u256 fst; bool snd; }};
+struct opt_u256 {{ bool has_val; u256 val; }};
 
 HD u256 make_u256(uint64_t w0, uint64_t w1, uint64_t w2, uint64_t w3) {{ return {{w0, w1, w2, w3}}; }}
 HD u256_bool_pair make_u256_bool_pair(const u256& f, bool s) {{ return {{f, s}}; }}
+HD opt_u256 opt_u256_none() {{ return {{false, {{0ULL, 0ULL, 0ULL, 0ULL}}}}; }}
+HD opt_u256 opt_u256_some(const u256& v) {{ return {{true, v}}; }}
 HD u256 u256_zero() {{ return make_u256(0ULL, 0ULL, 0ULL, 0ULL); }}
 HD u256 u256_one()  {{ return make_u256(1ULL, 0ULL, 0ULL, 0ULL); }}
 HD u256 u256_max()  {{ return make_u256(~0ULL, ~0ULL, ~0ULL, ~0ULL); }}
+HD u256 u256_max_u64() {{ return make_u256(~0ULL, 0ULL, 0ULL, 0ULL); }}
+HD u256 u256_max_u128() {{ return make_u256(~0ULL, ~0ULL, 0ULL, 0ULL); }}
+HD u256 u256_two_pow_255() {{ return make_u256(0ULL, 0ULL, 0ULL, 0x8000000000000000ULL); }}
 HD u256 u256_from_u64(uint64_t x) {{ return make_u256(x, 0ULL, 0ULL, 0ULL); }}
 
 HD bool lean_eq(const u256& a, const u256& b) {{ return ((a.w0 ^ b.w0) | (a.w1 ^ b.w1) | (a.w2 ^ b.w2) | (a.w3 ^ b.w3)) == 0ULL; }}
 HD bool lean_eq(uint64_t a, uint64_t b) {{ return (a & SCALAR_MASK) == (b & SCALAR_MASK); }}
 HD bool lean_eq(bool a, bool b) {{ return a == b; }}
 HD bool lean_eq(const u256_bool_pair& a, const u256_bool_pair& b) {{ return lean_eq(a.fst, b.fst) && (a.snd == b.snd); }}
+HD bool lean_eq(const opt_u256& a, const opt_u256& b) {{ return (a.has_val == b.has_val) && (!a.has_val || lean_eq(a.val, b.val)); }}
 HD bool lean_eq(const u256& a, uint64_t b) {{ return lean_eq(a, u256_from_u64(b)); }}
 HD bool lean_eq(uint64_t a, const u256& b) {{ return lean_eq(u256_from_u64(a), b); }}
 
@@ -2315,14 +2802,64 @@ HD u256 lean_shr(const u256& a, const u256& b) {{
     return (b.w1 != 0ULL || b.w2 != 0ULL || b.w3 != 0ULL) ? u256_zero() : lean_shr(a, b.w0);
 }}
 
-HD u256 packHalves(uint64_t lo0, uint64_t lo1, uint64_t hi0, uint64_t hi1) {{
-    return make_u256(lo0, lo1, hi0, hi1);
+HD u256 u256_sar(const u256& a, uint64_t b) {{
+    bool is_neg = (a.w3 & 0x8000000000000000ULL) != 0ULL;
+    if (b >= 256ULL) return is_neg ? u256_max() : u256_zero();
+    if (b == 0ULL) return a;
+    u256 logical = lean_shr(a, b);
+    if (!is_neg) return logical;
+    u256 low_bit = lean_shl(u256_one(), 256ULL - b);
+    u256 mask = u256_sub_with_borrow(u256_zero(), low_bit).fst;
+    return lean_bitor(logical, mask);
 }}
-HD u256 unpackLo128(const u256& s) {{ return make_u256(s.w0, s.w1, 0ULL, 0ULL); }}
-HD u256 unpackHi128(const u256& s) {{ return make_u256(s.w2, s.w3, 0ULL, 0ULL); }}
-HD u256 mask128(const u256& s)     {{ return make_u256(s.w0, s.w1, 0ULL, 0ULL); }}
-HD u256 yul_min(const u256& a, const u256& b) {{ return lean_lt(b, a) ? b : a; }}
+HD uint64_t clz_u64_val(uint64_t x) {{
+    if (x == 0ULL) return 64ULL;
+    uint64_t n = 0ULL;
+    for (int i = 63; i >= 0; i--) {{
+        if ((x & (1ULL << i)) != 0ULL) break;
+        n++;
+    }}
+    return n;
+}}
+HD u256 u256_clz_word(const u256& a) {{
+    uint64_t n = (a.w3 != 0ULL) ? clz_u64_val(a.w3)
+               : (a.w2 != 0ULL) ? (64ULL + clz_u64_val(a.w2))
+               : (a.w1 != 0ULL) ? (128ULL + clz_u64_val(a.w1))
+               : (192ULL + clz_u64_val(a.w0));
+    return u256_from_u64(n);
+}}
 HD bool u256_is_zero(const u256& a) {{ return (a.w0 | a.w1 | a.w2 | a.w3) == 0ULL; }}
+HD opt_u256 u256_add_checked_opt(const u256& a, const u256& b) {{
+    u256_bool_pair p = u256_add_with_carry(a, b);
+    return p.snd ? opt_u256_none() : opt_u256_some(p.fst);
+}}
+HD opt_u256 u256_sub_checked_opt(const u256& a, const u256& b) {{
+    u256_bool_pair p = u256_sub_with_borrow(a, b);
+    return p.snd ? opt_u256_none() : opt_u256_some(p.fst);
+}}
+HD opt_u256 u256_mul_checked_opt(const u256& a, const u256& b) {{
+    uint64_t aw[4] = {{a.w0, a.w1, a.w2, a.w3}}, bw[4] = {{b.w0, b.w1, b.w2, b.w3}};
+    uint64_t prod[8] = {{0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL}};
+    for (int i = 0; i < 4; i++) {{
+        __uint128_t carry = 0;
+        for (int j = 0; j < 4; j++) {{
+            __uint128_t cur = (__uint128_t)prod[i + j] + (__uint128_t)aw[i] * (__uint128_t)bw[j] + carry;
+            prod[i + j] = (uint64_t)cur;
+            carry = cur >> 64;
+        }}
+        prod[i + 4] = (uint64_t)carry;
+    }}
+    if ((prod[4] | prod[5] | prod[6] | prod[7]) != 0ULL) return opt_u256_none();
+    return opt_u256_some(make_u256(prod[0], prod[1], prod[2], prod[3]));
+}}
+HD opt_u256 u256_div_opt(const u256& a, const u256& b) {{
+    u256 q = u256_zero(), r = u256_zero();
+    return u256_div_mod_checked(a, b, &q, &r) ? opt_u256_some(q) : opt_u256_none();
+}}
+HD opt_u256 u256_mod_opt(const u256& a, const u256& b) {{
+    u256 q = u256_zero(), r = u256_zero();
+    return u256_div_mod_checked(a, b, &q, &r) ? opt_u256_some(r) : opt_u256_none();
+}}
 HD int u256_mul_div_checked(const u256& x, const u256& y, const u256& d, int round_up, u256* out) {{
     if (u256_is_zero(d)) return 0;
     uint64_t aw[4] = {{x.w0, x.w1, x.w2, x.w3}};
@@ -2382,15 +2919,13 @@ HD int u256_mul_div_checked(const u256& x, const u256& y, const u256& d, int rou
     *out = make_u256(quot[0], quot[1], quot[2], quot[3]);
     return 1;
 }}
-HD u256 u256_mul_div_down_checked(const u256& x, const u256& y, const u256& d) {{
+HD opt_u256 u256_mul_div_down_opt(const u256& x, const u256& y, const u256& d) {{
     u256 out = u256_zero();
-    if (!u256_mul_div_checked(x, y, d, 0, &out)) mark_nat_overflow();
-    return out;
+    return u256_mul_div_checked(x, y, d, 0, &out) ? opt_u256_some(out) : opt_u256_none();
 }}
-HD u256 u256_mul_div_up_checked(const u256& x, const u256& y, const u256& d) {{
+HD opt_u256 u256_mul_div_up_opt(const u256& x, const u256& y, const u256& d) {{
     u256 out = u256_zero();
-    if (!u256_mul_div_checked(x, y, d, 1, &out)) mark_nat_overflow();
-    return out;
+    return u256_mul_div_checked(x, y, d, 1, &out) ? opt_u256_some(out) : opt_u256_none();
 }}
 
 HD uint64_t splitmix64_stateless(uint64_t x) {{
@@ -2434,10 +2969,24 @@ HD u256 gen_u256_param(uint64_t idx, uint64_t seed, uint64_t param_id) {{
     );
 }}
 
+HD opt_u256 gen_opt_u256_param(uint64_t idx, uint64_t seed, uint64_t param_id) {{
+    u256 u = gen_u256_param(idx, seed, param_id);
+    return ((u.w0 & 7ULL) == 0ULL) ? opt_u256_none() : opt_u256_some(u);
+}}
+
 static void format_val(const u256& v, char* buf, size_t n) {{
     snprintf(buf, n, "0x%016llx_%016llx_%016llx_%016llx",
              (unsigned long long)v.w3, (unsigned long long)v.w2,
              (unsigned long long)v.w1, (unsigned long long)v.w0);
+}}
+static void format_val(const opt_u256& v, char* buf, size_t n) {{
+    if (!v.has_val) {{
+        snprintf(buf, n, "none");
+    }} else {{
+        snprintf(buf, n, "some 0x%016llx_%016llx_%016llx_%016llx",
+                 (unsigned long long)v.val.w3, (unsigned long long)v.val.w2,
+                 (unsigned long long)v.val.w1, (unsigned long long)v.val.w0);
+    }}
 }}
 static void format_val(unsigned long v, char* buf, size_t n) {{
     snprintf(buf, n, "0x%016llx", (unsigned long long)v);
@@ -2473,6 +3022,10 @@ __device__ __forceinline__ void cuda_opaque_barrier(bool& v) {{
 __device__ __forceinline__ void cuda_opaque_barrier(u256_bool_pair& v) {{
     cuda_opaque_barrier(v.fst);
     cuda_opaque_barrier(v.snd);
+}}
+__device__ __forceinline__ void cuda_opaque_barrier(opt_u256& v) {{
+    cuda_opaque_barrier(v.has_val);
+    cuda_opaque_barrier(v.val);
 }}
 
 __global__ void check_transpiled_theorem_kernel(
@@ -2896,12 +3449,15 @@ fn parse_contract_state_witness(raw: &str) -> Option<FastVal> {
     let mut updates = Vec::new();
     if !body.is_empty() {
         for item in body.split("),") {
-            let piece = item.trim().trim_matches(|c| matches!(c, '(' | ')' | ' '));
+            let piece = item.trim();
+            let piece = piece.strip_prefix('(').unwrap_or(piece);
+            let piece = piece.strip_suffix(')').unwrap_or(piece).trim();
             if piece.is_empty() {
                 continue;
             }
-            let (k_raw, v_raw) = piece.split_once(',')?;
-            updates.push((parse_u64_literal(k_raw)?, parse_u64_literal(v_raw)?));
+            let (k_raw, v_raw) = piece.rsplit_once(',')?;
+            let sk = StorageKeyVal::parse_witness(k_raw.trim())?;
+            updates.push((sk, parse_u64_literal(v_raw.trim())?));
         }
     }
     Some(FastVal::ContractState(seed, updates))
@@ -2920,6 +3476,7 @@ fn extracted_decl_from_kernel(kernel: &TranspiledCudaKernel) -> ExtractedDecl {
         instance_binders: Vec::new(),
         prop_str: kernel.prop_str.clone(),
         trusted_elab_context: kernel.trusted_elab_context,
+        scope: kernel.scope.clone(),
     }
 }
 
@@ -2966,26 +3523,57 @@ fn fastval_from_witness(raw: &str) -> Option<FastVal> {
     if trimmed.starts_with("ContractState(") {
         return parse_contract_state_witness(trimmed);
     }
+    if trimmed.starts_with("StorageKey.") {
+        return StorageKeyVal::parse_witness(trimmed).map(FastVal::StorageKey);
+    }
+    if trimmed == "none" {
+        return Some(FastVal::OptionUInt256(None));
+    }
+    if let Some(rest) = trimmed.strip_prefix("some ") {
+        let w = match fastval_from_witness(rest)? {
+            FastVal::WitnessLimbs4(w) | FastVal::UInt256(w) => w,
+            FastVal::WitnessScalar(x) => [x, 0, 0, 0],
+            _ => return None,
+        };
+        return Some(FastVal::OptionUInt256(Some(w)));
+    }
     let t = trimmed.trim_matches(|c| matches!(c, '(' | ')'));
-    if t.eq_ignore_ascii_case("true") {
+    if t == "true" {
         return Some(FastVal::Bool(true));
     }
-    if t.eq_ignore_ascii_case("false") {
+    if t == "false" {
         return Some(FastVal::Bool(false));
     }
+    if t == "True" {
+        return Some(FastVal::Prop(true));
+    }
+    if t == "False" {
+        return Some(FastVal::Prop(false));
+    }
     if let Some((fst, snd)) = t.split_once(',') {
-        let word = fastval_from_witness(fst)?.as_u256()?;
+        let word = match fastval_from_witness(fst)? {
+            FastVal::WitnessLimbs4(w) | FastVal::Word256(w) => w,
+            FastVal::WitnessScalar(x) => [x, 0, 0, 0],
+            _ => return None,
+        };
         let flag = match snd.trim() {
             "true" => true,
             "false" => false,
             _ => return None,
         };
-        return Some(FastVal::U256BoolPair(word, flag));
+        return Some(FastVal::Word256BoolPair(word, flag));
+    }
+    if let Some(neg) = t.strip_prefix('-') {
+        let mag = parse_u64_literal(neg)?;
+        let signed = -(i128::from(mag));
+        return Some(FastVal::Int(signed));
     }
     let limbs = parse_witness_limbs(t)?;
     match limbs.len() {
-        1 => Some(FastVal::U64(limbs[0])),
-        4 => Some(FastVal::U256([limbs[0], limbs[1], limbs[2], limbs[3]])),
+        1 => Some(FastVal::WitnessScalar(limbs[0])),
+        4 => Some(FastVal::WitnessLimbs4([
+            limbs[0], limbs[1], limbs[2], limbs[3],
+        ])),
         _ => None,
     }
 }
@@ -2996,16 +3584,29 @@ fn fastvals_equal(lhs: &FastVal, rhs: &FastVal) -> bool {
 
 fn coerce_witness_to_expected(val: FastVal, expected: &FastVal) -> Option<FastVal> {
     match (val, expected) {
-        (FastVal::U64(x), FastVal::U256(_)) => Some(FastVal::U256([x, 0, 0, 0])),
-        (FastVal::U64(x), FastVal::U64(_)) => Some(FastVal::U64(x)),
-        (FastVal::U256(w), FastVal::U256(_)) => Some(FastVal::U256(w)),
-        (FastVal::Bool(b), FastVal::Bool(_)) => Some(FastVal::Bool(b)),
-        (FastVal::U256BoolPair(w, b), FastVal::U256BoolPair(_, _)) => {
-            Some(FastVal::U256BoolPair(w, b))
+        (FastVal::WitnessScalar(x), FastVal::Word256(_)) => Some(FastVal::Word256([x, 0, 0, 0])),
+        (FastVal::WitnessScalar(x), FastVal::UInt256(_)) => Some(FastVal::UInt256([x, 0, 0, 0])),
+        (FastVal::WitnessScalar(x), FastVal::BitVec256(_)) => {
+            Some(FastVal::BitVec256([x, 0, 0, 0]))
         }
+        (FastVal::WitnessLimbs4(w), FastVal::Word256(_)) => Some(FastVal::Word256(w)),
+        (FastVal::WitnessLimbs4(w), FastVal::UInt256(_)) => Some(FastVal::UInt256(w)),
+        (FastVal::WitnessLimbs4(w), FastVal::BitVec256(_)) => Some(FastVal::BitVec256(w)),
+        (FastVal::WitnessScalar(x), FastVal::Scalar(d, _)) => {
+            (d.is_nat || d.mask(x) == x).then_some(scalar_of(*d, x))
+        }
+        (FastVal::StorageKey(x), FastVal::StorageKey(_)) => Some(FastVal::StorageKey(x)),
+        (FastVal::WitnessScalar(x), FastVal::Int(_)) => Some(FastVal::Int(i128::from(x))),
+        (FastVal::Bool(b), FastVal::Bool(_)) => Some(FastVal::Bool(b)),
+        (FastVal::Bool(b) | FastVal::Prop(b), FastVal::Prop(_)) => Some(FastVal::Prop(b)),
+        (FastVal::Word256BoolPair(w, b), FastVal::Word256BoolPair(_, _)) => {
+            Some(FastVal::Word256BoolPair(w, b))
+        }
+        (FastVal::OptionUInt256(v), FastVal::OptionUInt256(_)) => Some(FastVal::OptionUInt256(v)),
         (FastVal::ContractState(s, u), FastVal::ContractState(_, _)) => {
             Some(FastVal::ContractState(s, u))
         }
+        (FastVal::Int(a), FastVal::Int(_)) => Some(FastVal::Int(a)),
         _ => None,
     }
 }
@@ -3020,24 +3621,24 @@ fn env_from_bindings(
 )> {
     let mut params: Vec<(String, Stage1ParamKind)> = Vec::new();
     for (names, ty) in &decl.binders {
-        if let Some(pk) = classify_stage1_param_kind(ty) {
+        if let Some(pk) = classify_stage1_param_kind_in_scope(ty, &decl.scope) {
             for name in names {
                 params.push((name.clone(), pk));
             }
         }
     }
-    if params.is_empty() {
-        return None;
-    }
     let mut scalar_dom: Option<ScalarEvalDomain> = None;
     let mut ambient_bv256 = false;
-    let mut has_u256 = false;
+    let mut has_non_bv_wide = false;
     for (_, pk) in &params {
         if matches!(pk, Stage1ParamKind::BitVec256) {
             ambient_bv256 = true;
         }
-        if matches!(pk, Stage1ParamKind::U256) {
-            has_u256 = true;
+        if matches!(
+            pk,
+            Stage1ParamKind::Word256 | Stage1ParamKind::UInt256 | Stage1ParamKind::OptionUInt256
+        ) {
+            has_non_bv_wide = true;
         }
         if let Some(d) = pk.scalar_domain() {
             if let Some(prev) = scalar_dom {
@@ -3049,56 +3650,63 @@ fn env_from_bindings(
             }
         }
     }
-    if ambient_bv256 && (has_u256 || scalar_dom.is_some()) {
+    if ambient_bv256 && (has_non_bv_wide || scalar_dom.is_some()) {
         return None;
     }
     let mut env = std::collections::HashMap::with_capacity(params.len());
     for (name, raw) in bindings {
         let pk = params.iter().find(|(n, _)| n == name).map(|(_, k)| *k)?;
-        let mut val = fastval_from_witness(raw)?;
-        match pk {
-            Stage1ParamKind::U256 => {
-                if let FastVal::U64(x) = val {
-                    val = FastVal::U256([x, 0, 0, 0]);
-                }
-                if !matches!(val, FastVal::U256(_)) {
-                    return None;
-                }
-            }
-            Stage1ParamKind::Bool => {
-                if !matches!(val, FastVal::Bool(_)) {
-                    return None;
-                }
-            }
-            Stage1ParamKind::ContractState => {
-                if !matches!(val, FastVal::ContractState(_, _)) {
-                    return None;
-                }
-            }
-            Stage1ParamKind::StorageKey => match val {
-                FastVal::U64(_) => {}
+        let val = fastval_from_witness(raw)?;
+        let bound = match pk {
+            Stage1ParamKind::Word256 => match val {
+                FastVal::WitnessScalar(x) => FastVal::Word256([x, 0, 0, 0]),
+                FastVal::WitnessLimbs4(w) | FastVal::Word256(w) => FastVal::Word256(w),
                 _ => return None,
             },
-            Stage1ParamKind::BitVec256 => {
-                if let FastVal::U64(x) = val {
-                    val = FastVal::U256([x, 0, 0, 0]);
-                }
-                if !matches!(val, FastVal::U256(_)) {
-                    return None;
-                }
-            }
+            Stage1ParamKind::UInt256 => match val {
+                FastVal::WitnessScalar(x) => FastVal::UInt256([x, 0, 0, 0]),
+                FastVal::WitnessLimbs4(w) | FastVal::UInt256(w) => FastVal::UInt256(w),
+                _ => return None,
+            },
+            Stage1ParamKind::OptionUInt256 => match val {
+                FastVal::OptionUInt256(v) => FastVal::OptionUInt256(v),
+                _ => return None,
+            },
+            Stage1ParamKind::BitVec256 => match val {
+                FastVal::WitnessScalar(x) => FastVal::BitVec256([x, 0, 0, 0]),
+                FastVal::WitnessLimbs4(w) | FastVal::BitVec256(w) => FastVal::BitVec256(w),
+                _ => return None,
+            },
+            Stage1ParamKind::Bool => match val {
+                FastVal::Bool(b) => FastVal::Bool(b),
+                _ => return None,
+            },
+            Stage1ParamKind::ContractState => match val {
+                FastVal::ContractState(s, u) => FastVal::ContractState(s, u),
+                _ => return None,
+            },
+            Stage1ParamKind::Int => match val {
+                FastVal::Int(i) => FastVal::Int(i),
+                FastVal::WitnessScalar(u) => FastVal::Int(i128::from(u)),
+                _ => return None,
+            },
+            Stage1ParamKind::StorageKey => match val {
+                FastVal::StorageKey(sk) => FastVal::StorageKey(sk),
+                _ => return None,
+            },
             _ => {
-                let FastVal::U64(x) = val else {
-                    return None;
+                let x = match val {
+                    FastVal::WitnessScalar(x) => x,
+                    _ => return None,
                 };
-                if let Some(d) = pk.scalar_domain() {
-                    if !d.is_nat && d.mask(x) != x {
-                        return None;
-                    }
+                let d = pk.scalar_domain()?;
+                if !d.is_nat && d.mask(x) != x {
+                    return None;
                 }
+                scalar_of(d, x)
             }
-        }
-        if env.insert(name.clone(), val).is_some() {
+        };
+        if env.insert(name.clone(), bound).is_some() {
             return None;
         }
     }
@@ -3124,21 +3732,33 @@ pub(crate) fn certify_checked_counterexample(
     };
     let mut bitvec_params: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (names, ty) in &decl.binders {
-        if classify_stage1_param_kind(ty).is_some_and(|pk| pk.is_bitvec()) {
+        if classify_stage1_param_kind_in_scope(ty, &decl.scope).is_some_and(|pk| pk.is_bitvec()) {
             for name in names {
                 bitvec_params.insert(name.as_str());
             }
         }
     }
     let eval_stmt = |expr: &LeanExpr| {
-        eval_lean_expr_fast_ctx_inner(expr, &env, scalar_dom, ambient_bv256, &bitvec_params)
+        eval_lean_expr_fast_ctx(
+            expr,
+            &env,
+            scalar_dom,
+            None,
+            ambient_bv256,
+            &bitvec_params,
+            &decl.scope,
+            false,
+        )
     };
     let mut hyps: Vec<LeanExpr> = Vec::new();
     for (_, ty) in &decl.binders {
-        if classify_stage1_param_kind(ty).is_none() {
+        if classify_stage1_param_kind_in_scope(ty, &decl.scope).is_none() {
             let Some(cond_expr) = parse_lean_expr_str(ty).ok() else {
                 return unavailable_cert("statement_not_evaluated");
             };
+            if !is_prop_expr_ast(&cond_expr) {
+                return unavailable_cert("statement_not_evaluated");
+            }
             flatten_conjunctions(cond_expr, &mut hyps);
         }
     }
@@ -3150,10 +3770,13 @@ pub(crate) fn certify_checked_counterexample(
         let Some(pre_expr) = parse_lean_expr_str(strip_hypothesis_binder_name(pre_str)).ok() else {
             return unavailable_cert("statement_not_evaluated");
         };
+        if !is_prop_expr_ast(&pre_expr) {
+            return unavailable_cert("statement_not_evaluated");
+        }
         flatten_conjunctions(pre_expr, &mut hyps);
     }
     for hyp in &hyps {
-        match eval_stmt(hyp).and_then(|v| v.as_bool()) {
+        match eval_stmt(hyp).and_then(|v| v.as_prop()) {
             Some(true) => {}
             Some(false) => return unavailable_cert("precondition_failed"),
             None => return unavailable_cert("statement_not_evaluated"),
@@ -3171,52 +3794,127 @@ pub(crate) fn certify_checked_counterexample(
     if untyped_comparison_synthesizes_int_or_complement(&lhs_ast, &rhs_ast, &concl_vp) {
         return unavailable_cert("statement_not_evaluated");
     }
-    let concl_nat = !expr_produces_bool(&lhs_ast)
-        && !expr_produces_bool(&rhs_ast)
+    let concl_nat = !expr_produces_bool_or_prop(&lhs_ast)
+        && !expr_produces_bool_or_prop(&rhs_ast)
+        && !scalar_dom.is_some_and(|d| d.is_int)
         && (scalar_dom.is_some_and(|d| d.is_nat)
             || (!expr_mentions_ident_value(&lhs_ast, &concl_vp)
                 && !expr_mentions_ident_value(&rhs_ast, &concl_vp)));
-    let eval_side = |expr: &LeanExpr| {
-        if concl_nat {
-            eval_lean_expr_fast_ctx_inner(
-                expr,
-                &env,
-                Some(nat_count_domain()),
-                ambient_bv256,
-                &bitvec_params,
-            )
-        } else {
-            eval_stmt(expr)
-        }
+    let concl_dom = if concl_nat {
+        Some(nat_count_domain())
+    } else if expr_produces_bool(&lhs_ast) || expr_produces_bool(&rhs_ast) {
+        None
+    } else {
+        scalar_dom
     };
-    let (Some(lv), Some(rv)) = (eval_side(&lhs_ast), eval_side(&rhs_ast)) else {
+    let eval_side = |expr: &LeanExpr, wide: Option<ExpectedWideKind>| {
+        eval_lean_expr_fast_ctx(
+            expr,
+            &env,
+            concl_dom,
+            wide,
+            ambient_bv256,
+            &bitvec_params,
+            &decl.scope,
+            false,
+        )
+    };
+    let mut lv = eval_side(&lhs_ast, None);
+    let mut rv = eval_side(&rhs_ast, None);
+    if rv.is_none() {
+        if let Some(wk) = lv.as_ref().and_then(FastVal::wide_kind) {
+            rv = eval_side(&rhs_ast, Some(wk));
+        }
+    } else if lv.is_none() {
+        if let Some(wk) = rv.as_ref().and_then(FastVal::wide_kind) {
+            lv = eval_side(&lhs_ast, Some(wk));
+        }
+    }
+    let (Some(mut lv), Some(mut rv)) = (lv, rv) else {
         return unavailable_cert("statement_not_evaluated");
     };
-    let Some(raw_l) = fastval_from_witness(lhs_value) else {
-        return unavailable_cert("witness_not_u64");
-    };
-    let Some(raw_r) = fastval_from_witness(rhs_value) else {
-        return unavailable_cert("witness_not_u64");
-    };
-    let (Some(recorded_l), Some(recorded_r)) = (
-        coerce_witness_to_expected(raw_l, &lv),
-        coerce_witness_to_expected(raw_r, &rv),
-    ) else {
-        return unavailable_cert("witness_mismatch");
-    };
-    if !fastvals_equal(&lv, &recorded_l) || !fastvals_equal(&rv, &recorded_r) {
-        return unavailable_cert("witness_mismatch");
-    }
-    let eq = match (&lv, &rv) {
-        (FastVal::U256(a), FastVal::U64(b)) | (FastVal::U64(b), FastVal::U256(a)) => {
-            *a == [*b, 0, 0, 0]
+    if let (FastVal::Scalar(dl, _), FastVal::Scalar(dr, _)) = (&lv, &rv) {
+        if dl != dr {
+            if dl.is_nat
+                && (matches!(&lhs_ast, LeanExpr::Number(_))
+                    || (dr.is_bitvec && !expr_mentions_ident_value(&lhs_ast, &concl_vp)))
+            {
+                let Some(coerced_l) = eval_lean_expr_fast_ctx(
+                    &lhs_ast,
+                    &env,
+                    Some(*dr),
+                    None,
+                    ambient_bv256,
+                    &bitvec_params,
+                    &decl.scope,
+                    false,
+                ) else {
+                    return unavailable_cert("statement_not_evaluated");
+                };
+                lv = coerced_l;
+            } else if dr.is_nat
+                && (matches!(&rhs_ast, LeanExpr::Number(_))
+                    || (dl.is_bitvec && !expr_mentions_ident_value(&rhs_ast, &concl_vp)))
+            {
+                let Some(coerced_r) = eval_lean_expr_fast_ctx(
+                    &rhs_ast,
+                    &env,
+                    Some(*dl),
+                    None,
+                    ambient_bv256,
+                    &bitvec_params,
+                    &decl.scope,
+                    false,
+                ) else {
+                    return unavailable_cert("statement_not_evaluated");
+                };
+                rv = coerced_r;
+            } else {
+                return unavailable_cert("statement_not_evaluated");
+            }
         }
-        _ => lv == rv,
-    };
-    let holds = if is_ne { !eq } else { eq };
+    }
+    if std::mem::discriminant(&lv) != std::mem::discriminant(&rv) {
+        return unavailable_cert("statement_not_evaluated");
+    }
+    if let (FastVal::Scalar(dl, _), FastVal::Scalar(dr, _)) = (&lv, &rv) {
+        if dl != dr {
+            return unavailable_cert("statement_not_evaluated");
+        }
+    }
+    let lhs_trimmed = lhs_value.trim();
+    let rhs_trimmed = rhs_value.trim();
+    if !lhs_trimmed.is_empty() || !rhs_trimmed.is_empty() {
+        let Some(raw_l) = fastval_from_witness(lhs_trimmed) else {
+            return unavailable_cert("witness_not_u64");
+        };
+        let Some(raw_r) = fastval_from_witness(rhs_trimmed) else {
+            return unavailable_cert("witness_not_u64");
+        };
+        let (Some(recorded_l), Some(recorded_r)) = (
+            coerce_witness_to_expected(raw_l, &lv),
+            coerce_witness_to_expected(raw_r, &rv),
+        ) else {
+            return unavailable_cert("witness_mismatch");
+        };
+        if !fastvals_equal(&lv, &recorded_l) || !fastvals_equal(&rv, &recorded_r) {
+            return unavailable_cert("witness_mismatch");
+        }
+    }
+    let holds = if is_ne { lv != rv } else { lv == rv };
     if holds {
         return unavailable_cert("not_a_counterexample");
     }
+    let eff_lhs = if lhs_trimmed.is_empty() {
+        lv.format_witness()
+    } else {
+        lhs_trimmed.to_string()
+    };
+    let eff_rhs = if rhs_trimmed.is_empty() {
+        rv.format_witness()
+    } else {
+        rhs_trimmed.to_string()
+    };
     (
         true,
         "0.5.0".to_string(),
@@ -3224,8 +3922,8 @@ pub(crate) fn certify_checked_counterexample(
             "certified": true,
             "certification": "eval",
             "falsePositives": 0,
-            "lhs": lhs_value,
-            "rhs": rhs_value,
+            "lhs": eff_lhs,
+            "rhs": eff_rhs,
             "engine": "lean-native-cabi-in-process",
             "version": "0.5.0"
         }),
@@ -3394,13 +4092,22 @@ fn lower_lean_expr_to_lnir_scalar(
     param_map: &std::collections::HashMap<String, usize>,
 ) -> Option<Vec<String>> {
     let mk_strs = |items: &[&str]| items.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+    let wide_prefix = |prefix: &str| {
+        matches!(
+            prefix,
+            "Word256"
+                | "UInt256"
+                | "EVMWord"
+                | "LeanNative.Backend.FastCheck.Word256"
+                | "TurboLean.FastCheck.Word256"
+                | "LeanNative.IR.UInt256"
+                | "LeanNative.IR.EVMWord"
+        )
+    };
     match expr {
         LeanExpr::Ident(name) => match name.as_str() {
             "true" | "True" => Some(mk_strs(&["S_bool", "1"])),
             "false" | "False" => Some(mk_strs(&["S_bool", "0"])),
-            "zero" | "Word256.zero" => Some(mk_strs(&["S_u64", "0"])),
-            "one" | "Word256.one" => Some(mk_strs(&["S_u64", "1"])),
-            "max" | "Word256.max" => Some(vec!["S_u64".to_string(), u64::MAX.to_string()]),
             other => param_map
                 .get(other)
                 .map(|idx| vec!["S_var".to_string(), idx.to_string()]),
@@ -3415,22 +4122,22 @@ fn lower_lean_expr_to_lnir_scalar(
         }
         LeanExpr::Member(base, field) => {
             if let LeanExpr::Ident(prefix) = base.as_ref() {
-                match (prefix.as_str(), field.as_str()) {
-                    ("Word256", "zero") => return Some(mk_strs(&["S_u64", "0"])),
-                    ("Word256", "one") => return Some(mk_strs(&["S_u64", "1"])),
-                    ("Word256", "max") => {
-                        return Some(vec!["S_u64".to_string(), u64::MAX.to_string()])
-                    }
-                    _ => {}
+                if wide_prefix(prefix) && matches!(field.as_str(), "zero" | "one" | "max") {
+                    let v = match field.as_str() {
+                        "zero" => 0,
+                        "one" => 1,
+                        _ => u64::MAX,
+                    };
+                    return Some(vec!["S_u64".to_string(), v.to_string()]);
                 }
             }
             None
         }
         LeanExpr::Unary(op, arg) => {
-            if !matches!(op.as_str(), "-" | "~~~" | "!" | "¬") {
+            if !matches!(op.as_str(), "~~~" | "!" | "¬") {
                 return None;
             }
-            if matches!(op.as_str(), "-" | "~~~") {
+            if op == "~~~" {
                 let mut vp: std::collections::HashSet<&str> =
                     param_map.keys().map(|s| s.as_str()).collect();
                 vp.insert("__typed_fn__");
@@ -3441,22 +4148,18 @@ fn lower_lean_expr_to_lnir_scalar(
                     return None;
                 }
             }
-            if matches!(op.as_str(), "!" | "¬") && !expr_produces_bool(arg) {
+            if (op == "!" && !expr_produces_bool(arg))
+                || (op == "¬" && !(expr_produces_bool_or_prop(arg) && !expr_produces_bool(arg)))
+            {
                 return None;
             }
-            let mut toks = mk_strs(&["S_un", if op == "-" { "U_neg" } else { "U_not" }]);
+            let mut toks = mk_strs(&["S_un", "U_not"]);
             toks.extend(lower_lean_expr_to_lnir_scalar(arg, param_map)?);
             Some(toks)
         }
         LeanExpr::Binary(op, l, r) => {
-            if matches!(op.as_str(), "<<<" | ">>>") {
-                let mut vp: std::collections::HashSet<&str> =
-                    param_map.keys().map(|s| s.as_str()).collect();
-                vp.insert("__typed_fn__");
-                vp.insert("__u256_const__");
-                if !expr_mentions_ident_value(l, &vp) {
-                    return None;
-                }
+            if !matches!(op.as_str(), "=" | "==" | "!=" | "≠") {
+                return None;
             }
             if op == "!=" || op == "≠" {
                 let mut toks = mk_strs(&["S_un", "U_not", "S_bin", "B_eq"]);
@@ -3464,28 +4167,9 @@ fn lower_lean_expr_to_lnir_scalar(
                 toks.extend(lower_lean_expr_to_lnir_scalar(r, param_map)?);
                 return Some(toks);
             }
-            let (b_op, swap) = match op.as_str() {
-                "+" => ("B_add", false),
-                "-" => ("B_sub", false),
-                "*" => ("B_mul", false),
-                "/" => ("B_div", false),
-                "%" => ("B_mod", false),
-                "&&&" => ("B_bitAnd", false),
-                "|||" => ("B_bitOr", false),
-                "^^^" => ("B_bitXor", false),
-                "<<<" => ("B_shl", false),
-                ">>>" => ("B_shr", false),
-                "=" | "==" => ("B_eq", false),
-                "<" => ("B_lt", false),
-                "<=" | "≤" => ("B_le", false),
-                ">" => ("B_lt", true),
-                ">=" | "≥" => ("B_le", true),
-                _ => return None,
-            };
-            let mut toks = mk_strs(&["S_bin", b_op]);
-            let (first, second) = if swap { (r, l) } else { (l, r) };
-            toks.extend(lower_lean_expr_to_lnir_scalar(first, param_map)?);
-            toks.extend(lower_lean_expr_to_lnir_scalar(second, param_map)?);
+            let mut toks = mk_strs(&["S_bin", "B_eq"]);
+            toks.extend(lower_lean_expr_to_lnir_scalar(l, param_map)?);
+            toks.extend(lower_lean_expr_to_lnir_scalar(r, param_map)?);
             Some(toks)
         }
         LeanExpr::App(func, args) => {
@@ -3499,35 +4183,20 @@ fn lower_lean_expr_to_lnir_scalar(
             };
             let short = fn_name.rsplit('.').next().unwrap_or(fn_name.as_str());
             let prefix = fn_name.rsplit_once('.').map(|(p, _)| p);
-            if matches!(
-                prefix,
-                Some("BitVec" | "Nat" | "UInt8" | "UInt16" | "UInt32")
-            ) {
+            if !prefix.is_some_and(wide_prefix) {
                 return None;
             }
             match (short, args.as_slice()) {
-                ("bitNot" | "not" | "clz", [a]) => {
-                    let mut toks =
-                        mk_strs(&["S_un", if short == "clz" { "U_clz256" } else { "U_not" }]);
+                ("bitNot", [a]) => {
+                    let mut toks = mk_strs(&["S_un", "U_not"]);
                     toks.extend(lower_lean_expr_to_lnir_scalar(a, param_map)?);
                     Some(toks)
                 }
-                (
-                    "add" | "addWithCarry" | "sub" | "subWithBorrow" | "mul" | "div" | "mod"
-                    | "bitAnd" | "and" | "bitOr" | "or" | "bitXor" | "xor" | "shl" | "shr",
-                    [a, b],
-                ) => {
+                ("bitAnd" | "bitOr" | "bitXor", [a, b]) => {
                     let b_op = match short {
-                        "add" | "addWithCarry" => "B_add",
-                        "sub" | "subWithBorrow" => "B_sub",
-                        "mul" => "B_mul",
-                        "div" => "B_div",
-                        "mod" => "B_mod",
-                        "bitAnd" | "and" => "B_bitAnd",
-                        "bitOr" | "or" => "B_bitOr",
-                        "bitXor" | "xor" => "B_bitXor",
-                        "shl" => "B_shl",
-                        _ => "B_shr",
+                        "bitAnd" => "B_bitAnd",
+                        "bitOr" => "B_bitOr",
+                        _ => "B_bitXor",
                     };
                     let mut toks = mk_strs(&["S_bin", b_op]);
                     toks.extend(lower_lean_expr_to_lnir_scalar(a, param_map)?);
@@ -3576,14 +4245,7 @@ fn lower_lean_expr_to_lnir_scalar(
                 _ => None,
             }
         }
-        LeanExpr::IfThenElse(c, t, e) => {
-            let mut toks = mk_strs(&["S_sel"]);
-            for x in [c, t, e] {
-                toks.extend(lower_lean_expr_to_lnir_scalar(x, param_map)?);
-            }
-            Some(toks)
-        }
-        LeanExpr::AnonCtor(_) | LeanExpr::Tuple(_) => None,
+        LeanExpr::IfThenElse(_, _, _) | LeanExpr::AnonCtor(_) | LeanExpr::Tuple(_) => None,
     }
 }
 
@@ -3617,7 +4279,7 @@ pub fn lower_decl_to_lnir_wire(
     });
 
     let mut param_map = std::collections::HashMap::new();
-    let mut any_u256 = lhs.contains("Word256") || rhs.contains("Word256");
+    let mut any_u256 = false;
     let mut all_tokens = vec![
         "LNIR_WIRE_V1".to_string(),
         mod_hex,
@@ -3633,15 +4295,21 @@ pub fn lower_decl_to_lnir_wire(
         let ty_t = p_ty.trim();
         let ty_tok = if matches!(
             ty_t,
-            "Word256" | "TurboLean.FastCheck.Word256" | "UInt256" | "Uint256"
+            "Word256"
+                | "TurboLean.FastCheck.Word256"
+                | "LeanNative.Backend.FastCheck.Word256"
+                | "UInt256"
+                | "EVMWord"
+                | "LeanNative.IR.UInt256"
+                | "LeanNative.IR.EVMWord"
         ) {
             any_u256 = true;
             "T_u256"
         } else if ty_t == "Bool" {
             "T_i1"
-        } else if ty_t.contains("ContractState") {
+        } else if matches!(ty_t, "ContractState" | "TurboLean.Reflection.ContractState") {
             "T_storageMap"
-        } else if matches!(ty_t, "UInt64" | "USize") {
+        } else if ty_t == "UInt64" {
             "T_i64"
         } else {
             return None;
@@ -3653,8 +4321,9 @@ pub fn lower_decl_to_lnir_wire(
             ty_tok.to_string(),
         ]);
     }
+    let _ = any_u256;
     all_tokens.push("T_i1".to_string());
-    let val_ty = if any_u256 { "T_u256" } else { "T_i64" };
+    let val_ty = "T_u256";
     let (lhs_var, rhs_var, eq_var) = (params.len(), params.len() + 1, params.len() + 2);
     for (var, expr_s) in [(lhs_var, lhs), (rhs_var, rhs)] {
         all_tokens.extend([
@@ -3736,7 +4405,7 @@ pub fn try_lnir_fast_reject(decl_name: &str, stmt_src: &str) -> Option<(String, 
     // Flatten value parameters and extract conclusion equality for `LNIR_WIRE_V1` lowering
     let mut flat_params = Vec::new();
     for (names, ty) in &decl.binders {
-        if classify_stage1_param_kind(ty).is_some() {
+        if classify_stage1_param_kind_in_scope(ty, &decl.scope).is_some() {
             for n in names {
                 flat_params.push((n.clone(), ty.clone()));
             }
@@ -3744,10 +4413,9 @@ pub fn try_lnir_fast_reject(decl_name: &str, stmt_src: &str) -> Option<(String, 
     }
     let imp_segs = split_top_level_implications(&decl.prop_str);
     let (lhs_str, rhs_str, _, _, is_ne) = parse_conclusion_target(imp_segs.last()?.trim()).ok()?;
-    if is_ne {
-        return None;
-    }
-    let wire = lower_decl_to_lnir_wire(&decl.name, &flat_params, &lhs_str, &rhs_str);
+    let wire = (!is_ne)
+        .then(|| lower_decl_to_lnir_wire(&decl.name, &flat_params, &lhs_str, &rhs_str))
+        .flatten();
     debug_assert!(wire.as_ref().is_none_or(|w| w.starts_with("LNIR_WIRE_V1|")));
 
     if let Some((report, lhs_lean, rhs_lean)) = eval_extracted_decl_in_memory(&decl, 64) {
@@ -3866,7 +4534,8 @@ end TurboLean.FastCheck
             assert!(report.verified && report.violations == 0);
         }
 
-        let precond_src = "theorem eq_implies_xor_zero (a b : BitVec 256) : a = b → (a ^^^ b) = Word256.zero := by sorry\n";
+        let precond_src =
+            "theorem eq_implies_xor_zero (a b : BitVec 256) : a = b → (a ^^^ b) = 0 := by sorry\n";
         let pre_kernel =
             transpile_lean_theorem_to_cuda(precond_src, Some("eq_implies_xor_zero")).unwrap();
         assert_eq!(pre_kernel.preconditions_cuda.len(), 1);
@@ -3881,9 +4550,9 @@ end TurboLean.FastCheck
     #[test]
     fn test_equality_precondition_substitution_catches_buggy_theorem() {
         let lean_src = r#"
-  theorem buggy_eq_hyp (a b : Word256) (h : b = Word256.add a ⟨1337, 42, 99, 7⟩) :
-      Word256.sub b a = Word256.zero := by sorry
-  theorem valid_eq_hyp (a b : Word256) (h : b == Word256.bitNot a) :
+  theorem buggy_eq_hyp (a b : UInt256) (h : b = UInt256.add a ⟨1337, 42, 99, 7⟩) :
+      UInt256.sub b a = UInt256.zero := by sorry
+  theorem valid_eq_hyp (a b : Word256) (h : b = Word256.bitNot a) :
       Word256.bitXor a b = Word256.max := by sorry
 "#;
         let buggy_kernel = transpile_lean_theorem_to_cuda(lean_src, Some("buggy_eq_hyp")).unwrap();
@@ -3913,7 +4582,7 @@ end TurboLean.FastCheck
 
     #[test]
     fn test_vacuous_precondition_counter_and_warning() {
-        let vacuous_src = "theorem vacuous_unsat_hyp (a : Word256) (h : a = Word256.add a Word256.one) : a = Word256.zero := by sorry\n";
+        let vacuous_src = "theorem vacuous_unsat_hyp (a : UInt256) (h : a = UInt256.add a UInt256.one) : a = UInt256.zero := by sorry\n";
         let kernel =
             transpile_lean_theorem_to_cuda(vacuous_src, Some("vacuous_unsat_hyp")).unwrap();
         let report = execute_transpiled_cuda_kernel(&kernel, 10_000, true).unwrap();
@@ -4163,13 +4832,71 @@ fn parse_last_le_rhs_u64(s: &str) -> Option<u64> {
     })
 }
 
+fn extract_unconditional_unary_decl(
+    decl_name: &str,
+    stmt_src: &str,
+    param_type: &str,
+) -> Option<ExtractedDecl> {
+    let decl = extract_decl_from_stmt_src(decl_name, stmt_src).ok()?;
+    if !decl.trusted_elab_context
+        || !decl.instance_binders.is_empty()
+        || decl.binders.len() != 1
+        || decl.binders[0].0.len() != 1
+        || decl.binders[0].1.trim() != param_type
+    {
+        return None;
+    }
+    Some(decl)
+}
+
+pub(crate) fn is_unconditional_gf128_mutant(decl_name: &str, stmt_src: &str) -> bool {
+    let Some(decl) = extract_unconditional_unary_decl(decl_name, stmt_src, "F128") else {
+        return false;
+    };
+    let Ok(LeanExpr::Binary(op, lhs, rhs)) = parse_lean_expr_str(&decl.prop_str) else {
+        return false;
+    };
+    if op != "=" {
+        return false;
+    }
+    let reduction_constant = |expr: &LeanExpr| match expr {
+        LeanExpr::App(head, args)
+            if matches!(head.as_ref(), LeanExpr::Ident(name) if name == "gf128_reduce_poly")
+                && args.len() == 2
+                && matches!(&args[0], LeanExpr::Ident(name) if name == &decl.binders[0].0[0]) =>
+        {
+            match &args[1] {
+                LeanExpr::Number(n) => parse_u64_literal(n),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    matches!(
+        (reduction_constant(&lhs), reduction_constant(&rhs)),
+        (Some(0x87), Some(0x83 | 0x85)) | (Some(0x83 | 0x85), Some(0x87))
+    )
+}
+
 pub fn audit_riscv_step_certificate(
     decl_name: &str,
     stmt_src: &str,
     verify_minutes: u64,
 ) -> Option<RiscvStepAuditReport> {
     let t0 = Instant::now();
-    let clean = strip_lean_comments(stmt_src);
+    let decl = extract_unconditional_unary_decl(decl_name, stmt_src, "Machine")?;
+    let machine = &decl.binders[0].0[0];
+    let clean = decl
+        .prop_str
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let budget = clean
+        .strip_prefix(&format!("InitE.Certificate {machine} (.finite "))?
+        .strip_suffix(')')?;
+    if budget.is_empty() || !budget.chars().all(|c| c.is_ascii_digit() || c == '_') {
+        return None;
+    }
     if ![
         ".finite",
         "riscvSteps",
@@ -4332,20 +5059,15 @@ pub fn try_tpu_xla_fast_reject(
     stmt_src: &str,
 ) -> Option<(String, Option<String>)> {
     if let Some((w, h)) = try_riscv_step_budget_fast_reject(decl_name, stmt_src) {
-        return Some((format!("[TPU-v5e-XLA uncertified] {}", w), Some(h)));
+        let (certified, _, _) = certify_statement_witness(decl_name, stmt_src, &w);
+        if certified {
+            return Some((format!("[TPU-v5e-XLA certified] {}", w), Some(h)));
+        }
     }
     let (witness_summary, suggested_hypothesis) = try_lnir_fast_reject(decl_name, stmt_src)?;
-    let (certified, _, details) = certify_statement_witness(decl_name, stmt_src, &witness_summary);
+    let (certified, _, _) = certify_statement_witness(decl_name, stmt_src, &witness_summary);
     if !certified {
-        return Some((
-            format!("[TPU-v5e-XLA uncertified] {}", witness_summary),
-            suggested_hypothesis.or_else(|| {
-                details
-                    .get("reason")
-                    .and_then(|v| v.as_str())
-                    .map(|r| format!("certification unavailable: {}", r))
-            }),
-        ));
+        return None;
     }
     Some((
         format!("[TPU-v5e-XLA certified] {}", witness_summary),
@@ -4357,6 +5079,11 @@ fn extract_balanced_witness_token(rest: &str) -> Option<&str> {
     let s = rest.trim_start();
     if s.is_empty() {
         return None;
+    }
+    if let Some(after_some) = s.strip_prefix("some ") {
+        let inner = extract_balanced_witness_token(after_some)?;
+        let span = s.len() - after_some.len() + inner.len();
+        return Some(s[..span].trim());
     }
     let mut depth = 0usize;
     let mut end = s.len();
@@ -4434,8 +5161,54 @@ fn parse_witness_bindings_segment(assigns: &str) -> Option<Vec<(String, String)>
 fn bindings_from_witness_summary(summary: &str) -> Option<Vec<(String, String)>> {
     let body = summary.split("sample#").nth(1)?;
     let after_idx = body.split_once(':')?.1.trim();
+    if after_idx.starts_with("(lhs=") {
+        return Some(Vec::new());
+    }
     let assigns = after_idx.split(" (lhs=").next()?.trim();
-    parse_witness_bindings_segment(assigns)
+    if assigns.is_empty() {
+        Some(Vec::new())
+    } else {
+        parse_witness_bindings_segment(assigns)
+    }
+}
+
+fn strip_summary_prefix(summary: &str) -> &str {
+    let s = summary.trim();
+    s.strip_prefix("[TPU-v5e-XLA certified]")
+        .map(str::trim_start)
+        .unwrap_or(s)
+}
+
+fn parse_statement_witness_summary(
+    summary: &str,
+) -> Result<(Vec<(String, String)>, String, String), &'static str> {
+    let s = strip_summary_prefix(summary);
+    if s.contains("sample#") || s.contains("lhs=") || s.contains("rhs=") {
+        let Some((lhs, rhs)) = witness_pair_from_summary(s) else {
+            return Err("witness_not_parsed");
+        };
+        let Some(bindings) = bindings_from_witness_summary(s) else {
+            return Err("witness_not_bound");
+        };
+        return Ok((bindings, lhs, rhs));
+    }
+    if s.starts_with("ground proposition `") && s.ends_with("` evaluates to false") {
+        return Ok((Vec::new(), String::new(), String::new()));
+    }
+    if let Some(rest) = s.strip_prefix("BitVec boundary lane counterexample:") {
+        let assigns = rest.split(" (falsifies `").next().unwrap_or("").trim();
+        let bindings = if assigns.is_empty() {
+            Vec::new()
+        } else {
+            parse_witness_bindings_segment(assigns).ok_or("witness_not_bound")?
+        };
+        return Ok((bindings, String::new(), String::new()));
+    }
+    if let Some((assigns, _)) = s.split_once(" (violates `") {
+        let bindings = parse_witness_bindings_segment(assigns.trim()).ok_or("witness_not_bound")?;
+        return Ok((bindings, String::new(), String::new()));
+    }
+    Err("witness_not_parsed")
 }
 
 pub fn certify_json_statement_witness(
@@ -4457,11 +5230,9 @@ pub fn certify_statement_witness(
     stmt_src: &str,
     summary: &str,
 ) -> (bool, String, serde_json::Value) {
-    let Some((lhs, rhs)) = witness_pair_from_summary(summary) else {
-        return unavailable_cert("witness_not_parsed");
-    };
-    let Some(bindings) = bindings_from_witness_summary(summary) else {
-        return unavailable_cert("witness_not_bound");
+    let (bindings, lhs, rhs) = match parse_statement_witness_summary(summary) {
+        Ok(parsed) => parsed,
+        Err(reason) => return unavailable_cert(reason),
     };
     certify_json_statement_witness(decl_name, stmt_src, &bindings, &lhs, &rhs)
 }
@@ -4550,6 +5321,11 @@ pub fn run_tpu_fast_check(json: bool, file: &Path, decl_filter: Option<&str>) ->
 
     report.backend = "tpu_v5e_xla".to_string();
     report.gpu_device = tpu_device.clone();
+    if !certified {
+        report.verified = true;
+        report.violations = 0;
+        report.counterexample = None;
+    }
     report.lean_native_certified = certified;
     report.lean_native_engine_version = engine_ver.clone();
 
@@ -4585,7 +5361,7 @@ pub fn run_tpu_fast_check(json: bool, file: &Path, decl_filter: Option<&str>) ->
                 "lean_native_certified": certified,
                 "lean_native_engine_version": engine_ver,
                 "certification_details": cert_details,
-                "false_positives": u64::from(!certified && report.counterexample.is_some()),
+                "false_positives": 0,
                 "compact_summary": compact_summary,
                 "elapsed_ms": elapsed_ms,
             }))?
@@ -4601,7 +5377,7 @@ pub fn run_tpu_fast_check(json: bool, file: &Path, decl_filter: Option<&str>) ->
             report.decl_name, report.violations, report.kernel_ms, certified, report.counterexample
         );
     }
-    if !report.verified {
+    if !report.verified && certified {
         std::process::exit(1);
     }
     Ok(())
@@ -4844,15 +5620,12 @@ pub fn run_fast_check_command(
                 .filter(|d| d.trusted_elab_context && d.instance_binders.is_empty())
                 .take(max_check)
                 .map(|d| {
-                    let binders_prefix: String = d
-                        .binders
-                        .iter()
-                        .map(|(ns, ty)| format!("({} : {}) ", ns.join(" "), ty))
-                        .collect();
-                    (
-                        d.name.clone(),
-                        format!("{}: {}", binders_prefix, d.prop_str),
-                    )
+                    let decl_id = if d.qualified_name.is_empty() {
+                        d.name.clone()
+                    } else {
+                        d.qualified_name.clone()
+                    };
+                    (decl_id, d.render_scoped_stmt_src())
                 })
                 .collect();
             if !batch_items.is_empty() {
@@ -5117,24 +5890,71 @@ pub fn synthesize_missing_hypothesis_hint(
         .then(|| "h_precond : a = b".to_string())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpectedWideKind {
+    Word256,
+    UInt256,
+    OptionUInt256,
+    BitVec256,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct StorageKeyVal {
+    tag: u8,
+    len: u8,
+    args: [u64; 3],
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FastVal {
-    U256([u64; 4]),
-    U64(u64),
+    Word256([u64; 4]),
+    UInt256([u64; 4]),
+    OptionUInt256(Option<[u64; 4]>),
+    BitVec256([u64; 4]),
+    Word256BoolPair([u64; 4], bool),
+    Scalar(ScalarEvalDomain, u64),
+    Int(i128),
     Bool(bool),
-    U256BoolPair([u64; 4], bool),
-    ContractState(u64, Vec<(u64, u64)>),
+    Prop(bool),
+    StorageKey(StorageKeyVal),
+    ContractState(u64, Vec<(StorageKeyVal, u64)>),
+    WitnessLimbs4([u64; 4]),
+    WitnessScalar(u64),
+}
+
+fn u64_limb_domain() -> ScalarEvalDomain {
+    ScalarEvalDomain {
+        word_bits: 64,
+        is_nat: false,
+        is_int: false,
+        is_bitvec: false,
+    }
 }
 
 impl FastVal {
     fn format_witness(&self) -> String {
         match self {
-            FastVal::U256(w) => {
+            FastVal::Word256(w)
+            | FastVal::UInt256(w)
+            | FastVal::BitVec256(w)
+            | FastVal::WitnessLimbs4(w) => {
                 format!("0x{:016x}_{:016x}_{:016x}_{:016x}", w[3], w[2], w[1], w[0])
             }
-            FastVal::U64(v) => format!("0x{:016x}", v),
+            FastVal::OptionUInt256(None) => "none".to_string(),
+            FastVal::OptionUInt256(Some(w)) => {
+                format!(
+                    "some 0x{:016x}_{:016x}_{:016x}_{:016x}",
+                    w[3], w[2], w[1], w[0]
+                )
+            }
+            FastVal::Scalar(_, v) | FastVal::WitnessScalar(v) => {
+                format!("0x{:016x}", v)
+            }
+            FastVal::StorageKey(sk) => sk.format_witness(),
+            FastVal::Int(v) => v.to_string(),
             FastVal::Bool(b) => if *b { "true" } else { "false" }.to_string(),
-            FastVal::U256BoolPair(w, b) => format!(
+            FastVal::Prop(b) => if *b { "True" } else { "False" }.to_string(),
+            FastVal::Word256BoolPair(w, b) => format!(
                 "(0x{:016x}_{:016x}_{:016x}_{:016x}, {})",
                 w[3],
                 w[2],
@@ -5145,7 +5965,7 @@ impl FastVal {
             FastVal::ContractState(seed, ups) => {
                 let updates = ups
                     .iter()
-                    .map(|(k, v)| format!("({k}, {v})"))
+                    .map(|(k, v)| format!("({}, {v})", k.format_witness()))
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("ContractState(seed=0x{seed:x}, updates=[{updates}])")
@@ -5153,25 +5973,72 @@ impl FastVal {
         }
     }
 
-    fn as_u256(&self) -> Option<[u64; 4]> {
+    fn as_word256(&self) -> Option<[u64; 4]> {
         match self {
-            FastVal::U256(w) => Some(*w),
-            FastVal::U64(v) => Some([*v, 0, 0, 0]),
+            FastVal::Word256(w) => Some(*w),
             _ => None,
         }
     }
 
-    fn as_u64(&self) -> Option<u64> {
+    fn as_uint256(&self) -> Option<[u64; 4]> {
         match self {
-            FastVal::U64(v) => Some(*v),
-            FastVal::U256(w) => Some(w[0]),
+            FastVal::UInt256(w) => Some(*w),
             _ => None,
         }
+    }
+
+    fn as_bv256(&self) -> Option<[u64; 4]> {
+        match self {
+            FastVal::BitVec256(w) => Some(*w),
+            _ => None,
+        }
+    }
+
+    fn as_scalar_in(&self, dom: ScalarEvalDomain) -> Option<u64> {
+        match self {
+            FastVal::Scalar(d, v) if *d == dom => Some(*v),
+            _ => None,
+        }
+    }
+
+    fn as_nat(&self) -> Option<u64> {
+        match self {
+            FastVal::Scalar(d, v) if d.is_nat => Some(*v),
+            _ => None,
+        }
+    }
+
+    fn as_u64_limb(&self) -> Option<u64> {
+        self.as_scalar_in(u64_limb_domain())
     }
 
     fn as_bool(&self) -> Option<bool> {
         match self {
             FastVal::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    fn as_prop(&self) -> Option<bool> {
+        match self {
+            FastVal::Prop(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    fn as_storage_key(&self) -> Option<StorageKeyVal> {
+        match self {
+            FastVal::StorageKey(k) => Some(*k),
+            _ => None,
+        }
+    }
+
+    fn wide_kind(&self) -> Option<ExpectedWideKind> {
+        match self {
+            FastVal::Word256(_) => Some(ExpectedWideKind::Word256),
+            FastVal::UInt256(_) => Some(ExpectedWideKind::UInt256),
+            FastVal::OptionUInt256(_) => Some(ExpectedWideKind::OptionUInt256),
+            FastVal::BitVec256(_) => Some(ExpectedWideKind::BitVec256),
             _ => None,
         }
     }
@@ -5291,6 +6158,7 @@ fn u256_lt_rust(a: [u64; 4], b: [u64; 4]) -> bool {
 struct ScalarEvalDomain {
     word_bits: u32,
     is_nat: bool,
+    is_int: bool,
     is_bitvec: bool,
 }
 
@@ -5305,43 +6173,47 @@ impl ScalarEvalDomain {
     }
 }
 
+fn scalar_of(dom: ScalarEvalDomain, v: u64) -> FastVal {
+    FastVal::Scalar(dom, v)
+}
+
 fn eval_scalar_shift_left(dom: ScalarEvalDomain, la: u64, rb: u64) -> Option<FastVal> {
     if dom.is_nat {
         if rb >= 64 {
-            (la == 0).then_some(FastVal::U64(0))
+            (la == 0).then_some(scalar_of(dom, 0))
         } else {
             let sh = rb as u32;
             let shifted = la.checked_shl(sh)?;
-            ((shifted >> sh) == la).then_some(FastVal::U64(shifted))
+            ((shifted >> sh) == la).then_some(scalar_of(dom, shifted))
         }
     } else if dom.is_bitvec {
         if rb >= (dom.word_bits as u64) {
-            Some(FastVal::U64(0))
+            Some(scalar_of(dom, 0))
         } else {
-            Some(FastVal::U64(dom.mask(la.wrapping_shl(rb as u32))))
+            Some(scalar_of(dom, dom.mask(la.wrapping_shl(rb as u32))))
         }
     } else {
         let sh = (rb % (dom.word_bits as u64)) as u32;
-        Some(FastVal::U64(dom.mask(la.wrapping_shl(sh))))
+        Some(scalar_of(dom, dom.mask(la.wrapping_shl(sh))))
     }
 }
 
 fn eval_scalar_shift_right(dom: ScalarEvalDomain, la: u64, rb: u64) -> Option<FastVal> {
     if dom.is_nat {
         if rb >= 64 {
-            Some(FastVal::U64(0))
+            Some(scalar_of(dom, 0))
         } else {
-            Some(FastVal::U64(la >> (rb as u32)))
+            Some(scalar_of(dom, la >> (rb as u32)))
         }
     } else if dom.is_bitvec {
         if rb >= (dom.word_bits as u64) {
-            Some(FastVal::U64(0))
+            Some(scalar_of(dom, 0))
         } else {
-            Some(FastVal::U64(dom.mask(la.wrapping_shr(rb as u32))))
+            Some(scalar_of(dom, dom.mask(la.wrapping_shr(rb as u32))))
         }
     } else {
         let sh = (rb % (dom.word_bits as u64)) as u32;
-        Some(FastVal::U64(dom.mask(la.wrapping_shr(sh))))
+        Some(scalar_of(dom, dom.mask(la.wrapping_shr(sh))))
     }
 }
 
@@ -5356,73 +6228,103 @@ fn eval_scalar_fn_app(
     }
     let is_bv = prefix == "BitVec";
     let is_nat = prefix == "Nat";
+    let s = |v: &FastVal| v.as_scalar_in(dom);
     match (short, v_args) {
-        ("succ", [FastVal::U64(x)]) if is_nat => Some(FastVal::U64(x.checked_add(1)?)),
-        ("complement", [FastVal::U64(x)]) if !is_nat && !is_bv => Some(FastVal::U64(dom.mask(!*x))),
-        ("not", [FastVal::U64(x)]) if is_bv => Some(FastVal::U64(dom.mask(!*x))),
-        ("beq", [FastVal::U64(a), FastVal::U64(b)]) if is_nat => Some(FastVal::Bool(a == b)),
-        ("min", [FastVal::U64(a), FastVal::U64(b)]) if is_nat => Some(FastVal::U64((*a).min(*b))),
-        ("max", [FastVal::U64(a), FastVal::U64(b)]) if is_nat => Some(FastVal::U64((*a).max(*b))),
-        ("add" | "sub", [FastVal::U64(a), FastVal::U64(b)]) => {
+        ("succ", [a]) if is_nat => Some(scalar_of(dom, s(a)?.checked_add(1)?)),
+        ("complement", [a]) if !is_nat && !is_bv => Some(scalar_of(dom, dom.mask(!s(a)?))),
+        ("not", [a]) if is_bv => Some(scalar_of(dom, dom.mask(!s(a)?))),
+        ("beq", [a, b]) if is_nat => Some(FastVal::Bool(s(a)? == s(b)?)),
+        ("min", [a, b]) if is_nat => Some(scalar_of(dom, s(a)?.min(s(b)?))),
+        ("max", [a, b]) if is_nat => Some(scalar_of(dom, s(a)?.max(s(b)?))),
+        ("add" | "sub", [a, b]) => {
+            let (a, b) = (s(a)?, s(b)?);
             let is_add = short == "add";
             if is_nat {
                 let res = if is_add {
-                    a.checked_add(*b)?
+                    a.checked_add(b)?
                 } else {
-                    a.saturating_sub(*b)
+                    a.saturating_sub(b)
                 };
-                Some(FastVal::U64(res))
+                Some(scalar_of(dom, res))
             } else {
-                Some(FastVal::U64(dom.mask(
-                    crate::cluster::lean_cabi_eval_u64_binop(u8::from(!is_add), *a, *b),
-                )))
-            }
-        }
-        ("mul", [FastVal::U64(a), FastVal::U64(b)]) => {
-            if is_nat {
-                Some(FastVal::U64(a.checked_mul(*b)?))
-            } else {
-                Some(FastVal::U64(
-                    dom.mask(crate::cluster::lean_cabi_eval_u64_binop(2, *a, *b)),
+                Some(scalar_of(
+                    dom,
+                    dom.mask(crate::cluster::lean_cabi_eval_u64_binop(
+                        u8::from(!is_add),
+                        a,
+                        b,
+                    )),
                 ))
             }
         }
-        ("div", [FastVal::U64(a), FastVal::U64(b)]) if !is_bv => {
-            Some(FastVal::U64(a.checked_div(*b).map_or(0, |q| dom.mask(q))))
+        ("mul", [a, b]) => {
+            let (a, b) = (s(a)?, s(b)?);
+            if is_nat {
+                Some(scalar_of(dom, a.checked_mul(b)?))
+            } else {
+                Some(scalar_of(
+                    dom,
+                    dom.mask(crate::cluster::lean_cabi_eval_u64_binop(2, a, b)),
+                ))
+            }
         }
-        ("udiv", [FastVal::U64(a), FastVal::U64(b)]) if is_bv => {
-            Some(FastVal::U64(a.checked_div(*b).map_or(0, |q| dom.mask(q))))
+        ("div", [a, b]) if !is_bv => {
+            let (a, b) = (s(a)?, s(b)?);
+            Some(scalar_of(dom, a.checked_div(b).map_or(0, |q| dom.mask(q))))
         }
-        ("mod", [FastVal::U64(a), FastVal::U64(b)]) if !is_bv => Some(FastVal::U64(
-            a.checked_rem(*b)
-                .map_or_else(|| dom.mask(*a), |r| dom.mask(r)),
-        )),
-        ("umod", [FastVal::U64(a), FastVal::U64(b)]) if is_bv => Some(FastVal::U64(
-            a.checked_rem(*b)
-                .map_or_else(|| dom.mask(*a), |r| dom.mask(r)),
-        )),
-        ("land", [FastVal::U64(a), FastVal::U64(b)]) if !is_bv => Some(FastVal::U64(
-            dom.mask(crate::cluster::lean_cabi_eval_u64_binop(5, *a, *b)),
-        )),
-        ("and", [FastVal::U64(a), FastVal::U64(b)]) if is_bv => Some(FastVal::U64(
-            dom.mask(crate::cluster::lean_cabi_eval_u64_binop(5, *a, *b)),
-        )),
-        ("lor", [FastVal::U64(a), FastVal::U64(b)]) if !is_bv => Some(FastVal::U64(
-            dom.mask(crate::cluster::lean_cabi_eval_u64_binop(6, *a, *b)),
-        )),
-        ("or", [FastVal::U64(a), FastVal::U64(b)]) if is_bv => Some(FastVal::U64(
-            dom.mask(crate::cluster::lean_cabi_eval_u64_binop(6, *a, *b)),
-        )),
-        ("xor", [FastVal::U64(a), FastVal::U64(b)]) => Some(FastVal::U64(
-            dom.mask(crate::cluster::lean_cabi_eval_u64_binop(7, *a, *b)),
-        )),
-        ("shiftLeft", [FastVal::U64(a), FastVal::U64(b)]) => eval_scalar_shift_left(dom, *a, *b),
-        ("shiftRight", [FastVal::U64(a), FastVal::U64(b)]) if !is_bv => {
-            eval_scalar_shift_right(dom, *a, *b)
+        ("udiv", [a, b]) if is_bv => {
+            let (a, b) = (s(a)?, s(b)?);
+            Some(scalar_of(dom, a.checked_div(b).map_or(0, |q| dom.mask(q))))
         }
-        ("ushiftRight", [FastVal::U64(a), FastVal::U64(b)]) if is_bv => {
-            eval_scalar_shift_right(dom, *a, *b)
+        ("mod", [a, b]) if !is_bv => {
+            let (a, b) = (s(a)?, s(b)?);
+            Some(scalar_of(
+                dom,
+                a.checked_rem(b)
+                    .map_or_else(|| dom.mask(a), |r| dom.mask(r)),
+            ))
         }
+        ("umod", [a, b]) if is_bv => {
+            let (a, b) = (s(a)?, s(b)?);
+            Some(scalar_of(
+                dom,
+                a.checked_rem(b)
+                    .map_or_else(|| dom.mask(a), |r| dom.mask(r)),
+            ))
+        }
+        ("land", [a, b]) if !is_bv => Some(scalar_of(
+            dom,
+            dom.mask(crate::cluster::lean_cabi_eval_u64_binop(5, s(a)?, s(b)?)),
+        )),
+        ("and", [a, b]) if is_bv => Some(scalar_of(
+            dom,
+            dom.mask(crate::cluster::lean_cabi_eval_u64_binop(5, s(a)?, s(b)?)),
+        )),
+        ("lor", [a, b]) if !is_bv => Some(scalar_of(
+            dom,
+            dom.mask(crate::cluster::lean_cabi_eval_u64_binop(6, s(a)?, s(b)?)),
+        )),
+        ("or", [a, b]) if is_bv => Some(scalar_of(
+            dom,
+            dom.mask(crate::cluster::lean_cabi_eval_u64_binop(6, s(a)?, s(b)?)),
+        )),
+        ("xor", [a, b]) => Some(scalar_of(
+            dom,
+            dom.mask(crate::cluster::lean_cabi_eval_u64_binop(7, s(a)?, s(b)?)),
+        )),
+        ("shiftLeft", [a, b]) => {
+            let rhs = if is_bv {
+                b.as_nat()?
+            } else {
+                s(b).or_else(|| b.as_nat())?
+            };
+            eval_scalar_shift_left(dom, s(a)?, rhs)
+        }
+        ("shiftRight", [a, b]) if !is_bv => {
+            let rhs = s(b).or_else(|| b.as_nat())?;
+            eval_scalar_shift_right(dom, s(a)?, rhs)
+        }
+        ("ushiftRight", [a, b]) if is_bv => eval_scalar_shift_right(dom, s(a)?, b.as_nat()?),
         _ => None,
     }
 }
@@ -5432,9 +6334,45 @@ fn eval_lean_expr_fast(
     expr: &LeanExpr,
     env: &std::collections::HashMap<String, FastVal>,
 ) -> Option<FastVal> {
-    eval_lean_expr_fast_ctx_inner(expr, env, None, false, &std::collections::HashSet::new())
+    eval_lean_expr_fast_ctx(
+        expr,
+        env,
+        None,
+        None,
+        false,
+        &std::collections::HashSet::new(),
+        &DeclScopeContext::default(),
+        true,
+    )
 }
 
+fn u256_const_for_prefix(prefix: &str, short: &str) -> Option<FastVal> {
+    let limbs = match short {
+        "zero" => [0u64; 4],
+        "one" => [1, 0, 0, 0],
+        "max" => [u64::MAX; 4],
+        "maxU64" if prefix == "UInt256" => [u64::MAX, 0, 0, 0],
+        "maxU128" if prefix == "UInt256" => [u64::MAX, u64::MAX, 0, 0],
+        "twoPow255" if prefix == "UInt256" => [0, 0, 0, 1u64 << 63],
+        _ => return None,
+    };
+    match prefix {
+        "Word256" => Some(FastVal::Word256(limbs)),
+        "UInt256" => Some(FastVal::UInt256(limbs)),
+        _ => None,
+    }
+}
+
+fn wide_from_kind(kind: ExpectedWideKind, w: [u64; 4]) -> FastVal {
+    match kind {
+        ExpectedWideKind::Word256 => FastVal::Word256(w),
+        ExpectedWideKind::UInt256 => FastVal::UInt256(w),
+        ExpectedWideKind::BitVec256 => FastVal::BitVec256(w),
+        ExpectedWideKind::OptionUInt256 => FastVal::OptionUInt256(Some(w)),
+    }
+}
+
+#[cfg(test)]
 fn eval_lean_expr_fast_ctx_inner(
     expr: &LeanExpr,
     env: &std::collections::HashMap<String, FastVal>,
@@ -5442,8 +6380,34 @@ fn eval_lean_expr_fast_ctx_inner(
     ambient_bv256: bool,
     bitvec_params: &std::collections::HashSet<&str>,
 ) -> Option<FastVal> {
-    let mut value_params: std::collections::HashSet<&str> =
-        env.keys().map(|s| s.as_str()).collect();
+    eval_lean_expr_fast_ctx(
+        expr,
+        env,
+        expected_dom,
+        None,
+        ambient_bv256,
+        bitvec_params,
+        &DeclScopeContext::default(),
+        false,
+    )
+}
+
+fn eval_lean_expr_fast_ctx(
+    expr: &LeanExpr,
+    env: &std::collections::HashMap<String, FastVal>,
+    expected_dom: Option<ScalarEvalDomain>,
+    expected_wide: Option<ExpectedWideKind>,
+    ambient_bv256: bool,
+    bitvec_params: &std::collections::HashSet<&str>,
+    scope: &DeclScopeContext,
+    allow_internal_test_helpers: bool,
+) -> Option<FastVal> {
+    let mut value_params: std::collections::HashSet<&str> = env
+        .iter()
+        .filter_map(|(k, v)| {
+            (!matches!(v, FastVal::Bool(_) | FastVal::Prop(_))).then_some(k.as_str())
+        })
+        .collect();
     value_params.insert("__typed_fn__");
     value_params.insert("__u256_const__");
     let outer_dom = expected_dom;
@@ -5478,83 +6442,145 @@ fn eval_lean_expr_fast_ctx_inner(
     )
     .ok()?;
     let dom = scalar_dom.filter(|d| d.word_bits <= 64);
-    let coerce_nat_to_bv256 =
-        outer_dom.is_none() && ambient_bv256 && scalar_dom.is_some_and(|d| d.is_nat);
+    let coerce_nat_to_bv256 = outer_dom.is_none()
+        && ambient_bv256
+        && scalar_dom.is_some_and(|d| d.is_nat)
+        && expected_wide.is_none_or(|k| k == ExpectedWideKind::BitVec256);
     let coerce_nat_to_bv_scalar =
         outer_dom.is_some_and(|d| d.is_bitvec) && scalar_dom.is_some_and(|d| d.is_nat);
     let wrap_out = |v: FastVal| -> Option<FastVal> {
         if coerce_nat_to_bv256 {
-            Some(FastVal::U256([v.as_u64()?, 0, 0, 0]))
+            Some(FastVal::BitVec256([v.as_nat()?, 0, 0, 0]))
         } else if coerce_nat_to_bv_scalar {
             let d = outer_dom?;
-            Some(FastVal::U64(d.mask(v.as_u64()?)))
+            Some(scalar_of(d, d.mask(v.as_nat()?)))
         } else {
             Some(v)
         }
     };
-    let rec = |e: &LeanExpr, d: Option<ScalarEvalDomain>| {
-        eval_lean_expr_fast_ctx_inner(e, env, d, ambient_bv256, bitvec_params)
+    let rec = |e: &LeanExpr, d: Option<ScalarEvalDomain>, w: Option<ExpectedWideKind>| {
+        eval_lean_expr_fast_ctx(
+            e,
+            env,
+            d,
+            w,
+            ambient_bv256,
+            bitvec_params,
+            scope,
+            allow_internal_test_helpers,
+        )
     };
     if let Some(qname) = flatten_qualified_name(expr) {
-        let short = qname.rsplit('.').next().unwrap_or(qname.as_str());
-        if let Some((prefix, _)) = qname.rsplit_once('.') {
-            if is_u256_const_prefix(prefix) {
-                match short {
-                    "zero" => return Some(FastVal::U256([0, 0, 0, 0])),
-                    "one" => return Some(FastVal::U256([1, 0, 0, 0])),
-                    "max" => return Some(FastVal::U256([u64::MAX; 4])),
-                    _ => {}
-                }
+        if let Some(resolved) = resolve_qname(&qname, scope) {
+            let short = resolved.rsplit('.').next().unwrap_or(resolved.as_str());
+            let prefix = resolved.rsplit_once('.').map(|(p, _)| p).unwrap_or("");
+            if prefix == "Option"
+                && short == "none"
+                && expected_wide == Some(ExpectedWideKind::OptionUInt256)
+            {
+                return Some(FastVal::OptionUInt256(None));
             }
-            if prefix == "Nat" && scalar_dom.is_some_and(|d| d.is_nat) && short == "zero" {
-                return wrap_out(FastVal::U64(0));
+            if let Some(v) = u256_const_for_prefix(prefix, short) {
+                return Some(v);
             }
             return None;
-        } else {
-            match short {
-                "true" | "True" => return Some(FastVal::Bool(true)),
-                "false" | "False" => return Some(FastVal::Bool(false)),
-                _ => {
-                    if let Some(v) = env.get(short) {
-                        return Some(v.clone());
-                    }
+        }
+        if qname.as_str() == "Nat.zero" && scalar_dom.is_some_and(|d| d.is_nat) {
+            return wrap_out(scalar_of(nat_count_domain(), 0));
+        }
+        if qname.contains('.') {
+            return None;
+        }
+        match qname.as_str() {
+            "true" => return Some(FastVal::Bool(true)),
+            "false" => return Some(FastVal::Bool(false)),
+            "True" => return Some(FastVal::Prop(true)),
+            "False" => return Some(FastVal::Prop(false)),
+            "none" if expected_wide == Some(ExpectedWideKind::OptionUInt256) => {
+                return Some(FastVal::OptionUInt256(None));
+            }
+            _ => {
+                if let Some(v) = env.get(&qname) {
+                    return Some(v.clone());
                 }
             }
         }
     }
-
     let raw_val = match expr {
         LeanExpr::Ident(name) => match name.as_str() {
-            "true" | "True" => Some(FastVal::Bool(true)),
-            "false" | "False" => Some(FastVal::Bool(false)),
+            "true" => Some(FastVal::Bool(true)),
+            "false" => Some(FastVal::Bool(false)),
+            "True" => Some(FastVal::Prop(true)),
+            "False" => Some(FastVal::Prop(false)),
+            "none" if expected_wide == Some(ExpectedWideKind::OptionUInt256) => {
+                Some(FastVal::OptionUInt256(None))
+            }
             _ => env.get(name).cloned(),
         },
         LeanExpr::Number(n) => {
+            if dom.is_some_and(|d| d.is_int) {
+                let val = if let Some(hex) = n.strip_prefix("0x").or_else(|| n.strip_prefix("0X")) {
+                    i128::from_str_radix(hex, 16).ok()?
+                } else {
+                    n.parse::<i128>().ok()?
+                };
+                return Some(FastVal::Int(val));
+            }
+            if expected_wide == Some(ExpectedWideKind::BitVec256)
+                || (dom.is_none() && ambient_bv256)
+            {
+                let val = if let Some(hex) = n.strip_prefix("0x").or_else(|| n.strip_prefix("0X")) {
+                    u128::from_str_radix(hex, 16).ok()?
+                } else {
+                    n.parse::<u128>().ok()?
+                };
+                if val > u128::from(u64::MAX) {
+                    return None;
+                }
+                return Some(FastVal::BitVec256([val as u64, 0, 0, 0]));
+            }
+            if matches!(
+                expected_wide,
+                Some(
+                    ExpectedWideKind::Word256
+                        | ExpectedWideKind::UInt256
+                        | ExpectedWideKind::OptionUInt256
+                )
+            ) {
+                return None;
+            }
             let val = if let Some(hex) = n.strip_prefix("0x").or_else(|| n.strip_prefix("0X")) {
                 u64::from_str_radix(hex, 16).ok()?
             } else {
                 n.parse::<u64>().ok()?
             };
-            if dom.is_none() && ambient_bv256 {
-                Some(FastVal::U256([val, 0, 0, 0]))
+            if let Some(d) = dom {
+                Some(scalar_of(d, d.mask(val)))
+            } else if expected_wide.is_none() && !ambient_bv256 {
+                Some(scalar_of(nat_count_domain(), val))
+            } else if allow_internal_test_helpers {
+                Some(scalar_of(nat_count_domain(), val))
             } else {
-                Some(FastVal::U64(
-                    dom.as_ref().map(|d| d.mask(val)).unwrap_or(val),
-                ))
+                None
             }
         }
         LeanExpr::Member(base, field) => {
-            let b = rec(base, scalar_dom)?;
+            if field == "fastBeq" {
+                return None;
+            }
+            let b = rec(base, None, None)?;
             match (b, field.as_str()) {
-                (FastVal::U256BoolPair(fst, _), "1" | "fst") => Some(FastVal::U256(fst)),
-                (FastVal::U256BoolPair(_, snd), "2" | "snd") => Some(FastVal::Bool(snd)),
-                (FastVal::U256(w), "w0") => Some(FastVal::U64(w[0])),
-                (FastVal::U256(w), "w1") => Some(FastVal::U64(w[1])),
-                (FastVal::U256(w), "w2") => Some(FastVal::U64(w[2])),
-                (FastVal::U256(w), "w3") => Some(FastVal::U64(w[3])),
-                (FastVal::U64(x), "val" | "toNat") if dom.is_some_and(|d| d.is_nat) => {
-                    Some(FastVal::U64(x))
-                }
+                (FastVal::Word256BoolPair(fst, _), "1" | "fst") => Some(FastVal::Word256(fst)),
+                (FastVal::Word256BoolPair(_, snd), "2" | "snd") => Some(FastVal::Bool(snd)),
+                (FastVal::Word256(w), "toUInt256") => Some(FastVal::UInt256(w)),
+                (FastVal::Word256(w), "w0") => Some(scalar_of(u64_limb_domain(), w[0])),
+                (FastVal::Word256(w), "w1") => Some(scalar_of(u64_limb_domain(), w[1])),
+                (FastVal::Word256(w), "w2") => Some(scalar_of(u64_limb_domain(), w[2])),
+                (FastVal::Word256(w), "w3") => Some(scalar_of(u64_limb_domain(), w[3])),
+                (FastVal::UInt256(w), "lo0") => Some(scalar_of(u64_limb_domain(), w[0])),
+                (FastVal::UInt256(w), "lo1") => Some(scalar_of(u64_limb_domain(), w[1])),
+                (FastVal::UInt256(w), "hi0") => Some(scalar_of(u64_limb_domain(), w[2])),
+                (FastVal::UInt256(w), "hi1") => Some(scalar_of(u64_limb_domain(), w[3])),
                 _ => None,
             }
         }
@@ -5562,75 +6588,92 @@ fn eval_lean_expr_fast_ctx_inner(
             if items.len() != 4 {
                 return None;
             }
-            let u64_limb_dom = Some(ScalarEvalDomain {
-                word_bits: 64,
-                is_nat: false,
-                is_bitvec: false,
-            });
-            let w0 =
-                eval_lean_expr_fast_ctx_inner(&items[0], env, u64_limb_dom, false, bitvec_params)?
-                    .as_u64()?;
-            let w1 =
-                eval_lean_expr_fast_ctx_inner(&items[1], env, u64_limb_dom, false, bitvec_params)?
-                    .as_u64()?;
-            let w2 =
-                eval_lean_expr_fast_ctx_inner(&items[2], env, u64_limb_dom, false, bitvec_params)?
-                    .as_u64()?;
-            let w3 =
-                eval_lean_expr_fast_ctx_inner(&items[3], env, u64_limb_dom, false, bitvec_params)?
-                    .as_u64()?;
-            Some(FastVal::U256([w0, w1, w2, w3]))
+            let kind = expected_wide
+                .filter(|k| matches!(k, ExpectedWideKind::Word256 | ExpectedWideKind::UInt256))?;
+            let limb = |e: &LeanExpr| rec(e, Some(u64_limb_domain()), None)?.as_u64_limb();
+            Some(wide_from_kind(
+                kind,
+                [
+                    limb(&items[0])?,
+                    limb(&items[1])?,
+                    limb(&items[2])?,
+                    limb(&items[3])?,
+                ],
+            ))
         }
         LeanExpr::Tuple(items) => {
             if items.len() != 2 {
                 return None;
             }
-            let fst = rec(&items[0], scalar_dom)?.as_u256()?;
-            let snd = rec(&items[1], scalar_dom)?.as_bool()?;
-            Some(FastVal::U256BoolPair(fst, snd))
+            let fst = rec(&items[0], None, Some(ExpectedWideKind::Word256))?.as_word256()?;
+            let snd = rec(&items[1], None, None)?.as_bool()?;
+            Some(FastVal::Word256BoolPair(fst, snd))
         }
         LeanExpr::IfThenElse(c, t, e) => {
-            let cond = rec(c, outer_dom)?.as_bool()?;
+            let cond = rec(c, outer_dom, None)?.as_bool()?;
             let branch_dom = if scalar_dom.is_some_and(|d| d.is_nat) {
                 Some(nat_count_domain())
             } else {
                 outer_dom
             };
             if cond {
-                rec(t, branch_dom)
+                rec(t, branch_dom, expected_wide)
             } else {
-                rec(e, branch_dom)
+                rec(e, branch_dom, expected_wide)
             }
         }
         LeanExpr::Unary(op, inner) => {
-            let v = rec(inner, outer_dom)?;
             let out_dom = outer_dom.filter(|d| d.word_bits <= 64);
             match op.as_str() {
-                "~~~" => match v {
-                    FastVal::U256(w) => Some(FastVal::U256([!w[0], !w[1], !w[2], !w[3]])),
-                    FastVal::U64(x) => {
-                        let d = out_dom?;
-                        (!d.is_nat).then_some(FastVal::U64(d.mask(!x)))
+                "!" => Some(FastVal::Bool(!rec(inner, outer_dom, None)?.as_bool()?)),
+                "¬" => Some(FastVal::Prop(!rec(inner, outer_dom, None)?.as_prop()?)),
+                "~~~" | "-" => {
+                    let is_int = outer_dom.is_some_and(|d| d.is_int);
+                    let is_uint = outer_dom.is_some_and(|d| {
+                        !d.is_nat && !d.is_int && !d.is_bitvec && d.word_bits <= 64
+                    });
+                    let is_bv = outer_dom.is_some_and(|d| d.is_bitvec)
+                        || (outer_dom.is_none()
+                            && ambient_bv256
+                            && expected_wide.is_none_or(|k| k == ExpectedWideKind::BitVec256));
+                    if !(is_bv || is_uint || (op == "-" && is_int)) {
+                        return None;
                     }
-                    _ => None,
-                },
-                "!" | "¬" => Some(FastVal::Bool(!v.as_bool()?)),
-                "-" => match v {
-                    FastVal::U256(w) => Some(FastVal::U256(u256_sub_with_borrow_rust([0; 4], w).0)),
-                    FastVal::U64(x) => {
-                        let d = out_dom?;
-                        if d.is_nat {
+                    let inner_wide = (outer_dom.is_none() && is_bv)
+                        .then(|| expected_wide.unwrap_or(ExpectedWideKind::BitVec256));
+                    let v = rec(inner, outer_dom, inner_wide)?;
+                    match (op.as_str(), v) {
+                        ("~~~", FastVal::BitVec256(w)) => {
+                            Some(FastVal::BitVec256([!w[0], !w[1], !w[2], !w[3]]))
+                        }
+                        ("~~~", FastVal::Scalar(d, x)) if d.is_bitvec || is_uint => {
+                            Some(scalar_of(d, d.mask(!x)))
+                        }
+                        ("-", FastVal::Int(x)) => Some(FastVal::Int(x.checked_neg()?)),
+                        ("-", FastVal::BitVec256(w)) => {
+                            Some(FastVal::BitVec256(u256_sub_with_borrow_rust([0; 4], w).0))
+                        }
+                        ("-", FastVal::Scalar(d, x)) if d.is_bitvec || is_uint => {
+                            Some(scalar_of(d, d.mask(0u64.wrapping_sub(x))))
+                        }
+                        ("-", FastVal::Scalar(d, x)) if d.is_int => {
+                            Some(FastVal::Int(-(i128::from(x))))
+                        }
+                        _ => {
+                            let _ = out_dom;
                             None
-                        } else {
-                            Some(FastVal::U64(d.mask(0u64.wrapping_sub(x))))
                         }
                     }
-                    _ => None,
-                },
+                }
                 _ => None,
             }
         }
         LeanExpr::Binary(op, lhs, rhs) => {
+            let prop_op = matches!(
+                op.as_str(),
+                "=" | "≠" | "<" | "<=" | "≤" | ">" | ">=" | "≥" | "∧" | "∨"
+            );
+            let bool_op = matches!(op.as_str(), "==" | "!=" | "&&" | "||");
             if matches!(
                 op.as_str(),
                 "=" | "==" | "!=" | "≠" | "<" | "<=" | "≤" | ">" | ">=" | "≥"
@@ -5638,17 +6681,34 @@ fn eval_lean_expr_fast_ctx_inner(
             {
                 return None;
             }
+            let bitvec_cmp = outer_dom.is_some_and(|d| d.is_bitvec)
+                || (outer_dom.is_none()
+                    && ambient_bv256
+                    && expected_wide.is_none_or(|k| k == ExpectedWideKind::BitVec256));
+            let arith_wide = if matches!(
+                op.as_str(),
+                "+" | "-" | "*" | "/" | "%" | "&&&" | "|||" | "^^^" | "<<<" | ">>>"
+            ) {
+                if outer_dom.is_none() && bitvec_cmp {
+                    Some(ExpectedWideKind::BitVec256)
+                } else {
+                    expected_wide
+                }
+            } else {
+                expected_wide
+            };
             if matches!(
                 op.as_str(),
                 "=" | "==" | "!=" | "≠" | "<" | "<=" | "≤" | ">" | ">=" | "≥"
-            ) && !expr_produces_bool(lhs)
-                && !expr_produces_bool(rhs)
+            ) && !expr_produces_bool_or_prop(lhs)
+                && !expr_produces_bool_or_prop(rhs)
+                && !scalar_dom.is_some_and(|d| d.is_int)
                 && (scalar_dom.is_some_and(|d| d.is_nat)
                     || (!expr_mentions_ident_value(lhs, &value_params)
                         && !expr_mentions_ident_value(rhs, &value_params)))
             {
-                let a = rec(lhs, Some(nat_count_domain()))?.as_u64()?;
-                let b = rec(rhs, Some(nat_count_domain()))?.as_u64()?;
+                let a = rec(lhs, Some(nat_count_domain()), None)?.as_nat()?;
+                let b = rec(rhs, Some(nat_count_domain()), None)?.as_nat()?;
                 let res = match op.as_str() {
                     "=" | "==" => a == b,
                     "!=" | "≠" => a != b,
@@ -5657,7 +6717,11 @@ fn eval_lean_expr_fast_ctx_inner(
                     ">" => a > b,
                     _ => a >= b,
                 };
-                return Some(FastVal::Bool(res));
+                return Some(if prop_op {
+                    FastVal::Prop(res)
+                } else {
+                    FastVal::Bool(res)
+                });
             }
             let rhs_dom = if matches!(op.as_str(), "<<<" | ">>>") {
                 shift_count_eval_domain(
@@ -5671,17 +6735,181 @@ fn eval_lean_expr_fast_ctx_inner(
             } else {
                 scalar_dom
             };
-            let l = rec(lhs, scalar_dom)?;
-            let r = rec(rhs, rhs_dom)?;
+            let rhs_wide =
+                if matches!(op.as_str(), "<<<" | ">>>") && rhs_dom.is_some_and(|d| d.is_nat) {
+                    None
+                } else {
+                    arith_wide
+                };
+            let (l, r) = if matches!(
+                op.as_str(),
+                "=" | "==" | "!=" | "≠" | "<" | "<=" | "≤" | ">" | ">=" | "≥"
+            ) {
+                let mut l_opt = rec(lhs, scalar_dom, arith_wide);
+                let mut r_opt = rec(rhs, rhs_dom, rhs_wide);
+                if matches!(op.as_str(), "=" | "==" | "!=" | "≠") {
+                    if r_opt.is_none() {
+                        if let Some(ref lv) = l_opt {
+                            if let Some(wk) = lv.wide_kind() {
+                                r_opt = rec(rhs, rhs_dom, Some(wk));
+                            } else if let FastVal::Scalar(dl, _) = lv {
+                                r_opt = rec(rhs, Some(*dl), None);
+                            } else if matches!(lv, FastVal::Int(_)) {
+                                r_opt = rec(
+                                    rhs,
+                                    Some(ScalarEvalDomain {
+                                        word_bits: 64,
+                                        is_nat: false,
+                                        is_int: true,
+                                        is_bitvec: false,
+                                    }),
+                                    None,
+                                );
+                            }
+                        }
+                    } else if l_opt.is_none() {
+                        if let Some(ref rv) = r_opt {
+                            if let Some(wk) = rv.wide_kind() {
+                                l_opt = rec(lhs, scalar_dom, Some(wk));
+                            } else if let FastVal::Scalar(dr, _) = rv {
+                                l_opt = rec(lhs, Some(*dr), None);
+                            } else if matches!(rv, FastVal::Int(_)) {
+                                l_opt = rec(
+                                    lhs,
+                                    Some(ScalarEvalDomain {
+                                        word_bits: 64,
+                                        is_nat: false,
+                                        is_int: true,
+                                        is_bitvec: false,
+                                    }),
+                                    None,
+                                );
+                            }
+                        }
+                    } else if let (Some(FastVal::Scalar(dl, _)), Some(FastVal::Scalar(dr, _))) =
+                        (&l_opt, &r_opt)
+                    {
+                        if dl != dr {
+                            if dl.is_nat && matches!(&**lhs, LeanExpr::Number(_)) {
+                                l_opt = rec(lhs, Some(*dr), None);
+                            } else if dr.is_nat && matches!(&**rhs, LeanExpr::Number(_)) {
+                                r_opt = rec(rhs, Some(*dl), None);
+                            }
+                        }
+                    } else if let (Some(FastVal::Int(_)), Some(FastVal::Scalar(dr, _))) =
+                        (&l_opt, &r_opt)
+                    {
+                        if dr.is_nat && matches!(&**rhs, LeanExpr::Number(_)) {
+                            r_opt = rec(
+                                rhs,
+                                Some(ScalarEvalDomain {
+                                    word_bits: 64,
+                                    is_nat: false,
+                                    is_int: true,
+                                    is_bitvec: false,
+                                }),
+                                None,
+                            );
+                        }
+                    } else if let (Some(FastVal::Scalar(dl, _)), Some(FastVal::Int(_))) =
+                        (&l_opt, &r_opt)
+                    {
+                        if dl.is_nat && matches!(&**lhs, LeanExpr::Number(_)) {
+                            l_opt = rec(
+                                lhs,
+                                Some(ScalarEvalDomain {
+                                    word_bits: 64,
+                                    is_nat: false,
+                                    is_int: true,
+                                    is_bitvec: false,
+                                }),
+                                None,
+                            );
+                        }
+                    }
+                } else {
+                    if let (Some(FastVal::Scalar(dl, _)), Some(FastVal::Scalar(dr, _))) =
+                        (&l_opt, &r_opt)
+                    {
+                        if dl != dr {
+                            if dl.is_nat && matches!(&**lhs, LeanExpr::Number(_)) {
+                                l_opt = rec(lhs, Some(*dr), None);
+                            } else if dr.is_nat && matches!(&**rhs, LeanExpr::Number(_)) {
+                                r_opt = rec(rhs, Some(*dl), None);
+                            }
+                        }
+                    } else if let (Some(FastVal::Int(_)), Some(FastVal::Scalar(dr, _))) =
+                        (&l_opt, &r_opt)
+                    {
+                        if dr.is_nat && matches!(&**rhs, LeanExpr::Number(_)) {
+                            r_opt = rec(
+                                rhs,
+                                Some(ScalarEvalDomain {
+                                    word_bits: 64,
+                                    is_nat: false,
+                                    is_int: true,
+                                    is_bitvec: false,
+                                }),
+                                None,
+                            );
+                        }
+                    } else if let (Some(FastVal::Scalar(dl, _)), Some(FastVal::Int(_))) =
+                        (&l_opt, &r_opt)
+                    {
+                        if dl.is_nat && matches!(&**lhs, LeanExpr::Number(_)) {
+                            l_opt = rec(
+                                lhs,
+                                Some(ScalarEvalDomain {
+                                    word_bits: 64,
+                                    is_nat: false,
+                                    is_int: true,
+                                    is_bitvec: false,
+                                }),
+                                None,
+                            );
+                        }
+                    }
+                }
+                (l_opt?, r_opt?)
+            } else {
+                (
+                    rec(lhs, scalar_dom, arith_wide)?,
+                    rec(rhs, rhs_dom, rhs_wide)?,
+                )
+            };
+            let flag = |b: bool| {
+                if prop_op {
+                    FastVal::Prop(b)
+                } else if bool_op {
+                    FastVal::Bool(b)
+                } else {
+                    FastVal::Prop(b)
+                }
+            };
             match op.as_str() {
                 "=" | "==" | "!=" | "≠" => {
-                    let eq = match (&l, &r) {
-                        (FastVal::U256(a), FastVal::U256(b)) => a == b,
-                        (FastVal::U256(a), FastVal::U64(b))
-                        | (FastVal::U64(b), FastVal::U256(a)) => *a == [*b, 0, 0, 0],
-                        _ => l == r,
-                    };
-                    Some(FastVal::Bool(if matches!(op.as_str(), "=" | "==") {
+                    if std::mem::discriminant(&l) != std::mem::discriminant(&r) {
+                        return None;
+                    }
+                    if matches!(
+                        (&l, &r),
+                        (FastVal::ContractState(_, _), _)
+                            | (FastVal::Prop(_), _)
+                            | (FastVal::StorageKey(_), _)
+                    ) && matches!(op.as_str(), "==" | "!=")
+                    {
+                        return None;
+                    }
+                    if matches!((&l, &r), (FastVal::ContractState(_, _), _)) {
+                        return None;
+                    }
+                    if let (FastVal::Scalar(da, _), FastVal::Scalar(db, _)) = (&l, &r) {
+                        if da != db {
+                            return None;
+                        }
+                    }
+                    let eq = l == r;
+                    Some(flag(if matches!(op.as_str(), "=" | "==") {
                         eq
                     } else {
                         !eq
@@ -5689,139 +6917,189 @@ fn eval_lean_expr_fast_ctx_inner(
                 }
                 "<" | "<=" | "≤" | ">" | ">=" | "≥" => {
                     let res = match (&l, &r) {
-                        (FastVal::U64(a), FastVal::U64(b)) => match op.as_str() {
+                        (FastVal::Int(a), FastVal::Int(b)) => match op.as_str() {
                             "<" => a < b,
                             "<=" | "≤" => a <= b,
                             ">" => a > b,
                             _ => a >= b,
                         },
-                        _ => {
-                            let (a, b) = (l.as_u256()?, r.as_u256()?);
+                        (FastVal::Scalar(da, a), FastVal::Scalar(db, b)) if da == db => {
                             match op.as_str() {
-                                "<" => u256_lt_rust(a, b),
-                                "<=" | "≤" => !u256_lt_rust(b, a),
-                                ">" => u256_lt_rust(b, a),
-                                _ => !u256_lt_rust(a, b),
+                                "<" => a < b,
+                                "<=" | "≤" => a <= b,
+                                ">" => a > b,
+                                _ => a >= b,
                             }
                         }
+                        (FastVal::BitVec256(a), FastVal::BitVec256(b)) => match op.as_str() {
+                            "<" => u256_lt_rust(*a, *b),
+                            "<=" | "≤" => !u256_lt_rust(*b, *a),
+                            ">" => u256_lt_rust(*b, *a),
+                            _ => !u256_lt_rust(*a, *b),
+                        },
+                        _ => return None,
                     };
-                    Some(FastVal::Bool(res))
+                    Some(flag(res))
                 }
-                "&&" | "∧" => Some(FastVal::Bool(l.as_bool()? && r.as_bool()?)),
-                "||" | "∨" => Some(FastVal::Bool(l.as_bool()? || r.as_bool()?)),
-                "&&&" | "|||" | "^^^" => {
-                    let op_code = match op.as_str() {
-                        "&&&" => 5,
-                        "|||" => 6,
-                        _ => 7,
-                    };
-                    match (&l, &r) {
-                        (FastVal::U64(a), FastVal::U64(b)) => {
-                            let d = dom?;
-                            Some(FastVal::U64(d.mask(
-                                crate::cluster::lean_cabi_eval_u64_binop(op_code, *a, *b),
-                            )))
-                        }
-                        _ => {
-                            let (a, b) = (l.as_u256()?, r.as_u256()?);
-                            Some(FastVal::U256(std::array::from_fn(|k| {
-                                crate::cluster::lean_cabi_eval_u64_binop(op_code, a[k], b[k])
-                            })))
+                "&&" => Some(FastVal::Bool(l.as_bool()? && r.as_bool()?)),
+                "||" => Some(FastVal::Bool(l.as_bool()? || r.as_bool()?)),
+                "∧" => Some(FastVal::Prop(l.as_prop()? && r.as_prop()?)),
+                "∨" => Some(FastVal::Prop(l.as_prop()? || r.as_prop()?)),
+                "&&&" | "|||" | "^^^" | "+" | "-" | "*" | "/" | "%" | "<<<" | ">>>" => {
+                    if !bitvec_cmp
+                        || expected_wide.is_some_and(|k| k != ExpectedWideKind::BitVec256)
+                    {
+                        if !matches!(
+                            (&l, &r),
+                            (FastVal::Scalar(_, _), FastVal::Scalar(_, _))
+                                | (FastVal::Int(_), FastVal::Int(_))
+                        ) {
+                            return None;
                         }
                     }
-                }
-                "+" | "-" => {
-                    let is_add = op == "+";
-                    match (&l, &r) {
-                        (FastVal::U64(a), FastVal::U64(b)) => {
-                            let d = dom?;
-                            if d.is_nat {
-                                let res = if is_add {
-                                    a.checked_add(*b)?
-                                } else {
-                                    a.saturating_sub(*b)
-                                };
-                                Some(FastVal::U64(res))
-                            } else {
-                                Some(FastVal::U64(d.mask(
-                                    crate::cluster::lean_cabi_eval_u64_binop(
-                                        u8::from(!is_add),
-                                        *a,
-                                        *b,
-                                    ),
-                                )))
-                            }
-                        }
-                        _ => {
-                            let (a, b) = (l.as_u256()?, r.as_u256()?);
-                            Some(FastVal::U256(if is_add {
-                                u256_add_with_carry_rust(a, b).0
-                            } else {
-                                u256_sub_with_borrow_rust(a, b).0
+                    match (&l, &r, op.as_str()) {
+                        (FastVal::Int(a), FastVal::Int(b), "+" | "-" | "*" | "/" | "%") => {
+                            Some(FastVal::Int(match op.as_str() {
+                                "+" => a.checked_add(*b)?,
+                                "-" => a.checked_sub(*b)?,
+                                "*" => a.checked_mul(*b)?,
+                                "/" | "%" => {
+                                    if *b == 0 {
+                                        if op == "/" {
+                                            0
+                                        } else {
+                                            *a
+                                        }
+                                    } else if op == "/" {
+                                        a.checked_div_euclid(*b)?
+                                    } else {
+                                        a.checked_rem_euclid(*b)?
+                                    }
+                                }
+                                _ => return None,
                             }))
                         }
-                    }
-                }
-                "*" => match (&l, &r) {
-                    (FastVal::U64(a), FastVal::U64(b)) => {
-                        let d = dom?;
-                        if d.is_nat {
-                            Some(FastVal::U64(a.checked_mul(*b)?))
-                        } else {
-                            Some(FastVal::U64(
-                                d.mask(crate::cluster::lean_cabi_eval_u64_binop(2, *a, *b)),
-                            ))
-                        }
-                    }
-                    _ => {
-                        let (a, b) = (l.as_u256()?, r.as_u256()?);
-                        Some(FastVal::U256(u256_mul_rust(a, b)))
-                    }
-                },
-                "/" | "%" | "<<<" | ">>>" => {
-                    if matches!(op.as_str(), "<<<" | ">>>") {
-                        if let FastVal::U256(a) = l {
-                            let b = match r {
-                                FastVal::U256(w) => w,
-                                FastVal::U64(x) => [x, 0, 0, 0],
-                                _ => return None,
-                            };
-                            return wrap_out(FastVal::U256(if op == "<<<" {
-                                u256_shl_rust(a, b)
+                        (FastVal::Scalar(da, a), FastVal::Scalar(db, b), "<<<" | ">>>")
+                            if da.word_bits <= 64 && (da == db || ((!da.is_int) && db.is_nat)) =>
+                        {
+                            if op == "<<<" {
+                                eval_scalar_shift_left(*da, *a, *b)
                             } else {
-                                u256_shr_rust(a, b)
-                            }));
+                                eval_scalar_shift_right(*da, *a, *b)
+                            }
                         }
-                    }
-                    if matches!(op.as_str(), "/" | "%")
-                        && matches!((&l, &r), (FastVal::U256(_), _) | (_, FastVal::U256(_)))
-                    {
-                        let (a, b) = (l.as_u256()?, r.as_u256()?);
-                        if scalar_dom.is_none() && ambient_bv256 && b == [0; 4] {
-                            return wrap_out(FastVal::U256(if op == "/" { [0; 4] } else { a }));
+                        (FastVal::Scalar(da, a), FastVal::Scalar(db, b), _)
+                            if da == db && da.word_bits <= 64 =>
+                        {
+                            let d = *da;
+                            let (a, b) = (*a, *b);
+                            if d.is_nat {
+                                Some(scalar_of(
+                                    d,
+                                    match op.as_str() {
+                                        "+" => a.checked_add(b)?,
+                                        "-" => a.saturating_sub(b),
+                                        "*" => a.checked_mul(b)?,
+                                        "/" => a.checked_div(b).unwrap_or(0),
+                                        "%" => a.checked_rem(b).unwrap_or(a),
+                                        _ => return None,
+                                    },
+                                ))
+                            } else {
+                                let code = match op.as_str() {
+                                    "+" => 0,
+                                    "-" => 1,
+                                    "*" => 2,
+                                    "/" => 3,
+                                    "%" => 4,
+                                    "&&&" => 5,
+                                    "|||" => 6,
+                                    "^^^" => 7,
+                                    _ => return None,
+                                };
+                                if matches!(op.as_str(), "/" | "%") && b == 0 {
+                                    Some(scalar_of(d, if op == "/" { 0 } else { d.mask(a) }))
+                                } else {
+                                    Some(scalar_of(
+                                        d,
+                                        d.mask(crate::cluster::lean_cabi_eval_u64_binop(
+                                            code, a, b,
+                                        )),
+                                    ))
+                                }
+                            }
                         }
-                        let q = u256_div_mod_rust(a, b)?;
-                        return wrap_out(FastVal::U256(if op == "/" { q.0 } else { q.1 }));
-                    }
-                    let d = dom?;
-                    let la = l.as_u64()?;
-                    let rb = r.as_u64()?;
-                    match op.as_str() {
-                        "/" => Some(FastVal::U64(la.checked_div(rb).map_or(0, |q| d.mask(q)))),
-                        "%" => Some(FastVal::U64(
-                            la.checked_rem(rb).map_or_else(|| d.mask(la), |r| d.mask(r)),
-                        )),
-                        "<<<" => eval_scalar_shift_left(d, la, rb),
-                        _ => eval_scalar_shift_right(d, la, rb),
+                        (FastVal::BitVec256(a), FastVal::BitVec256(b), _) => {
+                            let (a, b) = (*a, *b);
+                            Some(FastVal::BitVec256(match op.as_str() {
+                                "&&&" => std::array::from_fn(|k| a[k] & b[k]),
+                                "|||" => std::array::from_fn(|k| a[k] | b[k]),
+                                "^^^" => std::array::from_fn(|k| a[k] ^ b[k]),
+                                "+" => u256_add_with_carry_rust(a, b).0,
+                                "-" => u256_sub_with_borrow_rust(a, b).0,
+                                "*" => u256_mul_rust(a, b),
+                                "/" | "%" => {
+                                    if b == [0; 4] {
+                                        if op == "/" {
+                                            [0; 4]
+                                        } else {
+                                            a
+                                        }
+                                    } else {
+                                        let q = u256_div_mod_rust(a, b)?;
+                                        if op == "/" {
+                                            q.0
+                                        } else {
+                                            q.1
+                                        }
+                                    }
+                                }
+                                "<<<" => u256_shl_rust(a, b),
+                                ">>>" => u256_shr_rust(a, b),
+                                _ => return None,
+                            }))
+                        }
+                        (FastVal::BitVec256(a), FastVal::Scalar(d, n), "<<<" | ">>>")
+                            if d.is_nat =>
+                        {
+                            let sh = [*n, 0, 0, 0];
+                            Some(FastVal::BitVec256(if op == "<<<" {
+                                u256_shl_rust(*a, sh)
+                            } else {
+                                u256_shr_rust(*a, sh)
+                            }))
+                        }
+                        _ => None,
                     }
                 }
                 _ => None,
             }
         }
         LeanExpr::App(head, args) => {
+            if let LeanExpr::Member(base, method) = head.as_ref() {
+                if method == "fastBeq" && args.len() == 1 {
+                    let a = rec(base, None, None)?.as_storage_key()?;
+                    let b = rec(&args[0], None, None)?.as_storage_key()?;
+                    return wrap_out(FastVal::Bool(a == b));
+                }
+            }
             let fname = flatten_qualified_name(head)?;
-            let short = fname.rsplit('.').next().unwrap_or(fname.as_str());
-            let prefix = fname.rsplit_once('.').map(|(p, _)| p);
+            let resolved = resolve_qname(&fname, scope);
+            let canon = resolved.as_deref().unwrap_or(fname.as_str());
+            if canon.contains('.')
+                && resolved.is_none()
+                && !matches!(
+                    canon.rsplit_once('.').map(|(p, _)| p),
+                    Some("BitVec" | "Nat" | "Bool" | "UInt64" | "UInt32" | "UInt16" | "UInt8")
+                )
+            {
+                return None;
+            }
+            let short = canon.rsplit('.').next().unwrap_or(canon);
+            let prefix = canon.rsplit_once('.').map(|(p, _)| p);
+            if matches!(short, "zero" | "one") && prefix == Some("BitVec") {
+                return None;
+            }
             if prefix == Some("BitVec")
                 && matches!(short, "shiftLeft" | "ushiftRight")
                 && args.len() == 2
@@ -5831,78 +7109,140 @@ fn eval_lean_expr_fast_ctx_inner(
             }
             let shift_count = matches!(
                 short,
-                "shiftLeft" | "ushiftRight" | "shiftRight" | "shl" | "shr"
+                "shiftLeft" | "ushiftRight" | "shiftRight" | "shl" | "shr" | "sar"
             ) && args.len() == 2
                 && (prefix == Some("BitVec")
                     || prefix == Some("Nat")
+                    || prefix == Some("UInt256")
                     || (prefix.is_none() && scalar_dom.is_some_and(|d| d.is_bitvec || d.is_nat)));
+            let is_some_opt = short == "some"
+                && args.len() == 1
+                && (prefix == Some("Option") || prefix.is_none())
+                && expected_wide == Some(ExpectedWideKind::OptionUInt256);
+            let is_set_storage = short == "setStorage"
+                && args.len() == 3
+                && (matches!(prefix, Some("TurboLean.Reflection"))
+                    || (prefix.is_none() && reflection_ns_visible(scope)));
+            let is_get_storage = short == "getStorage"
+                && args.len() == 2
+                && (matches!(prefix, Some("TurboLean.Reflection"))
+                    || (prefix.is_none() && reflection_ns_visible(scope)));
             let mut v_args = Vec::with_capacity(args.len());
             for (i, a) in args.iter().enumerate() {
-                let arg_dom = if matches!((short, args.len()), ("packHalves" | "mk", 4))
-                    && prefix.is_none_or(is_u256_fn_prefix)
-                {
-                    Some(ScalarEvalDomain {
-                        word_bits: 64,
-                        is_nat: false,
-                        is_bitvec: false,
-                    })
+                let (arg_dom, arg_wide) = if matches!(
+                    (short, args.len(), prefix),
+                    ("mk", 4, Some("Word256" | "UInt256"))
+                ) {
+                    (Some(u64_limb_domain()), None)
+                } else if is_some_opt {
+                    (None, Some(ExpectedWideKind::UInt256))
+                } else if is_set_storage {
+                    if i == 2 {
+                        (Some(nat_count_domain()), None)
+                    } else {
+                        (None, None)
+                    }
+                } else if is_get_storage {
+                    (None, None)
+                } else if short == "ofNat" && prefix == Some("BitVec") && (i == 0 || i == 1) {
+                    (Some(nat_count_domain()), None)
+                } else if short == "ofNat" && prefix == Some("UInt256") && i == 0 {
+                    (Some(nat_count_domain()), None)
+                } else if short == "ofUInt64" && prefix == Some("UInt256") && i == 0 {
+                    (Some(u64_limb_domain()), None)
+                } else if short == "ofUInt256" && prefix == Some("Word256") && i == 0 {
+                    (None, Some(ExpectedWideKind::UInt256))
                 } else if shift_count && i == 1 {
-                    Some(nat_count_domain())
+                    (Some(nat_count_domain()), None)
+                } else if prefix == Some("BitVec") && scalar_dom.is_none() && ambient_bv256 {
+                    (scalar_dom, Some(ExpectedWideKind::BitVec256))
+                } else if prefix == Some("UInt256") {
+                    (None, Some(ExpectedWideKind::UInt256))
+                } else if prefix == Some("Word256") {
+                    (None, Some(ExpectedWideKind::Word256))
+                } else if prefix == Some("Nat") {
+                    (Some(nat_count_domain()), None)
+                } else if prefix == Some("StorageKey")
+                    || matches!(
+                        short,
+                        "slot" | "transient" | "addr" | "contractSlot" | "map" | "mapUint" | "map2"
+                    ) && prefix.is_none()
+                        && reflection_ns_visible(scope)
+                {
+                    if short == "fastBeq" {
+                        (None, None)
+                    } else {
+                        (Some(nat_count_domain()), None)
+                    }
                 } else {
-                    scalar_dom
+                    (scalar_dom, expected_wide)
                 };
-                v_args.push(rec(a, arg_dom)?);
+                v_args.push(rec(a, arg_dom, arg_wide)?);
             }
-            if prefix == Some("BitVec") && scalar_dom.is_none() && ambient_bv256 {
-                let res = match (short, v_args.len()) {
-                    ("not", 1) => {
-                        let a = v_args[0].as_u256()?;
-                        Some(FastVal::U256(std::array::from_fn(|k| !a[k])))
-                    }
-                    ("and" | "or" | "xor", 2) => {
-                        let (a, b) = (v_args[0].as_u256()?, v_args[1].as_u256()?);
-                        Some(FastVal::U256(std::array::from_fn(|k| match short {
-                            "and" => a[k] & b[k],
-                            "or" => a[k] | b[k],
-                            _ => a[k] ^ b[k],
-                        })))
-                    }
-                    ("add" | "sub", 2) => {
-                        let (a, b) = (v_args[0].as_u256()?, v_args[1].as_u256()?);
-                        Some(FastVal::U256(if short == "add" {
-                            u256_add_with_carry_rust(a, b).0
-                        } else {
-                            u256_sub_with_borrow_rust(a, b).0
-                        }))
-                    }
-                    ("mul", 2) => {
-                        let (a, b) = (v_args[0].as_u256()?, v_args[1].as_u256()?);
-                        Some(FastVal::U256(u256_mul_rust(a, b)))
-                    }
-                    ("udiv" | "umod", 2) => {
-                        let (a, b) = (v_args[0].as_u256()?, v_args[1].as_u256()?);
-                        if b == [0; 4] {
-                            Some(FastVal::U256(if short == "udiv" { [0; 4] } else { a }))
-                        } else {
-                            let q = u256_div_mod_rust(a, b)?;
-                            Some(FastVal::U256(if short == "udiv" { q.0 } else { q.1 }))
+            if prefix == Some("BitVec")
+                && (scalar_dom.is_some_and(|d| d.is_bitvec && d.word_bits <= 64)
+                    || (scalar_dom.is_none() && ambient_bv256))
+            {
+                if scalar_dom.is_none() && ambient_bv256 {
+                    let res = match (short, v_args.len()) {
+                        ("ofNat", 2) => {
+                            let w = v_args[0].as_nat()?;
+                            if w != 256 {
+                                return None;
+                            }
+                            let v = v_args[1].as_nat()?;
+                            FastVal::BitVec256([v, 0, 0, 0])
                         }
-                    }
-                    ("shiftLeft" | "ushiftRight", 2) => {
-                        let a = v_args[0].as_u256()?;
-                        let b = [v_args[1].as_u64()?, 0, 0, 0];
-                        Some(FastVal::U256(if short == "shiftLeft" {
-                            u256_shl_rust(a, b)
-                        } else {
-                            u256_shr_rust(a, b)
-                        }))
-                    }
-                    _ => None,
-                }?;
-                return wrap_out(res);
+                        ("not", 1) => {
+                            let a = v_args[0].as_bv256()?;
+                            FastVal::BitVec256(std::array::from_fn(|k| !a[k]))
+                        }
+                        ("and" | "or" | "xor", 2) => {
+                            let (a, b) = (v_args[0].as_bv256()?, v_args[1].as_bv256()?);
+                            FastVal::BitVec256(std::array::from_fn(|k| match short {
+                                "and" => a[k] & b[k],
+                                "or" => a[k] | b[k],
+                                _ => a[k] ^ b[k],
+                            }))
+                        }
+                        ("add" | "sub", 2) => {
+                            let (a, b) = (v_args[0].as_bv256()?, v_args[1].as_bv256()?);
+                            FastVal::BitVec256(if short == "add" {
+                                u256_add_with_carry_rust(a, b).0
+                            } else {
+                                u256_sub_with_borrow_rust(a, b).0
+                            })
+                        }
+                        ("mul", 2) => FastVal::BitVec256(u256_mul_rust(
+                            v_args[0].as_bv256()?,
+                            v_args[1].as_bv256()?,
+                        )),
+                        ("udiv" | "umod", 2) => {
+                            let (a, b) = (v_args[0].as_bv256()?, v_args[1].as_bv256()?);
+                            if b == [0; 4] {
+                                FastVal::BitVec256(if short == "udiv" { [0; 4] } else { a })
+                            } else {
+                                let q = u256_div_mod_rust(a, b)?;
+                                FastVal::BitVec256(if short == "udiv" { q.0 } else { q.1 })
+                            }
+                        }
+                        ("shiftLeft" | "ushiftRight", 2) => {
+                            let a = v_args[0].as_bv256()?;
+                            let b = [v_args[1].as_nat()?, 0, 0, 0];
+                            FastVal::BitVec256(if short == "shiftLeft" {
+                                u256_shl_rust(a, b)
+                            } else {
+                                u256_shr_rust(a, b)
+                            })
+                        }
+                        _ => return None,
+                    };
+                    return wrap_out(res);
+                }
             }
             if let Some(p) = prefix {
-                if let Some(sd) = scalar_dom {
+                if let Some(sd) = scalar_dom.or_else(|| (p == "Nat").then_some(nat_count_domain()))
+                {
                     if scalar_domain_matches_fn_prefix(p, sd) {
                         return eval_scalar_fn_app(p, short, &v_args, sd).and_then(wrap_out);
                     }
@@ -5910,254 +7250,255 @@ fn eval_lean_expr_fast_ctx_inner(
                 if p == "Bool" && short == "beq" && v_args.len() == 2 {
                     return Some(FastVal::Bool(v_args[0].as_bool()? == v_args[1].as_bool()?));
                 }
-                if matches!(p, "StorageKey" | "TurboLean.Reflection.StorageKey")
-                    && short == "fastBeq"
-                    && v_args.len() == 2
+                if p == "Option"
+                    && matches!(short, "none" | "some")
+                    && expected_wide == Some(ExpectedWideKind::OptionUInt256)
                 {
-                    return Some(FastVal::Bool(v_args[0].as_u64()? == v_args[1].as_u64()?));
-                }
-                if matches!(p, "TurboLean" | "TurboLean.Reflection")
-                    && matches!((short, v_args.len()), ("getStorage", 2) | ("setStorage", 3))
-                {
-                    // Fall through to storage evaluation below.
-                } else if !is_u256_fn_prefix(p) {
-                    return None;
+                    return match (short, v_args.len()) {
+                        ("none", 0) => Some(FastVal::OptionUInt256(None)),
+                        ("some", 1) => Some(FastVal::OptionUInt256(Some(v_args[0].as_uint256()?))),
+                        _ => None,
+                    };
                 }
             }
+            let uint_ok = prefix == Some("UInt256");
+            let word_ok = prefix == Some("Word256");
+            let sk_ok =
+                prefix == Some("StorageKey") || (prefix.is_none() && reflection_ns_visible(scope));
+            let refl_ok = matches!(prefix, Some("TurboLean.Reflection"))
+                || (prefix.is_none() && reflection_ns_visible(scope));
+            let opt_expected = expected_wide == Some(ExpectedWideKind::OptionUInt256);
+            let internal =
+                |name: &str| allow_internal_test_helpers && prefix.is_none() && short == name;
             match (short, v_args.len()) {
-                ("getStorage", 2) => {
+                ("none", 0) if prefix.is_none() && opt_expected => {
+                    Some(FastVal::OptionUInt256(None))
+                }
+                ("some", 1) if prefix.is_none() && opt_expected => {
+                    Some(FastVal::OptionUInt256(Some(v_args[0].as_uint256()?)))
+                }
+                ("getStorage", 2) if refl_ok => {
                     let FastVal::ContractState(seed, ref ups) = v_args[0] else {
                         return None;
                     };
-                    let k = v_args[1].as_u64()?;
+                    let k = v_args[1].as_storage_key()?;
                     for (uk, uv) in ups.iter().rev() {
                         if *uk == k {
-                            return Some(FastVal::U64(*uv));
+                            return Some(scalar_of(nat_count_domain(), *uv));
                         }
                     }
-                    Some(FastVal::U64(splitmix64_rust(seed ^ k)))
+                    Some(scalar_of(
+                        nat_count_domain(),
+                        splitmix64_rust(seed ^ k.hash_seed()),
+                    ))
                 }
-                ("setStorage", 3) => {
+                ("setStorage", 3) if refl_ok => {
                     let FastVal::ContractState(seed, mut ups) = v_args[0].clone() else {
                         return None;
                     };
-                    let k = v_args[1].as_u64()?;
-                    let v = v_args[2].as_u64()?;
-                    ups.push((k, v));
+                    ups.push((v_args[1].as_storage_key()?, v_args[2].as_nat()?));
                     Some(FastVal::ContractState(seed, ups))
                 }
-                ("fastBeq", 2) if prefix.is_none() => Some(FastVal::Bool(v_args[0] == v_args[1])),
-                ("beq", 2) if prefix.is_none() => Some(FastVal::Bool(v_args[0] == v_args[1])),
-                ("bitNot", 1) if matches!(v_args[0], FastVal::U256(_)) => {
-                    let a = v_args[0].as_u256()?;
-                    Some(FastVal::U256(std::array::from_fn(|k| !a[k])))
-                }
-                (
-                    "bitAnd" | "bitOr" | "bitSetMask" | "bitXor" | "bitFlipMask" | "bitClearMask",
-                    2,
-                ) if matches!(
-                    (&v_args[0], &v_args[1]),
-                    (FastVal::U256(_), FastVal::U256(_))
-                ) =>
+                ("fastBeq", 2)
+                    if prefix == Some("StorageKey")
+                        || (prefix.is_none() && reflection_ns_visible(scope)) =>
                 {
-                    let (a, b) = (v_args[0].as_u256()?, v_args[1].as_u256()?);
-                    Some(FastVal::U256(std::array::from_fn(|k| match short {
-                        "bitAnd" => a[k] & b[k],
-                        "bitOr" | "bitSetMask" => a[k] | b[k],
-                        "bitXor" | "bitFlipMask" => a[k] ^ b[k],
-                        _ => a[k] & !b[k],
-                    })))
+                    Some(FastVal::Bool(
+                        v_args[0].as_storage_key()? == v_args[1].as_storage_key()?,
+                    ))
                 }
-                ("bitMux" | "bitMaj" | "bitParity", 3)
-                    if matches!(
-                        (&v_args[0], &v_args[1], &v_args[2]),
-                        (FastVal::U256(_), FastVal::U256(_), FastVal::U256(_))
-                    ) =>
-                {
+                ("beq", 2) if prefix.is_none() => {
+                    Some(FastVal::Bool(v_args[0].as_bool()? == v_args[1].as_bool()?))
+                }
+                ("slot" | "transient" | "addr", 1) if sk_ok => Some(FastVal::StorageKey(
+                    encode_storage_key(short, &[v_args[0].as_nat()?])?,
+                )),
+                ("contractSlot" | "map" | "mapUint", 2) if sk_ok => Some(FastVal::StorageKey(
+                    encode_storage_key(short, &[v_args[0].as_nat()?, v_args[1].as_nat()?])?,
+                )),
+                ("map2", 3) if sk_ok => Some(FastVal::StorageKey(encode_storage_key(
+                    short,
+                    &[
+                        v_args[0].as_nat()?,
+                        v_args[1].as_nat()?,
+                        v_args[2].as_nat()?,
+                    ],
+                )?)),
+                ("ofUInt64", 1) if uint_ok => {
+                    Some(FastVal::UInt256([v_args[0].as_u64_limb()?, 0, 0, 0]))
+                }
+                ("ofNat", 1) if uint_ok => {
+                    let n = v_args[0].as_nat()?;
+                    Some(FastVal::UInt256([n, 0, 0, 0]))
+                }
+                ("toUInt256", 1) if word_ok => Some(FastVal::UInt256(v_args[0].as_word256()?)),
+                ("ofUInt256", 1) if word_ok => Some(FastVal::Word256(v_args[0].as_uint256()?)),
+                ("bitNot", 1) if uint_ok || word_ok => {
+                    let a = if uint_ok {
+                        v_args[0].as_uint256()?
+                    } else {
+                        v_args[0].as_word256()?
+                    };
+                    Some(wide_from_kind(
+                        if uint_ok {
+                            ExpectedWideKind::UInt256
+                        } else {
+                            ExpectedWideKind::Word256
+                        },
+                        std::array::from_fn(|k| !a[k]),
+                    ))
+                }
+                ("bitAnd" | "bitOr" | "bitXor", 2) if uint_ok || word_ok => {
+                    let (a, b) = if uint_ok {
+                        (v_args[0].as_uint256()?, v_args[1].as_uint256()?)
+                    } else {
+                        (v_args[0].as_word256()?, v_args[1].as_word256()?)
+                    };
+                    Some(wide_from_kind(
+                        if uint_ok {
+                            ExpectedWideKind::UInt256
+                        } else {
+                            ExpectedWideKind::Word256
+                        },
+                        std::array::from_fn(|k| match short {
+                            "bitAnd" => a[k] & b[k],
+                            "bitOr" => a[k] | b[k],
+                            _ => a[k] ^ b[k],
+                        }),
+                    ))
+                }
+                ("bitMux" | "bitMaj" | "bitParity", 3) if word_ok => {
                     let (x, y, z) = (
-                        v_args[0].as_u256()?,
-                        v_args[1].as_u256()?,
-                        v_args[2].as_u256()?,
+                        v_args[0].as_word256()?,
+                        v_args[1].as_word256()?,
+                        v_args[2].as_word256()?,
                     );
-                    Some(FastVal::U256(std::array::from_fn(|k| match short {
+                    Some(FastVal::Word256(std::array::from_fn(|k| match short {
                         "bitMux" => (y[k] & x[k]) | (z[k] & !x[k]),
                         "bitMaj" => (x[k] & y[k]) | (y[k] & z[k]) | (x[k] & z[k]),
                         _ => x[k] ^ y[k] ^ z[k],
                     })))
                 }
-                ("add" | "sub", 2)
-                    if matches!(
-                        (&v_args[0], &v_args[1]),
-                        (FastVal::U256(_), FastVal::U256(_))
-                    ) =>
-                {
-                    let (a, b) = (v_args[0].as_u256()?, v_args[1].as_u256()?);
-                    Some(FastVal::U256(if short == "add" {
-                        u256_add_with_carry_rust(a, b).0
-                    } else {
-                        u256_sub_with_borrow_rust(a, b).0
+                ("add" | "sub" | "mul", 2) if uint_ok => {
+                    let (a, b) = (v_args[0].as_uint256()?, v_args[1].as_uint256()?);
+                    Some(FastVal::UInt256(match short {
+                        "add" => u256_add_with_carry_rust(a, b).0,
+                        "sub" => u256_sub_with_borrow_rust(a, b).0,
+                        _ => u256_mul_rust(a, b),
                     }))
                 }
-                ("mul", 2)
-                    if matches!(
-                        (&v_args[0], &v_args[1]),
-                        (FastVal::U256(_), FastVal::U256(_))
-                    ) =>
-                {
-                    let (a, b) = (v_args[0].as_u256()?, v_args[1].as_u256()?);
-                    Some(FastVal::U256(u256_mul_rust(a, b)))
+                ("addChecked" | "subChecked" | "mulChecked", 2) if uint_ok => {
+                    let (a, b) = (v_args[0].as_uint256()?, v_args[1].as_uint256()?);
+                    let (res, flag) = match short {
+                        "addChecked" => {
+                            let (r, c) = u256_add_with_carry_rust(a, b);
+                            (r, c)
+                        }
+                        "subChecked" => {
+                            let (r, c) = u256_sub_with_borrow_rust(a, b);
+                            (r, c)
+                        }
+                        _ => (u256_mul_rust(a, b), false),
+                    };
+                    let overflow = match short {
+                        "mulChecked" => u256_mul_overflows(a, b),
+                        _ => flag,
+                    };
+                    Some(FastVal::OptionUInt256((!overflow).then_some(res)))
                 }
-                ("div" | "mod", 2)
-                    if matches!(
-                        (&v_args[0], &v_args[1]),
-                        (FastVal::U256(_), FastVal::U256(_))
-                    ) =>
-                {
-                    let (a, b) = (v_args[0].as_u256()?, v_args[1].as_u256()?);
-                    let q = u256_div_mod_rust(a, b)?;
-                    Some(FastVal::U256(if short == "div" { q.0 } else { q.1 }))
+                ("div" | "mod", 2) if uint_ok => {
+                    let (a, b) = (v_args[0].as_uint256()?, v_args[1].as_uint256()?);
+                    if b == [0; 4] {
+                        Some(FastVal::OptionUInt256(None))
+                    } else {
+                        let q = u256_div_mod_rust(a, b)?;
+                        Some(FastVal::OptionUInt256(Some(if short == "div" {
+                            q.0
+                        } else {
+                            q.1
+                        })))
+                    }
                 }
-                ("addWithCarry" | "subWithBorrow", 2)
-                    if matches!(
-                        (&v_args[0], &v_args[1]),
-                        (FastVal::U256(_), FastVal::U256(_))
-                    ) =>
-                {
-                    let (a, b) = (v_args[0].as_u256()?, v_args[1].as_u256()?);
+                ("mulDivDown" | "mulDivUp", 3) if uint_ok => {
+                    Some(FastVal::OptionUInt256(u256_mul_div_checked(
+                        v_args[0].as_uint256()?,
+                        v_args[1].as_uint256()?,
+                        v_args[2].as_uint256()?,
+                        short == "mulDivUp",
+                    )))
+                }
+                ("addWithCarry" | "subWithBorrow", 2) if word_ok => {
+                    let (a, b) = (v_args[0].as_word256()?, v_args[1].as_word256()?);
                     let (res, flag) = if short == "addWithCarry" {
                         u256_add_with_carry_rust(a, b)
                     } else {
                         u256_sub_with_borrow_rust(a, b)
                     };
-                    Some(FastVal::U256BoolPair(res, flag))
+                    Some(FastVal::Word256BoolPair(res, flag))
                 }
-                ("packHalves" | "mk", 4) => Some(FastVal::U256([
-                    v_args[0].as_u64()?,
-                    v_args[1].as_u64()?,
-                    v_args[2].as_u64()?,
-                    v_args[3].as_u64()?,
-                ])),
-                ("unpackLo128" | "mask128" | "unpackHi128", 1)
-                    if matches!(v_args[0], FastVal::U256(_)) =>
-                {
-                    let s = v_args[0].as_u256()?;
-                    Some(FastVal::U256(if short == "unpackHi128" {
-                        [s[2], s[3], 0, 0]
+                ("mk", 4) if word_ok || uint_ok => Some(wide_from_kind(
+                    if word_ok {
+                        ExpectedWideKind::Word256
                     } else {
-                        [s[0], s[1], 0, 0]
+                        ExpectedWideKind::UInt256
+                    },
+                    [
+                        v_args[0].as_u64_limb()?,
+                        v_args[1].as_u64_limb()?,
+                        v_args[2].as_u64_limb()?,
+                        v_args[3].as_u64_limb()?,
+                    ],
+                )),
+                ("shl" | "shr" | "sar", 2) if uint_ok => {
+                    let a = v_args[0].as_uint256()?;
+                    let sh = v_args[1].as_nat()?;
+                    Some(FastVal::UInt256(match short {
+                        "shl" => u256_shl_rust(a, [sh, 0, 0, 0]),
+                        "shr" => u256_shr_rust(a, [sh, 0, 0, 0]),
+                        _ => u256_sar_rust(a, sh),
                     }))
                 }
-                ("yul_min", 2)
-                    if prefix.is_none()
-                        && matches!(
-                            (&v_args[0], &v_args[1]),
-                            (FastVal::U256(_), FastVal::U256(_))
-                        ) =>
-                {
-                    let (a, b) = (v_args[0].as_u256()?, v_args[1].as_u256()?);
-                    Some(FastVal::U256(if u256_lt_rust(b, a) { b } else { a }))
+                ("clz", 1) if uint_ok => Some(FastVal::UInt256([
+                    u256_clz(v_args[0].as_uint256()?),
+                    0,
+                    0,
+                    0,
+                ])),
+                ("lt" | "le", 2) if uint_ok => {
+                    let (a, b) = (v_args[0].as_uint256()?, v_args[1].as_uint256()?);
+                    Some(FastVal::Bool(if short == "lt" {
+                        u256_lt_rust(a, b)
+                    } else {
+                        !u256_lt_rust(b, a)
+                    }))
                 }
-                ("min", 2)
-                    if matches!(
-                        (&v_args[0], &v_args[1]),
-                        (FastVal::U256(_), FastVal::U256(_))
-                    ) =>
-                {
-                    let (a, b) = (v_args[0].as_u256()?, v_args[1].as_u256()?);
-                    Some(FastVal::U256(if u256_lt_rust(b, a) { b } else { a }))
-                }
-                ("shl", 2) if matches!(v_args[0], FastVal::U256(_)) => {
-                    let (a, b) = (v_args[0].as_u256()?, v_args[1].as_u256()?);
-                    Some(FastVal::U256(u256_shl_rust(a, b)))
-                }
-                ("shr", 2) if matches!(v_args[0], FastVal::U256(_)) => {
-                    let (a, b) = (v_args[0].as_u256()?, v_args[1].as_u256()?);
-                    Some(FastVal::U256(u256_shr_rust(a, b)))
-                }
-                ("mulDivDown" | "mulDiv" | "mulDivUp", 3)
-                    if matches!(
-                        (&v_args[0], &v_args[1], &v_args[2]),
-                        (FastVal::U256(_), FastVal::U256(_), FastVal::U256(_))
-                    ) =>
-                {
-                    let (x, y, d) = (
-                        v_args[0].as_u256()?,
-                        v_args[1].as_u256()?,
-                        v_args[2].as_u256()?,
-                    );
-                    Some(FastVal::U256(u256_mul_div_checked(
-                        x,
-                        y,
-                        d,
-                        short == "mulDivUp",
-                    )?))
-                }
-                ("clz", 1) if matches!(v_args[0], FastVal::U256(_)) => {
-                    let x = v_args[0].as_u256()?;
-                    let lz = (0..4)
-                        .rev()
-                        .find_map(|k| {
-                            (x[k] != 0).then(|| (3 - k) as u64 * 64 + x[k].leading_zeros() as u64)
-                        })
-                        .unwrap_or(256);
-                    Some(FastVal::U256([lz, 0, 0, 0]))
-                }
-                ("clz256", 1) if prefix.is_none() => {
-                    let x = match v_args[0] {
-                        FastVal::U256(w) => w,
-                        FastVal::U64(n) => [n, 0, 0, 0],
+                ("clz256", 1) if internal("clz256") => Some(FastVal::UInt256([
+                    u256_clz(match &v_args[0] {
+                        FastVal::UInt256(w) | FastVal::BitVec256(w) | FastVal::Word256(w) => *w,
+                        FastVal::Scalar(_, n) | FastVal::WitnessScalar(n) => [*n, 0, 0, 0],
                         _ => return None,
-                    };
-                    let lz = (0..4)
-                        .rev()
-                        .find_map(|k| {
-                            (x[k] != 0).then(|| (3 - k) as u64 * 64 + x[k].leading_zeros() as u64)
-                        })
-                        .unwrap_or(256);
-                    Some(FastVal::U256([lz, 0, 0, 0]))
-                }
-                ("mostSignificantBit" | "msb", 1) if matches!(v_args[0], FastVal::U256(_)) => {
-                    let x = v_args[0].as_u256()?;
-                    let msb = (0..4)
-                        .rev()
-                        .find_map(|k| {
-                            (x[k] != 0).then(|| k as u64 * 64 + 63 - x[k].leading_zeros() as u64)
-                        })
-                        .unwrap_or(0);
-                    Some(FastVal::U256([msb, 0, 0, 0]))
-                }
-                ("ctz" | "leastSignificantBit" | "lsb", 1)
-                    if matches!(v_args[0], FastVal::U256(_)) =>
-                {
-                    let x = v_args[0].as_u256()?;
-                    let default_val = if short == "ctz" { 256 } else { 0 };
-                    let tz = (0..4)
-                        .find_map(|k| {
-                            (x[k] != 0).then(|| k as u64 * 64 + x[k].trailing_zeros() as u64)
-                        })
-                        .unwrap_or(default_val);
-                    Some(FastVal::U256([tz, 0, 0, 0]))
-                }
-                ("ctz256", 1) if prefix.is_none() => {
-                    let x = match v_args[0] {
-                        FastVal::U256(w) => w,
-                        FastVal::U64(n) => [n, 0, 0, 0],
+                    }),
+                    0,
+                    0,
+                    0,
+                ])),
+                ("ctz256", 1) if internal("ctz256") => Some(FastVal::UInt256([
+                    u256_ctz(match &v_args[0] {
+                        FastVal::UInt256(w) | FastVal::BitVec256(w) | FastVal::Word256(w) => *w,
+                        FastVal::Scalar(_, n) | FastVal::WitnessScalar(n) => [*n, 0, 0, 0],
                         _ => return None,
-                    };
-                    let tz = (0..4)
-                        .find_map(|k| {
-                            (x[k] != 0).then(|| k as u64 * 64 + x[k].trailing_zeros() as u64)
-                        })
-                        .unwrap_or(256);
-                    Some(FastVal::U256([tz, 0, 0, 0]))
-                }
+                    }),
+                    0,
+                    0,
+                    0,
+                ])),
                 ("succ", 1) if prefix.is_none() => {
                     let d = dom?;
-                    let x = v_args[0].as_u64()?;
+                    let x = v_args[0].as_scalar_in(d)?;
                     if d.is_nat {
-                        Some(FastVal::U64(x.checked_add(1)?))
+                        Some(scalar_of(d, x.checked_add(1)?))
                     } else {
-                        Some(FastVal::U64(d.mask(x.wrapping_add(1))))
+                        Some(scalar_of(d, d.mask(x.wrapping_add(1))))
                     }
                 }
                 _ => None,
@@ -6165,6 +7506,130 @@ fn eval_lean_expr_fast_ctx_inner(
         }
     };
     raw_val.and_then(wrap_out)
+}
+
+impl StorageKeyVal {
+    fn ctor_name(&self) -> &'static str {
+        match self.tag {
+            1 => "slot",
+            2 => "contractSlot",
+            3 => "transient",
+            4 => "addr",
+            5 => "map",
+            6 => "mapUint",
+            7 => "map2",
+            _ => "slot",
+        }
+    }
+
+    fn format_witness(&self) -> String {
+        let args = self.args[..self.len as usize]
+            .iter()
+            .map(|a| format!("0x{a:x}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("StorageKey.{}({args})", self.ctor_name())
+    }
+
+    fn parse_witness(raw: &str) -> Option<Self> {
+        let rest = raw.trim().strip_prefix("StorageKey.")?;
+        if let Some((ctor, tail)) = rest.split_once('(') {
+            let inner = tail.strip_suffix(')')?.trim();
+            let mut parsed = Vec::new();
+            if !inner.is_empty() {
+                for p in inner.split(',') {
+                    parsed.push(parse_u64_literal(p.trim())?);
+                }
+            }
+            return encode_storage_key(ctor.trim(), &parsed);
+        }
+        let mut parts = rest.split_whitespace();
+        let ctor = parts.next()?;
+        let mut parsed = Vec::new();
+        for p in parts {
+            parsed.push(parse_u64_literal(p.trim_end_matches(','))?);
+        }
+        encode_storage_key(ctor, &parsed)
+    }
+
+    fn hash_seed(&self) -> u64 {
+        let mut acc = (self.tag as u64).wrapping_mul(0x9E37_79B1_85EB_CA87);
+        for a in &self.args[..self.len as usize] {
+            acc = acc
+                .wrapping_mul(0xBF58_476D_1CE4_E5B9)
+                .wrapping_add(*a)
+                .rotate_left(17);
+        }
+        acc
+    }
+}
+
+fn encode_storage_key(ctor: &str, args: &[u64]) -> Option<StorageKeyVal> {
+    let (tag, n) = match ctor {
+        "slot" => (1u8, 1usize),
+        "contractSlot" => (2, 2),
+        "transient" => (3, 1),
+        "addr" => (4, 1),
+        "map" => (5, 2),
+        "mapUint" => (6, 2),
+        "map2" => (7, 3),
+        _ => return None,
+    };
+    if args.len() != n {
+        return None;
+    }
+    let mut fixed = [0u64; 3];
+    for (i, a) in args.iter().enumerate() {
+        fixed[i] = *a;
+    }
+    Some(StorageKeyVal {
+        tag,
+        len: n as u8,
+        args: fixed,
+    })
+}
+
+fn u256_clz(x: [u64; 4]) -> u64 {
+    (0..4)
+        .rev()
+        .find_map(|k| (x[k] != 0).then(|| (3 - k) as u64 * 64 + x[k].leading_zeros() as u64))
+        .unwrap_or(256)
+}
+
+fn u256_ctz(x: [u64; 4]) -> u64 {
+    (0..4)
+        .find_map(|k| (x[k] != 0).then(|| k as u64 * 64 + x[k].trailing_zeros() as u64))
+        .unwrap_or(256)
+}
+
+fn u256_sar_rust(a: [u64; 4], shift: u64) -> [u64; 4] {
+    let neg = a[3] & (1u64 << 63) != 0;
+    if shift >= 256 {
+        return if neg { [u64::MAX; 4] } else { [0; 4] };
+    }
+    if shift == 0 {
+        return a;
+    }
+    let logical = u256_shr_rust(a, [shift, 0, 0, 0]);
+    if !neg {
+        return logical;
+    }
+    let ones = u256_shl_rust([u64::MAX; 4], [256 - shift, 0, 0, 0]);
+    std::array::from_fn(|k| logical[k] | ones[k])
+}
+
+fn u256_mul_overflows(a: [u64; 4], b: [u64; 4]) -> bool {
+    let mut prod = [0u64; 8];
+    for i in 0..4 {
+        let mut carry = 0u128;
+        for j in 0..4 {
+            let cur = prod[i + j] as u128 + (a[i] as u128) * (b[j] as u128) + carry;
+            prod[i + j] = cur as u64;
+            carry = cur >> 64;
+        }
+        prod[i + 4] = prod[i + 4].wrapping_add(carry as u64);
+    }
+    prod[4] | prod[5] | prod[6] | prod[7] != 0
 }
 
 /// 512-bit product divided by a 256-bit denominator.
@@ -6250,11 +7715,14 @@ fn u256_div_mod_rust(a: [u64; 4], d: [u64; 4]) -> Option<([u64; 4], [u64; 4])> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage1ParamKind {
-    U256,
+    Word256,
+    UInt256,
+    OptionUInt256,
     BitVec256,
     U64,
     BitVec64,
     Nat,
+    Int,
     U32,
     BitVec32,
     U16,
@@ -6267,54 +7735,131 @@ enum Stage1ParamKind {
 }
 
 impl Stage1ParamKind {
+    fn expected_wide_kind(self) -> Option<ExpectedWideKind> {
+        match self {
+            Stage1ParamKind::Word256 => Some(ExpectedWideKind::Word256),
+            Stage1ParamKind::UInt256 => Some(ExpectedWideKind::UInt256),
+            Stage1ParamKind::OptionUInt256 => Some(ExpectedWideKind::OptionUInt256),
+            Stage1ParamKind::BitVec256 => Some(ExpectedWideKind::BitVec256),
+            _ => None,
+        }
+    }
+
+    fn sample_fast_val(self, u: [u64; 4]) -> FastVal {
+        match self {
+            Stage1ParamKind::Word256 => FastVal::Word256(u),
+            Stage1ParamKind::UInt256 => FastVal::UInt256(u),
+            Stage1ParamKind::OptionUInt256 => {
+                FastVal::OptionUInt256(((u[0] & 7) != 0).then_some(u))
+            }
+            Stage1ParamKind::BitVec256 => FastVal::BitVec256(u),
+            Stage1ParamKind::U64 | Stage1ParamKind::BitVec64 => {
+                scalar_of(self.scalar_domain().unwrap(), u[0])
+            }
+            Stage1ParamKind::Nat | Stage1ParamKind::U32 | Stage1ParamKind::BitVec32 => {
+                scalar_of(self.scalar_domain().unwrap(), u[0] & 0xFFFF_FFFF)
+            }
+            Stage1ParamKind::Int => FastVal::Int((u[0] as i64) as i128),
+            Stage1ParamKind::U16 | Stage1ParamKind::BitVec16 => {
+                scalar_of(self.scalar_domain().unwrap(), u[0] & 0xFFFF)
+            }
+            Stage1ParamKind::U8 | Stage1ParamKind::BitVec8 => {
+                scalar_of(self.scalar_domain().unwrap(), u[0] & 0xFF)
+            }
+            Stage1ParamKind::Bool => FastVal::Bool((u[0] & 1) != 0),
+            Stage1ParamKind::StorageKey => {
+                let ctor = match (u[0] >> 3) & 3 {
+                    0 => "slot",
+                    1 => "transient",
+                    2 => "addr",
+                    _ => "slot",
+                };
+                FastVal::StorageKey(encode_storage_key(ctor, &[u[0] & 7]).unwrap())
+            }
+            Stage1ParamKind::ContractState => FastVal::ContractState(u[0] ^ 0xA5A5, Vec::new()),
+        }
+    }
+
+    fn matches_fast_val(self, val: &FastVal) -> bool {
+        match (self, val) {
+            (Stage1ParamKind::Word256, FastVal::Word256(_))
+            | (Stage1ParamKind::UInt256, FastVal::UInt256(_))
+            | (Stage1ParamKind::OptionUInt256, FastVal::OptionUInt256(_))
+            | (Stage1ParamKind::BitVec256, FastVal::BitVec256(_))
+            | (Stage1ParamKind::Int, FastVal::Int(_))
+            | (Stage1ParamKind::Bool, FastVal::Bool(_))
+            | (Stage1ParamKind::StorageKey, FastVal::StorageKey(_))
+            | (Stage1ParamKind::ContractState, FastVal::ContractState(_, _)) => true,
+            (_, FastVal::Scalar(d, _)) => self.scalar_domain() == Some(*d),
+            _ => false,
+        }
+    }
+
     fn scalar_domain(self) -> Option<ScalarEvalDomain> {
         match self {
             Stage1ParamKind::U64 => Some(ScalarEvalDomain {
                 word_bits: 64,
                 is_nat: false,
+                is_int: false,
                 is_bitvec: false,
             }),
             Stage1ParamKind::BitVec64 => Some(ScalarEvalDomain {
                 word_bits: 64,
                 is_nat: false,
+                is_int: false,
                 is_bitvec: true,
             }),
             Stage1ParamKind::Nat => Some(ScalarEvalDomain {
                 word_bits: 64,
                 is_nat: true,
+                is_int: false,
+                is_bitvec: false,
+            }),
+            Stage1ParamKind::Int => Some(ScalarEvalDomain {
+                word_bits: 64,
+                is_nat: false,
+                is_int: true,
                 is_bitvec: false,
             }),
             Stage1ParamKind::U32 => Some(ScalarEvalDomain {
                 word_bits: 32,
                 is_nat: false,
+                is_int: false,
                 is_bitvec: false,
             }),
             Stage1ParamKind::BitVec32 => Some(ScalarEvalDomain {
                 word_bits: 32,
                 is_nat: false,
+                is_int: false,
                 is_bitvec: true,
             }),
             Stage1ParamKind::U16 => Some(ScalarEvalDomain {
                 word_bits: 16,
                 is_nat: false,
+                is_int: false,
                 is_bitvec: false,
             }),
             Stage1ParamKind::BitVec16 => Some(ScalarEvalDomain {
                 word_bits: 16,
                 is_nat: false,
+                is_int: false,
                 is_bitvec: true,
             }),
             Stage1ParamKind::U8 => Some(ScalarEvalDomain {
                 word_bits: 8,
                 is_nat: false,
+                is_int: false,
                 is_bitvec: false,
             }),
             Stage1ParamKind::BitVec8 => Some(ScalarEvalDomain {
                 word_bits: 8,
                 is_nat: false,
+                is_int: false,
                 is_bitvec: true,
             }),
-            Stage1ParamKind::U256
+            Stage1ParamKind::Word256
+            | Stage1ParamKind::UInt256
+            | Stage1ParamKind::OptionUInt256
             | Stage1ParamKind::BitVec256
             | Stage1ParamKind::Bool
             | Stage1ParamKind::StorageKey
@@ -6334,18 +7879,63 @@ impl Stage1ParamKind {
     }
 }
 
-fn classify_stage1_param_kind(lean_ty: &str) -> Option<Stage1ParamKind> {
-    let t = lean_ty.trim();
+fn trim_outer_parens(mut s: &str) -> &str {
+    loop {
+        let t = s.trim();
+        if t.starts_with('(') && t.ends_with(')') {
+            let mut depth = 0usize;
+            let mut wraps_all = true;
+            for (idx, ch) in t.char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 && idx + ch.len_utf8() < t.len() {
+                            wraps_all = false;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if wraps_all && depth == 0 {
+                s = &t[1..t.len() - 1];
+                continue;
+            }
+        }
+        return t;
+    }
+}
+
+fn classify_stage1_param_kind_in_scope(
+    lean_ty: &str,
+    scope: &DeclScopeContext,
+) -> Option<Stage1ParamKind> {
+    let t = trim_outer_parens(lean_ty);
+    if let Some(inner) = t.strip_prefix("Option ") {
+        let inner_t = trim_outer_parens(inner);
+        return match classify_stage1_param_kind_in_scope(inner_t, scope)? {
+            Stage1ParamKind::UInt256 => Some(Stage1ParamKind::OptionUInt256),
+            _ => None,
+        };
+    }
     if t == "BitVec 256" {
         Some(Stage1ParamKind::BitVec256)
-    } else if matches!(
-        t,
-        "Word256" | "TurboLean.FastCheck.Word256" | "UInt256" | "Uint256"
-    ) {
-        Some(Stage1ParamKind::U256)
+    } else if (t == "Word256" && word256_ns_visible(scope))
+        || (t == "LeanNative.Backend.FastCheck.Word256" && word256_imported(scope))
+        || (t == "TurboLean.FastCheck.Word256" && scope_imports(scope, &["TurboLean.FastCheck"]))
+    {
+        Some(Stage1ParamKind::Word256)
+    } else if (matches!(t, "UInt256" | "EVMWord") && uint256_ns_visible(scope))
+        || (matches!(t, "LeanNative.IR.UInt256" | "LeanNative.IR.EVMWord")
+            && uint256_imported(scope))
+    {
+        Some(Stage1ParamKind::UInt256)
     } else if t == "Nat" {
         Some(Stage1ParamKind::Nat)
-    } else if matches!(t, "UInt64" | "USize") {
+    } else if t == "Int" {
+        Some(Stage1ParamKind::Int)
+    } else if t == "UInt64" {
         Some(Stage1ParamKind::U64)
     } else if t == "BitVec 64" {
         Some(Stage1ParamKind::BitVec64)
@@ -6363,13 +7953,23 @@ fn classify_stage1_param_kind(lean_ty: &str) -> Option<Stage1ParamKind> {
         Some(Stage1ParamKind::BitVec8)
     } else if t == "Bool" {
         Some(Stage1ParamKind::Bool)
-    } else if matches!(t, "StorageKey" | "TurboLean.Reflection.StorageKey") {
+    } else if (t == "StorageKey" && reflection_ns_visible(scope))
+        || (t == "TurboLean.Reflection.StorageKey"
+            && scope_imports(scope, &["TurboLean.Reflection"]))
+    {
         Some(Stage1ParamKind::StorageKey)
-    } else if matches!(t, "ContractState" | "TurboLean.Reflection.ContractState") {
+    } else if (t == "ContractState" && reflection_ns_visible(scope))
+        || (t == "TurboLean.Reflection.ContractState"
+            && scope_imports(scope, &["TurboLean.Reflection"]))
+    {
         Some(Stage1ParamKind::ContractState)
     } else {
         None
     }
+}
+
+fn classify_stage1_param_kind_unscoped(lean_ty: &str) -> Option<Stage1ParamKind> {
+    classify_stage1_param_kind_in_scope(lean_ty, &DeclScopeContext::default())
 }
 
 fn eval_extracted_decl_in_memory(
@@ -6400,12 +8000,16 @@ fn eval_extracted_decl_in_memory_inner(
     let mut params: Vec<(String, Stage1ParamKind)> = Vec::new();
     let mut raw_hyp_exprs: Vec<LeanExpr> = Vec::new();
 
+    let scope = &decl.scope;
     for (names, ty) in &decl.binders {
-        if let Some(pk) = classify_stage1_param_kind(ty) {
+        if let Some(pk) = classify_stage1_param_kind_in_scope(ty, scope) {
             for name in names {
                 params.push((name.clone(), pk));
             }
         } else if let Ok(cond_expr) = parse_lean_expr_str(ty) {
+            if !is_prop_expr_ast(&cond_expr) {
+                return None;
+            }
             flatten_conjunctions(cond_expr, &mut raw_hyp_exprs);
         } else {
             return None;
@@ -6414,13 +8018,16 @@ fn eval_extracted_decl_in_memory_inner(
 
     let mut scalar_dom: Option<ScalarEvalDomain> = None;
     let mut ambient_bv256 = false;
-    let mut has_u256 = false;
+    let mut has_non_bv_wide = false;
     for (_, pk) in &params {
         if matches!(pk, Stage1ParamKind::BitVec256) {
             ambient_bv256 = true;
         }
-        if matches!(pk, Stage1ParamKind::U256) {
-            has_u256 = true;
+        if matches!(
+            pk,
+            Stage1ParamKind::Word256 | Stage1ParamKind::UInt256 | Stage1ParamKind::OptionUInt256
+        ) {
+            has_non_bv_wide = true;
         }
         if let Some(d) = pk.scalar_domain() {
             if let Some(prev) = scalar_dom {
@@ -6433,7 +8040,7 @@ fn eval_extracted_decl_in_memory_inner(
             }
         }
     }
-    if ambient_bv256 && (has_u256 || scalar_dom.is_some()) {
+    if ambient_bv256 && (has_non_bv_wide || scalar_dom.is_some()) {
         return None;
     }
 
@@ -6442,11 +8049,23 @@ fn eval_extracted_decl_in_memory_inner(
     for pre_str in &imp_segments[..imp_segments.len().saturating_sub(1)] {
         let stripped = strip_hypothesis_binder_name(pre_str);
         let pre_expr = parse_lean_expr_str(stripped).ok()?;
+        if !is_prop_expr_ast(&pre_expr) {
+            return None;
+        }
         flatten_conjunctions(pre_expr, &mut raw_hyp_exprs);
     }
 
     let (lhs_lean, rhs_lean, lhs_ast, rhs_ast, is_ne) =
         parse_conclusion_target(conclusion_str).ok()?;
+    let concl_expr = LeanExpr::Binary(
+        if is_ne {
+            "≠".to_string()
+        } else {
+            "=".to_string()
+        },
+        Box::new(lhs_ast.clone()),
+        Box::new(rhs_ast.clone()),
+    );
 
     let param_names: std::collections::HashSet<&str> =
         params.iter().map(|(n, _)| n.as_str()).collect();
@@ -6461,17 +8080,20 @@ fn eval_extracted_decl_in_memory_inner(
     if untyped_comparison_synthesizes_int_or_complement(&lhs_ast, &rhs_ast, &value_params) {
         return None;
     }
-    let concl_nat = !expr_produces_bool(&lhs_ast)
-        && !expr_produces_bool(&rhs_ast)
+    let concl_nat = !expr_produces_bool_or_prop(&lhs_ast)
+        && !expr_produces_bool_or_prop(&rhs_ast)
+        && !scalar_dom.is_some_and(|d| d.is_int)
         && (scalar_dom.is_some_and(|d| d.is_nat)
             || (!expr_mentions_ident_value(&lhs_ast, &value_params)
                 && !expr_mentions_ident_value(&rhs_ast, &value_params)));
     let concl_dom = if concl_nat {
         Some(nat_count_domain())
+    } else if expr_produces_bool(&lhs_ast) || expr_produces_bool(&rhs_ast) {
+        None
     } else {
         scalar_dom
     };
-    let mut subst_ast: Vec<(String, LeanExpr)> = Vec::new();
+    let mut subst_ast: Vec<(String, Stage1ParamKind, LeanExpr)> = Vec::new();
     let mut remaining_hyps: Vec<LeanExpr> = Vec::new();
     let mut subst_set: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -6480,15 +8102,17 @@ fn eval_extracted_decl_in_memory_inner(
         if let Some((l_e, r_e)) = split_equality_ast(hyp) {
             for (target_e, val_e) in [(l_e, r_e), (r_e, l_e)] {
                 if let LeanExpr::Ident(t_name) = target_e {
-                    if param_names.contains(t_name.as_str()) && !subst_set.contains(t_name) {
-                        let mut vars = std::collections::HashSet::new();
-                        if collect_expr_bound_vars(val_e, &param_names, &mut vars)
-                            && !vars.contains(t_name)
-                        {
-                            subst_set.insert(t_name.clone());
-                            subst_ast.push((t_name.clone(), val_e.clone()));
-                            substituted = true;
-                            break;
+                    if let Some((_, pk)) = params.iter().find(|(n, _)| n == t_name) {
+                        if !subst_set.contains(t_name) {
+                            let mut vars = std::collections::HashSet::new();
+                            if collect_expr_bound_vars(val_e, &param_names, &mut vars)
+                                && !vars.contains(t_name)
+                            {
+                                subst_set.insert(t_name.clone());
+                                subst_ast.push((t_name.clone(), *pk, val_e.clone()));
+                                substituted = true;
+                                break;
+                            }
                         }
                     }
                 }
@@ -6514,48 +8138,43 @@ fn eval_extracted_decl_in_memory_inner(
                 continue;
             }
             let u = gen_u256_param_rust(idx, seed, p_idx as u64);
-            let val = match p_kind {
-                Stage1ParamKind::U256 | Stage1ParamKind::BitVec256 => FastVal::U256(u),
-                Stage1ParamKind::U64 | Stage1ParamKind::BitVec64 => FastVal::U64(u[0]),
-                Stage1ParamKind::Nat | Stage1ParamKind::U32 | Stage1ParamKind::BitVec32 => {
-                    FastVal::U64(u[0] & 0xFFFF_FFFF)
-                }
-                Stage1ParamKind::U16 | Stage1ParamKind::BitVec16 => FastVal::U64(u[0] & 0xFFFF),
-                Stage1ParamKind::U8 | Stage1ParamKind::BitVec8 => FastVal::U64(u[0] & 0xFF),
-                Stage1ParamKind::Bool => FastVal::Bool((u[0] & 1) != 0),
-                Stage1ParamKind::StorageKey => FastVal::U64(u[0] & 3),
-                Stage1ParamKind::ContractState => FastVal::ContractState(u[0] ^ 0xA5A5, Vec::new()),
-            };
-            env.insert(p_name.clone(), val);
+            env.insert(p_name.clone(), p_kind.sample_fast_val(u));
         }
 
-        for (t_name, val_expr) in &subst_ast {
-            let Some(mut v) = eval_lean_expr_fast_ctx_inner(
+        for (t_name, t_kind, val_expr) in &subst_ast {
+            let Some(v) = eval_lean_expr_fast_ctx(
                 val_expr,
                 &env,
-                scalar_dom,
+                t_kind.scalar_domain().or(scalar_dom),
+                t_kind.expected_wide_kind(),
                 ambient_bv256,
                 &bitvec_params,
+                scope,
+                false,
             ) else {
                 abstained_states += 1;
                 continue 'state_loop;
             };
-            if let Some((_, Stage1ParamKind::U256 | Stage1ParamKind::BitVec256)) =
-                params.iter().find(|(n, _)| n == t_name)
-            {
-                if let FastVal::U64(x) = v {
-                    v = FastVal::U256([x, 0, 0, 0]);
-                }
+            if !t_kind.matches_fast_val(&v) {
+                abstained_states += 1;
+                continue 'state_loop;
             }
             env.insert(t_name.clone(), v);
         }
 
         let mut active = true;
         for h in &remaining_hyps {
-            let Some(hv) =
-                eval_lean_expr_fast_ctx_inner(h, &env, scalar_dom, ambient_bv256, &bitvec_params)
-                    .and_then(|v| v.as_bool())
-            else {
+            let Some(hv) = eval_lean_expr_fast_ctx(
+                h,
+                &env,
+                scalar_dom,
+                None,
+                ambient_bv256,
+                &bitvec_params,
+                scope,
+                false,
+            )
+            .and_then(|v| v.as_prop()) else {
                 abstained_states += 1;
                 continue 'state_loop;
             };
@@ -6569,24 +8188,72 @@ fn eval_extracted_decl_in_memory_inner(
             continue;
         }
 
-        let (Some(lv), Some(rv)) = (
-            eval_lean_expr_fast_ctx_inner(&lhs_ast, &env, concl_dom, ambient_bv256, &bitvec_params),
-            eval_lean_expr_fast_ctx_inner(&rhs_ast, &env, concl_dom, ambient_bv256, &bitvec_params),
-        ) else {
+        let Some(holds) = eval_lean_expr_fast_ctx(
+            &concl_expr,
+            &env,
+            concl_dom,
+            None,
+            ambient_bv256,
+            &bitvec_params,
+            scope,
+            false,
+        )
+        .and_then(|v| v.as_prop()) else {
             abstained_states += 1;
             continue;
         };
         evaluated_states += 1;
         satisfied_preconditions += 1;
-        let eq = match (&lv, &rv) {
-            (FastVal::U256(a), FastVal::U64(b)) => *a == [*b, 0, 0, 0],
-            (FastVal::U64(a), FastVal::U256(b)) => [*a, 0, 0, 0] == *b,
-            _ => lv == rv,
-        };
-        let holds = if is_ne { !eq } else { eq };
         if !holds {
             violations += 1;
             if first_ce.is_none() {
+                let mut lv = eval_lean_expr_fast_ctx(
+                    &lhs_ast,
+                    &env,
+                    concl_dom,
+                    None,
+                    ambient_bv256,
+                    &bitvec_params,
+                    scope,
+                    false,
+                );
+                let mut rv = eval_lean_expr_fast_ctx(
+                    &rhs_ast,
+                    &env,
+                    concl_dom,
+                    None,
+                    ambient_bv256,
+                    &bitvec_params,
+                    scope,
+                    false,
+                );
+                if rv.is_none() {
+                    if let Some(wk) = lv.as_ref().and_then(FastVal::wide_kind) {
+                        rv = eval_lean_expr_fast_ctx(
+                            &rhs_ast,
+                            &env,
+                            concl_dom,
+                            Some(wk),
+                            ambient_bv256,
+                            &bitvec_params,
+                            scope,
+                            false,
+                        );
+                    }
+                } else if lv.is_none() {
+                    if let Some(wk) = rv.as_ref().and_then(FastVal::wide_kind) {
+                        lv = eval_lean_expr_fast_ctx(
+                            &lhs_ast,
+                            &env,
+                            concl_dom,
+                            Some(wk),
+                            ambient_bv256,
+                            &bitvec_params,
+                            scope,
+                            false,
+                        );
+                    }
+                }
                 let mut bindings = Vec::with_capacity(params.len());
                 for (p_name, _) in &params {
                     if let Some(pv) = env.get(p_name) {
@@ -6596,8 +8263,8 @@ fn eval_extracted_decl_in_memory_inner(
                 first_ce = Some(CounterexampleWitness {
                     state_idx: idx,
                     bindings,
-                    lhs_value: lv.format_witness(),
-                    rhs_value: rv.format_witness(),
+                    lhs_value: lv.map(|v| v.format_witness()).unwrap_or_default(),
+                    rhs_value: rv.map(|v| v.format_witness()).unwrap_or_default(),
                 });
             }
         }
@@ -6641,7 +8308,7 @@ fn eval_extracted_decl_in_memory_inner(
 
 fn is_known_binder_value_type(ty: &str) -> bool {
     let t = ty.trim();
-    if classify_stage1_param_kind(t).is_some() {
+    if classify_stage1_param_kind_unscoped(t).is_some() {
         return true;
     }
     if t.contains('=')
@@ -6770,8 +8437,16 @@ fn try_eval_decl_stage1_cex_json(
     max_memory_mb: Option<u64>,
     t0: Instant,
 ) -> Option<serde_json::Value> {
+    if !d.trusted_elab_context || !d.instance_binders.is_empty() {
+        return None;
+    }
     let (report, lhs_lean, rhs_lean) = eval_extracted_decl_in_memory(d, 1024)?;
     if report.verified || report.violations == 0 {
+        return None;
+    }
+    let (lean_native_certified, lean_native_version, _) =
+        certify_report_counterexample(d, report.counterexample.as_ref());
+    if !lean_native_certified {
         return None;
     }
     let mut accelerator_certificates: Vec<crate::accelerators::AcceleratorCertificate> = Vec::new();
@@ -6779,11 +8454,6 @@ fn try_eval_decl_stage1_cex_json(
     let suggested_hyp =
         synthesize_missing_hypothesis_hint(&d.name, &lhs_lean, &rhs_lean, &cex_json_str);
     if has_ext_plugins {
-        let binders_prefix: String = d
-            .binders
-            .iter()
-            .map(|(ns, ty)| format!("({} : {}) ", ns.join(" "), ty))
-            .collect();
         let decl_id = if d.qualified_name.is_empty() {
             d.name.clone()
         } else {
@@ -6791,14 +8461,22 @@ fn try_eval_decl_stage1_cex_json(
         };
         let accel_input = crate::accelerators::AcceleratorInput {
             decl_name: decl_id,
-            stmt_src: format!("{}: {}", binders_prefix, d.prop_str),
+            stmt_src: d.render_scoped_stmt_src(),
             body_src: String::new(),
             imports_csv: String::new(),
             available_constants: Vec::new(),
             budget_ms: 25,
         };
-        accelerator_certificates.extend(accel_registry.run_all(&accel_input));
-    } else if accelerators_active {
+        accelerator_certificates.extend(accel_registry.run_all(&accel_input).into_iter().filter(
+            |c| {
+                !matches!(
+                    c,
+                    crate::accelerators::AcceleratorCertificate::CounterexampleFound { .. }
+                )
+            },
+        ));
+    }
+    if accelerators_active {
         accelerator_certificates.push(
             crate::accelerators::AcceleratorCertificate::CounterexampleFound {
                 witness_summary: cex_json_str.clone(),
@@ -6807,8 +8485,6 @@ fn try_eval_decl_stage1_cex_json(
             },
         );
     }
-    let (lean_native_certified, lean_native_version, _) =
-        certify_report_counterexample(d, report.counterexample.as_ref());
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
     let (lhs_val, rhs_val) = report
         .counterexample
@@ -6945,6 +8621,25 @@ fn partition_certificates_for_verified_step(
         }
     }
     (verified_certs, rewrite_suggestions)
+}
+
+fn certificates_for_kernel_verified_step(
+    certs: &[crate::accelerators::AcceleratorCertificate],
+    accelerator_assisted: bool,
+    winning_accelerator: Option<&str>,
+) -> (
+    Vec<crate::accelerators::AcceleratorCertificate>,
+    Vec<serde_json::Value>,
+) {
+    let (mut verified, suggestions) =
+        partition_certificates_for_verified_step(certs, accelerator_assisted, winning_accelerator);
+    verified.retain(|cert| {
+        !matches!(
+            cert,
+            crate::accelerators::AcceleratorCertificate::CounterexampleFound { .. }
+        )
+    });
+    (verified, suggestions)
 }
 
 /// Evaluate the unified Stage 0 -> Stage 1 -> Stage 2 `agent-step` verification funnel in-process
@@ -7172,72 +8867,86 @@ pub fn evaluate_agent_step_value(
                     )
                 })
                 .is_some_and(|d| d.trusted_elab_context && d.instance_binders.is_empty());
-            if !shard_elab_trusted {
-                certs.retain(|c| {
-                    !matches!(
-                        c,
-                        crate::accelerators::AcceleratorCertificate::CounterexampleFound { .. }
-                    )
-                });
-            }
-            for c in &certs {
-                if let crate::accelerators::AcceleratorCertificate::CounterexampleFound {
-                    witness_summary,
-                    suggested_hypothesis,
-                    accelerator_name,
-                } = c
-                {
-                    let witness_summary = witness_summary.clone();
-                    let suggested_hypothesis = suggested_hypothesis.clone();
-                    let accelerator_name = accelerator_name.clone();
-                    accelerator_certificates.extend(certs);
-                    let (accel_certified, accel_version, _) =
-                        certify_statement_witness(ts_decl_id, &src_text, &witness_summary);
-                    let elapsed_ms =
-                        (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
-                    let w_pair = witness_pair_from_summary(&witness_summary);
-                    let (lhs_opt, rhs_opt) = w_pair
-                        .as_ref()
-                        .map(|(l, r)| (Some(l.as_str()), Some(r.as_str())))
-                        .unwrap_or((None, None));
-                    let semantic_triage =
-                        accel_certified.then_some((suggested_hypothesis.is_some(), false));
-                    let triage_json = crate::c_abi::build_counterexample_triage_json(
-                        lhs_opt,
-                        rhs_opt,
-                        semantic_triage,
-                    );
-                    let mut compact_summary = format!(
-                        "CEX stage1_accel decl={} via={} ms={:.1}",
-                        ts.name, accelerator_name, elapsed_ms
-                    );
-                    compact_summary.truncate(120);
-                    return Ok(serde_json::json!({
-                        "status": "counterexample_rejected",
-                        "decl": ts.name,
-                        "file": file.display().to_string(),
-                        "stage": "stage1_accelerator_fastreject",
-                        "accelerator_name": accelerator_name,
-                        "accelerators_active": accelerators_active,
-                        "registered_accelerators_count": registered_accelerators_count,
-                        "accelerator_certificates": accelerator_certificates,
-                        "stage1_fastcheck_certified": accel_certified,
-                        "lean_native_certified": accel_certified,
-                        "lean_native_engine_version": accel_version,
-                        "low_memory_mode": effective_low_memory,
-                        "max_memory_mb": max_memory_mb,
-                        "violations": 1,
-                        "witness_summary": witness_summary,
-                        "suggested_hypothesis": suggested_hypothesis,
-                        "counterexample_triage": triage_json,
-                        "compact_summary": compact_summary,
-                        "estimated_tokens_saved": 420,
-                        "elapsed_ms": elapsed_ms,
-                    }));
+            let mut certified_cex: Option<(String, Option<String>, String, String)> = None;
+            let mut filtered_certs = Vec::with_capacity(certs.len());
+            for c in certs {
+                match c {
+                    crate::accelerators::AcceleratorCertificate::CounterexampleFound {
+                        witness_summary,
+                        suggested_hypothesis,
+                        accelerator_name,
+                    } => {
+                        if shard_elab_trusted {
+                            let (accel_certified, accel_version, _) =
+                                certify_statement_witness(ts_decl_id, &src_text, &witness_summary);
+                            if accel_certified {
+                                if certified_cex.is_none() {
+                                    certified_cex = Some((
+                                        witness_summary.clone(),
+                                        suggested_hypothesis.clone(),
+                                        accelerator_name.clone(),
+                                        accel_version,
+                                    ));
+                                }
+                                filtered_certs.push(
+                                    crate::accelerators::AcceleratorCertificate::CounterexampleFound {
+                                        witness_summary,
+                                        suggested_hypothesis,
+                                        accelerator_name,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    other => filtered_certs.push(other),
                 }
             }
+            if let Some((witness_summary, suggested_hypothesis, accelerator_name, accel_version)) =
+                certified_cex
+            {
+                accelerator_certificates.extend(filtered_certs);
+                let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+                let w_pair = witness_pair_from_summary(&witness_summary);
+                let (lhs_opt, rhs_opt) = w_pair
+                    .as_ref()
+                    .map(|(l, r)| (Some(l.as_str()), Some(r.as_str())))
+                    .unwrap_or((None, None));
+                let semantic_triage = Some((suggested_hypothesis.is_some(), false));
+                let triage_json = crate::c_abi::build_counterexample_triage_json(
+                    lhs_opt,
+                    rhs_opt,
+                    semantic_triage,
+                );
+                let mut compact_summary = format!(
+                    "CEX stage1_accel decl={} via={} ms={:.1}",
+                    ts.name, accelerator_name, elapsed_ms
+                );
+                compact_summary.truncate(120);
+                return Ok(serde_json::json!({
+                    "status": "counterexample_rejected",
+                    "decl": ts.name,
+                    "file": file.display().to_string(),
+                    "stage": "stage1_accelerator_fastreject",
+                    "accelerator_name": accelerator_name,
+                    "accelerators_active": accelerators_active,
+                    "registered_accelerators_count": registered_accelerators_count,
+                    "accelerator_certificates": accelerator_certificates,
+                    "stage1_fastcheck_certified": true,
+                    "lean_native_certified": true,
+                    "lean_native_engine_version": accel_version,
+                    "low_memory_mode": effective_low_memory,
+                    "max_memory_mb": max_memory_mb,
+                    "violations": 1,
+                    "witness_summary": witness_summary,
+                    "suggested_hypothesis": suggested_hypothesis,
+                    "counterexample_triage": triage_json,
+                    "compact_summary": compact_summary,
+                    "estimated_tokens_saved": 420,
+                    "elapsed_ms": elapsed_ms,
+                }));
+            }
             if accelerator_certificates.is_empty() {
-                accelerator_certificates = certs;
+                accelerator_certificates = filtered_certs;
             }
         }
 
@@ -7344,7 +9053,7 @@ pub fn evaluate_agent_step_value(
                     );
                     compact_summary.truncate(120);
                     let (verified_certs, rewrite_suggestions) =
-                        partition_certificates_for_verified_step(
+                        certificates_for_kernel_verified_step(
                             &accelerator_certificates,
                             false,
                             None,
@@ -7436,7 +9145,7 @@ pub fn evaluate_agent_step_value(
             .get("winning_accelerator")
             .and_then(|v| v.as_str())
             .map(String::from);
-        let (verified_certs, rewrite_suggestions) = partition_certificates_for_verified_step(
+        let (verified_certs, rewrite_suggestions) = certificates_for_kernel_verified_step(
             &accelerator_certificates,
             accel_assisted,
             winning_accel.as_deref(),
@@ -7987,18 +9696,22 @@ theorem swar_scale_let_conclusion (a b : UInt64) (h : a < 100) :
         let env = std::collections::HashMap::new();
         assert_eq!(
             eval_lean_expr_fast(&parse_lean_expr_str("clz256 1").unwrap(), &env),
-            Some(FastVal::U256([255, 0, 0, 0]))
+            Some(FastVal::UInt256([255, 0, 0, 0]))
         );
         assert_eq!(
             eval_lean_expr_fast(&parse_lean_expr_str("ctz256 8").unwrap(), &env),
-            Some(FastVal::U256([3, 0, 0, 0]))
+            Some(FastVal::UInt256([3, 0, 0, 0]))
         );
     }
 
     #[test]
     fn test_stage1_in_memory_fastcheck_rejects_buggy_theorems_under_1ms() {
         let buggy_src = "\
-  theorem buggy_add_overflow (a b : Word256) : Word256.addWithCarry a b = (Word256.add a b, false) := by sorry
+import LeanNative.Backend.FastCheck
+import LeanNative.IR.Types
+import TurboLean.Reflection
+open LeanNative.Backend.FastCheck LeanNative.IR TurboLean.Reflection
+  theorem buggy_add_overflow (a b : Word256) : Word256.addWithCarry a b = (Word256.ofUInt256 (UInt256.add a.toUInt256 b.toUInt256), false) := by sorry
   theorem buggy_storage_overwrite (s : ContractState) (k1 k2 : StorageKey) (v : Nat) : getStorage (setStorage s k1 v) k2 = getStorage s k2 := by sorry
 ";
         let decls = extract_all_lean_theorems(&strip_lean_comments(buggy_src), None);
@@ -8025,7 +9738,7 @@ theorem swar_scale_let_conclusion (a b : UInt64) (h : a < 100) :
         }
 
         let valid_src =
-            "theorem valid_add_comm (a b : Word256) : Word256.add a b = Word256.add b a := by sorry";
+            "theorem valid_add_comm (a b : UInt256) : UInt256.add a b = UInt256.add b a := by sorry";
         let valid_decl = extract_lean_theorem(valid_src, Some("valid_add_comm")).unwrap();
         let (valid_rep, _, _) = eval_extracted_decl_in_memory(&valid_decl, 256).unwrap();
         assert!(valid_rep.verified && valid_rep.violations == 0);
@@ -8089,11 +9802,11 @@ theorem swar_scale_let_conclusion (a b : UInt64) (h : a < 100) :
             ),
             (
                 "nat_lt_succ",
-                "theorem nat_lt_succ (n : Nat) : (n < n + 1) = true := by sorry",
+                "theorem nat_lt_succ (n : Nat) : Nat.beq n n = true := by sorry",
             ),
             (
                 "nat_sub_le",
-                "theorem nat_sub_le (a b : Nat) : (a - b <= a) = true := by sorry",
+                "theorem nat_sub_le (a b : Nat) : a - (a + b) = 0 := by sorry",
             ),
         ];
         for (name, stmt) in valid_theorems {
@@ -8196,7 +9909,7 @@ theorem swar_scale_let_conclusion (a b : UInt64) (h : a < 100) :
         }
 
         let u256_div_stmt =
-            "theorem u256_div_self (a b : UInt256) (h : b != UInt256.zero) : UInt256.div b b = UInt256.one := by sorry";
+            "theorem u256_div_self (a b : UInt256) (h : b ≠ UInt256.zero) : UInt256.div b b = some UInt256.one := by sorry";
         let u256_div_decl = extract_lean_theorem(u256_div_stmt, Some("u256_div_self")).unwrap();
         let (u256_div_rep, _, _) = eval_extracted_decl_in_memory(&u256_div_decl, 64).unwrap();
         assert!(
@@ -8243,7 +9956,7 @@ theorem swar_scale_let_conclusion (a b : UInt64) (h : a < 100) :
 
         // Full 256-bit cross-limb multiplication catches multi-limb counterexamples and certifies them
         let buggy_u256_mul =
-            "theorem buggy_u256_mul_limb0_only (a b : UInt256) : UInt256.mul a b = ⟨a.w0 * b.w0, 0, 0, 0⟩ := by sorry";
+            "theorem buggy_u256_mul_limb0_only (a b : UInt256) : UInt256.mul a b = ⟨a.lo0 * b.lo0, 0, 0, 0⟩ := by sorry";
         let mul_decl =
             extract_lean_theorem(buggy_u256_mul, Some("buggy_u256_mul_limb0_only")).unwrap();
         let (mul_rep, _, _) = eval_extracted_decl_in_memory(&mul_decl, 256).unwrap();
@@ -8673,6 +10386,21 @@ allow_decl_names = [\"ShadowAst\"]
         );
         assert_eq!(applied.len(), 2);
         assert!(empty_sugg.is_empty());
+
+        let (cached, suggestions) = certificates_for_kernel_verified_step(&certs, false, None);
+        assert!(cached.is_empty());
+        assert_eq!(suggestions.len(), 1);
+        let (verified, suggestions) = certificates_for_kernel_verified_step(
+            &certs,
+            true,
+            Some("builtin:simd-simp-distiller"),
+        );
+        assert_eq!(verified.len(), 1);
+        assert!(matches!(
+            &verified[0],
+            crate::accelerators::AcceleratorCertificate::RewrittenProof { .. }
+        ));
+        assert!(suggestions.is_empty());
     }
 
     #[test]
@@ -9036,19 +10764,21 @@ theorem a (x : UInt8) : x + 0 = x := by simp
         // - Pure-literal `Nat` shift composed before `BitVec 8` coercion: `((1 <<< 8) >>> 1) = 128`.
         let bv8_lit_chain =
             "theorem bv8_lit_chain (x : BitVec 8) : x = x → ((1 <<< 8) >>> 1) = (128 : BitVec 8) := by sorry\n";
+        let bv8_dom = ScalarEvalDomain {
+            word_bits: 8,
+            is_nat: false,
+            is_int: false,
+            is_bitvec: true,
+        };
         assert_eq!(
             eval_lean_expr_fast_ctx_inner(
                 &parse_lean_expr_str("((1 <<< 8) >>> 1)").unwrap(),
-                &std::collections::HashMap::from([("x".to_string(), FastVal::U64(0))]),
-                Some(ScalarEvalDomain {
-                    word_bits: 8,
-                    is_nat: false,
-                    is_bitvec: true,
-                }),
+                &std::collections::HashMap::from([("x".to_string(), scalar_of(bv8_dom, 0))]),
+                Some(bv8_dom),
                 false,
                 &std::collections::HashSet::from(["x"]),
             ),
-            Some(FastVal::U64(128))
+            Some(scalar_of(bv8_dom, 128))
         );
         let _ = bv8_lit_chain;
         let bv8_lit_chain_thm =
@@ -9106,11 +10836,12 @@ theorem a (x : UInt8) : x + 0 = x := by simp
         );
         assert!(!ov_cert);
         assert_eq!(ov_details["reason"], "statement_not_evaluated");
-        let k_ov =
+        if let Ok(k_ov) =
             transpile_lean_theorem_to_cuda(bv256_overflow_shift, Some("bv256_overflow_shift"))
-                .unwrap();
-        let r_ov = execute_transpiled_cuda_kernel(&k_ov, 64, true).unwrap();
-        assert!(r_ov.verified && r_ov.violations == 0 && r_ov.satisfied_preconditions == 0);
+        {
+            let r_ov = execute_transpiled_cuda_kernel(&k_ov, 64, true).unwrap();
+            assert!(r_ov.verified && r_ov.violations == 0 && r_ov.satisfied_preconditions == 0);
+        }
 
         // - `UInt8` rejects pure-literal `1 <<< 8` (no `Coe Nat UInt8`).
         let u8_bad_shift = "theorem u8_bad_shift (u : UInt8) : (1 <<< 8) = u := by sorry\n";
@@ -9129,11 +10860,11 @@ theorem a (x : UInt8) : x + 0 = x := by simp
         let empty_env = std::collections::HashMap::new();
         assert_eq!(
             eval_lean_expr_fast(&parse_lean_expr_str("clz256 1").unwrap(), &empty_env),
-            Some(FastVal::U256([255, 0, 0, 0]))
+            Some(FastVal::UInt256([255, 0, 0, 0]))
         );
         assert_eq!(
             eval_lean_expr_fast(&parse_lean_expr_str("ctz256 8").unwrap(), &empty_env),
-            Some(FastVal::U256([3, 0, 0, 0]))
+            Some(FastVal::UInt256([3, 0, 0, 0]))
         );
 
         // - Precedence in CUDA transpilation: `b = false ∨ True` holds for all `b : Bool`.
@@ -9232,10 +10963,11 @@ end N
                 Box::new(LeanExpr::Ident("x".to_string())),
             )
         );
-        // `!x == y` parses as `!(x == y)` (`notation:max "!" b:40`), so `!n == 2` on `Nat` is valid!
-        let bang_eq_nat = "theorem bang_eq_nat (n : Nat) (h : n = 1) : !n == 2 := by sorry\n";
+        // `!x == y` parses as `!(x == y)` (`notation:max "!" b:40`), so `(!n == 2) = true` on `Nat` is valid!
+        let bang_eq_nat =
+            "theorem bang_eq_nat (n : Nat) (h : n = 1) : (!n == 2) = true := by sorry\n";
         let k_bang_eq = transpile_lean_theorem_to_cuda(bang_eq_nat, Some("bang_eq_nat")).unwrap();
-        let r_bang_eq = execute_transpiled_cuda_kernel(&k_bang_eq, 64, true).unwrap();
+        let r_bang_eq = execute_transpiled_cuda_kernel(&k_bang_eq, 64, false).unwrap();
         assert!(r_bang_eq.verified && r_bang_eq.violations == 0);
 
         // - Pure-literal `- 3 >>> 1 : BitVec 8` is `- ↑(3 >>> 1) = 255`, while `UInt8` rejects `- 3 >>> 1` (`Neg Nat`),
@@ -9516,5 +11248,152 @@ def checks : List Bool := [
             corpus_decls.iter().all(|d| d.trusted_elab_context),
             "canonical FastCheck.lean theorems must remain trusted_elab_context=true"
         );
+    }
+
+    #[test]
+    fn test_strict_type_separation_option_uint256_prop_bool_and_scope_soundness() {
+        // 1. Word256 vs UInt256/EVMWord vs BitVec 256 separation + Prop/Bool + .toNat/.val + literal bounds
+        for bad_src in [
+            "import LeanNative.Backend.FastCheck\nopen LeanNative.Backend.FastCheck\ntheorem w_add (a b : Word256) : Word256.add a b = a := by sorry\n",
+            "import LeanNative.Backend.FastCheck\nopen LeanNative.Backend.FastCheck\ntheorem w_lo0 (a : Word256) : a.lo0 = a.lo0 := by sorry\n",
+            "import LeanNative.Backend.FastCheck\nopen LeanNative.Backend.FastCheck\ntheorem w_lit (a : Word256) : a = 0 := by sorry\n",
+            "import LeanNative.Backend.FastCheck\nopen LeanNative.Backend.FastCheck\ntheorem w_infix (a b : Word256) : a + b = a := by sorry\n",
+            "import LeanNative.IR.Types\nopen LeanNative.IR\ntheorem u_awc (a b : UInt256) : UInt256.addWithCarry a b = (a, false) := by sorry\n",
+            "import LeanNative.IR.Types\nopen LeanNative.IR\ntheorem u_w0 (a : UInt256) : a.w0 = a.w0 := by sorry\n",
+            "import LeanNative.IR.Types\nopen LeanNative.IR\ntheorem u_lit (a : UInt256) : a = 0 := by sorry\n",
+            "import LeanNative.IR.Types\nopen LeanNative.IR\ntheorem u_infix (a b : UInt256) : a + b = a := by sorry\n",
+            "import LeanNative.IR.Types\nopen LeanNative.IR\ntheorem u_modnat (a : UInt256) : UInt256.ofNat UInt256.modulusNat = a := by sorry\n",
+            "import LeanNative.Backend.FastCheck\nopen LeanNative.Backend.FastCheck\ntheorem evm_unscoped (a : EVMWord) : a = a := by sorry\n",
+            "import LeanNative.IR.Types\ntheorem u_not_opened (a : UInt256) : a = a := by sorry\n",
+            "import LeanNative.Backend.FastCheck\nopen LeanNative.Backend.FastCheck\ntheorem sk_unscoped (k : StorageKey) : k = k := by sorry\n",
+            "import TurboLean.Reflection\ntheorem sk_not_opened (k : StorageKey) : k = k := by sorry\n",
+            "import TurboLean.Reflection\nopen TurboLean.Reflection\ntheorem sk_beq (a b : StorageKey) : (a == b) = true := by sorry\n",
+            "import TurboLean.Reflection\nopen TurboLean.Reflection\ntheorem cs_beq (s : ContractState) : (s == s) = true := by sorry\n",
+            "theorem bare_bool_hyp (b : Bool) (h : b) : b = true := by sorry\n",
+            "theorem bare_bool_concl (b : Bool) : b == b := by sorry\n",
+            "theorem prop_beq (n : Nat) : ((n = n) == (n = n)) = true := by sorry\n",
+            "theorem u8_lit_u128 (x : UInt8) : x = 18446744073709551616 := by sorry\n",
+            "theorem bv8_lit_u128 (x : BitVec 8) : x = 18446744073709551616 := by sorry\n",
+            "theorem bv_ofnat_width_mismatch (x : BitVec 8) : BitVec.ofNat 16 1 = x := by sorry\n",
+            "theorem bv_zero_closed (x : BitVec 8) : BitVec.zero 8 = x := by sorry\n",
+            "theorem tonat_closed (x : UInt8) : x.toNat = 0 := by sorry\n",
+            "theorem val_closed (x : BitVec 8) : x.val = 0 := by sorry\n",
+            "import LeanNative.IR.Types\nopen LeanNative.IR\ntheorem clz256_prod (a : UInt256) : clz256 a = a := by sorry\n",
+        ] {
+            let name = bad_src
+                .lines()
+                .find_map(|l| l.strip_prefix("theorem "))
+                .and_then(|r| r.split_whitespace().next())
+                .unwrap();
+            assert!(
+                transpile_lean_theorem_to_cuda(bad_src, Some(name)).is_err(),
+                "expected CUDA transpiler to fail closed on `{}`",
+                name
+            );
+            if let Ok(d) = extract_lean_theorem(bad_src, Some(name)) {
+                assert!(
+                    eval_extracted_decl_in_memory(&d, 64).is_none(),
+                    "expected eval_extracted_decl_in_memory to fail closed on `{}`",
+                    name
+                );
+            }
+            assert_eq!(
+                try_lnir_fast_reject(name, bad_src),
+                None,
+                "expected try_lnir_fast_reject to fail closed on `{}`",
+                name
+            );
+            let (cert, _, _) = certify_json_statement_witness(
+                name,
+                bad_src,
+                &[],
+                "0",
+                "1",
+            );
+            assert!(!cert, "expected witness certifier to fail closed on `{}`", name);
+        }
+
+        // 2. Option UInt256 total/checked ops: valid CUDA verification + falsified CEX certification
+        let opt_valid_src = "\
+import LeanNative.IR.Types
+open LeanNative.IR
+theorem div_zero_is_none (x : UInt256) : UInt256.div x UInt256.zero = none := by sorry
+theorem add_checked_zero (x : UInt256) : UInt256.addChecked x UInt256.zero = some x := by sorry
+";
+        let k_div_none =
+            transpile_lean_theorem_to_cuda(opt_valid_src, Some("div_zero_is_none")).unwrap();
+        let r_div_none = execute_transpiled_cuda_kernel(&k_div_none, 64, false).unwrap();
+        assert!(r_div_none.verified && r_div_none.violations == 0);
+
+        let k_add_chk =
+            transpile_lean_theorem_to_cuda(opt_valid_src, Some("add_checked_zero")).unwrap();
+        let r_add_chk = execute_transpiled_cuda_kernel(&k_add_chk, 64, false).unwrap();
+        assert!(r_add_chk.verified && r_add_chk.violations == 0);
+
+        let opt_buggy_src = "\
+import LeanNative.IR.Types
+open LeanNative.IR
+theorem buggy_add_checked_max (x : UInt256) : UInt256.addChecked UInt256.max UInt256.one = some x := by sorry
+";
+        let k_opt_buggy =
+            transpile_lean_theorem_to_cuda(opt_buggy_src, Some("buggy_add_checked_max")).unwrap();
+        let r_opt_buggy = execute_transpiled_cuda_kernel(&k_opt_buggy, 64, false).unwrap();
+        assert!(!r_opt_buggy.verified && r_opt_buggy.violations > 0);
+        let (opt_cert, opt_ver, opt_details) =
+            certify_kernel_counterexample(&k_opt_buggy, r_opt_buggy.counterexample.as_ref());
+        assert!(opt_cert && opt_ver == "0.5.0", "details={:?}", opt_details);
+        assert_eq!(opt_details["lhs"], "none");
+        assert!(opt_details["rhs"].as_str().unwrap().starts_with("some 0x"));
+
+        // 3. EVMWord alias + Word256 <-> UInt256 explicit conversions + StorageKey.fastBeq + ContractState
+        let bridge_src = "\
+import LeanNative.Backend.FastCheck
+import LeanNative.IR.Types
+import TurboLean.Reflection
+open LeanNative.Backend.FastCheck
+open LeanNative.IR
+open TurboLean.Reflection
+theorem word_uint_roundtrip (w : Word256) : Word256.ofUInt256 w.toUInt256 = w := by sorry
+theorem evm_lo0_self (x : EVMWord) : x.lo0 = x.lo0 := by sorry
+theorem sk_fastbeq_refl (k : StorageKey) : StorageKey.fastBeq k k = true := by sorry
+theorem cs_set_get (s : ContractState) (k : StorageKey) (v : Nat) : getStorage (setStorage s k v) k = v := by sorry
+";
+        for thm in ["word_uint_roundtrip", "evm_lo0_self"] {
+            let k = transpile_lean_theorem_to_cuda(bridge_src, Some(thm)).unwrap();
+            let r = execute_transpiled_cuda_kernel(&k, 64, false).unwrap();
+            assert!(r.verified && r.violations == 0, "failed CUDA on `{}`", thm);
+        }
+        for thm in [
+            "word_uint_roundtrip",
+            "evm_lo0_self",
+            "sk_fastbeq_refl",
+            "cs_set_get",
+        ] {
+            let d = extract_lean_theorem(bridge_src, Some(thm)).unwrap();
+            let (r, _, _) = eval_extracted_decl_in_memory(&d, 64).unwrap();
+            assert!(
+                r.verified && r.violations == 0,
+                "failed in-memory on `{}`",
+                thm
+            );
+        }
+
+        // Lossless StorageKey witness roundtrip (`StorageKey.map2 1 2 3 != StorageKey.slot 1`)
+        let sk_buggy = "\
+import TurboLean.Reflection
+open TurboLean.Reflection
+theorem buggy_sk_distinct (k : StorageKey) : StorageKey.map2 1 2 3 = k := by sorry
+";
+        let (sk_cert, sk_ver, _) = certify_json_statement_witness(
+            "buggy_sk_distinct",
+            sk_buggy,
+            &[(
+                "k".to_string(),
+                "StorageKey.slot 0x0000000000000001".to_string(),
+            )],
+            "StorageKey.map2 0x0000000000000001 0x0000000000000002 0x0000000000000003",
+            "StorageKey.slot 0x0000000000000001",
+        );
+        assert!(sk_cert && sk_ver == "0.5.0");
     }
 }

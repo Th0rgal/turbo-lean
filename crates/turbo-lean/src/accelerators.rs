@@ -588,23 +588,41 @@ fn run_fastcheck_backend_certificate(
     accelerator_name: &str,
     fallback_fn: fn(&str, &str) -> Option<(String, Option<String>)>,
 ) -> Option<AcceleratorCertificate> {
+    if !crate::gpu_fastcheck::stmt_src_has_trusted_elab_context(decl_name, stmt_src) {
+        return None;
+    }
     if let Ok(res) = crate::cluster::auto_fastcheck_decl(decl_name, stmt_src, backend_tag) {
-        if res.get("ok").and_then(|v| v.as_bool()) == Some(false) {
-            return Some(AcceleratorCertificate::CounterexampleFound {
-                witness_summary: res
-                    .get("witness_summary")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("counterexample")
-                    .to_string(),
-                suggested_hypothesis: res
-                    .get("suggested_hypothesis")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-                accelerator_name: accelerator_name.to_string(),
-            });
+        if res.get("ok").and_then(|v| v.as_bool()) == Some(false)
+            && res.get("lean_native_certified").and_then(|v| v.as_bool()) == Some(true)
+        {
+            let witness_summary = res
+                .get("witness_summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("counterexample")
+                .to_string();
+            let (certified, _, _) = crate::gpu_fastcheck::certify_statement_witness(
+                decl_name,
+                stmt_src,
+                &witness_summary,
+            );
+            if certified {
+                return Some(AcceleratorCertificate::CounterexampleFound {
+                    witness_summary,
+                    suggested_hypothesis: res
+                        .get("suggested_hypothesis")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    accelerator_name: accelerator_name.to_string(),
+                });
+            }
         }
     }
     let (witness_summary, suggested_hypothesis) = fallback_fn(decl_name, stmt_src)?;
+    let (certified, _, _) =
+        crate::gpu_fastcheck::certify_statement_witness(decl_name, stmt_src, &witness_summary);
+    if !certified {
+        return None;
+    }
     Some(AcceleratorCertificate::CounterexampleFound {
         witness_summary,
         suggested_hypothesis,
@@ -733,8 +751,6 @@ enum OmegaAst {
     Var(String),
     Lit(i128),
     BoolLit(bool),
-    TypedBitVecZero,
-    TypedBitVecOne,
     Unary(String, Box<OmegaAst>),
     Binary(String, Box<OmegaAst>, Box<OmegaAst>),
 }
@@ -791,13 +807,13 @@ fn classify_omega_binder_dom(ty: &str) -> Option<OmegaParamDom> {
     match ty.trim() {
         "Nat" => Some(OmegaParamDom::Nat),
         "Int" => Some(OmegaParamDom::Int),
-        "UInt64" | "USize" => Some(OmegaParamDom::UInt(64)),
+        "UInt64" => Some(OmegaParamDom::UInt(64)),
         "UInt32" => Some(OmegaParamDom::UInt(32)),
         "UInt16" => Some(OmegaParamDom::UInt(16)),
         "UInt8" => Some(OmegaParamDom::UInt(8)),
         t => t.strip_prefix("BitVec").and_then(|r| {
             let w = r.trim().parse::<u32>().ok()?;
-            (1..=64).contains(&w).then_some(OmegaParamDom::BitVec(w))
+            matches!(w, 8 | 16 | 32 | 64).then_some(OmegaParamDom::BitVec(w))
         }),
     }
 }
@@ -913,6 +929,9 @@ fn parse_omega_stmt(raw_stmt: &str) -> Option<(Vec<(String, OmegaParamDom)>, Vec
                     for v in vars_part.split_whitespace() {
                         let vt = v.trim();
                         if !vt.is_empty() {
+                            if params.iter().any(|(prev, _)| prev == vt) {
+                                return None;
+                            }
                             params.push((vt.to_string(), dom));
                         }
                     }
@@ -1172,8 +1191,6 @@ impl OmegaParser {
             OmegaTok::Ident(id) => match id.as_str() {
                 "True" | "true" => Some((OmegaAst::BoolLit(true), 1024)),
                 "False" | "false" => Some((OmegaAst::BoolLit(false), 1024)),
-                "BitVec.zero" => Some((OmegaAst::TypedBitVecZero, 1024)),
-                "BitVec.one" => Some((OmegaAst::TypedBitVecOne, 1024)),
                 "Nat.succ" if min_prec <= 1022 => {
                     let arg = self.parse_expr(1023)?;
                     Some((
@@ -1185,14 +1202,11 @@ impl OmegaParser {
                         1022,
                     ))
                 }
-                "BitVec.not" | "bitNot" if min_prec <= 1022 => Some((
-                    OmegaAst::Unary(
-                        if id == "BitVec.not" { "bv_not" } else { "~~~" }.to_string(),
-                        Box::new(self.parse_expr(1023)?),
-                    ),
+                "BitVec.not" if min_prec <= 1022 => Some((
+                    OmegaAst::Unary("bv_not".to_string(), Box::new(self.parse_expr(1023)?)),
                     1022,
                 )),
-                "Nat.succ" | "BitVec.not" | "bitNot" => None,
+                "Nat.succ" | "BitVec.not" | "BitVec.zero" | "BitVec.one" | "bitNot" => None,
                 _ if id.starts_with("Word256.")
                     || id.starts_with("Uint256.")
                     || id.starts_with("UInt256.") =>
@@ -1202,20 +1216,18 @@ impl OmegaParser {
                 _ => {
                     let bin_op = match id.as_str() {
                         "BitVec.shiftLeft" => Some("bv_shl"),
-                        "shl" => Some("<<<"),
                         "BitVec.ushiftRight" => Some("bv_shr"),
-                        "shr" => Some(">>>"),
                         "BitVec.and" => Some("bv_and"),
-                        "bitAnd" => Some("&&&"),
                         "BitVec.or" => Some("bv_or"),
-                        "bitOr" => Some("|||"),
                         "BitVec.xor" => Some("bv_xor"),
-                        "bitXor" => Some("^^^"),
                         "BitVec.add" => Some("bv_add"),
                         "BitVec.sub" => Some("bv_sub"),
                         "BitVec.mul" => Some("bv_mul"),
                         _ => None,
                     };
+                    if matches!(id.as_str(), "shl" | "shr" | "bitAnd" | "bitOr" | "bitXor") {
+                        return None;
+                    }
                     if let Some(op) = bin_op {
                         if min_prec > 1022 {
                             return None;
@@ -1263,10 +1275,7 @@ fn collect_omega_vars(ast: &OmegaAst, out: &mut Vec<String>) {
                 out.push(v.clone());
             }
         }
-        OmegaAst::Lit(_)
-        | OmegaAst::BoolLit(_)
-        | OmegaAst::TypedBitVecZero
-        | OmegaAst::TypedBitVecOne => {}
+        OmegaAst::Lit(_) | OmegaAst::BoolLit(_) => {}
         OmegaAst::Unary(_, inner) => collect_omega_vars(inner, out),
         OmegaAst::Binary(_, l, r) => {
             collect_omega_vars(l, out);
@@ -1282,7 +1291,6 @@ fn omega_ast_mentions_typed_value(
 ) -> bool {
     match ast {
         OmegaAst::Var(_) => !include_bitvec_only || matches!(default_dom, OmegaParamDom::BitVec(_)),
-        OmegaAst::TypedBitVecZero | OmegaAst::TypedBitVecOne => true,
         OmegaAst::Lit(_) | OmegaAst::BoolLit(_) => false,
         OmegaAst::Unary(op, inner) => {
             if op == "bv_not" {
@@ -1478,12 +1486,6 @@ fn eval_omega_ast(
 
     let raw = match ast {
         OmegaAst::Lit(n) => Some(OmegaVal::Int(mask_dom(*n)?)),
-        OmegaAst::TypedBitVecZero => {
-            matches!(outer_dom, OmegaParamDom::BitVec(_)).then_some(OmegaVal::Int(0))
-        }
-        OmegaAst::TypedBitVecOne => matches!(outer_dom, OmegaParamDom::BitVec(_))
-            .then(|| mask_for(outer_dom, 1).map(OmegaVal::Int))
-            .flatten(),
         OmegaAst::BoolLit(b) => Some(OmegaVal::Bool(*b)),
         OmegaAst::Var(name) => env.get(name).copied().map(OmegaVal::Int),
         OmegaAst::Unary(op, inner) => {
@@ -1773,10 +1775,7 @@ struct ParsedOmegaGoal {
 fn omega_ast_occurs(ast: &OmegaAst, var_name: &str) -> bool {
     match ast {
         OmegaAst::Var(v) => v == var_name,
-        OmegaAst::Lit(_)
-        | OmegaAst::BoolLit(_)
-        | OmegaAst::TypedBitVecZero
-        | OmegaAst::TypedBitVecOne => false,
+        OmegaAst::Lit(_) | OmegaAst::BoolLit(_) => false,
         OmegaAst::Unary(_, inner) => omega_ast_occurs(inner, var_name),
         OmegaAst::Binary(_, l, r) => omega_ast_occurs(l, var_name) || omega_ast_occurs(r, var_name),
     }
@@ -1785,11 +1784,7 @@ fn omega_ast_occurs(ast: &OmegaAst, var_name: &str) -> bool {
 fn omega_ast_subst(ast: &OmegaAst, var_name: &str, replacement: &OmegaAst) -> OmegaAst {
     match ast {
         OmegaAst::Var(v) if v == var_name => replacement.clone(),
-        OmegaAst::Var(_)
-        | OmegaAst::Lit(_)
-        | OmegaAst::BoolLit(_)
-        | OmegaAst::TypedBitVecZero
-        | OmegaAst::TypedBitVecOne => ast.clone(),
+        OmegaAst::Var(_) | OmegaAst::Lit(_) | OmegaAst::BoolLit(_) => ast.clone(),
         OmegaAst::Unary(op, inner) => OmegaAst::Unary(
             op.clone(),
             Box::new(omega_ast_subst(inner, var_name, replacement)),
@@ -2164,11 +2159,18 @@ impl TacticAccelerator for SimdOmegaFastAccel {
             if !trusted_ctx {
                 return None;
             }
+            let witness_summary =
+                format!("ground proposition `{}` evaluates to false", goal.concl_str);
+            let (certified, _, _) = crate::gpu_fastcheck::certify_statement_witness(
+                &input.decl_name,
+                &input.stmt_src,
+                &witness_summary,
+            );
+            if !certified {
+                return None;
+            }
             return Some(AcceleratorCertificate::CounterexampleFound {
-                witness_summary: format!(
-                    "ground proposition `{}` evaluates to false",
-                    goal.concl_str
-                ),
+                witness_summary,
                 suggested_hypothesis: None,
                 accelerator_name: self.name().to_string(),
             });
@@ -2217,11 +2219,19 @@ impl TacticAccelerator for SimdOmegaFastAccel {
                     .filter_map(|(pn, _)| env.get(pn).map(|v| format!("{} = {}", pn, v)))
                     .collect::<Vec<_>>()
                     .join(", ");
-                return Some(AcceleratorCertificate::CounterexampleFound {
-                    witness_summary: format!("{} (violates `{}`)", bindings_str, goal.concl_str),
-                    suggested_hypothesis: Some(format!("h_guard : {}", goal.concl_str)),
-                    accelerator_name: self.name().to_string(),
-                });
+                let witness_summary = format!("{} (violates `{}`)", bindings_str, goal.concl_str);
+                let (certified, _, _) = crate::gpu_fastcheck::certify_statement_witness(
+                    &input.decl_name,
+                    &input.stmt_src,
+                    &witness_summary,
+                );
+                if certified {
+                    return Some(AcceleratorCertificate::CounterexampleFound {
+                        witness_summary,
+                        suggested_hypothesis: Some(format!("h_guard : {}", goal.concl_str)),
+                        accelerator_name: self.name().to_string(),
+                    });
+                }
             }
         }
 
@@ -3369,9 +3379,8 @@ const SIMD_BV_BOUNDARY_U64: [u64; 6] = [
 ];
 
 fn mentions_bv_or_word256(s: &str) -> bool {
-    const KEYWORDS: [&str; 21] = [
+    const KEYWORDS: [&str; 20] = [
         "Word256",
-        "Uint256",
         "UInt256",
         "BitVec",
         "UInt64",
@@ -3452,7 +3461,7 @@ fn check_bv_shift_or_mask_truncation_pattern(stmt_src: &str) -> Option<(String, 
 
 /// Built-in Accelerator 6: `SimdBvDecideFastAccel` (`"builtin:simd-bv-decide-fastcheck"`).
 ///
-/// Targets 256-bit EVM `Word256` / `Uint256` / `BitVec` / `StorageKey` goals:
+/// Targets 256-bit EVM `Word256` / `UInt256` / `BitVec` / `StorageKey` goals:
 /// 1. **Boundary Bit-Vector Counterexample Detection**:
 ///    Queries `try_lnir_fast_reject` and evaluates 64/256-bit boundary lanes
 ///    (`0`, `1`, `u64::MAX`, `1u64 << 63`, `0x5555_5555_5555_5555`, `0xaaaa_aaaa_aaaa_aaaa`)
@@ -3481,21 +3490,35 @@ impl TacticAccelerator for SimdBvDecideFastAccel {
             if let Some((witness_summary, suggested_hypothesis)) =
                 check_bv_shift_or_mask_truncation_pattern(&input.stmt_src)
             {
-                return Some(AcceleratorCertificate::CounterexampleFound {
-                    witness_summary,
-                    suggested_hypothesis,
-                    accelerator_name: self.name().to_string(),
-                });
+                let (certified, _, _) = crate::gpu_fastcheck::certify_statement_witness(
+                    &input.decl_name,
+                    &input.stmt_src,
+                    &witness_summary,
+                );
+                if certified {
+                    return Some(AcceleratorCertificate::CounterexampleFound {
+                        witness_summary,
+                        suggested_hypothesis,
+                        accelerator_name: self.name().to_string(),
+                    });
+                }
             }
-        }
-        if let Some((witness_summary, suggested_hypothesis)) =
-            crate::gpu_fastcheck::try_lnir_fast_reject(&input.decl_name, &input.stmt_src)
-        {
-            return Some(AcceleratorCertificate::CounterexampleFound {
-                witness_summary,
-                suggested_hypothesis,
-                accelerator_name: self.name().to_string(),
-            });
+            if let Some((witness_summary, suggested_hypothesis)) =
+                crate::gpu_fastcheck::try_lnir_fast_reject(&input.decl_name, &input.stmt_src)
+            {
+                let (certified, _, _) = crate::gpu_fastcheck::certify_statement_witness(
+                    &input.decl_name,
+                    &input.stmt_src,
+                    &witness_summary,
+                );
+                if certified {
+                    return Some(AcceleratorCertificate::CounterexampleFound {
+                        witness_summary,
+                        suggested_hypothesis,
+                        accelerator_name: self.name().to_string(),
+                    });
+                }
+            }
         }
 
         // B. Fast Reflexivity / `by rfl` Candidate for Word256 / BitVec equalities
@@ -3849,14 +3872,29 @@ impl TpuGuidedTacticSynthAccel {
         // Case 1: Finite Bool / Decidable Case-Split Synthesis
         if let Some(bool_params) = extract_bool_only_params(&clean_stmt) {
             if has_sorry_or_admit || has_slow_simp_rw || has_multiline_cases {
-                if let Some((witness_summary, suggested_hypothesis)) =
-                    crate::gpu_fastcheck::try_lnir_fast_reject(&input.decl_name, &clean_stmt)
-                {
-                    return Some(AcceleratorCertificate::CounterexampleFound {
-                        witness_summary,
-                        suggested_hypothesis,
-                        accelerator_name: self.name().to_string(),
-                    });
+                if crate::gpu_fastcheck::stmt_src_has_trusted_elab_context(
+                    &input.decl_name,
+                    &input.stmt_src,
+                ) {
+                    if let Some((witness_summary, suggested_hypothesis)) =
+                        crate::gpu_fastcheck::try_lnir_fast_reject(
+                            &input.decl_name,
+                            &input.stmt_src,
+                        )
+                    {
+                        let (certified, _, _) = crate::gpu_fastcheck::certify_statement_witness(
+                            &input.decl_name,
+                            &input.stmt_src,
+                            &witness_summary,
+                        );
+                        if certified {
+                            return Some(AcceleratorCertificate::CounterexampleFound {
+                                witness_summary,
+                                suggested_hypothesis,
+                                accelerator_name: self.name().to_string(),
+                            });
+                        }
+                    }
                 }
                 let new_body_src = if bool_params.len() == 2 && has_multiline_cases {
                     format!(
@@ -3876,21 +3914,33 @@ impl TpuGuidedTacticSynthAccel {
 
         // Case 2: TPU/SIMD-Verified Ground & Bounded Modular Arithmetic -> `by decide` / `by omega`
         let is_arith_goal = [
-            "Nat", "Int", "UInt64", "UInt32", "UInt16", "UInt8", "BitVec", "Word256", "<", "<=",
-            "≤", "+", "-", "*", "%", "&&&", "|||", "^^^", "<<<", ">>>",
+            "Nat", "Int", "UInt64", "UInt32", "UInt16", "UInt8", "BitVec", "Word256", "UInt256",
+            "<", "<=", "≤", "+", "-", "*", "%", "&&&", "|||", "^^^", "<<<", ">>>",
         ]
         .iter()
         .any(|tok| clean_stmt.contains(tok));
 
         if is_arith_goal && (has_sorry_or_admit || has_slow_simp_rw) {
-            if let Some((witness_summary, suggested_hypothesis)) =
-                crate::gpu_fastcheck::try_tpu_xla_fast_reject(&input.decl_name, &clean_stmt)
-            {
-                return Some(AcceleratorCertificate::CounterexampleFound {
-                    witness_summary,
-                    suggested_hypothesis,
-                    accelerator_name: self.name().to_string(),
-                });
+            if crate::gpu_fastcheck::stmt_src_has_trusted_elab_context(
+                &input.decl_name,
+                &input.stmt_src,
+            ) {
+                if let Some((witness_summary, suggested_hypothesis)) =
+                    crate::gpu_fastcheck::try_tpu_xla_fast_reject(&input.decl_name, &input.stmt_src)
+                {
+                    let (certified, _, _) = crate::gpu_fastcheck::certify_statement_witness(
+                        &input.decl_name,
+                        &input.stmt_src,
+                        &witness_summary,
+                    );
+                    if certified {
+                        return Some(AcceleratorCertificate::CounterexampleFound {
+                            witness_summary,
+                            suggested_hypothesis,
+                            accelerator_name: self.name().to_string(),
+                        });
+                    }
+                }
             }
 
             if let Some(goal) = ParsedOmegaGoal::parse(&clean_stmt, OmegaParamDom::Nat) {
@@ -3904,21 +3954,29 @@ impl TpuGuidedTacticSynthAccel {
                     }
                     if crate::gpu_fastcheck::stmt_src_has_trusted_elab_context(
                         &input.decl_name,
-                        &clean_stmt,
+                        &input.stmt_src,
                     ) {
-                        return Some(AcceleratorCertificate::CounterexampleFound {
-                            witness_summary: format!(
-                                "[TPU-v5e-XLA uncertified] ground proposition `{}` evaluates to false",
-                                goal.concl_str
-                            ),
-                            suggested_hypothesis: None,
-                            accelerator_name: self.name().to_string(),
-                        });
+                        let witness_summary = format!(
+                            "[TPU-v5e-XLA certified] ground proposition `{}` evaluates to false",
+                            goal.concl_str
+                        );
+                        let (certified, _, _) = crate::gpu_fastcheck::certify_statement_witness(
+                            &input.decl_name,
+                            &input.stmt_src,
+                            &witness_summary,
+                        );
+                        if certified {
+                            return Some(AcceleratorCertificate::CounterexampleFound {
+                                witness_summary,
+                                suggested_hypothesis: None,
+                                accelerator_name: self.name().to_string(),
+                            });
+                        }
                     }
                 } else if !goal.params.is_empty() || !goal.free_vars.is_empty() {
                     let omega_cex = SimdOmegaFastAccel.try_accelerate(&AcceleratorInput {
                         decl_name: input.decl_name.clone(),
-                        stmt_src: clean_stmt,
+                        stmt_src: input.stmt_src.clone(),
                         body_src: "by omega".to_string(),
                         imports_csv: input.imports_csv.clone(),
                         available_constants: Vec::new(),
@@ -4042,7 +4100,10 @@ impl TacticAccelerator for SimdRiscvStepCertAccel {
         let clean_body = crate::splitter::strip_lean_comments(&input.body_src);
 
         // B. Step-Budget Counterexample Rejection (`WitnessRefuter`)
-        if [
+        if crate::gpu_fastcheck::stmt_src_has_trusted_elab_context(
+            &input.decl_name,
+            &input.stmt_src,
+        ) && [
             "<=",
             "≤",
             ".finite",
@@ -4346,19 +4407,10 @@ impl TacticAccelerator for SimdSnarkKernelCertAccel {
         let clean_body = crate::splitter::strip_lean_comments(&input.body_src);
 
         // 1. Instant Mutant & Soundness Refutation for GF(2^128) / TriNeon / NTT kernels
-        if clean_stmt.contains("0x87")
-            && (clean_stmt.contains("0x83") || clean_stmt.contains("0x85"))
-        {
+        if crate::gpu_fastcheck::is_unconditional_gf128_mutant(&input.decl_name, &input.stmt_src) {
             return Some(AcceleratorCertificate::CounterexampleFound {
                 witness_summary: "GF(2^128) reduction polynomial mismatch: x^128+x^7+x^2+x+1 requires low byte 0x87".to_string(),
                 suggested_hypothesis: Some("replace mutant reduction constant with 0x87".to_string()),
-                accelerator_name: self.name().to_string(),
-            });
-        }
-        if clean_stmt.contains("TriNeon") && clean_stmt.contains("vextq_u64::<0>") {
-            return Some(AcceleratorCertificate::CounterexampleFound {
-                witness_summary: "TriNeon cross-product alignment requires 64-bit lane shift vextq_u64::<1>, found <0>".to_string(),
-                suggested_hypothesis: Some("use vextq_u64::<1>(zero, cross) for lo and vextq_u64::<1>(cross, zero) for hi".to_string()),
                 accelerator_name: self.name().to_string(),
             });
         }
@@ -4976,10 +5028,10 @@ mod tests {
     fn test_simd_bv_decide_fastcheck_catches_shift_truncation_and_proposes_rfl() {
         let bv_accel = SimdBvDecideFastAccel;
         let buggy_shift_input = AcceleratorInput {
-            decl_name: "buggy_word256_shift_roundtrip".into(),
-            stmt_src: "(a : Word256) : Word256.shr (Word256.shl a 1) 1 = a".into(),
-            body_src: "by simp [Word256.shr, Word256.shl]".into(),
-            imports_csv: "TurboLean.FastCheck".into(),
+            decl_name: "buggy_u256_shift_roundtrip".into(),
+            stmt_src: "(a : UInt256) : UInt256.shr (UInt256.shl a 1) 1 = a".into(),
+            body_src: "by simp [UInt256.shr, UInt256.shl]".into(),
+            imports_csv: "LeanNative.IR.Types".into(),
             available_constants: vec![],
             budget_ms: 25,
         };
@@ -5043,24 +5095,26 @@ mod tests {
             .is_none());
         assert!(omega_accel
             .try_accelerate(&AcceleratorInput {
-                decl_name: "word256_shift64_abstain".into(),
-                stmt_src: "(a : Word256) (h : a = 1) : Word256.shl a 64 != 1".into(),
+                decl_name: "u256_shift64_abstain".into(),
+                stmt_src: "(a : UInt256) (h : a = UInt256.one) : UInt256.shl a 64 != UInt256.one"
+                    .into(),
                 body_src: "by bv_decide".into(),
                 ..buggy_shift_input.clone()
             })
             .is_none());
         assert!(bv_accel
             .try_accelerate(&AcceleratorInput {
-                decl_name: "word256_shift64_valid".into(),
-                stmt_src: "(a : Word256) (h : a = 1) : Word256.shl a 64 != 1".into(),
+                decl_name: "u256_shift64_valid".into(),
+                stmt_src: "(a : UInt256) (h : a = UInt256.one) : UInt256.shl a 64 != UInt256.one"
+                    .into(),
                 body_src: "by bv_decide".into(),
                 ..buggy_shift_input.clone()
             })
             .is_none());
         assert!(omega_accel
             .try_accelerate(&AcceleratorInput {
-                decl_name: "ground_word256_not_shr64_abstain".into(),
-                stmt_src: ": Word256.shr (Word256.bitNot Word256.zero) 64 = Word256.zero".into(),
+                decl_name: "ground_u256_not_shr64_abstain".into(),
+                stmt_src: ": UInt256.shr (UInt256.bitNot UInt256.zero) 64 = UInt256.zero".into(),
                 body_src: "by bv_decide".into(),
                 ..buggy_shift_input.clone()
             })
@@ -5075,8 +5129,8 @@ mod tests {
             .is_none());
         assert!(matches!(
             bv_accel.try_accelerate(&AcceleratorInput {
-                decl_name: "ground_word256_not_shr64_cex".into(),
-                stmt_src: ": Word256.shr (Word256.bitNot Word256.zero) 64 = Word256.zero".into(),
+                decl_name: "ground_u256_not_shr64_cex".into(),
+                stmt_src: ": UInt256.shr (UInt256.bitNot UInt256.zero) 64 = UInt256.zero".into(),
                 body_src: "by bv_decide".into(),
                 ..buggy_shift_input.clone()
             }),
@@ -5526,6 +5580,44 @@ mod tests {
     }
 
     #[test]
+    fn test_domain_mutant_emitters_reject_valid_wrappers() {
+        let riscv = SimdRiscvStepCertAccel;
+        let snark = SimdSnarkKernelCertAccel;
+        for stmt in [
+            "(m : Machine) (h : False) : InitE.Certificate m (.finite 10000)",
+            "(m : Machine) : False → InitE.Certificate m (.finite 10000)",
+            "(m : Machine) : False -> InitE.Certificate m (.finite 10000)",
+            "(m : Machine) : InitE.Certificate m (.finite 10000) ∨ True",
+            "(m : Machine) : InitE.Certificate m (.finite 10000) = InitE.Certificate m (.finite 10000)",
+            "(n : Nat) : n <= n + 10000 ∨ InitE.Certificate m (.finite 0)",
+            "(x : F128) (h : False) : gf128_reduce_poly x 0x87 = gf128_reduce_poly x 0x83",
+            "(x : F128) : False → gf128_reduce_poly x 0x87 = gf128_reduce_poly x 0x83",
+            "(x : F128) : gf128_reduce_poly x 0x87 = gf128_reduce_poly x 0x83 ∨ True",
+            "(x : F128) : gf128_reduce_poly x 0x87 = gf128_reduce_poly x 0x87",
+            "(x : F128) : (gf128_reduce_poly x 0x87, gf128_reduce_poly x 0x83) = (gf128_reduce_poly x 0x87, gf128_reduce_poly x 0x83)",
+            "(x : F128) : TriNeon (vextq_u64::<0> x) = TriNeon (vextq_u64::<0> x)",
+        ] {
+            let input = AcceleratorInput {
+                decl_name: "valid_wrapper".into(),
+                stmt_src: stmt.into(),
+                body_src: "by sorry".into(),
+                imports_csv: String::new(),
+                available_constants: vec![],
+                budget_ms: 25,
+            };
+            for certificate in [riscv.try_accelerate(&input), snark.try_accelerate(&input)] {
+                assert!(
+                    !matches!(certificate, Some(AcceleratorCertificate::CounterexampleFound { .. })),
+                    "unexpected refutation of {stmt}: {certificate:?}"
+                );
+            }
+            assert!(crate::gpu_fastcheck::audit_riscv_step_certificate(
+                &input.decl_name, stmt, 0
+            ).is_none());
+        }
+    }
+
+    #[test]
     fn test_simd_riscv_step_cert_accel_distills_spt_and_rejects_tight_k_bound() {
         let rv_accel = SimdRiscvStepCertAccel;
         for (decl, stmt, body, expected) in [
@@ -5615,7 +5707,9 @@ mod tests {
                 "plugins/verity_yul_plugin.py",
                 &AcceleratorInput {
                     decl_name: "mul_div_256".into(),
-                    stmt_src: "(x y d : Uint256) : mulDivDown x y d = mulDivDown y x d".into(),
+                    stmt_src:
+                        "(x y d : UInt256) : UInt256.mulDivDown x y d = UInt256.mulDivDown y x d"
+                            .into(),
                     body_src: "by simp".into(),
                     imports_csv: "Verity.Math".into(),
                     available_constants: vec!["mulDivDown_comm".into()],

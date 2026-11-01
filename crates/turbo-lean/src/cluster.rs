@@ -851,19 +851,23 @@ pub fn auto_fastcheck_batch(
             crate::gpu_fastcheck::try_lnir_fast_reject(decl_name, &formatted_src)
         };
 
-        if let Some((witness, suggested_hyp)) = cex_opt {
-            total_violations += 1;
+        let verified_cex = cex_opt.and_then(|(witness, suggested_hyp)| {
             let (locally_recertified, _, cert_details) =
                 crate::gpu_fastcheck::certify_statement_witness(
                     decl_name,
                     &formatted_src,
                     &witness,
                 );
+            locally_recertified.then_some((witness, suggested_hyp, cert_details))
+        });
+
+        if let Some((witness, suggested_hyp, cert_details)) = verified_cex {
+            total_violations += 1;
             if first_witness.is_none() {
                 first_witness = Some(witness.clone());
                 first_hypothesis = suggested_hyp.clone();
                 first_failing_decl = Some(decl_name.clone());
-                first_certified = locally_recertified;
+                first_certified = true;
             }
             let w_pair = crate::gpu_fastcheck::witness_pair_from_summary(&witness);
             let (lhs_opt, rhs_opt) = w_pair
@@ -873,7 +877,7 @@ pub fn auto_fastcheck_batch(
             let triage_json = crate::c_abi::build_counterexample_triage_json(
                 lhs_opt,
                 rhs_opt,
-                locally_recertified.then_some((suggested_hyp.is_some(), false)),
+                Some((suggested_hyp.is_some(), false)),
             );
             let r_code = lean_cabi_matryoshka_tier_router(50, 120, 380, 0, 1, 0);
             per_decl_results.push(serde_json::json!({
@@ -889,9 +893,9 @@ pub fn auto_fastcheck_batch(
                 "router_action": matryoshka_router_code_to_action(r_code),
                 "cbv_offload_recommended": cbv_offload_recommended,
                 "winning_tactic_hint": "skip_falsified",
-                "locally_recertified": locally_recertified,
-                "certification": cert_details.get("certification").cloned().unwrap_or(serde_json::json!("unavailable")),
-                "false_positives": u8::from(!locally_recertified),
+                "locally_recertified": true,
+                "certification": cert_details.get("certification").cloned().unwrap_or(serde_json::json!("eval")),
+                "false_positives": 0,
             }));
         } else {
             let winning_tactic_hint = if cbv_offload_recommended {
