@@ -161,6 +161,9 @@ pub struct ModuleNode {
     pub src_blake3: String,
     pub direct_dag_deps: Vec<String>,
     pub external_olean_deps: Vec<(String, PathBuf)>,
+    /// Source-less prebuilt `.olean`s among `external_olean_deps` (no replay provenance).
+    #[serde(default)]
+    pub prebuilt_olean_deps: Vec<String>,
     pub expected_all_deps: Vec<String>,
     pub extern_lib_digests: Vec<String>,
     pub pkg_config_digest: String,
@@ -5068,9 +5071,16 @@ pub(crate) fn is_builtin_toolchain_module(toolchain_lib_lean: &Path, mod_name: &
 pub(crate) struct VerifiedDepModuleEntry {
     pub src_blake3: String,
     pub olean_artifact_digest: String,
-    // Old metadata-only audit receipts cannot attest to kernel replay.
-    #[serde(default, rename = "kernel_replayed")]
-    pub kernel_audited: bool,
+    /// `ZYGOTE_REPLAY_VERSION` of the independent kernel replay this artifact passed; `0` for
+    /// entries written before every package's modules were replayed (rejected, fail closed).
+    #[serde(default)]
+    pub replay_version: u32,
+}
+
+impl VerifiedDepModuleEntry {
+    pub(crate) fn kernel_replayed(&self) -> bool {
+        self.replay_version == crate::zygote::ZYGOTE_REPLAY_VERSION
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -5240,7 +5250,8 @@ fn is_dep_olean_fresh(
         .to_string_lossy()
         .replace('\\', "/");
     let entry = manifest.modules.get(&rel_src)?;
-    if spec.is_root_pkg && !entry.kernel_audited {
+    // Every package, not only the root: dependency `.olean`s are imported, never re-checked.
+    if !entry.kernel_replayed() {
         return None;
     }
     let actual_src_hash = blake3::hash(src_content.as_bytes()).to_hex().to_string();
@@ -5663,6 +5674,7 @@ pub fn build_module_dag_with_trust(
             requested_c || spec.precompile_modules || header.has_c_export || global_emit_c;
         let mut direct_dag_deps = Vec::new();
         let mut external_olean_deps = Vec::new();
+        let mut prebuilt_olean_deps = Vec::new();
         for imp in &header.imports {
             if imp == &spec.module_name {
                 anyhow::bail!(
@@ -5735,6 +5747,7 @@ pub fn build_module_dag_with_trust(
                 }
                 if let Some(pb_path) = found_prebuilt {
                     external_olean_deps.push((imp.clone(), pb_path));
+                    prebuilt_olean_deps.push(imp.clone());
                     continue;
                 }
             }
@@ -5750,6 +5763,8 @@ pub fn build_module_dag_with_trust(
         direct_dag_deps.dedup();
         external_olean_deps.sort_by(|a, b| a.0.cmp(&b.0));
         external_olean_deps.dedup_by(|a, b| a.0 == b.0);
+        prebuilt_olean_deps.sort();
+        prebuilt_olean_deps.dedup();
         let rel_slash = module_name_to_rel_slash(&spec.module_name);
         let olean_path = spec.build_lib_lean_dir.join(format!("{}.olean", rel_slash));
         let ilean_path = spec.build_lib_lean_dir.join(format!("{}.ilean", rel_slash));
@@ -5778,6 +5793,7 @@ pub fn build_module_dag_with_trust(
                 src_blake3,
                 direct_dag_deps,
                 external_olean_deps,
+                prebuilt_olean_deps,
                 expected_all_deps: Vec::new(),
                 extern_lib_digests: spec.extern_lib_digests,
                 pkg_config_digest: spec.pkg_config_digest,
@@ -8393,11 +8409,37 @@ fn store_module_artifacts_in_cas(
     Ok(entries)
 }
 
+/// Gate for every compiled or CAS-materialized module before anything may import it: untrusted
+/// builds and root-package modules get the full in-kernel policy audit (which includes the
+/// independent kernel replay); trusted dependency modules get the independent kernel replay.
+/// Toolchain modules never enter the DAG and stay trusted.
+fn audit_or_replay_modules(
+    store: &TurboStore,
+    cfg: &ProjectConfig,
+    dag: &ModuleDag,
+    mod_names: &[String],
+    lean_path_env: &str,
+    is_untrusted: bool,
+) -> Result<()> {
+    let (audit, replay): (Vec<String>, Vec<String>) = mod_names
+        .iter()
+        .cloned()
+        .partition(|m| is_untrusted || dag.nodes.get(m).is_none_or(|n| n.is_root_pkg));
+    crate::zygote::audit_compiled_modules_with_zygote(
+        store,
+        cfg,
+        &audit,
+        lean_path_env,
+        &[],
+        is_untrusted,
+    )?;
+    crate::zygote::kernel_replay_modules_with_zygote(store, cfg, &replay, lean_path_env)
+}
+
 pub(crate) fn record_verified_dep_source(
     cfg: &ProjectConfig,
     node: &ModuleNode,
     olean_artifact_digest: &str,
-    kernel_audited: bool,
 ) {
     let pkg_root = &node.pkg_root;
     let build_dir = pkg_root.join(".lake/build");
@@ -8435,7 +8477,7 @@ pub(crate) fn record_verified_dep_source(
         VerifiedDepModuleEntry {
             src_blake3: node.src_blake3.clone(),
             olean_artifact_digest: olean_artifact_digest.to_string(),
-            kernel_audited,
+            replay_version: crate::zygote::ZYGOTE_REPLAY_VERSION,
         },
     );
     if let Ok(json_bytes) = serde_json::to_vec(&manifest) {
@@ -8547,6 +8589,20 @@ pub fn build_project_modules_native(
             }
         }
     }
+    // Source-less prebuilt `.olean`s have no replay provenance to check: replay them before any
+    // module imports them (fail closed). Manifest-verified externals already carry provenance.
+    let prebuilt: BTreeSet<String> = dag
+        .nodes
+        .values()
+        .flat_map(|n| n.prebuilt_olean_deps.iter().cloned())
+        .collect();
+    crate::zygote::kernel_replay_modules_with_zygote(
+        store,
+        &cfg,
+        &prebuilt.into_iter().collect::<Vec<_>>(),
+        &lean_path_env,
+    )
+    .context("Prebuilt dependency `.olean` failed independent kernel replay")?;
     // Execute topological waves
     for wave in &dag.waves {
         let mut misses_to_compile: Vec<(String, String)> = Vec::new();
@@ -8679,13 +8735,14 @@ pub fn build_project_modules_native(
                     restored
                 };
                 if let Some(dig) = cas_restored_dig_opt {
-                    if is_untrusted || node.is_root_pkg {
-                        let audit_res = crate::zygote::audit_compiled_modules_with_zygote(
+                    // CAS entries carry no replay provenance: every restore is re-audited.
+                    {
+                        let audit_res = audit_or_replay_modules(
                             store,
                             &cfg,
+                            &dag,
                             std::slice::from_ref(mod_name),
                             &lean_path_env,
-                            &[],
                             is_untrusted,
                         );
                         if let Err(audit_err) = audit_res {
@@ -8717,7 +8774,7 @@ pub fn build_project_modules_native(
                             true,
                         )?;
                         if !is_untrusted {
-                            record_verified_dep_source(&cfg, node, &dig, node.is_root_pkg);
+                            record_verified_dep_source(&cfg, node, &dig);
                         }
                     }
                     olean_digests.insert(mod_name.clone(), dig);
@@ -8842,24 +8899,16 @@ pub fn build_project_modules_native(
             }
             return Err(err);
         }
-        let wave_audit_mod_names: Vec<String> = compiled_wave_ok
+        let wave_mod_names: Vec<String> = compiled_wave_ok
             .iter()
-            .filter_map(|(i, _, _, _)| {
-                let mod_name = &misses_to_compile[*i].0;
-                let node = dag.nodes.get(mod_name)?;
-                if is_untrusted || node.is_root_pkg {
-                    Some(mod_name.clone())
-                } else {
-                    None
-                }
-            })
+            .map(|(i, _, _, _)| misses_to_compile[*i].0.clone())
             .collect();
-        if let Err(audit_err) = crate::zygote::audit_compiled_modules_with_zygote(
+        if let Err(audit_err) = audit_or_replay_modules(
             store,
             &cfg,
-            &wave_audit_mod_names,
+            &dag,
+            &wave_mod_names,
             &lean_path_env,
-            &[],
             is_untrusted,
         ) {
             let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
@@ -8914,7 +8963,7 @@ pub fn build_project_modules_native(
                 dur_ms,
             )?;
             if !is_untrusted {
-                record_verified_dep_source(&cfg, node, &dig, node.is_root_pkg);
+                record_verified_dep_source(&cfg, node, &dig);
             }
             olean_digests.insert(mod_name.clone(), dig);
             report.modules_compiled += 1;
@@ -10356,6 +10405,134 @@ lean_exe «demo-exe» where
                 "caller changed (prebuilt={prebuilt})"
             );
         }
+        Ok(())
+    }
+
+    /// Astra r4: a trusted dependency module forging a theorem with `debug.skipKernelTC` must
+    /// not be importable on the fresh-build, CAS-restore, or stale-manifest paths.
+    #[cfg(unix)]
+    #[test]
+    fn test_trusted_dependency_modules_are_kernel_replayed_before_import() -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = make_temp_test_dir("dep_replay");
+        let (proj, dep) = (dir.join("app"), dir.join("app/.lake/packages/dep"));
+        fs::create_dir_all(dep.join("Dep"))?;
+        let toolchain = include_str!("../../../lean/lean-toolchain");
+        fs::write(proj.join("lean-toolchain"), toolchain)?;
+        fs::write(dep.join("lean-toolchain"), toolchain)?;
+        fs::write(
+            dep.join("lakefile.toml"),
+            "name = \"dep\"\n[[lean_lib]]\nname = \"Dep\"\n",
+        )?;
+        fs::write(dep.join("Dep/Bad.lean"), "import Lean\nopen Lean Elab Command Term\nelab \"forge_bad\" : command => liftTermElabM do\n  withOptions (fun o => o.setBool `debug.skipKernelTC true) do\n    Lean.addDecl <| .thmDecl {name := `bad, levelParams := [], type := mkConst ``False, value := mkConst ``True.intro}\nforge_bad\n")?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            r#"{"version": "1.2.0", "packagesDir": ".lake/packages", "packages": [{"type": "path", "name": "dep", "dir": ".lake/packages/dep", "configFile": "lakefile.toml", "inherited": false}], "name": "app", "lakeDir": ".lake", "fixedToolchain": false}"#,
+        )?;
+        fs::write(proj.join("lakefile.toml"), "name = \"app\"\ndefaultTargets = [\"App\"]\n[[require]]\nname = \"dep\"\npath = \".lake/packages/dep\"\n[[lean_lib]]\nname = \"App\"\n")?;
+        fs::write(
+            proj.join("App.lean"),
+            "import Dep.Bad\ntheorem uses_bad : False := bad\n",
+        )?;
+        let mut store = TurboStore::open(Some(&dir.join("cache")))?;
+        let dep_olean = dep.join(".lake/build/lib/lean/Dep/Bad.olean");
+        let manifest_path = dep.join(".lake/build/.turbo_verified_sources.json");
+        let build = |store: &mut TurboStore| {
+            build_project_modules_native(
+                store,
+                &proj,
+                &[],
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .map(|_| ())
+            .unwrap_err()
+            .to_string()
+        };
+        let assert_rejected = |err: &str, path: &str| {
+            assert!(err.contains("Dep.Bad"), "{path}: {err}");
+            assert!(
+                !proj.join(".lake/build/lib/lean/App.olean").exists(),
+                "{path}"
+            );
+            let entry = fs::read(&manifest_path).ok().and_then(|b| {
+                serde_json::from_slice::<VerifiedDepManifest>(&b)
+                    .ok()?
+                    .modules
+                    .remove("Dep/Bad.lean")
+            });
+            assert!(entry.is_none_or(|e| !e.kernel_replayed()), "{path}");
+        };
+        // 1. Fresh build: the compiled dependency is replayed (and rejected) before App imports it.
+        let err = build(&mut store);
+        assert!(err.contains("KernelReplay"), "{err}");
+        assert_rejected(&err, "fresh");
+        // 2. CAS restore of the unreplayed Lake artifacts (as stored before this fix).
+        let lake = Command::new("lake")
+            .args(["build", "Dep.Bad"])
+            .current_dir(&proj)
+            .output()?;
+        anyhow::ensure!(
+            lake.status.success(),
+            "{}",
+            String::from_utf8_lossy(&lake.stderr)
+        );
+        let cfg = resolve_project_config(&proj)?;
+        let dag = build_module_dag_with_trust(&cfg, &[], false)?;
+        let node = &dag.nodes["Dep.Bad"];
+        let key = compute_module_cas_key(&cfg, node, &[], node.needs_c)?;
+        store_module_artifacts_in_cas(
+            &mut store,
+            &proj,
+            node,
+            &key,
+            &cfg.toolchain,
+            "trusted-internal",
+            1,
+            0,
+        )?;
+        fs::remove_dir_all(dep.join(".lake/build"))?;
+        let err = build(&mut store);
+        assert!(err.contains("materialized CAS hit"), "{err}");
+        assert_rejected(&err, "restore");
+        // 3. A manifest entry without current replay provenance never makes the `.olean` fresh.
+        let lake = Command::new("lake")
+            .args(["build", "Dep.Bad"])
+            .current_dir(&proj)
+            .output()?;
+        anyhow::ensure!(
+            lake.status.success(),
+            "{}",
+            String::from_utf8_lossy(&lake.stderr)
+        );
+        let stale = VerifiedDepManifest {
+            pkg_name: node.pkg_name.clone(),
+            toolchain: cfg.toolchain.clone(),
+            lean_githash: cfg.lean_githash.clone(),
+            pkg_config_digest: node.pkg_config_digest.clone(),
+            workspace_config_digest: cfg.canonical_config_digest.clone(),
+            allowed_axioms: crate::splitter::allowed_axioms(),
+            modules: BTreeMap::from([(
+                "Dep/Bad.lean".to_string(),
+                VerifiedDepModuleEntry {
+                    src_blake3: node.src_blake3.clone(),
+                    olean_artifact_digest: compute_olean_artifact_set_digest(&dep_olean)?,
+                    replay_version: 0,
+                },
+            )]),
+        };
+        fs::write(&manifest_path, serde_json::to_vec(&stale)?)?;
+        assert!(build_module_dag_with_trust(&cfg, &[], false)?
+            .nodes
+            .contains_key("Dep.Bad"));
+        assert_rejected(&build(&mut store), "stale manifest");
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
 
