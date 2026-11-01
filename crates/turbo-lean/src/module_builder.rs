@@ -4162,7 +4162,13 @@ fn check_input_file_is_contained_regular_file(canon_pkg_root: &Path, path: &Path
 /// Trust is not plumbed through `resolve_package_config`, so there is nothing to bypass on, and a
 /// same-length write with a restored mtime -- the poisoning the untrusted `ci-verify` test
 /// simulates with `utimensat` -- would be served the cached hash inside one long-lived `serve` or
-/// zygote process. Memoizing per top-level command, cleared at dispatch, would be the safe form.
+/// zygote process.
+///
+/// The repeated-work problem is solved one level up instead, by [`project_lake_inputs_tag`]'s
+/// per-command memo: it is keyed on the project directory alone, with no `(len, mtime)` for a
+/// restored timestamp to fool, and it is cleared at every command and request boundary. Nothing
+/// that gates an `.olean` on a *stat* was reintroduced; this function still re-reads every byte
+/// every time it runs.
 fn hash_input_target(pkg_root: &Path, input: &InputTargetConfig) -> Result<(String, String)> {
     let root = pkg_root.join(checked_input_path(&input.path)?);
     let canon_pkg_root = fs::canonicalize(pkg_root).unwrap_or_else(|_| pkg_root.to_path_buf());
