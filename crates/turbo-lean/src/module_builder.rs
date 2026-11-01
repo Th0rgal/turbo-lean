@@ -4432,7 +4432,7 @@ pub(crate) fn optional_package_config(project_dir: &Path) -> Result<Option<Packa
     {
         return Ok(None);
     }
-    resolve_package_config(project_dir, false)
+    resolve_package_config(project_dir, true)
         .with_context(|| {
             format!(
                 "Failed to resolve Lean options in {}",
@@ -8633,13 +8633,13 @@ struct SourceCompilationRecord {
     workspace_config_digest: String,
     allowed_axioms: Vec<String>,
     scanner_version: u32,
+    is_untrusted: bool,
     replay: DependencyReplayRecord,
 }
 
 impl SourceCompilationRecord {
-    fn new(cfg: &ProjectConfig, file: &Path, module: &str) -> Result<Self> {
-        let lp = lake_build::resolve_remote_lean_path(&cfg.root_pkg.pkg_root, None);
-        let lp = format!("{}:{}", lp, cfg.toolchain_lib_lean.display());
+    fn new(cfg: &ProjectConfig, file: &Path, module: &str, is_untrusted: bool) -> Result<Self> {
+        let (lp, _) = build_lean_search_path(cfg, is_untrusted);
         let imported = resolve_dependency_artifacts(
             vec![module.to_string()],
             &lp,
@@ -8659,6 +8659,7 @@ impl SourceCompilationRecord {
             workspace_config_digest: cfg.canonical_config_digest.clone(),
             allowed_axioms: crate::splitter::allowed_axioms(),
             scanner_version: crate::zygote::ZYGOTE_SCANNER_VERSION,
+            is_untrusted,
             replay: DependencyReplayRecord::new(
                 cfg,
                 module,
@@ -8670,8 +8671,12 @@ impl SourceCompilationRecord {
 }
 
 pub(crate) fn source_compilation_authorized(store: &TurboStore, root: &Path, file: &Path) -> bool {
+    source_compilation_authorized_with_trust(store, root, file, false)
+}
+
+fn source_compilation_authorized_with_trust(store: &TurboStore, root: &Path, file: &Path, is_untrusted: bool) -> bool {
     let lookup = || -> Result<bool> {
-        let cfg = resolve_project_config(root)?;
+        let cfg = resolve_project_config_with_trust(root, is_untrusted)?;
         if !verifier_controls_store(store, &cfg)? {
             return Ok(false);
         }
@@ -8683,7 +8688,7 @@ pub(crate) fn source_compilation_authorized(store: &TurboStore, root: &Path, fil
             |r| r.get(0),
         )?;
         let actual: SourceCompilationRecord = serde_json::from_str(&actual)?;
-        Ok(actual == SourceCompilationRecord::new(&cfg, file, &actual.replay.module)?)
+        Ok(actual == SourceCompilationRecord::new(&cfg, file, &actual.replay.module, is_untrusted)?)
     };
     lookup().unwrap_or(false)
 }
@@ -8693,20 +8698,22 @@ pub(crate) fn require_source_compilations(
 ) -> Result<()> {
     for file in files {
         if file.file_name().is_some_and(|n| n == "lakefile.lean") { continue; }
-        if source_compilation_authorized(store, root, file) { continue; }
+        if source_compilation_authorized_with_trust(store, root, file, is_untrusted) { continue; }
         anyhow::ensure!(!is_untrusted,
             "No verifier-controlled source compilation for {}: fail-closed untrusted source gate", file.display());
         // Checkout-local stores and older CAS entries have no compilation authority.
         // Check the full source now, including files outside the default target closure.
         let source = fs::read_to_string(file)?;
-        crate::splitter::reject_checking_weakening(&source)?;
+        let split = crate::splitter::split_lean_source(&source, &[]);
+        anyhow::ensure!(split.hygiene.is_clean_for_certification(),
+            "Source hygiene violation in {}: {:?}", file.display(), split.hygiene.disallowed_items());
         ensure_imported_oleans_replayed(store, root, std::slice::from_ref(file))?;
         let (lean, _, lib, _) = resolve_toolchain_compiler(root, &lake_build::detect_toolchain(root))?;
         let lp = format!("{}:{}", lake_build::resolve_remote_lean_path(root, None), lib.display());
         let env = HashMap::from([("LEAN_PATH".to_string(), lp)]);
         let pkg = optional_package_config(root)?;
         let args = pkg.as_ref().map(|p| resolve_file_lean_args_in_package(p, file)).unwrap_or_default();
-        let audit = crate::splitter::split_lean_source(&source, &[]).shards.into_iter().map(|sh| sh.name).collect();
+        let audit = split.shards.into_iter().map(|sh| sh.name).collect();
         let out = crate::zygote::run_audited_lean_shard(store, &lean, &env, Some(root), &source, &audit, &args, None)?;
         anyhow::ensure!(out.status.success(), "Source compilation failed for {}: {}{}",
             file.display(), String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
@@ -8720,11 +8727,12 @@ fn record_source_compilation(
     cfg: &ProjectConfig,
     node: &ModuleNode,
     digest: &str,
+    is_untrusted: bool,
 ) -> Result<()> {
     if !node.is_root_pkg || !verifier_controls_store(store, cfg)? {
         return Ok(());
     }
-    let record = SourceCompilationRecord::new(cfg, &node.src_path, &node.module_name)?;
+    let record = SourceCompilationRecord::new(cfg, &node.src_path, &node.module_name, is_untrusted)?;
     anyhow::ensure!(
         record.source_digest == node.src_blake3 && record.replay.artifact_digest == digest,
         "Source or artifact changed during compilation of {}: fail-closed",
@@ -9137,6 +9145,11 @@ pub fn build_project_modules_native(
             // part of the key: restore only onto this node's own (preflighted) artifact paths.
             let cas_hit_outputs =
                 cas_hit_outputs.filter(|o| cas_outputs_bound_to_node(o, target_root, node));
+            // A cache artifact audit does not establish source compilation provenance.
+            // In untrusted mode recompile a cold source record inside bwrap instead of
+            // permitting a host-side fallback; opt-out still fails closed before writes.
+            let cas_hit_outputs = cas_hit_outputs.filter(|_| !is_untrusted || !node.is_root_pkg
+                || source_compilation_authorized_with_trust(store, &canon_dir, &node.src_path, true));
             if let Some(outputs) = cas_hit_outputs {
                 // The invocation's project policy also covers external package roots.
                 // Keep cache-hit validation/auditing, but do not erase artifacts or
@@ -9421,7 +9434,7 @@ pub fn build_project_modules_native(
             if !is_untrusted {
                 record_verified_dep_source(&cfg, node, &dig);
             }
-            record_source_compilation(store, &cfg, node, &dig)?;
+            record_source_compilation(store, &cfg, node, &dig, is_untrusted)?;
             olean_digests.insert(mod_name.clone(), dig);
             report.modules_compiled += 1;
             report.compiled_modules.push(mod_name.clone());
@@ -10805,7 +10818,7 @@ lean_exe «demo-exe» where
                 &mut store,
                 &caller,
                 &targets,
-                "trusted-internal",
+                "trusted",
                 1,
                 false,
                 true,
@@ -10834,7 +10847,7 @@ lean_exe «demo-exe» where
                 &mut store,
                 &caller,
                 &targets,
-                "trusted-internal",
+                "trusted",
                 1,
                 false,
                 true,
@@ -10847,7 +10860,7 @@ lean_exe «demo-exe» where
                 true,
                 targets,
                 caller.clone(),
-                "trusted-internal".to_string(),
+                "trusted".to_string(),
                 1,
                 false,
             )?;
@@ -10912,6 +10925,8 @@ lean_exe «demo-exe» where
         )?;
         assert!(receipt.exists());
         fs::remove_file(&receipt)?;
+        let err = require_source_compilations(&store, &tree.project, std::slice::from_ref(&target), true).unwrap_err();
+        assert!(format!("{err:#}").contains("fail-closed untrusted source gate"));
         // A valid unrelated artifact cannot authorize changed proof source.
         let source = fs::read(&target)?;
         fs::write(&target, "theorem bad : False := by trivial\n")?;
@@ -11930,7 +11945,7 @@ lean_exe «demo-exe» where
             &mut store,
             &proj_dir,
             &[],
-            "trusted-internal",
+            "trusted",
             1,
             false,
             true,
@@ -11947,7 +11962,7 @@ lean_exe «demo-exe» where
             false,
             Vec::new(),
             proj_dir.clone(),
-            "trusted-internal".to_string(),
+            "trusted".to_string(),
             1,
             false,
         )

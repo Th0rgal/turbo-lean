@@ -2560,7 +2560,7 @@ pub(crate) fn seed_project_theorem_shards_from_splits(
             .filter(|(_, _, sp)| sp.shards.iter().any(|sh| seedable(sp, sh)))
             .map(|(p, _, _)| p.clone())
             .collect::<Vec<_>>(),
-        trust_domain == "untrusted",
+        trust_domain != "trusted",
     )?;
     for (lf, _src, split) in split_entries {
         if require_olean && resolve_prebuilt_module_import(store, canon_dir, lf).is_none() {
@@ -3071,6 +3071,8 @@ pub fn run_build_command(
     pin_level: i64,
     seed_shards: bool,
 ) -> Result<()> {
+    anyhow::ensure!(trust_domain == "trusted",
+        "Untrusted build requires `ci-verify --mode untrusted`: fail-closed build gate");
     let t0 = Instant::now();
     let canon_dir = project_dir
         .canonicalize()
@@ -3149,7 +3151,7 @@ pub fn run_build_command(
                     store,
                     &canon_dir,
                     &collect_lean_files(&canon_dir),
-                    trust_domain == "untrusted",
+                    trust_domain != "trusted",
                 )
                 .is_err()
             {
@@ -3159,7 +3161,7 @@ pub fn run_build_command(
                     &targets,
                     &trust_domain,
                     pin_level,
-                    false,
+                    trust_domain != "trusted",
                     json_output,
                     Some(&file_hashes),
                 )?;
@@ -3482,6 +3484,14 @@ mod tests {
             &mut store, &project, "test", "trusted", false, &splits,
         )?, (1, 1));
         assert!(store.has_cached_action_readonly(&key, "trusted")?);
+        let err = seed_project_theorem_shards_from_splits(
+            &mut store, &project, "test", "untrusted:fixture", false, &splits,
+        ).unwrap_err();
+        assert!(format!("{err:#}").contains("fail-closed untrusted source gate"));
+        assert!(!store.has_cached_action_readonly(&key, "untrusted:fixture")?);
+        let err = run_build_command(&mut store, true, vec![], project.clone(), "untrusted:fixture".into(), 1, true).unwrap_err();
+        assert!(format!("{err:#}").contains("fail-closed build gate"));
+
         fs::remove_dir_all(dir)?;
         Ok(())
     }
