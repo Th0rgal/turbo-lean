@@ -11023,14 +11023,15 @@ lean_exe «demo-exe» where
             &tree.project,
             &target
         ));
-        // Checkout-local stores cannot persist authority. A sandboxed compile is
-        // nevertheless authoritative within this verifier process, with full revalidation.
+        // Checkout-local stores cannot persist authority. Current-process compilation
+        // remains evidence in memory, with the same full revalidation on every read.
         let mut local = TurboStore::open(Some(&tree.project.join(".source-cache")))?;
-        let build = |store: &mut TurboStore| build_project_modules_native(
-            store, &tree.project, &[], "untrusted:fixture", 1, true, true, None,
+        let build = |store: &mut TurboStore, untrusted| build_project_modules_native(
+            store, &tree.project, &[], if untrusted { "untrusted:fixture" } else { "trusted" },
+            1, untrusted, true, None,
         );
-        assert_eq!(build(&mut local)?.modules_compiled, 1);
-        require_source_compilations(&local, &tree.project, std::slice::from_ref(&target), true)?;
+        assert_eq!(build(&mut local, false)?.modules_compiled, 1);
+        require_source_compilations(&local, &tree.project, std::slice::from_ref(&target), false)?;
         let tables: i64 = local.conn.query_row(
             "SELECT count(*) FROM sqlite_master WHERE name = 'source_kernel_compilations'", [], |r| r.get(0),
         )?;
@@ -11039,8 +11040,23 @@ lean_exe «demo-exe» where
             .remove(&(local.root.canonicalize()?, target.canonicalize()?));
         assert!(!source_compilation_authorized_with_trust(&local, &tree.project, &target, true));
         assert!(require_source_compilations(&local, &tree.project, std::slice::from_ref(&target), true).is_err());
-        assert_eq!(build(&mut local)?.modules_compiled, 1, "cold untrusted module-unit cache must recompile in bwrap");
-        require_source_compilations(&local, &tree.project, std::slice::from_ref(&target), true)?;
+        match build(&mut local, true) {
+            Ok(report) => {
+                assert_eq!(report.modules_compiled, 1);
+                require_source_compilations(&local, &tree.project, std::slice::from_ref(&target), true)?;
+                SOURCE_COMPILATION_MEMORY.get().unwrap().lock().unwrap()
+                    .remove(&(local.root.canonicalize()?, target.canonicalize()?));
+                assert_eq!(build(&mut local, true)?.modules_compiled, 1,
+                    "cold untrusted module-unit cache must recompile in bwrap");
+                require_source_compilations(&local, &tree.project, std::slice::from_ref(&target), true)?;
+            }
+            Err(err) => {
+                assert!(probe_bwrap_sandbox().is_none(), "{err:#}");
+                assert!(format!("{err:#}").contains("fail-closed sandbox gate"), "{err:#}");
+                assert!(!source_compilation_authorized_with_trust(&local, &tree.project, &target, true));
+                assert!(require_source_compilations(&local, &tree.project, std::slice::from_ref(&target), true).is_err());
+            }
+        }
         Ok(())
     }
 
