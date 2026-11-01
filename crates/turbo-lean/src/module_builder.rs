@@ -6225,18 +6225,130 @@ pub(crate) fn compute_replayed_olean_ilean_digest(olean_path: &Path) -> Result<S
     }
 }
 
+pub(crate) fn project_disallowed_replay_store_roots(cfg: &ProjectConfig) -> Vec<PathBuf> {
+    let mut roots = Vec::with_capacity(1 + cfg.dep_pkgs.len() + cfg.manifest_packages.len());
+    roots.push(cfg.root_pkg.pkg_root.clone());
+    for dp in &cfg.dep_pkgs {
+        roots.push(dp.pkg_root.clone());
+    }
+    for mp in &cfg.manifest_packages {
+        roots.push(mp.dir.clone());
+    }
+    roots
+}
+
+/// Compute the deterministic transitive binary import environment digest for `olean_path` along
+/// `lean_path_env` (plus `cfg.toolchain_lib_lean`), binding every reachable non-toolchain `.olean`
+/// (with `.ilean`/companion files via `compute_replayed_olean_ilean_digest`) and marking verified
+/// toolchain modules by `(module_name, cfg.lean_githash)` while failing closed (`Err`) if any
+/// binary import is unresolvable or unreadable. Because every imported non-toolchain artifact's
+/// full content digest is folded into `environment_digest`, modifying a child module's interface
+/// immediately invalidates the parent module's replay authority even when the parent `.olean` bytes
+/// were left untouched on disk.
+pub(crate) fn compute_olean_transitive_env_digest(
+    cfg: &ProjectConfig,
+    lean_path_env: &str,
+    olean_path: &Path,
+) -> Result<String> {
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(lean_path_env).collect();
+    if !cfg.toolchain_lib_lean.as_os_str().is_empty() && !dirs.contains(&cfg.toolchain_lib_lean) {
+        dirs.push(cfg.toolchain_lib_lean.clone());
+    }
+    let root_bytes = fs::read(olean_path).with_context(|| {
+        format!(
+            "Failed to read `.olean` `{}` for transitive replay environment digest",
+            olean_path.display()
+        )
+    })?;
+    let (root_imps, _) = parse_olean_binary_imports(&root_bytes).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Failed to parse binary `.olean` header of `{}`: fail-closed",
+            olean_path.display()
+        )
+    })?;
+    let mut worklist: Vec<String> = root_imps.into_iter().map(|i| i.module).collect();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut resolved_non_tc: BTreeMap<String, String> = BTreeMap::new();
+    let mut resolved_tc: BTreeSet<String> = BTreeSet::new();
+    while let Some(m) = worklist.pop() {
+        if !seen.insert(m.clone()) {
+            continue;
+        }
+        let rel = format!("{}.olean", module_name_to_rel_slash(&m));
+        let path = dirs
+            .iter()
+            .map(|d| d.join(&rel))
+            .find(|p| p.is_file())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Unresolvable binary import `{}` required by `{}` along LEAN_PATH: fail-closed",
+                    m,
+                    olean_path.display()
+                )
+            })?;
+        if is_verified_toolchain_olean_file(&cfg.toolchain_lib_lean, Some(&cfg.lean_githash), &path)
+        {
+            resolved_tc.insert(m);
+            continue;
+        }
+        let dep_dig = compute_replayed_olean_ilean_digest(&path)?;
+        let dep_bytes = fs::read(&path).with_context(|| {
+            format!(
+                "Failed to read imported `.olean` `{}` for transitive replay environment digest",
+                path.display()
+            )
+        })?;
+        let (sub_imps, _) = parse_olean_binary_imports(&dep_bytes).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Failed to parse binary `.olean` header of imported `{}` (`{}`): fail-closed",
+                m,
+                path.display()
+            )
+        })?;
+        worklist.extend(sub_imps.into_iter().map(|i| i.module));
+        resolved_non_tc.insert(m, dep_dig);
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(b"turbo-lean-olean-transitive-env-v1\n");
+    update_lp(&mut h, b"githash", cfg.lean_githash.as_bytes());
+    h.update(&(resolved_tc.len() as u64).to_le_bytes());
+    for tc_m in &resolved_tc {
+        update_lp(&mut h, b"tc", tc_m.as_bytes());
+    }
+    h.update(&(resolved_non_tc.len() as u64).to_le_bytes());
+    for (dep_m, dep_dig) in &resolved_non_tc {
+        update_lp(&mut h, b"dep_mod", dep_m.as_bytes());
+        update_lp(&mut h, b"dep_dig", dep_dig.as_bytes());
+    }
+    Ok(h.finalize().to_hex().to_string())
+}
+
 pub(crate) fn is_olean_replayed_in_store(
     store: &TurboStore,
-    lean_githash: &str,
+    cfg: &ProjectConfig,
+    lean_path_env: &str,
     olean_path: &Path,
 ) -> bool {
-    if lean_githash.is_empty() {
+    if cfg.lean_githash.is_empty() {
+        return false;
+    }
+    let disallowed_roots = project_disallowed_replay_store_roots(cfg);
+    if !store.is_store_outside_disallowed_roots(&disallowed_roots) {
         return false;
     }
     let Ok(dig) = compute_replayed_olean_ilean_digest(olean_path) else {
         return false;
     };
-    store.has_kernel_replayed_olean(&dig, crate::zygote::ZYGOTE_REPLAY_VERSION, lean_githash)
+    let Ok(env_dig) = compute_olean_transitive_env_digest(cfg, lean_path_env, olean_path) else {
+        return false;
+    };
+    store.has_kernel_replayed_olean(
+        &dig,
+        &env_dig,
+        crate::zygote::ZYGOTE_REPLAY_VERSION,
+        &cfg.lean_githash,
+        &disallowed_roots,
+    )
 }
 
 /// Compute the per-module CAS action key (`module_unit`), incorporating:
@@ -8656,13 +8768,13 @@ pub(crate) fn ensure_imported_oleans_replayed_with_roots(
         "Cannot kernel-replay imported `.olean`s without a resolvable project configuration: fail-closed",
     )?;
     let mut pending = Vec::new();
+    let replay_lp = format!("{}:{}", lean_path, cfg.toolchain_lib_lean.display());
     for (m, path) in &imported {
-        if !is_olean_replayed_in_store(store, &cfg.lean_githash, path) {
+        if !is_olean_replayed_in_store(store, &cfg, &replay_lp, path) {
             pending.push(m.clone());
         }
     }
     if !pending.is_empty() {
-        let replay_lp = format!("{}:{}", lean_path, cfg.toolchain_lib_lean.display());
         crate::zygote::kernel_replay_modules_with_zygote(store, &cfg, &pending, &replay_lp)
             .context("Imported `.olean` failed independent kernel replay")?;
     }
@@ -8826,7 +8938,7 @@ pub fn build_project_modules_native(
                 let d = compute_olean_artifact_set_digest_with_policy(ext_path, preserve_project)?;
                 olean_digests.insert(ext_mod.clone(), d);
             }
-            if !is_olean_replayed_in_store(store, &cfg.lean_githash, ext_path) {
+            if !is_olean_replayed_in_store(store, &cfg, &lean_path_env, ext_path) {
                 unverified_external_deps.insert(ext_mod.clone());
             }
         }
@@ -10700,8 +10812,9 @@ lean_exe «demo-exe» where
                 "{path}"
             );
             let cfg = resolve_project_config(&proj).unwrap();
+            let (lp_env, _) = build_lean_search_path(&cfg, false);
             assert!(
-                !is_olean_replayed_in_store(store, &cfg.lean_githash, &dep_olean),
+                !is_olean_replayed_in_store(store, &cfg, &lp_env, &dep_olean),
                 "{path}: forged `.olean` must never gain store DB replay authority"
             );
         };
@@ -13064,5 +13177,243 @@ roots = ["Fast"]
         .unwrap();
         parse_lakefile_toml(&dir, &tf, false).unwrap();
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_raw_sqlite_replay_row_and_checkout_local_store_never_suppress_kernel_replay() -> Result<()> {
+        let _env_guard = BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = make_temp_test_dir("replay_sqlite_mac_and_local_store");
+        let toolchain = "leanprover/lean4:v4.35.0\n";
+        let Ok((lean_bin, _, _, _)) = resolve_toolchain_compiler(&dir, toolchain.trim()) else {
+            let _ = fs::remove_dir_all(&dir);
+            return Ok(());
+        };
+        if !lean_bin.is_file() {
+            let _ = fs::remove_dir_all(&dir);
+            return Ok(());
+        }
+        let proj = dir.join("proj");
+        let dep = proj.join(".lake/packages/dep");
+        fs::create_dir_all(dep.join("Dep"))?;
+        fs::write(proj.join("lean-toolchain"), toolchain)?;
+        fs::write(dep.join("lean-toolchain"), toolchain)?;
+        let bad_src = "import Lean\nopen Lean Elab Command\nelab \"forge_bad\" : command => do\n  let k := Name.mkStr (Name.mkStr .anonymous \"debug\") (\"skip\" ++ \"KernelTC\")\n  withScope (fun sc => { sc with opts := sc.opts.setBool k true }) do\n    liftCoreM <| addDecl <| .thmDecl {\n      name := `bad, levelParams := [], type := mkConst ``False, value := mkConst ``True.intro }\nforge_bad\n";
+        fs::write(dep.join("Dep/Bad.lean"), bad_src)?;
+        fs::write(
+            dep.join("lakefile.toml"),
+            "name = \"dep\"\n[[lean_lib]]\nname = \"Dep\"\n",
+        )?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"app\"\ndefaultTargets = [\"App\"]\n[[require]]\nname = \"dep\"\npath = \".lake/packages/dep\"\n[[lean_lib]]\nname = \"App\"\n",
+        )?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            r#"{"version": "1.2.0", "packagesDir": ".lake/packages", "packages": [{"type": "path", "name": "dep", "dir": ".lake/packages/dep", "configFile": "lakefile.toml", "inherited": false}], "name": "app", "lakeDir": ".lake", "fixedToolchain": false}"#,
+        )?;
+        fs::write(
+            proj.join("App.lean"),
+            "import Dep.Bad\ntheorem uses_bad : False := bad\n",
+        )?;
+        let lake_bin = lean_bin.parent().expect("lean bin parent").join("lake");
+        let lake_out = Command::new(&lake_bin)
+            .args(["build", "Dep.Bad"])
+            .current_dir(&proj)
+            .env("SANDBOXED_ALLOW_RAW_LAKE", "1")
+            .output()?;
+        anyhow::ensure!(
+            lake_out.status.success(),
+            "lake build Dep.Bad: {}",
+            String::from_utf8_lossy(&lake_out.stderr)
+        );
+        let cfg = resolve_project_config(&proj)?;
+        let dep_cfg = &cfg.dep_pkgs[0];
+        let dep_olean = dep.join(".lake/build/lib/lean/Dep/Bad.olean");
+        let forged_manifest = serde_json::json!({
+            "pkg_name": dep_cfg.name,
+            "toolchain": cfg.toolchain,
+            "lean_githash": cfg.lean_githash,
+            "pkg_config_digest": dep_cfg.config_digest,
+            "workspace_config_digest": cfg.canonical_config_digest,
+            "allowed_axioms": crate::splitter::allowed_axioms(),
+            "modules": {
+                "Dep/Bad.lean": {
+                    "src_blake3": blake3::hash(bad_src.as_bytes()).to_hex().to_string(),
+                    "olean_artifact_digest": compute_olean_artifact_set_digest(&dep_olean)?,
+                }
+            }
+        });
+        fs::write(
+            dep.join(".lake/build/.turbo_verified_sources.json"),
+            serde_json::to_vec(&forged_manifest)?,
+        )?;
+        let (lp_env, _) = build_lean_search_path(&cfg, false);
+        let art_dig = compute_replayed_olean_ilean_digest(&dep_olean)?;
+        let env_dig = compute_olean_transitive_env_digest(&cfg, &lp_env, &dep_olean)?;
+
+        // 1. External verifier store with raw SQLite row insertion into both `kernel_replayed_oleans`
+        // and `kernel_replayed_oleans_auth` (forged MAC): `check` and `build` MUST still run
+        // independent kernel replay and reject `Dep.Bad` (`KernelReplay`)!
+        let mut ext_store = TurboStore::open(Some(&dir.join("external_cache")))?;
+        ext_store.conn.execute(
+            "INSERT INTO kernel_replayed_oleans (artifact_digest, replay_version, toolchain_hash, module_name, verified_at)
+             VALUES (?1, ?2, ?3, 'Dep.Bad', 1)",
+            rusqlite::params![
+                &art_dig,
+                i64::from(crate::zygote::ZYGOTE_REPLAY_VERSION),
+                &cfg.lean_githash
+            ],
+        )?;
+        ext_store.conn.execute(
+            "INSERT INTO kernel_replayed_oleans_auth (artifact_digest, environment_digest, replay_version, toolchain_hash, module_name, replay_mac, verified_at)
+             VALUES (?1, ?2, ?3, ?4, 'Dep.Bad', 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff', 1)",
+            rusqlite::params![
+                &art_dig,
+                &env_dig,
+                i64::from(crate::zygote::ZYGOTE_REPLAY_VERSION),
+                &cfg.lean_githash
+            ],
+        )?;
+        assert!(
+            !is_olean_replayed_in_store(&ext_store, &cfg, &lp_env, &dep_olean),
+            "unauthenticated SQLite row must never grant replay authority"
+        );
+        let check_err = crate::check::evaluate_check_command_value(
+            &mut ext_store,
+            proj.join("App.lean"),
+            None,
+            proj.clone(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{check_err:#}").contains("KernelReplay"),
+            "raw SQLite row suppressed check kernel replay: {check_err:#}"
+        );
+        let build_err = build_project_modules_native(
+            &mut ext_store,
+            &proj,
+            &[],
+            "trusted-internal",
+            1,
+            false,
+            true,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{build_err:#}").contains("KernelReplay"),
+            "raw SQLite row suppressed native build kernel replay: {build_err:#}"
+        );
+
+        // 2. Checkout-local store (`proj/.turbo-cache`): even if an attacker writes a valid 0600
+        // `.verifier_replay_hmac_key` AND valid keyed MAC inside the checkout, checkout-local stores
+        // are rejected as replay authority and kernel replay still executes and rejects `Dep.Bad`!
+        let local_cache = proj.join(".turbo-cache");
+        let mut local_store = TurboStore::open(Some(&local_cache))?;
+        let attacker_key = [0x42u8; 32];
+        let key_path = local_cache.join(".verifier_replay_hmac_key");
+        fs::write(&key_path, attacker_key)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
+        }
+        let mut mac_msg = Vec::new();
+        mac_msg.extend_from_slice(b"turbo-lean-verifier-replay-mac-v1\n");
+        mac_msg.extend_from_slice(&(art_dig.len() as u64).to_le_bytes());
+        mac_msg.extend_from_slice(art_dig.as_bytes());
+        mac_msg.extend_from_slice(&(env_dig.len() as u64).to_le_bytes());
+        mac_msg.extend_from_slice(env_dig.as_bytes());
+        mac_msg.extend_from_slice(&crate::zygote::ZYGOTE_REPLAY_VERSION.to_le_bytes());
+        mac_msg.extend_from_slice(&(cfg.lean_githash.len() as u64).to_le_bytes());
+        mac_msg.extend_from_slice(cfg.lean_githash.as_bytes());
+        let attacker_mac = blake3::keyed_hash(&attacker_key, &mac_msg).to_hex().to_string();
+        local_store.conn.execute(
+            "INSERT INTO kernel_replayed_oleans_auth (artifact_digest, environment_digest, replay_version, toolchain_hash, module_name, replay_mac, verified_at)
+             VALUES (?1, ?2, ?3, ?4, 'Dep.Bad', ?5, 1)",
+            rusqlite::params![
+                &art_dig,
+                &env_dig,
+                i64::from(crate::zygote::ZYGOTE_REPLAY_VERSION),
+                &cfg.lean_githash,
+                &attacker_mac
+            ],
+        )?;
+        assert!(
+            !is_olean_replayed_in_store(&local_store, &cfg, &lp_env, &dep_olean),
+            "checkout-local store must never be accepted as replay authority"
+        );
+        let local_check_err = crate::check::evaluate_check_command_value(
+            &mut local_store,
+            proj.join("App.lean"),
+            None,
+            proj.clone(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{local_check_err:#}").contains("KernelReplay"),
+            "checkout-local store suppressed kernel replay: {local_check_err:#}"
+        );
+
+        // 3. Transitive import environment binding: if `Mid` imports `Base` (`def k : Nat := 1`)
+        // and `Mid` is genuinely replayed & MAC-authenticated in `ext_store`, modifying `Base`'s
+        // `.olean` on disk immediately invalidates `Mid`'s replay authority (`env_dig` changes)
+        // even when `Mid.olean` bytes themselves are untouched!
+        let env_proj = dir.join("env_proj");
+        fs::create_dir_all(env_proj.join("Pkg"))?;
+        fs::write(env_proj.join("lean-toolchain"), toolchain)?;
+        fs::write(
+            env_proj.join("lakefile.toml"),
+            "name = \"env_proj\"\ndefaultTargets = [\"Pkg\"]\n[[lean_lib]]\nname = \"Pkg\"\nroots = [\"Pkg.Base\", \"Pkg.Mid\"]\n",
+        )?;
+        fs::write(env_proj.join("Pkg/Base.lean"), "def k : Nat := 1\n")?;
+        fs::write(
+            env_proj.join("Pkg/Mid.lean"),
+            "import Pkg.Base\ntheorem mid_ok : k = 1 := rfl\n",
+        )?;
+        build_project_modules_native(
+            &mut ext_store,
+            &env_proj,
+            &[],
+            "trusted-internal",
+            1,
+            false,
+            true,
+            None,
+        )?;
+        let env_cfg = resolve_project_config(&env_proj)?;
+        let (env_lp, _) = build_lean_search_path(&env_cfg, false);
+        let mid_olean = env_proj.join(".lake/build/lib/lean/Pkg/Mid.olean");
+        let base_olean = env_proj.join(".lake/build/lib/lean/Pkg/Base.olean");
+        assert!(
+            is_olean_replayed_in_store(&ext_store, &env_cfg, &env_lp, &mid_olean),
+            "freshly audited Mid.olean must hold authenticated replay authority under Base v1"
+        );
+        fs::write(env_proj.join("Pkg/Base.lean"), "def k : Nat := 2\n")?;
+        let recompile_base = Command::new(&env_cfg.lean_bin)
+            .arg("-R")
+            .arg(&env_proj)
+            .arg(env_proj.join("Pkg/Base.lean"))
+            .arg("-o")
+            .arg(&base_olean)
+            .arg("-i")
+            .arg(base_olean.with_extension("ilean"))
+            .current_dir(&env_proj)
+            .env("LEAN_PATH", &env_lp)
+            .output()?;
+        anyhow::ensure!(
+            recompile_base.status.success(),
+            "lean Base.lean v2: {}",
+            String::from_utf8_lossy(&recompile_base.stderr)
+        );
+        assert!(
+            !is_olean_replayed_in_store(&ext_store, &env_cfg, &env_lp, &mid_olean),
+            "editing child Base.olean must invalidate parent Mid.olean replay authority"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
     }
 }

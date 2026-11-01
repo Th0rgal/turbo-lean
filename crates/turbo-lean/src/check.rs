@@ -284,7 +284,12 @@ fn stateless_imports_replayed_in_store(
         ) {
             continue;
         }
-        if !crate::module_builder::is_olean_replayed_in_store(ro_store, &cfg.lean_githash, &path) {
+        if !crate::module_builder::is_olean_replayed_in_store(
+            ro_store,
+            &cfg,
+            local_lean_path,
+            &path,
+        ) {
             return false;
         }
         let Ok(bytes) = fs::read(&path) else {

@@ -1811,7 +1811,8 @@ pub(crate) fn are_all_project_oleans_replayed_in_store(
         if olean_path.is_file() {
             if !crate::module_builder::is_olean_replayed_in_store(
                 store,
-                &cfg.lean_githash,
+                &cfg,
+                &lean_path,
                 &olean_path,
             ) {
                 return false;
@@ -1839,7 +1840,7 @@ pub(crate) fn are_all_project_oleans_replayed_in_store(
         ) {
             continue;
         }
-        if !crate::module_builder::is_olean_replayed_in_store(store, &cfg.lean_githash, &path) {
+        if !crate::module_builder::is_olean_replayed_in_store(store, &cfg, &lean_path, &path) {
             return false;
         }
         let Ok(bytes) = fs::read(&path) else {
@@ -1920,7 +1921,7 @@ pub(crate) fn ensure_project_and_imported_oleans_replayed_in_store(
     let replay_lp = format!("{}:{}", lean_path, cfg.toolchain_lib_lean.display());
     let mut pending_deps = Vec::new();
     for (m, path) in &dep_mods {
-        if !crate::module_builder::is_olean_replayed_in_store(store, &cfg.lean_githash, path) {
+        if !crate::module_builder::is_olean_replayed_in_store(store, &cfg, &replay_lp, path) {
             pending_deps.push(m.clone());
         }
     }
@@ -1930,7 +1931,7 @@ pub(crate) fn ensure_project_and_imported_oleans_replayed_in_store(
     }
     let mut pending_roots = Vec::new();
     for (m, path) in &root_mods {
-        if !crate::module_builder::is_olean_replayed_in_store(store, &cfg.lean_githash, path) {
+        if !crate::module_builder::is_olean_replayed_in_store(store, &cfg, &replay_lp, path) {
             pending_roots.push(m.clone());
         }
     }
@@ -2161,10 +2162,10 @@ pub(crate) fn resolve_replayed_prebuilt_module_import(
     let (mod_name, olean_path) =
         resolve_prebuilt_module_import_with_path(canon_project_dir, canon_file)?;
     let cfg = crate::module_builder::resolve_project_config(canon_project_dir).ok()?;
-    if !crate::module_builder::is_olean_replayed_in_store(store, &cfg.lean_githash, &olean_path) {
+    let lean_path = resolve_remote_lean_path(canon_project_dir, None);
+    if !crate::module_builder::is_olean_replayed_in_store(store, &cfg, &lean_path, &olean_path) {
         return None;
     }
-    let lean_path = resolve_remote_lean_path(canon_project_dir, None);
     let mut dirs: Vec<PathBuf> = std::env::split_paths(&lean_path).collect();
     if !cfg.toolchain_lib_lean.as_os_str().is_empty() && !dirs.contains(&cfg.toolchain_lib_lean) {
         dirs.push(cfg.toolchain_lib_lean.clone());
@@ -2186,7 +2187,7 @@ pub(crate) fn resolve_replayed_prebuilt_module_import(
         ) {
             continue;
         }
-        if !crate::module_builder::is_olean_replayed_in_store(store, &cfg.lean_githash, &path) {
+        if !crate::module_builder::is_olean_replayed_in_store(store, &cfg, &lean_path, &path) {
             return None;
         }
         let sub_bytes = fs::read(&path).ok()?;

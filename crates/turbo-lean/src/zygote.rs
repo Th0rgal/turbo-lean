@@ -3315,6 +3315,7 @@ fn record_replayed_modules_in_store(
     mod_names: &[String],
     lean_path_env: &str,
 ) -> Result<()> {
+    let disallowed_roots = crate::module_builder::project_disallowed_replay_store_roots(cfg);
     let dirs: Vec<PathBuf> = std::env::split_paths(lean_path_env).collect();
     for m in mod_names {
         let rel_slash = crate::module_builder::module_name_to_rel_slash(m);
@@ -3336,11 +3337,24 @@ fn record_replayed_modules_in_store(
                     m
                 )
             })?;
+        let env_dig = crate::module_builder::compute_olean_transitive_env_digest(
+            cfg,
+            lean_path_env,
+            &olean_path,
+        )
+        .with_context(|| {
+            format!(
+                "Failed to compute post-replay transitive import environment digest for `{}`",
+                m
+            )
+        })?;
         store.record_kernel_replayed_olean(
             &dig,
+            &env_dig,
             ZYGOTE_REPLAY_VERSION,
             &cfg.lean_githash,
             m,
+            &disallowed_roots,
         )?;
     }
     Ok(())
