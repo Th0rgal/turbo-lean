@@ -8456,7 +8456,7 @@ pub fn build_module_dag_with_trust(
                     }
                     if let Some(pkg) = std::iter::once(&cfg.root_pkg)
                         .chain(&cfg.dep_pkgs)
-                        .find(|p| p.name == node.pkg_name)
+                        .find(|p| p.pkg_root == node.pkg_root)
                     {
                         if !pkg.extern_libs.is_empty() {
                             let _ = c_abi::verify_static_lake_config(true, true, false, false);
@@ -17766,6 +17766,43 @@ root = "Main"
             )
             .is_err(),
             "worklist re-hit promoting `needs_co_export` must enforce `native_unsupported` gate"
+        );
+
+        // Duplicate `origName` (`p.name == "cas_proj"`) across packages must resolve `extern_lib`
+        // per `pkg_root`: `shadow_dep` declaring `extern_lib` must reject `@shadow_dep/+DepMod:dynlib`
+        // even when root `cas_proj` has no `extern_lib`, and must NOT reject `+RootMod:dynlib` when
+        // reversed.
+        fs::write(
+            cas_proj.join("lakefile.toml"),
+            "name = \"cas_proj\"\n[[require]]\nname = \"shadow_dep\"\npath = \"deps/shadow_dep\"\n[[lean_lib]]\nname = \"SharedTarget\"\nroots = [\"RootMod\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            shadow_dep.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage cas_proj\nextern_lib native_ext pkg := do\n  return .nil\nlean_lib SharedTarget where\n  roots := #[`DepMod]\n",
+        )
+        .unwrap();
+        let _ = fs::remove_file(shadow_dep.join("lakefile.toml"));
+        fs::write(
+            cas_proj.join("lake-manifest.json"),
+            r#"{
+  "version": "1.1.0",
+  "packagesDir": ".lake/packages",
+  "packages": [
+    {"type": "path", "scope": "", "name": "shadow_dep", "inherited": false, "dir": "deps/shadow_dep", "configFile": "lakefile.lean"}
+  ]
+}
+"#,
+        )
+        .unwrap();
+        let dup_ext_cfg = resolve_project_config(&cas_proj).unwrap();
+        assert!(
+            build_module_dag(&dup_ext_cfg, &["+DepMod:dynlib".into()]).is_err(),
+            "dep sharing `origName` with root must still fail closed on its own `extern_lib` when building `:dynlib`"
+        );
+        assert!(
+            build_module_dag(&dup_ext_cfg, &["+RootMod:dynlib".into()]).is_ok(),
+            "root sharing `origName` with `extern_lib` dep must not be spuriously rejected when root has no `extern_lib`"
         );
 
         let _ = fs::remove_dir_all(&dir);
