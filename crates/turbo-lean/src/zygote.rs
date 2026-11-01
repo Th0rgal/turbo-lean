@@ -1055,6 +1055,8 @@ pub struct ZygoteWorkerProcess {
     stdout: BufReader<std::process::ChildStdout>,
     stderr_tail: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     stderr_scan: std::sync::Arc<StderrScan>,
+    #[cfg(target_os = "linux")]
+    pinned_snapshot_dir: Option<(u64, u64)>,
     warm_prefixes: std::collections::HashSet<String>,
     warm_prefix_tree: Vec<(String, String)>,
     warm_imports: std::collections::HashMap<String, String>,
@@ -1532,8 +1534,25 @@ struct MaterializedClosure {
     /// The worker's only non-toolchain search root.
     #[cfg_attr(not(test), allow(dead_code))]
     dir: PathBuf,
-    /// The worker's `LEAN_PATH`: `dir`, then the toolchain library.
+    /// Open `O_DIRECTORY | O_CLOEXEC` handle pinning `dir` by `(dev, ino)` so Linux workers
+    /// import through `/proc/self/fd/<fd>` without re-traversing mutable ancestor pathnames.
+    #[cfg(target_os = "linux")]
+    dir_fd: std::os::unix::io::OwnedFd,
+    #[cfg(target_os = "linux")]
+    dir_dev_ino: (u64, u64),
+    #[cfg(target_os = "linux")]
+    toolchain_lib: Option<PathBuf>,
+    /// The worker's canonical `LEAN_PATH`: `dir`, then the toolchain library.
     search_path: String,
+    /// Non-root ancestor directories above `dir` (`(path, dev, ino, ctime_ns, has_subsec)`),
+    /// used to detect ancestor rename/symlink swaps across pathname resolution.
+    #[cfg(unix)]
+    ancestors: Vec<SnapshotAncestorSig>,
+    #[cfg(not(unix))]
+    ancestors: Vec<(PathBuf, u64, u64, i128, bool)>,
+    /// Wall clock before ancestor verification (`STAT_TRUST_WINDOW_NS` fallback on non-Linux).
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    taken_at_ns: i128,
     /// Every directory in the snapshot tree (`dir` and all subdirectories) and the `lstat`
     /// tuple it held after being sealed read-only (`0o500`). Any directory rename/swap or
     /// link/unlink inside the tree changes a directory inode or `mtime`/`ctime`.
@@ -1546,13 +1565,98 @@ struct MaterializedClosure {
     fence: Option<i128>,
 }
 
+#[cfg(unix)]
+fn fstatat_dir_sig(
+    dir_fd: std::os::unix::io::RawFd,
+    rel: &Path,
+) -> Option<(OleanFileStatSig, u32)> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_rel = if rel.as_os_str().is_empty() {
+        std::ffi::CString::new(".").ok()?
+    } else {
+        std::ffi::CString::new(rel.as_os_str().as_bytes()).ok()?
+    };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::fstatat(
+            dir_fd,
+            c_rel.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    #[allow(unused_mut)]
+    let mut sig = OleanFileStatSig {
+        dev: st.st_dev as u64,
+        ino: st.st_ino as u64,
+        mtime_sec: st.st_mtime as i64,
+        mtime_nsec: st.st_mtime_nsec as i64,
+        ctime_sec: st.st_ctime as i64,
+        ctime_nsec: st.st_ctime_nsec as i64,
+        size: st.st_size as u64,
+    };
+    #[cfg(test)]
+    if let Some(g) = digest_test_hooks::FORCED_TS_GRANULARITY_NS.with(|c| c.get()) {
+        let trunc = |sec: i64, nsec: i64| {
+            let ns = ((sec as i128) * 1_000_000_000 + nsec as i128).div_euclid(g) * g;
+            (
+                ns.div_euclid(1_000_000_000) as i64,
+                ns.rem_euclid(1_000_000_000) as i64,
+            )
+        };
+        (sig.mtime_sec, sig.mtime_nsec) = trunc(sig.mtime_sec, sig.mtime_nsec);
+        (sig.ctime_sec, sig.ctime_nsec) = trunc(sig.ctime_sec, sig.ctime_nsec);
+    }
+    Some((sig, st.st_mode as u32))
+}
+
 impl MaterializedClosure {
-    /// `Bound` iff no snapshot directory or file was mutated or swapped since it was verified:
-    /// each still has its verified `symlink_metadata` tuple, every directory remains `0o500`,
-    /// and every verified `ctime` predates the fence, so a later write or rename would have
-    /// changed it.
+    /// `Bound` iff no snapshot directory, file, or ancestor path was mutated or swapped since
+    /// verification: every snapshot directory and file still matches its verified stat tuple and
+    /// `0o500` mode (both by pathname and, on Linux, relative to the pinned `dir_fd`), and
+    /// every verified `ctime` predates the fence.
     fn binding(&self) -> ClosureBinding {
         let mut ordered = self.fence.is_some();
+        #[cfg(unix)]
+        for (anc, dev, ino, ctime_ns, has_subsec) in &self.ancestors {
+            use std::os::unix::fs::MetadataExt;
+            let Ok(meta) = fs::symlink_metadata(anc) else {
+                return ClosureBinding::Changed;
+            };
+            if meta.file_type().is_symlink()
+                || !meta.is_dir()
+                || meta.dev() != *dev
+                || meta.ino() != *ino
+            {
+                return ClosureBinding::Changed;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let cur_ctime = OleanFileStatSig::from_meta(&meta).ctime_ns();
+                if cur_ctime != *ctime_ns {
+                    return ClosureBinding::Changed;
+                }
+                let anc_ordered = match self.fence {
+                    Some(f) if meta.dev() == self.dirs.last().map_or(0, |(_, s)| s.dev) => {
+                        *ctime_ns < f
+                    }
+                    _ => {
+                        self.taken_at_ns > 0
+                            && *ctime_ns < self.taken_at_ns - STAT_TRUST_WINDOW_NS
+                            && *has_subsec
+                    }
+                };
+                ordered &= anc_ordered;
+            }
+            #[cfg(target_os = "linux")]
+            let _ = (ctime_ns, has_subsec);
+        }
+        #[cfg(not(unix))]
+        let _ = (&self.ancestors, self.taken_at_ns);
+
         for (path, sig) in &self.dirs {
             let Ok(meta) = fs::symlink_metadata(path) else {
                 return ClosureBinding::Changed;
@@ -1567,6 +1671,22 @@ impl MaterializedClosure {
             if OleanFileStatSig::from_meta(&meta) != *sig {
                 return ClosureBinding::Changed;
             }
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::unix::io::AsRawFd;
+                let Ok(rel) = path.strip_prefix(&self.dir) else {
+                    return ClosureBinding::Changed;
+                };
+                let Some((fd_sig, fd_mode)) = fstatat_dir_sig(self.dir_fd.as_raw_fd(), rel) else {
+                    return ClosureBinding::Changed;
+                };
+                if (fd_mode & libc::S_IFMT) != libc::S_IFDIR
+                    || (fd_mode & 0o777) != 0o500
+                    || fd_sig != *sig
+                {
+                    return ClosureBinding::Changed;
+                }
+            }
             ordered &= self.fence.is_some_and(|f| sig.ctime_ns() < f);
         }
         for (path, sig) in &self.files {
@@ -1574,12 +1694,33 @@ impl MaterializedClosure {
             if now.as_ref().ok() != Some(sig) {
                 return ClosureBinding::Changed;
             }
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::unix::io::AsRawFd;
+                let Ok(rel) = path.strip_prefix(&self.dir) else {
+                    return ClosureBinding::Changed;
+                };
+                let Some((fd_sig, fd_mode)) = fstatat_dir_sig(self.dir_fd.as_raw_fd(), rel) else {
+                    return ClosureBinding::Changed;
+                };
+                if (fd_mode & libc::S_IFMT) != libc::S_IFREG || fd_sig != *sig {
+                    return ClosureBinding::Changed;
+                }
+            }
             ordered &= self.fence.is_some_and(|f| sig.ctime_ns() < f);
         }
         if ordered {
             ClosureBinding::Bound
         } else {
             ClosureBinding::Unproven
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn worker_spawn_lean_path(&self, inherited_fd: std::os::unix::io::RawFd) -> String {
+        match &self.toolchain_lib {
+            Some(t) => format!("/proc/self/fd/{}:{}", inherited_fd, t.display()),
+            None => format!("/proc/self/fd/{}", inherited_fd),
         }
     }
 }
@@ -1780,6 +1921,7 @@ impl ClosureSnapshot {
     }
 }
 
+#[derive(Debug)]
 enum SnapshotError {
     /// A source file no longer holds the bytes the scan hashed.
     Changed,
@@ -1798,8 +1940,24 @@ const CLOSURE_SNAPSHOT_KEEP: usize = 32;
 const CLOSURE_SNAPSHOT_MIN_IDLE: std::time::Duration = std::time::Duration::from_secs(600);
 const CLOSURE_SNAPSHOT_USAGE_DIR: &str = ".last-used";
 
+thread_local! {
+    /// Per-test-thread override for `closure_snapshot_root()` so ancestor-rename tests do not
+    /// interfere with parallel tests sharing `TURBO_LEAN_HOME/closure-snapshots`.
+    #[cfg(test)]
+    static TEST_CLOSURE_SNAPSHOT_CACHE_BASE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn closure_cache_base() -> PathBuf {
+    #[cfg(test)]
+    if let Some(p) = TEST_CLOSURE_SNAPSHOT_CACHE_BASE.with(|c| c.borrow().clone()) {
+        return p;
+    }
+    crate::shm_cache::cache_root()
+}
+
 fn closure_snapshot_root() -> PathBuf {
-    crate::shm_cache::cache_root().join("closure-snapshots")
+    closure_cache_base().join("closure-snapshots")
 }
 
 /// Refresh the sibling last-used timestamp for snapshot `label` without touching the sealed
@@ -1821,33 +1979,114 @@ fn mark_closure_snapshot_used(label: &str) {
     }
 }
 
-/// Create `dir` if needed with mode `0o700` from birth and require a real directory owned by us
-/// and closed to others.
+/// Create `dir` (and any missing parent components) with mode `0o700` from birth, require a
+/// real directory owned by us, and enforce `0o700` on `dir` and our `cache_root()` hierarchy.
 fn ensure_private_dir(dir: &Path) -> Result<PathBuf, SnapshotError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-        if let Some(parent) = dir.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        let uid = unsafe { libc::geteuid() };
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(dir)?;
-        let meta = fs::symlink_metadata(dir)?;
-        if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } {
+        let cache_base = closure_cache_base();
+        let mut cur = Some(dir);
+        while let Some(p) = cur {
+            if p == dir || p == cache_base || p.starts_with(&cache_base) {
+                let m = fs::symlink_metadata(p)?;
+                if !m.is_dir() || m.uid() != uid {
+                    return Err(SnapshotError::Io);
+                }
+                if m.mode() & 0o077 != 0 {
+                    fs::set_permissions(p, fs::Permissions::from_mode(0o700))?;
+                }
+            }
+            if p == cache_base {
+                break;
+            }
+            cur = p.parent();
+        }
+        let canon = fs::canonicalize(dir)?;
+        let meta = fs::symlink_metadata(&canon)?;
+        if !meta.is_dir() || meta.uid() != uid {
             return Err(SnapshotError::Io);
         }
         if meta.mode() & 0o077 != 0 {
-            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+            fs::set_permissions(&canon, fs::Permissions::from_mode(0o700))?;
         }
-        Ok(fs::canonicalize(dir)?)
+        Ok(canon)
     }
     #[cfg(not(unix))]
     {
         let _ = dir;
         Err(SnapshotError::Io)
     }
+}
+
+#[cfg(unix)]
+type SnapshotAncestorSig = (PathBuf, u64, u64, i128, bool);
+
+/// Record every non-root ancestor directory above canonical `dir` (`(path, dev, ino, ctime_ns, has_subsec)`),
+/// rejecting symlinks or non-directory components.
+#[cfg(unix)]
+fn stat_snapshot_ancestors(dir: &Path) -> Result<Vec<SnapshotAncestorSig>, SnapshotError> {
+    use std::os::unix::fs::MetadataExt;
+    let mut out = Vec::new();
+    let mut cur = dir.parent();
+    while let Some(p) = cur {
+        if p == Path::new("/") || p.as_os_str().is_empty() {
+            break;
+        }
+        let meta = fs::symlink_metadata(p)?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err(SnapshotError::Changed);
+        }
+        let sig = OleanFileStatSig::from_meta(&meta);
+        let subsec = dev_records_subsecond_timestamps(&sig);
+        out.push((p.to_path_buf(), meta.dev(), meta.ino(), sig.ctime_ns(), subsec));
+        cur = p.parent();
+    }
+    Ok(out)
+}
+
+#[cfg(not(unix))]
+fn stat_snapshot_ancestors(
+    dir: &Path,
+) -> Result<Vec<(PathBuf, u64, u64, i128, bool)>, SnapshotError> {
+    let _ = dir;
+    Err(SnapshotError::Io)
+}
+
+#[cfg(target_os = "linux")]
+fn open_pinned_snapshot_dir(
+    dir: &Path,
+    expected_root_sig: &OleanFileStatSig,
+) -> Result<(std::os::unix::io::OwnedFd, (u64, u64)), SnapshotError> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::FromRawFd;
+    let c_dir =
+        std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(|_| SnapshotError::Io)?;
+    let raw = unsafe {
+        libc::open(
+            c_dir.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if raw < 0 {
+        return Err(SnapshotError::Changed);
+    }
+    let fd = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(raw) };
+    let Some((fd_sig, fd_mode)) = fstatat_dir_sig(raw, Path::new("")) else {
+        return Err(SnapshotError::Changed);
+    };
+    if (fd_mode & libc::S_IFMT) != libc::S_IFDIR
+        || (fd_mode & 0o777) != 0o500
+        || fd_sig != *expected_root_sig
+    {
+        return Err(SnapshotError::Changed);
+    }
+    Ok((fd, (fd_sig.dev, fd_sig.ino)))
 }
 
 /// Collect every directory in `dir` (post-order: children before parents, ending at `dir`),
@@ -1995,26 +2234,59 @@ fn materialize_closure(
         Ok(verified)
     };
     let finish = |verified_dirs: Vec<(PathBuf, OleanFileStatSig)>,
-                  verified_files: Vec<(PathBuf, OleanFileStatSig)>| {
-        let newest = verified_dirs
+                  verified_files: Vec<(PathBuf, OleanFileStatSig)>|
+     -> Result<MaterializedClosure, SnapshotError> {
+        let taken_at_ns = wall_clock_ns();
+        let ancestors = stat_snapshot_ancestors(&dir)?;
+        #[cfg(target_os = "linux")]
+        let (dir_fd, dir_dev_ino) = {
+            let (_, root_sig) = verified_dirs.last().ok_or(SnapshotError::Changed)?;
+            let (fd, dev_ino) = open_pinned_snapshot_dir(&dir, root_sig)?;
+            if stat_snapshot_ancestors(&dir)? != ancestors {
+                return Err(SnapshotError::Changed);
+            }
+            (fd, dev_ino)
+        };
+        #[allow(unused_mut)]
+        let mut newest = verified_dirs
             .iter()
             .chain(&verified_files)
             .map(|(_, s)| s.ctime_ns())
-            .max();
-        MaterializedClosure {
-            fence: fence_after_in(&root, newest.unwrap_or(i128::MIN)),
+            .max()
+            .unwrap_or(i128::MIN);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let root_dev = verified_dirs.last().map_or(0, |(_, s)| s.dev);
+            for (_, adev, _, actime, _) in &ancestors {
+                if *adev == root_dev {
+                    newest = newest.max(*actime);
+                }
+            }
+        }
+        Ok(MaterializedClosure {
+            fence: fence_after_in(&root, newest),
             label: label.clone(),
             dir: dir.clone(),
+            #[cfg(target_os = "linux")]
+            dir_fd,
+            #[cfg(target_os = "linux")]
+            dir_dev_ino,
+            #[cfg(target_os = "linux")]
+            toolchain_lib: toolchain_lib.clone(),
             search_path: search_path.clone(),
+            ancestors,
+            taken_at_ns,
             dirs: verified_dirs,
             files: verified_files,
-        }
+        })
     };
     if dir.is_dir() {
         if let Ok(verified_files) = verify(&dir) {
             if let Ok(verified_dirs) = seal_and_stat_snapshot_dirs(&dir) {
                 mark_closure_snapshot_used_in(&root, &label)?;
-                return Ok(finish(verified_dirs, verified_files));
+                if let Ok(mat) = finish(verified_dirs, verified_files) {
+                    return Ok(mat);
+                }
             }
         }
         // Not what its name says (a source rewritten in place through a hardlink, tampered
@@ -2071,7 +2343,7 @@ fn materialize_closure(
     };
     mark_closure_snapshot_used_in(&root, &label)?;
     collect_closure_snapshots(&root, &label);
-    Ok(finish(verified_dirs, verified_files))
+    finish(verified_dirs, verified_files)
 }
 
 const CLOSURE_BLOB_DIR: &str = "blobs";
@@ -3965,6 +4237,9 @@ fn eval_with_zygote_pool_attempt(
         }
     }
 
+    #[cfg(target_os = "linux")]
+    let expected_pinned_dir = closure.materialized.as_ref().map(|m| m.dir_dev_ino);
+
     let spawn_zygote_worker = || -> Result<ZygoteChild> {
         let zygote_bin = ensure_zygote_binary(store, lean_bin, env_vars)?;
         let mut cmd = Command::new(&zygote_bin);
@@ -3973,9 +4248,35 @@ fn eval_with_zygote_pool_attempt(
             .cloned()
             .or_else(|| std::env::var("LEAN_STACK_SIZE_KB").ok())
             .unwrap_or_else(|| "262144".to_string());
+        #[cfg(target_os = "linux")]
+        let spawn_dir_fd: Option<std::os::unix::io::OwnedFd> = match &closure.materialized {
+            Some(m) => {
+                use std::os::unix::io::{AsRawFd, FromRawFd};
+                let dup_raw =
+                    unsafe { libc::fcntl(m.dir_fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 32) };
+                anyhow::ensure!(
+                    dup_raw >= 0,
+                    "Failed to dup closure snapshot fd: {}",
+                    std::io::Error::last_os_error()
+                );
+                Some(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(dup_raw) })
+            }
+            None => None,
+        };
+        #[cfg(target_os = "linux")]
+        let child_lean_path = match (&closure.materialized, &spawn_dir_fd) {
+            (Some(m), Some(fd)) => {
+                use std::os::unix::io::AsRawFd;
+                m.worker_spawn_lean_path(fd.as_raw_fd())
+            }
+            _ => effective_lean_path.clone(),
+        };
+        #[cfg(not(target_os = "linux"))]
+        let child_lean_path = effective_lean_path.clone();
+
         cmd.envs(env_vars)
             .env("LEAN_STACK_SIZE_KB", default_stack_kb)
-            .env("LEAN_PATH", &effective_lean_path)
+            .env("LEAN_PATH", &child_lean_path)
             .env("LEAN", lean_bin)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -4000,14 +4301,24 @@ fn eval_with_zygote_pool_attempt(
         }
         #[cfg(target_os = "linux")]
         unsafe {
+            use std::os::unix::io::AsRawFd;
             use std::os::unix::process::CommandExt;
             let parent = libc::getpid();
+            let inherit_fd = spawn_dir_fd.as_ref().map(|f| f.as_raw_fd());
             cmd.pre_exec(move || {
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 if libc::getppid() != parent {
                     libc::_exit(1);
+                }
+                if let Some(fd) = inherit_fd {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags < 0
+                        || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
                 }
                 Ok(())
             });
@@ -4019,7 +4330,12 @@ fn eval_with_zygote_pool_attempt(
         let (owner, lifetime) = std::sync::mpsc::channel();
         let (send_child, receive_child) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
-            let _ = send_child.send(cmd.spawn());
+            #[cfg(target_os = "linux")]
+            let hold_fd = spawn_dir_fd;
+            let res = cmd.spawn();
+            #[cfg(target_os = "linux")]
+            drop(hold_fd);
+            let _ = send_child.send(res);
             let _ = lifetime.recv();
         });
         let mut child = receive_child
@@ -4065,6 +4381,8 @@ fn eval_with_zygote_pool_attempt(
             stdout,
             stderr_tail,
             stderr_scan,
+            #[cfg(target_os = "linux")]
+            pinned_snapshot_dir: expected_pinned_dir,
             warm_prefixes: std::collections::HashSet::new(),
             warm_prefix_tree: Vec::new(),
             warm_imports: std::collections::HashMap::new(),
@@ -4306,6 +4624,10 @@ fn eval_with_zygote_pool_attempt(
                 for k in &matching_keys {
                     if let Some(vec) = pool.get_mut(k) {
                         vec.retain(|w| {
+                            #[cfg(target_os = "linux")]
+                            if w.pinned_snapshot_dir != expected_pinned_dir {
+                                return false;
+                            }
                             (w.warm_imports.is_empty()
                                 || (w.warm_imports.len() == 1
                                     && w.warm_imports.contains_key(&imports_csv)))
@@ -4620,6 +4942,10 @@ fn eval_with_zygote_pool_attempt(
         for k in &matching_keys {
             if let Some(vec) = pool.get_mut(k) {
                 vec.retain(|w| {
+                    #[cfg(target_os = "linux")]
+                    if w.pinned_snapshot_dir != expected_pinned_dir {
+                        return false;
+                    }
                     (w.warm_imports.is_empty()
                         || (w.warm_imports.len() == 1 && w.warm_imports.contains_key(&imports_csv)))
                         && w.warm_imports
@@ -8619,6 +8945,8 @@ mod tests {
                 stdout,
                 stderr_tail,
                 stderr_scan: Default::default(),
+                #[cfg(target_os = "linux")]
+                pinned_snapshot_dir: None,
                 warm_prefixes: std::collections::HashSet::new(),
                 warm_prefix_tree: Vec::new(),
                 warm_imports: std::collections::HashMap::new(),
@@ -9170,6 +9498,295 @@ mod tests {
         let _ = fs::remove_file(&cache_path_a);
         purge_snapshot_dir(&stage_b);
         purge_snapshot_dir(&saved_a);
+        purge_snapshot_dir(&snap_dir);
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_materialized_closure_ancestor_directory_aba_swap_never_poisons_caches() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Some((tmp_dir, store, env_vars, lean_bin)) =
+            open_test_zygote_env("ancestor_dir_aba")
+        else {
+            return;
+        };
+        struct ResetCacheBase;
+        impl Drop for ResetCacheBase {
+            fn drop(&mut self) {
+                TEST_CLOSURE_SNAPSHOT_CACHE_BASE.with(|c| *c.borrow_mut() = None);
+                TEST_NO_DAEMON.with(|c| c.set(false));
+                digest_test_hooks::clear();
+            }
+        }
+        let _reset_guard = ResetCacheBase;
+
+        // 1. Verify `ensure_private_dir` creates missing nested parent components under
+        // `closure_cache_base()` with mode `0o700` from birth (never world/group-traversable).
+        let private_cache_base = tmp_dir.join("nested_missing/parent_dir/turbo-lean-cache");
+        TEST_CLOSURE_SNAPSHOT_CACHE_BASE.with(|c| *c.borrow_mut() = Some(private_cache_base.clone()));
+        let snap_root = ensure_private_dir(&closure_snapshot_root()).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&private_cache_base)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "missing cache_root parent must be created with 0o700"
+        );
+        assert_eq!(
+            fs::symlink_metadata(&snap_root)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "closure-snapshots root must be created with 0o700"
+        );
+        // Also verify `ensure_private_dir` tightens pre-existing permissive `0o755` parents under `cache_root()`.
+        fs::set_permissions(&private_cache_base, fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = ensure_private_dir(&closure_snapshot_root()).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&private_cache_base)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "permissive cache_root parent must be tightened to 0o700"
+        );
+
+        let tc = "leanprover/lean4:v4.35.0";
+        let lib = tmp_dir.join("lib");
+        fs::create_dir_all(lib.join("Pkg")).unwrap();
+        let build_b = tmp_dir.join("build_b");
+        fs::create_dir_all(build_b.join("Pkg")).unwrap();
+
+        let a = compile_test_olean(&lean_bin, &lib, "Pkg/Mod", "def pkgVal : Nat := 1\n");
+        let b = compile_test_olean(&lean_bin, &build_b, "Pkg/Mod", "def pkgVal : Nat := 2\n");
+        fs::write(lib.join("Pkg/Mod.olean"), &a).unwrap();
+
+        let lp = lib.to_string_lossy().to_string();
+        let ctx_a = resolve_zygote_context(tc, &lp, &env_vars, &lean_bin, "Pkg.Mod");
+        let snap = ctx_a
+            .closure
+            .materialized
+            .as_ref()
+            .expect("closure materialized");
+        let label = snap.label.clone();
+        let snap_dir = snap.dir.clone();
+        assert_eq!(ctx_a.closure.binding(), ClosureBinding::Bound);
+
+        // Stage a complete fake `closure-snapshots` root (`fake_root/<label>/Pkg/Mod.olean` = B)
+        // on the same filesystem so `rename(snap_root, saved_root)` + `rename(fake_root, snap_root)`
+        // swaps the ancestor directory ABOVE `<snap_root>/<label>` without touching `<label>` or
+        // any of its descendants!
+        let saved_root = private_cache_base.join("closure-snapshots.saved");
+        let fake_root = private_cache_base.join("closure-snapshots.fake");
+        let fake_label_dir = fake_root.join(&label);
+        fs::create_dir_all(fake_label_dir.join("Pkg")).unwrap();
+        fs::write(fake_label_dir.join("Pkg/Mod.olean"), &b).unwrap();
+        let mut ro_perms = fs::metadata(fake_label_dir.join("Pkg/Mod.olean"))
+            .unwrap()
+            .permissions();
+        ro_perms.set_readonly(true);
+        fs::set_permissions(fake_label_dir.join("Pkg/Mod.olean"), ro_perms).unwrap();
+        fs::set_permissions(fake_label_dir.join("Pkg"), fs::Permissions::from_mode(0o500)).unwrap();
+        fs::set_permissions(&fake_label_dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let dir_sig_before =
+            OleanFileStatSig::from_meta(&fs::symlink_metadata(&snap_dir).unwrap());
+        let leaf_sig_before = OleanFileStatSig::from_meta(
+            &fs::symlink_metadata(snap_dir.join("Pkg/Mod.olean")).unwrap(),
+        );
+
+        // 2. While `snap_root` is swapped to `fake_root`, `ctx_a.closure.binding()` MUST observe
+        // `Changed` (pathname `<snap_root>/<label>` now points to `fake_label_dir`).
+        fs::rename(&snap_root, &saved_root).unwrap();
+        fs::rename(&fake_root, &snap_root).unwrap();
+        assert_eq!(
+            ctx_a.closure.binding(),
+            ClosureBinding::Changed,
+            "active ancestor swap must invalidate binding()"
+        );
+        // Restore `saved_root` -> `snap_root`: notice `<snap_root>/<label>` and `Pkg/Mod.olean`
+        // have the EXACT SAME `(dev, ino, mtime, ctime)` and `0o500` mode as before!
+        fs::rename(&snap_root, &fake_root).unwrap();
+        fs::rename(&saved_root, &snap_root).unwrap();
+        assert_eq!(
+            OleanFileStatSig::from_meta(&fs::symlink_metadata(&snap_dir).unwrap()),
+            dir_sig_before,
+            "ancestor ABA swap leaves <label> stat signature completely unchanged"
+        );
+        assert_eq!(
+            OleanFileStatSig::from_meta(
+                &fs::symlink_metadata(snap_dir.join("Pkg/Mod.olean")).unwrap()
+            ),
+            leaf_sig_before,
+            "ancestor ABA swap leaves leaf file stat signature completely unchanged"
+        );
+
+        // 3. End-to-end fault injection across `eval_with_zygote_pool`:
+        // Swap `closure-snapshots` -> `fake_root` in `after_closure_snapshot` (while the worker
+        // spawns and imports `Pkg.Mod`), and restore `saved_root` -> `closure-snapshots` in
+        // `after_worker_reply` BEFORE `closure.binding()` runs.
+        // Because the worker imports through its pinned directory FD (`/proc/self/fd/<fd>` on Linux)
+        // or `binding()` catches the ancestor swap, `theorem mod_two : pkgVal = 2 := rfl` MUST be
+        // rejected and MUST NOT poison `ZYGOTE_VERIFIED_SHARD_CACHE` or the warm `ZYGOTE_POOL`!
+        let swapped_once = std::rc::Rc::new(std::cell::Cell::new(false));
+        let swapped_active = std::rc::Rc::new(std::cell::Cell::new(false));
+        let (sr1, sv1, fk1, once1, act1) = (
+            snap_root.clone(),
+            saved_root.clone(),
+            fake_root.clone(),
+            swapped_once.clone(),
+            swapped_active.clone(),
+        );
+        digest_test_hooks::set("after_closure_snapshot", move || {
+            if !once1.get() && sr1.is_dir() && fk1.is_dir() {
+                once1.set(true);
+                act1.set(true);
+                fs::rename(&sr1, &sv1).unwrap();
+                fs::rename(&fk1, &sr1).unwrap();
+            }
+        });
+        let (sr2, sv2, fk2, act2) = (
+            snap_root.clone(),
+            saved_root.clone(),
+            fake_root.clone(),
+            swapped_active.clone(),
+        );
+        digest_test_hooks::set("after_worker_reply", move || {
+            if act2.replace(false) {
+                fs::rename(&sr2, &fk2).unwrap();
+                fs::rename(&sv2, &sr2).unwrap();
+            }
+        });
+
+        let wrong_thm = "import Pkg.Mod\ntheorem mod_two : pkgVal = 2 := rfl\n";
+        let rep_thm =
+            eval_with_zygote_pool(&store, tc, &lp, &env_vars, &lean_bin, wrong_thm, false).unwrap();
+        digest_test_hooks::clear();
+        assert!(swapped_once.get(), "ancestor ABA hook must have fired");
+        assert!(
+            !rep_thm.ok,
+            "ancestor directory ABA swap during import must never prove theorem on B: {rep_thm:?}"
+        );
+
+        // Subsequent warm-pool / verified-shard-cache call must also reject `pkgVal = 2` and prove `pkgVal = 1`.
+        let rep_warm =
+            eval_with_zygote_pool(&store, tc, &lp, &env_vars, &lean_bin, wrong_thm, false).unwrap();
+        assert!(
+            !rep_warm.ok,
+            "warm pool / verified shard cache must not retain B's env or verdict: {rep_warm:?}"
+        );
+        let right_thm = "import Pkg.Mod\ntheorem mod_one : pkgVal = 1 := rfl\n";
+        assert!(
+            eval_with_zygote_pool(&store, tc, &lp, &env_vars, &lean_bin, right_thm, false)
+                .unwrap()
+                .ok
+        );
+
+        // 4. End-to-end fault injection across `try_local_zygote_eval_with_args` (`eval_shm_cache`):
+        // Clear idle workers for this snapshot (`snap_dir`) so `try_local_zygote_eval_with_args`
+        // spawns/imports fresh while `closure-snapshots` is swapped to `fake_root`, then restores
+        // before `binding()`.
+        if let Some(pool) = ZYGOTE_POOL.get() {
+            if let Ok(mut guard) = pool.lock() {
+                guard.retain(|(_, lp_key, _), _| !lp_key.starts_with(&snap_dir.to_string_lossy().to_string()));
+            }
+        }
+        let ctx_eval = resolve_zygote_context(tc, &lp, &env_vars, &lean_bin, "Pkg.Mod");
+        let file_name = "ancestor_dir_aba_eval.lean";
+        let src = "import Pkg.Mod\n#eval pkgVal\n";
+        let caller_cwd = env_vars
+            .get("TURBO_LEAN_CALLER_CWD")
+            .cloned()
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|p| p.to_string_lossy().to_string())
+            });
+        let cache_name_a = compute_eval_shm_cache_filename(
+            &ctx_eval,
+            file_name,
+            caller_cwd.as_deref(),
+            src,
+            &[],
+        )
+        .unwrap();
+        let cache_path_a = store
+            .fast_staging_dir()
+            .join("eval_shm_cache")
+            .join(&cache_name_a);
+        let _ = fs::remove_file(&cache_path_a);
+
+        TEST_NO_DAEMON.with(|c| c.set(true));
+        let swapped_eval_once = std::rc::Rc::new(std::cell::Cell::new(false));
+        let swapped_eval_active = std::rc::Rc::new(std::cell::Cell::new(false));
+        let (sr3, sv3, fk3, once3, act3) = (
+            snap_root.clone(),
+            saved_root.clone(),
+            fake_root.clone(),
+            swapped_eval_once.clone(),
+            swapped_eval_active.clone(),
+        );
+        digest_test_hooks::set("after_closure_snapshot", move || {
+            if !once3.get() && sr3.is_dir() && fk3.is_dir() {
+                once3.set(true);
+                act3.set(true);
+                fs::rename(&sr3, &sv3).unwrap();
+                fs::rename(&fk3, &sr3).unwrap();
+            }
+        });
+        let (sr4, sv4, fk4, act4) = (
+            snap_root.clone(),
+            saved_root.clone(),
+            fake_root.clone(),
+            swapped_eval_active.clone(),
+        );
+        digest_test_hooks::set("after_worker_reply", move || {
+            if act4.replace(false) {
+                fs::rename(&sr4, &fk4).unwrap();
+                fs::rename(&sv4, &sr4).unwrap();
+            }
+        });
+        let rep_eval = try_local_zygote_eval_with_args(
+            &store,
+            &env_vars,
+            &lean_bin,
+            tc,
+            &lp,
+            src,
+            Some(file_name),
+            60_000,
+            &[],
+        )
+        .expect("eval must return A's output despite ancestor ABA swap");
+        digest_test_hooks::clear();
+        TEST_NO_DAEMON.with(|c| c.set(false));
+        assert!(swapped_eval_once.get());
+        assert!(
+            rep_eval.ok && rep_eval.messages.join("\n").trim() == "1",
+            "eval during ancestor ABA swap must return A's output (1), never B's (2): {rep_eval:?}"
+        );
+        if let Some(cached) = read_cached_eval_shm_reply(&cache_path_a) {
+            assert_eq!(
+                cached.messages.join("\n").trim(),
+                "1",
+                "eval_shm_cache must never contain B's output: {cached:?}"
+            );
+        }
+
+        let _ = fs::remove_file(&cache_path_a);
+        if let Some(pool) = ZYGOTE_POOL.get() {
+            if let Ok(mut guard) = pool.lock() {
+                guard.retain(|(_, lp_key, _), _| !lp_key.starts_with(&snap_dir.to_string_lossy().to_string()));
+            }
+        }
+        purge_snapshot_dir(&fake_label_dir);
         purge_snapshot_dir(&snap_dir);
         let _ = fs::remove_dir_all(&tmp_dir);
     }
