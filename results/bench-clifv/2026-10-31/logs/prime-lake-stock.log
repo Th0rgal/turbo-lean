@@ -549,3 +549,52 @@ warning: FV/Opt/Proof/SimpLoop.lean:917:39: `if_neg` has been deprecated: Use `i
 ✔ [435/4556] Built FV.Backend.Proof.StockSinkProvenance (19s)
 ✔ [436/4556] Built FV.Backend.Proof.StockPatternBindings (6.3s)
 ✔ [437/4556] Built FV.Backend.Proof.StockSinkRuleRhs (2.1s)
+✔ [438/4556] Built FV.Backend.Proof.StockBranchCfg (69s)
+✔ [439/4556] Built FV.Backend.Proof.StockNodeRecordOrigin (104s)
+✔ [440/4556] Built FV.Link.Ld.LayoutProof (6.2s)
+✔ [441/4556] Built FV.Backend.Proof.StockCountMath (2.1s)
+✔ [442/4556] Built FV.Backend.Proof.IselExtern (5.2s)
+✔ [443/4556] Built FV.Backend.Proof.RelocProvExt (5.0s)
+⚠ [444/4556] Built FV.Backend.Proof.UnwindTables (5.0s)
+warning: FV/Backend/Proof/UnwindTables.lean:44:10: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/UnwindTables.lean:81:10: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/UnwindTables.lean:118:12: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/UnwindTables.lean:118:31: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/UnwindTables.lean:149:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/UnwindTables.lean:301:6: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/UnwindTables.lean:651:10: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/UnwindTables.lean:769:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/UnwindTables.lean:771:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+✔ [445/4556] Built FV.Backend.Proof.EncodeRES (1.7s)
+✔ [446/4556] Built FV.Backend.Proof.EncodeLDST (12s)
+✔ [447/4556] Built FV.Backend.Proof.EncodeDPSFP (30s)
+⚠ [448/4556] Built FV.Opt.Proof.LegalSim (70s)
+warning: FV/Opt/Proof/LegalSim.lean:261:12: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalSim.lean:271:12: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalSim.lean:308:12: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalSim.lean:309:12: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalSim.lean:338:12: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalSim.lean:339:12: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalSim.lean:1191:12: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalSim.lean:1191:12: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalSim.lean:1191:12: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalSim.lean:1198:12: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalSim.lean:1198:12: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalSim.lean:1198:12: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalSim.lean:1216:12: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalSim.lean:1216:12: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalSim.lean:1216:12: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalSim.lean:1222:12: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalSim.lean:1222:12: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalSim.lean:1222:12: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalSim.lean:1565:14: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalSim.lean:1571:14: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Opt/Proof/LegalSim.lean:2643:12: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Opt/Proof/LegalSim.lean:2656:12: `if_neg` has been deprecated: Use `ite_eq_right` instead
+✔ [449/4556] Built FV.Backend.Proof.EncodeBR (7.2s)
+✔ [450/4556] Built FV.Backend.Proof.EncodeDPR (18s)
+✔ [451/4556] Built FV.Backend.Proof.StockBackwardSuffixSplit (2.2s)
+✔ [452/4556] Built FV.Backend.Proof.EncodeDPI (4.1s)
+✔ [453/4556] Built FV.Backend.Proof.StockForwardSourceOrder (2.1s)
+✔ [454/4556] Built FV.Backend.Proof.StockMinMaxRegisterRuns (225s)
+✔ [455/4556] Built FV.Backend.Proof.IselPrgPC (14s)
