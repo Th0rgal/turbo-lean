@@ -23,6 +23,8 @@ structure CAbiBindingSig where
   params : List (String × String × String) -- (paramName, cType, rustType)
   retCType : String
   retRustType : String
+  /-- Source-text signature (`def … :=` prefix) the binding was parsed from; empty for LNIR-derived sigs. -/
+  srcSig : String := ""
   deriving Repr, Inhabited
 
 private def mapLeanTypeStr (tyRaw : String) : String × String :=
@@ -36,24 +38,29 @@ private def mapLeanTypeStr (tyRaw : String) : String × String :=
   else if t == "Float" then ("double", "f64")
   else ("const void*", "*const core::ffi::c_void")
 
-private def parseParamGroups (sig : String) : List (String × String × String) :=
-  let groups := (sig.splitOn "(").drop 1
-  groups.foldl (fun acc g =>
+/-- `(names : Ty)` groups as `(name, rawTy)`; a group without `:` yields `(…, "")`. -/
+private def parseParamGroupsRaw (sig : String) : List (String × String) :=
+  ((sig.splitOn "(").drop 1).foldl (fun acc g =>
     match (g.splitOn ")").head? with
     | some inside =>
       match inside.splitOn ":" with
       | namesStr :: tyStr :: _ =>
-        let (cTy, rsTy) := mapLeanTypeStr tyStr
         let names := (namesStr.splitOn " ").map (·.trimAscii.toString) |>.filter (!·.isEmpty)
-        acc ++ names.map (fun n => (n, cTy, rsTy))
-      | _ => acc
+        acc ++ names.map (fun n => (n, tyStr.trimAscii.toString))
+      | _ => acc ++ [(inside.trimAscii.toString, "")]
     | none => acc) []
 
-private def extractReturnTypeStr (sig : String) : String × String :=
+private def parseParamGroups (sig : String) : List (String × String × String) :=
+  (parseParamGroupsRaw sig).map fun (n, ty) => let (cTy, rsTy) := mapLeanTypeStr ty; (n, cTy, rsTy)
+
+/-- Raw return type text; `none` when the signature has no explicit `: Ty` after its binders. -/
+private def extractReturnTypeRaw? (sig : String) : Option String :=
   let afterParens := match (sig.splitOn ")").reverse.head? with | some s => s | none => sig
   let beforeEq := (afterParens.splitOn ":=").headD afterParens
-  let retRaw := (beforeEq.splitOn ":").drop 1 |>.reverse.headD "UInt64"
-  mapLeanTypeStr retRaw
+  ((beforeEq.splitOn ":").drop 1).reverse.head?.map (·.trimAscii.toString)
+
+private def extractReturnTypeStr (sig : String) : String × String :=
+  mapLeanTypeStr ((extractReturnTypeRaw? sig).getD "UInt64")
 
 /-- Extract `@[export <sym>]` / `@[inline, export <sym>]` signatures and `#guard` fixtures from `.lean` source text. -/
 def extractLeanSourceCAbiAndGuards (raw : String) : List CAbiBindingSig × List (String × String) :=
@@ -91,10 +98,40 @@ def extractLeanSourceCAbiAndGuards (raw : String) : List CAbiBindingSig × List 
           let leanName := String.ofList (afterDef.toList.takeWhile (fun c => c != ' ' && c != '(' && c != ':'))
           let params := parseParamGroups sigHead
           let (retC, retRs) := extractReturnTypeStr sigHead
-          loop rest none ({ cSymbol := sym, leanName, params, retCType := retC, retRustType := retRs } :: sigs) guards'
+          loop rest none ({ cSymbol := sym, leanName, params, retCType := retC, retRustType := retRs, srcSig := sigHead } :: sigs) guards'
         | none => loop rest none sigs guards'
       else loop rest symOpt sigs guards'
   loop lines none [] []
+
+/-- Lean types with an unboxed scalar C-ABI representation that `mapLeanTypeStr` maps faithfully.
+    `Nat`/`Int` are boxed `lean_object*` at the Lean ABI, so they are deliberately absent. -/
+def scalarCAbiLeanTypes : List String := ["Bool", "UInt8", "UInt16", "UInt32", "UInt64", "USize", "Float", "Int64"]
+
+/-- Provenance recorded in every `--signatures-only` artifact. -/
+def signaturesOnlyMarker : String := "signatures-only: no Stage1D gate applied"
+
+/-- P-cert C4 `--signatures-only`: bindings from exported source signatures alone, with no elaboration and hence no
+    Stage 1D (RC-ADT) gate. Fails closed on: no export; an `@[… export …]` line not immediately followed by a plain
+    `def`/`abbrev` (so every export attribute binds the declaration it annotates); implicit/instance binders; and any
+    exported parameter or return type outside `scalarCAbiLeanTypes`. Only exported signatures are emitted, never
+    helper prototypes or RC-ADT runtime declarations. -/
+def extractSignaturesOnlyCAbi (raw : String) : Except String (List CAbiBindingSig × List (String × String)) := do
+  let (sigs, guards) := extractLeanSourceCAbiAndGuards raw
+  if sigs.isEmpty then throw "no `@[export]` signatures found"
+  let lines := (raw.splitOn "\n").map (·.trimAscii.toString)
+  let attrs := (lines.zip (lines.drop 1 ++ [""])).filter fun (l, _) => l.startsWith "@[" && (l.splitOn "export ").length > 1
+  if let some (l, _) := attrs.find? fun (_, nxt) => !(nxt.startsWith "def " || nxt.startsWith "abbrev ") then
+    throw s!"export attribute '{l}' is not immediately followed by a plain `def`/`abbrev`"
+  if attrs.length != sigs.length then throw s!"{attrs.length} export attributes but {sigs.length} parsed signatures"
+  for s in sigs do
+    if (s.srcSig.splitOn "(").length != (s.srcSig.splitOn ")").length then
+      throw s!"exported '{s.leanName}' ({s.cSymbol}) has an unparsed signature '{s.srcSig}'"
+    if ["{", "[", "⦃"].any (fun b => (s.srcSig.splitOn b).length > 1) then
+      throw s!"exported '{s.leanName}' ({s.cSymbol}) has an implicit/instance binder"
+    let tys := (s.srcSig |> parseParamGroupsRaw).map (·.2) ++ [(extractReturnTypeRaw? s.srcSig).getD ""]
+    if let some ty := tys.find? (!scalarCAbiLeanTypes.contains ·) then
+      throw s!"exported '{s.leanName}' ({s.cSymbol}) has non-scalar type '{ty}'"
+  return (sigs, guards)
 
 def moduleToCAbiSigs (m : LNIRModule) : List CAbiBindingSig :=
   m.decls.map fun d => {
@@ -133,12 +170,14 @@ def readLeanSourceExpandingUmbrella (filePath : String) : IO String := do
       outLines := outLines.push line
   return String.intercalate "\n" outLines.toList
 
-def emitCAbiHeaderFromSigs (sigs : List CAbiBindingSig) : String :=
+/-- `note?` (e.g. `signaturesOnlyMarker`) is recorded as provenance metadata in every emitted artifact. -/
+def emitCAbiHeaderFromSigs (sigs : List CAbiBindingSig) (note? : Option String := none) : String :=
   let declProtos := sigs.map fun s =>
     let paramsC := if s.params.isEmpty then "void" else String.intercalate ", " (s.params.map fun (n, cTy, _) => s!"{cTy} {n}")
     s!"{s.retCType} {s.cSymbol}({paramsC});"
   String.intercalate "\n" ([
-    "/* Auto-generated C99 Header by lean-native C-ABI Binding Generator */",
+    "/* Auto-generated C99 Header by lean-native C-ABI Binding Generator */"] ++
+    (note?.map (s!"/* {·} */")).toList ++ [
     "#pragma once", "#ifndef LEAN_NATIVE_GENERATED_C_ABI_H", "#define LEAN_NATIVE_GENERATED_C_ABI_H",
     "#include <stdint.h>", "#include <stddef.h>",
     "typedef struct { const void* data; size_t len; size_t stride_bytes; } lean_native_flat_slice_t;",
@@ -158,7 +197,7 @@ def emitCAbiHeaderFromSigs (sigs : List CAbiBindingSig) : String :=
     "#ifdef __cplusplus", "}", "#endif", "#endif /* LEAN_NATIVE_GENERATED_C_ABI_H */", ""])
 
 /-- Generate ABI declarations and forwarding wrappers only; domain execution stays in the compiled library. -/
-def emitCAbiRustFromSigs (sigs : List CAbiBindingSig) : String :=
+def emitCAbiRustFromSigs (sigs : List CAbiBindingSig) (note? : Option String := none) : String :=
   let declExterns := sigs.map fun s =>
     let paramsRs := String.intercalate ", " (s.params.map fun (n, _, rsTy) => s!"{n}: {rsTy}")
     let retPart := if s.retRustType == "()" then "" else s!" -> {s.retRustType}"
@@ -168,15 +207,18 @@ def emitCAbiRustFromSigs (sigs : List CAbiBindingSig) : String :=
     let paramsRs := String.intercalate ", " (s.params.map fun (n, _, rsTy) => s!"{n}: {rsTy}")
     let argsRs := String.intercalate ", " (s.params.map fun (n, _, _) => n)
     s!"#[cfg_attr(not(debug_assertions), inline(always))]\npub unsafe fn {s.cSymbol}({paramsRs}){retPart} \{\n    unsafe \{ c_abi::{s.cSymbol}({argsRs}) }\n}"
-  String.intercalate "\n" (["// Generated ABI forwarding wrappers; no independent Rust kernel implementation.", "pub mod c_abi {", "    extern \"C\" {"] ++ declExterns ++ ["    }", "}"] ++ declWrappers ++ [""])
+  String.intercalate "\n" (["// Generated ABI forwarding wrappers; no independent Rust kernel implementation."] ++
+    (note?.map (s!"// {·}")).toList ++ ["pub mod c_abi {", "    extern \"C\" {"] ++ declExterns ++ ["    }", "}"] ++ declWrappers ++ [""])
 
-def emitGuardFixturesJson (sourcePath : String) (sigs : List CAbiBindingSig) (guards : List (String × String)) : String :=
+def emitGuardFixturesJson (sourcePath : String) (sigs : List CAbiBindingSig) (guards : List (String × String))
+    (note? : Option String := none) : String :=
   let esc := LeanNative.IR.jsonEscape
   let expJson := String.intercalate "," (sigs.map fun s =>
     s!"\{\"c_symbol\":\"{esc s.cSymbol}\",\"lean_name\":\"{esc s.leanName}\",\"arity\":{s.params.length},\"ret_c\":\"{esc s.retCType}\",\"ret_rust\":\"{esc s.retRustType}\"}")
+  let prov := match note? with | some n => "\"provenance\":\"" ++ esc n ++ "\"," | none => ""
   let gJson := String.intercalate "," (guards.map fun (lhs, rhs) =>
     s!"\{\"expr\":\"{esc lhs}\",\"expected\":\"{esc rhs}\"}")
-  s!"\{\"schema\":\"lean-native.cabi-fixtures.v1\",\"source\":\"{esc sourcePath}\",\"exports_count\":{sigs.length},\"guards_count\":{guards.length},\"exports\":[{expJson}],\"guards\":[{gJson}]}\n"
+  s!"\{\"schema\":\"lean-native.cabi-fixtures.v1\",\"source\":\"{esc sourcePath}\",{prov}\"exports_count\":{sigs.length},\"guards_count\":{guards.length},\"exports\":[{expJson}],\"guards\":[{gJson}]}\n"
 
 private def cTypeToSwiftType (cTy : String) : String :=
   if cTy == "uint8_t" then "UInt8"
@@ -189,11 +231,13 @@ private def cTypeToSwiftType (cTy : String) : String :=
   else "UnsafeRawPointer?"
 
 /-- Emit a Clang module map (`module.modulemap`) for Xcode / SwiftPM zero-copy C-ABI interop. -/
-def emitModuleMap (moduleName : String := "TurboLeanCABI") (headerFile : String := "turbo_lean_cabi.h") : String :=
-  s!"module {moduleName} \{\n  header \"{headerFile}\"\n  export *\n}\n"
+def emitModuleMap (moduleName : String := "TurboLeanCABI") (headerFile : String := "turbo_lean_cabi.h")
+    (note? : Option String := none) : String :=
+  (match note? with | some n => "// " ++ n ++ "\n" | none => "") ++ s!"module {moduleName} \{\n  header \"{headerFile}\"\n  export *\n}\n"
 
 /-- Emit zero-copy Swift `@_silgen_name` C-ABI bindings (`TurboLeanKit.swift`) for iOS / macOS (`apple-a15`). -/
-def emitCAbiSwiftFromSigs (sigs : List CAbiBindingSig) (enumName : String := "TurboLeanKernel") : String :=
+def emitCAbiSwiftFromSigs (sigs : List CAbiBindingSig) (enumName : String := "TurboLeanKernel")
+    (note? : Option String := none) : String :=
   let externDecls := sigs.map fun s =>
     let paramsSw := String.intercalate ", " (s.params.map fun (n, cTy, _) => s!"_ {n}: {cTypeToSwiftType cTy}")
     let retSw := cTypeToSwiftType s.retCType
@@ -204,7 +248,8 @@ def emitCAbiSwiftFromSigs (sigs : List CAbiBindingSig) (enumName : String := "Tu
     let retSw := cTypeToSwiftType s.retCType
     s!"  @inlinable public static func {s.leanName}({paramsSw}) -> {retSw} \{\n    {s.cSymbol}({argsSw})\n  }"
   String.intercalate "\n" ([
-    "// Auto-generated Zero-Copy Swift C-ABI Bridge by lean-native (iOS / apple-a15)",
+    "// Auto-generated Zero-Copy Swift C-ABI Bridge by lean-native (iOS / apple-a15)"] ++
+    (note?.map (s!"// {·}")).toList ++ [
     "import Foundation",
     ""
   ] ++ externDecls ++ [
