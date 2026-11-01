@@ -3627,7 +3627,7 @@ fn seed_statement_dependencies(
             fs::create_dir_all(parent)?;
         }
         // Local object copy only: a canonical absolute directory (never a URL or remote
-        // helper), with every transport but `file` still disabled by the trusted wrapper.
+        // helper); `file` is the only transport this one command may use.
         let source = dep.pkg_root.canonicalize()?;
         anyhow::ensure!(
             source.is_absolute() && source.is_dir(),
@@ -3635,7 +3635,8 @@ fn seed_statement_dependencies(
             dep.name
         );
         let out = crate::trusted_tools::git(project)?
-            .args(["-c", "protocol.file.allow=always", "clone", "--local"])
+            .env("GIT_ALLOW_PROTOCOL", "file")
+            .args(["clone", "--local"])
             .args(["--quiet", "--no-hardlinks", "--no-checkout", "--template="])
             .arg("--")
             .arg(&source)

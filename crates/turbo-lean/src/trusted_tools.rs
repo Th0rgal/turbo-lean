@@ -175,6 +175,9 @@ pub(crate) fn git(project: &Path) -> Result<GitCommand> {
             .env("GIT_NO_REPLACE_OBJECTS", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_NO_LAZY_FETCH", "1")
+            // An empty allowlist permits no transport at all. Unlike `protocol.allow`, it
+            // cannot be relaxed by a repository's `protocol.<name>.allow`.
+            .env("GIT_ALLOW_PROTOCOL", "")
             .env("GIT_OPTIONAL_LOCKS", "0")
             .env("LC_ALL", "C")
             .env_remove("GIT_ASKPASS")
@@ -252,6 +255,139 @@ fn trusted_executables_reject_relative_and_checkout_symlink_targets() -> Result<
     assert!(outside_checkout(&root.join("link"), Path::new("/tmp")).is_err());
     assert!(system_executable(&root.join("link"), &root).is_err());
     assert!(system_executable(Path::new("/usr/bin/git"), &root).is_ok());
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn trusted_git_rejects_old_versions() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(parse_git_version("git version 2.46.0\n"), Some((2, 46)));
+    assert_eq!(parse_git_version("git version 2.43.0.windows.1"), Some((2, 43)));
+    assert_eq!(parse_git_version("not git"), None);
+    let root = std::env::temp_dir().join(format!(
+        "turbo-old-git-{}-{}",
+        std::process::id(),
+        crate::pack::next_tmp_id()
+    ));
+    fs::create_dir_all(&root)?;
+    for (version, ok) in [("2.43.0", false), ("2.46.0", true), ("3.0.0", true)] {
+        let fake = root.join(format!("git-{version}"));
+        fs::write(&fake, format!("#!/bin/sh\necho 'git version {version}'\n"))?;
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755))?;
+        let checked = checked_git(fake);
+        assert_eq!(checked.is_ok(), ok, "{version}: {checked:?}");
+        if !ok {
+            assert!(format!("{:#}", checked.unwrap_err()).contains("Git >= 2.46"));
+        }
+    }
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+/// A repository-local promisor remote, transport command and credential helper must never run
+/// through the trusted wrapper. Positive controls first prove plain Git runs each of them.
+#[cfg(test)]
+#[test]
+fn trusted_git_never_lazily_fetches_or_runs_repository_helpers() -> Result<()> {
+    let root = std::env::temp_dir().join(format!(
+        "turbo-lazy-fetch-{}-{}",
+        std::process::id(),
+        crate::pack::next_tmp_id()
+    ));
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo)?;
+    let marker = root.join("marker");
+    // Plain Git with no inherited environment, like a host user or CI shell.
+    let plain = |args: &[&str]| {
+        Command::new("git")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .current_dir(&repo)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .output()
+    };
+    let ok = |args: &[&str]| -> Result<String> {
+        let out = plain(args)?;
+        anyhow::ensure!(out.status.success(), "{args:?}: {out:?}");
+        Ok(String::from_utf8(out.stdout)?.trim().to_string())
+    };
+    ok(&["init", "-q"])?;
+    fs::write(repo.join("A.lean"), "theorem a : True := trivial\n")?;
+    ok(&["add", "A.lean"])?;
+    ok(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base"])?;
+    let oid = ok(&["rev-parse", "HEAD:A.lean"])?;
+    fs::remove_file(repo.join(".git/objects").join(&oid[..2]).join(&oid[2..]))?;
+    let touch = format!("sh -c 'touch {}; exit 1' --", marker.display());
+    for (key, value) in [
+        ("remote.origin.url", "ssh://example.invalid/repo"),
+        ("remote.origin.promisor", "true"),
+        ("extensions.partialClone", "origin"),
+        ("core.sshCommand", &touch),
+        ("protocol.ssh.allow", "always"),
+        ("credential.helper", &format!("!touch {} #", marker.display())),
+    ] {
+        ok(&["config", key, value])?;
+    }
+    // Positive controls: Git lazily fetches the promised blob over the repository's
+    // ssh command, and runs the repository's credential helper.
+    assert!(!plain(&["cat-file", "-p", "HEAD:A.lean"])?.status.success());
+    assert!(marker.exists(), "lazy fetch control did not run sshCommand");
+    fs::remove_file(&marker)?;
+    let mut fill = Command::new("git");
+    fill.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .current_dir(&repo)
+        .args(["credential", "fill"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = fill.spawn()?;
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"protocol=https\nhost=example.invalid\n\n")?;
+    child.wait()?;
+    assert!(marker.exists(), "credential helper control did not run");
+    fs::remove_file(&marker)?;
+
+    for args in [
+        &["cat-file", "-p", "HEAD:A.lean"][..],
+        &["show", "--no-textconv", "HEAD:A.lean"],
+        &["fetch", "origin"],
+    ] {
+        let out = git(&repo)?.arg("-C").arg(&repo).args(args).output()?;
+        assert!(!out.status.success(), "{args:?}");
+        assert!(!marker.exists(), "{args:?} ran a repository helper");
+    }
+    let mut child = git(&repo)?
+        .arg("-C")
+        .arg(&repo)
+        .args(["credential", "fill"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"protocol=https\nhost=example.invalid\n\n")?;
+    child.wait()?;
+    assert!(!marker.exists(), "credential helper ran through trusted Git");
+    // Reading base blobs by object id reports the missing object instead of skipping it.
+    let err = crate::pr_verify::fetch_git_blobs_batch(&repo, "HEAD", &["A.lean".into()])
+        .expect_err("missing promised blob must fail closed");
+    assert!(format!("{err:#}").contains("missing"), "{err:#}");
+    assert!(!marker.exists());
     fs::remove_dir_all(root)?;
     Ok(())
 }
