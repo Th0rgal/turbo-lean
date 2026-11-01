@@ -1304,9 +1304,7 @@ fn check_directory(
                                                 cmd.arg(arg);
                                             }
                                             let out = crate::zygote::run_lean_command(
-                                                cmd.arg(&leased_batch)
-                                                    .current_dir(canon_ref)
-                                                    ,
+                                                cmd.arg(&leased_batch).current_dir(canon_ref),
                                                 Some(crate::zygote::remaining_timeout_ms(
                                                     None, *t0,
                                                 )),
@@ -2690,7 +2688,6 @@ fn check_single_decl(
                     let out = crate::zygote::run_lean_command(
                         cmd.arg(&leased_shard)
                             .current_dir(canon_dir)
-                            
                             .env("LEAN_STACK_SIZE_KB", default_stack),
                         Some(crate::zygote::remaining_timeout_ms(None, *t0)),
                     )
@@ -3307,9 +3304,7 @@ fn check_single_file(
                         cmd.arg(arg);
                     }
                     let batch_out = crate::zygote::run_lean_command(
-                        cmd.arg(&leased_coalesced)
-                            .current_dir(canon_dir)
-                            ,
+                        cmd.arg(&leased_coalesced).current_dir(canon_dir),
                         Some(crate::zygote::remaining_timeout_ms(None, *t0)),
                     )
                     .context("Failed to execute `lean` on coalesced shard batch")?;
@@ -3657,9 +3652,7 @@ fn check_single_file(
                 cmd.arg(arg);
             }
             let out = crate::zygote::run_lean_command(
-                cmd.arg(canon_resolved_initial)
-                    .current_dir(canon_dir)
-                    ,
+                cmd.arg(canon_resolved_initial).current_dir(canon_dir),
                 Some(crate::zygote::remaining_timeout_ms(None, *t0)),
             )
             .context("Failed to execute `lean`")?;
@@ -4581,18 +4574,27 @@ but is expected to have type
         let project = dir.join("project");
         let store_root = dir.join("store");
         let store_staging = store_root.join("staging");
-        let bin_dir = dir.join("fake_bin");
+        let fake_elan_root = dir.join("fake_elan");
+        let tc_name = "leanprover/lean4:v4.35.0-check-gc-race";
+        let tc_root = fake_elan_root
+            .join("toolchains")
+            .join("leanprover--lean4---v4.35.0-check-gc-race");
+        let bin_dir = tc_root.join("bin");
         fs::create_dir_all(&project)?;
         fs::create_dir_all(&store_staging)?;
         fs::create_dir_all(&bin_dir)?;
+        fs::create_dir_all(tc_root.join("lib/lean"))?;
 
         // Configure `fast_staging_dir()` to resolve directly to `<store>/staging` (exercising the
-        // store-local fallback where `run_gc(0, ...)` sweeps 0-second unleased files immediately)
-        // and disable the background Zygote daemon so `evaluate_check_command_value` executes the
-        // real `StagedTempFile` -> `run_lean_command` coalesced staging path in `check.rs`.
+        // store-local fallback where `run_gc(0, ...)` sweeps 0-second unleased files immediately),
+        // point `ELAN_HOME` at our isolated synthetic toolchain so `ToolchainExecutables` resolves
+        // our wrapper `lean` binary cleanly under PR #308's absolute toolchain gate, and disable
+        // the background Zygote daemon so `evaluate_check_command_value` executes the real
+        // `StagedTempFile` -> `run_lean_command` coalesced staging path in `check.rs`.
         let prev_staging = std::env::var("TURBO_LEAN_STAGING_DIR").ok();
         let prev_no_daemon = std::env::var("TURBO_LEAN_NO_DAEMON").ok();
-        struct RestoreCheckEnv(Option<String>, Option<String>);
+        let prev_elan_home = std::env::var("ELAN_HOME").ok();
+        struct RestoreCheckEnv(Option<String>, Option<String>, Option<String>);
         impl Drop for RestoreCheckEnv {
             fn drop(&mut self) {
                 match &self.0 {
@@ -4603,9 +4605,13 @@ but is expected to have type
                     Some(v) => std::env::set_var("TURBO_LEAN_NO_DAEMON", v),
                     None => std::env::remove_var("TURBO_LEAN_NO_DAEMON"),
                 }
+                match &self.2 {
+                    Some(v) => std::env::set_var("ELAN_HOME", v),
+                    None => std::env::remove_var("ELAN_HOME"),
+                }
             }
         }
-        let _restore_env = RestoreCheckEnv(prev_staging, prev_no_daemon);
+        let _restore_env = RestoreCheckEnv(prev_staging, prev_no_daemon, prev_elan_home);
         std::env::set_var("TURBO_LEAN_STAGING_DIR", &store_staging);
         std::env::set_var("TURBO_LEAN_NO_DAEMON", "1");
 
@@ -4616,10 +4622,12 @@ but is expected to have type
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .filter(|s| !s.is_empty());
+        std::env::set_var("ELAN_HOME", &fake_elan_root);
 
-        // Wrapper `lean` binary: signals `arrived_marker` BEFORE opening the staged `.lean` source
-        // argument, blocks until the test's concurrent `run_gc(0, ...)` and `spill_shm_to_disk_dir`
-        // sweeps complete (`proceed_marker`), then reads/checks the staged `.lean` file.
+        // Wrapper `lean` binary: answers `--githash`/`--print-prefix` immediately during toolchain
+        // resolution, then when invoked on the staged `.lean` file signals `arrived_marker` BEFORE
+        // opening it, blocks until concurrent `run_gc(0, ...)` and `spill_shm_to_disk_dir` sweeps
+        // complete (`proceed_marker`), and finally reads/checks the staged `.lean` file.
         let arrived_marker = dir.join("child_arrived");
         let proceed_marker = dir.join("child_proceed");
         let fake_lean = bin_dir.join("lean");
@@ -4630,15 +4638,21 @@ but is expected to have type
             }
         };
         let script = format!(
-            "#!/bin/sh\ntouch '{}'\nwhile [ ! -f '{}' ]; do sleep 0.01; done\n{}\n",
+            "#!/bin/sh\nif [ \"${{1:-}}\" = \"--githash\" ]; then echo 0123456789abcdef0123456789abcdef01234567; exit 0; fi\nif [ \"${{1:-}}\" = \"--print-prefix\" ]; then echo '{}'; exit 0; fi\nif [ \"${{1:-}}\" = \"--version\" ]; then echo 'Lean (version 4.35.0, commit 0123456789ab, Release)'; exit 0; fi\ntouch '{}'\nwhile [ ! -f '{}' ]; do sleep 0.01; done\n{}\n",
+            tc_root.display(),
             arrived_marker.display(),
             proceed_marker.display(),
             exec_line
         );
         fs::write(&fake_lean, script)?;
         fs::set_permissions(&fake_lean, fs::Permissions::from_mode(0o755))?;
+        for sib in ["lake", "leanc"] {
+            let sp = bin_dir.join(sib);
+            fs::write(&sp, "#!/bin/sh\nexit 0\n")?;
+            fs::set_permissions(&sp, fs::Permissions::from_mode(0o755))?;
+        }
 
-        fs::write(project.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(project.join("lean-toolchain"), format!("{tc_name}\n"))?;
         let lean_file = project.join("CheckGcRace.lean");
         fs::write(
             &lean_file,
@@ -4649,12 +4663,8 @@ but is expected to have type
         assert_eq!(store.fast_staging_dir(), store_staging);
         let canon_project = project.canonicalize()?;
         let proj_key = TurboStore::compute_lake_env_key(&canon_project);
-        let orig_path = std::env::var("PATH").unwrap_or_default();
         let mut fake_env = HashMap::new();
-        fake_env.insert(
-            "PATH".to_string(),
-            format!("{}:{}", bin_dir.display(), orig_path),
-        );
+        fake_env.insert("LEAN_PATH".to_string(), String::new());
         store.put_lake_env(&proj_key, &fake_env)?;
         drop(store);
 

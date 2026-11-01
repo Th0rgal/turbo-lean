@@ -5041,6 +5041,23 @@ fn sync_published(dest: &Path, created: &[PathBuf]) -> std::io::Result<()> {
 /// publication syncs its ancestor chain even when a concurrent peer created `dir` first without
 /// yet syncing its parent.
 pub(crate) fn ensure_dir_tracking(dir: &Path, stop_at: &Path) -> Result<Vec<PathBuf>> {
+    fn normalize_lexical(path: &Path) -> PathBuf {
+        use std::path::Component;
+        let mut out = PathBuf::new();
+        for comp in path.components() {
+            match comp {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if !out.pop() {
+                        out.push(comp.as_os_str());
+                    }
+                }
+                _ => out.push(comp.as_os_str()),
+            }
+        }
+        out
+    }
+
     let mut to_create = Vec::new();
     let mut cur = Some(dir);
     while let Some(p) = cur {
@@ -5057,6 +5074,31 @@ pub(crate) fn ensure_dir_tracking(dir: &Path, stop_at: &Path) -> Result<Vec<Path
             Err(e) => return Err(e.into()),
         }
     }
+
+    let norm_dir = normalize_lexical(dir);
+    let norm_stop = normalize_lexical(stop_at);
+    #[cfg(unix)]
+    let stop_ino = {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(stop_at).ok().map(|m| (m.dev(), m.ino()))
+    };
+    let is_stop = |p: &Path| -> bool {
+        if p == stop_at || normalize_lexical(p) == norm_stop {
+            return true;
+        }
+        #[cfg(unix)]
+        if let Some(target_key) = stop_ino {
+            use std::os::unix::fs::MetadataExt;
+            if fs::metadata(p).is_ok_and(|m| (m.dev(), m.ino()) == target_key) {
+                return true;
+            }
+        }
+        false
+    };
+    if is_stop(dir) || (!norm_stop.as_os_str().is_empty() && !norm_dir.starts_with(&norm_stop)) {
+        return Ok(Vec::new());
+    }
+
     let mut sync_parents = Vec::new();
     let mut anc = dir.parent();
     while let Some(p) = anc {
@@ -5064,7 +5106,7 @@ pub(crate) fn ensure_dir_tracking(dir: &Path, stop_at: &Path) -> Result<Vec<Path
             break;
         }
         sync_parents.push(p.to_path_buf());
-        if p == stop_at {
+        if is_stop(p) {
             break;
         }
         anc = p.parent();
@@ -6845,6 +6887,30 @@ mod tests {
                         && raced_logs.iter().any(|s| s == "dir:user_workspace")
                         && !raced_logs.iter().any(|s| s == "dir:exec_only_0711_host_anc"),
                     "raced recovery must sync through user_workspace and stop cleanly at 0711 boundary: {raced_logs:?}"
+                );
+                // When `dir == stop_at` (as in `leansys_sst_write_splits` publishing
+                // `<root>/file_splits.sst` under an execute-only outer host ancestor),
+                // `ensure_dir_tracking` must return empty immediately without walking above
+                // `stop_at` into `exec_only_0711_host_anc` or `/`.
+                assert!(
+                    ensure_dir_tracking(&opened.root, &opened.root)?.is_empty(),
+                    "ensure_dir_tracking(root, root) must return empty ancestor list"
+                );
+                assert!(
+                    ensure_dir_tracking(&opened.root.join("."), &opened.root)?.is_empty(),
+                    "ensure_dir_tracking(root/., root) must return empty ancestor list"
+                );
+                let _ = take_log();
+                opened.leansys_sst_write_splits(&[(
+                    blake3::hash(b"sst-split-key").to_hex().to_string(),
+                    r#"{"decls":[]}"#.to_string(),
+                )])?;
+                let sst_logs = take_log();
+                assert!(
+                    sst_logs.iter().any(|s| s == "dir:cold_store_ok")
+                        && !sst_logs.iter().any(|s| s == "dir:nested_new")
+                        && !sst_logs.iter().any(|s| s == "dir:exec_only_0711_host_anc"),
+                    "leansys_sst_write_splits must sync only store root and never walk above stop_at: {sst_logs:?}"
                 );
                 logs.shrink_to_fit();
                 Ok(logs)

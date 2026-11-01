@@ -1868,27 +1868,59 @@ pub fn prestage_blobs_from_shared_cas(
                     let _ = crate::db::sync_dir(dir);
                 }
             };
+            let mut existing_local_verified: Option<Vec<u8>> = None;
             if let Ok((mut f, m)) = crate::db::open_regular_nofollow(&dest) {
                 let mut buf = Vec::with_capacity(m.len().min(64 * 1024 * 1024) as usize);
-                if crate::db::is_exclusively_created_immutable_cas_inode(&m, &b.blob_hash)
-                    && f.read_to_end(&mut buf).is_ok()
-                    && buf.len() as u64 == b.size_bytes
-                    && blake3::hash(&buf).to_hex().as_str() == b.blob_hash
-                {
-                    let durable = crate::db::durability_barrier(&f).is_ok()
-                        && crate::db::sync_dir(dest.parent().unwrap_or(&store_blobs)).is_ok();
-                    if !durable {
-                        sync_created_parents(&mut created_parents);
-                        return None;
+                if f.read_to_end(&mut buf).is_ok() {
+                    if buf.len() as u64 == b.size_bytes
+                        && blake3::hash(&buf).to_hex().as_str() == b.blob_hash
+                    {
+                        if crate::db::is_exclusively_created_immutable_cas_inode(&m, &b.blob_hash) {
+                            let durable = crate::db::durability_barrier(&f).is_ok()
+                                && crate::db::sync_dir(dest.parent().unwrap_or(&store_blobs))
+                                    .is_ok();
+                            if !durable {
+                                sync_created_parents(&mut created_parents);
+                                return None;
+                            }
+                            staged_blobs.push((
+                                b.blob_hash.clone(),
+                                b.kind.clone(),
+                                b.size_bytes as i64,
+                                m.ino() as i64,
+                            ));
+                            continue;
+                        }
+                        existing_local_verified = Some(buf);
+                    } else if buf.len() >= 12 && &buf[..4] == b"TLZ1" {
+                        let hdr_len = u64::from_le_bytes(buf[4..12].try_into().unwrap());
+                        if hdr_len == b.size_bytes {
+                            if let Some(raw) = crate::db::decompress_tlz1(&buf) {
+                                if raw.len() as u64 == b.size_bytes
+                                    && blake3::hash(&raw).to_hex().as_str() == b.blob_hash
+                                {
+                                    existing_local_verified = Some(raw);
+                                }
+                            }
+                        }
                     }
-                    staged_blobs.push((
-                        b.blob_hash.clone(),
-                        b.kind.clone(),
-                        b.size_bytes as i64,
-                        m.ino() as i64,
-                    ));
-                    continue;
                 }
+            }
+            if let Some(local_raw) = existing_local_verified {
+                let Ok(re_sealed_ino) =
+                    crate::db::write_blob_atomic(store_root, &dest, &b.blob_hash, &local_raw, true)
+                else {
+                    sync_created_parents(&mut created_parents);
+                    return None;
+                };
+                total_newly_written += 1;
+                staged_blobs.push((
+                    b.blob_hash.clone(),
+                    b.kind.clone(),
+                    b.size_bytes as i64,
+                    re_sealed_ino,
+                ));
+                continue;
             }
             let shared_p = shared_blobs.join(prefix).join(&b.blob_hash);
             let shared_p_alt = shared_blobs_shm.join(prefix).join(&b.blob_hash);
@@ -2201,17 +2233,19 @@ pub(crate) fn try_import_from_shared_cas_with_domain(
     manifest: &PackManifest,
     trust_domain: &str,
 ) -> Result<Option<(usize, usize)>> {
+    let _pub_guard = crate::db::acquire_cas_publication_guard(&store.root)?;
     let Some((staged_blobs, total_newly_written)) =
         prestage_blobs_from_shared_cas(&store.root, manifest)
     else {
         return Ok(None);
     };
-    let res = finish_import_from_prestaged_shared_cas_with_domain(
+    let res = finish_import_from_prestaged_shared_cas_inner(
         store,
         manifest,
         &staged_blobs,
         total_newly_written,
         trust_domain,
+        true,
     )?;
     Ok(Some(res))
 }
@@ -5495,6 +5529,153 @@ pub(crate) mod tests {
             );
             let _ = fs::remove_file(&sp_iso);
             let _ = fs::remove_dir_all(&iso_root);
+
+            // Post-restart header-only v3 pack import when shared CAS has been cleaned:
+            // `ExclusivelyCreatedCasRegistry` no longer knows the local `<store>/blobs/<p>/<hash>`
+            // inode (`unseal_cas_inode`), and both shared CAS locations are absent, yet the local
+            // persistent store holds a digest-valid blob. `import_pack_bytes_with_policy` must
+            // snapshot & verify the local blob into a fresh sealed owned inode and succeed.
+            let restart_root =
+                std::env::temp_dir().join(format!("turbo_lean_pack_restart_v3_{}", next_tmp_id()));
+            let _ = fs::remove_dir_all(&restart_root);
+            let mut restart_store = TurboStore::open(Some(&restart_root))?;
+            let local_payload = b"post-restart-local-cas-only-blob-v3".to_vec();
+            let local_bh = blake3::hash(&local_payload).to_hex().to_string();
+            let local_dest = restart_root
+                .join("blobs")
+                .join(&local_bh[..2])
+                .join(&local_bh);
+            fs::create_dir_all(local_dest.parent().unwrap())?;
+            let mut pre_restart_rw = fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&local_dest)?;
+            pre_restart_rw.write_all(&local_payload)?;
+            let old_local_meta = pre_restart_rw.metadata()?;
+            crate::db::unseal_cas_inode(old_local_meta.dev(), old_local_meta.ino());
+            assert!(!crate::db::is_exclusively_created_immutable_cas_inode(
+                &old_local_meta,
+                &local_bh
+            ));
+            let _ = fs::remove_file(
+                shared_cas_blobs_dir_for_store(&restart_root)
+                    .join(&local_bh[..2])
+                    .join(&local_bh),
+            );
+            let _ = fs::remove_file(shared_cas_blobs_dir().join(&local_bh[..2]).join(&local_bh));
+
+            let tlz1_raw = b"post-restart-local-tlz1-compressed-cas-blob-v3-payload-bytes".to_vec();
+            let tlz1_bh = blake3::hash(&tlz1_raw).to_hex().to_string();
+            let tlz1_dest = restart_root
+                .join("blobs")
+                .join(&tlz1_bh[..2])
+                .join(&tlz1_bh);
+            fs::create_dir_all(tlz1_dest.parent().unwrap())?;
+            fs::write(&tlz1_dest, crate::db::compress_tlz1(&tlz1_raw))?;
+            let old_tlz1_meta = fs::metadata(&tlz1_dest)?;
+            crate::db::unseal_cas_inode(old_tlz1_meta.dev(), old_tlz1_meta.ino());
+            let _ = fs::remove_file(
+                shared_cas_blobs_dir_for_store(&restart_root)
+                    .join(&tlz1_bh[..2])
+                    .join(&tlz1_bh),
+            );
+            let _ = fs::remove_file(shared_cas_blobs_dir().join(&tlz1_bh[..2]).join(&tlz1_bh));
+
+            let restart_manifest = PackManifest {
+                format_version: 3,
+                host_arch: std::env::consts::ARCH.to_string(),
+                created_at: 1,
+                actions: vec![ActionRecord {
+                    action_key: "act_post_restart_v3".to_string(),
+                    toolchain_githash: "leanprover/lean4:v4.35.0".to_string(),
+                    kind: "check_shard".to_string(),
+                    status: "completed".to_string(),
+                    fencing_token: 1,
+                    output_manifest_hash: blake3::hash(b"manifest-post-restart-v3")
+                        .to_hex()
+                        .to_string(),
+                    duration_ms: 5,
+                    peak_pss_bytes: 0,
+                    heartbeats: 0,
+                    trust_domain: "untrusted".to_string(),
+                    outputs: vec![
+                        BlobEntry {
+                            rel_path: "receipt.json".to_string(),
+                            blob_hash: local_bh.clone(),
+                            kind: "receipt".to_string(),
+                            size_bytes: local_payload.len() as u64,
+                        },
+                        BlobEntry {
+                            rel_path: "compressed_shard.olean".to_string(),
+                            blob_hash: tlz1_bh.clone(),
+                            kind: "olean".to_string(),
+                            size_bytes: tlz1_raw.len() as u64,
+                        },
+                    ],
+                }],
+                blobs: vec![
+                    PackedBlob {
+                        blob_hash: local_bh.clone(),
+                        kind: "receipt".to_string(),
+                        size_bytes: local_payload.len() as u64,
+                        portable: true,
+                        data_hex_or_base64: vec![],
+                    },
+                    PackedBlob {
+                        blob_hash: tlz1_bh.clone(),
+                        kind: "olean".to_string(),
+                        size_bytes: tlz1_raw.len() as u64,
+                        portable: true,
+                        data_hex_or_base64: vec![],
+                    },
+                ],
+                ed25519_pubkey: None,
+                ed25519_signature: None,
+            };
+            let hdr_bytes = serde_json::to_vec(&restart_manifest)?;
+            let mut v3_pack = Vec::with_capacity(16 + hdr_bytes.len());
+            v3_pack.extend_from_slice(b"TLPK\x00\x00\x00\x03");
+            v3_pack.extend_from_slice(&(hdr_bytes.len() as u64).to_le_bytes());
+            v3_pack.extend_from_slice(&hdr_bytes);
+
+            let (imp_acts, imp_blobs) = import_pack_bytes_with_policy(
+                &mut restart_store,
+                &v3_pack,
+                Some("untrusted"),
+                None,
+                false,
+            )?;
+            assert_eq!((imp_acts, imp_blobs), (1, 2));
+            let resealed_meta = fs::metadata(&local_dest)?;
+            assert_ne!(
+                resealed_meta.ino(),
+                old_local_meta.ino(),
+                "unsealed local blob must be snapshotted into a fresh exclusively created inode"
+            );
+            assert!(
+                crate::db::is_exclusively_created_immutable_cas_inode(&resealed_meta, &local_bh),
+                "re-published local blob must be sealed in ExclusivelyCreatedCasRegistry"
+            );
+            let resealed_tlz1_meta = fs::metadata(&tlz1_dest)?;
+            assert_ne!(resealed_tlz1_meta.ino(), old_tlz1_meta.ino());
+            assert!(
+                crate::db::is_exclusively_created_immutable_cas_inode(
+                    &resealed_tlz1_meta,
+                    &tlz1_bh
+                ),
+                "re-published TLZ1 local blob must be sealed in ExclusivelyCreatedCasRegistry"
+            );
+            assert_eq!(fs::read(&tlz1_dest)?, tlz1_raw);
+            pre_restart_rw.seek(std::io::SeekFrom::Start(0))?;
+            pre_restart_rw.write_all(b"mutated-via-pre-restart-writable-fd")?;
+            assert_eq!(
+                fs::read(&local_dest)?,
+                local_payload,
+                "retained writable fd on old unsealed local inode must not affect re-sealed blob"
+            );
+            let _ = fs::remove_dir_all(&restart_root);
         }
 
         let _ = fs::remove_file(&sp_disk);

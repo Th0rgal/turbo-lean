@@ -598,8 +598,19 @@ impl StagedTempFile {
                 fs::create_dir_all(parent)?;
             }
         }
+        #[cfg(unix)]
+        let mut dir_lease = lock_staging_parent_dir(&path, false, false)?;
         let lock_path = staging_lease_lock_path(&path);
-        let lease = acquire_staging_lease(&lock_path)?;
+        let lease = match acquire_staging_lease(&lock_path) {
+            Ok(l) => l,
+            Err(e) => {
+                #[cfg(unix)]
+                drop(dir_lease);
+                return Err(e);
+            }
+        };
+        #[cfg(unix)]
+        drop(dir_lease.take());
         if let Err(e) = replace_staged_payload_nofollow(&path, bytes) {
             drop(lease);
             let _ = reap_stale_lock_if_unheld(&lock_path);
@@ -738,6 +749,20 @@ fn staging_lease_lock_path(target: &Path) -> PathBuf {
 }
 
 #[cfg(unix)]
+fn lock_staging_parent_dir(
+    child_path: &Path,
+    exclusive: bool,
+    nonblocking: bool,
+) -> std::io::Result<Option<FlockGuard>> {
+    let parent = match child_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let dir_f = fs::File::open(parent)?;
+    flock_file(dir_f, exclusive, nonblocking)
+}
+
+#[cfg(unix)]
 fn file_inode_key(f: &fs::File) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     f.metadata().ok().map(|m| (m.dev(), m.ino()))
@@ -832,6 +857,11 @@ pub fn try_remove_unleased_staged_file(target: &Path) -> bool {
     if fs::symlink_metadata(target).is_err() {
         return false;
     }
+    #[cfg(unix)]
+    let _dir_guard = match lock_staging_parent_dir(target, true, true) {
+        Ok(Some(g)) => Some(g),
+        _ => return false,
+    };
     let lock_path = staging_lease_lock_path(target);
     let Some(guard) = try_lock_sidecar(&lock_path, true) else {
         return false;
@@ -845,6 +875,11 @@ pub fn try_remove_unleased_staged_file(target: &Path) -> bool {
 }
 
 pub fn reap_stale_lock_if_unheld(lock_path: &Path) -> bool {
+    #[cfg(unix)]
+    let _dir_guard = match lock_staging_parent_dir(lock_path, true, true) {
+        Ok(Some(g)) => Some(g),
+        _ => return false,
+    };
     let Some(guard) = try_lock_unheld_sidecar(lock_path) else {
         return false;
     };
@@ -1538,13 +1573,60 @@ mod tests {
         let _ = crate::db::TurboStore::open(Some(&store_root))?;
 
         // 1. Deterministic step-by-step interleaving of the exact P2 #3 window:
-        //    use `AFTER_SIDECAR_OPEN_HOOK` inside `acquire_staging_lease` so the production
-        //    acquisition function opens `.lease.lock`, a concurrent reaper acquires `LOCK_EX`
-        //    and unlinks the sidecar BEFORE `flock(LOCK_SH)` executes, and `acquire_staging_lease`
-        //    is forced through its retry branch (`!inode_matches_nofollow`) to re-bind to a live sidecar!
+        //    (a) Parent-directory shared lock (`lock_staging_parent_dir(..., false)`) blocks
+        //        concurrent `reap_stale_lock_if_unheld` / `try_remove_unleased_staged_file`
+        //        (`LOCK_EX | LOCK_NB` on the parent directory) while a writer is between
+        //        `open(.lease.lock)` and `flock(LOCK_SH)` in `StagedTempFile::reserve` / `write`.
+        //    (b) Even if an external unlink replaces `.lease.lock` between `open()` and `flock()`,
+        //        `acquire_staging_lease` detects `!inode_matches_nofollow` and retries to re-bind
+        //        to a live sidecar inode.
         let det_target = staging.join("deterministic_race.lean");
         let det_lock = staging_lease_lock_path(&det_target);
         fs::create_dir_all(&staging)?;
+        let reaper_blocked_mid_open = std::rc::Rc::new(std::cell::Cell::new(false));
+        let reaper_flag = reaper_blocked_mid_open.clone();
+        let det_target_for_hook = det_target.clone();
+        let store_root_for_hook = store_root.clone();
+        AFTER_SIDECAR_OPEN_HOOK.with(|h| {
+            *h.borrow_mut() = Some(std::rc::Rc::new(move |lp| {
+                if !reaper_flag.get() {
+                    reaper_flag.set(true);
+                    assert!(
+                        !reap_stale_lock_if_unheld(lp),
+                        "reap_stale_lock_if_unheld must be blocked while writer is mid-acquisition"
+                    );
+                    assert!(
+                        !try_remove_unleased_staged_file(&det_target_for_hook),
+                        "try_remove_unleased_staged_file must be blocked while writer is mid-acquisition"
+                    );
+                    let lp_thread = lp.to_path_buf();
+                    let gc_root = store_root_for_hook.clone();
+                    std::thread::spawn(move || {
+                        assert!(
+                            !reap_stale_lock_if_unheld(&lp_thread),
+                            "cross-thread reap_stale_lock_if_unheld must not unlink sidecar mid-acquisition"
+                        );
+                        let mut gc_s = crate::db::TurboStore::open(Some(&gc_root))
+                            .expect("open TurboStore for mid-acquisition run_gc(0)");
+                        gc_s.run_gc(0, 7 * 86400, false)
+                            .expect("run_gc(0) during mid-acquisition");
+                    })
+                    .join()
+                    .expect("join mid-acquisition GC thread");
+                    assert!(
+                        lp.exists(),
+                        "sidecar inode must remain stable on disk while writer is mid-acquisition"
+                    );
+                }
+            }));
+        });
+        let reserved_stable = StagedTempFile::reserve(det_target.clone())?;
+        AFTER_SIDECAR_OPEN_HOOK.with(|h| *h.borrow_mut() = None);
+        assert!(reaper_blocked_mid_open.get());
+        assert!(is_staging_lease_held(&det_target) && det_lock.exists());
+        drop(reserved_stable);
+        assert!(!det_target.exists() && !det_lock.exists());
+
         let retry_triggered = std::rc::Rc::new(std::cell::Cell::new(0u32));
         let retry_counter = retry_triggered.clone();
         AFTER_SIDECAR_OPEN_HOOK.with(|h| {
@@ -1552,10 +1634,7 @@ mod tests {
                 let c = retry_counter.get();
                 retry_counter.set(c + 1);
                 if c == 0 {
-                    assert!(
-                        reap_stale_lock_if_unheld(lp),
-                        "hook must unlink sidecar between open() and flock() on attempt 0"
-                    );
+                    fs::remove_file(lp).expect("direct unlink to exercise retry loop");
                 }
             }));
         });
