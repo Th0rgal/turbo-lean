@@ -18,6 +18,8 @@ import LeanNative.Transform.LoopVectorizeOpt
 import LeanNative.Transform.Superopt
 import LeanNative.Transform.Plugins
 import LeanNative.Backend.LLVM
+import LeanNative.Backend.Clif
+import FV.Clif.Print
 import LeanNative.Backend.GPUIR
 import LeanNative.Backend.MLIRGPU
 import LeanNative.Backend.Metal
@@ -771,6 +773,7 @@ def printCoreUsage (tag : String) (hasFrontend : Bool) : IO Unit := do
   let lines := [s!"{tag} v0.5.0 — Formally Validated Lean 4 Optimizer, TV, FastCheck & Multi-Target Codegen", s!"Usage: {tag} <command> [options]", "Commands:"] ++
     fe ["  build-exe          Compile a .lean source file directly to a native executable (<file.lean> -o <bin>)"] ++ [
     "  compile-llvm       Emit baseline or optimized LLVM 18 IR (--input <file>, --arch <target>, --baseline, -o <path>)",
+    "  compile-clif       Emit F64 CLIF (--input <file>, --decl <name>, -o <path>)",
     "  compile-static-lib Emit C-ABI static library (.a) + C header (.h) (--input <file>, -o <lib.a>, --header <lib.h>)",
     "  compile-mlir       Emit GPU MLIR module (--input <file>, -o <path>)",
     "  compile-ptx        Emit NVIDIA PTX 8.0 assembly (--input <file>, --sm sm_90, --fastcheck, -o <path>)",
@@ -869,6 +872,21 @@ def runEvalLNIR (elaborateHook? : Option (String → TargetArch → IO LNIRModul
   IO.println jsonRow
   return if ok then 0 else 1
 
+def runCompileClif (elaborateHook? : Option (String → TargetArch → IO LNIRModule))
+    (args : List String) : IO UInt32 := do
+  let m ← loadInputModule elaborateHook? args
+  let selected := findFlagValue args "--decl" ""
+  let ds := if selected.isEmpty then m.decls else m.decls.filter (·.name == selected)
+  if ds.isEmpty then throw <| IO.userError "[lean-native] No matching CLIF declarations"
+  let fs ← ds.mapM fun d =>
+    match LeanNative.Backend.Clif.lowerDecl d with
+    | .ok f => pure f
+    | .error e => throw <| IO.userError s!"[lean-native] {d.name}: {e}"
+  let text := _root_.Clif.print { funcs := fs }
+  let path := findFlagValue args "-o" ""
+  if path.isEmpty then IO.print text else IO.FS.writeFile path text
+  return 0
+
 /-- Shared CLI dispatcher for both `lean-native-core` (`elaborateHook? = none`) and `lean-native` (`elaborateHook? = some ...`). -/
 def dispatchSharedCommand (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule))
     (args : List String) : IO (Option UInt32) := do
@@ -878,7 +896,7 @@ def dispatchSharedCommand (tag : String) (elaborateHook? : Option (String → Ta
   let rest := args.drop 1
   let isCabiFallback := !(args.headD "").startsWith "compile" && (hasFlag args "--c-abi" || hasFlag args "--emit-c-abi")
   let effArgs := if args.head? == some "--c-abi" || args.head? == some "--emit-c-abi" || isCabiFallback then args else rest
-  if (["compile", "compile-llvm", "compile-static-lib", "compile-mlir", "compile-ptx", "compile-metal",
+  if (["compile", "compile-clif", "compile-llvm", "compile-static-lib", "compile-mlir", "compile-ptx", "compile-metal",
        "compile-hybrid", "compile-fastcheck", "superopt", "plugins", "telemetry", "verify-certs",
        "validate-tv", "eval-lnir", "emit-lnir", "emit-cabi-bindings", "compile-c-abi",
        "--c-abi", "--emit-c-abi"].contains (args.headD "") || isCabiFallback) &&
@@ -891,6 +909,7 @@ def dispatchSharedCommand (tag : String) (elaborateHook? : Option (String → Ta
   | "bench-snark-kernels" :: rest => some <$> runBenchSnarkKernels rest
   | "eval-lnir" :: rest          => some <$> runEvalLNIR elaborateHook? rest
   | "compile-llvm" :: rest       => some <$> runCompileLLVM tag elaborateHook? rest
+  | "compile-clif" :: rest       => some <$> runCompileClif elaborateHook? rest
   | "compile-static-lib" :: rest => some <$> runCompileStaticLib tag elaborateHook? rest
   | "emit-cabi-bindings" :: rest => some <$> runEmitCAbiBindings tag elaborateHook? rest
   | "compile-c-abi" :: rest      => some <$> runEmitCAbiBindings tag elaborateHook? rest
