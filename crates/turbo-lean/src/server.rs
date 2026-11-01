@@ -1014,12 +1014,20 @@ pub fn serve_cas_http_with_auth(
                     if let Some(expected) = req.execution_identity.as_deref() {
                         let (imports, _) = crate::zygote::split_shard_for_zygote(src);
                         let actual = crate::zygote::resolve_zygote_context(
-                            tc, &req.lean_path, &env_vars, &lean_bin, &imports,
+                            tc,
+                            &req.lean_path,
+                            &env_vars,
+                            &lean_bin,
+                            &imports,
                         );
                         if expected != actual.identity {
-                            let _ = write_json_response(&mut stream, 409, &serde_json::json!({
-                                "ok": false, "error": "eval execution identity changed"
-                            }));
+                            let _ = write_json_response(
+                                &mut stream,
+                                409,
+                                &serde_json::json!({
+                                    "ok": false, "error": "eval execution identity changed"
+                                }),
+                            );
                             return;
                         }
                     }
@@ -2151,13 +2159,16 @@ fn execute_fastcheck_payload_deferred(
                                 Some((staging, FASTCHECK_PRELUDE_HARNESS.to_string(), cached_bin));
                             return Ok((
                                 serde_json::json!({
-                                    "status": if status_ok { "ok" } else { "counterexample_found" },
+                                    "status": if status_ok { "ok" } else { "execution_failed" },
+                                    "ok": status_ok,
                                     "mode": "http_remote_cpu_perceus",
                                     "server_arch": std::env::consts::ARCH,
                                     "compile_cache_hit": false,
                                     "binary_cache_key": bin_key,
                                     "exec_us": exec_us,
                                     "total_ms": t0.elapsed().as_millis(),
+                                    "lean_native_certified": false,
+                                    "certification": "unavailable",
                                     "output": body.trim()
                                 }),
                                 deferred_pop,
@@ -2276,13 +2287,16 @@ fn execute_fastcheck_payload_deferred(
 
         Ok((
             serde_json::json!({
-                "status": if status_ok { "ok" } else { "counterexample_found" },
+                "status": if status_ok { "ok" } else { "execution_failed" },
+                "ok": status_ok,
                 "mode": "http_remote_cpu_perceus",
                 "server_arch": std::env::consts::ARCH,
                 "compile_cache_hit": compile_cache_hit,
                 "binary_cache_key": bin_key,
                 "exec_us": exec_us,
                 "total_ms": t0.elapsed().as_millis(),
+                "lean_native_certified": false,
+                "certification": "unavailable",
                 "output": stdout.trim()
             }),
             deferred_pop,
@@ -2457,7 +2471,8 @@ mod bind_auth_tests {
         batch.coalesced_shard_source = source.into();
         batch.items[0].shard_key = batch_key;
         batch.lean_args = low;
-        let (second, _, hits) = execute_check_shards_batch_payload_deferred(&mut store, &batch, None)?;
+        let (second, _, hits) =
+            execute_check_shards_batch_payload_deferred(&mut store, &batch, None)?;
         assert_eq!(second.cache_hits, 0);
         assert!(hits.is_empty());
         // Partial hit: only the entry verified under the requested options may be pruned.

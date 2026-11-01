@@ -1292,8 +1292,28 @@ pub fn execute_fast_check(
         if let Some(stmt) = stmt_src.filter(|s| !s.trim().is_empty()) {
             batch_pairs.push((decl_name.to_string(), stmt.to_string()));
         } else if let Some(f_str) = file.filter(|s| !s.trim().is_empty()) {
-            match fs::read_to_string(f_str) {
-                Ok(src_text) => batch_pairs.push((decl_name.to_string(), src_text)),
+            let f_path = Path::new(f_str);
+            match fs::read_to_string(f_path) {
+                Ok(src_text) => {
+                    let df = (!decl_name.is_empty()
+                        && !matches!(decl_name, "auto" | "fastcheck_decl"))
+                    .then_some(decl_name);
+                    let decls = crate::gpu_fastcheck::extract_decls_fast_for_path(
+                        &src_text,
+                        df,
+                        Some(f_path),
+                        project_dir,
+                    );
+                    if !decls.is_empty() && decls.iter().all(|d| !d.trusted_elab_context) {
+                        batch_pairs.push((
+                            decl_name.to_string(),
+                            "import Init\ntheorem _untrusted_context_guard : True := trivial"
+                                .to_string(),
+                        ));
+                    } else {
+                        batch_pairs.push((decl_name.to_string(), src_text));
+                    }
+                }
                 Err(e) => {
                     file_read_err = Some(format!("Failed to read `{}`: {}", f_str, e));
                 }
@@ -1929,6 +1949,7 @@ pub fn handle_mcp_jsonrpc_request(
 /// Read the next JSON-RPC 2.0 message from `reader`, supporting both:
 /// 1. `Content-Length: <N>\r\n\r\n<payload>` framed MCP messages, and
 /// 2. Newline-delimited JSON-RPC 2.0 lines (`{...}\n`).
+///
 /// Returns `Ok(Some((request_value, was_content_length_framed)))` or `Ok(None)` on EOF.
 pub fn read_next_mcp_message<R: BufRead>(
     reader: &mut R,

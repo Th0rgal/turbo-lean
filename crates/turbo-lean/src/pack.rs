@@ -2120,7 +2120,7 @@ pub fn try_populate_cached_bin_from_shared(
         let _ = fs::create_dir_all(parent);
         let shared_out = shared_bin.with_extension("out");
         if let Ok(text) = fs::read_to_string(&shared_out) {
-            if is_valid_cached_fastcheck_out(&text, false).is_some() {
+            if is_valid_cached_fastcheck_out(&text, true).is_some() {
                 let _ = fs::copy(&shared_out, cached_bin.with_extension("out"));
             }
         }
@@ -2150,7 +2150,7 @@ pub(crate) fn ensure_shared_fastcheck_out(shared_bin: &Path) {
     }
     let out_file = shared_bin.with_extension("out");
     if let Ok(existing) = fs::read_to_string(&out_file) {
-        if is_valid_cached_fastcheck_out(&existing, false).is_some() {
+        if is_valid_cached_fastcheck_out(&existing, true).is_some() {
             return;
         }
         let _ = fs::remove_file(&out_file);
@@ -2173,8 +2173,10 @@ pub(crate) fn ensure_shared_fastcheck_out(shared_bin: &Path) {
         }
     };
     let stdout = String::from_utf8_lossy(&out.stdout);
-    if !stdout.trim().is_empty() {
-        write_cached_fastcheck_out_atomic(&out_file, out.status.success(), &stdout);
+    if out.status.success() && !stdout.trim().is_empty() {
+        write_cached_fastcheck_out_atomic(&out_file, true, &stdout);
+    } else if !out.status.success() {
+        let _ = fs::remove_file(&out_file);
     } else {
         let _ = fs::remove_file(shared_bin);
     }
@@ -2184,7 +2186,7 @@ pub fn run_or_read_cached_fastcheck_bin(cached_bin: &Path) -> Result<(bool, Stri
     let run_t0 = std::time::Instant::now();
     let out_file = cached_bin.with_extension("out");
     if let Ok(cached_text) = fs::read_to_string(&out_file) {
-        if let Some((ok, body)) = is_valid_cached_fastcheck_out(&cached_text, false) {
+        if let Some((ok, body)) = is_valid_cached_fastcheck_out(&cached_text, true) {
             let exec_us = run_t0.elapsed().as_micros().max(1);
             return Ok((ok, body.to_string(), exec_us));
         }
@@ -2206,7 +2208,9 @@ pub fn run_or_read_cached_fastcheck_bin(cached_bin: &Path) -> Result<(bool, Stri
     let exec_us = run_t0.elapsed().as_micros().max(1);
     let ok = out.status.success();
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    write_cached_fastcheck_out_atomic(&out_file, ok, &stdout);
+    if ok {
+        write_cached_fastcheck_out_atomic(&out_file, true, &stdout);
+    }
     Ok((ok, stdout, exec_us))
 }
 
@@ -2592,7 +2596,11 @@ fn http_request_with_resolved_token(
     let mut reader = BufReader::new(stream);
     let mut status_line = String::with_capacity(64);
     if reader.read_line(&mut status_line)? == 0 {
-        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "EOF before HTTP response").into());
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "EOF before HTTP response",
+        )
+        .into());
     }
     let mut content_len: Option<usize> = None;
     let mut header_sha256: Option<String> = None;
@@ -3154,7 +3162,7 @@ pub(crate) mod tests {
             .unwrap_or("")
             .contains("Checked 1,000,000 256-bit states"));
 
-        // Verify shared-bin sidecar self-healing on empty `"0\n"` and preservation on non-empty counterexamples:
+        // Verify shared-bin sidecar self-healing on failed (`0\n...`) sidecars and non-caching of failing binaries:
         let shared_staging = dir.join("shared_staging");
         save_compiled_bin_to_shared(&shared_staging, src, &cached_bin);
         let shared_bin = shared_fastcheck_cgen_path(&shared_staging, src);
@@ -3163,13 +3171,36 @@ pub(crate) mod tests {
         assert!(fs::read_to_string(shared_bin.with_extension("out"))?.starts_with("1\n"));
         fs::write(
             shared_bin.with_extension("out"),
-            b"0\ncounterexample: x = 7\n",
+            b"0\nuncertified crash output\n",
         )?;
         ensure_shared_fastcheck_out(&shared_bin);
-        assert_eq!(
-            fs::read_to_string(shared_bin.with_extension("out"))?,
-            "0\ncounterexample: x = 7\n"
-        );
+        assert!(fs::read_to_string(shared_bin.with_extension("out"))?.starts_with("1\n"));
+
+        let fail_src = "def main : IO Unit := throw (IO.userError \"boom\")\n";
+        let fail_key = compute_fastcheck_binary_key(false, fail_src);
+        let fail_bin = bin_dir.join(&fail_key);
+        fs::write(&fail_bin, b"#!/bin/sh\necho 'boom'\nexit 1\n")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&fail_bin)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&fail_bin, perms)?;
+        }
+        let fail_req = FastCheckHttpRequest {
+            filename: "fail.lean".into(),
+            source: fail_src.into(),
+            gpu: false,
+            precomputed_bin_key: String::new(),
+            has_main: Some(true),
+            local_path: String::new(),
+        };
+        let fail_res = execute_fastcheck_payload(&store, &fail_req)?;
+        assert_eq!(fail_res["status"].as_str(), Some("execution_failed"));
+        assert_eq!(fail_res["ok"].as_bool(), Some(false));
+        assert_eq!(fail_res["lean_native_certified"].as_bool(), Some(false));
+        assert_eq!(fail_res["certification"].as_str(), Some("unavailable"));
+        assert!(!fail_bin.with_extension("out").exists());
 
         let _ = fs::remove_dir_all(&dir);
         Ok(())

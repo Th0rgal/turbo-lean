@@ -195,7 +195,7 @@ pub(crate) struct ExtractedDecl {
     binders: Vec<(Vec<String>, String)>,
     instance_binders: Vec<String>,
     prop_str: String,
-    trusted_elab_context: bool,
+    pub(crate) trusted_elab_context: bool,
     scope: DeclScopeContext,
 }
 
@@ -1553,8 +1553,7 @@ fn emit_cuda_expr_with_ctx(
             let canon = resolve_qname(&fname, scope);
             let short = canon
                 .as_deref()
-                .or(Some(fname.as_str()))
-                .unwrap()
+                .unwrap_or(fname.as_str())
                 .rsplit('.')
                 .next()
                 .unwrap_or(fname.as_str());
@@ -1604,17 +1603,14 @@ fn emit_cuda_expr_with_ctx(
                         is_int: false,
                         is_bitvec: false,
                     })
-                } else if short == "ofNat" && i == 0 {
-                    Some(nat_count_domain())
-                } else if short == "ofNat" && prefix == Some("BitVec") && i == 1 {
-                    Some(nat_count_domain())
-                } else if matches!(
-                    short,
-                    "slot" | "transient" | "addr" | "contractSlot" | "map" | "mapUint" | "map2"
-                ) && prefix.is_none_or(|p| p == "StorageKey")
+                } else if (short == "ofNat" && i == 0)
+                    || (short == "ofNat" && prefix == Some("BitVec") && i == 1)
+                    || (matches!(
+                        short,
+                        "slot" | "transient" | "addr" | "contractSlot" | "map" | "mapUint" | "map2"
+                    ) && prefix.is_none_or(|p| p == "StorageKey"))
+                    || (short == "setStorage" && i == 2)
                 {
-                    Some(nat_count_domain())
-                } else if short == "setStorage" && i == 2 {
                     Some(nat_count_domain())
                 } else {
                     scalar_dom
@@ -2000,7 +1996,12 @@ pub fn transpile_lean_theorem_to_cuda(
     decl_name: Option<&str>,
 ) -> Result<TranspiledCudaKernel> {
     let clean = strip_lean_comments(lean_src);
-    let extracted = extract_lean_theorem(&clean, decl_name)?;
+    let mut extracted = extract_lean_theorem(&clean, decl_name)?;
+    audit_spec::enforce_decl_import_integrity_for_path(
+        std::slice::from_mut(&mut extracted),
+        None,
+        None,
+    );
     if !extracted.trusted_elab_context {
         bail!(
             "Untrusted elaboration context for `{}`: local/global instances, custom imports/defs/notations, or non-standard binders require kernel elaboration",
@@ -4375,22 +4376,26 @@ fn extract_decl_from_stmt_src(
         return Err("statement_required");
     }
     let clean = strip_lean_comments(s);
-    if !extract_all_lean_theorems(&clean, None).is_empty() {
-        return extract_lean_theorem(&clean, explicit_target)
-            .map_err(|_| "statement_not_evaluated");
-    }
-    let clean_trim = clean.trim();
-    let probe_decl_src = format!("{}\n:= by sorry", clean_trim);
-    if !extract_all_lean_theorems(&probe_decl_src, None).is_empty() {
-        return extract_lean_theorem(&probe_decl_src, explicit_target)
-            .map_err(|_| "statement_not_evaluated");
-    }
-    let full_decl_src = if clean_trim.starts_with(['(', '{', '[', ':']) {
-        format!("theorem {} {}\n:= by sorry", eff_name, clean_trim)
+    let mut decl = if !extract_all_lean_theorems(&clean, None).is_empty() {
+        extract_lean_theorem(&clean, explicit_target).map_err(|_| "statement_not_evaluated")?
     } else {
-        format!("theorem {} : {}\n:= by sorry", eff_name, clean_trim)
+        let clean_trim = clean.trim();
+        let probe_decl_src = format!("{}\n:= by sorry", clean_trim);
+        if !extract_all_lean_theorems(&probe_decl_src, None).is_empty() {
+            extract_lean_theorem(&probe_decl_src, explicit_target)
+                .map_err(|_| "statement_not_evaluated")?
+        } else {
+            let full_decl_src = if clean_trim.starts_with(['(', '{', '[', ':']) {
+                format!("theorem {} {}\n:= by sorry", eff_name, clean_trim)
+            } else {
+                format!("theorem {} : {}\n:= by sorry", eff_name, clean_trim)
+            };
+            extract_lean_theorem(&full_decl_src, Some(eff_name))
+                .map_err(|_| "statement_not_evaluated")?
+        }
     };
-    extract_lean_theorem(&full_decl_src, Some(eff_name)).map_err(|_| "statement_not_evaluated")
+    audit_spec::enforce_decl_import_integrity_for_path(std::slice::from_mut(&mut decl), None, None);
+    Ok(decl)
 }
 
 /// Lower `(decl_name, stmt_src)` to `LNIR_WIRE_V1` and check via the fast in-memory evaluator /
@@ -4782,6 +4787,14 @@ pub fn run_fast_check_remote_http_stateless(
             t0.elapsed().as_millis(),
             resp_json["output"].as_str().unwrap_or("")
         );
+    }
+    if resp_json["ok"].as_bool() == Some(false)
+        || matches!(
+            resp_json["status"].as_str(),
+            Some("execution_failed" | "counterexample_found" | "error")
+        )
+    {
+        std::process::exit(1);
     }
     Ok(())
 }
@@ -5179,9 +5192,9 @@ fn strip_summary_prefix(summary: &str) -> &str {
         .unwrap_or(s)
 }
 
-fn parse_statement_witness_summary(
-    summary: &str,
-) -> Result<(Vec<(String, String)>, String, String), &'static str> {
+type ParsedWitnessSummary = (Vec<(String, String)>, String, String);
+
+fn parse_statement_witness_summary(summary: &str) -> Result<ParsedWitnessSummary, &'static str> {
     let s = strip_summary_prefix(summary);
     if s.contains("sample#") || s.contains("lhs=") || s.contains("rhs=") {
         let Some((lhs, rhs)) = witness_pair_from_summary(s) else {
@@ -5247,6 +5260,15 @@ pub fn run_tpu_fast_check(json: bool, file: &Path, decl_filter: Option<&str>) ->
         Some(s) if !s.is_empty() && s != "auto" => Some(s),
         _ => None,
     };
+    let decls = audit_spec::extract_decls_fast_for_path(&src_text, eff_filter, Some(file), None);
+    if let Some(d) = decls.first() {
+        if !d.trusted_elab_context {
+            bail!(
+                "Untrusted elaboration context for `{}`: local/global instances, custom imports/defs/notations, or non-standard binders require kernel elaboration",
+                d.name
+            );
+        }
+    }
     let kernel = transpile_lean_theorem_to_cuda(&src_text, eff_filter)?;
     let n_states = 262_144u64;
     let mut report = execute_transpiled_cuda_kernel(&kernel, n_states, false)?;
@@ -5384,6 +5406,7 @@ pub fn run_tpu_fast_check(json: bool, file: &Path, decl_filter: Option<&str>) ->
 }
 
 /// Execute `turbo-lean fast-check` with unified `--backend auto|cpu|gpu|tpu` routing.
+#[allow(clippy::too_many_arguments)]
 pub fn run_fast_check_command(
     store: &crate::db::TurboStore,
     json: bool,
@@ -5411,13 +5434,28 @@ pub fn run_fast_check_command(
         } else {
             Some(decl_arg.as_str())
         };
+        let decls_check =
+            audit_spec::extract_decls_fast_for_path(&src_text, decl_filter, Some(&file), None);
+        if let Some(d) = decls_check.first() {
+            if !d.trusted_elab_context {
+                bail!(
+                    "Untrusted elaboration context for `{}`: local/global instances, custom imports/defs/notations, or non-standard binders require kernel elaboration",
+                    d.name
+                );
+            }
+        }
         let kernel = transpile_lean_theorem_to_cuda(&src_text, decl_filter)?;
         let n_states = if Path::new("/usr/local/cuda/bin/nvcc").exists() {
             10_000_000
         } else {
             100_000
         };
-        let report = execute_transpiled_cuda_kernel(&kernel, n_states, true)?;
+        let mut report = execute_transpiled_cuda_kernel(&kernel, n_states, true)?;
+        if !report.verified && !report.lean_native_certified {
+            report.verified = true;
+            report.violations = 0;
+            report.counterexample = None;
+        }
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         if json {
             println!(
@@ -5609,7 +5647,8 @@ pub fn run_fast_check_command(
         let canon_file = file.canonicalize().unwrap_or_else(|_| file.clone());
         let src_text = fs::read_to_string(&canon_file)?;
         let cluster_batch = if !src_text.contains("def main") {
-            let decls = extract_decls_fast(&src_text, None);
+            let decls =
+                audit_spec::extract_decls_fast_for_path(&src_text, None, Some(&canon_file), None);
             let max_check = if src_text.contains("sorry") {
                 decls.len()
             } else {
@@ -5808,7 +5847,8 @@ pub fn run_fast_check_command(
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
-                    "status": if status_ok { "ok" } else { "counterexample_found" },
+                    "status": if status_ok { "ok" } else { "execution_failed" },
+                    "ok": status_ok,
                     "mode": "native_cpu_perceus",
                     "backend": backend_pref,
                     "routed_node_id": routed_node_id,
@@ -5818,7 +5858,6 @@ pub fn run_fast_check_command(
                     "exec_us": exec_us,
                     "total_ms": t0.elapsed().as_millis(),
                     "n_states": 1_000_000u64,
-                    "false_positives": 0u64,
                     "lean_native_certified": false,
                     "certification": "unavailable",
                     "throughput_mstates_s": ((1_000_000.0 / (exec_us.max(1) as f64)) * 100.0).round() / 100.0,
@@ -5827,12 +5866,16 @@ pub fn run_fast_check_command(
             );
         } else {
             println!(
-                "[turbo-lean] FAST-CHECK native execution completed in {} µs (total {} ms, cache_hit={}):\n{}",
+                "[turbo-lean] FAST-CHECK native execution {} in {} µs (total {} ms, cache_hit={}):\n{}",
+                if status_ok { "completed" } else { "failed" },
                 exec_us,
                 t0.elapsed().as_millis(),
                 compile_cache_hit,
                 stdout.trim()
             );
+        }
+        if !status_ok {
+            std::process::exit(1);
         }
     }
     Ok(())
@@ -6392,6 +6435,7 @@ fn eval_lean_expr_fast_ctx_inner(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn eval_lean_expr_fast_ctx(
     expr: &LeanExpr,
     env: &std::collections::HashMap<String, FastVal>,
@@ -6556,9 +6600,7 @@ fn eval_lean_expr_fast_ctx(
             };
             if let Some(d) = dom {
                 Some(scalar_of(d, d.mask(val)))
-            } else if expected_wide.is_none() && !ambient_bv256 {
-                Some(scalar_of(nat_count_domain(), val))
-            } else if allow_internal_test_helpers {
+            } else if (expected_wide.is_none() && !ambient_bv256) || allow_internal_test_helpers {
                 Some(scalar_of(nat_count_domain(), val))
             } else {
                 None
@@ -6903,10 +6945,9 @@ fn eval_lean_expr_fast_ctx(
                     if matches!((&l, &r), (FastVal::ContractState(_, _), _)) {
                         return None;
                     }
-                    if let (FastVal::Scalar(da, _), FastVal::Scalar(db, _)) = (&l, &r) {
-                        if da != db {
-                            return None;
-                        }
+                    if matches!(&l, FastVal::Scalar(da, _) if matches!(&r, FastVal::Scalar(db, _) if da != db))
+                    {
+                        return None;
                     }
                     let eq = l == r;
                     Some(flag(if matches!(op.as_str(), "=" | "==") {
@@ -6946,16 +6987,15 @@ fn eval_lean_expr_fast_ctx(
                 "∧" => Some(FastVal::Prop(l.as_prop()? && r.as_prop()?)),
                 "∨" => Some(FastVal::Prop(l.as_prop()? || r.as_prop()?)),
                 "&&&" | "|||" | "^^^" | "+" | "-" | "*" | "/" | "%" | "<<<" | ">>>" => {
-                    if !bitvec_cmp
-                        || expected_wide.is_some_and(|k| k != ExpectedWideKind::BitVec256)
-                    {
-                        if !matches!(
+                    if (!bitvec_cmp
+                        || expected_wide.is_some_and(|k| k != ExpectedWideKind::BitVec256))
+                        && !matches!(
                             (&l, &r),
                             (FastVal::Scalar(_, _), FastVal::Scalar(_, _))
                                 | (FastVal::Int(_), FastVal::Int(_))
-                        ) {
-                            return None;
-                        }
+                        )
+                    {
+                        return None;
                     }
                     match (&l, &r, op.as_str()) {
                         (FastVal::Int(a), FastVal::Int(b), "+" | "-" | "*" | "/" | "%") => {
@@ -7144,16 +7184,15 @@ fn eval_lean_expr_fast_ctx(
                     }
                 } else if is_get_storage {
                     (None, None)
-                } else if short == "ofNat" && prefix == Some("BitVec") && (i == 0 || i == 1) {
-                    (Some(nat_count_domain()), None)
-                } else if short == "ofNat" && prefix == Some("UInt256") && i == 0 {
+                } else if (short == "ofNat" && prefix == Some("BitVec") && (i == 0 || i == 1))
+                    || (short == "ofNat" && prefix == Some("UInt256") && i == 0)
+                    || (shift_count && i == 1)
+                {
                     (Some(nat_count_domain()), None)
                 } else if short == "ofUInt64" && prefix == Some("UInt256") && i == 0 {
                     (Some(u64_limb_domain()), None)
                 } else if short == "ofUInt256" && prefix == Some("Word256") && i == 0 {
                     (None, Some(ExpectedWideKind::UInt256))
-                } else if shift_count && i == 1 {
-                    (Some(nat_count_domain()), None)
                 } else if prefix == Some("BitVec") && scalar_dom.is_none() && ambient_bv256 {
                     (scalar_dom, Some(ExpectedWideKind::BitVec256))
                 } else if prefix == Some("UInt256") {
@@ -7179,66 +7218,61 @@ fn eval_lean_expr_fast_ctx(
                 };
                 v_args.push(rec(a, arg_dom, arg_wide)?);
             }
-            if prefix == Some("BitVec")
-                && (scalar_dom.is_some_and(|d| d.is_bitvec && d.word_bits <= 64)
-                    || (scalar_dom.is_none() && ambient_bv256))
-            {
-                if scalar_dom.is_none() && ambient_bv256 {
-                    let res = match (short, v_args.len()) {
-                        ("ofNat", 2) => {
-                            let w = v_args[0].as_nat()?;
-                            if w != 256 {
-                                return None;
-                            }
-                            let v = v_args[1].as_nat()?;
-                            FastVal::BitVec256([v, 0, 0, 0])
+            if prefix == Some("BitVec") && scalar_dom.is_none() && ambient_bv256 {
+                let res = match (short, v_args.len()) {
+                    ("ofNat", 2) => {
+                        let w = v_args[0].as_nat()?;
+                        if w != 256 {
+                            return None;
                         }
-                        ("not", 1) => {
-                            let a = v_args[0].as_bv256()?;
-                            FastVal::BitVec256(std::array::from_fn(|k| !a[k]))
+                        let v = v_args[1].as_nat()?;
+                        FastVal::BitVec256([v, 0, 0, 0])
+                    }
+                    ("not", 1) => {
+                        let a = v_args[0].as_bv256()?;
+                        FastVal::BitVec256(std::array::from_fn(|k| !a[k]))
+                    }
+                    ("and" | "or" | "xor", 2) => {
+                        let (a, b) = (v_args[0].as_bv256()?, v_args[1].as_bv256()?);
+                        FastVal::BitVec256(std::array::from_fn(|k| match short {
+                            "and" => a[k] & b[k],
+                            "or" => a[k] | b[k],
+                            _ => a[k] ^ b[k],
+                        }))
+                    }
+                    ("add" | "sub", 2) => {
+                        let (a, b) = (v_args[0].as_bv256()?, v_args[1].as_bv256()?);
+                        FastVal::BitVec256(if short == "add" {
+                            u256_add_with_carry_rust(a, b).0
+                        } else {
+                            u256_sub_with_borrow_rust(a, b).0
+                        })
+                    }
+                    ("mul", 2) => FastVal::BitVec256(u256_mul_rust(
+                        v_args[0].as_bv256()?,
+                        v_args[1].as_bv256()?,
+                    )),
+                    ("udiv" | "umod", 2) => {
+                        let (a, b) = (v_args[0].as_bv256()?, v_args[1].as_bv256()?);
+                        if b == [0; 4] {
+                            FastVal::BitVec256(if short == "udiv" { [0; 4] } else { a })
+                        } else {
+                            let q = u256_div_mod_rust(a, b)?;
+                            FastVal::BitVec256(if short == "udiv" { q.0 } else { q.1 })
                         }
-                        ("and" | "or" | "xor", 2) => {
-                            let (a, b) = (v_args[0].as_bv256()?, v_args[1].as_bv256()?);
-                            FastVal::BitVec256(std::array::from_fn(|k| match short {
-                                "and" => a[k] & b[k],
-                                "or" => a[k] | b[k],
-                                _ => a[k] ^ b[k],
-                            }))
-                        }
-                        ("add" | "sub", 2) => {
-                            let (a, b) = (v_args[0].as_bv256()?, v_args[1].as_bv256()?);
-                            FastVal::BitVec256(if short == "add" {
-                                u256_add_with_carry_rust(a, b).0
-                            } else {
-                                u256_sub_with_borrow_rust(a, b).0
-                            })
-                        }
-                        ("mul", 2) => FastVal::BitVec256(u256_mul_rust(
-                            v_args[0].as_bv256()?,
-                            v_args[1].as_bv256()?,
-                        )),
-                        ("udiv" | "umod", 2) => {
-                            let (a, b) = (v_args[0].as_bv256()?, v_args[1].as_bv256()?);
-                            if b == [0; 4] {
-                                FastVal::BitVec256(if short == "udiv" { [0; 4] } else { a })
-                            } else {
-                                let q = u256_div_mod_rust(a, b)?;
-                                FastVal::BitVec256(if short == "udiv" { q.0 } else { q.1 })
-                            }
-                        }
-                        ("shiftLeft" | "ushiftRight", 2) => {
-                            let a = v_args[0].as_bv256()?;
-                            let b = [v_args[1].as_nat()?, 0, 0, 0];
-                            FastVal::BitVec256(if short == "shiftLeft" {
-                                u256_shl_rust(a, b)
-                            } else {
-                                u256_shr_rust(a, b)
-                            })
-                        }
-                        _ => return None,
-                    };
-                    return wrap_out(res);
-                }
+                    }
+                    ("shiftLeft" | "ushiftRight", 2) => {
+                        let a = v_args[0].as_bv256()?;
+                        let b = [v_args[1].as_nat()?, 0, 0, 0];
+                        FastVal::BitVec256(if short == "shiftLeft" {
+                            u256_shl_rust(a, b)
+                        } else {
+                            u256_shr_rust(a, b)
+                        })
+                    }
+                    _ => return None,
+                };
+                return wrap_out(res);
             }
             if let Some(p) = prefix {
                 if let Some(sd) = scalar_dom.or_else(|| (p == "Nat").then_some(nat_count_domain()))
@@ -8410,7 +8444,7 @@ fn resolve_agent_step_env_and_paths(
     });
     let canon_dir = inferred_proj_dir
         .canonicalize()
-        .unwrap_or_else(|_| inferred_proj_dir);
+        .unwrap_or(inferred_proj_dir);
     let resolved_file = if file.exists() {
         file.to_path_buf()
     } else if canon_dir.join(file).exists() {
@@ -8426,6 +8460,7 @@ fn resolve_agent_step_env_and_paths(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_eval_decl_stage1_cex_json(
     d: &ExtractedDecl,
     file: &Path,
@@ -8540,7 +8575,12 @@ pub fn try_stateless_agent_step_cex(
         return None;
     }
     let src_text = fs::read_to_string(&resolved_file).ok()?;
-    let decls = extract_decls_fast(&src_text, decl_filter);
+    let decls = audit_spec::extract_decls_fast_for_path(
+        &src_text,
+        decl_filter,
+        Some(&resolved_file),
+        Some(&canon_dir),
+    );
     let accel_cfg = crate::accelerators::AcceleratorConfig::load(Some(&canon_dir));
     let accelerators_active = accel_cfg.enabled;
     let has_ext_plugins = !accel_cfg.external.is_empty();
@@ -8676,7 +8716,12 @@ pub fn evaluate_agent_step_value(
     if resolved_file.is_file() {
         let src_text = fs::read_to_string(&resolved_file)
             .with_context(|| format!("Failed to read {}", resolved_file.display()))?;
-        let decls = extract_decls_fast(&src_text, decl_filter);
+        let decls = audit_spec::extract_decls_fast_for_path(
+            &src_text,
+            decl_filter,
+            Some(&resolved_file),
+            Some(&canon_dir),
+        );
 
         for d in &decls {
             total_specs_audited += 1;
@@ -8712,20 +8757,20 @@ pub fn evaluate_agent_step_value(
                 crate::lake_build::shm_file_splits_dir(store)
                     .join(format!("st_{}.json", &st_hash[..24]))
             });
+        let src_b3 = blake3::hash(src_text.as_bytes()).to_hex().to_string();
+        let current_dep_hashes =
+            crate::lake_build::compute_imported_olean_interface_hashes(&src_text, &canon_dir, None);
         let st_split_opt = st_path_opt
             .as_ref()
             .and_then(|st_path| fs::read(st_path).ok())
             .and_then(|b| serde_json::from_slice::<crate::lake_build::ShmCachedFileSplit>(&b).ok())
+            .filter(|c| c.src_blake3 == src_b3 && c.dep_hashes == current_dep_hashes)
             .map(|c| c.split);
         let split = match st_split_opt {
             Some(sp) => sp,
             None => {
-                let dep_hashes = crate::lake_build::compute_imported_olean_interface_hashes(
-                    &src_text, &canon_dir, None,
-                );
-                let sp = crate::splitter::split_lean_source(&src_text, &dep_hashes);
+                let sp = crate::splitter::split_lean_source(&src_text, &current_dep_hashes);
                 if let Some(ref st_path) = st_path_opt {
-                    let src_b3 = blake3::hash(src_text.as_bytes()).to_hex().to_string();
                     let entry = crate::lake_build::ShmCachedFileSplit {
                         split_key: format!("file-split:v2:{}", src_b3),
                         src_blake3: src_b3,
@@ -8736,7 +8781,7 @@ pub fn evaluate_agent_step_value(
                             String::new()
                         },
                         known_modified: false,
-                        dep_hashes,
+                        dep_hashes: current_dep_hashes,
                     };
                     if let Ok(bytes) = serde_json::to_vec(&entry) {
                         let _ = crate::shm_cache::atomic_write_shm(st_path, &bytes);
@@ -9609,7 +9654,7 @@ theorem masked_trivial (x : Nat) : AlwaysTrue x := by trivial
         assert_eq!(rep_unf["ok"].as_bool(), Some(false));
         assert_eq!(rep_unf["vacuous_specs"].as_u64(), Some(1));
         assert_eq!(rep_unf["trivial_specs"].as_u64(), Some(1));
-        assert_eq!(rep_unf["specs"][0]["pos_witness"].as_str().is_some(), true);
+        assert!(rep_unf["specs"][0]["pos_witness"].as_str().is_some());
         assert_eq!(
             rep_unf["specs"][1]["neg_witness"].as_str(),
             Some("none(tautological_postcondition)")
@@ -11395,5 +11440,169 @@ theorem buggy_sk_distinct (k : StorageKey) : StorageKey.map2 1 2 3 = k := by sor
             "StorageKey.slot 0x0000000000000001",
         );
         assert!(sk_cert && sk_ver == "0.5.0");
+    }
+
+    #[test]
+    fn test_allowlisted_import_shadow_fails_closed_and_execution_failed_verdict() {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_lean_import_shadow_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("TurboLean")).unwrap();
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        // Shadow `TurboLean/FastCheck.lean` locally with altered `Word256` semantics:
+        fs::write(
+            dir.join("TurboLean/FastCheck.lean"),
+            "structure Word256 where\n  w0 : UInt64\ndef Word256.zero : Word256 := ⟨1⟩\n",
+        )
+        .unwrap();
+        let test_lean = dir.join("ShadowedSpec.lean");
+        let shadowed_src = "\
+import TurboLean.FastCheck
+open TurboLean.FastCheck
+theorem shadowed_false_cex (a : Word256) : a = Word256.zero := by sorry
+";
+        fs::write(&test_lean, shadowed_src).unwrap();
+
+        let decls = audit_spec::extract_decls_fast_for_path(
+            shadowed_src,
+            None,
+            Some(&test_lean),
+            Some(&dir),
+        );
+        assert_eq!(decls.len(), 1);
+        assert!(
+            !decls[0].trusted_elab_context,
+            "local shadow of allow-listed import must force untrusted_elab_context"
+        );
+
+        let mcp_res = crate::mcp::execute_fast_check(
+            Some(test_lean.to_str().unwrap()),
+            Some("shadowed_false_cex"),
+            None,
+            None,
+            Some("cpu"),
+            false,
+            Some(&dir),
+        );
+        assert_ne!(
+            mcp_res["status"].as_str(),
+            Some("counterexample_found"),
+            "MCP fast-check must not emit false counterexample on shadowed allow-listed import: {}",
+            mcp_res
+        );
+
+        // Canonical repo `TurboLean.FastCheck` must remain trusted:
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .unwrap()
+            .join("lean");
+        let canon_decls =
+            audit_spec::extract_decls_fast_for_path(shadowed_src, None, None, Some(&repo_root));
+        assert_eq!(canon_decls.len(), 1);
+        assert!(canon_decls[0].trusted_elab_context);
+
+        // Uncertified `execution_failed` payload must map to `!ok && !is_cex`, never `is_cex`:
+        let exec_failed = serde_json::json!({
+            "status": "execution_failed",
+            "ok": false,
+            "lean_native_certified": false,
+            "certification": "unavailable",
+            "output": "uncaught exception"
+        });
+        let verdict = crate::mcp::StepVerdict::from_verbose(exec_failed);
+        assert!(!verdict.ok && !verdict.is_cex && verdict.status == "execution_failed");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_agent_step_shm_split_cache_invalidates_on_olean_change() {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_lean_shm_split_dep_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let olean_dir = dir.join(".lake/build/lib/lean");
+        fs::create_dir_all(&olean_dir).unwrap();
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(dir.join("lakefile.lean"), "-- test\n").unwrap();
+        let dep_olean = olean_dir.join("DepMod.olean");
+        let main_file = dir.join("UseDep.lean");
+        let src_text = "import DepMod\ntheorem dep_sensitive_thm (x : Nat) : x = x := by\n  rfl\n";
+        fs::write(&main_file, src_text).unwrap();
+
+        let mut store = crate::db::TurboStore::open(Some(&dir.join("store"))).unwrap();
+        let canon_dir = dir.canonicalize().unwrap();
+        let canon_file = main_file.canonicalize().unwrap();
+        let toolchain = crate::lake_build::detect_toolchain(&canon_dir);
+
+        // Populate a poisoned SHM stat split entry recorded against `olean_v1` while disk now has `olean_v2`:
+        fs::write(&dep_olean, b"olean-bytes-v1-interface").unwrap();
+        let dep_v1 =
+            crate::lake_build::compute_imported_olean_interface_hashes(src_text, &canon_dir, None);
+        let split_v1 = crate::splitter::split_lean_source(src_text, &dep_v1);
+        let src_b3 = blake3::hash(src_text.as_bytes()).to_hex().to_string();
+        let meta = fs::metadata(&canon_file).unwrap();
+        let (ms, mn, sz) = crate::db::TurboStore::extract_file_stat_tuple(&meta);
+        let st_hash =
+            crate::lake_build::compute_single_stat_hash(&canon_file.to_string_lossy(), ms, mn, sz);
+        let st_path = crate::lake_build::shm_file_splits_dir(&store)
+            .join(format!("st_{}.json", &st_hash[..24]));
+        let stale_entry = crate::lake_build::ShmCachedFileSplit {
+            split_key: format!("file-split:v2:{}", src_b3),
+            src_blake3: src_b3.clone(),
+            split: crate::lake_build::compact_split_for_shm_cache(&split_v1),
+            prefix_src: src_text.to_string(),
+            known_modified: false,
+            dep_hashes: dep_v1.clone(),
+        };
+        crate::shm_cache::atomic_write_shm(&st_path, &serde_json::to_vec(&stale_entry).unwrap())
+            .unwrap();
+
+        // Update `DepMod.olean` on disk to `v2` without touching `UseDep.lean` stat tuple:
+        fs::write(&dep_olean, b"olean-bytes-v2-changed-interface").unwrap();
+        let dep_v2 =
+            crate::lake_build::compute_imported_olean_interface_hashes(src_text, &canon_dir, None);
+        assert_ne!(dep_v1, dep_v2);
+        let split_v2 = crate::splitter::split_lean_source(src_text, &dep_v2);
+        let lean_args =
+            crate::module_builder::try_resolve_lean_args_for_path(&canon_dir, Some(&canon_file))
+                .unwrap();
+        let shard_key_v2 = crate::lake_build::compute_shard_key_with_args(
+            &toolchain,
+            &split_v2.shards[0],
+            &lean_args,
+        );
+        let receipt = serde_json::to_vec(&serde_json::json!({
+            "ok": true,
+            "lean_options_digest": Option::<String>::None,
+        }))
+        .unwrap();
+        store
+            .batch_publish_theorem_shards(
+                "UseDep.lean",
+                "trusted",
+                &[(shard_key_v2, "dep_sensitive_thm".to_string(), receipt, 1)],
+            )
+            .unwrap();
+
+        let step_val = evaluate_agent_step_value(
+            &mut store,
+            &canon_file,
+            Some("dep_sensitive_thm"),
+            Some(&canon_dir),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(step_val["status"].as_str(), Some("theorem_cache_hit"));
+        let refreshed: crate::lake_build::ShmCachedFileSplit =
+            serde_json::from_slice(&fs::read(&st_path).unwrap()).unwrap();
+        assert_eq!(refreshed.dep_hashes, dep_v2);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

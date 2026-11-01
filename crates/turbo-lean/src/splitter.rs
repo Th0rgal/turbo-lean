@@ -835,6 +835,39 @@ pub(crate) fn is_section_header_line(trimmed_clean: &str) -> bool {
     after == "section" || after.starts_with("section ")
 }
 
+fn mask_structural_lean_text(clean: &str) -> std::borrow::Cow<'_, str> {
+    let no_strings = strip_string_literals(clean);
+    if !no_strings.contains('«') {
+        return no_strings;
+    }
+    let bytes = no_strings.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    let mut depth = 0i32;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0xC2 && i + 1 < bytes.len() && bytes[i + 1] == 0xAB {
+            depth += 1;
+            out.extend_from_slice(&[0xC2, 0xAB]);
+            i += 2;
+        } else if depth > 0 && b == 0xC2 && i + 1 < bytes.len() && bytes[i + 1] == 0xBB {
+            depth -= 1;
+            out.extend_from_slice(&[0xC2, 0xBB]);
+            i += 2;
+        } else if depth > 0 {
+            out.push(if b == b'\n' { b'\n' } else { b' ' });
+            i += 1;
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    std::borrow::Cow::Owned(
+        String::from_utf8(out)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
+    )
+}
+
 /// Zero-copy segmentation of `(src, clean)` into top-level `CmdSpan`s.
 /// Handles `/-- ... -/` doc comments, multi-line `@[...]` attribute / modifier prefixes,
 /// commands indented inside `section ... end` blocks, and `mutual ... end` blocks without
@@ -856,6 +889,8 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
     let mut pos = 0usize;
     let mut mutual_depth = 0usize;
     let mut scope_depth = 0usize;
+    let structural = mask_structural_lean_text(clean);
+    let structural = structural.as_ref();
 
     while pos < total_len {
         let line_start = pos;
@@ -875,8 +910,8 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
         };
 
         let line_orig = &src[line_start..line_end_no_cr];
-        let line_clean = &clean[line_start..line_end_no_cr];
-        let trimmed = line_clean.trim_start();
+        let line_structural = &structural[line_start..line_end_no_cr];
+        let trimmed = line_structural.trim_start();
         let indent = line_orig.len() - line_orig.trim_start().len();
         let is_unindented = indent == 0;
         let starts_doc_comment = line_orig.trim_start().starts_with("/--")
@@ -897,10 +932,10 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
         }
 
         let prev_clean = &clean[cur_byte_start..cur_byte_end];
-        let prev_trimmed = prev_clean.trim();
-        let prev_is_section_or_ns_header = is_section_header_line(prev_trimmed)
-            || prev_trimmed.starts_with("namespace ")
-            || is_end_line_start(prev_trimmed);
+        let prev_structural = structural[cur_byte_start..cur_byte_end].trim();
+        let prev_is_section_or_ns_header = is_section_header_line(prev_structural)
+            || prev_structural.starts_with("namespace ")
+            || is_end_line_start(prev_structural);
 
         let can_start_at_indent = is_unindented
             || (scope_depth > 0
@@ -1113,6 +1148,8 @@ fn split_mutual_block_subspans<'a>(
     if orig.len() != clean.len() {
         return None;
     }
+    let structural = mask_structural_lean_text(clean);
+    let structural = structural.as_ref();
     let first_nl = orig.find('\n')?;
 
     // Find the last non-empty line in `clean` so trailing blank lines after `end` are preserved
@@ -1126,7 +1163,7 @@ fn split_mutual_block_subspans<'a>(
         return None;
     }
 
-    let last_line_clean = clean[last_nl + 1..trimmed_end_len].trim();
+    let last_line_clean = structural[last_nl + 1..trimmed_end_len].trim();
     if !is_end_line_start(last_line_clean) {
         return None;
     }
@@ -1135,6 +1172,7 @@ fn split_mutual_block_subspans<'a>(
     let footer_orig = &orig[last_nl + 1..];
     let body_orig = &orig[first_nl + 1..last_nl];
     let body_clean = &clean[first_nl + 1..last_nl];
+    let body_structural = &structural[first_nl + 1..last_nl];
 
     if body_orig.trim().is_empty() {
         return None;
@@ -1142,7 +1180,7 @@ fn split_mutual_block_subspans<'a>(
 
     // Determine declaration indentation, not proof indentation: Lean also accepts
     // an unindented `:=` continuation inside a mutual block.
-    let min_indent = body_clean
+    let min_indent = body_structural
         .lines()
         .filter(|l| is_top_level_command_start(l.trim_start()))
         .map(|l| l.len() - l.trim_start().len())
@@ -1175,8 +1213,8 @@ fn split_mutual_block_subspans<'a>(
         };
 
         let line_orig = &body_orig[line_start..line_end_no_cr];
-        let line_clean = &body_clean[line_start..line_end_no_cr];
-        let trimmed = line_clean.trim_start();
+        let line_structural = &body_structural[line_start..line_end_no_cr];
+        let trimmed = line_structural.trim_start();
         let indent = line_orig.len() - line_orig.trim_start().len();
         let is_top_inner = indent <= min_indent;
         let starts_doc = is_top_inner && line_orig.trim_start().starts_with("/--");
@@ -1782,7 +1820,8 @@ fn extract_section_header_name(trimmed: &str) -> &str {
 /// Update `stack` for scope commands (`namespace A.B.C`, `section`, `noncomputable section`,
 /// `mutual`, `end A.B.C`) in `clean_chunk`.
 fn update_scope_stack_with_idx(stack: &mut Vec<ScopeFrame>, clean_chunk: &str, span_idx: usize) {
-    for line in clean_chunk.lines() {
+    let structural = mask_structural_lean_text(clean_chunk);
+    for line in structural.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("namespace ") {
             let name = rest.split_whitespace().next().unwrap_or("");
@@ -1895,7 +1934,8 @@ fn compute_closed_section_ranges(spans: &[CmdSpan<'_>]) -> Vec<(usize, usize)> {
     let mut closed_sections = Vec::new();
 
     for (idx, span) in spans.iter().enumerate() {
-        for line in span.clean_text.lines() {
+        let structural = mask_structural_lean_text(span.clean_text);
+        for line in structural.lines() {
             let trimmed = line.trim();
             if let Some(rest) = trimmed.strip_prefix("namespace ") {
                 let name = rest.split_whitespace().next().unwrap_or("");
@@ -5509,6 +5549,47 @@ end MathlibEdgeCases
                 .map(str::trim),
             src.lines().nth(target_shard.start_line - 1).map(str::trim)
         );
+    }
+
+    #[test]
+    fn test_multiline_string_literal_and_guillemet_do_not_split_or_corrupt_scopes() {
+        let src = "\
+namespace Outer
+
+def embeddedBanner : String := \"first line
+namespace FakeInner
+section FakeSec
+theorem fake_inside_string : False := by sorry
+mutual
+def fake_mutual : Nat := 0
+end
+end FakeSec
+end FakeInner\"
+
+def «end» : Nat := 7
+
+theorem real_after_multiline_string (x : Nat) : x = x := by
+  rfl
+
+end Outer
+";
+        let split = split_lean_source(src, &[]);
+        let names: Vec<&str> = split.shards.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            !names.iter().any(|n| n.contains("fake_")),
+            "unexpected fake shard from string literal: {:?}",
+            names
+        );
+        let real_shard = split
+            .shards
+            .iter()
+            .find(|s| s.name == "real_after_multiline_string")
+            .expect("expected real_after_multiline_string shard");
+        assert_eq!(
+            real_shard.qualified_name,
+            "Outer.real_after_multiline_string"
+        );
+        assert!(real_shard.shard_source.contains("embeddedBanner"));
     }
 }
 

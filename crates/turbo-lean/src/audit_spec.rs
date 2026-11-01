@@ -1338,9 +1338,7 @@ pub(super) fn extract_local_def_unfoldings(clean_src: &str) -> Vec<LocalDefUnfol
         }
         if line == "end" || line.starts_with("end ") {
             let end_ns = line.strip_prefix("end").unwrap_or("").trim();
-            if end_ns.is_empty() {
-                current_ns.clear();
-            } else if current_ns == end_ns {
+            if end_ns.is_empty() || current_ns == end_ns {
                 current_ns.clear();
             } else if let Some(prefix) = current_ns.strip_suffix(&format!(".{}", end_ns)) {
                 current_ns = prefix.to_string();
@@ -1368,13 +1366,10 @@ pub(super) fn extract_local_def_unfoldings(clean_src: &str) -> Vec<LocalDefUnfol
                 break;
             }
         }
-        let rest_kw = if let Some(r) = line.strip_prefix("def ") {
-            Some(r.trim())
-        } else if let Some(r) = line.strip_prefix("abbrev ") {
-            Some(r.trim())
-        } else {
-            None
-        };
+        let rest_kw = line
+            .strip_prefix("def ")
+            .or_else(|| line.strip_prefix("abbrev "))
+            .map(str::trim);
         let Some(first_rest) = rest_kw else {
             idx += 1;
             continue;
@@ -2698,17 +2693,19 @@ pub(super) fn audit_single_decl_spec_full(
     (res, pos_w, neg_w, drop_hyps)
 }
 
-pub(super) fn audit_single_decl_spec_full_with_policy(
-    decl: &ExtractedDecl,
-    local_defs: &[LocalDefUnfolding],
-    policy: &AuditSpecPolicyConfig,
-) -> (
+type AuditSingleDeclResult = (
     (bool, bool, String),
     String,
     String,
     Vec<String>,
     Vec<String>,
-) {
+);
+
+pub(super) fn audit_single_decl_spec_full_with_policy(
+    decl: &ExtractedDecl,
+    local_defs: &[LocalDefUnfolding],
+    policy: &AuditSpecPolicyConfig,
+) -> AuditSingleDeclResult {
     let mut hyp_strings = Vec::new();
     for (_, ty) in &decl.binders {
         if !is_known_binder_value_type(ty) {
@@ -2904,9 +2901,165 @@ pub(super) fn audit_single_decl_spec_full_with_policy(
     )
 }
 
+fn canonical_allowlisted_module_blake3(mod_name: &str) -> Option<blake3::Hash> {
+    let canonical_src = match mod_name {
+        "LeanNative.Backend.FastCheck" => {
+            include_str!("../../../lean/LeanNative/Backend/FastCheck.lean")
+        }
+        "TurboLean.FastCheck" => include_str!("../../../lean/TurboLean/FastCheck.lean"),
+        "LeanNative.IR.Types" => include_str!("../../../lean/LeanNative/IR/Types.lean"),
+        "TurboLean.Reflection" => include_str!("../../../lean/TurboLean/Reflection.lean"),
+        _ => return None,
+    };
+    Some(blake3::hash(canonical_src.as_bytes()))
+}
+
+pub(crate) fn allowlisted_imports_match_canonical_in_dir(
+    imported_modules: &[String],
+    project_dir: Option<&Path>,
+) -> bool {
+    let mut visited = std::collections::HashSet::new();
+    let mut queue: Vec<String> = imported_modules.to_vec();
+    while let Some(mod_name) = queue.pop() {
+        if !visited.insert(mod_name.clone()) {
+            continue;
+        }
+        let Some(expected_hash) = canonical_allowlisted_module_blake3(&mod_name) else {
+            return false;
+        };
+        if mod_name == "TurboLean.FastCheck" {
+            queue.push("LeanNative.Backend.FastCheck".to_string());
+        } else if mod_name == "LeanNative.Backend.FastCheck" {
+            queue.push("LeanNative.IR.Types".to_string());
+        }
+        let rel_slash = crate::module_builder::module_name_to_rel_slash(&mod_name);
+        let rel_lean = format!("{}.lean", rel_slash);
+        let rel_olean = format!("{}.olean", rel_slash);
+        let mut verified_local_source = false;
+
+        if let Some(proj) = project_dir.filter(|p| !p.as_os_str().is_empty()) {
+            let mut local_lean_cands = Vec::new();
+            if let Some(resolved) = crate::lake_build::resolve_project_lean_source(proj, &rel_slash)
+            {
+                local_lean_cands.push(resolved);
+            }
+            let pkgs_dir = proj.join(".lake/packages");
+            if let Ok(entries) = fs::read_dir(&pkgs_dir) {
+                for entry in entries.flatten() {
+                    if let Some(pkg_src) =
+                        crate::lake_build::resolve_project_lean_source(&entry.path(), &rel_slash)
+                    {
+                        local_lean_cands.push(pkg_src);
+                    }
+                }
+            }
+            for cand in local_lean_cands {
+                let Ok(bytes) = fs::read(&cand) else {
+                    return false;
+                };
+                if blake3::hash(&bytes) != expected_hash {
+                    return false;
+                }
+                verified_local_source = true;
+            }
+            let local_olean = proj.join(".lake/build/lib/lean").join(&rel_olean);
+            if local_olean.is_file() && !verified_local_source {
+                return false;
+            }
+            if let Ok(entries) = fs::read_dir(&pkgs_dir) {
+                for entry in entries.flatten() {
+                    let pkg_olean = entry.path().join(".lake/build/lib/lean").join(&rel_olean);
+                    if pkg_olean.is_file() {
+                        let pkg_lean_ok = crate::lake_build::resolve_project_lean_source(
+                            &entry.path(),
+                            &rel_slash,
+                        )
+                        .and_then(|p| fs::read(p).ok())
+                        .is_some_and(|b| blake3::hash(&b) == expected_hash);
+                        if !pkg_lean_ok {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Ok(lp) = std::env::var("LEAN_PATH") {
+            for part in lp
+                .split(':')
+                .filter(|s| !s.is_empty() && !s.contains("/toolchains/"))
+            {
+                let dir = Path::new(part);
+                let cand_olean = dir.join(&rel_olean);
+                let cand_lean = dir.join(&rel_lean);
+                if cand_lean.is_file() {
+                    let Ok(bytes) = fs::read(&cand_lean) else {
+                        return false;
+                    };
+                    if blake3::hash(&bytes) != expected_hash {
+                        return false;
+                    }
+                } else if cand_olean.is_file() {
+                    let root_lean_ok = dir
+                        .ancestors()
+                        .take(5)
+                        .find_map(|anc| {
+                            crate::lake_build::resolve_project_lean_source(anc, &rel_slash)
+                        })
+                        .and_then(|p| fs::read(p).ok())
+                        .is_some_and(|b| blake3::hash(&b) == expected_hash);
+                    if !root_lean_ok {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+pub(crate) fn enforce_decl_import_integrity_for_path(
+    decls: &mut [ExtractedDecl],
+    file: Option<&Path>,
+    project_dir: Option<&Path>,
+) {
+    let inferred = project_dir
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            file.filter(|f| f.exists() || f.parent().is_some_and(Path::exists))
+                .map(crate::lake_build::infer_project_dir_from_lean_file)
+        });
+    for d in decls {
+        if d.trusted_elab_context
+            && d.scope.has_explicit_imports
+            && !allowlisted_imports_match_canonical_in_dir(
+                &d.scope.imported_modules,
+                inferred.as_deref(),
+            )
+        {
+            d.trusted_elab_context = false;
+        }
+    }
+}
+
+#[allow(dead_code)]
 pub(super) fn extract_decls_fast(src: &str, decl_filter: Option<&str>) -> Vec<ExtractedDecl> {
     // Keep lexical context even for filtered declarations in large sources.
-    extract_all_lean_theorems(src, decl_filter)
+    let mut decls = extract_all_lean_theorems(src, decl_filter);
+    enforce_decl_import_integrity_for_path(&mut decls, None, None);
+    decls
+}
+
+pub(crate) fn extract_decls_fast_for_path(
+    src: &str,
+    decl_filter: Option<&str>,
+    file: Option<&Path>,
+    project_dir: Option<&Path>,
+) -> Vec<ExtractedDecl> {
+    let mut decls = extract_all_lean_theorems(src, decl_filter);
+    enforce_decl_import_integrity_for_path(&mut decls, file, project_dir);
+    decls
 }
 
 /// Schema version for the Blake3 content-addressed `audit-spec` per-file JSON cache.
@@ -3074,6 +3227,13 @@ pub fn audit_spec_file_or_source_with_policy(
                         ld_hasher.update(&(type_deps.len() as u64).to_le_bytes());
                         ld_hasher.update(type_deps.as_bytes());
                     }
+                    let proj_root = crate::lake_build::infer_project_dir_from_lean_file(file);
+                    for dep_entry in crate::lake_build::compute_imported_olean_interface_hashes(
+                        &file_src, &proj_root, None,
+                    ) {
+                        ld_hasher.update(&(dep_entry.len() as u64).to_le_bytes());
+                        ld_hasher.update(dep_entry.as_bytes());
+                    }
                     let ld_digest = *ld_hasher.finalize().as_bytes();
                     let hex_hash = compute_audit_spec_cache_key_with_policy(
                         decl_filter,
@@ -3223,7 +3383,9 @@ pub fn audit_spec_file_or_source_with_policy(
             defs
         };
 
-        for d in extract_decls_fast(src, decl_filter) {
+        let src_file_opt =
+            (inline_src.is_none() && src_path.is_file()).then_some(src_path.as_path());
+        for d in extract_decls_fast_for_path(src, decl_filter, src_file_opt, None) {
             total_specs_audited += 1;
             let ((is_vacuous, is_tight, reason), pos_witness, neg_witness, drop_hyps, decl_stubs) =
                 audit_single_decl_spec_full_with_policy(&d, &local_defs, policy);

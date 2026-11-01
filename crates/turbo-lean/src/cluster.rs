@@ -1006,7 +1006,7 @@ fn rust_boxed_baseline_step(i: u64) -> u64 {
     };
     let needed = (i & 63) <= 32;
     let is_sound = used_forbidden.is_empty();
-    let pinned = (i ^ 0xA5A5_5A5A) == (i ^ 0xA5A5_5A5A);
+    let pinned = std::hint::black_box(i ^ 0xA5A5_5A5A) == (i ^ 0xA5A5_5A5A);
     let mut z = i.wrapping_add(0x9e3779b97f4a7c15);
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
