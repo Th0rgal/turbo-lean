@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import time
@@ -645,6 +646,242 @@ class TestP0TrustBoundary(unittest.TestCase):
                 self.assertEqual(result["checked"], 0)
         with patch.object(fuzzer, "LEAN_NATIVE_FULL", Path("/nonexistent/frontend")):
             self.assertEqual(fuzzer.run_fuzzer(3)["status"], "incomplete_missing_engine")
+
+    def test_13_tiered_conformance_and_sanitizer_gates_fail_closed(self) -> None:
+        suite = ROOT / "scripts" / "run_conformance_suite.py"
+        for bad_tier in ("C2", "C3"):
+            res = subprocess.run(
+                [sys.executable, str(suite), "--tier", bad_tier, "--json"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(res.returncode, 0, bad_tier)
+            rep = json.loads(res.stdout)
+            self.assertFalse(rep["ok"])
+            self.assertEqual(rep["tierResults"][bad_tier]["status"], "BLOCKED_MISSING_DEPENDENCY")
+
+        bad_arg = subprocess.run(
+            [sys.executable, str(suite), "--tier", "C99"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(bad_arg.returncode, 2)
+
+        with patch.object(fuzzer, "find_sanitizer_linker", return_value=None):
+            missing_san = fuzzer.run_fuzzer(4, asan=True, ubsan=True)
+            self.assertFalse(missing_san["ok"])
+            self.assertEqual(missing_san["status"], "incomplete_missing_engine")
+
+        engines = fuzzer.probe_engines(asan=True, ubsan=True)
+        self.assertTrue(engines["c_abi_llvm"], engines)
+
+        # Fail closed when LLVM IR has zero definitions or references an undefined attribute group,
+        # handle non-#0/#1 attribute groups, and stay idempotent when sanitize_address is already present.
+        with self.assertRaises(RuntimeError):
+            fuzzer.instrument_llvm_ir_for_asan("; empty module\n")
+        with self.assertRaises(RuntimeError):
+            fuzzer.instrument_llvm_ir_for_asan("define i64 @f() #7 {\n  ret i64 0\n}\n")
+        inst_custom = fuzzer.instrument_llvm_ir_for_asan(
+            "define dso_local i64 @g() #3 {\n  ret i64 0\n}\n"
+            "define dso_local i64 @bare() {\n  ret i64 1\n}\n"
+            "attributes #3 = {nounwind}\n"
+        )
+        self.assertIn("attributes #3 = { sanitize_address nounwind }", inst_custom)
+        self.assertIn("define dso_local i64 @bare() sanitize_address {", inst_custom)
+        self.assertEqual(fuzzer.instrument_llvm_ir_for_asan(inst_custom).count("sanitize_address"), 2)
+        multi = fuzzer.instrument_llvm_ir_for_asan(
+            'define i64 @multi(i64 %x) #0 #1 section ".text" {\n  ret i64 %x\n}\n'
+            'define i64 @quoted(i64 %x) "section" "#9" #4 {\n  ret i64 %x\n}\n'
+            "attributes #0 = { nounwind }\n"
+            "attributes #1 = { uwtable }\n"
+            "attributes #4 = { nounwind }\n"
+            'attributes #9 = { "not-an-attribute" }\n'
+        )
+        self.assertIn("attributes #0 = { sanitize_address nounwind }", multi)
+        self.assertIn("attributes #1 = { sanitize_address uwtable }", multi)
+        self.assertIn("attributes #4 = { sanitize_address nounwind }", multi)
+        self.assertNotIn("sanitize_address", multi.split("attributes #9", 1)[1])
+        self.assertEqual(fuzzer.instrument_llvm_ir_for_asan(multi).count("sanitize_address"), 3)
+
+        with tempfile.TemporaryDirectory(prefix="p0_san_kill_") as tmp:
+            p = Path(tmp)
+            ll = p / "oob.ll"
+            c = p / "driver.c"
+            b = p / "oob_runner"
+            ll.write_text(
+                "define dso_local i64 @oob_read(i64 %idx) #2 {\n"
+                "entry:\n"
+                "  %arr = alloca [2 x i64], align 8\n"
+                "  %ptr = getelementptr [2 x i64], ptr %arr, i64 0, i64 %idx\n"
+                "  %v = load volatile i64, ptr %ptr, align 8\n"
+                "  ret i64 %v\n"
+                "}\n"
+                "attributes #2 = {nounwind uwtable}\n",
+                encoding="utf-8",
+            )
+            c.write_text(
+                "#include <stdint.h>\n#include <stdio.h>\n"
+                "extern uint64_t oob_read(uint64_t);\n"
+                "int main(void) {\n"
+                "  volatile int shift = 70;\n"
+                "  int ub = 1 << shift;\n"
+                "  printf(\"%d %llu\\n\", ub, (unsigned long long)oob_read(2));\n"
+                "  return 0;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            san_meta = fuzzer.compile_and_link_llvm_driver(
+                clang_bin=engines["clang_bin"],
+                extra_inc=fuzzer.clang_extra_flags(engines["clang_bin"]),
+                ll_path=ll,
+                driver_c_path=c,
+                out_bin_path=b,
+                asan=True,
+                ubsan=False,
+                sanitizer_linker=engines["sanitizer_linker"],
+            )
+            self.assertEqual(san_meta["ubsan_scope"], "disabled")
+            c_no_ub = p / "driver_asan.c"
+            c_no_ub.write_text(
+                "#include <stdint.h>\n#include <stdio.h>\n"
+                "extern uint64_t oob_read(uint64_t);\n"
+                "int main(void) { printf(\"%llu\\n\", (unsigned long long)oob_read(2)); return 0; }\n",
+                encoding="utf-8",
+            )
+            fuzzer.compile_and_link_llvm_driver(
+                clang_bin=engines["clang_bin"],
+                extra_inc=fuzzer.clang_extra_flags(engines["clang_bin"]),
+                ll_path=ll,
+                driver_c_path=c_no_ub,
+                out_bin_path=b,
+                asan=True,
+                ubsan=False,
+                sanitizer_linker=engines["sanitizer_linker"],
+            )
+            crash = subprocess.run(
+                [str(b)],
+                env={**os.environ, "ASAN_OPTIONS": "detect_leaks=0:abort_on_error=1:halt_on_error=1"},
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(crash.returncode, 0, "ASan must abort on out-of-bounds LLVM alloca read")
+            self.assertIn("AddressSanitizer", crash.stderr)
+
+            ub_bin = p / "ub_runner"
+            ub_ll = p / "noop.ll"
+            ub_ll.write_text(
+                "define dso_local i64 @oob_read(i64 %idx) #0 {\n"
+                "entry:\n"
+                "  ret i64 %idx\n"
+                "}\n"
+                "attributes #0 = { nounwind uwtable }\n",
+                encoding="utf-8",
+            )
+            ub_meta = fuzzer.compile_and_link_llvm_driver(
+                clang_bin=engines["clang_bin"],
+                extra_inc=fuzzer.clang_extra_flags(engines["clang_bin"]),
+                ll_path=ub_ll,
+                driver_c_path=c,
+                out_bin_path=ub_bin,
+                asan=False,
+                ubsan=True,
+            )
+            self.assertEqual(ub_meta["ubsan_scope"], "c_driver_and_link_runtime_only_not_llvm_ir")
+            ub_crash = subprocess.run(
+                [str(ub_bin)],
+                env={**os.environ, "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=1"},
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(ub_crash.returncode, 0, "UBSan must abort on C driver shift UB")
+
+        # End-to-end propagation: an ASan abort in the compiled LLVM binary must fail run_fuzzer / run_conformance_suite.
+        orig_instrument_asan = fuzzer.instrument_llvm_ir_for_asan
+
+        def _inject_oob_ir(ir_text: str) -> str:
+            base = orig_instrument_asan(ir_text)
+            if "@fuzz_seed_0" not in base:
+                return base
+            patched, n_repl = re.subn(
+                r"(^define\b[^\n]*@fuzz_seed_0\([^\n{]*\{\nentry:\n)",
+                r"\1  %bad_arr = alloca [2 x i64], align 8\n"
+                r"  %bad_idx_slot = alloca i64, align 8\n"
+                r"  store volatile i64 2, ptr %bad_idx_slot, align 8\n"
+                r"  %bad_idx = load volatile i64, ptr %bad_idx_slot, align 8\n"
+                r"  %bad_ptr = getelementptr [2 x i64], ptr %bad_arr, i64 0, i64 %bad_idx\n"
+                r"  %bad_ld = load volatile i64, ptr %bad_ptr, align 8\n",
+                base,
+                count=1,
+                flags=re.M,
+            )
+            self.assertEqual(n_repl, 1, "Failed to inject OOB read into @fuzz_seed_0")
+            return patched
+
+        with patch.object(fuzzer, "instrument_llvm_ir_for_asan", side_effect=_inject_oob_ir):
+            failed_fuzz = fuzzer.run_fuzzer(1, asan=True, ubsan=False)
+            self.assertFalse(failed_fuzz["ok"], failed_fuzz)
+            self.assertEqual(failed_fuzz["checked"], 0)
+            self.assertTrue(failed_fuzz["shrunk_failures"])
+
+        contract_sh = ROOT / "scripts" / "verify_roadmap_contract.sh"
+        bad_auditor = subprocess.run(
+            ["bash", str(contract_sh)],
+            env={**os.environ, "TURBO_AUDITOR_BIN": "/nonexistent/turbo-lean"},
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(bad_auditor.returncode, 0)
+        self.assertIn("TURBO_AUDITOR_BIN", bad_auditor.stderr)
+
+    def test_14_emitter_mutants_unit_and_negative_accounting(self):
+        import emitter_mutants as em
+
+        self.assertTrue(em.run_unit_tests())
+        spec = em.load_spec()
+        ids = [m["id"] for m in spec["mutations"]]
+        self.assertEqual(ids, [f"M{i}" for i in range(1, 12)])
+        base_rows = [
+            {
+                "id": m["id"],
+                "backend": m["backend"],
+                "outcome": "KILLED",
+                "killed_by": ["C1"],
+                "checks": {},
+            }
+            for m in spec["mutations"]
+        ]
+        self.assertTrue(em.summarize(base_rows, spec, ids)["conclusive"])
+        survived = [dict(r) for r in base_rows]
+        survived[0] = {**survived[0], "outcome": "SURVIVED", "killed_by": []}
+        s_sum = em.summarize(survived, spec, ids)
+        self.assertEqual(s_sum["counts"].get("SURVIVED"), 1)
+        infra = [dict(r) for r in base_rows]
+        infra[1] = {**infra[1], "outcome": "INFRA_FAILED", "killed_by": []}
+        i_sum = em.summarize(infra, spec, ids)
+        self.assertFalse(i_sum["conclusive"])
+        self.assertEqual(i_sum["infra_failed_ids"], ["M2"])
+        apply_fail = [dict(r) for r in base_rows]
+        apply_fail[2] = {**apply_fail[2], "outcome": "APPLY_FAILED", "killed_by": []}
+        a_sum = em.summarize(apply_fail, spec, ids)
+        self.assertFalse(a_sum["conclusive"])
+        self.assertEqual(a_sum["apply_failed_ids"], ["M3"])
+        missing_row = em.summarize(base_rows[:-1], spec, ids)
+        self.assertFalse(missing_row["conclusive"])
+        self.assertEqual(missing_row["missing_universe_ids"], ["M11"])
+        targeted_sum = em.summarize(base_rows[:2], spec, ids[:2], targeted=True)
+        self.assertFalse(targeted_sum["conclusive"])
+        self.assertEqual(targeted_sum["run_outcome"], "TARGETED")
+        with tempfile.TemporaryDirectory() as tmp:
+            bad_home = Path(tmp) / "home"
+            bad_home.mkdir()
+            (bad_home / ".gitconfig").write_text("[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = /nonexistent/gpg\n")
+            unit = subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "emitter_mutants.py"), "--unit-tests"],
+                env={**os.environ, "HOME": str(bad_home)},
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(unit.returncode, 0, unit.stderr + unit.stdout)
 
 
 if __name__ == "__main__":

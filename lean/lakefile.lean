@@ -21,6 +21,12 @@ lean_lib «LeanNative» where
 lean_lib «LeanNativeCore» where
   roots := #[`LeanNative.Core]
 
+-- Shadow-semantics checker fixtures (scripts/check_shadow_semantics.lean --self-test).
+-- Not a default target: built only by the CI self-test step (`lake build ShadowFixtures`).
+lean_lib «ShadowFixtures» where
+  roots := #[`ShadowFixtures]
+  globs := #[.andSubmodules `ShadowFixtures]
+
 @[default_target]
 lean_exe «turbo-zygote» where
   root := `TurboLean.ZygoteWorker

@@ -12,9 +12,9 @@ checks; infrastructure signatures in the full output or signal termination
 override all kills.
 
 The non-blocking mutation CI job runs on push/workflow_dispatch, not PRs.
-C5 deviates from spec v4's `--tier C1`: the conformance suite rejects --tier,
-so C5 uses its default 50 fuzz seeds without --tier; the rejected invocation
-is recorded separately as a flag check.
+C5 uses the default 50 fuzz seeds without --tier (keeping C5 runtime bounded
+per mutant), while `c5_flag_check` verifies `--tier` flag parsing and fail-closed
+rejection of unknown tiers.
 
 After baseline C1, a snapshot of `lean/.lake/build` is kept and restored
 before each mutant so `ci-verify`'s `.olean` writes cannot force a 157-job
@@ -182,16 +182,20 @@ def classify(checks: dict, order: tuple[str, ...] = CHECK_ORDER) -> tuple[str, l
 
 
 def c5_flag_check(root: Path, env: dict[str, str]) -> dict:
-    argv = ["python3", "scripts/run_conformance_suite.py", "--tier", "C1"]
-    result = subprocess.run(argv, cwd=root, env=env, capture_output=True, text=True)
-    text = (result.stderr or "") + (result.stdout or "")
+    help_argv = ["python3", "scripts/run_conformance_suite.py", "--help"]
+    help_res = subprocess.run(help_argv, cwd=root, env=env, capture_output=True, text=True)
+    help_text = (help_res.stdout or "") + (help_res.stderr or "")
+    bad_argv = ["python3", "scripts/run_conformance_suite.py", "--tier", "C99"]
+    bad_res = subprocess.run(bad_argv, cwd=root, env=env, capture_output=True, text=True)
+    bad_text = (bad_res.stderr or "") + (bad_res.stdout or "")
     return {
-        "argv": argv,
-        "exit": result.returncode,
-        "unrecognized": result.returncode == 2 and "unrecognized arguments" in text,
-        "stderr_tail": text[-500:],
+        "argv": bad_argv,
+        "exit": bad_res.returncode,
+        "tier_flag_supported": help_res.returncode == 0 and "--tier" in help_text,
+        "unknown_tier_rejected": bad_res.returncode == 2 and "Unknown conformance tier" in bad_text,
+        "stderr_tail": bad_text[-500:],
         "used_by_C5": False,
-        "note": "C5 runs scripts/run_conformance_suite.py with its default 50 fuzz seeds and no --tier.",
+        "note": "C5 runs scripts/run_conformance_suite.py with its default 50 fuzz seeds (tier C4); --tier C1,C4 runs in blocking roadmap-conformance CI.",
     }
 
 
@@ -864,10 +868,17 @@ def run_unit_tests() -> bool:
                 path.write_bytes(b"mutant")
                 self.assertNotEqual(before[relative], hash_builds(self.root)[relative])
 
+        def test_c5_flag_check_verifies_tier_support_and_unknown_tier_rejection(self):
+            flag_res = c5_flag_check(ROOT, os.environ.copy())
+            self.assertTrue(flag_res["tier_flag_supported"], flag_res)
+            self.assertTrue(flag_res["unknown_tier_rejected"], flag_res)
+            self.assertFalse(flag_res["used_by_C5"])
+
         def test_removed_in_requires_emitter_deletion_diff(self):
             git(["init", "-q"], self.root)
             git(["config", "user.name", "Runner Test"], self.root)
             git(["config", "user.email", "runner@example.invalid"], self.root)
+            git(["config", "commit.gpgsign", "false"], self.root)
             mutation = json.loads(json.dumps(self.spec["mutations"][-1]))
             path = self.root / mutation["file"]
             path.parent.mkdir(parents=True)
@@ -875,7 +886,7 @@ def run_unit_tests() -> bool:
 
             def commit(message: str) -> str:
                 git(["add", "."], self.root)
-                git(["commit", "-qm", message], self.root)
+                git(["-c", "commit.gpgsign=false", "commit", "--no-gpg-sign", "-qm", message], self.root)
                 return git(["rev-parse", "HEAD"], self.root).stdout.strip()
 
             commit("add emitter")

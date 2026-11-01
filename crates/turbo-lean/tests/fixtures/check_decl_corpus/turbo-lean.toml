@@ -1,0 +1,3 @@
+# Explicit fixture-only policy for clifv's native witnesses; never admit sorryAx/trustCompiler.
+[axioms]
+allow = ["Lean.ofReduceBool", "*._native.native_decide.ax_*", "*._native.bv_decide.ax_*"]

@@ -187,13 +187,12 @@ pub fn acquire_flock(
             fs::create_dir_all(parent)?;
         }
     }
-    let f = fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(lock_path)?;
-    flock_file(f, exclusive, nonblocking)
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).read(true).write(true).truncate(false);
+    // A planted symlink must not make the lock create or open a file elsewhere.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut opts, libc::O_NOFOLLOW);
+    flock_file(opts.open(lock_path)?, exclusive, nonblocking)
 }
 
 fn flock_file(
