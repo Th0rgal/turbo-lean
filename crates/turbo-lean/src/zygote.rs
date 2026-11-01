@@ -6761,6 +6761,15 @@ mod tests {
                 .env("TURBO_LEAN_STAGING_DIR", &dir)
                 .spawn()
                 .unwrap();
+            // Freeze startup before taking the /proc identity snapshot. Otherwise the
+            // copied sleep executable can still change its argv/environment during libc
+            // initialization, correctly making the later production identity check refuse
+            // SIGTERM. Stopped children also exercise escalation to SIGKILL deterministically.
+            let pid = child.id() as libc::pid_t;
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) }, pid);
+            assert!(libc::WIFSTOPPED(status));
             // Same user-wide (staging=None) identity path, with an explicit candidate set
             // so this test cannot affect any developer's live daemons.
             processes.push(open_test_lifecycle_process(&mut child, None));
