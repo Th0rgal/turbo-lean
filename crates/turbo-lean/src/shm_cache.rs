@@ -571,6 +571,145 @@ pub fn atomic_write_shm(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+pub struct StagedTempFile {
+    path: PathBuf,
+    _lease: Option<FlockGuard>,
+}
+
+impl StagedTempFile {
+    pub fn write(path: PathBuf, bytes: impl AsRef<[u8]>) -> std::io::Result<Self> {
+        let g = Self::reserve(path)?;
+        fs::write(&g.path, bytes.as_ref())?;
+        Ok(g)
+    }
+
+    pub fn reserve(path: PathBuf) -> std::io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        let lease = acquire_flock(&staging_lease_lock_path(&path), false, false)?;
+        Ok(Self {
+            path,
+            _lease: lease,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl std::ops::Deref for StagedTempFile {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for StagedTempFile {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for StagedTempFile {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.path.as_os_str()
+    }
+}
+
+impl Drop for StagedTempFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+        // Drop our `LOCK_SH` fd before attempting best-effort `LOCK_EX | LOCK_NB` sidecar cleanup.
+        let _ = self._lease.take();
+        let _ = reap_stale_lock_if_unheld(&staging_lease_lock_path(&self.path));
+    }
+}
+
+fn staging_lease_lock_path(target: &Path) -> PathBuf {
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let fname = target
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_else(|| std::borrow::Cow::Borrowed("staged"));
+    parent.join(format!(".{}.lease.lock", fname))
+}
+
+#[cfg(unix)]
+fn file_inode_key(f: &fs::File) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    f.metadata().ok().map(|m| (m.dev(), m.ino()))
+}
+
+#[cfg(unix)]
+fn path_nofollow_inode_key(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+fn try_lock_unheld_sidecar(lock_path: &Path) -> Option<FlockGuard> {
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true).write(true).create(false);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut opts, libc::O_NOFOLLOW);
+    let f = opts.open(lock_path).ok()?;
+    let guard = flock_file(f, true, true).ok()??;
+    #[cfg(unix)]
+    if file_inode_key(&guard.0) != path_nofollow_inode_key(lock_path) {
+        return None;
+    }
+    Some(guard)
+}
+
+pub fn try_remove_unleased_staged_file(target: &Path) -> bool {
+    let lock_path = staging_lease_lock_path(target);
+    if !lock_path.exists() {
+        return fs::remove_file(target).is_ok();
+    }
+    let Some(guard) = try_lock_unheld_sidecar(&lock_path) else {
+        return false;
+    };
+    let removed = fs::remove_file(target).is_ok();
+    if !target.exists() {
+        let _ = fs::remove_file(&lock_path);
+    }
+    drop(guard);
+    removed
+}
+
+pub fn reap_stale_lock_if_unheld(lock_path: &Path) -> bool {
+    let Some(guard) = try_lock_unheld_sidecar(lock_path) else {
+        return false;
+    };
+    if let Some(fname) = lock_path.file_name().and_then(|n| n.to_str()) {
+        if let Some(orig) = fname
+            .strip_prefix('.')
+            .and_then(|s| s.strip_suffix(".lease.lock"))
+        {
+            if lock_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(orig)
+                .exists()
+            {
+                return false;
+            }
+        }
+    }
+    let ok = fs::remove_file(lock_path).is_ok();
+    drop(guard);
+    ok
+}
+
+pub fn is_staging_lease_held(target: &Path) -> bool {
+    let lock_path = staging_lease_lock_path(target);
+    lock_path.exists() && try_lock_unheld_sidecar(&lock_path).is_none()
+}
+
 fn scan_evictable_shm_files(
     shm_dir: &Path,
     reap_stale_locks: bool,
@@ -591,8 +730,11 @@ fn scan_evictable_shm_files(
                     .and_then(|m| SystemTime::now().duration_since(m).ok())
                     .is_some_and(|d| d.as_secs() > 600)
             {
-                let _ = fs::remove_file(path);
+                let _ = reap_stale_lock_if_unheld(path);
             }
+            continue;
+        }
+        if is_staging_lease_held(path) {
             continue;
         }
         let fname = path
@@ -603,6 +745,8 @@ fn scan_evictable_shm_files(
             || fname == "zygote_daemon.json"
             || fname == "zygote_lru_registry.json"
             || path.to_string_lossy().contains("zygote_daemon_cas_")
+            || path.to_string_lossy().contains("TurboAuditedShard_")
+            || path.to_string_lossy().contains("fastcheck_shared_bins")
         {
             continue;
         }
@@ -640,13 +784,10 @@ pub fn enforce_shm_quota_lru(shm_dir: &Path, max_bytes: u64) -> std::io::Result<
         if total_size <= target_bytes {
             break;
         }
-        match fs::remove_file(&path) {
-            Ok(()) => {
-                total_size = total_size.saturating_sub(sz);
-                evicted_files += 1;
-                freed_bytes = freed_bytes.saturating_add(sz);
-            }
-            Err(e) => debug_log_cache_err("enforce_shm_quota_lru(remove_file)", &e),
+        if try_remove_unleased_staged_file(&path) {
+            total_size = total_size.saturating_sub(sz);
+            evicted_files += 1;
+            freed_bytes = freed_bytes.saturating_add(sz);
         }
     }
     Ok((evicted_files, freed_bytes))
@@ -866,6 +1007,9 @@ pub fn spill_shm_to_disk_dir(
         if max_shm_bytes > 0 && total_size <= target_bytes {
             break;
         }
+        if is_staging_lease_held(&path) {
+            continue;
+        }
         let Some(file_name) = path.file_name() else {
             continue;
         };
@@ -873,7 +1017,16 @@ pub fn spill_shm_to_disk_dir(
         let tmp_dest = stage_unique_tmp_path(&dest_path)?;
         let move_res = fs::copy(&path, &tmp_dest)
             .and_then(|_| fs::rename(&tmp_dest, &dest_path))
-            .and_then(|_| fs::remove_file(&path));
+            .and_then(|_| {
+                if try_remove_unleased_staged_file(&path) {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "staging file leased during spill",
+                    ))
+                }
+            });
         match move_res {
             Ok(()) => {
                 total_size = total_size.saturating_sub(sz);
@@ -882,6 +1035,9 @@ pub fn spill_shm_to_disk_dir(
             }
             Err(e) => {
                 let _ = fs::remove_file(&tmp_dest);
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    let _ = fs::remove_file(&dest_path);
+                }
                 debug_log_cache_err("spill_shm_to_disk_dir(move)", &e);
             }
         }

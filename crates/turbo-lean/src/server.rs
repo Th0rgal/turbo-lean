@@ -1014,12 +1014,20 @@ pub fn serve_cas_http_with_auth(
                     if let Some(expected) = req.execution_identity.as_deref() {
                         let (imports, _) = crate::zygote::split_shard_for_zygote(src);
                         let actual = crate::zygote::resolve_zygote_context(
-                            tc, &req.lean_path, &env_vars, &lean_bin, &imports,
+                            tc,
+                            &req.lean_path,
+                            &env_vars,
+                            &lean_bin,
+                            &imports,
                         );
                         if expected != actual.identity {
-                            let _ = write_json_response(&mut stream, 409, &serde_json::json!({
-                                "ok": false, "error": "eval execution identity changed"
-                            }));
+                            let _ = write_json_response(
+                                &mut stream,
+                                409,
+                                &serde_json::json!({
+                                    "ok": false, "error": "eval execution identity changed"
+                                }),
+                            );
                             return;
                         }
                     }
@@ -1046,9 +1054,10 @@ pub fn serve_cas_http_with_auth(
                             let mut deterministic = true;
                             if req.verify_determinism && !zreply.timed_out {
                                 let staging = req_store.fast_staging_dir();
-                                let tmp_eval =
-                                    staging.join(format!("http_eval_det_{}.lean", next_tmp_id()));
-                                if fs::write(&tmp_eval, src).is_ok() {
+                                if let Ok(tmp_eval) = crate::shm_cache::StagedTempFile::write(
+                                    staging.join(format!("http_eval_det_{}.lean", next_tmp_id())),
+                                    src,
+                                ) {
                                     let mut cmd = Command::new(&lean_bin);
                                     for arg in &filtered_eval_args {
                                         cmd.arg(arg);
@@ -1073,7 +1082,6 @@ pub fn serve_cas_http_with_auth(
                                     )
                                     .map(|out| out.status.success() == zreply.ok)
                                     .unwrap_or(false);
-                                    let _ = fs::remove_file(&tmp_eval);
                                 }
                             }
                             let _ = write_json_response(
@@ -2189,9 +2197,15 @@ fn execute_fastcheck_payload_deferred(
                 || try_populate_cached_bin_from_shared(&staging, &src_text, &cached_bin);
 
             if !shared_populated {
-                let tmp_lean = staging.join(format!("http_fc_{}_{}.lean", pid, ts));
-                let tmp_c = staging.join(format!("http_fc_{}_{}.c", pid, ts));
-                let tmp_bin = staging.join(format!("http_fc_{}_{}.bin", pid, ts));
+                let tmp_lean = crate::shm_cache::StagedTempFile::reserve(
+                    staging.join(format!("http_fc_{}_{}.lean", pid, ts)),
+                )?;
+                let tmp_c = crate::shm_cache::StagedTempFile::reserve(
+                    staging.join(format!("http_fc_{}_{}.c", pid, ts)),
+                )?;
+                let tmp_bin = crate::shm_cache::StagedTempFile::reserve(
+                    staging.join(format!("http_fc_{}_{}.bin", pid, ts)),
+                )?;
 
                 let (env_vars, lean_bin) =
                     resolve_server_lean_env_and_bin(store, "leanprover/lean4:v4.35.0", "");
@@ -2457,7 +2471,8 @@ mod bind_auth_tests {
         batch.coalesced_shard_source = source.into();
         batch.items[0].shard_key = batch_key;
         batch.lean_args = low;
-        let (second, _, hits) = execute_check_shards_batch_payload_deferred(&mut store, &batch, None)?;
+        let (second, _, hits) =
+            execute_check_shards_batch_payload_deferred(&mut store, &batch, None)?;
         assert_eq!(second.cache_hits, 0);
         assert!(hits.is_empty());
         // Partial hit: only the entry verified under the requested options may be pruned.

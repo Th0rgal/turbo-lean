@@ -181,22 +181,24 @@ fn deepest_preexisting_boundary_for_locks(raw_locks: &Path) -> Result<(PathBuf, 
 /// `fs::canonicalize` on the created directory) and durably persist `<store_root>/locks`,
 /// `store_root`, every newly created intermediate directory, and the immediate pre-existing parent
 /// directory naming the highest newly created entry (including `.` for relative `--cache-dir`
-/// roots and symlinked prefixes) before returning the canonical `<store_root>/locks` path.
+/// roots, symlinked prefixes, and partially created racing-peer ancestry) before returning the
+/// canonical `<store_root>/locks` path.
 ///
 /// Concurrency, permission & crash invariants:
 /// - Never lexically strip `..` or `file_name()` on unresolved prefixes: `fs::create_dir_all` on
 ///   `raw_locks` performs real OS component-by-component creation (including any missing
 ///   intermediate followed by `..`, which is synced before walking canonical `abs_locks` ancestors),
 ///   after which `fs::canonicalize` yields the exact canonical `locks/` directory inode.
-/// - Pre-existing upper host directories above the store's pre-existing parent (e.g., `/home`,
-///   `/Users/<admin>`, `/var/lib/...` with mode `0711` execute-only search permissions, or a
-///   read-only `/` root mount) were NOT modified to link this store and may forbid `O_RDONLY`
-///   directory opens (`EACCES`) or `fsync` (`EROFS`/`EINVAL`). Stopping the bottom-up barrier at
-///   the deepest pre-existing ancestor (floored at `abs_store.parent()` so racing peers that
-///   observe already-created `store_root/locks` without `store_tree_durable.v1` still sync the
-///   store's parent; and extending higher only while lower ancestors remain writable/syncable when
-///   `locks/` already existed) avoids touching unrelated upper host directories while failing
-///   closed on any required directory barrier before writing `store_tree_durable.v1`.
+/// - Every directory from `abs_locks` up through `required_stop` (the deepest pre-existing ancestor
+///   observed before creation, floored at `abs_store.parent()`) MUST succeed its directory barrier
+///   or initialization fails closed without writing `store_tree_durable.v1`.
+/// - Above `required_stop`, a racing peer paused partway through `fs::create_dir_all` (even before
+///   creating `locks/`) may have just created `required_stop` inside an unsynced outer workspace
+///   directory. We therefore continue syncing upward across readable/writable user ancestors
+///   regardless of whether `locks/` already existed, stopping cleanly at the first pre-existing
+///   traverse-only (`0711`/`EACCES`) or read-only (`EROFS`/`EINVAL` on `/`) host boundary while
+///   failing closed on genuine I/O errors (`EIO`, `ENOSPC`, etc.) or on barriers whose `File::open`
+///   succeeded (`PermissionDenied` from the sync/fsync itself).
 pub(crate) fn ensure_store_locks_dir_durable(store_root: &Path) -> Result<PathBuf> {
     let raw_locks = if store_root.is_absolute() {
         store_root.join("locks")
@@ -208,7 +210,6 @@ pub(crate) fn ensure_store_locks_dir_durable(store_root: &Path) -> Result<PathBu
     }
     let (pre_existing_boundary, missing_prefixes) =
         deepest_preexisting_boundary_for_locks(&raw_locks)?;
-    let locks_preexisted = raw_locks.exists();
     fs::create_dir_all(&raw_locks)?;
     let abs_locks = fs::canonicalize(&raw_locks)?;
     let abs_marker = abs_locks.join(STORE_TREE_DURABLE_MARKER);
@@ -248,36 +249,32 @@ pub(crate) fn ensure_store_locks_dir_durable(store_root: &Path) -> Result<PathBu
             }
             if same_dir_inode(p, &required_stop) || p.parent().is_none() {
                 reached_required_stop = true;
-                if !locks_preexisted {
-                    break;
-                }
             }
         } else {
-            // Racing-peer recovery (`locks_preexisted && !abs_marker.exists()`): a concurrent peer
-            // may have created an intermediate parent directory right before our scan without yet
-            // syncing the outer directory naming it. Sync upward opportunistically, stopping cleanly
-            // if we reach a pre-existing `0711` / read-only host boundary (`EACCES`/`EROFS`/`EINVAL`).
+            // Partially created racing-peer ancestry recovery: a concurrent initializer paused
+            // after creating an intermediate ancestor (whether or not `locks/` existed yet) may not
+            // have synced the outer workspace directory naming that intermediate. Sync upward across
+            // readable ancestors, stopping cleanly only if `File::open` hits a traverse-only host
+            // boundary (`EACCES`/`EPERM`) or `fsync` hits a read-only/virtual root mount (`EROFS`/`EINVAL`).
             if !synced_dirs.iter().any(|d| same_dir_inode(d, p)) {
-                match sync_dir(p) {
+                let dir_file = match File::open(p) {
+                    Ok(f) => f,
+                    Err(ioe)
+                        if matches!(ioe.kind(), std::io::ErrorKind::PermissionDenied)
+                            || matches!(ioe.raw_os_error(), Some(libc::EACCES | libc::EPERM)) =>
+                    {
+                        break;
+                    }
+                    Err(ioe) => return Err(ioe.into()),
+                };
+                match durability_barrier(&dir_file) {
                     Ok(()) => {
                         synced_dirs.push(p.to_path_buf());
                     }
-                    Err(e) => {
-                        let stop_host_boundary =
-                            e.downcast_ref::<std::io::Error>().is_some_and(|ioe| {
-                                matches!(ioe.kind(), std::io::ErrorKind::PermissionDenied)
-                                    || matches!(
-                                        ioe.raw_os_error(),
-                                        Some(
-                                            libc::EACCES | libc::EPERM | libc::EROFS | libc::EINVAL
-                                        )
-                                    )
-                            });
-                        if stop_host_boundary {
-                            break;
-                        }
-                        return Err(e);
+                    Err(ioe) if matches!(ioe.raw_os_error(), Some(libc::EROFS | libc::EINVAL)) => {
+                        break;
                     }
+                    Err(ioe) => return Err(ioe.into()),
                 }
             }
             if p.parent().is_none() {
@@ -1142,7 +1139,7 @@ impl TurboStore {
         blobs: &[(String, String, i64, i64)],
         actions: &[ActionRecord],
     ) -> Result<(usize, usize)> {
-        batch_import_pack_metadata(&self.conn, blobs, actions)
+        self.batch_import_pack_metadata_with_domain(blobs, actions, "trusted")
     }
 
     pub fn batch_import_pack_metadata_with_domain(
@@ -1151,7 +1148,66 @@ impl TurboStore {
         actions: &[ActionRecord],
         trust_domain: &str,
     ) -> Result<(usize, usize)> {
-        batch_import_pack_metadata_with_domain(&self.conn, blobs, actions, trust_domain)
+        let counts =
+            batch_import_pack_metadata_with_domain(&self.conn, blobs, actions, trust_domain)?;
+        self.sync_sqlite_durable()?;
+        Ok(counts)
+    }
+
+    /// Durably persist committed SQLite WAL/database pages before publishing external filesystem
+    /// completion stamps (`locks/last_import_stamp`, `locks/cached_portable_manifest.json`) or
+    /// unlinking durable deferred-pack recovery spool records.
+    ///
+    /// First requests `PRAGMA wal_checkpoint(PASSIVE)` (under `PRAGMA synchronous = FULL`) so
+    /// checkpointed database pages are synced when no concurrent reader pins the WAL, then
+    /// explicitly opens and runs `durability_barrier` (`fsync`) on `state.db` and `state.db-wal`
+    /// (if present), plus `sync_dir(&self.root)` if `state.db-wal` had not yet been synced in the
+    /// directory. Fails closed (`Err`) if any barrier fails so callers never retire recovery spools
+    /// or publish warm-import stamps ahead of SQLite durability.
+    pub(crate) fn sync_sqlite_durable(&self) -> Result<()> {
+        self.conn.execute_batch("PRAGMA synchronous = FULL;")?;
+        let ckpt_res: Result<(i64, i64, i64)> = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .map_err(Into::into);
+        let _ = self.conn.execute_batch("PRAGMA synchronous = NORMAL;");
+        let (_busy, log_frames, ckpt_frames) = ckpt_res?;
+
+        let db_path = self.root.join("state.db");
+        let db_file = File::open(&db_path)
+            .with_context(|| format!("open {} for SQLite durability barrier", db_path.display()))?;
+        durability_barrier(&db_file).with_context(|| {
+            format!("fsync {} for SQLite durability barrier", db_path.display())
+        })?;
+
+        let wal_path = self.root.join("state.db-wal");
+        match File::open(&wal_path) {
+            Ok(wal_file) => {
+                durability_barrier(&wal_file).with_context(|| {
+                    format!("fsync {} for SQLite durability barrier", wal_path.display())
+                })?;
+                sync_dir(&self.root)?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if log_frames > ckpt_frames {
+                    anyhow::bail!(
+                        "SQLite WAL {} disappeared with {} uncheckpointed frames ({} logged, {} checkpointed)",
+                        wal_path.display(),
+                        log_frames - ckpt_frames,
+                        log_frames,
+                        ckpt_frames
+                    );
+                }
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("open {} for SQLite durability barrier", wal_path.display())
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Size-checked presence of a CAS blob against its `blobs` row (bare existence when the blob
@@ -3132,8 +3188,23 @@ impl TurboStore {
         for &(st_dir, is_store_owned) in sweep_dirs {
             if let Ok(entries) = fs::read_dir(st_dir) {
                 for entry in entries.flatten() {
+                    let path = entry.path();
                     let fname = entry.file_name();
                     let fname_str = fname.to_string_lossy();
+                    if fname_str.ends_with(".lock") {
+                        if let Ok(meta) = entry.metadata() {
+                            let age_secs = meta
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.elapsed().ok())
+                                .map(|d| d.as_secs())
+                                .unwrap_or(120);
+                            if age_secs >= 30 || (is_store_owned && max_reclaimable_bytes == 0) {
+                                let _ = crate::shm_cache::reap_stale_lock_if_unheld(&path);
+                            }
+                        }
+                        continue;
+                    }
                     if fname_str.starts_with("git_head_tree_")
                         || fname_str.starts_with("project_stat_splits_")
                         || fname_str.starts_with("project_splits_")
@@ -3153,7 +3224,7 @@ impl TurboStore {
                                 .unwrap_or(120);
                             if age_secs >= 30 || (is_store_owned && max_reclaimable_bytes == 0) {
                                 let sz = meta.len();
-                                if fs::remove_file(entry.path()).is_ok() {
+                                if crate::shm_cache::try_remove_unleased_staged_file(&path) {
                                     cleaned_staging_files += 1;
                                     freed_bytes += sz;
                                 }
@@ -3858,15 +3929,7 @@ pub fn batch_get_theorem_shards_in_domain(
 
 /// Batch-insert or update imported `.tlpack` blobs, actions, and action_outputs inside a single
 /// `BEGIN IMMEDIATE ... COMMIT` SQLite transaction using cached prepared statements.
-pub fn batch_import_pack_metadata(
-    conn: &Connection,
-    blobs: &[(String, String, i64, i64)],
-    actions: &[ActionRecord],
-) -> Result<(usize, usize)> {
-    batch_import_pack_metadata_with_domain(conn, blobs, actions, "trusted")
-}
-
-pub fn batch_import_pack_metadata_with_domain(
+pub(crate) fn batch_import_pack_metadata_with_domain(
     conn: &Connection,
     blobs: &[(String, String, i64, i64)],
     actions: &[ActionRecord],
@@ -4115,7 +4178,15 @@ thread_local! {
 
 /// Record every barrier this thread takes (`file:<name>` or `dir:<name>`) instead of fsyncing.
 #[cfg(test)]
-fn set_durability_recorder(log: std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+pub(crate) fn set_durability_recorder(log: std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    set_durability_recorder_with_fault(log, None);
+}
+
+#[cfg(test)]
+pub(crate) fn set_durability_recorder_with_fault(
+    log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    fail_label_prefix: Option<&'static str>,
+) {
     use std::os::unix::io::AsRawFd;
     DURABILITY_HOOK.with(|h| {
         *h.borrow_mut() = Some(std::sync::Arc::new(move |f| {
@@ -4125,14 +4196,21 @@ fn set_durability_recorder(log: std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
                 .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
                 .unwrap_or_else(|| if is_dir { "dir" } else { "file" }.to_string());
             let prefix = if is_dir { "dir:" } else { "file:" };
-            log.lock().unwrap().push(format!("{}{}", prefix, name));
+            let label = format!("{}{}", prefix, name);
+            if fail_label_prefix.is_some_and(|fp| label.starts_with(fp)) {
+                log.lock().unwrap().push(format!("err:{label}"));
+                return Err(std::io::Error::other(format!(
+                    "injected durability barrier failure on {label}"
+                )));
+            }
+            log.lock().unwrap().push(label);
             Ok(())
         }));
     });
 }
 
 #[cfg(test)]
-fn clear_durability_recorder() {
+pub(crate) fn clear_durability_recorder() {
     DURABILITY_HOOK.with(|h| *h.borrow_mut() = None);
 }
 
@@ -5630,6 +5708,40 @@ mod tests {
             "expected bottom-up ancestor sync on raced pre-created dirs, got {evs:?}"
         );
         assert!(raced_store
+            .join("locks")
+            .join(STORE_TREE_DURABLE_MARKER)
+            .exists());
+
+        // Partially created racing-peer ancestry: a peer created the intermediate directory
+        // `partial_unpersisted_parent` inside `dir`, then paused BEFORE creating `partial_store`
+        // or `locks/` and BEFORE syncing `dir`. A second initializer sees `partial_unpersisted_parent`
+        // as the deepest pre-existing ancestor while `locks/` is still absent (`locks_preexisted == false`),
+        // and MUST still repair and sync the outer `dir` before publishing `store_tree_durable.v1`.
+        let partial_parent = dir.join("partial_unpersisted_parent");
+        let partial_store = partial_parent.join("partial_store");
+        fs::create_dir_all(&partial_parent)?;
+        assert!(!partial_store.exists());
+        let _ = take_log();
+        let partial_guard = acquire_cas_publication_guard(&partial_store)?;
+        drop(partial_guard);
+        let evs = take_log();
+        let pp_store = evs
+            .iter()
+            .position(|s| s == "dir:partial_store")
+            .expect("peer must sync newly created partial_store");
+        let pp_parent = evs
+            .iter()
+            .position(|s| s == "dir:partial_unpersisted_parent")
+            .expect("peer must sync partial_unpersisted_parent");
+        let pp_outer = evs
+            .iter()
+            .position(|s| *s == format!("dir:{dir_fname}"))
+            .expect("peer must sync outer workspace dir for partially created intermediate");
+        assert!(
+            pp_store < pp_parent && pp_parent < pp_outer,
+            "expected bottom-up sync partial_store -> partial_unpersisted_parent -> outer dir, got {evs:?}"
+        );
+        assert!(partial_store
             .join("locks")
             .join(STORE_TREE_DURABLE_MARKER)
             .exists());

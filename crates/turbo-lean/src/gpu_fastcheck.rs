@@ -3086,9 +3086,11 @@ pub fn run_fast_check_command(
             } else {
                 "nvcc"
             };
-            let tmp_bin = store
-                .fast_staging_dir()
-                .join(format!("fastcheck_gpu_{}.bin", std::process::id()));
+            let tmp_bin = crate::shm_cache::StagedTempFile::reserve(
+                store
+                    .fast_staging_dir()
+                    .join(format!("fastcheck_gpu_{}.bin", std::process::id())),
+            )?;
             let compile_out = Command::new(nvcc_bin)
                 .arg("-O3")
                 .arg("-arch=native")
@@ -3251,9 +3253,15 @@ pub fn run_fast_check_command(
                     crate::pack::resolve_server_lean_env_and_bin(store, &tc, "");
 
                 let pid = std::process::id();
-                let tmp_c = staging.join(format!("fastcheck_{}.c", pid));
-                let tmp_bin = staging.join(format!("fastcheck_{}.bin", pid));
-                let tmp_lean = staging.join(format!("fastcheck_src_{}.lean", pid));
+                let tmp_c = crate::shm_cache::StagedTempFile::reserve(
+                    staging.join(format!("fastcheck_{}.c", pid)),
+                )?;
+                let tmp_bin = crate::shm_cache::StagedTempFile::reserve(
+                    staging.join(format!("fastcheck_{}.bin", pid)),
+                )?;
+                let tmp_lean = crate::shm_cache::StagedTempFile::reserve(
+                    staging.join(format!("fastcheck_src_{}.lean", pid)),
+                )?;
 
                 let mut st1_ok = false;
                 if let Some(ref fast_src) = cgen_fast_src {
@@ -3277,27 +3285,26 @@ pub fn run_fast_check_command(
                             PathBuf::from(crate::lake_build::lean_bin_from_env(&lake_env));
                         env_vars = lake_env;
                     }
-                    let compile_target = if has_main {
-                        canon_file.clone()
+                    let compile_target: &Path = if has_main {
+                        &canon_file
                     } else {
                         fs::write(&tmp_lean, &effective_src)?;
-                        tmp_lean.clone()
+                        &tmp_lean
                     };
                     let compile_dir = if has_main { &lean_dir } else { &staging };
                     let st1 = Command::new(&lean_bin_path)
                         .arg("-c")
                         .arg(&tmp_c)
-                        .arg(&compile_target)
+                        .arg(compile_target)
                         .current_dir(compile_dir)
                         .envs(&env_vars)
                         .status()
                         .context("Failed to compile Lean to C via `lean -c`")?;
                     if !st1.success() {
-                        let _ = fs::remove_file(&tmp_lean);
                         anyhow::bail!("`lean -c` failed on {}", file.display());
                     }
                 }
-                let _ = fs::remove_file(&tmp_lean);
+                drop(tmp_lean);
 
                 let leanc_bin = lean_bin_path
                     .parent()

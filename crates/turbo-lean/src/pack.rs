@@ -582,11 +582,14 @@ pub(crate) fn replay_pending_deferred_packs_inner(
             deferred_td,
             true,
         ) {
-            Ok(_) => {
-                if fs::remove_file(&spool_path).is_ok() {
-                    removed_any = true;
+            Ok(_) => match fs::remove_file(&spool_path) {
+                Ok(()) => removed_any = true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    replay_err = Some(e.into());
+                    break;
                 }
-            }
+            },
             Err(e) => {
                 replay_err = Some(e);
                 break;
@@ -594,7 +597,11 @@ pub(crate) fn replay_pending_deferred_packs_inner(
         }
     }
     if removed_any {
-        let _ = crate::db::sync_dir(&locks_dir);
+        if let Err(e) = crate::db::sync_dir(&locks_dir) {
+            if replay_err.is_none() {
+                replay_err = Some(e);
+            }
+        }
     }
     if let Some(e) = replay_err {
         return Err(e);
@@ -1553,10 +1560,12 @@ pub fn export_pack_filtered_with_signing_key(
         return Ok((n_acts, n_blobs, total_raw_bytes));
     }
 
-    let tmp_raw = store
-        .fast_staging_dir()
-        .join(format!("export_{}.tlpack.raw", next_tmp_id()));
-    fs::write(&tmp_raw, &pack_stream)?;
+    let tmp_raw = crate::shm_cache::StagedTempFile::write(
+        store
+            .fast_staging_dir()
+            .join(format!("export_{}.tlpack.raw", next_tmp_id())),
+        &pack_stream,
+    )?;
 
     let zstd_status = Command::new("zstd")
         .args([
@@ -1569,7 +1578,7 @@ pub fn export_pack_filtered_with_signing_key(
         ])
         .status();
 
-    let _ = fs::remove_file(&tmp_raw);
+    drop(tmp_raw);
     if zstd_status.map(|s| !s.success()).unwrap_or(true) {
         fs::write(output_path, &pack_stream)?;
     }
@@ -1814,16 +1823,6 @@ pub fn try_stateless_cold_import_with_domain(
     }
     let _pub_guard = crate::db::acquire_cas_publication_guard(store_root).ok()?;
     let (staged_blobs, _) = prestage_blobs_from_shared_cas(store_root, &manifest)?;
-    let header_hash = blake3::hash(&header_buf).to_hex().to_string();
-    let stamp_val = format!(
-        "{}:{}:{}:{}",
-        header_hash,
-        manifest.actions.len(),
-        staged_blobs.len(),
-        td
-    );
-    let locks_dir = store_root.join("locks");
-    let created = crate::db::ensure_dir_tracking(&locks_dir, store_root).ok()?;
     let mut v3_bytes = Vec::with_capacity(16 + header_len);
     v3_bytes.extend_from_slice(b"TLPK\x00\x00\x00\x03");
     v3_bytes.extend_from_slice(&(header_len as u64).to_le_bytes());
@@ -1832,12 +1831,6 @@ pub fn try_stateless_cold_import_with_domain(
         return None;
     }
     drop(_pub_guard);
-    crate::db::write_bytes_durable(
-        &locks_dir.join("last_import_stamp"),
-        stamp_val.as_bytes(),
-        &created,
-    )
-    .ok()?;
     if td == "trusted" {
         save_cached_portable_manifest_from_pack(store_root, &manifest);
     }
@@ -2008,6 +2001,7 @@ pub(crate) fn finish_import_from_prestaged_shared_cas_inner(
                         && store.has_completed_action_in_domain(&a.action_key, "trusted"))
             })
         {
+            store.sync_sqlite_durable()?;
             write_stamp()?;
             if td == "trusted" {
                 save_cached_portable_manifest_from_pack(&store.root, manifest);
@@ -2120,14 +2114,16 @@ pub fn import_pack_bytes_with_policy(
     let owned_decomp: Option<Vec<u8>> = if is_uncompressed {
         None
     } else {
-        let tmp_in = store
-            .fast_staging_dir()
-            .join(format!("import_{}.tlpack.zst", next_tmp_id()));
-        fs::write(&tmp_in, input_bytes)?;
+        let tmp_in = crate::shm_cache::StagedTempFile::write(
+            store
+                .fast_staging_dir()
+                .join(format!("import_{}.tlpack.zst", next_tmp_id())),
+            input_bytes,
+        )?;
         let decomp = Command::new("zstd")
             .args(["-q", "-d", "-c", tmp_in.to_str().unwrap_or("")])
             .output();
-        let _ = fs::remove_file(&tmp_in);
+        drop(tmp_in);
         match decomp {
             Ok(out) if out.status.success() && !out.stdout.is_empty() => Some(out.stdout),
             _ => None,
@@ -2678,10 +2674,16 @@ pub fn prewarm_shared_fastcheck_harness(
         .unwrap_or_else(|| std::path::PathBuf::from("leanc"));
     let pid = std::process::id();
     let ts = next_tmp_id();
-    let tmp_lean = staging.join(format!("prewarm_fc_{}_{}.lean", pid, ts));
-    let tmp_c = staging.join(format!("prewarm_fc_{}_{}.c", pid, ts));
-    let tmp_bin = staging.join(format!("prewarm_fc_{}_{}.bin", pid, ts));
-    fs::write(&tmp_lean, FASTCHECK_PRELUDE_HARNESS)?;
+    let tmp_lean = crate::shm_cache::StagedTempFile::write(
+        staging.join(format!("prewarm_fc_{}_{}.lean", pid, ts)),
+        FASTCHECK_PRELUDE_HARNESS,
+    )?;
+    let tmp_c = crate::shm_cache::StagedTempFile::reserve(
+        staging.join(format!("prewarm_fc_{}_{}.c", pid, ts)),
+    )?;
+    let tmp_bin = crate::shm_cache::StagedTempFile::reserve(
+        staging.join(format!("prewarm_fc_{}_{}.bin", pid, ts)),
+    )?;
     let out1 = Command::new(lean_bin)
         .arg(format!("--root={}", staging.display()))
         .arg("-c")
@@ -2690,19 +2692,17 @@ pub fn prewarm_shared_fastcheck_harness(
         .current_dir(&staging)
         .envs(env_vars)
         .output()?;
-    let _ = fs::remove_file(&tmp_lean);
+    drop(tmp_lean);
     if out1.status.success() {
         if let Ok(out2) =
             compile_fastcheck_c_to_bin(lean_bin, &leanc_bin, &tmp_c, &tmp_bin, &staging, env_vars)
         {
-            let _ = fs::remove_file(&tmp_c);
+            drop(tmp_c);
             if out2.status.success() {
                 save_compiled_bin_to_shared(&staging, FASTCHECK_PRELUDE_HARNESS, &tmp_bin);
             }
         }
     }
-    let _ = fs::remove_file(&tmp_c);
-    let _ = fs::remove_file(&tmp_bin);
     Ok(())
 }
 
@@ -4897,6 +4897,119 @@ pub(crate) mod tests {
         }
         drop(gc_peer);
 
+        // 4. SQLite durability handoff ordering & fail-closed spool preservation:
+        //    - During cold-import replay, `last_import_stamp` must stay absent while the deferred
+        //      spool is still pending so `try_stateless_warm_import_with_domain` never short-circuits
+        //      ahead of SQLite replay.
+        //    - If the SQLite durability barrier (`file:state.db`) fails, `TurboStore::open` must fail
+        //      closed, preserve the pending deferred spool file, and leave `last_import_stamp` absent.
+        //    - When the barrier succeeds, `file:state.db` (and `file:state.db-wal` when present)
+        //      must be synced BEFORE `.last_import_stamp.*` / `dir:locks` retire the spool.
+        let root_handoff =
+            std::env::temp_dir().join(format!("turbo_lean_def_handoff_{}", next_tmp_id()));
+        let _ = fs::remove_dir_all(&root_handoff);
+        assert!(try_stateless_cold_import_with_domain(
+            &root_handoff,
+            &pack_a,
+            Some("trusted"),
+            None,
+            true
+        )
+        .is_some());
+        assert!(
+            !root_handoff
+                .join("locks")
+                .join("last_import_stamp")
+                .exists(),
+            "cold stateless import must not publish last_import_stamp before SQLite replay"
+        );
+        assert!(try_stateless_warm_import_with_domain(
+            &root_handoff,
+            &pack_a,
+            Some("trusted"),
+            None,
+            true
+        )
+        .is_none());
+
+        let fault_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::db::set_durability_recorder_with_fault(fault_log.clone(), Some("file:state.db"));
+        let fault_open = TurboStore::open(Some(&root_handoff));
+        crate::db::clear_durability_recorder();
+        assert!(
+            fault_open.is_err(),
+            "SQLite durability barrier failure must abort deferred-pack handoff"
+        );
+        assert_eq!(
+            list_pending_deferred_pack_files(&root_handoff.join("locks"))?.len(),
+            1,
+            "deferred spool must remain intact when SQLite durability barrier fails"
+        );
+        assert!(
+            !root_handoff
+                .join("locks")
+                .join("last_import_stamp")
+                .exists(),
+            "last_import_stamp must not be published when SQLite durability barrier fails"
+        );
+        assert!(try_stateless_warm_import_with_domain(
+            &root_handoff,
+            &pack_a,
+            Some("trusted"),
+            None,
+            true
+        )
+        .is_none());
+
+        // Clear any uncommitted/pre-barrier SQLite state as in a post-crash reboot, then record
+        // successful barrier ordering across deferred replay -> stamp -> spool removal.
+        let _ = fs::remove_file(root_handoff.join("state.db"));
+        let _ = fs::remove_file(root_handoff.join("state.db-wal"));
+        let _ = fs::remove_file(root_handoff.join("state.db-shm"));
+        let ok_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::db::set_durability_recorder(ok_log.clone());
+        let handoff_store = TurboStore::open(Some(&root_handoff))?;
+        crate::db::clear_durability_recorder();
+        let evs = std::mem::take(&mut *ok_log.lock().unwrap());
+        let db_sync_pos = evs
+            .iter()
+            .position(|s| s == "file:state.db")
+            .expect("SQLite state.db barrier recorded before stamp/spool retirement");
+        let stamp_sync_pos = evs
+            .iter()
+            .position(|s| s.starts_with("file:.last_import_stamp."))
+            .expect("last_import_stamp barrier recorded");
+        let final_locks_sync_pos = evs
+            .iter()
+            .rposition(|s| s == "dir:locks")
+            .expect("locks directory synced after spool removal");
+        assert!(
+            db_sync_pos < stamp_sync_pos && stamp_sync_pos < final_locks_sync_pos,
+            "expected file:state.db -> file:.last_import_stamp.* -> dir:locks ordering, got {evs:?}"
+        );
+        if let Some(wal_pos) = evs.iter().position(|s| s == "file:state.db-wal") {
+            assert!(
+                wal_pos < stamp_sync_pos,
+                "state.db-wal barrier must precede last_import_stamp: {evs:?}"
+            );
+        }
+        assert!(list_pending_deferred_pack_files(&root_handoff.join("locks"))?.is_empty());
+        assert!(handoff_store
+            .get_cached_action("def-act-alpha", "trusted")?
+            .is_some());
+        drop(handoff_store);
+        assert_eq!(
+            try_stateless_warm_import_with_domain(
+                &root_handoff,
+                &pack_a,
+                Some("trusted"),
+                None,
+                true
+            ),
+            Some((1, 1))
+        );
+
+        let _ = fs::remove_dir_all(&root_handoff);
         let _ = fs::remove_dir_all(&root_crash);
         let _ = fs::remove_dir_all(&root_a);
         let _ = fs::remove_dir_all(&root_b);

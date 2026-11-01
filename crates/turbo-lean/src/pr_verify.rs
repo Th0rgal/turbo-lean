@@ -1301,18 +1301,20 @@ fn base_revision_package_config(
     let mut blobs = fetch_git_blobs_batch(repo_root, &sha, &paths)?;
     for (index, path) in paths.iter().enumerate() {
         if let Some(raw) = blobs.remove(path) {
-            let staged = store.fast_staging_dir().join(format!(
-                "base-lakefile-{}-{}",
-                std::process::id(),
-                crate::pack::next_tmp_id()
-            ));
-            fs::write(&staged, raw)?;
+            let staged = crate::shm_cache::StagedTempFile::write(
+                store.fast_staging_dir().join(format!(
+                    "base-lakefile-{}-{}",
+                    std::process::id(),
+                    crate::pack::next_tmp_id()
+                )),
+                raw,
+            )?;
             let result = if index == 0 {
                 crate::module_builder::parse_lakefile_toml(canon_dir, &staged, false)
             } else {
                 crate::module_builder::parse_lakefile_lean(canon_dir, &staged, false)
             };
-            let _ = fs::remove_file(&staged);
+            drop(staged);
             return result
                 .with_context(|| {
                     format!("Failed to resolve base Lean options at {base_ref}:{path}")

@@ -1176,8 +1176,10 @@ fn check_directory(
             let mut cross_ok = proj_build_verified
                 || pack::try_local_zygote_check_shard(store, &env_vars, &zreq).is_some();
             if !cross_ok {
-                let tmp_cross = staging_dir.join(format!("cross_file_coalesced_{}.lean", pid));
-                fs::write(&tmp_cross, &cross_src)?;
+                let tmp_cross = crate::shm_cache::StagedTempFile::write(
+                    staging_dir.join(format!("cross_file_coalesced_{}.lean", pid)),
+                    &cross_src,
+                )?;
                 let mut cmd = Command::new(&lean_bin);
                 for arg in crate::module_builder::filter_allowed_lean_args(&cross_args) {
                     cmd.arg(arg);
@@ -1186,7 +1188,7 @@ fn check_directory(
                     cmd.arg(&tmp_cross).current_dir(canon_dir).envs(&env_vars),
                     Some(crate::zygote::remaining_timeout_ms(None, *t0)),
                 )?;
-                let _ = fs::remove_file(&tmp_cross);
+                drop(tmp_cross);
                 cross_ok = cross_out.status.success();
             }
             if cross_ok {
@@ -1283,7 +1285,11 @@ fn check_directory(
                                             }
                                         }
                                         if !batch_ok {
-                                            fs::write(&tmp_batch, &fast_src)?;
+                                            let leased_batch =
+                                                crate::shm_cache::StagedTempFile::write(
+                                                    tmp_batch.clone(),
+                                                    &fast_src,
+                                                )?;
                                             let mut cmd = Command::new(lean_bin_ref);
                                             for arg in
                                                 crate::module_builder::filter_allowed_lean_args(
@@ -1293,14 +1299,14 @@ fn check_directory(
                                                 cmd.arg(arg);
                                             }
                                             let out = crate::zygote::run_lean_command(
-                                                cmd.arg(&tmp_batch)
+                                                cmd.arg(&leased_batch)
                                                     .current_dir(canon_ref)
                                                     .envs(env_ref),
                                                 Some(crate::zygote::remaining_timeout_ms(
                                                     None, *t0,
                                                 )),
                                             )?;
-                                            let _ = fs::remove_file(&tmp_batch);
+                                            drop(leased_batch);
                                             if out.status.success() {
                                                 batch_ok = true;
                                             }
@@ -1313,7 +1319,9 @@ fn check_directory(
                                         src,
                                         &uncached_names,
                                     );
-                                    fs::write(&tmp_batch, &coal_src)?;
+                                    let leased_batch = crate::shm_cache::StagedTempFile::write(
+                                        tmp_batch, &coal_src,
+                                    )?;
                                     let mut cmd = Command::new(lean_bin_ref);
                                     for arg in crate::module_builder::filter_allowed_lean_args(
                                         file_lean_args,
@@ -1321,10 +1329,10 @@ fn check_directory(
                                         cmd.arg(arg);
                                     }
                                     let out = crate::zygote::run_lean_command(
-                                        cmd.arg(&tmp_batch).current_dir(canon_ref).envs(env_ref),
+                                        cmd.arg(&leased_batch).current_dir(canon_ref).envs(env_ref),
                                         Some(crate::zygote::remaining_timeout_ms(None, *t0)),
                                     )?;
-                                    let _ = fs::remove_file(&tmp_batch);
+                                    drop(leased_batch);
                                     if !out.status.success() {
                                         let stderr = String::from_utf8_lossy(&out.stderr);
                                         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -2657,7 +2665,10 @@ fn check_single_decl(
                     }
                 }
                 if !verified_via_zygote {
-                    fs::write(&tmp_shard, &full_shard_src)?;
+                    let leased_shard = crate::shm_cache::StagedTempFile::write(
+                        tmp_shard.clone(),
+                        &full_shard_src,
+                    )?;
                     let default_stack = env_vars
                         .get("LEAN_STACK_SIZE_KB")
                         .cloned()
@@ -2668,14 +2679,14 @@ fn check_single_decl(
                         cmd.arg(arg);
                     }
                     let out = crate::zygote::run_lean_command(
-                        cmd.arg(&tmp_shard)
+                        cmd.arg(&leased_shard)
                             .current_dir(canon_dir)
                             .envs(&env_vars)
                             .env("LEAN_STACK_SIZE_KB", default_stack),
                         Some(crate::zygote::remaining_timeout_ms(None, *t0)),
                     )
                     .context("Failed to execute `lean` on theorem shard")?;
-                    let _ = fs::remove_file(&tmp_shard);
+                    drop(leased_shard);
 
                     if !out.status.success() {
                         let tmp_display = tmp_shard.display().to_string();
@@ -3279,19 +3290,20 @@ fn check_single_file(
                     batch_succeeded = true;
                 }
                 Ok(None) => {
-                    fs::write(&tmp_coalesced, &coalesced_src)?;
+                    let leased_coalesced =
+                        crate::shm_cache::StagedTempFile::write(tmp_coalesced, &coalesced_src)?;
                     let mut cmd = Command::new(&lean_bin);
                     for arg in crate::module_builder::filter_allowed_lean_args(&file_lean_args) {
                         cmd.arg(arg);
                     }
                     let batch_out = crate::zygote::run_lean_command(
-                        cmd.arg(&tmp_coalesced)
+                        cmd.arg(&leased_coalesced)
                             .current_dir(canon_dir)
                             .envs(&env_vars),
                         Some(crate::zygote::remaining_timeout_ms(None, *t0)),
                     )
                     .context("Failed to execute `lean` on coalesced shard batch")?;
-                    let _ = fs::remove_file(&tmp_coalesced);
+                    drop(leased_coalesced);
                     if batch_out.status.success() {
                         batch_succeeded = true;
                     }
@@ -3433,11 +3445,13 @@ fn check_single_file(
                                     .chars()
                                     .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
                                     .collect();
-                                let tmp_shard = staging_ref.join(format!(
-                                    "par_shard_{}_{}_{}.lean",
-                                    safe_name, pid, idx
-                                ));
-                                fs::write(&tmp_shard, &shard_src_owned)?;
+                                let tmp_shard = crate::shm_cache::StagedTempFile::write(
+                                    staging_ref.join(format!(
+                                        "par_shard_{}_{}_{}.lean",
+                                        safe_name, pid, idx
+                                    )),
+                                    &shard_src_owned,
+                                )?;
 
                                 let mut cmd = Command::new(lean_bin_ref);
                                 for arg in crate::module_builder::filter_allowed_lean_args(args_ref)
@@ -3452,7 +3466,7 @@ fn check_single_file(
                                         format!("Failed to execute `lean` on shard `{}`", shard.name)
                                     })?;
                                 let tmp_display = tmp_shard.display().to_string();
-                                let _ = fs::remove_file(&tmp_shard);
+                                drop(tmp_shard);
 
                                 if !out.status.success() {
                                     abort_ref.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -4538,5 +4552,183 @@ but is expected to have type
             &["-DmaxHeartbeats=4000000".to_string()],
         );
         assert_ne!(f_bare, f_hb);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_active_check_staging_writer_protected_against_store_local_gc_and_shm_spill(
+    ) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_check_staging_gc_race_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let project = dir.join("project");
+        let store_root = dir.join("store");
+        let store_staging = store_root.join("staging");
+        let bin_dir = dir.join("fake_bin");
+        fs::create_dir_all(&project)?;
+        fs::create_dir_all(&store_staging)?;
+        fs::create_dir_all(&bin_dir)?;
+
+        // Configure `fast_staging_dir()` to resolve directly to `<store>/staging` (exercising the
+        // store-local fallback where `run_gc(0, ...)` sweeps 0-second unleased files immediately)
+        // and disable the background Zygote daemon so `evaluate_check_command_value` executes the
+        // real `StagedTempFile` -> `run_lean_command` coalesced staging path in `check.rs`.
+        let prev_staging = std::env::var("TURBO_LEAN_STAGING_DIR").ok();
+        let prev_no_daemon = std::env::var("TURBO_LEAN_NO_DAEMON").ok();
+        struct RestoreCheckEnv(Option<String>, Option<String>);
+        impl Drop for RestoreCheckEnv {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => std::env::set_var("TURBO_LEAN_STAGING_DIR", v),
+                    None => std::env::remove_var("TURBO_LEAN_STAGING_DIR"),
+                }
+                match &self.1 {
+                    Some(v) => std::env::set_var("TURBO_LEAN_NO_DAEMON", v),
+                    None => std::env::remove_var("TURBO_LEAN_NO_DAEMON"),
+                }
+            }
+        }
+        let _restore_env = RestoreCheckEnv(prev_staging, prev_no_daemon);
+        std::env::set_var("TURBO_LEAN_STAGING_DIR", &store_staging);
+        std::env::set_var("TURBO_LEAN_NO_DAEMON", "1");
+
+        let real_lean = Command::new("sh")
+            .args(["-c", "command -v lean"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        // Wrapper `lean` binary: signals `arrived_marker` BEFORE opening the staged `.lean` source
+        // argument, blocks until the test's concurrent `run_gc(0, ...)` and `spill_shm_to_disk_dir`
+        // sweeps complete (`proceed_marker`), then reads/checks the staged `.lean` file.
+        let arrived_marker = dir.join("child_arrived");
+        let proceed_marker = dir.join("child_proceed");
+        let fake_lean = bin_dir.join("lean");
+        let exec_line = match real_lean {
+            Some(ref rl) => format!("exec '{}' \"$@\"", rl),
+            None => {
+                "for last; do :; done; test -f \"$last\" && cat \"$last\" >/dev/null".to_string()
+            }
+        };
+        let script = format!(
+            "#!/bin/sh\ntouch '{}'\nwhile [ ! -f '{}' ]; do sleep 0.01; done\n{}\n",
+            arrived_marker.display(),
+            proceed_marker.display(),
+            exec_line
+        );
+        fs::write(&fake_lean, script)?;
+        fs::set_permissions(&fake_lean, fs::Permissions::from_mode(0o755))?;
+
+        fs::write(project.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        let lean_file = project.join("CheckGcRace.lean");
+        fs::write(
+            &lean_file,
+            "theorem gc_race_a : True := trivial\ntheorem gc_race_b : True := trivial\n",
+        )?;
+
+        let store = TurboStore::open(Some(&store_root))?;
+        assert_eq!(store.fast_staging_dir(), store_staging);
+        let canon_project = project.canonicalize()?;
+        let proj_key = TurboStore::compute_lake_env_key(&canon_project);
+        let orig_path = std::env::var("PATH").unwrap_or_default();
+        let mut fake_env = HashMap::new();
+        fake_env.insert(
+            "PATH".to_string(),
+            format!("{}:{}", bin_dir.display(), orig_path),
+        );
+        store.put_lake_env(&proj_key, &fake_env)?;
+        drop(store);
+
+        // Seed an unleased orphan in `<store>/staging` so we also prove `run_gc(0, ...)` actively
+        // sweeps `<store>/staging` during the window while sparing the live check staging file.
+        let orphan_tmp = store_staging.join("unleased_orphan_before_check.lean");
+        fs::write(&orphan_tmp, b"-- stale unleased staging file\n")?;
+
+        let check_store_root = store_root.clone();
+        let check_file = lean_file.clone();
+        let check_proj = project.clone();
+        let worker = std::thread::spawn(move || -> Result<serde_json::Value> {
+            let mut worker_store = TurboStore::open(Some(&check_store_root))?;
+            evaluate_check_command_value(&mut worker_store, check_file, None, check_proj)
+        });
+
+        let wait_t0 = Instant::now();
+        while !arrived_marker.exists() {
+            if worker.is_finished() {
+                break;
+            }
+            assert!(
+                wait_t0.elapsed().as_secs() < 15,
+                "timed out waiting for check subprocess to spawn"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            arrived_marker.exists(),
+            "check path must invoke lean subprocess on staged file"
+        );
+        let active_leased_lean =
+            store_staging.join(format!("coalesced_batch_{}.lean", std::process::id()));
+        assert!(
+            active_leased_lean.exists(),
+            "active leased coalesced_batch_<pid>.lean must exist while lean subprocess is parked"
+        );
+
+        let mut gc_store = TurboStore::open(Some(&store_root))?;
+        let gc_rep = gc_store.run_gc(0, 7 * 86400, true)?;
+        assert!(
+            !orphan_tmp.exists(),
+            "run_gc(0) must still reap unleased orphans in <store>/staging"
+        );
+        assert!(
+            active_leased_lean.exists(),
+            "run_gc(0) must preserve active leased check staging file in <store>/staging"
+        );
+        assert!(gc_rep.cleaned_staging_files >= 1);
+
+        let spill_dir = dir.join("shm_spill");
+        let _ = crate::shm_cache::spill_shm_to_disk_dir(&store_staging, &spill_dir, 0)?;
+        assert!(
+            active_leased_lean.exists()
+                && !spill_dir
+                    .join(active_leased_lean.file_name().unwrap())
+                    .exists(),
+            "spill_shm_to_disk_dir must not evict/move leased active check staging files"
+        );
+        let _ = crate::shm_cache::enforce_shm_quota_lru(&store_staging, 1)?;
+        assert!(
+            active_leased_lean.exists(),
+            "enforce_shm_quota_lru must not evict leased active check staging files"
+        );
+
+        fs::write(&proceed_marker, b"go")?;
+        let check_val = worker
+            .join()
+            .expect("check worker thread panicked")
+            .context("active check must succeed despite concurrent run_gc(0) + SHM eviction")?;
+        assert_eq!(check_val["status"], "file_verified");
+
+        // After check completes and drops `StagedTempFile`, neither `.lean` nor `.lease.lock` remains.
+        let remaining: Vec<String> = fs::read_dir(&store_staging)?
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("coalesced_batch_") || n.contains("par_shard_"))
+            .collect();
+        assert!(
+            remaining.is_empty(),
+            "StagedTempFile drop must clean up both staged .lean and sidecar .lease.lock, found {remaining:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
     }
 }
