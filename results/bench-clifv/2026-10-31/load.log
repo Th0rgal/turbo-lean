@@ -43,3 +43,33 @@ sandbox+ 2598583 21.7  0.0   6124  2036 ?        S    01:00   0:00 timeout --sig
 sandbox+ 2598584 19.0  0.0   6124  2036 ?        S    01:00   0:00 timeout --signal=TERM --kill-after=5s 86253.25945353508 bash -lc exec /var/lib/sandboxed-node/work/88fd3dc8-2d05-4816-9c09-40950a5c391a/meta/loadloop2.sh
 sandbox+ 2440045 18.0  0.0      0     0 ?        ZN   Oct31  28:08 [lean] <defunct>
 
+=== 2026-11-01T00:30:13Z [DURING]
+ 01:30:13 up 9 days, 23:01,  5 users,  load average: 28.53, 24.03, 19.02
+Mem:           64086       23958        6020         298       35131       40128
+USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+sandbox+ 2652303  100  0.0  11880  4992 ?        R    01:30   0:00 ps aux --sort=-%cpu
+sandbox+ 2649827 82.7  0.5 821856 376344 ?       Sl   01:28   1:33 git grep -n HtabExitSafe\|htab_set_spec_safe origin/wave8/base origin/wave8/base2 origin/wave8/contracts-m19 origin/wave8/contracts-shards origin/wave8/guestinv-opus55 origin/wave8/gu
+sandbox+ 2610261 77.0  0.6 14538076 393756 ?     SNl  01:07  17:25 /var/lib/sandboxed-node/work/caches/elan/toolchains/leanprover--lean4---v4.34.1/bin/lean -Dlinter.unusedSimpArgs=false -Dlinter.unusedVariables=false -Dlinter.unnecessarySimpa=false -
+sandbox+ 2611994 69.3  0.6 15545328 410124 ?     SNl  01:09  14:31 /var/lib/sandboxed-node/work/caches/elan/toolchains/leanprover--lean4---v4.34.1/bin/lean -Dlinter.unusedSimpArgs=false -Dlinter.unusedVariables=false -Dlinter.unnecessarySimpa=false -
+sandbox+ 2652055 62.9  2.6 15517564 1735108 ?    SNl  01:29   0:11 /var/lib/sandboxed-node/work/caches/elan/toolchains/leanprover--lean4---v4.33.1/bin/lean -M6144 -o /var/lib/sandboxed-node/work/45ee8099-8de1-4c20-bf68-7514a38f3fae/evm-fast-pilot/.la
+sandbox+ 2237837 49.0  0.1 770864 124288 ?       Sl   Oct31 185:51 codex -c mcp_servers.sandboxed.command="/usr/local/bin/sandboxed-mcp" -c mcp_servers.sandboxed.args=["--api-url","https://agent-backend.thomas.md","--token-file","/var/lib/sandboxed-n
+sandbox+ 2642603 40.7  6.0 21498996 3979992 ?    SNl  01:25   1:57 /var/lib/sandboxed-node/work/caches/elan/toolchains/leanprover--lean4---v4.33.1/bin/lean -M 6144 -R . campaign/leaves/salvage-htab/TargetScratchRefutation.lean
+sandbox+ 2611368 35.8  2.1 33356908 1406524 ?    SNl  01:08   7:43 /var/lib/sandboxed-node/work/caches/elan/toolchains/leanprover--lean4---v4.34.1/bin/lean -Dlinter.unusedSimpArgs=false -Dlinter.unusedVariables=false -Dlinter.unnecessarySimpa=false -
+sandbox+ 2651241 35.4  1.1 12756348 728124 ?     RNl  01:29   0:22 /var/lib/sandboxed-node/work/caches/elan/toolchains/leanprover--lean4---v4.31.0/bin/lean /var/lib/sandboxed-node/work/1b493ee6-f1b5-46b5-853e-21e8fe70c485/verity/Verity/Core/Model/Typ
+sandbox+ 2605888 35.1  5.2 13800972 3442756 ?    SNl  01:03   9:33 /var/lib/sandboxed-node/work/caches/elan/toolchains/leanprover--lean4---v4.34.1/bin/lean -Dlinter.unusedSimpArgs=false -Dlinter.unusedVariables=false -Dlinter.unnecessarySimpa=false -
+
+=== 2026-11-01T01:00:14Z [DURING]
+ 02:00:14 up 9 days, 23:31,  5 users,  load average: 31.62, 24.27, 22.66
+Mem:           64086       22119        7868         294       35122       41967
+USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+sandbox+ 2697206  100  0.0  11880  5012 ?        R    02:00   0:00 ps aux --sort=-%cpu
+sandbox+ 2696061 84.5  0.8 1955380 587972 ?      SNl  01:58   1:45 /var/lib/sandboxed-node/.rustup/toolchains/1.97.0-x86_64-unknown-linux-gnu/bin/rustc --crate-name turbo_lean --edition=2021 crates/turbo-lean/src/main.rs --error-format=json --json=di
+sandbox+ 2694754 84.2  0.7 2008700 484016 ?      SNl  01:57   2:16 /var/lib/sandboxed-node/work/d68fe3ea-3eb0-4108-96b5-666d4a9b9b99/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc --crate-name turbo_lean --edition=2021 crates/turbo-lean
+sandbox+ 2610261 82.8  0.6 14538076 394076 ?     SNl  01:07  43:37 /var/lib/sandboxed-node/work/caches/elan/toolchains/leanprover--lean4---v4.34.1/bin/lean -Dlinter.unusedSimpArgs=false -Dlinter.unusedVariables=false -Dlinter.unnecessarySimpa=false -
+sandbox+ 2611994 64.4  0.6 15545328 410124 ?     SNl  01:09  32:49 /var/lib/sandboxed-node/work/caches/elan/toolchains/leanprover--lean4---v4.34.1/bin/lean -Dlinter.unusedSimpArgs=false -Dlinter.unusedVariables=false -Dlinter.unnecessarySimpa=false -
+sandbox+ 2694756 55.6  0.5 1991740 350888 ?      SNl  01:57   1:30 /var/lib/sandboxed-node/work/d68fe3ea-3eb0-4108-96b5-666d4a9b9b99/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc --crate-name turbo_lean --edition=2021 crates/turbo-lean
+sandbox+ 2237837 45.4  0.2 771548 131316 ?       Sl   Oct31 186:00 codex -c mcp_servers.sandboxed.command="/usr/local/bin/sandboxed-mcp" -c mcp_servers.sandboxed.args=["--api-url","https://agent-backend.thomas.md","--token-file","/var/lib/sandboxed-n
+sandbox+ 2682454 41.9  3.8 14416428 2506600 ?    RNl  01:51   3:28 /var/lib/sandboxed-node/work/caches/elan/toolchains/leanprover--lean4---v4.31.0/bin/lean /var/lib/sandboxed-node/work/1b493ee6-f1b5-46b5-853e-21e8fe70c485/verity/Verity/Macro/Translat
+sandbox+ 2696463 35.0  1.1 31701600 724236 ?     SNl  01:59   0:25 /var/lib/sandboxed-node/work/caches/elan/toolchains/leanprover--lean4---v4.35.0/bin/lean /var/lib/sandboxed-node/work/7a0a9682-dacb-47da-b480-77f0fa41e637/turbo-lean/lean/LeanNative/P
+sandbox+ 2617595 32.2  0.1 14047360 83480 ?      SNl  01:12  15:25 /var/lib/sandboxed-node/work/caches/elan/toolchains/leanprover--lean4---v4.34.1/bin/lean -Dlinter.unusedSimpArgs=false -Dlinter.unusedVariables=false -Dlinter.unnecessarySimpa=false -
+
