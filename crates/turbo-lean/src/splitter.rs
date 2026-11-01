@@ -3216,42 +3216,84 @@ pub(crate) fn matches_uncached_or_fast_verify_name(
     name: &str,
     uncached_names: &std::collections::HashSet<String>,
 ) -> bool {
-    if matches_uncached_name(name, uncached_names) {
-        return true;
-    }
+    matches_uncached_name(name, uncached_names)
+        || uncached_names
+            .iter()
+            .any(|u| resolve_fast_verify_rooted_target(name, u).is_some())
+}
+
+pub(crate) fn resolve_fast_verify_rooted_target(name: &str, target: &str) -> Option<String> {
     let qname = name.strip_prefix("_root_.").unwrap_or(name);
     let comps = host_name_components(qname);
-    let Some(last) = comps.last() else {
-        return false;
-    };
-    if let Some(after_prefix) = last.strip_prefix("_turbo_verify_") {
-        if let Some(orig_safe) = after_prefix
-            .trim_start_matches(|c: char| c.is_ascii_digit())
-            .strip_prefix('_')
-        {
-            let ns_pre = &comps[..comps.len() - 1];
-            return uncached_names.iter().any(|u| {
-                let (exact_root, tc) = parse_host_target(u);
-                if tc.is_empty() {
-                    return false;
-                }
-                let starts_at = |k: usize| -> bool {
-                    let req_ns = &ns_pre[k..];
-                    tc.starts_with(req_ns) && {
-                        let rem = &tc[req_ns.len()..];
-                        !rem.is_empty()
-                            && orig_safe == sanitize_ident_for_fast_check(&rem.join("."))
-                    }
-                };
-                if exact_root {
-                    starts_at(0)
-                } else {
-                    (0..=ns_pre.len()).any(starts_at)
-                }
-            });
-        }
+    let orig_safe = comps
+        .last()?
+        .strip_prefix("_turbo_verify_")?
+        .trim_start_matches(|c: char| c.is_ascii_digit())
+        .strip_prefix('_')?;
+    let ns_pre = &comps[..comps.len() - 1];
+    let (exact_root, tc) = parse_host_target(target);
+    if tc.is_empty() {
+        return None;
     }
-    false
+    let at = |k: usize| -> Option<String> {
+        let req_ns = &ns_pre[k..];
+        if !tc.starts_with(req_ns) {
+            return None;
+        }
+        let rem = &tc[req_ns.len()..];
+        (!rem.is_empty() && orig_safe == sanitize_ident_for_fast_check(&rem.join("."))).then(|| {
+            let full: Vec<&str> = ns_pre
+                .iter()
+                .chain(rem.iter())
+                .map(String::as_str)
+                .collect();
+            format!("_root_.{}", full.join("."))
+        })
+    };
+    if exact_root {
+        at(0)
+    } else {
+        (0..=ns_pre.len()).find_map(at)
+    }
+}
+
+pub(crate) fn resolve_shard_rooted_targets(
+    shards: &[TheoremShard],
+    targets: &[String],
+) -> anyhow::Result<Vec<String>> {
+    targets
+        .iter()
+        .map(|raw| {
+            let t = raw.trim();
+            if t.is_empty() {
+                anyhow::bail!("Empty target declaration name in shard verification request");
+            }
+            let mut hits: Vec<String> = Vec::new();
+            for sh in shards {
+                let eff = sh.effective_name();
+                let base = eff.split("__turbo_check_").next().unwrap_or(eff);
+                let hit = if decl_name_matches_target(base, t) {
+                    Some(format!("_root_.{}", base))
+                } else {
+                    resolve_fast_verify_rooted_target(base, t)
+                };
+                if let Some(canon) = hit {
+                    if !hits.contains(&canon) {
+                        hits.push(canon);
+                    }
+                }
+            }
+            match hits.len() {
+                1 => Ok(hits.pop().unwrap()),
+                0 => anyhow::bail!("Target declaration `{}` not found in shard source", t),
+                _ => anyhow::bail!(
+                    "Ambiguous target declaration `{}` matches multiple declarations: {:?}",
+                    t,
+                    hits
+                ),
+            }
+        })
+        .collect()
 }
 
 /// Returns true if `clean_text` is a scope or scoped-modifier command (`namespace`, `section`,

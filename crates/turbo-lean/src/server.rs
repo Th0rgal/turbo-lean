@@ -1397,9 +1397,9 @@ fn toolchain_dir_candidates(toolchain: &str) -> (String, String, String) {
 }
 
 /// Store key of a receipt this server publishes for a caller-supplied shard key. The epoch makes
-/// receipts written before the `sorry` target gates (P0-1) unreachable, whatever keys callers send.
+/// receipts written before canonical rooted target resolution unreachable, whatever keys callers send.
 fn server_receipt_key(shard_key: &str) -> String {
-    format!("srv-v3:{}", shard_key)
+    format!("srv-v4:{}", shard_key)
 }
 
 /// Pin the request's toolchain for an elan-proxied `lean` unless the environment already does.
@@ -1530,14 +1530,6 @@ impl HttpShardReceiptContext {
         out.target_context = canon_targets;
         out
     }
-
-    fn with_batch_decl(&self, decl_name: &str) -> Self {
-        let clean = decl_name
-            .trim()
-            .strip_prefix("_root_.")
-            .unwrap_or(decl_name.trim());
-        self.with_targets(&[format!("_root_.{}", clean)])
-    }
 }
 
 fn hash_framed_str(h: &mut blake3::Hasher, s: &str) {
@@ -1557,7 +1549,7 @@ fn hash_framed_slice(h: &mut blake3::Hasher, items: &[String]) {
 fn context_bound_http_key(key: &str, ctx: &HttpShardReceiptContext) -> String {
     let base = server_receipt_key(key);
     let mut h = blake3::Hasher::new();
-    h.update(b"http-shard-context-v3:");
+    h.update(b"http-shard-context-v4:");
     hash_framed_str(&mut h, &base);
     hash_framed_str(&mut h, &ctx.lean_args_digest);
     hash_framed_slice(&mut h, &ctx.allowed_axioms);
@@ -1574,7 +1566,7 @@ fn context_bound_receipt(
     if !receipt.is_object() {
         anyhow::bail!("HTTP shard receipt must serialize as a JSON object");
     }
-    receipt["receipt_schema"] = serde_json::Value::String("srv-v3".to_string());
+    receipt["receipt_schema"] = serde_json::Value::String("srv-v4".to_string());
     receipt["lean_args_digest"] = serde_json::Value::String(ctx.lean_args_digest.clone());
     receipt["allowed_axioms"] = serde_json::json!(ctx.allowed_axioms);
     receipt["target_context"] = serde_json::json!(ctx.target_context);
@@ -1599,7 +1591,7 @@ fn receipt_matches_http_context(
             })
             .unwrap_or(false)
     };
-    receipt["receipt_schema"].as_str() == Some("srv-v3")
+    receipt["receipt_schema"].as_str() == Some("srv-v4")
         && receipt["lean_args_digest"].as_str() == Some(ctx.lean_args_digest.as_str())
         && str_vec_eq(&receipt["allowed_axioms"], &ctx.allowed_axioms)
         && str_vec_eq(&receipt["target_context"], &ctx.target_context)
@@ -1654,15 +1646,22 @@ fn execute_check_shard_payload_deferred_with_domain(
     // A named target is gated (and checked with its name) on every path, the local daemon's
     // `skip_cas_lock` requests included. A batch names its targets in `targets`; one that names none
     // has every declaration of its source treated as a target (so no `sorry` stub is admitted).
+    let parsed_source = crate::splitter::split_lean_source_fast_no_cone(&req.shard_source, &[]);
     let named_target = !matches!(req.decl.as_str(), "" | "__batch__" | "__coalesced_batch__");
     let stub_targets: Vec<String> = if !req.targets.is_empty() {
-        req.targets.clone()
+        crate::splitter::resolve_shard_rooted_targets(&parsed_source.shards, &req.targets)?
     } else if named_target {
-        vec![req.decl.clone()]
+        crate::splitter::resolve_shard_rooted_targets(
+            &parsed_source.shards,
+            std::slice::from_ref(&req.decl),
+        )?
     } else {
-        crate::splitter::split_lean_source(&req.shard_source, &[])
+        if parsed_source.shards.is_empty() && !req.skip_cas_lock {
+            anyhow::bail!("No theorem declarations found in /check-shard request");
+        }
+        parsed_source
             .shards
-            .into_iter()
+            .iter()
             .map(|sh| sh.rooted_name())
             .collect()
     };
@@ -1685,23 +1684,13 @@ fn execute_check_shard_payload_deferred_with_domain(
         if source_violations.has_sorry
             && (named_target || !req.targets.is_empty() || !req.skip_cas_lock)
         {
-            let dep_hashes = crate::lake_build::compute_imported_olean_interface_hashes(
-                &req.shard_source,
-                Path::new("."),
-                if req.lean_path.is_empty() {
-                    None
-                } else {
-                    Some(req.lean_path.as_str())
-                },
-            );
-            let parsed = crate::splitter::split_lean_source(&req.shard_source, &dep_hashes);
-            let target_body = if parsed.shards.len() == 1 {
-                let s = &parsed.shards[0];
+            let target_body = if parsed_source.shards.len() == 1 {
+                let s = &parsed_source.shards[0];
                 format!("{}\n{}", s.signature_text, s.proof_text)
             } else {
                 let req_set: std::collections::HashSet<String> =
                     stub_targets.iter().cloned().collect();
-                let matched: Vec<String> = parsed
+                let matched: Vec<String> = parsed_source
                     .shards
                     .iter()
                     .filter(|s| {
@@ -1852,8 +1841,15 @@ fn execute_check_shard_payload_deferred_with_domain(
     let deferred = if req.skip_cas_lock {
         None
     } else {
+        let receipt_decl = if stub_targets.len() == 1 {
+            stub_targets[0]
+                .strip_prefix("_root_.")
+                .unwrap_or(stub_targets[0].as_str())
+        } else {
+            req.decl.strip_prefix("_root_.").unwrap_or(&req.decl)
+        };
         let receipt_obj = serde_json::json!({
-            "decl": req.decl,
+            "decl": receipt_decl,
             "prefix_env_hash": req.prefix_env_hash,
             "stmt_hash": req.stmt_hash,
             "proof_hash": req.proof_hash,
@@ -1862,7 +1858,7 @@ fn execute_check_shard_payload_deferred_with_domain(
         let receipt = context_bound_receipt(receipt_obj, &receipt_ctx)?;
         Some((
             toolchain.to_string(),
-            vec![(cache_key, req.decl.clone(), receipt, dur_ms)],
+            vec![(cache_key, receipt_decl.to_string(), receipt, dur_ms)],
         ))
     };
 
@@ -1937,6 +1933,11 @@ fn execute_check_shards_batch_payload_deferred(
         crate::module_builder::compute_lean_args_digest(&filtered_batch_args)?;
     let (req_allowed, req_allowed_csv) =
         resolve_request_axiom_policy(req.allowed_axioms.as_deref(), trust_domain);
+    let parsed_batch =
+        crate::splitter::split_lean_source_fast_no_cone(&req.coalesced_shard_source, &[]);
+    let raw_item_targets: Vec<String> = req.items.iter().map(|i| i.decl_name.clone()).collect();
+    let resolved_item_decls =
+        crate::splitter::resolve_shard_rooted_targets(&parsed_batch.shards, &raw_item_targets)?;
     let (base_ctx, mut env_vars, lean_bin) = HttpShardReceiptContext::resolve_base(
         store,
         toolchain,
@@ -1949,8 +1950,9 @@ fn execute_check_shards_batch_payload_deferred(
     let item_key_contexts: Vec<(String, HttpShardReceiptContext)> = req
         .items
         .iter()
-        .map(|i| {
-            let ctx = base_ctx.with_batch_decl(&i.decl_name);
+        .zip(&resolved_item_decls)
+        .map(|(i, canon_decl)| {
+            let ctx = base_ctx.with_targets(std::slice::from_ref(canon_decl));
             (context_bound_http_key(&i.shard_key, &ctx), ctx)
         })
         .collect();
@@ -1981,25 +1983,13 @@ fn execute_check_shards_batch_payload_deferred(
             );
         }
         if violations.has_sorry {
-            let target_set: HashSet<String> = req
-                .items
+            let target_set: HashSet<String> = resolved_item_decls
                 .iter()
                 .zip(&hit_mask)
                 .filter(|&(_, &hit)| !hit)
-                .map(|(i, _)| i.decl_name.clone())
+                .map(|(d, _)| d.clone())
                 .collect();
-            let dep_hashes = crate::lake_build::compute_imported_olean_interface_hashes(
-                &req.coalesced_shard_source,
-                Path::new("."),
-                if req.lean_path.is_empty() {
-                    None
-                } else {
-                    Some(req.lean_path.as_str())
-                },
-            );
-            let parsed =
-                crate::splitter::split_lean_source(&req.coalesced_shard_source, &dep_hashes);
-            let uncached_has_sorry = parsed.shards.iter().any(|sh| {
+            let uncached_has_sorry = parsed_batch.shards.iter().any(|sh| {
                 let eff = sh.effective_name();
                 let base = eff.split("__turbo_check_").next().unwrap_or(eff);
                 crate::splitter::matches_uncached_or_fast_verify_name(base, &target_set)
@@ -2008,7 +1998,7 @@ fn execute_check_shards_batch_payload_deferred(
                     ))
                     .has_sorry
             });
-            if uncached_has_sorry || parsed.shards.is_empty() {
+            if uncached_has_sorry || parsed_batch.shards.is_empty() {
                 anyhow::bail!(
                     "Soundness hygiene violation in remote batch shard payload: uncached theorem contains `sorry`"
                 );
@@ -2034,12 +2024,11 @@ fn execute_check_shards_batch_payload_deferred(
         ));
     }
 
-    let server_uncached_decls: HashSet<String> = req
-        .items
+    let server_uncached_decls: HashSet<String> = resolved_item_decls
         .iter()
         .zip(&hit_mask)
         .filter(|&(_, &hit)| !hit)
-        .map(|(i, _)| i.decl_name.clone())
+        .map(|(d, _)| d.clone())
         .collect();
     let effective_batch_source = if cache_hits > 0 {
         crate::splitter::build_coalesced_shard_source(
@@ -2150,18 +2139,16 @@ fn execute_check_shards_batch_payload_deferred(
     let per_shard_ms = ((t0.elapsed().as_millis() as i64) / (uncached_count.max(1) as i64)).max(1);
     let now = now_unix();
     let mut publish_items = Vec::with_capacity(uncached_count);
-    for (item, ((bound_key, item_ctx), &hit)) in req
+    for ((item, canon_decl), ((bound_key, item_ctx), &hit)) in req
         .items
         .iter()
+        .zip(&resolved_item_decls)
         .zip(item_key_contexts.iter().zip(&hit_mask))
     {
         if hit {
             continue;
         }
-        let clean_decl = item
-            .decl_name
-            .strip_prefix("_root_.")
-            .unwrap_or(&item.decl_name);
+        let clean_decl = canon_decl.strip_prefix("_root_.").unwrap_or(canon_decl);
         let receipt_obj = serde_json::json!({
             "decl": clean_decl,
             "prefix_env_hash": item.prefix_env_hash,
@@ -2686,7 +2673,7 @@ mod bind_auth_tests {
         assert_eq!(entries.len(), 1);
         batch.lean_args = vec!["--plugin=unsafe.so".into()];
         assert!(execute_check_shards_batch_payload_deferred(&mut store, &batch, None).is_err());
-        assert_eq!(server_receipt_key("legacy-key"), "srv-v3:legacy-key");
+        assert_eq!(server_receipt_key("legacy-key"), "srv-v4:legacy-key");
         let _ = entries;
         let _ = std::fs::remove_dir_all(dir);
         Ok(())
@@ -2770,7 +2757,7 @@ mod bind_auth_tests {
         single.targets = vec!["_root_.t1".into()];
         assert_eq!(
             execute_check_shard_payload(&mut store, &single)?["status"],
-            "remote_theorem_verified"
+            "remote_theorem_cache_hit"
         );
         single.targets.clear();
         single.decl = "t1".into();
@@ -2949,6 +2936,204 @@ mod bind_auth_tests {
         if let Ok(val) = execute_check_shard_payload(&mut store, &single_ax) {
             assert_eq!(val["status"], "remote_theorem_verified");
         }
+        let _ = std::fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn http_target_canonicalization_rejects_namespace_aliasing_and_ambiguity() -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_http_target_canon_{}",
+            crate::pack::next_tmp_id()
+        ));
+        let mut store = TurboStore::open(Some(&dir))?;
+
+        let ns_only = "import Init\nnamespace Foo\ntheorem t : True := trivial\nend Foo\n";
+        let sorry_root_with_ns =
+            "import Init\ntheorem t : True := sorry\nnamespace Foo\ntheorem t : True := trivial\nend Foo\n";
+
+        let batch_ns_bare = CheckShardsBatchRequest {
+            items: vec![crate::pack::CheckShardBatchItem {
+                shard_key: "ns-shared-key".into(),
+                decl_name: "t".into(),
+                ..Default::default()
+            }],
+            coalesced_shard_source: ns_only.into(),
+            ..Default::default()
+        };
+        let (ns_res, ns_pub, _) =
+            execute_check_shards_batch_payload_deferred(&mut store, &batch_ns_bare, None)?;
+        assert!(ns_res.ok && ns_res.verified_count == 1 && ns_res.cache_hits == 0);
+        publish_batch(&mut store, ns_pub);
+
+        let batch_ns_qual = CheckShardsBatchRequest {
+            items: vec![crate::pack::CheckShardBatchItem {
+                shard_key: "ns-shared-key".into(),
+                decl_name: "_root_.Foo.t".into(),
+                ..Default::default()
+            }],
+            coalesced_shard_source: ns_only.into(),
+            ..Default::default()
+        };
+        let (ns_warm, _, _) =
+            execute_check_shards_batch_payload_deferred(&mut store, &batch_ns_qual, None)?;
+        assert!(ns_warm.ok && ns_warm.cache_hits == 1);
+
+        let batch_exact_root_on_ns = CheckShardsBatchRequest {
+            items: vec![crate::pack::CheckShardBatchItem {
+                shard_key: "ns-shared-key".into(),
+                decl_name: "_root_.t".into(),
+                ..Default::default()
+            }],
+            coalesced_shard_source: ns_only.into(),
+            ..Default::default()
+        };
+        assert!(execute_check_shards_batch_payload_deferred(
+            &mut store,
+            &batch_exact_root_on_ns,
+            None
+        )
+        .is_err());
+
+        let batch_exact_root_sorry = CheckShardsBatchRequest {
+            items: vec![crate::pack::CheckShardBatchItem {
+                shard_key: "ns-shared-key".into(),
+                decl_name: "_root_.t".into(),
+                ..Default::default()
+            }],
+            coalesced_shard_source: sorry_root_with_ns.into(),
+            ..Default::default()
+        };
+        assert!(execute_check_shards_batch_payload_deferred(
+            &mut store,
+            &batch_exact_root_sorry,
+            None
+        )
+        .is_err());
+
+        let single_exact_root_sorry = CheckShardHttpRequest {
+            decl: "_root_.t".into(),
+            shard_key: "ns-shared-key".into(),
+            shard_source: sorry_root_with_ns.into(),
+            ..Default::default()
+        };
+        assert!(execute_check_shard_payload(&mut store, &single_exact_root_sorry).is_err());
+
+        let single_ns_bare = CheckShardHttpRequest {
+            decl: "t".into(),
+            shard_key: "ns-single-to-batch-key".into(),
+            shard_source: ns_only.into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            execute_check_shard_payload(&mut store, &single_ns_bare)?["status"],
+            "remote_theorem_verified"
+        );
+        let batch_attack = CheckShardsBatchRequest {
+            items: vec![crate::pack::CheckShardBatchItem {
+                shard_key: "ns-single-to-batch-key".into(),
+                decl_name: "_root_.t".into(),
+                ..Default::default()
+            }],
+            coalesced_shard_source: sorry_root_with_ns.into(),
+            ..Default::default()
+        };
+        assert!(
+            execute_check_shards_batch_payload_deferred(&mut store, &batch_attack, None).is_err()
+        );
+        let batch_ns_hit = CheckShardsBatchRequest {
+            items: vec![crate::pack::CheckShardBatchItem {
+                shard_key: "ns-single-to-batch-key".into(),
+                decl_name: "Foo.t".into(),
+                ..Default::default()
+            }],
+            coalesced_shard_source: ns_only.into(),
+            ..Default::default()
+        };
+        let (ns_cross_hit, _, _) =
+            execute_check_shards_batch_payload_deferred(&mut store, &batch_ns_hit, None)?;
+        assert!(ns_cross_hit.ok && ns_cross_hit.cache_hits == 1);
+
+        let ambig_single = CheckShardHttpRequest {
+            decl: "t".into(),
+            shard_key: "ambig-key".into(),
+            shard_source: sorry_root_with_ns.into(),
+            ..Default::default()
+        };
+        assert!(execute_check_shard_payload(&mut store, &ambig_single).is_err());
+        let ambig_batch = CheckShardsBatchRequest {
+            items: vec![crate::pack::CheckShardBatchItem {
+                shard_key: "ambig-key".into(),
+                decl_name: "t".into(),
+                ..Default::default()
+            }],
+            coalesced_shard_source: sorry_root_with_ns.into(),
+            ..Default::default()
+        };
+        assert!(
+            execute_check_shards_batch_payload_deferred(&mut store, &ambig_batch, None).is_err()
+        );
+
+        let ambig_ns_src = "import Init\nnamespace A\ntheorem t : True := trivial\nend A\nnamespace B\ntheorem t : True := sorry\nend B\n";
+        let ambig_ns_single = CheckShardHttpRequest {
+            decl: "t".into(),
+            shard_key: "ambig-ns-key".into(),
+            shard_source: ambig_ns_src.into(),
+            ..Default::default()
+        };
+        assert!(execute_check_shard_payload(&mut store, &ambig_ns_single).is_err());
+
+        let root_only = "import Init\ntheorem t : True := trivial\n";
+        let single_root = CheckShardHttpRequest {
+            decl: "t".into(),
+            shard_key: "interop-root-key".into(),
+            shard_source: root_only.into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            execute_check_shard_payload(&mut store, &single_root)?["status"],
+            "remote_theorem_verified"
+        );
+        let batch_root = CheckShardsBatchRequest {
+            items: vec![crate::pack::CheckShardBatchItem {
+                shard_key: "interop-root-key".into(),
+                decl_name: "_root_.t".into(),
+                ..Default::default()
+            }],
+            coalesced_shard_source: root_only.into(),
+            ..Default::default()
+        };
+        let (root_hit, _, _) =
+            execute_check_shards_batch_payload_deferred(&mut store, &batch_root, None)?;
+        assert!(root_hit.ok && root_hit.cache_hits == 1);
+
+        let batch_to_single_req = CheckShardsBatchRequest {
+            items: vec![crate::pack::CheckShardBatchItem {
+                shard_key: "interop-root-key-2".into(),
+                decl_name: "t".into(),
+                ..Default::default()
+            }],
+            coalesced_shard_source: root_only.into(),
+            ..Default::default()
+        };
+        let (b2s_res, b2s_pub, _) =
+            execute_check_shards_batch_payload_deferred(&mut store, &batch_to_single_req, None)?;
+        assert!(b2s_res.ok && b2s_res.verified_count == 1);
+        publish_batch(&mut store, b2s_pub);
+        let single_root_hit = CheckShardHttpRequest {
+            decl: "_root_.t".into(),
+            shard_key: "interop-root-key-2".into(),
+            shard_source: root_only.into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            execute_check_shard_payload(&mut store, &single_root_hit)?["status"],
+            "remote_theorem_cache_hit"
+        );
+
         let _ = std::fs::remove_dir_all(dir);
         Ok(())
     }
