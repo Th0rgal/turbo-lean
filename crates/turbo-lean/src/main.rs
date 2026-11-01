@@ -31,6 +31,7 @@ pub mod remote_prebuild;
 pub mod server;
 pub mod shm_cache;
 mod splitter;
+mod trusted_tools;
 pub mod verify;
 #[cfg(all(test, unix))]
 mod worktree_test_support;
@@ -339,7 +340,7 @@ enum Commands {
         /// Cap the maximum number of cone verification jobs (`0` = uncapped)
         #[arg(long, default_value_t = 0)]
         max_cone_jobs: usize,
-        /// Optional external kernel checker binary (`nanoda_bin` or `lean4checker`) for dual-auditor cross-checking
+        /// Absolute external kernel checker path outside the checkout for dual-auditor cross-checking
         #[arg(long)]
         nanoda_bin: Option<PathBuf>,
     },
@@ -648,7 +649,7 @@ fn run(cli: Cli) -> Result<()> {
         std::env::remove_var("TURBO_LEAN_ALLOWED_CSIMP_FROM_CONFIG");
     }
     if let Some(dir) = dir {
-        let config = splitter::read_project_config(dir, rev).unwrap_or_default();
+        let config = splitter::read_project_config(dir, rev)?.unwrap_or_default();
         if rev.is_some()
             || std::env::var_os("TURBO_LEAN_ALLOWED_CSIMP").is_none()
             || csimp_from_config
@@ -1573,7 +1574,7 @@ fn run(cli: Cli) -> Result<()> {
             let may_declare_inputs = module_builder::workspace_may_declare_lake_inputs(&proj_dir);
 
             let (mut env_vars, lean_bin, req_lp) = if let Some(lp) = explicit_lp {
-                let (mut ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, &lp);
+                let (mut ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, &lp)?;
                 if lp.is_empty() {
                     ev.remove("LEAN_PATH");
                 } else {
@@ -1589,11 +1590,15 @@ fn run(cli: Cli) -> Result<()> {
                 let lp = lake_build::resolve_remote_lean_path(&canon_proj, None);
                 let mut ev = std::collections::HashMap::new();
                 ev.insert("LEAN_PATH".to_string(), lp.clone());
-                (ev, PathBuf::from("lean"), lp)
+                (
+                    ev,
+                    pack::resolve_server_lean_env_and_bin(&store, &toolchain, &lp)?.1,
+                    lp,
+                )
             } else if lake_build::has_lake_config(&proj_dir) {
                 if let Ok((ev, _)) = lake_build::resolve_lake_env(&store, &proj_dir) {
                     let lp = ev.get("LEAN_PATH").cloned().unwrap_or_default();
-                    let (_, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, &lp);
+                    let (_, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, &lp)?;
                     (ev, lb, lp)
                 } else if may_declare_inputs {
                     anyhow::bail!(
@@ -1601,12 +1606,12 @@ fn run(cli: Cli) -> Result<()> {
                         proj_dir.display()
                     );
                 } else {
-                    let (ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, "");
+                    let (ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, "")?;
                     let lp = ev.get("LEAN_PATH").cloned().unwrap_or_default();
                     (ev, lb, lp)
                 }
             } else {
-                let (ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, "");
+                let (ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, "")?;
                 (ev, lb, String::new())
             };
 
