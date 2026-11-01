@@ -8888,16 +8888,18 @@ theorem valid_second (x : UInt8) : x + 0 = x := by simp
         assert!(!empty_cert);
         assert_eq!(empty_details["reason"], "statement_required");
 
-        // Let-bound fragment without trailing proof `:=` preserves let binding and certifies genuine CEX.
+        // Statement `let` loses Lean's inferred type under textual substitution, so the
+        // witness is not certified even when the substituted statement looks false.
         let let_frag = "(x : UInt8) : let y := x + 1; y = x";
-        let (let_cert, let_ver, _) = certify_json_statement_witness(
+        let (let_cert, let_ver, let_details) = certify_json_statement_witness(
             "let_frag_buggy",
             let_frag,
             &[("x".to_string(), "5".to_string())],
             "6",
             "5",
         );
-        assert!(let_cert && let_ver == "0.5.0");
+        assert!(!let_cert && let_ver == "unavailable");
+        assert_eq!(let_details["reason"], "statement_not_evaluated");
 
         let (bv_nat_cert, bv_nat_ver, bv_nat_details) = certify_json_statement_witness(
             "bv_nat_shift_cex",
@@ -9354,6 +9356,16 @@ def checks : List Bool := [
                 "x=256 => lhs=0 != rhs=1",
             ),
             (
+                "let_shared_uint8",
+                "theorem let_shared_uint8 (x : UInt8) :\n  let y := 255;\n  (y + 1 = 0) = (x + y = x - 1) := by\n  cases x; decide +revert\n",
+                "x=0 => lhs=0 != rhs=1",
+            ),
+            (
+                "let_multiline_shared_uint8",
+                "theorem let_multiline_shared_uint8 (x : UInt8) :\n  let y := 255\n  (y + 1 = 0) = (x + y = x - 1) := by\n  cases x; decide +revert\n",
+                "x=0 => lhs=0 != rhs=1",
+            ),
+            (
                 "custom_import_override",
                 "import Init\ntheorem custom_import_override (x : UInt8) : x + 1 = x := by sorry\n",
                 "x=0 => lhs=1 != rhs=0",
@@ -9380,13 +9392,13 @@ def checks : List Bool := [
             ),
         ];
 
-        // First 8 cases are genuinely valid theorems in Lean 4.35 (`0 sorry`); verify live with `lean --stdin` when available.
+        // First 10 cases are genuinely valid theorems in Lean 4.35 (`0 sorry`); verify live with `lean --stdin` when available.
         if std::process::Command::new("lean")
             .arg("--version")
             .output()
             .is_ok()
         {
-            for (name, src, _) in &contextual_cases[..8] {
+            for (name, src, _) in &contextual_cases[..10] {
                 let mut cmd = std::process::Command::new("lean");
                 cmd.arg("--stdin")
                     .stdin(std::process::Stdio::piped())

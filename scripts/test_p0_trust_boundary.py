@@ -986,6 +986,34 @@ class TestP0TrustBoundary(unittest.TestCase):
             )
             self.assertNotEqual(fc.returncode, 0, fc.stdout)
 
+            let_file = root / "SharedLetValid.lean"
+            let_file.write_text(
+                "theorem let_shared_uint8 (x : UInt8) :\n"
+                "  let y := 255;\n"
+                "  (y + 1 = 0) = (x + y = x - 1) := by\n"
+                "  cases x; decide +revert\n",
+                encoding="utf-8",
+            )
+            step_let = subprocess.run(
+                [
+                    str(turbo_bin),
+                    "--json",
+                    "--cache-dir",
+                    str(root / "cache"),
+                    "agent-step",
+                    str(let_file),
+                    "--decl",
+                    "let_shared_uint8",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(step_let.returncode, 0, step_let.stderr)
+            payload_let = json.loads(step_let.stdout)
+            self.assertNotEqual(payload_let.get("status"), "counterexample_rejected", payload_let)
+            self.assertEqual(payload_let.get("status"), "theorem_verified", payload_let)
+            self.assertTrue(payload_let.get("verified"), payload_let)
+
 
 if __name__ == "__main__":
     unittest.main()

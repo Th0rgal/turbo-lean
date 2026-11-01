@@ -6,9 +6,51 @@ pub(super) fn inline_stmt_let_bindings(stmt: &str) -> String {
     inline_stmt_let_bindings_checked(stmt).0
 }
 
+fn stmt_has_untrusted_term_keywords(s: &str) -> bool {
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+    let mut i = 0usize;
+    while i < n {
+        if is_ident_start(chars[i]) {
+            let prev_dot = i > 0 && chars[i - 1] == '.';
+            let start = i;
+            i += 1;
+            while i < n && is_ident_continue(chars[i]) {
+                i += 1;
+            }
+            if !prev_dot {
+                let word: String = chars[start..i].iter().collect();
+                if matches!(
+                    word.as_str(),
+                    "let"
+                        | "letI"
+                        | "have"
+                        | "haveI"
+                        | "match"
+                        | "fun"
+                        | "show"
+                        | "suffices"
+                        | "do"
+                        | "by"
+                        | "where"
+                        | "forall"
+                        | "exists"
+                ) {
+                    return true;
+                }
+            }
+        } else if matches!(chars[i], '∀' | '∃' | 'λ' | ';' | '↦') {
+            return true;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
 fn inline_stmt_let_bindings_checked(stmt: &str) -> (String, bool) {
     let mut cur = stmt.trim().to_string();
-    let mut clean_let = true;
+    let mut had_let = false;
     for _ in 0..16 {
         let trimmed = cur.trim_start();
         let Some(after_let) = trimmed
@@ -17,26 +59,28 @@ fn inline_stmt_let_bindings_checked(stmt: &str) -> (String, bool) {
         else {
             break;
         };
+        had_let = true;
         let rest = after_let.trim_start();
         let name_end = rest
             .find(|c: char| !is_ident_continue(c))
             .unwrap_or(rest.len());
         if name_end == 0 || !is_ident_start(rest.chars().next().unwrap_or('0')) {
-            clean_let = false;
             break;
         }
         let var_name = &rest[..name_end];
         if var_name == "rec" {
-            clean_let = false;
             break;
         }
         let after_name = rest[name_end..].trim_start();
-        let Some(after_eq_raw) = after_name.strip_prefix(":=") else {
-            clean_let = false;
+        let after_ty = if let Some((_ty, rhs_part)) = split_top_level_colon(after_name) {
+            rhs_part.trim_start()
+        } else {
+            after_name
+        };
+        let Some(after_eq_raw) = after_ty.strip_prefix(":=") else {
             break;
         };
         let after_eq = after_eq_raw.trim_start();
-        // Find top-level `;` terminating the `let` RHS (multiline layout `let` without `;` is untrusted)
         let chars: Vec<char> = after_eq.chars().collect();
         let mut p_depth = 0usize;
         let mut split_char_idx = None;
@@ -44,19 +88,14 @@ fn inline_stmt_let_bindings_checked(stmt: &str) -> (String, bool) {
             match ch {
                 '(' | '{' | '[' | '⟨' => p_depth += 1,
                 ')' | '}' | ']' | '⟩' => p_depth = p_depth.saturating_sub(1),
-                ';' if p_depth == 0 => {
+                ';' | '\n' if p_depth == 0 => {
                     split_char_idx = Some(idx);
-                    break;
-                }
-                '\n' if p_depth == 0 => {
-                    clean_let = false;
                     break;
                 }
                 _ => {}
             }
         }
         let Some(sc_idx) = split_char_idx else {
-            clean_let = false;
             break;
         };
         let rhs: String = chars[..sc_idx].iter().collect();
@@ -64,18 +103,8 @@ fn inline_stmt_let_bindings_checked(stmt: &str) -> (String, bool) {
         let rhs_wrapped = format!("({})", rhs.trim());
         cur = replace_ident_boundary(body.trim(), var_name, &rhs_wrapped);
     }
-    let rem = cur.trim_start();
-    for kw in [
-        "let", "letI", "have", "haveI", "match", "fun", "show", "suffices", "do",
-    ] {
-        if rem
-            .strip_prefix(kw)
-            .is_some_and(|r| r.is_empty() || !is_ident_continue(r.chars().next().unwrap()))
-        {
-            clean_let = false;
-        }
-    }
-    (cur, clean_let)
+    let clean_stmt = !had_let && !stmt_has_untrusted_term_keywords(stmt);
+    (cur, clean_stmt)
 }
 
 /// A literal or comment beginning at a UTF-8 byte boundary. Unterminated strings
