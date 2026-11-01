@@ -454,3 +454,165 @@ theorem bad : False := cheat
         );
     }
 }
+
+#[test]
+fn round9_whole_file_toctou_and_lexer_cache_soundness() {
+    if !lean_available() {
+        return;
+    }
+    let p = Project::new(false);
+
+    // 1. TOCTOU regression: if the live file on disk mutates during whole-file compilation
+    //    (e.g. `#eval` or a concurrent writer overwrites `Toctou.lean` from `False` to `True`),
+    //    `turbo-lean check` (with daemon=false, hitting `run_audited_lean_shard_at(..., Some(orig))`)
+    //    must reject the run and NEVER poison the persistent `theorem_shard` CAS for `False`.
+    let toctou_path = p.0.join("Toctou.lean");
+    let false_src = r#"import Lean
+elab "__file__" : term => do
+  return Lean.mkStrLit (← Lean.getFileName)
+#eval do
+  IO.FS.writeFile (__file__) "theorem target : True := trivial\n"
+theorem target : False := by trivial
+"#;
+    fs::write(&toctou_path, false_src).unwrap();
+    let race_out = p.run(&["check", "Toctou.lean"], false);
+    assert!(
+        !race_out.status.success(),
+        "TOCTOU self-overwrite during whole-file check must be rejected:\n{}{}",
+        String::from_utf8_lossy(&race_out.stdout),
+        String::from_utf8_lossy(&race_out.stderr)
+    );
+
+    // Re-write the exact original `False` file (which shares the same `theorem_shard` key for `target`
+    // if `prefix_env_hash` matches, and also test pure `False` with identical prefix): neither may hit CAS!
+    fs::write(&toctou_path, false_src).unwrap();
+    let retry_decl = p.run(&["check", "Toctou.lean", "--decl", "target"], false);
+    assert!(
+        !retry_decl.status.success(),
+        "CAS must not be poisoned for `target : False` after TOCTOU overwrite attempt:\n{}{}",
+        String::from_utf8_lossy(&retry_decl.stdout),
+        String::from_utf8_lossy(&retry_decl.stderr)
+    );
+
+    // Also test an external concurrent writer racing while `RaceExt.lean` is checked on the whole-file path.
+    let race_ext = p.0.join("RaceExt.lean");
+    let ext_false = "#eval IO.sleep 150\ntheorem ext_target : False := by trivial\n";
+    let ext_true = "#eval IO.sleep 150\ntheorem ext_target : True := trivial\n";
+    fs::write(&race_ext, ext_false).unwrap();
+    let race_ext_bg = race_ext.clone();
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let _ = fs::write(&race_ext_bg, ext_true);
+    });
+    let _ = p.run(&["check", "RaceExt.lean"], false);
+    writer.join().unwrap();
+    fs::write(&race_ext, ext_false).unwrap();
+    let verify_ext_false = p.run(&["check", "RaceExt.lean"], false);
+    assert!(
+        !verify_ext_false.status.success(),
+        "concurrent overwrite to True must never allow `ext_target : False` to pass on subsequent check:\n{}{}",
+        String::from_utf8_lossy(&verify_ext_false.stdout),
+        String::from_utf8_lossy(&verify_ext_false.stderr)
+    );
+
+    // 2. End-to-end Lean 4 kernel check for zero-hash raw strings (`r"a  b"` vs `r"a b"`),
+    //    guillemet identifiers (`«Foo.Bar».«baz»`), docstrings (`/-- ... -/`), and `f1!"..."` macros.
+    let lex_file = p.0.join("LexerSound.lean");
+    fs::write(
+        &lex_file,
+        r#"import Lean
+
+macro "f1!" s:interpolatedStr(term) : term => `(s!$s)
+
+theorem raw_ws : r"a  b" = "a  b" := rfl
+
+theorem custom_interp : f1!"x {"a  b"} y" = "x a  b y" := rfl
+
+namespace «Foo.Bar»
+theorem «baz qux» : True := trivial
+end «Foo.Bar»
+
+/-- first docstring -/
+theorem doc_checked : True := trivial
+
+open Lean Elab Term in
+elab "doc_contains_first" : term => do
+  let some doc ← findDocString? (← getEnv) ``doc_checked
+    | throwError "missing docstring"
+  if (doc.splitOn "first docstring").length >= 2 then
+    return mkConst ``True.intro
+  else
+    throwError s!"unexpected docstring: {doc}"
+
+theorem verify_doc : True := doc_contains_first
+"#,
+    )
+    .unwrap();
+    let ok_lex = p.run(&["check", "LexerSound.lean"], false);
+    assert!(
+        ok_lex.status.success() && status(&ok_lex) == "file_verified",
+        "LexerSound.lean must verify cleanly:\n{}{}",
+        String::from_utf8_lossy(&ok_lex.stdout),
+        String::from_utf8_lossy(&ok_lex.stderr)
+    );
+
+    // Mutate `r"a  b"` -> `r"a b"` (must NOT false-hit cached `raw_ws` shard!)
+    fs::write(
+        &lex_file,
+        r#"theorem raw_ws : r"a b" = "a  b" := rfl
+"#,
+    )
+    .unwrap();
+    let bad_raw = p.run(&["check", "LexerSound.lean"], false);
+    assert!(
+        !bad_raw.status.success(),
+        "mutated zero-hash raw string `r\"a b\" = \"a  b\"` must not hit stale CAS:\n{}{}",
+        String::from_utf8_lossy(&bad_raw.stdout),
+        String::from_utf8_lossy(&bad_raw.stderr)
+    );
+
+    // Mutate `f1!"x {"a  b"} y"` -> `f1!"x {"a b"} y"` (must NOT false-hit cached `custom_interp` shard!)
+    fs::write(
+        &lex_file,
+        r#"macro "f1!" s:interpolatedStr(term) : term => `(s!$s)
+theorem custom_interp : f1!"x {"a b"} y" = "x a  b y" := rfl
+"#,
+    )
+    .unwrap();
+    let bad_interp = p.run(&["check", "LexerSound.lean"], false);
+    assert!(
+        !bad_interp.status.success(),
+        "mutated `f1!` nested string literal must not hit stale CAS:\n{}{}",
+        String::from_utf8_lossy(&bad_interp.stdout),
+        String::from_utf8_lossy(&bad_interp.stderr)
+    );
+
+    // Mutate docstring `/-- first docstring -/` -> `/-- second docstring -/` while `verify_doc` checks it!
+    fs::write(
+        &lex_file,
+        r#"import Lean
+
+/-- second docstring -/
+theorem doc_checked : True := trivial
+
+open Lean Elab Term in
+elab "doc_contains_first" : term => do
+  let some doc ← findDocString? (← getEnv) ``doc_checked
+    | throwError "missing docstring"
+  if (doc.splitOn "first docstring").length >= 2 then
+    return mkConst ``True.intro
+  else
+    throwError s!"unexpected docstring: {doc}"
+
+theorem verify_doc : True := doc_contains_first
+"#,
+    )
+    .unwrap();
+    let bad_doc = p.run(&["check", "LexerSound.lean"], false);
+    assert!(
+        !bad_doc.status.success(),
+        "mutated docstring on `doc_checked` must invalidate `verify_doc`'s prefix_env_hash:\n{}{}",
+        String::from_utf8_lossy(&bad_doc.stdout),
+        String::from_utf8_lossy(&bad_doc.stderr)
+    );
+}

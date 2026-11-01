@@ -592,8 +592,8 @@ pub(crate) fn compute_shard_key_with_args(
     lean_args: &[String],
 ) -> String {
     let mut key_hasher = blake3::Hasher::new();
-    // v5: invalidates receipts written before literal/layout-preserving content normalization.
-    key_hasher.update(b"theorem-shard-v5:");
+    // v6: invalidates receipts written before zero-hash raw string, guillemet, docstring, and custom interpolated-string lexer fixes.
+    key_hasher.update(b"theorem-shard-v6:");
     key_hasher.update(toolchain.as_bytes());
     key_hasher.update(b":");
     key_hasher.update(shard.prefix_env_hash.as_bytes());
@@ -1011,14 +1011,14 @@ pub(crate) struct ShmProjectStatSummary {
 }
 
 pub(crate) fn shm_file_splits_dir(store: &TurboStore) -> PathBuf {
-    let dir = store.fast_staging_dir().join("file_splits_v5");
+    let dir = store.fast_staging_dir().join("file_splits_v6");
     let _ = fs::create_dir_all(&dir);
     dir
 }
 
 pub(crate) fn compute_single_stat_hash(pk: &str, ms: i64, mn: i64, sz: i64) -> String {
     let mut h = blake3::Hasher::new();
-    h.update(b"single-stat-split:v5\n");
+    h.update(b"single-stat-split:v6\n");
     h.update(pk.as_bytes());
     h.update(b":");
     h.update(&ms.to_le_bytes());
@@ -1044,7 +1044,7 @@ pub(crate) fn compact_split_for_shm_cache(split: &splitter::SplitResult) -> spli
 
 pub(crate) fn compute_stat_slice_hash(stats: &[(String, i64, i64, i64)]) -> String {
     let mut h = blake3::Hasher::new();
-    h.update(b"project-stat-splits:v5\n");
+    h.update(b"project-stat-splits:v6\n");
     for (pk, ms, mn, sz) in stats {
         h.update(pk.as_bytes());
         h.update(b":");
@@ -1079,7 +1079,7 @@ pub(crate) fn load_project_stat_summary_cached(
         let stat_hash = compute_stat_slice_hash(&valid_stats);
         let p = store
             .fast_staging_dir()
-            .join(format!("project_stat_summary_v4_{}.json", &stat_hash[..24]));
+            .join(format!("project_stat_summary_v5_{}.json", &stat_hash[..24]));
         if let Ok(bytes) = fs::read(&p) {
             if let Ok(summary) = serde_json::from_slice::<ShmProjectStatSummary>(&bytes) {
                 if summary.total_files == paths.len() {
@@ -1142,7 +1142,7 @@ pub(crate) fn compute_project_interface_key_fast_summary(
     trust_domain: &str,
 ) -> Result<(String, String, BTreeMap<String, String>)> {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"turbo-lean-build-v3\n");
+    hasher.update(b"turbo-lean-build-v4\n");
     hasher.update(toolchain.as_bytes());
     hasher.update(b"\n");
     hasher.update(trust_domain.as_bytes());
@@ -1392,13 +1392,13 @@ pub(crate) fn split_and_audit_with_hashes_cached(
 
     let shm_proj_path = if files.len() <= 128 {
         let mut ch = blake3::Hasher::new();
-        ch.update(b"project-content-splits:v5\n");
+        ch.update(b"project-content-splits:v6\n");
         for (_, fk) in &file_keys {
             ch.update(fk.as_bytes());
             ch.update(b"\n");
         }
         let p = store.fast_staging_dir().join(format!(
-            "project_splits_v5_{}.json",
+            "project_splits_v6_{}.json",
             &ch.finalize().to_hex()[..24]
         ));
         if let Ok(bytes) = fs::read(&p) {
@@ -3353,7 +3353,10 @@ mod tests {
                 .env("PATH", &bin)
                 .env("HOME", tree.root.join("isolated/a/b/home"))
                 // Register the installed toolchain explicitly; verification never trusts PATH discovery.
-                .env("ELAN_HOME", lean.ancestors().nth(4).expect("installed Elan toolchain"))
+                .env(
+                    "ELAN_HOME",
+                    lean.ancestors().nth(4).expect("installed Elan toolchain"),
+                )
                 .env("TURBO_LEAN_HOME", tree.root.join("cache"))
                 .env("TURBO_LEAN_STAGING_DIR", tree.root.join("staging"))
                 .env("TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK", "0")
@@ -3915,7 +3918,11 @@ mod tests {
             assert_eq!(fs::metadata(&wt_local)?.permissions().mode() & 0o777, 0o600);
         }
         for (path, bytes) in &main_lake_bytes {
-            assert_eq!(&fs::read(path)?, bytes, "opt-out must not copy or rewrite main `.lake`");
+            assert_eq!(
+                &fs::read(path)?,
+                bytes,
+                "opt-out must not copy or rewrite main `.lake`"
+            );
         }
         #[cfg(unix)]
         {

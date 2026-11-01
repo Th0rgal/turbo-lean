@@ -3567,16 +3567,66 @@ pub(crate) fn run_audited_lean_shard_at(
         }
     }
     let _guard = TmpDirGuard(tmp_dir.clone());
-    let (lean_file, root_dir) = if let Some(orig) = source_path {
+    let expected_source_hash = blake3::hash(source.as_bytes());
+    let read_verified_live_source = |orig: &Path| -> Result<(OleanFileStatSig, i128)> {
+        use std::io::Read;
+        let sym_meta = fs::symlink_metadata(orig).with_context(|| {
+            format!(
+                "[TurboLean.KernelGate] failed to stat live source `{}`",
+                orig.display()
+            )
+        })?;
+        if sym_meta.file_type().is_symlink() || !sym_meta.is_file() {
+            anyhow::bail!(
+                "[TurboLean.KernelGate] live source `{}` must be a regular non-symlink file",
+                orig.display()
+            );
+        }
+        let sym_sig = OleanFileStatSig::from_meta(&sym_meta);
+        let mut f = fs::File::open(orig).with_context(|| {
+            format!(
+                "[TurboLean.KernelGate] failed to open live source `{}`",
+                orig.display()
+            )
+        })?;
+        let pre_sig = OleanFileStatSig::from_meta(&f.metadata()?);
+        if pre_sig != sym_sig {
+            anyhow::bail!(
+                "[TurboLean.KernelGate] live source `{}` changed concurrently before verification",
+                orig.display()
+            );
+        }
+        let read_started_ns = wall_clock_ns();
+        let mut disk_bytes = Vec::with_capacity(pre_sig.size as usize);
+        f.read_to_end(&mut disk_bytes)?;
+        let post_sig = OleanFileStatSig::from_meta(&f.metadata()?);
+        if post_sig != pre_sig || blake3::hash(&disk_bytes) != expected_source_hash {
+            anyhow::bail!(
+                "[TurboLean.KernelGate] live source `{}` diverged from audited in-memory snapshot",
+                orig.display()
+            );
+        }
+        Ok((pre_sig, read_started_ns))
+    };
+    let (lean_file, root_dir, live_source_pre_sig) = if let Some(orig) = source_path {
+        let (mut pre_sig, mut read_started_ns) = read_verified_live_source(orig)?;
+        if !dev_records_subsecond_timestamps(&pre_sig)
+            && read_started_ns > 0
+            && pre_sig.ctime_ns() >= read_started_ns - STAT_TRUST_WINDOW_NS
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2100));
+            (pre_sig, read_started_ns) = read_verified_live_source(orig)?;
+        }
+        let _ = read_started_ns;
         let root = cwd
             .filter(|d| orig.starts_with(d))
             .or_else(|| orig.parent())
             .unwrap_or(&tmp_dir);
-        (orig.to_path_buf(), root.to_path_buf())
+        (orig.to_path_buf(), root.to_path_buf(), Some(pre_sig))
     } else {
         let lf = tmp_dir.join(format!("{}.lean", mod_name));
         fs::write(&lf, source)?;
-        (lf, tmp_dir.clone())
+        (lf, tmp_dir.clone(), None)
     };
     // Pinned toolchain executables replace any PATH/LEAN/LAKE/LEANC overrides in `env_vars`.
     let mut cmd = crate::module_builder::verifier_command(lean_bin, env_vars)?;
@@ -3590,11 +3640,22 @@ pub(crate) fn run_audited_lean_shard_at(
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
+    run_digest_test_hook("audited_shard_before_lean");
     let out = match timeout_ms {
         Some(_) => run_lean_command(&mut cmd, timeout_ms),
         None => cmd.output().map_err(Into::into),
     }
     .context("Failed to execute `lean` on shard fallback")?;
+    run_digest_test_hook("audited_shard_after_lean");
+    if let (Some(orig), Some(pre_sig)) = (source_path, live_source_pre_sig) {
+        let (post_compile_sig, _) = read_verified_live_source(orig)?;
+        if post_compile_sig != pre_sig {
+            anyhow::bail!(
+                "[TurboLean.KernelGate] live source `{}` changed on disk during compilation",
+                orig.display()
+            );
+        }
+    }
     if !out.status.success() {
         return Ok(out);
     }
@@ -3728,6 +3789,15 @@ pub(crate) fn run_audited_lean_shard_at(
             "[TurboLean.KernelGate] audited theorem(s) {:?} missing from the compiled shard",
             missing
         );
+    }
+    if let (Some(orig), Some(pre_sig)) = (source_path, live_source_pre_sig) {
+        let (post_audit_sig, _) = read_verified_live_source(orig)?;
+        if post_audit_sig != pre_sig {
+            anyhow::bail!(
+                "[TurboLean.KernelGate] live source `{}` changed on disk during kernel audit",
+                orig.display()
+            );
+        }
     }
     Ok(out)
 }
@@ -10464,6 +10534,85 @@ mod tests {
         }
         purge_snapshot_dir(&fake_label_dir);
         purge_snapshot_dir(&snap_dir);
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_run_audited_lean_shard_at_rejects_live_source_toctou_and_aba_swap() {
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("audited_toctou")
+        else {
+            return;
+        };
+        struct ResetHooks;
+        impl Drop for ResetHooks {
+            fn drop(&mut self) {
+                digest_test_hooks::clear();
+            }
+        }
+        let _reset = ResetHooks;
+
+        let live_file = tmp_dir.join("LiveToctou.lean");
+        let in_mem_false = "theorem target : False := by trivial\n";
+        let disk_true = "theorem target : True := trivial\n";
+        let audit_targets: std::collections::HashSet<String> =
+            ["_root_.target".to_string()].into_iter().collect();
+
+        // Case A: file on disk overwritten before `lean` runs and left as `True`.
+        fs::write(&live_file, in_mem_false).unwrap();
+        let lf_a = live_file.clone();
+        digest_test_hooks::set("audited_shard_before_lean", move || {
+            fs::write(&lf_a, disk_true).unwrap();
+        });
+        let err_a = run_audited_lean_shard_at(
+            &store.root,
+            &store.fast_staging_dir(),
+            &lean_bin,
+            &env_vars,
+            Some(&tmp_dir),
+            Some(&live_file),
+            in_mem_false,
+            &audit_targets,
+            false,
+            &[],
+            Some(60_000),
+        )
+        .expect_err("must reject live source overwrite to True before lean");
+        assert!(
+            format!("{err_a:#}").contains("KernelGate"),
+            "unexpected error for Case A: {err_a:#}"
+        );
+        digest_test_hooks::clear();
+
+        // Case B: ABA swap — overwritten with `True` before `lean`, then restored to `False` right after `lean`!
+        fs::write(&live_file, in_mem_false).unwrap();
+        let lf_b1 = live_file.clone();
+        let lf_b2 = live_file.clone();
+        digest_test_hooks::set("audited_shard_before_lean", move || {
+            fs::write(&lf_b1, disk_true).unwrap();
+        });
+        digest_test_hooks::set("audited_shard_after_lean", move || {
+            fs::write(&lf_b2, in_mem_false).unwrap();
+        });
+        let err_b = run_audited_lean_shard_at(
+            &store.root,
+            &store.fast_staging_dir(),
+            &lean_bin,
+            &env_vars,
+            Some(&tmp_dir),
+            Some(&live_file),
+            in_mem_false,
+            &audit_targets,
+            false,
+            &[],
+            Some(60_000),
+        )
+        .expect_err("must reject ABA live source swap (False -> True -> False)");
+        assert!(
+            format!("{err_b:#}").contains("KernelGate"),
+            "unexpected error for Case B: {err_b:#}"
+        );
+        digest_test_hooks::clear();
+
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 }

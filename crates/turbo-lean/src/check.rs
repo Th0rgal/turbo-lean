@@ -53,7 +53,7 @@ fn cache_shm_stat_split(
         let st_path = shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
         let src_b3 = blake3::hash(active_src.as_bytes()).to_hex().to_string();
         let entry = ShmCachedFileSplit {
-            split_key: format!("file-split:v5:{}", src_b3),
+            split_key: format!("file-split:v6:{}", src_b3),
             src_blake3: src_b3,
             split: compact_split_for_shm_cache(split),
             prefix_src: String::new(),
@@ -789,7 +789,7 @@ fn run_check_command_inner(
             let src_b3 = blake3::hash(loaded_src.as_bytes()).to_hex().to_string();
             if let Some((ref st_path, _)) = st_paths_opt {
                 let entry = ShmCachedFileSplit {
-                    split_key: format!("file-split:v5:{}", src_b3),
+                    split_key: format!("file-split:v6:{}", src_b3),
                     src_blake3: src_b3.clone(),
                     split: compact_split_for_shm_cache(&sp),
                     prefix_src: String::new(),
@@ -828,7 +828,7 @@ fn run_check_command_inner(
                     split_key: if src_b3.is_empty() {
                         String::new()
                     } else {
-                        format!("file-split:v5:{}", src_b3)
+                        format!("file-split:v6:{}", src_b3)
                     },
                     src_blake3: src_b3,
                     split: compact_split_for_shm_cache(&fast_res.0),
@@ -1508,7 +1508,7 @@ pub(crate) fn compute_fission_store_key_with_args(
     let mut base = if allowed.len() > splitter::STANDARD_AXIOMS.len() {
         let ax_hash = blake3::hash(allowed.join(",").as_bytes()).to_hex();
         format!(
-            "fission-v5:{}:{}:{}:ax:{}",
+            "fission-v6:{}:{}:{}:ax:{}",
             toolchain,
             prefix_env_hash,
             sub_shard_key,
@@ -1516,7 +1516,7 @@ pub(crate) fn compute_fission_store_key_with_args(
         )
     } else {
         format!(
-            "fission-v5:{}:{}:{}",
+            "fission-v6:{}:{}:{}",
             toolchain, prefix_env_hash, sub_shard_key
         )
     };
@@ -1645,7 +1645,7 @@ fn check_single_decl(
                         let st_path =
                             shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
                         let entry = ShmCachedFileSplit {
-                            split_key: format!("file-split:v5:{}", sub_b3),
+                            split_key: format!("file-split:v6:{}", sub_b3),
                             src_blake3: sub_b3.clone(),
                             split: compact_split_for_shm_cache(&sub_split),
                             prefix_src: if sub_src.len() <= 64 * 1024 {
@@ -3671,9 +3671,46 @@ fn check_single_file(
         }
         Ok(out_json)
     } else {
-        if src.is_empty() {
+        let needs_fresh_read = match cached_file_blake3 {
+            None => true,
+            Some(expected_hex) => {
+                src.is_empty() || blake3::hash(src.as_bytes()).to_hex().as_str() != expected_hex
+            }
+        };
+        if needs_fresh_read {
             *src = fs::read_to_string(resolved_file)
                 .with_context(|| format!("Failed to read {}", resolved_file.display()))?;
+            let actual_deps = compute_imported_olean_interface_hashes(src, canon_dir, None);
+            let actual_split = split_lean_source(src, &actual_deps);
+            if !actual_split.hygiene.is_clean_for_certification() {
+                anyhow::bail!(
+                    "Soundness hygiene violation in {}: {}",
+                    file.display(),
+                    if actual_split.hygiene.disallowed_items().is_empty() {
+                        "file contains sorry/admit or forbidden axioms".to_string()
+                    } else {
+                        actual_split.hygiene.disallowed_items().join(", ")
+                    }
+                );
+            }
+            if actual_split.interface_hash != split.interface_hash
+                || actual_split.shards.len() != split.shards.len()
+                || actual_split
+                    .shards
+                    .iter()
+                    .zip(split.shards.iter())
+                    .any(|(a, b)| {
+                        a.rooted_name() != b.rooted_name()
+                            || a.prefix_env_hash != b.prefix_env_hash
+                            || a.stmt_hash != b.stmt_hash
+                            || a.proof_hash != b.proof_hash
+                    })
+            {
+                anyhow::bail!(
+                    "[TurboLean.KernelGate] source `{}` diverged from cached split before whole-file verification",
+                    file.display()
+                );
+            }
         }
         let orig_display = file.display().to_string();
         let mut verified_via_zygote_eval = false;

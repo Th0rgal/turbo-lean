@@ -1259,7 +1259,7 @@ pub(crate) fn resolve_server_lean_env_and_bin(
 /// Store key of a receipt this server publishes for a caller-supplied shard key. The epoch makes
 /// receipts written before canonical rooted target + server-computed content binding unreachable.
 fn server_receipt_key(shard_key: &str) -> String {
-    format!("srv-v6:{}", shard_key)
+    format!("srv-v7:{}", shard_key)
 }
 
 /// Pin the request's toolchain for an elan-proxied `lean` unless the environment already does.
@@ -1477,7 +1477,7 @@ fn hash_framed_slice(h: &mut blake3::Hasher, items: &[String]) {
 fn context_bound_http_key(key: &str, ctx: &HttpShardReceiptContext) -> String {
     let base = server_receipt_key(key);
     let mut h = blake3::Hasher::new();
-    h.update(b"http-shard-context-v6:");
+    h.update(b"http-shard-context-v7:");
     hash_framed_str(&mut h, &base);
     hash_framed_str(&mut h, &ctx.lean_args_digest);
     hash_framed_slice(&mut h, &ctx.allowed_axioms);
@@ -1495,7 +1495,7 @@ fn context_bound_receipt(
     if !receipt.is_object() {
         anyhow::bail!("HTTP shard receipt must serialize as a JSON object");
     }
-    receipt["receipt_schema"] = serde_json::Value::String("srv-v6".to_string());
+    receipt["receipt_schema"] = serde_json::Value::String("srv-v7".to_string());
     receipt["lean_args_digest"] = serde_json::Value::String(ctx.lean_args_digest.clone());
     receipt["allowed_axioms"] = serde_json::json!(ctx.allowed_axioms);
     receipt["target_context"] = serde_json::json!(ctx.target_context);
@@ -1521,7 +1521,7 @@ fn receipt_matches_http_context(
             })
             .unwrap_or(false)
     };
-    receipt["receipt_schema"].as_str() == Some("srv-v6")
+    receipt["receipt_schema"].as_str() == Some("srv-v7")
         && receipt["lean_args_digest"].as_str() == Some(ctx.lean_args_digest.as_str())
         && str_vec_eq(&receipt["allowed_axioms"], &ctx.allowed_axioms)
         && str_vec_eq(&receipt["target_context"], &ctx.target_context)
@@ -2653,7 +2653,7 @@ mod bind_auth_tests {
         assert_eq!(entries.len(), 1);
         batch.lean_args = vec!["--plugin=unsafe.so".into()];
         assert!(execute_check_shards_batch_payload_deferred(&mut store, &batch, None).is_err());
-        assert_eq!(server_receipt_key("legacy-key"), "srv-v6:legacy-key");
+        assert_eq!(server_receipt_key("legacy-key"), "srv-v7:legacy-key");
         let _ = entries;
         let _ = std::fs::remove_dir_all(dir);
         Ok(())
@@ -2695,10 +2695,20 @@ mod bind_auth_tests {
             "toolchain_policy": matching.toolchain_policy,
             "import_context": matching.import_context
         });
+        let v6_receipt = serde_json::json!({
+            "receipt_schema": "srv-v6",
+            "lean_args_digest": matching.lean_args_digest,
+            "allowed_axioms": matching.allowed_axioms,
+            "target_context": matching.target_context,
+            "target_content_digests": matching.target_content_digests,
+            "toolchain_policy": matching.toolchain_policy,
+            "import_context": matching.import_context
+        });
         let entries = [
             ("legacy", br#"{"decl":"unknown-context"}"#.to_vec()),
             ("srv_v4", serde_json::to_vec(&mut v4_receipt)?),
             ("srv_v5", serde_json::to_vec(&v5_receipt)?),
+            ("srv_v6", serde_json::to_vec(&v6_receipt)?),
             (
                 "matching",
                 context_bound_receipt(serde_json::json!({}), &matching)?,

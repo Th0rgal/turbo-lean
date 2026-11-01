@@ -304,6 +304,120 @@ struct ScopeFrame {
     open_span_idx: usize,
 }
 
+#[inline]
+fn is_lean_letter_like(c: char) -> bool {
+    let v = c as u32;
+    ((0x3b1..=0x3c9).contains(&v) && v != 0x3bb)
+        || ((0x391..=0x3a9).contains(&v) && v != 0x3a0 && v != 0x3a3)
+        || (0x3ca..=0x3fb).contains(&v)
+        || (0x1f00..=0x1ffe).contains(&v)
+        || (0x2100..=0x214f).contains(&v)
+        || (0x1d49c..=0x1d59f).contains(&v)
+        || ((0x00c0..=0x00ff).contains(&v) && v != 0x00d7 && v != 0x00f7)
+        || (0x0100..=0x017f).contains(&v)
+}
+
+#[inline]
+fn is_lean_subscript_alnum(c: char) -> bool {
+    let v = c as u32;
+    (0x2080..=0x2089).contains(&v)
+        || (0x2090..=0x209c).contains(&v)
+        || (0x1d62..=0x1d6a).contains(&v)
+        || v == 0x2c7c
+}
+
+#[inline]
+fn is_lean_id_first(c: char) -> bool {
+    c.is_ascii_alphabetic() || c == '_' || is_lean_letter_like(c)
+}
+
+#[inline]
+fn is_lean_id_rest(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(c, '_' | '\'' | '!' | '?')
+        || is_lean_letter_like(c)
+        || is_lean_subscript_alnum(c)
+}
+
+/// Scan a guillemet-quoted identifier segment `«...»` starting at byte offset `start` (`«` is `[0xC2, 0xAB]`).
+/// Returns the byte offset immediately after the closing `»` (`[0xC2, 0xBB]`), or `src.len()` if unterminated.
+pub(crate) fn scan_lean_guillemet_ident_end(src: &str, start: usize) -> Option<usize> {
+    let bytes = src.as_bytes();
+    if bytes.get(start) != Some(&0xC2) || bytes.get(start + 1) != Some(&0xAB) {
+        return None;
+    }
+    let mut i = start + 2;
+    while i < bytes.len() {
+        if bytes[i] == 0xC2 && bytes.get(i + 1) == Some(&0xBB) {
+            return Some(i + 2);
+        }
+        i += 1;
+    }
+    Some(bytes.len())
+}
+
+/// Parse a potentially dotted Lean identifier (`foo`, `«a  b»`, `Foo.«a.b».bar`) at the start of `s`.
+/// Returns `(ident_slice, rest_slice)` where `ident_slice` excludes any trailing dangling `.`.
+fn take_leading_lean_ident(s: &str) -> Option<(&str, &str)> {
+    let mut pos = 0usize;
+    let mut last_valid_end = 0usize;
+    loop {
+        if pos >= s.len() {
+            break;
+        }
+        let seg_end = if let Some(gend) = scan_lean_guillemet_ident_end(s, pos) {
+            gend
+        } else {
+            let mut chars = s[pos..].char_indices();
+            let (_, c0) = chars.next()?;
+            if !is_lean_id_first(c0) {
+                break;
+            }
+            let mut end_rel = c0.len_utf8();
+            for (rel, ch) in chars {
+                if is_lean_id_rest(ch) {
+                    end_rel = rel + ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            pos + end_rel
+        };
+        if seg_end == pos {
+            break;
+        }
+        last_valid_end = seg_end;
+        if s.as_bytes().get(seg_end) == Some(&b'.') {
+            pos = seg_end + 1;
+        } else {
+            break;
+        }
+    }
+    (last_valid_end > 0).then(|| (&s[..last_valid_end], &s[last_valid_end..]))
+}
+
+fn last_host_name_component(name: &str) -> &str {
+    let bytes = name.as_bytes();
+    let mut quoted = false;
+    let mut last_dot_end = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == 0xC2 && bytes.get(i + 1) == Some(&0xAB) {
+            quoted = true;
+            i += 2;
+        } else if bytes[i] == 0xC2 && bytes.get(i + 1) == Some(&0xBB) {
+            quoted = false;
+            i += 2;
+        } else {
+            if bytes[i] == b'.' && !quoted {
+                last_dot_end = i + 1;
+            }
+            i += 1;
+        }
+    }
+    &name[last_dot_end..]
+}
+
 /// Parse a well-formed Lean character literal starting at byte offset `start` (`bytes[start] == b'\''`),
 /// returning the byte index immediately following the closing `'` if valid (matching `Lean.Parser.charLitFnAux`).
 pub(crate) fn scan_lean_char_lit_end(src: &str, start: usize) -> Option<usize> {
@@ -348,16 +462,32 @@ pub(crate) fn scan_lean_char_lit_end(src: &str, start: usize) -> Option<usize> {
     }
 }
 
+fn ends_with_closed_char_lit(src: &str, end: usize) -> bool {
+    let bytes = src.as_bytes();
+    if end < 3 || bytes.get(end - 1) != Some(&b'\'') {
+        return false;
+    }
+    let lo = end.saturating_sub(10);
+    (lo..=end - 3).any(|k| src.is_char_boundary(k) && scan_lean_char_lit_end(src, k) == Some(end))
+}
+
 pub(crate) fn scan_lean_raw_string_end(src: &str, start: usize) -> Option<usize> {
     let bytes = src.as_bytes();
-    if bytes.get(start) != Some(&b'r')
-        || bytes.get(start + 1) != Some(&b'#')
-        || src[..start]
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '\'')
-    {
+    if bytes.get(start) != Some(&b'r') {
         return None;
+    }
+    if let Some(prev) = src[..start].chars().next_back() {
+        let prev_continues_name = if prev == '\'' {
+            !ends_with_closed_char_lit(src, start)
+        } else if prev == '.' {
+            // Single `.` (`foo.r"x"` or `.r"x"`) continues/projects a name, whereas `..` / `...` is a range op.
+            start < 2 || bytes[start - 2] != b'.'
+        } else {
+            is_lean_id_rest(prev) || prev == '»' || prev == '`'
+        };
+        if prev_continues_name {
+            return None;
+        }
     }
     let mut i = start + 1;
     while bytes.get(i) == Some(&b'#') {
@@ -393,12 +523,81 @@ pub(crate) fn scan_lean_string_lit_end(src: &str, start: usize) -> Option<usize>
     Some(bytes.len())
 }
 
+fn has_valid_interp_ident_prefix(src: &str, bang_idx: usize) -> bool {
+    if bang_idx == 0 || src.as_bytes().get(bang_idx) != Some(&b'!') {
+        return false;
+    }
+    let mut seg_end = bang_idx;
+    loop {
+        let before = &src[..seg_end];
+        let Some((mut seg_start, last_ch)) = before.char_indices().next_back() else {
+            return false;
+        };
+        if last_ch == '\'' && ends_with_closed_char_lit(src, seg_end) {
+            return false;
+        }
+        if !is_lean_id_rest(last_ch) {
+            return false;
+        }
+        let mut first_ch = last_ch;
+        for (idx, ch) in before[..seg_start].char_indices().rev() {
+            if ch == '\'' && ends_with_closed_char_lit(src, idx + 1) {
+                break;
+            }
+            if is_lean_id_rest(ch) {
+                seg_start = idx;
+                first_ch = ch;
+            } else {
+                break;
+            }
+        }
+        if !is_lean_id_first(first_ch) {
+            return false;
+        }
+        let prev = src[..seg_start].chars().next_back();
+        if prev == Some('»') {
+            return false;
+        }
+        if prev == Some('.') && seg_start >= 2 && src.as_bytes()[seg_start - 2] != b'.' {
+            seg_end = seg_start - 1;
+            continue;
+        }
+        return true;
+    }
+}
+
+/// Scan a comment starting at `start` (`/-` or `--`), returning `(end_offset, is_docstring)` where
+/// `is_docstring` is true iff the comment is a `/-- ... -/` or `/-! ... -/` docstring.
+/// Matches Lean 4's 3-byte `/--` and `/-!` openers so `/--/` and `/-!/` remain open until a closing `-/`.
+fn scan_lean_block_comment_end(src: &str, start: usize) -> Option<(usize, bool)> {
+    let bytes = src.as_bytes();
+    if start + 1 >= bytes.len() || bytes[start] != b'/' || bytes[start + 1] != b'-' {
+        return None;
+    }
+    let is_doc = matches!(bytes.get(start + 2), Some(b'-' | b'!'))
+        && !matches!(bytes.get(start + 3), Some(b'-' | b'/'));
+    let mut i = start + if is_doc { 3 } else { 2 };
+    let mut depth = 1usize;
+    while i < bytes.len() && depth > 0 {
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'-' {
+            depth += 1;
+            i += 2;
+        } else if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'/' {
+            depth -= 1;
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    Some((i, is_doc))
+}
+
 pub(crate) fn scan_lean_interpolated_string_end(src: &str, start: usize) -> Option<usize> {
     let bytes = src.as_bytes();
     if bytes.get(start) != Some(&b'"')
         || start < 2
         || bytes[start - 1] != b'!'
-        || !(bytes[start - 2].is_ascii_alphabetic() || bytes[start - 2] == b'_')
+        || !has_valid_interp_ident_prefix(src, start - 1)
     {
         return None;
     }
@@ -412,20 +611,8 @@ pub(crate) fn scan_lean_interpolated_string_end(src: &str, start: usize) -> Opti
                 i = end;
                 continue;
             }
-            if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'-' {
-                let mut depth = 1usize;
-                i += 2;
-                while i < bytes.len() && depth > 0 {
-                    if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'-' {
-                        depth += 1;
-                        i += 2;
-                    } else if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'/' {
-                        depth -= 1;
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
+            if let Some((end, _)) = scan_lean_block_comment_end(src, i) {
+                i = end;
                 continue;
             }
             if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
@@ -460,6 +647,7 @@ pub(crate) fn scan_lean_literal_end(src: &str, start: usize) -> Option<usize> {
         b'"' => scan_lean_string_lit_end(src, start),
         b'\'' => scan_lean_char_lit_end(src, start),
         b'r' => scan_lean_raw_string_end(src, start),
+        0xC2 => scan_lean_guillemet_ident_end(src, start),
         _ => None,
     }
 }
@@ -468,8 +656,9 @@ pub(crate) fn scan_lean_norm_literal_end(src: &str, start: usize) -> Option<usiz
     scan_lean_interpolated_string_end(src, start).or_else(|| scan_lean_literal_end(src, start))
 }
 
-fn scan_lean_comments_with(
+fn scan_lean_comments_inner(
     src: &str,
+    preserve_docstrings: bool,
     out: &mut Vec<u8>,
     on_line_comment: &mut dyn FnMut(usize, usize),
 ) {
@@ -518,6 +707,14 @@ fn scan_lean_comments_with(
             continue;
         }
 
+        if bytes[i] == 0xC2 {
+            if let Some(end) = scan_lean_guillemet_ident_end(src, i) {
+                char_lit_end = end;
+                out.push(bytes[i]);
+                i += 1;
+                continue;
+            }
+        }
         if bytes[i] == b'\'' {
             if let Some(end) = scan_lean_char_lit_end(src, i) {
                 char_lit_end = end;
@@ -542,30 +739,27 @@ fn scan_lean_comments_with(
                 while j < end {
                     if interp_depth > 0 {
                         if let Some(sub_end) = scan_lean_norm_literal_end(src, j) {
-                            scan_lean_comments_with(&src[j..sub_end], out, &mut |s, e| {
-                                on_line_comment(j + s, j + e);
-                            });
+                            scan_lean_comments_inner(
+                                &src[j..sub_end],
+                                preserve_docstrings,
+                                out,
+                                &mut |s, e| {
+                                    on_line_comment(j + s, j + e);
+                                },
+                            );
                             j = sub_end;
                             continue;
                         }
-                        if j + 1 < end && bytes[j] == b'/' && bytes[j + 1] == b'-' {
-                            let mut sub_depth = 1usize;
-                            out.extend_from_slice(b"  ");
-                            j += 2;
-                            while j < end && sub_depth > 0 {
-                                if j + 1 < end && bytes[j] == b'/' && bytes[j + 1] == b'-' {
-                                    sub_depth += 1;
-                                    out.extend_from_slice(b"  ");
-                                    j += 2;
-                                } else if j + 1 < end && bytes[j] == b'-' && bytes[j + 1] == b'/' {
-                                    sub_depth -= 1;
-                                    out.extend_from_slice(b"  ");
-                                    j += 2;
-                                } else {
-                                    out.push(if bytes[j] == b'\n' { b'\n' } else { b' ' });
-                                    j += 1;
+                        if let Some((cend, is_doc)) = scan_lean_block_comment_end(src, j) {
+                            let clamped = cend.min(end);
+                            if preserve_docstrings && is_doc {
+                                out.extend_from_slice(&bytes[j..clamped]);
+                            } else {
+                                for &b in &bytes[j..clamped] {
+                                    out.push(if b == b'\n' { b'\n' } else { b' ' });
                                 }
                             }
+                            j = clamped;
                             continue;
                         }
                         if j + 1 < end && bytes[j] == b'-' && bytes[j + 1] == b'-' {
@@ -631,14 +825,47 @@ fn scan_lean_comments_with(
         ) && bytes[i] == b'/'
             && bytes[i + 1] == b'-'
         {
-            block_depth = 1;
-            out.extend_from_slice(b"  ");
-            i += 2;
+            if let Some((cend, is_doc)) = scan_lean_block_comment_end(src, i) {
+                if preserve_docstrings && is_doc {
+                    out.extend_from_slice(&bytes[i..cend]);
+                    i = cend;
+                } else {
+                    let opener = if is_doc { 3 } else { 2 }.min(bytes.len() - i);
+                    for &b in &bytes[i..i + opener] {
+                        out.push(if b == b'\n' { b'\n' } else { b' ' });
+                    }
+                    block_depth = 1;
+                    i += opener;
+                }
+            } else {
+                block_depth = 1;
+                out.extend_from_slice(b"  ");
+                i += 2;
+            }
         } else {
             out.push(bytes[i]);
             i += 1;
         }
     }
+}
+
+fn scan_lean_comments_with(
+    src: &str,
+    out: &mut Vec<u8>,
+    on_line_comment: &mut dyn FnMut(usize, usize),
+) {
+    scan_lean_comments_inner(src, false, out, on_line_comment);
+}
+
+/// Strip ordinary `--` and `/- ... -/` comments while preserving `/-- ... -/` and `/-! ... -/`
+/// docstrings, string/character literals, guillemet identifiers, exact byte offsets, and newline counts.
+fn strip_non_doc_lean_comments(src: &str) -> String {
+    if !src.contains("--") && !src.contains("/-") {
+        return src.to_string();
+    }
+    let mut out = Vec::with_capacity(src.len());
+    scan_lean_comments_inner(src, true, &mut out, &mut |_, _| {});
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 /// Strip comments while preserving string/character literals, exact byte offsets, and newline counts.
@@ -652,13 +879,18 @@ pub fn strip_lean_comments(src: &str) -> String {
 }
 
 fn strip_string_literals(src: &str) -> std::borrow::Cow<'_, str> {
-    if !src.contains('"') && !src.contains('\'') {
+    if !src.contains('"') && !src.contains('\'') && !src.contains('«') {
         return std::borrow::Cow::Borrowed(src);
     }
     let bytes = src.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
+        if let Some(end) = scan_lean_guillemet_ident_end(src, i) {
+            out.extend_from_slice(&bytes[i..end]);
+            i = end;
+            continue;
+        }
         if let Some(end) = scan_lean_norm_literal_end(src, i) {
             if scan_lean_interpolated_string_end(src, i).is_some() {
                 out.push(b'"');
@@ -957,23 +1189,24 @@ fn strip_leading_attr_block(s: &str) -> Option<&str> {
     }
     let bytes = s.as_bytes();
     let mut depth = 0i32;
-    let mut in_string = false;
     let mut i = 1usize;
     while i < bytes.len() {
-        let c = bytes[i];
-        if in_string {
-            if c == b'\\' {
-                i += 2;
-                continue;
-            }
-            if c == b'"' {
-                in_string = false;
-            }
-            i += 1;
+        if let Some((end, _)) = scan_lean_block_comment_end(s, i) {
+            i = end;
             continue;
         }
-        match c {
-            b'"' => in_string = true,
+        if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(end) = scan_lean_norm_literal_end(s, i) {
+            i = end;
+            continue;
+        }
+        match bytes[i] {
             b'[' => depth += 1,
             b']' => {
                 depth -= 1;
@@ -1034,6 +1267,12 @@ pub(crate) fn strip_decl_prefixes(cmd_text: &str) -> &str {
     ];
     let mut rest = cmd_text.trim_start();
     loop {
+        if let Some((end, is_doc)) = scan_lean_block_comment_end(rest, 0) {
+            if is_doc {
+                rest = rest[end..].trim_start();
+                continue;
+            }
+        }
         if let Some(after_attr) = strip_leading_attr_block(rest) {
             rest = after_attr.trim_start();
             continue;
@@ -1067,12 +1306,27 @@ pub(crate) fn strip_decl_prefixes(cmd_text: &str) -> &str {
     rest
 }
 
-/// Returns true if `clean_chunk` consists solely of comments, whitespace, `@[...]` attributes,
-/// or declaration modifiers (`private`, `scoped`, `local`, etc.) waiting for a declaration on
-/// a following line.
-fn is_incomplete_prefix_only_span(clean_chunk: &str) -> bool {
+/// Returns true if `clean_chunk` (with corresponding `orig_chunk`) consists solely of comments,
+/// `/-- ... -/` declaration docstrings, whitespace, `@[...]` attributes, or declaration modifiers
+/// (`private`, `scoped`, `local`, etc.) waiting for a declaration on a following line.
+fn is_incomplete_prefix_only_span(orig_chunk: &str, clean_chunk: &str) -> bool {
     let trimmed = clean_chunk.trim();
     if trimmed.is_empty() {
+        let mut r = orig_chunk.trim_start();
+        while !r.is_empty() {
+            if let Some((end, is_doc)) = scan_lean_block_comment_end(r, 0) {
+                if is_doc && r[..end].starts_with("/-!") {
+                    return false;
+                }
+                r = r[end..].trim_start();
+                continue;
+            }
+            if r.starts_with("--") {
+                r = r.find('\n').map_or("", |p| &r[p + 1..]).trim_start();
+                continue;
+            }
+            break;
+        }
         return true;
     }
     strip_decl_prefixes(trimmed).is_empty()
@@ -1148,8 +1402,12 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
         let trimmed = line_clean.trim_start();
         let indent = line_orig.len() - line_orig.trim_start().len();
         let is_unindented = indent == 0;
-        let starts_doc_comment = line_orig.trim_start().starts_with("/--")
-            && (is_unindented || (scope_depth > 0 && indent <= cur_cmd_indent.unwrap_or(indent)));
+        let trimmed_orig_line = line_orig.trim_start();
+        let starts_doc_comment = matches!(
+            scan_lean_block_comment_end(trimmed_orig_line, 0),
+            Some((_, true))
+        ) && (is_unindented
+            || (scope_depth > 0 && indent <= cur_cmd_indent.unwrap_or(indent)));
 
         if mutual_depth > 0 {
             if is_unindented || (scope_depth > 0 && indent <= cur_cmd_indent.unwrap_or(0)) {
@@ -1179,11 +1437,12 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
             && can_start_at_indent
             && (starts_doc_comment || (!trimmed.is_empty() && is_top_level_command_start(trimmed)))
         {
-            if !is_incomplete_prefix_only_span(prev_clean) {
+            let prev_orig = &src[cur_byte_start..cur_byte_end];
+            if !is_incomplete_prefix_only_span(prev_orig, prev_clean) {
                 spans.push(CmdSpan {
                     start_line: cur_start_line,
                     end_line: line_num - 1,
-                    orig_text: &src[cur_byte_start..cur_byte_end],
+                    orig_text: prev_orig,
                     clean_text: prev_clean,
                 });
                 cur_start_line = line_num;
@@ -1229,16 +1488,8 @@ fn classify_decl_header(cmd_text: &str) -> Option<(String, String)> {
     for kw in ["theorem", "lemma"] {
         if let Some(after) = rest.strip_prefix(kw) {
             if after.starts_with(char::is_whitespace) {
-                let raw_name: String = after
-                    .trim_start()
-                    .chars()
-                    .take_while(|c| {
-                        !c.is_whitespace() && *c != '(' && *c != '{' && *c != '[' && *c != ':'
-                    })
-                    .collect();
-                let name = raw_name.trim_end_matches('.').to_string();
-                if !name.is_empty() {
-                    return Some((kw.to_string(), name));
+                if let Some((name, _)) = take_leading_lean_ident(after.trim_start()) {
+                    return Some((kw.to_string(), name.to_string()));
                 }
             }
         }
@@ -1280,11 +1531,9 @@ fn classify_any_decl_header(cmd_text: &str) -> Option<(&'static str, String)> {
                         after = after[close_idx + 1..].trim_start();
                     }
                 }
-                let raw_name: String = after
-                    .chars()
-                    .take_while(|c| !c.is_whitespace() && !matches!(*c, '(' | '{' | '[' | ':'))
-                    .collect();
-                let name = raw_name.trim_end_matches('.').to_string();
+                let name = take_leading_lean_ident(after)
+                    .map(|(n, _)| n.to_string())
+                    .unwrap_or_default();
                 return Some((kw, name));
             }
         }
@@ -1448,18 +1697,24 @@ fn split_mutual_block_subspans<'a>(
         let trimmed = line_clean.trim_start();
         let indent = line_orig.len() - line_orig.trim_start().len();
         let is_top_inner = indent <= min_indent;
-        let starts_doc = is_top_inner && line_orig.trim_start().starts_with("/--");
+        let orig_trimmed = line_orig.trim_start();
+        let starts_doc = is_top_inner
+            && matches!(
+                scan_lean_block_comment_end(orig_trimmed, 0),
+                Some((_, true))
+            );
 
         if line_num > span.start_line + 1
             && is_top_inner
             && (starts_doc || (!trimmed.is_empty() && is_top_level_command_start(trimmed)))
         {
+            let prev_orig = &body_orig[cur_byte_start..cur_byte_end];
             let prev_clean = &body_clean[cur_byte_start..cur_byte_end];
-            if !is_incomplete_prefix_only_span(prev_clean) {
+            if !is_incomplete_prefix_only_span(prev_orig, prev_clean) {
                 inner_spans.push(CmdSpan {
                     start_line: cur_start_line,
                     end_line: line_num - 1,
-                    orig_text: &body_orig[cur_byte_start..cur_byte_end],
+                    orig_text: prev_orig,
                     clean_text: prev_clean,
                 });
                 cur_start_line = line_num;
@@ -1497,27 +1752,11 @@ fn is_pattern_match_arm_at(cmd: &str, pipe_idx: usize) -> bool {
     let mut paren = 0i32;
     let mut bracket = 0i32;
     let mut brace = 0i32;
-    let mut block_comment_depth = 0usize;
     let mut j = pipe_idx + 1;
     while j < bytes.len() {
         let c = bytes[j];
-        if block_comment_depth > 0 {
-            if j + 1 < bytes.len() && c == b'/' && bytes[j + 1] == b'-' {
-                block_comment_depth += 1;
-                j += 2;
-                continue;
-            }
-            if j + 1 < bytes.len() && c == b'-' && bytes[j + 1] == b'/' {
-                block_comment_depth -= 1;
-                j += 2;
-                continue;
-            }
-            j += 1;
-            continue;
-        }
-        if j + 1 < bytes.len() && c == b'/' && bytes[j + 1] == b'-' {
-            block_comment_depth += 1;
-            j += 2;
+        if let Some((end, _)) = scan_lean_block_comment_end(cmd, j) {
+            j = end;
             continue;
         }
         if j + 1 < bytes.len() && c == b'-' && bytes[j + 1] == b'-' {
@@ -1597,7 +1836,6 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
     let mut bracket = 0i32;
     let mut brace = 0i32;
     let mut i = 0usize;
-    let mut block_comment_depth = 0usize;
     let mut pending_let_assigns = 0usize;
     let mut seen_top_level_colon = false;
     let mut seen_top_level_match_after_colon = false;
@@ -1605,23 +1843,8 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
 
     while i < bytes.len() {
         let c = bytes[i];
-        if block_comment_depth > 0 {
-            if i + 1 < bytes.len() && c == b'/' && bytes[i + 1] == b'-' {
-                block_comment_depth += 1;
-                i += 2;
-                continue;
-            }
-            if i + 1 < bytes.len() && c == b'-' && bytes[i + 1] == b'/' {
-                block_comment_depth -= 1;
-                i += 2;
-                continue;
-            }
-            i += 1;
-            continue;
-        }
-        if i + 1 < bytes.len() && c == b'/' && bytes[i + 1] == b'-' {
-            block_comment_depth += 1;
-            i += 2;
+        if let Some((end, _)) = scan_lean_block_comment_end(cmd, i) {
+            i = end;
             continue;
         }
         if i + 1 < bytes.len() && c == b'-' && bytes[i + 1] == b'-' {
@@ -1735,7 +1958,7 @@ struct PriorDeclEntry {
 }
 
 fn is_lean_ident_continuation(c: char) -> bool {
-    c.is_alphabetic() || c.is_numeric() || matches!(c, '_' | '\'' | '?' | '!')
+    is_lean_id_rest(c)
 }
 
 fn is_lean_keyword_or_builtin(tok: &str) -> bool {
@@ -1803,53 +2026,86 @@ fn is_lean_keyword_or_builtin(tok: &str) -> bool {
 fn extract_ident_tokens(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut cur_start: Option<usize> = None;
-    let mut qual_start: Option<usize> = None;
-
-    for (idx, ch) in s.char_indices() {
-        if is_lean_ident_continuation(ch) {
-            if cur_start.is_none() {
-                if !ch.is_ascii_digit() {
-                    cur_start = Some(idx);
-                    if qual_start.is_none() {
-                        qual_start = Some(idx);
-                    }
-                }
-            }
-        } else {
-            if let Some(st) = cur_start.take() {
-                let tok = &s[st..idx];
-                if !is_lean_keyword_or_builtin(tok) && seen.insert(tok.to_string()) {
-                    out.push(tok.to_string());
-                }
-                if ch != '.' {
-                    if let Some(qst) = qual_start.take() {
-                        if qst < st {
-                            let qtok = &s[qst..idx];
-                            if seen.insert(qtok.to_string()) {
-                                out.push(qtok.to_string());
+    let mut i = 0usize;
+    let bytes = s.as_bytes();
+    while i < bytes.len() {
+        if let Some(end) = scan_lean_interpolated_string_end(s, i).or_else(|| match bytes[i] {
+            b'"' => scan_lean_string_lit_end(s, i),
+            b'\'' => scan_lean_char_lit_end(s, i),
+            b'r' => scan_lean_raw_string_end(s, i),
+            _ => None,
+        }) {
+            if scan_lean_interpolated_string_end(s, i).is_some() {
+                let mut j = i + 1;
+                while j < end {
+                    if bytes[j] == b'\\' && j + 1 < end {
+                        j += 2;
+                    } else if bytes[j] == b'{' {
+                        j += 1;
+                        let expr_start = j;
+                        let mut depth = 1usize;
+                        while j < end && depth > 0 {
+                            if let Some(sub_end) = scan_lean_norm_literal_end(s, j) {
+                                j = sub_end;
+                                continue;
+                            }
+                            match bytes[j] {
+                                b'{' => depth += 1,
+                                b'}' => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            j += 1;
+                        }
+                        for sub_tok in extract_ident_tokens(&s[expr_start..j]) {
+                            if seen.insert(sub_tok.clone()) {
+                                out.push(sub_tok);
                             }
                         }
+                        if j < end && bytes[j] == b'}' {
+                            j += 1;
+                        }
+                    } else {
+                        j += 1;
                     }
                 }
-            } else if ch != '.' {
-                qual_start = None;
             }
+            i = end;
+            continue;
         }
-    }
-    if let Some(st) = cur_start {
-        let tok = &s[st..];
-        if !is_lean_keyword_or_builtin(tok) && seen.insert(tok.to_string()) {
-            out.push(tok.to_string());
-        }
-        if let Some(qst) = qual_start {
-            if qst < st {
-                let qtok = &s[qst..];
-                if seen.insert(qtok.to_string()) {
-                    out.push(qtok.to_string());
+        if let Some((qual_tok, _)) = take_leading_lean_ident(&s[i..]) {
+            let mut seg_pos = 0usize;
+            while seg_pos < qual_tok.len() {
+                let seg_end = if let Some(gend) = scan_lean_guillemet_ident_end(qual_tok, seg_pos) {
+                    gend
+                } else {
+                    qual_tok[seg_pos..]
+                        .find('.')
+                        .map_or(qual_tok.len(), |p| seg_pos + p)
+                };
+                let seg = &qual_tok[seg_pos..seg_end];
+                if !seg.is_empty()
+                    && !is_lean_keyword_or_builtin(seg)
+                    && seen.insert(seg.to_string())
+                {
+                    out.push(seg.to_string());
                 }
+                seg_pos = seg_end + 1;
             }
+            if qual_tok.len() > last_host_name_component(qual_tok).len()
+                && seen.insert(qual_tok.to_string())
+            {
+                out.push(qual_tok.to_string());
+            }
+            i += qual_tok.len();
+            continue;
         }
+        let ch = s[i..].chars().next().unwrap_or('\0');
+        i += ch.len_utf8().max(1);
     }
     out
 }
@@ -1859,13 +2115,8 @@ fn extract_inductive_constructors(clean_text: &str) -> Vec<String> {
     for line in clean_text.lines().skip(1) {
         let trimmed = line.trim_start();
         if let Some(rest) = trimmed.strip_prefix('|') {
-            let name: String = rest
-                .trim_start()
-                .chars()
-                .take_while(|c| is_lean_ident_continuation(*c))
-                .collect();
-            if !name.is_empty() {
-                ctors.push(name);
+            if let Some((name, _)) = take_leading_lean_ident(rest.trim_start()) {
+                ctors.push(name.to_string());
             }
         }
     }
@@ -2012,6 +2263,24 @@ fn compute_cone_env_hash_for_theorem(
     hasher.finalize().to_hex().to_string()
 }
 
+fn split_scope_ident_segments(name: &str) -> Vec<&str> {
+    let mut segs = Vec::new();
+    let mut pos = 0usize;
+    while pos < name.len() {
+        let seg_end = if let Some(gend) = scan_lean_guillemet_ident_end(name, pos) {
+            gend
+        } else {
+            name[pos..].find('.').map_or(name.len(), |p| pos + p)
+        };
+        let seg = &name[pos..seg_end];
+        if !seg.is_empty() {
+            segs.push(seg);
+        }
+        pos = seg_end + 1;
+    }
+    segs
+}
+
 fn extract_section_header_name(trimmed: &str) -> &str {
     let mut after_sec = trimmed;
     while let Some(next) = strip_leading_attr_block(after_sec) {
@@ -2022,13 +2291,8 @@ fn extract_section_header_name(trimmed: &str) -> &str {
             after_sec = next.trim_start();
         }
     }
-    after_sec
-        .strip_prefix("section")
-        .unwrap_or("")
-        .trim()
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
+    let rest = after_sec.strip_prefix("section").unwrap_or("").trim();
+    take_leading_lean_ident(rest).map(|(n, _)| n).unwrap_or("")
 }
 
 /// Update `stack` for scope commands (`namespace A.B.C`, `section`, `noncomputable section`,
@@ -2037,8 +2301,10 @@ fn update_scope_stack_with_idx(stack: &mut Vec<ScopeFrame>, clean_chunk: &str, s
     for line in clean_chunk.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("namespace ") {
-            let name = rest.split_whitespace().next().unwrap_or("");
-            for seg in name.split('.').filter(|s| !s.is_empty()) {
+            let name = take_leading_lean_ident(rest.trim_start())
+                .map(|(n, _)| n)
+                .unwrap_or("");
+            for seg in split_scope_ident_segments(name) {
                 stack.push(ScopeFrame {
                     kind: ScopeKind::Namespace,
                     name: seg.to_string(),
@@ -2054,7 +2320,7 @@ fn update_scope_stack_with_idx(stack: &mut Vec<ScopeFrame>, clean_chunk: &str, s
                     open_span_idx: span_idx,
                 });
             } else {
-                for seg in name.split('.').filter(|s| !s.is_empty()) {
+                for seg in split_scope_ident_segments(name) {
                     stack.push(ScopeFrame {
                         kind: ScopeKind::Section,
                         name: seg.to_string(),
@@ -2069,16 +2335,14 @@ fn update_scope_stack_with_idx(stack: &mut Vec<ScopeFrame>, clean_chunk: &str, s
                 open_span_idx: span_idx,
             });
         } else if trimmed == "end" || trimmed.starts_with("end ") {
-            let name = trimmed
-                .strip_prefix("end")
-                .unwrap_or("")
-                .split_whitespace()
-                .next()
-                .unwrap_or("");
+            let name =
+                take_leading_lean_ident(trimmed.strip_prefix("end").unwrap_or("").trim_start())
+                    .map(|(n, _)| n)
+                    .unwrap_or("");
             if name.is_empty() {
                 stack.pop();
             } else {
-                for seg in name.split('.').filter(|s| !s.is_empty()).rev() {
+                for seg in split_scope_ident_segments(name).into_iter().rev() {
                     if let Some(pos) = stack.iter().rposition(|f| f.name == seg) {
                         stack.truncate(pos);
                     } else {
@@ -2150,8 +2414,10 @@ fn compute_closed_section_ranges(spans: &[CmdSpan<'_>]) -> Vec<(usize, usize)> {
         for line in span.clean_text.lines() {
             let trimmed = line.trim();
             if let Some(rest) = trimmed.strip_prefix("namespace ") {
-                let name = rest.split_whitespace().next().unwrap_or("");
-                for seg in name.split('.').filter(|s| !s.is_empty()) {
+                let name = take_leading_lean_ident(rest.trim_start())
+                    .map(|(n, _)| n)
+                    .unwrap_or("");
+                for seg in split_scope_ident_segments(name) {
                     stack.push(ScopeFrame {
                         kind: ScopeKind::Namespace,
                         name: seg.to_string(),
@@ -2160,11 +2426,21 @@ fn compute_closed_section_ranges(spans: &[CmdSpan<'_>]) -> Vec<(usize, usize)> {
                 }
             } else if is_section_header_line(trimmed) {
                 let name = extract_section_header_name(trimmed);
-                stack.push(ScopeFrame {
-                    kind: ScopeKind::Section,
-                    name: name.to_string(),
-                    open_span_idx: idx,
-                });
+                if name.is_empty() {
+                    stack.push(ScopeFrame {
+                        kind: ScopeKind::Section,
+                        name: String::new(),
+                        open_span_idx: idx,
+                    });
+                } else {
+                    for seg in split_scope_ident_segments(name) {
+                        stack.push(ScopeFrame {
+                            kind: ScopeKind::Section,
+                            name: seg.to_string(),
+                            open_span_idx: idx,
+                        });
+                    }
+                }
             } else if trimmed == "mutual" || trimmed.starts_with("mutual ") {
                 stack.push(ScopeFrame {
                     kind: ScopeKind::Mutual,
@@ -2172,12 +2448,10 @@ fn compute_closed_section_ranges(spans: &[CmdSpan<'_>]) -> Vec<(usize, usize)> {
                     open_span_idx: idx,
                 });
             } else if trimmed == "end" || trimmed.starts_with("end ") {
-                let name = trimmed
-                    .strip_prefix("end")
-                    .unwrap_or("")
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("");
+                let name =
+                    take_leading_lean_ident(trimmed.strip_prefix("end").unwrap_or("").trim_start())
+                        .map(|(n, _)| n)
+                        .unwrap_or("");
                 if name.is_empty() {
                     if let Some(popped) = stack.pop() {
                         if popped.kind == ScopeKind::Section {
@@ -2185,7 +2459,7 @@ fn compute_closed_section_ranges(spans: &[CmdSpan<'_>]) -> Vec<(usize, usize)> {
                         }
                     }
                 } else {
-                    for seg in name.split('.').filter(|s| !s.is_empty()).rev() {
+                    for seg in split_scope_ident_segments(name).into_iter().rev() {
                         if let Some(pos) = stack.iter().rposition(|f| f.name == seg) {
                             for popped in stack.drain(pos..).rev() {
                                 if popped.kind == ScopeKind::Section {
@@ -2235,37 +2509,80 @@ fn extract_local_ref_tokens_into<'a>(
     let len = bytes.len();
     let mut i = 0usize;
     while i < len {
-        let b = bytes[i];
-        if !(b.is_ascii_alphanumeric() || matches!(b, b'_' | b'\'' | b'.')) {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < len {
-            let c = bytes[i];
-            if c.is_ascii_alphanumeric() || matches!(c, b'_' | b'\'' | b'.') {
-                i += 1;
-            } else {
-                break;
-            }
-        }
-        let qual_ident = clean_text[start..i].trim_matches('.');
-        if qual_ident.is_empty() {
-            continue;
-        }
-        let vec_exact = exact_map.entry(qual_ident).or_default();
-        if vec_exact.last() != Some(&span_idx) {
-            vec_exact.push(span_idx);
-        }
-        if !STD_QUAL_PREFIXES.iter().any(|p| qual_ident.starts_with(p)) {
-            let short = qual_ident.rsplit('.').next().unwrap_or(qual_ident);
-            if !short.is_empty() {
-                let vec_short = non_std_short_map.entry(short).or_default();
-                if vec_short.last() != Some(&span_idx) {
-                    vec_short.push(span_idx);
+        if let Some(end) =
+            scan_lean_interpolated_string_end(clean_text, i).or_else(|| match bytes[i] {
+                b'"' => scan_lean_string_lit_end(clean_text, i),
+                b'\'' => scan_lean_char_lit_end(clean_text, i),
+                b'r' => scan_lean_raw_string_end(clean_text, i),
+                _ => None,
+            })
+        {
+            if scan_lean_interpolated_string_end(clean_text, i).is_some() {
+                let mut j = i + 1;
+                while j < end {
+                    if bytes[j] == b'\\' && j + 1 < end {
+                        j += 2;
+                    } else if bytes[j] == b'{' {
+                        j += 1;
+                        let expr_start = j;
+                        let mut depth = 1usize;
+                        while j < end && depth > 0 {
+                            if let Some((cend, _)) = scan_lean_block_comment_end(clean_text, j) {
+                                j = cend.min(end);
+                                continue;
+                            }
+                            if let Some(sub_end) = scan_lean_norm_literal_end(clean_text, j) {
+                                j = sub_end;
+                                continue;
+                            }
+                            match bytes[j] {
+                                b'{' => depth += 1,
+                                b'}' => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            j += 1;
+                        }
+                        extract_local_ref_tokens_into(
+                            &clean_text[expr_start..j],
+                            span_idx,
+                            exact_map,
+                            non_std_short_map,
+                        );
+                        if j < end && bytes[j] == b'}' {
+                            j += 1;
+                        }
+                    } else {
+                        j += 1;
+                    }
                 }
             }
+            i = end;
+            continue;
         }
+        if let Some((qual_ident, _)) = take_leading_lean_ident(&clean_text[i..]) {
+            let vec_exact = exact_map.entry(qual_ident).or_default();
+            if vec_exact.last() != Some(&span_idx) {
+                vec_exact.push(span_idx);
+            }
+            if !STD_QUAL_PREFIXES.iter().any(|p| qual_ident.starts_with(p)) {
+                let short = last_host_name_component(qual_ident);
+                if !short.is_empty() {
+                    let vec_short = non_std_short_map.entry(short).or_default();
+                    if vec_short.last() != Some(&span_idx) {
+                        vec_short.push(span_idx);
+                    }
+                }
+            }
+            i += qual_ident.len();
+            continue;
+        }
+        let ch = clean_text[i..].chars().next().unwrap_or('\0');
+        i += ch.len_utf8().max(1);
     }
 }
 
@@ -2292,7 +2609,14 @@ fn precompute_closed_section_min_needed_idx(
         let mut thms = Vec::new();
         for inner in &spans[sec_open + 1..sec_close] {
             let trimmed = inner.clean_text.trim();
-            if trimmed.is_empty() || is_scope_or_context_command(trimmed) {
+            if trimmed.is_empty() {
+                if inner.orig_text.contains("/-!") {
+                    unconditional = true;
+                    break;
+                }
+                continue;
+            }
+            if is_scope_or_context_command(trimmed) {
                 continue;
             }
             let after_attrs = {
@@ -2316,7 +2640,7 @@ fn precompute_closed_section_min_needed_idx(
                             unconditional = true;
                             break;
                         }
-                        let short = name.rsplit('.').next().unwrap_or(&name).to_string();
+                        let short = last_host_name_component(&name).to_string();
                         if !short.is_empty() {
                             thms.push((short, name));
                         }
@@ -2336,7 +2660,7 @@ fn precompute_closed_section_min_needed_idx(
                     unconditional = true;
                     break;
                 }
-                let short = name.rsplit('.').next().unwrap_or(&name).to_string();
+                let short = last_host_name_component(&name).to_string();
                 if !short.is_empty() {
                     thms.push((short, name));
                 }
@@ -2502,6 +2826,40 @@ fn emit_normalized_lean(s: &str, emit: &mut dyn FnMut(&[u8])) -> bool {
     let mut pending_space = false;
     let mut pending_newlines = 0usize;
     while i < bytes.len() {
+        if let Some((end, is_doc)) = scan_lean_block_comment_end(s, i) {
+            if is_doc {
+                if pending_newlines > 0 {
+                    for _ in 0..pending_newlines {
+                        emit(b"\n");
+                    }
+                    pending_newlines = 0;
+                }
+                if pending_space {
+                    emit(b" ");
+                    pending_space = false;
+                }
+                emit(&bytes[i..end]);
+                emitted_any = true;
+                at_line_start = false;
+            } else if s[i..end].contains('\n') {
+                if emitted_any {
+                    pending_newlines = 1;
+                }
+                pending_space = false;
+                at_line_start = true;
+            } else if !at_line_start && emitted_any {
+                pending_space = true;
+            }
+            i = end;
+            continue;
+        }
+        if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
         if let Some(end) = scan_lean_norm_literal_end(s, i) {
             if pending_newlines > 0 {
                 for _ in 0..pending_newlines {
@@ -2526,6 +2884,17 @@ fn emit_normalized_lean(s: &str, emit: &mut dyn FnMut(&[u8])) -> bool {
                         let expr_start = j;
                         let mut depth = 1usize;
                         while j < end && depth > 0 {
+                            if let Some((blk_end, _)) = scan_lean_block_comment_end(s, j) {
+                                j = blk_end;
+                                continue;
+                            }
+                            if bytes[j] == b'-' && j + 1 < end && bytes[j + 1] == b'-' {
+                                j += 2;
+                                while j < end && bytes[j] != b'\n' {
+                                    j += 1;
+                                }
+                                continue;
+                            }
                             if let Some(sub_end) = scan_lean_norm_literal_end(s, j) {
                                 j = sub_end;
                                 continue;
@@ -2617,7 +2986,10 @@ fn emit_normalized_lean(s: &str, emit: &mut dyn FnMut(&[u8])) -> bool {
             let tok_start = i;
             i += ch_len;
             while i < bytes.len() {
-                if scan_lean_norm_literal_end(s, i).is_some() {
+                if scan_lean_block_comment_end(s, i).is_some()
+                    || (bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-')
+                    || scan_lean_norm_literal_end(s, i).is_some()
+                {
                     break;
                 }
                 let c = s[i..].chars().next().unwrap_or('\0');
@@ -2671,6 +3043,45 @@ fn split_lean_source_inner(
     include_cone_and_source: bool,
 ) -> SplitResult {
     let clean = strip_lean_comments(src);
+    let doc_clean = if src.contains("/--") || src.contains("/-!") {
+        Some(strip_non_doc_lean_comments(src))
+    } else {
+        None
+    };
+    let doc_slice = |orig: &str, cln: &str| -> String {
+        if let Some(ref dc) = doc_clean {
+            let off = orig.as_ptr() as usize - src.as_ptr() as usize;
+            dc.get(off..off + orig.len()).unwrap_or(cln).to_string()
+        } else {
+            cln.to_string()
+        }
+    };
+    let doc_sig_proof = |orig: &str, sig_cln: &str, prf_cln: &str| -> (String, String) {
+        let full = if let Some(ref dc) = doc_clean {
+            let off = orig.as_ptr() as usize - src.as_ptr() as usize;
+            dc.get(off..off + orig.len())
+        } else {
+            None
+        };
+        if let Some(dspan) = full {
+            if dspan.len() == sig_cln.len() + 2 + prf_cln.len() {
+                return (
+                    dspan[..sig_cln.len()].to_string(),
+                    dspan[sig_cln.len() + 2..].to_string(),
+                );
+            }
+            if dspan.len() == sig_cln.len() + prf_cln.len() {
+                return (
+                    dspan[..sig_cln.len()].to_string(),
+                    dspan[sig_cln.len()..].to_string(),
+                );
+            }
+            if let Some((ds, dp)) = split_at_top_level_assign(dspan) {
+                return (ds.to_string(), dp.to_string());
+            }
+        }
+        (sig_cln.to_string(), prf_cln.to_string())
+    };
     let hygiene = audit_hygiene(&clean);
     let spans = parse_command_spans(src, &clean);
     let closed_sections = compute_closed_section_ranges(&spans);
@@ -2728,9 +3139,11 @@ fn split_lean_source_inner(
                                         proof_clean,
                                     ));
                                     if has_closed_sections {
+                                        let (sig_doc, _) =
+                                            doc_sig_proof(sub.orig_text, sig_clean, proof_clean);
                                         inner_norm_parts.push(format!(
                                             "{} := sorry",
-                                            normalize_whitespace(sig_clean)
+                                            normalize_whitespace(&sig_doc)
                                         ));
                                     }
                                     continue;
@@ -2738,7 +3151,10 @@ fn split_lean_source_inner(
                             }
                             inner_skel_parts.push(sub.orig_text.to_string());
                             if has_closed_sections {
-                                inner_norm_parts.push(normalize_whitespace(sub.clean_text));
+                                inner_norm_parts.push(normalize_whitespace(&doc_slice(
+                                    sub.orig_text,
+                                    sub.clean_text,
+                                )));
                             }
                         }
                         inner_skel_parts.push(footer_orig.to_string());
@@ -2746,17 +3162,22 @@ fn split_lean_source_inner(
                     } else if has_closed_sections {
                         for sub in &inner_spans {
                             if classify_decl_header(sub.clean_text).is_some() {
-                                if let Some((sig_clean, _)) =
+                                if let Some((sig_clean, proof_clean)) =
                                     split_at_top_level_assign(sub.clean_text)
                                 {
+                                    let (sig_doc, _) =
+                                        doc_sig_proof(sub.orig_text, sig_clean, proof_clean);
                                     inner_norm_parts.push(format!(
                                         "{} := sorry",
-                                        normalize_whitespace(sig_clean)
+                                        normalize_whitespace(&sig_doc)
                                     ));
                                     continue;
                                 }
                             }
-                            inner_norm_parts.push(normalize_whitespace(sub.clean_text));
+                            inner_norm_parts.push(normalize_whitespace(&doc_slice(
+                                sub.orig_text,
+                                sub.clean_text,
+                            )));
                         }
                     }
                     if has_closed_sections {
@@ -2777,8 +3198,9 @@ fn split_lean_source_inner(
                         ));
                     }
                     if has_closed_sections {
+                        let (sig_doc, _) = doc_sig_proof(span.orig_text, sig_clean, proof_clean);
                         span_norm_hash_line
-                            .push(format!("{} := sorry\n", normalize_whitespace(sig_clean)));
+                            .push(format!("{} := sorry\n", normalize_whitespace(&sig_doc)));
                     }
                     continue;
                 }
@@ -2788,7 +3210,7 @@ fn split_lean_source_inner(
                 span_skel_orig.push(sanitize_stubbed_prefix_options(span.orig_text));
             }
             if has_closed_sections {
-                let norm_cmd = normalize_whitespace(span.clean_text);
+                let norm_cmd = normalize_whitespace(&doc_slice(span.orig_text, span.clean_text));
                 if norm_cmd.is_empty() {
                     span_norm_hash_line.push(String::new());
                 } else {
@@ -2901,6 +3323,8 @@ fn split_lean_source_inner(
                         found_inner_thm = true;
                         let (sig_orig, proof_orig) = split_at_top_level_assign(sub.orig_text)
                             .unwrap_or((sig_clean, proof_clean));
+                        let (sig_doc, proof_doc) =
+                            doc_sig_proof(sub.orig_text, sig_clean, proof_clean);
                         let (prefix_env_hash, prefix_skeleton_accum, omit_mask) =
                             build_pruned_prefix(span_idx, &dep_prefix_hasher);
                         let cone_env_hash = if compute_cone {
@@ -2917,8 +3341,8 @@ fn split_lean_source_inner(
                         } else {
                             String::new()
                         };
-                        let stmt_hash = hash_normalized_whitespace_hex(sig_clean);
-                        let proof_hash = hash_normalized_whitespace_hex(proof_clean);
+                        let stmt_hash = hash_normalized_whitespace_hex(&sig_doc);
+                        let proof_hash = hash_normalized_whitespace_hex(&proof_doc);
 
                         let shard_source = if omit_shard_source {
                             String::new()
@@ -2951,9 +3375,12 @@ fn split_lean_source_inner(
             if compute_cone {
                 for sub in &inner_spans {
                     if let Some((_kind, name)) = classify_decl_header(sub.clean_text) {
-                        if let Some((sig_clean, _)) = split_at_top_level_assign(sub.clean_text) {
-                            let short = name.rsplit('.').next().unwrap_or(&name).to_string();
-                            let st_hash = hash_normalized_whitespace_hex(sig_clean);
+                        if let Some((sig_clean, proof_clean)) =
+                            split_at_top_level_assign(sub.clean_text)
+                        {
+                            let short = last_host_name_component(&name).to_string();
+                            let (sig_doc, _) = doc_sig_proof(sub.orig_text, sig_clean, proof_clean);
+                            let st_hash = hash_normalized_whitespace_hex(&sig_doc);
                             register_prior_decl(
                                 &mut prior_decls,
                                 &mut name_to_decl_idxs,
@@ -2970,13 +3397,16 @@ fn split_lean_source_inner(
                         }
                     }
                     if let Some((kw, name)) = classify_any_decl_header(sub.clean_text) {
-                        let short = name.rsplit('.').next().unwrap_or(&name).to_string();
+                        let short = last_host_name_component(&name).to_string();
                         let extra_names = if kw == "inductive" || kw == "coinductive" {
                             extract_inductive_constructors(sub.clean_text)
                         } else {
                             Vec::new()
                         };
-                        let decl_hash = hash_normalized_whitespace_hex(sub.clean_text);
+                        let decl_hash = hash_normalized_whitespace_hex(&doc_slice(
+                            sub.orig_text,
+                            sub.clean_text,
+                        ));
                         register_prior_decl(
                             &mut prior_decls,
                             &mut name_to_decl_idxs,
@@ -3012,18 +3442,21 @@ fn split_lean_source_inner(
                     dep_prefix_hasher.update(b"mutual\n");
                     for sub in &inner_spans {
                         if classify_decl_header(sub.clean_text).is_some() {
-                            if let Some((sig_clean, _)) = split_at_top_level_assign(sub.clean_text)
+                            if let Some((sig_clean, proof_clean)) =
+                                split_at_top_level_assign(sub.clean_text)
                             {
+                                let (sig_doc, _) =
+                                    doc_sig_proof(sub.orig_text, sig_clean, proof_clean);
                                 if !hash_normalized_whitespace(
                                     &mut interface_hasher,
-                                    sig_clean,
+                                    &sig_doc,
                                     b" := sorry\n",
                                 ) {
                                     interface_hasher.update(b" := sorry\n");
                                 }
                                 if !hash_normalized_whitespace(
                                     &mut dep_prefix_hasher,
-                                    sig_clean,
+                                    &sig_doc,
                                     b" := sorry\n",
                                 ) {
                                     dep_prefix_hasher.update(b" := sorry\n");
@@ -3031,15 +3464,11 @@ fn split_lean_source_inner(
                                 continue;
                             }
                         }
-                        if !hash_normalized_whitespace(&mut interface_hasher, sub.clean_text, b"\n")
-                        {
+                        let sub_doc = doc_slice(sub.orig_text, sub.clean_text);
+                        if !hash_normalized_whitespace(&mut interface_hasher, &sub_doc, b"\n") {
                             interface_hasher.update(b"\n");
                         }
-                        if !hash_normalized_whitespace(
-                            &mut dep_prefix_hasher,
-                            sub.clean_text,
-                            b"\n",
-                        ) {
+                        if !hash_normalized_whitespace(&mut dep_prefix_hasher, &sub_doc, b"\n") {
                             dep_prefix_hasher.update(b"\n");
                         }
                     }
@@ -3056,6 +3485,7 @@ fn split_lean_source_inner(
             if let Some((sig_clean, proof_clean)) = split_at_top_level_assign(span.clean_text) {
                 let (sig_orig, proof_orig) =
                     split_at_top_level_assign(span.orig_text).unwrap_or((sig_clean, proof_clean));
+                let (sig_doc, proof_doc) = doc_sig_proof(span.orig_text, sig_clean, proof_clean);
 
                 let (prefix_env_hash, prefix_skeleton_accum, omit_mask) =
                     build_pruned_prefix(span_idx, &dep_prefix_hasher);
@@ -3073,8 +3503,8 @@ fn split_lean_source_inner(
                 } else {
                     String::new()
                 };
-                let stmt_hash = hash_normalized_whitespace_hex(sig_clean);
-                let proof_hash = hash_normalized_whitespace_hex(proof_clean);
+                let stmt_hash = hash_normalized_whitespace_hex(&sig_doc);
+                let proof_hash = hash_normalized_whitespace_hex(&proof_doc);
 
                 let shard_source = if omit_shard_source {
                     String::new()
@@ -3087,7 +3517,7 @@ fn split_lean_source_inner(
                 };
 
                 if compute_cone {
-                    let short_name = name.rsplit('.').next().unwrap_or(&name).to_string();
+                    let short_name = last_host_name_component(&name).to_string();
                     register_prior_decl(
                         &mut prior_decls,
                         &mut name_to_decl_idxs,
@@ -3101,7 +3531,7 @@ fn split_lean_source_inner(
                         },
                     );
                     if is_cone_scope_or_header_directive(span.clean_text) {
-                        let line_str = format!("{} := sorry\n", normalize_whitespace(sig_clean));
+                        let line_str = format!("{} := sorry\n", normalize_whitespace(&sig_doc));
                         dep_scope_hasher.update(line_str.as_bytes());
                         scope_directives.push((span_idx, line_str));
                     }
@@ -3126,15 +3556,12 @@ fn split_lean_source_inner(
                     interface_hasher.update(span_norm_hash_line[span_idx].as_bytes());
                     dep_prefix_hasher.update(span_norm_hash_line[span_idx].as_bytes());
                 } else {
-                    if !hash_normalized_whitespace(&mut interface_hasher, sig_clean, b" := sorry\n")
+                    if !hash_normalized_whitespace(&mut interface_hasher, &sig_doc, b" := sorry\n")
                     {
                         interface_hasher.update(b" := sorry\n");
                     }
-                    if !hash_normalized_whitespace(
-                        &mut dep_prefix_hasher,
-                        sig_clean,
-                        b" := sorry\n",
-                    ) {
+                    if !hash_normalized_whitespace(&mut dep_prefix_hasher, &sig_doc, b" := sorry\n")
+                    {
                         dep_prefix_hasher.update(b" := sorry\n");
                     }
                 }
@@ -3144,9 +3571,12 @@ fn split_lean_source_inner(
         }
 
         // Case 3: Non-theorem command (`import`, `open`, `variable`, `def`, `structure`, `instance`, etc.)
+        let span_doc = doc_slice(span.orig_text, span.clean_text);
         if compute_cone {
-            if is_cone_scope_or_header_directive(span.clean_text) {
-                let norm_dir = normalize_whitespace(span.clean_text);
+            if is_cone_scope_or_header_directive(span.clean_text)
+                || (span.clean_text.trim().is_empty() && span_doc.trim_start().starts_with("/-!"))
+            {
+                let norm_dir = normalize_whitespace(&span_doc);
                 if !norm_dir.is_empty() {
                     let line_str = format!("{}\n", norm_dir);
                     dep_scope_hasher.update(line_str.as_bytes());
@@ -3154,20 +3584,20 @@ fn split_lean_source_inner(
                 }
             } else if let Some((kw, name)) = classify_any_decl_header(span.clean_text) {
                 if name.is_empty() && kw == "instance" {
-                    let norm_dir = normalize_whitespace(span.clean_text);
+                    let norm_dir = normalize_whitespace(&span_doc);
                     if !norm_dir.is_empty() {
                         let line_str = format!("{}\n", norm_dir);
                         dep_scope_hasher.update(line_str.as_bytes());
                         scope_directives.push((span_idx, line_str));
                     }
                 } else {
-                    let short = name.rsplit('.').next().unwrap_or(&name).to_string();
+                    let short = last_host_name_component(&name).to_string();
                     let extra_names = if kw == "inductive" || kw == "coinductive" {
                         extract_inductive_constructors(span.clean_text)
                     } else {
                         Vec::new()
                     };
-                    let decl_hash = hash_normalized_whitespace_hex(span.clean_text);
+                    let decl_hash = hash_normalized_whitespace_hex(&span_doc);
                     register_prior_decl(
                         &mut prior_decls,
                         &mut name_to_decl_idxs,
@@ -3190,8 +3620,8 @@ fn split_lean_source_inner(
                 dep_prefix_hasher.update(span_norm_hash_line[span_idx].as_bytes());
             }
         } else {
-            hash_normalized_whitespace(&mut interface_hasher, span.clean_text, b"\n");
-            hash_normalized_whitespace(&mut dep_prefix_hasher, span.clean_text, b"\n");
+            hash_normalized_whitespace(&mut interface_hasher, &span_doc, b"\n");
+            hash_normalized_whitespace(&mut dep_prefix_hasher, &span_doc, b"\n");
         }
         update_scope_stack_with_idx(&mut scope_stack, span.clean_text, span_idx);
     }
@@ -3360,16 +3790,18 @@ fn format_stubbed_decl_span(orig_text: &str, sig_clean: &str, proof_clean: &str)
 }
 
 pub(crate) fn sanitize_ident_for_fast_check(name: &str) -> String {
-    name.chars()
-        .filter(|&c| c != '«' && c != '»')
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(name.len() + 8);
+    for b in name.bytes() {
+        if b.is_ascii_alphanumeric() {
+            out.push(b as char);
+        } else {
+            out.push('_');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
+        }
+    }
+    out
 }
 
 /// Reconstruct the self-contained prefix-only `shard_source` (`prefix_skeleton_accum + span.orig_text + closing_scopes`)
@@ -3477,6 +3909,30 @@ fn flatten_inline_preserving_literals(s: &str) -> String {
     let mut emitted_any = false;
     let mut pending_space = false;
     while i < bytes.len() {
+        if let Some((end, is_doc)) = scan_lean_block_comment_end(s, i) {
+            if is_doc {
+                if pending_space {
+                    out.push(b' ');
+                    pending_space = false;
+                }
+                out.extend_from_slice(&bytes[i..end]);
+                emitted_any = true;
+            } else if emitted_any {
+                pending_space = true;
+            }
+            i = end;
+            continue;
+        }
+        if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            if emitted_any {
+                pending_space = true;
+            }
+            continue;
+        }
         if let Some(end) = scan_lean_norm_literal_end(s, i) {
             if pending_space {
                 out.push(b' ');
@@ -3502,7 +3958,10 @@ fn flatten_inline_preserving_literals(s: &str) -> String {
             let tok_start = i;
             i += ch_len;
             while i < bytes.len() {
-                if scan_lean_norm_literal_end(s, i).is_some() {
+                if scan_lean_block_comment_end(s, i).is_some()
+                    || (bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-')
+                    || scan_lean_norm_literal_end(s, i).is_some()
+                {
                     break;
                 }
                 let c = s[i..].chars().next().unwrap_or('\0');
@@ -3844,34 +4303,19 @@ pub fn build_coalesced_shard_source(
 }
 
 fn contains_local_decl_ref(haystack: &str, short: &str, full_name: &str) -> bool {
-    let bytes = haystack.as_bytes();
-    for (idx, _) in haystack.match_indices(short) {
-        let end = idx + short.len();
-        let next_ok = end >= bytes.len()
-            || (!bytes[end].is_ascii_alphanumeric() && bytes[end] != b'_' && bytes[end] != b'\'');
-        if !next_ok {
-            continue;
-        }
-        let mut q_start = idx;
-        while q_start > 0
-            && (bytes[q_start - 1].is_ascii_alphanumeric()
-                || matches!(bytes[q_start - 1], b'_' | b'\'' | b'.'))
-        {
-            q_start -= 1;
-        }
-        let qual_ident = &haystack[q_start..end];
-        if qual_ident == short || qual_ident == full_name {
-            return true;
-        }
-        if STD_QUAL_PREFIXES
-            .iter()
-            .any(|p| qual_ident.starts_with(p) && !full_name.starts_with(p))
-        {
-            continue;
-        }
-        if idx == q_start || (!bytes[idx - 1].is_ascii_alphanumeric() && bytes[idx - 1] != b'_') {
-            return true;
-        }
+    let mut exact_map = std::collections::HashMap::new();
+    let mut non_std_short_map = std::collections::HashMap::new();
+    extract_local_ref_tokens_into(haystack, 0, &mut exact_map, &mut non_std_short_map);
+    if exact_map.contains_key(full_name) || exact_map.contains_key(short) {
+        return true;
+    }
+    if non_std_short_map.contains_key(short) {
+        return true;
+    }
+    if STD_QUAL_PREFIXES.iter().any(|p| full_name.starts_with(p)) {
+        return exact_map
+            .keys()
+            .any(|q| last_host_name_component(q) == short);
     }
     false
 }
@@ -3883,10 +4327,10 @@ pub fn shard_is_acyclic_for_fast_import(shards: &[TheoremShard], idx: usize) -> 
     if idx >= shards.len() {
         return false;
     }
-    let proof = &shards[idx].proof_text;
+    let proof_clean = strip_lean_comments(&shards[idx].proof_text);
     for later in &shards[idx..] {
-        let short = later.name.rsplit('.').next().unwrap_or(&later.name);
-        if contains_local_decl_ref(proof, short, &later.name) {
+        let short = last_host_name_component(&later.name);
+        if contains_local_decl_ref(&proof_clean, short, &later.name) {
             return false;
         }
     }
@@ -4024,23 +4468,24 @@ fn format_scoped_instance_for_fast_check(orig_text: &str, clean_text: &str, idx:
     if let Some(after_inst) = rest.strip_prefix("instance") {
         if after_inst.starts_with(char::is_whitespace) {
             let trimmed_after = after_inst.trim_start();
-            let name: String = trimmed_after
-                .chars()
-                .take_while(|c| {
-                    !c.is_whitespace() && *c != '(' && *c != '{' && *c != '[' && *c != ':'
-                })
-                .collect();
-            if !name.is_empty() && orig_text.len() == clean_text.len() {
-                let offset_in_clean = clean_text.len() - trimmed_after.len();
-                let name_end = offset_in_clean + name.len();
-                let safe_name = sanitize_ident_for_fast_check(&name);
-                return format!(
-                    "{}_turbo_inst_{}_{}{}",
-                    &orig_text[..offset_in_clean],
-                    idx,
-                    safe_name,
-                    &orig_text[name_end..]
-                );
+            if let Some((name, after_name)) = take_leading_lean_ident(trimmed_after) {
+                if (after_name.is_empty()
+                    || after_name.starts_with(|c: char| {
+                        c.is_whitespace() || matches!(c, '(' | '{' | '[' | ':')
+                    }))
+                    && orig_text.len() == clean_text.len()
+                {
+                    let offset_in_clean = clean_text.len() - trimmed_after.len();
+                    let name_end = offset_in_clean + name.len();
+                    let safe_name = sanitize_ident_for_fast_check(name);
+                    return format!(
+                        "{}_turbo_inst_{}_{}{}",
+                        &orig_text[..offset_in_clean],
+                        idx,
+                        safe_name,
+                        &orig_text[name_end..]
+                    );
+                }
             }
         }
     }
@@ -4114,10 +4559,20 @@ fn rename_decl_header_for_fast_check(
 
     for kw in ["theorem", "lemma"] {
         for (kw_pos, _) in sig_clean.match_indices(kw) {
+            if kw_pos > 0 {
+                let prev = sig_clean[..kw_pos].chars().next_back().unwrap_or(' ');
+                if is_lean_id_rest(prev) || prev == '»' || prev == '.' {
+                    continue;
+                }
+            }
             let after_kw = &sig_clean[kw_pos + kw.len()..];
-            if let Some(name_rel_pos) = after_kw.find(decl_name) {
-                let prefix_between = &after_kw[..name_rel_pos];
-                if !prefix_between.is_empty() && prefix_between.chars().all(char::is_whitespace) {
+            if !after_kw.starts_with(char::is_whitespace) {
+                continue;
+            }
+            let trimmed_after = after_kw.trim_start();
+            let name_rel_pos = after_kw.len() - trimmed_after.len();
+            if let Some((parsed_name, _)) = take_leading_lean_ident(trimmed_after) {
+                if parsed_name == decl_name {
                     let abs_name_start = kw_pos + kw.len() + name_rel_pos;
                     let abs_name_end = abs_name_start + decl_name.len();
                     let prefix_orig = if sig_clean[..kw_pos].contains("to_additive") {
@@ -4138,9 +4593,13 @@ fn rename_decl_header_for_fast_check(
                         sep,
                         opt_proof
                     );
+                    let renamed_doc = strip_non_doc_lean_comments(&renamed_body);
                     let renamed_clean = strip_lean_comments(&renamed_body);
                     let (gen_sig_clean, _) = split_at_top_level_assign(&renamed_clean)?;
-                    let expected_gen_stmt_hash = hash_normalized_whitespace_hex(gen_sig_clean);
+                    let gen_sig_doc = renamed_doc
+                        .get(..gen_sig_clean.len())
+                        .unwrap_or(gen_sig_clean);
+                    let expected_gen_stmt_hash = hash_normalized_whitespace_hex(gen_sig_doc);
                     let orig_rooted =
                         format!("_root_.{}", qualified_decl_name(decl_name, scope_stack));
                     let gen_rooted =
@@ -4747,24 +5206,19 @@ fn split_signature_at_top_level_colon<'a>(
     let mut paren = 0i32;
     let mut bracket = 0i32;
     let mut brace = 0i32;
-    let mut in_string = false;
     let mut i = start_offset;
 
     while i < bytes.len() {
-        let c = bytes[i];
-        if in_string {
-            if c == b'\\' {
-                i += 2;
-                continue;
-            }
-            if c == b'"' {
-                in_string = false;
-            }
-            i += 1;
+        if let Some((cend, _)) = scan_lean_block_comment_end(sig_clean, i) {
+            i = cend;
             continue;
         }
+        if let Some(end) = scan_lean_norm_literal_end(sig_clean, i) {
+            i = end;
+            continue;
+        }
+        let c = bytes[i];
         match c {
-            b'"' => in_string = true,
             b'(' => paren += 1,
             b')' => paren = (paren - 1).max(0),
             b'[' => bracket += 1,
@@ -4907,32 +5361,29 @@ fn format_cut_proof_rhs(proof_rhs: &str, base_indent: usize) -> String {
 #[allow(dead_code)]
 fn split_stmt_at_top_level_semicolons(s_orig: &str, s_clean: &str, pad: &str) -> String {
     let mut parts = Vec::new();
-    let (mut depth, mut in_str, mut last, bytes) = (0usize, false, 0usize, s_clean.as_bytes());
+    let (mut depth, mut last, bytes) = (0usize, 0usize, s_clean.as_bytes());
     let mut i = 0usize;
     while i < bytes.len() {
+        if let Some((cend, _)) = scan_lean_block_comment_end(s_clean, i) {
+            i = cend;
+            continue;
+        }
+        if let Some(end) = scan_lean_norm_literal_end(s_clean, i) {
+            i = end;
+            continue;
+        }
         let b = bytes[i];
-        if in_str {
-            if b == b'\\' {
-                i += 2;
-                continue;
-            }
-            if b == b'"' {
-                in_str = false;
-            }
-        } else {
-            match b {
-                b'"' => in_str = true,
-                b'(' | b'[' | b'{' => depth += 1,
-                b')' | b']' | b'}' => depth = depth.saturating_sub(1),
-                b';' if depth == 0 && bytes.get(i + 1) != Some(&b'>') => {
-                    let seg = s_orig[last..i].trim();
-                    if !seg.is_empty() {
-                        parts.push(format!("{}{}", pad, seg));
-                    }
-                    last = i + 1;
+        match b {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b';' if depth == 0 && bytes.get(i + 1) != Some(&b'>') => {
+                let seg = s_orig[last..i].trim();
+                if !seg.is_empty() {
+                    parts.push(format!("{}{}", pad, seg));
                 }
-                _ => {}
+                last = i + 1;
             }
+            _ => {}
         }
         i += 1;
     }
@@ -6557,6 +7008,205 @@ end MathlibEdgeCases
         assert!(have1[0].sub_decl_source.contains("\"a  b\" = \"a  b\""));
         assert!(have2[0].sub_decl_source.contains("\"a b\" = \"a  b\""));
         assert_ne!(have1[0].sub_shard_key, have2[0].sub_shard_key);
+    }
+
+    #[test]
+    fn test_round9_zero_hash_raw_strings_guillemets_docstrings_and_interp_macros() {
+        // 1. Zero-hash raw strings `r"..."`: backslashes are literal (`\"` ends the literal),
+        //    comment delimiters inside `r"..."` are preserved, and `var"` / `'r'"..."` are NOT raw strings.
+        let r1 = split_lean_source("theorem t : r\"a  b\" = r\"a  b\" := rfl\n", &[]);
+        let r2 = split_lean_source("theorem t : r\"a b\" = r\"a  b\" := rfl\n", &[]);
+        assert_ne!(r1.shards[0].stmt_hash, r2.shards[0].stmt_hash);
+
+        let r_slash = split_lean_source(
+            "def p := r\"foo\\\"\ntheorem after_raw : p = \"foo\\\\\" := rfl\n",
+            &[],
+        );
+        assert_eq!(r_slash.shards.len(), 1);
+        assert_eq!(r_slash.shards[0].name, "after_raw");
+        assert!(r_slash.hygiene.is_clean_for_certification());
+
+        let r_hyg = split_lean_source(
+            "def s := r\"\\\"\naxiom bad : False\ndef tail := \"ok\"\n",
+            &[],
+        );
+        assert!(
+            !r_hyg.hygiene.is_clean_for_certification(),
+            "axiom after r\"\\\" must not be swallowed into raw string"
+        );
+
+        let r_cmt1 = split_lean_source(
+            "def c := r\"a -- b\"\ntheorem t : c.length = 6 := rfl\n",
+            &[],
+        );
+        let r_cmt2 = split_lean_source("def c := r\"a \"\ntheorem t : c.length = 6 := rfl\n", &[]);
+        assert_ne!(
+            r_cmt1.shards[0].prefix_env_hash,
+            r_cmt2.shards[0].prefix_env_hash
+        );
+
+        let r_ident_pref = split_lean_source(
+            "def f (xr : String → String) := xr\"\\\"\naxiom not_swallowed : False\n\"\n",
+            &[],
+        );
+        assert!(
+            r_ident_pref.hygiene.is_clean_for_certification(),
+            "`xr\"...\"` is an identifier `xr` followed by an ordinary string where `\\\"` is escaped"
+        );
+
+        let r_colon = split_lean_source("theorem rc : r\"x := y\" = r\"x := y\" := rfl\n", &[]);
+        assert_eq!(r_colon.shards.len(), 1);
+        assert!(r_colon.shards[0].signature_text.contains("r\"x := y\""));
+
+        // 2. Guillemet-escaped identifiers with dots, spaces, dashes, and Lean keyword bodies.
+        let g_ns = split_lean_source(
+            "namespace «Foo.Bar»\ntheorem «baz.qux» : True := trivial\nend «Foo.Bar»\n",
+            &[],
+        );
+        assert_eq!(g_ns.shards.len(), 1);
+        assert_eq!(g_ns.shards[0].name, "«baz.qux»");
+        assert_eq!(g_ns.shards[0].effective_name(), "«Foo.Bar».«baz.qux»");
+        assert_eq!(g_ns.shards[0].rooted_name(), "_root_.«Foo.Bar».«baz.qux»");
+
+        let g_kw = split_lean_source(
+            "def «def» : Nat := 1\ntheorem «theorem» : «def» = 1 := rfl\n",
+            &[],
+        );
+        assert_eq!(g_kw.shards.len(), 1);
+        assert_eq!(g_kw.shards[0].name, "«theorem»");
+        let fast_kw = build_fast_olean_shard_source(
+            "def «def» : Nat := 1\ntheorem «theorem» : «def» = 1 := rfl\n",
+            "ModKw",
+            &["_root_.«theorem»".to_string()].into_iter().collect(),
+        )
+        .expect("fast olean source for guillemet keyword theorem");
+        let parsed_fast_kw = split_lean_source(&fast_kw, &[]);
+        let validated_kw =
+            FastVerifyMap::parse_and_validate(&fast_kw, &parsed_fast_kw.shards).unwrap();
+        assert!(validated_kw.gen_for_orig("_root_.«theorem»").is_some());
+
+        let g_coll_src = "theorem «a b» : True := trivial\ntheorem a_b : True := trivial\n";
+        let g_coll_split = split_lean_source(g_coll_src, &[]);
+        assert_eq!(g_coll_split.shards.len(), 2);
+        let targets_both: std::collections::HashSet<String> =
+            ["_root_.«a b»".to_string(), "_root_.a_b".to_string()]
+                .into_iter()
+                .collect();
+        let fast_coll = build_fast_olean_shard_source(g_coll_src, "ModColl", &targets_both)
+            .expect("fast olean source must not collide between «a b» and a_b");
+        let parsed_coll = split_lean_source(&fast_coll, &[]);
+        assert_eq!(parsed_coll.shards.len(), 2);
+        assert_ne!(parsed_coll.shards[0].name, parsed_coll.shards[1].name);
+        FastVerifyMap::parse_and_validate(&fast_coll, &parsed_coll.shards)
+            .expect("guillemet + underscore fast verify map must validate without collision");
+
+        let g_cone1 = split_lean_source(
+            "def «helper fn» : Nat := 1\ntheorem use_g : «helper fn» = 1 := rfl\n",
+            &[],
+        );
+        let g_cone2 = split_lean_source(
+            "def «helper fn» : Nat := 2\ntheorem use_g : «helper fn» = 1 := rfl\n",
+            &[],
+        );
+        assert_ne!(
+            g_cone1.shards[0].cone_env_hash,
+            g_cone2.shards[0].cone_env_hash
+        );
+
+        // 3. Docstrings (`/-- ... -/` and `/-! ... -/`) preserved in hashes; ordinary `/- ... -/` ignored.
+        let doc1 = split_lean_source(
+            "/-- doc alpha -/\ntheorem dt : True := trivial\ntheorem downstream : True := dt\n",
+            &[],
+        );
+        let doc2 = split_lean_source(
+            "/-- doc beta -/\ntheorem dt : True := trivial\ntheorem downstream : True := dt\n",
+            &[],
+        );
+        let doc_ord = split_lean_source(
+            "/- ordinary comment -/\ntheorem dt : True := trivial\ntheorem downstream : True := dt\n",
+            &[],
+        );
+        let doc_none = split_lean_source(
+            "theorem dt : True := trivial\ntheorem downstream : True := dt\n",
+            &[],
+        );
+        assert_ne!(doc1.interface_hash, doc2.interface_hash);
+        assert_ne!(doc1.shards[0].stmt_hash, doc2.shards[0].stmt_hash);
+        assert_ne!(
+            doc1.shards[1].prefix_env_hash,
+            doc2.shards[1].prefix_env_hash
+        );
+        assert_ne!(doc1.shards[1].cone_env_hash, doc2.shards[1].cone_env_hash);
+        assert_eq!(doc_ord.interface_hash, doc_none.interface_hash);
+        assert_eq!(doc_ord.shards[0].stmt_hash, doc_none.shards[0].stmt_hash);
+        assert_eq!(
+            doc_ord.shards[1].prefix_env_hash,
+            doc_none.shards[1].prefix_env_hash
+        );
+
+        let mdoc1 = split_lean_source("/-! mod doc 1 -/\ntheorem dt : True := trivial\n", &[]);
+        let mdoc2 = split_lean_source("/-! mod doc 2 -/\ntheorem dt : True := trivial\n", &[]);
+        assert_ne!(
+            mdoc1.shards[0].prefix_env_hash,
+            mdoc2.shards[0].prefix_env_hash
+        );
+
+        let slash3_a = split_lean_source("/--- box a -/\ntheorem dt : True := trivial\n", &[]);
+        let slash3_b = split_lean_source("/--- box b -/\ntheorem dt : True := trivial\n", &[]);
+        assert_eq!(
+            slash3_a.shards[0].stmt_hash, slash3_b.shards[0].stmt_hash,
+            "`/--- ... -/` is a regular block comment in Lean 4, not a docstring"
+        );
+
+        let doc_fast_targets: std::collections::HashSet<String> =
+            ["_root_.dt".to_string()].into_iter().collect();
+        let doc_fast_src = build_fast_olean_shard_source(
+            "/-- doc alpha -/\ntheorem dt : True := trivial\n",
+            "ModDoc",
+            &doc_fast_targets,
+        )
+        .unwrap();
+        let doc_fast_parsed = split_lean_source(&doc_fast_src, &[]);
+        FastVerifyMap::parse_and_validate(&doc_fast_src, &doc_fast_parsed.shards)
+            .expect("docstring-bearing theorem must validate in FastVerifyMap");
+
+        // 4. Custom interpolated-string prefixes (`f1!"..."`, `s'!"..."`, Greek/guillemet prefixes)
+        //    plus block comments inside `{...}` splices.
+        let interp1 = split_lean_source(
+            "macro \"f1!\" s:interpolatedStr(term) : term => `(s!$s)\ntheorem it : f1!\"x {\"a  b\"} y\" = \"x a  b y\" := rfl\n",
+            &[],
+        );
+        let interp2 = split_lean_source(
+            "macro \"f1!\" s:interpolatedStr(term) : term => `(s!$s)\ntheorem it : f1!\"x {\"a b\"} y\" = \"x a  b y\" := rfl\n",
+            &[],
+        );
+        assert_ne!(interp1.shards[0].stmt_hash, interp2.shards[0].stmt_hash);
+
+        let interp_prime1 = split_lean_source(
+            "macro \"s'!\" s:interpolatedStr(term) : term => `(s!$s)\ntheorem it : s'!\"x {\"a  b\"} y\" = \"x a  b y\" := rfl\n",
+            &[],
+        );
+        let interp_prime2 = split_lean_source(
+            "macro \"s'!\" s:interpolatedStr(term) : term => `(s!$s)\ntheorem it : s'!\"x {\"a b\"} y\" = \"x a  b y\" := rfl\n",
+            &[],
+        );
+        assert_ne!(
+            interp_prime1.shards[0].stmt_hash,
+            interp_prime2.shards[0].stmt_hash
+        );
+
+        let interp_fv = "macro \"f1!\" s:interpolatedStr(term) : term => `(s!$s)\ndef msg := f1!\"{\"\\n-- @turbo_fast_verify deadbeef\"}\"\ntheorem ok_thm : True := trivial\n";
+        let interp_fv_split = split_lean_source(interp_fv, &[]);
+        let fv_map = FastVerifyMap::parse_and_validate(interp_fv, &interp_fv_split.shards)
+            .expect("directive-like text inside f1!\"{...}\" nested string must not be treated as a real comment");
+        assert!(fv_map.is_empty());
+
+        let interp_blk = split_lean_source(
+            "def msg := s!\"{1 /- \"} -/ + 2}\"\ntheorem after_blk : True := trivial\n",
+            &[],
+        );
+        assert_eq!(interp_blk.shards.len(), 1);
+        assert_eq!(interp_blk.shards[0].name, "after_blk");
     }
 }
 
