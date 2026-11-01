@@ -1548,9 +1548,9 @@ impl MaterializedClosure {
     }
 }
 
-/// Whether work done between `ClosureSnapshot::take` and `rebind` read the snapshot's bytes.
-#[derive(Debug, PartialEq, Eq)]
-enum ClosureBinding {
+///Whether work done between `ClosureSnapshot::take` and `rebind` read the snapshot's bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClosureBinding {
     /// Provably unchanged: the snapshot may label caches.
     Bound,
     /// A change was observed: the work read other bytes than the snapshot's.
@@ -3570,6 +3570,38 @@ pub(crate) fn resolve_zygote_context(
 const CLOSURE_CHANGED_ERR: &str = "[turbo-lean] imported .olean closure changed while it was \
      being evaluated (twice); refusing to report a verdict for bytes that were not hashed";
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn eval_with_resolved_context_opts_with_args(
+    store: &TurboStore,
+    toolchain: &str,
+    req_lean_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    lean_bin: &Path,
+    shard_source: &str,
+    allow_stub: bool,
+    eval_mode: bool,
+    file_name: Option<&str>,
+    timeout_ms: Option<u64>,
+    lean_args: &[String],
+    initial_context: Option<&ResolvedZygoteContext>,
+) -> Result<(ZygoteEvalReply, ClosureBinding, String)> {
+    eval_with_zygote_pool_inner_with_context(
+        store,
+        toolchain,
+        req_lean_path,
+        env_vars,
+        lean_bin,
+        shard_source,
+        allow_stub,
+        eval_mode,
+        file_name,
+        timeout_ms,
+        None,
+        lean_args,
+        initial_context,
+    )
+}
+
 /// Runs a request against a snapshot of its imported `.olean` closure; if the closure changed
 /// while the worker imported it, the reply is discarded (nothing cached, worker killed) and
 /// the request retried once on a fresh snapshot, then fails closed.
@@ -3588,8 +3620,42 @@ fn eval_with_zygote_pool_inner(
     batch_fission_override: Option<(String, String, String)>,
     lean_args: &[String],
 ) -> Result<ZygoteEvalReply> {
+    eval_with_zygote_pool_inner_with_context(
+        store,
+        toolchain,
+        req_lean_path,
+        env_vars,
+        lean_bin,
+        shard_source,
+        allow_stub,
+        eval_mode,
+        file_name,
+        timeout_ms,
+        batch_fission_override,
+        lean_args,
+        None,
+    )
+    .map(|(rep, _, _)| rep)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn eval_with_zygote_pool_inner_with_context(
+    store: &TurboStore,
+    toolchain: &str,
+    req_lean_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    lean_bin: &Path,
+    shard_source: &str,
+    allow_stub: bool,
+    eval_mode: bool,
+    file_name: Option<&str>,
+    timeout_ms: Option<u64>,
+    batch_fission_override: Option<(String, String, String)>,
+    lean_args: &[String],
+    initial_context: Option<&ResolvedZygoteContext>,
+) -> Result<(ZygoteEvalReply, ClosureBinding, String)> {
     let request_started = std::time::Instant::now();
-    let attempt = |timeout_ms: Option<u64>| {
+    let attempt = |timeout_ms: Option<u64>, ctx: Option<&ResolvedZygoteContext>| {
         eval_with_zygote_pool_attempt(
             store,
             toolchain,
@@ -3604,22 +3670,27 @@ fn eval_with_zygote_pool_inner(
             batch_fission_override.clone(),
             lean_args,
             request_started,
+            ctx,
         )
     };
-    let (rep, binding) = attempt(timeout_ms)?;
+    let (rep, binding, identity) = attempt(timeout_ms, initial_context)?;
     if binding != ClosureBinding::Changed {
-        return Ok(rep);
+        return Ok((rep, binding, identity));
     }
-    let (rep, binding) = attempt(timeout_ms)?;
+    let (rep, binding, identity) = attempt(timeout_ms, None)?;
     if binding != ClosureBinding::Changed {
-        return Ok(rep);
+        return Ok((rep, binding, identity));
     }
-    Ok(ZygoteEvalReply {
-        kernel_gate_active: !eval_mode,
-        errors: vec![CLOSURE_CHANGED_ERR.to_string()],
-        messages: vec![CLOSURE_CHANGED_ERR.to_string()],
-        ..Default::default()
-    })
+    Ok((
+        ZygoteEvalReply {
+            kernel_gate_active: !eval_mode,
+            errors: vec![CLOSURE_CHANGED_ERR.to_string()],
+            messages: vec![CLOSURE_CHANGED_ERR.to_string()],
+            ..Default::default()
+        },
+        ClosureBinding::Changed,
+        identity,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3637,7 +3708,8 @@ fn eval_with_zygote_pool_attempt(
     batch_fission_override: Option<(String, String, String)>,
     lean_args: &[String],
     request_started: std::time::Instant,
-) -> Result<(ZygoteEvalReply, ClosureBinding)> {
+    pre_resolved_context: Option<&ResolvedZygoteContext>,
+) -> Result<(ZygoteEvalReply, ClosureBinding, String)> {
     let default_timeout_ms = if eval_mode { 900_000 } else { 30_000 };
     let effective_timeout_ms = timeout_ms.unwrap_or_else(|| {
         std::env::var("TURBO_LEAN_TIMEOUT_MS")
@@ -3657,20 +3729,28 @@ fn eval_with_zygote_pool_attempt(
     } else {
         split_shard_for_zygote(shard_source)
     };
-    let context = resolve_zygote_context(
-        toolchain,
-        req_lean_path,
-        env_vars,
-        lean_bin,
-        &raw_imports_csv,
-    );
-    let closure = context.closure;
-    let effective_lean_path = context.worker_lean_path;
-    let imports_csv = context.imports_csv;
-    let pool_digest_tag = context.search_path_digest;
-    let toolchain_policy = context.toolchain_policy;
-    let olean_digest = context.olean_digest;
+    let owned_context;
+    let context = match pre_resolved_context {
+        Some(ctx) => ctx,
+        None => {
+            owned_context = resolve_zygote_context(
+                toolchain,
+                req_lean_path,
+                env_vars,
+                lean_bin,
+                &raw_imports_csv,
+            );
+            &owned_context
+        }
+    };
+    let closure = &context.closure;
+    let effective_lean_path = context.worker_lean_path.clone();
+    let imports_csv = context.imports_csv.clone();
+    let pool_digest_tag = context.search_path_digest.clone();
+    let toolchain_policy = context.toolchain_policy.clone();
+    let olean_digest = context.olean_digest.clone();
     let host_closure_digest = context.host_closure_digest.as_str();
+    let executed_identity = context.identity.clone();
     let pool_key = (
         toolchain_policy.clone(),
         effective_lean_path.clone(),
@@ -3713,7 +3793,7 @@ fn eval_with_zygote_pool_attempt(
                 hit.import_us = 0;
                 hit.prefix_us = 0;
                 hit.elab_us = 1;
-                return Ok((hit, ClosureBinding::Bound));
+                return Ok((hit, ClosureBinding::Bound, executed_identity));
             }
         }
     }
@@ -4172,6 +4252,7 @@ fn eval_with_zygote_pool_attempt(
                                 Some(last_request),
                             ),
                             binding,
+                            executed_identity,
                         ));
                     }
                     WorkerReqOutcome::Crashed(diag) => {
@@ -4249,7 +4330,7 @@ fn eval_with_zygote_pool_attempt(
                     }
                 }
             }
-            return Ok((combined_rep, binding));
+            return Ok((combined_rep, binding, executed_identity));
         }
     }
 
@@ -4459,6 +4540,7 @@ fn eval_with_zygote_pool_attempt(
                 Some(request_identity.clone()),
             ),
             ClosureBinding::Unproven,
+            executed_identity,
         ));
     }
     if worker.is_none() {
@@ -4481,6 +4563,7 @@ fn eval_with_zygote_pool_attempt(
                     first_diag.last_request,
                 ),
                 ClosureBinding::Unproven,
+                executed_identity,
             ));
         }
         match spawn_zygote_worker() {
@@ -4491,6 +4574,7 @@ fn eval_with_zygote_pool_attempt(
                 return Ok((
                     ZygoteEvalReply::crashed_reply_with_diag(eval_mode, diag),
                     ClosureBinding::Unproven,
+                    executed_identity,
                 ));
             }
         }
@@ -4542,7 +4626,7 @@ fn eval_with_zygote_pool_attempt(
             } else {
                 drop(w);
             }
-            Ok((rep, binding))
+            Ok((rep, binding, executed_identity))
         }
         WorkerReqOutcome::TimedOut {
             elapsed_us,
@@ -4561,6 +4645,7 @@ fn eval_with_zygote_pool_attempt(
                     Some(last_request),
                 ),
                 ClosureBinding::Unproven,
+                executed_identity,
             ))
         }
         WorkerReqOutcome::Crashed(diag) => {
@@ -4568,6 +4653,7 @@ fn eval_with_zygote_pool_attempt(
             Ok((
                 ZygoteEvalReply::crashed_reply_with_diag(eval_mode, diag),
                 ClosureBinding::Unproven,
+                executed_identity,
             ))
         }
     }
@@ -5537,7 +5623,7 @@ pub fn try_local_zygote_eval_with_args(
     };
 
     let Some((base_url, auth_token)) = existing_daemon else {
-        let rep = eval_with_zygote_pool_opts_with_args(
+        let (rep, executed_binding, executed_identity) = eval_with_resolved_context_opts_with_args(
             store,
             toolchain,
             lean_path,
@@ -5553,12 +5639,15 @@ pub fn try_local_zygote_eval_with_args(
                 None
             },
             &filtered_args,
+            Some(&context),
         )
         .ok()?;
         if eval_reply_cacheable(&rep) {
-            if let Some(ref path) = eval_shm_file {
-                if let Ok(bytes) = serde_json::to_vec(&rep) {
-                    write_eval_shm_cache(path, &context.closure, &bytes);
+            if executed_binding == ClosureBinding::Bound && executed_identity == context.identity {
+                if let Some(ref path) = eval_shm_file {
+                    if let Ok(bytes) = serde_json::to_vec(&rep) {
+                        write_eval_shm_cache(path, &context.closure, &bytes);
+                    }
                 }
             }
             warm_local_zygote_daemon_nonblocking(store, env_vars);
@@ -5640,17 +5729,29 @@ pub fn try_local_zygote_eval_with_args(
             .ok()?
         }
     };
-    let parsed = serde_json::from_slice::<ZygoteEvalReply>(&resp_bytes).ok();
-    if let Some(ref rep) = parsed {
-        if eval_reply_cacheable(rep) {
+    #[derive(Deserialize)]
+    struct DaemonEvalEnvelope {
+        #[serde(flatten)]
+        reply: ZygoteEvalReply,
+        #[serde(default)]
+        executed_execution_identity: Option<String>,
+        #[serde(default)]
+        binding_ok: bool,
+    }
+    let parsed_env = serde_json::from_slice::<DaemonEvalEnvelope>(&resp_bytes).ok();
+    if let Some(ref env) = parsed_env {
+        if eval_reply_cacheable(&env.reply)
+            && env.binding_ok
+            && env.executed_execution_identity.as_deref() == Some(context.identity.as_str())
+        {
             if let Some(ref path) = eval_shm_file {
-                if let Ok(bytes) = serde_json::to_vec(rep) {
+                if let Ok(bytes) = serde_json::to_vec(&env.reply) {
                     write_eval_shm_cache(path, &context.closure, &bytes);
                 }
             }
         }
     }
-    parsed
+    parsed_env.map(|env| env.reply)
 }
 
 #[cfg(test)]
@@ -8449,6 +8550,183 @@ mod tests {
             "warm prefix from high maxHeartbeats must not leak into low maxHeartbeats: {:?}",
             rep_low_after
         );
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_local_zygote_eval_aba_swap_never_poisons_eval_shm_cache() {
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("eval_aba_cache")
+        else {
+            return;
+        };
+        let tc = "leanprover/lean4:v4.35.0";
+        let lib = tmp_dir.join("lib");
+        fs::create_dir_all(&lib).unwrap();
+        let a = compile_test_olean(&lean_bin, &lib, "EvSwap", "def evSwapVal : Nat := 1\n");
+        let b = compile_test_olean(&lean_bin, &lib, "EvSwap", "def evSwapVal : Nat := 2\n");
+        let olean = lib.join("EvSwap.olean");
+        fs::write(&olean, &a).unwrap();
+        let lp = lib.to_string_lossy().to_string();
+        let src = format!(
+            "import EvSwap\n-- {}\n#eval evSwapVal\n",
+            next_tmp_id()
+        );
+        let file_name = "EvalAba.lean";
+        let caller_cwd = std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string());
+        let (imports_csv, _) = split_shard_for_zygote(&src);
+        let ctx_a = resolve_zygote_context(tc, &lp, &env_vars, &lean_bin, &imports_csv);
+        let cache_name_a =
+            compute_eval_shm_cache_filename(&ctx_a, file_name, caller_cwd.as_deref(), &src, &[])
+                .unwrap();
+        let cache_path_a = store
+            .fast_staging_dir()
+            .join("eval_shm_cache")
+            .join(&cache_name_a);
+        let _ = fs::remove_file(&cache_path_a);
+
+        // 1. In-process (`NO_DAEMON`) path: `try_local_zygote_eval_with_args` resolves context A,
+        // `after_closure_snapshot` swaps live `.olean` to B, `after_worker_reply` swaps back to A.
+        // Without passing the pre-resolved context into the evaluator, a second resolution would
+        // execute B and `write_eval_shm_cache` would validate A's untouched snapshot, caching B's
+        // output ("2") under A's key!
+        TEST_NO_DAEMON.with(|c| c.set(true));
+        let resolutions = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let (res_cnt, to_b, b_bytes) = (resolutions.clone(), olean.clone(), b.clone());
+        digest_test_hooks::set("after_closure_snapshot", move || {
+            let n = res_cnt.get() + 1;
+            res_cnt.set(n);
+            if n == 1 {
+                fs::write(&to_b, &b_bytes).unwrap();
+            }
+        });
+        let (to_a, a_bytes) = (olean.clone(), a.clone());
+        digest_test_hooks::set("after_worker_reply", move || {
+            fs::write(&to_a, &a_bytes).unwrap();
+        });
+        let rep = try_local_zygote_eval_with_args(
+            &store,
+            &env_vars,
+            &lean_bin,
+            tc,
+            &lp,
+            &src,
+            Some(file_name),
+            60_000,
+            &[],
+        )
+        .expect("eval must succeed on snapshot A");
+        digest_test_hooks::clear();
+        assert_eq!(
+            resolutions.get(),
+            1,
+            "in-process eval must resolve closure snapshot exactly once"
+        );
+        assert!(
+            rep.ok && rep.messages.join("\n").trim() == "1",
+            "evaluator must run on snapshot A, not swapped B: {rep:?}"
+        );
+        if let Some(cached) = read_cached_eval_shm_reply(&cache_path_a) {
+            assert_eq!(
+                cached.messages.join("\n").trim(),
+                "1",
+                "eval_shm_cache under A's key was poisoned with B's output: {cached:?}"
+            );
+        }
+        let _ = fs::remove_file(&cache_path_a);
+
+        // 2. HTTP daemon `/eval` path: if the live `.olean` swaps A -> B after the client resolves
+        // A (or if a rogue/unaligned daemon reply reports another identity or unbound snapshot),
+        // `/eval` rejects the mismatched identity (409) and never poisons A's `eval_shm_cache`.
+        TEST_NO_DAEMON.with(|c| c.set(false));
+        let srv_dir = tmp_dir.join("srv_store");
+        let _ = TurboStore::open(Some(&srv_dir)).unwrap();
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let addr = format!("127.0.0.1:{port}");
+        let tok = "eval-aba-daemon-tok";
+        let (srv_dir_bg, addr_bg, tok_bg) = (srv_dir.clone(), addr.clone(), tok.to_string());
+        std::thread::spawn(move || {
+            let _ = crate::server::run_server_with_auth(
+                Some(&srv_dir_bg),
+                &addr_bg,
+                false,
+                Some(&tok_bg),
+                false,
+            );
+        });
+        for _ in 0..40 {
+            if std::net::TcpStream::connect(&addr).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let (_, exe_mtime_sec, exe_mtime_nsec, _, _) = current_exe_daemon_paths(&store).unwrap();
+        let daemon_info = LocalZygoteDaemonInfo {
+            addr: addr.clone(),
+            pid: std::process::id(),
+            exe_mtime_sec,
+            exe_mtime_nsec,
+            auth_token: tok.to_string(),
+            policy: daemon_policy(),
+        };
+        fs::write(
+            store.root.join("zygote_daemon.json"),
+            serde_json::to_vec(&daemon_info).unwrap(),
+        )
+        .unwrap();
+
+        let (to_b2, b_bytes2) = (olean.clone(), b.clone());
+        digest_test_hooks::set("after_closure_snapshot", move || {
+            fs::write(&to_b2, &b_bytes2).unwrap();
+        });
+        let daemon_mismatch = try_local_zygote_eval_with_args(
+            &store,
+            &env_vars,
+            &lean_bin,
+            tc,
+            &lp,
+            &src,
+            Some(file_name),
+            60_000,
+            &[],
+        );
+        digest_test_hooks::clear();
+        fs::write(&olean, &a).unwrap();
+        assert!(
+            daemon_mismatch.is_none(),
+            "daemon /eval must reject execution_identity mismatch with HTTP 409: {daemon_mismatch:?}"
+        );
+        assert!(
+            !cache_path_a.exists(),
+            "mismatched daemon /eval must never populate A's eval_shm_cache"
+        );
+
+        let daemon_ok = try_local_zygote_eval_with_args(
+            &store,
+            &env_vars,
+            &lean_bin,
+            tc,
+            &lp,
+            &src,
+            Some(file_name),
+            60_000,
+            &[],
+        )
+        .expect("daemon /eval must succeed when identity matches");
+        assert!(
+            daemon_ok.ok && daemon_ok.messages.join("\n").trim() == "1",
+            "unexpected daemon reply: {daemon_ok:?}"
+        );
+        let cached_daemon = read_cached_eval_shm_reply(&cache_path_a)
+            .expect("aligned Bound daemon /eval must populate eval_shm_cache");
+        assert_eq!(cached_daemon.messages.join("\n").trim(), "1");
+
+        let _ = fs::remove_file(&cache_path_a);
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 }
