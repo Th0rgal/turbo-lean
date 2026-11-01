@@ -549,7 +549,15 @@ fn missing_promised_base_blob_fails_closed_without_running_repository_helpers() 
     for args in [
         &["init", "-q"][..],
         &["add", "."],
-        &["-c", "user.name=T", "-c", "user.email=t@e", "commit", "-qm", "base"],
+        &[
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@e",
+            "commit",
+            "-qm",
+            "base",
+        ],
     ] {
         assert!(plain(args).status.success(), "{args:?}");
     }
@@ -569,7 +577,9 @@ fn missing_promised_base_blob_fails_closed_without_running_repository_helpers() 
         assert!(plain(&["config", key, value]).status.success(), "{key}");
     }
     // Positive control: plain Git lazily fetches and runs the repository's ssh command.
-    assert!(!plain(&["cat-file", "-p", "HEAD:Demo.lean"]).status.success());
+    assert!(!plain(&["cat-file", "-p", "HEAD:Demo.lean"])
+        .status
+        .success());
     assert!(marker.exists(), "lazy-fetch control did not run sshCommand");
     fs::remove_file(&marker).unwrap();
 
@@ -581,7 +591,15 @@ fn missing_promised_base_blob_fails_closed_without_running_repository_helpers() 
     for mode in ["trusted", "untrusted"] {
         let out = f.run(
             &format!("cache-{mode}"),
-            &["pr-verify", "--project-dir", ".", "--base", "HEAD", "--mode", mode],
+            &[
+                "pr-verify",
+                "--project-dir",
+                ".",
+                "--base",
+                "HEAD",
+                "--mode",
+                mode,
+            ],
             false,
         );
         let diagnostic = format!(

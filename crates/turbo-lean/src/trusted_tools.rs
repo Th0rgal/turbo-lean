@@ -264,7 +264,10 @@ fn trusted_executables_reject_relative_and_checkout_symlink_targets() -> Result<
 fn trusted_git_rejects_old_versions() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     assert_eq!(parse_git_version("git version 2.46.0\n"), Some((2, 46)));
-    assert_eq!(parse_git_version("git version 2.43.0.windows.1"), Some((2, 43)));
+    assert_eq!(
+        parse_git_version("git version 2.43.0.windows.1"),
+        Some((2, 43))
+    );
     assert_eq!(parse_git_version("not git"), None);
     let root = std::env::temp_dir().join(format!(
         "turbo-old-git-{}-{}",
@@ -319,7 +322,15 @@ fn trusted_git_never_lazily_fetches_or_runs_repository_helpers() -> Result<()> {
     ok(&["init", "-q"])?;
     fs::write(repo.join("A.lean"), "theorem a : True := trivial\n")?;
     ok(&["add", "A.lean"])?;
-    ok(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base"])?;
+    ok(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "base",
+    ])?;
     let oid = ok(&["rev-parse", "HEAD:A.lean"])?;
     fs::remove_file(repo.join(".git/objects").join(&oid[..2]).join(&oid[2..]))?;
     let touch = format!("sh -c 'touch {}; exit 1' --", marker.display());
@@ -329,7 +340,10 @@ fn trusted_git_never_lazily_fetches_or_runs_repository_helpers() -> Result<()> {
         ("extensions.partialClone", "origin"),
         ("core.sshCommand", &touch),
         ("protocol.ssh.allow", "always"),
-        ("credential.helper", &format!("!touch {} #", marker.display())),
+        (
+            "credential.helper",
+            &format!("!touch {} #", marker.display()),
+        ),
     ] {
         ok(&["config", key, value])?;
     }
@@ -382,7 +396,10 @@ fn trusted_git_never_lazily_fetches_or_runs_repository_helpers() -> Result<()> {
         .unwrap()
         .write_all(b"protocol=https\nhost=example.invalid\n\n")?;
     child.wait()?;
-    assert!(!marker.exists(), "credential helper ran through trusted Git");
+    assert!(
+        !marker.exists(),
+        "credential helper ran through trusted Git"
+    );
     // Reading base blobs by object id reports the missing object instead of skipping it.
     let err = crate::pr_verify::fetch_git_blobs_batch(&repo, "HEAD", &["A.lean".into()])
         .expect_err("missing promised blob must fail closed");
