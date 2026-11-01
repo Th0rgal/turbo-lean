@@ -31,9 +31,10 @@ pub mod remote_prebuild;
 pub mod server;
 pub mod shm_cache;
 mod splitter;
+mod trusted_tools;
+pub mod verify;
 #[cfg(all(test, unix))]
 mod worktree_test_support;
-pub mod verify;
 pub mod zygote;
 
 pub use gpu_fastcheck::*;
@@ -339,7 +340,7 @@ enum Commands {
         /// Cap the maximum number of cone verification jobs (`0` = uncapped)
         #[arg(long, default_value_t = 0)]
         max_cone_jobs: usize,
-        /// Optional external kernel checker binary (`nanoda_bin` or `lean4checker`) for dual-auditor cross-checking
+        /// Absolute external kernel checker path outside the checkout for dual-auditor cross-checking
         #[arg(long)]
         nanoda_bin: Option<PathBuf>,
     },
@@ -573,10 +574,10 @@ fn run(cli: Cli) -> Result<()> {
         } else if pol.mode == "local" {
             std::env::set_var("TURBO_LEAN_TELEMETRY", "local");
         }
-    } else if !is_telemetry_cmd {
-        if !mcp::resolve_telemetry_policy_with_trust(tel_dir, trust_proj_toml).enabled {
-            std::env::set_var("LEAN_NATIVE_TELEMETRY", "off");
-        }
+    } else if !is_telemetry_cmd
+        && !mcp::resolve_telemetry_policy_with_trust(tel_dir, trust_proj_toml).enabled
+    {
+        std::env::set_var("LEAN_NATIVE_TELEMETRY", "off");
     }
 
     if let Commands::Telemetry {
@@ -606,12 +607,10 @@ fn run(cli: Cli) -> Result<()> {
         } => (Some(project_dir.as_path()), Some(base.as_str())),
         Commands::CiVerify {
             project_dir,
-            base,
+            base: Some(base),
             ..
-        } => match base {
-            Some(base) => (Some(project_dir.as_path()), Some(base.as_str())),
-            None => (None, None),
-        },
+        } => (Some(project_dir.as_path()), Some(base.as_str())),
+        Commands::CiVerify { base: None, .. } => (None, None),
         Commands::Check { project_dir, .. }
         | Commands::Build { project_dir, .. }
         | Commands::SeedShards { project_dir, .. } => (Some(project_dir.as_path()), None),
@@ -650,7 +649,7 @@ fn run(cli: Cli) -> Result<()> {
         std::env::remove_var("TURBO_LEAN_ALLOWED_CSIMP_FROM_CONFIG");
     }
     if let Some(dir) = dir {
-        let config = splitter::read_project_config(dir, rev).unwrap_or_default();
+        let config = splitter::read_project_config(dir, rev)?.unwrap_or_default();
         if rev.is_some()
             || std::env::var_os("TURBO_LEAN_ALLOWED_CSIMP").is_none()
             || csimp_from_config
@@ -826,7 +825,7 @@ fn run(cli: Cli) -> Result<()> {
             decl.as_deref(),
             project_dir.as_deref(),
             low_memory,
-        ) {
+        )? {
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&out_json)?);
             } else {
@@ -938,11 +937,9 @@ fn run(cli: Cli) -> Result<()> {
         None;
     let mut prefetched_manifest: Option<std::thread::JoinHandle<Option<pack::DeltaManifest>>> =
         None;
-    let mut prefetched_import: Option<
-        std::thread::JoinHandle<
-            Option<(pack::PackManifest, Vec<(String, String, i64, i64)>, usize)>,
-        >,
-    > = None;
+    type PrefetchedImportPayload = (pack::PackManifest, Vec<(String, String, i64, i64)>, usize);
+    let mut prefetched_import: Option<std::thread::JoinHandle<Option<PrefetchedImportPayload>>> =
+        None;
     if let Commands::Import {
         ref input,
         ref trust_domain,
@@ -1055,34 +1052,33 @@ fn run(cli: Cli) -> Result<()> {
                         .join("locks")
                         .join("cached_portable_manifest.json")
                         .exists())
+                && pack::try_stateless_noop_pull_sync(&resolved_cache_root, &base)
             {
-                if pack::try_stateless_noop_pull_sync(&resolved_cache_root, &base) {
-                    if cli.json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "status": "synced",
-                                "mode": "bidirectional",
-                                "remote": remote,
-                                "pulled_actions": 0,
-                                "pulled_blobs": 0,
-                                "pulled_pack_bytes": 0,
-                                "pushed_actions": 0,
-                                "pushed_blobs": 0,
-                                "pushed_raw_bytes": 0,
-                                "pushed_pack_bytes": 0,
-                                "delta_push_noop": true,
-                                "elapsed_ms": 0
-                            }))?
-                        );
-                    } else {
-                        println!(
-                            "[turbo-lean] Synced with {} in 0 ms: pulled 0 actions (0 blobs), pushed 0 actions (0 blobs)",
-                            remote
-                        );
-                    }
-                    return Ok(());
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "status": "synced",
+                            "mode": "bidirectional",
+                            "remote": remote,
+                            "pulled_actions": 0,
+                            "pulled_blobs": 0,
+                            "pulled_pack_bytes": 0,
+                            "pushed_actions": 0,
+                            "pushed_blobs": 0,
+                            "pushed_raw_bytes": 0,
+                            "pushed_pack_bytes": 0,
+                            "delta_push_noop": true,
+                            "elapsed_ms": 0
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "[turbo-lean] Synced with {} in 0 ms: pulled 0 actions (0 blobs), pushed 0 actions (0 blobs)",
+                        remote
+                    );
                 }
+                return Ok(());
             }
             if !push && !db_warm_on_open && !has_expected_sha {
                 if let Some((pulled, pulled_bytes)) = pack::try_stateless_cold_pull_sync_with_domain(
@@ -1566,7 +1562,7 @@ fn run(cli: Cli) -> Result<()> {
             let explicit_lp: Option<String> = lean_path.or_else(|| std::env::var("LEAN_PATH").ok());
 
             let (mut env_vars, lean_bin, req_lp) = if let Some(lp) = explicit_lp {
-                let (mut ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, &lp);
+                let (mut ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, &lp)?;
                 if lp.is_empty() {
                     ev.remove("LEAN_PATH");
                 } else {
@@ -1581,21 +1577,25 @@ fn run(cli: Cli) -> Result<()> {
                 let lp = lake_build::resolve_remote_lean_path(&canon_proj, None);
                 let mut ev = std::collections::HashMap::new();
                 ev.insert("LEAN_PATH".to_string(), lp.clone());
-                (ev, PathBuf::from("lean"), lp)
+                (
+                    ev,
+                    pack::resolve_server_lean_env_and_bin(&store, &toolchain, &lp)?.1,
+                    lp,
+                )
             } else if proj_dir.join("lakefile.lean").exists()
                 || proj_dir.join("lakefile.toml").exists()
             {
                 if let Ok((ev, _)) = lake_build::resolve_lake_env(&store, &proj_dir) {
                     let lp = ev.get("LEAN_PATH").cloned().unwrap_or_default();
-                    let (_, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, &lp);
+                    let (_, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, &lp)?;
                     (ev, lb, lp)
                 } else {
-                    let (ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, "");
+                    let (ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, "")?;
                     let lp = ev.get("LEAN_PATH").cloned().unwrap_or_default();
                     (ev, lb, lp)
                 }
             } else {
-                let (ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, "");
+                let (ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, "")?;
                 (ev, lb, String::new())
             };
 

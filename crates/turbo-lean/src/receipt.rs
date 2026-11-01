@@ -45,6 +45,7 @@ pub struct ReceiptVerificationReport {
     pub signature_verified: Option<bool>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn compute_receipt_blake3(
     schema_version: u32,
     mode: &str,

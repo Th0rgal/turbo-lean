@@ -1,6 +1,7 @@
 //! Specification auditor extracted mechanically from gpu_fastcheck.rs.
 
 use super::*;
+use crate::splitter::skip_lean_lexeme;
 
 pub(super) fn inline_stmt_let_bindings(stmt: &str) -> String {
     inline_stmt_let_bindings_checked(stmt).0
@@ -107,82 +108,6 @@ fn inline_stmt_let_bindings_checked(stmt: &str) -> (String, bool) {
     (cur, clean_stmt)
 }
 
-/// A literal or comment beginning at a UTF-8 byte boundary. Unterminated strings
-/// and block comments consume the remainder so their contents cannot become code.
-struct LeanLexicalSpan {
-    end: usize,
-    is_comment: bool,
-}
-
-fn skip_lean_lexeme(src: &str, start: usize) -> Option<LeanLexicalSpan> {
-    let bytes = src.as_bytes();
-    let mut i = start;
-    let is_comment = src[start..].starts_with("--") || src[start..].starts_with("/-");
-    match *bytes.get(start)? {
-        b'-' if src[start..].starts_with("--") => {
-            i += 2;
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
-        }
-        b'/' if src[start..].starts_with("/-") => {
-            i += 2;
-            let mut depth = 1usize;
-            while i < bytes.len() && depth > 0 {
-                if bytes[i..].starts_with(b"/-") {
-                    depth += 1;
-                    i += 2;
-                } else if bytes[i..].starts_with(b"-/") {
-                    depth -= 1;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-        }
-        b'\'' => i = crate::splitter::scan_lean_char_lit_end(src, start)?,
-        b'"' => {
-            i += 1;
-            while i < bytes.len() {
-                match bytes[i] {
-                    b'\\' => i = (i + 2).min(bytes.len()),
-                    b'"' => {
-                        i += 1;
-                        break;
-                    }
-                    _ => i += 1,
-                }
-            }
-        }
-        b'r' if !src[..start]
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '\'') =>
-        {
-            i += 1;
-            while bytes.get(i) == Some(&b'#') {
-                i += 1;
-            }
-            let hashes = i - start - 1;
-            if bytes.get(i) != Some(&b'"') {
-                return None;
-            }
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == b'"'
-                    && bytes[i + 1..].starts_with(&bytes[start + 1..start + 1 + hashes])
-                {
-                    i += 1 + hashes;
-                    break;
-                }
-                i += 1;
-            }
-        }
-        _ => return None,
-    }
-    Some(LeanLexicalSpan { end: i, is_comment })
-}
-
 /// Audit-only stripping: preserve literal text, byte offsets, and newlines.
 /// The splitter's existing shared stripper deliberately retains its behavior.
 fn strip_audit_comments(src: &str) -> String {
@@ -211,12 +136,12 @@ pub(super) fn decl_matches_requested_target(
     target: &str,
 ) -> bool {
     let target = target.trim();
-    if let Some(root_target) = target.strip_prefix("_root_.") {
-        return qualified_name == root_target;
-    }
-    qualified_name == target
-        || (!target.contains('.')
-            && (decl_name == target || qualified_name.ends_with(&format!(".{}", target))))
+    let id = if qualified_name.is_empty() {
+        decl_name
+    } else {
+        qualified_name
+    };
+    crate::splitter::decl_name_matches_target(id, target)
 }
 
 pub(super) fn select_target_decl_unambiguously(
@@ -516,14 +441,36 @@ fn source_has_no_untrusted_elab_tokens(
                     k = next_k;
                     continue;
                 }
+                "def" => {
+                    let mut p = k;
+                    while p > 0 && chars[p - 1] != '\n' {
+                        p -= 1;
+                        if !chars[p].is_whitespace() {
+                            return false;
+                        }
+                    }
+                    while next_k < n && chars[next_k] != '\n' && chars[next_k].is_whitespace() {
+                        next_k += 1;
+                    }
+                    let Some((name, after_name)) = dotted_at(next_k) else {
+                        return false;
+                    };
+                    if name
+                        .split('.')
+                        .any(|seg| is_reserved_shadow_ident(seg) || is_builtin_eval_fn_ident(seg))
+                    {
+                        return false;
+                    }
+                    k = after_name;
+                    continue;
+                }
                 "local" | "scoped" | "instance" | "attribute" | "notation" | "infix" | "infixl"
                 | "infixr" | "prefix" | "postfix" | "macro" | "macro_rules" | "syntax" | "elab"
                 | "elab_rules" | "variable" | "variables" | "universe" | "universes" | "export"
                 | "include" | "omit" | "mutual" | "opaque" | "axiom" | "constant" | "structure"
-                | "class" | "inductive" | "coinductive" | "deriving" | "def" | "example"
-                | "initialize" | "builtin_initialize" | "register_option"
-                | "declare_syntax_cat" | "unif_hint" | "unsafe" | "partial" | "meta" | "haveI"
-                | "letI" | "module" | "prelude" => {
+                | "class" | "inductive" | "coinductive" | "deriving" | "example" | "initialize"
+                | "builtin_initialize" | "register_option" | "declare_syntax_cat" | "unif_hint"
+                | "unsafe" | "partial" | "meta" | "haveI" | "letI" | "module" | "prelude" => {
                     return false;
                 }
                 _ => {
@@ -573,6 +520,77 @@ fn is_reserved_shadow_ident(name: &str) -> bool {
             | "setStorage"
             | "fastBeq"
             | "decide"
+            | "Char"
+            | "String"
+            | "F128"
+            | "UInt128"
+    )
+}
+
+fn is_builtin_eval_fn_ident(name: &str) -> bool {
+    matches!(
+        name,
+        "add"
+            | "addChecked"
+            | "addWithCarry"
+            | "addr"
+            | "and"
+            | "beq"
+            | "bitAnd"
+            | "bitMaj"
+            | "bitMux"
+            | "bitNot"
+            | "bitOr"
+            | "bitParity"
+            | "bitXor"
+            | "clz"
+            | "clz256"
+            | "complement"
+            | "contractSlot"
+            | "ctz256"
+            | "div"
+            | "fastBeq"
+            | "getStorage"
+            | "gf128_reduce_poly"
+            | "land"
+            | "le"
+            | "lor"
+            | "lt"
+            | "map"
+            | "map2"
+            | "mapUint"
+            | "mk"
+            | "mod"
+            | "mul"
+            | "mulChecked"
+            | "mulDivDown"
+            | "mulDivUp"
+            | "none"
+            | "not"
+            | "ofNat"
+            | "ofUInt256"
+            | "ofUInt64"
+            | "or"
+            | "sar"
+            | "setStorage"
+            | "shiftLeft"
+            | "shiftRight"
+            | "shl"
+            | "shr"
+            | "slot"
+            | "some"
+            | "sub"
+            | "subChecked"
+            | "subWithBorrow"
+            | "succ"
+            | "toNat"
+            | "toUInt256"
+            | "transient"
+            | "udiv"
+            | "umod"
+            | "ushiftRight"
+            | "val"
+            | "xor"
     )
 }
 
@@ -728,22 +746,21 @@ pub(super) fn extract_all_lean_theorems(
     clean_src: &str,
     target_name: Option<&str>,
 ) -> Vec<ExtractedDecl> {
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum LexScopeKind {
-        Namespace,
-        Section,
-        Mutual,
-    }
     let clean_src = strip_audit_comments(clean_src);
     let chars: Vec<char> = clean_src.chars().collect();
     let byte_offsets: Vec<usize> = clean_src.char_indices().map(|(offset, _)| offset).collect();
-    let skip_at = |i: usize| {
+    let skip_literal_or_comment_at = |i: usize| {
+        skip_lean_lexeme(&clean_src, byte_offsets[i])
+            .filter(|span| span.is_comment || span.is_literal)
+            .map(|span| byte_offsets.partition_point(|offset| *offset < span.end))
+    };
+    let skip_any_lexeme_at = |i: usize| {
         skip_lean_lexeme(&clean_src, byte_offsets[i])
             .map(|span| byte_offsets.partition_point(|offset| *offset < span.end))
     };
     let is_line_command_head = |pos: usize| -> bool {
         let mut p = pos;
-        while p > 0 && chars[p - 1] != '\n' {
+        while p > 0 && chars[p - 1] != '\n' && chars[p - 1] != ';' {
             p -= 1;
         }
         let mut cur = p;
@@ -758,7 +775,7 @@ pub(super) fn extract_all_lean_theorems(
                 let mut depth = 1usize;
                 cur += 2;
                 while cur < pos && depth > 0 {
-                    if let Some(end) = skip_at(cur) {
+                    if let Some(end) = skip_any_lexeme_at(cur) {
                         cur = end;
                         continue;
                     }
@@ -798,7 +815,7 @@ pub(super) fn extract_all_lean_theorems(
                 ) {
                     let mut found_in = false;
                     while cur < pos {
-                        if let Some(end) = skip_at(cur) {
+                        if let Some(end) = skip_any_lexeme_at(cur) {
                             cur = end;
                             continue;
                         }
@@ -824,29 +841,48 @@ pub(super) fn extract_all_lean_theorems(
         }
         true
     };
-    let read_dotted_ident = |mut idx: usize, limit: usize| -> (String, usize) {
-        while idx < limit && (chars[idx] == ' ' || chars[idx] == '\t') {
-            idx += 1;
+    let scan_dotted_name = |mut pos: usize, limit: usize| -> (String, usize) {
+        while pos < limit && (chars[pos] == ' ' || chars[pos] == '\t') {
+            pos += 1;
         }
-        let s = idx;
-        while idx < limit && (is_ident_continue(chars[idx]) || chars[idx] == '.') {
-            idx += 1;
+        let start = pos;
+        while pos < limit {
+            if chars[pos] == '«' {
+                if let Some(end) = skip_any_lexeme_at(pos) {
+                    pos = end;
+                    continue;
+                }
+                break;
+            }
+            if is_ident_continue(chars[pos]) || chars[pos] == '.' {
+                pos += 1;
+            } else {
+                break;
+            }
         }
-        (chars[s..idx].iter().collect(), idx)
+        let raw: String = chars[start..pos].iter().collect();
+        (raw.trim_end_matches('.').to_string(), pos)
     };
     let n = chars.len();
     let mut i = 0;
-    let mut scope_stack: Vec<(LexScopeKind, String)> = Vec::new();
+    let mut scope_stack: Vec<crate::splitter::ScopeFrame> = Vec::new();
     let mut open_stack: Vec<(usize, String)> = Vec::new();
     let mut transient_opens: Vec<String> = Vec::new();
     let mut all_decls: Vec<ExtractedDecl> = Vec::new();
-    let file_elab_trusted = source_has_no_untrusted_elab_tokens(&chars, &skip_at);
-    let mut file_scope = scan_file_scope_context(&chars, &skip_at);
+    let file_elab_trusted =
+        source_has_no_untrusted_elab_tokens(&chars, &skip_literal_or_comment_at);
+    let mut file_scope = scan_file_scope_context(&chars, &skip_literal_or_comment_at);
 
     while i < n {
-        if let Some(end) = skip_at(i) {
+        if let Some(end) = skip_literal_or_comment_at(i) {
             i = end;
             continue;
+        }
+        if chars[i] == '«' {
+            if let Some(end) = skip_any_lexeme_at(i) {
+                i = end;
+                continue;
+            }
         }
         if chars[i].is_whitespace() {
             i += 1;
@@ -864,47 +900,79 @@ pub(super) fn extract_all_lean_theorems(
             let word: String = chars[start..i].iter().collect();
             if is_line_command_head(start) {
                 match word.as_str() {
-                    "namespace" => {
+                    "namespace" if i < n && (chars[i] == ' ' || chars[i] == '\t') => {
                         transient_opens.clear();
-                        let (ns_name, next_i) = read_dotted_ident(i, n);
+                        let (ns_name, next_i) = scan_dotted_name(i, n);
                         i = next_i;
-                        for seg in ns_name.split('.').filter(|s| !s.is_empty()) {
-                            scope_stack.push((LexScopeKind::Namespace, seg.to_string()));
-                            if is_reserved_shadow_ident(seg) {
+                        for seg in crate::splitter::split_lean_name_components(&ns_name) {
+                            scope_stack.push(crate::splitter::ScopeFrame {
+                                kind: crate::splitter::ScopeKind::Namespace,
+                                name: seg.to_string(),
+                                open_span_idx: 0,
+                            });
+                            let raw_seg = seg
+                                .strip_prefix('«')
+                                .and_then(|s| s.strip_suffix('»'))
+                                .unwrap_or(seg);
+                            if is_reserved_shadow_ident(raw_seg) {
                                 file_scope.trusted_shadow_ok = false;
                             }
                         }
                         continue;
                     }
-                    "section" => {
+                    "section" if i >= n || chars[i].is_whitespace() => {
                         transient_opens.clear();
-                        let (sec_name, next_i) = read_dotted_ident(i, n);
+                        let (sec_name, next_i) = if i < n && (chars[i] == ' ' || chars[i] == '\t') {
+                            scan_dotted_name(i, n)
+                        } else {
+                            (String::new(), i)
+                        };
                         i = next_i;
                         if sec_name.is_empty() {
-                            scope_stack.push((LexScopeKind::Section, String::new()));
+                            scope_stack.push(crate::splitter::ScopeFrame {
+                                kind: crate::splitter::ScopeKind::Section,
+                                name: String::new(),
+                                open_span_idx: 0,
+                            });
                         } else {
-                            for seg in sec_name.split('.').filter(|s| !s.is_empty()) {
-                                scope_stack.push((LexScopeKind::Section, seg.to_string()));
+                            for seg in crate::splitter::split_lean_name_components(&sec_name) {
+                                scope_stack.push(crate::splitter::ScopeFrame {
+                                    kind: crate::splitter::ScopeKind::Section,
+                                    name: seg.to_string(),
+                                    open_span_idx: 0,
+                                });
                             }
                         }
                         continue;
                     }
-                    "mutual" => {
+                    "mutual" if i >= n || chars[i].is_whitespace() => {
                         transient_opens.clear();
-                        scope_stack.push((LexScopeKind::Mutual, String::new()));
+                        scope_stack.push(crate::splitter::ScopeFrame {
+                            kind: crate::splitter::ScopeKind::Mutual,
+                            name: String::new(),
+                            open_span_idx: 0,
+                        });
                         continue;
                     }
-                    "end" => {
+                    "end" if i >= n || chars[i].is_whitespace() => {
                         transient_opens.clear();
-                        let (end_name, next_i) = read_dotted_ident(i, n);
+                        let (end_name, next_i) = if i < n && (chars[i] == ' ' || chars[i] == '\t') {
+                            scan_dotted_name(i, n)
+                        } else {
+                            (String::new(), i)
+                        };
                         i = next_i;
                         if end_name.is_empty() {
                             scope_stack.pop();
                         } else {
-                            for seg in end_name.split('.').filter(|s| !s.is_empty()).rev() {
-                                if let Some(pos) =
-                                    scope_stack.iter().rposition(|(_, name)| name == seg)
-                                {
+                            for seg in crate::splitter::split_lean_name_components(&end_name)
+                                .into_iter()
+                                .rev()
+                            {
+                                let canon = crate::splitter::canonical_lean_name_component(seg);
+                                if let Some(pos) = scope_stack.iter().rposition(|f| {
+                                    crate::splitter::canonical_lean_name_component(&f.name) == canon
+                                }) {
                                     scope_stack.truncate(pos);
                                 } else {
                                     scope_stack.pop();
@@ -926,7 +994,7 @@ pub(super) fn extract_all_lean_theorems(
                             if cur >= n || chars[cur] == '\n' {
                                 break;
                             }
-                            let (tok, after_tok) = read_dotted_ident(cur, n);
+                            let (tok, after_tok) = scan_dotted_name(cur, n);
                             if tok.is_empty() {
                                 break;
                             }
@@ -982,27 +1050,18 @@ pub(super) fn extract_all_lean_theorems(
                 while i < n && chars[i].is_whitespace() {
                     i += 1;
                 }
-                let name_start = i;
-                while i < n && (is_ident_continue(chars[i]) || chars[i] == '.') {
-                    i += 1;
-                }
-                if i == name_start {
+                let (raw_decl_name, next_i) = scan_dotted_name(i, n);
+                if raw_decl_name.is_empty() {
                     continue;
                 }
-                let raw_decl_name: String = chars[name_start..i].iter().collect();
-                let (decl_name, qualified_name) =
-                    if let Some(root_stripped) = raw_decl_name.strip_prefix("_root_.") {
-                        (root_stripped.to_string(), root_stripped.to_string())
-                    } else {
-                        let q = scope_stack
-                            .iter()
-                            .filter(|(k, _)| *k == LexScopeKind::Namespace)
-                            .map(|(_, s)| s.as_str())
-                            .chain(std::iter::once(raw_decl_name.as_str()))
-                            .collect::<Vec<_>>()
-                            .join(".");
-                        (raw_decl_name, q)
-                    };
+                i = next_i;
+                let qualified_name =
+                    crate::splitter::qualified_decl_name(&raw_decl_name, &scope_stack);
+                let decl_name = if let Some(root_stripped) = raw_decl_name.strip_prefix("_root_.") {
+                    crate::splitter::canonicalize_lean_name(root_stripped)
+                } else {
+                    raw_decl_name
+                };
 
                 let mut binders = Vec::new();
                 let mut instance_binders = Vec::new();
@@ -1029,7 +1088,7 @@ pub(super) fn extract_all_lean_theorems(
                     if i >= n {
                         break;
                     }
-                    if let Some(end) = skip_at(i) {
+                    if let Some(end) = skip_any_lexeme_at(i) {
                         i = end;
                         continue;
                     }
@@ -1054,7 +1113,7 @@ pub(super) fn extract_all_lean_theorems(
                         let mut depth = 1usize;
                         let mut closed = false;
                         while i < n && depth > 0 {
-                            if let Some(end) = skip_at(i) {
+                            if let Some(end) = skip_any_lexeme_at(i) {
                                 i = end;
                                 continue;
                             }
@@ -1135,7 +1194,7 @@ pub(super) fn extract_all_lean_theorems(
                 let mut in_stmt_match = false;
                 let mut stmt_end = n;
                 while i < n {
-                    if let Some(end) = skip_at(i) {
+                    if let Some(end) = skip_any_lexeme_at(i) {
                         i = end;
                         continue;
                     }
@@ -1202,6 +1261,22 @@ pub(super) fn extract_all_lean_theorems(
                     }
                     i += 1;
                 }
+                let raw_decl_name_shadow = crate::splitter::split_lean_name_components(&decl_name)
+                    .into_iter()
+                    .map(|s| {
+                        s.strip_prefix('«')
+                            .and_then(|r| r.strip_suffix('»'))
+                            .unwrap_or(s)
+                    })
+                    .any(is_reserved_shadow_ident)
+                    || crate::splitter::split_lean_name_components(&qualified_name)
+                        .into_iter()
+                        .map(|s| {
+                            s.strip_prefix('«')
+                                .and_then(|r| r.strip_suffix('»'))
+                                .unwrap_or(s)
+                        })
+                        .any(is_reserved_shadow_ident);
                 let prop_str: String = chars[stmt_start..stmt_end].iter().collect();
                 let (trimmed, let_ok) = inline_stmt_let_bindings_checked(prop_str.trim());
                 let abbrev_valid = !file_scope.scope.has_word256_abbrev
@@ -1212,8 +1287,6 @@ pub(super) fn extract_all_lean_theorems(
                                 "LeanNative.Backend.FastCheck" | "TurboLean.FastCheck"
                             )
                         }));
-                let decl_name_shadow = decl_name.split('.').any(is_reserved_shadow_ident)
-                    || qualified_name.split('.').any(is_reserved_shadow_ident);
                 let mut open_namespaces: Vec<String> =
                     open_stack.iter().map(|(_, ns)| ns.clone()).collect();
                 for ns in std::mem::take(&mut transient_opens) {
@@ -1222,10 +1295,10 @@ pub(super) fn extract_all_lean_theorems(
                     }
                 }
                 let mut enclosing_namespaces: Vec<String> = Vec::new();
-                let ns_segs: Vec<&str> = scope_stack
+                let ns_segs: Vec<String> = scope_stack
                     .iter()
-                    .filter(|(k, _)| *k == LexScopeKind::Namespace)
-                    .map(|(_, s)| s.as_str())
+                    .filter(|f| matches!(f.kind, crate::splitter::ScopeKind::Namespace))
+                    .map(|f| crate::splitter::canonical_lean_name_component(&f.name))
                     .collect();
                 for len in 1..=ns_segs.len() {
                     let prefix = ns_segs[..len].join(".");
@@ -1243,15 +1316,20 @@ pub(super) fn extract_all_lean_theorems(
                 let decl_trusted = file_elab_trusted
                     && file_scope.trusted_shadow_ok
                     && abbrev_valid
-                    && !decl_name_shadow
+                    && !raw_decl_name_shadow
                     && header_trusted
                     && let_ok
                     && !trimmed.contains(';')
                     && instance_binders.is_empty()
                     && !trimmed.is_empty();
+                let report_name = if qualified_name.is_empty() {
+                    decl_name
+                } else {
+                    qualified_name.clone()
+                };
                 if !trimmed.is_empty() {
                     all_decls.push(ExtractedDecl {
-                        name: decl_name,
+                        name: report_name,
                         qualified_name,
                         binders,
                         instance_binders,
@@ -3145,7 +3223,7 @@ pub(crate) fn extract_decls_fast_for_path(
 }
 
 /// Schema version for the Blake3 content-addressed `audit-spec` per-file JSON cache.
-pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 13;
+pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 15;
 
 static AUDIT_SPEC_CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
@@ -4097,5 +4175,40 @@ end N
         assert_eq!(nmb.len(), 1);
         assert_eq!(nmb[0].qualified_name, "N.M.b");
         assert_eq!(extract_all_lean_theorems(src, Some("b")).len(), 1);
+    }
+
+    #[test]
+    fn audit_spec_qualifies_namespaced_theorems_and_filters() {
+        let src = r#"
+namespace A
+section Hidden
+def msg := "
+end A
+"
+theorem bad (n : Nat) : True := by trivial
+theorem «good.one» (n : Nat) : n + 0 = n := by simp
+end Hidden
+end A
+theorem bad (n : Nat) : n = n := by rfl
+"#;
+        let all = extract_decls_fast(src, None);
+        assert_eq!(
+            all.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            ["A.bad", "A.«good.one»", "bad"]
+        );
+        let a_bad = audit_spec_file_or_source(Path::new("NsAudit.lean"), Some(src), Some("A.bad"));
+        assert_eq!(a_bad["ok"].as_bool(), Some(false));
+        assert_eq!(a_bad["total_specs_audited"].as_u64(), Some(1));
+        assert_eq!(a_bad["trivial_specs"].as_u64(), Some(1));
+
+        let root_bad =
+            audit_spec_file_or_source(Path::new("NsAudit.lean"), Some(src), Some("_root_.bad"));
+        assert_eq!(root_bad["total_specs_audited"].as_u64(), Some(1));
+        assert_eq!(root_bad["specs"][0]["decl"].as_str(), Some("bad"));
+
+        let good =
+            audit_spec_file_or_source(Path::new("NsAudit.lean"), Some(src), Some("A.«good.one»"));
+        assert_eq!(good["ok"].as_bool(), Some(true));
+        assert_eq!(good["total_specs_audited"].as_u64(), Some(1));
     }
 }

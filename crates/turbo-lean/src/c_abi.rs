@@ -1330,10 +1330,8 @@ pub fn synthesize_farkas_nat_weights(
 
     // 2. Pairwise combinations k1 * e_i + k2 * e_j Ordered by L1 norm (k1 + k2 <= 16)
     for l1_sum in 2..=16u64 {
-        for a_pos in 0..active_idx.len() {
-            let i = active_idx[a_pos];
-            for b_pos in (a_pos + 1)..active_idx.len() {
-                let j = active_idx[b_pos];
+        for (a_pos, &i) in active_idx.iter().enumerate() {
+            for &j in &active_idx[(a_pos + 1)..] {
                 for k1 in 1..l1_sum {
                     let k2 = l1_sum - k1;
                     let cost = (k1 as u128)
@@ -1358,6 +1356,7 @@ pub fn synthesize_farkas_nat_weights(
     let act_rhs: Vec<u64> = active_idx.iter().map(|&i| rhs[i]).collect();
     let act_m = active_idx.len();
 
+    #[allow(clippy::too_many_arguments)]
     fn dfs_farkas(
         idx: usize,
         m: usize,
@@ -1396,11 +1395,9 @@ pub fn synthesize_farkas_nat_weights(
             }
         }
         let b_i = rhs[idx] as u128;
-        let max_wi_by_bound = if b_i == 0 {
-            rem_l1
-        } else {
-            (rem_bound / b_i).min(rem_l1 as u128) as u64
-        };
+        let max_wi_by_bound = rem_bound
+            .checked_div(b_i)
+            .map_or(rem_l1, |q| q.min(rem_l1 as u128) as u64);
         let max_wi = max_wi_by_bound.min(16);
         let target_exact = idx + 1 == m;
         let start_wi = if target_exact { rem_l1 } else { 0 };
@@ -1410,9 +1407,9 @@ pub fn synthesize_farkas_nat_weights(
         for wi in start_wi..=max_wi {
             cur_w[idx] = wi;
             if wi > 0 {
-                for j in 0..n {
+                for (j, col_sum) in col_sums.iter_mut().enumerate().take(n) {
                     let a_ij = matrix[idx].get(j).copied().unwrap_or(0) as u128;
-                    col_sums[j] = col_sums[j].saturating_add((wi as u128) * a_ij);
+                    *col_sum = col_sum.saturating_add((wi as u128) * a_ij);
                 }
             }
             let next_bound = rem_bound - (wi as u128) * b_i;
@@ -1432,9 +1429,9 @@ pub fn synthesize_farkas_nat_weights(
                 return true;
             }
             if wi > 0 {
-                for j in 0..n {
+                for (j, col_sum) in col_sums.iter_mut().enumerate().take(n) {
                     let a_ij = matrix[idx].get(j).copied().unwrap_or(0) as u128;
-                    col_sums[j] -= (wi as u128) * a_ij;
+                    *col_sum -= (wi as u128) * a_ij;
                 }
             }
             cur_w[idx] = 0;

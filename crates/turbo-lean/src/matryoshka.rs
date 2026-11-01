@@ -4,6 +4,7 @@
 //! Supports both:
 //!   * `fractal-trm-matryoshka-v4` full payloads (`int8_q8_tensors` with RFC 1950 `zlib_b64`), and
 //!   * `fractal-trm-matryoshka-v4-s0s1` compact payloads (`int8_q8_raw_tensors` raw base64 Q8),
+//!
 //! with a compact embedded Stage-0 fallback (`matryoshka_s0_weights.json`, `include_str!`) so
 //! sub-10-us premise affinity & vacuity scoring still work when `matryoshka_weights.nvfp4.json`
 //! is absent on disk. External paths (`MAXWELL_MATRYOSHKA_WEIGHTS`, sibling `maxwell/training/`,
@@ -48,12 +49,18 @@ fn rms_norm(vec: &[f32]) -> Vec<f32> {
 }
 
 /// Row-major matvec `out[0..c_use] = x[0..r_use] @ w_flat` (`rows x cols` full shape).
-fn matvec_rowmajor(x: &[f32], w_flat: &[f32], rows: usize, cols: usize, r_use: usize, c_use: usize) -> Vec<f32> {
+fn matvec_rowmajor(
+    x: &[f32],
+    w_flat: &[f32],
+    rows: usize,
+    cols: usize,
+    r_use: usize,
+    c_use: usize,
+) -> Vec<f32> {
     let mut out = vec![0.0f32; c_use];
     let r_lim = r_use.min(rows).min(x.len());
     let c_lim = c_use.min(cols);
-    for i in 0..r_lim {
-        let xi = x[i];
+    for (i, &xi) in x.iter().enumerate().take(r_lim) {
         if xi == 0.0 {
             continue;
         }
@@ -124,10 +131,8 @@ pub fn parse_lean_stmt_features(decl_name: &str, stmt_src: &str) -> LeanStmtFeat
             ')' | ']' | '}' | '⟩' => {
                 cur_depth = cur_depth.saturating_sub(1).max(1);
             }
-            ':' => {
-                if cur_depth == 1 && idx > 0 && bytes[idx - 1] != ':' {
-                    in_sig = false;
-                }
+            ':' if cur_depth == 1 && idx > 0 && bytes[idx - 1] != ':' => {
+                in_sig = false;
             }
             _ => {}
         }
@@ -167,16 +172,18 @@ pub fn parse_lean_stmt_features(decl_name: &str, stmt_src: &str) -> LeanStmtFeat
             continue;
         }
         let first = tok.chars().next().unwrap_or('_');
-        if tok.contains('.') || first.is_uppercase() {
-            if !stmt_consts.iter().any(|c| c == &tok) {
-                stmt_consts.push(tok);
-            }
+        if (tok.contains('.') || first.is_uppercase()) && !stmt_consts.iter().any(|c| c == &tok) {
+            stmt_consts.push(tok);
         }
     }
     let stmt_consts_count = stmt_consts.len().max(1);
     stmt_consts.truncate(24);
     LeanStmtFeatures {
-        decl: if decl_name.is_empty() { "anon".to_string() } else { decl_name.to_string() },
+        decl: if decl_name.is_empty() {
+            "anon".to_string()
+        } else {
+            decl_name.to_string()
+        },
         stmt_nodes,
         stmt_depth: max_depth.max(2),
         num_binders,
@@ -220,7 +227,9 @@ fn contains_tactic_pair(low: &str, first: &str, second: &str) -> bool {
 pub fn extract_tactic_skeleton(body_src: &str) -> String {
     let b = body_src.trim();
     let low = b.to_ascii_lowercase();
-    if contains_tactic_ident(&low, "structural_induction") || contains_tactic_ident(&low, "induction") {
+    if contains_tactic_ident(&low, "structural_induction")
+        || contains_tactic_ident(&low, "induction")
+    {
         return "structural_induction".to_string();
     }
     if contains_tactic_ident(&low, "cut_lemma") || contains_tactic_ident(&low, "have") {
@@ -337,7 +346,10 @@ impl Q8Tensor {
             .iter()
             .map(|b| (*b as i8) as f32 * spec.q8_scale)
             .collect();
-        Some(Self { shape: spec.shape.clone(), values })
+        Some(Self {
+            shape: spec.shape.clone(),
+            values,
+        })
     }
 }
 
@@ -395,7 +407,11 @@ impl QuantizedMatryoshkaRuntime {
             return None;
         }
         let mut tensors: HashMap<String, Q8Tensor> = HashMap::new();
-        for (name, spec) in payload.int8_q8_raw_tensors.iter().chain(payload.int8_q8_tensors.iter()) {
+        for (name, spec) in payload
+            .int8_q8_raw_tensors
+            .iter()
+            .chain(payload.int8_q8_tensors.iter())
+        {
             if let Some(t) = Q8Tensor::from_spec(spec) {
                 tensors.insert(name.clone(), t);
             }
@@ -429,9 +445,13 @@ impl QuantizedMatryoshkaRuntime {
 
     fn pool_ngrams(&self, tokens: &[String], slice_mode: &str) -> Vec<f32> {
         let table = if slice_mode == "s0" {
-            self.tensors.get("ngram_table_s0_4096x4").or_else(|| self.tensors.get("ngram_table_8192x8"))
+            self.tensors
+                .get("ngram_table_s0_4096x4")
+                .or_else(|| self.tensors.get("ngram_table_8192x8"))
         } else {
-            self.tensors.get("ngram_table_8192x8").or_else(|| self.tensors.get("ngram_table_s0_4096x4"))
+            self.tensors
+                .get("ngram_table_8192x8")
+                .or_else(|| self.tensors.get("ngram_table_s0_4096x4"))
         };
         let Some(table) = table else {
             return Vec::new();
@@ -460,28 +480,60 @@ impl QuantizedMatryoshkaRuntime {
             let b = (h % (num_buckets as u64)) as usize;
             let w = sign * inv_sqrt;
             let base = b * table_d;
-            for d in 0..table_d {
-                out[d] += w * table.values[base + d];
+            for (d, dst) in out.iter_mut().enumerate().take(table_d) {
+                *dst += w * table.values[base + d];
             }
         }
         out
     }
 
-    pub fn encode_latent(&self, tokens: &[String], num_feats: &[f32], slice_mode: &str) -> Vec<f32> {
-        let effective_mode = if slice_mode == "s1" && !self.tensors.contains_key("ngram_table_8192x8") {
-            "s0"
+    pub fn encode_latent(
+        &self,
+        tokens: &[String],
+        num_feats: &[f32],
+        slice_mode: &str,
+    ) -> Vec<f32> {
+        let effective_mode =
+            if slice_mode == "s1" && !self.tensors.contains_key("ngram_table_8192x8") {
+                "s0"
+            } else {
+                slice_mode
+            };
+        let (d_m, d_h, t_d, steps) = if effective_mode == "s0" {
+            (16, 32, 4, 1)
         } else {
-            slice_mode
+            (32, 64, 8, 4)
         };
-        let (d_m, d_h, t_d, steps) = if effective_mode == "s0" { (16, 32, 4, 1) } else { (32, 64, 8, 4) };
         let x_ng_low = self.pool_ngrams(tokens, effective_mode);
-        let Some(w_ng) = self.tensors.get("W_ng_proj") else { return Vec::new() };
-        let Some(w_num) = self.tensors.get("W_num") else { return Vec::new() };
-        let Some(w1) = self.tensors.get("W1") else { return Vec::new() };
-        let Some(w2) = self.tensors.get("W2") else { return Vec::new() };
+        let Some(w_ng) = self.tensors.get("W_ng_proj") else {
+            return Vec::new();
+        };
+        let Some(w_num) = self.tensors.get("W_num") else {
+            return Vec::new();
+        };
+        let Some(w1) = self.tensors.get("W1") else {
+            return Vec::new();
+        };
+        let Some(w2) = self.tensors.get("W2") else {
+            return Vec::new();
+        };
 
-        let x_ng = matvec_rowmajor(&x_ng_low, &w_ng.values, w_ng.shape[0], w_ng.shape[1], t_d, d_m);
-        let x_num = matvec_rowmajor(num_feats, &w_num.values, w_num.shape[0], w_num.shape[1], 8, d_m);
+        let x_ng = matvec_rowmajor(
+            &x_ng_low,
+            &w_ng.values,
+            w_ng.shape[0],
+            w_ng.shape[1],
+            t_d,
+            d_m,
+        );
+        let x_num = matvec_rowmajor(
+            num_feats,
+            &w_num.values,
+            w_num.shape[0],
+            w_num.shape[1],
+            8,
+            d_m,
+        );
         let mut x0 = vec![0.0f32; d_m];
         for i in 0..d_m {
             x0[i] = x_ng[i] + x_num[i];
@@ -489,7 +541,11 @@ impl QuantizedMatryoshkaRuntime {
 
         let mut z = x0.clone();
         let mut y = x0.clone();
-        let mudd = self.biases.get("mudd_alpha").cloned().unwrap_or_else(|| vec![0.65, 0.35]);
+        let mudd = self
+            .biases
+            .get("mudd_alpha")
+            .cloned()
+            .unwrap_or_else(|| vec![0.65, 0.35]);
         let alpha0 = mudd.first().copied().unwrap_or(0.65);
         let alpha1 = mudd.get(1).copied().unwrap_or(0.35);
 
@@ -535,7 +591,11 @@ impl QuantizedMatryoshkaRuntime {
         tokens.push(format!("NB:{}", feats.num_binders.min(8)));
         tokens.push(format!("SN:{}", (feats.stmt_nodes / 25).min(8)));
         for sc in &feats.stmt_consts {
-            tokens.extend(sc.split('.').filter(|p| !p.is_empty()).map(|p| p.to_string()));
+            tokens.extend(
+                sc.split('.')
+                    .filter(|p| !p.is_empty())
+                    .map(|p| p.to_string()),
+            );
         }
         if let Some(extra) = goal_tokens_extra {
             tokens.extend(extra.iter().filter(|t| !t.is_empty()).cloned());
@@ -546,9 +606,21 @@ impl QuantizedMatryoshkaRuntime {
             ((feats.stmt_consts_count.max(1) as f32) + 1.0).ln() / 6.0,
             ((feats.num_binders as f32) + 1.0).ln() / 4.0,
             if gh == "Eq" { 1.0 } else { 0.0 },
-            if matches!(gh, "And" | "Exists" | "Iff") { 1.0 } else { 0.0 },
-            if matches!(gh, "LE.le" | "LT.lt" | "Not") { 1.0 } else { 0.0 },
-            if feats.decl.contains("InitE.source") { 1.0 } else { 0.0 },
+            if matches!(gh, "And" | "Exists" | "Iff") {
+                1.0
+            } else {
+                0.0
+            },
+            if matches!(gh, "LE.le" | "LT.lt" | "Not") {
+                1.0
+            } else {
+                0.0
+            },
+            if feats.decl.contains("InitE.source") {
+                1.0
+            } else {
+                0.0
+            },
         ];
         let y_out = self.encode_latent(&tokens, &num_feats, slice_mode);
         (feats, tokens, y_out)
@@ -562,13 +634,15 @@ impl QuantizedMatryoshkaRuntime {
         constant: &str,
     ) -> f32 {
         let mut sc_val = 0.0f32;
-        if let (Some(&col), Some(w_prem)) = (self.vocab_idx.get(constant), self.tensors.get("W_prem")) {
+        if let (Some(&col), Some(w_prem)) =
+            (self.vocab_idx.get(constant), self.tensors.get("W_prem"))
+        {
             let cols = w_prem.shape[1];
             if col < cols {
                 let mut dot = 0.0f32;
                 let r_lim = y_out.len().min(w_prem.shape[0]);
-                for i in 0..r_lim {
-                    dot += y_out[i] * w_prem.values[i * cols + col];
+                for (i, &yi) in y_out.iter().enumerate().take(r_lim) {
+                    dot += yi * w_prem.values[i * cols + col];
                 }
                 let bias = self
                     .biases
@@ -604,10 +678,21 @@ impl QuantizedMatryoshkaRuntime {
             self.encode_goal_tokens_and_latent(decl_name, stmt_src, goal_tokens_extra, slice_mode);
         let d_m = y_out.len();
 
-        let mut cost_pred = vec![0.0f32; 4];
+        let mut cost_pred = [0.0f32; 4];
         if let Some(w_cost) = self.tensors.get("W_cost") {
-            let b_cost = self.biases.get("b_cost").cloned().unwrap_or_else(|| vec![0.0; 4]);
-            let raw = matvec_rowmajor(&y_out, &w_cost.values, w_cost.shape[0], w_cost.shape[1], d_m, 4);
+            let b_cost = self
+                .biases
+                .get("b_cost")
+                .cloned()
+                .unwrap_or_else(|| vec![0.0; 4]);
+            let raw = matvec_rowmajor(
+                &y_out,
+                &w_cost.values,
+                w_cost.shape[0],
+                w_cost.shape[1],
+                d_m,
+                4,
+            );
             for k in 0..4 {
                 cost_pred[k] = raw[k] + b_cost.get(k).copied().unwrap_or(0.0);
             }
@@ -616,18 +701,33 @@ impl QuantizedMatryoshkaRuntime {
 
         let mut vac_logit = 0.0f32;
         if let Some(w_vac) = self.tensors.get("W_vacuity") {
-            let b_vac = self.biases.get("b_vacuity").and_then(|v| v.first()).copied().unwrap_or(0.0);
-            vac_logit = matvec_rowmajor(&y_out, &w_vac.values, w_vac.shape[0], w_vac.shape[1], d_m, 1)
-                .first()
+            let b_vac = self
+                .biases
+                .get("b_vacuity")
+                .and_then(|v| v.first())
                 .copied()
-                .unwrap_or(0.0)
+                .unwrap_or(0.0);
+            vac_logit = matvec_rowmajor(
+                &y_out,
+                &w_vac.values,
+                w_vac.shape[0],
+                w_vac.shape[1],
+                d_m,
+                1,
+            )
+            .first()
+            .copied()
+            .unwrap_or(0.0)
                 + b_vac;
         }
         let mut vac_prob = sigmoid(vac_logit);
         let low_stmt = stmt_src.to_ascii_lowercase();
         let low_decl = decl_name.to_ascii_lowercase();
         let goal_tail = stmt_src.rsplit(':').next().unwrap_or(stmt_src);
-        if goal_tail.contains("true") && !low_stmt.contains("= true") && !low_stmt.contains("== true") {
+        if goal_tail.contains("true")
+            && !low_stmt.contains("= true")
+            && !low_stmt.contains("== true")
+        {
             vac_prob = vac_prob.max(0.78);
         }
         if low_decl.contains("buggy") || low_decl.contains("vacuous") {
@@ -636,15 +736,36 @@ impl QuantizedMatryoshkaRuntime {
 
         let mut skel_scores: HashMap<String, f32> = HashMap::new();
         if let Some(w_skel) = self.tensors.get("W_skel") {
-            let b_skel = self.biases.get("b_skel").cloned().unwrap_or_else(|| vec![0.0; w_skel.shape[1]]);
-            let raw = matvec_rowmajor(&y_out, &w_skel.values, w_skel.shape[0], w_skel.shape[1], d_m, w_skel.shape[1]);
-            for (k, cls_name) in self.skeleton_classes.iter().take(w_skel.shape[1]).enumerate() {
-                skel_scores.insert(cls_name.clone(), raw[k] + b_skel.get(k).copied().unwrap_or(0.0));
+            let b_skel = self
+                .biases
+                .get("b_skel")
+                .cloned()
+                .unwrap_or_else(|| vec![0.0; w_skel.shape[1]]);
+            let raw = matvec_rowmajor(
+                &y_out,
+                &w_skel.values,
+                w_skel.shape[0],
+                w_skel.shape[1],
+                d_m,
+                w_skel.shape[1],
+            );
+            for (k, cls_name) in self
+                .skeleton_classes
+                .iter()
+                .take(w_skel.shape[1])
+                .enumerate()
+            {
+                skel_scores.insert(
+                    cls_name.clone(),
+                    raw[k] + b_skel.get(k).copied().unwrap_or(0.0),
+                );
             }
         }
         let mut top_skeletons: Vec<String> = skel_scores.keys().cloned().collect();
         top_skeletons.sort_by(|a, b| {
-            skel_scores[b].partial_cmp(&skel_scores[a]).unwrap_or(std::cmp::Ordering::Equal)
+            skel_scores[b]
+                .partial_cmp(&skel_scores[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         let mut ranked_avail: Vec<(String, f32)> = Vec::new();
@@ -664,12 +785,16 @@ impl QuantizedMatryoshkaRuntime {
 
         GoalEval {
             slice_mode: slice_mode.to_string(),
-            pred_add_decl_us: ((cost_pred[0].clamp(0.0, 14.0)).exp_m1() * 100.0).round() as f64 / 100.0,
+            pred_add_decl_us: ((cost_pred[0].clamp(0.0, 14.0)).exp_m1() * 100.0).round() as f64
+                / 100.0,
             pred_heartbeats: (cost_pred[1].clamp(0.0, 14.0)).exp_m1().round() as i64,
             pred_proof_nodes: (cost_pred[2].clamp(0.0, 14.0)).exp_m1().round() as i64,
             survival_permille: (surv_prob * 1000.0).round() as i64,
             vacuity_hazard_permille: (vac_prob * 1000.0).round() as i64,
-            top_skeleton: top_skeletons.first().cloned().unwrap_or_else(|| "simp_only".to_string()),
+            top_skeleton: top_skeletons
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "simp_only".to_string()),
             top_skeletons: top_skeletons.into_iter().take(4).collect(),
             skeleton_logits: skel_scores,
             ranked_available_constants: ranked_avail.iter().map(|(c, _)| c.clone()).collect(),
@@ -690,7 +815,8 @@ impl QuantizedMatryoshkaRuntime {
         if c.is_empty() {
             return Some(0.0);
         }
-        let (_feats, tokens, y_out) = self.encode_goal_tokens_and_latent("anon", stmt_src, None, "s0");
+        let (_feats, tokens, y_out) =
+            self.encode_goal_tokens_and_latent("anon", stmt_src, None, "s0");
         Some(self.score_candidate_from_latent(stmt_src, &tokens, &y_out, c))
     }
 
@@ -698,7 +824,10 @@ impl QuantizedMatryoshkaRuntime {
         if !self.ready() {
             return None;
         }
-        Some(self.evaluate_lean_goal(decl_name, stmt_src, None, None, "s0").vacuity_hazard_permille)
+        Some(
+            self.evaluate_lean_goal(decl_name, stmt_src, None, None, "s0")
+                .vacuity_hazard_permille,
+        )
     }
 }
 
@@ -711,7 +840,7 @@ fn candidate_weight_paths() -> Vec<PathBuf> {
             out.push(PathBuf::from(p));
         }
     }
-    if let Some(exe) = std::env::current_exe().ok() {
+    if let Ok(exe) = std::env::current_exe() {
         let mut dir = exe.parent().map(|p| p.to_path_buf());
         for _ in 0..6 {
             if let Some(d) = dir {
@@ -731,7 +860,9 @@ fn candidate_weight_paths() -> Vec<PathBuf> {
             }
         }
     }
-    out.push(PathBuf::from("/usr/local/share/maxwell/training/matryoshka_weights.nvfp4.json"));
+    out.push(PathBuf::from(
+        "/usr/local/share/maxwell/training/matryoshka_weights.nvfp4.json",
+    ));
     out
 }
 
@@ -751,7 +882,10 @@ pub fn global_matryoshka_runtime() -> Option<&'static QuantizedMatryoshkaRuntime
             for path in candidate_weight_paths() {
                 if path.is_file() {
                     if let Ok(text) = std::fs::read_to_string(&path) {
-                        if let Some(rt) = QuantizedMatryoshkaRuntime::from_json_str(&text, &path.display().to_string()) {
+                        if let Some(rt) = QuantizedMatryoshkaRuntime::from_json_str(
+                            &text,
+                            &path.display().to_string(),
+                        ) {
                             if rt.ready() {
                                 return Some(rt);
                             }
@@ -808,7 +942,11 @@ struct BitReader<'a> {
 
 impl<'a> BitReader<'a> {
     fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0, bit: 0 }
+        Self {
+            data,
+            pos: 0,
+            bit: 0,
+        }
     }
     fn read_bits(&mut self, n: u32) -> Option<u32> {
         if n == 0 {
@@ -909,7 +1047,7 @@ pub fn inflate_zlib(data: &[u8]) -> Option<Vec<u8>> {
     if cmf & 0x0F != 8 {
         return None;
     }
-    if (((cmf as u16) << 8) | flg as u16) % 31 != 0 {
+    if !(((cmf as u16) << 8) | flg as u16).is_multiple_of(31) {
         return None;
     }
     if flg & 0x20 != 0 {
@@ -972,15 +1110,11 @@ pub fn inflate_zlib(data: &[u8]) -> Option<Vec<u8>> {
                             }
                             17 => {
                                 let rep = 3 + br.read_bits(3)? as usize;
-                                for _ in 0..rep {
-                                    lengths.push(0);
-                                }
+                                lengths.extend(std::iter::repeat_n(0, rep));
                             }
                             18 => {
                                 let rep = 11 + br.read_bits(7)? as usize;
-                                for _ in 0..rep {
-                                    lengths.push(0);
-                                }
+                                lengths.extend(std::iter::repeat_n(0, rep));
                             }
                             _ => return None,
                         }
@@ -1007,7 +1141,8 @@ pub fn inflate_zlib(data: &[u8]) -> Option<Vec<u8>> {
                         if dsym >= 30 {
                             return None;
                         }
-                        let dist = DIST_BASE[dsym] as usize + br.read_bits(DIST_EXTRA[dsym])? as usize;
+                        let dist =
+                            DIST_BASE[dsym] as usize + br.read_bits(DIST_EXTRA[dsym])? as usize;
                         if dist > out.len() {
                             return None;
                         }
@@ -1086,7 +1221,13 @@ mod tests {
         assert!(ev.vacuity_hazard_permille >= 0 && ev.vacuity_hazard_permille <= 1000);
         assert_eq!(ev.ranked_available_scores.len(), 2);
         assert!(ev.ranked_available_scores[0].1 >= ev.ranked_available_scores[1].1);
-        let buggy = rt.evaluate_lean_goal("buggy_vacuous_theorem", "theorem buggy : True", None, None, "s0");
+        let buggy = rt.evaluate_lean_goal(
+            "buggy_vacuous_theorem",
+            "theorem buggy : True",
+            None,
+            None,
+            "s0",
+        );
         assert!(buggy.vacuity_hazard_permille >= 820);
         let sc = rt.score_constant_affinity(stmt, "Nat.add_comm").unwrap();
         assert!(sc.is_finite());
@@ -1108,7 +1249,11 @@ mod tests {
                 break;
             }
         }
-        assert!(best_us < 10.0, "cached S0 affinity should be <10us, got {:.3}us", best_us);
+        assert!(
+            best_us < 10.0,
+            "cached S0 affinity should be <10us, got {:.3}us",
+            best_us
+        );
     }
 
     #[test]
@@ -1135,7 +1280,10 @@ mod tests {
 
     #[test]
     fn test_extract_tactic_skeleton_distinguishes_dsimp_from_simp() {
-        assert_eq!(extract_tactic_skeleton("by dsimp only [Nat.add_zero]"), "dsimp_only");
+        assert_eq!(
+            extract_tactic_skeleton("by dsimp only [Nat.add_zero]"),
+            "dsimp_only"
+        );
         assert_eq!(extract_tactic_skeleton("by dsimp"), "dsimp_only");
         assert_eq!(
             extract_tactic_skeleton("by rcases h with ⟨a, b⟩; dsimp"),

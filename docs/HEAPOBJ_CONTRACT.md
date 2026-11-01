@@ -20,8 +20,8 @@ allocates a live `HeapObj` with `rc = 1`, but with #280's single flat `fields = 
 emits unguarded `isExclusive` / unloaded projections. `allocCtor` with **empty** field lists still calls
 `allocHeapCtor` and returns an `.objPtr` (a heap allocation with `rc = 1`), violating the fieldless-ctor exception of
 §C1.1. §8 column "today" records which clauses hold on `main` (**pass**: 12 of them flipped when #280 landed) and
-which are explicit **expected failures** (**XFAIL**). The remaining XFAILs are fixed by the 5b PR (#300), which must
-flip every one of them.
+which are explicit **expected failures** (**XFAIL**). The 5b PR (#300) flips 19 of the 20 remaining XFAILs to
+**pass**; `codegen_projection_guarded_field_load` stays XFAIL for the checker reason given in §8.
 
 ## Terminology
 
@@ -240,7 +240,7 @@ fail-closed gates (C4/C5 of P-cert), the `getCtorLayout` scalar-slot lowering, a
 ## 8. Clause → regression table
 
 All names refer to `-- REGRESSION(<name>)` markers in `lean/LeanNative/Tests/HeapObjContract.lean`.
-**pass** means the regression is a positive `#guard` that holds on `main` (2a8939e). **XFAIL** means it carries
+**pass** means the regression is a positive `#guard` that holds (on `main` 2a8939e, or with #300 where noted). **XFAIL** means it carries
 `-- XFAIL(heapobj-contract): flips in 5b` and asserts `main`'s wrong behaviour: first `#guard !<pred>` (named in the
 last column) on a contract predicate over the evaluator/emitter/validator, then optionally `#guard_msgs` pinning
 `main`'s output. When 5b (#300) fixes the defect, the xfail breaks the build until someone flips it.
@@ -256,8 +256,14 @@ one new `heapObjs` entry; release regressions require `.ok` with **no** live `He
 new allocation); and the RC-effect validator check also requires the decl with the `decRef` kept to validate.
 `nullary_ctor_is_immediate` was previously mislabelled **pass** (it only compared the end-state `rc` list, which
 holds even though `main` heap-allocates the nullary ctor); it now inspects the allocation result and heap and is
-XFAIL awaiting #300. The 20 remaining XFAILs await #300. Measured on `main` + #300 (adcd211) + this module, 19 of
-them flip, incl. `nullary_ctor_is_immediate` and the recalibrated `symtv_source_fuel_exhaustion_fails_closed`. The exception is `codegen_projection_guarded_field_load`: #300 emits
+XFAIL on `main`. Flipped by #300 (now **pass**, 19 of the 20 remaining XFAILs): `layout_scalar_slot_indexing`,
+`layout_ctorGetObj_out_of_objFields_is_error`, `layout_scalar_oob_is_error`, `nullary_ctor_is_immediate`,
+`codegen_box_u64_high_bit`, `codegen_box_usize_heap`, `codegen_box_float_heap`, `codegen_box_float32_heap`,
+`codegen_isExclusive_checks_tag_bit`, `codegen_unguarded_decl_rejected`, `codegen_nullary_ctor_boxed`,
+`wf_objFields_no_nested_tuple_ownership`, `del_shared_is_ub`, `del_exclusive_preserves_fields`,
+`ctor_set_out_of_bounds_is_error`, `ctor_set_nested_tuple_ownership_rejected`, `mutation_freed_is_error`,
+`symtv_fuel_exhaustion_fails_closed`, `symtv_source_fuel_exhaustion_fails_closed`. Their pinned `#guard_msgs` now
+show the contract output. The one remaining XFAIL is `codegen_projection_guarded_field_load`: #300 emits
 the guarded load at `P + 8`, but returns it through a slot whose store is in another basic block (`proj_heap_7` →
 `proj_cont_10`), and the conservative block-local reload rule (`IRCheck.Fn.reachingStore`) resolves that reload
 to `uninitOrigin`. That regression flips only once the emitter returns the loaded value without a cross-block
@@ -267,27 +273,27 @@ slot round-trip, or once the reload rule is made CFG-aware.
 |---|---|---|---|
 | C1.1 obj index space | `layout_ctorGetObj_indexes_objFields` | pass | — |
 | C1.1 scalar index space | `layout_scalar_only_ctor_indexes_scalarFields` | pass | — |
-| C1.1 scalar-slot indexing (mixed ctor) | `layout_scalar_slot_indexing` | XFAIL | `#guard !scalarSlotIndexing` |
-| C1.1 obj index bounded by `objFields` | `layout_ctorGetObj_out_of_objFields_is_error` | XFAIL | `#guard !objIndexBounded` |
+| C1.1 scalar-slot indexing (mixed ctor) | `layout_scalar_slot_indexing` | pass | — |
+| C1.1 obj index bounded by `objFields` | `layout_ctorGetObj_out_of_objFields_is_error` | pass | — |
 | C1.1 ctor with fields allocates a live `HeapObj`, `rc = 1` | `layout_alloc_live_rc_one` | pass | — |
-| C1.1 scalar index bounded by `scalarFields` | `layout_scalar_oob_is_error` | XFAIL | `#guard !scalarOOBBounded` |
+| C1.1 scalar index bounded by `scalarFields` | `layout_scalar_oob_is_error` | pass | — |
 | C1.1 reads of a freed object are `useAfterFree` | `layout_freed_read_is_error` | pass | — |
 | C1.2 Lean runtime offsets | `layout_lean_runtime_offsets` | pass | — |
 | C2.1 abstract boxing is identity incl. `2^63`; in-pointer range `[0, 2^63)` | `box_abstract_high_bit_roundtrip` | pass | — |
 | C2.1 `i1/i8/i16/i32` boxed in-pointer (returns `lean_box(x)`) | `codegen_box_small_scalar_in_pointer` | pass | — |
-| C2.1 `UInt64` boxed as heap scalar carrying the value (`2^63` regression) | `codegen_box_u64_high_bit` | XFAIL | `#guard !u64BoxIsHeap` |
-| C2.1 `USize` boxed as heap scalar carrying the value | `codegen_box_usize_heap` | XFAIL | `#guard !usizeBoxIsHeap` |
-| C2.1 `Float` boxed as heap scalar carrying the value | `codegen_box_float_heap` | XFAIL | `#guard !floatBoxIsHeap` |
-| C2.1 `Float32` boxed as heap scalar carrying the value | `codegen_box_float32_heap` | XFAIL | `#guard !float32BoxIsHeap` |
+| C2.1 `UInt64` boxed as heap scalar carrying the value (`2^63` regression) | `codegen_box_u64_high_bit` | pass | — |
+| C2.1 `USize` boxed as heap scalar carrying the value | `codegen_box_usize_heap` | pass | — |
+| C2.1 `Float` boxed as heap scalar carrying the value | `codegen_box_float_heap` | pass | — |
+| C2.1 `Float32` boxed as heap scalar carrying the value | `codegen_box_float32_heap` | pass | — |
 | C2.2 RC on immediates is a no-op | `tagged_immediate_rc_noop` | pass | — |
 | C2.2 `isExclusive` immediate | `tagged_immediate_isExclusive_true` | pass | — |
-| C1.1/C2.1 nullary ctor is immediate `.tuple [.u64 t]`, heap unchanged | `nullary_ctor_is_immediate` | XFAIL | `#guard !nullaryCtorImmediate` |
+| C1.1/C2.1 nullary ctor is immediate `.tuple [.u64 t]`, heap unchanged | `nullary_ctor_is_immediate` | pass | — |
 | C2.3 RC codegen checks tag bit | `codegen_rc_checks_tag_bit` | pass | — |
-| C2.3 `isExclusive` codegen checks tag bit (P-cert C5) | `codegen_isExclusive_checks_tag_bit` | XFAIL | `#guard !isExclusiveCodegenTagChecked` |
+| C2.3 `isExclusive` codegen checks tag bit (P-cert C5) | `codegen_isExclusive_checks_tag_bit` | pass | — |
 | C2.3 projection returns a guarded load from `P + 8 + 8·i` (structural) | `codegen_projection_guarded_field_load` | XFAIL | `#guard !projectionGuardedLoad` |
 | C2.3 fallback: tag reads with no lowering are rejected | `codegen_tag_read_rejected` | pass | — |
-| C2.3 fallback: a decl with an unguarded dereference is rejected | `codegen_unguarded_decl_rejected` | XFAIL | `#guard !isxDeclGuardedOrRejected` |
-| C2.1 nullary ctor emitted as `lean_box(t)` | `codegen_nullary_ctor_boxed` | XFAIL | `#guard !nullaryCtorCodegenBoxed` |
+| C2.3 fallback: a decl with an unguarded dereference is rejected | `codegen_unguarded_decl_rejected` | pass | — |
+| C2.1 nullary ctor emitted as `lean_box(t)` | `codegen_nullary_ctor_boxed` | pass | — |
 | C3.3 RC arithmetic over repeated decrements | `rc_repeated_edges_arith` | pass | — |
 | C3.3 freed / underflow is error | `decref_freed_or_underflow_is_error` | pass | — |
 | C3.2 repeated owning edges released | `rc_repeated_owning_edges_released` | pass | — |
@@ -296,7 +302,7 @@ slot round-trip, or once the reload rule is made CFG-aware.
 | C3.3 `incRef` on a freed object is `useAfterFree` | `incref_freed_is_error` | pass | — |
 | C3.4 / C5.1 P-cert C3 reproducer (100 edges) | `c3_100_owning_edges` | pass | — |
 | C5.3 fuel bound `B` exact (`B` ok, `B − 1` exhausts) on C3/chain/diamond/mixed | `fuel_bound_boundary` | pass | — |
-| C5.2 nested tuple ownership is ill-formed (`allocCtor` of a malformed `.tuple [.u64 0, .objPtr c]` field is `typeError`) | `wf_objFields_no_nested_tuple_ownership` | XFAIL | `#guard !nestedTupleOwnershipRejected` |
+| C5.2 nested tuple ownership is ill-formed (`allocCtor` of a malformed `.tuple [.u64 0, .objPtr c]` field is `typeError`) | `wf_objFields_no_nested_tuple_ownership` | pass | — |
 | C5.2 ctor-to-ctor nesting is well-formed and accepted | `wf_objFields_ctor_nesting_accepted` | pass | — |
 | C5.1 release path total-or-error (chain, every evaluator fuel 0..64) | `decref_chain_total_or_error` | pass | — |
 | C4.2 shared write is UB (sarray precedent) | `exclusive_write_sarray_shared_is_ub` | pass | — |
@@ -304,15 +310,15 @@ slot round-trip, or once the reload rule is made CFG-aware.
 | C4.1 `isExclusive` of a freed object is `useAfterFree` | `isExclusive_freed_is_error` | pass | — |
 | C4.2 shared `ctor_set` is UB | `ctor_set_shared_is_ub` | pass | — |
 | C4.2 exclusive `ctor_set` succeeds | `ctor_set_exclusive_ok` | pass | — |
-| C4.2 shared `del` is UB | `del_shared_is_ub` | XFAIL | `#guard !delSharedIsUB` |
-| C4.2 `ctor_set` / `del` on a freed object is `useAfterFree` | `mutation_freed_is_error` | XFAIL | `#guard !freedMutationIsUAF` |
-| C4.2 exclusive `del` frees the shell and preserves references owned by its fields | `del_exclusive_preserves_fields` | XFAIL | `#guard !delExclusivePreservesFields` |
-| C4.2 out-of-bounds `ctor_set` is `outOfBounds i (length objFields)` | `ctor_set_out_of_bounds_is_error` | XFAIL | `#guard !ctorSetOOBIsError` |
-| C5.2 via C4.2 `ctor_set` of a nested owning tuple is `typeError` | `ctor_set_nested_tuple_ownership_rejected` | XFAIL | `#guard !ctorSetNestedTupleRejected` |
+| C4.2 shared `del` is UB | `del_shared_is_ub` | pass | — |
+| C4.2 `ctor_set` / `del` on a freed object is `useAfterFree` | `mutation_freed_is_error` | pass | — |
+| C4.2 exclusive `del` frees the shell and preserves references owned by its fields | `del_exclusive_preserves_fields` | pass | — |
+| C4.2 out-of-bounds `ctor_set` is `outOfBounds i (length objFields)` | `ctor_set_out_of_bounds_is_error` | pass | — |
+| C5.2 via C4.2 `ctor_set` of a nested owning tuple is `typeError` | `ctor_set_nested_tuple_ownership_rejected` | pass | — |
 | C6 rejects wrong result | `symtv_rejects_wrong_result` | pass | — |
-| C6.1 fuel exhaustion ⇒ `passed = false` | `symtv_fuel_exhaustion_fails_closed` | XFAIL | `#guard !symtvFuelExhaustionFailsClosed` |
+| C6.1 fuel exhaustion ⇒ `passed = false` | `symtv_fuel_exhaustion_fails_closed` | pass | — |
 | C6.2 untracked RC effects ⇒ `passed = false` | `symtv_rc_effects_fail_closed` | pass | — |
-| C6.3 source evaluator-fuel exhaustion counts as failure, not source UB | `symtv_source_fuel_exhaustion_fails_closed` | XFAIL | `#guard !symtvSourceFuelExhaustionFailsClosed` |
+| C6.3 source evaluator-fuel exhaustion counts as failure, not source UB | `symtv_source_fuel_exhaustion_fails_closed` | pass | — |
 
 To flip an xfail in 5b:
 1. Replace `#guard !p` with `#guard p`.

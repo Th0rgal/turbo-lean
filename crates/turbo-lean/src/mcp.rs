@@ -161,10 +161,11 @@ pub fn derive_telemetry_project_id(dir: Option<&Path>) -> String {
         .unwrap_or_else(|| PathBuf::from("."));
     let canon = work_dir.canonicalize().unwrap_or(work_dir);
     let mut ident = canon.display().to_string();
-    if let Ok(out) = std::process::Command::new("git")
-        .args(["-C", &ident, "config", "--get", "remote.origin.url"])
-        .output()
-    {
+    if let Ok(out) = crate::trusted_tools::git(&canon).and_then(|mut git| {
+        git.args(["-C", &ident, "config", "--get", "remote.origin.url"])
+            .output()
+            .map_err(Into::into)
+    }) {
         if out.status.success() {
             let rem = String::from_utf8_lossy(&out.stdout)
                 .trim()
@@ -1329,35 +1330,29 @@ pub fn execute_fast_check(
                 guard_stmt(decl_name, stmt, f_path_opt),
             ));
         } else if let Some(f_str) = file.filter(|s| !s.trim().is_empty()) {
-            let f_path = Path::new(f_str);
-            match fs::read_to_string(f_path) {
+            let raw_path = Path::new(f_str);
+            let resolved_path = if raw_path.is_relative() {
+                project_dir
+                    .map(|pd| pd.join(raw_path))
+                    .unwrap_or_else(|| raw_path.to_path_buf())
+            } else {
+                raw_path.to_path_buf()
+            };
+            match fs::read_to_string(&resolved_path) {
                 Ok(src_text) => {
-                    let df = (!decl_name.is_empty()
-                        && !matches!(decl_name, "auto" | "fastcheck_decl"))
-                    .then_some(decl_name);
-                    let decls = crate::gpu_fastcheck::extract_decls_fast_for_path(
+                    let proj_root = project_dir
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| crate::lake_build::find_project_root(&resolved_path));
+                    let df =
+                        decl.filter(|d| !d.is_empty() && !matches!(*d, "auto" | "fastcheck_decl"));
+                    match crate::gpu_fastcheck::extract_confirmed_fastcheck_pairs(
                         &src_text,
                         df,
-                        Some(f_path),
-                        project_dir,
-                    );
-                    if decls.is_empty() {
-                        batch_pairs.push((decl_name.to_string(), untrusted_guard_src.clone()));
-                    } else {
-                        for d in decls {
-                            let decl_id = if d.qualified_name.is_empty() {
-                                d.name.clone()
-                            } else {
-                                d.qualified_name.clone()
-                            };
-                            let stmt_payload =
-                                if d.trusted_elab_context && d.instance_binders.is_empty() {
-                                    d.render_scoped_stmt_src()
-                                } else {
-                                    untrusted_guard_src.clone()
-                                };
-                            batch_pairs.push((decl_id, stmt_payload));
-                        }
+                        &proj_root,
+                        &resolved_path,
+                    ) {
+                        Ok(pairs) => batch_pairs = pairs,
+                        Err(e) => file_read_err = Some(format!("{:#}", e)),
                     }
                 }
                 Err(e) => {
@@ -1428,7 +1423,7 @@ pub fn execute_fast_check(
 }
 
 fn resolve_cli_bin() -> PathBuf {
-    let mut cli_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("turbo-lean"));
+    let mut cli_bin = std::env::current_exe().unwrap_or_default();
     if cli_bin.file_name().and_then(|s| s.to_str()) != Some("turbo-lean") {
         if let Some(parent_bin) = cli_bin
             .parent()

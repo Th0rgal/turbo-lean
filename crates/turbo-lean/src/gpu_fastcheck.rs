@@ -228,9 +228,17 @@ impl ExtractedDecl {
             .iter()
             .map(|(ns, ty)| format!("({} : {}) ", ns.join(" "), ty))
             .collect();
+        let short_name = match &enclosing {
+            Some(ns) => self
+                .name
+                .strip_prefix(ns.as_str())
+                .and_then(|r| r.strip_prefix('.'))
+                .unwrap_or(self.name.as_str()),
+            None => self.name.as_str(),
+        };
         out.push_str(&format!(
             "theorem {} {}: {}\n:= by sorry\n",
-            self.name, binders_prefix, self.prop_str
+            short_name, binders_prefix, self.prop_str
         ));
         if let Some(ref ns) = enclosing {
             out.push_str("end ");
@@ -2070,8 +2078,7 @@ pub(crate) fn transpile_lean_theorem_to_cuda_for_path(
     file: Option<&Path>,
     project_dir: Option<&Path>,
 ) -> Result<TranspiledCudaKernel> {
-    let clean = strip_lean_comments(lean_src);
-    let mut extracted = extract_lean_theorem(&clean, decl_name)?;
+    let mut extracted = extract_lean_theorem(lean_src, decl_name)?;
     audit_spec::enforce_decl_import_integrity_for_path(
         std::slice::from_mut(&mut extracted),
         file,
@@ -4597,7 +4604,7 @@ end TurboLean.FastCheck
             "subWithBorrow_zero_right",
         ] {
             let kernel = transpile_lean_theorem_to_cuda(lean_src, Some(decl)).unwrap();
-            assert_eq!(kernel.decl_name, decl);
+            assert_eq!(kernel.decl_name, format!("TurboLean.FastCheck.{decl}"));
             assert!(kernel
                 .cuda_source
                 .contains("__global__ void check_transpiled_theorem_kernel"));
@@ -5365,20 +5372,15 @@ pub fn run_tpu_fast_check(json: bool, file: &Path, decl_filter: Option<&str>) ->
     let t0 = Instant::now();
     let src_text =
         fs::read_to_string(file).with_context(|| format!("Failed to read {}", file.display()))?;
-    let eff_filter = match decl_filter {
-        Some(s) if !s.is_empty() && s != "auto" => Some(s),
-        _ => None,
-    };
-    let decls = audit_spec::extract_decls_fast_for_path(&src_text, eff_filter, Some(file), None);
-    if let Some(d) = decls.first() {
-        if !d.trusted_elab_context {
-            bail!(
-                "Untrusted elaboration context for `{}`: local/global instances, custom imports/defs/notations, or non-standard binders require kernel elaboration",
-                d.name
-            );
-        }
-    }
-    let kernel = transpile_lean_theorem_to_cuda_for_path(&src_text, eff_filter, Some(file), None)?;
+    let project_root = crate::lake_build::find_project_root(file);
+    let confirmed_decl =
+        confirm_single_fastcheck_decl(&src_text, decl_filter, &project_root, file)?;
+    let kernel = transpile_lean_theorem_to_cuda_for_path(
+        &src_text,
+        Some(confirmed_decl.as_str()),
+        Some(file),
+        Some(&project_root),
+    )?;
     let n_states = 262_144u64;
     let mut report = execute_transpiled_cuda_kernel(&kernel, n_states, false)?;
     let (certified, engine_ver, cert_details) =
@@ -5560,23 +5562,19 @@ pub fn run_fast_check_command(
     if let Some(decl_arg) = transpile_lean {
         let src_text = fs::read_to_string(&file)
             .with_context(|| format!("Failed to read {}", file.display()))?;
-        let decl_filter = if decl_arg.is_empty() || decl_arg == "auto" {
-            None
-        } else {
-            Some(decl_arg.as_str())
-        };
-        let decls_check =
-            audit_spec::extract_decls_fast_for_path(&src_text, decl_filter, Some(&file), None);
-        if let Some(d) = decls_check.first() {
-            if !d.trusted_elab_context {
-                bail!(
-                    "Untrusted elaboration context for `{}`: local/global instances, custom imports/defs/notations, or non-standard binders require kernel elaboration",
-                    d.name
-                );
-            }
-        }
-        let kernel =
-            transpile_lean_theorem_to_cuda_for_path(&src_text, decl_filter, Some(&file), None)?;
+        let project_root = crate::lake_build::find_project_root(&file);
+        let confirmed_decl = confirm_single_fastcheck_decl(
+            &src_text,
+            Some(decl_arg.as_str()),
+            &project_root,
+            &file,
+        )?;
+        let kernel = transpile_lean_theorem_to_cuda_for_path(
+            &src_text,
+            Some(confirmed_decl.as_str()),
+            Some(&file),
+            Some(&project_root),
+        )?;
         let n_states = if Path::new("/usr/local/cuda/bin/nvcc").exists() {
             10_000_000
         } else {
@@ -5797,8 +5795,33 @@ pub fn run_fast_check_command(
         let canon_file = file.canonicalize().unwrap_or_else(|_| file.clone());
         let src_text = fs::read_to_string(&canon_file)?;
         let cluster_batch = if !src_text.contains("def main") {
-            let decls =
-                audit_spec::extract_decls_fast_for_path(&src_text, None, Some(&canon_file), None);
+            let project_root = crate::lake_build::find_project_root(&canon_file);
+            let split = crate::splitter::split_lean_source(&src_text, &[]);
+            for shard in &split.shards {
+                crate::check::confirm_decl_identity(&src_text, shard, &project_root, &canon_file)?;
+            }
+            let file_decls = audit_spec::extract_decls_fast_for_path(
+                &src_text,
+                None,
+                Some(&canon_file),
+                Some(&project_root),
+            );
+            let decls: Vec<ExtractedDecl> = split
+                .shards
+                .iter()
+                .filter_map(|shard| {
+                    file_decls
+                        .iter()
+                        .find(|d| {
+                            audit_spec::decl_matches_requested_target(
+                                &d.name,
+                                &d.qualified_name,
+                                shard.decl_name(),
+                            )
+                        })
+                        .cloned()
+                })
+                .collect();
             let max_check = if src_text.contains("sorry") {
                 decls.len()
             } else {
@@ -5895,7 +5918,7 @@ pub fn run_fast_check_command(
                 }
                 let tc = crate::lake_build::detect_toolchain(&lean_dir);
                 let (mut env_vars, mut lean_bin_path) =
-                    crate::pack::resolve_server_lean_env_and_bin(store, &tc, "");
+                    crate::pack::resolve_server_lean_env_and_bin(store, &tc, "")?;
 
                 let pid = std::process::id();
                 let tmp_c = staging.join(format!("fastcheck_{}.c", pid));
@@ -5921,7 +5944,7 @@ pub fn run_fast_check_command(
                     if let Ok((lake_env, _)) = crate::lake_build::resolve_lake_env(store, &lean_dir)
                     {
                         lean_bin_path =
-                            PathBuf::from(crate::lake_build::lean_bin_from_env(&lake_env));
+                            PathBuf::from(crate::lake_build::resolve_lean_bin(&lean_dir)?);
                         env_vars = lake_env;
                     }
                     let compile_target = if has_main {
@@ -5945,15 +5968,8 @@ pub fn run_fast_check_command(
                     }
                 }
                 let _ = fs::remove_file(&tmp_lean);
-
-                let leanc_bin = lean_bin_path
-                    .parent()
-                    .map(|p| p.join("leanc"))
-                    .filter(|c| c.exists())
-                    .unwrap_or_else(|| PathBuf::from("leanc"));
                 let out2 = crate::pack::compile_fastcheck_c_to_bin(
                     &lean_bin_path,
-                    &leanc_bin,
                     &tmp_c,
                     &tmp_bin,
                     &lean_dir,
@@ -8582,21 +8598,9 @@ fn resolve_agent_step_env_and_paths(
         .and_then(|s| s.parse().ok());
     let effective_low_memory = low_memory || max_memory_mb.is_some_and(|m| m <= 2048);
 
-    let inferred_proj_dir = project_dir.map(Path::to_path_buf).unwrap_or_else(|| {
-        let start_dir = if file.is_dir() {
-            file.to_path_buf()
-        } else {
-            file.parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf()
-        };
-        let canon_start = start_dir.canonicalize().unwrap_or(start_dir);
-        canon_start
-            .ancestors()
-            .find(|p| p.join("lean-toolchain").exists() || p.join("lakefile.lean").exists())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."))
-    });
+    let inferred_proj_dir = project_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| crate::lake_build::find_project_root(file));
     let canon_dir = inferred_proj_dir
         .canonicalize()
         .unwrap_or(inferred_proj_dir);
@@ -8715,6 +8719,106 @@ fn try_eval_decl_stage1_cex_json(
     }))
 }
 
+fn extract_shard_decl(src: &str, shard: &crate::splitter::TheoremShard) -> Option<ExtractedDecl> {
+    // The signature excludes neighboring declarations and the proof's lexical contents.
+    let (stmt, _) = crate::splitter::extract_shard_stmt_and_proof(src, shard);
+    let mut decl = extract_decls_fast(&stmt, None).into_iter().next()?;
+    decl.name = shard.decl_name().to_string();
+    Some(decl)
+}
+
+/// Confirm the exact elaborated Lean identity of the single theorem/lemma selected by `decl_filter`
+/// (including `None` / `"auto"`, which selects the first extractable theorem shard in `src`)
+/// before transpiling or emitting any Stage-1 verdict.
+fn confirm_single_fastcheck_decl(
+    src: &str,
+    decl_filter: Option<&str>,
+    project_dir: &Path,
+    file: &Path,
+) -> Result<String> {
+    let split = crate::splitter::split_lean_source_fast_no_cone(src, &[]);
+    match decl_filter.filter(|t| !t.is_empty() && *t != "auto") {
+        Some(target) => {
+            let idx = crate::splitter::find_decl_shard_index(&split.shards, target)?.with_context(
+                || format!("Declaration `{target}` not found in {}", file.display()),
+            )?;
+            let shard = &split.shards[idx];
+            crate::check::confirm_decl_identity(src, shard, project_dir, file)?;
+            Ok(shard.decl_name().to_string())
+        }
+        None => {
+            for shard in &split.shards {
+                crate::check::confirm_decl_identity(src, shard, project_dir, file)?;
+            }
+            for shard in &split.shards {
+                if extract_shard_decl(src, shard).is_some() {
+                    return Ok(shard.decl_name().to_string());
+                }
+            }
+            anyhow::bail!(
+                "No `theorem` or `lemma` declaration found in {}",
+                file.display()
+            )
+        }
+    }
+}
+
+/// Resolve and confirm all selected theorem/lemma declarations in `file` for `turbo_fast_check`.
+pub(crate) fn extract_confirmed_fastcheck_pairs(
+    src: &str,
+    decl_filter: Option<&str>,
+    project_dir: &Path,
+    file: &Path,
+) -> Result<Vec<(String, String)>> {
+    let split = crate::splitter::split_lean_source_fast_no_cone(src, &[]);
+    let shards: Vec<&crate::splitter::TheoremShard> = match decl_filter
+        .filter(|t| !t.is_empty() && *t != "auto")
+    {
+        Some(target) => {
+            let idx = crate::splitter::find_decl_shard_index(&split.shards, target)?.with_context(
+                || format!("Declaration `{target}` not found in {}", file.display()),
+            )?;
+            vec![&split.shards[idx]]
+        }
+        None => split.shards.iter().collect(),
+    };
+    if shards.is_empty() {
+        anyhow::bail!(
+            "No `theorem` or `lemma` declaration found in {}",
+            file.display()
+        );
+    }
+    for shard in &shards {
+        crate::check::confirm_decl_identity(src, shard, project_dir, file)?;
+    }
+    let pairs: Vec<(String, String)> = shards
+        .into_iter()
+        .map(|shard| {
+            let file_decls = audit_spec::extract_decls_fast_for_path(
+                src,
+                Some(shard.decl_name()),
+                Some(file),
+                Some(project_dir),
+            );
+            if let Some(d) = file_decls.into_iter().next() {
+                if d.trusted_elab_context && d.instance_binders.is_empty() {
+                    (shard.decl_name().to_string(), d.render_scoped_stmt_src())
+                } else {
+                    (
+                        shard.decl_name().to_string(),
+                        "import Init\ntheorem _untrusted_context_guard : True := trivial"
+                            .to_string(),
+                    )
+                }
+            } else {
+                let (stmt, _) = crate::splitter::extract_shard_stmt_and_proof(src, shard);
+                (shard.decl_name().to_string(), format!("{stmt} := by sorry"))
+            }
+        })
+        .collect();
+    Ok(pairs)
+}
+
 /// Fast pre-SQLite Stage-1 counterexample check for `turbo-lean agent-step`.
 /// Returns `Some(json)` when a counterexample is immediately found in memory without needing `state.db`.
 pub fn try_stateless_agent_step_cex(
@@ -8722,26 +8826,53 @@ pub fn try_stateless_agent_step_cex(
     decl_filter: Option<&str>,
     project_dir: Option<&Path>,
     low_memory: bool,
-) -> Option<serde_json::Value> {
+) -> Result<Option<serde_json::Value>> {
     let t0 = Instant::now();
     let (max_memory_mb, effective_low_memory, canon_dir, resolved_file) =
         resolve_agent_step_env_and_paths(file, project_dir, low_memory, false);
     if !resolved_file.is_file() {
-        return None;
+        return Ok(None);
     }
-    let src_text = fs::read_to_string(&resolved_file).ok()?;
-    let decls = audit_spec::extract_decls_fast_for_path(
+    let Ok(src_text) = fs::read_to_string(&resolved_file) else {
+        return Ok(None);
+    };
+    let split = crate::splitter::split_lean_source_fast_no_cone(&src_text, &[]);
+    let target_shards: Vec<&crate::splitter::TheoremShard> =
+        match decl_filter.filter(|t| !t.is_empty() && *t != "auto") {
+            Some(target) => match crate::splitter::find_decl_shard_index(&split.shards, target)? {
+                Some(idx) => vec![&split.shards[idx]],
+                None => return Ok(None),
+            },
+            None => split.shards.iter().collect(),
+        };
+    let file_decls = audit_spec::extract_decls_fast_for_path(
         &src_text,
         decl_filter,
         Some(&resolved_file),
         Some(&canon_dir),
     );
+    let shard_decls: Vec<(&crate::splitter::TheoremShard, ExtractedDecl)> = target_shards
+        .into_iter()
+        .filter_map(|shard| {
+            let d = file_decls
+                .iter()
+                .find(|d| {
+                    audit_spec::decl_matches_requested_target(
+                        &d.name,
+                        &d.qualified_name,
+                        shard.decl_name(),
+                    )
+                })
+                .cloned()?;
+            Some((shard, d))
+        })
+        .collect();
     let accel_cfg = crate::accelerators::AcceleratorConfig::load(Some(&canon_dir));
     let accelerators_active = accel_cfg.enabled;
     let has_ext_plugins = !accel_cfg.external.is_empty();
     let accel_registry = crate::accelerators::AcceleratorRegistry::from_config(accel_cfg);
     let registered_accelerators_count = accel_registry.plugin_count();
-    for d in &decls {
+    for (shard, d) in &shard_decls {
         if let Some(val) = try_eval_decl_stage1_cex_json(
             d,
             file,
@@ -8753,10 +8884,18 @@ pub fn try_stateless_agent_step_cex(
             max_memory_mb,
             t0,
         ) {
-            return Some(val);
+            crate::check::confirm_decl_identity_with_budget(
+                &src_text,
+                shard,
+                &canon_dir,
+                &resolved_file,
+                false,
+                Some(t0),
+            )?;
+            return Ok(Some(val));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Build structured `rewrite_suggestions` alongside verified `accelerator_certificates`
@@ -8866,17 +9005,106 @@ pub fn evaluate_agent_step_value(
     let mut primary_stmt_src = String::new();
     let mut primary_body_src = String::new();
     let mut primary_decl_name = String::new();
-    let mut primary_qualified_name = String::new();
 
     if resolved_file.is_file() {
         let src_text = fs::read_to_string(&resolved_file)
             .with_context(|| format!("Failed to read {}", resolved_file.display()))?;
-        let decls = audit_spec::extract_decls_fast_for_path(
+        let toolchain = crate::lake_build::detect_toolchain(&canon_dir);
+        let canon_resolved = resolved_file
+            .canonicalize()
+            .unwrap_or_else(|_| resolved_file.clone());
+        let st_path_opt = fs::metadata(&canon_resolved)
+            .ok()
+            .map(|m| crate::db::TurboStore::extract_file_stat_tuple(&m))
+            .map(|(ms, mn, sz)| {
+                let pk = canon_resolved.to_string_lossy();
+                let st_hash = crate::lake_build::compute_single_stat_hash(&pk, ms, mn, sz);
+                crate::lake_build::shm_file_splits_dir(store)
+                    .join(format!("st_{}.json", &st_hash[..24]))
+            });
+        let src_b3 = blake3::hash(src_text.as_bytes()).to_hex().to_string();
+        let current_dep_hashes =
+            crate::lake_build::compute_imported_olean_interface_hashes(&src_text, &canon_dir, None);
+        let expected_split_key = format!("file-split:v11:{}", src_b3);
+        let st_split_opt = st_path_opt
+            .as_ref()
+            .and_then(|st_path| fs::read(st_path).ok())
+            .and_then(|b| serde_json::from_slice::<crate::lake_build::ShmCachedFileSplit>(&b).ok())
+            .filter(|c| {
+                c.split_key == expected_split_key
+                    && c.src_blake3 == src_b3
+                    && c.dep_hashes == current_dep_hashes
+            })
+            .map(|c| c.split);
+        let split = match st_split_opt {
+            Some(sp) => sp,
+            None => {
+                let dep_hashes = current_dep_hashes.clone();
+                let sp = crate::splitter::split_lean_source(&src_text, &dep_hashes);
+                if let Some(ref st_path) = st_path_opt {
+                    let entry = crate::lake_build::ShmCachedFileSplit {
+                        split_key: expected_split_key,
+                        src_blake3: src_b3,
+                        split: crate::lake_build::compact_split_for_shm_cache(&sp),
+                        prefix_src: if src_text.len() <= 64 * 1024 {
+                            src_text.clone()
+                        } else {
+                            String::new()
+                        },
+                        known_modified: false,
+                        dep_hashes,
+                    };
+                    if let Ok(bytes) = serde_json::to_vec(&entry) {
+                        let _ = crate::shm_cache::atomic_write_shm(st_path, &bytes);
+                    }
+                }
+                sp
+            }
+        };
+
+        let target_shards: Vec<&crate::splitter::TheoremShard> = match decl_filter {
+            Some(df) if !df.is_empty() && df != "auto" => {
+                match crate::splitter::find_decl_shard_index(&split.shards, df)? {
+                    Some(idx) => vec![&split.shards[idx]],
+                    None => Vec::new(),
+                }
+            }
+            _ => split.shards.iter().collect(),
+        };
+
+        let target_kernel_type_hashes: Vec<String> =
+            crate::check::confirm_file_decl_identities_with_budget(
+                &src_text,
+                &target_shards,
+                &canon_dir,
+                &resolved_file,
+                false,
+                Some(t0),
+            )?
+            .into_iter()
+            .map(|att| att.kernel_type_hash)
+            .collect();
+        let file_decls = audit_spec::extract_decls_fast_for_path(
             &src_text,
             decl_filter,
             Some(&resolved_file),
             Some(&canon_dir),
         );
+        let decls: Vec<_> = target_shards
+            .iter()
+            .filter_map(|ts| {
+                file_decls
+                    .iter()
+                    .find(|d| {
+                        audit_spec::decl_matches_requested_target(
+                            &d.name,
+                            &d.qualified_name,
+                            ts.decl_name(),
+                        )
+                    })
+                    .cloned()
+            })
+            .collect();
 
         for d in &decls {
             total_specs_audited += 1;
@@ -8899,93 +9127,13 @@ pub fn evaluate_agent_step_value(
             }
         }
 
-        let toolchain = crate::lake_build::detect_toolchain(&canon_dir);
-        let canon_resolved = resolved_file
-            .canonicalize()
-            .unwrap_or_else(|_| resolved_file.clone());
-        let st_path_opt = fs::metadata(&canon_resolved)
-            .ok()
-            .map(|m| crate::db::TurboStore::extract_file_stat_tuple(&m))
-            .map(|(ms, mn, sz)| {
-                let pk = canon_resolved.to_string_lossy();
-                let st_hash = crate::lake_build::compute_single_stat_hash(&pk, ms, mn, sz);
-                crate::lake_build::shm_file_splits_dir(store)
-                    .join(format!("st_{}.json", &st_hash[..24]))
-            });
-        let src_b3 = blake3::hash(src_text.as_bytes()).to_hex().to_string();
-        let current_dep_hashes =
-            crate::lake_build::compute_imported_olean_interface_hashes(&src_text, &canon_dir, None);
-        let expected_split_key = format!("file-split:v4:{}", src_b3);
-        let st_split_opt = st_path_opt
-            .as_ref()
-            .and_then(|st_path| fs::read(st_path).ok())
-            .and_then(|b| serde_json::from_slice::<crate::lake_build::ShmCachedFileSplit>(&b).ok())
-            .filter(|c| {
-                c.split_key == expected_split_key
-                    && c.src_blake3 == src_b3
-                    && c.dep_hashes == current_dep_hashes
-            })
-            .map(|c| c.split);
-        let split = match st_split_opt {
-            Some(sp) => sp,
-            None => {
-                let sp = crate::splitter::split_lean_source(&src_text, &current_dep_hashes);
-                if let Some(ref st_path) = st_path_opt {
-                    let entry = crate::lake_build::ShmCachedFileSplit {
-                        split_key: expected_split_key,
-                        src_blake3: src_b3,
-                        split: crate::lake_build::compact_split_for_shm_cache(&sp),
-                        prefix_src: if src_text.len() <= 64 * 1024 {
-                            src_text.clone()
-                        } else {
-                            String::new()
-                        },
-                        known_modified: false,
-                        dep_hashes: current_dep_hashes,
-                    };
-                    if let Ok(bytes) = serde_json::to_vec(&entry) {
-                        let _ = crate::shm_cache::atomic_write_shm(st_path, &bytes);
-                    }
-                }
-                sp
-            }
-        };
-
-        let target_shards: Vec<&crate::splitter::TheoremShard> = match decl_filter.map(str::trim) {
-            Some(df) if !df.is_empty() && df != "auto" => {
-                let matches: Vec<&crate::splitter::TheoremShard> = split
-                    .shards
-                    .iter()
-                    .filter(|s| {
-                        let qname = if s.qualified_name.is_empty() {
-                            s.name.as_str()
-                        } else {
-                            s.qualified_name.as_str()
-                        };
-                        audit_spec::decl_matches_requested_target(&s.name, qname, df)
-                    })
-                    .collect();
-                if matches.len() == 1 {
-                    matches
-                } else {
-                    Vec::new()
-                }
-            }
-            _ => split.shards.iter().collect(),
-        };
-
         for ts in &target_shards {
-            let ts_decl_id = if ts.qualified_name.is_empty() {
-                ts.name.as_str()
-            } else {
-                ts.qualified_name.as_str()
-            };
+            let ts_decl_id = ts.decl_name();
             let (stmt_src, body_src) = crate::splitter::extract_shard_stmt_and_proof(&src_text, ts);
             if primary_stmt_src.is_empty() {
                 primary_stmt_src = stmt_src.clone();
                 primary_body_src = body_src.clone();
-                primary_decl_name = ts.name.clone();
-                primary_qualified_name = ts_decl_id.to_string();
+                primary_decl_name = ts_decl_id.to_string();
             }
             if !accelerators_active {
                 continue;
@@ -9124,12 +9272,14 @@ pub fn evaluate_agent_step_value(
                 );
                 let mut compact_summary = format!(
                     "CEX stage1_accel decl={} via={} ms={:.1}",
-                    ts.name, accelerator_name, elapsed_ms
+                    ts.decl_name(),
+                    accelerator_name,
+                    elapsed_ms
                 );
                 compact_summary.truncate(120);
                 return Ok(serde_json::json!({
                     "status": "counterexample_rejected",
-                    "decl": ts.name,
+                    "decl": ts.decl_name(),
                     "file": file.display().to_string(),
                     "stage": "stage1_accelerator_fastreject",
                     "accelerator_name": accelerator_name,
@@ -9170,26 +9320,34 @@ pub fn evaluate_agent_step_value(
                 })
                 .collect();
             if let Ok(cached_map) = store.batch_get_theorem_shards(&shard_keys, "trusted") {
-                if cached_map.len() == shard_keys.len() {
+                let mut all_attested = cached_map.len() == shard_keys.len();
+                for ((sh, k), kth) in target_shards
+                    .iter()
+                    .zip(&shard_keys)
+                    .zip(&target_kernel_type_hashes)
+                {
+                    if cached_map.contains_key(k)
+                        && !store.has_attested_decl_receipt(k, "trusted", sh.decl_name(), kth)
+                    {
+                        all_attested = false;
+                        let _ = store.invalidate_action_for_reattestation(k);
+                    }
+                }
+                if all_attested {
                     crate::lake_build::recheck_dependents_if_nonlocal(&canon_dir, &resolved_file)?;
                     let elapsed_ms =
                         (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
                     let first_shard = target_shards[0];
-                    let first_qname = if first_shard.qualified_name.is_empty() {
-                        first_shard.name.as_str()
-                    } else {
-                        first_shard.qualified_name.as_str()
-                    };
                     let cached_stmt_src = if !first_shard.signature_text.is_empty() {
                         first_shard.signature_text.as_str()
-                    } else if first_qname == primary_qualified_name {
+                    } else if first_shard.decl_name() == primary_decl_name {
                         primary_stmt_src.as_str()
                     } else {
                         ""
                     };
                     let cached_body_src = if !first_shard.proof_text.is_empty() {
                         first_shard.proof_text.as_str()
-                    } else if first_qname == primary_qualified_name {
+                    } else if first_shard.decl_name() == primary_decl_name {
                         primary_body_src.as_str()
                     } else {
                         ""
@@ -9205,21 +9363,16 @@ pub fn evaluate_agent_step_value(
                     );
                     let mut cached_proof_nodes: u64 = 0;
                     for sh in &target_shards {
-                        let sh_qname = if sh.qualified_name.is_empty() {
-                            sh.name.as_str()
-                        } else {
-                            sh.qualified_name.as_str()
-                        };
                         let sh_stmt = if !sh.signature_text.is_empty() {
                             sh.signature_text.as_str()
-                        } else if sh_qname == primary_qualified_name {
+                        } else if sh.decl_name() == primary_decl_name {
                             primary_stmt_src.as_str()
                         } else {
                             ""
                         };
                         let sh_body = if !sh.proof_text.is_empty() {
                             sh.proof_text.as_str()
-                        } else if sh_qname == primary_qualified_name {
+                        } else if sh.decl_name() == primary_decl_name {
                             primary_body_src.as_str()
                         } else {
                             ""
@@ -9254,7 +9407,8 @@ pub fn evaluate_agent_step_value(
                     };
                     let mut compact_summary = format!(
                         "OK stage2_cached decl={} ms={:.1}",
-                        first_shard.name, elapsed_ms
+                        first_shard.decl_name(),
+                        elapsed_ms
                     );
                     compact_summary.truncate(120);
                     let (verified_certs, rewrite_suggestions) =
@@ -9267,7 +9421,7 @@ pub fn evaluate_agent_step_value(
                         "status": status_str,
                         "verification_status": "verified",
                         "verified": true,
-                        "decl": first_shard.name,
+                        "decl": first_shard.decl_name(),
                         "file": file.display().to_string(),
                         "stage": "stage2_kernel_verified",
                         "accelerators_active": accelerators_active,
@@ -11327,6 +11481,16 @@ def checks : List Bool := [
                 "theorem havei_in_proof (x : UInt8) : x = x := by haveI : Inhabited UInt8 := ⟨0⟩; rfl\n",
                 "x=0 => lhs=1 != rhs=0",
             ),
+            (
+                "def_builtin_shadow",
+                "namespace B\ndef add (a _b : UInt8) : UInt8 := a\ntheorem def_builtin_shadow (x : UInt8) : add x 1 = x := by rfl\nend B\n",
+                "x=0 => lhs=1 != rhs=0",
+            ),
+            (
+                "def_type_shadow",
+                "namespace B\ndef UInt8 := Unit\ntheorem def_type_shadow (x : _root_.UInt8) : x + 1 = x := by sorry\nend B\n",
+                "x=0 => lhs=1 != rhs=0",
+            ),
         ];
 
         // First 10 cases are genuinely valid theorems in Lean 4.35 (`0 sorry`); verify live with `lean --stdin` when available.
@@ -11433,7 +11597,8 @@ def checks : List Bool := [
             Some("local_inst_in_section"),
             Some(&tmp_dir),
             false,
-        );
+        )
+        .unwrap();
         let _ = std::fs::remove_dir_all(&tmp_dir);
         assert!(
             stateless_cex.is_none(),
@@ -11453,6 +11618,12 @@ def checks : List Bool := [
             corpus_decls.iter().all(|d| d.trusted_elab_context),
             "canonical FastCheck.lean theorems must remain trusted_elab_context=true"
         );
+        let benign_def_decls = audit_spec::extract_all_lean_theorems(
+            "namespace B\ndef message : String := \"decoy\"\ntheorem same (n : Nat) : n = n + 1 := by sorry\nend B\n",
+            Some("B.same"),
+        );
+        assert_eq!(benign_def_decls.len(), 1);
+        assert!(benign_def_decls[0].trusted_elab_context);
     }
 
     #[test]
@@ -11687,8 +11858,17 @@ theorem shadowed_false_cex (a : Word256) : a = Word256.zero := by sorry
         let _ = fs::remove_dir_all(&dir);
         let olean_dir = dir.join(".lake/build/lib/lean");
         fs::create_dir_all(&olean_dir).unwrap();
-        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
-        fs::write(dir.join("lakefile.lean"), "-- test\n").unwrap();
+        fs::write(
+            dir.join("lean-toolchain"),
+            include_str!("../../../lean/lean-toolchain"),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("lakefile.toml"),
+            "name = \"shm_dep_test\"\ndefaultTargets = [\"DepMod\"]\n[[lean_lib]]\nname = \"DepMod\"\n",
+        )
+        .unwrap();
+        let dep_src = dir.join("DepMod.lean");
         let dep_olean = olean_dir.join("DepMod.olean");
         let main_file = dir.join("UseDep.lean");
         let src_text = "import DepMod\ntheorem dep_sensitive_thm (x : Nat) : x = x := by\n  rfl\n";
@@ -11699,8 +11879,21 @@ theorem shadowed_false_cex (a : Word256) : a = Word256.zero := by sorry
         let canon_file = main_file.canonicalize().unwrap();
         let toolchain = crate::lake_build::detect_toolchain(&canon_dir);
 
+        let compile_dep = |body: &str| {
+            fs::write(&dep_src, body).unwrap();
+            let lean_bin = crate::lake_build::resolve_lean_bin(&canon_dir).unwrap();
+            let status = std::process::Command::new(lean_bin)
+                .current_dir(&canon_dir)
+                .arg(&dep_src)
+                .arg("-o")
+                .arg(&dep_olean)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+
         // Populate a poisoned SHM stat split entry recorded against `olean_v1` while disk now has `olean_v2`:
-        fs::write(&dep_olean, b"olean-bytes-v1-interface").unwrap();
+        compile_dep("def depVal : Nat := 1\n");
         let dep_v1 =
             crate::lake_build::compute_imported_olean_interface_hashes(src_text, &canon_dir, None);
         let split_v1 = crate::splitter::split_lean_source(src_text, &dep_v1);
@@ -11712,7 +11905,7 @@ theorem shadowed_false_cex (a : Word256) : a = Word256.zero := by sorry
         let st_path = crate::lake_build::shm_file_splits_dir(&store)
             .join(format!("st_{}.json", &st_hash[..24]));
         let stale_entry = crate::lake_build::ShmCachedFileSplit {
-            split_key: format!("file-split:v4:{}", src_b3),
+            split_key: format!("file-split:v11:{}", src_b3),
             src_blake3: src_b3.clone(),
             split: crate::lake_build::compact_split_for_shm_cache(&split_v1),
             prefix_src: src_text.to_string(),
@@ -11723,7 +11916,7 @@ theorem shadowed_false_cex (a : Word256) : a = Word256.zero := by sorry
             .unwrap();
 
         // Update `DepMod.olean` on disk to `v2` without touching `UseDep.lean` stat tuple:
-        fs::write(&dep_olean, b"olean-bytes-v2-changed-interface").unwrap();
+        compile_dep("def depVal : Nat := 2\n");
         let dep_v2 =
             crate::lake_build::compute_imported_olean_interface_hashes(src_text, &canon_dir, None);
         assert_ne!(dep_v1, dep_v2);
@@ -11731,15 +11924,20 @@ theorem shadowed_false_cex (a : Word256) : a = Word256.zero := by sorry
         let lean_args =
             crate::module_builder::try_resolve_lean_args_for_path(&canon_dir, Some(&canon_file))
                 .unwrap();
-        let shard_key_v2 = crate::lake_build::compute_shard_key_with_args(
-            &toolchain,
-            &split_v2.shards[0],
-            &lean_args,
-        );
-        let receipt = serde_json::to_vec(&serde_json::json!({
-            "ok": true,
-            "lean_options_digest": Option::<String>::None,
-        }))
+        let shard_v2 = &split_v2.shards[0];
+        let shard_key_v2 =
+            crate::lake_build::compute_shard_key_with_args(&toolchain, shard_v2, &lean_args);
+        let att_v2 =
+            crate::check::confirm_decl_identity(src_text, shard_v2, &canon_dir, &canon_file)
+                .unwrap();
+        let receipt = crate::check::make_attested_shard_receipt_bytes(
+            shard_v2.decl_name(),
+            &shard_v2.prefix_env_hash,
+            &shard_v2.stmt_hash,
+            &shard_v2.proof_hash,
+            1,
+            Some(&att_v2.kernel_type_hash),
+        )
         .unwrap();
         store
             .batch_publish_theorem_shards(
@@ -11852,5 +12050,26 @@ theorem shadowed_in_srcdir (a : Word256) : a = Word256.zero := by sorry
             batch_res
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_stateless_agent_step_returns_none_for_absent_local_decl() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "tl_agent_step_imported_fallback_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let wrapper = tmp_dir.join("Wrapper.lean");
+        fs::write(
+            &wrapper,
+            "import Foo\ntheorem local_thm (n : Nat) : n = n := by rfl\n",
+        )
+        .unwrap();
+        let res =
+            try_stateless_agent_step_cex(&wrapper, Some("A.foo"), Some(&tmp_dir), false).unwrap();
+        assert!(res.is_none());
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 }

@@ -201,7 +201,9 @@ def getOrInitWorkerCache (cacheRef : IO.Ref (Option WorkerCache)) : IO WorkerCac
 
 def handleFastWorkerRequest? (engineName line : String) : Option String :=
   let reqId := extractRpcId line
-  if invalidRpcWire line then
+  if hasRpcBoolField line "allow_rc_adt" true || hasRpcBoolField line "allowRcAdt" true then
+    some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"unsupported_flag:allow_rc_adt\"}"
+  else if invalidRpcWire line then
     some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"invalid_lnir_wire\"}"
   else
   let method := (extractRpcStringField line "method").getD "ping"
@@ -320,14 +322,20 @@ def handleFastWorkerRequest? (engineName line : String) : Option String :=
       | none =>
         some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"invalid_lnir_wire\"}"
       | some m =>
-        if m.decls.any (·.assurance == .unsupported) then
+        if hasRpcBoolField line "canonical_benchmark" true || hasRpcBoolField line "fastcheck_sample" true then
+          some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"conflicting_input_selectors\"}"
+        else if m.decls.any (·.assurance == .unsupported) then
           some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"unsupported_assurance_level_decl\"}"
+        else if let some dName := m.findRcAdtDecl? then
+          some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"unsupported_rc_adt_decl:{escapeJsonWorker dName}\"}"
         else
           let rep := runFastCheckModule m numSamples (!noProp)
           some s!"\{\"id\":{reqId},\"ok\":true,\"recommended_target\":\"{recTarget}\",\"c_abi_ready\":true,\"result\":\{\"recommended_target\":\"{recTarget}\",\"c_abi_ready\":true,\"report\":{rep.toJson}}}"
     | none =>
       if invalidRpcWire line then
         some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"invalid_lnir_wire\"}"
+      else if hasRpcBoolField line "canonical_benchmark" true && hasRpcBoolField line "fastcheck_sample" true then
+        some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"conflicting_input_selectors\"}"
       else if !hasRpcBoolField line "canonical_benchmark" true && !hasRpcBoolField line "fastcheck_sample" true then
         some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"explicit_input_wire_required\"}"
       else
@@ -346,8 +354,16 @@ def handleWorkerRequest (engineName : String) (cache : WorkerCache) (line : Stri
     let customModOpt := rawWireOpt.bind LNIRModule.fromWire?
     if invalidRpcWire line || (rawWireOpt.isSome && customModOpt.isNone) then
       s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"invalid_lnir_wire\"}"
+    else if (if rawWireOpt.isSome then 1 else 0) +
+        (if hasRpcBoolField line "canonical_benchmark" true then 1 else 0) +
+        (if hasRpcBoolField line "fastcheck_sample" true then 1 else 0) > 1 then
+      s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"conflicting_input_selectors\"}"
     else if (customModOpt.map (fun m => m.decls.any (·.assurance == .unsupported))).getD false then
       s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"unsupported_assurance_level_decl\"}"
+    else if !["verify-certs", "validate-tv"].contains method &&
+        (customModOpt.bind LNIRModule.findRcAdtDecl?).isSome then
+      let dName := (customModOpt.bind LNIRModule.findRcAdtDecl?).getD ""
+      s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"unsupported_rc_adt_decl:{escapeJsonWorker dName}\"}"
     else if ["compile-llvm", "compile-ptx", "compile-metal", "compile-mlir", "compile-tpu",
              "compile-fastcheck", "superopt", "plugins", "verify-certs", "validate-tv"].contains method &&
         customModOpt.isNone && !hasRpcBoolField line "canonical_benchmark" true &&
