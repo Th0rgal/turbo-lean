@@ -4091,7 +4091,178 @@ fn kernel_statement_changes(
     base: &str,
     scope: Option<&Path>,
 ) -> Result<Vec<String>> {
-    kernel_statement_changes_with_trust(project, base, scope, None)
+    let store_dir = std::env::temp_dir().join(format!(
+        "turbo-stmt-store-{}-{}",
+        std::process::id(),
+        pack::next_tmp_id()
+    ));
+    struct StoreDirGuard(PathBuf);
+    impl Drop for StoreDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _guard = StoreDirGuard(store_dir.clone());
+    let store = TurboStore::open(Some(&store_dir))?;
+    kernel_statement_changes_with_trust(&store, project, base, scope, None)
+}
+
+fn certify_head_statement_modules_and_replay(
+    store: &TurboStore,
+    head_project: &Path,
+    policy: &StatementPolicy,
+    is_untrusted: bool,
+) -> Result<()> {
+    let cfg = crate::module_builder::resolve_project_config_with_trust(head_project, true)?;
+    let lib_dir = head_project
+        .join(&cfg.root_pkg.build_dir)
+        .join(&cfg.root_pkg.lean_lib_dir);
+    let statement_modules = statement_source_modules(head_project, &cfg.root_pkg)?;
+    if statement_modules.is_empty() {
+        return Ok(());
+    }
+    let mut head_root_mods: Vec<(String, PathBuf)> = Vec::with_capacity(statement_modules.len());
+    for (mod_name, (source, root)) in &statement_modules {
+        let rel = source.strip_prefix(head_project)?.to_string_lossy();
+        let src_text = fs::read_to_string(source)?;
+        let split = splitter::split_lean_source(&src_text, &[]);
+        anyhow::ensure!(
+            !split.hygiene.has_checking_weakening,
+            "Soundness hygiene violation in {rel}: {:?}",
+            split.hygiene.disallowed_items_under(&policy.axioms)
+        );
+        anyhow::ensure!(
+            !split.hygiene.native_violation_under(&policy.axioms),
+            "[TurboLean.KernelGate] native_decide/bv_decide in {rel} requires the base project's axiom allowlist"
+        );
+        let mut disallowed = split.hygiene.disallowed_items_under(&policy.axioms);
+        if !policy.csimp.is_empty() {
+            disallowed.retain(|item| item.rsplit(": ").next() != Some("csimp"));
+        }
+        anyhow::ensure!(
+            disallowed.is_empty(),
+            "PR Hygiene & Axiom Gate FAILED on {rel}: {disallowed:?}"
+        );
+        let olean_path = lib_dir
+            .join(source.strip_prefix(root)?)
+            .with_extension("olean");
+        anyhow::ensure!(
+            olean_path.is_file(),
+            "No built .olean for {} after stock checking (statement pinning fails closed)",
+            source.display()
+        );
+        head_root_mods.push((mod_name.clone(), olean_path));
+    }
+
+    let (lean_path, _) = crate::module_builder::build_lean_search_path(&cfg, true);
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(&lean_path).collect();
+    if !cfg.toolchain_lib_lean.as_os_str().is_empty() && !dirs.contains(&cfg.toolchain_lib_lean) {
+        dirs.push(cfg.toolchain_lib_lean.clone());
+    }
+    let replay_lp = if cfg.toolchain_lib_lean.as_os_str().is_empty() {
+        lean_path.clone()
+    } else {
+        format!("{lean_path}:{}", cfg.toolchain_lib_lean.display())
+    };
+
+    let mut worklist: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (mod_name, olean_path) in &head_root_mods {
+        seen.insert(mod_name.clone());
+        let bytes = fs::read(olean_path)?;
+        let (imps, _) = crate::module_builder::parse_olean_binary_imports(&bytes).ok_or_else(
+            || {
+                anyhow::anyhow!(
+                    "Failed to parse binary `.olean` header of `{}`: fail-closed",
+                    olean_path.display()
+                )
+            },
+        )?;
+        worklist.extend(imps.into_iter().map(|i| i.module));
+    }
+    let mut dep_mods: Vec<(String, PathBuf)> = Vec::new();
+    while let Some(m) = worklist.pop() {
+        if !seen.insert(m.clone()) {
+            continue;
+        }
+        let rel_olean = format!("{}.olean", crate::module_builder::module_name_to_rel_slash(&m));
+        let path = dirs
+            .iter()
+            .map(|d| d.join(&rel_olean))
+            .find(|p| p.is_file())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Unresolvable binary import `{m}` required by head statement build along LEAN_PATH: fail-closed"
+                )
+            })?;
+        if crate::module_builder::is_verified_toolchain_olean_file(
+            &cfg.toolchain_lib_lean,
+            Some(&cfg.lean_githash),
+            &path,
+        ) {
+            continue;
+        }
+        let bytes = fs::read(&path)?;
+        let (imps, _) = crate::module_builder::parse_olean_binary_imports(&bytes).ok_or_else(
+            || {
+                anyhow::anyhow!(
+                    "Failed to parse binary `.olean` header of imported `{m}` (`{}`): fail-closed",
+                    path.display()
+                )
+            },
+        )?;
+        worklist.extend(imps.into_iter().map(|i| i.module));
+        dep_mods.push((m, path));
+    }
+
+    if is_untrusted {
+        let mut all_mods: Vec<String> = dep_mods
+            .into_iter()
+            .chain(head_root_mods)
+            .map(|(m, _)| m)
+            .collect();
+        all_mods.sort();
+        all_mods.dedup();
+        let prev_ax = std::env::var(splitter::ALLOWED_AXIOMS_ENV).ok();
+        let prev_csimp = std::env::var("TURBO_LEAN_ALLOWED_CSIMP").ok();
+        struct PolicyEnvGuard(Option<String>, Option<String>);
+        impl Drop for PolicyEnvGuard {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => std::env::set_var(splitter::ALLOWED_AXIOMS_ENV, v),
+                    None => std::env::remove_var(splitter::ALLOWED_AXIOMS_ENV),
+                }
+                match &self.1 {
+                    Some(v) => std::env::set_var("TURBO_LEAN_ALLOWED_CSIMP", v),
+                    None => std::env::remove_var("TURBO_LEAN_ALLOWED_CSIMP"),
+                }
+            }
+        }
+        let _env_guard = PolicyEnvGuard(prev_ax, prev_csimp);
+        std::env::set_var(splitter::ALLOWED_AXIOMS_ENV, policy.axioms.join(","));
+        std::env::set_var("TURBO_LEAN_ALLOWED_CSIMP", policy.csimp.join(","));
+        crate::zygote::audit_compiled_modules_with_zygote(
+            store,
+            &cfg,
+            &all_mods,
+            &replay_lp,
+            &[],
+            true,
+        )
+        .context("Head statement build `.olean` failed untrusted in-kernel soundness & replay audit")?;
+    } else {
+        let mut pending = Vec::new();
+        for (m, path) in dep_mods.iter().chain(head_root_mods.iter()) {
+            if !crate::module_builder::is_olean_replayed_in_store(store, &cfg, &replay_lp, path) {
+                pending.push(m.clone());
+            }
+        }
+        if !pending.is_empty() {
+            crate::zygote::kernel_replay_modules_with_zygote(store, &cfg, &pending, &replay_lp)
+                .context("Head statement build `.olean` failed independent kernel replay")?;
+        }
+    }
+    Ok(())
 }
 
 fn ensure_statement_lake_project(project: &Path) -> Result<()> {
@@ -4115,6 +4286,7 @@ fn ensure_statement_lake_project(project: &Path) -> Result<()> {
 }
 
 fn kernel_statement_changes_with_trust(
+    store: &TurboStore,
     project: &Path,
     base: &str,
     scope: Option<&Path>,
@@ -4169,13 +4341,15 @@ fn kernel_statement_changes_with_trust(
         .as_ref()
         .map(|s| s.path.join(project.strip_prefix(&repo).unwrap()))
         .unwrap_or_else(|| project.to_path_buf());
+    let policy = StatementPolicy::at(project, base);
     stock_statement_build_with_trust(&base_project, is_untrusted)?;
     let before =
         built_kernel_statements_with_trust(&base_project, relative_scope.as_deref(), is_untrusted)?;
     stock_statement_build_with_trust(&head_project, is_untrusted)?;
+    certify_head_statement_modules_and_replay(store, &head_project, &policy, is_untrusted)?;
     let after =
         built_kernel_statement_report(&head_project, relative_scope.as_deref(), is_untrusted)?;
-    StatementPolicy::at(project, base).audit(&after)?;
+    policy.audit(&after)?;
     Ok(compare_kernel_statements(&before, &after.statements))
 }
 
@@ -4380,6 +4554,7 @@ pub fn run_pr_verify_command(
     let statement_digest_t0 = Instant::now();
     let source_statement_edit = !classification.statement_edited_theorems.is_empty();
     classification.statement_edited_theorems = kernel_statement_changes_with_trust(
+        store,
         &canon_dir,
         &base,
         scope.as_deref(),
@@ -7987,6 +8162,136 @@ end Fixture
         assert!(
             err_direct_msg.contains("KernelReplay"),
             "trusted pr-verify on interface change directly importing forged dependency must fail KernelReplay, got: {err_direct_msg}"
+        );
+
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_pr_verify_rejects_unchanged_non_default_zero_shard_forged_module_and_emits_no_receipt(
+    ) -> Result<()> {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_pr_verify_unchanged_nondefault_forged_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let proj = dir.join("proj");
+        fs::create_dir_all(&proj)?;
+        let toolchain = include_str!("../../../lean/lean-toolchain");
+        fs::write(proj.join("lean-toolchain"), toolchain)?;
+        fs::write(proj.join(".gitignore"), ".lake/\n")?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            concat!(
+                "name = \"proj\"\n",
+                "defaultTargets = [\"MainLib\"]\n",
+                "[[lean_lib]]\nname = \"MainLib\"\nroots = [\"MainLib\"]\n",
+                "[[lean_lib]]\nname = \"HiddenLib\"\nroots = [\"HiddenLib\"]\n",
+            ),
+        )?;
+        fs::write(
+            proj.join("MainLib.lean"),
+            "theorem main_ok : (1 : Nat) = 1 := rfl\n",
+        )?;
+        fs::write(
+            proj.join("HiddenLib.lean"),
+            concat!(
+                "import Lean\n",
+                "open Lean Elab Command in\n",
+                "elab \"forge_bad\" : command => do\n",
+                "  let d : Declaration := .defnDecl {\n",
+                "    name := `HiddenLib.forged_false,\n",
+                "    levelParams := [],\n",
+                "    type := mkConst ``False,\n",
+                "    value := mkConst ``True.intro,\n",
+                "    hints := .opaque,\n",
+                "    safety := .safe\n",
+                "  }\n",
+                "  liftCoreM do\n",
+                "    match (← getEnv).addDeclCore 0 0 d none false with\n",
+                "    | .ok env' => setEnv env'\n",
+                "    | .error _ => throwError \"addDeclCore failed\"\n",
+                "forge_bad\n",
+            ),
+        )?;
+        git_init_and_commit(&proj, "base with unchanged non-default 0-shard forged lib")?;
+        fs::write(
+            proj.join("MainLib.lean"),
+            "theorem main_ok : (1 : Nat) = 1 := by rfl\n",
+        )?;
+
+        let receipt_path = dir.join("receipt.json");
+        let mut store = TurboStore::open(Some(&dir.join("cache")))?;
+        let err = run_pr_verify_command(
+            &mut store,
+            true,
+            proj.clone(),
+            "HEAD".to_string(),
+            "trusted".to_string(),
+            false,
+            Some(receipt_path.clone()),
+            None,
+            None,
+            None,
+            false,
+            1,
+            None,
+        )
+        .unwrap_err();
+        let err_msg = format!("{err:#}");
+        assert!(
+            err_msg.contains("KernelReplay") || err_msg.contains("kernel replay"),
+            "trusted pr-verify must fail-closed on unchanged non-default 0-shard forged module, got: {err_msg}"
+        );
+        assert!(
+            !receipt_path.exists(),
+            "pr-verify must not emit a receipt when unchanged non-default module fails kernel replay"
+        );
+
+        fs::write(
+            proj.join("HiddenLib.lean"),
+            "set_option debug.skipKernelTC true\ndef bad_def : True := True.intro\n",
+        )?;
+        fs::write(
+            proj.join("MainLib.lean"),
+            "theorem main_ok : (1 : Nat) = 1 := rfl\n",
+        )?;
+        git_init_and_commit(&proj, "base with unchanged non-default skipKernelTC")?;
+        fs::write(
+            proj.join("MainLib.lean"),
+            "theorem main_ok : (1 : Nat) = 1 := by rfl\n",
+        )?;
+        let err_hyg = run_pr_verify_command(
+            &mut store,
+            true,
+            proj.clone(),
+            "HEAD".to_string(),
+            "trusted".to_string(),
+            false,
+            Some(receipt_path.clone()),
+            None,
+            None,
+            None,
+            false,
+            1,
+            None,
+        )
+        .unwrap_err();
+        let err_hyg_msg = format!("{err_hyg:#}");
+        assert!(
+            err_hyg_msg.contains("Soundness hygiene violation")
+                && err_hyg_msg.contains("HiddenLib.lean"),
+            "trusted pr-verify must fail-closed on unchanged non-default checking-weakening directive, got: {err_hyg_msg}"
+        );
+        assert!(
+            !receipt_path.exists(),
+            "pr-verify must not emit a receipt when unchanged non-default module fails source hygiene"
         );
 
         drop(store);
