@@ -1186,7 +1186,9 @@ fn compute_source_only_import_digests(
     // Same synthetic entry `compute_imported_olean_interface_hashes` adds on the trusted path, so
     // an untrusted re-verification cannot reuse a split or a shard computed against older input
     // bytes either. Taken from the already-resolved config when there is one, which keeps the
-    // untrusted mode's "never trust a stat, re-read the bytes" rule intact.
+    // untrusted mode's "never trust a stat, re-read the bytes" rule intact -- and, deliberately,
+    // bypasses `project_lake_inputs_tag`'s per-command memo entirely: untrusted verification reads
+    // its digests out of the config this run resolved, never out of a cache.
     let lake_inputs_tag = match cfg_opt {
         Some(cfg) => crate::module_builder::lake_inputs_tag_from_digest(
             &crate::module_builder::workspace_lake_inputs_digest(cfg),
@@ -2814,6 +2816,8 @@ pub fn run_ci_verify_command(
     seed_shards: bool,
     scope: Option<PathBuf>,
 ) -> Result<()> {
+    // One top-level command, one Lake-input memo window.
+    crate::module_builder::reset_lake_inputs_tag_memo();
     let t0 = Instant::now();
     let canon_dir = project_dir
         .canonicalize()
@@ -4114,6 +4118,8 @@ pub fn run_pr_verify_command(
     max_cone_jobs: usize,
     nanoda_bin: Option<PathBuf>,
 ) -> Result<()> {
+    // One top-level command, one Lake-input memo window.
+    crate::module_builder::reset_lake_inputs_tag_memo();
     let t0 = Instant::now();
     let canon_dir = project_dir
         .canonicalize()

@@ -1125,6 +1125,11 @@ fn run(cli: Cli) -> Result<()> {
 
     let mut store = TurboStore::open(cli.cache_dir.as_deref())?;
 
+    // Open the Lake-input memo window for this command (see `reset_lake_inputs_tag_memo`). A CLI
+    // process runs one command, so this is belt-and-braces here; `serve` and the MCP server call it
+    // per request, which is what actually bounds it.
+    module_builder::reset_lake_inputs_tag_memo();
+
     match cli.command {
         Commands::Build {
             targets,

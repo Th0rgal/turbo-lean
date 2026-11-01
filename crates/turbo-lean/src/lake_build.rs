@@ -3297,6 +3297,8 @@ pub fn run_build_command(
     pin_level: i64,
     seed_shards: bool,
 ) -> Result<()> {
+    // One top-level command, one Lake-input memo window.
+    crate::module_builder::reset_lake_inputs_tag_memo();
     let t0 = Instant::now();
     let canon_dir = project_dir
         .canonicalize()

@@ -632,6 +632,8 @@ pub fn run_check_command(
     parallel_shards: bool,
     remote_http: Option<String>,
 ) -> Result<()> {
+    // One top-level command, one Lake-input memo window.
+    crate::module_builder::reset_lake_inputs_tag_memo();
     run_check_command_inner(
         store,
         db_warm_on_open,

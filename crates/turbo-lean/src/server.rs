@@ -335,6 +335,9 @@ pub fn serve_cas_http_with_auth(
         let _ = stream.set_nodelay(true);
         let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
         let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
+        // New request, new Lake-input memo window: a daemon must never answer from the input bytes
+        // a previous request read. See `module_builder::reset_lake_inputs_tag_memo`.
+        crate::module_builder::reset_lake_inputs_tag_memo();
 
         if active_conns.load(std::sync::atomic::Ordering::Relaxed) >= 64 {
             let _ = write_http_response(

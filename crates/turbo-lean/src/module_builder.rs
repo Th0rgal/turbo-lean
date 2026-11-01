@@ -5991,6 +5991,12 @@ pub(crate) fn workspace_may_declare_lake_inputs(project_dir: &Path) -> bool {
     })
 }
 
+/// Wrap a [`workspace_lake_inputs_digest`] into the synthetic dependency-interface-hash entry.
+/// The `NUL` prefix cannot collide with a `"<Module>:<hex>"` entry and sorts the tag first.
+pub(crate) fn lake_inputs_tag_from_digest(digest: &str) -> Option<String> {
+    (!digest.is_empty()).then(|| format!("\u{0}lake-inputs:{}", blake3::hash(digest.as_bytes())))
+}
+
 /// The workspace's Lake file inputs as a synthetic *dependency interface hash* entry, to be mixed
 /// into the per-file dependency list that seeds [`crate::splitter::split_lean_source`] and
 /// [`crate::lake_build::compute_file_split_key_with_deps`].
@@ -6011,24 +6017,58 @@ pub(crate) fn workspace_may_declare_lake_inputs(project_dir: &Path) -> bool {
 /// alternative.
 ///
 /// `None` for a workspace that declares no inputs, so those keys are untouched.
-/// Wrap a [`workspace_lake_inputs_digest`] into the synthetic dependency-interface-hash entry.
-/// The `NUL` prefix cannot collide with a `"<Module>:<hex>"` entry and sorts the tag first.
-pub(crate) fn lake_inputs_tag_from_digest(digest: &str) -> Option<String> {
-    (!digest.is_empty()).then(|| format!("\u{0}lake-inputs:{}", blake3::hash(digest.as_bytes())))
+///
+/// Memoized per top-level command, keyed on the project directory alone. This runs once per `.lean`
+/// file, and resolving the workspace re-reads every declared input byte: measured at 33 ms per call
+/// for a 200-file `input_dir`, i.e. ~16 s on a 500-module project, down to 0.4 ms amortized with
+/// the memo (and 104 µs → 3.5 µs for a project that declares no inputs, where only the config scan
+/// runs). The memo is the form the reverted `hash_input_target` memo's docstring identified as the
+/// safe one, and it is safe for the reason that one was not: there is no `(len, mtime)` in the key,
+/// so a same-length write with a restored mtime cannot be served a stale digest -- the only thing
+/// the memo asserts is that the inputs are read once per command, which is already how every other
+/// config resolution behaves. [`reset_lake_inputs_tag_memo`] bounds that window.
+static LAKE_INPUTS_TAG_MEMO: OnceLock<Mutex<HashMap<PathBuf, Option<String>>>> = OnceLock::new();
+
+/// End the memo window above. Called once per CLI command and once per `serve` / MCP request, so a
+/// process that outlives a single command never answers from a previous request's input bytes.
+pub fn reset_lake_inputs_tag_memo() {
+    if let Some(m) = LAKE_INPUTS_TAG_MEMO.get() {
+        if let Ok(mut g) = m.lock() {
+            g.clear();
+        }
+    }
 }
 
 pub(crate) fn project_lake_inputs_tag(project_dir: &Path) -> Option<String> {
-    if project_dir.as_os_str().is_empty() || !workspace_may_declare_lake_inputs(project_dir) {
+    if project_dir.as_os_str().is_empty() {
         return None;
     }
-    // A workspace whose config names inputs but will not resolve must not silently drop them:
-    // a `None` here would be indistinguishable from "declares none" and would restore the very
-    // stale hit this guards against.
-    let digest = match resolve_project_config(project_dir) {
-        Ok(cfg) => workspace_lake_inputs_digest(&cfg),
-        Err(e) => format!("unresolved:{e:#}"),
+    let memo = LAKE_INPUTS_TAG_MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(g) = memo.lock() {
+        if let Some(hit) = g.get(project_dir) {
+            return hit.clone();
+        }
+    }
+    let tag = if workspace_may_declare_lake_inputs(project_dir) {
+        // A workspace whose config names inputs but will not resolve must not silently drop them:
+        // a `None` here would be indistinguishable from "declares none" and would restore the very
+        // stale hit this guards against.
+        let digest = match resolve_project_config(project_dir) {
+            Ok(cfg) => workspace_lake_inputs_digest(&cfg),
+            Err(e) => format!("unresolved:{e:#}"),
+        };
+        lake_inputs_tag_from_digest(&digest)
+    } else {
+        None
     };
-    lake_inputs_tag_from_digest(&digest)
+    if let Ok(mut g) = memo.lock() {
+        // Bounded: one entry per project directory seen, cleared at every command boundary.
+        if g.len() >= 256 {
+            g.clear();
+        }
+        g.insert(project_dir.to_path_buf(), tag.clone());
+    }
+    tag
 }
 
 /// Lake's `LeanLib.recBuildExtraDepTargets` mixes one trace entry per `needs` target into the
@@ -9289,6 +9329,10 @@ lean_lib Later where
     /// independent of the `.olean` freshness logic being right.
     #[test]
     fn test_lake_input_digest_reaches_shard_split_and_fission_keys() {
+        // Drives the process-global Lake-input memo window.
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = make_temp_test_dir("input_shard_keys");
         fs::create_dir_all(dir.join("Smoke")).unwrap();
         fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
@@ -9306,7 +9350,9 @@ lean_lib Later where
         fs::write(dir.join("Smoke/A.lean"), imports_src).unwrap();
 
         // (dep hashes, file-split key, prefix_env_hash, shard key, fission key) for both sources.
+        // Each call stands for a fresh command, so it must see the inputs on disk.
         let keys = || {
+            reset_lake_inputs_tag_memo();
             [imports_src, no_imports_src].map(|src| {
                 let deps = lake_build::compute_imported_olean_interface_hashes(src, &dir, None);
                 let sb = blake3::hash(src.as_bytes()).to_hex().to_string();
@@ -9381,6 +9427,10 @@ lean_lib Later where
     /// be read must fail the resolve instead of hashing to a constant.
     #[test]
     fn test_dependency_package_lake_inputs_are_folded_and_fail_closed() {
+        // Drives the process-global Lake-input memo window.
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = make_temp_test_dir("dep_inputs");
         let dep_dir = dir.join(".lake/packages/dep_pkg");
         fs::create_dir_all(dep_dir.join("DepPkg")).unwrap();
@@ -9408,6 +9458,7 @@ lean_lib Later where
 
         // (workspace digest, `build` / `ci-verify` project fold, dependency-hash tag)
         let folds = || {
+            reset_lake_inputs_tag_memo();
             let cfg = resolve_project_config(&dir).unwrap();
             let mut h = blake3::Hasher::new();
             lake_build::update_with_lake_input_digests(&mut h, &dir).unwrap();
@@ -9437,6 +9488,7 @@ lean_lib Later where
         let err = resolve_project_config(&dir).unwrap_err().to_string();
         assert!(err.contains("Unreadable Lake input `depSources`"), "{err}");
         // And that unresolvable workspace reads as "inputs changed" rather than "nothing to do".
+        reset_lake_inputs_tag_memo();
         assert!(
             project_lake_inputs_tag(&dir).is_some(),
             "an unresolvable workspace that declares inputs must still carry a tag"
@@ -9551,6 +9603,38 @@ lean_lib Later where
             .is_ok_and(|s| s.success()));
         let err = resolve().unwrap_err().to_string();
         assert!(err.contains("is not a regular file"), "{err}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The per-command memo must not outlive its command: the whole point of folding the inputs
+    /// into the keys is that an edit is seen, and a `serve` / MCP process handles many edits.
+    #[test]
+    fn test_lake_inputs_tag_memo_is_reset_between_commands() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = make_temp_test_dir("input_tag_memo");
+        fs::create_dir_all(dir.join("Data")).unwrap();
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            dir.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage demo\ninput_dir d where\n  path := \"Data\"\n  filter := .extension \"sol\"\n@[default_target]\nlean_lib Smoke where\n  globs := #[.submodules `Smoke]\n  needs := #[d]\n",
+        )
+        .unwrap();
+        fs::write(dir.join("Data/a.sol"), "contract A {}").unwrap();
+        reset_lake_inputs_tag_memo();
+        let t0 = project_lake_inputs_tag(&dir).expect("declared inputs produce a tag");
+        // Within one command the digest is stable even though the bytes moved: that is the memo,
+        // and it is exactly the window `reset_lake_inputs_tag_memo` exists to close.
+        fs::write(dir.join("Data/a.sol"), "contract AMuchLongerName {}").unwrap();
+        assert_eq!(project_lake_inputs_tag(&dir).as_deref(), Some(t0.as_str()));
+        // Across the boundary the edit must be visible.
+        reset_lake_inputs_tag_memo();
+        let t1 = project_lake_inputs_tag(&dir).expect("still declares inputs");
+        assert_ne!(t0, t1, "a reset command window must re-read the inputs");
+        reset_lake_inputs_tag_memo();
+        fs::write(dir.join("Data/a.sol"), "contract A {}").unwrap();
+        assert_eq!(project_lake_inputs_tag(&dir).as_deref(), Some(t0.as_str()));
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -4103,6 +4103,10 @@ mod tests {
     /// edited input left every one of them matching and the worker answered from the old bytes.
     #[test]
     fn test_zygote_lake_inputs_digest_tracks_declared_input_contents() {
+        // Drives the process-global Lake-input memo window, as the tests in `module_builder` do.
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp_dir = std::env::temp_dir().join(format!(
             "turbo_zygote_lake_inputs_{}_{}",
             std::process::id(),
@@ -4117,9 +4121,14 @@ mod tests {
         )
         .unwrap();
         let lp = lib.to_string_lossy().to_string();
+        // Each read stands for a fresh command, which is what the memo window is scoped to.
+        let digest = |path: &str| {
+            crate::module_builder::reset_lake_inputs_tag_memo();
+            compute_lean_path_lake_inputs_digest(path)
+        };
         // No Lake config yet: nothing declared, so nothing is mixed in and every existing
         // project's pool key and `olean_digest` stay byte-identical.
-        assert_eq!(compute_lean_path_lake_inputs_digest(&lp), "");
+        assert_eq!(digest(&lp), "");
 
         fs::write(
             tmp_dir.join("lakefile.lean"),
@@ -4127,25 +4136,22 @@ mod tests {
         )
         .unwrap();
         fs::write(tmp_dir.join("Data/a.sol"), "contract A {}").unwrap();
-        let d1 = compute_lean_path_lake_inputs_digest(&lp);
+        let d1 = digest(&lp);
         assert!(!d1.is_empty(), "a declared input must reach the worker key");
-        assert_eq!(d1, compute_lean_path_lake_inputs_digest(&lp), "stable");
+        assert_eq!(d1, digest(&lp), "stable");
 
         // A matched edit moves it; an unmatched file does not.
         fs::write(tmp_dir.join("Data/a.sol"), "contract ALongerName {}").unwrap();
-        let d2 = compute_lean_path_lake_inputs_digest(&lp);
+        let d2 = digest(&lp);
         assert_ne!(d1, d2, "editing a matched input must retire warm workers");
         fs::write(tmp_dir.join("Data/notes.txt"), "notes").unwrap();
-        assert_eq!(d2, compute_lean_path_lake_inputs_digest(&lp));
+        assert_eq!(d2, digest(&lp));
         // Restoring the bytes restores the digest, so a warm worker is reusable again.
         fs::write(tmp_dir.join("Data/a.sol"), "contract A {}").unwrap();
-        assert_eq!(d1, compute_lean_path_lake_inputs_digest(&lp));
+        assert_eq!(d1, digest(&lp));
 
         // A search-path entry that is not a package build directory is ignored.
-        assert_eq!(
-            compute_lean_path_lake_inputs_digest(&tmp_dir.to_string_lossy()),
-            ""
-        );
+        assert_eq!(digest(&tmp_dir.to_string_lossy()), "");
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 
