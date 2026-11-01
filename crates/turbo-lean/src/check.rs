@@ -955,6 +955,9 @@ fn check_directory(
     let dir_files = collect_lean_files(resolved_file);
     crate::lake_build::ensure_project_imports_fresh_for_check(canon_dir, &dir_files)?;
     crate::module_builder::ensure_imported_oleans_replayed(store, canon_dir, &dir_files)?;
+    // Certify complete sources before accepting shard hits, including files with
+    // no theorem shards. Checkout freshness manifests cannot bind source to code.
+    crate::module_builder::require_source_compilations(store, canon_dir, &dir_files, false)?;
     let mut dir_hasher = blake3::Hasher::new();
     dir_hasher.update(toolchain.as_bytes());
 

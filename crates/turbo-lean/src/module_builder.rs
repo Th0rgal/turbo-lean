@@ -11099,7 +11099,7 @@ lean_exe «demo-exe» where
         let _guard = crate::pack::tests::env_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        for (attack, version) in [0, 1, 2].into_iter().flat_map(|attack| {
+        for (attack, version) in [0, 1, 2, 3, 4, 5].into_iter().flat_map(|attack| {
             [0, crate::zygote::ZYGOTE_REPLAY_VERSION].map(|version| (attack, version))
         }) {
             let poisoned_root = attack != 0;
@@ -11120,7 +11120,12 @@ lean_exe «demo-exe» where
                 tree.lake(&["build", "P.Target"])?;
                 // The checkout can rewrite all freshness evidence around a poisoned artifact.
                 // Reuse the existing bad artifact while presenting ordinary, invalid proof source.
-                let source = "import Lean\ntheorem bad : False := by trivial\ntheorem other : True := trivial\n";
+                let source = match attack {
+                    3 => "import Lean\naxiom bad : False\n",
+                    4 => "import Lean\ndef bad : False := sorry\n",
+                    5 => "import Lean\ndef bad : Nat := true\n",
+                    _ => "import Lean\ntheorem bad : False := by trivial\ntheorem other : True := trivial\n",
+                };
                 fs::write(&target, source)?;
                 let trace_path = tree.project.join(".lake/build/lib/lean/P/Target.trace");
                 let mut trace: serde_json::Value = serde_json::from_slice(&fs::read(&trace_path)?)?;
@@ -11201,10 +11206,17 @@ lean_exe «demo-exe» where
             let diagnostic = format!("{err:#}");
             assert!(
                 diagnostic.contains("KernelReplay")
+                    || diagnostic.contains("Hygiene & Axiom Gate FAILED")
                     || (diagnostic.contains("Lean compilation failed") || diagnostic.contains("Source compilation failed")),
                 "{diagnostic}"
             );
             assert!(!receipt.exists());
+            if poisoned_root {
+                let err = crate::lake_build::lake_recheck_dependents(
+                    &store, &tree.project, &["P/Target.lean".to_string()], None,
+                ).unwrap_err();
+                assert!(format!("{err:#}").contains("Source") || format!("{err:#}").contains("KernelReplay"), "{err:#}");
+            }
             let attestations: i64 =
                 store
                     .conn

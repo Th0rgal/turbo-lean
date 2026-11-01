@@ -5501,7 +5501,7 @@ mod pr_verify_tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_optout_untrusted_ci_cached_audit_failure_preserves_lake_tree() -> Result<()> {
+    fn test_optout_untrusted_ci_cold_cached_source_preserves_lake_tree() -> Result<()> {
         use crate::worktree_test_support::{snapshot, LakeTree};
         let _guard = crate::pack::tests::env_test_lock()
             .lock()
@@ -5567,13 +5567,9 @@ mod pr_verify_tests {
             false,
             None,
         )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("soundness audit rejected compiled artifact(s)")
-                && err.contains("sorryAx"),
-            "{err}"
-        );
+        .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("Worktree opt-out prevents compiling uncached module"), "{err}");
         assert_eq!(
             snapshot(&tree.project)?,
             before,

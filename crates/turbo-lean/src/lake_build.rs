@@ -2482,6 +2482,7 @@ pub(crate) fn lake_recheck_dependents(
         .map(|n| n.src_path.clone())
         .collect();
     crate::module_builder::ensure_imported_oleans_replayed(store, canon_dir, &sources)?;
+    crate::module_builder::require_source_compilations(store, canon_dir, &sources, false)?;
     Ok(count)
 }
 pub(crate) fn untrusted_recheck_dependents(
