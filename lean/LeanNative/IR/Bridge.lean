@@ -100,12 +100,9 @@ def lowerImpureLetValue (lv : Lean.Compiler.LCNF.LetValue .impure) (retTy : LNIR
   | .ctor ctorInfo args _ =>
     lowerTupleOrEnumCtor ctorInfo.name ctorInfo.cidx args retTy
   | .reuse slotFVar ctorInfo _ args _ =>
-    let slotVid ← internFVar slotFVar
-    let slotTy ← getVarType slotVid
-    if isUnboxedScalarOrTuple slotTy then
-      lowerTupleOrEnumCtor ctorInfo.name ctorInfo.cidx args retTy
-    else
-      Lean.throwError "[lean-native] Unsupported legacy heap reuse instruction in Stage 1B"
+    if isUnboxedScalarOrTuple (← getVarType (← internFVar slotFVar)) then
+      return ← lowerTupleOrEnumCtor ctorInfo.name ctorInfo.cidx args retTy
+    Lean.throwError "[lean-native] Unsupported legacy heap reuse instruction in Stage 1B"
   | .oproj idx fvarId _ => lowerTupleProj fvarId idx retTy true
   | .uproj idx fvarId _ => lowerScalarProjM fvarId true idx 0 retTy
   | .sproj n off fvarId _ => lowerScalarProjM fvarId false n off retTy
@@ -119,19 +116,13 @@ def lowerImpureLetValue (lv : Lean.Compiler.LCNF.LetValue .impure) (retTy : LNIR
   | .isShared fvarId _ =>
     let v ← internFVar fvarId
     let vt ← getVarType v
-    if isUnboxedScalarOrTuple vt then
-      return .scalar (.constBool true)
-    else if (← get).allowStage1DHeap && (vt == .objPtr || vt == .taggedPtr) then
-      return .isExclusive v
-    else
-      Lean.throwError "[lean-native] internal bridge error: unintercepted isShared"
+    if isUnboxedScalarOrTuple vt then return .scalar (.constBool true)
+    if (← get).allowStage1DHeap && (vt == .objPtr || vt == .taggedPtr) then return .isExclusive v
+    Lean.throwError "[lean-native] internal bridge error: unintercepted isShared"
   | .reset _ fvarId _ =>
     let v ← internFVar fvarId
-    let vt ← getVarType v
-    if isUnboxedScalarOrTuple vt then
-      return .scalar (.var v)
-    else
-      Lean.throwError "[lean-native] Unsupported heap reset instruction in Stage 1B"
+    if isUnboxedScalarOrTuple (← getVarType v) then return .scalar (.var v)
+    Lean.throwError "[lean-native] Unsupported heap reset instruction in Stage 1B"
 
 def lowerTagBranch (condVar : VarId) (cidx : Nat) (isBool : Bool) (yes no : LNIRCode) : BridgeM LNIRCode := do
   let condTy ← getVarType condVar
@@ -144,23 +135,18 @@ mutual
 partial def lowerImpureAlts (condVar : VarId) (isBool : Bool) (idx : Nat) (alts : List (Lean.Compiler.LCNF.Alt .impure))
     (discr? : Option VarId := none) : BridgeM LNIRCode := do
   -- C1.2: inside a heap `cases` alt the scrutinee's ctor (hence its `getCtorLayout` slots) is known
-  let inAlt (info : Lean.Compiler.LCNF.CtorInfo) (code : Lean.Compiler.LCNF.Code .impure) : BridgeM LNIRCode :=
-    match discr? with
-    | some d => withActiveCtor d info.name (lowerImpureCode code)
-    | none => lowerImpureCode code
   match alts with
   | [] => return .unreachable
-  | [singleAlt] =>
-    if let .alt ctorName params _ _ := singleAlt then
-      if !params.isEmpty then
-        Lean.throwError s!"[lean-native] unsupported constructor payload pattern in {ctorName}"
-    if let .ctorAlt info code _ := singleAlt then
-      return ← inAlt info code
-    lowerImpureCode singleAlt.getCode
+  | [.alt ctorName params code _] =>
+    if !params.isEmpty then Lean.throwError s!"[lean-native] unsupported constructor payload pattern in {ctorName}"
+    lowerImpureCode code
+  | [.ctorAlt info code _] => withActiveCtor? discr? info.name (lowerImpureCode code)
+  | [.default code] => lowerImpureCode code
   | alt :: rest =>
     match alt with
     | .ctorAlt info code _ =>
-      lowerTagBranch condVar info.cidx isBool (← inAlt info code) (← lowerImpureAlts condVar isBool (idx + 1) rest discr?)
+      lowerTagBranch condVar info.cidx isBool (← withActiveCtor? discr? info.name (lowerImpureCode code))
+        (← lowerImpureAlts condVar isBool (idx + 1) rest discr?)
     | .default code => lowerImpureCode code
     | .alt ctorName params code _ =>
       if !params.isEmpty then
@@ -339,10 +325,8 @@ def ingestLCNFDeclGeneric {pu} (decl : Lean.Compiler.LCNF.Decl pu)
 
 def ingestLCNFImpureDecl (decl : Lean.Compiler.LCNF.Decl .impure)
     (localDeclNames : Array Lean.Name := #[]) (arch : TargetArch := .x86_64) (allowRcAdt : Bool := false) : Lean.CoreM LNIRDecl :=
-  let fvarCtor := match decl.value with | .code c => collectFVarCtors c | _ => {}
-  ingestLCNFDeclGeneric decl (fun c => do
-    modify fun s => { s with fvarCtor := fvarCtor }
-    lowerImpureCode c) localDeclNames arch true allowRcAdt
+  ingestLCNFDeclGeneric decl (fun c => do modify ({ · with fvarCtor := collectFVarCtors c }); lowerImpureCode c)
+    localDeclNames arch true allowRcAdt
 
 def ingestLCNFMonoDecl (decl : Lean.Compiler.LCNF.Decl .pure)
     (localDeclNames : Array Lean.Name := #[]) (arch : TargetArch := .x86_64) : Lean.CoreM LNIRDecl :=

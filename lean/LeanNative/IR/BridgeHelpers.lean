@@ -1682,6 +1682,10 @@ def withActiveCtor {α} (v : VarId) (ctorName : Lean.Name) (act : BridgeM α) : 
   modify fun s => { s with activeCtor := old }
   return r
 
+/-- `withActiveCtor` when the `cases` scrutinee is a heap var (`some v`), else `act` unchanged. -/
+def withActiveCtor? {α} (v? : Option VarId) (ctorName : Lean.Name) (act : BridgeM α) : BridgeM α :=
+  match v? with | some v => withActiveCtor v ctorName act | none => act
+
 /-- C1.2 layout of the heap var `v` (= `fvarId`), from the enclosing `cases` alt / `setTag`, else the
     `collectFVarCtors` pre-pass (`let x := ctor`, reset/reuse join-point params); fails closed. -/
 def heapCtorLayoutOfM (v : VarId) (fvarId : Lean.FVarId) (what : String) : BridgeM RcCtorLayoutSpec := do
