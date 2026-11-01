@@ -245,3 +245,41 @@ Swap:          9.3Gi       372Mi       8.9Gi
   32670 orbnode  99.4  3.2 2163516 lean
   39356 orbnode  98.8  5.9 3887748 lean
 
+=== 2026-11-01T09:26:23Z [DURING-20m] ===
+ 09:26:23 up 137 days,  2:06,  0 user,  load average: 13.77, 14.97, 15.93
+cgroup_mem_bytes=23566700544 / 64560824320
+               total        used        free      shared  buff/cache   available
+Mem:            62Gi        20Gi        36Gi       1.6Mi       5.5Gi        41Gi
+Swap:          9.3Gi       369Mi       9.0Gi
+    PID USER     %CPU %MEM   RSS COMMAND
+  49081 orbnode   348  8.0 5265164 lean
+  25742 orbnode   112  6.4 4243512 lean
+  49161 orbnode   100  4.5 2993064 lean
+  50129 orbnode  99.9  4.8 3154236 lean
+  50144 orbnode  99.9  3.2 2155484 lean
+  47049 orbnode  99.9  3.7 2438796 lean
+  47392 orbnode  99.8  4.4 2900660 lean
+  47017 orbnode  99.8  3.3 2178488 lean
+  50188 orbnode  99.8  3.7 2465456 lean
+  39356 orbnode  99.1  6.2 4125824 lean
+  43620 orbnode  99.0  3.1 2081820 lean
+
+=== 2026-11-01T09:46:23Z [DURING-20m] ===
+ 09:46:23 up 137 days,  2:26,  0 user,  load average: 12.24, 12.19, 13.15
+cgroup_mem_bytes=17743224832 / 64560824320
+               total        used        free      shared  buff/cache   available
+Mem:            62Gi        15Gi        42Gi       1.6Mi       5.6Gi        47Gi
+Swap:          9.3Gi       369Mi       9.0Gi
+    PID USER     %CPU %MEM   RSS COMMAND
+  25742 orbnode   111  6.4 4239660 lean
+  53164 orbnode   100  2.7 1812124 lean
+  50762 orbnode  99.9  4.1 2714036 lean
+  52624 orbnode  99.9  4.0 2653896 lean
+  51105 orbnode  99.9  7.9 5210024 lean
+  52928 orbnode  99.9  3.7 2489368 lean
+  52950 orbnode  99.9  3.2 2111836 lean
+  52448 orbnode  99.9  2.8 1878348 lean
+  52885 orbnode  99.9  3.1 2081408 lean
+  53076 orbnode  99.9  2.7 1804956 lean
+  53102 orbnode  99.9  2.8 1860620 lean
+
