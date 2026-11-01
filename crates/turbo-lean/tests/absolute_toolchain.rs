@@ -620,3 +620,146 @@ fn missing_promised_base_blob_fails_closed_without_running_repository_helpers() 
         assert!(!marker.exists(), "{mode}: a repository Git helper ran");
     }
 }
+
+// A clean filter defined ONLY in an initialized submodule's own config (directly, or through
+// an `include.path` there) is invisible to the superproject. Plain `git status` recurses into
+// the submodule and runs it on the host; pr-verify must never do so.
+#[test]
+fn submodule_only_filters_never_run_during_pr_verification() {
+    for via_include in [false, true] {
+        let f = Fixture(std::env::temp_dir().join(format!(
+            "turbo-submodule-filter-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        )));
+        let (sub, proj) = (f.0.join(".sub-origin"), f.0.join("proj"));
+        let marker = f.0.join("shim-invoked");
+        fs::create_dir_all(&sub).unwrap();
+        fs::create_dir_all(&proj).unwrap();
+        let plain = |dir: &Path, args: &[&str]| {
+            Command::new("/usr/bin/git")
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", &f.0)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(["-c", "user.name=T", "-c", "user.email=t@e"])
+                .args(["-c", "protocol.file.allow=always"])
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let ok = |dir: &Path, args: &[&str]| {
+            let out = plain(dir, args);
+            assert!(out.status.success(), "{args:?}: {out:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        ok(&sub, &["init", "-q"]);
+        fs::write(sub.join(".gitattributes"), "*.txt filter=subattack\n").unwrap();
+        fs::write(sub.join("data.txt"), "a\n").unwrap();
+        ok(&sub, &["add", "."]);
+        ok(&sub, &["commit", "-qm", "sub"]);
+        ok(&f.0, &["init", "-q"]);
+        fs::write(
+            f.0.join(".gitignore"),
+            ".sub-origin/\n.lake/\ncache*/\nproj/.lake/\nproj/cache*/\n",
+        )
+        .unwrap();
+        for dir in [&f.0, &proj] {
+            fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+            fs::write(dir.join("Demo.lean"), "theorem pinned : 1 + 1 = 2 := rfl\n").unwrap();
+        }
+        ok(&f.0, &["add", "."]);
+        ok(&f.0, &["commit", "-qm", "base"]);
+        ok(
+            &f.0,
+            &["submodule", "add", "-q", &sub.to_string_lossy(), "dep"],
+        );
+        ok(&f.0, &["commit", "-qm", "dep"]);
+        let base = ok(&f.0, &["rev-parse", "HEAD"]);
+        let dep = f.0.join("dep");
+        let filter = format!("touch '{}'; cat", marker.display());
+        if via_include {
+            let inc = f.0.join(".sub-origin/include");
+            ok(
+                &f.0,
+                &[
+                    "config",
+                    "--file",
+                    &inc.to_string_lossy(),
+                    "filter.subattack.clean",
+                    &filter,
+                ],
+            );
+            ok(&dep, &["config", "include.path", &inc.to_string_lossy()]);
+        } else {
+            ok(&dep, &["config", "filter.subattack.clean", &filter]);
+        }
+        // A repository setting that would otherwise force Git to inspect the submodule.
+        ok(&f.0, &["config", "submodule.dep.ignore", "none"]);
+        let mut stamp = 0u64;
+        let mut restat = || {
+            stamp += 1;
+            // Same size as the committed blob: only the clean filter can tell it changed.
+            fs::write(dep.join("data.txt"), "b\n").unwrap();
+            fs::File::options()
+                .append(true)
+                .open(dep.join("data.txt"))
+                .unwrap()
+                .set_modified(SystemTime::now() + Duration::from_secs(stamp))
+                .unwrap();
+        };
+        assert_eq!(
+            plain(&f.0, &["config", "--get", "filter.subattack.clean"])
+                .status
+                .code(),
+            Some(1),
+            "filter must be unseen in the superproject"
+        );
+        // Positive control: plain status runs the submodule-only filter on the host.
+        restat();
+        ok(&f.0, &["status", "--porcelain"]);
+        assert!(
+            marker.exists(),
+            "{via_include}: submodule filter control did not run"
+        );
+        fs::remove_file(&marker).unwrap();
+
+        fs::write(
+            f.0.join("Demo.lean"),
+            "theorem pinned : 1 + 1 = 2 := by decide\n",
+        )
+        .unwrap();
+        fs::write(
+            proj.join("Demo.lean"),
+            "theorem pinned : 1 + 1 = 2 := by decide\n",
+        )
+        .unwrap();
+        for base_ref in ["HEAD", base.as_str()] {
+            // Both the project containing the gitlink and a sibling project of the same
+            // repository are refused: a gitlink's contents are never inspected, by change
+            // discovery (root) or by the raw statement snapshot of the whole tree (sibling).
+            for (dir, cache) in [(".", "cache"), ("proj", "cache-proj")] {
+                restat();
+                let out = f.run(
+                    cache,
+                    &["pr-verify", "--project-dir", dir, "--base", base_ref],
+                    false,
+                );
+                let diagnostic = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                assert!(
+                    diagnostic.contains("gitlinks"),
+                    "{dir} {base_ref}: {diagnostic}"
+                );
+                assert!(
+                    !marker.exists(),
+                    "{via_include} {dir} {base_ref}: filter ran"
+                );
+            }
+        }
+    }
+}
