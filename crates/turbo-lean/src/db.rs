@@ -130,64 +130,34 @@ impl Drop for CasExclusiveGcGuard {
 
 const STORE_TREE_DURABLE_MARKER: &str = "store_tree_durable.v1";
 
-/// Resolve `path` using real filesystem semantics (canonicalizing the longest existing prefix so
-/// symlinks followed by `..` resolve identically to OS path traversal, then joining any not-yet-
-/// created suffix components).
-fn resolve_store_root_real(store_root: &Path) -> Result<PathBuf> {
-    let raw = if store_root.is_absolute() {
-        store_root.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(store_root)
-    };
-    let mut missing_tail: Vec<std::ffi::OsString> = Vec::new();
-    let mut cur = raw.as_path();
-    loop {
-        if let Ok(canon) = fs::canonicalize(cur) {
-            let mut resolved = canon;
-            for part in missing_tail.into_iter().rev() {
-                if part == "." {
-                    continue;
-                } else if part == ".." {
-                    let _ = resolved.pop();
-                } else {
-                    resolved.push(part);
-                }
-            }
-            return Ok(resolved);
-        }
-        let Some(name) = cur.file_name() else {
-            return Ok(cur.to_path_buf());
-        };
-        missing_tail.push(name.to_os_string());
-        let Some(parent) = cur.parent() else {
-            return Ok(raw);
-        };
-        cur = parent;
-    }
-}
-
-/// Ensure `<store_root>/locks` exists and durably persist `store_root`, `<store_root>/locks`, and
-/// every ancestor directory above `store_root` (including `.` for relative `--cache-dir` roots and
-/// symlinked prefixes) before returning the canonical `<store_root>/locks` path.
+/// Ensure `<store_root>/locks` exists using real OS path traversal (`fs::create_dir_all` +
+/// `fs::canonicalize` on the created directory) and durably persist `store_root`,
+/// `<store_root>/locks`, and every ancestor directory above `store_root` (including `.` for
+/// relative `--cache-dir` roots, symlinked prefixes, and missing intermediate components followed
+/// by `..`) before returning the canonical `<store_root>/locks` path.
 ///
 /// Concurrency & crash invariant:
-/// Mere filesystem existence of `locks/` does NOT prove a racing peer finished syncing the parent
-/// directories naming `store_root`. We therefore gate the fast path on a durable marker file
-/// `<store_root>/locks/store_tree_durable.v1` published ONLY after every ancestor directory barrier
-/// bottom-up (`store_root` -> `store_root.parent()` -> ... -> `/`) succeeds. Any barrier failure
-/// propagates immediately without writing the marker.
+/// - Never lexically strip `..` or `file_name()` on unresolved prefixes: `fs::create_dir_all` on
+///   `store_root.join("locks")` performs real OS component-by-component traversal (failing with
+///   `ENOENT` on `/existing/missing/../cache`, matching `TurboStore::open`, and creating any
+///   missing intermediate directories along valid symlinked or relative paths), after which
+///   `fs::canonicalize` yields the exact canonical `locks/` directory inode.
+/// - Mere filesystem existence of `locks/` does NOT prove a racing peer finished syncing the
+///   parent directories naming `store_root`. We gate the fast path on a durable marker file
+///   `<store_root>/locks/store_tree_durable.v1` published ONLY after every ancestor directory
+///   barrier bottom-up (`store_root` -> `store_root.parent()` -> ... -> `/`) succeeds. Any barrier
+///   failure propagates immediately without writing the marker.
 pub(crate) fn ensure_store_locks_dir_durable(store_root: &Path) -> Result<PathBuf> {
-    let probe_locks = store_root.join("locks");
-    if probe_locks.join(STORE_TREE_DURABLE_MARKER).exists() {
-        return Ok(fs::canonicalize(&probe_locks).unwrap_or(probe_locks));
+    let raw_locks = if store_root.is_absolute() {
+        store_root.join("locks")
+    } else {
+        std::env::current_dir()?.join(store_root).join("locks")
+    };
+    if raw_locks.join(STORE_TREE_DURABLE_MARKER).exists() {
+        return Ok(fs::canonicalize(&raw_locks)?);
     }
-    let pre_resolved_root = resolve_store_root_real(store_root)?;
-    let pre_locks = pre_resolved_root.join("locks");
-    if pre_locks.join(STORE_TREE_DURABLE_MARKER).exists() {
-        return Ok(fs::canonicalize(&pre_locks).unwrap_or(pre_locks));
-    }
-    fs::create_dir_all(&pre_locks)?;
-    let abs_locks = fs::canonicalize(&pre_locks)?;
+    fs::create_dir_all(&raw_locks)?;
+    let abs_locks = fs::canonicalize(&raw_locks)?;
     let abs_marker = abs_locks.join(STORE_TREE_DURABLE_MARKER);
     if abs_marker.exists() {
         return Ok(abs_locks);
@@ -5653,6 +5623,37 @@ mod tests {
             "failed ancestor barrier must never publish store_tree_durable.v1"
         );
         set_durability_recorder(log.clone());
+
+        // Missing intermediate component followed by `..` (`/existing/missing_mid/../target_cache`):
+        // must NOT discard `target_cache` and create/lock `/existing/locks`! Instead, `create_dir_all`
+        // performs real OS component-by-component creation (creating `missing_mid`, traversing `..`
+        // back to `existing`, and creating `existing/target_cache/locks`), so cold lock acquisition
+        // and subsequent warm/GC lock acquisition agree on the exact same `target_cache/locks` inode.
+        let dotdot_base = dir.join("dotdot_existing");
+        fs::create_dir_all(&dotdot_base)?;
+        let missing_dotdot_root = dotdot_base
+            .join("missing_intermediate")
+            .join("..")
+            .join("target_cache");
+        let _ = take_log();
+        let cold_dd_locks = ensure_store_locks_dir_durable(&missing_dotdot_root)?;
+        let warm_dd_locks = ensure_store_locks_dir_durable(&dotdot_base.join("target_cache"))?;
+        assert_eq!(cold_dd_locks, warm_dd_locks);
+        assert!(
+            !dotdot_base.join("locks").exists(),
+            "missing intermediate followed by `..` must never misdirect locks into parent `/existing/locks`"
+        );
+        {
+            use std::os::unix::fs::MetadataExt;
+            let g_cold = acquire_cas_publication_guard(&missing_dotdot_root)?;
+            let g_warm = acquire_cas_publication_guard(&dotdot_base.join("target_cache"))?;
+            assert_eq!(
+                g_cold.file.metadata()?.ino(),
+                g_warm.file.metadata()?.ino(),
+                "cold and warm callers must lock the exact same gc_publish.lock inode"
+            );
+        }
+        let _ = take_log();
 
         let created = ensure_dir_tracking(&fresh_root.join("nested/stamp_dir"), &fresh_root)?;
         write_bytes_durable(
