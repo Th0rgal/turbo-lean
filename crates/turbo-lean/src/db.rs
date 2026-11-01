@@ -128,14 +128,48 @@ impl Drop for CasExclusiveGcGuard {
     }
 }
 
-/// Ensure `<store_root>/locks` exists and durably persist any newly created directory components
-/// (including `store_root`'s entry in its parent directory and any missing ancestors above it)
-/// bottom-up so cold-store callers that open lock files before prestaging/spooling never leave
-/// newly created store directories unpersisted across a crash.
+const STORE_TREE_DURABLE_MARKER: &str = "store_tree_durable.v1";
+
+fn resolve_store_root_abs(store_root: &Path) -> Result<PathBuf> {
+    let raw = if store_root.is_absolute() {
+        store_root.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(store_root)
+    };
+    let mut normalized = PathBuf::new();
+    for comp in raw.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                let _ = normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
+/// Ensure `<store_root>/locks` exists and durably persist `store_root`, `<store_root>/locks`, and
+/// every ancestor directory above `store_root` (including `.` for relative `--cache-dir` roots)
+/// before returning.
+///
+/// Concurrency & crash invariant:
+/// Mere filesystem existence of `locks/` does NOT prove a racing peer finished syncing the parent
+/// directories naming `store_root`. We therefore gate the fast path on a durable marker file
+/// `<store_root>/locks/store_tree_durable.v1` published ONLY after syncing the full ancestor chain
+/// bottom-up (`store_root` -> `store_root.parent()` -> ... -> `/`). If a peer created `locks/` and
+/// paused/crashed before writing the marker, any concurrent caller observing `!marker.exists()`
+/// independently performs the full bottom-up ancestor barrier before returning or publishing.
 pub(crate) fn ensure_store_locks_dir_durable(store_root: &Path) -> Result<PathBuf> {
     let locks_dir = store_root.join("locks");
+    let marker_path = locks_dir.join(STORE_TREE_DURABLE_MARKER);
+    if marker_path.exists() {
+        return Ok(locks_dir);
+    }
+    let abs_root = resolve_store_root_abs(store_root)?;
+    let abs_locks = abs_root.join("locks");
     let mut to_create = Vec::new();
-    let mut cur = Some(locks_dir.as_path());
+    let mut cur = Some(abs_locks.as_path());
     while let Some(p) = cur {
         if p.as_os_str().is_empty() || p.exists() {
             break;
@@ -143,26 +177,36 @@ pub(crate) fn ensure_store_locks_dir_durable(store_root: &Path) -> Result<PathBu
         to_create.push(p.to_path_buf());
         cur = p.parent();
     }
-    let mut parents_to_sync = Vec::new();
     for p in to_create.iter().rev() {
         match fs::create_dir(p) {
-            Ok(()) => {
-                if let Some(parent) = p.parent().filter(|par| !par.as_os_str().is_empty()) {
-                    parents_to_sync.push(parent.to_path_buf());
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if let Some(parent) = p.parent().filter(|par| !par.as_os_str().is_empty()) {
-                    parents_to_sync.push(parent.to_path_buf());
-                }
-            }
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e.into()),
         }
     }
-    parents_to_sync.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
-    parents_to_sync.dedup();
-    for dir in &parents_to_sync {
-        sync_dir(dir)?;
+    let mut anc = abs_locks.parent();
+    while let Some(p) = anc {
+        if p.as_os_str().is_empty() {
+            break;
+        }
+        if let Err(e) = sync_dir(p) {
+            let transient_perm = matches!(
+                e.downcast_ref::<std::io::Error>().map(|ioe| ioe.kind()),
+                Some(std::io::ErrorKind::PermissionDenied)
+            ) && p != abs_root
+                && Some(p) != abs_root.parent();
+            if !transient_perm {
+                return Err(e);
+            }
+        }
+        if p.parent().is_none() {
+            break;
+        }
+        anc = p.parent();
+    }
+    let abs_marker = abs_locks.join(STORE_TREE_DURABLE_MARKER);
+    if !abs_marker.exists() {
+        write_bytes_durable(&abs_marker, b"1\n", &[])?;
     }
     Ok(locks_dir)
 }
@@ -345,7 +389,6 @@ impl TurboStore {
         let mut from_template = false;
         let (template_path, uid) = template_shm_path();
         if !db_warm {
-            let root_preexisted = root.exists();
             fs::create_dir_all(&root)?;
             for sub in ["blobs", "staging", "locks"] {
                 match fs::create_dir(root.join(sub)) {
@@ -354,12 +397,7 @@ impl TurboStore {
                     Err(e) => return Err(e.into()),
                 }
             }
-            sync_dir(&root)?;
-            if !root_preexisted {
-                if let Some(parent) = root.parent().filter(|p| !p.as_os_str().is_empty()) {
-                    sync_dir(parent)?;
-                }
-            }
+            ensure_store_locks_dir_durable(&root)?;
             if template_path.exists() {
                 let tmp_db = root.join(format!(
                     "state.db.init.{}.{}",
@@ -5494,6 +5532,62 @@ mod tests {
         assert!(
             p_store < p_parent && p_parent < p_outer,
             "expected bottom-up ancestor sync brand_new_store -> missing_cold_parent -> outer dir, got {evs:?}"
+        );
+        assert!(cold_store_root.join("locks").join(STORE_TREE_DURABLE_MARKER).exists());
+
+        // Racing peer case: if a concurrent process already created `raced_parent/raced_store/locks`
+        // on disk via `create_dir_all` (without yet completing parent-directory fsyncs or writing
+        // `store_tree_durable.v1`), a second caller MUST still sync `raced_store`, `raced_parent`,
+        // and the outer parent directory before returning.
+        let raced_parent = dir.join("raced_unpersisted_parent");
+        let raced_store = raced_parent.join("raced_store");
+        fs::create_dir_all(raced_store.join("locks"))?;
+        let _ = take_log();
+        let raced_guard = acquire_cas_publication_guard(&raced_store)?;
+        drop(raced_guard);
+        let evs = take_log();
+        let r_store = evs
+            .iter()
+            .position(|s| s == "dir:raced_store")
+            .expect("peer must sync raced_store when durable marker absent");
+        let r_parent = evs
+            .iter()
+            .position(|s| s == "dir:raced_unpersisted_parent")
+            .expect("peer must sync raced_unpersisted_parent when durable marker absent");
+        let r_outer = evs
+            .iter()
+            .position(|s| *s == format!("dir:{dir_fname}"))
+            .expect("peer must sync outer parent when durable marker absent");
+        assert!(
+            r_store < r_parent && r_parent < r_outer,
+            "expected bottom-up ancestor sync on raced pre-created dirs, got {evs:?}"
+        );
+        assert!(raced_store.join("locks").join(STORE_TREE_DURABLE_MARKER).exists());
+
+        // Relative `--cache-dir` store roots (whose lexical `Path::parent()` is `Some("")`) must
+        // resolve against `current_dir()` and durably sync the current working directory naming the
+        // relative top-level entry.
+        let rel_cwd = dir.join("rel_cwd_anchor");
+        fs::create_dir_all(&rel_cwd)?;
+        let prev_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(&rel_cwd)?;
+        let _ = take_log();
+        let rel_res = acquire_cas_publication_guard(Path::new("rel_cache_store"));
+        std::env::set_current_dir(&prev_cwd)?;
+        let rel_guard = rel_res?;
+        drop(rel_guard);
+        let evs = take_log();
+        let rel_store_pos = evs
+            .iter()
+            .position(|s| s == "dir:rel_cache_store")
+            .expect("relative store root synced");
+        let rel_cwd_pos = evs
+            .iter()
+            .position(|s| s == "dir:rel_cwd_anchor")
+            .expect("current working directory synced for relative store root");
+        assert!(
+            rel_store_pos < rel_cwd_pos,
+            "expected relative store root -> current directory sync order, got {evs:?}"
         );
 
         let created = ensure_dir_tracking(&fresh_root.join("nested/stamp_dir"), &fresh_root)?;
