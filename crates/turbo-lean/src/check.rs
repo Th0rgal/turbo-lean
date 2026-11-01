@@ -702,6 +702,11 @@ fn run_check_command_inner(
             &canon_dir,
             std::slice::from_ref(&canon_resolved_initial),
         )?;
+        crate::module_builder::ensure_imported_oleans_replayed(
+            store,
+            &canon_dir,
+            std::slice::from_ref(&canon_resolved_initial),
+        )?;
     }
     let file_stat_tuple: Option<(i64, i64, i64)> = fs::metadata(&canon_resolved_initial)
         .ok()
@@ -943,6 +948,7 @@ fn check_directory(
 ) -> Result<serde_json::Value> {
     let dir_files = collect_lean_files(resolved_file);
     crate::lake_build::ensure_project_imports_fresh_for_check(canon_dir, &dir_files)?;
+    crate::module_builder::ensure_imported_oleans_replayed(store, canon_dir, &dir_files)?;
     let mut dir_hasher = blake3::Hasher::new();
     dir_hasher.update(toolchain.as_bytes());
 
