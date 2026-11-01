@@ -2708,6 +2708,8 @@ impl TurboStore {
                 probe_blob_digest(&src, &out.blob_hash, out.size_bytes),
                 BlobDisk::Intact
             ) {
+                #[cfg(unix)]
+                unseal_cas_inode_at_path(&src);
                 let _ = fs::remove_file(&src);
                 anyhow::bail!(
                     "CAS blob {} is missing or torn; refusing to link",
@@ -2842,11 +2844,27 @@ impl TurboStore {
                 // A truncated or corrupt cold body passes the header-only probe; drop it so it
                 // self-heals, unless a concurrent promotion already replaced it.
                 if fs::symlink_metadata(&src).is_ok_and(|m| m.is_file() && m.ino() == opened_ino) {
+                    #[cfg(unix)]
+                    unseal_cas_inode_at_path(&src);
                     let _ = fs::remove_file(&src);
                 }
                 anyhow::bail!("Failed to decompress or verify TLZ1 blob {}", blob_hash);
             };
+            #[cfg(unix)]
+            let old_key = fs::symlink_metadata(&src)
+                .ok()
+                .filter(|m| m.is_file())
+                .map(|m| (m.dev(), m.ino()));
             write_blob_atomic(&self.root, &src, blob_hash, &raw, true)?;
+            #[cfg(unix)]
+            if let Some((dev, ino)) = old_key {
+                if fs::symlink_metadata(&src)
+                    .ok()
+                    .is_none_or(|nm| (nm.dev(), nm.ino()) != (dev, ino))
+                {
+                    unseal_cas_inode(dev, ino);
+                }
+            }
             if let Ok((_, meta)) = open_regular_nofollow(&src) {
                 let _ = self.conn.execute(
                     "UPDATE blobs SET inode = ?1, last_accessed = ?2 WHERE blob_hash = ?3",
@@ -2901,6 +2919,8 @@ impl TurboStore {
         };
         let Some(len) = len else {
             if fs::symlink_metadata(src).is_ok_and(|m| m.is_file()) {
+                #[cfg(unix)]
+                unseal_cas_inode_at_path(src);
                 let _ = fs::remove_file(src);
             }
             anyhow::bail!(
@@ -3503,6 +3523,8 @@ impl TurboStore {
                 self.conn
                     .execute("DELETE FROM blobs WHERE blob_hash = ?1", params![bh])?;
                 if p.exists() {
+                    #[cfg(unix)]
+                    unseal_cas_inode_at_path(&p);
                     let _ = fs::remove_file(&p);
                 }
                 Ok(true)
@@ -3601,6 +3623,10 @@ impl TurboStore {
                         let p = self.blob_path(&bh);
                         let nlink = fs::metadata(&p).map(|m| m.nlink()).unwrap_or(1);
                         if p.exists() {
+                            #[cfg(unix)]
+                            if nlink <= 1 {
+                                unseal_cas_inode_at_path(&p);
+                            }
                             let _ = fs::remove_file(&p);
                         }
                         self.conn.execute(
@@ -3676,6 +3702,10 @@ impl TurboStore {
                         let p = self.blob_path(&bh);
                         let nlink = fs::metadata(&p).map(|m| m.nlink()).unwrap_or(1);
                         if p.exists() {
+                            #[cfg(unix)]
+                            if nlink <= 1 {
+                                unseal_cas_inode_at_path(&p);
+                            }
                             let _ = fs::remove_file(&p);
                         }
                         self.conn.execute(
@@ -3744,13 +3774,22 @@ impl TurboStore {
                 continue;
             }
             let compressed = compress_tlz1(&raw_bytes);
-            if compressed.len() < (raw_bytes.len() * 9) / 10
-                && write_blob_bytes_checked(&self.root, &p, &bh, &compressed, true).is_ok()
-            {
-                compressed_blobs += 1;
-                let saved = (raw_bytes.len() - compressed.len()) as u64;
-                freed_bytes += saved;
-                current_reclaimable = current_reclaimable.saturating_sub(saved);
+            if compressed.len() < (raw_bytes.len() * 9) / 10 {
+                #[cfg(unix)]
+                let old_key = (meta.dev(), meta.ino());
+                if write_blob_bytes_checked(&self.root, &p, &bh, &compressed, true).is_ok() {
+                    #[cfg(unix)]
+                    if fs::symlink_metadata(&p)
+                        .ok()
+                        .is_none_or(|nm| (nm.dev(), nm.ino()) != old_key)
+                    {
+                        unseal_cas_inode(old_key.0, old_key.1);
+                    }
+                    compressed_blobs += 1;
+                    let saved = (raw_bytes.len() - compressed.len()) as u64;
+                    freed_bytes += saved;
+                    current_reclaimable = current_reclaimable.saturating_sub(saved);
+                }
             }
             Self::unlock_singleflights(guards);
         }
@@ -4358,19 +4397,36 @@ where
         mode
     };
     let (mut f, staging) = open_unique_staging_file(stage_dir, stem, initial_mode)?;
+    #[cfg(unix)]
+    let mut sealed_key: Option<ExclusivelyCreatedCasKey> = None;
+    #[cfg(unix)]
+    let mut published_staged_inode = false;
     let res = (|| -> std::io::Result<T> {
         populate(&mut f)?;
         #[cfg(unix)]
         if let Some(hash) = immutable_cas_hash {
-            seal_exclusively_created_cas_inode(&f, mode, hash)?;
+            sealed_key = Some(seal_exclusively_created_cas_inode(
+                &f, &staging, mode, hash,
+            )?);
         }
         durability_barrier(&f)?;
         let out = publish(&f, &staging, dest)?;
+        #[cfg(unix)]
+        if let Some(sk) = sealed_key {
+            published_staged_inode =
+                fs::symlink_metadata(dest).is_ok_and(|dm| (dm.dev(), dm.ino()) == sk);
+        }
         sync_published(dest, created)?;
         Ok(out)
     })();
     drop(f);
     let _ = fs::remove_file(&staging);
+    #[cfg(unix)]
+    if let Some((dev, ino)) = sealed_key {
+        if res.is_err() || !published_staged_inode {
+            unseal_cas_inode(dev, ino);
+        }
+    }
     res
 }
 
@@ -4523,50 +4579,164 @@ pub(crate) fn link_regular_nofollow(src: &Path, dst: &Path) -> std::io::Result<(
 type ExclusivelyCreatedCasKey = (u64, u64);
 
 #[cfg(unix)]
-#[derive(Clone)]
 struct ExclusivelyCreatedCasEntry {
+    pinned_ro_fd: File,
     mtime: (i64, i64),
     size: u64,
     expected_hash: String,
+    order_seq: u64,
 }
 
 #[cfg(unix)]
-fn exclusively_created_cas_registry() -> &'static std::sync::Mutex<
-    std::collections::HashMap<ExclusivelyCreatedCasKey, ExclusivelyCreatedCasEntry>,
-> {
-    static REGISTRY: std::sync::OnceLock<
-        std::sync::Mutex<
-            std::collections::HashMap<ExclusivelyCreatedCasKey, ExclusivelyCreatedCasEntry>,
-        >,
-    > = std::sync::OnceLock::new();
-    REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+struct ExclusivelyCreatedCasRegistry {
+    entries: std::collections::HashMap<ExclusivelyCreatedCasKey, ExclusivelyCreatedCasEntry>,
+    order: std::collections::VecDeque<(ExclusivelyCreatedCasKey, u64)>,
+    next_seq: u64,
+}
+
+#[cfg(unix)]
+fn exclusively_created_cas_registry_max_entries() -> usize {
+    use std::sync::OnceLock;
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| unsafe {
+        let mut rlim: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 && rlim.rlim_cur > 0 {
+            let cur = usize::try_from(rlim.rlim_cur).unwrap_or(4096);
+            (cur / 4).clamp(64, 4096)
+        } else {
+            512
+        }
+    })
+}
+
+#[cfg(unix)]
+fn exclusively_created_cas_registry() -> &'static std::sync::Mutex<ExclusivelyCreatedCasRegistry> {
+    static REGISTRY: std::sync::OnceLock<std::sync::Mutex<ExclusivelyCreatedCasRegistry>> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        std::sync::Mutex::new(ExclusivelyCreatedCasRegistry {
+            entries: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            next_seq: 1,
+        })
+    })
+}
+
+#[cfg(unix)]
+fn open_pinned_readonly_cas_fd(f: &File, staging_path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let target = f.metadata()?;
+    #[cfg(target_os = "linux")]
+    if let Ok(ro) = OpenOptions::new()
+        .read(true)
+        .open(format!("/proc/self/fd/{}", f.as_raw_fd()))
+    {
+        if let Ok(m) = ro.metadata() {
+            if m.dev() == target.dev()
+                && m.ino() == target.ino()
+                && unsafe { libc::fcntl(ro.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE
+                    == libc::O_RDONLY
+            {
+                return Ok(ro);
+            }
+        }
+    }
+    let ro = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(staging_path)?;
+    let m = ro.metadata()?;
+    if m.dev() != target.dev()
+        || m.ino() != target.ino()
+        || unsafe { libc::fcntl(ro.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE != libc::O_RDONLY
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "pinned read-only descriptor did not match sealed staging inode",
+        ));
+    }
+    Ok(ro)
 }
 
 #[cfg(unix)]
 fn seal_exclusively_created_cas_inode(
     f: &File,
+    staging_path: &Path,
     mode: u32,
     expected_hash: &str,
-) -> std::io::Result<()> {
+) -> std::io::Result<ExclusivelyCreatedCasKey> {
     let mut perms = f.metadata()?.permissions();
     perms.set_mode(mode);
     f.set_permissions(perms)?;
-    let meta = f.metadata()?;
-    let mut guard = exclusively_created_cas_registry()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if guard.len() >= 131_072 {
-        guard.clear();
+    let pinned_ro_fd = open_pinned_readonly_cas_fd(f, staging_path)?;
+    let meta = pinned_ro_fd.metadata()?;
+    if !meta.is_file() || (meta.permissions().mode() & 0o222) != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "sealed CAS staging inode remained writable or non-regular",
+        ));
     }
-    guard.insert(
-        (meta.dev(), meta.ino()),
-        ExclusivelyCreatedCasEntry {
-            mtime: (meta.mtime(), meta.mtime_nsec()),
-            size: meta.len(),
-            expected_hash: expected_hash.to_string(),
-        },
-    );
-    Ok(())
+    let key = (meta.dev(), meta.ino());
+    let cap = exclusively_created_cas_registry_max_entries();
+    let mut evicted_fds: Vec<File> = Vec::new();
+    {
+        let mut reg = exclusively_created_cas_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(prev) = reg.entries.remove(&key) {
+            evicted_fds.push(prev.pinned_ro_fd);
+        }
+        while reg.entries.len() >= cap {
+            let Some((old_key, old_seq)) = reg.order.pop_front() else {
+                break;
+            };
+            if reg
+                .entries
+                .get(&old_key)
+                .is_some_and(|e| e.order_seq == old_seq)
+            {
+                if let Some(evicted) = reg.entries.remove(&old_key) {
+                    evicted_fds.push(evicted.pinned_ro_fd);
+                }
+            }
+        }
+        let seq = reg.next_seq;
+        reg.next_seq = reg.next_seq.wrapping_add(1);
+        reg.order.push_back((key, seq));
+        reg.entries.insert(
+            key,
+            ExclusivelyCreatedCasEntry {
+                pinned_ro_fd,
+                mtime: (meta.mtime(), meta.mtime_nsec()),
+                size: meta.len(),
+                expected_hash: expected_hash.to_string(),
+                order_seq: seq,
+            },
+        );
+    }
+    drop(evicted_fds);
+    Ok(key)
+}
+
+#[cfg(unix)]
+pub(crate) fn unseal_cas_inode(dev: u64, ino: u64) {
+    let removed = {
+        let mut reg = exclusively_created_cas_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reg.entries.remove(&(dev, ino))
+    };
+    drop(removed);
+}
+
+#[cfg(unix)]
+pub(crate) fn unseal_cas_inode_at_path(path: &Path) {
+    if let Ok(m) = fs::symlink_metadata(path) {
+        if m.is_file() {
+            unseal_cas_inode(m.dev(), m.ino());
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -4581,14 +4751,36 @@ pub(crate) fn is_exclusively_created_immutable_cas_inode(
     {
         return false;
     }
-    let guard = exclusively_created_cas_registry()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    guard.get(&(meta.dev(), meta.ino())).is_some_and(|e| {
-        e.mtime == (meta.mtime(), meta.mtime_nsec())
-            && e.size == meta.len()
-            && e.expected_hash == expected_hash
-    })
+    let key = (meta.dev(), meta.ino());
+    let mut stale_fd: Option<File> = None;
+    let matched = {
+        let mut reg = exclusively_created_cas_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = reg.entries.get(&key) {
+            match entry.pinned_ro_fd.metadata() {
+                Ok(pin_meta)
+                    if pin_meta.is_file()
+                        && (pin_meta.permissions().mode() & 0o222) == 0
+                        && (pin_meta.dev(), pin_meta.ino()) == key
+                        && (pin_meta.mtime(), pin_meta.mtime_nsec()) == entry.mtime
+                        && pin_meta.len() == entry.size
+                        && (meta.mtime(), meta.mtime_nsec()) == entry.mtime
+                        && meta.len() == entry.size =>
+                {
+                    entry.expected_hash == expected_hash
+                }
+                _ => {
+                    stale_fd = reg.entries.remove(&key).map(|e| e.pinned_ro_fd);
+                    false
+                }
+            }
+        } else {
+            false
+        }
+    };
+    drop(stale_fd);
+    matched
 }
 fn reserve_unique_staging_path(dir: &Path, stem: &str) -> std::io::Result<PathBuf> {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -4650,12 +4842,16 @@ pub(crate) fn publish_durable_link(
 }
 
 /// Publish a CAS blob from `src` to `dest`, binding BLAKE3 digest + byte-length verification to an
-/// isolated store-owned inode before atomic publication at `dest`. Only an inode proven in-process
-/// to have been created exclusively by `turbo-lean` via `O_CREAT | O_EXCL` with its sole writable
-/// fd closed (`is_exclusively_created_immutable_cas_inode`) may use the same-device hardlink fast
-/// path; externally supplied or prior-process inodes are snapshotted into a fresh `O_CREAT | O_EXCL`
-/// staging inode (via verified `FICLONE` or verified byte copy), `chmod 0o444`ed, fsynced, and
-/// atomically renamed onto `dest`. Returns the published destination inode.
+/// isolated store-owned inode before atomic publication at `dest`. Only a live inode proven
+/// in-process to have been created exclusively by `turbo-lean` via `O_CREAT | O_EXCL` with a
+/// private `0o600` initial mode (eliminating external writable opens for the same-UID adversary
+/// until sealed `0o444` and pinned by a retained `O_RDONLY` descriptor in
+/// `is_exclusively_created_immutable_cas_inode`; privileged `CAP_DAC_OVERRIDE` / same-UID `chmod`
+/// or `/proc/<pid>/fd` tampering is outside this unprivileged process threat model) may use the
+/// same-device hardlink fast path; externally supplied, unsealed, or prior-process inodes are
+/// snapshotted into a fresh `O_CREAT | O_EXCL` staging inode (via verified `FICLONE` or verified
+/// byte copy), `chmod 0o444`ed, fsynced, and atomically renamed onto `dest`. Returns the published
+/// destination inode.
 pub(crate) fn publish_verified_durable_blob(
     src: &Path,
     dest: &Path,
@@ -5407,11 +5603,18 @@ fn install_blob_to_path_checked(
     //    a CoW FS and re-verified on the independent snapshot, otherwise write `src_bytes`), seal
     //    in-process exclusive immutability + `chmod 0o444`, and atomically rename onto `dst`.
     let (mut dst_file, tmp_dst) = open_unique_staging_file(parent, &stem, 0o600)?;
+    #[cfg(unix)]
+    let mut sealed_key: Option<ExclusivelyCreatedCasKey> = None;
     let install_res = (|| -> Result<&'static str> {
-        let finalize_immutable = |f: &File| -> std::io::Result<()> {
+        let mut finalize_immutable = |f: &File| -> std::io::Result<()> {
             #[cfg(unix)]
             {
-                seal_exclusively_created_cas_inode(f, 0o444, &effective_hash)?;
+                sealed_key = Some(seal_exclusively_created_cas_inode(
+                    f,
+                    &tmp_dst,
+                    0o444,
+                    &effective_hash,
+                )?);
             }
             Ok(())
         };
@@ -5454,6 +5657,12 @@ fn install_blob_to_path_checked(
         Ok("copy")
     })();
     let _ = fs::remove_file(&tmp_dst);
+    #[cfg(unix)]
+    if install_res.is_err() {
+        if let Some((dev, ino)) = sealed_key {
+            unseal_cas_inode(dev, ino);
+        }
+    }
     install_res
 }
 
@@ -7708,6 +7917,244 @@ mod tests {
                 orig_b,
                 "ensure_blob_file must isolate destination against retained writable fd even with forged xattr + 0o444"
             );
+
+            // 4d. Sealed-then-failed staging unregistration + inode recycling defense:
+            //     Verify that a live exclusively created inode keeps a pinned O_RDONLY fd in the
+            //     registry (preventing kernel inode recycling while registered), and that failed
+            //     publications in BOTH `stage_and_publish_durable_ext` and `install_blob_to_path_checked`
+            //     explicitly `unseal_cas_inode`, so even if the kernel later recycles `(dev, ino)`
+            //     with matching owner-controlled `(mtime, size, hash)` and a retained writable fd,
+            //     `is_exclusively_created_immutable_cas_inode` returns false and hardlink
+            //     publication, installation, and reuse are all refused.
+            #[cfg(unix)]
+            {
+                let ensured_meta = fs::metadata(&pre_dest)?;
+                assert!(
+                    is_exclusively_created_immutable_cas_inode(&ensured_meta, &orig_hash),
+                    "freshly published store-owned CAS blob must be registered with live pinned fd"
+                );
+                {
+                    let reg = exclusively_created_cas_registry()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let entry = reg
+                        .entries
+                        .get(&(ensured_meta.dev(), ensured_meta.ino()))
+                        .expect("pinned registry entry must exist for published CAS blob");
+                    let pin_m = entry.pinned_ro_fd.metadata()?;
+                    assert_eq!(
+                        (pin_m.dev(), pin_m.ino()),
+                        (ensured_meta.dev(), ensured_meta.ino())
+                    );
+                    #[cfg(target_os = "linux")]
+                    {
+                        use std::os::unix::io::AsRawFd;
+                        let fl =
+                            unsafe { libc::fcntl(entry.pinned_ro_fd.as_raw_fd(), libc::F_GETFL) };
+                        assert_eq!(fl & libc::O_ACCMODE, libc::O_RDONLY);
+                    }
+                }
+
+                // Force `stage_and_publish_durable_ext` to seal the staging inode, capture its
+                // `(dev, ino, mtime, size)`, and then fail publication (`dest` is an existing dir -> EISDIR).
+                let fail_stage_dir = dir.join("fail_stage_unseal");
+                fs::create_dir_all(&fail_stage_dir)?;
+                let blocking_dest_dir = dir.join("blocking_dest_is_dir");
+                fs::create_dir_all(&blocking_dest_dir)?;
+                let mut captured_sealed: Option<fs::Metadata> = None;
+                let stage_fail_res = stage_and_publish_durable_ext(
+                    &fail_stage_dir,
+                    "unseal_probe",
+                    0o444,
+                    Some(&orig_hash),
+                    &blocking_dest_dir,
+                    &[],
+                    |f| f.write_all(&orig_b),
+                    |f, staging_p, dst_p| {
+                        let m = f.metadata()?;
+                        assert!(
+                            is_exclusively_created_immutable_cas_inode(&m, &orig_hash),
+                            "staging inode must be registered right after seal"
+                        );
+                        captured_sealed = Some(m);
+                        fs::rename(staging_p, dst_p)
+                    },
+                );
+                assert!(stage_fail_res.is_err(), "rename onto directory must fail");
+                let old_meta = captured_sealed.expect("publish closure must have run after seal");
+                assert!(
+                    !is_exclusively_created_immutable_cas_inode(&old_meta, &orig_hash),
+                    "failed stage_and_publish_durable_ext must unseal staging inode immediately"
+                );
+                assert!(
+                    !exclusively_created_cas_registry()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .entries
+                        .contains_key(&(old_meta.dev(), old_meta.ino())),
+                    "registry must drop failed staging entry and its pinned fd"
+                );
+
+                // Force `install_verified_blob_to_path` (stage-copy fallback from unstamped `ext_src`)
+                // to seal `tmp_dst` and fail rename onto a directory, verifying `tmp_dst` is also unsealed.
+                let blocking_install_dir =
+                    dir.join("wt_pkg/.lake/packages/dep/.lake/build/lib/lean/Dep/DirDest.olean");
+                fs::create_dir_all(&blocking_install_dir)?;
+                let reg_len_before = exclusively_created_cas_registry()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entries
+                    .len();
+                {
+                    let mut f = retained_fd.lock().unwrap();
+                    f.seek(std::io::SeekFrom::Start(0))?;
+                    f.write_all(&orig_b)?;
+                }
+                assert!(
+                    install_verified_blob_to_path(
+                        &ext_src,
+                        &blocking_install_dir,
+                        &orig_hash,
+                        orig_b.len() as u64
+                    )
+                    .is_err(),
+                    "install onto directory must fail"
+                );
+                let reg_len_after = exclusively_created_cas_registry()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entries
+                    .len();
+                assert_eq!(
+                    reg_len_after, reg_len_before,
+                    "failed install_blob_to_path_checked must unseal its temporary staged inode"
+                );
+
+                // Attempt to recycle `old_meta.ino()` in the same filesystem (`fail_stage_dir`), or
+                // test against the replacement candidate with forged identical `(mtime, size, hash)`
+                // and a retained writable fd.
+                let recycle_dir = dir.join("recycle_probe");
+                fs::create_dir_all(&recycle_dir)?;
+                let mut replacement_path = recycle_dir.join("candidate_0.olean");
+                let mut replacement_rw: Option<File> = None;
+                for idx in 0..256usize {
+                    let cand = recycle_dir.join(format!("candidate_{idx}.olean"));
+                    let mut rf = OpenOptions::new()
+                        .create(true)
+                        .truncate(true)
+                        .read(true)
+                        .write(true)
+                        .open(&cand)?;
+                    if rf.metadata()?.ino() == old_meta.ino() || idx == 255 {
+                        rf.write_all(&orig_b)?;
+                        forge_xattr_and_ro(&rf, &cand, &orig_hash)?;
+                        unsafe {
+                            use std::os::unix::io::AsRawFd;
+                            let ts = [
+                                libc::timespec {
+                                    tv_sec: old_meta.atime(),
+                                    tv_nsec: old_meta.atime_nsec() as _,
+                                },
+                                libc::timespec {
+                                    tv_sec: old_meta.mtime(),
+                                    tv_nsec: old_meta.mtime_nsec() as _,
+                                },
+                            ];
+                            let _ = libc::futimens(rf.as_raw_fd(), ts.as_ptr());
+                        }
+                        replacement_path = cand;
+                        replacement_rw = Some(rf);
+                        break;
+                    }
+                    drop(rf);
+                    let _ = fs::remove_file(&cand);
+                }
+                let mut rep_rw = replacement_rw.unwrap();
+                let rep_meta = fs::metadata(&replacement_path)?;
+                assert_eq!(rep_meta.len(), old_meta.len());
+                assert!(
+                    !is_exclusively_created_immutable_cas_inode(&rep_meta, &orig_hash),
+                    "replacement file (even with recycled ino + matching mtime/size/hash + forged xattr) must be rejected"
+                );
+
+                // Hardlink publication, package installation, and `ensure_blob_file` reuse must all
+                // refuse to share `replacement_path`'s inode, isolating against writes on `rep_rw`.
+                let rec_pub_dst = dir.join("recycled_pub_dst").join(&orig_hash);
+                fs::create_dir_all(rec_pub_dst.parent().unwrap())?;
+                let rec_pub_ino = publish_verified_durable_blob(
+                    &replacement_path,
+                    &rec_pub_dst,
+                    &orig_hash,
+                    orig_b.len() as u64,
+                    &[],
+                )?;
+                assert_ne!(rec_pub_ino as u64, rep_meta.ino());
+
+                let rec_pkg_dst = dir
+                    .join("wt_pkg/.lake/packages/dep/.lake/build/lib/lean/Dep/RecycledPkg.olean");
+                install_verified_blob_to_path(
+                    &replacement_path,
+                    &rec_pkg_dst,
+                    &orig_hash,
+                    orig_b.len() as u64,
+                )?;
+                assert_ne!(fs::metadata(&rec_pkg_dst)?.ino(), rep_meta.ino());
+
+                let rec_reuse_dst = dir.join("recycled_reuse_dst").join(&orig_hash);
+                fs::create_dir_all(rec_reuse_dst.parent().unwrap())?;
+                fs::hard_link(&replacement_path, &rec_reuse_dst)?;
+                let (rec_ensured_ino, _) =
+                    ensure_blob_file(&dir, &rec_reuse_dst, &orig_hash, &orig_b, false)?;
+                assert_ne!(rec_ensured_ino as u64, rep_meta.ino());
+
+                rep_rw.seek(std::io::SeekFrom::Start(0))?;
+                rep_rw.write_all(&mutated_b2)?;
+                assert_eq!(fs::read(&rec_pub_dst)?, orig_b);
+                assert_eq!(fs::read(&rec_pkg_dst)?, orig_b);
+                assert_eq!(fs::read(&rec_reuse_dst)?, orig_b);
+
+                // Verify bounded FIFO eviction drops only oldest entries rather than wiping the map:
+                use std::os::unix::fs::OpenOptionsExt;
+                let cap = exclusively_created_cas_registry_max_entries();
+                let evict_dir = dir.join("evict_cap_probe");
+                fs::create_dir_all(&evict_dir)?;
+                let mut evict_keys = Vec::with_capacity(cap + 4);
+                let mut newest_meta: Option<fs::Metadata> = None;
+                for idx in 0..(cap + 4) {
+                    let p = evict_dir.join(format!("ev_{idx}.bin"));
+                    let mut ef = OpenOptions::new()
+                        .create_new(true)
+                        .read(true)
+                        .write(true)
+                        .mode(0o600)
+                        .open(&p)?;
+                    ef.write_all(&orig_b)?;
+                    let k = seal_exclusively_created_cas_inode(&ef, &p, 0o444, &orig_hash)?;
+                    evict_keys.push(k);
+                    if idx == cap + 3 {
+                        newest_meta = Some(ef.metadata()?);
+                    }
+                }
+                let reg_len = exclusively_created_cas_registry()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entries
+                    .len();
+                assert_eq!(
+                    reg_len, cap,
+                    "registry must evict oldest entries at cap without clearing recent entries"
+                );
+                assert!(
+                    is_exclusively_created_immutable_cas_inode(
+                        newest_meta.as_ref().unwrap(),
+                        &orig_hash
+                    ),
+                    "newest sealed inode must remain registered after bounded eviction"
+                );
+                for (d, i) in evict_keys {
+                    unseal_cas_inode(d, i);
+                }
+            }
         }
 
         let _ = fs::remove_dir_all(&shm_root);
