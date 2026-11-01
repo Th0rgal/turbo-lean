@@ -4254,9 +4254,13 @@ fn eval_with_zygote_pool_attempt(
     let expected_pinned_dir = closure.materialized.as_ref().map(|m| m.dir_dev_ino);
 
     let spawn_zygote_worker = || -> Result<ZygoteChild> {
-        let zygote_bin = ensure_zygote_binary(store, lean_bin, env_vars)?;
+        let tools = crate::module_builder::ToolchainExecutables::from_lean(lean_bin)?;
+        let lean_bin = tools.lean.as_path();
+        let mut worker_env = env_vars.clone();
+        tools.apply_env(&mut worker_env);
+        let zygote_bin = ensure_zygote_binary(store, lean_bin, &worker_env)?;
         let mut cmd = Command::new(&zygote_bin);
-        let default_stack_kb = env_vars
+        let default_stack_kb = worker_env
             .get("LEAN_STACK_SIZE_KB")
             .cloned()
             .or_else(|| std::env::var("LEAN_STACK_SIZE_KB").ok())
@@ -4287,11 +4291,9 @@ fn eval_with_zygote_pool_attempt(
         #[cfg(not(target_os = "linux"))]
         let child_lean_path = effective_lean_path.clone();
 
-        cmd.envs(env_vars)
+        cmd.envs(&worker_env)
             .env("LEAN_STACK_SIZE_KB", default_stack_kb)
             .env("LEAN_PATH", &child_lean_path)
-            .env("PATH", crate::module_builder::verifier_path(lean_bin))
-            .env("LEAN", lean_bin)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -7313,13 +7315,17 @@ mod tests {
         let src_path = lib.join(format!("{name}.lean"));
         let out = lib.join(format!("{name}.build.olean"));
         fs::write(&src_path, src).unwrap();
-        let st = Command::new(lean_bin)
+        let env = std::collections::HashMap::from([(
+            "LEAN_PATH".to_string(),
+            lib.to_string_lossy().into_owned(),
+        )]);
+        let st = crate::module_builder::verifier_command(lean_bin, &env)
+            .unwrap()
             .arg("-R")
             .arg(lib)
             .arg(&src_path)
             .arg("-o")
             .arg(&out)
-            .env("LEAN_PATH", lib)
             .status()
             .unwrap();
         assert!(st.success());

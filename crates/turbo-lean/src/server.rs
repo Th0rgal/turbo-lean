@@ -1083,28 +1083,32 @@ pub fn serve_cas_http_with_auth(
                                 let tmp_eval =
                                     staging.join(format!("http_eval_det_{}.lean", next_tmp_id()));
                                 if fs::write(&tmp_eval, src).is_ok() {
-                                    let mut cmd = Command::new(&lean_bin);
-                                    for arg in &filtered_eval_args {
-                                        cmd.arg(arg);
-                                    }
-                                    cmd.arg(&tmp_eval).envs(&env_vars);
-                                    if !req.lean_path.is_empty() {
-                                        cmd.env("LEAN_PATH", &req.lean_path);
-                                    } else {
-                                        cmd.env_remove("LEAN_PATH");
-                                    }
-                                    let budget = req
-                                        .timeout_ms
-                                        .filter(|ms| *ms > 0)
-                                        .or_else(crate::zygote::invocation_timeout_ms)
-                                        .or(Some(900_000));
-                                    deterministic = crate::zygote::run_lean_command(
-                                        &mut cmd,
-                                        Some(crate::zygote::remaining_timeout_ms(
-                                            budget,
-                                            request_started,
-                                        )),
+                                    deterministic = crate::module_builder::verifier_command(
+                                        &lean_bin, &env_vars,
                                     )
+                                    .and_then(|mut cmd| {
+                                        for arg in &filtered_eval_args {
+                                            cmd.arg(arg);
+                                        }
+                                        cmd.arg(&tmp_eval);
+                                        if !req.lean_path.is_empty() {
+                                            cmd.env("LEAN_PATH", &req.lean_path);
+                                        } else {
+                                            cmd.env_remove("LEAN_PATH");
+                                        }
+                                        let budget = req
+                                            .timeout_ms
+                                            .filter(|ms| *ms > 0)
+                                            .or_else(crate::zygote::invocation_timeout_ms)
+                                            .or(Some(900_000));
+                                        crate::zygote::run_lean_command(
+                                            &mut cmd,
+                                            Some(crate::zygote::remaining_timeout_ms(
+                                                budget,
+                                                request_started,
+                                            )),
+                                        )
+                                    })
                                     .map(|out| out.status.success() == zreply.ok)
                                     .unwrap_or(false);
                                     let _ = fs::remove_file(&tmp_eval);
