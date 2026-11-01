@@ -51,7 +51,7 @@ Open follow-ups:
     (`1038` modules) with **0 OOM kills** (peak `59.08 GiB` during `IselData`/`RuleBitops`,
     then steady `11–20 GiB`) when the 720-minute managed-VM lifetime ceiling expired
     (`INCONCLUSIVE`, 0 pairs).
-  - Earlier diagnostic branch `origin/bench/b1-clifv-uruk` (`69c1571`,
+  - Earlier diagnostic branch `origin/bench/b1-clifv-uruk` (`292a631`,
     `results/bench-clifv/2026-10-31/README.md`) ran on shared 8-thread `uruk` under
     a 16 GiB job cgroup cap (`LEAN_NUM_THREADS=3`, `TURBO_LEAN_JOBS=3`) and also
     recorded **0 complete pairs**.
