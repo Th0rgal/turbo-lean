@@ -4615,13 +4615,31 @@ but is expected to have type
         std::env::set_var("TURBO_LEAN_STAGING_DIR", &store_staging);
         std::env::set_var("TURBO_LEAN_NO_DAEMON", "1");
 
-        let real_lean = Command::new("sh")
-            .args(["-c", "command -v lean"])
+        let fake_lean = bin_dir.join("lean");
+        let repo_lean_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lean");
+        let resolve_cwd = if repo_lean_dir.is_dir() {
+            repo_lean_dir
+        } else {
+            dir.clone()
+        };
+        let real_lean = Command::new("lean")
+            .arg("--print-prefix")
+            .current_dir(&resolve_cwd)
             .output()
             .ok()
             .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .filter(|s| !s.is_empty());
+            .map(|o| {
+                PathBuf::from(String::from_utf8_lossy(&o.stdout).trim())
+                    .join("bin")
+                    .join("lean")
+            })
+            .and_then(|p| p.canonicalize().ok())
+            .filter(|p| {
+                p.is_file()
+                    && p != &fake_lean
+                    && !p.starts_with(&fake_elan_root)
+                    && !p.with_file_name("elan").exists()
+            });
         std::env::set_var("ELAN_HOME", &fake_elan_root);
 
         // Wrapper `lean` binary: answers `--githash`/`--print-prefix` immediately during toolchain
@@ -4630,9 +4648,8 @@ but is expected to have type
         // complete (`proceed_marker`), and finally reads/checks the staged `.lean` file.
         let arrived_marker = dir.join("child_arrived");
         let proceed_marker = dir.join("child_proceed");
-        let fake_lean = bin_dir.join("lean");
         let exec_line = match real_lean {
-            Some(ref rl) => format!("exec '{}' \"$@\"", rl),
+            Some(ref rl) => format!("exec '{}' \"$@\"", rl.display()),
             None => {
                 "for last; do :; done; test -f \"$last\" && cat \"$last\" >/dev/null".to_string()
             }
