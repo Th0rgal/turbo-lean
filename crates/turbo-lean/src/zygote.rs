@@ -74,7 +74,9 @@ pub(crate) const ZYGOTE_SCANNER_VERSION: u32 = 1;
 /// `kernelReplayNewDecls`, dependency/module audits via `--kernel-replay-module`). Verdicts
 /// cached before the replay existed may have been produced with `debug.skipKernelTC` in effect,
 /// so every persisted verdict must carry this version. Bump when the replay is strengthened.
-pub(crate) const ZYGOTE_REPLAY_VERSION: u32 = 1;
+/// v2: trusted non-root dependency modules (compiled, CAS-restored or prebuilt) are replayed
+/// too; v1 outputs may import an unreplayed dependency `.olean`.
+pub(crate) const ZYGOTE_REPLAY_VERSION: u32 = 2;
 
 /// Fail-closed provenance gate for every persisted verifier verdict: it must have been vetted
 /// by the current stderr scanner *and* produced under the current kernel replay.
@@ -3267,6 +3269,39 @@ pub(crate) fn audit_compiled_modules_with_zygote(
             extra_ro_binds,
             is_untrusted,
         )?;
+    }
+    Ok(())
+}
+
+/// Independent kernel replay (`--kernel-replay-module`, one child per module so import regions
+/// are reclaimed between modules) of trusted dependency artifacts that skip the full policy
+/// audit: their declarations are rechecked against their imports before anything imports them.
+pub(crate) fn kernel_replay_modules_with_zygote(
+    store: &TurboStore,
+    cfg: &crate::module_builder::ProjectConfig,
+    mod_names: &[String],
+    lean_path_env: &str,
+) -> Result<()> {
+    for m in mod_names {
+        anyhow::ensure!(
+            !m.trim().is_empty(),
+            "Kernel replay received an empty module name: fail-closed"
+        );
+        let (mut cmd, timeout_secs) = auditor_command(store, cfg, lean_path_env, &[], false)?;
+        cmd.args(["--kernel-replay-module", m]);
+        let out = crate::module_builder::run_command_with_timeout(
+            &mut cmd,
+            std::time::Duration::from_secs(timeout_secs),
+            false,
+        )
+        .context("Failed to execute independent kernel replay (`--kernel-replay-module`)")?;
+        anyhow::ensure!(
+            out.status.success(),
+            "[TurboLean.KernelReplay] independent kernel re-check of dependency `{}` failed (exit={}):\n{}",
+            m,
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(())
 }

@@ -6546,7 +6546,7 @@ end Fixture
             crate::module_builder::VerifiedDepModuleEntry {
                 src_blake3: blake3::hash(src_raw.as_bytes()).to_hex().to_string(),
                 olean_artifact_digest: art_dig,
-                kernel_audited: true,
+                replay_version: crate::zygote::ZYGOTE_REPLAY_VERSION,
             },
         );
         fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
