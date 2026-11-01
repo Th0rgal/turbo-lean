@@ -3285,7 +3285,7 @@ impl StatementSnapshot {
                 Err(e) => return Err(e.into()),
             }
         };
-        materialize_statement_tree(repo, rev, &snapshot.path)?;
+        materialize_statement_tree(repo, rev, &snapshot.path, None)?;
         Ok(snapshot)
     }
 }
@@ -3296,7 +3296,93 @@ impl Drop for StatementSnapshot {
     }
 }
 
-fn materialize_statement_tree(repo: &Path, rev: &str, root: &Path) -> Result<()> {
+fn dependency_symlink_touches_build(
+    rel: &Path,
+    dep: &crate::module_builder::PackageConfig,
+) -> bool {
+    let norm = |p: &Path| -> PathBuf {
+        p.components()
+            .filter(|c| !matches!(c, std::path::Component::CurDir))
+            .collect()
+    };
+    let rel = norm(rel);
+    if dep.unsupported.is_some()
+        || !dep.extern_libs.is_empty()
+        || !dep.custom_targets.is_empty()
+        || rel.extension().is_some_and(|e| e == "lean")
+    {
+        return true;
+    }
+    if let Some(name) = rel.file_name().and_then(|n| n.to_str()) {
+        if matches!(
+            name,
+            "lakefile.lean" | "lakefile.toml" | "lake-manifest.json" | "lean-toolchain"
+        ) || (rel.parent().is_some_and(|p| p.as_os_str().is_empty())
+            && matches!(rel.file_stem().and_then(|s| s.to_str()), Some("lakefile")))
+        {
+            return true;
+        }
+    }
+    let overlaps = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
+    let base = norm(&dep.src_dir);
+    for path in [&dep.build_dir, &dep.packages_dir] {
+        if overlaps(&rel, &norm(path)) {
+            return true;
+        }
+    }
+    if dep.libs.is_empty() && dep.exes.is_empty() {
+        return overlaps(&rel, &base);
+    }
+    let module_prefix = |root: &Path, module: &str| {
+        let first = module.split('.').next().unwrap_or(module);
+        norm(&root.join(first))
+    };
+    for lib in &dep.libs {
+        let root = match &lib.src_dir {
+            Some(dir) => norm(&base.join(dir)),
+            None => base.clone(),
+        };
+        if lib.globs.is_empty() && lib.roots.is_empty() && overlaps(&rel, &root) {
+            return true;
+        }
+        let names = lib
+            .roots
+            .iter()
+            .map(String::as_str)
+            .chain(lib.globs.iter().map(|g| {
+                use crate::module_builder::GlobSpec;
+                match g {
+                    GlobSpec::One(n) | GlobSpec::Submodules(n) | GlobSpec::AndSubmodules(n) => {
+                        n.as_str()
+                    }
+                }
+            }));
+        for name in names {
+            let prefix = module_prefix(&root, name);
+            if overlaps(&rel, &prefix) || overlaps(&rel, &prefix.with_extension("lean")) {
+                return true;
+            }
+        }
+    }
+    for exe in &dep.exes {
+        let root = match &exe.src_dir {
+            Some(dir) => norm(&base.join(dir)),
+            None => base.clone(),
+        };
+        let prefix = module_prefix(&root, &exe.root);
+        if overlaps(&rel, &prefix) || overlaps(&rel, &prefix.with_extension("lean")) {
+            return true;
+        }
+    }
+    false
+}
+
+fn materialize_statement_tree(
+    repo: &Path,
+    rev: &str,
+    root: &Path,
+    dep: Option<&crate::module_builder::PackageConfig>,
+) -> Result<()> {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::os::unix::{
         ffi::OsStrExt,
@@ -3342,7 +3428,12 @@ fn materialize_statement_tree(repo: &Path, rev: &str, root: &Path) -> Result<()>
             "Unsupported Git tree entry: {}",
             rel.display()
         );
-        entries.push((fields[0].to_owned(), fields[2].to_owned(), root.join(rel)));
+        entries.push((
+            fields[0].to_owned(),
+            fields[2].to_owned(),
+            rel.to_path_buf(),
+            root.join(rel),
+        ));
     }
     let mut git = crate::trusted_tools::git(repo)?;
     let mut child = git
@@ -3356,7 +3447,7 @@ fn materialize_statement_tree(repo: &Path, rev: &str, root: &Path) -> Result<()>
         let mut input = child.stdin.take().context("Missing Git batch stdin")?;
         let mut output = BufReader::new(child.stdout.take().context("Missing Git batch stdout")?);
         let mut links = Vec::new();
-        for (mode, oid, target) in entries {
+        for (mode, oid, rel, target) in entries {
             ensure_statement_snapshot_path(root, &target)?;
             fs::create_dir_all(target.parent().context("Missing snapshot parent")?)?;
             writeln!(input, "{oid}")?;
@@ -3375,12 +3466,16 @@ fn materialize_statement_tree(repo: &Path, rev: &str, root: &Path) -> Result<()>
                 blob.read_to_end(&mut bytes)?;
                 anyhow::ensure!(bytes.len() as u64 == size, "Truncated Git symlink blob");
                 let link = PathBuf::from(std::ffi::OsStr::from_bytes(&bytes));
-                anyhow::ensure!(
-                    !link.is_absolute(),
-                    "Absolute symlink in statement snapshot: {}",
-                    target.display()
-                );
-                links.push((target, link));
+                if link.is_absolute() {
+                    if dep.is_none_or(|d| dependency_symlink_touches_build(&rel, d)) {
+                        anyhow::bail!(
+                            "Absolute symlink in statement snapshot: {}",
+                            target.display()
+                        );
+                    }
+                } else {
+                    links.push((rel, target, link));
+                }
             } else {
                 let mut file = fs::OpenOptions::new()
                     .write(true)
@@ -3403,23 +3498,44 @@ fn materialize_statement_tree(repo: &Path, rev: &str, root: &Path) -> Result<()>
         // Create links only after every regular file has been written, so even
         // malformed trees cannot redirect writes. Validate actual resolution,
         // including link chains and `..` traversing another symlink.
-        for (target, link) in &links {
+        for (_, target, link) in &links {
             ensure_statement_snapshot_path(root, target)?;
             symlink(link, target)?;
         }
         let canonical_root = root.canonicalize()?;
-        for (target, _) in links {
-            let resolved = target.canonicalize().with_context(|| {
-                format!(
-                    "Unresolvable statement snapshot symlink: {}",
-                    target.display()
-                )
-            })?;
-            anyhow::ensure!(
-                resolved.starts_with(&canonical_root),
-                "Symlink escapes statement snapshot: {}",
-                target.display()
-            );
+        loop {
+            let mut removed = false;
+            for (rel, target, _) in &links {
+                if !target.is_symlink() {
+                    continue;
+                }
+                match target.canonicalize() {
+                    Ok(resolved) if resolved.starts_with(&canonical_root) => {}
+                    res => {
+                        let _ = fs::remove_file(target);
+                        removed = true;
+                        if dep.is_none_or(|d| dependency_symlink_touches_build(rel, d)) {
+                            match res {
+                                Ok(_) => anyhow::bail!(
+                                    "Symlink escapes statement snapshot: {}",
+                                    target.display()
+                                ),
+                                Err(e) => {
+                                    return Err(e).with_context(|| {
+                                        format!(
+                                            "Unresolvable statement snapshot symlink: {}",
+                                            target.display()
+                                        )
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !removed {
+                break;
+            }
         }
         Ok(())
     })();
@@ -3659,7 +3775,7 @@ fn seed_statement_dependencies(
             dep.name,
             String::from_utf8_lossy(&out.stderr)
         );
-        materialize_statement_tree(&target, "HEAD", &target)?;
+        materialize_statement_tree(&target, "HEAD", &target, Some(dep))?;
     }
     Ok(())
 }
@@ -3749,12 +3865,12 @@ fn stock_statement_build_with_trust(project: &Path, is_untrusted: bool) -> Resul
                 })
         }) || pkg.exes.iter().any(|exe| exe.root == name);
         if owned {
-            lake_targets.push(format!("+{name}"));
+            lake_targets.push(format!("+{name}:olean"));
         } else {
             standalone.insert(name, (source, root));
         }
     }
-    // Ask Lake to refresh every registered module, including non-default targets.
+    // Ask Lake to refresh every registered module `.olean`, including non-default targets.
     if !lake_targets.is_empty() {
         let mut command = statement_lake_command(project, is_untrusted)?;
         command.arg("build").args(&lake_targets);
@@ -5436,6 +5552,147 @@ mod pr_verify_tests {
             error.to_string().contains("submodule gitlinks: submodule"),
             "{error}"
         );
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn seed_statement_dependencies_omits_non_lean_broken_symlinks_and_fails_closed_on_build_paths(
+    ) -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let dir = Path::new("/tmp").join(format!(
+            "turbo-dep-symlinks-{}-{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let root_proj = dir.join("root");
+        let dep_repo = root_proj.join(".lake/packages/fv");
+        fs::create_dir_all(dep_repo.join("FV"))?;
+        fs::create_dir_all(dep_repo.join("corpus/dsl/Corpus"))?;
+        fs::create_dir_all(dep_repo.join("docs"))?;
+        fs::write(
+            root_proj.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )?;
+        fs::write(
+            root_proj.join("lakefile.toml"),
+            "name = \"root_pkg\"\ndefaultTargets = [\"Root\"]\n[[lean_lib]]\nname = \"Root\"\n",
+        )?;
+        fs::write(
+            root_proj.join("Root.lean"),
+            "import FV.Basic\ntheorem ok : FV.val = 1 := rfl\n",
+        )?;
+        fs::write(
+            root_proj.join("lake-manifest.json"),
+            r#"{
+  "version": "1.2.0",
+  "packagesDir": ".lake/packages",
+  "packages": [
+    { "type": "git", "name": "fv", "rev": "HEAD", "url": "https://example.invalid/fv.git", "inherited": false }
+  ],
+  "name": "root_pkg",
+  "lakeDir": ".lake",
+  "fixedToolchain": false
+}"#,
+        )?;
+        fs::write(
+            dep_repo.join("lakefile.toml"),
+            r#"name = "fv"
+defaultTargets = ["FV"]
+[[lean_lib]]
+name = "FV"
+globs = ["FV.+"]
+[[lean_lib]]
+name = "Corpus"
+srcDir = "corpus/dsl"
+globs = ["Corpus.+"]
+"#,
+        )?;
+        fs::write(
+            dep_repo.join("FV/Basic.lean"),
+            "namespace FV\ndef val : Nat := 1\nend FV\n",
+        )?;
+        fs::write(
+            dep_repo.join("corpus/dsl/Corpus/Spec.lean"),
+            "namespace Corpus\ndef c : Nat := 2\nend Corpus\n",
+        )?;
+        fs::write(dep_repo.join("docs/real.txt"), "kept\n")?;
+        symlink(
+            "/home/kev/work/clifv-wt/publish-stack/lnsym-upstream",
+            dep_repo.join("lnsym-upstream"),
+        )?;
+        symlink("../../../etc/passwd", dep_repo.join("docs/escape-link"))?;
+        symlink("nonexistent-target", dep_repo.join("docs/dangling-link"))?;
+        symlink("dangling-link", dep_repo.join("docs/chained-dangling"))?;
+        symlink("real.txt", dep_repo.join("docs/valid-link"))?;
+        git_init_and_commit(&dep_repo, "clifv-like dep with non-lean broken symlinks")?;
+
+        let cfg = crate::module_builder::resolve_project_config_with_trust(&root_proj, true)?;
+        let snap = dir.join("snap-ok");
+        fs::create_dir_all(&snap)?;
+        seed_statement_dependencies(&snap, &cfg)?;
+        let seeded = snap.join(".lake/packages/fv");
+        assert!(seeded.join("FV/Basic.lean").is_file());
+        assert_eq!(
+            fs::read_to_string(seeded.join("docs/valid-link"))?,
+            "kept\n"
+        );
+        for omitted in [
+            "lnsym-upstream",
+            "docs/escape-link",
+            "docs/dangling-link",
+            "docs/chained-dangling",
+        ] {
+            assert!(
+                fs::symlink_metadata(seeded.join(omitted)).is_err(),
+                "unsafe non-build symlink `{omitted}` must not exist on disk"
+            );
+        }
+
+        let live_fv_snap = dir.join("snap-live-fv");
+        fs::create_dir_all(&live_fv_snap)?;
+        let repo_lean = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lean");
+        if repo_lean.join(".lake/packages/fv/.git").exists() {
+            let live_cfg =
+                crate::module_builder::resolve_project_config_with_trust(&repo_lean, true)?;
+            seed_statement_dependencies(&live_fv_snap, &live_cfg)?;
+            assert!(
+                fs::symlink_metadata(live_fv_snap.join(".lake/packages/fv/lnsym-upstream"))
+                    .is_err(),
+                "upstream broken absolute symlink in clifv must be omitted"
+            );
+            assert!(
+                live_fv_snap
+                    .join(".lake/packages/fv/FV/Basic.lean")
+                    .exists()
+                    || live_fv_snap
+                        .join(".lake/packages/fv/lakefile.toml")
+                        .is_file()
+            );
+        }
+
+        for (bad_rel, bad_target) in [
+            ("FV/Bad.lean", "/etc/passwd"),
+            ("FV/Sub", "../../../etc"),
+            ("corpus/dsl/Corpus/Bad", "missing"),
+            ("lakefile.lean", "/etc/passwd"),
+            ("lean-toolchain", "missing"),
+        ] {
+            let full = dep_repo.join(bad_rel);
+            if let Some(p) = full.parent() {
+                fs::create_dir_all(p)?;
+            }
+            symlink(bad_target, &full)?;
+            git_init_and_commit(&dep_repo, &format!("bad symlink {bad_rel}"))?;
+            let snap_bad = dir.join(format!("snap-bad-{}", pack::next_tmp_id()));
+            fs::create_dir_all(&snap_bad)?;
+            assert!(
+                seed_statement_dependencies(&snap_bad, &cfg).is_err(),
+                "dependency symlink at `{bad_rel}` -> `{bad_target}` must fail closed"
+            );
+            fs::remove_file(&full)?;
+            git_init_and_commit(&dep_repo, &format!("cleanup {bad_rel}"))?;
+        }
         fs::remove_dir_all(dir)?;
         Ok(())
     }
