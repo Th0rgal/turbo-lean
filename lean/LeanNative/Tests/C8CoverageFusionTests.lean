@@ -58,11 +58,12 @@ def twoStageFused : LNIRCode := fuseParForCode twoStageParFor
 
 #guard countParForLaunches twoStageParFor == 2
 #guard countParForLaunches twoStageFused == 1
-#guard countParForLaunches (fuseParForCode twoStageRcParFor) == 2
+#guard countParForLaunches (fuseParForCode twoStageRcParFor) == 1
 -- Unfused allocates 2 buffers (`nextId`: 10 -> 12); fused allocates 1 buffer (`nextId`: 10 -> 11)
 -- with identical output elements `(x * 3 + 5) * 2 + 7 = x * 6 + 17` on `#[5, 6, 7, 8]`:
 #guard runSarrayEval fusionEnv baseHeap twoStageParFor == some (#[47, 53, 59, 65], 12)
 #guard runSarrayEval fusionEnv baseHeap twoStageFused == some (#[47, 53, 59, 65], 11)
+#guard runSarrayEval fusionEnv baseHeap (fuseParForCode twoStageRcParFor) == some (#[47, 53, 59, 65], 11)
 
 /-- 3-stage pipeline: `t1 := mapScaleAdd 2 1 src1; t2 := saxpy 3 t1 src2; out := zipAdd t2 src3`. -/
 def threeStageParFor : LNIRCode :=
@@ -106,6 +107,36 @@ def boolProducerCustomParFor : LNIRCode :=
 #guard countParForLaunches (fuseParForCode boolProducerCustomParFor) == 1
 #guard runSarrayEval fusionEnv baseHeap boolProducerCustomParFor == some (#[11, 10, 10, 10], 12)
 #guard runSarrayEval fusionEnv baseHeap (fuseParForCode boolProducerCustomParFor) == some (#[11, 10, 10, 10], 11)
+
+/-- Capture-avoidance guard (`idx2 == pVar`): producer uses `idx1 = 0, pVars = [1]` (`i + src1[i]`)
+    and consumer uses `idx2 = 1, cVars = [2]` (`tmp[i]`); aligning both to fresh `freshIdx` avoids
+    capturing `pVar = 1` as the loop index (`#[5 + 0, 6 + 1, 7 + 2, 8 + 3] = #[5, 7, 9, 11]`). -/
+def idxCaptureRegressionParFor : LNIRCode :=
+  .parFor 11 0 [1] .i64 (.customScalar 0 [1] (.binOp .add (.var 0) (.var 1)))
+    (.parFor 12 0 [11] .i64 (.customScalar 1 [2] (.var 2))
+      (.ret 12))
+
+#guard countParForLaunches (fuseParForCode idxCaptureRegressionParFor) == 1
+#guard runSarrayEval fusionEnv baseHeap idxCaptureRegressionParFor == some (#[5, 7, 9, 11], 12)
+#guard runSarrayEval fusionEnv baseHeap (fuseParForCode idxCaptureRegressionParFor) == some (#[5, 7, 9, 11], 11)
+
+/-- Bounds-check preservation guard: when consumer ignores its element parameter (`cBody = .constU64 9`)
+    and `src1` is shorter than `len = 4`, both unfused and fused trap with `.outOfBounds 2 2`. -/
+def unusedConsumerOobParFor : LNIRCode :=
+  .parFor 11 0 [1] .i64 (.mapScaleAdd 3 5)
+    (.parFor 12 0 [11] .i64 (.customScalar 60 [61] (.constU64 9))
+      (.ret 12))
+
+def shortSrcHeap : HeapState :=
+  { buffers := [{ id := 1, exclusive := true, data := #[5, 6] }], nextId := 10 }
+
+def isOutOfBounds22 : Except UBError (Val × HeapState) → Bool
+  | .error (.outOfBounds 2 2) => true
+  | _ => false
+
+#guard countParForLaunches (fuseParForCode unusedConsumerOobParFor) == 1
+#guard isOutOfBounds22 (evalCode 16 fusionEnv shortSrcHeap unusedConsumerOobParFor) == true
+#guard isOutOfBounds22 (evalCode 16 fusionEnv shortSrcHeap (fuseParForCode unusedConsumerOobParFor)) == true
 
 /-- Intra-kernel specialization via segregated `builtinKernelFusionPlugin` (`verifyOptPluginGate`):
     specializes `.customScalar` `x * 4 + 9` into `.mapScaleAdd 4 9` (`declScalarCost`: `5 -> 0`). -/

@@ -355,11 +355,13 @@ def fuseTwoParForStage
           match coerceProducerScalarToU64? (idx1 :: pVars) pBody with
           | none => none
           | some pBodyU64 =>
-            let pBodyIdxAligned := substScalarVar idx1 (.var idx2) pBodyU64
-            match substConsumerInputs tmpVar inputs1 pVars pBodyIdxAligned (base + 100) inputs2 cVars cBody with
+            let freshIdx := base + 99
+            let pBodyFreshIdx := substScalarVar idx1 (.var freshIdx) pBodyU64
+            let cBodyFreshIdx := substScalarVar idx2 (.var freshIdx) cBody
+            match substConsumerInputs tmpVar inputs1 pVars pBodyFreshIdx (base + 100) inputs2 cVars cBodyFreshIdx with
             | some (fusedInputs, fusedVars, fusedBody) =>
               let simplified := contractKernelScalar fusedBody
-              let kern := specializeKernel (.customScalar idx2 fusedVars simplified)
+              let kern := specializeKernel (.customScalar freshIdx fusedVars simplified)
               some (fusedInputs, kern)
             | none => none
       | _, _ => none
@@ -395,13 +397,13 @@ def fuseParForCode : LNIRCode → LNIRCode
   | .parFor out1 len1 in1 ety1 k1 k =>
     let k1' := specializeKernel k1
     let k' := fuseParForCode k
-    let kCleaned := stripDeadTmpDecRef out1 k'
-    match kCleaned with
+    match k' with
     | .parFor out2 len2 in2 ety2 k2 rest =>
-      if out1 != out2 && len1 == len2 && sameElemType ety1 ety2 && !codeUsesVar out1 rest then
+      let restCleaned := stripDeadTmpDecRef out1 rest
+      if out1 != out2 && len1 == len2 && sameElemType ety1 ety2 && !codeUsesVar out1 restCleaned then
         match fuseTwoParForStage out1 in1 k1' in2 k2 with
         | some (fusedIns, fusedKern) =>
-          .parFor out2 len2 fusedIns ety2 fusedKern rest
+          .parFor out2 len2 fusedIns ety2 fusedKern restCleaned
         | none => .parFor out1 len1 in1 ety1 k1' k'
       else
         .parFor out1 len1 in1 ety1 k1' k'
