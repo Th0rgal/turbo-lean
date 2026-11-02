@@ -5,9 +5,14 @@ import LeanNative.Backend.MetalAst
 # Executable & Kernel-Checked SIMT Tests for `PTXAst` and `MetalAst` (`C2b`)
 
 Covers multi-thread SIMT vector addition, shared-memory reduction, divergent barrier detection,
-read-only `constant` address-space violation, and out-of-bounds buffer writes. Every scenario is
-checked twice: `#guard` runs the evaluator, and a kernel-checked `rfl` theorem re-proves the same
-equality with `0 sorryAx` and no `native_decide`.
+read-only `constant` address-space violation, out-of-bounds buffer writes, declared-register
+enforcement (`regDecls`), `atom.cas` & atomic vs non-atomic epoch race rules, multi-lane Metal
+vectors/structs (`ulong2`, `u256`, `.structTy`), single-pass simdgroup collectives, depth-8 helper
+calls with >64-step helper loops, `thread` local arrays with pass-by-reference write-back,
+short-circuit `&&`/`||`, pointer dereference & `atomic_exchange_explicit`, C++/MSL integer rank
+promotion, and signed arithmetic shifts. Every scenario is checked twice: `#guard` runs the
+evaluator, and a kernel-checked `rfl` theorem re-proves the same equality with `0 sorryAx` and no
+`native_decide`.
 -/
 
 namespace LeanNative.Tests.GpuAstTests
@@ -24,48 +29,6 @@ abbrev MSLRes := LeanNative.Backend.MetalAst.MSLOutcome MSLDevTable
 open LeanNative.Backend.PTXAst
 open LeanNative.Backend.MetalAst
 
-/-! ## 1. CUDA PTX: 2-thread SIMT vector addition (`out[i] = a[i] + b[i]`) -/
-
-def ptxVecAddBody : List PTXStmt :=
-  [ .instr none (.mov .u32 "%r_tid" (.sreg .tidX))
-  , .instr none (.mul .lo .u64 "%r_off" (.reg "%r_tid") (.immU64 8#64))
-  , .instr none (.ldParam .u64 "%r_a" "param_a")
-  , .instr none (.add .none .u64 "%r_a_addr" (.reg "%r_a") (.reg "%r_off"))
-  , .instr none (.ldGlobal .u64 "%r_av" (.regOffset "%r_a_addr" 0))
-  , .instr none (.ldParam .u64 "%r_b" "param_b")
-  , .instr none (.add .none .u64 "%r_b_addr" (.reg "%r_b") (.reg "%r_off"))
-  , .instr none (.ldGlobal .u64 "%r_bv" (.regOffset "%r_b_addr" 0))
-  , .instr none (.add .none .u64 "%r_sum" (.reg "%r_av") (.reg "%r_bv"))
-  , .instr none (.ldParam .u64 "%r_o" "param_out")
-  , .instr none (.add .none .u64 "%r_o_addr" (.reg "%r_o") (.reg "%r_off"))
-  , .instr none (.stGlobal .u64 (.regOffset "%r_o_addr" 0) (.reg "%r_sum"))
-  , .instr none .ret ]
-
-def ptxVecAddKernel : PTXKernel where
-  name := "vec_add_u64"
-  params := [ { ty := .u64, name := "param_a" }
-            , { ty := .u64, name := "param_b" }
-            , { ty := .u64, name := "param_out" } ]
-  body := ptxVecAddBody
-
-def ptxVecAddGlobal : LeanNative.Backend.PTXAst.ByteMemory :=
-  LeanNative.Backend.PTXAst.ByteMemory.ofU64Words
-    [ 3#64, 5#64
-    , 10#64, 20#64
-    , 0#64, 0#64 ]
-
-def ptxVecAddParams : LeanNative.Backend.PTXAst.ParamMemory :=
-  { params := [ ("param_a", 0#64), ("param_b", 16#64), ("param_out", 32#64) ] }
-
-def ptxVecAddResult : LeanNative.Backend.PTXAst.PTXOutcome LeanNative.Backend.PTXAst.ByteMemory :=
-  evalPTXKernel 32 ptxVecAddKernel { x := 1 } { x := 2 } ptxVecAddGlobal ptxVecAddParams
-
-def ptxVecAddExpected : LeanNative.Backend.PTXAst.PTXOutcome LeanNative.Backend.PTXAst.ByteMemory :=
-  .ok (LeanNative.Backend.PTXAst.ByteMemory.ofU64Words
-    [ 3#64, 5#64
-    , 10#64, 20#64
-    , 13#64, 25#64 ])
-
 def ptxReadWord? (r : PTXRes) (idx : Nat) : Option (BitVec 64) :=
   match r with
   | .ok m => m.readU64Word? idx
@@ -79,6 +42,56 @@ def mslReadWord? (r : MSLRes) (bufIdx elemIdx : Nat) : Option (BitVec 64) :=
     | none => none
   | _ => none
 
+def mslReadU32? (res : MSLRes) (bufIdx elemIdx : Nat) : Option (BitVec 32) :=
+  match res with
+  | .ok bufs => (bufs.lookup bufIdx).bind (fun m => m.readU32Word? elemIdx)
+  | _ => none
+
+/-! ## 1. CUDA PTX: 2-thread SIMT vector addition (`out[i] = a[i] + b[i]`) -/
+
+def ptxVecAddBody : List PTXStmt :=
+  [ .instr none (.mov .u32 "%r0" (.sreg .tidX))
+  , .instr none (.cvt .none .u64 .u32 "%rd0" (.reg "%r0"))
+  , .instr none (.mul .lo .u64 "%rd1" (.reg "%rd0") (.immU64 8#64))
+  , .instr none (.ldParam .u64 "%rd2" "param_a")
+  , .instr none (.add .none .u64 "%rd3" (.reg "%rd2") (.reg "%rd1"))
+  , .instr none (.ldGlobal .u64 "%rd4" (.regOffset "%rd3" 0))
+  , .instr none (.ldParam .u64 "%rd5" "param_b")
+  , .instr none (.add .none .u64 "%rd6" (.reg "%rd5") (.reg "%rd1"))
+  , .instr none (.ldGlobal .u64 "%rd7" (.regOffset "%rd6" 0))
+  , .instr none (.add .none .u64 "%rd8" (.reg "%rd4") (.reg "%rd7"))
+  , .instr none (.ldParam .u64 "%rd9" "param_out")
+  , .instr none (.add .none .u64 "%rd10" (.reg "%rd9") (.reg "%rd1"))
+  , .instr none (.stGlobal .u64 (.regOffset "%rd10" 0) (.reg "%rd8"))
+  , .instr none .ret ]
+
+def ptxVecAddKernel : PTXKernel where
+  name := "vec_add_u64"
+  params := [ { ty := .u64, name := "param_a" }
+            , { ty := .u64, name := "param_b" }
+            , { ty := .u64, name := "param_out" } ]
+  regDecls := [ { ty := .u32, prefixName := "%r", count := 1 }
+              , { ty := .u64, prefixName := "%rd", count := 11 } ]
+  body := ptxVecAddBody
+
+def ptxVecAddGlobal : PTXMem :=
+  LeanNative.Backend.PTXAst.ByteMemory.ofU64Words
+    [ 3#64, 5#64
+    , 10#64, 20#64
+    , 0#64, 0#64 ]
+
+def ptxVecAddParams : PTXParams :=
+  { params := [ ("param_a", 0#64), ("param_b", 16#64), ("param_out", 32#64) ] }
+
+def ptxVecAddResult : PTXRes :=
+  evalPTXKernel 32 ptxVecAddKernel { x := 1 } { x := 2 } ptxVecAddGlobal ptxVecAddParams
+
+def ptxVecAddExpected : PTXRes :=
+  .ok (LeanNative.Backend.PTXAst.ByteMemory.ofU64Words
+    [ 3#64, 5#64
+    , 10#64, 20#64
+    , 13#64, 25#64 ])
+
 #guard ptxVecAddResult == ptxVecAddExpected
 
 theorem ptx_vec_add_kernel_checked :
@@ -88,40 +101,44 @@ theorem ptx_vec_add_kernel_checked :
 /-! ## 2. CUDA PTX: 2-thread shared-memory reduction (`sum(xs)` via `.shared` + `bar.sync`) -/
 
 def ptxReduceBody : List PTXStmt :=
-  [ .instr none (.mov .u32 "%r_tid" (.sreg .tidX))
-  , .instr none (.mul .lo .u64 "%r_off" (.reg "%r_tid") (.immU64 8#64))
-  , .instr none (.ldParam .u64 "%r_in" "param_in")
-  , .instr none (.add .none .u64 "%r_in_addr" (.reg "%r_in") (.reg "%r_off"))
-  , .instr none (.ldGlobal .u64 "%r_v" (.regOffset "%r_in_addr" 0))
-  , .instr none (.mov .u64 "%r_smem" (.sym "smem"))
-  , .instr none (.add .none .u64 "%r_smem_addr" (.reg "%r_smem") (.reg "%r_off"))
-  , .instr none (.stShared .u64 (.regOffset "%r_smem_addr" 0) (.reg "%r_v"))
+  [ .instr none (.mov .u32 "%r0" (.sreg .tidX))
+  , .instr none (.cvt .none .u64 .u32 "%rd0" (.reg "%r0"))
+  , .instr none (.mul .lo .u64 "%rd1" (.reg "%rd0") (.immU64 8#64))
+  , .instr none (.ldParam .u64 "%rd2" "param_in")
+  , .instr none (.add .none .u64 "%rd3" (.reg "%rd2") (.reg "%rd1"))
+  , .instr none (.ldGlobal .u64 "%rd4" (.regOffset "%rd3" 0))
+  , .instr none (.mov .u64 "%rd5" (.sym "smem"))
+  , .instr none (.add .none .u64 "%rd6" (.reg "%rd5") (.reg "%rd1"))
+  , .instr none (.stShared .u64 (.regOffset "%rd6" 0) (.reg "%rd4"))
   , .instr none (.barSync 0)
-  , .instr none (.setp .eq .u32 "%p_is0" (.reg "%r_tid") (.immU64 0#64))
-  , .instr (some { predReg := "%p_is0" }) (.ldShared .u64 "%r_s0" (.symOffset "smem" 0))
-  , .instr (some { predReg := "%p_is0" }) (.ldShared .u64 "%r_s1" (.symOffset "smem" 8))
-  , .instr (some { predReg := "%p_is0" }) (.add .none .u64 "%r_acc" (.reg "%r_s0") (.reg "%r_s1"))
-  , .instr (some { predReg := "%p_is0" }) (.ldParam .u64 "%r_out" "param_out")
-  , .instr (some { predReg := "%p_is0" })
-      (.stGlobal .u64 (.regOffset "%r_out" 0) (.reg "%r_acc"))
+  , .instr none (.setp .eq .u32 "%p0" (.reg "%r0") (.immU64 0#64))
+  , .instr (some { predReg := "%p0" }) (.ldShared .u64 "%rd7" (.symOffset "smem" 0))
+  , .instr (some { predReg := "%p0" }) (.ldShared .u64 "%rd8" (.symOffset "smem" 8))
+  , .instr (some { predReg := "%p0" }) (.add .none .u64 "%rd9" (.reg "%rd7") (.reg "%rd8"))
+  , .instr (some { predReg := "%p0" }) (.ldParam .u64 "%rd10" "param_out")
+  , .instr (some { predReg := "%p0" })
+      (.stGlobal .u64 (.regOffset "%rd10" 0) (.reg "%rd9"))
   , .instr none .ret ]
 
 def ptxReduceKernel : PTXKernel where
   name := "shared_reduce_u64"
   params := [ { ty := .u64, name := "param_in" }, { ty := .u64, name := "param_out" } ]
   sharedDecls := [ { align := 8, elemTy := .u64, name := "smem", count := 2 } ]
+  regDecls := [ { ty := .u32, prefixName := "%r", count := 1 }
+              , { ty := .u64, prefixName := "%rd", count := 11 }
+              , { ty := .pred, prefixName := "%p", count := 1 } ]
   body := ptxReduceBody
 
-def ptxReduceGlobal : LeanNative.Backend.PTXAst.ByteMemory :=
+def ptxReduceGlobal : PTXMem :=
   LeanNative.Backend.PTXAst.ByteMemory.ofU64Words [ 17#64, 25#64, 0#64 ]
 
-def ptxReduceParams : LeanNative.Backend.PTXAst.ParamMemory :=
+def ptxReduceParams : PTXParams :=
   { params := [ ("param_in", 0#64), ("param_out", 16#64) ] }
 
-def ptxReduceResult : LeanNative.Backend.PTXAst.PTXOutcome LeanNative.Backend.PTXAst.ByteMemory :=
+def ptxReduceResult : PTXRes :=
   evalPTXKernel 64 ptxReduceKernel { x := 1 } { x := 2 } ptxReduceGlobal ptxReduceParams
 
-def ptxReduceExpected : LeanNative.Backend.PTXAst.PTXOutcome LeanNative.Backend.PTXAst.ByteMemory :=
+def ptxReduceExpected : PTXRes :=
   .ok (LeanNative.Backend.PTXAst.ByteMemory.ofU64Words [ 17#64, 25#64, 42#64 ])
 
 #guard ptxReduceResult == ptxReduceExpected
@@ -131,18 +148,18 @@ theorem ptx_shared_reduce_kernel_checked :
 
 /-! ## 3. CUDA PTX: divergent `bar.sync` is rejected -/
 
-def ptxDivergentBody : List PTXStmt :=
-  [ .instr none (.mov .u32 "%r_tid" (.sreg .tidX))
-  , .instr none (.setp .eq .u32 "%p_is0" (.reg "%r_tid") (.immU64 0#64))
-  , .instr (some { predReg := "%p_is0" }) (.barSync 0)
-  , .instr none .ret ]
-
 def ptxDivergentKernel : PTXKernel where
   name := "divergent_barrier"
   params := []
-  body := ptxDivergentBody
+  regDecls := [ { ty := .u32, prefixName := "%r", count := 1 }
+              , { ty := .pred, prefixName := "%p", count := 1 } ]
+  body :=
+    [ .instr none (.mov .u32 "%r0" (.sreg .tidX))
+    , .instr none (.setp .eq .u32 "%p0" (.reg "%r0") (.immU64 0#64))
+    , .instr (some { predReg := "%p0" }) (.barSync 0)
+    , .instr none .ret ]
 
-def ptxDivergentResult : LeanNative.Backend.PTXAst.PTXOutcome LeanNative.Backend.PTXAst.ByteMemory :=
+def ptxDivergentResult : PTXRes :=
   evalPTXKernel 32 ptxDivergentKernel { x := 1 } { x := 2 }
     (LeanNative.Backend.PTXAst.ByteMemory.zeros 0) { params := [] }
 
@@ -153,17 +170,16 @@ theorem ptx_divergent_barrier_kernel_checked :
 
 /-! ## 4. CUDA PTX: out-of-bounds global store is rejected -/
 
-def ptxOobBody : List PTXStmt :=
-  [ .instr none (.mov .u64 "%r_base" (.immU64 16#64))
-  , .instr none (.stGlobal .u64 (.regOffset "%r_base" 0) (.immU64 1#64))
-  , .instr none .ret ]
-
 def ptxOobKernel : PTXKernel where
   name := "oob_store"
   params := []
-  body := ptxOobBody
+  regDecls := [ { ty := .u64, prefixName := "%rd", count := 1 } ]
+  body :=
+    [ .instr none (.mov .u64 "%rd0" (.immU64 16#64))
+    , .instr none (.stGlobal .u64 (.regOffset "%rd0" 0) (.immU64 1#64))
+    , .instr none .ret ]
 
-def ptxOobResult : LeanNative.Backend.PTXAst.PTXOutcome LeanNative.Backend.PTXAst.ByteMemory :=
+def ptxOobResult : PTXRes :=
   evalPTXKernel 16 ptxOobKernel { x := 1 } { x := 1 }
     (LeanNative.Backend.PTXAst.ByteMemory.zeros 8) { params := [] }
 
@@ -189,7 +205,7 @@ def mslVecAddKernel : MSLKernelDecl where
     , { ty := .uint, name := "gid", attr := some .threadPositionInGrid } ]
   body := mslVecAddBody
 
-def mslVecAddDevice : List (Nat × LeanNative.Backend.MetalAst.ByteMemory) :=
+def mslVecAddDevice : MSLDevTable :=
   [ (0, LeanNative.Backend.MetalAst.ByteMemory.ofU64Words [ 3#64, 5#64 ])
   , (1, LeanNative.Backend.MetalAst.ByteMemory.ofU64Words [ 10#64, 20#64 ])
   , (2, LeanNative.Backend.MetalAst.ByteMemory.zeros 16) ]
@@ -231,7 +247,7 @@ def mslReduceKernel : MSLKernelDecl where
   sharedDecls := [ { elemTy := .ulong, name := "smem", count := 2 } ]
   body := mslReduceBody
 
-def mslReduceDevice : List (Nat × LeanNative.Backend.MetalAst.ByteMemory) :=
+def mslReduceDevice : MSLDevTable :=
   [ (0, LeanNative.Backend.MetalAst.ByteMemory.ofU64Words [ 17#64, 25#64 ])
   , (1, LeanNative.Backend.MetalAst.ByteMemory.zeros 8) ]
 
@@ -249,17 +265,14 @@ theorem msl_shared_reduce_kernel_checked :
 
 /-! ## 7. Apple Metal: divergent `threadgroup_barrier` is rejected -/
 
-def mslDivergentBody : List MSLStmt :=
-  [ .ifElse (.eq (.var "tid") (.immU64 0#64))
-      (.cons .threadgroupBarrier .nil)
-      .nil
-  , .returnStmt ]
-
 def mslDivergentKernel : MSLKernelDecl where
   name := "divergent_barrier"
-  params :=
-    [ { ty := .uint, name := "tid", attr := some .threadPositionInThreadgroup } ]
-  body := mslDivergentBody
+  params := [ { ty := .uint, name := "tid", attr := some .threadPositionInThreadgroup } ]
+  body :=
+    [ .ifElse (.eq (.var "tid") (.immU64 0#64))
+        (.cons .threadgroupBarrier .nil)
+        .nil
+    , .returnStmt ]
 
 def mslDivergentResult : MSLRes :=
   evalMSLKernel 32 mslDivergentKernel { x := 1 } { x := 2 } [] []
@@ -271,15 +284,12 @@ theorem msl_divergent_barrier_kernel_checked :
 
 /-! ## 8. Apple Metal: writing a `constant` buffer is rejected -/
 
-def mslConstWriteBody : List MSLStmt :=
-  [ .indexAssign "coeffs" (.immU64 0#64) (.immU64 99#64)
-  , .returnStmt ]
-
 def mslConstWriteKernel : MSLKernelDecl where
   name := "constant_write"
-  params :=
-    [ { ty := .pointer .constant false .ulong, name := "coeffs", attr := some (.buffer 3) } ]
-  body := mslConstWriteBody
+  params := [ { ty := .pointer .constant false .ulong, name := "coeffs", attr := some (.buffer 3) } ]
+  body :=
+    [ .indexAssign "coeffs" (.immU64 0#64) (.immU64 99#64)
+    , .returnStmt ]
 
 def mslConstWriteResult : MSLRes :=
   evalMSLKernel 16 mslConstWriteKernel { x := 1 } { x := 1 } []
@@ -292,15 +302,12 @@ theorem msl_constant_write_rejected_kernel_checked :
 
 /-! ## 9. Apple Metal: out-of-bounds `device` store is rejected -/
 
-def mslOobBody : List MSLStmt :=
-  [ .indexAssign "buf" (.immU64 4#64) (.immU64 1#64)
-  , .returnStmt ]
-
 def mslOobKernel : MSLKernelDecl where
   name := "oob_store"
-  params :=
-    [ { ty := .pointer .device false .ulong, name := "buf", attr := some (.buffer 0) } ]
-  body := mslOobBody
+  params := [ { ty := .pointer .device false .ulong, name := "buf", attr := some (.buffer 0) } ]
+  body :=
+    [ .indexAssign "buf" (.immU64 4#64) (.immU64 1#64)
+    , .returnStmt ]
 
 def mslOobResult : MSLRes :=
   evalMSLKernel 16 mslOobKernel { x := 1 } { x := 1 }
@@ -311,16 +318,14 @@ def mslOobResult : MSLRes :=
 theorem msl_oob_write_kernel_checked :
     mslOobResult = .outOfBoundsWrite .device 0 4 := rfl
 
-/-! ## 10. Finding coverage: PTX div0, signed overflow, float remainder, shift width, races -/
-
-def ptxDiv0Body : List PTXStmt :=
-  [ .instr none (.div .u64 "%r" (.immU64 7#64) (.immU64 0#64))
-  , .instr none .ret ]
+/-! ## 10. PTX div0, signed overflow, float remainder, shift width, non-atomic race -/
 
 def ptxDiv0Kernel : PTXKernel where
   name := "div0"
-  params := []
-  body := ptxDiv0Body
+  regDecls := [ { ty := .u64, prefixName := "%rd", count := 1 } ]
+  body :=
+    [ .instr none (.div .u64 "%rd0" (.immU64 7#64) (.immU64 0#64))
+    , .instr none .ret ]
 
 def ptxDiv0Result : PTXRes :=
   evalPTXKernel 16 ptxDiv0Kernel { x := 1 } { x := 1 }
@@ -331,14 +336,12 @@ def ptxDiv0Result : PTXRes :=
 theorem ptx_div_zero_kernel_checked :
     ptxDiv0Result = .divisionByZero := rfl
 
-def ptxSdivBody : List PTXStmt :=
-  [ .instr none (.div .s32 "%r" (.immU64 2147483648#64) (.immU64 4294967295#64))
-  , .instr none .ret ]
-
 def ptxSdivKernel : PTXKernel where
   name := "sdiv_overflow"
-  params := []
-  body := ptxSdivBody
+  regDecls := [ { ty := .s32, prefixName := "%r", count := 1 } ]
+  body :=
+    [ .instr none (.div .s32 "%r0" (.immU64 2147483648#64) (.immU64 4294967295#64))
+    , .instr none .ret ]
 
 def ptxSdivResult : PTXRes :=
   evalPTXKernel 16 ptxSdivKernel { x := 1 } { x := 1 }
@@ -349,14 +352,12 @@ def ptxSdivResult : PTXRes :=
 theorem ptx_signed_div_overflow_kernel_checked :
     ptxSdivResult = .signedDivOverflow := rfl
 
-def ptxFloatRemBody : List PTXStmt :=
-  [ .instr none (.rem .f32 "%r" (.immF32 0) (.immF32 1))
-  , .instr none .ret ]
-
 def ptxFloatRemKernel : PTXKernel where
   name := "float_rem"
-  params := []
-  body := ptxFloatRemBody
+  regDecls := [ { ty := .f32, prefixName := "%f", count := 1 } ]
+  body :=
+    [ .instr none (.rem .f32 "%f0" (.immF32 0) (.immF32 1))
+    , .instr none .ret ]
 
 def ptxFloatRemResult : PTXRes :=
   evalPTXKernel 16 ptxFloatRemKernel { x := 1 } { x := 1 }
@@ -367,14 +368,12 @@ def ptxFloatRemResult : PTXRes :=
 theorem ptx_float_rem_kernel_checked :
     ptxFloatRemResult = .unsupportedFloatOp "rem on floating-point type" := rfl
 
-def ptxShiftBody : List PTXStmt :=
-  [ .instr none (.shl .u32 "%r" (.immU64 1#64) (.immU64 0x1_0000_0000#64))
-  , .instr none .ret ]
-
 def ptxShiftKernel : PTXKernel where
   name := "shift_oob"
-  params := []
-  body := ptxShiftBody
+  regDecls := [ { ty := .u32, prefixName := "%r", count := 1 } ]
+  body :=
+    [ .instr none (.shl .u32 "%r0" (.immU64 1#64) (.immU64 0x1_0000_0000#64))
+    , .instr none .ret ]
 
 def ptxShiftResult : PTXRes :=
   evalPTXKernel 16 ptxShiftKernel { x := 1 } { x := 1 }
@@ -385,15 +384,13 @@ def ptxShiftResult : PTXRes :=
 theorem ptx_shift_width_kernel_checked :
     ptxShiftResult = .invalidOperand "shift amount exceeds 32-bit .u32/.b32 operand width" := rfl
 
-def ptxRaceBody : List PTXStmt :=
-  [ .instr none (.stGlobal .u64 (.regOffset "%r_base" 0) (.immU64 1#64))
-  , .instr none .ret ]
-
 def ptxRaceKernel : PTXKernel where
   name := "race_store"
-  params := []
+  regDecls := [ { ty := .u64, prefixName := "%rd", count := 1 } ]
   body :=
-    [ .instr none (.mov .u64 "%r_base" (.immU64 0#64)) ] ++ ptxRaceBody
+    [ .instr none (.mov .u64 "%rd0" (.immU64 0#64))
+    , .instr none (.stGlobal .u64 (.regOffset "%rd0" 0) (.immU64 1#64))
+    , .instr none .ret ]
 
 def ptxRaceResult : PTXRes :=
   evalPTXKernel 32 ptxRaceKernel { x := 1 } { x := 2 }
@@ -404,19 +401,7 @@ def ptxRaceResult : PTXRes :=
 theorem ptx_data_race_kernel_checked :
     ptxRaceResult = .dataRace .global 0 := rfl
 
-/-! ## 11. Finding coverage: Metal div0, signed overflow, short-circuit vs eager select, float rem, shift, race -/
-
-def mslUnaryKernel (name : String) (body : List MSLStmt) : MSLKernelDecl where
-  name := name
-  params :=
-    [ { ty := .ulong, name := "rx", attr := none }
-    , { ty := .ulong, name := "ry", attr := none } ]
-  body := body
-
-def mslDiv0Kernel : MSLKernelDecl :=
-  mslUnaryKernel "msl_div0"
-    [ .varDecl .ulong "q" (.div (.var "rx") (.var "ry"))
-    , .returnStmt ]
+/-! ## 11. Metal div0, signed overflow, short-circuit vs eager select, float rem, shift, race -/
 
 def mslLocalsRxRy (rx ry : BitVec 64) (rxTy ryTy : MSLType) : MSLLocals :=
   MSLLocals.empty.setTyped "rx" rxTy rx |>.setTyped "ry" ryTy ry
@@ -480,8 +465,7 @@ theorem msl_shift_width_kernel_checked :
 
 def mslRaceKernel : MSLKernelDecl where
   name := "msl_race"
-  params :=
-    [ { ty := .pointer .device false .ulong, name := "buf", attr := some (.buffer 0) } ]
+  params := [ { ty := .pointer .device false .ulong, name := "buf", attr := some (.buffer 0) } ]
   body :=
     [ .indexAssign "buf" (.immU64 0#64) (.immU64 1#64)
     , .returnStmt ]
@@ -495,11 +479,14 @@ def mslRaceResult : MSLRes :=
 theorem msl_data_race_kernel_checked :
     mslRaceResult = .dataRace .device 0 := rfl
 
-/-! ## 12. Finding 2–5 end-to-end coverage: IEEE-754 floats, 3D coords, multi-CTA/local/const/atomics/shuffle, helpers & `u256` -/
+/-! ## 12. IEEE-754 floats, 3D coords, multi-CTA/local/const/atomics/shuffle, helpers & `u256` -/
 
 def ptxFmaKernel : PTXKernel where
   name := "ptx_fma_f32"
   params := [ { ty := .u64, name := "out_ptr" } ]
+  regDecls := [ { ty := .u64, prefixName := "%rd", count := 1 }
+              , { ty := .f32, prefixName := "%f", count := 1 }
+              , { ty := .f64, prefixName := "%fd", count := 1 } ]
   body :=
     [ .instr none (.ldParam .u64 "%rd0" "out_ptr")
     , .instr none (.fma .rn .f32 "%f0" (.immF32 0x3FC00000) (.immF32 0x40000000) (.immF32 0x3F000000))
@@ -521,26 +508,29 @@ def ptxMultiCtaKernel : PTXKernel where
   name := "ptx_multi_cta_local_const_atom_shfl"
   params := [ { ty := .u64, name := "out_ptr" } ]
   localBytes := 8
+  regDecls := [ { ty := .u32, prefixName := "%r", count := 3 }
+              , { ty := .b32, prefixName := "%rb", count := 2 }
+              , { ty := .u64, prefixName := "%rd", count := 10 } ]
   body :=
-    [ .instr none (.ldParam .u64 "%rd_out" "out_ptr")
-    , .instr none (.mov .u32 "%r_tid" (.sreg .tidX))
-    , .instr none (.mov .u32 "%r_ty" (.sreg .tidY))
-    , .instr none (.mov .u32 "%r_cta" (.sreg .ctaidX))
-    , .instr none (.mov .u64 "%rd_zero" (.immU64 0#64))
-    , .instr none (.ldConst .u64 "%rd_c" (.regOffset "%rd_zero" 0))
-    , .instr none (.cvt .none .u64 .u32 "%rd_tid" (.reg "%r_tid"))
-    , .instr none (.cvt .none .u64 .u32 "%rd_ty" (.reg "%r_ty"))
-    , .instr none (.cvt .none .u64 .u32 "%rd_cta" (.reg "%r_cta"))
-    , .instr none (.add .none .u64 "%rd_sum" (.reg "%rd_tid") (.reg "%rd_ty"))
-    , .instr none (.add .none .u64 "%rd_sum" (.reg "%rd_sum") (.reg "%rd_cta"))
-    , .instr none (.add .none .u64 "%rd_sum" (.reg "%rd_sum") (.reg "%rd_c"))
-    , .instr none (.stLocal .u64 (.regOffset "%rd_zero" 0) (.reg "%rd_sum"))
-    , .instr none (.ldLocal .u64 "%rd_loc" (.regOffset "%rd_zero" 0))
-    , .instr none (.atomAdd .global .u64 "%rd_old" (.regOffset "%rd_out" 0) (.reg "%rd_loc"))
-    , .instr none (.mov .b32 "%r_src" (.immU64 1#64))
-    , .instr none (.shflSyncBfly "%r_shfl" (.reg "%r_src") (.immU64 1#64) (.immU64 31#64) (.immU64 15#64))
-    , .instr none (.cvt .none .u64 .u32 "%rd_shfl" (.reg "%r_shfl"))
-    , .instr none (.atomAdd .global .u64 "%rd_old2" (.regOffset "%rd_out" 8) (.reg "%rd_shfl"))
+    [ .instr none (.ldParam .u64 "%rd0" "out_ptr")
+    , .instr none (.mov .u32 "%r0" (.sreg .tidX))
+    , .instr none (.mov .u32 "%r1" (.sreg .tidY))
+    , .instr none (.mov .u32 "%r2" (.sreg .ctaidX))
+    , .instr none (.mov .u64 "%rd1" (.immU64 0#64))
+    , .instr none (.ldConst .u64 "%rd2" (.regOffset "%rd1" 0))
+    , .instr none (.cvt .none .u64 .u32 "%rd3" (.reg "%r0"))
+    , .instr none (.cvt .none .u64 .u32 "%rd4" (.reg "%r1"))
+    , .instr none (.cvt .none .u64 .u32 "%rd5" (.reg "%r2"))
+    , .instr none (.add .none .u64 "%rd6" (.reg "%rd3") (.reg "%rd4"))
+    , .instr none (.add .none .u64 "%rd6" (.reg "%rd6") (.reg "%rd5"))
+    , .instr none (.add .none .u64 "%rd6" (.reg "%rd6") (.reg "%rd2"))
+    , .instr none (.stLocal .u64 (.regOffset "%rd1" 0) (.reg "%rd6"))
+    , .instr none (.ldLocal .u64 "%rd7" (.regOffset "%rd1" 0))
+    , .instr none (.atomAdd .global .u64 "%rd8" (.regOffset "%rd0" 0) (.reg "%rd7"))
+    , .instr none (.mov .b32 "%rb0" (.immU64 1#64))
+    , .instr none (.shflSyncBfly "%rb1" (.reg "%rb0") (.immU64 1#64) (.immU64 31#64) (.immU64 15#64))
+    , .instr none (.cvt .none .u64 .u32 "%rd9" (.reg "%rb1"))
+    , .instr none (.atomAdd .global .u64 "%rd8" (.regOffset "%rd0" 8) (.reg "%rd9"))
     , .instr none .ret ]
 
 def ptxMultiCtaResult : PTXRes :=
@@ -558,8 +548,7 @@ theorem ptx_multi_cta_local_const_atom_shfl_kernel_checked :
 
 def mslFmaKernel : MSLKernelDecl where
   name := "msl_fma_f32"
-  params :=
-    [ { ty := .pointer .device false .double, name := "out", attr := some (.buffer 0) } ]
+  params := [ { ty := .pointer .device false .double, name := "out", attr := some (.buffer 0) } ]
   body :=
     [ .varDecl .float "f0" (.fma (.immF32 0x3FC00000#32) (.immF32 0x40000000#32) (.immF32 0x3F000000#32))
     , .varDecl .double "d0" (.cast .double (.var "f0"))
@@ -637,6 +626,10 @@ def mslHelperU256Result : MSLRes :=
 #guard mslReadWord? mslHelperU256Result 0 0 == some 11#64
 #guard mslReadWord? mslHelperU256Result 0 3 == some 4#64
 
+theorem msl_helper_u256_kernel_checked :
+    mslReadWord? mslHelperU256Result 0 0 = some 11#64 ∧
+    mslReadWord? mslHelperU256Result 0 3 = some 4#64 := ⟨rfl, rfl⟩
+
 def mslHelperRefKernel : MSLKernelDecl where
   name := "msl_helper_ref"
   params :=
@@ -692,8 +685,7 @@ theorem msl_simd_collectives_kernel_checked :
 
 def mslDeviceConstKernel : MSLKernelDecl where
   name := "msl_device_const_write"
-  params :=
-    [ { ty := .pointer .device true .ulong, name := "ro", attr := some (.buffer 0) } ]
+  params := [ { ty := .pointer .device true .ulong, name := "ro", attr := some (.buffer 0) } ]
   body :=
     [ .indexAssign "ro" (.immU64 0#64) (.immU64 9#64)
     , .returnStmt ]
@@ -710,42 +702,368 @@ theorem msl_device_const_write_rejected_kernel_checked :
 def mslAtomicKernel : MSLKernelDecl where
   name := "msl_atomic_add"
   params :=
-    [ { ty := .pointer .device false .uint, name := "acc", attr := some (.buffer 0) }
+    [ { ty := .pointer .device false .atomicUint, name := "acc", attr := some (.buffer 0) }
     , { ty := .uint, name := "tid", attr := some .threadPositionInThreadgroup } ]
   body :=
-    [ .atomicFetchAdd (some .uint) (some "prev") "acc" (.immU64 0#64) (.add (.var "tid") (.immU64 1#64))
+    [ .atomicFetchAdd (some .uint) (some "prev") "acc" (some (.immU64 0#64)) (.add (.var "tid") (.immU64 1#64))
     , .returnStmt ]
 
 def mslAtomicResult : MSLRes :=
   evalMSLKernel 64 mslAtomicKernel { x := 2 } { x := 2 }
     [ (0, LeanNative.Backend.MetalAst.ByteMemory.ofU32Words [ 10#32 ]) ] []
 
-def mslReadU32? (res : MSLRes) (bufIdx elemIdx : Nat) : Option (BitVec 32) :=
-  match res with
-  | .ok bufs => (bufs.lookup bufIdx).bind (fun m => m.readU32Word? elemIdx)
-  | _ => none
-
 #guard mslReadU32? mslAtomicResult 0 0 == some 16#32
 
 theorem msl_multi_group_atomic_add_kernel_checked :
     mslReadU32? mslAtomicResult 0 0 = some 16#32 := rfl
 
-/-! ## 13. Structural Pretty-Printer Smoke Checks (`PTXModule` and `MSLModule`) -/
+/-! ## 13. Round-2 PTX coverage: `regDecls` checks, `atom.cas`, and atomic vs non-atomic epoch races -/
+
+def ptxUndeclRegKernel : PTXKernel where
+  name := "ptx_undecl_reg"
+  regDecls := []
+  body :=
+    [ .instr none (.mov .u64 "%rd0" (.immU64 1#64))
+    , .instr none .ret ]
+
+def ptxUndeclRegResult : PTXRes :=
+  evalPTXKernel 8 ptxUndeclRegKernel { x := 1 } { x := 1 }
+    (LeanNative.Backend.PTXAst.ByteMemory.zeros 0) { params := [] }
+
+#guard ptxUndeclRegResult == .invalidOperand "undeclared register %rd0"
+
+theorem ptx_undeclared_reg_rejected :
+    ptxUndeclRegResult = .invalidOperand "undeclared register %rd0" := rfl
+
+def ptxUninitRegKernel : PTXKernel where
+  name := "ptx_uninit_reg"
+  regDecls := [ { ty := .u64, prefixName := "%rd", count := 2 } ]
+  body :=
+    [ .instr none (.add .none .u64 "%rd1" (.reg "%rd0") (.immU64 1#64))
+    , .instr none .ret ]
+
+def ptxUninitRegResult : PTXRes :=
+  evalPTXKernel 8 ptxUninitRegKernel { x := 1 } { x := 1 }
+    (LeanNative.Backend.PTXAst.ByteMemory.zeros 0) { params := [] }
+
+#guard ptxUninitRegResult == .invalidOperand "read of uninitialized register %rd0"
+
+theorem ptx_uninit_reg_rejected :
+    ptxUninitRegResult = .invalidOperand "read of uninitialized register %rd0" := rfl
+
+def ptxWidthMismatchKernel : PTXKernel where
+  name := "ptx_width_mismatch"
+  regDecls := [ { ty := .u32, prefixName := "%r", count := 1 }
+              , { ty := .u64, prefixName := "%rd", count := 1 } ]
+  body :=
+    [ .instr none (.mov .u32 "%r0" (.immU64 5#64))
+    , .instr none (.add .none .u64 "%rd0" (.reg "%r0") (.immU64 1#64))
+    , .instr none .ret ]
+
+def ptxWidthMismatchResult : PTXRes :=
+  evalPTXKernel 8 ptxWidthMismatchKernel { x := 1 } { x := 1 }
+    (LeanNative.Backend.PTXAst.ByteMemory.zeros 0) { params := [] }
+
+#guard ptxWidthMismatchResult == .invalidOperand "register %r0 has width 32, expected 64"
+
+theorem ptx_reg_width_mismatch_rejected :
+    ptxWidthMismatchResult = .invalidOperand "register %r0 has width 32, expected 64" := rfl
+
+def ptxAtomCasKernel : PTXKernel where
+  name := "ptx_atom_cas_u64"
+  params := [ { ty := .u64, name := "buf" } ]
+  regDecls := [ { ty := .u64, prefixName := "%rd", count := 3 } ]
+  body :=
+    [ .instr none (.ldParam .u64 "%rd0" "buf")
+    , .instr none (.atomCas .global .u64 "%rd1" (.regOffset "%rd0" 0) (.immU64 10#64) (.immU64 99#64))
+    , .instr none (.atomCas .global .u64 "%rd2" (.regOffset "%rd0" 0) (.immU64 10#64) (.immU64 77#64))
+    , .instr none (.stGlobal .u64 (.regOffset "%rd0" 8) (.reg "%rd1"))
+    , .instr none (.stGlobal .u64 (.regOffset "%rd0" 16) (.reg "%rd2"))
+    , .instr none .ret ]
+
+def ptxAtomCasResult : PTXRes :=
+  evalPTXKernel 16 ptxAtomCasKernel { x := 1 } { x := 1 }
+    (LeanNative.Backend.PTXAst.ByteMemory.ofU64Words [ 10#64, 0#64, 0#64 ])
+    { params := [ ("buf", 0#64) ] }
+
+#guard ptxReadWord? ptxAtomCasResult 0 == some 99#64
+#guard ptxReadWord? ptxAtomCasResult 1 == some 10#64
+#guard ptxReadWord? ptxAtomCasResult 2 == some 99#64
+
+theorem ptx_atom_cas_kernel_checked :
+    ptxReadWord? ptxAtomCasResult 0 = some 99#64 ∧
+    ptxReadWord? ptxAtomCasResult 1 = some 10#64 ∧
+    ptxReadWord? ptxAtomCasResult 2 = some 99#64 := ⟨rfl, rfl, rfl⟩
+
+def ptxAtomVsStoreRaceKernel : PTXKernel where
+  name := "ptx_atom_vs_store_race"
+  params := [ { ty := .u64, name := "buf" } ]
+  regDecls := [ { ty := .u32, prefixName := "%r", count := 1 }
+              , { ty := .u64, prefixName := "%rd", count := 2 }
+              , { ty := .pred, prefixName := "%p", count := 2 } ]
+  body :=
+    [ .instr none (.ldParam .u64 "%rd0" "buf")
+    , .instr none (.mov .u32 "%r0" (.sreg .tidX))
+    , .instr none (.setp .eq .u32 "%p0" (.reg "%r0") (.immU64 0#64))
+    , .instr none (.setp .ne .u32 "%p1" (.reg "%r0") (.immU64 0#64))
+    , .instr (some { predReg := "%p0" }) (.atomAdd .global .u64 "%rd1" (.regOffset "%rd0" 0) (.immU64 1#64))
+    , .instr (some { predReg := "%p1" }) (.stGlobal .u64 (.regOffset "%rd0" 0) (.immU64 2#64))
+    , .instr none .ret ]
+
+def ptxAtomVsStoreRaceResult : PTXRes :=
+  evalPTXKernel 32 ptxAtomVsStoreRaceKernel { x := 1 } { x := 2 }
+    (LeanNative.Backend.PTXAst.ByteMemory.zeros 8) { params := [ ("buf", 0#64) ] }
+
+#guard ptxAtomVsStoreRaceResult == .dataRace .global 0
+
+theorem ptx_atom_vs_nonatomic_store_race_checked :
+    ptxAtomVsStoreRaceResult = .dataRace .global 0 := rfl
+
+/-! ## 14. Round-2 Metal coverage: multi-lane vectors/structs, single-pass simd, depth-8 calls, arrays, short-circuit, pointer atomics & rank promotion -/
+
+def mslUlong2Kernel : MSLKernelDecl where
+  name := "msl_ulong2_lanes"
+  params := [ { ty := .pointer .device false .ulong2, name := "out", attr := some (.buffer 0) } ]
+  body :=
+    [ .varDecl .ulong2 "a" (.structLit .ulong2 (.ofList [ .immU64 0xAA#64, .immU64 0x5500#64 ]))
+    , .varDecl .ulong2 "b" (.structLit .ulong2 (.ofList [ .immU64 0x0F#64, .immU64 0x00FF#64 ]))
+    , .varDecl .ulong2 "c" (.bitXor (.var "a") (.var "b"))
+    , .fieldAssign "c" "x" (.add (.fieldAccess (.var "c") "x") (.immU64 1#64))
+    , .indexAssign "out" (.immU64 0#64) (.var "c")
+    , .returnStmt ]
+
+def mslUlong2Result : MSLRes :=
+  evalMSLKernel 16 mslUlong2Kernel { x := 1 } { x := 1 }
+    [ (0, LeanNative.Backend.MetalAst.ByteMemory.zeros 16) ] []
+
+#guard mslReadWord? mslUlong2Result 0 0 == some 0xA6#64
+#guard mslReadWord? mslUlong2Result 0 1 == some 0x55FF#64
+
+theorem msl_ulong2_lane_isolation_checked :
+    mslReadWord? mslUlong2Result 0 0 = some 0xA6#64 ∧
+    mslReadWord? mslUlong2Result 0 1 = some 0x55FF#64 := ⟨rfl, rfl⟩
+
+def mslImpureBumpFunc : MSLFuncDecl where
+  retTy := .ulong
+  name := "bump_once"
+  params := [ { ty := .ref .thread .ulong, name := "cnt" } ]
+  body := .ofList
+    [ .assign "cnt" (.add (.var "cnt") (.immU64 1#64))
+    , .returnVal (.var "cnt") ]
+
+def mslSinglePassSimdKernel : MSLKernelDecl where
+  name := "msl_single_pass_simd"
+  params :=
+    [ { ty := .pointer .device false .ulong, name := "out", attr := some (.buffer 0) }
+    , { ty := .uint, name := "lane", attr := some .threadIndexInSimdgroup } ]
+  body :=
+    [ .varDecl .ulong "cnt" (.mul (.var "lane") (.immU64 10#64))
+    , .simdSum (some .ulong) "s" (.call "bump_once" (.ofList [ .var "cnt" ]))
+    , .simdShuffleXor (some .ulong) "sw" (.call "bump_once" (.ofList [ .var "cnt" ])) (.immU64 1#64)
+    , .indexAssign "out" (.var "lane")
+        (.add (.mul (.var "cnt") (.immU64 100#64)) (.add (.var "s") (.var "sw")))
+    , .returnStmt ]
+
+def mslSinglePassSimdResult : MSLRes :=
+  evalMSLKernel 32 mslSinglePassSimdKernel { x := 1 } { x := 2 }
+    [ (0, LeanNative.Backend.MetalAst.ByteMemory.zeros 16) ] [] [ mslImpureBumpFunc ] []
+
+-- Lane 0: cnt starts 0 -> simdSum bump_once => 1 (sum=1+11=12, cnt=1) -> simdShuffle bump_once => 2 (partner lane1 gives 12, cnt=2) -> 2*100 + 12 + 12 = 224
+-- Lane 1: cnt starts 10 -> simdSum bump_once => 11 (sum=12, cnt=11) -> simdShuffle bump_once => 12 (partner lane0 gives 2, cnt=12) -> 12*100 + 12 + 2 = 1214
+#guard mslReadWord? mslSinglePassSimdResult 0 0 == some 224#64
+#guard mslReadWord? mslSinglePassSimdResult 0 1 == some 1214#64
+
+theorem msl_single_pass_simd_side_effect_checked :
+    mslReadWord? mslSinglePassSimdResult 0 0 = some 224#64 ∧
+    mslReadWord? mslSinglePassSimdResult 0 1 = some 1214#64 := ⟨rfl, rfl⟩
+
+def mkChainHelper (idx : Nat) : MSLFuncDecl :=
+  if idx == 8 then
+    { retTy := .ulong
+      name := "chain8"
+      params := [ { ty := .ulong, name := "x" } ]
+      body := .ofList
+        [ .varDecl .ulong "acc" (.var "x")
+        , .forLoop "i" .uint (.immU64 0#64) (.lt (.var "i") (.immU64 70#64))
+            (.add (.var "i") (.immU64 1#64))
+            (.ofList [ .assign "acc" (.add (.var "acc") (.immU64 1#64)) ])
+        , .returnVal (.var "acc") ] }
+  else
+    { retTy := .ulong
+      name := s!"chain{idx}"
+      params := [ { ty := .ulong, name := "x" } ]
+      body := .ofList
+        [ .returnVal (.call s!"chain{idx + 1}" (.ofList [ .add (.var "x") (.immU64 1#64) ])) ] }
+
+def mslDeepChainHelpers : List MSLFuncDecl :=
+  [1, 2, 3, 4, 5, 6, 7, 8].map mkChainHelper
+
+def mslDeepChainKernel : MSLKernelDecl where
+  name := "msl_deep_chain"
+  params := [ { ty := .pointer .device false .ulong, name := "out", attr := some (.buffer 0) } ]
+  body :=
+    [ .varDecl .ulong "res" (.call "chain1" (.ofList [ .immU64 5#64 ]))
+    , .indexAssign "out" (.immU64 0#64) (.var "res")
+    , .returnStmt ]
+
+def mslDeepChainResult : MSLRes :=
+  evalMSLKernel 200 mslDeepChainKernel { x := 1 } { x := 1 }
+    [ (0, LeanNative.Backend.MetalAst.ByteMemory.zeros 8) ] [] mslDeepChainHelpers []
+
+-- 5 + 7 intermediate increments + 70 loop iterations in chain8 = 82
+#guard mslReadWord? mslDeepChainResult 0 0 == some 82#64
+
+theorem msl_deep_chain_and_long_callee_loop_checked :
+    mslReadWord? mslDeepChainResult 0 0 = some 82#64 := rfl
+
+def mslArrayRefFunc : MSLFuncDecl where
+  retTy := .void
+  name := "mix_words"
+  params := [ { ty := .threadArr .thread .ulong 4, name := "v" } ]
+  body := .ofList
+    [ .indexAssign "v" (.immU64 0#64) (.add (.index "v" (.immU64 0#64)) (.index "v" (.immU64 1#64)))
+    , .indexAssign "v" (.immU64 3#64) (.bitXor (.index "v" (.immU64 3#64)) (.index "v" (.immU64 0#64)))
+    , .returnStmt ]
+
+def mslThreadArrayKernel : MSLKernelDecl where
+  name := "msl_thread_array_ref"
+  params := [ { ty := .pointer .device false .ulong, name := "out", attr := some (.buffer 0) } ]
+  body :=
+    [ .arrayDecl .ulong "state" 4 (.ofList [ .immU64 10#64, .immU64 20#64, .immU64 30#64, .immU64 7#64 ])
+    , .exprStmt (.call "mix_words" (.ofList [ .var "state" ]))
+    , .indexAssign "out" (.immU64 0#64) (.index "state" (.immU64 0#64))
+    , .indexAssign "out" (.immU64 1#64) (.index "state" (.immU64 3#64))
+    , .returnStmt ]
+
+def mslThreadArrayResult : MSLRes :=
+  evalMSLKernel 32 mslThreadArrayKernel { x := 1 } { x := 1 }
+    [ (0, LeanNative.Backend.MetalAst.ByteMemory.zeros 16) ] [] [ mslArrayRefFunc ] []
+
+-- state[0] = 10 + 20 = 30; state[3] = 7 ^ 30 = 25
+#guard mslReadWord? mslThreadArrayResult 0 0 == some 30#64
+#guard mslReadWord? mslThreadArrayResult 0 1 == some 25#64
+
+theorem msl_thread_array_pass_by_ref_checked :
+    mslReadWord? mslThreadArrayResult 0 0 = some 30#64 ∧
+    mslReadWord? mslThreadArrayResult 0 1 = some 25#64 := ⟨rfl, rfl⟩
+
+def mslThreadArrayOobKernel : MSLKernelDecl where
+  name := "msl_thread_array_oob"
+  params := []
+  body :=
+    [ .arrayDecl .ulong "state" 2 (.ofList [ .immU64 1#64, .immU64 2#64 ])
+    , .indexAssign "state" (.immU64 2#64) (.immU64 9#64)
+    , .returnStmt ]
+
+def mslThreadArrayOobResult : MSLRes :=
+  evalMSLKernel 16 mslThreadArrayOobKernel { x := 1 } { x := 1 } [] []
+
+#guard mslThreadArrayOobResult == .outOfBoundsWrite .thread 0 2
+
+theorem msl_thread_array_oob_checked :
+    mslThreadArrayOobResult = .outOfBoundsWrite .thread 0 2 := rfl
+
+def mslShortCircuitAndResult : MSLOutcome (BitVec 64) :=
+  evalMSLExpr mslEmptyGroup { tid := {}, locals := mslLocalsRxRy 7#64 0#64 .ulong .ulong, stmts := [], halted := false }
+    (.logAnd (.ne (.var "ry") (.immU64 0#64)) (.gt (.div (.var "rx") (.var "ry")) (.immU64 0#64)))
+
+def mslShortCircuitOrResult : MSLOutcome (BitVec 64) :=
+  evalMSLExpr mslEmptyGroup { tid := {}, locals := mslLocalsRxRy 7#64 0#64 .ulong .ulong, stmts := [], halted := false }
+    (.logOr (.eq (.var "ry") (.immU64 0#64)) (.gt (.div (.var "rx") (.var "ry")) (.immU64 0#64)))
+
+#guard mslShortCircuitAndResult == .ok 0#64
+#guard mslShortCircuitOrResult == .ok 1#64
+
+theorem msl_short_circuit_and_or_checked :
+    mslShortCircuitAndResult = .ok 0#64 ∧
+    mslShortCircuitOrResult = .ok 1#64 := ⟨rfl, rfl⟩
+
+def mslPtrAtomicDerefKernel : MSLKernelDecl where
+  name := "msl_ptr_atomic_deref"
+  params :=
+    [ { ty := .pointer .device false .atomicUint, name := "lockPtr", attr := some (.buffer 0) }
+    , { ty := .pointer .device false .ulong, name := "valPtr", attr := some (.buffer 1) } ]
+  body :=
+    [ .atomicExchange (some .uint) (some "old0") "lockPtr" none (.immU64 1#64)
+    , .atomicFetchAdd (some .uint) (some "old1") "lockPtr" none (.immU64 4#64)
+    , .derefAssign "valPtr" (.add (.deref "valPtr") (.add (.var "old0") (.var "old1")))
+    , .returnStmt ]
+
+def mslPtrAtomicDerefResult : MSLRes :=
+  evalMSLKernel 32 mslPtrAtomicDerefKernel { x := 1 } { x := 1 }
+    [ (0, LeanNative.Backend.MetalAst.ByteMemory.ofU32Words [ 7#32 ])
+    , (1, LeanNative.Backend.MetalAst.ByteMemory.ofU64Words [ 100#64 ]) ] []
+
+-- old0 = 7 (lock becomes 1), old1 = 1 (lock becomes 5), *valPtr = 100 + 7 + 1 = 108
+#guard mslReadU32? mslPtrAtomicDerefResult 0 0 == some 5#32
+#guard mslReadWord? mslPtrAtomicDerefResult 1 0 == some 108#64
+
+theorem msl_ptr_atomic_exchange_and_deref_checked :
+    mslReadU32? mslPtrAtomicDerefResult 0 0 = some 5#32 ∧
+    mslReadWord? mslPtrAtomicDerefResult 1 0 = some 108#64 := ⟨rfl, rfl⟩
+
+def mslAtomVsNonAtomRaceKernel : MSLKernelDecl where
+  name := "msl_atom_vs_nonatom_race"
+  params :=
+    [ { ty := .pointer .device false .uint, name := "buf", attr := some (.buffer 0) }
+    , { ty := .uint, name := "tid", attr := some .threadPositionInThreadgroup } ]
+  body :=
+    [ .ifElse (.eq (.var "tid") (.immU64 0#64))
+        (.ofList [ .atomicFetchAdd none none "buf" (some (.immU64 0#64)) (.immU64 1#64) ])
+        (.ofList [ .indexAssign "buf" (.immU64 0#64) (.immU64 2#64) ])
+    , .returnStmt ]
+
+def mslAtomVsNonAtomRaceResult : MSLRes :=
+  evalMSLKernel 32 mslAtomVsNonAtomRaceKernel { x := 1 } { x := 2 }
+    [ (0, LeanNative.Backend.MetalAst.ByteMemory.ofU32Words [ 0#32 ]) ] []
+
+#guard mslAtomVsNonAtomRaceResult == .dataRace .device 0
+
+theorem msl_atomic_vs_nonatomic_race_checked :
+    mslAtomVsNonAtomRaceResult = .dataRace .device 0 := rfl
+
+def mslRankPromotionResult : MSLOutcome (BitVec 64) :=
+  evalMSLExpr mslEmptyGroup
+    { tid := {}, locals := mslLocalsRxRy 0xFFFF_FFFF#64 1#64 .uint .ulong, stmts := [], halted := false }
+    (.add (.var "rx") (.var "ry"))
+
+def mslSignedShrResult : MSLOutcome (BitVec 64) :=
+  evalMSLExpr mslEmptyGroup
+    { tid := {}, locals := mslLocalsRxRy 0xFFFF_FFF8#64 1#64 .int .uint, stmts := [], halted := false }
+    (.shr (.var "rx") (.var "ry"))
+
+def mslUintMaskCmpResult : MSLOutcome (BitVec 64) :=
+  evalMSLExpr mslEmptyGroup
+    { tid := {}, locals := mslLocalsRxRy 0x1_0000_0005#64 5#64 .uint .uint, stmts := [], halted := false }
+    (.eq (.var "rx") (.var "ry"))
+
+#guard mslRankPromotionResult == .ok 0x1_0000_0000#64
+#guard mslSignedShrResult == .ok 0xFFFF_FFFC#64
+#guard mslUintMaskCmpResult == .ok 1#64
+
+theorem msl_rank_promotion_signed_shr_and_uint_cmp_checked :
+    mslRankPromotionResult = .ok 0x1_0000_0000#64 ∧
+    mslSignedShrResult = .ok 0xFFFF_FFFC#64 ∧
+    mslUintMaskCmpResult = .ok 1#64 := ⟨rfl, rfl, rfl⟩
+
+/-! ## 15. Structural Pretty-Printer Smoke Checks (`PTXModule` and `MSLModule`) -/
 
 def hasSubstr (haystack needle : String) : Bool :=
   (haystack.splitOn needle).length > 1
 
 def ptxSampleModule : PTXModule where
-  kernels := [ ptxVecAddKernel, ptxReduceKernel ]
+  kernels := [ ptxVecAddKernel, ptxReduceKernel, ptxAtomCasKernel ]
 
 def mslSampleModule : MSLModule where
   structs := [ { name := "ln_u256", fields := [ { ty := .ulong, name := "w0" } ] } ]
-  kernels := [ mslVecAddKernel, mslReduceKernel ]
+  kernels := [ mslVecAddKernel, mslReduceKernel, mslUlong2Kernel, mslPtrAtomicDerefKernel ]
 
 #guard hasSubstr (ppPTXModule ptxSampleModule) ".version 8.0"
 #guard hasSubstr (ppPTXModule ptxSampleModule) ".visible .entry vec_add_u64("
 #guard hasSubstr (ppPTXModule ptxSampleModule) "bar.sync 0;"
 #guard hasSubstr (ppPTXModule ptxSampleModule) ".shared .align 8 .u64 smem[2];"
+#guard hasSubstr (ppPTXModule ptxSampleModule) ".reg .u64 %rd<11>;"
+#guard hasSubstr (ppPTXModule ptxSampleModule) "atom.cas.global.u64"
 
 #guard hasSubstr (ppMSLModule mslSampleModule) "#include <metal_stdlib>"
 #guard hasSubstr (ppMSLModule mslSampleModule) "using namespace metal;"
@@ -753,6 +1071,8 @@ def mslSampleModule : MSLModule where
 #guard hasSubstr (ppMSLModule mslSampleModule) "threadgroup ulong smem[2];"
 #guard hasSubstr (ppMSLModule mslSampleModule)
   "threadgroup_barrier(mem_flags::mem_threadgroup);"
+#guard hasSubstr (ppMSLModule mslSampleModule) "ulong2("
+#guard hasSubstr (ppMSLModule mslSampleModule) "atomic_exchange_explicit(lockPtr, "
 
 theorem ptx_sample_module_header_checked :
     List.isPrefixOf

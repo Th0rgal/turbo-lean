@@ -13,6 +13,14 @@
     "LeanNative.Backend.LLVMAst.PP",
     "LeanNative.Backend.LLVMAst.RoundtripProofs",
     "LeanNative.Backend.LLVMAst.SemanticsProofs",
+    "LeanNative.Backend.MetalAst",
+    "LeanNative.Backend.MetalAst.Syntax",
+    "LeanNative.Backend.MetalAst.Eval",
+    "LeanNative.Backend.MetalAst.Proofs",
+    "LeanNative.Backend.PTXAst",
+    "LeanNative.Backend.PTXAst.Syntax",
+    "LeanNative.Backend.PTXAst.Eval",
+    "LeanNative.Backend.PTXAst.Proofs",
     "LeanNative.IR.LCNF",
     "TurboLean.ConLeche"
   ],
@@ -24,7 +32,9 @@
     "LeanNative.Backend.StableHLOAst",
     "LeanNative.Backend.TargetIR",
     "LeanNative.Backend.LLVMAst",
-    "LeanNative.Backend.LLVMAst.PP"
+    "LeanNative.Backend.LLVMAst.PP",
+    "LeanNative.Backend.MetalAst",
+    "LeanNative.Backend.PTXAst"
   ],
   "namespace_owners": {
     "LeanMLIR": ["LeanNative.Backend.Semantics"],
@@ -46,7 +56,19 @@
       "LeanNative.Backend.LLVMAst.RoundtripProofs",
       "LeanNative.Backend.LLVMAst.SemanticsProofs"
     ],
-    "LeanNative.Backend.LLVMAst.PP": ["LeanNative.Backend.LLVMAst.PP"]
+    "LeanNative.Backend.LLVMAst.PP": ["LeanNative.Backend.LLVMAst.PP"],
+    "LeanNative.Backend.MetalAst": [
+      "LeanNative.Backend.MetalAst",
+      "LeanNative.Backend.MetalAst.Syntax",
+      "LeanNative.Backend.MetalAst.Eval",
+      "LeanNative.Backend.MetalAst.Proofs"
+    ],
+    "LeanNative.Backend.PTXAst": [
+      "LeanNative.Backend.PTXAst",
+      "LeanNative.Backend.PTXAst.Syntax",
+      "LeanNative.Backend.PTXAst.Eval",
+      "LeanNative.Backend.PTXAst.Proofs"
+    ]
   },
   "proof_module_prefixes": [
     "LeanNative.Proofs"
