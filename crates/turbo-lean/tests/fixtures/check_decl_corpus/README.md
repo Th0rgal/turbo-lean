@@ -1,8 +1,8 @@
 # A0d declaration corpus
 
-Minimal, self-contained adaptations of eth-act/clifv at
-`5018b9509dc124154dbe08a5bd85862595d8eab7`. Each module credits its source
-paths; building clifv is neither required nor performed.
+Minimal, self-contained declaration-discovery fixtures minimized from an external
+`FV/` proof package (`5018b9509dc124154dbe08a5bd85862595d8eab7`). Each module notes
+the proof shapes it exercises; no external package checkout or build is required.
 
 - `Commands`: option wrappers (inline, stacked, indented), private/protected
   declarations, namespaces, sections with variables, local/scoped simp attributes.

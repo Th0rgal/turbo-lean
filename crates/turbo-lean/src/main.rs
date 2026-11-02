@@ -32,9 +32,9 @@ pub mod server;
 pub mod shm_cache;
 mod splitter;
 mod trusted_tools;
+pub mod verify;
 #[cfg(all(test, unix))]
 mod worktree_test_support;
-pub mod verify;
 pub mod zygote;
 
 pub use gpu_fastcheck::*;
@@ -574,10 +574,10 @@ fn run(cli: Cli) -> Result<()> {
         } else if pol.mode == "local" {
             std::env::set_var("TURBO_LEAN_TELEMETRY", "local");
         }
-    } else if !is_telemetry_cmd {
-        if !mcp::resolve_telemetry_policy_with_trust(tel_dir, trust_proj_toml).enabled {
-            std::env::set_var("LEAN_NATIVE_TELEMETRY", "off");
-        }
+    } else if !is_telemetry_cmd
+        && !mcp::resolve_telemetry_policy_with_trust(tel_dir, trust_proj_toml).enabled
+    {
+        std::env::set_var("LEAN_NATIVE_TELEMETRY", "off");
     }
 
     if let Commands::Telemetry {
@@ -599,6 +599,14 @@ fn run(cli: Cli) -> Result<()> {
         } => Some(lake_build::find_project_root(
             project_dir.as_deref().unwrap_or(file),
         )),
+        Commands::AgentStep {
+            project_dir, file, ..
+        } => Some(
+            project_dir
+                .as_ref()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| lake_build::find_project_root(file)),
+        ),
         _ => None,
     };
     let (dir, rev) = match &cli.command {
@@ -607,25 +615,14 @@ fn run(cli: Cli) -> Result<()> {
         } => (Some(project_dir.as_path()), Some(base.as_str())),
         Commands::CiVerify {
             project_dir,
-            base,
+            base: Some(base),
             ..
-        } => match base {
-            Some(base) => (Some(project_dir.as_path()), Some(base.as_str())),
-            None => (None, None),
-        },
+        } => (Some(project_dir.as_path()), Some(base.as_str())),
+        Commands::CiVerify { base: None, .. } => (None, None),
         Commands::Check { project_dir, .. }
         | Commands::Build { project_dir, .. }
         | Commands::SeedShards { project_dir, .. } => (Some(project_dir.as_path()), None),
-        Commands::AgentStep {
-            project_dir, file, ..
-        } => {
-            let file_dir = file.parent().filter(|p| !p.as_os_str().is_empty());
-            (
-                Some(project_dir.as_deref().or(file_dir).unwrap_or(here)),
-                None,
-            )
-        }
-        Commands::Eval { .. } => (eval_project_root.as_deref(), None),
+        Commands::AgentStep { .. } | Commands::Eval { .. } => (eval_project_root.as_deref(), None),
         Commands::Mcp { project_dir } => (Some(project_dir.as_deref().unwrap_or(here)), None),
         _ => (None, None),
     };
@@ -939,8 +936,9 @@ fn run(cli: Cli) -> Result<()> {
         None;
     let mut prefetched_manifest: Option<std::thread::JoinHandle<Option<pack::DeltaManifest>>> =
         None;
-    let mut prefetched_import: Option<std::thread::JoinHandle<Option<pack::PrefetchedPackPrestage>>> =
-        None;
+    let mut prefetched_import: Option<
+        std::thread::JoinHandle<Option<pack::PrefetchedPackPrestage>>,
+    > = None;
     if let Commands::Import {
         ref input,
         ref trust_domain,
@@ -1053,34 +1051,33 @@ fn run(cli: Cli) -> Result<()> {
                         .join("locks")
                         .join("cached_portable_manifest.json")
                         .exists())
+                && pack::try_stateless_noop_pull_sync(&resolved_cache_root, &base)
             {
-                if pack::try_stateless_noop_pull_sync(&resolved_cache_root, &base) {
-                    if cli.json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "status": "synced",
-                                "mode": "bidirectional",
-                                "remote": remote,
-                                "pulled_actions": 0,
-                                "pulled_blobs": 0,
-                                "pulled_pack_bytes": 0,
-                                "pushed_actions": 0,
-                                "pushed_blobs": 0,
-                                "pushed_raw_bytes": 0,
-                                "pushed_pack_bytes": 0,
-                                "delta_push_noop": true,
-                                "elapsed_ms": 0
-                            }))?
-                        );
-                    } else {
-                        println!(
-                            "[turbo-lean] Synced with {} in 0 ms: pulled 0 actions (0 blobs), pushed 0 actions (0 blobs)",
-                            remote
-                        );
-                    }
-                    return Ok(());
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "status": "synced",
+                            "mode": "bidirectional",
+                            "remote": remote,
+                            "pulled_actions": 0,
+                            "pulled_blobs": 0,
+                            "pulled_pack_bytes": 0,
+                            "pushed_actions": 0,
+                            "pushed_blobs": 0,
+                            "pushed_raw_bytes": 0,
+                            "pushed_pack_bytes": 0,
+                            "delta_push_noop": true,
+                            "elapsed_ms": 0
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "[turbo-lean] Synced with {} in 0 ms: pulled 0 actions (0 blobs), pushed 0 actions (0 blobs)",
+                        remote
+                    );
                 }
+                return Ok(());
             }
             if !push && !db_warm_on_open && !has_expected_sha {
                 if let Some((pulled, pulled_bytes)) = pack::try_stateless_cold_pull_sync_with_domain(
@@ -1189,6 +1186,11 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     let mut store = TurboStore::open(cli.cache_dir.as_deref())?;
+
+    // Open the Lake-input memo window for this command (see `reset_lake_inputs_tag_memo`). A CLI
+    // process runs one command, so this is belt-and-braces here; `serve` and the MCP server call it
+    // per request, which is what actually bounds it.
+    module_builder::reset_lake_inputs_tag_memo();
 
     match cli.command {
         Commands::Build {
@@ -1558,12 +1560,16 @@ fn run(cli: Cli) -> Result<()> {
             let proj_dir = project_dir
                 .map(|p| lake_build::find_project_root(&p))
                 .unwrap_or_else(|| lake_build::find_project_root(&file));
+            if lake_build::has_lake_config(&proj_dir) {
+                module_builder::try_project_lake_inputs_tag(&proj_dir)?;
+            }
             let toolchain = lake_build::detect_toolchain(&proj_dir);
             if !server::is_toolchain_installed(&toolchain) {
                 eprintln!("error: toolchain '{}' is not installed", toolchain);
                 std::process::exit(1);
             }
             let explicit_lp: Option<String> = lean_path.or_else(|| std::env::var("LEAN_PATH").ok());
+            let may_declare_inputs = module_builder::workspace_may_declare_lake_inputs(&proj_dir);
 
             let (mut env_vars, lean_bin, req_lp) = if let Some(lp) = explicit_lp {
                 let (mut ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, &lp)?;
@@ -1573,7 +1579,8 @@ fn run(cli: Cli) -> Result<()> {
                     ev.insert("LEAN_PATH".to_string(), lp.clone());
                 }
                 (ev, lb, lp)
-            } else if !proj_dir.join(".lake/packages").is_dir()
+            } else if !may_declare_inputs
+                && !proj_dir.join(".lake/packages").is_dir()
                 && proj_dir.join(".lake/build/lib/lean").exists()
                 && zygote::has_active_local_zygote_daemon(&store)
             {
@@ -1586,13 +1593,16 @@ fn run(cli: Cli) -> Result<()> {
                     pack::resolve_server_lean_env_and_bin(&store, &toolchain, &lp)?.1,
                     lp,
                 )
-            } else if proj_dir.join("lakefile.lean").exists()
-                || proj_dir.join("lakefile.toml").exists()
-            {
+            } else if lake_build::has_lake_config(&proj_dir) {
                 if let Ok((ev, _)) = lake_build::resolve_lake_env(&store, &proj_dir) {
                     let lp = ev.get("LEAN_PATH").cloned().unwrap_or_default();
                     let (_, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, &lp)?;
                     (ev, lb, lp)
+                } else if may_declare_inputs {
+                    anyhow::bail!(
+                        "Failed to resolve Lake environment for `{}` which declares Lake file inputs: fail-closed eval gate",
+                        proj_dir.display()
+                    );
                 } else {
                     let (ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, "")?;
                     let lp = ev.get("LEAN_PATH").cloned().unwrap_or_default();
@@ -1607,6 +1617,13 @@ fn run(cli: Cli) -> Result<()> {
                 if k != "LEAN_PATH" {
                     env_vars.entry(k).or_insert(v);
                 }
+            }
+            if lake_build::has_lake_config(&proj_dir) {
+                let canon_proj = proj_dir.canonicalize().unwrap_or_else(|_| proj_dir.clone());
+                env_vars.insert(
+                    "TURBO_LEAN_PROJECT_DIR".to_string(),
+                    canon_proj.to_string_lossy().to_string(),
+                );
             }
             if let Ok(cwd) = std::env::current_dir() {
                 env_vars.insert(
@@ -1628,19 +1645,23 @@ fn run(cli: Cli) -> Result<()> {
                 module_builder::try_resolve_lean_args_for_path(&proj_dir, Some(&file))?;
             let filtered_file_lean_args = module_builder::filter_allowed_lean_args(&file_lean_args);
 
+            let file_audit = splitter::split_lean_source(&source, &[])
+                .shards
+                .into_iter()
+                .map(|sh| sh.name)
+                .collect();
             let run_direct_lean = || -> Result<()> {
                 use std::io::Write;
-                let mut cmd = std::process::Command::new(&lean_bin);
-                for arg in &filtered_file_lean_args {
-                    cmd.arg(arg);
-                }
-                cmd.arg(&file).envs(&env_vars);
-                if !req_lp.is_empty() {
-                    cmd.env("LEAN_PATH", &req_lp);
-                } else {
-                    cmd.env_remove("LEAN_PATH");
-                }
-                let out = cmd.output()?;
+                let out = zygote::run_audited_lean_shard(
+                    &store,
+                    &lean_bin,
+                    &env_vars,
+                    Some(&proj_dir),
+                    &source,
+                    &file_audit,
+                    &file_lean_args,
+                    Some(timeout_ms),
+                )?;
                 std::io::stdout().write_all(&out.stdout)?;
                 std::io::stderr().write_all(&out.stderr)?;
                 std::io::stdout().flush()?;
@@ -1732,17 +1753,16 @@ fn run(cli: Cli) -> Result<()> {
             let check_det = verify_determinism
                 || std::env::var("TURBO_LEAN_VERIFY_DETERMINISM").as_deref() == Ok("1");
             if check_det {
-                let mut cmd = std::process::Command::new(&lean_bin);
-                for arg in &filtered_file_lean_args {
-                    cmd.arg(arg);
-                }
-                cmd.arg(&file).envs(&env_vars);
-                if !req_lp.is_empty() {
-                    cmd.env("LEAN_PATH", &req_lp);
-                } else {
-                    cmd.env_remove("LEAN_PATH");
-                }
-                let lean_out = cmd.output()?;
+                let lean_out = zygote::run_audited_lean_shard(
+                    &store,
+                    &lean_bin,
+                    &env_vars,
+                    Some(&proj_dir),
+                    &source,
+                    &file_audit,
+                    &file_lean_args,
+                    Some(timeout_ms),
+                )?;
                 let lean_ok = lean_out.status.success();
                 if reply.ok != lean_ok
                     || rendered_stdout.as_bytes() != lean_out.stdout.as_slice()

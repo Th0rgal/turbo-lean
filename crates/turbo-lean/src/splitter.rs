@@ -45,6 +45,8 @@ pub struct HygieneReport {
     pub has_unsafe: bool,
     pub has_extern_or_implemented_by: bool,
     pub has_impure_metaprograms: bool,
+    #[serde(default)]
+    pub has_checking_weakening: bool,
     pub flagged_items: Vec<String>,
 }
 
@@ -539,6 +541,9 @@ pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
         "csimp",
         "#eval",
         "run_cmd",
+        "run_elab",
+        "run_meta",
+        "set_option",
         "#guard_msgs",
         "initialize ",
     ]
@@ -546,6 +551,32 @@ pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
     .any(|kw| clean_src.contains(kw))
     {
         return report;
+    }
+
+    // Scan across line boundaries and through scoped command prefixes. Strings and comments
+    // have already been stripped; quoted name segments denote the same option keys.
+    for (pos, _) in clean_src.match_indices("set_option") {
+        if pos > 0
+            && clean_src[..pos]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
+        {
+            continue;
+        }
+        let mut words = clean_src[pos + "set_option".len()..].split_whitespace();
+        let key = words.next().unwrap_or("").replace(['«', '»'], "");
+        if key == "debug"
+            || key.starts_with("debug.")
+            || key.starts_with("weak.")
+            || (key == "warn.sorry" && words.next() != Some("true"))
+        {
+            report.has_checking_weakening = true;
+            let line = clean_src[..pos].bytes().filter(|b| *b == b'\n').count() + 1;
+            report
+                .flagged_items
+                .push(format!("L{line}: checking-weakening option `{key}`"));
+        }
     }
 
     for (idx, line) in clean_src.lines().enumerate() {
@@ -562,6 +593,15 @@ pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
             report
                 .flagged_items
                 .push(format!("L{}: sorry/admit token", ln));
+        }
+        for command in ["run_elab", "run_cmd", "run_meta"] {
+            if contains_word(trimmed, command) {
+                report.has_checking_weakening = true;
+                report.has_impure_metaprograms = true;
+                report
+                    .flagged_items
+                    .push(format!("L{ln}: checking-weakening command `{command}`"));
+            }
         }
         let after_prefixes = strip_decl_prefixes(trimmed);
         if trimmed.starts_with("axiom ") || after_prefixes.starts_with("axiom ") {
@@ -615,7 +655,7 @@ pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
                 report.flagged_items.push(format!("L{}: {}", ln, attr_kw));
             }
         }
-        if ["#eval", "run_cmd", "#guard_msgs", "initialize "]
+        if ["#eval", "#guard_msgs", "initialize "]
             .iter()
             .any(|p| trimmed.starts_with(p))
         {
@@ -629,6 +669,16 @@ pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
     }
 
     report
+}
+
+pub(crate) fn reject_checking_weakening(source: &str) -> anyhow::Result<()> {
+    let report = audit_hygiene(&strip_lean_comments(source));
+    anyhow::ensure!(
+        !report.has_checking_weakening,
+        "Soundness hygiene violation: {}",
+        report.disallowed_items().join(", ")
+    );
+    Ok(())
 }
 
 fn contains_word(haystack: &str, word: &str) -> bool {
@@ -1423,10 +1473,13 @@ fn is_pattern_match_arm_at(bytes: &[u8], pipe_idx: usize) -> bool {
                     return true;
                 }
             }
-            b':' if paren == 0 && bracket == 0 && brace == 0 => {
-                if j + 1 < bytes.len() && bytes[j + 1] == b'=' {
-                    return false;
-                }
+            b':' if paren == 0
+                && bracket == 0
+                && brace == 0
+                && j + 1 < bytes.len()
+                && bytes[j + 1] == b'=' =>
+            {
+                return false;
             }
             _ => {}
         }
@@ -1697,12 +1750,10 @@ fn extract_ident_tokens(s: &str) -> Vec<String> {
 
     for (idx, ch) in s.char_indices() {
         if is_lean_ident_continuation(ch) {
-            if cur_start.is_none() {
-                if !ch.is_ascii_digit() {
-                    cur_start = Some(idx);
-                    if qual_start.is_none() {
-                        qual_start = Some(idx);
-                    }
+            if cur_start.is_none() && !ch.is_ascii_digit() {
+                cur_start = Some(idx);
+                if qual_start.is_none() {
+                    qual_start = Some(idx);
                 }
             }
         } else {
@@ -1845,6 +1896,7 @@ fn register_prior_decl(
     prior_decls.push(entry);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_cone_env_hash_for_theorem(
     dep_interface_hashes: &[String],
     dep_scope_hasher: &blake3::Hasher,
@@ -1873,7 +1925,7 @@ fn compute_cone_env_hash_for_theorem(
     };
 
     if !prior_decls.is_empty() {
-        let num_words = (prior_decls.len() + 63) / 64;
+        let num_words = prior_decls.len().div_ceil(64);
         let mut thm_cone = vec![0u64; num_words];
         for tok in extract_ident_tokens(sig_clean)
             .into_iter()
@@ -2602,8 +2654,8 @@ fn split_lean_source_inner(
                 let mut prefix_accum = String::new();
                 if !omit_shard_source {
                     prefix_accum.reserve(src.len());
-                    for i in 0..target_idx {
-                        prefix_accum.push_str(&span_skel_orig[i]);
+                    for skel in span_skel_orig.iter().take(target_idx) {
+                        prefix_accum.push_str(skel);
                         prefix_accum.push('\n');
                     }
                 }
@@ -2747,7 +2799,7 @@ fn split_lean_source_inner(
                     }
                 }
                 if prior_decls.len() > mutual_start_idx + 1 {
-                    let mut union_bits = vec![0u64; (prior_decls.len() + 63) / 64];
+                    let mut union_bits = vec![0u64; prior_decls.len().div_ceil(64)];
                     for entry in &prior_decls[mutual_start_idx..] {
                         for (dst, &src) in union_bits.iter_mut().zip(entry.cone_bits.iter()) {
                             *dst |= src;
@@ -4925,6 +4977,42 @@ mod tests {
         assert!(clean.contains("'\"'") && clean.contains("'\\''") && clean.contains("'\\\\'"));
         assert!(clean.contains("\"-- not a comment /- neither -/\""));
         assert!(audit_hygiene(&clean).is_clean_for_certification());
+    }
+
+    #[test]
+    fn test_checking_weakening_source_options_and_scoped_metaprograms() {
+        for command in [
+            "set_option debug.skipKernelTC true",
+            "set_option debug.skipKernelTC false",
+            "set_option debug.other false",
+            "set_option warn.sorry false",
+            "set_option weak.debug.skipKernelTC true",
+            "set_option weak.weak.warn.sorry false",
+            "set_option «debug».«skipKernelTC» true",
+            "set_option\n /- comment -/ debug.skipKernelTC\n true",
+            "set_option debug.skipKernelTC true in\ntheorem bad : True := True.intro",
+            "section\nset_option warn.sorry false\nend",
+            "open Lean Elab Command in run_cmd set_option debug.skipKernelTC true",
+            "run_elab pure ()",
+            "run_meta pure ()",
+        ] {
+            let report = audit_hygiene(&strip_lean_comments(command));
+            assert!(
+                report.has_checking_weakening && !report.is_clean_for_certification(),
+                "{command}: {report:?}"
+            );
+            assert!(reject_checking_weakening(command).is_err(), "{command}");
+        }
+        for command in [
+            "set_option maxHeartbeats 400000\ntheorem good : True := True.intro",
+            "set_option maxHeartbeats 400000 in\ntheorem good : True := True.intro",
+            "set_option warn.sorry true",
+            "set_option linter.deprecated false in\ndef n := 1",
+            "-- set_option debug.skipKernelTC true\n/- run_cmd -/",
+            "def text := \"run_elab; set_option debug.skipKernelTC true\"",
+        ] {
+            assert!(reject_checking_weakening(command).is_ok(), "{command}");
+        }
     }
 
     #[test]
