@@ -18,6 +18,7 @@ import LeanNative.Transform.LoopSchedule
 import LeanNative.Transform.OwnershipRC
 import LeanNative.Backend.FastCheck
 import LeanNative.Proofs.HybridCAbiProofs
+import LeanNative.Backend.StableHLOAst
 
 namespace LeanNative.Proofs
 
@@ -165,6 +166,9 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Backend.Proofs.lowerToLeanMLIR_sound
   , ``LeanNative.Backend.Proofs.runArm64_butterflyStepInstrs_inv
   , ``LeanNative.Backend.Proofs.arm64_f128_kernel_refines_lnir
+  , ``LeanNative.Backend.StableHLOAst.stablehlo_add_comm
+  , ``LeanNative.Backend.StableHLOAst.stablehlo_add_assoc
+  , ``LeanNative.Backend.StableHLOAst.evalOp_add_result_type
   , ``ConLeche.inferType_sound
   , ``ConLeche.con_leche_verify_decl_sound
   , ``ConLeche.olean_mmap_bridge_sound

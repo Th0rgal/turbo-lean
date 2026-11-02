@@ -99,40 +99,41 @@ def primSar256 (a : BitVec 256) (sh : Nat) : BitVec 256 :=
     if !isNeg then shifted
     else shifted + ((BitVec.allOnes 256) <<< (256 - sh))
 
-/-- Independent `BitVec`-backed LCNF primitive binary operator evaluation. -/
+/-- Independent `BitVec`-backed LCNF primitive binary operator evaluation. Operates strictly
+    on typed scalar words (`.u64` / `.u256` / `.bool`), rejecting ill-typed non-scalar operands
+    with `.error (.typeError ...)` and zero divisors with `.error .divisionByZero` rather than
+    untyped identity/zero/one shortcuts. -/
 def primBinOp (op : BinOp) (v1 v2 : Val) : Except UBError Val :=
   match op with
   | .add =>
     match v1, v2 with
     | .u64 a, .u64 b => .ok (.u64 (UInt64.ofBitVec (a.toBitVec + b.toBitVec)))
-    | v, .u64 0 => .ok v
-    | .u64 0, v => .ok v
     | .u256 a, .u256 b => .ok (.u256 (ofBv256 (toBv256 a + toBv256 b)))
     | _, _ => .error (.typeError "evalBinOp: invalid operand types")
   | .sub =>
     match v1, v2 with
     | .u64 a, .u64 b => .ok (.u64 (UInt64.ofBitVec (a.toBitVec - b.toBitVec)))
-    | v, .u64 0 => .ok v
     | .u256 a, .u256 b => .ok (.u256 (ofBv256 (toBv256 a - toBv256 b)))
     | _, _ => .error (.typeError "evalBinOp: invalid operand types")
   | .mul =>
     match v1, v2 with
     | .u64 a, .u64 b => .ok (.u64 (UInt64.ofBitVec (a.toBitVec * b.toBitVec)))
-    | v, .u64 1 => .ok v
-    | .u64 1, v => .ok v
     | .u256 a, .u256 b => .ok (.u256 (ofBv256 (toBv256 a * toBv256 b)))
     | _, _ => .error (.typeError "evalBinOp: invalid operand types")
   | .div =>
     match v1, v2 with
-    | .u64 a, .u64 b => .ok (.u64 (UInt64.ofBitVec (a.toBitVec / b.toBitVec)))
-    | v, .u64 1 => .ok v
+    | .u64 a, .u64 b =>
+      if b.toBitVec == 0#64 then .error .divisionByZero
+      else .ok (.u64 (UInt64.ofBitVec (a.toBitVec / b.toBitVec)))
     | .u256 a, .u256 b =>
       if toBv256 b == 0#256 then .error .divisionByZero
       else .ok (.u256 (ofBv256 (toBv256 a / toBv256 b)))
     | _, _ => .error (.typeError "evalBinOp: invalid operand types")
   | .mod =>
     match v1, v2 with
-    | .u64 a, .u64 b => .ok (.u64 (UInt64.ofBitVec (a.toBitVec % b.toBitVec)))
+    | .u64 a, .u64 b =>
+      if b.toBitVec == 0#64 then .error .divisionByZero
+      else .ok (.u64 (UInt64.ofBitVec (a.toBitVec % b.toBitVec)))
     | .u256 a, .u256 b =>
       if toBv256 b == 0#256 then .error .divisionByZero
       else .ok (.u256 (ofBv256 (toBv256 a % toBv256 b)))
@@ -144,24 +145,18 @@ def primBinOp (op : BinOp) (v1 v2 : Val) : Except UBError Val :=
       let la := packLimbs a
       let lb := packLimbs b
       .ok (.u256 (unpackLimbs ⟨la.w0 &&& lb.w0, la.w1 &&& lb.w1, la.w2 &&& lb.w2, la.w3 &&& lb.w3⟩))
-    | _, _ =>
-      if v1 == v2 then .ok v1 else .error (.typeError "bitAnd requires u64 or u256")
+    | _, _ => .error (.typeError "bitAnd requires u64 or u256")
   | .bitOr =>
     match v1, v2 with
     | .u64 a, .u64 b => .ok (.u64 (UInt64.ofBitVec (a.toBitVec ||| b.toBitVec)))
-    | v, .u64 0 => .ok v
-    | .u64 0, v => .ok v
     | .u256 a, .u256 b =>
       let la := packLimbs a
       let lb := packLimbs b
       .ok (.u256 (unpackLimbs ⟨la.w0 ||| lb.w0, la.w1 ||| lb.w1, la.w2 ||| lb.w2, la.w3 ||| lb.w3⟩))
-    | _, _ =>
-      if v1 == v2 then .ok v1 else .error (.typeError "bitOr requires u64 or u256")
+    | _, _ => .error (.typeError "bitOr requires u64 or u256")
   | .bitXor =>
     match v1, v2 with
     | .u64 a, .u64 b => .ok (.u64 (UInt64.ofBitVec (a.toBitVec ^^^ b.toBitVec)))
-    | v, .u64 0 => .ok v
-    | .u64 0, v => .ok v
     | .u256 a, .u256 b =>
       let la := packLimbs a
       let lb := packLimbs b
@@ -170,13 +165,11 @@ def primBinOp (op : BinOp) (v1 v2 : Val) : Except UBError Val :=
   | .shl =>
     match v1, v2 with
     | .u64 a, .u64 b => .ok (.u64 (UInt64.ofBitVec (a.toBitVec <<< (b.toBitVec % 64#64))))
-    | v, .u64 0 => .ok v
     | .u256 a, .u256 b => .ok (.u256 (ofBv256 (toBv256 a <<< (toBv256 b).toNat)))
     | _, _ => .error (.typeError "evalBinOp: invalid operand types")
   | .shr =>
     match v1, v2 with
     | .u64 a, .u64 b => .ok (.u64 (UInt64.ofBitVec (a.toBitVec >>> (b.toBitVec % 64#64))))
-    | v, .u64 0 => .ok v
     | .u256 a, .u256 b => .ok (.u256 (ofBv256 (toBv256 a >>> (toBv256 b).toNat)))
     | _, _ => .error (.typeError "evalBinOp: invalid operand types")
   | .sar =>

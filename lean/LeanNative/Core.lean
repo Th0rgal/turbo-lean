@@ -27,6 +27,7 @@ import LeanNative.Transform.Plugins
 import LeanNative.Backend.LLVM
 import LeanNative.Backend.GPUIR
 import LeanNative.Backend.MLIRGPU
+import LeanNative.Backend.StableHLOAst
 import LeanNative.Backend.Metal
 import LeanNative.Backend.Hybrid
 import LeanNative.Backend.FastCheck

@@ -87,9 +87,12 @@ theorem u256_add_bv (a b : UInt256) :
   rw [BitVec.toNat_add, word256_toNat, word256_toNat]
   unfold UInt256.toNat
   dsimp only [Nat.toUInt64]
-  congr 1 <;> apply UInt64.eq_of_toBitVec_eq <;> apply BitVec.eq_of_toNat_eq <;>
-    change (BitVec.ofNat 64 _).toNat = (BitVec.ofNat 64 _).toNat <;>
-    rw [BitVec.toNat_ofNat, BitVec.toNat_ofNat] <;> omega
+  congr 1 <;>
+  (apply UInt64.eq_of_toBitVec_eq
+   apply BitVec.eq_of_toNat_eq
+   change (BitVec.ofNat 64 _).toNat = (BitVec.ofNat 64 _).toNat
+   rw [BitVec.toNat_ofNat, BitVec.toNat_ofNat]
+   omega)
 
 theorem u256_sub_bv (a b : UInt256) :
     LeanMLIR.ofWord256 (LeanMLIR.word256 a - LeanMLIR.word256 b) = UInt256.sub a b := by
@@ -153,10 +156,20 @@ theorem word_lt (a b : UInt256) :
   rcases Decidable.em (a.hi1.toNat = b.hi1.toNat) with h3 | h3
   · rcases Decidable.em (a.hi0.toNat = b.hi0.toNat) with h2 | h2
     · rcases Decidable.em (a.lo1.toNat = b.lo1.toNat) with h1 | h1
-      · simp [h3, h2, h1]; rw [hlt]; simp [h3, h2, h1]
-      · simp [h3, h2, h1]; rw [hlt]; simp [h3, h2]; omega
-    · simp [h3, h2]; rw [hlt]; simp [h3]; omega
-  · simp [h3]; rw [hlt]; omega
+      · simp [h3, h2, h1]
+        rw [hlt]
+        simp [h3, h2, h1]
+      · simp [h3, h2, h1]
+        rw [hlt]
+        simp [h3, h2]
+        omega
+    · simp [h3, h2]
+      rw [hlt]
+      simp [h3]
+      omega
+  · simp [h3]
+    rw [hlt]
+    omega
 
 theorem word_le (a b : UInt256) :
     decide (LeanMLIR.word256 a ≤ LeanMLIR.word256 b) = UInt256.le a b := by
@@ -182,7 +195,10 @@ theorem word_le (a b : UInt256) :
     · have : LeanMLIR.word256 a ≤ LeanMLIR.word256 b := hle.mpr (Or.inr hlt)
       simp [this, hlt]
     · have : ¬(LeanMLIR.word256 a ≤ LeanMLIR.word256 b) := by
-        intro h; rcases hle.mp h with h1 | h2; exact he h1; exact hlt h2
+        intro h
+        rcases hle.mp h with h1 | h2
+        · exact he h1
+        · exact hlt h2
       simp [this, hlt]
 
 theorem u256_shl_bv (a : UInt256) (s : Nat) :
@@ -828,6 +844,51 @@ theorem applyWordUnaryOp_agrees (op : UnaryOp) (v r : Val)
   rw [applyWordUnaryOp_eq_eval, h]
 
 
+/-- Strict agreement domain of `LeanMLIR.applyWordBinOp`, `LCNF.primBinOp`, and `evalBinOp`:
+    same-width scalar pairs (plus unconditional agreement on checked-256 and GF(2)/EOR3 ops),
+    and `b ≠ 0` on `u64` division and modulo. -/
+def StrictWordBinOpDom (op : BinOp) (v1 v2 : Val) : Prop :=
+  match op, v1, v2 with
+  | .div, .u64 _, .u64 b | .mod, .u64 _, .u64 b => b ≠ 0
+  | .div, .u256 _, .u256 _ | .mod, .u256 _, .u256 _ => True
+  | .eq, .u64 _, .u64 _ | .eq, .u256 _, .u256 _ | .eq, .bool _, .bool _ => True
+  | .clmul64, _, _ | .clmul64Hi, _, _ | .gf2Affine, _, _ | .eor3, _, _ => True
+  | .addChecked256, _, _ | .subChecked256, _, _ | .mulChecked256, _, _ => True
+  | _, .u64 _, .u64 _ | _, .u256 _, .u256 _ => True
+  | _, _, _ => False
+
+def StrictScalarExpr (env : VarEnv) : ScalarExpr → Prop
+  | .constU64 _ | .constBool _ | .var _ => True
+  | .binOp op l r =>
+    StrictScalarExpr env l ∧ StrictScalarExpr env r ∧
+      ∀ v1 v2, evalScalarExpr env l = .ok v1 → evalScalarExpr env r = .ok v2 →
+        StrictWordBinOpDom op v1 v2
+  | .unaryOp _ a => StrictScalarExpr env a
+  | .select c t e =>
+    StrictScalarExpr env c ∧ StrictScalarExpr env t ∧ StrictScalarExpr env e
+  | .fma a b c =>
+    StrictScalarExpr env a ∧ StrictScalarExpr env b ∧ StrictScalarExpr env c ∧
+      ∀ va vb vab vc,
+        evalScalarExpr env a = .ok va → evalScalarExpr env b = .ok vb →
+          evalBinOp .mul va vb = .ok vab → evalScalarExpr env c = .ok vc →
+            StrictWordBinOpDom .mul va vb ∧ StrictWordBinOpDom .add vab vc
+
+def StrictLNIRCode (env : VarEnv) : LNIRCode → Prop
+  | .letBind dst _ty (.scalar se) k =>
+    StrictScalarExpr env se ∧
+      ∀ v, evalScalarExpr env se = .ok v → StrictLNIRCode (env.bind dst v) k
+  | .ite condVar thenBranch elseBranch =>
+    (∀ v, env condVar = some v →
+      match v with
+      | .bool true | .u64 _ | .u256 _ => StrictLNIRCode env thenBranch
+      | _ => True) ∧
+    (∀ v, env condVar = some v →
+      match v with
+      | .bool false | .u64 _ | .u256 _ => StrictLNIRCode env elseBranch
+      | _ => True)
+  | .ret _ | .unreachable => True
+  | _ => False
+
 def outcomeToPoison : Except UBError Val → LeanMLIR.PoisonOr Val
   | .ok v => .val v
   | .error .divisionByZero => .poison "binOp64 div0"
@@ -841,254 +902,191 @@ theorem outcomeToPoison_ite (c : Bool) (e : UBError) (v : Val) :
       if c then outcomeToPoison (Except.error e) else LeanMLIR.PoisonOr.val v := by
   cases c <;> rfl
 
-theorem mlir_add (v1 v2 : Val) :
+theorem mlir_add (v1 v2 : Val) (hdom : StrictWordBinOpDom .add v1 v2) :
     LeanMLIR.applyWordBinOp .add v1 v2 = outcomeToPoison (evalBinOp .add v1 v2) := by
   cases v1 with
   | u64 a =>
     cases v2 with
     | u64 b => rfl
-    | _ =>
-      exact u64_cases_01
-        (fun a => LeanMLIR.applyWordBinOp .add (.u64 a) _ = outcomeToPoison (evalBinOp .add (.u64 a) _))
-        (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) a
+    | _ => nomatch hdom
   | u256 a =>
     cases v2 with
-    | u64 b =>
-      exact u64_cases_01
-        (fun b => LeanMLIR.applyWordBinOp .add (.u256 a) (.u64 b) = outcomeToPoison (evalBinOp .add (.u256 a) (.u64 b)))
-        (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) b
     | u256 b => exact congrArg (fun w => LeanMLIR.PoisonOr.val (Val.u256 w)) (u256_add_bv a b)
-    | _ => rfl
-  | _ =>
-    cases v2 with
-    | u64 b =>
-      exact u64_cases_01
-        (fun b => LeanMLIR.applyWordBinOp .add _ (.u64 b) = outcomeToPoison (evalBinOp .add _ (.u64 b)))
-        (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) b
-    | _ => rfl
+    | _ => nomatch hdom
+  | _ => nomatch hdom
 
-theorem mlir_sub (v1 v2 : Val) :
+theorem mlir_sub (v1 v2 : Val) (hdom : StrictWordBinOpDom .sub v1 v2) :
     LeanMLIR.applyWordBinOp .sub v1 v2 = outcomeToPoison (evalBinOp .sub v1 v2) := by
   cases v1 with
   | u64 a =>
     cases v2 with
     | u64 b => rfl
-    | _ => rfl
+    | _ => nomatch hdom
   | u256 a =>
     cases v2 with
-    | u64 b =>
-      exact u64_cases_01
-        (fun b => LeanMLIR.applyWordBinOp .sub (.u256 a) (.u64 b) = outcomeToPoison (evalBinOp .sub (.u256 a) (.u64 b)))
-        (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) b
     | u256 b => exact congrArg (fun w => LeanMLIR.PoisonOr.val (Val.u256 w)) (u256_sub_bv a b)
-    | _ => rfl
-  | _ =>
-    cases v2 with
-    | u64 b =>
-      exact u64_cases_01
-        (fun b => LeanMLIR.applyWordBinOp .sub _ (.u64 b) = outcomeToPoison (evalBinOp .sub _ (.u64 b)))
-        (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) b
-    | _ => rfl
+    | _ => nomatch hdom
+  | _ => nomatch hdom
 
-theorem mlir_mul (v1 v2 : Val) :
+theorem mlir_mul (v1 v2 : Val) (hdom : StrictWordBinOpDom .mul v1 v2) :
     LeanMLIR.applyWordBinOp .mul v1 v2 = outcomeToPoison (evalBinOp .mul v1 v2) := by
   cases v1 with
   | u64 a =>
     cases v2 with
     | u64 b => rfl
-    | _ =>
-      exact u64_cases_01
-        (fun a => LeanMLIR.applyWordBinOp .mul (.u64 a) _ = outcomeToPoison (evalBinOp .mul (.u64 a) _))
-        (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) a
+    | _ => nomatch hdom
   | u256 a =>
     cases v2 with
-    | u64 b =>
-      exact u64_cases_01
-        (fun b => LeanMLIR.applyWordBinOp .mul (.u256 a) (.u64 b) = outcomeToPoison (evalBinOp .mul (.u256 a) (.u64 b)))
-        (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) b
     | u256 b => exact congrArg (fun w => LeanMLIR.PoisonOr.val (Val.u256 w)) (u256_mul_bv a b)
-    | _ => rfl
-  | _ =>
-    cases v2 with
-    | u64 b =>
-      exact u64_cases_01
-        (fun b => LeanMLIR.applyWordBinOp .mul _ (.u64 b) = outcomeToPoison (evalBinOp .mul _ (.u64 b)))
-        (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) b
-    | _ => rfl
+    | _ => nomatch hdom
+  | _ => nomatch hdom
 
-theorem mlir_div (v1 v2 : Val) :
+theorem mlir_div (v1 v2 : Val) (hdom : StrictWordBinOpDom .div v1 v2) :
     LeanMLIR.applyWordBinOp .div v1 v2 = outcomeToPoison (evalBinOp .div v1 v2) := by
   cases v1 with
   | u64 a =>
     cases v2 with
-    | u64 b => rfl
-    | _ => rfl
+    | u64 b =>
+      dsimp [StrictWordBinOpDom] at hdom
+      have hbv : (LeanMLIR.bv64 b == 0#64) = false := by
+        cases h0 : LeanMLIR.bv64 b == 0#64 with
+        | false => rfl
+        | true =>
+          exact False.elim (hdom (UInt64.eq_of_toBitVec_eq (eq_of_beq h0)))
+      dsimp [LeanMLIR.applyWordBinOp, evalBinOp, outcomeToPoison]
+      rw [hbv]
+      rfl
+    | _ => nomatch hdom
   | u256 a =>
     cases v2 with
-    | u64 b =>
-      exact u64_cases_01
-        (fun b => LeanMLIR.applyWordBinOp .div (.u256 a) (.u64 b) = outcomeToPoison (evalBinOp .div (.u256 a) (.u64 b)))
-        (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) b
     | u256 b =>
       have hL : LeanMLIR.applyWordBinOp .div (.u256 a) (.u256 b) =
           (if LeanMLIR.word256 b == 0#256 then LeanMLIR.PoisonOr.poison "binOp64 div0"
-           else LeanMLIR.PoisonOr.val (Val.u256 (LeanMLIR.ofWord256 (LeanMLIR.word256 a / LeanMLIR.word256 b)))) := rfl
+           else LeanMLIR.PoisonOr.val
+             (Val.u256 (LeanMLIR.ofWord256 (LeanMLIR.word256 a / LeanMLIR.word256 b)))) := rfl
       have hR : evalBinOp .div (.u256 a) (.u256 b) =
           (if LeanMLIR.word256 b == 0#256 then Except.error UBError.divisionByZero
-           else Except.ok (Val.u256 (LeanMLIR.ofWord256 (LeanMLIR.word256 a / LeanMLIR.word256 b)))) := by
+           else Except.ok
+             (Val.u256 (LeanMLIR.ofWord256 (LeanMLIR.word256 a / LeanMLIR.word256 b)))) := by
         rw [eval_div_u256, match9_eq, opt_to_except _ _ _ Val.u256, u256_div_opt]
       rw [hL, hR, outcomeToPoison_ite]
       rfl
-    | _ => rfl
-  | _ =>
-    cases v2 with
-    | u64 b =>
-      exact u64_cases_01
-        (fun b => LeanMLIR.applyWordBinOp .div _ (.u64 b) = outcomeToPoison (evalBinOp .div _ (.u64 b)))
-        (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) b
-    | _ => rfl
+    | _ => nomatch hdom
+  | _ => nomatch hdom
 
-theorem mlir_mod (v1 v2 : Val) :
+theorem mlir_mod (v1 v2 : Val) (hdom : StrictWordBinOpDom .mod v1 v2) :
     LeanMLIR.applyWordBinOp .mod v1 v2 = outcomeToPoison (evalBinOp .mod v1 v2) := by
   cases v1 with
+  | u64 a =>
+    cases v2 with
+    | u64 b =>
+      dsimp [StrictWordBinOpDom] at hdom
+      have hbv : (LeanMLIR.bv64 b == 0#64) = false := by
+        cases h0 : LeanMLIR.bv64 b == 0#64 with
+        | false => rfl
+        | true =>
+          exact False.elim (hdom (UInt64.eq_of_toBitVec_eq (eq_of_beq h0)))
+      dsimp [LeanMLIR.applyWordBinOp, evalBinOp, outcomeToPoison]
+      rw [hbv]
+      rfl
+    | _ => nomatch hdom
   | u256 a =>
     cases v2 with
     | u256 b =>
       have hL : LeanMLIR.applyWordBinOp .mod (.u256 a) (.u256 b) =
           (if LeanMLIR.word256 b == 0#256 then LeanMLIR.PoisonOr.poison "binOp64 div0"
-           else LeanMLIR.PoisonOr.val (Val.u256 (LeanMLIR.ofWord256 (LeanMLIR.word256 a % LeanMLIR.word256 b)))) := rfl
+           else LeanMLIR.PoisonOr.val
+             (Val.u256 (LeanMLIR.ofWord256 (LeanMLIR.word256 a % LeanMLIR.word256 b)))) := rfl
       have hR : evalBinOp .mod (.u256 a) (.u256 b) =
           (if LeanMLIR.word256 b == 0#256 then Except.error UBError.divisionByZero
-           else Except.ok (Val.u256 (LeanMLIR.ofWord256 (LeanMLIR.word256 a % LeanMLIR.word256 b)))) := by
+           else Except.ok
+             (Val.u256 (LeanMLIR.ofWord256 (LeanMLIR.word256 a % LeanMLIR.word256 b)))) := by
         rw [eval_mod_u256, match9_eq, opt_to_except _ _ _ Val.u256, u256_mod_opt]
       rw [hL, hR, outcomeToPoison_ite]
       rfl
-    | _ => rfl
-  | _ => cases v2 <;> rfl
+    | _ => nomatch hdom
+  | _ => nomatch hdom
 
-theorem outcomeToPoison_sameVal (v1 v2 : Val) (msg : String) :
-    (if LeanMLIR.sameVal v1 v2 then LeanMLIR.PoisonOr.val v1 else LeanMLIR.PoisonOr.poison "binOp64 type") =
-    outcomeToPoison (if v1 == v2 then Except.ok v1 else Except.error (UBError.typeError msg)) := by
-  unfold LeanMLIR.sameVal
-  cases v1 == v2 <;> rfl
-
-theorem mlir_bitAnd (v1 v2 : Val) :
+theorem mlir_bitAnd (v1 v2 : Val) (hdom : StrictWordBinOpDom .bitAnd v1 v2) :
     LeanMLIR.applyWordBinOp .bitAnd v1 v2 = outcomeToPoison (evalBinOp .bitAnd v1 v2) := by
   cases v1 with
   | u64 a =>
     cases v2 with
     | u64 b => rfl
-    | _ => exact outcomeToPoison_sameVal _ _ _
+    | _ => nomatch hdom
   | u256 a =>
     cases v2 with
     | u256 b => rfl
-    | _ => exact outcomeToPoison_sameVal _ _ _
-  | _ =>
-    cases v2 <;> exact outcomeToPoison_sameVal _ _ _
+    | _ => nomatch hdom
+  | _ => nomatch hdom
 
-theorem mlir_bitOr (v1 v2 : Val) :
+theorem mlir_bitOr (v1 v2 : Val) (hdom : StrictWordBinOpDom .bitOr v1 v2) :
     LeanMLIR.applyWordBinOp .bitOr v1 v2 = outcomeToPoison (evalBinOp .bitOr v1 v2) := by
   cases v1 with
   | u64 a =>
     cases v2 with
     | u64 b => rfl
-    | _ =>
-      exact u64_cases_01
-        (fun a => LeanMLIR.applyWordBinOp .bitOr (.u64 a) _ = outcomeToPoison (evalBinOp .bitOr (.u64 a) _))
-        (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) a
+    | _ => nomatch hdom
   | u256 a =>
     cases v2 with
-    | u64 b =>
-      exact u64_cases_01
-        (fun b => LeanMLIR.applyWordBinOp .bitOr (.u256 a) (.u64 b) = outcomeToPoison (evalBinOp .bitOr (.u256 a) (.u64 b)))
-        (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) b
     | u256 b => rfl
-    | _ => rfl
-  | _ =>
-    cases v2 with
-    | u64 b =>
-      exact u64_cases_01
-        (fun b => LeanMLIR.applyWordBinOp .bitOr _ (.u64 b) = outcomeToPoison (evalBinOp .bitOr _ (.u64 b)))
-        (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) b
-    | _ => exact outcomeToPoison_sameVal _ _ "bitOr requires u64 or u256"
+    | _ => nomatch hdom
+  | _ => nomatch hdom
 
-theorem mlir_bitXor (v1 v2 : Val) :
+theorem mlir_bitXor (v1 v2 : Val) (hdom : StrictWordBinOpDom .bitXor v1 v2) :
     LeanMLIR.applyWordBinOp .bitXor v1 v2 = outcomeToPoison (evalBinOp .bitXor v1 v2) := by
   cases v1 with
   | u64 a =>
     cases v2 with
     | u64 b => rfl
-    | _ =>
-      exact u64_cases_01
-        (fun a => LeanMLIR.applyWordBinOp .bitXor (.u64 a) _ = outcomeToPoison (evalBinOp .bitXor (.u64 a) _))
-        (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) a
-  | _ =>
+    | _ => nomatch hdom
+  | u256 a =>
     cases v2 with
-    | u64 b =>
-      exact u64_cases_01
-        (fun b => LeanMLIR.applyWordBinOp .bitXor _ (.u64 b) = outcomeToPoison (evalBinOp .bitXor _ (.u64 b)))
-        (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) b
-    | _ => rfl
+    | u256 b => rfl
+    | _ => nomatch hdom
+  | _ => nomatch hdom
 
-theorem mlir_shl (v1 v2 : Val) :
+theorem mlir_shl (v1 v2 : Val) (hdom : StrictWordBinOpDom .shl v1 v2) :
     LeanMLIR.applyWordBinOp .shl v1 v2 = outcomeToPoison (evalBinOp .shl v1 v2) := by
   cases v1 with
   | u64 a =>
     cases v2 with
     | u64 b => rfl
-    | _ => rfl
+    | _ => nomatch hdom
   | u256 a =>
     cases v2 with
-    | u64 b =>
-      exact u64_cases_01
-        (fun b => LeanMLIR.applyWordBinOp .shl (.u256 a) (.u64 b) = outcomeToPoison (evalBinOp .shl (.u256 a) (.u64 b)))
-        (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) b
     | u256 b =>
       have hL : LeanMLIR.applyWordBinOp .shl (.u256 a) (.u256 b) =
-          LeanMLIR.PoisonOr.val (Val.u256 (LeanMLIR.ofWord256 (LeanMLIR.word256 a <<< (LeanMLIR.word256 b).toNat))) := rfl
+          LeanMLIR.PoisonOr.val
+            (Val.u256 (LeanMLIR.ofWord256 (LeanMLIR.word256 a <<< (LeanMLIR.word256 b).toNat))) := rfl
       have hR : evalBinOp .shl (.u256 a) (.u256 b) =
           Except.ok (Val.u256 (UInt256.shl a b.toNat)) := rfl
       rw [hL, hR, word256_toNat, u256_shl_bv]
       rfl
-    | _ => rfl
-  | _ =>
-    cases v2 with
-    | u64 b =>
-      exact u64_cases_01
-        (fun b => LeanMLIR.applyWordBinOp .shl _ (.u64 b) = outcomeToPoison (evalBinOp .shl _ (.u64 b)))
-        (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) b
-    | _ => rfl
+    | _ => nomatch hdom
+  | _ => nomatch hdom
 
-theorem mlir_shr (v1 v2 : Val) :
+theorem mlir_shr (v1 v2 : Val) (hdom : StrictWordBinOpDom .shr v1 v2) :
     LeanMLIR.applyWordBinOp .shr v1 v2 = outcomeToPoison (evalBinOp .shr v1 v2) := by
   cases v1 with
   | u64 a =>
     cases v2 with
     | u64 b => rfl
-    | _ => rfl
+    | _ => nomatch hdom
   | u256 a =>
     cases v2 with
-    | u64 b =>
-      exact u64_cases_01
-        (fun b => LeanMLIR.applyWordBinOp .shr (.u256 a) (.u64 b) = outcomeToPoison (evalBinOp .shr (.u256 a) (.u64 b)))
-        (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) b
     | u256 b =>
       have hL : LeanMLIR.applyWordBinOp .shr (.u256 a) (.u256 b) =
-          LeanMLIR.PoisonOr.val (Val.u256 (LeanMLIR.ofWord256 (LeanMLIR.word256 a >>> (LeanMLIR.word256 b).toNat))) := rfl
+          LeanMLIR.PoisonOr.val
+            (Val.u256 (LeanMLIR.ofWord256 (LeanMLIR.word256 a >>> (LeanMLIR.word256 b).toNat))) := rfl
       have hR : evalBinOp .shr (.u256 a) (.u256 b) =
           Except.ok (Val.u256 (UInt256.shr a b.toNat)) := rfl
       rw [hL, hR, word256_toNat, u256_shr_bv]
       rfl
-    | _ => rfl
-  | _ =>
-    cases v2 with
-    | u64 b =>
-      exact u64_cases_01
-        (fun b => LeanMLIR.applyWordBinOp .shr _ (.u64 b) = outcomeToPoison (evalBinOp .shr _ (.u64 b)))
-        (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) b
-    | _ => rfl
+    | _ => nomatch hdom
+  | _ => nomatch hdom
 
-theorem mlir_sar (v1 v2 : Val) :
+theorem mlir_sar (v1 v2 : Val) (hdom : StrictWordBinOpDom .sar v1 v2) :
     LeanMLIR.applyWordBinOp .sar v1 v2 = outcomeToPoison (evalBinOp .sar v1 v2) := by
   cases v1 with
   | u64 a =>
@@ -1098,22 +1096,28 @@ theorem mlir_sar (v1 v2 : Val) :
           LeanMLIR.PoisonOr.val (Val.u64 (UInt64.ofBitVec (LeanMLIR.sar64 a.toBitVec b.toBitVec))) := rfl
       rw [hL, u64_sar_bv]
       rfl
-    | _ => rfl
+    | _ => nomatch hdom
   | u256 a =>
     cases v2 with
     | u256 b =>
       have hL : LeanMLIR.applyWordBinOp .sar (.u256 a) (.u256 b) =
-          LeanMLIR.PoisonOr.val (Val.u256 (LeanMLIR.ofWord256 (LeanMLIR.sar256 (LeanMLIR.word256 a) (LeanMLIR.word256 b).toNat))) := rfl
+          LeanMLIR.PoisonOr.val
+            (Val.u256 (LeanMLIR.ofWord256
+              (LeanMLIR.sar256 (LeanMLIR.word256 a) (LeanMLIR.word256 b).toNat))) := rfl
       have hR : evalBinOp .sar (.u256 a) (.u256 b) =
           Except.ok (Val.u256 (UInt256.sar a b.toNat)) := rfl
       rw [hL, hR, word256_toNat, u256_sar_bv]
       rfl
-    | _ => rfl
-  | _ => cases v2 <;> rfl
+    | _ => nomatch hdom
+  | _ => nomatch hdom
 
-theorem mlir_eq (v1 v2 : Val) :
+theorem mlir_eq (v1 v2 : Val) (hdom : StrictWordBinOpDom .eq v1 v2) :
     LeanMLIR.applyWordBinOp .eq v1 v2 = outcomeToPoison (evalBinOp .eq v1 v2) := by
   cases v1 with
+  | u64 _ =>
+    cases v2 with
+    | u64 _ => rfl
+    | _ => nomatch hdom
   | u256 a =>
     cases v2 with
     | u256 b =>
@@ -1121,12 +1125,20 @@ theorem mlir_eq (v1 v2 : Val) :
           LeanMLIR.PoisonOr.val (Val.bool (LeanMLIR.word256 a == LeanMLIR.word256 b)) := rfl
       rw [hL, word_eq]
       rfl
-    | _ => rfl
-  | _ => cases v2 <;> rfl
+    | _ => nomatch hdom
+  | bool _ =>
+    cases v2 with
+    | bool _ => rfl
+    | _ => nomatch hdom
+  | _ => nomatch hdom
 
-theorem mlir_lt (v1 v2 : Val) :
+theorem mlir_lt (v1 v2 : Val) (hdom : StrictWordBinOpDom .lt v1 v2) :
     LeanMLIR.applyWordBinOp .lt v1 v2 = outcomeToPoison (evalBinOp .lt v1 v2) := by
   cases v1 with
+  | u64 _ =>
+    cases v2 with
+    | u64 _ => rfl
+    | _ => nomatch hdom
   | u256 a =>
     cases v2 with
     | u256 b =>
@@ -1134,12 +1146,16 @@ theorem mlir_lt (v1 v2 : Val) :
           LeanMLIR.PoisonOr.val (Val.bool (decide (LeanMLIR.word256 a < LeanMLIR.word256 b))) := rfl
       rw [hL, word_lt]
       rfl
-    | _ => rfl
-  | _ => cases v2 <;> rfl
+    | _ => nomatch hdom
+  | _ => nomatch hdom
 
-theorem mlir_le (v1 v2 : Val) :
+theorem mlir_le (v1 v2 : Val) (hdom : StrictWordBinOpDom .le v1 v2) :
     LeanMLIR.applyWordBinOp .le v1 v2 = outcomeToPoison (evalBinOp .le v1 v2) := by
   cases v1 with
+  | u64 _ =>
+    cases v2 with
+    | u64 _ => rfl
+    | _ => nomatch hdom
   | u256 a =>
     cases v2 with
     | u256 b =>
@@ -1147,8 +1163,8 @@ theorem mlir_le (v1 v2 : Val) :
           LeanMLIR.PoisonOr.val (Val.bool (decide (LeanMLIR.word256 a ≤ LeanMLIR.word256 b))) := rfl
       rw [hL, word_le]
       rfl
-    | _ => rfl
-  | _ => cases v2 <;> rfl
+    | _ => nomatch hdom
+  | _ => nomatch hdom
 
 theorem outcomeToPoison_optPair (o1 o2 : Option UInt256)
     (g : UInt256 → UInt256 → Except UBError Val) (err : Except UBError Val) :
@@ -1319,23 +1335,24 @@ theorem mlir_eor3 (v1 v2 : Val) :
     LeanMLIR.applyWordBinOp .eor3 v1 v2 = outcomeToPoison (evalBinOp .eor3 v1 v2) := by
   cases v1 <;> cases v2 <;> rfl
 
-theorem applyWordBinOp_eq_eval (op : BinOp) (v1 v2 : Val) :
+theorem applyWordBinOp_eq_eval (op : BinOp) (v1 v2 : Val)
+    (hdom : StrictWordBinOpDom op v1 v2) :
     LeanMLIR.applyWordBinOp op v1 v2 = outcomeToPoison (evalBinOp op v1 v2) := by
   cases op with
-  | add => exact mlir_add v1 v2
-  | sub => exact mlir_sub v1 v2
-  | mul => exact mlir_mul v1 v2
-  | div => exact mlir_div v1 v2
-  | mod => exact mlir_mod v1 v2
-  | bitAnd => exact mlir_bitAnd v1 v2
-  | bitOr => exact mlir_bitOr v1 v2
-  | bitXor => exact mlir_bitXor v1 v2
-  | shl => exact mlir_shl v1 v2
-  | shr => exact mlir_shr v1 v2
-  | sar => exact mlir_sar v1 v2
-  | eq => exact mlir_eq v1 v2
-  | lt => exact mlir_lt v1 v2
-  | le => exact mlir_le v1 v2
+  | add => exact mlir_add v1 v2 hdom
+  | sub => exact mlir_sub v1 v2 hdom
+  | mul => exact mlir_mul v1 v2 hdom
+  | div => exact mlir_div v1 v2 hdom
+  | mod => exact mlir_mod v1 v2 hdom
+  | bitAnd => exact mlir_bitAnd v1 v2 hdom
+  | bitOr => exact mlir_bitOr v1 v2 hdom
+  | bitXor => exact mlir_bitXor v1 v2 hdom
+  | shl => exact mlir_shl v1 v2 hdom
+  | shr => exact mlir_shr v1 v2 hdom
+  | sar => exact mlir_sar v1 v2 hdom
+  | eq => exact mlir_eq v1 v2 hdom
+  | lt => exact mlir_lt v1 v2 hdom
+  | le => exact mlir_le v1 v2 hdom
   | addChecked256 => exact mlir_addChecked v1 v2
   | subChecked256 => exact mlir_subChecked v1 v2
   | mulChecked256 => exact mlir_mulChecked v1 v2
@@ -1345,11 +1362,11 @@ theorem applyWordBinOp_eq_eval (op : BinOp) (v1 v2 : Val) :
   | eor3 => exact mlir_eor3 v1 v2
 
 theorem applyWordBinOp_agrees (op : BinOp) (v1 v2 v : Val)
+    (hdom : StrictWordBinOpDom op v1 v2)
     (h : evalBinOp op v1 v2 = .ok v) :
     LeanMLIR.applyWordBinOp op v1 v2 = .val v := by
-  rw [applyWordBinOp_eq_eval, h]
+  rw [applyWordBinOp_eq_eval op v1 v2 hdom, h]
   rfl
-
 
 /-- Encode an LNIR `(VarEnv, HeapState)` pair into `LeanMLIR.EncodedMLIRState`. -/
 def encodeState (env : VarEnv) (st : HeapState) : LeanMLIR.EncodedMLIRState :=
@@ -1361,6 +1378,7 @@ abbrev lowerLNIRToMLIR : LNIRCode → Except String LeanMLIR.LLVM.Com :=
 
 /-- Soundness of `LeanMLIR.lowerScalarToMLIR` against `evalScalarExpr` and `LeanMLIR.denoteExpr`. -/
 theorem lowerScalarToMLIR_sound (env : VarEnv) (se : ScalarExpr) (v : Val)
+    (hdom : StrictScalarExpr env se)
     (heval : evalScalarExpr env se = .ok v) :
     LeanMLIR.denoteExpr env (LeanMLIR.lowerScalarToMLIR se) = .val v := by
   induction se generalizing v with
@@ -1383,6 +1401,7 @@ theorem lowerScalarToMLIR_sound (env : VarEnv) (se : ScalarExpr) (v : Val)
       subst heval
       rfl
   | binOp op l r ihl ihr =>
+    rcases hdom with ⟨hdomL, hdomR, hdomOp⟩
     dsimp [evalScalarExpr, LeanMLIR.lowerScalarToMLIR, LeanMLIR.denoteExpr] at heval ⊢
     cases hl : evalScalarExpr env l with
     | error _ => simp [hl] at heval
@@ -1391,42 +1410,45 @@ theorem lowerScalarToMLIR_sound (env : VarEnv) (se : ScalarExpr) (v : Val)
       | error _ => simp [hl, hr] at heval
       | ok vr =>
         simp only [hl, hr] at heval
-        rw [ihl vl hl, ihr vr hr]
+        rw [ihl vl hdomL hl, ihr vr hdomR hr]
         dsimp only
-        exact applyWordBinOp_agrees op vl vr v heval
+        exact applyWordBinOp_agrees op vl vr v (hdomOp vl vr hl hr) heval
   | unaryOp op a iha =>
+    dsimp [StrictScalarExpr] at hdom
     dsimp [evalScalarExpr, LeanMLIR.lowerScalarToMLIR, LeanMLIR.denoteExpr] at heval ⊢
     cases ha : evalScalarExpr env a with
     | error _ => simp [ha] at heval
     | ok va =>
       simp only [ha] at heval
-      rw [iha va ha]
+      rw [iha va hdom ha]
       dsimp only
       exact applyWordUnaryOp_agrees op va v heval
   | select c t e ihc iht ihe =>
+    rcases hdom with ⟨hdomC, hdomT, hdomE⟩
     dsimp [evalScalarExpr, LeanMLIR.lowerScalarToMLIR, LeanMLIR.denoteExpr] at heval ⊢
     cases hc : evalScalarExpr env c with
     | error _ => simp [hc] at heval
     | ok vc =>
       simp only [hc] at heval
-      rw [ihc vc hc]
+      rw [ihc vc hdomC hc]
       cases vc with
       | bool b =>
         cases b with
-        | true => exact iht v heval
-        | false => exact ihe v heval
+        | true => exact iht v hdomT heval
+        | false => exact ihe v hdomE heval
       | u64 n =>
         dsimp only at heval ⊢
         split at heval <;> rename_i hcond <;> simp [hcond]
-        · exact iht v heval
-        · exact ihe v heval
+        · exact iht v hdomT heval
+        · exact ihe v hdomE heval
       | u256 w =>
         dsimp only at heval ⊢
         split at heval <;> rename_i hcond <;> simp [hcond]
-        · exact iht v heval
-        · exact ihe v heval
+        · exact iht v hdomT heval
+        · exact ihe v hdomE heval
       | _ => contradiction
   | fma a b c iha ihb ihc =>
+    rcases hdom with ⟨hdomA, hdomB, hdomC, hdomFma⟩
     dsimp [evalScalarExpr, LeanMLIR.lowerScalarToMLIR, LeanMLIR.denoteExpr] at heval ⊢
     cases ha : evalScalarExpr env a with
     | error _ => simp [ha] at heval
@@ -1435,24 +1457,26 @@ theorem lowerScalarToMLIR_sound (env : VarEnv) (se : ScalarExpr) (v : Val)
       | error _ => simp [ha, hb] at heval
       | ok vb =>
         simp only [ha, hb] at heval
-        rw [iha va ha, ihb vb hb]
+        rw [iha va hdomA ha, ihb vb hdomB hb]
         dsimp only
         cases hmul : evalBinOp .mul va vb with
         | error _ => simp [hmul] at heval
         | ok vab =>
-          rw [applyWordBinOp_agrees .mul va vb vab hmul]
           cases hc : evalScalarExpr env c with
           | error _ => simp [hmul, hc] at heval
           | ok vc =>
+            rcases hdomFma va vb vab vc ha hb hmul hc with ⟨hdomMul, hdomAdd⟩
+            rw [applyWordBinOp_agrees .mul va vb vab hdomMul hmul]
             simp only [hmul, hc] at heval
-            rw [ihc vc hc]
+            rw [ihc vc hdomC hc]
             dsimp only
-            exact applyWordBinOp_agrees .add vab vc v heval
+            exact applyWordBinOp_agrees .add vab vc v hdomAdd heval
 
 /-- Milestone M5 (Item 1): Machine-checked soundness of `lowerLNIRToMLIR` (`lowerToLeanMLIR_sound`)
     against `LeanMLIR.denote` (`BitVec 64` + `PoisonOr` semantics, `0 sorryAx`). -/
 theorem lowerToLeanMLIR_sound (code : LNIRCode) (mlirCom : LeanMLIR.LLVM.Com)
     (fuel : Nat) (env : VarEnv) (st : HeapState) (v : Val) (st' : HeapState)
+    (h_strict : StrictLNIRCode env code)
     (h_lower : lowerLNIRToMLIR code = .ok mlirCom)
     (h_eval : evalCode fuel env st code = .ok (v, st')) :
     LeanMLIR.denote mlirCom (encodeState env st) = .val (v, st') := by
@@ -1461,31 +1485,41 @@ theorem lowerToLeanMLIR_sound (code : LNIRCode) (mlirCom : LeanMLIR.LLVM.Com)
   | letBind dst ty val k ih =>
     cases val with
     | scalar se =>
+      rcases h_strict with ⟨hse_dom, hk_dom⟩
       dsimp [LeanMLIR.lowerLNIRToMLIR] at h_lower
       cases hk : LeanMLIR.lowerLNIRToMLIR k with
-      | error _ => rw [hk] at h_lower; contradiction
+      | error _ =>
+        rw [hk] at h_lower
+        contradiction
       | ok k' =>
         rw [hk] at h_lower
         injection h_lower with heq
         subst heq
         dsimp [evalCode, evalExpr] at h_eval
         cases hse : evalScalarExpr env se with
-        | error _ => rw [hse] at h_eval; contradiction
+        | error _ =>
+          rw [hse] at h_eval
+          contradiction
         | ok vse =>
           rw [hse] at h_eval
           dsimp [LeanMLIR.denote, encodeState]
-          rw [lowerScalarToMLIR_sound env se vse hse]
-          exact ih k' (env.bind dst vse) st v st' hk h_eval
+          rw [lowerScalarToMLIR_sound env se vse hse_dom hse]
+          exact ih k' (env.bind dst vse) st v st' (hk_dom vse hse) hk h_eval
     | _ =>
       simp [LeanMLIR.lowerLNIRToMLIR] at h_lower
   | ite condVar thenBranch elseBranch iht ihe =>
+    rcases h_strict with ⟨ht_dom, he_dom⟩
     dsimp [LeanMLIR.lowerLNIRToMLIR] at h_lower
     cases ht : LeanMLIR.lowerLNIRToMLIR thenBranch with
-    | error _ => rw [ht] at h_lower; contradiction
+    | error _ =>
+      rw [ht] at h_lower
+      contradiction
     | ok t' =>
       rw [ht] at h_lower
       cases he : LeanMLIR.lowerLNIRToMLIR elseBranch with
-      | error _ => rw [he] at h_lower; contradiction
+      | error _ =>
+        rw [he] at h_lower
+        contradiction
       | ok e' =>
         rw [he] at h_lower
         injection h_lower with heq
@@ -1493,24 +1527,26 @@ theorem lowerToLeanMLIR_sound (code : LNIRCode) (mlirCom : LeanMLIR.LLVM.Com)
         dsimp [evalCode] at h_eval
         dsimp [LeanMLIR.denote, encodeState]
         cases hc : env condVar with
-        | none => rw [hc] at h_eval; contradiction
+        | none =>
+          rw [hc] at h_eval
+          contradiction
         | some vc =>
           rw [hc] at h_eval
           cases vc with
           | bool b =>
             cases b with
-            | true => exact iht t' env st v st' ht h_eval
-            | false => exact ihe e' env st v st' he h_eval
+            | true => exact iht t' env st v st' (ht_dom (.bool true) hc) ht h_eval
+            | false => exact ihe e' env st v st' (he_dom (.bool false) hc) he h_eval
           | u64 n =>
             dsimp only at h_eval ⊢
             split at h_eval <;> rename_i hcond <;> simp [hcond]
-            · exact iht t' env st v st' ht h_eval
-            · exact ihe e' env st v st' he h_eval
+            · exact iht t' env st v st' (ht_dom (.u64 n) hc) ht h_eval
+            · exact ihe e' env st v st' (he_dom (.u64 n) hc) he h_eval
           | u256 w =>
             dsimp only at h_eval ⊢
             split at h_eval <;> rename_i hcond <;> simp [hcond]
-            · exact iht t' env st v st' ht h_eval
-            · exact ihe e' env st v st' he h_eval
+            · exact iht t' env st v st' (ht_dom (.u256 w) hc) ht h_eval
+            · exact ihe e' env st v st' (he_dom (.u256 w) hc) he h_eval
           | _ => contradiction
   | ret retVar =>
     dsimp [LeanMLIR.lowerLNIRToMLIR] at h_lower
@@ -1519,7 +1555,9 @@ theorem lowerToLeanMLIR_sound (code : LNIRCode) (mlirCom : LeanMLIR.LLVM.Com)
     dsimp [evalCode] at h_eval
     dsimp [LeanMLIR.denote, encodeState]
     cases hv : env retVar with
-    | none => rw [hv] at h_eval; contradiction
+    | none =>
+      rw [hv] at h_eval
+      contradiction
     | some val =>
       rw [hv] at h_eval
       injection h_eval with hpair

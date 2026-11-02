@@ -79,8 +79,6 @@ def asWord256 : Val → Option (BitVec 256)
   | .u64 n => some (BitVec.ofNat 256 n.toBitVec.toNat)
   | _ => none
 
-def sameVal (a b : Val) : Bool := a == b
-
 def sar64 (a b : BitVec 64) : BitVec 64 :=
   let sh := b &&& 63#64
   let shifted := a >>> (sh % 64#64)
@@ -101,41 +99,40 @@ def sar256 (a : BitVec 256) (sh : Nat) : BitVec 256 :=
     if !isNeg then shifted
     else shifted + ((BitVec.allOnes 256) <<< (256 - sh))
 
-/-- Machine-word interpretation of a binary operator. The opcode is applied to `BitVec`
-    lanes first; LNIR value tags are reconstructed only at the boundary. -/
+/-- Machine-word interpretation of a binary operator. The opcode is applied strictly to typed
+    `BitVec` lanes (`.u64` / `.u256` / `.bool`), rejecting ill-typed non-scalar operands with
+    `.poison "binOp64 type"` and 64-bit / 256-bit zero divisors with `.poison "binOp64 div0"`. -/
 def applyWordBinOp (op : BinOp) (v1 v2 : Val) : PoisonOr Val :=
   match op with
   | .add =>
     match v1, v2 with
     | .u64 a, .u64 b => .val (.u64 (UInt64.ofBitVec (bv64 a + bv64 b)))
-    | _, .u64 0 => .val v1
-    | .u64 0, _ => .val v2
     | .u256 a, .u256 b => .val (.u256 (ofWord256 (word256 a + word256 b)))
     | _, _ => .poison "binOp64 type"
   | .sub =>
     match v1, v2 with
     | .u64 a, .u64 b => .val (.u64 (UInt64.ofBitVec (bv64 a - bv64 b)))
-    | _, .u64 0 => .val v1
     | .u256 a, .u256 b => .val (.u256 (ofWord256 (word256 a - word256 b)))
     | _, _ => .poison "binOp64 type"
   | .mul =>
     match v1, v2 with
     | .u64 a, .u64 b => .val (.u64 (UInt64.ofBitVec (bv64 a * bv64 b)))
-    | _, .u64 1 => .val v1
-    | .u64 1, _ => .val v2
     | .u256 a, .u256 b => .val (.u256 (ofWord256 (word256 a * word256 b)))
     | _, _ => .poison "binOp64 type"
   | .div =>
     match v1, v2 with
-    | .u64 a, .u64 b => .val (.u64 (UInt64.ofBitVec (bv64 a / bv64 b)))
-    | _, .u64 1 => .val v1
+    | .u64 a, .u64 b =>
+      if bv64 b == 0#64 then .poison "binOp64 div0"
+      else .val (.u64 (UInt64.ofBitVec (bv64 a / bv64 b)))
     | .u256 a, .u256 b =>
       if word256 b == 0#256 then .poison "binOp64 div0"
       else .val (.u256 (ofWord256 (word256 a / word256 b)))
     | _, _ => .poison "binOp64 type"
   | .mod =>
     match v1, v2 with
-    | .u64 a, .u64 b => .val (.u64 (UInt64.ofBitVec (bv64 a % bv64 b)))
+    | .u64 a, .u64 b =>
+      if bv64 b == 0#64 then .poison "binOp64 div0"
+      else .val (.u64 (UInt64.ofBitVec (bv64 a % bv64 b)))
     | .u256 a, .u256 b =>
       if word256 b == 0#256 then .poison "binOp64 div0"
       else .val (.u256 (ofWord256 (word256 a % word256 b)))
@@ -147,22 +144,18 @@ def applyWordBinOp (op : BinOp) (v1 v2 : Val) : PoisonOr Val :=
       let va := toVec4x64 a
       let vb := toVec4x64 b
       .val (.u256 (ofVec4x64 ⟨va.l0 &&& vb.l0, va.l1 &&& vb.l1, va.l2 &&& vb.l2, va.l3 &&& vb.l3⟩))
-    | _, _ => if sameVal v1 v2 then .val v1 else .poison "binOp64 type"
+    | _, _ => .poison "binOp64 type"
   | .bitOr =>
     match v1, v2 with
     | .u64 a, .u64 b => .val (.u64 (UInt64.ofBitVec (bv64 a ||| bv64 b)))
-    | _, .u64 0 => .val v1
-    | .u64 0, _ => .val v2
     | .u256 a, .u256 b =>
       let va := toVec4x64 a
       let vb := toVec4x64 b
       .val (.u256 (ofVec4x64 ⟨va.l0 ||| vb.l0, va.l1 ||| vb.l1, va.l2 ||| vb.l2, va.l3 ||| vb.l3⟩))
-    | _, _ => if sameVal v1 v2 then .val v1 else .poison "binOp64 type"
+    | _, _ => .poison "binOp64 type"
   | .bitXor =>
     match v1, v2 with
     | .u64 a, .u64 b => .val (.u64 (UInt64.ofBitVec (bv64 a ^^^ bv64 b)))
-    | _, .u64 0 => .val v1
-    | .u64 0, _ => .val v2
     | .u256 a, .u256 b =>
       let va := toVec4x64 a
       let vb := toVec4x64 b
@@ -171,13 +164,11 @@ def applyWordBinOp (op : BinOp) (v1 v2 : Val) : PoisonOr Val :=
   | .shl =>
     match v1, v2 with
     | .u64 a, .u64 b => .val (.u64 (UInt64.ofBitVec (bv64 a <<< (bv64 b % 64#64))))
-    | _, .u64 0 => .val v1
     | .u256 a, .u256 b => .val (.u256 (ofWord256 (word256 a <<< (word256 b).toNat)))
     | _, _ => .poison "binOp64 type"
   | .shr =>
     match v1, v2 with
     | .u64 a, .u64 b => .val (.u64 (UInt64.ofBitVec (bv64 a >>> (bv64 b % 64#64))))
-    | _, .u64 0 => .val v1
     | .u256 a, .u256 b => .val (.u256 (ofWord256 (word256 a >>> (word256 b).toNat)))
     | _, _ => .poison "binOp64 type"
   | .sar =>

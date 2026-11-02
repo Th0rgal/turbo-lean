@@ -57,77 +57,94 @@ theorem primSar64_eq_sar64 (a b : BitVec 64) : LCNF.primSar64 a b = LeanMLIR.sar
 theorem primSar256_eq_sar256 (a : BitVec 256) (s : Nat) :
     LCNF.primSar256 a s = LeanMLIR.sar256 a s := rfl
 
-theorem prim_add (v1 v2 : Val) : LCNF.primBinOp .add v1 v2 = evalBinOp .add v1 v2 := by
+theorem prim_add (v1 v2 : Val) (hdom : StrictWordBinOpDom .add v1 v2) :
+    LCNF.primBinOp .add v1 v2 = evalBinOp .add v1 v2 := by
   cases v1 with
   | u64 a =>
     cases v2 with
     | u64 b => rfl
-    | _ => exact u64_cases_01 (fun a => LCNF.primBinOp .add (.u64 a) _ = evalBinOp .add (.u64 a) _) (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) a
+    | _ => nomatch hdom
   | u256 a =>
     cases v2 with
-    | u64 b => exact u64_cases_01 (fun b => LCNF.primBinOp .add (.u256 a) (.u64 b) = evalBinOp .add (.u256 a) (.u64 b)) (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) b
     | u256 b => exact congrArg (fun w => Except.ok (Val.u256 w)) (u256_add_bv a b)
-    | _ => rfl
-  | _ =>
-    cases v2 with
-    | u64 b => exact u64_cases_01 (fun b => LCNF.primBinOp .add _ (.u64 b) = evalBinOp .add _ (.u64 b)) (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) b
-    | _ => rfl
+    | _ => nomatch hdom
+  | _ => nomatch hdom
 
-theorem prim_sub (v1 v2 : Val) : LCNF.primBinOp .sub v1 v2 = evalBinOp .sub v1 v2 := by
+theorem prim_sub (v1 v2 : Val) (hdom : StrictWordBinOpDom .sub v1 v2) :
+    LCNF.primBinOp .sub v1 v2 = evalBinOp .sub v1 v2 := by
   cases v1 with
   | u64 a =>
     cases v2 with
     | u64 b => rfl
-    | _ => rfl
+    | _ => nomatch hdom
   | u256 a =>
     cases v2 with
-    | u64 b => exact u64_cases_01 (fun b => LCNF.primBinOp .sub (.u256 a) (.u64 b) = evalBinOp .sub (.u256 a) (.u64 b)) (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) b
     | u256 b => exact congrArg (fun w => Except.ok (Val.u256 w)) (u256_sub_bv a b)
-    | _ => rfl
-  | _ =>
-    cases v2 with
-    | u64 b => exact u64_cases_01 (fun b => LCNF.primBinOp .sub _ (.u64 b) = evalBinOp .sub _ (.u64 b)) (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) b
-    | _ => rfl
+    | _ => nomatch hdom
+  | _ => nomatch hdom
 
-theorem prim_mul (v1 v2 : Val) : LCNF.primBinOp .mul v1 v2 = evalBinOp .mul v1 v2 := by
+theorem prim_mul (v1 v2 : Val) (hdom : StrictWordBinOpDom .mul v1 v2) :
+    LCNF.primBinOp .mul v1 v2 = evalBinOp .mul v1 v2 := by
   cases v1 with
   | u64 a =>
     cases v2 with
     | u64 b => rfl
-    | _ => exact u64_cases_01 (fun a => LCNF.primBinOp .mul (.u64 a) _ = evalBinOp .mul (.u64 a) _) (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) a
+    | _ => nomatch hdom
   | u256 a =>
     cases v2 with
-    | u64 b => exact u64_cases_01 (fun b => LCNF.primBinOp .mul (.u256 a) (.u64 b) = evalBinOp .mul (.u256 a) (.u64 b)) (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) b
     | u256 b => exact congrArg (fun w => Except.ok (Val.u256 w)) (u256_mul_bv a b)
-    | _ => rfl
-  | _ =>
-    cases v2 with
-    | u64 b => exact u64_cases_01 (fun b => LCNF.primBinOp .mul _ (.u64 b) = evalBinOp .mul _ (.u64 b)) (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) b
-    | _ => rfl
+    | _ => nomatch hdom
+  | _ => nomatch hdom
 
-theorem prim_div (v1 v2 : Val) : LCNF.primBinOp .div v1 v2 = evalBinOp .div v1 v2 := by
+theorem prim_div (v1 v2 : Val) (hdom : StrictWordBinOpDom .div v1 v2) :
+    LCNF.primBinOp .div v1 v2 = evalBinOp .div v1 v2 := by
   cases v1 with
   | u64 a =>
     cases v2 with
-    | u64 b => rfl
-    | _ => rfl
+    | u64 b =>
+      have hne : b ≠ 0 := hdom
+      have hbeq : (b.toBitVec == 0#64) = false := by
+        cases h : b.toBitVec == 0#64 with
+        | false => rfl
+        | true =>
+          have hb0 : b = 0 := UInt64.eq_of_toBitVec_eq (eq_of_beq h)
+          exact False.elim (hne hb0)
+      have hL : LCNF.primBinOp .div (.u64 a) (.u64 b) =
+          (if b.toBitVec == 0#64 then Except.error UBError.divisionByZero
+           else Except.ok (Val.u64 (UInt64.ofBitVec (a.toBitVec / b.toBitVec)))) := rfl
+      rw [hL, hbeq]
+      rfl
+    | _ => nomatch hdom
   | u256 a =>
     cases v2 with
-    | u64 b => exact u64_cases_01 (fun b => LCNF.primBinOp .div (.u256 a) (.u64 b) = evalBinOp .div (.u256 a) (.u64 b)) (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) b
     | u256 b =>
       have hL : LCNF.primBinOp .div (.u256 a) (.u256 b) =
           (if LCNF.toBv256 b == 0#256 then Except.error UBError.divisionByZero
            else Except.ok (Val.u256 (LCNF.ofBv256 (LCNF.toBv256 a / LCNF.toBv256 b)))) := rfl
       rw [hL, eval_div_u256, match9_eq, toBv_eq_word, toBv_eq_word, ofBv_eq_word,
           opt_to_except _ _ _ Val.u256, u256_div_opt]
-    | _ => rfl
-  | _ =>
-    cases v2 with
-    | u64 b => exact u64_cases_01 (fun b => LCNF.primBinOp .div _ (.u64 b) = evalBinOp .div _ (.u64 b)) (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) b
-    | _ => rfl
+    | _ => nomatch hdom
+  | _ => nomatch hdom
 
-theorem prim_mod (v1 v2 : Val) : LCNF.primBinOp .mod v1 v2 = evalBinOp .mod v1 v2 := by
+theorem prim_mod (v1 v2 : Val) (hdom : StrictWordBinOpDom .mod v1 v2) :
+    LCNF.primBinOp .mod v1 v2 = evalBinOp .mod v1 v2 := by
   cases v1 with
+  | u64 a =>
+    cases v2 with
+    | u64 b =>
+      have hne : b ≠ 0 := hdom
+      have hbeq : (b.toBitVec == 0#64) = false := by
+        cases h : b.toBitVec == 0#64 with
+        | false => rfl
+        | true =>
+          have hb0 : b = 0 := UInt64.eq_of_toBitVec_eq (eq_of_beq h)
+          exact False.elim (hne hb0)
+      have hL : LCNF.primBinOp .mod (.u64 a) (.u64 b) =
+          (if b.toBitVec == 0#64 then Except.error UBError.divisionByZero
+           else Except.ok (Val.u64 (UInt64.ofBitVec (a.toBitVec % b.toBitVec)))) := rfl
+      rw [hL, hbeq]
+      rfl
+    | _ => nomatch hdom
   | u256 a =>
     cases v2 with
     | u256 b =>
@@ -136,85 +153,95 @@ theorem prim_mod (v1 v2 : Val) : LCNF.primBinOp .mod v1 v2 = evalBinOp .mod v1 v
            else Except.ok (Val.u256 (LCNF.ofBv256 (LCNF.toBv256 a % LCNF.toBv256 b)))) := rfl
       rw [hL, eval_mod_u256, match9_eq, toBv_eq_word, toBv_eq_word, ofBv_eq_word,
           opt_to_except _ _ _ Val.u256, u256_mod_opt]
-    | _ => rfl
-  | _ => cases v2 <;> rfl
+    | _ => nomatch hdom
+  | _ => nomatch hdom
 
-theorem prim_bitAnd (v1 v2 : Val) : LCNF.primBinOp .bitAnd v1 v2 = evalBinOp .bitAnd v1 v2 := by
-  cases v1 <;> cases v2 <;> rfl
+theorem prim_bitAnd (v1 v2 : Val) (hdom : StrictWordBinOpDom .bitAnd v1 v2) :
+    LCNF.primBinOp .bitAnd v1 v2 = evalBinOp .bitAnd v1 v2 := by
+  cases v1 with
+  | u64 _ =>
+    cases v2 with
+    | u64 _ => rfl
+    | _ => nomatch hdom
+  | u256 _ =>
+    cases v2 with
+    | u256 _ => rfl
+    | _ => nomatch hdom
+  | _ => nomatch hdom
 
-theorem prim_bitOr (v1 v2 : Val) : LCNF.primBinOp .bitOr v1 v2 = evalBinOp .bitOr v1 v2 := by
+theorem prim_bitOr (v1 v2 : Val) (hdom : StrictWordBinOpDom .bitOr v1 v2) :
+    LCNF.primBinOp .bitOr v1 v2 = evalBinOp .bitOr v1 v2 := by
   cases v1 with
   | u64 a =>
     cases v2 with
-    | u64 b => rfl
-    | _ => exact u64_cases_01 (fun a => LCNF.primBinOp .bitOr (.u64 a) _ = evalBinOp .bitOr (.u64 a) _) (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) a
-  | _ =>
+    | u64 b => exact congrArg (fun x => Except.ok (Val.u64 x)) (u64_or_bv a b)
+    | _ => nomatch hdom
+  | u256 _ =>
     cases v2 with
-    | u64 b => exact u64_cases_01 (fun b => LCNF.primBinOp .bitOr _ (.u64 b) = evalBinOp .bitOr _ (.u64 b)) (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) b
-    | _ => rfl
+    | u256 _ => rfl
+    | _ => nomatch hdom
+  | _ => nomatch hdom
 
-theorem prim_bitXor (v1 v2 : Val) : LCNF.primBinOp .bitXor v1 v2 = evalBinOp .bitXor v1 v2 := by
+theorem prim_bitXor (v1 v2 : Val) (hdom : StrictWordBinOpDom .bitXor v1 v2) :
+    LCNF.primBinOp .bitXor v1 v2 = evalBinOp .bitXor v1 v2 := by
   cases v1 with
   | u64 a =>
     cases v2 with
-    | u64 b => rfl
-    | _ => exact u64_cases_01 (fun a => LCNF.primBinOp .bitXor (.u64 a) _ = evalBinOp .bitXor (.u64 a) _) (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) a
-  | _ =>
+    | u64 b => exact congrArg (fun x => Except.ok (Val.u64 x)) (u64_xor_bv a b)
+    | _ => nomatch hdom
+  | u256 _ =>
     cases v2 with
-    | u64 b => exact u64_cases_01 (fun b => LCNF.primBinOp .bitXor _ (.u64 b) = evalBinOp .bitXor _ (.u64 b)) (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) b
-    | _ => rfl
+    | u256 _ => rfl
+    | _ => nomatch hdom
+  | _ => nomatch hdom
 
-theorem prim_shl (v1 v2 : Val) : LCNF.primBinOp .shl v1 v2 = evalBinOp .shl v1 v2 := by
+theorem prim_shl (v1 v2 : Val) (hdom : StrictWordBinOpDom .shl v1 v2) :
+    LCNF.primBinOp .shl v1 v2 = evalBinOp .shl v1 v2 := by
   cases v1 with
   | u64 a =>
     cases v2 with
-    | u64 b => rfl
-    | _ => rfl
+    | u64 b => exact congrArg (fun x => Except.ok (Val.u64 x)) (u64_shl_bv a b)
+    | _ => nomatch hdom
   | u256 a =>
     cases v2 with
-    | u64 b => exact u64_cases_01 (fun b => LCNF.primBinOp .shl (.u256 a) (.u64 b) = evalBinOp .shl (.u256 a) (.u64 b)) (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) b
     | u256 b =>
       have hL : LCNF.primBinOp .shl (.u256 a) (.u256 b) =
           Except.ok (Val.u256 (LCNF.ofBv256 (LCNF.toBv256 a <<< (LCNF.toBv256 b).toNat))) := rfl
       have hR : evalBinOp .shl (.u256 a) (.u256 b) =
           Except.ok (Val.u256 (UInt256.shl a b.toNat)) := rfl
       rw [hL, hR, toBv_eq_word, toBv_eq_word, ofBv_eq_word, word256_toNat, u256_shl_bv]
-    | _ => rfl
-  | _ =>
-    cases v2 with
-    | u64 b => exact u64_cases_01 (fun b => LCNF.primBinOp .shl _ (.u64 b) = evalBinOp .shl _ (.u64 b)) (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) b
-    | _ => rfl
+    | _ => nomatch hdom
+  | _ => nomatch hdom
 
-theorem prim_shr (v1 v2 : Val) : LCNF.primBinOp .shr v1 v2 = evalBinOp .shr v1 v2 := by
+theorem prim_shr (v1 v2 : Val) (hdom : StrictWordBinOpDom .shr v1 v2) :
+    LCNF.primBinOp .shr v1 v2 = evalBinOp .shr v1 v2 := by
   cases v1 with
   | u64 a =>
     cases v2 with
-    | u64 b => rfl
-    | _ => rfl
+    | u64 b => exact congrArg (fun x => Except.ok (Val.u64 x)) (u64_shr_bv a b)
+    | _ => nomatch hdom
   | u256 a =>
     cases v2 with
-    | u64 b => exact u64_cases_01 (fun b => LCNF.primBinOp .shr (.u256 a) (.u64 b) = evalBinOp .shr (.u256 a) (.u64 b)) (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) b
     | u256 b =>
       have hL : LCNF.primBinOp .shr (.u256 a) (.u256 b) =
           Except.ok (Val.u256 (LCNF.ofBv256 (LCNF.toBv256 a >>> (LCNF.toBv256 b).toNat))) := rfl
       have hR : evalBinOp .shr (.u256 a) (.u256 b) =
           Except.ok (Val.u256 (UInt256.shr a b.toNat)) := rfl
       rw [hL, hR, toBv_eq_word, toBv_eq_word, ofBv_eq_word, word256_toNat, u256_shr_bv]
-    | _ => rfl
-  | _ =>
-    cases v2 with
-    | u64 b => exact u64_cases_01 (fun b => LCNF.primBinOp .shr _ (.u64 b) = evalBinOp .shr _ (.u64 b)) (fun _ => rfl) (fun _ => rfl) (fun _ _ => rfl) b
-    | _ => rfl
+    | _ => nomatch hdom
+  | _ => nomatch hdom
 
-theorem prim_sar (v1 v2 : Val) : LCNF.primBinOp .sar v1 v2 = evalBinOp .sar v1 v2 := by
+theorem prim_sar (v1 v2 : Val) (hdom : StrictWordBinOpDom .sar v1 v2) :
+    LCNF.primBinOp .sar v1 v2 = evalBinOp .sar v1 v2 := by
   cases v1 with
   | u64 a =>
     cases v2 with
     | u64 b =>
       have hL : LCNF.primBinOp .sar (.u64 a) (.u64 b) =
           Except.ok (Val.u64 (UInt64.ofBitVec (LCNF.primSar64 a.toBitVec b.toBitVec))) := rfl
-      rw [hL, primSar64_eq_sar64, u64_sar_bv]; rfl
-    | _ => rfl
+      rw [hL, primSar64_eq_sar64, u64_sar_bv]
+      rfl
+    | _ => nomatch hdom
   | u256 a =>
     cases v2 with
     | u256 b =>
@@ -223,41 +250,63 @@ theorem prim_sar (v1 v2 : Val) : LCNF.primBinOp .sar v1 v2 = evalBinOp .sar v1 v
       have hR : evalBinOp .sar (.u256 a) (.u256 b) =
           Except.ok (Val.u256 (UInt256.sar a b.toNat)) := rfl
       rw [hL, hR, toBv_eq_word, toBv_eq_word, ofBv_eq_word, primSar256_eq_sar256, word256_toNat, u256_sar_bv]
-    | _ => rfl
-  | _ => cases v2 <;> rfl
+    | _ => nomatch hdom
+  | _ => nomatch hdom
 
-theorem prim_eq (v1 v2 : Val) : LCNF.primBinOp .eq v1 v2 = evalBinOp .eq v1 v2 := by
+theorem prim_eq (v1 v2 : Val) (hdom : StrictWordBinOpDom .eq v1 v2) :
+    LCNF.primBinOp .eq v1 v2 = evalBinOp .eq v1 v2 := by
   cases v1 with
+  | u64 _ =>
+    cases v2 with
+    | u64 _ => rfl
+    | _ => nomatch hdom
   | u256 a =>
     cases v2 with
     | u256 b =>
       have hL : LCNF.primBinOp .eq (.u256 a) (.u256 b) =
           Except.ok (Val.bool (LCNF.toBv256 a == LCNF.toBv256 b)) := rfl
-      rw [hL, toBv_eq_word, toBv_eq_word, word_eq]; rfl
-    | _ => rfl
-  | _ => cases v2 <;> rfl
+      rw [hL, toBv_eq_word, toBv_eq_word, word_eq]
+      rfl
+    | _ => nomatch hdom
+  | bool _ =>
+    cases v2 with
+    | bool _ => rfl
+    | _ => nomatch hdom
+  | _ => nomatch hdom
 
-theorem prim_lt (v1 v2 : Val) : LCNF.primBinOp .lt v1 v2 = evalBinOp .lt v1 v2 := by
+theorem prim_lt (v1 v2 : Val) (hdom : StrictWordBinOpDom .lt v1 v2) :
+    LCNF.primBinOp .lt v1 v2 = evalBinOp .lt v1 v2 := by
   cases v1 with
+  | u64 _ =>
+    cases v2 with
+    | u64 _ => rfl
+    | _ => nomatch hdom
   | u256 a =>
     cases v2 with
     | u256 b =>
       have hL : LCNF.primBinOp .lt (.u256 a) (.u256 b) =
           Except.ok (Val.bool (decide (LCNF.toBv256 a < LCNF.toBv256 b))) := rfl
-      rw [hL, toBv_eq_word, toBv_eq_word, word_lt]; rfl
-    | _ => rfl
-  | _ => cases v2 <;> rfl
+      rw [hL, toBv_eq_word, toBv_eq_word, word_lt]
+      rfl
+    | _ => nomatch hdom
+  | _ => nomatch hdom
 
-theorem prim_le (v1 v2 : Val) : LCNF.primBinOp .le v1 v2 = evalBinOp .le v1 v2 := by
+theorem prim_le (v1 v2 : Val) (hdom : StrictWordBinOpDom .le v1 v2) :
+    LCNF.primBinOp .le v1 v2 = evalBinOp .le v1 v2 := by
   cases v1 with
+  | u64 _ =>
+    cases v2 with
+    | u64 _ => rfl
+    | _ => nomatch hdom
   | u256 a =>
     cases v2 with
     | u256 b =>
       have hL : LCNF.primBinOp .le (.u256 a) (.u256 b) =
           Except.ok (Val.bool (decide (LCNF.toBv256 a ≤ LCNF.toBv256 b))) := rfl
-      rw [hL, toBv_eq_word, toBv_eq_word, word_le]; rfl
-    | _ => rfl
-  | _ => cases v2 <;> rfl
+      rw [hL, toBv_eq_word, toBv_eq_word, word_le]
+      rfl
+    | _ => nomatch hdom
+  | _ => nomatch hdom
 
 theorem prim_addChecked (v1 v2 : Val) :
     LCNF.primBinOp .addChecked256 v1 v2 = evalBinOp .addChecked256 v1 v2 := by
@@ -376,23 +425,24 @@ theorem prim_gf2 (v1 v2 : Val) : LCNF.primBinOp .gf2Affine v1 v2 = evalBinOp .gf
 theorem prim_eor3 (v1 v2 : Val) : LCNF.primBinOp .eor3 v1 v2 = evalBinOp .eor3 v1 v2 := by
   cases v1 <;> cases v2 <;> rfl
 
-theorem primBinOp_eq_evalBinOp (op : BinOp) (v1 v2 : Val) :
+theorem primBinOp_eq_evalBinOp (op : BinOp) (v1 v2 : Val)
+    (hdom : StrictWordBinOpDom op v1 v2) :
     LCNF.primBinOp op v1 v2 = evalBinOp op v1 v2 := by
   cases op with
-  | add => exact prim_add v1 v2
-  | sub => exact prim_sub v1 v2
-  | mul => exact prim_mul v1 v2
-  | div => exact prim_div v1 v2
-  | mod => exact prim_mod v1 v2
-  | bitAnd => exact prim_bitAnd v1 v2
-  | bitOr => exact prim_bitOr v1 v2
-  | bitXor => exact prim_bitXor v1 v2
-  | shl => exact prim_shl v1 v2
-  | shr => exact prim_shr v1 v2
-  | sar => exact prim_sar v1 v2
-  | eq => exact prim_eq v1 v2
-  | lt => exact prim_lt v1 v2
-  | le => exact prim_le v1 v2
+  | add => exact prim_add v1 v2 hdom
+  | sub => exact prim_sub v1 v2 hdom
+  | mul => exact prim_mul v1 v2 hdom
+  | div => exact prim_div v1 v2 hdom
+  | mod => exact prim_mod v1 v2 hdom
+  | bitAnd => exact prim_bitAnd v1 v2 hdom
+  | bitOr => exact prim_bitOr v1 v2 hdom
+  | bitXor => exact prim_bitXor v1 v2 hdom
+  | shl => exact prim_shl v1 v2 hdom
+  | shr => exact prim_shr v1 v2 hdom
+  | sar => exact prim_sar v1 v2 hdom
+  | eq => exact prim_eq v1 v2 hdom
+  | lt => exact prim_lt v1 v2 hdom
+  | le => exact prim_le v1 v2 hdom
   | addChecked256 => exact prim_addChecked v1 v2
   | subChecked256 => exact prim_subChecked v1 v2
   | mulChecked256 => exact prim_mulChecked v1 v2
@@ -452,39 +502,73 @@ theorem primUnaryOp_eq_evalUnaryOp (op : UnaryOp) (v : Val) :
     | u64 n => exact lcnf_unary_clz_u64 n
     | _ => rfl
 
+/-- Strict typing and non-zero `u64` divisor precondition for `LCNF.LetValue`. -/
+def StrictLetValue (env : LCNF.Env) : LCNF.LetValue → Prop
+  | .binOp op aVar bVar =>
+    ∀ va vb, env aVar = some va → env bVar = some vb → StrictWordBinOpDom op va vb
+  | _ => True
+
+/-- Execution-aware strict typing precondition for `LCNF.Code`. -/
+def StrictLCNFCode (env : LCNF.Env) (st : HeapState) : LCNF.Code → Prop
+  | .letBind dst _ty val k =>
+    StrictLetValue env val ∧
+      ∀ v st', LCNF.evalLetValue env st val = .ok (v, st') →
+        StrictLCNFCode (LCNF.Env.bind env dst v) st' k
+  | .inc objVar count k =>
+    ∀ st', st.evalIncRef env objVar count = .ok st' → StrictLCNFCode env st' k
+  | .dec objVar count k =>
+    ∀ st', st.evalDecRef env objVar count = .ok st' → StrictLCNFCode env st' k
+  | .casesBool discr falseBranch trueBranch =>
+    (∀ v, env discr = some v →
+      match v with
+      | .bool false | .u64 _ | .u256 _ => StrictLCNFCode env st falseBranch
+      | _ => True) ∧
+    (∀ v, env discr = some v →
+      match v with
+      | .bool true | .u64 _ | .u256 _ => StrictLCNFCode env st trueBranch
+      | _ => True)
+  | .return _ | .unreach => True
+
 /-- Soundness of `LCNF.lowerLetValue` with respect to `LCNF.evalLetValue` and `evalExpr`. -/
 theorem lowerLetValue_sound (val : LCNF.LetValue) (expr : LNIRExpr)
     (env : VarEnv) (st : HeapState)
+    (h_strict : StrictLetValue env val)
     (h_lv : LCNF.lowerLetValue val = .ok expr) :
     LCNF.evalLetValue env st val = evalExpr env st expr := by
   cases val with
   | litU64 n =>
-    injection h_lv with heq; subst heq
+    injection h_lv with heq
+    subst heq
     rfl
   | litBool b =>
-    injection h_lv with heq; subst heq
+    injection h_lv with heq
+    subst heq
     rfl
   | litU256 w =>
-    injection h_lv with heq; subst heq
+    injection h_lv with heq
+    subst heq
     rfl
   | fvar x =>
-    injection h_lv with heq; subst heq
+    injection h_lv with heq
+    subst heq
     dsimp [LCNF.evalLetValue, evalExpr, evalScalarExpr]
     cases env x <;> rfl
   | binOp op aVar bVar =>
-    injection h_lv with heq; subst heq
+    injection h_lv with heq
+    subst heq
     dsimp [LCNF.lowerLetValue, LCNF.evalLetValue, evalExpr, evalScalarExpr]
-    cases env aVar with
+    cases ha : env aVar with
     | none => rfl
     | some va =>
-      cases env bVar with
+      cases hb : env bVar with
       | none => rfl
       | some vb =>
         dsimp only
-        rw [primBinOp_eq_evalBinOp op va vb]
+        rw [primBinOp_eq_evalBinOp op va vb (h_strict va vb ha hb)]
         cases evalBinOp op va vb <;> rfl
   | unaryOp op aVar =>
-    injection h_lv with heq; subst heq
+    injection h_lv with heq
+    subst heq
     dsimp [LCNF.lowerLetValue, LCNF.evalLetValue, evalExpr, evalScalarExpr]
     cases env aVar with
     | none => rfl
@@ -493,7 +577,8 @@ theorem lowerLetValue_sound (val : LCNF.LetValue) (expr : LNIRExpr)
       rw [primUnaryOp_eq_evalUnaryOp op va]
       cases evalUnaryOp op va <;> rfl
   | mkPair aVar bVar =>
-    injection h_lv with heq; subst heq
+    injection h_lv with heq
+    subst heq
     dsimp [LCNF.evalLetValue, evalExpr, evalVarList]
     cases env aVar with
     | none => rfl
@@ -502,16 +587,20 @@ theorem lowerLetValue_sound (val : LCNF.LetValue) (expr : LNIRExpr)
       | none => rfl
       | some vb => rfl
   | projTuple tupleVar idx =>
-    injection h_lv with heq; subst heq
+    injection h_lv with heq
+    subst heq
     rfl
   | sarrayLen arrVar =>
-    injection h_lv with heq; subst heq
+    injection h_lv with heq
+    subst heq
     rfl
   | sarrayGet arrVar idxVar elemTy =>
-    injection h_lv with heq; subst heq
+    injection h_lv with heq
+    subst heq
     rfl
   | sarraySet arrVar idxVar valVar elemTy =>
-    injection h_lv with heq; subst heq
+    injection h_lv with heq
+    subst heq
     rfl
   | unsupportedCall fnName =>
     simp [LCNF.lowerLetValue] at h_lv
@@ -522,12 +611,14 @@ theorem lowerLetValue_sound (val : LCNF.LetValue) (expr : LNIRExpr)
 theorem lowerLCNFCode_sound (c : LCNF.Code) (lnirCode : LNIRCode)
     (lcnfEnv : LCNF.Env) (lnirEnv : VarEnv) (st : HeapState) (fuel : Nat)
     (h_env : EnvCorresponds lcnfEnv lnirEnv)
+    (h_strict : StrictLCNFCode lcnfEnv st c)
     (h_lower : lowerCode c = .ok lnirCode) :
     evalLCNF lcnfEnv st c fuel ≈ evalCode fuel lnirEnv st lnirCode := by
   unfold EvalOutcomeEquiv evalLCNF lowerCode at *
   induction c generalizing lnirCode lcnfEnv lnirEnv st with
   | letBind dst ty val k ih =>
     dsimp [LCNF.lowerCode] at h_lower
+    rcases h_strict with ⟨hslv, hsk⟩
     cases hlv : LCNF.lowerLetValue val with
     | error err =>
       rw [hlv] at h_lower
@@ -545,12 +636,15 @@ theorem lowerLCNFCode_sound (c : LCNF.Code) (lnirCode : LNIRCode)
         have henv_eq := envCorresponds_eq h_env
         subst henv_eq
         dsimp [LCNF.evalLCNF, evalCode]
-        rw [lowerLetValue_sound val expr lcnfEnv st hlv]
-        cases evalExpr lcnfEnv st expr with
+        have hsound := lowerLetValue_sound val expr lcnfEnv st hslv hlv
+        rw [hsound]
+        cases hexpr : evalExpr lcnfEnv st expr with
         | error _ => rfl
         | ok pair =>
+          have heval_lv : LCNF.evalLetValue lcnfEnv st val = .ok (pair.1, pair.2) := by
+            rw [hsound, hexpr]
           exact ih k' (LCNF.Env.bind lcnfEnv dst pair.1) (lcnfEnv.bind dst pair.1) pair.2
-            (envCorresponds_bind h_env dst pair.1) hk
+            (envCorresponds_bind h_env dst pair.1) (hsk pair.1 pair.2 heval_lv) hk
   | inc objVar count k ih =>
     dsimp [LCNF.lowerCode] at h_lower
     cases hk : LCNF.lowerCode k with
@@ -564,9 +658,9 @@ theorem lowerLCNFCode_sound (c : LCNF.Code) (lnirCode : LNIRCode)
       have henv_eq := envCorresponds_eq h_env
       subst henv_eq
       dsimp [LCNF.evalLCNF, evalCode]
-      cases st.evalIncRef lcnfEnv objVar count with
+      cases hinc : st.evalIncRef lcnfEnv objVar count with
       | error _ => rfl
-      | ok st' => exact ih k' lcnfEnv lcnfEnv st' h_env hk
+      | ok st' => exact ih k' lcnfEnv lcnfEnv st' h_env (h_strict st' hinc) hk
   | dec objVar count k ih =>
     dsimp [LCNF.lowerCode] at h_lower
     cases hk : LCNF.lowerCode k with
@@ -580,11 +674,12 @@ theorem lowerLCNFCode_sound (c : LCNF.Code) (lnirCode : LNIRCode)
       have henv_eq := envCorresponds_eq h_env
       subst henv_eq
       dsimp [LCNF.evalLCNF, evalCode]
-      cases st.evalDecRef lcnfEnv objVar count with
+      cases hdec : st.evalDecRef lcnfEnv objVar count with
       | error _ => rfl
-      | ok st' => exact ih k' lcnfEnv lcnfEnv st' h_env hk
+      | ok st' => exact ih k' lcnfEnv lcnfEnv st' h_env (h_strict st' hdec) hk
   | casesBool discr falseBranch trueBranch ihf iht =>
     dsimp [LCNF.lowerCode] at h_lower
+    rcases h_strict with ⟨hsf, hst⟩
     cases hfb : LCNF.lowerCode falseBranch with
     | error err =>
       rw [hfb] at h_lower
@@ -602,24 +697,26 @@ theorem lowerLCNFCode_sound (c : LCNF.Code) (lnirCode : LNIRCode)
         have henv_eq := envCorresponds_eq h_env
         subst henv_eq
         dsimp [LCNF.evalLCNF, evalCode]
-        cases lcnfEnv discr with
+        cases hdiscr : lcnfEnv discr with
         | none => rfl
         | some cval =>
           cases cval with
           | bool b =>
             cases b with
-            | false => exact ihf fb' lcnfEnv lcnfEnv st h_env hfb
-            | true => exact iht tb' lcnfEnv lcnfEnv st h_env htb
+            | false =>
+              exact ihf fb' lcnfEnv lcnfEnv st h_env (hsf (.bool false) hdiscr) hfb
+            | true =>
+              exact iht tb' lcnfEnv lcnfEnv st h_env (hst (.bool true) hdiscr) htb
           | u64 n =>
             simp only
             split
-            · exact iht tb' lcnfEnv lcnfEnv st h_env htb
-            · exact ihf fb' lcnfEnv lcnfEnv st h_env hfb
+            · exact iht tb' lcnfEnv lcnfEnv st h_env (hst (.u64 n) hdiscr) htb
+            · exact ihf fb' lcnfEnv lcnfEnv st h_env (hsf (.u64 n) hdiscr) hfb
           | u256 w =>
             simp only
             split
-            · exact iht tb' lcnfEnv lcnfEnv st h_env htb
-            · exact ihf fb' lcnfEnv lcnfEnv st h_env hfb
+            · exact iht tb' lcnfEnv lcnfEnv st h_env (hst (.u256 w) hdiscr) htb
+            · exact ihf fb' lcnfEnv lcnfEnv st h_env (hsf (.u256 w) hdiscr) hfb
           | _ => rfl
   | «return» v =>
     dsimp [LCNF.lowerCode] at h_lower
