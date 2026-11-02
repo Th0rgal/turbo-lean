@@ -48,8 +48,12 @@ def naturalAlign : IntWidth → Nat
   | .i32 => 4
   | .i64 => 8
   | .i128 => 16
-  | .i256 => 8
-  | .i512 => 8
+  | .i256 => 16
+  | .i512 => 16
+
+theorem naturalAlign_isPow2 (w : IntWidth) :
+    (decide (0 < w.naturalAlign) && (w.naturalAlign &&& (w.naturalAlign - 1) == 0)) = true := by
+  cases w <;> decide
 
 def pp : IntWidth → String
   | .i1 => "i1"
@@ -91,6 +95,10 @@ def byteSize : FloatWidth → Nat
   | .f32 => 4
   | .f64 => 8
 
+def naturalAlign : FloatWidth → Nat
+  | .f32 => 4
+  | .f64 => 8
+
 def pp : FloatWidth → String
   | .f32 => "float"
   | .f64 => "double"
@@ -109,6 +117,49 @@ end FloatWidth
 
 def isPow2 (a : Nat) : Bool :=
   decide (0 < a) && (a &&& (a - 1) == 0)
+
+def nextPow2Aux (target : Nat) : Nat → Nat → Nat
+  | 0, acc => acc
+  | fuel + 1, acc =>
+    if target ≤ acc then acc
+    else nextPow2Aux target fuel (acc * 2)
+
+def nextPow2 (n : Nat) : Nat :=
+  if n ≤ 1 then 1 else nextPow2Aux n n 1
+
+theorem nextPow2Aux_isPow2 (target fuel acc : Nat) (h : isPow2 acc = true) :
+    isPow2 (nextPow2Aux target fuel acc) = true := by
+  induction fuel generalizing acc with
+  | zero => exact h
+  | succ f ih =>
+    simp only [nextPow2Aux]
+    split
+    · exact h
+    · apply ih (acc * 2)
+      unfold isPow2 at h ⊢
+      rcases Bool.and_eq_true_iff.mp h with ⟨hpos, hand⟩
+      have hp : 0 < acc := of_decide_eq_true hpos
+      have ha0 : acc &&& (acc - 1) = 0 := beq_iff_eq.mp hand
+      apply Bool.and_eq_true_iff.mpr
+      refine ⟨decide_eq_true (by omega), beq_iff_eq.mpr ?_⟩
+      have hdiv2 : ((acc * 2) &&& (acc * 2 - 1)) / 2 = acc &&& (acc - 1) := by
+        have h1 : (acc * 2) / 2 = acc := by omega
+        have h2 : (acc * 2 - 1) / 2 = acc - 1 := by omega
+        have hd := @Nat.and_div_two_pow (acc * 2) (acc * 2 - 1) 1
+        simp only [Nat.pow_one] at hd
+        rw [hd, h1, h2]
+      have hmod2 : ((acc * 2) &&& (acc * 2 - 1)) % 2 = 0 := by
+        have hm := @Nat.and_mod_two_pow (acc * 2) (acc * 2 - 1) 1
+        simp only [Nat.pow_one] at hm
+        have heven : (acc * 2) % 2 = 0 := by omega
+        rw [hm, heven, Nat.zero_and]
+      omega
+
+theorem nextPow2_isPow2 (n : Nat) : isPow2 (nextPow2 n) = true := by
+  unfold nextPow2
+  split
+  · decide
+  · exact nextPow2Aux_isPow2 n n 1 (by decide)
 
 def isAligned (addr : BitVec 64) (align : Nat) : Bool :=
   isPow2 align && (addr.toNat % align == 0)

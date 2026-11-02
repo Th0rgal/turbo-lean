@@ -38,7 +38,7 @@ inductive LLVMType where
   | int : IntWidth → LLVMType
   | float : FloatWidth → LLVMType
   | ptr : AddrSpace → LLVMType
-  | structFields : LLVMTypeFields → LLVMType
+  | structFields : Bool → LLVMTypeFields → LLVMType
   | array : Nat → LLVMType → LLVMType
   | vec : Nat → LLVMType → LLVMType
   deriving Repr, DecidableEq, Inhabited
@@ -59,49 +59,96 @@ end LLVMTypeFields
 
 namespace LLVMType
 
-def struct (fields : List LLVMType) : LLVMType :=
-  .structFields (LLVMTypeFields.ofList fields)
+def struct (fields : List LLVMType) (packed : Bool := false) : LLVMType :=
+  .structFields packed (LLVMTypeFields.ofList fields)
 
-def byteSize : LLVMType → Nat
+mutual
+def sizeOfType : LLVMType → Nat
   | .void => 0
-  | .int w => w.byteSize
-  | .float fw => fw.byteSize
-  | .ptr _ => 8
-  | .structFields fs => fieldsByteSize fs
-  | .array n et => n * et.byteSize
-  | .vec n et => n * et.byteSize
-where
-  fieldsByteSize : LLVMTypeFields → Nat
-    | .nil => 0
-    | .cons h t => h.byteSize + fieldsByteSize t
+  | .int _ | .float _ | .ptr _ => 1
+  | .structFields _ fs => 1 + sizeOfFields fs
+  | .array _ et => 1 + sizeOfType et
+  | .vec _ et => 1 + sizeOfType et
 
+def sizeOfFields : LLVMTypeFields → Nat
+  | .nil => 1
+  | .cons h t => 1 + sizeOfType h + sizeOfFields t
+end
+
+mutual
 def bitSize : LLVMType → Nat
   | .void => 0
   | .int w => w.bits
   | .float fw => fw.bits
   | .ptr _ => 64
-  | .structFields fs => fieldsBitSize fs
+  | .structFields _ fs => fieldsBitSize fs
   | .array n et => n * et.bitSize
   | .vec n et => n * et.bitSize
-where
-  fieldsBitSize : LLVMTypeFields → Nat
-    | .nil => 0
-    | .cons h t => h.bitSize + fieldsBitSize t
+
+def fieldsBitSize : LLVMTypeFields → Nat
+  | .nil => 0
+  | .cons h t => h.bitSize + fieldsBitSize t
+end
+
+mutual
+def abiAlign : LLVMType → Nat
+  | .void => 1
+  | .int w => w.naturalAlign
+  | .float fw => fw.naturalAlign
+  | .ptr _ => 8
+  | .structFields true _ => 1
+  | .structFields false fs => fieldsAbiAlign fs
+  | .array _ et => et.abiAlign
+  | .vec n et => nextPow2 ((n * et.bitSize + 7) / 8)
+
+def fieldsAbiAlign : LLVMTypeFields → Nat
+  | .nil => 1
+  | .cons h t => Nat.max h.abiAlign (fieldsAbiAlign t)
+end
+
+mutual
+def byteSize : LLVMType → Nat
+  | .void => 0
+  | .int w => w.byteSize
+  | .float fw => fw.byteSize
+  | .ptr _ => 8
+  | .structFields packed fs =>
+    let rawEnd := fieldsRawEnd packed fs 0
+    if packed then rawEnd
+    else ByteMem.alignUp rawEnd (fieldsAbiAlign fs)
+  | .array n et => n * et.byteSize
+  | .vec n et =>
+    let bits := n * et.bitSize
+    if bits == 0 then 0 else nextPow2 ((bits + 7) / 8)
+
+def fieldsRawEnd : Bool → LLVMTypeFields → Nat → Nat
+  | _, .nil, cur => cur
+  | packed, .cons h t, cur =>
+    let off := if packed then cur else ByteMem.alignUp cur h.abiAlign
+    fieldsRawEnd packed t (off + h.byteSize)
+end
 
 def structFieldTy : LLVMTypeFields → Nat → Option LLVMType
   | .cons h _, 0 => some h
   | .cons _ t, i + 1 => structFieldTy t i
   | .nil, _ => none
 
-def structFieldOffset : LLVMTypeFields → Nat → Option Nat
-  | .cons _ _, 0 => some 0
-  | .cons h t, i + 1 => (structFieldOffset t i).map (fun o => h.byteSize + o)
-  | .nil, _ => none
+def structFieldOffsetAux (packed : Bool) : LLVMTypeFields → Nat → Nat → Option Nat
+  | .nil, _, _ => none
+  | .cons h _, 0, cur =>
+    some (if packed then cur else ByteMem.alignUp cur h.abiAlign)
+  | .cons h t, i + 1, cur =>
+    let off := if packed then cur else ByteMem.alignUp cur h.abiAlign
+    structFieldOffsetAux packed t i (off + h.byteSize)
+
+def structFieldOffset (packed : Bool) (fs : LLVMTypeFields) (idx : Nat) : Option Nat :=
+  structFieldOffsetAux packed fs idx 0
 
 end LLVMType
 
 inductive Operand where
   | reg : RegName → Operand
+  | global : GlobalSym → Operand
   | constInt : (w : IntWidth) → BitVec w.bits → Operand
   | constFloat : (fw : FloatWidth) → BitVec fw.bits → Operand
   | constNull : Operand
@@ -117,8 +164,8 @@ def Operand.constAgg (ops : List Operand) : Operand :=
 
 inductive LLVMInstr where
   | alloca : RegName → LLVMType → Nat → LLVMInstr
-  | load : RegName → Bool → LLVMType → Operand → Nat → LLVMInstr
-  | store : Bool → LLVMType → Operand → Operand → Nat → LLVMInstr
+  | load : RegName → Bool → LLVMType → Operand → Nat → (as_ : AddrSpace := 0) → LLVMInstr
+  | store : Bool → LLVMType → Operand → Operand → Nat → (as_ : AddrSpace := 0) → LLVMInstr
   | add : RegName → OverflowFlags → IntWidth → Operand → Operand → LLVMInstr
   | sub : RegName → OverflowFlags → IntWidth → Operand → Operand → LLVMInstr
   | mul : RegName → OverflowFlags → IntWidth → Operand → Operand → LLVMInstr
@@ -144,10 +191,13 @@ inductive LLVMInstr where
   | bitcast : RegName → LLVMType → Operand → LLVMType → LLVMInstr
   | inttoptr : RegName → IntWidth → Operand → AddrSpace → LLVMInstr
   | ptrtoint : RegName → AddrSpace → Operand → IntWidth → LLVMInstr
-  | getelementptr : RegName → Bool → LLVMType → Operand → List (IntWidth × Operand) → LLVMInstr
+  | getelementptr : RegName → Bool → LLVMType → Operand → List (IntWidth × Operand) →
+      (as_ : AddrSpace := 0) → LLVMInstr
   | select : RegName → Operand → LLVMType → Operand → Operand → LLVMInstr
-  | call : Option RegName → LLVMType → GlobalSym → List (LLVMType × Operand) → LLVMInstr
-  | atomicrmw : RegName → AtomicRMWOp → Operand → LLVMType → Operand → AtomicOrdering → Nat → LLVMInstr
+  | call : Option RegName → LLVMType → GlobalSym → List (LLVMType × Operand) →
+      (cc : CallingConv := .ccc) → LLVMInstr
+  | atomicrmw : RegName → AtomicRMWOp → Operand → LLVMType → Operand → AtomicOrdering → Nat →
+      (as_ : AddrSpace := 0) → LLVMInstr
   | insertelement : RegName → Nat → LLVMType → Operand → Operand → IntWidth → Operand → LLVMInstr
   | extractelement : RegName → Nat → LLVMType → Operand → IntWidth → Operand → LLVMInstr
   | shufflevector : RegName → Nat → Nat → LLVMType → Operand → Operand → List Nat → LLVMInstr
@@ -241,31 +291,35 @@ def LLVMVal.ofList : List LLVMVal → LLVMVal
   | [] => .aggNil
   | h :: rest => .aggCons h (ofList rest)
 
+mutual
 def LLVMVal.zeroOf : LLVMType → LLVMVal
   | .void => .aggNil
   | .int w => .bits w (BitVec.ofNat w.bits 0)
   | .float fw => .floatBits fw (BitVec.ofNat fw.bits 0)
   | .ptr _ => .ptr 0#64
-  | .structFields fs => zeroFields fs
+  | .structFields _ fs => zeroOfFields fs
   | .array n et => LLVMVal.ofList (List.replicate n (zeroOf et))
   | .vec n et => LLVMVal.ofList (List.replicate n (zeroOf et))
-where
-  zeroFields : LLVMTypeFields → LLVMVal
-    | .nil => .aggNil
-    | .cons h t => .aggCons (zeroOf h) (zeroFields t)
 
+def LLVMVal.zeroOfFields : LLVMTypeFields → LLVMVal
+  | .nil => .aggNil
+  | .cons h t => .aggCons (LLVMVal.zeroOf h) (LLVMVal.zeroOfFields t)
+end
+
+mutual
 def LLVMVal.undefOf : LLVMType → LLVMVal
   | .void => .aggNil
   | .int w => .bits w (BitVec.ofNat w.bits 0)
   | .float fw => .floatBits fw (BitVec.ofNat fw.bits 0)
   | .ptr _ => .ptr 0#64
-  | .structFields fs => undefFields fs
+  | .structFields _ fs => undefOfFields fs
   | .array n et => LLVMVal.ofList (List.replicate n (undefOf et))
   | .vec n et => LLVMVal.ofList (List.replicate n (undefOf et))
-where
-  undefFields : LLVMTypeFields → LLVMVal
-    | .nil => .aggNil
-    | .cons h t => .aggCons (undefOf h) (undefFields t)
+
+def LLVMVal.undefOfFields : LLVMTypeFields → LLVMVal
+  | .nil => .aggNil
+  | .cons h t => .aggCons (LLVMVal.undefOf h) (LLVMVal.undefOfFields t)
+end
 
 inductive ExecOutcome where
   | returned : Option LLVMVal → ExecOutcome
@@ -275,6 +329,7 @@ inductive ExecOutcome where
 
 structure ExecState where
   regs : List (RegName × LLVMVal) := []
+  globals : List (GlobalSym × BitVec 64) := []
   mem : ByteMem := {}
   prevBlock : Option BlockLabel := none
   deriving Repr, DecidableEq, Inhabited
@@ -287,6 +342,10 @@ def bindReg (st : ExecState) (r : RegName) (v : LLVMVal) : ExecState :=
 
 def evalOperand (st : ExecState) : Operand → LLVMVal
   | .reg r => (lookupReg st r).getD .poison
+  | .global sym =>
+    match st.globals.lookup sym with
+    | some ptr => .ptr ptr
+    | none => .poison
   | .constInt w v => .bits w v
   | .constFloat fw v => .floatBits fw v
   | .constNull => .ptr 0#64
@@ -302,11 +361,12 @@ def evalTypedOperand (st : ExecState) (ty : LLVMType) (op : Operand) : LLVMVal :
   | .constUndef => LLVMVal.undefOf ty
   | .aggNil =>
     match ty with
-    | .array _ _ | .vec _ _ | .structFields _ => LLVMVal.zeroOf ty
+    | .array _ _ | .vec _ _ | .structFields _ _ => LLVMVal.zeroOf ty
     | _ => .aggNil
   | .aggCons h t =>
     match ty with
-    | .structFields (.cons hty tty) => .aggCons (evalTypedOperand st hty h) (evalTypedOperand st (.structFields tty) t)
+    | .structFields packed (.cons hty tty) =>
+      .aggCons (evalTypedOperand st hty h) (evalTypedOperand st (.structFields packed tty) t)
     | .array (k + 1) et => .aggCons (evalTypedOperand st et h) (evalTypedOperand st (.array k et) t)
     | .vec (k + 1) et => .aggCons (evalTypedOperand st et h) (evalTypedOperand st (.vec k et) t)
     | _ => .aggCons (evalOperand st h) (evalOperand st t)
@@ -499,7 +559,150 @@ def f32Bin (op : String) (a b : BitVec 32) : BitVec 32 :=
     | _ => fa / fb
   BitVec.ofNat 32 fr.toBits.toNat
 
-def serializeVal : LLVMVal → List MemByte
+def packI1Chunk : Nat → List LLVMVal → Option (BitVec 8)
+  | 0, _ => some 0#8
+  | k + 1, [] =>
+    match packI1Chunk k [] with
+    | some hi => some (hi <<< 1)
+    | none => none
+  | k + 1, .bits .i1 b :: rest =>
+    match packI1Chunk k rest with
+    | some hi => some ((hi <<< 1) ||| (if b == 1#1 then 1#8 else 0#8))
+    | none => none
+  | _, _ => none
+
+def packI1Lanes : Nat → List LLVMVal → List MemByte
+  | 0, _ => []
+  | bytes + 1, vs =>
+    let b0 :=
+      match packI1Chunk 8 (vs.take 8) with
+      | some bv => MemByte.init bv
+      | none => MemByte.poisonByte
+    b0 :: packI1Lanes bytes (vs.drop 8)
+
+def unpackI1Chunk (b : MemByte) : Nat → Nat → List LLVMVal
+  | 0, _ => []
+  | k + 1, shift =>
+    let elem :=
+      match b with
+      | .init bv => LLVMVal.bits .i1 (if bv.getLsbD shift then 1#1 else 0#1)
+      | .poisonByte => .poison
+    elem :: unpackI1Chunk b k (shift + 1)
+
+def unpackI1Lanes : Nat → List MemByte → List LLVMVal
+  | 0, _ => []
+  | n, [] => List.replicate n .poison
+  | n, b :: bs =>
+    let chunk := Nat.min n 8
+    unpackI1Chunk b chunk 0 ++ unpackI1Lanes (n - chunk) bs
+
+def repeatMapIdx {α : Type} (n : Nat) (f : Nat → α) : List α :=
+  go 0 n
+where
+  go (i : Nat) : Nat → List α
+    | 0 => []
+    | k + 1 => f i :: go (i + 1) k
+
+def structFieldOffsetList (packed : Bool) : LLVMTypeFields → Nat → List (Nat × LLVMType)
+  | .nil, _ => []
+  | .cons h t, cur =>
+    let off := if packed then cur else ByteMem.alignUp cur h.abiAlign
+    (off, h) :: structFieldOffsetList packed t (off + h.byteSize)
+
+def padChunkList : Nat → List (Nat × List MemByte) → List MemByte
+  | _, [] => []
+  | cur, (off, chunk) :: rest =>
+    ByteMem.zeroBytes (off - cur) ++ chunk ++ padChunkList (off + chunk.length) rest
+
+def serializeTypedValAux : Nat → LLVMType → LLVMVal → List MemByte
+  | 0, ty, _ => ByteMem.poisonBytes ty.byteSize
+  | _ + 1, .void, _ => []
+  | _ + 1, .int w, .bits w' bv =>
+    if h : w' = w then ByteMem.initBytes (ByteMem.bvToLEBytes w.byteSize (h ▸ bv))
+    else ByteMem.poisonBytes w.byteSize
+  | _ + 1, .int w, _ => ByteMem.poisonBytes w.byteSize
+  | _ + 1, .ptr _, .ptr p => ByteMem.initBytes (ByteMem.bvToLEBytes 8 p)
+  | _ + 1, .ptr _, _ => ByteMem.poisonBytes 8
+  | _ + 1, .float fw, .floatBits fw' fb =>
+    if h : fw' = fw then ByteMem.initBytes (ByteMem.bvToLEBytes fw.byteSize (h ▸ fb))
+    else ByteMem.poisonBytes fw.byteSize
+  | _ + 1, .float fw, _ => ByteMem.poisonBytes fw.byteSize
+  | fuel + 1, .structFields packed fs, v =>
+    let total := (LLVMType.structFields packed fs).byteSize
+    if isPoison v then ByteMem.poisonBytes total
+    else
+      match v.toList? with
+      | none => ByteMem.poisonBytes total
+      | some vs =>
+        let specs := structFieldOffsetList packed fs 0
+        let chunks := repeatMapIdx specs.length fun i =>
+          match specs.getD i (0, .void) with
+          | (off, fty) => (off, serializeTypedValAux fuel fty (vs.getD i .poison))
+        let raw := padChunkList 0 chunks
+        raw ++ ByteMem.zeroBytes (total - Nat.min raw.length total)
+  | fuel + 1, .array n et, v =>
+    if isPoison v then ByteMem.poisonBytes (LLVMType.array n et).byteSize
+    else
+      match v.toList? with
+      | none => ByteMem.poisonBytes (LLVMType.array n et).byteSize
+      | some vs =>
+        (repeatMapIdx n fun i => serializeTypedValAux fuel et (vs.getD i .poison)).flatten
+  | fuel + 1, .vec n et, v =>
+    let storeBytes := (LLVMType.vec n et).byteSize
+    if isPoison v then ByteMem.poisonBytes storeBytes
+    else
+      match v.toList? with
+      | none => ByteMem.poisonBytes storeBytes
+      | some vs =>
+        if et == .int .i1 then
+          let rawBytes := (n + 7) / 8
+          let packed := packI1Lanes rawBytes (vs.take n)
+          packed ++ ByteMem.zeroBytes (storeBytes - Nat.min packed.length storeBytes)
+        else
+          let rawBytes := (n * et.bitSize + 7) / 8
+          let body := ((repeatMapIdx n fun i => serializeTypedValAux fuel et (vs.getD i .poison)).flatten).take rawBytes
+          body ++ ByteMem.zeroBytes (storeBytes - Nat.min body.length storeBytes)
+
+def serializeTypedVal (ty : LLVMType) (v : LLVMVal) : List MemByte :=
+  serializeTypedValAux (ty.sizeOfType + 1) ty v
+
+def deserializeValAux : Nat → LLVMType → List MemByte → LLVMVal
+  | 0, _, _ => .poison
+  | _ + 1, .void, _ => .aggNil
+  | _ + 1, .int w, bs =>
+    match ByteMem.bytesToBv? w.bits (bs.take w.byteSize) with
+    | some v => .bits w v
+    | none => .poison
+  | _ + 1, .ptr _, bs =>
+    match ByteMem.bytesToBv? 64 (bs.take 8) with
+    | some v => .ptr v
+    | none => .poison
+  | _ + 1, .float fw, bs =>
+    match ByteMem.bytesToBv? fw.bits (bs.take fw.byteSize) with
+    | some v => .floatBits fw v
+    | none => .poison
+  | fuel + 1, .structFields packed fs, bs =>
+    let specs := structFieldOffsetList packed fs 0
+    LLVMVal.ofList (repeatMapIdx specs.length fun i =>
+      match specs.getD i (0, .void) with
+      | (off, fty) => deserializeValAux fuel fty ((bs.drop off).take fty.byteSize))
+  | fuel + 1, .array n et, bs =>
+    let sz := et.byteSize
+    LLVMVal.ofList (repeatMapIdx n fun i =>
+      deserializeValAux fuel et ((bs.drop (i * sz)).take sz))
+  | fuel + 1, .vec n et, bs =>
+    if et == .int .i1 then
+      LLVMVal.ofList (unpackI1Lanes n bs)
+    else
+      let sz := et.byteSize
+      LLVMVal.ofList (repeatMapIdx n fun i =>
+        deserializeValAux fuel et ((bs.drop (i * sz)).take sz))
+
+def deserializeVal (ty : LLVMType) (bs : List MemByte) : LLVMVal :=
+  deserializeValAux (ty.sizeOfType + 1) ty bs
+
+def serializeVal (v : LLVMVal) : List MemByte :=
+  match v with
   | .bits w bv => ByteMem.initBytes (ByteMem.bvToLEBytes w.byteSize bv)
   | .ptr p => ByteMem.initBytes (ByteMem.bvToLEBytes 8 p)
   | .floatBits fw fb => ByteMem.initBytes (ByteMem.bvToLEBytes fw.byteSize fb)
@@ -507,35 +710,8 @@ def serializeVal : LLVMVal → List MemByte
   | .aggNil => []
   | .aggCons h t => serializeVal h ++ serializeVal t
 
-def deserializeVal (ty : LLVMType) (bs : List MemByte) : LLVMVal :=
-  match ty with
-  | .void => .aggNil
-  | .int w =>
-    match ByteMem.bytesToBv? w.bits (bs.take w.byteSize) with
-    | some v => .bits w v
-    | none => .poison
-  | .ptr _ =>
-    match ByteMem.bytesToBv? 64 (bs.take 8) with
-    | some v => .ptr v
-    | none => .poison
-  | .float fw =>
-    match ByteMem.bytesToBv? fw.bits (bs.take fw.byteSize) with
-    | some v => .floatBits fw v
-    | none => .poison
-  | .structFields fs => deserializeFields fs bs
-  | .array n et => deserializeElems n et bs
-  | .vec n et => deserializeElems n et bs
-where
-  deserializeFields : LLVMTypeFields → List MemByte → LLVMVal
-    | .nil, _ => .aggNil
-    | .cons h t, bs =>
-      let n := h.byteSize
-      .aggCons (deserializeVal h (bs.take n)) (deserializeFields t (bs.drop n))
-  deserializeElems : Nat → LLVMType → List MemByte → LLVMVal
-    | 0, _, _ => .aggNil
-    | k + 1, et, bs =>
-      let n := et.byteSize
-      .aggCons (deserializeVal et (bs.take n)) (deserializeElems k et (bs.drop n))
+def storeTypedVal (m : ByteMem) (addr : BitVec 64) (ty : LLVMType) (v : LLVMVal) : ByteMem :=
+  m.writeBytesAt addr.toNat (serializeTypedVal ty v)
 
 def storeVal (m : ByteMem) (addr : BitVec 64) (v : LLVMVal) : ByteMem :=
   m.writeBytesAt addr.toNat (serializeVal v)
@@ -564,10 +740,10 @@ where
       match walk et rest with
       | some inner => some (Int.ofNat et.byteSize * i + inner)
       | none => none
-    | .structFields fs, (i, w) :: rest =>
+    | .structFields packed fs, (i, w) :: rest =>
       if w == .i32 then
         if 0 ≤ i then
-          match LLVMType.structFieldOffset fs i.toNat, LLVMType.structFieldTy fs i.toNat with
+          match LLVMType.structFieldOffset packed fs i.toNat, LLVMType.structFieldTy fs i.toNat with
           | some off, some fty =>
             match walk fty rest with
             | some inner => some (Int.ofNat off + inner)
@@ -577,25 +753,33 @@ where
       else none
     | _, _ => none
 
+def containsPtr : LLVMType → Bool
+  | .ptr _ => true
+  | .vec _ et => containsPtr et
+  | _ => false
+
 def bitcastVal (srcTy dstTy : LLVMType) (v : LLVMVal) : Option LLVMVal :=
   if srcTy.bitSize != dstTy.bitSize then none
+  else if srcTy matches .void || srcTy matches .structFields _ _ || srcTy matches .array _ _ then none
+  else if dstTy matches .void || dstTy matches .structFields _ _ || dstTy matches .array _ _ then none
   else if isPoison v then some .poison
-  else
-    let bs := serializeVal v
-    if bs.length * 8 < dstTy.bitSize then none
-    else some (deserializeVal dstTy bs)
+  else if containsPtr srcTy || containsPtr dstTy then
+    if srcTy == dstTy then some v else none
+  else some (deserializeVal dstTy (serializeTypedVal srcTy v))
 
 def bswapBytes (w : IntWidth) (v : BitVec w.bits) : BitVec w.bits :=
-  let rec go : Nat → Nat → Nat → Nat
+  BitVec.ofNat w.bits (bswapAcc w.byteSize v.toNat 0)
+where
+  bswapAcc : Nat → Nat → Nat → Nat
     | 0, _, acc => acc
-    | k + 1, src, acc => go k (src / 256) (acc * 256 + src % 256)
-  BitVec.ofNat w.bits (go w.byteSize v.toNat 0)
+    | k + 1, src, acc => bswapAcc k (src / 256) (acc * 256 + src % 256)
 
 def ctlzBits (w : IntWidth) (v : BitVec w.bits) : BitVec w.bits :=
-  let rec go : Nat → Nat
+  BitVec.ofNat w.bits (ctlzAcc w v w.bits)
+where
+  ctlzAcc (w : IntWidth) (v : BitVec w.bits) : Nat → Nat
     | 0 => w.bits
-    | k + 1 => if v.getLsbD k then w.bits - 1 - k else go k
-  BitVec.ofNat w.bits (go w.bits)
+    | k + 1 => if v.getLsbD k then w.bits - 1 - k else ctlzAcc w v k
 
 def uaddOverflow (w : IntWidth) (a b : BitVec w.bits) : LLVMVal :=
   let sum := a + b
@@ -668,30 +852,36 @@ def binResult (dst : RegName) (st : ExecState) (w : IntWidth) (flags : OverflowF
 
 def divOrRem (dst : RegName) (st : ExecState) (w : IntWidth) (exact : Bool) (a b : LLVMVal)
     (signed isRem : Bool) : ExecOutcome ⊕ ExecState :=
-  match a, b with
-  | .poison, _ => .inr (bindReg st dst .poison)
-  | _, .poison => .inr (bindReg st dst .poison)
-  | .bits wa va, .bits wb vb =>
-    if ha : wa = w then
-      if hb : wb = w then
-        let va' : BitVec w.bits := ha ▸ va
-        let vb' : BitVec w.bits := hb ▸ vb
-        if vb' == 0#w.bits then .inl (.ub "division by zero")
-        else if signed && sdivOverflow w va' vb' then .inl (.ub "signed division overflow")
-        else
-          let res :=
-            if signed then
-              if isRem then bvSRem w va' vb' else bvSDiv w va' vb'
+  match b with
+  | .poison => .inl (.ub "division by poison")
+  | .bits wb vb =>
+    if hb : wb = w then
+      let vb' : BitVec w.bits := hb ▸ vb
+      if vb' == 0#w.bits then .inl (.ub "division by zero")
+      else
+        match a with
+        | .poison =>
+          if signed && bvSigned w vb' == -1 then .inl (.ub "signed division overflow")
+          else .inr (bindReg st dst .poison)
+        | .bits wa va =>
+          if ha : wa = w then
+            let va' : BitVec w.bits := ha ▸ va
+            if signed && sdivOverflow w va' vb' then .inl (.ub "signed division overflow")
             else
-              if isRem then va' % vb' else va' / vb'
-          let inexact :=
-            if isRem then false
-            else if signed then bvSRem w va' vb' != 0#w.bits else va' % vb' != 0#w.bits
-          if exact && inexact then .inr (bindReg st dst .poison)
-          else .inr (bindReg st dst (.bits w res))
-      else .inl (.ub "operand width mismatch")
+              let res :=
+                if signed then
+                  if isRem then bvSRem w va' vb' else bvSDiv w va' vb'
+                else
+                  if isRem then va' % vb' else va' / vb'
+              let inexact :=
+                if isRem then false
+                else if signed then bvSRem w va' vb' != 0#w.bits else va' % vb' != 0#w.bits
+              if exact && inexact then .inr (bindReg st dst .poison)
+              else .inr (bindReg st dst (.bits w res))
+          else .inl (.ub "operand width mismatch")
+        | _ => .inl (.ub "non-integer operand")
     else .inl (.ub "operand width mismatch")
-  | _, _ => .inl (.ub "non-integer operand")
+  | _ => .inl (.ub "non-integer operand")
 
 def shiftResult (dst : RegName) (st : ExecState) (w : IntWidth) (flags : OverflowFlags)
     (exact : Bool) (a b : LLVMVal) (kind : String) : ExecOutcome ⊕ ExecState :=
@@ -740,9 +930,13 @@ def floatResult (dst : RegName) (st : ExecState) (fw : FloatWidth) (a b : LLVMVa
     else .inl (.ub "float width mismatch")
   | _, _ => .inl (.ub "float on non-float")
 
+def effectiveAlign (ty : LLVMType) (align : Nat) : Nat :=
+  if align == 0 then ty.abiAlign else align
+
 def accessCheck (m : ByteMem) (addr : BitVec 64) (n align : Nat) (needWrite : Bool) : Option String :=
   if addr == 0#64 then some "null pointer"
-  else if align != 0 && !isAligned addr align then some "misaligned access"
+  else if !isPow2 align then some "invalid alignment"
+  else if !isAligned addr align then some "misaligned access"
   else if !m.accessInAlloc addr.toNat n needWrite then some "out of bounds access"
   else none
 
@@ -784,32 +978,41 @@ def intrinsicResult (callee : GlobalSym) (args : List LLVMVal) : Option LLVMVal 
     if a == 0#256 && z == 1#1 then some .poison else some (.bits .i256 (ctlzBits .i256 a))
   | _, _ => none
 
-def stepInstrWith (runCall : ExecState → Option RegName → LLVMType → GlobalSym → List LLVMVal → ExecOutcome ⊕ ExecState)
+def stepInstrWith
+    (runCall : ExecState → Option RegName → CallingConv → LLVMType → GlobalSym → List LLVMVal →
+      ExecOutcome ⊕ ExecState)
     (st : ExecState) : LLVMInstr → ExecOutcome ⊕ ExecState
   | .alloca dst ty align =>
-    match st.mem.allocAligned ty.byteSize (if isPow2 align then align else 1) with
-    | none => .inl (.ub "alloca out of address space")
-    | some (ptr, mem') => .inr (bindReg { st with mem := mem' } dst (.ptr ptr))
-  | .load dst _volatile ty ptrOp align =>
+    let effAlign := effectiveAlign ty align
+    if !isPow2 effAlign then .inl (.ub "invalid alignment")
+    else
+      match st.mem.allocAligned ty.byteSize effAlign with
+      | none => .inl (.ub "alloca out of address space")
+      | some (ptr, mem') => .inr (bindReg { st with mem := mem' } dst (.ptr ptr))
+  | .load dst _volatile ty ptrOp align _as =>
+    let effAlign := effectiveAlign ty align
     match evalOperand st ptrOp with
     | .poison => .inl (.ub "load from poison pointer")
     | .ptr addr =>
-      match accessCheck st.mem addr ty.byteSize align false with
+      match accessCheck st.mem addr ty.byteSize effAlign false with
       | some "null pointer" => .inl (.ub "load from null pointer")
+      | some "invalid alignment" => .inl (.ub "invalid alignment")
       | some "misaligned access" => .inl (.ub "misaligned load")
       | some _ => .inl (.ub "load out of bounds")
       | none => .inr (bindReg st dst (loadVal st.mem addr ty))
     | _ => .inl (.ub "load from non-pointer")
-  | .store _volatile ty valOp ptrOp align =>
+  | .store _volatile ty valOp ptrOp align _as =>
+    let effAlign := effectiveAlign ty align
     let val := evalTypedOperand st ty valOp
     match evalOperand st ptrOp with
     | .poison => .inl (.ub "store to poison pointer")
     | .ptr addr =>
-      match accessCheck st.mem addr ty.byteSize align true with
+      match accessCheck st.mem addr ty.byteSize effAlign true with
       | some "null pointer" => .inl (.ub "store to null pointer")
+      | some "invalid alignment" => .inl (.ub "invalid alignment")
       | some "misaligned access" => .inl (.ub "misaligned store")
       | some _ => .inl (.ub "store out of bounds")
-      | none => .inr { st with mem := storeVal st.mem addr val }
+      | none => .inr { st with mem := storeTypedVal st.mem addr ty val }
     | _ => .inl (.ub "store to non-pointer")
   | .add dst flags w aOp bOp =>
     binResult dst st w flags (evalOperand st aOp) (evalOperand st bOp) "add"
@@ -922,7 +1125,7 @@ def stepInstrWith (runCall : ExecState → Option RegName → LLVMType → Globa
     | .poison => .inr (bindReg st dst .poison)
     | .ptr p => .inr (bindReg st dst (.bits dstW (p.truncate dstW.bits)))
     | _ => .inl (.ub "ptrtoint on non-pointer")
-  | .getelementptr dst inbounds_ ty baseOp idxs =>
+  | .getelementptr dst inbounds_ ty baseOp idxs _as =>
     match evalOperand st baseOp with
     | .poison => .inr (bindReg st dst .poison)
     | .ptr base => gepResult st dst inbounds_ ty base idxs
@@ -934,17 +1137,19 @@ def stepInstrWith (runCall : ExecState → Option RegName → LLVMType → Globa
       if c == 1#1 then .inr (bindReg st dst (evalTypedOperand st ty tOp))
       else .inr (bindReg st dst (evalTypedOperand st ty eOp))
     | _ => .inl (.ub "select condition is not i1")
-  | .call dst? retTy callee args =>
+  | .call dst? retTy callee args cc =>
     let argVals := args.map fun pair => evalTypedOperand st pair.fst pair.snd
-    runCall st dst? retTy callee argVals
-  | .atomicrmw dst op ptrOp ty valOp _ord align =>
+    runCall st dst? cc retTy callee argVals
+  | .atomicrmw dst op ptrOp ty valOp _ord align _as =>
     match ty with
     | .int w =>
+      let effAlign := if align == 0 then w.byteSize else align
       match evalOperand st ptrOp with
       | .poison => .inl (.ub "atomicrmw on poison pointer")
       | .ptr addr =>
-        match accessCheck st.mem addr w.byteSize align true with
+        match accessCheck st.mem addr w.byteSize effAlign true with
         | some "null pointer" => .inl (.ub "atomicrmw on null pointer")
+        | some "invalid alignment" => .inl (.ub "invalid alignment")
         | some "misaligned access" => .inl (.ub "misaligned atomicrmw")
         | some _ => .inl (.ub "atomicrmw out of bounds")
         | none =>
@@ -967,7 +1172,7 @@ def stepInstrWith (runCall : ExecState → Option RegName → LLVMType → Globa
     | .bits w iv =>
       if h : w = idxW then
         let i := (h ▸ iv).toNat
-        if n ≤ i then .inl (.ub "insertelement index out of range")
+        if n ≤ i then .inr (bindReg st dst .poison)
         else
           let vval := evalTypedOperand st (.vec n et) vecOp
           if isPoison vval then .inr (bindReg st dst .poison)
@@ -983,7 +1188,7 @@ def stepInstrWith (runCall : ExecState → Option RegName → LLVMType → Globa
     | .bits w iv =>
       if h : w = idxW then
         let i := (h ▸ iv).toNat
-        if n ≤ i then .inl (.ub "extractelement index out of range")
+        if n ≤ i then .inr (bindReg st dst .poison)
         else
           let vval := evalTypedOperand st (.vec n et) vecOp
           if isPoison vval then .inr (bindReg st dst .poison)
@@ -1037,7 +1242,9 @@ where
           | none => none
           | some inner => some (LLVMVal.agg (vs.set i inner))
 
-def execInstrsWith (runCall : ExecState → Option RegName → LLVMType → GlobalSym → List LLVMVal → ExecOutcome ⊕ ExecState)
+def execInstrsWith
+    (runCall : ExecState → Option RegName → CallingConv → LLVMType → GlobalSym → List LLVMVal →
+      ExecOutcome ⊕ ExecState)
     (st : ExecState) : List LLVMInstr → ExecOutcome ⊕ ExecState
   | [] => .inr st
   | ins :: rest =>
@@ -1051,7 +1258,9 @@ inductive CalleeRes where
   | outOfFuel : CalleeRes
   deriving Repr, DecidableEq
 
-def execBlockWith (runCall : ExecState → Option RegName → LLVMType → GlobalSym → List LLVMVal → ExecOutcome ⊕ ExecState)
+def execBlockWith
+    (runCall : ExecState → Option RegName → CallingConv → LLVMType → GlobalSym → List LLVMVal →
+      ExecOutcome ⊕ ExecState)
     (fn : LLVMFn) : Nat → ExecState → LLVMBlock → CalleeRes
   | 0, _, _ => .outOfFuel
   | k + 1, st, blk =>
@@ -1093,7 +1302,7 @@ def execBlockWith (runCall : ExecState → Option RegName → LLVMType → Globa
       | .unreachable => .ub "unreachable"
 
 def runCallWith (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
-    (dst? : Option RegName) (retTy : LLVMType) (callee : GlobalSym) (argVals : List LLVMVal) :
+    (dst? : Option RegName) (callCc : CallingConv) (retTy : LLVMType) (callee : GlobalSym) (argVals : List LLVMVal) :
     ExecOutcome ⊕ ExecState :=
   match fuel with
   | 0 =>
@@ -1116,24 +1325,26 @@ def runCallWith (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
       | none =>
         match mod_.fns.find? (fun f => f.name == callee) with
         | some fn =>
-          match fn.blocks with
-          | [] => .inl (.ub "callee has no entry block")
-          | entry :: _ =>
-            match bindArgs { mem := st.mem } fn.params argVals with
-            | none => .inl (.ub "callee arity mismatch")
-            | some calleeSt =>
-              match execBlockWith (runCallWith mod_ k) fn (k + 1) calleeSt entry with
-              | .returned rv mem' =>
-                let st' := { st with mem := mem' }
-                match dst? with
-                | none => .inr st'
-                | some dst =>
-                  match rv with
-                  | some v => .inr (bindReg st' dst v)
-                  | none =>
-                    if retTy == .void then .inr st' else .inr (bindReg st' dst .poison)
-              | .ub msg => .inl (.ub msg)
-              | .outOfFuel => .inl .outOfFuel
+          if fn.cc != callCc then .inl (.ub "calling convention mismatch")
+          else
+            match fn.blocks with
+            | [] => .inl (.ub "callee has no entry block")
+            | entry :: _ =>
+              match bindArgs { mem := st.mem, globals := st.globals } fn.params argVals with
+              | none => .inl (.ub "callee arity mismatch")
+              | some calleeSt =>
+                match execBlockWith (runCallWith mod_ k) fn (k + 1) calleeSt entry with
+                | .returned rv mem' =>
+                  let st' := { st with mem := mem' }
+                  match dst? with
+                  | none => .inr st'
+                  | some dst =>
+                    match rv with
+                    | some v => .inr (bindReg st' dst v)
+                    | none =>
+                      if retTy == .void then .inr st' else .inr (bindReg st' dst .poison)
+                | .ub msg => .inl (.ub msg)
+                | .outOfFuel => .inl .outOfFuel
         | none =>
           match extOracle callee argVals st.mem with
           | some er =>
@@ -1160,13 +1371,35 @@ def execInstrs (mod_ : LLVMModule) (fuel : Nat) (st : ExecState) (is : List LLVM
 def execBlock (mod_ : LLVMModule) (fn : LLVMFn) (fuel : Nat) (st : ExecState) (blk : LLVMBlock) : ExecOutcome :=
   calleeResToOutcome (execBlockWith (runCallWith mod_ fuel) fn fuel st blk)
 
+def initGlobalsAux : List LLVMGlobal → ByteMem → List (GlobalSym × BitVec 64) → Option (ByteMem × List (GlobalSym × BitVec 64))
+  | [], m, acc => some (m, acc.reverse)
+  | g :: gs, m, acc =>
+    if g.linkage == .external && g.init.isNone then
+      initGlobalsAux gs m acc
+    else
+      let gAlign := Nat.max g.ty.abiAlign (if isPow2 g.align then g.align else 1)
+      match m.allocAligned g.ty.byteSize gAlign (!g.isConstant) with
+      | none => none
+      | some (ptr, m') =>
+        let initVal := match g.init with
+          | some op => evalTypedOperand { globals := acc.reverse, mem := m' } g.ty op
+          | none => LLVMVal.zeroOf g.ty
+        let m'' := storeTypedVal m' ptr g.ty initVal
+        initGlobalsAux gs m'' ((g.name, ptr) :: acc)
+
+def initGlobals (mod_ : LLVMModule) : Option (ByteMem × List (GlobalSym × BitVec 64)) :=
+  initGlobalsAux mod_.globals {} []
+
 def execFn (mod_ : LLVMModule) (fn : LLVMFn) (args : List LLVMVal) (fuel : Nat) : ExecOutcome :=
-  match fn.blocks with
-  | [] => .ub "function has no entry block"
-  | entry :: _ =>
-    match bindArgs {} fn.params args with
-    | none => .ub "argument arity mismatch"
-    | some st => execBlock mod_ fn fuel st entry
+  match initGlobals mod_ with
+  | none => .ub "global allocation failed"
+  | some (mem0, globals) =>
+    match fn.blocks with
+    | [] => .ub "function has no entry block"
+    | entry :: _ =>
+      match bindArgs { mem := mem0, globals := globals } fn.params args with
+      | none => .ub "argument arity mismatch"
+      | some st => execBlock mod_ fn fuel st entry
 
 namespace PP
 
@@ -1255,8 +1488,10 @@ def typeChars : LLVMType → List Char
   | .ptr as_ =>
     if as_ == 0 then ['p', 't', 'r']
     else ['p', 't', 'r', ' ', 'a', 'd', 'd', 'r', 's', 'p', 'a', 'c', 'e', '('] ++ TargetIR.natDigits as_ ++ [')']
-  | .structFields .nil => ['{', ' ', '}']
-  | .structFields (.cons h t) => ['{', ' '] ++ typeChars h ++ fieldsTailChars t ++ [' ', '}']
+  | .structFields false .nil => ['{', ' ', '}']
+  | .structFields true .nil => ['<', '{', ' ', '}', '>']
+  | .structFields false (.cons h t) => ['{', ' '] ++ typeChars h ++ fieldsTailChars t ++ [' ', '}']
+  | .structFields true (.cons h t) => ['<', '{', ' '] ++ typeChars h ++ fieldsTailChars t ++ [' ', '}', '>']
   | .array n et => ['['] ++ TargetIR.natDigits n ++ [' ', 'x', ' '] ++ typeChars et ++ [']']
   | .vec n et => ['<'] ++ TargetIR.natDigits n ++ [' ', 'x', ' '] ++ typeChars et ++ ['>']
 
@@ -1287,12 +1522,20 @@ def parseType : Nat → List Char → Option (LLVMType × List Char)
     | (as_, ')' :: rest) => some (.ptr as_, rest)
     | _ => none
   | _ + 1, 'p' :: 't' :: 'r' :: rest => some (.ptr 0, rest)
-  | _ + 1, '{' :: ' ' :: '}' :: rest => some (.structFields .nil, rest)
+  | _ + 1, '{' :: ' ' :: '}' :: rest => some (.structFields false .nil, rest)
+  | _ + 1, '<' :: '{' :: ' ' :: '}' :: '>' :: rest => some (.structFields true .nil, rest)
   | fuel + 1, '{' :: ' ' :: cs =>
     match parseType fuel cs with
     | some (h, rest1) =>
       match parseFieldsTail fuel rest1 with
-      | some (t, ' ' :: '}' :: rest2) => some (.structFields (.cons h t), rest2)
+      | some (t, ' ' :: '}' :: rest2) => some (.structFields false (.cons h t), rest2)
+      | _ => none
+    | none => none
+  | fuel + 1, '<' :: '{' :: ' ' :: cs =>
+    match parseType fuel cs with
+    | some (h, rest1) =>
+      match parseFieldsTail fuel rest1 with
+      | some (t, ' ' :: '}' :: '>' :: rest2) => some (.structFields true (.cons h t), rest2)
       | _ => none
     | none => none
   | fuel + 1, '[' :: cs =>
@@ -1326,7 +1569,7 @@ end
 mutual
 def typeDepth : LLVMType → Nat
   | .void | .int _ | .float _ | .ptr _ => 1
-  | .structFields fs => 1 + fieldsDepth fs
+  | .structFields _ fs => 1 + fieldsDepth fs
   | .array _ et => 1 + typeDepth et
   | .vec _ et => 1 + typeDepth et
 
@@ -1347,6 +1590,7 @@ inductive ValidTailSuffix : List Char → Prop where
 
 def ppVal : Operand → String
   | .reg r => "%" ++ r
+  | .global g => "@" ++ g
   | .constInt _ v => ppInt v.toNat
   | .constFloat fw v => ppFloatHex fw v
   | .constNull => "null"
@@ -1356,50 +1600,70 @@ def ppVal : Operand → String
   | .aggCons h t => ppVal h ++ ", " ++ ppVal t
   | .poison => "poison"
 
-mutual
-def ppAggElems : LLVMTypeFields → Operand → List String
-  | .cons hty tty, .aggCons hop top => ppTypedOperand hty hop :: ppAggElems tty top
-  | _, _ => []
+def nthAggOperand : Operand → Nat → Operand
+  | .aggCons h _, 0 => h
+  | .aggCons _ t, k + 1 => nthAggOperand t k
+  | _, _ => .poison
 
-def ppHomogElems : Nat → LLVMType → Operand → List String
-  | k + 1, et, .aggCons hop top => ppTypedOperand et hop :: ppHomogElems k et top
-  | _, _, _ => []
+def structFieldTypesList : LLVMTypeFields → List LLVMType
+  | .nil => []
+  | .cons h t => h :: structFieldTypesList t
 
-def ppBareVal (ty : LLVMType) (op : Operand) : String :=
-  match op with
-  | .aggNil | .constZero =>
+def ppBareValAux : Nat → LLVMType → Operand → String
+  | 0, _, op => ppVal op
+  | _ + 1, ty, .aggNil =>
     match ty with
     | .int _ => "0"
     | .float fw => ppFloatHex fw (BitVec.ofNat fw.bits 0)
     | .ptr _ => "null"
     | _ => "zeroinitializer"
-  | .aggCons _ _ =>
+  | _ + 1, ty, .constZero =>
     match ty with
-    | .vec n et => "<" ++ String.intercalate ", " (ppHomogElems n et op) ++ ">"
-    | .array n et => "[" ++ String.intercalate ", " (ppHomogElems n et op) ++ "]"
-    | .structFields fs => "{ " ++ String.intercalate ", " (ppAggElems fs op) ++ " }"
+    | .int _ => "0"
+    | .float fw => ppFloatHex fw (BitVec.ofNat fw.bits 0)
+    | .ptr _ => "null"
+    | _ => "zeroinitializer"
+  | fuel + 1, ty, op@(.aggCons _ _) =>
+    match ty with
+    | .vec n et =>
+      "<" ++ String.intercalate ", " (repeatMapIdx n fun i =>
+        ppType et ++ " " ++ ppBareValAux fuel et (nthAggOperand op i)) ++ ">"
+    | .array n et =>
+      "[" ++ String.intercalate ", " (repeatMapIdx n fun i =>
+        ppType et ++ " " ++ ppBareValAux fuel et (nthAggOperand op i)) ++ "]"
+    | .structFields packed fs =>
+      let ftys := structFieldTypesList fs
+      let inner := String.intercalate ", " (repeatMapIdx ftys.length fun i =>
+        let fty := ftys.getD i .void
+        ppType fty ++ " " ++ ppBareValAux fuel fty (nthAggOperand op i))
+      if packed then "<{ " ++ inner ++ " }>" else "{ " ++ inner ++ " }"
     | _ => ppVal op
-  | _ => ppVal op
+  | _ + 1, _, op => ppVal op
+
+def ppBareVal (ty : LLVMType) (op : Operand) : String :=
+  ppBareValAux (ty.sizeOfType + 1) ty op
 
 def ppTypedOperand (ty : LLVMType) (op : Operand) : String :=
   ppType ty ++ " " ++ ppBareVal ty op
-end
 
 def ppAlign (align : Nat) : String :=
-  if align == 0 then "" else ", align " ++ ppInt align
+  if align != 0 && isPow2 align then ", align " ++ ppInt align else ""
 
-def ppGEP (inbounds_ : Bool) (ty : LLVMType) (base : Operand) (idxs : List (IntWidth × Operand)) : String :=
+def ppPtr (as_ : AddrSpace) : String :=
+  ppType (.ptr as_)
+
+def ppGEP (inbounds_ : Bool) (ty : LLVMType) (base : Operand) (idxs : List (IntWidth × Operand)) (as_ : AddrSpace) : String :=
   let ib := if inbounds_ then " inbounds" else ""
   let idxStr := String.join (idxs.map fun (w, op) => ", " ++ w.pp ++ " " ++ ppVal op)
-  "getelementptr" ++ ib ++ " " ++ ppType ty ++ ", ptr " ++ ppVal base ++ idxStr
+  "getelementptr" ++ ib ++ " " ++ ppType ty ++ ", " ++ ppPtr as_ ++ " " ++ ppVal base ++ idxStr
 
 def ppInstr : LLVMInstr → String
   | .alloca dst ty align =>
     "%" ++ dst ++ " = alloca " ++ ppType ty ++ ppAlign align
-  | .load dst volatile ty ptrOp align =>
-    "%" ++ dst ++ " = load" ++ ppVolatile volatile ++ " " ++ ppType ty ++ ", ptr " ++ ppVal ptrOp ++ ppAlign align
-  | .store volatile ty valOp ptrOp align =>
-    "store" ++ ppVolatile volatile ++ " " ++ ppTypedOperand ty valOp ++ ", ptr " ++ ppVal ptrOp ++ ppAlign align
+  | .load dst volatile ty ptrOp align as_ =>
+    "%" ++ dst ++ " = load" ++ ppVolatile volatile ++ " " ++ ppType ty ++ ", " ++ ppPtr as_ ++ " " ++ ppVal ptrOp ++ ppAlign align
+  | .store volatile ty valOp ptrOp align as_ =>
+    "store" ++ ppVolatile volatile ++ " " ++ ppTypedOperand ty valOp ++ ", " ++ ppPtr as_ ++ " " ++ ppVal ptrOp ++ ppAlign align
   | .add dst flags w aOp bOp =>
     "%" ++ dst ++ " = add" ++ ppFlags flags ++ " " ++ w.pp ++ " " ++ ppVal aOp ++ ", " ++ ppVal bOp
   | .sub dst flags w aOp bOp =>
@@ -1450,16 +1714,17 @@ def ppInstr : LLVMInstr → String
     "%" ++ dst ++ " = inttoptr " ++ srcW.pp ++ " " ++ ppVal op ++ " to " ++ ppType (.ptr as_)
   | .ptrtoint dst as_ op dstW =>
     "%" ++ dst ++ " = ptrtoint " ++ ppType (.ptr as_) ++ " " ++ ppVal op ++ " to " ++ dstW.pp
-  | .getelementptr dst inbounds_ ty baseOp idxs =>
-    "%" ++ dst ++ " = " ++ ppGEP inbounds_ ty baseOp idxs
+  | .getelementptr dst inbounds_ ty baseOp idxs as_ =>
+    "%" ++ dst ++ " = " ++ ppGEP inbounds_ ty baseOp idxs as_
   | .select dst condOp ty tOp eOp =>
     "%" ++ dst ++ " = select i1 " ++ ppVal condOp ++ ", " ++ ppTypedOperand ty tOp ++ ", " ++ ppTypedOperand ty eOp
-  | .call dst? retTy callee args =>
+  | .call dst? retTy callee args cc =>
     let lhs := match dst? with | none => "" | some dst => "%" ++ dst ++ " = "
     let argStr := String.intercalate ", " (args.map fun (ty, op) => ppTypedOperand ty op)
-    lhs ++ "call " ++ ppType retTy ++ " @" ++ callee ++ "(" ++ argStr ++ ")"
-  | .atomicrmw dst op ptrOp ty valOp ord align =>
-    "%" ++ dst ++ " = atomicrmw " ++ ppRMW op ++ " ptr " ++ ppVal ptrOp ++ ", " ++ ppTypedOperand ty valOp ++
+    let ccStr := if cc == .ccc then "" else ppCC cc ++ " "
+    lhs ++ "call " ++ ccStr ++ ppType retTy ++ " @" ++ callee ++ "(" ++ argStr ++ ")"
+  | .atomicrmw dst op ptrOp ty valOp ord align as_ =>
+    "%" ++ dst ++ " = atomicrmw " ++ ppRMW op ++ " " ++ ppPtr as_ ++ " " ++ ppVal ptrOp ++ ", " ++ ppTypedOperand ty valOp ++
       " " ++ ppOrdering ord ++ ppAlign align
   | .insertelement dst n et vecOp elemOp idxW idxOp =>
     "%" ++ dst ++ " = insertelement " ++ ppTypedOperand (.vec n et) vecOp ++ ", " ++
@@ -1561,10 +1826,8 @@ theorem typeChars_head_not_brace (ty : LLVMType) (rest : List Char) :
       exact ⟨'p', _, by decide, rfl⟩
     · simp only [PP.typeChars, ha, Bool.false_eq_true, ↓reduceIte, List.cons_append, List.append_assoc]
       exact ⟨'p', _, by decide, rfl⟩
-  | structFields fs =>
-    cases fs with
-    | nil => exact ⟨'{', _, by decide, rfl⟩
-    | cons _ _ => exact ⟨'{', _, by decide, rfl⟩
+  | structFields packed fs =>
+    cases packed <;> cases fs <;> exact ⟨_, _, by decide, rfl⟩
   | array _ _ => exact ⟨'[', _, by decide, rfl⟩
   | vec _ _ => exact ⟨'<', _, by decide, rfl⟩
 
@@ -1572,8 +1835,58 @@ theorem parseType_struct_open (fuel : Nat) (c : Char) (cs : List Char) (hc : c �
     (h : LLVMType) (rest1 : List Char) (t : LLVMTypeFields) (rest2 : List Char)
     (hp1 : PP.parseType fuel (c :: cs) = some (h, rest1))
     (hp2 : PP.parseFieldsTail fuel rest1 = some (t, ' ' :: '}' :: rest2)) :
-    PP.parseType (fuel + 1) ('{' :: ' ' :: c :: cs) = some (.structFields (.cons h t), rest2) := by
+    PP.parseType (fuel + 1) ('{' :: ' ' :: c :: cs) = some (.structFields false (.cons h t), rest2) := by
   simp [PP.parseType, hc, hp1, hp2]
+
+theorem parseType_packed_struct_open (fuel : Nat) (c : Char) (cs : List Char) (hc : c ≠ '}')
+    (h : LLVMType) (rest1 : List Char) (t : LLVMTypeFields) (rest2 : List Char)
+    (hp1 : PP.parseType fuel (c :: cs) = some (h, rest1))
+    (hp2 : PP.parseFieldsTail fuel rest1 = some (t, ' ' :: '}' :: '>' :: rest2)) :
+    PP.parseType (fuel + 1) ('<' :: '{' :: ' ' :: c :: cs) = some (.structFields true (.cons h t), rest2) := by
+  simp [PP.parseType, hc, hp1, hp2]
+
+theorem natDigits_head_not_brace (n : Nat) (rest : List Char) :
+    ∃ c cs, c ≠ '{' ∧ TargetIR.natDigits n ++ rest = c :: cs := by
+  unfold TargetIR.natDigits
+  have haux : ∀ fuel m acc, 0 < fuel → ∃ c cs, (c = TargetIR.digitChar (m % 10) ∨ ∃ k < 10, c = TargetIR.digitChar k) ∧
+      TargetIR.natDigitsAux fuel m acc ++ rest = c :: cs := by
+    intro fuel
+    induction fuel with
+    | zero => intro _ _ h; omega
+    | succ f ih =>
+      intro m acc _
+      simp only [TargetIR.natDigitsAux]
+      by_cases hlt : m < 10
+      · simp only [hlt, ↓reduceIte, List.cons_append]
+        exact ⟨TargetIR.digitChar (m % 10), acc ++ rest, Or.inl rfl, rfl⟩
+      · simp only [hlt, ↓reduceIte]
+        cases f with
+        | zero =>
+          simp only [TargetIR.natDigitsAux, List.cons_append]
+          exact ⟨TargetIR.digitChar (m % 10), acc ++ rest, Or.inl rfl, rfl⟩
+        | succ f' =>
+          rcases ih (m / 10) (TargetIR.digitChar (m % 10) :: acc) (by omega) with ⟨c, cs, hd, heq⟩
+          refine ⟨c, cs, ?_, heq⟩
+          rcases hd with rfl | ⟨k, hk, rfl⟩
+          · exact Or.inr ⟨(m / 10) % 10, Nat.mod_lt _ (by decide), rfl⟩
+          · exact Or.inr ⟨k, hk, rfl⟩
+  rcases haux (n + 1) n [] (by omega) with ⟨c, cs, hd, heq⟩
+  refine ⟨c, cs, ?_, heq⟩
+  have hne : ∀ k < 10, TargetIR.digitChar k ≠ '{' := by
+    intro k hk
+    match k with
+    | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 => decide
+    | m + 10 => omega
+  rcases hd with rfl | ⟨k, hk, rfl⟩
+  · exact hne (n % 10) (Nat.mod_lt n (by decide))
+  · exact hne k hk
+
+theorem parseType_vec_open (fuel : Nat) (c : Char) (cs : List Char) (hc : c ≠ '{')
+    (n : Nat) (rest1 : List Char) (et : LLVMType) (rest2 : List Char)
+    (hrd : TargetIR.readDigits 0 (c :: cs) = (n, ' ' :: 'x' :: ' ' :: rest1))
+    (hp : PP.parseType fuel rest1 = some (et, '>' :: rest2)) :
+    PP.parseType (fuel + 1) ('<' :: c :: cs) = some (.vec n et, rest2) := by
+  simp [PP.parseType, hc, hrd, hp]
 
 mutual
 theorem parseType_roundtrip (fuel : Nat) (ty : LLVMType) (rest : List Char)
@@ -1589,28 +1902,52 @@ theorem parseType_roundtrip (fuel : Nat) (ty : LLVMType) (rest : List Char)
     | int w => exact parseType_int f w rest hsuf
     | float fw => cases fw <;> rfl
     | ptr as_ => exact parseType_ptr f as_ rest hsuf
-    | structFields fs =>
-      cases fs with
-      | nil => rfl
-      | cons h t =>
-        simp only [PP.typeDepth, PP.fieldsDepth] at hf
-        have hmax : Nat.max (PP.typeDepth h) (PP.fieldsDepth t) ≤ f := by omega
-        have hh_le : PP.typeDepth h ≤ f := Nat.le_trans (Nat.le_max_left _ _) hmax
-        have ht_le : PP.fieldsDepth t ≤ f := Nat.le_trans (Nat.le_max_right _ _) hmax
-        have htsuf : PP.ValidTypeSuffix (PP.fieldsTailChars t ++ (' ' :: '}' :: rest)) := by
-          cases t with
-          | nil => exact .closeBrace rest
-          | cons _ _ => exact .comma _
-        simp only [PP.typeChars, List.cons_append, List.nil_append, List.append_assoc]
-        rcases typeChars_head_not_brace h (PP.fieldsTailChars t ++ ' ' :: '}' :: rest) with ⟨c, cs, hc, heq⟩
-        have hp1 : PP.parseType f (c :: cs) = some (h, PP.fieldsTailChars t ++ ' ' :: '}' :: rest) := by
-          rw [← heq]
-          exact parseType_roundtrip f h (PP.fieldsTailChars t ++ ' ' :: '}' :: rest) hh_le htsuf
-        have hp2 : PP.parseFieldsTail f (PP.fieldsTailChars t ++ ' ' :: '}' :: rest) =
-            some (t, ' ' :: '}' :: rest) :=
-          parseFieldsTail_roundtrip f t (' ' :: '}' :: rest) ht_le (.closeBrace rest)
-        rw [heq]
-        exact parseType_struct_open f c cs hc h _ t rest hp1 hp2
+    | structFields packed fs =>
+      cases packed with
+      | false =>
+        cases fs with
+        | nil => rfl
+        | cons h t =>
+          simp only [PP.typeDepth, PP.fieldsDepth] at hf
+          have hmax : Nat.max (PP.typeDepth h) (PP.fieldsDepth t) ≤ f := by omega
+          have hh_le : PP.typeDepth h ≤ f := Nat.le_trans (Nat.le_max_left _ _) hmax
+          have ht_le : PP.fieldsDepth t ≤ f := Nat.le_trans (Nat.le_max_right _ _) hmax
+          have htsuf : PP.ValidTypeSuffix (PP.fieldsTailChars t ++ (' ' :: '}' :: rest)) := by
+            cases t with
+            | nil => exact .closeBrace rest
+            | cons _ _ => exact .comma _
+          simp only [PP.typeChars, List.cons_append, List.nil_append, List.append_assoc]
+          rcases typeChars_head_not_brace h (PP.fieldsTailChars t ++ ' ' :: '}' :: rest) with ⟨c, cs, hc, heq⟩
+          have hp1 : PP.parseType f (c :: cs) = some (h, PP.fieldsTailChars t ++ ' ' :: '}' :: rest) := by
+            rw [← heq]
+            exact parseType_roundtrip f h (PP.fieldsTailChars t ++ ' ' :: '}' :: rest) hh_le htsuf
+          have hp2 : PP.parseFieldsTail f (PP.fieldsTailChars t ++ ' ' :: '}' :: rest) =
+              some (t, ' ' :: '}' :: rest) :=
+            parseFieldsTail_roundtrip f t (' ' :: '}' :: rest) ht_le (.closeBrace rest)
+          rw [heq]
+          exact parseType_struct_open f c cs hc h _ t rest hp1 hp2
+      | true =>
+        cases fs with
+        | nil => rfl
+        | cons h t =>
+          simp only [PP.typeDepth, PP.fieldsDepth] at hf
+          have hmax : Nat.max (PP.typeDepth h) (PP.fieldsDepth t) ≤ f := by omega
+          have hh_le : PP.typeDepth h ≤ f := Nat.le_trans (Nat.le_max_left _ _) hmax
+          have ht_le : PP.fieldsDepth t ≤ f := Nat.le_trans (Nat.le_max_right _ _) hmax
+          have htsuf : PP.ValidTypeSuffix (PP.fieldsTailChars t ++ (' ' :: '}' :: '>' :: rest)) := by
+            cases t with
+            | nil => exact .closeBrace ('>' :: rest)
+            | cons _ _ => exact .comma _
+          simp only [PP.typeChars, List.cons_append, List.nil_append, List.append_assoc]
+          rcases typeChars_head_not_brace h (PP.fieldsTailChars t ++ ' ' :: '}' :: '>' :: rest) with ⟨c, cs, hc, heq⟩
+          have hp1 : PP.parseType f (c :: cs) = some (h, PP.fieldsTailChars t ++ ' ' :: '}' :: '>' :: rest) := by
+            rw [← heq]
+            exact parseType_roundtrip f h (PP.fieldsTailChars t ++ ' ' :: '}' :: '>' :: rest) hh_le htsuf
+          have hp2 : PP.parseFieldsTail f (PP.fieldsTailChars t ++ ' ' :: '}' :: '>' :: rest) =
+              some (t, ' ' :: '}' :: '>' :: rest) :=
+            parseFieldsTail_roundtrip f t (' ' :: '}' :: '>' :: rest) ht_le (.closeBrace ('>' :: rest))
+          rw [heq]
+          exact parseType_packed_struct_open f c cs hc h _ t rest hp1 hp2
     | array n et =>
       simp only [PP.typeDepth] at hf
       simp only [PP.typeChars, List.cons_append, List.append_assoc, List.nil_append, PP.parseType]
@@ -1620,11 +1957,15 @@ theorem parseType_roundtrip (fuel : Nat) (ty : LLVMType) (rest : List Char)
       rfl
     | vec n et =>
       simp only [PP.typeDepth] at hf
-      simp only [PP.typeChars, List.cons_append, List.append_assoc, List.nil_append, PP.parseType]
-      rw [readDigits_natDigits_delim n ' ' ('x' :: ' ' :: (PP.typeChars et ++ '>' :: rest)) rfl]
-      simp only
-      rw [parseType_roundtrip f et ('>' :: rest) (by omega) (.closeAngle rest)]
-      rfl
+      simp only [PP.typeChars, List.cons_append, List.append_assoc, List.nil_append]
+      rcases natDigits_head_not_brace n (' ' :: 'x' :: ' ' :: (PP.typeChars et ++ '>' :: rest)) with ⟨c, cs, hc, heq⟩
+      have hrd : TargetIR.readDigits 0 (c :: cs) = (n, ' ' :: 'x' :: ' ' :: (PP.typeChars et ++ '>' :: rest)) := by
+        rw [← heq]
+        exact readDigits_natDigits_delim n ' ' ('x' :: ' ' :: (PP.typeChars et ++ '>' :: rest)) rfl
+      have hp : PP.parseType f (PP.typeChars et ++ '>' :: rest) = some (et, '>' :: rest) :=
+        parseType_roundtrip f et ('>' :: rest) (by omega) (.closeAngle rest)
+      rw [heq]
+      exact parseType_vec_open f c cs hc n _ et rest hrd hp
 
 theorem parseFieldsTail_roundtrip (fuel : Nat) (fs : LLVMTypeFields) (rest : List Char)
     (hf : PP.fieldsDepth fs ≤ fuel)
@@ -1748,11 +2089,18 @@ theorem load_after_alloca_store (st : ExecState) (w : IntWidth) (v : BitVec w.bi
       (((mem1.storeInt ptr w v).readBytesAt ptr.toNat w.byteSize).take w.byteSize) = some v := by
     rw [h_take]
     exact ByteMem.loadInt?_storeInt_same mem1 ptr w v
+  have h_anz : align ≠ 0 := by
+    intro hz
+    subst hz
+    simp [isPow2] at h_pow
+  have h_eff : effectiveAlign (.int w) align = align := by
+    simp [effectiveAlign, h_anz]
   refine ⟨mem1.storeInt ptr w v, ?_, ?_⟩
-  · simp [stepInstr, stepInstrWith, evalTypedOperand, evalOperand, lookupReg, accessCheck, storeVal, serializeVal,
-      ByteMem.storeInt, LLVMType.byteSize, h_nz, h_al, h_in1]
-  · simp [stepInstr, stepInstrWith, evalOperand, lookupReg, accessCheck, loadVal, deserializeVal,
-      LLVMType.byteSize, h_nz, h_al, h_in2, h_load]
+  · simp [stepInstr, stepInstrWith, evalTypedOperand, evalOperand, lookupReg, accessCheck, h_eff,
+      storeTypedVal, serializeTypedVal, serializeTypedValAux, LLVMType.sizeOfType, ByteMem.storeInt,
+      LLVMType.byteSize, h_pow, h_nz, h_al, h_in1]
+  · simp [stepInstr, stepInstrWith, evalOperand, lookupReg, accessCheck, h_eff, loadVal, deserializeVal,
+      deserializeValAux, LLVMType.byteSize, h_pow, h_nz, h_al, h_in2, h_load]
 
 theorem select_cond_poison (ty : LLVMType) (tOp eOp : Operand) :
     stepInstr {} 1 {} (.select "r" .poison ty tOp eOp) =
@@ -1761,16 +2109,25 @@ theorem select_cond_poison (ty : LLVMType) (tOp eOp : Operand) :
 
 theorem ppInstr_nonempty (ins : LLVMInstr) : PP.ppInstr ins ≠ "" := by
   cases ins <;> simp [PP.ppInstr, PP.ppFlags, PP.ppExact, PP.ppVolatile, PP.ppICmp, PP.ppFCmp,
-    PP.ppRMW, PP.ppOrdering, PP.ppAlign, PP.ppGEP, PP.ppTypedOperand, PP.ppVal, PP.ppType]
+    PP.ppRMW, PP.ppOrdering, PP.ppAlign, PP.ppGEP, PP.ppPtr, PP.ppCC, PP.ppTypedOperand, PP.ppType]
 
 inductive ExecFnRel (mod_ : LLVMModule) (fn : LLVMFn) (args : List LLVMVal) : Nat → ExecOutcome → Prop where
-  | noEntry (fuel : Nat) (h : fn.blocks = []) :
+  | noGlobals (fuel : Nat) (h : initGlobals mod_ = none) :
+      ExecFnRel mod_ fn args fuel (.ub "global allocation failed")
+  | noEntry (fuel : Nat) (mem0 : ByteMem) (globals : List (GlobalSym × BitVec 64))
+      (hg : initGlobals mod_ = some (mem0, globals)) (h : fn.blocks = []) :
       ExecFnRel mod_ fn args fuel (.ub "function has no entry block")
-  | badArity (fuel : Nat) (entry : LLVMBlock) (rest : List LLVMBlock)
-      (h : fn.blocks = entry :: rest) (hbind : bindArgs {} fn.params args = none) :
+  | badArity (fuel : Nat) (mem0 : ByteMem) (globals : List (GlobalSym × BitVec 64))
+      (entry : LLVMBlock) (rest : List LLVMBlock)
+      (hg : initGlobals mod_ = some (mem0, globals))
+      (h : fn.blocks = entry :: rest)
+      (hbind : bindArgs { mem := mem0, globals := globals } fn.params args = none) :
       ExecFnRel mod_ fn args fuel (.ub "argument arity mismatch")
-  | ran (fuel : Nat) (entry : LLVMBlock) (rest : List LLVMBlock) (st : ExecState) (out : ExecOutcome)
-      (h : fn.blocks = entry :: rest) (hbind : bindArgs {} fn.params args = some st)
+  | ran (fuel : Nat) (mem0 : ByteMem) (globals : List (GlobalSym × BitVec 64))
+      (entry : LLVMBlock) (rest : List LLVMBlock) (st : ExecState) (out : ExecOutcome)
+      (hg : initGlobals mod_ = some (mem0, globals))
+      (h : fn.blocks = entry :: rest)
+      (hbind : bindArgs { mem := mem0, globals := globals } fn.params args = some st)
       (hrun : execBlock mod_ fn fuel st entry = out) :
       ExecFnRel mod_ fn args fuel out
 
@@ -1782,21 +2139,30 @@ theorem execFnRel_iff (mod_ : LLVMModule) (fn : LLVMFn) (args : List LLVMVal) (f
     all_goals simp_all [execFn]
   · intro h
     unfold execFn at h
-    cases hblocks : fn.blocks with
-    | nil =>
-      simp [hblocks] at h
+    cases hg : initGlobals mod_ with
+    | none =>
+      simp [hg] at h
       subst h
-      exact ExecFnRel.noEntry fuel hblocks
-    | cons entry rest =>
-      simp [hblocks] at h
-      cases hbind : bindArgs {} fn.params args with
-      | none =>
-        simp [hbind] at h
-        subst h
-        exact ExecFnRel.badArity fuel entry rest hblocks hbind
-      | some st =>
-        simp [hbind] at h
-        exact ExecFnRel.ran fuel entry rest st out hblocks hbind h
+      exact ExecFnRel.noGlobals fuel hg
+    | some pair =>
+      cases pair with
+      | mk mem0 globals =>
+        simp [hg] at h
+        cases hblocks : fn.blocks with
+        | nil =>
+          simp [hblocks] at h
+          subst h
+          exact ExecFnRel.noEntry fuel mem0 globals hg hblocks
+        | cons entry rest =>
+          simp [hblocks] at h
+          cases hbind : bindArgs { mem := mem0, globals := globals } fn.params args with
+          | none =>
+            simp [hbind] at h
+            subst h
+            exact ExecFnRel.badArity fuel mem0 globals entry rest hg hblocks hbind
+          | some st =>
+            simp [hbind] at h
+            exact ExecFnRel.ran fuel mem0 globals entry rest st out hg hblocks hbind h
 
 theorem execFn_deterministic (mod_ : LLVMModule) (fn : LLVMFn) (args : List LLVMVal) (fuel : Nat)
     (out1 out2 : ExecOutcome)
@@ -1808,25 +2174,25 @@ theorem execFn_deterministic (mod_ : LLVMModule) (fn : LLVMFn) (args : List LLVM
   rw [← e1, e2]
 
 theorem stepInstrWith_mono
-    (rc1 rc2 : ExecState → Option RegName → LLVMType → GlobalSym → List LLVMVal → ExecOutcome ⊕ ExecState)
+    (rc1 rc2 : ExecState → Option RegName → CallingConv → LLVMType → GlobalSym → List LLVMVal → ExecOutcome ⊕ ExecState)
     (st : ExecState) (ins : LLVMInstr)
-    (hrc : ∀ st' dst? ty callee args,
-      rc1 st' dst? ty callee args ≠ .inl .outOfFuel →
-      rc2 st' dst? ty callee args = rc1 st' dst? ty callee args)
+    (hrc : ∀ st' dst? cc ty callee args,
+      rc1 st' dst? cc ty callee args ≠ .inl .outOfFuel →
+      rc2 st' dst? cc ty callee args = rc1 st' dst? cc ty callee args)
     (hfin : stepInstrWith rc1 st ins ≠ .inl .outOfFuel) :
     stepInstrWith rc2 st ins = stepInstrWith rc1 st ins := by
   cases ins with
-  | call dst? retTy callee args =>
+  | call dst? retTy callee args cc =>
     simp only [stepInstrWith] at hfin ⊢
-    exact hrc st dst? retTy callee (args.map fun pair => evalTypedOperand st pair.fst pair.snd) hfin
+    exact hrc st dst? cc retTy callee (args.map fun pair => evalTypedOperand st pair.fst pair.snd) hfin
   | _ => rfl
 
 theorem execInstrsWith_mono
-    (rc1 rc2 : ExecState → Option RegName → LLVMType → GlobalSym → List LLVMVal → ExecOutcome ⊕ ExecState)
+    (rc1 rc2 : ExecState → Option RegName → CallingConv → LLVMType → GlobalSym → List LLVMVal → ExecOutcome ⊕ ExecState)
     (st : ExecState) (is : List LLVMInstr)
-    (hrc : ∀ st' dst? ty callee args,
-      rc1 st' dst? ty callee args ≠ .inl .outOfFuel →
-      rc2 st' dst? ty callee args = rc1 st' dst? ty callee args)
+    (hrc : ∀ st' dst? cc ty callee args,
+      rc1 st' dst? cc ty callee args ≠ .inl .outOfFuel →
+      rc2 st' dst? cc ty callee args = rc1 st' dst? cc ty callee args)
     (hfin : execInstrsWith rc1 st is ≠ .inl .outOfFuel) :
     execInstrsWith rc2 st is = execInstrsWith rc1 st is := by
   induction is generalizing st with
@@ -1845,11 +2211,11 @@ theorem execInstrsWith_mono
       exact ih st' hfin
 
 theorem execBlockWith_mono
-    (rc1 rc2 : ExecState → Option RegName → LLVMType → GlobalSym → List LLVMVal → ExecOutcome ⊕ ExecState)
+    (rc1 rc2 : ExecState → Option RegName → CallingConv → LLVMType → GlobalSym → List LLVMVal → ExecOutcome ⊕ ExecState)
     (fn : LLVMFn) (f1 f2 : Nat) (st : ExecState) (blk : LLVMBlock)
-    (hrc : ∀ st' dst? ty callee args,
-      rc1 st' dst? ty callee args ≠ .inl .outOfFuel →
-      rc2 st' dst? ty callee args = rc1 st' dst? ty callee args)
+    (hrc : ∀ st' dst? cc ty callee args,
+      rc1 st' dst? cc ty callee args ≠ .inl .outOfFuel →
+      rc2 st' dst? cc ty callee args = rc1 st' dst? cc ty callee args)
     (hle : f1 ≤ f2)
     (hfin : execBlockWith rc1 fn f1 st blk ≠ .outOfFuel) :
     execBlockWith rc2 fn f2 st blk = execBlockWith rc1 fn f1 st blk := by
@@ -1923,11 +2289,11 @@ theorem execBlockWith_mono
         | unreachable => simp
 
 theorem runCallWith_mono (mod_ : LLVMModule) (f1 f2 : Nat)
-    (st : ExecState) (dst? : Option RegName) (retTy : LLVMType) (callee : GlobalSym) (args : List LLVMVal)
+    (st : ExecState) (dst? : Option RegName) (callCc : CallingConv) (retTy : LLVMType) (callee : GlobalSym) (args : List LLVMVal)
     (hle : f1 ≤ f2)
-    (hfin : runCallWith mod_ f1 st dst? retTy callee args ≠ .inl .outOfFuel) :
-    runCallWith mod_ f2 st dst? retTy callee args = runCallWith mod_ f1 st dst? retTy callee args := by
-  induction f1 generalizing f2 st dst? retTy callee args with
+    (hfin : runCallWith mod_ f1 st dst? callCc retTy callee args ≠ .inl .outOfFuel) :
+    runCallWith mod_ f2 st dst? callCc retTy callee args = runCallWith mod_ f1 st dst? callCc retTy callee args := by
+  induction f1 generalizing f2 st dst? callCc retTy callee args with
   | zero =>
     cases f2 with
     | zero => rfl
@@ -1957,25 +2323,28 @@ theorem runCallWith_mono (mod_ : LLVMModule) (f1 f2 : Nat)
           | none => rfl
           | some fn =>
             simp only [hfn] at hfin ⊢
-            cases hblks : fn.blocks with
-            | nil => rfl
-            | cons entry rest =>
-              simp only [hblks] at hfin ⊢
-              cases hbind : bindArgs { mem := st.mem } fn.params args with
-              | none => rfl
-              | some calleeSt =>
-                simp only [hbind] at hfin ⊢
-                have hblkFin : execBlockWith (runCallWith mod_ k) fn (k + 1) calleeSt entry ≠ .outOfFuel := by
-                  intro ho
-                  rw [ho] at hfin
-                  exact hfin rfl
-                have hrc_k : ∀ st' d ty c as,
-                    runCallWith mod_ k st' d ty c as ≠ .inl .outOfFuel →
-                    runCallWith mod_ m st' d ty c as = runCallWith mod_ k st' d ty c as := by
-                  intro st' d ty c as hc
-                  exact ih m st' d ty c as (by omega) hc
-                rw [execBlockWith_mono (runCallWith mod_ k) (runCallWith mod_ m) fn (k + 1) (m + 1)
-                    calleeSt entry hrc_k (by omega) hblkFin]
+            by_cases hcc : fn.cc != callCc
+            · simp [hcc]
+            · simp only [hcc, Bool.false_eq_true, ↓reduceIte] at hfin ⊢
+              cases hblks : fn.blocks with
+              | nil => rfl
+              | cons entry rest =>
+                simp only [hblks] at hfin ⊢
+                cases hbind : bindArgs { mem := st.mem, globals := st.globals } fn.params args with
+                | none => rfl
+                | some calleeSt =>
+                  simp only [hbind] at hfin ⊢
+                  have hblkFin : execBlockWith (runCallWith mod_ k) fn (k + 1) calleeSt entry ≠ .outOfFuel := by
+                    intro ho
+                    rw [ho] at hfin
+                    exact hfin rfl
+                  have hrc_k : ∀ st' d cc ty c as,
+                      runCallWith mod_ k st' d cc ty c as ≠ .inl .outOfFuel →
+                      runCallWith mod_ m st' d cc ty c as = runCallWith mod_ k st' d cc ty c as := by
+                    intro st' d cc ty c as hc
+                    exact ih m st' d cc ty c as (by omega) hc
+                  rw [execBlockWith_mono (runCallWith mod_ k) (runCallWith mod_ m) fn (k + 1) (m + 1)
+                      calleeSt entry hrc_k (by omega) hblkFin]
 
 theorem execBlock_mono (mod_ : LLVMModule) (fn : LLVMFn) (f1 f2 : Nat) (st : ExecState) (blk : LLVMBlock)
     (hle : f1 ≤ f2)
@@ -1987,7 +2356,7 @@ theorem execBlock_mono (mod_ : LLVMModule) (fn : LLVMFn) (f1 f2 : Nat) (st : Exe
     rw [ho] at hfin
     exact hfin rfl
   have heq := execBlockWith_mono (runCallWith mod_ f1) (runCallWith mod_ f2) fn f1 f2 st blk
-    (fun st' dst? ty callee args hc => runCallWith_mono mod_ f1 f2 st' dst? ty callee args hle hc)
+    (fun st' dst? cc ty callee args hc => runCallWith_mono mod_ f1 f2 st' dst? cc ty callee args hle hc)
     hle hblkFin
   rw [heq]
 
@@ -1996,13 +2365,19 @@ theorem execFn_mono_fuel (mod_ : LLVMModule) (fn : LLVMFn) (args : List LLVMVal)
     (hfin : execFn mod_ fn args f1 ≠ .outOfFuel) :
     execFn mod_ fn args f2 = execFn mod_ fn args f1 := by
   unfold execFn at hfin ⊢
-  cases hblocks : fn.blocks with
-  | nil => simp
-  | cons entry rest =>
-    cases hbind : bindArgs {} fn.params args with
-    | none => simp
-    | some st =>
-      simp only [hblocks, hbind] at hfin ⊢
-      exact execBlock_mono mod_ fn f1 f2 st entry hle hfin
+  cases hg : initGlobals mod_ with
+  | none => simp
+  | some pair =>
+    cases pair with
+    | mk mem0 globals =>
+      simp only [hg] at hfin ⊢
+      cases hblocks : fn.blocks with
+      | nil => simp
+      | cons entry rest =>
+        cases hbind : bindArgs { mem := mem0, globals := globals } fn.params args with
+        | none => simp
+        | some st =>
+          simp only [hblocks, hbind] at hfin ⊢
+          exact execBlock_mono mod_ fn f1 f2 st entry hle hfin
 
 end LeanNative.Backend.LLVMAst

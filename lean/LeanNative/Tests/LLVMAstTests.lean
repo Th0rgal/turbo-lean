@@ -544,6 +544,148 @@ def fullIRFixtureModule : LLVMModule :=
 def renderedFullIR : String := PP.ppModule fullIRFixtureModule
 
 #guard renderedFullIR.startsWith "target datalayout ="
+#guard isReturned (i64b 26) (execFn fullIRFixtureModule fullIRFixtureFn [i64b 10, .ptr 4096#64] 16)
+
+-- ABI layout & alignment checks (matching x86_64 DataLayout / LLVM 18)
+#guard (LLVMType.int .i256).abiAlign == 16 && (LLVMType.int .i512).abiAlign == 16
+#guard (LLVMType.vec 3 (.int .i32)).byteSize == 16 && (LLVMType.vec 3 (.int .i32)).abiAlign == 16
+#guard (LLVMType.vec 4 (.int .i64)).byteSize == 32 && (LLVMType.vec 4 (.int .i64)).abiAlign == 32
+#guard (LLVMType.vec 8 (.int .i1)).byteSize == 1 && (LLVMType.vec 8 (.int .i1)).abiAlign == 1
+#guard (LLVMType.vec 16 (.int .i1)).byteSize == 2 && (LLVMType.vec 16 (.int .i1)).abiAlign == 2
+#guard (LLVMType.struct []).byteSize == 0 && (LLVMType.struct []).abiAlign == 1
+#guard (LLVMType.struct [.int .i32, .int .i64]).byteSize == 16 &&
+  (LLVMType.struct [.int .i32, .int .i64]).abiAlign == 8
+#guard (LLVMType.struct [.int .i32, .int .i64] true).byteSize == 12 &&
+  (LLVMType.struct [.int .i32, .int .i64] true).abiAlign == 1
+#guard (LLVMType.struct [.int .i64, .int .i256, .int .i64]).byteSize == 64 &&
+  (LLVMType.struct [.int .i64, .int .i256, .int .i64]).abiAlign == 16
+#guard (LLVMType.struct [.int .i64, .int .i1]).byteSize == 16 &&
+  (LLVMType.struct [.int .i64, .int .i1]).abiAlign == 8
+#guard (LLVMType.struct [.int .i8, .vec 4 (.int .i64)]).byteSize == 64 &&
+  (LLVMType.struct [.int .i8, .vec 4 (.int .i64)]).abiAlign == 32
+
+-- <8 x i1> LE bit-packing and <3 x i32> -> <6 x i16> bitcast
+def i1VecBitpackCheck : Bool :=
+  let v8 := Operand.constAgg [
+    .constInt .i1 1#1, .constInt .i1 0#1, .constInt .i1 1#1, .constInt .i1 0#1,
+    .constInt .i1 0#1, .constInt .i1 0#1, .constInt .i1 0#1, .constInt .i1 1#1
+  ]
+  let bc1 := boundReg (stepInstr {} 1 st0 (.bitcast "b" (.vec 8 (.int .i1)) v8 (.int .i8))) == some (i8b 133)
+  let bc2 :=
+    match stepInstr {} 1 st0 (.bitcast "v" (.int .i8) (i8v 133) (.vec 8 (.int .i1))) with
+    | .inr st1 =>
+      match st1.regs.head? with
+      | some (_, vecVal) =>
+        let rst : ExecState := { regs := [("v", vecVal)] }
+        boundReg (stepInstr {} 1 rst (.extractelement "e0" 8 (.int .i1) (.reg "v") .i32 (i32v 0))) == some (i1b true) &&
+        boundReg (stepInstr {} 1 rst (.extractelement "e1" 8 (.int .i1) (.reg "v") .i32 (i32v 1))) == some (i1b false) &&
+        boundReg (stepInstr {} 1 rst (.extractelement "e2" 8 (.int .i1) (.reg "v") .i32 (i32v 2))) == some (i1b true) &&
+        boundReg (stepInstr {} 1 rst (.extractelement "e7" 8 (.int .i1) (.reg "v") .i32 (i32v 7))) == some (i1b true)
+      | none => false
+    | _ => false
+  let vPoison := Operand.constAgg [
+    .constInt .i1 1#1, .poison, .constInt .i1 1#1, .constInt .i1 0#1,
+    .constInt .i1 0#1, .constInt .i1 0#1, .constInt .i1 0#1, .constInt .i1 1#1
+  ]
+  let bcPoison := isInrPoison (stepInstr {} 1 st0 (.bitcast "bp" (.vec 8 (.int .i1)) vPoison (.int .i8)))
+  let v3i32 := Operand.constAgg [i32v 1, i32v 2, i32v 3]
+  let bcVec :=
+    match stepInstr {} 1 st0 (.bitcast "v6" (.vec 3 (.int .i32)) v3i32 (.vec 6 (.int .i16))) with
+    | .inr st1 =>
+      match st1.regs.head? with
+      | some (_, v6) =>
+        v6.toList? == some [i16b 1, i16b 0, i16b 2, i16b 0, i16b 3, i16b 0]
+      | none => false
+    | _ => false
+  bc1 && bc2 && bcPoison && bcVec
+
+#guard i1VecBitpackCheck
+
+-- Bitcast legality (reject ptr <-> int, cross-addrspace ptr, aggregate <-> int)
+#guard isUb "bitcast size mismatch" (stepInstr {} 1 st0 (.bitcast "bad1" (.ptr 0) .constNull (.int .i64)))
+#guard isUb "bitcast size mismatch" (stepInstr {} 1 st0 (.bitcast "bad2" (.ptr 0) .constNull (.ptr 3)))
+#guard isUb "bitcast size mismatch"
+  (stepInstr {} 1 st0 (.bitcast "bad3" (LLVMType.struct [.int .i64]) .constZero (.int .i64)))
+#guard boundReg (stepInstr {} 1 st0 (.bitcast "okp" (.ptr 0) .constNull (.ptr 0))) == some (.ptr 0#64)
+
+-- Division / remainder poison vs UB precedence
+#guard isUb "division by zero" (stepInstr {} 1 st0 (.udiv "r" false .i8 .poison (i8v 0)))
+#guard isUb "division by poison" (stepInstr {} 1 st0 (.udiv "r" false .i8 (i8v 1) .poison))
+#guard isInrPoison (stepInstr {} 1 st0 (.udiv "r" false .i8 .poison (i8v 2)))
+#guard isUb "signed division overflow" (stepInstr {} 1 st0 (.sdiv "r" false .i8 .poison (i8v 255)))
+#guard isInrPoison (stepInstr {} 1 st0 (.sdiv "r" false .i8 .poison (i8v 2)))
+
+-- OOB extractelement / insertelement -> poison (not UB)
+#guard isInrPoison
+  (stepInstr {} 1 st0 (.extractelement "oob1" 2 (.int .i8) .constZero .i32 (i32v 2)))
+#guard isInrPoison
+  (stepInstr {} 1 st0 (.insertelement "oob2" 2 (.int .i8) .constZero (i8v 7) .i32 (i32v 5)))
+
+-- Alignment 0 uses ABI align; non-pow2 alignment is UB
+def alignChecks : Bool :=
+  match st0.mem.allocAligned 8 8 with
+  | none => false
+  | some (ptr, mem1) =>
+    let mem2 := mem1.storeInt ptr .i64 99#64
+    let oddPtr := BitVec.ofNat 64 (ptr.toNat + 4)
+    let st := { st0 with mem := mem2, regs := [("p", .ptr ptr), ("odd", .ptr oddPtr)] }
+    boundReg (stepInstr {} 1 st (.load "ok" false (.int .i64) (.reg "p") 0)) == some (i64b 99) &&
+    isUb "misaligned load" (stepInstr {} 1 st (.load "mis" false (.int .i64) (.reg "odd") 0)) &&
+    isUb "invalid alignment" (stepInstr {} 1 st (.load "bad" false (.int .i64) (.reg "p") 3))
+
+#guard alignChecks
+
+-- Globals (@sym), constant global write -> UB, calling convention mismatch -> UB, addrspace PP
+def globalAndCCFn : LLVMFn :=
+  let pairTy := LLVMType.struct [.int .i32, .int .i64]
+  { name := "read_globals"
+    cc := .ccc
+    retTy := .int .i64
+    params := []
+    blocks := [{
+      label := "entry"
+      body := [
+        .load "c" false (.int .i64) (.global "g_const") 8,
+        .getelementptr "pf" true pairTy (.global "g_pair") [(.i64, i64v 0), (.i32, i32v 1)],
+        .load "p1" false (.int .i64) (.reg "pf") 8,
+        .add "sum" .nsw .i64 (.reg "c") (.reg "p1")
+      ]
+      term := .ret (some (.int .i64, .reg "sum"))
+    }] }
+
+def writeConstGlobalFn : LLVMFn :=
+  { name := "write_const"
+    cc := .ccc
+    retTy := .void
+    params := []
+    blocks := [{
+      label := "entry"
+      body := [.store false (.int .i64) (i64v 1) (.global "g_const") 8]
+      term := .ret none
+    }] }
+
+def badCCCallerFn : LLVMFn :=
+  { name := "bad_cc"
+    cc := .ccc
+    retTy := .int .i64
+    params := []
+    blocks := [{
+      label := "entry"
+      body := [.call (some "r") (.int .i64) "all_forms" [(.int .i64, i64v 1), (.ptr 0, .constNull)] .ccc]
+      term := .ret (some (.int .i64, .reg "r"))
+    }] }
+
+#guard isReturned (i64b 51) (execFn fullIRFixtureModule globalAndCCFn [] 4)
+#guard execFn fullIRFixtureModule writeConstGlobalFn [] 4 == .ub "store out of bounds"
+#guard execFn fullIRFixtureModule badCCCallerFn [] 4 == .ub "calling convention mismatch"
+
+#guard PP.ppType (LLVMType.struct [.int .i32, .int .i64] true) == "<{ i32, i64 }>"
+#guard PP.ppInstr (.load "x" false (.int .i32) (.reg "p") 4 3) ==
+  "%x = load i32, ptr addrspace(3) %p, align 4"
+#guard PP.ppInstr (.store false (.int .i32) (i32v 7) (.reg "p") 0 3) ==
+  "store i32 7, ptr addrspace(3) %p"
+#guard PP.ppInstr (.call (some "r") (.int .i64) "fn_fast" [(.int .i64, i64v 1)] .fastcc) ==
+  "%r = call fastcc i64 @fn_fast(i64 1)"
 
 theorem retFn_returns_arg (v : LLVMVal) (fuel : Nat) (hf : 0 < fuel) :
     execFn {} retFn [v] fuel = .returned (some v) := by
@@ -556,7 +698,7 @@ theorem nested_struct_ppType_injective (t1 t2 : LLVMType)
     (h : PP.ppType (LLVMType.struct [t1, .vec 4 t2]) = PP.ppType (LLVMType.struct [t2, .vec 4 t1])) :
     t1 = t2 := by
   have hinj := ppType_injective _ _ h
-  injection hinj with hfs
+  injection hinj with _ hfs
   injection hfs with ht1 _
 
 end LeanNative.Tests.LLVMAstTests
