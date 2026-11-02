@@ -23,6 +23,7 @@ import LeanNative.Transform.UnboxTupleSROA
 import LeanNative.Transform.HoistExclusivity
 import LeanNative.Transform.LoopVectorizeOpt
 import LeanNative.Transform.KernelFusion
+import LeanNative.Proofs.KernelFusionProofs
 import LeanNative.Transform.Superopt
 import LeanNative.Backend.FastCheck
 
@@ -79,21 +80,13 @@ def verifyOptPluginGate
   sigOk && tvRes.passed && costOk
 
 /-- Pure wrapper applying `LeanNative.Spec.evalWithUntrustedOptPlugin` to a declaration plugin. -/
-def applyVerifiedOptPlugin
-    (target : SuperoptTarget)
-    (requireStrictCost : Bool)
-    (pluginFn : LNIRDecl → Option (LNIRDecl × OptPluginCertificate))
-    (src : LNIRDecl) : LNIRDecl × Bool × Option OptPluginCertificate :=
-  let verifiedDecl :=
-    evalWithUntrustedOptPlugin
-      pluginFn
-      (verifyOptPluginGate target requireStrictCost)
-      src
+def applyVerifiedOptPlugin (target : SuperoptTarget) (requireStrictCost : Bool)
+    (pluginFn : LNIRDecl → Option (LNIRDecl × OptPluginCertificate)) (src : LNIRDecl) :
+    LNIRDecl × Bool × Option OptPluginCertificate :=
+  let verifiedDecl := evalWithUntrustedOptPlugin pluginFn (verifyOptPluginGate target requireStrictCost) src
   match pluginFn src with
   | none => (verifiedDecl, false, none)
-  | some (cand, cert) =>
-    let accepted := verifyOptPluginGate target requireStrictCost src cand cert
-    (verifiedDecl, accepted, some cert)
+  | some (cand, cert) => (verifiedDecl, verifyOptPluginGate target requireStrictCost src cand cert, some cert)
 
 /-! ## 2. Built-In Segregated Optimization Plugins & Adversarial Test Plugin -/
 
@@ -102,15 +95,19 @@ def passToBuiltinPlugin (pluginName : String) (pass : TransformPass) (target : S
     Option (LNIRDecl × OptPluginCertificate) :=
   let (d', stepCert) := pass.runDecl d
   if !stepCert.changed then none
-  else
-    some (d', {
-      pluginName
-      kind := "builtin_verified"
-      theoremOrRule := stepCert.theoremRef
-      costBefore := declScalarCost target d
-      costAfter := declScalarCost target d'
-      notes := stepCert.notes
-    })
+  else some (d', { pluginName, kind := "builtin_verified", theoremOrRule := stepCert.theoremRef
+                   costBefore := declScalarCost target d, costAfter := declScalarCost target d'
+                   notes := stepCert.notes })
+
+/-- Machine-checked verification contract (`Contract V2`) for intra-kernel `parFor`
+    scalar folding and primitive specialization (`LeanNative.Proofs.specializeKernelCode_refines`). -/
+def verifiedKernelSpecializeContract : VerifiedCodePassContract :=
+  { name := "KernelSpecialize", theoremRef := "LeanNative.Proofs.specializeKernelCode_refines"
+    notes := "Specialized parFor scalar kernel bodies via verified UInt64 identities and FMA contraction"
+    runCode := specializeKernelCode, sound := LeanNative.Proofs.specializeKernelCode_refines }
+
+/-- Intra-kernel specialization pass constructed via `TransformPass.ofVerifiedContract` (`Contract V2`). -/
+def kernelSpecializePass : TransformPass := TransformPass.ofVerifiedContract verifiedKernelSpecializeContract
 
 def builtinAlgebraicPlugin := passToBuiltinPlugin "builtin:algebraic-peephole" algebraicOptPass
 def builtinUnboxTuplePlugin := passToBuiltinPlugin "builtin:unbox-tuple-sroa" unboxTupleSROAPass

@@ -248,6 +248,7 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.fuseMapScaleAdd_loop_sound
   , ``LeanNative.Proofs.fuseParForKernels_sound
   , ``LeanNative.Proofs.fuseCustomScalar1_elem_sound
+  , ``LeanNative.Proofs.fuseCustomScalar1_bool_coerced_elem_sound
   , ``LeanNative.Proofs.ctorTag_obj_sound
   , ``LeanNative.Proofs.ctorTag_tuple_sound
   , ``LeanNative.Proofs.ctorGetObj_sound

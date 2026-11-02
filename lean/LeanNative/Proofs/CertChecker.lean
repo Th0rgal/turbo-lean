@@ -77,6 +77,7 @@ def verifiedTheoremRegistry : List String :=
     "elideAndMutateRC_sound", "rewriteCodeVerified_refines", "rewriteLNIRExprVerified_sound",
     "contractKernelScalar_sound", "specializeKernelCode_refines", "fuseMapScaleAddPair_algebra",
     "fuseMapScaleAdd_loop_sound", "fuseParForKernels_sound", "fuseCustomScalar1_elem_sound",
+    "fuseCustomScalar1_bool_coerced_elem_sound",
     "ctorTag_obj_sound", "ctorTag_tuple_sound", "ctorGetObj_sound", "lowerClosureAlloc_sound",
     "specializeKnownClosure_sound", "lowerClosureSeqFor_step1_sound", "adtMatchArm_taken",
     "adtMatchArm_fallthrough", "defunctionalizeClosure_sound", "lowerAdtMatch_sound",

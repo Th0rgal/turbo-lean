@@ -94,6 +94,19 @@ def stencilHazardParFor : LNIRCode :=
 
 #guard countParForLaunches (fuseParForCode stencilHazardParFor) == 2
 
+/-- Boolean-producing `.customScalar` (`eq -> bool`, coerced to `1/0` at `parFor` boundary)
+    fuses cleanly into a `.u64`-expecting consumer by wrapping the inlined producer in
+    `.select p (.constU64 1) (.constU64 0)` (`fuseCustomScalar1_bool_coerced_elem_sound`),
+    eliminating the intermediate allocation (`nextId`: `12 -> 11`) while preserving `#[11, 10, 10, 10]`. -/
+def boolProducerCustomParFor : LNIRCode :=
+  .parFor 11 0 [1] .i64 (.customScalar 50 [51] (.binOp .eq (.var 51) (.constU64 5)))
+    (.parFor 12 0 [11] .i64 (.customScalar 60 [61] (.binOp .add (.var 61) (.constU64 10)))
+      (.ret 12))
+
+#guard countParForLaunches (fuseParForCode boolProducerCustomParFor) == 1
+#guard runSarrayEval fusionEnv baseHeap boolProducerCustomParFor == some (#[11, 10, 10, 10], 12)
+#guard runSarrayEval fusionEnv baseHeap (fuseParForCode boolProducerCustomParFor) == some (#[11, 10, 10, 10], 11)
+
 /-- Intra-kernel specialization via segregated `builtinKernelFusionPlugin` (`verifyOptPluginGate`):
     specializes `.customScalar` `x * 4 + 9` into `.mapScaleAdd 4 9` (`declScalarCost`: `5 -> 0`). -/
 def unspecializedDecl : LNIRDecl :=
@@ -189,10 +202,27 @@ def parentFloatSlice : TypedSliceView := mkFloatArraySlice 1 6 2 3
 
 #guard isRegisteredTheorem "LeanNative.Proofs.fuseParForKernels_sound" == true
 #guard isRegisteredTheorem "LeanNative.Proofs.specializeKernelCode_refines" == true
+#guard isRegisteredTheorem "LeanNative.Proofs.fuseCustomScalar1_bool_coerced_elem_sound" == true
 #guard isRegisteredTheorem "LeanNative.Proofs.defunctionalizeClosure_sound" == true
 #guard isRegisteredTheorem "LeanNative.Proofs.lowerAdtMatch_sound" == true
 #guard isRegisteredTheorem "LeanNative.Proofs.subSliceBounds_no_oob" == true
 #guard isRegisteredTheorem "LeanNative.Proofs.lowerSliceFold_sound" == true
-#guard (kernelFusionPass.runDecl { name := "twoStage", params := [], retTy := .sarray .i64, body := twoStageParFor }).2.changed == true
+#guard (let c := (kernelSpecializePass.runDecl unspecializedDecl).2
+        c.changed == true && c.assurance == .verifiedKernelProof &&
+        c.theoremRef == "LeanNative.Proofs.specializeKernelCode_refines" &&
+        (verifySingleCert {
+          passName := c.passName, declName := c.declName, inputHash := c.inputHash,
+          outputHash := c.outputHash, changed := c.changed, assurance := c.assurance,
+          theoremRef := c.theoremRef, notes := c.notes }).1)
+#guard (let c := (kernelFusionPass.runDecl { name := "twoStage", params := [], retTy := .sarray .i64, body := twoStageParFor }).2
+        c.changed == true && c.assurance == .tested && c.theoremRef == "LeanNative.Proofs.fuseParForKernels_sound" &&
+        (verifySingleCert {
+          passName := c.passName, declName := c.declName, inputHash := c.inputHash,
+          outputHash := c.outputHash, changed := c.changed, assurance := c.assurance,
+          theoremRef := c.theoremRef, notes := c.notes }).1)
+#guard (let c := (kernelFusionPass.runDecl { name := "threeStage", params := [], retTy := .sarray .i64, body := threeStageParFor }).2
+        c.changed == true && c.assurance == .tested && c.theoremRef == "KernelFusion.multi_stage_tested")
+#guard (let c := (kernelFusionPass.runDecl { name := "noop", params := [], retTy := .sarray .i64, body := stencilHazardParFor }).2
+        c.changed == false && c.assurance == .verifiedKernelProof && c.theoremRef == "LeanNative.Semantics.CodeRefines.refl")
 
 end LeanNative.Tests.C8CoverageFusionTests

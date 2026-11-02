@@ -250,6 +250,83 @@ def substConsumerInputs
       | none => none
   | _, _, _ => none
 
+/-- Structural equality on `LNIRType` (total, reflexive on all scalar/array/pointer/unit types). -/
+def sameElemType : LNIRType → LNIRType → Bool
+  | .i1, .i1 | .i8, .i8 | .i16, .i16 | .i32, .i32 | .i64, .i64 | .usize, .usize
+  | .u256, .u256 | .i256, .i256 | .f16, .f16 | .f32, .f32 | .f64, .f64
+  | .objPtr, .objPtr | .taggedPtr, .taggedPtr | .storageMap, .storageMap | .unit, .unit => true
+  | .sarray a, .sarray b | .rawPtr a, .rawPtr b => sameElemType a b
+  | .tuple as, .tuple bs => as == bs
+  | _, _ => false
+
+/-- Structural scalar sort (`some true` = guaranteed `.u64`, `some false` = guaranteed `.bool`,
+    `none` = untyped or 256-bit) over `.u64`-bound element variables `allowedU64Vars`.
+    Defined by single-pass structural recursion (`0` `_unsafe_rec`). -/
+def inferScalarSort? (allowedU64Vars : List VarId) : ScalarExpr → Option Bool
+  | .constU64 _ => some true
+  | .constBool _ => some false
+  | .var id => if allowedU64Vars.contains id then some true else none
+  | .fma a b c =>
+    if inferScalarSort? allowedU64Vars a == some true &&
+       inferScalarSort? allowedU64Vars b == some true &&
+       inferScalarSort? allowedU64Vars c == some true then
+      some true
+    else none
+  | .binOp op l r =>
+    let sl := inferScalarSort? allowedU64Vars l
+    let sr := inferScalarSort? allowedU64Vars r
+    match op with
+    | .eq =>
+      if (sl == some true && sr == some true) || (sl == some false && sr == some false) then
+        some false
+      else none
+    | .lt | .le =>
+      if sl == some true && sr == some true then some false else none
+    | .addChecked256 | .subChecked256 | .mulChecked256 => none
+    | _ =>
+      if sl == some true && sr == some true then some true else none
+  | .unaryOp op a =>
+    let sa := inferScalarSort? allowedU64Vars a
+    match op with
+    | .not => sa
+    | .neg => if sa == some true then some true else none
+    | .clz256 => none
+  | .select c t f =>
+    let sc := inferScalarSort? allowedU64Vars c
+    let st := inferScalarSort? allowedU64Vars t
+    let sf := inferScalarSort? allowedU64Vars f
+    if sc.isSome && st.isSome && st == sf then st else none
+
+/-- Coerce a producer `ScalarExpr` over `allowedU64Vars` to a `UInt64`-producing `ScalarExpr` matching
+    `evalParKernelElem`'s output buffer write (`Eval.lean:489–490`), or return `none` if untyped/256-bit. -/
+def coerceProducerScalarToU64? (allowedU64Vars : List VarId) (e : ScalarExpr) : Option ScalarExpr :=
+  match inferScalarSort? allowedU64Vars e with
+  | some true => some e
+  | some false => some (.select e (.constU64 1) (.constU64 0))
+  | none => none
+
+/-- Strict verified two-stage `.mapScaleAdd` producer-consumer fusion across an `LNIRCode` block,
+    restricted exclusively to the pattern proven by `LeanNative.Proofs.fuseParForKernels_sound`. -/
+def fuseVerifiedMapScaleAddCode : LNIRCode → LNIRCode
+  | .letBind dst ty val k => .letBind dst ty val (fuseVerifiedMapScaleAddCode k)
+  | .rawStore p i x ety k => .rawStore p i x ety (fuseVerifiedMapScaleAddCode k)
+  | .incRef o c k => .incRef o c (fuseVerifiedMapScaleAddCode k)
+  | .decRef o c k => .decRef o c (fuseVerifiedMapScaleAddCode k)
+  | .ite c t e => .ite c (fuseVerifiedMapScaleAddCode t) (fuseVerifiedMapScaleAddCode e)
+  | .seqFor idx lo hi acc init accTy s k =>
+    .seqFor idx lo hi acc init accTy (fuseVerifiedMapScaleAddCode s) (fuseVerifiedMapScaleAddCode k)
+  | .parFor out1 len1 in1 ety1 k1 k =>
+    match k1, in1, k with
+    | .mapScaleAdd s1 b1, [srcBuf], .parFor out2 len2 [cBuf] ety2 (.mapScaleAdd s2 b2) (.ret retV) =>
+      if out1 != out2 && out1 != len1 && srcBuf != out1 && cBuf == out1 &&
+         len1 == len2 && sameElemType ety1 ety2 && retV == out2 then
+        .parFor out2 len2 [srcBuf] ety2 (fuseMapScaleAddPair s1 b1 s2 b2) (.ret retV)
+      else
+        .parFor out1 len1 in1 ety1 k1 (fuseVerifiedMapScaleAddCode k)
+    | _, _, _ => .parFor out1 len1 in1 ety1 k1 (fuseVerifiedMapScaleAddCode k)
+  | .ret v => .ret v
+  | .unreachable => .unreachable
+
 /-- Fuse a producer `(inputs1, k1)` feeding `tmpVar` into consumer `(inputs2, k2)` over identical `lenVar`.
     Handles algebraic fast paths (`mapScaleAdd + mapScaleAdd`, `zipAdd/zipMul/saxpy + mapScaleAdd`)
     as well as general pointwise `.customScalar` producer-consumer pipelines. -/
@@ -271,15 +348,20 @@ def fuseTwoParForStage
       match kernelToCustomScalar? base k1, kernelToCustomScalar? (base + 50) k2 with
       | some (idx1, pVars, pBody), some (idx2, cVars, cBody) =>
         if inputs1.length != pVars.length || inputs2.length != cVars.length then none
+        else if pVars.eraseDups.length != pVars.length || pVars.contains idx1 then none
+        else if cVars.eraseDups.length != cVars.length || cVars.contains idx2 then none
         else if scalarExprUsesVar tmpVar pBody || scalarExprUsesVar tmpVar cBody then none
         else
-          let pBodyIdxAligned := substScalarVar idx1 (.var idx2) pBody
-          match substConsumerInputs tmpVar inputs1 pVars pBodyIdxAligned (base + 100) inputs2 cVars cBody with
-          | some (fusedInputs, fusedVars, fusedBody) =>
-            let simplified := contractKernelScalar fusedBody
-            let kern := specializeKernel (.customScalar idx2 fusedVars simplified)
-            some (fusedInputs, kern)
+          match coerceProducerScalarToU64? (idx1 :: pVars) pBody with
           | none => none
+          | some pBodyU64 =>
+            let pBodyIdxAligned := substScalarVar idx1 (.var idx2) pBodyU64
+            match substConsumerInputs tmpVar inputs1 pVars pBodyIdxAligned (base + 100) inputs2 cVars cBody with
+            | some (fusedInputs, fusedVars, fusedBody) =>
+              let simplified := contractKernelScalar fusedBody
+              let kern := specializeKernel (.customScalar idx2 fusedVars simplified)
+              some (fusedInputs, kern)
+            | none => none
       | _, _ => none
 
 /-- Strip a single `.decRef tmpVar 1` from `code` if `tmpVar` is never referenced before that release,
@@ -299,15 +381,6 @@ def stripDeadTmpDecRef (tmpVar : VarId) : LNIRCode → LNIRCode
       .parFor out len ins ety kern k
     else .parFor out len ins ety kern (stripDeadTmpDecRef tmpVar k)
   | other => other
-
-/-- Structural equality on `LNIRType` (total, reflexive on all scalar/array/pointer/unit types). -/
-def sameElemType : LNIRType → LNIRType → Bool
-  | .i1, .i1 | .i8, .i8 | .i16, .i16 | .i32, .i32 | .i64, .i64 | .usize, .usize
-  | .u256, .u256 | .i256, .i256 | .f16, .f16 | .f32, .f32 | .f64, .f64
-  | .objPtr, .objPtr | .taggedPtr, .taggedPtr | .storageMap, .storageMap | .unit, .unit => true
-  | .sarray a, .sarray b | .rawPtr a, .rawPtr b => sameElemType a b
-  | .tuple as, .tuple bs => as == bs
-  | _, _ => false
 
 /-- Bottom-up multi-stage producer-consumer `parFor` fusion across an `LNIRCode` block.
     Because `rest` is fused first, 3-stage and N-stage pipelines fuse into a single `parFor` pass! -/
@@ -349,42 +422,31 @@ def countParForLaunches : LNIRCode → Nat
 def fuseParForDecl (d : LNIRDecl) : LNIRDecl :=
   { d with body := fuseParForCode d.body }
 
-/-- Intra-kernel specialization pass (`specializeKernelCode`, `CodeRefines`-preserving). -/
-def kernelSpecializePass : TransformPass where
-  name := "KernelSpecialize"
-  assurance := .verifiedKernelProof
-  theoremRef := "LeanNative.Proofs.specializeKernelCode_refines"
-  runDecl := fun d =>
-    let inHash := d.structuralHash
-    let body' := specializeKernelCode d.body
-    let changed := body' != d.body
-    let comb := AssuranceLevel.combine d.assurance .verifiedKernelProof
-    let d' : LNIRDecl := { d with body := body', assurance := comb }
-    let outHash := d'.structuralHash
-    (d', {
-      passName := "KernelSpecialize"
-      declName := d.name
-      inputHash := inHash
-      outputHash := outHash
-      changed := changed
-      assurance := comb
-      theoremRef := if changed then "LeanNative.Proofs.specializeKernelCode_refines"
-        else "LeanNative.Semantics.CodeRefines.refl"
-      notes := if changed then "Specialized parFor scalar kernel bodies" else "Unchanged"
-    })
-
-/-- Multi-stage producer-consumer `parFor` loop fusion pass (`fuseParForCode`). -/
+/-- Multi-stage producer-consumer `parFor` loop fusion pass (`fuseParForCode`).
+    Follows the P0 Provenance Contract (`Contract V2`):
+    - No-op (`d'.body == d.body`) stamps `.verifiedKernelProof` via `CodeRefines.refl`.
+    - Exact 2-stage `.mapScaleAdd` pipelines matching `fuseVerifiedMapScaleAddCode` carry the
+      observational buffer-data theorem `LeanNative.Proofs.fuseParForKernels_sound` (`stTgt.nextId + 1 = stSrc.nextId`,
+      so `AssuranceLevel.tested` rather than `CodeRefines` `VerifiedKernelProof`).
+    - Extended multi-stage / `.customScalar` / RC-cleanup rewrites stamp `AssuranceLevel.tested`
+      (`KernelFusion.multi_stage_tested`) and never claim `.verifiedKernelProof`. -/
 def kernelFusionPass : TransformPass where
   name := "KernelFusion"
-  assurance := .verifiedKernelProof
+  assurance := .tested
   theoremRef := "LeanNative.Proofs.fuseParForKernels_sound"
   runDecl := fun d =>
     let inHash := d.structuralHash
     let d' := fuseParForDecl d
     let changed := d'.body != d.body
-    let comb := AssuranceLevel.combine d.assurance .verifiedKernelProof
+    let isVerified2Stage := changed && d'.body == fuseVerifiedMapScaleAddCode d.body
+    let stepAssurance : AssuranceLevel := if !changed then .verifiedKernelProof else .tested
+    let comb := AssuranceLevel.combine d.assurance stepAssurance
     let dOut : LNIRDecl := { d' with assurance := comb }
     let outHash := dOut.structuralHash
+    let thmRef :=
+      if !changed then "LeanNative.Semantics.CodeRefines.refl"
+      else if isVerified2Stage then "LeanNative.Proofs.fuseParForKernels_sound"
+      else "KernelFusion.multi_stage_tested"
     (dOut, {
       passName := "KernelFusion"
       declName := d.name
@@ -392,10 +454,9 @@ def kernelFusionPass : TransformPass where
       outputHash := outHash
       changed := changed
       assurance := comb
-      theoremRef := if changed then "LeanNative.Proofs.fuseParForKernels_sound"
-        else "LeanNative.Semantics.CodeRefines.refl"
+      theoremRef := thmRef
       notes := if changed then
-        s!"Fused parFor launches ({countParForLaunches d.body} -> {countParForLaunches d'.body})"
+        s!"Fused parFor launches ({countParForLaunches d.body} -> {countParForLaunches d'.body}; assurance={comb})"
       else "No fusible adjacent parFor stages"
     })
 

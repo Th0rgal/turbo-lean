@@ -628,7 +628,8 @@ theorem fuseParForKernels_sound
                 rfl, rfl, by simp [HeapState.findBuffer], by simp [HeapState.findBuffer], rfl, rfl, rfl, rfl⟩
     | _ => simp at hsrc
 
-/-- General 1-input `.customScalar` producer-consumer fusion soundness at element `i`. -/
+/-- General 1-input `.customScalar` producer-consumer fusion soundness at element `i`
+    for `UInt64`-producing producers (`evalScalarExpr ... pBody = .ok (.u64 v1)`). -/
 theorem fuseCustomScalar1_elem_sound
     (env : VarEnv) (st : HeapState) (srcBuf : VarId) (len : Nat)
     (idxVar pVar cVar : VarId) (pBody cBody : ScalarExpr) (i : Nat) (x v1 : UInt64)
@@ -642,6 +643,34 @@ theorem fuseCustomScalar1_elem_sound
      | .error err => .error err) := by
   simp only [evalParKernelElem, bindCustomParInputs, hread]
   rw [substScalarVar_eval_eq ((env.bind idxVar (.u64 i.toUInt64)).bind pVar (.u64 x)) cVar pBody cBody (.u64 v1) hp]
+  rfl
+
+/-- General 1-input `.customScalar` producer-consumer fusion soundness at element `i`
+    for `Bool`-producing producers (`evalScalarExpr ... pBody = .ok (.bool b1)`), proving that
+    wrapping `pBody` in `.select pBody (.constU64 1) (.constU64 0)` matches `evalParKernelElem`'s
+    `bool -> UInt64` (`if b1 then 1 else 0`) boundary coercion (`Eval.lean:490`). -/
+theorem fuseCustomScalar1_bool_coerced_elem_sound
+    (env : VarEnv) (st : HeapState) (srcBuf : VarId) (len : Nat)
+    (idxVar pVar cVar : VarId) (pBody cBody : ScalarExpr) (i : Nat) (x : UInt64) (b1 : Bool)
+    (hread : readParInput env st [srcBuf] 0 i = .ok x)
+    (hp : evalScalarExpr ((env.bind idxVar (.u64 i.toUInt64)).bind pVar (.u64 x)) pBody = .ok (.bool b1)) :
+    evalParKernelElem env st [srcBuf] len
+      (.customScalar idxVar [pVar]
+        (substScalarVar cVar (.select pBody (.constU64 1) (.constU64 0)) cBody)) i =
+    (match evalScalarExpr
+        (((env.bind idxVar (.u64 i.toUInt64)).bind pVar (.u64 x)).bind cVar (.u64 (if b1 then 1 else 0))) cBody with
+     | .ok (.u64 v) => .ok v
+     | .ok (.bool b) => .ok (if b then 1 else 0)
+     | .ok _ => .error (.typeError "customScalar body must evaluate to u64 or bool")
+     | .error err => .error err) := by
+  have hsel :
+      evalScalarExpr ((env.bind idxVar (.u64 i.toUInt64)).bind pVar (.u64 x))
+        (.select pBody (.constU64 1) (.constU64 0)) =
+      .ok (.u64 (if b1 then 1 else 0)) := by
+    cases b1 <;> simp [evalScalarExpr, hp]
+  simp only [evalParKernelElem, bindCustomParInputs, hread]
+  rw [substScalarVar_eval_eq ((env.bind idxVar (.u64 i.toUInt64)).bind pVar (.u64 x)) cVar
+    (.select pBody (.constU64 1) (.constU64 0)) cBody (.u64 (if b1 then 1 else 0)) hsel]
   rfl
 
 end LeanNative.Proofs
