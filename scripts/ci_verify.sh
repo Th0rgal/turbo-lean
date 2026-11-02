@@ -96,10 +96,13 @@ table = {n: (p if s == "XFAIL" else None) for n, s, p in rows}
 assert all((s == "XFAIL") == bool(p) for _, s, p in rows), "XFAIL rows must name `#guard !pred`; pass rows `—`"
 assert regs == table, f"contract table out of sync: module={regs} doc={table}"
 unc = re.findall(r"^-- UNCOVERED\(([\w.-]+)\):", src, re.M)
-unc_doc = re.findall(r"^\| `([\w.-]+)` \| [^|]+ \|$", doc.split("### UNCOVERED clauses", 1)[1], re.M)
+unc_section = doc.split("### UNCOVERED clauses", 1)[1]
+unc_doc = re.findall(r"^\| `([\w.-]+)` \| [^|]+ \|$", unc_section, re.M)
 assert len(unc) == len(set(unc)) and set(unc) == set(unc_doc), f"UNCOVERED list out of sync: module={unc} doc={unc_doc}"
+assert len(regs) == 54 and not unc, f"HeapObj contract must be 54/54 PASS with 0 UNCOVERED, got {len(regs)} regressions and {unc}"
 nx = sum(p is not None for p in regs.values())
-print(f"HeapObj contract: {len(regs)} regressions, {nx} explicit XFAIL (flip in 5b), {len(unc)} UNCOVERED; "
+assert nx == 0, f"HeapObj contract must have 0 XFAIL, got {nx}"
+print(f"HeapObj contract: {len(regs)}/54 PASS, {nx} XFAIL, {len(unc)} UNCOVERED; "
       f"structural self-test rejected {len(bad)} malformed XFAILs")
 open("/tmp/heapobj_xfail_preds", "w").write(" ".join(p for p in regs.values() if p))
 PY
@@ -223,10 +226,12 @@ open HeapObjXfailCheck in
   for p in bad do
     if (← checkPred (st ++ p)).isEmpty then throwError "checker self-test: malformed {p} accepted"
   let preds := ((← IO.getEnv "HEAPOBJ_XFAIL_PREDS").getD "").splitOn " " |>.filter (· != "")
-  if preds.isEmpty then throwError "no XFAIL predicates given"
-  let errs ← preds.flatMapM fun p => checkPred (`LeanNative.Tests.HeapObjContract ++ p.toName)
-  unless errs.isEmpty do throwError "XFAIL predicates: {errs}"
-  IO.println s!"XFAIL meta check: {preds.length} predicates reach the evaluator/emitter/validator; self-test rejected {bad.length} malformed"
+  if preds.isEmpty then
+    IO.println "XFAIL meta check: 0 XFAIL, 0 UNCOVERED, 54/54 PASS (self-test rejected 12 malformed)"
+  else
+    let errs ← preds.flatMapM fun p => checkPred (`LeanNative.Tests.HeapObjContract ++ p.toName)
+    unless errs.isEmpty do throwError "XFAIL predicates: {errs}"
+    IO.println s!"XFAIL meta check: {preds.length} predicates reach the evaluator/emitter/validator; self-test rejected {bad.length} malformed"
 LEAN
 
 cargo check --locked --release -j 1

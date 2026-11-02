@@ -21,7 +21,8 @@ emits unguarded `isExclusive` / unloaded projections. `allocCtor` with **empty**
 `allocHeapCtor` and returns an `.objPtr` (a heap allocation with `rc = 1`), violating the fieldless-ctor exception of
 §C1.1. §8 column "today" records which clauses hold on `main` (**pass**: 12 of them flipped when #280 landed) and
 which are explicit **expected failures** (**XFAIL**). The 5b PR (#300) flips 19 of the 20 remaining XFAILs to
-**pass**; `codegen_projection_guarded_field_load` stays XFAIL for the checker reason given in §8.
+**pass**. Track **C6** flips the last one, `codegen_projection_guarded_field_load`, and discharges every
+**UNCOVERED** clause, so the table is **54/54 PASS**, **0 XFAIL**, **0 UNCOVERED**.
 
 ## Terminology
 
@@ -263,11 +264,11 @@ XFAIL on `main`. Flipped by #300 (now **pass**, 19 of the 20 remaining XFAILs): 
 `wf_objFields_no_nested_tuple_ownership`, `del_shared_is_ub`, `del_exclusive_preserves_fields`,
 `ctor_set_out_of_bounds_is_error`, `ctor_set_nested_tuple_ownership_rejected`, `mutation_freed_is_error`,
 `symtv_fuel_exhaustion_fails_closed`, `symtv_source_fuel_exhaustion_fails_closed`. Their pinned `#guard_msgs` now
-show the contract output. The one remaining XFAIL is `codegen_projection_guarded_field_load`: #300 emits
-the guarded load at `P + 8`, but returns it through a slot whose store is in another basic block (`proj_heap_7` →
-`proj_cont_10`), and the conservative block-local reload rule (`IRCheck.Fn.reachingStore`) resolves that reload
-to `uninitOrigin`. That regression flips only once the emitter returns the loaded value without a cross-block
-slot round-trip, or once the reload rule is made CFG-aware.
+show the contract output. Track **C6** flips the last XFAIL, `codegen_projection_guarded_field_load`: the emitter
+still stores the guarded field load into the destination slot, but the continuation reuses the dominating SSA
+value instead of reloading that slot across basic blocks, so `IRCheck.Fn.reachingStore` no longer has to resolve a
+cross-block reload. C6 also replaces every **UNCOVERED** marker with a passing regression, so the table below is
+**54/54 PASS**.
 
 | Clause | Regression | today | XFAIL expectation |
 |---|---|---|---|
@@ -279,6 +280,7 @@ slot round-trip, or once the reload rule is made CFG-aware.
 | C1.1 scalar index bounded by `scalarFields` | `layout_scalar_oob_is_error` | pass | — |
 | C1.1 reads of a freed object are `useAfterFree` | `layout_freed_read_is_error` | pass | — |
 | C1.2 Lean runtime offsets | `layout_lean_runtime_offsets` | pass | — |
+| C1.2 `getCtorLayout`-driven scalar-slot lowering | `layout_scalar_lowering_follows_getCtorLayout` | pass | — |
 | C2.1 abstract boxing is identity incl. `2^63`; in-pointer range `[0, 2^63)` | `box_abstract_high_bit_roundtrip` | pass | — |
 | C2.1 `i1/i8/i16/i32` boxed in-pointer (returns `lean_box(x)`) | `codegen_box_small_scalar_in_pointer` | pass | — |
 | C2.1 `UInt64` boxed as heap scalar carrying the value (`2^63` regression) | `codegen_box_u64_high_bit` | pass | — |
@@ -290,7 +292,7 @@ slot round-trip, or once the reload rule is made CFG-aware.
 | C1.1/C2.1 nullary ctor is immediate `.tuple [.u64 t]`, heap unchanged | `nullary_ctor_is_immediate` | pass | — |
 | C2.3 RC codegen checks tag bit | `codegen_rc_checks_tag_bit` | pass | — |
 | C2.3 `isExclusive` codegen checks tag bit (P-cert C5) | `codegen_isExclusive_checks_tag_bit` | pass | — |
-| C2.3 projection returns a guarded load from `P + 8 + 8·i` (structural) | `codegen_projection_guarded_field_load` | XFAIL | `#guard !projectionGuardedLoad` |
+| C2.3 projection returns a guarded load from `P + 8 + 8·i` (structural) | `codegen_projection_guarded_field_load` | pass | — |
 | C2.3 fallback: tag reads with no lowering are rejected | `codegen_tag_read_rejected` | pass | — |
 | C2.3 fallback: a decl with an unguarded dereference is rejected | `codegen_unguarded_decl_rejected` | pass | — |
 | C2.1 nullary ctor emitted as `lean_box(t)` | `codegen_nullary_ctor_boxed` | pass | — |
@@ -302,6 +304,8 @@ slot round-trip, or once the reload rule is made CFG-aware.
 | C3.3 `incRef` on a freed object is `useAfterFree` | `incref_freed_is_error` | pass | — |
 | C3.4 / C5.1 P-cert C3 reproducer (100 edges) | `c3_100_owning_edges` | pass | — |
 | C5.3 fuel bound `B` exact (`B` ok, `B − 1` exhausts) on C3/chain/diamond/mixed | `fuel_bound_boundary` | pass | — |
+| C5.1 distinguished `UBError.fuelExhausted` on release exhaustion + cyclic heap error | `decref_fuelExhausted_ctor_distinguished` | pass | — |
+| C5.4 underfueled `decRefObjFuel` / `decRefValsFuel` is `.fuelExhausted` | `decref_underfueled_helpers_total_or_error` | pass | — |
 | C5.2 nested tuple ownership is ill-formed (`allocCtor` of a malformed `.tuple [.u64 0, .objPtr c]` field is `typeError`) | `wf_objFields_no_nested_tuple_ownership` | pass | — |
 | C5.2 ctor-to-ctor nesting is well-formed and accepted | `wf_objFields_ctor_nesting_accepted` | pass | — |
 | C5.1 release path total-or-error (chain, every evaluator fuel 0..64) | `decref_chain_total_or_error` | pass | — |
@@ -310,6 +314,8 @@ slot round-trip, or once the reload rule is made CFG-aware.
 | C4.1 `isExclusive` of a freed object is `useAfterFree` | `isExclusive_freed_is_error` | pass | — |
 | C4.2 shared `ctor_set` is UB | `ctor_set_shared_is_ub` | pass | — |
 | C4.2 exclusive `ctor_set` succeeds | `ctor_set_exclusive_ok` | pass | — |
+| C4.2 scalar-slot `ctor_set` (`uset`/`sset`) exclusivity and bounds | `ctor_set_scalar_slot_exclusive_shared_freed` | pass | — |
+| C4.2 `setTag` exclusivity (exclusive / shared / freed) | `set_tag_exclusive_shared_freed` | pass | — |
 | C4.2 shared `del` is UB | `del_shared_is_ub` | pass | — |
 | C4.2 `ctor_set` / `del` on a freed object is `useAfterFree` | `mutation_freed_is_error` | pass | — |
 | C4.2 exclusive `del` frees the shell and preserves references owned by its fields | `del_exclusive_preserves_fields` | pass | — |
@@ -319,6 +325,7 @@ slot round-trip, or once the reload rule is made CFG-aware.
 | C6.1 fuel exhaustion ⇒ `passed = false` | `symtv_fuel_exhaustion_fails_closed` | pass | — |
 | C6.2 untracked RC effects ⇒ `passed = false` | `symtv_rc_effects_fail_closed` | pass | — |
 | C6.3 source evaluator-fuel exhaustion counts as failure, not source UB | `symtv_source_fuel_exhaustion_fails_closed` | pass | — |
+| C6.3 concrete RC/heap-exhaustion sample is `.fuelExhausted` | `symtv_rc_exhaustion_sample_fails_closed` | pass | — |
 
 To flip an xfail in 5b:
 1. Replace `#guard !p` with `#guard p`.
@@ -355,16 +362,8 @@ compound `#guard !(… && false)` and a regression without a guard.
 
 ### UNCOVERED clauses
 
-Some clauses have no behaviour on `main` that a regression can observe, because the operation, helper or code path
-does not exist yet. Such a clause is listed here and marked `-- UNCOVERED(<id>)` in the module, together with
-the reason. Nothing here is counted as covered. 5b must replace each entry with a regression in the table above.
-`ci_verify.sh` fails if this list and the module's `UNCOVERED` markers disagree.
-
-| UNCOVERED id | Why no regression on `main` |
-|---|---|
-| `C5.1-fuelExhausted-ctor` | `main` (#280) releases recursively but has no `UBError.fuelExhausted` (its `decRefObjFuel 0 st _ _ = .ok st`), so there is no distinguished exhaustion error to assert; the counting rule is pinned by `fuel_bound_boundary`. |
-| `C5.4-underfueled-helper` | `main`'s `decRefObjFuel` returns a partial `.ok` at fuel `0` and there is no `fuelExhausted` constructor to expect; `decRefValsFuel` does not exist. |
-| `C1.2-scalar-lowering` | `main`'s emitter has no `getCtorLayout`-driven `lean_ctor_get_usize`/`_uintN` lowering; only the Lean layout itself is pinned (`layout_lean_runtime_offsets`). |
-| `C4.2-uset-sset` | `main` has no scalar-slot `ctor_set` (`uset`/`sset`) call name, so scalar-slot bounds and exclusivity cannot be exercised. |
-| `C4.2-setTag` | `main` has no `setTag` / `lean_ctor_set_tag` operation or call name, so there is nothing to call. |
-| `C6.3-rc-exhaustion-sample` | `main`'s `evalCode` has no RC/heap-exhaustion error (#280's release returns `.ok` when its fuel runs out), so no concrete sample can produce one. |
+None. Track C6 replaced every previously uncovered clause with a named regression in the table above
+(`layout_scalar_lowering_follows_getCtorLayout`, `decref_fuelExhausted_ctor_distinguished`,
+`decref_underfueled_helpers_total_or_error`, `ctor_set_scalar_slot_exclusive_shared_freed`,
+`set_tag_exclusive_shared_freed`, `symtv_rc_exhaustion_sample_fails_closed`). `ci_verify.sh` still fails if a
+`-- UNCOVERED(<id>)` marker reappears in the module without a matching row here.
