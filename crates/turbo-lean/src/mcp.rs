@@ -1701,6 +1701,11 @@ pub fn handle_mcp_jsonrpc_request(
     }
     let id = id_opt.unwrap_or(serde_json::Value::Null);
 
+    // New request, new Lake-input memo window: this server outlives many edits, so it must never
+    // answer from the input bytes a previous request read. See
+    // `module_builder::reset_lake_inputs_tag_memo`.
+    crate::module_builder::reset_lake_inputs_tag_memo();
+
     match method {
         "initialize" => Some(serde_json::json!({
             "jsonrpc": "2.0", "id": id,
@@ -1951,6 +1956,7 @@ pub fn handle_mcp_jsonrpc_request(
 /// Read the next JSON-RPC 2.0 message from `reader`, supporting both:
 /// 1. `Content-Length: <N>\r\n\r\n<payload>` framed MCP messages, and
 /// 2. Newline-delimited JSON-RPC 2.0 lines (`{...}\n`).
+///
 /// Returns `Ok(Some((request_value, was_content_length_framed)))` or `Ok(None)` on EOF.
 pub fn read_next_mcp_message<R: BufRead>(
     reader: &mut R,

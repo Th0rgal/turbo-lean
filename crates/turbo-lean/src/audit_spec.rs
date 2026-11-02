@@ -429,9 +429,7 @@ pub(super) fn extract_local_def_unfoldings(clean_src: &str) -> Vec<LocalDefUnfol
         }
         if line == "end" || line.starts_with("end ") {
             let end_ns = line.strip_prefix("end").unwrap_or("").trim();
-            if end_ns.is_empty() {
-                current_ns.clear();
-            } else if current_ns == end_ns {
+            if end_ns.is_empty() || current_ns == end_ns {
                 current_ns.clear();
             } else if let Some(prefix) = current_ns.strip_suffix(&format!(".{}", end_ns)) {
                 current_ns = prefix.to_string();
@@ -459,13 +457,10 @@ pub(super) fn extract_local_def_unfoldings(clean_src: &str) -> Vec<LocalDefUnfol
                 break;
             }
         }
-        let rest_kw = if let Some(r) = line.strip_prefix("def ") {
-            Some(r.trim())
-        } else if let Some(r) = line.strip_prefix("abbrev ") {
-            Some(r.trim())
-        } else {
-            None
-        };
+        let rest_kw = line
+            .strip_prefix("def ")
+            .or_else(|| line.strip_prefix("abbrev "))
+            .map(str::trim);
         let Some(first_rest) = rest_kw else {
             idx += 1;
             continue;
@@ -1787,6 +1782,7 @@ pub(super) fn audit_single_decl_spec_full(
     (res, pos_w, neg_w, drop_hyps)
 }
 
+#[allow(clippy::type_complexity)]
 pub(super) fn audit_single_decl_spec_full_with_policy(
     decl: &ExtractedDecl,
     local_defs: &[LocalDefUnfolding],

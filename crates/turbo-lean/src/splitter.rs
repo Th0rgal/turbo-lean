@@ -1473,10 +1473,13 @@ fn is_pattern_match_arm_at(bytes: &[u8], pipe_idx: usize) -> bool {
                     return true;
                 }
             }
-            b':' if paren == 0 && bracket == 0 && brace == 0 => {
-                if j + 1 < bytes.len() && bytes[j + 1] == b'=' {
-                    return false;
-                }
+            b':' if paren == 0
+                && bracket == 0
+                && brace == 0
+                && j + 1 < bytes.len()
+                && bytes[j + 1] == b'=' =>
+            {
+                return false;
             }
             _ => {}
         }
@@ -1747,12 +1750,10 @@ fn extract_ident_tokens(s: &str) -> Vec<String> {
 
     for (idx, ch) in s.char_indices() {
         if is_lean_ident_continuation(ch) {
-            if cur_start.is_none() {
-                if !ch.is_ascii_digit() {
-                    cur_start = Some(idx);
-                    if qual_start.is_none() {
-                        qual_start = Some(idx);
-                    }
+            if cur_start.is_none() && !ch.is_ascii_digit() {
+                cur_start = Some(idx);
+                if qual_start.is_none() {
+                    qual_start = Some(idx);
                 }
             }
         } else {
@@ -1895,6 +1896,7 @@ fn register_prior_decl(
     prior_decls.push(entry);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_cone_env_hash_for_theorem(
     dep_interface_hashes: &[String],
     dep_scope_hasher: &blake3::Hasher,
@@ -1923,7 +1925,7 @@ fn compute_cone_env_hash_for_theorem(
     };
 
     if !prior_decls.is_empty() {
-        let num_words = (prior_decls.len() + 63) / 64;
+        let num_words = prior_decls.len().div_ceil(64);
         let mut thm_cone = vec![0u64; num_words];
         for tok in extract_ident_tokens(sig_clean)
             .into_iter()
@@ -2652,8 +2654,8 @@ fn split_lean_source_inner(
                 let mut prefix_accum = String::new();
                 if !omit_shard_source {
                     prefix_accum.reserve(src.len());
-                    for i in 0..target_idx {
-                        prefix_accum.push_str(&span_skel_orig[i]);
+                    for skel in span_skel_orig.iter().take(target_idx) {
+                        prefix_accum.push_str(skel);
                         prefix_accum.push('\n');
                     }
                 }
@@ -2797,7 +2799,7 @@ fn split_lean_source_inner(
                     }
                 }
                 if prior_decls.len() > mutual_start_idx + 1 {
-                    let mut union_bits = vec![0u64; (prior_decls.len() + 63) / 64];
+                    let mut union_bits = vec![0u64; prior_decls.len().div_ceil(64)];
                     for entry in &prior_decls[mutual_start_idx..] {
                         for (dst, &src) in union_bits.iter_mut().zip(entry.cone_bits.iter()) {
                             *dst |= src;

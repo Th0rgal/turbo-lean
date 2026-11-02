@@ -117,6 +117,7 @@ pub fn is_safe_lean_env_key(key: &str) -> bool {
         "LEAN_STACK_SIZE_KB"
             | "TURBO_LEAN_ZYGOTE_MAX_CHECKPOINTS"
             | "TURBO_LEAN_CALLER_CWD"
+            | "TURBO_LEAN_PROJECT_DIR"
             | "LEAN_NATIVE_TELEMETRY"
             | "LEAN_NATIVE_TELEMETRY_DIR"
             | "SANDBOXED_TELEMETRY_BATCH_ONLY"
@@ -301,7 +302,7 @@ pub fn serve_cas_http_with_auth(
                 if !lp.is_empty() {
                     // Ensure at least two idle workers in the server's Zygote pool have
                     // `TurboLean.FastCheck` and `TurboLean.Reflection` warm in their in-memory `envCache`.
-                    let _ = std::thread::scope(|s| {
+                    std::thread::scope(|s| {
                         let root_ref = store_root_owned.as_deref();
                         let lp_ref = &lp;
                         let env_ref = &env_vars;
@@ -439,6 +440,12 @@ pub fn serve_cas_http_with_auth(
         let expected_token_clone = expected_token.clone();
 
         std::thread::spawn(move || {
+            // New request, new Lake-input memo window: a daemon must never answer from the input
+            // bytes a previous request read. Opened here on the handler thread rather than on the
+            // accept loop, so the window belongs to the request that does the reading and a
+            // rejected 503 opens none. Concurrent handlers are safe because every memo entry
+            // records its window; see `module_builder::reset_lake_inputs_tag_memo`.
+            crate::module_builder::reset_lake_inputs_tag_memo();
             struct ConnDropGuard(std::sync::Arc<std::sync::Mutex<ServerActivity>>);
             impl Drop for ConnDropGuard {
                 fn drop(&mut self) {
@@ -1040,6 +1047,66 @@ pub fn serve_cas_http_with_auth(
                     if let Some(ref c) = req.cwd {
                         env_vars.insert("TURBO_LEAN_CALLER_CWD".to_string(), c.clone());
                     }
+                    let eval_proj_opt = env_vars
+                        .get("TURBO_LEAN_PROJECT_DIR")
+                        .filter(|s| !s.is_empty())
+                        .map(std::path::PathBuf::from)
+                        .or_else(|| {
+                            req.file_name
+                                .as_deref()
+                                .filter(|s| !s.is_empty())
+                                .and_then(|f| {
+                                    let p = Path::new(f);
+                                    if p.is_absolute() {
+                                        Some(crate::lake_build::infer_project_dir_from_lean_file(p))
+                                    } else {
+                                        req.cwd.as_deref().map(|c| {
+                                            crate::lake_build::infer_project_dir_from_lean_file(
+                                                &Path::new(c).join(p),
+                                            )
+                                        })
+                                    }
+                                })
+                        })
+                        .or_else(|| {
+                            req.cwd
+                                .as_deref()
+                                .filter(|s| !s.is_empty())
+                                .map(Path::new)
+                                .filter(|p| crate::lake_build::has_lake_config(p))
+                                .map(crate::lake_build::find_project_root)
+                        });
+                    if let Some(ref proj_dir) = eval_proj_opt {
+                        if let Err(e) = crate::module_builder::try_project_lake_inputs_tag(proj_dir)
+                        {
+                            let msg = format!("{:#}", e);
+                            let _ = write_json_response(
+                                &mut stream,
+                                200,
+                                &serde_json::json!({
+                                    "ok": false,
+                                    "kernel_gate_active": false,
+                                    "import_ok": false,
+                                    "env_cache_hit": false,
+                                    "prefix_cache_hit": false,
+                                    "import_us": 0,
+                                    "prefix_us": 0,
+                                    "elab_us": 0,
+                                    "heartbeats": 0,
+                                    "stdout": "",
+                                    "messages": [msg.clone()],
+                                    "errors": [msg],
+                                    "timed_out": false,
+                                    "crashed": false,
+                                    "deterministic": true
+                                }),
+                            );
+                            return;
+                        }
+                        env_vars
+                            .entry("TURBO_LEAN_PROJECT_DIR".to_string())
+                            .or_insert_with(|| proj_dir.to_string_lossy().to_string());
+                    }
                     if !req.lean_path.is_empty() {
                         env_vars.insert("LEAN_PATH".to_string(), req.lean_path.clone());
                     } else {
@@ -1371,6 +1438,16 @@ fn execute_check_shard_payload_deferred_with_domain(
         anyhow::bail!("Missing shard_key or shard_source in /check-shard request");
     }
 
+    // The Lake file inputs a shard's project declares reach this cache through `req.shard_key`,
+    // which the client derives from `prefix_env_hash` -- and that now folds in
+    // `module_builder::project_lake_inputs_tag`. The server deliberately does not re-derive it: it
+    // has the shard source and nothing else, no checkout and no lakefile, so it cannot know what
+    // the requester declared. It is a content-addressed store keyed by whatever the requester
+    // computed, and a requester whose inputs changed presents a different key here.
+    //
+    // The converse also holds for the elaboration below: a shard that reads a declared input
+    // cannot be verified remotely at all, because the file is not on this host -- `include_str`
+    // fails to resolve rather than silently reading different bytes.
     let filtered_req_args = crate::module_builder::validate_effective_lean_args(&req.lean_args)?;
     let req_args_digest_opt = crate::module_builder::compute_lean_args_digest(&filtered_req_args)?;
     let cache_key = option_bound_http_key(&req.shard_key, req_args_digest_opt.as_deref());
@@ -1982,6 +2059,7 @@ pub(crate) fn execute_fastcheck_payload(
     Ok(metrics)
 }
 
+#[allow(clippy::type_complexity)]
 fn execute_fastcheck_payload_deferred(
     store: &TurboStore,
     req: &FastCheckHttpRequest,

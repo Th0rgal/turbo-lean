@@ -702,6 +702,7 @@ impl TurboStore {
     /// Read and validate the 24-byte footer and `[index_off..footer_off]` index slice of
     /// `file_splits.sst` via positional `Seek + read_exact` (never loading the value pages into RAM),
     /// gated by `c_abi::verify_sst_block` and `c_abi::verify_ios_jetsam_budget`.
+    #[allow(clippy::type_complexity)]
     fn leansys_sst_read_index(file: &mut fs::File) -> Option<(u64, Vec<(String, u64, usize)>)> {
         use std::io::{Read, Seek, SeekFrom};
         let file_size = file.metadata().ok()?.len();
@@ -1367,6 +1368,7 @@ impl TurboStore {
         let waiters_path = locks_dir.join(format!("{}.waiters", action_key));
         let lock_file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)?;
@@ -1384,6 +1386,7 @@ impl TurboStore {
             let mut counted_by_leader = false;
             if let Ok(mut wf) = OpenOptions::new()
                 .create(true)
+                .truncate(false)
                 .read(true)
                 .write(true)
                 .open(&waiters_path)
@@ -1391,10 +1394,11 @@ impl TurboStore {
                 let wfd = wf.as_raw_fd();
                 if unsafe { libc::flock(wfd, libc::LOCK_EX) } == 0 {
                     let mut buf = Vec::new();
-                    if wf.read_to_end(&mut buf).is_ok() && !buf.starts_with(b"S") {
-                        if wf.write_all(b"1").is_ok() {
-                            counted_by_leader = true;
-                        }
+                    if wf.read_to_end(&mut buf).is_ok()
+                        && !buf.starts_with(b"S")
+                        && wf.write_all(b"1").is_ok()
+                    {
+                        counted_by_leader = true;
                     }
                     unsafe {
                         libc::flock(wfd, libc::LOCK_UN);

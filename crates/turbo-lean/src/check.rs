@@ -998,6 +998,7 @@ fn cache_shm_stat_split(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_remote_decl_result(
     json_output: bool,
     emit_stdout: bool,
@@ -1087,6 +1088,7 @@ pub fn run_check_command_value(
     parallel_shards: bool,
     remote_http: Option<String>,
 ) -> Result<serde_json::Value> {
+    crate::module_builder::reset_lake_inputs_tag_memo();
     run_check_command_inner(
         store,
         db_warm_on_open,
@@ -1108,6 +1110,7 @@ pub fn evaluate_check_command_value(
     decl: Option<String>,
     project_dir: PathBuf,
 ) -> Result<serde_json::Value> {
+    crate::module_builder::reset_lake_inputs_tag_memo();
     run_check_command_inner(
         store,
         true,
@@ -1133,12 +1136,17 @@ type StatelessRemoteInit = (
     splitter::SplitResult,
 );
 
-fn prepare_stateless_remote_file(file: &Path, project_dir: &Path) -> Option<StatelessRemoteInit> {
+fn prepare_stateless_remote_file(
+    file: &Path,
+    project_dir: &Path,
+) -> Result<Option<StatelessRemoteInit>> {
+    crate::module_builder::reset_lake_inputs_tag_memo();
     let canon_dir = project_dir
         .canonicalize()
         .unwrap_or_else(|_| project_dir.to_path_buf());
+    crate::module_builder::try_project_lake_inputs_tag(&canon_dir)?;
     let resolved_file = if file == Path::new(".") {
-        return None;
+        return Ok(None);
     } else if file.is_relative() && canon_dir.join(file).exists() {
         canon_dir.join(file)
     } else if file.exists() {
@@ -1147,14 +1155,22 @@ fn prepare_stateless_remote_file(file: &Path, project_dir: &Path) -> Option<Stat
         canon_dir.join(file)
     };
     if resolved_file.is_dir() || !resolved_file.exists() {
-        return None;
+        return Ok(None);
     }
-    let active_src = fs::read_to_string(&resolved_file)
-        .ok()
-        .filter(|s| s.len() <= 64 * 1024)?;
-    let canon_file = resolved_file
-        .canonicalize()
-        .unwrap_or_else(|_| resolved_file);
+    let Ok(active_src) = fs::read_to_string(&resolved_file) else {
+        return Ok(None);
+    };
+    if active_src.len() > 64 * 1024 {
+        return Ok(None);
+    }
+    let canon_file = match resolved_file.canonicalize() {
+        Ok(p) => p,
+        Err(_) => resolved_file,
+    };
+    crate::lake_build::ensure_project_imports_fresh_for_check(
+        &canon_dir,
+        std::slice::from_ref(&canon_file),
+    )?;
     let toolchain = detect_toolchain(&canon_dir);
     let effective_tc = if toolchain.is_empty() || toolchain == "unknown" {
         "leanprover/lean4:v4.35.0".to_string()
@@ -1164,7 +1180,7 @@ fn prepare_stateless_remote_file(file: &Path, project_dir: &Path) -> Option<Stat
     let local_lean_path = resolve_remote_lean_path(&canon_dir, None);
     let dep_hashes = compute_imported_olean_interface_hashes(&active_src, &canon_dir, None);
     let split = splitter::split_lean_source_fast_no_cone(&active_src, &dep_hashes);
-    Some((
+    Ok(Some((
         canon_dir,
         canon_file,
         active_src,
@@ -1173,7 +1189,7 @@ fn prepare_stateless_remote_file(file: &Path, project_dir: &Path) -> Option<Stat
         local_lean_path,
         dep_hashes,
         split,
-    ))
+    )))
 }
 
 fn rollback_inflight(store_opt: &Option<TurboStore>, inflight_tx_open: bool) {
@@ -1264,7 +1280,7 @@ pub fn try_stateless_remote_check(
         local_lean_path,
         dep_hashes,
         split,
-    )) = prepare_stateless_remote_file(file, project_dir)
+    )) = prepare_stateless_remote_file(file, project_dir)?
     else {
         return Ok(false);
     };
@@ -1486,7 +1502,7 @@ pub fn try_stateless_remote_single_decl_check(
         local_lean_path,
         dep_hashes,
         split,
-    )) = prepare_stateless_remote_file(file, project_dir)
+    )) = prepare_stateless_remote_file(file, project_dir)?
     else {
         return Ok(false);
     };
@@ -1705,6 +1721,8 @@ pub fn run_check_command(
     parallel_shards: bool,
     remote_http: Option<String>,
 ) -> Result<()> {
+    // One top-level command, one Lake-input memo window.
+    crate::module_builder::reset_lake_inputs_tag_memo();
     run_check_command_inner(
         store,
         db_warm_on_open,
@@ -1738,6 +1756,7 @@ fn run_check_command_inner(
     let canon_dir = project_dir
         .canonicalize()
         .unwrap_or_else(|_| project_dir.clone());
+    crate::module_builder::try_project_lake_inputs_tag(&canon_dir)?;
     let toolchain = detect_toolchain(&canon_dir);
     let resolved_file = if file == Path::new(".") {
         canon_dir.clone()
@@ -1822,7 +1841,7 @@ fn run_check_command_inner(
         known_modified_vs_head = c.known_modified;
         let cb3 = (!c.src_blake3.is_empty()).then_some(c.src_blake3);
         (c.prefix_src, cb3, c.split, 1usize)
-    } else if let Some((pref_src, fast_sp, 0)) = file_stat_tuple
+    } else if let Some((pref_src, fast_sp, 0, fast_deps)) = file_stat_tuple
         .filter(|(_, _, sz)| *sz > 64 * 1024)
         .and_then(|(_, _, sz)| {
             try_fast_split_single_file_from_path(
@@ -1836,15 +1855,13 @@ fn run_check_command_inner(
     {
         known_modified_vs_head = true;
         if let Some((ref st_path, _)) = st_paths_opt {
-            let dep_hashes =
-                compute_imported_olean_interface_hashes(&fast_sp.imports_header, &canon_dir, None);
             let entry = ShmCachedFileSplit {
                 split_key: String::new(),
                 src_blake3: String::new(),
                 split: compact_split_for_shm_cache(&fast_sp),
                 prefix_src: pref_src.clone(),
                 known_modified: true,
-                dep_hashes,
+                dep_hashes: fast_deps,
             };
             if let Ok(bytes) = serde_json::to_vec(&entry) {
                 let _ = crate::shm_cache::atomic_write_shm(st_path, &bytes);
@@ -1880,6 +1897,7 @@ fn run_check_command_inner(
             &canon_resolved_initial,
             &loaded_src,
             &toolchain,
+            &dep_hashes,
         ) {
             if fast_res.1 == 0 {
                 known_modified_vs_head = true;
@@ -2113,6 +2131,7 @@ fn check_directory(
             );
             pack::warm_local_zygote_daemon_nonblocking(store, &fast_ev);
         }
+        crate::lake_build::recheck_dependents_if_nonlocal(store, canon_dir, resolved_file)?;
         return Ok(out_json);
     }
 
@@ -2139,6 +2158,7 @@ fn check_directory(
             }
         }
     }
+    #[allow(clippy::type_complexity)]
     let uncached_files: Vec<(
         PathBuf,
         String,
@@ -2182,8 +2202,9 @@ fn check_directory(
     } else {
         resolve_lake_env(store, canon_dir)?
     };
-    let lean_bin = resolve_lean_bin(&canon_dir)?;
+    let lean_bin = resolve_lean_bin(canon_dir)?;
 
+    #[allow(clippy::type_complexity)]
     let mut cross_verified_items: Option<Vec<(String, String, Vec<u8>, i64)>> = None;
     let mut cross_verify_mode = "cross_file_coalesced_shards";
     let lean_path_str = if proj_build_verified
@@ -3216,10 +3237,10 @@ fn check_single_decl(
                     let lp = resolve_remote_lean_path(canon_dir, None);
                     let mut fast_ev = HashMap::new();
                     fast_ev.insert("LEAN_PATH".to_string(), lp.clone());
-                    (fast_ev, db_warm_on_open, resolve_lean_bin(&canon_dir)?, lp)
+                    (fast_ev, db_warm_on_open, resolve_lean_bin(canon_dir)?, lp)
                 } else {
                     let (ev, ech) = resolve_lake_env(store, canon_dir)?;
-                    let lb = resolve_lean_bin(&canon_dir)?;
+                    let lb = resolve_lean_bin(canon_dir)?;
                     let lp = resolve_remote_lean_path(canon_dir, Some(&ev));
                     (ev, ech, lb, lp)
                 };
@@ -3279,7 +3300,7 @@ fn check_single_decl(
                 if !cached_subs.is_empty() || fission_cold_enabled {
                     if env_vars.len() <= 1 {
                         let (ev, ech) = resolve_lake_env(store, canon_dir)?;
-                        lean_bin = resolve_lean_bin(&canon_dir)?;
+                        lean_bin = resolve_lean_bin(canon_dir)?;
                         env_vars = ev;
                         env_cache_hit = ech;
                     }
@@ -3728,7 +3749,7 @@ fn check_single_decl(
 
             if !verified_via_zygote && env_vars.is_empty() && fast_local_zygote_url.is_none() {
                 let (ev, ech) = resolve_lake_env(store, canon_dir)?;
-                lean_bin = resolve_lean_bin(&canon_dir)?;
+                lean_bin = resolve_lean_bin(canon_dir)?;
                 env_vars = ev;
                 env_cache_hit = ech;
             }
@@ -3745,7 +3766,6 @@ fn check_single_decl(
                         apply_zygote_json!(&zjson);
                     }
                 }
-                drop(try_zygote_src);
                 if !verified_via_zygote
                     && last_daemon_verify_err.is_none()
                     && !decl_src.is_empty()
@@ -3814,7 +3834,7 @@ fn check_single_decl(
                             if !cand_decls.is_empty() {
                                 if env_vars.len() <= 1 {
                                     let (ev, ech) = resolve_lake_env(store, canon_dir)?;
-                                    lean_bin = resolve_lean_bin(&canon_dir)?;
+                                    lean_bin = resolve_lean_bin(canon_dir)?;
                                     env_vars = ev;
                                     env_cache_hit = ech;
                                 }
@@ -4275,7 +4295,7 @@ fn check_single_file(
                 let existing_daemon = crate::zygote::has_active_local_zygote_daemon(store);
                 if !existing_daemon {
                     if let Ok((ev, _)) = resolve_lake_env(store, canon_dir) {
-                        let lb = resolve_lean_bin(&canon_dir)?;
+                        let lb = resolve_lean_bin(canon_dir)?;
                         let lp = resolve_remote_lean_path(canon_dir, Some(&ev));
                         let _ = crate::zygote::try_local_zygote_eval_with_args(
                             store,
@@ -4412,7 +4432,7 @@ fn check_single_file(
                     anyhow::bail!(
                         "Remote batch shard check failed on {}: {}",
                         remote_url,
-                        r.error.unwrap_or_else(|| r.stderr)
+                        r.error.unwrap_or(r.stderr)
                     );
                 }
                 remote_resp = Some(r);
@@ -4485,10 +4505,10 @@ fn check_single_file(
             let lp = resolve_remote_lean_path(canon_dir, None);
             let mut fast_ev = HashMap::new();
             fast_ev.insert("LEAN_PATH".to_string(), lp.clone());
-            (fast_ev, db_warm_on_open, resolve_lean_bin(&canon_dir)?, lp)
+            (fast_ev, db_warm_on_open, resolve_lean_bin(canon_dir)?, lp)
         } else {
             let (ev, ech) = resolve_lake_env(store, canon_dir)?;
-            let lb = resolve_lean_bin(&canon_dir)?;
+            let lb = resolve_lean_bin(canon_dir)?;
             let lp = if fast_lib_lean.exists() || has_pkg_lib_dir {
                 resolve_remote_lean_path(canon_dir, None)
             } else {
@@ -4700,26 +4720,28 @@ fn check_single_file(
             let next_idx = std::sync::atomic::AtomicUsize::new(0);
             let abort_flag = std::sync::atomic::AtomicBool::new(false);
             let src_ref: &str = src.as_str();
-            let worker_results: Vec<Result<Vec<(String, &splitter::TheoremShard, i64)>>> =
-                std::thread::scope(|s| {
-                    let mut handles = Vec::with_capacity(effective_jobs);
-                    for _worker_id in 0..effective_jobs {
-                        let next_idx_ref = &next_idx;
-                        let abort_ref = &abort_flag;
-                        let uncached_ref = &uncached_shards;
-                        let canon_ref = canon_dir;
-                        let env_ref = &env_vars;
-                        let lean_bin_ref = &lean_bin;
-                        let file_display = file.display().to_string();
-                        let z_url_ref = local_zygote_url.as_deref();
-                        let tc_ref = toolchain;
-                        let lp_ref = &local_lean_path;
-                        let iface_ref = &split.interface_hash;
-                        let args_ref = &file_lean_args;
+            #[allow(clippy::type_complexity)]
+            let worker_results: Vec<
+                Result<Vec<(String, &splitter::TheoremShard, i64)>>,
+            > = std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(effective_jobs);
+                for _worker_id in 0..effective_jobs {
+                    let next_idx_ref = &next_idx;
+                    let abort_ref = &abort_flag;
+                    let uncached_ref = &uncached_shards;
+                    let canon_ref = canon_dir;
+                    let env_ref = &env_vars;
+                    let lean_bin_ref = &lean_bin;
+                    let file_display = file.display().to_string();
+                    let z_url_ref = local_zygote_url.as_deref();
+                    let tc_ref = toolchain;
+                    let lp_ref = &local_lean_path;
+                    let iface_ref = &split.interface_hash;
+                    let args_ref = &file_lean_args;
 
-                        let kth_ref = &attested_kths;
+                    let kth_ref = &attested_kths;
 
-                        handles.push(s.spawn(move || -> Result<Vec<(String, &splitter::TheoremShard, i64)>> {
+                    handles.push(s.spawn(move || -> Result<Vec<(String, &splitter::TheoremShard, i64)>> {
                             let worker_store = TurboStore::open(Some(store_root))?;
                             let mut verified = Vec::new();
                             loop {
@@ -4833,15 +4855,15 @@ fn check_single_file(
                             }
                             Ok(verified)
                         }));
-                    }
-                    handles
-                        .into_iter()
-                        .map(|h| {
-                            h.join()
-                                .unwrap_or_else(|_| Err(anyhow::anyhow!("Worker thread panicked")))
-                        })
-                        .collect()
-                });
+                }
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join()
+                            .unwrap_or_else(|_| Err(anyhow::anyhow!("Worker thread panicked")))
+                    })
+                    .collect()
+            });
 
             let mut verified = Vec::with_capacity(uncached_shards.len());
             let mut first_err: Option<anyhow::Error> = None;
@@ -5215,7 +5237,7 @@ fn parse_last_int_literal(s: &str) -> Option<i128> {
                 tok.parse::<i128>().ok()
             }
         })
-        .last()
+        .next_back()
 }
 
 fn strip_trailing_type_ascription(expr: &str) -> &str {

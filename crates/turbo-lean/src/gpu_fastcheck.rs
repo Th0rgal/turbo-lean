@@ -2922,6 +2922,7 @@ pub fn run_tpu_fast_check(json: bool, file: &Path, decl_filter: Option<&str>) ->
 }
 
 /// Execute `turbo-lean fast-check` with unified `--backend auto|cpu|gpu|tpu` routing.
+#[allow(clippy::too_many_arguments)]
 pub fn run_fast_check_command(
     store: &crate::db::TurboStore,
     json: bool,
@@ -3832,7 +3833,7 @@ fn eval_lean_expr_fast_with_domain(
                     let la = l.as_u64()?;
                     let rb = r.as_u64()?;
                     match op.as_str() {
-                        "/" => Some(FastVal::U64(if rb == 0 { 0 } else { dom.mask(la / rb) })),
+                        "/" => Some(FastVal::U64(la.checked_div(rb).map_or(0, |q| dom.mask(q)))),
                         "%" => Some(FastVal::U64(if rb == 0 {
                             dom.mask(la)
                         } else {
@@ -4486,9 +4487,10 @@ fn resolve_agent_step_env_and_paths(
     let inferred_proj_dir = project_dir
         .map(Path::to_path_buf)
         .unwrap_or_else(|| crate::lake_build::find_project_root(file));
-    let canon_dir = inferred_proj_dir
-        .canonicalize()
-        .unwrap_or(inferred_proj_dir);
+    let canon_dir = match inferred_proj_dir.canonicalize() {
+        Ok(p) => p,
+        Err(_) => inferred_proj_dir,
+    };
     let resolved_file = if file.exists() {
         file.to_path_buf()
     } else if canon_dir.join(file).exists() {
@@ -4504,6 +4506,7 @@ fn resolve_agent_step_env_and_paths(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_eval_decl_stage1_cex_json(
     d: &ExtractedDecl,
     file: &Path,
@@ -4668,6 +4671,16 @@ pub(crate) fn extract_confirmed_fastcheck_pairs(
     project_dir: &Path,
     file: &Path,
 ) -> Result<Vec<(String, String)>> {
+    let canon_dir = match project_dir.canonicalize() {
+        Ok(p) => p,
+        Err(_) => project_dir.to_path_buf(),
+    };
+    let canon_resolved = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+    crate::module_builder::try_project_lake_inputs_tag(&canon_dir)?;
+    crate::lake_build::ensure_project_imports_fresh_for_check(
+        &canon_dir,
+        std::slice::from_ref(&canon_resolved),
+    )?;
     let split = crate::splitter::split_lean_source_fast_no_cone(src, &[]);
     let shards: Vec<&crate::splitter::TheoremShard> = match decl_filter
         .filter(|t| !t.is_empty() && *t != "auto")
@@ -4687,7 +4700,7 @@ pub(crate) fn extract_confirmed_fastcheck_pairs(
         );
     }
     for shard in &shards {
-        crate::check::confirm_decl_identity(src, shard, project_dir, file)?;
+        crate::check::confirm_decl_identity(src, shard, &canon_dir, file)?;
     }
     let pairs: Vec<(String, String)> = shards
         .into_iter()
@@ -4720,6 +4733,14 @@ pub fn try_stateless_agent_step_cex(
     let Ok(src_text) = fs::read_to_string(&resolved_file) else {
         return Ok(None);
     };
+    let canon_resolved = resolved_file
+        .canonicalize()
+        .unwrap_or_else(|_| resolved_file.clone());
+    crate::module_builder::try_project_lake_inputs_tag(&canon_dir)?;
+    crate::lake_build::ensure_project_imports_fresh_for_check(
+        &canon_dir,
+        std::slice::from_ref(&canon_resolved),
+    )?;
     let split = crate::splitter::split_lean_source_fast_no_cone(&src_text, &[]);
     let target_shards: Vec<&crate::splitter::TheoremShard> =
         match decl_filter.filter(|t| !t.is_empty() && *t != "auto") {
@@ -4841,6 +4862,7 @@ pub fn evaluate_agent_step_value(
     use_tpu: bool,
 ) -> Result<serde_json::Value> {
     let t0 = Instant::now();
+    crate::module_builder::reset_lake_inputs_tag_memo();
     let (max_memory_mb, effective_low_memory, canon_dir, resolved_file) =
         resolve_agent_step_env_and_paths(file, project_dir, low_memory, use_tpu);
 
@@ -4880,6 +4902,11 @@ pub fn evaluate_agent_step_value(
         let canon_resolved = resolved_file
             .canonicalize()
             .unwrap_or_else(|_| resolved_file.clone());
+        crate::module_builder::try_project_lake_inputs_tag(&canon_dir)?;
+        crate::lake_build::ensure_project_imports_fresh_for_check(
+            &canon_dir,
+            std::slice::from_ref(&canon_resolved),
+        )?;
         let st_path_opt = fs::metadata(&canon_resolved)
             .ok()
             .map(|m| crate::db::TurboStore::extract_file_stat_tuple(&m))
@@ -4894,7 +4921,14 @@ pub fn evaluate_agent_step_value(
             .as_ref()
             .and_then(|st_path| fs::read(st_path).ok())
             .and_then(|b| serde_json::from_slice::<crate::lake_build::ShmCachedFileSplit>(&b).ok())
-            .filter(|c| c.src_blake3 == src_b3)
+            .filter(|c| {
+                c.src_blake3 == src_b3
+                    && crate::lake_build::compute_imported_olean_interface_hashes(
+                        &c.split.imports_header,
+                        &canon_dir,
+                        None,
+                    ) == c.dep_hashes
+            })
             .map(|c| c.split);
         let split = match st_split_opt {
             Some(sp) => sp,
@@ -5779,7 +5813,7 @@ theorem masked_trivial (x : Nat) : AlwaysTrue x := by trivial
         assert_eq!(rep_unf["ok"].as_bool(), Some(false));
         assert_eq!(rep_unf["vacuous_specs"].as_u64(), Some(1));
         assert_eq!(rep_unf["trivial_specs"].as_u64(), Some(1));
-        assert_eq!(rep_unf["specs"][0]["pos_witness"].as_str().is_some(), true);
+        assert!(rep_unf["specs"][0]["pos_witness"].as_str().is_some());
         assert_eq!(
             rep_unf["specs"][1]["neg_witness"].as_str(),
             Some("none(tautological_postcondition)")

@@ -596,6 +596,7 @@ pub fn try_stateless_noop_pull_sync(store_root: &Path, base_url: &str) -> bool {
     }
 }
 
+#[allow(clippy::type_complexity)]
 pub fn try_stateless_push_sync(
     store_root: &Path,
     base_url: &str,
@@ -1038,6 +1039,7 @@ pub fn export_pack_filtered_with_mode_and_signing_key(
         ))
     })?;
 
+    #[allow(clippy::type_complexity)]
     let mut cur_meta: Option<(
         String,
         String,
@@ -1356,6 +1358,7 @@ pub fn try_parse_v3_header(input_bytes: &[u8]) -> Option<PackManifest> {
     serde_json::from_slice::<PackManifest>(&input_bytes[16..16 + header_len]).ok()
 }
 
+#[allow(clippy::type_complexity)]
 pub fn prestage_blobs_from_shared_cas(
     store_root: &Path,
     manifest: &PackManifest,
@@ -1656,6 +1659,7 @@ pub(crate) fn try_import_from_shared_cas_with_domain(
     Ok(Some(res))
 }
 
+#[allow(clippy::type_complexity)]
 pub fn try_read_and_prestage_pack(
     store_root: &Path,
     input_path: &Path,
@@ -1828,6 +1832,7 @@ pub fn import_pack_bytes_with_policy(
         }
     }
 
+    #[allow(clippy::type_complexity)]
     let process_chunk = |chunk: &[(&PackedBlob, &[u8])],
                          root_dir: &Path,
                          #[cfg_attr(unix, allow(unused_variables))] staging_dir_ref: &Path,
@@ -1919,7 +1924,7 @@ pub fn import_pack_bytes_with_policy(
             .unwrap_or(4)
             .min(slices.len().max(1))
             .max(1);
-        let chunk_size = (slices.len() + n_threads - 1) / n_threads;
+        let chunk_size = slices.len().div_ceil(n_threads);
         let store_root = store.root.clone();
         let staging_dir_ref = &staging_dir;
         let new_prefixes_ref = &newly_created_prefix;
@@ -2416,6 +2421,7 @@ pub(crate) fn resolve_http_auth_token(url: &str, explicit: Option<&str>) -> Opti
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn http_request_full(
     method: &str,
     url: &str,
@@ -2955,6 +2961,352 @@ pub fn offload_check_shards_batch_http(
     Ok(resp)
 }
 
+#[allow(clippy::type_complexity)]
+pub type PrefetchedExportItem = (
+    Vec<u8>,
+    Option<(PackManifest, Vec<(String, String, i64, i64)>, usize)>,
+);
+
+/// Execute `turbo-lean export`.
+pub fn run_export_command(
+    store: &TurboStore,
+    json: bool,
+    output: std::path::PathBuf,
+    portable_only: bool,
+    signing_key: Option<String>,
+) -> Result<()> {
+    let (acts, blobs, bytes) =
+        export_pack_with_signing_key(store, &output, portable_only, signing_key.as_deref())?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "exported_actions": acts, "exported_blobs": blobs,
+                "raw_bytes": bytes, "archive": output.display().to_string()
+            }))?
+        );
+    } else {
+        println!(
+            "[turbo-lean] Exported {} actions and {} portable blobs ({:.2} MiB raw) to {}",
+            acts,
+            blobs,
+            bytes as f64 / (1024.0 * 1024.0),
+            output.display()
+        );
+    }
+    Ok(())
+}
+
+/// Execute `turbo-lean import`.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn run_import_command(
+    store: &mut TurboStore,
+    json: bool,
+    input: std::path::PathBuf,
+    trust_domain: Option<String>,
+    trusted_pubkey: Option<String>,
+    allow_unattested_trusted: bool,
+    expected_sha256: Option<String>,
+    prefetched: Option<
+        std::thread::JoinHandle<Option<(PackManifest, Vec<(String, String, i64, i64)>, usize)>>,
+    >,
+) -> Result<()> {
+    let req_td = trust_domain.as_deref();
+    let pk_opt = trusted_pubkey.as_deref();
+    let env_sha = std::env::var("TURBO_LEAN_PACK_EXPECTED_SHA256")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let sha_opt = expected_sha256.as_deref().or(env_sha.as_deref());
+    let (acts, blobs) = if let Some(exp_sha) = sha_opt {
+        if let Some(h) = prefetched {
+            let _ = h.join();
+        }
+        let raw_bytes = fs::read(&input)
+            .with_context(|| format!("Failed to read pack file {}", input.display()))?;
+        verify_optional_sha256(
+            &raw_bytes,
+            None,
+            Some(exp_sha),
+            &input.display().to_string(),
+        )?;
+        import_pack_bytes_with_policy(store, &raw_bytes, req_td, pk_opt, allow_unattested_trusted)?
+    } else if let Some((manifest, staged_blobs, newly_written)) =
+        prefetched.and_then(|h| h.join().ok().flatten())
+    {
+        let td =
+            resolve_pack_import_trust_domain(&manifest, req_td, pk_opt, allow_unattested_trusted)?;
+        finish_import_from_prestaged_shared_cas_with_domain(
+            store,
+            &manifest,
+            &staged_blobs,
+            newly_written,
+            td,
+        )?
+    } else {
+        import_pack_with_policy(store, &input, req_td, pk_opt, allow_unattested_trusted)?
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "imported_actions": acts, "imported_blobs": blobs, "archive": input.display().to_string()
+            }))?
+        );
+    } else {
+        println!(
+            "[turbo-lean] Imported & BLAKE3-verified {} actions and {} blobs from {}",
+            acts,
+            blobs,
+            input.display()
+        );
+    }
+    Ok(())
+}
+
+/// Execute `turbo-lean sync`.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn run_sync_command(
+    store: &mut TurboStore,
+    json: bool,
+    remote: String,
+    push: bool,
+    bidirectional: bool,
+    trust_domain: Option<String>,
+    trusted_pubkey: Option<String>,
+    allow_unattested_trusted: bool,
+    expected_sha256: Option<String>,
+    mut prefetched_export: Option<std::thread::JoinHandle<Result<PrefetchedExportItem>>>,
+    mut prefetched_manifest: Option<std::thread::JoinHandle<Option<DeltaManifest>>>,
+) -> Result<()> {
+    let t0 = std::time::Instant::now();
+    if !remote.starts_with("http://") && !remote.starts_with("https://") {
+        anyhow::bail!(
+            "Unsupported remote scheme `{}` (use http://host:port or export/import)",
+            remote
+        );
+    }
+    let req_td = trust_domain.as_deref();
+    let pk_opt = trusted_pubkey.as_deref();
+    let sha_opt = expected_sha256.as_deref();
+    let print_sync_report = |mode: &str,
+                             pulled: (usize, usize),
+                             pulled_bytes: u64,
+                             pushed: (usize, usize, u64),
+                             pushed_pack_bytes: u64,
+                             delta_push_noop: bool|
+     -> Result<()> {
+        let elapsed_ms = t0.elapsed().as_millis();
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "synced", "mode": mode, "remote": remote,
+                    "pulled_actions": pulled.0, "pulled_blobs": pulled.1, "pulled_pack_bytes": pulled_bytes,
+                    "pushed_actions": pushed.0, "pushed_blobs": pushed.1, "pushed_raw_bytes": pushed.2,
+                    "pushed_pack_bytes": pushed_pack_bytes, "delta_push_noop": delta_push_noop, "elapsed_ms": elapsed_ms
+                }))?
+            );
+        } else if mode == "push_only" {
+            println!(
+                "[turbo-lean] Delta-pushed to {} in {} ms: {} actions ({} blobs, {} bytes)",
+                remote, elapsed_ms, pushed.0, pushed.1, pushed_pack_bytes
+            );
+        } else {
+            println!("[turbo-lean] Synced with {} in {} ms: pulled {} actions ({} blobs), pushed {} actions ({} blobs)", remote, elapsed_ms, pulled.0, pulled.1, pushed.0, pushed.1);
+        }
+        Ok(())
+    };
+
+    if push && !bidirectional {
+        let pre_man = prefetched_manifest
+            .take()
+            .and_then(|h| h.join().ok().flatten());
+        let (pushed_acts, pushed_blobs, pushed_raw, pushed_pack, delta_push_noop) =
+            sync_push_http_with_manifest(store, &remote, true, pre_man)?;
+        return print_sync_report(
+            "push_only",
+            (0, 0),
+            0,
+            (pushed_acts, pushed_blobs, pushed_raw),
+            pushed_pack,
+            delta_push_noop,
+        );
+    }
+    if !bidirectional {
+        let mut pulled = (0usize, 0usize);
+        let mut pulled_bytes = 0u64;
+        if let Some(handle) = prefetched_export.take() {
+            match handle.join() {
+                Ok(Ok((pack_bytes, prestaged_opt))) => {
+                    verify_optional_sha256(&pack_bytes, None, sha_opt, &remote)?;
+                    if !pack_bytes.is_empty() {
+                        pulled =
+                            if let Some((manifest, staged_blobs, newly_written)) = prestaged_opt {
+                                let td = resolve_pack_import_trust_domain(
+                                    &manifest,
+                                    req_td,
+                                    pk_opt,
+                                    allow_unattested_trusted,
+                                )?;
+                                finish_import_from_prestaged_shared_cas_with_domain(
+                                    store,
+                                    &manifest,
+                                    &staged_blobs,
+                                    newly_written,
+                                    td,
+                                )?
+                            } else {
+                                import_pack_bytes_with_policy(
+                                    store,
+                                    &pack_bytes,
+                                    req_td,
+                                    pk_opt,
+                                    allow_unattested_trusted,
+                                )?
+                            };
+                        if pulled.0 > 0 || pulled.1 > 0 {
+                            pulled_bytes = pack_bytes.len() as u64;
+                        }
+                    }
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    (pulled, pulled_bytes) = sync_pull_http_with_policy(
+                        store,
+                        &remote,
+                        true,
+                        req_td,
+                        pk_opt,
+                        allow_unattested_trusted,
+                        sha_opt,
+                    )?
+                }
+            }
+        } else {
+            (pulled, pulled_bytes) = sync_pull_http_with_policy(
+                store,
+                &remote,
+                true,
+                req_td,
+                pk_opt,
+                allow_unattested_trusted,
+                sha_opt,
+            )?;
+        }
+        return print_sync_report("bidirectional", pulled, pulled_bytes, (0, 0, 0), 0, true);
+    }
+
+    let base = remote.trim_end_matches('/');
+    let local_manifest = get_store_manifest(store, true)?;
+    let mut pulled = (0usize, 0usize);
+    let mut pulled_bytes = 0u64;
+    let mut pushed = (0usize, 0usize, 0u64);
+    let mut pushed_pack_bytes = 0u64;
+
+    if local_manifest.action_keys.is_empty() && local_manifest.blob_hashes.is_empty() {
+        let pack_bytes = http_request_with_expected_sha256(
+            "GET",
+            &format!("{}/export", base),
+            "application/octet-stream",
+            &[],
+            sha_opt,
+        )?;
+        if !pack_bytes.is_empty() {
+            pulled = import_pack_bytes_with_policy(
+                store,
+                &pack_bytes,
+                req_td,
+                pk_opt,
+                allow_unattested_trusted,
+            )?;
+            if pulled.0 > 0 || pulled.1 > 0 {
+                pulled_bytes = pack_bytes.len() as u64;
+            }
+        }
+    } else {
+        let local_action_set: std::collections::HashSet<String> =
+            local_manifest.action_keys.iter().cloned().collect();
+        let local_blob_set: std::collections::HashSet<String> =
+            local_manifest.blob_hashes.iter().cloned().collect();
+        let remote_manifest: DeltaManifest = http_request(
+            "GET",
+            &format!("{}/manifest", base),
+            "application/json",
+            &[],
+        )
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+        let remote_action_set: std::collections::HashSet<String> =
+            remote_manifest.action_keys.iter().cloned().collect();
+        let remote_blob_set: std::collections::HashSet<String> =
+            remote_manifest.blob_hashes.iter().cloned().collect();
+
+        let need_pull = remote_manifest
+            .action_keys
+            .iter()
+            .any(|k| !local_action_set.contains(k))
+            || remote_manifest
+                .blob_hashes
+                .iter()
+                .any(|b| !local_blob_set.contains(b));
+        if need_pull {
+            let delta_req = serde_json::to_vec(&ExportDeltaRequest {
+                exclude_actions: local_manifest.action_keys.clone(),
+                exclude_blobs: local_manifest.blob_hashes.clone(),
+            })?;
+            let pack_bytes = http_request_with_expected_sha256(
+                "POST",
+                &format!("{}/export-delta", base),
+                "application/json",
+                &delta_req,
+                sha_opt,
+            )?;
+            if !pack_bytes.is_empty() {
+                pulled_bytes = pack_bytes.len() as u64;
+                pulled = import_pack_bytes_with_policy(
+                    store,
+                    &pack_bytes,
+                    req_td,
+                    pk_opt,
+                    allow_unattested_trusted,
+                )?;
+            }
+        }
+
+        let need_push = local_manifest
+            .action_keys
+            .iter()
+            .any(|k| !remote_action_set.contains(k))
+            || local_manifest
+                .blob_hashes
+                .iter()
+                .any(|b| !remote_blob_set.contains(b));
+        if need_push {
+            let (p_acts, p_blobs, p_raw, push_bytes) =
+                export_pack_filtered_bytes(store, true, &remote_action_set, &remote_blob_set)?;
+            pushed = (p_acts, p_blobs, p_raw);
+            if pushed.0 > 0 || pushed.1 > 0 {
+                pushed_pack_bytes = push_bytes.len() as u64;
+                let _ = http_request(
+                    "POST",
+                    &format!("{}/import-delta", base),
+                    "application/octet-stream",
+                    &push_bytes,
+                )?;
+            }
+        }
+    }
+    print_sync_report(
+        "bidirectional",
+        pulled,
+        pulled_bytes,
+        pushed,
+        pushed_pack_bytes,
+        pushed.0 == 0 && pushed.1 == 0,
+    )
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -3381,7 +3733,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    fn spawn_test_server(dir_server: &Path) -> Result<String> {
+    pub(crate) fn spawn_test_server(dir_server: &Path) -> Result<String> {
         let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
         let (srv_dir, addr) = (dir_server.to_path_buf(), format!("127.0.0.1:{}", port));
         let addr_clone = addr.clone();
@@ -3509,6 +3861,12 @@ pub(crate) mod tests {
 
         // Permissive server (`*`) must still enforce a strict caller's `allowed_axioms = Some(vec![])`
         // and reject a `bv_decide` shard instead of admitting or caching it under the strict policy.
+        // `TURBO_LEAN_ALLOWED_AXIOMS` is otherwise mutated under `BWRAP_TEST_ENV_LOCK` (`check`,
+        // `mcp`, `zygote`). Take it here too, after the `env_test_lock` held above, so the axiom
+        // policy has a single owning lock and no key-reading test can observe a half-applied one.
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let prev_allow = std::env::var(crate::splitter::ALLOWED_AXIOMS_ENV).ok();
         std::env::set_var(crate::splitter::ALLOWED_AXIOMS_ENV, "*");
         let strict_bv_req = CheckShardHttpRequest {
@@ -3545,7 +3903,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    fn spawn_authed_test_server(dir_server: &Path, token: &str) -> Result<String> {
+    pub(crate) fn spawn_authed_test_server(dir_server: &Path, token: &str) -> Result<String> {
         let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
         let (srv_dir, addr, tok) = (
             dir_server.to_path_buf(),
@@ -4493,347 +4851,4 @@ pub(crate) mod tests {
         let _ = fs::remove_dir_all(&dir_wt);
         Ok(())
     }
-}
-
-pub type PrefetchedExportItem = (
-    Vec<u8>,
-    Option<(PackManifest, Vec<(String, String, i64, i64)>, usize)>,
-);
-
-/// Execute `turbo-lean export`.
-pub fn run_export_command(
-    store: &TurboStore,
-    json: bool,
-    output: std::path::PathBuf,
-    portable_only: bool,
-    signing_key: Option<String>,
-) -> Result<()> {
-    let (acts, blobs, bytes) =
-        export_pack_with_signing_key(store, &output, portable_only, signing_key.as_deref())?;
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "exported_actions": acts, "exported_blobs": blobs,
-                "raw_bytes": bytes, "archive": output.display().to_string()
-            }))?
-        );
-    } else {
-        println!(
-            "[turbo-lean] Exported {} actions and {} portable blobs ({:.2} MiB raw) to {}",
-            acts,
-            blobs,
-            bytes as f64 / (1024.0 * 1024.0),
-            output.display()
-        );
-    }
-    Ok(())
-}
-
-/// Execute `turbo-lean import`.
-pub fn run_import_command(
-    store: &mut TurboStore,
-    json: bool,
-    input: std::path::PathBuf,
-    trust_domain: Option<String>,
-    trusted_pubkey: Option<String>,
-    allow_unattested_trusted: bool,
-    expected_sha256: Option<String>,
-    prefetched: Option<
-        std::thread::JoinHandle<Option<(PackManifest, Vec<(String, String, i64, i64)>, usize)>>,
-    >,
-) -> Result<()> {
-    let req_td = trust_domain.as_deref();
-    let pk_opt = trusted_pubkey.as_deref();
-    let env_sha = std::env::var("TURBO_LEAN_PACK_EXPECTED_SHA256")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
-    let sha_opt = expected_sha256.as_deref().or(env_sha.as_deref());
-    let (acts, blobs) = if let Some(exp_sha) = sha_opt {
-        if let Some(h) = prefetched {
-            let _ = h.join();
-        }
-        let raw_bytes = fs::read(&input)
-            .with_context(|| format!("Failed to read pack file {}", input.display()))?;
-        verify_optional_sha256(
-            &raw_bytes,
-            None,
-            Some(exp_sha),
-            &input.display().to_string(),
-        )?;
-        import_pack_bytes_with_policy(store, &raw_bytes, req_td, pk_opt, allow_unattested_trusted)?
-    } else if let Some((manifest, staged_blobs, newly_written)) =
-        prefetched.and_then(|h| h.join().ok().flatten())
-    {
-        let td =
-            resolve_pack_import_trust_domain(&manifest, req_td, pk_opt, allow_unattested_trusted)?;
-        finish_import_from_prestaged_shared_cas_with_domain(
-            store,
-            &manifest,
-            &staged_blobs,
-            newly_written,
-            td,
-        )?
-    } else {
-        import_pack_with_policy(store, &input, req_td, pk_opt, allow_unattested_trusted)?
-    };
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "imported_actions": acts, "imported_blobs": blobs, "archive": input.display().to_string()
-            }))?
-        );
-    } else {
-        println!(
-            "[turbo-lean] Imported & BLAKE3-verified {} actions and {} blobs from {}",
-            acts,
-            blobs,
-            input.display()
-        );
-    }
-    Ok(())
-}
-
-/// Execute `turbo-lean sync`.
-pub fn run_sync_command(
-    store: &mut TurboStore,
-    json: bool,
-    remote: String,
-    push: bool,
-    bidirectional: bool,
-    trust_domain: Option<String>,
-    trusted_pubkey: Option<String>,
-    allow_unattested_trusted: bool,
-    expected_sha256: Option<String>,
-    mut prefetched_export: Option<std::thread::JoinHandle<Result<PrefetchedExportItem>>>,
-    mut prefetched_manifest: Option<std::thread::JoinHandle<Option<DeltaManifest>>>,
-) -> Result<()> {
-    let t0 = std::time::Instant::now();
-    if !remote.starts_with("http://") && !remote.starts_with("https://") {
-        anyhow::bail!(
-            "Unsupported remote scheme `{}` (use http://host:port or export/import)",
-            remote
-        );
-    }
-    let req_td = trust_domain.as_deref();
-    let pk_opt = trusted_pubkey.as_deref();
-    let sha_opt = expected_sha256.as_deref();
-    let print_sync_report = |mode: &str,
-                             pulled: (usize, usize),
-                             pulled_bytes: u64,
-                             pushed: (usize, usize, u64),
-                             pushed_pack_bytes: u64,
-                             delta_push_noop: bool|
-     -> Result<()> {
-        let elapsed_ms = t0.elapsed().as_millis();
-        if json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "status": "synced", "mode": mode, "remote": remote,
-                    "pulled_actions": pulled.0, "pulled_blobs": pulled.1, "pulled_pack_bytes": pulled_bytes,
-                    "pushed_actions": pushed.0, "pushed_blobs": pushed.1, "pushed_raw_bytes": pushed.2,
-                    "pushed_pack_bytes": pushed_pack_bytes, "delta_push_noop": delta_push_noop, "elapsed_ms": elapsed_ms
-                }))?
-            );
-        } else if mode == "push_only" {
-            println!(
-                "[turbo-lean] Delta-pushed to {} in {} ms: {} actions ({} blobs, {} bytes)",
-                remote, elapsed_ms, pushed.0, pushed.1, pushed_pack_bytes
-            );
-        } else {
-            println!("[turbo-lean] Synced with {} in {} ms: pulled {} actions ({} blobs), pushed {} actions ({} blobs)", remote, elapsed_ms, pulled.0, pulled.1, pushed.0, pushed.1);
-        }
-        Ok(())
-    };
-
-    if push && !bidirectional {
-        let pre_man = prefetched_manifest
-            .take()
-            .and_then(|h| h.join().ok().flatten());
-        let (pushed_acts, pushed_blobs, pushed_raw, pushed_pack, delta_push_noop) =
-            sync_push_http_with_manifest(store, &remote, true, pre_man)?;
-        return print_sync_report(
-            "push_only",
-            (0, 0),
-            0,
-            (pushed_acts, pushed_blobs, pushed_raw),
-            pushed_pack,
-            delta_push_noop,
-        );
-    }
-    if !bidirectional {
-        let mut pulled = (0usize, 0usize);
-        let mut pulled_bytes = 0u64;
-        if let Some(handle) = prefetched_export.take() {
-            match handle.join() {
-                Ok(Ok((pack_bytes, prestaged_opt))) => {
-                    verify_optional_sha256(&pack_bytes, None, sha_opt, &remote)?;
-                    if !pack_bytes.is_empty() {
-                        pulled =
-                            if let Some((manifest, staged_blobs, newly_written)) = prestaged_opt {
-                                let td = resolve_pack_import_trust_domain(
-                                    &manifest,
-                                    req_td,
-                                    pk_opt,
-                                    allow_unattested_trusted,
-                                )?;
-                                finish_import_from_prestaged_shared_cas_with_domain(
-                                    store,
-                                    &manifest,
-                                    &staged_blobs,
-                                    newly_written,
-                                    td,
-                                )?
-                            } else {
-                                import_pack_bytes_with_policy(
-                                    store,
-                                    &pack_bytes,
-                                    req_td,
-                                    pk_opt,
-                                    allow_unattested_trusted,
-                                )?
-                            };
-                        if pulled.0 > 0 || pulled.1 > 0 {
-                            pulled_bytes = pack_bytes.len() as u64;
-                        }
-                    }
-                }
-                Ok(Err(e)) => return Err(e),
-                Err(_) => {
-                    (pulled, pulled_bytes) = sync_pull_http_with_policy(
-                        store,
-                        &remote,
-                        true,
-                        req_td,
-                        pk_opt,
-                        allow_unattested_trusted,
-                        sha_opt,
-                    )?
-                }
-            }
-        } else {
-            (pulled, pulled_bytes) = sync_pull_http_with_policy(
-                store,
-                &remote,
-                true,
-                req_td,
-                pk_opt,
-                allow_unattested_trusted,
-                sha_opt,
-            )?;
-        }
-        return print_sync_report("bidirectional", pulled, pulled_bytes, (0, 0, 0), 0, true);
-    }
-
-    let base = remote.trim_end_matches('/');
-    let local_manifest = get_store_manifest(store, true)?;
-    let mut pulled = (0usize, 0usize);
-    let mut pulled_bytes = 0u64;
-    let mut pushed = (0usize, 0usize, 0u64);
-    let mut pushed_pack_bytes = 0u64;
-
-    if local_manifest.action_keys.is_empty() && local_manifest.blob_hashes.is_empty() {
-        let pack_bytes = http_request_with_expected_sha256(
-            "GET",
-            &format!("{}/export", base),
-            "application/octet-stream",
-            &[],
-            sha_opt,
-        )?;
-        if !pack_bytes.is_empty() {
-            pulled = import_pack_bytes_with_policy(
-                store,
-                &pack_bytes,
-                req_td,
-                pk_opt,
-                allow_unattested_trusted,
-            )?;
-            if pulled.0 > 0 || pulled.1 > 0 {
-                pulled_bytes = pack_bytes.len() as u64;
-            }
-        }
-    } else {
-        let local_action_set: std::collections::HashSet<String> =
-            local_manifest.action_keys.iter().cloned().collect();
-        let local_blob_set: std::collections::HashSet<String> =
-            local_manifest.blob_hashes.iter().cloned().collect();
-        let remote_manifest: DeltaManifest = http_request(
-            "GET",
-            &format!("{}/manifest", base),
-            "application/json",
-            &[],
-        )
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default();
-        let remote_action_set: std::collections::HashSet<String> =
-            remote_manifest.action_keys.iter().cloned().collect();
-        let remote_blob_set: std::collections::HashSet<String> =
-            remote_manifest.blob_hashes.iter().cloned().collect();
-
-        let need_pull = remote_manifest
-            .action_keys
-            .iter()
-            .any(|k| !local_action_set.contains(k))
-            || remote_manifest
-                .blob_hashes
-                .iter()
-                .any(|b| !local_blob_set.contains(b));
-        if need_pull {
-            let delta_req = serde_json::to_vec(&ExportDeltaRequest {
-                exclude_actions: local_manifest.action_keys.clone(),
-                exclude_blobs: local_manifest.blob_hashes.clone(),
-            })?;
-            let pack_bytes = http_request_with_expected_sha256(
-                "POST",
-                &format!("{}/export-delta", base),
-                "application/json",
-                &delta_req,
-                sha_opt,
-            )?;
-            if !pack_bytes.is_empty() {
-                pulled_bytes = pack_bytes.len() as u64;
-                pulled = import_pack_bytes_with_policy(
-                    store,
-                    &pack_bytes,
-                    req_td,
-                    pk_opt,
-                    allow_unattested_trusted,
-                )?;
-            }
-        }
-
-        let need_push = local_manifest
-            .action_keys
-            .iter()
-            .any(|k| !remote_action_set.contains(k))
-            || local_manifest
-                .blob_hashes
-                .iter()
-                .any(|b| !remote_blob_set.contains(b));
-        if need_push {
-            let (p_acts, p_blobs, p_raw, push_bytes) =
-                export_pack_filtered_bytes(store, true, &remote_action_set, &remote_blob_set)?;
-            pushed = (p_acts, p_blobs, p_raw);
-            if pushed.0 > 0 || pushed.1 > 0 {
-                pushed_pack_bytes = push_bytes.len() as u64;
-                let _ = http_request(
-                    "POST",
-                    &format!("{}/import-delta", base),
-                    "application/octet-stream",
-                    &push_bytes,
-                )?;
-            }
-        }
-    }
-    print_sync_report(
-        "bidirectional",
-        pulled,
-        pulled_bytes,
-        pushed,
-        pushed_pack_bytes,
-        pushed.0 == 0 && pushed.1 == 0,
-    )
 }
