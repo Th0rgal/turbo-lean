@@ -152,16 +152,21 @@ theorem rangesDisjoint_ne_in_bounds (b1 s1 b2 s2 i j : Nat)
   have hor : b1 + s1 ≤ b2 ∨ b2 + s2 ≤ b1 := of_decide_eq_true h_disj
   omega
 
-inductive MemCell where
-  | byte : BitVec 8 → MemCell
-  | int : (w : IntWidth) → BitVec w.bits → MemCell
-  | ptr : BitVec 64 → MemCell
-  | floatBits : (fw : FloatWidth) → BitVec fw.bits → MemCell
-  | poison : MemCell
+inductive MemByte where
+  | init : BitVec 8 → MemByte
+  | poisonByte : MemByte
+  deriving Repr, DecidableEq, Inhabited
+
+structure AllocBlock where
+  base : Nat
+  size : Nat
+  align : Nat
+  writable : Bool
   deriving Repr, DecidableEq, Inhabited
 
 structure ByteMem where
-  cells : List (Nat × MemCell) := []
+  cells : List (Nat × MemByte) := []
+  allocs : List AllocBlock := []
   nextAlloc : Nat := 4096
   deriving Repr, DecidableEq, Inhabited
 
@@ -169,36 +174,36 @@ namespace ByteMem
 
 def empty : ByteMem := {}
 
-def readCells (a : Nat) : List (Nat × MemCell) → Option MemCell
+def readCells (a : Nat) : List (Nat × MemByte) → Option MemByte
   | [] => none
   | (k, c) :: rest => if a == k then some c else readCells a rest
 
-def readAt (m : ByteMem) (a : Nat) : Option MemCell :=
+def readAt (m : ByteMem) (a : Nat) : Option MemByte :=
   readCells a m.cells
 
-def writeAt (m : ByteMem) (a : Nat) (c : MemCell) : ByteMem :=
+def writeAt (m : ByteMem) (a : Nat) (c : MemByte) : ByteMem :=
   { m with cells := (a, c) :: m.cells }
 
-theorem readAt_writeAt_same (m : ByteMem) (a : Nat) (c : MemCell) :
+theorem readAt_writeAt_same (m : ByteMem) (a : Nat) (c : MemByte) :
     (m.writeAt a c).readAt a = some c := by
   simp [readAt, writeAt, readCells]
 
-theorem readAt_writeAt_ne (m : ByteMem) (a1 a2 : Nat) (c : MemCell)
+theorem readAt_writeAt_ne (m : ByteMem) (a1 a2 : Nat) (c : MemByte)
     (hne : a1 ≠ a2) :
     (m.writeAt a1 c).readAt a2 = m.readAt a2 := by
   have hbeq : (a2 == a1) = false := beq_eq_false_iff_ne.mpr (Ne.symm hne)
   simp [readAt, writeAt, readCells, hbeq]
 
-def writeBytesAt (m : ByteMem) (base : Nat) : List (BitVec 8) → ByteMem
+def writeBytesAt (m : ByteMem) (base : Nat) : List MemByte → ByteMem
   | [] => m
-  | b :: bs => writeBytesAt (m.writeAt base (.byte b)) (base + 1) bs
+  | b :: bs => writeBytesAt (m.writeAt base b) (base + 1) bs
 
-def readByte (m : ByteMem) (a : Nat) : BitVec 8 :=
+def readByte (m : ByteMem) (a : Nat) : MemByte :=
   match m.readAt a with
-  | some (.byte b) => b
-  | _ => 0#8
+  | some b => b
+  | none => .init 0#8
 
-def readBytesAt (m : ByteMem) (base n : Nat) : List (BitVec 8) :=
+def readBytesAt (m : ByteMem) (base n : Nat) : List MemByte :=
   match n with
   | 0 => []
   | k + 1 => m.readByte base :: readBytesAt m (base + 1) k
@@ -210,7 +215,7 @@ theorem readBytesAt_length (m : ByteMem) (base n : Nat) :
   | succ k ih =>
     simp [readBytesAt, ih]
 
-theorem readAt_writeBytesAt_outside (m : ByteMem) (base : Nat) (bs : List (BitVec 8)) (q : Nat)
+theorem readAt_writeBytesAt_outside (m : ByteMem) (base : Nat) (bs : List MemByte) (q : Nat)
     (hout : q < base ∨ base + bs.length ≤ q) :
     (m.writeBytesAt base bs).readAt q = m.readAt q := by
   induction bs generalizing m base with
@@ -220,22 +225,22 @@ theorem readAt_writeBytesAt_outside (m : ByteMem) (base : Nat) (bs : List (BitVe
     have hne : base ≠ q := by omega
     have hout' : q < base + 1 ∨ (base + 1) + rest.length ≤ q := by omega
     simp only [writeBytesAt]
-    rw [ih (m.writeAt base (.byte b)) (base + 1) hout']
-    exact readAt_writeAt_ne m base q (.byte b) hne
+    rw [ih (m.writeAt base b) (base + 1) hout']
+    exact readAt_writeAt_ne m base q b hne
 
-theorem readBytesAt_writeBytesAt_same (m : ByteMem) (base : Nat) (bs : List (BitVec 8)) :
+theorem readBytesAt_writeBytesAt_same (m : ByteMem) (base : Nat) (bs : List MemByte) :
     (m.writeBytesAt base bs).readBytesAt base bs.length = bs := by
   induction bs generalizing m base with
   | nil => rfl
   | cons b rest ih =>
     simp only [List.length_cons, writeBytesAt, readBytesAt]
-    have hhead : ((m.writeAt base (.byte b)).writeBytesAt (base + 1) rest).readByte base = b := by
+    have hhead : ((m.writeAt base b).writeBytesAt (base + 1) rest).readByte base = b := by
       simp only [readByte]
-      rw [readAt_writeBytesAt_outside (m.writeAt base (.byte b)) (base + 1) rest base (Or.inl (by omega))]
+      rw [readAt_writeBytesAt_outside (m.writeAt base b) (base + 1) rest base (Or.inl (by omega))]
       simp [readAt_writeAt_same]
-    rw [hhead, ih (m.writeAt base (.byte b)) (base + 1)]
+    rw [hhead, ih (m.writeAt base b) (base + 1)]
 
-theorem readBytesAt_writeBytesAt_disjoint (m : ByteMem) (b1 : Nat) (bs : List (BitVec 8))
+theorem readBytesAt_writeBytesAt_disjoint (m : ByteMem) (b1 : Nat) (bs : List MemByte)
     (b2 n2 : Nat)
     (h_disj : rangesDisjoint b1 bs.length b2 n2 = true) :
     (m.writeBytesAt b1 bs).readBytesAt b2 n2 = m.readBytesAt b2 n2 := by
@@ -251,55 +256,255 @@ theorem readBytesAt_writeBytesAt_disjoint (m : ByteMem) (b1 : Nat) (bs : List (B
     have hor' : b1 + bs.length ≤ b2 + 1 ∨ b2 + 1 + k ≤ b1 := by omega
     rw [readAt_writeBytesAt_outside m b1 bs b2 hout, ih (b2 + 1) hdisj' hor']
 
-def storeInt (m : ByteMem) (addr : BitVec 64) (w : IntWidth) (v : BitVec w.bits) : ByteMem :=
-  m.writeAt addr.toNat (.int w v)
+def natToLEBytes : Nat → Nat → List (BitVec 8)
+  | 0, _ => []
+  | m + 1, x => BitVec.ofNat 8 (x % 256) :: natToLEBytes m (x / 256)
 
-def loadInt (m : ByteMem) (addr : BitVec 64) (w : IntWidth) : BitVec w.bits :=
-  match m.readAt addr.toNat with
-  | some (.int w' v) =>
-    if h : w' = w then h ▸ v else 0#w.bits
-  | _ => 0#w.bits
+def natFromLEBytes : List (BitVec 8) → Nat
+  | [] => 0
+  | b :: bs => b.toNat + 256 * natFromLEBytes bs
+
+theorem natFromLEBytes_lt (bs : List (BitVec 8)) :
+    natFromLEBytes bs < 256 ^ bs.length := by
+  induction bs with
+  | nil => simp [natFromLEBytes]
+  | cons b rest ih =>
+    simp only [natFromLEBytes, List.length_cons, Nat.pow_succ]
+    have hb : b.toNat < 256 := b.isLt
+    omega
+
+theorem natToLEBytes_length (n x : Nat) :
+    (natToLEBytes n x).length = n := by
+  induction n generalizing x with
+  | zero => rfl
+  | succ m ih => simp [natToLEBytes, ih]
+
+theorem natToLEBytes_take (m k x : Nat) (h : k ≤ m) :
+    (natToLEBytes m x).take k = natToLEBytes k x := by
+  induction k generalizing m x with
+  | zero => simp [natToLEBytes]
+  | succ k' ih =>
+    cases m with
+    | zero => omega
+    | succ m' =>
+      simp only [natToLEBytes, List.take_succ_cons]
+      rw [ih m' (x / 256) (by omega)]
+
+theorem natToLEBytes_drop (m k x : Nat) (h : k ≤ m) :
+    (natToLEBytes m x).drop k = natToLEBytes (m - k) (x / 256 ^ k) := by
+  induction k generalizing m x with
+  | zero => simp
+  | succ k' ih =>
+    cases m with
+    | zero => omega
+    | succ m' =>
+      simp only [natToLEBytes, List.drop_succ_cons, Nat.succ_sub_succ_eq_sub]
+      rw [ih m' (x / 256) (by omega), Nat.div_div_eq_div_mul, ← Nat.pow_succ']
+
+theorem natFromLEBytes_natToLEBytes_general (n x : Nat) :
+    natFromLEBytes (natToLEBytes n x) = x % 256 ^ n := by
+  induction n generalizing x with
+  | zero => simp [natToLEBytes, natFromLEBytes, Nat.mod_one]
+  | succ m ih =>
+    simp only [natToLEBytes, natFromLEBytes, ih (x / 256)]
+    have hmod8 : (BitVec.ofNat 8 (x % 256)).toNat = x % 256 := by
+      rw [BitVec.toNat_ofNat]
+      exact Nat.mod_eq_of_lt (Nat.mod_lt x (by decide))
+    rw [hmod8, Nat.pow_succ, Nat.mul_comm (256 ^ m) 256, Nat.mod_mul]
+
+theorem natFromLEBytes_subslice (m off n x : Nat) (h : off + n ≤ m) :
+    natFromLEBytes (((natToLEBytes m x).drop off).take n) = x / 256 ^ off % 256 ^ n := by
+  rw [natToLEBytes_drop m off x (by omega), natToLEBytes_take (m - off) n (x / 256 ^ off) (by omega),
+      natFromLEBytes_natToLEBytes_general]
+
+theorem bits_le_eight_mul_byteSize (w : IntWidth) : w.bits ≤ 8 * w.byteSize := by
+  cases w <;> decide
+
+theorem pow256_eq (n : Nat) : 256 ^ n = 2 ^ (8 * n) := by
+  have h256 : (256 : Nat) = 2 ^ 8 := by decide
+  rw [h256, ← Nat.pow_mul]
+
+theorem bits_le_byte_pow (w : IntWidth) : 2 ^ w.bits ≤ 256 ^ w.byteSize := by
+  rw [pow256_eq]
+  exact Nat.pow_le_pow_right (by decide) (bits_le_eight_mul_byteSize w)
+
+def bvToLEBytes {k : Nat} (n : Nat) (v : BitVec k) : List (BitVec 8) :=
+  natToLEBytes n v.toNat
+
+def bvFromLEBytes (k : Nat) (bs : List (BitVec 8)) : BitVec k :=
+  BitVec.ofNat k (natFromLEBytes bs)
+
+theorem bvFromLEBytes_bvToLEBytes {k : Nat} (n : Nat) (v : BitVec k)
+    (hk : k ≤ 8 * n) :
+    bvFromLEBytes k (bvToLEBytes n v) = v := by
+  unfold bvFromLEBytes bvToLEBytes
+  have hpow : 2 ^ k ≤ 256 ^ n := by
+    rw [pow256_eq]
+    exact Nat.pow_le_pow_right (by decide) hk
+  have hv : v.toNat < 256 ^ n := Nat.lt_of_lt_of_le v.isLt hpow
+  rw [natFromLEBytes_natToLEBytes_general, Nat.mod_eq_of_lt hv, BitVec.ofNat_toNat, BitVec.setWidth_eq]
+
+theorem bvFromLEBytes_subslice {k : Nat} (m off n : Nat) (v : BitVec k)
+    (h : off + n ≤ m) :
+    bvFromLEBytes (8 * n) (((bvToLEBytes m v).drop off).take n) =
+      BitVec.ofNat (8 * n) (v.toNat / 256 ^ off) := by
+  unfold bvFromLEBytes bvToLEBytes
+  rw [natFromLEBytes_subslice m off n v.toNat h, pow256_eq n]
+  apply BitVec.eq_of_toNat_eq
+  simp [BitVec.toNat_ofNat, Nat.mod_mod]
+
+def initBytes : List (BitVec 8) → List MemByte
+  | [] => []
+  | b :: bs => .init b :: initBytes bs
+
+def poisonBytes : Nat → List MemByte
+  | 0 => []
+  | k + 1 => .poisonByte :: poisonBytes k
+
+def bytesToNat? : List MemByte → Option Nat
+  | [] => some 0
+  | .init b :: bs => do
+    let rest ← bytesToNat? bs
+    pure (b.toNat + 256 * rest)
+  | .poisonByte :: _ => none
+
+def bytesToBv? (k : Nat) (bs : List MemByte) : Option (BitVec k) :=
+  (bytesToNat? bs).map (BitVec.ofNat k)
+
+theorem initBytes_length (bs : List (BitVec 8)) :
+    (initBytes bs).length = bs.length := by
+  induction bs with
+  | nil => rfl
+  | cons b rest ih => simp [initBytes, ih]
+
+theorem poisonBytes_length (n : Nat) :
+    (poisonBytes n).length = n := by
+  induction n with
+  | zero => rfl
+  | succ k ih => simp [poisonBytes, ih]
+
+theorem bytesToNat?_initBytes (bs : List (BitVec 8)) :
+    bytesToNat? (initBytes bs) = some (natFromLEBytes bs) := by
+  induction bs with
+  | nil => rfl
+  | cons b rest ih => simp [initBytes, bytesToNat?, natFromLEBytes, ih]
+
+theorem bytesToBv?_initBytes (k : Nat) (bs : List (BitVec 8)) :
+    bytesToBv? k (initBytes bs) = some (bvFromLEBytes k bs) := by
+  simp [bytesToBv?, bvFromLEBytes, bytesToNat?_initBytes]
+
+def storeInt (m : ByteMem) (addr : BitVec 64) (w : IntWidth) (v : BitVec w.bits) : ByteMem :=
+  m.writeBytesAt addr.toNat (initBytes (bvToLEBytes w.byteSize v))
+
+def loadInt? (m : ByteMem) (addr : BitVec 64) (w : IntWidth) : Option (BitVec w.bits) :=
+  bytesToBv? w.bits (m.readBytesAt addr.toNat w.byteSize)
 
 def storePtr (m : ByteMem) (addr ptrVal : BitVec 64) : ByteMem :=
-  m.writeAt addr.toNat (.ptr ptrVal)
+  m.storeInt addr .i64 ptrVal
 
-def loadPtr (m : ByteMem) (addr : BitVec 64) : BitVec 64 :=
-  match m.readAt addr.toNat with
-  | some (.ptr p) => p
-  | _ => 0#64
+def loadPtr? (m : ByteMem) (addr : BitVec 64) : Option (BitVec 64) :=
+  m.loadInt? addr .i64
 
 def storeFloatBits (m : ByteMem) (addr : BitVec 64) (fw : FloatWidth) (v : BitVec fw.bits) : ByteMem :=
-  m.writeAt addr.toNat (.floatBits fw v)
+  m.writeBytesAt addr.toNat (initBytes (bvToLEBytes fw.byteSize v))
 
-def loadFloatBits (m : ByteMem) (addr : BitVec 64) (fw : FloatWidth) : BitVec fw.bits :=
-  match m.readAt addr.toNat with
-  | some (.floatBits fw' v) =>
-    if h : fw' = fw then h ▸ v else 0#fw.bits
-  | _ => 0#fw.bits
+def loadFloatBits? (m : ByteMem) (addr : BitVec 64) (fw : FloatWidth) : Option (BitVec fw.bits) :=
+  bytesToBv? fw.bits (m.readBytesAt addr.toNat fw.byteSize)
 
-def storePoison (m : ByteMem) (addr : BitVec 64) : ByteMem :=
-  m.writeAt addr.toNat .poison
+def storePoison (m : ByteMem) (addr : BitVec 64) (n : Nat) : ByteMem :=
+  m.writeBytesAt addr.toNat (poisonBytes n)
 
-def isPoisonCell (m : ByteMem) (addr : BitVec 64) : Bool :=
-  match m.readAt addr.toNat with
-  | some .poison => true
-  | _ => false
+def isPoisonSlice (m : ByteMem) (addr : BitVec 64) (n : Nat) : Bool :=
+  (m.readBytesAt addr.toNat n).any (fun b => b == .poisonByte)
 
-theorem load_store_same (m : ByteMem) (addr : BitVec 64) (w : IntWidth) (v : BitVec w.bits) :
-    (m.storeInt addr w v).loadInt addr w = v := by
-  simp [storeInt, loadInt, readAt_writeAt_same]
+theorem loadInt?_storeInt_same (m : ByteMem) (addr : BitVec 64) (w : IntWidth) (v : BitVec w.bits) :
+    (m.storeInt addr w v).loadInt? addr w = some v := by
+  simp only [storeInt, loadInt?]
+  have hlen : (initBytes (bvToLEBytes w.byteSize v)).length = w.byteSize := by
+    rw [initBytes_length, bvToLEBytes, natToLEBytes_length]
+  have hrw := readBytesAt_writeBytesAt_same m addr.toNat (initBytes (bvToLEBytes w.byteSize v))
+  rw [hlen] at hrw
+  rw [hrw, bytesToBv?_initBytes, bvFromLEBytes_bvToLEBytes w.byteSize v (bits_le_eight_mul_byteSize w)]
 
-theorem load_store_disjoint (m : ByteMem) (a1 : BitVec 64) (w1 : IntWidth) (v : BitVec w1.bits)
+theorem loadInt?_storeInt_disjoint (m : ByteMem) (a1 : BitVec 64) (w1 : IntWidth) (v : BitVec w1.bits)
     (a2 : BitVec 64) (w2 : IntWidth)
     (h_disj : rangesDisjoint a1.toNat w1.byteSize a2.toNat w2.byteSize = true) :
-    (m.storeInt a1 w1 v).loadInt a2 w2 = m.loadInt a2 w2 := by
-  have hor : a1.toNat + w1.byteSize ≤ a2.toNat ∨ a2.toNat + w2.byteSize ≤ a1.toNat :=
-    of_decide_eq_true h_disj
-  have hne : a1.toNat ≠ a2.toNat := by
-    have hpos1 := IntWidth.byteSize_pos w1
-    have hpos2 := IntWidth.byteSize_pos w2
-    omega
-  simp [storeInt, loadInt, readAt_writeAt_ne m a1.toNat a2.toNat (.int w1 v) hne]
+    (m.storeInt a1 w1 v).loadInt? a2 w2 = m.loadInt? a2 w2 := by
+  simp only [storeInt, loadInt?]
+  have hlen : (initBytes (bvToLEBytes w1.byteSize v)).length = w1.byteSize := by
+    rw [initBytes_length, bvToLEBytes, natToLEBytes_length]
+  rw [readBytesAt_writeBytesAt_disjoint m a1.toNat (initBytes (bvToLEBytes w1.byteSize v)) a2.toNat w2.byteSize]
+  rw [hlen]
+  exact h_disj
+
+theorem readBytesAt_writeBytesAt_subslice (m : ByteMem) (base : Nat) (bs : List MemByte)
+    (off n : Nat) (h : off + n ≤ bs.length) :
+    (m.writeBytesAt base bs).readBytesAt (base + off) n = (bs.drop off).take n := by
+  induction bs generalizing m base off n with
+  | nil =>
+    simp only [List.length_nil] at h
+    have hn : n = 0 := by omega
+    subst hn
+    rfl
+  | cons b rest ih =>
+    simp only [List.length_cons] at h
+    cases off with
+    | zero =>
+      simp only [Nat.add_zero, List.drop_zero]
+      cases n with
+      | zero => rfl
+      | succ k =>
+        simp only [writeBytesAt, readBytesAt, List.take_succ_cons]
+        have hhead : ((m.writeAt base b).writeBytesAt (base + 1) rest).readByte base = b := by
+          simp only [readByte]
+          rw [readAt_writeBytesAt_outside (m.writeAt base b) (base + 1) rest base (Or.inl (by omega))]
+          simp [readAt_writeAt_same]
+        have htail := ih (m.writeAt base b) (base + 1) 0 k (by omega)
+        simp only [Nat.add_zero, List.drop_zero] at htail
+        rw [hhead, htail]
+    | succ off' =>
+      simp only [writeBytesAt, List.drop_succ_cons]
+      have hadd : base + (off' + 1) = (base + 1) + off' := by omega
+      rw [hadd]
+      exact ih (m.writeAt base b) (base + 1) off' n (by omega)
+
+theorem initBytes_drop (bs : List (BitVec 8)) (off : Nat) :
+    (initBytes bs).drop off = initBytes (bs.drop off) := by
+  induction bs generalizing off with
+  | nil => simp [initBytes]
+  | cons b rest ih =>
+    cases off with
+    | zero => rfl
+    | succ off' => simp [initBytes, ih]
+
+theorem initBytes_take (bs : List (BitVec 8)) (n : Nat) :
+    (initBytes bs).take n = initBytes (bs.take n) := by
+  induction bs generalizing n with
+  | nil => simp [initBytes]
+  | cons b rest ih =>
+    cases n with
+    | zero => rfl
+    | succ k => simp [initBytes, ih]
+
+theorem loadInt?_storeInt_subslice (m : ByteMem) (addr : BitVec 64)
+    (wWide wNarrow : IntWidth) (v : BitVec wWide.bits) (off : Nat)
+    (h_byte : wNarrow.bits = 8 * wNarrow.byteSize)
+    (h_slice : off + wNarrow.byteSize ≤ wWide.byteSize)
+    (h_fit : addr.toNat + off < 2 ^ 64) :
+    (m.storeInt addr wWide v).loadInt? (BitVec.ofNat 64 (addr.toNat + off)) wNarrow =
+      some (BitVec.ofNat wNarrow.bits (v.toNat / 256 ^ off)) := by
+  simp only [storeInt, loadInt?]
+  have haddr : (BitVec.ofNat 64 (addr.toNat + off)).toNat = addr.toNat + off := by
+    rw [BitVec.toNat_ofNat, Nat.mod_eq_of_lt h_fit]
+  rw [haddr]
+  have hlen : (initBytes (bvToLEBytes wWide.byteSize v)).length = wWide.byteSize := by
+    rw [initBytes_length, bvToLEBytes, natToLEBytes_length]
+  rw [readBytesAt_writeBytesAt_subslice m addr.toNat (initBytes (bvToLEBytes wWide.byteSize v))
+        off wNarrow.byteSize (by omega)]
+  rw [initBytes_drop, initBytes_take, bytesToBv?_initBytes]
+  have hb := bvFromLEBytes_subslice wWide.byteSize off wNarrow.byteSize v h_slice
+  rw [← h_byte] at hb
+  rw [hb]
 
 def alignUp (x align : Nat) : Nat :=
   if align ≤ 1 then x
@@ -332,23 +537,48 @@ theorem alignUp_mod_eq_zero (x align : Nat) (h_pos : 0 < align) :
       rw [show x + (align - x % align) = align * (x / align + 1) by omega]
       exact Nat.mul_mod_right _ _
 
-def zeroBytes (n : Nat) : List (BitVec 8) :=
-  List.replicate n 0#8
+def zeroBytes (n : Nat) : List MemByte :=
+  List.replicate n (.init 0#8)
 
 def effectiveAlign (align : Nat) : Nat :=
   if isPow2 align then align else 1
 
-def allocAligned (m : ByteMem) (sizeBytes align : Nat) : Option (BitVec 64 × ByteMem) :=
+def allocAligned (m : ByteMem) (sizeBytes align : Nat) (writable : Bool := true) :
+    Option (BitVec 64 × ByteMem) :=
   let base := alignUp (Nat.max m.nextAlloc 4096) (effectiveAlign align)
   let span := Nat.max sizeBytes 1
   if base + span < 2 ^ 64 then
+    let block : AllocBlock :=
+      { base := base, size := span, align := effectiveAlign align, writable := writable }
     let mZero := m.writeBytesAt base (zeroBytes span)
-    some (BitVec.ofNat 64 base, { mZero with nextAlloc := base + span })
+    some (BitVec.ofNat 64 base,
+      { mZero with nextAlloc := base + span, allocs := block :: m.allocs })
   else
     none
 
-theorem allocAligned_nonzero (m : ByteMem) (sz align : Nat) (ptr : BitVec 64) (m' : ByteMem)
-    (h_alloc : m.allocAligned sz align = some (ptr, m')) :
+def findAlloc (m : ByteMem) (addr : Nat) : Option AllocBlock :=
+  m.allocs.find? (fun b => b.base ≤ addr && addr < b.base + b.size)
+
+def accessInAlloc (m : ByteMem) (addr n : Nat) (needWrite : Bool) : Bool :=
+  match m.findAlloc addr with
+  | none => false
+  | some b =>
+    b.base ≤ addr && addr + n ≤ b.base + b.size && (!needWrite || b.writable)
+
+def accessOk (m : ByteMem) (addr : BitVec 64) (n align : Nat) (needWrite : Bool) : Bool :=
+  addr ≠ 0#64 && isAligned addr align && m.accessInAlloc addr.toNat n needWrite
+
+def inboundsInAlloc (m : ByteMem) (basePtr : Nat) (resAddr : Int) : Bool :=
+  if resAddr < 0 then false
+  else
+    let resNat := resAddr.toNat
+    match m.allocs.find? (fun b => b.base ≤ basePtr && basePtr ≤ b.base + b.size) with
+    | none => false
+    | some b => b.base ≤ resNat && resNat ≤ b.base + b.size
+
+theorem allocAligned_nonzero (m : ByteMem) (sz align : Nat) (writable : Bool)
+    (ptr : BitVec 64) (m' : ByteMem)
+    (h_alloc : m.allocAligned sz align writable = some (ptr, m')) :
     ptr ≠ 0#64 := by
   unfold allocAligned at h_alloc
   dsimp only at h_alloc
@@ -369,9 +599,10 @@ theorem allocAligned_nonzero (m : ByteMem) (sz align : Nat) (ptr : BitVec 64) (m
   case isFalse =>
     contradiction
 
-theorem allocAligned_isAligned (m : ByteMem) (sz align : Nat) (ptr : BitVec 64) (m' : ByteMem)
+theorem allocAligned_isAligned (m : ByteMem) (sz align : Nat) (writable : Bool)
+    (ptr : BitVec 64) (m' : ByteMem)
     (h_pow : isPow2 align = true)
-    (h_alloc : m.allocAligned sz align = some (ptr, m')) :
+    (h_alloc : m.allocAligned sz align writable = some (ptr, m')) :
     isAligned ptr align = true := by
   unfold allocAligned effectiveAlign at h_alloc
   simp only [h_pow, ↓reduceIte] at h_alloc
@@ -390,6 +621,46 @@ theorem allocAligned_isAligned (m : ByteMem) (sz align : Nat) (ptr : BitVec 64) 
     have hlt : alignUp (Nat.max m.nextAlloc 4096) align < 2 ^ 64 := by omega
     rw [BitVec.toNat_ofNat, Nat.mod_eq_of_lt hlt]
     exact alignUp_mod_eq_zero (Nat.max m.nextAlloc 4096) align hpos
+  case isFalse =>
+    contradiction
+
+theorem accessOk_null_false (m : ByteMem) (n align : Nat) (needWrite : Bool) :
+    m.accessOk 0#64 n align needWrite = false := by
+  simp [accessOk]
+
+theorem accessOk_zero_align_false (m : ByteMem) (addr : BitVec 64) (n : Nat) (needWrite : Bool) :
+    m.accessOk addr n 0 needWrite = false := by
+  simp [accessOk, isAligned_zero_false]
+
+theorem allocAligned_accessOk (m : ByteMem) (sz align : Nat) (writable : Bool)
+    (ptr : BitVec 64) (m' : ByteMem)
+    (h_pow : isPow2 align = true)
+    (h_sz : 0 < sz)
+    (h_alloc : m.allocAligned sz align writable = some (ptr, m')) :
+    m'.accessOk ptr sz align writable = true := by
+  have hnz := allocAligned_nonzero m sz align writable ptr m' h_alloc
+  have hal := allocAligned_isAligned m sz align writable ptr m' h_pow h_alloc
+  unfold accessOk
+  simp only [hnz, ne_eq, not_false_eq_true, decide_true, hal, Bool.true_and]
+  unfold allocAligned at h_alloc
+  dsimp only at h_alloc
+  split at h_alloc
+  case isTrue hfit =>
+    injection h_alloc with hpair
+    injection hpair with hptr hm'
+    subst hptr hm'
+    have hspan : Nat.max sz 1 = sz := Nat.max_eq_left (by omega)
+    have hbase_lt : alignUp (Nat.max m.nextAlloc 4096) (effectiveAlign align) < 2 ^ 64 := by omega
+    have htoNat :
+        (BitVec.ofNat 64 (alignUp (Nat.max m.nextAlloc 4096) (effectiveAlign align))).toNat =
+          alignUp (Nat.max m.nextAlloc 4096) (effectiveAlign align) := by
+      rw [BitVec.toNat_ofNat, Nat.mod_eq_of_lt hbase_lt]
+    unfold accessInAlloc findAlloc
+    simp only [htoNat, hspan, List.find?_cons]
+    have hlt : alignUp (Nat.max m.nextAlloc 4096) (effectiveAlign align) <
+        alignUp (Nat.max m.nextAlloc 4096) (effectiveAlign align) + sz := by omega
+    simp only [Nat.le_refl, decide_true, hlt, Bool.and_self]
+    cases writable <;> rfl
   case isFalse =>
     contradiction
 
