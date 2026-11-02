@@ -1,14 +1,14 @@
 import LeanNative.IR.Types
 import LeanNative.IR.AST
 import LeanNative.Semantics.Value
-import LeanNative.Semantics.Eval
 
 /-!
 # Formal Backend Semantics: `LeanMLIR` (`BitVec 64` + `PoisonOr`) and `LNSym` (`ARM64 NEON GF(2^128)`)
 
 Milestone M5: Provides independent operational & denotational semantics for:
 1. `LeanMLIR`: SSA/register IR over `BitVec 64` with explicit `PoisonOr` poison/trap propagation
-   for `lowerToLeanMLIR_sound`.
+   for `lowerToLeanMLIR_sound`. Binary and unary operators are evaluated on machine words
+   (`BitVec 64` / `BitVec 256`) and only then re-wrapped as LNIR values.
 2. `LNSym`: ARM64 NEON 128-bit `QReg` (`uint64x2_t`) state machine executing `pmullLo`, `pmullHi`,
    `eor128`, and polynomial reduction modulo $x^{128} + x^7 + x^2 + x + 1$ (`0x87`) across register
    files `q0..q7` for `arm64_f128_kernel_refines_lnir`.
@@ -54,6 +54,202 @@ structure EncodedMLIRState where
   heap : HeapState
   deriving Inhabited
 
+/-- Four-lane 64-bit SIMD register view of a 256-bit machine word. -/
+structure Vec4x64 where
+  l0 : BitVec 64
+  l1 : BitVec 64
+  l2 : BitVec 64
+  l3 : BitVec 64
+  deriving Repr, DecidableEq, Inhabited
+
+def toVec4x64 (w : UInt256) : Vec4x64 :=
+  ⟨w.lo0.toBitVec, w.lo1.toBitVec, w.hi0.toBitVec, w.hi1.toBitVec⟩
+
+def ofVec4x64 (v : Vec4x64) : UInt256 :=
+  ⟨UInt64.ofBitVec v.l0, UInt64.ofBitVec v.l1, UInt64.ofBitVec v.l2, UInt64.ofBitVec v.l3⟩
+
+def bv64 (n : UInt64) : BitVec 64 := n.toBitVec
+
+def word256 (w : UInt256) : BitVec 256 := BitVec.ofNat 256 w.toNat
+
+def ofWord256 (w : BitVec 256) : UInt256 := UInt256.ofNat w.toNat
+
+def asWord256 : Val → Option (BitVec 256)
+  | .u256 w => some (word256 w)
+  | .u64 n => some (BitVec.ofNat 256 n.toBitVec.toNat)
+  | _ => none
+
+def sameVal (a b : Val) : Bool := a == b
+
+def sar64 (a b : BitVec 64) : BitVec 64 :=
+  let sh := b &&& 63#64
+  let shifted := a >>> (sh % 64#64)
+  let signBit := (a >>> 63#64) &&& 1#64
+  if signBit != 0#64 && sh != 0#64 then
+    shifted ||| ((BitVec.allOnes 64) <<< ((64#64 - sh) % 64#64))
+  else
+    shifted
+
+def sar256 (a : BitVec 256) (sh : Nat) : BitVec 256 :=
+  let isNeg := decide (2 ^ 255 ≤ a.toNat)
+  if sh ≥ 256 then
+    if isNeg then BitVec.allOnes 256 else 0#256
+  else if sh == 0 then
+    a
+  else
+    let shifted := a >>> sh
+    if !isNeg then shifted
+    else shifted + ((BitVec.allOnes 256) <<< (256 - sh))
+
+/-- Machine-word interpretation of a binary operator. The opcode is applied to `BitVec`
+    lanes first; LNIR value tags are reconstructed only at the boundary. -/
+def applyWordBinOp (op : BinOp) (v1 v2 : Val) : PoisonOr Val :=
+  match op with
+  | .add =>
+    match v1, v2 with
+    | .u64 a, .u64 b => .val (.u64 (UInt64.ofBitVec (bv64 a + bv64 b)))
+    | _, .u64 0 => .val v1
+    | .u64 0, _ => .val v2
+    | .u256 a, .u256 b => .val (.u256 (ofWord256 (word256 a + word256 b)))
+    | _, _ => .poison "binOp64 type"
+  | .sub =>
+    match v1, v2 with
+    | .u64 a, .u64 b => .val (.u64 (UInt64.ofBitVec (bv64 a - bv64 b)))
+    | _, .u64 0 => .val v1
+    | .u256 a, .u256 b => .val (.u256 (ofWord256 (word256 a - word256 b)))
+    | _, _ => .poison "binOp64 type"
+  | .mul =>
+    match v1, v2 with
+    | .u64 a, .u64 b => .val (.u64 (UInt64.ofBitVec (bv64 a * bv64 b)))
+    | _, .u64 1 => .val v1
+    | .u64 1, _ => .val v2
+    | .u256 a, .u256 b => .val (.u256 (ofWord256 (word256 a * word256 b)))
+    | _, _ => .poison "binOp64 type"
+  | .div =>
+    match v1, v2 with
+    | .u64 a, .u64 b => .val (.u64 (UInt64.ofBitVec (bv64 a / bv64 b)))
+    | _, .u64 1 => .val v1
+    | .u256 a, .u256 b =>
+      if word256 b == 0#256 then .poison "binOp64 div0"
+      else .val (.u256 (ofWord256 (word256 a / word256 b)))
+    | _, _ => .poison "binOp64 type"
+  | .mod =>
+    match v1, v2 with
+    | .u64 a, .u64 b => .val (.u64 (UInt64.ofBitVec (bv64 a % bv64 b)))
+    | .u256 a, .u256 b =>
+      if word256 b == 0#256 then .poison "binOp64 div0"
+      else .val (.u256 (ofWord256 (word256 a % word256 b)))
+    | _, _ => .poison "binOp64 type"
+  | .bitAnd =>
+    match v1, v2 with
+    | .u64 a, .u64 b => .val (.u64 (UInt64.ofBitVec (bv64 a &&& bv64 b)))
+    | .u256 a, .u256 b =>
+      let va := toVec4x64 a
+      let vb := toVec4x64 b
+      .val (.u256 (ofVec4x64 ⟨va.l0 &&& vb.l0, va.l1 &&& vb.l1, va.l2 &&& vb.l2, va.l3 &&& vb.l3⟩))
+    | _, _ => if sameVal v1 v2 then .val v1 else .poison "binOp64 type"
+  | .bitOr =>
+    match v1, v2 with
+    | .u64 a, .u64 b => .val (.u64 (UInt64.ofBitVec (bv64 a ||| bv64 b)))
+    | _, .u64 0 => .val v1
+    | .u64 0, _ => .val v2
+    | .u256 a, .u256 b =>
+      let va := toVec4x64 a
+      let vb := toVec4x64 b
+      .val (.u256 (ofVec4x64 ⟨va.l0 ||| vb.l0, va.l1 ||| vb.l1, va.l2 ||| vb.l2, va.l3 ||| vb.l3⟩))
+    | _, _ => if sameVal v1 v2 then .val v1 else .poison "binOp64 type"
+  | .bitXor =>
+    match v1, v2 with
+    | .u64 a, .u64 b => .val (.u64 (UInt64.ofBitVec (bv64 a ^^^ bv64 b)))
+    | _, .u64 0 => .val v1
+    | .u64 0, _ => .val v2
+    | .u256 a, .u256 b =>
+      let va := toVec4x64 a
+      let vb := toVec4x64 b
+      .val (.u256 (ofVec4x64 ⟨va.l0 ^^^ vb.l0, va.l1 ^^^ vb.l1, va.l2 ^^^ vb.l2, va.l3 ^^^ vb.l3⟩))
+    | _, _ => .poison "binOp64 type"
+  | .shl =>
+    match v1, v2 with
+    | .u64 a, .u64 b => .val (.u64 (UInt64.ofBitVec (bv64 a <<< (bv64 b % 64#64))))
+    | _, .u64 0 => .val v1
+    | .u256 a, .u256 b => .val (.u256 (ofWord256 (word256 a <<< (word256 b).toNat)))
+    | _, _ => .poison "binOp64 type"
+  | .shr =>
+    match v1, v2 with
+    | .u64 a, .u64 b => .val (.u64 (UInt64.ofBitVec (bv64 a >>> (bv64 b % 64#64))))
+    | _, .u64 0 => .val v1
+    | .u256 a, .u256 b => .val (.u256 (ofWord256 (word256 a >>> (word256 b).toNat)))
+    | _, _ => .poison "binOp64 type"
+  | .sar =>
+    match v1, v2 with
+    | .u64 a, .u64 b => .val (.u64 (UInt64.ofBitVec (sar64 (bv64 a) (bv64 b))))
+    | .u256 a, .u256 b => .val (.u256 (ofWord256 (sar256 (word256 a) (word256 b).toNat)))
+    | _, _ => .poison "binOp64 type"
+  | .eq =>
+    match v1, v2 with
+    | .u64 a, .u64 b => .val (.bool (bv64 a == bv64 b))
+    | .u256 a, .u256 b => .val (.bool (word256 a == word256 b))
+    | .bool a, .bool b => .val (.bool (a == b))
+    | _, _ => .poison "binOp64 type"
+  | .lt =>
+    match v1, v2 with
+    | .u64 a, .u64 b => .val (.bool (decide (bv64 a < bv64 b)))
+    | .u256 a, .u256 b => .val (.bool (decide (word256 a < word256 b)))
+    | _, _ => .poison "binOp64 type"
+  | .le =>
+    match v1, v2 with
+    | .u64 a, .u64 b => .val (.bool (decide (bv64 a ≤ bv64 b)))
+    | .u256 a, .u256 b => .val (.bool (decide (word256 a ≤ word256 b)))
+    | _, _ => .poison "binOp64 type"
+  | .addChecked256 =>
+    match asWord256 v1, asWord256 v2 with
+    | some a, some b =>
+      if BitVec.uaddOverflow a b then .poison "binOp64 overflow"
+      else .val (.u256 (ofWord256 (a + b)))
+    | _, _ => .poison "binOp64 type"
+  | .subChecked256 =>
+    match asWord256 v1, asWord256 v2 with
+    | some a, some b =>
+      if decide (a < b) then .poison "binOp64 underflow"
+      else .val (.u256 (ofWord256 (a - b)))
+    | _, _ => .poison "binOp64 type"
+  | .mulChecked256 =>
+    match asWord256 v1, asWord256 v2 with
+    | some a, some b =>
+      if BitVec.umulOverflow a b then .poison "binOp64 overflow"
+      else .val (.u256 (ofWord256 (a * b)))
+    | _, _ => .poison "binOp64 type"
+  | .clmul64 =>
+    match v1, v2 with
+    | .u64 a, .u64 b => .val (.u64 (clmul64 a b))
+    | _, _ => .poison "binOp64 type"
+  | .clmul64Hi =>
+    match v1, v2 with
+    | .u64 a, .u64 b => .val (.u64 (clmul64Hi a b))
+    | _, _ => .poison "binOp64 type"
+  | .gf2Affine =>
+    match v1, v2 with
+    | .u64 a, .u64 b => .val (.u64 (gf2Affine a b))
+    | _, _ => .poison "binOp64 type"
+  | .eor3 =>
+    match v1, v2 with
+    | .u64 a, .u64 b => .val (.u64 (eor3 a b))
+    | _, _ => .poison "binOp64 type"
+
+/-- Machine-word interpretation of a unary operator. -/
+def applyWordUnaryOp (op : UnaryOp) (v : Val) : PoisonOr Val :=
+  match op, v with
+  | .not, .u64 n => .val (.u64 (UInt64.ofBitVec (~~~ (bv64 n))))
+  | .not, .u256 w =>
+    let vw := toVec4x64 w
+    .val (.u256 (ofVec4x64 ⟨~~~vw.l0, ~~~vw.l1, ~~~vw.l2, ~~~vw.l3⟩))
+  | .not, .bool b => .val (.bool (!b))
+  | .neg, .u64 n => .val (.u64 (UInt64.ofBitVec (0#64 - bv64 n)))
+  | .neg, .u256 w => .val (.u256 (ofWord256 (0#256 - word256 w)))
+  | .clz256, .u256 w => .val (.u256 (UInt256.clz (ofWord256 (word256 w))))
+  | .clz256, .u64 n => .val (.u256 (UInt256.clz (ofWord256 (BitVec.ofNat 256 n.toBitVec.toNat))))
+  | _, _ => .poison "unaryOp64 type"
+
 /-- Independent `LeanMLIR` scalar expression evaluator producing `PoisonOr Val`. -/
 def denoteExpr (env : VarEnv) : LLVM.Expr → PoisonOr Val
   | .const64 w => .val (.u64 (UInt64.ofBitVec w))
@@ -64,18 +260,12 @@ def denoteExpr (env : VarEnv) : LLVM.Expr → PoisonOr Val
     | none => .poison s!"unbound register v{id}"
   | .binOp64 op lhs rhs =>
     match denoteExpr env lhs, denoteExpr env rhs with
-    | .val v1, .val v2 =>
-      match evalBinOp op v1 v2 with
-      | .ok v => .val v
-      | .error _ => .poison "binOp64 poison"
+    | .val v1, .val v2 => applyWordBinOp op v1 v2
     | .poison msg, _ => .poison msg
     | .val _, .poison msg => .poison msg
   | .unaryOp64 op arg =>
     match denoteExpr env arg with
-    | .val v =>
-      match evalUnaryOp op v with
-      | .ok out => .val out
-      | .error _ => .poison "unaryOp64 poison"
+    | .val v => applyWordUnaryOp op v
     | .poison msg => .poison msg
   | .select64 c t e =>
     match denoteExpr env c with
@@ -88,13 +278,10 @@ def denoteExpr (env : VarEnv) : LLVM.Expr → PoisonOr Val
   | .fma64 a b c =>
     match denoteExpr env a, denoteExpr env b with
     | .val va, .val vb =>
-      match evalBinOp .mul va vb, denoteExpr env c with
-      | .ok vab, .val vc =>
-        match evalBinOp .add vab vc with
-        | .ok v => .val v
-        | .error _ => .poison "fma64 add poison"
-      | .error _, _ => .poison "fma64 mul poison"
-      | .ok _, .poison msg => .poison msg
+      match applyWordBinOp .mul va vb, denoteExpr env c with
+      | .val vab, .val vc => applyWordBinOp .add vab vc
+      | .poison msg, _ => .poison msg
+      | .val _, .poison msg => .poison msg
     | .poison msg, _ => .poison msg
     | .val _, .poison msg => .poison msg
 
