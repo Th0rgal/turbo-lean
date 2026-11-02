@@ -155,6 +155,9 @@ theorem rangesDisjoint_ne_in_bounds (b1 s1 b2 s2 i j : Nat)
 inductive MemCell where
   | byte : BitVec 8 → MemCell
   | int : (w : IntWidth) → BitVec w.bits → MemCell
+  | ptr : BitVec 64 → MemCell
+  | floatBits : (fw : FloatWidth) → BitVec fw.bits → MemCell
+  | poison : MemCell
   deriving Repr, DecidableEq, Inhabited
 
 structure ByteMem where
@@ -256,6 +259,31 @@ def loadInt (m : ByteMem) (addr : BitVec 64) (w : IntWidth) : BitVec w.bits :=
   | some (.int w' v) =>
     if h : w' = w then h ▸ v else 0#w.bits
   | _ => 0#w.bits
+
+def storePtr (m : ByteMem) (addr ptrVal : BitVec 64) : ByteMem :=
+  m.writeAt addr.toNat (.ptr ptrVal)
+
+def loadPtr (m : ByteMem) (addr : BitVec 64) : BitVec 64 :=
+  match m.readAt addr.toNat with
+  | some (.ptr p) => p
+  | _ => 0#64
+
+def storeFloatBits (m : ByteMem) (addr : BitVec 64) (fw : FloatWidth) (v : BitVec fw.bits) : ByteMem :=
+  m.writeAt addr.toNat (.floatBits fw v)
+
+def loadFloatBits (m : ByteMem) (addr : BitVec 64) (fw : FloatWidth) : BitVec fw.bits :=
+  match m.readAt addr.toNat with
+  | some (.floatBits fw' v) =>
+    if h : fw' = fw then h ▸ v else 0#fw.bits
+  | _ => 0#fw.bits
+
+def storePoison (m : ByteMem) (addr : BitVec 64) : ByteMem :=
+  m.writeAt addr.toNat .poison
+
+def isPoisonCell (m : ByteMem) (addr : BitVec 64) : Bool :=
+  match m.readAt addr.toNat with
+  | some .poison => true
+  | _ => false
 
 theorem load_store_same (m : ByteMem) (addr : BitVec 64) (w : IntWidth) (v : BitVec w.bits) :
     (m.storeInt addr w v).loadInt addr w = v := by
