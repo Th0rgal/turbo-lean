@@ -1501,7 +1501,11 @@ fn execute_check_shard_payload_deferred_with_domain(
         if !req.skip_cas_lock && source_violations.has_sorry {
             let dep_hashes = crate::lake_build::compute_imported_olean_interface_hashes(
                 &req.shard_source,
-                Path::new("."),
+                if req.lean_path.is_empty() {
+                    Path::new(".")
+                } else {
+                    Path::new("")
+                },
                 if req.lean_path.is_empty() {
                     None
                 } else {
@@ -1825,7 +1829,11 @@ fn execute_check_shards_batch_payload_deferred(
                 req.items.iter().map(|i| i.decl_name.as_str()).collect();
             let dep_hashes = crate::lake_build::compute_imported_olean_interface_hashes(
                 &req.coalesced_shard_source,
-                Path::new("."),
+                if req.lean_path.is_empty() {
+                    Path::new(".")
+                } else {
+                    Path::new("")
+                },
                 if req.lean_path.is_empty() {
                     None
                 } else {

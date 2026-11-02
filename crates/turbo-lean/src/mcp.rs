@@ -1581,7 +1581,12 @@ pub fn execute_mcp_agent_step(
 
     record_agent_call_telemetry(AgentCallTelemetry {
         tool_name: "turbo_agent_step".to_string(),
-        project_dir: project_dir.or_else(|| file.parent()).map(Path::to_path_buf),
+        project_dir: Some(
+            project_dir
+                .or_else(|| file.parent().filter(|p| !p.as_os_str().is_empty()))
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
+        ),
         decl_name: decl.map(|s| s.to_string()).or_else(|| {
             verbose
                 .get("decl")
@@ -1644,7 +1649,12 @@ pub fn execute_mcp_audit_spec(
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
     record_agent_call_telemetry(AgentCallTelemetry {
         tool_name: "turbo_audit_spec".to_string(),
-        project_dir: project_dir.or_else(|| file.parent()).map(Path::to_path_buf),
+        project_dir: Some(
+            project_dir
+                .or_else(|| file.parent().filter(|p| !p.as_os_str().is_empty()))
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
+        ),
         decl_name: decl.map(|s| s.to_string()),
         elapsed_ms,
         stage1_tpu_ms: elapsed_ms,

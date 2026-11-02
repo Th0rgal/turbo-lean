@@ -4492,12 +4492,12 @@ fn resolve_agent_step_env_and_paths(
     let effective_low_memory = low_memory || max_memory_mb.is_some_and(|m| m <= 2048);
 
     let inferred_proj_dir = project_dir
+        .filter(|p| !p.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| crate::lake_build::find_project_root(file));
-    let canon_dir = match inferred_proj_dir.canonicalize() {
-        Ok(p) => p,
-        Err(_) => inferred_proj_dir,
-    };
+    let canon_dir = inferred_proj_dir
+        .canonicalize()
+        .unwrap_or(inferred_proj_dir);
     let resolved_file = if file.exists() {
         file.to_path_buf()
     } else if canon_dir.join(file).exists() {
@@ -4744,10 +4744,6 @@ pub fn try_stateless_agent_step_cex(
         .canonicalize()
         .unwrap_or_else(|_| resolved_file.clone());
     crate::module_builder::try_project_lake_inputs_tag(&canon_dir)?;
-    crate::lake_build::ensure_project_imports_fresh_for_check(
-        &canon_dir,
-        std::slice::from_ref(&canon_resolved),
-    )?;
     let split = crate::splitter::split_lean_source_fast_no_cone(&src_text, &[]);
     let target_shards: Vec<&crate::splitter::TheoremShard> =
         match decl_filter.filter(|t| !t.is_empty() && *t != "auto") {
@@ -4757,6 +4753,10 @@ pub fn try_stateless_agent_step_cex(
             },
             None => split.shards.iter().collect(),
         };
+    crate::lake_build::ensure_project_imports_fresh_for_check(
+        &canon_dir,
+        std::slice::from_ref(&canon_resolved),
+    )?;
     for shard in &target_shards {
         crate::check::confirm_decl_identity_with_budget(
             &src_text,
@@ -4924,9 +4924,12 @@ pub fn evaluate_agent_step_value(
                     .join(format!("st_{}.json", &st_hash[..24]))
             });
         let src_b3 = blake3::hash(src_text.as_bytes()).to_hex().to_string();
+        let disk_spill_dir = store.root.join("disk_spill");
         let st_split_opt = st_path_opt
             .as_ref()
-            .and_then(|st_path| fs::read(st_path).ok())
+            .and_then(|st_path| {
+                crate::shm_cache::read_shm_or_disk_spill(st_path, Some(&disk_spill_dir))
+            })
             .and_then(|b| serde_json::from_slice::<crate::lake_build::ShmCachedFileSplit>(&b).ok())
             .filter(|c| {
                 c.src_blake3 == src_b3

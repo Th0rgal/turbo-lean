@@ -1174,10 +1174,7 @@ fn prepare_stateless_remote_file(
     if active_src.len() > 64 * 1024 {
         return Ok(None);
     }
-    let canon_file = match resolved_file.canonicalize() {
-        Ok(p) => p,
-        Err(_) => resolved_file,
-    };
+    let canon_file = resolved_file.canonicalize().unwrap_or(resolved_file);
     crate::lake_build::ensure_project_imports_fresh_for_check(
         &canon_dir,
         std::slice::from_ref(&canon_file),
@@ -1189,7 +1186,11 @@ fn prepare_stateless_remote_file(
         toolchain.clone()
     };
     let local_lean_path = resolve_remote_lean_path(&canon_dir, None);
-    let dep_hashes = compute_imported_olean_interface_hashes(&active_src, &canon_dir, None);
+    let dep_hashes = compute_imported_olean_interface_hashes(
+        &active_src,
+        &canon_dir,
+        (!local_lean_path.is_empty()).then_some(local_lean_path.as_str()),
+    );
     let split = splitter::split_lean_source_fast_no_cone(&active_src, &dep_hashes);
     Ok(Some((
         canon_dir,
@@ -6312,6 +6313,124 @@ but is expected to have type
             &["-DmaxHeartbeats=4000000".to_string()],
         );
         assert_ne!(f_bare, f_hb);
+    }
+
+    #[test]
+    fn agent_step_warm_cache_invalidates_on_rebuilt_transitive_import_and_stale_trace() {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_agent_step_warm_trans_{}",
+            pack::next_tmp_id()
+        ));
+        let proj = dir.join("proj");
+        fs::create_dir_all(proj.join("P")).unwrap();
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"P\"\ndefaultTargets = [\"P\"]\n[[lean_lib]]\nname = \"P\"\nglobs = [\"P.+\"]\n",
+        )
+        .unwrap();
+        fs::write(proj.join("P/A.lean"), "def k : Nat := 1\n").unwrap();
+        fs::write(proj.join("P/B.lean"), "import P.A\ndef m : Nat := k\n").unwrap();
+        let c_file = proj.join("P/C.lean");
+        fs::write(&c_file, "import P.B\ntheorem c_ok : m = 1 := rfl\n").unwrap();
+        let run_lake = |args: &[&str]| {
+            Command::new("lake")
+                .args(args)
+                .current_dir(&proj)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !run_lake(&["build", "P.B"]) {
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+        let cache_dir = dir.join(".cache");
+        let mut store = TurboStore::open(Some(&cache_dir)).unwrap();
+        let cold = crate::gpu_fastcheck::evaluate_agent_step_value(
+            &mut store,
+            &c_file,
+            Some("c_ok"),
+            Some(&proj),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(cold["verified"], true);
+        let warm = crate::gpu_fastcheck::evaluate_agent_step_value(
+            &mut store,
+            &c_file,
+            Some("c_ok"),
+            Some(&proj),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(warm["status"], "theorem_cache_hit");
+
+        let b_trace = proj.join(".lake/build/lib/lean/P/B.trace");
+        let saved_b_trace = fs::read(&b_trace).unwrap();
+        fs::remove_file(&b_trace).unwrap();
+        fs::write(
+            proj.join("turbo-lean.toml"),
+            "[worktree]\nauto_link = false\n",
+        )
+        .unwrap();
+        let trace_err = crate::gpu_fastcheck::evaluate_agent_step_value(
+            &mut store,
+            &c_file,
+            Some("c_ok"),
+            Some(&proj),
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{trace_err:#}").contains("Worktree opt-out prevents refreshing stale imports"),
+            "unexpected error on missing trace: {trace_err:#}"
+        );
+        fs::write(&b_trace, &saved_b_trace).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(proj.join("P/A.lean"), "def k : Nat := 2\n").unwrap();
+        assert!(run_lake(&["build", "P.A"]));
+        let opt_err = crate::gpu_fastcheck::evaluate_agent_step_value(
+            &mut store,
+            &c_file,
+            Some("c_ok"),
+            Some(&proj),
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{opt_err:#}").contains("Worktree opt-out prevents refreshing stale imports"),
+            "warm agent-step bypassed opt-out stale import check: {opt_err:#}"
+        );
+        fs::remove_file(proj.join("turbo-lean.toml")).unwrap();
+        assert!(
+            crate::gpu_fastcheck::evaluate_agent_step_value(
+                &mut store,
+                &c_file,
+                Some("c_ok"),
+                Some(&proj),
+                false,
+                false,
+            )
+            .is_err(),
+            "warm agent-step accepted unchanged P/C.lean after P.A changed from 1 to 2"
+        );
+        let mcp_out = crate::mcp::execute_mcp_agent_step(
+            &c_file,
+            Some("c_ok"),
+            false,
+            false,
+            Some(&proj),
+            Some(&cache_dir),
+        );
+        assert_eq!(mcp_out["ok"], false);
+        assert_eq!(mcp_out["verified"], false);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
