@@ -38,9 +38,40 @@ jobs:
           lake env lean --run Emit.lean "$RUNNER_TEMP/b2-collatz"
       - name: Cross-check exported AArch64 bytes
         run: |
+          set -euo pipefail
           clang --target=aarch64-unknown-linux-gnu -c "$RUNNER_TEMP/b2-collatz.s" -o "$RUNNER_TEMP/b2-collatz.o"
-          b2_objcopy="$(command -v llvm-objcopy || command -v llvm-objcopy-18)"
-          "$b2_objcopy" -O binary --only-section=.text "$RUNNER_TEMP/b2-collatz.o" "$RUNNER_TEMP/b2-collatz.asm.bin"
+          b2_objcopy=""
+          for candidate in llvm-objcopy llvm-objcopy-22 llvm-objcopy-21 llvm-objcopy-20 llvm-objcopy-19 llvm-objcopy-18; do
+            if b2_objcopy="$(command -v "$candidate")"; then
+              break
+            fi
+          done
+          if [ -n "$b2_objcopy" ]; then
+            "$b2_objcopy" -O binary --only-section=.text "$RUNNER_TEMP/b2-collatz.o" "$RUNNER_TEMP/b2-collatz.asm.bin"
+          else
+            python3 - "$RUNNER_TEMP/b2-collatz.o" "$RUNNER_TEMP/b2-collatz.asm.bin" <<'PY'
+          import struct, sys
+          data = open(sys.argv[1], "rb").read()
+          assert data[:6] == b"\x7fELF\x02\x01", "expected 64-bit little-endian ELF"
+          e_type, e_machine = struct.unpack_from("<HH", data, 16)
+          assert (e_type, e_machine) == (1, 183), f"expected ET_REL EM_AARCH64, got {(e_type, e_machine)}"
+          e_shoff = struct.unpack_from("<Q", data, 40)[0]
+          e_shentsize, e_shnum, e_shstrndx = struct.unpack_from("<HHH", data, 58)
+          def shdr(i):
+              return struct.unpack_from("<IIQQQQIIQQ", data, e_shoff + i * e_shentsize)
+          _, _, _, _, shstr_off, shstr_size, *_ = shdr(e_shstrndx)
+          shstr = data[shstr_off:shstr_off + shstr_size]
+          texts = []
+          for i in range(e_shnum):
+              name_off, sh_type, _, _, offset, size, *_ = shdr(i)
+              name = shstr[name_off:shstr.index(0, name_off)]
+              if sh_type == 1 and name == b".text":
+                  texts.append(data[offset:offset + size])
+              assert name not in (b".rela.text", b".rel.text") or size == 0, f"unexpected relocations in {name!r}"
+          assert len(texts) == 1, f"expected 1 .text section, found {len(texts)}"
+          open(sys.argv[2], "wb").write(texts[0])
+          PY
+          fi
           cmp "$RUNNER_TEMP/b2-collatz.bin" "$RUNNER_TEMP/b2-collatz.asm.bin"
       - name: Check compiler integration on compiler toolchain
         working-directory: lean
