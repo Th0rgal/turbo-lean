@@ -48,6 +48,8 @@ FIXTURES = {
     "  let val := mkLambda `n .default (mkConst ``Nat) (mkNatLit 999)\n"
     "  addDecl (.defnDecl { name := Compiler.mkUnsafeRecName ``safeTarget, levelParams := [], type := ty, value := val, hints := .opaque, safety := .partial })\n",
     "FxUnsafeDef": "unsafe def badUnsafe (n : Nat) : Nat := badUnsafe n\n",
+    "FxMainA": "def main : IO Unit := pure ()\ntheorem mainA_ok : (1 : Nat) = 1 := rfl\n",
+    "FxMainB": "def main : IO UInt32 := pure 0\ntheorem mainB_ok : (2 : Nat) = 2 := rfl\n",
 }
 
 
@@ -141,6 +143,14 @@ class KernelGateAudit(unittest.TestCase):
         self.assertTrue(self.audit("FxPartialOk")["ok"])
         self.assert_rejected("FxPartialHijack", "forged or unpaired _unsafe_rec/partial declaration `safeTarget._unsafe_rec`")
         self.assert_rejected("FxUnsafeDef", "unsafe declaration `badUnsafe`")
+
+    def test_colliding_root_main_modules_bisect_in_child_processes(self) -> None:
+        r = self.audit("FxMainA", "FxMainB")
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["audited"], ["FxMainA", "FxMainB"])
+        bad = self.audit("FxMainA", "FxMainB", "FxUnsafeDef")
+        self.assertFalse(bad["ok"], bad)
+        self.assertTrue(any("unsafe declaration `badUnsafe`" in v for v in bad["violations"]), bad)
 
 
 if __name__ == "__main__":

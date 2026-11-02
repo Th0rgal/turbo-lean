@@ -13,37 +13,40 @@ private instance : MonadEnv (ReaderT Environment Id) where
   getEnv := read
   modifyEnv _ := pure ()
 
-private def node (tag : String) (xs : Array Json := #[]) : Json :=
+def node (tag : String) (xs : Array Json := #[]) : Json :=
   Json.arr (#[toJson tag] ++ xs)
 
-private def nameJson : Name → Json
-  | .anonymous => node "anonymous"
-  | .str p s => node "str" #[nameJson p, toJson s]
-  | .num p n => node "num" #[nameJson p, toJson n]
+def nameJson (normName : Name → Name := id) : Name → Json
+  | n =>
+    let rec go : Name → Json
+      | .anonymous => node "anonymous"
+      | .str p s => node "str" #[go p, toJson s]
+      | .num p k => node "num" #[go p, toJson k]
+    go (normName n)
 
-private def levelJson : Level → Json
+def levelJson (normName : Name → Name := id) : Level → Json
   | .zero => node "zero"
-  | .succ l => node "succ" #[levelJson l]
-  | .max a b => node "max" #[levelJson a, levelJson b]
-  | .imax a b => node "imax" #[levelJson a, levelJson b]
-  | .param n => node "param" #[nameJson n]
-  | .mvar n => node "mvar" #[nameJson n.name]
+  | .succ l => node "succ" #[levelJson normName l]
+  | .max a b => node "max" #[levelJson normName a, levelJson normName b]
+  | .imax a b => node "imax" #[levelJson normName a, levelJson normName b]
+  | .param n => node "param" #[nameJson normName n]
+  | .mvar n => node "mvar" #[nameJson normName n.name]
 
 -- Binder display names and elaborator metadata do not affect kernel types.
-private partial def exprJson : Expr → Json
+partial def exprJson (normName : Name → Name := id) : Expr → Json
   | .bvar i => node "bvar" #[toJson i]
-  | .fvar n => node "fvar" #[nameJson n.name]
-  | .mvar n => node "mvar" #[nameJson n.name]
-  | .sort l => node "sort" #[levelJson l]
-  | .const n ls => node "const" #[nameJson n, toJson (ls.map levelJson)]
-  | .app f a => node "app" #[exprJson f, exprJson a]
-  | .lam _ t b bi => node "lam" #[toJson (reprStr bi), exprJson t, exprJson b]
-  | .forallE _ t b bi => node "forall" #[toJson (reprStr bi), exprJson t, exprJson b]
-  | .letE _ t v b nd => node "let" #[exprJson t, exprJson v, exprJson b, toJson nd]
+  | .fvar n => node "fvar" #[nameJson normName n.name]
+  | .mvar n => node "mvar" #[nameJson normName n.name]
+  | .sort l => node "sort" #[levelJson normName l]
+  | .const n ls => node "const" #[nameJson normName n, toJson (ls.map (levelJson normName))]
+  | .app f a => node "app" #[exprJson normName f, exprJson normName a]
+  | .lam _ t b bi => node "lam" #[toJson (reprStr bi), exprJson normName t, exprJson normName b]
+  | .forallE _ t b bi => node "forall" #[toJson (reprStr bi), exprJson normName t, exprJson normName b]
+  | .letE _ t v b nd => node "let" #[exprJson normName t, exprJson normName v, exprJson normName b, toJson nd]
   | .lit (.natVal n) => node "nat" #[toJson n]
   | .lit (.strVal s) => node "string" #[toJson s]
-  | .mdata _ e => exprJson e
-  | .proj n i e => node "proj" #[nameJson n, toJson i, exprJson e]
+  | .mdata _ e => exprJson normName e
+  | .proj n i e => node "proj" #[nameJson normName n, toJson i, exprJson normName e]
 
 private def hintsJson : ReducibilityHints → Json
   | .opaque => node "opaque"
@@ -56,8 +59,20 @@ private def quotJson : QuotKind → Json
   | .lift => node "lift"
   | .ind => node "ind"
 
-private def statement (c : ConstantInfo) : Json :=
-  node "statement-v1" #[toJson (c.levelParams.map nameJson), exprJson c.type]
+def statement (c : ConstantInfo) (normName : Name → Name := id) : Json :=
+  node "statement-v1" #[toJson (c.levelParams.map (nameJson normName)), exprJson normName c.type]
+
+def normalizeLocalPrivateName (localMod? : Option Name) (n : Name) : Name :=
+  match Lean.privatePrefix? n with
+  | some pfx =>
+    let isLocal := match localMod? with
+      | some m => pfx == Lean.mkPrivateNameCore m .anonymous || pfx == Lean.mkPrivateNameCore .anonymous .anonymous
+      | none => pfx == Lean.mkPrivateNameCore .anonymous .anonymous
+    if isLocal then
+      Lean.mkPrivateNameCore .anonymous (Lean.privateToUserName n)
+    else
+      n
+  | none => n
 
 -- Theorems contribute their type, never their proof (proof irrelevance).
 -- Recursor reduction rules and inductive/constructor metadata are kernel inputs too.
@@ -66,30 +81,30 @@ private def interface (c : ConstantInfo) : Json × Array Name := Id.run do
   let kind ← match c with
     | .defnInfo v =>
       deps := deps ++ v.value.getUsedConstants
-      pure <| node "definition" #[exprJson v.value, hintsJson v.hints, toJson (reprStr v.safety)]
+      pure <| node "definition" #[exprJson id v.value, hintsJson v.hints, toJson (reprStr v.safety)]
     | .opaqueInfo v =>
       deps := deps ++ v.value.getUsedConstants
-      pure <| node "opaque" #[exprJson v.value, toJson v.isUnsafe]
+      pure <| node "opaque" #[exprJson id v.value, toJson v.isUnsafe]
     | .thmInfo _ => pure <| node "theorem"
     | .axiomInfo v => pure <| node "axiom" #[toJson v.isUnsafe]
     | .quotInfo v => pure <| node "quotient" #[quotJson v.kind]
     | .inductInfo v =>
       deps := deps ++ v.all.toArray ++ v.ctors.toArray
       pure <| node "inductive" #[toJson v.numParams, toJson v.numIndices,
-        toJson (v.all.map nameJson), toJson (v.ctors.map nameJson),
+        toJson (v.all.map (nameJson id)), toJson (v.ctors.map (nameJson id)),
         toJson v.numNested, toJson v.isRec, toJson v.isUnsafe, toJson v.isReflexive]
     | .ctorInfo v =>
       deps := deps.push v.induct
-      pure <| node "constructor" #[nameJson v.induct, toJson v.cidx,
+      pure <| node "constructor" #[nameJson id v.induct, toJson v.cidx,
         toJson v.numParams, toJson v.numFields, toJson v.isUnsafe]
     | .recInfo v =>
       deps := deps ++ v.all.toArray
       for r in v.rules do
         deps := deps.push r.ctor ++ r.rhs.getUsedConstants
-      pure <| node "recursor" #[toJson (v.all.map nameJson), toJson v.numParams,
+      pure <| node "recursor" #[toJson (v.all.map (nameJson id)), toJson v.numParams,
         toJson v.numIndices, toJson v.numMotives, toJson v.numMinors, toJson v.k,
         toJson v.isUnsafe, toJson (v.rules.map fun r =>
-          node "rule" #[nameJson r.ctor, toJson r.nfields, exprJson r.rhs])]
+          node "rule" #[nameJson id r.ctor, toJson r.nfields, exprJson id r.rhs])]
   return (node "interface-v1" #[statement c, kind], deps)
 
 private def emit (j : Json) : IO Unit := do (← IO.getStdout).putStrLn j.compress
@@ -125,7 +140,7 @@ def dump (env : Environment) (mod : Name) : IO Unit := do
 
 end TurboLean.StatementHash
 
-def main (args : List String) : IO Unit := do
+def statementHashCliMain (args : List String) : IO Unit := do
   initSearchPath (← findSysroot)
   let imports : Array Import := args.toArray.map fun mod => { module := mod.toName, importAll := true }
   let env ← importModules imports {} 0 #[] true false .private

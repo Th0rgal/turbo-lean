@@ -1,6 +1,7 @@
 //! Specification auditor extracted mechanically from gpu_fastcheck.rs.
 
 use super::*;
+use crate::splitter::skip_lean_lexeme;
 
 pub(super) fn inline_stmt_let_bindings(stmt: &str) -> String {
     let mut cur = stmt.trim().to_string();
@@ -51,82 +52,6 @@ pub(super) fn inline_stmt_let_bindings(stmt: &str) -> String {
     cur
 }
 
-/// A literal or comment beginning at a UTF-8 byte boundary. Unterminated strings
-/// and block comments consume the remainder so their contents cannot become code.
-struct LeanLexicalSpan {
-    end: usize,
-    is_comment: bool,
-}
-
-fn skip_lean_lexeme(src: &str, start: usize) -> Option<LeanLexicalSpan> {
-    let bytes = src.as_bytes();
-    let mut i = start;
-    let is_comment = src[start..].starts_with("--") || src[start..].starts_with("/-");
-    match *bytes.get(start)? {
-        b'-' if src[start..].starts_with("--") => {
-            i += 2;
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
-        }
-        b'/' if src[start..].starts_with("/-") => {
-            i += 2;
-            let mut depth = 1usize;
-            while i < bytes.len() && depth > 0 {
-                if bytes[i..].starts_with(b"/-") {
-                    depth += 1;
-                    i += 2;
-                } else if bytes[i..].starts_with(b"-/") {
-                    depth -= 1;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-        }
-        b'\'' => i = crate::splitter::scan_lean_char_lit_end(src, start)?,
-        b'"' => {
-            i += 1;
-            while i < bytes.len() {
-                match bytes[i] {
-                    b'\\' => i = (i + 2).min(bytes.len()),
-                    b'"' => {
-                        i += 1;
-                        break;
-                    }
-                    _ => i += 1,
-                }
-            }
-        }
-        b'r' if !src[..start]
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '\'') =>
-        {
-            i += 1;
-            while bytes.get(i) == Some(&b'#') {
-                i += 1;
-            }
-            let hashes = i - start - 1;
-            if bytes.get(i) != Some(&b'"') {
-                return None;
-            }
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == b'"'
-                    && bytes[i + 1..].starts_with(&bytes[start + 1..start + 1 + hashes])
-                {
-                    i += 1 + hashes;
-                    break;
-                }
-                i += 1;
-            }
-        }
-        _ => return None,
-    }
-    Some(LeanLexicalSpan { end: i, is_comment })
-}
-
 /// Audit-only stripping: preserve literal text, byte offsets, and newlines.
 /// The splitter's existing shared stripper deliberately retains its behavior.
 fn strip_audit_comments(src: &str) -> String {
@@ -156,18 +81,59 @@ pub(super) fn extract_all_lean_theorems(
     let clean_src = strip_audit_comments(clean_src);
     let chars: Vec<char> = clean_src.chars().collect();
     let byte_offsets: Vec<usize> = clean_src.char_indices().map(|(offset, _)| offset).collect();
-    let skip_at = |i: usize| {
+    let skip_literal_or_comment_at = |i: usize| {
+        skip_lean_lexeme(&clean_src, byte_offsets[i])
+            .filter(|span| span.is_comment || span.is_literal)
+            .map(|span| byte_offsets.partition_point(|offset| *offset < span.end))
+    };
+    let skip_any_lexeme_at = |i: usize| {
         skip_lean_lexeme(&clean_src, byte_offsets[i])
             .map(|span| byte_offsets.partition_point(|offset| *offset < span.end))
+    };
+    let scan_dotted_name = |mut pos: usize, n: usize| -> (String, usize) {
+        while pos < n && (chars[pos] == ' ' || chars[pos] == '\t') {
+            pos += 1;
+        }
+        let start = pos;
+        while pos < n {
+            if chars[pos] == '«' {
+                if let Some(end) = skip_any_lexeme_at(pos) {
+                    pos = end;
+                    continue;
+                }
+                break;
+            }
+            if is_ident_continue(chars[pos]) || chars[pos] == '.' {
+                pos += 1;
+            } else {
+                break;
+            }
+        }
+        let raw: String = chars[start..pos].iter().collect();
+        (raw.trim_end_matches('.').to_string(), pos)
+    };
+    let is_line_command_start = |word_idx: usize| -> bool {
+        let mut p = word_idx;
+        while p > 0 && (chars[p - 1] == ' ' || chars[p - 1] == '\t') {
+            p -= 1;
+        }
+        p == 0 || chars[p - 1] == '\n' || chars[p - 1] == ';'
     };
     let n = chars.len();
     let mut i = 0;
     let mut out = Vec::new();
+    let mut scope_stack: Vec<crate::splitter::ScopeFrame> = Vec::new();
 
     while i < n {
-        if let Some(end) = skip_at(i) {
+        if let Some(end) = skip_literal_or_comment_at(i) {
             i = end;
             continue;
+        }
+        if chars[i] == '«' {
+            if let Some(end) = skip_any_lexeme_at(i) {
+                i = end;
+                continue;
+            }
         }
         if is_ident_start(chars[i]) {
             let start = i;
@@ -175,23 +141,88 @@ pub(super) fn extract_all_lean_theorems(
                 i += 1;
             }
             let word: String = chars[start..i].iter().collect();
+            if is_line_command_start(start) {
+                if word == "namespace" && i < n && (chars[i] == ' ' || chars[i] == '\t') {
+                    let (ns_name, next_i) = scan_dotted_name(i, n);
+                    i = next_i;
+                    for seg in crate::splitter::split_lean_name_components(&ns_name) {
+                        scope_stack.push(crate::splitter::ScopeFrame {
+                            kind: crate::splitter::ScopeKind::Namespace,
+                            name: seg.to_string(),
+                            open_span_idx: 0,
+                        });
+                    }
+                    continue;
+                } else if word == "section" {
+                    let (sec_name, next_i) = if i < n && (chars[i] == ' ' || chars[i] == '\t') {
+                        scan_dotted_name(i, n)
+                    } else {
+                        (String::new(), i)
+                    };
+                    i = next_i;
+                    if sec_name.is_empty() {
+                        scope_stack.push(crate::splitter::ScopeFrame {
+                            kind: crate::splitter::ScopeKind::Section,
+                            name: String::new(),
+                            open_span_idx: 0,
+                        });
+                    } else {
+                        for seg in crate::splitter::split_lean_name_components(&sec_name) {
+                            scope_stack.push(crate::splitter::ScopeFrame {
+                                kind: crate::splitter::ScopeKind::Section,
+                                name: seg.to_string(),
+                                open_span_idx: 0,
+                            });
+                        }
+                    }
+                    continue;
+                } else if word == "mutual" && (i >= n || chars[i].is_whitespace()) {
+                    scope_stack.push(crate::splitter::ScopeFrame {
+                        kind: crate::splitter::ScopeKind::Mutual,
+                        name: String::new(),
+                        open_span_idx: 0,
+                    });
+                    continue;
+                } else if word == "end" && (i >= n || chars[i].is_whitespace()) {
+                    let (end_name, next_i) = if i < n && (chars[i] == ' ' || chars[i] == '\t') {
+                        scan_dotted_name(i, n)
+                    } else {
+                        (String::new(), i)
+                    };
+                    i = next_i;
+                    if end_name.is_empty() {
+                        scope_stack.pop();
+                    } else {
+                        for seg in crate::splitter::split_lean_name_components(&end_name)
+                            .into_iter()
+                            .rev()
+                        {
+                            let canon = crate::splitter::canonical_lean_name_component(seg);
+                            if let Some(pos) = scope_stack.iter().rposition(|f| {
+                                crate::splitter::canonical_lean_name_component(&f.name) == canon
+                            }) {
+                                scope_stack.truncate(pos);
+                            } else {
+                                scope_stack.pop();
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
             if word == "theorem" || word == "lemma" {
                 while i < n && chars[i].is_whitespace() {
                     i += 1;
                 }
-                let name_start = i;
-                while i < n && (is_ident_continue(chars[i]) || chars[i] == '.') {
-                    i += 1;
-                }
-                if i == name_start {
+                let (raw_decl_name, next_i) = scan_dotted_name(i, n);
+                if raw_decl_name.is_empty() {
                     continue;
                 }
-                let decl_name: String = chars[name_start..i].iter().collect();
+                i = next_i;
+                let decl_name = crate::splitter::qualified_decl_name(&raw_decl_name, &scope_stack);
                 let matches_filter = match target_name {
                     Some(t) if !t.is_empty() && t != "auto" => {
-                        decl_name == t
-                            || decl_name.ends_with(&format!(".{}", t))
-                            || t.ends_with(&format!(".{}", decl_name))
+                        crate::splitter::decl_name_matches_target(&decl_name, t)
                     }
                     _ => true,
                 };
@@ -205,7 +236,7 @@ pub(super) fn extract_all_lean_theorems(
                     if i >= n {
                         break;
                     }
-                    if let Some(end) = skip_at(i) {
+                    if let Some(end) = skip_any_lexeme_at(i) {
                         i = end;
                         continue;
                     }
@@ -229,7 +260,7 @@ pub(super) fn extract_all_lean_theorems(
                         let b_start = i;
                         let mut depth = 1usize;
                         while i < n && depth > 0 {
-                            if let Some(end) = skip_at(i) {
+                            if let Some(end) = skip_any_lexeme_at(i) {
                                 i = end;
                                 continue;
                             }
@@ -268,7 +299,7 @@ pub(super) fn extract_all_lean_theorems(
                 let mut pending_let_assign = false;
                 let mut stmt_end = n;
                 while i < n {
-                    if let Some(end) = skip_at(i) {
+                    if let Some(end) = skip_any_lexeme_at(i) {
                         i = end;
                         continue;
                     }
@@ -325,9 +356,6 @@ pub(super) fn extract_all_lean_theorems(
                             binders,
                             prop_str: trimmed,
                         });
-                        if matches!(target_name, Some(t) if !t.is_empty() && t != "auto") {
-                            break;
-                        }
                     }
                 }
             }
@@ -401,9 +429,7 @@ pub(super) fn extract_local_def_unfoldings(clean_src: &str) -> Vec<LocalDefUnfol
         }
         if line == "end" || line.starts_with("end ") {
             let end_ns = line.strip_prefix("end").unwrap_or("").trim();
-            if end_ns.is_empty() {
-                current_ns.clear();
-            } else if current_ns == end_ns {
+            if end_ns.is_empty() || current_ns == end_ns {
                 current_ns.clear();
             } else if let Some(prefix) = current_ns.strip_suffix(&format!(".{}", end_ns)) {
                 current_ns = prefix.to_string();
@@ -431,13 +457,10 @@ pub(super) fn extract_local_def_unfoldings(clean_src: &str) -> Vec<LocalDefUnfol
                 break;
             }
         }
-        let rest_kw = if let Some(r) = line.strip_prefix("def ") {
-            Some(r.trim())
-        } else if let Some(r) = line.strip_prefix("abbrev ") {
-            Some(r.trim())
-        } else {
-            None
-        };
+        let rest_kw = line
+            .strip_prefix("def ")
+            .or_else(|| line.strip_prefix("abbrev "))
+            .map(str::trim);
         let Some(first_rest) = rest_kw else {
             idx += 1;
             continue;
@@ -1759,6 +1782,7 @@ pub(super) fn audit_single_decl_spec_full(
     (res, pos_w, neg_w, drop_hyps)
 }
 
+#[allow(clippy::type_complexity)]
 pub(super) fn audit_single_decl_spec_full_with_policy(
     decl: &ExtractedDecl,
     local_defs: &[LocalDefUnfolding],
@@ -1969,7 +1993,7 @@ pub(super) fn extract_decls_fast(src: &str, decl_filter: Option<&str>) -> Vec<Ex
 }
 
 /// Schema version for the Blake3 content-addressed `audit-spec` per-file JSON cache.
-pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 12;
+pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 14;
 
 static AUDIT_SPEC_CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
@@ -2880,5 +2904,40 @@ theorem actualToo : True := by trivial
         ] {
             assert!(extract_all_lean_theorems(src, None).is_empty());
         }
+    }
+
+    #[test]
+    fn audit_spec_qualifies_namespaced_theorems_and_filters() {
+        let src = r#"
+namespace A
+section Hidden
+def msg := "
+end A
+"
+theorem bad (n : Nat) : True := by trivial
+theorem «good.one» (n : Nat) : n + 0 = n := by simp
+end Hidden
+end A
+theorem bad (n : Nat) : n = n := by rfl
+"#;
+        let all = extract_decls_fast(src, None);
+        assert_eq!(
+            all.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            ["A.bad", "A.«good.one»", "bad"]
+        );
+        let a_bad = audit_spec_file_or_source(Path::new("NsAudit.lean"), Some(src), Some("A.bad"));
+        assert_eq!(a_bad["ok"].as_bool(), Some(false));
+        assert_eq!(a_bad["total_specs_audited"].as_u64(), Some(1));
+        assert_eq!(a_bad["trivial_specs"].as_u64(), Some(1));
+
+        let root_bad =
+            audit_spec_file_or_source(Path::new("NsAudit.lean"), Some(src), Some("_root_.bad"));
+        assert_eq!(root_bad["total_specs_audited"].as_u64(), Some(1));
+        assert_eq!(root_bad["specs"][0]["decl"].as_str(), Some("bad"));
+
+        let good =
+            audit_spec_file_or_source(Path::new("NsAudit.lean"), Some(src), Some("A.«good.one»"));
+        assert_eq!(good["ok"].as_bool(), Some(true));
+        assert_eq!(good["total_specs_audited"].as_u64(), Some(1));
     }
 }

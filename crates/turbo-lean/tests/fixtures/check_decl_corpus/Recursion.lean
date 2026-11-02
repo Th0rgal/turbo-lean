@@ -1,7 +1,7 @@
 import Std
 
 namespace Corpus.Recursion
--- eth-act/clifv@5018b95 FV/Backend/Proof/DefGenOfV.lean: regsU/regsUL mutual
+-- FV/Backend/Proof/DefGenOfV.lean: regsU/regsUL mutual
 -- definitions, simp lemmas, and mem_regsUL structural recursion.
 mutual
   def even : Nat → Bool

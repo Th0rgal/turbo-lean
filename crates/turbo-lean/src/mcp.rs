@@ -1293,8 +1293,29 @@ pub fn execute_fast_check(
         if let Some(stmt) = stmt_src.filter(|s| !s.trim().is_empty()) {
             batch_pairs.push((decl_name.to_string(), stmt.to_string()));
         } else if let Some(f_str) = file.filter(|s| !s.trim().is_empty()) {
-            match fs::read_to_string(f_str) {
-                Ok(src_text) => batch_pairs.push((decl_name.to_string(), src_text)),
+            let raw_path = Path::new(f_str);
+            let resolved_path = if raw_path.is_relative() {
+                project_dir
+                    .map(|pd| pd.join(raw_path))
+                    .unwrap_or_else(|| raw_path.to_path_buf())
+            } else {
+                raw_path.to_path_buf()
+            };
+            match fs::read_to_string(&resolved_path) {
+                Ok(src_text) => {
+                    let proj_root = project_dir
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| crate::lake_build::find_project_root(&resolved_path));
+                    match crate::gpu_fastcheck::extract_confirmed_fastcheck_pairs(
+                        &src_text,
+                        decl,
+                        &proj_root,
+                        &resolved_path,
+                    ) {
+                        Ok(pairs) => batch_pairs = pairs,
+                        Err(e) => file_read_err = Some(format!("{:#}", e)),
+                    }
+                }
                 Err(e) => {
                     file_read_err = Some(format!("Failed to read `{}`: {}", f_str, e));
                 }
@@ -1560,7 +1581,12 @@ pub fn execute_mcp_agent_step(
 
     record_agent_call_telemetry(AgentCallTelemetry {
         tool_name: "turbo_agent_step".to_string(),
-        project_dir: project_dir.or_else(|| file.parent()).map(Path::to_path_buf),
+        project_dir: Some(
+            project_dir
+                .or_else(|| file.parent().filter(|p| !p.as_os_str().is_empty()))
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
+        ),
         decl_name: decl.map(|s| s.to_string()).or_else(|| {
             verbose
                 .get("decl")
@@ -1623,7 +1649,12 @@ pub fn execute_mcp_audit_spec(
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
     record_agent_call_telemetry(AgentCallTelemetry {
         tool_name: "turbo_audit_spec".to_string(),
-        project_dir: project_dir.or_else(|| file.parent()).map(Path::to_path_buf),
+        project_dir: Some(
+            project_dir
+                .or_else(|| file.parent().filter(|p| !p.as_os_str().is_empty()))
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
+        ),
         decl_name: decl.map(|s| s.to_string()),
         elapsed_ms,
         stage1_tpu_ms: elapsed_ms,
@@ -1679,6 +1710,11 @@ pub fn handle_mcp_jsonrpc_request(
         return id_opt.map(|id| serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} }));
     }
     let id = id_opt.unwrap_or(serde_json::Value::Null);
+
+    // New request, new Lake-input memo window: this server outlives many edits, so it must never
+    // answer from the input bytes a previous request read. See
+    // `module_builder::reset_lake_inputs_tag_memo`.
+    crate::module_builder::reset_lake_inputs_tag_memo();
 
     match method {
         "initialize" => Some(serde_json::json!({
@@ -1930,6 +1966,7 @@ pub fn handle_mcp_jsonrpc_request(
 /// Read the next JSON-RPC 2.0 message from `reader`, supporting both:
 /// 1. `Content-Length: <N>\r\n\r\n<payload>` framed MCP messages, and
 /// 2. Newline-delimited JSON-RPC 2.0 lines (`{...}\n`).
+///
 /// Returns `Ok(Some((request_value, was_content_length_framed)))` or `Ok(None)` on EOF.
 pub fn read_next_mcp_message<R: BufRead>(
     reader: &mut R,

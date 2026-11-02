@@ -2,6 +2,7 @@ import Lean
 import LeanNative.Semantics.Eval
 import LeanNative.Proofs.SymbolicTV
 import LeanNative.Backend.LLVM
+import LeanNative.IR.Bridge
 
 /-!
 # HeapObj contract regressions (`docs/HEAPOBJ_CONTRACT.md`, D1 step 5a)
@@ -198,8 +199,47 @@ open Lean Compiler LCNF in
       | .scalar sz off ty => s!"scalar size={sz} off={off} {ty}"
       | _ => "erased")
 
--- UNCOVERED(C1.2-scalar-lowering): `main`'s emitter has no `getCtorLayout`-driven `lean_ctor_get_usize`/`_uintN`
--- lowering; only the Lean layout itself is pinned (`layout_lean_runtime_offsets`).
+/-- Mixed-scalar ADT (`UInt8`, `UInt64`, `USize`) lowered by the Bridge under `allowRcAdt = true` (C1.2). -/
+inductive ScalarLoweringProbe where
+  | mk (b : UInt8) (c : UInt64) (d : USize)
+  | z (q : UInt32)
+
+@[noinline] def scalarLoweringProbeMk (k : UInt64) : ScalarLoweringProbe := .mk k.toUInt8 (k * 3) k.toUSize
+
+@[noinline] def scalarLoweringProbeSum : ScalarLoweringProbe → UInt64
+  | .mk b c d => b.toUInt64 + c + d.toUInt64
+  | .z q => q.toUInt64
+
+def scalarLoweringProbeRun (ds : List LNIRDecl) (k : UInt64) : Option (List Val × Val) := do
+  let mk ← ds.find? (·.name.endsWith "scalarLoweringProbeMk")
+  let sum ← ds.find? (·.name.endsWith "scalarLoweringProbeSum")
+  let (o, st) ← (evalCode 4096 (VarEnv.empty.bind 0 (.u64 k)) .empty mk.body).toOption
+  let env := VarEnv.empty.bind 1 o
+  let slots ← [0, 1, 2].mapM fun i => (evalCtorGet env st 1 i false).toOption.map Prod.fst
+  let p ← sum.params.head?
+  let (r, _) ← (evalCode 4096 (VarEnv.empty.bind p.id o) st sum.body).toOption
+  return (slots, r)
+
+/-- Contract (C1.2): `getRcCtorLayoutSpecM` and Bridge lowering place `usize` slots first (`d ↦ 0`), then scalar
+    slots sorted by ascending byte offset (`c ↦ 1` at `off = 0`, `b ↦ 2` at `off = 8`), and lowered projections
+    read back those exact slots. -/
+def scalarLoweringContract : Lean.CoreM Bool := do
+  let spec ← LeanNative.IR.getRcCtorLayoutSpecM ``LayoutProbe.mk
+  let specOk := spec.objSlots == 1 && spec.usizeSlots == 1 &&
+    spec.usizeSlot? 1 == some (0, .usize) &&
+    spec.scalarSlot? 2 0 == some (1, .i64) &&
+    spec.scalarSlot? 2 8 == some (2, .i8) &&
+    spec.scalarSlot? 1 0 == none
+  let ds := (← LeanNative.IR.ingestModuleDecls #[``scalarLoweringProbeMk, ``scalarLoweringProbeSum]
+    "HeapObjContract" .x86_64 true).decls
+  let bridgeOk := [0, 5, 0x1_0107].all fun k =>
+    scalarLoweringProbeRun ds k == some ([.u64 k, .u64 (k * 3), .u64 (k &&& 0xFF)], .u64 ((k &&& 0xFF) + k * 3 + k))
+  return specOk && bridgeOk
+
+-- REGRESSION(layout_scalar_lowering_follows_getCtorLayout)
+/-- info: true -/
+#guard_msgs in
+#eval scalarLoweringContract
 
 /-! ## C2 tagged immediates -/
 
@@ -702,12 +742,11 @@ def prjOK (heapPath : String) (off : Nat := 8) : Bool := IRCheck.projectionLoads
 #guard prjOK "  %a = getelementptr inbounds i8, ptr %p, i64 16\n  %r = load ptr, ptr %a, align 8\n  ret ptr %r\n" 16
 
 -- REGRESSION(codegen_projection_guarded_field_load)
--- XFAIL(heapobj-contract): flips in 5b — #300 emits the guarded field load at `P + 8` (`declDerefs` is `[true]`),
--- but stores it to `%slot_v1` in `proj_heap_7` and reloads it in `proj_cont_10`; the block-local reload rule
--- (`IRCheck.Fn.reachingStore`) resolves that cross-block reload to `uninitOrigin`, so the returned value is not
--- recognised as the field load. Flips once the emitter returns the load without a cross-block slot round-trip, or
--- the reload rule is made CFG-aware.
-#guard !projectionGuardedLoad
+-- Flipped by C6. Was XFAIL on `main` / 5b: `emitLetExpr` emitted the guarded field load at `P + 8` (`declDerefs`
+-- is `[true]`), then stored `%proj_val` to `%slot_v1` in `proj_heap` and reloaded it in `proj_cont`, which the
+-- block-local `IRCheck.Fn.reachingStore` resolved to `uninitOrigin`. Forwarding the dominating SSA `%proj_val`
+-- across `proj_cont` returns the guarded field load directly without a cross-block slot reload.
+#guard projectionGuardedLoad
 #guard declDerefs projDecl == [true]
 
 -- REGRESSION(codegen_tag_read_rejected)
@@ -931,13 +970,49 @@ def chainReleaseTotalOrError : Bool :=
 -- Holds since #280 at every evaluator fuel in `0..64`: `.error`, or `.ok` with the child freed.
 #guard chainReleaseTotalOrError
 
--- UNCOVERED(C5.1-fuelExhausted-ctor): `main` (#280) releases recursively, but `UBError` has no `fuelExhausted`
--- constructor and `decRefObjFuel 0 st _ _ = .ok st`, so there is no distinguished exhaustion error to assert; on
--- well-formed heaps `decRefObj`'s fuel (`|heapObjs| + 1`) covers the release depth. The counting rule is pinned by
--- `fuel_bound_boundary`; 5b adds `.fuelExhausted` and its regression.
--- UNCOVERED(C5.4-underfueled-helper): `main`'s `decRefObjFuel` (#280) returns a partial `.ok st` at fuel 0 (no
--- `fuelExhausted` constructor exists); `decRefValsFuel` does not exist. 5b adds the regression "underfuelled call
--- ⇒ `.error .fuelExhausted`, never partial `.ok`".
+/-- Concrete `HeapState` for P-cert C3 (100 owning edges to `childId`, exact release bound `B = 103`). -/
+def c3Heap : HeapState :=
+  ((heapWithChild 100).allocHeapCtor 0 (List.replicate 100 (.objPtr childId)) []).2
+
+/-- Concrete `HeapState` for the 4-object chain (exact release bound `B = 8`). -/
+def chainHeap : HeapState :=
+  (List.range 3).foldl (fun st _ => (st.allocHeapCtor 0 [.objPtr st.nextId] []).2) (heapWithChild 1)
+
+/-- Malformed cyclic `HeapState` (`2` owns itself): `decRefObj` frees `2` and then encounters `.objPtr 2` at `rc = 0`,
+    rejecting the cycle with `.error (.useAfterFree 2)` rather than returning a partial `.ok`. -/
+def cyclicHeap : HeapState :=
+  { HeapState.empty with
+    nextId := 2
+    refCounts := [(true, 2, 1)]
+    heapObjs := [{ id := 2, tag := 0, objFields := [.objPtr 2], scalarFields := [] }] }
+
+/-- Contract (C5.1): recursive release has the distinguished `UBError.fuelExhausted` constructor (returned on fuel
+    exhaustion by `decRefObjFuel`, `decRefValsFuel`, and `evalCode`'s `parFor` budget), rejects malformed cyclic
+    heaps with `.error` (never a partial `.ok`), and releases well-formed heaps (`c3Heap`, `chainHeap`) completely. -/
+def decRefFuelExhaustedCtor : Bool :=
+  (match c3Heap.decRefObjFuel 102 c3Heap.nextId 1 with | .error .fuelExhausted => true | _ => false) &&
+  (match HeapState.decRefValsFuel 7 chainHeap [.objPtr chainHeap.nextId] with | .error .fuelExhausted => true | _ => false) &&
+  (match evalCode 4096 (VarEnv.empty.bind 0 (.objPtr 2)) cyclicHeap (.decRef 0 1 retZero) with
+   | .error _ => true | .ok _ => false) &&
+  allReleased (c3Heap.decRefObj c3Heap.nextId 1 |>.map (.unit, ·)) &&
+  allReleased (chainHeap.decRefObj chainHeap.nextId 1 |>.map (.unit, ·))
+
+-- REGRESSION(decref_fuelExhausted_ctor_distinguished)
+#guard decRefFuelExhaustedCtor
+
+/-- Contract (C5.4): exposed helpers `decRefObjFuel` and `decRefValsFuel` are total-or-error for every fuel argument:
+    exact bound `B` (`103` on `c3Heap`, `8` on `chainHeap`) releases completely, and every underfueled call
+    `0 ≤ f < B` returns `.error .fuelExhausted` (never a partial `.ok`). -/
+def underfueledHelpersTotalOrError : Bool :=
+  [(c3Heap, c3Heap.nextId, 103), (chainHeap, chainHeap.nextId, 8)].all fun (st, root, b) =>
+    allReleased (st.decRefObjFuel b root 1 |>.map (.unit, ·)) &&
+    allReleased (HeapState.decRefValsFuel b st [.objPtr root] |>.map (.unit, ·)) &&
+    (List.range b).all fun f =>
+      (match st.decRefObjFuel f root 1 with | .error .fuelExhausted => true | _ => false) &&
+      (match HeapState.decRefValsFuel f st [.objPtr root] with | .error .fuelExhausted => true | _ => false)
+
+-- REGRESSION(decref_underfueled_helpers_total_or_error)
+#guard underfueledHelpersTotalOrError
 
 /-! ## C4 exclusivity: `ctor_set` / `del` only when `rc == 1`, else UB error -/
 
@@ -1070,10 +1145,36 @@ def ctorSetNestedTupleRejected : Bool :=
 #guard_msgs in
 #eval IO.println (showRes ctorSetMalformed)
 
--- UNCOVERED(C4.2-uset-sset): `main` has no scalar-slot `ctor_set` (`uset`/`sset`) call name, so scalar-slot
--- bounds and exclusivity cannot be exercised.
--- UNCOVERED(C4.2-setTag): `main` has no `setTag` / `lean_ctor_set_tag` operation and no call name for it;
--- 5b adds it with the same exclusive / shared / freed regressions as `ctor_set`.
+def scalarSet : LNIRExpr := .call "lean_native_ctor_set_scalar" [1, idxZero, 21] .unit
+
+/-- `withCtor shareCount op`, then read `read` back. -/
+def mutateThenRead (shareCount : Nat) (op read : LNIRExpr) : Except UBError (Val × HeapState) :=
+  run (heapWithChild 1) (.letBind 1 .objPtr (.allocCtor 0 [0] [20])
+    (.incRef 1 shareCount (.letBind 3 .unit op (.letBind 4 .i64 read (.ret 4)))))
+
+/-- Contract (C4.2, `uset`/`sset`): exclusive scalar-slot `ctor_set` updates `scalarFields[0]` in place without
+    touching `objFields[0]`; shared ⇒ `.nonExclusiveWrite`; freed ⇒ `.useAfterFree`; out-of-range ⇒ `outOfBounds 5 1`. -/
+def scalarSetContract : Bool :=
+  retVal? (mutateThenRead 0 scalarSet (.ctorGetScalar 1 0 .i64)) == some (.u64 43) &&
+  retVal? (mutateThenRead 0 scalarSet (.ctorGetObj 1 0)) == some (.objPtr childId) &&
+  isNonExclusiveWrite (withCtor 1 scalarSet) && isUseAfterFree (onFreedCtor scalarSet) &&
+  (match withCtor 0 (.call "lean_native_ctor_set_scalar" [1, idxFive, 21] .unit) with
+   | .error (.outOfBounds 5 1) => true | _ => false)
+
+-- REGRESSION(ctor_set_scalar_slot_exclusive_shared_freed)
+#guard scalarSetContract
+
+def setTag : LNIRExpr := .call "lean_native_ctor_set_tag" [1, 21] .unit
+
+/-- Contract (C4.2, `setTag` / `lean_ctor_set_tag`): exclusive ⇒ tag becomes `43` with fields unchanged;
+    shared ⇒ `.nonExclusiveWrite`; freed ⇒ `.useAfterFree`. -/
+def setTagContract : Bool :=
+  retVal? (mutateThenRead 0 setTag (.call "lean_native_ctor_tag" [1] .i64)) == some (.u64 43) &&
+  retVal? (mutateThenRead 0 setTag (.ctorGetScalar 1 0 .i64)) == some (.u64 42) &&
+  isNonExclusiveWrite (withCtor 1 setTag) && isUseAfterFree (onFreedCtor setTag)
+
+-- REGRESSION(set_tag_exclusive_shared_freed)
+#guard setTagContract
 
 /-- Contract (C4.2 freed): `ctor_set` and `del` on a freed object are `.useAfterFree` (not
     `nonExclusiveWrite`, not `unsupportedCall`). -/
@@ -1159,7 +1260,19 @@ def symtvSourceFuelExhaustionFailsClosed : Bool := !(validateTranslationDecl fue
 #guard_msgs in
 #eval IO.println (showRes (fuelHungrySample 256 0))
 
--- UNCOVERED(C6.3-rc-exhaustion-sample): `main`'s `evalCode` has no RC/heap-exhaustion error (#280's release
--- returns `.ok` when its fuel runs out), so no concrete sample can produce one; 5b adds it with `fuelExhausted`.
+/-- Contract (C6.3): RC/heap release exhaustion (`decRefObjFuel` below `B`) and source sample exhaustion (`evalCode`
+    at the validator's fuel floor) share the distinguished `.fuelExhausted` constructor, which `checkDeclConcreteRefinement`
+    counts as a failed sample (`concreteRefines = false`, `passed = false`), while a cyclic heap through `evalCode`
+    is `.error` and never `.ok`. -/
+def rcExhaustionSampleFailsClosed : Bool :=
+  let r := validateTranslationDecl fuelHungry fuelHungry
+  (match evalCode 4096 (VarEnv.empty.bind 0 (.objPtr 2)) cyclicHeap (.decRef 0 1 retZero) with
+   | .error _ => true | .ok _ => false) &&
+  (match c3Heap.decRefObjFuel 50 c3Heap.nextId 1 with | .error .fuelExhausted => true | _ => false) &&
+  (match fuelHungrySample 256 0 with | .error .fuelExhausted => true | _ => false) &&
+  !r.concreteRefines && !r.passed
+
+-- REGRESSION(symtv_rc_exhaustion_sample_fails_closed)
+#guard rcExhaustionSampleFailsClosed
 
 end LeanNative.Tests.HeapObjContract

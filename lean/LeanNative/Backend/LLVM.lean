@@ -248,6 +248,7 @@ structure EmitState where
   varTypes  : List (VarId × LNIRType)
   nextTmp   : Nat := 0
   scalarBindings : List (VarId × String) := []
+  ptrBindings    : List (VarId × String) := []
   lines     : List String := []
   deriving Inhabited
 
@@ -305,20 +306,24 @@ def loadVarAsI256 (vid : VarId) : EmitM String := do
 
 /-- Load a `VarId` as an LLVM `ptr` SSA value (converting `i64` via `inttoptr` if necessary). -/
 def loadVarAsPtr (vid : VarId) : EmitM String := do
-  let (llvmTy, raw) ← loadVarSlotRaw vid "ldp"
-  if llvmTy == "ptr" then return raw
-  else if llvmTy == "i64" || llvmTy == "i256" then
-    let v64 ← if llvmTy == "i64" then pure raw else do
-      let tr ← freshTmp "tr64"
-      emitLine s!"  {tr} = trunc i256 {raw} to i64"
-      pure tr
-    let c ← freshTmp "i2p"
-    emitLine s!"  {c} = inttoptr i64 {v64} to ptr"
-    return c
-  else return "null"
+  match (← get).ptrBindings.lookup vid with
+  | some v => return v
+  | none =>
+    let (llvmTy, raw) ← loadVarSlotRaw vid "ldp"
+    if llvmTy == "ptr" then return raw
+    else if llvmTy == "i64" || llvmTy == "i256" then
+      let v64 ← if llvmTy == "i64" then pure raw else do
+        let tr ← freshTmp "tr64"
+        emitLine s!"  {tr} = trunc i256 {raw} to i64"
+        pure tr
+      let c ← freshTmp "i2p"
+      emitLine s!"  {c} = inttoptr i64 {v64} to ptr"
+      return c
+    else return "null"
 
 /-- Store an `i64` SSA value into `%slot_v{dst}`, coercing to the slot's type if needed. -/
 def storeI64ToVar (dst : VarId) (valI64 : String) : EmitM Unit := do
+  modify fun st => { st with ptrBindings := st.ptrBindings.filter (·.1 != dst) }
   let llvmTy := slotLLVMType (← getVarSlotType dst)
   if llvmTy == "i64" then
     emitLine s!"  store i64 {valI64}, ptr %slot_v{dst}, align 8"
@@ -335,6 +340,7 @@ def storeI64ToVar (dst : VarId) (valI64 : String) : EmitM Unit := do
 
 /-- Store an `i256` SSA value into `%slot_v{dst}`, coercing to the slot's type if needed. -/
 def storeI256ToVar (dst : VarId) (valI256 : String) : EmitM Unit := do
+  modify fun st => { st with ptrBindings := st.ptrBindings.filter (·.1 != dst) }
   let llvmTy := slotLLVMType (← getVarSlotType dst)
   if llvmTy == "i256" then
     emitLine s!"  store i256 {valI256}, ptr %slot_v{dst}, align 8"
@@ -347,6 +353,7 @@ def storeI256ToVar (dst : VarId) (valI256 : String) : EmitM Unit := do
 
 /-- Store a `ptr` SSA value into `%slot_v{dst}`, coercing to the slot's type if needed. -/
 def storePtrToVar (dst : VarId) (valPtr : String) : EmitM Unit := do
+  modify fun st => { st with ptrBindings := st.ptrBindings.filter (·.1 != dst) }
   let llvmTy := slotLLVMType (← getVarSlotType dst)
   if llvmTy == "ptr" then
     emitLine s!"  store ptr {valPtr}, ptr %slot_v{dst}, align 8"
@@ -774,6 +781,8 @@ def emitLetExpr (dst : VarId) (ty : LNIRType) (expr : LNIRExpr) : EmitM Unit := 
     storePtrToVar dst v
     let contLbl ← freshLabel "proj_cont"
     emitLine s!"  br label %{contLbl}\n{trapLbl}:\n  call void @llvm.trap()\n  unreachable\n{contLbl}:"
+    if slotLLVMType (← getVarSlotType dst) == "ptr" then
+      modify fun st => { st with ptrBindings := (dst, v) :: st.ptrBindings.filter (·.1 != dst) }
   | .isExclusive objVar =>
     -- C2.3 / P-cert C5: `lean_is_exclusive` tests null and the tag bit before reading `m_rc`;
     -- an immediate is (trivially) exclusive, matching `Eval` on tagged scalars.
@@ -1143,8 +1152,13 @@ partial def emitCode (code : LNIRCode) (retTy : LNIRType)
         emitLine s!"  switch i64 {discrVal}, label %{defLbl} ["
         for (caseLbl, tagVal, _) in labeledCases do emitLine s!"    i64 {tagVal}, label %{caseLbl}"
         emitLine "  ]"
-        for (caseLbl, _, brCode) in labeledCases do emitLine s!"{caseLbl}:"; emitCode brCode retTy loopAccTarget
+        for (caseLbl, _, brCode) in labeledCases do
+          let savedPtrs := (← get).ptrBindings
+          emitLine s!"{caseLbl}:"; emitCode brCode retTy loopAccTarget
+          modify fun s => { s with ptrBindings := savedPtrs }
+        let savedPtrs := (← get).ptrBindings
         emitLine s!"{defLbl}:"; emitCode defaultBranch retTy loopAccTarget
+        modify fun s => { s with ptrBindings := savedPtrs }
       else emitLetExpr dst ty val; emitCode k retTy loopAccTarget
     | none =>
       let st ← get
@@ -1195,10 +1209,13 @@ partial def emitCode (code : LNIRCode) (retTy : LNIRType)
       let cVal ← loadVarAsI64 condVar
       emitLine s!"  {cBool} = icmp ne i64 {cVal}, 0"
     emitLine s!"  br i1 {cBool}, label %{thenLbl}, label %{elseLbl}"
+    let savedPtrs := (← get).ptrBindings
     emitLine s!"{thenLbl}:"
     emitCode thenBranch retTy loopAccTarget
+    modify fun s => { s with ptrBindings := savedPtrs }
     emitLine s!"{elseLbl}:"
     emitCode elseBranch retTy loopAccTarget
+    modify fun s => { s with ptrBindings := savedPtrs }
   | .seqFor idxVar loVar hiVar accVar accInit _ stepBody k =>
     let loVal ← loadVarAsI64 loVar
     let hiVal ← loadVarAsI64 hiVar
@@ -1216,8 +1233,10 @@ partial def emitCode (code : LNIRCode) (retTy : LNIRType)
     storeI64ToVar idxVar curIdx
     emitLine s!"  {cmp} = icmp ult i64 {curIdx}, {hiVal}"
     emitLine s!"  br i1 {cmp}, label %{bodyLbl}, label %{exitLbl}"
+    let savedPtrs := (← get).ptrBindings
     emitLine s!"{bodyLbl}:"
     emitCode stepBody retTy (some (accVar, latchLbl))
+    modify fun s => { s with ptrBindings := savedPtrs.filter (·.1 != accVar) }
     emitLine s!"{latchLbl}:"
     let addOp := if opt then "add nuw nsw i64" else "add i64"
     emitLine s!"  {idxNext} = {addOp} {curIdx}, 1"

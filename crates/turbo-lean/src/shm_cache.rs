@@ -433,11 +433,15 @@ pub fn user_config_toml_path() -> PathBuf {
 /// Locate the nearest `turbo-lean.toml` or `.turbo-lean.toml` walking upward from `start_dir` (or CWD).
 pub fn find_nearest_project_toml(start_dir: Option<&Path>) -> Option<PathBuf> {
     let dir = start_dir
+        .filter(|p| !p.as_os_str().is_empty())
         .map(|p| {
             if p.is_dir() {
                 p.to_path_buf()
             } else {
-                p.parent().unwrap_or_else(|| Path::new(".")).to_path_buf()
+                p.parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf()
             }
         })
         .or_else(|| std::env::current_dir().ok())?;
@@ -486,8 +490,13 @@ where
     let dir = start_dir.map(|p| {
         if p.is_dir() {
             p.to_path_buf()
+        } else if p.as_os_str().is_empty() {
+            PathBuf::from(".")
         } else {
-            p.parent().unwrap_or_else(|| Path::new(".")).to_path_buf()
+            p.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
         }
     })?;
     for rel in extra_project_rels {
@@ -526,6 +535,10 @@ pub fn default_max_shm_bytes() -> u64 {
 }
 
 fn stage_unique_tmp_path(target: &Path) -> std::io::Result<PathBuf> {
+    stage_unique_tmp_path_ext(target, "tmp")
+}
+
+fn stage_unique_tmp_path_ext(target: &Path, ext: &str) -> std::io::Result<PathBuf> {
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
     if !parent.as_os_str().is_empty() && !parent.exists() {
         fs::create_dir_all(parent)?;
@@ -540,35 +553,452 @@ fn stage_unique_tmp_path(target: &Path) -> std::io::Result<PathBuf> {
         .unwrap_or_default()
         .as_nanos();
     Ok(parent.join(format!(
-        ".{}.{}.{}.{}.tmp",
+        ".{}.{}.{}.{}.{}",
         file_name,
         std::process::id(),
         seq,
-        nanos
+        nanos,
+        ext
     )))
 }
 
 /// Atomically write `bytes` to `target` by staging into a process+sequence-unique temporary file
 /// in `target.parent()` and invoking `fs::rename` over `target`.
 pub fn atomic_write_shm(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp_path = stage_unique_tmp_path(target)?;
-    let write_res = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&tmp_path)
-        .and_then(|mut f| f.write_all(bytes));
-    if let Err(e) = write_res {
+    let (mut tmp_f, tmp_path) = match open_unique_exclusive_tmp(target, 0o644) {
+        Ok(pair) => pair,
+        Err(e) => {
+            debug_log_cache_err("atomic_write_shm(open)", &e);
+            return Err(e);
+        }
+    };
+    if let Err(e) = tmp_f.write_all(bytes) {
+        drop(tmp_f);
         let _ = fs::remove_file(&tmp_path);
         debug_log_cache_err("atomic_write_shm(write)", &e);
         return Err(e);
     }
+    drop(tmp_f);
     if let Err(e) = fs::rename(&tmp_path, target) {
         let _ = fs::remove_file(&tmp_path);
         debug_log_cache_err("atomic_write_shm(rename)", &e);
         return Err(e);
     }
     Ok(())
+}
+
+pub(crate) struct StagingLeaseGuard {
+    lock_path: PathBuf,
+    _lease: Option<FlockGuard>,
+}
+
+impl StagingLeaseGuard {
+    pub(crate) fn acquire_for_target(target: &Path) -> std::io::Result<Self> {
+        if let Some(parent) = target.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        #[cfg(unix)]
+        let mut dir_lease = lock_staging_parent_dir(target, false, false)?;
+        let lock_path = staging_lease_lock_path(target);
+        let lease = match acquire_staging_lease(&lock_path) {
+            Ok(l) => l,
+            Err(e) => {
+                #[cfg(unix)]
+                drop(dir_lease);
+                return Err(e);
+            }
+        };
+        #[cfg(unix)]
+        drop(dir_lease.take());
+        Ok(Self {
+            lock_path,
+            _lease: lease,
+        })
+    }
+}
+
+impl Drop for StagingLeaseGuard {
+    fn drop(&mut self) {
+        let _ = self._lease.take();
+        let _ = reap_stale_lock_if_unheld(&self.lock_path);
+    }
+}
+
+pub fn is_staging_lease_held_on_self_or_ancestor(target: &Path, root: &Path) -> bool {
+    let mut cur = target;
+    loop {
+        if is_staging_lease_held(cur) {
+            return true;
+        }
+        let Some(parent) = cur.parent() else {
+            break;
+        };
+        if parent == cur || parent == root {
+            break;
+        }
+        cur = parent;
+    }
+    false
+}
+
+pub struct StagedTempFile {
+    path: PathBuf,
+    _lease: Option<FlockGuard>,
+}
+
+impl StagedTempFile {
+    pub fn write(path: PathBuf, bytes: impl AsRef<[u8]>) -> std::io::Result<Self> {
+        Self::stage_with_lease(path, bytes.as_ref())
+    }
+
+    pub fn reserve(path: PathBuf) -> std::io::Result<Self> {
+        Self::stage_with_lease(path, &[])
+    }
+
+    fn stage_with_lease(path: PathBuf, bytes: &[u8]) -> std::io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        #[cfg(unix)]
+        let mut dir_lease = lock_staging_parent_dir(&path, false, false)?;
+        let lock_path = staging_lease_lock_path(&path);
+        let lease = match acquire_staging_lease(&lock_path) {
+            Ok(l) => l,
+            Err(e) => {
+                #[cfg(unix)]
+                drop(dir_lease);
+                return Err(e);
+            }
+        };
+        #[cfg(unix)]
+        drop(dir_lease.take());
+        if let Err(e) = replace_staged_payload_nofollow(&path, bytes) {
+            drop(lease);
+            let _ = reap_stale_lock_if_unheld(&lock_path);
+            return Err(e);
+        }
+        Ok(Self {
+            path,
+            _lease: lease,
+        })
+    }
+
+    pub fn overwrite(&self, bytes: &[u8]) -> std::io::Result<()> {
+        replace_staged_payload_nofollow(&self.path, bytes)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn replace_staged_payload_nofollow(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if !meta.file_type().is_file() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("refusing non-regular staged target path {}", path.display()),
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let (mut tmp_f, tmp_path) = open_unique_exclusive_tmp_ext(path, 0o600, "stgtmp")?;
+    let res = (|| -> std::io::Result<()> {
+        if !bytes.is_empty() {
+            tmp_f.write_all(bytes)?;
+        }
+        match fs::symlink_metadata(path) {
+            Ok(meta) if !meta.file_type().is_file() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("refusing non-regular staged target path {}", path.display()),
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        fs::rename(&tmp_path, path)?;
+        #[cfg(unix)]
+        if !inode_matches_nofollow(&tmp_f, path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "staged target path {} changed during atomic replacement",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(())
+    })();
+    drop(tmp_f);
+    let _ = fs::remove_file(&tmp_path);
+    res
+}
+
+fn open_unique_exclusive_tmp(target: &Path, mode: u32) -> std::io::Result<(fs::File, PathBuf)> {
+    open_unique_exclusive_tmp_ext(target, mode, "tmp")
+}
+
+fn open_unique_exclusive_tmp_ext(
+    target: &Path,
+    mode: u32,
+    ext: &str,
+) -> std::io::Result<(fs::File, PathBuf)> {
+    for _ in 0..16 {
+        let tmp_path = stage_unique_tmp_path_ext(target, ext)?;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(mode).custom_flags(libc::O_NOFOLLOW);
+        }
+        match opts.open(&tmp_path) {
+            Ok(f) => return Ok((f, tmp_path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "could not allocate unique exclusive staging file for {}",
+            target.display()
+        ),
+    ))
+}
+
+impl std::ops::Deref for StagedTempFile {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for StagedTempFile {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for StagedTempFile {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.path.as_os_str()
+    }
+}
+
+impl Drop for StagedTempFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+        // Drop our `LOCK_SH` fd before attempting best-effort `LOCK_EX | LOCK_NB` sidecar cleanup.
+        let _ = self._lease.take();
+        let _ = reap_stale_lock_if_unheld(&staging_lease_lock_path(&self.path));
+    }
+}
+
+fn staging_lease_lock_path(target: &Path) -> PathBuf {
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let fname = target
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_else(|| std::borrow::Cow::Borrowed("staged"));
+    parent.join(format!(".{}.lease.lock", fname))
+}
+
+#[cfg(unix)]
+fn lock_staging_parent_dir(
+    child_path: &Path,
+    exclusive: bool,
+    nonblocking: bool,
+) -> std::io::Result<Option<FlockGuard>> {
+    let parent = match child_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let dir_f = fs::File::open(parent)?;
+    flock_file(dir_f, exclusive, nonblocking)
+}
+
+#[cfg(unix)]
+fn file_inode_key(f: &fs::File) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    f.metadata().ok().map(|m| (m.dev(), m.ino()))
+}
+
+#[cfg(unix)]
+fn path_nofollow_inode_key(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+#[cfg(unix)]
+fn inode_matches_nofollow(f: &fs::File, path: &Path) -> bool {
+    matches!(
+        (file_inode_key(f), path_nofollow_inode_key(path)),
+        (Some(a), Some(b)) if a == b
+    )
+}
+
+#[cfg(test)]
+type AfterSidecarOpenHook = std::rc::Rc<dyn Fn(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_SIDECAR_OPEN_HOOK: std::cell::RefCell<Option<AfterSidecarOpenHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn acquire_staging_lease(lock_path: &Path) -> std::io::Result<Option<FlockGuard>> {
+    for attempt in 0..4096u32 {
+        if let Some(parent) = lock_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).read(true).write(true).truncate(false);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::custom_flags(&mut opts, libc::O_NOFOLLOW);
+        let f = opts.open(lock_path)?;
+        #[cfg(test)]
+        if let Some(hook) = AFTER_SIDECAR_OPEN_HOOK.with(|h| h.borrow().clone()) {
+            hook(lock_path);
+        }
+        let Some(guard) = flock_file(f, false, false)? else {
+            continue;
+        };
+        #[cfg(unix)]
+        if !inode_matches_nofollow(&guard.0, lock_path) {
+            drop(guard);
+            if attempt >= 4 {
+                std::thread::yield_now();
+            }
+            continue;
+        }
+        #[cfg(not(unix))]
+        let _ = attempt;
+        return Ok(Some(guard));
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "staging lease sidecar contended during acquisition",
+    ))
+}
+
+fn try_lock_sidecar(lock_path: &Path, create: bool) -> Option<FlockGuard> {
+    for _ in 0..16u8 {
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true).write(true).create(create).truncate(false);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::custom_flags(&mut opts, libc::O_NOFOLLOW);
+        let f = opts.open(lock_path).ok()?;
+        let guard = flock_file(f, true, true).ok()??;
+        #[cfg(unix)]
+        if !inode_matches_nofollow(&guard.0, lock_path) {
+            drop(guard);
+            if create {
+                continue;
+            }
+            return None;
+        }
+        return Some(guard);
+    }
+    None
+}
+
+fn try_lock_unheld_sidecar(lock_path: &Path) -> Option<FlockGuard> {
+    try_lock_sidecar(lock_path, false)
+}
+
+pub fn try_remove_unleased_staged_file(target: &Path) -> bool {
+    if fs::symlink_metadata(target).is_err() {
+        return false;
+    }
+    #[cfg(unix)]
+    let _dir_guard = match lock_staging_parent_dir(target, true, true) {
+        Ok(Some(g)) => Some(g),
+        _ => return false,
+    };
+    let lock_path = staging_lease_lock_path(target);
+    let Some(guard) = try_lock_sidecar(&lock_path, true) else {
+        return false;
+    };
+    let removed = fs::remove_file(target).is_ok();
+    if fs::symlink_metadata(target).is_err() {
+        let _ = fs::remove_file(&lock_path);
+    }
+    drop(guard);
+    removed
+}
+
+pub fn try_remove_unleased_staged_dir(target: &Path) -> bool {
+    if !fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_dir()) {
+        return false;
+    }
+    #[cfg(unix)]
+    let _dir_guard = match lock_staging_parent_dir(target, true, true) {
+        Ok(Some(g)) => Some(g),
+        _ => return false,
+    };
+    let lock_path = staging_lease_lock_path(target);
+    let Some(guard) = try_lock_sidecar(&lock_path, true) else {
+        return false;
+    };
+    crate::check::thaw_private_dir_tree(target);
+    let removed = fs::remove_dir_all(target).is_ok();
+    if fs::symlink_metadata(target).is_err() {
+        let _ = fs::remove_file(&lock_path);
+    }
+    drop(guard);
+    removed
+}
+
+pub fn reap_stale_lock_if_unheld(lock_path: &Path) -> bool {
+    #[cfg(unix)]
+    let _dir_guard = match lock_staging_parent_dir(lock_path, true, true) {
+        Ok(Some(g)) => Some(g),
+        _ => return false,
+    };
+    let Some(guard) = try_lock_unheld_sidecar(lock_path) else {
+        return false;
+    };
+    if let Some(fname) = lock_path.file_name().and_then(|n| n.to_str()) {
+        if let Some(orig) = fname
+            .strip_prefix('.')
+            .and_then(|s| s.strip_suffix(".lease.lock"))
+        {
+            if fs::symlink_metadata(
+                lock_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(orig),
+            )
+            .is_ok()
+            {
+                return false;
+            }
+        }
+    }
+    let ok = fs::remove_file(lock_path).is_ok();
+    drop(guard);
+    ok
+}
+
+pub fn is_staging_lease_held(target: &Path) -> bool {
+    let lock_path = staging_lease_lock_path(target);
+    #[cfg(unix)]
+    let exists = path_nofollow_inode_key(&lock_path).is_some();
+    #[cfg(not(unix))]
+    let exists = lock_path.exists();
+    exists && try_lock_unheld_sidecar(&lock_path).is_none()
 }
 
 fn scan_evictable_shm_files(
@@ -591,18 +1021,22 @@ fn scan_evictable_shm_files(
                     .and_then(|m| SystemTime::now().duration_since(m).ok())
                     .is_some_and(|d| d.as_secs() > 600)
             {
-                let _ = fs::remove_file(path);
+                let _ = reap_stale_lock_if_unheld(path);
             }
+            continue;
+        }
+        if is_staging_lease_held_on_self_or_ancestor(path, shm_dir) {
             continue;
         }
         let fname = path
             .file_name()
             .map(|n| n.to_string_lossy())
             .unwrap_or_default();
-        if (fname.starts_with('.') && fname.ends_with(".tmp"))
+        if (fname.starts_with('.') && (fname.ends_with(".tmp") || fname.ends_with(".stgtmp")))
             || fname == "zygote_daemon.json"
             || fname == "zygote_lru_registry.json"
             || path.to_string_lossy().contains("zygote_daemon_cas_")
+            || path.to_string_lossy().contains("fastcheck_shared_bins")
         {
             continue;
         }
@@ -640,13 +1074,10 @@ pub fn enforce_shm_quota_lru(shm_dir: &Path, max_bytes: u64) -> std::io::Result<
         if total_size <= target_bytes {
             break;
         }
-        match fs::remove_file(&path) {
-            Ok(()) => {
-                total_size = total_size.saturating_sub(sz);
-                evicted_files += 1;
-                freed_bytes = freed_bytes.saturating_add(sz);
-            }
-            Err(e) => debug_log_cache_err("enforce_shm_quota_lru(remove_file)", &e),
+        if try_remove_unleased_staged_file(&path) {
+            total_size = total_size.saturating_sub(sz);
+            evicted_files += 1;
+            freed_bytes = freed_bytes.saturating_add(sz);
         }
     }
     Ok((evicted_files, freed_bytes))
@@ -768,7 +1199,7 @@ pub(crate) fn parse_macos_vm_stat_budget_mb(vm_stat_out: &str) -> Option<u64> {
         }
         for key in ["Pages free:", "Pages inactive:", "Pages speculative:"] {
             if let Some(rest) = line.trim().strip_prefix(key) {
-                if let Some(pages) = rest.trim().trim_end_matches('.').parse::<u64>().ok() {
+                if let Ok(pages) = rest.trim().trim_end_matches('.').parse::<u64>() {
                     free_pages = free_pages.saturating_add(pages);
                     found_any = true;
                 }
@@ -870,6 +1301,9 @@ pub fn spill_shm_to_disk_dir(
         if max_shm_bytes > 0 && total_size <= target_bytes {
             break;
         }
+        if is_staging_lease_held_on_self_or_ancestor(&path, shm_dir) {
+            continue;
+        }
         let Some(file_name) = path.file_name() else {
             continue;
         };
@@ -877,7 +1311,16 @@ pub fn spill_shm_to_disk_dir(
         let tmp_dest = stage_unique_tmp_path(&dest_path)?;
         let move_res = fs::copy(&path, &tmp_dest)
             .and_then(|_| fs::rename(&tmp_dest, &dest_path))
-            .and_then(|_| fs::remove_file(&path));
+            .and_then(|_| {
+                if try_remove_unleased_staged_file(&path) {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "staging file leased during spill",
+                    ))
+                }
+            });
         match move_res {
             Ok(()) => {
                 total_size = total_size.saturating_sub(sz);
@@ -886,6 +1329,9 @@ pub fn spill_shm_to_disk_dir(
             }
             Err(e) => {
                 let _ = fs::remove_file(&tmp_dest);
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    let _ = fs::remove_file(&dest_path);
+                }
                 debug_log_cache_err("spill_shm_to_disk_dir(move)", &e);
             }
         }
@@ -1190,6 +1636,282 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&base_dir);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_staged_temp_file_reserve_races_cleanup_and_gc_without_orphaned_lease(
+    ) -> anyhow::Result<()> {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Barrier,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "turbo_lease_race_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let store_root = root.join("store");
+        let staging = store_root.join("staging");
+        let spill = root.join("spill");
+        let _ = crate::db::TurboStore::open(Some(&store_root))?;
+
+        // 1. Deterministic step-by-step interleaving of the exact P2 #3 window:
+        //    (a) Parent-directory shared lock (`lock_staging_parent_dir(..., false)`) blocks
+        //        concurrent `reap_stale_lock_if_unheld` / `try_remove_unleased_staged_file`
+        //        (`LOCK_EX | LOCK_NB` on the parent directory) while a writer is between
+        //        `open(.lease.lock)` and `flock(LOCK_SH)` in `StagedTempFile::reserve` / `write`.
+        //    (b) Even if an external unlink replaces `.lease.lock` between `open()` and `flock()`,
+        //        `acquire_staging_lease` detects `!inode_matches_nofollow` and retries to re-bind
+        //        to a live sidecar inode.
+        let det_target = staging.join("deterministic_race.lean");
+        let det_lock = staging_lease_lock_path(&det_target);
+        fs::create_dir_all(&staging)?;
+        let reaper_blocked_mid_open = std::rc::Rc::new(std::cell::Cell::new(false));
+        let reaper_flag = reaper_blocked_mid_open.clone();
+        let det_target_for_hook = det_target.clone();
+        let store_root_for_hook = store_root.clone();
+        AFTER_SIDECAR_OPEN_HOOK.with(|h| {
+            *h.borrow_mut() = Some(std::rc::Rc::new(move |lp| {
+                if !reaper_flag.get() {
+                    reaper_flag.set(true);
+                    assert!(
+                        !reap_stale_lock_if_unheld(lp),
+                        "reap_stale_lock_if_unheld must be blocked while writer is mid-acquisition"
+                    );
+                    assert!(
+                        !try_remove_unleased_staged_file(&det_target_for_hook),
+                        "try_remove_unleased_staged_file must be blocked while writer is mid-acquisition"
+                    );
+                    let lp_thread = lp.to_path_buf();
+                    let gc_root = store_root_for_hook.clone();
+                    std::thread::spawn(move || {
+                        assert!(
+                            !reap_stale_lock_if_unheld(&lp_thread),
+                            "cross-thread reap_stale_lock_if_unheld must not unlink sidecar mid-acquisition"
+                        );
+                        let mut gc_s = crate::db::TurboStore::open(Some(&gc_root))
+                            .expect("open TurboStore for mid-acquisition run_gc(0)");
+                        gc_s.run_gc(0, 7 * 86400, false)
+                            .expect("run_gc(0) during mid-acquisition");
+                    })
+                    .join()
+                    .expect("join mid-acquisition GC thread");
+                    assert!(
+                        lp.exists(),
+                        "sidecar inode must remain stable on disk while writer is mid-acquisition"
+                    );
+                }
+            }));
+        });
+        let reserved_stable = StagedTempFile::reserve(det_target.clone())?;
+        AFTER_SIDECAR_OPEN_HOOK.with(|h| *h.borrow_mut() = None);
+        assert!(reaper_blocked_mid_open.get());
+        assert!(is_staging_lease_held(&det_target) && det_lock.exists());
+        drop(reserved_stable);
+        assert!(!det_target.exists() && !det_lock.exists());
+
+        let retry_triggered = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let retry_counter = retry_triggered.clone();
+        AFTER_SIDECAR_OPEN_HOOK.with(|h| {
+            *h.borrow_mut() = Some(std::rc::Rc::new(move |lp| {
+                let c = retry_counter.get();
+                retry_counter.set(c + 1);
+                if c == 0 {
+                    fs::remove_file(lp).expect("direct unlink to exercise retry loop");
+                }
+            }));
+        });
+        let leased = StagedTempFile::write(det_target.clone(), b"-- active staged source\n")?;
+        AFTER_SIDECAR_OPEN_HOOK.with(|h| *h.borrow_mut() = None);
+        assert_eq!(
+            retry_triggered.get(),
+            2,
+            "acquire_staging_lease must detect unlinked sidecar on attempt 0 and succeed on retry attempt 1"
+        );
+        assert!(is_staging_lease_held(&det_target));
+        assert!(!reap_stale_lock_if_unheld(&det_lock));
+        assert!(!try_remove_unleased_staged_file(&det_target));
+        drop(leased);
+        assert!(!det_target.exists() && !det_lock.exists());
+
+        // 1b. Planted symlink protection on BOTH the staged payload target AND its `.lease.lock` sidecar:
+        //     `StagedTempFile::write` and `StagedTempFile::reserve` must reject symlinks without
+        //     modifying or truncating the symlink referent.
+        let victim = root.join("victim_outside_staging.txt");
+        fs::write(&victim, b"untouched-victim-bytes")?;
+        let sym_target = staging.join("planted_symlink.lean");
+        std::os::unix::fs::symlink(&victim, &sym_target)?;
+        assert!(
+            StagedTempFile::write(sym_target.clone(), b"attacker-overwrite").is_err(),
+            "StagedTempFile::write must refuse planted payload symlink"
+        );
+        assert!(
+            StagedTempFile::reserve(sym_target.clone()).is_err(),
+            "StagedTempFile::reserve must refuse planted payload symlink"
+        );
+        assert_eq!(
+            fs::read(&victim)?,
+            b"untouched-victim-bytes",
+            "planted payload symlink referent must remain untouched"
+        );
+        fs::remove_file(&sym_target)?;
+
+        let clean_target = staging.join("clean_with_sym_lock.lean");
+        let sym_lock = staging_lease_lock_path(&clean_target);
+        std::os::unix::fs::symlink(&victim, &sym_lock)?;
+        assert!(
+            StagedTempFile::reserve(clean_target.clone()).is_err(),
+            "StagedTempFile::reserve must refuse planted sidecar symlink"
+        );
+        assert_eq!(fs::read(&victim)?, b"untouched-victim-bytes");
+        fs::remove_file(&sym_lock)?;
+
+        // 1c. Hardlinked payload & retained writable descriptor isolation (`P2` regression):
+        //     If a staging path `P` is a hardlink to an ordinary writable file `V` (and/or has a
+        //     pre-existing open writable descriptor), `StagedTempFile::reserve`, `write`, and
+        //     `overwrite` MUST allocate a fresh inode and atomically replace `P` instead of
+        //     truncating `V` in place, and subsequent writes through the retained fd must not
+        //     alter the staged payload.
+        {
+            use std::io::{Seek, Write};
+            use std::os::unix::fs::MetadataExt;
+            let hardlink_victim = root.join("ordinary_hardlinked_victim.lean");
+            let victim_orig = b"valuable-external-file-must-not-truncate".to_vec();
+            let mut retained_victim_fd = fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&hardlink_victim)?;
+            retained_victim_fd.write_all(&victim_orig)?;
+            let victim_ino = retained_victim_fd.metadata()?.ino();
+
+            let planted_hl_reserve = staging.join("planted_hardlink_reserve.lean");
+            fs::hard_link(&hardlink_victim, &planted_hl_reserve)?;
+            let reserved = StagedTempFile::reserve(planted_hl_reserve.clone())?;
+            assert_eq!(
+                fs::read(&hardlink_victim)?,
+                victim_orig,
+                "StagedTempFile::reserve must never truncate a hardlinked sibling file"
+            );
+            assert_ne!(
+                fs::metadata(reserved.path())?.ino(),
+                victim_ino,
+                "StagedTempFile::reserve must bind a fresh isolated payload inode"
+            );
+            assert_eq!(fs::read(reserved.path())?, b"");
+            reserved.overwrite(b"-- staged payload v1\n")?;
+            assert_eq!(
+                fs::read(&hardlink_victim)?,
+                victim_orig,
+                "StagedTempFile::overwrite must leave hardlinked sibling untouched"
+            );
+            retained_victim_fd.seek(std::io::SeekFrom::Start(0))?;
+            retained_victim_fd.write_all(b"external-writer-mutates-old-inode!!!!!!!")?;
+            assert_eq!(
+                fs::read(reserved.path())?,
+                b"-- staged payload v1\n",
+                "retained writable fd on replaced inode must never alter leased staged payload"
+            );
+            drop(reserved);
+
+            // Also verify `StagedTempFile::write` directly against a pre-existing hardlinked path.
+            fs::write(&hardlink_victim, &victim_orig)?;
+            let planted_hl_write = staging.join("planted_hardlink_write.lean");
+            fs::hard_link(&hardlink_victim, &planted_hl_write)?;
+            let written = StagedTempFile::write(planted_hl_write.clone(), b"-- direct write\n")?;
+            assert_eq!(fs::read(&hardlink_victim)?, victim_orig);
+            assert_eq!(fs::read(written.path())?, b"-- direct write\n");
+            drop(written);
+        }
+
+        // 2. Multi-threaded stress race: writers repeatedly `reserve` + write + hold + verify
+        //    against concurrent `reap_stale_lock_if_unheld`, `try_remove_unleased_staged_file`,
+        //    `enforce_shm_quota_lru`, `spill_shm_to_disk_dir`, and `TurboStore::run_gc(0, ...)`.
+        let slots: Arc<Vec<PathBuf>> = Arc::new(
+            (0..4)
+                .map(|i| staging.join(format!("slot_{i}.lean")))
+                .collect(),
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let barrier = Arc::new(Barrier::new(7));
+        let mut handles = Vec::new();
+
+        for (wi, slot) in slots.iter().cloned().enumerate() {
+            let bar = Arc::clone(&barrier);
+            let stop_flag = Arc::clone(&stop);
+            handles.push(std::thread::spawn(move || -> anyhow::Result<()> {
+                bar.wait();
+                for iter in 0..120u32 {
+                    let g = StagedTempFile::reserve(slot.clone())?;
+                    let lock_p = staging_lease_lock_path(g.path());
+                    anyhow::ensure!(
+                        is_staging_lease_held(g.path()),
+                        "writer {wi} iter {iter}: lease not discoverable right after reserve"
+                    );
+                    let payload = format!("-- writer {wi} iter {iter}\n");
+                    g.overwrite(payload.as_bytes())?;
+                    std::thread::yield_now();
+                    anyhow::ensure!(
+                        is_staging_lease_held(g.path()) && lock_p.exists(),
+                        "writer {wi} iter {iter}: sidecar unlinked while lease held"
+                    );
+                    let got = fs::read(g.path())?;
+                    anyhow::ensure!(
+                        got == payload.as_bytes(),
+                        "writer {wi} iter {iter}: active staged file mutated or truncated"
+                    );
+                    drop(g);
+                }
+                stop_flag.store(true, Ordering::Release);
+                Ok(())
+            }));
+        }
+
+        for cleaner_id in 0..2usize {
+            let bar = Arc::clone(&barrier);
+            let stop_flag = Arc::clone(&stop);
+            let paths = Arc::clone(&slots);
+            let staging_dir = staging.clone();
+            let spill_dir = spill.join(format!("c{cleaner_id}"));
+            handles.push(std::thread::spawn(move || -> anyhow::Result<()> {
+                bar.wait();
+                while !stop_flag.load(Ordering::Acquire) {
+                    for p in paths.iter() {
+                        let lp = staging_lease_lock_path(p);
+                        let _ = reap_stale_lock_if_unheld(&lp);
+                        let _ = try_remove_unleased_staged_file(p);
+                    }
+                    let _ = enforce_shm_quota_lru(&staging_dir, 1);
+                    let _ = spill_shm_to_disk_dir(&staging_dir, &spill_dir, 0);
+                }
+                Ok(())
+            }));
+        }
+
+        {
+            let bar = Arc::clone(&barrier);
+            let stop_flag = Arc::clone(&stop);
+            let gc_root = store_root.clone();
+            handles.push(std::thread::spawn(move || -> anyhow::Result<()> {
+                let mut gc_store = crate::db::TurboStore::open(Some(&gc_root))?;
+                bar.wait();
+                while !stop_flag.load(Ordering::Acquire) {
+                    let _ = gc_store.run_gc(0, 7 * 86400, true);
+                    std::thread::yield_now();
+                }
+                Ok(())
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("race thread panicked")?;
+        }
+
+        let _ = fs::remove_dir_all(&root);
         Ok(())
     }
 }

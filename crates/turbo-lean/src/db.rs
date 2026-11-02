@@ -98,6 +98,240 @@ pub struct GcReport {
     pub reaped_zygote_workers: usize,
 }
 
+/// Shared store-level publication guard (`LOCK_SH` on `<store>/locks/gc_publish.lock`) held
+/// across blob staging through action/pack metadata publication so concurrent `run_gc` (`LOCK_EX`)
+/// cannot orphan-reclaim, supersede, or `TLZ1`-compress in-flight blobs before their referencer
+/// rows commit.
+pub struct CasPublicationGuard {
+    file: File,
+}
+
+impl Drop for CasPublicationGuard {
+    fn drop(&mut self) {
+        unsafe {
+            use std::os::unix::io::AsRawFd;
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+pub(crate) struct CasExclusiveGcGuard {
+    file: File,
+}
+
+impl Drop for CasExclusiveGcGuard {
+    fn drop(&mut self) {
+        unsafe {
+            use std::os::unix::io::AsRawFd;
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+const STORE_TREE_DURABLE_MARKER: &str = "store_tree_durable.v1";
+
+fn same_dir_inode(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(ma), Ok(mb)) = (fs::metadata(a), fs::metadata(b)) {
+            return ma.dev() == mb.dev() && ma.ino() == mb.ino();
+        }
+    }
+    a == b
+}
+
+/// Find the deepest pre-existing canonical directory along `raw_locks` using real OS traversal on
+/// every existing prefix (handling symlinks, relative paths, and `..`). When a missing component is
+/// encountered (even if followed by `..`, which `fs::create_dir_all` creates component-by-component
+/// on Unix), the deepest existing canonical directory reached before that missing component is the
+/// exact pre-existing parent directory into which the highest newly created entry is linked.
+fn deepest_preexisting_boundary_for_locks(raw_locks: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
+    let mut cur = PathBuf::new();
+    let mut deepest: Option<PathBuf> = None;
+    let mut saw_missing = false;
+    let mut missing_prefixes = Vec::new();
+    for comp in raw_locks.components() {
+        cur.push(comp);
+        if saw_missing {
+            missing_prefixes.push(cur.clone());
+            continue;
+        }
+        match fs::metadata(&cur) {
+            Ok(_) => {
+                deepest = Some(fs::canonicalize(&cur)?);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                saw_missing = true;
+                missing_prefixes.push(cur.clone());
+            }
+            // If an existing upper ancestor is traverse-only (e.g., `0111` or unusual FS returning
+            // `PermissionDenied` on `stat("/")` while allowing `+x` traversal into a writable child),
+            // continue probing deeper prefixes until we reach the writable existing workspace boundary.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let boundary = deepest
+        .ok_or_else(|| anyhow::anyhow!("no existing ancestor for {}", raw_locks.display()))?;
+    Ok((boundary, missing_prefixes))
+}
+
+/// Ensure `<store_root>/locks` exists using real OS path traversal (`fs::create_dir_all` +
+/// `fs::canonicalize` on the created directory) and durably persist `<store_root>/locks`,
+/// `store_root`, every newly created intermediate directory, and the immediate pre-existing parent
+/// directory naming the highest newly created entry (including `.` for relative `--cache-dir`
+/// roots, symlinked prefixes, and partially created racing-peer ancestry) before returning the
+/// canonical `<store_root>/locks` path.
+///
+/// Concurrency, permission & crash invariants:
+/// - Never lexically strip `..` or `file_name()` on unresolved prefixes: `fs::create_dir_all` on
+///   `raw_locks` performs real OS component-by-component creation (including any missing
+///   intermediate followed by `..`, which is synced before walking canonical `abs_locks` ancestors),
+///   after which `fs::canonicalize` yields the exact canonical `locks/` directory inode.
+/// - Every directory from `abs_locks` up through `required_stop` (the deepest pre-existing ancestor
+///   observed before creation, floored at `abs_store.parent()`) MUST succeed its directory barrier
+///   or initialization fails closed without writing `store_tree_durable.v1`.
+/// - Above `required_stop`, a racing peer paused partway through `fs::create_dir_all` (even before
+///   creating `locks/`) may have just created `required_stop` inside an unsynced outer workspace
+///   directory. We therefore continue syncing upward across readable/writable user ancestors
+///   regardless of whether `locks/` already existed, stopping cleanly at the first pre-existing
+///   traverse-only (`0711`/`EACCES`) or read-only (`EROFS`/`EINVAL` on `/`) host boundary while
+///   failing closed on genuine I/O errors (`EIO`, `ENOSPC`, etc.) or on barriers whose `File::open`
+///   succeeded (`PermissionDenied` from the sync/fsync itself).
+pub(crate) fn ensure_store_locks_dir_durable(store_root: &Path) -> Result<PathBuf> {
+    let raw_locks = if store_root.is_absolute() {
+        store_root.join("locks")
+    } else {
+        std::env::current_dir()?.join(store_root).join("locks")
+    };
+    if raw_locks.join(STORE_TREE_DURABLE_MARKER).exists() {
+        return Ok(fs::canonicalize(&raw_locks)?);
+    }
+    let (pre_existing_boundary, missing_prefixes) =
+        deepest_preexisting_boundary_for_locks(&raw_locks)?;
+    fs::create_dir_all(&raw_locks)?;
+    let abs_locks = fs::canonicalize(&raw_locks)?;
+    let abs_marker = abs_locks.join(STORE_TREE_DURABLE_MARKER);
+    if abs_marker.exists() {
+        return Ok(abs_locks);
+    }
+    sync_dir(&abs_locks)?;
+    let abs_store = abs_locks.parent().unwrap_or(&abs_locks);
+    let required_stop = if same_dir_inode(&pre_existing_boundary, &abs_locks)
+        || same_dir_inode(&pre_existing_boundary, abs_store)
+    {
+        abs_store.parent().unwrap_or(abs_store).to_path_buf()
+    } else {
+        pre_existing_boundary
+    };
+    let mut synced_dirs = vec![abs_locks.clone()];
+    for mp in missing_prefixes.iter().rev() {
+        let canon = fs::canonicalize(mp)?;
+        if !same_dir_inode(&canon, &required_stop)
+            && !synced_dirs.iter().any(|d| same_dir_inode(d, &canon))
+        {
+            sync_dir(&canon)?;
+            synced_dirs.push(canon);
+        }
+    }
+
+    let mut reached_required_stop = false;
+    let mut anc = abs_locks.parent();
+    while let Some(p) = anc {
+        if p.as_os_str().is_empty() {
+            break;
+        }
+        if !reached_required_stop {
+            if !synced_dirs.iter().any(|d| same_dir_inode(d, p)) {
+                sync_dir(p)?;
+                synced_dirs.push(p.to_path_buf());
+            }
+            if same_dir_inode(p, &required_stop) || p.parent().is_none() {
+                reached_required_stop = true;
+            }
+        } else {
+            // Partially created racing-peer ancestry recovery: a concurrent initializer paused
+            // after creating an intermediate ancestor (whether or not `locks/` existed yet) may not
+            // have synced the outer workspace directory naming that intermediate. Sync upward across
+            // readable ancestors, stopping cleanly only if `File::open` hits a traverse-only host
+            // boundary (`EACCES`/`EPERM`) or `fsync` hits a read-only/virtual root mount (`EROFS`/`EINVAL`).
+            if !synced_dirs.iter().any(|d| same_dir_inode(d, p)) {
+                let dir_file = match File::open(p) {
+                    Ok(f) => f,
+                    Err(ioe)
+                        if matches!(ioe.kind(), std::io::ErrorKind::PermissionDenied)
+                            || matches!(ioe.raw_os_error(), Some(libc::EACCES | libc::EPERM)) =>
+                    {
+                        break;
+                    }
+                    Err(ioe) => return Err(ioe.into()),
+                };
+                match durability_barrier(&dir_file) {
+                    Ok(()) => {
+                        synced_dirs.push(p.to_path_buf());
+                    }
+                    Err(ioe) if matches!(ioe.raw_os_error(), Some(libc::EROFS | libc::EINVAL)) => {
+                        break;
+                    }
+                    Err(ioe) => return Err(ioe.into()),
+                }
+            }
+            if p.parent().is_none() {
+                break;
+            }
+        }
+        anc = p.parent();
+    }
+    if !abs_marker.exists() {
+        write_bytes_durable(&abs_marker, b"1\n", &[])?;
+    }
+    Ok(abs_locks)
+}
+
+fn open_gc_publish_lock_file(store_root: &Path) -> Result<File> {
+    let locks_dir = ensure_store_locks_dir_durable(store_root)?;
+    let lock_path = locks_dir.join("gc_publish.lock");
+    let created_lock = !lock_path.exists();
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+    if created_lock {
+        sync_dir(&locks_dir)?;
+    }
+    Ok(file)
+}
+
+pub fn acquire_cas_publication_guard(store_root: &Path) -> Result<CasPublicationGuard> {
+    use std::os::unix::io::AsRawFd;
+    let file = open_gc_publish_lock_file(store_root)?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("flock(LOCK_SH) gc_publish.lock");
+    }
+    Ok(CasPublicationGuard { file })
+}
+
+fn try_acquire_cas_gc_guard(store_root: &Path) -> Result<Option<CasExclusiveGcGuard>> {
+    use std::os::unix::io::AsRawFd;
+    let file = open_gc_publish_lock_file(store_root)?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        Ok(Some(CasExclusiveGcGuard { file }))
+    } else {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock
+            || err.raw_os_error() == Some(libc::EWOULDBLOCK)
+            || err.raw_os_error() == Some(libc::EAGAIN)
+        {
+            Ok(None)
+        } else {
+            Err(err).context("flock(LOCK_EX | LOCK_NB) gc_publish.lock")
+        }
+    }
+}
+
 pub struct SingleflightLease {
     pub action_key: String,
     pub toolchain: String,
@@ -141,6 +375,235 @@ const WORKTREE_LEASES_DDL: &str = "
     CREATE INDEX IF NOT EXISTS idx_wfb_blob ON worktree_file_blobs(blob_hash);
 ";
 
+const KERNEL_REPLAYED_OLEANS_DDL: &str = "
+    CREATE TABLE IF NOT EXISTS kernel_replayed_oleans (
+        artifact_digest TEXT NOT NULL,
+        replay_version INTEGER NOT NULL,
+        toolchain_hash TEXT NOT NULL,
+        module_name TEXT NOT NULL DEFAULT '',
+        verified_at INTEGER NOT NULL,
+        PRIMARY KEY (artifact_digest, replay_version, toolchain_hash)
+    );
+";
+
+const KERNEL_REPLAYED_OLEANS_AUTH_DDL: &str = "
+    CREATE TABLE IF NOT EXISTS kernel_replayed_oleans_auth (
+        artifact_digest TEXT NOT NULL,
+        environment_digest TEXT NOT NULL,
+        replay_version INTEGER NOT NULL,
+        toolchain_hash TEXT NOT NULL,
+        module_name TEXT NOT NULL DEFAULT '',
+        replay_mac TEXT NOT NULL,
+        verified_at INTEGER NOT NULL,
+        PRIMARY KEY (artifact_digest, environment_digest, replay_version, toolchain_hash)
+    );
+";
+
+const VERIFIER_REPLAY_HMAC_KEY_FILENAME: &str = ".verifier_replay_hmac_key";
+
+fn canonical_or_lexical_path(p: &Path) -> PathBuf {
+    if let Ok(canon) = p.canonicalize() {
+        return canon;
+    }
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("/"))
+            .join(p)
+    };
+    let mut cur = abs.as_path();
+    let mut tail = Vec::new();
+    while let Some(name) = cur.file_name() {
+        if let Ok(canon_cur) = cur.canonicalize() {
+            let mut out = canon_cur;
+            for comp in tail.into_iter().rev() {
+                out.push(comp);
+            }
+            return out;
+        }
+        tail.push(name.to_os_string());
+        match cur.parent() {
+            Some(parent) => cur = parent,
+            None => break,
+        }
+    }
+    abs
+}
+
+fn path_is_inside_any_disallowed_root(candidate: &Path, disallowed_roots: &[PathBuf]) -> bool {
+    if disallowed_roots.is_empty() {
+        return false;
+    }
+    let mut cand_paths = vec![canonical_or_lexical_path(candidate)];
+    if let Ok(meta) = fs::symlink_metadata(candidate) {
+        if meta.file_type().is_symlink() {
+            // If symlink itself sits inside a disallowed root (or points into one), reject both.
+            let raw_parent = candidate
+                .parent()
+                .map(canonical_or_lexical_path)
+                .unwrap_or_else(|| candidate.to_path_buf());
+            if let Some(fname) = candidate.file_name() {
+                cand_paths.push(raw_parent.join(fname));
+            }
+        }
+    }
+    for root in disallowed_roots {
+        if root.as_os_str().is_empty() {
+            continue;
+        }
+        let canon_root = canonical_or_lexical_path(root);
+        if cand_paths.iter().any(|cp| cp.starts_with(&canon_root)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn compute_kernel_replay_mac(
+    key: &[u8; 32],
+    artifact_digest: &str,
+    environment_digest: &str,
+    replay_version: u32,
+    toolchain_hash: &str,
+) -> String {
+    let mut msg = Vec::with_capacity(
+        64 + artifact_digest.len() + environment_digest.len() + toolchain_hash.len(),
+    );
+    msg.extend_from_slice(b"turbo-lean-verifier-replay-mac-v1\n");
+    msg.extend_from_slice(&(artifact_digest.len() as u64).to_le_bytes());
+    msg.extend_from_slice(artifact_digest.as_bytes());
+    msg.extend_from_slice(&(environment_digest.len() as u64).to_le_bytes());
+    msg.extend_from_slice(environment_digest.as_bytes());
+    msg.extend_from_slice(&replay_version.to_le_bytes());
+    msg.extend_from_slice(&(toolchain_hash.len() as u64).to_le_bytes());
+    msg.extend_from_slice(toolchain_hash.as_bytes());
+    blake3::keyed_hash(key, &msg).to_hex().to_string()
+}
+
+fn fill_os_csprng_bytes(buf: &mut [u8]) -> Result<()> {
+    use std::io::Read;
+    let mut f = File::open("/dev/urandom")
+        .context("Failed to open `/dev/urandom` for verifier replay HMAC key generation")?;
+    f.read_exact(buf)
+        .context("Failed to read 32 CSPRNG bytes from `/dev/urandom`")?;
+    anyhow::ensure!(
+        buf.iter().any(|&b| b != 0),
+        "CSPRNG returned all-zero key from `/dev/urandom`"
+    );
+    Ok(())
+}
+
+fn read_verified_replay_hmac_key_file(
+    key_path: &Path,
+    disallowed_roots: &[PathBuf],
+) -> Option<[u8; 32]> {
+    if path_is_inside_any_disallowed_root(key_path, disallowed_roots) {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let sym_meta = fs::symlink_metadata(key_path).ok()?;
+        if sym_meta.file_type().is_symlink() || !sym_meta.file_type().is_file() {
+            return None;
+        }
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true).custom_flags(libc::O_NOFOLLOW);
+        let mut f = opts.open(key_path).ok()?;
+        let meta = f.metadata().ok()?;
+        let euid = unsafe { libc::geteuid() };
+        if !meta.file_type().is_file()
+            || meta.uid() != euid
+            || (meta.mode() & 0o077) != 0
+            || meta.len() != 32
+        {
+            return None;
+        }
+        let mut key = [0u8; 32];
+        f.read_exact(&mut key).ok()?;
+        if key.iter().all(|&b| b == 0) {
+            return None;
+        }
+        Some(key)
+    }
+    #[cfg(not(unix))]
+    {
+        let bytes = fs::read(key_path).ok()?;
+        if bytes.len() != 32 || bytes.iter().all(|&b| b == 0) {
+            return None;
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        Some(key)
+    }
+}
+
+fn get_or_create_verified_replay_hmac_key(
+    store_root: &Path,
+    disallowed_roots: &[PathBuf],
+) -> Option<[u8; 32]> {
+    let db_path = store_root.join("state.db");
+    let key_path = store_root.join(VERIFIER_REPLAY_HMAC_KEY_FILENAME);
+    if path_is_inside_any_disallowed_root(store_root, disallowed_roots)
+        || path_is_inside_any_disallowed_root(&db_path, disallowed_roots)
+        || path_is_inside_any_disallowed_root(&key_path, disallowed_roots)
+    {
+        return None;
+    }
+    if let Some(existing) = read_verified_replay_hmac_key_file(&key_path, disallowed_roots) {
+        return Some(existing);
+    }
+    let lock_path = store_root.join("locks/verifier_replay_hmac_key.lock");
+    let _lock = crate::shm_cache::acquire_flock(&lock_path, true, false).ok()??;
+    if let Some(existing) = read_verified_replay_hmac_key_file(&key_path, disallowed_roots) {
+        return Some(existing);
+    }
+    // Remove any corrupt/untrusted file at `key_path` only if it is not a directory, then atomically install 0600 key.
+    if let Ok(meta) = fs::symlink_metadata(&key_path) {
+        if meta.file_type().is_dir() {
+            return None;
+        }
+        let _ = fs::remove_file(&key_path);
+    }
+    let mut fresh_key = [0u8; 32];
+    fill_os_csprng_bytes(&mut fresh_key).ok()?;
+    let tmp_path = store_root.join(format!(
+        ".verifier_replay_hmac_key.tmp.{}.{}",
+        std::process::id(),
+        crate::pack::next_tmp_id()
+    ));
+    let wrote = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut f = opts.open(&tmp_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        f.write_all(&fresh_key)?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if wrote.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+        return None;
+    }
+    if fs::rename(&tmp_path, &key_path).is_err() {
+        let _ = fs::remove_file(&tmp_path);
+        return read_verified_replay_hmac_key_file(&key_path, disallowed_roots);
+    }
+    read_verified_replay_hmac_key_file(&key_path, disallowed_roots)
+}
+
 fn template_shm_path() -> (PathBuf, u32) {
     let shm_base = if Path::new("/dev/shm").is_dir() {
         PathBuf::from("/dev/shm")
@@ -149,7 +612,7 @@ fn template_shm_path() -> (PathBuf, u32) {
     };
     let uid = unsafe { libc::geteuid() };
     (
-        shm_base.join(format!("turbo_lean_template_state_v4_{}.db", uid)),
+        shm_base.join(format!("turbo_lean_template_state_v6_{}.db", uid)),
         uid,
     )
 }
@@ -205,6 +668,7 @@ struct StagedTheoremShards {
     now: i64,
     unique_blobs: usize,
     rows: Vec<StagedTheoremShard>,
+    _pub_guard: CasPublicationGuard,
 }
 
 pub struct TurboStore {
@@ -232,10 +696,15 @@ impl TurboStore {
         let mut from_template = false;
         let (template_path, uid) = template_shm_path();
         if !db_warm {
-            fs::create_dir_all(&root)?;
-            for sub in ["blobs", "staging", "locks"] {
-                let _ = fs::create_dir(root.join(sub));
+            ensure_store_locks_dir_durable(&root)?;
+            for sub in ["blobs", "staging"] {
+                match fs::create_dir(root.join(sub)) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(e.into()),
+                }
             }
+            sync_dir(&root)?;
             if template_path.exists() {
                 let tmp_db = root.join(format!(
                     "state.db.init.{}.{}",
@@ -302,6 +771,18 @@ impl TurboStore {
                         WORKTREE_LEASES_DDL
                     ))?;
                 }
+                if uver < 3 {
+                    conn.execute_batch(&format!(
+                        "{}\nPRAGMA user_version = 3;",
+                        KERNEL_REPLAYED_OLEANS_DDL
+                    ))?;
+                }
+                if uver < 4 {
+                    conn.execute_batch(&format!(
+                        "{}\nPRAGMA user_version = 4;",
+                        KERNEL_REPLAYED_OLEANS_AUTH_DDL
+                    ))?;
+                }
             }
         } else {
             conn.execute_batch(&format!(
@@ -336,6 +817,8 @@ impl TurboStore {
                      PRIMARY KEY (worktree_id, rel_path)
                  );
                  {}
+                 {}
+                 {}
                  CREATE TABLE IF NOT EXISTS inflight_leases (
                      action_key TEXT PRIMARY KEY, fencing_token INTEGER NOT NULL, worker_pid INTEGER NOT NULL,
                      boot_id TEXT NOT NULL, started_at INTEGER NOT NULL, waiter_count INTEGER NOT NULL DEFAULT 1
@@ -353,10 +836,12 @@ impl TurboStore {
                      path_key TEXT PRIMARY KEY, mtime_sec INTEGER NOT NULL, mtime_nsec INTEGER NOT NULL,
                      size_bytes INTEGER NOT NULL, split_key TEXT NOT NULL, updated_at INTEGER NOT NULL
                  );
-                 PRAGMA user_version = 2;
+                 PRAGMA user_version = 4;
                  COMMIT;
                  PRAGMA wal_checkpoint(TRUNCATE);",
-                WORKTREE_LEASES_DDL
+                WORKTREE_LEASES_DDL,
+                KERNEL_REPLAYED_OLEANS_DDL,
+                KERNEL_REPLAYED_OLEANS_AUTH_DDL
             ))?;
             if !template_path.exists() {
                 if let Some(shm_base) = template_path.parent() {
@@ -377,45 +862,16 @@ impl TurboStore {
             conn,
             inflight_staged_shards: std::cell::RefCell::new(None),
         };
-        let locks_dir = store.root.join("locks");
-        let deferred_v3 = locks_dir.join("deferred_pack_v3.bin");
-        let _ = fs::remove_file(locks_dir.join("deferred_pack_v3.domain"));
-        let claim_path = locks_dir.join(format!(
-            "deferred_pack_v3.claim.{}.{}",
-            std::process::id(),
-            crate::pack::next_tmp_id()
-        ));
-        if fs::rename(&deferred_v3, &claim_path).is_ok() {
-            let claimed_bytes = fs::read(&claim_path);
-            let _ = fs::remove_file(&claim_path);
-            if let Ok(pack_bytes) = claimed_bytes {
-                if let Some((deferred_td, manifest)) =
-                    crate::pack::decode_deferred_pack_record(&pack_bytes)
-                {
-                    let staged_blobs: Vec<(String, String, i64, i64)> = manifest
-                        .blobs
-                        .iter()
-                        .map(|b| (b.blob_hash.clone(), b.kind.clone(), b.size_bytes as i64, 0))
-                        .collect();
-                    let _ = crate::pack::finish_import_from_prestaged_shared_cas_with_domain(
-                        &mut store,
-                        &manifest,
-                        &staged_blobs,
-                        staged_blobs.len(),
-                        deferred_td,
-                    );
-                }
-            }
-        }
+        crate::pack::replay_pending_deferred_packs(&mut store)?;
 
         Ok(store)
     }
 
     /// Compute the deterministic BLAKE3 cache key for `file_split_cache` from an existing
-    /// hex-encoded BLAKE3 digest of the raw file bytes (`BLAKE3("file-split:v10:" + src_blake3_hex)`).
+    /// hex-encoded BLAKE3 digest of the raw file bytes (`BLAKE3("file-split:v12:" + src_blake3_hex)`).
     pub fn compute_file_split_key_from_src_hash(src_blake3_hex: &str) -> String {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"file-split:v10:");
+        hasher.update(b"file-split:v12:");
         hasher.update(src_blake3_hex.as_bytes());
         hasher.finalize().to_hex().to_string()
     }
@@ -457,6 +913,7 @@ impl TurboStore {
     /// Read and validate the 24-byte footer and `[index_off..footer_off]` index slice of
     /// `file_splits.sst` via positional `Seek + read_exact` (never loading the value pages into RAM),
     /// gated by `c_abi::verify_sst_block` and `c_abi::verify_ios_jetsam_budget`.
+    #[allow(clippy::type_complexity)]
     fn leansys_sst_read_index(file: &mut fs::File) -> Option<(u64, Vec<(String, u64, usize)>)> {
         use std::io::{Read, Seek, SeekFrom};
         let file_size = file.metadata().ok()?.len();
@@ -633,9 +1090,11 @@ impl TurboStore {
         ) {
             anyhow::bail!("C-ABI gate `leansys_verify_sst_block` rejected file_splits.sst");
         }
-        let tmp_path = self.root.join("file_splits.sst.tmp");
-        fs::write(&tmp_path, &buf)?;
-        fs::rename(&tmp_path, &sst_path)?;
+        let created = match sst_path.parent() {
+            Some(parent) => ensure_dir_tracking(parent, &self.root)?,
+            None => Vec::new(),
+        };
+        write_bytes_durable(&sst_path, &buf, &created)?;
         Ok(())
     }
 
@@ -839,34 +1298,127 @@ impl TurboStore {
         self.root.join("staging")
     }
 
-    /// Batch-lookup multiple theorem shard keys in a single `BEGIN IMMEDIATE ... COMMIT` SQLite
-    /// transaction, verifying that the backing CAS blobs exist on disk and atomically incrementing
-    /// `hit_count` and `last_accessed`.
+    /// Batch-lookup multiple theorem shard keys in a single SQLite pass, verifying that the
+    /// backing CAS blobs are digest-intact on disk BEFORE incrementing `hit_count` and
+    /// `last_accessed`.
     pub fn batch_get_theorem_shards(
         &self,
         shard_keys: &[String],
         trust_domain: &str,
     ) -> Result<std::collections::HashMap<String, String>> {
-        let raw_hits = if trust_domain == "trusted" {
-            batch_get_theorem_shards(&self.conn, shard_keys)?
-        } else {
-            batch_get_theorem_shards_in_domain(&self.conn, shard_keys, trust_domain)?
-        };
-        let mut verified = std::collections::HashMap::with_capacity(raw_hits.len());
-        let mut exists_cache: std::collections::HashMap<String, bool> =
+        if shard_keys.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let now = now_unix();
+        let mut verified = std::collections::HashMap::with_capacity(shard_keys.len());
+        let mut intact_cache: std::collections::HashMap<String, bool> =
             std::collections::HashMap::new();
-        for (k, blob_hash) in raw_hits {
-            let exists = *exists_cache
-                .entry(blob_hash.clone())
-                .or_insert_with(|| self.blob_intact_by_row(&blob_hash));
-            if exists {
-                verified.insert(k, blob_hash);
+        let mut hit_keys_in_order = Vec::new();
+        let mut touched_blobs = std::collections::HashSet::new();
+
+        if shard_keys.len() >= 128 {
+            let mut db_map = std::collections::HashMap::with_capacity(shard_keys.len());
+            {
+                let mut scan_stmt = self.conn.prepare_cached(
+                    "SELECT a.action_key, ao.blob_hash, b.size_bytes, b.last_accessed
+                     FROM actions a JOIN action_outputs ao ON ao.action_key = a.action_key
+                     JOIN blobs b ON b.blob_hash = ao.blob_hash
+                     WHERE a.kind = 'theorem_shard' AND a.status = 'completed'
+                       AND ((?1 = 'trusted' AND a.trust_domain = 'trusted' AND b.trust_domain = 'trusted')
+                            OR (?1 != 'trusted' AND (a.trust_domain = 'trusted' OR a.trust_domain = ?1)))",
+                )?;
+                let mut rows = scan_stmt.query(params![trust_domain])?;
+                while let Some(row) = rows.next()? {
+                    db_map.insert(
+                        row.get::<_, String>(0)?,
+                        (
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ),
+                    );
+                }
             }
+            for key in shard_keys {
+                if let Some((blob_hash, sz, last_acc)) = db_map.get(key) {
+                    let intact = *intact_cache.entry(blob_hash.clone()).or_insert_with(|| {
+                        matches!(
+                            probe_blob_digest(&self.blob_path(blob_hash), blob_hash, *sz as u64),
+                            BlobDisk::Intact
+                        )
+                    });
+                    if intact {
+                        hit_keys_in_order.push(key.as_str());
+                        if now - *last_acc >= 60 {
+                            touched_blobs.insert(blob_hash.clone());
+                        }
+                        verified.insert(key.clone(), blob_hash.clone());
+                    }
+                }
+            }
+        } else {
+            let mut sel_stmt = self.conn.prepare_cached(
+                "SELECT ao.blob_hash, b.size_bytes, b.last_accessed FROM actions a
+                 JOIN action_outputs ao ON ao.action_key = a.action_key
+                 JOIN blobs b ON b.blob_hash = ao.blob_hash
+                 WHERE a.action_key = ?1 AND a.status = 'completed'
+                   AND ((?2 = 'trusted' AND a.trust_domain = 'trusted' AND b.trust_domain = 'trusted')
+                        OR (?2 != 'trusted' AND (a.trust_domain = 'trusted' OR a.trust_domain = ?2)))
+                 LIMIT 1",
+            )?;
+            for key in shard_keys {
+                if let Some((blob_hash, sz, last_acc)) = sel_stmt
+                    .query_row(params![key, trust_domain], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, i64>(2)?,
+                        ))
+                    })
+                    .optional()?
+                {
+                    let intact = *intact_cache.entry(blob_hash.clone()).or_insert_with(|| {
+                        matches!(
+                            probe_blob_digest(&self.blob_path(&blob_hash), &blob_hash, sz as u64),
+                            BlobDisk::Intact
+                        )
+                    });
+                    if intact {
+                        hit_keys_in_order.push(key.as_str());
+                        if now - last_acc >= 60 {
+                            touched_blobs.insert(blob_hash.clone());
+                        }
+                        verified.insert(key.clone(), blob_hash);
+                    }
+                }
+            }
+        }
+
+        if !hit_keys_in_order.is_empty() {
+            let tx = self.conn.unchecked_transaction()?;
+            {
+                let mut upd_action = tx.prepare_cached(
+                    "UPDATE actions SET hit_count = hit_count + 1 WHERE action_key = ?1",
+                )?;
+                for k in hit_keys_in_order {
+                    upd_action.execute(params![k])?;
+                }
+                if !touched_blobs.is_empty() {
+                    let mut upd_blob = tx.prepare_cached(
+                        "UPDATE blobs SET last_accessed = ?1 WHERE blob_hash = ?2",
+                    )?;
+                    for bh in touched_blobs {
+                        upd_blob.execute(params![now, &bh])?;
+                    }
+                }
+            }
+            tx.commit()?;
         }
         Ok(verified)
     }
 
-    /// Fast read-only batch check for completed action keys in `trust_domain` (or `'trusted'`).
+    /// Batch check for completed action keys in `trust_domain` (or `'trusted'`) whose backing
+    /// output CAS blobs exist and verify their BLAKE3 digests on disk.
     pub fn batch_completed_action_keys(
         &self,
         keys: &[String],
@@ -876,32 +1428,32 @@ impl TurboStore {
             return Ok(std::collections::HashSet::new());
         }
         let mut hits = std::collections::HashSet::with_capacity(keys.len());
-        if trust_domain != "trusted" {
-            let mut stmt = self.conn.prepare_cached(
-                "SELECT 1 FROM actions
-                 WHERE action_key = ?1 AND status = 'completed'
-                   AND (trust_domain = 'trusted' OR trust_domain = ?2)
-                 LIMIT 1",
-            )?;
-            for k in keys {
-                let found: Option<i64> = stmt
-                    .query_row(params![k, trust_domain], |r| r.get(0))
-                    .optional()?;
-                if found.is_some() {
-                    hits.insert(k.clone());
-                }
-            }
-        } else {
-            let mut stmt = self.conn.prepare_cached(
-                "SELECT 1 FROM actions
-                 WHERE action_key = ?1 AND status = 'completed' AND trust_domain = 'trusted'
-                 LIMIT 1",
-            )?;
-            for k in keys {
-                let found: Option<i64> = stmt.query_row(params![k], |r| r.get(0)).optional()?;
-                if found.is_some() {
-                    hits.insert(k.clone());
-                }
+        let mut intact_cache: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT ao.blob_hash, b.size_bytes
+             FROM actions a
+             JOIN action_outputs ao ON ao.action_key = a.action_key
+             JOIN blobs b ON b.blob_hash = ao.blob_hash
+             WHERE a.action_key = ?1 AND a.status = 'completed'
+               AND ((?2 = 'trusted' AND a.trust_domain = 'trusted' AND b.trust_domain = 'trusted')
+                    OR (?2 != 'trusted' AND (a.trust_domain = 'trusted' OR a.trust_domain = ?2)))",
+        )?;
+        for k in keys {
+            let outputs: Vec<(String, i64)> = stmt
+                .query_map(params![k, trust_domain], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if !outputs.is_empty()
+                && outputs.iter().all(|(bh, sz)| {
+                    *intact_cache.entry(bh.clone()).or_insert_with(|| {
+                        matches!(
+                            probe_blob_digest(&self.blob_path(bh), bh, (*sz).max(0) as u64),
+                            BlobDisk::Intact
+                        )
+                    })
+                })
+            {
+                hits.insert(k.clone());
             }
         }
         if !hits.is_empty() {
@@ -926,7 +1478,7 @@ impl TurboStore {
         blobs: &[(String, String, i64, i64)],
         actions: &[ActionRecord],
     ) -> Result<(usize, usize)> {
-        batch_import_pack_metadata(&self.conn, blobs, actions)
+        self.batch_import_pack_metadata_with_domain(blobs, actions, "trusted")
     }
 
     pub fn batch_import_pack_metadata_with_domain(
@@ -935,11 +1487,70 @@ impl TurboStore {
         actions: &[ActionRecord],
         trust_domain: &str,
     ) -> Result<(usize, usize)> {
-        batch_import_pack_metadata_with_domain(&self.conn, blobs, actions, trust_domain)
+        let counts =
+            batch_import_pack_metadata_with_domain(&self.conn, blobs, actions, trust_domain)?;
+        self.sync_sqlite_durable()?;
+        Ok(counts)
     }
 
-    /// Size-checked presence of a CAS blob against its `blobs` row (bare existence when the blob
-    /// has no row yet).
+    /// Durably persist committed SQLite WAL/database pages before publishing external filesystem
+    /// completion stamps (`locks/last_import_stamp`, `locks/cached_portable_manifest.json`) or
+    /// unlinking durable deferred-pack recovery spool records.
+    ///
+    /// First requests `PRAGMA wal_checkpoint(PASSIVE)` (under `PRAGMA synchronous = FULL`) so
+    /// checkpointed database pages are synced when no concurrent reader pins the WAL, then
+    /// explicitly opens and runs `durability_barrier` (`fsync`) on `state.db` and `state.db-wal`
+    /// (if present), plus `sync_dir(&self.root)` if `state.db-wal` had not yet been synced in the
+    /// directory. Fails closed (`Err`) if any barrier fails so callers never retire recovery spools
+    /// or publish warm-import stamps ahead of SQLite durability.
+    pub(crate) fn sync_sqlite_durable(&self) -> Result<()> {
+        self.conn.execute_batch("PRAGMA synchronous = FULL;")?;
+        let ckpt_res: Result<(i64, i64, i64)> = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .map_err(Into::into);
+        let _ = self.conn.execute_batch("PRAGMA synchronous = NORMAL;");
+        let (_busy, log_frames, ckpt_frames) = ckpt_res?;
+
+        let db_path = self.root.join("state.db");
+        let db_file = File::open(&db_path)
+            .with_context(|| format!("open {} for SQLite durability barrier", db_path.display()))?;
+        durability_barrier(&db_file).with_context(|| {
+            format!("fsync {} for SQLite durability barrier", db_path.display())
+        })?;
+
+        let wal_path = self.root.join("state.db-wal");
+        match File::open(&wal_path) {
+            Ok(wal_file) => {
+                durability_barrier(&wal_file).with_context(|| {
+                    format!("fsync {} for SQLite durability barrier", wal_path.display())
+                })?;
+                sync_dir(&self.root)?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if log_frames > ckpt_frames {
+                    anyhow::bail!(
+                        "SQLite WAL {} disappeared with {} uncheckpointed frames ({} logged, {} checkpointed)",
+                        wal_path.display(),
+                        log_frames - ckpt_frames,
+                        log_frames,
+                        ckpt_frames
+                    );
+                }
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("open {} for SQLite durability barrier", wal_path.display())
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Digest-checked presence of a CAS blob against its `blobs` row (or direct BLAKE3 check when
+    /// the blob has no row yet).
     fn blob_intact_by_row(&self, blob_hash: &str) -> bool {
         let path = self.blob_path(blob_hash);
         let recorded: Option<i64> = self
@@ -949,17 +1560,20 @@ impl TurboStore {
             .ok()
             .flatten();
         match recorded {
-            Some(sz) => matches!(probe_blob_file(&path, sz as u64), BlobDisk::Intact(_)),
-            None => path.exists(),
+            Some(sz) => matches!(
+                probe_blob_digest(&path, blob_hash, sz.max(0) as u64),
+                BlobDisk::Intact
+            ),
+            None => read_cas_blob_verified(&path, blob_hash, None).is_some(),
         }
     }
 
-    /// Size-checked (never hashed) presence test for every output blob of an action.
+    /// Digest-checked presence test for every output blob of an action.
     fn entries_intact_on_disk(&self, entries: &[BlobEntry]) -> bool {
         entries.iter().all(|e| {
             matches!(
-                probe_blob_file(&self.blob_path(&e.blob_hash), e.size_bytes),
-                BlobDisk::Intact(_)
+                probe_blob_digest(&self.blob_path(&e.blob_hash), &e.blob_hash, e.size_bytes),
+                BlobDisk::Intact
             )
         })
     }
@@ -1122,6 +1736,7 @@ impl TurboStore {
         let waiters_path = locks_dir.join(format!("{}.waiters", action_key));
         let lock_file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)?;
@@ -1139,6 +1754,7 @@ impl TurboStore {
             let mut counted_by_leader = false;
             if let Ok(mut wf) = OpenOptions::new()
                 .create(true)
+                .truncate(false)
                 .read(true)
                 .write(true)
                 .open(&waiters_path)
@@ -1146,10 +1762,11 @@ impl TurboStore {
                 let wfd = wf.as_raw_fd();
                 if unsafe { libc::flock(wfd, libc::LOCK_EX) } == 0 {
                     let mut buf = Vec::new();
-                    if wf.read_to_end(&mut buf).is_ok() && !buf.starts_with(b"S") {
-                        if wf.write_all(b"1").is_ok() {
-                            counted_by_leader = true;
-                        }
+                    if wf.read_to_end(&mut buf).is_ok()
+                        && !buf.starts_with(b"S")
+                        && wf.write_all(b"1").is_ok()
+                    {
+                        counted_by_leader = true;
                     }
                     unsafe {
                         libc::flock(wfd, libc::LOCK_UN);
@@ -1199,8 +1816,8 @@ impl TurboStore {
             }
         }
 
-        // GC unlinks an evicted action's uncontended `.lock`; if we locked an inode that is no
-        // longer the one at `lock_path`, a peer may hold a different one, so start over.
+        // `.lock` files are never unlinked, so `lock_file` is always the inode at `lock_path`;
+        // verify defensively and restart if anything external replaced it.
         let lock_id = |m: fs::Metadata| (m.dev(), m.ino());
         if fs::metadata(&lock_path).ok().map(lock_id) != lock_file.metadata().ok().map(lock_id) {
             unsafe {
@@ -1263,6 +1880,7 @@ impl TurboStore {
         trust_domain: &str,
         pin_level: i64,
     ) -> Result<String> {
+        let _pub_guard = acquire_cas_publication_guard(&self.root)?;
         let hash = blake3::hash(bytes).to_hex().to_string();
         let (inode, size) = self.ensure_immutable_blob_on_disk(&hash, bytes)?;
         let now = now_unix();
@@ -1293,11 +1911,11 @@ impl TurboStore {
         if items.is_empty() {
             return Ok(Vec::new());
         }
+        let _pub_guard = acquire_cas_publication_guard(&self.root)?;
         let now = now_unix();
         let mut entries = Vec::with_capacity(items.len());
         let mut seen_blobs: std::collections::HashMap<String, (i64, i64, String)> =
             std::collections::HashMap::with_capacity(items.len());
-        let mut created_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
         for (pre_hash, bytes, kind, rel_path, size_bytes) in items {
             let hash = if pre_hash.is_empty() {
@@ -1307,11 +1925,6 @@ impl TurboStore {
             };
             if !seen_blobs.contains_key(&hash) {
                 let dest = self.blob_path(&hash);
-                if let Some(parent) = dest.parent() {
-                    if created_dirs.insert(parent.to_path_buf()) {
-                        fs::create_dir_all(parent)?;
-                    }
-                }
                 let (ino, sz) = ensure_blob_file(&self.root, &dest, &hash, bytes, false)?;
                 seen_blobs.insert(hash.clone(), (ino, sz, kind.clone()));
             }
@@ -1367,6 +1980,18 @@ impl TurboStore {
         if blobs.is_empty() {
             return Ok(());
         }
+        let _pub_guard = acquire_cas_publication_guard(&self.root)?;
+        for (hash, _, size, _) in blobs {
+            if !matches!(
+                probe_blob_digest(&self.blob_path(hash), hash, (*size).max(0) as u64),
+                BlobDisk::Intact
+            ) {
+                anyhow::bail!(
+                    "Refusing to register CAS blob {}: missing or torn on disk",
+                    hash
+                );
+            }
+        }
         let now = now_unix();
         let tx = self.conn.unchecked_transaction()?;
         {
@@ -1395,19 +2020,62 @@ impl TurboStore {
         Ok(())
     }
 
-    /// Batch-publish multiple verified theorem shard receipts in a single atomic SQLite transaction.
-    pub fn has_completed_action(&self, action_key: &str) -> bool {
-        self.has_completed_action_in_domain(action_key, "trusted")
+    /// Verify that a cached theorem-shard action in `trust_domain` has an intact receipt blob
+    /// whose `"decl"` AND `"kernel_type_hash"` match the freshly attested probe values.
+    pub fn has_attested_decl_receipt(
+        &self,
+        action_key: &str,
+        trust_domain: &str,
+        expected_decl: &str,
+        expected_kernel_type_hash: &str,
+    ) -> bool {
+        let Ok(Some(entries)) = self.get_cached_action_no_hit_bump(action_key, trust_domain) else {
+            return false;
+        };
+        self.outputs_have_attested_decl_receipt(&entries, expected_decl, expected_kernel_type_hash)
     }
 
-    pub fn has_completed_action_in_domain(&self, action_key: &str, trust_domain: &str) -> bool {
-        self.conn
-            .query_row(
-                "SELECT 1 FROM actions WHERE action_key = ?1 AND status = 'completed' AND trust_domain = ?2",
-                params![action_key, trust_domain],
-                |_| Ok(()),
-            )
-            .is_ok()
+    pub fn outputs_have_attested_decl_receipt(
+        &self,
+        entries: &[BlobEntry],
+        expected_decl: &str,
+        expected_kernel_type_hash: &str,
+    ) -> bool {
+        entries.iter().any(|entry| {
+            let Some(bytes) = self.read_verified_blob(&entry.blob_hash) else {
+                return false;
+            };
+            let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                return false;
+            };
+            let version = |field: &str| val[field].as_u64().and_then(|v| u32::try_from(v).ok());
+            val["decl"].as_str().is_some_and(|d| {
+                crate::splitter::canonicalize_lean_name(d)
+                    == crate::splitter::canonicalize_lean_name(expected_decl)
+            }) && val["kernel_type_hash"].as_str() == Some(expected_kernel_type_hash)
+                && crate::zygote::verifier_provenance_ok(
+                    version("scanner_version").unwrap_or(0),
+                    version("replay_version").unwrap_or(0),
+                )
+        })
+    }
+
+    /// Evict an unattested or stale cached action and its `.done` marker so singleflight can
+    /// re-acquire leader ownership and publish an attested receipt.
+    pub fn invalidate_action_for_reattestation(&self, action_key: &str) -> Result<()> {
+        let _pub_guard = acquire_cas_publication_guard(&self.root)?;
+        self.remove_singleflight_markers(action_key);
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM action_outputs WHERE action_key = ?1",
+            params![action_key],
+        )?;
+        tx.execute(
+            "DELETE FROM actions WHERE action_key = ?1",
+            params![action_key],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn has_cached_action_readonly(&self, action_key: &str, trust_domain: &str) -> Result<bool> {
@@ -1428,6 +2096,18 @@ impl TurboStore {
         Ok(hashes.iter().all(|h| self.blob_intact_by_row(h)))
     }
 
+    /// Read and digest-verify a CAS blob (transparently decompressing cold `TLZ1` blobs).
+    pub(crate) fn read_verified_blob(&self, blob_hash: &str) -> Option<Vec<u8>> {
+        let path = self.blob_path(blob_hash);
+        let recorded: Option<i64> = self
+            .conn
+            .prepare_cached("SELECT size_bytes FROM blobs WHERE blob_hash = ?1")
+            .and_then(|mut st| st.query_row(params![blob_hash], |r| r.get(0)).optional())
+            .ok()
+            .flatten();
+        read_cas_blob_verified(&path, blob_hash, recorded.map(|sz| sz.max(0) as u64))
+    }
+
     pub fn batch_get_theorem_shards_readonly(
         &self,
         shard_keys: &[String],
@@ -1437,26 +2117,36 @@ impl TurboStore {
             return Ok(std::collections::HashMap::new());
         }
         let mut verified = std::collections::HashMap::with_capacity(shard_keys.len());
-        let mut exists_cache: std::collections::HashMap<String, bool> =
+        let mut intact_cache: std::collections::HashMap<String, bool> =
             std::collections::HashMap::new();
         let mut sel_stmt = self.conn.prepare_cached(
-            "SELECT ao.blob_hash
+            "SELECT ao.blob_hash, b.size_bytes
              FROM actions a
              JOIN action_outputs ao ON ao.action_key = a.action_key
              JOIN blobs b ON b.blob_hash = ao.blob_hash
-             WHERE a.action_key = ?1 AND a.status = 'completed' AND a.trust_domain = ?2
-               AND (?2 != 'trusted' OR b.trust_domain = 'trusted')
+             WHERE a.action_key = ?1 AND a.status = 'completed'
+               AND ((?2 = 'trusted' AND a.trust_domain = 'trusted' AND b.trust_domain = 'trusted')
+                    OR (?2 != 'trusted' AND (a.trust_domain = 'trusted' OR a.trust_domain = ?2)))
              LIMIT 1",
         )?;
         for key in shard_keys {
-            if let Some(blob_hash) = sel_stmt
-                .query_row(params![key, trust_domain], |r| r.get::<_, String>(0))
+            if let Some((blob_hash, sz)) = sel_stmt
+                .query_row(params![key, trust_domain], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                })
                 .optional()?
             {
-                let exists = *exists_cache
-                    .entry(blob_hash.clone())
-                    .or_insert_with(|| self.blob_intact_by_row(&blob_hash));
-                if exists {
+                let intact = *intact_cache.entry(blob_hash.clone()).or_insert_with(|| {
+                    matches!(
+                        probe_blob_digest(
+                            &self.blob_path(&blob_hash),
+                            &blob_hash,
+                            sz.max(0) as u64
+                        ),
+                        BlobDisk::Intact
+                    )
+                });
+                if intact {
                     verified.insert(key.clone(), blob_hash);
                 }
             }
@@ -1498,12 +2188,13 @@ impl TurboStore {
         if items.is_empty() {
             return Ok(());
         }
+        let pub_guard = acquire_cas_publication_guard(&self.root)?;
         let now = now_unix();
         let mut staged = Vec::with_capacity(items.len());
         let mut seen_blobs: std::collections::HashMap<String, (i64, i64)> =
             std::collections::HashMap::with_capacity(items.len());
         let mut seen_prefix = [false; 256];
-        let mut newly_created_prefix = [false; 256];
+        let mut created_parents = std::collections::HashSet::new();
 
         for (action_key, decl_name, receipt_bytes, dur_ms) in items {
             let hash = blake3::hash(receipt_bytes).to_hex().to_string();
@@ -1516,19 +2207,22 @@ impl TurboStore {
                 if !seen_prefix[p_idx] {
                     seen_prefix[p_idx] = true;
                     if let Some(parent) = dest.parent() {
-                        if fs::create_dir(parent).is_ok() {
-                            newly_created_prefix[p_idx] = true;
-                        }
+                        created_parents.extend(ensure_dir_tracking(parent, &self.root)?);
                     }
                 }
                 // Inode is left 0 as before; only completeness matters here.
-                let (_, sz) = ensure_blob_file(
-                    &self.root,
-                    &dest,
-                    &hash,
-                    receipt_bytes,
-                    newly_created_prefix[p_idx],
-                )?;
+                let (_, sz) = match ensure_blob_file(&self.root, &dest, &hash, receipt_bytes, false)
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let mut dirs: Vec<PathBuf> = created_parents.into_iter().collect();
+                        dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+                        for dir in dirs {
+                            let _ = sync_dir(&dir);
+                        }
+                        return Err(e);
+                    }
+                };
                 let ino = 0i64;
                 seen_blobs.insert(hash.clone(), (ino, sz));
                 (ino, sz)
@@ -1543,12 +2237,19 @@ impl TurboStore {
             });
         }
 
+        let mut dirs: Vec<PathBuf> = created_parents.into_iter().collect();
+        dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+        for dir in dirs {
+            sync_dir(&dir)?;
+        }
+
         *self.inflight_staged_shards.borrow_mut() = Some(StagedTheoremShards {
             toolchain: toolchain.to_string(),
             trust_domain: trust_domain.to_string(),
             now,
             unique_blobs: seen_blobs.len(),
             rows: staged,
+            _pub_guard: pub_guard,
         });
         Ok(())
     }
@@ -1557,6 +2258,22 @@ impl TurboStore {
         let Some(staged) = self.inflight_staged_shards.borrow_mut().take() else {
             return Ok(());
         };
+        for row in &staged.rows {
+            if !matches!(
+                probe_blob_digest(
+                    &self.blob_path(&row.blob_hash),
+                    &row.blob_hash,
+                    row.size as u64
+                ),
+                BlobDisk::Intact
+            ) {
+                anyhow::bail!(
+                    "Refusing to publish theorem shard {}: CAS blob {} missing or torn on disk",
+                    row.action_key,
+                    row.blob_hash
+                );
+            }
+        }
         let waiters = lease_action_key
             .map(|ak| self.seal_singleflight_waiters(ak))
             .unwrap_or(0);
@@ -1592,6 +2309,7 @@ impl TurboStore {
                  ON CONFLICT(blob_hash) DO UPDATE SET
                     last_accessed = excluded.last_accessed,
                     size_bytes = CASE WHEN excluded.size_bytes > 0 THEN excluded.size_bytes ELSE blobs.size_bytes END,
+                    pin_level = MAX(blobs.pin_level, excluded.pin_level),
                     trust_domain = CASE WHEN blobs.trust_domain = 'trusted' THEN 'trusted' ELSE excluded.trust_domain END",
             )?;
             let mut ins_act = self.conn.prepare_cached(
@@ -1689,7 +2407,7 @@ impl TurboStore {
         );
         res?;
         if let Some((ak, entry)) = lease_done_entry {
-            self.write_singleflight_done(&ak, &[entry]);
+            self.write_singleflight_done(&ak, &[entry])?;
         }
         Ok(())
     }
@@ -1749,11 +2467,14 @@ impl TurboStore {
         count
     }
 
-    pub fn write_singleflight_done(&self, action_key: &str, outputs: &[BlobEntry]) {
-        let done_path = self.root.join("locks").join(format!("{}.done", action_key));
-        if let Ok(bytes) = serde_json::to_vec(outputs) {
-            let _ = write_blob_atomic(&self.root, &done_path, action_key, &bytes, true);
-        }
+    pub fn write_singleflight_done(&self, action_key: &str, outputs: &[BlobEntry]) -> Result<()> {
+        let _pub_guard = acquire_cas_publication_guard(&self.root)?;
+        let locks = self.root.join("locks");
+        let created = ensure_dir_tracking(&locks, &self.root)?;
+        let done_path = locks.join(format!("{}.done", action_key));
+        let bytes = serde_json::to_vec(outputs)?;
+        write_bytes_durable(&done_path, &bytes, &created)?;
+        Ok(())
     }
 
     pub fn remove_singleflight_done(&self, action_key: &str) {
@@ -1771,6 +2492,20 @@ impl TurboStore {
         heartbeats: i64,
         trust_domain: &str,
     ) -> Result<String> {
+        let _pub_guard = acquire_cas_publication_guard(&self.root)?;
+        for o in outputs {
+            if !matches!(
+                probe_blob_digest(&self.blob_path(&o.blob_hash), &o.blob_hash, o.size_bytes),
+                BlobDisk::Intact
+            ) {
+                anyhow::bail!(
+                    "Refusing to publish action {}: CAS blob {} ({}) missing or torn on disk",
+                    lease.action_key,
+                    o.blob_hash,
+                    o.rel_path
+                );
+            }
+        }
         let mut manifest_hasher = blake3::Hasher::new();
         for o in outputs {
             manifest_hasher.update(o.rel_path.as_bytes());
@@ -1860,7 +2595,7 @@ impl TurboStore {
         );
         commit_res?;
         if trust_domain == "trusted" && act_updated > 0 {
-            self.write_singleflight_done(&lease.action_key, outputs);
+            self.write_singleflight_done(&lease.action_key, outputs)?;
         }
         Ok(manifest_hash)
     }
@@ -1875,6 +2610,7 @@ impl TurboStore {
         duration_ms: i64,
         trust_domain: &str,
     ) -> Result<String> {
+        let _pub_guard = acquire_cas_publication_guard(&self.root)?;
         let blob_hash = blake3::hash(bytes).to_hex().to_string();
         let (inode, size) = self.ensure_immutable_blob_on_disk(&blob_hash, bytes)?;
 
@@ -1905,6 +2641,7 @@ impl TurboStore {
                  ON CONFLICT(blob_hash) DO UPDATE SET
                     last_accessed = excluded.last_accessed,
                     size_bytes = CASE WHEN excluded.size_bytes > 0 THEN excluded.size_bytes ELSE blobs.size_bytes END,
+                    pin_level = MAX(blobs.pin_level, excluded.pin_level),
                     trust_domain = CASE WHEN blobs.trust_domain = 'trusted' THEN 'trusted' ELSE excluded.trust_domain END",
             )?;
             ins_blob.execute(params![blob_hash, kind, size, inode, now, trust_domain])?;
@@ -1976,7 +2713,7 @@ impl TurboStore {
                 size_bytes: size as u64,
                 rel_path: rel_path.to_string(),
             }];
-            self.write_singleflight_done(&lease.action_key, &single_out);
+            self.write_singleflight_done(&lease.action_key, &single_out)?;
         }
         Ok(manifest_hash)
     }
@@ -2004,6 +2741,118 @@ impl TurboStore {
         Ok(())
     }
 
+    pub(crate) fn is_store_outside_disallowed_roots(&self, disallowed_roots: &[PathBuf]) -> bool {
+        let db_path = self.root.join("state.db");
+        let key_path = self.root.join(VERIFIER_REPLAY_HMAC_KEY_FILENAME);
+        !path_is_inside_any_disallowed_root(&self.root, disallowed_roots)
+            && !path_is_inside_any_disallowed_root(&db_path, disallowed_roots)
+            && !path_is_inside_any_disallowed_root(&key_path, disallowed_roots)
+    }
+
+    pub(crate) fn record_kernel_replayed_olean(
+        &self,
+        artifact_digest: &str,
+        environment_digest: &str,
+        replay_version: u32,
+        toolchain_hash: &str,
+        module_name: &str,
+        disallowed_roots: &[PathBuf],
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !artifact_digest.is_empty()
+                && !environment_digest.is_empty()
+                && replay_version > 0
+                && !toolchain_hash.is_empty(),
+            "Refusing to record empty kernel-replay authority row (fail-closed)"
+        );
+        if !self.is_store_outside_disallowed_roots(disallowed_roots) {
+            // Checkout-local / project-writable stores are never granted replay authority;
+            // verification still succeeds, and subsequent runs will always re-run kernel replay.
+            return Ok(());
+        }
+        let Some(key) = get_or_create_verified_replay_hmac_key(&self.root, disallowed_roots) else {
+            return Ok(());
+        };
+        let replay_mac = compute_kernel_replay_mac(
+            &key,
+            artifact_digest,
+            environment_digest,
+            replay_version,
+            toolchain_hash,
+        );
+        let now = now_unix();
+        self.conn.execute(
+            "INSERT INTO kernel_replayed_oleans_auth (
+                artifact_digest, environment_digest, replay_version, toolchain_hash, module_name, replay_mac, verified_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(artifact_digest, environment_digest, replay_version, toolchain_hash) DO UPDATE SET
+                module_name = excluded.module_name,
+                replay_mac = excluded.replay_mac,
+                verified_at = excluded.verified_at",
+            params![
+                artifact_digest,
+                environment_digest,
+                i64::from(replay_version),
+                toolchain_hash,
+                module_name,
+                replay_mac,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn has_kernel_replayed_olean(
+        &self,
+        artifact_digest: &str,
+        environment_digest: &str,
+        replay_version: u32,
+        toolchain_hash: &str,
+        disallowed_roots: &[PathBuf],
+    ) -> bool {
+        if artifact_digest.is_empty()
+            || environment_digest.is_empty()
+            || replay_version == 0
+            || toolchain_hash.is_empty()
+            || !self.is_store_outside_disallowed_roots(disallowed_roots)
+        {
+            return false;
+        }
+        let key_path = self.root.join(VERIFIER_REPLAY_HMAC_KEY_FILENAME);
+        let Some(key) = read_verified_replay_hmac_key_file(&key_path, disallowed_roots) else {
+            return false;
+        };
+        let Ok(stored_mac) = self.conn.query_row(
+            "SELECT replay_mac FROM kernel_replayed_oleans_auth
+             WHERE artifact_digest = ?1 AND environment_digest = ?2 AND replay_version = ?3 AND toolchain_hash = ?4
+             LIMIT 1",
+            params![
+                artifact_digest,
+                environment_digest,
+                i64::from(replay_version),
+                toolchain_hash
+            ],
+            |r| r.get::<_, String>(0),
+        ) else {
+            return false;
+        };
+        let expected_mac = compute_kernel_replay_mac(
+            &key,
+            artifact_digest,
+            environment_digest,
+            replay_version,
+            toolchain_hash,
+        );
+        stored_mac.len() == expected_mac.len()
+            && stored_mac
+                .as_bytes()
+                .iter()
+                .zip(expected_mac.as_bytes().iter())
+                .fold(0u8, |acc, (&a, &b)| acc | (a ^ b))
+                == 0
+    }
+
     /// Single-transaction publication of an ingested worktree build action:
     /// atomically registers `reg_blobs`, publishes `action_key` + `outputs`, records
     /// `worktrees` + `worktree_installations`, optionally caches `lake_env`, and optionally
@@ -2025,6 +2874,32 @@ impl TurboStore {
         lake_env: Option<(&str, &std::collections::HashMap<String, String>)>,
         attestation: Option<(&str, &str, &[String], Option<&str>)>,
     ) -> Result<(String, usize)> {
+        let _pub_guard = acquire_cas_publication_guard(&self.root)?;
+        for (hash, _, size, _) in reg_blobs {
+            if !matches!(
+                probe_blob_digest(&self.blob_path(hash), hash, (*size).max(0) as u64),
+                BlobDisk::Intact
+            ) {
+                anyhow::bail!(
+                    "Refusing to publish ingested action {}: staged CAS blob {} missing or torn on disk",
+                    action_key,
+                    hash
+                );
+            }
+        }
+        for o in outputs {
+            if !matches!(
+                probe_blob_digest(&self.blob_path(&o.blob_hash), &o.blob_hash, o.size_bytes),
+                BlobDisk::Intact
+            ) {
+                anyhow::bail!(
+                    "Refusing to publish ingested action {}: CAS blob {} ({}) missing or torn on disk",
+                    action_key,
+                    o.blob_hash,
+                    o.rel_path
+                );
+            }
+        }
         let mut manifest_hasher = blake3::Hasher::new();
         for o in outputs {
             manifest_hasher.update(o.rel_path.as_bytes());
@@ -2189,7 +3064,7 @@ impl TurboStore {
         );
         commit_res?;
         if trust_domain == "trusted" && act_updated > 0 {
-            self.write_singleflight_done(action_key, outputs);
+            self.write_singleflight_done(action_key, outputs)?;
         }
         Ok((manifest_hash, linked))
     }
@@ -2248,7 +3123,13 @@ impl TurboStore {
                 continue;
             }
             let src = self.ensure_blob_uncompressed(&out.blob_hash)?;
-            if !matches!(probe_blob_file(&src, out.size_bytes), BlobDisk::Intact(_)) {
+            if !matches!(
+                probe_blob_digest(&src, &out.blob_hash, out.size_bytes),
+                BlobDisk::Intact
+            ) {
+                #[cfg(unix)]
+                unseal_cas_inode_at_path(&src);
+                let _ = fs::remove_file(&src);
                 anyhow::bail!(
                     "CAS blob {} is missing or torn; refusing to link",
                     out.blob_hash
@@ -2258,8 +3139,8 @@ impl TurboStore {
             let dst_in_lake_build = is_non_package_lake_build_path(&dst);
 
             let already_valid_in_place = if dst_in_lake_build {
-                match (fs::metadata(&src), fs::metadata(&dst)) {
-                    (Ok(src_meta), Ok(dst_meta)) => {
+                match (fs::symlink_metadata(&src), fs::symlink_metadata(&dst)) {
+                    (Ok(src_meta), Ok(dst_meta)) if src_meta.is_file() && dst_meta.is_file() => {
                         let same_ino =
                             src_meta.dev() == dst_meta.dev() && src_meta.ino() == dst_meta.ino();
                         !same_ino
@@ -2267,19 +3148,36 @@ impl TurboStore {
                             && (dst_meta.permissions().mode() & 0o200) != 0
                             && src_meta.len() == dst_meta.len()
                             && existing_map.get(&out.rel_path) == Some(&out.blob_hash)
-                            && fs::read(&dst).ok().is_some_and(|b| {
-                                blake3::hash(&b).to_hex().as_str() == out.blob_hash
+                            && read_regular_nofollow(&dst).is_some_and(|(b, _)| {
+                                b.len() as u64 == out.size_bytes
+                                    && blake3::hash(&b).to_hex().as_str() == out.blob_hash
                             })
                     }
                     _ => false,
                 }
             } else {
-                match (fs::metadata(&src), fs::metadata(&dst)) {
-                    (Ok(src_meta), Ok(dst_meta)) => {
-                        (src_meta.dev() == dst_meta.dev() && src_meta.ino() == dst_meta.ino())
+                match (open_regular_nofollow(&src), open_regular_nofollow(&dst)) {
+                    (Ok((_src_f, src_meta)), Ok((mut dst_f, dst_meta))) => {
+                        let dst_owned =
+                            is_exclusively_created_immutable_cas_inode(&dst_meta, &out.blob_hash);
+                        (src_meta.dev() == dst_meta.dev()
+                            && src_meta.ino() == dst_meta.ino()
+                            && dst_owned
+                            && is_exclusively_created_immutable_cas_inode(
+                                &src_meta,
+                                &out.blob_hash,
+                            ))
                             || (src_meta.dev() != dst_meta.dev()
+                                && dst_owned
                                 && src_meta.len() == dst_meta.len()
-                                && (dst_meta.permissions().mode() & 0o222) == 0)
+                                && {
+                                    let mut b = Vec::with_capacity(
+                                        dst_meta.len().min(64 * 1024 * 1024) as usize,
+                                    );
+                                    dst_f.read_to_end(&mut b).is_ok()
+                                        && b.len() as u64 == out.size_bytes
+                                        && blake3::hash(&b).to_hex().as_str() == out.blob_hash
+                                })
                     }
                     _ => false,
                 }
@@ -2307,7 +3205,7 @@ impl TurboStore {
                 }
             }
 
-            let mode = try_reflink_or_hardlink(&src, &dst, Some(out.size_bytes))?;
+            let mode = install_verified_blob_to_path(&src, &dst, &out.blob_hash, out.size_bytes)?;
             if existing_map.get(&out.rel_path) != Some(&out.blob_hash) {
                 db_updates.push((&out.rel_path, &out.blob_hash, mode));
             }
@@ -2339,39 +3237,88 @@ impl TurboStore {
     /// atomically rewriting it back to raw `0o444` bytes in the Hot tier so it can be hardlinked.
     pub fn ensure_blob_uncompressed(&self, blob_hash: &str) -> Result<PathBuf> {
         let src = self.blob_path(blob_hash);
-        let mut f = match File::open(&src) {
-            Ok(file) => file,
-            Err(_) => return Ok(src),
+        let mut f = match open_regular_nofollow(&src) {
+            Ok((file, _)) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(src),
+            Err(e) => {
+                anyhow::bail!(
+                    "CAS blob {} at {} is not a regular file: {}",
+                    blob_hash,
+                    src.display(),
+                    e
+                );
+            }
         };
         let mut magic = [0u8; 4];
         if f.read_exact(&mut magic).is_ok() && &magic == b"TLZ1" {
+            let _pub_guard = acquire_cas_publication_guard(&self.root)?;
             // Read the inode we sniffed (not the path again): a racing promotion swaps the path.
             let opened_ino = f.metadata()?.ino();
             let mut compressed = magic.to_vec();
             f.read_to_end(&mut compressed)?;
             drop(f);
-            let Some(raw) = decompress_tlz1(&compressed) else {
-                // A truncated cold body passes the header-only probe; drop it so it self-heals,
-                // unless a concurrent promotion already replaced it.
-                if fs::metadata(&src).is_ok_and(|m| m.ino() == opened_ino) {
+            let Some(raw) = decompress_tlz1(&compressed)
+                .filter(|b| blake3::hash(b).to_hex().as_str() == blob_hash)
+            else {
+                // A truncated or corrupt cold body passes the header-only probe; drop it so it
+                // self-heals, unless a concurrent promotion already replaced it.
+                if fs::symlink_metadata(&src).is_ok_and(|m| m.is_file() && m.ino() == opened_ino) {
+                    #[cfg(unix)]
+                    unseal_cas_inode_at_path(&src);
                     let _ = fs::remove_file(&src);
                 }
-                anyhow::bail!("Failed to decompress TLZ1 blob {}", blob_hash);
+                anyhow::bail!("Failed to decompress or verify TLZ1 blob {}", blob_hash);
             };
+            #[cfg(unix)]
+            let old_key = fs::symlink_metadata(&src)
+                .ok()
+                .filter(|m| m.is_file())
+                .map(|m| (m.dev(), m.ino()));
             write_blob_atomic(&self.root, &src, blob_hash, &raw, true)?;
-            if let Ok(meta) = fs::metadata(&src) {
+            #[cfg(unix)]
+            if let Some((dev, ino)) = old_key {
+                if fs::symlink_metadata(&src)
+                    .ok()
+                    .is_none_or(|nm| (nm.dev(), nm.ino()) != (dev, ino))
+                {
+                    unseal_cas_inode(dev, ino);
+                }
+            }
+            if let Ok((_, meta)) = open_regular_nofollow(&src) {
                 let _ = self.conn.execute(
                     "UPDATE blobs SET inode = ?1, last_accessed = ?2 WHERE blob_hash = ?3",
                     params![meta.ino() as i64, now_unix(), blob_hash],
                 );
             }
+        } else {
+            #[cfg(unix)]
+            if let Ok(meta) = f.metadata() {
+                if !is_exclusively_created_immutable_cas_inode(&meta, blob_hash) {
+                    use std::io::Seek;
+                    let _pub_guard = acquire_cas_publication_guard(&self.root)?;
+                    if f.seek(std::io::SeekFrom::Start(0)).is_ok() {
+                        let mut raw = Vec::with_capacity(meta.len().min(64 * 1024 * 1024) as usize);
+                        if f.read_to_end(&mut raw).is_ok()
+                            && blake3::hash(&raw).to_hex().as_str() == blob_hash
+                        {
+                            drop(f);
+                            write_blob_atomic(&self.root, &src, blob_hash, &raw, true)?;
+                            if let Ok((_, new_meta)) = open_regular_nofollow(&src) {
+                                let _ = self.conn.execute(
+                                    "UPDATE blobs SET inode = ?1, last_accessed = ?2 WHERE blob_hash = ?3",
+                                    params![new_meta.ino() as i64, now_unix(), blob_hash],
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
         Ok(src)
     }
 
-    /// Refuse to link a CAS blob whose bytes are not the recorded blob: size check against the
-    /// `blobs` row (cheap), falling back to a full BLAKE3 check only for blobs with no row.
-    /// A torn blob is unlinked so the next producer rewrites it.
+    /// Refuse to link a CAS blob whose bytes do not verify against `blob_hash`.
+    /// A torn or corrupt regular blob is unlinked so the next producer rewrites it.
     fn verify_blob_before_link(&self, blob_hash: &str, src: &Path) -> Result<u64> {
         let recorded: Option<i64> = self
             .conn
@@ -2382,16 +3329,19 @@ impl TurboStore {
             )
             .optional()?;
         let len = match recorded {
-            Some(sz) => {
-                matches!(probe_blob_file(src, sz as u64), BlobDisk::Intact(_)).then_some(sz as u64)
-            }
-            None => fs::read(src)
-                .ok()
-                .filter(|b| blake3::hash(b).to_hex().as_str() == blob_hash)
-                .map(|b| b.len() as u64),
+            Some(sz) => matches!(
+                probe_blob_digest(src, blob_hash, sz.max(0) as u64),
+                BlobDisk::Intact
+            )
+            .then_some(sz.max(0) as u64),
+            None => read_cas_blob_verified(src, blob_hash, None).map(|b| b.len() as u64),
         };
         let Some(len) = len else {
-            let _ = fs::remove_file(src);
+            if fs::symlink_metadata(src).is_ok_and(|m| m.is_file()) {
+                #[cfg(unix)]
+                unseal_cas_inode_at_path(src);
+                let _ = fs::remove_file(src);
+            }
             anyhow::bail!(
                 "CAS blob {} is missing or torn; refusing to link",
                 blob_hash
@@ -2408,7 +3358,7 @@ impl TurboStore {
         if let Some(parent) = dest_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        try_reflink_or_hardlink(&src, dest_path, Some(len))
+        install_verified_blob_to_path(&src, dest_path, blob_hash, len)
     }
 
     /// Record an active worktree lease and its active file->blob mappings.
@@ -2571,40 +3521,129 @@ impl TurboStore {
         })
     }
 
-    /// Drop the per-action `.done` / `.waiters` markers (and the `.lock` file when no peer holds
-    /// it) of an action that GC evicted, so they neither leak nor short-circuit later lookups.
+    /// Drop the per-action `.done` / `.waiters` markers of an action that GC evicted. The `.lock`
+    /// file is never removed: its inode is the singleflight exclusion domain, and unlinking it
+    /// between a peer's `open` and its `flock` would let a second caller create and lock a new
+    /// inode for the same action.
     fn remove_singleflight_markers(&self, action_key: &str) {
         let locks = self.root.join("locks");
         let _ = fs::remove_file(locks.join(format!("{}.done", action_key)));
         let _ = fs::remove_file(locks.join(format!("{}.waiters", action_key)));
+    }
+
+    /// Exclusively lock `action_key`'s singleflight file without blocking (`None` if some peer
+    /// holds it). A non-existent lock file is created so a concurrent `acquire_singleflight`
+    /// shares the same inode and blocks until the caller finishes.
+    fn try_lock_singleflight(&self, action_key: &str) -> Option<File> {
+        use std::os::unix::io::AsRawFd;
+        let locks = self.root.join("locks");
+        let _ = fs::create_dir_all(&locks);
         let lock_path = locks.join(format!("{}.lock", action_key));
-        if let Ok(f) = OpenOptions::new().read(true).write(true).open(&lock_path) {
-            use std::os::unix::io::AsRawFd;
-            // Only unlink an uncontended lock: a live leader/follower keeps its flock.
-            let lock_id = |m: fs::Metadata| (m.dev(), m.ino());
-            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0
-                // A concurrent GC may already have replaced the path: never unlink a newer lock.
-                && fs::metadata(&lock_path).ok().map(lock_id) == f.metadata().ok().map(lock_id)
-            {
-                let _ = fs::remove_file(&lock_path);
-            }
+        let f = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .ok()?;
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            Some(f)
+        } else {
+            None
         }
     }
 
-    fn remove_singleflight_markers_for_blob(&self, blob_hash: &str) {
-        let Ok(mut stmt) = self
-            .conn
-            .prepare_cached("SELECT action_key FROM action_outputs WHERE blob_hash = ?1")
-        else {
-            return;
-        };
-        let keys: Vec<String> = stmt
-            .query_map(params![blob_hash], |r| r.get(0))
-            .map(|rows| rows.flatten().collect())
-            .unwrap_or_default();
-        for k in keys {
-            self.remove_singleflight_markers(&k);
+    fn try_lock_all_singleflights(&self, keys: &[String]) -> Option<Vec<File>> {
+        let mut sorted: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut guards = Vec::with_capacity(sorted.len());
+        for k in sorted {
+            let Some(f) = self.try_lock_singleflight(k) else {
+                for g in guards {
+                    unsafe {
+                        libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&g), libc::LOCK_UN)
+                    };
+                }
+                return None;
+            };
+            guards.push(f);
         }
+        Some(guards)
+    }
+
+    fn unlock_singleflights(guards: Vec<File>) {
+        for g in guards {
+            unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&g), libc::LOCK_UN) };
+        }
+    }
+
+    /// Action keys currently referencing `blob_hash`, read and then re-read while every listed
+    /// singleflight lock is held. A key that appears between the two reads (a publisher that
+    /// committed after the first scan) makes this return `Ok(None)` so the caller skips the blob,
+    /// while SQLite errors propagate via `Err` so GC fails closed.
+    fn lock_blob_referencers(&self, blob_hash: &str) -> Result<Option<(Vec<File>, Vec<String>)>> {
+        let referencing = |bh: &str| -> std::result::Result<Vec<String>, rusqlite::Error> {
+            let mut stmt = self
+                .conn
+                .prepare_cached("SELECT action_key FROM action_outputs WHERE blob_hash = ?1")?;
+            let mut keys: Vec<String> = stmt
+                .query_map(params![bh], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            keys.sort_unstable();
+            keys.dedup();
+            Ok(keys)
+        };
+        let first = referencing(blob_hash)?;
+        let Some(guards) = self.try_lock_all_singleflights(&first) else {
+            return Ok(None);
+        };
+        let second = match referencing(blob_hash) {
+            Ok(keys) => keys,
+            Err(e) => {
+                Self::unlock_singleflights(guards);
+                return Err(e.into());
+            }
+        };
+        if first == second {
+            Ok(Some((guards, second)))
+        } else {
+            Self::unlock_singleflights(guards);
+            Ok(None)
+        }
+    }
+
+    /// `true` when `blob_hash` is pinned, still referenced by an action, or covered by a live
+    /// worktree lease. Called only while `lock_blob_referencers` holds every referencing lock;
+    /// propagates SQLite errors so GC fails closed rather than misclassifying live blobs as orphans.
+    fn blob_still_reachable(
+        &self,
+        blob_hash: &str,
+        now: i64,
+        ignore_actions: bool,
+    ) -> Result<bool> {
+        let sql = if ignore_actions {
+            "SELECT 1 FROM blobs WHERE blob_hash = ?1 AND pin_level > 0
+             UNION ALL
+             SELECT 1 FROM worktree_file_blobs wfb
+             JOIN worktree_leases wl ON wl.worktree_id = wfb.worktree_id
+             WHERE wfb.blob_hash = ?1 AND (?2 - wl.last_seen) <= 7200
+             LIMIT 1"
+        } else {
+            "SELECT 1 FROM blobs WHERE blob_hash = ?1 AND pin_level > 0
+             UNION ALL
+             SELECT 1 FROM action_outputs WHERE blob_hash = ?1
+             UNION ALL
+             SELECT 1 FROM worktree_file_blobs wfb
+             JOIN worktree_leases wl ON wl.worktree_id = wfb.worktree_id
+             WHERE wfb.blob_hash = ?1 AND (?2 - wl.last_seen) <= 7200
+             LIMIT 1"
+        };
+        Ok(self
+            .conn
+            .query_row(sql, params![blob_hash, now], |_| Ok(true))
+            .optional()?
+            .unwrap_or(false))
     }
 
     /// Smart multi-project Garbage Collector using Cost-Aware GDSF (Greedy-Dual-Size-Frequency):
@@ -2629,43 +3668,7 @@ impl TurboStore {
         let mut evicted_actions = 0usize;
         let mut unlinked_blobs = 0usize;
 
-        // 0. Clean orphaned temporary files in `<store>/staging` and `/dev/shm/turbo-lean-staging`
-        for st_dir in [self.root.join("staging"), self.fast_staging_dir()] {
-            if let Ok(entries) = fs::read_dir(&st_dir) {
-                for entry in entries.flatten() {
-                    let fname = entry.file_name();
-                    let fname_str = fname.to_string_lossy();
-                    if fname_str.starts_with("git_head_tree_")
-                        || fname_str.starts_with("project_stat_splits_")
-                        || fname_str.starts_with("project_splits_")
-                        || fname_str.starts_with("lake_env_v1_")
-                        || fname_str.starts_with("zygote_daemon.")
-                        || fname_str == "zygote_lru_registry.json"
-                    {
-                        continue;
-                    }
-                    if let Ok(meta) = entry.metadata() {
-                        if meta.is_file() {
-                            let age_secs = meta
-                                .modified()
-                                .ok()
-                                .and_then(|t| t.elapsed().ok())
-                                .map(|d| d.as_secs())
-                                .unwrap_or(120);
-                            if age_secs >= 30 || max_reclaimable_bytes == 0 {
-                                let sz = meta.len();
-                                if fs::remove_file(entry.path()).is_ok() {
-                                    cleaned_staging_files += 1;
-                                    freed_bytes += sz;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 0a. Bound the nested `/dev/shm` eval reply cache (the flat scan above skips subdirs)
+        // 0a. Bound the nested `/dev/shm` eval reply cache (the flat scan skips subdirs)
         if let Ok((n, b)) = crate::shm_cache::enforce_shm_quota_lru(
             &self.fast_staging_dir().join("eval_shm_cache"),
             0,
@@ -2747,10 +3750,116 @@ impl TurboStore {
             }
         }
 
+        // Acquire exclusive `gc_publish.lock` BEFORE sweeping `<store>/staging` or `fast_staging_dir()`,
+        // so active publishers holding `CasPublicationGuard` (`LOCK_SH`) never have in-flight `.tmp`
+        // or `import_*.tlpack.zst` / `export_*.tlpack.raw` files unlinked between write/fsync and
+        // `hard_link`/`rename`.
+        let Some(gc_guard) = try_acquire_cas_gc_guard(&self.root)? else {
+            let reaped_zygote_workers = if cfg!(test) || max_reclaimable_bytes > 0 {
+                0
+            } else {
+                crate::zygote::reap_zygote_workers_and_daemons(Some(&self.root))
+            };
+            let current_reclaimable = self.storage_status()?.reclaimable_bytes;
+            return Ok(GcReport {
+                pruned_worktrees,
+                evicted_actions,
+                unlinked_blobs,
+                cleaned_staging_files,
+                pruned_fastcheck_bins,
+                freed_reclaimable_bytes: freed_bytes,
+                remaining_reclaimable_bytes: current_reclaimable,
+                superseded_evicted,
+                compressed_blobs,
+                reaped_zygote_workers,
+            });
+        };
+
+        // 0. Clean orphaned temporary files in `<store>/staging` (under `CasExclusiveGcGuard`) and
+        //    stale files in shared `/dev/shm/turbo-lean-staging-<uid>` (`age_secs >= 30` when shared
+        //    outside `self.root` so `run_gc(0, ...)` on one store cannot delete another store's or
+        //    live command's fresh 0-second temporary files in `/dev/shm`).
+        let store_staging = self.root.join("staging");
+        let fast_staging = self.fast_staging_dir();
+        let sweep_dirs: &[(&Path, bool)] = if same_dir_inode(&store_staging, &fast_staging) {
+            &[(&store_staging, true)]
+        } else {
+            &[(&store_staging, true), (&fast_staging, false)]
+        };
+        for &(st_dir, is_store_owned) in sweep_dirs {
+            if let Ok(entries) = fs::read_dir(st_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let fname = entry.file_name();
+                    let fname_str = fname.to_string_lossy();
+                    if fname_str.ends_with(".lock") {
+                        if let Ok(meta) = entry.metadata() {
+                            let age_secs = meta
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.elapsed().ok())
+                                .map(|d| d.as_secs())
+                                .unwrap_or(120);
+                            if age_secs >= 30 || (is_store_owned && max_reclaimable_bytes == 0) {
+                                let _ = crate::shm_cache::reap_stale_lock_if_unheld(&path);
+                            }
+                        }
+                        continue;
+                    }
+                    if fname_str.starts_with('.') && fname_str.ends_with(".stgtmp") {
+                        let age_secs = entry
+                            .metadata()
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                            .and_then(|t| t.elapsed().ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(120);
+                        if age_secs < 30 {
+                            continue;
+                        }
+                    }
+                    if fname_str.starts_with("git_head_tree_")
+                        || fname_str.starts_with("project_stat_splits_")
+                        || fname_str.starts_with("project_splits_")
+                        || fname_str.starts_with("lake_env_v1_")
+                        || fname_str.starts_with("zygote_daemon.")
+                        || fname_str == "zygote_lru_registry.json"
+                    {
+                        continue;
+                    }
+                    if let Ok(meta) = entry.metadata() {
+                        let age_secs = meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.elapsed().ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(120);
+                        if meta.is_file() {
+                            if age_secs >= 30 || (is_store_owned && max_reclaimable_bytes == 0) {
+                                let sz = meta.len();
+                                if crate::shm_cache::try_remove_unleased_staged_file(&path) {
+                                    cleaned_staging_files += 1;
+                                    freed_bytes += sz;
+                                }
+                            }
+                        } else if meta.is_dir()
+                            && (fname_str.starts_with("turbo_audited_")
+                                || fname_str.starts_with("standalone_recheck_"))
+                            && (age_secs >= 30 || (is_store_owned && max_reclaimable_bytes == 0))
+                            && crate::shm_cache::try_remove_unleased_staged_dir(&path)
+                        {
+                            cleaned_staging_files += 1;
+                        }
+                    }
+                }
+            }
+        }
+
         // Step A (Immediate Supersession Eviction):
         // Always evict any blob in `blobs` with `pin_level < 0` that is not referenced in
         // `worktree_file_blobs` of any active lease (`now - last_seen <= 7200`), even before
         // checking `max_reclaimable_bytes`!
+        crate::pack::replay_pending_deferred_packs_inner(self, true)?;
         let superseded_blobs: Vec<(String, u64)> = {
             let mut stmt = self.conn.prepare(
                 "SELECT b.blob_hash, b.size_bytes
@@ -2769,28 +3878,89 @@ impl TurboStore {
         };
 
         for (bh, sz) in superseded_blobs {
-            let p = self.blob_path(&bh);
-            if p.exists() {
-                let _ = fs::remove_file(&p);
+            if self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM action_outputs ao WHERE ao.blob_hash = ?1 AND EXISTS (
+                         SELECT 1 FROM action_outputs ao2
+                         WHERE ao2.action_key = ao.action_key AND ao2.blob_hash != ?1
+                     ) LIMIT 1",
+                    params![bh],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some()
+            {
+                continue;
             }
-            self.remove_singleflight_markers_for_blob(&bh);
-            self.conn.execute(
-                "DELETE FROM actions WHERE action_key IN (SELECT action_key FROM action_outputs WHERE blob_hash = ?1)",
-                params![bh],
-            )?;
-            self.conn.execute(
-                "DELETE FROM action_outputs WHERE blob_hash = ?1",
-                params![bh],
-            )?;
-            self.conn.execute(
-                "DELETE FROM worktree_installations WHERE blob_hash = ?1",
-                params![bh],
-            )?;
-            self.conn
-                .execute("DELETE FROM blobs WHERE blob_hash = ?1", params![bh])?;
-            superseded_evicted += 1;
-            unlinked_blobs += 1;
-            freed_bytes += sz;
+            // Re-scan under the locks: a publisher that registered this blob on a different action
+            // after the first read makes the set change, and this pass skips the blob entirely.
+            let Some((guards, live_keys)) = self.lock_blob_referencers(&bh)? else {
+                continue;
+            };
+            let guarded_res = (|| -> Result<bool> {
+                let pin_now: Option<i64> = self
+                    .conn
+                    .query_row(
+                        "SELECT pin_level FROM blobs WHERE blob_hash = ?1",
+                        params![bh],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if pin_now.unwrap_or(0) >= 0 || self.blob_still_reachable(&bh, now, true)? {
+                    return Ok(false);
+                }
+                if !live_keys.is_empty()
+                    && self
+                        .conn
+                        .query_row(
+                            "SELECT 1 FROM action_outputs ao WHERE ao.blob_hash = ?1 AND EXISTS (
+                                 SELECT 1 FROM action_outputs ao2
+                                 WHERE ao2.action_key = ao.action_key AND ao2.blob_hash != ?1
+                             ) LIMIT 1",
+                            params![bh],
+                            |_| Ok(()),
+                        )
+                        .optional()?
+                        .is_some()
+                {
+                    return Ok(false);
+                }
+                let p = self.blob_path(&bh);
+                for k in &live_keys {
+                    self.remove_singleflight_markers(k);
+                    self.conn
+                        .execute("DELETE FROM actions WHERE action_key = ?1", params![k])?;
+                    self.conn.execute(
+                        "DELETE FROM action_outputs WHERE action_key = ?1 AND blob_hash = ?2",
+                        params![k, bh],
+                    )?;
+                }
+                if live_keys.is_empty() {
+                    self.conn.execute(
+                        "DELETE FROM action_outputs WHERE blob_hash = ?1",
+                        params![bh],
+                    )?;
+                }
+                self.conn.execute(
+                    "DELETE FROM worktree_installations WHERE blob_hash = ?1",
+                    params![bh],
+                )?;
+                self.conn
+                    .execute("DELETE FROM blobs WHERE blob_hash = ?1", params![bh])?;
+                if p.exists() {
+                    #[cfg(unix)]
+                    unseal_cas_inode_at_path(&p);
+                    let _ = fs::remove_file(&p);
+                }
+                Ok(true)
+            })();
+            Self::unlock_singleflights(guards);
+            if guarded_res? {
+                superseded_evicted += 1;
+                unlinked_blobs += 1;
+                freed_bytes += sz;
+            }
         }
 
         // Step B (Standard GDSF Eviction):
@@ -2823,12 +3993,84 @@ impl TurboStore {
                 if current_reclaimable <= max_reclaimable_bytes {
                     break;
                 }
-                self.conn.execute(
-                    "DELETE FROM actions WHERE action_key = ?1",
-                    params![action_key],
-                )?;
-                self.remove_singleflight_markers(&action_key);
-                evicted_actions += 1;
+                // Recheck under the same lock a publisher holds, and keep it until this action's
+                // blobs are gone: a lease taken after the candidate scan (or still held) keeps both
+                // the row and its blobs.
+                let Some(guard) = self.try_lock_singleflight(&action_key) else {
+                    continue;
+                };
+                let evict_act_res = (|| -> Result<()> {
+                    let action_blobs: Vec<(String, u64, i64)> = {
+                        let mut stmt = self.conn.prepare(
+                            "SELECT DISTINCT b.blob_hash, b.size_bytes, b.pin_level
+                             FROM action_outputs ao JOIN blobs b ON b.blob_hash = ao.blob_hash
+                             WHERE ao.action_key = ?1",
+                        )?;
+                        let mapped = stmt.query_map(params![action_key], |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, i64>(1)? as u64,
+                                r.get::<_, i64>(2)?,
+                            ))
+                        })?;
+                        mapped.collect::<std::result::Result<Vec<_>, _>>()?
+                    };
+                    self.conn.execute(
+                        "DELETE FROM actions WHERE action_key = ?1",
+                        params![action_key],
+                    )?;
+                    self.remove_singleflight_markers(&action_key);
+                    evicted_actions += 1;
+
+                    for (bh, sz, pin) in action_blobs {
+                        if keep_pinned && pin > 0 {
+                            continue;
+                        }
+                        let still_used: bool = if keep_pinned {
+                            self.blob_still_reachable(&bh, now, false)?
+                        } else {
+                            self.conn
+                                .query_row(
+                                    "SELECT 1 FROM action_outputs WHERE blob_hash = ?1
+                                     UNION ALL
+                                     SELECT 1 FROM worktree_file_blobs wfb
+                                     JOIN worktree_leases wl ON wl.worktree_id = wfb.worktree_id
+                                     WHERE wfb.blob_hash = ?1 AND (?2 - wl.last_seen) <= 7200
+                                     LIMIT 1",
+                                    params![bh, now],
+                                    |_| Ok(true),
+                                )
+                                .optional()?
+                                .unwrap_or(false)
+                        };
+                        if still_used {
+                            continue;
+                        }
+                        let p = self.blob_path(&bh);
+                        let nlink = fs::metadata(&p).map(|m| m.nlink()).unwrap_or(1);
+                        if p.exists() {
+                            #[cfg(unix)]
+                            if nlink <= 1 {
+                                unseal_cas_inode_at_path(&p);
+                            }
+                            let _ = fs::remove_file(&p);
+                        }
+                        self.conn.execute(
+                            "DELETE FROM worktree_installations WHERE blob_hash = ?1",
+                            params![bh],
+                        )?;
+                        self.conn
+                            .execute("DELETE FROM blobs WHERE blob_hash = ?1", params![bh])?;
+                        unlinked_blobs += 1;
+                        if nlink == 1 && pin <= 0 {
+                            freed_bytes += sz;
+                            current_reclaimable = current_reclaimable.saturating_sub(sz);
+                        }
+                    }
+                    Ok(())
+                })();
+                Self::unlock_singleflights(vec![guard]);
+                evict_act_res?;
 
                 // Find orphan blobs no longer referenced by any action_outputs or active worktree leases
                 let orphan_blobs: Vec<(String, u64, i64)> = {
@@ -2857,21 +4099,56 @@ impl TurboStore {
                     if keep_pinned && pin > 0 {
                         continue;
                     }
-                    let p = self.blob_path(&bh);
-                    let nlink = fs::metadata(&p).map(|m| m.nlink()).unwrap_or(1);
-                    if p.exists() {
-                        let _ = fs::remove_file(&p);
-                    }
-                    self.conn.execute(
-                        "DELETE FROM worktree_installations WHERE blob_hash = ?1",
-                        params![bh],
-                    )?;
-                    self.conn
-                        .execute("DELETE FROM blobs WHERE blob_hash = ?1", params![bh])?;
-                    unlinked_blobs += 1;
-                    if nlink == 1 && pin <= 0 {
-                        freed_bytes += sz;
-                        current_reclaimable = current_reclaimable.saturating_sub(sz);
+                    // The scan above is stale: lock whoever references it now and skip when a
+                    // publisher registered it (or raised its pin) after the scan.
+                    let Some((blob_guards, _)) = self.lock_blob_referencers(&bh)? else {
+                        continue;
+                    };
+                    let orphan_res = (|| -> Result<bool> {
+                        let reachable = if keep_pinned {
+                            self.blob_still_reachable(&bh, now, false)?
+                        } else {
+                            self.conn
+                                .query_row(
+                                    "SELECT 1 FROM action_outputs WHERE blob_hash = ?1
+                                     UNION ALL
+                                     SELECT 1 FROM worktree_file_blobs wfb
+                                     JOIN worktree_leases wl ON wl.worktree_id = wfb.worktree_id
+                                     WHERE wfb.blob_hash = ?1 AND (?2 - wl.last_seen) <= 7200
+                                     LIMIT 1",
+                                    params![bh, now],
+                                    |_| Ok(true),
+                                )
+                                .optional()?
+                                .unwrap_or(false)
+                        };
+                        if reachable {
+                            return Ok(false);
+                        }
+                        let p = self.blob_path(&bh);
+                        let nlink = fs::metadata(&p).map(|m| m.nlink()).unwrap_or(1);
+                        if p.exists() {
+                            #[cfg(unix)]
+                            if nlink <= 1 {
+                                unseal_cas_inode_at_path(&p);
+                            }
+                            let _ = fs::remove_file(&p);
+                        }
+                        self.conn.execute(
+                            "DELETE FROM worktree_installations WHERE blob_hash = ?1",
+                            params![bh],
+                        )?;
+                        self.conn
+                            .execute("DELETE FROM blobs WHERE blob_hash = ?1", params![bh])?;
+                        if nlink == 1 && pin <= 0 {
+                            freed_bytes += sz;
+                            current_reclaimable = current_reclaimable.saturating_sub(sz);
+                        }
+                        Ok(true)
+                    })();
+                    Self::unlock_singleflights(blob_guards);
+                    if orphan_res? {
+                        unlinked_blobs += 1;
                     }
                 }
             }
@@ -2905,22 +4182,44 @@ impl TurboStore {
             if meta.nlink() != 1 || meta.len() < 512 {
                 continue;
             }
+            // Hold every referencing action's lock across the swap, re-checking the set under the
+            // locks so a publisher that registered the blob after the scan keeps it uncompressed.
+            let Some((guards, _)) = self.lock_blob_referencers(&bh)? else {
+                continue;
+            };
             let Ok(raw_bytes) = fs::read(&p) else {
+                Self::unlock_singleflights(guards);
                 continue;
             };
             if raw_bytes.len() < 512 || raw_bytes.starts_with(b"TLZ1") {
+                Self::unlock_singleflights(guards);
+                continue;
+            }
+            if blake3::hash(&raw_bytes).to_hex().as_str() != bh {
+                Self::unlock_singleflights(guards);
                 continue;
             }
             let compressed = compress_tlz1(&raw_bytes);
-            if compressed.len() < (raw_bytes.len() * 9) / 10
-                && write_blob_atomic(&self.root, &p, &bh, &compressed, true).is_ok()
-            {
-                compressed_blobs += 1;
-                let saved = (raw_bytes.len() - compressed.len()) as u64;
-                freed_bytes += saved;
-                current_reclaimable = current_reclaimable.saturating_sub(saved);
+            if compressed.len() < (raw_bytes.len() * 9) / 10 {
+                #[cfg(unix)]
+                let old_key = (meta.dev(), meta.ino());
+                if write_blob_bytes_checked(&self.root, &p, &bh, &compressed, true).is_ok() {
+                    #[cfg(unix)]
+                    if fs::symlink_metadata(&p)
+                        .ok()
+                        .is_none_or(|nm| (nm.dev(), nm.ino()) != old_key)
+                    {
+                        unseal_cas_inode(old_key.0, old_key.1);
+                    }
+                    compressed_blobs += 1;
+                    let saved = (raw_bytes.len() - compressed.len()) as u64;
+                    freed_bytes += saved;
+                    current_reclaimable = current_reclaimable.saturating_sub(saved);
+                }
             }
+            Self::unlock_singleflights(guards);
         }
+        drop(gc_guard);
 
         let reaped_zygote_workers = if cfg!(test) || max_reclaimable_bytes > 0 {
             0
@@ -3155,133 +4454,9 @@ fn mark_superseded_worktree_blobs(
     Ok(newly_superseded)
 }
 
-/// Batch-query theorem shards in SQLite inside a single `BEGIN IMMEDIATE ... COMMIT` transaction,
-/// incrementing `hit_count` and updating `last_accessed` in one atomic commit.
-pub fn batch_get_theorem_shards(
-    conn: &Connection,
-    shard_keys: &[String],
-) -> Result<std::collections::HashMap<String, String>> {
-    batch_get_theorem_shards_in_domain(conn, shard_keys, "trusted")
-}
-
-pub fn batch_get_theorem_shards_in_domain(
-    conn: &Connection,
-    shard_keys: &[String],
-    trust_domain: &str,
-) -> Result<std::collections::HashMap<String, String>> {
-    if shard_keys.is_empty() {
-        return Ok(std::collections::HashMap::new());
-    }
-    let now = now_unix();
-    let mut hits = std::collections::HashMap::with_capacity(shard_keys.len());
-    if shard_keys.len() >= 128 {
-        let tx = conn.unchecked_transaction()?;
-        let mut db_map = std::collections::HashMap::with_capacity(shard_keys.len());
-        {
-            let mut scan_stmt = tx.prepare_cached(
-                "SELECT a.action_key, ao.blob_hash, b.last_accessed
-                 FROM actions a JOIN action_outputs ao ON ao.action_key = a.action_key
-                 JOIN blobs b ON b.blob_hash = ao.blob_hash
-                 WHERE a.kind = 'theorem_shard' AND a.status = 'completed' AND a.trust_domain = ?1
-                   AND (?1 != 'trusted' OR b.trust_domain = 'trusted')",
-            )?;
-            let mut rows = scan_stmt.query(params![trust_domain])?;
-            while let Some(row) = rows.next()? {
-                db_map.insert(
-                    row.get::<_, String>(0)?,
-                    (row.get::<_, String>(1)?, row.get::<_, i64>(2)?),
-                );
-            }
-        }
-        let mut touched_blobs = std::collections::HashSet::new();
-        let mut hit_keys_in_order = Vec::with_capacity(shard_keys.len());
-        for key in shard_keys {
-            if let Some((blob_hash, last_acc)) = db_map.get(key) {
-                hit_keys_in_order.push(key.as_str());
-                if now - *last_acc >= 60 {
-                    touched_blobs.insert(blob_hash.clone());
-                }
-                hits.insert(key.clone(), blob_hash.clone());
-            }
-        }
-        if !hit_keys_in_order.is_empty() {
-            if hits.len() == db_map.len() && hit_keys_in_order.len() == hits.len() {
-                tx.execute(
-                    "UPDATE actions SET hit_count = hit_count + 1 WHERE kind = 'theorem_shard' AND status = 'completed' AND trust_domain = ?1",
-                    params![trust_domain],
-                )?;
-            } else {
-                let mut upd_action = tx.prepare_cached(
-                    "UPDATE actions SET hit_count = hit_count + 1 WHERE action_key = ?1",
-                )?;
-                for k in hit_keys_in_order {
-                    upd_action.execute(params![k])?;
-                }
-            }
-            if !touched_blobs.is_empty() {
-                let mut upd_blob =
-                    tx.prepare_cached("UPDATE blobs SET last_accessed = ?1 WHERE blob_hash = ?2")?;
-                for bh in touched_blobs {
-                    upd_blob.execute(params![now, &bh])?;
-                }
-            }
-            tx.commit()?;
-        }
-    } else {
-        let mut hit_rows: Vec<(&str, String, i64)> = Vec::new();
-        {
-            let mut sel_stmt = conn.prepare_cached(
-                "SELECT ao.blob_hash, b.last_accessed FROM actions a
-                 JOIN action_outputs ao ON ao.action_key = a.action_key
-                 JOIN blobs b ON b.blob_hash = ao.blob_hash
-                 WHERE a.action_key = ?1 AND a.status = 'completed' AND a.trust_domain = ?2
-                   AND (?2 != 'trusted' OR b.trust_domain = 'trusted') LIMIT 1",
-            )?;
-            for key in shard_keys {
-                if let Some((blob_hash, last_acc)) = sel_stmt
-                    .query_row(params![key, trust_domain], |r| {
-                        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-                    })
-                    .optional()?
-                {
-                    hit_rows.push((key.as_str(), blob_hash.clone(), last_acc));
-                    hits.insert(key.clone(), blob_hash);
-                }
-            }
-        }
-        if !hit_rows.is_empty() {
-            let tx = conn.unchecked_transaction()?;
-            {
-                let mut upd_action = tx.prepare_cached(
-                    "UPDATE actions SET hit_count = hit_count + 1 WHERE action_key = ?1",
-                )?;
-                let mut upd_blob =
-                    tx.prepare_cached("UPDATE blobs SET last_accessed = ?1 WHERE blob_hash = ?2")?;
-                let mut touched_blobs = std::collections::HashSet::new();
-                for (key, blob_hash, last_acc) in hit_rows {
-                    upd_action.execute(params![key])?;
-                    if now - last_acc >= 60 && touched_blobs.insert(blob_hash.clone()) {
-                        upd_blob.execute(params![now, &blob_hash])?;
-                    }
-                }
-            }
-            tx.commit()?;
-        }
-    }
-    Ok(hits)
-}
-
 /// Batch-insert or update imported `.tlpack` blobs, actions, and action_outputs inside a single
 /// `BEGIN IMMEDIATE ... COMMIT` SQLite transaction using cached prepared statements.
-pub fn batch_import_pack_metadata(
-    conn: &Connection,
-    blobs: &[(String, String, i64, i64)],
-    actions: &[ActionRecord],
-) -> Result<(usize, usize)> {
-    batch_import_pack_metadata_with_domain(conn, blobs, actions, "trusted")
-}
-
-pub fn batch_import_pack_metadata_with_domain(
+pub(crate) fn batch_import_pack_metadata_with_domain(
     conn: &Connection,
     blobs: &[(String, String, i64, i64)],
     actions: &[ActionRecord],
@@ -3301,6 +4476,7 @@ pub fn batch_import_pack_metadata_with_domain(
              ON CONFLICT(blob_hash) DO UPDATE SET
                 last_accessed = excluded.last_accessed,
                 size_bytes = CASE WHEN excluded.size_bytes > 0 THEN excluded.size_bytes ELSE blobs.size_bytes END,
+                pin_level = MAX(blobs.pin_level, excluded.pin_level),
                 trust_domain = CASE WHEN blobs.trust_domain = 'trusted' THEN 'trusted' ELSE excluded.trust_domain END",
         )?;
         for (blob_hash, kind, size_bytes, inode) in blobs {
@@ -3512,40 +4688,1021 @@ pub fn batch_put_file_stats(
     Ok(())
 }
 
+/// Ordered crash-durability barrier. Production fsyncs; tests install a recorder.
+pub(crate) fn durability_barrier(f: &File) -> std::io::Result<()> {
+    if let Some(hook) = DURABILITY_HOOK.with(|h| h.borrow().clone()) {
+        return hook(f);
+    }
+    f.sync_all()
+}
+
+type DurabilityHook = std::sync::Arc<dyn Fn(&File) -> std::io::Result<()> + Send + Sync>;
+
+thread_local! {
+    static DURABILITY_HOOK: std::cell::RefCell<Option<DurabilityHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Record every barrier this thread takes (`file:<name>` or `dir:<name>`) instead of fsyncing.
+#[cfg(test)]
+pub(crate) fn set_durability_recorder(log: std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    set_durability_recorder_with_fault(log, None);
+}
+
+#[cfg(test)]
+pub(crate) fn set_durability_recorder_with_fault(
+    log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    fail_label_prefix: Option<&'static str>,
+) {
+    use std::os::unix::io::AsRawFd;
+    DURABILITY_HOOK.with(|h| {
+        *h.borrow_mut() = Some(std::sync::Arc::new(move |f| {
+            let is_dir = f.metadata().is_ok_and(|m| m.is_dir());
+            let name = fs::read_link(format!("/proc/self/fd/{}", f.as_raw_fd()))
+                .ok()
+                .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| if is_dir { "dir" } else { "file" }.to_string());
+            let prefix = if is_dir { "dir:" } else { "file:" };
+            let label = format!("{}{}", prefix, name);
+            if fail_label_prefix.is_some_and(|fp| label.starts_with(fp)) {
+                log.lock().unwrap().push(format!("err:{label}"));
+                return Err(std::io::Error::other(format!(
+                    "injected durability barrier failure on {label}"
+                )));
+            }
+            log.lock().unwrap().push(label);
+            Ok(())
+        }));
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn clear_durability_recorder() {
+    DURABILITY_HOOK.with(|h| *h.borrow_mut() = None);
+}
+
+fn next_staging_nanos() -> u128 {
+    #[cfg(test)]
+    if let Some(n) = STAGING_NANOS_HOOK.with(|h| *h.borrow()) {
+        return n;
+    }
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+thread_local! {
+    static STAGING_NANOS_HOOK: std::cell::RefCell<Option<u128>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
+    let f = File::open(dir)?;
+    durability_barrier(&f)?;
+    Ok(())
+}
+
+/// Allocate a unique staging file `<dir>/<stem>.<pid>.<seq>.<nanos>.tmp` with `O_CREAT | O_EXCL`
+/// (`create_new(true)`), retrying up to 8 times if a crashed predecessor with a recycled PID left
+/// a colliding filename on disk.
+fn open_unique_staging_file(dir: &Path, stem: &str, mode: u32) -> std::io::Result<(File, PathBuf)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    for _attempt in 0..8u64 {
+        let nanos = next_staging_nanos();
+        #[cfg(test)]
+        let seq = if STAGING_NANOS_HOOK.with(|h| h.borrow().is_some()) {
+            _attempt
+        } else {
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        };
+        #[cfg(not(test))]
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("{stem}.{}.{seq}.{nanos}.tmp", std::process::id()));
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&path)
+        {
+            Ok(file) => return Ok((file, path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique staging file",
+    ))
+}
+
+/// Stage into a unique temporary file `<stage_dir>/<stem>.<pid>.<seq>.<nanos>.tmp`, populate it via
+/// `populate`, optionally stamp immutable CAS ownership + `chmod 0o444`, `fsync` its bytes, run
+/// `publish` to install `dest` (`rename` or `link` + race resolution), `fsync` `dest`'s parent plus
+/// `created` ancestors, and unlink any leftover staging link on exit.
+#[allow(clippy::too_many_arguments)]
+fn stage_and_publish_durable_ext<T, P, Pub>(
+    stage_dir: &Path,
+    stem: &str,
+    mode: u32,
+    immutable_cas_hash: Option<&str>,
+    dest: &Path,
+    created: &[PathBuf],
+    populate: P,
+    publish: Pub,
+) -> std::io::Result<T>
+where
+    P: FnOnce(&mut File) -> std::io::Result<()>,
+    Pub: FnOnce(&File, &Path, &Path) -> std::io::Result<T>,
+{
+    let initial_mode = if immutable_cas_hash.is_some() {
+        0o600
+    } else {
+        mode
+    };
+    let (mut f, staging) = open_unique_staging_file(stage_dir, stem, initial_mode)?;
+    #[cfg(unix)]
+    let mut sealed_key: Option<ExclusivelyCreatedCasKey> = None;
+    #[cfg(unix)]
+    let mut published_staged_inode = false;
+    let res = (|| -> std::io::Result<T> {
+        populate(&mut f)?;
+        #[cfg(unix)]
+        if let Some(hash) = immutable_cas_hash {
+            sealed_key = Some(seal_exclusively_created_cas_inode(
+                &f, &staging, mode, hash,
+            )?);
+        }
+        durability_barrier(&f)?;
+        let out = publish(&f, &staging, dest)?;
+        #[cfg(unix)]
+        if let Some(sk) = sealed_key {
+            published_staged_inode =
+                fs::symlink_metadata(dest).is_ok_and(|dm| (dm.dev(), dm.ino()) == sk);
+        }
+        sync_published(dest, created)?;
+        Ok(out)
+    })();
+    drop(f);
+    let _ = fs::remove_file(&staging);
+    #[cfg(unix)]
+    if let Some((dev, ino)) = sealed_key {
+        if res.is_err() || !published_staged_inode {
+            unseal_cas_inode(dev, ino);
+        }
+    }
+    res
+}
+
+fn stage_and_publish_durable<T, P, Pub>(
+    stage_dir: &Path,
+    stem: &str,
+    mode: u32,
+    dest: &Path,
+    created: &[PathBuf],
+    populate: P,
+    publish: Pub,
+) -> std::io::Result<T>
+where
+    P: FnOnce(&mut File) -> std::io::Result<()>,
+    Pub: FnOnce(&File, &Path, &Path) -> std::io::Result<T>,
+{
+    stage_and_publish_durable_ext(
+        stage_dir, stem, mode, None, dest, created, populate, publish,
+    )
+}
+
+/// Stage into a private sibling file next to `dest`, populate it via `populate`, `fsync` its bytes,
+/// atomically `rename` it onto `dest`, and `fsync` `dest`'s parent plus `created` ancestors.
+fn stage_and_rename_durable<F>(
+    dest: &Path,
+    default_name: &str,
+    mode: u32,
+    created: &[PathBuf],
+    populate: F,
+) -> std::io::Result<()>
+where
+    F: FnOnce(&mut File) -> std::io::Result<()>,
+{
+    let parent = dest.parent().unwrap_or(dest);
+    let stem = format!(
+        ".{}",
+        dest.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(default_name)
+    );
+    stage_and_publish_durable(
+        parent,
+        &stem,
+        mode,
+        dest,
+        created,
+        populate,
+        |_f, staging, dst| fs::rename(staging, dst),
+    )
+}
+
+#[cfg(test)]
+type BeforeBlobInstallHook = std::sync::Arc<dyn Fn(&Path, &Path) + Send + Sync>;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_BLOB_INSTALL_HOOK: std::cell::RefCell<Option<BeforeBlobInstallHook>> =
+        const { std::cell::RefCell::new(None) };
+    static AFTER_BLOB_VERIFY_BEFORE_RENAME_HOOK: std::cell::RefCell<Option<BeforeBlobInstallHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_before_blob_install_hook(hook: BeforeBlobInstallHook) {
+    BEFORE_BLOB_INSTALL_HOOK.with(|h| *h.borrow_mut() = Some(hook));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_before_blob_install_hook() {
+    BEFORE_BLOB_INSTALL_HOOK.with(|h| *h.borrow_mut() = None);
+}
+
+#[cfg(test)]
+pub(crate) fn set_after_blob_verify_before_rename_hook(hook: BeforeBlobInstallHook) {
+    AFTER_BLOB_VERIFY_BEFORE_RENAME_HOOK.with(|h| *h.borrow_mut() = Some(hook));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_after_blob_verify_before_rename_hook() {
+    AFTER_BLOB_VERIFY_BEFORE_RENAME_HOOK.with(|h| *h.borrow_mut() = None);
+}
+
+/// Open `path` without following symlinks (`O_NOFOLLOW`) and verify the opened descriptor is a
+/// regular file (`S_ISREG` / `meta.is_file()`).
+pub(crate) fn open_regular_nofollow(path: &Path) -> std::io::Result<(File, fs::Metadata)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let sym = fs::symlink_metadata(path)?;
+    if sym.file_type().is_symlink() || !sym.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    let f = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} opened descriptor is not a regular file", path.display()),
+        ));
+    }
+    Ok((f, meta))
+}
+
+/// Read all bytes from `path` only if it resolves directly (`O_NOFOLLOW`) to a regular file.
+pub(crate) fn read_regular_nofollow(path: &Path) -> Option<(Vec<u8>, fs::Metadata)> {
+    let (mut f, meta) = open_regular_nofollow(path).ok()?;
+    let mut buf = Vec::with_capacity(meta.len().min(64 * 1024 * 1024) as usize);
+    f.read_to_end(&mut buf).ok()?;
+    Some((buf, meta))
+}
+
+/// Create a hardlink at `dst` to `src` without following symlinks (`linkat(..., 0)`), rejecting
+/// non-regular source inodes.
+pub(crate) fn link_regular_nofollow(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let (_, meta) = open_regular_nofollow(src)?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to hardlink non-regular source",
+        ));
+    }
+    let src_c = CString::new(src.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL byte in source path")
+    })?;
+    let dst_c = CString::new(dst.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL byte in dest path")
+    })?;
+    if unsafe {
+        libc::linkat(
+            libc::AT_FDCWD,
+            src_c.as_ptr(),
+            libc::AT_FDCWD,
+            dst_c.as_ptr(),
+            0,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+type ExclusivelyCreatedCasKey = (u64, u64);
+
+#[cfg(unix)]
+struct ExclusivelyCreatedCasEntry {
+    pinned_ro_fd: File,
+    mtime: (i64, i64),
+    size: u64,
+    expected_hash: String,
+    order_seq: u64,
+}
+
+#[cfg(unix)]
+struct ExclusivelyCreatedCasRegistry {
+    entries: std::collections::HashMap<ExclusivelyCreatedCasKey, ExclusivelyCreatedCasEntry>,
+    order: std::collections::VecDeque<(ExclusivelyCreatedCasKey, u64)>,
+    next_seq: u64,
+}
+
+#[cfg(unix)]
+fn exclusively_created_cas_registry_max_entries() -> usize {
+    use std::sync::OnceLock;
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| unsafe {
+        let mut rlim: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 && rlim.rlim_cur > 0 {
+            let cur = usize::try_from(rlim.rlim_cur).unwrap_or(4096);
+            (cur / 4).clamp(64, 4096)
+        } else {
+            512
+        }
+    })
+}
+
+#[cfg(unix)]
+fn exclusively_created_cas_registry() -> &'static std::sync::Mutex<ExclusivelyCreatedCasRegistry> {
+    static REGISTRY: std::sync::OnceLock<std::sync::Mutex<ExclusivelyCreatedCasRegistry>> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        std::sync::Mutex::new(ExclusivelyCreatedCasRegistry {
+            entries: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            next_seq: 1,
+        })
+    })
+}
+
+#[cfg(unix)]
+fn open_pinned_readonly_cas_fd(f: &File, staging_path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let target = f.metadata()?;
+    #[cfg(target_os = "linux")]
+    if let Ok(ro) = OpenOptions::new()
+        .read(true)
+        .open(format!("/proc/self/fd/{}", f.as_raw_fd()))
+    {
+        if let Ok(m) = ro.metadata() {
+            if m.dev() == target.dev()
+                && m.ino() == target.ino()
+                && unsafe { libc::fcntl(ro.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE
+                    == libc::O_RDONLY
+            {
+                return Ok(ro);
+            }
+        }
+    }
+    let ro = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(staging_path)?;
+    let m = ro.metadata()?;
+    if m.dev() != target.dev()
+        || m.ino() != target.ino()
+        || unsafe { libc::fcntl(ro.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE != libc::O_RDONLY
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "pinned read-only descriptor did not match sealed staging inode",
+        ));
+    }
+    Ok(ro)
+}
+
+#[cfg(unix)]
+fn seal_exclusively_created_cas_inode(
+    f: &File,
+    staging_path: &Path,
+    mode: u32,
+    expected_hash: &str,
+) -> std::io::Result<ExclusivelyCreatedCasKey> {
+    let mut perms = f.metadata()?.permissions();
+    perms.set_mode(mode);
+    f.set_permissions(perms)?;
+    let pinned_ro_fd = open_pinned_readonly_cas_fd(f, staging_path)?;
+    let meta = pinned_ro_fd.metadata()?;
+    if !meta.is_file() || (meta.permissions().mode() & 0o222) != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "sealed CAS staging inode remained writable or non-regular",
+        ));
+    }
+    let key = (meta.dev(), meta.ino());
+    let cap = exclusively_created_cas_registry_max_entries();
+    let mut evicted_fds: Vec<File> = Vec::new();
+    {
+        let mut reg = exclusively_created_cas_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(prev) = reg.entries.remove(&key) {
+            evicted_fds.push(prev.pinned_ro_fd);
+        }
+        while reg.entries.len() >= cap {
+            let Some((old_key, old_seq)) = reg.order.pop_front() else {
+                break;
+            };
+            if reg
+                .entries
+                .get(&old_key)
+                .is_some_and(|e| e.order_seq == old_seq)
+            {
+                if let Some(evicted) = reg.entries.remove(&old_key) {
+                    evicted_fds.push(evicted.pinned_ro_fd);
+                }
+            }
+        }
+        let seq = reg.next_seq;
+        reg.next_seq = reg.next_seq.wrapping_add(1);
+        reg.order.push_back((key, seq));
+        reg.entries.insert(
+            key,
+            ExclusivelyCreatedCasEntry {
+                pinned_ro_fd,
+                mtime: (meta.mtime(), meta.mtime_nsec()),
+                size: meta.len(),
+                expected_hash: expected_hash.to_string(),
+                order_seq: seq,
+            },
+        );
+    }
+    drop(evicted_fds);
+    Ok(key)
+}
+
+#[cfg(unix)]
+pub(crate) fn unseal_cas_inode(dev: u64, ino: u64) {
+    let removed = {
+        let mut reg = exclusively_created_cas_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reg.entries.remove(&(dev, ino))
+    };
+    drop(removed);
+}
+
+#[cfg(unix)]
+pub(crate) fn unseal_cas_inode_at_path(path: &Path) {
+    if let Ok(m) = fs::symlink_metadata(path) {
+        if m.is_file() {
+            unseal_cas_inode(m.dev(), m.ino());
+        }
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn is_exclusively_created_immutable_cas_inode(
+    meta: &fs::Metadata,
+    expected_hash: &str,
+) -> bool {
+    if !meta.is_file()
+        || (meta.permissions().mode() & 0o222) != 0
+        || expected_hash.is_empty()
+        || expected_hash.len() > 128
+    {
+        return false;
+    }
+    let key = (meta.dev(), meta.ino());
+    let mut stale_fd: Option<File> = None;
+    let matched = {
+        let mut reg = exclusively_created_cas_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = reg.entries.get(&key) {
+            match entry.pinned_ro_fd.metadata() {
+                Ok(pin_meta)
+                    if pin_meta.is_file()
+                        && (pin_meta.permissions().mode() & 0o222) == 0
+                        && (pin_meta.dev(), pin_meta.ino()) == key
+                        && (pin_meta.mtime(), pin_meta.mtime_nsec()) == entry.mtime
+                        && pin_meta.len() == entry.size
+                        && (meta.mtime(), meta.mtime_nsec()) == entry.mtime
+                        && meta.len() == entry.size =>
+                {
+                    entry.expected_hash == expected_hash
+                }
+                _ => {
+                    stale_fd = reg.entries.remove(&key).map(|e| e.pinned_ro_fd);
+                    false
+                }
+            }
+        } else {
+            false
+        }
+    };
+    drop(stale_fd);
+    matched
+}
+fn reserve_unique_staging_path(dir: &Path, stem: &str) -> std::io::Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LINK_SEQ: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..16u64 {
+        let nanos = next_staging_nanos();
+        let seq = LINK_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("{stem}.{}.{seq}.{nanos}.tmp", std::process::id()));
+        if fs::symlink_metadata(&path).is_err() {
+            return Ok(path);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate unique link staging path",
+    ))
+}
+
+#[cfg(test)]
+fn clone_or_copy_from_open_file(mut src_file: &File, dst_file: &mut File) -> std::io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        const FICLONE: libc::c_ulong = 0x40049409;
+        if unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) } == 0 {
+            return Ok(true);
+        }
+    }
+    use std::io::Seek;
+    src_file.seek(std::io::SeekFrom::Start(0))?;
+    std::io::copy(&mut src_file, dst_file)?;
+    Ok(false)
+}
+
+/// Publish `src` at `dest` so the bytes are durable before the name exists: fsync `src` (`O_NOFOLLOW`,
+/// regular file) and hardlink via `linkat(..., 0)` when the two share a device, or stage into a
+/// private sibling file (reflink or copy from the open `src` descriptor, mode `0o444`, fsynced) and
+/// atomically rename into place otherwise.
+#[cfg(test)]
+pub(crate) fn publish_durable_link(
+    src: &Path,
+    dest: &Path,
+    created: &[PathBuf],
+) -> std::io::Result<()> {
+    let (src_file, src_meta) = open_regular_nofollow(src)?;
+    durability_barrier(&src_file)?;
+    if link_regular_nofollow(src, dest).is_ok() {
+        if let Ok((_, dst_meta)) = open_regular_nofollow(dest) {
+            if dst_meta.dev() == src_meta.dev() && dst_meta.ino() == src_meta.ino() {
+                return sync_published(dest, created);
+            }
+        }
+        let _ = fs::remove_file(dest);
+    }
+    stage_and_rename_durable(dest, "blob", 0o444, created, |dst_file| {
+        let _ = clone_or_copy_from_open_file(&src_file, dst_file)?;
+        Ok(())
+    })
+}
+
+/// Publish a CAS blob from `src` to `dest`, binding BLAKE3 digest + byte-length verification to an
+/// isolated store-owned inode before atomic publication at `dest`. Only a live inode proven
+/// in-process to have been created exclusively by `turbo-lean` via `O_CREAT | O_EXCL` with a
+/// private `0o600` initial mode (eliminating external writable opens for the same-UID adversary
+/// until sealed `0o444` and pinned by a retained `O_RDONLY` descriptor in
+/// `is_exclusively_created_immutable_cas_inode`; privileged `CAP_DAC_OVERRIDE` / same-UID `chmod`
+/// or `/proc/<pid>/fd` tampering is outside this unprivileged process threat model) may use the
+/// same-device hardlink fast path; externally supplied, unsealed, or prior-process inodes are
+/// snapshotted into a fresh `O_CREAT | O_EXCL` staging inode (via verified `FICLONE` or verified
+/// byte copy), `chmod 0o444`ed, fsynced, and atomically renamed onto `dest`. Returns the published
+/// destination inode.
+pub(crate) fn publish_verified_durable_blob(
+    src: &Path,
+    dest: &Path,
+    expected_hash: &str,
+    expected_len: u64,
+    created: &[PathBuf],
+) -> std::io::Result<i64> {
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_BLOB_INSTALL_HOOK.with(|h| h.borrow().clone()) {
+        hook(src, dest);
+    }
+    let parent = dest.parent().unwrap_or(dest);
+    let stem = format!(
+        ".{}",
+        dest.file_name().and_then(|s| s.to_str()).unwrap_or("blob")
+    );
+    // 1. Same-device fast path ONLY when the staged hardlink resolves to an inode exclusively
+    //    created in this process via `O_CREAT | O_EXCL` with no external writable fd ever exposed.
+    //    Filesystem metadata (`0o444`, user xattrs) alone never authorizes hardlinking.
+    #[cfg(unix)]
+    if let Ok(staged_link) = reserve_unique_staging_path(parent, &stem) {
+        if link_regular_nofollow(src, &staged_link).is_ok() {
+            let link_ok = (|| -> std::io::Result<i64> {
+                let (mut f, meta) = open_regular_nofollow(&staged_link)?;
+                if !is_exclusively_created_immutable_cas_inode(&meta, expected_hash)
+                    || meta.len() != expected_len
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "staged hardlink is not an exclusively created immutable CAS inode",
+                    ));
+                }
+                let mut buf = Vec::with_capacity(expected_len.min(64 * 1024 * 1024) as usize);
+                f.read_to_end(&mut buf)?;
+                if buf.len() as u64 != expected_len
+                    || blake3::hash(&buf).to_hex().as_str() != expected_hash
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "staged hardlink digest mismatch",
+                    ));
+                }
+                durability_barrier(&f)?;
+                #[cfg(test)]
+                if let Some(hook) =
+                    AFTER_BLOB_VERIFY_BEFORE_RENAME_HOOK.with(|h| h.borrow().clone())
+                {
+                    hook(src, dest);
+                }
+                let ino = meta.ino() as i64;
+                drop(f);
+                fs::rename(&staged_link, dest)?;
+                sync_published(dest, created)?;
+                Ok(ino)
+            })();
+            let _ = fs::remove_file(&staged_link);
+            if let Ok(ino) = link_ok {
+                return Ok(ino);
+            }
+        }
+    }
+
+    // 2. Snapshot into a fresh `O_CREAT | O_EXCL` store-owned staging inode: try `FICLONE` onto the
+    //    private staging inode and verify the independent cloned snapshot, or read + verify `src`
+    //    (`O_NOFOLLOW`, regular file, including `TLZ1` decompression) and write verified bytes.
+    let src_open = open_regular_nofollow(src).ok();
+    let mut raw_fallback: Option<Vec<u8>> = None;
+    let get_verified_raw = |cache: &mut Option<Vec<u8>>| -> std::io::Result<Vec<u8>> {
+        if let Some(b) = cache.take() {
+            return Ok(b);
+        }
+        read_cas_blob_verified(src, expected_hash, Some(expected_len)).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("CAS source {} failed digest verification", src.display()),
+            )
+        })
+    };
+    if src_open.is_none() {
+        raw_fallback = Some(get_verified_raw(&mut raw_fallback)?);
+    }
+    stage_and_publish_durable_ext(
+        parent,
+        &stem,
+        0o444,
+        Some(expected_hash),
+        dest,
+        created,
+        |dst_file| {
+            #[cfg(target_os = "linux")]
+            if let Some((ref src_file, _)) = src_open {
+                use std::io::{Read, Seek};
+                use std::os::unix::io::AsRawFd;
+                const FICLONE: libc::c_ulong = 0x40049409;
+                if unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) } == 0
+                {
+                    // Read from the private `O_CREAT | O_EXCL` `dst_file` descriptor to verify the
+                    // independent CoW snapshot itself (immune to subsequent source fd writes).
+                    if dst_file.seek(std::io::SeekFrom::Start(0)).is_ok() {
+                        let mut cloned =
+                            Vec::with_capacity(expected_len.min(64 * 1024 * 1024) as usize);
+                        if dst_file.read_to_end(&mut cloned).is_ok()
+                            && cloned.len() as u64 == expected_len
+                            && blake3::hash(&cloned).to_hex().as_str() == expected_hash
+                        {
+                            return Ok(());
+                        }
+                    }
+                    dst_file.set_len(0)?;
+                    dst_file.seek(std::io::SeekFrom::Start(0))?;
+                }
+            }
+            let raw = if let Some((mut src_file, src_meta)) = src_open {
+                let mut disk_bytes =
+                    Vec::with_capacity(src_meta.len().min(64 * 1024 * 1024) as usize);
+                src_file.read_to_end(&mut disk_bytes)?;
+                if disk_bytes.len() as u64 == expected_len
+                    && blake3::hash(&disk_bytes).to_hex().as_str() == expected_hash
+                {
+                    disk_bytes
+                } else if disk_bytes.len() >= 12 && &disk_bytes[..4] == b"TLZ1" {
+                    let hdr_len = u64::from_le_bytes(disk_bytes[4..12].try_into().unwrap());
+                    let decomp = (hdr_len == expected_len)
+                        .then(|| decompress_tlz1(&disk_bytes))
+                        .flatten()
+                        .filter(|r| {
+                            r.len() as u64 == expected_len
+                                && blake3::hash(r).to_hex().as_str() == expected_hash
+                        });
+                    match decomp {
+                        Some(r) => r,
+                        None => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("CAS source {} failed digest verification", src.display()),
+                            ))
+                        }
+                    }
+                } else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("CAS source {} failed digest verification", src.display()),
+                    ));
+                }
+            } else {
+                get_verified_raw(&mut raw_fallback)?
+            };
+            dst_file.write_all(&raw)
+        },
+        |f, staging, dst| {
+            #[cfg(test)]
+            if let Some(hook) = AFTER_BLOB_VERIFY_BEFORE_RENAME_HOOK.with(|h| h.borrow().clone()) {
+                hook(src, dst);
+            }
+            let ino = f.metadata()?.ino() as i64;
+            fs::rename(staging, dst)?;
+            Ok(ino)
+        },
+    )
+}
+
+/// Write `bytes` to `dest` through a unique staging file next to it: the file is fsynced before
+/// the name exists, and `created` (directories this call created) plus the destination directory
+/// are fsynced after.
+pub(crate) fn write_bytes_durable(
+    dest: &Path,
+    bytes: &[u8],
+    created: &[PathBuf],
+) -> std::io::Result<()> {
+    stage_and_rename_durable(dest, "file", 0o644, created, |f| f.write_all(bytes))
+}
+
+fn sync_published(dest: &Path, created: &[PathBuf]) -> std::io::Result<()> {
+    if let Some(parent) = dest.parent() {
+        let f = File::open(parent)?;
+        durability_barrier(&f)?;
+    }
+    for dir in created {
+        let f = File::open(dir)?;
+        durability_barrier(&f)?;
+    }
+    Ok(())
+}
+
+/// Ensure `dir` exists under `stop_at`, creating missing components top-down and returning the
+/// ancestor directories from `dir.parent()` up to `stop_at` (deepest first) so every successful
+/// publication syncs its ancestor chain even when a concurrent peer created `dir` first without
+/// yet syncing its parent.
+pub(crate) fn ensure_dir_tracking(dir: &Path, stop_at: &Path) -> Result<Vec<PathBuf>> {
+    fn normalize_lexical(path: &Path) -> PathBuf {
+        use std::path::Component;
+        let mut out = PathBuf::new();
+        for comp in path.components() {
+            match comp {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if !out.pop() {
+                        out.push(comp.as_os_str());
+                    }
+                }
+                _ => out.push(comp.as_os_str()),
+            }
+        }
+        out
+    }
+
+    let mut to_create = Vec::new();
+    let mut cur = Some(dir);
+    while let Some(p) = cur {
+        if p == stop_at || p.as_os_str().is_empty() || p.exists() {
+            break;
+        }
+        to_create.push(p.to_path_buf());
+        cur = p.parent();
+    }
+    for p in to_create.iter().rev() {
+        match fs::create_dir(p) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    let norm_dir = normalize_lexical(dir);
+    let norm_stop = normalize_lexical(stop_at);
+    #[cfg(unix)]
+    let stop_ino = {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(stop_at).ok().map(|m| (m.dev(), m.ino()))
+    };
+    let is_stop = |p: &Path| -> bool {
+        if p == stop_at || normalize_lexical(p) == norm_stop {
+            return true;
+        }
+        #[cfg(unix)]
+        if let Some(target_key) = stop_ino {
+            use std::os::unix::fs::MetadataExt;
+            if fs::metadata(p).is_ok_and(|m| (m.dev(), m.ino()) == target_key) {
+                return true;
+            }
+        }
+        false
+    };
+    if is_stop(dir) || (!norm_stop.as_os_str().is_empty() && !norm_dir.starts_with(&norm_stop)) {
+        return Ok(Vec::new());
+    }
+
+    let mut sync_parents = Vec::new();
+    let mut anc = dir.parent();
+    while let Some(p) = anc {
+        if p.as_os_str().is_empty() {
+            break;
+        }
+        sync_parents.push(p.to_path_buf());
+        if is_stop(p) {
+            break;
+        }
+        anc = p.parent();
+    }
+    Ok(sync_parents)
+}
+
 /// On-disk state of a CAS blob file relative to its expected raw size.
 pub(crate) enum BlobDisk {
     Missing,
-    Intact(fs::Metadata),
+    Intact,
     /// Present but not the expected size (a partial write left by an older writer or a crash).
     Torn,
 }
 
-/// Classify the CAS file at `path` by size alone (no hashing): a raw blob has `len == expected`,
-/// a cold `TLZ1` blob carries the raw length in its 12-byte header.
-pub(crate) fn probe_blob_file(path: &Path, expected_len: u64) -> BlobDisk {
-    let Ok(meta) = fs::metadata(path) else {
-        return BlobDisk::Missing;
-    };
-    if meta.len() == expected_len {
-        return BlobDisk::Intact(meta);
+/// Read a CAS blob (raw or `TLZ1`-compressed) from a regular non-symlink file and verify its
+/// uncompressed length (when supplied) and BLAKE3 digest against `expected_hash`.
+pub(crate) fn read_cas_blob_verified(
+    path: &Path,
+    expected_hash: &str,
+    expected_len: Option<u64>,
+) -> Option<Vec<u8>> {
+    let (disk_bytes, _) = read_regular_nofollow(path)?;
+    if let Some(exp) = expected_len {
+        if disk_bytes.len() as u64 == exp
+            && blake3::hash(&disk_bytes).to_hex().as_str() == expected_hash
+        {
+            return Some(disk_bytes);
+        }
+    } else if blake3::hash(&disk_bytes).to_hex().as_str() == expected_hash {
+        return Some(disk_bytes);
     }
-    let mut hdr = [0u8; 12];
-    let tlz1_len = File::open(path)
-        .and_then(|mut f| f.read_exact(&mut hdr))
-        .ok()
-        .filter(|_| &hdr[..4] == b"TLZ1")
-        .map(|_| u64::from_le_bytes(hdr[4..].try_into().unwrap()));
-    if tlz1_len == Some(expected_len) {
-        BlobDisk::Intact(meta)
-    } else {
-        BlobDisk::Torn
+    if disk_bytes.len() >= 12 && &disk_bytes[..4] == b"TLZ1" {
+        let hdr_len = u64::from_le_bytes(disk_bytes[4..12].try_into().ok()?);
+        if expected_len.is_some_and(|exp| hdr_len != exp) {
+            return None;
+        }
+        let raw = decompress_tlz1(&disk_bytes)?;
+        if raw.len() as u64 == hdr_len && blake3::hash(&raw).to_hex().as_str() == expected_hash {
+            return Some(raw);
+        }
     }
+    None
 }
 
-/// Atomically publish `bytes` as the CAS blob `dest` through a unique staging file under
-/// `<store_root>/staging`, so a partially written final blob is never observable. A missing
-/// `dest` is created with `link` (never clobbering a concurrent valid writer); `replace` swaps
-/// a torn file out with `rename`. Returns the inode of the published file.
+/// Classify the CAS file at `path` (`O_NOFOLLOW`, regular file only) by verifying both its
+/// uncompressed length (`expected_len`) and its BLAKE3 digest (`expected_hash`), transparently
+/// decompressing cold `TLZ1` blobs.
+pub(crate) fn probe_blob_digest(path: &Path, expected_hash: &str, expected_len: u64) -> BlobDisk {
+    let (mut f, meta) = match open_regular_nofollow(path) {
+        Ok(pair) => pair,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return BlobDisk::Missing,
+        Err(_) => return BlobDisk::Torn,
+    };
+    #[cfg(unix)]
+    if (meta.permissions().mode() & 0o222) != 0 {
+        return BlobDisk::Torn;
+    }
+    let mut buf = Vec::with_capacity(meta.len().min(64 * 1024 * 1024) as usize);
+    if f.read_to_end(&mut buf).is_err() {
+        return BlobDisk::Torn;
+    }
+    if buf.len() as u64 == expected_len && blake3::hash(&buf).to_hex().as_str() == expected_hash {
+        return BlobDisk::Intact;
+    }
+    if buf.len() >= 12 && &buf[..4] == b"TLZ1" {
+        let hdr_len = u64::from_le_bytes(buf[4..12].try_into().unwrap());
+        if hdr_len == expected_len
+            && decompress_tlz1(&buf)
+                .is_some_and(|raw| blake3::hash(&raw).to_hex().as_str() == expected_hash)
+        {
+            return BlobDisk::Intact;
+        }
+    }
+    BlobDisk::Torn
+}
+
+fn verify_blob_payload_matches_hash(hash: &str, bytes: &[u8]) -> Result<u64> {
+    if blake3::hash(bytes).to_hex().as_str() == hash {
+        return Ok(bytes.len() as u64);
+    }
+    if bytes.len() >= 12 && &bytes[..4] == b"TLZ1" {
+        let raw_len = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
+        if let Some(raw) = decompress_tlz1(bytes) {
+            if raw.len() as u64 == raw_len && blake3::hash(&raw).to_hex().as_str() == hash {
+                return Ok(raw_len);
+            }
+        }
+    }
+    anyhow::bail!(
+        "Refusing to publish CAS blob {}: payload digest does not match supplied hash",
+        hash
+    )
+}
+
+pub(crate) fn write_blob_bytes_checked(
+    store_root: &Path,
+    dest: &Path,
+    hash: &str,
+    bytes: &[u8],
+    replace: bool,
+) -> Result<i64> {
+    let expected_raw_len = verify_blob_payload_matches_hash(hash, bytes)?;
+    let staging_dir = store_root.join("staging");
+    let staging_dirs = ensure_dir_tracking(&staging_dir, store_root)?;
+    let mut created_dirs = match dest.parent() {
+        Some(parent) => ensure_dir_tracking(parent, store_root)?,
+        None => Vec::new(),
+    };
+    created_dirs.extend(staging_dirs);
+    let ino = stage_and_publish_durable_ext(
+        &staging_dir,
+        hash,
+        0o444,
+        Some(hash),
+        dest,
+        &created_dirs,
+        |f| f.write_all(bytes),
+        |f, staging_path, dst| {
+            let staged_ino = f.metadata()?.ino() as i64;
+            if replace {
+                fs::rename(staging_path, dst)?;
+                return Ok(staged_ino);
+            }
+            match link_regular_nofollow(staging_path, dst) {
+                Ok(()) => Ok(staged_ino),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Lost a race (or a pre-fix writer left a partial/corrupt/unstamped file): keep
+                    // only a store-owned immutable `0o444` digest-verified blob (and still sync its
+                    // bytes before `sync_published` syncs its directory chain), otherwise replace it
+                    // with our freshly staged private inode.
+                    if let Ok((mut peer_f, m)) = open_regular_nofollow(dst) {
+                        let peer_owned = {
+                            #[cfg(unix)]
+                            {
+                                is_exclusively_created_immutable_cas_inode(&m, hash)
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                true
+                            }
+                        };
+                        if peer_owned {
+                            let mut peer_buf =
+                                Vec::with_capacity(m.len().min(64 * 1024 * 1024) as usize);
+                            if peer_f.read_to_end(&mut peer_buf).is_ok()
+                                && verify_blob_payload_matches_hash(hash, &peer_buf)
+                                    .is_ok_and(|l| l == expected_raw_len)
+                            {
+                                durability_barrier(&peer_f)?;
+                                return Ok(m.ino() as i64);
+                            }
+                        }
+                    }
+                    fs::rename(staging_path, dst)?;
+                    Ok(staged_ino)
+                }
+                Err(e) => Err(e),
+            }
+        },
+    )?;
+    Ok(ino)
+}
+
+/// Atomically publish raw `bytes` (whose BLAKE3 digest MUST equal `hash`) as the CAS blob `dest`
+/// through a unique staging file under `<store_root>/staging`, so neither a partially written nor
+/// a hash-mismatched final blob is ever observable. A missing `dest` is created with `link` (never
+/// clobbering a concurrent digest-verified writer); `replace` swaps a torn/corrupt file out with
+/// `rename`. Returns the inode of the published file.
 pub(crate) fn write_blob_atomic(
     store_root: &Path,
     dest: &Path,
@@ -3553,73 +5710,19 @@ pub(crate) fn write_blob_atomic(
     bytes: &[u8],
     replace: bool,
 ) -> Result<i64> {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let staging_dir = store_root.join("staging");
-    let nanos = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    // pid + per-process sequence + clock: a stale file of a crashed process with a recycled pid
-    // cannot collide.
-    let staging_path = staging_dir.join(format!(
-        "{}.{}.{}.{}.tmp",
-        hash,
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed),
-        nanos
-    ));
-    let open = || {
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o444)
-            .open(&staging_path)
-    };
-    let mut f = match open() {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(&staging_dir)?;
-            open()?
-        }
-        Err(e) => return Err(e.into()),
-    };
-    let res = (|| -> Result<i64> {
-        f.write_all(bytes)?;
-        let ino = f.metadata()?.ino() as i64;
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        if replace {
-            fs::rename(&staging_path, dest)?;
-            return Ok(ino);
-        }
-        match fs::hard_link(&staging_path, dest) {
-            Ok(()) => Ok(ino),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Lost a race (or a pre-fix writer left a partial file): keep a complete
-                // blob, otherwise replace it with ours.
-                match probe_blob_file(dest, bytes.len() as u64) {
-                    BlobDisk::Intact(m) => Ok(m.ino() as i64),
-                    _ => {
-                        fs::rename(&staging_path, dest)?;
-                        Ok(ino)
-                    }
-                }
-            }
-            Err(e) => Err(e.into()),
-        }
-    })();
-    drop(f);
-    if !replace || res.is_err() {
-        let _ = fs::remove_file(&staging_path);
+    if blake3::hash(bytes).to_hex().as_str() != hash {
+        anyhow::bail!(
+            "Refusing to publish CAS blob {}: raw payload digest does not match supplied hash",
+            hash
+        );
     }
-    res
+    write_blob_bytes_checked(store_root, dest, hash, bytes, replace)
 }
 
-/// Ensure `dest` holds a complete copy of `bytes`: write it when missing, rewrite it when torn.
-/// `known_missing` skips the existence probe (freshly created shard directory).
+/// Ensure `dest` holds a complete, digest-verified, crash-durable copy of raw `bytes` (whose
+/// BLAKE3 digest MUST equal `hash`): write it when missing, rewrite it when torn/corrupt, and sync
+/// its containing directory + ancestor chain up to `store_root` when an existing verified copy is
+/// reused.
 pub(crate) fn ensure_blob_file(
     store_root: &Path,
     dest: &Path,
@@ -3627,14 +5730,58 @@ pub(crate) fn ensure_blob_file(
     bytes: &[u8],
     known_missing: bool,
 ) -> Result<(i64, i64)> {
+    if blake3::hash(bytes).to_hex().as_str() != hash {
+        anyhow::bail!(
+            "Refusing to publish CAS blob {}: raw payload digest does not match supplied hash",
+            hash
+        );
+    }
     let len = bytes.len() as u64;
-    let state = if known_missing {
+    if !known_missing {
+        if let Ok((mut f, meta)) = open_regular_nofollow(dest) {
+            let owned_immutable = {
+                #[cfg(unix)]
+                {
+                    is_exclusively_created_immutable_cas_inode(&meta, hash)
+                }
+                #[cfg(not(unix))]
+                {
+                    true
+                }
+            };
+            let mut buf = Vec::with_capacity(meta.len().min(64 * 1024 * 1024) as usize);
+            let verified = owned_immutable
+                && f.read_to_end(&mut buf).is_ok()
+                && ((buf.len() as u64 == len && blake3::hash(&buf).to_hex().as_str() == hash)
+                    || (buf.len() >= 12
+                        && &buf[..4] == b"TLZ1"
+                        && u64::from_le_bytes(buf[4..12].try_into().unwrap()) == len
+                        && decompress_tlz1(&buf)
+                            .is_some_and(|raw| blake3::hash(&raw).to_hex().as_str() == hash)));
+            if verified {
+                durability_barrier(&f)?;
+                if let Some(parent) = dest.parent() {
+                    let ancestors = ensure_dir_tracking(parent, store_root)?;
+                    sync_dir(parent)?;
+                    for dir in ancestors {
+                        sync_dir(&dir)?;
+                    }
+                }
+                return Ok((meta.ino() as i64, len as i64));
+            }
+            return Ok((
+                write_blob_atomic(store_root, dest, hash, bytes, true)?,
+                len as i64,
+            ));
+        }
+    }
+    let state = if known_missing || fs::symlink_metadata(dest).is_err() {
         BlobDisk::Missing
     } else {
-        probe_blob_file(dest, len)
+        BlobDisk::Torn
     };
     match state {
-        BlobDisk::Intact(meta) => Ok((meta.ino() as i64, len as i64)),
+        BlobDisk::Intact => unreachable!(),
         BlobDisk::Missing => Ok((
             write_blob_atomic(store_root, dest, hash, bytes, false)?,
             len as i64,
@@ -3653,9 +5800,10 @@ pub fn prestage_theorem_shard_blobs_at(
     if items.is_empty() {
         return Ok(());
     }
+    let _pub_guard = acquire_cas_publication_guard(store_root)?;
     let mut seen_blobs = std::collections::HashSet::with_capacity(items.len());
     let mut seen_prefix = [false; 256];
-    let mut newly_created_prefix = [false; 256];
+    let mut created_parents = std::collections::HashSet::new();
 
     for (_action_key, _decl_name, receipt_bytes, _dur_ms) in items {
         let hash = blake3::hash(receipt_bytes).to_hex().to_string();
@@ -3668,18 +5816,22 @@ pub fn prestage_theorem_shard_blobs_at(
         if !seen_prefix[p_idx] {
             seen_prefix[p_idx] = true;
             if let Some(parent) = dest.parent() {
-                if fs::create_dir(parent).is_ok() {
-                    newly_created_prefix[p_idx] = true;
-                }
+                created_parents.extend(ensure_dir_tracking(parent, store_root)?);
             }
         }
-        ensure_blob_file(
-            store_root,
-            &dest,
-            &hash,
-            receipt_bytes,
-            newly_created_prefix[p_idx],
-        )?;
+        if let Err(e) = ensure_blob_file(store_root, &dest, &hash, receipt_bytes, false) {
+            let mut dirs: Vec<PathBuf> = created_parents.into_iter().collect();
+            dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+            for dir in dirs {
+                let _ = sync_dir(&dir);
+            }
+            return Err(e);
+        }
+    }
+    let mut dirs: Vec<PathBuf> = created_parents.into_iter().collect();
+    dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    for dir in dirs {
+        sync_dir(&dir)?;
     }
     Ok(())
 }
@@ -3705,126 +5857,282 @@ pub(crate) fn is_non_package_lake_build_path(p: &Path) -> bool {
     false
 }
 
-/// Install `src` at `dst` (reflink/hardlink/copy via a private temp + atomic rename). With
-/// `expected_len`, the temp file must have exactly that length before it is renamed into place, so a
-/// blob that GC re-compressed after the caller's probe is never published.
+/// Install a CAS blob `src` at `dst`, binding BLAKE3 digest (`expected_hash`) and byte length
+/// (`expected_len`) verification to the exact private staged inode/descriptor before atomic rename.
+pub(crate) fn install_verified_blob_to_path(
+    src: &Path,
+    dst: &Path,
+    expected_hash: &str,
+    expected_len: u64,
+) -> Result<&'static str> {
+    install_blob_to_path_checked(src, dst, Some(expected_hash), Some(expected_len))
+}
+
+#[cfg(test)]
 pub(crate) fn try_reflink_or_hardlink(
     src: &Path,
     dst: &Path,
     expected_len: Option<u64>,
 ) -> Result<&'static str> {
-    let pid = std::process::id();
-    let tid = format!("{:?}", std::thread::current().id())
-        .chars()
-        .filter(|c| c.is_ascii_digit())
-        .collect::<String>();
+    install_blob_to_path_checked(src, dst, None, expected_len)
+}
+
+fn install_blob_to_path_checked(
+    src: &Path,
+    dst: &Path,
+    expected_hash: Option<&str>,
+    expected_len: Option<u64>,
+) -> Result<&'static str> {
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_BLOB_INSTALL_HOOK.with(|h| h.borrow().clone()) {
+        hook(src, dst);
+    }
+    let parent = dst.parent().unwrap_or_else(|| Path::new("."));
     let fname = dst
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "artifact".to_string());
-    let tmp_dst = dst.with_file_name(format!(".{}.tl_tmp.{}.{}", fname, pid, tid));
-    let _ = fs::remove_file(&tmp_dst);
-    let check_len = |tmp: &Path| -> Result<()> {
-        if expected_len.is_some_and(|n| fs::metadata(tmp).map_or(true, |m| m.len() != n)) {
-            let _ = fs::remove_file(tmp);
-            anyhow::bail!("CAS blob changed while linking into {}", dst.display());
-        }
-        Ok(())
-    };
+    let stem = format!(".{}.tl_tmp", fname);
     let is_mutable_sidecar = fname == ".turbo_verified_sources.json"
         || fname.ends_with(".trace")
         || fname.ends_with(".hash")
         || fname.ends_with(".c")
         || is_non_package_lake_build_path(dst);
+
+    let verify_bytes = |bytes: &[u8]| -> Result<()> {
+        if expected_len.is_some_and(|n| bytes.len() as u64 != n) {
+            anyhow::bail!("CAS blob changed while linking into {}", dst.display());
+        }
+        if expected_hash.is_some_and(|h| blake3::hash(bytes).to_hex().as_str() != h) {
+            anyhow::bail!(
+                "CAS blob digest mismatch while installing into {}",
+                dst.display()
+            );
+        }
+        Ok(())
+    };
+
     if is_mutable_sidecar {
+        let (src_bytes, src_file) = {
+            let (mut f, meta) = open_regular_nofollow(src)
+                .with_context(|| format!("CAS source {} is not a regular file", src.display()))?;
+            let mut b = Vec::with_capacity(meta.len().min(64 * 1024 * 1024) as usize);
+            f.read_to_end(&mut b)?;
+            verify_bytes(&b)?;
+            (b, f)
+        };
+        let (mut dst_file, tmp_dst) = open_unique_staging_file(parent, &stem, 0o644)?;
+        let install_res = (|| -> Result<&'static str> {
+            #[cfg(target_os = "linux")]
+            {
+                use std::io::Seek;
+                use std::os::unix::io::AsRawFd;
+                const FICLONE: libc::c_ulong = 0x40049409;
+                if unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) } == 0
+                {
+                    if dst_file.seek(std::io::SeekFrom::Start(0)).is_ok() {
+                        let mut cloned_buf = Vec::with_capacity(src_bytes.len());
+                        if dst_file.read_to_end(&mut cloned_buf).is_ok()
+                            && verify_bytes(&cloned_buf).is_ok()
+                        {
+                            #[cfg(test)]
+                            if let Some(hook) =
+                                AFTER_BLOB_VERIFY_BEFORE_RENAME_HOOK.with(|h| h.borrow().clone())
+                            {
+                                hook(src, dst);
+                            }
+                            drop(dst_file);
+                            fs::rename(&tmp_dst, dst)?;
+                            return Ok("reflink");
+                        }
+                    }
+                    dst_file.set_len(0)?;
+                    dst_file.seek(std::io::SeekFrom::Start(0))?;
+                }
+            }
+            let _ = &src_file;
+            dst_file.write_all(&src_bytes)?;
+            #[cfg(test)]
+            if let Some(hook) = AFTER_BLOB_VERIFY_BEFORE_RENAME_HOOK.with(|h| h.borrow().clone()) {
+                hook(src, dst);
+            }
+            drop(dst_file);
+            fs::rename(&tmp_dst, dst)?;
+            Ok("copy")
+        })();
+        let _ = fs::remove_file(&tmp_dst);
+        return install_res;
+    }
+
+    // 1. Try immutable hardlink (`linkat(..., 0)`, no symlink following) to a private staging path
+    //    ONLY when the staged inode is proven in-process to have been created exclusively by
+    //    `turbo-lean` via `O_CREAT | O_EXCL` (`is_exclusively_created_immutable_cas_inode`).
+    //    Externally supplied files (even with `0o444` or forged `user.*` xattrs) fall through to
+    //    fresh-inode isolation so retained writable fds can never mutate `dst` between verification
+    //    and rename or after return.
+    if let Ok(tmp_link) = reserve_unique_staging_path(parent, &stem) {
+        if link_regular_nofollow(src, &tmp_link).is_ok() {
+            enum HardlinkAttempt {
+                Linked,
+                UnstampedFallback,
+                Corrupt(anyhow::Error),
+            }
+            let hardlink_res = (|| -> HardlinkAttempt {
+                let Ok((mut f, meta)) = open_regular_nofollow(&tmp_link) else {
+                    return HardlinkAttempt::UnstampedFallback;
+                };
+                if expected_len.is_some_and(|n| meta.len() != n) {
+                    return HardlinkAttempt::Corrupt(anyhow::anyhow!(
+                        "CAS blob changed while linking into {}",
+                        dst.display()
+                    ));
+                }
+                let mut b = Vec::with_capacity(meta.len().min(64 * 1024 * 1024) as usize);
+                if let Err(e) = f.read_to_end(&mut b) {
+                    return HardlinkAttempt::Corrupt(e.into());
+                }
+                if let Err(e) = verify_bytes(&b) {
+                    return HardlinkAttempt::Corrupt(e);
+                }
+                #[cfg(unix)]
+                {
+                    let computed;
+                    let hash_for_stamp = match expected_hash {
+                        Some(h) => h,
+                        None => {
+                            computed = blake3::hash(&b).to_hex().to_string();
+                            computed.as_str()
+                        }
+                    };
+                    if !is_exclusively_created_immutable_cas_inode(&meta, hash_for_stamp) {
+                        return HardlinkAttempt::UnstampedFallback;
+                    }
+                }
+                #[cfg(not(unix))]
+                if (meta.permissions().mode() & 0o222) != 0 {
+                    return HardlinkAttempt::UnstampedFallback;
+                }
+                #[cfg(test)]
+                if let Some(hook) =
+                    AFTER_BLOB_VERIFY_BEFORE_RENAME_HOOK.with(|h| h.borrow().clone())
+                {
+                    hook(src, dst);
+                }
+                drop(f);
+                match fs::rename(&tmp_link, dst) {
+                    Ok(()) => HardlinkAttempt::Linked,
+                    Err(_) => HardlinkAttempt::UnstampedFallback,
+                }
+            })();
+            let _ = fs::remove_file(&tmp_link);
+            match hardlink_res {
+                HardlinkAttempt::Linked => return Ok("hardlink"),
+                HardlinkAttempt::Corrupt(e) => return Err(e),
+                HardlinkAttempt::UnstampedFallback => {}
+            }
+        }
+    }
+
+    // Read and verify the regular source descriptor once; never re-open `src` by pathname afterward.
+    let (src_bytes, src_file, effective_hash) = {
+        let (mut f, meta) = open_regular_nofollow(src)
+            .with_context(|| format!("CAS source {} is not a regular file", src.display()))?;
+        let mut b = Vec::with_capacity(meta.len().min(64 * 1024 * 1024) as usize);
+        f.read_to_end(&mut b)?;
+        verify_bytes(&b)?;
+        let h = match expected_hash {
+            Some(eh) => eh.to_string(),
+            None => blake3::hash(&b).to_hex().to_string(),
+        };
+        (b, f, h)
+    };
+
+    // If hardlinking was unavailable (e.g. EXDEV across filesystems) and `dst` already exists as an
+    // exclusively created store-owned `0o444` file with identical verified bytes, preserve `dst`.
+    if let Ok((mut dst_f, dst_meta)) = open_regular_nofollow(dst) {
+        let dst_owned = {
+            #[cfg(unix)]
+            {
+                is_exclusively_created_immutable_cas_inode(&dst_meta, &effective_hash)
+            }
+            #[cfg(not(unix))]
+            {
+                (dst_meta.permissions().mode() & 0o222) == 0
+            }
+        };
+        if dst_owned && dst_meta.len() == src_bytes.len() as u64 {
+            let mut db = Vec::with_capacity(src_bytes.len());
+            if dst_f.read_to_end(&mut db).is_ok() && db == src_bytes {
+                return Ok("hardlink");
+            }
+        }
+    }
+
+    // 2. Stage into a fresh `O_CREAT | O_EXCL` temp file (FICLONE from verified `src_file` when on
+    //    a CoW FS and re-verified on the independent snapshot, otherwise write `src_bytes`), seal
+    //    in-process exclusive immutability + `chmod 0o444`, and atomically rename onto `dst`.
+    let (mut dst_file, tmp_dst) = open_unique_staging_file(parent, &stem, 0o600)?;
+    #[cfg(unix)]
+    let mut sealed_key: Option<ExclusivelyCreatedCasKey> = None;
+    let install_res = (|| -> Result<&'static str> {
+        let mut finalize_immutable = |f: &File| -> std::io::Result<()> {
+            #[cfg(unix)]
+            {
+                sealed_key = Some(seal_exclusively_created_cas_inode(
+                    f,
+                    &tmp_dst,
+                    0o444,
+                    &effective_hash,
+                )?);
+            }
+            Ok(())
+        };
         #[cfg(target_os = "linux")]
         {
+            use std::io::Seek;
             use std::os::unix::io::AsRawFd;
-            if let (Ok(src_file), Ok(dst_file)) = (File::open(src), File::create(&tmp_dst)) {
-                const FICLONE: libc::c_ulong = 0x40049409;
-                let ret =
-                    unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) };
-                if ret == 0 {
-                    let mut perms = dst_file.metadata()?.permissions();
-                    perms.set_mode(0o644);
-                    let _ = dst_file.set_permissions(perms);
-                    drop(dst_file);
-                    check_len(&tmp_dst)?;
-                    fs::rename(&tmp_dst, dst)?;
-                    return Ok("reflink");
-                } else {
-                    drop(dst_file);
-                    let _ = fs::remove_file(&tmp_dst);
-                }
-            }
-        }
-        fs::copy(src, &tmp_dst)?;
-        #[cfg(unix)]
-        {
-            let mut perms = fs::metadata(&tmp_dst)?.permissions();
-            perms.set_mode(0o644);
-            let _ = fs::set_permissions(&tmp_dst, perms);
-        }
-        check_len(&tmp_dst)?;
-        fs::rename(&tmp_dst, dst)?;
-        return Ok("copy");
-    }
-
-    // 1. Try immutable hardlink to process-private temp path + atomic rename
-    // (shares OS page-cache mmap Shared_Clean across all worktrees and never races on dst)
-    if fs::hard_link(src, &tmp_dst).is_ok() {
-        check_len(&tmp_dst)?;
-        if fs::rename(&tmp_dst, dst).is_ok() {
-            return Ok("hardlink");
-        }
-        let _ = fs::remove_file(&tmp_dst);
-    }
-
-    // If hardlinking failed (e.g. EXDEV across bind mounts) and `dst` already exists as a
-    // read-only 0o444 file with identical size and bytes, preserve `dst`'s existing inode & mtime!
-    if let (Ok(src_meta), Ok(dst_meta)) = (fs::metadata(src), fs::metadata(dst)) {
-        if src_meta.len() == dst_meta.len()
-            && expected_len.is_none_or(|n| src_meta.len() == n)
-            && (dst_meta.permissions().mode() & 0o222) == 0
-        {
-            if let (Ok(sb), Ok(db)) = (fs::read(src), fs::read(dst)) {
-                if sb == db {
-                    return Ok("hardlink");
-                }
-            }
-        }
-    }
-
-    // 2. Try FICLONE ioctl reflink on CoW filesystems (Btrfs / XFS) via temp path
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::io::AsRawFd;
-        if let (Ok(src_file), Ok(dst_file)) = (File::open(src), File::create(&tmp_dst)) {
             const FICLONE: libc::c_ulong = 0x40049409;
-            let ret = unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) };
-            if ret == 0 {
-                let mut perms = dst_file.metadata()?.permissions();
-                perms.set_mode(0o444);
-                let _ = dst_file.set_permissions(perms);
-                drop(dst_file);
-                check_len(&tmp_dst)?;
-                fs::rename(&tmp_dst, dst)?;
-                return Ok("reflink");
-            } else {
-                drop(dst_file);
-                let _ = fs::remove_file(&tmp_dst);
+            if unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) } == 0 {
+                if dst_file.seek(std::io::SeekFrom::Start(0)).is_ok() {
+                    let mut cloned_buf = Vec::with_capacity(src_bytes.len());
+                    if dst_file.read_to_end(&mut cloned_buf).is_ok()
+                        && verify_bytes(&cloned_buf).is_ok()
+                    {
+                        finalize_immutable(&dst_file)?;
+                        #[cfg(test)]
+                        if let Some(hook) =
+                            AFTER_BLOB_VERIFY_BEFORE_RENAME_HOOK.with(|h| h.borrow().clone())
+                        {
+                            hook(src, dst);
+                        }
+                        drop(dst_file);
+                        fs::rename(&tmp_dst, dst)?;
+                        return Ok("reflink");
+                    }
+                }
+                dst_file.set_len(0)?;
+                dst_file.seek(std::io::SeekFrom::Start(0))?;
             }
         }
+        let _ = &src_file;
+        dst_file.write_all(&src_bytes)?;
+        finalize_immutable(&dst_file)?;
+        #[cfg(test)]
+        if let Some(hook) = AFTER_BLOB_VERIFY_BEFORE_RENAME_HOOK.with(|h| h.borrow().clone()) {
+            hook(src, dst);
+        }
+        drop(dst_file);
+        fs::rename(&tmp_dst, dst)?;
+        Ok("copy")
+    })();
+    let _ = fs::remove_file(&tmp_dst);
+    #[cfg(unix)]
+    if install_res.is_err() {
+        if let Some((dev, ino)) = sealed_key {
+            unseal_cas_inode(dev, ino);
+        }
     }
-
-    // 3. Fallback to file copy across distinct filesystems via temp path + atomic rename
-    fs::copy(src, &tmp_dst)?;
-    let mut perms = fs::metadata(&tmp_dst)?.permissions();
-    perms.set_mode(0o444);
-    let _ = fs::set_permissions(&tmp_dst, perms);
-    check_len(&tmp_dst)?;
-    fs::rename(&tmp_dst, dst)?;
-    Ok("copy")
+    install_res
 }
 
 #[cfg(test)]
@@ -3911,8 +6219,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gc_eviction_removes_done_and_lock_so_singleflight_never_hits_missing_row() -> Result<()>
-    {
+    fn test_gc_eviction_removes_done_but_keeps_lock_inode_stable() -> Result<()> {
         let (dir, mut store) = tmp_store("evicted_done")?;
         let payload = b"pinned output survives eviction".to_vec();
         let bh = store.store_immutable_blob(&payload, "olean", "trusted", 1)?;
@@ -3926,9 +6233,10 @@ mod tests {
             SingleflightOutcome::Leader(l) => l,
             _ => panic!("expected leader"),
         };
+        let lock_ino_before = lease.lock_file.metadata()?.ino();
         store.publish_action(&lease, std::slice::from_ref(&entry), 5, 0, 0, "trusted")?;
         drop(lease);
-        store.write_singleflight_done("evict_key", std::slice::from_ref(&entry));
+        store.write_singleflight_done("evict_key", std::slice::from_ref(&entry))?;
         // An unpinned action makes the store reclaimable so GC step B actually runs.
         let filler =
             store.store_immutable_blob(b"unpinned filler output", "olean", "trusted", 0)?;
@@ -3951,12 +6259,21 @@ mod tests {
         assert_eq!(report.evicted_actions, 2);
         assert!(store.blob_path(&bh).exists(), "pinned blob survives");
         assert!(!locks.join("evict_key.done").exists());
-        assert!(!locks.join("evict_key.lock").exists());
+        assert!(
+            locks.join("evict_key.lock").exists(),
+            "lock file must never be unlinked by GC"
+        );
+        assert_eq!(
+            fs::metadata(locks.join("evict_key.lock"))?.ino(),
+            lock_ino_before
+        );
 
         // Even a stale marker (e.g. written by a racing leader) cannot fake a hit.
-        store.write_singleflight_done("evict_key", &[entry]);
+        store.write_singleflight_done("evict_key", &[entry])?;
         match store.acquire_singleflight("evict_key", "tc", "olean", "trusted")? {
-            SingleflightOutcome::Leader(_) => {}
+            SingleflightOutcome::Leader(l) => {
+                assert_eq!(l.lock_file.metadata()?.ino(), lock_ino_before);
+            }
             SingleflightOutcome::CacheHit { .. } => panic!("hit for action missing from DB"),
         }
         let hits: i64 = store
@@ -3980,17 +6297,17 @@ mod tests {
             rel_path: "D.olean".to_string(),
         };
 
-        // A cold TLZ1 blob is intact by its header length, and writers report the raw size.
+        // A cold TLZ1 blob is intact by its decompressed digest, and writers report the raw size.
         assert!(store.run_gc(u64::MAX, 7 * 86400, true)?.compressed_blobs >= 1);
         assert!(fs::metadata(&path)?.len() < payload.len() as u64);
         assert!(matches!(
-            probe_blob_file(&path, payload.len() as u64),
-            BlobDisk::Intact(_)
+            probe_blob_digest(&path, &bh, payload.len() as u64),
+            BlobDisk::Intact
         ));
         let (_, sz) = ensure_blob_file(&dir, &path, &bh, &payload, false)?;
         assert_eq!(sz, payload.len() as i64);
         assert!(matches!(
-            probe_blob_file(&path, payload.len() as u64 + 1),
+            probe_blob_digest(&path, &bh, payload.len() as u64 + 1),
             BlobDisk::Torn
         ));
 
@@ -4049,15 +6366,17 @@ mod tests {
             "hardlink"
         );
 
-        // GC keeps the `.lock` of a live holder; an unlinked lock makes a peer start over.
+        // `remove_singleflight_markers` never unlinks `.lock` (whether contended or idle).
         let locks = dir.join("locks");
         fs::create_dir_all(&locks)?;
         let held = locks.join("live.lock");
         let f = OpenOptions::new()
             .create(true)
-            .truncate(true)
+            .truncate(false)
+            .read(true)
             .write(true)
             .open(&held)?;
+        let orig_ino = f.metadata()?.ino();
         assert_eq!(
             unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&f), libc::LOCK_EX) },
             0
@@ -4066,11 +6385,13 @@ mod tests {
         assert!(held.exists());
         drop(f);
         store.remove_singleflight_markers("live");
-        assert!(!held.exists());
+        assert!(held.exists());
+        assert_eq!(fs::metadata(&held)?.ino(), orig_ino);
         match store.acquire_singleflight("live", "tc", "olean", "trusted")? {
             SingleflightOutcome::Leader(l) => {
                 let a = fs::metadata(&held)?.ino();
                 let b = l.lock_file.metadata()?.ino();
+                assert_eq!(a, orig_ino);
                 assert_eq!(a, b, "leader holds the lock file currently on disk");
             }
             SingleflightOutcome::CacheHit { .. } => panic!("unexpected hit"),
@@ -4141,7 +6462,7 @@ mod tests {
             "shard_key_beta".to_string(),
             "shard_key_missing".to_string(),
         ];
-        let hits1 = batch_get_theorem_shards(&store.conn, &query_keys)?;
+        let hits1 = store.batch_get_theorem_shards(&query_keys, "trusted")?;
         assert!(
             hits1.len() == 2
                 && hits1.contains_key("shard_key_alpha")
@@ -4616,6 +6937,1812 @@ mod tests {
             .conn
             .execute_batch("DROP TRIGGER temp.abort_inflight_test;")?;
 
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_durability_barrier_order_across_cas_done_markers_and_stamps() -> Result<()> {
+        let (dir, store) = tmp_store("durability_order")?;
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        set_durability_recorder(log.clone());
+
+        let take_log = || -> Vec<String> { std::mem::take(&mut *log.lock().unwrap()) };
+
+        let fresh_root = dir.join("fresh_store");
+        fs::create_dir_all(&fresh_root)?;
+        let payload = b"durable-cas-blob-payload";
+        let bh = blake3::hash(payload).to_hex().to_string();
+        let prefix = &bh[..2];
+        let dest = fresh_root.join("blobs").join(prefix).join(&bh);
+        write_blob_atomic(&fresh_root, &dest, &bh, payload, false)?;
+        let evs = take_log();
+        assert_eq!(fs::read(&dest)?, payload);
+        assert!(
+            evs.first().is_some_and(|s| s.starts_with("file:")),
+            "staged file bytes must be synced before publication: {evs:?}"
+        );
+        let pos = |needle: &str| evs.iter().position(|s| s == needle);
+        let file_pos = 0usize;
+        let shard_pos = pos(&format!("dir:{prefix}")).expect("shard dir synced");
+        let blobs_pos = pos("dir:blobs").expect("parent blobs dir synced");
+        let root_pos = pos("dir:fresh_store").expect("store root synced for new subdirs");
+        assert!(
+            file_pos < shard_pos && shard_pos < blobs_pos && blobs_pos < root_pos,
+            "expected file -> shard dir -> blobs -> store_root order, got {evs:?}"
+        );
+
+        // Reusing an already-present Intact blob (and AlreadyExists race fallback) must still
+        // barrier the blob bytes, containing shard directory, and ancestor chain up to store_root.
+        ensure_blob_file(&fresh_root, &dest, &bh, payload, false)?;
+        let evs = take_log();
+        let reuse_file = evs
+            .iter()
+            .position(|s| *s == format!("file:{bh}"))
+            .expect("reused intact blob synced");
+        let reuse_shard = evs
+            .iter()
+            .position(|s| *s == format!("dir:{prefix}"))
+            .expect("reused shard dir synced");
+        let reuse_blobs = evs
+            .iter()
+            .position(|s| s == "dir:blobs")
+            .expect("reused blobs dir synced");
+        let reuse_root = evs
+            .iter()
+            .position(|s| s == "dir:fresh_store")
+            .expect("reused store root synced");
+        assert!(
+            reuse_file < reuse_shard && reuse_shard < reuse_blobs && reuse_blobs < reuse_root,
+            "expected reused blob -> shard -> blobs -> store_root order, got {evs:?}"
+        );
+
+        write_blob_atomic(&fresh_root, &dest, &bh, payload, false)?;
+        let evs = take_log();
+        assert!(
+            evs.iter().any(|s| *s == format!("file:{bh}"))
+                && evs.iter().any(|s| *s == format!("dir:{prefix}"))
+                && evs.iter().any(|s| s == "dir:blobs")
+                && evs.iter().any(|s| s == "dir:fresh_store"),
+            "AlreadyExists Intact path must sync peer file + ancestor chain: {evs:?}"
+        );
+
+        let entry = BlobEntry {
+            blob_hash: bh.clone(),
+            kind: "olean".to_string(),
+            size_bytes: payload.len() as u64,
+            rel_path: "A.olean".to_string(),
+        };
+        store.write_singleflight_done("durable_act", &[entry])?;
+        let evs = take_log();
+        let done_pos = evs
+            .iter()
+            .position(|s| s.starts_with("file:.durable_act.done."))
+            .expect(".done staging file synced before rename");
+        let locks_after_done = evs[done_pos..]
+            .iter()
+            .position(|s| s == "dir:locks")
+            .expect("locks synced after .done rename");
+        assert!(locks_after_done > 0, "{evs:?}");
+
+        assert!(crate::pack::stage_deferred_pack_record(
+            &fresh_root,
+            "trusted",
+            b"v3-payload"
+        ));
+        let evs = take_log();
+        assert!(
+            evs.iter().any(|s| s == "dir:fresh_store"),
+            "newly created locks dir must sync store_root: {evs:?}"
+        );
+        let spool_pos = evs
+            .iter()
+            .position(|s| s.starts_with("file:.deferred_pack_v4."))
+            .expect("spool file synced");
+        let locks_after_spool = evs[spool_pos..]
+            .iter()
+            .position(|s| s == "dir:locks")
+            .expect("locks synced after spool publish");
+        assert!(locks_after_spool > 0, "{evs:?}");
+
+        // Cold-store lock initialization into a previously nonexistent store root (with a missing
+        // intermediate parent) must durably sync every newly created ancestor, including the parent
+        // directory naming `brand_new_store` itself.
+        let cold_parent = dir.join("missing_cold_parent");
+        let cold_store_root = cold_parent.join("brand_new_store");
+        assert!(!cold_parent.exists());
+        let cold_guard = acquire_cas_publication_guard(&cold_store_root)?;
+        drop(cold_guard);
+        let evs = take_log();
+        let p_store = evs
+            .iter()
+            .position(|s| s == "dir:brand_new_store")
+            .expect("brand_new_store synced for locks/");
+        let p_parent = evs
+            .iter()
+            .position(|s| s == "dir:missing_cold_parent")
+            .expect("missing_cold_parent synced for brand_new_store");
+        let dir_fname = dir.file_name().unwrap().to_string_lossy().to_string();
+        let p_outer = evs
+            .iter()
+            .position(|s| *s == format!("dir:{dir_fname}"))
+            .expect("outer parent synced for missing_cold_parent");
+        assert!(
+            p_store < p_parent && p_parent < p_outer,
+            "expected bottom-up ancestor sync brand_new_store -> missing_cold_parent -> outer dir, got {evs:?}"
+        );
+        assert!(cold_store_root
+            .join("locks")
+            .join(STORE_TREE_DURABLE_MARKER)
+            .exists());
+
+        // Racing peer case: if a concurrent process already created `raced_parent/raced_store/locks`
+        // on disk via `create_dir_all` (without yet completing parent-directory fsyncs or writing
+        // `store_tree_durable.v1`), a second caller MUST still sync `raced_store`, `raced_parent`,
+        // and the outer parent directory before returning.
+        let raced_parent = dir.join("raced_unpersisted_parent");
+        let raced_store = raced_parent.join("raced_store");
+        fs::create_dir_all(raced_store.join("locks"))?;
+        let _ = take_log();
+        let raced_guard = acquire_cas_publication_guard(&raced_store)?;
+        drop(raced_guard);
+        let evs = take_log();
+        let r_store = evs
+            .iter()
+            .position(|s| s == "dir:raced_store")
+            .expect("peer must sync raced_store when durable marker absent");
+        let r_parent = evs
+            .iter()
+            .position(|s| s == "dir:raced_unpersisted_parent")
+            .expect("peer must sync raced_unpersisted_parent when durable marker absent");
+        let r_outer = evs
+            .iter()
+            .position(|s| *s == format!("dir:{dir_fname}"))
+            .expect("peer must sync outer parent when durable marker absent");
+        assert!(
+            r_store < r_parent && r_parent < r_outer,
+            "expected bottom-up ancestor sync on raced pre-created dirs, got {evs:?}"
+        );
+        assert!(raced_store
+            .join("locks")
+            .join(STORE_TREE_DURABLE_MARKER)
+            .exists());
+
+        // Partially created racing-peer ancestry: a peer created the intermediate directory
+        // `partial_unpersisted_parent` inside `dir`, then paused BEFORE creating `partial_store`
+        // or `locks/` and BEFORE syncing `dir`. A second initializer sees `partial_unpersisted_parent`
+        // as the deepest pre-existing ancestor while `locks/` is still absent (`locks_preexisted == false`),
+        // and MUST still repair and sync the outer `dir` before publishing `store_tree_durable.v1`.
+        let partial_parent = dir.join("partial_unpersisted_parent");
+        let partial_store = partial_parent.join("partial_store");
+        fs::create_dir_all(&partial_parent)?;
+        assert!(!partial_store.exists());
+        let _ = take_log();
+        let partial_guard = acquire_cas_publication_guard(&partial_store)?;
+        drop(partial_guard);
+        let evs = take_log();
+        let pp_store = evs
+            .iter()
+            .position(|s| s == "dir:partial_store")
+            .expect("peer must sync newly created partial_store");
+        let pp_parent = evs
+            .iter()
+            .position(|s| s == "dir:partial_unpersisted_parent")
+            .expect("peer must sync partial_unpersisted_parent");
+        let pp_outer = evs
+            .iter()
+            .position(|s| *s == format!("dir:{dir_fname}"))
+            .expect("peer must sync outer workspace dir for partially created intermediate");
+        assert!(
+            pp_store < pp_parent && pp_parent < pp_outer,
+            "expected bottom-up sync partial_store -> partial_unpersisted_parent -> outer dir, got {evs:?}"
+        );
+        assert!(partial_store
+            .join("locks")
+            .join(STORE_TREE_DURABLE_MARKER)
+            .exists());
+
+        // Relative `--cache-dir` store roots (whose lexical `Path::parent()` is `Some("")`) must
+        // resolve against `current_dir()` and durably sync the current working directory naming the
+        // relative top-level entry.
+        let rel_cwd = dir.join("rel_cwd_anchor");
+        fs::create_dir_all(&rel_cwd)?;
+        let prev_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(&rel_cwd)?;
+        let _ = take_log();
+        let rel_res = acquire_cas_publication_guard(Path::new("rel_cache_store"));
+        std::env::set_current_dir(&prev_cwd)?;
+        let rel_guard = rel_res?;
+        drop(rel_guard);
+        let evs = take_log();
+        let rel_store_pos = evs
+            .iter()
+            .position(|s| s == "dir:rel_cache_store")
+            .expect("relative store root synced");
+        let rel_cwd_pos = evs
+            .iter()
+            .position(|s| s == "dir:rel_cwd_anchor")
+            .expect("current working directory synced for relative store root");
+        assert!(
+            rel_store_pos < rel_cwd_pos,
+            "expected relative store root -> current directory sync order, got {evs:?}"
+        );
+
+        // Symlink followed by `..` (`/dir/ws_parent/link_to_vol/../sym_cache`): OS traversal resolves
+        // `link_to_vol/..` to `vol_root`, NOT `ws_parent`. Initialization must create and sync
+        // `vol_root/sym_cache` (and `vol_root`), leaving `ws_parent/sym_cache` untouched.
+        let ws_parent = dir.join("ws_parent");
+        let vol_project = dir.join("vol_root").join("project");
+        fs::create_dir_all(&ws_parent)?;
+        fs::create_dir_all(&vol_project)?;
+        std::os::unix::fs::symlink(&vol_project, ws_parent.join("link_to_vol"))?;
+        let sym_dotdot_root = ws_parent.join("link_to_vol").join("..").join("sym_cache");
+        let _ = take_log();
+        let sym_guard = acquire_cas_publication_guard(&sym_dotdot_root)?;
+        drop(sym_guard);
+        let evs = take_log();
+        assert!(
+            dir.join("vol_root")
+                .join("sym_cache")
+                .join("locks")
+                .join(STORE_TREE_DURABLE_MARKER)
+                .exists(),
+            "marker must be written in real resolved target store"
+        );
+        assert!(
+            !ws_parent.join("sym_cache").exists(),
+            "lexical `..` must not create sibling store under symlink's lexical parent"
+        );
+        let sym_store_pos = evs
+            .iter()
+            .position(|s| s == "dir:sym_cache")
+            .expect("real sym_cache synced");
+        let vol_root_pos = evs
+            .iter()
+            .position(|s| s == "dir:vol_root")
+            .expect("real vol_root parent synced");
+        assert!(sym_store_pos < vol_root_pos, "{evs:?}");
+
+        // Fail-closed ancestor barrier: if an ancestor directory barrier fails (e.g., `PermissionDenied`
+        // on an upper ancestor), `ensure_store_locks_dir_durable` must return `Err` and MUST NOT
+        // write `store_tree_durable.v1`.
+        let denied_anc = dir.join("denied_ancestor");
+        let denied_store = denied_anc.join("job_dir").join("store_under_denied");
+        DURABILITY_HOOK.with(|h| {
+            *h.borrow_mut() = Some(std::sync::Arc::new(move |f| {
+                use std::os::unix::io::AsRawFd;
+                let fname = fs::read_link(format!("/proc/self/fd/{}", f.as_raw_fd()))
+                    .ok()
+                    .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+                    .unwrap_or_default();
+                if fname == "denied_ancestor" {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "simulated execute-only ancestor open/fsync failure",
+                    ));
+                }
+                Ok(())
+            }));
+        });
+        assert!(acquire_cas_publication_guard(&denied_store).is_err());
+        assert!(
+            !denied_store
+                .join("locks")
+                .join(STORE_TREE_DURABLE_MARKER)
+                .exists(),
+            "failed ancestor barrier must never publish store_tree_durable.v1"
+        );
+        set_durability_recorder(log.clone());
+
+        // Missing intermediate component followed by `..` (`/existing/missing_mid/../target_cache`):
+        // must NOT discard `target_cache` and create/lock `/existing/locks`! Instead, `create_dir_all`
+        // performs real OS component-by-component creation (creating `missing_mid`, traversing `..`
+        // back to `existing`, and creating `existing/target_cache/locks`), so cold lock acquisition
+        // and subsequent warm/GC lock acquisition agree on the exact same `target_cache/locks` inode.
+        let dotdot_base = dir.join("dotdot_existing");
+        fs::create_dir_all(&dotdot_base)?;
+        let missing_dotdot_root = dotdot_base
+            .join("missing_intermediate")
+            .join("..")
+            .join("target_cache");
+        let _ = take_log();
+        let cold_dd_locks = ensure_store_locks_dir_durable(&missing_dotdot_root)?;
+        let evs_dd = take_log();
+        assert!(
+            evs_dd.iter().any(|s| s == "dir:missing_intermediate")
+                && evs_dd.iter().any(|s| s == "dir:target_cache")
+                && evs_dd.iter().any(|s| s == "dir:dotdot_existing"),
+            "missing intermediate followed by `..` must sync missing_intermediate + target_cache + dotdot_existing: {evs_dd:?}"
+        );
+        let warm_dd_locks = ensure_store_locks_dir_durable(&dotdot_base.join("target_cache"))?;
+        assert_eq!(cold_dd_locks, warm_dd_locks);
+        assert!(
+            !dotdot_base.join("locks").exists(),
+            "missing intermediate followed by `..` must never misdirect locks into parent `/existing/locks`"
+        );
+        {
+            use std::os::unix::fs::MetadataExt;
+            let g_cold = acquire_cas_publication_guard(&missing_dotdot_root)?;
+            let g_warm = acquire_cas_publication_guard(&dotdot_base.join("target_cache"))?;
+            assert_eq!(
+                g_cold.file.metadata()?.ino(),
+                g_warm.file.metadata()?.ino(),
+                "cold and warm callers must lock the exact same gc_publish.lock inode"
+            );
+        }
+        let _ = take_log();
+
+        // Standard multi-user execute-only (`0111` for owner / `0711` for other users) upper host
+        // ancestor above a writable workspace directory: cold store initialization (`TurboStore::open`
+        // and `acquire_cas_publication_guard`) must succeed without trying `O_RDONLY` `File::open`
+        // on the execute-only outer ancestor, while still syncing `locks/`, the newly created store
+        // chain, and the immediate writable parent directory.
+        #[cfg(unix)]
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            let exec_only_outer = dir.join("exec_only_0711_host_anc");
+            let writable_ws = exec_only_outer.join("user_workspace");
+            fs::create_dir_all(&writable_ws)?;
+            fs::set_permissions(&exec_only_outer, fs::Permissions::from_mode(0o111))?;
+            assert!(
+                File::open(&exec_only_outer).is_err(),
+                "execute-only directory must reject O_RDONLY File::open for non-root user"
+            );
+            let _ = take_log();
+            let cold_under_0711 = writable_ws.join("nested_new").join("cold_store_ok");
+            let init_res = (|| -> Result<Vec<String>> {
+                let opened = TurboStore::open(Some(&cold_under_0711))?;
+                let _g = acquire_cas_publication_guard(&opened.root)?;
+                let mut logs = take_log();
+                // Racing-peer recovery (`locks/` pre-created without `store_tree_durable.v1`)
+                // under the same `0711` outer ancestor must also succeed cleanly.
+                let raced_under_0711 = writable_ws.join("raced_mid").join("raced_store_ok");
+                fs::create_dir_all(raced_under_0711.join("locks"))?;
+                let _ = take_log();
+                let _rg = acquire_cas_publication_guard(&raced_under_0711)?;
+                let raced_logs = take_log();
+                assert!(
+                    raced_under_0711
+                        .join("locks")
+                        .join(STORE_TREE_DURABLE_MARKER)
+                        .exists(),
+                    "raced store under 0711 upper ancestor must durably initialize"
+                );
+                assert!(
+                    raced_logs.iter().any(|s| s == "dir:raced_store_ok")
+                        && raced_logs.iter().any(|s| s == "dir:raced_mid")
+                        && raced_logs.iter().any(|s| s == "dir:user_workspace")
+                        && !raced_logs.iter().any(|s| s == "dir:exec_only_0711_host_anc"),
+                    "raced recovery must sync through user_workspace and stop cleanly at 0711 boundary: {raced_logs:?}"
+                );
+                // When `dir == stop_at` (as in `leansys_sst_write_splits` publishing
+                // `<root>/file_splits.sst` under an execute-only outer host ancestor),
+                // `ensure_dir_tracking` must return empty immediately without walking above
+                // `stop_at` into `exec_only_0711_host_anc` or `/`.
+                assert!(
+                    ensure_dir_tracking(&opened.root, &opened.root)?.is_empty(),
+                    "ensure_dir_tracking(root, root) must return empty ancestor list"
+                );
+                assert!(
+                    ensure_dir_tracking(&opened.root.join("."), &opened.root)?.is_empty(),
+                    "ensure_dir_tracking(root/., root) must return empty ancestor list"
+                );
+                let _ = take_log();
+                opened.leansys_sst_write_splits(&[(
+                    blake3::hash(b"sst-split-key").to_hex().to_string(),
+                    r#"{"decls":[]}"#.to_string(),
+                )])?;
+                let sst_logs = take_log();
+                assert!(
+                    sst_logs.iter().any(|s| s == "dir:cold_store_ok")
+                        && !sst_logs.iter().any(|s| s == "dir:nested_new")
+                        && !sst_logs.iter().any(|s| s == "dir:exec_only_0711_host_anc"),
+                    "leansys_sst_write_splits must sync only store root and never walk above stop_at: {sst_logs:?}"
+                );
+                logs.shrink_to_fit();
+                Ok(logs)
+            })();
+            let _ = fs::set_permissions(&exec_only_outer, fs::Permissions::from_mode(0o755));
+            let evs_0711 = init_res?;
+            assert!(
+                cold_under_0711
+                    .join("locks")
+                    .join(STORE_TREE_DURABLE_MARKER)
+                    .exists(),
+                "cold store under 0711 upper ancestor must durably initialize"
+            );
+            let p_locks = evs_0711
+                .iter()
+                .position(|s| s == "dir:locks")
+                .expect("locks/ synced");
+            let p_store = evs_0711
+                .iter()
+                .position(|s| s == "dir:cold_store_ok")
+                .expect("cold_store_ok synced");
+            let p_nested = evs_0711
+                .iter()
+                .position(|s| s == "dir:nested_new")
+                .expect("nested_new synced");
+            let p_ws = evs_0711
+                .iter()
+                .position(|s| s == "dir:user_workspace")
+                .expect("writable parent user_workspace synced");
+            assert!(
+                p_locks < p_store && p_store < p_nested && p_nested < p_ws,
+                "expected locks -> cold_store_ok -> nested_new -> user_workspace order, got {evs_0711:?}"
+            );
+            assert!(
+                !evs_0711.iter().any(|s| s == "dir:exec_only_0711_host_anc"),
+                "must not walk above pre-existing parent into 0711 host ancestor: {evs_0711:?}"
+            );
+        }
+
+        let created = ensure_dir_tracking(&fresh_root.join("nested/stamp_dir"), &fresh_root)?;
+        write_bytes_durable(
+            &fresh_root.join("nested/stamp_dir/last_import_stamp"),
+            b"stamp:1:1:trusted",
+            &created,
+        )?;
+        let evs = take_log();
+        assert!(
+            evs.first()
+                .is_some_and(|s| s.starts_with("file:.last_import_stamp.")),
+            "{evs:?}"
+        );
+        let d1 = evs.iter().position(|s| s == "dir:stamp_dir").unwrap();
+        let d2 = evs.iter().position(|s| s == "dir:nested").unwrap();
+        let d3 = evs.iter().position(|s| s == "dir:fresh_store").unwrap();
+        assert!(d1 < d2 && d2 < d3, "{evs:?}");
+
+        let link_created = ensure_dir_tracking(&fresh_root.join("shared_cas/ab"), &fresh_root)?;
+        publish_durable_link(
+            &dest,
+            &fresh_root.join("shared_cas/ab").join(&bh),
+            &link_created,
+        )?;
+        let evs = take_log();
+        let s0 = evs.iter().position(|s| *s == format!("file:{bh}")).unwrap();
+        let s1 = evs.iter().position(|s| s == "dir:ab").unwrap();
+        let s2 = evs.iter().position(|s| s == "dir:shared_cas").unwrap();
+        let s3 = evs.iter().position(|s| s == "dir:fresh_store").unwrap();
+        assert!(s0 < s1 && s1 < s2 && s2 < s3, "{evs:?}");
+
+        // Shared-CAS prestaging must fail closed (never reporting success or writing a stamp) if a
+        // directory durability barrier fails.
+        let fail_store = dir.join("fail_prestage_store");
+        fs::create_dir_all(&fail_store)?;
+        let shared_for_fail = crate::pack::shared_cas_blobs_dir_for_store(&fail_store);
+        let shared_blob = shared_for_fail.join(prefix).join(&bh);
+        fs::create_dir_all(shared_blob.parent().unwrap())?;
+        fs::write(&shared_blob, payload)?;
+        let manifest = crate::pack::PackManifest {
+            format_version: 2,
+            host_arch: std::env::consts::ARCH.to_string(),
+            created_at: 1,
+            actions: Vec::new(),
+            blobs: vec![crate::pack::PackedBlob {
+                blob_hash: bh.clone(),
+                kind: "olean".to_string(),
+                size_bytes: payload.len() as u64,
+                portable: true,
+                data_hex_or_base64: Vec::new(),
+            }],
+            ed25519_pubkey: None,
+            ed25519_signature: None,
+        };
+        DURABILITY_HOOK.with(|h| {
+            *h.borrow_mut() = Some(std::sync::Arc::new(|f| {
+                if f.metadata().is_ok_and(|m| m.is_dir()) {
+                    return Err(std::io::Error::other("simulated dir fsync failure"));
+                }
+                Ok(())
+            }));
+        });
+        assert!(
+            crate::pack::prestage_blobs_from_shared_cas(&fail_store, &manifest).is_none(),
+            "prestage_blobs_from_shared_cas must reject failed directory barriers"
+        );
+        clear_durability_recorder();
+
+        // Stateless prestaging onto a brand-new (non-existent) `store_root` must create the root,
+        // hardlink/stage from shared CAS, and sync `blobs/<prefix>`, `blobs`, `store_root`, and its
+        // parent directory.
+        set_durability_recorder(log.clone());
+        let _ = take_log();
+        let cold_uncreated_root = dir.join("cold_uncreated_store");
+        assert!(!cold_uncreated_root.exists());
+        let (staged_cold, newly_cold) =
+            crate::pack::prestage_blobs_from_shared_cas(&cold_uncreated_root, &manifest)
+                .expect("fresh non-existent store_root must prestage from shared CAS");
+        assert_eq!(staged_cold.len(), 1);
+        assert_eq!(newly_cold, 1);
+        assert_eq!(
+            fs::read(cold_uncreated_root.join("blobs").join(prefix).join(&bh))?,
+            payload
+        );
+        let evs = take_log();
+        assert!(
+            evs.iter().any(|s| *s == format!("dir:{prefix}"))
+                && evs.iter().any(|s| s == "dir:blobs")
+                && evs.iter().any(|s| s == "dir:cold_uncreated_store"),
+            "cold prestage on fresh root must sync shard + blobs + store_root: {evs:?}"
+        );
+        let _ = fs::remove_file(&shared_blob);
+
+        clear_durability_recorder();
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_staging_collision_retries_and_preserves_preexisting_leftovers() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_lean_staging_collision_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let staging = dir.join("staging");
+        fs::create_dir_all(&staging)?;
+        let pid = std::process::id();
+        let payload = b"collision-resilient-blob";
+        let bh = blake3::hash(payload).to_hex().to_string();
+        let leftover = staging.join(format!("{bh}.{pid}.0.0.tmp"));
+        fs::write(&leftover, b"crashed-writer-leftover")?;
+
+        STAGING_NANOS_HOOK.with(|h| *h.borrow_mut() = Some(0));
+        let dest = dir.join("blobs").join(&bh[..2]).join(&bh);
+        write_blob_atomic(&dir, &dest, &bh, payload, false)?;
+        assert_eq!(fs::read(&dest)?, payload);
+        assert_eq!(fs::read(&leftover)?, b"crashed-writer-leftover");
+
+        let stamp_dir = dir.join("locks");
+        fs::create_dir_all(&stamp_dir)?;
+        let stamp_leftover = stamp_dir.join(format!(".stamp.{pid}.0.0.tmp"));
+        fs::write(&stamp_leftover, b"old")?;
+        write_bytes_durable(&stamp_dir.join("stamp"), b"new-stamp", &[])?;
+        assert_eq!(fs::read(stamp_dir.join("stamp"))?, b"new-stamp");
+        assert_eq!(fs::read(&stamp_leftover)?, b"old");
+        STAGING_NANOS_HOOK.with(|h| *h.borrow_mut() = None);
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_gc_skips_held_singleflight_lease_and_concurrent_open_flock_shares_inode() -> Result<()>
+    {
+        let (dir, mut store) = tmp_store("gc_lease_and_open_flock")?;
+        let tc = "leanprover/lean4:v4.35.0";
+
+        // 1. Completed action whose singleflight lock is currently held by a peer (e.g. follower
+        // upgrading or publisher re-running): GC must skip evicting both the row and its blobs,
+        // and must skip Step C TLZ1 re-compression while the lock is held.
+        let compressible = b"held-lease-olean-".repeat(80);
+        let bh_held = store.store_immutable_blob(&compressible, "olean", "trusted", 0)?;
+        let entry_held = BlobEntry {
+            blob_hash: bh_held.clone(),
+            kind: "olean".to_string(),
+            size_bytes: compressible.len() as u64,
+            rel_path: "Held.olean".to_string(),
+        };
+        let lease1 = match store.acquire_singleflight("held_act", tc, "olean", "trusted")? {
+            SingleflightOutcome::Leader(l) => l,
+            _ => panic!("expected leader"),
+        };
+        store.publish_action(
+            &lease1,
+            std::slice::from_ref(&entry_held),
+            5,
+            0,
+            0,
+            "trusted",
+        )?;
+        store.write_singleflight_done("held_act", std::slice::from_ref(&entry_held))?;
+        // Keep `lease1` alive while a second handle runs GC(0) (aggressive eviction + Step C).
+        let mut gc_store = TurboStore::open(Some(&dir))?;
+        let rep = gc_store.run_gc(0, 7 * 86400, true)?;
+        assert_eq!(rep.evicted_actions, 0);
+        assert_eq!(rep.compressed_blobs, 0);
+        assert_eq!(fs::read(store.blob_path(&bh_held))?, compressible);
+        assert!(dir.join("locks/held_act.done").exists());
+        assert!(store.get_cached_action("held_act", "trusted")?.is_some());
+
+        // Step A (superseded blob `pin_level < 0`) also skips while its referencing action's lock
+        // is held, then evicts cleanly once the lease drops.
+        store.conn.execute(
+            "UPDATE blobs SET pin_level = -1 WHERE blob_hash = ?1",
+            params![bh_held],
+        )?;
+        let rep_a_held = gc_store.run_gc(u64::MAX, 7 * 86400, true)?;
+        assert_eq!(rep_a_held.superseded_evicted, 0);
+        assert!(store.blob_path(&bh_held).exists());
+        let lock_ino = lease1.lock_file.metadata()?.ino();
+        drop(lease1);
+
+        let rep_after = gc_store.run_gc(u64::MAX, 7 * 86400, true)?;
+        assert_eq!(rep_after.superseded_evicted, 1);
+        assert!(!store.blob_path(&bh_held).exists());
+        assert!(!dir.join("locks/held_act.done").exists());
+        assert_eq!(
+            fs::metadata(dir.join("locks/held_act.lock"))?.ino(),
+            lock_ino,
+            "lock inode must remain identical across supersession eviction"
+        );
+
+        // 2. Simulate the exact Codex race: Peer A has `open()`ed `race.lock` BEFORE `flock()`,
+        // then GC evicts `race` in the middle, then Peer B calls `acquire_singleflight("race")`,
+        // and Peer A proceeds to `flock(LOCK_EX | LOCK_NB)`. Because `.lock` is never unlinked,
+        // Peer A and Peer B contend on the exact same kernel inode — never split-brain leaders.
+        let race_bytes = b"race-output-bytes";
+        let bh_race = store.store_immutable_blob(race_bytes, "olean", "trusted", 0)?;
+        let race_entry = BlobEntry {
+            blob_hash: bh_race.clone(),
+            kind: "olean".to_string(),
+            size_bytes: race_bytes.len() as u64,
+            rel_path: "Race.olean".to_string(),
+        };
+        let l_race = match store.acquire_singleflight("race_act", tc, "olean", "trusted")? {
+            SingleflightOutcome::Leader(l) => l,
+            _ => panic!("expected leader"),
+        };
+        let race_lock_path = dir.join("locks/race_act.lock");
+        let race_ino = l_race.lock_file.metadata()?.ino();
+        store.publish_action(
+            &l_race,
+            std::slice::from_ref(&race_entry),
+            5,
+            0,
+            0,
+            "trusted",
+        )?;
+        drop(l_race);
+
+        // Peer A opens `race_act.lock` BEFORE GC runs, pausing before `flock`.
+        let preopened_peer_a = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&race_lock_path)?;
+        assert_eq!(preopened_peer_a.metadata()?.ino(), race_ino);
+
+        // GC evicts `race_act` completely.
+        let rep_race = gc_store.run_gc(0, 7 * 86400, true)?;
+        assert_eq!(rep_race.evicted_actions, 1);
+        assert!(!store.blob_path(&bh_race).exists());
+        assert_eq!(fs::metadata(&race_lock_path)?.ino(), race_ino);
+
+        // Peer B acquires `SingleflightOutcome::Leader` after GC eviction.
+        let peer_b_lease = match store.acquire_singleflight("race_act", tc, "olean", "trusted")? {
+            SingleflightOutcome::Leader(l) => l,
+            _ => panic!("expected leader after GC eviction"),
+        };
+        assert_eq!(peer_b_lease.lock_file.metadata()?.ino(), race_ino);
+
+        // Peer A now attempts `flock(LOCK_EX | LOCK_NB)` on its pre-GC fd: MUST fail with EWOULDBLOCK!
+        let rc = unsafe {
+            libc::flock(
+                std::os::unix::io::AsRawFd::as_raw_fd(&preopened_peer_a),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        };
+        assert_ne!(
+            rc, 0,
+            "pre-opened fd must contend on the same lock inode held by post-GC leader"
+        );
+        drop(peer_b_lease);
+        let rc_after = unsafe {
+            libc::flock(
+                std::os::unix::io::AsRawFd::as_raw_fd(&preopened_peer_a),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        };
+        assert_eq!(rc_after, 0);
+        drop(preopened_peer_a);
+
+        // 3. Re-pinning and newly referencing action under lock_blob_referencers:
+        //    - Promoting a superseded (`pin_level = -1`) blob via `batch_publish_theorem_shards`
+        //      raises `pin_level` to `0` (`MAX(blobs.pin_level, excluded.pin_level)`), so Step A
+        //      never evicts it.
+        //    - If a second action references a superseded blob and holds its singleflight lock,
+        //      `lock_blob_referencers` sees the held lock and preserves BOTH actions and the blob.
+        let shared_payload = b"repinned-and-co-referenced-olean".repeat(25);
+        let bh_shared = store.store_immutable_blob(&shared_payload, "olean", "trusted", 0)?;
+        store.conn.execute(
+            "UPDATE blobs SET pin_level = -1 WHERE blob_hash = ?1",
+            params![bh_shared],
+        )?;
+        let e_shared = BlobEntry {
+            blob_hash: bh_shared.clone(),
+            kind: "olean".to_string(),
+            size_bytes: shared_payload.len() as u64,
+            rel_path: "Shared.olean".to_string(),
+        };
+        let l_old = match store.acquire_singleflight("old_ref_act", tc, "olean", "trusted")? {
+            SingleflightOutcome::Leader(l) => l,
+            _ => panic!("expected leader"),
+        };
+        store.publish_action(&l_old, std::slice::from_ref(&e_shared), 5, 0, 0, "trusted")?;
+        drop(l_old);
+        let l_new = match store.acquire_singleflight("new_ref_act", tc, "olean", "trusted")? {
+            SingleflightOutcome::Leader(l) => l,
+            _ => panic!("expected leader"),
+        };
+        store.publish_action(&l_new, std::slice::from_ref(&e_shared), 5, 0, 0, "trusted")?;
+        // Keep `l_new` held: Step A and Step C must skip `bh_shared` and keep `old_ref_act` intact.
+        let rep_co = gc_store.run_gc(u64::MAX, 7 * 86400, true)?;
+        assert_eq!(rep_co.superseded_evicted, 0);
+        assert_eq!(rep_co.compressed_blobs, 0);
+        assert!(store.blob_path(&bh_shared).exists());
+        assert!(store.get_cached_action("old_ref_act", "trusted")?.is_some());
+        assert!(store.get_cached_action("new_ref_act", "trusted")?.is_some());
+        drop(l_new);
+
+        // Re-publishing via `store_immutable_blob(..., pin_level = 0)` clamps `pin_level` from -1 -> 0.
+        store.store_immutable_blob(&shared_payload, "olean", "trusted", 0)?;
+        let pinned_after: i64 = store.conn.query_row(
+            "SELECT pin_level FROM blobs WHERE blob_hash = ?1",
+            params![bh_shared],
+            |r| r.get(0),
+        )?;
+        assert_eq!(pinned_after, 0);
+        let rep_repinned = gc_store.run_gc(u64::MAX, 7 * 86400, true)?;
+        assert_eq!(rep_repinned.superseded_evicted, 0);
+        assert!(store.blob_path(&bh_shared).exists());
+
+        // 4. Duplicate output paths pointing at the same blob within one action must not
+        //    double-count `unlinked_blobs` / `freed_bytes` or under-evict remaining candidates.
+        let dup_dir = dir.join("dup_gc_store");
+        let mut dup_store = TurboStore::open(Some(&dup_dir))?;
+        let dup_bytes = vec![b'd'; 1024];
+        let bh_dup = dup_store.store_immutable_blob(&dup_bytes, "olean", "trusted", 0)?;
+        let dup_entries = vec![
+            BlobEntry {
+                blob_hash: bh_dup.clone(),
+                kind: "olean".to_string(),
+                size_bytes: 1024,
+                rel_path: "DupA.olean".to_string(),
+            },
+            BlobEntry {
+                blob_hash: bh_dup.clone(),
+                kind: "olean".to_string(),
+                size_bytes: 1024,
+                rel_path: "DupB.olean".to_string(),
+            },
+        ];
+        let l_dup = match dup_store.acquire_singleflight("dup_act", tc, "olean", "trusted")? {
+            SingleflightOutcome::Leader(l) => l,
+            _ => panic!("expected leader"),
+        };
+        dup_store.publish_action(&l_dup, &dup_entries, 1, 0, 0, "trusted")?;
+        drop(l_dup);
+        dup_store.conn.execute(
+            "UPDATE actions SET updated_at = 1 WHERE action_key = 'dup_act'",
+            [],
+        )?;
+
+        let tail_bytes = vec![b't'; 1024];
+        let bh_tail = dup_store.store_immutable_blob(&tail_bytes, "olean", "trusted", 0)?;
+        let tail_entry = BlobEntry {
+            blob_hash: bh_tail.clone(),
+            kind: "olean".to_string(),
+            size_bytes: 1024,
+            rel_path: "Tail.olean".to_string(),
+        };
+        let l_tail = match dup_store.acquire_singleflight("tail_act", tc, "olean", "trusted")? {
+            SingleflightOutcome::Leader(l) => l,
+            _ => panic!("expected leader"),
+        };
+        dup_store.publish_action(&l_tail, &[tail_entry], 10_000, 0, 0, "trusted")?;
+        drop(l_tail);
+
+        // Total reclaimable = 2048 bytes (`bh_dup` + `bh_tail`). Quota = 512 bytes requires
+        // evicting BOTH actions; if `dup_act` double-subtracted `bh_dup` (2 * 1024 = 2048),
+        // `current_reclaimable` would drop to 0 early and leave `tail_act` (1024 > 512) behind.
+        let rep_dup = dup_store.run_gc(512, 7 * 86400, true)?;
+        assert_eq!(rep_dup.evicted_actions, 2);
+        assert_eq!(rep_dup.unlinked_blobs, 2);
+        assert_eq!(rep_dup.freed_reclaimable_bytes, 2048);
+        assert!(!dup_store.blob_path(&bh_dup).exists());
+        assert!(!dup_store.blob_path(&bh_tail).exists());
+
+        // 5. Unpublished staging + GC race: while a publisher holds `CasPublicationGuard`
+        //    (between staging blobs and committing `action_outputs`), `run_gc` must skip CAS
+        //    blob eviction/compression instead of unlinking staged blobs as unreferenced orphans,
+        //    AND `publish_action` must fail closed if an output blob is missing/torn on disk.
+        let stage_race_dir = dir.join("stage_race_store");
+        let mut pub_store = TurboStore::open(Some(&stage_race_dir))?;
+        let mut conc_gc = TurboStore::open(Some(&stage_race_dir))?;
+        let evict_seed =
+            pub_store.store_immutable_blob(&vec![b'e'; 1024], "olean", "trusted", 0)?;
+        let l_seed =
+            match pub_store.acquire_singleflight("seed_evict_act", tc, "olean", "trusted")? {
+                SingleflightOutcome::Leader(l) => l,
+                _ => panic!("expected leader"),
+            };
+        pub_store.publish_action(
+            &l_seed,
+            &[BlobEntry {
+                blob_hash: evict_seed.clone(),
+                kind: "olean".to_string(),
+                size_bytes: 1024,
+                rel_path: "Seed.olean".to_string(),
+            }],
+            1,
+            0,
+            0,
+            "trusted",
+        )?;
+        drop(l_seed);
+
+        let staged_bytes = vec![b'p'; 1024];
+        let pub_guard = acquire_cas_publication_guard(&pub_store.root)?;
+        let staged_entries = pub_store.batch_store_immutable_blobs(
+            &[(
+                String::new(),
+                staged_bytes.clone(),
+                "olean".to_string(),
+                "Staged.olean".to_string(),
+                1024u64,
+            )],
+            "trusted",
+            0,
+        )?;
+        let staged_entry = staged_entries[0].clone();
+        let staged_bh = staged_entry.blob_hash.clone();
+        // `staged_bh` is in `blobs` with zero `action_outputs` rows right now; without
+        // `CasPublicationGuard` vs `try_acquire_cas_gc_guard`, `conc_gc.run_gc(0, ...)` would
+        // evict `seed_evict_act` and then sweep `staged_bh` as an unreferenced orphan.
+        // Likewise, active 0-second `.tmp` staging files in `<store>/staging` and shared
+        // `fast_staging_dir()` (`import_*.tlpack.zst`) MUST NOT be unlinked by `run_gc(0, ...)`
+        // while `CasPublicationGuard` is held.
+        let active_store_tmp = pub_store.root.join("staging").join("inflight_publish.tmp");
+        fs::create_dir_all(active_store_tmp.parent().unwrap())?;
+        fs::write(&active_store_tmp, b"in-flight-cas-staging-payload")?;
+        let active_fast_tmp = pub_store.fast_staging_dir().join(format!(
+            "import_test_{}_{}.tlpack.zst",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        fs::write(&active_fast_tmp, b"in-flight-pack-import-zst")?;
+
+        let rep_while_publishing = conc_gc.run_gc(0, 7 * 86400, true)?;
+        assert_eq!(rep_while_publishing.evicted_actions, 0);
+        assert_eq!(rep_while_publishing.unlinked_blobs, 0);
+        assert!(pub_store.blob_path(&staged_bh).exists());
+        assert!(
+            active_store_tmp.exists(),
+            "run_gc(0) must not unlink active <store>/staging/*.tmp while CasPublicationGuard is held"
+        );
+        assert!(
+            active_fast_tmp.exists(),
+            "run_gc(0) must not unlink active fast_staging_dir() temp file while CasPublicationGuard is held"
+        );
+
+        let l_staged =
+            match pub_store.acquire_singleflight("staged_pub_act", tc, "olean", "trusted")? {
+                SingleflightOutcome::Leader(l) => l,
+                _ => panic!("expected leader"),
+            };
+        pub_store.publish_action(
+            &l_staged,
+            std::slice::from_ref(&staged_entry),
+            10,
+            0,
+            0,
+            "trusted",
+        )?;
+        drop(l_staged);
+        drop(pub_guard);
+        assert!(pub_store.blob_path(&staged_bh).exists());
+        assert!(pub_store
+            .get_cached_action("staged_pub_act", "trusted")?
+            .is_some());
+
+        // Once `CasPublicationGuard` is released, `run_gc(0, ...)` acquires `CasExclusiveGcGuard`
+        // and reaps orphaned `<store>/staging/*.tmp` files, while leaving fresh (<30s) files in a
+        // shared `/dev/shm` `fast_staging_dir()` untouched so cross-store processes cannot break each other.
+        let shared_fast_separate = !same_dir_inode(
+            &pub_store.root.join("staging"),
+            &pub_store.fast_staging_dir(),
+        );
+        let rep_after_drop = conc_gc.run_gc(0, 7 * 86400, true)?;
+        assert!(
+            !active_store_tmp.exists(),
+            "run_gc(0) must reap orphaned <store>/staging/*.tmp once CasExclusiveGcGuard is acquired"
+        );
+        assert!(rep_after_drop.cleaned_staging_files >= 1);
+        if shared_fast_separate {
+            assert!(
+                active_fast_tmp.exists(),
+                "run_gc(0) on one store must not reap 0-second files in shared /dev/shm fast_staging_dir"
+            );
+        }
+        let _ = fs::remove_file(&active_fast_tmp);
+
+        // Fail-closed publish check: if a staged blob file is missing on disk before `publish_action`,
+        // `publish_action` must return `Err` and leave no completed action row in SQLite.
+        let missing_bh = blake3::hash(b"missing-on-disk-payload")
+            .to_hex()
+            .to_string();
+        let l_missing =
+            match pub_store.acquire_singleflight("missing_blob_act", tc, "olean", "trusted")? {
+                SingleflightOutcome::Leader(l) => l,
+                _ => panic!("expected leader"),
+            };
+        let missing_res = pub_store.publish_action(
+            &l_missing,
+            &[BlobEntry {
+                blob_hash: missing_bh,
+                kind: "olean".to_string(),
+                size_bytes: 23,
+                rel_path: "Missing.olean".to_string(),
+            }],
+            1,
+            0,
+            0,
+            "trusted",
+        );
+        assert!(missing_res.is_err());
+        drop(l_missing);
+        assert!(pub_store
+            .get_cached_action("missing_blob_act", "trusted")?
+            .is_none());
+
+        // 6. Fail-closed GC on SQLite error: if a reachability query encounters a SQLite error
+        //    (e.g., corrupted/dropped `worktree_leases` table), `run_gc` must return `Err` and
+        //    preserve CAS blob files on disk instead of treating query failure as `unreachable`.
+        let err_gc_dir = dir.join("err_gc_store");
+        let mut err_store = TurboStore::open(Some(&err_gc_dir))?;
+        let live_bytes = vec![b'z'; 1024];
+        let live_bh = err_store.store_immutable_blob(&live_bytes, "olean", "trusted", -1)?;
+        assert!(err_store.blob_path(&live_bh).exists());
+        err_store
+            .conn
+            .execute_batch("DROP TABLE worktree_leases;")?;
+        assert!(err_store.run_gc(0, 7 * 86400, true).is_err());
+        assert!(
+            err_store.blob_path(&live_bh).exists(),
+            "GC must fail closed on SQLite reachability errors without unlinking CAS blobs"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_action_and_shard_cache_hits_verify_blob_digest_and_reject_mismatched_writes(
+    ) -> Result<()> {
+        let (dir, mut store) = tmp_store("digest_gate_and_checked_write")?;
+        let tc = "leanprover/lean4:v4.35.0";
+
+        // 1. `write_blob_atomic` and `ensure_blob_file` reject payloads whose BLAKE3 digest
+        //    does not match `hash`, without leaving a file at `dest`.
+        let valid_payload = b"verified-olean-payload-".repeat(40);
+        let valid_bh = blake3::hash(&valid_payload).to_hex().to_string();
+        let wrong_dest = store.blob_path(&valid_bh);
+        assert!(write_blob_atomic(&dir, &wrong_dest, &valid_bh, b"wrong-bytes", false).is_err());
+        assert!(!wrong_dest.exists());
+        assert!(ensure_blob_file(&dir, &wrong_dest, &valid_bh, b"wrong-bytes", false).is_err());
+        assert!(!wrong_dest.exists());
+
+        // 2. Publish a valid action + `.done` marker and a theorem shard receipt.
+        let bh = store.store_immutable_blob(&valid_payload, "olean", "trusted", 1)?;
+        let blob_path = store.blob_path(&bh);
+        let entry = BlobEntry {
+            blob_hash: bh.clone(),
+            kind: "olean".to_string(),
+            size_bytes: valid_payload.len() as u64,
+            rel_path: "DigestChecked.olean".to_string(),
+        };
+        let lease = match store.acquire_singleflight("act_digest", tc, "olean", "trusted")? {
+            SingleflightOutcome::Leader(l) => l,
+            _ => panic!("expected leader"),
+        };
+        store.publish_action(&lease, std::slice::from_ref(&entry), 3, 0, 0, "trusted")?;
+        store.write_singleflight_done("act_digest", std::slice::from_ref(&entry))?;
+        drop(lease);
+
+        let shard_bytes = b"{\"decl\":\"thm_digest\",\"lean_args_digest\":\"\"}".to_vec();
+        let shard_bh = blake3::hash(&shard_bytes).to_hex().to_string();
+        store.batch_publish_theorem_shards(
+            tc,
+            "trusted",
+            &[(
+                "shard_digest".to_string(),
+                "thm_digest".to_string(),
+                shard_bytes.clone(),
+                2,
+            )],
+        )?;
+        let shard_path = store.blob_path(&shard_bh);
+
+        let all_keys = vec!["act_digest".to_string(), "shard_digest".to_string()];
+        assert_eq!(
+            store
+                .batch_completed_action_keys(&all_keys, "trusted")?
+                .len(),
+            2
+        );
+        assert!(store.has_cached_action_readonly("act_digest", "trusted")?);
+        assert!(store.get_cached_action("act_digest", "trusted")?.is_some());
+        assert_eq!(
+            store
+                .batch_get_theorem_shards(&["shard_digest".to_string()], "trusted")?
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .batch_get_theorem_shards_readonly(&["shard_digest".to_string()], "trusted")?
+                .len(),
+            1
+        );
+
+        // 3. Same-size payload corruption on disk must miss EVERY cache query (`.done` fast path,
+        //    `get_cached_action`, `has_cached_action_readonly`, `batch_completed_action_keys`,
+        //    `batch_get_theorem_shards`, and `batch_get_theorem_shards_readonly`) without bumping `hit_count`.
+        let mut corrupt_olean = valid_payload.clone();
+        corrupt_olean[0] ^= 0xFF;
+        assert_eq!(corrupt_olean.len(), valid_payload.len());
+        fs::remove_file(&blob_path)?;
+        fs::write(&blob_path, &corrupt_olean)?;
+
+        let mut corrupt_shard = shard_bytes.clone();
+        corrupt_shard[0] ^= 0xFF;
+        assert_eq!(corrupt_shard.len(), shard_bytes.len());
+        fs::remove_file(&shard_path)?;
+        fs::write(&shard_path, &corrupt_shard)?;
+
+        let hits_before: i64 = store.conn.query_row(
+            "SELECT hit_count FROM actions WHERE action_key = 'shard_digest'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert!(store.get_cached_action("act_digest", "trusted")?.is_none());
+        assert!(store
+            .get_cached_action_no_hit_bump("act_digest", "trusted")?
+            .is_none());
+        assert!(!store.has_cached_action_readonly("act_digest", "trusted")?);
+        assert!(store
+            .batch_completed_action_keys(&all_keys, "trusted")?
+            .is_empty());
+        assert!(store
+            .batch_get_theorem_shards(&["shard_digest".to_string()], "trusted")?
+            .is_empty());
+        assert!(store
+            .batch_get_theorem_shards_readonly(&["shard_digest".to_string()], "trusted")?
+            .is_empty());
+        let hits_after: i64 = store.conn.query_row(
+            "SELECT hit_count FROM actions WHERE action_key = 'shard_digest'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(
+            hits_after, hits_before,
+            "corrupt shard must not bump hit_count"
+        );
+        match store.acquire_singleflight("act_digest", tc, "olean", "trusted")? {
+            SingleflightOutcome::Leader(l) => drop(l),
+            SingleflightOutcome::CacheHit { .. } => {
+                panic!("corrupt blob behind .done marker must not produce CacheHit")
+            }
+        }
+
+        // 4. Same-uncompressed-length forged `TLZ1` cold blob (valid TLZ1 stream of different bytes
+        //    decompressing to `valid_payload.len()`) must also be rejected as Torn by `probe_blob_digest`
+        //    and repaired by `ensure_blob_file`.
+        let forged_raw = vec![b'X'; valid_payload.len()];
+        let forged_tlz1 = compress_tlz1(&forged_raw);
+        fs::remove_file(&blob_path)?;
+        fs::write(&blob_path, &forged_tlz1)?;
+        assert!(matches!(
+            probe_blob_digest(&blob_path, &bh, valid_payload.len() as u64),
+            BlobDisk::Torn
+        ));
+        assert!(store.get_cached_action("act_digest", "trusted")?.is_none());
+        assert!(store.ensure_blob_uncompressed(&bh).is_err());
+        assert!(
+            !blob_path.exists(),
+            "corrupt TLZ1 blob must be unlinked for self-healing"
+        );
+
+        ensure_blob_file(&dir, &blob_path, &bh, &valid_payload, false)?;
+        ensure_blob_file(&dir, &shard_path, &shard_bh, &shard_bytes, false)?;
+        assert_eq!(
+            store
+                .batch_completed_action_keys(&all_keys, "trusted")?
+                .len(),
+            2
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_cross_device_materialize_and_fd_bound_install_reject_symlinks_and_races() -> Result<()>
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let (dir, mut store) = tmp_store("cross_dev_and_fd_bound_install")?;
+        let tc = "leanprover/lean4:v4.35.0";
+
+        let valid_bytes = b"cross-device-and-fd-bound-olean-payload-".repeat(32);
+        let bh = store.store_immutable_blob(&valid_bytes, "olean", "trusted", 0)?;
+        let cas_path = store.blob_path(&bh);
+        let entry = BlobEntry {
+            blob_hash: bh.clone(),
+            kind: "olean".to_string(),
+            size_bytes: valid_bytes.len() as u64,
+            rel_path: "lib/lean/CrossDev.olean".to_string(),
+        };
+        let lease = match store.acquire_singleflight("act_xdev", tc, "olean", "trusted")? {
+            SingleflightOutcome::Leader(l) => l,
+            _ => panic!("expected leader"),
+        };
+        store.publish_action(&lease, std::slice::from_ref(&entry), 5, 0, 0, "trusted")?;
+        drop(lease);
+
+        // 1. P1 #1: Cross-filesystem (`st_dev` mismatch via `/dev/shm` vs `temp_dir()`) destination
+        //    with the EXACT same byte length and mode `0o444`, but corrupt bytes, MUST NOT be
+        //    accepted by `already_valid_in_place` in `materialize_into_worktree`.
+        let shm_root = PathBuf::from("/dev/shm").join(format!(
+            "turbo_lean_xdev_wt_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&shm_root);
+        let xdev_wt = if fs::create_dir_all(&shm_root).is_ok()
+            && fs::metadata(&shm_root)
+                .ok()
+                .zip(fs::metadata(&dir).ok())
+                .is_some_and(|(m1, m2)| m1.dev() != m2.dev())
+        {
+            shm_root.clone()
+        } else {
+            dir.join("fallback_wt")
+        };
+        let dst_rel = xdev_wt.join(&entry.rel_path);
+        fs::create_dir_all(dst_rel.parent().unwrap())?;
+        let mut corrupt_same_len = valid_bytes.clone();
+        corrupt_same_len[0] ^= 0xAA;
+        fs::write(&dst_rel, &corrupt_same_len)?;
+        let mut p444 = fs::metadata(&dst_rel)?.permissions();
+        p444.set_mode(0o444);
+        fs::set_permissions(&dst_rel, p444)?;
+        if xdev_wt == shm_root {
+            assert_ne!(
+                fs::metadata(&dst_rel)?.dev(),
+                fs::metadata(&cas_path)?.dev(),
+                "expected distinct st_dev between /dev/shm worktree and CAS store"
+            );
+        }
+
+        let n_mat =
+            store.materialize_into_worktree(&xdev_wt, "xdev_proj", std::slice::from_ref(&entry))?;
+        assert_eq!(n_mat, 1);
+        assert_eq!(
+            fs::read(&dst_rel)?,
+            valid_bytes,
+            "materialize_into_worktree must overwrite same-length 0o444 corrupt cross-device destination"
+        );
+        assert_eq!(
+            fs::symlink_metadata(&dst_rel)?.permissions().mode() & 0o222,
+            0
+        );
+
+        // Plant a symlink at the destination pointing at a valid-looking decoy file:
+        // `materialize_into_worktree` must replace the symlink with a regular file without
+        // mutating or trusting the symlink.
+        let decoy = dir.join("decoy_target.olean");
+        fs::write(&decoy, &corrupt_same_len)?;
+        let mut p_decoy = fs::metadata(&decoy)?.permissions();
+        p_decoy.set_mode(0o444);
+        fs::set_permissions(&decoy, p_decoy)?;
+        fs::remove_file(&dst_rel)?;
+        std::os::unix::fs::symlink(&decoy, &dst_rel)?;
+        store.materialize_into_worktree(&xdev_wt, "xdev_proj", std::slice::from_ref(&entry))?;
+        assert!(
+            fs::symlink_metadata(&dst_rel)?.file_type().is_file(),
+            "destination symlink must be replaced by a regular file"
+        );
+        assert_eq!(fs::read(&dst_rel)?, valid_bytes);
+        assert_eq!(fs::read(&decoy)?, corrupt_same_len);
+
+        // 2. P1 #2 (symlink rejection across CAS probes/reads/materialization):
+        //    Replace the CAS entry with a relative symlink pointing to an intact file; all CAS
+        //    digest probes, reads, and worktree materialization must reject the symlinked CAS entry.
+        let real_copy = dir.join("real_cas_copy.bin");
+        fs::write(&real_copy, &valid_bytes)?;
+        let mut p_real = fs::metadata(&real_copy)?.permissions();
+        p_real.set_mode(0o444);
+        fs::set_permissions(&real_copy, p_real)?;
+        fs::remove_file(&cas_path)?;
+        std::os::unix::fs::symlink(&real_copy, &cas_path)?;
+        assert!(matches!(
+            probe_blob_digest(&cas_path, &bh, valid_bytes.len() as u64),
+            BlobDisk::Torn
+        ));
+        assert!(read_cas_blob_verified(&cas_path, &bh, Some(valid_bytes.len() as u64)).is_none());
+        let sym_wt = dir.join("sym_wt");
+        assert!(
+            store
+                .materialize_into_worktree(&sym_wt, "xdev_proj", std::slice::from_ref(&entry))
+                .is_err(),
+            "symlinked CAS entry must never materialize into worktree"
+        );
+        assert!(
+            store.get_cached_action("act_xdev", "trusted")?.is_none(),
+            "symlinked CAS entry must never validate as a cache hit"
+        );
+        // Restore genuine regular CAS entry.
+        fs::remove_file(&cas_path)?;
+        ensure_blob_file(&dir, &cas_path, &bh, &valid_bytes, false)?;
+
+        // 3. P1 #2 (deterministic replacement between outer verification and blob install/publish):
+        //    Use `set_before_blob_install_hook` to swap `cas_path` with a same-length `0o444`
+        //    corrupted file right before `install_verified_blob_to_path` / `publish_verified_durable_blob`
+        //    stages the link. Both must fail closed without publishing corrupt bytes.
+        let race_dst = dir.join("race_wt/lib/lean/CrossDev.olean");
+        let corrupt_for_hook = corrupt_same_len.clone();
+        set_before_blob_install_hook(std::sync::Arc::new(move |src, _dst| {
+            let _ = fs::remove_file(src);
+            if fs::write(src, &corrupt_for_hook).is_ok() {
+                if let Ok(m) = fs::metadata(src) {
+                    let mut p = m.permissions();
+                    p.set_mode(0o444);
+                    let _ = fs::set_permissions(src, p);
+                }
+            }
+        }));
+        let mat_race_res = store.restore_blob_to_path(&bh, &race_dst);
+        clear_before_blob_install_hook();
+        assert!(
+            mat_race_res.is_err(),
+            "same-length replacement right before install must fail closed"
+        );
+        assert!(
+            !race_dst.exists(),
+            "corrupted replacement must never be installed at destination"
+        );
+
+        // Restore genuine CAS entry and test `publish_verified_durable_blob` under the same hook.
+        fs::remove_file(&cas_path)?;
+        ensure_blob_file(&dir, &cas_path, &bh, &valid_bytes, false)?;
+        let pub_dst = dir.join("shared_pub").join(&bh);
+        fs::create_dir_all(pub_dst.parent().unwrap())?;
+        let corrupt_for_pub = corrupt_same_len.clone();
+        set_before_blob_install_hook(std::sync::Arc::new(move |src, _dst| {
+            let _ = fs::remove_file(src);
+            if fs::write(src, &corrupt_for_pub).is_ok() {
+                if let Ok(m) = fs::metadata(src) {
+                    let mut p = m.permissions();
+                    p.set_mode(0o444);
+                    let _ = fs::set_permissions(src, p);
+                }
+            }
+        }));
+        let pub_race_res =
+            publish_verified_durable_blob(&cas_path, &pub_dst, &bh, valid_bytes.len() as u64, &[]);
+        clear_before_blob_install_hook();
+        assert!(
+            pub_race_res.is_err(),
+            "publish_verified_durable_blob must reject same-length replacement before staging"
+        );
+        assert!(!pub_dst.exists());
+
+        // 4. P1 retained-writable-descriptor isolation across verification-to-rename AND after return:
+        //    Hold an already-open writable descriptor on an externally supplied `0o444` source file
+        //    (and even forge `user.*` xattrs or test `ensure_blob_file` reuse), mutate same-length
+        //    bytes BOTH inside `AFTER_BLOB_VERIFY_BEFORE_RENAME_HOOK` (after verification, before
+        //    rename) AND again after successful return. Neither `publish_verified_durable_blob`,
+        //    `install_verified_blob_to_path`, nor `ensure_blob_file` may expose the destination to
+        //    mutations through that retained writable fd.
+        {
+            use std::io::{Seek, Write};
+            let orig_b = b"verified-immutable-payload-0001".to_vec();
+            let mut mutated_b1 = orig_b.clone();
+            mutated_b1[0] ^= 0x55;
+            let mut mutated_b2 = orig_b.clone();
+            mutated_b2[1] ^= 0xAA;
+            let orig_hash = blake3::hash(&orig_b).to_hex().to_string();
+
+            let forge_xattr_and_ro = |f: &File, p: &Path, h: &str| -> Result<()> {
+                #[cfg(target_os = "linux")]
+                unsafe {
+                    use std::os::unix::io::AsRawFd;
+                    const FORGED_XATTR: &[u8] = b"user.turbo_lean.cas_immutable\0";
+                    let _ = libc::fsetxattr(
+                        f.as_raw_fd(),
+                        FORGED_XATTR.as_ptr().cast(),
+                        h.as_bytes().as_ptr().cast(),
+                        h.len(),
+                        0,
+                    );
+                }
+                #[cfg(target_os = "macos")]
+                unsafe {
+                    use std::os::unix::io::AsRawFd;
+                    const FORGED_XATTR: &[u8] = b"user.turbo_lean.cas_immutable\0";
+                    let _ = libc::fsetxattr(
+                        f.as_raw_fd(),
+                        FORGED_XATTR.as_ptr().cast(),
+                        h.as_bytes().as_ptr().cast(),
+                        h.len(),
+                        0,
+                        0,
+                    );
+                }
+                let mut ro = fs::metadata(p)?.permissions();
+                ro.set_mode(0o444);
+                fs::set_permissions(p, ro)?;
+                Ok(())
+            };
+
+            // 4a. `publish_verified_durable_blob`: external `0o444` source carrying forged
+            //     `user.turbo_lean.cas_immutable` xattr + retained writable fd.
+            let ext_src = dir.join("external_shared_src.olean");
+            let retained_fd = std::sync::Arc::new(std::sync::Mutex::new(
+                OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .read(true)
+                    .write(true)
+                    .open(&ext_src)?,
+            ));
+            {
+                let mut f = retained_fd.lock().unwrap();
+                f.write_all(&orig_b)?;
+                forge_xattr_and_ro(&f, &ext_src, &orig_hash)?;
+            }
+
+            let fd_in_hook = std::sync::Arc::clone(&retained_fd);
+            let m1_for_hook = mutated_b1.clone();
+            set_after_blob_verify_before_rename_hook(std::sync::Arc::new(move |_s, _d| {
+                if let Ok(mut f) = fd_in_hook.lock() {
+                    let _ = f.seek(std::io::SeekFrom::Start(0));
+                    let _ = f.write_all(&m1_for_hook);
+                }
+            }));
+            let isolated_cas_dst = dir.join("isolated_cas_dst").join(&orig_hash);
+            fs::create_dir_all(isolated_cas_dst.parent().unwrap())?;
+            let pub_ino = publish_verified_durable_blob(
+                &ext_src,
+                &isolated_cas_dst,
+                &orig_hash,
+                orig_b.len() as u64,
+                &[],
+            )?;
+            clear_after_blob_verify_before_rename_hook();
+            assert_ne!(
+                pub_ino as u64,
+                fs::metadata(&ext_src)?.ino(),
+                "publish_verified_durable_blob must allocate an independent inode even when external 0o444 source carries forged xattr"
+            );
+            assert_eq!(
+                fs::read(&isolated_cas_dst)?,
+                orig_b,
+                "mutation between verification and rename via retained writable fd must not affect published CAS blob"
+            );
+            {
+                let mut f = retained_fd.lock().unwrap();
+                f.seek(std::io::SeekFrom::Start(0))?;
+                f.write_all(&mutated_b2)?;
+            }
+            assert_eq!(
+                fs::read(&isolated_cas_dst)?,
+                orig_b,
+                "mutation after return via retained writable fd must not affect published CAS blob"
+            );
+
+            // 4b. `install_verified_blob_to_path`: external `0o444` source carrying forged
+            //     `user.turbo_lean.cas_immutable` xattr + retained writable fd targeting a
+            //     package/non-mutable destination path.
+            let ext_pkg_src = dir.join("external_pkg_src.olean");
+            let pkg_fd = std::sync::Arc::new(std::sync::Mutex::new(
+                OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .read(true)
+                    .write(true)
+                    .open(&ext_pkg_src)?,
+            ));
+            {
+                let mut f = pkg_fd.lock().unwrap();
+                f.write_all(&orig_b)?;
+                forge_xattr_and_ro(&f, &ext_pkg_src, &orig_hash)?;
+            }
+
+            let pkg_fd_hook = std::sync::Arc::clone(&pkg_fd);
+            let m1_pkg = mutated_b1.clone();
+            set_after_blob_verify_before_rename_hook(std::sync::Arc::new(move |_s, _d| {
+                if let Ok(mut f) = pkg_fd_hook.lock() {
+                    let _ = f.seek(std::io::SeekFrom::Start(0));
+                    let _ = f.write_all(&m1_pkg);
+                }
+            }));
+            let pkg_dst =
+                dir.join("wt_pkg/.lake/packages/dep/.lake/build/lib/lean/Dep/Target.olean");
+            fs::create_dir_all(pkg_dst.parent().unwrap())?;
+            install_verified_blob_to_path(&ext_pkg_src, &pkg_dst, &orig_hash, orig_b.len() as u64)?;
+            clear_after_blob_verify_before_rename_hook();
+            assert_ne!(
+                fs::metadata(&pkg_dst)?.ino(),
+                fs::metadata(&ext_pkg_src)?.ino(),
+                "install_verified_blob_to_path must isolate forged-xattr 0o444 source into a fresh inode"
+            );
+            assert_eq!(fs::read(&pkg_dst)?, orig_b);
+            {
+                let mut f = pkg_fd.lock().unwrap();
+                f.seek(std::io::SeekFrom::Start(0))?;
+                f.write_all(&mutated_b2)?;
+            }
+            assert_eq!(
+                fs::read(&pkg_dst)?,
+                orig_b,
+                "post-install write through retained source fd must leave installed artifact intact"
+            );
+
+            // 4c. `ensure_blob_file`: pre-planted `0o444` destination carrying forged
+            //     `user.turbo_lean.cas_immutable` xattr + retained writable fd must be replaced
+            //     with a fresh store-owned inode rather than reused.
+            let pre_dest = dir.join("blobs").join(&orig_hash[..2]).join(&orig_hash);
+            fs::create_dir_all(pre_dest.parent().unwrap())?;
+            let mut pre_rw = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&pre_dest)?;
+            pre_rw.write_all(&orig_b)?;
+            forge_xattr_and_ro(&pre_rw, &pre_dest, &orig_hash)?;
+            let pre_ino = pre_rw.metadata()?.ino();
+            let (ensured_ino, _) = ensure_blob_file(&dir, &pre_dest, &orig_hash, &orig_b, false)?;
+            assert_ne!(
+                ensured_ino as u64, pre_ino,
+                "ensure_blob_file must replace pre-planted 0o444 forged-xattr destination inode"
+            );
+            pre_rw.seek(std::io::SeekFrom::Start(0))?;
+            pre_rw.write_all(&mutated_b2)?;
+            assert_eq!(
+                fs::read(&pre_dest)?,
+                orig_b,
+                "ensure_blob_file must isolate destination against retained writable fd even with forged xattr + 0o444"
+            );
+
+            // 4d. Sealed-then-failed staging unregistration + inode recycling defense:
+            //     Verify that a live exclusively created inode keeps a pinned O_RDONLY fd in the
+            //     registry (preventing kernel inode recycling while registered), and that failed
+            //     publications in BOTH `stage_and_publish_durable_ext` and `install_blob_to_path_checked`
+            //     explicitly `unseal_cas_inode`, so even if the kernel later recycles `(dev, ino)`
+            //     with matching owner-controlled `(mtime, size, hash)` and a retained writable fd,
+            //     `is_exclusively_created_immutable_cas_inode` returns false and hardlink
+            //     publication, installation, and reuse are all refused.
+            #[cfg(unix)]
+            {
+                let ensured_meta = fs::metadata(&pre_dest)?;
+                assert!(
+                    is_exclusively_created_immutable_cas_inode(&ensured_meta, &orig_hash),
+                    "freshly published store-owned CAS blob must be registered with live pinned fd"
+                );
+                {
+                    let reg = exclusively_created_cas_registry()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let entry = reg
+                        .entries
+                        .get(&(ensured_meta.dev(), ensured_meta.ino()))
+                        .expect("pinned registry entry must exist for published CAS blob");
+                    let pin_m = entry.pinned_ro_fd.metadata()?;
+                    assert_eq!(
+                        (pin_m.dev(), pin_m.ino()),
+                        (ensured_meta.dev(), ensured_meta.ino())
+                    );
+                    #[cfg(target_os = "linux")]
+                    {
+                        use std::os::unix::io::AsRawFd;
+                        let fl =
+                            unsafe { libc::fcntl(entry.pinned_ro_fd.as_raw_fd(), libc::F_GETFL) };
+                        assert_eq!(fl & libc::O_ACCMODE, libc::O_RDONLY);
+                    }
+                }
+
+                // Force `stage_and_publish_durable_ext` to seal the staging inode, capture its
+                // `(dev, ino, mtime, size)`, and then fail publication (`dest` is an existing dir -> EISDIR).
+                let fail_stage_dir = dir.join("fail_stage_unseal");
+                fs::create_dir_all(&fail_stage_dir)?;
+                let blocking_dest_dir = dir.join("blocking_dest_is_dir");
+                fs::create_dir_all(&blocking_dest_dir)?;
+                let mut captured_sealed: Option<fs::Metadata> = None;
+                let stage_fail_res = stage_and_publish_durable_ext(
+                    &fail_stage_dir,
+                    "unseal_probe",
+                    0o444,
+                    Some(&orig_hash),
+                    &blocking_dest_dir,
+                    &[],
+                    |f| f.write_all(&orig_b),
+                    |f, staging_p, dst_p| {
+                        let m = f.metadata()?;
+                        assert!(
+                            is_exclusively_created_immutable_cas_inode(&m, &orig_hash),
+                            "staging inode must be registered right after seal"
+                        );
+                        captured_sealed = Some(m);
+                        fs::rename(staging_p, dst_p)
+                    },
+                );
+                assert!(stage_fail_res.is_err(), "rename onto directory must fail");
+                let old_meta = captured_sealed.expect("publish closure must have run after seal");
+                assert!(
+                    !is_exclusively_created_immutable_cas_inode(&old_meta, &orig_hash),
+                    "failed stage_and_publish_durable_ext must unseal staging inode immediately"
+                );
+                assert!(
+                    !exclusively_created_cas_registry()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .entries
+                        .contains_key(&(old_meta.dev(), old_meta.ino())),
+                    "registry must drop failed staging entry and its pinned fd"
+                );
+
+                // Force `install_verified_blob_to_path` (stage-copy fallback from unstamped `ext_src`)
+                // to seal `tmp_dst` and fail rename onto a directory, verifying `tmp_dst` is also unsealed.
+                let blocking_install_dir =
+                    dir.join("wt_pkg/.lake/packages/dep/.lake/build/lib/lean/Dep/DirDest.olean");
+                fs::create_dir_all(&blocking_install_dir)?;
+                let reg_len_before = exclusively_created_cas_registry()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entries
+                    .len();
+                {
+                    let mut f = retained_fd.lock().unwrap();
+                    f.seek(std::io::SeekFrom::Start(0))?;
+                    f.write_all(&orig_b)?;
+                }
+                assert!(
+                    install_verified_blob_to_path(
+                        &ext_src,
+                        &blocking_install_dir,
+                        &orig_hash,
+                        orig_b.len() as u64
+                    )
+                    .is_err(),
+                    "install onto directory must fail"
+                );
+                let reg_len_after = exclusively_created_cas_registry()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entries
+                    .len();
+                assert_eq!(
+                    reg_len_after, reg_len_before,
+                    "failed install_blob_to_path_checked must unseal its temporary staged inode"
+                );
+
+                // Attempt to recycle `old_meta.ino()` in the same filesystem (`fail_stage_dir`), or
+                // test against the replacement candidate with forged identical `(mtime, size, hash)`
+                // and a retained writable fd.
+                let recycle_dir = dir.join("recycle_probe");
+                fs::create_dir_all(&recycle_dir)?;
+                let mut replacement_path = recycle_dir.join("candidate_0.olean");
+                let mut replacement_rw: Option<File> = None;
+                for idx in 0..256usize {
+                    let cand = recycle_dir.join(format!("candidate_{idx}.olean"));
+                    let mut rf = OpenOptions::new()
+                        .create(true)
+                        .truncate(true)
+                        .read(true)
+                        .write(true)
+                        .open(&cand)?;
+                    if rf.metadata()?.ino() == old_meta.ino() || idx == 255 {
+                        rf.write_all(&orig_b)?;
+                        forge_xattr_and_ro(&rf, &cand, &orig_hash)?;
+                        unsafe {
+                            use std::os::unix::io::AsRawFd;
+                            let ts = [
+                                libc::timespec {
+                                    tv_sec: old_meta.atime(),
+                                    tv_nsec: old_meta.atime_nsec() as _,
+                                },
+                                libc::timespec {
+                                    tv_sec: old_meta.mtime(),
+                                    tv_nsec: old_meta.mtime_nsec() as _,
+                                },
+                            ];
+                            let _ = libc::futimens(rf.as_raw_fd(), ts.as_ptr());
+                        }
+                        replacement_path = cand;
+                        replacement_rw = Some(rf);
+                        break;
+                    }
+                    drop(rf);
+                    let _ = fs::remove_file(&cand);
+                }
+                let mut rep_rw = replacement_rw.unwrap();
+                let rep_meta = fs::metadata(&replacement_path)?;
+                assert_eq!(rep_meta.len(), old_meta.len());
+                assert!(
+                    !is_exclusively_created_immutable_cas_inode(&rep_meta, &orig_hash),
+                    "replacement file (even with recycled ino + matching mtime/size/hash + forged xattr) must be rejected"
+                );
+
+                // Hardlink publication, package installation, and `ensure_blob_file` reuse must all
+                // refuse to share `replacement_path`'s inode, isolating against writes on `rep_rw`.
+                let rec_pub_dst = dir.join("recycled_pub_dst").join(&orig_hash);
+                fs::create_dir_all(rec_pub_dst.parent().unwrap())?;
+                let rec_pub_ino = publish_verified_durable_blob(
+                    &replacement_path,
+                    &rec_pub_dst,
+                    &orig_hash,
+                    orig_b.len() as u64,
+                    &[],
+                )?;
+                assert_ne!(rec_pub_ino as u64, rep_meta.ino());
+
+                let rec_pkg_dst = dir
+                    .join("wt_pkg/.lake/packages/dep/.lake/build/lib/lean/Dep/RecycledPkg.olean");
+                install_verified_blob_to_path(
+                    &replacement_path,
+                    &rec_pkg_dst,
+                    &orig_hash,
+                    orig_b.len() as u64,
+                )?;
+                assert_ne!(fs::metadata(&rec_pkg_dst)?.ino(), rep_meta.ino());
+
+                let rec_reuse_dst = dir.join("recycled_reuse_dst").join(&orig_hash);
+                fs::create_dir_all(rec_reuse_dst.parent().unwrap())?;
+                fs::hard_link(&replacement_path, &rec_reuse_dst)?;
+                let (rec_ensured_ino, _) =
+                    ensure_blob_file(&dir, &rec_reuse_dst, &orig_hash, &orig_b, false)?;
+                assert_ne!(rec_ensured_ino as u64, rep_meta.ino());
+
+                rep_rw.seek(std::io::SeekFrom::Start(0))?;
+                rep_rw.write_all(&mutated_b2)?;
+                assert_eq!(fs::read(&rec_pub_dst)?, orig_b);
+                assert_eq!(fs::read(&rec_pkg_dst)?, orig_b);
+                assert_eq!(fs::read(&rec_reuse_dst)?, orig_b);
+
+                // Verify bounded FIFO eviction drops only oldest entries rather than wiping the map:
+                use std::os::unix::fs::OpenOptionsExt;
+                let cap = exclusively_created_cas_registry_max_entries();
+                let evict_dir = dir.join("evict_cap_probe");
+                fs::create_dir_all(&evict_dir)?;
+                let mut evict_keys = Vec::with_capacity(cap + 4);
+                let mut newest_meta: Option<fs::Metadata> = None;
+                for idx in 0..(cap + 4) {
+                    let p = evict_dir.join(format!("ev_{idx}.bin"));
+                    let mut ef = OpenOptions::new()
+                        .create_new(true)
+                        .read(true)
+                        .write(true)
+                        .mode(0o600)
+                        .open(&p)?;
+                    ef.write_all(&orig_b)?;
+                    let k = seal_exclusively_created_cas_inode(&ef, &p, 0o444, &orig_hash)?;
+                    evict_keys.push(k);
+                    if idx == cap + 3 {
+                        newest_meta = Some(ef.metadata()?);
+                    }
+                }
+                let reg_len = exclusively_created_cas_registry()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entries
+                    .len();
+                assert_eq!(
+                    reg_len, cap,
+                    "registry must evict oldest entries at cap without clearing recent entries"
+                );
+                assert!(
+                    is_exclusively_created_immutable_cas_inode(
+                        newest_meta.as_ref().unwrap(),
+                        &orig_hash
+                    ),
+                    "newest sealed inode must remain registered after bounded eviction"
+                );
+                for (d, i) in evict_keys {
+                    unseal_cas_inode(d, i);
+                }
+            }
+        }
+
+        let _ = fs::remove_dir_all(&shm_root);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_kernel_replayed_oleans_table_and_v2_migration() -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_db_replay_authority_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let cache_dir = tmp_dir.join("cache");
+        fs::create_dir_all(&cache_dir)?;
+
+        // Simulate a v2 DB before `kernel_replayed_oleans` existed.
+        {
+            let conn = Connection::open(cache_dir.join("state.db"))?;
+            conn.execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 CREATE TABLE blobs (blob_hash TEXT PRIMARY KEY, size_bytes INTEGER NOT NULL, ref_count INTEGER NOT NULL DEFAULT 0, pin_level INTEGER NOT NULL DEFAULT 0, last_accessed INTEGER NOT NULL);
+                 PRAGMA user_version = 2;",
+            )?;
+        }
+
+        let store = TurboStore::open(Some(&cache_dir))?;
+        let uv: i64 = store
+            .conn
+            .query_row("PRAGMA user_version;", [], |r| r.get(0))?;
+        assert_eq!(uv, 4);
+        assert!(!store.has_kernel_replayed_olean("dig1", "env1", 2, "tc1", &[]));
+        assert!(store
+            .record_kernel_replayed_olean("", "env1", 2, "tc1", "M", &[])
+            .is_err());
+        assert!(store
+            .record_kernel_replayed_olean("dig1", "", 2, "tc1", "M", &[])
+            .is_err());
+        assert!(store
+            .record_kernel_replayed_olean("dig1", "env1", 0, "tc1", "M", &[])
+            .is_err());
+        assert!(store
+            .record_kernel_replayed_olean("dig1", "env1", 2, "", "M", &[])
+            .is_err());
+
+        store.record_kernel_replayed_olean("dig1", "env1", 2, "tc1", "Dep.Good", &[])?;
+        assert!(store.has_kernel_replayed_olean("dig1", "env1", 2, "tc1", &[]));
+        assert!(!store.has_kernel_replayed_olean("dig2", "env1", 2, "tc1", &[]));
+        assert!(!store.has_kernel_replayed_olean("dig1", "env2", 2, "tc1", &[]));
+        assert!(!store.has_kernel_replayed_olean("dig1", "env1", 1, "tc1", &[]));
+        assert!(!store.has_kernel_replayed_olean("dig1", "env1", 3, "tc1", &[]));
+        assert!(!store.has_kernel_replayed_olean("dig1", "env1", 2, "tc2", &[]));
+
+        // Raw SQLite row insertion into `kernel_replayed_oleans` OR `kernel_replayed_oleans_auth`
+        // without the secret `.verifier_replay_hmac_key` MAC is never accepted.
+        store.conn.execute(
+            "INSERT INTO kernel_replayed_oleans (artifact_digest, replay_version, toolchain_hash, module_name, verified_at)
+             VALUES ('raw_legacy_dig', 2, 'tc1', 'Forged', 1)",
+            [],
+        )?;
+        assert!(!store.has_kernel_replayed_olean("raw_legacy_dig", "env1", 2, "tc1", &[]));
+        store.conn.execute(
+            "INSERT INTO kernel_replayed_oleans_auth (artifact_digest, environment_digest, replay_version, toolchain_hash, module_name, replay_mac, verified_at)
+             VALUES ('raw_forged_dig', 'env1', 2, 'tc1', 'Forged', '0000000000000000000000000000000000000000000000000000000000000000', 1)",
+            [],
+        )?;
+        assert!(!store.has_kernel_replayed_olean("raw_forged_dig", "env1", 2, "tc1", &[]));
+
+        // Checkout-local / disallowed store root is never granted replay authority even with a valid MAC.
+        assert!(!store.has_kernel_replayed_olean(
+            "dig1",
+            "env1",
+            2,
+            "tc1",
+            std::slice::from_ref(&tmp_dir)
+        ));
+
+        let ro = TurboStore::open(Some(&cache_dir))?;
+        assert!(ro.has_kernel_replayed_olean("dig1", "env1", 2, "tc1", &[]));
+
+        // Permissive key mode (`0644`) or missing key invalidates MAC verification and forces replay.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let key_path = cache_dir.join(VERIFIER_REPLAY_HMAC_KEY_FILENAME);
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o644))?;
+            assert!(!ro.has_kernel_replayed_olean("dig1", "env1", 2, "tc1", &[]));
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
+            assert!(ro.has_kernel_replayed_olean("dig1", "env1", 2, "tc1", &[]));
+        }
+
+        drop(ro);
+        drop(store);
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
