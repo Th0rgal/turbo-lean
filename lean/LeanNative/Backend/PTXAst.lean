@@ -1961,13 +1961,13 @@ theorem ptx_sdiv64_min_neg1_traps (stmts : List PTXStmt) (cta : PTXCTAState) (th
 private theorem lookup_setAssoc_same (xs : List (String × PTXRegVal)) (k : String) (v : PTXRegVal) :
     List.lookup k (PTXRegFile.setAssoc xs k v) = some v := by
   induction xs with
-  | nil => simp [PTXRegFile.setAssoc, List.lookup]
+  | nil => simp [PTXRegFile.setAssoc]
   | cons hd tl ih =>
     rcases hd with ⟨k', v'⟩
     by_cases hk : k' == k
     · have heq : k' = k := LawfulBEq.eq_of_beq hk
       subst heq
-      simp [PTXRegFile.setAssoc, List.lookup]
+      simp [PTXRegFile.setAssoc]
     · have hk2 : (k == k') = false := by
         cases h2 : k == k'
         · rfl
@@ -2032,9 +2032,8 @@ theorem ptx_guarded_div_zero_safe (cta : PTXCTAState) (th : PTXThreadState) (va 
   have hUs64 : (PTXType.u64 == PTXType.s64) = false := rfl
   have hUs32 : (PTXType.u64 == PTXType.s32) = false := rfl
   have h1z : (1#64 == 0#64) = false := rfl
-  have h0z : (0#64 == 0#64) = true := rfl
   simp [execNonBarrierInstr, PTXOutcome.bind, evalOperand, evalPTXCmp, maskForType,
-    hGet2, h0z, hPred0, hGet3, hUf32, hUf64, hUs64, hUs32, h1z, hPredAfter, hFinal]
+    hGet2, hPred0, hGet3, hUf32, hUf64, hUs64, hUs32, h1z, hPredAfter, hFinal]
 
 /-- Misaligned global loads (`byteAddr % ty.byteWidth ≠ 0`) trap explicitly with `.misalignedAccess`. -/
 theorem ptx_misaligned_global_load_traps (stmts : List PTXStmt) (cta : PTXCTAState) (th : PTXThreadState)
@@ -2056,9 +2055,8 @@ theorem ptx_const_store_traps (stmts : List PTXStmt) (cta : PTXCTAState) (th : P
 /-- Negative register address displacements render as `[%rd-8]` (never invalid `[%rd+-8]`). -/
 theorem ppPTXAddr_neg_displacement (r : String) :
     ppPTXAddr (.regOffset r (-8)) = "[" ++ r ++ "-8]" := by
-  have hlt : ¬ ((-8 : Int) > 0) := by decide
   have hstr : toString (-8 : Int) = "-8" := rfl
-  simp [ppPTXAddr, hlt, hstr, String.append_assoc]
+  simp [ppPTXAddr, hstr, String.append_assoc]
   rfl
 
 /-- Disjoint byte ranges never trigger a SIMT data race: when `a1 + w1 ≤ a2` or `a2 + w2 ≤ a1`,
@@ -2096,7 +2094,7 @@ theorem recordEpochAccess_overlap_races (tid1 tid2 : Dim3) (sp : StateSpace)
     exact decide_eq_true ⟨Nat.lt_add_of_pos_right h_pos_width, Nat.lt_add_of_pos_right h_pos_width⟩
   have hSp : (sp == sp) = true := by cases sp <;> rfl
   unfold recordEpochAccess findDataRace? findDataRace?.go
-  simp [h_diff_tid, hOv, hSp, Nat.max_self]
+  simp [h_diff_tid, hOv, hSp]
 
 /-- Fuel monotonicity of `runCTA`: once `runCTA f1 stmts cta` reaches any terminal (non-`fuelExhausted`)
     outcome `out`, running with any larger fuel budget `f2 ≥ f1` produces the exact same `out`. -/

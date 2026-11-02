@@ -1550,6 +1550,24 @@ def writeBackRefs (structs : List MSLStructDecl) (caller callee : MSLLocals)
       | none => acc
     | _, _ => acc) caller
 
+/-- Bind helper parameters. Structural on `MSLExprList`; `callEval` evaluates each argument. -/
+def bindParams
+    (callEval : MSLGroupState → Dim3 → MSLLocals → List MSLAccess → String → MSLExprList →
+      MSLOutcome MSLEval)
+    (structs : List MSLStructDecl) (fnName : String)
+    (g : MSLGroupState) (tid : Dim3) :
+    List MSLParamDecl → MSLExprList → MSLLocals → MSLLocals → List MSLAccess →
+      MSLOutcome (MSLLocals × MSLLocals × List MSLAccess)
+  | [], .nil, callerLs, calleeAcc, curLog => .ok (callerLs, calleeAcc, curLog)
+  | p :: prest, .cons e erest, callerLs, calleeAcc, curLog =>
+    match evalExprWithCall callEval g tid callerLs curLog e with
+    | .ok ev =>
+      let paramTy := match p.ty with | .ref .thread inner => inner | other => other
+      let calleeAcc' := bindValue structs calleeAcc p.name paramTy ev.value ev.fields
+      bindParams callEval structs fnName g tid prest erest ev.locals calleeAcc' ev.log
+    | err => propagateErr err
+  | _, _, _, _, _ => .unboundIdentifier fnName
+
 /-- Interpret a function call at bounded nesting depth `depth`. Structural on `depth`. -/
 def makeCallEval (depth : Nat) :
     MSLGroupState → Dim3 → MSLLocals → List MSLAccess → String → MSLExprList →
@@ -1560,20 +1578,7 @@ def makeCallEval (depth : Nat) :
     match g.funcs.find? (fun f => f.name == name) with
     | none => .unboundIdentifier name
     | some fn =>
-      let rec bindParams (ps : List MSLParamDecl) (es : MSLExprList)
-          (callerLs calleeAcc : MSLLocals) (curLog : List MSLAccess) :
-          MSLOutcome (MSLLocals × MSLLocals × List MSLAccess) :=
-        match ps, es with
-        | [], .nil => .ok (callerLs, calleeAcc, curLog)
-        | p :: prest, .cons e erest =>
-          match evalExprWithCall (makeCallEval d) g tid callerLs curLog e with
-          | .ok ev =>
-            let paramTy := match p.ty with | .ref .thread inner => inner | other => other
-            let calleeAcc' := bindValue g.structs calleeAcc p.name paramTy ev.value ev.fields
-            bindParams prest erest ev.locals calleeAcc' ev.log
-          | err => propagateErr err
-        | _, _ => .unboundIdentifier name
-      match bindParams fn.params args ls MSLLocals.empty log with
+      match bindParams (makeCallEval d) g.structs name g tid fn.params args ls MSLLocals.empty log with
       | .ok (callerLs', calleeLocals, logAfterArgs) =>
         let callee : MSLThreadState :=
           { tid, locals := calleeLocals, stmts := fn.body.toList, halted := false }
@@ -2220,11 +2225,11 @@ theorem exec_preserves_constant_buffers (g : MSLGroupState) (th : MSLThreadState
       simp [hI, propagateErr] at h
     case ok ei =>
       cases hR : evalExprWithCall kernelCallEval g th.tid ei.locals ei.log rhsExpr <;>
-        simp [hR, propagateErr] at h
+        simp [hR] at h
       case ok er =>
         cases hW : execIndexWrite { g with epochLog := er.log } th.tid target
             ei.value.toNat er.value er.fields false <;>
-          simp [hW, propagateErr] at h
+          simp [hW] at h
         case ok gMid =>
           rw [← h.2]
           exact execIndexWrite_preserves_constant_buffers
@@ -2245,7 +2250,7 @@ theorem exec_preserves_constant_buffers (g : MSLGroupState) (th : MSLThreadState
       simp [hI, propagateErr] at h
     case ok ei =>
       cases hV : evalExprWithCall kernelCallEval g th.tid ei.locals ei.log valExpr <;>
-        simp [hV, propagateErr] at h
+        simp [hV] at h
       case ok ev =>
         cases hB : g.bindings.lookup target <;> simp [hB] at h
         case some b =>
@@ -2262,7 +2267,7 @@ theorem exec_preserves_constant_buffers (g : MSLGroupState) (th : MSLThreadState
                 cases hW : execIndexWrite { g with epochLog := ev.log } th.tid target
                     ei.value.toNat (maskForType elemTy (maskForType elemTy old + ev.value))
                     [] true <;>
-                  simp [hW, propagateErr] at h
+                  simp [hW] at h
                 case ok gMid =>
                   rw [← h.2]
                   exact execIndexWrite_preserves_constant_buffers
@@ -2277,7 +2282,7 @@ theorem exec_preserves_constant_buffers (g : MSLGroupState) (th : MSLThreadState
                 cases hW : execIndexWrite { g with epochLog := ev.log } th.tid target
                     ei.value.toNat (maskForType elemTy (maskForType elemTy old + ev.value))
                     [] true <;>
-                  simp [hW, propagateErr] at h
+                  simp [hW] at h
                 case ok gMid =>
                   rw [← h.2]
                   exact execIndexWrite_preserves_constant_buffers
@@ -2553,7 +2558,7 @@ private theorem stepSimdgroup_preserves_const (g g' : MSLGroupState) (sgId : Nat
           simp [hCS, propagateErr] at h
         case ok pair1 =>
           cases hAS : stepSimdgroup.applyShuffle g sgId pair1.1 g.epochLog g.threads <;>
-            simp [hAS, propagateErr] at h
+            simp [hAS] at h
           rw [← h]
       case simdSum declTy dst leaderSrc =>
         cases hCS : stepSimdgroup.collectSum g sgId (inferExprType g leader.locals leaderSrc)
@@ -2561,7 +2566,7 @@ private theorem stepSimdgroup_preserves_const (g g' : MSLGroupState) (sgId : Nat
           simp [hCS, propagateErr] at h
         case ok pair1 =>
           cases hAS : stepSimdgroup.applySum g sgId pair1.1 g.epochLog g.threads <;>
-            simp [hAS, propagateErr] at h
+            simp [hAS] at h
           rw [← h]
 
 private theorem stepFirstReady_preserves_const (g : MSLGroupState) :
@@ -2609,14 +2614,14 @@ private theorem stepGroup_preserves_const (g g' : MSLGroupState) (done : Bool)
         | some th =>
           simp [hFind] at hStep
           cases hSimd : stepSimdgroup gMid (simdgroupOf gMid.groupDim th.tid) <;>
-            simp [hSimd, propagateErr] at hStep
+            simp [hSimd] at hStep
           case ok synced =>
             have hEq1 := congrArg MSLGroupState.constantBuffers hStep.2.symm
             have hEq2 := stepSimdgroup_preserves_const gMid synced _ hSimd
             exact (hEq1.trans hEq2).trans hC1
         | none =>
           simp [hFind] at hStep
-          cases hBar : stepGroupBarrier gMid <;> simp [hBar, propagateErr] at hStep
+          cases hBar : stepGroupBarrier gMid <;> simp [hBar] at hStep
           case ok synced =>
             have hEq1 := congrArg MSLGroupState.constantBuffers hStep.2.symm
             unfold stepGroupBarrier at hBar
