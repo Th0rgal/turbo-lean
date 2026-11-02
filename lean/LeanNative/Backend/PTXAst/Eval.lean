@@ -404,52 +404,67 @@ def evalPTXCvt (rm : PTXRoundMode) (dstTy srcTy : PTXType) (v : BitVec 64) : PTX
   | .f32, .f64 =>
     let b32 := f64BitsToF32Bits rz (UInt64.ofNat v.toNat)
     .ok (BitVec.ofNat 64 b32.toNat)
-  | .f32, .u32 | .f32, .b32 =>
-    let u := UInt32.ofNat (v &&& 0xFFFF_FFFF#64).toNat
-    .ok (f32ToBv u.toFloat32)
-  | .f32, .u64 | .f32, .b64 =>
-    let u := UInt64.ofNat v.toNat
-    .ok (f32ToBv u.toFloat32)
-  | .f32, .u16 | .f32, .b16 =>
-    let u := UInt32.ofNat (v &&& 0xFFFF#64).toNat
-    .ok (f32ToBv u.toFloat32)
-  | .f32, .s32 =>
-    let i := Int32.ofBitVec (v.truncate 32)
-    .ok (f32ToBv i.toFloat32)
-  | .f32, .s64 =>
-    let i := Int64.ofBitVec v
-    .ok (f32ToBv i.toFloat32)
-  | .f64, .u32 | .f64, .b32 =>
-    let u := UInt32.ofNat (v &&& 0xFFFF_FFFF#64).toNat
-    .ok (f64ToBv u.toFloat)
-  | .f64, .u64 | .f64, .b64 =>
-    let u := UInt64.ofNat v.toNat
-    .ok (f64ToBv u.toFloat)
-  | .f64, .u16 | .f64, .b16 =>
-    let u := UInt32.ofNat (v &&& 0xFFFF#64).toNat
-    .ok (f64ToBv u.toFloat)
-  | .f64, .s32 =>
-    let i := Int32.ofBitVec (v.truncate 32)
-    .ok (f64ToBv i.toFloat)
-  | .f64, .s64 =>
-    let i := Int64.ofBitVec v
-    .ok (f64ToBv i.toFloat)
-  | .u32, .f32 | .b32, .f32 =>
-    .ok (BitVec.ofNat 64 (bvToF32 v).toUInt32.toNat)
-  | .u64, .f32 | .b64, .f32 =>
-    .ok (bvToF32 v).toUInt64.toBitVec
-  | .s32, .f32 =>
-    .ok ((bvToF32 v).toInt32.toBitVec.zeroExtend 64)
-  | .s64, .f32 =>
-    .ok (bvToF32 v).toInt64.toBitVec
-  | .u32, .f64 | .b32, .f64 =>
-    .ok (BitVec.ofNat 64 (bvToF64 v).toUInt32.toNat)
-  | .u64, .f64 | .b64, .f64 =>
-    .ok (bvToF64 v).toUInt64.toBitVec
-  | .s32, .f64 =>
-    .ok ((bvToF64 v).toInt32.toBitVec.zeroExtend 64)
-  | .s64, .f64 =>
-    .ok (bvToF64 v).toInt64.toBitVec
+  | .f32, .u32 | .f32, .b32 | .f32, .u64 | .f32, .b64 | .f32, .u16 | .f32, .b16
+  | .f32, .s32 | .f32, .s64 | .f64, .u32 | .f64, .b32 | .f64, .u64 | .f64, .b64
+  | .f64, .u16 | .f64, .b16 | .f64, .s32 | .f64, .s64 =>
+    if rm == .rz then
+      .unsupportedFloatOp "cvt.rz int-to-float"
+    else
+      match dstTy, srcTy with
+      | .f32, .u32 | .f32, .b32 =>
+        let u := UInt32.ofNat (v &&& 0xFFFF_FFFF#64).toNat
+        .ok (f32ToBv u.toFloat32)
+      | .f32, .u64 | .f32, .b64 =>
+        let u := UInt64.ofNat v.toNat
+        .ok (f32ToBv u.toFloat32)
+      | .f32, .u16 | .f32, .b16 =>
+        let u := UInt32.ofNat (v &&& 0xFFFF#64).toNat
+        .ok (f32ToBv u.toFloat32)
+      | .f32, .s32 =>
+        let i := Int32.ofBitVec (v.truncate 32)
+        .ok (f32ToBv i.toFloat32)
+      | .f32, .s64 =>
+        let i := Int64.ofBitVec v
+        .ok (f32ToBv i.toFloat32)
+      | .f64, .u32 | .f64, .b32 =>
+        let u := UInt32.ofNat (v &&& 0xFFFF_FFFF#64).toNat
+        .ok (f64ToBv u.toFloat)
+      | .f64, .u64 | .f64, .b64 =>
+        let u := UInt64.ofNat v.toNat
+        .ok (f64ToBv u.toFloat)
+      | .f64, .u16 | .f64, .b16 =>
+        let u := UInt32.ofNat (v &&& 0xFFFF#64).toNat
+        .ok (f64ToBv u.toFloat)
+      | .f64, .s32 =>
+        let i := Int32.ofBitVec (v.truncate 32)
+        .ok (f64ToBv i.toFloat)
+      | .f64, .s64 =>
+        let i := Int64.ofBitVec v
+        .ok (f64ToBv i.toFloat)
+      | _, _ => .unsupportedFloatOp "unsupported float conversion"
+  | .u32, .f32 | .b32, .f32 | .u64, .f32 | .b64, .f32 | .s32, .f32 | .s64, .f32
+  | .u32, .f64 | .b32, .f64 | .u64, .f64 | .b64, .f64 | .s32, .f64 | .s64, .f64 =>
+    if rm == .rn then
+      .unsupportedFloatOp "cvt.rn float-to-int"
+    else
+      match dstTy, srcTy with
+      | .u32, .f32 | .b32, .f32 =>
+        .ok (BitVec.ofNat 64 (bvToF32 v).toUInt32.toNat)
+      | .u64, .f32 | .b64, .f32 =>
+        .ok (bvToF32 v).toUInt64.toBitVec
+      | .s32, .f32 =>
+        .ok ((bvToF32 v).toInt32.toBitVec.zeroExtend 64)
+      | .s64, .f32 =>
+        .ok (bvToF32 v).toInt64.toBitVec
+      | .u32, .f64 | .b32, .f64 =>
+        .ok (BitVec.ofNat 64 (bvToF64 v).toUInt32.toNat)
+      | .u64, .f64 | .b64, .f64 =>
+        .ok (bvToF64 v).toUInt64.toBitVec
+      | .s32, .f64 =>
+        .ok ((bvToF64 v).toInt32.toBitVec.zeroExtend 64)
+      | .s64, .f64 =>
+        .ok (bvToF64 v).toInt64.toBitVec
+      | _, _ => .unsupportedFloatOp "unsupported float conversion"
   | _, .f32 | _, .f64 | .f32, _ | .f64, _ =>
     .unsupportedFloatOp "unsupported float conversion"
   | _, _ =>
@@ -549,9 +564,12 @@ def PTXRegFile.setScalar (rf : PTXRegFile) (name : String) (v : BitVec 64)
         else
           let masked :=
             if declTy.bitWidth == 64 then v
-            else if declTy == .s32 && (v >>> 32) == 0xFFFF_FFFF#64 then v
+            else if (v >>> 32) != 0#64 then v
             else maskForType declTy v
-          .ok (rf.setScalarRaw name masked)
+          if declTy.bitWidth < 64 && (masked >>> 32) != 0#64 then
+            .typeMismatch s!"scalar value written to {name} is not canonical for a 32-bit register"
+          else
+            .ok (rf.setScalarRaw name masked)
   else
     .ok (rf.setScalarRaw name v)
 
@@ -799,7 +817,7 @@ def execNonBarrierInstr (stmts : List PTXStmt) (cta : PTXCTAState) (th : PTXThre
   | .ldParam ty dst paramName =>
     match cta.paramMem.lookupParam? paramName with
     | some v =>
-      let val := if ty == .s32 then signExtend32To64 v else maskForType ty v
+      let val := maskForType ty v
       PTXOutcome.bind (th.regs.setScalar dst val (some ty.bitWidth)) fun rf' =>
         .ok ({ th with pc := nextPc, regs := rf' }, cta.globalMem, cta.sharedMem, cta.epochLog)
     | none => .unboundParam paramName
@@ -810,7 +828,7 @@ def execNonBarrierInstr (stmts : List PTXStmt) (cta : PTXCTAState) (th : PTXThre
         PTXOutcome.bind (recordEpochAccess cta.epochLog th.tid .global byteAddr w false false) fun log' =>
           match cta.globalMem.loadBits byteAddr w with
           | some raw =>
-            let v := if ty == .s32 then signExtend32To64 raw else maskForType ty raw
+            let v := maskForType ty raw
             PTXOutcome.bind (th.regs.setScalar dst v (some ty.bitWidth)) fun rf' =>
               .ok ({ th with pc := nextPc, regs := rf' }, cta.globalMem, cta.sharedMem, log')
           | none => .outOfBoundsLoad .global byteAddr
@@ -821,7 +839,7 @@ def execNonBarrierInstr (stmts : List PTXStmt) (cta : PTXCTAState) (th : PTXThre
         PTXOutcome.bind (recordEpochAccess cta.epochLog th.tid .shared byteAddr w false false) fun log' =>
           match cta.sharedMem.loadBits byteAddr w with
           | some raw =>
-            let v := if ty == .s32 then signExtend32To64 raw else maskForType ty raw
+            let v := maskForType ty raw
             PTXOutcome.bind (th.regs.setScalar dst v (some ty.bitWidth)) fun rf' =>
               .ok ({ th with pc := nextPc, regs := rf' }, cta.globalMem, cta.sharedMem, log')
           | none => .outOfBoundsLoad .shared byteAddr
@@ -831,7 +849,7 @@ def execNonBarrierInstr (stmts : List PTXStmt) (cta : PTXCTAState) (th : PTXThre
       PTXOutcome.bind (checkAligned .const byteAddr w) fun () =>
         match cta.constMem.loadBits byteAddr w with
         | some raw =>
-          let v := if ty == .s32 then signExtend32To64 raw else maskForType ty raw
+          let v := maskForType ty raw
           PTXOutcome.bind (th.regs.setScalar dst v (some ty.bitWidth)) fun rf' =>
             .ok ({ th with pc := nextPc, regs := rf' }, cta.globalMem, cta.sharedMem, cta.epochLog)
         | none => .outOfBoundsLoad .const byteAddr
@@ -841,7 +859,7 @@ def execNonBarrierInstr (stmts : List PTXStmt) (cta : PTXCTAState) (th : PTXThre
       PTXOutcome.bind (checkAligned .local byteAddr w) fun () =>
         match th.localMem.loadBits byteAddr w with
         | some raw =>
-          let v := if ty == .s32 then signExtend32To64 raw else maskForType ty raw
+          let v := maskForType ty raw
           PTXOutcome.bind (th.regs.setScalar dst v (some ty.bitWidth)) fun rf' =>
             .ok ({ th with pc := nextPc, regs := rf' }, cta.globalMem, cta.sharedMem, cta.epochLog)
         | none => .outOfBoundsLoad .local byteAddr
@@ -887,7 +905,7 @@ def execNonBarrierInstr (stmts : List PTXStmt) (cta : PTXCTAState) (th : PTXThre
               match mem.loadBits byteAddr w with
               | none => .outOfBoundsStore sp byteAddr
               | some oldRaw =>
-                let oldVal := if ty == .s32 then signExtend32To64 oldRaw else maskForType ty oldRaw
+                let oldVal := maskForType ty oldRaw
                 let addResOutcome : PTXOutcome (BitVec 64) :=
                   match ty with
                   | .f32 => .ok (f32ToBv (bvToF32 oldRaw + bvToF32 v))
@@ -989,25 +1007,33 @@ def execNonBarrierInstr (stmts : List PTXStmt) (cta : PTXCTAState) (th : PTXThre
         else
           let out := match mode, ty with
             | .wide, .u32 | .wide, .b32 =>
-              (va &&& 0xFFFF_FFFF#64) * (vb &&& 0xFFFF_FFFF#64)
+              .ok ((va &&& 0xFFFF_FFFF#64) * (vb &&& 0xFFFF_FFFF#64))
             | .wide, .s32 =>
-              signExtend32To64 va * signExtend32To64 vb
+              .ok (signExtend32To64 va * signExtend32To64 vb)
+            | .wide, _ =>
+              .typeMismatch "mul.wide requires a 32-bit integer type"
+            | .rn, _ =>
+              .typeMismatch "mul.rn requires a floating-point type"
             | .hi, .u64 | .hi, .b64 =>
               let prod128 : BitVec 128 := (va.zeroExtend 128) * (vb.zeroExtend 128)
-              (prod128 >>> 64).truncate 64
+              .ok ((prod128 >>> 64).truncate 64)
             | .hi, .s64 =>
               let prod128 : BitVec 128 := (va.signExtend 128) * (vb.signExtend 128)
-              (prod128 >>> 64).truncate 64
+              .ok ((prod128 >>> 64).truncate 64)
             | .hi, .u32 | .hi, .b32 =>
               let prod64 : BitVec 64 := (va &&& 0xFFFF_FFFF#64) * (vb &&& 0xFFFF_FFFF#64)
-              (prod64 >>> 32) &&& 0xFFFF_FFFF#64
+              .ok ((prod64 >>> 32) &&& 0xFFFF_FFFF#64)
             | .hi, .s32 =>
               let prod64 : BitVec 64 := signExtend32To64 va * signExtend32To64 vb
-              (prod64 >>> 32) &&& 0xFFFF_FFFF#64
+              .ok ((prod64 >>> 32) &&& 0xFFFF_FFFF#64)
+            | .hi, .u16 | .hi, .b16 =>
+              let prod32 : BitVec 64 := (va &&& 0xFFFF#64) * (vb &&& 0xFFFF#64)
+              .ok ((prod32 >>> 16) &&& 0xFFFF#64)
             | _, _ =>
-              maskForType ty (maskForType ty va * maskForType ty vb)
-          PTXOutcome.bind (th.regs.setScalar dst out (some dstWidth)) fun rf' =>
-            .ok ({ th with pc := nextPc, regs := rf' }, cta.globalMem, cta.sharedMem, cta.epochLog)
+              .ok (maskForType ty (maskForType ty va * maskForType ty vb))
+          PTXOutcome.bind out fun outVal =>
+            PTXOutcome.bind (th.regs.setScalar dst outVal (some dstWidth)) fun rf' =>
+              .ok ({ th with pc := nextPc, regs := rf' }, cta.globalMem, cta.sharedMem, cta.epochLog)
   | .div ty dst a b =>
     PTXOutcome.bind (evalOperand cta th a (some ty.bitWidth)) fun va =>
       PTXOutcome.bind (evalOperand cta th b (some ty.bitWidth)) fun vb =>
@@ -1075,24 +1101,47 @@ def execNonBarrierInstr (stmts : List PTXStmt) (cta : PTXCTAState) (th : PTXThre
             PTXOutcome.bind (th.regs.setScalar dst res (some ty.bitWidth)) fun rf' =>
               .ok ({ th with pc := nextPc, regs := rf' }, cta.globalMem, cta.sharedMem, cta.epochLog)
   | .mad mode ty dst a b c =>
-    let resTy := if mode == .wide && (ty == .u32 || ty == .b32 || ty == .s32) then PTXType.u64 else ty
-    PTXOutcome.bind (evalOperand cta th a (some ty.bitWidth)) fun va =>
-      PTXOutcome.bind (evalOperand cta th b (some ty.bitWidth)) fun vb =>
-        PTXOutcome.bind (evalOperand cta th c (some resTy.bitWidth)) fun vc =>
-          if ty == .f32 then
-            let res := f32ToBv (bvToF32 va * bvToF32 vb + bvToF32 vc)
-            PTXOutcome.bind (th.regs.setScalar dst res (some resTy.bitWidth)) fun rf' =>
-              .ok ({ th with pc := nextPc, regs := rf' }, cta.globalMem, cta.sharedMem, cta.epochLog)
-          else if ty == .f64 then
-            let res := f64ToBv (bvToF64 va * bvToF64 vb + bvToF64 vc)
-            PTXOutcome.bind (th.regs.setScalar dst res (some resTy.bitWidth)) fun rf' =>
-              .ok ({ th with pc := nextPc, regs := rf' }, cta.globalMem, cta.sharedMem, cta.epochLog)
-          else
+    if ty == .f32 || ty == .f64 then
+      if mode != .rn then
+        .unsupportedFloatOp "mad float mode"
+      else
+        PTXOutcome.bind (evalOperand cta th a (some ty.bitWidth)) fun va =>
+          PTXOutcome.bind (evalOperand cta th b (some ty.bitWidth)) fun vb =>
+            PTXOutcome.bind (evalOperand cta th c (some ty.bitWidth)) fun vc =>
+              let res :=
+                if ty == .f32 then f32ToBv (Float32.fma (bvToF32 va) (bvToF32 vb) (bvToF32 vc))
+                else f64ToBv (Float.fma (bvToF64 va) (bvToF64 vb) (bvToF64 vc))
+              PTXOutcome.bind (th.regs.setScalar dst res (some ty.bitWidth)) fun rf' =>
+                .ok ({ th with pc := nextPc, regs := rf' }, cta.globalMem, cta.sharedMem, cta.epochLog)
+    else if mode == .rn then
+      .typeMismatch "mad.rn requires a floating-point type"
+    else if mode == .wide && ty != .u32 && ty != .b32 && ty != .s32 then
+      .typeMismatch "mad.wide requires a 32-bit integer type"
+    else
+      let resTy := if mode == .wide then PTXType.u64 else ty
+      PTXOutcome.bind (evalOperand cta th a (some ty.bitWidth)) fun va =>
+        PTXOutcome.bind (evalOperand cta th b (some ty.bitWidth)) fun vb =>
+          PTXOutcome.bind (evalOperand cta th c (some resTy.bitWidth)) fun vc =>
             let prod := match mode, ty with
               | .wide, .u32 | .wide, .b32 =>
                 (va &&& 0xFFFF_FFFF#64) * (vb &&& 0xFFFF_FFFF#64)
               | .wide, .s32 =>
                 signExtend32To64 va * signExtend32To64 vb
+              | .hi, .u64 | .hi, .b64 =>
+                let prod128 : BitVec 128 := (va.zeroExtend 128) * (vb.zeroExtend 128)
+                (prod128 >>> 64).truncate 64
+              | .hi, .s64 =>
+                let prod128 : BitVec 128 := (va.signExtend 128) * (vb.signExtend 128)
+                (prod128 >>> 64).truncate 64
+              | .hi, .u32 | .hi, .b32 =>
+                let prod64 : BitVec 64 := (va &&& 0xFFFF_FFFF#64) * (vb &&& 0xFFFF_FFFF#64)
+                (prod64 >>> 32) &&& 0xFFFF_FFFF#64
+              | .hi, .s32 =>
+                let prod64 : BitVec 64 := signExtend32To64 va * signExtend32To64 vb
+                (prod64 >>> 32) &&& 0xFFFF_FFFF#64
+              | .hi, .u16 | .hi, .b16 =>
+                let prod32 : BitVec 64 := (va &&& 0xFFFF#64) * (vb &&& 0xFFFF#64)
+                (prod32 >>> 16) &&& 0xFFFF#64
               | _, _ =>
                 maskForType ty (maskForType ty va * maskForType ty vb)
             let res := maskForType resTy (prod + maskForType resTy vc)
@@ -1481,21 +1530,75 @@ def initCTAState (k : PTXKernel) (gridDim blockDim ctaId : Dim3)
     sharedLayout := layout
     epochLog := [] }
 
+/-- Check whether two `.global` memory accesses across distinct CTAs conflict (`W-W` or `R-W`, and
+    not both atomic). -/
+def findCrossCTARace? (prior : List MemAccessLog) (entry : MemAccessLog) : Option Nat :=
+  match prior with
+  | [] => none
+  | p :: rest =>
+    if p.space == .global && entry.space == .global &&
+       (entry.isWrite || p.isWrite) && !(entry.isAtomic && p.isAtomic) &&
+       rangesOverlap entry.addr entry.width p.addr p.width then
+      some (Nat.max entry.addr p.addr)
+    else
+      findCrossCTARace? rest entry
+
+private def checkCrossCTAGlobalLog (prior : List MemAccessLog) :
+    List MemAccessLog → PTXOutcome Unit
+  | [] => .ok ()
+  | entry :: rest =>
+    if entry.space != .global then
+      checkCrossCTAGlobalLog prior rest
+    else
+      match findCrossCTARace? prior entry with
+      | some conflictAddr => .dataRace .global conflictAddr
+      | none => checkCrossCTAGlobalLog prior rest
+
+/-- Execute a CTA with bounded `fuel` steps, returning both the final `PTXCTAState` and the list of
+    all `.global` memory accesses performed across all barrier epochs of this CTA (`bar.sync`
+    synchronizes intra-CTA threads only, never across distinct CTAs). -/
+def runCTAWithGlobalLog (fuel : Nat) (stmts : List PTXStmt) (cta : PTXCTAState)
+    (savedGlobal : List MemAccessLog := []) : PTXOutcome (PTXCTAState × List MemAccessLog) :=
+  match fuel with
+  | 0 =>
+    if cta.threads.all (·.halted) then
+      let curGlobal := cta.epochLog.filter (fun e => e.space == .global)
+      .ok (cta, curGlobal ++ savedGlobal)
+    else
+      .fuelExhausted
+  | f + 1 =>
+    let preGlobal := cta.epochLog.filter (fun e => e.space == .global)
+    PTXOutcome.bind (stepCTA stmts cta) fun (done, cta') =>
+      let saved' :=
+        if !cta.epochLog.isEmpty && cta'.epochLog.isEmpty then
+          preGlobal ++ savedGlobal
+        else
+          savedGlobal
+      if done then
+        let postGlobal := cta'.epochLog.filter (fun e => e.space == .global)
+        .ok (cta', postGlobal ++ saved')
+      else
+        runCTAWithGlobalLog f stmts cta' saved'
+
 private def evalPTXKernelLoop (fuelPerCTA : Nat) (k : PTXKernel) (gridDim blockDim : Dim3)
-    (paramMem : ParamMemory) (constMem : ByteMemory) (gMem : ByteMemory) :
+    (paramMem : ParamMemory) (constMem : ByteMemory) (gMem : ByteMemory)
+    (priorGlobalLog : List MemAccessLog) :
     List Dim3 → PTXOutcome ByteMemory
   | [] => .ok gMem
   | ctaId :: rest =>
     let cta0 := initCTAState k gridDim blockDim ctaId gMem paramMem constMem
-    PTXOutcome.bind (runCTA fuelPerCTA k.body cta0) fun ctaFinal =>
-      evalPTXKernelLoop fuelPerCTA k gridDim blockDim paramMem constMem ctaFinal.globalMem rest
+    PTXOutcome.bind (runCTAWithGlobalLog fuelPerCTA k.body cta0 []) fun (ctaFinal, ctaGlobalLog) =>
+      PTXOutcome.bind (checkCrossCTAGlobalLog priorGlobalLog ctaGlobalLog) fun () =>
+        evalPTXKernelLoop fuelPerCTA k gridDim blockDim paramMem constMem ctaFinal.globalMem
+          (ctaGlobalLog ++ priorGlobalLog) rest
 
 /-- Launch a `PTXKernel` across every CTA in `gridDim` (each with fresh per-CTA `sharedMem` and
-    per-thread `localMem`), threading `globalMem` across CTAs and returning the final `ByteMemory`. -/
+    per-thread `localMem`), threading `globalMem` across CTAs, trapping on unsynchronized cross-CTA
+    `.global` data races, and returning the final `ByteMemory`. -/
 def evalPTXKernel (fuelPerCTA : Nat) (k : PTXKernel) (gridDim blockDim : Dim3)
     (globalMem : ByteMemory) (paramMem : ParamMemory)
     (constMem : ByteMemory := ByteMemory.zeros 0) : PTXOutcome ByteMemory :=
-  evalPTXKernelLoop fuelPerCTA k gridDim blockDim paramMem constMem globalMem gridDim.coords
+  evalPTXKernelLoop fuelPerCTA k gridDim blockDim paramMem constMem globalMem [] gridDim.coords
 
 /-! ## 3. 1:1 Structural Pretty-Printer -/
 

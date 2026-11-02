@@ -473,18 +473,18 @@ theorem ptx_reg_width_mismatch_traps (rf : PTXRegFile)
   rw [h_en, h_decl]
   rfl
 
-/-- `ld.param.s32` sign-extends a negative 32-bit parameter into a 64-bit register. -/
-theorem ptx_ldParam_s32_sign_extends (stmts : List PTXStmt) (cta : PTXCTAState) (th : PTXThreadState)
-    (h_param : cta.paramMem.lookupParam? "p" = some 0xFFFF_FFFF#64)
-    (h_set : th.regs.setScalar "%rd0" (signExtend32To64 0xFFFF_FFFF#64) (some PTXType.s32.bitWidth) =
-      .ok (th.regs.setScalarRaw "%rd0" (signExtend32To64 0xFFFF_FFFF#64))) :
-    execNonBarrierInstr stmts cta th (.ldParam .s32 "%rd0" "p") =
-      .ok ({ th with pc := th.pc + 1, regs := th.regs.setScalarRaw "%rd0" (signExtend32To64 0xFFFF_FFFF#64) },
+/-- `ld.param.s32` masks a 32-bit parameter into canonical 32-bit register form (`maskForType .s32`). -/
+theorem ptx_ldParam_s32_canonical_mask (stmts : List PTXStmt) (cta : PTXCTAState) (th : PTXThreadState)
+    (h_param : cta.paramMem.lookupParam? "p" = some 0xFFFF_FFFF_FFFF_FFFF#64)
+    (h_set : th.regs.setScalar "%r0" (maskForType .s32 0xFFFF_FFFF_FFFF_FFFF#64) (some PTXType.s32.bitWidth) =
+      .ok (th.regs.setScalarRaw "%r0" 0x0000_0000_FFFF_FFFF#64)) :
+    execNonBarrierInstr stmts cta th (.ldParam .s32 "%r0" "p") =
+      .ok ({ th with pc := th.pc + 1, regs := th.regs.setScalarRaw "%r0" 0x0000_0000_FFFF_FFFF#64 },
            cta.globalMem, cta.sharedMem, cta.epochLog) := by
-  have hs : (PTXType.s32 == PTXType.s32) = true := rfl
   dsimp [execNonBarrierInstr, PTXOutcome.bind]
   rw [h_param]
-  simp [hs, h_set]
+  dsimp
+  rw [h_set]
 
 /-- `atom.global.cas.b64` records an atomic epoch access and leaves `sharedMem` unchanged. -/
 theorem atomCas_global_preserves_shared (stmts : List PTXStmt) (cta : PTXCTAState) (th : PTXThreadState)

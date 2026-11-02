@@ -1062,6 +1062,174 @@ theorem msl_rank_promotion_signed_shr_and_uint_cmp_checked :
     mslSignedShrResult = .ok 0xFFFF_FFFC#64 ∧
     mslUintMaskCmpResult = .ok 1#64 := ⟨rfl, rfl, rfl⟩
 
+def ptxReadU32? (res : PTXRes) (elemIdx : Nat) : Option (BitVec 32) :=
+  match res with
+  | .ok mem => (mem.loadBits (elemIdx * 4) 4).map (fun v => v.truncate 32)
+  | _ => none
+
+def ptxCvtRzResult : PTXRes :=
+  evalPTXKernel 8
+    { name := "ptx_cvt_rz_fail"
+    , params := []
+    , regDecls := [ { ty := .u64, prefixName := "%rd", count := 1 }
+                  , { ty := .f32, prefixName := "%f", count := 1 } ]
+    , body :=
+        [ .instr none (.cvt .rz .f32 .u64 "%f0" (.immU64 3#64))
+        , .instr none .ret ] }
+    { x := 1 } { x := 1 }
+    (LeanNative.Backend.PTXAst.ByteMemory.zeros 0) { params := [] }
+
+#guard ptxCvtRzResult == .unsupportedFloatOp "cvt.rz int-to-float"
+
+theorem ptx_cvt_rz_int_to_float_rejected :
+    ptxCvtRzResult = .unsupportedFloatOp "cvt.rz int-to-float" := rfl
+
+def ptxS32Kernel : PTXKernel where
+  name := "ptx_s32_canonical"
+  params := [ { ty := .u64, name := "buf" } ]
+  regDecls := [ { ty := .s32, prefixName := "%r", count := 3 }
+              , { ty := .u32, prefixName := "%ru", count := 1 }
+              , { ty := .u64, prefixName := "%rd", count := 1 }
+              , { ty := .pred, prefixName := "%p", count := 1 } ]
+  body :=
+    [ .instr none (.ldParam .u64 "%rd0" "buf")
+    , .instr none (.ldGlobal .s32 "%r0" (.regOffset "%rd0" 0))
+    , .instr none (.mov .s32 "%r2" (.immS64 (-1)))
+    , .instr none (.setp .eq .s32 "%p0" (.reg "%r0") (.reg "%r2"))
+    , .instr none (.selp .u32 "%ru0" (.immU64 1#64) (.immU64 0#64) "%p0")
+    , .instr none (.add .none .s32 "%r1" (.reg "%r0") (.immU64 2#64))
+    , .instr none (.stGlobal .s32 (.regOffset "%rd0" 4) (.reg "%r1"))
+    , .instr none (.stGlobal .u32 (.regOffset "%rd0" 8) (.reg "%ru0"))
+    , .instr none .ret ]
+
+def ptxS32Result : PTXRes :=
+  evalPTXKernel 24 ptxS32Kernel { x := 1 } { x := 1 }
+    (LeanNative.Backend.PTXAst.ByteMemory.ofU64Words [ 0x0000_0000_FFFF_FFFF#64, 0#64 ])
+    { params := [ ("buf", 0#64) ] }
+
+#guard ptxReadU32? ptxS32Result 1 == some 1#32
+#guard ptxReadU32? ptxS32Result 2 == some 1#32
+
+theorem ptx_s32_canonical_add_checked :
+    ptxReadU32? ptxS32Result 1 = some 1#32 ∧
+    ptxReadU32? ptxS32Result 2 = some 1#32 := ⟨rfl, rfl⟩
+
+def ptxMadHiKernel : PTXKernel where
+  name := "ptx_mad_hi"
+  params := [ { ty := .u64, name := "buf" } ]
+  regDecls := [ { ty := .u32, prefixName := "%r", count := 1 }
+              , { ty := .s32, prefixName := "%rs", count := 1 }
+              , { ty := .u64, prefixName := "%rd", count := 1 } ]
+  body :=
+    [ .instr none (.ldParam .u64 "%rd0" "buf")
+    , .instr none (.mad .hi .u32 "%r0" (.immU64 0x1_0000#64) (.immU64 0x1_0000#64) (.immU64 3#64))
+    , .instr none (.stGlobal .u32 (.regOffset "%rd0" 0) (.reg "%r0"))
+    , .instr none (.mad .hi .s32 "%rs0" (.immU64 0x8000_0000#64) (.immU64 2#64) (.immU64 5#64))
+    , .instr none (.stGlobal .s32 (.regOffset "%rd0" 4) (.reg "%rs0"))
+    , .instr none .ret ]
+
+def ptxMadHiResult : PTXRes :=
+  evalPTXKernel 16 ptxMadHiKernel { x := 1 } { x := 1 }
+    (LeanNative.Backend.PTXAst.ByteMemory.zeros 8)
+    { params := [ ("buf", 0#64) ] }
+
+#guard ptxReadU32? ptxMadHiResult 0 == some 4#32
+#guard ptxReadU32? ptxMadHiResult 1 == some 4#32
+
+theorem ptx_mad_hi_u32_s32_checked :
+    ptxReadU32? ptxMadHiResult 0 = some 4#32 ∧
+    ptxReadU32? ptxMadHiResult 1 = some 4#32 := ⟨rfl, rfl⟩
+
+def ptxMadWideU64Result : PTXRes :=
+  evalPTXKernel 8
+    { name := "ptx_mad_wide_u64"
+    , params := []
+    , regDecls := [ { ty := .u64, prefixName := "%rd", count := 1 } ]
+    , body :=
+        [ .instr none (.mad .wide .u64 "%rd0" (.immU64 2#64) (.immU64 3#64) (.immU64 1#64))
+        , .instr none .ret ] }
+    { x := 1 } { x := 1 }
+    (LeanNative.Backend.PTXAst.ByteMemory.zeros 0) { params := [] }
+
+#guard ptxMadWideU64Result == .typeMismatch "mad.wide requires a 32-bit integer type"
+
+theorem ptx_mad_wide_u64_rejected :
+    ptxMadWideU64Result = .typeMismatch "mad.wide requires a 32-bit integer type" := rfl
+
+def ptxCrossCtaRaceKernel : PTXKernel where
+  name := "ptx_cross_cta_race"
+  params := [ { ty := .u64, name := "buf" } ]
+  regDecls := [ { ty := .u64, prefixName := "%rd", count := 1 } ]
+  body :=
+    [ .instr none (.ldParam .u64 "%rd0" "buf")
+    , .instr none (.barSync 0)
+    , .instr none (.stGlobal .u64 (.regOffset "%rd0" 0) (.immU64 1#64))
+    , .instr none .ret ]
+
+def ptxCrossCtaRaceResult : PTXRes :=
+  evalPTXKernel 32 ptxCrossCtaRaceKernel { x := 2 } { x := 1 }
+    (LeanNative.Backend.PTXAst.ByteMemory.zeros 8)
+    { params := [ ("buf", 0#64) ] }
+
+#guard ptxCrossCtaRaceResult == .dataRace .global 0
+
+theorem ptx_cross_cta_global_race_checked :
+    ptxCrossCtaRaceResult = .dataRace .global 0 := rfl
+
+def ptxCrossCtaAtomKernel : PTXKernel where
+  name := "ptx_cross_cta_atom"
+  params := [ { ty := .u64, name := "buf" } ]
+  regDecls := [ { ty := .u64, prefixName := "%rd", count := 2 } ]
+  body :=
+    [ .instr none (.ldParam .u64 "%rd0" "buf")
+    , .instr none (.barSync 0)
+    , .instr none (.atomAdd .global .u64 "%rd1" (.regOffset "%rd0" 0) (.immU64 1#64))
+    , .instr none .ret ]
+
+def ptxCrossCtaAtomResult : PTXRes :=
+  evalPTXKernel 32 ptxCrossCtaAtomKernel { x := 2 } { x := 1 }
+    (LeanNative.Backend.PTXAst.ByteMemory.zeros 8)
+    { params := [ ("buf", 0#64) ] }
+
+#guard ptxReadWord? ptxCrossCtaAtomResult 0 == some 2#64
+
+theorem ptx_cross_cta_atomic_add_checked :
+    ptxReadWord? ptxCrossCtaAtomResult 0 = some 2#64 := rfl
+
+def mslCrossGroupRaceKernel : MSLKernelDecl where
+  name := "msl_cross_group_race"
+  params := [ { ty := .pointer .device false .ulong, name := "buf", attr := some (.buffer 0) } ]
+  body :=
+    [ .threadgroupBarrier
+    , .indexAssign "buf" (.immU64 0#64) (.immU64 1#64)
+    , .returnStmt ]
+
+def mslCrossGroupRaceResult : MSLRes :=
+  evalMSLKernel 16 mslCrossGroupRaceKernel { x := 2 } { x := 1 }
+    [ (0, LeanNative.Backend.MetalAst.ByteMemory.zeros 8) ] []
+
+#guard mslCrossGroupRaceResult == .dataRace .device 0
+
+theorem msl_cross_group_device_race_checked :
+    mslCrossGroupRaceResult = .dataRace .device 0 := rfl
+
+def mslCrossGroupAtomKernel : MSLKernelDecl where
+  name := "msl_cross_group_atom"
+  params := [ { ty := .pointer .device false .atomicUint, name := "acc", attr := some (.buffer 0) } ]
+  body :=
+    [ .threadgroupBarrier
+    , .atomicFetchAdd none none "acc" (some (.immU64 0#64)) (.immU64 1#64)
+    , .returnStmt ]
+
+def mslCrossGroupAtomResult : MSLRes :=
+  evalMSLKernel 16 mslCrossGroupAtomKernel { x := 2 } { x := 1 }
+    [ (0, LeanNative.Backend.MetalAst.ByteMemory.ofU32Words [ 0#32 ]) ] []
+
+#guard mslReadU32? mslCrossGroupAtomResult 0 0 == some 2#32
+
+theorem msl_cross_group_atomic_add_checked :
+    mslReadU32? mslCrossGroupAtomResult 0 0 = some 2#32 := rfl
+
 /-! ## 15. Structural Pretty-Printer Smoke Checks (`PTXModule` and `MSLModule`) -/
 
 def hasSubstr (haystack needle : String) : Bool :=

@@ -2030,30 +2030,90 @@ def initGroupState (k : MSLKernelDecl) (gridDim groupDim groupId : Dim3)
       halted := false }
   { g0 with threads }
 
-/-- Run `evalMSLKernel` across a list of threadgroup coordinates, threading `deviceBuffers`.
-    Structural on the coordinate list. -/
+/-- True when an `MSLAccess` targets a `device` buffer (as opposed to per-threadgroup shared memory). -/
+def isDeviceAccess (a : MSLAccess) : Bool :=
+  match a.target with
+  | .deviceBuf _ => true
+  | .threadgroupArr _ => false
+
+/-- Check whether a `device` memory access conflicts with any `device` access from a prior
+    threadgroup (`W-W` or `R-W`, and not both atomic). -/
+def findCrossGroupRace? (tgt : MSLMemTarget) (addr width : Nat) (isWrite isAtomic : Bool) :
+    List MSLAccess → Option Nat
+  | [] => none
+  | a :: rest =>
+    if (tgt == a.target) && (isWrite || a.isWrite) && !(isAtomic && a.isAtomic) &&
+        rangesOverlap addr width a.addr a.width then
+      some (Nat.max addr a.addr)
+    else
+      findCrossGroupRace? tgt addr width isWrite isAtomic rest
+
+def checkCrossGroupDeviceLog (prior : List MSLAccess) : List MSLAccess → MSLOutcome Unit
+  | [] => .ok ()
+  | a :: rest =>
+    if !isDeviceAccess a then
+      checkCrossGroupDeviceLog prior rest
+    else
+      match findCrossGroupRace? a.target a.addr a.width a.isWrite a.isAtomic prior with
+      | some conflictAddr => .dataRace .device conflictAddr
+      | none => checkCrossGroupDeviceLog prior rest
+
+/-- Multi-step SIMT threadgroup evaluator collecting all `device` memory accesses across all
+    intra-group barrier epochs (`threadgroup_barrier` synchronizes within a single threadgroup
+    only, never across distinct threadgroups). -/
+def runGroupWithDeviceLog (fuel : Nat) (g : MSLGroupState)
+    (savedDevice : List MSLAccess := []) : MSLOutcome (MSLGroupState × List MSLAccess) :=
+  match fuel with
+  | 0 =>
+    if g.threads.all (·.halted) then
+      .ok (g, g.epochLog.filter isDeviceAccess ++ savedDevice)
+    else
+      .fuelExhausted
+  | f + 1 =>
+    let preDevice := g.epochLog.filter isDeviceAccess
+    match stepGroup g with
+    | .ok (true, g') =>
+      let saved' :=
+        if !g.epochLog.isEmpty && g'.epochLog.isEmpty then preDevice ++ savedDevice
+        else savedDevice
+      .ok (g', g'.epochLog.filter isDeviceAccess ++ saved')
+    | .ok (false, g') =>
+      let saved' :=
+        if !g.epochLog.isEmpty && g'.epochLog.isEmpty then preDevice ++ savedDevice
+        else savedDevice
+      runGroupWithDeviceLog f g' saved'
+    | err => propagateErr err
+
+/-- Run `evalMSLKernel` across a list of threadgroup coordinates, threading `deviceBuffers` and
+    detecting unsynchronized cross-threadgroup `device` data races. Structural on the coordinate list. -/
 def evalMSLKernelLoop (fuelPerGroup : Nat) (k : MSLKernelDecl) (gridDim groupDim : Dim3)
     (constantBuffers : List (Nat × ByteMemory))
     (funcs : List MSLFuncDecl) (structs : List MSLStructDecl)
-    (devBufs : List (Nat × ByteMemory)) :
+    (devBufs : List (Nat × ByteMemory))
+    (priorDeviceLog : List MSLAccess) :
     List Dim3 → MSLOutcome (List (Nat × ByteMemory))
   | [] => .ok devBufs
   | gid :: rest =>
     let g0 := initGroupState k gridDim groupDim gid devBufs constantBuffers funcs structs fuelPerGroup
-    match runGroup fuelPerGroup g0 with
-    | .ok gFinal => evalMSLKernelLoop fuelPerGroup k gridDim groupDim constantBuffers funcs structs
-        gFinal.deviceBuffers rest
+    match runGroupWithDeviceLog fuelPerGroup g0 [] with
+    | .ok (gFinal, groupDevLog) =>
+      match checkCrossGroupDeviceLog priorDeviceLog groupDevLog with
+      | .ok () =>
+        evalMSLKernelLoop fuelPerGroup k gridDim groupDim constantBuffers funcs structs
+          gFinal.deviceBuffers (groupDevLog ++ priorDeviceLog) rest
+      | err => propagateErr err
     | err => propagateErr err
 
 /-- Launch an `MSLKernelDecl` across every threadgroup in `gridDim` (each with fresh zeroed
     `threadgroup` shared arrays and immutable `constantBuffers`), threading `deviceBuffers`
-    across threadgroups and returning the final `device` buffer table. -/
+    across threadgroups, trapping on unsynchronized cross-threadgroup `device` data races, and
+    returning the final `device` buffer table. -/
 def evalMSLKernel (fuelPerGroup : Nat) (k : MSLKernelDecl) (gridDim groupDim : Dim3)
     (deviceBuffers constantBuffers : List (Nat × ByteMemory))
     (funcs : List MSLFuncDecl := []) (structs : List MSLStructDecl := []) :
     MSLOutcome (List (Nat × ByteMemory)) :=
   evalMSLKernelLoop fuelPerGroup k gridDim groupDim constantBuffers funcs structs
-    deviceBuffers gridDim.coords
+    deviceBuffers [] gridDim.coords
 
 /-! ## 2. 1:1 Structural Pretty-Printer (`MSLModule -> String`) -/
 
