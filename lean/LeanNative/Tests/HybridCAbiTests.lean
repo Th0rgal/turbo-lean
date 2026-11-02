@@ -239,8 +239,16 @@ def diverseCAbiModule : LNIRModule := {
 #guard (moduleToCAbiSigs sampleHybridModule).all (fun s => s.toC99FnSig.isSome)
 #guard (moduleToCAbiSigs diverseCAbiModule).all (fun s => s.toC99FnSig.isSome)
 #guard ((emitCAbiHeader diverseCAbiModule .x86_64).splitOn "sizeof(lean_native_flat_slice_t) == 24").length > 1
+#guard ((emitCAbiHeader diverseCAbiModule .x86_64).splitOn
+  "#error \"Mismatched or unsupported C-ABI target: pinned to LP64 (64-bit)\"").length > 1
+#guard ((emitCAbiHeader diverseCAbiModule .x86_64).splitOn "UINTPTR_MAX").length == 1
 #guard ((emitCAbiHeader diverseCAbiModule .wasm32).splitOn "sizeof(lean_native_flat_slice_t) == 12").length > 1
 #guard ((emitCAbiHeader diverseCAbiModule .wasm32).splitOn "#if defined(__wasm32__)").length > 1
+#guard ((emitCAbiHeader diverseCAbiModule .wasm32).splitOn
+  "#error \"Mismatched or unsupported C-ABI target: pinned to wasm32 (32-bit)\"").length > 1
+#guard ((emitCAbiHeaderFromSigs (moduleToCAbiSigs diverseCAbiModule)).splitOn
+  "#error \"Unsupported ABI data model: LeanNative C-ABI requires LP64 or wasm32\"").length > 1
+#guard ((emitCAbiHeaderFromSigs (moduleToCAbiSigs diverseCAbiModule)).splitOn "UINTPTR_MAX").length == 1
 
 #guard execValidatedSliceHostCall stridedByteView id == some backingBytes
 #guard execValidatedSliceHostCall stridedByteView
@@ -257,15 +265,15 @@ def bundleStructsForClang : List (String × List C99FieldSpec) :=
 def stripPragmaOnce (src : String) : String :=
   String.intercalate "\n" ((src.splitOn "\n").filter (fun ln => ln.trimAscii.toString != "#pragma once"))
 
-def runClangC11ConformanceSuite : IO Unit := do
+def runClangC11ConformanceSuite : IO Bool := do
   let some (hdr64, shim64) := emitValidatedC99Bundle bundleStructsForClang sampleFnSigs .bits64
     | throw <| IO.userError "emitValidatedC99Bundle .bits64 returned none"
   let some (hdr32, shim32) := emitValidatedC99Bundle bundleStructsForClang sampleFnSigs .bits32
     | throw <| IO.userError "emitValidatedC99Bundle .bits32 returned none"
   let modHdr64 := stripPragmaOnce (emitCAbiHeader diverseCAbiModule .x86_64)
   let modHdr32 := stripPragmaOnce (emitCAbiHeader diverseCAbiModule .wasm32)
-  let dualHdr := stripPragmaOnce (emitCAbiHeaderFromSigs (moduleToCAbiSigs diverseCAbiModule))
-  let checks : List (String × String × TargetArch) := [
+  let dualHdr := stripPragmaOnce (emitCAbiHeaderFromSigs (moduleToCAbiSigs diverseCAbiModule) (width? := none))
+  let posChecks : List (String × String × TargetArch) := [
     ("bundle-hdr-64", stripPragmaOnce hdr64, .x86_64),
     ("bundle-shim-64", shim64, .x86_64),
     ("bundle-combined-64", stripPragmaOnce hdr64 ++ "\n" ++ shim64, .x86_64),
@@ -277,11 +285,41 @@ def runClangC11ConformanceSuite : IO Unit := do
     ("emitCAbiHeaderFromSigs-dual-x86_64", dualHdr, .x86_64),
     ("emitCAbiHeaderFromSigs-dual-wasm32", dualHdr, .wasm32)
   ]
-  for (label, src, arch) in checks do
+  for (label, src, arch) in posChecks do
     let (ok, err) ← c11SyntaxCheck src arch
     if !ok then
       throw <| IO.userError s!"clang C11 syntax/layout check failed for {label} ({arch.triple}): {err}"
+  let negChecks : List (String × String × TargetArch × Array String × String) := [
+    ("neg-emitCAbiHeader-bits64-on-wasm32", modHdr64, .wasm32, #[],
+      "pinned to LP64 (64-bit)"),
+    ("neg-bundle-hdr-bits64-on-wasm32", stripPragmaOnce hdr64, .wasm32, #[],
+      "pinned to LP64 (64-bit)"),
+    ("neg-bundle-shim-bits64-on-wasm32", shim64, .wasm32, #[],
+      "pinned to LP64 (64-bit)"),
+    ("neg-emitCAbiHeader-bits32-on-x86_64", modHdr32, .x86_64, #[],
+      "pinned to wasm32 (32-bit)"),
+    ("neg-bundle-hdr-bits32-on-x86_64", stripPragmaOnce hdr32, .x86_64, #[],
+      "pinned to wasm32 (32-bit)"),
+    ("neg-bundle-shim-bits32-on-x86_64", shim32, .x86_64, #[],
+      "pinned to wasm32 (32-bit)"),
+    ("neg-dual-on-i386-ilp32", dualHdr, .x86_64,
+      #["--target=i386-unknown-linux-gnu", "-ffreestanding"],
+      "Unsupported ABI data model: LeanNative C-ABI requires LP64 or wasm32"),
+    ("neg-dual-on-win64-llp64", dualHdr, .x86_64,
+      #["--target=x86_64-pc-windows-msvc", "-ffreestanding"],
+      "Unsupported ABI data model: LeanNative C-ABI requires LP64 or wasm32")
+  ]
+  for (label, src, arch, extraFlags, expectedErr) in negChecks do
+    let (ok, err) ← c11SyntaxCheck src arch extraFlags
+    if ok then
+      throw <| IO.userError s!"clang C11 negative cross-width check unexpectedly succeeded for {label}"
+    if (err.splitOn expectedErr).length <= 1 then
+      throw <| IO.userError
+        s!"clang C11 negative check {label} failed without expected diagnostic '{expectedErr}': {err}"
+  return true
 
-#eval runClangC11ConformanceSuite
+#eval do
+  let ok ← runClangC11ConformanceSuite
+  if !ok then throw <| IO.userError "runClangC11ConformanceSuite returned false"
 
 end LeanNative.Tests.HybridCAbiTests

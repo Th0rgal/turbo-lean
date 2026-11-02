@@ -303,7 +303,7 @@ def emitInlineC99Typedef (layout : C99StructLayout) : String :=
   s!"typedef struct \{ {fields} } {layout.name};"
 
 /-- Render C11 `_Static_assert`s verifying `sizeof`, `_Alignof`, and `offsetof`
-    for computed slice layouts across LP64 and `wasm32`. -/
+    for computed slice layouts across LP64 and `wasm32`, failing closed on unsupported data models. -/
 def emitSliceStaticAsserts (flat64 mut64 flat32 mut32 : C99StructLayout) : List String :=
   let mkChecks (layout : C99StructLayout) : List String :=
     [ s!"_Static_assert(sizeof({layout.name}) == {layout.structSize}, \"{layout.name} size\");",
@@ -313,19 +313,25 @@ def emitSliceStaticAsserts (flat64 mut64 flat32 mut32 : C99StructLayout) : List 
   [ "#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L",
     "#if defined(__wasm32__)" ] ++
   mkChecks flat32 ++ mkChecks mut32 ++
-  [ "#elif defined(__LP64__) || defined(_LP64) || (defined(UINTPTR_MAX) && UINTPTR_MAX == 0xFFFFFFFFFFFFFFFFULL)" ] ++
+  [ "#elif defined(__LP64__) || defined(_LP64)" ] ++
   mkChecks flat64 ++ mkChecks mut64 ++
-  [ "#endif",
+  [ "#else",
+    "#error \"Unsupported ABI data model: LeanNative C-ABI requires LP64 or wasm32\"",
+    "#endif",
     "#endif" ]
 
-/-- Render target-specific C11 `_Static_assert`s when an explicit `ArchWidth` is pinned. -/
+/-- Render target-specific C11 `_Static_assert`s when an explicit `ArchWidth` is pinned,
+    failing closed via `#error` on target/data-model mismatch. -/
 def emitPinnedSliceStaticAsserts (flatLayout mutLayout : C99StructLayout)
     (width : ArchWidth := .bits64) : List String :=
-  let archGuard :=
+  let (archGuard, errLine) :=
     match width with
-    | .bits32 => "#if defined(__wasm32__)"
+    | .bits32 =>
+      ("#if defined(__wasm32__)",
+       "#error \"Mismatched or unsupported C-ABI target: pinned to wasm32 (32-bit)\"")
     | .bits64 =>
-      "#if defined(__LP64__) || defined(_LP64) || (defined(UINTPTR_MAX) && UINTPTR_MAX == 0xFFFFFFFFFFFFFFFFULL)"
+      ("#if defined(__LP64__) || defined(_LP64)",
+       "#error \"Mismatched or unsupported C-ABI target: pinned to LP64 (64-bit)\"")
   let mkChecks (layout : C99StructLayout) : List String :=
     [ s!"_Static_assert(sizeof({layout.name}) == {layout.structSize}, \"{layout.name} size\");",
       s!"_Static_assert(_Alignof({layout.name}) == {layout.structAlign}, \"{layout.name} align\");" ] ++
@@ -334,7 +340,9 @@ def emitPinnedSliceStaticAsserts (flatLayout mutLayout : C99StructLayout)
   [ "#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L",
     archGuard ] ++
   mkChecks flatLayout ++ mkChecks mutLayout ++
-  [ "#endif",
+  [ "#else",
+    errLine,
+    "#endif",
     "#endif" ]
 
 private def lnirTypeToRustType : LNIRType → String
@@ -945,7 +953,8 @@ def execValidatedSliceHostCall (v : C99ByteView) (kernel : ByteArray → ByteArr
   else none
 
 /-- Header fragment for one computed struct, including explicit offsets and C11 `_Static_assert`s
-    for `sizeof`, `_Alignof`, and per-field `offsetof` when `width?` is specified. -/
+    for `sizeof`, `_Alignof`, and per-field `offsetof` when `width?` is specified,
+    failing closed via `#error` on target/data-model mismatch. -/
 def emitC99StructLayoutDecl (layout : C99StructLayout)
     (width? : Option ArchWidth := some .bits64) : String :=
   let fields := layout.fields.map fun f =>
@@ -954,11 +963,14 @@ def emitC99StructLayoutDecl (layout : C99StructLayout)
     match width? with
     | none => []
     | some width =>
-      let archGuard :=
+      let (archGuard, errLine) :=
         match width with
-        | .bits32 => "#if defined(__wasm32__)"
+        | .bits32 =>
+          ("#if defined(__wasm32__)",
+           "#error \"Mismatched or unsupported C-ABI target: pinned to wasm32 (32-bit)\"")
         | .bits64 =>
-          "#if defined(__LP64__) || defined(_LP64) || (defined(UINTPTR_MAX) && UINTPTR_MAX == 0xFFFFFFFFFFFFFFFFULL)"
+          ("#if defined(__LP64__) || defined(_LP64)",
+           "#error \"Mismatched or unsupported C-ABI target: pinned to LP64 (64-bit)\"")
       let fieldAsserts := layout.fields.map fun f =>
         s!"_Static_assert(offsetof({layout.name}, {f.name}) == {f.offset}, \"{layout.name}.{f.name} offset\");"
       [ "#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L",
@@ -966,7 +978,9 @@ def emitC99StructLayoutDecl (layout : C99StructLayout)
         s!"_Static_assert(sizeof({layout.name}) == {layout.structSize}, \"{layout.name} size\");",
         s!"_Static_assert(_Alignof({layout.name}) == {layout.structAlign}, \"{layout.name} align\");" ] ++
       fieldAsserts ++
-      [ "#endif",
+      [ "#else",
+        errLine,
+        "#endif",
         "#endif" ]
   String.intercalate "\n" ([
     s!"typedef struct {layout.name} \{"] ++ fields ++ [
@@ -1038,9 +1052,10 @@ def emitValidatedC99Bundle (structs : List (String × List C99FieldSpec)) (fns :
   let shim := String.intercalate "\n\n" shimParts ++ "\n"
   some (hdr, shim)
 
-/-- Syntax-check emitted C11 text with `clang -std=c11 -fsyntax-only`.
+/-- Syntax-check emitted C11 text with `clang -std=c11 -fsyntax-only` and optional `extraFlags`.
     `arch` selects the LP64 host target or `wasm32`. -/
-def c11SyntaxCheck (src : String) (arch : TargetArch := .x86_64) : IO (Bool × String) := do
+def c11SyntaxCheck (src : String) (arch : TargetArch := .x86_64)
+    (extraFlags : Array String := #[]) : IO (Bool × String) := do
   let nonce ← IO.monoNanosNow
   let path := s!"/tmp/lean_native_cabi_{nonce}.c"
   IO.FS.writeFile path src
@@ -1057,9 +1072,10 @@ def c11SyntaxCheck (src : String) (arch : TargetArch := .x86_64) : IO (Bool × S
       else if ← brewClang.pathExists then pure (brewClang.toString, #[])
       else pure ("clang", extraIncArgs)
     let targetArgs : Array String :=
-      match arch with
-      | .wasm32 => #["--target=wasm32", "-ffreestanding"]
-      | _ => #[]
+      if !extraFlags.isEmpty then extraFlags
+      else match arch with
+        | .wasm32 => #["--target=wasm32-unknown-unknown", "-ffreestanding"]
+        | _ => #[]
     let out ← IO.Process.output {
       cmd := clangCmd
       args := targetArgs ++ incArgs ++ #["-std=c11", "-fsyntax-only", path]

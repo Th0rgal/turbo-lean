@@ -155,6 +155,32 @@ theorem computeC99StructLayout_field_align_dvd (name : String) (specs : List C99
   rcases (hall f hf).1 with ⟨ha, hmod⟩
   exact ⟨ha, Nat.dvd_of_mod_eq_zero hmod⟩
 
+/-- Dual-width C11 preprocessor guards (`emitSliceStaticAsserts`) strictly check `__wasm32__` and
+    `__LP64__` / `_LP64` (without `UINTPTR_MAX` LLP64 fallback) and fail closed via `#error` on `#else`. -/
+theorem emitSliceStaticAsserts_fail_closed (flat64 mut64 flat32 mut32 : C99StructLayout) :
+    "#elif defined(__LP64__) || defined(_LP64)" ∈ emitSliceStaticAsserts flat64 mut64 flat32 mut32 ∧
+    "#else" ∈ emitSliceStaticAsserts flat64 mut64 flat32 mut32 ∧
+    "#error \"Unsupported ABI data model: LeanNative C-ABI requires LP64 or wasm32\"" ∈
+      emitSliceStaticAsserts flat64 mut64 flat32 mut32 := by
+  unfold emitSliceStaticAsserts
+  refine ⟨by simp, by simp, by simp⟩
+
+/-- Pinned-width C11 preprocessor guards (`emitPinnedSliceStaticAsserts`) emit the exact target guard
+    (`__wasm32__` vs `__LP64__ || _LP64`) and fail closed via `#error` on `#else`. -/
+theorem emitPinnedSliceStaticAsserts_fail_closed (flatLayout mutLayout : C99StructLayout)
+    (width : ArchWidth) :
+    "#else" ∈ emitPinnedSliceStaticAsserts flatLayout mutLayout width ∧
+    (match width with
+     | .bits32 =>
+       "#if defined(__wasm32__)" ∈ emitPinnedSliceStaticAsserts flatLayout mutLayout width ∧
+       "#error \"Mismatched or unsupported C-ABI target: pinned to wasm32 (32-bit)\"" ∈
+         emitPinnedSliceStaticAsserts flatLayout mutLayout width
+     | .bits64 =>
+       "#if defined(__LP64__) || defined(_LP64)" ∈ emitPinnedSliceStaticAsserts flatLayout mutLayout width ∧
+       "#error \"Mismatched or unsupported C-ABI target: pinned to LP64 (64-bit)\"" ∈
+         emitPinnedSliceStaticAsserts flatLayout mutLayout width) := by
+  cases width <;> unfold emitPinnedSliceStaticAsserts <;> exact ⟨by simp, by simp, by simp⟩
+
 /-!
 # Theorem Group 2: Overflow-free strided span & C99 byte/float slice marshaling roundtrip
 -/

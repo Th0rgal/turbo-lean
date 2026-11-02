@@ -183,6 +183,8 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.HybridCAbi.c99OccupiedEnd_ge
   , ``LeanNative.Proofs.HybridCAbi.computeC99StructLayout_sound
   , ``LeanNative.Proofs.HybridCAbi.computeC99StructLayout_field_align_dvd
+  , ``LeanNative.Proofs.HybridCAbi.emitSliceStaticAsserts_fail_closed
+  , ``LeanNative.Proofs.HybridCAbi.emitPinnedSliceStaticAsserts_fail_closed
   , ``LeanNative.Proofs.HybridCAbi.archWidth_addrLimit_pos
   , ``LeanNative.Proofs.HybridCAbi.checkedByteLen_no_overflow
   , ``LeanNative.Proofs.HybridCAbi.checkedStridedSpan_no_overflow
