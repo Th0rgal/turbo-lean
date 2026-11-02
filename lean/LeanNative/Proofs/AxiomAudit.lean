@@ -151,6 +151,7 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Spec.backend_choice_gate_sound, ``LeanNative.Spec.backend_choice_rejects_misaligned_or_small_metal
   , ``LeanNative.Spec.low_twiddle_zmm_ntt_gate_sound, ``LeanNative.Spec.nonzero_tw_hi_rejects_low_twiddle_3clmul
   , ``LeanNative.Spec.trineon_fold_four_gate_sound, ``LeanNative.Spec.gpr_fmov_or_misaligned_rejects_trineon_fold_four
+  , ``LeanNative.Spec.zero_copy_slice_io_gate_sound, ``LeanNative.Spec.overlap_or_overflow_rejects_zero_copy_slice_io
   , ``LeanNative.Proofs.evalParKernelLoop_append, ``LeanNative.Proofs.parFor_chunk_partition_sound
   , ``LeanNative.Semantics.HeapState.decRefBuf_one_frees_buffer
   , ``LeanNative.Semantics.HeapState.decRefBuf_none_error, ``LeanNative.Semantics.HeapState.incRefBuf_none_error
@@ -230,6 +231,14 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.HybridCAbi.buffersOwned_implies_rcConserved
   , ``LeanNative.Proofs.HybridCAbi.globalThreadId_bijection
   , ``LeanNative.Proofs.HybridCAbi.validateHybridDispatch_sound
+  , ``LeanNative.Proofs.HybridCAbi.validateZeroCopySliceIoCall_sound
+  , ``LeanNative.Proofs.HybridCAbi.zeroCopySpanFitsU64_iff_addrLimit
+  , ``LeanNative.Proofs.HybridCAbi.spliceOutputSlice_size
+  , ``LeanNative.Proofs.HybridCAbi.spliceOutputSlice_extract_written
+  , ``LeanNative.Proofs.HybridCAbi.spliceOutputSlice_preserves_prefix
+  , ``LeanNative.Proofs.HybridCAbi.spliceOutputSlice_preserves_suffix_outside_cap
+  , ``LeanNative.Proofs.HybridCAbi.execZeroCopySliceIoHostCall_failure_preserves_mem
+  , ``LeanNative.Proofs.HybridCAbi.execZeroCopySliceIoHostCall_ok_sound
   ]
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/
