@@ -446,10 +446,24 @@ fn source_has_no_untrusted_elab_tokens(
                     while p > 0 && chars[p - 1] != '\n' {
                         p -= 1;
                         if !chars[p].is_whitespace() {
-                            return false;
+                            let Some((mod_kw, mod_end)) = ident_at(p) else {
+                                return false;
+                            };
+                            if !matches!(mod_kw.as_str(), "private" | "protected" | "noncomputable")
+                                || !chars[mod_end..k].iter().all(|c| c.is_whitespace())
+                            {
+                                return false;
+                            }
+                            while p > 0 && chars[p - 1] != '\n' {
+                                p -= 1;
+                                if !chars[p].is_whitespace() {
+                                    return false;
+                                }
+                            }
+                            break;
                         }
                     }
-                    while next_k < n && chars[next_k] != '\n' && chars[next_k].is_whitespace() {
+                    while next_k < n && chars[next_k].is_whitespace() {
                         next_k += 1;
                     }
                     let Some((name, after_name)) = dotted_at(next_k) else {
@@ -651,13 +665,38 @@ fn scan_file_scope_context(
         };
         let line_head = {
             let mut p = k;
-            let mut ok = true;
             while p > 0 && chars[p - 1] != '\n' {
                 p -= 1;
-                if !chars[p].is_whitespace() {
-                    ok = false;
+            }
+            let mut cur = p;
+            let mut ok = true;
+            while cur < k {
+                while cur < k && chars[cur].is_whitespace() {
+                    cur += 1;
+                }
+                if cur >= k {
                     break;
                 }
+                if let Some((mw, after_mw)) = ident_at(cur) {
+                    if matches!(
+                        mw.as_str(),
+                        "private"
+                            | "protected"
+                            | "noncomputable"
+                            | "scoped"
+                            | "local"
+                            | "unsafe"
+                            | "partial"
+                            | "nonrec"
+                            | "public"
+                            | "meta"
+                    ) {
+                        cur = after_mw;
+                        continue;
+                    }
+                }
+                ok = false;
+                break;
             }
             ok
         };
@@ -719,7 +758,7 @@ fn scan_file_scope_context(
                 k = after_name;
             }
             "def" | "theorem" | "lemma" | "inductive" | "structure" => {
-                while next_k < n && chars[next_k] != '\n' && chars[next_k].is_whitespace() {
+                while next_k < n && chars[next_k].is_whitespace() {
                     next_k += 1;
                 }
                 if let Some((name, after)) = dotted_at(next_k) {
@@ -760,10 +799,76 @@ pub(super) fn extract_all_lean_theorems(
     };
     let is_line_command_head = |pos: usize| -> bool {
         let mut p = pos;
-        while p > 0 && chars[p - 1] != '\n' && chars[p - 1] != ';' {
-            p -= 1;
-        }
-        let mut cur = p;
+        let mut cur = loop {
+            while p > 0 && chars[p - 1] != '\n' && chars[p - 1] != ';' {
+                p -= 1;
+            }
+            if p == 0 || chars[p - 1] == ';' {
+                break p;
+            }
+            let mut q = p - 1;
+            while q > 0 && chars[q - 1] != '\n' && chars[q - 1] != ';' {
+                q -= 1;
+            }
+            let mut lc = q;
+            let mut prefix_only = false;
+            while lc < p - 1 {
+                while lc < p - 1 && chars[lc].is_whitespace() {
+                    lc += 1;
+                }
+                if lc >= p - 1 {
+                    break;
+                }
+                if lc + 1 < p - 1 && chars[lc] == '@' && chars[lc + 1] == '[' {
+                    let mut depth = 1usize;
+                    lc += 2;
+                    while lc < pos && depth > 0 {
+                        if let Some(end) = skip_any_lexeme_at(lc) {
+                            lc = end;
+                            continue;
+                        }
+                        if chars[lc] == '[' {
+                            depth += 1;
+                        } else if chars[lc] == ']' {
+                            depth -= 1;
+                        }
+                        lc += 1;
+                    }
+                    prefix_only = depth == 0;
+                    continue;
+                }
+                if is_ident_start(chars[lc]) {
+                    let ws = lc;
+                    while lc < p - 1 && is_ident_continue(chars[lc]) {
+                        lc += 1;
+                    }
+                    let kw: String = chars[ws..lc].iter().collect();
+                    if matches!(
+                        kw.as_str(),
+                        "noncomputable"
+                            | "private"
+                            | "protected"
+                            | "scoped"
+                            | "local"
+                            | "unsafe"
+                            | "partial"
+                            | "nonrec"
+                            | "public"
+                            | "meta"
+                    ) {
+                        prefix_only = true;
+                        continue;
+                    }
+                }
+                prefix_only = false;
+                break;
+            }
+            if prefix_only {
+                p = q;
+            } else {
+                break p;
+            }
+        };
         while cur < pos {
             while cur < pos && chars[cur].is_whitespace() {
                 cur += 1;
@@ -841,7 +946,7 @@ pub(super) fn extract_all_lean_theorems(
         }
         true
     };
-    let scan_dotted_name = |mut pos: usize, limit: usize| -> (String, usize) {
+    let scan_dotted_name_inline = |mut pos: usize, limit: usize| -> (String, usize) {
         while pos < limit && (chars[pos] == ' ' || chars[pos] == '\t') {
             pos += 1;
         }
@@ -862,6 +967,12 @@ pub(super) fn extract_all_lean_theorems(
         }
         let raw: String = chars[start..pos].iter().collect();
         (raw.trim_end_matches('.').to_string(), pos)
+    };
+    let scan_dotted_name = |mut pos: usize, limit: usize| -> (String, usize) {
+        while pos < limit && chars[pos].is_whitespace() {
+            pos += 1;
+        }
+        scan_dotted_name_inline(pos, limit)
     };
     let n = chars.len();
     let mut i = 0;
@@ -900,7 +1011,7 @@ pub(super) fn extract_all_lean_theorems(
             let word: String = chars[start..i].iter().collect();
             if is_line_command_head(start) {
                 match word.as_str() {
-                    "namespace" if i < n && (chars[i] == ' ' || chars[i] == '\t') => {
+                    "namespace" if i < n && chars[i].is_whitespace() => {
                         transient_opens.clear();
                         let (ns_name, next_i) = scan_dotted_name(i, n);
                         i = next_i;
@@ -923,7 +1034,7 @@ pub(super) fn extract_all_lean_theorems(
                     "section" if i >= n || chars[i].is_whitespace() => {
                         transient_opens.clear();
                         let (sec_name, next_i) = if i < n && (chars[i] == ' ' || chars[i] == '\t') {
-                            scan_dotted_name(i, n)
+                            scan_dotted_name_inline(i, n)
                         } else {
                             (String::new(), i)
                         };
@@ -957,7 +1068,7 @@ pub(super) fn extract_all_lean_theorems(
                     "end" if i >= n || chars[i].is_whitespace() => {
                         transient_opens.clear();
                         let (end_name, next_i) = if i < n && (chars[i] == ' ' || chars[i] == '\t') {
-                            scan_dotted_name(i, n)
+                            scan_dotted_name_inline(i, n)
                         } else {
                             (String::new(), i)
                         };

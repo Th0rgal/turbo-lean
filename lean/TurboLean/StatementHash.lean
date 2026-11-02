@@ -115,36 +115,36 @@ def normalizeLocalPrivateName (localMod? : Option Name) (n : Name) : Name :=
 
 -- Theorems contribute their type, never their proof (proof irrelevance).
 -- Recursor reduction rules and inductive/constructor metadata are kernel inputs too.
-private def interface (c : ConstantInfo) : Json × Array Name := Id.run do
+private def interface (c : ConstantInfo) (normName : Name → Name := id) : Json × Array Name := Id.run do
   let mut deps := c.type.getUsedConstants
   let kind ← match c with
     | .defnInfo v =>
       deps := deps ++ v.value.getUsedConstants
-      pure <| node "definition" #[exprJson id v.value, hintsJson v.hints, toJson (reprStr v.safety)]
+      pure <| node "definition" #[exprJson normName v.value, hintsJson v.hints, toJson (reprStr v.safety)]
     | .opaqueInfo v =>
       deps := deps ++ v.value.getUsedConstants
-      pure <| node "opaque" #[exprJson id v.value, toJson v.isUnsafe]
+      pure <| node "opaque" #[exprJson normName v.value, toJson v.isUnsafe]
     | .thmInfo _ => pure <| node "theorem"
     | .axiomInfo v => pure <| node "axiom" #[toJson v.isUnsafe]
     | .quotInfo v => pure <| node "quotient" #[quotJson v.kind]
     | .inductInfo v =>
       deps := deps ++ v.all.toArray ++ v.ctors.toArray
       pure <| node "inductive" #[toJson v.numParams, toJson v.numIndices,
-        toJson (v.all.map (nameJson id)), toJson (v.ctors.map (nameJson id)),
+        toJson (v.all.map (nameJson normName)), toJson (v.ctors.map (nameJson normName)),
         toJson v.numNested, toJson v.isRec, toJson v.isUnsafe, toJson v.isReflexive]
     | .ctorInfo v =>
       deps := deps.push v.induct
-      pure <| node "constructor" #[nameJson id v.induct, toJson v.cidx,
+      pure <| node "constructor" #[nameJson normName v.induct, toJson v.cidx,
         toJson v.numParams, toJson v.numFields, toJson v.isUnsafe]
     | .recInfo v =>
       deps := deps ++ v.all.toArray
       for r in v.rules do
         deps := deps.push r.ctor ++ r.rhs.getUsedConstants
-      pure <| node "recursor" #[toJson (v.all.map (nameJson id)), toJson v.numParams,
+      pure <| node "recursor" #[toJson (v.all.map (nameJson normName)), toJson v.numParams,
         toJson v.numIndices, toJson v.numMotives, toJson v.numMinors, toJson v.k,
         toJson v.isUnsafe, toJson (v.rules.map fun r =>
-          node "rule" #[nameJson id r.ctor, toJson r.nfields, exprJson id r.rhs])]
-  return (node "interface-v1" #[statement c, kind], deps)
+          node "rule" #[nameJson normName r.ctor, toJson r.nfields, exprJson normName r.rhs])]
+  return (node "interface-v1" #[statement c normName, kind], deps)
 
 private def emit (j : Json) : IO Unit := do (← IO.getStdout).putStrLn j.compress
 
@@ -152,6 +152,8 @@ private def emit (j : Json) : IO Unit := do (← IO.getStdout).putStrLn j.compre
 -- The encoding uses constant names, never import-order-dependent module indices.
 def dump (env : Environment) (mod : Name) : IO Unit := do
   let some idx := env.getModuleIdx? mod | throw <| IO.userError s!"missing module {mod}"
+  let normName := normalizeLocalPrivateName (some mod)
+  let normStr (n : Name) : String := (normName n).toString
   let mut pending : Array Name := #[]
   for c in env.header.moduleData[idx.toNat]!.constants do
     let axioms := Id.run ((collectAxioms c.name : ReaderT Environment Id (Array Name)).run env)
@@ -159,7 +161,7 @@ def dump (env : Environment) (mod : Name) : IO Unit := do
       ("axioms", toJson (axioms.map Name.toString))]
     if c.isTheorem then
       emit <| Json.mkObj [("theorem", toJson c.name.toString),
-        ("statement", statement c), ("deps", toJson (c.type.getUsedConstants.map Name.toString))]
+        ("statement", statement c normName), ("deps", toJson (c.type.getUsedConstants.map normStr))]
       pending := pending ++ c.type.getUsedConstants
   let mut seen : NameSet := {}
   while !pending.isEmpty do
@@ -168,9 +170,9 @@ def dump (env : Environment) (mod : Name) : IO Unit := do
     if seen.contains n then continue
     seen := seen.insert n
     let some c := env.find? n | throw <| IO.userError s!"missing constant {n}"
-    let (payload, deps) := interface c
-    emit <| Json.mkObj [("constant", toJson n.toString), ("interface", payload),
-      ("deps", toJson (deps.map Name.toString))]
+    let (payload, deps) := interface c normName
+    emit <| Json.mkObj [("constant", toJson (normStr n)), ("interface", payload),
+      ("deps", toJson (deps.map normStr))]
     pending := pending ++ deps
   let csimp := (Compiler.CSimp.ext.ext.getModuleEntries env idx).map fun entry =>
     match entry with | .global e | .scoped _ e => e.thmName.toString

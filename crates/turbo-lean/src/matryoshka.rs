@@ -134,6 +134,7 @@ pub fn parse_lean_stmt_features(decl_name: &str, stmt_src: &str) -> LeanStmtFeat
             ':' if cur_depth == 1 && idx > 0 && bytes[idx - 1] != ':' => {
                 in_sig = false;
             }
+            ':' => {}
             _ => {}
         }
     }

@@ -599,6 +599,14 @@ fn run(cli: Cli) -> Result<()> {
         } => Some(lake_build::find_project_root(
             project_dir.as_deref().unwrap_or(file),
         )),
+        Commands::AgentStep {
+            project_dir, file, ..
+        } => Some(
+            project_dir
+                .as_ref()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| lake_build::find_project_root(file)),
+        ),
         _ => None,
     };
     let (dir, rev) = match &cli.command {
@@ -614,16 +622,7 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Check { project_dir, .. }
         | Commands::Build { project_dir, .. }
         | Commands::SeedShards { project_dir, .. } => (Some(project_dir.as_path()), None),
-        Commands::AgentStep {
-            project_dir, file, ..
-        } => {
-            let file_dir = file.parent().filter(|p| !p.as_os_str().is_empty());
-            (
-                Some(project_dir.as_deref().or(file_dir).unwrap_or(here)),
-                None,
-            )
-        }
-        Commands::Eval { .. } => (eval_project_root.as_deref(), None),
+        Commands::AgentStep { .. } | Commands::Eval { .. } => (eval_project_root.as_deref(), None),
         Commands::Mcp { project_dir } => (Some(project_dir.as_deref().unwrap_or(here)), None),
         _ => (None, None),
     };
@@ -1186,6 +1185,11 @@ fn run(cli: Cli) -> Result<()> {
 
     let mut store = TurboStore::open(cli.cache_dir.as_deref())?;
 
+    // Open the Lake-input memo window for this command (see `reset_lake_inputs_tag_memo`). A CLI
+    // process runs one command, so this is belt-and-braces here; `serve` and the MCP server call it
+    // per request, which is what actually bounds it.
+    module_builder::reset_lake_inputs_tag_memo();
+
     match cli.command {
         Commands::Build {
             targets,
@@ -1554,12 +1558,16 @@ fn run(cli: Cli) -> Result<()> {
             let proj_dir = project_dir
                 .map(|p| lake_build::find_project_root(&p))
                 .unwrap_or_else(|| lake_build::find_project_root(&file));
+            if lake_build::has_lake_config(&proj_dir) {
+                module_builder::try_project_lake_inputs_tag(&proj_dir)?;
+            }
             let toolchain = lake_build::detect_toolchain(&proj_dir);
             if !server::is_toolchain_installed(&toolchain) {
                 eprintln!("error: toolchain '{}' is not installed", toolchain);
                 std::process::exit(1);
             }
             let explicit_lp: Option<String> = lean_path.or_else(|| std::env::var("LEAN_PATH").ok());
+            let may_declare_inputs = module_builder::workspace_may_declare_lake_inputs(&proj_dir);
 
             let (mut env_vars, lean_bin, req_lp) = if let Some(lp) = explicit_lp {
                 let (mut ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, &lp)?;
@@ -1569,7 +1577,8 @@ fn run(cli: Cli) -> Result<()> {
                     ev.insert("LEAN_PATH".to_string(), lp.clone());
                 }
                 (ev, lb, lp)
-            } else if !proj_dir.join(".lake/packages").is_dir()
+            } else if !may_declare_inputs
+                && !proj_dir.join(".lake/packages").is_dir()
                 && proj_dir.join(".lake/build/lib/lean").exists()
                 && zygote::has_active_local_zygote_daemon(&store)
             {
@@ -1582,13 +1591,16 @@ fn run(cli: Cli) -> Result<()> {
                     pack::resolve_server_lean_env_and_bin(&store, &toolchain, &lp)?.1,
                     lp,
                 )
-            } else if proj_dir.join("lakefile.lean").exists()
-                || proj_dir.join("lakefile.toml").exists()
-            {
+            } else if lake_build::has_lake_config(&proj_dir) {
                 if let Ok((ev, _)) = lake_build::resolve_lake_env(&store, &proj_dir) {
                     let lp = ev.get("LEAN_PATH").cloned().unwrap_or_default();
                     let (_, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, &lp)?;
                     (ev, lb, lp)
+                } else if may_declare_inputs {
+                    anyhow::bail!(
+                        "Failed to resolve Lake environment for `{}` which declares Lake file inputs: fail-closed eval gate",
+                        proj_dir.display()
+                    );
                 } else {
                     let (ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, "")?;
                     let lp = ev.get("LEAN_PATH").cloned().unwrap_or_default();
@@ -1603,6 +1615,13 @@ fn run(cli: Cli) -> Result<()> {
                 if k != "LEAN_PATH" {
                     env_vars.entry(k).or_insert(v);
                 }
+            }
+            if lake_build::has_lake_config(&proj_dir) {
+                let canon_proj = proj_dir.canonicalize().unwrap_or_else(|_| proj_dir.clone());
+                env_vars.insert(
+                    "TURBO_LEAN_PROJECT_DIR".to_string(),
+                    canon_proj.to_string_lossy().to_string(),
+                );
             }
             if let Ok(cwd) = std::env::current_dir() {
                 env_vars.insert(

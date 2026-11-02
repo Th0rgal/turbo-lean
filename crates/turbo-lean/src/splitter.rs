@@ -876,6 +876,38 @@ fn is_top_level_command_start(trimmed: &str) -> bool {
                 | "public"
                 | "meta"
                 | "module"
+                | "theorem"
+                | "lemma"
+                | "def"
+                | "abbrev"
+                | "instance"
+                | "inductive"
+                | "coinductive"
+                | "structure"
+                | "class"
+                | "axiom"
+                | "opaque"
+                | "constant"
+                | "example"
+                | "alias"
+                | "namespace"
+                | "open"
+                | "variable"
+                | "variables"
+                | "universe"
+                | "universes"
+                | "set_option"
+                | "attribute"
+                | "export"
+                | "include"
+                | "omit"
+                | "deriving"
+                | "initialize"
+                | "builtin_initialize"
+                | "syntax"
+                | "macro"
+                | "elab"
+                | "notation"
         )
 }
 
@@ -2503,14 +2535,15 @@ fn precompute_closed_section_min_needed_idx(
             if trimmed.is_empty() || is_scope_or_context_command(trimmed) {
                 continue;
             }
-            let after_attrs = {
-                let mut r = trimmed;
-                while let Some(next) = strip_leading_attr_block(r) {
-                    r = next.trim_start();
-                }
-                r
-            };
-            if after_attrs.starts_with("local ") {
+            let after_prefixes = strip_decl_prefixes(trimmed);
+            if after_prefixes != trimmed
+                && trimmed.len() - after_prefixes.len() >= 5
+                && (trimmed.contains("local") && after_prefixes.is_empty()
+                    || strip_leading_attr_block(trimmed)
+                        .map_or(trimmed, str::trim_start)
+                        .strip_prefix("local")
+                        .is_some_and(|r| r.is_empty() || r.starts_with(char::is_whitespace)))
+            {
                 continue;
             }
             if let Some((_, mut_subspans, _)) = split_mutual_block_subspans(inner) {
@@ -2905,8 +2938,8 @@ fn split_lean_source_inner(
                 let mut prefix_accum = String::new();
                 if !omit_shard_source {
                     prefix_accum.reserve(src.len());
-                    for item in span_skel_orig.iter().take(target_idx) {
-                        prefix_accum.push_str(item);
+                    for skel in span_skel_orig.iter().take(target_idx) {
+                        prefix_accum.push_str(skel);
                         prefix_accum.push('\n');
                     }
                 }
@@ -3818,32 +3851,32 @@ fn is_scope_or_context_command(clean_text: &str) -> bool {
     while let Some(next) = strip_leading_attr_block(after_attrs) {
         after_attrs = next.trim_start();
     }
-    [
-        "local notation",
-        "scoped notation",
-        "local infix",
-        "scoped infix",
-        "local prefix",
-        "scoped prefix",
-        "local postfix",
-        "scoped postfix",
-        "local instance",
-        "scoped instance",
-        "local attribute",
-        "scoped attribute",
-        "local simproc",
-        "scoped simproc",
-        "local dsimproc",
-        "scoped dsimproc",
-        "local syntax",
-        "scoped syntax",
-        "local macro",
-        "scoped macro",
-        "local elab",
-        "scoped elab",
-    ]
-    .iter()
-    .any(|&prefix| after_attrs.starts_with(prefix))
+    for scope_kw in ["local", "scoped"] {
+        if let Some(rest) = after_attrs.strip_prefix(scope_kw) {
+            if rest.starts_with(char::is_whitespace) {
+                let after_scope = rest.trim_start();
+                if [
+                    "notation",
+                    "infix",
+                    "prefix",
+                    "postfix",
+                    "instance",
+                    "attribute",
+                    "simproc",
+                    "dsimproc",
+                    "syntax",
+                    "macro",
+                    "elab",
+                ]
+                .iter()
+                .any(|&kw| after_scope.starts_with(kw))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Rename a named `local instance <name> ...` or `scoped instance <name> ...` for fast `.olean`
@@ -5372,7 +5405,9 @@ mod tests {
                 .and_then(|t| crate::accelerators::toml_string_array(&t, "axioms", "allow"))
         };
         assert_eq!(allow(None).unwrap(), ["A.*", "B"]);
-        assert_eq!(allow(Some("HEAD")), None);
+        if crate::trusted_tools::git(&repo).is_ok() {
+            assert_eq!(allow(Some("HEAD")), None);
+        }
         std::fs::write(
             repo.join("turbo-lean.toml"),
             "[zygote]\ntimeout_secs = 900\n",

@@ -1287,22 +1287,24 @@ pub fn execute_fast_check(
     let decl_name = decl.unwrap_or("fastcheck_decl");
 
     let f_path_opt = file.filter(|s| !s.trim().is_empty()).map(Path::new);
-    let untrusted_guard_src =
-        "import Init\ntheorem _untrusted_context_guard : True := trivial".to_string();
-    let guard_stmt = |d_name: &str, s: &str, item_file: Option<&Path>| -> String {
-        if crate::gpu_fastcheck::stmt_src_has_trusted_elab_context_for_path(
-            d_name,
-            s,
-            item_file.or(f_path_opt),
-            project_dir,
-        ) {
-            s.to_string()
-        } else {
-            untrusted_guard_src.clone()
-        }
-    };
+    let check_trusted_stmt =
+        |d_name: &str, s: &str, item_file: Option<&Path>| -> Result<String, String> {
+            if crate::gpu_fastcheck::stmt_src_has_trusted_elab_context_for_path(
+                d_name,
+                s,
+                item_file.or(f_path_opt),
+                project_dir,
+            ) {
+                Ok(s.to_string())
+            } else {
+                Err(format!(
+                "Untrusted or unparseable elaboration context for `{d_name}` in Stage-1 fast-check"
+            ))
+            }
+        };
 
     let mut batch_pairs: Vec<(String, String)> = Vec::new();
+    let mut file_read_err: Option<String> = None;
     if let Some(arr) = items {
         for (idx, item) in arr.iter().enumerate() {
             let d = item
@@ -1317,18 +1319,22 @@ pub fn execute_fast_check(
                 .filter(|s| !s.trim().is_empty())
                 .map(Path::new);
             if let Some(s) = item.get("stmt_src").and_then(|v| v.as_str()) {
-                let guarded = guard_stmt(&d, s, item_file);
-                batch_pairs.push((d, guarded));
+                match check_trusted_stmt(&d, s, item_file) {
+                    Ok(trusted_s) => batch_pairs.push((d, trusted_s)),
+                    Err(e) => {
+                        file_read_err = Some(e);
+                        break;
+                    }
+                }
             }
         }
     }
-    let mut file_read_err: Option<String> = None;
-    if batch_pairs.is_empty() {
+    if file_read_err.is_none() && batch_pairs.is_empty() {
         if let Some(stmt) = stmt_src.filter(|s| !s.trim().is_empty()) {
-            batch_pairs.push((
-                decl_name.to_string(),
-                guard_stmt(decl_name, stmt, f_path_opt),
-            ));
+            match check_trusted_stmt(decl_name, stmt, f_path_opt) {
+                Ok(trusted_s) => batch_pairs.push((decl_name.to_string(), trusted_s)),
+                Err(e) => file_read_err = Some(e),
+            }
         } else if let Some(f_str) = file.filter(|s| !s.trim().is_empty()) {
             let raw_path = Path::new(f_str);
             let resolved_path = if raw_path.is_relative() {
@@ -1739,6 +1745,11 @@ pub fn handle_mcp_jsonrpc_request(
         return id_opt.map(|id| serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} }));
     }
     let id = id_opt.unwrap_or(serde_json::Value::Null);
+
+    // New request, new Lake-input memo window: this server outlives many edits, so it must never
+    // answer from the input bytes a previous request read. See
+    // `module_builder::reset_lake_inputs_tag_memo`.
+    crate::module_builder::reset_lake_inputs_tag_memo();
 
     match method {
         "initialize" => Some(serde_json::json!({

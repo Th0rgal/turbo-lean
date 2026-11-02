@@ -1088,6 +1088,7 @@ pub fn run_check_command_value(
     parallel_shards: bool,
     remote_http: Option<String>,
 ) -> Result<serde_json::Value> {
+    crate::module_builder::reset_lake_inputs_tag_memo();
     run_check_command_inner(
         store,
         db_warm_on_open,
@@ -1109,6 +1110,7 @@ pub fn evaluate_check_command_value(
     decl: Option<String>,
     project_dir: PathBuf,
 ) -> Result<serde_json::Value> {
+    crate::module_builder::reset_lake_inputs_tag_memo();
     run_check_command_inner(
         store,
         true,
@@ -1134,12 +1136,17 @@ type StatelessRemoteInit = (
     splitter::SplitResult,
 );
 
-fn prepare_stateless_remote_file(file: &Path, project_dir: &Path) -> Option<StatelessRemoteInit> {
+fn prepare_stateless_remote_file(
+    file: &Path,
+    project_dir: &Path,
+) -> Result<Option<StatelessRemoteInit>> {
+    crate::module_builder::reset_lake_inputs_tag_memo();
     let canon_dir = project_dir
         .canonicalize()
         .unwrap_or_else(|_| project_dir.to_path_buf());
+    crate::module_builder::try_project_lake_inputs_tag(&canon_dir)?;
     let resolved_file = if file == Path::new(".") {
-        return None;
+        return Ok(None);
     } else if file.is_relative() && canon_dir.join(file).exists() {
         canon_dir.join(file)
     } else if file.exists() {
@@ -1148,12 +1155,22 @@ fn prepare_stateless_remote_file(file: &Path, project_dir: &Path) -> Option<Stat
         canon_dir.join(file)
     };
     if resolved_file.is_dir() || !resolved_file.exists() {
-        return None;
+        return Ok(None);
     }
-    let active_src = fs::read_to_string(&resolved_file)
-        .ok()
-        .filter(|s| s.len() <= 64 * 1024)?;
-    let canon_file = resolved_file.canonicalize().unwrap_or(resolved_file);
+    let Ok(active_src) = fs::read_to_string(&resolved_file) else {
+        return Ok(None);
+    };
+    if active_src.len() > 64 * 1024 {
+        return Ok(None);
+    }
+    let canon_file = match resolved_file.canonicalize() {
+        Ok(p) => p,
+        Err(_) => resolved_file,
+    };
+    crate::lake_build::ensure_project_imports_fresh_for_check(
+        &canon_dir,
+        std::slice::from_ref(&canon_file),
+    )?;
     let toolchain = detect_toolchain(&canon_dir);
     let effective_tc = if toolchain.is_empty() || toolchain == "unknown" {
         "leanprover/lean4:v4.35.0".to_string()
@@ -1163,7 +1180,7 @@ fn prepare_stateless_remote_file(file: &Path, project_dir: &Path) -> Option<Stat
     let local_lean_path = resolve_remote_lean_path(&canon_dir, None);
     let dep_hashes = compute_imported_olean_interface_hashes(&active_src, &canon_dir, None);
     let split = splitter::split_lean_source_fast_no_cone(&active_src, &dep_hashes);
-    Some((
+    Ok(Some((
         canon_dir,
         canon_file,
         active_src,
@@ -1172,7 +1189,7 @@ fn prepare_stateless_remote_file(file: &Path, project_dir: &Path) -> Option<Stat
         local_lean_path,
         dep_hashes,
         split,
-    ))
+    )))
 }
 
 fn rollback_inflight(store_opt: &Option<TurboStore>, inflight_tx_open: bool) {
@@ -1263,7 +1280,7 @@ pub fn try_stateless_remote_check(
         local_lean_path,
         dep_hashes,
         split,
-    )) = prepare_stateless_remote_file(file, project_dir)
+    )) = prepare_stateless_remote_file(file, project_dir)?
     else {
         return Ok(false);
     };
@@ -1485,7 +1502,7 @@ pub fn try_stateless_remote_single_decl_check(
         local_lean_path,
         dep_hashes,
         split,
-    )) = prepare_stateless_remote_file(file, project_dir)
+    )) = prepare_stateless_remote_file(file, project_dir)?
     else {
         return Ok(false);
     };
@@ -1704,6 +1721,8 @@ pub fn run_check_command(
     parallel_shards: bool,
     remote_http: Option<String>,
 ) -> Result<()> {
+    // One top-level command, one Lake-input memo window.
+    crate::module_builder::reset_lake_inputs_tag_memo();
     run_check_command_inner(
         store,
         db_warm_on_open,
@@ -1737,6 +1756,7 @@ fn run_check_command_inner(
     let canon_dir = project_dir
         .canonicalize()
         .unwrap_or_else(|_| project_dir.clone());
+    crate::module_builder::try_project_lake_inputs_tag(&canon_dir)?;
     let toolchain = detect_toolchain(&canon_dir);
     let resolved_file = if file == Path::new(".") {
         canon_dir.clone()
@@ -1825,7 +1845,7 @@ fn run_check_command_inner(
         known_modified_vs_head = c.known_modified;
         let cb3 = (!c.src_blake3.is_empty()).then_some(c.src_blake3);
         (c.prefix_src, cb3, c.split, 1usize)
-    } else if let Some((pref_src, fast_sp, 0)) = file_stat_tuple
+    } else if let Some((pref_src, fast_sp, 0, fast_deps)) = file_stat_tuple
         .filter(|(_, _, sz)| *sz > 64 * 1024)
         .and_then(|(_, _, sz)| {
             try_fast_split_single_file_from_path(
@@ -1839,15 +1859,13 @@ fn run_check_command_inner(
     {
         known_modified_vs_head = true;
         if let Some((ref st_path, _)) = st_paths_opt {
-            let dep_hashes =
-                compute_imported_olean_interface_hashes(&fast_sp.imports_header, &canon_dir, None);
             let entry = ShmCachedFileSplit {
                 split_key: "file-split:v11:partial".to_string(),
                 src_blake3: String::new(),
                 split: compact_split_for_shm_cache(&fast_sp),
                 prefix_src: pref_src.clone(),
                 known_modified: true,
-                dep_hashes,
+                dep_hashes: fast_deps,
             };
             if let Ok(bytes) = serde_json::to_vec(&entry) {
                 let _ = crate::shm_cache::atomic_write_shm(st_path, &bytes);
@@ -1883,6 +1901,7 @@ fn run_check_command_inner(
             &canon_resolved_initial,
             &loaded_src,
             &toolchain,
+            &dep_hashes,
         ) {
             if fast_res.1 == 0 {
                 known_modified_vs_head = true;
@@ -2116,6 +2135,7 @@ fn check_directory(
             );
             pack::warm_local_zygote_daemon_nonblocking(store, &fast_ev);
         }
+        crate::lake_build::recheck_dependents_if_nonlocal(store, canon_dir, resolved_file)?;
         return Ok(out_json);
     }
 
@@ -3751,7 +3771,6 @@ fn check_single_decl(
                         apply_zygote_json!(&zjson);
                     }
                 }
-                drop(try_zygote_src);
                 if !verified_via_zygote
                     && last_daemon_verify_err.is_none()
                     && !decl_src.is_empty()

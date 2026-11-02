@@ -8601,9 +8601,10 @@ fn resolve_agent_step_env_and_paths(
     let inferred_proj_dir = project_dir
         .map(Path::to_path_buf)
         .unwrap_or_else(|| crate::lake_build::find_project_root(file));
-    let canon_dir = inferred_proj_dir
-        .canonicalize()
-        .unwrap_or(inferred_proj_dir);
+    let canon_dir = match inferred_proj_dir.canonicalize() {
+        Ok(p) => p,
+        Err(_) => inferred_proj_dir,
+    };
     let resolved_file = if file.exists() {
         file.to_path_buf()
     } else if canon_dir.join(file).exists() {
@@ -8770,6 +8771,16 @@ pub(crate) fn extract_confirmed_fastcheck_pairs(
     project_dir: &Path,
     file: &Path,
 ) -> Result<Vec<(String, String)>> {
+    let canon_dir = match project_dir.canonicalize() {
+        Ok(p) => p,
+        Err(_) => project_dir.to_path_buf(),
+    };
+    let canon_resolved = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+    crate::module_builder::try_project_lake_inputs_tag(&canon_dir)?;
+    crate::lake_build::ensure_project_imports_fresh_for_check(
+        &canon_dir,
+        std::slice::from_ref(&canon_resolved),
+    )?;
     let split = crate::splitter::split_lean_source_fast_no_cone(src, &[]);
     let shards: Vec<&crate::splitter::TheoremShard> = match decl_filter
         .filter(|t| !t.is_empty() && *t != "auto")
@@ -8789,33 +8800,31 @@ pub(crate) fn extract_confirmed_fastcheck_pairs(
         );
     }
     for shard in &shards {
-        crate::check::confirm_decl_identity(src, shard, project_dir, file)?;
+        crate::check::confirm_decl_identity(src, shard, &canon_dir, file)?;
     }
-    let pairs: Vec<(String, String)> = shards
-        .into_iter()
-        .map(|shard| {
-            let file_decls = audit_spec::extract_decls_fast_for_path(
-                src,
-                Some(shard.decl_name()),
-                Some(file),
-                Some(project_dir),
-            );
-            if let Some(d) = file_decls.into_iter().next() {
-                if d.trusted_elab_context && d.instance_binders.is_empty() {
-                    (shard.decl_name().to_string(), d.render_scoped_stmt_src())
-                } else {
-                    (
-                        shard.decl_name().to_string(),
-                        "import Init\ntheorem _untrusted_context_guard : True := trivial"
-                            .to_string(),
-                    )
-                }
-            } else {
-                let (stmt, _) = crate::splitter::extract_shard_stmt_and_proof(src, shard);
-                (shard.decl_name().to_string(), format!("{stmt} := by sorry"))
-            }
-        })
-        .collect();
+    let mut pairs: Vec<(String, String)> = Vec::with_capacity(shards.len());
+    for shard in shards {
+        let file_decls = audit_spec::extract_decls_fast_for_path(
+            src,
+            Some(shard.decl_name()),
+            Some(file),
+            Some(&canon_dir),
+        );
+        let d = file_decls.into_iter().next().with_context(|| {
+            format!(
+                "Failed to extract Stage-1 fast-check declaration `{}` in {}",
+                shard.decl_name(),
+                file.display()
+            )
+        })?;
+        anyhow::ensure!(
+            d.trusted_elab_context && d.instance_binders.is_empty(),
+            "Untrusted elaboration context for `{}` in {} (Stage-1 fast-check requires an unmodified prelude/allow-listed context without local/scoped instances, custom notation/macros, or shadowing)",
+            shard.decl_name(),
+            file.display()
+        );
+        pairs.push((shard.decl_name().to_string(), d.render_scoped_stmt_src()));
+    }
     Ok(pairs)
 }
 
@@ -8836,6 +8845,14 @@ pub fn try_stateless_agent_step_cex(
     let Ok(src_text) = fs::read_to_string(&resolved_file) else {
         return Ok(None);
     };
+    let canon_resolved = resolved_file
+        .canonicalize()
+        .unwrap_or_else(|_| resolved_file.clone());
+    crate::module_builder::try_project_lake_inputs_tag(&canon_dir)?;
+    crate::lake_build::ensure_project_imports_fresh_for_check(
+        &canon_dir,
+        std::slice::from_ref(&canon_resolved),
+    )?;
     let split = crate::splitter::split_lean_source_fast_no_cone(&src_text, &[]);
     let target_shards: Vec<&crate::splitter::TheoremShard> =
         match decl_filter.filter(|t| !t.is_empty() && *t != "auto") {
@@ -8987,6 +9004,7 @@ pub fn evaluate_agent_step_value(
     use_tpu: bool,
 ) -> Result<serde_json::Value> {
     let t0 = Instant::now();
+    crate::module_builder::reset_lake_inputs_tag_memo();
     let (max_memory_mb, effective_low_memory, canon_dir, resolved_file) =
         resolve_agent_step_env_and_paths(file, project_dir, low_memory, use_tpu);
 
@@ -9013,6 +9031,11 @@ pub fn evaluate_agent_step_value(
         let canon_resolved = resolved_file
             .canonicalize()
             .unwrap_or_else(|_| resolved_file.clone());
+        crate::module_builder::try_project_lake_inputs_tag(&canon_dir)?;
+        crate::lake_build::ensure_project_imports_fresh_for_check(
+            &canon_dir,
+            std::slice::from_ref(&canon_resolved),
+        )?;
         let st_path_opt = fs::metadata(&canon_resolved)
             .ok()
             .map(|m| crate::db::TurboStore::extract_file_stat_tuple(&m))
@@ -11826,12 +11849,14 @@ theorem shadowed_false_cex (a : Word256) : a = Word256.zero := by sorry
             false,
             Some(&dir),
         );
-        assert_ne!(
+        assert_eq!(
             mcp_res["status"].as_str(),
-            Some("counterexample_found"),
-            "MCP fast-check must not emit false counterexample on shadowed allow-listed import: {}",
+            Some("error"),
+            "MCP fast-check must fail closed (`status: error`, `ok: false`) on shadowed allow-listed import: {}",
             mcp_res
         );
+        assert_eq!(mcp_res["ok"].as_bool(), Some(false), "{}", mcp_res);
+        assert_ne!(mcp_res["verified"].as_bool(), Some(true), "{}", mcp_res);
 
         // Canonical repo `TurboLean.FastCheck` must remain trusted:
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -12052,12 +12077,14 @@ theorem shadowed_in_srcdir (a : Word256) : a = Word256.zero := by sorry
             false,
             Some(&dir),
         );
-        assert_ne!(
+        assert_eq!(
             batch_res["status"].as_str(),
-            Some("counterexample_found"),
-            "MCP batch items must fail closed on custom srcDir shadowed import: {}",
+            Some("error"),
+            "MCP batch items must fail closed (`status: error`, `ok: false`) on custom srcDir shadowed import: {}",
             batch_res
         );
+        assert_eq!(batch_res["ok"].as_bool(), Some(false), "{}", batch_res);
+        assert_ne!(batch_res["verified"].as_bool(), Some(true), "{}", batch_res);
         let _ = fs::remove_dir_all(&dir);
     }
 
