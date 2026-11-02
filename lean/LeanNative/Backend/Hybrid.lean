@@ -695,9 +695,13 @@ def emitDeclHostGlue (minGpuElements : Nat) (actionOpt : Option TransferAction) 
   | .ok vplan =>
     let modeComment := match actionOpt with
       | some act =>
-        s!"/* TransferMode: {act.mode}, minElements: {act.minElements}, gridThreads: {vplan.gridThreads}, COW-exclusivity-check: {act.requiresHostCowCheck}, sync: {act.syncPoint} */"
+        let cow := act.requiresHostCowCheck
+        s!"/* TransferMode: {act.mode}, minElements: {act.minElements}, " ++
+          s!"gridThreads: {vplan.gridThreads}, COW-exclusivity-check: {cow}, " ++
+          s!"sync: {act.syncPoint} */"
       | none =>
-        s!"/* TransferMode: UnifiedMemoryZeroCopy, minElements: {minGpuElements}, gridThreads: {vplan.gridThreads} */"
+        s!"/* TransferMode: UnifiedMemoryZeroCopy, minElements: {minGpuElements}, " ++
+          s!"gridThreads: {vplan.gridThreads} */"
     let mkGlue (sig nullChk sizeVar : String) (numBufs : Nat) (outIsScalar : Bool)
         (inPtrs : List String) (gpuCall cpuFallback : String) : String :=
       let outCapGuard :=
@@ -713,7 +717,7 @@ def emitDeclHostGlue (minGpuElements : Nat) (actionOpt : Option TransferAction) 
         "    if (!lean_native_sarray_is_exclusive(out)) return -1;",
         s!"    size_t n = {sizeVar}->m_size;",
         s!"    {outCapGuard}",
-        s!"    if (n > UINT64_MAX / (sizeof(uint64_t) * {numBufs}ULL)) return -1;",
+        s!"    if (n > SIZE_MAX / (sizeof(uint64_t) * {numBufs}ULL)) return -1;",
         "    size_t bytes = n * sizeof(uint64_t);",
         aliasChecks,
         s!"    if (n >= {minGpuElements}ULL && lean_native_gpu_available() && lean_native_gpu_has_headroom(bytes * {numBufs}ULL)) \{",
@@ -724,31 +728,88 @@ def emitDeclHostGlue (minGpuElements : Nat) (actionOpt : Option TransferAction) 
         "    return 0;",
         "}"
       ]
+    let cForHeader : List String := [
+      "    for (size_t i = 0;",
+      "         i < n;",
+      "         ++i) {"
+    ]
     match extractParForRegions d.body with
     | [(_, _, _, .i64, .mapScaleAdd scale bias)] =>
-      mkGlue "lean_native_sarray_u64* out, const lean_native_sarray_u64* in0" "!out || !in0" "in0" 2 false ["in0"]
-        s!"        int rc = lean_native_hybrid_map_scale_add_u64(out->m_data, in0->m_data, (uint64_t){scale}ULL, (uint64_t){bias}ULL, n);"
-        s!"    for (size_t i = 0; i < n; ++i) \{\n        out->m_data[i] = in0->m_data[i] * (uint64_t){scale}ULL + (uint64_t){bias}ULL;\n    }"
+      let sig := "lean_native_sarray_u64* out, const lean_native_sarray_u64* in0"
+      let gpuCall :=
+        "        int rc = lean_native_hybrid_map_scale_add_u64(\n" ++
+        s!"            out->m_data, in0->m_data, (uint64_t){scale}ULL, (uint64_t){bias}ULL, n);"
+      let cpuFallback := String.intercalate "\n" (cForHeader ++ [
+        s!"        out->m_data[i] = in0->m_data[i] * (uint64_t){scale}ULL + (uint64_t){bias}ULL;",
+        "    }"
+      ])
+      mkGlue sig "!out || !in0" "in0" 2 false ["in0"] gpuCall cpuFallback
     | [(_, _, _, .i64, .zipAdd)] =>
-      mkGlue "lean_native_sarray_u64* out, const lean_native_sarray_u64* in0, const lean_native_sarray_u64* in1" "!out || !in0 || !in1 || in1->m_size < in0->m_size" "in0" 3 false ["in0", "in1"]
-        "        int rc = lean_native_hybrid_zip_add_u64(out->m_data, in0->m_data, in1->m_data, n);"
-        "    for (size_t i = 0; i < n; ++i) {\n        out->m_data[i] = in0->m_data[i] + in1->m_data[i];\n    }"
+      let sig :=
+        "lean_native_sarray_u64* out, const lean_native_sarray_u64* in0, " ++
+        "const lean_native_sarray_u64* in1"
+      let nullChk := "!out || !in0 || !in1 || in1->m_size < in0->m_size"
+      let gpuCall := "        int rc = lean_native_hybrid_zip_add_u64(out->m_data, in0->m_data, in1->m_data, n);"
+      let cpuFallback := String.intercalate "\n" (cForHeader ++ [
+        "        out->m_data[i] = in0->m_data[i] + in1->m_data[i];",
+        "    }"
+      ])
+      mkGlue sig nullChk "in0" 3 false ["in0", "in1"] gpuCall cpuFallback
     | [(_, _, _, .i64, .zipMul)] =>
-      mkGlue "lean_native_sarray_u64* out, const lean_native_sarray_u64* in0, const lean_native_sarray_u64* in1" "!out || !in0 || !in1 || in1->m_size < in0->m_size" "in0" 3 false ["in0", "in1"]
-        "        void* args[4] = { (void*)&out->m_data, (void*)&in0->m_data, (void*)&in1->m_data, (void*)&n };\n        int rc = lean_native_launch_ptx_kernel(\"lean_native_kernel_zip_mul\", args, n);"
-        "    for (size_t i = 0; i < n; ++i) {\n        out->m_data[i] = in0->m_data[i] * in1->m_data[i];\n    }"
+      let sig :=
+        "lean_native_sarray_u64* out, const lean_native_sarray_u64* in0, " ++
+        "const lean_native_sarray_u64* in1"
+      let nullChk := "!out || !in0 || !in1 || in1->m_size < in0->m_size"
+      let gpuCall := String.intercalate "\n" [
+        "        void* args[4] = {",
+        "            (void*)&out->m_data, (void*)&in0->m_data, (void*)&in1->m_data, (void*)&n",
+        "        };",
+        "        int rc = lean_native_launch_ptx_kernel(\"lean_native_kernel_zip_mul\", args, n);"
+      ]
+      let cpuFallback := String.intercalate "\n" (cForHeader ++ [
+        "        out->m_data[i] = in0->m_data[i] * in1->m_data[i];",
+        "    }"
+      ])
+      mkGlue sig nullChk "in0" 3 false ["in0", "in1"] gpuCall cpuFallback
     | [(_, _, _, .i64, .dotProduct)] =>
-      mkGlue "lean_native_sarray_u64* out, const lean_native_sarray_u64* in0, const lean_native_sarray_u64* in1" "!out || !in0 || !in1 || out->m_size == 0 || in1->m_size < in0->m_size" "in0" 2 true ["in0", "in1"]
+      let sig :=
+        "lean_native_sarray_u64* out, const lean_native_sarray_u64* in0, " ++
+        "const lean_native_sarray_u64* in1"
+      let nullChk := "!out || !in0 || !in1 || out->m_size == 0 || in1->m_size < in0->m_size"
+      let gpuCall :=
         "        int rc = lean_native_hybrid_dot_product_u64(&out->m_data[0], in0->m_data, in1->m_data, n);"
+      let cpuFallback :=
         "    lean_native_cpu_dot_product_u64(&out->m_data[0], in0->m_data, in1->m_data, n);"
+      mkGlue sig nullChk "in0" 2 true ["in0", "in1"] gpuCall cpuFallback
     | [(_, _, _, .i64, .saxpy alphaBits)] =>
-      mkGlue "lean_native_sarray_u64* out, const lean_native_sarray_u64* x, const lean_native_sarray_u64* y" "!out || !x || !y || y->m_size < x->m_size" "x" 3 false ["x", "y"]
-        s!"        int rc = lean_native_hybrid_saxpy_u64(out->m_data, x->m_data, y->m_data, (uint64_t){alphaBits}ULL, n);"
-        s!"    for (size_t i = 0; i < n; ++i) \{\n        out->m_data[i] = (uint64_t){alphaBits}ULL * x->m_data[i] + y->m_data[i];\n    }"
+      let sig :=
+        "lean_native_sarray_u64* out, const lean_native_sarray_u64* x, " ++
+        "const lean_native_sarray_u64* y"
+      let nullChk := "!out || !x || !y || y->m_size < x->m_size"
+      let gpuCall :=
+        "        int rc = lean_native_hybrid_saxpy_u64(\n" ++
+        s!"            out->m_data, x->m_data, y->m_data, (uint64_t){alphaBits}ULL, n);"
+      let cpuFallback := String.intercalate "\n" (cForHeader ++ [
+        s!"        out->m_data[i] = (uint64_t){alphaBits}ULL * x->m_data[i] + y->m_data[i];",
+        "    }"
+      ])
+      mkGlue sig nullChk "x" 3 false ["x", "y"] gpuCall cpuFallback
     | [(_, _, _, .i64, .stencil1D3Pt wLeft wCenter wRight)] =>
-      mkGlue "lean_native_sarray_u64* out, const lean_native_sarray_u64* in0" "!out || !in0" "in0" 2 false ["in0"]
-        s!"        int rc = lean_native_hybrid_stencil1d_u64(out->m_data, in0->m_data, (uint64_t){wLeft}ULL, (uint64_t){wCenter}ULL, (uint64_t){wRight}ULL, n);"
-        s!"    for (size_t i = 0; i < n; ++i) \{\n        if (i == 0 || i + 1 >= n) \{\n            out->m_data[i] = in0->m_data[i];\n        } else \{\n            out->m_data[i] = in0->m_data[i - 1] * {wLeft}ULL + in0->m_data[i] * {wCenter}ULL + in0->m_data[i + 1] * {wRight}ULL;\n        }\n    }"
+      let sig := "lean_native_sarray_u64* out, const lean_native_sarray_u64* in0"
+      let gpuCall :=
+        "        int rc = lean_native_hybrid_stencil1d_u64(\n" ++
+        s!"            out->m_data, in0->m_data, (uint64_t){wLeft}ULL, " ++
+        s!"(uint64_t){wCenter}ULL, (uint64_t){wRight}ULL, n);"
+      let cpuFallback := String.intercalate "\n" (cForHeader ++ [
+        "        if (i == 0 || i + 1 >= n) {",
+        "            out->m_data[i] = in0->m_data[i];",
+        "        } else {",
+        s!"            out->m_data[i] = in0->m_data[i - 1] * {wLeft}ULL +",
+        s!"                in0->m_data[i] * {wCenter}ULL + in0->m_data[i + 1] * {wRight}ULL;",
+        "        }",
+        "    }"
+      ])
+      mkGlue sig "!out || !in0" "in0" 2 false ["in0"] gpuCall cpuFallback
     | _ => s!"#error \"unsupported hybrid dispatch for {d.name}\""
 
 /-- Generate C/LLVM host dispatch glue (`emitHybridHostGlue`) from a `HybridPartitionPlan`.
@@ -788,7 +849,9 @@ def emitHybridHostGlue (plan : HybridPartitionPlan) : String :=
     else
       let lines := plan.transferSchedule.map fun act =>
         let bufs := String.intercalate "," (act.bufferVars.map fun v => s!"%v{v}")
-        s!" *   - {act.declName}: buffers=[{bufs}] mode={act.mode} minElements={act.minElements} cowCheck={act.requiresHostCowCheck} sync={act.syncPoint}"
+        let cow := act.requiresHostCowCheck
+        s!" *   - {act.declName}: buffers=[{bufs}] mode={act.mode} " ++
+          s!"minElements={act.minElements} cowCheck={cow} sync={act.syncPoint}"
       "/*\n * Transfer Schedule:\n" ++ String.intercalate "\n" lines ++ "\n */"
 
   let declGlues := plan.gpuDecls.map fun d =>
@@ -927,7 +990,9 @@ def emitMetalZeroCopyHostGlue (plan : HybridPartitionPlan) : String :=
     "    if (posix_memalign(&ptr, 16384ULL, aligned) != 0) return NULL;",
     "    return ptr;",
     "}\n",
-    "static inline int lean_native_metal_route_admissible(const void* out_ptr, size_t out_capacity, const void* in0_ptr, size_t in0_capacity, size_t elem_bytes, size_t n) {",
+    "static inline int lean_native_metal_route_admissible(\n" ++
+      "    const void* out_ptr, size_t out_capacity, const void* in0_ptr,\n" ++
+      "    size_t in0_capacity, size_t elem_bytes, size_t n) {",
     "    if (!out_ptr || !in0_ptr || elem_bytes == 0ULL || n < LEAN_NATIVE_METAL_MIN_ELEMENTS) return 0;",
     "    if (n > (SIZE_MAX - 16383ULL) / elem_bytes) return 0;",
     "    size_t aligned_bytes = lean_native_align16k(n * elem_bytes);",
@@ -939,14 +1004,19 @@ def emitMetalZeroCopyHostGlue (plan : HybridPartitionPlan) : String :=
     "    return (((out_data | in_data | out_capacity | in0_capacity) & 16383ULL) == 0ULL) ? 1 : 0;",
     "}\n",
     "#ifdef __OBJC__",
-    "static inline id<MTLBuffer> lean_native_metal_buffer_nocopy(id<MTLDevice> dev, void* ptr, size_t bytes, size_t capacity) {",
+    "static inline id<MTLBuffer> lean_native_metal_buffer_nocopy(\n" ++
+      "    id<MTLDevice> dev, void* ptr, size_t bytes, size_t capacity) {",
     "    if (!dev || !ptr || (((uintptr_t)ptr & 16383ULL) != 0ULL)) return nil;",
     "    size_t aligned = lean_native_align16k(bytes);",
     "    if (capacity < aligned || (capacity & 16383ULL) != 0ULL) return nil;",
-    "    return [dev newBufferWithBytesNoCopy:ptr length:aligned options:MTLResourceStorageModeShared deallocator:nil];",
+    "    return [dev newBufferWithBytesNoCopy:ptr length:aligned " ++
+      "options:MTLResourceStorageModeShared\n" ++
+      "        deallocator:nil];",
     "}\n",
     "/* Unary 1D kernel contract: in0 -> buffer(0), out -> buffer(1), n -> buffer(2) */",
-    "static inline int lean_native_metal_dispatch_1d(const char* kernel_name, void* out_ptr, size_t out_capacity, const void* in0_ptr, size_t in0_capacity, size_t elem_bytes, size_t n) {",
+    "static inline int lean_native_metal_dispatch_1d(\n" ++
+      "    const char* kernel_name, void* out_ptr, size_t out_capacity,\n" ++
+      "    const void* in0_ptr, size_t in0_capacity, size_t elem_bytes, size_t n) {",
     "    if (!lean_native_metal_route_admissible(out_ptr, out_capacity, in0_ptr, in0_capacity, elem_bytes, n)) return 1;",
     "    @autoreleasepool {",
     "        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();",
@@ -984,7 +1054,10 @@ def emitMetalZeroCopyHostGlue (plan : HybridPartitionPlan) : String :=
     "    }",
     "}\n",
     "/* Binary 1D kernel contract: in0 -> buffer(0), in1 -> buffer(1), out -> buffer(2), n -> buffer(3) */",
-    "static inline int lean_native_metal_dispatch_binary_1d(const char* kernel_name, void* out_ptr, size_t out_capacity, const void* in0_ptr, size_t in0_capacity, const void* in1_ptr, size_t in1_capacity, size_t elem_bytes, size_t n) {",
+    "static inline int lean_native_metal_dispatch_binary_1d(\n" ++
+      "    const char* kernel_name, void* out_ptr, size_t out_capacity,\n" ++
+      "    const void* in0_ptr, size_t in0_capacity, const void* in1_ptr,\n" ++
+      "    size_t in1_capacity, size_t elem_bytes, size_t n) {",
     "    if (!lean_native_metal_route_admissible(out_ptr, out_capacity, in0_ptr, in0_capacity, elem_bytes, n)) return 1;",
     "    if (!lean_native_metal_route_admissible(out_ptr, out_capacity, in1_ptr, in1_capacity, elem_bytes, n)) return 1;",
     "    @autoreleasepool {",
@@ -1024,8 +1097,11 @@ def emitMetalZeroCopyHostGlue (plan : HybridPartitionPlan) : String :=
     "        return ([cmd status] == MTLCommandBufferStatusCompleted) ? 0 : 1;",
     "    }",
     "}\n",
-    "/* SAXPY FP16 kernel contract (lean_native_kernel_saxpy_f16): x -> buffer(0), y -> buffer(1), out -> buffer(2), alpha -> buffer(3), n -> buffer(4) */",
-    "static inline int lean_native_metal_dispatch_saxpy_f16(void* out_ptr, size_t out_capacity, const void* x_ptr, size_t x_capacity, const void* y_ptr, size_t y_capacity, uint16_t alpha_f16_bits, size_t n) {",
+    "/* SAXPY FP16 kernel contract (lean_native_kernel_saxpy_f16): " ++
+      "x -> buffer(0), y -> buffer(1), out -> buffer(2), alpha -> buffer(3), n -> buffer(4) */",
+    "static inline int lean_native_metal_dispatch_saxpy_f16(\n" ++
+      "    void* out_ptr, size_t out_capacity, const void* x_ptr, size_t x_capacity,\n" ++
+      "    const void* y_ptr, size_t y_capacity, uint16_t alpha_f16_bits, size_t n) {",
     "    if (!lean_native_metal_route_admissible(out_ptr, out_capacity, x_ptr, x_capacity, sizeof(uint16_t), n)) return 1;",
     "    if (!lean_native_metal_route_admissible(out_ptr, out_capacity, y_ptr, y_capacity, sizeof(uint16_t), n)) return 1;",
     "    @autoreleasepool {",
@@ -1066,11 +1142,14 @@ def emitMetalZeroCopyHostGlue (plan : HybridPartitionPlan) : String :=
     "    }",
     "}",
     "#endif\n",
-    "int lean_native_metal_zerocopy_saxpy_f16(void* out_ptr, size_t out_capacity, const void* x_ptr, size_t x_capacity, const void* y_ptr, size_t y_capacity, uint16_t alpha_f16_bits, size_t n) {",
+    "int lean_native_metal_zerocopy_saxpy_f16(\n" ++
+      "    void* out_ptr, size_t out_capacity, const void* x_ptr, size_t x_capacity,\n" ++
+      "    const void* y_ptr, size_t y_capacity, uint16_t alpha_f16_bits, size_t n) {",
     "    if (!lean_native_metal_route_admissible(out_ptr, out_capacity, x_ptr, x_capacity, sizeof(uint16_t), n)) return 1;",
     "    if (!lean_native_metal_route_admissible(out_ptr, out_capacity, y_ptr, y_capacity, sizeof(uint16_t), n)) return 1;",
     "#ifdef __OBJC__",
-    "    return lean_native_metal_dispatch_saxpy_f16(out_ptr, out_capacity, x_ptr, x_capacity, y_ptr, y_capacity, alpha_f16_bits, n);",
+    "    return lean_native_metal_dispatch_saxpy_f16(\n" ++
+      "        out_ptr, out_capacity, x_ptr, x_capacity, y_ptr, y_capacity, alpha_f16_bits, n);",
     "#else",
     "    (void)alpha_f16_bits;",
     "    return 1;",
@@ -1085,12 +1164,17 @@ def emitMetalZeroCopyHostGlue (plan : HybridPartitionPlan) : String :=
       let spec := declMetalBindingSpec d
       if spec.numInputs >= 2 then
         String.intercalate "\n" [
-          s!"/* Validated Metal Zero-Copy Plan: {vplan.kernelName}, minElems={vplan.workloadElems}, gridThreads={vplan.gridThreads} */",
-          s!"int lean_native_metal_zerocopy_{d.name}(void* out_ptr, size_t out_capacity, const void* in0_ptr, size_t in0_capacity, const void* in1_ptr, size_t in1_capacity, size_t n) \{",
+          s!"/* Validated Metal Zero-Copy Plan: {vplan.kernelName}, " ++
+            s!"minElems={vplan.workloadElems}, gridThreads={vplan.gridThreads} */",
+          s!"int lean_native_metal_zerocopy_{d.name}(" ++
+            "void* out_ptr, size_t out_capacity, const void* in0_ptr, size_t in0_capacity, " ++
+            "\n    const void* in1_ptr, size_t in1_capacity, size_t n) {",
           "    if (!lean_native_metal_route_admissible(out_ptr, out_capacity, in0_ptr, in0_capacity, sizeof(uint64_t), n)) return 1;",
           "    if (!lean_native_metal_route_admissible(out_ptr, out_capacity, in1_ptr, in1_capacity, sizeof(uint64_t), n)) return 1;",
           "#ifdef __OBJC__",
-          s!"    return lean_native_metal_dispatch_binary_1d(\"{spec.kernelName}\", out_ptr, out_capacity, in0_ptr, in0_capacity, in1_ptr, in1_capacity, sizeof(uint64_t), n);",
+          s!"    return lean_native_metal_dispatch_binary_1d(\"{spec.kernelName}\", " ++
+            "out_ptr, out_capacity, in0_ptr, in0_capacity,\n" ++
+            "        in1_ptr, in1_capacity, sizeof(uint64_t), n);",
           "#else",
           "    return 1; /* Non-ObjC TU -> fallback to ARM64 NEON CPU SIMD */",
           "#endif",
@@ -1098,13 +1182,18 @@ def emitMetalZeroCopyHostGlue (plan : HybridPartitionPlan) : String :=
         ]
       else
         String.intercalate "\n" [
-          s!"/* Validated Metal Zero-Copy Plan: {vplan.kernelName}, minElems={vplan.workloadElems}, gridThreads={vplan.gridThreads} */",
-          s!"int lean_native_metal_zerocopy_{d.name}(void* out_ptr, size_t out_capacity, const void* in0_ptr, size_t in0_capacity, size_t n) \{",
+          s!"/* Validated Metal Zero-Copy Plan: {vplan.kernelName}, " ++
+            s!"minElems={vplan.workloadElems}, gridThreads={vplan.gridThreads} */",
+          s!"int lean_native_metal_zerocopy_{d.name}(" ++
+            "void* out_ptr, size_t out_capacity,\n" ++
+            "    const void* in0_ptr, size_t in0_capacity, size_t n) {",
           "    if (!lean_native_metal_route_admissible(out_ptr, out_capacity, in0_ptr, in0_capacity, sizeof(uint64_t), n)) {",
           "        return 1; /* Route rejected by cost/alignment/capacity/alias gate -> CPU SIMD fallback */",
           "    }",
           "#ifdef __OBJC__",
-          s!"    return lean_native_metal_dispatch_1d(\"{spec.kernelName}\", out_ptr, out_capacity, in0_ptr, in0_capacity, sizeof(uint64_t), n);",
+          s!"    return lean_native_metal_dispatch_1d(\"{spec.kernelName}\", " ++
+            "out_ptr, out_capacity,\n" ++
+            "        in0_ptr, in0_capacity, sizeof(uint64_t), n);",
           "#else",
           "    return 1; /* Non-ObjC TU -> fallback to ARM64 NEON CPU SIMD */",
           "#endif",

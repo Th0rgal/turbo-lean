@@ -50,9 +50,11 @@ or wraps the target pointer width (`ArchWidth`), a misaligned `dataPtr`, and a n
 pointer to a non-empty slice.
 -/
 
-/-- Unboxed C99 scalar carried by a generated binding. -/
+/-- Unboxed C99 scalar or slice-struct value carried by a generated binding. -/
 inductive C99ScalarType where
-  | u8 | u16 | u32 | u64 | usize | i64 | f32 | f64 | ptr | constPtr
+  | u8 | i8 | bool | cBool | u16 | i16 | u32 | i32 | u64 | i64 | usize | f32 | f64
+  | ptr | constPtr | u8Ptr | constU8Ptr | u64Ptr | constU64Ptr | f64Ptr | constF64Ptr
+  | flatSlice | mutSlice
   deriving Repr, DecidableEq, Inhabited
 
 namespace C99ScalarType
@@ -60,23 +62,60 @@ namespace C99ScalarType
 /-- Natural C99 size in bytes parameterized by target pointer width (`8` on LP64, `4` on `wasm32`). -/
 def sizeOf (ty : C99ScalarType) (width : ArchWidth := .bits64) : Nat :=
   match ty with
-  | .u8 => 1
-  | .u16 => 2
-  | .u32 | .f32 => 4
+  | .u8 | .i8 | .bool | .cBool => 1
+  | .u16 | .i16 => 2
+  | .u32 | .i32 | .f32 => 4
   | .u64 | .i64 | .f64 => 8
-  | .usize | .ptr | .constPtr => width.ptrBytes
+  | .usize | .ptr | .constPtr | .u8Ptr | .constU8Ptr
+  | .u64Ptr | .constU64Ptr | .f64Ptr | .constF64Ptr => width.ptrBytes
+  | .flatSlice | .mutSlice => 3 * width.ptrBytes
 
 /-- Natural C99 alignment in bytes parameterized by target pointer width. -/
 def alignOf (ty : C99ScalarType) (width : ArchWidth := .bits64) : Nat :=
   match ty, width with
   | .u64, .bits32 | .i64, .bits32 | .f64, .bits32 => 8
+  | .flatSlice, _ | .mutSlice, _ => width.ptrBytes
   | _, _ => ty.sizeOf width
 
 /-- C spelling used by the generated header. -/
 def cSpelling : C99ScalarType → String
-  | .u8 => "uint8_t" | .u16 => "uint16_t" | .u32 => "uint32_t" | .u64 => "uint64_t"
-  | .usize => "size_t" | .i64 => "int64_t" | .f32 => "float" | .f64 => "double"
+  | .u8 => "uint8_t" | .i8 => "int8_t" | .bool => "bool" | .cBool => "_Bool"
+  | .u16 => "uint16_t" | .i16 => "int16_t" | .u32 => "uint32_t" | .i32 => "int32_t"
+  | .u64 => "uint64_t" | .i64 => "int64_t" | .usize => "size_t"
+  | .f32 => "float" | .f64 => "double"
   | .ptr => "void*" | .constPtr => "const void*"
+  | .u8Ptr => "uint8_t*" | .constU8Ptr => "const uint8_t*"
+  | .u64Ptr => "uint64_t*" | .constU64Ptr => "const uint64_t*"
+  | .f64Ptr => "double*" | .constF64Ptr => "const double*"
+  | .flatSlice => "lean_native_flat_slice_t" | .mutSlice => "lean_native_mut_slice_t"
+
+/-- Parse a C99 type spelling emitted by the C-ABI frontends into a typed `C99ScalarType`. -/
+def ofCSpelling? (raw : String) : Option C99ScalarType :=
+  let t := raw.trimAscii.toString
+  if t == "uint8_t" then some .u8
+  else if t == "int8_t" then some .i8
+  else if t == "bool" then some .bool
+  else if t == "_Bool" then some .cBool
+  else if t == "uint16_t" then some .u16
+  else if t == "int16_t" then some .i16
+  else if t == "uint32_t" then some .u32
+  else if t == "int32_t" then some .i32
+  else if t == "uint64_t" then some .u64
+  else if t == "int64_t" then some .i64
+  else if t == "size_t" then some .usize
+  else if t == "float" then some .f32
+  else if t == "double" then some .f64
+  else if t == "void*" then some .ptr
+  else if t == "const void*" then some .constPtr
+  else if t == "uint8_t*" then some .u8Ptr
+  else if t == "const uint8_t*" then some .constU8Ptr
+  else if t == "uint64_t*" then some .u64Ptr
+  else if t == "const uint64_t*" then some .constU64Ptr
+  else if t == "double*" then some .f64Ptr
+  else if t == "const double*" then some .constF64Ptr
+  else if t == "lean_native_flat_slice_t" then some .flatSlice
+  else if t == "lean_native_mut_slice_t" then some .mutSlice
+  else none
 
 end C99ScalarType
 
@@ -124,12 +163,18 @@ structure C99SliceDesc where
   backingBytes : Nat := 0
   deriving Repr, DecidableEq, Inhabited
 
-/-- Typed C function signature derived from scalar layouts. -/
+/-- Typed C function signature derived from scalar layouts (`retTy = none` represents `void`). -/
 structure C99FnSig where
   cSymbol : String
   params : List C99FieldSpec
-  retTy : C99ScalarType
+  retTy : Option C99ScalarType := none
   deriving Repr, DecidableEq, Inhabited
+
+/-- C99 return type spelling (`"void"` when `retTy = none`). -/
+def C99FnSig.retCSpelling (sig : C99FnSig) : String :=
+  match sig.retTy with
+  | some ty => ty.cSpelling
+  | none => "void"
 
 /-- Round `n` up to the next positive multiple of `a`; zero alignment fails closed. -/
 def c99AlignUp (n a : Nat) : Option Nat :=
@@ -257,23 +302,39 @@ def emitInlineC99Typedef (layout : C99StructLayout) : String :=
   let fields := String.intercalate " " (layout.fields.map fun f => s!"{f.ty.cSpelling} {f.name};")
   s!"typedef struct \{ {fields} } {layout.name};"
 
-/-- Render C11 `_Static_assert`s verifying `sizeof` for a computed struct layout across LP64 and ILP32/`wasm32`. -/
+/-- Render C11 `_Static_assert`s verifying `sizeof`, `_Alignof`, and `offsetof`
+    for computed slice layouts across LP64 and `wasm32`. -/
 def emitSliceStaticAsserts (flat64 mut64 flat32 mut32 : C99StructLayout) : List String :=
+  let mkChecks (layout : C99StructLayout) : List String :=
+    [ s!"_Static_assert(sizeof({layout.name}) == {layout.structSize}, \"{layout.name} size\");",
+      s!"_Static_assert(_Alignof({layout.name}) == {layout.structAlign}, \"{layout.name} align\");" ] ++
+    layout.fields.map fun f =>
+      s!"_Static_assert(offsetof({layout.name}, {f.name}) == {f.offset}, \"{layout.name}.{f.name} offset\");"
   [ "#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L",
-    "#if defined(__wasm32__) || (defined(UINTPTR_MAX) && UINTPTR_MAX == 0xFFFFFFFFU)",
-    s!"_Static_assert(sizeof({flat32.name}) == {flat32.structSize}, \"{flat32.name} size == {flat32.structSize}\");",
-    s!"_Static_assert(sizeof({mut32.name}) == {mut32.structSize}, \"{mut32.name} size == {mut32.structSize}\");",
-    "#else",
-    s!"_Static_assert(sizeof({flat64.name}) == {flat64.structSize}, \"{flat64.name} size == {flat64.structSize}\");",
-    s!"_Static_assert(sizeof({mut64.name}) == {mut64.structSize}, \"{mut64.name} size == {mut64.structSize}\");",
-    "#endif",
+    "#if defined(__wasm32__)" ] ++
+  mkChecks flat32 ++ mkChecks mut32 ++
+  [ "#elif defined(__LP64__) || defined(_LP64) || (defined(UINTPTR_MAX) && UINTPTR_MAX == 0xFFFFFFFFFFFFFFFFULL)" ] ++
+  mkChecks flat64 ++ mkChecks mut64 ++
+  [ "#endif",
     "#endif" ]
 
 /-- Render target-specific C11 `_Static_assert`s when an explicit `ArchWidth` is pinned. -/
-def emitPinnedSliceStaticAsserts (flatLayout mutLayout : C99StructLayout) : List String :=
+def emitPinnedSliceStaticAsserts (flatLayout mutLayout : C99StructLayout)
+    (width : ArchWidth := .bits64) : List String :=
+  let archGuard :=
+    match width with
+    | .bits32 => "#if defined(__wasm32__)"
+    | .bits64 =>
+      "#if defined(__LP64__) || defined(_LP64) || (defined(UINTPTR_MAX) && UINTPTR_MAX == 0xFFFFFFFFFFFFFFFFULL)"
+  let mkChecks (layout : C99StructLayout) : List String :=
+    [ s!"_Static_assert(sizeof({layout.name}) == {layout.structSize}, \"{layout.name} size\");",
+      s!"_Static_assert(_Alignof({layout.name}) == {layout.structAlign}, \"{layout.name} align\");" ] ++
+    layout.fields.map fun f =>
+      s!"_Static_assert(offsetof({layout.name}, {f.name}) == {f.offset}, \"{layout.name}.{f.name} offset\");"
   [ "#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L",
-    s!"_Static_assert(sizeof({flatLayout.name}) == {flatLayout.structSize}, \"{flatLayout.name} size == {flatLayout.structSize}\");",
-    s!"_Static_assert(sizeof({mutLayout.name}) == {mutLayout.structSize}, \"{mutLayout.name} size == {mutLayout.structSize}\");",
+    archGuard ] ++
+  mkChecks flatLayout ++ mkChecks mutLayout ++
+  [ "#endif",
     "#endif" ]
 
 private def lnirTypeToRustType : LNIRType → String
@@ -290,6 +351,24 @@ structure CAbiBindingSig where
   /-- Source-text signature (`def … :=` prefix) the binding was parsed from; empty for LNIR-derived sigs. -/
   srcSig : String := ""
   deriving Repr, Inhabited
+
+/-- Convert a parsed or LNIR-derived `CAbiBindingSig` into a typed `C99FnSig`. -/
+def CAbiBindingSig.toC99FnSig (s : CAbiBindingSig) : Option C99FnSig := do
+  let typedParams ← s.params.mapM fun (nm, cTy, _) => do
+    let ty ← C99ScalarType.ofCSpelling? cTy
+    pure ({ name := nm, ty } : C99FieldSpec)
+  let retRaw := s.retCType.trimAscii.toString
+  let retOpt ←
+    if retRaw == "void" then some none
+    else (C99ScalarType.ofCSpelling? retRaw).map some
+  some { cSymbol := s.cSymbol, params := typedParams, retTy := retOpt }
+
+/-- Emit a C99 function prototype from a typed `C99FnSig`. -/
+def emitC99FnProto (sig : C99FnSig) : String :=
+  let params :=
+    if sig.params.isEmpty then "void"
+    else String.intercalate ", " (sig.params.map fun p => s!"{p.ty.cSpelling} {p.name}")
+  s!"{sig.retCSpelling} {sig.cSymbol}({params});"
 
 private def mapLeanTypeStr (tyRaw : String) : String × String :=
   let t := tyRaw.trimAscii.toString
@@ -437,12 +516,17 @@ def readLeanSourceExpandingUmbrella (filePath : String) : IO String := do
 /-- `note?` (e.g. `signaturesOnlyMarker`) is recorded as provenance metadata in every emitted artifact.
     Slice typedefs (`lean_native_flat_slice_t`, `lean_native_mut_slice_t`) and C11 `_Static_assert`s
     are derived directly from `computeC99StructLayout` across `ArchWidth` (`24` bytes on 64-bit LP64,
-    `12` bytes on 32-bit `wasm32`). -/
+    `12` bytes on 32-bit `wasm32`), and exported function prototypes route through typed `C99FnSig`. -/
 def emitCAbiHeaderFromSigs (sigs : List CAbiBindingSig) (note? : Option String := none)
     (width? : Option ArchWidth := none) : String :=
   let declProtos := sigs.map fun s =>
-    let paramsC := if s.params.isEmpty then "void" else String.intercalate ", " (s.params.map fun (n, cTy, _) => s!"{cTy} {n}")
-    s!"{s.retCType} {s.cSymbol}({paramsC});"
+    match s.toC99FnSig with
+    | some fnSig => emitC99FnProto fnSig
+    | none =>
+      let paramsC :=
+        if s.params.isEmpty then "void"
+        else String.intercalate ", " (s.params.map fun (n, cTy, _) => s!"{cTy} {n}")
+      s!"{s.retCType} {s.cSymbol}({paramsC});"
   let activeWidth := width?.getD .bits64
   let flat64 := (computeC99StructLayout "lean_native_flat_slice_t" flatSliceFieldSpecs .bits64).getD
     { name := "lean_native_flat_slice_t", fields := [], structAlign := 8, structSize := 24 }
@@ -455,27 +539,47 @@ def emitCAbiHeaderFromSigs (sigs : List CAbiBindingSig) (note? : Option String :
   let activeFlat := if activeWidth == .bits32 then flat32 else flat64
   let activeMut := if activeWidth == .bits32 then mut32 else mut64
   let staticAsserts := match width? with
-    | some .bits32 => emitPinnedSliceStaticAsserts flat32 mut32
-    | some .bits64 => emitPinnedSliceStaticAsserts flat64 mut64
+    | some .bits32 => emitPinnedSliceStaticAsserts flat32 mut32 .bits32
+    | some .bits64 => emitPinnedSliceStaticAsserts flat64 mut64 .bits64
     | none => emitSliceStaticAsserts flat64 mut64 flat32 mut32
+  let widthTag := if activeWidth == .bits32 then "wasm32" else "LP64"
   String.intercalate "\n" ([
     "/* Auto-generated C99 Header by lean-native C-ABI Binding Generator */",
-    s!"/* ABI Slice Layout ({if activeWidth == .bits32 then "ILP32/wasm32" else "LP64"}): sizeof({activeFlat.name}) == {activeFlat.structSize}, alignof == {activeFlat.structAlign} */"] ++
+    s!"/* ABI Slice Layout ({widthTag}): sizeof({activeFlat.name}) == {activeFlat.structSize}, " ++
+      s!"alignof == {activeFlat.structAlign} */"] ++
     (note?.map (s!"/* {·} */")).toList ++ [
-    "#pragma once", "#ifndef LEAN_NATIVE_GENERATED_C_ABI_H", "#define LEAN_NATIVE_GENERATED_C_ABI_H",
-    "#include <stdint.h>", "#include <stddef.h>",
+    "#pragma once",
+    "#ifndef LEAN_NATIVE_GENERATED_C_ABI_H",
+    "#define LEAN_NATIVE_GENERATED_C_ABI_H",
+    "#include <stdint.h>",
+    "#include <stddef.h>",
     emitInlineC99Typedef activeFlat,
     emitInlineC99Typedef activeMut,
     "/* Zero-Runtime SliceOut C-ABI Contract: packed u64 span (start:32 | len:24 | kind:8) */",
-    "typedef uint32_t (*lean_native_slice_out_scan_fn)(const uint8_t* ptr, size_t len, uint64_t* out_spans, size_t cap, uint64_t* state_io);",
-    "static inline uint64_t lean_native_pack_span(uint32_t start, uint32_t len, uint8_t kind) { return ((uint64_t)start << 32) | ((uint64_t)(len & 0xFFFFFFU) << 8) | (uint64_t)kind; }",
-    "static inline uint32_t lean_native_span_start(uint64_t span) { return (uint32_t)(span >> 32); }",
-    "static inline uint32_t lean_native_span_len(uint64_t span) { return (uint32_t)((span >> 8) & 0xFFFFFFU); }",
-    "static inline uint8_t lean_native_span_kind(uint64_t span) { return (uint8_t)(span & 0xFFU); }"
+    "typedef uint32_t (*lean_native_slice_out_scan_fn)(",
+    "    const uint8_t* ptr, size_t len, uint64_t* out_spans, size_t cap, uint64_t* state_io);",
+    "static inline uint64_t lean_native_pack_span(uint32_t start, uint32_t len, uint8_t kind) {",
+    "    return ((uint64_t)start << 32) | ((uint64_t)(len & 0xFFFFFFU) << 8) | (uint64_t)kind;",
+    "}",
+    "static inline uint32_t lean_native_span_start(uint64_t span) {",
+    "    return (uint32_t)(span >> 32);",
+    "}",
+    "static inline uint32_t lean_native_span_len(uint64_t span) {",
+    "    return (uint32_t)((span >> 8) & 0xFFFFFFU);",
+    "}",
+    "static inline uint8_t lean_native_span_kind(uint64_t span) {",
+    "    return (uint8_t)(span & 0xFFU);",
+    "}"
   ] ++ staticAsserts ++ [
-    "#ifdef __cplusplus", "extern \"C\" {", "#endif"
+    "#ifdef __cplusplus",
+    "extern \"C\" {",
+    "#endif"
   ] ++ declProtos ++ [
-    "#ifdef __cplusplus", "}", "#endif", "#endif /* LEAN_NATIVE_GENERATED_C_ABI_H */", ""])
+    "#ifdef __cplusplus",
+    "}",
+    "#endif",
+    "#endif /* LEAN_NATIVE_GENERATED_C_ABI_H */",
+    ""])
 
 /-- Generate ABI declarations and forwarding wrappers only; domain execution stays in the compiled library. -/
 def emitCAbiRustFromSigs (sigs : List CAbiBindingSig) (note? : Option String := none) : String :=
@@ -487,19 +591,32 @@ def emitCAbiRustFromSigs (sigs : List CAbiBindingSig) (note? : Option String := 
     let retPart := if s.retRustType == "()" then "" else s!" -> {s.retRustType}"
     let paramsRs := String.intercalate ", " (s.params.map fun (n, _, rsTy) => s!"{n}: {rsTy}")
     let argsRs := String.intercalate ", " (s.params.map fun (n, _, _) => n)
-    s!"#[cfg_attr(not(debug_assertions), inline(always))]\npub unsafe fn {s.cSymbol}({paramsRs}){retPart} \{\n    unsafe \{ c_abi::{s.cSymbol}({argsRs}) }\n}"
-  String.intercalate "\n" (["// Generated ABI forwarding wrappers; no independent Rust kernel implementation."] ++
-    (note?.map (s!"// {·}")).toList ++ ["pub mod c_abi {", "    extern \"C\" {"] ++ declExterns ++ ["    }", "}"] ++ declWrappers ++ [""])
+    String.intercalate "\n" [
+      "#[cfg_attr(not(debug_assertions), inline(always))]",
+      s!"pub unsafe fn {s.cSymbol}({paramsRs}){retPart} \{",
+      s!"    unsafe \{ c_abi::{s.cSymbol}({argsRs}) }",
+      "}"
+    ]
+  String.intercalate "\n" ([
+    "// Generated ABI forwarding wrappers; no independent Rust kernel implementation."
+  ] ++ (note?.map (s!"// {·}")).toList ++ [
+    "pub mod c_abi {",
+    "    extern \"C\" {"
+  ] ++ declExterns ++ ["    }", "}"] ++ declWrappers ++ [""])
 
 def emitGuardFixturesJson (sourcePath : String) (sigs : List CAbiBindingSig) (guards : List (String × String))
     (note? : Option String := none) : String :=
   let esc := LeanNative.IR.jsonEscape
   let expJson := String.intercalate "," (sigs.map fun s =>
-    s!"\{\"c_symbol\":\"{esc s.cSymbol}\",\"lean_name\":\"{esc s.leanName}\",\"arity\":{s.params.length},\"ret_c\":\"{esc s.retCType}\",\"ret_rust\":\"{esc s.retRustType}\"}")
+    s!"\{\"c_symbol\":\"{esc s.cSymbol}\",\"lean_name\":\"{esc s.leanName}\"," ++
+      s!"\"arity\":{s.params.length},\"ret_c\":\"{esc s.retCType}\"," ++
+      s!"\"ret_rust\":\"{esc s.retRustType}\"}")
   let prov := match note? with | some n => "\"provenance\":\"" ++ esc n ++ "\"," | none => ""
   let gJson := String.intercalate "," (guards.map fun (lhs, rhs) =>
     s!"\{\"expr\":\"{esc lhs}\",\"expected\":\"{esc rhs}\"}")
-  s!"\{\"schema\":\"lean-native.cabi-fixtures.v1\",\"source\":\"{esc sourcePath}\",{prov}\"exports_count\":{sigs.length},\"guards_count\":{guards.length},\"exports\":[{expJson}],\"guards\":[{gJson}]}\n"
+  s!"\{\"schema\":\"lean-native.cabi-fixtures.v1\",\"source\":\"{esc sourcePath}\"," ++
+    s!"{prov}\"exports_count\":{sigs.length},\"guards_count\":{guards.length}," ++
+    s!"\"exports\":[{expJson}],\"guards\":[{gJson}]}\n"
 
 private def cTypeToSwiftType (cTy : String) : String :=
   if cTy == "uint8_t" then "UInt8"
@@ -538,9 +655,9 @@ def emitCAbiSwiftFromSigs (sigs : List CAbiBindingSig) (enumName : String := "Tu
     s!"public enum {enumName} \{"
   ] ++ enumMethods ++ ["}", ""])
 
-/-- Emit a C-ABI header (`.h`) for an `LNIRModule` parameterized by optional target `ArchWidth`. -/
-def emitCAbiHeader (m : LNIRModule) (arch? : Option TargetArch := none) : String :=
-  emitCAbiHeaderFromSigs (moduleToCAbiSigs m) none (arch?.map ArchWidth.ofTargetArch)
+/-- Emit a C-ABI header (`.h`) for an `LNIRModule` parameterized by target `TargetArch`. -/
+def emitCAbiHeader (m : LNIRModule) (arch : TargetArch := .x86_64) : String :=
+  emitCAbiHeaderFromSigs (moduleToCAbiSigs m) none (some (ArchWidth.ofTargetArch arch))
 
 /-- Publish one file by POSIX rename from an exclusively reserved sibling directory.
     Preserves any previous file on staging failure; power-loss durability is assumed. -/
@@ -640,7 +757,8 @@ def verifyObjectBytesForTarget (arch : TargetArch) (b : ByteArray) : Bool × Str
   else
     match arch with
     | .x86_64 =>
-      let isElf64 := b.size >= 64 && b.get! 0 == 0x7F && b.get! 1 == 0x45 && b.get! 2 == 0x4C && b.get! 3 == 0x46 && b.get! 4 == 2 && b.get! 5 == 1
+      let isElf64 := b.size >= 64 && b.get! 0 == 0x7F && b.get! 1 == 0x45 &&
+        b.get! 2 == 0x4C && b.get! 3 == 0x46 && b.get! 4 == 2 && b.get! 5 == 1
       let etype := readU16LE b 16
       let mach := readU16LE b 18
       if !isElf64 then (false, "expected ELF64 little-endian header (>= 64 bytes)")
@@ -648,7 +766,8 @@ def verifyObjectBytesForTarget (arch : TargetArch) (b : ByteArray) : Bool × Str
       else if mach != 0x3E then (false, s!"expected ELF e_machine=0x3E (EM_X86_64), got {mach}")
       else (true, "ELF64 ET_REL EM_X86_64; OS/ABI not verified")
     | .arm64 | .androidArm64 =>
-      let isElf64 := b.size >= 64 && b.get! 0 == 0x7F && b.get! 1 == 0x45 && b.get! 2 == 0x4C && b.get! 3 == 0x46 && b.get! 4 == 2 && b.get! 5 == 1
+      let isElf64 := b.size >= 64 && b.get! 0 == 0x7F && b.get! 1 == 0x45 &&
+        b.get! 2 == 0x4C && b.get! 3 == 0x46 && b.get! 4 == 2 && b.get! 5 == 1
       let etype := readU16LE b 16
       let mach := readU16LE b 18
       if !isElf64 then (false, "expected ELF64 little-endian header (>= 64 bytes)")
@@ -712,9 +831,10 @@ def verifyStaticArchiveBytes (b expectedObj : ByteArray) : Bool :=
               | some n =>
                 if n > size then false
                 else
+                  let nulSep := String.singleton (Char.ofNat 0)
                   let name :=
                     if n == 0 then rawName
-                    else ((String.fromUTF8! (b.extract start (start + n))).splitOn (String.singleton (Char.ofNat 0))).headD "" |>.trimAscii.toString
+                    else ((String.fromUTF8! (b.extract start (start + n))).splitOn nulSep).headD "" |>.trimAscii.toString
                   let isIndex := name == "/" || name == "//" || name == "/SYM64/" ||
                     name == "__.SYMDEF" || name == "__.SYMDEF SORTED"
                   if isIndex then members next count fuel
@@ -804,18 +924,60 @@ def unmarshalSlice (v : C99ByteView) (payload : ByteArray) : Option ByteArray :=
       some (unmarshalStridedGo v.bytes v.base stride v.elemSize v.len payload)
     else none
 
-/-- Header fragment for one computed struct, including explicit offsets. -/
-def emitC99StructLayoutDecl (layout : C99StructLayout) : String :=
+/-- Derive the explicit `C99SliceDesc` for a `C99ByteView` so slice descriptor validation
+    gates every host-side C-ABI slice call. -/
+def C99ByteView.toSliceDesc (v : C99ByteView) : C99SliceDesc :=
+  { dataPtr := some v.base
+    len := v.len
+    byteStride := v.effectiveStride
+    elemSize := v.elemSize
+    align := v.align
+    backingBytes := v.bytes.size }
+
+/-- Execute a validated host-side C-ABI slice call: verify `validateC99Slice` for `v.width`,
+    marshal strided elements into a contiguous packed payload, run `kernel`, and unmarshal
+    the transformed packed payload back into `v.bytes` while preserving non-addressed bytes. -/
+def execValidatedSliceHostCall (v : C99ByteView) (kernel : ByteArray → ByteArray) : Option ByteArray :=
+  if validateC99Slice v.toSliceDesc v.width then
+    match marshalSlice v with
+    | none => none
+    | some packedIn => unmarshalSlice v (kernel packedIn)
+  else none
+
+/-- Header fragment for one computed struct, including explicit offsets and C11 `_Static_assert`s
+    for `sizeof`, `_Alignof`, and per-field `offsetof` when `width?` is specified. -/
+def emitC99StructLayoutDecl (layout : C99StructLayout)
+    (width? : Option ArchWidth := some .bits64) : String :=
   let fields := layout.fields.map fun f =>
     s!"  {f.ty.cSpelling} {f.name}; /* offset {f.offset}, size {f.size}, align {f.align} */"
+  let staticAsserts :=
+    match width? with
+    | none => []
+    | some width =>
+      let archGuard :=
+        match width with
+        | .bits32 => "#if defined(__wasm32__)"
+        | .bits64 =>
+          "#if defined(__LP64__) || defined(_LP64) || (defined(UINTPTR_MAX) && UINTPTR_MAX == 0xFFFFFFFFFFFFFFFFULL)"
+      let fieldAsserts := layout.fields.map fun f =>
+        s!"_Static_assert(offsetof({layout.name}, {f.name}) == {f.offset}, \"{layout.name}.{f.name} offset\");"
+      [ "#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L",
+        archGuard,
+        s!"_Static_assert(sizeof({layout.name}) == {layout.structSize}, \"{layout.name} size\");",
+        s!"_Static_assert(_Alignof({layout.name}) == {layout.structAlign}, \"{layout.name} align\");" ] ++
+      fieldAsserts ++
+      [ "#endif",
+        "#endif" ]
   String.intercalate "\n" ([
     s!"typedef struct {layout.name} \{"] ++ fields ++ [
     s!"} {layout.name};",
-    s!"/* sizeof({layout.name}) = {layout.structSize}; alignof({layout.name}) = {layout.structAlign} */"])
+    s!"/* sizeof({layout.name}) = {layout.structSize}; alignof({layout.name}) = {layout.structAlign} */"] ++
+    staticAsserts)
 
-/-- Validate and emit a struct declaration. -/
-def emitValidatedC99Struct (name : String) (specs : List C99FieldSpec) (width : ArchWidth := .bits64) : Option String :=
-  (computeC99StructLayout name specs width).map emitC99StructLayoutDecl
+/-- Validate and emit a struct declaration for `width`. -/
+def emitValidatedC99Struct (name : String) (specs : List C99FieldSpec)
+    (width : ArchWidth := .bits64) : Option String :=
+  (computeC99StructLayout name specs width).map (fun layout => emitC99StructLayoutDecl layout (some width))
 
 /-- Host 64-bit float view (`FloatArray`, 8-byte IEEE-754 scalars) for C99 `double*` slice marshaling. -/
 structure C99FloatView where
@@ -843,31 +1005,67 @@ def unmarshalFloatSlice (backing : FloatArray) (base : Nat) (payload : Array Flo
     some ⟨backing.data.extract 0 base ++ payload ++ backing.data.extract (base + payload.size) backing.size⟩
   else none
 
-/-- Emit a C99 function prototype from a typed `C99FnSig`. -/
-def emitC99FnProto (sig : C99FnSig) : String :=
-  let params :=
-    if sig.params.isEmpty then "void"
-    else String.intercalate ", " (sig.params.map fun p => s!"{p.ty.cSpelling} {p.name}")
-  s!"{sig.retTy.cSpelling} {sig.cSymbol}({params});"
-
 /-- Emit a complete C99 header + forwarding shim pair for validated structs and typed function signatures. -/
 def emitValidatedC99Bundle (structs : List (String × List C99FieldSpec)) (fns : List C99FnSig)
     (width : ArchWidth := .bits64) : Option (String × String) := do
   let layouts ← structs.mapM (fun (nm, specs) => computeC99StructLayout nm specs width)
-  let structDecls := layouts.map emitC99StructLayoutDecl
+  let structDecls := layouts.map (fun layout => emitC99StructLayoutDecl layout (some width))
   let protos := fns.map emitC99FnProto
   let shims := fns.map fun fn =>
     let params :=
       if fn.params.isEmpty then "void"
       else String.intercalate ", " (fn.params.map fun p => s!"{p.ty.cSpelling} {p.name}")
     let args := String.intercalate ", " (fn.params.map (·.name))
+    let callStmt :=
+      match fn.retTy with
+      | some _ => s!"  return {fn.cSymbol}({args});"
+      | none => s!"  {fn.cSymbol}({args});"
     String.intercalate "\n" [
-      s!"{fn.retTy.cSpelling} {fn.cSymbol}_c99_shim({params}) \{",
-      s!"  return {fn.cSymbol}({args});",
+      s!"{fn.retCSpelling} {fn.cSymbol}_c99_shim({params}) \{",
+      callStmt,
       "}"
     ]
-  let hdr := String.intercalate "\n\n" (["#pragma once", "#include <stdint.h>", "#include <stddef.h>"] ++ structDecls ++ protos) ++ "\n"
-  let shim := String.intercalate "\n\n" (["#include <stdint.h>", "#include <stddef.h>"] ++ protos ++ shims) ++ "\n"
+  let hdrParts :=
+    ["#pragma once", "#ifndef LEAN_NATIVE_VALIDATED_C99_BUNDLE_H", "#define LEAN_NATIVE_VALIDATED_C99_BUNDLE_H",
+     "#include <stdint.h>", "#include <stddef.h>"] ++
+    structDecls ++ protos ++
+    ["#endif /* LEAN_NATIVE_VALIDATED_C99_BUNDLE_H */"]
+  let shimParts :=
+    ["#include <stdint.h>", "#include <stddef.h>",
+     "#ifndef LEAN_NATIVE_VALIDATED_C99_BUNDLE_H"] ++
+    structDecls ++ ["#endif"] ++ protos ++ shims
+  let hdr := String.intercalate "\n\n" hdrParts ++ "\n"
+  let shim := String.intercalate "\n\n" shimParts ++ "\n"
   some (hdr, shim)
+
+/-- Syntax-check emitted C11 text with `clang -std=c11 -fsyntax-only`.
+    `arch` selects the LP64 host target or `wasm32`. -/
+def c11SyntaxCheck (src : String) (arch : TargetArch := .x86_64) : IO (Bool × String) := do
+  let nonce ← IO.monoNanosNow
+  let path := s!"/tmp/lean_native_cabi_{nonce}.c"
+  IO.FS.writeFile path src
+  try
+    let sysClang : System.FilePath := "/usr/bin/clang"
+    let brewClang : System.FilePath := "/opt/homebrew/opt/llvm/bin/clang"
+    let sysrootOpt ← IO.getEnv "LEAN_SYSROOT"
+    let extraIncArgs : Array String :=
+      match sysrootOpt with
+      | some sr => #[s!"-isystem{sr}/include/clang"]
+      | none => #[]
+    let (clangCmd, incArgs) ←
+      if ← sysClang.pathExists then pure (sysClang.toString, #[])
+      else if ← brewClang.pathExists then pure (brewClang.toString, #[])
+      else pure ("clang", extraIncArgs)
+    let targetArgs : Array String :=
+      match arch with
+      | .wasm32 => #["--target=wasm32", "-ffreestanding"]
+      | _ => #[]
+    let out ← IO.Process.output {
+      cmd := clangCmd
+      args := targetArgs ++ incArgs ++ #["-std=c11", "-fsyntax-only", path]
+    }
+    return (out.exitCode == 0, out.stderr.trimAscii.toString)
+  finally
+    try IO.FS.removeFile path catch _ => pure ()
 
 end LeanNative.Driver.CoreCLI

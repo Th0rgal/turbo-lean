@@ -34,17 +34,30 @@ def mixedStructSpecs : List C99FieldSpec :=
 
 def sampleFnSigs : List C99FnSig :=
   [ { cSymbol := "lean_native_scale_slice",
-      params := [{ name := "data", ty := .ptr }, { name := "len", ty := .usize }, { name := "alpha", ty := .f64 }],
-      retTy := .u32 } ]
+      params := [
+        { name := "data", ty := .ptr },
+        { name := "len", ty := .usize },
+        { name := "alpha", ty := .f64 }
+      ],
+      retTy := some .u32 },
+    { cSymbol := "lean_native_flush_slice",
+      params := [{ name := "slice", ty := .mutSlice }],
+      retTy := none } ]
 
 #guard match emitValidatedC99Bundle [("lean_native_packet_t", mixedStructSpecs)] sampleFnSigs with
   | some (hdr, shim) =>
     (hdr.splitOn "typedef struct lean_native_packet_t {").length > 1 &&
     (hdr.splitOn "uint64_t count; /* offset 8, size 8, align 8 */").length > 1 &&
     (hdr.splitOn "sizeof(lean_native_packet_t) = 24; alignof(lean_native_packet_t) = 8").length > 1 &&
+    (hdr.splitOn "_Static_assert(sizeof(lean_native_packet_t) == 24,").length > 1 &&
+    (hdr.splitOn "_Static_assert(_Alignof(lean_native_packet_t) == 8,").length > 1 &&
+    (hdr.splitOn "_Static_assert(offsetof(lean_native_packet_t, count) == 8,").length > 1 &&
     (hdr.splitOn "uint32_t lean_native_scale_slice(void* data, size_t len, double alpha);").length > 1 &&
+    (hdr.splitOn "void lean_native_flush_slice(lean_native_mut_slice_t slice);").length > 1 &&
     (shim.splitOn "uint32_t lean_native_scale_slice_c99_shim(void* data, size_t len, double alpha)").length > 1 &&
-    (shim.splitOn "return lean_native_scale_slice(data, len, alpha);").length > 1
+    (shim.splitOn "return lean_native_scale_slice(data, len, alpha);").length > 1 &&
+    (shim.splitOn "void lean_native_flush_slice_c99_shim(lean_native_mut_slice_t slice)").length > 1 &&
+    (shim.splitOn "  lean_native_flush_slice(slice);").length > 1
   | none => false
 
 #guard checkedByteLen 1024 8 == some 8192
@@ -196,5 +209,79 @@ def lifecycleHeap : HeapState :=
     | some buf => stFinal.getBufRefCount buf == 1 && buf.exclusive == true && buf.data == #[7]
     | none => false
   | .error _ => false
+
+/-- End-to-end LNIR C-ABI signature coverage across scalar, pointer, 256-bit, and unit types:
+    every `moduleToCAbiSigs` entry converts cleanly through `CAbiBindingSig.toC99FnSig` (`some fnSig`). -/
+def diverseCAbiModule : LNIRModule := {
+  moduleName := "DiverseCAbi"
+  decls := [
+    { name := "kern_sarray"
+      params := [
+        { id := 0, name := "x", ty := .sarray .i64 },
+        { id := 1, name := "len", ty := .usize },
+        { id := 2, name := "alpha", ty := .f64 },
+        { id := 3, name := "beta", ty := .f32 },
+        { id := 4, name := "flag", ty := .i1 },
+        { id := 5, name := "word", ty := .u256 }
+      ]
+      retTy := .i32
+      body := .ret 4 },
+    { name := "kern_void_sink"
+      params := [
+        { id := 0, name := "u", ty := .unit },
+        { id := 1, name := "h", ty := .i16 }
+      ]
+      retTy := .unit
+      body := .ret 0 }
+  ]
+}
+
+#guard (moduleToCAbiSigs sampleHybridModule).all (fun s => s.toC99FnSig.isSome)
+#guard (moduleToCAbiSigs diverseCAbiModule).all (fun s => s.toC99FnSig.isSome)
+#guard ((emitCAbiHeader diverseCAbiModule .x86_64).splitOn "sizeof(lean_native_flat_slice_t) == 24").length > 1
+#guard ((emitCAbiHeader diverseCAbiModule .wasm32).splitOn "sizeof(lean_native_flat_slice_t) == 12").length > 1
+#guard ((emitCAbiHeader diverseCAbiModule .wasm32).splitOn "#if defined(__wasm32__)").length > 1
+
+#guard execValidatedSliceHostCall stridedByteView id == some backingBytes
+#guard execValidatedSliceHostCall stridedByteView
+    (fun packed => ByteArray.mk (packed.data.map (· + 1))) ==
+  some (ByteArray.mk #[11, 12, 12, 13, 15, 16, 16, 17, 19, 20, 20, 21])
+#guard execValidatedSliceHostCall { stridedByteView with align := 0 } id == none
+#guard execValidatedSliceHostCall { stridedByteView with base := 1, align := 4 } id == none
+
+def bundleStructsForClang : List (String × List C99FieldSpec) :=
+  [ ("lean_native_flat_slice_t", flatSliceFieldSpecs),
+    ("lean_native_mut_slice_t", mutSliceFieldSpecs),
+    ("lean_native_packet_t", mixedStructSpecs) ]
+
+def stripPragmaOnce (src : String) : String :=
+  String.intercalate "\n" ((src.splitOn "\n").filter (fun ln => ln.trimAscii.toString != "#pragma once"))
+
+def runClangC11ConformanceSuite : IO Unit := do
+  let some (hdr64, shim64) := emitValidatedC99Bundle bundleStructsForClang sampleFnSigs .bits64
+    | throw <| IO.userError "emitValidatedC99Bundle .bits64 returned none"
+  let some (hdr32, shim32) := emitValidatedC99Bundle bundleStructsForClang sampleFnSigs .bits32
+    | throw <| IO.userError "emitValidatedC99Bundle .bits32 returned none"
+  let modHdr64 := stripPragmaOnce (emitCAbiHeader diverseCAbiModule .x86_64)
+  let modHdr32 := stripPragmaOnce (emitCAbiHeader diverseCAbiModule .wasm32)
+  let dualHdr := stripPragmaOnce (emitCAbiHeaderFromSigs (moduleToCAbiSigs diverseCAbiModule))
+  let checks : List (String × String × TargetArch) := [
+    ("bundle-hdr-64", stripPragmaOnce hdr64, .x86_64),
+    ("bundle-shim-64", shim64, .x86_64),
+    ("bundle-combined-64", stripPragmaOnce hdr64 ++ "\n" ++ shim64, .x86_64),
+    ("bundle-hdr-32", stripPragmaOnce hdr32, .wasm32),
+    ("bundle-shim-32", shim32, .wasm32),
+    ("bundle-combined-32", stripPragmaOnce hdr32 ++ "\n" ++ shim32, .wasm32),
+    ("emitCAbiHeader-x86_64", modHdr64, .x86_64),
+    ("emitCAbiHeader-wasm32", modHdr32, .wasm32),
+    ("emitCAbiHeaderFromSigs-dual-x86_64", dualHdr, .x86_64),
+    ("emitCAbiHeaderFromSigs-dual-wasm32", dualHdr, .wasm32)
+  ]
+  for (label, src, arch) in checks do
+    let (ok, err) ← c11SyntaxCheck src arch
+    if !ok then
+      throw <| IO.userError s!"clang C11 syntax/layout check failed for {label} ({arch.triple}): {err}"
+
+#eval runClangC11ConformanceSuite
 
 end LeanNative.Tests.HybridCAbiTests

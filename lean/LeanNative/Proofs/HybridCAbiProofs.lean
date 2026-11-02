@@ -118,7 +118,7 @@ theorem c99OccupiedEnd_ge (fields : List C99FieldLayout) :
     · exact hm.1
     · exact Nat.le_trans (ih g hgFs) hm.2
 
-/-- Every `computeC99StructLayout` output across LP64 (`bits64`) and ILP32/`wasm32` (`bits32`)
+/-- Every `computeC99StructLayout` output across LP64 (`bits64`) and `wasm32` (`bits32`)
     satisfies natural field alignment (`f.align ∣ f.offset`), pairwise disjoint half-open field
     intervals `[offset, offset + size)`, `structSize` covering all fields, and `structAlign ∣ structSize`. -/
 theorem computeC99StructLayout_sound (name : String) (specs : List C99FieldSpec)
@@ -449,6 +449,42 @@ theorem validateC99Slice_sound (s : C99SliceDesc) (width : ArchWidth)
         simp [hp] at hptr ⊢
         rcases hptr with ⟨hp1, hp2⟩
         exact ⟨hp1, hp2⟩
+
+/-- `execValidatedSliceHostCall v id` succeeds only when `validC99Slice v.toSliceDesc v.width`
+    holds and restores `v.bytes` identically. -/
+theorem execValidatedSliceHostCall_id_roundtrip (v : C99ByteView) (out : ByteArray)
+    (h : execValidatedSliceHostCall v id = some out) :
+    validC99Slice v.toSliceDesc v.width ∧ out = v.bytes := by
+  unfold execValidatedSliceHostCall at h
+  cases hv : validateC99Slice v.toSliceDesc v.width
+  · simp [hv] at h
+  · simp [hv] at h
+    cases hm : marshalSlice v with
+    | none => simp [hm] at h
+    | some packedIn =>
+      simp [hm] at h
+      have hvalidDesc : validC99Slice v.toSliceDesc v.width :=
+        validateC99Slice_sound v.toSliceDesc v.width hv
+      unfold marshalSlice at hm
+      cases hcs : checkedStridedSpan v.len v.effectiveStride v.elemSize v.width with
+      | none => simp [hcs] at hm
+      | some span =>
+        simp [hcs] at hm
+        obtain ⟨⟨⟨⟨ha, hmod⟩, hbSz⟩, hbLim⟩, rfl⟩ := hm
+        have hnz : v.elemSize ≠ 0 ∧ v.elemSize ≤ v.effectiveStride := by
+          unfold checkedStridedSpan at hcs
+          by_cases hbad : v.elemSize = 0 ∨ v.effectiveStride < v.elemSize
+          · simp [hbad] at hcs
+          · omega
+        have hvView : v.isValid :=
+          ⟨ha, hnz.1, hnz.2, hmod, span, hcs, hbSz, hbLim⟩
+        rcases marshal_unmarshal_byte_slice_roundtrip v hvView with ⟨payload, hm2, _, _, hunm⟩
+        unfold marshalSlice at hm2
+        simp [hcs, ha, hmod, hbSz, hbLim] at hm2
+        subst hm2
+        rw [hunm] at h
+        injection h with hout
+        exact ⟨hvalidDesc, hout.symm⟩
 
 /-!
 # Theorem Group 3: Strided elementwise non-overlap, operational HeapState RC lifecycle, and hybrid dispatch soundness
