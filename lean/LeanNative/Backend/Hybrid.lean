@@ -633,6 +633,285 @@ def classifyDeclComputeTarget
   let isControlHeavy := !(analyzeGpuCompatibility d).1
   selectOptimalComputeTarget tripCount isMatrixContraction is256BitWorkload isControlHeavy hasTpu hasCudaGpu hasMetalGpu
 
+/-!
+# Typed host-device buffers, launch geometry, and RC ownership
+
+The functions below are the formal contract used by CPU+PTX, CPU+Metal, and CPU+StableHLO
+dispatch plans. They do not replace `partitionModule` or the existing glue emitters.
+-/
+
+/-- Direction of an explicit host-device transfer. `InOut` is the only in-place alias permission. -/
+inductive TransferDirection where
+  | hostToDevice
+  | deviceToHost
+  | inOut
+  deriving Repr, DecidableEq, Inhabited, BEq
+
+/-- Three-dimensional launch extent. Every component is a number of threads or blocks. -/
+structure Dim3 where
+  x : Nat
+  y : Nat
+  z : Nat
+  deriving Repr, DecidableEq, Inhabited, BEq
+
+namespace Dim3
+
+/-- Product of the three extents. -/
+def volume (d : Dim3) : Nat := d.x * d.y * d.z
+
+/-- Every component is nonzero, so a linearized index has a unique coordinate triple. -/
+def allPositive (d : Dim3) : Prop := d.x ≠ 0 ∧ d.y ≠ 0 ∧ d.z ≠ 0
+
+end Dim3
+
+/-- Ownership state of one host allocation relative to an in-flight device stream. -/
+inductive RcOwnership where
+  | borrowedByDevice
+  | pinnedHostRef
+  | uniqueOutBuffer
+  deriving Repr, DecidableEq, Inhabited, BEq
+
+/-- One host allocation participating in a hybrid launch. -/
+structure DeviceBufferDesc where
+  name : String
+  elemBytes : Nat
+  numElems : Nat
+  byteStride : Nat
+  baseAlign : Nat
+  direction : TransferDirection
+  zeroCopy : Bool
+  rc : Nat
+  baseAddr : Nat
+  ownership : RcOwnership
+  deriving Repr, DecidableEq, Inhabited, BEq
+
+namespace DeviceBufferDesc
+
+/-- Checked byte length of the addressed elements. -/
+def checkedBytes (b : DeviceBufferDesc) : Option Nat :=
+  if b.elemBytes = 0 then none
+  else if b.numElems ≤ (2 ^ 64 - 1) / b.elemBytes then some (b.numElems * b.elemBytes)
+  else none
+
+/-- Half-open device address interval. An invalid length yields the empty interval. -/
+def addressEnd (b : DeviceBufferDesc) : Nat :=
+  b.baseAddr + b.checkedBytes.getD 0
+
+/-- Geometry required before any transfer or zero-copy binding is admitted. -/
+def geometryOk (b : DeviceBufferDesc) : Prop :=
+  b.baseAlign ≠ 0 ∧ b.elemBytes ≠ 0 ∧ b.elemBytes ≤ b.byteStride ∧
+  b.byteStride % b.baseAlign = 0 ∧ b.baseAddr % b.baseAlign = 0 ∧ b.checkedBytes.isSome
+
+/-- A read-only input may be borrowed; every written buffer must be uniquely owned. -/
+def ownershipOk (b : DeviceBufferDesc) : Prop :=
+  match b.direction with
+  | .hostToDevice => b.rc ≥ 1 ∧ (b.ownership = .borrowedByDevice ∨ b.ownership = .pinnedHostRef)
+  | .deviceToHost => b.rc = 1 ∧ b.ownership = .uniqueOutBuffer
+  | .inOut => b.rc = 1 ∧ b.ownership = .uniqueOutBuffer
+
+end DeviceBufferDesc
+
+/-- Two address intervals are disjoint. -/
+def addressIntervalsDisjoint (a0 a1 b0 b1 : Nat) : Prop :=
+  a1 ≤ b0 ∨ b1 ≤ a0
+
+/-- Two buffers are disjoint unless they are read-only inputs or intentionally share the same `InOut` buffer. -/
+def disjointBuffers (a b : DeviceBufferDesc) : Prop :=
+  (a.name = b.name ∧ a.direction = .inOut ∧ b.direction = .inOut) ∨
+  addressIntervalsDisjoint a.baseAddr a.addressEnd b.baseAddr b.addressEnd ∨
+  (a.direction = .hostToDevice ∧ b.direction = .hostToDevice)
+
+/-- Launch request checked by `validateHybridDispatch`. -/
+structure HybridLaunchRequest where
+  kernelName : String
+  target : ComputeTarget
+  workloadElems : Nat
+  maxThreadsPerBlock : Nat
+  gridDim : Dim3
+  blockDim : Dim3
+  buffers : List DeviceBufferDesc
+  tailGuarded : Bool
+  deriving Repr, DecidableEq, Inhabited, BEq
+
+/-- Accepted launch plan. Its fields are exactly the validated request fields. -/
+structure HybridDispatchPlan where
+  kernelName : String
+  target : ComputeTarget
+  workloadElems : Nat
+  gridThreads : Nat
+  buffers : List DeviceBufferDesc
+  tailGuarded : Bool
+  deriving Repr, DecidableEq, Inhabited, BEq
+
+/-- Total threads launched by the grid. -/
+def gridThreadsOf (req : HybridLaunchRequest) : Nat :=
+  req.gridDim.volume * req.blockDim.volume
+
+/-- Global thread id `(block, lane)` is below the launched thread count. -/
+def globalThreadId (req : HybridLaunchRequest) (block lane : Nat) : Nat :=
+  block * req.blockDim.volume + lane
+
+/-- The tail guard `gid < workloadElems` covers every element exactly through the workload bound. -/
+def tailGuardCovers (req : HybridLaunchRequest) : Prop :=
+  req.tailGuarded ∧ req.workloadElems ≤ gridThreadsOf req ∧
+  ∀ gid, gid < req.workloadElems → gid < gridThreadsOf req
+
+/-- Grid geometry is nonzero and every block fits the device limit. -/
+def validLaunchGeometry (req : HybridLaunchRequest) : Prop :=
+  req.gridDim.allPositive ∧ req.blockDim.allPositive ∧
+  req.blockDim.volume ≤ req.maxThreadsPerBlock ∧
+  (req.tailGuarded ∧ req.workloadElems ≤ gridThreadsOf req ∨
+    ¬ req.tailGuarded ∧ gridThreadsOf req = req.workloadElems)
+
+/-- Every distinct pair of buffers in the launch schedule satisfies `disjointBuffers`. -/
+def buffersDisjoint : List DeviceBufferDesc → Prop
+  | [] => True
+  | a :: rest => (∀ b ∈ rest, disjointBuffers a b) ∧ buffersDisjoint rest
+
+/-- Every buffer has valid geometry and the ownership required by its direction. -/
+def buffersOwned : List DeviceBufferDesc → Prop
+  | [] => True
+  | b :: rest => b.geometryOk ∧ b.ownershipOk ∧ buffersOwned rest
+
+/-- Why a hybrid launch was rejected. -/
+inductive HybridDispatchError where
+  | zeroGrid
+  | blockTooLarge
+  | incompleteCoverage
+  | bufferGeometry
+  | ownership
+  | aliasedOutput
+  deriving Repr, DecidableEq, Inhabited, BEq
+
+/-- Boolean form of the grid precondition. -/
+def launchGeometryOk (req : HybridLaunchRequest) : Bool :=
+  req.gridDim.x != 0 && req.gridDim.y != 0 && req.gridDim.z != 0 &&
+  req.blockDim.x != 0 && req.blockDim.y != 0 && req.blockDim.z != 0 &&
+  req.blockDim.volume ≤ req.maxThreadsPerBlock &&
+  ((req.tailGuarded && req.workloadElems ≤ gridThreadsOf req) ||
+    (!req.tailGuarded && gridThreadsOf req == req.workloadElems))
+
+/-- Boolean form of one buffer's geometry precondition. -/
+def bufferGeometryOk (b : DeviceBufferDesc) : Bool :=
+  b.baseAlign != 0 && b.elemBytes != 0 && b.elemBytes ≤ b.byteStride &&
+  b.byteStride % b.baseAlign == 0 && b.baseAddr % b.baseAlign == 0 && b.checkedBytes.isSome
+
+/-- Boolean form of one buffer's ownership precondition. -/
+def bufferOwnershipOk (b : DeviceBufferDesc) : Bool :=
+  match b.direction with
+  | .hostToDevice => b.rc != 0 && (b.ownership == .borrowedByDevice || b.ownership == .pinnedHostRef)
+  | .deviceToHost => b.rc == 1 && b.ownership == .uniqueOutBuffer
+  | .inOut => b.rc == 1 && b.ownership == .uniqueOutBuffer
+
+/-- Pairwise alias checker aligned with `disjointBuffers` (only identical `InOut` or dual `HostToDevice` may alias). -/
+def bufferAliasPairOk (a b : DeviceBufferDesc) : Bool :=
+  (a.name == b.name && a.direction == .inOut && b.direction == .inOut) ||
+  (a.baseAddr + (a.checkedBytes.getD 0) ≤ b.baseAddr ||
+    b.baseAddr + (b.checkedBytes.getD 0) ≤ a.baseAddr ||
+    (a.direction == .hostToDevice && b.direction == .hostToDevice))
+
+/-- Boolean form of the pairwise output-alias precondition. -/
+def bufferAliasOk : List DeviceBufferDesc → Bool
+  | [] => true
+  | a :: rest => (rest.all fun b => bufferAliasPairOk a b) && bufferAliasOk rest
+
+/-- Admit a launch only when geometry, coverage, ownership, and output aliasing all hold. -/
+def validateHybridDispatch (req : HybridLaunchRequest) : Except HybridDispatchError HybridDispatchPlan :=
+  if !launchGeometryOk req &&
+      (req.gridDim.x = 0 || req.gridDim.y = 0 || req.gridDim.z = 0 ||
+        req.blockDim.x = 0 || req.blockDim.y = 0 || req.blockDim.z = 0) then
+    .error .zeroGrid
+  else if !launchGeometryOk req && req.maxThreadsPerBlock < req.blockDim.volume then
+    .error .blockTooLarge
+  else if !launchGeometryOk req then
+    .error .incompleteCoverage
+  else if req.buffers.any fun b => !bufferGeometryOk b then
+    .error .bufferGeometry
+  else if req.buffers.any fun b => !bufferOwnershipOk b then
+    .error .ownership
+  else if !bufferAliasOk req.buffers then
+    .error .aliasedOutput
+  else
+    .ok {
+      kernelName := req.kernelName
+      target := req.target
+      workloadElems := req.workloadElems
+      gridThreads := gridThreadsOf req
+      buffers := req.buffers
+      tailGuarded := req.tailGuarded
+    }
+
+/-- Staged RC count while a stream is active. `none` means the buffer is not pinned. -/
+structure RcPhase where
+  beforePin : Nat
+  whileActive : Option Nat
+  afterRelease : Nat
+  deriving Repr, DecidableEq, Inhabited, BEq
+
+/-- Borrowed inputs gain one temporary pin; unique outputs stay at one owner. -/
+def rcPhaseOf (b : DeviceBufferDesc) : RcPhase :=
+  match b.ownership with
+  | .borrowedByDevice => { beforePin := b.rc, whileActive := some (b.rc + 1), afterRelease := b.rc }
+  | .pinnedHostRef => { beforePin := b.rc, whileActive := some b.rc, afterRelease := b.rc }
+  | .uniqueOutBuffer => { beforePin := b.rc, whileActive := some b.rc, afterRelease := b.rc }
+
+/-- Net RC change from pin through release. -/
+def rcNetDelta (p : RcPhase) : Int := (p.afterRelease : Int) - (p.beforePin : Int)
+
+/-- A borrowed input is never released to zero while the stream is active. -/
+def rcConserved (b : DeviceBufferDesc) : Prop :=
+  let p := rcPhaseOf b
+  rcNetDelta p = 0 ∧
+  (match p.whileActive with | some n => n ≥ 1 | none => False) ∧
+  (b.ownership = .uniqueOutBuffer → p.afterRelease = 1)
+
+/-- The predicate established by an accepted dispatch plan. -/
+def hybridDispatchSound (req : HybridLaunchRequest) (plan : HybridDispatchPlan) : Prop :=
+  validLaunchGeometry req ∧ buffersOwned req.buffers ∧ buffersDisjoint req.buffers ∧
+  plan.gridThreads = gridThreadsOf req ∧ plan.workloadElems = req.workloadElems ∧
+  plan.buffers = req.buffers ∧
+  (req.tailGuarded → req.workloadElems ≤ plan.gridThreads) ∧
+  (∀ gid, req.tailGuarded → gid < req.workloadElems →
+    ∃ block lane, block < req.gridDim.volume ∧ lane < req.blockDim.volume ∧
+      globalThreadId req block lane = gid) ∧
+  (∀ block lane, block < req.gridDim.volume → lane < req.blockDim.volume →
+    globalThreadId req block lane < plan.gridThreads) ∧
+  (∀ b ∈ req.buffers, rcConserved b)
+
+/-- CPU+PTX, CPU+Metal, or CPU+StableHLO plan retained for executable tests. -/
+structure HybridTargetPlan where
+  target : ComputeTarget
+  request : HybridLaunchRequest
+  source : String
+  deriving Repr, Inhabited
+
+/-- Build one representative request for a compute target. -/
+def sampleHybridRequest (target : ComputeTarget) : HybridLaunchRequest :=
+  let input : DeviceBufferDesc := {
+    name := "in0", elemBytes := 8, numElems := 256, byteStride := 8, baseAlign := 8,
+    direction := .hostToDevice, zeroCopy := target == .gpuMetal, rc := 2, baseAddr := 0,
+    ownership := .pinnedHostRef
+  }
+  let output : DeviceBufferDesc := {
+    name := "out", elemBytes := 8, numElems := 256, byteStride := 8, baseAlign := 8,
+    direction := .deviceToHost, zeroCopy := target == .gpuMetal, rc := 1, baseAddr := 4096,
+    ownership := .uniqueOutBuffer
+  }
+  {
+    kernelName := s!"lean_native_hybrid_{target}", target, workloadElems := 256,
+    maxThreadsPerBlock := 1024, gridDim := { x := 1, y := 1, z := 1 },
+    blockDim := { x := 256, y := 1, z := 1 }, buffers := [input, output], tailGuarded := true
+  }
+
+/-- Concrete dispatch plans for the three hybrid backends. -/
+def hybridTargetPlans : List HybridTargetPlan :=
+  [ { target := .gpuCudaPtx, request := sampleHybridRequest .gpuCudaPtx,
+      source := "cpu+ptx stream: pin inputs, launch grid, synchronize, release" },
+    { target := .gpuMetal, request := sampleHybridRequest .gpuMetal,
+      source := "cpu+metal unified memory: page-aligned zero-copy buffers, tail-guarded gid < n" },
+    { target := .tpuXlaStableHLO, request := sampleHybridRequest .tpuXlaStableHLO,
+      source := "cpu+stablehlo: disjoint host outputs returned at rc = 1" } ]
+
 end LeanNative.Backend.Hybrid
 
 namespace LeanNative.Backend
