@@ -1330,9 +1330,8 @@ pub fn synthesize_farkas_nat_weights(
 
     // 2. Pairwise combinations k1 * e_i + k2 * e_j Ordered by L1 norm (k1 + k2 <= 16)
     for l1_sum in 2..=16u64 {
-        for a_pos in 0..active_idx.len() {
-            let i = active_idx[a_pos];
-            for &j in active_idx.iter().skip(a_pos + 1) {
+        for (a_pos, &i) in active_idx.iter().enumerate() {
+            for &j in &active_idx[(a_pos + 1)..] {
                 for k1 in 1..l1_sum {
                     let k2 = l1_sum - k1;
                     let cost = (k1 as u128)

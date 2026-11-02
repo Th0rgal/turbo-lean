@@ -1102,9 +1102,7 @@ impl StepVerdict {
             .and_then(|v| v.as_str())
             .unwrap_or(if compact_ok { "ok" } else { "error" })
             .to_string();
-        let is_cex = compact.get("kind").and_then(|v| v.as_str()) == Some("cex")
-            || status == "counterexample_rejected"
-            || status == "counterexample_found";
+        let is_cex = compact.get("kind").and_then(|v| v.as_str()) == Some("cex");
         let res = Self {
             ok: compact_ok,
             status,
@@ -1145,13 +1143,23 @@ pub fn compact_for_llm(verbose: &serde_json::Value) -> serde_json::Value {
         .unwrap_or(1.0);
     let verbose_bytes = serde_json::to_vec(verbose).map(|v| v.len()).unwrap_or(1680);
 
-    let is_cex = status == "counterexample_rejected"
-        || status == "counterexample_found"
-        || verbose
-            .get("violations")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0)
-            > 0;
+    let raw_violations = verbose
+        .get("violations")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let explicitly_uncertified = verbose
+        .get("lean_native_certified")
+        .and_then(|v| v.as_bool())
+        == Some(false);
+    let is_uncertified_violation = status == "uncertified_violation"
+        || (explicitly_uncertified
+            && (raw_violations > 0
+                || status == "counterexample_found"
+                || status == "counterexample_rejected"));
+    let is_cex = !is_uncertified_violation
+        && (status == "counterexample_rejected"
+            || status == "counterexample_found"
+            || raw_violations > 0);
     if is_cex {
         let witness = extract_compact_witness(verbose);
         let fix_hint_opt = verbose
@@ -1186,16 +1194,20 @@ pub fn compact_for_llm(verbose: &serde_json::Value) -> serde_json::Value {
         });
     }
 
-    let is_verified = verbose.get("verified").and_then(|v| v.as_bool()) == Some(true)
-        || matches!(
-            status,
-            "verified"
-                | "theorem_verified"
-                | "theorem_cache_hit"
-                | "all_shards_cached"
-                | "file_verified"
-                | "ok"
-        );
+    let explicitly_unverified = verbose.get("verified").and_then(|v| v.as_bool()) == Some(false)
+        || verbose.get("ok").and_then(|v| v.as_bool()) == Some(false);
+    let is_verified = !is_uncertified_violation
+        && !explicitly_unverified
+        && (verbose.get("verified").and_then(|v| v.as_bool()) == Some(true)
+            || matches!(
+                status,
+                "verified"
+                    | "theorem_verified"
+                    | "theorem_cache_hit"
+                    | "all_shards_cached"
+                    | "file_verified"
+                    | "ok"
+            ));
     if is_verified {
         let stage = if status.contains("cache") || status == "all_shards_cached" {
             "cas_hit"
@@ -1274,7 +1286,25 @@ pub fn execute_fast_check(
     let backend_pref = backend.unwrap_or("auto");
     let decl_name = decl.unwrap_or("fastcheck_decl");
 
+    let f_path_opt = file.filter(|s| !s.trim().is_empty()).map(Path::new);
+    let check_trusted_stmt =
+        |d_name: &str, s: &str, item_file: Option<&Path>| -> Result<String, String> {
+            if crate::gpu_fastcheck::stmt_src_has_trusted_elab_context_for_path(
+                d_name,
+                s,
+                item_file.or(f_path_opt),
+                project_dir,
+            ) {
+                Ok(s.to_string())
+            } else {
+                Err(format!(
+                "Untrusted or unparseable elaboration context for `{d_name}` in Stage-1 fast-check"
+            ))
+            }
+        };
+
     let mut batch_pairs: Vec<(String, String)> = Vec::new();
+    let mut file_read_err: Option<String> = None;
     if let Some(arr) = items {
         for (idx, item) in arr.iter().enumerate() {
             let d = item
@@ -1283,15 +1313,28 @@ pub fn execute_fast_check(
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| format!("item_{}", idx));
+            let item_file = item
+                .get("file")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(Path::new);
             if let Some(s) = item.get("stmt_src").and_then(|v| v.as_str()) {
-                batch_pairs.push((d, s.to_string()));
+                match check_trusted_stmt(&d, s, item_file) {
+                    Ok(trusted_s) => batch_pairs.push((d, trusted_s)),
+                    Err(e) => {
+                        file_read_err = Some(e);
+                        break;
+                    }
+                }
             }
         }
     }
-    let mut file_read_err: Option<String> = None;
-    if batch_pairs.is_empty() {
+    if file_read_err.is_none() && batch_pairs.is_empty() {
         if let Some(stmt) = stmt_src.filter(|s| !s.trim().is_empty()) {
-            batch_pairs.push((decl_name.to_string(), stmt.to_string()));
+            match check_trusted_stmt(decl_name, stmt, f_path_opt) {
+                Ok(trusted_s) => batch_pairs.push((decl_name.to_string(), trusted_s)),
+                Err(e) => file_read_err = Some(e),
+            }
         } else if let Some(f_str) = file.filter(|s| !s.trim().is_empty()) {
             let raw_path = Path::new(f_str);
             let resolved_path = if raw_path.is_relative() {
@@ -1306,9 +1349,11 @@ pub fn execute_fast_check(
                     let proj_root = project_dir
                         .map(Path::to_path_buf)
                         .unwrap_or_else(|| crate::lake_build::find_project_root(&resolved_path));
+                    let df =
+                        decl.filter(|d| !d.is_empty() && !matches!(*d, "auto" | "fastcheck_decl"));
                     match crate::gpu_fastcheck::extract_confirmed_fastcheck_pairs(
                         &src_text,
-                        decl,
+                        df,
                         &proj_root,
                         &resolved_path,
                     ) {
@@ -2151,7 +2196,7 @@ mod tests {
                 "kind": "rewritten_proof", "new_body_src": "by simp only [Nat.add_comm]",
                 "accelerator_name": "builtin:simd-simp-distiller", "estimated_speedup_hint": "9.1x"
             }],
-            "stage1_fastcheck_certified": true, "lean_native_certified": true, "lean_native_engine_version": "0.5.0",
+            "stage1_fastcheck_certified": false, "lean_native_certified": false, "lean_native_engine_version": "unavailable",
             "low_memory_mode": false, "max_memory_mb": 8192, "total_specs_audited": 12, "vacuous_specs": 0, "tight_specs": 12,
             "shard_hits": 1, "shard_misses": 0,
             "shard_key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
@@ -2602,5 +2647,36 @@ mod tests {
         let compact = verdict.to_compact_json();
         assert_eq!(compact["ok"], true);
         assert_eq!(compact["fast_tactic"], "by simp only [eligible, Eligible]");
+    }
+
+    #[test]
+    fn test_uncertified_violation_verdict_is_consistent_non_cex_error() {
+        for verbose in [
+            serde_json::json!({
+                "status": "uncertified_violation",
+                "ok": false,
+                "verified": false,
+                "decl": "suspect_thm",
+                "violations": 3,
+                "lean_native_certified": false,
+                "error": "Candidate violation could not be certified locally"
+            }),
+            serde_json::json!({
+                "status": "ok",
+                "ok": true,
+                "verified": true,
+                "decl": "suspect_thm",
+                "violations": 1,
+                "lean_native_certified": false
+            }),
+        ] {
+            let verdict = StepVerdict::from_verbose(verbose);
+            assert!(!verdict.ok);
+            assert!(!verdict.is_cex);
+            assert_eq!(verdict.to_full_json()["ok"], false);
+            let compact = verdict.to_compact_json();
+            assert_eq!(compact["ok"], false);
+            assert_eq!(compact["kind"], "error");
+        }
     }
 }

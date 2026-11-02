@@ -346,6 +346,75 @@ pub(crate) fn scan_lean_char_lit_end(src: &str, start: usize) -> Option<usize> {
     }
 }
 
+fn is_lean_id_rest_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'\'' | b'!' | b'?' | 0xBB)
+}
+
+/// Parse a Lean raw string literal starting at byte offset `start` (`r"..."`, `r#"..."#`,
+/// `r##"..."##`), matching `Lean.Parser.rawStrLitFn`. Returns `(content_start, end)` where
+/// `end` is the byte index immediately after the closing delimiter, or `src.len()` when the
+/// literal is unclosed. `None` when `start` does not begin a raw string.
+pub(crate) fn scan_lean_raw_string_end(src: &str, start: usize) -> Option<(usize, usize)> {
+    let bytes = src.as_bytes();
+    if start >= bytes.len() || bytes[start] != b'r' {
+        return None;
+    }
+    if start > 0 && is_lean_id_rest_byte(bytes[start - 1]) {
+        return None;
+    }
+    let mut i = start + 1;
+    let mut hashes = 0usize;
+    while i < bytes.len() && bytes[i] == b'#' {
+        hashes += 1;
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'"' {
+        return None;
+    }
+    let content_start = i + 1;
+    i = content_start;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            let mut h = 0usize;
+            while i + 1 + h < bytes.len() && bytes[i + 1 + h] == b'#' {
+                h += 1;
+            }
+            if h == hashes {
+                return Some((content_start, i + 1 + hashes));
+            }
+        }
+        i += 1;
+    }
+    Some((content_start, bytes.len()))
+}
+
+/// Parse a Lean guillemet-escaped identifier part starting at byte offset `start`
+/// (`«...»`, UTF-8 `C2 AB` .. `C2 BB`), matching `Lean.Parser.ident`. Returns the byte index
+/// immediately after the closing `»`, or `src.len()` when the guillemet is unclosed.
+pub(crate) fn scan_lean_guillemet_end(src: &str, start: usize) -> Option<usize> {
+    let bytes = src.as_bytes();
+    if start + 1 >= bytes.len() || bytes[start] != 0xC2 || bytes[start + 1] != 0xAB {
+        return None;
+    }
+    let mut i = start + 2;
+    while i + 1 < bytes.len() {
+        if bytes[i] == 0xC2 && bytes[i + 1] == 0xBB {
+            return Some(i + 2);
+        }
+        i += 1;
+    }
+    Some(bytes.len())
+}
+
+/// Shortest trailing segment of a Lean name, splitting on `.` that sit outside `«...»`.
+/// `«foo.bar»` is one atomic identifier part, so its short name is the whole token.
+pub(crate) fn rsplit_lean_name_short(name: &str) -> &str {
+    split_lean_name_components(name)
+        .last()
+        .copied()
+        .unwrap_or(name)
+}
+
 /// A literal, escaped identifier, or comment beginning at a UTF-8 byte boundary.
 /// Unterminated strings and block comments consume the remainder so their contents cannot become code.
 pub(crate) struct LeanLexicalSpan {
@@ -358,10 +427,8 @@ pub(crate) fn skip_lean_lexeme(src: &str, start: usize) -> Option<LeanLexicalSpa
     let bytes = src.as_bytes();
     let mut i = start;
     if src[start..].starts_with('«') {
-        let body = start + '«'.len_utf8();
-        let rel_end = src[body..].find('»')?;
         return Some(LeanLexicalSpan {
-            end: body + rel_end + '»'.len_utf8(),
+            end: scan_lean_guillemet_end(src, start)?,
             is_comment: false,
             is_literal: false,
         });
@@ -369,7 +436,7 @@ pub(crate) fn skip_lean_lexeme(src: &str, start: usize) -> Option<LeanLexicalSpa
     let at_token_start = !src[..start]
         .chars()
         .next_back()
-        .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '\'');
+        .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '\'' | '!' | '?' | '»'));
     let two_bytes_avail = start + 1 < bytes.len();
     let comment_guard_ok =
         crate::c_abi::verify_lexer_comment_guard(false, false, two_bytes_avail, 0, u32::MAX as u64);
@@ -420,24 +487,8 @@ pub(crate) fn skip_lean_lexeme(src: &str, start: usize) -> Option<LeanLexicalSpa
             }
         }
         b'r' if at_token_start => {
-            i += 1;
-            while bytes.get(i) == Some(&b'#') {
-                i += 1;
-            }
-            let hashes = i - start - 1;
-            if bytes.get(i) != Some(&b'"') {
-                return None;
-            }
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == b'"'
-                    && bytes[i + 1..].starts_with(&bytes[start + 1..start + 1 + hashes])
-                {
-                    i += 1 + hashes;
-                    break;
-                }
-                i += 1;
-            }
+            let (_content_start, end) = scan_lean_raw_string_end(src, start)?;
+            i = end;
         }
         _ => return None,
     }
@@ -496,6 +547,34 @@ fn strip_string_literals(src: &str) -> std::borrow::Cow<'_, str> {
                 out.push(if bytes[i] == b'\n' { b'\n' } else { b' ' });
                 i += 1;
             }
+        } else if bytes[i] == 0xC2 && i + 1 < bytes.len() && bytes[i + 1] == 0xAB {
+            if let Some(end) = scan_lean_guillemet_end(src, i) {
+                out.extend_from_slice(&bytes[i..end]);
+                i = end;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        } else if bytes[i] == b'r' {
+            if let Some((content_start, end)) = scan_lean_raw_string_end(src, i) {
+                out.extend_from_slice(&bytes[i..content_start]);
+                let hashes = content_start.saturating_sub(i + 2);
+                let close_len = 1 + hashes;
+                let content_end =
+                    if end >= content_start + close_len && bytes[end - close_len] == b'"' {
+                        end - close_len
+                    } else {
+                        end
+                    };
+                for &b in &bytes[content_start..content_end] {
+                    out.push(if b == b'\n' { b'\n' } else { b' ' });
+                }
+                out.extend_from_slice(&bytes[content_end..end]);
+                i = end;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
         } else if bytes[i] == b'\'' {
             if let Some(end) = scan_lean_char_lit_end(src, i) {
                 out.push(b'\'');
@@ -526,7 +605,9 @@ fn strip_string_literals(src: &str) -> std::borrow::Cow<'_, str> {
 pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
     let mut report = HygieneReport::default();
     let clean_no_strings = strip_string_literals(clean_src);
-    let clean_src = clean_no_strings.as_ref();
+    let clean_with_guillemets = clean_no_strings.as_ref();
+    let clean_no_guillemets = mask_structural_lean_text(clean_src);
+    let clean_src = clean_no_guillemets.as_ref();
     if ![
         "sorry",
         "admit",
@@ -556,15 +637,20 @@ pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
     // Scan across line boundaries and through scoped command prefixes. Strings and comments
     // have already been stripped; quoted name segments denote the same option keys.
     for (pos, _) in clean_src.match_indices("set_option") {
-        if pos > 0
+        let after_pos = pos + "set_option".len();
+        if (pos > 0
             && clean_src[..pos]
                 .chars()
                 .next_back()
-                .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '»'))
+            || clean_src[after_pos..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '«')
         {
             continue;
         }
-        let mut words = clean_src[pos + "set_option".len()..].split_whitespace();
+        let mut words = clean_with_guillemets[after_pos..].split_whitespace();
         let key = words.next().unwrap_or("").replace(['«', '»'], "");
         if key == "debug"
             || key.starts_with("debug.")
@@ -790,6 +876,38 @@ fn is_top_level_command_start(trimmed: &str) -> bool {
                 | "public"
                 | "meta"
                 | "module"
+                | "theorem"
+                | "lemma"
+                | "def"
+                | "abbrev"
+                | "instance"
+                | "inductive"
+                | "coinductive"
+                | "structure"
+                | "class"
+                | "axiom"
+                | "opaque"
+                | "constant"
+                | "example"
+                | "alias"
+                | "namespace"
+                | "open"
+                | "variable"
+                | "variables"
+                | "universe"
+                | "universes"
+                | "set_option"
+                | "attribute"
+                | "export"
+                | "include"
+                | "omit"
+                | "deriving"
+                | "initialize"
+                | "builtin_initialize"
+                | "syntax"
+                | "macro"
+                | "elab"
+                | "notation"
         )
 }
 
@@ -947,6 +1065,40 @@ pub(crate) fn is_section_header_line(trimmed_clean: &str) -> bool {
     after == "section" || after.starts_with("section ")
 }
 
+fn mask_structural_lean_text(clean: &str) -> std::borrow::Cow<'_, str> {
+    let no_strings = strip_string_literals(clean);
+    if !no_strings.contains('«') {
+        return no_strings;
+    }
+    let src = no_strings.as_ref();
+    let bytes = src.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == 0xC2 && i + 1 < bytes.len() && bytes[i + 1] == 0xAB {
+            if let Some(end) = scan_lean_guillemet_end(src, i) {
+                out.extend_from_slice(&[0xC2, 0xAB]);
+                let closed = end >= i + 4 && bytes[end - 2] == 0xC2 && bytes[end - 1] == 0xBB;
+                let inner_end = if closed { end - 2 } else { end };
+                for &b in &bytes[i + 2..inner_end] {
+                    out.push(if b == b'\n' { b'\n' } else { b' ' });
+                }
+                if closed {
+                    out.extend_from_slice(&[0xC2, 0xBB]);
+                }
+                i = end;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    std::borrow::Cow::Owned(
+        String::from_utf8(out)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
+    )
+}
+
 /// Zero-copy segmentation of `(src, clean)` into top-level `CmdSpan`s.
 /// Handles `/-- ... -/` doc comments, multi-line `@[...]` attribute / modifier prefixes,
 /// commands indented inside `section ... end` blocks, and `mutual ... end` blocks without
@@ -968,8 +1120,8 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
     let mut pos = 0usize;
     let mut mutual_depth = 0usize;
     let mut scope_depth = 0usize;
-    let mut lexical_cursor = 0usize;
-    let mut literal_end = 0usize;
+    let structural = mask_structural_lean_text(clean);
+    let structural = structural.as_ref();
 
     while pos < total_len {
         let line_start = pos;
@@ -989,28 +1141,8 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
         };
 
         let line_orig = &src[line_start..line_end_no_cr];
-        let line_clean = &clean[line_start..line_end_no_cr];
-        let trimmed = line_clean.trim_start();
-        let token_start = line_start + line_clean.len() - trimmed.len();
-        // Keep the whole source's lexical context: a command-looking line inside a
-        // literal must not become a declaration or change the namespace stack.
-        while lexical_cursor < token_start {
-            if let Some(span) = skip_lean_lexeme(src, lexical_cursor) {
-                if span.is_literal {
-                    literal_end = span.end;
-                }
-                lexical_cursor = span.end;
-            } else {
-                lexical_cursor += src[lexical_cursor..].chars().next().unwrap().len_utf8();
-            }
-        }
-        if token_start < literal_end {
-            cur_byte_end = line_end_no_cr;
-            pos = next_pos;
-            line_num += 1;
-            continue;
-        }
-
+        let line_structural = &structural[line_start..line_end_no_cr];
+        let trimmed = line_structural.trim_start();
         let indent = line_orig.len() - line_orig.trim_start().len();
         let at_command_indent = cur_cmd_indent.is_none_or(|base| indent <= base);
         let starts_doc_comment = line_orig.trim_start().starts_with("/--") && at_command_indent;
@@ -1030,10 +1162,10 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
         }
 
         let prev_clean = &clean[cur_byte_start..cur_byte_end];
-        let prev_trimmed = prev_clean.trim();
-        let prev_is_section_or_ns_header = is_section_header_line(prev_trimmed)
-            || prev_trimmed.starts_with("namespace ")
-            || is_end_line_start(prev_trimmed);
+        let prev_structural = structural[cur_byte_start..cur_byte_end].trim();
+        let prev_is_section_or_ns_header = is_section_header_line(prev_structural)
+            || prev_structural.starts_with("namespace ")
+            || is_end_line_start(prev_structural);
 
         let can_start_at_indent =
             at_command_indent || (scope_depth > 0 && prev_is_section_or_ns_header);
@@ -1304,6 +1436,8 @@ fn split_mutual_block_subspans<'a>(
     if orig.len() != clean.len() {
         return None;
     }
+    let structural = mask_structural_lean_text(clean);
+    let structural = structural.as_ref();
     let first_nl = orig.find('\n')?;
 
     // Find the last non-empty line in `clean` so trailing blank lines after `end` are preserved
@@ -1317,7 +1451,7 @@ fn split_mutual_block_subspans<'a>(
         return None;
     }
 
-    let last_line_clean = clean[last_nl + 1..trimmed_end_len].trim();
+    let last_line_clean = structural[last_nl + 1..trimmed_end_len].trim();
     if !is_end_line_start(last_line_clean) {
         return None;
     }
@@ -1326,6 +1460,7 @@ fn split_mutual_block_subspans<'a>(
     let footer_orig = &orig[last_nl + 1..];
     let body_orig = &orig[first_nl + 1..last_nl];
     let body_clean = &clean[first_nl + 1..last_nl];
+    let body_structural = &structural[first_nl + 1..last_nl];
 
     if body_orig.trim().is_empty() {
         return None;
@@ -1333,7 +1468,7 @@ fn split_mutual_block_subspans<'a>(
 
     // Determine declaration indentation, not proof indentation: Lean also accepts
     // an unindented `:=` continuation inside a mutual block.
-    let min_indent = body_clean
+    let min_indent = body_structural
         .lines()
         .filter(|l| is_top_level_command_start(l.trim_start()))
         .map(|l| l.len() - l.trim_start().len())
@@ -1366,8 +1501,8 @@ fn split_mutual_block_subspans<'a>(
         };
 
         let line_orig = &body_orig[line_start..line_end_no_cr];
-        let line_clean = &body_clean[line_start..line_end_no_cr];
-        let trimmed = line_clean.trim_start();
+        let line_structural = &body_structural[line_start..line_end_no_cr];
+        let trimmed = line_structural.trim_start();
         let indent = line_orig.len() - line_orig.trim_start().len();
         let is_top_inner = indent <= min_indent;
         let starts_doc = is_top_inner && line_orig.trim_start().starts_with("/--");
@@ -1410,7 +1545,8 @@ fn split_mutual_block_subspans<'a>(
 /// Check whether `|` at `pipe_idx` (at the start of an indented line after `:`) begins a
 /// genuine equation-compiler pattern-matching arm (`| pat => rhs`) rather than an absolute-value
 /// or norm expression (`|expr|`) inside the theorem's return type.
-fn is_pattern_match_arm_at(bytes: &[u8], pipe_idx: usize) -> bool {
+fn is_pattern_match_arm_at(cmd: &str, pipe_idx: usize) -> bool {
+    let bytes = cmd.as_bytes();
     if pipe_idx + 1 >= bytes.len() || (bytes[pipe_idx + 1] != b' ' && bytes[pipe_idx + 1] != b'\t')
     {
         return false;
@@ -1448,6 +1584,22 @@ fn is_pattern_match_arm_at(bytes: &[u8], pipe_idx: usize) -> bool {
             j += 1;
             continue;
         }
+        if c == 0xC2 && j + 1 < bytes.len() && bytes[j + 1] == 0xAB {
+            j = scan_lean_guillemet_end(cmd, j).unwrap_or(bytes.len());
+            continue;
+        }
+        if c == b'r' {
+            if let Some((_, end)) = scan_lean_raw_string_end(cmd, j) {
+                j = end;
+                continue;
+            }
+        }
+        if c == b'\'' {
+            if let Some(end) = scan_lean_char_lit_end(cmd, j) {
+                j = end;
+                continue;
+            }
+        }
         if j + 1 < bytes.len() && c == b'/' && bytes[j + 1] == b'-' {
             block_comment_depth += 1;
             j += 2;
@@ -1468,10 +1620,13 @@ fn is_pattern_match_arm_at(bytes: &[u8], pipe_idx: usize) -> bool {
             b']' => bracket = (bracket - 1).max(0),
             b'{' => brace += 1,
             b'}' => brace = (brace - 1).max(0),
-            b'=' if paren == 0 && bracket == 0 && brace == 0 => {
-                if j + 1 < bytes.len() && bytes[j + 1] == b'>' {
-                    return true;
-                }
+            b'=' if paren == 0
+                && bracket == 0
+                && brace == 0
+                && j + 1 < bytes.len()
+                && bytes[j + 1] == b'>' =>
+            {
+                return true;
             }
             b':' if paren == 0
                 && bracket == 0
@@ -1564,6 +1719,22 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
             i += 1;
             continue;
         }
+        if c == 0xC2 && i + 1 < bytes.len() && bytes[i + 1] == 0xAB {
+            i = scan_lean_guillemet_end(cmd, i).unwrap_or(bytes.len());
+            continue;
+        }
+        if c == b'r' {
+            if let Some((_, end)) = scan_lean_raw_string_end(cmd, i) {
+                i = end;
+                continue;
+            }
+        }
+        if c == b'\'' {
+            if let Some(end) = scan_lean_char_lit_end(cmd, i) {
+                i = end;
+                continue;
+            }
+        }
         if i + 1 < bytes.len() && c == b'/' && bytes[i + 1] == b'-' {
             block_comment_depth += 1;
             i += 2;
@@ -1644,7 +1815,7 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
                     }
                     if k > 0
                         && (bytes[k - 1] == b'\n' || bytes[k - 1] == b'\r')
-                        && is_pattern_match_arm_at(bytes, i)
+                        && is_pattern_match_arm_at(cmd, i)
                     {
                         let mut nl_idx = k - 1;
                         if nl_idx > 0 && bytes[nl_idx] == b'\n' && bytes[nl_idx - 1] == b'\r' {
@@ -1742,54 +1913,130 @@ fn is_lean_keyword_or_builtin(tok: &str) -> bool {
     )
 }
 
-fn extract_ident_tokens(s: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    let mut cur_start: Option<usize> = None;
-    let mut qual_start: Option<usize> = None;
+fn unescape_guillemet_segment(seg: &str) -> &str {
+    seg.strip_prefix('«')
+        .and_then(|s| s.strip_suffix('»'))
+        .unwrap_or(seg)
+}
 
-    for (idx, ch) in s.char_indices() {
-        if is_lean_ident_continuation(ch) {
-            if cur_start.is_none() && !ch.is_ascii_digit() {
-                cur_start = Some(idx);
-                if qual_start.is_none() {
-                    qual_start = Some(idx);
-                }
+fn normalize_lean_qual_ident(name: &str) -> String {
+    let bytes = name.as_bytes();
+    let mut i = 0usize;
+    let mut seg_start = 0usize;
+    let mut segs = Vec::new();
+    while i < bytes.len() {
+        if bytes[i] == 0xC2 && i + 1 < bytes.len() && bytes[i + 1] == 0xAB {
+            i = scan_lean_guillemet_end(name, i).unwrap_or(bytes.len());
+        } else if bytes[i] == b'.' {
+            let seg = unescape_guillemet_segment(&name[seg_start..i]);
+            if !seg.is_empty() {
+                segs.push(seg);
             }
+            i += 1;
+            seg_start = i;
         } else {
-            if let Some(st) = cur_start.take() {
-                let tok = &s[st..idx];
-                if !is_lean_keyword_or_builtin(tok) && seen.insert(tok.to_string()) {
-                    out.push(tok.to_string());
-                }
-                if ch != '.' {
-                    if let Some(qst) = qual_start.take() {
-                        if qst < st {
-                            let qtok = &s[qst..idx];
-                            if seen.insert(qtok.to_string()) {
-                                out.push(qtok.to_string());
-                            }
-                        }
-                    }
-                }
-            } else if ch != '.' {
-                qual_start = None;
+            i += 1;
+        }
+    }
+    let last = unescape_guillemet_segment(&name[seg_start..]);
+    if !last.is_empty() {
+        segs.push(last);
+    }
+    segs.join(".")
+}
+
+fn scan_lean_qual_ident_at(s: &str, start: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if start >= bytes.len() {
+        return None;
+    }
+    let mut i = start;
+    while i < bytes.len() {
+        if bytes[i] == 0xC2 && i + 1 < bytes.len() && bytes[i + 1] == 0xAB {
+            i = scan_lean_guillemet_end(s, i).unwrap_or(bytes.len());
+        } else if bytes[i] == b'.' {
+            i += 1;
+        } else {
+            let ch = s[i..].chars().next()?;
+            if is_lean_ident_continuation(ch) {
+                i += ch.len_utf8();
+            } else {
+                break;
             }
         }
     }
-    if let Some(st) = cur_start {
-        let tok = &s[st..];
-        if !is_lean_keyword_or_builtin(tok) && seen.insert(tok.to_string()) {
-            out.push(tok.to_string());
+    (i > start).then_some(i)
+}
+
+fn extract_ident_tokens(s: &str) -> Vec<String> {
+    let no_strings = strip_string_literals(s);
+    let s = no_strings.as_ref();
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut push_tok = |t: String| {
+        if !t.is_empty() && !is_lean_keyword_or_builtin(&t) && seen.insert(t.clone()) {
+            out.push(t);
         }
-        if let Some(qst) = qual_start {
-            if qst < st {
-                let qtok = &s[qst..];
-                if seen.insert(qtok.to_string()) {
-                    out.push(qtok.to_string());
+    };
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let starts_guillemet = bytes[i] == 0xC2 && i + 1 < bytes.len() && bytes[i + 1] == 0xAB;
+        let starts_ident = if starts_guillemet {
+            true
+        } else if bytes[i] == b'.' || bytes[i].is_ascii_digit() {
+            false
+        } else {
+            s[i..]
+                .chars()
+                .next()
+                .map(is_lean_ident_continuation)
+                .unwrap_or(false)
+        };
+        if !starts_ident {
+            i += s[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+            continue;
+        }
+        let Some(end) = scan_lean_qual_ident_at(s, i) else {
+            i += 1;
+            continue;
+        };
+        let qual = s[i..end].trim_matches('.');
+        if !qual.is_empty() {
+            let norm_qual = normalize_lean_qual_ident(qual);
+            let mut seg_i = 0usize;
+            let mut seg_start = 0usize;
+            let qbytes = qual.as_bytes();
+            while seg_i < qbytes.len() {
+                if qbytes[seg_i] == 0xC2 && seg_i + 1 < qbytes.len() && qbytes[seg_i + 1] == 0xAB {
+                    seg_i = scan_lean_guillemet_end(qual, seg_i).unwrap_or(qbytes.len());
+                } else if qbytes[seg_i] == b'.' {
+                    let seg = &qual[seg_start..seg_i];
+                    push_tok(seg.to_string());
+                    let unesc = unescape_guillemet_segment(seg);
+                    if unesc != seg {
+                        push_tok(unesc.to_string());
+                    }
+                    seg_i += 1;
+                    seg_start = seg_i;
+                } else {
+                    seg_i += 1;
                 }
             }
+            let last_seg = &qual[seg_start..];
+            push_tok(last_seg.to_string());
+            let unesc = unescape_guillemet_segment(last_seg);
+            if unesc != last_seg {
+                push_tok(unesc.to_string());
+            }
+            if qual != last_seg {
+                push_tok(qual.to_string());
+            }
+            if norm_qual != qual && norm_qual != unesc {
+                push_tok(norm_qual);
+            }
         }
+        i = end;
     }
     out
 }
@@ -1873,24 +2120,31 @@ fn register_prior_decl(
     }
     entry.cone_bits = cone_bits;
 
-    if !entry.short_name.is_empty() {
-        name_to_decl_idxs
-            .entry(entry.short_name.clone())
-            .or_default()
-            .push(idx);
+    let push_key = |map: &mut std::collections::HashMap<String, Vec<usize>>, k: String| {
+        if !k.is_empty() {
+            let v = map.entry(k).or_default();
+            if v.last() != Some(&idx) {
+                v.push(idx);
+            }
+        }
+    };
+    push_key(name_to_decl_idxs, entry.short_name.clone());
+    let unesc_short = unescape_guillemet_segment(&entry.short_name).to_string();
+    if unesc_short != entry.short_name {
+        push_key(name_to_decl_idxs, unesc_short);
     }
-    if !entry.full_name.is_empty() && entry.full_name != entry.short_name {
-        name_to_decl_idxs
-            .entry(entry.full_name.clone())
-            .or_default()
-            .push(idx);
+    if entry.full_name != entry.short_name {
+        push_key(name_to_decl_idxs, entry.full_name.clone());
+    }
+    let norm_full = normalize_lean_qual_ident(&entry.full_name);
+    if norm_full != entry.full_name && norm_full != entry.short_name {
+        push_key(name_to_decl_idxs, norm_full);
     }
     for extra in &entry.extra_names {
-        if !extra.is_empty() {
-            name_to_decl_idxs
-                .entry(extra.clone())
-                .or_default()
-                .push(idx);
+        push_key(name_to_decl_idxs, extra.clone());
+        let unesc_extra = unescape_guillemet_segment(extra).to_string();
+        if unesc_extra != *extra {
+            push_key(name_to_decl_idxs, unesc_extra);
         }
     }
     prior_decls.push(entry);
@@ -2188,47 +2442,70 @@ const STD_QUAL_PREFIXES: &[&str] = &[
 
 /// Extract all dot-qualified identifiers (`qual_ident`) and their trailing short segment (`short_tok`)
 /// from `clean_text` in a single O(len) pass, matching `contains_local_decl_ref` semantics.
-fn extract_local_ref_tokens_into<'a>(
-    clean_text: &'a str,
+fn extract_local_ref_tokens_into(
+    clean_text: &str,
     span_idx: usize,
-    exact_map: &mut std::collections::HashMap<&'a str, Vec<usize>>,
-    non_std_short_map: &mut std::collections::HashMap<&'a str, Vec<usize>>,
+    exact_map: &mut std::collections::HashMap<String, Vec<usize>>,
+    non_std_short_map: &mut std::collections::HashMap<String, Vec<usize>>,
 ) {
+    let no_strings = strip_string_literals(clean_text);
+    let clean_text = no_strings.as_ref();
     let bytes = clean_text.as_bytes();
     let len = bytes.len();
-    let mut i = 0usize;
-    while i < len {
-        let b = bytes[i];
-        if !(b.is_ascii_alphanumeric() || matches!(b, b'_' | b'\'' | b'.')) {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < len {
-            let c = bytes[i];
-            if c.is_ascii_alphanumeric() || matches!(c, b'_' | b'\'' | b'.') {
-                i += 1;
-            } else {
-                break;
+    let push_pos = |map: &mut std::collections::HashMap<String, Vec<usize>>, key: String| {
+        if !key.is_empty() {
+            let v = map.entry(key).or_default();
+            if v.last() != Some(&span_idx) {
+                v.push(span_idx);
             }
         }
-        let qual_ident = clean_text[start..i].trim_matches('.');
-        if qual_ident.is_empty() {
+    };
+    let mut i = 0usize;
+    while i < len {
+        let starts_guillemet = bytes[i] == 0xC2 && i + 1 < len && bytes[i + 1] == 0xAB;
+        let starts_ident = if starts_guillemet {
+            true
+        } else if bytes[i] == b'.' || bytes[i].is_ascii_digit() {
+            false
+        } else {
+            clean_text[i..]
+                .chars()
+                .next()
+                .map(is_lean_ident_continuation)
+                .unwrap_or(false)
+        };
+        if !starts_ident {
+            i += clean_text[i..]
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(1);
             continue;
         }
-        let vec_exact = exact_map.entry(qual_ident).or_default();
-        if vec_exact.last() != Some(&span_idx) {
-            vec_exact.push(span_idx);
-        }
-        if !STD_QUAL_PREFIXES.iter().any(|p| qual_ident.starts_with(p)) {
-            let short = qual_ident.rsplit('.').next().unwrap_or(qual_ident);
-            if !short.is_empty() {
-                let vec_short = non_std_short_map.entry(short).or_default();
-                if vec_short.last() != Some(&span_idx) {
-                    vec_short.push(span_idx);
+        let Some(end) = scan_lean_qual_ident_at(clean_text, i) else {
+            i += 1;
+            continue;
+        };
+        let qual_ident = clean_text[i..end].trim_matches('.');
+        if !qual_ident.is_empty() {
+            let norm_qual = normalize_lean_qual_ident(qual_ident);
+            push_pos(exact_map, qual_ident.to_string());
+            if norm_qual != qual_ident {
+                push_pos(exact_map, norm_qual.clone());
+            }
+            if !STD_QUAL_PREFIXES
+                .iter()
+                .any(|p| qual_ident.starts_with(p) || norm_qual.starts_with(p))
+            {
+                let short = rsplit_lean_name_short(qual_ident);
+                push_pos(non_std_short_map, short.to_string());
+                let unesc_short = unescape_guillemet_segment(short);
+                if unesc_short != short {
+                    push_pos(non_std_short_map, unesc_short.to_string());
                 }
             }
         }
+        i = end;
     }
 }
 
@@ -2258,14 +2535,15 @@ fn precompute_closed_section_min_needed_idx(
             if trimmed.is_empty() || is_scope_or_context_command(trimmed) {
                 continue;
             }
-            let after_attrs = {
-                let mut r = trimmed;
-                while let Some(next) = strip_leading_attr_block(r) {
-                    r = next.trim_start();
-                }
-                r
-            };
-            if after_attrs.starts_with("local ") {
+            let after_prefixes = strip_decl_prefixes(trimmed);
+            if after_prefixes != trimmed
+                && trimmed.len() - after_prefixes.len() >= 5
+                && (trimmed.contains("local") && after_prefixes.is_empty()
+                    || strip_leading_attr_block(trimmed)
+                        .map_or(trimmed, str::trim_start)
+                        .strip_prefix("local")
+                        .is_some_and(|r| r.is_empty() || r.starts_with(char::is_whitespace)))
+            {
                 continue;
             }
             if let Some((_, mut_subspans, _)) = split_mutual_block_subspans(inner) {
@@ -2279,7 +2557,7 @@ fn precompute_closed_section_min_needed_idx(
                             unconditional = true;
                             break;
                         }
-                        let short = name.rsplit('.').next().unwrap_or(&name).to_string();
+                        let short = rsplit_lean_name_short(&name).to_string();
                         if !short.is_empty() {
                             thms.push((short, name));
                         }
@@ -2299,7 +2577,7 @@ fn precompute_closed_section_min_needed_idx(
                     unconditional = true;
                     break;
                 }
-                let short = name.rsplit('.').next().unwrap_or(&name).to_string();
+                let short = rsplit_lean_name_short(&name).to_string();
                 if !short.is_empty() {
                     thms.push((short, name));
                 }
@@ -2320,9 +2598,9 @@ fn precompute_closed_section_min_needed_idx(
         return min_needed;
     }
 
-    let mut exact_map: std::collections::HashMap<&str, Vec<usize>> =
+    let mut exact_map: std::collections::HashMap<String, Vec<usize>> =
         std::collections::HashMap::with_capacity(spans.len() * 4);
-    let mut non_std_short_map: std::collections::HashMap<&str, Vec<usize>> =
+    let mut non_std_short_map: std::collections::HashMap<String, Vec<usize>> =
         std::collections::HashMap::with_capacity(spans.len() * 4);
     for (s_idx, span) in spans.iter().enumerate() {
         extract_local_ref_tokens_into(
@@ -2340,16 +2618,22 @@ fn precompute_closed_section_min_needed_idx(
         }
         let mut earliest = usize::MAX;
         for (short, full_name) in thms {
-            if let Some(positions) = non_std_short_map.get(short.as_str()) {
-                let p = positions.partition_point(|&idx| idx <= sec_close);
-                if p < positions.len() {
-                    earliest = earliest.min(positions[p]);
+            let unesc_short = unescape_guillemet_segment(short);
+            let norm_full = normalize_lean_qual_ident(full_name);
+            for key in [short.as_str(), unesc_short] {
+                if let Some(positions) = non_std_short_map.get(key) {
+                    let p = positions.partition_point(|&idx| idx <= sec_close);
+                    if p < positions.len() {
+                        earliest = earliest.min(positions[p]);
+                    }
                 }
             }
-            if let Some(positions) = exact_map.get(full_name.as_str()) {
-                let p = positions.partition_point(|&idx| idx <= sec_close);
-                if p < positions.len() {
-                    earliest = earliest.min(positions[p]);
+            for key in [full_name.as_str(), norm_full.as_str()] {
+                if let Some(positions) = exact_map.get(key) {
+                    let p = positions.partition_point(|&idx| idx <= sec_close);
+                    if p < positions.len() {
+                        earliest = earliest.min(positions[p]);
+                    }
                 }
             }
             if earliest == sec_close + 1 {
@@ -2759,7 +3043,7 @@ fn split_lean_source_inner(
                 for sub in &inner_spans {
                     if let Some((_kind, name)) = classify_decl_header(sub.clean_text) {
                         if let Some((sig_clean, _)) = split_at_top_level_assign(sub.clean_text) {
-                            let short = name.rsplit('.').next().unwrap_or(&name).to_string();
+                            let short = rsplit_lean_name_short(&name).to_string();
                             let st_hash = hash_normalized_whitespace_hex(sig_clean);
                             register_prior_decl(
                                 &mut prior_decls,
@@ -2777,7 +3061,7 @@ fn split_lean_source_inner(
                         }
                     }
                     if let Some((kw, name)) = classify_any_decl_header(sub.clean_text) {
-                        let short = name.rsplit('.').next().unwrap_or(&name).to_string();
+                        let short = rsplit_lean_name_short(&name).to_string();
                         let extra_names = if kw == "inductive" || kw == "coinductive" {
                             extract_inductive_constructors(sub.clean_text)
                         } else {
@@ -2894,7 +3178,7 @@ fn split_lean_source_inner(
                 };
 
                 if compute_cone {
-                    let short_name = name.rsplit('.').next().unwrap_or(&name).to_string();
+                    let short_name = rsplit_lean_name_short(&name).to_string();
                     register_prior_decl(
                         &mut prior_decls,
                         &mut name_to_decl_idxs,
@@ -2968,7 +3252,7 @@ fn split_lean_source_inner(
                         scope_directives.push((span_idx, line_str));
                     }
                 } else {
-                    let short = name.rsplit('.').next().unwrap_or(&name).to_string();
+                    let short = rsplit_lean_name_short(&name).to_string();
                     let extra_names = if kw == "inductive" || kw == "coinductive" {
                         extract_inductive_constructors(span.clean_text)
                     } else {
@@ -3360,7 +3644,7 @@ pub fn build_coalesced_shard_source(
                 &qualified_decl_name(&name, &scope_stack),
                 uncached_names,
             ) {
-                let short = name.rsplit('.').next().unwrap_or(&name);
+                let short = rsplit_lean_name_short(&name);
                 if short.starts_with("_turbo_verify_") {
                     continue;
                 }
@@ -3381,34 +3665,63 @@ pub fn build_coalesced_shard_source(
 }
 
 fn contains_local_decl_ref(haystack: &str, short: &str, full_name: &str) -> bool {
+    let clean = strip_lean_comments(haystack);
+    let no_strings = strip_string_literals(&clean);
+    let haystack = no_strings.as_ref();
     let bytes = haystack.as_bytes();
-    for (idx, _) in haystack.match_indices(short) {
-        let end = idx + short.len();
-        let next_ok = end >= bytes.len()
-            || (!bytes[end].is_ascii_alphanumeric() && bytes[end] != b'_' && bytes[end] != b'\'');
-        if !next_ok {
+    let len = bytes.len();
+    let unesc_short = unescape_guillemet_segment(short);
+    let norm_full = normalize_lean_qual_ident(full_name);
+    let mut i = 0usize;
+    while i < len {
+        let starts_guillemet = bytes[i] == 0xC2 && i + 1 < len && bytes[i + 1] == 0xAB;
+        let starts_ident = if starts_guillemet {
+            true
+        } else if bytes[i] == b'.' || bytes[i].is_ascii_digit() {
+            false
+        } else {
+            haystack[i..]
+                .chars()
+                .next()
+                .map(is_lean_ident_continuation)
+                .unwrap_or(false)
+        };
+        if !starts_ident {
+            i += haystack[i..]
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(1);
             continue;
         }
-        let mut q_start = idx;
-        while q_start > 0
-            && (bytes[q_start - 1].is_ascii_alphanumeric()
-                || matches!(bytes[q_start - 1], b'_' | b'\'' | b'.'))
-        {
-            q_start -= 1;
-        }
-        let qual_ident = &haystack[q_start..end];
-        if qual_ident == short || qual_ident == full_name {
-            return true;
-        }
-        if STD_QUAL_PREFIXES
-            .iter()
-            .any(|p| qual_ident.starts_with(p) && !full_name.starts_with(p))
-        {
+        let Some(end) = scan_lean_qual_ident_at(haystack, i) else {
+            i += 1;
             continue;
+        };
+        let qual_ident = haystack[i..end].trim_matches('.');
+        if !qual_ident.is_empty() {
+            let norm_qual = normalize_lean_qual_ident(qual_ident);
+            if qual_ident == short
+                || qual_ident == full_name
+                || norm_qual == unesc_short
+                || norm_qual == norm_full
+            {
+                return true;
+            }
+            let is_std_other = STD_QUAL_PREFIXES.iter().any(|p| {
+                (qual_ident.starts_with(p) || norm_qual.starts_with(p))
+                    && !full_name.starts_with(p)
+                    && !norm_full.starts_with(p)
+            });
+            if !is_std_other {
+                let tok_short = rsplit_lean_name_short(qual_ident);
+                let unesc_tok_short = unescape_guillemet_segment(tok_short);
+                if tok_short == short || unesc_tok_short == unesc_short {
+                    return true;
+                }
+            }
         }
-        if idx == q_start || (!bytes[idx - 1].is_ascii_alphanumeric() && bytes[idx - 1] != b'_') {
-            return true;
-        }
+        i = end;
     }
     false
 }
@@ -3422,7 +3735,7 @@ pub fn shard_is_acyclic_for_fast_import(shards: &[TheoremShard], idx: usize) -> 
     }
     let proof = &shards[idx].proof_text;
     for later in &shards[idx..] {
-        let short = later.name.rsplit('.').next().unwrap_or(&later.name);
+        let short = rsplit_lean_name_short(&later.name);
         if contains_local_decl_ref(proof, short, &later.name) {
             return false;
         }
@@ -3538,32 +3851,32 @@ fn is_scope_or_context_command(clean_text: &str) -> bool {
     while let Some(next) = strip_leading_attr_block(after_attrs) {
         after_attrs = next.trim_start();
     }
-    [
-        "local notation",
-        "scoped notation",
-        "local infix",
-        "scoped infix",
-        "local prefix",
-        "scoped prefix",
-        "local postfix",
-        "scoped postfix",
-        "local instance",
-        "scoped instance",
-        "local attribute",
-        "scoped attribute",
-        "local simproc",
-        "scoped simproc",
-        "local dsimproc",
-        "scoped dsimproc",
-        "local syntax",
-        "scoped syntax",
-        "local macro",
-        "scoped macro",
-        "local elab",
-        "scoped elab",
-    ]
-    .iter()
-    .any(|&prefix| after_attrs.starts_with(prefix))
+    for scope_kw in ["local", "scoped"] {
+        if let Some(rest) = after_attrs.strip_prefix(scope_kw) {
+            if rest.starts_with(char::is_whitespace) {
+                let after_scope = rest.trim_start();
+                if [
+                    "notation",
+                    "infix",
+                    "prefix",
+                    "postfix",
+                    "instance",
+                    "attribute",
+                    "simproc",
+                    "dsimproc",
+                    "syntax",
+                    "macro",
+                    "elab",
+                ]
+                .iter()
+                .any(|&kw| after_scope.starts_with(kw))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Rename a named `local instance <name> ...` or `scoped instance <name> ...` for fast `.olean`
@@ -4850,7 +5163,7 @@ pub fn audit_source_declarations(
         }
         let is_priv = after_attrs.starts_with("private ");
         if let Some((kw, name)) = classify_any_decl_header(span.clean_text) {
-            let short = name.rsplit('.').next().unwrap_or(&name).to_string();
+            let short = rsplit_lean_name_short(&name).to_string();
             let matches_filter = decl_filter
                 .filter(|d| !d.is_empty() && *d != "auto")
                 .map(|df| decl_name_matches_target(&qualified_decl_name(&name, &scope_stack), df))
@@ -5092,7 +5405,9 @@ mod tests {
                 .and_then(|t| crate::accelerators::toml_string_array(&t, "axioms", "allow"))
         };
         assert_eq!(allow(None).unwrap(), ["A.*", "B"]);
-        assert_eq!(allow(Some("HEAD")), None);
+        if crate::trusted_tools::git(&repo).is_ok() {
+            assert_eq!(allow(Some("HEAD")), None);
+        }
         std::fs::write(
             repo.join("turbo-lean.toml"),
             "[zygote]\ntimeout_secs = 900\n",
@@ -6054,6 +6369,105 @@ end MathlibEdgeCases
                 .nth(target_shard.start_line - 1)
                 .map(str::trim),
             src.lines().nth(target_shard.start_line - 1).map(str::trim)
+        );
+    }
+
+    #[test]
+    fn test_multiline_string_literal_and_guillemet_do_not_split_or_corrupt_scopes() {
+        let src = "\
+namespace Outer
+
+def embeddedBanner : String := \"first line
+namespace FakeInner
+section FakeSec
+theorem fake_inside_string : False := by sorry
+mutual
+def fake_mutual : Nat := 0
+end
+end FakeSec
+end FakeInner\"
+
+def «end» : Nat := 7
+
+theorem real_after_multiline_string (x : Nat) : x = x := by
+  rfl
+
+end Outer
+";
+        let split = split_lean_source(src, &[]);
+        let names: Vec<&str> = split.shards.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            !names.iter().any(|n| n.contains("fake_")),
+            "unexpected fake shard from string literal: {:?}",
+            names
+        );
+        let real_shard = split
+            .shards
+            .iter()
+            .find(|s| s.name == "real_after_multiline_string")
+            .expect("expected real_after_multiline_string shard");
+        assert_eq!(
+            real_shard.qualified_name,
+            "Outer.real_after_multiline_string"
+        );
+        assert!(real_shard.shard_source.contains("embeddedBanner"));
+    }
+
+    #[test]
+    fn test_raw_strings_and_guillemets_preserve_comments_deps_and_hygiene() {
+        let raw_src = "def banner : String := r#\"line 1\n-- not a comment\n/- not block -/\n\"#\ntheorem after_raw : True := trivial\n";
+        let stripped = strip_lean_comments(raw_src);
+        assert_eq!(stripped, raw_src);
+
+        let guillemet_src = "\
+namespace «A.B»
+def «helper -- one» : Nat := 41
+def «sorry» : Nat := «helper -- one» + 1
+def «used\nin\ntmp» : Nat := «sorry» + 1
+section «Tmp.Sec»
+theorem unused_in_tmp : True := trivial
+end «Tmp.Sec»
+def mentions_name_in_str : String := r\"unused_in_tmp\"
+theorem «check.dot» : «A.B».«used\nin\ntmp» = 43 := by
+  rfl
+end «A.B»
+";
+        let split = split_lean_source(guillemet_src, &[]);
+        assert!(
+            !split.hygiene.has_sorry && split.hygiene.flagged_items.is_empty(),
+            "guillemet identifier `«sorry»` must not trigger sorry hygiene: {:?}",
+            split.hygiene
+        );
+        let thm = split
+            .shards
+            .iter()
+            .find(|s| s.name == "«check.dot»")
+            .expect("expected «check.dot» theorem shard");
+        assert_eq!(thm.qualified_name, "«A.B».«check.dot»");
+        assert!(
+            thm.shard_source.contains("«helper -- one»") && thm.shard_source.contains("«sorry»"),
+            "shard must retain guillemet dependencies: {}",
+            thm.shard_source
+        );
+        assert!(
+            !thm.shard_source.contains("theorem unused_in_tmp"),
+            "closed-section pruning must ignore string literal mention of `unused_in_tmp`: {}",
+            thm.shard_source
+        );
+
+        let cyclic_guillemet = "\
+theorem «cyc.a» : True := «cyc.b»
+theorem «cyc.b» : True := trivial
+";
+        let cyc_split = split_lean_source(cyclic_guillemet, &[]);
+        let cyc_idx = cyc_split
+            .shards
+            .iter()
+            .position(|s| s.name == "«cyc.a»")
+            .unwrap();
+        assert!(
+            !shard_is_acyclic_for_fast_import(&cyc_split.shards, cyc_idx),
+            "forward reference between guillemet theorems must be detected as non-acyclic"
         );
     }
 

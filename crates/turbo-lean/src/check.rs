@@ -1815,8 +1815,12 @@ fn run_check_command_inner(
         crate::shm_cache::read_shm_or_disk_spill(st_path, Some(&disk_spill_dir))
             .and_then(|bytes| serde_json::from_slice::<ShmCachedFileSplit>(&bytes).ok())
             .filter(|c| {
-                compute_imported_olean_interface_hashes(&c.split.imports_header, &canon_dir, None)
-                    == c.dep_hashes
+                c.split_key.starts_with("file-split:v11:")
+                    && compute_imported_olean_interface_hashes(
+                        &c.split.imports_header,
+                        &canon_dir,
+                        None,
+                    ) == c.dep_hashes
             })
     };
     let mut stat_cached_entry = st_paths_opt
@@ -1856,7 +1860,7 @@ fn run_check_command_inner(
         known_modified_vs_head = true;
         if let Some((ref st_path, _)) = st_paths_opt {
             let entry = ShmCachedFileSplit {
-                split_key: String::new(),
+                split_key: "file-split:v11:partial".to_string(),
                 src_blake3: String::new(),
                 split: compact_split_for_shm_cache(&fast_sp),
                 prefix_src: pref_src.clone(),
@@ -1916,7 +1920,7 @@ fn run_check_command_inner(
                 }
                 let entry = ShmCachedFileSplit {
                     split_key: if src_b3.is_empty() {
-                        String::new()
+                        "file-split:v11:partial".to_string()
                     } else {
                         format!("file-split:v11:{}", src_b3)
                     },
@@ -2158,13 +2162,13 @@ fn check_directory(
             }
         }
     }
-    #[allow(clippy::type_complexity)]
-    let uncached_files: Vec<(
+    type UncachedFileEntry = (
         PathBuf,
         String,
         Vec<(String, splitter::TheoremShard)>,
         Vec<String>,
-    )> = uncached_files
+    );
+    let uncached_files: Vec<UncachedFileEntry> = uncached_files
         .into_iter()
         .map(|(lf, _sb, src, fu, fa)| (lf, src, fu, fa))
         .collect();
@@ -2204,8 +2208,8 @@ fn check_directory(
     };
     let lean_bin = resolve_lean_bin(canon_dir)?;
 
-    #[allow(clippy::type_complexity)]
-    let mut cross_verified_items: Option<Vec<(String, String, Vec<u8>, i64)>> = None;
+    type CrossVerifiedItem = (String, String, Vec<u8>, i64);
+    let mut cross_verified_items: Option<Vec<CrossVerifiedItem>> = None;
     let mut cross_verify_mode = "cross_file_coalesced_shards";
     let lean_path_str = if proj_build_verified
         && remote_http.is_none()
@@ -2649,11 +2653,12 @@ fn check_single_decl(
                     )
                     .and_then(|b| serde_json::from_slice::<ShmCachedFileSplit>(&b).ok())
                     .filter(|c| {
-                        compute_imported_olean_interface_hashes(
-                            &c.split.imports_header,
-                            canon_dir,
-                            None,
-                        ) == c.dep_hashes
+                        c.split_key.starts_with("file-split:v11:")
+                            && compute_imported_olean_interface_hashes(
+                                &c.split.imports_header,
+                                canon_dir,
+                                None,
+                            ) == c.dep_hashes
                     })
                     .map(|c| {
                         let cb3 = (!c.src_blake3.is_empty()).then_some(c.src_blake3);
@@ -4720,10 +4725,8 @@ fn check_single_file(
             let next_idx = std::sync::atomic::AtomicUsize::new(0);
             let abort_flag = std::sync::atomic::AtomicBool::new(false);
             let src_ref: &str = src.as_str();
-            #[allow(clippy::type_complexity)]
-            let worker_results: Vec<
-                Result<Vec<(String, &splitter::TheoremShard, i64)>>,
-            > = std::thread::scope(|s| {
+            type WorkerShardResult<'a> = (String, &'a splitter::TheoremShard, i64);
+            let worker_results: Vec<Result<Vec<WorkerShardResult<'_>>>> = std::thread::scope(|s| {
                 let mut handles = Vec::with_capacity(effective_jobs);
                 for _worker_id in 0..effective_jobs {
                     let next_idx_ref = &next_idx;

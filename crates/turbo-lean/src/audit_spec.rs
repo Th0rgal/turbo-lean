@@ -4,7 +4,54 @@ use super::*;
 use crate::splitter::skip_lean_lexeme;
 
 pub(super) fn inline_stmt_let_bindings(stmt: &str) -> String {
+    inline_stmt_let_bindings_checked(stmt).0
+}
+
+fn stmt_has_untrusted_term_keywords(s: &str) -> bool {
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+    let mut i = 0usize;
+    while i < n {
+        if is_ident_start(chars[i]) {
+            let prev_dot = i > 0 && chars[i - 1] == '.';
+            let start = i;
+            i += 1;
+            while i < n && is_ident_continue(chars[i]) {
+                i += 1;
+            }
+            if !prev_dot {
+                let word: String = chars[start..i].iter().collect();
+                if matches!(
+                    word.as_str(),
+                    "let"
+                        | "letI"
+                        | "have"
+                        | "haveI"
+                        | "match"
+                        | "fun"
+                        | "show"
+                        | "suffices"
+                        | "do"
+                        | "by"
+                        | "where"
+                        | "forall"
+                        | "exists"
+                ) {
+                    return true;
+                }
+            }
+        } else if matches!(chars[i], '∀' | '∃' | 'λ' | ';' | '↦') {
+            return true;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+fn inline_stmt_let_bindings_checked(stmt: &str) -> (String, bool) {
     let mut cur = stmt.trim().to_string();
+    let mut had_let = false;
     for _ in 0..16 {
         let trimmed = cur.trim_start();
         let Some(after_let) = trimmed
@@ -13,20 +60,28 @@ pub(super) fn inline_stmt_let_bindings(stmt: &str) -> String {
         else {
             break;
         };
+        had_let = true;
         let rest = after_let.trim_start();
         let name_end = rest
             .find(|c: char| !is_ident_continue(c))
             .unwrap_or(rest.len());
-        if name_end == 0 {
+        if name_end == 0 || !is_ident_start(rest.chars().next().unwrap_or('0')) {
             break;
         }
         let var_name = &rest[..name_end];
-        let after_name = &rest[name_end..];
-        let Some(eq_idx) = after_name.find(":=") else {
+        if var_name == "rec" {
+            break;
+        }
+        let after_name = rest[name_end..].trim_start();
+        let after_ty = if let Some((_ty, rhs_part)) = split_top_level_colon(after_name) {
+            rhs_part.trim_start()
+        } else {
+            after_name
+        };
+        let Some(after_eq_raw) = after_ty.strip_prefix(":=") else {
             break;
         };
-        let after_eq = after_name[eq_idx + 2..].trim_start();
-        // Find top-level `;` or `\n` terminating the `let` RHS
+        let after_eq = after_eq_raw.trim_start();
         let chars: Vec<char> = after_eq.chars().collect();
         let mut p_depth = 0usize;
         let mut split_char_idx = None;
@@ -49,7 +104,8 @@ pub(super) fn inline_stmt_let_bindings(stmt: &str) -> String {
         let rhs_wrapped = format!("({})", rhs.trim());
         cur = replace_ident_boundary(body.trim(), var_name, &rhs_wrapped);
     }
-    cur
+    let clean_stmt = !had_let && !stmt_has_untrusted_term_keywords(stmt);
+    (cur, clean_stmt)
 }
 
 /// Audit-only stripping: preserve literal text, byte offsets, and newlines.
@@ -74,6 +130,657 @@ fn strip_audit_comments(src: &str) -> String {
     String::from_utf8(out).expect("masking comments preserves UTF-8")
 }
 
+pub(super) fn decl_matches_requested_target(
+    decl_name: &str,
+    qualified_name: &str,
+    target: &str,
+) -> bool {
+    let target = target.trim();
+    let id = if qualified_name.is_empty() {
+        decl_name
+    } else {
+        qualified_name
+    };
+    crate::splitter::decl_name_matches_target(id, target)
+}
+
+pub(super) fn select_target_decl_unambiguously(
+    decls: Vec<ExtractedDecl>,
+    target_name: Option<&str>,
+) -> Option<ExtractedDecl> {
+    match target_name.map(str::trim) {
+        Some(t) if !t.is_empty() && t != "auto" => {
+            let mut matches: Vec<ExtractedDecl> = decls
+                .into_iter()
+                .filter(|d| decl_matches_requested_target(&d.name, &d.qualified_name, t))
+                .collect();
+            (matches.len() == 1).then(|| matches.swap_remove(0))
+        }
+        _ => decls.into_iter().next(),
+    }
+}
+
+fn source_has_no_untrusted_elab_tokens(
+    chars: &[char],
+    skip_at: &impl Fn(usize) -> Option<usize>,
+) -> bool {
+    let n = chars.len();
+    let ident_at = |idx: usize| -> Option<(String, usize)> {
+        if idx >= n || !is_ident_start(chars[idx]) {
+            return None;
+        }
+        let mut j = idx + 1;
+        while j < n && is_ident_continue(chars[j]) {
+            j += 1;
+        }
+        Some((chars[idx..j].iter().collect(), j))
+    };
+    let dotted_at = |idx: usize| -> Option<(String, usize)> {
+        let mut j = idx;
+        let mut out = String::new();
+        loop {
+            let (seg, next) = ident_at(j)?;
+            out.push_str(&seg);
+            j = next;
+            if j < n && chars[j] == '.' {
+                out.push('.');
+                j += 1;
+                continue;
+            }
+            return Some((out, j));
+        }
+    };
+    let mut k = 0usize;
+    let mut allow_imports = true;
+    while k < n {
+        if let Some(end) = skip_at(k) {
+            k = end;
+            continue;
+        }
+        if chars[k].is_whitespace() {
+            k += 1;
+            continue;
+        }
+        if chars[k] == '@' && k + 1 < n && chars[k + 1] == '[' {
+            return false;
+        }
+        if chars[k] == '#' && (k == 0 || !is_ident_continue(chars[k - 1])) {
+            return false;
+        }
+        if matches!(chars[k], '«' | '»' | '⦃' | '⦄') {
+            return false;
+        }
+        if is_ident_start(chars[k]) {
+            let prev_dot = k > 0 && chars[k - 1] == '.';
+            let Some((word, mut next_k)) = ident_at(k) else {
+                k += 1;
+                continue;
+            };
+            if prev_dot {
+                k = next_k;
+                continue;
+            }
+            if word != "import" {
+                allow_imports = false;
+            }
+            match word.as_str() {
+                "import" => {
+                    if !allow_imports {
+                        return false;
+                    }
+                    let mut p = k;
+                    while p > 0 && chars[p - 1] != '\n' {
+                        p -= 1;
+                        if !chars[p].is_whitespace() {
+                            return false;
+                        }
+                    }
+                    let mut saw_module = false;
+                    let mut cur = next_k;
+                    loop {
+                        while cur < n && chars[cur] != '\n' && chars[cur].is_whitespace() {
+                            cur += 1;
+                        }
+                        if cur >= n || chars[cur] == '\n' {
+                            break;
+                        }
+                        let Some((path, after_path)) = dotted_at(cur) else {
+                            return false;
+                        };
+                        if !matches!(
+                            path.as_str(),
+                            "LeanNative.Backend.FastCheck"
+                                | "TurboLean.FastCheck"
+                                | "LeanNative.IR.Types"
+                                | "TurboLean.Reflection"
+                        ) {
+                            return false;
+                        }
+                        saw_module = true;
+                        cur = after_path;
+                    }
+                    if !saw_module {
+                        return false;
+                    }
+                    k = cur;
+                    continue;
+                }
+                "open" => {
+                    while next_k < n && chars[next_k] != '\n' && chars[next_k].is_whitespace() {
+                        next_k += 1;
+                    }
+                    let mut p = k;
+                    while p > 0 && chars[p - 1] != '\n' {
+                        p -= 1;
+                        if !chars[p].is_whitespace() {
+                            return false;
+                        }
+                    }
+                    let mut cur = next_k;
+                    let mut saw_ns = false;
+                    loop {
+                        while cur < n && chars[cur] != '\n' && chars[cur].is_whitespace() {
+                            cur += 1;
+                        }
+                        if cur >= n || chars[cur] == '\n' {
+                            break;
+                        }
+                        if let Some((kw, after_kw)) = ident_at(cur) {
+                            if kw == "in" && saw_ns {
+                                cur = after_kw;
+                                break;
+                            }
+                        }
+                        let Some((path, after_path)) = dotted_at(cur) else {
+                            return false;
+                        };
+                        if !matches!(
+                            path.as_str(),
+                            "LeanNative.Backend.FastCheck"
+                                | "TurboLean.FastCheck"
+                                | "LeanNative.IR"
+                                | "TurboLean.Reflection"
+                        ) {
+                            return false;
+                        }
+                        saw_ns = true;
+                        cur = after_path;
+                    }
+                    if !saw_ns {
+                        return false;
+                    }
+                    k = cur;
+                    continue;
+                }
+                "abbrev" => {
+                    let mut p = k;
+                    while p > 0 && chars[p - 1] != '\n' {
+                        p -= 1;
+                        if !chars[p].is_whitespace() {
+                            return false;
+                        }
+                    }
+                    while next_k < n && chars[next_k] != '\n' && chars[next_k].is_whitespace() {
+                        next_k += 1;
+                    }
+                    let Some((name, after_name)) = ident_at(next_k) else {
+                        return false;
+                    };
+                    if name != "Word256" {
+                        return false;
+                    }
+                    next_k = after_name;
+                    while next_k < n && chars[next_k] != '\n' && chars[next_k].is_whitespace() {
+                        next_k += 1;
+                    }
+                    if chars.get(next_k) != Some(&':') || chars.get(next_k + 1) != Some(&'=') {
+                        return false;
+                    }
+                    next_k += 2;
+                    while next_k < n && chars[next_k] != '\n' && chars[next_k].is_whitespace() {
+                        next_k += 1;
+                    }
+                    let Some((rhs, after_rhs)) = dotted_at(next_k) else {
+                        return false;
+                    };
+                    if rhs != "LeanNative.Backend.FastCheck.Word256" {
+                        return false;
+                    }
+                    let mut p = after_rhs;
+                    while p < n && chars[p] != '\n' && chars[p].is_whitespace() {
+                        p += 1;
+                    }
+                    if p < n && chars[p] != '\n' {
+                        return false;
+                    }
+                    k = after_rhs;
+                    continue;
+                }
+                "set_option" => {
+                    let mut p = k;
+                    while p > 0 && chars[p - 1] != '\n' {
+                        p -= 1;
+                        if !chars[p].is_whitespace() {
+                            return false;
+                        }
+                    }
+                    while next_k < n && chars[next_k] != '\n' && chars[next_k].is_whitespace() {
+                        next_k += 1;
+                    }
+                    let Some((opt, after_opt)) = ident_at(next_k) else {
+                        return false;
+                    };
+                    if opt != "maxHeartbeats" {
+                        return false;
+                    }
+                    next_k = after_opt;
+                    while next_k < n && chars[next_k] != '\n' && chars[next_k].is_whitespace() {
+                        next_k += 1;
+                    }
+                    let d0 = next_k;
+                    while next_k < n && chars[next_k].is_ascii_digit() {
+                        next_k += 1;
+                    }
+                    if next_k == d0 || (next_k < n && is_ident_continue(chars[next_k])) {
+                        return false;
+                    }
+                    let mut p = next_k;
+                    while p < n && chars[p] != '\n' && chars[p].is_whitespace() {
+                        p += 1;
+                    }
+                    if p < n && chars[p] != '\n' {
+                        let Some((in_kw, after_in)) = ident_at(p) else {
+                            return false;
+                        };
+                        if in_kw != "in" {
+                            return false;
+                        }
+                        let mut q = after_in;
+                        while q < n && chars[q] != '\n' && chars[q].is_whitespace() {
+                            q += 1;
+                        }
+                        if q < n && chars[q] != '\n' {
+                            return false;
+                        }
+                        next_k = after_in;
+                    }
+                    k = next_k;
+                    continue;
+                }
+                "namespace" | "section" => {
+                    let mut p = k;
+                    while p > 0 && chars[p - 1] != '\n' {
+                        p -= 1;
+                        if !chars[p].is_whitespace() {
+                            return false;
+                        }
+                    }
+                    while next_k < n && chars[next_k] != '\n' && chars[next_k].is_whitespace() {
+                        next_k += 1;
+                    }
+                    if next_k < n && chars[next_k] != '\n' {
+                        if word == "namespace" {
+                            let Some((_, after_ns)) = dotted_at(next_k) else {
+                                return false;
+                            };
+                            next_k = after_ns;
+                        } else if let Some((_, after_sec)) = dotted_at(next_k) {
+                            next_k = after_sec;
+                        } else {
+                            return false;
+                        }
+                        while next_k < n && chars[next_k] != '\n' && chars[next_k].is_whitespace() {
+                            next_k += 1;
+                        }
+                        if next_k < n && chars[next_k] != '\n' {
+                            return false;
+                        }
+                    } else if word == "namespace" {
+                        return false;
+                    }
+                    k = next_k;
+                    continue;
+                }
+                "def" => {
+                    let mut p = k;
+                    while p > 0 && chars[p - 1] != '\n' {
+                        p -= 1;
+                        if !chars[p].is_whitespace() {
+                            let Some((mod_kw, mod_end)) = ident_at(p) else {
+                                return false;
+                            };
+                            if !matches!(mod_kw.as_str(), "private" | "protected" | "noncomputable")
+                                || !chars[mod_end..k].iter().all(|c| c.is_whitespace())
+                            {
+                                return false;
+                            }
+                            while p > 0 && chars[p - 1] != '\n' {
+                                p -= 1;
+                                if !chars[p].is_whitespace() {
+                                    return false;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    while next_k < n && chars[next_k].is_whitespace() {
+                        next_k += 1;
+                    }
+                    let Some((name, after_name)) = dotted_at(next_k) else {
+                        return false;
+                    };
+                    if name
+                        .split('.')
+                        .any(|seg| is_reserved_shadow_ident(seg) || is_builtin_eval_fn_ident(seg))
+                    {
+                        return false;
+                    }
+                    k = after_name;
+                    continue;
+                }
+                "local" | "scoped" | "instance" | "attribute" | "notation" | "infix" | "infixl"
+                | "infixr" | "prefix" | "postfix" | "macro" | "macro_rules" | "syntax" | "elab"
+                | "elab_rules" | "variable" | "variables" | "universe" | "universes" | "export"
+                | "include" | "omit" | "mutual" | "opaque" | "axiom" | "constant" | "structure"
+                | "class" | "inductive" | "coinductive" | "deriving" | "example" | "initialize"
+                | "builtin_initialize" | "register_option" | "declare_syntax_cat" | "unif_hint"
+                | "unsafe" | "partial" | "meta" | "haveI" | "letI" | "module" | "prelude" => {
+                    return false;
+                }
+                _ => {
+                    k = next_k;
+                    continue;
+                }
+            }
+        }
+        k += 1;
+    }
+    true
+}
+
+fn is_reserved_shadow_ident(name: &str) -> bool {
+    matches!(
+        name,
+        "Word256"
+            | "UInt256"
+            | "Uint256"
+            | "EVMWord"
+            | "BitVec"
+            | "Nat"
+            | "Bool"
+            | "Int"
+            | "UInt8"
+            | "UInt16"
+            | "UInt32"
+            | "UInt64"
+            | "USize"
+            | "Option"
+            | "Prod"
+            | "StorageKey"
+            | "ContractState"
+            | "True"
+            | "False"
+            | "true"
+            | "false"
+            | "some"
+            | "none"
+            | "zero"
+            | "one"
+            | "max"
+            | "maxU64"
+            | "maxU128"
+            | "twoPow255"
+            | "getStorage"
+            | "setStorage"
+            | "fastBeq"
+            | "decide"
+            | "Char"
+            | "String"
+            | "F128"
+            | "UInt128"
+    )
+}
+
+fn is_builtin_eval_fn_ident(name: &str) -> bool {
+    matches!(
+        name,
+        "add"
+            | "addChecked"
+            | "addWithCarry"
+            | "addr"
+            | "and"
+            | "beq"
+            | "bitAnd"
+            | "bitMaj"
+            | "bitMux"
+            | "bitNot"
+            | "bitOr"
+            | "bitParity"
+            | "bitXor"
+            | "clz"
+            | "clz256"
+            | "complement"
+            | "contractSlot"
+            | "ctz256"
+            | "div"
+            | "fastBeq"
+            | "getStorage"
+            | "gf128_reduce_poly"
+            | "land"
+            | "le"
+            | "lor"
+            | "lt"
+            | "map"
+            | "map2"
+            | "mapUint"
+            | "mk"
+            | "mod"
+            | "mul"
+            | "mulChecked"
+            | "mulDivDown"
+            | "mulDivUp"
+            | "none"
+            | "not"
+            | "ofNat"
+            | "ofUInt256"
+            | "ofUInt64"
+            | "or"
+            | "sar"
+            | "setStorage"
+            | "shiftLeft"
+            | "shiftRight"
+            | "shl"
+            | "shr"
+            | "slot"
+            | "some"
+            | "sub"
+            | "subChecked"
+            | "subWithBorrow"
+            | "succ"
+            | "toNat"
+            | "toUInt256"
+            | "transient"
+            | "udiv"
+            | "umod"
+            | "ushiftRight"
+            | "val"
+            | "xor"
+    )
+}
+
+struct FileScopeScan {
+    scope: DeclScopeContext,
+    trusted_shadow_ok: bool,
+}
+
+fn scan_file_scope_context(
+    chars: &[char],
+    skip_at: &impl Fn(usize) -> Option<usize>,
+) -> FileScopeScan {
+    let n = chars.len();
+    let ident_at = |idx: usize| -> Option<(String, usize)> {
+        if idx >= n || !is_ident_start(chars[idx]) {
+            return None;
+        }
+        let mut j = idx + 1;
+        while j < n && is_ident_continue(chars[j]) {
+            j += 1;
+        }
+        Some((chars[idx..j].iter().collect(), j))
+    };
+    let dotted_at = |idx: usize| -> Option<(String, usize)> {
+        let mut j = idx;
+        let mut out = String::new();
+        loop {
+            let (seg, next) = ident_at(j)?;
+            out.push_str(&seg);
+            j = next;
+            if j < n && chars[j] == '.' {
+                out.push('.');
+                j += 1;
+                continue;
+            }
+            return Some((out, j));
+        }
+    };
+    let mut scope = DeclScopeContext::default();
+    let mut trusted_shadow_ok = true;
+    let mut k = 0usize;
+    while k < n {
+        if let Some(end) = skip_at(k) {
+            k = end;
+            continue;
+        }
+        if chars[k].is_whitespace() {
+            k += 1;
+            continue;
+        }
+        if !is_ident_start(chars[k]) || (k > 0 && chars[k - 1] == '.') {
+            k += 1;
+            continue;
+        }
+        let Some((word, mut next_k)) = ident_at(k) else {
+            k += 1;
+            continue;
+        };
+        let line_head = {
+            let mut p = k;
+            while p > 0 && chars[p - 1] != '\n' {
+                p -= 1;
+            }
+            let mut cur = p;
+            let mut ok = true;
+            while cur < k {
+                while cur < k && chars[cur].is_whitespace() {
+                    cur += 1;
+                }
+                if cur >= k {
+                    break;
+                }
+                if let Some((mw, after_mw)) = ident_at(cur) {
+                    if matches!(
+                        mw.as_str(),
+                        "private"
+                            | "protected"
+                            | "noncomputable"
+                            | "scoped"
+                            | "local"
+                            | "unsafe"
+                            | "partial"
+                            | "nonrec"
+                            | "public"
+                            | "meta"
+                    ) {
+                        cur = after_mw;
+                        continue;
+                    }
+                }
+                ok = false;
+                break;
+            }
+            ok
+        };
+        if !line_head {
+            k = next_k;
+            continue;
+        }
+        match word.as_str() {
+            "import" => {
+                scope.has_explicit_imports = true;
+                let mut cur = next_k;
+                loop {
+                    while cur < n && chars[cur] != '\n' && chars[cur].is_whitespace() {
+                        cur += 1;
+                    }
+                    if cur >= n || chars[cur] == '\n' {
+                        break;
+                    }
+                    let Some((path, after_path)) = dotted_at(cur) else {
+                        break;
+                    };
+                    if !scope.imported_modules.iter().any(|m| m == &path) {
+                        scope.imported_modules.push(path);
+                    }
+                    cur = after_path;
+                }
+                k = cur;
+            }
+            "open" => {
+                k = next_k;
+            }
+            "abbrev" => {
+                while next_k < n && chars[next_k] != '\n' && chars[next_k].is_whitespace() {
+                    next_k += 1;
+                }
+                let Some((name, after_name)) = dotted_at(next_k) else {
+                    k = next_k;
+                    continue;
+                };
+                let mut cur = after_name;
+                while cur < n && chars[cur] != '\n' && chars[cur].is_whitespace() {
+                    cur += 1;
+                }
+                if chars.get(cur) == Some(&':') && chars.get(cur + 1) == Some(&'=') {
+                    cur += 2;
+                    while cur < n && chars[cur] != '\n' && chars[cur].is_whitespace() {
+                        cur += 1;
+                    }
+                    if let Some((rhs, _)) = dotted_at(cur) {
+                        if name == "Word256" && rhs == "LeanNative.Backend.FastCheck.Word256" {
+                            scope.has_word256_abbrev = true;
+                        } else if name.split('.').any(is_reserved_shadow_ident) {
+                            trusted_shadow_ok = false;
+                        }
+                    }
+                } else if name.split('.').any(is_reserved_shadow_ident) {
+                    trusted_shadow_ok = false;
+                }
+                k = after_name;
+            }
+            "def" | "theorem" | "lemma" | "inductive" | "structure" => {
+                while next_k < n && chars[next_k].is_whitespace() {
+                    next_k += 1;
+                }
+                if let Some((name, after)) = dotted_at(next_k) {
+                    if name.split('.').any(is_reserved_shadow_ident) {
+                        trusted_shadow_ok = false;
+                    }
+                    k = after;
+                } else {
+                    k = next_k;
+                }
+            }
+            _ => {
+                k = next_k;
+            }
+        }
+    }
+    FileScopeScan {
+        scope,
+        trusted_shadow_ok,
+    }
+}
+
 pub(super) fn extract_all_lean_theorems(
     clean_src: &str,
     target_name: Option<&str>,
@@ -90,12 +797,161 @@ pub(super) fn extract_all_lean_theorems(
         skip_lean_lexeme(&clean_src, byte_offsets[i])
             .map(|span| byte_offsets.partition_point(|offset| *offset < span.end))
     };
-    let scan_dotted_name = |mut pos: usize, n: usize| -> (String, usize) {
-        while pos < n && (chars[pos] == ' ' || chars[pos] == '\t') {
+    let is_line_command_head = |pos: usize| -> bool {
+        let mut p = pos;
+        let mut cur = loop {
+            while p > 0 && chars[p - 1] != '\n' && chars[p - 1] != ';' {
+                p -= 1;
+            }
+            if p == 0 || chars[p - 1] == ';' {
+                break p;
+            }
+            let mut q = p - 1;
+            while q > 0 && chars[q - 1] != '\n' && chars[q - 1] != ';' {
+                q -= 1;
+            }
+            let mut lc = q;
+            let mut prefix_only = false;
+            while lc < p - 1 {
+                while lc < p - 1 && chars[lc].is_whitespace() {
+                    lc += 1;
+                }
+                if lc >= p - 1 {
+                    break;
+                }
+                if lc + 1 < p - 1 && chars[lc] == '@' && chars[lc + 1] == '[' {
+                    let mut depth = 1usize;
+                    lc += 2;
+                    while lc < pos && depth > 0 {
+                        if let Some(end) = skip_any_lexeme_at(lc) {
+                            lc = end;
+                            continue;
+                        }
+                        if chars[lc] == '[' {
+                            depth += 1;
+                        } else if chars[lc] == ']' {
+                            depth -= 1;
+                        }
+                        lc += 1;
+                    }
+                    prefix_only = depth == 0;
+                    continue;
+                }
+                if is_ident_start(chars[lc]) {
+                    let ws = lc;
+                    while lc < p - 1 && is_ident_continue(chars[lc]) {
+                        lc += 1;
+                    }
+                    let kw: String = chars[ws..lc].iter().collect();
+                    if matches!(
+                        kw.as_str(),
+                        "noncomputable"
+                            | "private"
+                            | "protected"
+                            | "scoped"
+                            | "local"
+                            | "unsafe"
+                            | "partial"
+                            | "nonrec"
+                            | "public"
+                            | "meta"
+                    ) {
+                        prefix_only = true;
+                        continue;
+                    }
+                }
+                prefix_only = false;
+                break;
+            }
+            if prefix_only {
+                p = q;
+            } else {
+                break p;
+            }
+        };
+        while cur < pos {
+            while cur < pos && chars[cur].is_whitespace() {
+                cur += 1;
+            }
+            if cur >= pos {
+                return true;
+            }
+            if cur + 1 < pos && chars[cur] == '@' && chars[cur + 1] == '[' {
+                let mut depth = 1usize;
+                cur += 2;
+                while cur < pos && depth > 0 {
+                    if let Some(end) = skip_any_lexeme_at(cur) {
+                        cur = end;
+                        continue;
+                    }
+                    if chars[cur] == '[' {
+                        depth += 1;
+                    } else if chars[cur] == ']' {
+                        depth -= 1;
+                    }
+                    cur += 1;
+                }
+                continue;
+            }
+            if is_ident_start(chars[cur]) {
+                let ws = cur;
+                while cur < pos && is_ident_continue(chars[cur]) {
+                    cur += 1;
+                }
+                let kw: String = chars[ws..cur].iter().collect();
+                if matches!(
+                    kw.as_str(),
+                    "noncomputable"
+                        | "private"
+                        | "protected"
+                        | "scoped"
+                        | "local"
+                        | "unsafe"
+                        | "partial"
+                        | "nonrec"
+                        | "public"
+                        | "meta"
+                ) {
+                    continue;
+                }
+                if matches!(
+                    kw.as_str(),
+                    "set_option" | "open" | "variable" | "universe" | "include" | "omit"
+                ) {
+                    let mut found_in = false;
+                    while cur < pos {
+                        if let Some(end) = skip_any_lexeme_at(cur) {
+                            cur = end;
+                            continue;
+                        }
+                        if is_ident_start(chars[cur]) {
+                            let is = cur;
+                            while cur < pos && is_ident_continue(chars[cur]) {
+                                cur += 1;
+                            }
+                            if chars[is..cur] == ['i', 'n'] {
+                                found_in = true;
+                                break;
+                            }
+                        } else {
+                            cur += 1;
+                        }
+                    }
+                    if found_in {
+                        continue;
+                    }
+                }
+            }
+            return false;
+        }
+        true
+    };
+    let scan_dotted_name_inline = |mut pos: usize, limit: usize| -> (String, usize) {
+        while pos < limit && (chars[pos] == ' ' || chars[pos] == '\t') {
             pos += 1;
         }
         let start = pos;
-        while pos < n {
+        while pos < limit {
             if chars[pos] == '«' {
                 if let Some(end) = skip_any_lexeme_at(pos) {
                     pos = end;
@@ -112,17 +968,21 @@ pub(super) fn extract_all_lean_theorems(
         let raw: String = chars[start..pos].iter().collect();
         (raw.trim_end_matches('.').to_string(), pos)
     };
-    let is_line_command_start = |word_idx: usize| -> bool {
-        let mut p = word_idx;
-        while p > 0 && (chars[p - 1] == ' ' || chars[p - 1] == '\t') {
-            p -= 1;
+    let scan_dotted_name = |mut pos: usize, limit: usize| -> (String, usize) {
+        while pos < limit && chars[pos].is_whitespace() {
+            pos += 1;
         }
-        p == 0 || chars[p - 1] == '\n' || chars[p - 1] == ';'
+        scan_dotted_name_inline(pos, limit)
     };
     let n = chars.len();
     let mut i = 0;
-    let mut out = Vec::new();
     let mut scope_stack: Vec<crate::splitter::ScopeFrame> = Vec::new();
+    let mut open_stack: Vec<(usize, String)> = Vec::new();
+    let mut transient_opens: Vec<String> = Vec::new();
+    let mut all_decls: Vec<ExtractedDecl> = Vec::new();
+    let file_elab_trusted =
+        source_has_no_untrusted_elab_tokens(&chars, &skip_literal_or_comment_at);
+    let mut file_scope = scan_file_scope_context(&chars, &skip_literal_or_comment_at);
 
     while i < n {
         if let Some(end) = skip_literal_or_comment_at(i) {
@@ -135,82 +995,169 @@ pub(super) fn extract_all_lean_theorems(
                 continue;
             }
         }
+        if chars[i].is_whitespace() {
+            i += 1;
+            continue;
+        }
         if is_ident_start(chars[i]) {
             let start = i;
+            let prev_is_dot_or_guillemet = start > 0 && matches!(chars[start - 1], '.' | '«');
             while i < n && is_ident_continue(chars[i]) {
                 i += 1;
             }
+            if prev_is_dot_or_guillemet {
+                continue;
+            }
             let word: String = chars[start..i].iter().collect();
-            if is_line_command_start(start) {
-                if word == "namespace" && i < n && (chars[i] == ' ' || chars[i] == '\t') {
-                    let (ns_name, next_i) = scan_dotted_name(i, n);
-                    i = next_i;
-                    for seg in crate::splitter::split_lean_name_components(&ns_name) {
-                        scope_stack.push(crate::splitter::ScopeFrame {
-                            kind: crate::splitter::ScopeKind::Namespace,
-                            name: seg.to_string(),
-                            open_span_idx: 0,
-                        });
-                    }
-                    continue;
-                } else if word == "section" {
-                    let (sec_name, next_i) = if i < n && (chars[i] == ' ' || chars[i] == '\t') {
-                        scan_dotted_name(i, n)
-                    } else {
-                        (String::new(), i)
-                    };
-                    i = next_i;
-                    if sec_name.is_empty() {
-                        scope_stack.push(crate::splitter::ScopeFrame {
-                            kind: crate::splitter::ScopeKind::Section,
-                            name: String::new(),
-                            open_span_idx: 0,
-                        });
-                    } else {
-                        for seg in crate::splitter::split_lean_name_components(&sec_name) {
+            if is_line_command_head(start) {
+                match word.as_str() {
+                    "namespace" if i < n && chars[i].is_whitespace() => {
+                        transient_opens.clear();
+                        let (ns_name, next_i) = scan_dotted_name(i, n);
+                        i = next_i;
+                        for seg in crate::splitter::split_lean_name_components(&ns_name) {
                             scope_stack.push(crate::splitter::ScopeFrame {
-                                kind: crate::splitter::ScopeKind::Section,
+                                kind: crate::splitter::ScopeKind::Namespace,
                                 name: seg.to_string(),
                                 open_span_idx: 0,
                             });
-                        }
-                    }
-                    continue;
-                } else if word == "mutual" && (i >= n || chars[i].is_whitespace()) {
-                    scope_stack.push(crate::splitter::ScopeFrame {
-                        kind: crate::splitter::ScopeKind::Mutual,
-                        name: String::new(),
-                        open_span_idx: 0,
-                    });
-                    continue;
-                } else if word == "end" && (i >= n || chars[i].is_whitespace()) {
-                    let (end_name, next_i) = if i < n && (chars[i] == ' ' || chars[i] == '\t') {
-                        scan_dotted_name(i, n)
-                    } else {
-                        (String::new(), i)
-                    };
-                    i = next_i;
-                    if end_name.is_empty() {
-                        scope_stack.pop();
-                    } else {
-                        for seg in crate::splitter::split_lean_name_components(&end_name)
-                            .into_iter()
-                            .rev()
-                        {
-                            let canon = crate::splitter::canonical_lean_name_component(seg);
-                            if let Some(pos) = scope_stack.iter().rposition(|f| {
-                                crate::splitter::canonical_lean_name_component(&f.name) == canon
-                            }) {
-                                scope_stack.truncate(pos);
-                            } else {
-                                scope_stack.pop();
+                            let raw_seg = seg
+                                .strip_prefix('«')
+                                .and_then(|s| s.strip_suffix('»'))
+                                .unwrap_or(seg);
+                            if is_reserved_shadow_ident(raw_seg) {
+                                file_scope.trusted_shadow_ok = false;
                             }
                         }
+                        continue;
                     }
-                    continue;
+                    "section" if i >= n || chars[i].is_whitespace() => {
+                        transient_opens.clear();
+                        let (sec_name, next_i) = if i < n && (chars[i] == ' ' || chars[i] == '\t') {
+                            scan_dotted_name_inline(i, n)
+                        } else {
+                            (String::new(), i)
+                        };
+                        i = next_i;
+                        if sec_name.is_empty() {
+                            scope_stack.push(crate::splitter::ScopeFrame {
+                                kind: crate::splitter::ScopeKind::Section,
+                                name: String::new(),
+                                open_span_idx: 0,
+                            });
+                        } else {
+                            for seg in crate::splitter::split_lean_name_components(&sec_name) {
+                                scope_stack.push(crate::splitter::ScopeFrame {
+                                    kind: crate::splitter::ScopeKind::Section,
+                                    name: seg.to_string(),
+                                    open_span_idx: 0,
+                                });
+                            }
+                        }
+                        continue;
+                    }
+                    "mutual" if i >= n || chars[i].is_whitespace() => {
+                        transient_opens.clear();
+                        scope_stack.push(crate::splitter::ScopeFrame {
+                            kind: crate::splitter::ScopeKind::Mutual,
+                            name: String::new(),
+                            open_span_idx: 0,
+                        });
+                        continue;
+                    }
+                    "end" if i >= n || chars[i].is_whitespace() => {
+                        transient_opens.clear();
+                        let (end_name, next_i) = if i < n && (chars[i] == ' ' || chars[i] == '\t') {
+                            scan_dotted_name_inline(i, n)
+                        } else {
+                            (String::new(), i)
+                        };
+                        i = next_i;
+                        if end_name.is_empty() {
+                            scope_stack.pop();
+                        } else {
+                            for seg in crate::splitter::split_lean_name_components(&end_name)
+                                .into_iter()
+                                .rev()
+                            {
+                                let canon = crate::splitter::canonical_lean_name_component(seg);
+                                if let Some(pos) = scope_stack.iter().rposition(|f| {
+                                    crate::splitter::canonical_lean_name_component(&f.name) == canon
+                                }) {
+                                    scope_stack.truncate(pos);
+                                } else {
+                                    scope_stack.pop();
+                                }
+                            }
+                        }
+                        let depth_now = scope_stack.len();
+                        open_stack.retain(|(d, _)| *d <= depth_now);
+                        continue;
+                    }
+                    "open" => {
+                        let mut cur = i;
+                        let mut parsed_ns = Vec::new();
+                        let mut has_in = false;
+                        loop {
+                            while cur < n && chars[cur] != '\n' && chars[cur].is_whitespace() {
+                                cur += 1;
+                            }
+                            if cur >= n || chars[cur] == '\n' {
+                                break;
+                            }
+                            let (tok, after_tok) = scan_dotted_name(cur, n);
+                            if tok.is_empty() {
+                                break;
+                            }
+                            if tok == "in" && !parsed_ns.is_empty() {
+                                has_in = true;
+                                cur = after_tok;
+                                break;
+                            }
+                            parsed_ns.push(tok);
+                            cur = after_tok;
+                        }
+                        if has_in {
+                            for ns in parsed_ns {
+                                if !transient_opens.contains(&ns) {
+                                    transient_opens.push(ns);
+                                }
+                            }
+                        } else {
+                            transient_opens.clear();
+                            let d = scope_stack.len();
+                            for ns in parsed_ns {
+                                if !open_stack.iter().any(|(_, existing)| existing == &ns) {
+                                    open_stack.push((d, ns));
+                                }
+                            }
+                        }
+                        i = cur;
+                        continue;
+                    }
+                    "import" | "set_option" => {}
+                    _ => {
+                        if !matches!(
+                            word.as_str(),
+                            "theorem"
+                                | "lemma"
+                                | "noncomputable"
+                                | "private"
+                                | "protected"
+                                | "scoped"
+                                | "local"
+                                | "unsafe"
+                                | "partial"
+                                | "nonrec"
+                                | "public"
+                                | "meta"
+                        ) {
+                            transient_opens.clear();
+                        }
+                    }
                 }
             }
-            if word == "theorem" || word == "lemma" {
+            if (word == "theorem" || word == "lemma") && is_line_command_head(start) {
                 while i < n && chars[i].is_whitespace() {
                     i += 1;
                 }
@@ -219,16 +1166,32 @@ pub(super) fn extract_all_lean_theorems(
                     continue;
                 }
                 i = next_i;
-                let decl_name = crate::splitter::qualified_decl_name(&raw_decl_name, &scope_stack);
-                let matches_filter = match target_name {
-                    Some(t) if !t.is_empty() && t != "auto" => {
-                        crate::splitter::decl_name_matches_target(&decl_name, t)
-                    }
-                    _ => true,
+                let qualified_name =
+                    crate::splitter::qualified_decl_name(&raw_decl_name, &scope_stack);
+                let decl_name = if let Some(root_stripped) = raw_decl_name.strip_prefix("_root_.") {
+                    crate::splitter::canonicalize_lean_name(root_stripped)
+                } else {
+                    raw_decl_name
                 };
 
                 let mut binders = Vec::new();
+                let mut instance_binders = Vec::new();
                 let mut found_colon = false;
+                let mut header_trusted = true;
+                let mut seen_names: Vec<String> = Vec::new();
+                if i < n && chars[i] == '.' && chars.get(i + 1) == Some(&'{') {
+                    header_trusted = false;
+                    let mut depth = 1usize;
+                    i += 2;
+                    while i < n && depth > 0 {
+                        if chars[i] == '{' {
+                            depth += 1;
+                        } else if chars[i] == '}' {
+                            depth -= 1;
+                        }
+                        i += 1;
+                    }
+                }
                 while i < n {
                     while i < n && chars[i].is_whitespace() {
                         i += 1;
@@ -259,6 +1222,7 @@ pub(super) fn extract_all_lean_theorems(
                         i += 1;
                         let b_start = i;
                         let mut depth = 1usize;
+                        let mut closed = false;
                         while i < n && depth > 0 {
                             if let Some(end) = skip_any_lexeme_at(i) {
                                 i = end;
@@ -268,10 +1232,19 @@ pub(super) fn extract_all_lean_theorems(
                                 depth += 1;
                             } else if chars[i] == close {
                                 depth -= 1;
+                                if depth == 0 {
+                                    closed = true;
+                                }
                             }
                             i += 1;
                         }
+                        if !closed {
+                            header_trusted = false;
+                        }
                         let inner: String = chars[b_start..i.saturating_sub(1)].iter().collect();
+                        if inner.contains(":=") || inner.contains("⦃") || inner.contains("⦄") {
+                            header_trusted = false;
+                        }
                         if open == '(' || open == '{' {
                             if let Some((vars_part, ty_part)) = split_top_level_colon(&inner) {
                                 let var_names: Vec<String> = vars_part
@@ -279,12 +1252,44 @@ pub(super) fn extract_all_lean_theorems(
                                     .map(|s| s.trim().to_string())
                                     .filter(|s| !s.is_empty())
                                     .collect();
+                                if var_names.is_empty()
+                                    || var_names.iter().any(|v| {
+                                        v == "_"
+                                            || !v.chars().enumerate().all(|(idx, c)| {
+                                                if idx == 0 {
+                                                    is_ident_start(c)
+                                                } else {
+                                                    is_ident_continue(c)
+                                                }
+                                            })
+                                    })
+                                    || ty_part.trim().is_empty()
+                                {
+                                    header_trusted = false;
+                                }
+                                for v in &var_names {
+                                    if seen_names.iter().any(|s| s == v)
+                                        || is_reserved_shadow_ident(v)
+                                    {
+                                        header_trusted = false;
+                                    }
+                                    seen_names.push(v.clone());
+                                }
                                 if !var_names.is_empty() {
                                     binders.push((var_names, ty_part.trim().to_string()));
                                 }
+                            } else {
+                                header_trusted = false;
                             }
+                        } else {
+                            header_trusted = false;
+                            let inst_ty = split_top_level_colon(&inner)
+                                .map(|(_, ty)| ty.trim())
+                                .unwrap_or_else(|| inner.trim());
+                            instance_binders.push(inst_ty.to_string());
                         }
                     } else {
+                        header_trusted = false;
                         i += 1;
                     }
                 }
@@ -297,6 +1302,7 @@ pub(super) fn extract_all_lean_theorems(
                 let mut paren_depth = 0usize;
                 let mut angle_depth = 0usize;
                 let mut pending_let_assign = false;
+                let mut in_stmt_match = false;
                 let mut stmt_end = n;
                 while i < n {
                     if let Some(end) = skip_any_lexeme_at(i) {
@@ -312,6 +1318,20 @@ pub(super) fn extract_all_lean_theorems(
                         angle_depth += 1;
                     } else if c == '⟩' {
                         angle_depth = angle_depth.saturating_sub(1);
+                    } else if paren_depth == 0
+                        && angle_depth == 0
+                        && c == 'm'
+                        && i + 5 < n
+                        && chars[i + 1] == 'a'
+                        && chars[i + 2] == 't'
+                        && chars[i + 3] == 'c'
+                        && chars[i + 4] == 'h'
+                        && chars[i + 5].is_whitespace()
+                        && (i == stmt_start || !is_ident_continue(chars[i - 1]))
+                    {
+                        in_stmt_match = true;
+                        i += 5;
+                        continue;
                     } else if paren_depth == 0
                         && angle_depth == 0
                         && c == 'l'
@@ -337,7 +1357,12 @@ pub(super) fn extract_all_lean_theorems(
                         }
                         stmt_end = i;
                         break;
-                    } else if paren_depth == 0 && angle_depth == 0 && c == '|' && i > stmt_start {
+                    } else if paren_depth == 0
+                        && angle_depth == 0
+                        && !in_stmt_match
+                        && c == '|'
+                        && i > stmt_start
+                    {
                         // Pattern-matching theorem without `:=`
                         let prev_nl = chars[stmt_start..i].contains(&'\n');
                         if prev_nl {
@@ -347,23 +1372,96 @@ pub(super) fn extract_all_lean_theorems(
                     }
                     i += 1;
                 }
-                if matches_filter {
-                    let prop_str: String = chars[stmt_start..stmt_end].iter().collect();
-                    let trimmed = inline_stmt_let_bindings(prop_str.trim());
-                    if !trimmed.is_empty() {
-                        out.push(ExtractedDecl {
-                            name: decl_name,
-                            binders,
-                            prop_str: trimmed,
-                        });
+                let raw_decl_name_shadow = crate::splitter::split_lean_name_components(&decl_name)
+                    .into_iter()
+                    .map(|s| {
+                        s.strip_prefix('«')
+                            .and_then(|r| r.strip_suffix('»'))
+                            .unwrap_or(s)
+                    })
+                    .any(is_reserved_shadow_ident)
+                    || crate::splitter::split_lean_name_components(&qualified_name)
+                        .into_iter()
+                        .map(|s| {
+                            s.strip_prefix('«')
+                                .and_then(|r| r.strip_suffix('»'))
+                                .unwrap_or(s)
+                        })
+                        .any(is_reserved_shadow_ident);
+                let prop_str: String = chars[stmt_start..stmt_end].iter().collect();
+                let (trimmed, let_ok) = inline_stmt_let_bindings_checked(prop_str.trim());
+                let abbrev_valid = !file_scope.scope.has_word256_abbrev
+                    || (file_scope.scope.has_explicit_imports
+                        && file_scope.scope.imported_modules.iter().any(|m| {
+                            matches!(
+                                m.as_str(),
+                                "LeanNative.Backend.FastCheck" | "TurboLean.FastCheck"
+                            )
+                        }));
+                let mut open_namespaces: Vec<String> =
+                    open_stack.iter().map(|(_, ns)| ns.clone()).collect();
+                for ns in std::mem::take(&mut transient_opens) {
+                    if !open_namespaces.contains(&ns) {
+                        open_namespaces.push(ns);
                     }
+                }
+                let mut enclosing_namespaces: Vec<String> = Vec::new();
+                let ns_segs: Vec<String> = scope_stack
+                    .iter()
+                    .filter(|f| matches!(f.kind, crate::splitter::ScopeKind::Namespace))
+                    .map(|f| crate::splitter::canonical_lean_name_component(&f.name))
+                    .collect();
+                for len in 1..=ns_segs.len() {
+                    let prefix = ns_segs[..len].join(".");
+                    if !enclosing_namespaces.contains(&prefix) {
+                        enclosing_namespaces.push(prefix);
+                    }
+                }
+                let decl_scope = DeclScopeContext {
+                    has_explicit_imports: file_scope.scope.has_explicit_imports,
+                    imported_modules: file_scope.scope.imported_modules.clone(),
+                    open_namespaces,
+                    enclosing_namespaces,
+                    has_word256_abbrev: file_scope.scope.has_word256_abbrev,
+                };
+                let decl_trusted = file_elab_trusted
+                    && file_scope.trusted_shadow_ok
+                    && abbrev_valid
+                    && !raw_decl_name_shadow
+                    && header_trusted
+                    && let_ok
+                    && !trimmed.contains(';')
+                    && instance_binders.is_empty()
+                    && !trimmed.is_empty();
+                let report_name = if qualified_name.is_empty() {
+                    decl_name
+                } else {
+                    qualified_name.clone()
+                };
+                if !trimmed.is_empty() {
+                    all_decls.push(ExtractedDecl {
+                        name: report_name,
+                        qualified_name,
+                        binders,
+                        instance_binders,
+                        prop_str: trimmed,
+                        trusted_elab_context: decl_trusted,
+                        scope: decl_scope,
+                    });
                 }
             }
         } else {
             i += 1;
         }
     }
-    out
+    match target_name.map(str::trim) {
+        Some(t) if !t.is_empty() && t != "auto" => {
+            select_target_decl_unambiguously(all_decls, Some(t))
+                .into_iter()
+                .collect()
+        }
+        _ => all_decls,
+    }
 }
 
 pub(super) fn split_at_first_top_level_assign(s: &str) -> Option<(&str, &str)> {
@@ -1040,10 +2138,12 @@ pub(super) fn is_syntactically_contradictory_hyp(hyp: &str) -> bool {
             return true;
         }
         if !is_ne {
-            // Detect `a = Word256.add a Word256.one` or `a = a + 1`
+            // Detect `a = Word256.add a Word256.one`, `a = UInt256.add a UInt256.one`, or `a = a + 1`
             if r == format!("Word256.add {} Word256.one", l)
+                || r == format!("UInt256.add {} UInt256.one", l)
                 || r == format!("{} + 1", l)
                 || l == format!("Word256.add {} Word256.one", r)
+                || l == format!("UInt256.add {} UInt256.one", r)
                 || l == format!("{} + 1", r)
             {
                 return true;
@@ -1782,18 +2882,19 @@ pub(super) fn audit_single_decl_spec_full(
     (res, pos_w, neg_w, drop_hyps)
 }
 
-#[allow(clippy::type_complexity)]
-pub(super) fn audit_single_decl_spec_full_with_policy(
-    decl: &ExtractedDecl,
-    local_defs: &[LocalDefUnfolding],
-    policy: &AuditSpecPolicyConfig,
-) -> (
+type AuditSingleDeclResult = (
     (bool, bool, String),
     String,
     String,
     Vec<String>,
     Vec<String>,
-) {
+);
+
+pub(super) fn audit_single_decl_spec_full_with_policy(
+    decl: &ExtractedDecl,
+    local_defs: &[LocalDefUnfolding],
+    policy: &AuditSpecPolicyConfig,
+) -> AuditSingleDeclResult {
     let mut hyp_strings = Vec::new();
     for (_, ty) in &decl.binders {
         if !is_known_binder_value_type(ty) {
@@ -1861,7 +2962,7 @@ pub(super) fn audit_single_decl_spec_full_with_policy(
     let mut pos_witness = "precondition_satisfiable(unconstrained_or_symbolic)".to_string();
     let mut droppable_hyps = Vec::new();
     if !is_vacuous && !hyp_strings.is_empty() {
-        if let Some((rep, _, _)) = eval_extracted_decl_in_memory(&unfolded_decl, 256) {
+        if let Some((rep, _, _)) = eval_extracted_decl_for_audit_spec(&unfolded_decl, 256) {
             if rep.vacuous_precondition_warning || rep.satisfied_preconditions == 0 {
                 is_vacuous = true;
             } else {
@@ -1876,7 +2977,9 @@ pub(super) fn audit_single_decl_spec_full_with_policy(
                     if !is_known_binder_value_type(ty) {
                         let mut mutated = unfolded_decl.clone();
                         mutated.binders.remove(b_idx);
-                        if let Some((m_rep, _, _)) = eval_extracted_decl_in_memory(&mutated, 256) {
+                        if let Some((m_rep, _, _)) =
+                            eval_extracted_decl_for_audit_spec(&mutated, 256)
+                        {
                             if m_rep.verified && m_rep.violations == 0 {
                                 let mut hyp_vars = std::collections::HashSet::new();
                                 let mut concl_vars = std::collections::HashSet::new();
@@ -1987,13 +3090,251 @@ pub(super) fn audit_single_decl_spec_full_with_policy(
     )
 }
 
+fn canonical_allowlisted_module_blake3(mod_name: &str) -> Option<blake3::Hash> {
+    let canonical_src = match mod_name {
+        "LeanNative.Backend.FastCheck" => {
+            include_str!("../../../lean/LeanNative/Backend/FastCheck.lean")
+        }
+        "TurboLean.FastCheck" => include_str!("../../../lean/TurboLean/FastCheck.lean"),
+        "LeanNative.IR.Types" => include_str!("../../../lean/LeanNative/IR/Types.lean"),
+        "TurboLean.Reflection" => include_str!("../../../lean/TurboLean/Reflection.lean"),
+        _ => return None,
+    };
+    Some(blake3::hash(canonical_src.as_bytes()))
+}
+
+fn package_module_ok(
+    pkg_dir: &Path,
+    config_file: Option<&str>,
+    rel_slash: &str,
+    rel_lean: &str,
+    rel_olean: &str,
+    expected_hash: blake3::Hash,
+) -> Option<bool> {
+    let cfg_opt = match crate::module_builder::package_config_path(pkg_dir, config_file) {
+        Ok(Some(_)) => {
+            match crate::module_builder::resolve_package_config_file(pkg_dir, false, config_file) {
+                Ok(cfg) => Some(cfg),
+                Err(_) => return None,
+            }
+        }
+        Ok(None) => None,
+        Err(_) => return None,
+    };
+    if cfg_opt.as_ref().is_some_and(|c| c.unsupported.is_some()) {
+        return None;
+    }
+
+    let mut lean_cands = Vec::new();
+    let mut push_unique = |p: PathBuf| {
+        if p.is_file() && !lean_cands.contains(&p) {
+            lean_cands.push(p);
+        }
+    };
+    if let Some(ref cfg) = cfg_opt {
+        let base = pkg_dir.join(&cfg.src_dir);
+        push_unique(base.join(rel_lean));
+        for sd in cfg
+            .libs
+            .iter()
+            .filter_map(|l| l.src_dir.as_ref())
+            .chain(cfg.exes.iter().filter_map(|e| e.src_dir.as_ref()))
+        {
+            push_unique(base.join(sd).join(rel_lean));
+        }
+    }
+    if let Some(resolved) = crate::lake_build::resolve_project_lean_source(pkg_dir, rel_slash) {
+        push_unique(resolved);
+    }
+
+    let mut verified_source = false;
+    for cand in lean_cands {
+        let Ok(bytes) = fs::read(&cand) else {
+            return None;
+        };
+        if blake3::hash(&bytes) != expected_hash {
+            return None;
+        }
+        verified_source = true;
+    }
+
+    let mut olean_cands = vec![pkg_dir.join(".lake/build/lib/lean").join(rel_olean)];
+    if let Some(ref cfg) = cfg_opt {
+        let custom_olean = pkg_dir
+            .join(&cfg.build_dir)
+            .join(&cfg.lean_lib_dir)
+            .join(rel_olean);
+        if !olean_cands.contains(&custom_olean) {
+            olean_cands.push(custom_olean);
+        }
+    }
+    if olean_cands.iter().any(|p| p.is_file()) && !verified_source {
+        return None;
+    }
+
+    Some(verified_source)
+}
+
+pub(crate) fn allowlisted_imports_match_canonical_in_dir(
+    imported_modules: &[String],
+    project_dir: Option<&Path>,
+) -> bool {
+    let mut visited = std::collections::HashSet::new();
+    let mut queue: Vec<String> = imported_modules.to_vec();
+    while let Some(mod_name) = queue.pop() {
+        if !visited.insert(mod_name.clone()) {
+            continue;
+        }
+        let Some(expected_hash) = canonical_allowlisted_module_blake3(&mod_name) else {
+            return false;
+        };
+        if mod_name == "TurboLean.FastCheck" {
+            queue.push("LeanNative.Backend.FastCheck".to_string());
+        } else if mod_name == "LeanNative.Backend.FastCheck" {
+            queue.push("LeanNative.IR.Types".to_string());
+        }
+        let rel_slash = crate::module_builder::module_name_to_rel_slash(&mod_name);
+        let rel_lean = format!("{}.lean", rel_slash);
+        let rel_olean = format!("{}.olean", rel_slash);
+
+        if let Some(proj) = project_dir.filter(|p| !p.as_os_str().is_empty()) {
+            if package_module_ok(proj, None, &rel_slash, &rel_lean, &rel_olean, expected_hash)
+                .is_none()
+            {
+                return false;
+            }
+            let root_cfg_opt = match crate::module_builder::optional_package_config(proj) {
+                Ok(cfg) => cfg,
+                Err(_) => return false,
+            };
+            let (manifest_pkgs_dir, manifest_entries, _) =
+                match crate::module_builder::parse_lake_manifest(proj, false) {
+                    Ok(m) => m,
+                    Err(_) => return false,
+                };
+            let mut dep_dirs: Vec<(PathBuf, Option<String>)> = Vec::new();
+            let mut push_dep = |d: PathBuf, cf: Option<String>| {
+                if d.is_dir() && !dep_dirs.iter().any(|(x, _)| x == &d) {
+                    dep_dirs.push((d, cf));
+                }
+            };
+            for mp in manifest_entries {
+                push_dep(mp.dir, mp.config_file);
+            }
+            let mut pkgs_roots = vec![proj.join(".lake/packages"), proj.join(&manifest_pkgs_dir)];
+            if let Some(ref rcfg) = root_cfg_opt {
+                pkgs_roots.push(proj.join(&rcfg.packages_dir));
+            }
+            for pkgs_dir in pkgs_roots {
+                if let Ok(entries) = fs::read_dir(&pkgs_dir) {
+                    for entry in entries.flatten() {
+                        push_dep(entry.path(), None);
+                    }
+                }
+            }
+            for (dep_dir, dep_cfg) in dep_dirs {
+                if package_module_ok(
+                    &dep_dir,
+                    dep_cfg.as_deref(),
+                    &rel_slash,
+                    &rel_lean,
+                    &rel_olean,
+                    expected_hash,
+                )
+                .is_none()
+                {
+                    return false;
+                }
+            }
+        }
+
+        if let Ok(lp) = std::env::var("LEAN_PATH") {
+            for part in lp
+                .split(':')
+                .filter(|s| !s.is_empty() && !s.contains("/toolchains/"))
+            {
+                let dir = Path::new(part);
+                let cand_olean = dir.join(&rel_olean);
+                let cand_lean = dir.join(&rel_lean);
+                if cand_lean.is_file() {
+                    let Ok(bytes) = fs::read(&cand_lean) else {
+                        return false;
+                    };
+                    if blake3::hash(&bytes) != expected_hash {
+                        return false;
+                    }
+                } else if cand_olean.is_file() {
+                    let root_lean_ok = dir.ancestors().take(5).any(|anc| {
+                        package_module_ok(
+                            anc,
+                            None,
+                            &rel_slash,
+                            &rel_lean,
+                            &rel_olean,
+                            expected_hash,
+                        ) == Some(true)
+                    });
+                    if !root_lean_ok {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+pub(crate) fn enforce_decl_import_integrity_for_path(
+    decls: &mut [ExtractedDecl],
+    file: Option<&Path>,
+    project_dir: Option<&Path>,
+) {
+    let inferred = project_dir
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            file.filter(|f| f.exists() || f.parent().is_some_and(Path::exists))
+                .map(crate::lake_build::infer_project_dir_from_lean_file)
+        })
+        .or_else(|| {
+            std::env::current_dir().ok().map(|cwd| {
+                crate::lake_build::infer_project_dir_from_lean_file(&cwd.join("_probe.lean"))
+            })
+        });
+    for d in decls {
+        if d.trusted_elab_context
+            && d.scope.has_explicit_imports
+            && !allowlisted_imports_match_canonical_in_dir(
+                &d.scope.imported_modules,
+                inferred.as_deref(),
+            )
+        {
+            d.trusted_elab_context = false;
+        }
+    }
+}
+
+#[allow(dead_code)]
 pub(super) fn extract_decls_fast(src: &str, decl_filter: Option<&str>) -> Vec<ExtractedDecl> {
     // Keep lexical context even for filtered declarations in large sources.
-    extract_all_lean_theorems(src, decl_filter)
+    let mut decls = extract_all_lean_theorems(src, decl_filter);
+    enforce_decl_import_integrity_for_path(&mut decls, None, None);
+    decls
+}
+
+pub(crate) fn extract_decls_fast_for_path(
+    src: &str,
+    decl_filter: Option<&str>,
+    file: Option<&Path>,
+    project_dir: Option<&Path>,
+) -> Vec<ExtractedDecl> {
+    let mut decls = extract_all_lean_theorems(src, decl_filter);
+    enforce_decl_import_integrity_for_path(&mut decls, file, project_dir);
+    decls
 }
 
 /// Schema version for the Blake3 content-addressed `audit-spec` per-file JSON cache.
-pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 14;
+pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 15;
 
 static AUDIT_SPEC_CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
@@ -2157,6 +3498,13 @@ pub fn audit_spec_file_or_source_with_policy(
                         ld_hasher.update(&(type_deps.len() as u64).to_le_bytes());
                         ld_hasher.update(type_deps.as_bytes());
                     }
+                    let proj_root = crate::lake_build::infer_project_dir_from_lean_file(file);
+                    for dep_entry in crate::lake_build::compute_imported_olean_interface_hashes(
+                        &file_src, &proj_root, None,
+                    ) {
+                        ld_hasher.update(&(dep_entry.len() as u64).to_le_bytes());
+                        ld_hasher.update(dep_entry.as_bytes());
+                    }
                     let ld_digest = *ld_hasher.finalize().as_bytes();
                     let hex_hash = compute_audit_spec_cache_key_with_policy(
                         decl_filter,
@@ -2306,7 +3654,9 @@ pub fn audit_spec_file_or_source_with_policy(
             defs
         };
 
-        for d in extract_decls_fast(src, decl_filter) {
+        let src_file_opt =
+            (inline_src.is_none() && src_path.is_file()).then_some(src_path.as_path());
+        for d in extract_decls_fast_for_path(src, decl_filter, src_file_opt, None) {
             total_specs_audited += 1;
             let ((is_vacuous, is_tight, reason), pos_witness, neg_witness, drop_hyps, decl_stubs) =
                 audit_single_decl_spec_full_with_policy(&d, &local_defs, policy);
@@ -2904,6 +4254,38 @@ theorem actualToo : True := by trivial
         ] {
             assert!(extract_all_lean_theorems(src, None).is_empty());
         }
+    }
+
+    #[test]
+    fn namespace_qualified_and_ambiguous_target_selection_fail_closed() {
+        let src = "\
+theorem a : False := by sorry
+namespace N
+  section S
+    theorem a : True := by trivial
+  end S
+  namespace M
+    theorem b : True := by trivial
+  end M
+end N
+";
+        let na = extract_all_lean_theorems(src, Some("N.a"));
+        assert_eq!(na.len(), 1);
+        assert_eq!(na[0].qualified_name, "N.a");
+        assert_eq!(na[0].prop_str, "True");
+
+        let root_a = extract_all_lean_theorems(src, Some("_root_.a"));
+        assert_eq!(root_a.len(), 1);
+        assert_eq!(root_a[0].qualified_name, "a");
+        assert_eq!(root_a[0].prop_str, "False");
+
+        assert!(extract_all_lean_theorems(src, Some("a")).is_empty());
+        assert!(extract_all_lean_theorems(src, Some("M.b")).is_empty());
+
+        let nmb = extract_all_lean_theorems(src, Some("N.M.b"));
+        assert_eq!(nmb.len(), 1);
+        assert_eq!(nmb[0].qualified_name, "N.M.b");
+        assert_eq!(extract_all_lean_theorems(src, Some("b")).len(), 1);
     }
 
     #[test]

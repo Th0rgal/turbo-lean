@@ -103,8 +103,74 @@ pub fn query_lean_native_core_worker(
         .ok()
         .filter(|s| !s.trim().is_empty())
         .is_some_and(|s| !Path::new(s.trim()).is_file());
-    let cabi_certified = !custom_nonexistent
-        && crate::c_abi::leannative_certify_cex_witnesses_safe(1_000_000, 0, u64::MAX);
+    let mut eval_decl_name = "candidate_witness".to_string();
+    let (cabi_certified, _, cex_details) = if custom_nonexistent {
+        crate::gpu_fastcheck::certify_candidate_witness("", "")
+    } else if let Some(extra) = _extra_fields_json {
+        let parsed = serde_json::from_str::<serde_json::Value>(extra).ok();
+        let lhs = parsed
+            .as_ref()
+            .and_then(|v| v.get("lhs").or_else(|| v.get("lhs_value")))
+            .and_then(|v| v.as_str());
+        let rhs = parsed
+            .as_ref()
+            .and_then(|v| v.get("rhs").or_else(|| v.get("rhs_value")))
+            .and_then(|v| v.as_str());
+        let stmt = parsed
+            .as_ref()
+            .and_then(|v| v.get("stmt").or_else(|| v.get("stmt_src")))
+            .and_then(|v| v.as_str());
+        let decl_name = parsed
+            .as_ref()
+            .and_then(|v| v.get("decl").or_else(|| v.get("declName")))
+            .and_then(|v| v.as_str())
+            .unwrap_or("candidate_witness");
+        let bindings = parsed
+            .as_ref()
+            .and_then(|v| v.get("bindings"))
+            .and_then(|v| {
+                if let Some(arr) = v.as_array() {
+                    arr.iter()
+                        .map(|pair| {
+                            let items = pair.as_array()?;
+                            Some((
+                                items.first()?.as_str()?.to_string(),
+                                items.get(1)?.as_str()?.to_string(),
+                            ))
+                        })
+                        .collect::<Option<Vec<_>>>()
+                } else if let Some(obj) = v.as_object() {
+                    obj.iter()
+                        .map(|(k, val)| Some((k.clone(), val.as_str()?.to_string())))
+                        .collect::<Option<Vec<_>>>()
+                } else {
+                    None
+                }
+            });
+        let witness_summary = parsed
+            .as_ref()
+            .and_then(|v| v.get("witness_summary"))
+            .and_then(|v| v.as_str());
+        if let Some(stmt_src) = stmt {
+            eval_decl_name = decl_name.to_string();
+            if let Some(summary) = witness_summary {
+                crate::gpu_fastcheck::certify_statement_witness(decl_name, stmt_src, summary)
+            } else if let (Some(binds), Some(l), Some(r)) = (bindings, lhs, rhs) {
+                crate::gpu_fastcheck::certify_json_statement_witness(
+                    decl_name, stmt_src, &binds, l, r,
+                )
+            } else {
+                crate::gpu_fastcheck::certify_statement_witness(decl_name, stmt_src, "")
+            }
+        } else {
+            match (lhs, rhs) {
+                (Some(l), Some(r)) => crate::gpu_fastcheck::certify_candidate_witness(l, r),
+                _ => crate::gpu_fastcheck::certify_candidate_witness("", ""),
+            }
+        }
+    } else {
+        crate::gpu_fastcheck::certify_candidate_witness("", "")
+    };
     let result = match method {
         "ping" => serde_json::json!({
             "status": "pong",
@@ -131,12 +197,14 @@ pub fn query_lean_native_core_worker(
             "fallback": custom_nonexistent
         }),
         "eval-cex" => serde_json::json!({
-            "declName": "evm_constrained_buggy_prop",
+            "declName": eval_decl_name,
             "certified": cabi_certified,
-            "overallAssurance": if custom_nonexistent { "FallbackUnverified" } else { "VerifiedKernelProof" },
-            "fallback": custom_nonexistent,
-            "falsePositives": 0,
-            "theorem": "LeanNative.Backend.certifyCounterexample_no_false_positive"
+            "overallAssurance": if cabi_certified { "CertifiedFastCheckEval" } else { "FallbackUnverified" },
+            "fallback": !cabi_certified,
+            "falsePositives": u8::from(!cabi_certified),
+            "certification": cex_details.get("certification").cloned().unwrap_or(serde_json::json!("unavailable")),
+            "reason": cex_details.get("reason").cloned().unwrap_or(serde_json::Value::Null),
+            "theorem": "LeanNative.Backend.FastCheck.certifyCounterexample_no_false_positive"
         }),
         "compile-fastcheck" => serde_json::json!({
             "schemaVersion": "lean-native-fastcheck-v1",
@@ -144,9 +212,10 @@ pub fn query_lean_native_core_worker(
             "numSamplesPerDecl": 1024,
             "useConstraintProp": true,
             "totalDecls": 2,
-            "counterexamplesFound": usize::from(cabi_certified),
+            "counterexamplesFound": 0,
             "vacuousPasses": 0,
             "falsePositives": 0,
+            "certification": "unavailable",
             "declResults": [],
             "fallback": custom_nonexistent
         }),
@@ -280,7 +349,7 @@ pub fn govern_machine_wide_zygote_rss(current_pid: u32, current_rss_mb: u64) {
                 last_used_ms: now_ms,
                 rss_mb: current_rss_mb,
             });
-            entries.sort_by_key(|b| std::cmp::Reverse(b.last_used_ms));
+            entries.sort_by_key(|a| std::cmp::Reverse(a.last_used_ms));
             let self_pid = std::process::id();
             let mut running_rss_mb = 0u64;
             let mut kept_entries = Vec::with_capacity(entries.len().min(max_entries));
@@ -418,6 +487,8 @@ fn owned_lifecycle_process(pid: u32, staging: Option<&Path>, parent: Option<u32>
     let args = fs::read(proc.join("cmdline")).unwrap_or_default();
     let env = fs::read(proc.join("environ")).unwrap_or_default();
     let worker = (name.starts_with("turbo_zygote_") || name == "turbo-zygote")
+        && !args.is_empty()
+        && !env.is_empty()
         && !args
             .split(|b| *b == 0)
             .any(|arg| arg == b"--audit-modules" || arg == b"--decl-identity");
@@ -1110,11 +1181,11 @@ impl Drop for ZygoteWorkerProcess {
 }
 
 type ZygoteChild = ZygoteWorkerProcess;
+type ZygotePoolKey = (String, String, String);
+type ZygotePoolMap = std::collections::HashMap<ZygotePoolKey, Vec<ZygoteWorkerProcess>>;
 
-#[allow(clippy::type_complexity)]
-static ZYGOTE_POOL: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<(String, String, String), Vec<ZygoteWorkerProcess>>>,
-> = std::sync::OnceLock::new();
+static ZYGOTE_POOL: std::sync::OnceLock<std::sync::Mutex<ZygotePoolMap>> =
+    std::sync::OnceLock::new();
 
 /// Test-only fault injection: named callbacks fired at race-sensitive points of the digest /
 /// import pipeline, and a forced filesystem timestamp granularity. Thread-local, so parallel
@@ -4838,11 +4909,9 @@ fn eval_with_zygote_pool_attempt(
         None => imports_csv.clone(),
     };
 
-    #[allow(clippy::type_complexity)]
+    type VerifiedShardCacheKey = (String, String, bool, String);
     static ZYGOTE_VERIFIED_SHARD_CACHE: std::sync::OnceLock<
-        std::sync::Mutex<
-            std::collections::HashMap<(String, String, bool, String), ZygoteEvalReply>,
-        >,
+        std::sync::Mutex<std::collections::HashMap<VerifiedShardCacheKey, ZygoteEvalReply>>,
     > = std::sync::OnceLock::new();
     let verified_cache_key = if !eval_mode
         && !lake_inputs_uncacheable
@@ -5163,72 +5232,68 @@ fn eval_with_zygote_pool_attempt(
             }
         };
 
-    #[allow(clippy::type_complexity)]
-    let return_worker_to_pool = |pool_mutex: &std::sync::Mutex<
-        std::collections::HashMap<(String, String, String), Vec<ZygoteWorkerProcess>>,
-    >,
-                                 key: (String, String, String),
-                                 mut w: ZygoteChild| {
-        if daemon_disabled() {
-            drop(w);
-            return;
-        }
-        w.request_count += 1;
-        if w.request_count >= 256 {
-            drop(w);
-            return;
-        }
-        let pid = w.child.id();
-        let worker_rss_mb = measure_process_rss_mb(pid);
-        let effective_rss_limit_mb = if std::env::var("TURBO_LEAN_WORKER_RSS_LIMIT_MB").is_ok()
-            || std::env::var("TURBO_LEAN_MAX_MEMORY_MB").is_ok()
-        {
-            worker_rss_limit_mb
-        } else {
-            worker_rss_limit_mb.max(2048)
-        };
-        if worker_rss_mb > effective_rss_limit_mb {
-            drop(w);
-            return;
-        }
-        govern_machine_wide_zygote_rss(pid, worker_rss_mb);
-        if let Ok(mut pool) = pool_mutex.lock() {
-            let mut total_idle: usize = pool.values().map(|v| v.len()).sum();
-            if total_idle >= max_global_idle {
-                let other_keys: Vec<(String, String, String)> =
-                    pool.keys().filter(|k| **k != key).cloned().collect();
-                for ok in other_keys {
-                    if total_idle < max_global_idle {
-                        break;
-                    }
-                    if let Some(ovec) = pool.get_mut(&ok) {
-                        if let Some(evicted) = ovec.pop() {
-                            drop(evicted);
-                            total_idle = total_idle.saturating_sub(1);
+    let return_worker_to_pool =
+        |pool_mutex: &std::sync::Mutex<ZygotePoolMap>, key: ZygotePoolKey, mut w: ZygoteChild| {
+            if daemon_disabled() {
+                drop(w);
+                return;
+            }
+            w.request_count += 1;
+            if w.request_count >= 256 {
+                drop(w);
+                return;
+            }
+            let pid = w.child.id();
+            let worker_rss_mb = measure_process_rss_mb(pid);
+            let effective_rss_limit_mb = if std::env::var("TURBO_LEAN_WORKER_RSS_LIMIT_MB").is_ok()
+                || std::env::var("TURBO_LEAN_MAX_MEMORY_MB").is_ok()
+            {
+                worker_rss_limit_mb
+            } else {
+                worker_rss_limit_mb.max(2048)
+            };
+            if worker_rss_mb > effective_rss_limit_mb {
+                drop(w);
+                return;
+            }
+            govern_machine_wide_zygote_rss(pid, worker_rss_mb);
+            if let Ok(mut pool) = pool_mutex.lock() {
+                let mut total_idle: usize = pool.values().map(|v| v.len()).sum();
+                if total_idle >= max_global_idle {
+                    let other_keys: Vec<(String, String, String)> =
+                        pool.keys().filter(|k| **k != key).cloned().collect();
+                    for ok in other_keys {
+                        if total_idle < max_global_idle {
+                            break;
+                        }
+                        if let Some(ovec) = pool.get_mut(&ok) {
+                            if let Some(evicted) = ovec.pop() {
+                                drop(evicted);
+                                total_idle = total_idle.saturating_sub(1);
+                            }
                         }
                     }
+                    pool.retain(|_, v| !v.is_empty());
                 }
-                pool.retain(|_, v| !v.is_empty());
-            }
-            let vec = pool.entry(key).or_default();
-            while vec.len() >= max_pool_per_key || total_idle >= max_global_idle {
-                if vec.is_empty() {
-                    break;
+                let vec = pool.entry(key).or_default();
+                while vec.len() >= max_pool_per_key || total_idle >= max_global_idle {
+                    if vec.is_empty() {
+                        break;
+                    }
+                    let evict_idx = vec
+                        .iter()
+                        .position(|cand| cand.warm_prefixes.is_empty())
+                        .unwrap_or(0);
+                    let _ = vec.remove(evict_idx);
+                    total_idle = total_idle.saturating_sub(1);
                 }
-                let evict_idx = vec
-                    .iter()
-                    .position(|cand| cand.warm_prefixes.is_empty())
-                    .unwrap_or(0);
-                let _ = vec.remove(evict_idx);
-                total_idle = total_idle.saturating_sub(1);
+                if vec.len() < max_pool_per_key && total_idle < max_global_idle {
+                    vec.push(w);
+                } else {
+                    drop(w);
+                }
             }
-            if vec.len() < max_pool_per_key && total_idle < max_global_idle {
-                vec.push(w);
-            } else {
-                drop(w);
-            }
-        }
-    };
+        };
 
     let pool_mutex =
         ZYGOTE_POOL.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -7377,7 +7442,10 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             if let Some(process) = LifecycleProcess::open(child.id(), staging, None) {
-                return process;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                if process.valid_identity() {
+                    return process;
+                }
             }
             assert!(
                 child.try_wait().unwrap().is_none(),
@@ -7401,10 +7469,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("turbo-pidfd-{}", next_tmp_id()));
         fs::create_dir_all(&dir).unwrap();
         let exe = dir.join("turbo_zygote_pidfd_test");
-        fs::copy("/bin/sleep", &exe).unwrap();
+        fs::copy("/bin/bash", &exe).unwrap();
         let mut child = std::process::Command::new(&exe)
-            .arg("30")
+            .args(["-c", "read -t 30"])
             .env("TURBO_LEAN_STAGING_DIR", &dir)
+            .stdin(std::process::Stdio::piped())
             .spawn()
             .unwrap();
         let mut process = open_test_lifecycle_process(&mut child, Some(&dir));
@@ -7446,10 +7515,11 @@ mod tests {
             let dir = std::env::temp_dir().join(format!("turbo-stop-namespace-{}", next_tmp_id()));
             fs::create_dir_all(&dir).unwrap();
             let exe = dir.join("turbo_zygote_stop_test");
-            fs::copy("/bin/sleep", &exe).unwrap();
+            fs::copy("/bin/bash", &exe).unwrap();
             let mut child = Command::new(exe)
-                .arg("30")
+                .args(["-c", "read -t 30"])
                 .env("TURBO_LEAN_STAGING_DIR", &dir)
+                .stdin(std::process::Stdio::piped())
                 .spawn()
                 .unwrap();
             // Same user-wide (staging=None) identity path, with an explicit candidate set
@@ -8011,15 +8081,75 @@ mod tests {
                 ),
                 "verify-certs" => assert_eq!(result["verified"].as_bool(), Some(true)),
                 "eval-cex" => {
-                    let is_fb = result["fallback"].as_bool().unwrap_or(false)
-                        || resp["fallback"].as_bool().unwrap_or(false);
+                    assert_eq!(result["certified"].as_bool(), Some(false));
                     assert_eq!(
-                        (
-                            result["certified"].as_bool(),
-                            result["falsePositives"].as_u64()
-                        ),
-                        (Some(!is_fb), Some(0))
+                        result["overallAssurance"].as_str(),
+                        Some("FallbackUnverified")
                     );
+                    assert_eq!(result["certification"].as_str(), Some("unavailable"));
+                    let raw_pair = query_lean_native_core_worker(
+                        "eval-cex",
+                        Some(r#"{"lhs":"0x1","rhs":"0x0"}"#),
+                    )
+                    .unwrap();
+                    assert_eq!(raw_pair["result"]["certified"].as_bool(), Some(false));
+                    assert_eq!(raw_pair["result"]["falsePositives"].as_u64(), Some(1));
+                    assert_eq!(
+                        raw_pair["result"]["certification"].as_str(),
+                        Some("unavailable")
+                    );
+                    assert_eq!(
+                        raw_pair["result"]["reason"].as_str(),
+                        Some("statement_required")
+                    );
+                    let cex = crate::gpu_fastcheck::try_lnir_fast_reject(
+                        "buggy_de_morgan",
+                        "(a b : Word256) : Word256.bitNot (Word256.bitAnd a b) = Word256.bitAnd (Word256.bitNot a) (Word256.bitNot b)",
+                    )
+                    .expect("buggy De Morgan witness");
+                    let (lhs, rhs) =
+                        crate::gpu_fastcheck::witness_pair_from_summary(&cex.0).expect("lhs/rhs");
+                    let binds = cex
+                        .0
+                        .split(" (lhs=")
+                        .next()
+                        .and_then(|s| s.split(": ").nth(1))
+                        .unwrap_or("");
+                    let mut bindings = Vec::new();
+                    for part in binds.split(", ") {
+                        let (name, raw) = part.split_once('=').expect("binding");
+                        bindings.push(serde_json::json!([name, raw]));
+                    }
+                    let payload = serde_json::json!({
+                        "decl": "buggy_de_morgan",
+                        "stmt": "(a b : Word256) : Word256.bitNot (Word256.bitAnd a b) = Word256.bitAnd (Word256.bitNot a) (Word256.bitNot b)",
+                        "bindings": bindings,
+                        "lhs": lhs,
+                        "rhs": rhs,
+                    });
+                    let genuine =
+                        query_lean_native_core_worker("eval-cex", Some(&payload.to_string()))
+                            .unwrap();
+                    assert_eq!(genuine["result"]["certified"].as_bool(), Some(true));
+                    assert_eq!(genuine["result"]["falsePositives"].as_u64(), Some(0));
+                    assert_eq!(genuine["result"]["certification"].as_str(), Some("eval"));
+                    let equal = query_lean_native_core_worker(
+                        "eval-cex",
+                        Some(r#"{"lhs":"0x1","rhs":"0x1"}"#),
+                    )
+                    .unwrap();
+                    assert_eq!(equal["result"]["certified"].as_bool(), Some(false));
+                    assert_eq!(
+                        equal["result"]["certification"].as_str(),
+                        Some("unavailable")
+                    );
+                    let garbage = query_lean_native_core_worker(
+                        "eval-cex",
+                        Some(r#"{"lhs":"garbage","rhs":"0x0"}"#),
+                    )
+                    .unwrap();
+                    assert_eq!(garbage["result"]["certified"].as_bool(), Some(false));
+                    assert_eq!(garbage["result"]["falsePositives"].as_u64(), Some(1));
                 }
                 _ => unreachable!(),
             }
@@ -10634,6 +10764,41 @@ mod tests {
             rep_low_after
         );
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_eval_cex_assurance_is_certified_fastcheck_eval() {
+        let extra = serde_json::json!({
+            "decl": "bad_u64_add",
+            "stmt_src": "theorem bad_u64_add (a : UInt64) : a + 1 = a := by sorry",
+            "bindings": [["a", "0"]],
+            "lhs": "1",
+            "rhs": "0",
+        })
+        .to_string();
+        let certified = query_lean_native_core_worker("eval-cex", Some(&extra)).unwrap();
+        assert_eq!(certified["result"]["certified"], true);
+        assert_eq!(
+            certified["result"]["overallAssurance"],
+            "CertifiedFastCheckEval"
+        );
+        assert_eq!(certified["result"]["falsePositives"], 0);
+
+        let bogus_extra = serde_json::json!({
+            "decl": "good_u64_refl",
+            "stmt_src": "theorem good_u64_refl (a : UInt64) : a = a := by rfl",
+            "bindings": [["a", "0"]],
+            "lhs": "0",
+            "rhs": "1",
+        })
+        .to_string();
+        let uncertified = query_lean_native_core_worker("eval-cex", Some(&bogus_extra)).unwrap();
+        assert_eq!(uncertified["result"]["certified"], false);
+        assert_eq!(
+            uncertified["result"]["overallAssurance"],
+            "FallbackUnverified"
+        );
+        assert_eq!(uncertified["result"]["falsePositives"], 1);
     }
 
     #[test]

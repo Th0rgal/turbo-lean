@@ -384,3 +384,273 @@ fn untargeted_and_auto_fastcheck_agent_step_and_mcp_confirm_elaborated_identity(
         "{mcp_unconfirmed_body}"
     );
 }
+
+#[test]
+fn anonymous_local_and_private_instances_match_kernel_statement_hashes() {
+    let tmp = identity_project(
+        "anon-local-instance-kth",
+        concat!(
+            "namespace Foo\n",
+            "section\n",
+            "local instance : HAdd UInt8 UInt8 UInt8 where\n",
+            "  hAdd a _ := a\n",
+            "private local instance : HSub UInt8 UInt8 UInt8 where\n",
+            "  hSub _ b := b\n",
+            "theorem local_inst_valid (x : UInt8) : x + 1 = x ∧ x - 1 = 1 := ⟨rfl, rfl⟩\n",
+            "end\n",
+            "end Foo\n",
+        ),
+    );
+    for mode in ["check", "agent-step"] {
+        let (ok, text) = run_decl(&tmp, mode, "Foo.local_inst_valid");
+        assert!(ok, "{mode}: {text}");
+        let json = &text[text.find('{').unwrap()..=text.rfind('}').unwrap()];
+        let v: serde_json::Value = serde_json::from_str(json).expect(&text);
+        assert_eq!(v["decl"], "Foo.local_inst_valid", "{text}");
+        assert!(
+            matches!(
+                v["status"].as_str(),
+                Some("theorem_verified" | "theorem_cache_hit")
+            ),
+            "{text}"
+        );
+    }
+
+    // Stage-1 fast-check (both CLI and MCP `turbo_fast_check` file mode) must fail closed on
+    // files containing `local instance` / untrusted elaboration context instead of emitting
+    // `verified: true` or a false counterexample via a synthetic `:= by sorry` fallback.
+    let (fc_ok, fc_text) = run_decl(&tmp, "fast-check", "Foo.local_inst_valid");
+    assert!(!fc_ok, "fast-check must fail closed: {fc_text}");
+    assert!(
+        !fc_text.contains("counterexample_found") && !fc_text.contains("\"verified\":true"),
+        "fast-check must not verify or refute untrusted context: {fc_text}"
+    );
+    for decl_arg in [
+        serde_json::Value::Null,
+        serde_json::json!("Foo.local_inst_valid"),
+    ] {
+        let mcp_res = call_mcp_tool(
+            &tmp,
+            "turbo_fast_check",
+            serde_json::json!({
+                "file": "Identity.lean",
+                "decl": decl_arg,
+                "compact": false,
+            }),
+        );
+        assert_eq!(mcp_res["isError"], true, "{mcp_res}");
+        let body: serde_json::Value =
+            serde_json::from_str(mcp_res["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["ok"], false, "{body}");
+        assert_eq!(body["status"], "error", "{body}");
+        assert_ne!(body["verified"], true, "{body}");
+    }
+}
+
+#[test]
+fn multiline_theorem_and_modifier_headers_preserve_identity_and_fail_closed_shadow() {
+    let valid_multiline_src = concat!(
+        "namespace Multi\n",
+        "private\n",
+        "theorem\n",
+        "  split_hdr_ok\n",
+        "  (x : UInt64)\n",
+        "  : x = x := rfl\n",
+        "end Multi\n",
+    );
+    let tmp = identity_project("multiline-hdr-identity", valid_multiline_src);
+
+    for mode in ["check", "fast-check", "agent-step"] {
+        let (ok, text) = run_decl(&tmp, mode, "Multi.split_hdr_ok");
+        assert!(ok, "{mode} Multi.split_hdr_ok: {text}");
+        assert!(text.contains("Multi.split_hdr_ok"), "{mode}: {text}");
+    }
+    let mcp_ok = call_mcp_tool(
+        &tmp,
+        "turbo_fast_check",
+        serde_json::json!({
+            "file": "Identity.lean",
+            "decl": "Multi.split_hdr_ok",
+            "compact": false,
+        }),
+    );
+    assert_ne!(mcp_ok["isError"], true, "{mcp_ok}");
+    let mcp_ok_body: serde_json::Value =
+        serde_json::from_str(mcp_ok["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(mcp_ok_body["ok"], true, "{mcp_ok_body}");
+
+    let cex_multiline_src = concat!(
+        "namespace Multi\n",
+        "theorem\n",
+        "  split_hdr_cex\n",
+        "  (x : UInt64)\n",
+        "  : x + 1 = x := by sorry\n",
+        "end Multi\n",
+    );
+    let cex_tmp = identity_project("multiline-hdr-cex", cex_multiline_src);
+    let (cex_ok, cex_text) = run_decl(&cex_tmp, "fast-check", "Multi.split_hdr_cex");
+    assert!(!cex_ok, "expected cex: {cex_text}");
+    assert!(cex_text.contains("Multi.split_hdr_cex"), "{cex_text}");
+    assert!(cex_text.contains("counterexample"), "{cex_text}");
+
+    let attr_multiline_src = concat!(
+        "namespace AttrMulti\n",
+        "@[\n  simp\n]\n",
+        "theorem\n",
+        "  attr_hdr_ok\n",
+        "  (x : Nat)\n",
+        "  : x + 0 = x := Nat.add_zero x\n",
+        "end AttrMulti\n",
+    );
+    let attr_tmp = identity_project("multiline-attr-identity", attr_multiline_src);
+    let (attr_check_ok, attr_check_text) = run_decl(&attr_tmp, "check", "AttrMulti.attr_hdr_ok");
+    assert!(
+        attr_check_ok,
+        "check AttrMulti.attr_hdr_ok: {attr_check_text}"
+    );
+    assert!(
+        attr_check_text.contains("AttrMulti.attr_hdr_ok"),
+        "{attr_check_text}"
+    );
+    let (attr_fc_ok, attr_fc_text) = run_decl(&attr_tmp, "fast-check", "AttrMulti.attr_hdr_ok");
+    assert!(
+        !attr_fc_ok,
+        "attribute header must fail closed in Stage-1 fast-check: {attr_fc_text}"
+    );
+
+    let shadowed_multiline_src = concat!(
+        "private def\n",
+        "  add (a b : UInt64) : UInt64 := a\n",
+        "theorem\n",
+        "  multiline_untrusted (x : UInt64) : x = x := rfl\n",
+    );
+    let bad_tmp = identity_project("multiline-shadow-untrusted", shadowed_multiline_src);
+    let (bad_fc_ok, bad_fc_text) = run_decl(&bad_tmp, "fast-check", "multiline_untrusted");
+    assert!(
+        !bad_fc_ok,
+        "multiline shadow must fail closed: {bad_fc_text}"
+    );
+    let mcp_bad = call_mcp_tool(
+        &bad_tmp,
+        "turbo_fast_check",
+        serde_json::json!({
+            "file": "Identity.lean",
+            "decl": "multiline_untrusted",
+            "compact": false,
+        }),
+    );
+    assert_eq!(mcp_bad["isError"], true, "{mcp_bad}");
+    let mcp_bad_body: serde_json::Value =
+        serde_json::from_str(mcp_bad["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(mcp_bad_body["status"], "error", "{mcp_bad_body}");
+
+    let notation_multiline_src = concat!(
+        "local\n",
+        "  notation \"⊕\" => HAdd.hAdd\n",
+        "theorem\n",
+        "  multiline_not_untrusted (x : UInt64) : x = x := rfl\n",
+    );
+    let not_tmp = identity_project("multiline-notation-untrusted", notation_multiline_src);
+    let (not_check_ok, not_check_text) = run_decl(&not_tmp, "check", "multiline_not_untrusted");
+    assert!(
+        not_check_ok,
+        "check multiline_not_untrusted: {not_check_text}"
+    );
+    let (not_fc_ok, _) = run_decl(&not_tmp, "fast-check", "multiline_not_untrusted");
+    assert!(!not_fc_ok);
+
+    // Targetless `lakefile.toml` with multi-file imports (`Dep.lean` + `Main.lean` importing
+    // `Dep`): checking `Dep.lean` (with dependent recheck of `Main.lean`) and checking `Main.lean`
+    // after `Dep.olean` becomes stale must purge standalone `Dep.olean` instead of calling
+    // `lake build Dep` (`unknown target`).
+    let dep_tmp = corpus::Temp::new("targetless-lakefile-dep-check");
+    fs::write(
+        dep_tmp.0.join("lean-toolchain"),
+        include_str!("../../../lean/lean-toolchain"),
+    )
+    .unwrap();
+    fs::write(
+        dep_tmp.0.join("lakefile.toml"),
+        "name = \"targetless\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let olean_dir = dep_tmp.0.join(".lake/build/lib/lean");
+    fs::create_dir_all(&olean_dir).unwrap();
+    fs::write(dep_tmp.0.join("Dep.lean"), "def depVal : Nat := 7\n").unwrap();
+    let lean_status = Command::new("lean")
+        .current_dir(&dep_tmp.0)
+        .args(["Dep.lean", "-o"])
+        .arg(olean_dir.join("Dep.olean"))
+        .status()
+        .unwrap();
+    assert!(lean_status.success());
+    fs::write(
+        dep_tmp.0.join("Main.lean"),
+        "import Dep\ntheorem uses_dep : depVal = 7 := rfl\n",
+    )
+    .unwrap();
+    let mut dep_cmd = Command::new(env!("CARGO_BIN_EXE_turbo-lean"));
+    dep_cmd
+        .current_dir(&dep_tmp.0)
+        .env("TURBO_LEAN_NO_DAEMON", "1")
+        .args(["--json", "--cache-dir"])
+        .arg(dep_tmp.0.join("cache"))
+        .args(["check", "Main.lean", "--project-dir"])
+        .arg(&dep_tmp.0);
+    let dep_out = corpus::run(&mut dep_cmd);
+    let dep_text = corpus::diagnostic(&dep_out);
+    assert!(
+        dep_out.status.success(),
+        "targetless lakefile.toml multi-file check must succeed without `unknown target`: {dep_text}"
+    );
+    assert!(
+        dep_text.contains("\"status\": \"file_verified\""),
+        "{dep_text}"
+    );
+    assert!(!dep_text.contains("unknown target"), "{dep_text}");
+
+    // Dependent recheck when `Dep.lean` changes (triggers `lake_recheck_dependents_with_store`
+    // standalone path under targetless `lakefile.toml`).
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    fs::write(
+        dep_tmp.0.join("Dep.lean"),
+        "def depVal : Nat := 7\ntheorem dep_eq : depVal = 7 := rfl\n",
+    )
+    .unwrap();
+    let mut recheck_cmd = Command::new(env!("CARGO_BIN_EXE_turbo-lean"));
+    recheck_cmd
+        .current_dir(&dep_tmp.0)
+        .env("TURBO_LEAN_NO_DAEMON", "1")
+        .args(["--json", "--cache-dir"])
+        .arg(dep_tmp.0.join("cache"))
+        .args(["check", "Dep.lean", "--project-dir"])
+        .arg(&dep_tmp.0);
+    let recheck_out = corpus::run(&mut recheck_cmd);
+    let recheck_text = corpus::diagnostic(&recheck_out);
+    assert!(
+        recheck_out.status.success(),
+        "targetless lakefile.toml dependent recheck must succeed without `unknown target`: {recheck_text}"
+    );
+    assert!(!recheck_text.contains("unknown target"), "{recheck_text}");
+
+    // Stale `Dep.olean` on `check Main.lean`: `ensure_project_imports_fresh_for_check` must purge
+    // the non-target `Dep.olean` rather than calling `lake build Dep` (`unknown target`).
+    let mut stale_cmd = Command::new(env!("CARGO_BIN_EXE_turbo-lean"));
+    stale_cmd
+        .current_dir(&dep_tmp.0)
+        .env("TURBO_LEAN_NO_DAEMON", "1")
+        .args(["--json", "--cache-dir"])
+        .arg(dep_tmp.0.join("cache"))
+        .args(["check", "Main.lean", "--project-dir"])
+        .arg(&dep_tmp.0);
+    let stale_out = corpus::run(&mut stale_cmd);
+    let stale_text = corpus::diagnostic(&stale_out);
+    assert!(
+        !stale_text.contains("unknown target"),
+        "stale import under targetless lakefile.toml must never call `lake build Dep`: {stale_text}"
+    );
+    assert!(
+        !olean_dir.join("Dep.olean").exists(),
+        "stale standalone Dep.olean should have been purged"
+    );
+}

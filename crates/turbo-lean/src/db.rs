@@ -378,7 +378,7 @@ fn template_shm_path() -> (PathBuf, u32) {
     };
     let uid = unsafe { libc::geteuid() };
     (
-        shm_base.join(format!("turbo_lean_template_state_v6_{}.db", uid)),
+        shm_base.join(format!("turbo_lean_template_state_v7_{}.db", uid)),
         uid,
     )
 }
@@ -543,6 +543,11 @@ impl TurboStore {
                         KERNEL_REPLAYED_OLEANS_AUTH_DDL
                     ))?;
                 }
+                if uver < 5 {
+                    let _ = conn.execute("DELETE FROM file_stat_cache", []);
+                    let _ = conn.execute("DELETE FROM file_split_cache", []);
+                    conn.execute_batch("PRAGMA user_version = 5;")?;
+                }
             }
         } else {
             conn.execute_batch(&format!(
@@ -596,7 +601,7 @@ impl TurboStore {
                      path_key TEXT PRIMARY KEY, mtime_sec INTEGER NOT NULL, mtime_nsec INTEGER NOT NULL,
                      size_bytes INTEGER NOT NULL, split_key TEXT NOT NULL, updated_at INTEGER NOT NULL
                  );
-                 PRAGMA user_version = 4;
+                 PRAGMA user_version = 5;
                  COMMIT;
                  PRAGMA wal_checkpoint(TRUNCATE);",
                 WORKTREE_LEASES_DDL,
@@ -5061,7 +5066,7 @@ mod tests {
         let uv: i64 = store
             .conn
             .query_row("PRAGMA user_version;", [], |r| r.get(0))?;
-        assert_eq!(uv, 4);
+        assert_eq!(uv, 5);
         assert!(!store.has_kernel_replayed_olean("dig1", "env1", 2, "tc1", &[]));
         assert!(store
             .record_kernel_replayed_olean("", "env1", 2, "tc1", "M", &[])

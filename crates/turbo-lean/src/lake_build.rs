@@ -830,9 +830,9 @@ fn compute_single_olean_digest_and_imports(olean_path: &Path) -> Option<(String,
     Some((h.finalize().to_hex().to_string(), olean_deps))
 }
 
-#[allow(clippy::type_complexity)]
+type SourceBlake3MemoKey = (PathBuf, u64, i64, u64, [u8; 32]);
 static PROJECT_SOURCE_BLAKE3_MEMO: std::sync::OnceLock<
-    std::sync::Mutex<HashMap<(PathBuf, u64, i64, u64, [u8; 32]), String>>,
+    std::sync::Mutex<HashMap<SourceBlake3MemoKey, String>>,
 > = std::sync::OnceLock::new();
 
 pub(crate) fn compute_cached_source_blake3(path: &Path) -> Option<String> {
@@ -891,6 +891,24 @@ pub(crate) fn resolve_project_lean_source(project_dir: &Path, rel_slash: &str) -
         return None;
     }
     let rel_file = format!("{}.lean", rel_slash);
+    if let Ok(Some(pkg)) = crate::module_builder::optional_package_config(project_dir) {
+        let pkg_src_base = project_dir.join(&pkg.src_dir);
+        let cand_base = pkg_src_base.join(&rel_file);
+        if cand_base.is_file() {
+            return Some(cand_base);
+        }
+        for sd in pkg
+            .libs
+            .iter()
+            .filter_map(|l| l.src_dir.as_ref())
+            .chain(pkg.exes.iter().filter_map(|e| e.src_dir.as_ref()))
+        {
+            let cand = pkg_src_base.join(sd).join(&rel_file);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
     let direct = project_dir.join(&rel_file);
     if direct.is_file() {
         return Some(direct);
@@ -1134,8 +1152,8 @@ pub(crate) fn compute_single_stat_hash(pk: &str, ms: i64, mn: i64, sz: i64) -> S
     let mut h = blake3::Hasher::new();
     // v4 rebuilds legacy shards without qualified declaration identities.
     // v9 invalidates declaration scopes computed before lossless dotted-component canonicalization.
-    // v10 includes checking-weakening hygiene fields in cached file splits.
-    h.update(b"single-stat-split:v10\n");
+    // v10 includes checking-weakening hygiene fields and raw-string/guillemet lexical & dependency updates.
+    h.update(b"single-stat-split:v11\n");
     h.update(pk.as_bytes());
     h.update(b":");
     h.update(&ms.to_le_bytes());
@@ -1389,12 +1407,14 @@ pub(crate) fn compute_project_interface_key_fast_summary(
     ))
 }
 
+pub(crate) type LoadedFileSplit = (PathBuf, String, String, splitter::SplitResult);
+
 /// Zero-read stat-backed file split loader returning `(path, src_blake3_hex, optional_src, SplitResult)`.
 #[allow(clippy::type_complexity)]
 pub(crate) fn load_and_split_files_with_hashes_cached(
     store: &TurboStore,
     paths: &[PathBuf],
-) -> Result<(Vec<(PathBuf, String, String, splitter::SplitResult)>, usize)> {
+) -> Result<(Vec<LoadedFileSplit>, usize)> {
     if paths.is_empty() {
         return Ok((Vec::new(), 0));
     }
@@ -1406,7 +1426,7 @@ pub(crate) fn load_and_split_files_with_hashes_cached(
         let stat_hash = compute_stat_slice_hash(&valid_stats);
         let p = store
             .fast_staging_dir()
-            .join(format!("project_stat_splits_v3_{}.json", &stat_hash[..24]));
+            .join(format!("project_stat_splits_v4_{}.json", &stat_hash[..24]));
         if let Ok(bytes) = fs::read(&p) {
             if let Ok(cached_entries) = serde_json::from_slice::<Vec<ShmCachedFileSplit>>(&bytes) {
                 if cached_entries.len() == paths.len()
@@ -1436,8 +1456,8 @@ pub(crate) fn load_and_split_files_with_hashes_cached(
 
     let splits_dir = shm_file_splits_dir(store);
     let mut hits = 0usize;
-    let mut results: Vec<Option<(PathBuf, String, String, splitter::SplitResult, Vec<String>)>> =
-        vec![None; paths.len()];
+    type PendingSplitSlot = (PathBuf, String, String, splitter::SplitResult, Vec<String>);
+    let mut results: Vec<Option<PendingSplitSlot>> = vec![None; paths.len()];
     let mut miss_indices = Vec::new();
 
     for (idx, p) in paths.iter().enumerate() {
@@ -1558,7 +1578,7 @@ pub(crate) fn compute_file_split_key_with_deps(src_blake3: &str, dep_hashes: &[S
 pub(crate) fn split_and_audit_with_hashes_cached(
     store: &TurboStore,
     files: &[(PathBuf, String)],
-) -> Result<(Vec<(PathBuf, String, String, splitter::SplitResult)>, usize)> {
+) -> Result<(Vec<LoadedFileSplit>, usize)> {
     if files.is_empty() {
         return Ok((Vec::new(), 0));
     }
@@ -1582,20 +1602,20 @@ pub(crate) fn split_and_audit_with_hashes_cached(
 
     let shm_proj_path = if files.len() <= 128 {
         let mut ch = blake3::Hasher::new();
-        ch.update(b"project-content-splits:v3\n");
+        ch.update(b"project-content-splits:v4\n");
         for (_, fk) in &file_keys {
             ch.update(fk.as_bytes());
             ch.update(b"\n");
         }
         let p = store.fast_staging_dir().join(format!(
-            "project_splits_v3_{}.json",
+            "project_splits_v4_{}.json",
             &ch.finalize().to_hex()[..24]
         ));
         if let Ok(bytes) = fs::read(&p) {
             if let Ok(cached_splits) = serde_json::from_slice::<Vec<splitter::SplitResult>>(&bytes)
             {
                 if cached_splits.len() == files.len() {
-                    let out: Vec<(PathBuf, String, String, splitter::SplitResult)> = files
+                    let out: Vec<LoadedFileSplit> = files
                         .iter()
                         .cloned()
                         .zip(file_keys)
@@ -1715,7 +1735,7 @@ pub(crate) fn split_and_audit_with_hashes_cached(
         let stat_hash = compute_stat_slice_hash(&valid_stats);
         let stat_p = store
             .fast_staging_dir()
-            .join(format!("project_stat_splits_v3_{}.json", &stat_hash[..24]));
+            .join(format!("project_stat_splits_v4_{}.json", &stat_hash[..24]));
         if !stat_p.exists() || !new_splits.is_empty() {
             let compacts: Vec<ShmCachedFileSplit> = results
                 .iter()
@@ -2494,6 +2514,14 @@ pub(crate) fn lake_refresh_targets(canon_dir: &Path, modules: &[String]) -> Vec<
     let Ok(cfg) = crate::module_builder::resolve_project_config(canon_dir) else {
         return modules.to_vec();
     };
+    let has_any_targets = (!cfg.root_pkg.libs.is_empty() || !cfg.root_pkg.exes.is_empty())
+        || cfg
+            .dep_pkgs
+            .iter()
+            .any(|dp| !dp.libs.is_empty() || !dp.exes.is_empty());
+    if !has_any_targets {
+        return Vec::new();
+    }
     let any_inputs =
         !cfg.root_pkg.inputs.is_empty() || cfg.dep_pkgs.iter().any(|dp| !dp.inputs.is_empty());
     let any_matching_exe = modules
@@ -2856,34 +2884,29 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
         );
     }
     if has_lake_config(canon_dir) {
-        let (lake_targets, non_target_stale): (Vec<String>, Vec<String>) = if let Some(ref cfg) =
-            cfg_opt
-        {
-            targets.iter().cloned().partition(|m| {
-                crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, m).is_some()
-                    || cfg.dep_pkgs.iter().any(|dp| {
-                        crate::module_builder::resolve_module_in_package(dp, false, m).is_some()
-                    })
-            })
-        } else if let Some(pkg) = crate::module_builder::optional_package_config(canon_dir)
-            .ok()
-            .flatten()
-        {
-            targets.iter().cloned().partition(|m| {
-                crate::module_builder::resolve_module_in_package(&pkg, true, m).is_some()
-            })
-        } else {
-            (targets.clone(), Vec::new())
-        };
+        let (lake_targets, non_target_stale): (Vec<String>, Vec<String>) =
+            if let Some(ref cfg) = cfg_opt {
+                targets.iter().cloned().partition(|m| {
+                    crate::module_builder::is_lake_target_buildable_in_workspace(cfg, m)
+                })
+            } else if let Some(pkg) = crate::module_builder::optional_package_config(canon_dir)
+                .ok()
+                .flatten()
+            {
+                targets.iter().cloned().partition(|m| {
+                    crate::module_builder::is_lake_target_buildable_in_package(&pkg, m, None)
+                })
+            } else {
+                (targets.clone(), Vec::new())
+            };
         // Lake owns `.lake/build` for target-owned modules (whose files may be hard links into its
         // artifact cache): let Lake bring stale target imports up to date, and purge any stale
         // standalone non-target `.olean`s left in `.lake/build/lib/lean`.
         if !lake_targets.is_empty() {
-            lake_build_modules(
-                canon_dir,
-                &lake_refresh_targets(canon_dir, &lake_targets),
-                None,
-            )?;
+            let refreshed = lake_refresh_targets(canon_dir, &lake_targets);
+            if !refreshed.is_empty() {
+                lake_build_modules(canon_dir, &refreshed, None)?;
+            }
         }
         for mod_name in &non_target_stale {
             let imp_slash = crate::module_builder::module_name_to_rel_slash(mod_name);
@@ -3160,9 +3183,11 @@ fn discover_standalone_project_modules(
         if mod_name.is_empty() || dag.is_some_and(|d| d.nodes.contains_key(&mod_name)) {
             continue;
         }
-        if crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, &mod_name)
-            .is_some_and(|spec| canon(&spec.src_path) == canon_src)
-        {
+        if crate::module_builder::is_lake_target_buildable_in_package(
+            &cfg.root_pkg,
+            &mod_name,
+            Some(&root),
+        ) {
             continue;
         }
         if is_untrusted {
@@ -3258,7 +3283,14 @@ fn compute_project_dependent_closure(
             .any(|x| dep == x || x.ends_with(&format!(".{}", dep)))
     };
 
-    let dag_opt = if is_untrusted {
+    let dag_opt = if seeds.is_empty() {
+        Some(crate::module_builder::ModuleDag {
+            nodes: BTreeMap::new(),
+            topological_order: Vec::new(),
+            waves: Vec::new(),
+            root_modules: Vec::new(),
+        })
+    } else if is_untrusted {
         Some(crate::module_builder::build_module_dag_with_trust(
             &cfg, &seeds, true,
         )?)
@@ -3467,12 +3499,7 @@ fn check_and_audit_standalone_modules(
                 if standalone_names.contains(imp.as_str()) {
                     continue;
                 }
-                if crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, imp)
-                    .is_some()
-                    || cfg.dep_pkgs.iter().any(|dp| {
-                        crate::module_builder::resolve_module_in_package(dp, false, imp).is_some()
-                    })
-                {
+                if crate::module_builder::is_lake_target_buildable_in_workspace(&cfg, imp) {
                     target_imports.push(imp.clone());
                 }
             }
@@ -3512,7 +3539,9 @@ fn check_and_audit_standalone_modules(
                 .collect();
             if !missing_target_imports.is_empty() {
                 let targets = lake_refresh_targets(canon_dir, &missing_target_imports);
-                lake_build_modules(canon_dir, &targets, rev)?;
+                if !targets.is_empty() {
+                    lake_build_modules(canon_dir, &targets, rev)?;
+                }
             }
         }
         ensure_modules_and_imports_replayed(store, canon_dir, &standalone_files, &target_imports)?;
@@ -4121,12 +4150,17 @@ pub(crate) fn lake_recheck_dependents_with_store(
         // not the one Lake attributes it to has to be asked for by library name, or Lake compares
         // an input-blind trace and reports it up to date.
         (Some(mods), Some(files)) if !mods.is_empty() => {
-            lake_build_modules(canon_dir, &lake_refresh_targets(canon_dir, &mods), rev)?;
+            let targets = lake_refresh_targets(canon_dir, &mods);
+            if !targets.is_empty() {
+                lake_build_modules(canon_dir, &targets, rev)?;
+            }
             (mods.len(), files, mods)
         }
         (Some(_), Some(_)) => (0, Vec::new(), Vec::new()),
         _ => {
-            lake_build_modules(canon_dir, &closure.seeds, rev)?;
+            if !closure.seeds.is_empty() {
+                lake_build_modules(canon_dir, &closure.seeds, rev)?;
+            }
             let all_files = collect_project_lean_files(canon_dir, false, None);
             let fallback_mods: Vec<String> = all_files
                 .iter()
@@ -4136,18 +4170,17 @@ pub(crate) fn lake_recheck_dependents_with_store(
             (0, all_files, fallback_mods)
         }
     };
-    let (_standalone_files, _overlay) = check_and_audit_standalone_modules(
+    let (_standalone_files, overlay) = check_and_audit_standalone_modules(
         store_opt,
         canon_dir,
         &closure.standalone_modules,
         false,
         None,
         rev,
-        false,
+        retain_standalone_oleans,
     )?;
-    let _ = retain_standalone_oleans;
     let standalone_count = closure.standalone_modules.len();
-    Ok((dag_count + standalone_count, files, mods, None))
+    Ok((dag_count + standalone_count, files, mods, overlay))
 }
 
 pub(crate) fn ensure_modules_and_imports_replayed(
@@ -4234,19 +4267,19 @@ pub(crate) fn untrusted_recheck_dependents(
         let built_dag = crate::module_builder::build_module_dag_with_trust(&cfg, &targets, true)?;
         verified_targets.extend(built_dag.nodes.into_keys());
     }
-    let (_standalone_files, _overlay) = check_and_audit_standalone_modules(
+    let (_standalone_files, overlay) = check_and_audit_standalone_modules(
         Some(store),
         canon_dir,
         &closure.standalone_modules,
         true,
         Some(&verified_targets),
         None,
-        false,
+        true,
     )?;
     Ok((
         dag_count + closure.standalone_modules.len(),
         built_all,
-        None,
+        overlay,
     ))
 }
 
@@ -4282,7 +4315,14 @@ pub(crate) fn build_imported_standalone_modules_overlay(
             seeds.push(target);
         }
     }
-    let dag_opt = if is_untrusted {
+    let dag_opt = if seeds.is_empty() {
+        Some(crate::module_builder::ModuleDag {
+            nodes: BTreeMap::new(),
+            topological_order: Vec::new(),
+            waves: Vec::new(),
+            root_modules: Vec::new(),
+        })
+    } else if is_untrusted {
         Some(crate::module_builder::build_module_dag_with_trust(
             &cfg, &seeds, true,
         )?)
@@ -4418,12 +4458,9 @@ pub(crate) fn project_imports_of(canon_dir: &Path, files: &[PathBuf]) -> Vec<Str
         .flat_map(|f| read_header_imports_from_file(f).unwrap_or_default())
         .filter(|m| {
             if let Some(ref cfg) = cfg_opt {
-                crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, m).is_some()
-                    || cfg.dep_pkgs.iter().any(|dp| {
-                        crate::module_builder::resolve_module_in_package(dp, false, m).is_some()
-                    })
+                crate::module_builder::is_lake_target_buildable_in_workspace(cfg, m)
             } else if let Some(ref pkg) = pkg_opt {
-                crate::module_builder::resolve_module_in_package(pkg, true, m).is_some()
+                crate::module_builder::is_lake_target_buildable_in_package(pkg, m, None)
             } else {
                 resolve_project_lean_source(canon_dir, &m.replace('.', "/")).is_some()
             }

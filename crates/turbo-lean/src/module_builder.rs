@@ -721,9 +721,8 @@ pub fn parse_olean_binary_imports(bytes: &[u8]) -> Option<(Vec<ParsedImport>, bo
     }
     Some((out, is_module))
 }
-#[allow(clippy::type_complexity)]
-static LEAN_INFO_CACHE: OnceLock<Mutex<HashMap<PathBuf, (String, PathBuf, PathBuf)>>> =
-    OnceLock::new();
+type LeanInfoEntry = (String, PathBuf, PathBuf);
+static LEAN_INFO_CACHE: OnceLock<Mutex<HashMap<PathBuf, LeanInfoEntry>>> = OnceLock::new();
 fn path_has_toolchain_component(path: &Path, tc_dir_name: &str) -> bool {
     let comps: Vec<String> = path
         .components()
@@ -5216,7 +5215,7 @@ pub(crate) fn package_config_path(
         .map(|ext| pkg_root.join(&rel).with_extension(ext))
         .find(|p| p.is_file()))
 }
-fn resolve_package_config_file(
+pub(crate) fn resolve_package_config_file(
     pkg_root: &Path,
     is_root_pkg: bool,
     config_file: Option<&str>,
@@ -5617,6 +5616,52 @@ pub(crate) fn lib_can_build_module(lib: &LeanLibConfig, mod_name: &str) -> bool 
             .iter()
             .any(|r| (mod_name == r || under(mod_name, r)) && matches(r))
 }
+
+/// Whether `pkg` declares an actual `lean_lib` or `lean_exe` target that Lake can build for
+/// `mod_name` (and, when `src_root` is given, whose target source directory matches `src_root`).
+/// Unlike [`resolve_module_in_package`], this returns `false` for bare targetless packages where
+/// `lake build <Mod>` would fail with `unknown target`.
+pub(crate) fn is_lake_target_buildable_in_package(
+    pkg: &PackageConfig,
+    mod_name: &str,
+    src_root: Option<&Path>,
+) -> bool {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let pkg_src_base = pkg.pkg_root.join(&pkg.src_dir);
+    let root_matches = |cand_root: &Path| match src_root {
+        Some(expected) => canon(cand_root) == canon(expected),
+        None => true,
+    };
+    let rel_slash = module_name_to_rel_slash(mod_name);
+    pkg.exes.iter().any(|exe| {
+        if exe.root != mod_name {
+            return false;
+        }
+        let exe_src = match &exe.src_dir {
+            Some(sd) => pkg_src_base.join(sd),
+            None => pkg_src_base.clone(),
+        };
+        root_matches(&exe_src) && exe_src.join(format!("{}.lean", rel_slash)).is_file()
+    }) || pkg.libs.iter().any(|lib| {
+        if !lib_can_build_module(lib, mod_name) {
+            return false;
+        }
+        let lib_src = match &lib.src_dir {
+            Some(sd) => pkg_src_base.join(sd),
+            None => pkg_src_base.clone(),
+        };
+        root_matches(&lib_src) && lib_src.join(format!("{}.lean", rel_slash)).is_file()
+    })
+}
+
+pub(crate) fn is_lake_target_buildable_in_workspace(cfg: &ProjectConfig, mod_name: &str) -> bool {
+    is_lake_target_buildable_in_package(&cfg.root_pkg, mod_name, None)
+        || cfg
+            .dep_pkgs
+            .iter()
+            .any(|dp| is_lake_target_buildable_in_package(dp, mod_name, None))
+}
+
 pub(crate) fn resolve_module_in_package(
     pkg: &PackageConfig,
     is_root_pkg: bool,
@@ -7776,16 +7821,15 @@ pub fn lake_murmur64a(data: &[u8], seed: u64) -> u64 {
     const M: u64 = 0xc6a4a7935bd1e995;
     const R: u32 = 47;
     let mut h = seed ^ (data.len() as u64).wrapping_mul(M);
-    let mut chunks = data.chunks_exact(8);
-    for chunk in &mut chunks {
-        let mut k = u64::from_le_bytes(chunk.try_into().unwrap());
+    let (chunks, rem) = data.as_chunks::<8>();
+    for &chunk in chunks {
+        let mut k = u64::from_le_bytes(chunk);
         k = k.wrapping_mul(M);
         k ^= k >> R;
         k = k.wrapping_mul(M);
         h ^= k;
         h = h.wrapping_mul(M);
     }
-    let rem = chunks.remainder();
     if !rem.is_empty() {
         let mut val = 0u64;
         for &b in rem.iter().rev() {

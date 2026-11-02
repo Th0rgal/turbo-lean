@@ -2198,13 +2198,16 @@ fn execute_fastcheck_payload_deferred(
                                 Some((staging, FASTCHECK_PRELUDE_HARNESS.to_string(), cached_bin));
                             return Ok((
                                 serde_json::json!({
-                                    "status": if status_ok { "ok" } else { "counterexample_found" },
+                                    "status": if status_ok { "ok" } else { "execution_failed" },
+                                    "ok": status_ok,
                                     "mode": "http_remote_cpu_perceus",
                                     "server_arch": std::env::consts::ARCH,
                                     "compile_cache_hit": false,
                                     "binary_cache_key": bin_key,
                                     "exec_us": exec_us,
                                     "total_ms": t0.elapsed().as_millis(),
+                                    "lean_native_certified": false,
+                                    "certification": "unavailable",
                                     "output": body.trim()
                                 }),
                                 deferred_pop,
@@ -2310,13 +2313,16 @@ fn execute_fastcheck_payload_deferred(
 
         Ok((
             serde_json::json!({
-                "status": if status_ok { "ok" } else { "counterexample_found" },
+                "status": if status_ok { "ok" } else { "execution_failed" },
+                "ok": status_ok,
                 "mode": "http_remote_cpu_perceus",
                 "server_arch": std::env::consts::ARCH,
                 "compile_cache_hit": compile_cache_hit,
                 "binary_cache_key": bin_key,
                 "exec_us": exec_us,
                 "total_ms": t0.elapsed().as_millis(),
+                "lean_native_certified": false,
+                "certification": "unavailable",
                 "output": stdout.trim()
             }),
             deferred_pop,

@@ -936,12 +936,9 @@ fn run(cli: Cli) -> Result<()> {
         None;
     let mut prefetched_manifest: Option<std::thread::JoinHandle<Option<pack::DeltaManifest>>> =
         None;
-    #[allow(clippy::type_complexity)]
-    let mut prefetched_import: Option<
-        std::thread::JoinHandle<
-            Option<(pack::PackManifest, Vec<(String, String, i64, i64)>, usize)>,
-        >,
-    > = None;
+    type PrefetchedImportPayload = (pack::PackManifest, Vec<(String, String, i64, i64)>, usize);
+    let mut prefetched_import: Option<std::thread::JoinHandle<Option<PrefetchedImportPayload>>> =
+        None;
     if let Commands::Import {
         ref input,
         ref trust_domain,
