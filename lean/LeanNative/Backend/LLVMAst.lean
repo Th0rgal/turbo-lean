@@ -476,7 +476,7 @@ def stepInstr (mod_ : LLVMModule) (st : ExecState) : LLVMInstr → ExecOutcome �
         .inr (bindReg st dst (loadVal st.mem addr ty))
       else .inl (.ub "misaligned load")
     | _ => .inl (.ub "load from non-pointer")
-  | .store ty valOp ptrOp align =>
+  | .store _ty valOp ptrOp align =>
     let val := evalOperand st valOp
     match evalOperand st ptrOp with
     | .poison => .inl (.ub "store to poison pointer")
@@ -618,7 +618,7 @@ def stepInstr (mod_ : LLVMModule) (st : ExecState) : LLVMInstr → ExecOutcome �
       if isPoison v then .inr (bindReg st dst .poison)
       else .inr (bindReg st dst v)
     else .inl (.ub "bitcast size mismatch")
-  | .inttoptr dst srcW op as_ =>
+  | .inttoptr dst srcW op _as =>
     match evalOperand st op with
     | .poison => .inr (bindReg st dst .poison)
     | .bits w v =>
@@ -626,7 +626,7 @@ def stepInstr (mod_ : LLVMModule) (st : ExecState) : LLVMInstr → ExecOutcome �
         .inr (bindReg st dst (.ptr ((h ▸ v).zeroExtend 64)))
       else .inl (.ub "inttoptr width mismatch")
     | _ => .inl (.ub "inttoptr on non-integer")
-  | .ptrtoint dst as_ op dstW =>
+  | .ptrtoint dst _as op dstW =>
     match evalOperand st op with
     | .poison => .inr (bindReg st dst .poison)
     | .ptr p =>
@@ -1047,8 +1047,8 @@ theorem load_after_alloca_store (st : ExecState) (w : IntWidth) (v : BitVec w.bi
   have h_np : (mem1.storeInt ptr w v).isPoisonCell ptr = false := by
     simp [ByteMem.isPoisonCell, ByteMem.storeInt, ByteMem.readAt_writeAt_same]
   refine ⟨mem1.storeInt ptr w v, ?_, ?_⟩
-  · simp [stepInstr, evalOperand, lookupReg, checkAlign, h_pow, h_al, h_nz, storeVal]
-  · simp [stepInstr, evalOperand, lookupReg, checkAlign, h_pow, h_al, h_nz, loadVal,
+  · simp [stepInstr, evalOperand, lookupReg, checkAlign, h_al, h_nz, storeVal]
+  · simp [stepInstr, evalOperand, lookupReg, checkAlign, h_al, h_nz, loadVal,
           h_np, ByteMem.load_store_same]
 
 theorem select_cond_poison (ty : LLVMType) (tOp eOp : Operand) :
@@ -1136,60 +1136,60 @@ theorem execBlock_mono (mod_ : LLVMModule) (fn : LLVMFn) (f1 f2 : Nat) (st : Exe
     | succ m =>
       simp only [execBlock] at hfin ⊢
       cases hexec : execInstrs mod_ st (blk.phis ++ blk.body) with
-      | inl out => simp [hexec]
+      | inl out => simp
       | inr st' =>
         simp only [hexec] at hfin ⊢
         cases hterm : blk.term with
         | br lbl =>
           simp only [hterm] at hfin ⊢
           cases hfind : findBlock fn lbl with
-          | none => simp [hfind]
+          | none => simp
           | some next =>
             simp only [hfind] at hfin ⊢
             exact ih m { st' with prevBlock := some blk.label } next (by omega) hfin
         | condBr condOp tLbl eLbl =>
           simp only [hterm] at hfin ⊢
           cases heval : evalOperand st' condOp with
-          | poison => simp [heval]
+          | poison => simp
           | bits wb vb =>
             cases wb with
             | i1 =>
               simp only [heval] at hfin ⊢
               cases hfind : findBlock fn (if vb == 1#1 then tLbl else eLbl) with
-              | none => simp [hfind]
+              | none => simp
               | some next =>
                 simp only [hfind] at hfin ⊢
                 exact ih m { st' with prevBlock := some blk.label } next (by omega) hfin
-            | i8 | i16 | i32 | i64 | i128 | i256 | i512 => simp [heval]
-          | ptr _ => simp [heval]
-          | floatBits _ _ => simp [heval]
-          | aggNil => simp [heval]
-          | aggCons _ _ => simp [heval]
+            | i8 | i16 | i32 | i64 | i128 | i256 | i512 => simp
+          | ptr _ => simp
+          | floatBits _ _ => simp
+          | aggNil => simp
+          | aggCons _ _ => simp
         | switch w scrutOp defLbl cases =>
           simp only [hterm] at hfin ⊢
           cases heval : evalOperand st' scrutOp with
-          | poison => simp [heval]
+          | poison => simp
           | bits ws sv =>
             by_cases hws : ws = w
             · subst hws
               simp only [heval, ↓reduceDIte] at hfin ⊢
               cases hfind : findBlock fn (((cases.find? (fun pair => pair.fst == sv.zeroExtend 64)).map (·.snd)).getD defLbl) with
-              | none => simp [hfind]
+              | none => simp
               | some next =>
                 simp only [hfind] at hfin ⊢
                 exact ih m { st' with prevBlock := some blk.label } next (by omega) hfin
-            · simp [heval, hws]
-          | ptr _ => simp [heval]
-          | floatBits _ _ => simp [heval]
-          | aggNil => simp [heval]
-          | aggCons _ _ => simp [heval]
+            · simp [hws]
+          | ptr _ => simp
+          | floatBits _ _ => simp
+          | aggNil => simp
+          | aggCons _ _ => simp
         | ret rv =>
           cases rv with
-          | none => simp [hterm]
+          | none => simp
           | some p =>
             cases p
-            simp [hterm]
-        | unreachable => simp [hterm]
+            simp
+        | unreachable => simp
 
 theorem execFn_mono_fuel (mod_ : LLVMModule) (fn : LLVMFn) (args : List LLVMVal) (f1 f2 : Nat)
     (hle : f1 ≤ f2)
@@ -1197,10 +1197,10 @@ theorem execFn_mono_fuel (mod_ : LLVMModule) (fn : LLVMFn) (args : List LLVMVal)
     execFn mod_ fn args f2 = execFn mod_ fn args f1 := by
   unfold execFn at hfin ⊢
   cases hblocks : fn.blocks with
-  | nil => simp [hblocks]
+  | nil => simp
   | cons entry rest =>
     cases hbind : bindArgs {} fn.params args with
-    | none => simp [hblocks, hbind]
+    | none => simp
     | some st =>
       simp only [hblocks, hbind] at hfin ⊢
       exact execBlock_mono mod_ fn f1 f2 st entry hle hfin
