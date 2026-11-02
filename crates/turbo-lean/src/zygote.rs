@@ -488,6 +488,7 @@ fn owned_lifecycle_process(pid: u32, staging: Option<&Path>, parent: Option<u32>
     let env = fs::read(proc.join("environ")).unwrap_or_default();
     let worker = (name.starts_with("turbo_zygote_") || name == "turbo-zygote")
         && !args.is_empty()
+        && !env.is_empty()
         && !args
             .split(|b| *b == 0)
             .any(|arg| arg == b"--audit-modules" || arg == b"--decl-identity");
@@ -7440,10 +7441,11 @@ mod tests {
         // Establish a stable baseline before testing deliberate identity changes.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            if let Some(process) = LifecycleProcess::open(child.id(), staging, None)
-                .filter(|p| !p.identity.2.is_empty())
-            {
-                return process;
+            if let Some(process) = LifecycleProcess::open(child.id(), staging, None) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                if process.valid_identity() {
+                    return process;
+                }
             }
             assert!(
                 child.try_wait().unwrap().is_none(),
