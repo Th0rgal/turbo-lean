@@ -257,6 +257,47 @@ def diverseCAbiModule : LNIRModule := {
 #guard execValidatedSliceHostCall { stridedByteView with align := 0 } id == none
 #guard execValidatedSliceHostCall { stridedByteView with base := 1, align := 4 } id == none
 
+def zeroCopySampleMem : ByteArray :=
+  ByteArray.mk #[0xAA, 10, 20, 30, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]
+
+def zeroCopyValidCall64 : C99ZeroCopySliceIoCall :=
+  { mem := zeroCopySampleMem, inPtr := some 1, inLen := 3, outPtr := some 5, outCap := 3, width := .bits64 }
+
+def zeroCopyValidCall32 : C99ZeroCopySliceIoCall :=
+  { zeroCopyValidCall64 with width := .bits32 }
+
+#guard execZeroCopySliceIoHostCall zeroCopyValidCall64
+    (fun inp => some (ByteArray.mk (inp.data.map (· + 1)))) ==
+  .ok (ByteArray.mk #[0xAA, 10, 20, 30, 0xBB, 11, 21, 31, 0xFF]) 3
+#guard execZeroCopySliceIoHostCall zeroCopyValidCall32
+    (fun inp => some (ByteArray.mk (inp.data.take 2))) ==
+  .ok (ByteArray.mk #[0xAA, 10, 20, 30, 0xBB, 10, 20, 0xEE, 0xFF]) 2
+#guard execZeroCopySliceIoHostCall { zeroCopyValidCall64 with outPtr := some 2 }
+    (fun inp => some inp) ==
+  .errInvalidGeometry zeroCopySampleMem
+#guard execZeroCopySliceIoHostCall { zeroCopyValidCall64 with inPtr := some 0 }
+    (fun inp => some inp) ==
+  .errInvalidGeometry zeroCopySampleMem
+#guard execZeroCopySliceIoHostCall zeroCopyValidCall64
+    (fun _ => none) ==
+  .errKernelFailed zeroCopySampleMem
+#guard execZeroCopySliceIoHostCall zeroCopyValidCall64
+    (fun _ => some (ByteArray.mk #[1, 2, 3, 4])) ==
+  .errOutputOverflow zeroCopySampleMem 4
+
+def sampleZeroCopySliceSig : CAbiBindingSig :=
+  mkZeroCopySliceIoCAbiSig "lean_native_orb_wire_step_slice" "orbWireStepSlice"
+
+#guard sampleZeroCopySliceSig.toC99FnSig.isSome
+#guard ((emitCAbiHeaderFromSigs [sampleZeroCopySliceSig] none (some .bits64)).splitOn
+  "int64_t lean_native_orb_wire_step_slice(const uint8_t* in_ptr, size_t in_len, uint8_t* out_ptr, size_t out_cap);").length > 1
+#guard ((emitCAbiRustFromSigs [sampleZeroCopySliceSig]).splitOn
+  "pub fn lean_native_orb_wire_step_slice(in_ptr: *const u8, in_len: usize, out_ptr: *mut u8, out_cap: usize) -> i64;").length > 1
+#guard ((emitCAbiSwiftFromSigs [sampleZeroCopySliceSig]).splitOn
+  "UnsafePointer<UInt8>?").length > 1
+#guard ((emitCAbiSwiftFromSigs [sampleZeroCopySliceSig]).splitOn
+  "UnsafeMutablePointer<UInt8>?").length > 1
+
 def bundleStructsForClang : List (String × List C99FieldSpec) :=
   [ ("lean_native_flat_slice_t", flatSliceFieldSpecs),
     ("lean_native_mut_slice_t", mutSliceFieldSpecs),
@@ -273,6 +314,8 @@ def runClangC11ConformanceSuite : IO Bool := do
   let modHdr64 := stripPragmaOnce (emitCAbiHeader diverseCAbiModule .x86_64)
   let modHdr32 := stripPragmaOnce (emitCAbiHeader diverseCAbiModule .wasm32)
   let dualHdr := stripPragmaOnce (emitCAbiHeaderFromSigs (moduleToCAbiSigs diverseCAbiModule) (width? := none))
+  let sliceHdr64 := stripPragmaOnce (emitCAbiHeaderFromSigs [sampleZeroCopySliceSig] none (some .bits64))
+  let sliceHdr32 := stripPragmaOnce (emitCAbiHeaderFromSigs [sampleZeroCopySliceSig] none (some .bits32))
   let posChecks : List (String × String × TargetArch) := [
     ("bundle-hdr-64", stripPragmaOnce hdr64, .x86_64),
     ("bundle-shim-64", shim64, .x86_64),
@@ -283,7 +326,9 @@ def runClangC11ConformanceSuite : IO Bool := do
     ("emitCAbiHeader-x86_64", modHdr64, .x86_64),
     ("emitCAbiHeader-wasm32", modHdr32, .wasm32),
     ("emitCAbiHeaderFromSigs-dual-x86_64", dualHdr, .x86_64),
-    ("emitCAbiHeaderFromSigs-dual-wasm32", dualHdr, .wasm32)
+    ("emitCAbiHeaderFromSigs-dual-wasm32", dualHdr, .wasm32),
+    ("zero-copy-slice-hdr-64", sliceHdr64, .x86_64),
+    ("zero-copy-slice-hdr-32", sliceHdr32, .wasm32)
   ]
   for (label, src, arch) in posChecks do
     let (ok, err) ← c11SyntaxCheck src arch

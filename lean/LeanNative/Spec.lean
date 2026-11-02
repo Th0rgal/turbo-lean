@@ -1582,9 +1582,104 @@ theorem gpr_fmov_or_misaligned_rejects_trineon_fold_four (inp : TriNeonFoldFourI
 def verifyTriNeonFoldFourC (gprRoundTrips unreducedLanes clmulsPerQuad inLenMod4 : UInt64) : UInt64 :=
   if canEmitTriNeonFoldFour ⟨gprRoundTrips.toNat, unreducedLanes.toNat, clmulsPerQuad.toNat, inLenMod4.toNat⟩ then 1 else 0
 
+/-- Width-aware LP64 / `wasm32` zero-copy input/output byte-slice marshaling gate
+    (`leannative_verify_zero_copy_slice_io`): validates width selector (`is32Bit ≤ 1`),
+    non-null pointers on non-empty spans, target address-space no-overflow (`2^32` vs `2^64`),
+    non-aliasing (`inPtr + inLen ≤ outPtr ∨ outPtr + outCap ≤ inPtr` when both spans are
+    non-empty), and bounded output write (`writtenLen ≤ outCap`) using purely unboxed `UInt64`/`UInt8`
+    primitives (`0` undefined `lean_*` runtime symbols in `libturbo_spec_cabi.a`). -/
+@[inline, export leannative_verify_zero_copy_slice_io]
+def verifyZeroCopySliceIoC
+    (inPtr inLen outPtr outCap writtenLen : UInt64) (is32Bit : UInt8) : UInt8 :=
+  let maxAddr : UInt64 := if is32Bit == 1 then 0xFFFFFFFF else 0xFFFFFFFFFFFFFFFF
+  let widthOk := is32Bit ≤ 1
+  let inNonNull := inLen == 0 || inPtr != 0
+  let outNonNull := outCap == 0 || outPtr != 0
+  let inFits := inPtr ≤ maxAddr && inLen ≤ maxAddr - inPtr
+  let outFits := outPtr ≤ maxAddr && outCap ≤ maxAddr - outPtr
+  let disjoint :=
+    inLen == 0 || outCap == 0 ||
+    (inLen ≤ outPtr && inPtr ≤ outPtr - inLen) ||
+    (outCap ≤ inPtr && outPtr ≤ inPtr - outCap)
+  let writeFits := writtenLen ≤ outCap
+  if widthOk && inNonNull && outNonNull && inFits && outFits && disjoint && writeFits then 1
+  else 0
+
+/-- Certified zero-copy input/output slice check parameters (`≤ 3` fields). -/
+structure ZeroCopySliceIoCheck where
+  inSpan  : UInt64 × UInt64
+  outSpan : UInt64 × UInt64
+  writeW  : UInt64 × UInt8
+  deriving Repr, DecidableEq, BEq
+
+def zeroCopyMaxAddrU64 (is32Bit : UInt8) : UInt64 :=
+  if is32Bit == 1 then 0xFFFFFFFF else 0xFFFFFFFFFFFFFFFF
+
+def checkZeroCopySliceIo (c : ZeroCopySliceIoCheck) : Bool :=
+  verifyZeroCopySliceIoC c.inSpan.1 c.inSpan.2 c.outSpan.1 c.outSpan.2 c.writeW.1 c.writeW.2 == 1
+
+theorem zero_copy_slice_io_gate_sound (c : ZeroCopySliceIoCheck) :
+    checkZeroCopySliceIo c = true ↔
+      (c.writeW.2 ≤ 1 ∧
+       (c.inSpan.2 = 0 ∨ c.inSpan.1 ≠ 0) ∧
+       (c.outSpan.2 = 0 ∨ c.outSpan.1 ≠ 0) ∧
+       c.inSpan.1 ≤ zeroCopyMaxAddrU64 c.writeW.2 ∧
+       c.inSpan.2 ≤ zeroCopyMaxAddrU64 c.writeW.2 - c.inSpan.1 ∧
+       c.outSpan.1 ≤ zeroCopyMaxAddrU64 c.writeW.2 ∧
+       c.outSpan.2 ≤ zeroCopyMaxAddrU64 c.writeW.2 - c.outSpan.1 ∧
+       (c.inSpan.2 = 0 ∨ c.outSpan.2 = 0 ∨
+        (c.inSpan.2 ≤ c.outSpan.1 ∧ c.inSpan.1 ≤ c.outSpan.1 - c.inSpan.2) ∨
+        (c.outSpan.2 ≤ c.inSpan.1 ∧ c.outSpan.1 ≤ c.inSpan.1 - c.outSpan.2)) ∧
+       c.writeW.1 ≤ c.outSpan.2) := by
+  rcases c with ⟨⟨ip, il⟩, ⟨op, oc⟩, ⟨wl, w⟩⟩
+  unfold checkZeroCopySliceIo verifyZeroCopySliceIoC zeroCopyMaxAddrU64
+  split <;> simp_all [Bool.and_eq_true, Bool.or_eq_true, decide_eq_true_eq,
+    beq_iff_eq, bne_iff_ne, and_assoc, or_assoc]
+
+def zeroCopySliceIoMetaSpec : MetaGateSpec ZeroCopySliceIoCheck
+    (fun c =>
+      c.writeW.2 ≤ 1 ∧
+      (c.inSpan.2 = 0 ∨ c.inSpan.1 ≠ 0) ∧
+      (c.outSpan.2 = 0 ∨ c.outSpan.1 ≠ 0) ∧
+      c.inSpan.1 ≤ zeroCopyMaxAddrU64 c.writeW.2 ∧
+      c.inSpan.2 ≤ zeroCopyMaxAddrU64 c.writeW.2 - c.inSpan.1 ∧
+      c.outSpan.1 ≤ zeroCopyMaxAddrU64 c.writeW.2 ∧
+      c.outSpan.2 ≤ zeroCopyMaxAddrU64 c.writeW.2 - c.outSpan.1 ∧
+      (c.inSpan.2 = 0 ∨ c.outSpan.2 = 0 ∨
+       (c.inSpan.2 ≤ c.outSpan.1 ∧ c.inSpan.1 ≤ c.outSpan.1 - c.inSpan.2) ∨
+       (c.outSpan.2 ≤ c.inSpan.1 ∧ c.outSpan.1 ≤ c.inSpan.1 - c.outSpan.2)) ∧
+      c.writeW.1 ≤ c.outSpan.2) :=
+  ⟨checkZeroCopySliceIo, fun c => (zero_copy_slice_io_gate_sound c).mp,
+   fun c => (zero_copy_slice_io_gate_sound c).mpr,
+   ⟨(4096, 64), (8192, 128), (64, 1)⟩, ⟨(4096, 64), (4128, 128), (64, 1)⟩, rfl, rfl⟩
+
+theorem overlap_or_overflow_rejects_zero_copy_slice_io (c : ZeroCopySliceIoCheck)
+    (h_bad : ¬ (c.writeW.2 ≤ 1 ∧
+      (c.inSpan.2 = 0 ∨ c.inSpan.1 ≠ 0) ∧
+      (c.outSpan.2 = 0 ∨ c.outSpan.1 ≠ 0) ∧
+      c.inSpan.1 ≤ zeroCopyMaxAddrU64 c.writeW.2 ∧
+      c.inSpan.2 ≤ zeroCopyMaxAddrU64 c.writeW.2 - c.inSpan.1 ∧
+      c.outSpan.1 ≤ zeroCopyMaxAddrU64 c.writeW.2 ∧
+      c.outSpan.2 ≤ zeroCopyMaxAddrU64 c.writeW.2 - c.outSpan.1 ∧
+      (c.inSpan.2 = 0 ∨ c.outSpan.2 = 0 ∨
+       (c.inSpan.2 ≤ c.outSpan.1 ∧ c.inSpan.1 ≤ c.outSpan.1 - c.inSpan.2) ∨
+       (c.outSpan.2 ≤ c.inSpan.1 ∧ c.outSpan.1 ≤ c.inSpan.1 - c.outSpan.2)) ∧
+      c.writeW.1 ≤ c.outSpan.2)) :
+    checkZeroCopySliceIo c = false :=
+  zeroCopySliceIoMetaSpec.rejects_unsafe c h_bad
+
 #guard verifyLowTwiddleZmmNttC 64 0 3 1 == 1
 #guard verifyLowTwiddleZmmNttC 64 1 3 1 == 0
 #guard verifyTriNeonFoldFourC 0 3 17 0 == 1
 #guard verifyTriNeonFoldFourC 2 3 17 0 == 0
+#guard verifyZeroCopySliceIoC 4096 64 8192 128 64 0 == 1
+#guard verifyZeroCopySliceIoC 4096 64 8192 128 64 1 == 1
+#guard verifyZeroCopySliceIoC 0 16 8192 128 16 0 == 0
+#guard verifyZeroCopySliceIoC 4096 64 0 128 0 0 == 0
+#guard verifyZeroCopySliceIoC 4096 64 4128 128 32 0 == 0
+#guard verifyZeroCopySliceIoC 4294967280 32 8192 128 16 1 == 0
+#guard verifyZeroCopySliceIoC 4294967280 32 8192 128 16 0 == 1
+#guard verifyZeroCopySliceIoC 4096 64 8192 32 64 0 == 0
+#guard verifyZeroCopySliceIoC 4096 64 8192 128 64 2 == 0
 
 end LeanNative.Spec

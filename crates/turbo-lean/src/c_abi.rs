@@ -355,6 +355,14 @@ extern "C" {
         is_page_aligned: u8,
         chosen_backend: u8,
     ) -> u8;
+    pub fn leannative_verify_zero_copy_slice_io(
+        in_ptr: u64,
+        in_len: u64,
+        out_ptr: u64,
+        out_cap: u64,
+        written_len: u64,
+        is_32_bit: u8,
+    ) -> u8;
     pub fn lean_native_ntt_butterfly_fused_2layer_slice(
         a_lo: u64,
         a_hi: u64,
@@ -1060,6 +1068,27 @@ pub fn verify_backend_choice(
             has_metal_gpu as u8,
             is_page_aligned as u8,
             chosen_backend,
+        ) == 1
+    }
+}
+
+#[inline(always)]
+pub fn verify_zero_copy_slice_io(
+    in_ptr: u64,
+    in_len: u64,
+    out_ptr: u64,
+    out_cap: u64,
+    written_len: u64,
+    is_32_bit: bool,
+) -> bool {
+    unsafe {
+        leannative_verify_zero_copy_slice_io(
+            in_ptr,
+            in_len,
+            out_ptr,
+            out_cap,
+            written_len,
+            is_32_bit as u8,
         ) == 1
     }
 }
@@ -1863,5 +1892,43 @@ mod tests {
         assert!(!verify_pack_trust_admission(
             false, false, true, true, false
         ));
+    }
+
+    #[test]
+    fn test_verify_zero_copy_slice_io_c_abi_gate() {
+        // Valid disjoint LP64 and wasm32 spans
+        assert!(verify_zero_copy_slice_io(4096, 64, 8192, 128, 64, false));
+        assert!(verify_zero_copy_slice_io(4096, 64, 8192, 128, 64, true));
+        // Null pointers with empty spans are permitted; non-empty spans reject null
+        assert!(verify_zero_copy_slice_io(0, 0, 8192, 64, 16, false));
+        assert!(verify_zero_copy_slice_io(4096, 64, 0, 0, 0, false));
+        assert!(!verify_zero_copy_slice_io(0, 16, 8192, 64, 16, false));
+        assert!(!verify_zero_copy_slice_io(4096, 64, 0, 64, 0, false));
+        // Overlapping input/output slices are rejected
+        assert!(!verify_zero_copy_slice_io(4096, 64, 4128, 128, 32, false));
+        // 32-bit wasm32 ceiling overflow (4 GiB) rejected in 32-bit mode, admitted in LP64
+        assert!(!verify_zero_copy_slice_io(
+            4_294_967_280,
+            32,
+            8192,
+            128,
+            16,
+            true
+        ));
+        assert!(verify_zero_copy_slice_io(
+            4_294_967_280,
+            32,
+            8192,
+            128,
+            16,
+            false
+        ));
+        // Output write exceeding out_cap rejected
+        assert!(!verify_zero_copy_slice_io(4096, 64, 8192, 32, 64, false));
+        // Invalid width selector (> 1) rejected at raw FFI boundary
+        assert_eq!(
+            unsafe { leannative_verify_zero_copy_slice_io(4096, 64, 8192, 128, 64, 2) },
+            0
+        );
     }
 }

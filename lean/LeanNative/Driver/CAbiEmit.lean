@@ -628,12 +628,22 @@ def emitGuardFixturesJson (sourcePath : String) (sigs : List CAbiBindingSig) (gu
 
 private def cTypeToSwiftType (cTy : String) : String :=
   if cTy == "uint8_t" then "UInt8"
+  else if cTy == "int8_t" then "Int8"
+  else if cTy == "bool" || cTy == "_Bool" then "Bool"
   else if cTy == "uint16_t" then "UInt16"
+  else if cTy == "int16_t" then "Int16"
   else if cTy == "uint32_t" then "UInt32"
+  else if cTy == "int32_t" then "Int32"
   else if cTy == "uint64_t" || cTy == "size_t" then "UInt64"
   else if cTy == "int64_t" then "Int64"
+  else if cTy == "float" then "Float"
   else if cTy == "double" then "Double"
   else if cTy == "void" then "Void"
+  else if cTy == "const uint8_t*" then "UnsafePointer<UInt8>?"
+  else if cTy == "uint8_t*" then "UnsafeMutablePointer<UInt8>?"
+  else if cTy == "const uint64_t*" then "UnsafePointer<UInt64>?"
+  else if cTy == "uint64_t*" then "UnsafeMutablePointer<UInt64>?"
+  else if cTy == "void*" then "UnsafeMutableRawPointer?"
   else "UnsafeRawPointer?"
 
 /-- Emit a Clang module map (`module.modulemap`) for Xcode / SwiftPM zero-copy C-ABI interop. -/
@@ -951,6 +961,119 @@ def execValidatedSliceHostCall (v : C99ByteView) (kernel : ByteArray → ByteArr
     | none => none
     | some packedIn => unmarshalSlice v (kernel packedIn)
   else none
+
+/-- Width-aware zero-copy input/output byte-slice call descriptor for flat `(in_ptr, in_len, out_ptr, out_cap)`
+    C99 / Rust / Swift / `wasm32` ABI boundaries over a shared backing memory image. -/
+structure C99ZeroCopySliceIoCall where
+  mem : ByteArray
+  inPtr : Option Nat
+  inLen : Nat
+  outPtr : Option Nat
+  outCap : Nat
+  width : ArchWidth := .bits64
+  deriving DecidableEq, Inhabited
+
+/-- Proposition characterizing a valid width-aware zero-copy input/output byte-slice ABI call:
+    non-null pointers for non-empty spans, target address-space (`LP64` vs `wasm32`) and backing-buffer
+    no-overflow, and non-aliasing (`disjoint`) whenever both input and output spans are non-empty. -/
+def validZeroCopySliceIoCall (c : C99ZeroCopySliceIoCall) : Prop :=
+  (match c.inPtr with
+   | none => c.inLen = 0
+   | some ip =>
+     (c.inLen = 0 ∨ ip ≠ 0) ∧
+     ip + c.inLen ≤ c.mem.size ∧
+     ip + c.inLen ≤ c.width.addrLimit) ∧
+  (match c.outPtr with
+   | none => c.outCap = 0
+   | some op =>
+     (c.outCap = 0 ∨ op ≠ 0) ∧
+     op + c.outCap ≤ c.mem.size ∧
+     op + c.outCap ≤ c.width.addrLimit) ∧
+  (match c.inPtr, c.outPtr with
+   | some ip, some op =>
+     c.inLen = 0 ∨ c.outCap = 0 ∨ ip + c.inLen ≤ op ∨ op + c.outCap ≤ ip
+   | _, _ => True)
+
+/-- Boolean gate validating a zero-copy input/output byte-slice ABI call across `ArchWidth` (`LP64` / `wasm32`). -/
+def validateZeroCopySliceIoCall (c : C99ZeroCopySliceIoCall) : Bool :=
+  let inOk := match c.inPtr with
+    | none => c.inLen == 0
+    | some ip =>
+      (c.inLen == 0 || ip != 0) &&
+      decide (ip ≤ c.mem.size) && decide (c.inLen ≤ c.mem.size - ip) &&
+      decide (ip ≤ c.width.addrLimit) && decide (c.inLen ≤ c.width.addrLimit - ip)
+  let outOk := match c.outPtr with
+    | none => c.outCap == 0
+    | some op =>
+      (c.outCap == 0 || op != 0) &&
+      decide (op ≤ c.mem.size) && decide (c.outCap ≤ c.mem.size - op) &&
+      decide (op ≤ c.width.addrLimit) && decide (c.outCap ≤ c.width.addrLimit - op)
+  let aliasOk := match c.inPtr, c.outPtr with
+    | some ip, some op =>
+      c.inLen == 0 || c.outCap == 0 ||
+      decide (ip + c.inLen ≤ op) || decide (op + c.outCap ≤ ip)
+    | _, _ => true
+  inOk && outOk && aliasOk
+
+/-- Outcome of a zero-copy input/output byte-slice host call, preserving `mem` identically on every error path. -/
+inductive ZeroCopySliceIoOutcome where
+  | ok (mem' : ByteArray) (writtenLen : Nat)
+  | errInvalidGeometry (memUnchanged : ByteArray)
+  | errKernelFailed (memUnchanged : ByteArray)
+  | errOutputOverflow (memUnchanged : ByteArray) (neededLen : Nat)
+  deriving DecidableEq, Inhabited
+
+/-- Resulting memory image of a `ZeroCopySliceIoOutcome`. -/
+def ZeroCopySliceIoOutcome.memory : ZeroCopySliceIoOutcome → ByteArray
+  | .ok m _ => m
+  | .errInvalidGeometry m => m
+  | .errKernelFailed m => m
+  | .errOutputOverflow m _ => m
+
+/-- Splice `payload` into `mem` at `outBase` without changing total backing memory size (`payload.size ≤ outCap`). -/
+def spliceOutputSlice (mem : ByteArray) (outBase : Nat) (payload : ByteArray) : ByteArray :=
+  mem.extract 0 outBase ++ payload ++ mem.extract (outBase + payload.size) mem.size
+
+/-- Extract the borrowed zero-copy input byte slice for `c`. -/
+def zeroCopyInputBytes (c : C99ZeroCopySliceIoCall) : ByteArray :=
+  match c.inPtr with
+  | none => ByteArray.empty
+  | some ip => c.mem.extract ip (ip + c.inLen)
+
+/-- Execute a width-aware zero-copy `(in_ptr, in_len, out_ptr, out_cap)` host call:
+    validates non-null/bounds/no-overflow/disjointness for `c.width`, borrows the exact input slice,
+    runs `kernel`, rejects `none` or `payload.size > c.outCap` without mutating `c.mem`, and writes
+    at most `c.outCap` bytes into `[outBase, outBase + payload.size)` while preserving all other bytes. -/
+def execZeroCopySliceIoHostCall (c : C99ZeroCopySliceIoCall)
+    (kernel : ByteArray → Option ByteArray) : ZeroCopySliceIoOutcome :=
+  if validateZeroCopySliceIoCall c then
+    match kernel (zeroCopyInputBytes c) with
+    | none => .errKernelFailed c.mem
+    | some outPayload =>
+      if outPayload.size ≤ c.outCap then
+        match c.outPtr with
+        | none => .ok c.mem 0
+        | some op =>
+          if outPayload.size == 0 then .ok c.mem 0
+          else .ok (spliceOutputSlice c.mem op outPayload) outPayload.size
+      else
+        .errOutputOverflow c.mem outPayload.size
+  else
+    .errInvalidGeometry c.mem
+
+/-- Canonical typed C99 signature `(const uint8_t* in_ptr, size_t in_len, uint8_t* out_ptr, size_t out_cap) -> int64_t`
+    for a zero-copy byte-slice kernel symbol (`>= 0` bytes written on success, `< 0` on error with zero partial mutation). -/
+def mkZeroCopySliceIoCAbiSig (cSymbol : String) (leanName : String := cSymbol) : CAbiBindingSig :=
+  { cSymbol
+    leanName
+    params := [
+      ("in_ptr", "const uint8_t*", "*const u8"),
+      ("in_len", "size_t", "usize"),
+      ("out_ptr", "uint8_t*", "*mut u8"),
+      ("out_cap", "size_t", "usize")
+    ]
+    retCType := "int64_t"
+    retRustType := "i64" }
 
 /-- Header fragment for one computed struct, including explicit offsets and C11 `_Static_assert`s
     for `sizeof`, `_Alignof`, and per-field `offsetof` when `width?` is specified,
