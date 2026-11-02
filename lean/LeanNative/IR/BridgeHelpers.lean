@@ -12,6 +12,7 @@ import LeanNative.IR.Types
 import LeanNative.IR.AST
 import LeanNative.IR.Codec
 import LeanNative.IR.LCNF
+import LeanNative.IR.RealLCNFBridge
 import LeanNative.Transform.EqSat
 
 set_option autoImplicit true
@@ -141,58 +142,12 @@ def isClosureOrRuntimeNatExpr (e : Lean.Expr) : Bool :=
     | .forallE .. | .lam .. => true
     | _ => false
 
-def archSupportsUSize (arch : TargetArch) : Bool :=
-  match arch with
-  | .nvptx64 | .hybridCpuGpu => false
-  | _ => true
-
-def archUSizeMask (arch : TargetArch) : UInt64 :=
-  match arch with
-  | .wasm32 => 0xFFFFFFFF
-  | _ => 0xFFFFFFFFFFFFFFFF
-
-def archUSizeShiftMask (arch : TargetArch) : UInt64 :=
-  match arch with
-  | .wasm32 => 31
-  | _ => 63
-
-def scalarWidthMask? (ty : LNIRType) (arch : TargetArch := .x86_64) : Option UInt64 :=
-  match ty with
-  | .i8 => some 0xFF
-  | .i16 => some 0xFFFF
-  | .i32 => some 0xFFFFFFFF
-  | .i64 => some 0xFFFFFFFFFFFFFFFF
-  | .usize => if archSupportsUSize arch then some (archUSizeMask arch) else none
-  | _ => none
-
-def scalarShiftMask? (ty : LNIRType) (arch : TargetArch := .x86_64) : Option UInt64 :=
-  match ty with
-  | .i8 => some 7
-  | .i16 => some 15
-  | .i32 => some 31
-  | .i64 => some 63
-  | .usize => if archSupportsUSize arch then some (archUSizeShiftMask arch) else none
-  | _ => none
-
-def isSupportedStage1BScalarType (ty : LNIRType) (arch : TargetArch) : Bool :=
-  match ty with
-  | .i1 | .i8 | .i16 | .i32 | .i64 | .unit => true
-  | .usize => archSupportsUSize arch
-  | _ => false
-
-def isSupportedStage1BScalarOrTuple (ty : LNIRType) (arch : TargetArch) : Bool :=
-  if isSupportedStage1BScalarType ty arch then true
-  else match ty with
-    | .tuple fs => !fs.isEmpty && fs.length ≤ 8 && fs.all (isSupportedStage1BScalarType · arch)
-    | _ => false
-
-def isFlatUnboxedScalar : LNIRType → Bool
-  | .i1 | .i8 | .i16 | .i32 | .i64 | .usize | .u256 | .i256 => true
-  | _ => false
-
-def isUnboxedScalarOrTuple : LNIRType → Bool
-  | .tuple fs => !fs.isEmpty && fs.all isFlatUnboxedScalar
-  | ty => isFlatUnboxedScalar ty
+export LeanNative.IR.RealLCNFBridge (
+  archSupportsUSize archUSizeMask archUSizeShiftMask
+  scalarWidthMask? scalarShiftMask?
+  isSupportedStage1BScalarType isSupportedStage1BScalarOrTuple
+  isFlatUnboxedScalar isUnboxedScalarOrTuple
+)
 
 partial def lowerImpureType (e : Lean.Expr) (env? : Option Lean.Environment := none) : LNIRType :=
   if e == ImpureType.uint8 then .i8
@@ -363,16 +318,7 @@ def validateSupportedTypeM (ctx : String) (rawTy : Lean.Expr) (ty : LNIRType) (a
   if !(isSupportedStage1BScalarOrTuple ty arch || (allowInternalObj && (ty == .objPtr || ty == .taggedPtr))) then
     Lean.throwError s!"[lean-native] Unsupported non-scalar {ctx} type `{rawTy}` (lowered as `{reprStr ty}`)"
 
-/-- HEAPOBJ_CONTRACT C1.2 constructor layout (ported from #277's `RcCtorLayoutSpec`), read from
-    `Lean.Compiler.LCNF.getCtorLayout`, never guessed from `numFields`. `scalarSlots` is the `scalarFields`
-    order: the `usize` slots first (`none`), then the scalar fields sorted by ascending byte offset `off_i`. -/
-structure RcCtorLayoutSpec where
-  ctorName    : Lean.Name := .anonymous
-  cidx        : Nat := 0
-  objSlots    : Nat := 0
-  usizeSlots  : Nat := 0
-  scalarSlots : List (Option Nat × LNIRType) := []
-  deriving Inhabited, BEq
+abbrev RcCtorLayoutSpec := LeanNative.IR.RealLCNFBridge.RcCtorLayoutSpec
 
 def getRcCtorLayoutSpecM (ctorName : Lean.Name) : Lean.CoreM RcCtorLayoutSpec := do
   let env ← getEnv
@@ -383,15 +329,6 @@ def getRcCtorLayoutSpecM (ctorName : Lean.Name) : Lean.CoreM RcCtorLayoutSpec :=
   return { ctorName, cidx := lay.ctorInfo.cidx, objSlots := lay.ctorInfo.size, usizeSlots := lay.ctorInfo.usize
            scalarSlots := (List.replicate lay.ctorInfo.usize (none, .usize)) ++
              (scalars.qsort (·.1 < ·.1)).toList.map fun (off, ty) => (some off, ty) }
-
-/-- `uproj i` / `uset i`: `usize` slot `i - objSlots` (C1.2: `lean_ctor_get_usize(o, n + k)`). -/
-def RcCtorLayoutSpec.usizeSlot? (spec : RcCtorLayoutSpec) (i : Nat) : Option (Nat × LNIRType) :=
-  if spec.objSlots ≤ i && i - spec.objSlots < spec.usizeSlots then some (i - spec.objSlots, .usize) else none
-
-/-- `sproj n off` / `sset n off`: the scalar slot at byte offset `off` (C1.2: requires `n = objSlots + usizeSlots`). -/
-def RcCtorLayoutSpec.scalarSlot? (spec : RcCtorLayoutSpec) (n off : Nat) : Option (Nat × LNIRType) :=
-  if n != spec.objSlots + spec.usizeSlots then none
-  else (spec.scalarSlots.zipIdx.find? (·.1.1 == some off)).map fun ((_, ty), i) => (i, ty)
 
 def checkEnvConstSignatureM (env : Lean.Environment) (declName : Lean.Name) (arch : TargetArch)
     (isExported : Bool) : Lean.CoreM Unit := do
@@ -682,34 +619,14 @@ def spliceJoinPointJmp {pu} (jpParams : Array (Lean.Compiler.LCNF.Param .impure)
   return preBinds.foldr (fun (dst, ty, val) acc => .letBind dst ty val acc) body'
 
 def orderAlts (alts : List (Lean.Compiler.LCNF.Alt pu)) : List (Lean.Compiler.LCNF.Alt pu) :=
-  alts.filter (fun | .default _ => false | _ => true) ++ alts.filter (fun | .default _ => true | _ => false)
+  RealLCNFBridge.orderAltsPure alts
 
 def lowerLitValueM (lit : Lean.Compiler.LCNF.LitValue) (retTy : LNIRType := .i64)
     (allowInternalObj : Bool := false) : BridgeM LNIRExpr := do
   let arch := (← get).arch
-  if retTy == .usize && !archSupportsUSize arch then
-    Lean.throwError s!"[lean-native] Unsupported USize literal on target `{reprStr arch}`"
-  let raw : UInt64 ← match lit with
-    | .nat n =>
-      if (retTy == .taggedPtr || retTy == .objPtr) && !allowInternalObj then
-        Lean.throwError "[lean-native] Unsupported runtime Nat literal"
-      let m := (scalarWidthMask? retTy arch).getD 0xFFFFFFFFFFFFFFFF
-      pure ((n % (2 ^ 64)).toUInt64 &&& m)
-    | .uint8 v => pure v.toUInt64
-    | .uint16 v => pure v.toUInt64
-    | .uint32 v => pure v.toUInt64
-    | .uint64 v => pure v
-    | .usize v =>
-      if !archSupportsUSize arch then
-        Lean.throwError s!"[lean-native] Unsupported USize literal on target `{reprStr arch}`"
-      pure (v &&& archUSizeMask arch)
-    | .str _ => Lean.throwError "[lean-native] unsupported string literal"
-  let masked := match scalarWidthMask? retTy arch with
-    | some m => raw &&& m
-    | none => raw
-  if retTy == .i1 then
-    return .scalar (.constBool (masked != 0))
-  return .scalar (.constU64 masked)
+  match RealLCNFBridge.lowerLitValuePure lit retTy arch allowInternalObj with
+  | .ok expr => return expr
+  | .error msg => Lean.throwError msg
 
 def lowerLitValue (lit : Lean.Compiler.LCNF.LitValue) : BridgeM LNIRExpr :=
   lowerLitValueM lit .i64
@@ -772,12 +689,12 @@ def internParams {pu} (params : Array (Lean.Compiler.LCNF.Param pu)) (allowInter
     checkBridgeType "parameter" p.type pTy allowInternalObj
     let _ ← internFVar p.fvarId pTy true
 
-def lowerRefOp (isInc : Bool) (fvarId : Lean.FVarId) (_n : Nat) (kCode : LNIRCode) : BridgeM LNIRCode := do
+def lowerRefOp (isInc : Bool) (fvarId : Lean.FVarId) (n : Nat) (kCode : LNIRCode) : BridgeM LNIRCode := do
   let v ← internFVar fvarId
   let vt ← getVarType v
-  if isUnboxedScalarOrTuple vt then return kCode
-  else if vt == .objPtr || vt == .taggedPtr then return if isInc then .incRef v _n kCode else .decRef v _n kCode
-  else Lean.throwError s!"[lean-native] Unsupported heap RC instruction on `{reprStr vt}` in Stage 1B"
+  match RealLCNFBridge.lowerRefOpPure isInc v vt n kCode with
+  | .ok code => return code
+  | .error msg => Lean.throwError msg
 
 def inferImpureRhsType (rhs : LNIRExpr) (declTy : LNIRType) (isBox : Bool) : BridgeM LNIRType := do
   if isBox then
@@ -1262,118 +1179,9 @@ partial def inlineLocalFunCode (ren : Std.HashMap VarId VarId) (dst : VarId) (ds
   | .unreachable => return .unreachable
   | _ => Lean.throwError "[lean-native] Unsupported non-scalar instruction inside local function body"
 
-def lowerScalarIntrinsicExpr? (op : BinOp) (lhs rhs : VarId) (operandTy retTy : LNIRType)
-    (arch : TargetArch) : Option ScalarExpr := do
-  if (operandTy == .usize || retTy == .usize) && !archSupportsUSize arch then none else
-  let wrapBool (cmp : ScalarExpr) : Option ScalarExpr :=
-    if retTy == .i8 then some (.select cmp (.constU64 1) (.constU64 0))
-    else if retTy == .i1 then some cmp
-    else none
-  if operandTy == .i1 then
-    let bL : ScalarExpr := .var lhs
-    let bR : ScalarExpr := .var rhs
-    match op with
-    | .bitAnd => wrapBool (.select bL bR (.constBool false))
-    | .bitOr  => wrapBool (.select bL (.constBool true) bR)
-    | .bitXor => wrapBool (.unaryOp .not (.binOp .eq bL bR))
-    | .eq     => wrapBool (.binOp .eq bL bR)
-    | _       => none
-  else
-    let mask ← scalarWidthMask? operandTy arch
-    let sMask ← scalarShiftMask? operandTy arch
-    let lMasked : ScalarExpr := if mask == 0xFFFFFFFFFFFFFFFF then .var lhs else .binOp .bitAnd (.var lhs) (.constU64 mask)
-    let rMasked : ScalarExpr := if mask == 0xFFFFFFFFFFFFFFFF then .var rhs else .binOp .bitAnd (.var rhs) (.constU64 mask)
-    match op with
-    | .add | .sub | .mul =>
-      if retTy != operandTy then none
-      else
-        let raw := ScalarExpr.binOp op lMasked rMasked
-        some (if mask == 0xFFFFFFFFFFFFFFFF then raw else .binOp .bitAnd raw (.constU64 mask))
-    | .div =>
-      if retTy != operandTy then none
-      else some (.select (.binOp .eq rMasked (.constU64 0)) (.constU64 0) (.binOp .div lMasked rMasked))
-    | .mod =>
-      if retTy != operandTy then none
-      else some (.select (.binOp .eq rMasked (.constU64 0)) lMasked (.binOp .mod lMasked rMasked))
-    | .bitAnd | .bitOr | .bitXor =>
-      if retTy != operandTy then none
-      else
-        let raw := ScalarExpr.binOp op lMasked rMasked
-        some (if mask == 0xFFFFFFFFFFFFFFFF then raw else .binOp .bitAnd raw (.constU64 mask))
-    | .shl =>
-      if retTy != operandTy then none
-      else
-        let shAmt : ScalarExpr := if sMask == 63 then rMasked else .binOp .bitAnd rMasked (.constU64 sMask)
-        let raw := ScalarExpr.binOp .shl lMasked shAmt
-        some (if mask == 0xFFFFFFFFFFFFFFFF then raw else .binOp .bitAnd raw (.constU64 mask))
-    | .shr =>
-      if retTy != operandTy then none
-      else
-        let shAmt : ScalarExpr := if sMask == 63 then rMasked else .binOp .bitAnd rMasked (.constU64 sMask)
-        some (.binOp .shr lMasked shAmt)
-    | .eq | .lt | .le =>
-      wrapBool (.binOp op lMasked rMasked)
-    | _ => none
-
-def lowerBoolBinIntrinsic? (fnName : Lean.Name) (lhs rhs : VarId) (argTys : List LNIRType)
-    (retTy : LNIRType) : Option LNIRExpr := do
-  let toCond (v : VarId) (t : LNIRType) : Option ScalarExpr :=
-    if t == .i1 then some (.var v)
-    else if t == .i8 then some (.unaryOp .not (.binOp .eq (.binOp .bitAnd (.var v) (.constU64 1)) (.constU64 0)))
-    else none
-  let wrapOut (bExpr : ScalarExpr) : Option LNIRExpr :=
-    if retTy == .i1 then some (.scalar bExpr)
-    else if retTy == .i8 then some (.scalar (.select bExpr (.constU64 1) (.constU64 0)))
-    else none
-  let [tL, tR] := argTys | none
-  let cL ← toCond lhs tL
-  let cR ← toCond rhs tR
-  if fnName == ``Bool.and then wrapOut (.select cL cR (.constBool false))
-  else if fnName == ``Bool.or then wrapOut (.select cL (.constBool true) cR)
-  else if fnName == ``Bool.xor || fnName == `Bool.bne || fnName == `bne then wrapOut (.unaryOp .not (.binOp .eq cL cR))
-  else if fnName == ``Bool.beq then wrapOut (.binOp .eq cL cR)
-  else none
-
-def lowerUnaryScalarIntrinsic? (fnName : Lean.Name) (arg : VarId) (argTys : List LNIRType)
-    (retTy : LNIRType) (arch : TargetArch) : Option LNIRExpr := do
-  let [srcTy] := argTys | none
-  if fnName == ``Bool.not then
-    if srcTy == .i1 && retTy == .i1 then
-      return .scalar (.unaryOp .not (.var arg))
-    else if srcTy == .i8 && retTy == .i8 then
-      let isZero := ScalarExpr.binOp .eq (.binOp .bitAnd (.var arg) (.constU64 1)) (.constU64 0)
-      return .scalar (.select isZero (.constU64 1) (.constU64 0))
-    else none
-  else if fnName == ``Bool.toUInt8 || fnName == ``Bool.toUInt16 ||
-          fnName == ``Bool.toUInt32 || fnName == ``Bool.toUInt64 || fnName == ``Bool.toUSize then
-    let expectedRet : LNIRType :=
-      if fnName == ``Bool.toUInt8 then .i8
-      else if fnName == ``Bool.toUInt16 then .i16
-      else if fnName == ``Bool.toUInt32 then .i32
-      else if fnName == ``Bool.toUInt64 then .i64
-      else .usize
-    guard ((srcTy == .i1 || srcTy == .i8) && retTy == expectedRet && isSupportedStage1BScalarType expectedRet arch)
-    if srcTy == .i1 then
-      return .scalar (.select (.var arg) (.constU64 1) (.constU64 0))
-    else
-      return .scalar (.binOp .bitAnd (.var arg) (.constU64 1))
-  else
-    let (expectedTy, isNeg) ←
-      if fnName == ``UInt8.complement then some (LNIRType.i8, false)
-      else if fnName == ``UInt16.complement then some (.i16, false)
-      else if fnName == ``UInt32.complement then some (.i32, false)
-      else if fnName == ``UInt64.complement then some (.i64, false)
-      else if fnName == ``USize.complement then some (.usize, false)
-      else if fnName == ``UInt8.neg then some (.i8, true)
-      else if fnName == ``UInt16.neg then some (.i16, true)
-      else if fnName == ``UInt32.neg then some (.i32, true)
-      else if fnName == ``UInt64.neg then some (.i64, true)
-      else if fnName == ``USize.neg then some (.usize, true)
-      else none
-    guard (srcTy == expectedTy && retTy == expectedTy)
-    let mask ← scalarWidthMask? expectedTy arch
-    let raw := if isNeg then ScalarExpr.binOp .sub (.constU64 0) (.var arg) else ScalarExpr.unaryOp .not (.var arg)
-    return .scalar (if mask == 0xFFFFFFFFFFFFFFFF then raw else .binOp .bitAnd raw (.constU64 mask))
+export LeanNative.IR.RealLCNFBridge (
+  lowerScalarIntrinsicExpr? lowerBoolBinIntrinsic? lowerUnaryScalarIntrinsic?
+)
 
 def lowerTupleOrEnumCtor (ctorName : Lean.Name) (cidx : Nat) (args : Array (Lean.Compiler.LCNF.Arg pu))
     (retTy : LNIRType) : BridgeM LNIRExpr := do

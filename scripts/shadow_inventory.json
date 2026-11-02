@@ -22,6 +22,7 @@
     "LeanNative.Backend.PTXAst.Eval",
     "LeanNative.Backend.PTXAst.Proofs",
     "LeanNative.IR.LCNF",
+    "LeanNative.IR.RealLCNFSemantics",
     "TurboLean.ConLeche"
   ],
   "namespaces": [
@@ -29,6 +30,7 @@
     "LNSym",
     "ConLeche",
     "LCNF",
+    "LeanNative.IR.RealLCNFSemantics",
     "LeanNative.Backend.StableHLOAst",
     "LeanNative.Backend.TargetIR",
     "LeanNative.Backend.LLVMAst",
@@ -41,6 +43,7 @@
     "LNSym": ["LeanNative.Backend.Semantics"],
     "ConLeche": ["TurboLean.ConLeche"],
     "LCNF": ["LeanNative.IR.LCNF"],
+    "LeanNative.IR.RealLCNFSemantics": ["LeanNative.IR.RealLCNFSemantics"],
     "LeanNative.Backend.StableHLOAst": [
       "LeanNative.Backend.StableHLOAst",
       "LeanNative.Backend.StableHLOAst.Syntax",

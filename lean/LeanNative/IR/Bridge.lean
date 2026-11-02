@@ -7,70 +7,30 @@ namespace LeanNative.IR
 open Lean
 open Lean.Compiler.LCNF
 
-/-- Canonical `Lean.Name` lookup table with explicit operand width (`LNIRType`).
-    Runtime `Nat` is excluded so unbounded integer operations fail closed. -/
-def canonicalScalarBinOpTypedTable : List (Lean.Name × LNIRType × BinOp) := [
-  (``UInt64.add, .i64, .add), (``UInt64.sub, .i64, .sub), (``UInt64.mul, .i64, .mul), (``UInt64.div, .i64, .div), (``UInt64.mod, .i64, .mod),
-  (``UInt64.land, .i64, .bitAnd), (``UInt64.lor, .i64, .bitOr), (``UInt64.xor, .i64, .bitXor), (``UInt64.shiftLeft, .i64, .shl), (``UInt64.shiftRight, .i64, .shr),
-  (``UInt64.decEq, .i64, .eq), (`UInt64.beq, .i64, .eq), (``UInt64.decLt, .i64, .lt), (`UInt64.blt, .i64, .lt), (``UInt64.decLe, .i64, .le), (`UInt64.ble, .i64, .le),
-  (``UInt32.add, .i32, .add), (``UInt32.sub, .i32, .sub), (``UInt32.mul, .i32, .mul), (``UInt32.div, .i32, .div), (``UInt32.mod, .i32, .mod),
-  (``UInt32.land, .i32, .bitAnd), (``UInt32.lor, .i32, .bitOr), (``UInt32.xor, .i32, .bitXor), (``UInt32.shiftLeft, .i32, .shl), (``UInt32.shiftRight, .i32, .shr),
-  (``UInt32.decEq, .i32, .eq), (`UInt32.beq, .i32, .eq), (``UInt32.decLt, .i32, .lt), (`UInt32.blt, .i32, .lt), (``UInt32.decLe, .i32, .le), (`UInt32.ble, .i32, .le),
-  (``UInt16.add, .i16, .add), (``UInt16.sub, .i16, .sub), (``UInt16.mul, .i16, .mul), (``UInt16.div, .i16, .div), (``UInt16.mod, .i16, .mod),
-  (``UInt16.land, .i16, .bitAnd), (``UInt16.lor, .i16, .bitOr), (``UInt16.xor, .i16, .bitXor), (``UInt16.shiftLeft, .i16, .shl), (``UInt16.shiftRight, .i16, .shr),
-  (``UInt16.decEq, .i16, .eq), (`UInt16.beq, .i16, .eq), (``UInt16.decLt, .i16, .lt), (`UInt16.blt, .i16, .lt), (``UInt16.decLe, .i16, .le), (`UInt16.ble, .i16, .le),
-  (``UInt8.add, .i8, .add), (``UInt8.sub, .i8, .sub), (``UInt8.mul, .i8, .mul), (``UInt8.div, .i8, .div), (``UInt8.mod, .i8, .mod),
-  (``UInt8.land, .i8, .bitAnd), (``UInt8.lor, .i8, .bitOr), (``UInt8.xor, .i8, .bitXor), (``UInt8.shiftLeft, .i8, .shl), (``UInt8.shiftRight, .i8, .shr),
-  (``UInt8.decEq, .i8, .eq), (`UInt8.beq, .i8, .eq), (``UInt8.decLt, .i8, .lt), (`UInt8.blt, .i8, .lt), (``UInt8.decLe, .i8, .le), (`UInt8.ble, .i8, .le),
-  (``USize.add, .usize, .add), (``USize.sub, .usize, .sub), (``USize.mul, .usize, .mul), (``USize.div, .usize, .div), (``USize.mod, .usize, .mod),
-  (``USize.land, .usize, .bitAnd), (``USize.lor, .usize, .bitOr), (``USize.xor, .usize, .bitXor), (``USize.shiftLeft, .usize, .shl), (``USize.shiftRight, .usize, .shr),
-  (``USize.decEq, .usize, .eq), (`USize.beq, .usize, .eq), (``USize.decLt, .usize, .lt), (`USize.blt, .usize, .lt), (``USize.decLe, .usize, .le), (`USize.ble, .usize, .le)
-]
+def canonicalScalarBinOpTypedTable : List (Lean.Name × LNIRType × BinOp) :=
+  RealLCNFBridge.canonicalScalarBinOpTypedTable
 
 def canonicalScalarBinOpTable : List (Lean.Name × BinOp) :=
-  canonicalScalarBinOpTypedTable.map fun (n, _, op) => (n, op)
+  RealLCNFBridge.canonicalScalarBinOpTable
 
 def lookupCanonicalTypedBinOp? (fnName : Lean.Name) : Option (LNIRType × BinOp) :=
-  (canonicalScalarBinOpTypedTable.find? (fun (n, _, _) => n == fnName)).map Prod.snd
+  RealLCNFBridge.lookupCanonicalTypedBinOp? fnName
 
 def lookupCanonicalBinOp? (fnName : Lean.Name) : Option BinOp :=
-  (lookupCanonicalTypedBinOp? fnName).map Prod.snd
+  RealLCNFBridge.lookupCanonicalBinOp? fnName
 
-/-- Exact primitive names and types only: unsigned narrowing truncates low bits;
-    widening masks by `min srcMask dstMask` to clamp any unmasked i64 representation. -/
 def canonicalUIntCastMask? (fnName : Lean.Name) (argTys : List LNIRType) (retTy : LNIRType)
-    (arch : TargetArch := .x86_64) : Option UInt64 := do
-  let usizeEntry : List (Lean.Name × LNIRType × UInt64) :=
-    if archSupportsUSize arch then [(``USize, .usize, archUSizeMask arch)] else []
-  let types : List (Lean.Name × LNIRType × UInt64) :=
-    [(``UInt8, .i8, 255), (``UInt16, .i16, 65535),
-     (``UInt32, .i32, 4294967295), (``UInt64, .i64, 18446744073709551615)] ++ usizeEntry
-  types.findSome? fun (src, srcTy, srcMask) => types.findSome? fun (dst, dstTy, dstMask) =>
-    if src != dst && fnName == Lean.Name.str src ("to" ++ dst.toString) &&
-        argTys == [srcTy] && retTy == dstTy then
-      some (min srcMask dstMask)
-    else none
+    (arch : TargetArch := .x86_64) : Option UInt64 :=
+  RealLCNFBridge.canonicalUIntCastMask? fnName argTys retTy arch
 
 def tryLowerIntrinsicCall (env : Lean.Environment) (fnName : Lean.Name) (argVars : List VarId)
     (retTy : LNIRType) (argTys : List LNIRType := []) (isLocal : Bool := false)
     (arch : TargetArch := .x86_64) : Option LNIRExpr :=
   match argVars with
-  | [lhs, rhs] =>
-    match tryLowerGfSimdIntrinsic env fnName argVars retTy argTys with
-    | some intr => some intr
-    | none =>
-      if isLocal then none
-      else match lookupCanonicalTypedBinOp? fnName with
-        | some (opTy, op) =>
-          if argTys != [opTy, opTy] then none
-          else .scalar <$> lowerScalarIntrinsicExpr? op lhs rhs opTy retTy arch
-        | none => lowerBoolBinIntrinsic? fnName lhs rhs argTys retTy
-  | [arg] =>
-    if isLocal then none else
-    match canonicalUIntCastMask? fnName argTys retTy arch with
-    | some effMask => some (.scalar (.binOp .bitAnd (.var arg) (.constU64 effMask)))
-    | none => lowerUnaryScalarIntrinsic? fnName arg argTys retTy arch
-  | _ => none
+  | [_, _] =>
+    (tryLowerGfSimdIntrinsic env fnName argVars retTy argTys).orElse fun _ =>
+      RealLCNFBridge.lowerCanonicalIntrinsicPure? fnName argVars retTy argTys isLocal arch
+  | _ => RealLCNFBridge.lowerCanonicalIntrinsicPure? fnName argVars retTy argTys isLocal arch
 
 def lowerNamedCall (fnName : Lean.Name) (args : Array (Lean.Compiler.LCNF.Arg pu)) (retTy : LNIRType) : BridgeM LNIRExpr := do
   let env ← getEnv
@@ -127,9 +87,9 @@ def lowerImpureLetValue (lv : Lean.Compiler.LCNF.LetValue .impure) (retTy : LNIR
 def lowerTagBranch (condVar : VarId) (cidx : Nat) (isBool : Bool) (yes no : LNIRCode) : BridgeM LNIRCode := do
   let condTy ← getVarType condVar
   if isBool || condTy == .i1 then
-    return if cidx == 0 then .ite condVar no yes else if cidx == 1 then .ite condVar yes no else no
+    return (RealLCNFBridge.lowerTagBranchPure condVar condTy cidx isBool 0 yes no).1
   let cmpVar ← freshBridgeVar .i1
-  return .letBind cmpVar .i1 (.scalar (.binOp .eq (.var condVar) (.constU64 cidx.toUInt64))) (.ite cmpVar yes no)
+  return (RealLCNFBridge.lowerTagBranchPure condVar condTy cidx isBool cmpVar yes no).1
 
 mutual
 partial def lowerImpureAlts (condVar : VarId) (isBool : Bool) (idx : Nat) (alts : List (Lean.Compiler.LCNF.Alt .impure))
