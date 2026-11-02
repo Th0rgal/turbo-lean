@@ -349,4 +349,54 @@ def countParForLaunches : LNIRCode → Nat
 def fuseParForDecl (d : LNIRDecl) : LNIRDecl :=
   { d with body := fuseParForCode d.body }
 
+/-- Intra-kernel specialization pass (`specializeKernelCode`, `CodeRefines`-preserving). -/
+def kernelSpecializePass : TransformPass where
+  name := "KernelSpecialize"
+  assurance := .verifiedKernelProof
+  theoremRef := "LeanNative.Proofs.specializeKernelCode_refines"
+  runDecl := fun d =>
+    let inHash := d.structuralHash
+    let body' := specializeKernelCode d.body
+    let changed := body' != d.body
+    let comb := AssuranceLevel.combine d.assurance .verifiedKernelProof
+    let d' : LNIRDecl := { d with body := body', assurance := comb }
+    let outHash := d'.structuralHash
+    (d', {
+      passName := "KernelSpecialize"
+      declName := d.name
+      inputHash := inHash
+      outputHash := outHash
+      changed := changed
+      assurance := comb
+      theoremRef := if changed then "LeanNative.Proofs.specializeKernelCode_refines"
+        else "LeanNative.Semantics.CodeRefines.refl"
+      notes := if changed then "Specialized parFor scalar kernel bodies" else "Unchanged"
+    })
+
+/-- Multi-stage producer-consumer `parFor` loop fusion pass (`fuseParForCode`). -/
+def kernelFusionPass : TransformPass where
+  name := "KernelFusion"
+  assurance := .verifiedKernelProof
+  theoremRef := "LeanNative.Proofs.fuseParForKernels_sound"
+  runDecl := fun d =>
+    let inHash := d.structuralHash
+    let d' := fuseParForDecl d
+    let changed := d'.body != d.body
+    let comb := AssuranceLevel.combine d.assurance .verifiedKernelProof
+    let dOut : LNIRDecl := { d' with assurance := comb }
+    let outHash := dOut.structuralHash
+    (dOut, {
+      passName := "KernelFusion"
+      declName := d.name
+      inputHash := inHash
+      outputHash := outHash
+      changed := changed
+      assurance := comb
+      theoremRef := if changed then "LeanNative.Proofs.fuseParForKernels_sound"
+        else "LeanNative.Semantics.CodeRefines.refl"
+      notes := if changed then
+        s!"Fused parFor launches ({countParForLaunches d.body} -> {countParForLaunches d'.body})"
+      else "No fusible adjacent parFor stages"
+    })
+
 end LeanNative.Transform
