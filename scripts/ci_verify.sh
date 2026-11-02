@@ -8,7 +8,10 @@ export PATH="$ROOT_DIR/target/release:$PATH:$HOME/.elan/toolchains/leanprover--l
 
 TURBO_BIN="${TURBO_AUDITOR_BIN:-$ROOT_DIR/target/release/turbo-lean}"
 if [ ! -x "$TURBO_BIN" ]; then
-  echo "[FAIL] Missing turbo-lean auditor: $TURBO_BIN" >&2
+  TURBO_BIN="$(command -v turbo-lean || true)"
+fi
+if [ -z "$TURBO_BIN" ] || [ ! -x "$TURBO_BIN" ]; then
+  echo "[FAIL] Missing turbo-lean auditor: ${TURBO_AUDITOR_BIN:-$ROOT_DIR/target/release/turbo-lean}" >&2
   exit 1
 fi
 

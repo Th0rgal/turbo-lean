@@ -66,7 +66,7 @@ theorem unbox_box_id (n : BitVec 64) (h : n.toNat < 2 ^ 63) :
     have hnot_lt : ¬(1 + i < 1) := by omega
     have hsub : 1 + i - 1 = i := by omega
     have h1_false : (1#64).getLsbD (1 + i) = false := one64_getLsbD_pos (1 + i) (by omega)
-    simp only [hi, decide_true, Bool.true_and, BitVec.getLsbD_or, h1_false, Bool.or_false,
+    simp only [decide_true, Bool.true_and, BitVec.getLsbD_or, h1_false, Bool.or_false,
       BitVec.getLsbD_shiftLeft, hi1, hnot_lt, decide_false, Bool.not_false, hsub]
   · have hi_eq : i = 63 := by omega
     subst hi_eq
@@ -80,7 +80,7 @@ theorem unbox_box_id (n : BitVec 64) (h : n.toNat < 2 ^ 63) :
       have hb0 := congrArg (fun x => x.getLsbD 0) hshr0
       rw [BitVec.getLsbD_ushiftRight] at hb0
       exact hb0
-    simp only [hi, decide_true, Bool.true_and, hlhs, hrhs]
+    simp only [hlhs, hrhs]
 
 /-- Above `2^63`, `lean_box` truncates bit 63, so `lean_unbox(lean_box(n))` strictly loses information. -/
 theorem unbox_box_ne_of_ge (n : BitVec 64) (h : 2 ^ 63 ≤ n.toNat) :
@@ -210,7 +210,7 @@ theorem packHeader_rc_eq (h : LeanObjectHeader) :
   have h1 : ¬(56 ≤ i ∧ i < 56 + 8) := by omega
   have h2 : ¬(48 ≤ i ∧ i < 48 + 8) := by omega
   have h3 : ¬(32 ≤ i ∧ i < 32 + 16) := by omega
-  rw [if_neg h1, if_neg h2, if_neg h3]
+  rw [ite_eq_right h1, ite_eq_right h2, ite_eq_right h3]
   simp
 
 theorem packHeader_csSz_eq (h : LeanObjectHeader) :
@@ -226,7 +226,7 @@ theorem packHeader_csSz_eq (h : LeanObjectHeader) :
   have h3 : 32 ≤ 32 + i ∧ 32 + i < 32 + 16 := by omega
   have hrc : h.rc.getLsbD (32 + i) = false := BitVec.getLsbD_of_ge h.rc (32 + i) (by omega)
   have hsub : 32 + i - 32 = i := by omega
-  rw [if_neg h1, if_neg h2, if_pos h3, hsub, hrc]
+  rw [ite_eq_right h1, ite_eq_right h2, ite_eq_left h3, hsub, hrc]
   simp
 
 theorem packHeader_other_eq (h : LeanObjectHeader) :
@@ -242,7 +242,7 @@ theorem packHeader_other_eq (h : LeanObjectHeader) :
   have h3 : ¬(32 ≤ 48 + i ∧ 48 + i < 32 + 16) := by omega
   have hrc : h.rc.getLsbD (48 + i) = false := BitVec.getLsbD_of_ge h.rc (48 + i) (by omega)
   have hsub : 48 + i - 48 = i := by omega
-  rw [if_neg h1, if_pos h2, if_neg h3, hsub, hrc]
+  rw [ite_eq_right h1, ite_eq_left h2, ite_eq_right h3, hsub, hrc]
   simp
 
 theorem packHeader_tag_eq (h : LeanObjectHeader) :
@@ -258,7 +258,7 @@ theorem packHeader_tag_eq (h : LeanObjectHeader) :
   have h3 : ¬(32 ≤ 56 + i ∧ 56 + i < 32 + 16) := by omega
   have hrc : h.rc.getLsbD (56 + i) = false := BitVec.getLsbD_of_ge h.rc (56 + i) (by omega)
   have hsub : 56 + i - 56 = i := by omega
-  rw [if_pos h1, if_neg h2, if_neg h3, hsub, hrc]
+  rw [ite_eq_left h1, ite_eq_right h2, ite_eq_right h3, hsub, hrc]
   simp
 
 /-- Unpacking a packed `LeanObjectHeader` recovers all four fields (`m_rc`, `m_cs_sz`, `m_other`, `m_tag`). -/
@@ -284,7 +284,7 @@ theorem pack_unpack_header_id (w : BitVec 64) :
       rw [getLsbD_extractLsb'_of_lt _ _ _ _ (by omega)]
       congr 1
       omega
-    rw [if_pos h1, if_neg h2, if_neg h3, hrc, htag]
+    rw [ite_eq_left h1, ite_eq_right h2, ite_eq_right h3, hrc, htag]
     simp
   · by_cases h48 : 48 ≤ i
     · have h1 : ¬(56 ≤ i ∧ i < 56 + 8) := by omega
@@ -296,7 +296,7 @@ theorem pack_unpack_header_id (w : BitVec 64) :
         rw [getLsbD_extractLsb'_of_lt _ _ _ _ (by omega)]
         congr 1
         omega
-      rw [if_neg h1, if_pos h2, if_neg h3, hrc, hoth]
+      rw [ite_eq_right h1, ite_eq_left h2, ite_eq_right h3, hrc, hoth]
       simp
     · by_cases h32 : 32 ≤ i
       · have h1 : ¬(56 ≤ i ∧ i < 56 + 8) := by omega
@@ -308,7 +308,7 @@ theorem pack_unpack_header_id (w : BitVec 64) :
           rw [getLsbD_extractLsb'_of_lt _ _ _ _ (by omega)]
           congr 1
           omega
-        rw [if_neg h1, if_neg h2, if_pos h3, hrc, hcs]
+        rw [ite_eq_right h1, ite_eq_right h2, ite_eq_left h3, hrc, hcs]
         simp
       · have h1 : ¬(56 ≤ i ∧ i < 56 + 8) := by omega
         have h2 : ¬(48 ≤ i ∧ i < 48 + 8) := by omega
@@ -316,7 +316,7 @@ theorem pack_unpack_header_id (w : BitVec 64) :
         have hrc : (w.extractLsb' 0 32).getLsbD i = w.getLsbD i := by
           rw [getLsbD_extractLsb'_of_lt _ _ _ _ (by omega)]
           simp
-        rw [if_neg h1, if_neg h2, if_neg h3, hrc]
+        rw [ite_eq_right h1, ite_eq_right h2, ite_eq_right h3, hrc]
         simp
 
 /-- Mutating `m_rc` (bytes `[0, 4)`) leaves the upper 32 bits (`m_cs_sz`, `m_other`, `m_tag`) untouched. -/
@@ -342,7 +342,7 @@ theorem update_tag_preserves_prefix_bits (h : LeanObjectHeader) (tag' : BitVec 8
   simp only [Nat.zero_add, packHeader, BitVec.getLsbD_or, getLsbD_zeroExtend_shiftLeft_64 _ _ _ hi64,
     getLsbD_setWidth_64 _ _ hi64]
   have hnot56 : ¬(56 ≤ i ∧ i < 56 + 8) := by omega
-  rw [if_neg hnot56, if_neg hnot56]
+  rw [ite_eq_right hnot56, ite_eq_right hnot56]
 
 /-- Byte offset of each of the 4 `lean_object` header fields (`0 ↦ m_rc`, `1 ↦ m_cs_sz`, `2 ↦ m_other`, `3 ↦ m_tag`). -/
 def headerFieldOffset (f : Fin 4) : Nat :=
@@ -677,7 +677,7 @@ theorem cowWriteField_matches_pureClone_payload (st : HeapState) (objId idx : Na
     by_cases h_rc1 : st.getObjRefCount objId == 1
     · have hrc_val : st.getObjRefCount objId = 1 := of_decide_eq_true h_rc1
       have hnot1 : (st.getObjRefCount objId != 1) = false := by simp [bne, hrc_val]
-      simp only [h_live, Bind.bind, Except.bind, h_rc1, ↓reduceIte]
+      simp only [Bind.bind, Except.bind, h_rc1, ↓reduceIte]
       unfold HeapState.writeHeapObjFieldExclusive HeapState.mutateHeapObjExclusive pureCloneWriteField
       simp only [h_live, Bind.bind, Except.bind, hnot1, Bool.false_eq_true, ↓reduceIte, pure, Except.pure]
       by_cases hwf : isObj && !val.wfField
@@ -710,7 +710,7 @@ theorem cowWriteField_matches_pureClone_payload (st : HeapState) (objId idx : Na
           simp only [List.find?, beq_self_eq_true, Option.map]
           cases isObj <;> simp [updatedObj, ctorPayload]
         · simp [hlt, Except.map]
-    · simp [h_live, Bind.bind, Except.bind, h_rc1]
+    · simp [Bind.bind, Except.bind, h_rc1]
 
 /-- Every successful `cowWriteField` yields an exclusively owned (`rc = 1`) output constructor handle. -/
 theorem cowWriteField_result_exclusive (st : HeapState) (objId idx : Nat) (val : Val) (isObj : Bool)
@@ -728,18 +728,18 @@ theorem cowWriteField_result_exclusive (st : HeapState) (objId idx : Nat) (val :
       simp only [h_live, Bind.bind, Except.bind, h_rc1, ↓reduceIte] at h_ok
       unfold HeapState.writeHeapObjFieldExclusive HeapState.mutateHeapObjExclusive at h_ok
       simp only [h_live, Bind.bind, Except.bind, hnot1, Bool.false_eq_true, ↓reduceIte,
-        pure, Except.pure, throw, throwThe, MonadExceptOf.throw] at h_ok
+        pure, Except.pure] at h_ok
       by_cases hwf : isObj && !val.wfField
-      · simp [hwf, Bind.bind, Except.bind] at h_ok
+      · simp [hwf] at h_ok
       · simp only [hwf, Bool.false_eq_true, ↓reduceIte] at h_ok
         by_cases hlt : idx < (if isObj then obj.objFields else obj.scalarFields).length
-        · simp only [hlt, ↓reduceIte, Bind.bind, Except.bind] at h_ok
+        · simp only [hlt, ↓reduceIte] at h_ok
           injection h_ok with hpair
           injection hpair with hout hst
           subst hout
           subst hst
           exact hrc_val
-        · simp [hlt, Bind.bind, Except.bind] at h_ok
+        · simp [hlt] at h_ok
     · simp only [h_live, Bind.bind, Except.bind, h_rc1, Bool.false_eq_true, ↓reduceIte] at h_ok
       unfold pureCloneWriteField at h_ok
       simp only [h_live, Bind.bind, Except.bind] at h_ok
@@ -778,12 +778,12 @@ theorem cowWriteField_preserves_live_alias (st : HeapState) (objId idx aliasId :
       unfold HeapState.writeHeapObjFieldExclusive HeapState.mutateHeapObjExclusive at h_ok
       have hnot1 : (st.getObjRefCount objId != 1) = false := by simp [bne, hrc_val]
       simp only [h_live, Bind.bind, Except.bind, hnot1, Bool.false_eq_true, ↓reduceIte,
-        pure, Except.pure, throw, throwThe, MonadExceptOf.throw] at h_ok
+        pure, Except.pure] at h_ok
       by_cases hwf : isObj && !val.wfField
-      · simp [hwf, Bind.bind, Except.bind] at h_ok
+      · simp [hwf] at h_ok
       · simp only [hwf, Bool.false_eq_true, ↓reduceIte] at h_ok
         by_cases hlt : idx < (if isObj then obj.objFields else obj.scalarFields).length
-        · simp only [hlt, ↓reduceIte, Bind.bind, Except.bind] at h_ok
+        · simp only [hlt, ↓reduceIte] at h_ok
           injection h_ok with hpair
           injection hpair with _ hst
           subst hst
@@ -805,7 +805,7 @@ theorem cowWriteField_preserves_live_alias (st : HeapState) (objId idx aliasId :
           have ht_id : targetObj.id = objId := by cases isObj <;> simp [targetObj, h_obj_id]
           unfold HeapState.findHeapObj
           exact findHeapObj_map_const_other st.heapObjs objId aliasId targetObj hne ht_id
-        · simp [hlt, Bind.bind, Except.bind] at h_ok
+        · simp [hlt] at h_ok
     · have hrc_ne0 : st.getObjRefCount objId ≠ 0 := by
         unfold HeapState.liveHeapObj at h_live
         intro h0
