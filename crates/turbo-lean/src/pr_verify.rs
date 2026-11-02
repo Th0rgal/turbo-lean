@@ -4379,11 +4379,17 @@ fn dependency_symlink_touches_build(
     false
 }
 
+#[derive(Clone, Copy)]
+struct StatementDependencySpec<'a> {
+    dep: Option<&'a crate::module_builder::PackageConfig>,
+    config_file: Option<&'a str>,
+}
+
 fn materialize_statement_tree(
     repo: &Path,
     rev: &str,
     root: &Path,
-    dep: Option<&crate::module_builder::PackageConfig>,
+    dep_spec: Option<StatementDependencySpec<'_>>,
 ) -> Result<()> {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::os::unix::{
@@ -4468,16 +4474,7 @@ fn materialize_statement_tree(
                 blob.read_to_end(&mut bytes)?;
                 anyhow::ensure!(bytes.len() as u64 == size, "Truncated Git symlink blob");
                 let link = PathBuf::from(std::ffi::OsStr::from_bytes(&bytes));
-                if link.is_absolute() {
-                    if dep.is_none_or(|d| dependency_symlink_touches_build(&rel, d)) {
-                        anyhow::bail!(
-                            "Absolute symlink in statement snapshot: {}",
-                            target.display()
-                        );
-                    }
-                } else {
-                    links.push((rel, target, link));
-                }
+                links.push((rel, target, link));
             } else {
                 let mut file = fs::OpenOptions::new()
                     .write(true)
@@ -4497,10 +4494,47 @@ fn materialize_statement_tree(
             output.read_exact(&mut newline)?;
             anyhow::ensure!(newline == *b"\n", "Invalid Git batch blob terminator");
         }
+        let mut dep_config = None;
+        if let Some(spec) = dep_spec.filter(|spec| spec.dep.is_none()) {
+            let cfg_path = crate::module_builder::package_config_path(root, spec.config_file)?;
+            dep_config = Some(
+                match cfg_path
+                    .as_ref()
+                    .and_then(|p| p.extension())
+                    .and_then(|e| e.to_str())
+                {
+                    Some("lean") => crate::module_builder::parse_lakefile_lean(
+                        root,
+                        cfg_path.as_ref().unwrap(),
+                        false,
+                    )?,
+                    Some("toml") => crate::module_builder::parse_lakefile_toml(
+                        root,
+                        cfg_path.as_ref().unwrap(),
+                        false,
+                    )?,
+                    _ => anyhow::bail!(
+                        "No static Lake configuration (`{}.lean` or `.toml`) found in {}: fail-closed static Lake config gate",
+                        spec.config_file.unwrap_or("lakefile"),
+                        root.display()
+                    ),
+                },
+            );
+        }
+        let dep = dep_spec.and_then(|spec| spec.dep).or(dep_config.as_ref());
         // Create links only after every regular file has been written, so even
         // malformed trees cannot redirect writes. Validate actual resolution,
         // including link chains and `..` traversing another symlink.
-        for (_, target, link) in &links {
+        for (rel, target, link) in &links {
+            if link.is_absolute() {
+                if dep.is_none_or(|d| dependency_symlink_touches_build(rel, d)) {
+                    anyhow::bail!(
+                        "Absolute symlink in statement snapshot: {}",
+                        target.display()
+                    );
+                }
+                continue;
+            }
             ensure_statement_snapshot_path(root, target)?;
             symlink(link, target)?;
         }
@@ -4939,7 +4973,214 @@ fn seed_statement_dependencies(
             dep.name,
             String::from_utf8_lossy(&out.stderr)
         );
-        materialize_statement_tree(&target, "HEAD", &target, Some(dep))?;
+        materialize_statement_tree(
+            &target,
+            "HEAD",
+            &target,
+            Some(StatementDependencySpec {
+                dep: Some(dep),
+                config_file: None,
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+fn seed_base_statement_dependencies(
+    base_project: &Path,
+    head_project: &Path,
+    head_cfg: &crate::module_builder::ProjectConfig,
+) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    seed_statement_dependencies(base_project, head_cfg)?;
+    let (_, manifest_packages, _) = crate::module_builder::parse_lake_manifest(base_project, true)?;
+    let canon_head = head_project
+        .canonicalize()
+        .unwrap_or_else(|_| head_project.to_path_buf());
+    for mp in manifest_packages {
+        let target = mp.dir;
+        ensure_statement_snapshot_path(base_project, &target)?;
+        if target.exists() {
+            continue;
+        }
+        let rel = target.strip_prefix(base_project)?;
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let local_cand = head_project.join(rel);
+        if fs::symlink_metadata(&local_cand)
+            .map(|m| m.is_dir() && !m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            let source = local_cand.canonicalize()?;
+            anyhow::ensure!(
+                source.is_absolute() && source.is_dir() && source.starts_with(&canon_head),
+                "Statement dependency {} resolves outside head project",
+                mp.name
+            );
+            let clone_rev = match mp.rev.as_deref().filter(|r| !r.is_empty()) {
+                Some(rev) => {
+                    anyhow::ensure!(
+                        !rev.starts_with('-'),
+                        "Invalid base manifest dependency revision for {}",
+                        mp.name
+                    );
+                    rev
+                }
+                None => "HEAD",
+            };
+            let out = crate::trusted_tools::git(base_project)?
+                .env("GIT_ALLOW_PROTOCOL", "file")
+                .args(["clone", "--local"])
+                .args(["--quiet", "--no-hardlinks", "--no-checkout", "--template="])
+                .arg("--")
+                .arg(&source)
+                .arg(&target)
+                .current_dir("/")
+                .output()?;
+            anyhow::ensure!(
+                out.status.success(),
+                "Cannot seed offline base statement dependency {}: {}",
+                mp.name,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            materialize_statement_tree(
+                &target,
+                clone_rev,
+                &target,
+                Some(StatementDependencySpec {
+                    dep: None,
+                    config_file: mp.config_file.as_deref(),
+                }),
+            )?;
+            continue;
+        }
+        if mp.pkg_type == "git" {
+            let rev = mp.rev.as_deref().unwrap_or("");
+            anyhow::ensure!(
+                !rev.is_empty()
+                    && !rev.starts_with('-')
+                    && matches!(rev.len(), 40 | 64)
+                    && rev.bytes().all(|b| b.is_ascii_hexdigit()),
+                "Base manifest git dependency {} lacks a pinned hex commit SHA: {:?}",
+                mp.name,
+                mp.rev
+            );
+            let url = mp.url.as_deref().unwrap_or("");
+            let protocol = if url.starts_with("https://") {
+                "https"
+            } else if url.starts_with("file://") {
+                "file"
+            } else {
+                anyhow::bail!(
+                    "Unsupported base manifest git dependency URL for {}: {:?}",
+                    mp.name,
+                    mp.url
+                );
+            };
+            anyhow::ensure!(
+                !url.starts_with('-'),
+                "Invalid base manifest git dependency URL for {}",
+                mp.name
+            );
+            struct ScratchRepoGuard(PathBuf);
+            impl Drop for ScratchRepoGuard {
+                fn drop(&mut self) {
+                    let _ = fs::remove_dir_all(&self.0);
+                }
+            }
+            let scratch = loop {
+                let path = Path::new("/tmp").join(format!(
+                    "turbo-base-dep-{}-{}",
+                    std::process::id(),
+                    pack::next_tmp_id()
+                ));
+                match fs::DirBuilder::new().mode(0o700).create(&path) {
+                    Ok(()) => break ScratchRepoGuard(path),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            };
+            let init = crate::trusted_tools::git(base_project)?
+                .args(["init", "--bare", "--quiet"])
+                .arg(&scratch.0)
+                .current_dir("/")
+                .output()?;
+            anyhow::ensure!(
+                init.status.success(),
+                "Cannot initialize scratch repo for base dependency {}: {}",
+                mp.name,
+                String::from_utf8_lossy(&init.stderr)
+            );
+            let fetch = crate::trusted_tools::git(base_project)?
+                .env("GIT_ALLOW_PROTOCOL", protocol)
+                .arg("-C")
+                .arg(&scratch.0)
+                .args(["fetch", "--quiet", "--depth=1", "--no-tags", "--", url, rev])
+                .current_dir("/")
+                .output()?;
+            anyhow::ensure!(
+                fetch.status.success(),
+                "Cannot fetch pinned base statement dependency {} ({rev}): {}",
+                mp.name,
+                String::from_utf8_lossy(&fetch.stderr)
+            );
+            let parsed = crate::trusted_tools::git(base_project)?
+                .arg("-C")
+                .arg(&scratch.0)
+                .args(["rev-parse", "FETCH_HEAD"])
+                .current_dir("/")
+                .output()?;
+            anyhow::ensure!(
+                parsed.status.success(),
+                "Cannot verify fetched commit for base statement dependency {}: {}",
+                mp.name,
+                String::from_utf8_lossy(&parsed.stderr)
+            );
+            let fetched_rev = std::str::from_utf8(&parsed.stdout)?.trim();
+            anyhow::ensure!(
+                fetched_rev.eq_ignore_ascii_case(rev),
+                "Fetched commit mismatch for base statement dependency {}: expected {rev}, got {fetched_rev}",
+                mp.name
+            );
+            let update_head = crate::trusted_tools::git(base_project)?
+                .arg("-C")
+                .arg(&scratch.0)
+                .args(["update-ref", "--no-deref", "HEAD", fetched_rev])
+                .current_dir("/")
+                .output()?;
+            anyhow::ensure!(
+                update_head.status.success(),
+                "Cannot pin HEAD in scratch repo for base statement dependency {}: {}",
+                mp.name,
+                String::from_utf8_lossy(&update_head.stderr)
+            );
+            let clone_out = crate::trusted_tools::git(base_project)?
+                .env("GIT_ALLOW_PROTOCOL", "file")
+                .args(["clone", "--local"])
+                .args(["--quiet", "--no-hardlinks", "--no-checkout", "--template="])
+                .arg("--")
+                .arg(&scratch.0)
+                .arg(&target)
+                .current_dir("/")
+                .output()?;
+            anyhow::ensure!(
+                clone_out.status.success(),
+                "Cannot clone offline base statement dependency {}: {}",
+                mp.name,
+                String::from_utf8_lossy(&clone_out.stderr)
+            );
+            materialize_statement_tree(
+                &target,
+                fetched_rev,
+                &target,
+                Some(StatementDependencySpec {
+                    dep: None,
+                    config_file: mp.config_file.as_deref(),
+                }),
+            )?;
+        }
     }
     Ok(())
 }
@@ -5493,7 +5734,7 @@ fn kernel_statement_changes_with_trust(
     ensure_statement_lake_project(&base_project)?;
     if let Some(cfg) = untrusted_cfg {
         clear_untrusted_statement_build_products(&base_project)?;
-        seed_statement_dependencies(&base_project, cfg)?;
+        seed_base_statement_dependencies(&base_project, project, cfg)?;
     }
     let head_snapshot = if is_untrusted || !crate::lake_build::has_lake_config(project) {
         let snapshot = StatementSnapshot::at(&repo, "HEAD")?;
@@ -7245,14 +7486,14 @@ globs = ["Corpus.+"]
         )?;
         fs::write(dep_repo.join("docs/real.txt"), "kept\n")?;
         symlink(
-            "/home/kev/work/clifv-wt/publish-stack/lnsym-upstream",
+            "/nonexistent/upstream-worktree/lnsym-upstream",
             dep_repo.join("lnsym-upstream"),
         )?;
         symlink("../../../etc/passwd", dep_repo.join("docs/escape-link"))?;
         symlink("nonexistent-target", dep_repo.join("docs/dangling-link"))?;
         symlink("dangling-link", dep_repo.join("docs/chained-dangling"))?;
         symlink("real.txt", dep_repo.join("docs/valid-link"))?;
-        git_init_and_commit(&dep_repo, "clifv-like dep with non-lean broken symlinks")?;
+        git_init_and_commit(&dep_repo, "dep with non-lean broken symlinks")?;
 
         let cfg = crate::module_builder::resolve_project_config_with_trust(&root_proj, true)?;
         let snap = dir.join("snap-ok");
@@ -7264,37 +7505,15 @@ globs = ["Corpus.+"]
             fs::read_to_string(seeded.join("docs/valid-link"))?,
             "kept\n"
         );
-        for omitted in [
+        for bad in [
             "lnsym-upstream",
             "docs/escape-link",
             "docs/dangling-link",
             "docs/chained-dangling",
         ] {
             assert!(
-                fs::symlink_metadata(seeded.join(omitted)).is_err(),
-                "unsafe non-build symlink `{omitted}` must not exist on disk"
-            );
-        }
-
-        let live_fv_snap = dir.join("snap-live-fv");
-        fs::create_dir_all(&live_fv_snap)?;
-        let repo_lean = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lean");
-        if repo_lean.join(".lake/packages/fv/.git").exists() {
-            let live_cfg =
-                crate::module_builder::resolve_project_config_with_trust(&repo_lean, true)?;
-            seed_statement_dependencies(&live_fv_snap, &live_cfg)?;
-            assert!(
-                fs::symlink_metadata(live_fv_snap.join(".lake/packages/fv/lnsym-upstream"))
-                    .is_err(),
-                "upstream broken absolute symlink in clifv must be omitted"
-            );
-            assert!(
-                live_fv_snap
-                    .join(".lake/packages/fv/FV/Basic.lean")
-                    .exists()
-                    || live_fv_snap
-                        .join(".lake/packages/fv/lakefile.toml")
-                        .is_file()
+                fs::symlink_metadata(seeded.join(bad)).is_err(),
+                "unsafe non-build symlink `{bad}` must not exist on disk"
             );
         }
 
@@ -7321,6 +7540,167 @@ globs = ["Corpus.+"]
             git_init_and_commit(&dep_repo, &format!("cleanup {bad_rel}"))?;
         }
         fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn untrusted_kernel_statements_materialize_removed_base_manifest_git_dependencies() -> Result<()>
+    {
+        use std::os::unix::fs::symlink;
+        if crate::module_builder::probe_bwrap_sandbox(Path::new(".")).is_none() {
+            println!("untrusted removed base dependency fixture skipped: no working bubblewrap");
+            return Ok(());
+        }
+        let dir = Path::new("/tmp").join(format!(
+            "turbo-removed-base-dep-{}-{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        struct DirGuard(PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = DirGuard(dir.clone());
+
+        let upstream_fv = dir.join("upstream-fv");
+        fs::create_dir_all(upstream_fv.join("FV"))?;
+        fs::create_dir_all(upstream_fv.join("docs"))?;
+        fs::write(
+            upstream_fv.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )?;
+        fs::write(
+            upstream_fv.join("lakefile.toml"),
+            r#"name = "fv"
+defaultTargets = ["FV"]
+[[lean_lib]]
+name = "FV"
+globs = ["FV.+"]
+"#,
+        )?;
+        fs::write(
+            upstream_fv.join("FV/Basic.lean"),
+            "namespace FV\ndef val : Nat := 1\nend FV\n",
+        )?;
+        fs::write(upstream_fv.join("docs/real.txt"), "kept\n")?;
+        symlink(
+            "/nonexistent/upstream-worktree/lnsym-upstream",
+            upstream_fv.join("lnsym-upstream"),
+        )?;
+        symlink("nonexistent-target", upstream_fv.join("docs/dangling-link"))?;
+        symlink("../../../etc/passwd", upstream_fv.join("docs/escape-link"))?;
+        git_init_and_commit(&upstream_fv, "fv release with non-build broken symlinks")?;
+        let fv_rev_out = crate::trusted_tools::git(&upstream_fv)?
+            .arg("-C")
+            .arg(&upstream_fv)
+            .args(["rev-parse", "HEAD"])
+            .output()?;
+        assert!(fv_rev_out.status.success());
+        let fv_rev = std::str::from_utf8(&fv_rev_out.stdout)?.trim().to_string();
+        let fv_url = format!("file://{}", upstream_fv.canonicalize()?.display());
+
+        let repo = dir.join("repo");
+        let proj = repo.join("lean");
+        fs::create_dir_all(proj.join("Demo"))?;
+        fs::write(repo.join(".gitignore"), "lean/.lake/\n")?;
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            proj.join("lakefile.lean"),
+            format!(
+                r#"import Lake
+open Lake DSL
+
+package «demo-pkg»
+
+require fv from git
+  "{fv_url}" @ "{fv_rev}"
+
+@[default_target]
+lean_lib Demo where
+  globs := #[.submodules `Demo]
+"#
+            ),
+        )?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            format!(
+                r#"{{
+  "version": "1.3.0",
+  "packagesDir": ".lake/packages",
+  "packages": [
+    {{
+      "url": "{fv_url}",
+      "type": "git",
+      "subDir": null,
+      "scope": "",
+      "rev": "{fv_rev}",
+      "name": "fv",
+      "manifestFile": "lake-manifest.json",
+      "inputRev": "{fv_rev}",
+      "inherited": false,
+      "configFile": "lakefile.toml"
+    }}
+  ],
+  "name": "«demo-pkg»",
+  "lakeDir": ".lake",
+  "fixedToolchain": false
+}}"#
+            ),
+        )?;
+        fs::write(
+            proj.join("Demo/Keep.lean"),
+            "theorem keep : (1 : Nat) = 1 := rfl\n",
+        )?;
+        fs::write(
+            proj.join("Demo/OldFv.lean"),
+            "import FV.Basic\ntheorem old_fv : FV.val = 1 := rfl\n",
+        )?;
+        git_init_and_commit(&repo, "base with fv dependency")?;
+        let base_rev_out = crate::trusted_tools::git(&repo)?
+            .arg("-C")
+            .arg(&repo)
+            .args(["rev-parse", "HEAD"])
+            .output()?;
+        assert!(base_rev_out.status.success());
+        let base_rev = std::str::from_utf8(&base_rev_out.stdout)?
+            .trim()
+            .to_string();
+
+        fs::remove_file(proj.join("Demo/OldFv.lean"))?;
+        fs::write(
+            proj.join("lakefile.lean"),
+            r#"import Lake
+open Lake DSL
+
+package «demo-pkg»
+
+@[default_target]
+lean_lib Demo where
+  globs := #[.submodules `Demo]
+"#,
+        )?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            r#"{
+  "version": "1.3.0",
+  "packagesDir": ".lake/packages",
+  "packages": [],
+  "name": "«demo-pkg»",
+  "lakeDir": ".lake",
+  "fixedToolchain": false
+}"#,
+        )?;
+        git_commit_all(&repo, "remove fv dependency in HEAD")?;
+        assert!(!proj.join(".lake/packages/fv").exists());
+
+        let head_cfg = crate::module_builder::resolve_project_config_with_trust(&proj, true)?;
+        assert!(head_cfg.dep_pkgs.is_empty());
+        let store = TurboStore::open(Some(&dir.join("store")))?;
+        let changed =
+            kernel_statement_changes_with_trust(&store, &proj, &base_rev, None, Some(&head_cfg))?;
+        assert_eq!(changed, vec!["Demo/OldFv.lean::old_fv (deleted)"]);
         Ok(())
     }
 

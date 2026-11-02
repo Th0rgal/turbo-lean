@@ -3,7 +3,7 @@ mod corpus;
 use std::{collections::BTreeSet, fs, process::Command};
 
 /// Heavy A0d integration test, intentionally not #[ignore]: the existing cargo test --release
-/// CI step runs every baseline and every mutant. No clifv checkout/build or network is needed.
+/// CI step runs every baseline and every mutant. Self-contained; no external checkout or network is needed.
 #[test]
 fn heavy_check_decl_corpus_stock_lean_verdict_parity() {
     let tmp = corpus::Temp::new("verdict");

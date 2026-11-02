@@ -1,7 +1,7 @@
 import Std
 
--- Minimized from eth-act/clifv@5018b95 FV/Backend/Proof/CSemRename.lean
--- (ispec_mapRegs), and FV/Arm/BitVec.lean (private/protected lemmas, local attributes).
+-- Minimized from FV/Backend/Proof/CSemRename.lean (ispec_mapRegs) and
+-- FV/Arm/BitVec.lean (private/protected lemmas, local attributes).
 namespace Corpus.Commands
 set_option maxHeartbeats 4000000 in
 theorem option_line (n : Nat) : n + 0 = n
