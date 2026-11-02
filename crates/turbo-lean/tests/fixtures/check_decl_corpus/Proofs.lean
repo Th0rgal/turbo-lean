@@ -2,7 +2,7 @@ import Std
 import Std.Tactic.BVDecide
 
 namespace Corpus.Proofs
--- eth-act/clifv@5018b95 FV/Arm/Memory/MemoryProofs.lean: helper chains of `have`.
+-- FV/Arm/Memory/MemoryProofs.lean: helper chains of `have`.
 theorem have_chain (a b c : Nat) (hab : a ≤ b) (hbc : b ≤ c) : a ≤ c
 -- CORPUS-PROOF Corpus.Proofs.have_chain
 := by

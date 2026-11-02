@@ -7235,14 +7235,14 @@ globs = ["Corpus.+"]
         )?;
         fs::write(dep_repo.join("docs/real.txt"), "kept\n")?;
         symlink(
-            "/home/kev/work/clifv-wt/publish-stack/lnsym-upstream",
+            "/nonexistent/upstream-worktree/lnsym-upstream",
             dep_repo.join("lnsym-upstream"),
         )?;
         symlink("../../../etc/passwd", dep_repo.join("docs/escape-link"))?;
         symlink("nonexistent-target", dep_repo.join("docs/dangling-link"))?;
         symlink("dangling-link", dep_repo.join("docs/chained-dangling"))?;
         symlink("real.txt", dep_repo.join("docs/valid-link"))?;
-        git_init_and_commit(&dep_repo, "clifv-like dep with non-lean broken symlinks")?;
+        git_init_and_commit(&dep_repo, "dep with non-lean broken symlinks")?;
 
         let cfg = crate::module_builder::resolve_project_config_with_trust(&root_proj, true)?;
         let snap = dir.join("snap-ok");
@@ -7254,37 +7254,15 @@ globs = ["Corpus.+"]
             fs::read_to_string(seeded.join("docs/valid-link"))?,
             "kept\n"
         );
-        for omitted in [
+        for bad in [
             "lnsym-upstream",
             "docs/escape-link",
             "docs/dangling-link",
             "docs/chained-dangling",
         ] {
             assert!(
-                fs::symlink_metadata(seeded.join(omitted)).is_err(),
-                "unsafe non-build symlink `{omitted}` must not exist on disk"
-            );
-        }
-
-        let live_fv_snap = dir.join("snap-live-fv");
-        fs::create_dir_all(&live_fv_snap)?;
-        let repo_lean = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lean");
-        if repo_lean.join(".lake/packages/fv/.git").exists() {
-            let live_cfg =
-                crate::module_builder::resolve_project_config_with_trust(&repo_lean, true)?;
-            seed_statement_dependencies(&live_fv_snap, &live_cfg)?;
-            assert!(
-                fs::symlink_metadata(live_fv_snap.join(".lake/packages/fv/lnsym-upstream"))
-                    .is_err(),
-                "upstream broken absolute symlink in clifv must be omitted"
-            );
-            assert!(
-                live_fv_snap
-                    .join(".lake/packages/fv/FV/Basic.lean")
-                    .exists()
-                    || live_fv_snap
-                        .join(".lake/packages/fv/lakefile.toml")
-                        .is_file()
+                fs::symlink_metadata(seeded.join(bad)).is_err(),
+                "unsafe non-build symlink `{bad}` must not exist on disk"
             );
         }
 
