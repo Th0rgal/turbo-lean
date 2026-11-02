@@ -3,6 +3,9 @@
   "comment": "Pinned target-side inventory for scripts/check_shadow_semantics.lean (Track B0 spec v4, deliverable 3). Code-owner review is requested via .github/CODEOWNERS but NOT enforced until a ruleset requires it (docs/SHADOW_SEMANTICS.md, Enforcement); the checker itself refuses any inventory that drops an entry present in the base revision or in its hard-coded minimum.",
   "modules": [
     "LeanNative.Backend.Semantics",
+    "LeanNative.Backend.StableHLOAst",
+    "LeanNative.Backend.StableHLOAst.Syntax",
+    "LeanNative.Backend.StableHLOAst.Eval",
     "LeanNative.IR.LCNF",
     "TurboLean.ConLeche"
   ],
@@ -10,13 +13,20 @@
     "LeanMLIR",
     "LNSym",
     "ConLeche",
-    "LCNF"
+    "LCNF",
+    "LeanNative.Backend.StableHLOAst"
   ],
   "namespace_owners": {
     "LeanMLIR": ["LeanNative.Backend.Semantics"],
     "LNSym": ["LeanNative.Backend.Semantics"],
     "ConLeche": ["TurboLean.ConLeche"],
-    "LCNF": ["LeanNative.IR.LCNF"]
+    "LCNF": ["LeanNative.IR.LCNF"],
+    "LeanNative.Backend.StableHLOAst": [
+      "LeanNative.Backend.StableHLOAst",
+      "LeanNative.Backend.StableHLOAst.Syntax",
+      "LeanNative.Backend.StableHLOAst.Eval",
+      "LeanNative.Backend.StableHLOAst.Proofs"
+    ]
   },
   "proof_module_prefixes": [
     "LeanNative.Proofs"
