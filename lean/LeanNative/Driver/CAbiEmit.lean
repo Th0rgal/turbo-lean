@@ -634,7 +634,8 @@ private def cTypeToSwiftType (cTy : String) : String :=
   else if cTy == "int16_t" then "Int16"
   else if cTy == "uint32_t" then "UInt32"
   else if cTy == "int32_t" then "Int32"
-  else if cTy == "uint64_t" || cTy == "size_t" then "UInt64"
+  else if cTy == "uint64_t" then "UInt64"
+  else if cTy == "size_t" then "Int"
   else if cTy == "int64_t" then "Int64"
   else if cTy == "float" then "Float"
   else if cTy == "double" then "Double"
@@ -643,6 +644,8 @@ private def cTypeToSwiftType (cTy : String) : String :=
   else if cTy == "uint8_t*" then "UnsafeMutablePointer<UInt8>?"
   else if cTy == "const uint64_t*" then "UnsafePointer<UInt64>?"
   else if cTy == "uint64_t*" then "UnsafeMutablePointer<UInt64>?"
+  else if cTy == "const double*" then "UnsafePointer<Double>?"
+  else if cTy == "double*" then "UnsafeMutablePointer<Double>?"
   else if cTy == "void*" then "UnsafeMutableRawPointer?"
   else "UnsafeRawPointer?"
 
@@ -974,19 +977,24 @@ structure C99ZeroCopySliceIoCall where
   deriving DecidableEq, Inhabited
 
 /-- Proposition characterizing a valid width-aware zero-copy input/output byte-slice ABI call:
-    non-null pointers for non-empty spans, target address-space (`LP64` vs `wasm32`) and backing-buffer
-    no-overflow, and non-aliasing (`disjoint`) whenever both input and output spans are non-empty. -/
+    non-null pointers for non-empty spans, `uintptr_t`/`size_t` representability (`≤ width.maxAddr`),
+    target address-space (`≤ width.addrLimit`) and backing-buffer no-overflow, and non-aliasing
+    (`disjoint`) whenever both input and output spans are non-empty. -/
 def validZeroCopySliceIoCall (c : C99ZeroCopySliceIoCall) : Prop :=
   (match c.inPtr with
    | none => c.inLen = 0
    | some ip =>
      (c.inLen = 0 ∨ ip ≠ 0) ∧
+     ip ≤ c.width.maxAddr ∧
+     c.inLen ≤ c.width.maxAddr ∧
      ip + c.inLen ≤ c.mem.size ∧
      ip + c.inLen ≤ c.width.addrLimit) ∧
   (match c.outPtr with
    | none => c.outCap = 0
    | some op =>
      (c.outCap = 0 ∨ op ≠ 0) ∧
+     op ≤ c.width.maxAddr ∧
+     c.outCap ≤ c.width.maxAddr ∧
      op + c.outCap ≤ c.mem.size ∧
      op + c.outCap ≤ c.width.addrLimit) ∧
   (match c.inPtr, c.outPtr with
@@ -1000,12 +1008,14 @@ def validateZeroCopySliceIoCall (c : C99ZeroCopySliceIoCall) : Bool :=
     | none => c.inLen == 0
     | some ip =>
       (c.inLen == 0 || ip != 0) &&
+      decide (ip ≤ c.width.maxAddr) && decide (c.inLen ≤ c.width.maxAddr) &&
       decide (ip ≤ c.mem.size) && decide (c.inLen ≤ c.mem.size - ip) &&
       decide (ip ≤ c.width.addrLimit) && decide (c.inLen ≤ c.width.addrLimit - ip)
   let outOk := match c.outPtr with
     | none => c.outCap == 0
     | some op =>
       (c.outCap == 0 || op != 0) &&
+      decide (op ≤ c.width.maxAddr) && decide (c.outCap ≤ c.width.maxAddr) &&
       decide (op ≤ c.mem.size) && decide (c.outCap ≤ c.mem.size - op) &&
       decide (op ≤ c.width.addrLimit) && decide (c.outCap ≤ c.width.addrLimit - op)
   let aliasOk := match c.inPtr, c.outPtr with

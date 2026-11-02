@@ -294,9 +294,12 @@ def sampleZeroCopySliceSig : CAbiBindingSig :=
 #guard ((emitCAbiRustFromSigs [sampleZeroCopySliceSig]).splitOn
   "pub fn lean_native_orb_wire_step_slice(in_ptr: *const u8, in_len: usize, out_ptr: *mut u8, out_cap: usize) -> i64;").length > 1
 #guard ((emitCAbiSwiftFromSigs [sampleZeroCopySliceSig]).splitOn
-  "UnsafePointer<UInt8>?").length > 1
-#guard ((emitCAbiSwiftFromSigs [sampleZeroCopySliceSig]).splitOn
-  "UnsafeMutablePointer<UInt8>?").length > 1
+  "_ in_ptr: UnsafePointer<UInt8>?, _ in_len: Int, _ out_ptr: UnsafeMutablePointer<UInt8>?, _ out_cap: Int").length > 1
+#guard ((emitCAbiSwiftFromSigs [
+    { cSymbol := "ln_f64_step", leanName := "lnF64Step",
+      params := [("src", "const double*", "*const f64"), ("dst", "double*", "*mut f64")],
+      retCType := "void", retRustType := "()" }]).splitOn
+  "_ src: UnsafePointer<Double>?, _ dst: UnsafeMutablePointer<Double>?").length > 1
 
 def bundleStructsForClang : List (String × List C99FieldSpec) :=
   [ ("lean_native_flat_slice_t", flatSliceFieldSpecs),

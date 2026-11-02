@@ -232,6 +232,7 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.HybridCAbi.globalThreadId_bijection
   , ``LeanNative.Proofs.HybridCAbi.validateHybridDispatch_sound
   , ``LeanNative.Proofs.HybridCAbi.validateZeroCopySliceIoCall_sound
+  , ``LeanNative.Proofs.HybridCAbi.zeroCopySpanFitsU64_iff_addrLimit
   , ``LeanNative.Proofs.HybridCAbi.spliceOutputSlice_size
   , ``LeanNative.Proofs.HybridCAbi.spliceOutputSlice_extract_written
   , ``LeanNative.Proofs.HybridCAbi.spliceOutputSlice_preserves_prefix

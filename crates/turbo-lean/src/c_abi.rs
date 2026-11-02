@@ -1906,7 +1906,27 @@ mod tests {
         assert!(!verify_zero_copy_slice_io(4096, 64, 0, 64, 0, false));
         // Overlapping input/output slices are rejected
         assert!(!verify_zero_copy_slice_io(4096, 64, 4128, 128, 32, false));
-        // 32-bit wasm32 ceiling overflow (4 GiB) rejected in 32-bit mode, admitted in LP64
+        // Exact top-of-memory slices: [0xFFFFFFF0, 2^32) on wasm32 and [u64::MAX, 2^64) on LP64 admitted
+        assert!(verify_zero_copy_slice_io(
+            0xFFFF_FFF0,
+            16,
+            8192,
+            128,
+            16,
+            true
+        ));
+        assert!(verify_zero_copy_slice_io(
+            0xFFFF_FFFF,
+            1,
+            8192,
+            128,
+            1,
+            true
+        ));
+        assert!(verify_zero_copy_slice_io(u64::MAX, 1, 8192, 128, 1, false));
+        assert!(!verify_zero_copy_slice_io(u64::MAX, 2, 8192, 128, 1, false));
+        // 32-bit size_t overflow (len == 2^32) and 4 GiB ceiling overflow rejected in wasm32 mode
+        assert!(!verify_zero_copy_slice_io(0, 1 << 32, 8192, 128, 0, true));
         assert!(!verify_zero_copy_slice_io(
             4_294_967_280,
             32,
