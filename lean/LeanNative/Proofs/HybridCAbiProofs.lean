@@ -185,7 +185,7 @@ theorem marshal_unmarshal_byte_slice_roundtrip (v : C99ByteView)
       rw [ByteArray.size_extract]
       omega
     have hcond : v.base + (v.bytes.extract v.base (v.base + v.len * v.elemSize)).size ≤ v.bytes.size := by omega
-    rw [ite_cond_eq_true _ _ (eq_true hcond)]
+    rw [ite_eq_left_iff.mpr fun h => absurd hcond h]
     congr 1
     apply ByteArray.ext
     rw [ByteArray.data_append, ByteArray.data_append, ByteArray.data_extract,
@@ -225,7 +225,7 @@ theorem marshal_unmarshal_float_slice_roundtrip (v : C99FloatView)
       simp [Array.size_extract]
       omega
     have hcond : v.base + (v.floats.data.extract v.base (v.base + v.len)).size ≤ v.floats.size := by omega
-    rw [ite_cond_eq_true _ _ (eq_true hcond)]
+    rw [ite_eq_left_iff.mpr fun h => absurd hcond h]
     congr 1
     apply FloatArray.ext
     change v.floats.data.extract 0 v.base ++
