@@ -405,9 +405,11 @@ def execHybridTransferLifecycle (mode : TransferMode) (b : DeviceBufferDesc) (st
   releaseBufferStep mode b stSynced
 
 /-- Operational RC conservation predicate over `HeapState`: for any heap containing `buf₀` at `b.bufId`
-    with `getBufRefCount = b.rc`, `execHybridTransferLifecycle` succeeds, elevates `rc` to `b.rc + 1 ≥ 2`
-    while active, and restores `b.rc` (with `exclusive = true` and `b.rc = 1` on mutable outputs) upon release. -/
+    with `getBufRefCount = b.rc` and geometry `bufferGeometryOk b = true`, `execHybridTransferLifecycle`
+    succeeds, elevates `rc` to `b.rc + 1 ≥ 2` while active, and restores `b.rc` (with `exclusive = true`
+    and `b.rc = 1` on mutable outputs) upon release. -/
 def rcConserved (b : DeviceBufferDesc) : Prop :=
+  bufferGeometryOk b = true →
   ∀ (st : HeapState) (buf₀ : ArrayBuffer),
     st.findBuffer b.bufId = some buf₀ →
     st.getBufRefCount buf₀ = b.rc →
@@ -419,6 +421,7 @@ def rcConserved (b : DeviceBufferDesc) : Prop :=
       stPinned.getBufRefCount bufPinned = b.rc + 1 ∧
       2 ≤ stPinned.getBufRefCount bufPinned ∧
       stFinal.getBufRefCount bufFinal = b.rc ∧
+      bufFinal.data = buf₀.data ∧
       (isMutableTransfer b.direction = true → bufFinal.exclusive = true ∧ b.rc = 1)
 
 /-- Launch request checked by `validateHybridDispatch`. -/

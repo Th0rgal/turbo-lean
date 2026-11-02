@@ -17,6 +17,7 @@ import LeanNative.Transform.EqSat
 import LeanNative.Transform.LoopSchedule
 import LeanNative.Transform.OwnershipRC
 import LeanNative.Backend.FastCheck
+import LeanNative.Proofs.HybridCAbiProofs
 
 namespace LeanNative.Proofs
 
@@ -173,6 +174,19 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.mutant2_exclusivity_violation_killed
   , ``LeanNative.Proofs.mutant3_algebraic_swap_killed
   , ``LeanNative.Proofs.all_three_mandatory_mutants_killed
+  , ``LeanNative.Proofs.HybridCAbi.computeC99StructLayout_sound
+  , ``LeanNative.Proofs.HybridCAbi.computeC99StructLayout_field_align_dvd
+  , ``LeanNative.Proofs.HybridCAbi.checkedByteLen_no_overflow
+  , ``LeanNative.Proofs.HybridCAbi.checkedStridedSpan_no_overflow
+  , ``LeanNative.Proofs.HybridCAbi.marshal_unmarshal_byte_slice_roundtrip
+  , ``LeanNative.Proofs.HybridCAbi.marshal_unmarshal_float_slice_roundtrip
+  , ``LeanNative.Proofs.HybridCAbi.validateC99Slice_sound
+  , ``LeanNative.Proofs.HybridCAbi.disjointBuffers_elemByteAddr_ne
+  , ``LeanNative.Proofs.HybridCAbi.execHybridTransferLifecycle_active_live
+  , ``LeanNative.Proofs.HybridCAbi.execHybridTransferLifecycle_preserves_rc
+  , ``LeanNative.Proofs.HybridCAbi.execHybridTransferLifecycle_exclusive_out
+  , ``LeanNative.Proofs.HybridCAbi.ownershipOk_implies_rcConserved
+  , ``LeanNative.Proofs.HybridCAbi.validateHybridDispatch_sound
   ]
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/

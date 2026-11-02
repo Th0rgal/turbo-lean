@@ -3,10 +3,12 @@ import LeanNative.Backend.Hybrid
 import LeanNative.Backend.Metal
 import LeanNative.Backend.MLIRGPU
 import LeanNative.Proofs.HybridCAbiProofs
+import LeanNative.Semantics.Value
 
 namespace LeanNative.Tests.HybridCAbiTests
 
 open LeanNative.IR
+open LeanNative.Semantics
 open LeanNative.Driver.CoreCLI
 open LeanNative.Backend.Hybrid
 open LeanNative.Backend.MLIRGPU
@@ -61,10 +63,27 @@ def sampleByteView : C99ByteView := { bytes := backingBytes, base := 4, len := 2
 #guard match marshalSlice sampleByteView with
   | some payload =>
     payload == ByteArray.mk #[14, 15, 16, 17, 18, 19, 20, 21] &&
-    unmarshalSlice backingBytes 4 payload == some backingBytes
+    unmarshalSlice sampleByteView payload == some backingBytes
   | none => false
 
 #guard marshalSlice { bytes := backingBytes, base := 8, len := 2, elemSize := 4 } == none
+
+/-- Strided view (`byteStride = 4 > elemSize = 2`): only the addressed bytes are packed and restored. -/
+def stridedByteView : C99ByteView :=
+  { bytes := backingBytes, base := 0, len := 3, byteStride := 4, elemSize := 2, align := 1 }
+
+#guard match marshalSlice stridedByteView with
+  | some payload =>
+    payload == ByteArray.mk #[10, 11, 14, 15, 18, 19] &&
+    unmarshalSlice stridedByteView payload == some backingBytes
+  | none => false
+
+#guard match computeC99StructLayout "lean_native_flat_slice_t" flatSliceFieldSpecs .bits32 with
+  | some layout => layout.structAlign == 4 && layout.structSize == 12
+  | none => false
+
+#guard checkedStridedSpan (2 ^ 30) 8 8 .bits32 == none
+#guard checkedStridedSpan 4 8 8 .bits32 == some 32
 
 def backingFloats : FloatArray := FloatArray.mk #[1.5, 2.5, 3.5, 4.5, 5.5]
 def sampleFloatView : C99FloatView := { floats := backingFloats, base := 1, len := 3 }
@@ -77,11 +96,12 @@ def sampleFloatView : C99FloatView := { floats := backingFloats, base := 1, len 
 
 #guard hybridTargetPlans.length == 3
 #guard hybridTargetPlans.all fun tp =>
+  let expectedElems := if tp.target == .gpuMetal then metalDispatchFloor else 256
   match validateHybridDispatch tp.request with
   | .ok plan =>
     plan.target == tp.target &&
-    plan.gridThreads == 256 &&
-    plan.workloadElems == 256 &&
+    plan.gridThreads == expectedElems &&
+    plan.workloadElems == expectedElems &&
     plan.buffers.length == 2
   | .error _ => false
 
@@ -123,6 +143,13 @@ def unalignedBuf : DeviceBufferDesc := {
 
 #guard isDispatchErr (validateHybridDispatch { ptxBaseReq with buffers := [unalignedBuf] }) .bufferGeometry
 
+def metalUnalignedPageBuf : DeviceBufferDesc := {
+  name := "metal_unaligned_page", elemBytes := 8, numElems := metalDispatchFloor, byteStride := 8, baseAlign := 8,
+  direction := .hostToDevice, zeroCopy := true, rc := 2, baseAddr := 4096, ownership := .pinnedHostRef
+}
+
+#guard isDispatchErr (validateHybridDispatch { (sampleHybridRequest .gpuMetal) with buffers := [metalUnalignedPageBuf] }) .bufferGeometry
+
 def sharedOutBuf : DeviceBufferDesc := {
   name := "shared_out", elemBytes := 8, numElems := 256, byteStride := 8, baseAlign := 8,
   direction := .deviceToHost, zeroCopy := false, rc := 2, baseAddr := 4096, ownership := .uniqueOutBuffer
@@ -148,12 +175,26 @@ def inPlaceBuf : DeviceBufferDesc := {
 
 #guard match validateHybridDispatch { (sampleHybridRequest .gpuMetal) with
     workloadElems := 200, buffers := [inPlaceBuf, inPlaceBuf] } with
-  | .ok plan =>
-    plan.gridThreads == 256 &&
-    rcNetDelta (rcPhaseOf inPlaceBuf) == 0 &&
-    rcNetDelta (rcPhaseOf aliasedInBuf) == 0 &&
-    (rcPhaseOf aliasedInBuf).whileActive == some 2 &&
-    (rcPhaseOf inPlaceBuf).afterRelease == 1
+  | .ok _ => false
+  | .error err => err == .aliasedOutput
+
+/-- Operational RC lifecycle: pinning a unique live buffer raises `rc` from 1 to 2 and the full
+    `pin -> launch -> sync -> release` cycle restores `rc = 1` and `exclusive = true`. -/
+def lifecycleHeap : HeapState :=
+  { buffers := [{ id := inPlaceBuf.bufId, data := #[7], exclusive := true }], nextId := inPlaceBuf.bufId + 1 }
+
+#guard match pinBufferStep inPlaceBuf.transferMode inPlaceBuf lifecycleHeap with
+  | .ok stPinned =>
+    match stPinned.findBuffer inPlaceBuf.bufId with
+    | some buf => stPinned.getBufRefCount buf == 2
+    | none => false
+  | .error _ => false
+
+#guard match execHybridTransferLifecycle inPlaceBuf.transferMode inPlaceBuf lifecycleHeap with
+  | .ok stFinal =>
+    match stFinal.findBuffer inPlaceBuf.bufId with
+    | some buf => stFinal.getBufRefCount buf == 1 && buf.exclusive == true && buf.data == #[7]
+    | none => false
   | .error _ => false
 
 end LeanNative.Tests.HybridCAbiTests
