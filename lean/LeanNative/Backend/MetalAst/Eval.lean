@@ -1697,12 +1697,12 @@ def bindParams
 def defaultCallDepth : Nat := 10
 
 /-- Interpret a function call at bounded nesting depth `depth`. Structural on `depth`. -/
-def makeCallEval (depth : Nat) :
-    Nat → MSLGroupState → Dim3 → MSLLocals → List MSLAccess → String → MSLExprList →
-      MSLOutcome MSLEval :=
+def makeCallEval (depth : Nat) (calleeFuel : Nat) (g : MSLGroupState) (tid : Dim3)
+    (ls : MSLLocals) (log : List MSLAccess) (name : String) (args : MSLExprList) :
+    MSLOutcome MSLEval :=
   match depth with
-  | 0 => fun _ _ _ _ _ _ _ => .fuelExhausted
-  | d + 1 => fun calleeFuel g tid ls log name args =>
+  | 0 => .fuelExhausted
+  | d + 1 =>
     match g.funcs.find? (fun f => f.name == name) with
     | none => .unboundIdentifier name
     | some fn =>

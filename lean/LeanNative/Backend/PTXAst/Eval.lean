@@ -621,7 +621,8 @@ def evalShiftAmount (cta : PTXCTAState) (th : PTXThreadState) (sh : PTXOperand) 
         .ok (vsh &&& 0xFFFF_FFFF#64).toNat
 
 /-- Resolve a byte address for addressable state spaces (`global`, `shared`, `const`, `local`). -/
-def evalAddr (cta : PTXCTAState) (th : PTXThreadState) : PTXAddr → PTXOutcome Nat
+def evalAddr (cta : PTXCTAState) (th : PTXThreadState) (addr : PTXAddr) : PTXOutcome Nat :=
+  match addr with
   | .paramSym sym => .invalidOperand s!"param symbol [{sym}] used as addressable pointer"
   | .regOffset regName disp =>
     PTXOutcome.bind (th.regs.readScalarChecked regName (some 64)) fun baseBv =>
@@ -1289,8 +1290,10 @@ def stepCTABarrier (bid : Nat) (states : List (Option Nat)) (cta : PTXCTAState) 
   else
     .barrierDivergence bid
 
-private def evalShflParticipants (stmts : List PTXStmt) (cta : PTXCTAState) (shflPc : Nat) :
-    List PTXThreadState → PTXOutcome (List (Nat × PTXThreadState × String × BitVec 64 × Nat × Nat × Nat))
+private def evalShflParticipants (stmts : List PTXStmt) (cta : PTXCTAState) (shflPc : Nat)
+    (threads : List PTXThreadState) :
+    PTXOutcome (List (Nat × PTXThreadState × String × BitVec 64 × Nat × Nat × Nat)) :=
+  match threads with
   | [] => .ok []
   | th :: rest =>
     PTXOutcome.bind (threadAtActiveShfl stmts th) fun atShfl =>

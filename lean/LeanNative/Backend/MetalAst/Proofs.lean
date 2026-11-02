@@ -21,20 +21,6 @@ Kernel-checked theorems over `LeanNative.Backend.MetalAst`:
 
 namespace LeanNative.Backend.MetalAst
 
-private theorem writeLEAux_size (bs : Array UInt8) (addr : Nat) (val : BitVec 64) :
-    ∀ n : Nat, (ByteMemory.writeLEAux bs addr val n).size = bs.size
-  | 0 => rfl
-  | k + 1 => by
-    simp [ByteMemory.writeLEAux, Array.size_setIfInBounds, writeLEAux_size _ addr val k]
-
-private theorem storeBits_size (m m' : ByteMemory) (addr width : Nat) (val : BitVec 64)
-    (h : m.storeBits addr width val = some m') :
-    m'.bytes.size = m.bytes.size := by
-  unfold ByteMemory.storeBits at h
-  split at h <;> simp at h
-  rw [← h]
-  exact writeLEAux_size m.bytes addr val width
-
 /-- `writeDeviceBuffer` never alters `constantBuffers` or `threadgroupArrays`. -/
 theorem writeDeviceBuffer_preserves_const_and_tg (g g' : MSLGroupState)
     (bufIdx : Nat) (elemTy : MSLType) (elemIdx : Nat) (val : BitVec 64)

@@ -322,6 +322,7 @@ theorem msl_oob_write_kernel_checked :
 
 def ptxDiv0Kernel : PTXKernel where
   name := "div0"
+  params := []
   regDecls := [ { ty := .u64, prefixName := "%rd", count := 1 } ]
   body :=
     [ .instr none (.div .u64 "%rd0" (.immU64 7#64) (.immU64 0#64))
@@ -338,6 +339,7 @@ theorem ptx_div_zero_kernel_checked :
 
 def ptxSdivKernel : PTXKernel where
   name := "sdiv_overflow"
+  params := []
   regDecls := [ { ty := .s32, prefixName := "%r", count := 1 } ]
   body :=
     [ .instr none (.div .s32 "%r0" (.immU64 2147483648#64) (.immU64 4294967295#64))
@@ -354,6 +356,7 @@ theorem ptx_signed_div_overflow_kernel_checked :
 
 def ptxFloatRemKernel : PTXKernel where
   name := "float_rem"
+  params := []
   regDecls := [ { ty := .f32, prefixName := "%f", count := 1 } ]
   body :=
     [ .instr none (.rem .f32 "%f0" (.immF32 0) (.immF32 1))
@@ -370,9 +373,10 @@ theorem ptx_float_rem_kernel_checked :
 
 def ptxShiftKernel : PTXKernel where
   name := "shift_oob"
-  regDecls := [ { ty := .u32, prefixName := "%r", count := 1 } ]
+  params := []
+  regDecls := [ { ty := .b32, prefixName := "%r", count := 1 } ]
   body :=
-    [ .instr none (.shl .u32 "%r0" (.immU64 1#64) (.immU64 0x1_0000_0000#64))
+    [ .instr none (.shl .b32 "%r0" (.immU64 1#64) (.immU64 0x1_0000_0000#64))
     , .instr none .ret ]
 
 def ptxShiftResult : PTXRes :=
@@ -386,6 +390,7 @@ theorem ptx_shift_width_kernel_checked :
 
 def ptxRaceKernel : PTXKernel where
   name := "race_store"
+  params := []
   regDecls := [ { ty := .u64, prefixName := "%rd", count := 1 } ]
   body :=
     [ .instr none (.mov .u64 "%rd0" (.immU64 0#64))
@@ -721,6 +726,7 @@ theorem msl_multi_group_atomic_add_kernel_checked :
 
 def ptxUndeclRegKernel : PTXKernel where
   name := "ptx_undecl_reg"
+  params := []
   regDecls := []
   body :=
     [ .instr none (.mov .u64 "%rd0" (.immU64 1#64))
@@ -730,13 +736,14 @@ def ptxUndeclRegResult : PTXRes :=
   evalPTXKernel 8 ptxUndeclRegKernel { x := 1 } { x := 1 }
     (LeanNative.Backend.PTXAst.ByteMemory.zeros 0) { params := [] }
 
-#guard ptxUndeclRegResult == .invalidOperand "undeclared register %rd0"
+#guard ptxUndeclRegResult == .unboundReg "%rd0"
 
 theorem ptx_undeclared_reg_rejected :
-    ptxUndeclRegResult = .invalidOperand "undeclared register %rd0" := rfl
+    ptxUndeclRegResult = .unboundReg "%rd0" := rfl
 
 def ptxUninitRegKernel : PTXKernel where
   name := "ptx_uninit_reg"
+  params := []
   regDecls := [ { ty := .u64, prefixName := "%rd", count := 2 } ]
   body :=
     [ .instr none (.add .none .u64 "%rd1" (.reg "%rd0") (.immU64 1#64))
@@ -746,13 +753,14 @@ def ptxUninitRegResult : PTXRes :=
   evalPTXKernel 8 ptxUninitRegKernel { x := 1 } { x := 1 }
     (LeanNative.Backend.PTXAst.ByteMemory.zeros 0) { params := [] }
 
-#guard ptxUninitRegResult == .invalidOperand "read of uninitialized register %rd0"
+#guard ptxUninitRegResult == .unboundReg "%rd0"
 
 theorem ptx_uninit_reg_rejected :
-    ptxUninitRegResult = .invalidOperand "read of uninitialized register %rd0" := rfl
+    ptxUninitRegResult = .unboundReg "%rd0" := rfl
 
 def ptxWidthMismatchKernel : PTXKernel where
   name := "ptx_width_mismatch"
+  params := []
   regDecls := [ { ty := .u32, prefixName := "%r", count := 1 }
               , { ty := .u64, prefixName := "%rd", count := 1 } ]
   body :=
@@ -764,10 +772,10 @@ def ptxWidthMismatchResult : PTXRes :=
   evalPTXKernel 8 ptxWidthMismatchKernel { x := 1 } { x := 1 }
     (LeanNative.Backend.PTXAst.ByteMemory.zeros 0) { params := [] }
 
-#guard ptxWidthMismatchResult == .invalidOperand "register %r0 has width 32, expected 64"
+#guard ptxWidthMismatchResult == .typeMismatch "register %r0 width 32 mismatches instruction width"
 
 theorem ptx_reg_width_mismatch_rejected :
-    ptxWidthMismatchResult = .invalidOperand "register %r0 has width 32, expected 64" := rfl
+    ptxWidthMismatchResult = .typeMismatch "register %r0 width 32 mismatches instruction width" := rfl
 
 def ptxAtomCasKernel : PTXKernel where
   name := "ptx_atom_cas_u64"
@@ -819,7 +827,8 @@ def ptxAtomVsStoreRaceResult : PTXRes :=
 theorem ptx_atom_vs_nonatomic_store_race_checked :
     ptxAtomVsStoreRaceResult = .dataRace .global 0 := rfl
 
-/-! ## 14. Round-2 Metal coverage: multi-lane vectors/structs, single-pass simd, depth-8 calls, arrays, short-circuit, pointer atomics & rank promotion -/
+/-! ## 14. Round-2 Metal coverage: multi-lane vectors/structs, single-pass simd,
+    depth-8 calls, arrays, short-circuit, pointer atomics & rank promotion -/
 
 def mslUlong2Kernel : MSLKernelDecl where
   name := "msl_ulong2_lanes"
@@ -868,8 +877,8 @@ def mslSinglePassSimdResult : MSLRes :=
   evalMSLKernel 32 mslSinglePassSimdKernel { x := 1 } { x := 2 }
     [ (0, LeanNative.Backend.MetalAst.ByteMemory.zeros 16) ] [] [ mslImpureBumpFunc ] []
 
--- Lane 0: cnt starts 0 -> simdSum bump_once => 1 (sum=1+11=12, cnt=1) -> simdShuffle bump_once => 2 (partner lane1 gives 12, cnt=2) -> 2*100 + 12 + 12 = 224
--- Lane 1: cnt starts 10 -> simdSum bump_once => 11 (sum=12, cnt=11) -> simdShuffle bump_once => 12 (partner lane0 gives 2, cnt=12) -> 12*100 + 12 + 2 = 1214
+-- Lane 0: cnt 0 -> simdSum(1, sum=12) -> simdShuffle(2, partner=12) -> 224
+-- Lane 1: cnt 10 -> simdSum(11, sum=12) -> simdShuffle(12, partner=2) -> 1214
 #guard mslReadWord? mslSinglePassSimdResult 0 0 == some 224#64
 #guard mslReadWord? mslSinglePassSimdResult 0 1 == some 1214#64
 
@@ -877,26 +886,33 @@ theorem msl_single_pass_simd_side_effect_checked :
     mslReadWord? mslSinglePassSimdResult 0 0 = some 224#64 ∧
     mslReadWord? mslSinglePassSimdResult 0 1 = some 1214#64 := ⟨rfl, rfl⟩
 
-def mkChainHelper (idx : Nat) : MSLFuncDecl :=
-  if idx == 8 then
-    { retTy := .ulong
-      name := "chain8"
-      params := [ { ty := .ulong, name := "x" } ]
-      body := .ofList
-        [ .varDecl .ulong "acc" (.var "x")
-        , .forLoop "i" .uint (.immU64 0#64) (.lt (.var "i") (.immU64 70#64))
-            (.add (.var "i") (.immU64 1#64))
-            (.ofList [ .assign "acc" (.add (.var "acc") (.immU64 1#64)) ])
-        , .returnVal (.var "acc") ] }
-  else
-    { retTy := .ulong
-      name := s!"chain{idx}"
-      params := [ { ty := .ulong, name := "x" } ]
-      body := .ofList
-        [ .returnVal (.call s!"chain{idx + 1}" (.ofList [ .add (.var "x") (.immU64 1#64) ])) ] }
+def mkChainStep (nm nextNm : String) : MSLFuncDecl where
+  retTy := .ulong
+  name := nm
+  params := [ { ty := .ulong, name := "x" } ]
+  body := .ofList
+    [ .returnVal (.call nextNm (.ofList [ .add (.var "x") (.immU64 1#64) ])) ]
+
+def mslChainLeaf : MSLFuncDecl where
+  retTy := .ulong
+  name := "chain8"
+  params := [ { ty := .ulong, name := "x" } ]
+  body := .ofList
+    [ .varDecl .ulong "acc" (.var "x")
+    , .forLoop "i" .uint (.immU64 0#64) (.lt (.var "i") (.immU64 70#64))
+        (.add (.var "i") (.immU64 1#64))
+        (.ofList [ .assign "acc" (.add (.var "acc") (.immU64 1#64)) ])
+    , .returnVal (.var "acc") ]
 
 def mslDeepChainHelpers : List MSLFuncDecl :=
-  [1, 2, 3, 4, 5, 6, 7, 8].map mkChainHelper
+  [ mkChainStep "chain1" "chain2"
+  , mkChainStep "chain2" "chain3"
+  , mkChainStep "chain3" "chain4"
+  , mkChainStep "chain4" "chain5"
+  , mkChainStep "chain5" "chain6"
+  , mkChainStep "chain6" "chain7"
+  , mkChainStep "chain7" "chain8"
+  , mslChainLeaf ]
 
 def mslDeepChainKernel : MSLKernelDecl where
   name := "msl_deep_chain"
@@ -907,7 +923,7 @@ def mslDeepChainKernel : MSLKernelDecl where
     , .returnStmt ]
 
 def mslDeepChainResult : MSLRes :=
-  evalMSLKernel 200 mslDeepChainKernel { x := 1 } { x := 1 }
+  evalMSLKernel 256 mslDeepChainKernel { x := 1 } { x := 1 }
     [ (0, LeanNative.Backend.MetalAst.ByteMemory.zeros 8) ] [] mslDeepChainHelpers []
 
 -- 5 + 7 intermediate increments + 70 loop iterations in chain8 = 82
@@ -919,7 +935,7 @@ theorem msl_deep_chain_and_long_callee_loop_checked :
 def mslArrayRefFunc : MSLFuncDecl where
   retTy := .void
   name := "mix_words"
-  params := [ { ty := .threadArr .thread .ulong 4, name := "v" } ]
+  params := [ { ty := .threadArr false .ulong 4, name := "v" } ]
   body := .ofList
     [ .indexAssign "v" (.immU64 0#64) (.add (.index "v" (.immU64 0#64)) (.index "v" (.immU64 1#64)))
     , .indexAssign "v" (.immU64 3#64) (.bitXor (.index "v" (.immU64 3#64)) (.index "v" (.immU64 0#64)))
@@ -1063,7 +1079,7 @@ def mslSampleModule : MSLModule where
 #guard hasSubstr (ppPTXModule ptxSampleModule) "bar.sync 0;"
 #guard hasSubstr (ppPTXModule ptxSampleModule) ".shared .align 8 .u64 smem[2];"
 #guard hasSubstr (ppPTXModule ptxSampleModule) ".reg .u64 %rd<11>;"
-#guard hasSubstr (ppPTXModule ptxSampleModule) "atom.cas.global.u64"
+#guard hasSubstr (ppPTXModule ptxSampleModule) "atom.global.cas.u64"
 
 #guard hasSubstr (ppMSLModule mslSampleModule) "#include <metal_stdlib>"
 #guard hasSubstr (ppMSLModule mslSampleModule) "using namespace metal;"
