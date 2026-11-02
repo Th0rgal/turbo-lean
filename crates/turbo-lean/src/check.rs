@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-use crate::db::{self, BlobEntry, SingleflightOutcome, TurboStore};
+use crate::db::{self, SingleflightOutcome, TurboStore};
 use crate::lake_build::{
     collect_lean_files, compact_split_for_shm_cache, compute_imported_olean_interface_hashes,
     compute_shard_key_with_args, compute_single_stat_hash, detect_toolchain,
@@ -617,6 +617,7 @@ pub(crate) struct PrivateScratchDir {
     pub(crate) path: PathBuf,
     pub(crate) nonce: String,
     armed: bool,
+    lease: Option<crate::shm_cache::StagingLeaseGuard>,
 }
 
 impl PrivateScratchDir {
@@ -634,25 +635,34 @@ impl PrivateScratchDir {
 
     pub(crate) fn create_with_nonce(base: &Path, label: &str, nonce: String) -> Result<Self> {
         let path = base.join(format!("{label}_{nonce}"));
+        let lease = crate::shm_cache::StagingLeaseGuard::acquire_for_target(&path)
+            .with_context(|| format!("Failed to acquire staging lease for `{}`", path.display()))?;
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
         // `create` (not `create_all`) fails on any existing entry, including symlinks.
-        builder.create(&path).with_context(|| {
-            format!("Failed to create private scratch dir `{}`", path.display())
-        })?;
+        if let Err(e) = builder
+            .create(&path)
+            .with_context(|| format!("Failed to create private scratch dir `{}`", path.display()))
+        {
+            drop(lease);
+            return Err(e);
+        }
         Ok(Self {
             path,
             nonce,
             armed: true,
+            lease: Some(lease),
         })
     }
 
     pub(crate) fn remove(mut self) -> Result<()> {
         self.armed = false;
         thaw_private_dir_tree(&self.path);
-        fs::remove_dir_all(&self.path)
-            .with_context(|| format!("Failed to remove scratch dir `{}`", self.path.display()))
+        let res = fs::remove_dir_all(&self.path)
+            .with_context(|| format!("Failed to remove scratch dir `{}`", self.path.display()));
+        drop(self.lease.take());
+        res
     }
 }
 
@@ -662,10 +672,11 @@ impl Drop for PrivateScratchDir {
             thaw_private_dir_tree(&self.path);
             let _ = fs::remove_dir_all(&self.path);
         }
+        drop(self.lease.take());
     }
 }
 
-fn thaw_private_dir_tree(dir: &Path) {
+pub(crate) fn thaw_private_dir_tree(dir: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1399,18 +1410,16 @@ pub fn try_stateless_remote_check(
                         ));
                     }
                 }
-                if publish_items.len() == req_items.len() {
-                    let _ = st.prestage_theorem_shard_blobs(&publish_items);
-                    if st
+                if publish_items.len() == req_items.len()
+                    && st
                         .begin_inflight_publish_theorem_shards(
                             &toolchain,
                             "trusted",
                             &publish_items,
                         )
                         .is_ok()
-                    {
-                        inflight_tx_open = true;
-                    }
+                {
+                    inflight_tx_open = true;
                 }
                 store_opt = Some(st);
             }
@@ -1602,7 +1611,6 @@ pub fn try_stateless_remote_single_decl_check(
                         r_bytes.clone(),
                         1,
                     )];
-                    let _ = st.prestage_theorem_shard_blobs(&items);
                     if st
                         .begin_inflight_publish_theorem_shards(&toolchain, "trusted", &items)
                         .is_ok()
@@ -2570,7 +2578,7 @@ pub(crate) fn compute_fission_store_key_with_args(
 }
 
 fn subshard_receipt_provenance_ok(store: &TurboStore, blob_hash: &str) -> bool {
-    let Ok(bytes) = fs::read(store.blob_path(blob_hash)) else {
+    let Some(bytes) = store.read_verified_blob(blob_hash) else {
         return false;
     };
     let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
@@ -2932,7 +2940,6 @@ fn check_single_decl(
                                 r_bytes.clone(),
                                 1,
                             )];
-                            let _ = store.prestage_theorem_shard_blobs(&items);
                             if store
                                 .begin_inflight_publish_theorem_shards(toolchain, "trusted", &items)
                                 .is_ok()
@@ -3550,7 +3557,6 @@ fn check_single_decl(
                                         r_bytes,
                                         1i64,
                                     )];
-                                    let _ = store.prestage_theorem_shard_blobs(&single_pub);
                                     if store
                                         .begin_inflight_publish_theorem_shards(
                                             toolchain,
@@ -5032,6 +5038,14 @@ fn check_single_file(
                 .iter()
                 .map(|(_, sh)| sh.decl_name().to_string())
                 .collect();
+            let whole_expected_types: Vec<(String, String)> = uncached_shards
+                .iter()
+                .filter_map(|(k, sh)| {
+                    attested_kths
+                        .get(k)
+                        .map(|kth| (sh.decl_name().to_string(), kth.clone()))
+                })
+                .collect();
             let out = crate::zygote::run_audited_lean_shard_with_types(
                 store,
                 Path::new(&lean_bin),
@@ -5087,14 +5101,15 @@ fn check_single_file(
                         now,
                         attested_kths.get(&shard_key).map(String::as_str),
                     )?;
-                    let bh = store.store_immutable_blob(&receipt, "expr_shard", "trusted", 0)?;
-                    let entries = vec![BlobEntry {
-                        blob_hash: bh,
-                        kind: "expr_shard".to_string(),
-                        size_bytes: receipt.len() as u64,
-                        rel_path: format!("thm:{}", shard.decl_name()),
-                    }];
-                    store.publish_action(&lease, &entries, dur_ms, 0, 0, "trusted")?;
+                    let rel_path = format!("thm:{}", shard.decl_name());
+                    store.publish_action_with_blob(
+                        &lease,
+                        &receipt,
+                        "expr_shard",
+                        &rel_path,
+                        dur_ms,
+                        "trusted",
+                    )?;
                 }
             }
         }
@@ -6297,6 +6312,280 @@ but is expected to have type
             &["-DmaxHeartbeats=4000000".to_string()],
         );
         assert_ne!(f_bare, f_hb);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_active_check_staging_writer_protected_against_store_local_gc_and_shm_spill(
+    ) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_check_staging_gc_race_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let project = dir.join("project");
+        let store_root = dir.join("store");
+        let store_staging = store_root.join("staging");
+        let fake_elan_root = dir.join("fake_elan");
+        let tc_name = "leanprover/lean4:v4.35.0-check-gc-race";
+        let tc_root = fake_elan_root
+            .join("toolchains")
+            .join("leanprover--lean4---v4.35.0-check-gc-race");
+        let bin_dir = tc_root.join("bin");
+        fs::create_dir_all(&project)?;
+        fs::create_dir_all(&store_staging)?;
+        fs::create_dir_all(&bin_dir)?;
+
+        // Configure `fast_staging_dir()` to resolve directly to `<store>/staging` (exercising the
+        // store-local fallback where `run_gc(0, ...)` sweeps 0-second unleased entries immediately),
+        // point `ELAN_HOME` at our isolated synthetic toolchain so `ToolchainExecutables` resolves
+        // our wrapper `lean` binary cleanly under PR #308's absolute toolchain gate, and disable
+        // the background Zygote daemon so `evaluate_check_command_value` executes the real
+        // `PrivateScratchDir` -> `run_audited_lean_shard_with_types` staging path.
+        let prev_staging = std::env::var("TURBO_LEAN_STAGING_DIR").ok();
+        let prev_no_daemon = std::env::var("TURBO_LEAN_NO_DAEMON").ok();
+        let prev_elan_home = std::env::var("ELAN_HOME").ok();
+        let prev_test_bwrap = std::env::var("TURBO_LEAN_TEST_BWRAP_BIN").ok();
+        struct RestoreCheckEnv(
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        impl Drop for RestoreCheckEnv {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => std::env::set_var("TURBO_LEAN_STAGING_DIR", v),
+                    None => std::env::remove_var("TURBO_LEAN_STAGING_DIR"),
+                }
+                match &self.1 {
+                    Some(v) => std::env::set_var("TURBO_LEAN_NO_DAEMON", v),
+                    None => std::env::remove_var("TURBO_LEAN_NO_DAEMON"),
+                }
+                match &self.2 {
+                    Some(v) => std::env::set_var("ELAN_HOME", v),
+                    None => std::env::remove_var("ELAN_HOME"),
+                }
+                match &self.3 {
+                    Some(v) => std::env::set_var("TURBO_LEAN_TEST_BWRAP_BIN", v),
+                    None => std::env::remove_var("TURBO_LEAN_TEST_BWRAP_BIN"),
+                }
+            }
+        }
+        let _restore_env = RestoreCheckEnv(
+            prev_staging,
+            prev_no_daemon,
+            prev_elan_home,
+            prev_test_bwrap,
+        );
+        std::env::set_var("TURBO_LEAN_STAGING_DIR", &store_staging);
+        std::env::set_var("TURBO_LEAN_NO_DAEMON", "1");
+        std::env::set_var("TURBO_LEAN_TEST_BWRAP_BIN", dir.join("missing_bwrap"));
+
+        let fake_lean = bin_dir.join("lean");
+        let repo_lean_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lean");
+        let resolve_cwd = if repo_lean_dir.is_dir() {
+            repo_lean_dir
+        } else {
+            dir.clone()
+        };
+        let real_prefix = Command::new("lean")
+            .arg("--print-prefix")
+            .current_dir(&resolve_cwd)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
+            .and_then(|p| p.canonicalize().ok())
+            .filter(|p| {
+                p.join("bin/lean").is_file()
+                    && !p.starts_with(&fake_elan_root)
+                    && !p.join("bin/elan").exists()
+            });
+        let Some(real_prefix) = real_prefix else {
+            let _ = fs::remove_dir_all(&dir);
+            return Ok(());
+        };
+        let real_lean = real_prefix.join("bin/lean");
+        for sub in ["lib", "include", "share"] {
+            let src_sub = real_prefix.join(sub);
+            if src_sub.exists() {
+                std::os::unix::fs::symlink(&src_sub, tc_root.join(sub))?;
+            }
+        }
+        for sib in ["lake", "leanc"] {
+            let real_sib = real_prefix.join("bin").join(sib);
+            let sp = bin_dir.join(sib);
+            if real_sib.is_file() {
+                fs::write(
+                    &sp,
+                    format!("#!/bin/sh\nexec '{}' \"$@\"\n", real_sib.display()),
+                )?;
+            } else {
+                fs::write(&sp, "#!/bin/sh\nexit 0\n")?;
+            }
+            fs::set_permissions(&sp, fs::Permissions::from_mode(0o755))?;
+        }
+        std::env::set_var("ELAN_HOME", &fake_elan_root);
+
+        // Wrapper `lean` binary: forwards identity/build calls directly, then when invoked on the
+        // staged `TurboAuditedShard_*.lean` file inside `<store>/staging` signals `arrived_marker`
+        // BEFORE compiling it, blocks until concurrent `run_gc(0, ...)` and `spill_shm_to_disk_dir`
+        // sweeps complete (`proceed_marker`), and finally compiles the staged shard.
+        let arrived_marker = dir.join("child_arrived");
+        let proceed_marker = dir.join("child_proceed");
+        let script = format!(
+            "#!/bin/sh\nif [ \"${{1:-}}\" = \"--githash\" ]; then exec '{rl}' --githash; fi\nif [ \"${{1:-}}\" = \"--print-prefix\" ]; then echo '{tc}'; exit 0; fi\nif [ \"${{1:-}}\" = \"--version\" ]; then exec '{rl}' --version; fi\ncase \"$*\" in\n  *TurboAuditedShard_*)\n    : > '{arr}'\n    while [ ! -f '{proc}' ]; do\n      if [ -x /bin/sleep ]; then /bin/sleep 0.01; elif [ -x /usr/bin/sleep ]; then /usr/bin/sleep 0.01; fi\n    done\n    ;;\nesac\nexec '{rl}' \"$@\"\n",
+            rl = real_lean.display(),
+            tc = tc_root.display(),
+            arr = arrived_marker.display(),
+            proc = proceed_marker.display(),
+        );
+        fs::write(&fake_lean, script)?;
+        fs::set_permissions(&fake_lean, fs::Permissions::from_mode(0o755))?;
+
+        fs::write(project.join("lean-toolchain"), format!("{tc_name}\n"))?;
+        let lean_file = project.join("CheckGcRace.lean");
+        fs::write(&lean_file, "theorem gc_race_a : True := trivial\n")?;
+
+        let store = TurboStore::open(Some(&store_root))?;
+        assert_eq!(store.fast_staging_dir(), store_staging);
+        let canon_project = project.canonicalize()?;
+        let proj_key = TurboStore::compute_lake_env_key(&canon_project);
+        let mut fake_env = HashMap::new();
+        fake_env.insert("LEAN_PATH".to_string(), String::new());
+        store.put_lake_env(&proj_key, &fake_env)?;
+        drop(store);
+
+        // Pre-warm the declaration-identity / shard auditor binary BEFORE spawning the timed
+        // `evaluate_check_command_value` worker so a cold `ensure_zygote_binary_at` compile does
+        // not consume the request timeout budget, and give the parked subprocess generous slack.
+        let prev_timeout_ms = std::env::var("TURBO_LEAN_TIMEOUT_MS").ok();
+        std::env::set_var("TURBO_LEAN_TIMEOUT_MS", "120000");
+        struct RestoreTimeout(Option<String>);
+        impl Drop for RestoreTimeout {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => std::env::set_var("TURBO_LEAN_TIMEOUT_MS", v),
+                    None => std::env::remove_var("TURBO_LEAN_TIMEOUT_MS"),
+                }
+            }
+        }
+        let _restore_timeout = RestoreTimeout(prev_timeout_ms);
+        let mut warm_env = HashMap::new();
+        warm_env.insert("LEAN_PATH".to_string(), String::new());
+        let _ = crate::zygote::ensure_zygote_binary_at(
+            &crate::shm_cache::cache_root(),
+            &fake_lean,
+            &warm_env,
+        )?;
+        let _ = crate::zygote::ensure_zygote_binary_at(&store_root, &fake_lean, &warm_env)?;
+
+        // Seed unleased file and directory orphans in `<store>/staging` so we prove `run_gc(0, ...)`
+        // actively sweeps `<store>/staging` during the window while sparing the live leased scratch dirs.
+        let orphan_tmp = store_staging.join("unleased_orphan_before_check.lean");
+        fs::write(&orphan_tmp, b"-- stale unleased staging file\n")?;
+        let orphan_dir = store_staging.join("turbo_audited_src_stale_orphan");
+        fs::create_dir_all(&orphan_dir)?;
+        fs::write(orphan_dir.join("Stale.lean"), b"-- stale orphan dir\n")?;
+
+        let check_store_root = store_root.clone();
+        let check_file = lean_file.clone();
+        let check_proj = project.clone();
+        let worker = std::thread::spawn(move || -> Result<serde_json::Value> {
+            let mut worker_store = TurboStore::open(Some(&check_store_root))?;
+            evaluate_check_command_value(&mut worker_store, check_file, None, check_proj)
+        });
+
+        let wait_t0 = Instant::now();
+        while !arrived_marker.exists() {
+            if worker.is_finished() {
+                break;
+            }
+            assert!(
+                wait_t0.elapsed().as_secs() < 120,
+                "timed out waiting for check subprocess to spawn"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !arrived_marker.exists() && worker.is_finished() {
+            let val = worker.join().unwrap()?;
+            anyhow::bail!(
+                "check path finished without invoking lean subprocess on staged file: {val}"
+            );
+        }
+        assert!(
+            arrived_marker.exists(),
+            "check path must invoke lean subprocess on staged file"
+        );
+        let active_src_dir = fs::read_dir(&store_staging)?
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                p != &orphan_dir
+                    && p.is_dir()
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("turbo_audited_src_"))
+            })
+            .expect("active leased turbo_audited_src_* dir must exist while lean is parked");
+        let active_leased_lean = fs::read_dir(&active_src_dir)?
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().and_then(|s| s.to_str()) == Some("lean"))
+            .expect("staged TurboAuditedShard_*.lean must exist inside active_src_dir");
+
+        let mut gc_store = TurboStore::open(Some(&store_root))?;
+        let gc_rep = gc_store.run_gc(0, 7 * 86400, true)?;
+        assert!(
+            !orphan_tmp.exists() && !orphan_dir.exists(),
+            "run_gc(0) must still reap unleased file and dir orphans in <store>/staging"
+        );
+        assert!(
+            active_src_dir.exists() && fs::symlink_metadata(&active_leased_lean).is_ok(),
+            "run_gc(0) must preserve active leased check staging scratch dir and file in <store>/staging"
+        );
+        assert!(gc_rep.cleaned_staging_files >= 2);
+
+        let spill_dir = dir.join("shm_spill");
+        let _ = crate::shm_cache::spill_shm_to_disk_dir(&store_staging, &spill_dir, 0)?;
+        assert!(
+            fs::symlink_metadata(&active_leased_lean).is_ok()
+                && !spill_dir
+                    .join(active_leased_lean.file_name().unwrap())
+                    .exists(),
+            "spill_shm_to_disk_dir must not evict/move leased active check staging files"
+        );
+        let _ = crate::shm_cache::enforce_shm_quota_lru(&store_staging, 1)?;
+        assert!(
+            fs::symlink_metadata(&active_leased_lean).is_ok(),
+            "enforce_shm_quota_lru must not evict leased active check staging files"
+        );
+
+        fs::write(&proceed_marker, b"go")?;
+        let check_val = worker
+            .join()
+            .expect("check worker thread panicked")
+            .context("active check must succeed despite concurrent run_gc(0) + SHM eviction")?;
+        assert_eq!(check_val["status"], "file_verified");
+
+        // After check completes and drops `PrivateScratchDir`, neither scratch dirs nor `.lease.lock` remain.
+        let remaining: Vec<String> = fs::read_dir(&store_staging)?
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("turbo_audited_") || n.ends_with(".lease.lock"))
+            .collect();
+        assert!(
+            remaining.is_empty(),
+            "PrivateScratchDir drop must clean up both scratch dirs and sidecar .lease.lock, found {remaining:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     #[test]

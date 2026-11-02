@@ -3087,9 +3087,11 @@ pub fn run_fast_check_command(
             } else {
                 "nvcc"
             };
-            let tmp_bin = store
-                .fast_staging_dir()
-                .join(format!("fastcheck_gpu_{}.bin", std::process::id()));
+            let tmp_bin = crate::shm_cache::StagedTempFile::reserve(
+                store
+                    .fast_staging_dir()
+                    .join(format!("fastcheck_gpu_{}.bin", std::process::id())),
+            )?;
             let compile_out = Command::new(nvcc_bin)
                 .arg("-O3")
                 .arg("-arch=native")
@@ -3113,8 +3115,8 @@ pub fn run_fast_check_command(
             }
             if fs::rename(&tmp_bin, &cached_bin).is_err() {
                 fs::copy(&tmp_bin, &cached_bin)?;
-                let _ = fs::remove_file(&tmp_bin);
             }
+            drop(tmp_bin);
         }
         let run_t0 = Instant::now();
         let out = Command::new(&cached_bin)
@@ -3251,13 +3253,19 @@ pub fn run_fast_check_command(
                     crate::pack::resolve_server_lean_env_and_bin(store, &tc, "")?;
 
                 let pid = std::process::id();
-                let tmp_c = staging.join(format!("fastcheck_{}.c", pid));
-                let tmp_bin = staging.join(format!("fastcheck_{}.bin", pid));
-                let tmp_lean = staging.join(format!("fastcheck_src_{}.lean", pid));
+                let tmp_c = crate::shm_cache::StagedTempFile::reserve(
+                    staging.join(format!("fastcheck_{}.c", pid)),
+                )?;
+                let tmp_bin = crate::shm_cache::StagedTempFile::reserve(
+                    staging.join(format!("fastcheck_{}.bin", pid)),
+                )?;
+                let tmp_lean = crate::shm_cache::StagedTempFile::reserve(
+                    staging.join(format!("fastcheck_src_{}.lean", pid)),
+                )?;
 
                 let mut st1_ok = false;
                 if let Some(ref fast_src) = cgen_fast_src {
-                    fs::write(&tmp_lean, fast_src)?;
+                    tmp_lean.overwrite(fast_src.as_bytes())?;
                     if let Ok(o) = Command::new(&lean_bin_path)
                         .arg(format!("--root={}", staging.display()))
                         .arg("-c")
@@ -3277,27 +3285,26 @@ pub fn run_fast_check_command(
                             PathBuf::from(crate::lake_build::resolve_lean_bin(&lean_dir)?);
                         env_vars = lake_env;
                     }
-                    let compile_target = if has_main {
-                        canon_file.clone()
+                    let compile_target: &Path = if has_main {
+                        &canon_file
                     } else {
-                        fs::write(&tmp_lean, &effective_src)?;
-                        tmp_lean.clone()
+                        tmp_lean.overwrite(effective_src.as_bytes())?;
+                        &tmp_lean
                     };
                     let compile_dir = if has_main { &lean_dir } else { &staging };
                     let st1 = Command::new(&lean_bin_path)
                         .arg("-c")
                         .arg(&tmp_c)
-                        .arg(&compile_target)
+                        .arg(compile_target)
                         .current_dir(compile_dir)
                         .envs(&env_vars)
                         .status()
                         .context("Failed to compile Lean to C via `lean -c`")?;
                     if !st1.success() {
-                        let _ = fs::remove_file(&tmp_lean);
                         anyhow::bail!("`lean -c` failed on {}", file.display());
                     }
                 }
-                let _ = fs::remove_file(&tmp_lean);
+                drop(tmp_lean);
                 let out2 = crate::pack::compile_fastcheck_c_to_bin(
                     &lean_bin_path,
                     &tmp_c,
@@ -3305,7 +3312,7 @@ pub fn run_fast_check_command(
                     &lean_dir,
                     &env_vars,
                 )?;
-                let _ = fs::remove_file(&tmp_c);
+                drop(tmp_c);
                 if !out2.status.success() {
                     anyhow::bail!(
                         "`leanc -O3` failed:\n{}\n{}",
@@ -3322,8 +3329,8 @@ pub fn run_fast_check_command(
                 }
                 if fs::rename(&tmp_bin, &cached_bin).is_err() {
                     fs::copy(&tmp_bin, &cached_bin)?;
-                    let _ = fs::remove_file(&tmp_bin);
                 }
+                drop(tmp_bin);
             }
         }
 
@@ -5229,7 +5236,7 @@ pub fn evaluate_agent_step_value(
                         );
                         let n = cached_map
                             .get(&sh_key)
-                            .and_then(|bh| fs::read(store.blob_path(bh)).ok())
+                            .and_then(|bh| store.read_verified_blob(bh))
                             .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
                             .and_then(|v| v.get("proof_term_nodes").and_then(|n| n.as_u64()))
                             .filter(|&n| n > 0)

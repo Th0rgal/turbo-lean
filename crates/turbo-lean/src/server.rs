@@ -1391,8 +1391,8 @@ fn option_matching_http_hits(
     let raw_hits = store.batch_get_theorem_shards_readonly(keys, trust_domain)?;
     let mut hits = std::collections::HashMap::with_capacity(raw_hits.len());
     for (k, blob_hash) in raw_hits {
-        let Some(receipt) = fs::read(store.blob_path(&blob_hash))
-            .ok()
+        let Some(receipt) = store
+            .read_verified_blob(&blob_hash)
             .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
         else {
             continue;
@@ -2236,16 +2236,22 @@ fn execute_fastcheck_payload_deferred(
                 || try_populate_cached_bin_from_shared(&staging, &src_text, &cached_bin);
 
             if !shared_populated {
-                let tmp_lean = staging.join(format!("http_fc_{}_{}.lean", pid, ts));
-                let tmp_c = staging.join(format!("http_fc_{}_{}.c", pid, ts));
-                let tmp_bin = staging.join(format!("http_fc_{}_{}.bin", pid, ts));
+                let tmp_lean = crate::shm_cache::StagedTempFile::reserve(
+                    staging.join(format!("http_fc_{}_{}.lean", pid, ts)),
+                )?;
+                let tmp_c = crate::shm_cache::StagedTempFile::reserve(
+                    staging.join(format!("http_fc_{}_{}.c", pid, ts)),
+                )?;
+                let tmp_bin = crate::shm_cache::StagedTempFile::reserve(
+                    staging.join(format!("http_fc_{}_{}.bin", pid, ts)),
+                )?;
 
                 let (env_vars, lean_bin) =
                     resolve_server_lean_env_and_bin(store, "leanprover/lean4:v4.35.0", "")?;
 
                 let mut out1_ok = false;
                 if let Some(ref fast_src) = cgen_fast_src {
-                    fs::write(&tmp_lean, fast_src)?;
+                    tmp_lean.overwrite(fast_src.as_bytes())?;
                     if let Ok(o) = Command::new(&lean_bin)
                         .arg(format!("--root={}", staging.display()))
                         .arg("-c")
@@ -2259,7 +2265,7 @@ fn execute_fastcheck_payload_deferred(
                     }
                 }
                 if !out1_ok {
-                    fs::write(&tmp_lean, &src_text)?;
+                    tmp_lean.overwrite(src_text.as_bytes())?;
                     let out1 = Command::new(&lean_bin)
                         .arg(format!("--root={}", staging.display()))
                         .arg("-c")
@@ -2270,7 +2276,7 @@ fn execute_fastcheck_payload_deferred(
                         .output()
                         .context("Failed to compile Lean to C via `lean -c`")?;
                     if !out1.status.success() {
-                        let _ = fs::remove_file(&tmp_lean);
+                        drop(tmp_lean);
                         anyhow::bail!(
                             "`lean -c` failed on HTTP fast-check payload:\n{}\n{}",
                             String::from_utf8_lossy(&out1.stdout),
@@ -2278,11 +2284,11 @@ fn execute_fastcheck_payload_deferred(
                         );
                     }
                 }
-                let _ = fs::remove_file(&tmp_lean);
+                drop(tmp_lean);
 
                 let out2 =
                     compile_fastcheck_c_to_bin(&lean_bin, &tmp_c, &tmp_bin, &staging, &env_vars)?;
-                let _ = fs::remove_file(&tmp_c);
+                drop(tmp_c);
                 if !out2.status.success() {
                     anyhow::bail!(
                         "`leanc -O3` failed on HTTP fast-check payload:\n{}\n{}",
@@ -2300,9 +2306,9 @@ fn execute_fastcheck_payload_deferred(
                 if fs::rename(&tmp_bin, &cached_bin).is_err() {
                     let tmp_dest = bin_dir.join(format!("http_fc_{}_{}.dest.tmp", pid, ts));
                     fs::copy(&tmp_bin, &tmp_dest)?;
-                    let _ = fs::remove_file(&tmp_bin);
                     let _ = fs::rename(&tmp_dest, &cached_bin);
                 }
+                drop(tmp_bin);
             }
         }
 

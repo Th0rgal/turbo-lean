@@ -3401,13 +3401,7 @@ fn topologically_order_standalone_modules(
 
 pub struct StandaloneOleanOverlay {
     pub olean_dir: PathBuf,
-    staging_root: PathBuf,
-}
-
-impl Drop for StandaloneOleanOverlay {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.staging_root);
-    }
+    _scratch: crate::check::PrivateScratchDir,
 }
 
 fn check_and_audit_standalone_modules(
@@ -3522,23 +3516,11 @@ fn check_and_audit_standalone_modules(
     // (preserving `--no-auto-worktree-link` worktrees) and run Stage 1C / kernel replay over the outputs.
     let staging_base = store.fast_staging_dir();
     fs::create_dir_all(&staging_base)?;
-    let staging_raw = staging_base.join(format!(
-        "standalone_recheck_{}_{}",
-        std::process::id(),
-        pack::next_tmp_id()
-    ));
-    let _ = fs::remove_dir_all(&staging_raw);
-    fs::create_dir_all(&staging_raw)?;
-    let staging_dir = staging_raw.canonicalize().unwrap_or(staging_raw);
-    struct StagingGuard(Option<PathBuf>);
-    impl Drop for StagingGuard {
-        fn drop(&mut self) {
-            if let Some(ref p) = self.0 {
-                let _ = fs::remove_dir_all(p);
-            }
-        }
-    }
-    let mut staging_guard = StagingGuard(Some(staging_dir.clone()));
+    let scratch = crate::check::PrivateScratchDir::create(&staging_base, "standalone_recheck")?;
+    let staging_dir = scratch
+        .path
+        .canonicalize()
+        .unwrap_or_else(|_| scratch.path.clone());
     let olean_out_dir = staging_dir.join("oleans");
     fs::create_dir_all(&olean_out_dir)?;
 
@@ -3897,10 +3879,9 @@ fn check_and_audit_standalone_modules(
     }
 
     let overlay = if retain_oleans {
-        let root = staging_guard.0.take().expect("staging dir active");
         Some(StandaloneOleanOverlay {
             olean_dir: olean_out_dir,
-            staging_root: root,
+            _scratch: scratch,
         })
     } else {
         None
@@ -4667,20 +4648,10 @@ pub(crate) fn stage_lake_build_outputs(
     let fallback_shm_blobs = pack::shared_cas_blobs_dir();
     let has_distinct_fallback = fallback_shm_blobs != shared_blobs;
     let mut seen_prefix = [false; 256];
+    let mut created_parents: Vec<PathBuf> = Vec::new();
     let mut seen_shared_prefix = [false; 256];
     let mut seen_blobs = std::collections::HashSet::with_capacity(entries.len());
     let mut reg_blobs = Vec::with_capacity(entries.len());
-    let dest_ino = |d: &Path| -> i64 {
-        #[cfg(unix)]
-        {
-            fs::metadata(d).map(|m| m.ino() as i64).unwrap_or(0)
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = d;
-            0
-        }
-    };
 
     for (entry, (path, _, _, _, _, _, mode, _cand_ino)) in entries.iter().zip(candidates.iter()) {
         // Never hardlink `.lake/build` artifacts into CAS or mark them read-only (`0o444`):
@@ -4690,14 +4661,7 @@ pub(crate) fn stage_lake_build_outputs(
             let nlink = fs::metadata(path)?.nlink();
             if !preserve_lake && ((*mode & 0o200) == 0 || nlink > 1) {
                 let bytes = fs::read(path)?;
-                let tmp_detach = path.with_extension(format!(
-                    "detach_tmp.{}.{}",
-                    std::process::id(),
-                    pack::next_tmp_id()
-                ));
-                fs::write(&tmp_detach, &bytes)?;
-                fs::set_permissions(&tmp_detach, fs::Permissions::from_mode(0o644))?;
-                fs::rename(&tmp_detach, path)?;
+                crate::db::write_bytes_durable(path, &bytes, &[])?;
                 if fs::metadata(path)?.nlink() != 1 {
                     anyhow::bail!(
                         "Failed to detach `.lake/build` artifact `{}` from CAS hard-link",
@@ -4719,50 +4683,147 @@ pub(crate) fn stage_lake_build_outputs(
         if !seen_prefix[p_idx] {
             seen_prefix[p_idx] = true;
             if let Some(parent) = dest.parent() {
-                let _ = fs::create_dir(parent);
+                created_parents.extend(crate::db::ensure_dir_tracking(parent, &store.root)?);
             }
         }
         let shared_dir = shared_blobs.join(prefix);
         let shared_p = shared_dir.join(&entry.blob_hash);
         let fallback_p = fallback_shm_blobs.join(prefix).join(&entry.blob_hash);
         let mut sync_shared = |dest_p: &Path| {
-            if !seen_shared_prefix[p_idx] {
+            let shared_stop = shared_blobs.parent().unwrap_or(&shared_blobs);
+            let shared_created = if !seen_shared_prefix[p_idx] {
+                let Ok(dirs) = crate::db::ensure_dir_tracking(&shared_dir, shared_stop) else {
+                    return;
+                };
                 seen_shared_prefix[p_idx] = true;
-                let _ = fs::create_dir_all(&shared_dir);
-            }
-            if !shared_p.exists() {
-                let _ = fs::hard_link(dest_p, &shared_p);
+                dirs
+            } else {
+                Vec::new()
+            };
+            let shared_intact = crate::db::open_regular_nofollow(&shared_p)
+                .ok()
+                .is_some_and(|(mut sf, sm)| {
+                    use std::io::Read;
+                    #[cfg(unix)]
+                    let owned = crate::db::is_exclusively_created_immutable_cas_inode(
+                        &sm,
+                        &entry.blob_hash,
+                    );
+                    #[cfg(not(unix))]
+                    let owned = true;
+                    if !owned {
+                        return false;
+                    }
+                    let mut b = Vec::with_capacity(sm.len().min(64 * 1024 * 1024) as usize);
+                    sf.read_to_end(&mut b).is_ok()
+                        && b.len() as u64 == entry.size_bytes
+                        && blake3::hash(&b).to_hex().as_str() == entry.blob_hash
+                });
+            if !shared_intact {
+                let _ = crate::db::publish_verified_durable_blob(
+                    dest_p,
+                    &shared_p,
+                    &entry.blob_hash,
+                    entry.size_bytes,
+                    &shared_created,
+                );
+            } else {
+                for dir in &shared_created {
+                    let _ = crate::db::sync_dir(dir);
+                }
             }
         };
-        let ino = if fs::hard_link(&shared_p, &dest).is_ok()
-            || (has_distinct_fallback && fs::hard_link(&fallback_p, &dest).is_ok())
-        {
+        let existing_dest_ino =
+            crate::db::open_regular_nofollow(&dest)
+                .ok()
+                .and_then(|(mut f, m)| {
+                    use std::io::Read;
+                    #[cfg(unix)]
+                    if !crate::db::is_exclusively_created_immutable_cas_inode(&m, &entry.blob_hash)
+                    {
+                        return None;
+                    }
+                    let mut buf = Vec::with_capacity(m.len().min(64 * 1024 * 1024) as usize);
+                    if f.read_to_end(&mut buf).is_ok()
+                        && buf.len() as u64 == entry.size_bytes
+                        && blake3::hash(&buf).to_hex().as_str() == entry.blob_hash
+                    {
+                        crate::db::durability_barrier(&f).ok()?;
+                        Some(m.ino() as i64)
+                    } else {
+                        None
+                    }
+                });
+        let ino = if let Some(d_ino) = existing_dest_ino {
+            if let Some(parent) = dest.parent() {
+                crate::db::sync_dir(parent)?;
+            }
             sync_shared(&dest);
-            dest_ino(&dest)
-        } else if dest.exists() {
-            dest_ino(&dest)
+            d_ino
+        } else if let Ok(published_ino) = crate::db::publish_verified_durable_blob(
+            &shared_p,
+            &dest,
+            &entry.blob_hash,
+            entry.size_bytes,
+            &[],
+        )
+        .or_else(|e| {
+            if has_distinct_fallback {
+                crate::db::publish_verified_durable_blob(
+                    &fallback_p,
+                    &dest,
+                    &entry.blob_hash,
+                    entry.size_bytes,
+                    &[],
+                )
+            } else {
+                Err(e)
+            }
+        }) {
+            sync_shared(&dest);
+            published_ino
         } else {
-            let staging_dir = store.root.join("staging");
-            fs::create_dir_all(&staging_dir)?;
-            let tmp_dest = staging_dir.join(format!(
-                "{}.{}.{}.tmp",
-                entry.blob_hash,
-                std::process::id(),
-                pack::next_tmp_id()
-            ));
-            let bytes = fs::read(path)?;
+            let bytes = match fs::read(path) {
+                Ok(b) => b,
+                Err(e) => {
+                    created_parents.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+                    created_parents.dedup();
+                    for dir in &created_parents {
+                        let _ = crate::db::sync_dir(dir);
+                    }
+                    return Err(e.into());
+                }
+            };
             if blake3::hash(&bytes).to_hex().as_str() != entry.blob_hash {
+                created_parents.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+                created_parents.dedup();
+                for dir in &created_parents {
+                    let _ = crate::db::sync_dir(dir);
+                }
                 anyhow::bail!(
                     "Concurrent mutation detected while staging `{}` into CAS",
                     path.display()
                 );
             }
-            fs::write(&tmp_dest, &bytes)?;
-            #[cfg(unix)]
-            fs::set_permissions(&tmp_dest, fs::Permissions::from_mode(0o444))?;
-            fs::rename(&tmp_dest, &dest)?;
+            let (ino, _) = match crate::db::ensure_blob_file(
+                &store.root,
+                &dest,
+                &entry.blob_hash,
+                &bytes,
+                false,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    created_parents.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+                    created_parents.dedup();
+                    for dir in &created_parents {
+                        let _ = crate::db::sync_dir(dir);
+                    }
+                    return Err(e);
+                }
+            };
             sync_shared(&dest);
-            dest_ino(&dest)
+            ino
         };
         reg_blobs.push((
             entry.blob_hash.clone(),
@@ -4770,6 +4831,11 @@ pub(crate) fn stage_lake_build_outputs(
             entry.size_bytes as i64,
             ino,
         ));
+    }
+    created_parents.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    created_parents.dedup();
+    for dir in created_parents {
+        crate::db::sync_dir(&dir)?;
     }
 
     Ok((entries, reg_blobs))
@@ -4795,13 +4861,12 @@ pub fn dedup_worktree_packages(
         }));
     }
     #[cfg(unix)]
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::MetadataExt;
 
     let t0 = Instant::now();
     let lake_dir = project_dir.join(".lake");
     let packages_dir = lake_dir.join("packages");
     let pkg_cas_dir = store.root.join("pkg_cas");
-    let _ = fs::create_dir_all(&pkg_cas_dir);
 
     let mut purged_barrels = 0u64;
     let mut purged_git_packs = 0u64;
@@ -4810,8 +4875,8 @@ pub fn dedup_worktree_packages(
     let mut deduped_bytes = 0u64;
 
     if lake_dir.is_dir() {
+        let _pub_guard = crate::db::acquire_cas_publication_guard(&store.root)?;
         let mut stack = vec![lake_dir];
-        let mut seen_hash_cache: HashMap<(u64, u64), String> = HashMap::new();
         while let Some(dir) = stack.pop() {
             let Ok(entries) = fs::read_dir(&dir) else {
                 continue;
@@ -4863,79 +4928,59 @@ pub fn dedup_worktree_packages(
                     || name.ends_with(".olean.server")
                     || name.ends_with(".ilean");
                 if is_dedup_ext && path.starts_with(&packages_dir) {
-                    let Ok(meta) = entry.metadata() else {
+                    let Ok((mut src_file, meta)) = crate::db::open_regular_nofollow(&path) else {
                         continue;
                     };
-                    let sz = meta.len();
-                    if sz == 0 {
+                    if meta.len() == 0 {
                         continue;
                     }
-                    #[cfg(unix)]
-                    let file_ino = (meta.dev(), meta.ino());
-                    #[cfg(not(unix))]
-                    let file_ino = (0u64, 0u64);
-
-                    let hash_hex = if let Some(h) = seen_hash_cache.get(&file_ino) {
-                        h.clone()
-                    } else {
-                        let Ok(bytes) = fs::read(&path) else {
-                            continue;
-                        };
-                        let h = blake3::hash(&bytes).to_hex().to_string();
-                        if file_ino.1 != 0 {
-                            seen_hash_cache.insert(file_ino, h.clone());
-                        }
-                        h
-                    };
+                    use std::io::Read;
+                    let mut bytes = Vec::with_capacity(meta.len() as usize);
+                    if src_file.read_to_end(&mut bytes).is_err() || bytes.is_empty() {
+                        continue;
+                    }
+                    drop(src_file);
+                    let sz = bytes.len() as u64;
+                    let hash_hex = blake3::hash(&bytes).to_hex().to_string();
 
                     let shard_dir = pkg_cas_dir.join(&hash_hex[0..2]);
-                    let _ = fs::create_dir_all(&shard_dir);
+                    let Ok(_created) = crate::db::ensure_dir_tracking(&shard_dir, &store.root)
+                    else {
+                        continue;
+                    };
                     let cas_file = shard_dir.join(&hash_hex);
 
-                    if let Ok(cas_meta) = fs::metadata(&cas_file) {
-                        #[cfg(unix)]
-                        let same_inode =
-                            cas_meta.dev() == meta.dev() && cas_meta.ino() == meta.ino();
-                        #[cfg(not(unix))]
-                        let same_inode = false;
+                    let cas_ready = crate::db::ensure_blob_file(
+                        &store.root,
+                        &cas_file,
+                        &hash_hex,
+                        &bytes,
+                        false,
+                    )
+                    .is_ok();
 
-                        if !same_inode
-                            && crate::db::try_reflink_or_hardlink(&cas_file, &path, None).is_ok()
+                    if cas_ready {
+                        #[cfg(unix)]
+                        let already_same_cas_inode = crate::db::open_regular_nofollow(&cas_file)
+                            .ok()
+                            .is_some_and(|(_cf, cm)| {
+                                cm.dev() == meta.dev()
+                                    && cm.ino() == meta.ino()
+                                    && crate::db::is_exclusively_created_immutable_cas_inode(
+                                        &cm, &hash_hex,
+                                    )
+                            });
+                        #[cfg(not(unix))]
+                        let already_same_cas_inode = false;
+
+                        if !already_same_cas_inode
+                            && crate::db::install_verified_blob_to_path(
+                                &cas_file, &path, &hash_hex, sz,
+                            )
+                            .is_ok()
                         {
                             hardlinked_files += 1;
                             deduped_bytes += sz;
-                        }
-                    } else {
-                        #[cfg(unix)]
-                        {
-                            let mut perms = meta.permissions();
-                            if (perms.mode() & 0o222) != 0 {
-                                perms.set_mode(0o444);
-                                let _ = fs::set_permissions(&path, perms);
-                            }
-                        }
-                        if fs::hard_link(&path, &cas_file).is_ok() {
-                            hardlinked_files += 1;
-                        } else {
-                            let tmp_cas =
-                                shard_dir.join(format!("{}.{}.tmp", hash_hex, std::process::id()));
-                            if fs::copy(&path, &tmp_cas).is_ok() {
-                                #[cfg(unix)]
-                                if let Ok(tm) = fs::metadata(&tmp_cas) {
-                                    let mut perms = tm.permissions();
-                                    perms.set_mode(0o444);
-                                    let _ = fs::set_permissions(&tmp_cas, perms);
-                                }
-                                if fs::rename(&tmp_cas, &cas_file).is_ok() {
-                                    if crate::db::try_reflink_or_hardlink(&cas_file, &path, None)
-                                        .is_ok()
-                                    {
-                                        hardlinked_files += 1;
-                                    }
-                                } else {
-                                    let _ = fs::remove_file(&tmp_cas);
-                                }
-                            }
                         }
                     }
                 }
@@ -5066,6 +5111,7 @@ pub fn run_build_command(
             let resolved_env = resolve_or_share_lake_env(store, &canon_dir, &env_key)?;
 
             let dur_ms = t0.elapsed().as_millis() as i64;
+            let _pub_guard = crate::db::acquire_cas_publication_guard(&store.root)?;
             let (outputs, reg_blobs) = stage_lake_build_outputs(store, &canon_dir)?;
             let lake_env_to_put = resolved_env
                 .as_ref()
@@ -5086,6 +5132,7 @@ pub fn run_build_command(
                 lake_env_to_put,
                 None,
             )?;
+            drop(_pub_guard);
             if !crate::zygote::daemon_disabled() {
                 if let Some((ref env_vars, _)) = resolved_env {
                     pack::warm_local_zygote_daemon_nonblocking(store, env_vars);
@@ -6148,6 +6195,184 @@ mod tests {
                 .exists(),
             ".turbo_verified_sources.json must not be copied into worktree"
         );
+
+        match saved_wt_env {
+            Some(v) => std::env::set_var("TURBO_LEAN_NO_WORKTREE_LINK", v),
+            None => std::env::remove_var("TURBO_LEAN_NO_WORKTREE_LINK"),
+        }
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_dedup_worktree_packages_verifies_cas_digest_and_stages_exact_bytes() -> Result<()> {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let saved_wt_env = std::env::var("TURBO_LEAN_NO_WORKTREE_LINK").ok();
+        std::env::remove_var("TURBO_LEAN_NO_WORKTREE_LINK");
+        #[cfg(unix)]
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_dedup_digest_test_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let cache_dir = tmp_dir.join("cache");
+        let wt = tmp_dir.join("wt");
+        let pkg_dir = wt.join(".lake/packages/dep/.lake/build/lib/lean/Dep");
+        fs::create_dir_all(&pkg_dir)?;
+
+        let store = TurboStore::open(Some(&cache_dir))?;
+        let good_bytes = vec![0x5Au8; 1024];
+        let good_hash = blake3::hash(&good_bytes).to_hex().to_string();
+        let cas_file = store
+            .root
+            .join("pkg_cas")
+            .join(&good_hash[..2])
+            .join(&good_hash);
+        fs::create_dir_all(cas_file.parent().unwrap())?;
+        // Pre-seed a corrupt `pkg_cas` entry with the EXACT same byte length (1024 bytes).
+        fs::write(&cas_file, vec![0xFFu8; 1024])?;
+
+        let olean_a = pkg_dir.join("A.olean");
+        let olean_b = pkg_dir.join("B.olean");
+        fs::write(&olean_a, &good_bytes)?;
+        fs::write(&olean_b, &good_bytes)?;
+
+        // Also place two hardlinked files sharing an inode (`C.olean` and `D.olean`), keep an
+        // already-open writable descriptor on `C.olean` BEFORE setting mode `0o444`, and mutate
+        // `C.olean` in-place (same byte length!) via that pre-opened writable fd. Permissions do
+        // not revoke an open writable fd: `dedup_worktree_packages` must never reuse a stale hash
+        // from `(dev, ino, len, 0o444)` alone, and must stage the true mutated bytes.
+        let orig_shared_bytes = vec![0x3Cu8; 768];
+        let olean_c = pkg_dir.join("C.olean");
+        let olean_d = pkg_dir.join("D.olean");
+        let mut pre_open_rw = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&olean_c)?;
+        std::io::Write::write_all(&mut pre_open_rw, &orig_shared_bytes)?;
+        fs::hard_link(&olean_c, &olean_d)?;
+        #[cfg(unix)]
+        {
+            let mut ro = fs::metadata(&olean_c)?.permissions();
+            ro.set_mode(0o444);
+            fs::set_permissions(&olean_c, ro)?;
+        }
+        // First dedup pass records `orig_shared_bytes` into `pkg_cas`.
+        let rep0 = dedup_worktree_packages(&store, &wt)?;
+        assert_eq!(rep0["status"], "worktree_packages_deduped");
+        // Now mutate `pre_open_rw` (or re-create a hardlinked `0o444` pair with open writable fd)
+        // to prove a `0o444` hardlinked pair mutated via an open writable descriptor between or
+        // during dedup is hashed from live bytes rather than cached inode metadata.
+        let olean_e = pkg_dir.join("E.olean");
+        let olean_f = pkg_dir.join("F.olean");
+        let mut rw_ef = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&olean_e)?;
+        std::io::Write::write_all(&mut rw_ef, &orig_shared_bytes)?;
+        fs::hard_link(&olean_e, &olean_f)?;
+        #[cfg(unix)]
+        {
+            let mut ro = fs::metadata(&olean_e)?.permissions();
+            ro.set_mode(0o444);
+            fs::set_permissions(&olean_e, ro)?;
+        }
+        // Mutate same-length `0o444` inode through the already-open writable descriptor!
+        let mutated_shared_bytes = vec![0x99u8; 768];
+        use std::io::Seek;
+        rw_ef.seek(std::io::SeekFrom::Start(0))?;
+        std::io::Write::write_all(&mut rw_ef, &mutated_shared_bytes)?;
+        drop(rw_ef);
+        drop(pre_open_rw);
+
+        let rep = dedup_worktree_packages(&store, &wt)?;
+        assert_eq!(rep["status"], "worktree_packages_deduped");
+        assert_eq!(
+            fs::read(&cas_file)?,
+            good_bytes,
+            "same-size corrupt pkg_cas entry must be replaced with digest-verified bytes, never linked over worktree files"
+        );
+        assert_eq!(fs::read(&olean_a)?, good_bytes);
+        assert_eq!(fs::read(&olean_b)?, good_bytes);
+        assert_eq!(fs::read(&olean_c)?, orig_shared_bytes);
+        assert_eq!(fs::read(&olean_d)?, orig_shared_bytes);
+        assert_eq!(
+            fs::read(&olean_e)?,
+            mutated_shared_bytes,
+            "0o444 inode mutated via open writable fd must hash actual bytes, never reuse orig_shared_bytes CAS blob"
+        );
+        assert_eq!(fs::read(&olean_f)?, mutated_shared_bytes);
+        let mutated_hash = blake3::hash(&mutated_shared_bytes).to_hex().to_string();
+        let mutated_cas = store
+            .root
+            .join("pkg_cas")
+            .join(&mutated_hash[..2])
+            .join(&mutated_hash);
+        assert_eq!(fs::read(&mutated_cas)?, mutated_shared_bytes);
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                fs::metadata(&olean_a)?.ino(),
+                fs::metadata(&cas_file)?.ino()
+            );
+            assert_eq!(
+                fs::metadata(&olean_b)?.ino(),
+                fs::metadata(&cas_file)?.ino()
+            );
+            assert_eq!(fs::metadata(&cas_file)?.permissions().mode() & 0o222, 0);
+            assert_eq!(fs::metadata(&olean_c)?.ino(), fs::metadata(&olean_d)?.ino());
+            assert_eq!(fs::metadata(&olean_c)?.permissions().mode() & 0o222, 0);
+            assert_eq!(
+                fs::metadata(&olean_e)?.ino(),
+                fs::metadata(&mutated_cas)?.ino()
+            );
+            assert_eq!(
+                fs::metadata(&olean_f)?.ino(),
+                fs::metadata(&mutated_cas)?.ino()
+            );
+
+            // Also verify `dedup_worktree_packages` isolates against a pre-existing unstamped
+            // `pkg_cas` inode that has a retained open writable descriptor: dedup must replace
+            // `pkg_cas` with a fresh store-owned inode so post-dedup writes to the retained fd
+            // cannot corrupt either `pkg_cas` or deduplicated package artifacts!
+            let leaked_bytes = vec![0x77u8; 640];
+            let leaked_hash = blake3::hash(&leaked_bytes).to_hex().to_string();
+            let leaked_cas = store
+                .root
+                .join("pkg_cas")
+                .join(&leaked_hash[..2])
+                .join(&leaked_hash);
+            fs::create_dir_all(leaked_cas.parent().unwrap())?;
+            let mut retained_cas_rw = fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&leaked_cas)?;
+            std::io::Write::write_all(&mut retained_cas_rw, &leaked_bytes)?;
+            let old_cas_ino = retained_cas_rw.metadata()?.ino();
+            let olean_g = pkg_dir.join("G.olean");
+            let olean_h = pkg_dir.join("H.olean");
+            fs::write(&olean_g, &leaked_bytes)?;
+            fs::write(&olean_h, &leaked_bytes)?;
+            dedup_worktree_packages(&store, &wt)?;
+            assert_ne!(fs::metadata(&leaked_cas)?.ino(), old_cas_ino);
+            retained_cas_rw.seek(std::io::SeekFrom::Start(0))?;
+            std::io::Write::write_all(&mut retained_cas_rw, &vec![0xEEu8; 640])?;
+            drop(retained_cas_rw);
+            assert_eq!(fs::read(&leaked_cas)?, leaked_bytes);
+            assert_eq!(fs::read(&olean_g)?, leaked_bytes);
+            assert_eq!(fs::read(&olean_h)?, leaked_bytes);
+        }
 
         match saved_wt_env {
             Some(v) => std::env::set_var("TURBO_LEAN_NO_WORKTREE_LINK", v),

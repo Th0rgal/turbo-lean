@@ -936,11 +936,8 @@ fn run(cli: Cli) -> Result<()> {
         None;
     let mut prefetched_manifest: Option<std::thread::JoinHandle<Option<pack::DeltaManifest>>> =
         None;
-    #[allow(clippy::type_complexity)]
     let mut prefetched_import: Option<
-        std::thread::JoinHandle<
-            Option<(pack::PackManifest, Vec<(String, String, i64, i64)>, usize)>,
-        >,
+        std::thread::JoinHandle<Option<pack::PrefetchedPackPrestage>>,
     > = None;
     if let Commands::Import {
         ref input,
@@ -1177,8 +1174,10 @@ fn run(cli: Cli) -> Result<()> {
                 prefetched_export = Some(std::thread::spawn(move || {
                     let bytes = pack::http_request("GET", &url, "application/octet-stream", &[])?;
                     let prestaged = pack::try_parse_v3_header(&bytes).and_then(|manifest| {
+                        let pub_guard =
+                            crate::db::acquire_cas_publication_guard(&root_for_prestage).ok()?;
                         pack::prestage_blobs_from_shared_cas(&root_for_prestage, &manifest)
-                            .map(|(staged, n)| (manifest, staged, n))
+                            .map(|(staged, n)| (manifest, staged, n, pub_guard))
                     });
                     Ok((bytes, prestaged))
                 }));
