@@ -12,6 +12,270 @@ private def lnirTypeToCType : LNIRType → String
   | .usize => "size_t" | .u256 | .i256 => "const uint64_t*" | .f32 => "float" | .f64 => "double"
   | .rawPtr _ | .sarray _ | .objPtr | .taggedPtr | .storageMap => "void*" | .unit => "void"
 
+/-- C pointer and `size_t` width. Native LP64 targets are 8 bytes; `wasm32` is 4 bytes. -/
+inductive ArchWidth where
+  | bits64
+  | bits32
+  deriving Repr, DecidableEq, Inhabited, BEq
+
+namespace ArchWidth
+
+/-- Byte size of `void*` and `size_t` for this width. -/
+def ptrBytes : ArchWidth → Nat
+  | .bits64 => 8
+  | .bits32 => 4
+
+/-- Exclusive upper bound of the unsigned address space (`2^64` vs `2^32`). -/
+def addrLimit : ArchWidth → Nat
+  | .bits64 => 2 ^ 64
+  | .bits32 => 2 ^ 32
+
+/-- Maximum representable unsigned `uintptr_t` / `size_t` (`2^64 - 1` vs `2^32 - 1`). -/
+def maxAddr (w : ArchWidth) : Nat := w.addrLimit - 1
+
+/-- `TargetArch` selects the C99 pointer width used by slice typedefs and static asserts. -/
+def ofTargetArch : TargetArch → ArchWidth
+  | .wasm32 => .bits32
+  | _ => .bits64
+
+end ArchWidth
+
+/-!
+# Typed C99 ABI layout and slice marshaling
+
+These definitions compute the C99 layout that header and shim emission follow.
+Validation rejects zero alignment, an offset that is not a multiple of the field
+alignment, a strided slice whose `(len - 1) * byteStride + elemSize` span overflows
+or wraps the target pointer width (`ArchWidth`), a misaligned `dataPtr`, and a null
+pointer to a non-empty slice.
+-/
+
+/-- Unboxed C99 scalar carried by a generated binding. -/
+inductive C99ScalarType where
+  | u8 | u16 | u32 | u64 | usize | i64 | f32 | f64 | ptr | constPtr
+  deriving Repr, DecidableEq, Inhabited
+
+namespace C99ScalarType
+
+/-- Natural C99 size in bytes parameterized by target pointer width (`8` on LP64, `4` on `wasm32`). -/
+def sizeOf (ty : C99ScalarType) (width : ArchWidth := .bits64) : Nat :=
+  match ty with
+  | .u8 => 1
+  | .u16 => 2
+  | .u32 | .f32 => 4
+  | .u64 | .i64 | .f64 => 8
+  | .usize | .ptr | .constPtr => width.ptrBytes
+
+/-- Natural C99 alignment in bytes parameterized by target pointer width. -/
+def alignOf (ty : C99ScalarType) (width : ArchWidth := .bits64) : Nat :=
+  match ty, width with
+  | .u64, .bits32 | .i64, .bits32 | .f64, .bits32 => 8
+  | _, _ => ty.sizeOf width
+
+/-- C spelling used by the generated header. -/
+def cSpelling : C99ScalarType → String
+  | .u8 => "uint8_t" | .u16 => "uint16_t" | .u32 => "uint32_t" | .u64 => "uint64_t"
+  | .usize => "size_t" | .i64 => "int64_t" | .f32 => "float" | .f64 => "double"
+  | .ptr => "void*" | .constPtr => "const void*"
+
+end C99ScalarType
+
+/-- One field before offsets are assigned. -/
+structure C99FieldSpec where
+  name : String
+  ty : C99ScalarType
+  deriving Repr, DecidableEq, Inhabited
+
+/-- One field after natural alignment has assigned its byte interval. -/
+structure C99FieldLayout where
+  name : String
+  ty : C99ScalarType
+  offset : Nat
+  size : Nat
+  align : Nat
+  deriving Repr, DecidableEq, Inhabited
+
+namespace C99FieldLayout
+
+/-- Half-open byte interval occupied by the field. -/
+def byteEnd (f : C99FieldLayout) : Nat := f.offset + f.size
+
+/-- The alignment is positive and divides the assigned offset. -/
+def isAligned (f : C99FieldLayout) : Prop :=
+  f.align ≠ 0 ∧ f.offset % f.align = 0
+
+end C99FieldLayout
+
+/-- Complete C99 aggregate: field intervals, struct alignment, and `sizeof`. -/
+structure C99StructLayout where
+  name : String
+  fields : List C99FieldLayout
+  structAlign : Nat
+  structSize : Nat
+  deriving Repr, DecidableEq, Inhabited
+
+/-- Explicit C99 slice descriptor: pointer, element count, stride, element size,alignment, and backing buffer byte capacity. -/
+structure C99SliceDesc where
+  dataPtr : Option Nat
+  len : Nat
+  byteStride : Nat
+  elemSize : Nat
+  align : Nat
+  backingBytes : Nat := 0
+  deriving Repr, DecidableEq, Inhabited
+
+/-- Typed C function signature derived from scalar layouts. -/
+structure C99FnSig where
+  cSymbol : String
+  params : List C99FieldSpec
+  retTy : C99ScalarType
+  deriving Repr, DecidableEq, Inhabited
+
+/-- Round `n` up to the next positive multiple of `a`; zero alignment fails closed. -/
+def c99AlignUp (n a : Nat) : Option Nat :=
+  if a = 0 then none else some ((n + (a - 1)) / a * a)
+
+/-- Maximum of two natural numbers. -/
+def c99NatMax (a b : Nat) : Nat := if a < b then b else a
+
+/-- Place one field at the next naturally aligned offset for `width`. -/
+def placeC99Field (off : Nat) (spec : C99FieldSpec) (width : ArchWidth := .bits64) : Option (C99FieldLayout × Nat) :=
+  let sz := spec.ty.sizeOf width
+  let al := spec.ty.alignOf width
+  match c99AlignUp off al with
+  | none => none
+  | some aligned =>
+    some ({ name := spec.name, ty := spec.ty, offset := aligned, size := sz, align := al }, aligned + sz)
+
+/-- Place every field starting at `off`, returning placed fields and the running maximum alignment. -/
+def placeC99FieldsFrom (specs : List C99FieldSpec) (off : Nat) (maxA : Nat) (width : ArchWidth := .bits64) :
+    Option (List C99FieldLayout × Nat) :=
+  match specs with
+  | [] => some ([], maxA)
+  | spec :: rs =>
+    match placeC99Field off spec width with
+    | none => none
+    | some (field, nextOff) =>
+      match placeC99FieldsFrom rs nextOff (c99NatMax maxA field.align) width with
+      | none => none
+      | some (restFields, finalAlign) => some (field :: restFields, finalAlign)
+
+/-- Place every field from offset `0` with base alignment `1`. -/
+def placeC99Fields (specs : List C99FieldSpec) (width : ArchWidth := .bits64) : Option (List C99FieldLayout × Nat) :=
+  placeC99FieldsFrom specs 0 1 width
+
+/-- Rightmost occupied byte of a field list. -/
+def c99OccupiedEnd : List C99FieldLayout → Nat
+  | [] => 0
+  | f :: fs => c99NatMax f.byteEnd (c99OccupiedEnd fs)
+
+/-- Place fields at naturally aligned offsets and round `sizeof` up to the struct alignment. -/
+def computeC99StructLayout (name : String) (specs : List C99FieldSpec) (width : ArchWidth := .bits64) :
+    Option C99StructLayout :=
+  match placeC99Fields specs width with
+  | none => none
+  | some (placed, maxAlign) =>
+    match c99AlignUp (c99OccupiedEnd placed) maxAlign with
+    | none => none
+    | some sz => some { name, fields := placed, structAlign := maxAlign, structSize := sz }
+
+/-- Two half-open intervals do not overlap. -/
+def c99IntervalsDisjoint (a0 a1 b0 b1 : Nat) : Prop :=
+  a1 ≤ b0 ∨ b1 ≤ a0
+
+/-- Every pair of distinct field intervals in list order is strictly disjoint. -/
+def fieldsPairwiseDisjoint : List C99FieldLayout → Prop
+  | [] => True
+  | f :: fs => (∀ g ∈ fs, c99IntervalsDisjoint f.offset f.byteEnd g.offset g.byteEnd) ∧ fieldsPairwiseDisjoint fs
+
+/-- A computed layout has positive alignment, aligned fields, disjoint intervals, and covering `sizeof`. -/
+def c99LayoutSound (layout : C99StructLayout) (width : ArchWidth := .bits64) : Prop :=
+  layout.structAlign ≠ 0 ∧ layout.structAlign ∣ layout.structSize ∧
+  (∀ f ∈ layout.fields, f.isAligned ∧ f.size = f.ty.sizeOf width ∧ f.align = f.ty.alignOf width) ∧
+  fieldsPairwiseDisjoint layout.fields ∧
+  (∀ f ∈ layout.fields, f.byteEnd ≤ layout.structSize)
+
+/-- Checked product bounded by `width.maxAddr`. `none` is the only result on unsigned overflow. -/
+def checkedByteLen (len elemBytes : Nat) (width : ArchWidth := .bits64) : Option Nat :=
+  if elemBytes = 0 then some 0
+  else if len ≤ width.maxAddr / elemBytes then some (len * elemBytes)
+  else none
+
+/-- Exact physical byte span `(len - 1) * byteStride + elemSize` (or `0` when `len = 0`)
+    for a strided slice, checked against unsigned overflow in `width`. -/
+def checkedStridedSpan (len byteStride elemSize : Nat) (width : ArchWidth := .bits64) : Option Nat :=
+  if elemSize = 0 ∨ byteStride < elemSize then none
+  else if len = 0 then some 0
+  else if byteStride = 0 then none
+  else if len - 1 ≤ width.maxAddr / byteStride then
+    let lastOff := (len - 1) * byteStride
+    if lastOff + elemSize < width.addrLimit then some (lastOff + elemSize) else none
+  else none
+
+/-- Pure arithmetic byte span of `len` elements with `byteStride` and `elemSize`. -/
+def stridedByteSpan (len byteStride elemSize : Nat) : Nat :=
+  if len = 0 then 0 else (len - 1) * byteStride + elemSize
+
+/-- A slice is marshalable when its geometry is aligned, its strided byte span fits in `width`
+    and `backingBytes`, and any present `dataPtr` is `align`-aligned without pointer wrap-around. -/
+def validC99Slice (s : C99SliceDesc) (width : ArchWidth := .bits64) : Prop :=
+  s.align ≠ 0 ∧ s.elemSize ≠ 0 ∧ s.elemSize ≤ s.byteStride ∧
+  s.byteStride % s.align = 0 ∧ s.elemSize % s.align = 0 ∧
+  ∃ span,
+    checkedStridedSpan s.len s.byteStride s.elemSize width = some span ∧
+    (s.backingBytes = 0 ∨ span ≤ s.backingBytes) ∧
+    match s.dataPtr with
+    | none => s.len = 0
+    | some ptr => ptr % s.align = 0 ∧ ptr + span ≤ width.addrLimit
+
+/-- Validate a slice before a shim may pass it across the C boundary. -/
+def validateC99Slice (s : C99SliceDesc) (width : ArchWidth := .bits64) : Bool :=
+  s.align != 0 && s.elemSize != 0 && s.elemSize ≤ s.byteStride &&
+  s.byteStride % s.align == 0 && s.elemSize % s.align == 0 &&
+  match checkedStridedSpan s.len s.byteStride s.elemSize width with
+  | none => false
+  | some span =>
+    (s.backingBytes == 0 || span ≤ s.backingBytes) &&
+    match s.dataPtr with
+    | none => s.len == 0
+    | some ptr => ptr % s.align == 0 && ptr + span ≤ width.addrLimit
+
+/-- Canonical field specification of `lean_native_flat_slice_t`. -/
+def flatSliceFieldSpecs : List C99FieldSpec :=
+  [ { name := "data", ty := .constPtr },
+    { name := "len", ty := .usize },
+    { name := "stride_bytes", ty := .usize } ]
+
+/-- Canonical field specification of `lean_native_mut_slice_t`. -/
+def mutSliceFieldSpecs : List C99FieldSpec :=
+  [ { name := "data", ty := .ptr },
+    { name := "len", ty := .usize },
+    { name := "cap", ty := .usize } ]
+
+/-- Render a single-line C99 `typedef struct { ... } name;` from a computed `C99StructLayout`. -/
+def emitInlineC99Typedef (layout : C99StructLayout) : String :=
+  let fields := String.intercalate " " (layout.fields.map fun f => s!"{f.ty.cSpelling} {f.name};")
+  s!"typedef struct \{ {fields} } {layout.name};"
+
+/-- Render C11 `_Static_assert`s verifying `sizeof` for a computed struct layout across LP64 and ILP32/`wasm32`. -/
+def emitSliceStaticAsserts (flat64 mut64 flat32 mut32 : C99StructLayout) : List String :=
+  [ "#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L",
+    "#if defined(__wasm32__) || (defined(UINTPTR_MAX) && UINTPTR_MAX == 0xFFFFFFFFU)",
+    s!"_Static_assert(sizeof({flat32.name}) == {flat32.structSize}, \"{flat32.name} size == {flat32.structSize}\");",
+    s!"_Static_assert(sizeof({mut32.name}) == {mut32.structSize}, \"{mut32.name} size == {mut32.structSize}\");",
+    "#else",
+    s!"_Static_assert(sizeof({flat64.name}) == {flat64.structSize}, \"{flat64.name} size == {flat64.structSize}\");",
+    s!"_Static_assert(sizeof({mut64.name}) == {mut64.structSize}, \"{mut64.name} size == {mut64.structSize}\");",
+    "#endif",
+    "#endif" ]
+
+/-- Render target-specific C11 `_Static_assert`s when an explicit `ArchWidth` is pinned. -/
+def emitPinnedSliceStaticAsserts (flatLayout mutLayout : C99StructLayout) : List String :=
+  [ "#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L",
+    s!"_Static_assert(sizeof({flatLayout.name}) == {flatLayout.structSize}, \"{flatLayout.name} size == {flatLayout.structSize}\");",
+    s!"_Static_assert(sizeof({mutLayout.name}) == {mutLayout.structSize}, \"{mutLayout.name} size == {mutLayout.structSize}\");",
+    "#endif" ]
+
 private def lnirTypeToRustType : LNIRType → String
   | .i1 | .i8 => "u8" | .i16 | .f16 => "u16" | .i32 => "u32" | .i64 | .tuple _ => "u64"
   | .usize => "usize" | .u256 | .i256 => "*const u64" | .f32 => "f32" | .f64 => "f64"
@@ -170,28 +434,45 @@ def readLeanSourceExpandingUmbrella (filePath : String) : IO String := do
       outLines := outLines.push line
   return String.intercalate "\n" outLines.toList
 
-/-- `note?` (e.g. `signaturesOnlyMarker`) is recorded as provenance metadata in every emitted artifact. -/
-def emitCAbiHeaderFromSigs (sigs : List CAbiBindingSig) (note? : Option String := none) : String :=
+/-- `note?` (e.g. `signaturesOnlyMarker`) is recorded as provenance metadata in every emitted artifact.
+    Slice typedefs (`lean_native_flat_slice_t`, `lean_native_mut_slice_t`) and C11 `_Static_assert`s
+    are derived directly from `computeC99StructLayout` across `ArchWidth` (`24` bytes on 64-bit LP64,
+    `12` bytes on 32-bit `wasm32`). -/
+def emitCAbiHeaderFromSigs (sigs : List CAbiBindingSig) (note? : Option String := none)
+    (width? : Option ArchWidth := none) : String :=
   let declProtos := sigs.map fun s =>
     let paramsC := if s.params.isEmpty then "void" else String.intercalate ", " (s.params.map fun (n, cTy, _) => s!"{cTy} {n}")
     s!"{s.retCType} {s.cSymbol}({paramsC});"
+  let activeWidth := width?.getD .bits64
+  let flat64 := (computeC99StructLayout "lean_native_flat_slice_t" flatSliceFieldSpecs .bits64).getD
+    { name := "lean_native_flat_slice_t", fields := [], structAlign := 8, structSize := 24 }
+  let mut64 := (computeC99StructLayout "lean_native_mut_slice_t" mutSliceFieldSpecs .bits64).getD
+    { name := "lean_native_mut_slice_t", fields := [], structAlign := 8, structSize := 24 }
+  let flat32 := (computeC99StructLayout "lean_native_flat_slice_t" flatSliceFieldSpecs .bits32).getD
+    { name := "lean_native_flat_slice_t", fields := [], structAlign := 4, structSize := 12 }
+  let mut32 := (computeC99StructLayout "lean_native_mut_slice_t" mutSliceFieldSpecs .bits32).getD
+    { name := "lean_native_mut_slice_t", fields := [], structAlign := 4, structSize := 12 }
+  let activeFlat := if activeWidth == .bits32 then flat32 else flat64
+  let activeMut := if activeWidth == .bits32 then mut32 else mut64
+  let staticAsserts := match width? with
+    | some .bits32 => emitPinnedSliceStaticAsserts flat32 mut32
+    | some .bits64 => emitPinnedSliceStaticAsserts flat64 mut64
+    | none => emitSliceStaticAsserts flat64 mut64 flat32 mut32
   String.intercalate "\n" ([
-    "/* Auto-generated C99 Header by lean-native C-ABI Binding Generator */"] ++
+    "/* Auto-generated C99 Header by lean-native C-ABI Binding Generator */",
+    s!"/* ABI Slice Layout ({if activeWidth == .bits32 then "ILP32/wasm32" else "LP64"}): sizeof({activeFlat.name}) == {activeFlat.structSize}, alignof == {activeFlat.structAlign} */"] ++
     (note?.map (s!"/* {·} */")).toList ++ [
     "#pragma once", "#ifndef LEAN_NATIVE_GENERATED_C_ABI_H", "#define LEAN_NATIVE_GENERATED_C_ABI_H",
     "#include <stdint.h>", "#include <stddef.h>",
-    "typedef struct { const void* data; size_t len; size_t stride_bytes; } lean_native_flat_slice_t;",
-    "typedef struct { void* data; size_t len; size_t cap; } lean_native_mut_slice_t;",
+    emitInlineC99Typedef activeFlat,
+    emitInlineC99Typedef activeMut,
     "/* Zero-Runtime SliceOut C-ABI Contract: packed u64 span (start:32 | len:24 | kind:8) */",
     "typedef uint32_t (*lean_native_slice_out_scan_fn)(const uint8_t* ptr, size_t len, uint64_t* out_spans, size_t cap, uint64_t* state_io);",
     "static inline uint64_t lean_native_pack_span(uint32_t start, uint32_t len, uint8_t kind) { return ((uint64_t)start << 32) | ((uint64_t)(len & 0xFFFFFFU) << 8) | (uint64_t)kind; }",
     "static inline uint32_t lean_native_span_start(uint64_t span) { return (uint32_t)(span >> 32); }",
     "static inline uint32_t lean_native_span_len(uint64_t span) { return (uint32_t)((span >> 8) & 0xFFFFFFU); }",
-    "static inline uint8_t lean_native_span_kind(uint64_t span) { return (uint8_t)(span & 0xFFU); }",
-    "#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L",
-    "_Static_assert(sizeof(lean_native_flat_slice_t) == 24, \"lean_native_flat_slice_t size == 24\");",
-    "_Static_assert(sizeof(lean_native_mut_slice_t) == 24, \"lean_native_mut_slice_t size == 24\");",
-    "#endif",
+    "static inline uint8_t lean_native_span_kind(uint64_t span) { return (uint8_t)(span & 0xFFU); }"
+  ] ++ staticAsserts ++ [
     "#ifdef __cplusplus", "extern \"C\" {", "#endif"
   ] ++ declProtos ++ [
     "#ifdef __cplusplus", "}", "#endif", "#endif /* LEAN_NATIVE_GENERATED_C_ABI_H */", ""])
@@ -257,9 +538,9 @@ def emitCAbiSwiftFromSigs (sigs : List CAbiBindingSig) (enumName : String := "Tu
     s!"public enum {enumName} \{"
   ] ++ enumMethods ++ ["}", ""])
 
-/-- Emit a C-ABI header (`.h`) for an `LNIRModule`. -/
-def emitCAbiHeader (m : LNIRModule) : String :=
-  emitCAbiHeaderFromSigs (moduleToCAbiSigs m)
+/-- Emit a C-ABI header (`.h`) for an `LNIRModule` parameterized by optional target `ArchWidth`. -/
+def emitCAbiHeader (m : LNIRModule) (arch? : Option TargetArch := none) : String :=
+  emitCAbiHeaderFromSigs (moduleToCAbiSigs m) none (arch?.map ArchWidth.ofTargetArch)
 
 /-- Publish one file by POSIX rename from an exclusively reserved sibling directory.
     Preserves any previous file on staging failure; power-loss durability is assumed. -/
@@ -449,188 +730,79 @@ def verifyStaticArchiveFile (path : String) (expectedObj : ByteArray) : IO (Bool
     (true, "parsed archive with exactly one byte-identical object member")
   else (false, s!"archive '{path}' is malformed or does not bind exactly the expected object")
 
-/-!
-# Typed C99 ABI layout and slice marshaling
-
-These definitions compute the C99 layout that header and shim emission must follow.
-Validation rejects zero alignment, an offset that is not a multiple of the field
-alignment, a slice whose `len * elem_size` does not fit in 64 bits, and a null
-pointer to a non-empty slice. Existing signature and archive emitters above are unchanged.
--/
-
-/-- Unboxed C99 scalar carried by a generated binding. -/
-inductive C99ScalarType where
-  | u8 | u16 | u32 | u64 | usize | i64 | f32 | f64 | ptr
-  deriving Repr, DecidableEq, Inhabited
-
-namespace C99ScalarType
-
-/-- Natural C99 size in bytes. Pointers use the LP64 size. -/
-def sizeOf : C99ScalarType → Nat
-  | .u8 => 1 | .u16 => 2 | .u32 | .f32 => 4 | .u64 | .i64 | .f64 | .usize | .ptr => 8
-
-/-- Natural C99 alignment in bytes. Every scalar alignment is positive. -/
-def alignOf : C99ScalarType → Nat
-  | ty => ty.sizeOf
-
-/-- C spelling used by the generated header. -/
-def cSpelling : C99ScalarType → String
-  | .u8 => "uint8_t" | .u16 => "uint16_t" | .u32 => "uint32_t" | .u64 => "uint64_t"
-  | .usize => "size_t" | .i64 => "int64_t" | .f32 => "float" | .f64 => "double" | .ptr => "void*"
-
-end C99ScalarType
-
-/-- One field before offsets are assigned. -/
-structure C99FieldSpec where
-  name : String
-  ty : C99ScalarType
-  deriving Repr, DecidableEq, Inhabited
-
-/-- One field after natural alignment has assigned its byte interval. -/
-structure C99FieldLayout where
-  name : String
-  ty : C99ScalarType
-  offset : Nat
-  size : Nat
-  align : Nat
-  deriving Repr, DecidableEq, Inhabited
-
-namespace C99FieldLayout
-
-/-- Half-open byte interval occupied by the field. -/
-def byteEnd (f : C99FieldLayout) : Nat := f.offset + f.size
-
-/-- The alignment is positive and divides the assigned offset. -/
-def isAligned (f : C99FieldLayout) : Prop :=
-  f.align ≠ 0 ∧ f.offset % f.align = 0
-
-end C99FieldLayout
-
-/-- Complete C99 aggregate: field intervals, struct alignment, and `sizeof`. -/
-structure C99StructLayout where
-  name : String
-  fields : List C99FieldLayout
-  structAlign : Nat
-  structSize : Nat
-  deriving Repr, DecidableEq, Inhabited
-
-/-- Explicit C99 slice descriptor: pointer, element count, stride, element size, and alignment. -/
-structure C99SliceDesc where
-  dataPtr : Option Nat
-  len : Nat
-  byteStride : Nat
-  elemSize : Nat
-  align : Nat
-  deriving Repr, DecidableEq, Inhabited
-
-/-- Typed C function signature derived from scalar layouts. -/
-structure C99FnSig where
-  cSymbol : String
-  params : List C99FieldSpec
-  retTy : C99ScalarType
-  deriving Repr, DecidableEq, Inhabited
-
-/-- Round `n` up to the next positive multiple of `a`; zero alignment fails closed. -/
-def c99AlignUp (n a : Nat) : Option Nat :=
-  if a = 0 then none else some ((n + (a - 1)) / a * a)
-
-/-- Greatest-common-divisor step used only as a totality witness for the alignment fold. -/
-def c99NatMax (a b : Nat) : Nat := if a < b then b else a
-
-/-- Place one field at the next naturally aligned offset. -/
-def placeC99Field (off : Nat) (spec : C99FieldSpec) : Option (C99FieldLayout × Nat) :=
-  let sz := spec.ty.sizeOf
-  let al := spec.ty.alignOf
-  match c99AlignUp off al with
-  | none => none
-  | some aligned =>
-    some ({ name := spec.name, ty := spec.ty, offset := aligned, size := sz, align := al }, aligned + sz)
-
-/-- Place every field starting at `off`, returning placed fields and the running maximum alignment. -/
-def placeC99FieldsFrom (specs : List C99FieldSpec) (off : Nat) (maxA : Nat) :
-    Option (List C99FieldLayout × Nat) :=
-  match specs with
-  | [] => some ([], maxA)
-  | spec :: rs =>
-    match placeC99Field off spec with
-    | none => none
-    | some (field, nextOff) =>
-      match placeC99FieldsFrom rs nextOff (c99NatMax maxA field.align) with
-      | none => none
-      | some (restFields, finalAlign) => some (field :: restFields, finalAlign)
-
-/-- Place every field from offset `0` with base alignment `1`. -/
-def placeC99Fields (specs : List C99FieldSpec) : Option (List C99FieldLayout × Nat) :=
-  placeC99FieldsFrom specs 0 1
-
-/-- Rightmost occupied byte of a field list. -/
-def c99OccupiedEnd : List C99FieldLayout → Nat
-  | [] => 0
-  | f :: fs => c99NatMax f.byteEnd (c99OccupiedEnd fs)
-
-/-- Place fields at naturally aligned offsets and round `sizeof` up to the struct alignment. -/
-def computeC99StructLayout (name : String) (specs : List C99FieldSpec) : Option C99StructLayout :=
-  match placeC99Fields specs with
-  | none => none
-  | some (placed, maxAlign) =>
-    match c99AlignUp (c99OccupiedEnd placed) maxAlign with
-    | none => none
-    | some sz => some { name, fields := placed, structAlign := maxAlign, structSize := sz }
-
-/-- Two half-open intervals do not overlap. -/
-def c99IntervalsDisjoint (a0 a1 b0 b1 : Nat) : Prop :=
-  a1 ≤ b0 ∨ b1 ≤ a0
-
-/-- Every pair of distinct field intervals in list order is strictly disjoint. -/
-def fieldsPairwiseDisjoint : List C99FieldLayout → Prop
-  | [] => True
-  | f :: fs => (∀ g ∈ fs, c99IntervalsDisjoint f.offset f.byteEnd g.offset g.byteEnd) ∧ fieldsPairwiseDisjoint fs
-
-/-- A computed layout has positive alignment, aligned fields, disjoint intervals, and covering `sizeof`. -/
-def c99LayoutSound (layout : C99StructLayout) : Prop :=
-  layout.structAlign ≠ 0 ∧ layout.structAlign ∣ layout.structSize ∧
-  (∀ f ∈ layout.fields, f.isAligned ∧ f.size = f.ty.sizeOf ∧ f.align = f.ty.alignOf) ∧
-  fieldsPairwiseDisjoint layout.fields ∧
-  (∀ f ∈ layout.fields, f.byteEnd ≤ layout.structSize)
-
-/-- Checked 64-bit product. `none` is the only result on unsigned overflow. -/
-def checkedByteLen (len elemBytes : Nat) : Option Nat :=
-  if elemBytes = 0 then some 0
-  else if len ≤ (2 ^ 64 - 1) / elemBytes then some (len * elemBytes)
-  else none
-
-/-- A slice is marshalable when its geometry is aligned and its byte length fits. -/
-def validC99Slice (s : C99SliceDesc) : Prop :=
-  s.align ≠ 0 ∧ s.elemSize ≠ 0 ∧ s.elemSize ≤ s.byteStride ∧
-  s.byteStride % s.align = 0 ∧ s.elemSize % s.align = 0 ∧
-  (s.len = 0 ∨ s.dataPtr.isSome) ∧
-  (checkedByteLen s.len s.elemSize).isSome
-
 /-- Host byte view used by the pure marshal and unmarshal functions. -/
 structure C99ByteView where
   bytes : ByteArray
   base : Nat
   len : Nat
+  byteStride : Nat := 0
   elemSize : Nat
+  align : Nat := 1
+  width : ArchWidth := .bits64
   deriving DecidableEq, Inhabited
 
-/-- A view stays inside its backing array and has a positive element size. -/
+/-- The effective byte stride of a view (`elemSize` when `byteStride = 0`). -/
+def C99ByteView.effectiveStride (v : C99ByteView) : Nat :=
+  if v.byteStride = 0 then v.elemSize else v.byteStride
+
+/-- A view stays inside its backing array, is aligned, and its strided span does not wrap `width`. -/
 def C99ByteView.isValid (v : C99ByteView) : Prop :=
-  v.elemSize ≠ 0 ∧ checkedByteLen v.len v.elemSize = some (v.len * v.elemSize) ∧
-  v.base + v.len * v.elemSize ≤ v.bytes.size
+  v.align ≠ 0 ∧ v.elemSize ≠ 0 ∧ v.elemSize ≤ v.effectiveStride ∧
+  v.base % v.align = 0 ∧
+  ∃ span,
+    checkedStridedSpan v.len v.effectiveStride v.elemSize v.width = some span ∧
+    v.base + span ≤ v.bytes.size ∧
+    v.base + span ≤ v.width.addrLimit
 
-/-- Copy the addressed elements. Invalid geometry yields `none` rather than a partial buffer. -/
+/-- Copy the `i`-th strided element (`elemSize` bytes at `base + i * stride`). -/
+def copyStridedElem (bytes : ByteArray) (base stride elemSize i : Nat) : ByteArray :=
+  bytes.extract (base + i * stride) (base + i * stride + elemSize)
+
+/-- Fold strided element copies into a packed payload. -/
+def marshalStridedGo (bytes : ByteArray) (base stride elemSize fuel : Nat) (acc : ByteArray) : ByteArray :=
+  match fuel with
+  | 0 => acc
+  | n + 1 =>
+    marshalStridedGo bytes base stride elemSize n
+      (copyStridedElem bytes base stride elemSize n ++ acc)
+
+/-- Copy the addressed strided elements into a packed buffer. Invalid geometry yields `none`. -/
 def marshalSlice (v : C99ByteView) : Option ByteArray :=
-  match checkedByteLen v.len v.elemSize with
+  let stride := v.effectiveStride
+  match checkedStridedSpan v.len stride v.elemSize v.width with
   | none => none
-  | some nbytes =>
-    if v.base + nbytes ≤ v.bytes.size then some (v.bytes.extract v.base (v.base + nbytes)) else none
+  | some span =>
+    if v.align != 0 && v.base % v.align == 0 &&
+        v.base + span ≤ v.bytes.size && v.base + span ≤ v.width.addrLimit then
+      some (marshalStridedGo v.bytes v.base stride v.elemSize v.len ByteArray.empty)
+    else none
 
-/-- Write marshaled bytes back at the same base. The backing array size is preserved. -/
-def unmarshalSlice (backing : ByteArray) (base : Nat) (payload : ByteArray) : Option ByteArray :=
-  if base + payload.size ≤ backing.size then
-    some (backing.extract 0 base ++ payload ++ backing.extract (base + payload.size) backing.size)
-  else none
+/-- Write one packed element of `payload` back at a strided offset of `backing`. -/
+def writeStridedElem (backing : ByteArray) (base stride elemSize i : Nat) (payload : ByteArray) : ByteArray :=
+  let src := i * elemSize
+  let dst := base + i * stride
+  let elem := payload.extract src (src + elemSize)
+  backing.extract 0 dst ++ elem ++ backing.extract (dst + elemSize) backing.size
+
+/-- Fold packed payload elements back into strided slots. -/
+def unmarshalStridedGo (backing : ByteArray) (base stride elemSize fuel : Nat) (payload : ByteArray) : ByteArray :=
+  match fuel with
+  | 0 => backing
+  | n + 1 =>
+    writeStridedElem (unmarshalStridedGo backing base stride elemSize n payload)
+      base stride elemSize n payload
+
+/-- Write a packed payload back into strided slots. The backing array size is preserved. -/
+def unmarshalSlice (v : C99ByteView) (payload : ByteArray) : Option ByteArray :=
+  let stride := v.effectiveStride
+  match checkedStridedSpan v.len stride v.elemSize v.width with
+  | none => none
+  | some span =>
+    if v.align != 0 && v.base % v.align == 0 &&
+        v.base + span ≤ v.bytes.size && v.base + span ≤ v.width.addrLimit &&
+        payload.size == v.len * v.elemSize then
+      some (unmarshalStridedGo v.bytes v.base stride v.elemSize v.len payload)
+    else none
 
 /-- Header fragment for one computed struct, including explicit offsets. -/
 def emitC99StructLayoutDecl (layout : C99StructLayout) : String :=
@@ -642,15 +814,8 @@ def emitC99StructLayoutDecl (layout : C99StructLayout) : String :=
     s!"/* sizeof({layout.name}) = {layout.structSize}; alignof({layout.name}) = {layout.structAlign} */"])
 
 /-- Validate and emit a struct declaration. -/
-def emitValidatedC99Struct (name : String) (specs : List C99FieldSpec) : Option String :=
-  (computeC99StructLayout name specs).map emitC99StructLayoutDecl
-
-/-- Validate a slice before a shim may pass it across the C boundary. -/
-def validateC99Slice (s : C99SliceDesc) : Bool :=
-  s.align != 0 && s.elemSize != 0 && s.elemSize ≤ s.byteStride &&
-  s.byteStride % s.align == 0 && s.elemSize % s.align == 0 &&
-  (s.len == 0 || s.dataPtr.isSome) &&
-  (checkedByteLen s.len s.elemSize).isSome
+def emitValidatedC99Struct (name : String) (specs : List C99FieldSpec) (width : ArchWidth := .bits64) : Option String :=
+  (computeC99StructLayout name specs width).map emitC99StructLayoutDecl
 
 /-- Host 64-bit float view (`FloatArray`, 8-byte IEEE-754 scalars) for C99 `double*` slice marshaling. -/
 structure C99FloatView where
@@ -686,9 +851,9 @@ def emitC99FnProto (sig : C99FnSig) : String :=
   s!"{sig.retTy.cSpelling} {sig.cSymbol}({params});"
 
 /-- Emit a complete C99 header + forwarding shim pair for validated structs and typed function signatures. -/
-def emitValidatedC99Bundle (structs : List (String × List C99FieldSpec)) (fns : List C99FnSig) :
-    Option (String × String) := do
-  let layouts ← structs.mapM (fun (nm, specs) => computeC99StructLayout nm specs)
+def emitValidatedC99Bundle (structs : List (String × List C99FieldSpec)) (fns : List C99FnSig)
+    (width : ArchWidth := .bits64) : Option (String × String) := do
+  let layouts ← structs.mapM (fun (nm, specs) => computeC99StructLayout nm specs width)
   let structDecls := layouts.map emitC99StructLayoutDecl
   let protos := fns.map emitC99FnProto
   let shims := fns.map fun fn =>
