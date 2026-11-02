@@ -4,6 +4,8 @@
   "modules": [
     "LeanNative.Backend.Semantics",
     "LeanNative.Backend.StableHLOAst",
+    "LeanNative.Backend.StableHLOAst.Syntax",
+    "LeanNative.Backend.StableHLOAst.Eval",
     "LeanNative.IR.LCNF",
     "TurboLean.ConLeche"
   ],
@@ -19,7 +21,12 @@
     "LNSym": ["LeanNative.Backend.Semantics"],
     "ConLeche": ["TurboLean.ConLeche"],
     "LCNF": ["LeanNative.IR.LCNF"],
-    "LeanNative.Backend.StableHLOAst": ["LeanNative.Backend.StableHLOAst"]
+    "LeanNative.Backend.StableHLOAst": [
+      "LeanNative.Backend.StableHLOAst",
+      "LeanNative.Backend.StableHLOAst.Syntax",
+      "LeanNative.Backend.StableHLOAst.Eval",
+      "LeanNative.Backend.StableHLOAst.Proofs"
+    ]
   },
   "proof_module_prefixes": [
     "LeanNative.Proofs"
