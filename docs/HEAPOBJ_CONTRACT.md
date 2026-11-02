@@ -367,3 +367,23 @@ None. Track C6 replaced every previously uncovered clause with a named regressio
 `decref_underfueled_helpers_total_or_error`, `ctor_set_scalar_slot_exclusive_shared_freed`,
 `set_tag_exclusive_shared_freed`, `symtv_rc_exhaustion_sample_fails_closed`). `ci_verify.sh` still fails if a
 `-- UNCOVERED(<id>)` marker reappears in the module without a matching row here.
+
+## 9. Formal `lean.h` ABI & RC Proofs (`LeanNative.Proofs.HeapObjAbiProofs`)
+
+Kernel-checked theorems (`0 sorryAx`, standard kernel axioms only, enforced at compile time via
+`#verify_heapobj_abi_axioms` and audited under `turbo-lean audit-spec --policy strict-proofs`) in
+`lean/LeanNative/Proofs/HeapObjAbiProofs.lean` (`namespace LeanNative.Proofs.HeapObjAbi`):
+
+1. **63-bit Tagged Immediate Boxing (`lean_box` / `lean_unbox` / `lean_is_scalar`)**:
+   `unbox_box_id`, `unbox_box_ne_of_ge`, `unbox_box_eq_iff`, `is_scalar_box_true`,
+   `is_scalar_aligned_ptr_false`, `box_ne_aligned_ptr`.
+2. **8-Byte `lean_object` Header Packing & `lean_ctor_object` Offset Disjointness**:
+   `packHeader_rc_eq`, `packHeader_csSz_eq`, `packHeader_other_eq`, `packHeader_tag_eq`,
+   `unpack_pack_header_id`, `pack_unpack_header_id`, `update_rc_preserves_metadata_bits`,
+   `update_tag_preserves_prefix_bits`, `header_fields_eq_of_overlap`, `header_byte_lt_ctor_payload`,
+   `ctor_obj_slots_byte_disjoint`, `ctor_obj_lt_scalar_payload`, `ctor_usize_slot_eq_payload_offset`.
+3. **`m_rc` Reference Counting Preservation (Persistent, Unique Reset/Reuse/Set, Shared COW)**:
+   `persistent_inc_ref_preserves_header`, `persistent_dec_ref_never_frees`, `nonpos_dec_ref_never_frees`,
+   `unique_dec_ref_triggers_free`, `shared_dec_ref_stays_live`, `inc_then_dec_header_roundtrip`,
+   `shared_inplace_write_rejected`, `cowWriteField_matches_pureClone_payload`,
+   `cowWriteField_result_exclusive`, `cowWriteField_preserves_live_alias`.
