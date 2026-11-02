@@ -138,7 +138,7 @@ impl Fixture {
         for (key, _) in std::env::vars_os() {
             let k = key.to_string_lossy();
             if k.contains("TELEMETRY")
-                || k.starts_with("TURBO_LEAN_")
+                || (k.starts_with("TURBO_LEAN_") && k != "TURBO_LEAN_GIT")
                 || k == "SANDBOXED_MISSION_ID"
             {
                 cmd.env_remove(key);

@@ -75,7 +75,7 @@ pub struct ZygoteEvalReply {
 /// Version of the host-side reply vetting (`StderrScan` + `mark_runtime_panic` + `decl_types`).
 /// Bump whenever a reply that an older host accepted could now be rejected, so persisted replies
 /// are not replayed.
-pub(crate) const ZYGOTE_SCANNER_VERSION: u32 = 4;
+pub(crate) const ZYGOTE_SCANNER_VERSION: u32 = 5;
 
 /// Version of the independent kernel replay of newly added declarations (worker
 /// `kernelReplayNewDecls`, dependency/module audits via `--kernel-replay-module`). Verdicts
@@ -2913,6 +2913,7 @@ fn mark_runtime_panic(rep: &mut ZygoteEvalReply, stderr_panic: bool) -> bool {
         return false;
     }
     rep.ok = false;
+    rep.import_ok = true;
     if !reported {
         rep.errors.push(RUNTIME_PANIC_ERR.to_string());
     }
@@ -3883,8 +3884,9 @@ fn parse_audit_modules_reply(
 /// Plain-`lean` fallback for a shard the zygote could not check (unavailable or import failure):
 /// compile `source` to a scratch `.olean`, then accept it only on the kernel-level
 /// `--audit-modules --shard` verdict over the compiled module (axioms incl. `sorryAx`,
-/// extern/implemented_by, csimp, `unsafe`), never on output the shard itself controls. Only the
-/// source's `:= sorry` prefix stubs outside `audit` are exempt, by name and kernel value, and every
+/// extern/implemented_by, csimp, `unsafe`), never on output the shard itself controls. When
+/// `allow_prefix_stubs` is true, only the source's `:= sorry` prefix stubs outside `audit` are
+/// exempt, by name and kernel value; when false (whole-file audit), zero stubs are exempt. Every
 /// `audit` theorem must be declared. A failed compile returns its non-success output; an audit
 /// rejection is an error.
 #[allow(clippy::too_many_arguments)]
@@ -3952,28 +3954,153 @@ pub(crate) fn run_audited_lean_shard_with_types_report(
     std::process::Output,
     std::collections::BTreeMap<String, String>,
 )> {
+    run_audited_lean_shard_at_with_types_report(
+        &store.root,
+        &store.fast_staging_dir(),
+        lean_bin,
+        env_vars,
+        cwd,
+        None,
+        source,
+        audit,
+        true,
+        expected_types,
+        lean_args,
+        timeout_ms,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_audited_lean_shard_at(
+    store_root: &Path,
+    staging_dir: &Path,
+    lean_bin: &Path,
+    env_vars: &std::collections::HashMap<String, String>,
+    cwd: Option<&Path>,
+    source_path: Option<&Path>,
+    source: &str,
+    audit: &std::collections::HashSet<String>,
+    allow_prefix_stubs: bool,
+    lean_args: &[String],
+    timeout_ms: Option<u64>,
+) -> Result<std::process::Output> {
+    run_audited_lean_shard_at_with_types_report(
+        store_root,
+        staging_dir,
+        lean_bin,
+        env_vars,
+        cwd,
+        source_path,
+        source,
+        audit,
+        allow_prefix_stubs,
+        &[],
+        lean_args,
+        timeout_ms,
+    )
+    .map(|(out, _)| out)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_audited_lean_shard_at_with_types_report(
+    store_root: &Path,
+    staging_dir: &Path,
+    lean_bin: &Path,
+    env_vars: &std::collections::HashMap<String, String>,
+    cwd: Option<&Path>,
+    source_path: Option<&Path>,
+    source: &str,
+    audit: &std::collections::HashSet<String>,
+    allow_prefix_stubs: bool,
+    expected_types: &[(String, String)],
+    lean_args: &[String],
+    timeout_ms: Option<u64>,
+) -> Result<(
+    std::process::Output,
+    std::collections::BTreeMap<String, String>,
+)> {
     crate::module_builder::validate_lean_args(lean_args)?;
     let started = std::time::Instant::now();
     let nonce = format!("{}_{}", std::process::id(), next_tmp_id());
     let mod_name = format!("TurboAuditedShard_{}", nonce);
     let src_dir = crate::check::PrivateScratchDir::create_with_nonce(
-        &store.fast_staging_dir(),
+        staging_dir,
         "turbo_audited_src",
         nonce.clone(),
     )?;
     let out_dir = crate::check::PrivateScratchDir::create_with_nonce(
-        &store.fast_staging_dir(),
+        staging_dir,
         "turbo_audited_out",
         nonce.clone(),
     )?;
     let reader_dir = crate::check::PrivateScratchDir::create_with_nonce(
-        &store.fast_staging_dir(),
+        staging_dir,
         "turbo_audited_rdr",
         nonce.clone(),
     )?;
-    let lean_file = src_dir.path.join(format!("{}.lean", mod_name));
-    crate::check::create_readonly_private_file(&lean_file, source.as_bytes())?;
-    crate::check::freeze_private_dir(&src_dir.path)?;
+    let expected_source_hash = blake3::hash(source.as_bytes());
+    let read_verified_live_source = |orig: &Path| -> Result<(OleanFileStatSig, i128)> {
+        use std::io::Read;
+        let sym_meta = fs::symlink_metadata(orig).with_context(|| {
+            format!(
+                "[TurboLean.KernelGate] failed to stat live source `{}`",
+                orig.display()
+            )
+        })?;
+        if sym_meta.file_type().is_symlink() || !sym_meta.is_file() {
+            anyhow::bail!(
+                "[TurboLean.KernelGate] live source `{}` must be a regular non-symlink file",
+                orig.display()
+            );
+        }
+        let sym_sig = OleanFileStatSig::from_meta(&sym_meta);
+        let mut f = fs::File::open(orig).with_context(|| {
+            format!(
+                "[TurboLean.KernelGate] failed to open live source `{}`",
+                orig.display()
+            )
+        })?;
+        let pre_sig = OleanFileStatSig::from_meta(&f.metadata()?);
+        if pre_sig != sym_sig {
+            anyhow::bail!(
+                "[TurboLean.KernelGate] live source `{}` changed concurrently before verification",
+                orig.display()
+            );
+        }
+        let read_started_ns = wall_clock_ns();
+        let mut disk_bytes = Vec::with_capacity(pre_sig.size as usize);
+        f.read_to_end(&mut disk_bytes)?;
+        let post_sig = OleanFileStatSig::from_meta(&f.metadata()?);
+        if post_sig != pre_sig || blake3::hash(&disk_bytes) != expected_source_hash {
+            anyhow::bail!(
+                "[TurboLean.KernelGate] live source `{}` diverged from audited in-memory snapshot",
+                orig.display()
+            );
+        }
+        Ok((pre_sig, read_started_ns))
+    };
+    let (lean_file, root_dir, live_source_pre_sig) = if let Some(orig) = source_path {
+        let (mut pre_sig, mut read_started_ns) = read_verified_live_source(orig)?;
+        if !dev_records_subsecond_timestamps(&pre_sig)
+            && read_started_ns > 0
+            && pre_sig.ctime_ns() >= read_started_ns - STAT_TRUST_WINDOW_NS
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2100));
+            (pre_sig, read_started_ns) = read_verified_live_source(orig)?;
+        }
+        let _ = read_started_ns;
+        let root = cwd
+            .filter(|d| orig.starts_with(d))
+            .or_else(|| orig.parent())
+            .unwrap_or(&src_dir.path);
+        (orig.to_path_buf(), root.to_path_buf(), Some(pre_sig))
+    } else {
+        let lf = src_dir.path.join(format!("{}.lean", mod_name));
+        crate::check::create_readonly_private_file(&lf, source.as_bytes())?;
+        crate::check::freeze_private_dir(&src_dir.path)?;
+        (lf, src_dir.path.clone(), None)
+    };
     let out_olean = out_dir.path.join(format!("{}.olean", mod_name));
     let reader_olean = reader_dir.path.join(format!("{}.olean", mod_name));
     let nonce_env_val = format!("shard_{}", nonce);
@@ -3989,7 +4116,7 @@ pub(crate) fn run_audited_lean_shard_with_types_report(
         .arg("-Dwarn.sorry=true")
         .arg("-Ddebug.skipKernelTC=false")
         .arg("-R")
-        .arg(&src_dir.path)
+        .arg(&root_dir)
         .arg(&lean_file)
         .arg("-o")
         .arg(&out_olean)
@@ -3997,9 +4124,20 @@ pub(crate) fn run_audited_lean_shard_with_types_report(
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
+    run_digest_test_hook("audited_shard_before_lean");
     let out_res = run_lean_command(&mut cmd, timeout_ms);
     reap_processes_with_nonce(&nonce_env_val);
     let out = out_res.context("Failed to execute `lean` on shard fallback")?;
+    run_digest_test_hook("audited_shard_after_lean");
+    if let (Some(orig), Some(pre_sig)) = (source_path, live_source_pre_sig.as_ref()) {
+        let (post_compile_sig, _) = read_verified_live_source(orig)?;
+        if &post_compile_sig != pre_sig {
+            anyhow::bail!(
+                "[TurboLean.KernelGate] live source `{}` changed on disk during compilation",
+                orig.display()
+            );
+        }
+    }
     if !out.status.success() {
         return Ok((out, std::collections::BTreeMap::new()));
     }
@@ -4035,11 +4173,15 @@ pub(crate) fn run_audited_lean_shard_with_types_report(
             .transpose()
     };
     let zygote_bin = match budget_left("the shard auditor was ready")? {
-        None => ensure_zygote_binary(store, lean_bin, env_vars)?,
+        None => ensure_zygote_binary_at(store_root, lean_bin, env_vars)?,
         // A cold auditor build may outlive the request; it still warms the cache in the background.
         Some(left) => {
             let (tx, rx) = std::sync::mpsc::channel();
-            let (root, lean, env) = (store.root.clone(), lean_bin.to_path_buf(), env_vars.clone());
+            let (root, lean, env) = (
+                store_root.to_path_buf(),
+                lean_bin.to_path_buf(),
+                env_vars.clone(),
+            );
             std::thread::spawn(move || {
                 let _ = tx.send(ensure_zygote_binary_at(&root, &lean, &env));
             });
@@ -4089,11 +4231,23 @@ pub(crate) fn run_audited_lean_shard_with_types_report(
             crate::splitter::extra_allowed_axiom_patterns().join(","),
         );
     }
-    for sh in crate::splitter::split_lean_source(source, &[]).shards {
-        if crate::splitter::strip_lean_comments(&sh.proof_text).trim() == "sorry"
-            && !crate::splitter::matches_uncached_or_fast_verify_name(sh.decl_name(), audit)
-        {
-            auditor.arg(format!("--stub-ok={}", sh.decl_name()));
+    let parsed_shards = crate::splitter::split_lean_source(source, &[]).shards;
+    let fast_map = crate::splitter::FastVerifyMap::parse_and_validate(source, &parsed_shards)?;
+    for entry in fast_map.entries() {
+        auditor.arg(format!(
+            "--fast-map={}:{}",
+            hex_encode_bytes(entry.orig_rooted.as_bytes()),
+            hex_encode_bytes(entry.gen_rooted.as_bytes())
+        ));
+    }
+    if allow_prefix_stubs {
+        for sh in &parsed_shards {
+            if crate::splitter::strip_lean_comments(&sh.proof_text).trim() == "sorry"
+                && !fast_map.shard_matches_targets(sh, audit)
+                && !crate::splitter::matches_uncached_or_fast_verify_name(sh.decl_name(), audit)
+            {
+                auditor.arg(format!("--stub-ok={}", sh.rooted_name()));
+            }
         }
     }
     auditor.arg(&mod_name);
@@ -4112,10 +4266,9 @@ pub(crate) fn run_audited_lean_shard_with_types_report(
     let missing: Vec<&String> = audit
         .iter()
         .filter(|name| {
-            let one = std::collections::HashSet::from([(*name).clone()]);
             !decls
                 .iter()
-                .any(|d| crate::splitter::matches_uncached_or_fast_verify_name(d, &one))
+                .any(|d| crate::splitter::decl_name_matches_target(d, name.as_str()))
         })
         .collect();
     if !missing.is_empty() {
@@ -4123,6 +4276,15 @@ pub(crate) fn run_audited_lean_shard_with_types_report(
             "[TurboLean.KernelGate] audited theorem(s) {:?} missing from the compiled shard",
             missing
         );
+    }
+    if let (Some(orig), Some(pre_sig)) = (source_path, live_source_pre_sig.as_ref()) {
+        let (post_audit_sig, _) = read_verified_live_source(orig)?;
+        if &post_audit_sig != pre_sig {
+            anyhow::bail!(
+                "[TurboLean.KernelGate] live source `{}` changed on disk during kernel audit",
+                orig.display()
+            );
+        }
     }
     let decl_types = parsed_reply.decl_types.unwrap_or_default();
     if !expected_types.is_empty() {
@@ -4374,6 +4536,8 @@ pub fn eval_with_zygote_pool_with_args(
         None,
         None,
         lean_args,
+        &[],
+        false,
     )
 }
 
@@ -4432,20 +4596,22 @@ pub fn eval_with_zygote_pool_opts_with_args(
         timeout_ms,
         None,
         lean_args,
+        &[],
+        false,
     )
 }
 
 /// The cache and executor must agree on the final import search order and artifacts.
 pub(crate) struct ResolvedZygoteContext {
-    lean_path: String,
+    pub(crate) lean_path: String,
     /// What the worker searches: the closure snapshot and the toolchain, when materialized.
     worker_lean_path: String,
-    imports_csv: String,
-    olean_digest: String,
+    pub(crate) imports_csv: String,
+    pub(crate) olean_digest: String,
     search_path_digest: String,
     host_closure_digest: String,
-    toolchain_policy: String,
-    lake_inputs_uncacheable: bool,
+    pub(crate) toolchain_policy: String,
+    pub(crate) lake_inputs_uncacheable: bool,
     pub(crate) identity: String,
     /// The imported closure `identity` was computed from. Its materialized snapshot is all the
     /// worker can import besides the toolchain; without one nothing is cached under `identity`.
@@ -4459,6 +4625,160 @@ fn encode_lean_args_hex(lean_args: &[String]) -> String {
     } else {
         hex_encode_bytes(filtered.join("\n").as_bytes())
     }
+}
+
+fn encode_fast_map_lines(entries: &[crate::splitter::FastVerifyEntry]) -> String {
+    entries
+        .iter()
+        .map(|e| format!("{}\t{}", e.orig_rooted, e.gen_rooted))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Worker mode flag for a stubbed (`allow_stub`) or strict check of `shard_source`. Named `stub_targets`
+/// (the declarations under check) travel as `<allow_stub|strict>:<hex targets>:<hex stubs>[:<hex req>:<hex fast_map>]`,
+/// with the stubs the host wrote (`… := sorry` declarations that are not targets). The worker exempts only
+/// those, by kernel value and name, never a target; with no named targets it exempts nothing in the final run.
+fn stub_mode_flag(allow_stub: bool, stub_targets: &[String], shard_source: &str) -> Result<String> {
+    let shards = crate::splitter::split_lean_source(shard_source, &[]).shards;
+    let fast_map = crate::splitter::FastVerifyMap::parse_and_validate(shard_source, &shards)?;
+    let prefix = if allow_stub { "allow_stub" } else { "strict" };
+    if stub_targets.is_empty() && fast_map.is_empty() {
+        return Ok(prefix.to_string());
+    }
+    let targets: std::collections::HashSet<String> = stub_targets.iter().cloned().collect();
+    let stubs: Vec<String> = if allow_stub && !stub_targets.is_empty() {
+        shards
+            .iter()
+            .filter(|sh| {
+                crate::splitter::strip_lean_comments(&sh.proof_text).trim() == "sorry"
+                    && !fast_map.shard_matches_targets(sh, &targets)
+            })
+            .map(|sh| sh.rooted_name())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let targets_hex = hex_encode_bytes(stub_targets.join("\n").as_bytes());
+    let stubs_hex = hex_encode_bytes(stubs.join("\n").as_bytes());
+    if fast_map.is_empty() {
+        Ok(format!("{}:{}:{}", prefix, targets_hex, stubs_hex))
+    } else {
+        let fmap_hex = hex_encode_bytes(encode_fast_map_lines(fast_map.entries()).as_bytes());
+        Ok(format!(
+            "{}:{}:{}:{}:{}",
+            prefix, targets_hex, stubs_hex, targets_hex, fmap_hex
+        ))
+    }
+}
+
+/// `stub_mode` for one cross-file block of a request: every target still counts for ownership (never
+/// exempt), but the block must declare only the targets and fast-verify mappings its own text declares.
+fn block_stub_mode(stub_mode: &str, stub_targets: &[String], blk: &str) -> Result<String> {
+    let shards = crate::splitter::split_lean_source(blk, &[]).shards;
+    let blk_map = crate::splitter::FastVerifyMap::parse_and_validate(blk, &shards)?;
+    if !stub_mode.starts_with("allow_stub:") && !stub_mode.starts_with("strict:") {
+        if blk_map.is_empty() {
+            return Ok(stub_mode.to_string());
+        }
+        let prefix = if stub_mode == "allow_stub" {
+            "allow_stub"
+        } else {
+            "strict"
+        };
+        let fmap_hex = hex_encode_bytes(encode_fast_map_lines(blk_map.entries()).as_bytes());
+        return Ok(format!("{}::::{}", prefix, fmap_hex));
+    }
+    let parts: Vec<&str> = stub_mode.split(':').collect();
+    let base_prefix = parts.first().copied().unwrap_or("strict");
+    let targets_hex = parts.get(1).copied().unwrap_or("");
+    let stubs_hex = parts.get(2).copied().unwrap_or("");
+    let required: Vec<&str> = stub_targets
+        .iter()
+        .filter(|t| {
+            let one = std::collections::HashSet::from([(*t).clone()]);
+            shards
+                .iter()
+                .any(|sh| blk_map.shard_matches_targets(sh, &one))
+        })
+        .map(String::as_str)
+        .collect();
+    let req_hex = hex_encode_bytes(required.join("\n").as_bytes());
+    if blk_map.is_empty() {
+        Ok(format!(
+            "{}:{}:{}:{}",
+            base_prefix, targets_hex, stubs_hex, req_hex
+        ))
+    } else {
+        let fmap_hex = hex_encode_bytes(encode_fast_map_lines(blk_map.entries()).as_bytes());
+        Ok(format!(
+            "{}:{}:{}:{}:{}",
+            base_prefix, targets_hex, stubs_hex, req_hex, fmap_hex
+        ))
+    }
+}
+
+/// Check `shard_source` with its prefix `sorry` stubs admitted, but never the `sorryAx` of `stub_targets`.
+#[allow(clippy::too_many_arguments)]
+pub fn eval_with_zygote_pool_for_targets(
+    store: &TurboStore,
+    toolchain: &str,
+    req_lean_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    lean_bin: &Path,
+    shard_source: &str,
+    stub_targets: &[String],
+    timeout_ms: Option<u64>,
+    lean_args: &[String],
+) -> Result<ZygoteEvalReply> {
+    eval_with_zygote_pool_inner(
+        store,
+        toolchain,
+        req_lean_path,
+        env_vars,
+        lean_bin,
+        shard_source,
+        true,
+        false,
+        None,
+        timeout_ms,
+        None,
+        lean_args,
+        stub_targets,
+        false,
+    )
+}
+
+/// Check `shard_source` with no `sorry` stub exempt anywhere, prefix checkpoints included (`strict_all`):
+/// the kernel-gate audit of a whole file.
+#[allow(clippy::too_many_arguments)]
+pub fn eval_with_zygote_pool_audit_all(
+    store: &TurboStore,
+    toolchain: &str,
+    req_lean_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    lean_bin: &Path,
+    shard_source: &str,
+    file_name: Option<&str>,
+    timeout_ms: Option<u64>,
+    lean_args: &[String],
+) -> Result<ZygoteEvalReply> {
+    eval_with_zygote_pool_inner(
+        store,
+        toolchain,
+        req_lean_path,
+        env_vars,
+        lean_bin,
+        shard_source,
+        false,
+        false,
+        file_name,
+        timeout_ms,
+        None,
+        lean_args,
+        &[],
+        true,
+    )
 }
 
 fn attach_host_closure_digest(req_line: &str, host_closure_digest: &str) -> String {
@@ -4591,13 +4911,20 @@ pub(crate) fn resolve_zygote_context(
         format!("{}#inputs:{}", search_path_digest, lake_inputs_digest)
     };
     // Workers enforce the axiom policy they were spawned with: key them (and their replies) by it.
+    let extra_axioms: Vec<String> = env_vars
+        .get(crate::splitter::ALLOWED_AXIOMS_ENV)
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_else(crate::splitter::extra_allowed_axiom_patterns);
     let toolchain_policy = format!(
         "{}#{}",
         toolchain,
-        env_vars
-            .get(crate::splitter::ALLOWED_AXIOMS_ENV)
-            .cloned()
-            .unwrap_or_else(|| crate::splitter::allowed_axioms().join(","))
+        crate::splitter::allowed_axioms_with_extra(&extra_axioms).join(",")
     );
     let olean_digest = if lake_inputs_digest.is_empty() {
         format!("{}:{}", search_path_digest, imported_digest)
@@ -4674,6 +5001,8 @@ pub(crate) fn eval_with_resolved_context_opts_with_args(
         timeout_ms,
         None,
         lean_args,
+        &[],
+        false,
         initial_context,
     )
 }
@@ -4695,6 +5024,8 @@ fn eval_with_zygote_pool_inner(
     timeout_ms: Option<u64>,
     batch_fission_override: Option<(String, String, String)>,
     lean_args: &[String],
+    stub_targets: &[String],
+    audit_all: bool,
 ) -> Result<ZygoteEvalReply> {
     eval_with_zygote_pool_inner_with_context(
         store,
@@ -4709,9 +5040,41 @@ fn eval_with_zygote_pool_inner(
         timeout_ms,
         batch_fission_override,
         lean_args,
+        stub_targets,
+        audit_all,
         None,
     )
     .map(|(rep, _, _)| rep)
+}
+
+fn encode_mode_with_file_and_cwd(
+    base: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    file_name: Option<&str>,
+) -> String {
+    let caller_cwd = env_vars
+        .get("TURBO_LEAN_CALLER_CWD")
+        .cloned()
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string())
+        })
+        .unwrap_or_default();
+    let hex_fn = file_name
+        .filter(|s| !s.is_empty())
+        .map(|s| hex_encode_bytes(s.as_bytes()))
+        .unwrap_or_default();
+    let hex_cwd = if caller_cwd.is_empty() {
+        String::new()
+    } else {
+        hex_encode_bytes(caller_cwd.as_bytes())
+    };
+    if hex_fn.is_empty() && hex_cwd.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}:{hex_fn}:{hex_cwd}")
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4728,6 +5091,8 @@ fn eval_with_zygote_pool_inner_with_context(
     timeout_ms: Option<u64>,
     batch_fission_override: Option<(String, String, String)>,
     lean_args: &[String],
+    stub_targets: &[String],
+    audit_all: bool,
     initial_context: Option<&ResolvedZygoteContext>,
 ) -> Result<(ZygoteEvalReply, ClosureBinding, String)> {
     if !eval_mode {
@@ -4735,6 +5100,20 @@ fn eval_with_zygote_pool_inner_with_context(
     }
     let request_started = std::time::Instant::now();
     crate::module_builder::validate_lean_args(lean_args)?;
+    let stub_mode = if eval_mode {
+        "eval".to_string()
+    } else if audit_all {
+        let shards = crate::splitter::split_lean_source(shard_source, &[]).shards;
+        let fmap = crate::splitter::FastVerifyMap::parse_and_validate(shard_source, &shards)?;
+        if !fmap.is_empty() {
+            anyhow::bail!(
+                "Fast-verify renamed declarations are forbidden in `strict_all` whole-file audits"
+            );
+        }
+        encode_mode_with_file_and_cwd("strict_all", env_vars, file_name)
+    } else {
+        stub_mode_flag(allow_stub, stub_targets, shard_source)?
+    };
     let attempt = |timeout_ms: Option<u64>, ctx: Option<&ResolvedZygoteContext>| {
         eval_with_zygote_pool_attempt(
             store,
@@ -4749,6 +5128,8 @@ fn eval_with_zygote_pool_inner_with_context(
             timeout_ms,
             batch_fission_override.clone(),
             lean_args,
+            &stub_mode,
+            stub_targets,
             request_started,
             ctx,
         )
@@ -4787,6 +5168,8 @@ fn eval_with_zygote_pool_attempt(
     timeout_ms: Option<u64>,
     batch_fission_override: Option<(String, String, String)>,
     lean_args: &[String],
+    stub_mode: &str,
+    stub_targets: &[String],
     request_started: std::time::Instant,
     pre_resolved_context: Option<&ResolvedZygoteContext>,
 ) -> Result<(ZygoteEvalReply, ClosureBinding, String)> {
@@ -4850,7 +5233,7 @@ fn eval_with_zygote_pool_attempt(
     #[allow(clippy::type_complexity)]
     static ZYGOTE_VERIFIED_SHARD_CACHE: std::sync::OnceLock<
         std::sync::Mutex<
-            std::collections::HashMap<(String, String, bool, String), ZygoteEvalReply>,
+            std::collections::HashMap<(String, String, String, String), ZygoteEvalReply>,
         >,
     > = std::sync::OnceLock::new();
     let verified_cache_key = if !eval_mode
@@ -4861,7 +5244,7 @@ fn eval_with_zygote_pool_attempt(
         Some((
             verified_cache_policy,
             olean_digest.clone(),
-            allow_stub,
+            stub_mode.to_string(),
             shard_source.to_string(),
         ))
     } else {
@@ -5322,21 +5705,21 @@ fn eval_with_zygote_pool_attempt(
 
             let req_lines: Vec<String> = blocks
                 .iter()
-                .map(|blk| {
+                .map(|blk| -> Result<String> {
                     let hb = hex_encode_bytes(blk.as_bytes());
+                    let mode_flag = block_stub_mode(stub_mode, stub_targets, blk)?;
                     let base = if hex_opts.is_empty() {
-                        if allow_stub {
-                            format!("{}\t{}\tallow_stub\n", imports_csv, hb)
+                        if mode_flag != "strict" {
+                            format!("{}\t{}\t{}\n", imports_csv, hb, mode_flag)
                         } else {
                             format!("{}\t{}\n", imports_csv, hb)
                         }
                     } else {
-                        let mode_flag = if allow_stub { "allow_stub" } else { "strict" };
                         format!("{}\t{}\t{}\t\t\t{}\n", imports_csv, hb, mode_flag, hex_opts)
                     };
-                    attach_host_closure_digest(&base, host_closure_digest)
+                    Ok(attach_host_closure_digest(&base, host_closure_digest))
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
 
             let results: Vec<(ZygoteChild, WorkerReqOutcome)> = std::thread::scope(|s| {
                 let req_id_ref = request_identity.as_str();
@@ -5496,7 +5879,7 @@ fn eval_with_zygote_pool_attempt(
             {
                 let hex_decl = hex_encode_bytes(decl_code.as_bytes());
                 let hex_prefix = hex_encode_bytes(prefix_code.as_bytes());
-                let mode_flag = if allow_stub { "allow_stub" } else { "strict" };
+                let mode_flag = stub_mode;
                 let rl = if hex_opts.is_empty() {
                     format!(
                         "{}\t{}\t{}\t{}\t{}\n",
@@ -5516,13 +5899,13 @@ fn eval_with_zygote_pool_attempt(
             } else {
                 let hex_body = hex_encode_bytes(body_code.as_bytes());
                 let rl = if hex_opts.is_empty() {
-                    if allow_stub {
-                        format!("{}\t{}\tallow_stub\n", imports_csv, hex_body)
+                    if stub_mode != "strict" {
+                        format!("{}\t{}\t{}\n", imports_csv, hex_body, stub_mode)
                     } else {
                         format!("{}\t{}\n", imports_csv, hex_body)
                     }
                 } else {
-                    let mode_flag = if allow_stub { "allow_stub" } else { "strict" };
+                    let mode_flag = stub_mode;
                     format!(
                         "{}\t{}\t{}\t\t\t{}\n",
                         imports_csv, hex_body, mode_flag, hex_opts
@@ -5531,29 +5914,7 @@ fn eval_with_zygote_pool_attempt(
                 (rl, None, None)
             }
         } else {
-            let caller_cwd = env_vars
-                .get("TURBO_LEAN_CALLER_CWD")
-                .cloned()
-                .or_else(|| {
-                    std::env::current_dir()
-                        .ok()
-                        .map(|p| p.to_string_lossy().to_string())
-                })
-                .unwrap_or_default();
-            let hex_fn = file_name
-                .filter(|s| !s.is_empty())
-                .map(|s| hex_encode_bytes(s.as_bytes()))
-                .unwrap_or_default();
-            let hex_cwd = if caller_cwd.is_empty() {
-                String::new()
-            } else {
-                hex_encode_bytes(caller_cwd.as_bytes())
-            };
-            let mode_flag = if hex_fn.is_empty() && hex_cwd.is_empty() {
-                "eval".to_string()
-            } else {
-                format!("eval:{}:{}", hex_fn, hex_cwd)
-            };
+            let mode_flag = encode_mode_with_file_and_cwd("eval", env_vars, file_name);
             if let Some((prefix_key, prefix_code, decl_code)) =
                 split_eval_body_into_prefix_and_cmds(&body_code)
             {
@@ -5876,6 +6237,8 @@ pub(crate) fn probe_stub_decl_types_via_zygote(
         None,
         Some((imports_csv, prefix_key, req_line)),
         lean_args,
+        &[],
+        false,
     )
 }
 #[allow(clippy::too_many_arguments)]
@@ -5898,14 +6261,38 @@ pub fn eval_shard_via_zygote(
             sub_decl_source.trim_start()
         )
     };
-    eval_with_zygote_pool_with_args(
+    let ns_prefix = crate::splitter::open_namespace_prefix(prefix_source);
+    let scoped_sub = if ns_prefix.is_empty() {
+        std::borrow::Cow::Borrowed(sub_decl_source)
+    } else {
+        std::borrow::Cow::Owned(format!("{}{}", ns_prefix, sub_decl_source))
+    };
+    let sub_targets: Vec<String> = crate::splitter::split_lean_source(&scoped_sub, &[])
+        .shards
+        .into_iter()
+        .map(|s| s.rooted_name())
+        .collect();
+    if sub_targets.is_empty() {
+        return eval_with_zygote_pool_with_args(
+            store,
+            toolchain,
+            req_lean_path,
+            env_vars,
+            lean_bin,
+            &combined_source,
+            false,
+            lean_args,
+        );
+    }
+    eval_with_zygote_pool_for_targets(
         store,
         toolchain,
         req_lean_path,
         env_vars,
         lean_bin,
         &combined_source,
-        false,
+        &sub_targets,
+        None,
         lean_args,
     )
 }
@@ -5921,10 +6308,61 @@ fn encode_multi_decl_zygote_req(
     mode: &str,
     decl_sources: &[String],
     lean_args: &[String],
-) -> (String, String, String) {
+) -> Result<(String, String, String)> {
     let (imports_csv, prefix_body) = split_shard_for_zygote(prefix_source);
     let prefix_key = blake3::hash(prefix_body.as_bytes()).to_hex().to_string();
     let hex_prefix = hex_encode_bytes(prefix_body.as_bytes());
+    let ns_prefix = crate::splitter::open_namespace_prefix(prefix_source);
+    let mut targets: Vec<String> = Vec::new();
+    for s in decl_sources {
+        let scoped = if ns_prefix.is_empty() {
+            std::borrow::Cow::Borrowed(s.as_str())
+        } else {
+            std::borrow::Cow::Owned(format!("{}{}", ns_prefix, s))
+        };
+        let sub_shards = crate::splitter::split_lean_source(&scoped, &[]).shards;
+        let sub_map = crate::splitter::FastVerifyMap::parse_and_validate(&scoped, &sub_shards)?;
+        if !sub_map.is_empty() {
+            anyhow::bail!(
+                "Fast-verify renamed declarations are forbidden in `{}` sub-shards",
+                mode
+            );
+        }
+        for sh in sub_shards {
+            let rooted = sh.rooted_name();
+            if !targets.contains(&rooted) {
+                targets.push(rooted);
+            }
+        }
+    }
+    let target_set: std::collections::HashSet<String> = targets.iter().cloned().collect();
+    let prefix_shards = crate::splitter::split_lean_source(prefix_source, &[]).shards;
+    let prefix_map =
+        crate::splitter::FastVerifyMap::parse_and_validate(prefix_source, &prefix_shards)?;
+    if !prefix_map.is_empty() {
+        anyhow::bail!(
+            "Fast-verify renamed declarations are forbidden in `{}` prefix",
+            mode
+        );
+    }
+    let stubs: Vec<String> = prefix_shards
+        .into_iter()
+        .filter(|sh| {
+            crate::splitter::strip_lean_comments(&sh.proof_text).trim() == "sorry"
+                && !prefix_map.shard_matches_targets(sh, &target_set)
+        })
+        .map(|sh| sh.rooted_name())
+        .collect();
+    let mode_with_stubs = if stubs.is_empty() && targets.is_empty() {
+        mode.to_string()
+    } else {
+        format!(
+            "{}:{}:{}",
+            mode,
+            hex_encode_bytes(targets.join("\n").as_bytes()),
+            hex_encode_bytes(stubs.join("\n").as_bytes())
+        )
+    };
     let hex_decls_csv = decl_sources
         .iter()
         .map(|s| {
@@ -5938,15 +6376,15 @@ fn encode_multi_decl_zygote_req(
     let req_line = if hex_opts.is_empty() {
         format!(
             "{}\t{}\t{}\t{}\t{}\n",
-            imports_csv, mode, prefix_key, hex_prefix, hex_decls_csv
+            imports_csv, mode_with_stubs, prefix_key, hex_prefix, hex_decls_csv
         )
     } else {
         format!(
             "{}\t{}\t{}\t{}\t{}\t{}\n",
-            imports_csv, mode, prefix_key, hex_prefix, hex_decls_csv, hex_opts
+            imports_csv, mode_with_stubs, prefix_key, hex_prefix, hex_decls_csv, hex_opts
         )
     };
-    (imports_csv, prefix_key, req_line)
+    Ok((imports_csv, prefix_key, req_line))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5975,20 +6413,8 @@ pub fn eval_subshards_batch_via_zygote(
             ..Default::default()
         });
     }
-    if sub_decl_sources.len() == 1 {
-        return eval_shard_via_zygote(
-            store,
-            toolchain,
-            req_lean_path,
-            env_vars,
-            lean_bin,
-            prefix_source,
-            &sub_decl_sources[0],
-            lean_args,
-        );
-    }
     let req_tuple =
-        encode_multi_decl_zygote_req(prefix_source, "batch_fission", sub_decl_sources, lean_args);
+        encode_multi_decl_zygote_req(prefix_source, "batch_fission", sub_decl_sources, lean_args)?;
     eval_with_zygote_pool_inner(
         store,
         toolchain,
@@ -6002,6 +6428,8 @@ pub fn eval_subshards_batch_via_zygote(
         None,
         Some(req_tuple),
         lean_args,
+        &[],
+        false,
     )
 }
 
@@ -6036,28 +6464,12 @@ pub fn eval_candidates_race_via_zygote(
             ..Default::default()
         });
     }
-    if candidate_decl_sources.len() == 1 {
-        let mut rep = eval_shard_via_zygote(
-            store,
-            toolchain,
-            req_lean_path,
-            env_vars,
-            lean_bin,
-            prefix_source,
-            &candidate_decl_sources[0],
-            lean_args,
-        )?;
-        if rep.ok {
-            rep.winning_candidate_idx = Some(0);
-        }
-        return Ok(rep);
-    }
     let req_tuple = encode_multi_decl_zygote_req(
         prefix_source,
         "race_candidates",
         candidate_decl_sources,
         lean_args,
-    );
+    )?;
     eval_with_zygote_pool_inner(
         store,
         toolchain,
@@ -6071,6 +6483,8 @@ pub fn eval_candidates_race_via_zygote(
         None,
         Some(req_tuple),
         lean_args,
+        &[],
+        false,
     )
 }
 
@@ -6530,25 +6944,6 @@ pub(crate) fn try_zygote_url_check_shard_inner_with_inflight_detailed(
     ))
 }
 
-pub fn try_zygote_url_check_shard_with_inflight(
-    base_url: &str,
-    req: &CheckShardHttpRequest,
-    on_inflight: impl FnOnce(),
-) -> Option<serde_json::Value> {
-    try_zygote_url_check_shard_inner_with_inflight_detailed(base_url, req, on_inflight)
-        .ok()
-        .flatten()
-}
-
-pub fn try_zygote_url_check_shard(
-    base_url: &str,
-    req: &CheckShardHttpRequest,
-) -> Option<serde_json::Value> {
-    try_zygote_url_check_shard_inner_with_inflight_detailed(base_url, req, || {})
-        .ok()
-        .flatten()
-}
-
 pub fn try_local_zygote_check_shard_detailed(
     store: &TurboStore,
     env_vars: &std::collections::HashMap<String, String>,
@@ -6595,16 +6990,6 @@ pub fn try_local_zygote_check_shard_detailed(
         }
         response => finish_check_shard_request(response),
     }
-}
-
-pub fn try_local_zygote_check_shard(
-    store: &TurboStore,
-    env_vars: &std::collections::HashMap<String, String>,
-    req: &CheckShardHttpRequest,
-) -> Option<serde_json::Value> {
-    try_local_zygote_check_shard_detailed(store, env_vars, req)
-        .ok()
-        .flatten()
 }
 
 fn is_pure_eval_source(source: &str) -> bool {
@@ -6656,9 +7041,9 @@ fn compute_eval_shm_cache_filename(
     lean_args: &[String],
 ) -> Result<String> {
     let args_digest = crate::module_builder::compute_lean_args_digest(lean_args)?;
-    // v7: combines kernel replay (`replay_version`) and `decl_types` kernel statement hashes.
+    // v8: scanner v5 + kernel replay + `decl_types` kernel statement hashes + fast-verify/stub-mode.
     let bytes = serde_json::to_vec(&(
-        "eval-shm:v7",
+        "eval-shm:v8",
         ZYGOTE_SCANNER_VERSION,
         ZYGOTE_REPLAY_VERSION,
         &context.identity,
@@ -6824,6 +7209,35 @@ pub fn try_local_zygote_eval(
         timeout_ms,
         &[],
     )
+    .ok()
+    .flatten()
+}
+
+#[derive(Debug, Deserialize)]
+struct DaemonEvalEnvelope {
+    #[serde(flatten)]
+    reply: ZygoteEvalReply,
+    #[serde(default)]
+    executed_execution_identity: Option<String>,
+    #[serde(default)]
+    binding_ok: bool,
+}
+
+impl std::ops::Deref for DaemonEvalEnvelope {
+    type Target = ZygoteEvalReply;
+    fn deref(&self) -> &Self::Target {
+        &self.reply
+    }
+}
+
+fn finish_eval_http_request(response: Result<Vec<u8>>) -> Result<Option<DaemonEvalEnvelope>> {
+    match response {
+        Ok(bytes) => serde_json::from_slice::<DaemonEvalEnvelope>(&bytes)
+            .map(Some)
+            .map_err(|err| anyhow::anyhow!("unparseable zygote /eval reply: {err}")),
+        Err(err) if is_expired_daemon_transport_error(&err) => Ok(None),
+        Err(err) => Err(extract_http_error_detail(err)),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6837,18 +7251,35 @@ pub fn try_local_zygote_eval_with_args(
     file_name: Option<&str>,
     timeout_ms: u64,
     lean_args: &[String],
-) -> Option<ZygoteEvalReply> {
+) -> Result<Option<ZygoteEvalReply>> {
     let filtered_args = match crate::module_builder::validate_effective_lean_args(lean_args) {
         Ok(args) => args,
         Err(error) => {
-            return Some(ZygoteEvalReply {
+            return Ok(Some(ZygoteEvalReply {
                 errors: vec![format!("{error:#}")],
                 ..Default::default()
-            })
+            }))
         }
     };
+    let effective_tc = if toolchain.is_empty() || toolchain == "unknown" {
+        "leanprover/lean4:v4.35.0"
+    } else {
+        toolchain
+    };
+    let resolved_lean_bin;
+    let lean_bin = if !lean_bin.exists() && lean_bin.components().count() == 1 {
+        match crate::server::resolve_server_lean_env_and_bin(store, effective_tc, "") {
+            Ok((_, bin)) => {
+                resolved_lean_bin = bin;
+                resolved_lean_bin.as_path()
+            }
+            Err(_) => lean_bin,
+        }
+    } else {
+        lean_bin
+    };
     let (imports_csv, _) = split_shard_for_zygote(source);
-    let context = resolve_zygote_context(toolchain, lean_path, env_vars, lean_bin, &imports_csv);
+    let context = resolve_zygote_context(effective_tc, lean_path, env_vars, lean_bin, &imports_csv);
     let timeout_ms = if timeout_ms > 0 {
         timeout_ms
     } else {
@@ -6867,13 +7298,12 @@ pub fn try_local_zygote_eval_with_args(
             caller_cwd.as_deref(),
             source,
             &filtered_args,
-        )
-        .ok()?;
+        )?;
         let dir = store.fast_staging_dir().join("eval_shm_cache");
         let _ = fs::create_dir_all(&dir);
         let path = dir.join(filename);
         if let Some(cached_rep) = read_cached_eval_shm_reply(&path) {
-            return Some(cached_rep);
+            return Ok(Some(cached_rep));
         }
         Some(path)
     } else {
@@ -6901,7 +7331,7 @@ pub fn try_local_zygote_eval_with_args(
     let Some((base_url, auth_token)) = existing_daemon else {
         let (rep, executed_binding, executed_identity) = eval_with_resolved_context_opts_with_args(
             store,
-            toolchain,
+            effective_tc,
             lean_path,
             env_vars,
             lean_bin,
@@ -6916,8 +7346,7 @@ pub fn try_local_zygote_eval_with_args(
             },
             &filtered_args,
             Some(&context),
-        )
-        .ok()?;
+        )?;
         if eval_reply_cacheable(&rep) {
             if executed_binding == ClosureBinding::Bound && executed_identity == context.identity {
                 if let Some(ref path) = eval_shm_file {
@@ -6928,7 +7357,7 @@ pub fn try_local_zygote_eval_with_args(
             }
             warm_local_zygote_daemon_nonblocking(store, env_vars);
         }
-        return Some(rep);
+        return Ok(Some(rep));
     };
     let endpoint = format!("{}/eval", base_url.trim_end_matches('/'));
     let mut forwarded_env: std::collections::HashMap<String, String> = std::env::vars()
@@ -6944,21 +7373,31 @@ pub fn try_local_zygote_eval_with_args(
     } else {
         None
     };
+    let allowed_axioms: Vec<String> = env_vars
+        .get(crate::splitter::ALLOWED_AXIOMS_ENV)
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_else(crate::splitter::extra_allowed_axiom_patterns);
     let body = serde_json::to_vec(&serde_json::json!({
-        "toolchain": toolchain,
+        "toolchain": effective_tc,
         "lean_path": context.lean_path,
         "execution_identity": context.identity,
         "source": source,
         "file_name": file_name,
         "cwd": caller_cwd,
         "env_vars": forwarded_env,
+        "allowed_axioms": allowed_axioms,
         "timeout_ms": effective_timeout_opt,
         "verify_determinism": false,
         "lean_args": filtered_args
-    }))
-    .ok()?;
+    }))?;
     let http_timeout = effective_timeout_opt.map(|ms| ms.saturating_add(250));
-    let resp_bytes = match http_request_with_timeout_and_token(
+    let outcome = match http_request_with_timeout_and_token(
         "POST",
         &endpoint,
         "application/json",
@@ -6967,7 +7406,7 @@ pub fn try_local_zygote_eval_with_args(
         Some(&auth_token),
         || {},
     ) {
-        Ok(b) => b,
+        Ok(b) => finish_eval_http_request(Ok(b))?,
         Err(e) => {
             if let Some(limit_ms) = effective_timeout_opt {
                 if t0.elapsed().as_millis() as u64 >= limit_ms
@@ -6975,25 +7414,29 @@ pub fn try_local_zygote_eval_with_args(
                     || e.to_string().contains("timed out")
                     || e.to_string().contains("TimedOut")
                 {
-                    return Some(ZygoteEvalReply::timed_out_reply(
+                    return Ok(Some(ZygoteEvalReply::timed_out_reply(
                         true,
                         t0.elapsed().as_micros() as u64,
                         limit_ms,
                         0,
                         String::new(),
                         None,
-                    ));
+                    )));
                 }
             }
-            if e.to_string().contains("HTTP ") {
-                return None;
+            if !is_expired_daemon_transport_error(&e) {
+                return Err(extract_http_error_detail(e));
             }
             if let Some((_, _, _, _, state_file)) = current_exe_daemon_paths(store) {
                 terminate_and_remove_daemon_state_file(&state_file);
             }
-            let (retry_url, retry_token) = ensure_local_zygote_daemon_with_token(store, env_vars)?;
+            let Some((retry_url, retry_token)) =
+                ensure_local_zygote_daemon_with_token(store, env_vars)
+            else {
+                return Ok(None);
+            };
             let retry_endpoint = format!("{}/eval", retry_url.trim_end_matches('/'));
-            http_request_with_timeout_and_token(
+            finish_eval_http_request(http_request_with_timeout_and_token(
                 "POST",
                 &retry_endpoint,
                 "application/json",
@@ -7001,21 +7444,10 @@ pub fn try_local_zygote_eval_with_args(
                 http_timeout,
                 Some(&retry_token),
                 || {},
-            )
-            .ok()?
+            ))?
         }
     };
-    #[derive(Deserialize)]
-    struct DaemonEvalEnvelope {
-        #[serde(flatten)]
-        reply: ZygoteEvalReply,
-        #[serde(default)]
-        executed_execution_identity: Option<String>,
-        #[serde(default)]
-        binding_ok: bool,
-    }
-    let parsed_env = serde_json::from_slice::<DaemonEvalEnvelope>(&resp_bytes).ok();
-    if let Some(ref env) = parsed_env {
+    if let Some(ref env) = outcome {
         if eval_reply_cacheable(&env.reply)
             && env.binding_ok
             && env.executed_execution_identity.as_deref() == Some(context.identity.as_str())
@@ -7027,7 +7459,7 @@ pub fn try_local_zygote_eval_with_args(
             }
         }
     }
-    parsed_env.map(|env| env.reply)
+    Ok(outcome.map(|env| env.reply))
 }
 
 #[cfg(test)]
@@ -7057,6 +7489,52 @@ mod tests {
         ));
         assert!(matches!(
             finish_check_shard_request(Err(std::io::Error::from(
+                std::io::ErrorKind::ConnectionRefused
+            )
+            .into())),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn test_finish_eval_http_request_fails_closed_on_errors_and_crash_replies() {
+        let http_409 = finish_eval_http_request(Err(anyhow::anyhow!(
+            "HTTP request POST http://127.0.0.1:1/eval failed (HTTP 409): {{\"ok\":false,\"error\":\"eval execution identity changed\"}}"
+        )))
+        .unwrap_err();
+        assert_eq!(http_409.to_string(), "eval execution identity changed");
+        let http_err = finish_eval_http_request(Err(anyhow::anyhow!(
+            "HTTP request POST http://127.0.0.1:1/eval failed (HTTP 500): {{\"ok\":false,\"error\":\"internal daemon failure\"}}"
+        )))
+        .unwrap_err();
+        assert_eq!(http_err.to_string(), "internal daemon failure");
+        assert!(finish_eval_http_request(Ok(b"{\"ok\":false}".to_vec())).is_err());
+        let server_crash = serde_json::to_vec(&serde_json::json!({
+            "ok": false,
+            "kernel_gate_active": false,
+            "import_ok": false,
+            "env_cache_hit": false,
+            "prefix_cache_hit": false,
+            "import_us": 0,
+            "prefix_us": 0,
+            "elab_us": 0,
+            "heartbeats": 0,
+            "stdout": "",
+            "messages": [],
+            "error": "worker pool failed",
+            "errors": ["worker pool failed"],
+            "timed_out": false,
+            "crashed": true,
+            "deterministic": false
+        }))
+        .unwrap();
+        let rep = finish_eval_http_request(Ok(server_crash))
+            .unwrap()
+            .expect("server crash payload must parse as a crash reply");
+        assert!(rep.crashed && !rep.ok && !rep.import_ok);
+        assert_eq!(rep.errors, vec!["worker pool failed"]);
+        assert!(matches!(
+            finish_eval_http_request(Err(std::io::Error::from(
                 std::io::ErrorKind::ConnectionRefused
             )
             .into())),
@@ -7288,26 +7766,34 @@ mod tests {
             "an audited theorem is never a stub",
             "disallowed axiom `sorryAx`",
         );
+        // Cross-namespace `Evil.s1` no longer collides with root-anchored `_root_.N.s1` / `_root_.s1`
+        // stubs and is rejected directly as an unexempt `sorryAx`; a macro-injected second `N.s1`
+        // inside the same namespace is rejected as an ambiguous `_root_.N.s1` stub.
         reject(
             format!(
                 "import Lean\n{}theorem Evil.s1 : False := by\n  run_tac do\n    let g ← Lean.Elab.Tactic.getMainGoal\n    g.assign (← Lean.Meta.mkSorry (← g.getType) false)\ntheorem tgt : False := Evil.s1\n",
                 stubs
             ),
-            "a second explicit sorry outside the qualified stub's namespace is still audited and rejected",
+            "cross-namespace sorry is not exempted by N.s1 stub",
             "disallowed axiom `sorryAx`",
         );
         reject(
             format!(
-                "import Lean\n{}theorem Evil.N.s1 : False := by\n  run_tac do\n    let g ← Lean.Elab.Tactic.getMainGoal\n    g.assign (← Lean.Meta.mkSorry (← g.getType) false)\ntheorem tgt : False := Evil.N.s1\n",
-                stubs
+                "import Lean\n{}\nopen Lean Elab Command in\nelab \"inject_s1\" : command => liftCoreM do\n  addDecl <| .thmDecl {{ name := mkPrivateNameCore `Other `N.s1, levelParams := [], type := mkConst ``False, value := mkApp2 (mkConst ``sorryAx [0]) (mkConst ``False) (mkConst ``Bool.false) }}\n  addDecl <| .thmDecl {{ name := `tgt, levelParams := [], type := mkConst ``False, value := mkConst (mkPrivateNameCore `Other `N.s1) }}\ninject_s1\n",
+                "namespace N\nmacro_rules | `(term| sorry) => `(term| trivial)\ntheorem s1 : True := sorry\nend N\n"
             ),
-            "a second explicit sorry matching a qualified stub suffix is ambiguous",
-            "prefix stub `N.s1` is ambiguous",
+            "a root-anchored stub turned into a proof cannot lend its name to a same-namespace injected sorry",
+            "prefix stub `_root_.N.s1` is ambiguous",
         );
         reject(
             "import Lean\nmacro_rules | `(term| sorry) => `(term| trivial)\ntheorem s1 : True := sorry\ntheorem Evil.s1 : False := by\n  run_tac do\n    let g ← Lean.Elab.Tactic.getMainGoal\n    g.assign (← Lean.Meta.mkSorry (← g.getType) false)\ntheorem tgt : False := Evil.s1\n".into(),
-            "a stub turned into a proof cannot lend its name to an injected sorry",
-            "prefix stub `s1` is ambiguous",
+            "a root stub turned into a proof cannot lend its name to an injected sorry",
+            "declaration `Evil.s1`",
+        );
+        reject(
+            "import Lean\nnamespace N\nmacro_rules | `(term| sorry) => `(term| trivial)\ntheorem s1 : True := sorry\nend N\nopen Lean in\n#eval show Elab.Command.CommandElabM Unit from Elab.Command.liftCoreM do\n  let pn := mkPrivateNameCore `Other `N.s1\n  addDecl <| .thmDecl { name := pn, levelParams := [], type := mkConst ``False, value := mkApp2 (mkConst ``sorryAx [0]) (mkConst ``False) (mkConst ``false) }\n  addDecl <| .thmDecl { name := `tgt, levelParams := [], type := mkConst ``False, value := mkConst pn }\n".into(),
+            "an addDecl-injected private theorem with the same user name is ambiguous",
+            "prefix stub `_root_.N.s1` is ambiguous",
         );
         reject(
             "theorem other : 1 = 1 := rfl\n".into(),
@@ -7663,7 +8149,7 @@ mod tests {
                     Some(&file),
                     60_000,
                     &[],
-                )
+                )?
                 .context("local eval must produce a reply")?;
                 assert!(reply.ok && reply.import_ok, "{reply:?}");
                 assert_eq!(
@@ -7688,7 +8174,7 @@ mod tests {
                 Some(&file),
                 60_000,
                 &[],
-            )
+            )?
             .context("replaced import eval")?;
             assert!(reply.ok && reply.import_ok, "{reply:?}");
             assert_eq!(reply.messages.concat().trim(), "17", "{reply:?}");
@@ -7749,12 +8235,12 @@ mod tests {
                 args,
             )
         };
-        let cached = eval(&[]).expect("fixture must hit the empty-option cache");
+        let cached = eval(&[])?.expect("fixture must hit the empty-option cache");
         assert!(cached.ok && cached.env_cache_hit && cached.prefix_cache_hit);
         assert_eq!(cached.stdout, reply.stdout);
         for invalid in ["--plugin=bad.so", "--json", "-q", " -DautoImplicit=false "] {
             let rejected =
-                eval(&[invalid.to_string()]).expect("invalid options return a final rejection");
+                eval(&[invalid.to_string()])?.expect("invalid options return a final rejection");
             assert!(
                 !rejected.ok && !rejected.env_cache_hit && !rejected.prefix_cache_hit,
                 "invalid argument must not reuse cached reply: {invalid}: {rejected:?}"
@@ -8970,9 +9456,19 @@ mod tests {
         );
 
         let shard2 = format!("{}theorem helper_shift_eq (n : Nat) : shiftByFour n = n + 4 := sorry\ntheorem chained_thm (n : Nat) : shiftByFour n = n + 4 := by\n  simp [helper_shift_eq]\n", prefix1);
-        let rep2 =
-            eval_with_zygote_pool(&store, toolchain, "", &env_vars, &lean_bin, &shard2, true)
-                .unwrap();
+        // Stub exemptions need the checked declaration named (an unnamed request exempts nothing).
+        let rep2 = eval_with_zygote_pool_for_targets(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            &shard2,
+            &["chained_thm".to_string()],
+            None,
+            &[],
+        )
+        .unwrap();
         assert!(
             rep2.ok
                 && rep2
@@ -8987,6 +9483,63 @@ mod tests {
             eval_with_zygote_pool(&store, toolchain, "", &env_vars, &lean_bin, &shard3, true)
                 .unwrap();
         assert!(rep3.ok && rep3.env_cache_hit);
+
+        // Live worker rejects an ambiguous stub name (a second `sorryAx` theorem injected under a
+        // colliding `userNameComponents` identity `N.1`), both via a cached prefix checkpoint and in a single block.
+        let ambig_prefix = "import Lean\nnamespace N\nlocal macro_rules | `(term| sorry) => `(term| trivial)\ntheorem «1» : True := sorry\nend N\nopen Lean Elab Command in\nelab \"inject\" : command => liftCoreM do\n  addDecl <| .thmDecl { name := Name.mkNum `N 1, levelParams := [], type := mkConst ``False, value := mkApp2 (mkConst ``sorryAx [0]) (mkConst ``False) (mkConst ``Bool.false) }\ninject\n";
+        let ambig_ckpt = format!(
+            "{}theorem _root_.tgt : False := by\n  run_tac do\n    (← Lean.Elab.Tactic.getMainGoal).assign (Lean.mkConst (Lean.Name.mkNum `N 1))\n",
+            ambig_prefix
+        );
+        for run in 0..2 {
+            let rep = eval_with_zygote_pool_for_targets(
+                &store,
+                toolchain,
+                "Lean",
+                &env_vars,
+                &lean_bin,
+                &ambig_ckpt,
+                &["_root_.tgt".to_string()],
+                None,
+                &[],
+            )
+            .unwrap();
+            assert!(!rep.ok, "ambiguous prefix stub must fail: {:?}", rep);
+            if run == 1 {
+                assert!(rep.prefix_cache_hit, "expected warm prefix hit: {:?}", rep);
+            }
+            assert!(
+                rep.errors
+                    .iter()
+                    .any(|e| e.contains("prefix stub `_root_.N.«1»` is ambiguous")),
+                "unexpected live-worker errors: {:?}",
+                rep.errors
+            );
+        }
+        let ambig_final = "import Lean\n/- no-prefix-split -/\n".to_string()
+            + ambig_ckpt.strip_prefix("import Lean\n").unwrap();
+        let rep_final = eval_with_zygote_pool_for_targets(
+            &store,
+            toolchain,
+            "Lean",
+            &env_vars,
+            &lean_bin,
+            &ambig_final,
+            &["_root_.tgt".to_string()],
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            !rep_final.ok
+                && !rep_final.prefix_cache_hit
+                && rep_final
+                    .errors
+                    .iter()
+                    .any(|e| e.contains("prefix stub `_root_.N.«1»` is ambiguous")),
+            "ambiguous final-run stub must fail: {:?}",
+            rep_final
+        );
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 
@@ -9866,6 +10419,7 @@ mod tests {
             60_000,
             &[],
         )
+        .expect("eval must not error")
         .expect("worker must execute");
         assert!(
             !rep.ok && rep.errors.iter().any(|e| e == RUNTIME_PANIC_ERR),
@@ -9888,6 +10442,7 @@ mod tests {
             60_000,
             &[],
         )
+        .unwrap()
         .unwrap();
         assert!(!again.ok && again.errors.iter().any(|e| e == RUNTIME_PANIC_ERR));
         for name in [&v3_name, &v4_name] {
@@ -9973,6 +10528,7 @@ mod tests {
             60_000,
             &[],
         )
+        .expect("eval must not error")
         .expect("worker must execute");
         assert!(!rep.ok, "pre-replay cached ok replayed: {rep:?}");
         assert!(
@@ -10402,6 +10958,7 @@ mod tests {
                     0,
                     args,
                 )
+                .expect("invalid options must not error")
                 .expect("invalid options must fail closed, never trigger fallback");
                 assert!(
                     !reply.ok && reply.errors.iter().any(|e| e.contains(&arg)),
@@ -10696,6 +11253,151 @@ mod tests {
     }
 
     #[test]
+    fn test_zygote_and_audited_fallback_enforce_fast_verify_kernel_statement_pinning() {
+        let Some((tmp_dir, store, mut env_vars, lean_bin)) = open_test_zygote_env("fast_map_pin")
+        else {
+            return;
+        };
+        let toolchain = "leanprover/lean4:v4.35.0";
+        let mod_lean = tmp_dir.join("FastPinMod.lean");
+        let mod_olean = tmp_dir.join("FastPinMod.olean");
+        let orig_mod_src =
+            "namespace a\ndef k : Nat := 7\ntheorem b : k = 7 := rfl\ntheorem other : 1 = 1 := rfl\nend a\n";
+        fs::write(&mod_lean, orig_mod_src).unwrap();
+        let status = std::process::Command::new(&lean_bin)
+            .envs(&env_vars)
+            .current_dir(&tmp_dir)
+            .arg(&mod_lean)
+            .arg("-o")
+            .arg(&mod_olean)
+            .status()
+            .unwrap();
+        assert!(status.success(), "failed to compile FastPinMod.lean");
+        let lp = tmp_dir.to_string_lossy().to_string();
+        env_vars.insert("LEAN_PATH".to_string(), lp.clone());
+
+        let uncached: std::collections::HashSet<String> =
+            ["_root_.a.b".to_string()].into_iter().collect();
+        let valid_fast =
+            crate::splitter::build_fast_olean_shard_source(orig_mod_src, "FastPinMod", &uncached)
+                .unwrap();
+
+        let rep_ok = eval_with_zygote_pool_for_targets(
+            &store,
+            toolchain,
+            &lp,
+            &env_vars,
+            &lean_bin,
+            &valid_fast,
+            &["_root_.a.b".to_string()],
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            rep_ok.ok,
+            "expected valid fast-verify shard to pass: {:?}",
+            rep_ok
+        );
+
+        let fallback_ok = run_audited_lean_shard(
+            &store,
+            &lean_bin,
+            &env_vars,
+            None,
+            &valid_fast,
+            &uncached,
+            &[],
+            None,
+        )
+        .unwrap();
+        assert!(fallback_ok.status.success());
+
+        // Forge a fast-verify directive whose expected_gen_stmt_hash matches a weakened statement
+        // (`True` instead of `k = 7`), verifying that the Lean kernel check rejects the mismatch
+        // against imported `_root_.a.b` in `FastPinMod.olean`.
+        let forged_body =
+            "import FastPinMod\nnamespace a\ntheorem _turbo_verify_0_b : True := trivial\nend a\n";
+        let forged_shards = crate::splitter::split_lean_source(forged_body, &[]).shards;
+        let forged_dir = crate::splitter::format_fast_verify_directive(
+            "_root_.a.b",
+            "_root_.a._turbo_verify_0_b",
+            &forged_shards[0].stmt_hash,
+        );
+        let forged_src = format!("{}\n{}", forged_dir, forged_body);
+
+        let rep_forged = eval_with_zygote_pool_for_targets(
+            &store,
+            toolchain,
+            &lp,
+            &env_vars,
+            &lean_bin,
+            &forged_src,
+            &["_root_.a.b".to_string()],
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            !rep_forged.ok,
+            "forged fast-verify statement must be rejected by kernel type check: {:?}",
+            rep_forged
+        );
+
+        let fallback_forged = run_audited_lean_shard(
+            &store,
+            &lean_bin,
+            &env_vars,
+            None,
+            &forged_src,
+            &uncached,
+            &[],
+            None,
+        );
+        match fallback_forged {
+            Ok(out) => assert!(
+                !out.status.success(),
+                "audited fallback must reject forged fast-verify statement"
+            ),
+            Err(e) => assert!(
+                format!("{:#}", e).contains("fast-verify kernel statement mismatch"),
+                "unexpected fallback error: {:#}",
+                e
+            ),
+        }
+
+        // Unmapped `_turbo_verify_0_a_b` must fail both zygote and audited fallback.
+        let unmapped = "import Init\ntheorem _turbo_verify_0_a_b : True := trivial\n";
+        assert!(eval_with_zygote_pool_for_targets(
+            &store,
+            toolchain,
+            &lp,
+            &env_vars,
+            &lean_bin,
+            unmapped,
+            &["_root_.a.b".to_string()],
+            None,
+            &[],
+        )
+        .is_err());
+        let bad_set: std::collections::HashSet<String> =
+            ["_root_.a.b".to_string()].into_iter().collect();
+        assert!(run_audited_lean_shard(
+            &store,
+            &lean_bin,
+            &env_vars,
+            None,
+            unmapped,
+            &bad_set,
+            &[],
+            None,
+        )
+        .is_err());
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
     fn test_local_zygote_eval_aba_swap_never_poisons_eval_shm_cache() {
         let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("eval_aba_cache")
         else {
@@ -10755,6 +11457,7 @@ mod tests {
             60_000,
             &[],
         )
+        .expect("eval must not error")
         .expect("eval must succeed on snapshot A");
         digest_test_hooks::clear();
         assert_eq!(
@@ -10837,7 +11540,9 @@ mod tests {
         digest_test_hooks::clear();
         fs::write(&olean, &a).unwrap();
         assert!(
-            daemon_mismatch.is_none(),
+            daemon_mismatch
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("eval execution identity changed")),
             "daemon /eval must reject execution_identity mismatch with HTTP 409: {daemon_mismatch:?}"
         );
         assert!(
@@ -10856,6 +11561,7 @@ mod tests {
             60_000,
             &[],
         )
+        .expect("daemon /eval must not error")
         .expect("daemon /eval must succeed when identity matches");
         assert!(
             daemon_ok.ok && daemon_ok.messages.join("\n").trim() == "1",
@@ -11094,6 +11800,7 @@ mod tests {
             60_000,
             &[],
         )
+        .expect("eval must not error")
         .expect("eval must recover on retry with clean snapshot A");
         digest_test_hooks::clear();
         TEST_NO_DAEMON.with(|c| c.set(false));
@@ -11376,6 +12083,7 @@ mod tests {
             60_000,
             &[],
         )
+        .expect("eval must not error")
         .expect("eval must return A's output despite ancestor ABA swap");
         digest_test_hooks::clear();
         TEST_NO_DAEMON.with(|c| c.set(false));
@@ -11402,6 +12110,85 @@ mod tests {
         }
         purge_snapshot_dir(&fake_label_dir);
         purge_snapshot_dir(&snap_dir);
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_run_audited_lean_shard_at_rejects_live_source_toctou_and_aba_swap() {
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("audited_toctou")
+        else {
+            return;
+        };
+        struct ResetHooks;
+        impl Drop for ResetHooks {
+            fn drop(&mut self) {
+                digest_test_hooks::clear();
+            }
+        }
+        let _reset = ResetHooks;
+
+        let live_file = tmp_dir.join("LiveToctou.lean");
+        let in_mem_false = "theorem target : False := by trivial\n";
+        let disk_true = "theorem target : True := trivial\n";
+        let audit_targets: std::collections::HashSet<String> =
+            ["_root_.target".to_string()].into_iter().collect();
+
+        // Case A: file on disk overwritten before `lean` runs and left as `True`.
+        fs::write(&live_file, in_mem_false).unwrap();
+        let lf_a = live_file.clone();
+        digest_test_hooks::set("audited_shard_before_lean", move || {
+            fs::write(&lf_a, disk_true).unwrap();
+        });
+        let err_a = run_audited_lean_shard_at(
+            &store.root,
+            &store.fast_staging_dir(),
+            &lean_bin,
+            &env_vars,
+            Some(&tmp_dir),
+            Some(&live_file),
+            in_mem_false,
+            &audit_targets,
+            false,
+            &[],
+            Some(60_000),
+        )
+        .expect_err("must reject live source overwrite to True before lean");
+        assert!(
+            format!("{err_a:#}").contains("KernelGate"),
+            "unexpected error for Case A: {err_a:#}"
+        );
+        digest_test_hooks::clear();
+
+        // Case B: ABA swap — overwritten with `True` before `lean`, then restored to `False` right after `lean`!
+        fs::write(&live_file, in_mem_false).unwrap();
+        let lf_b1 = live_file.clone();
+        let lf_b2 = live_file.clone();
+        digest_test_hooks::set("audited_shard_before_lean", move || {
+            fs::write(&lf_b1, disk_true).unwrap();
+        });
+        digest_test_hooks::set("audited_shard_after_lean", move || {
+            fs::write(&lf_b2, in_mem_false).unwrap();
+        });
+        let err_b = run_audited_lean_shard_at(
+            &store.root,
+            &store.fast_staging_dir(),
+            &lean_bin,
+            &env_vars,
+            Some(&tmp_dir),
+            Some(&live_file),
+            in_mem_false,
+            &audit_targets,
+            false,
+            &[],
+            Some(60_000),
+        )
+        .expect_err("must reject ABA live source swap (False -> True -> False)");
+        assert!(
+            format!("{err_b:#}").contains("KernelGate"),
+            "unexpected error for Case B: {err_b:#}"
+        );
+        digest_test_hooks::clear();
+
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 
@@ -11508,6 +12295,7 @@ mod tests {
             60_000,
             &[],
         )
+        .expect("daemon /eval must not error")
         .expect("daemon /eval must preserve TURBO_LEAN_PROJECT_DIR and match execution_identity");
         assert!(
             rep1.ok && rep1.messages.join("\n").contains("contract A {}"),
@@ -11549,6 +12337,7 @@ mod tests {
             60_000,
             &[],
         )
+        .expect("daemon /eval must not error")
         .expect(
             "daemon /eval with bare file_name and outside cwd must forward TURBO_LEAN_PROJECT_DIR",
         );
@@ -11580,6 +12369,7 @@ mod tests {
             60_000,
             &[],
         )
+        .expect("daemon /eval must not error")
         .expect("daemon /eval after input_dir edit must succeed with updated identity");
         assert!(
             rep2.ok && rep2.messages.join("\n").contains("contract B {}"),
@@ -11629,17 +12419,19 @@ theorem uncached_first : 1 + 1 = 2 := rfl
 
 theorem uncached_second : 2 + 2 = 4 := rfl
 ";
-        let rep_ok = eval_with_zygote_pool_opts(
+        let rep_ok = eval_with_zygote_pool_for_targets(
             &store,
             toolchain,
             "",
             &env_vars,
             &lean_bin,
             clean_coalesced,
-            true,
-            false,
+            &[
+                "_root_.uncached_first".to_string(),
+                "_root_.uncached_second".to_string(),
+            ],
             None,
-            None,
+            &[],
         )
         .unwrap();
         assert!(rep_ok.ok && rep_ok.kernel_gate_active, "{rep_ok:?}");
@@ -11662,24 +12454,29 @@ theorem sneaky_in_prefix : 1 = 2 := by sorry
 
 theorem uncached_tail : 2 + 2 = 4 := rfl
 ";
-        let rep_bad = eval_with_zygote_pool_opts(
+        let rep_bad = eval_with_zygote_pool_for_targets(
             &store,
             toolchain,
             "",
             &env_vars,
             &lean_bin,
             sneaky_coalesced,
-            true,
-            false,
+            &["_root_.uncached_tail".to_string()],
             None,
-            None,
+            &[],
         )
         .unwrap();
         assert!(
             !rep_bad.ok,
             "tactic sorry inside non-stub theorem in prefix must be rejected even with allow_stub: {rep_bad:?}"
         );
-        assert!(rep_bad.errors.join("\n").contains("sorryAx"));
+        assert!(
+            rep_bad
+                .errors
+                .iter()
+                .any(|e| e.contains("sorryAx") || e.contains("`sorry` theorem")),
+            "{rep_bad:?}"
+        );
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }

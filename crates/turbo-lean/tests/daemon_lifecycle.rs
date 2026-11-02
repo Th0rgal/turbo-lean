@@ -555,6 +555,7 @@ fn unavailable_zygote_fallback_obeys_check_timeout_and_reaps_lean() {
 case "$1" in --*) exec '{}' "$@";; esac
 while IFS= read -r request; do
   echo unavailable >> '{}'
+  printf '\n[TurboLean.ZygoteWorker] reply\n' >&2
   echo '{{"ok":false,"import_ok":false,"env_cache_hit":false,"import_us":0,"elab_us":0,"errors":["import unavailable"]}}'
 done
 "#, real.display(), marker.display())).unwrap();
@@ -791,6 +792,280 @@ fn no_daemon_env_uses_relaxed_booleans() {
             i < 2
         ));
     }
+}
+
+#[test]
+fn crashed_zygote_worker_fails_closed_without_stock_lean_fallback() {
+    use std::os::unix::fs::PermissionsExt;
+    let _serial = LIFECYCLE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new();
+    let private_tmp = PathBuf::from(format!("/tmp/turbo-crash-tmp-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&private_tmp);
+    fs::create_dir_all(&private_tmp).unwrap();
+    fs::set_permissions(&private_tmp, fs::Permissions::from_mode(0o700)).unwrap();
+    struct RemoveDirOnDrop(PathBuf);
+    impl Drop for RemoveDirOnDrop {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _private_tmp_guard = RemoveDirOnDrop(private_tmp.clone());
+    let mut seed = f.check("Quick.lean");
+    seed.env("TMPDIR", &private_tmp);
+    seed.args(["--decl", "quick", "--no-daemon"]);
+    assert!(f.run(seed).status.success());
+    for elan_tc in [None, Some("leanprover/lean4:v4.35.0")] {
+        let mut seed_eval = f.command();
+        seed_eval.env("TMPDIR", &private_tmp);
+        if let Some(tc) = elan_tc {
+            seed_eval.env("ELAN_TOOLCHAIN", tc);
+        } else {
+            seed_eval.env_remove("ELAN_TOOLCHAIN");
+        }
+        seed_eval.args([
+            "eval",
+            "Quick.lean",
+            "--project-dir",
+            ".",
+            "--no-daemon",
+            "--lean-path",
+            "",
+        ]);
+        assert!(f.run(seed_eval).status.success());
+    }
+    let marker = f.root.join("worker-crashed");
+    let count_crashes = || {
+        fs::read_to_string(&marker)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    };
+    let poison_fastcheck_bins = |dir: &Path| -> usize {
+        let mut n = 0;
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("turbo_zygote_")
+                {
+                    let tmp = entry.path().with_extension("crash_replacement");
+                    fs::write(
+                        &tmp,
+                        format!("#!/bin/sh\necho crash >> '{}'\nexit 1\n", marker.display()),
+                    )
+                    .unwrap();
+                    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).unwrap();
+                    fs::rename(tmp, entry.path()).unwrap();
+                    n += 1;
+                }
+            }
+        }
+        n
+    };
+    let poison_all_zygote_bins = || -> usize {
+        let mut total = poison_fastcheck_bins(&f.root.join("cas/fastcheck_bins"));
+        for dir_root in [&private_tmp, &f.staging] {
+            if let Ok(entries) = fs::read_dir(dir_root) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name.starts_with("zygote_daemon_cas_") {
+                        total += poison_fastcheck_bins(&entry.path().join("fastcheck_bins"));
+                    } else if name.starts_with("turbo_lean_shared_zygote_bins_") {
+                        total += poison_fastcheck_bins(&entry.path());
+                    }
+                }
+            }
+        }
+        total
+    };
+    fs::write(
+        f.root.join("SeedEval.lean"),
+        "def seed_val : Nat := 0\n#eval IO.println seed_val\n",
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let mut daemon_seed = f.command();
+        daemon_seed.env("TMPDIR", &private_tmp);
+        daemon_seed.args(["eval", "SeedEval.lean", "--project-dir", "."]);
+        assert!(f.run(daemon_seed).status.success());
+    }
+    f.stop();
+    let replaced = poison_all_zygote_bins();
+    assert!(replaced > 0, "seed did not cache a worker");
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let addr = format!("127.0.0.1:{port}");
+    let server = ChildGuard(
+        f.command()
+            .current_dir(f.root.join("home"))
+            .env("TURBO_LEAN_DAEMON", "1")
+            .env("TMPDIR", &private_tmp)
+            .args([
+                "--cache-dir",
+                f.root.join("cas").to_str().unwrap(),
+                "serve",
+                "--listen",
+                &addr,
+                "--allow-unauthenticated-local",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    f.wait_for(Duration::from_secs(30), || {
+        std::net::TcpStream::connect(&addr).is_ok()
+    });
+    fs::write(
+        f.root.join("CrashValid.lean"),
+        "theorem valid_after_crash : 1 + 1 = 2 := rfl\n",
+    )
+    .unwrap();
+    fs::write(
+        f.root.join("CrashWholeFile.lean"),
+        "def val_after_crash : Nat := 1\n#eval val_after_crash\n",
+    )
+    .unwrap();
+    for remote in [false, true] {
+        for decl in [true, false] {
+            let before = count_crashes();
+            let mut cmd = f.check("CrashValid.lean");
+            cmd.env("TMPDIR", &private_tmp);
+            cmd.arg("--no-daemon");
+            if remote {
+                cmd.args(["--remote-http", &format!("http://{addr}")]);
+            }
+            if decl {
+                cmd.args(["--decl", "valid_after_crash"]);
+            }
+            let out = f.run(cmd);
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                !out.status.success(),
+                "worker crash fell back to stock lean (remote={remote}, decl={decl}): {text}"
+            );
+            assert!(
+                count_crashes() > before,
+                "crashing worker was not exercised (remote={remote}, decl={decl}): {text}"
+            );
+        }
+    }
+    use std::os::unix::fs::MetadataExt;
+    let exe_meta = fs::metadata(BIN).unwrap();
+    let state_json = serde_json::json!({
+        "addr": addr,
+        "pid": server.0.id(),
+        "exe_mtime_sec": exe_meta.mtime(),
+        "exe_mtime_nsec": exe_meta.mtime_nsec(),
+        "auth_token": "",
+        "policy": ["propext", "Quot.sound", "Classical.choice"]
+    });
+    for entry in fs::read_dir(&f.staging).unwrap().flatten() {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("zygote_daemon_cas_")
+        {
+            let _ = fs::remove_file(entry.path().join("zygote_daemon.json"));
+        }
+    }
+    fs::write(
+        f.root.join("cas/zygote_daemon.json"),
+        serde_json::to_vec(&state_json).unwrap(),
+    )
+    .unwrap();
+    {
+        let before = count_crashes();
+        let mut cmd = f.check("CrashWholeFile.lean");
+        cmd.env("TMPDIR", &private_tmp);
+        let out = f.run(cmd);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !out.status.success(),
+            "whole-file /eval worker crash fell back to stock lean: {text}"
+        );
+        assert!(
+            count_crashes() > before,
+            "whole-file /eval did not exercise crashing worker: {text}"
+        );
+    }
+    for no_daemon in [true, false] {
+        let before_eval = count_crashes();
+        let mut eval_cmd = f.command();
+        eval_cmd.env("TMPDIR", &private_tmp);
+        eval_cmd.args(["eval", "CrashWholeFile.lean", "--project-dir", "."]);
+        if no_daemon {
+            eval_cmd.arg("--no-daemon");
+        }
+        let eval_out = f.run(eval_cmd);
+        let eval_text = String::from_utf8_lossy(&eval_out.stdout);
+        assert!(
+            !eval_out.status.success(),
+            "`turbo-lean eval` worker crash succeeded (no_daemon={no_daemon}): {eval_text}"
+        );
+        assert!(
+            count_crashes() > before_eval,
+            "`turbo-lean eval` did not exercise crashing worker (no_daemon={no_daemon}): {eval_text}"
+        );
+    }
+    {
+        let before_nd = count_crashes();
+        let mut nd_check = f.check("CrashWholeFile.lean");
+        nd_check.env("TMPDIR", &private_tmp);
+        nd_check.arg("--no-daemon");
+        let nd_out = f.run(nd_check);
+        let nd_text = String::from_utf8_lossy(&nd_out.stdout);
+        assert!(
+            !nd_out.status.success(),
+            "`check --no-daemon` auditor crash succeeded: {nd_text}"
+        );
+        assert!(
+            count_crashes() > before_nd,
+            "`check --no-daemon` did not exercise crashing auditor: {nd_text}"
+        );
+    }
+    let _ = fs::remove_file(f.root.join("cas/zygote_daemon.json"));
+    drop(server);
+    f.stop();
+    let before_auto = count_crashes();
+    let mut auto_check = f.check("CrashWholeFile.lean");
+    auto_check.env("TMPDIR", &private_tmp);
+    let out_auto = f.run(auto_check);
+    let text_auto = String::from_utf8_lossy(&out_auto.stdout);
+    assert!(
+        !out_auto.status.success(),
+        "auto-daemon whole-file /eval worker crash fell back to stock lean: {text_auto}"
+    );
+    assert!(
+        count_crashes() > before_auto,
+        "auto-daemon whole-file /eval did not exercise crashing worker: {text_auto}"
+    );
+    let before_auto_eval = count_crashes();
+    let mut auto_eval = f.command();
+    auto_eval.env("TMPDIR", &private_tmp);
+    auto_eval.args(["eval", "CrashWholeFile.lean", "--project-dir", "."]);
+    let auto_eval_out = f.run(auto_eval);
+    let auto_eval_text = String::from_utf8_lossy(&auto_eval_out.stdout);
+    assert!(
+        !auto_eval_out.status.success(),
+        "auto-daemon `turbo-lean eval` worker crash succeeded: {auto_eval_text}"
+    );
+    assert!(
+        count_crashes() > before_auto_eval,
+        "auto-daemon `turbo-lean eval` did not exercise crashing worker: {auto_eval_text}"
+    );
+    f.stop();
+    let _ = fs::remove_dir_all(&private_tmp);
+    assert!(marker.exists(), "crashing worker was not exercised");
+    evidence(
+        "worker crash failed closed across remote/daemon and --no-daemon without fallback".into(),
+    );
 }
 
 #[test]

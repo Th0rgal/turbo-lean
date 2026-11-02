@@ -540,7 +540,11 @@ fn http_stock_lean_fallback_rejects_source_bypasses() {
     let real = dir.join("real-auditor");
     fs::copy(&worker, &real).unwrap();
     let wrapper = dir.join("unavailable-worker");
-    fs::write(&wrapper, "#!/bin/sh\ncase \"$1\" in --audit-modules|--kernel-replay-module) exec \"$TURBO_LEAN_TEST_REAL_AUDITOR\" \"$@\" ;; esac\nexit 1\n").unwrap();
+    fs::write(
+        &wrapper,
+        "#!/bin/sh\ncase \"$1\" in --*) exec \"$TURBO_LEAN_TEST_REAL_AUDITOR\" \"$@\" ;; esac\nwhile IFS= read -r _request; do\n  printf '\\n[TurboLean.ZygoteWorker] reply\\n' >&2\n  echo '{\"ok\":false,\"import_ok\":false,\"env_cache_hit\":false,\"import_us\":0,\"elab_us\":0,\"errors\":[\"import unavailable\"]}'\ndone\n",
+    )
+    .unwrap();
     fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
     fs::rename(wrapper, worker).unwrap();
     let (server, addr) = start_option_server(&dir, Some(&real));
