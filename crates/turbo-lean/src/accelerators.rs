@@ -104,7 +104,7 @@ impl AcceleratorConfig {
     /// 1. `TURBO_LEAN_ACCELERATORS_CONFIG` environment variable (inline JSON or file path),
     /// 2. `<project_dir>/.turbo-lean/accelerators.json`,
     /// 3. `<project_dir>/turbo-lean.toml`,
-    /// falling back to the zero-config defaults (`enabled: true, default_budget_ms: 25`).
+    ///    falling back to the zero-config defaults (`enabled: true, default_budget_ms: 25`).
     pub fn load(project_dir: Option<&Path>) -> Self {
         let mut resolved = crate::shm_cache::load_project_or_env_config(
             None,
@@ -581,12 +581,14 @@ fn replace_first_word(src: &str, target_word: &str, replacement: &str) -> Option
     None
 }
 
+type FastcheckFallbackFn = fn(&str, &str) -> Option<(String, Option<String>)>;
+
 fn run_fastcheck_backend_certificate(
     decl_name: &str,
     stmt_src: &str,
     backend_tag: &str,
     accelerator_name: &str,
-    fallback_fn: fn(&str, &str) -> Option<(String, Option<String>)>,
+    fallback_fn: FastcheckFallbackFn,
 ) -> Option<AcceleratorCertificate> {
     if let Ok(res) = crate::cluster::auto_fastcheck_decl(decl_name, stmt_src, backend_tag) {
         if res.get("ok").and_then(|v| v.as_bool()) == Some(false) {
@@ -884,7 +886,9 @@ fn scan_stmt_binders(s: &str) -> (Vec<(char, String)>, bool, String, bool) {
     (binders, found_colon, tail, hit_unexpected)
 }
 
-fn parse_omega_stmt(raw_stmt: &str) -> Option<(Vec<(String, OmegaParamDom)>, Vec<String>, String)> {
+type ParsedOmegaStmt = (Vec<(String, OmegaParamDom)>, Vec<String>, String);
+
+fn parse_omega_stmt(raw_stmt: &str) -> Option<ParsedOmegaStmt> {
     let s = strip_decl_header_and_assign(raw_stmt);
     let (binders, found_colon, tail, _) = scan_stmt_binders(&s);
     let mut params: Vec<(String, OmegaParamDom)> = Vec::new();
@@ -1656,7 +1660,9 @@ impl ParsedOmegaGoal {
                     let mut sub_coeffs = vec![0u64; params.len()];
                     let mut sub_const = 0u64;
                     collect_lin_terms(sub, 1, params, &mut sub_coeffs, &mut sub_const)?;
-                    if sub_const % div_d != 0 || sub_coeffs.iter().any(|&c| c % div_d != 0) {
+                    if !sub_const.is_multiple_of(div_d)
+                        || sub_coeffs.iter().any(|&c| !c.is_multiple_of(div_d))
+                    {
                         return None;
                     }
                     let q_const = (sub_const / div_d).checked_mul(scale)?;
@@ -2355,10 +2361,10 @@ fn distill_constants_for_simp_chain_inner(
             non_core.push(c.to_string());
         }
         let cand_mask = simd_ident_bloom_mask_u64(c);
-        if crate::c_abi::verify_ident_bloom(false, cand_mask, context_mask) {
-            if !bloom_matched.iter().any(|existing| existing == c) {
-                bloom_matched.push(c.to_string());
-            }
+        if crate::c_abi::verify_ident_bloom(false, cand_mask, context_mask)
+            && !bloom_matched.iter().any(|existing| existing == c)
+        {
+            bloom_matched.push(c.to_string());
         }
     }
     let mut selected = if !bloom_matched.is_empty() {
@@ -3317,11 +3323,11 @@ fn extract_ac_equality_conclusion(stmt_src: &str) -> Option<(String, String)> {
                     .copied()
                     .unwrap_or(b' ');
                 let next = c_bytes.get(idx + 1).copied().unwrap_or(b' ');
-                if !matches!(prev, b'=' | b'!' | b'<' | b'>' | b':') && !matches!(next, b'=' | b'>')
+                if !matches!(prev, b'=' | b'!' | b'<' | b'>' | b':')
+                    && !matches!(next, b'=' | b'>')
+                    && eq_idx.replace(idx).is_some()
                 {
-                    if eq_idx.replace(idx).is_some() {
-                        return None;
-                    }
+                    return None;
                 }
             }
             _ => {}
