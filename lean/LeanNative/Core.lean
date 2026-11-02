@@ -13,6 +13,7 @@ import LeanNative.Proofs.SymbolicTV
 import LeanNative.Proofs.CertChecker
 import LeanNative.Proofs.MutantSuite
 import LeanNative.Proofs.AxiomAudit
+import LeanNative.Proofs.HybridCAbiProofs
 import LeanNative.Transform.Pass
 import LeanNative.Transform.EqSat
 import LeanNative.Transform.LoopSchedule
@@ -26,6 +27,7 @@ import LeanNative.Transform.Plugins
 import LeanNative.Backend.LLVM
 import LeanNative.Backend.GPUIR
 import LeanNative.Backend.MLIRGPU
+import LeanNative.Backend.StableHLOAst
 import LeanNative.Backend.Metal
 import LeanNative.Backend.Hybrid
 import LeanNative.Backend.FastCheck

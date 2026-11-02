@@ -18,8 +18,6 @@ import LeanNative.Transform.LoopVectorizeOpt
 import LeanNative.Transform.Superopt
 import LeanNative.Transform.Plugins
 import LeanNative.Backend.LLVM
-import LeanNative.Backend.Clif
-import FV.Clif.Print
 import LeanNative.Backend.GPUIR
 import LeanNative.Backend.MLIRGPU
 import LeanNative.Backend.Metal
@@ -202,6 +200,8 @@ def runEmitCAbiBindings (tag : String) (elaborateHook? : Option (String → Targ
   validateValueTakingFlags args
   -- one resolved input feeds BOTH signature extraction and the Stage 1D / A_L0 validation below
   let sel ← match preloaded? with | some (s, _) => pure s | none => resolveInput args
+  let rawArch := findFlagValue args "--arch" (findFlagValue args "--target" "")
+  let width? ← if rawArch.isEmpty then pure none else (some ∘ ArchWidth.ofTargetArch) <$> parseTargetArchIO rawArch
   let leanPath := sel.path
   let hdrPath := findFlagValue args "--emit-header" (findFlagValue args "--header" "")
   let rsPath := findFlagValue args "--emit-rust" (findFlagValue args "--rust" "")
@@ -235,7 +235,7 @@ def runEmitCAbiBindings (tag : String) (elaborateHook? : Option (String → Targ
       let m ← loadMod
       pure (moduleToCAbiSigs (runDefaultPipeline m).1, [], if leanPath.isEmpty then m.moduleName else leanPath)
   let note? := if sigOnly then some signaturesOnlyMarker else none
-  let hdrText := emitCAbiHeaderFromSigs sigs note?
+  let hdrText := emitCAbiHeaderFromSigs sigs note? width?
   let rsText := emitCAbiRustFromSigs sigs note?
   let swiftText := emitCAbiSwiftFromSigs sigs (note? := note?)
   let fixText := emitGuardFixturesJson srcLabel sigs guards note?
@@ -327,7 +327,7 @@ def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → Targ
       pure (if srcSigs.isEmpty then moduleToCAbiSigs optMod else srcSigs, srcGuards)
     else pure (moduleToCAbiSigs optMod, [])
   let irText := emitLLVMOptimized optMod arch none wasmSimd128
-  let hdrText := emitCAbiHeaderFromSigs sigs
+  let hdrText := emitCAbiHeaderFromSigs sigs (width? := some (ArchWidth.ofTargetArch arch))
   let nonce ← IO.monoNanosNow
   let (tmpLl, tmpObj, tmpArchive, tmpAsm) := (s!"{outPath}.{nonce}.tmp.ll", s!"{outPath}.{nonce}.tmp.o", s!"{outPath}.{nonce}.tmp.a", s!"{asmPath}.{nonce}.tmp.s")
   IO.FS.writeFile tmpLl irText
@@ -820,7 +820,6 @@ def printCoreUsage (tag : String) (hasFrontend : Bool) : IO Unit := do
   let lines := [s!"{tag} v0.5.0 — Formally Validated Lean 4 Optimizer, TV, FastCheck & Multi-Target Codegen", s!"Usage: {tag} <command> [options]", "Commands:"] ++
     fe ["  build-exe          Compile a .lean source file directly to a native executable (<file.lean> -o <bin>)"] ++ [
     "  compile-llvm       Emit baseline or optimized LLVM 18 IR (--input <file>, --arch <target>, --baseline, -o <path>)",
-    "  compile-clif       Emit F64 CLIF (--input <file>, --decl <name>, -o <path>)",
     "  compile-static-lib Emit C-ABI static library (.a) + C header (.h) (--input <file>, -o <lib.a>, --header <lib.h>)",
     "  emit-cabi-bindings Emit C/Rust/Swift/modulemap/fixture bindings (--emit-header|--emit-rust|--emit-swift|--emit-modulemap|--emit-fixtures <path>)"] ++
     (if hasFrontend then [] else [
@@ -926,16 +925,6 @@ def runEvalLNIR (elaborateHook? : Option (String → TargetArch → IO LNIRModul
   IO.println jsonRow
   return if ok then 0 else 1
 
-def runCompileClif (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
-  let (m, selected, path) := (← loadInputModule elaborateHook? args, findFlagValue args "--decl" "", findFlagValue args "-o" "")
-  let ds := if selected.isEmpty then m.decls else m.decls.filter (·.name == selected)
-  if ds.isEmpty then throw <| IO.userError "[lean-native] No matching CLIF declarations"
-  let fs ← ds.mapM fun d => match LeanNative.Backend.Clif.lowerDecl d with
-    | .ok f => pure f | .error e => throw <| IO.userError s!"[lean-native] {d.name}: {e}"
-  let text := _root_.Clif.print { funcs := fs }
-  if path.isEmpty then IO.print text else IO.FS.writeFile path text
-  return 0
-
 def rcAdtSupportedCommands : List String := ["emit-lnir", "eval-lnir", "validate-tv", "verify-certs"]
 
 /-- Shared CLI dispatcher for both `lean-native-core` (`elaborateHook? = none`) and `lean-native` (`elaborateHook? = some ...`). -/
@@ -952,7 +941,7 @@ def dispatchSharedCommand (tag : String) (elaborateHook? : Option (String → Ta
   let rest := args.drop 1
   let effArgs := if args.head? == some "--c-abi" || args.head? == some "--emit-c-abi" || isCabiFallback then args else rest
   -- every input-reading command resolves its input once, up front: conflicting selectors are a hard error here
-  let readsInput := ["compile", "compile-clif", "compile-llvm", "compile-static-lib", "compile-mlir", "compile-ptx", "compile-metal",
+  let readsInput := ["compile", "compile-llvm", "compile-static-lib", "compile-mlir", "compile-ptx", "compile-metal",
        "compile-hybrid", "compile-fastcheck", "superopt", "plugins", "telemetry", "verify-certs",
        "validate-tv", "eval-lnir", "emit-lnir", "emit-cabi-bindings", "compile-c-abi",
        "--c-abi", "--emit-c-abi"].contains (args.headD "") || isCabiFallback
@@ -966,7 +955,6 @@ def dispatchSharedCommand (tag : String) (elaborateHook? : Option (String → Ta
   | "bench-snark-kernels" :: rest => some <$> runBenchSnarkKernels rest
   | "eval-lnir" :: rest          => some <$> runEvalLNIR elaborateHook? rest
   | "compile-llvm" :: rest       => some <$> runCompileLLVM tag elaborateHook? rest
-  | "compile-clif" :: rest       => some <$> runCompileClif elaborateHook? rest
   | "compile-static-lib" :: rest => some <$> runCompileStaticLib tag elaborateHook? rest
   | "emit-cabi-bindings" :: rest => some <$> runEmitCAbiBindings tag elaborateHook? rest
   | "compile-c-abi" :: rest      => do

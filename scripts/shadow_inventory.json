@@ -3,6 +3,24 @@
   "comment": "Pinned target-side inventory for scripts/check_shadow_semantics.lean (Track B0 spec v4, deliverable 3). Code-owner review is requested via .github/CODEOWNERS but NOT enforced until a ruleset requires it (docs/SHADOW_SEMANTICS.md, Enforcement); the checker itself refuses any inventory that drops an entry present in the base revision or in its hard-coded minimum.",
   "modules": [
     "LeanNative.Backend.Semantics",
+    "LeanNative.Backend.StableHLOAst",
+    "LeanNative.Backend.StableHLOAst.Syntax",
+    "LeanNative.Backend.StableHLOAst.Eval",
+    "LeanNative.Backend.TargetIR",
+    "LeanNative.Backend.LLVMAst",
+    "LeanNative.Backend.LLVMAst.Syntax",
+    "LeanNative.Backend.LLVMAst.Eval",
+    "LeanNative.Backend.LLVMAst.PP",
+    "LeanNative.Backend.LLVMAst.RoundtripProofs",
+    "LeanNative.Backend.LLVMAst.SemanticsProofs",
+    "LeanNative.Backend.MetalAst",
+    "LeanNative.Backend.MetalAst.Syntax",
+    "LeanNative.Backend.MetalAst.Eval",
+    "LeanNative.Backend.MetalAst.Proofs",
+    "LeanNative.Backend.PTXAst",
+    "LeanNative.Backend.PTXAst.Syntax",
+    "LeanNative.Backend.PTXAst.Eval",
+    "LeanNative.Backend.PTXAst.Proofs",
     "LeanNative.IR.LCNF",
     "TurboLean.ConLeche"
   ],
@@ -10,13 +28,47 @@
     "LeanMLIR",
     "LNSym",
     "ConLeche",
-    "LCNF"
+    "LCNF",
+    "LeanNative.Backend.StableHLOAst",
+    "LeanNative.Backend.TargetIR",
+    "LeanNative.Backend.LLVMAst",
+    "LeanNative.Backend.LLVMAst.PP",
+    "LeanNative.Backend.MetalAst",
+    "LeanNative.Backend.PTXAst"
   ],
   "namespace_owners": {
     "LeanMLIR": ["LeanNative.Backend.Semantics"],
     "LNSym": ["LeanNative.Backend.Semantics"],
     "ConLeche": ["TurboLean.ConLeche"],
-    "LCNF": ["LeanNative.IR.LCNF"]
+    "LCNF": ["LeanNative.IR.LCNF"],
+    "LeanNative.Backend.StableHLOAst": [
+      "LeanNative.Backend.StableHLOAst",
+      "LeanNative.Backend.StableHLOAst.Syntax",
+      "LeanNative.Backend.StableHLOAst.Eval",
+      "LeanNative.Backend.StableHLOAst.Proofs"
+    ],
+    "LeanNative.Backend.TargetIR": ["LeanNative.Backend.TargetIR"],
+    "LeanNative.Backend.LLVMAst": [
+      "LeanNative.Backend.LLVMAst",
+      "LeanNative.Backend.LLVMAst.Syntax",
+      "LeanNative.Backend.LLVMAst.Eval",
+      "LeanNative.Backend.LLVMAst.PP",
+      "LeanNative.Backend.LLVMAst.RoundtripProofs",
+      "LeanNative.Backend.LLVMAst.SemanticsProofs"
+    ],
+    "LeanNative.Backend.LLVMAst.PP": ["LeanNative.Backend.LLVMAst.PP"],
+    "LeanNative.Backend.MetalAst": [
+      "LeanNative.Backend.MetalAst",
+      "LeanNative.Backend.MetalAst.Syntax",
+      "LeanNative.Backend.MetalAst.Eval",
+      "LeanNative.Backend.MetalAst.Proofs"
+    ],
+    "LeanNative.Backend.PTXAst": [
+      "LeanNative.Backend.PTXAst",
+      "LeanNative.Backend.PTXAst.Syntax",
+      "LeanNative.Backend.PTXAst.Eval",
+      "LeanNative.Backend.PTXAst.Proofs"
+    ]
   },
   "proof_module_prefixes": [
     "LeanNative.Proofs"

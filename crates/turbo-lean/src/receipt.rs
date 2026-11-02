@@ -3,6 +3,18 @@
 //! Provides sub-millisecond offline verification of `ci-verify` and `pr-verify` receipts
 //! without opening SQLite (`state.db`), including BLAKE3 content addressing, keyed HMAC-BLAKE3
 //! / Ed25519-domain-separated attestation helpers, and per-file `InterfaceHash` drift pinpointing.
+//!
+//! Declarative Lake file inputs (`input_dir` / `input_file`) are deliberately **not** mixed into
+//! `interface_hash` or `per_file_interfaces`. Those are projections of the Lean sources alone --
+//! the proof-irrelevant signature of each file -- and their one job is to be compared between two
+//! revisions to pinpoint interface drift. Both sides of that comparison are read with the same
+//! inputs on disk, so folding the input bytes in would move both and report nothing new, while
+//! making an unchanged Lean interface look changed whenever a `.sol` file was touched.
+//!
+//! The receipt is still bound to the input bytes, through `action_key`:
+//! `lake_build::update_with_lake_input_digests` folds the whole workspace's input digests into the
+//! `build` and `ci-verify` action keys, and `compute_receipt_blake3` covers `action_key`. So a
+//! receipt issued against one set of inputs cannot be presented for another.
 
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -45,6 +57,7 @@ pub struct ReceiptVerificationReport {
     pub signature_verified: Option<bool>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn compute_receipt_blake3(
     schema_version: u32,
     mode: &str,
