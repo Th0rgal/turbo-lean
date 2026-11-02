@@ -1271,7 +1271,7 @@ theorem bar_sync_uniform_converges (bid : Nat) (states : List (Option Nat)) (cta
     stepCTABarrier bid states cta =
       .ok { cta with threads := cta.threads.map fun th => { th with pc := th.pc + 1 } } := by
   unfold stepCTABarrier
-  rw [if_pos h_uniform]
+  simp [h_uniform]
 
 /-- Divergent CTA `bar.sync` detection: when at least one thread in the CTA disagrees with `some bid`
     (e.g., took a divergent branch or halted early), `stepCTABarrier` traps with explicit
@@ -1280,7 +1280,7 @@ theorem bar_sync_divergent_errors (bid : Nat) (states : List (Option Nat)) (cta 
     (h_div : states.all (fun s => s == some bid) = false) :
     stepCTABarrier bid states cta = .barrierDivergence bid := by
   unfold stepCTABarrier
-  rw [if_neg (by simp [h_div])]
+  simp [h_div]
 
 /-- Halted CTA fixed-point: once all threads in `cta` have halted, `runCTA` immediately returns
     `.ok cta` for every step budget `fuel`. -/
@@ -1290,10 +1290,10 @@ theorem runCTA_halted (fuel : Nat) (stmts : List PTXStmt) (cta : PTXCTAState)
   cases fuel with
   | zero =>
     unfold runCTA
-    rw [if_pos h_halted]
+    simp [h_halted]
   | succ f =>
     unfold runCTA stepCTA
-    rw [if_pos h_halted]
+    simp [h_halted]
 
 /-- Fuel-independent operational determinism of the PTX SIMT CTA semantics (`runCTA`):
     any two executions from the same kernel body and initial CTA state under arbitrary step
@@ -1310,9 +1310,9 @@ theorem runCTA_deterministic (f1 f2 : Nat) (stmts : List PTXStmt) (cta : PTXCTAS
   | zero =>
     unfold runCTA at h1
     cases hAll : cta.threads.all (·.halted)
-    · rw [if_neg (by simp [hAll])] at h1
+    · simp [hAll] at h1
       exact False.elim (hne1 h1.symm)
-    · rw [if_pos hAll] at h1
+    · simp [hAll] at h1
       have hRun2 := runCTA_halted f2 stmts cta hAll
       rw [hRun2] at h2
       exact h1.symm.trans h2
@@ -1321,9 +1321,9 @@ theorem runCTA_deterministic (f1 f2 : Nat) (stmts : List PTXStmt) (cta : PTXCTAS
     | zero =>
       unfold runCTA at h2
       cases hAll : cta.threads.all (·.halted)
-      · rw [if_neg (by simp [hAll])] at h2
+      · simp [hAll] at h2
         exact False.elim (hne2 h2.symm)
-      · rw [if_pos hAll] at h2
+      · simp [hAll] at h2
         have hRun1 := runCTA_halted (f1' + 1) stmts cta hAll
         rw [hRun1] at h1
         exact h1.symm.trans h2
@@ -1394,7 +1394,7 @@ private theorem charList_isPrefixOf_append :
     ∀ (xs ys : List Char), List.isPrefixOf xs (xs ++ ys) = true
   | [], _ => rfl
   | x :: xs, ys => by
-    simp [List.isPrefixOf, charList_isPrefixOf_append xs ys]
+    simp [charList_isPrefixOf_append xs ys]
 
 /-- Structural header well-formedness of `ppPTXModule`: every rendered module begins with the exact
     `.version <major>.<minor>`, `.target`, and `.address_size` header directives of `m`. -/

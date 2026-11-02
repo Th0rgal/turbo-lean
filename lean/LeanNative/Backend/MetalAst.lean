@@ -1078,7 +1078,9 @@ theorem threadgroupBarrier_divergent_errors (g : MSLGroupState)
     (h_div : (!g.threads.isEmpty && g.threads.all threadAtBarrier) = false) :
     stepGroupBarrier g = .barrierDivergence := by
   unfold stepGroupBarrier
-  rw [if_neg (by simp [h_div])]
+  have hFalse : ¬ ((!g.threads.isEmpty && g.threads.all threadAtBarrier) = true) := by
+    rw [h_div]; decide
+  exact ite_eq_right_iff.mpr fun h => False.elim (hFalse h)
 
 private theorem stepFirstReady_preserves_const (g : MSLGroupState) :
     ∀ (pre suf : List MSLThreadState) (progressed : Bool) (g' : MSLGroupState),
@@ -1225,10 +1227,10 @@ theorem runGroup_halted (fuel : Nat) (g : MSLGroupState)
   cases fuel with
   | zero =>
     unfold runGroup
-    rw [if_pos h_halted]
+    simp [h_halted]
   | succ f =>
     unfold runGroup stepGroup
-    rw [if_pos h_halted]
+    simp [h_halted]
 
 /-- Fuel-independent operational determinism of the Metal SIMT threadgroup semantics (`runGroup`):
     any two executions from the same initial `MSLGroupState` under arbitrary step budgets `f1`
@@ -1244,9 +1246,9 @@ theorem runGroup_deterministic (f1 f2 : Nat) (g : MSLGroupState)
   | zero =>
     unfold runGroup at h1
     cases hAll : g.threads.all (·.halted)
-    · rw [if_neg (by simp [hAll])] at h1
+    · simp [hAll] at h1
       exact False.elim (hne1 h1.symm)
-    · rw [if_pos hAll] at h1
+    · simp [hAll] at h1
       have hRun2 := runGroup_halted f2 g hAll
       rw [hRun2] at h2
       exact h1.symm.trans h2
@@ -1255,9 +1257,9 @@ theorem runGroup_deterministic (f1 f2 : Nat) (g : MSLGroupState)
     | zero =>
       unfold runGroup at h2
       cases hAll : g.threads.all (·.halted)
-      · rw [if_neg (by simp [hAll])] at h2
+      · simp [hAll] at h2
         exact False.elim (hne2 h2.symm)
-      · rw [if_pos hAll] at h2
+      · simp [hAll] at h2
         have hRun1 := runGroup_halted (f1' + 1) g hAll
         rw [hRun1] at h1
         exact h1.symm.trans h2
@@ -1297,7 +1299,7 @@ private theorem charList_isPrefixOf_append :
     ∀ (xs ys : List Char), List.isPrefixOf xs (xs ++ ys) = true
   | [], _ => rfl
   | x :: xs, ys => by
-    simp [List.isPrefixOf, charList_isPrefixOf_append xs ys]
+    simp [charList_isPrefixOf_append xs ys]
 
 /-- Structural header well-formedness of `ppMSLModule`: every rendered Metal module begins with
     `#include <metal_stdlib>\nusing namespace metal;`. -/
