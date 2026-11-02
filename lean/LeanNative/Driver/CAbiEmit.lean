@@ -461,7 +461,7 @@ pointer to a non-empty slice. Existing signature and archive emitters above are 
 /-- Unboxed C99 scalar carried by a generated binding. -/
 inductive C99ScalarType where
   | u8 | u16 | u32 | u64 | usize | i64 | f32 | f64 | ptr
-  deriving Repr, DecidableEq, Inhabited, BEq
+  deriving Repr, DecidableEq, Inhabited
 
 namespace C99ScalarType
 
@@ -484,7 +484,7 @@ end C99ScalarType
 structure C99FieldSpec where
   name : String
   ty : C99ScalarType
-  deriving Repr, DecidableEq, Inhabited, BEq
+  deriving Repr, DecidableEq, Inhabited
 
 /-- One field after natural alignment has assigned its byte interval. -/
 structure C99FieldLayout where
@@ -493,7 +493,7 @@ structure C99FieldLayout where
   offset : Nat
   size : Nat
   align : Nat
-  deriving Repr, DecidableEq, Inhabited, BEq
+  deriving Repr, DecidableEq, Inhabited
 
 namespace C99FieldLayout
 
@@ -512,7 +512,7 @@ structure C99StructLayout where
   fields : List C99FieldLayout
   structAlign : Nat
   structSize : Nat
-  deriving Repr, DecidableEq, Inhabited, BEq
+  deriving Repr, DecidableEq, Inhabited
 
 /-- Explicit C99 slice descriptor: pointer, element count, stride, element size, and alignment. -/
 structure C99SliceDesc where
@@ -521,14 +521,14 @@ structure C99SliceDesc where
   byteStride : Nat
   elemSize : Nat
   align : Nat
-  deriving Repr, DecidableEq, Inhabited, BEq
+  deriving Repr, DecidableEq, Inhabited
 
 /-- Typed C function signature derived from scalar layouts. -/
 structure C99FnSig where
   cSymbol : String
   params : List C99FieldSpec
   retTy : C99ScalarType
-  deriving Repr, DecidableEq, Inhabited, BEq
+  deriving Repr, DecidableEq, Inhabited
 
 /-- Round `n` up to the next positive multiple of `a`; zero alignment fails closed. -/
 def c99AlignUp (n a : Nat) : Option Nat :=

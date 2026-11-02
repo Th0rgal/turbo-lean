@@ -645,14 +645,14 @@ inductive TransferDirection where
   | hostToDevice
   | deviceToHost
   | inOut
-  deriving Repr, DecidableEq, Inhabited, BEq
+  deriving Repr, DecidableEq, Inhabited
 
 /-- Three-dimensional launch extent. Every component is a number of threads or blocks. -/
 structure Dim3 where
   x : Nat
   y : Nat
   z : Nat
-  deriving Repr, DecidableEq, Inhabited, BEq
+  deriving Repr, DecidableEq, Inhabited
 
 namespace Dim3
 
@@ -669,7 +669,7 @@ inductive RcOwnership where
   | borrowedByDevice
   | pinnedHostRef
   | uniqueOutBuffer
-  deriving Repr, DecidableEq, Inhabited, BEq
+  deriving Repr, DecidableEq, Inhabited
 
 /-- One host allocation participating in a hybrid launch. -/
 structure DeviceBufferDesc where
@@ -683,7 +683,7 @@ structure DeviceBufferDesc where
   rc : Nat
   baseAddr : Nat
   ownership : RcOwnership
-  deriving Repr, DecidableEq, Inhabited, BEq
+  deriving Repr, DecidableEq, Inhabited
 
 namespace DeviceBufferDesc
 
@@ -731,7 +731,7 @@ structure HybridLaunchRequest where
   blockDim : Dim3
   buffers : List DeviceBufferDesc
   tailGuarded : Bool
-  deriving Repr, DecidableEq, Inhabited, BEq
+  deriving Repr, DecidableEq, Inhabited
 
 /-- Accepted launch plan. Its fields are exactly the validated request fields. -/
 structure HybridDispatchPlan where
@@ -741,7 +741,7 @@ structure HybridDispatchPlan where
   gridThreads : Nat
   buffers : List DeviceBufferDesc
   tailGuarded : Bool
-  deriving Repr, DecidableEq, Inhabited, BEq
+  deriving Repr, DecidableEq, Inhabited
 
 /-- Total threads launched by the grid. -/
 def gridThreadsOf (req : HybridLaunchRequest) : Nat :=
@@ -781,7 +781,7 @@ inductive HybridDispatchError where
   | bufferGeometry
   | ownership
   | aliasedOutput
-  deriving Repr, DecidableEq, Inhabited, BEq
+  deriving Repr, DecidableEq, Inhabited
 
 /-- Boolean form of the grid precondition. -/
 def launchGeometryOk (req : HybridLaunchRequest) : Bool :=
@@ -846,7 +846,7 @@ structure RcPhase where
   beforePin : Nat
   whileActive : Option Nat
   afterRelease : Nat
-  deriving Repr, DecidableEq, Inhabited, BEq
+  deriving Repr, DecidableEq, Inhabited
 
 /-- Borrowed inputs gain one temporary pin; unique outputs stay at one owner. -/
 def rcPhaseOf (b : DeviceBufferDesc) : RcPhase :=
