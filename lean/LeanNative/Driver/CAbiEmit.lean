@@ -1062,15 +1062,41 @@ def c11SyntaxCheck (src : String) (arch : TargetArch := .x86_64)
   try
     let sysClang : System.FilePath := "/usr/bin/clang"
     let brewClang : System.FilePath := "/opt/homebrew/opt/llvm/bin/clang"
-    let sysrootOpt ← IO.getEnv "LEAN_SYSROOT"
-    let extraIncArgs : Array String :=
-      match sysrootOpt with
-      | some sr => #[s!"-isystem{sr}/include/clang"]
-      | none => #[]
+    let appSysroot : List System.FilePath ← do
+      try
+        let exe ← IO.appPath
+        match exe.parent >>= (·.parent) with
+        | some root => pure [root]
+        | none => pure []
+      catch _ => pure []
+    let sysrootEnv := ((← IO.getEnv "LEAN_SYSROOT").getD "").trimAscii.toString
+    let elanHome := ((← IO.getEnv "ELAN_HOME").getD "").trimAscii.toString
+    let home := ((← IO.getEnv "HOME").getD "").trimAscii.toString
+    let tcRoots : List System.FilePath :=
+      (if sysrootEnv.isEmpty then [] else [System.FilePath.mk sysrootEnv]) ++
+      appSysroot ++
+      (if elanHome.isEmpty then [] else [System.FilePath.mk s!"{elanHome}/toolchains/leanprover--lean4---v4.35.0"]) ++
+      (if home.isEmpty then [] else [System.FilePath.mk s!"{home}/.elan/toolchains/leanprover--lean4---v4.35.0"]) ++
+      [ System.FilePath.mk "/opt/orb/elan/toolchains/leanprover--lean4---v4.35.0",
+        System.FilePath.mk "/var/lib/orb-node/orb-warm/elan/toolchains/leanprover--lean4---v4.35.0",
+        System.FilePath.mk "/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0",
+        System.FilePath.mk "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.35.0" ]
+    let mut tcClangFound : Option (String × Array String) := none
+    for sr in tcRoots do
+      let cand := sr / "bin" / "clang"
+      if ← cand.pathExists then
+        tcClangFound := some (cand.toString, #[s!"-isystem{(sr / "include" / "clang").toString}"])
+        break
+    let fallbackIncArgs : Array String :=
+      match tcClangFound with
+      | some (_, inc) => inc
+      | none => if sysrootEnv.isEmpty then #[] else #[s!"-isystem{sysrootEnv}/include/clang"]
     let (clangCmd, incArgs) ←
       if ← sysClang.pathExists then pure (sysClang.toString, #[])
       else if ← brewClang.pathExists then pure (brewClang.toString, #[])
-      else pure ("clang", extraIncArgs)
+      else match tcClangFound with
+        | some (cmd, inc) => pure (cmd, inc)
+        | none => pure ("clang", fallbackIncArgs)
     let targetArgs : Array String :=
       if !extraFlags.isEmpty then extraFlags
       else match arch with

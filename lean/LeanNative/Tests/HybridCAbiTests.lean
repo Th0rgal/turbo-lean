@@ -318,8 +318,4 @@ def runClangC11ConformanceSuite : IO Bool := do
         s!"clang C11 negative check {label} failed without expected diagnostic '{expectedErr}': {err}"
   return true
 
-#eval do
-  let ok ← runClangC11ConformanceSuite
-  if !ok then throw <| IO.userError "runClangC11ConformanceSuite returned false"
-
 end LeanNative.Tests.HybridCAbiTests

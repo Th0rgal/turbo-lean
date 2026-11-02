@@ -124,6 +124,15 @@ grep -q "module TurboLeanCABI" /tmp/ln_cabi_check.modulemap
 rm -f /tmp/ln_cabi_check.rs /tmp/ln_cabi_check.swift /tmp/ln_cabi_check.modulemap
 ./lean/.lake/build/bin/turbo-lean-native self-test
 
+echo "[3a/3] Running C7 Hybrid C-ABI C11 positive & negative cross-width clang conformance suite..."
+(cd lean && lake env lean --stdin) <<'LEAN'
+import LeanNative.Tests.HybridCAbiTests
+#eval show IO Unit from do
+  let ok ← LeanNative.Tests.HybridCAbiTests.runClangC11ConformanceSuite
+  if !ok then throw <| IO.userError "runClangC11ConformanceSuite returned false"
+  IO.println "[c7-cabi] C11 positive & negative cross-width clang conformance suite PASSED"
+LEAN
+
 echo "[3b/3] HeapObj XFAIL predicates: Lean meta check over the elaborated definitions..."
 (cd lean && lake env lean --stdin) <<'LEAN'
 import LeanNative.Tests.HeapObjContract
