@@ -7469,10 +7469,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("turbo-pidfd-{}", next_tmp_id()));
         fs::create_dir_all(&dir).unwrap();
         let exe = dir.join("turbo_zygote_pidfd_test");
-        fs::copy("/bin/sleep", &exe).unwrap();
+        fs::copy("/bin/bash", &exe).unwrap();
         let mut child = std::process::Command::new(&exe)
-            .arg("30")
+            .args(["-c", "read -t 30"])
             .env("TURBO_LEAN_STAGING_DIR", &dir)
+            .stdin(std::process::Stdio::piped())
             .spawn()
             .unwrap();
         let mut process = open_test_lifecycle_process(&mut child, Some(&dir));
@@ -7514,10 +7515,11 @@ mod tests {
             let dir = std::env::temp_dir().join(format!("turbo-stop-namespace-{}", next_tmp_id()));
             fs::create_dir_all(&dir).unwrap();
             let exe = dir.join("turbo_zygote_stop_test");
-            fs::copy("/bin/sleep", &exe).unwrap();
+            fs::copy("/bin/bash", &exe).unwrap();
             let mut child = Command::new(exe)
-                .arg("30")
+                .args(["-c", "read -t 30"])
                 .env("TURBO_LEAN_STAGING_DIR", &dir)
+                .stdin(std::process::Stdio::piped())
                 .spawn()
                 .unwrap();
             // Same user-wide (staging=None) identity path, with an explicit candidate set
