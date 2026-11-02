@@ -351,7 +351,7 @@ theorem bvFromLEBytes_subslice {k : Nat} (m off n : Nat) (v : BitVec k)
   unfold bvFromLEBytes bvToLEBytes
   rw [natFromLEBytes_subslice m off n v.toNat h, pow256_eq n]
   apply BitVec.eq_of_toNat_eq
-  simp [BitVec.toNat_ofNat, Nat.mod_mod]
+  simp [BitVec.toNat_ofNat]
 
 def initBytes : List (BitVec 8) → List MemByte
   | [] => []
@@ -739,5 +739,78 @@ theorem runFuelSteps_mono {σ ρ : Type} (f1 f2 : Nat) (step : σ → StepStatus
       | halt res => rfl
       | outOfFuel => rfl
       | fault msg => rfl
+
+def digitChar : Nat → Char
+  | 0 => '0' | 1 => '1' | 2 => '2' | 3 => '3' | 4 => '4'
+  | 5 => '5' | 6 => '6' | 7 => '7' | 8 => '8' | _ => '9'
+
+def charDigit? : Char → Option Nat
+  | '0' => some 0 | '1' => some 1 | '2' => some 2 | '3' => some 3 | '4' => some 4
+  | '5' => some 5 | '6' => some 6 | '7' => some 7 | '8' => some 8 | '9' => some 9
+  | _ => none
+
+theorem charDigit?_digitChar (d : Nat) (hd : d < 10) :
+    charDigit? (digitChar d) = some d := by
+  match d with
+  | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 => rfl
+  | n + 10 => omega
+
+def natDigitsAux : Nat → Nat → List Char → List Char
+  | 0, _, acc => acc
+  | fuel + 1, n, acc =>
+    let d := digitChar (n % 10)
+    if n < 10 then d :: acc
+    else natDigitsAux fuel (n / 10) (d :: acc)
+
+def natDigits (n : Nat) : List Char :=
+  natDigitsAux (n + 1) n []
+
+def ppInt (n : Nat) : String :=
+  String.ofList (natDigits n)
+
+def readDigits (acc : Nat) : List Char → Nat × List Char
+  | [] => (acc, [])
+  | c :: cs =>
+    match charDigit? c with
+    | some d => readDigits (acc * 10 + d) cs
+    | none => (acc, c :: cs)
+
+theorem readDigits_cons_digit (acc d : Nat) (hd : d < 10) (cs : List Char) :
+    readDigits acc (digitChar d :: cs) = readDigits (acc * 10 + d) cs := by
+  simp [readDigits, charDigit?_digitChar d hd]
+
+theorem readDigits_natDigitsAux_zero (fuel n : Nat) (accDigits rest : List Char)
+    (hfuel : n < fuel) :
+    readDigits 0 (natDigitsAux fuel n accDigits ++ rest) =
+      readDigits n (accDigits ++ rest) := by
+  induction fuel generalizing n accDigits with
+  | zero => omega
+  | succ f ih =>
+    simp only [natDigitsAux]
+    have hmod : n % 10 < 10 := Nat.mod_lt n (by decide)
+    by_cases hlt : n < 10
+    · simp only [hlt, ↓reduceIte, List.cons_append, readDigits_cons_digit 0 (n % 10) hmod]
+      have hmn : n % 10 = n := Nat.mod_eq_of_lt hlt
+      simp [hmn]
+    · simp only [hlt, ↓reduceIte]
+      rw [ih (n / 10) (digitChar (n % 10) :: accDigits) (by omega)]
+      simp only [List.cons_append, readDigits_cons_digit (n / 10) (n % 10) hmod]
+      have hdiv : n / 10 * 10 + n % 10 = n := by omega
+      rw [hdiv]
+
+theorem readDigits_natDigits_delim (n : Nat) (c : Char) (cs : List Char)
+    (h_stop : charDigit? c = none) :
+    readDigits 0 (natDigits n ++ c :: cs) = (n, c :: cs) := by
+  unfold natDigits
+  rw [readDigits_natDigitsAux_zero (n + 1) n [] (c :: cs) (by omega)]
+  simp [readDigits, h_stop]
+
+theorem readDigits_natDigits_eof (n : Nat) :
+    readDigits 0 (natDigits n) = (n, []) := by
+  have h := readDigits_natDigitsAux_zero (n + 1) n [] [] (by omega)
+  simp only [List.append_nil] at h
+  unfold natDigits
+  rw [h]
+  rfl
 
 end LeanNative.Backend.TargetIR
