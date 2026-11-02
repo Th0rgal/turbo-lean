@@ -17,6 +17,7 @@ import LeanNative.Transform.EqSat
 import LeanNative.Transform.LoopSchedule
 import LeanNative.Transform.OwnershipRC
 import LeanNative.Backend.FastCheck
+import LeanNative.Proofs.HybridCAbiProofs
 
 namespace LeanNative.Proofs
 
@@ -173,6 +174,58 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.mutant2_exclusivity_violation_killed
   , ``LeanNative.Proofs.mutant3_algebraic_swap_killed
   , ``LeanNative.Proofs.all_three_mandatory_mutants_killed
+  , ``LeanNative.Proofs.HybridCAbi.c99AlignUp_spec
+  , ``LeanNative.Proofs.HybridCAbi.c99Scalar_align_pos
+  , ``LeanNative.Proofs.HybridCAbi.c99Scalar_size_pos
+  , ``LeanNative.Proofs.HybridCAbi.c99NatMax_ge
+  , ``LeanNative.Proofs.HybridCAbi.placeC99Field_spec
+  , ``LeanNative.Proofs.HybridCAbi.placeC99FieldsFrom_spec
+  , ``LeanNative.Proofs.HybridCAbi.c99OccupiedEnd_ge
+  , ``LeanNative.Proofs.HybridCAbi.computeC99StructLayout_sound
+  , ``LeanNative.Proofs.HybridCAbi.computeC99StructLayout_field_align_dvd
+  , ``LeanNative.Proofs.HybridCAbi.emitSliceStaticAsserts_fail_closed
+  , ``LeanNative.Proofs.HybridCAbi.emitPinnedSliceStaticAsserts_fail_closed
+  , ``LeanNative.Proofs.HybridCAbi.archWidth_addrLimit_pos
+  , ``LeanNative.Proofs.HybridCAbi.checkedByteLen_no_overflow
+  , ``LeanNative.Proofs.HybridCAbi.checkedStridedSpan_no_overflow
+  , ``LeanNative.Proofs.HybridCAbi.strided_slot_in_bounds
+  , ``LeanNative.Proofs.HybridCAbi.byteArray_splice_extract_id
+  , ``LeanNative.Proofs.HybridCAbi.copyStridedElem_size
+  , ``LeanNative.Proofs.HybridCAbi.marshalStridedGo_eq_append
+  , ``LeanNative.Proofs.HybridCAbi.marshalStridedGo_empty_size
+  , ``LeanNative.Proofs.HybridCAbi.byteArray_extract_mid
+  , ``LeanNative.Proofs.HybridCAbi.marshalStridedGo_extract_slot
+  , ``LeanNative.Proofs.HybridCAbi.unmarshalStridedGo_roundtrip
+  , ``LeanNative.Proofs.HybridCAbi.marshal_unmarshal_byte_slice_roundtrip
+  , ``LeanNative.Proofs.HybridCAbi.marshal_unmarshal_float_slice_roundtrip
+  , ``LeanNative.Proofs.HybridCAbi.validateC99Slice_sound
+  , ``LeanNative.Proofs.HybridCAbi.execValidatedSliceHostCall_id_roundtrip
+  , ``LeanNative.Proofs.HybridCAbi.checkedBytes_spec
+  , ``LeanNative.Proofs.HybridCAbi.elemByteAddr_in_addressInterval
+  , ``LeanNative.Proofs.HybridCAbi.disjointBuffers_elemByteAddr_ne
+  , ``LeanNative.Proofs.HybridCAbi.launchGeometryOk_sound
+  , ``LeanNative.Proofs.HybridCAbi.bufferGeometryOk_sound
+  , ``LeanNative.Proofs.HybridCAbi.bufferGeometryOk_of_geometryOk
+  , ``LeanNative.Proofs.HybridCAbi.targetBufferGeometryOk_sound
+  , ``LeanNative.Proofs.HybridCAbi.bufferOwnershipOk_sound
+  , ``LeanNative.Proofs.HybridCAbi.buffersOwned_of_all
+  , ``LeanNative.Proofs.HybridCAbi.bufferAliasPairOk_sound
+  , ``LeanNative.Proofs.HybridCAbi.bufferAliasOk_sound
+  , ``LeanNative.Proofs.HybridCAbi.find?_map_preserve_buf_id
+  , ``LeanNative.Proofs.HybridCAbi.find?_setBufferExclusive
+  , ``LeanNative.Proofs.HybridCAbi.find?_eq_some_id
+  , ``LeanNative.Proofs.HybridCAbi.find?_filter_self_none
+  , ``LeanNative.Proofs.HybridCAbi.find?_refCounts_filtered
+  , ``LeanNative.Proofs.HybridCAbi.getBufRefCount_pos
+  , ``LeanNative.Proofs.HybridCAbi.incRefBuf_decRefBuf_one_roundtrip
+  , ``LeanNative.Proofs.HybridCAbi.transferModeCompatible_self
+  , ``LeanNative.Proofs.HybridCAbi.execHybridTransferLifecycle_active_live
+  , ``LeanNative.Proofs.HybridCAbi.execHybridTransferLifecycle_preserves_rc
+  , ``LeanNative.Proofs.HybridCAbi.execHybridTransferLifecycle_exclusive_out
+  , ``LeanNative.Proofs.HybridCAbi.ownershipOk_implies_rcConserved
+  , ``LeanNative.Proofs.HybridCAbi.buffersOwned_implies_rcConserved
+  , ``LeanNative.Proofs.HybridCAbi.globalThreadId_bijection
+  , ``LeanNative.Proofs.HybridCAbi.validateHybridDispatch_sound
   ]
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/

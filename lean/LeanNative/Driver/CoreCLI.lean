@@ -200,6 +200,8 @@ def runEmitCAbiBindings (tag : String) (elaborateHook? : Option (String → Targ
   validateValueTakingFlags args
   -- one resolved input feeds BOTH signature extraction and the Stage 1D / A_L0 validation below
   let sel ← match preloaded? with | some (s, _) => pure s | none => resolveInput args
+  let rawArch := findFlagValue args "--arch" (findFlagValue args "--target" "")
+  let width? ← if rawArch.isEmpty then pure none else (some ∘ ArchWidth.ofTargetArch) <$> parseTargetArchIO rawArch
   let leanPath := sel.path
   let hdrPath := findFlagValue args "--emit-header" (findFlagValue args "--header" "")
   let rsPath := findFlagValue args "--emit-rust" (findFlagValue args "--rust" "")
@@ -233,7 +235,7 @@ def runEmitCAbiBindings (tag : String) (elaborateHook? : Option (String → Targ
       let m ← loadMod
       pure (moduleToCAbiSigs (runDefaultPipeline m).1, [], if leanPath.isEmpty then m.moduleName else leanPath)
   let note? := if sigOnly then some signaturesOnlyMarker else none
-  let hdrText := emitCAbiHeaderFromSigs sigs note?
+  let hdrText := emitCAbiHeaderFromSigs sigs note? width?
   let rsText := emitCAbiRustFromSigs sigs note?
   let swiftText := emitCAbiSwiftFromSigs sigs (note? := note?)
   let fixText := emitGuardFixturesJson srcLabel sigs guards note?
@@ -325,7 +327,7 @@ def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → Targ
       pure (if srcSigs.isEmpty then moduleToCAbiSigs optMod else srcSigs, srcGuards)
     else pure (moduleToCAbiSigs optMod, [])
   let irText := emitLLVMOptimized optMod arch none wasmSimd128
-  let hdrText := emitCAbiHeaderFromSigs sigs
+  let hdrText := emitCAbiHeaderFromSigs sigs (width? := some (ArchWidth.ofTargetArch arch))
   let nonce ← IO.monoNanosNow
   let (tmpLl, tmpObj, tmpArchive, tmpAsm) := (s!"{outPath}.{nonce}.tmp.ll", s!"{outPath}.{nonce}.tmp.o", s!"{outPath}.{nonce}.tmp.a", s!"{asmPath}.{nonce}.tmp.s")
   IO.FS.writeFile tmpLl irText
