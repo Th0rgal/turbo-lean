@@ -175,8 +175,17 @@ def ingestLCNFDeclGeneric {pu} (decl : Lean.Compiler.LCNF.Decl pu)
           pure (.letBind retVar retTy intrExpr (.ret retVar))
         else if codeHasSelfTailCall decl.name c then
           Lean.throwError s!"[lean-native] unsupported self-tail recursion in {decl.name}: no qualified loop lowering"
-        else
-          lowerCodeFn c >>= compressScalarCode
+        else do
+          let rawBody ← lowerCodeFn c
+          let candBody ← compressScalarCode rawBody
+          let rawRetTy := match inferReturnedType rawBody with | some (.tuple fs) => .tuple fs | _ => retTy
+          let candRetTy := match inferReturnedType candBody with | some (.tuple fs) => .tuple fs | _ => retTy
+          let baseDecl : LNIRDecl := { name := metaInfo.mangledSymbol, params := lnirParams, retTy := rawRetTy, body := rawBody }
+          let candDecl : LNIRDecl := { baseDecl with retTy := candRetTy, body := candBody }
+          if candBody != rawBody && (LeanNative.Proofs.validateTranslationDecl baseDecl candDecl 64).passed then
+            pure candBody
+          else
+            pure rawBody
       let effRetTy := match inferReturnedType body with | some (.tuple fs) => .tuple fs | _ => retTy
       return {
         name := metaInfo.mangledSymbol, params := lnirParams, retTy := effRetTy, body := body,

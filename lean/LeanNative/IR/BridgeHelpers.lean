@@ -992,20 +992,37 @@ partial def codeContainsTupleOp : LNIRCode → Bool
   | .ite _ t e | .seqFor _ _ _ _ _ _ t e => codeContainsTupleOp t || codeContainsTupleOp e
   | .ret _ | .unreachable => false
 
+private def initialSeenVarsForCode (st : BridgeState) (code : LNIRCode) : Std.HashSet VarId :=
+  let initFromState := st.varTypes.fold (fun s k _ => s.insert k) ({} : Std.HashSet VarId)
+  (freeVarsInCode [] [] code).foldl (fun s v => s.insert v) initFromState
+
+def gateCodeWithSymbolicTV (code cand : LNIRCode) (st : BridgeState) (retTy : LNIRType) : LNIRCode :=
+  if cand == code then code
+  else
+    let fvIds := (freeVarsInCode [] [] code).mergeSort (· < ·)
+    let synParams : List LNIRParam := fvIds.map fun vid =>
+      { id := vid, name := s!"v_{vid}", ty := st.varTypes.getD vid .i64 }
+    let srcDecl : LNIRDecl := { name := "_tv_gate", params := synParams, retTy := retTy, body := code }
+    let candDecl : LNIRDecl := { srcDecl with body := cand }
+    if (LeanNative.Proofs.validateTranslationDecl srcDecl candDecl 64).passed then cand else code
+
 def compressScalarCode (code : LNIRCode) : BridgeM LNIRCode := do
   if codeContainsTupleOp code then
     return code
-  match ← collectScalarCodeRev #[] {} code with
+  let st0 ← get
+  let initSeen := initialSeenVarsForCode st0 code
+  match ← collectScalarCodeRev #[] initSeen code with
   | some (outTy, binds, _, resExpr) =>
-    match resExpr with
-    | .var rv =>
-      return binds.foldr (fun (dst, ty, se) acc => .letBind dst ty (.scalar se) acc) (.ret rv)
-    | _ =>
-      let resVar ← freshBridgeVar outTy
-      let tail := LNIRCode.letBind resVar outTy (.scalar resExpr) (.ret resVar)
-      return binds.foldr (fun (dst, ty, se) acc => .letBind dst ty (.scalar se) acc) tail
+    let cand ← match resExpr with
+      | .var rv =>
+        pure (binds.foldr (fun (dst, ty, se) acc => .letBind dst ty (.scalar se) acc) (.ret rv))
+      | _ =>
+        let resVar ← freshBridgeVar outTy
+        let tail := LNIRCode.letBind resVar outTy (.scalar resExpr) (.ret resVar)
+        pure (binds.foldr (fun (dst, ty, se) acc => .letBind dst ty (.scalar se) acc) tail)
+    return gateCodeWithSymbolicTV code cand (← get) outTy
   | none =>
-    match ← collectTupleCodeRev #[] {} code with
+    match ← collectTupleCodeRev #[] initSeen code with
     | some (outTys, binds, _, resExprs) =>
       let mut curBinds := binds
       let mut fieldVars : List VarId := []
@@ -1018,7 +1035,8 @@ def compressScalarCode (code : LNIRCode) : BridgeM LNIRCode := do
           fieldVars := fieldVars ++ [fv]
       let tupVar ← freshBridgeVar (.tuple outTys)
       let tail := LNIRCode.letBind tupVar (.tuple outTys) (.mkTuple fieldVars) (.ret tupVar)
-      return curBinds.foldr (fun (dst, ty, se) acc => .letBind dst ty (.scalar se) acc) tail
+      let cand := curBinds.foldr (fun (dst, ty, se) acc => .letBind dst ty (.scalar se) acc) tail
+      return gateCodeWithSymbolicTV code cand (← get) (.tuple outTys)
     | none => return code
 
 def bindScalarParamsBefore (paramVids : List VarId) (paramTys : List LNIRType)
@@ -1091,12 +1109,14 @@ def lowerJoinPoint {pu} (decl : Lean.Compiler.LCNF.FunDecl pu) (k : Lean.Compile
       let dagRes? ← try
         modify fun st => { st with jpMap := outerStubs, jpIndexMap := tagMap }
         let jpRaw ← lowerCodeFn decl.value
-        match ← collectDagOutcome #[] {} jpRaw with
+        let jpInitSeen := initialSeenVarsForCode (← get) jpRaw
+        match ← collectDagOutcome #[] jpInitSeen jpRaw with
         | none => pure none
         | some (jpBinds, _, jpOut) =>
           modify fun st => { st with jpMap := outerStubs.insert decl.fvarId (impParams, selfStub) }
           let kRaw ← lowerCodeFn k
-          match ← collectDagOutcome #[] {} kRaw with
+          let kInitSeen := initialSeenVarsForCode (← get) kRaw
+          match ← collectDagOutcome #[] kInitSeen kRaw with
           | none => pure none
           | some (kBinds, _, kOut) =>
             match ← substituteJpTargetInOutcome jpTag paramVids paramTys jpBinds jpOut kOut with
@@ -1915,15 +1935,28 @@ def ingestImpureDeclViaReal (decl : Lean.Compiler.LCNF.Decl .impure)
       match RealLCNFBridge.lowerRealLCNFDecl fuel ctx decl metaInfo.mangledSymbol with
       | .ok d =>
         let rstAfter := (RealLCNFBridge.internRealParams ctx {} decl.params.toList).2
-        let nextAfter := match RealLCNFBridge.lowerRealLCNFCode fuel ctx rstAfter c with
-          | .ok (_, rstEnd) => rstEnd.nextVarId
-          | .error _ => d.params.length + 16
-        modify fun s => { s with nextVarId := max s.nextVarId (nextAfter + 4) }
-        let compressedBody ← compressScalarCode d.body
-        let effRetTy := match inferReturnedType compressedBody with | some (.tuple fs) => .tuple fs | _ => d.retTy
+        let (nextAfter, endVarTypes) := match RealLCNFBridge.lowerRealLCNFCode fuel ctx rstAfter c with
+          | .ok (_, rstEnd) => (rstEnd.nextVarId, rstEnd.varTypes)
+          | .error _ => (d.params.length + 16, rstAfter.varTypes)
+        modify fun s => {
+          s with
+          varTypes := endVarTypes.foldl (fun m (v, t) => m.insert v t) s.varTypes
+          nextVarId := max s.nextVarId (nextAfter + 4) }
+        let compressedCand ← compressScalarCode d.body
+        let candRetTy := match inferReturnedType compressedCand with | some (.tuple fs) => .tuple fs | _ => d.retTy
+        let baseRetTy := match inferReturnedType d.body with | some (.tuple fs) => .tuple fs | _ => d.retTy
+        let baseDecl : LNIRDecl := { d with retTy := baseRetTy }
+        let candDecl : LNIRDecl := { d with body := compressedCand, retTy := candRetTy }
+        let useCompressed :=
+          compressedCand != d.body && (LeanNative.Proofs.validateTranslationDecl baseDecl candDecl 64).passed
+        let finalBody := if useCompressed then compressedCand else d.body
+        let effRetTy := if useCompressed then candRetTy else baseRetTy
+        let effAssurance :=
+          if useCompressed then AssuranceLevel.combine d.assurance .translationValidated else d.assurance
         return { d with
-          body := compressedBody
+          body := finalBody
           retTy := effRetTy
+          assurance := effAssurance
           isGpuCand := d.params.all (fun p => p.ty.isGpuCompatible) && effRetTy.isGpuCompatible }
       | .error msg => Lean.throwError msg
   Prod.fst <$> action.run initSt

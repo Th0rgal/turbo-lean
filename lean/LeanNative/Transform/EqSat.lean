@@ -137,20 +137,24 @@ partial def spliceInlinedBodyM (paramMap : List (VarId × VarId)) (unboxedLocal 
     let isUbSe := match se with | .var sv => unboxedLocal.contains sv | _ => true
     let effBTy := if isUbSe && (bTy == .objPtr || bTy == .taggedPtr) then .i64 else bTy
     let ub' := if effBTy.isUnboxedScalar || isUbSe then bDst :: unboxedLocal else unboxedLocal
+    let paramMap' := paramMap.filter fun (kId, _) => kId != bDst
     return .letBind (bDst + offset) effBTy (.scalar (renameScalarExpr paramMap offset se))
-      (← spliceInlinedBodyM paramMap ub' offset retCont k)
+      (← spliceInlinedBodyM paramMap' ub' offset retCont k)
   | .letBind bDst bTy (.mkTuple fs) k => do
+    let paramMap' := paramMap.filter fun (kId, _) => kId != bDst
     return .letBind (bDst + offset) bTy (.mkTuple (fs.map (renameVarId paramMap offset)))
-      (← spliceInlinedBodyM paramMap (bDst :: unboxedLocal) offset retCont k)
+      (← spliceInlinedBodyM paramMap' (bDst :: unboxedLocal) offset retCont k)
   | .letBind bDst bTy (.projTuple tv idx) k => do
     let isUbTv := unboxedLocal.contains tv
     let effBTy := if isUbTv && (bTy == .objPtr || bTy == .taggedPtr) then .i64 else bTy
     let ub' := if effBTy.isUnboxedScalar || isUbTv then bDst :: unboxedLocal else unboxedLocal
+    let paramMap' := paramMap.filter fun (kId, _) => kId != bDst
     return .letBind (bDst + offset) effBTy (.projTuple (renameVarId paramMap offset tv) idx)
-      (← spliceInlinedBodyM paramMap ub' offset retCont k)
+      (← spliceInlinedBodyM paramMap' ub' offset retCont k)
   | .letBind bDst bTy (.ctorGetObj cv idx) k => do
+    let paramMap' := paramMap.filter fun (kId, _) => kId != bDst
     return .letBind (bDst + offset) bTy (.ctorGetObj (renameVarId paramMap offset cv) idx)
-      (← spliceInlinedBodyM paramMap unboxedLocal offset retCont k)
+      (← spliceInlinedBodyM paramMap' unboxedLocal offset retCont k)
   | .incRef ov c k => do
     if unboxedLocal.contains ov then spliceInlinedBodyM paramMap unboxedLocal offset retCont k
     else return .incRef (renameVarId paramMap offset ov) c (← spliceInlinedBodyM paramMap unboxedLocal offset retCont k)
@@ -324,7 +328,55 @@ partial def scalarExprIsTrapFree : ScalarExpr → Bool
   | .unaryOp _ a => scalarExprIsTrapFree a
   | .select c t e | .fma c t e => scalarExprIsTrapFree c && scalarExprIsTrapFree t && scalarExprIsTrapFree e
 
-partial def compressTupleIteCodeAux (tupEnv : List (VarId × List VarId)) :
+private def freeVarsScalarExpr (bound : List VarId) (acc : List VarId) : ScalarExpr → List VarId
+  | .constU64 _ | .constBool _ => acc
+  | .var id => if bound.contains id || acc.contains id then acc else id :: acc
+  | .binOp _ l r => freeVarsScalarExpr bound (freeVarsScalarExpr bound acc l) r
+  | .unaryOp _ a => freeVarsScalarExpr bound acc a
+  | .select c t e | .fma c t e =>
+    freeVarsScalarExpr bound (freeVarsScalarExpr bound (freeVarsScalarExpr bound acc c) t) e
+
+private def freeVarsExpr (bound : List VarId) (acc : List VarId) : LNIRExpr → List VarId
+  | .scalar se => freeVarsScalarExpr bound acc se
+  | .constU256 _ => acc
+  | .mkTuple vs => vs.foldl (fun a v => if bound.contains v || a.contains v then a else v :: a) acc
+  | .allocCtor _ objs scals =>
+    (objs ++ scals).foldl (fun a v => if bound.contains v || a.contains v then a else v :: a) acc
+  | .projTuple tv _ | .ctorGetObj tv _ | .ctorGetScalar tv _ _ | .isExclusive tv
+  | .sarrayLen tv | .sarrayDataPtr tv _ | .sarrayEnsureExclusive tv _
+  | .boxScalar tv _ | .unboxScalar tv _ =>
+    if bound.contains tv || acc.contains tv then acc else tv :: acc
+  | .storageLoad pv iv | .sarrayGet pv iv _ | .rawLoad pv iv _ =>
+    [pv, iv].foldl (fun a v => if bound.contains v || a.contains v then a else v :: a) acc
+  | .mulDivDown av bv cv | .mulDivUp av bv cv | .storageStore av bv cv | .sarraySet av bv cv _ =>
+    [av, bv, cv].foldl (fun a v => if bound.contains v || a.contains v then a else v :: a) acc
+  | .call _ args _ _ =>
+    args.foldl (fun a v => if bound.contains v || a.contains v then a else v :: a) acc
+
+partial def freeVarsInCode (bound : List VarId := []) (acc : List VarId := []) : LNIRCode → List VarId
+  | .letBind dst _ val k =>
+    let acc1 := freeVarsExpr bound acc val
+    freeVarsInCode (dst :: bound) acc1 k
+  | .rawStore pv iv vv _ k =>
+    let acc1 := [pv, iv, vv].foldl (fun a v => if bound.contains v || a.contains v then a else v :: a) acc
+    freeVarsInCode bound acc1 k
+  | .incRef ov _ k | .decRef ov _ k =>
+    let acc1 := if bound.contains ov || acc.contains ov then acc else ov :: acc
+    freeVarsInCode bound acc1 k
+  | .ite cv t e =>
+    let acc1 := if bound.contains cv || acc.contains cv then acc else cv :: acc
+    freeVarsInCode bound (freeVarsInCode bound acc1 t) e
+  | .seqFor iv lv hv av ai _ s k =>
+    let acc1 := [lv, hv, ai].foldl (fun a v => if bound.contains v || a.contains v then a else v :: a) acc
+    let acc2 := freeVarsInCode (iv :: av :: bound) acc1 s
+    freeVarsInCode (av :: bound) acc2 k
+  | .parFor ov lv ins _ _ k =>
+    let acc1 := (lv :: ins).foldl (fun a v => if bound.contains v || a.contains v then a else v :: a) acc
+    freeVarsInCode (ov :: bound) acc1 k
+  | .ret v => if bound.contains v || acc.contains v then acc else v :: acc
+  | .unreachable => acc
+
+partial def compressTupleIteCodeAux (tupEnv : List (VarId × List VarId)) (forbid : List VarId) :
     LNIRCode → StateM VarId (Option (List LNIRType × List (VarId × LNIRType × ScalarExpr) × List ScalarExpr))
   | .letBind dst (.tuple fTys) (.mkTuple fVars) (.ret rv) => do
     if dst == rv && !fTys.isEmpty && fTys.length == fVars.length &&
@@ -332,25 +384,30 @@ partial def compressTupleIteCodeAux (tupEnv : List (VarId × List VarId)) :
       return some (fTys, [], fVars.map .var)
     else return none
   | .letBind dst (.tuple fTys) (.mkTuple fVars) rest => do
-    if !fTys.isEmpty && fTys.length == fVars.length &&
+    if !forbid.contains dst && !fTys.isEmpty && fTys.length == fVars.length &&
         fTys.all (fun t => t.isUnboxedScalar || t == .taggedPtr) then
-      compressTupleIteCodeAux ((dst, fVars) :: tupEnv) rest
+      compressTupleIteCodeAux ((dst, fVars) :: tupEnv) (dst :: forbid) rest
     else return none
   | .letBind dst ty (.projTuple tv idx) rest => do
+    if forbid.contains dst then return none
     match (tupEnv.lookup tv).bind (·[idx]?) with
     | some srcVar =>
-      let some (fTys, binds, exprs) ← compressTupleIteCodeAux tupEnv rest | return none
+      let some (fTys, binds, exprs) ← compressTupleIteCodeAux tupEnv (dst :: forbid) rest | return none
+      if binds.any (fun (d, _, _) => d == dst) then return none
       return some (fTys, (dst, ty, .var srcVar) :: binds, exprs)
     | none => return none
   | .letBind dst ty (.scalar se) rest => do
-    if scalarExprIsTrapFree se then
-      let some (fTys, binds, exprs) ← compressTupleIteCodeAux tupEnv rest | return none
+    if !forbid.contains dst && scalarExprIsTrapFree se then
+      let some (fTys, binds, exprs) ← compressTupleIteCodeAux tupEnv (dst :: forbid) rest | return none
+      if binds.any (fun (d, _, _) => d == dst) then return none
       return some (fTys, (dst, ty, se) :: binds, exprs)
     else return none
-  | .incRef _ _ rest | .decRef _ _ rest => compressTupleIteCodeAux tupEnv rest
+  | .incRef _ _ rest | .decRef _ _ rest => compressTupleIteCodeAux tupEnv forbid rest
   | .ite cv t e => do
-    let some (tTys, tBinds, tExprs) ← compressTupleIteCodeAux tupEnv t | return none
-    let some (eTys, eBinds, eExprs) ← compressTupleIteCodeAux tupEnv e | return none
+    let forbid' := if forbid.contains cv then forbid else cv :: forbid
+    let some (tTys, tBinds, tExprs) ← compressTupleIteCodeAux tupEnv forbid' t | return none
+    let forbidE := tBinds.foldl (fun acc (d, _, _) => if acc.contains d then acc else d :: acc) forbid'
+    let some (eTys, eBinds, eExprs) ← compressTupleIteCodeAux tupEnv forbidE e | return none
     if tTys.length != eTys.length || tExprs.length != eExprs.length then return none
     let boundT := tBinds.map fun (d, _, _) => d
     if !(eBinds.all fun (d, _, _) => !boundT.contains d) then return none
@@ -365,21 +422,24 @@ partial def compressTupleIteCodeAux (tupEnv : List (VarId × List VarId)) :
     return some (outTys, tBinds ++ eBinds ++ selBinds, selExprs)
   | _ => return none
 
-def compressTupleIteCodeM (c : LNIRCode) := compressTupleIteCodeAux [] c
+def compressTupleIteCodeM (forbid : List VarId) (c : LNIRCode) := compressTupleIteCodeAux [] forbid c
 
-def compressScalarIteCodeAux : LNIRCode → StateM VarId (Option (LNIRType × List (VarId × LNIRType × ScalarExpr) × ScalarExpr))
+def compressScalarIteCodeAux (forbid : List VarId) :
+    LNIRCode → StateM VarId (Option (LNIRType × List (VarId × LNIRType × ScalarExpr) × ScalarExpr))
   | .ret rv => return some (.i64, [], .var rv)
   | .letBind dst ty (.scalar se) rest => do
-    if ty.isUnboxedScalar && scalarExprIsTrapFree se then
-      let some (rTy, binds, expr) ← compressScalarIteCodeAux rest | return none
+    if !forbid.contains dst && ty.isUnboxedScalar && scalarExprIsTrapFree se then
+      let some (rTy, binds, expr) ← compressScalarIteCodeAux (dst :: forbid) rest | return none
       if binds.any (fun (d, _, _) => d == dst) then return none
       let effRTy := if rest matches (.ret _) && rTy == .i64 then ty else rTy
       return some (effRTy, (dst, ty, se) :: binds, expr)
     else return none
-  | .incRef _ _ rest | .decRef _ _ rest => compressScalarIteCodeAux rest
+  | .incRef _ _ rest | .decRef _ _ rest => compressScalarIteCodeAux forbid rest
   | .ite cv t e => do
-    let some (tTy, tBinds, tExpr) ← compressScalarIteCodeAux t | return none
-    let some (eTy, eBinds, eExpr) ← compressScalarIteCodeAux e | return none
+    let forbid' := if forbid.contains cv then forbid else cv :: forbid
+    let some (tTy, tBinds, tExpr) ← compressScalarIteCodeAux forbid' t | return none
+    let forbidE := tBinds.foldl (fun acc (d, _, _) => if acc.contains d then acc else d :: acc) forbid'
+    let some (eTy, eBinds, eExpr) ← compressScalarIteCodeAux forbidE e | return none
     let boundT := tBinds.map fun (d, _, _) => d
     if !(eBinds.all fun (d, _, _) => !boundT.contains d) then return none
     let oTy := if tTy == eTy && tTy.isUnboxedScalar then tTy else .i64
@@ -438,44 +498,55 @@ private def dedupAndPruneScalarBinds
     initLive
   (liveBinds, subst)
 
+private def gateDeclWithSymbolicTV (src cand : LNIRDecl) : LNIRDecl :=
+  if cand.body == src.body then src
+  else if (LeanNative.Proofs.validateTranslationDecl src cand 64).passed then
+    let effAssurance := AssuranceLevel.combine src.assurance .translationValidated
+    { cand with assurance := effAssurance }
+  else src
+
 def flattenInlinedHelperBody (d : LNIRDecl) : LNIRDecl :=
   if !codeHasIte d.body then d
-  else if d.retTy matches (.tuple _) then
-    let startId := maxVarIdInDecl d + 16
-    match (compressTupleIteCodeM d.body).run startId with
-    | (some (outTys, binds, exprs), nextId) =>
-      let fieldVars := (List.range exprs.length).map (fun i => nextId + i)
-      let tupVar := nextId + exprs.length
-      let allBinds := binds ++ ((fieldVars.zip outTys).zip exprs).map fun ((fv, fty), fe) => (fv, fty, fe)
-      let (pruned, subst) := dedupAndPruneScalarBinds allBinds fieldVars
-      let finalFieldVars := fieldVars.map fun fv =>
-        match subst.lookup fv with
-        | some (.var sv) => sv
-        | _ => fv
-      let needCopyBinds := (fieldVars.zip outTys).filterMap fun (fv, fty) =>
-        match subst.lookup fv with
-        | some (.constU64 v) => some (fv, fty, ScalarExpr.constU64 v)
-        | some (.constBool b) => some (fv, fty, ScalarExpr.constBool b)
-        | _ => none
-      let tail := LNIRCode.letBind tupVar (.tuple outTys) (.mkTuple finalFieldVars) (.ret tupVar)
-      { d with body := (pruned ++ needCopyBinds).foldr (fun (dst, ty, se) acc => LNIRCode.letBind dst ty (.scalar se) acc) tail }
-    | (none, _) => d
-  else if d.retTy.isUnboxedScalar then
-    let startId := maxVarIdInDecl d + 16
-    match (compressScalarIteCodeAux d.body).run startId with
-    | (some (_, binds, resExpr), nextId) =>
-      let allBinds := binds ++ [(nextId, d.retTy, resExpr)]
-      let (pruned, subst) := dedupAndPruneScalarBinds allBinds [nextId]
-      match subst.lookup nextId with
-      | some (.var rv) =>
-        { d with body := pruned.foldr (fun (dst, ty, se) acc => LNIRCode.letBind dst ty (.scalar se) acc) (.ret rv) }
-      | some finalExpr =>
-        let tail := LNIRCode.letBind nextId d.retTy (.scalar finalExpr) (.ret nextId)
-        { d with body := pruned.foldr (fun (dst, ty, se) acc => LNIRCode.letBind dst ty (.scalar se) acc) tail }
-      | none =>
-        { d with body := pruned.foldr (fun (dst, ty, se) acc => LNIRCode.letBind dst ty (.scalar se) acc) (.ret nextId) }
-    | (none, _) => d
-  else d
+  else
+    let initForbid := freeVarsInCode [] (d.params.map (·.id)) d.body
+    let candDecl :=
+      if d.retTy matches (.tuple _) then
+        let startId := maxVarIdInDecl d + 16
+        match (compressTupleIteCodeM initForbid d.body).run startId with
+        | (some (outTys, binds, exprs), nextId) =>
+          let fieldVars := (List.range exprs.length).map (fun i => nextId + i)
+          let tupVar := nextId + exprs.length
+          let allBinds := binds ++ ((fieldVars.zip outTys).zip exprs).map fun ((fv, fty), fe) => (fv, fty, fe)
+          let (pruned, subst) := dedupAndPruneScalarBinds allBinds fieldVars
+          let finalFieldVars := fieldVars.map fun fv =>
+            match subst.lookup fv with
+            | some (.var sv) => sv
+            | _ => fv
+          let needCopyBinds := (fieldVars.zip outTys).filterMap fun (fv, fty) =>
+            match subst.lookup fv with
+            | some (.constU64 v) => some (fv, fty, ScalarExpr.constU64 v)
+            | some (.constBool b) => some (fv, fty, ScalarExpr.constBool b)
+            | _ => none
+          let tail := LNIRCode.letBind tupVar (.tuple outTys) (.mkTuple finalFieldVars) (.ret tupVar)
+          { d with body := (pruned ++ needCopyBinds).foldr (fun (dst, ty, se) acc => LNIRCode.letBind dst ty (.scalar se) acc) tail }
+        | (none, _) => d
+      else if d.retTy.isUnboxedScalar then
+        let startId := maxVarIdInDecl d + 16
+        match (compressScalarIteCodeAux initForbid d.body).run startId with
+        | (some (_, binds, resExpr), nextId) =>
+          let allBinds := binds ++ [(nextId, d.retTy, resExpr)]
+          let (pruned, subst) := dedupAndPruneScalarBinds allBinds [nextId]
+          match subst.lookup nextId with
+          | some (.var rv) =>
+            { d with body := pruned.foldr (fun (dst, ty, se) acc => LNIRCode.letBind dst ty (.scalar se) acc) (.ret rv) }
+          | some finalExpr =>
+            let tail := LNIRCode.letBind nextId d.retTy (.scalar finalExpr) (.ret nextId)
+            { d with body := pruned.foldr (fun (dst, ty, se) acc => LNIRCode.letBind dst ty (.scalar se) acc) tail }
+          | none =>
+            { d with body := pruned.foldr (fun (dst, ty, se) acc => LNIRCode.letBind dst ty (.scalar se) acc) (.ret nextId) }
+        | (none, _) => d
+      else d
+    gateDeclWithSymbolicTV d candDecl
 
 def normalizeAndInlineLocalDefs (m : LNIRModule) : LNIRModule :=
   let step (cur : LNIRModule) : LNIRModule :=
@@ -485,7 +556,10 @@ def normalizeAndInlineLocalDefs (m : LNIRModule) : LNIRModule :=
       { cur with decls := cur.decls.map fun d =>
         let initUb := d.params.filterMap fun p => if p.ty.isUnboxedScalar || p.ty matches (.tuple _) then some p.id else none
         let cand := inlineLocalHelperCalls helpers initUb (maxVarIdInDecl d + 1000) d.body
-        let d' := if codeNodeSize cand > 16384 then d else { d with body := cand }
+        let d' :=
+          if cand == d.body || codeNodeSize cand > 16384 then d
+          else if codeCallsDecl d.name d.body && !codeCallsDecl d.name cand then d
+          else { d with body := cand }
         flattenInlinedHelperBody d' }
   let rec loop (fuel : Nat) (cur : LNIRModule) : LNIRModule :=
     match fuel with

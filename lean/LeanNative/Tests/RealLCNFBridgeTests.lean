@@ -2,8 +2,11 @@ import Lean.Compiler.LCNF.Basic
 import Lean.Compiler.LCNF.ToImpureType
 import LeanNative.IR.RealLCNFBridge
 import LeanNative.IR.RealLCNFSemantics
+import LeanNative.IR.BridgeHelpers
+import LeanNative.Transform.EqSat
 import LeanNative.Semantics.Eval
 import LeanNative.Proofs.RealLCNFBridgeProofs
+import LeanNative.Proofs.SymbolicTV
 
 namespace LeanNative.Tests.RealLCNFBridgeTests
 
@@ -86,10 +89,10 @@ private def boolJpDecl : Decl .impure :=
 #guard checkDeclParity 32 { arch := .x86_64 } boolJpDecl [.u64 9, .u64 3] (.u64 107)
 
 /-- Test 3: Stage 1D heap ADT constructor allocation, `oset`, `setTag`, `cases` tag dispatch, and `dec` cleanup. -/
-private def objBoxSpec0 : RcCtorLayoutSpec :=
+private def objBoxSpec0 : RealLCNFBridge.RcCtorLayoutSpec :=
   { ctorName := `ObjBox.left, cidx := 0, objSlots := 1, usizeSlots := 0, scalarSlots := [] }
 
-private def objBoxSpec1 : RcCtorLayoutSpec :=
+private def objBoxSpec1 : RealLCNFBridge.RcCtorLayoutSpec :=
   { ctorName := `ObjBox.right, cidx := 1, objSlots := 1, usizeSlots := 0, scalarSlots := [] }
 
 private def objHeapCtx : RealBridgeCtx :=
@@ -146,5 +149,67 @@ private def recJpDecl : Decl .impure :=
     .jp jpDecl (.jmp (fv 10) #[.fvar (fv 1)])
 
 #guard (lowerRealLCNFDecl 32 { arch := .x86_64 } recJpDecl).isOk == false
+
+private def evalDeclProduces (fuel : Nat) (d : LNIRDecl) (args : List Val) (expected : Val) : Bool :=
+  match evalLoweredDecl fuel d args with
+  | .ok (v, hst) => v == expected && hst == HeapState.empty
+  | .error _ => false
+
+/-- Test 6: Regression against branch-local `letBind` shadowing outer parameters in `flattenInlinedHelperBody`,
+    `normalizeAndInlineLocalDefs`, and `compressScalarCode` (TV-gated fail-closed fallback). -/
+private def shadowedIteDecl : LNIRDecl :=
+  { name := "test_shadowed_ite"
+    params := [{ id := 0, name := "cond", ty := .i1 }, { id := 1, name := "x", ty := .i64 }]
+    retTy := .i64
+    body := .ite 0 (.letBind 1 .i64 (.scalar (.constU64 999)) (.ret 1)) (.ret 1) }
+
+#guard evalDeclProduces 16 shadowedIteDecl [.bool false, .u64 42] (.u64 42)
+#guard evalDeclProduces 16 (flattenInlinedHelperBody shadowedIteDecl) [.bool false, .u64 42] (.u64 42)
+#guard evalDeclProduces 16 (flattenInlinedHelperBody shadowedIteDecl) [.bool true, .u64 42] (.u64 999)
+
+private def shadowedTupleIteDecl : LNIRDecl :=
+  { name := "test_shadowed_tuple_ite"
+    params := [{ id := 0, name := "cond", ty := .i1 }, { id := 1, name := "x", ty := .i64 }]
+    retTy := .tuple [.i64, .i64]
+    body := .ite 0
+      (.letBind 1 .i64 (.scalar (.constU64 999))
+        (.letBind 2 (.tuple [.i64, .i64]) (.mkTuple [1, 1]) (.ret 2)))
+      (.letBind 3 (.tuple [.i64, .i64]) (.mkTuple [1, 1]) (.ret 3)) }
+
+#guard evalDeclProduces 16 (flattenInlinedHelperBody shadowedTupleIteDecl) [.bool false, .u64 42]
+  (.tuple [.u64 42, .u64 42])
+#guard evalDeclProduces 16 (flattenInlinedHelperBody shadowedTupleIteDecl) [.bool true, .u64 42]
+  (.tuple [.u64 999, .u64 999])
+
+private def shadowedInlineMod : LNIRModule :=
+  normalizeAndInlineLocalDefs
+    { moduleName := "shadowed_inline_mod"
+      decls := [
+        shadowedIteDecl,
+        { name := "caller"
+          params := [{ id := 0, name := "c", ty := .i1 }, { id := 1, name := "y", ty := .i64 }]
+          retTy := .i64
+          body := .letBind 2 .i64 (.call "test_shadowed_ite" [0, 1] .i64 false) (.ret 2) }
+      ] }
+
+#guard
+  match shadowedInlineMod.decls.find? (·.name == "caller") with
+  | some d =>
+    evalDeclProduces 16 d [.bool false, .u64 42] (.u64 42) &&
+    evalDeclProduces 16 d [.bool true, .u64 42] (.u64 999)
+  | none => false
+
+private def checkCompressScalarShadowing : Lean.CoreM Bool := do
+  let initSt : BridgeState := {
+    varTypes := ({} : Std.HashMap VarId LNIRType).insert 0 .i1 |>.insert 1 .i64
+    nextVarId := 10 }
+  let (candBody, _) ← (compressScalarCode shadowedIteDecl.body).run initSt
+  let candDecl := { shadowedIteDecl with body := candBody }
+  return evalDeclProduces 16 candDecl [.bool false, .u64 42] (.u64 42) &&
+    evalDeclProduces 16 candDecl [.bool true, .u64 42] (.u64 999)
+
+#eval do
+  unless (← checkCompressScalarShadowing) do
+    Lean.throwError "compressScalarCode outer-scope shadowing regression failed!"
 
 end LeanNative.Tests.RealLCNFBridgeTests
