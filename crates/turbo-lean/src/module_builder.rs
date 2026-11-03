@@ -12157,7 +12157,7 @@ fn collect_module_artifact_paths(node: &ModuleNode) -> Vec<(&'static str, PathBu
     if ir_sig.is_file() {
         list.push(("ir_sig", ir_sig));
     }
-    if node.c_path.is_file() {
+    if node.needs_c && node.c_path.is_file() {
         list.push(("c", node.c_path.clone()));
     }
     list
@@ -16638,22 +16638,26 @@ pub fn build_project_modules_native(
                         .into_iter()
                         .map(|(_, p)| p)
                         .collect();
-                    paths.extend(outputs.iter().map(|e| target_root.join(&e.rel_path)));
+                    let checked_outputs: Vec<BlobEntry> = outputs
+                        .into_iter()
+                        .filter(|e| node.needs_c || e.kind != "c")
+                        .collect();
+                    paths.extend(
+                        checked_outputs
+                            .iter()
+                            .map(|e| target_root.join(&e.rel_path)),
+                    );
                     let restored = _flock_guard.read_consistent(&paths, || {
                         if preserve_lake {
-                            crate::db::reuse_worktree_outputs(target_root, &outputs)?;
+                            crate::db::reuse_worktree_outputs(target_root, &checked_outputs)?;
                         }
                         let hashes_ok = validate_materialized_module_artifacts(node, preserve_lake)
-                            && outputs
-                                .iter()
-                                .filter(|e| node.needs_c || e.kind != "c")
-                                .all(|entry| {
-                                    fs::read(target_root.join(&entry.rel_path)).is_ok_and(|bytes| {
-                                        bytes.len() as u64 == entry.size_bytes
-                                            && blake3::hash(&bytes).to_hex().as_str()
-                                                == entry.blob_hash
-                                    })
-                                });
+                            && checked_outputs.iter().all(|entry| {
+                                fs::read(target_root.join(&entry.rel_path)).is_ok_and(|bytes| {
+                                    bytes.len() as u64 == entry.size_bytes
+                                        && blake3::hash(&bytes).to_hex().as_str() == entry.blob_hash
+                                })
+                            });
                         if hashes_ok {
                             compute_olean_artifact_set_digest_locked(
                                 &node.olean_path,
@@ -16813,6 +16817,21 @@ pub fn build_project_modules_native(
                             invalidate_node()?;
                             misses_to_compile.push((mod_name, mod_key));
                             continue;
+                        }
+                        if !preserve_lake && !node.needs_c {
+                            let c_hash_path =
+                                PathBuf::from(format!("{}.hash", node.c_path.display()));
+                            if fs::symlink_metadata(&node.c_path).is_ok()
+                                || fs::symlink_metadata(&c_hash_path).is_ok()
+                            {
+                                let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
+                                let _guard = lock.lock().map_err(|_| {
+                                    anyhow::anyhow!("Module artifact publication mutex poisoned")
+                                })?;
+                                let _flock_guard = acquire_publish_flock(&node.pkg_root, false)?;
+                                let _ = fs::remove_file(&node.c_path);
+                                let _ = fs::remove_file(&c_hash_path);
+                            }
                         }
                         write_lake_module_hashes_and_trace(
                             &cfg,
