@@ -9,6 +9,15 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::process::Command;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttestedOleanReplay {
+    pub artifact_digest: String,
+    pub environment_digest: String,
+    pub replay_version: u32,
+    pub toolchain_hash: String,
+    pub module_name: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackManifest {
     pub format_version: u32,
@@ -20,6 +29,8 @@ pub struct PackManifest {
     pub ed25519_pubkey: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ed25519_signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replayed_oleans: Vec<AttestedOleanReplay>,
 }
 
 pub fn decode_hex_fixed<const N: usize>(hex: &str) -> Result<[u8; N]> {
@@ -48,9 +59,16 @@ pub fn encode_hex_bytes(bytes: &[u8]) -> String {
     s
 }
 
-pub fn compute_pack_attestation_digest(manifest: &PackManifest) -> [u8; 32] {
+fn compute_pack_attestation_digest_with_version(
+    manifest: &PackManifest,
+    include_replayed_oleans_v2: bool,
+) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
-    h.update(b"turbo-lean:pack-attestation:v1\n");
+    if include_replayed_oleans_v2 {
+        h.update(b"turbo-lean:pack-attestation:v2\n");
+    } else {
+        h.update(b"turbo-lean:pack-attestation:v1\n");
+    }
     h.update(&manifest.format_version.to_le_bytes());
     h.update(manifest.host_arch.as_bytes());
     h.update(b"\n");
@@ -90,7 +108,45 @@ pub fn compute_pack_attestation_digest(manifest: &PackManifest) -> [u8; 32] {
         h.update(&b.size_bytes.to_le_bytes());
         h.update(b"\n");
     }
+    if include_replayed_oleans_v2 {
+        let mut replayed: Vec<&AttestedOleanReplay> = manifest.replayed_oleans.iter().collect();
+        replayed.sort_by(|a, b| {
+            a.artifact_digest
+                .cmp(&b.artifact_digest)
+                .then_with(|| a.environment_digest.cmp(&b.environment_digest))
+                .then_with(|| a.replay_version.cmp(&b.replay_version))
+                .then_with(|| a.toolchain_hash.cmp(&b.toolchain_hash))
+                .then_with(|| a.module_name.cmp(&b.module_name))
+        });
+        h.update(b"replayed_count:");
+        h.update(&(replayed.len() as u64).to_le_bytes());
+        h.update(b"\n");
+        for r in replayed {
+            h.update(b"replayed:");
+            for field in [
+                r.artifact_digest.as_bytes(),
+                r.environment_digest.as_bytes(),
+                r.toolchain_hash.as_bytes(),
+                r.module_name.as_bytes(),
+            ] {
+                h.update(&(field.len() as u64).to_le_bytes());
+                h.update(field);
+            }
+            h.update(&r.replay_version.to_le_bytes());
+            h.update(b"\n");
+        }
+    }
     *h.finalize().as_bytes()
+}
+
+pub fn compute_pack_attestation_digest(manifest: &PackManifest) -> [u8; 32] {
+    compute_pack_attestation_digest_with_version(manifest, true)
+}
+
+#[cfg(test)]
+#[cfg(test)]
+pub(crate) fn compute_pack_attestation_digest_v1_legacy(manifest: &PackManifest) -> [u8; 32] {
+    compute_pack_attestation_digest_with_version(manifest, false)
 }
 
 pub fn sign_pack_manifest_ed25519(
@@ -127,10 +183,33 @@ pub fn verify_pack_manifest_ed25519(
         .ok_or_else(|| anyhow::anyhow!("Pack manifest is missing Ed25519 attestation signature"))?;
     let sig_bytes = decode_hex_fixed::<64>(sig_hex)?;
     let sig = Signature::from_bytes(&sig_bytes);
-    let digest = compute_pack_attestation_digest(manifest);
-    vk.verify(&digest, &sig)
-        .map_err(|_| anyhow::anyhow!("Pack Ed25519 attestation signature verification failed"))?;
-    Ok(())
+    let digest_v2 = compute_pack_attestation_digest_with_version(manifest, true);
+    if vk.verify(&digest_v2, &sig).is_ok() {
+        return Ok(());
+    }
+    if manifest.replayed_oleans.is_empty() {
+        let digest_v1 = compute_pack_attestation_digest_with_version(manifest, false);
+        if vk.verify(&digest_v1, &sig).is_ok() {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("Pack Ed25519 attestation signature verification failed")
+}
+
+pub fn pack_manifest_has_verified_ed25519(
+    manifest: &PackManifest,
+    trusted_pubkey: Option<&str>,
+) -> bool {
+    let env_pk = std::env::var("TURBO_LEAN_PACK_TRUSTED_PUBKEY")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let Some(pk) = trusted_pubkey
+        .filter(|s| !s.trim().is_empty())
+        .or(env_pk.as_deref())
+    else {
+        return false;
+    };
+    verify_pack_manifest_ed25519(manifest, pk).is_ok()
 }
 
 pub fn resolve_pack_import_trust_domain(
@@ -590,6 +669,7 @@ pub(crate) fn replay_pending_deferred_packs_inner(
             &staged_blobs,
             force_commit,
             deferred_td,
+            None,
             true,
         ) {
             Ok(_) => match fs::remove_file(&spool_path) {
@@ -744,6 +824,9 @@ pub fn try_stateless_cold_pull_sync_with_domain(
         allow_unattested_trusted,
     )
     .ok()?;
+    if td == "trusted" && !manifest.replayed_oleans.is_empty() {
+        return None;
+    }
     let _pub_guard = crate::db::acquire_cas_publication_guard(store_root).ok()?;
     let (_, _) = prestage_blobs_from_shared_cas(store_root, &manifest)?;
     if !stage_deferred_pack_record_locked(store_root, td, &pack_bytes) {
@@ -902,6 +985,7 @@ pub fn export_pack(
     export_pack_with_signing_key(store, output_path, only_portable, None)
 }
 
+#[allow(dead_code)]
 pub fn export_pack_with_signing_key(
     store: &TurboStore,
     output_path: &Path,
@@ -1155,7 +1239,21 @@ fn verify_cached_pack_stream_integrity(
     expected_acts: usize,
     expected_blobs: usize,
     expected_raw_bytes: u64,
+    expected_replayed: usize,
 ) -> bool {
+    if stream.len() < 16 {
+        return false;
+    }
+    let hlen = read_u64_le_at(stream, 8) as usize;
+    if 16 + hlen > stream.len() {
+        return false;
+    }
+    let Ok(m) = serde_json::from_slice::<PackManifest>(&stream[16..16 + hlen]) else {
+        return false;
+    };
+    if m.replayed_oleans.len() != expected_replayed {
+        return false;
+    }
     verify_cached_pack_stream_integrity_at_root(
         &store.root,
         stream,
@@ -1191,11 +1289,38 @@ pub fn export_pack_filtered_with_mode(
     )
 }
 
+#[derive(Debug, Clone)]
+pub struct ExportInclusionFilter {
+    pub allowed_actions: Option<HashSet<String>>,
+    pub allowed_replay_modules: Option<HashSet<String>>,
+    pub allowed_replay_artifact_digests: Option<HashSet<String>>,
+}
+
 pub fn export_pack_filtered_with_mode_and_signing_key(
     store: &TurboStore,
     only_portable: bool,
     exclude_actions: &HashSet<String>,
     exclude_blobs: &HashSet<String>,
+    header_only_shared_cas: bool,
+    signing_key: Option<&str>,
+) -> Result<(usize, usize, u64, Vec<u8>)> {
+    export_pack_with_filter_mode_and_signing_key(
+        store,
+        only_portable,
+        exclude_actions,
+        exclude_blobs,
+        None,
+        header_only_shared_cas,
+        signing_key,
+    )
+}
+
+pub fn export_pack_with_filter_mode_and_signing_key(
+    store: &TurboStore,
+    only_portable: bool,
+    exclude_actions: &HashSet<String>,
+    exclude_blobs: &HashSet<String>,
+    inclusion_filter: Option<&ExportInclusionFilter>,
     header_only_shared_cas: bool,
     signing_key: Option<&str>,
 ) -> Result<(usize, usize, u64, Vec<u8>)> {
@@ -1207,29 +1332,34 @@ pub fn export_pack_filtered_with_mode_and_signing_key(
     let full_export_cache_path = if signing_key_env.is_none()
         && exclude_actions.is_empty()
         && exclude_blobs.is_empty()
+        && inclusion_filter.is_none()
     {
-        let state_sig: Option<(i64, i64, i64)> = store
-                .conn
-                .query_row(
-                    "SELECT
-                       (SELECT COALESCE(val, 0) FROM meta_counters WHERE name = 'fencing_seq'),
-                       (SELECT COUNT(*) FROM actions WHERE status = 'completed' AND trust_domain = 'trusted'),
-                       (SELECT COUNT(*) FROM blobs WHERE trust_domain = 'trusted')",
-                    [],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
-                .ok();
-        if let Some((fseq, act_cnt, blob_cnt)) = state_sig {
+        let state_sig: Option<(i64, i64, i64, i64, i64)> = store
+            .conn
+            .query_row(
+                "SELECT
+                   (SELECT COALESCE(val, 0) FROM meta_counters WHERE name = 'fencing_seq'),
+                   (SELECT COUNT(*) FROM actions WHERE status = 'completed' AND trust_domain = 'trusted'),
+                   (SELECT COUNT(*) FROM blobs WHERE trust_domain = 'trusted'),
+                   (SELECT COUNT(*) FROM kernel_replayed_oleans_auth),
+                   (SELECT COALESCE(MAX(verified_at), 0) FROM kernel_replayed_oleans_auth)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .ok();
+        if let Some((fseq, act_cnt, blob_cnt, replay_cnt, replay_max_ts)) = state_sig {
             if act_cnt > 0 {
                 let mut h = blake3::Hasher::new();
                 h.update(store.root.to_string_lossy().as_bytes());
                 let root_tag = &h.finalize().to_hex()[..16];
                 let cache_file = store.fast_staging_dir().join(format!(
-                    "pack_exp_v2_{}_{}_{}_{}_{}_{}.bin",
+                    "pack_exp_v2_{}_{}_{}_{}_{}_{}_{}_{}.bin",
                     root_tag,
                     fseq,
                     act_cnt,
                     blob_cnt,
+                    replay_cnt,
+                    replay_max_ts,
                     if only_portable { 1 } else { 0 },
                     if header_only_shared_cas { 1 } else { 0 }
                 ));
@@ -1243,7 +1373,12 @@ pub fn export_pack_filtered_with_mode_and_signing_key(
                             let raw_bytes = read_u64_le_at(&cached_bytes, 16);
                             let stream = cached_bytes.split_off(24);
                             if verify_cached_pack_stream_integrity(
-                                store, &stream, n_acts, n_blobs, raw_bytes,
+                                store,
+                                &stream,
+                                n_acts,
+                                n_blobs,
+                                raw_bytes,
+                                replay_cnt as usize,
                             ) {
                                 if only_portable {
                                     let locks_dir = store.root.join("locks");
@@ -1525,6 +1660,13 @@ pub fn export_pack_filtered_with_mode_and_signing_key(
         if exclude_actions.contains(&ak) {
             continue;
         }
+        if let Some(inc) = inclusion_filter {
+            if let Some(ref allowed_acts) = inc.allowed_actions {
+                if !allowed_acts.contains(&ak) {
+                    continue;
+                }
+            }
+        }
         if cur_meta.as_ref().map(|m| m.0.as_str()) != Some(ak.as_str()) {
             if let Some(prev_meta) = cur_meta.take() {
                 let outs = std::mem::take(&mut cur_outputs);
@@ -1637,13 +1779,37 @@ pub fn export_pack_filtered_with_mode_and_signing_key(
     }
 
     if header_only_shared_cas && !all_in_shared {
-        return export_pack_filtered_with_mode(
+        drop(_pub_guard);
+        return export_pack_with_filter_mode_and_signing_key(
             store,
             only_portable,
             exclude_actions,
             exclude_blobs,
+            inclusion_filter,
             false,
+            signing_key,
         );
+    }
+
+    let mut replayed_oleans = store.export_verified_kernel_replayed_oleans(&[])?;
+    if let Some(inc) = inclusion_filter {
+        replayed_oleans.retain(|r| {
+            let mod_ok = inc
+                .allowed_replay_modules
+                .as_ref()
+                .is_some_and(|mods| !r.module_name.is_empty() && mods.contains(&r.module_name));
+            let dig_ok = inc
+                .allowed_replay_artifact_digests
+                .as_ref()
+                .is_some_and(|digs| digs.contains(&r.artifact_digest));
+            match (
+                &inc.allowed_replay_modules,
+                &inc.allowed_replay_artifact_digests,
+            ) {
+                (None, None) => true,
+                _ => mod_ok || dig_ok,
+            }
+        });
     }
 
     let mut manifest = PackManifest {
@@ -1654,6 +1820,7 @@ pub fn export_pack_filtered_with_mode_and_signing_key(
         blobs,
         ed25519_pubkey: None,
         ed25519_signature: None,
+        replayed_oleans,
     };
     if let Some(ref sk_hex) = signing_key_env {
         sign_pack_manifest_ed25519(&mut manifest, sk_hex)?;
@@ -1673,7 +1840,7 @@ pub fn export_pack_filtered_with_mode_and_signing_key(
 
     let n_acts = manifest.actions.len();
     let n_blobs = manifest.blobs.len();
-    if exclude_actions.is_empty() && exclude_blobs.is_empty() {
+    if exclude_actions.is_empty() && exclude_blobs.is_empty() && inclusion_filter.is_none() {
         save_cached_portable_manifest_from_pack(&store.root, &manifest);
     }
     if let Some(cache_file) = full_export_cache_path {
@@ -1742,6 +1909,7 @@ pub fn export_pack_filtered(
     )
 }
 
+#[allow(dead_code)]
 pub fn export_pack_filtered_with_signing_key(
     store: &TurboStore,
     output_path: &Path,
@@ -1750,13 +1918,34 @@ pub fn export_pack_filtered_with_signing_key(
     exclude_blobs: &HashSet<String>,
     signing_key: Option<&str>,
 ) -> Result<(usize, usize, u64)> {
+    export_pack_with_filter_and_signing_key(
+        store,
+        output_path,
+        only_portable,
+        exclude_actions,
+        exclude_blobs,
+        None,
+        signing_key,
+    )
+}
+
+pub fn export_pack_with_filter_and_signing_key(
+    store: &TurboStore,
+    output_path: &Path,
+    only_portable: bool,
+    exclude_actions: &HashSet<String>,
+    exclude_blobs: &HashSet<String>,
+    inclusion_filter: Option<&ExportInclusionFilter>,
+    signing_key: Option<&str>,
+) -> Result<(usize, usize, u64)> {
     let _pub_guard = crate::db::acquire_cas_publication_guard(&store.root)?;
     let (n_acts, n_blobs, total_raw_bytes, pack_stream) =
-        export_pack_filtered_with_mode_and_signing_key(
+        export_pack_with_filter_mode_and_signing_key(
             store,
             only_portable,
             exclude_actions,
             exclude_blobs,
+            inclusion_filter,
             false,
             signing_key,
         )?;
@@ -2025,6 +2214,9 @@ pub fn try_stateless_cold_import_with_domain(
         allow_unattested_trusted,
     )
     .ok()?;
+    if td == "trusted" && !manifest.replayed_oleans.is_empty() {
+        return None;
+    }
     let expected_payload: u64 = manifest.blobs.iter().map(|b| b.size_bytes).sum();
     let size_ok = &magic == b"TLPK\x00\x00\x00\x03"
         || 16 + (header_len as u64) + expected_payload == file_len;
@@ -2083,6 +2275,9 @@ pub fn try_stateless_warm_import_with_domain(
         allow_unattested_trusted,
     )
     .ok()?;
+    if td == "trusted" && !manifest.replayed_oleans.is_empty() {
+        return None;
+    }
     let header_hash = blake3::hash(&header_buf).to_hex().to_string();
     if header_hash == saved_stamp
         && (saved_td == td || (saved_td == "trusted" && td == "untrusted"))
@@ -2093,6 +2288,7 @@ pub fn try_stateless_warm_import_with_domain(
     }
 }
 
+#[allow(dead_code)]
 pub fn finish_import_from_prestaged_shared_cas_with_domain(
     store: &mut TurboStore,
     manifest: &PackManifest,
@@ -2106,6 +2302,7 @@ pub fn finish_import_from_prestaged_shared_cas_with_domain(
         staged_blobs,
         total_newly_written,
         trust_domain,
+        None,
         false,
     )
 }
@@ -2116,6 +2313,7 @@ pub(crate) fn finish_import_from_prestaged_shared_cas_inner(
     staged_blobs: &[(String, String, i64, i64)],
     total_newly_written: usize,
     trust_domain: &str,
+    trusted_pubkey: Option<&str>,
     already_holds_gc_lock: bool,
 ) -> Result<(usize, usize)> {
     let _pub_guard = if already_holds_gc_lock {
@@ -2194,11 +2392,28 @@ pub(crate) fn finish_import_from_prestaged_shared_cas_inner(
     let has_pending_deferred = list_pending_deferred_pack_files(&locks_dir)
         .map(|v| !v.is_empty())
         .unwrap_or(false);
+    let installed_replayed = if td == "trusted"
+        && !manifest.replayed_oleans.is_empty()
+        && pack_manifest_has_verified_ed25519(manifest, trusted_pubkey)
+    {
+        let allowed_githashes = crate::module_builder::discover_host_installed_lean_githashes();
+        store.import_attested_replayed_oleans(
+            &manifest.replayed_oleans,
+            td,
+            &allowed_githashes,
+            &[],
+        )?
+    } else {
+        0
+    };
     if effective_newly_written == 0 && !has_pending_deferred && !manifest.actions.is_empty() {
         if fs::read_to_string(&stamp_file)
             .map(|s| s == stamp_val)
             .unwrap_or(false)
         {
+            if installed_replayed > 0 {
+                store.sync_sqlite_durable()?;
+            }
             if td == "trusted" {
                 save_cached_portable_manifest_from_pack(&store.root, manifest);
             }
@@ -2234,6 +2449,9 @@ pub(crate) fn finish_import_from_prestaged_shared_cas_inner(
 
     let res =
         store.batch_import_pack_metadata_with_domain(&effective_blobs, &manifest.actions, td)?;
+    if manifest.actions.is_empty() && effective_blobs.is_empty() && installed_replayed > 0 {
+        store.sync_sqlite_durable()?;
+    }
     write_stamp()?;
     if td == "trusted" {
         save_cached_portable_manifest_from_pack(&store.root, manifest);
@@ -2245,6 +2463,15 @@ pub(crate) fn try_import_from_shared_cas_with_domain(
     store: &mut TurboStore,
     manifest: &PackManifest,
     trust_domain: &str,
+) -> Result<Option<(usize, usize)>> {
+    try_import_from_shared_cas_with_domain_and_pubkey(store, manifest, trust_domain, None)
+}
+
+pub(crate) fn try_import_from_shared_cas_with_domain_and_pubkey(
+    store: &mut TurboStore,
+    manifest: &PackManifest,
+    trust_domain: &str,
+    trusted_pubkey: Option<&str>,
 ) -> Result<Option<(usize, usize)>> {
     let _pub_guard = crate::db::acquire_cas_publication_guard(&store.root)?;
     let Some((staged_blobs, total_newly_written)) =
@@ -2258,6 +2485,7 @@ pub(crate) fn try_import_from_shared_cas_with_domain(
         &staged_blobs,
         total_newly_written,
         trust_domain,
+        trusted_pubkey,
         true,
     )?;
     Ok(Some(res))
@@ -2305,12 +2533,14 @@ pub fn import_pack_with_policy(
             trusted_pubkey,
             allow_unattested_trusted,
         )?;
-        let res = finish_import_from_prestaged_shared_cas_with_domain(
+        let res = finish_import_from_prestaged_shared_cas_inner(
             store,
             &manifest,
             &staged_blobs,
             newly_written,
             td,
+            trusted_pubkey,
+            false,
         );
         drop(pub_guard);
         return res;
@@ -2389,7 +2619,9 @@ pub fn import_pack_bytes_with_policy(
     let expected_payload: usize = manifest.blobs.iter().map(|b| b.size_bytes as usize).sum();
     if is_v3_header_only || (!payload_region.is_empty() && payload_region.len() == expected_payload)
     {
-        if let Some(res) = try_import_from_shared_cas_with_domain(store, &manifest, td)? {
+        if let Some(res) =
+            try_import_from_shared_cas_with_domain_and_pubkey(store, &manifest, td, trusted_pubkey)?
+        {
             return Ok(res);
         }
     }
@@ -2598,6 +2830,21 @@ pub fn import_pack_bytes_with_policy(
     }
     sync_created_parents(&mut created_parents)?;
 
+    let installed_replayed = if td == "trusted"
+        && !manifest.replayed_oleans.is_empty()
+        && pack_manifest_has_verified_ed25519(&manifest, trusted_pubkey)
+    {
+        let allowed_githashes = crate::module_builder::discover_host_installed_lean_githashes();
+        store.import_attested_replayed_oleans(
+            &manifest.replayed_oleans,
+            td,
+            &allowed_githashes,
+            &[],
+        )?
+    } else {
+        0
+    };
+
     if total_newly_written == 0 && !manifest.actions.is_empty() {
         let existing_completed: i64 = store
             .conn
@@ -2618,11 +2865,18 @@ pub fn import_pack_bytes_with_policy(
                             .unwrap_or(false))
             })
         {
+            if installed_replayed > 0 {
+                store.sync_sqlite_durable()?;
+            }
             return Ok((manifest.actions.len(), staged_blobs.len()));
         }
     }
 
-    store.batch_import_pack_metadata_with_domain(&staged_blobs, &manifest.actions, td)
+    let res = store.batch_import_pack_metadata_with_domain(&staged_blobs, &manifest.actions, td)?;
+    if manifest.actions.is_empty() && staged_blobs.is_empty() && installed_replayed > 0 {
+        store.sync_sqlite_durable()?;
+    }
+    Ok(res)
 }
 
 pub use crate::server::*;
@@ -3625,6 +3879,183 @@ pub fn offload_check_shards_batch_http(
 
 pub type PrefetchedExportItem = (Vec<u8>, Option<PrefetchedPackPrestage>);
 
+pub fn resolve_remote_cache_url() -> Option<String> {
+    std::env::var("TURBO_LEAN_REMOTE_CACHE")
+        .ok()
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+}
+
+pub fn resolve_remote_cache_token() -> Option<String> {
+    std::env::var("TURBO_LEAN_REMOTE_TOKEN")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("TURBO_LEAN_API_TOKEN")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+}
+
+pub fn fetch_remote_cache_manifest(
+    base_url: &str,
+    auth_token: Option<&str>,
+) -> Result<DeltaManifest> {
+    let base = base_url.trim_end_matches('/');
+    let bytes = http_request_with_timeout_and_token(
+        "GET",
+        &format!("{}/manifest", base),
+        "application/json",
+        &[],
+        Some(15_000),
+        auth_token,
+        || {},
+    )?;
+    let dm = serde_json::from_slice::<DeltaManifest>(&bytes)
+        .context("Failed to parse remote cache `/manifest` JSON")?;
+    Ok(dm)
+}
+
+pub fn try_pull_remote_module_action(
+    store: &mut TurboStore,
+    base_url: &str,
+    auth_token: Option<&str>,
+    remote_manifest: &mut Option<DeltaManifest>,
+    wanted_action_keys: &[String],
+    trust_domain: &str,
+    is_untrusted: bool,
+) -> Result<bool> {
+    if wanted_action_keys.is_empty() {
+        return Ok(false);
+    }
+    let base = base_url.trim_end_matches('/');
+    if remote_manifest.is_none() {
+        *remote_manifest = Some(fetch_remote_cache_manifest(base, auth_token)?);
+    }
+    let Some(ref dm) = remote_manifest else {
+        return Ok(false);
+    };
+    let wanted_set: HashSet<&str> = wanted_action_keys.iter().map(|s| s.as_str()).collect();
+    if !dm
+        .action_keys
+        .iter()
+        .any(|k| wanted_set.contains(k.as_str()))
+    {
+        return Ok(false);
+    }
+    let exclude_actions: Vec<String> = dm
+        .action_keys
+        .iter()
+        .filter(|k| !wanted_set.contains(k.as_str()))
+        .cloned()
+        .collect();
+    let local_manifest = get_store_manifest(store, true).unwrap_or_default();
+    let req_body = serde_json::to_vec(&ExportDeltaRequest {
+        exclude_actions,
+        exclude_blobs: local_manifest.blob_hashes,
+    })?;
+    let pack_bytes = http_request_with_timeout_and_token(
+        "POST",
+        &format!("{}/pull-delta", base),
+        "application/json",
+        &req_body,
+        Some(30_000),
+        auth_token,
+        || {},
+    )?;
+    if pack_bytes.is_empty() {
+        return Ok(false);
+    }
+    let requested_domain = if is_untrusted || trust_domain == "untrusted" {
+        Some("untrusted")
+    } else {
+        Some("trusted")
+    };
+    let has_env_pubkey = std::env::var("TURBO_LEAN_PACK_TRUSTED_PUBKEY")
+        .ok()
+        .is_some_and(|s| !s.trim().is_empty());
+    let allow_unattested_trusted = !is_untrusted && !has_env_pubkey;
+    let (acts, blobs) = import_pack_bytes_with_policy(
+        store,
+        &pack_bytes,
+        requested_domain,
+        None,
+        allow_unattested_trusted,
+    )?;
+    Ok(acts > 0 || blobs > 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn try_push_remote_module_action(
+    store: &TurboStore,
+    base_url: &str,
+    auth_token: Option<&str>,
+    remote_manifest: &mut Option<DeltaManifest>,
+    mod_action_key: &str,
+    mod_name: &str,
+    artifact_digest_opt: Option<&str>,
+    trust_domain: &str,
+    is_untrusted: bool,
+) -> Result<bool> {
+    if is_untrusted || trust_domain != "trusted" {
+        return Ok(false);
+    }
+    let base = base_url.trim_end_matches('/');
+    if remote_manifest.is_none() {
+        *remote_manifest = fetch_remote_cache_manifest(base, auth_token).ok();
+    }
+    let mut remote_blobs: HashSet<String> = HashSet::new();
+    if let Some(ref dm) = remote_manifest {
+        if dm.action_keys.iter().any(|k| k == mod_action_key) {
+            return Ok(false);
+        }
+        remote_blobs.extend(dm.blob_hashes.iter().cloned());
+    }
+    let mut allowed_actions = HashSet::new();
+    allowed_actions.insert(mod_action_key.to_string());
+    let mut allowed_mods = HashSet::new();
+    if !mod_name.is_empty() {
+        allowed_mods.insert(mod_name.to_string());
+    }
+    let allowed_digs = artifact_digest_opt.map(|d| {
+        let mut s = HashSet::new();
+        s.insert(d.to_string());
+        s
+    });
+    let filter = ExportInclusionFilter {
+        allowed_actions: Some(allowed_actions),
+        allowed_replay_modules: Some(allowed_mods),
+        allowed_replay_artifact_digests: allowed_digs,
+    };
+    let (n_acts, n_blobs, _, pack_bytes) = export_pack_with_filter_mode_and_signing_key(
+        store,
+        true,
+        &HashSet::new(),
+        &remote_blobs,
+        Some(&filter),
+        false,
+        None,
+    )?;
+    if n_acts == 0 && n_blobs == 0 {
+        return Ok(false);
+    }
+    http_request_with_timeout_and_token(
+        "POST",
+        &format!("{}/import-delta", base),
+        "application/octet-stream",
+        &pack_bytes,
+        Some(30_000),
+        auth_token,
+        || {},
+    )?;
+    if let Some(ref mut dm) = remote_manifest {
+        if !dm.action_keys.iter().any(|k| k == mod_action_key) {
+            dm.action_keys.push(mod_action_key.to_string());
+        }
+    }
+    Ok(true)
+}
+
 /// Execute `turbo-lean export`.
 pub fn run_export_command(
     store: &TurboStore,
@@ -3632,17 +4063,46 @@ pub fn run_export_command(
     output: std::path::PathBuf,
     portable_only: bool,
     signing_key: Option<String>,
+    cone: Option<String>,
+    project_dir: Option<std::path::PathBuf>,
 ) -> Result<()> {
-    let (acts, blobs, bytes) =
-        export_pack_with_signing_key(store, &output, portable_only, signing_key.as_deref())?;
+    let cone_filter = if let Some(ref cone_target) = cone {
+        let proj = match project_dir {
+            Some(p) => p,
+            None => {
+                std::env::current_dir().context("Failed to resolve current working directory")?
+            }
+        };
+        Some(crate::module_builder::build_cone_export_filter(
+            store,
+            &proj,
+            cone_target,
+        )?)
+    } else {
+        None
+    };
+    let (acts, blobs, bytes) = export_pack_with_filter_and_signing_key(
+        store,
+        &output,
+        portable_only,
+        &HashSet::new(),
+        &HashSet::new(),
+        cone_filter.as_ref(),
+        signing_key.as_deref(),
+    )?;
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "exported_actions": acts, "exported_blobs": blobs,
-                "raw_bytes": bytes, "archive": output.display().to_string()
-            }))?
-        );
+        let mut obj = serde_json::json!({
+            "exported_actions": acts,
+            "exported_blobs": blobs,
+            "raw_bytes": bytes,
+            "archive": output.display().to_string()
+        });
+        if let Some(ref c) = cone {
+            if let Some(map) = obj.as_object_mut() {
+                map.insert("cone".to_string(), serde_json::Value::String(c.clone()));
+            }
+        }
+        println!("{}", serde_json::to_string_pretty(&obj)?);
     } else {
         println!(
             "[turbo-lean] Exported {} actions and {} portable blobs ({:.2} MiB raw) to {}",
@@ -3691,12 +4151,14 @@ pub fn run_import_command(
     {
         let td =
             resolve_pack_import_trust_domain(&manifest, req_td, pk_opt, allow_unattested_trusted)?;
-        let res = finish_import_from_prestaged_shared_cas_with_domain(
+        let res = finish_import_from_prestaged_shared_cas_inner(
             store,
             &manifest,
             &staged_blobs,
             newly_written,
             td,
+            pk_opt,
+            false,
         )?;
         drop(pub_guard);
         res
@@ -3807,12 +4269,14 @@ pub fn run_sync_command(
                                 pk_opt,
                                 allow_unattested_trusted,
                             )?;
-                            let res = finish_import_from_prestaged_shared_cas_with_domain(
+                            let res = finish_import_from_prestaged_shared_cas_inner(
                                 store,
                                 &manifest,
                                 &staged_blobs,
                                 newly_written,
                                 td,
+                                pk_opt,
+                                false,
                             )?;
                             drop(pub_guard);
                             res
@@ -5653,6 +6117,7 @@ pub(crate) mod tests {
             created_at: 1,
             ed25519_pubkey: None,
             ed25519_signature: None,
+            replayed_oleans: Vec::new(),
             blobs: vec![PackedBlob {
                 blob_hash: missing_bh.clone(),
                 kind: "olean".into(),
@@ -6084,6 +6549,7 @@ pub(crate) mod tests {
                 }],
                 ed25519_pubkey: None,
                 ed25519_signature: None,
+                replayed_oleans: Vec::new(),
             };
             let staged = prestage_blobs_from_shared_cas(&iso_root, &iso_manifest);
             crate::db::clear_after_blob_verify_before_rename_hook();
@@ -6211,6 +6677,7 @@ pub(crate) mod tests {
                 ],
                 ed25519_pubkey: None,
                 ed25519_signature: None,
+                replayed_oleans: Vec::new(),
             };
             let hdr_bytes = serde_json::to_vec(&restart_manifest)?;
             let mut v3_pack = Vec::with_capacity(16 + hdr_bytes.len());
@@ -6260,6 +6727,280 @@ pub(crate) mod tests {
         let _ = fs::remove_file(&sp_shm);
         let _ = fs::remove_dir_all(&root_src);
         let _ = fs::remove_dir_all(&root_dst);
+        Ok(())
+    }
+
+    #[test]
+    fn test_speed3_v1_signed_pack_backward_compat_and_v2_replay_tamper_rejected() -> Result<()> {
+        let _env_guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("turbo_lean_speed3_v1_v2_{}", next_tmp_id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)?;
+
+        let sk_hex = "5555555555555555555555555555555555555555555555555555555555555555";
+        let pk_hex = crate::receipt::ed25519_verifying_key_hex(&[0x55u8; 32]);
+
+        let payload = b"speed3-v1-compat-blob";
+        let bh = blake3::hash(payload).to_hex().to_string();
+        let mut v1_manifest = PackManifest {
+            format_version: 2,
+            host_arch: std::env::consts::ARCH.into(),
+            created_at: 1000,
+            ed25519_pubkey: Some(pk_hex.clone()),
+            ed25519_signature: None,
+            actions: vec![ActionRecord {
+                action_key: "speed3-v1-act".into(),
+                toolchain_githash: "v4.35.0".into(),
+                kind: "module_unit".into(),
+                status: "done".into(),
+                fencing_token: 1,
+                output_manifest_hash: "00".repeat(32),
+                duration_ms: 12,
+                peak_pss_bytes: 0,
+                heartbeats: 1,
+                trust_domain: "trusted".into(),
+                outputs: vec![BlobEntry {
+                    blob_hash: bh.clone(),
+                    kind: "olean".into(),
+                    size_bytes: payload.len() as u64,
+                    rel_path: "build/lib/lean/V1Mod.olean".into(),
+                }],
+            }],
+            blobs: vec![PackedBlob {
+                blob_hash: bh.clone(),
+                kind: "olean".into(),
+                size_bytes: payload.len() as u64,
+                portable: true,
+                data_hex_or_base64: Vec::new(),
+            }],
+            replayed_oleans: Vec::new(),
+        };
+        {
+            use ed25519_dalek::{Signer, SigningKey};
+            let sk = SigningKey::from_bytes(&decode_hex_fixed::<32>(sk_hex)?);
+            let dig_v1 = compute_pack_attestation_digest_v1_legacy(&v1_manifest);
+            let sig_v1 = sk.sign(&dig_v1);
+            v1_manifest.ed25519_signature = Some(encode_hex_bytes(&sig_v1.to_bytes()));
+        }
+        verify_pack_manifest_ed25519(&v1_manifest, &pk_hex)?;
+
+        // Injecting an unsigned `replayed_oleans` entry onto a v1-signed pack MUST fail closed.
+        let mut injected_v1 = v1_manifest.clone();
+        injected_v1.replayed_oleans.push(AttestedOleanReplay {
+            artifact_digest: "aa".repeat(32),
+            environment_digest: "bb".repeat(32),
+            replay_version: crate::zygote::ZYGOTE_REPLAY_VERSION,
+            toolchain_hash: "deadbeef".into(),
+            module_name: "Evil.Mod".into(),
+        });
+        assert!(
+            verify_pack_manifest_ed25519(&injected_v1, &pk_hex).is_err(),
+            "v1 fallback must never verify when replayed_oleans is non-empty"
+        );
+
+        let v1_hdr = serde_json::to_vec(&v1_manifest)?;
+        let mut v1_stream = Vec::with_capacity(16 + v1_hdr.len() + payload.len());
+        v1_stream.extend_from_slice(b"TLPK\x00\x00\x00\x02");
+        v1_stream.extend_from_slice(&(v1_hdr.len() as u64).to_le_bytes());
+        v1_stream.extend_from_slice(&v1_hdr);
+        v1_stream.extend_from_slice(payload);
+        let mut dst_v1 = TurboStore::open(Some(&dir.join("dst_v1")))?;
+        let (acts, blobs) = import_pack_bytes_with_policy(
+            &mut dst_v1,
+            &v1_stream,
+            Some("trusted"),
+            Some(&pk_hex),
+            false,
+        )?;
+        assert_eq!((acts, blobs), (1, 1));
+        assert!(dst_v1
+            .get_cached_action("speed3-v1-act", "trusted")?
+            .is_some());
+
+        // Now build a v2-signed pack carrying `replayed_oleans` and verify any field mutation fails closed.
+        let mut src_v2 = TurboStore::open(Some(&dir.join("src_v2")))?;
+        let bh2 = src_v2.store_immutable_blob(payload, "olean", "trusted", 0)?;
+        if let SingleflightOutcome::Leader(lease) =
+            src_v2.acquire_singleflight("speed3-v2-act", "v4.35.0", "module_unit", "trusted")?
+        {
+            src_v2.publish_action(
+                &lease,
+                &[BlobEntry {
+                    blob_hash: bh2,
+                    kind: "olean".into(),
+                    size_bytes: payload.len() as u64,
+                    rel_path: "build/lib/lean/V2Mod.olean".into(),
+                }],
+                10,
+                0,
+                0,
+                "trusted",
+            )?;
+        }
+        src_v2.record_kernel_replayed_olean(
+            &"11".repeat(32),
+            &"22".repeat(32),
+            crate::zygote::ZYGOTE_REPLAY_VERSION,
+            "cafebabe1234",
+            "Dep.V2Mod",
+            &[],
+        )?;
+        let (_, _, _, v2_stream) = export_pack_with_filter_mode_and_signing_key(
+            &src_v2,
+            true,
+            &HashSet::new(),
+            &HashSet::new(),
+            None,
+            false,
+            Some(sk_hex),
+        )?;
+        let hlen = read_u64_le_at(&v2_stream, 8) as usize;
+        let orig_m: PackManifest = serde_json::from_slice(&v2_stream[16..16 + hlen])?;
+        assert_eq!(orig_m.replayed_oleans.len(), 1);
+        verify_pack_manifest_ed25519(&orig_m, &pk_hex)?;
+
+        for tamper_idx in 0..5 {
+            let mut tampered = orig_m.clone();
+            match tamper_idx {
+                0 => tampered.replayed_oleans[0].artifact_digest = "ff".repeat(32),
+                1 => tampered.replayed_oleans[0].environment_digest = "ee".repeat(32),
+                2 => tampered.replayed_oleans[0].replay_version += 1,
+                3 => tampered.replayed_oleans[0].toolchain_hash = "forged_githash".into(),
+                _ => tampered.replayed_oleans.clear(),
+            }
+            let thdr = serde_json::to_vec(&tampered)?;
+            let mut tstream = Vec::new();
+            tstream.extend_from_slice(b"TLPK\x00\x00\x00\x02");
+            tstream.extend_from_slice(&(thdr.len() as u64).to_le_bytes());
+            tstream.extend_from_slice(&thdr);
+            tstream.extend_from_slice(&v2_stream[16 + hlen..]);
+            let mut dst_t = TurboStore::open(Some(&dir.join(format!("dst_tamper_{tamper_idx}"))))?;
+            assert!(
+                import_pack_bytes_with_policy(
+                    &mut dst_t,
+                    &tstream,
+                    Some("trusted"),
+                    Some(&pk_hex),
+                    false,
+                )
+                .is_err(),
+                "tampered v2 replayed_oleans case {tamper_idx} must be rejected"
+            );
+            let replay_rows: i64 = dst_t.conn.query_row(
+                "SELECT COUNT(*) FROM kernel_replayed_oleans_auth",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(replay_rows, 0);
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_speed3_mismatched_toolchain_githash_or_replay_version_never_installs_hmac() -> Result<()>
+    {
+        let _env_guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("turbo_lean_speed3_mismatch_{}", next_tmp_id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)?;
+
+        let sk_hex = "6666666666666666666666666666666666666666666666666666666666666666";
+        let pk_hex = crate::receipt::ed25519_verifying_key_hex(&[0x66u8; 32]);
+        let installed_ghs = crate::module_builder::discover_host_installed_lean_githashes();
+        let real_gh = installed_ghs
+            .iter()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "real_githash_fallback".to_string());
+
+        let payload = b"speed3-mismatch-blob";
+        let bh = blake3::hash(payload).to_hex().to_string();
+        let mut manifest = PackManifest {
+            format_version: 2,
+            host_arch: std::env::consts::ARCH.into(),
+            created_at: 2000,
+            ed25519_pubkey: None,
+            ed25519_signature: None,
+            actions: vec![ActionRecord {
+                action_key: "speed3-mismatch-act".into(),
+                toolchain_githash: "v4.35.0".into(),
+                kind: "module_unit".into(),
+                status: "done".into(),
+                fencing_token: 1,
+                output_manifest_hash: "00".repeat(32),
+                duration_ms: 5,
+                peak_pss_bytes: 0,
+                heartbeats: 1,
+                trust_domain: "trusted".into(),
+                outputs: vec![BlobEntry {
+                    blob_hash: bh.clone(),
+                    kind: "olean".into(),
+                    size_bytes: payload.len() as u64,
+                    rel_path: "build/lib/lean/Mismatch.olean".into(),
+                }],
+            }],
+            blobs: vec![PackedBlob {
+                blob_hash: bh,
+                kind: "olean".into(),
+                size_bytes: payload.len() as u64,
+                portable: true,
+                data_hex_or_base64: Vec::new(),
+            }],
+            replayed_oleans: vec![
+                AttestedOleanReplay {
+                    artifact_digest: "33".repeat(32),
+                    environment_digest: "44".repeat(32),
+                    replay_version: crate::zygote::ZYGOTE_REPLAY_VERSION,
+                    toolchain_hash: "nonexistent_foreign_toolchain_githash_0000".into(),
+                    module_name: "Dep.ForeignTc".into(),
+                },
+                AttestedOleanReplay {
+                    artifact_digest: "55".repeat(32),
+                    environment_digest: "66".repeat(32),
+                    replay_version: crate::zygote::ZYGOTE_REPLAY_VERSION + 99,
+                    toolchain_hash: real_gh.clone(),
+                    module_name: "Dep.WrongVer".into(),
+                },
+            ],
+        };
+        sign_pack_manifest_ed25519(&mut manifest, sk_hex)?;
+        let hdr = serde_json::to_vec(&manifest)?;
+        let mut stream = Vec::with_capacity(16 + hdr.len() + payload.len());
+        stream.extend_from_slice(b"TLPK\x00\x00\x00\x02");
+        stream.extend_from_slice(&(hdr.len() as u64).to_le_bytes());
+        stream.extend_from_slice(&hdr);
+        stream.extend_from_slice(payload);
+
+        let mut dst = TurboStore::open(Some(&dir.join("dst")))?;
+        import_pack_bytes_with_policy(&mut dst, &stream, Some("trusted"), Some(&pk_hex), false)?;
+        let replay_rows: i64 = dst.conn.query_row(
+            "SELECT COUNT(*) FROM kernel_replayed_oleans_auth",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(
+            replay_rows, 0,
+            "mismatched toolchain_hash or replay_version must never install local replay HMAC rows"
+        );
+        assert!(!dst.has_kernel_replayed_olean(
+            &"33".repeat(32),
+            &"44".repeat(32),
+            crate::zygote::ZYGOTE_REPLAY_VERSION,
+            "nonexistent_foreign_toolchain_githash_0000",
+            &[]
+        ));
+        assert!(!dst.has_kernel_replayed_olean(
+            &"55".repeat(32),
+            &"66".repeat(32),
+            crate::zygote::ZYGOTE_REPLAY_VERSION + 99,
+            &real_gh,
+            &[]
+        ));
+
+        let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
 }

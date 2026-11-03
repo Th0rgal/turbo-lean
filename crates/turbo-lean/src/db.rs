@@ -2871,6 +2871,132 @@ impl TurboStore {
                 == 0
     }
 
+    pub(crate) fn export_verified_kernel_replayed_oleans(
+        &self,
+        disallowed_roots: &[PathBuf],
+    ) -> Result<Vec<crate::pack::AttestedOleanReplay>> {
+        if !self.is_store_outside_disallowed_roots(disallowed_roots) {
+            return Ok(Vec::new());
+        }
+        let key_path = self.root.join(VERIFIER_REPLAY_HMAC_KEY_FILENAME);
+        let Some(key) = read_verified_replay_hmac_key_file(&key_path, disallowed_roots) else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT artifact_digest, environment_digest, replay_version, toolchain_hash, module_name, replay_mac
+             FROM kernel_replayed_oleans_auth
+             ORDER BY artifact_digest ASC, environment_digest ASC, replay_version ASC, toolchain_hash ASC, module_name ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (art_dig, env_dig, rv_i64, tc_hash, mod_name, stored_mac) = row?;
+            let Ok(replay_version) = u32::try_from(rv_i64) else {
+                continue;
+            };
+            if art_dig.is_empty() || env_dig.is_empty() || replay_version == 0 || tc_hash.is_empty()
+            {
+                continue;
+            }
+            let expected_mac =
+                compute_kernel_replay_mac(&key, &art_dig, &env_dig, replay_version, &tc_hash);
+            let mac_ok = stored_mac.len() == expected_mac.len()
+                && stored_mac
+                    .as_bytes()
+                    .iter()
+                    .zip(expected_mac.as_bytes().iter())
+                    .fold(0u8, |acc, (&a, &b)| acc | (a ^ b))
+                    == 0;
+            if mac_ok {
+                out.push(crate::pack::AttestedOleanReplay {
+                    artifact_digest: art_dig,
+                    environment_digest: env_dig,
+                    replay_version,
+                    toolchain_hash: tc_hash,
+                    module_name: mod_name,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn import_attested_replayed_oleans(
+        &mut self,
+        replayed_oleans: &[crate::pack::AttestedOleanReplay],
+        trust_domain: &str,
+        allowed_toolchain_hashes: &std::collections::HashSet<String>,
+        disallowed_roots: &[PathBuf],
+    ) -> Result<usize> {
+        if trust_domain != "trusted"
+            || replayed_oleans.is_empty()
+            || allowed_toolchain_hashes.is_empty()
+            || !self.is_store_outside_disallowed_roots(disallowed_roots)
+        {
+            return Ok(0);
+        }
+        let eligible: Vec<&crate::pack::AttestedOleanReplay> = replayed_oleans
+            .iter()
+            .filter(|r| {
+                !r.artifact_digest.is_empty()
+                    && !r.environment_digest.is_empty()
+                    && r.replay_version == crate::zygote::ZYGOTE_REPLAY_VERSION
+                    && !r.toolchain_hash.is_empty()
+                    && allowed_toolchain_hashes.contains(&r.toolchain_hash)
+            })
+            .collect();
+        if eligible.is_empty() {
+            return Ok(0);
+        }
+        let Some(key) = get_or_create_verified_replay_hmac_key(&self.root, disallowed_roots) else {
+            return Ok(0);
+        };
+        let now = now_unix();
+        let tx = self.conn.transaction()?;
+        let mut installed = 0usize;
+        {
+            let mut ins = tx.prepare_cached(
+                "INSERT INTO kernel_replayed_oleans_auth (
+                    artifact_digest, environment_digest, replay_version, toolchain_hash, module_name, replay_mac, verified_at
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(artifact_digest, environment_digest, replay_version, toolchain_hash) DO UPDATE SET
+                    module_name = excluded.module_name,
+                    replay_mac = excluded.replay_mac,
+                    verified_at = excluded.verified_at",
+            )?;
+            for r in eligible {
+                let replay_mac = compute_kernel_replay_mac(
+                    &key,
+                    &r.artifact_digest,
+                    &r.environment_digest,
+                    r.replay_version,
+                    &r.toolchain_hash,
+                );
+                ins.execute(params![
+                    r.artifact_digest,
+                    r.environment_digest,
+                    i64::from(r.replay_version),
+                    r.toolchain_hash,
+                    r.module_name,
+                    replay_mac,
+                    now
+                ])?;
+                installed += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(installed)
+    }
+
     /// Single-transaction publication of an ingested worktree build action:
     /// atomically registers `reg_blobs`, publishes `action_key` + `outputs`, records
     /// `worktrees` + `worktree_installations`, optionally caches `lake_env`, and optionally
@@ -7449,6 +7575,7 @@ mod tests {
             }],
             ed25519_pubkey: None,
             ed25519_signature: None,
+            replayed_oleans: Vec::new(),
         };
         DURABILITY_HOOK.with(|h| {
             *h.borrow_mut() = Some(std::sync::Arc::new(|f| {
