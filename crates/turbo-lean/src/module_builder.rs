@@ -1304,21 +1304,34 @@ fn find_project_olean_header_with<F>(
 where
     F: FnMut(&str) -> bool,
 {
-    let mut lib_dirs: Vec<PathBuf> = vec![project_dir.join(".lake/build/lib/lean")];
-    let pkgs_dir = project_dir.join(".lake/packages");
-    if let Ok(entries) = fs::read_dir(&pkgs_dir) {
-        let mut pkg_paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-        pkg_paths.sort();
-        for p in pkg_paths {
-            if fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir()) {
-                lib_dirs.push(p.join(".lake/build/lib/lean"));
+    let is_real_rel_dir = |base: &Path, rel: &[&str]| -> Option<PathBuf> {
+        let mut cur = base.to_path_buf();
+        for seg in rel {
+            cur.push(seg);
+            if !fs::symlink_metadata(&cur).is_ok_and(|m| m.is_dir()) {
+                return None;
+            }
+        }
+        Some(cur)
+    };
+    let mut lib_dirs: Vec<PathBuf> = Vec::new();
+    if let Some(root_lib) = is_real_rel_dir(project_dir, &[".lake", "build", "lib", "lean"]) {
+        lib_dirs.push(root_lib);
+    }
+    if let Some(pkgs_dir) = is_real_rel_dir(project_dir, &[".lake", "packages"]) {
+        if let Ok(entries) = fs::read_dir(&pkgs_dir) {
+            let mut pkg_paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+            pkg_paths.sort();
+            for p in pkg_paths {
+                if fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir()) {
+                    if let Some(dep_lib) = is_real_rel_dir(&p, &[".lake", "build", "lib", "lean"]) {
+                        lib_dirs.push(dep_lib);
+                    }
+                }
             }
         }
     }
     for dir in lib_dirs {
-        if !fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
-            continue;
-        }
         for entry in walkdir::WalkDir::new(&dir)
             .follow_links(false)
             .sort_by_file_name()
@@ -7431,7 +7444,7 @@ pub(crate) fn is_verified_toolchain_olean_file(
     lean_githash: Option<&str>,
     olean_path: &Path,
 ) -> bool {
-    if toolchain_lib_lean.as_os_str().is_empty() || !olean_path.is_file() {
+    if toolchain_lib_lean.as_os_str().is_empty() {
         return false;
     }
     let Some(expected_gh) = lean_githash
@@ -7443,20 +7456,41 @@ pub(crate) fn is_verified_toolchain_olean_file(
     let Ok(canon_tc) = toolchain_lib_lean.canonicalize() else {
         return false;
     };
-    let Ok(canon_olean) = olean_path.canonicalize() else {
+    let rel_from_tc = if let Ok(rel) = olean_path.strip_prefix(toolchain_lib_lean) {
+        rel.to_path_buf()
+    } else if let Ok(rel) = olean_path.strip_prefix(&canon_tc) {
+        rel.to_path_buf()
+    } else {
         return false;
     };
-    if !canon_olean.starts_with(&canon_tc) {
+    if rel_from_tc.as_os_str().is_empty() {
         return false;
     }
-    let Ok(mut f) = fs::File::open(&canon_olean) else {
+    let mut cur = canon_tc.clone();
+    let comps: Vec<_> = rel_from_tc.components().collect();
+    for (idx, comp) in comps.iter().enumerate() {
+        let std::path::Component::Normal(seg) = comp else {
+            return false;
+        };
+        cur.push(seg);
+        let Ok(meta) = fs::symlink_metadata(&cur) else {
+            return false;
+        };
+        if meta.file_type().is_symlink() {
+            return false;
+        }
+        if idx + 1 == comps.len() {
+            if !meta.is_file() {
+                return false;
+            }
+        } else if !meta.is_dir() {
+            return false;
+        }
+    }
+    let Some((_, hdr_gh)) = read_olean_header_version_and_githash(&cur) else {
         return false;
     };
-    let mut hdr = [0u8; 80];
-    if std::io::Read::read_exact(&mut f, &mut hdr).is_err() {
-        return false;
-    }
-    &hdr[0..5] == b"olean" && hdr[5] == 2 && &hdr[40..80] == expected_gh.as_bytes()
+    hdr_gh.eq_ignore_ascii_case(expected_gh)
 }
 
 pub(crate) fn is_builtin_toolchain_prefix_name(mod_name: &str) -> bool {
@@ -31013,6 +31047,39 @@ globs = ["Down.+"]
             rebuilt_gh, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
             "turbo-lean build must rebuild skewed .olean on toolchain upgrade instead of failing closed"
         );
+
+        #[cfg(unix)]
+        {
+            let fake_tc = dir.join("fake_tc_lib_lean");
+            fs::create_dir_all(fake_tc.join("Init"))?;
+            fs::copy(&base_olean, fake_tc.join("RealBase.olean"))?;
+            assert!(is_verified_toolchain_olean_file(
+                &fake_tc,
+                Some(&rebuilt_gh),
+                &fake_tc.join("RealBase.olean")
+            ));
+            std::os::unix::fs::symlink(&base_olean, fake_tc.join("Init/SymlinkLeaf.olean"))?;
+            assert!(
+                !is_verified_toolchain_olean_file(
+                    &fake_tc,
+                    Some(&rebuilt_gh),
+                    &fake_tc.join("Init/SymlinkLeaf.olean")
+                ),
+                "is_verified_toolchain_olean_file must reject symlinked .olean leaf"
+            );
+            std::os::unix::fs::symlink(
+                proj.join(".lake/build/lib/lean/W8"),
+                fake_tc.join("SymlinkDir"),
+            )?;
+            assert!(
+                !is_verified_toolchain_olean_file(
+                    &fake_tc,
+                    Some(&rebuilt_gh),
+                    &fake_tc.join("SymlinkDir/Base.olean")
+                ),
+                "is_verified_toolchain_olean_file must reject symlinked directory inside toolchain_lib_lean"
+            );
+        }
 
         let _ = fs::remove_dir_all(&dir);
         Ok(())

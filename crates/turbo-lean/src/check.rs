@@ -2120,6 +2120,45 @@ fn run_check_command_inner(
                 true,
                 None,
             )?;
+            let built_count = build_rep.modules_compiled
+                + build_rep.modules_cached
+                + build_rep.modules_up_to_date_reused;
+            if build_rep.modules_total == 0 || built_count != build_rep.modules_total {
+                anyhow::bail!(
+                    "`--emit-olean` target `{}` resolved an incomplete module build ({}/{} modules materialized)",
+                    target_spec,
+                    built_count,
+                    build_rep.modules_total
+                );
+            }
+            if !fs::symlink_metadata(&olean_path).is_ok_and(|m| m.is_file()) {
+                anyhow::bail!(
+                    "`--emit-olean` failed to materialize regular `.olean` artifact at `{}`",
+                    olean_path.display()
+                );
+            }
+            let (_, emitted_gh) =
+                crate::module_builder::read_olean_header_version_and_githash(&olean_path)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "`--emit-olean` emitted invalid `.olean` header at `{}`",
+                            olean_path.display()
+                        )
+                    })?;
+            if let Ok(cfg) = crate::module_builder::resolve_project_config(&canon_dir) {
+                let exp_gh = cfg.lean_githash.trim();
+                if !exp_gh.is_empty()
+                    && exp_gh != "lean-not-installed"
+                    && !emitted_gh.eq_ignore_ascii_case(exp_gh)
+                {
+                    anyhow::bail!(
+                        "`--emit-olean` emitted `.olean` githash `{}` != active compiler `{}` at `{}`",
+                        emitted_gh,
+                        exp_gh,
+                        olean_path.display()
+                    );
+                }
+            }
             let total_ms = t0.elapsed().as_millis() as i64;
             if let Some(obj) = out_json.as_object_mut() {
                 obj.insert("olean_emitted".to_string(), serde_json::json!(true));

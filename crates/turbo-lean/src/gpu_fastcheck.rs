@@ -1684,17 +1684,18 @@ pub fn execute_transpiled_cuda_kernel(
                 }
             }
         }
-        for orb_elan in [
-            "/var/lib/orb-node/.elan",
-            "/var/lib/orb-node/caches/elan",
-            "/var/lib/orb-node/work/caches/elan",
-            "/opt/orb/elan",
-            "/var/lib/sandboxed-node/.elan",
-            "/var/lib/sandboxed-node/caches/elan",
-        ] {
+        for orb_elan in crate::module_builder::FLEET_SYSTEM_ELAN_ROOTS {
             let p = Path::new(orb_elan).join("toolchains/leanprover--lean4---v4.35.0/bin/clang");
             if p.exists() {
                 candidates.push((p, &["-x", "c++", "-O3", "-std=c++17"]));
+            }
+            if let Ok(entries) = fs::read_dir(Path::new(orb_elan).join("toolchains")) {
+                for ent in entries.flatten() {
+                    let c = ent.path().join("bin/clang");
+                    if c.is_file() {
+                        candidates.push((c, &["-x", "c++", "-O3", "-std=c++17"]));
+                    }
+                }
             }
         }
         candidates.extend([
