@@ -222,6 +222,12 @@ def kernelOf (name : String) (nIn : Nat) (env : PEnv) (body : List PTXStmt) : PT
 
 def baseEnv (extraRd : Nat) : PEnv := { nextRd := 7 + extraRd, nextR := 3, nextP := 1 }
 
+def customVarOf (idxVar : Nat) (inVars : List VarId) (id : Nat) : Option PReg :=
+  if id == idxVar then some (.rd 2)
+  else match inVars.idxOf? id with
+    | some k => some (.rd (7 + k))
+    | none => none
+
 def lowerKind (name : String) : ParallelKernelKind → PTXKernel
   | .mapScaleAdd scale bias =>
     let e0 := baseEnv 1
@@ -267,12 +273,7 @@ def lowerKind (name : String) : ParallelKernelKind → PTXKernel
     kernelOf name 1 { nextRd := 13, nextR := 3, nextP := 3 } body
   | .customScalar idxVar inVars bodyExpr =>
     let loads := (List.range inVars.length).foldl (fun acc k => acc ++ loadIn k s!"%rd{7 + k}") []
-    let varOf (id : Nat) : Option PReg :=
-      if id == idxVar then some (.rd 2)
-      else match inVars.idxOf? id with
-        | some k => some (.rd (7 + k))
-        | none => none
-    let (el, res, env) := lowerScalar varOf (baseEnv inVars.length) bodyExpr
+    let (el, res, env) := lowerScalar (customVarOf idxVar inVars) (baseEnv inVars.length) bodyExpr
     let body := gidSetup s!"$L_done_{name}" ++ loads ++ el ++
       [ins (.stGlobal .u64 (.regOffset "%rd6" 0) (iOp res))]
     kernelOf name inVars.length env body
@@ -282,5 +283,162 @@ def lowerToPTX (name : String) (k : ParallelKernelKind) : PTXModule where
 
 def ppLowered (name : String) (k : ParallelKernelKind) : String :=
   ppPTXModule (lowerToPTX name k)
+
+def valOfSort : Bool → LeanNative.Semantics.Val → Option (BitVec 64)
+  | false, .u64 x => some x.toBitVec
+  | true, .bool b => some (if b then 1#64 else 0#64)
+  | _, _ => none
+
+def inferBinOpU64 : BinOp → Option Bool
+  | .add => some false | .sub => some false | .mul => some false
+  | .div => some false | .mod => some false | .bitAnd => some false
+  | .bitOr => some false | .bitXor => some false | .shl => some false
+  | .shr => some false | .sar => some false | .eor3 => some false
+  | .eq => some true | .lt => some true | .le => some true
+  | .addChecked256 => none | .subChecked256 => none | .mulChecked256 => none
+  | .clmul64 => none | .clmul64Hi => none | .gf2Affine => none
+
+def inferBinOpBool : BinOp → Option Bool
+  | .eq => some true
+  | .bitAnd => none | .bitOr => none
+  | .add => none | .sub => none | .mul => none | .div => none | .mod => none
+  | .bitXor => none | .shl => none | .shr => none | .sar => none
+  | .lt => none | .le => none
+  | .addChecked256 => none | .subChecked256 => none | .mulChecked256 => none
+  | .clmul64 => none | .clmul64Hi => none | .gf2Affine => none | .eor3 => none
+
+def inferUnaryOpU64 : UnaryOp → Option Bool
+  | .not => some false | .neg => some false | .clz256 => none
+
+def inferScalarSort (boundVars : List Nat) : ScalarExpr → Option Bool
+  | .constU64 _ => some false
+  | .constBool _ => some true
+  | .var id => if id ∈ boundVars then some false else none
+  | .binOp op l r =>
+    match inferScalarSort boundVars l with
+    | some sl =>
+      match inferScalarSort boundVars r with
+      | some sr =>
+        if !sl && !sr then inferBinOpU64 op
+        else if sl && sr then inferBinOpBool op
+        else none
+      | none => none
+    | none => none
+  | .unaryOp op a =>
+    match inferScalarSort boundVars a with
+    | some sa => if !sa then inferUnaryOpU64 op else none
+    | none => none
+  | .select c t f =>
+    match inferScalarSort boundVars c with
+    | some _ =>
+      match inferScalarSort boundVars t with
+      | some st =>
+        match inferScalarSort boundVars f with
+        | some sf => if st == sf then some st else none
+        | none => none
+      | none => none
+    | none => none
+  | .fma a b c =>
+    match inferScalarSort boundVars a with
+    | some sa =>
+      match inferScalarSort boundVars b with
+      | some sb =>
+        match inferScalarSort boundVars c with
+        | some sc => if !sa && !sb && !sc then some false else none
+        | none => none
+      | none => none
+    | none => none
+
+def kernelArity : ParallelKernelKind → Nat
+  | .mapScaleAdd _ _ | .stencil1D3Pt _ _ _ => 1
+  | .zipAdd | .zipMul | .dotProduct | .saxpy _ => 2
+  | .customScalar _ inVars _ => inVars.length
+
+def wfPTXKernel : ParallelKernelKind → Bool
+  | .mapScaleAdd _ _ | .zipAdd | .zipMul | .dotProduct | .saxpy _ | .stencil1D3Pt _ _ _ => true
+  | .customScalar idxVar inVars body =>
+    decide (inVars.Nodup ∧ idxVar ∉ inVars) && (inferScalarSort (idxVar :: inVars) body).isSome
+
+def packInputWordLists (env : LeanNative.Semantics.VarEnv)
+    (st : LeanNative.Semantics.HeapState) (len : Nat) :
+    List VarId → Option (List (List (BitVec 64)))
+  | [] => some []
+  | v :: rest =>
+    match env v, packInputWordLists env st len rest with
+    | some (.sarrayId bid), some tail | some (.rawPtrId bid), some tail =>
+      match st.findBuffer bid with
+      | some buf =>
+        if len ≤ buf.data.size then
+          let words := (List.range len).map fun i => (buf.data[i]?.getD 0).toBitVec
+          some (words :: tail)
+        else none
+      | none => none
+    | _, _ => none
+
+def concatPTXMems : List ByteMemory → ByteMemory
+  | [] => { bytes := #[] }
+  | m :: ms => { bytes := m.bytes ++ (concatPTXMems ms).bytes }
+
+def mkPTXGlobalMem (inWords : List (List (BitVec 64))) (nIn len : Nat) : ByteMemory :=
+  concatPTXMems (((List.range nIn).map fun j => ByteMemory.ofU64Words (inWords[j]?.getD [])) ++
+    [ByteMemory.zeros (len * 8)])
+
+def mkPTXParamMem (nIn len : Nat) : ParamMemory :=
+  { params := ("param_out", BitVec.ofNat 64 (nIn * len * 8)) ::
+      (List.range nIn).map (fun j => (s!"param_in{j}", BitVec.ofNat 64 (j * len * 8))) ++
+      [("param_n", BitVec.ofNat 64 len)] }
+
+def maxMidStepsForKind : ParallelKernelKind → Nat
+  | .mapScaleAdd _ _ => 5
+  | .zipAdd | .zipMul | .dotProduct | .saxpy _ => 9
+  | .stencil1D3Pt _ _ _ => 15
+  | .customScalar idxVar inVars bodyExpr =>
+    4 * inVars.length +
+      (lowerScalar (customVarOf idxVar inVars) (baseEnv inVars.length) bodyExpr).1.length
+
+def ctaStepsForKind (blockSize : Nat) (k : ParallelKernelKind) : Nat :=
+  blockSize * (16 + maxMidStepsForKind k) + 1
+
+/-- `M7` mutant of `lowerScalar`: swaps `.sub` operands `lo, ro` → `ro, lo`
+    (`sub.u64 dst, rReg, lReg;`, matching `MLIRGPU.lean` mutant `M7`). -/
+def ptxMutantM7Scalar (varOf : Nat → Option PReg) (e0 : PEnv) :
+    ScalarExpr → List PTXStmt × PReg × PEnv
+  | .binOp .sub lhs rhs =>
+    let (ll, lr, e1) := lowerScalar varOf e0 lhs
+    let (rl, rr, e2) := lowerScalar varOf e1 rhs
+    let (d, e3) := freshRd e2
+    (ll ++ rl ++ [ins (.sub .u64 d.name (iOp rr) (iOp lr))], d, e3)
+  | e => lowerScalar varOf e0 e
+
+def ptxMutantM7Kernel (name : String) (idxVar : Nat) (inVars : List VarId)
+    (bodyExpr : ScalarExpr) : PTXKernel :=
+  let loads := (List.range inVars.length).foldl (fun acc k => acc ++ loadIn k s!"%rd{7 + k}") []
+  let (el, res, env) := ptxMutantM7Scalar (customVarOf idxVar inVars) (baseEnv inVars.length) bodyExpr
+  let body := gidSetup s!"$L_done_{name}" ++ loads ++ el ++
+    [ins (.stGlobal .u64 (.regOffset "%rd6" 0) (iOp res))]
+  kernelOf name inVars.length env body
+
+/-- `M8` mutant of `lowerScalar`: weakens `.lt` predicate from `setp.lt.u64` to `setp.le.u64`
+    (matching `MLIRGPU.lean` mutant `M8`). -/
+def ptxMutantM8Scalar (varOf : Nat → Option PReg) (e0 : PEnv) :
+    ScalarExpr → List PTXStmt × PReg × PEnv
+  | .binOp .lt lhs rhs =>
+    let (ll, lr, e1) := lowerScalar varOf e0 lhs
+    let (rl, rr, e2) := lowerScalar varOf e1 rhs
+    let (d, e3) := freshRd e2
+    let (p, e4) := freshP e3
+    (ll ++ rl ++ [
+      ins (.setp .le .u64 p (iOp lr) (iOp rr)),
+      ins (.selp .u64 d.name (i64 1) (i64 0) p)
+    ], d, e4)
+  | e => lowerScalar varOf e0 e
+
+def ptxMutantM8Kernel (name : String) (idxVar : Nat) (inVars : List VarId)
+    (bodyExpr : ScalarExpr) : PTXKernel :=
+  let loads := (List.range inVars.length).foldl (fun acc k => acc ++ loadIn k s!"%rd{7 + k}") []
+  let (el, res, env) := ptxMutantM8Scalar (customVarOf idxVar inVars) (baseEnv inVars.length) bodyExpr
+  let body := gidSetup s!"$L_done_{name}" ++ loads ++ el ++
+    [ins (.stGlobal .u64 (.regOffset "%rd6" 0) (iOp res))]
+  kernelOf name inVars.length env body
 
 end LeanNative.Backend.PTXLower

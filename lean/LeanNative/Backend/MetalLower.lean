@@ -242,4 +242,42 @@ def groupStepsForKind (groupSize : Nat) (k : ParallelKernelKind) : Nat :=
     | _ => 4
   groupSize * perThread + 2
 
+/-- `M9` mutant of `lowerKind` for `.customScalar`: replaces the zero-divisor guard
+`((rs == 0UL) ? 0UL : (ls / rs))` on `.div` with unguarded `ls / rs`. -/
+def metalMutantM9Scalar (idxName : String) (idxVar : Nat) : ScalarExpr → MSLExpr
+  | .binOp .div l r =>
+    .div (lowerScalar idxName idxVar l) (lowerScalar idxName idxVar r)
+  | e => lowerScalar idxName idxVar e
+
+def metalMutantM9Kernel (name : String) (idxVar : Nat) (inVars : List VarId) (body : ScalarExpr) :
+    MSLKernelDecl :=
+  let loads := (List.range inVars.length).map fun k =>
+    let id := inVars[k]?.getD 0
+    .varDecl .ulong s!"v{id}" (elem s!"in{k}")
+  { name := name
+    params := (List.range inVars.length).map (fun i => bufParam s!"in{i}" i true) ++
+      [bufParam "out" inVars.length false, lenParam (inVars.length + 1), gidParam]
+    body := guarded
+      ([.varDecl .ulong "gid64" (.cast .ulong (.var "gid"))] ++ loads ++
+        [storeOut (metalMutantM9Scalar "gid64" idxVar body)]) }
+
+/-- `M10` mutant of `lowerKind` for `.customScalar`: narrows the 64-bit `.shl` mask
+from `& 63UL` (`m63`) to `& 31UL`. -/
+def metalMutantM10Scalar (idxName : String) (idxVar : Nat) : ScalarExpr → MSLExpr
+  | .binOp .shl l r =>
+    .shl (lowerScalar idxName idxVar l) (.bitAnd (lowerScalar idxName idxVar r) (u 31))
+  | e => lowerScalar idxName idxVar e
+
+def metalMutantM10Kernel (name : String) (idxVar : Nat) (inVars : List VarId) (body : ScalarExpr) :
+    MSLKernelDecl :=
+  let loads := (List.range inVars.length).map fun k =>
+    let id := inVars[k]?.getD 0
+    .varDecl .ulong s!"v{id}" (elem s!"in{k}")
+  { name := name
+    params := (List.range inVars.length).map (fun i => bufParam s!"in{i}" i true) ++
+      [bufParam "out" inVars.length false, lenParam (inVars.length + 1), gidParam]
+    body := guarded
+      ([.varDecl .ulong "gid64" (.cast .ulong (.var "gid"))] ++ loads ++
+        [storeOut (metalMutantM10Scalar "gid64" idxVar body)]) }
+
 end LeanNative.Backend.MetalLower
