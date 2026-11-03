@@ -1151,102 +1151,254 @@ pub fn parse_olean_binary_imports(bytes: &[u8]) -> Option<(Vec<ParsedImport>, bo
 }
 
 fn is_compiler_private_proof_helper_name(name: &str) -> bool {
-    name.contains("._proof_")
+    name.starts_with("_private.") && name.contains("._proof_")
 }
+
+const OLEAN_COMPACT_MAX_DEPTH: usize = 4096;
+const OLEAN_COMPACT_MAX_VISITED: usize = 2_097_152;
 
 fn hash_olean_compact_graph(
     bytes: &[u8],
     base_addr: u64,
-    ptr: u64,
+    root_ptr: u64,
     memo: &mut HashMap<u64, [u8; 32]>,
-    depth: usize,
 ) -> Option<[u8; 32]> {
-    if depth > 4096 {
-        return None;
+    enum WorkFrame {
+        Enter {
+            ptr: u64,
+            depth: usize,
+        },
+        FinishCtor {
+            ptr: u64,
+            m_tag: u8,
+            m_other: u8,
+            children: Vec<u64>,
+            scalars_start: usize,
+            obj_end: usize,
+        },
+        FinishArray {
+            ptr: u64,
+            m_other: u8,
+            elems: Vec<u64>,
+        },
+        FinishThunk {
+            ptr: u64,
+            m_other: u8,
+            val_ptr: u64,
+        },
     }
-    if (ptr & 1) == 1 || ptr == 0 {
+
+    let scalar_digest = |p: u64| -> [u8; 32] {
         let mut h = blake3::Hasher::new();
         h.update(b"scalar:");
-        h.update(&ptr.to_le_bytes());
-        return Some(*h.finalize().as_bytes());
+        h.update(&p.to_le_bytes());
+        *h.finalize().as_bytes()
+    };
+    let lookup_or_scalar = |p: u64, memo: &HashMap<u64, [u8; 32]>| -> Option<[u8; 32]> {
+        if (p & 1) == 1 || p == 0 {
+            Some(scalar_digest(p))
+        } else {
+            memo.get(&p).copied()
+        }
+    };
+
+    if let Some(hit) = lookup_or_scalar(root_ptr, memo) {
+        return Some(hit);
     }
-    if let Some(hit) = memo.get(&ptr) {
-        return Some(*hit);
+
+    let mut stack: Vec<WorkFrame> = Vec::with_capacity(64);
+    let mut in_progress: HashSet<u64> = HashSet::new();
+    let mut visited_nodes: usize = 0;
+    stack.push(WorkFrame::Enter {
+        ptr: root_ptr,
+        depth: 0,
+    });
+
+    while let Some(frame) = stack.pop() {
+        match frame {
+            WorkFrame::Enter { ptr, depth } => {
+                if depth > OLEAN_COMPACT_MAX_DEPTH {
+                    return None;
+                }
+                if (ptr & 1) == 1 || ptr == 0 || memo.contains_key(&ptr) {
+                    continue;
+                }
+                if ptr < base_addr || !in_progress.insert(ptr) {
+                    return None;
+                }
+                visited_nodes = visited_nodes.checked_add(1)?;
+                if visited_nodes > OLEAN_COMPACT_MAX_VISITED {
+                    return None;
+                }
+                let off = usize::try_from(ptr - base_addr).ok()?;
+                let m_csz = u16::from_le_bytes(
+                    bytes
+                        .get(off.checked_add(4)?..off.checked_add(6)?)?
+                        .try_into()
+                        .ok()?,
+                ) as usize;
+                let m_other = *bytes.get(off.checked_add(6)?)?;
+                let m_tag = *bytes.get(off.checked_add(7)?)?;
+                match m_tag {
+                    0..=244 => {
+                        let num_objs = m_other as usize;
+                        let fields_start = off.checked_add(8)?;
+                        let scalars_start = fields_start.checked_add(num_objs.checked_mul(8)?)?;
+                        let obj_end = off.checked_add(m_csz.max(8 + num_objs * 8))?;
+                        if obj_end > bytes.len() || scalars_start > obj_end {
+                            return None;
+                        }
+                        let mut children = Vec::with_capacity(num_objs);
+                        for i in 0..num_objs {
+                            children.push(read_le_u64_at(bytes, fields_start + i * 8)?);
+                        }
+                        stack.push(WorkFrame::FinishCtor {
+                            ptr,
+                            m_tag,
+                            m_other,
+                            children: children.clone(),
+                            scalars_start,
+                            obj_end,
+                        });
+                        for &child_ptr in children.iter().rev() {
+                            if (child_ptr & 1) == 0
+                                && child_ptr != 0
+                                && !memo.contains_key(&child_ptr)
+                            {
+                                stack.push(WorkFrame::Enter {
+                                    ptr: child_ptr,
+                                    depth: depth + 1,
+                                });
+                            }
+                        }
+                    }
+                    246 => {
+                        let sz =
+                            usize::try_from(read_le_u64_at(bytes, off.checked_add(8)?)?).ok()?;
+                        if sz > 1_048_576 {
+                            return None;
+                        }
+                        let elems_start = off.checked_add(24)?;
+                        let elems_end = elems_start.checked_add(sz.checked_mul(8)?)?;
+                        if elems_end > bytes.len() {
+                            return None;
+                        }
+                        let mut elems = Vec::with_capacity(sz);
+                        for i in 0..sz {
+                            elems.push(read_le_u64_at(bytes, elems_start + i * 8)?);
+                        }
+                        stack.push(WorkFrame::FinishArray {
+                            ptr,
+                            m_other,
+                            elems: elems.clone(),
+                        });
+                        for &elem_ptr in elems.iter().rev() {
+                            if (elem_ptr & 1) == 0 && elem_ptr != 0 && !memo.contains_key(&elem_ptr)
+                            {
+                                stack.push(WorkFrame::Enter {
+                                    ptr: elem_ptr,
+                                    depth: depth + 1,
+                                });
+                            }
+                        }
+                    }
+                    248 => {
+                        if !matches!(m_other, 1 | 2 | 4 | 8) {
+                            return None;
+                        }
+                        let sz =
+                            usize::try_from(read_le_u64_at(bytes, off.checked_add(8)?)?).ok()?;
+                        let byte_len = sz.checked_mul(m_other as usize)?;
+                        let data_start = off.checked_add(24)?;
+                        let data_end = data_start.checked_add(byte_len)?;
+                        let mut h = blake3::Hasher::new();
+                        h.update(&[248, m_other]);
+                        h.update(&(sz as u64).to_le_bytes());
+                        h.update(bytes.get(data_start..data_end)?);
+                        in_progress.remove(&ptr);
+                        memo.insert(ptr, *h.finalize().as_bytes());
+                    }
+                    249 => {
+                        let sz =
+                            usize::try_from(read_le_u64_at(bytes, off.checked_add(8)?)?).ok()?;
+                        let len =
+                            usize::try_from(read_le_u64_at(bytes, off.checked_add(24)?)?).ok()?;
+                        let data_start = off.checked_add(32)?;
+                        let data_end = data_start.checked_add(sz)?;
+                        let mut h = blake3::Hasher::new();
+                        h.update(&[249, m_other]);
+                        h.update(&(sz as u64).to_le_bytes());
+                        h.update(&(len as u64).to_le_bytes());
+                        h.update(bytes.get(data_start..data_end)?);
+                        in_progress.remove(&ptr);
+                        memo.insert(ptr, *h.finalize().as_bytes());
+                    }
+                    250 => {
+                        return None;
+                    }
+                    251 => {
+                        let val_ptr = read_le_u64_at(bytes, off.checked_add(8)?)?;
+                        stack.push(WorkFrame::FinishThunk {
+                            ptr,
+                            m_other,
+                            val_ptr,
+                        });
+                        if (val_ptr & 1) == 0 && val_ptr != 0 && !memo.contains_key(&val_ptr) {
+                            stack.push(WorkFrame::Enter {
+                                ptr: val_ptr,
+                                depth: depth + 1,
+                            });
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            WorkFrame::FinishCtor {
+                ptr,
+                m_tag,
+                m_other,
+                children,
+                scalars_start,
+                obj_end,
+            } => {
+                let mut h = blake3::Hasher::new();
+                h.update(&[m_tag, m_other]);
+                for child_ptr in children {
+                    h.update(&lookup_or_scalar(child_ptr, memo)?);
+                }
+                h.update(bytes.get(scalars_start..obj_end)?);
+                in_progress.remove(&ptr);
+                memo.insert(ptr, *h.finalize().as_bytes());
+            }
+            WorkFrame::FinishArray {
+                ptr,
+                m_other,
+                elems,
+            } => {
+                let mut h = blake3::Hasher::new();
+                h.update(&[246, m_other]);
+                h.update(&(elems.len() as u64).to_le_bytes());
+                for elem_ptr in elems {
+                    h.update(&lookup_or_scalar(elem_ptr, memo)?);
+                }
+                in_progress.remove(&ptr);
+                memo.insert(ptr, *h.finalize().as_bytes());
+            }
+            WorkFrame::FinishThunk {
+                ptr,
+                m_other,
+                val_ptr,
+            } => {
+                let mut h = blake3::Hasher::new();
+                h.update(&[251, m_other]);
+                h.update(&lookup_or_scalar(val_ptr, memo)?);
+                in_progress.remove(&ptr);
+                memo.insert(ptr, *h.finalize().as_bytes());
+            }
+        }
     }
-    if ptr < base_addr {
-        return None;
-    }
-    let off = usize::try_from(ptr - base_addr).ok()?;
-    let m_csz = u16::from_le_bytes(
-        bytes
-            .get(off.checked_add(4)?..off.checked_add(6)?)?
-            .try_into()
-            .ok()?,
-    ) as usize;
-    let m_other = *bytes.get(off.checked_add(6)?)?;
-    let m_tag = *bytes.get(off.checked_add(7)?)?;
-    let mut h = blake3::Hasher::new();
-    h.update(&[m_tag, m_other]);
-    match m_tag {
-        0..=244 => {
-            let num_objs = m_other as usize;
-            let fields_start = off.checked_add(8)?;
-            let scalars_start = fields_start.checked_add(num_objs.checked_mul(8)?)?;
-            let obj_end = off.checked_add(m_csz.max(8 + num_objs * 8))?;
-            if obj_end > bytes.len() || scalars_start > obj_end {
-                return None;
-            }
-            for i in 0..num_objs {
-                let child_ptr = read_le_u64_at(bytes, fields_start + i * 8)?;
-                let child_dig =
-                    hash_olean_compact_graph(bytes, base_addr, child_ptr, memo, depth + 1)?;
-                h.update(&child_dig);
-            }
-            h.update(bytes.get(scalars_start..obj_end)?);
-        }
-        246 => {
-            let sz = usize::try_from(read_le_u64_at(bytes, off.checked_add(8)?)?).ok()?;
-            if sz > 1_048_576 {
-                return None;
-            }
-            h.update(&(sz as u64).to_le_bytes());
-            let elems_start = off.checked_add(24)?;
-            for i in 0..sz {
-                let elem_ptr = read_le_u64_at(bytes, elems_start.checked_add(i.checked_mul(8)?)?)?;
-                let elem_dig =
-                    hash_olean_compact_graph(bytes, base_addr, elem_ptr, memo, depth + 1)?;
-                h.update(&elem_dig);
-            }
-        }
-        248 => {
-            let sz = usize::try_from(read_le_u64_at(bytes, off.checked_add(8)?)?).ok()?;
-            let data_start = off.checked_add(24)?;
-            let data_end = data_start.checked_add(sz)?;
-            h.update(&(sz as u64).to_le_bytes());
-            h.update(bytes.get(data_start..data_end)?);
-        }
-        249 => {
-            let sz = usize::try_from(read_le_u64_at(bytes, off.checked_add(8)?)?).ok()?;
-            let len = usize::try_from(read_le_u64_at(bytes, off.checked_add(24)?)?).ok()?;
-            let data_start = off.checked_add(32)?;
-            let data_end = data_start.checked_add(sz)?;
-            h.update(&(sz as u64).to_le_bytes());
-            h.update(&(len as u64).to_le_bytes());
-            h.update(bytes.get(data_start..data_end)?);
-        }
-        250 => {
-            return None;
-        }
-        251 => {
-            let val_ptr = read_le_u64_at(bytes, off.checked_add(8)?)?;
-            let val_dig = hash_olean_compact_graph(bytes, base_addr, val_ptr, memo, depth + 1)?;
-            h.update(&val_dig);
-        }
-        _ => return None,
-    }
-    let out = *h.finalize().as_bytes();
-    memo.insert(ptr, out);
-    Some(out)
+
+    lookup_or_scalar(root_ptr, memo)
 }
 
 /// Compute a deterministic theorem-interface digest from a Lean v4 `.olean` binary:
@@ -1317,7 +1469,6 @@ pub fn compute_olean_theorem_interface_digest(bytes: &[u8]) -> Option<String> {
         base_addr,
         imports_ptr,
         &mut memo,
-        0,
     )?);
 
     let mut const_records: Vec<(String, u8, [u8; 32])> = Vec::new();
@@ -1359,14 +1510,14 @@ pub fn compute_olean_theorem_interface_digest(bytes: &[u8]) -> Option<String> {
             let mut ch = blake3::Hasher::new();
             ch.update(b"thm:");
             ch.update(&hash_olean_compact_graph(
-                bytes, base_addr, cval_ptr, &mut memo, 0,
+                bytes, base_addr, cval_ptr, &mut memo,
             )?);
             ch.update(&hash_olean_compact_graph(
-                bytes, base_addr, all_ptr, &mut memo, 0,
+                bytes, base_addr, all_ptr, &mut memo,
             )?);
             const_records.push((cname, c_tag, *ch.finalize().as_bytes()));
         } else {
-            let full_dig = hash_olean_compact_graph(bytes, base_addr, c_ptr, &mut memo, 0)?;
+            let full_dig = hash_olean_compact_graph(bytes, base_addr, c_ptr, &mut memo)?;
             const_records.push((cname, c_tag, full_dig));
         }
     }
@@ -1392,6 +1543,7 @@ pub fn compute_olean_theorem_interface_digest(bytes: &[u8]) -> Option<String> {
     }
 
     let mut entry_records: Vec<(String, [u8; 32])> = Vec::new();
+    let mut saw_exported_axioms_ext = false;
     for e_ptr in read_array(entries_ptr)? {
         if (e_ptr & 1) != 0 || e_ptr < base_addr {
             return None;
@@ -1409,6 +1561,7 @@ pub fn compute_olean_theorem_interface_digest(bytes: &[u8]) -> Option<String> {
             continue;
         }
         if ename.ends_with(".exportedAxiomsExt") {
+            saw_exported_axioms_ext = true;
             let mut non_std_axioms: BTreeMap<String, Vec<String>> = BTreeMap::new();
             for item_ptr in read_array(earr_ptr)? {
                 if (item_ptr & 1) != 0 || item_ptr < base_addr {
@@ -1451,9 +1604,12 @@ pub fn compute_olean_theorem_interface_digest(bytes: &[u8]) -> Option<String> {
             }
             entry_records.push((ename, *eh.finalize().as_bytes()));
         } else {
-            let edig = hash_olean_compact_graph(bytes, base_addr, earr_ptr, &mut memo, 0)?;
+            let edig = hash_olean_compact_graph(bytes, base_addr, earr_ptr, &mut memo)?;
             entry_records.push((ename, edig));
         }
+    }
+    if !saw_exported_axioms_ext {
+        return None;
     }
     entry_records.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     h.update(&(entry_records.len() as u64).to_le_bytes());
@@ -19456,9 +19612,11 @@ pub fn resolve_cone_export_filter(
     );
     let mut allowed_modules: HashSet<String> = HashSet::new();
     let mut allowed_rel_paths: HashSet<String> = HashSet::new();
-    let mut allowed_decls: HashSet<String> = HashSet::new();
+    let mut allowed_thm_action_keys: HashSet<String> = HashSet::new();
     let mut olean_paths_for_replay: Vec<PathBuf> = Vec::new();
     let mut all_oleans_present = true;
+    let (lean_path_env, _) = build_lean_search_path(&cfg, false);
+    let check_toolchain = crate::lake_build::detect_toolchain(&canon_dir);
 
     let add_rel = |set: &mut HashSet<String>, abs: &Path, base: &Path| {
         if let Ok(rel) = abs.strip_prefix(base) {
@@ -19489,14 +19647,31 @@ pub fn resolve_cone_export_filter(
         add_rel(&mut allowed_rel_paths, &node.src_path, &canon_dir);
 
         if let Ok(src_text) = fs::read_to_string(&node.src_path) {
-            let split = crate::splitter::split_lean_source(&src_text, &[]);
-            for sh in &split.shards {
-                let eff = sh.effective_name().to_string();
-                if !eff.is_empty() {
-                    allowed_decls.insert(eff);
-                }
-                if !sh.name.is_empty() {
-                    allowed_decls.insert(sh.name.clone());
+            let file_lean_args = compose_flat_filtered_args_with_options(
+                &node.weak_args,
+                &node.strong_args,
+                &node.lean_options,
+            );
+            let mut dep_variants =
+                vec![crate::lake_build::compute_imported_olean_interface_hashes(
+                    &src_text,
+                    &node.pkg_root,
+                    Some(&lean_path_env),
+                )];
+            let canon_deps = crate::lake_build::compute_imported_olean_interface_hashes(
+                &src_text, &canon_dir, None,
+            );
+            if !dep_variants.contains(&canon_deps) {
+                dep_variants.push(canon_deps);
+            }
+            for deps in &dep_variants {
+                let split = crate::splitter::split_lean_source(&src_text, deps);
+                for sh in &split.shards {
+                    for tc in [&check_toolchain, &cfg.toolchain] {
+                        allowed_thm_action_keys.insert(
+                            crate::lake_build::compute_shard_key_with_args(tc, sh, &file_lean_args),
+                        );
+                    }
                 }
             }
         }
@@ -19526,7 +19701,6 @@ pub fn resolve_cone_export_filter(
         }
     }
 
-    let (lean_path_env, _) = build_lean_search_path(&cfg, false);
     let lp_dirs: Vec<PathBuf> = std::env::split_paths(&lean_path_env).collect();
     let mut bin_work: Vec<PathBuf> = olean_paths_for_replay.clone();
     let mut seen_bin: HashSet<PathBuf> = HashSet::new();
@@ -19570,10 +19744,6 @@ pub fn resolve_cone_export_filter(
         }
     }
 
-    for d in &allowed_decls {
-        allowed_rel_paths.insert(d.clone());
-    }
-
     let allowed_replay_artifacts = if all_oleans_present {
         let mut set = HashSet::new();
         let mut all_dig_ok = true;
@@ -19599,6 +19769,7 @@ pub fn resolve_cone_export_filter(
 
     Ok(crate::pack::ConeExportFilter {
         allowed_rel_paths,
+        allowed_thm_action_keys,
         allowed_modules,
         allowed_replay_artifacts,
     })
@@ -21041,14 +21212,56 @@ pub fn evaluate_gate_report(
         }
 
         if !wave_verified_mods.is_empty() {
-            let _ = build_wave_native_artifacts(
+            let native_t0 = Instant::now();
+            if let Err(native_err) = build_wave_native_artifacts(
                 &cfg,
                 &dag,
                 &wave_verified_mods,
                 preserve_project,
                 &completed_mods,
                 &mut built_shared_libs,
-            );
+            ) {
+                let native_candidates: Vec<String> = wave_verified_mods
+                    .iter()
+                    .filter(|m| {
+                        dag.nodes
+                            .get(*m)
+                            .is_some_and(|n| n.needs_co_export || n.needs_dynlib)
+                            || dag
+                                .shared_libs
+                                .iter()
+                                .any(|sl| sl.local_modules.contains(m))
+                    })
+                    .cloned()
+                    .collect();
+                let fail_mods = if native_candidates.is_empty() {
+                    vec![wave_verified_mods[0].clone()]
+                } else {
+                    native_candidates
+                };
+                let dur_ms = native_t0.elapsed().as_millis() as i64;
+                let diag = format!("{:#}", native_err);
+                for fail_mod in fail_mods {
+                    if completed_mods.remove(&fail_mod) {
+                        modules_verified = modules_verified.saturating_sub(1);
+                    }
+                    let fail_file = dag
+                        .nodes
+                        .get(&fail_mod)
+                        .map(rel_file_of)
+                        .unwrap_or_else(|| fail_mod.clone());
+                    root_cause_failures.push(GateRootFailure {
+                        module: fail_mod.clone(),
+                        file: fail_file,
+                        failure_kind: "native_artifact_error".to_string(),
+                        duration_ms: dur_ms,
+                        diagnostic: diag.clone(),
+                    });
+                    let mut self_set = BTreeSet::new();
+                    self_set.insert(fail_mod.clone());
+                    failed_roots_of.entry(fail_mod).or_insert(self_set);
+                }
+            }
         }
     }
 
@@ -33173,6 +33386,370 @@ globs = ["Down.+"]
         assert_eq!(gate_ok.modules_compiled, 3);
         assert!(gate_ok.root_cause_failures.is_empty());
         assert!(gate_ok.blocked_downstream.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_wave8_compact_graph_iterative_bounds_cycles_scalar_arrays_and_iface_soundness(
+    ) -> Result<()> {
+        let base_addr: u64 = 0x10_0000;
+
+        // 1) Deep pointer chain (depth = 3000 <= 4096) succeeds on a 128 KB thread stack without overflow;
+        //    depth = 4500 (> OLEAN_COMPACT_MAX_DEPTH = 4096) fails closed (`None`).
+        let build_ctor_chain = |chain_len: usize| -> (Vec<u8>, u64) {
+            // Each ctor object: 16 bytes (`header[8] + field0[8]`), tag = 0, m_other = 1, m_csz = 16.
+            let mut buf = vec![0u8; chain_len * 16];
+            for i in 0..chain_len {
+                let off = i * 16;
+                buf[off + 4..off + 6].copy_from_slice(&16u16.to_le_bytes());
+                buf[off + 6] = 1; // num_objs = 1
+                buf[off + 7] = 0; // m_tag = 0
+                let child_ptr = if i + 1 < chain_len {
+                    base_addr + ((i + 1) * 16) as u64
+                } else {
+                    1u64 // scalar leaf `(0 << 1) | 1`
+                };
+                buf[off + 8..off + 16].copy_from_slice(&child_ptr.to_le_bytes());
+            }
+            (buf, base_addr)
+        };
+
+        let (chain_ok, root_ok) = build_ctor_chain(3000);
+        let small_stack_res = std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || {
+                let mut memo = HashMap::new();
+                hash_olean_compact_graph(&chain_ok, base_addr, root_ok, &mut memo)
+            })?
+            .join()
+            .expect("small stack thread must not overflow");
+        assert!(
+            small_stack_res.is_some(),
+            "depth 3000 compact graph must hash cleanly on 128 KB stack"
+        );
+
+        let (chain_too_deep, root_deep) = build_ctor_chain(4500);
+        let mut memo_deep = HashMap::new();
+        assert!(
+            hash_olean_compact_graph(&chain_too_deep, base_addr, root_deep, &mut memo_deep)
+                .is_none(),
+            "chain deeper than OLEAN_COMPACT_MAX_DEPTH (4096) must fail closed"
+        );
+
+        // 2) Cyclic pointer graph (`node0 -> node1 -> node0`) terminates immediately and returns `None`.
+        let mut cyc = vec![0u8; 32];
+        for (i, next_idx) in [(0usize, 1usize), (1usize, 0usize)] {
+            let off = i * 16;
+            cyc[off + 4..off + 6].copy_from_slice(&16u16.to_le_bytes());
+            cyc[off + 6] = 1;
+            cyc[off + 7] = 0;
+            let next_ptr = base_addr + (next_idx * 16) as u64;
+            cyc[off + 8..off + 16].copy_from_slice(&next_ptr.to_le_bytes());
+        }
+        let mut memo_cyc = HashMap::new();
+        assert!(
+            hash_olean_compact_graph(&cyc, base_addr, base_addr, &mut memo_cyc).is_none(),
+            "cyclic compact graph must fail closed instead of looping"
+        );
+
+        // 3) [P1-1] `LeanScalarArray` (`m_tag == 248`) hashes full `sz * m_other` payload bytes
+        //    for element widths 1, 2, 4, 8, and rejects invalid `m_other` (0, 3, 16).
+        let build_sarray = |elem_size: u8, sz: usize, fill: &[u8]| -> Vec<u8> {
+            let mut b = vec![0u8; 24 + fill.len()];
+            b[6] = elem_size;
+            b[7] = 248;
+            b[8..16].copy_from_slice(&(sz as u64).to_le_bytes());
+            b[16..24].copy_from_slice(&(sz as u64).to_le_bytes());
+            b[24..24 + fill.len()].copy_from_slice(fill);
+            b
+        };
+        // Two `UInt64` arrays (`m_other = 8, sz = 2` -> 16 bytes) identical in bytes `0..2`
+        // (`sz` bytes) and differing ONLY at byte 15 (the high byte of element 1):
+        let mut payload_a = [0u8; 16];
+        payload_a[0] = 0x11;
+        payload_a[15] = 0xAA;
+        let mut payload_b = payload_a;
+        payload_b[15] = 0xBB;
+        let sarr_a = build_sarray(8, 2, &payload_a);
+        let sarr_b = build_sarray(8, 2, &payload_b);
+        let h_a = hash_olean_compact_graph(&sarr_a, base_addr, base_addr, &mut HashMap::new())
+            .expect("valid UInt64 scalar array must hash");
+        let h_b = hash_olean_compact_graph(&sarr_b, base_addr, base_addr, &mut HashMap::new())
+            .expect("valid UInt64 scalar array must hash");
+        assert_ne!(
+            h_a, h_b,
+            "LeanScalarArray with m_other=8 must hash all sz*8 bytes, distinguishing trailing element bytes"
+        );
+
+        // `UInt32` (`m_other = 4, sz = 2` -> 8 bytes) differing at byte 7:
+        let sarr_u32_1 = build_sarray(4, 2, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        let sarr_u32_2 = build_sarray(4, 2, &[1, 2, 3, 4, 5, 6, 7, 9]);
+        assert_ne!(
+            hash_olean_compact_graph(&sarr_u32_1, base_addr, base_addr, &mut HashMap::new())
+                .unwrap(),
+            hash_olean_compact_graph(&sarr_u32_2, base_addr, base_addr, &mut HashMap::new())
+                .unwrap(),
+        );
+
+        // Truncated `UInt64` array (`sz = 2`, only 8 bytes provided instead of 16) -> `None`.
+        let sarr_trunc = build_sarray(8, 2, &[0u8; 8]);
+        assert!(
+            hash_olean_compact_graph(&sarr_trunc, base_addr, base_addr, &mut HashMap::new())
+                .is_none(),
+            "truncated LeanScalarArray (fewer than sz * m_other bytes) must fail closed"
+        );
+
+        // Invalid `m_other` values (0, 3, 16) -> `None`.
+        for bad_other in [0u8, 3u8, 16u8] {
+            let bad_arr = build_sarray(bad_other, 1, &[0u8; 16]);
+            assert!(
+                hash_olean_compact_graph(&bad_arr, base_addr, base_addr, &mut HashMap::new())
+                    .is_none(),
+                "LeanScalarArray with invalid m_other={bad_other} must fail closed"
+            );
+        }
+
+        // 4) [P1-4b] User theorem named with `._proof_` vs compiler `_private...._proof_`:
+        assert!(is_compiler_private_proof_helper_name(
+            "_private.W8.Base.0.W8.base_eq._proof_1"
+        ));
+        assert!(
+            !is_compiler_private_proof_helper_name("Foo._proof_1"),
+            "public user theorem containing `._proof_` must NOT be treated as a compiler private helper"
+        );
+        assert!(!is_compiler_private_proof_helper_name(
+            "my_thm._proof_helper"
+        ));
+
+        // 5) [P1-4a] Crafted `.olean` v2 binary missing `exportedAxiomsExt` in `entries` must return `None`
+        //    from `compute_olean_theorem_interface_digest` (fail-closed fallback to full `.olean` BLAKE3).
+        let mut fake_olean = vec![0u8; 88 + 8 + 64 + 32];
+        fake_olean[0..5].copy_from_slice(b"olean");
+        fake_olean[5] = 2;
+        fake_olean[6] = 1;
+        fake_olean[7..13].copy_from_slice(b"4.35.0");
+        fake_olean[40..80].copy_from_slice(b"0123456789abcdef0123456789abcdef01234567");
+        fake_olean[80..88].copy_from_slice(&base_addr.to_le_bytes());
+        let root_p = base_addr + 96;
+        let empty_arr_p = base_addr + 96 + 64;
+        fake_olean[88..96].copy_from_slice(&root_p.to_le_bytes());
+        // Root `ModuleData`: 5 obj fields (`imports`, `constNames`, `constants`, `extraConstNames`, `entries`) + 1 byte `isModule`
+        fake_olean[96 + 4..96 + 6].copy_from_slice(&49u16.to_le_bytes());
+        fake_olean[96 + 6] = 5;
+        fake_olean[96 + 7] = 0;
+        for f in 0..5 {
+            let f_off = 96 + 8 + f * 8;
+            fake_olean[f_off..f_off + 8].copy_from_slice(&empty_arr_p.to_le_bytes());
+        }
+        fake_olean[96 + 48] = 1; // isModule = true
+                                 // Empty `Array` at `96 + 64`: tag = 246, size = 0, cap = 0
+        let arr_off = 96 + 64;
+        fake_olean[arr_off + 7] = 246;
+        assert!(
+            compute_olean_theorem_interface_digest(&fake_olean).is_none(),
+            "olean missing `.exportedAxiomsExt` entry must return None (fail-closed)"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_wave8_cone_export_same_decl_name_isolation_and_gate_native_failure() -> Result<()> {
+        let _env_lock_guard = native_build_env_guard();
+        let _bwrap_guard = BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "turbo-w8-cone-gate-{}-{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let proj = dir.join("proj");
+        fs::create_dir_all(proj.join("W8"))?;
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"w8conegate\"\ndefaultTargets = [\"W8\"]\n[[lean_lib]]\nname = \"W8\"\nglobs = [\"W8.+\"]\n",
+        )?;
+
+        // 1) [P1-4b] User theorem named `Foo._proof_1` signature edit MUST change theorem-interface digest!
+        let u1 = proj.join("W8/UserProofName.lean");
+        fs::write(
+            &u1,
+            "namespace Foo\ntheorem _proof_1 : 1 + 1 = 2 := rfl\nend Foo\n",
+        )?;
+        let mut store = TurboStore::open(Some(&dir.join("store")))?;
+        build_project_modules_native(
+            &mut store,
+            &proj,
+            &["+W8.UserProofName".to_string()],
+            "trusted",
+            0,
+            false,
+            true,
+            None,
+        )?;
+        let u_olean = proj.join(".lake/build/lib/lean/W8/UserProofName.olean");
+        let dig_u1 = compute_olean_theorem_interface_digest(&fs::read(&u_olean)?)
+            .expect("valid compiled olean must produce theorem-interface digest");
+
+        fs::write(
+            &u1,
+            "namespace Foo\ntheorem _proof_1 : 2 + 2 = 4 := rfl\nend Foo\n",
+        )?;
+        build_project_modules_native(
+            &mut store,
+            &proj,
+            &["+W8.UserProofName".to_string()],
+            "trusted",
+            0,
+            false,
+            true,
+            None,
+        )?;
+        let dig_u2 = compute_olean_theorem_interface_digest(&fs::read(&u_olean)?)
+            .expect("valid compiled olean must produce theorem-interface digest");
+        assert_ne!(
+            dig_u1, dig_u2,
+            "signature change to public theorem `Foo._proof_1` must change theorem-interface digest"
+        );
+
+        // 2) [P1-6] `export --cone +W8.ConeA` must include `W8/ConeA.lean`'s `theorem foo` shard
+        //    and EXCLUDE `W8/ConeB.lean`'s identically named `theorem foo` shard!
+        fs::write(
+            proj.join("W8/ConeA.lean"),
+            "def valA : Nat := 10\ntheorem foo : valA = 10 := rfl\n",
+        )?;
+        fs::write(
+            proj.join("W8/ConeB.lean"),
+            "def valB : Nat := 20\ntheorem foo : valB = 20 := rfl\n",
+        )?;
+        let ca_res = crate::check::evaluate_check_command_value(
+            &mut store,
+            PathBuf::from("W8/ConeA.lean"),
+            Some("foo".to_string()),
+            proj.clone(),
+        )?;
+        let cb_res = crate::check::evaluate_check_command_value(
+            &mut store,
+            PathBuf::from("W8/ConeB.lean"),
+            Some("foo".to_string()),
+            proj.clone(),
+        )?;
+        let key_a = ca_res["shard_key"].as_str().unwrap().to_string();
+        let key_b = cb_res["shard_key"].as_str().unwrap().to_string();
+        assert_ne!(key_a, key_b);
+        assert!(store.has_theorem_shard(&key_a));
+        assert!(store.has_theorem_shard(&key_b));
+
+        let cone_filter = resolve_cone_export_filter(&proj, "+W8.ConeA")?;
+        assert!(cone_filter.allowed_thm_action_keys.contains(&key_a));
+        assert!(
+            !cone_filter.allowed_thm_action_keys.contains(&key_b),
+            "ConeA export filter must not allow ConeB's `theorem foo` shard key"
+        );
+
+        let pack_path = dir.join("conea_only.tlpack");
+        let sk_hex = "3333333333333333333333333333333333333333333333333333333333333333";
+        let vk_hex = {
+            use ed25519_dalek::SigningKey;
+            let mut sk_bytes = [0u8; 32];
+            for (i, b) in sk_bytes.iter_mut().enumerate() {
+                *b = u8::from_str_radix(&sk_hex[i * 2..i * 2 + 2], 16)?;
+            }
+            SigningKey::from_bytes(&sk_bytes)
+                .verifying_key()
+                .as_bytes()
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>()
+        };
+        crate::pack::export_pack_filtered_with_signing_key_and_cone(
+            &store,
+            &pack_path,
+            true,
+            &HashSet::new(),
+            &HashSet::new(),
+            Some(sk_hex),
+            Some(&cone_filter),
+        )?;
+        let mut dst_store = TurboStore::open(Some(&dir.join("dst_store")))?;
+        crate::pack::import_pack_with_policy(
+            &mut dst_store,
+            &pack_path,
+            Some("trusted"),
+            Some(&vk_hex),
+            false,
+        )?;
+        assert!(
+            dst_store.has_theorem_shard(&key_a),
+            "ConeA's `theorem foo` shard must be imported"
+        );
+        assert!(
+            !dst_store.has_theorem_shard(&key_b),
+            "ConeB's `theorem foo` shard must NOT leak into `--cone +W8.ConeA` export"
+        );
+
+        // 3) [P1-5] `evaluate_gate_report` captures `build_wave_native_artifacts` failures as structured
+        //    `GateRootFailure` (`failure_kind == "native_artifact_error"`) with `gate_passed == false`,
+        //    and blocks downstream importers!
+        let nat_proj = dir.join("nat_proj");
+        fs::create_dir_all(nat_proj.join("NatMod"))?;
+        fs::write(
+            nat_proj.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )?;
+        fs::write(
+            nat_proj.join("lakefile.toml"),
+            "name = \"natgate\"\ndefaultTargets = [\"NatMod\"]\nprecompileModules = true\n[[lean_lib]]\nname = \"NatMod\"\nglobs = [\"NatMod.+\"]\n",
+        )?;
+        fs::write(
+            nat_proj.join("NatMod/Base.lean"),
+            "def natBase : Nat := 5\n",
+        )?;
+        fs::write(
+            nat_proj.join("NatMod/Top.lean"),
+            "import NatMod.Base\ntheorem natTop_eq : natBase = 5 := rfl\n",
+        )?;
+
+        let prev_cc = std::env::var_os("LEAN_CC");
+        std::env::set_var("LEAN_CC", dir.join("nonexistent_cc_binary_xyz"));
+        let mut nat_store = TurboStore::open(Some(&dir.join("nat_store")))?;
+        let gate_nat_res = evaluate_gate_report(
+            &mut nat_store,
+            false,
+            "+NatMod.Top".to_string(),
+            nat_proj.clone(),
+            60,
+            Some(1),
+        );
+        match prev_cc {
+            Some(v) => std::env::set_var("LEAN_CC", v),
+            None => std::env::remove_var("LEAN_CC"),
+        }
+        let gate_nat = gate_nat_res.expect(
+            "evaluate_gate_report must return Ok(GateReport) instead of aborting on native CC failure",
+        );
+        assert!(!gate_nat.gate_passed);
+        assert!(
+            gate_nat
+                .root_cause_failures
+                .iter()
+                .any(|f| f.module == "NatMod.Base" && f.failure_kind == "native_artifact_error"),
+            "expected native_artifact_error on NatMod.Base, got: {:?}",
+            gate_nat.root_cause_failures
+        );
+        assert!(
+            gate_nat
+                .blocked_downstream
+                .iter()
+                .any(|b| b.module == "NatMod.Top"
+                    && b.blocked_by.contains(&"NatMod.Base".to_string())),
+            "expected NatMod.Top blocked by NatMod.Base, got: {:?}",
+            gate_nat.blocked_downstream
+        );
 
         let _ = fs::remove_dir_all(&dir);
         Ok(())

@@ -21,6 +21,7 @@ pub struct PackedKernelReplay {
 #[derive(Debug, Clone, Default)]
 pub struct ConeExportFilter {
     pub allowed_rel_paths: HashSet<String>,
+    pub allowed_thm_action_keys: HashSet<String>,
     pub allowed_modules: HashSet<String>,
     pub allowed_replay_artifacts: Option<HashSet<String>>,
 }
@@ -1597,11 +1598,7 @@ pub fn export_pack_filtered_with_mode_signing_and_cone(
                     .filter(|o| !o.rel_path.starts_with("thm:"))
                     .all(|o| cf.allowed_rel_paths.contains(&o.rel_path));
             let matches_thm = outputs.iter().all(|o| o.rel_path.starts_with("thm:"))
-                && outputs.iter().all(|o| {
-                    o.rel_path
-                        .strip_prefix("thm:")
-                        .is_some_and(|rest| cf.allowed_rel_paths.contains(rest))
-                });
+                && cf.allowed_thm_action_keys.contains(&meta.0);
             if !matches_cone && !matches_thm {
                 return;
             }

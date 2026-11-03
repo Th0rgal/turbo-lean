@@ -2145,6 +2145,7 @@ fn run_check_command_inner(
             db_warm_on_open,
             json_output,
             emit_stdout && !emit_olean,
+            !emit_olean,
             &t0,
             &file,
             &resolved_file,
@@ -2276,9 +2277,6 @@ fn run_check_command_inner(
         }
         out_json
     };
-    if !emit_olean && !allow_sorry {
-        crate::lake_build::recheck_dependents_if_nonlocal(store, &canon_dir, &resolved_file)?;
-    }
     Ok(res)
 }
 
@@ -2385,6 +2383,7 @@ fn check_directory(
             "interface_hash": dir_interface_hash,
             "elapsed_ms": elapsed_ms
         });
+        crate::lake_build::recheck_dependents_if_nonlocal(store, canon_dir, resolved_file)?;
         if emit_stdout {
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -2406,7 +2405,6 @@ fn check_directory(
             );
             pack::warm_local_zygote_daemon_nonblocking(store, &fast_ev);
         }
-        crate::lake_build::recheck_dependents_if_nonlocal(store, canon_dir, resolved_file)?;
         return Ok(out_json);
     }
 
@@ -2808,6 +2806,7 @@ fn check_directory(
         "interface_hash": dir_interface_hash,
         "elapsed_ms": elapsed_ms
     });
+    crate::lake_build::recheck_dependents_if_nonlocal(store, canon_dir, resolved_file)?;
     if emit_stdout {
         if json_output {
             println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -2841,7 +2840,6 @@ fn check_directory(
         };
         pack::warm_local_zygote_daemon_nonblocking(store, &ev);
     }
-    crate::lake_build::recheck_dependents_if_nonlocal(store, canon_dir, resolved_file)?;
     Ok(out_json)
 }
 
@@ -3076,6 +3074,41 @@ fn check_single_decl(
         let fresh_deps = compute_imported_olean_interface_hashes(&active_src, canon_dir, None);
         *split = split_lean_source(&active_src, &fresh_deps);
         *cached_file_blake3 = Some(blake3::hash(active_src.as_bytes()).to_hex().to_string());
+        let non_sorry = split.hygiene.non_sorry_disallowed_items();
+        if !non_sorry.is_empty() {
+            anyhow::bail!(
+                "Soundness hygiene violation in {} (even under `--allow-sorry`): {}",
+                active_file.display(),
+                non_sorry.join(", ")
+            );
+        }
+        let shard_lines: Vec<(usize, usize)> = split
+            .shards
+            .iter()
+            .map(|s| (s.start_line, s.end_line))
+            .collect();
+        let outside_sorry: Vec<String> = split
+            .hygiene
+            .disallowed_items()
+            .into_iter()
+            .filter(|item| {
+                let ln_opt = item
+                    .strip_prefix('L')
+                    .and_then(|r| r.split_once(": "))
+                    .and_then(|(ln, _)| ln.parse::<usize>().ok());
+                match ln_opt {
+                    Some(ln) => !shard_lines.iter().any(|(st, en)| *st <= ln && ln <= *en),
+                    None => true,
+                }
+            })
+            .collect();
+        if !outside_sorry.is_empty() {
+            anyhow::bail!(
+                "Cannot run partial `--allow-sorry` check on {}: `sorry`/`admit` appears outside theorem shards ({}); definitions and non-theorem commands must be sorry-free",
+                active_file.display(),
+                outside_sorry.join(", ")
+            );
+        }
     }
     let shard_idx =
         splitter::find_decl_shard_index(&split.shards, target_decl)?.with_context(|| {
@@ -3225,6 +3258,9 @@ fn check_single_decl(
                 &attested.kernel_type_hash,
             )
         {
+            if !allow_sorry {
+                crate::lake_build::recheck_dependents_if_nonlocal(store, canon_dir, &active_file)?;
+            }
             let elapsed_ms = t0.elapsed().as_millis();
             let out_json = make_cache_hit_json(false, elapsed_ms);
             if emit_stdout {
@@ -3505,6 +3541,9 @@ fn check_single_decl(
             )?;
         }
 
+        if !allow_sorry {
+            crate::lake_build::recheck_dependents_if_nonlocal(store, canon_dir, &active_file)?;
+        }
         let (_, out_json) = emit_remote_decl_result(
             json_output,
             emit_stdout,
@@ -3541,6 +3580,9 @@ fn check_single_decl(
 
     match singleflight_outcome {
         SingleflightOutcome::CacheHit { coalesced, .. } => {
+            if !allow_sorry {
+                crate::lake_build::recheck_dependents_if_nonlocal(store, canon_dir, &active_file)?;
+            }
             let elapsed_ms = t0.elapsed().as_millis();
             let out_json = make_cache_hit_json(coalesced, elapsed_ms);
             if emit_stdout {
@@ -4709,6 +4751,9 @@ fn check_single_decl(
                 }
                 store.batch_put_theorem_shards(toolchain, &seed_items)?;
             }
+            if !allow_sorry {
+                crate::lake_build::recheck_dependents_if_nonlocal(store, canon_dir, &active_file)?;
+            }
             if emit_stdout {
                 if json_output {
                     println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -4911,6 +4956,7 @@ fn check_single_file_allow_sorry(
             db_warm_on_open,
             false,
             false,
+            true,
             t0,
             file,
             resolved_file,
@@ -5299,9 +5345,59 @@ fn check_single_file_allow_sorry(
         store.batch_publish_theorem_shards(toolchain, "trusted", &verified_publish)?;
     }
 
+    // Verify all non-theorem commands (including trailing `def` / `instance` / `#check` commands
+    // after the final theorem shard) by compiling and auditing the module skeleton with theorem
+    // shard proofs stubbed as `sorry`. Without this check, a broken non-theorem definition could
+    // pass `sorry_count > 0` silently or even receive `certified_module: true` when `sorry_count == 0`.
+    {
+        let skeleton_t0 = Instant::now();
+        let empty_uncached: HashSet<String> = HashSet::new();
+        let skeleton_src = splitter::build_coalesced_shard_source(src, &empty_uncached);
+        let skel_res = crate::zygote::run_audited_lean_shard(
+            store,
+            Path::new(&lean_bin),
+            &env_vars,
+            Some(canon_dir),
+            &skeleton_src,
+            &empty_uncached,
+            &file_lean_args,
+            Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+        );
+        let skel_err: Option<String> = match skel_res {
+            Ok(o) if o.status.success() => None,
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
+                let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
+                Some(format!("{}\n{}", stdout, stderr).trim().to_string())
+            }
+            Err(e) => Some(format!("{:#}", e)),
+        };
+        if let Some(raw_err) = skel_err {
+            error_count += 1;
+            let end_ln = src.lines().count().max(1);
+            let m_diags = extract_mismatch_diagnostics(&raw_err);
+            let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
+            verdicts.push(Some(PartialDeclVerdict {
+                decl: "<module_definitions>".to_string(),
+                kind: "module_skeleton".to_string(),
+                status: "error".to_string(),
+                start_line: 1,
+                end_line: end_ln,
+                shard_key: String::new(),
+                certified: false,
+                elapsed_ms: skeleton_t0.elapsed().as_millis() as i64,
+                error: Some(format!("{}{}", raw_err.trim(), m_suffix)),
+                auto_profiler: None,
+            }));
+        }
+    }
+
     let decl_verdicts: Vec<PartialDeclVerdict> = verdicts.into_iter().flatten().collect();
-    let dur_ms = t0.elapsed().as_millis() as i64;
     let certified_module = sorry_count == 0 && error_count == 0;
+    if certified_module {
+        crate::lake_build::recheck_dependents_if_nonlocal(store, canon_dir, resolved_file)?;
+    }
+    let dur_ms = t0.elapsed().as_millis() as i64;
     let status = if error_count > 0 {
         "partial_file_failed"
     } else if sorry_count > 0 {
@@ -5391,6 +5487,7 @@ fn check_single_file(
     db_warm_on_open: bool,
     json_output: bool,
     emit_stdout: bool,
+    recheck_dependents: bool,
     t0: &Instant,
     file: &Path,
     resolved_file: &Path,
@@ -5498,6 +5595,9 @@ fn check_single_file(
     }
 
     if misses == 0 && !split.shards.is_empty() && split.eligible_for_sharding {
+        if recheck_dependents {
+            crate::lake_build::recheck_dependents_if_nonlocal(store, canon_dir, resolved_file)?;
+        }
         let elapsed_ms = t0.elapsed().as_millis();
         let out_json = serde_json::json!({
             "status": "all_shards_cached",
@@ -5613,6 +5713,9 @@ fn check_single_file(
             }
 
             let resp = remote_resp.unwrap();
+            if recheck_dependents {
+                crate::lake_build::recheck_dependents_if_nonlocal(store, canon_dir, resolved_file)?;
+            }
             let dur_ms = t0.elapsed().as_millis() as i64;
             let out_json = serde_json::json!({
                 "status": "file_verified",
@@ -6126,6 +6229,9 @@ fn check_single_file(
             ));
         }
         store.batch_publish_theorem_shards(toolchain, "trusted", &batch_items)?;
+        if recheck_dependents {
+            crate::lake_build::recheck_dependents_if_nonlocal(store, canon_dir, resolved_file)?;
+        }
         let dur_ms = t0.elapsed().as_millis() as i64;
         let out_json = serde_json::json!({
             "status": "file_verified",
@@ -6379,22 +6485,6 @@ fn check_single_file(
                 whole_verified_types = cli_types;
             }
         }
-        if emit_stdout && !json_output {
-            if !eval_stdout_text.is_empty() {
-                print!("{}", eval_stdout_text);
-                if !eval_stdout_text.ends_with('\n') {
-                    println!();
-                }
-            }
-            for msg in &eval_messages {
-                println!(
-                    "{}",
-                    msg.replace("<zygote-eval>", &orig_display)
-                        .replace("<zygote-decl>", &orig_display)
-                        .replace("<zygote-shard>", &orig_display)
-                );
-            }
-        }
         let dur_ms = t0.elapsed().as_millis() as i64;
         if !uncached_shards.is_empty() {
             let now = db::now_unix();
@@ -6426,6 +6516,10 @@ fn check_single_file(
                 }
             }
         }
+        if recheck_dependents {
+            crate::lake_build::recheck_dependents_if_nonlocal(store, canon_dir, resolved_file)?;
+        }
+        let dur_ms = t0.elapsed().as_millis() as i64;
         let out_json = serde_json::json!({
             "status": "file_verified",
             "mode": if verified_via_zygote_eval { "zygote_whole_file" } else { "whole_file" },
@@ -6439,6 +6533,22 @@ fn check_single_file(
             "elapsed_ms": dur_ms
         });
         if emit_stdout {
+            if !json_output {
+                if !eval_stdout_text.is_empty() {
+                    print!("{}", eval_stdout_text);
+                    if !eval_stdout_text.ends_with('\n') {
+                        println!();
+                    }
+                }
+                for msg in &eval_messages {
+                    println!(
+                        "{}",
+                        msg.replace("<zygote-eval>", &orig_display)
+                            .replace("<zygote-decl>", &orig_display)
+                            .replace("<zygote-shard>", &orig_display)
+                    );
+                }
+            }
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&out_json)?);
             } else {
@@ -9204,7 +9314,7 @@ theorem fixed_thm (n : Nat) : addOne n = 1 + n := by
         assert_eq!(full_val["shard_hits"], 2);
         assert_eq!(full_val["shard_misses"], 1);
 
-        // Phase 4: Forbidden axiom is still rejected even under `--allow-sorry`.
+        // Phase 4: Forbidden axiom is still rejected even under `--allow-sorry` (both file and `--decl`).
         let src_bad_axiom = "\
 axiom bad_ax : False
 theorem t_ax : False := bad_ax
@@ -9217,6 +9327,83 @@ theorem t_ax : False := bad_ax
             proj_dir.clone(),
         )
         .is_err());
+        assert!(evaluate_check_command_allow_sorry_value(
+            &mut store,
+            dummy_file.clone(),
+            Some("t_ax".to_string()),
+            proj_dir.clone(),
+        )
+        .is_err());
+
+        // Phase 5: [P1-3] `check --decl <thm> --allow-sorry` rejects `sorry` in a non-theorem `def`
+        // outside theorem shards even when `<thm>` does not reference that `def`.
+        let src_def_sorry = "\
+def badDef : Nat := sorry
+
+theorem unrelated_thm : 1 + 1 = 2 := rfl
+";
+        fs::write(&dummy_file, src_def_sorry).unwrap();
+        let def_sorry_err = evaluate_check_command_allow_sorry_value(
+            &mut store,
+            dummy_file.clone(),
+            Some("unrelated_thm".to_string()),
+            proj_dir.clone(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            def_sorry_err.contains("outside theorem shards"),
+            "expected outside theorem shards error, got: {def_sorry_err}"
+        );
+
+        // Phase 6: [P0-2] Broken trailing non-theorem definition after the last theorem shard
+        // must fail `check --allow-sorry` both when `sorry_count > 0` AND when `sorry_count == 0`
+        // (never returning `certified_module: true`), while still caching clean theorem shards.
+        let src_trailing_broken_with_sorry = "\
+theorem pre_clean_thm : 2 + 2 = 4 := rfl
+
+theorem mid_sorry_thm : 3 + 3 = 6 := by
+  sorry
+
+def trailingBroken : Nat := \"not_a_nat\"
+";
+        fs::write(&dummy_file, src_trailing_broken_with_sorry).unwrap();
+        let trailing_err1 = evaluate_check_command_allow_sorry_value(
+            &mut store,
+            dummy_file.clone(),
+            None,
+            proj_dir.clone(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            trailing_err1.contains("partial_file_failed")
+                || trailing_err1.contains("<module_definitions>"),
+            "expected partial_file_failed on trailing broken def with sorry_count > 0, got: {trailing_err1}"
+        );
+        let split_tr = split_lean_source(src_trailing_broken_with_sorry, &[]);
+        let pre_clean_key = compute_shard_key_with_args(&toolchain, &split_tr.shards[0], &[]);
+        assert!(
+            store.has_theorem_shard(&pre_clean_key),
+            "clean theorem shard must still be cached when trailing non-theorem def fails"
+        );
+
+        let src_trailing_broken_zero_sorry = "\
+theorem pre_clean_thm : 2 + 2 = 4 := rfl
+
+def trailingBroken : Nat := \"not_a_nat\"
+";
+        fs::write(&dummy_file, src_trailing_broken_zero_sorry).unwrap();
+        let trailing_err2 = evaluate_check_command_allow_sorry_value(
+            &mut store,
+            dummy_file.clone(),
+            None,
+            proj_dir.clone(),
+        );
+        assert!(
+            trailing_err2.is_err(),
+            "zero-sorry file with broken trailing def must fail instead of returning certified_module: true"
+        );
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }
