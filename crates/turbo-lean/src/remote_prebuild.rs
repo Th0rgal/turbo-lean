@@ -191,7 +191,9 @@ fn working_tree_dirty_paths(project_dir: &Path, selected_sha: &str) -> Result<Ve
         .map_err(|e| anyhow::anyhow!("cannot run `git` to inspect the working tree: {e}"))?;
     if !probe.status.success() {
         let stderr = String::from_utf8_lossy(&probe.stderr);
-        if stderr.contains("not a git repository (or any of the parent directories)") {
+        if stderr.contains("not a git repository (or any of the parent directories)")
+            || stderr.contains("not a git repository (or any parent up to mount point ")
+        {
             return Ok(Vec::new());
         }
         anyhow::bail!("`git rev-parse` failed: {}", stderr.trim());
@@ -657,8 +659,31 @@ pub fn run_remote_prebuild_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
+    use std::net::{Shutdown, TcpListener, TcpStream};
     use std::process::Command;
+
+    fn accept_with_timeout(listener: &TcpListener, deadline: Duration) -> std::io::Result<TcpStream> {
+        listener.set_nonblocking(true)?;
+        let start = Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((sock, _)) => {
+                    sock.set_nonblocking(false)?;
+                    return Ok(sock);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if start.elapsed() >= deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "timed out waiting for mock HTTP connection",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
 
     #[test]
     fn resolves_base_origin_to_v1_prebuilds_and_preserves_explicit_paths() {
@@ -698,51 +723,56 @@ mod tests {
         let sha_for_srv = artifact_sha.clone();
         let manifest_for_srv = expected_manifest_sha.clone();
         let srv = std::thread::spawn(move || {
-            for step in 0..5 {
-                if let Ok((mut sock, _)) = listener.accept() {
-                    let mut rbuf = [0u8; 4096];
-                    let n = sock.read(&mut rbuf).unwrap_or(0);
-                    let req = String::from_utf8_lossy(&rbuf[..n]);
-                    let body = match step {
-                        0 => {
-                            assert!(req.contains("POST /v1/prebuilds "));
-                            assert!(req.contains("Authorization: Bearer test-secret-tok"));
-                            assert!(req.contains(&manifest_for_srv));
-                            assert!(req.contains("\"targets\":[\"Solution\"]"));
-                            format!(
-                                "{{\"job_id\":\"j1\",\"status\":\"queued\",\"status_url\":\"http://{}/v1/prebuilds/j1\"}}",
-                                addr
-                            )
-                            .into_bytes()
-                        }
-                        1 => {
-                            assert!(req.contains("GET /v1/prebuilds/j1 "));
-                            format!(
-                                "{{\"job_id\":\"j1\",\"status\":\"ready\",\"artifact_url\":\"http://{}/blob/j1\",\"artifact_sha256\":\"{}\",\"artifact_size_bytes\":{}}}",
-                                addr,
-                                sha_for_srv,
-                                artifact_bytes.len()
-                            )
-                            .into_bytes()
-                        }
-                        2 => {
-                            assert!(req.contains("GET /blob/j1 "));
-                            artifact_bytes.to_vec()
-                        }
-                        3 => b"{\"job_id\":\"j2\",\"status\":\"compile_failed\",\"failing_module\":\"Candidate.Bad\",\"error\":\"type mismatch\"}".to_vec(),
-                        _ => format!(
-                            "{{\"job_id\":\"j3\",\"status\":\"ready\",\"artifact_url\":\"http://{}/blob/j3\",\"artifact_sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"}}",
+            for step in 0..6 {
+                let mut sock = accept_with_timeout(&listener, Duration::from_secs(15)).unwrap();
+                let mut rbuf = [0u8; 4096];
+                let n = sock.read(&mut rbuf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&rbuf[..n]);
+                let body = match step {
+                    0 => {
+                        assert!(req.contains("POST /v1/prebuilds "));
+                        assert!(req.contains("Authorization: Bearer test-secret-tok"));
+                        assert!(req.contains(&manifest_for_srv));
+                        assert!(req.contains("\"targets\":[\"Solution\"]"));
+                        format!(
+                            "{{\"job_id\":\"j1\",\"status\":\"queued\",\"status_url\":\"http://{}/v1/prebuilds/j1\"}}",
                             addr
                         )
-                        .into_bytes(),
-                    };
-                    let hdr = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    let _ = sock.write_all(hdr.as_bytes());
-                    let _ = sock.write_all(&body);
-                }
+                        .into_bytes()
+                    }
+                    1 => {
+                        assert!(req.contains("GET /v1/prebuilds/j1 "));
+                        format!(
+                            "{{\"job_id\":\"j1\",\"status\":\"ready\",\"artifact_url\":\"http://{}/blob/j1\",\"artifact_sha256\":\"{}\",\"artifact_size_bytes\":{}}}",
+                            addr,
+                            sha_for_srv,
+                            artifact_bytes.len()
+                        )
+                        .into_bytes()
+                    }
+                    2 => {
+                        assert!(req.contains("GET /blob/j1 "));
+                        artifact_bytes.to_vec()
+                    }
+                    3 => b"{\"job_id\":\"j2\",\"status\":\"compile_failed\",\"failing_module\":\"Candidate.Bad\",\"error\":\"type mismatch\"}".to_vec(),
+                    4 => format!(
+                        "{{\"job_id\":\"j3\",\"status\":\"ready\",\"artifact_url\":\"http://{}/blob/j3\",\"artifact_sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"}}",
+                        addr
+                    )
+                    .into_bytes(),
+                    _ => {
+                        assert!(req.contains("GET /blob/j3 "));
+                        b"tampered".to_vec()
+                    }
+                };
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(hdr.as_bytes());
+                let _ = sock.write_all(&body);
+                let _ = sock.shutdown(Shutdown::Write);
+                let _ = std::io::copy(&mut sock, &mut std::io::sink());
             }
         });
 
@@ -798,7 +828,7 @@ mod tests {
         )?;
         assert!(!tampered_out.exists());
 
-        let _ = srv.join();
+        srv.join().unwrap();
         let _ = fs::remove_dir_all(&tmp);
         Ok(())
     }
@@ -1046,11 +1076,13 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let url = format!("http://{}/artifact", listener.local_addr()?);
         let srv = std::thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
+            let mut sock = accept_with_timeout(&listener, Duration::from_secs(10)).unwrap();
             let mut buf = [0u8; 4096];
             let n = sock.read(&mut buf).unwrap();
             let _ = sock
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            let _ = sock.shutdown(Shutdown::Write);
+            let _ = std::io::copy(&mut sock, &mut std::io::sink());
             String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase()
         });
         let out = std::env::temp_dir().join(format!("turbo_lean_rp_dl_{}", std::process::id()));
@@ -1073,6 +1105,22 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp)?;
         assert!(working_tree_dirty_paths(&tmp, &"a".repeat(40))?.is_empty());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let shm_base = Path::new("/dev/shm");
+            if let (Ok(root_meta), Ok(shm_meta)) = (fs::metadata("/"), fs::metadata(shm_base)) {
+                if root_meta.dev() != shm_meta.dev() {
+                    let shm_tmp =
+                        shm_base.join(format!("turbo_lean_rp_shm_{}", std::process::id()));
+                    let _ = fs::remove_dir_all(&shm_tmp);
+                    fs::create_dir_all(&shm_tmp)?;
+                    let shm_res = working_tree_dirty_paths(&shm_tmp, &"a".repeat(40));
+                    let _ = fs::remove_dir_all(&shm_tmp);
+                    assert!(shm_res?.is_empty());
+                }
+            }
+        }
         fs::write(tmp.join(".git"), "not a gitfile\n")?;
         assert!(working_tree_dirty_paths(&tmp, &"a".repeat(40)).is_err());
         // A gitfile pointing at a missing gitdir is not "no repository": fail closed.
@@ -1099,7 +1147,7 @@ mod tests {
         foreign.set_nonblocking(true)?;
         let foreign_addr = foreign.local_addr()?;
         let srv = std::thread::spawn(move || {
-            let (mut sock, _) = coordinator.accept().unwrap();
+            let mut sock = accept_with_timeout(&coordinator, Duration::from_secs(10)).unwrap();
             let mut rbuf = [0u8; 4096];
             let _ = sock.read(&mut rbuf);
             let body = format!(
@@ -1110,6 +1158,8 @@ mod tests {
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
+            let _ = sock.shutdown(Shutdown::Write);
+            let _ = std::io::copy(&mut sock, &mut std::io::sink());
         });
         run_remote_prebuild_command(
             true,

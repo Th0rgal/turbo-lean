@@ -5897,6 +5897,8 @@ fn install_blob_to_path_checked(
         || fname.ends_with(".trace")
         || fname.ends_with(".hash")
         || fname.ends_with(".c")
+        || fname.ends_with(".rsp")
+        || fname.ends_with(".setup.json")
         || is_non_package_lake_build_path(dst);
 
     let verify_bytes = |bytes: &[u8]| -> Result<()> {
