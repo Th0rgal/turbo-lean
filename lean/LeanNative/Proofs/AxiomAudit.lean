@@ -7,7 +7,7 @@ import LeanNative.Semantics.Eval
 import LeanNative.Semantics.Refinement
 import LeanNative.Proofs.PeepholeProofs
 import LeanNative.Proofs.LoopOptProofs
-import LeanNative.Proofs.LCNFBridgeProofs
+import LeanNative.Proofs.RealLCNFBridgeProofs
 import LeanNative.Proofs.BackendProofs
 import LeanNative.Proofs.KernelElabProofs
 import LeanNative.Proofs.SymbolicTV
@@ -171,8 +171,6 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Semantics.HeapState.decRefBuf_none_error, ``LeanNative.Semantics.HeapState.incRefBuf_none_error
   , ``LeanNative.Proofs.applyExprRules_sound
   , ``LeanNative.Proofs.applyRewriteTable_sound
-  , ``LeanNative.Proofs.lowerLetValue_sound
-  , ``LeanNative.Proofs.lowerLCNFCode_sound
   , ``LeanNative.Transform.optimizeEqSatCode_sound
   , ``LeanNative.Transform.applyLoopScheduleAux_refines
   , ``LeanNative.Transform.scheduleStructuredLoop_sound
@@ -349,6 +347,19 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.superoptDeclCore_sound, ``LeanNative.Proofs.superoptDecl_sound
   , ``LeanNative.Proofs.superoptModuleCore_sound, ``LeanNative.Proofs.superoptModule_sound
   , ``LeanNative.Proofs.superoptModuleWithProfile_sound
+  , ``LeanNative.Proofs.lowerLitValuePure_sound
+  , ``LeanNative.Proofs.lowerScalarIntrinsicExpr_sound
+  , ``LeanNative.Proofs.lowerBoolBinIntrinsic_sound
+  , ``LeanNative.Proofs.lowerUnaryAndCast_sound
+  , ``LeanNative.Proofs.lowerRealCtor_sound
+  , ``LeanNative.Proofs.lowerCanonicalIntrinsicPure_sound
+  , ``LeanNative.Proofs.lowerImpureLetValuePure_sound
+  , ``LeanNative.Proofs.tag_branch_sound
+  , ``LeanNative.Proofs.lowerRefOpPure_sound
+  , ``LeanNative.Proofs.lowerStepInr_sound
+  , ``LeanNative.Proofs.lowerImpureStepPure_sound
+  , ``LeanNative.Proofs.lowerRealLCNFCode_sound
+  , ``LeanNative.Proofs.lowerRealLCNFDecl_sound
   ]
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/
