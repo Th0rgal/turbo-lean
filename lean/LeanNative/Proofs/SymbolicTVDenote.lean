@@ -286,4 +286,89 @@ def evalBoolAtoms (ω : SymValuation) : List SymExpr → Except UBError Bool
     | .ok _, _ => .error (.typeError "evalBoolAtoms: non-bool atom")
     | .error err, _ => .error err
 
+/-- Predicate that `LNIRCode` consists of straight-line pure 64-bit scalar `.letBind` chains
+    terminating in `.ret v`, where every bound expression is an `isPureU64ScalarExpr` assigned to `.i64`. -/
+def isPureU64ScalarCode : LNIRCode → Bool
+  | .ret _ => true
+  | .letBind _ .i64 (.scalar se) k => isPureU64ScalarExpr se && isPureU64ScalarCode k
+  | _ => false
+
+/-- Check whether every variable in `ScalarExpr` is contained in `bound`. -/
+def scalarExprAllBound (bound : List VarId) : ScalarExpr → Bool
+  | .constU64 _ | .constBool _ => true
+  | .var id => bound.contains id
+  | .binOp _ l r => scalarExprAllBound bound l && scalarExprAllBound bound r
+  | .unaryOp _ a => scalarExprAllBound bound a
+  | .select c t e | .fma c t e =>
+    scalarExprAllBound bound c && scalarExprAllBound bound t && scalarExprAllBound bound e
+
+/-- Check that every `.letBind dst ... val k` in a straight-line pure 64-bit `LNIRCode` binds a fresh
+    SSA variable `dst ∉ bound` over variables already in `bound`. -/
+def isSSAPureU64Code (bound : List VarId) : LNIRCode → Bool
+  | .ret v => bound.contains v
+  | .letBind dst .i64 (.scalar se) k =>
+    !(bound.contains dst) &&
+    scalarExprAllBound bound se &&
+    isPureU64ScalarExpr se &&
+    isSSAPureU64Code (dst :: bound) k
+  | _ => false
+
+/-- Number of `.letBind` steps in `c` plus 1 (`codeStepDepth c ≤ fuel` guarantees `symExecCode`
+    and `evalCode` never exhaust fuel on straight-line code). -/
+def codeStepDepth : LNIRCode → Nat
+  | .letBind _ _ _ k => codeStepDepth k + 1
+  | _ => 1
+
+/-- Predicate matching tuple symbolic expressions (avoids inline `match` dependent-motive clashes). -/
+def isTupleSymExpr : SymExpr → Bool
+  | .tuple _ => true
+  | _ => false
+
+/-- Check whether an `LNIRDecl`'s parameter list consists solely of distinct `.i64`/`.usize`/`.i32`/`.i16`/`.i8`
+    scalar parameters, and extract their `VarId` list. -/
+def pureU64ParamIds? : List LNIRParam → Option (List VarId)
+  | [] => some []
+  | p :: ps =>
+    match p.ty, pureU64ParamIds? ps with
+    | .i64, some rest => if rest.contains p.id then none else some (p.id :: rest)
+    | _, _ => none
+
+/-- Check whether `env` binds every parameter in `params` to a `.u64` runtime value. -/
+def AllParamsU64Env (params : List VarId) (env : VarEnv) : Prop :=
+  ∀ p : VarId, params.contains p = true → ∃ n : UInt64, env p = some (.u64 n)
+
+/-- Clean pure-scalar SSA invariant on `SymExecState` over input parameter valuation `ω0`
+    and current concrete `VarEnv` `env` with live bound variable list `bound`. -/
+def PureU64SymState (ω0 : SymValuation) (params : List VarId) (bound : List VarId)
+    (st : SymExecState) (env : VarEnv) : Prop :=
+  st.bufAliases = [] ∧
+  st.allocRoots = [] ∧
+  st.sarrayVars = [] ∧
+  st.objPtrVars = [] ∧
+  st.extSeenRoots = [] ∧
+  st.typedTuples = [] ∧
+  st.refCounts = [] ∧
+  st.rcExprs = [] ∧
+  st.exclusiveBufs = [] ∧
+  st.boolVars = [] ∧
+  st.u256Vars = [] ∧
+  st.ubCond = .constBool true ∧
+  st.noUB = true ∧
+  st.symUnsupported = false ∧
+  st.symExhausted = false ∧
+  (∀ v : VarId, isTupleSymExpr (st.lookupVar v).expr = false) ∧
+  (∀ p : VarId, params.contains p = true →
+    st.u64Vars.contains p = true ∧ ∃ n : UInt64, ω0.varVal p = some (.u64 n)) ∧
+  (∀ id : VarId, bound.contains id = true →
+    ∃ n : UInt64,
+      env id = some (.u64 n) ∧
+      (st.lookupVar id).noUB = true ∧
+      isPureU64SymExprIn params (st.lookupVar id).expr = true ∧
+      denoteSymExpr ω0 (st.lookupVar id).expr = .ok (.u64 n))
+
+@[inline] def matchTupleSymExpr {α : Type} (s : SymExpr) (onTuple : List SymExpr → α) (onOther : α) : α :=
+  match s with
+  | .tuple fs => onTuple fs
+  | _ => onOther
+
 end LeanNative.Proofs

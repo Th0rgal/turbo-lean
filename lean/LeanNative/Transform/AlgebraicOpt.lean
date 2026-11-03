@@ -1,6 +1,7 @@
 import LeanNative.IR.Types
 import LeanNative.IR.AST
 import LeanNative.Proofs.PeepholeProofs
+import LeanNative.Proofs.SymbolicTVRefinesSoundness
 import LeanNative.Transform.Pass
 
 namespace LeanNative.Transform
@@ -233,6 +234,14 @@ def algebraicOptPass : TransformPass :=
   TransformPass.ofHybridVerifiedContract
     verifiedAlgebraicPeepholeContract
     (fun d => (optimizeCodeAlgebraic [] d.body, none))
+
+/-- Verified TV pass contract (`Contract V2`) for extended `optimizeCodeAlgebraic` gated by `symbolicCodeRefines`. -/
+def verifiedAlgebraicTVContract : VerifiedTVPassContract where
+  name       := "AlgebraicOpt"
+  theoremRef := "LeanNative.Proofs.SymbolicTVRefinesSoundness.symbolicValidatedDeclOpt_sound"
+  notes      := "Extended algebraic peephole & shift-add strength reduction gated by symbolicCodeRefines_sound"
+  run        := LeanNative.Proofs.runSymbolicValidatedDecl (fun d => { d with body := optimizeCodeAlgebraic [] d.body })
+  sound      := LeanNative.Proofs.symbolicValidatedDeclOpt_sound (fun d => { d with body := optimizeCodeAlgebraic [] d.body })
 
 /-- Run algebraic optimization on an `LNIRDecl` via the verified contract gate. -/
 def algebraicOptDecl (d : LNIRDecl) : LNIRDecl :=

@@ -23,6 +23,12 @@ import LeanNative.Proofs.SymbolicTVDenote
 import LeanNative.Proofs.SymbolicTVUnarySoundness
 import LeanNative.Proofs.SymbolicTVBinOpSoundness
 import LeanNative.Proofs.SymbolicTVSoundness
+import LeanNative.Proofs.SymbolicTVCodeHelpers
+import LeanNative.Proofs.SymbolicTVCodeSoundness
+import LeanNative.Proofs.SymbolicTVRefinesDefs
+import LeanNative.Proofs.SymbolicTVRefinesCtxSoundness
+import LeanNative.Proofs.SymbolicTVRefinesDeadSoundness
+import LeanNative.Proofs.SymbolicTVRefinesSoundness
 import LeanNative.Proofs.SuperoptHelpersSoundness
 import LeanNative.Proofs.SuperoptSoundness
 import LeanNative.Proofs.CertChecker

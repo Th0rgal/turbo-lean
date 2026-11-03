@@ -74,6 +74,10 @@ def verifiedTheoremRegistry : List String :=
     "checkConcreteSamples_of_codeRefines", "sound_of_checkSingleSample_eq_true",
     "symbolicTV_refl_sound", "validateTranslationDeclSound_of_passed",
     "symEvalScalarRes_pureU64_sound", "normSymExpr_pureU64_denotes",
+    "symExecCode_pureU64_denotes", "symExecCode_pureU64_eval_eq",
+    "symExecCode_pureU64_codeRefines_on_u64Env",
+    "symbolicCodeRefinesAux_sound", "symbolicCodeRefines_sound",
+    "symbolicValidatedDeclOpt_sound",
     "checkSuperoptScalarVerified_sound", "superoptScalarExprCore_sound",
     "superoptScalarExpr_sound", "superoptCodeCore_sound", "superoptCode_sound",
     "superoptDeclCore_sound", "superoptDecl_sound", "superoptModuleCore_sound",
@@ -137,6 +141,11 @@ def verifiedTheoremRegistry : List String :=
   (proofs.map ("LeanNative.Proofs.SymbolicTVUnarySoundness." ++ ·)) ++
   (proofs.map ("LeanNative.Proofs.SymbolicTVBinOpSoundness." ++ ·)) ++
   (proofs.map ("LeanNative.Proofs.SymbolicTVSoundness." ++ ·)) ++
+  (proofs.map ("LeanNative.Proofs.SymbolicTVCodeHelpers." ++ ·)) ++
+  (proofs.map ("LeanNative.Proofs.SymbolicTVCodeSoundness." ++ ·)) ++
+  (proofs.map ("LeanNative.Proofs.SymbolicTVRefinesCtxSoundness." ++ ·)) ++
+  (proofs.map ("LeanNative.Proofs.SymbolicTVRefinesDeadSoundness." ++ ·)) ++
+  (proofs.map ("LeanNative.Proofs.SymbolicTVRefinesSoundness." ++ ·)) ++
   (proofs.map ("LeanNative.Proofs.SuperoptHelpersSoundness." ++ ·)) ++
   (proofs.map ("LeanNative.Proofs.SuperoptSoundness." ++ ·)) ++
   (xform.map ("LeanNative.Transform." ++ ·)) ++

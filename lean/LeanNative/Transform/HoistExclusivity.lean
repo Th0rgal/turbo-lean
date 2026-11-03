@@ -1,6 +1,7 @@
 import LeanNative.IR.Types
 import LeanNative.IR.AST
 import LeanNative.Transform.Pass
+import LeanNative.Proofs.SymbolicTVRefinesSoundness
 
 namespace LeanNative.Transform
 
@@ -283,6 +284,14 @@ def hoistExclusivityDecl (d : LNIRDecl) : LNIRDecl :=
   let startId := maxVarDecl d + 100
   let (body', _) := hoistExclusivityCode startId d.body
   { d with body := body' }
+
+/-- Verified TV pass contract (`Contract V2`) for `HoistExclusivity` gated by `symbolicCodeRefines`. -/
+def verifiedHoistExclusivityTVContract : VerifiedTVPassContract where
+  name       := "HoistExclusivity"
+  theoremRef := "LeanNative.Proofs.SymbolicTVRefinesSoundness.symbolicValidatedDeclOpt_sound"
+  notes      := "Loop exclusivity & data pointer hoisting gated by symbolicCodeRefines_sound"
+  run        := LeanNative.Proofs.runSymbolicValidatedDecl hoistExclusivityDecl
+  sound      := LeanNative.Proofs.symbolicValidatedDeclOpt_sound hoistExclusivityDecl
 
 /-- Verified Loop Exclusivity Hoisting Pass (`HoistExclusivity`). -/
 def hoistExclusivityPass : TransformPass :=
