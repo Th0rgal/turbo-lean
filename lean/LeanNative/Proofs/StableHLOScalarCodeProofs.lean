@@ -220,7 +220,7 @@ theorem lowerScalarCode_post (Γ : HLOTyEnv) (env : VarEnv) (code : LNIRCode)
           | some rk =>
             simp only [hLk, Option.some.injEq] at hLow
             subst hLow
-            rcases lowerScalarExpr_post Γ env se tenv k rs hAgree hFr hLs with
+            rcases lowerHLOScalarExpr_post Γ env se tenv k rs hAgree hFr hLs with
               ⟨hs_le, hs_all, vs, ws, tenvS, hEvS, hEncS, hExS, hLookS, hFrS, hFrameS⟩
             rcases sameScalarTy_eq_true rs.ty declTy hsame with ⟨hdecl_eq, _⟩
             rw [hdecl_eq] at hEncS

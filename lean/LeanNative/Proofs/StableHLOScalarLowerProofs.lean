@@ -437,7 +437,7 @@ theorem lowerHLOFmaStep_post (env : VarEnv) (a b c : ScalarExpr) (tenv : Env) (k
             env_bind_ne _ _ _ _ (hq rc.nextTmp (by omega) (by omega))]⟩
 
 /-- Straight-line `lowerScalarExpr` post-condition. -/
-theorem lowerScalarExpr_post (Γ : HLOTyEnv) (env : VarEnv) (se : ScalarExpr)
+theorem lowerHLOScalarExpr_post (Γ : HLOTyEnv) (env : VarEnv) (se : ScalarExpr)
     (tenv : Env) (k : Nat) (res : HLOScalarRes)
     (hAgree : HLOEnvAgree Γ env tenv)
     (hFr : HLORegFresh tenv k)
