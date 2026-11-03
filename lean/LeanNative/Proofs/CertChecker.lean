@@ -72,7 +72,13 @@ def verifiedTheoremRegistry : List String :=
     "unboxedLoopStep_sound", "unboxedLoopAccumulator_sim", "normSymExpr_constU64",
     "normSymExpr_constBool", "normSymExpr_const_sound", "checkSingleSample_of_codeRefines",
     "checkConcreteSamples_of_codeRefines", "sound_of_checkSingleSample_eq_true",
-    "symbolicTV_refl_sound", "applyExprRules_sound", "applyRewriteTable_sound",
+    "symbolicTV_refl_sound", "validateTranslationDeclSound_of_passed",
+    "symEvalScalarRes_pureU64_sound", "normSymExpr_pureU64_denotes",
+    "checkSuperoptScalarVerified_sound", "superoptScalarExprCore_sound",
+    "superoptScalarExpr_sound", "superoptCodeCore_sound", "superoptCode_sound",
+    "superoptDeclCore_sound", "superoptDecl_sound", "superoptModuleCore_sound",
+    "superoptModule_sound", "superoptModuleWithProfile_sound",
+    "applyExprRules_sound", "applyRewriteTable_sound",
     "scheduleStructuredLoop_sound", "applyLoopScheduleAux_refines",
     "elideAndMutateRC_sound", "rewriteCodeVerified_refines", "rewriteLNIRExprVerified_sound"
   ]

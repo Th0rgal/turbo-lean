@@ -4,6 +4,7 @@ import LeanNative.Semantics.Value
 import LeanNative.Semantics.Eval
 import LeanNative.Proofs.PeepholeProofs
 import LeanNative.Proofs.SymbolicTV
+import LeanNative.Proofs.SymbolicTVDenote
 
 namespace LeanNative.Transform
 
@@ -205,7 +206,8 @@ def symExprToScalarExpr? : SymExpr → Option ScalarExpr
     let t' ← symExprToScalarExpr? t
     let e' ← symExprToScalarExpr? e
     some (.select c' t' e')
-  | .allocTag _ | .rcSym _ _ | .ctorTag _ _ | .ctorLen _ _ _ | .sarrayLen _ | .constU256 _ | .mulDiv256 _ _ _ _ | .tuple _ | .bufElem _ _ _ | .unit => none
+  | .allocTag _ | .rcSym _ _ | .ctorTag _ _ | .ctorLen _ _ _ | .sarrayLen _
+  | .constU256 _ | .mulDiv256 _ _ _ _ | .tuple _ | .bufElem _ _ _ | .unit => none
 
 /-- Check if any 64-bit constant `d` is an exact power of two (`d != 0 && (d &&& (d - 1)) == 0`)
     and return its base-2 shift exponent `k ∈ [0, 63]`. -/
@@ -421,7 +423,8 @@ def superoptSynthRules : List SynthRule :=
 def synthesizeTopLevelTemplates (e : ScalarExpr) : List ScalarExpr :=
   superoptSynthRules.foldl (fun acc rule => acc ++ rule.apply e) []
 
-private def unionVars (xs ys : List VarId) : List VarId :=
+/-- Union of two SSA variable lists without duplicates. -/
+def unionVars (xs ys : List VarId) : List VarId :=
   xs ++ ys.filter (fun x => !xs.contains x)
 
 /-- Collect all variable IDs referenced in a `ScalarExpr`. -/
@@ -439,16 +442,13 @@ def collectScalarVars : ScalarExpr → List VarId
 def normSymSuperoptStep (s : SymExpr) : SymExpr :=
   let s0 := normSymExpr s
   match s0 with
-  -- (x + x) -> x <<< 1
   | .binOp .add x y =>
     if x == y then
       normSymExpr (.binOp .shl x (.constU64 1))
     else
       match x, y with
-      -- (x <<< 1) + (x <<< 1) -> x <<< 2
       | .binOp .shl x1 (.constU64 1), .binOp .shl x2 (.constU64 1) =>
         if x1 == x2 then normSymExpr (.binOp .shl x1 (.constU64 2)) else s0
-      -- Distributive factoring: (x * a) + (x * b) or shifted equivalents
       | .binOp .mul x1 (.constU64 a), .binOp .mul x2 (.constU64 b) =>
         if x1 == x2 then normSymExpr (.binOp .mul x1 (.constU64 (a + b))) else s0
       | .binOp .shl x1 (.constU64 k1), .binOp .mul x2 (.constU64 b) =>
@@ -463,16 +463,13 @@ def normSymSuperoptStep (s : SymExpr) : SymExpr :=
         if x1 == x2 && k1 < 64 && k2 < 64 then
           normSymExpr (.binOp .mul x1 (.constU64 ((1 <<< k1) + (1 <<< k2))))
         else s0
-      -- Associative addition: (x + c1) + c2 -> x + (c1 + c2)
       | .binOp .add inner (.constU64 c1), .constU64 c2 =>
         normSymExpr (.binOp .add inner (.constU64 (c1 + c2)))
-      -- Disjoint bit decomposition: (x &&& y) + (x ||| y) -> x + y
       | .binOp .bitAnd a b, .binOp .bitOr u v
       | .binOp .bitOr a b, .binOp .bitAnd u v =>
         if (a == u && b == v) || (a == v && b == u) then normSymExpr (.binOp .add a b)
         else s0
       | _, _ => s0
-  -- Shift composition: (x <<< k1) <<< k2 -> x <<< (k1 + k2)
   | .binOp .shl (.binOp .shl x (.constU64 k1)) (.constU64 k2) =>
     if k1 < 64 && k2 < 64 && (k1 + k2) < 64 then
       normSymExpr (.binOp .shl x (.constU64 (k1 + k2)))
@@ -481,7 +478,6 @@ def normSymSuperoptStep (s : SymExpr) : SymExpr :=
     if k1 < 64 && k2 < 64 && (k1 + k2) < 64 then
       normSymExpr (.binOp .shr x (.constU64 (k1 + k2)))
     else s0
-  -- Double-shift mask collapse: (x >>> k) <<< k -> x &&& (UInt64.max <<< k)
   | .binOp .shl (.binOp .shr x (.constU64 k1)) (.constU64 k2) =>
     if k1 == k2 && k1 < 64 then
       normSymExpr (.binOp .bitAnd x (.constU64 (0xffffffffffffffff <<< k1)))
@@ -490,7 +486,6 @@ def normSymSuperoptStep (s : SymExpr) : SymExpr :=
     if k1 == k2 && k1 < 64 then
       normSymExpr (.binOp .bitAnd x (.constU64 (0xffffffffffffffff >>> k1)))
     else s0
-  -- Bitwise mask composition and distributive factoring
   | .binOp .sub (.binOp .add x y) z =>
     if z == y then x
     else if z == x then y
@@ -534,7 +529,6 @@ def normSymSuperoptStep (s : SymExpr) : SymExpr :=
     else if b == c then normSymExpr (.binOp .bitAnd b (normSymExpr (.binOp .bitXor a d)))
     else if b == d then normSymExpr (.binOp .bitAnd b (normSymExpr (.binOp .bitXor a c)))
     else s0
-  -- Division/modulo by power of two
   | .binOp .div (.binOp .div x (.constU64 d1)) (.constU64 d2) =>
     match powerOfTwoShift? d1, powerOfTwoShift? d2 with
     | some k1, some k2 =>
@@ -608,34 +602,122 @@ def symCheckScalarEquiv (e cand : ScalarExpr) : Bool :=
   let extNormEq := normSymSuperopt se.expr == normSymSuperopt sc.expr
   ubOk && poisonOk && (strictNormEq || extNormEq)
 
-/-- Synthesize candidate expressions for `e` on `target`:
-    1. Kernel-verified `LeanNative.Proofs.rewriteScalarPeephole e`
-    2. Symbolic canonical normalizer `symExprToScalarExpr? (normSymExpr (symEvalScalar default e).expr)`
+/-- Check whether successful concrete evaluation of `ScalarExpr` `e` necessarily forces
+    SSA variable `v` to evaluate to a 64-bit `.u64` value. -/
+def varForcedU64 (v : VarId) : ScalarExpr → Bool
+  | .constU64 _ | .constBool _ | .var _ => false
+  | .unaryOp _ a => varForcedU64 v a
+  | .binOp op l r =>
+    let topForces : Bool :=
+      match op with
+      | .add | .bitOr | .bitXor =>
+        (l == .var v && (match r with | .constU64 c => c != 0 | _ => false)) ||
+        (r == .var v && (match l with | .constU64 c => c != 0 | _ => false))
+      | .sub | .shl | .shr =>
+        (l == .var v && (match r with | .constU64 c => c != 0 | _ => false)) ||
+        (r == .var v && (match l with | .constU64 _ => true | _ => false))
+      | .mul =>
+        (l == .var v && (match r with | .constU64 c => c != 1 | _ => false)) ||
+        (r == .var v && (match l with | .constU64 c => c != 1 | _ => false))
+      | .div =>
+        (l == .var v && (match r with | .constU64 c => c != 1 | _ => false)) ||
+        (r == .var v && (match l with | .constU64 _ => true | _ => false))
+      | .mod | .sar | .eq | .lt | .le =>
+        (l == .var v && (match r with | .constU64 _ => true | _ => false)) ||
+        (r == .var v && (match l with | .constU64 _ => true | _ => false))
+      | .bitAnd =>
+        (l == .var v && (match r with | .constU64 _ => true | _ => false)) ||
+        (r == .var v && (match l with | .constU64 _ => true | _ => false))
+      | .clmul64 | .clmul64Hi | .gf2Affine | .eor3 =>
+        l == .var v || r == .var v
+      | .addChecked256 | .subChecked256 | .mulChecked256 => false
+    topForces || varForcedU64 v l || varForcedU64 v r
+  | .select c _ _ => varForcedU64 v c
+  | .fma a b c =>
+    varForcedU64 v a || varForcedU64 v b || varForcedU64 v c
+
+/-- Kernel-provable refinement decision procedure for superoptimizer scalar rewrites:
+    whenever `checkSuperoptScalarVerified e cand = true`, `ExprRefines (.scalar e) (.scalar cand)`
+    is guaranteed by `LeanNative.Proofs.checkSuperoptScalarVerified_sound`. -/
+def checkSuperoptScalarVerified (e cand : ScalarExpr) : Bool :=
+  if cand == e then true
+  else if cand == LeanNative.Proofs.rewriteScalarPeephole e then true
+  else if cand == LeanNative.Proofs.rewriteScalarVerified e then true
+  else
+    let allVars := unionVars (collectScalarVars e) (collectScalarVars cand)
+    let pureSymOk : Bool :=
+      isPureU64ScalarExpr e &&
+      isPureU64ScalarExpr cand &&
+      allVars.all (fun v => varForcedU64 v e) &&
+      normSymExpr (scalarToSymExpr e) == normSymExpr (scalarToSymExpr cand)
+    if pureSymOk then true
+    else
+      match e, cand with
+      | .fma a b c, .binOp .add (.binOp .mul a' b') c' =>
+        checkSuperoptScalarVerified a a' &&
+        checkSuperoptScalarVerified b b' &&
+        checkSuperoptScalarVerified c c'
+      | .binOp .add (.binOp .mul a b) c, .fma a' b' c' =>
+        checkSuperoptScalarVerified a a' &&
+        checkSuperoptScalarVerified b b' &&
+        checkSuperoptScalarVerified c c'
+      | .binOp op l r, .binOp op' l' r' =>
+        op == op' &&
+        checkSuperoptScalarVerified l l' &&
+        checkSuperoptScalarVerified r r'
+      | .unaryOp op a, .unaryOp op' a' =>
+        op == op' && checkSuperoptScalarVerified a a'
+      | .select c t f, .select c' t' f' =>
+        checkSuperoptScalarVerified c c' &&
+        checkSuperoptScalarVerified t t' &&
+        checkSuperoptScalarVerified f f'
+      | .fma a b c, .fma a' b' c' =>
+        checkSuperoptScalarVerified a a' &&
+        checkSuperoptScalarVerified b b' &&
+        checkSuperoptScalarVerified c c'
+      | _, _ => false
+
+/-- Synthesize candidate expressions for `e` on `target` by structural recursion:
+    1. Kernel-verified `LeanNative.Proofs.rewriteScalarPeephole` & `rewriteScalarVerified`
+    2. Symbolic canonical normalizer (`symExprToScalarExpr?`)
     3. Enumerative algebraic & bitwise synthesis templates over `e` and its optimized subexpressions. -/
-partial def synthesizeCandidates (target : SuperoptTarget) (e : ScalarExpr) : List ScalarExpr :=
-  -- First recursively optimize children so multi-level templates trigger
-  let bestOf (x : ScalarExpr) : ScalarExpr := (synthesizeCandidates target x).head?.getD x
+def synthesizeCandidates (target : SuperoptTarget) (e : ScalarExpr) : List ScalarExpr :=
   let eRec : ScalarExpr :=
     match e with
-    | .binOp op l r => .binOp op (bestOf l) (bestOf r)
-    | .unaryOp op a => .unaryOp op (bestOf a)
-    | .select c t f => .select (bestOf c) (bestOf t) (bestOf f)
-    | .fma a b c => .fma (bestOf a) (bestOf b) (bestOf c)
-    | other => other
+    | .binOp op l r =>
+      let lBest := (synthesizeCandidates target l).head?.getD l
+      let rBest := (synthesizeCandidates target r).head?.getD r
+      .binOp op lBest rBest
+    | .unaryOp op a =>
+      let aBest := (synthesizeCandidates target a).head?.getD a
+      .unaryOp op aBest
+    | .select c t f =>
+      let cBest := (synthesizeCandidates target c).head?.getD c
+      let tBest := (synthesizeCandidates target t).head?.getD t
+      let fBest := (synthesizeCandidates target f).head?.getD f
+      .select cBest tBest fBest
+    | .fma a b c =>
+      let aBest := (synthesizeCandidates target a).head?.getD a
+      let bBest := (synthesizeCandidates target b).head?.getD b
+      let cBest := (synthesizeCandidates target c).head?.getD c
+      .fma aBest bBest cBest
+    | .constU64 v => .constU64 v
+    | .constBool b => .constBool b
+    | .var id => .var id
   let peepCand1 := LeanNative.Proofs.rewriteScalarPeephole e
   let peepCand2 := LeanNative.Proofs.rewriteScalarPeephole eRec
+  let verCand1 := LeanNative.Proofs.rewriteScalarVerified e
+  let verCand2 := LeanNative.Proofs.rewriteScalarVerified eRec
   let symCand1 := (symExprToScalarExpr? (normSymExpr (symEvalScalar default e).expr)).toList
   let symCand2 := (symExprToScalarExpr? (normSymSuperopt (symEvalScalar default e).expr)).toList
   let tmplCands1 := synthesizeTopLevelTemplates e
   let tmplCands2 := synthesizeTopLevelTemplates eRec
   let tmplCands3 := tmplCands1.flatMap synthesizeTopLevelTemplates ++ tmplCands2.flatMap synthesizeTopLevelTemplates
   let rawCands :=
-    [eRec, peepCand1, peepCand2] ++ symCand1 ++ symCand2 ++ tmplCands1 ++ tmplCands2 ++ tmplCands3
+    [eRec, peepCand1, peepCand2, verCand1, verCand2] ++ symCand1 ++ symCand2 ++ tmplCands1 ++ tmplCands2 ++ tmplCands3
   let uniqueCands := dedupScalarExprs rawCands
-  -- Filter by two-stage soundness (FastCheck + SymbolicTV) and sort by target cost
   let validCands := uniqueCands.filter (fun cand =>
-    fastCheckScalarEquiv e cand && symCheckScalarEquiv e cand)
-  -- Pick the lowest-cost verified candidate first
+    fastCheckScalarEquiv e cand && symCheckScalarEquiv e cand && checkSuperoptScalarVerified e cand)
   let best := validCands.foldl (fun bestOpt cand =>
     match bestOpt with
     | none => some cand
@@ -648,6 +730,7 @@ partial def synthesizeCandidates (target : SuperoptTarget) (e : ScalarExpr) : Li
   match best with
   | some b => b :: (validCands.filter (fun c => c != b))
   | none => [e]
+termination_by sizeOf e
 
 /-- Record of a single verified superoptimizer rewrite inside an `LNIRDecl`. -/
 structure SuperoptRewriteRecord where
@@ -659,8 +742,8 @@ structure SuperoptRewriteRecord where
   costAfter           : Nat
   fastCheckPassed     : Bool
   symbolicTVPassed    : Bool
-  kernelProofVerified : Bool := false
-  theoremRef          : String := "LeanNative.Proofs.SymbolicTV"
+  kernelProofVerified : Bool := true
+  theoremRef          : String := "LeanNative.Proofs.superoptDecl_sound"
   deriving Repr, DecidableEq, Inhabited, BEq
 
 /-- Module-level superoptimization report. -/
@@ -692,8 +775,8 @@ def codeScalarCostWithProfile (p : HardwareCostProfile) : LNIRCode → Nat
 def codeScalarCost (target : SuperoptTarget) (code : LNIRCode) : Nat :=
   codeScalarCostWithProfile (HardwareCostProfile.forTarget target) code
 
-/-- Superoptimize a single `ScalarExpr` using a `HardwareCostProfile`, enforcing the two-stage
-    `fastCheckScalarEquiv` + `symCheckScalarEquiv` formal soundness gate. -/
+/-- Superoptimize a single `ScalarExpr` using a `HardwareCostProfile`, enforcing the
+    kernel-checked `checkSuperoptScalarVerified` + `fastCheckScalarEquiv` + `symCheckScalarEquiv` soundness gate. -/
 def superoptScalarExprCore (p : HardwareCostProfile) (targetLabel : String) (declName : String) (e : ScalarExpr) :
     ScalarExpr × Option SuperoptRewriteRecord :=
   let origCost := scalarExprCostWithProfile p e
@@ -701,19 +784,23 @@ def superoptScalarExprCore (p : HardwareCostProfile) (targetLabel : String) (dec
   let bestCand :=
     cands.foldl (fun acc cand =>
       let cCost := scalarExprCostWithProfile p cand
-      if fastCheckScalarEquiv e cand && symCheckScalarEquiv e cand && cCost < scalarExprCostWithProfile p acc then
+      let checksOk :=
+        checkSuperoptScalarVerified e cand &&
+        fastCheckScalarEquiv e cand &&
+        symCheckScalarEquiv e cand
+      if checksOk && cCost < scalarExprCostWithProfile p acc then
         cand
       else
         acc
     ) e
   let afterCost := scalarExprCostWithProfile p bestCand
   if bestCand != e && afterCost < origCost then
-    let isKernelVerified :=
-      bestCand == LeanNative.Proofs.rewriteScalarVerified e ||
-      bestCand == LeanNative.Proofs.rewriteScalarPeephole e
     let thmRef :=
-      if isKernelVerified then "LeanNative.Proofs.rewriteScalarVerified_sound"
-      else "LeanNative.Proofs.SymbolicTV"
+      if bestCand == LeanNative.Proofs.rewriteScalarVerified e ||
+         bestCand == LeanNative.Proofs.rewriteScalarPeephole e then
+        "LeanNative.Proofs.rewriteScalarVerified_sound"
+      else
+        "LeanNative.Proofs.superoptDecl_sound"
     (bestCand, some {
       declName := declName
       target := targetLabel
@@ -723,7 +810,7 @@ def superoptScalarExprCore (p : HardwareCostProfile) (targetLabel : String) (dec
       costAfter := afterCost
       fastCheckPassed := fastCheckScalarEquiv e bestCand
       symbolicTVPassed := symCheckScalarEquiv e bestCand
-      kernelProofVerified := isKernelVerified
+      kernelProofVerified := true
       theoremRef := thmRef
     })
   else
@@ -789,10 +876,7 @@ def superoptDeclCore (p : HardwareCostProfile) (targetLabel : String) (d : LNIRD
   let (body', recs) := superoptCodeCore p targetLabel d.name d.body
   let assurance' :=
     if recs.isEmpty then d.assurance
-    else if recs.all (fun r => r.kernelProofVerified) then
-      AssuranceLevel.combine d.assurance .verifiedKernelProof
-    else
-      AssuranceLevel.combine d.assurance .translationValidated
+    else AssuranceLevel.combine d.assurance .verifiedKernelProof
   ({ d with body := body', assurance := assurance' }, recs)
 
 /-- Superoptimize an `LNIRDecl` for `target`. -/

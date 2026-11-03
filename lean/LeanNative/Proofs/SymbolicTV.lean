@@ -158,141 +158,208 @@ def atomDefinitelyBool : SymExpr → Bool
   | .ite c t (.constBool false) => atomDefinitelyBool c && atomDefinitelyBool t
   | _ => false
 
-/-- Extract core body of `normSymBinOpStep` after commutativity ordering (`l`, `r`) and width flag (`w64`). -/
+/-- Extract core body of `normSymBinOpStep` after commutativity ordering (`l`, `r`) and width flag (`w64`),
+    dispatching on `op` first so each operator's matcher stays compact. -/
 def normSymBinOpCore (op : BinOp) (l r : SymExpr) (w64 : Bool) : SymExpr :=
-  match op, l, r with
-  | .add, .constU64 a, .constU64 b => .constU64 (a + b)
-  | .sub, .constU64 a, .constU64 b => .constU64 (a - b)
-  | .mul, .constU64 a, .constU64 b => .constU64 (a * b)
-  | .clmul64, .constU64 a, .constU64 b => .constU64 (clmul64 a b)
-  | .clmul64Hi, .constU64 a, .constU64 b => .constU64 (clmul64Hi a b)
-  | .gf2Affine, .constU64 a, .constU64 b => .constU64 (gf2Affine a b) | .eor3, .constU64 a, .constU64 b => .constU64 (eor3 a b)
-  | .div, .constU64 a, .constU64 b => .constU64 (a / b)
-  | .mod, .constU64 a, .constU64 b => .constU64 (a % b)
-  | .bitAnd, .constU64 a, .constU64 b => .constU64 (a &&& b)
-  | .bitOr,  .constU64 a, .constU64 b => .constU64 (a ||| b)
-  | .bitXor, .constU64 a, .constU64 b => .constU64 (a ^^^ b)
-  | .shl,    .constU64 a, .constU64 b => .constU64 (a <<< (b &&& 63))
-  | .shr,    .constU64 a, .constU64 b => .constU64 (a >>> (b &&& 63))
-  | .eq,     .constU64 a, .constU64 b => .constBool (a == b)
-  | .lt,     .constU64 a, .constU64 b => .constBool (decide (a < b))
-  | .le,     .constU64 a, .constU64 b => .constBool (decide (a ≤ b))
-  | .eq,     .constBool a, .constBool b => .constBool (a == b)
-  | .add,    .constU256 a, .constU256 b => .constU256 (UInt256.add a b)
-  | .sub,    .constU256 a, .constU256 b => .constU256 (UInt256.sub a b)
-  | .mul,    .constU256 a, .constU256 b => .constU256 (UInt256.mul a b)
-  | .bitAnd, .constU256 a, .constU256 b => .constU256 (UInt256.bitAnd a b)
-  | .bitOr,  .constU256 a, .constU256 b => .constU256 (UInt256.bitOr a b)
-  | .bitXor, .constU256 a, .constU256 b => .constU256 (UInt256.bitXor a b)
-  | .shl,    .constU256 a, .constU256 b => .constU256 (UInt256.shl a b.toNat)
-  | .shr,    .constU256 a, .constU256 b => .constU256 (UInt256.shr a b.toNat)
-  | .sar,    .constU256 a, .constU256 b => .constU256 (UInt256.sar a b.toNat)
-  | .eq,     .constU256 a, .constU256 b => .constBool (a == b)
-  | .lt,     .constU256 a, .constU256 b => .constBool (UInt256.lt a b)
-  | .le,     .constU256 a, .constU256 b => .constBool (UInt256.le a b)
-  | .add, x, .constU256 w | .add, .constU256 w, x | .sub, x, .constU256 w
-  | .bitOr, x, .constU256 w | .bitOr, .constU256 w, x
-  | .bitXor, x, .constU256 w | .bitXor, .constU256 w, x
-  | .shl, x, .constU256 w | .shr, x, .constU256 w | .sar, x, .constU256 w =>
-    if w == UInt256.zero then x else .binOp op l r
-  | .mul, x, .constU256 w | .mul, .constU256 w, x =>
-    if w == UInt256.zero then .constU256 UInt256.zero
-    else if w == UInt256.ofUInt64 1 then x
-    else .binOp op l r
-  | .div, x, .constU256 w =>
-    if w == UInt256.ofUInt64 1 then x else .binOp op l r
-  | .bitAnd, _, .constU256 w | .bitAnd, .constU256 w, _ =>
-    if w == UInt256.zero then .constU256 UInt256.zero else .binOp op l r
-  | .add, x, .constU64 0 | .add, .constU64 0, x | .sub, x, .constU64 0 => x
-  | .add, .binOp .add x (.constU64 a), .constU64 b =>
-    if subexprDefinitely64 w64 a x then
-      let s := a + b
-      if s == 0 then x else .binOp .add x (.constU64 s)
-    else .binOp op l r
-  | .add, .binOp .sub x (.constU64 a), .constU64 b =>
-    if subexprDefinitely64 w64 a x then
-      if a == b then x
-      else if b > a then .binOp .add x (.constU64 (b - a))
-      else .binOp .sub x (.constU64 (a - b))
-    else .binOp op l r
-  | .sub, .binOp .add x (.constU64 a), .constU64 b =>
-    if subexprDefinitely64 w64 a x then
-      if a == b then x
-      else if a > b then .binOp .add x (.constU64 (a - b))
-      else .binOp .sub x (.constU64 (b - a))
-    else .binOp op l r
-  | .sub, .binOp .sub x (.constU64 a), .constU64 b =>
-    if subexprDefinitely64 w64 a x then
-      let s := a + b
-      if s == 0 then x else .binOp .sub x (.constU64 s)
-    else .binOp op l r
-  | .sub, x, y =>
-    if (w64 || exprDefinitely64 x) && x == y then .constU64 0
-    else match x with
-      | .constU256 _ => if x == y then .constU256 UInt256.zero else .binOp .sub x y
-      | _ => .binOp .sub x y
-  | .mul, x, .constU64 1 | .mul, .constU64 1, x => x
-  | .mul, x, .constU64 0 => if w64 || exprDefinitely64 x then .constU64 0 else .binOp .mul x (.constU64 0)
-  | .mul, .constU64 0, x => if w64 || exprDefinitely64 x then .constU64 0 else .binOp .mul (.constU64 0) x
-  | .mul, x, .constU64 c =>
-    if w64 || exprDefinitely64 x then
-      match pow2ShiftLog2 c with
-      | some k => .binOp .shl x (.constU64 k)
-      | none => .binOp .mul x (.constU64 c)
-    else .binOp .mul x (.constU64 c)
-  | .mul, .constU64 c, x =>
-    if w64 || exprDefinitely64 x then
-      match pow2ShiftLog2 c with
-      | some k => .binOp .shl x (.constU64 k)
-      | none => .binOp .mul (.constU64 c) x
-    else .binOp .mul (.constU64 c) x
-  | .div, x, .constU64 0 => if w64 || exprDefinitely64 x then .constU64 0 else .binOp .div x (.constU64 0)
-  | .div, x, .constU64 1 => x
-  | .div, x, .constU64 c =>
-    if w64 || exprDefinitely64 x then
-      match pow2ShiftLog2 c with
-      | some k => .binOp .shr x (.constU64 k)
-      | none => .binOp .div x (.constU64 c)
-    else .binOp .div x (.constU64 c)
-  | .mod, x, .constU64 0 => if w64 || exprDefinitely64 x then x else .binOp .mod x (.constU64 0)
-  | .mod, x, .constU64 1 => if w64 || exprDefinitely64 x then .constU64 0 else .binOp .mod x (.constU64 1)
-  | .mod, x, .constU64 c =>
-    if w64 || exprDefinitely64 x then
-      match pow2ShiftLog2 c with
-      | some _ => .binOp .bitAnd x (.constU64 (c - 1))
-      | none => .binOp .mod x (.constU64 c)
-    else .binOp .mod x (.constU64 c)
-  | .bitXor, x, .constU64 0 | .bitXor, .constU64 0, x => x
-  | .bitXor, x, y =>
-    if (w64 || exprDefinitely64 x) && x == y then .constU64 0
-    else match x with
-      | .constU256 _ => if x == y then .constU256 UInt256.zero else .binOp .bitXor x y
-      | _ => .binOp .bitXor x y
-  | .bitOr,  x, .constU64 0 | .bitOr,  .constU64 0, x => x
-  | .bitOr,  x, y => if x == y then x else .binOp .bitOr x y
-  | .bitAnd, x, .constU64 0 => if w64 || exprDefinitely64 x then .constU64 0 else .binOp .bitAnd x (.constU64 0)
-  | .bitAnd, .constU64 0, x => if w64 || exprDefinitely64 x then .constU64 0 else .binOp .bitAnd (.constU64 0) x
-  | .bitAnd, x, y => if x == y then x else .binOp .bitAnd x y
-  | .shl, x, .constU64 0 | .shr, x, .constU64 0 => x
-  | .eq, x, .constBool true | .eq, .constBool true, x =>
-    if atomDefinitelyBool x then x else .binOp .eq l r
-  | .eq, .unaryOp .not x, .constBool false | .eq, .constBool false, .unaryOp .not x =>
-    if atomDefinitelyBool x then x else .binOp .eq l r
-  | .eq, x, .constBool false | .eq, .constBool false, x =>
-    if atomDefinitelyBool x then .unaryOp .not x else .binOp .eq l r
-  | .eq, x, y =>
-    if x == y && (w64 || exprDefinitely64 x || atomDefinitelyBool x ||
-        (match x with | .constU256 _ => true | _ => false)) then .constBool true
-    else .binOp .eq x y
-  | .lt, x, y =>
-    if x == y && (w64 || exprDefinitely64 x ||
-        (match x with | .constU256 _ => true | _ => false)) then .constBool false
-    else .binOp .lt x y
-  | .le, x, y =>
-    if x == y && (w64 || exprDefinitely64 x ||
-        (match x with | .constU256 _ => true | _ => false)) then .constBool true
-    else .binOp .le x y
-  | _, _, _ => .binOp op l r
+  match op with
+  | .add =>
+    match l, r with
+    | .constU64 a, .constU64 b => .constU64 (a + b)
+    | .constU256 a, .constU256 b => .constU256 (UInt256.add a b)
+    | x, .constU256 w | .constU256 w, x =>
+      if w == UInt256.zero then x else .binOp .add l r
+    | x, .constU64 0 | .constU64 0, x => x
+    | .binOp .add x (.constU64 a), .constU64 b =>
+      if subexprDefinitely64 w64 a x then
+        let s := a + b
+        if s == 0 then x else .binOp .add x (.constU64 s)
+      else .binOp .add l r
+    | .binOp .sub x (.constU64 a), .constU64 b =>
+      if subexprDefinitely64 w64 a x then
+        if a == b then x
+        else if b > a then .binOp .add x (.constU64 (b - a))
+        else .binOp .sub x (.constU64 (a - b))
+      else .binOp .add l r
+    | _, _ => .binOp .add l r
+  | .sub =>
+    match l, r with
+    | .constU64 a, .constU64 b => .constU64 (a - b)
+    | .constU256 a, .constU256 b => .constU256 (UInt256.sub a b)
+    | x, .constU256 w =>
+      if w == UInt256.zero then x else .binOp .sub l r
+    | x, .constU64 0 => x
+    | .binOp .add x (.constU64 a), .constU64 b =>
+      if subexprDefinitely64 w64 a x then
+        if a == b then x
+        else if a > b then .binOp .add x (.constU64 (a - b))
+        else .binOp .sub x (.constU64 (b - a))
+      else .binOp .sub l r
+    | .binOp .sub x (.constU64 a), .constU64 b =>
+      if subexprDefinitely64 w64 a x then
+        let s := a + b
+        if s == 0 then x else .binOp .sub x (.constU64 s)
+      else .binOp .sub l r
+    | x, y =>
+      if (w64 || exprDefinitely64 x) && x == y then .constU64 0
+      else match x with
+        | .constU256 _ => if x == y then .constU256 UInt256.zero else .binOp .sub x y
+        | _ => .binOp .sub x y
+  | .mul =>
+    match l, r with
+    | .constU64 a, .constU64 b => .constU64 (a * b)
+    | .constU256 a, .constU256 b => .constU256 (UInt256.mul a b)
+    | x, .constU256 w | .constU256 w, x =>
+      if w == UInt256.zero then .constU256 UInt256.zero
+      else if w == UInt256.ofUInt64 1 then x
+      else .binOp .mul l r
+    | x, .constU64 1 | .constU64 1, x => x
+    | x, .constU64 0 =>
+      if w64 || exprDefinitely64 x then .constU64 0 else .binOp .mul x (.constU64 0)
+    | .constU64 0, x =>
+      if w64 || exprDefinitely64 x then .constU64 0 else .binOp .mul (.constU64 0) x
+    | x, .constU64 c =>
+      if w64 || exprDefinitely64 x then
+        match pow2ShiftLog2 c with
+        | some k => .binOp .shl x (.constU64 k)
+        | none => .binOp .mul x (.constU64 c)
+      else .binOp .mul x (.constU64 c)
+    | .constU64 c, x =>
+      if w64 || exprDefinitely64 x then
+        match pow2ShiftLog2 c with
+        | some k => .binOp .shl x (.constU64 k)
+        | none => .binOp .mul (.constU64 c) x
+      else .binOp .mul (.constU64 c) x
+    | _, _ => .binOp .mul l r
+  | .div =>
+    match l, r with
+    | .constU64 a, .constU64 b => .constU64 (a / b)
+    | x, .constU256 w =>
+      if w == UInt256.ofUInt64 1 then x else .binOp .div l r
+    | x, .constU64 0 =>
+      if w64 || exprDefinitely64 x then .constU64 0 else .binOp .div x (.constU64 0)
+    | x, .constU64 1 => x
+    | x, .constU64 c =>
+      if w64 || exprDefinitely64 x then
+        match pow2ShiftLog2 c with
+        | some k => .binOp .shr x (.constU64 k)
+        | none => .binOp .div x (.constU64 c)
+      else .binOp .div x (.constU64 c)
+    | _, _ => .binOp .div l r
+  | .mod =>
+    match l, r with
+    | .constU64 a, .constU64 b => .constU64 (a % b)
+    | x, .constU64 0 =>
+      if w64 || exprDefinitely64 x then x else .binOp .mod x (.constU64 0)
+    | x, .constU64 1 =>
+      if w64 || exprDefinitely64 x then .constU64 0 else .binOp .mod x (.constU64 1)
+    | x, .constU64 c =>
+      if w64 || exprDefinitely64 x then
+        match pow2ShiftLog2 c with
+        | some _ => .binOp .bitAnd x (.constU64 (c - 1))
+        | none => .binOp .mod x (.constU64 c)
+      else .binOp .mod x (.constU64 c)
+    | _, _ => .binOp .mod l r
+  | .bitAnd =>
+    match l, r with
+    | .constU64 a, .constU64 b => .constU64 (a &&& b)
+    | .constU256 a, .constU256 b => .constU256 (UInt256.bitAnd a b)
+    | _, .constU256 w | .constU256 w, _ =>
+      if w == UInt256.zero then .constU256 UInt256.zero else .binOp .bitAnd l r
+    | x, .constU64 0 =>
+      if w64 || exprDefinitely64 x then .constU64 0 else .binOp .bitAnd x (.constU64 0)
+    | .constU64 0, x =>
+      if w64 || exprDefinitely64 x then .constU64 0 else .binOp .bitAnd (.constU64 0) x
+    | x, y => if x == y then x else .binOp .bitAnd x y
+  | .bitOr =>
+    match l, r with
+    | .constU64 a, .constU64 b => .constU64 (a ||| b)
+    | .constU256 a, .constU256 b => .constU256 (UInt256.bitOr a b)
+    | x, .constU256 w | .constU256 w, x =>
+      if w == UInt256.zero then x else .binOp .bitOr l r
+    | x, .constU64 0 | .constU64 0, x => x
+    | x, y => if x == y then x else .binOp .bitOr x y
+  | .bitXor =>
+    match l, r with
+    | .constU64 a, .constU64 b => .constU64 (a ^^^ b)
+    | .constU256 a, .constU256 b => .constU256 (UInt256.bitXor a b)
+    | x, .constU256 w | .constU256 w, x =>
+      if w == UInt256.zero then x else .binOp .bitXor l r
+    | x, .constU64 0 | .constU64 0, x => x
+    | x, y =>
+      if (w64 || exprDefinitely64 x) && x == y then .constU64 0
+      else match x with
+        | .constU256 _ => if x == y then .constU256 UInt256.zero else .binOp .bitXor x y
+        | _ => .binOp .bitXor x y
+  | .shl =>
+    match l, r with
+    | .constU64 a, .constU64 b => .constU64 (a <<< (b &&& 63))
+    | .constU256 a, .constU256 b => .constU256 (UInt256.shl a b.toNat)
+    | x, .constU256 w =>
+      if w == UInt256.zero then x else .binOp .shl l r
+    | x, .constU64 0 => x
+    | _, _ => .binOp .shl l r
+  | .shr =>
+    match l, r with
+    | .constU64 a, .constU64 b => .constU64 (a >>> (b &&& 63))
+    | .constU256 a, .constU256 b => .constU256 (UInt256.shr a b.toNat)
+    | x, .constU256 w =>
+      if w == UInt256.zero then x else .binOp .shr l r
+    | x, .constU64 0 => x
+    | _, _ => .binOp .shr l r
+  | .sar =>
+    match l, r with
+    | .constU256 a, .constU256 b => .constU256 (UInt256.sar a b.toNat)
+    | x, .constU256 w =>
+      if w == UInt256.zero then x else .binOp .sar l r
+    | _, _ => .binOp .sar l r
+  | .clmul64 =>
+    match l, r with
+    | .constU64 a, .constU64 b => .constU64 (clmul64 a b)
+    | _, _ => .binOp .clmul64 l r
+  | .clmul64Hi =>
+    match l, r with
+    | .constU64 a, .constU64 b => .constU64 (clmul64Hi a b)
+    | _, _ => .binOp .clmul64Hi l r
+  | .gf2Affine =>
+    match l, r with
+    | .constU64 a, .constU64 b => .constU64 (gf2Affine a b)
+    | _, _ => .binOp .gf2Affine l r
+  | .eor3 =>
+    match l, r with
+    | .constU64 a, .constU64 b => .constU64 (eor3 a b)
+    | _, _ => .binOp .eor3 l r
+  | .eq =>
+    match l, r with
+    | .constU64 a, .constU64 b => .constBool (a == b)
+    | .constBool a, .constBool b => .constBool (a == b)
+    | .constU256 a, .constU256 b => .constBool (a == b)
+    | x, .constBool true | .constBool true, x =>
+      if atomDefinitelyBool x then x else .binOp .eq l r
+    | .unaryOp .not x, .constBool false | .constBool false, .unaryOp .not x =>
+      if atomDefinitelyBool x then x else .binOp .eq l r
+    | x, .constBool false | .constBool false, x =>
+      if atomDefinitelyBool x then .unaryOp .not x else .binOp .eq l r
+    | x, y =>
+      if x == y && (w64 || exprDefinitely64 x || atomDefinitelyBool x ||
+          (match x with | .constU256 _ => true | _ => false)) then .constBool true
+      else .binOp .eq x y
+  | .lt =>
+    match l, r with
+    | .constU64 a, .constU64 b => .constBool (decide (a < b))
+    | .constU256 a, .constU256 b => .constBool (UInt256.lt a b)
+    | x, y =>
+      if x == y && (w64 || exprDefinitely64 x ||
+          (match x with | .constU256 _ => true | _ => false)) then .constBool false
+      else .binOp .lt x y
+  | .le =>
+    match l, r with
+    | .constU64 a, .constU64 b => .constBool (decide (a ≤ b))
+    | .constU256 a, .constU256 b => .constBool (UInt256.le a b)
+    | x, y =>
+      if x == y && (w64 || exprDefinitely64 x ||
+          (match x with | .constU256 _ => true | _ => false)) then .constBool true
+      else .binOp .le x y
+  | .addChecked256 | .subChecked256 | .mulChecked256 => .binOp op l r
 
 /-- Single-step algebraic & strength-reduction normalizer on `SymExpr`. -/
 def normSymBinOpStep (op : BinOp) (lhs rhs : SymExpr) (width64Safe : Bool := false) : SymExpr :=

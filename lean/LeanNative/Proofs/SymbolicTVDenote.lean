@@ -258,6 +258,20 @@ def isPureU64ScalarExpr : ScalarExpr → Bool
      | .sar | .eq | .lt | .le | .addChecked256 | .subChecked256 | .mulChecked256 => false) &&
     isPureU64ScalarExpr l && isPureU64ScalarExpr r
 
+/-- Predicate that a symbolic expression uses only canonical 64-bit arithmetic, bitwise,
+    and shift operators over `u64`-bound symbolic variables in `vars` and 64-bit constants. -/
+def isPureU64SymExprIn (vars : List VarId) : SymExpr → Bool
+  | .constU64 _ => true
+  | .symVar id => vars.contains id
+  | .unaryOp .not a | .unaryOp .neg a => isPureU64SymExprIn vars a
+  | .binOp op l r =>
+    (match op with
+     | .add | .sub | .mul | .div | .mod | .bitAnd | .bitOr | .bitXor
+     | .shl | .shr | .clmul64 | .clmul64Hi | .gf2Affine | .eor3 => true
+     | .sar | .eq | .lt | .le | .addChecked256 | .subChecked256 | .mulChecked256 => false) &&
+    isPureU64SymExprIn vars l && isPureU64SymExprIn vars r
+  | _ => false
+
 /-- Every expression in `xs` denotes a `.bool` value under `ω`. -/
 def allBoolAtoms (ω : SymValuation) : List SymExpr → Prop
   | [] => True

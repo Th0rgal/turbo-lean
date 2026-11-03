@@ -653,302 +653,344 @@ theorem normSymBinOpCore_u64_denotes (ω : SymValuation) (op : BinOp) (l r : Sym
     (hl : denoteSymExpr ω l = .ok (.u64 nl))
     (hr : denoteSymExpr ω r = .ok (.u64 nr)) :
     denoteSymExpr ω (normSymBinOpCore op l r w64) = evalBinOp op (.u64 nl) (.u64 nr) := by
-  unfold normSymBinOpCore
   have deflt : denoteSymExpr ω (.binOp op l r) = evalBinOp op (.u64 nl) (.u64 nr) := by
     simp only [denoteSymExpr, hl, hr]
-  split
-  -- 1..12: UInt64 constant folding
-  · cases hl; cases hr; rfl
-  · cases hl; cases hr; rfl
-  · cases hl; cases hr; rfl
-  · cases hl; cases hr; rfl
-  · cases hl; cases hr; rfl
-  · cases hl; cases hr; rfl
-  · cases hl; cases hr; rfl
-  · cases hl; cases hr; rfl
-  · cases hl; cases hr; rfl
-  · cases hl; cases hr; rfl
-  · cases hl; cases hr; rfl
-  · cases hl; cases hr; rfl
-  -- 13..14: shl, shr constant folding
-  · cases hl; cases hr
-    exact congrArg (Except.ok ∘ Val.u64) (uint64_shiftLeft_and_63 _ _)
-  · cases hl; cases hr
-    exact congrArg (Except.ok ∘ Val.u64) (uint64_shiftRight_and_63 _ _)
-  -- 15..17: eq, lt, le constant folding
-  · cases hl; cases hr; rfl
-  · cases hl; cases hr; rfl
-  · cases hl; cases hr; rfl
-  -- Eliminate all constBool / constU256 branches and fallback identity branches!
-  all_goals try (cases hl; done)
-  all_goals try (cases hr; done)
-  all_goals try (exact deflt)
-  -- add x 0
-  · injection hr with h2; injection h2 with h2'; subst h2'
-    rw [hl]; exact (evalBinOp_add_zero (.u64 nl)).symm
-  -- add 0 x
-  · injection hl with h1; injection h1 with h1'; subst h1'
-    rw [hr]; exact (evalBinOp_zero_add (.u64 nr)).symm
-  -- sub x 0
-  · injection hr with h2; injection h2 with h2'; subst h2'
-    rw [hl]; exact (evalBinOp_sub_zero (.u64 nl)).symm
-  -- add (add x a) b
-  · injection hr with h2; injection h2 with h2'; subst h2'
-    rename_i x a b _
-    cases hsub : subexprDefinitely64 w64 a x
-    · exact deflt
-    · simp only [↓reduceIte]
-      obtain ⟨nx, hx, hnx⟩ := denote_binOp_constU64_u64 (Or.inl rfl) hl
-      simp only [↓reduceIte] at hnx; subst hnx
-      have hre := uint64_add_add_reassoc nx a b
-      cases hs : (a + b == 0)
-      · simp only [hs, Bool.false_eq_true, ↓reduceIte, denoteSymExpr, hx] at hre ⊢
-        exact congrArg (Except.ok ∘ Val.u64) hre.symm
-      · simp only [hs, ↓reduceIte] at hre ⊢
-        rw [hx]; exact congrArg (Except.ok ∘ Val.u64) hre.symm
-  -- add (sub x a) b
-  · injection hr with h2; injection h2 with h2'; subst h2'
-    rename_i x a b _
-    cases hsub : subexprDefinitely64 w64 a x
-    · exact deflt
-    · simp only [↓reduceIte]
-      obtain ⟨nx, hx, hnx⟩ := denote_binOp_constU64_u64 (Or.inr rfl) hl
-      simp only [reduceCtorEq, ↓reduceIte] at hnx; subst hnx
-      have hre := uint64_sub_add_reassoc nx a b
-      cases hab : (a == b)
-      · simp only [hab, Bool.false_eq_true, ↓reduceIte] at hre ⊢
-        by_cases hgt : b > a
-        · simp only [hgt, decide_true, ↓reduceIte, denoteSymExpr, hx] at hre ⊢
-          exact congrArg (Except.ok ∘ Val.u64) hre.symm
-        · simp only [hgt, decide_false, Bool.false_eq_true, ↓reduceIte, denoteSymExpr, hx] at hre ⊢
-          exact congrArg (Except.ok ∘ Val.u64) hre.symm
-      · simp only [hab, ↓reduceIte] at hre ⊢
-        rw [hx]; exact congrArg (Except.ok ∘ Val.u64) hre.symm
-  -- sub (add x a) b
-  · injection hr with h2; injection h2 with h2'; subst h2'
-    rename_i x a b _
-    cases hsub : subexprDefinitely64 w64 a x
-    · exact deflt
-    · simp only [↓reduceIte]
-      obtain ⟨nx, hx, hnx⟩ := denote_binOp_constU64_u64 (Or.inl rfl) hl
-      simp only [↓reduceIte] at hnx; subst hnx
-      have hre := uint64_add_sub_reassoc nx a b
-      cases hab : (a == b)
-      · simp only [hab, Bool.false_eq_true, ↓reduceIte] at hre ⊢
-        by_cases hgt : a > b
-        · simp only [hgt, decide_true, ↓reduceIte, denoteSymExpr, hx] at hre ⊢
-          exact congrArg (Except.ok ∘ Val.u64) hre.symm
-        · simp only [hgt, decide_false, Bool.false_eq_true, ↓reduceIte, denoteSymExpr, hx] at hre ⊢
-          exact congrArg (Except.ok ∘ Val.u64) hre.symm
-      · simp only [hab, ↓reduceIte] at hre ⊢
-        rw [hx]; exact congrArg (Except.ok ∘ Val.u64) hre.symm
-  -- sub (sub x a) b
-  · injection hr with h2; injection h2 with h2'; subst h2'
-    rename_i x a b _
-    cases hsub : subexprDefinitely64 w64 a x
-    · exact deflt
-    · simp only [↓reduceIte]
-      obtain ⟨nx, hx, hnx⟩ := denote_binOp_constU64_u64 (Or.inr rfl) hl
-      simp only [reduceCtorEq, ↓reduceIte] at hnx; subst hnx
-      have hre := uint64_sub_sub_reassoc nx a b
-      cases hs : (a + b == 0)
-      · simp only [hs, Bool.false_eq_true, ↓reduceIte, denoteSymExpr, hx] at hre ⊢
-        exact congrArg (Except.ok ∘ Val.u64) hre.symm
-      · simp only [hs, ↓reduceIte] at hre ⊢
-        rw [hx]; exact congrArg (Except.ok ∘ Val.u64) hre.symm
-  -- sub l r (reflexive)
-  · cases hcond : ((w64 || exprDefinitely64 l) && (l == r))
-    · simp only [Bool.false_eq_true, ↓reduceIte]
-      cases l with
-      | constU256 _ => cases hl
-      | _ => exact deflt
-    · simp only [↓reduceIte]
-      simp only [Bool.and_eq_true] at hcond
-      have hlr := SymExpr_eq_of_beq hcond.2; subst hlr
-      have hn : nl = nr := by rw [hl] at hr; injection hr with h1; injection h1 with h2
-      subst hn
-      change Except.ok (Val.u64 0) = Except.ok (Val.u64 (nl - nl))
-      rw [UInt64.sub_self]
-  -- mul l 1
-  · injection hr with h2; injection h2 with h2'; subst h2'
-    rw [hl]; exact (evalBinOp_mul_one (.u64 nl)).symm
-  -- mul 1 r
-  · injection hl with h1; injection h1 with h1'; subst h1'
-    rw [hr]; exact (evalBinOp_one_mul (.u64 nr)).symm
-  -- mul l 0
-  · injection hr with h2; injection h2 with h2'; subst h2'
-    cases (w64 || exprDefinitely64 l)
-    · exact deflt
-    · change Except.ok (Val.u64 0) = Except.ok (Val.u64 (nl * 0)); rw [UInt64.mul_zero]
-  -- mul 0 r
-  · injection hl with h1; injection h1 with h1'; subst h1'
-    cases (w64 || exprDefinitely64 r)
-    · exact deflt
-    · change Except.ok (Val.u64 0) = Except.ok (Val.u64 (0 * nr)); rw [UInt64.zero_mul]
-  -- mul l c (pow2ShiftLog2)
-  · injection hr with h2; injection h2 with h2'; subst h2'
-    cases (w64 || exprDefinitely64 l)
-    · exact deflt
-    · simp only [↓reduceIte]
-      split
-      · rename_i k hk
-        simp only [denoteSymExpr, hl]
-        exact congrArg (Except.ok ∘ Val.u64) (pow2ShiftLog2_mul_right hk nl).symm
+  cases op <;> dsimp only [normSymBinOpCore]
+  case add =>
+    split
+    · cases hl; cases hr; rfl
+    · cases hl
+    · cases hr
+    · cases hl
+    · injection hr with h2; injection h2 with h2'; subst h2'
+      rw [hl]; exact (evalBinOp_add_zero (.u64 nl)).symm
+    · injection hl with h1; injection h1 with h1'; subst h1'
+      rw [hr]; exact (evalBinOp_zero_add (.u64 nr)).symm
+    · injection hr with h2; injection h2 with h2'; subst h2'
+      rename_i x a b _
+      cases hsub : subexprDefinitely64 w64 a x
       · exact deflt
-  -- mul c r (pow2ShiftLog2)
-  · injection hl with h1; injection h1 with h1'; subst h1'
-    cases (w64 || exprDefinitely64 r)
-    · exact deflt
-    · simp only [↓reduceIte]
-      split
-      · rename_i k hk
-        simp only [denoteSymExpr, hr]
-        exact congrArg (Except.ok ∘ Val.u64) (pow2ShiftLog2_mul_left hk nr).symm
+      · simp only [↓reduceIte]
+        obtain ⟨nx, hx, hnx⟩ := denote_binOp_constU64_u64 (Or.inl rfl) hl
+        simp only [↓reduceIte] at hnx; subst hnx
+        have hre := uint64_add_add_reassoc nx a b
+        cases hs : (a + b == 0)
+        · simp only [hs, Bool.false_eq_true, ↓reduceIte, denoteSymExpr, hx] at hre ⊢
+          exact congrArg (Except.ok ∘ Val.u64) hre.symm
+        · simp only [hs, ↓reduceIte] at hre ⊢
+          rw [hx]; exact congrArg (Except.ok ∘ Val.u64) hre.symm
+    · injection hr with h2; injection h2 with h2'; subst h2'
+      rename_i x a b _
+      cases hsub : subexprDefinitely64 w64 a x
       · exact deflt
-  -- div l 0
-  · injection hr with h2; injection h2 with h2'; subst h2'
-    cases (w64 || exprDefinitely64 l)
+      · simp only [↓reduceIte]
+        obtain ⟨nx, hx, hnx⟩ := denote_binOp_constU64_u64 (Or.inr rfl) hl
+        simp only [reduceCtorEq, ↓reduceIte] at hnx; subst hnx
+        have hre := uint64_sub_add_reassoc nx a b
+        cases hab : (a == b)
+        · simp only [hab, Bool.false_eq_true, ↓reduceIte] at hre ⊢
+          by_cases hgt : b > a
+          · simp only [hgt, decide_true, ↓reduceIte, denoteSymExpr, hx] at hre ⊢
+            exact congrArg (Except.ok ∘ Val.u64) hre.symm
+          · simp only [hgt, decide_false, Bool.false_eq_true, ↓reduceIte, denoteSymExpr, hx] at hre ⊢
+            exact congrArg (Except.ok ∘ Val.u64) hre.symm
+        · simp only [hab, ↓reduceIte] at hre ⊢
+          rw [hx]; exact congrArg (Except.ok ∘ Val.u64) hre.symm
     · exact deflt
-    · change Except.ok (Val.u64 0) = Except.ok (Val.u64 (nl / 0))
-      cases nl with | ofBitVec bv => exact congrArg (Except.ok ∘ Val.u64 ∘ UInt64.ofBitVec) BitVec.udiv_zero.symm
-  -- div l 1
-  · injection hr with h2; injection h2 with h2'; subst h2'
-    rw [hl]
-    change Except.ok (Val.u64 nl) = Except.ok (Val.u64 (nl / 1))
-    cases nl with | ofBitVec bv => exact congrArg (Except.ok ∘ Val.u64 ∘ UInt64.ofBitVec) BitVec.udiv_one.symm
-  -- div l c (pow2ShiftLog2)
-  · injection hr with h2; injection h2 with h2'; subst h2'
-    cases (w64 || exprDefinitely64 l)
-    · exact deflt
-    · simp only [↓reduceIte]
-      split
-      · rename_i k hk
-        simp only [denoteSymExpr, hl]
-        exact congrArg (Except.ok ∘ Val.u64) (pow2ShiftLog2_div hk nl).symm
+  case sub =>
+    split
+    · cases hl; cases hr; rfl
+    · cases hl
+    · cases hr
+    · injection hr with h2; injection h2 with h2'; subst h2'
+      rw [hl]; exact (evalBinOp_sub_zero (.u64 nl)).symm
+    · injection hr with h2; injection h2 with h2'; subst h2'
+      rename_i x a b _
+      cases hsub : subexprDefinitely64 w64 a x
       · exact deflt
-  -- mod l 0
-  · injection hr with h2; injection h2 with h2'; subst h2'
-    cases (w64 || exprDefinitely64 l)
-    · exact deflt
-    · simp only [↓reduceIte, hl]
-      change Except.ok (Val.u64 nl) = Except.ok (Val.u64 (nl % 0))
-      cases nl with | ofBitVec bv => exact congrArg (Except.ok ∘ Val.u64 ∘ UInt64.ofBitVec) BitVec.umod_zero.symm
-  -- mod l 1
-  · injection hr with h2; injection h2 with h2'; subst h2'
-    cases (w64 || exprDefinitely64 l)
-    · exact deflt
-    · change Except.ok (Val.u64 0) = Except.ok (Val.u64 (nl % 1))
-      cases nl with | ofBitVec bv => exact congrArg (Except.ok ∘ Val.u64 ∘ UInt64.ofBitVec) BitVec.umod_one.symm
-  -- mod l c (pow2ShiftLog2)
-  · injection hr with h2; injection h2 with h2'; subst h2'
-    cases (w64 || exprDefinitely64 l)
-    · exact deflt
-    · simp only [↓reduceIte]
-      split
-      · rename_i k hk
-        simp only [denoteSymExpr, hl]
-        exact congrArg (Except.ok ∘ Val.u64) (pow2ShiftLog2_mod hk nl).symm
+      · simp only [↓reduceIte]
+        obtain ⟨nx, hx, hnx⟩ := denote_binOp_constU64_u64 (Or.inl rfl) hl
+        simp only [↓reduceIte] at hnx; subst hnx
+        have hre := uint64_add_sub_reassoc nx a b
+        cases hab : (a == b)
+        · simp only [hab, Bool.false_eq_true, ↓reduceIte] at hre ⊢
+          by_cases hgt : a > b
+          · simp only [hgt, decide_true, ↓reduceIte, denoteSymExpr, hx] at hre ⊢
+            exact congrArg (Except.ok ∘ Val.u64) hre.symm
+          · simp only [hgt, decide_false, Bool.false_eq_true, ↓reduceIte, denoteSymExpr, hx] at hre ⊢
+            exact congrArg (Except.ok ∘ Val.u64) hre.symm
+        · simp only [hab, ↓reduceIte] at hre ⊢
+          rw [hx]; exact congrArg (Except.ok ∘ Val.u64) hre.symm
+    · injection hr with h2; injection h2 with h2'; subst h2'
+      rename_i x a b _
+      cases hsub : subexprDefinitely64 w64 a x
       · exact deflt
-  -- bitXor l 0
-  · injection hr with h2; injection h2 with h2'; subst h2'
-    rw [hl]; exact (evalBinOp_xor_zero (.u64 nl)).symm
-  -- bitXor 0 r
-  · injection hl with h1; injection h1 with h1'; subst h1'
-    rw [hr]; exact (evalBinOp_zero_xor (.u64 nr)).symm
-  -- bitXor l r (reflexive)
-  · cases hcond : ((w64 || exprDefinitely64 l) && (l == r))
-    · simp only [Bool.false_eq_true, ↓reduceIte]
-      cases l with
-      | constU256 _ => cases hl
-      | _ => exact deflt
-    · simp only [↓reduceIte]
-      simp only [Bool.and_eq_true] at hcond
-      have hlr := SymExpr_eq_of_beq hcond.2; subst hlr
-      have hn : nl = nr := by rw [hl] at hr; injection hr with h1; injection h1 with h2
-      subst hn
-      change Except.ok (Val.u64 0) = Except.ok (Val.u64 (nl ^^^ nl))
-      rw [UInt64.xor_self]
-  -- bitOr l 0
-  · injection hr with h2; injection h2 with h2'; subst h2'
-    rw [hl]; exact (evalBinOp_or_zero (.u64 nl)).symm
-  -- bitOr 0 r
-  · injection hl with h1; injection h1 with h1'; subst h1'
-    rw [hr]; exact (evalBinOp_zero_or (.u64 nr)).symm
-  -- bitOr l r (reflexive)
-  · cases hxy : (l == r)
-    · exact deflt
-    · simp only [↓reduceIte]
-      have hlr := SymExpr_eq_of_beq hxy; subst hlr
-      have hn : nl = nr := by rw [hl] at hr; injection hr with h1; injection h1 with h2
-      subst hn
-      rw [hl]; exact (evalBinOp_or_self (.u64 nl)).symm
-  -- bitAnd l 0
-  · injection hr with h2; injection h2 with h2'; subst h2'
-    cases (w64 || exprDefinitely64 l)
-    · exact deflt
-    · change Except.ok (Val.u64 0) = Except.ok (Val.u64 (nl &&& 0)); rw [UInt64.and_zero]
-  -- bitAnd 0 r
-  · injection hl with h1; injection h1 with h1'; subst h1'
-    cases (w64 || exprDefinitely64 r)
-    · exact deflt
-    · change Except.ok (Val.u64 0) = Except.ok (Val.u64 (0 &&& nr)); rw [UInt64.zero_and]
-  -- bitAnd l r (reflexive)
-  · cases hxy : (l == r)
-    · exact deflt
-    · simp only [↓reduceIte]
-      have hlr := SymExpr_eq_of_beq hxy; subst hlr
-      have hn : nl = nr := by rw [hl] at hr; injection hr with h1; injection h1 with h2
-      subst hn
-      rw [hl]; exact (evalBinOp_and_self (.u64 nl)).symm
-  -- shl l 0
-  · injection hr with h2; injection h2 with h2'; subst h2'
-    rw [hl]
-    change Except.ok (Val.u64 nl) = Except.ok (Val.u64 (nl <<< 0))
-    cases nl with | ofBitVec bv => exact congrArg (Except.ok ∘ Val.u64 ∘ UInt64.ofBitVec) (BitVec.shiftLeft_zero bv).symm
-  -- shr l 0
-  · injection hr with h2; injection h2 with h2'; subst h2'
-    rw [hl]
-    change Except.ok (Val.u64 nl) = Except.ok (Val.u64 (nl >>> 0))
-    cases nl with | ofBitVec bv => exact congrArg (Except.ok ∘ Val.u64 ∘ UInt64.ofBitVec) (BitVec.ushiftRight_zero bv).symm
-  -- eq l r (reflexive)
-  · by_cases hxy : (l == r) = true
-    · have hlr := SymExpr_eq_of_beq hxy; subst hlr
-      have hn : nl = nr := by rw [hl] at hr; injection hr with h1; injection h1 with h2
-      subst hn
-      simp only [hxy, Bool.true_and]
-      split
-      · cases hl
-      · split
-        · change Except.ok (Val.bool true) = Except.ok (Val.bool (nl == nl)); simp
+      · simp only [↓reduceIte]
+        obtain ⟨nx, hx, hnx⟩ := denote_binOp_constU64_u64 (Or.inr rfl) hl
+        simp only [reduceCtorEq, ↓reduceIte] at hnx; subst hnx
+        have hre := uint64_sub_sub_reassoc nx a b
+        cases hs : (a + b == 0)
+        · simp only [hs, Bool.false_eq_true, ↓reduceIte, denoteSymExpr, hx] at hre ⊢
+          exact congrArg (Except.ok ∘ Val.u64) hre.symm
+        · simp only [hs, ↓reduceIte] at hre ⊢
+          rw [hx]; exact congrArg (Except.ok ∘ Val.u64) hre.symm
+    · cases hcond : ((w64 || exprDefinitely64 l) && (l == r))
+      · simp only [Bool.false_eq_true, ↓reduceIte]
+        cases l with
+        | constU256 _ => cases hl
+        | _ => exact deflt
+      · simp only [↓reduceIte]
+        simp only [Bool.and_eq_true] at hcond
+        have hlr := SymExpr_eq_of_beq hcond.2; subst hlr
+        have hn : nl = nr := by rw [hl] at hr; injection hr with h1; injection h1 with h2
+        subst hn
+        change Except.ok (Val.u64 0) = Except.ok (Val.u64 (nl - nl))
+        rw [UInt64.sub_self]
+  case mul =>
+    split
+    · cases hl; cases hr; rfl
+    · cases hl
+    · cases hr
+    · cases hl
+    · injection hr with h2; injection h2 with h2'; subst h2'
+      rw [hl]; exact (evalBinOp_mul_one (.u64 nl)).symm
+    · injection hl with h1; injection h1 with h1'; subst h1'
+      rw [hr]; exact (evalBinOp_one_mul (.u64 nr)).symm
+    · injection hr with h2; injection h2 with h2'; subst h2'
+      cases (w64 || exprDefinitely64 l)
+      · exact deflt
+      · change Except.ok (Val.u64 0) = Except.ok (Val.u64 (nl * 0)); rw [UInt64.mul_zero]
+    · injection hl with h1; injection h1 with h1'; subst h1'
+      cases (w64 || exprDefinitely64 r)
+      · exact deflt
+      · change Except.ok (Val.u64 0) = Except.ok (Val.u64 (0 * nr)); rw [UInt64.zero_mul]
+    · injection hr with h2; injection h2 with h2'; subst h2'
+      cases (w64 || exprDefinitely64 l)
+      · exact deflt
+      · simp only [↓reduceIte]
+        split
+        · rename_i k hk
+          simp only [denoteSymExpr, hl]
+          exact congrArg (Except.ok ∘ Val.u64) (pow2ShiftLog2_mul_right hk nl).symm
         · exact deflt
-    · simp only [hxy, Bool.false_and, Bool.false_eq_true, ↓reduceIte]; exact deflt
-  -- lt l r (reflexive)
-  · by_cases hxy : (l == r) = true
-    · have hlr := SymExpr_eq_of_beq hxy; subst hlr
-      have hn : nl = nr := by rw [hl] at hr; injection hr with h1; injection h1 with h2
-      subst hn
-      simp only [hxy, Bool.true_and]
-      split
-      · cases hl
-      · split
-        · change Except.ok (Val.bool false) = Except.ok (Val.bool (decide (nl < nl)))
-          have hirr : ¬ (nl < nl) := Nat.lt_irrefl nl.toNat
-          simp [hirr]
+    · injection hl with h1; injection h1 with h1'; subst h1'
+      cases (w64 || exprDefinitely64 r)
+      · exact deflt
+      · simp only [↓reduceIte]
+        split
+        · rename_i k hk
+          simp only [denoteSymExpr, hr]
+          exact congrArg (Except.ok ∘ Val.u64) (pow2ShiftLog2_mul_left hk nr).symm
         · exact deflt
-    · simp only [hxy, Bool.false_and, Bool.false_eq_true, ↓reduceIte]; exact deflt
-  -- le l r (reflexive)
-  · by_cases hxy : (l == r) = true
-    · have hlr := SymExpr_eq_of_beq hxy; subst hlr
-      have hn : nl = nr := by rw [hl] at hr; injection hr with h1; injection h1 with h2
-      subst hn
-      simp only [hxy, Bool.true_and]
-      split
-      · cases hl
-      · split
-        · change Except.ok (Val.bool true) = Except.ok (Val.bool (decide (nl ≤ nl)))
-          simp
+    · exact deflt
+  case div =>
+    split
+    · cases hl; cases hr; rfl
+    · cases hr
+    · injection hr with h2; injection h2 with h2'; subst h2'
+      cases (w64 || exprDefinitely64 l)
+      · exact deflt
+      · change Except.ok (Val.u64 0) = Except.ok (Val.u64 (nl / 0))
+        cases nl with | ofBitVec bv => exact congrArg (Except.ok ∘ Val.u64 ∘ UInt64.ofBitVec) BitVec.udiv_zero.symm
+    · injection hr with h2; injection h2 with h2'; subst h2'
+      rw [hl]
+      change Except.ok (Val.u64 nl) = Except.ok (Val.u64 (nl / 1))
+      cases nl with | ofBitVec bv => exact congrArg (Except.ok ∘ Val.u64 ∘ UInt64.ofBitVec) BitVec.udiv_one.symm
+    · injection hr with h2; injection h2 with h2'; subst h2'
+      cases (w64 || exprDefinitely64 l)
+      · exact deflt
+      · simp only [↓reduceIte]
+        split
+        · rename_i k hk
+          simp only [denoteSymExpr, hl]
+          exact congrArg (Except.ok ∘ Val.u64) (pow2ShiftLog2_div hk nl).symm
         · exact deflt
-    · simp only [hxy, Bool.false_and, Bool.false_eq_true, ↓reduceIte]; exact deflt
+    · exact deflt
+  case mod =>
+    split
+    · cases hl; cases hr; rfl
+    · injection hr with h2; injection h2 with h2'; subst h2'
+      cases (w64 || exprDefinitely64 l)
+      · exact deflt
+      · simp only [↓reduceIte, hl]
+        change Except.ok (Val.u64 nl) = Except.ok (Val.u64 (nl % 0))
+        cases nl with | ofBitVec bv => exact congrArg (Except.ok ∘ Val.u64 ∘ UInt64.ofBitVec) BitVec.umod_zero.symm
+    · injection hr with h2; injection h2 with h2'; subst h2'
+      cases (w64 || exprDefinitely64 l)
+      · exact deflt
+      · change Except.ok (Val.u64 0) = Except.ok (Val.u64 (nl % 1))
+        cases nl with | ofBitVec bv => exact congrArg (Except.ok ∘ Val.u64 ∘ UInt64.ofBitVec) BitVec.umod_one.symm
+    · injection hr with h2; injection h2 with h2'; subst h2'
+      cases (w64 || exprDefinitely64 l)
+      · exact deflt
+      · simp only [↓reduceIte]
+        split
+        · rename_i k hk
+          simp only [denoteSymExpr, hl]
+          exact congrArg (Except.ok ∘ Val.u64) (pow2ShiftLog2_mod hk nl).symm
+        · exact deflt
+    · exact deflt
+  case bitAnd =>
+    split
+    · cases hl; cases hr; rfl
+    · cases hl
+    · cases hr
+    · cases hl
+    · injection hr with h2; injection h2 with h2'; subst h2'
+      cases (w64 || exprDefinitely64 l)
+      · exact deflt
+      · change Except.ok (Val.u64 0) = Except.ok (Val.u64 (nl &&& 0)); rw [UInt64.and_zero]
+    · injection hl with h1; injection h1 with h1'; subst h1'
+      cases (w64 || exprDefinitely64 r)
+      · exact deflt
+      · change Except.ok (Val.u64 0) = Except.ok (Val.u64 (0 &&& nr)); rw [UInt64.zero_and]
+    · cases hxy : (l == r)
+      · exact deflt
+      · simp only [↓reduceIte]
+        have hlr := SymExpr_eq_of_beq hxy; subst hlr
+        have hn : nl = nr := by rw [hl] at hr; injection hr with h1; injection h1 with h2
+        subst hn
+        rw [hl]; exact (evalBinOp_and_self (.u64 nl)).symm
+  case bitOr =>
+    split
+    · cases hl; cases hr; rfl
+    · cases hl
+    · cases hr
+    · cases hl
+    · injection hr with h2; injection h2 with h2'; subst h2'
+      rw [hl]; exact (evalBinOp_or_zero (.u64 nl)).symm
+    · injection hl with h1; injection h1 with h1'; subst h1'
+      rw [hr]; exact (evalBinOp_zero_or (.u64 nr)).symm
+    · cases hxy : (l == r)
+      · exact deflt
+      · simp only [↓reduceIte]
+        have hlr := SymExpr_eq_of_beq hxy; subst hlr
+        have hn : nl = nr := by rw [hl] at hr; injection hr with h1; injection h1 with h2
+        subst hn
+        rw [hl]; exact (evalBinOp_or_self (.u64 nl)).symm
+  case bitXor =>
+    split
+    · cases hl; cases hr; rfl
+    · cases hl
+    · cases hr
+    · cases hl
+    · injection hr with h2; injection h2 with h2'; subst h2'
+      rw [hl]; exact (evalBinOp_xor_zero (.u64 nl)).symm
+    · injection hl with h1; injection h1 with h1'; subst h1'
+      rw [hr]; exact (evalBinOp_zero_xor (.u64 nr)).symm
+    · cases hcond : ((w64 || exprDefinitely64 l) && (l == r))
+      · simp only [Bool.false_eq_true, ↓reduceIte]
+        cases l with
+        | constU256 _ => cases hl
+        | _ => exact deflt
+      · simp only [↓reduceIte]
+        simp only [Bool.and_eq_true] at hcond
+        have hlr := SymExpr_eq_of_beq hcond.2; subst hlr
+        have hn : nl = nr := by rw [hl] at hr; injection hr with h1; injection h1 with h2
+        subst hn
+        change Except.ok (Val.u64 0) = Except.ok (Val.u64 (nl ^^^ nl))
+        rw [UInt64.xor_self]
+  case shl =>
+    split
+    · cases hl; cases hr
+      exact congrArg (Except.ok ∘ Val.u64) (uint64_shiftLeft_and_63 _ _)
+    · cases hl
+    · cases hr
+    · injection hr with h2; injection h2 with h2'; subst h2'
+      rw [hl]
+      change Except.ok (Val.u64 nl) = Except.ok (Val.u64 (nl <<< 0))
+      cases nl with | ofBitVec bv => exact congrArg (Except.ok ∘ Val.u64 ∘ UInt64.ofBitVec) (BitVec.shiftLeft_zero bv).symm
+    · exact deflt
+  case shr =>
+    split
+    · cases hl; cases hr
+      exact congrArg (Except.ok ∘ Val.u64) (uint64_shiftRight_and_63 _ _)
+    · cases hl
+    · cases hr
+    · injection hr with h2; injection h2 with h2'; subst h2'
+      rw [hl]
+      change Except.ok (Val.u64 nl) = Except.ok (Val.u64 (nl >>> 0))
+      cases nl with | ofBitVec bv => exact congrArg (Except.ok ∘ Val.u64 ∘ UInt64.ofBitVec) (BitVec.ushiftRight_zero bv).symm
+    · exact deflt
+  case sar =>
+    split
+    · cases hl
+    · cases hr
+    · exact deflt
+  case clmul64 =>
+    split
+    · cases hl; cases hr; rfl
+    · exact deflt
+  case clmul64Hi =>
+    split
+    · cases hl; cases hr; rfl
+    · exact deflt
+  case gf2Affine =>
+    split
+    · cases hl; cases hr; rfl
+    · exact deflt
+  case eor3 =>
+    split
+    · cases hl; cases hr; rfl
+    · exact deflt
+  case eq =>
+    split
+    · cases hl; cases hr; rfl
+    · cases hl
+    · cases hl
+    · cases hr
+    · cases hl
+    · cases hr
+    · cases hl
+    · cases hr
+    · cases hl
+    · by_cases hxy : (l == r) = true
+      · have hlr := SymExpr_eq_of_beq hxy; subst hlr
+        have hn : nl = nr := by rw [hl] at hr; injection hr with h1; injection h1 with h2
+        subst hn
+        simp only [hxy, Bool.true_and]
+        split
+        · cases hl
+        · split
+          · change Except.ok (Val.bool true) = Except.ok (Val.bool (nl == nl)); simp
+          · exact deflt
+      · simp only [hxy, Bool.false_and, Bool.false_eq_true, ↓reduceIte]; exact deflt
+  case lt =>
+    split
+    · cases hl; cases hr; rfl
+    · cases hl
+    · by_cases hxy : (l == r) = true
+      · have hlr := SymExpr_eq_of_beq hxy; subst hlr
+        have hn : nl = nr := by rw [hl] at hr; injection hr with h1; injection h1 with h2
+        subst hn
+        simp only [hxy, Bool.true_and]
+        split
+        · cases hl
+        · split
+          · change Except.ok (Val.bool false) = Except.ok (Val.bool (decide (nl < nl)))
+            have hirr : ¬ (nl < nl) := Nat.lt_irrefl nl.toNat
+            simp [hirr]
+          · exact deflt
+      · simp only [hxy, Bool.false_and, Bool.false_eq_true, ↓reduceIte]; exact deflt
+  case le =>
+    split
+    · cases hl; cases hr; rfl
+    · cases hl
+    · by_cases hxy : (l == r) = true
+      · have hlr := SymExpr_eq_of_beq hxy; subst hlr
+        have hn : nl = nr := by rw [hl] at hr; injection hr with h1; injection h1 with h2
+        subst hn
+        simp only [hxy, Bool.true_and]
+        split
+        · cases hl
+        · split
+          · change Except.ok (Val.bool true) = Except.ok (Val.bool (decide (nl ≤ nl)))
+            simp
+          · exact deflt
+      · simp only [hxy, Bool.false_and, Bool.false_eq_true, ↓reduceIte]; exact deflt
+  case addChecked256 => exact deflt
+  case subChecked256 => exact deflt
+  case mulChecked256 => exact deflt
 
 /-- Single-step `normSymBinOpStep` on two 64-bit-denoting symbolic operands preserves concrete
     denotation for every binary operator. -/
@@ -1085,143 +1127,187 @@ theorem normSymBinOpCore_sortU64 (st : SymExecState) (op : BinOp) (l r : SymExpr
     symExprScalarSort? st (normSymBinOpCore op l r w64) = some sortU64 := by
   have deflt : symExprScalarSort? st (.binOp op l r) = some sortU64 :=
     symExprScalarSort_pureU64_binOp st op l r hop hl hr
-  unfold normSymBinOpCore
   have hl1 : symExprScalarSort? st l = some 1 := hl
   have hr1 : symExprScalarSort? st r = some 1 := hr
-  split
-  -- 1..14: UInt64 constant folding producing `.constU64 _`
-  · rfl
-  · rfl
-  · rfl
-  · rfl
-  · rfl
-  · rfl
-  · rfl
-  · rfl
-  · rfl
-  · rfl
-  · rfl
-  · rfl
-  · rfl
-  · rfl
-  -- 15..17: eq, lt, le constant folding (contradict `hop`)
-  · cases hop
-  · cases hop
-  · cases hop
-  -- Eliminate constBool / constU256 / comparison branches and default fallback!
-  all_goals try (cases hop; done)
-  all_goals try (cases hl1; done)
-  all_goals try (cases hr1; done)
-  all_goals try (exact deflt)
-  all_goals try (exact hl)
-  all_goals try (exact hr)
-  -- Remaining compound branches!
-  -- add (add x a) b
-  · split
-    · have hx := symExprScalarSort_binOp_constU64_u64 st .add _ _ (Or.inl rfl) hl
-      dsimp only []
-      split
-      · exact hx
-      · exact symExprScalarSort_pureU64_binOp st .add _ _ rfl hx rfl
-    · exact deflt
-  -- add (sub x a) b
-  · split
-    · have hx := symExprScalarSort_binOp_constU64_u64 st .sub _ _ (Or.inr rfl) hl
-      split
-      · exact hx
-      · split
+  cases op <;> dsimp only [normSymBinOpCore]
+  case add =>
+    split
+    · rfl
+    · cases hl1
+    · cases hr1
+    · cases hl1
+    · exact hl
+    · exact hr
+    · split
+      · have hx := symExprScalarSort_binOp_constU64_u64 st .add _ _ (Or.inl rfl) hl
+        split
+        · exact hx
         · exact symExprScalarSort_pureU64_binOp st .add _ _ rfl hx rfl
-        · exact symExprScalarSort_pureU64_binOp st .sub _ _ rfl hx rfl
+      · exact deflt
+    · split
+      · have hx := symExprScalarSort_binOp_constU64_u64 st .sub _ _ (Or.inr rfl) hl
+        split
+        · exact hx
+        · split
+          · exact symExprScalarSort_pureU64_binOp st .add _ _ rfl hx rfl
+          · exact symExprScalarSort_pureU64_binOp st .sub _ _ rfl hx rfl
+      · exact deflt
     · exact deflt
-  -- sub (add x a) b
-  · split
-    · have hx := symExprScalarSort_binOp_constU64_u64 st .add _ _ (Or.inl rfl) hl
-      split
-      · exact hx
+  case sub =>
+    split
+    · rfl
+    · cases hl1
+    · cases hr1
+    · exact hl
+    · split
+      · have hx := symExprScalarSort_binOp_constU64_u64 st .add _ _ (Or.inl rfl) hl
+        split
+        · exact hx
+        · split
+          · exact symExprScalarSort_pureU64_binOp st .add _ _ rfl hx rfl
+          · exact symExprScalarSort_pureU64_binOp st .sub _ _ rfl hx rfl
+      · exact deflt
+    · split
+      · have hx := symExprScalarSort_binOp_constU64_u64 st .sub _ _ (Or.inr rfl) hl
+        split
+        · exact hx
+        · exact symExprScalarSort_pureU64_binOp st .sub _ _ rfl hx rfl
+      · exact deflt
+    · split
+      · rfl
+      · cases l with
+        | constU256 _ => cases hl1
+        | _ => exact deflt
+  case mul =>
+    split
+    · rfl
+    · cases hl1
+    · cases hr1
+    · cases hl1
+    · exact hl
+    · exact hr
+    · split
+      · rfl
+      · exact deflt
+    · split
+      · rfl
+      · exact deflt
+    · split
       · split
-        · exact symExprScalarSort_pureU64_binOp st .add _ _ rfl hx rfl
-        · exact symExprScalarSort_pureU64_binOp st .sub _ _ rfl hx rfl
-    · exact deflt
-  -- sub (sub x a) b
-  · split
-    · have hx := symExprScalarSort_binOp_constU64_u64 st .sub _ _ (Or.inr rfl) hl
-      dsimp only []
-      split
-      · exact hx
-      · exact symExprScalarSort_pureU64_binOp st .sub _ _ rfl hx rfl
-    · exact deflt
-  -- sub l r (reflexive)
-  · split
-    · rfl
-    · cases l with
-      | constU256 _ => cases hl1
-      | _ => exact deflt
-  -- mul l 0
-  · split
-    · rfl
-    · exact deflt
-  -- mul 0 r
-  · split
-    · rfl
-    · exact deflt
-  -- mul l c (pow2ShiftLog2)
-  · split
+        · exact symExprScalarSort_pureU64_binOp st .shl _ _ rfl hl rfl
+        · exact deflt
+      · exact deflt
     · split
-      · exact symExprScalarSort_pureU64_binOp st .shl _ _ rfl hl rfl
+      · split
+        · exact symExprScalarSort_pureU64_binOp st .shl _ _ rfl hr rfl
+        · exact deflt
       · exact deflt
     · exact deflt
-  -- mul c r (pow2ShiftLog2)
-  · split
-    · split
-      · exact symExprScalarSort_pureU64_binOp st .shl _ _ rfl hr rfl
-      · exact deflt
-    · exact deflt
-  -- div l 0
-  · split
+  case div =>
+    split
     · rfl
-    · exact deflt
-  -- div l c (pow2ShiftLog2)
-  · split
+    · cases hr1
     · split
-      · exact symExprScalarSort_pureU64_binOp st .shr _ _ rfl hl rfl
+      · rfl
+      · exact deflt
+    · exact hl
+    · split
+      · split
+        · exact symExprScalarSort_pureU64_binOp st .shr _ _ rfl hl rfl
+        · exact deflt
       · exact deflt
     · exact deflt
-  -- mod l 0
-  · split
+  case mod =>
+    split
+    · rfl
+    · split
+      · exact hl
+      · exact deflt
+    · split
+      · rfl
+      · exact deflt
+    · split
+      · split
+        · exact symExprScalarSort_pureU64_binOp st .bitAnd _ _ rfl hl rfl
+        · exact deflt
+      · exact deflt
+    · exact deflt
+  case bitAnd =>
+    split
+    · rfl
+    · cases hl1
+    · cases hr1
+    · cases hl1
+    · split
+      · rfl
+      · exact deflt
+    · split
+      · rfl
+      · exact deflt
+    · split
+      · exact hl
+      · exact deflt
+  case bitOr =>
+    split
+    · rfl
+    · cases hl1
+    · cases hr1
+    · cases hl1
+    · exact hl
+    · exact hr
+    · split
+      · exact hl
+      · exact deflt
+  case bitXor =>
+    split
+    · rfl
+    · cases hl1
+    · cases hr1
+    · cases hl1
+    · exact hl
+    · exact hr
+    · split
+      · rfl
+      · cases l with
+        | constU256 _ => cases hl1
+        | _ => exact deflt
+  case shl =>
+    split
+    · rfl
+    · cases hl1
+    · cases hr1
     · exact hl
     · exact deflt
-  -- mod l 1
-  · split
+  case shr =>
+    split
     · rfl
-    · exact deflt
-  -- mod l c (pow2ShiftLog2)
-  · split
-    · split
-      · exact symExprScalarSort_pureU64_binOp st .bitAnd _ _ rfl hl rfl
-      · exact deflt
-    · exact deflt
-  -- bitXor l r (reflexive)
-  · split
-    · rfl
-    · cases l with
-      | constU256 _ => cases hl1
-      | _ => exact deflt
-  -- bitOr l r (reflexive)
-  · split
+    · cases hl1
+    · cases hr1
     · exact hl
     · exact deflt
-  -- bitAnd l 0
-  · split
+  case sar => cases hop
+  case clmul64 =>
+    split
     · rfl
     · exact deflt
-  -- bitAnd 0 r
-  · split
+  case clmul64Hi =>
+    split
     · rfl
     · exact deflt
-  -- bitAnd l r (reflexive)
-  · split
-    · exact hl
+  case gf2Affine =>
+    split
+    · rfl
     · exact deflt
+  case eor3 =>
+    split
+    · rfl
+    · exact deflt
+  case eq => cases hop
+  case lt => cases hop
+  case le => cases hop
+  case addChecked256 => cases hop
+  case subChecked256 => cases hop
+  case mulChecked256 => cases hop
 
 theorem symBinOpIdentityShortCircuit_u64 (st : SymExecState) (ω : SymValuation)
     (op : BinOp) (l r idExpr : SymExpr) (nl nr : UInt64)
@@ -1393,6 +1479,60 @@ theorem symEvalScalarRes_pureU64_sound (st : SymExecState) (env : VarEnv) (e : S
         have hstepSort := normSymBinOpStep_sortU64 st op _ _ true hop hlSort hrSort
         have hstepDen := (normSymBinOpStep_u64_denotes (SymValuation.ofVarEnv env) op _ _ true nl nr hlDen hrDen).trans hn
         cases op <;> simp at hop <;> exact ⟨rfl, rfl, hstepSort, hstepDen⟩
+
+/-- Recursive bottom-up `normSymExpr` preserves exact 64-bit concrete denotation across
+    `isPureU64SymExprIn vars` whenever every variable in `vars` is bound to `.u64` in `ω`. -/
+theorem normSymExpr_pureU64_denotes (vars : List VarId) (ω : SymValuation) :
+    ∀ (s : SymExpr),
+      isPureU64SymExprIn vars s = true →
+      (∀ id : VarId, vars.contains id = true → ∃ n : UInt64, ω.varVal id = some (Val.u64 n)) →
+      ∃ n : UInt64, denoteSymExpr ω s = .ok (Val.u64 n) ∧
+        denoteSymExpr ω (normSymExpr s) = .ok (Val.u64 n)
+  | .constU64 v, _, _ => ⟨v, rfl, rfl⟩
+  | .symVar id, hp, hvars =>
+    let ⟨n, hn⟩ := hvars id hp
+    ⟨n, by simp [denoteSymExpr, hn], by simp [normSymExpr, denoteSymExpr, hn]⟩
+  | .unaryOp op a, hp, hvars => by
+    cases op with
+    | clz256 => simp [isPureU64SymExprIn] at hp
+    | not =>
+      simp only [isPureU64SymExprIn] at hp
+      obtain ⟨na, hda, hdna⟩ := normSymExpr_pureU64_denotes vars ω a hp hvars
+      refine ⟨~~~na, ?_, ?_⟩
+      · simp [denoteSymExpr, hda, evalUnaryOp]
+      · rw [normSymExpr.eq_def]
+        dsimp only []
+        rw [normSymUnaryOpStep_denotes_eq]
+        simp [denoteSymExpr, hdna, evalUnaryOp]
+    | neg =>
+      simp only [isPureU64SymExprIn] at hp
+      obtain ⟨na, hda, hdna⟩ := normSymExpr_pureU64_denotes vars ω a hp hvars
+      refine ⟨0 - na, ?_, ?_⟩
+      · simp [denoteSymExpr, hda, evalUnaryOp]
+      · rw [normSymExpr.eq_def]
+        dsimp only []
+        rw [normSymUnaryOpStep_denotes_eq]
+        simp [denoteSymExpr, hdna, evalUnaryOp]
+  | .binOp op l r, hp, hvars => by
+    simp only [isPureU64SymExprIn, Bool.and_eq_true] at hp
+    rcases hp with ⟨⟨hop, hl⟩, hr⟩
+    obtain ⟨nl, hdl, hdnl⟩ := normSymExpr_pureU64_denotes vars ω l hl hvars
+    obtain ⟨nr, hdr, hdnr⟩ := normSymExpr_pureU64_denotes vars ω r hr hvars
+    have hev : ∃ n : UInt64, evalBinOp op (Val.u64 nl) (Val.u64 nr) = .ok (Val.u64 n) := by
+      cases op <;> simp at hop <;> exact ⟨_, rfl⟩
+    obtain ⟨n, hn⟩ := hev
+    refine ⟨n, ?_, ?_⟩
+    · simp [denoteSymExpr, hdl, hdr, hn]
+    · rw [normSymExpr.eq_def]
+      dsimp only []
+      rw [normSymBinOpStep_u64_denotes ω op (normSymExpr l) (normSymExpr r) false nl nr hdnl hdnr]
+      exact hn
+  | .constU256 _, hp, _ | .constBool _, hp, _ | .allocTag _, hp, _ | .rcSym _ _, hp, _
+  | .ctorTag _ _, hp, _ | .ctorLen _ _ _, hp, _ | .sarrayLen _, hp, _
+  | .mulDiv256 _ _ _ _, hp, _ | .ite _ _ _, hp, _ | .tuple _, hp, _
+  | .bufElem _ _ _, hp, _ | .unit, hp, _ => by
+    simp [isPureU64SymExprIn] at hp
+termination_by s => sizeOf s
 
 /-- Passing translation validation implies the recorded concrete and symbolic invariants hold. -/
 theorem validateTranslationDeclSound_of_passed (src tgt : LNIRDecl) (numSamples : Nat) :
