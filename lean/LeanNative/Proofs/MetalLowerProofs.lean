@@ -43,8 +43,7 @@ theorem lowerScalar_inferExprType (g : MetalAst.MSLGroupState) (ls : MetalAst.MS
         · cases sr <;> try simp at hsort
           cases op <;> simp [inferBinOpBool] at hsort
           all_goals
-            simp only [lowerScalar, u, m63, MetalAst.inferExprType,
-              MetalSIMT.promoteMSLArithType_ulong, tl, tr]
+            simp only [lowerScalar, MetalAst.inferExprType]
   | unaryOp op a iha =>
     simp only [inferScalarSort] at hsort
     cases hsa : inferScalarSort boundVars a <;> simp only [hsa] at hsort

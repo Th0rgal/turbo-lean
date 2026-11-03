@@ -226,6 +226,35 @@ def gen_expr(rng: Rng, depth: int) -> tuple[dict[str, Any], int]:
 
 
 def build_program(seed: int) -> dict[str, Any]:
+    if seed == 0:
+        return {
+            "k": "program",
+            "tree": {"k": "binop", "op": "sub", "l": {"k": "const", "v": 19}, "r": {"k": "var", "id": 0}},
+            "arg0": 7,
+            "seed": seed,
+        }
+    if seed == 1:
+        return {
+            "k": "program",
+            "tree": {"k": "ite_input", "op": "<", "bits": 64, "boundary": 42},
+            "arg0": 42,
+            "seed": seed,
+        }
+    if seed == 2:
+        zero_rhs = {"k": "binop", "op": "xor", "l": {"k": "var", "id": 0}, "r": {"k": "var", "id": 0}}
+        return {
+            "k": "program",
+            "tree": {"k": "binop", "op": "div", "l": {"k": "var", "id": 0}, "r": zero_rhs},
+            "arg0": 13,
+            "seed": seed,
+        }
+    if seed == 3:
+        return {
+            "k": "program",
+            "tree": {"k": "binop", "op": "shl", "l": {"k": "var", "id": 0}, "r": {"k": "const", "v": 3}},
+            "arg0": 5,
+            "seed": seed,
+        }
     rng = Rng(splitmix64(seed))
     depth = 1 + rng.choice(3)
     arg0 = pick_scalar(rng)

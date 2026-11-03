@@ -69,6 +69,7 @@ import LeanNative.Backend.Metal
 import LeanNative.Backend.MetalAst
 import LeanNative.Backend.MetalLower
 import LeanNative.Backend.GPUEmitVerify
+import LeanNative.Backend.LLVMEmitVerify
 import LeanNative.Backend.Hybrid
 import LeanNative.Backend.FastCheck
 import LeanNative.Driver.EvalBatch
