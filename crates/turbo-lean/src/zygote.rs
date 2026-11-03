@@ -1548,7 +1548,8 @@ pub(crate) fn is_resolved_toolchain_builtin(
         return false;
     }
     if let Some(tc) = toolchain_lib.filter(|p| !p.as_os_str().is_empty()) {
-        return crate::module_builder::is_builtin_toolchain_module(tc, None, mod_name);
+        let gh = crate::module_builder::lean_githash_for_sysroot_lib_lean(tc);
+        return crate::module_builder::is_builtin_toolchain_module(tc, gh.as_deref(), mod_name);
     }
     if !search_dirs.iter().copied().any(is_sysroot_lib_lean_dir) {
         return true;
@@ -1557,7 +1558,10 @@ pub(crate) fn is_resolved_toolchain_builtin(
         .iter()
         .copied()
         .filter(|d| is_sysroot_lib_lean_dir(d))
-        .any(|d| crate::module_builder::is_builtin_toolchain_module(d, None, mod_name))
+        .any(|d| {
+            let gh = crate::module_builder::lean_githash_for_sysroot_lib_lean(d);
+            crate::module_builder::is_builtin_toolchain_module(d, gh.as_deref(), mod_name)
+        })
 }
 
 /// Resolve `mod_name` along `search_dirs` the way Lean's `findOLean` (`findWithExt`) does:

@@ -4763,6 +4763,25 @@ pub(crate) fn seed_project_theorem_shards_from_splits(
     Ok((files_seeded, shards_seeded))
 }
 
+pub(crate) fn seed_theorem_shards_for_files(
+    store: &mut TurboStore,
+    canon_dir: &Path,
+    toolchain: &str,
+    trust_domain: &str,
+    lean_files: &[PathBuf],
+) -> Result<(usize, usize, usize)> {
+    let (split_entries, split_cache_hits) = load_and_split_files_cached(store, lean_files)?;
+    let (files_seeded, shards_seeded) = seed_project_theorem_shards_from_splits(
+        store,
+        canon_dir,
+        toolchain,
+        trust_domain,
+        false,
+        &split_entries,
+    )?;
+    Ok((files_seeded, shards_seeded, split_cache_hits))
+}
+
 pub(crate) fn seed_project_theorem_shards(
     store: &mut TurboStore,
     canon_dir: &Path,
@@ -5416,14 +5435,6 @@ pub fn run_build_command(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "lean-project".to_string());
     let toolchain = detect_toolchain(&canon_dir);
-    let (action_key, interface_hash, file_hashes) = compute_project_interface_key_fast_summary(
-        store,
-        &canon_dir,
-        &toolchain,
-        &targets,
-        &trust_domain,
-    )?;
-
     let emit_build_telemetry = |ev: serde_json::Value| {
         crate::mcp::emit_cli_telemetry_event(
             Some(&canon_dir),
@@ -5432,6 +5443,110 @@ pub fn run_build_command(
             "turbo_lean_events.jsonl",
         );
     };
+    if !targets.is_empty() && has_lake_config(&canon_dir) {
+        let cfg = crate::module_builder::resolve_project_config_with_trust(
+            &canon_dir,
+            trust_domain.starts_with("untrusted"),
+        )
+        .with_context(|| {
+            format!(
+                "Static Lake config validation failed for {}",
+                canon_dir.display()
+            )
+        })?;
+        let _ = crate::module_builder::workspace_lake_inputs_digest(&cfg)?;
+        if !crate::module_builder::targets_include_exe_link_target(&cfg, &targets) {
+            let build_report = crate::module_builder::build_project_modules_native(
+                store,
+                &canon_dir,
+                &targets,
+                &trust_domain,
+                pin_level,
+                trust_domain.starts_with("untrusted"),
+                json_output,
+                None,
+            )?;
+            let env_key = TurboStore::compute_lake_env_key(&canon_dir);
+            let resolved_env = resolve_or_share_lake_env(store, &canon_dir, &env_key)?;
+            if let Some((ref env_vars, is_new)) = resolved_env {
+                if is_new {
+                    let _ = store.put_lake_env(&env_key, env_vars);
+                }
+                if !crate::zygote::daemon_disabled() {
+                    pack::warm_local_zygote_daemon_nonblocking(store, env_vars);
+                }
+            }
+            let seeded_shards = if seed_shards {
+                seed_theorem_shards_for_files(
+                    store,
+                    &canon_dir,
+                    &toolchain,
+                    &trust_domain,
+                    &build_report.cone_source_paths,
+                )?
+                .1
+            } else {
+                0
+            };
+            let dur_ms = t0.elapsed().as_millis() as i64;
+            let cache_hit = build_report.modules_compiled == 0
+                && (build_report.modules_cached > 0 || build_report.modules_up_to_date_reused > 0);
+            emit_build_telemetry(serde_json::json!({
+                "schema": "turbo-lean.telemetry.v1",
+                "tool_name": "build",
+                "command": "build",
+                "decl_name": project_name,
+                "status": if cache_hit { "cache_hit" } else { "built" },
+                "cache_hit": cache_hit,
+                "accepted": true,
+                "target_cone_scoped": true,
+                "targets": targets,
+                "modules_total": build_report.modules_total,
+                "modules_up_to_date_reused": build_report.modules_up_to_date_reused,
+                "modules_compiled": build_report.modules_compiled,
+                "modules_cached": build_report.modules_cached,
+                "shards_seeded": seeded_shards,
+                "elapsed_ms": dur_ms,
+            }));
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "status": if cache_hit { "cache_hit" } else { "built" },
+                        "build_engine": "native_module_dag",
+                        "target_cone_scoped": true,
+                        "targets": targets,
+                        "modules_total": build_report.modules_total,
+                        "modules_up_to_date_reused": build_report.modules_up_to_date_reused,
+                        "modules_compiled": build_report.modules_compiled,
+                        "modules_cached": build_report.modules_cached,
+                        "shards_seeded": seeded_shards,
+                        "config_digest": build_report.config_digest,
+                        "elapsed_ms": dur_ms
+                    }))?
+                );
+            } else {
+                println!(
+                    "[turbo-lean] BUILT TARGET CONE {} ({} modules: {} reused, {} cached, {} compiled in {} ms)",
+                    project_name,
+                    build_report.modules_total,
+                    build_report.modules_up_to_date_reused,
+                    build_report.modules_cached,
+                    build_report.modules_compiled,
+                    dur_ms
+                );
+            }
+            return Ok(());
+        }
+    }
+    let (action_key, interface_hash, file_hashes) = compute_project_interface_key_fast_summary(
+        store,
+        &canon_dir,
+        &toolchain,
+        &targets,
+        &trust_domain,
+    )?;
+
     let has_external_dep_build = has_out_of_tree_dep_build_dir(&canon_dir);
     let outcome = if has_external_dep_build {
         None
@@ -5576,6 +5691,7 @@ pub fn run_build_command(
                         "materialized_files": linked,
                         "shards_seeded": seeded_shards,
                         "modules_total": build_report.modules_total,
+                        "modules_up_to_date_reused": build_report.modules_up_to_date_reused,
                         "modules_compiled": build_report.modules_compiled,
                         "modules_cached": build_report.modules_cached,
                         "config_digest": build_report.config_digest,

@@ -353,7 +353,65 @@ pub struct NativeBuildReport {
     pub config_digest: String,
     pub compiled_modules: Vec<String>,
     pub cached_modules: Vec<String>,
+    #[serde(default)]
+    pub cone_source_paths: Vec<PathBuf>,
     pub bwrap_used: bool,
+}
+
+pub fn run_seed_oleans_command(
+    store: &mut TurboStore,
+    json_output: bool,
+    project_dir: PathBuf,
+    targets: Vec<String>,
+    jobs: usize,
+) -> Result<()> {
+    let t0 = std::time::Instant::now();
+    let prev_jobs = std::env::var_os("TURBO_LEAN_JOBS");
+    if jobs > 0 {
+        std::env::set_var("TURBO_LEAN_JOBS", jobs.to_string());
+    }
+    let build_res = build_project_modules_native(
+        store,
+        &project_dir,
+        &targets,
+        "trusted",
+        1,
+        false,
+        json_output,
+        None,
+    );
+    match prev_jobs {
+        Some(v) => std::env::set_var("TURBO_LEAN_JOBS", v),
+        None if jobs > 0 => std::env::remove_var("TURBO_LEAN_JOBS"),
+        None => {}
+    }
+    let report = build_res?;
+    let elapsed_ms = t0.elapsed().as_millis() as u64;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "seeded_oleans",
+                "targets": targets,
+                "modules_total": report.modules_total,
+                "modules_up_to_date_reused": report.modules_up_to_date_reused,
+                "modules_cached": report.modules_cached,
+                "modules_compiled": report.modules_compiled,
+                "config_digest": report.config_digest,
+                "elapsed_ms": elapsed_ms,
+            }))?
+        );
+    } else {
+        println!(
+            "[turbo-lean] SEED-OLEANS ({} modules: {} reused, {} cached, {} compiled in {} ms)",
+            report.modules_total,
+            report.modules_up_to_date_reused,
+            report.modules_cached,
+            report.modules_compiled,
+            elapsed_ms,
+        );
+    }
+    Ok(())
 }
 /// Strip surrounding whitespace, leading backtick `` ` ``, and Lake guillemets `«...»`.
 pub fn clean_lake_ident(raw: &str) -> String {
@@ -1151,15 +1209,18 @@ fn path_is_elan_proxy_bin(path: &Path) -> bool {
     path_has_elan_bin_component(path)
 }
 
+fn allow_toolchain_fallback_opt_in() -> bool {
+    std::env::var("TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 fn is_toolchain_eligible_for_fleet_fallback(toolchain: &str) -> bool {
     let trimmed = toolchain.trim();
     if trimmed.is_empty() || trimmed == "unknown" {
         return true;
     }
-    if std::env::var("TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-    {
+    if allow_toolchain_fallback_opt_in() {
         if let Some(ver) = extract_toolchain_version_token(trimmed) {
             let mut parts = ver.split('.');
             if let (Some(major_str), Some(minor_raw)) = (parts.next(), parts.next()) {
@@ -1217,6 +1278,15 @@ pub fn resolve_toolchain_compiler_with_trust(
     toolchain: &str,
     is_untrusted: bool,
 ) -> Result<(PathBuf, String, PathBuf, PathBuf)> {
+    resolve_toolchain_compiler_with_roots(project_dir, toolchain, is_untrusted, None)
+}
+
+fn resolve_toolchain_compiler_with_roots(
+    project_dir: &Path,
+    toolchain: &str,
+    is_untrusted: bool,
+    explicit_elan_roots: Option<&[PathBuf]>,
+) -> Result<(PathBuf, String, PathBuf, PathBuf)> {
     let canon_proj = project_dir
         .canonicalize()
         .unwrap_or_else(|_| project_dir.to_path_buf());
@@ -1237,63 +1307,78 @@ pub fn resolve_toolchain_compiler_with_trust(
         }
     }
     let mut elan_roots: Vec<PathBuf> = Vec::new();
-    if !is_untrusted {
-        if let Ok(extra_roots) = std::env::var("TURBO_LEAN_ELAN_ROOTS") {
-            for r in std::env::split_paths(&extra_roots) {
-                if r.is_dir() {
-                    elan_roots.push(r);
+    if let Some(roots) = explicit_elan_roots {
+        elan_roots.extend_from_slice(roots);
+    } else {
+        if !is_untrusted {
+            if let Ok(extra_roots) = std::env::var("TURBO_LEAN_ELAN_ROOTS") {
+                for r in std::env::split_paths(&extra_roots) {
+                    if r.is_dir() {
+                        elan_roots.push(r);
+                    }
                 }
             }
         }
-    }
-    if let Ok(eh) = std::env::var("ELAN_HOME") {
-        elan_roots.push(PathBuf::from(eh));
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        let home_path = PathBuf::from(&home);
-        elan_roots.push(home_path.join(".elan"));
-        let mut anc = home_path.parent();
-        for _ in 0..3 {
-            if let Some(p) = anc {
-                elan_roots.push(p.join(".elan"));
-                elan_roots.push(p.join("caches/elan"));
-                anc = p.parent();
-            }
+        if let Ok(eh) = std::env::var("ELAN_HOME") {
+            elan_roots.push(PathBuf::from(eh));
         }
-    }
-    for sys_elan in [
-        "/root/.elan",
-        "/var/lib/sandboxed-node/.elan",
-        "/var/lib/sandboxed-node/caches/elan",
-    ] {
-        let p = PathBuf::from(sys_elan);
-        if p.is_dir() && !elan_roots.contains(&p) {
-            elan_roots.push(p);
-        }
-    }
-    if !is_untrusted {
-        if let Ok(cwd) = std::env::current_dir() {
-            let mut anc = Some(cwd.as_path());
-            for _ in 0..4 {
+        if let Ok(home) = std::env::var("HOME") {
+            let home_path = PathBuf::from(&home);
+            elan_roots.push(home_path.join(".elan"));
+            let mut anc = home_path.parent();
+            for _ in 0..3 {
                 if let Some(p) = anc {
-                    if p.join(".elan/toolchains").is_dir() {
-                        elan_roots.push(p.join(".elan"));
-                    }
-                    if p.join("caches/elan/toolchains").is_dir() {
-                        elan_roots.push(p.join("caches/elan"));
-                    }
+                    elan_roots.push(p.join(".elan"));
+                    elan_roots.push(p.join("caches/elan"));
                     anc = p.parent();
                 }
             }
         }
-        if let Ok(path_var) = std::env::var("PATH") {
-            for dir in std::env::split_paths(&path_var) {
-                if let Some(parent) = dir.parent() {
-                    if parent.join("toolchains").is_dir() {
-                        elan_roots.push(parent.to_path_buf());
-                    } else if let Some(gp) = parent.parent().and_then(|p| p.parent()) {
-                        if gp.join("toolchains").is_dir() {
-                            elan_roots.push(gp.to_path_buf());
+        for sys_elan in [
+            "/root/.elan",
+            "/var/lib/sandboxed-node/.elan",
+            "/var/lib/sandboxed-node/caches/elan",
+        ] {
+            let p = PathBuf::from(sys_elan);
+            if p.is_dir() && !elan_roots.contains(&p) {
+                elan_roots.push(p);
+            }
+        }
+        if !is_untrusted {
+            for orb_elan in [
+                "/var/lib/orb-node/caches/elan",
+                "/var/lib/orb-node/.elan",
+                "/var/lib/orb-node/work/caches/elan",
+                "/opt/orb/elan",
+            ] {
+                let p = PathBuf::from(orb_elan);
+                if p.is_dir() && !elan_roots.contains(&p) {
+                    elan_roots.push(p);
+                }
+            }
+            if let Ok(cwd) = std::env::current_dir() {
+                let mut anc = Some(cwd.as_path());
+                for _ in 0..4 {
+                    if let Some(p) = anc {
+                        if p.join(".elan/toolchains").is_dir() {
+                            elan_roots.push(p.join(".elan"));
+                        }
+                        if p.join("caches/elan/toolchains").is_dir() {
+                            elan_roots.push(p.join("caches/elan"));
+                        }
+                        anc = p.parent();
+                    }
+                }
+            }
+            if let Ok(path_var) = std::env::var("PATH") {
+                for dir in std::env::split_paths(&path_var) {
+                    if let Some(parent) = dir.parent() {
+                        if parent.join("toolchains").is_dir() {
+                            elan_roots.push(parent.to_path_buf());
+                        } else if let Some(gp) = parent.parent().and_then(|p| p.parent()) {
+                            if gp.join("toolchains").is_dir() {
+                                elan_roots.push(gp.to_path_buf());
+                            }
                         }
                     }
                 }
@@ -1311,10 +1396,9 @@ pub fn resolve_toolchain_compiler_with_trust(
         || std::env::var("TURBO_LEAN_STRICT_TOOLCHAIN")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+    let allow_explicit_fallback = allow_toolchain_fallback_opt_in() && !strict_tc;
     let mut used_fallback_tc = false;
-    if candidate_bins.is_empty() && !strict_tc {
-        // Fallback 1: Prefer canonical fleet toolchain `leanprover/lean4:v4.35.0` when a project's
-        // `lean-toolchain` still references an older version (e.g. `v4.31.0`, `v4.33.1`) not installed locally.
+    if candidate_bins.is_empty() && allow_explicit_fallback {
         for root in &elan_roots {
             let v435 = root
                 .join("toolchains")
@@ -1326,26 +1410,15 @@ pub fn resolve_toolchain_compiler_with_trust(
             }
         }
     }
-    if candidate_bins.is_empty() && !is_untrusted {
+    if candidate_bins.is_empty() && !is_untrusted && (!has_specific_tc || allow_explicit_fallback) {
         if let Ok(path_var) = std::env::var("PATH") {
             for dir in std::env::split_paths(&path_var) {
                 let cand = dir.join("lean");
                 if cand.is_file() {
-                    if strict_tc
-                        && has_specific_tc
-                        && (path_is_elan_proxy_bin(&cand)
-                            || (path_is_inside_any_toolchains_dir(&cand)
-                                && !path_has_toolchain_component(&cand, &tc_dir_name)))
-                    {
-                        continue;
-                    }
                     if path_is_elan_proxy_bin(&cand) {
                         continue;
                     }
-                    if !strict_tc
-                        && has_specific_tc
-                        && !path_has_toolchain_component(&cand, &tc_dir_name)
-                    {
+                    if has_specific_tc && !path_has_toolchain_component(&cand, &tc_dir_name) {
                         used_fallback_tc = true;
                     }
                     candidate_bins.push(cand);
@@ -1353,7 +1426,7 @@ pub fn resolve_toolchain_compiler_with_trust(
             }
         }
     }
-    if candidate_bins.is_empty() && (!has_specific_tc || !strict_tc) {
+    if candidate_bins.is_empty() && (!has_specific_tc || allow_explicit_fallback) {
         for root in &elan_roots {
             let tc_dir = root.join("toolchains");
             if let Ok(entries) = fs::read_dir(&tc_dir) {
@@ -6486,7 +6559,7 @@ pub fn resolve_project_config_with_trust(
         .unwrap_or_else(|_| project_dir.to_path_buf());
     let toolchain = lake_build::detect_toolchain(&canon_dir);
     let (lean_bin, lean_githash, toolchain_lib_lean, toolchain_lib) =
-        match resolve_toolchain_compiler_with_trust(&canon_dir, &toolchain, true) {
+        match resolve_toolchain_compiler_with_trust(&canon_dir, &toolchain, is_untrusted) {
             Ok(resolved) => resolved,
             Err(e) => {
                 let strict_tc = is_untrusted
@@ -7071,6 +7144,57 @@ fn resolve_module_in_package_mode(
     }
     None
 }
+pub(crate) fn lean_githash_for_bin(lean_bin: &Path) -> Option<String> {
+    let canon_bin = lean_bin.canonicalize().ok()?;
+    let cache = LEAN_INFO_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some((gh, _, _)) = guard.get(&canon_bin) {
+            return Some(gh.clone());
+        }
+    }
+    let out = Command::new(&canon_bin)
+        .env("PATH", "/usr/bin:/bin")
+        .arg("--githash")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let gh = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if gh.is_empty() {
+        return None;
+    }
+    let prefix_root = canon_bin
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .filter(|p| p.join("lib/lean").is_dir());
+    if let Some(root) = prefix_root {
+        if let Ok(mut guard) = cache.lock() {
+            guard.insert(
+                canon_bin,
+                (gh.clone(), root.join("lib/lean"), root.join("lib")),
+            );
+        }
+    }
+    Some(gh)
+}
+
+pub(crate) fn lean_githash_for_sysroot_lib_lean(dir: &Path) -> Option<String> {
+    let check_root = |p: &Path| -> Option<PathBuf> {
+        if !p.ends_with("lib/lean") {
+            return None;
+        }
+        let tc = p.parent()?.parent()?;
+        [tc.join("bin/lean"), tc.join("bin/lean.exe")]
+            .into_iter()
+            .find(|cand| cand.is_file())
+    };
+    let lean_bin =
+        check_root(dir).or_else(|| fs::canonicalize(dir).ok().and_then(|c| check_root(&c)))?;
+    lean_githash_for_bin(&lean_bin)
+}
+
 pub(crate) fn is_verified_toolchain_olean_file(
     toolchain_lib_lean: &Path,
     lean_githash: Option<&str>,
@@ -7079,6 +7203,12 @@ pub(crate) fn is_verified_toolchain_olean_file(
     if toolchain_lib_lean.as_os_str().is_empty() || !olean_path.is_file() {
         return false;
     }
+    let Some(expected_gh) = lean_githash
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "lean-not-installed")
+    else {
+        return false;
+    };
     let Ok(canon_tc) = toolchain_lib_lean.canonicalize() else {
         return false;
     };
@@ -7088,12 +7218,6 @@ pub(crate) fn is_verified_toolchain_olean_file(
     if !canon_olean.starts_with(&canon_tc) {
         return false;
     }
-    let Some(expected_gh) = lean_githash
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && *s != "lean-not-installed")
-    else {
-        return true;
-    };
     let Ok(mut f) = fs::File::open(&canon_olean) else {
         return false;
     };
@@ -7104,20 +7228,27 @@ pub(crate) fn is_verified_toolchain_olean_file(
     &hdr[0..5] == b"olean" && hdr[5] == 2 && &hdr[40..80] == expected_gh.as_bytes()
 }
 
+pub(crate) fn is_builtin_toolchain_prefix_name(mod_name: &str) -> bool {
+    mod_name == "Init"
+        || mod_name.starts_with("Init.")
+        || mod_name == "Std"
+        || mod_name.starts_with("Std.")
+        || mod_name == "Lean"
+        || mod_name.starts_with("Lean.")
+        || mod_name == "Lake"
+        || mod_name.starts_with("Lake.")
+}
+
 pub(crate) fn is_builtin_toolchain_module(
     toolchain_lib_lean: &Path,
     lean_githash: Option<&str>,
     mod_name: &str,
 ) -> bool {
     if toolchain_lib_lean.as_os_str().is_empty() {
-        return mod_name == "Init"
-            || mod_name.starts_with("Init.")
-            || mod_name == "Std"
-            || mod_name.starts_with("Std.")
-            || mod_name == "Lean"
-            || mod_name.starts_with("Lean.")
-            || mod_name == "Lake"
-            || mod_name.starts_with("Lake.");
+        let is_zero_compiler = lean_githash
+            .map(str::trim)
+            .is_none_or(|s| s.is_empty() || s == "lean-not-installed");
+        return is_zero_compiler && is_builtin_toolchain_prefix_name(mod_name);
     }
     let rel_slash = module_name_to_rel_slash(mod_name);
     let cand = toolchain_lib_lean.join(format!("{}.olean", rel_slash));
@@ -7147,7 +7278,11 @@ pub(crate) fn is_unshadowed_toolchain_olean_import(
     let Some(first_hit) = all_dirs.iter().map(|d| d.join(&rel)).find(|p| p.is_file()) else {
         return !is_untrusted
             && cfg.toolchain_lib_lean.as_os_str().is_empty()
-            && is_builtin_toolchain_module(&cfg.toolchain_lib_lean, None, mod_name);
+            && is_builtin_toolchain_module(
+                &cfg.toolchain_lib_lean,
+                Some(&cfg.lean_githash),
+                mod_name,
+            );
     };
     is_verified_toolchain_olean_file(&cfg.toolchain_lib_lean, Some(&cfg.lean_githash), &first_hit)
 }
@@ -9238,6 +9373,100 @@ pub(crate) fn global_emit_c_enabled() -> bool {
         })
 }
 
+pub(crate) fn targets_include_exe_link_target(cfg: &ProjectConfig, targets: &[String]) -> bool {
+    let root_pkg = &cfg.root_pkg;
+    let ws_pkgs = || std::iter::once(root_pkg).chain(cfg.dep_pkgs.iter());
+    for raw_target in targets {
+        let raw_trimmed = raw_target.trim();
+        let explicit_pkg = raw_trimmed.starts_with('@');
+        let explicit_workspace_module = !explicit_pkg && raw_trimmed.starts_with('+');
+        let t = raw_trimmed.strip_prefix('@').unwrap_or(raw_trimmed);
+        if t.matches(':').count() > 1 {
+            continue;
+        }
+        let (target_base, facet_opt) = match t.split_once(':') {
+            Some((b, f)) => (b.trim(), Some(f.trim())),
+            None => (t.trim(), None),
+        };
+        if facet_opt == Some("exe") {
+            return true;
+        }
+        if facet_opt.is_some_and(|f| f != "default") {
+            continue;
+        }
+        let slash_parts: Vec<&str> = target_base.split('/').collect();
+        let (pkg_filter, item_raw, explicit_pkg_item_mod) = match slash_parts.as_slice() {
+            [only] => (None, *only, false),
+            [pkg, item] => (
+                Some((*pkg).trim()),
+                (*item).trim(),
+                (*item).trim().starts_with('+'),
+            ),
+            _ => continue,
+        };
+        if explicit_workspace_module || explicit_pkg_item_mod {
+            continue;
+        }
+        let item_body = item_raw.strip_prefix('+').unwrap_or(item_raw);
+        let item_name = clean_lake_ident(item_body);
+        if let Some(pf) = pkg_filter {
+            let base = clean_lake_ident(pf.strip_prefix('@').unwrap_or(pf));
+            let pkg_opt = if base.is_empty() {
+                Some(root_pkg)
+            } else {
+                ws_pkgs().find(|p| p.base_name == base)
+            };
+            if let Some(pkg) = pkg_opt {
+                if item_raw.is_empty() {
+                    if pkg
+                        .default_targets
+                        .iter()
+                        .any(|dt| pkg.exes.iter().any(|e| e.name == clean_lake_ident(dt)))
+                    {
+                        return true;
+                    }
+                } else if pkg.exes.iter().any(|e| e.name == item_name) {
+                    return true;
+                }
+            }
+        } else if explicit_pkg {
+            let pkg_opt = if item_name.is_empty() {
+                Some(root_pkg)
+            } else {
+                ws_pkgs().find(|p| p.base_name == item_name)
+            };
+            if let Some(pkg) = pkg_opt {
+                if pkg
+                    .default_targets
+                    .iter()
+                    .any(|dt| pkg.exes.iter().any(|e| e.name == clean_lake_ident(dt)))
+                {
+                    return true;
+                }
+            }
+        } else if item_name.is_empty() {
+            if root_pkg
+                .default_targets
+                .iter()
+                .any(|dt| root_pkg.exes.iter().any(|e| e.name == clean_lake_ident(dt)))
+            {
+                return true;
+            }
+        } else if ws_pkgs().any(|p| p.exes.iter().any(|e| e.name == item_name)) {
+            return true;
+        } else if let Some(pkg) = ws_pkgs().find(|p| p.base_name == item_name) {
+            if pkg
+                .default_targets
+                .iter()
+                .any(|dt| pkg.exes.iter().any(|e| e.name == clean_lake_ident(dt)))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub fn build_module_dag_with_trust(
     cfg: &ProjectConfig,
     targets: &[String],
@@ -10509,8 +10738,23 @@ pub fn build_module_dag_with_trust(
             }
             out.push(m.to_string());
         }
-        for (m, _) in expand_lib_configured_modules(pkg, lib)? {
-            rec_collect_local(&m, lib_name, &nodes, &mut visited_local, &mut local_modules);
+        if targets.is_empty()
+            || expanded_shared_libs.contains(&(pkg_root.clone(), lib_name.clone()))
+        {
+            for (m, _) in expand_lib_configured_modules(pkg, lib)? {
+                rec_collect_local(&m, lib_name, &nodes, &mut visited_local, &mut local_modules);
+            }
+        } else {
+            for m in nodes
+                .values()
+                .filter(|n| {
+                    !n.is_exe_target && &n.pkg_root == pkg_root && &n.target_name == lib_name
+                })
+                .map(|n| n.module_name.clone())
+                .collect::<Vec<_>>()
+            {
+                rec_collect_local(&m, lib_name, &nodes, &mut visited_local, &mut local_modules);
+            }
         }
         if local_modules.is_empty() {
             continue;
@@ -11913,7 +12157,7 @@ fn collect_module_artifact_paths(node: &ModuleNode) -> Vec<(&'static str, PathBu
     if ir_sig.is_file() {
         list.push(("ir_sig", ir_sig));
     }
-    if node.c_path.is_file() {
+    if node.needs_c && node.c_path.is_file() {
         list.push(("c", node.c_path.clone()));
     }
     list
@@ -15702,6 +15946,453 @@ pub(crate) fn record_verified_dep_source(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn probe_warm_on_disk_module_candidate(
+    cfg: &ProjectConfig,
+    dag: &ModuleDag,
+    node: &ModuleNode,
+    preserve_lake: bool,
+    olean_digests: &HashMap<String, String>,
+    raw_imp_dynlibs: &[PathBuf],
+) -> Option<String> {
+    if cfg.lean_githash.is_empty()
+        || cfg.lean_githash == "lean-not-installed"
+        || cfg.lean_githash.len() != 40
+    {
+        return None;
+    }
+    let src_raw = fs::read_to_string(&node.src_path).ok()?;
+    if blake3::hash(src_raw.as_bytes()).to_hex().as_str() != node.src_blake3 {
+        return None;
+    }
+    let header = parse_header_info(&src_raw);
+    if header.header_error.is_some() || header.is_module != node.is_module {
+        return None;
+    }
+    let hygiene = splitter::audit_hygiene(&splitter::strip_lean_comments(&src_raw));
+    if hygiene.has_sorry
+        || hygiene.has_axiom
+        || hygiene.native_violation()
+        || hygiene.has_trust_compiler
+        || hygiene.has_checking_weakening
+    {
+        return None;
+    }
+    if node.is_module {
+        let ir_path = node.olean_path.with_extension("ir");
+        let ir_sig_path = PathBuf::from(format!("{}.sig", ir_path.display()));
+        if !is_regular_nonempty_file(&ir_path) || !is_regular_nonempty_file(&ir_sig_path) {
+            return None;
+        }
+    }
+    let actual_olean_digest = {
+        let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
+        let _guard = lock.lock().ok()?;
+        let _flock_guard = acquire_publish_flock_mode(&node.pkg_root, false, true).ok()?;
+        let mut paths: Vec<_> = olean_artifact_paths(&node.olean_path)
+            .into_iter()
+            .map(|(_, p)| p)
+            .collect();
+        if node.needs_c || node.c_path.exists() {
+            paths.push(node.c_path.clone());
+        }
+        _flock_guard
+            .read_consistent(&paths, || {
+                if !validate_materialized_module_artifacts(node, true) {
+                    return Ok(None);
+                }
+                let mut f = fs::File::open(&node.olean_path)?;
+                let mut hdr = [0u8; 80];
+                use std::io::Read;
+                if f.read_exact(&mut hdr).is_err() {
+                    return Ok(None);
+                }
+                if &hdr[0..5] != b"olean"
+                    || hdr[5] != 2
+                    || &hdr[40..80] != cfg.lean_githash.as_bytes()
+                {
+                    return Ok(None);
+                }
+                compute_olean_artifact_set_digest_locked(&node.olean_path, Some(&_flock_guard))
+                    .map(Some)
+            })
+            .ok()
+            .flatten()?
+    };
+
+    let expected_ws_inputs = workspace_lake_inputs_digest(cfg).ok()?;
+    let rel_src = node
+        .src_path
+        .strip_prefix(&node.pkg_root)
+        .unwrap_or(&node.src_path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let manifest_path = node
+        .pkg_root
+        .join(".lake/build/.turbo_verified_sources.json");
+    let mut raw_manifest_opt: Option<VerifiedDepManifest> = None;
+    match fs::read(&manifest_path) {
+        Ok(bytes) => match serde_json::from_slice::<VerifiedDepManifest>(&bytes) {
+            Ok(m) => raw_manifest_opt = Some(m),
+            Err(_) => return None,
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return None,
+    }
+    let raw_has_entry = raw_manifest_opt
+        .as_ref()
+        .is_some_and(|m| m.modules.contains_key(&rel_src));
+    let validated_entry = raw_manifest_opt.as_ref().and_then(|m| {
+        if m.pkg_name == node.pkg_name
+            && m.toolchain == cfg.toolchain
+            && m.lean_githash == cfg.lean_githash
+            && m.pkg_config_digest == node.pkg_config_digest
+            && m.lake_inputs_digest == expected_ws_inputs
+            && (!node.is_root_pkg
+                || (m.workspace_config_digest == cfg.canonical_config_digest
+                    && m.allowed_axioms == crate::splitter::allowed_axioms()))
+        {
+            m.modules.get(&rel_src)
+        } else {
+            None
+        }
+    });
+    if raw_has_entry && validated_entry.is_none() {
+        return None;
+    }
+
+    let manifest_matched = if let Some(entry) = validated_entry {
+        if raw_imp_dynlibs.is_empty()
+            && entry.lake_inputs_digest == expected_ws_inputs
+            && entry.src_blake3 == node.src_blake3
+            && entry.olean_artifact_digest == actual_olean_digest
+        {
+            verified_entry_imports_current(entry, &header.imports, |imp, pin| {
+                if let Some(expected_dig) = olean_digests.get(imp) {
+                    pin == Some(expected_dig.as_str())
+                } else {
+                    pin.is_none()
+                        && is_builtin_toolchain_module(
+                            &cfg.toolchain_lib_lean,
+                            Some(&cfg.lean_githash),
+                            imp,
+                        )
+                }
+            })
+        } else {
+            return None;
+        }
+    } else {
+        false
+    };
+    if raw_has_entry && !manifest_matched {
+        return None;
+    }
+
+    let clean_stale_ltar_bc = || -> bool {
+        if preserve_lake {
+            return true;
+        }
+        let ltar_path = node.c_path.with_extension("ltar");
+        let bc_path = node.c_path.with_extension("bc");
+        let ltar_hash_path = PathBuf::from(format!("{}.hash", ltar_path.display()));
+        let bc_hash_path = PathBuf::from(format!("{}.hash", bc_path.display()));
+        let exists_any = |p: &Path| fs::symlink_metadata(p).is_ok();
+        if !exists_any(&ltar_path)
+            && !exists_any(&bc_path)
+            && !exists_any(&ltar_hash_path)
+            && !exists_any(&bc_hash_path)
+        {
+            return true;
+        }
+        let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
+        let Ok(_guard) = lock.lock() else {
+            return false;
+        };
+        let Ok(_flock) = acquire_publish_flock(&node.pkg_root, false) else {
+            return false;
+        };
+        for p in [&ltar_path, &bc_path, &ltar_hash_path, &bc_hash_path] {
+            let _ = fs::remove_file(p);
+        }
+        validate_materialized_module_artifacts(node, false)
+    };
+
+    if manifest_matched {
+        if preserve_lake {
+            let rel_slash = module_name_to_rel_slash(&node.module_name);
+            let ir_dir = node
+                .c_path
+                .to_string_lossy()
+                .strip_suffix(&format!("{rel_slash}.c"))
+                .map(|s| PathBuf::from(s.trim_end_matches('/')));
+            if verify_module_lake_sidecars(
+                &node.olean_path,
+                ir_dir.as_deref(),
+                &rel_slash,
+                &src_raw,
+                node.is_module,
+                node.needs_c,
+            )
+            .is_err()
+            {
+                return None;
+            }
+        }
+        if !clean_stale_ltar_bc() {
+            return None;
+        }
+        return Some(actual_olean_digest);
+    }
+
+    if node.native_unsupported.is_some()
+        || node.link_unsupported.is_some()
+        || !node.extern_lib_digests.is_empty()
+        || !node.weak_args.is_empty()
+    {
+        return None;
+    }
+    let rel_slash = module_name_to_rel_slash(&node.module_name);
+    let ir_dir = node
+        .c_path
+        .to_string_lossy()
+        .strip_suffix(&format!("{rel_slash}.c"))
+        .map(|s| PathBuf::from(s.trim_end_matches('/')));
+    verify_module_lake_sidecars(
+        &node.olean_path,
+        ir_dir.as_deref(),
+        &rel_slash,
+        &src_raw,
+        node.is_module,
+        node.needs_c,
+    )
+    .ok()?;
+    let tv: serde_json::Value =
+        serde_json::from_slice(&fs::read(node.olean_path.with_extension("trace")).ok()?).ok()?;
+
+    let mut import_entries = Vec::new();
+    let mut exp_memo = HashMap::new();
+    let mut visiting = HashSet::new();
+    for imp in &header.import_specs {
+        let is_ws_or_pkg = dag.nodes.contains_key(&imp.module)
+            || node
+                .external_olean_deps
+                .iter()
+                .any(|(m, _)| m == &imp.module)
+            || dag
+                .nodes
+                .values()
+                .any(|n| n.external_olean_deps.iter().any(|(m, _)| m == &imp.module))
+            || resolve_importable_module_in_package(&cfg.root_pkg, true, &imp.module).is_some()
+            || cfg
+                .dep_pkgs
+                .iter()
+                .any(|dp| resolve_importable_module_in_package(dp, false, &imp.module).is_some())
+            || matches!(
+                resolve_import_site(cfg, &imp.module),
+                ImportSite::Module(_) | ImportSite::Prebuilt(_)
+            );
+        if !is_ws_or_pkg {
+            if is_builtin_toolchain_module(
+                &cfg.toolchain_lib_lean,
+                Some(&cfg.lean_githash),
+                &imp.module,
+            ) {
+                continue;
+            }
+            return None;
+        }
+        let exp_info =
+            compute_lake_export_info(cfg, dag, node, &imp.module, &mut exp_memo, &mut visiting)
+                .ok()?;
+        import_entries.extend(lake_import_trace_entries(node.is_module, imp, &exp_info));
+    }
+
+    let expected_imports_h = if import_entries.is_empty() {
+        LAKE_NIL_HASH
+    } else {
+        lake_input_hash(&serde_json::Value::Array(import_entries)).ok()?
+    };
+    let actual_imports_h = tv
+        .pointer("/inputs/0/1/1")
+        .filter(|p| p.get(0).and_then(|v| v.as_str()) == Some("imports"))
+        .and_then(|p| lake_input_hash(&p[1]).ok())?;
+    let actual_extra_dep_h = tv
+        .pointer("/inputs/0/1/0/1")
+        .and_then(|v| lake_input_hash(v).ok())?;
+    let actual_libs_h = tv
+        .pointer("/inputs/1/1")
+        .and_then(|v| lake_input_hash(v).ok())?;
+
+    let base_pkg_name = if node.pkg_base_name.is_empty() {
+        &node.pkg_name
+    } else {
+        &node.pkg_base_name
+    };
+    let pkg_base_ident = if base_pkg_name.contains('-') {
+        format!("«{}»", base_pkg_name)
+    } else {
+        base_pkg_name.clone()
+    };
+    let mut extra_dep_entries = vec![serde_json::json!([
+        format!("@{}:extraDep", pkg_base_ident),
+        format!("{LAKE_NIL_HASH:016x}")
+    ])];
+    extra_dep_entries.extend(lake_needs_trace_entries(cfg, node));
+    let expected_extra_dep_h =
+        lake_input_hash(&serde_json::Value::Array(extra_dep_entries)).ok()?;
+
+    let expected_libs_json = if node.platform_independent == Some(true) {
+        serde_json::json!([
+            ["import dynlibs", "00000000000006bb"],
+            ["package external libraries", "00000000000006bb"],
+            ["module dynlibs", "00000000000006bb"],
+            ["module plugins", "00000000000006bb"]
+        ])
+    } else {
+        let mut import_dynlib_entries = Vec::with_capacity(raw_imp_dynlibs.len());
+        for p in raw_imp_dynlibs {
+            let h = verify_and_hash_artifact_bytes(p, false, false).ok()?;
+            import_dynlib_entries.push(serde_json::json!([
+                p.to_string_lossy(),
+                format!("{:016x}", h)
+            ]));
+        }
+        let import_dynlibs_json = if import_dynlib_entries.is_empty() {
+            serde_json::Value::String("00000000000006bb".to_string())
+        } else {
+            serde_json::Value::Array(import_dynlib_entries)
+        };
+        serde_json::json!([
+            ["import dynlibs", import_dynlibs_json],
+            ["package external libraries", "00000000000006bb"],
+            ["module dynlibs", "00000000000006bb"],
+            ["module plugins", "00000000000006bb"]
+        ])
+    };
+    let expected_libs_h = lake_input_hash(&expected_libs_json).ok()?;
+
+    let has_plat_entry = node.platform_independent == Some(false);
+    let base_idx = if has_plat_entry { 3usize } else { 2usize };
+    if has_plat_entry {
+        let tc_spec = query_toolchain_native_spec(&cfg.lean_bin).ok()?;
+        if tc_spec.target.is_empty() {
+            return None;
+        }
+        let expected_plat_h = format!("{:016x}", lake_hash_bytes(tc_spec.target.as_bytes()));
+        if tv.pointer("/inputs/2/0").and_then(|v| v.as_str()) != Some(tc_spec.target.as_str())
+            || tv.pointer("/inputs/2/1").and_then(|v| v.as_str()) != Some(expected_plat_h.as_str())
+        {
+            return None;
+        }
+    }
+
+    let inputs_arr = tv.get("inputs").and_then(|v| v.as_array())?;
+    let expected_len = base_idx + 7;
+    if inputs_arr.len() != expected_len {
+        return None;
+    }
+
+    let opt_idx = base_idx + 2;
+    let opt_pair = inputs_arr.get(opt_idx).and_then(|v| v.as_array())?;
+    if opt_pair.len() != 2 || opt_pair[0].as_str() != Some("options") {
+        return None;
+    }
+    if node.lean_options.is_empty() {
+        let empty_ok = opt_pair[1].as_str() == Some("00000000000006bb")
+            || opt_pair[1].as_array().is_some_and(Vec::is_empty);
+        if !empty_ok {
+            return None;
+        }
+    } else {
+        let arr = opt_pair[1].as_array()?;
+        if arr.len() != node.lean_options.len() {
+            return None;
+        }
+        for (item, (k, v)) in arr.iter().zip(node.lean_options.iter()) {
+            let cap = format!("-D{}={}", k.to_lean_string(), v.as_cli_flag_value());
+            let hex = format!("{:016x}", lake_hash_text(&cap));
+            let p = item.as_array()?;
+            if p.len() != 2
+                || p[0].as_str() != Some(cap.as_str())
+                || p[1].as_str() != Some(hex.as_str())
+            {
+                return None;
+            }
+        }
+    }
+
+    let args_pair = inputs_arr.get(opt_idx + 4).and_then(|v| v.as_array())?;
+    if args_pair.len() != 2 {
+        return None;
+    }
+    let expected_args_cap = if node.strong_args.is_empty() {
+        "Module.leanArgs: #[]".to_string()
+    } else {
+        format!("Module.leanArgs: #[{}]", node.strong_args.join(", "))
+    };
+    let expected_args_h = format!(
+        "{:016x}",
+        node.strong_args
+            .iter()
+            .fold(LAKE_NIL_HASH, |acc, a| lake_mix_hash(
+                acc,
+                lake_hash_bytes(a.as_bytes())
+            ))
+    );
+    if args_pair[0].as_str() != Some(expected_args_cap.as_str())
+        || args_pair[1].as_str() != Some(expected_args_h.as_str())
+    {
+        return None;
+    }
+
+    let expected_gh = format!("{:016x}", lake_hash_bytes(cfg.lean_githash.as_bytes()));
+    let expected_src = format!("{:016x}", lake_hash_text(&src_raw));
+    let expected_is_mod = format!(
+        "{:016x}",
+        lake_mix_hash(LAKE_NIL_HASH, if node.is_module { 11 } else { 13 })
+    );
+    let expected_mod_name = format!("{:016x}", lake_hash_name(&node.module_name));
+    let expected_pkg_id = format!("{:016x}", lake_hash_pkg_id(&node.pkg_name));
+
+    if actual_imports_h != expected_imports_h
+        || actual_extra_dep_h != expected_extra_dep_h
+        || actual_libs_h != expected_libs_h
+        || inputs_arr
+            .get(base_idx)
+            .and_then(|v| v.get(1))
+            .and_then(|v| v.as_str())
+            != Some(expected_gh.as_str())
+        || inputs_arr
+            .get(base_idx + 1)
+            .and_then(|v| v.get(1))
+            .and_then(|v| v.as_str())
+            != Some(expected_src.as_str())
+        || inputs_arr
+            .get(base_idx + 3)
+            .and_then(|v| v.get(1))
+            .and_then(|v| v.as_str())
+            != Some(expected_is_mod.as_str())
+        || inputs_arr
+            .get(base_idx + 4)
+            .and_then(|v| v.get(1))
+            .and_then(|v| v.as_str())
+            != Some(expected_mod_name.as_str())
+        || inputs_arr
+            .get(base_idx + 5)
+            .and_then(|v| v.get(1))
+            .and_then(|v| v.as_str())
+            != Some(expected_pkg_id.as_str())
+    {
+        return None;
+    }
+
+    if !clean_stale_ltar_bc() {
+        return None;
+    }
+    Some(actual_olean_digest)
+}
+
 /// Orchestrate native Lean module compilation across the resolved DAG without invoking `lake build`.
 /// Uses per-module CAS (`module_unit`), bounded worker parallelism (`jobs`), temporary output
 /// directories, and atomic publication.
@@ -15736,6 +16427,7 @@ pub fn build_project_modules_native(
         config_digest: cfg.canonical_config_digest.clone(),
         compiled_modules: Vec::new(),
         cached_modules: Vec::new(),
+        cone_source_paths: dag.nodes.values().map(|n| n.src_path.clone()).collect(),
         bwrap_used: false,
     };
     if dag.nodes.is_empty() {
@@ -15813,7 +16505,12 @@ pub fn build_project_modules_native(
     let mut completed_mods: HashSet<String> = HashSet::new();
     let mut built_shared_libs: HashSet<(PathBuf, String)> = HashSet::new();
     for wave in &dag.waves {
+        enum WaveHitKind {
+            CasRestored { dig: String, preserve_lake: bool },
+            WarmAdopted { dig: String, mod_key: String },
+        }
         let mut misses_to_compile: Vec<(String, String)> = Vec::new();
+        let mut wave_hits: Vec<(String, WaveHitKind)> = Vec::new();
         for mod_name in wave {
             let node = dag.nodes.get(mod_name).expect("wave module in dag");
             let preserve_lake =
@@ -15941,22 +16638,26 @@ pub fn build_project_modules_native(
                         .into_iter()
                         .map(|(_, p)| p)
                         .collect();
-                    paths.extend(outputs.iter().map(|e| target_root.join(&e.rel_path)));
+                    let checked_outputs: Vec<BlobEntry> = outputs
+                        .into_iter()
+                        .filter(|e| node.needs_c || e.kind != "c")
+                        .collect();
+                    paths.extend(
+                        checked_outputs
+                            .iter()
+                            .map(|e| target_root.join(&e.rel_path)),
+                    );
                     let restored = _flock_guard.read_consistent(&paths, || {
                         if preserve_lake {
-                            crate::db::reuse_worktree_outputs(target_root, &outputs)?;
+                            crate::db::reuse_worktree_outputs(target_root, &checked_outputs)?;
                         }
                         let hashes_ok = validate_materialized_module_artifacts(node, preserve_lake)
-                            && outputs
-                                .iter()
-                                .filter(|e| node.needs_c || e.kind != "c")
-                                .all(|entry| {
-                                    fs::read(target_root.join(&entry.rel_path)).is_ok_and(|bytes| {
-                                        bytes.len() as u64 == entry.size_bytes
-                                            && blake3::hash(&bytes).to_hex().as_str()
-                                                == entry.blob_hash
-                                    })
-                                });
+                            && checked_outputs.iter().all(|entry| {
+                                fs::read(target_root.join(&entry.rel_path)).is_ok_and(|bytes| {
+                                    bytes.len() as u64 == entry.size_bytes
+                                        && blake3::hash(&bytes).to_hex().as_str() == entry.blob_hash
+                                })
+                            });
                         if hashes_ok {
                             compute_olean_artifact_set_digest_locked(
                                 &node.olean_path,
@@ -15973,69 +16674,199 @@ pub fn build_project_modules_native(
                     restored
                 };
                 if let Some(dig) = cas_restored_dig_opt {
-                    // CAS entries carry no replay provenance: every restore is re-audited.
-                    {
-                        let audit_res = audit_or_replay_modules(
-                            store,
-                            &cfg,
-                            &dag,
-                            std::slice::from_ref(mod_name),
-                            &lean_path_env,
-                            is_untrusted,
-                        );
-                        if let Err(audit_err) = audit_res {
-                            invalidate()?;
-                            return Err(audit_err.context(format!(
-                                "In-kernel `.olean` audit rejected materialized CAS hit for module `{}`",
-                                mod_name
-                            )));
-                        }
-                    }
-                    let post_audit_dig = compute_olean_artifact_set_digest_with_policy(
-                        &node.olean_path,
-                        preserve_project,
-                    )?;
-                    if post_audit_dig != dig {
-                        invalidate()?;
-                        anyhow::bail!(
-                            "Artifact digest mutated during `.olean` kernel audit for `{}`",
-                            mod_name
-                        );
-                    }
-                    if !preserve_lake {
-                        write_lake_module_hashes_and_trace(
-                            &cfg,
-                            &dag,
-                            node,
-                            &dig,
-                            Some(&post_audit_dig),
-                            true,
-                        )?;
-                        if !is_untrusted {
-                            record_verified_dep_source(
-                                &cfg,
-                                node,
-                                &dig,
-                                node.is_root_pkg,
-                                &olean_digests,
-                            );
-                        }
-                        write_file_atomic(
-                            &module_setup_json_path(node),
-                            &serde_json::to_vec(&build_setup_json(&cfg, &dag, node, None, None)?)?,
-                        )?;
-                    }
-                    olean_digests.insert(mod_name.clone(), dig);
-                    report.modules_cached += 1;
-                    report.cached_modules.push(mod_name.clone());
+                    wave_hits.push((
+                        mod_name.clone(),
+                        WaveHitKind::CasRestored { dig, preserve_lake },
+                    ));
                     continue;
                 }
                 anyhow::ensure!(!preserve_lake, "Worktree opt-out prevents rebuilding invalid CAS outputs for `{mod_name}`; build with Lake first");
             } else {
                 anyhow::ensure!(!preserve_lake, "Worktree opt-out prevents compiling uncached module `{mod_name}`; build with Lake first");
+                if !is_untrusted {
+                    if let Some(warm_dig) = probe_warm_on_disk_module_candidate(
+                        &cfg,
+                        &dag,
+                        node,
+                        preserve_lake,
+                        &olean_digests,
+                        &raw_imp_dynlibs,
+                    ) {
+                        wave_hits.push((
+                            mod_name.clone(),
+                            WaveHitKind::WarmAdopted {
+                                dig: warm_dig,
+                                mod_key,
+                            },
+                        ));
+                        continue;
+                    }
+                }
                 invalidate()?;
             }
             misses_to_compile.push((mod_name.clone(), mod_key));
+        }
+        if !wave_hits.is_empty() {
+            // CAS entries and warm on-disk artifacts carry no replay provenance: batch-audit
+            // all wave hits in one Zygote round-trip, falling back per-module if the batch fails
+            // so a rejected warm candidate falls back to clean recompilation while CAS hits fail closed.
+            let hit_names: Vec<String> = wave_hits.iter().map(|(m, _)| m.clone()).collect();
+            let batch_ok = audit_or_replay_modules(
+                store,
+                &cfg,
+                &dag,
+                &hit_names,
+                &lean_path_env,
+                is_untrusted,
+            )
+            .is_ok();
+            for (mod_name, hit_kind) in wave_hits {
+                let node = dag.nodes.get(&mod_name).expect("wave module in dag");
+                let preserve_lake = preserve_project
+                    || crate::lake_build::worktree_auto_link_disabled(&node.pkg_root);
+                let invalidate_node = || -> Result<()> {
+                    if !preserve_lake {
+                        let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
+                        let _guard = lock.lock().map_err(|_| {
+                            anyhow::anyhow!("Module artifact publication mutex poisoned")
+                        })?;
+                        let _flock_guard = acquire_publish_flock(&node.pkg_root, false)?;
+                        wipe_existing_module_artifacts(node);
+                    }
+                    Ok(())
+                };
+                match hit_kind {
+                    WaveHitKind::CasRestored { dig, preserve_lake } => {
+                        if !batch_ok {
+                            if let Err(audit_err) = audit_or_replay_modules(
+                                store,
+                                &cfg,
+                                &dag,
+                                std::slice::from_ref(&mod_name),
+                                &lean_path_env,
+                                is_untrusted,
+                            ) {
+                                invalidate_node()?;
+                                return Err(audit_err.context(format!(
+                                    "In-kernel `.olean` audit rejected materialized CAS hit for module `{}`",
+                                    mod_name
+                                )));
+                            }
+                        }
+                        let post_audit_dig = compute_olean_artifact_set_digest_with_policy(
+                            &node.olean_path,
+                            preserve_project,
+                        )?;
+                        if post_audit_dig != dig {
+                            invalidate_node()?;
+                            anyhow::bail!(
+                                "Artifact digest mutated during `.olean` kernel audit for `{}`",
+                                mod_name
+                            );
+                        }
+                        if !preserve_lake {
+                            write_lake_module_hashes_and_trace(
+                                &cfg,
+                                &dag,
+                                node,
+                                &dig,
+                                Some(&post_audit_dig),
+                                true,
+                            )?;
+                            if !is_untrusted {
+                                record_verified_dep_source(
+                                    &cfg,
+                                    node,
+                                    &dig,
+                                    node.is_root_pkg,
+                                    &olean_digests,
+                                );
+                            }
+                            write_file_atomic(
+                                &module_setup_json_path(node),
+                                &serde_json::to_vec(&build_setup_json(
+                                    &cfg, &dag, node, None, None,
+                                )?)?,
+                            )?;
+                        }
+                        olean_digests.insert(mod_name.clone(), dig);
+                        report.modules_cached += 1;
+                        report.cached_modules.push(mod_name);
+                    }
+                    WaveHitKind::WarmAdopted { dig, mod_key } => {
+                        let individual_ok = batch_ok
+                            || audit_or_replay_modules(
+                                store,
+                                &cfg,
+                                &dag,
+                                std::slice::from_ref(&mod_name),
+                                &lean_path_env,
+                                is_untrusted,
+                            )
+                            .is_ok();
+                        let post_audit_dig = individual_ok
+                            .then(|| {
+                                compute_olean_artifact_set_digest_with_policy(
+                                    &node.olean_path,
+                                    preserve_project,
+                                )
+                                .ok()
+                            })
+                            .flatten();
+                        if post_audit_dig.as_deref() != Some(dig.as_str()) {
+                            invalidate_node()?;
+                            misses_to_compile.push((mod_name, mod_key));
+                            continue;
+                        }
+                        if !preserve_lake && !node.needs_c {
+                            let c_hash_path =
+                                PathBuf::from(format!("{}.hash", node.c_path.display()));
+                            if fs::symlink_metadata(&node.c_path).is_ok()
+                                || fs::symlink_metadata(&c_hash_path).is_ok()
+                            {
+                                let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
+                                let _guard = lock.lock().map_err(|_| {
+                                    anyhow::anyhow!("Module artifact publication mutex poisoned")
+                                })?;
+                                let _flock_guard = acquire_publish_flock(&node.pkg_root, false)?;
+                                let _ = fs::remove_file(&node.c_path);
+                                let _ = fs::remove_file(&c_hash_path);
+                            }
+                        }
+                        write_lake_module_hashes_and_trace(
+                            &cfg,
+                            &dag,
+                            node,
+                            &dig,
+                            Some(&dig),
+                            true,
+                        )?;
+                        store_module_artifacts_in_cas(
+                            store,
+                            &canon_dir,
+                            node,
+                            &mod_key,
+                            &cfg.toolchain,
+                            trust_domain,
+                            pin_level,
+                            0,
+                        )?;
+                        record_verified_dep_source(
+                            &cfg,
+                            node,
+                            &dig,
+                            node.is_root_pkg,
+                            &olean_digests,
+                        );
+                        write_file_atomic(
+                            &module_setup_json_path(node),
+                            &serde_json::to_vec(&build_setup_json(&cfg, &dag, node, None, None)?)?,
+                        )?;
+                        olean_digests.insert(mod_name, dig);
+                        report.modules_up_to_date_reused += 1;
+                    }
+                }
+            }
         }
         if misses_to_compile.is_empty() {
             for mod_name in wave {
@@ -19292,7 +20123,8 @@ lean_lib Smoke where
                 true,
                 None,
             )?;
-            assert_eq!(seed.modules_compiled, 2);
+            assert_eq!(seed.modules_compiled, 0);
+            assert_eq!(seed.modules_up_to_date_reused, 2);
             if !prebuilt {
                 fs::remove_file(
                     tree.project
@@ -22891,6 +23723,138 @@ globs = ["Demo.+"]
                 path_is_elan_proxy_bin(&sym_lean),
                 "symlink pointing into .elan/bin/lean must be detected as elan proxy"
             );
+        }
+
+        // 4. `v4.31.0` with only `v4.35.0` installed fails closed unless `TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK=1`
+        {
+            let _env_guard = native_build_env_guard();
+            let _bwrap_guard = BWRAP_TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let prev_fallback = std::env::var_os("TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK");
+            let prev_strict = std::env::var_os("TURBO_LEAN_STRICT_TOOLCHAIN");
+            let prev_elan = std::env::var_os("ELAN_HOME");
+            let prev_extra = std::env::var_os("TURBO_LEAN_ELAN_ROOTS");
+
+            let (_, _, real_lib_lean, _) =
+                resolve_toolchain_compiler_with_trust(&dir, "leanprover/lean4:v4.35.0", false)
+                    .expect("resolve installed v4.35.0 toolchain");
+            let real_elan_root = real_lib_lean
+                .ancestors()
+                .nth(4)
+                .expect("elan root from lib/lean")
+                .to_path_buf();
+
+            let isolated_elan = dir.join("only_v435_elan");
+            fs::create_dir_all(isolated_elan.join("toolchains")).unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(
+                real_elan_root.join("toolchains/leanprover--lean4---v4.35.0"),
+                isolated_elan.join("toolchains/leanprover--lean4---v4.35.0"),
+            )
+            .unwrap();
+            let isolated_home = dir.join("isolated/a/b/home");
+            fs::create_dir_all(&isolated_home).unwrap();
+            let prev_home = std::env::var_os("HOME");
+            let prev_path = std::env::var_os("PATH");
+
+            unsafe {
+                std::env::remove_var("TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK");
+                std::env::remove_var("TURBO_LEAN_STRICT_TOOLCHAIN");
+                std::env::set_var("ELAN_HOME", &isolated_elan);
+                std::env::set_var("HOME", &isolated_home);
+                std::env::set_var("PATH", "/usr/bin:/bin");
+                std::env::remove_var("TURBO_LEAN_ELAN_ROOTS");
+            }
+
+            let isolated_roots = vec![isolated_elan.clone()];
+            let err_v431 = resolve_toolchain_compiler_with_roots(
+                &dir,
+                "leanprover/lean4:v4.31.0",
+                false,
+                Some(&isolated_roots),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err_v431.contains(
+                    "Could not locate installed `lean` compiler binary matching toolchain"
+                ) && err_v431.contains("v4.31.0")
+                    && err_v431.contains("fail-closed"),
+                "expected v4.31.0 without fallback opt-in to fail closed, got: {err_v431}"
+            );
+
+            unsafe {
+                std::env::set_var("TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK", "1");
+            }
+            let (fb_bin, fb_gh, _, _) = resolve_toolchain_compiler_with_roots(
+                &dir,
+                "leanprover/lean4:v4.31.0",
+                false,
+                Some(&isolated_roots),
+            )
+            .expect("TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK=1 restores fleet fallback");
+            assert!(
+                fb_bin
+                    .to_string_lossy()
+                    .contains("leanprover--lean4---v4.35.0"),
+                "expected v4.35.0 fallback binary, got: {}",
+                fb_bin.display()
+            );
+
+            // 5. Hard-block `.olean` v2 githash skew and missing/sentinel githashes
+            let init_olean = real_lib_lean.join("Init.olean");
+            assert!(
+                is_verified_toolchain_olean_file(&real_lib_lean, Some(&fb_gh), &init_olean),
+                "matching real githash must verify toolchain Init.olean"
+            );
+            assert!(
+                !is_verified_toolchain_olean_file(&real_lib_lean, None, &init_olean),
+                "None githash must fail closed"
+            );
+            assert!(
+                !is_verified_toolchain_olean_file(
+                    &real_lib_lean,
+                    Some("lean-not-installed"),
+                    &init_olean
+                ),
+                "sentinel githash must fail closed"
+            );
+            assert!(
+                !is_verified_toolchain_olean_file(
+                    &real_lib_lean,
+                    Some("0000000000000000000000000000000000000000"),
+                    &init_olean
+                ),
+                "mismatched githash must fail closed"
+            );
+
+            unsafe {
+                match prev_fallback {
+                    Some(v) => std::env::set_var("TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK", v),
+                    None => std::env::remove_var("TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK"),
+                }
+                match prev_strict {
+                    Some(v) => std::env::set_var("TURBO_LEAN_STRICT_TOOLCHAIN", v),
+                    None => std::env::remove_var("TURBO_LEAN_STRICT_TOOLCHAIN"),
+                }
+                match prev_elan {
+                    Some(v) => std::env::set_var("ELAN_HOME", v),
+                    None => std::env::remove_var("ELAN_HOME"),
+                }
+                match prev_extra {
+                    Some(v) => std::env::set_var("TURBO_LEAN_ELAN_ROOTS", v),
+                    None => std::env::remove_var("TURBO_LEAN_ELAN_ROOTS"),
+                }
+                match prev_home {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+                match prev_path {
+                    Some(v) => std::env::set_var("PATH", v),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
         }
 
         let _ = fs::remove_dir_all(&dir);
@@ -26609,5 +27573,290 @@ root = "Main"
             Ok(inner) => inner,
             Err(p) => std::panic::resume_unwind(p),
         }
+    }
+
+    #[test]
+    fn test_warm_on_disk_olean_reuse_and_githash_gate() -> Result<()> {
+        let _env_guard = native_build_env_guard();
+        let dir = make_temp_test_dir("warm_olean_reuse");
+        let proj_dir = dir.join("proj");
+        fs::create_dir_all(proj_dir.join("Warm"))?;
+        fs::write(
+            proj_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )?;
+        fs::write(
+            proj_dir.join("lakefile.toml"),
+            "name = \"warm_pkg\"\ndefaultTargets = [\"Warm\"]\n[[lean_lib]]\nname = \"Warm\"\nglobs = [\"Warm.+\"]\n",
+        )?;
+        fs::write(
+            proj_dir.join("Warm/Base.lean"),
+            "namespace Warm\ndef baseVal : Nat := 11\nend Warm\n",
+        )?;
+        fs::write(
+            proj_dir.join("Warm/Top.lean"),
+            "import Warm.Base\nnamespace Warm\ntheorem top_eq : baseVal + 4 = 15 := rfl\nend Warm\n",
+        )?;
+
+        let out = Command::new("lake")
+            .arg("build")
+            .env("LEAN_NUM_THREADS", "2")
+            .current_dir(&proj_dir)
+            .output()?;
+        anyhow::ensure!(
+            out.status.success(),
+            "lake build failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let base_olean = proj_dir.join(".lake/build/lib/lean/Warm/Base.olean");
+        let top_olean = proj_dir.join(".lake/build/lib/lean/Warm/Top.olean");
+        assert!(base_olean.is_file() && top_olean.is_file());
+
+        // 1. Positive test: fresh TurboStore adopts Lake-built `.olean`s without recompiling
+        //    and ingests them into per-module CAS.
+        let mut store1 = TurboStore::open(Some(&dir.join("store1")))?;
+        let rep1 = build_project_modules_native(
+            &mut store1,
+            &proj_dir,
+            &[],
+            "trusted",
+            1,
+            false,
+            true,
+            None,
+        )?;
+        assert_eq!(rep1.modules_total, 2);
+        assert_eq!(rep1.modules_compiled, 0);
+        assert_eq!(rep1.modules_cached, 0);
+        assert_eq!(rep1.modules_up_to_date_reused, 2);
+
+        // Verify CAS ingestion: deleting `.lake/build` and rebuilding hits per-module CAS!
+        fs::remove_dir_all(proj_dir.join(".lake/build"))?;
+        let rep_cas = build_project_modules_native(
+            &mut store1,
+            &proj_dir,
+            &[],
+            "trusted",
+            1,
+            false,
+            true,
+            None,
+        )?;
+        assert_eq!(rep_cas.modules_compiled, 0);
+        assert_eq!(rep_cas.modules_cached, 2);
+        assert_eq!(rep_cas.modules_up_to_date_reused, 0);
+
+        // 2. CLI `run_seed_oleans_command` smoke test on a fresh store with warm `.olean`s:
+        let mut store_seed = TurboStore::open(Some(&dir.join("store_seed")))?;
+        run_seed_oleans_command(
+            &mut store_seed,
+            true,
+            proj_dir.clone(),
+            vec!["Warm".to_string()],
+            1,
+        )?;
+        fs::remove_dir_all(proj_dir.join(".lake/build"))?;
+        let rep_after_seed = build_project_modules_native(
+            &mut store_seed,
+            &proj_dir,
+            &["Warm".to_string()],
+            "trusted",
+            1,
+            false,
+            true,
+            None,
+        )?;
+        assert_eq!(rep_after_seed.modules_compiled, 0);
+        assert_eq!(rep_after_seed.modules_cached, 2);
+
+        // 3. Negative test: mutating the `.olean` v2 header githash (`hdr[40..80]`) to a
+        //    mismatched 40-char githash forces recompilation on a fresh TurboStore.
+        let out2 = Command::new("lake")
+            .arg("build")
+            .env("LEAN_NUM_THREADS", "2")
+            .current_dir(&proj_dir)
+            .output()?;
+        anyhow::ensure!(
+            out2.status.success(),
+            "second lake build failed: {}",
+            String::from_utf8_lossy(&out2.stderr)
+        );
+        let mut tampered_base = fs::read(&base_olean)?;
+        assert!(
+            tampered_base.len() >= 80 && &tampered_base[0..5] == b"olean" && tampered_base[5] == 2
+        );
+        tampered_base[40..80].copy_from_slice(b"0000000000000000000000000000000000000000");
+        fs::write(&base_olean, &tampered_base)?;
+        let _ = fs::remove_file(proj_dir.join(".lake/build/.turbo_verified_sources.json"));
+
+        let mut store2 = TurboStore::open(Some(&dir.join("store2")))?;
+        let rep_bad_hdr = build_project_modules_native(
+            &mut store2,
+            &proj_dir,
+            &[],
+            "trusted",
+            1,
+            false,
+            true,
+            None,
+        )?;
+        assert!(
+            rep_bad_hdr.modules_compiled >= 1,
+            "mismatched olean header githash must force recompilation, got {:?}",
+            rep_bad_hdr
+        );
+        assert!(
+            rep_bad_hdr
+                .compiled_modules
+                .contains(&"Warm.Base".to_string()),
+            "Warm.Base with tampered githash must recompile: {:?}",
+            rep_bad_hdr.compiled_modules
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_target_cone_scoping_skips_unrelated_libs_and_module_full_cas() -> Result<()> {
+        let _env_guard = native_build_env_guard();
+        let dir = make_temp_test_dir("target_cone_scoping");
+        let proj_dir = dir.join("proj");
+        fs::create_dir_all(proj_dir.join("LibA"))?;
+        fs::write(
+            proj_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )?;
+        // Declare two libraries: `LibA` (present) and `LibB` whose `LibB.+` directory does not
+        // exist unless walked, plus later a broken `LibB/Broken.lean` that would fail `split_lean_source`
+        // or compilation if `LibB` were eagerly walked or compiled.
+        fs::write(
+            proj_dir.join("lakefile.toml"),
+            "name = \"two_libs\"\ndefaultTargets = [\"LibA\", \"LibB\"]\n[[lean_lib]]\nname = \"LibA\"\nglobs = [\"LibA.+\"]\n[[lean_lib]]\nname = \"LibB\"\nglobs = [\"LibB.+\"]\n",
+        )?;
+        fs::write(
+            proj_dir.join("LibA/Core.lean"),
+            "namespace LibA\ndef val : Nat := 42\ntheorem val_eq : val = 42 := rfl\nend LibA\n",
+        )?;
+
+        // 1. Even before `LibB/` exists on disk (which would fail `expand_lib_configured_modules`
+        //    if `LibB.+` were walked), `build_module_dag_with_trust(..., &["LibA"], ...)` and
+        //    `run_build_command(..., vec!["LibA"])` succeed and build only `LibA.Core`.
+        let cfg = resolve_project_config(&proj_dir)?;
+        let dag_a = build_module_dag_with_trust(&cfg, &["LibA".to_string()], false)?;
+        assert_eq!(
+            dag_a.nodes.keys().cloned().collect::<Vec<_>>(),
+            vec!["LibA.Core".to_string()]
+        );
+
+        // Now populate `LibB/Broken.lean` with an invalid Lean proof/header that must never be
+        // compiled or walked when building target `LibA`.
+        fs::create_dir_all(proj_dir.join("LibB"))?;
+        fs::write(
+            proj_dir.join("LibB/Broken.lean"),
+            "import NonExistent.Module\ndef broken : Nat := \"type_mismatch\"\n",
+        )?;
+
+        let mut store = TurboStore::open(Some(&dir.join("store")))?;
+        crate::lake_build::run_build_command(
+            &mut store,
+            true,
+            vec!["LibA".to_string()],
+            proj_dir.clone(),
+            "trusted".to_string(),
+            1,
+            true,
+        )?;
+        assert!(
+            proj_dir
+                .join(".lake/build/lib/lean/LibA/Core.olean")
+                .is_file(),
+            "LibA.Core.olean must be built"
+        );
+        assert!(
+            !proj_dir
+                .join(".lake/build/lib/lean/LibB/Broken.olean")
+                .exists(),
+            "LibB.Broken.olean must never be built when targeting LibA"
+        );
+        let module_full_count: i64 = store.conn.query_row(
+            "SELECT COUNT(*) FROM actions WHERE kind = 'module_full'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(
+            module_full_count, 0,
+            "target-scoped build must publish zero `module_full` actions"
+        );
+        let module_unit_count: i64 = store.conn.query_row(
+            "SELECT COUNT(*) FROM actions WHERE kind = 'module_unit'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(
+            module_unit_count, 1,
+            "target-scoped build must populate `module_unit` CAS for LibA.Core"
+        );
+
+        // 2. Clean `.lake/build` into a fresh worktree `proj2` (still keeping broken `LibB/Broken.lean`)
+        //    and verify `run_build_command(..., vec!["LibA"])` restores `LibA.Core` from `module_unit` CAS
+        //    without touching `LibB` or publishing `module_full`.
+        let proj2 = dir.join("proj2");
+        fs::create_dir_all(proj2.join("LibA"))?;
+        fs::create_dir_all(proj2.join("LibB"))?;
+        for rel in [
+            "lean-toolchain",
+            "lakefile.toml",
+            "LibA/Core.lean",
+            "LibB/Broken.lean",
+        ] {
+            fs::copy(proj_dir.join(rel), proj2.join(rel))?;
+        }
+        crate::lake_build::run_build_command(
+            &mut store,
+            true,
+            vec!["LibA".to_string()],
+            proj2.clone(),
+            "trusted".to_string(),
+            1,
+            false,
+        )?;
+        assert!(
+            proj2.join(".lake/build/lib/lean/LibA/Core.olean").is_file(),
+            "proj2 LibA.Core.olean must be restored from module_unit CAS"
+        );
+        let module_full_count_after: i64 = store.conn.query_row(
+            "SELECT COUNT(*) FROM actions WHERE kind = 'module_full'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(module_full_count_after, 0);
+
+        // 3. Whole-repo build (`targets = []`) once `LibB/Broken.lean` is fixed still publishes `module_full`.
+        fs::write(
+            proj_dir.join("LibB/Broken.lean"),
+            "namespace LibB\ndef okVal : Nat := 7\nend LibB\n",
+        )?;
+        crate::lake_build::run_build_command(
+            &mut store,
+            true,
+            Vec::new(),
+            proj_dir.clone(),
+            "trusted".to_string(),
+            1,
+            false,
+        )?;
+        let module_full_whole: i64 = store.conn.query_row(
+            "SELECT COUNT(*) FROM actions WHERE kind = 'module_full'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(
+            module_full_whole, 1,
+            "whole-repo build (`targets = []`) must still publish `module_full`"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
     }
 }

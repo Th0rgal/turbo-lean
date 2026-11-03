@@ -662,7 +662,10 @@ mod tests {
     use std::net::{Shutdown, TcpListener, TcpStream};
     use std::process::Command;
 
-    fn accept_with_timeout(listener: &TcpListener, deadline: Duration) -> std::io::Result<TcpStream> {
+    fn accept_with_timeout(
+        listener: &TcpListener,
+        deadline: Duration,
+    ) -> std::io::Result<TcpStream> {
         listener.set_nonblocking(true)?;
         let start = Instant::now();
         loop {
