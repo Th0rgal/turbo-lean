@@ -80,7 +80,16 @@ def verifiedTheoremRegistry : List String :=
     "superoptModule_sound", "superoptModuleWithProfile_sound",
     "applyExprRules_sound", "applyRewriteTable_sound",
     "scheduleStructuredLoop_sound", "applyLoopScheduleAux_refines",
-    "elideAndMutateRC_sound", "rewriteCodeVerified_refines", "rewriteLNIRExprVerified_sound"
+    "elideAndMutateRC_sound", "rewriteCodeVerified_refines", "rewriteLNIRExprVerified_sound",
+    "contractKernelScalar_sound", "specializeKernelCode_refines", "fuseMapScaleAddPair_algebra",
+    "fuseMapScaleAdd_loop_sound", "fuseParForKernels_sound", "fuseCustomScalar1_elem_sound",
+    "fuseCustomScalar1_bool_coerced_elem_sound",
+    "ctorTag_obj_sound", "ctorTag_tuple_sound", "ctorGetObj_sound", "lowerClosureAlloc_sound",
+    "specializeKnownClosure_sound", "lowerClosureSeqFor_step1_sound", "adtMatchArm_taken",
+    "adtMatchArm_fallthrough", "defunctionalizeClosure_sound", "lowerAdtMatch_sound",
+    "checkedSubSlice_valid", "checkedSubSlice_oob_rejects", "subSliceBounds_no_oob",
+    "lowerSliceGet_sound", "lowerSliceRawLoad_sound", "sliceFoldStep_sound",
+    "sliceFoldLoop_sound", "lowerSliceFold_sound"
   ]
   let xform := [
     "optimizeEqSatCode_sound", "applyLoopScheduleAux_refines",

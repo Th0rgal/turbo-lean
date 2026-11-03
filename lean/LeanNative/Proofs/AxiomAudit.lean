@@ -21,6 +21,15 @@ import LeanNative.Transform.LoopSchedule
 import LeanNative.Transform.OwnershipRC
 import LeanNative.Backend.FastCheck
 import LeanNative.Proofs.HybridCAbiProofs
+import LeanNative.Proofs.KernelFusionProofs
+import LeanNative.Proofs.ClosureADTProofs
+import LeanNative.Proofs.SliceViewProofs
+import LeanNative.Proofs.HeapObjAbiProofs
+import LeanNative.Proofs.LLVMLowerProofs
+import LeanNative.Proofs.StableHLOLowerProofs
+import LeanNative.Backend.LLVMAst
+import LeanNative.Backend.PTXAst
+import LeanNative.Backend.MetalAst
 import LeanNative.Backend.StableHLOAst
 
 namespace LeanNative.Proofs
@@ -242,6 +251,88 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.HybridCAbi.spliceOutputSlice_preserves_suffix_outside_cap
   , ``LeanNative.Proofs.HybridCAbi.execZeroCopySliceIoHostCall_failure_preserves_mem
   , ``LeanNative.Proofs.HybridCAbi.execZeroCopySliceIoHostCall_ok_sound
+  , ``LeanNative.Proofs.contractKernelScalar_sound
+  , ``LeanNative.Proofs.specializeKernelCode_refines
+  , ``LeanNative.Proofs.fuseMapScaleAddPair_algebra
+  , ``LeanNative.Proofs.fuseMapScaleAdd_loop_sound
+  , ``LeanNative.Proofs.fuseParForKernels_sound
+  , ``LeanNative.Proofs.fuseCustomScalar1_elem_sound
+  , ``LeanNative.Proofs.fuseCustomScalar1_bool_coerced_elem_sound
+  , ``LeanNative.Proofs.ctorTag_obj_sound
+  , ``LeanNative.Proofs.ctorTag_tuple_sound
+  , ``LeanNative.Proofs.ctorGetObj_sound
+  , ``LeanNative.Proofs.lowerClosureAlloc_sound
+  , ``LeanNative.Proofs.specializeKnownClosure_sound
+  , ``LeanNative.Proofs.lowerClosureSeqFor_step1_sound
+  , ``LeanNative.Proofs.adtMatchArm_taken
+  , ``LeanNative.Proofs.adtMatchArm_fallthrough
+  , ``LeanNative.Proofs.defunctionalizeClosure_sound
+  , ``LeanNative.Proofs.lowerAdtMatch_sound
+  , ``LeanNative.Proofs.checkedSubSlice_valid
+  , ``LeanNative.Proofs.checkedSubSlice_oob_rejects
+  , ``LeanNative.Proofs.subSliceBounds_no_oob
+  , ``LeanNative.Proofs.lowerSliceGet_sound
+  , ``LeanNative.Proofs.lowerSliceRawLoad_sound
+  , ``LeanNative.Proofs.sliceFoldStep_sound
+  , ``LeanNative.Proofs.sliceFoldLoop_sound
+  , ``LeanNative.Proofs.lowerSliceFold_sound
+  , ``LeanNative.Proofs.HeapObjAbi.unbox_box_id
+  , ``LeanNative.Proofs.HeapObjAbi.unbox_box_eq_iff
+  , ``LeanNative.Proofs.HeapObjAbi.box_ne_aligned_ptr
+  , ``LeanNative.Proofs.HeapObjAbi.unpack_pack_header_id
+  , ``LeanNative.Proofs.HeapObjAbi.pack_unpack_header_id
+  , ``LeanNative.Proofs.HeapObjAbi.unique_dec_ref_triggers_free
+  , ``LeanNative.Proofs.HeapObjAbi.shared_dec_ref_stays_live
+  , ``LeanNative.Proofs.HeapObjAbi.cowWriteField_matches_pureClone_payload
+  , ``LeanNative.Proofs.HeapObjAbi.cowWriteField_result_exclusive
+  , ``LeanNative.Proofs.HeapObjAbi.cowWriteField_preserves_live_alias
+  , ``LeanNative.Backend.LLVMAst.ppType_injective
+  , ``LeanNative.Backend.LLVMAst.ppInstr_nonempty
+  , ``LeanNative.Backend.LLVMAst.add_nsw_overflow_poison
+  , ``LeanNative.Backend.LLVMAst.shl_overshift_poison
+  , ``LeanNative.Backend.LLVMAst.udiv_zero_ub
+  , ``LeanNative.Backend.LLVMAst.phi_parallel_swap
+  , ``LeanNative.Backend.LLVMAst.load_after_alloca_store
+  , ``LeanNative.Backend.LLVMAst.execFn_deterministic
+  , ``LeanNative.Backend.LLVMAst.execFn_mono_fuel
+  , ``LeanNative.Backend.PTXAst.st_shared_preserves_global
+  , ``LeanNative.Backend.PTXAst.st_global_preserves_shared
+  , ``LeanNative.Backend.PTXAst.bar_sync_uniform_converges
+  , ``LeanNative.Backend.PTXAst.bar_sync_divergent_errors
+  , ``LeanNative.Backend.PTXAst.runCTA_deterministic
+  , ``LeanNative.Backend.PTXAst.ppPTXType_injective
+  , ``LeanNative.Backend.PTXAst.ptx_div_zero_traps
+  , ``LeanNative.Backend.PTXAst.ptx_sdiv64_min_neg1_traps
+  , ``LeanNative.Backend.MetalAst.exec_preserves_constant_buffers
+  , ``LeanNative.Backend.MetalAst.constant_write_rejected
+  , ``LeanNative.Backend.MetalAst.device_const_write_rejected
+  , ``LeanNative.Backend.MetalAst.recordEpochAccess_disjoint_ok
+  , ``LeanNative.Backend.MetalAst.recordEpochAccess_overlap_races
+  , ``LeanNative.Backend.MetalAst.threadgroupBarrier_uniform_converges
+  , ``LeanNative.Backend.MetalAst.threadgroupBarrier_divergent_errors
+  , ``LeanNative.Backend.MetalAst.runGroup_mono_fuel
+  , ``LeanNative.Backend.MetalAst.runGroup_deterministic
+  , ``LeanNative.Proofs.lowerScalarExpr_sound
+  , ``LeanNative.Proofs.lowerCode_sound
+  , ``LeanNative.Proofs.lowerToLLVM_sound
+  , ``LeanNative.Proofs.lowerToLLVM_nonvacuous
+  , ``LeanNative.Proofs.mutant_m1_killed
+  , ``LeanNative.Proofs.mutant_m2_killed
+  , ``LeanNative.Proofs.mutant_m3_killed
+  , ``LeanNative.Proofs.mutant_m4_killed
+  , ``LeanNative.Proofs.mutant_m5_killed
+  , ``LeanNative.Proofs.lowerHLOScalarExpr_post
+  , ``LeanNative.Proofs.lowerScalarCode_post
+  , ``LeanNative.Proofs.lowerParKernel_post
+  , ``LeanNative.Proofs.lowerHLOCode_post
+  , ``LeanNative.Proofs.bindHLOParams_post
+  , ``LeanNative.Proofs.lowerToStableHLO_sound
+  , ``LeanNative.Proofs.lowerModuleToStableHLO_singleton_sound
+  , ``LeanNative.Proofs.lowerToStableHLO_scalar_nonvacuous
+  , ``LeanNative.Proofs.lowerToStableHLO_pipeline_nonvacuous
+  , ``LeanNative.Proofs.hlo_mutant_h1_killed
+  , ``LeanNative.Proofs.hlo_mutant_h2_killed
+  , ``LeanNative.Proofs.hlo_mutant_h3_killed
   , ``LeanNative.Proofs.normSymBinOpStep_u64_denotes, ``LeanNative.Proofs.normSymExpr_pureU64_denotes
   , ``LeanNative.Proofs.symEvalScalarRes_pureU64_sound
   , ``LeanNative.Proofs.validateTranslationDeclSound_of_passed

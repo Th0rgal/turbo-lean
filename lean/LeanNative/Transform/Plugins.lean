@@ -1,24 +1,12 @@
 /-
   LeanNative.Transform.Plugins: Segregated Optimization Plugin Architecture (v0.5)
-  Zero `import Lean` (compiles into `lean-native-core` with `libleanrt.a` only),
-  zero `sorryAx`.
-
-  Implements the "Untrusted Optimization Plugin / Verified TV & Kernel Replay Gate"
-  governed by `LeanNative.Spec.evalWithUntrustedOptPlugin` (Law 1 & Law 2):
-  - Segregates heuristic/experimental optimization passes (built-in passes, enumerative
-    superoptimization, contributor PR passes, and external out-of-process JSONL-stdio
-    plugins) from the trusted semantic core (`LeanNative.Spec`, `LeanNative.Semantics`,
-    `LeanNative.Proofs`).
-  - Every candidate `LNIRDecl` returned by any plugin is gated by `verifyOptPluginGate`:
+  Zero `import Lean` (`libleanrt.a` only), zero `sorryAx`.
+  Implements `evalWithUntrustedOptPlugin` (Law 1 & Law 2) with `verifyOptPluginGate`:
     1. Alive2-style Symbolic Translation Validation (`validateTranslationDecl`),
     2. 64-state Concrete Evaluation Equivalence (`evalCode`),
     3. Hardware Cycle Cost Non-Regression (`declScalarCost target cand <= declScalarCost target src`).
-  - If a plugin times out, crashes, or produces an unsound/regressing rewrite (e.g., the
-    built-in adversarial test plugin `"adversarial:unsound-mul-to-add"`),
-    `evalWithUntrustedOptPlugin` rejects the candidate and preserves `src` unchanged.
-  - Also implements `runTurboLeanPluginStdio` (`lean-native-core turbo-plugin`) speaking
-    the exact `AcceleratorInput` / `AcceleratorCertificate` JSONL-stdio protocol of
-    `Th0rgal/turbo-lean` (`crates/turbo-lean/src/accelerators.rs`).
+  Unsound/regressing rewrites are rejected and preserve `src` unchanged.
+  Also implements `runTurboLeanPluginStdio` (`lean-native-core turbo-plugin`).
 -/
 import LeanNative.IR.Types
 import LeanNative.IR.AST
@@ -34,6 +22,8 @@ import LeanNative.Transform.AlgebraicOpt
 import LeanNative.Transform.UnboxTupleSROA
 import LeanNative.Transform.HoistExclusivity
 import LeanNative.Transform.LoopVectorizeOpt
+import LeanNative.Transform.KernelFusion
+import LeanNative.Proofs.KernelFusionProofs
 import LeanNative.Transform.Superopt
 import LeanNative.Backend.FastCheck
 
@@ -90,21 +80,13 @@ def verifyOptPluginGate
   sigOk && tvRes.passed && costOk
 
 /-- Pure wrapper applying `LeanNative.Spec.evalWithUntrustedOptPlugin` to a declaration plugin. -/
-def applyVerifiedOptPlugin
-    (target : SuperoptTarget)
-    (requireStrictCost : Bool)
-    (pluginFn : LNIRDecl → Option (LNIRDecl × OptPluginCertificate))
-    (src : LNIRDecl) : LNIRDecl × Bool × Option OptPluginCertificate :=
-  let verifiedDecl :=
-    evalWithUntrustedOptPlugin
-      pluginFn
-      (verifyOptPluginGate target requireStrictCost)
-      src
+def applyVerifiedOptPlugin (target : SuperoptTarget) (requireStrictCost : Bool)
+    (pluginFn : LNIRDecl → Option (LNIRDecl × OptPluginCertificate)) (src : LNIRDecl) :
+    LNIRDecl × Bool × Option OptPluginCertificate :=
+  let verifiedDecl := evalWithUntrustedOptPlugin pluginFn (verifyOptPluginGate target requireStrictCost) src
   match pluginFn src with
   | none => (verifiedDecl, false, none)
-  | some (cand, cert) =>
-    let accepted := verifyOptPluginGate target requireStrictCost src cand cert
-    (verifiedDecl, accepted, some cert)
+  | some (cand, cert) => (verifiedDecl, verifyOptPluginGate target requireStrictCost src cand cert, some cert)
 
 /-! ## 2. Built-In Segregated Optimization Plugins & Adversarial Test Plugin -/
 
@@ -113,20 +95,25 @@ def passToBuiltinPlugin (pluginName : String) (pass : TransformPass) (target : S
     Option (LNIRDecl × OptPluginCertificate) :=
   let (d', stepCert) := pass.runDecl d
   if !stepCert.changed then none
-  else
-    some (d', {
-      pluginName
-      kind := "builtin_verified"
-      theoremOrRule := stepCert.theoremRef
-      costBefore := declScalarCost target d
-      costAfter := declScalarCost target d'
-      notes := stepCert.notes
-    })
+  else some (d', { pluginName, kind := "builtin_verified", theoremOrRule := stepCert.theoremRef
+                   costBefore := declScalarCost target d, costAfter := declScalarCost target d'
+                   notes := stepCert.notes })
+
+/-- Machine-checked verification contract (`Contract V2`) for intra-kernel `parFor`
+    scalar folding and primitive specialization (`LeanNative.Proofs.specializeKernelCode_refines`). -/
+def verifiedKernelSpecializeContract : VerifiedCodePassContract :=
+  { name := "KernelSpecialize", theoremRef := "LeanNative.Proofs.specializeKernelCode_refines"
+    notes := "Specialized parFor scalar kernel bodies via verified UInt64 identities and FMA contraction"
+    runCode := specializeKernelCode, sound := LeanNative.Proofs.specializeKernelCode_refines }
+
+/-- Intra-kernel specialization pass constructed via `TransformPass.ofVerifiedContract` (`Contract V2`). -/
+def kernelSpecializePass : TransformPass := TransformPass.ofVerifiedContract verifiedKernelSpecializeContract
 
 def builtinAlgebraicPlugin := passToBuiltinPlugin "builtin:algebraic-peephole" algebraicOptPass
 def builtinUnboxTuplePlugin := passToBuiltinPlugin "builtin:unbox-tuple-sroa" unboxTupleSROAPass
 def builtinHoistExclusivityPlugin := passToBuiltinPlugin "builtin:hoist-exclusivity" hoistExclusivityPass
 def builtinLoopVectorizePlugin := passToBuiltinPlugin "builtin:loop-vectorize" loopVectorizeOptPass
+def builtinKernelFusionPlugin := passToBuiltinPlugin "builtin:kernel-fusion" kernelSpecializePass
 
 def builtinSuperoptPlugin (target : SuperoptTarget) (d : LNIRDecl) : Option (LNIRDecl × OptPluginCertificate) :=
   let (d', rewrites) := superoptDecl target d
@@ -324,6 +311,7 @@ def registeredBuiltinPlugins (target : SuperoptTarget) (includeAdversarial : Boo
   , ("builtin:unbox-tuple-sroa", builtinUnboxTuplePlugin target)
   , ("builtin:hoist-exclusivity", builtinHoistExclusivityPlugin target)
   , ("builtin:loop-vectorize", builtinLoopVectorizePlugin target)
+  , ("builtin:kernel-fusion", builtinKernelFusionPlugin target)
   , ("builtin:branchless-select", builtinBranchlessSelectPlugin target)
   , ("builtin:enumerative-superopt", builtinSuperoptPlugin target)
   ] ++ (if includeAdversarial then [("adversarial:unsound-alu-corruptor", adversarialBuggyPlugin target)] else [])
