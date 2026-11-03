@@ -2871,6 +2871,109 @@ impl TurboStore {
                 == 0
     }
 
+    /// Export locally HMAC-verified `kernel_replayed_oleans_auth` rows for attested pack export.
+    /// Every row is verified in constant time against the verifier-private HMAC key before export,
+    /// so SQLite tampering cannot forge exported replay authority.
+    pub(crate) fn export_verified_kernel_replayed_oleans(
+        &self,
+        filter_modules: Option<&std::collections::HashSet<String>>,
+        filter_artifacts: Option<&std::collections::HashSet<String>>,
+    ) -> Result<Vec<crate::pack::PackedKernelReplay>> {
+        if !self.is_store_outside_disallowed_roots(&[]) {
+            return Ok(Vec::new());
+        }
+        let key_path = self.root.join(VERIFIER_REPLAY_HMAC_KEY_FILENAME);
+        let Some(key) = read_verified_replay_hmac_key_file(&key_path, &[]) else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT artifact_digest, environment_digest, replay_version, toolchain_hash, module_name, replay_mac
+             FROM kernel_replayed_oleans_auth
+             ORDER BY module_name ASC, artifact_digest ASC, environment_digest ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (art, env_dig, rv_i64, tc_hash, mod_name, stored_mac) = row?;
+            let Ok(rv) = u32::try_from(rv_i64) else {
+                continue;
+            };
+            if let Some(mods) = filter_modules {
+                if !mods.contains(&mod_name) {
+                    continue;
+                }
+            }
+            if let Some(arts) = filter_artifacts {
+                if !arts.contains(&art) {
+                    continue;
+                }
+            }
+            let expected_mac = compute_kernel_replay_mac(&key, &art, &env_dig, rv, &tc_hash);
+            let mac_ok = stored_mac.len() == expected_mac.len()
+                && stored_mac
+                    .as_bytes()
+                    .iter()
+                    .zip(expected_mac.as_bytes().iter())
+                    .fold(0u8, |acc, (&a, &b)| acc | (a ^ b))
+                    == 0;
+            if mac_ok {
+                out.push(crate::pack::PackedKernelReplay {
+                    artifact_digest: art,
+                    environment_digest: env_dig,
+                    replay_version: rv,
+                    toolchain_hash: tc_hash,
+                    module_name: mod_name,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Record Ed25519-attested kernel replay authority from an imported pack, strictly restricted
+    /// to `trust_domain == "trusted"` AND `has_attested_ed25519_sig == true` (never `--allow-unattested-trusted`).
+    pub(crate) fn import_trusted_kernel_replayed_oleans(
+        &self,
+        rows: &[crate::pack::PackedKernelReplay],
+        trust_domain: &str,
+        has_attested_ed25519_sig: bool,
+    ) -> Result<usize> {
+        if trust_domain != "trusted" || !has_attested_ed25519_sig || rows.is_empty() {
+            return Ok(0);
+        }
+        if !self.is_store_outside_disallowed_roots(&[]) {
+            return Ok(0);
+        }
+        let mut imported = 0usize;
+        for row in rows {
+            if row.artifact_digest.is_empty()
+                || row.environment_digest.is_empty()
+                || row.toolchain_hash.is_empty()
+                || row.module_name.is_empty()
+            {
+                continue;
+            }
+            self.record_kernel_replayed_olean(
+                &row.artifact_digest,
+                &row.environment_digest,
+                row.replay_version,
+                &row.toolchain_hash,
+                &row.module_name,
+                &[],
+            )?;
+            imported += 1;
+        }
+        Ok(imported)
+    }
+
     /// Single-transaction publication of an ingested worktree build action:
     /// atomically registers `reg_blobs`, publishes `action_key` + `outputs`, records
     /// `worktrees` + `worktree_installations`, optionally caches `lake_env`, and optionally
@@ -7449,6 +7552,7 @@ mod tests {
             }],
             ed25519_pubkey: None,
             ed25519_signature: None,
+            kernel_replayed_oleans: Vec::new(),
         };
         DURABILITY_HOOK.with(|h| {
             *h.borrow_mut() = Some(std::sync::Arc::new(|f| {

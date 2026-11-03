@@ -116,6 +116,31 @@ enum Commands {
         #[arg(long, default_value = ".")]
         project_dir: PathBuf,
     },
+    /// Analyze module-level and declaration-level reverse-import impact of editing a `.lean` file
+    Impact {
+        /// Path to the edited `.lean` file
+        file: PathBuf,
+        /// Project root directory
+        #[arg(long, default_value = ".")]
+        project_dir: PathBuf,
+        /// Base git revision or baseline `.lean` file path (defaults to `HEAD`)
+        #[arg(long)]
+        base: Option<String>,
+    },
+    /// Non-fail-fast DAG verification gate isolating root-cause failures from blocked downstream modules
+    Gate {
+        /// Target module (`+Module` or `Module`) or `.lean` file path
+        target: String,
+        /// Project root directory
+        #[arg(long, default_value = ".")]
+        project_dir: PathBuf,
+        /// Per-module compilation timeout in seconds (0 = fallback to env / 300s)
+        #[arg(long, default_value_t = 300)]
+        module_timeout: u64,
+        /// Number of parallel worker threads per DAG wave
+        #[arg(short = 'j', long)]
+        jobs: Option<usize>,
+    },
     /// Fast theorem-level or declaration-level check using PrefixEnv sharding & direct Lean env
     Check {
         /// Path to the .lean file to check
@@ -144,6 +169,9 @@ enum Commands {
         /// Emit `.olean`, `.ilean`, `.hash`, and Lake `.trace` artifacts into `.lake/build` on 0-sorry module check
         #[arg(long, default_value_t = false)]
         emit_olean: bool,
+        /// Verify and CAS-cache all 0-sorry declarations in a partial file while reporting per-declaration status (`verified`, `sorry`, `error`)
+        #[arg(long, default_value_t = false)]
+        allow_sorry: bool,
     },
     /// Run native (leanc -O3 Perceus/FBIP), GPU (CUDA), or Google Cloud TPU v5e (MLIR/XLA) fast counterexample search
     FastCheck {
@@ -205,6 +233,12 @@ enum Commands {
         /// Optional Ed25519 private signing key (32-byte hex seed; falls back to TURBO_LEAN_PACK_SIGNING_KEY)
         #[arg(long)]
         signing_key: Option<String>,
+        /// Optional target module or `.lean` file path to export only its transitive dependency cone
+        #[arg(long)]
+        cone: Option<String>,
+        /// Optional Lean project root directory used when resolving `--cone`
+        #[arg(long)]
+        project_dir: Option<PathBuf>,
     },
     /// Import and BLAKE3-verify a .tlpack CAS bundle into local SQLite & CAS
     Import {
@@ -549,6 +583,9 @@ fn run(cli: Cli) -> Result<()> {
         } => (Some(project_dir.as_path()), mode != "untrusted"),
         Commands::Check { project_dir, .. }
         | Commands::Build { project_dir, .. }
+        | Commands::HydrateTraces { project_dir }
+        | Commands::Impact { project_dir, .. }
+        | Commands::Gate { project_dir, .. }
         | Commands::SeedShards { project_dir, .. }
         | Commands::SeedOleans { project_dir, .. }
         | Commands::WorktreeDedup { project_dir } => (Some(project_dir.as_path()), true),
@@ -560,6 +597,7 @@ fn run(cli: Cli) -> Result<()> {
         } => (project_dir.as_deref().or_else(|| file.parent()), true),
         Commands::Mcp { project_dir }
         | Commands::Accelerators { project_dir }
+        | Commands::Export { project_dir, .. }
         | Commands::Gc { project_dir, .. } => (project_dir.as_deref(), true),
         _ => (None, true),
     };
@@ -643,6 +681,8 @@ fn run(cli: Cli) -> Result<()> {
         Commands::CiVerify { base: None, .. } => (None, None),
         Commands::Check { project_dir, .. }
         | Commands::Build { project_dir, .. }
+        | Commands::Impact { project_dir, .. }
+        | Commands::Gate { project_dir, .. }
         | Commands::SeedShards { project_dir, .. }
         | Commands::SeedOleans { project_dir, .. } => (Some(project_dir.as_path()), None),
         Commands::AgentStep { .. } | Commands::Eval { .. } => (eval_project_root.as_deref(), None),
@@ -815,6 +855,14 @@ fn run(cli: Cli) -> Result<()> {
     if let Commands::HydrateTraces { project_dir } = cli.command {
         return lake_build::run_hydrate_traces_command(cli.json, project_dir);
     }
+    if let Commands::Impact {
+        file,
+        project_dir,
+        base,
+    } = cli.command
+    {
+        return module_builder::run_impact_command(cli.json, file, project_dir, base);
+    }
     if let Commands::FastCheck {
         ref file,
         gpu,
@@ -940,6 +988,7 @@ fn run(cli: Cli) -> Result<()> {
         jobs,
         remote_http: Some(ref remote_url),
         emit_olean: false,
+        allow_sorry: false,
         ..
     } = cli.command
     {
@@ -1240,6 +1289,26 @@ fn run(cli: Cli) -> Result<()> {
             lake_build::run_hydrate_traces_command(cli.json, project_dir)
         }
 
+        Commands::Impact {
+            file,
+            project_dir,
+            base,
+        } => module_builder::run_impact_command(cli.json, file, project_dir, base),
+
+        Commands::Gate {
+            target,
+            project_dir,
+            module_timeout,
+            jobs,
+        } => module_builder::run_gate_command(
+            &mut store,
+            cli.json,
+            target,
+            project_dir,
+            module_timeout,
+            jobs,
+        ),
+
         Commands::Check {
             file,
             decl,
@@ -1250,6 +1319,7 @@ fn run(cli: Cli) -> Result<()> {
             timeout,
             kernel,
             emit_olean,
+            allow_sorry,
         } => {
             std::env::set_var("TURBO_LEAN_KERNEL_ENGINE", &kernel);
             if timeout > 0 {
@@ -1299,7 +1369,7 @@ fn run(cli: Cli) -> Result<()> {
                     }
                 });
             }
-            let res = check::run_check_command_with_opts(
+            let res = check::run_check_command_with_allow_sorry(
                 &mut store,
                 db_warm_on_open,
                 cli.json,
@@ -1310,6 +1380,7 @@ fn run(cli: Cli) -> Result<()> {
                 parallel_shards,
                 remote_http,
                 emit_olean,
+                allow_sorry,
             );
             done_flag.store(true, std::sync::atomic::Ordering::Relaxed);
             res
@@ -1419,7 +1490,17 @@ fn run(cli: Cli) -> Result<()> {
             output,
             portable_only,
             signing_key,
-        } => pack::run_export_command(&store, cli.json, output, portable_only, signing_key),
+            cone,
+            project_dir,
+        } => pack::run_export_command(
+            &store,
+            cli.json,
+            output,
+            portable_only,
+            signing_key,
+            cone,
+            project_dir,
+        ),
 
         Commands::Import {
             input,

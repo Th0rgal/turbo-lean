@@ -238,6 +238,15 @@ impl HygieneReport {
         blocking_items_under(&self.flagged_items, allowed)
     }
 
+    /// Flagged items that block even partial `--allow-sorry` verification (i.e., everything except
+    /// `sorry`/`admit` tokens, such as forbidden axioms, `unsafe`, `implemented_by`, or checking-weakening options).
+    pub fn non_sorry_disallowed_items(&self) -> Vec<String> {
+        self.disallowed_items()
+            .into_iter()
+            .filter(|item| item_kind(item) != "sorry/admit token")
+            .collect()
+    }
+
     /// Return only hygiene items that are newly introduced relative to `base`
     /// (plus any `sorry`, which is always flagged in modified files), as
     /// `(blocking, admitted by the axiom allowlist)`. The admitted ones are new uses of
@@ -6240,6 +6249,92 @@ pub fn audit_source_declarations(
         })
         .collect();
     (shadowed, unused_private, horiz)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceDeclFingerprint {
+    pub qualified_name: String,
+    pub kind: String,
+    pub stmt_or_decl_hash: String,
+    pub proof_hash: Option<String>,
+    pub clean_text: String,
+}
+
+/// Extract all top-level and `mutual`-nested named declarations (`theorem`, `lemma`, `def`,
+/// `abbrev`, `structure`, `inductive`, `class`, `instance`, `opaque`, `axiom`, etc.) with
+/// normalized hashes so `turbo-lean impact` tracks both theorem proof/statement edits AND
+/// `def`/`abbrev`/`structure`/`inductive` edits.
+pub fn extract_all_source_decl_fingerprints(src: &str) -> Vec<SourceDeclFingerprint> {
+    let clean = strip_lean_comments(src);
+    let spans = parse_command_spans(src, &clean);
+    let mut scope_stack = Vec::new();
+    let mut out = Vec::new();
+
+    for (idx, span) in spans.iter().enumerate() {
+        if let Some((_hdr, inner_spans, _ftr)) = split_mutual_block_subspans(span) {
+            for sub in &inner_spans {
+                if let Some((kind, name)) = classify_decl_header(sub.clean_text) {
+                    if let Some((sig_clean, proof_clean)) =
+                        split_at_top_level_assign(sub.clean_text)
+                    {
+                        let qname = qualified_decl_name(&name, &scope_stack);
+                        out.push(SourceDeclFingerprint {
+                            qualified_name: if qname.is_empty() { name } else { qname },
+                            kind,
+                            stmt_or_decl_hash: hash_normalized_whitespace_hex(sig_clean),
+                            proof_hash: Some(hash_normalized_whitespace_hex(proof_clean)),
+                            clean_text: sub.clean_text.to_string(),
+                        });
+                        continue;
+                    }
+                }
+                if let Some((kw, name)) = classify_any_decl_header(sub.clean_text) {
+                    if !name.is_empty() {
+                        let qname = qualified_decl_name(&name, &scope_stack);
+                        out.push(SourceDeclFingerprint {
+                            qualified_name: if qname.is_empty() { name } else { qname },
+                            kind: kw.to_string(),
+                            stmt_or_decl_hash: hash_normalized_whitespace_hex(sub.clean_text),
+                            proof_hash: None,
+                            clean_text: sub.clean_text.to_string(),
+                        });
+                    }
+                }
+            }
+            update_scope_stack_with_idx(&mut scope_stack, span.orig_text, idx);
+            continue;
+        }
+
+        if let Some((kind, name)) = classify_decl_header(span.clean_text) {
+            if let Some((sig_clean, proof_clean)) = split_at_top_level_assign(span.clean_text) {
+                let qname = qualified_decl_name(&name, &scope_stack);
+                out.push(SourceDeclFingerprint {
+                    qualified_name: if qname.is_empty() { name } else { qname },
+                    kind,
+                    stmt_or_decl_hash: hash_normalized_whitespace_hex(sig_clean),
+                    proof_hash: Some(hash_normalized_whitespace_hex(proof_clean)),
+                    clean_text: span.clean_text.to_string(),
+                });
+                update_scope_stack_with_idx(&mut scope_stack, span.orig_text, idx);
+                continue;
+            }
+        }
+        if let Some((kw, name)) = classify_any_decl_header(span.clean_text) {
+            if !name.is_empty() {
+                let qname = qualified_decl_name(&name, &scope_stack);
+                out.push(SourceDeclFingerprint {
+                    qualified_name: if qname.is_empty() { name } else { qname },
+                    kind: kw.to_string(),
+                    stmt_or_decl_hash: hash_normalized_whitespace_hex(span.clean_text),
+                    proof_hash: None,
+                    clean_text: span.clean_text.to_string(),
+                });
+            }
+        }
+        update_scope_stack_with_idx(&mut scope_stack, span.orig_text, idx);
+    }
+
+    out
 }
 
 #[cfg(test)]

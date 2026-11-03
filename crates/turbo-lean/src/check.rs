@@ -3,6 +3,7 @@
 //! and cross-file coalesced shard batching.
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1106,6 +1107,7 @@ pub fn run_check_command_value(
         false,
         false,
         false,
+        false,
         file,
         decl,
         project_dir,
@@ -1129,6 +1131,32 @@ pub fn evaluate_check_command_value(
         false,
         false,
         false,
+        false,
+        file,
+        decl,
+        project_dir,
+        None,
+        true,
+        None,
+    )
+}
+
+/// Evaluate `turbo-lean check --allow-sorry` in-process (`emit_stdout: false`) and return its JSON payload.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn evaluate_check_command_allow_sorry_value(
+    store: &mut TurboStore,
+    file: PathBuf,
+    decl: Option<String>,
+    project_dir: PathBuf,
+) -> Result<serde_json::Value> {
+    crate::module_builder::reset_lake_inputs_tag_memo();
+    run_check_command_inner(
+        store,
+        true,
+        false,
+        false,
+        false,
+        true,
         file,
         decl,
         project_dir,
@@ -1764,6 +1792,35 @@ pub fn run_check_command_with_opts(
     remote_http: Option<String>,
     emit_olean: bool,
 ) -> Result<()> {
+    run_check_command_with_allow_sorry(
+        store,
+        db_warm_on_open,
+        json_output,
+        file,
+        decl,
+        project_dir,
+        jobs,
+        parallel_shards,
+        remote_http,
+        emit_olean,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_check_command_with_allow_sorry(
+    store: &mut TurboStore,
+    db_warm_on_open: bool,
+    json_output: bool,
+    file: PathBuf,
+    decl: Option<String>,
+    project_dir: PathBuf,
+    jobs: Option<usize>,
+    parallel_shards: bool,
+    remote_http: Option<String>,
+    emit_olean: bool,
+    allow_sorry: bool,
+) -> Result<()> {
     // One top-level command, one Lake-input memo window.
     crate::module_builder::reset_lake_inputs_tag_memo();
     run_check_command_inner(
@@ -1772,6 +1829,7 @@ pub fn run_check_command_with_opts(
         json_output,
         true,
         emit_olean,
+        allow_sorry,
         file,
         decl,
         project_dir,
@@ -1789,6 +1847,7 @@ fn run_check_command_inner(
     json_output: bool,
     emit_stdout: bool,
     emit_olean: bool,
+    allow_sorry: bool,
     file: PathBuf,
     decl: Option<String>,
     project_dir: PathBuf,
@@ -1799,6 +1858,11 @@ fn run_check_command_inner(
     if emit_olean && decl.is_some() {
         anyhow::bail!(
             "`--emit-olean` cannot be combined with `--decl` (must check a full module file)"
+        );
+    }
+    if emit_olean && allow_sorry {
+        anyhow::bail!(
+            "`--emit-olean` cannot be combined with `--allow-sorry` (only 0-sorry certified modules may emit `.olean`)"
         );
     }
     let _lifecycle = crate::zygote::lifecycle_lock(false)?;
@@ -1822,6 +1886,12 @@ fn run_check_command_inner(
         if emit_olean {
             anyhow::bail!(
                 "`--emit-olean` requires a single `.lean` module file, not directory `{}`",
+                resolved_file.display()
+            );
+        }
+        if allow_sorry {
+            anyhow::bail!(
+                "`--allow-sorry` requires a single `.lean` module file, not directory `{}`",
                 resolved_file.display()
             );
         }
@@ -2038,6 +2108,7 @@ fn run_check_command_inner(
             db_warm_on_open,
             json_output,
             emit_stdout,
+            allow_sorry,
             &t0,
             &file,
             &resolved_file,
@@ -2051,6 +2122,22 @@ fn run_check_command_inner(
             known_modified_vs_head,
             single_split_hits,
             remote_http.as_deref(),
+        )?
+    } else if allow_sorry {
+        check_single_file_allow_sorry(
+            store,
+            db_warm_on_open,
+            json_output,
+            emit_stdout,
+            &t0,
+            &file,
+            &resolved_file,
+            &canon_resolved_initial,
+            &canon_dir,
+            &toolchain,
+            &mut src,
+            &split,
+            jobs,
         )?
     } else {
         let mut out_json = check_single_file(
@@ -2122,7 +2209,8 @@ fn run_check_command_inner(
             )?;
             let built_count = build_rep.modules_compiled
                 + build_rep.modules_cached
-                + build_rep.modules_up_to_date_reused;
+                + build_rep.modules_up_to_date_reused
+                + build_rep.modules_early_cutoff_reused;
             if build_rep.modules_total == 0 || built_count != build_rep.modules_total {
                 anyhow::bail!(
                     "`--emit-olean` target `{}` resolved an incomplete module build ({}/{} modules materialized)",
@@ -2188,7 +2276,7 @@ fn run_check_command_inner(
         }
         out_json
     };
-    if !emit_olean {
+    if !emit_olean && !allow_sorry {
         crate::lake_build::recheck_dependents_if_nonlocal(store, &canon_dir, &resolved_file)?;
     }
     Ok(res)
@@ -2861,12 +2949,33 @@ fn target_hygiene_violations(
     items
 }
 
+fn target_non_sorry_hygiene_violations(
+    split: &splitter::SplitResult,
+    shard: &splitter::TheoremShard,
+) -> Vec<String> {
+    let on_shard_lines = |item: &String| {
+        item.strip_prefix('L')
+            .and_then(|r| r.split_once(": "))
+            .and_then(|(ln, _)| ln.parse::<usize>().ok())
+            .is_some_and(|ln| shard.start_line <= ln && ln <= shard.end_line)
+    };
+    let mut items: Vec<String> = split.hygiene.non_sorry_disallowed_items();
+    items.retain(on_shard_lines);
+    if items.is_empty() {
+        let text = format!("{}\n{}", shard.signature_text, shard.proof_text);
+        items = splitter::audit_hygiene(&splitter::strip_lean_comments(&text))
+            .non_sorry_disallowed_items();
+    }
+    items
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_single_decl(
     store: &mut TurboStore,
     db_warm_on_open: bool,
     json_output: bool,
     emit_stdout: bool,
+    allow_sorry: bool,
     t0: &Instant,
     file: &Path,
     resolved_file: &Path,
@@ -2962,6 +3071,12 @@ fn check_single_decl(
         }
     }
 
+    if allow_sorry {
+        active_src = fs::read_to_string(&active_file)?;
+        let fresh_deps = compute_imported_olean_interface_hashes(&active_src, canon_dir, None);
+        *split = split_lean_source(&active_src, &fresh_deps);
+        *cached_file_blake3 = Some(blake3::hash(active_src.as_bytes()).to_hex().to_string());
+    }
     let shard_idx =
         splitter::find_decl_shard_index(&split.shards, target_decl)?.with_context(|| {
             format!(
@@ -3000,13 +3115,20 @@ fn check_single_decl(
     let target_decl = resolved_decl.as_str();
     let shard = &split.shards[shard_idx];
     let target_violations = target_hygiene_violations(split, shard);
+    let mut target_is_sorry_stub = false;
     if !target_violations.is_empty() {
-        anyhow::bail!(
-            "Soundness hygiene violation in `{}` ({}): {}",
-            target_decl,
-            file.display(),
-            target_violations.join(", ")
-        );
+        let non_sorry_file = split.hygiene.non_sorry_disallowed_items();
+        let non_sorry_target = target_non_sorry_hygiene_violations(split, shard);
+        if allow_sorry && non_sorry_file.is_empty() && non_sorry_target.is_empty() {
+            target_is_sorry_stub = true;
+        } else {
+            anyhow::bail!(
+                "Soundness hygiene violation in `{}` ({}): {}",
+                target_decl,
+                file.display(),
+                target_violations.join(", ")
+            );
+        }
     }
     // Stat/split caches are not evidence of the identity in the current source.
     if active_src.is_empty() {
@@ -3020,6 +3142,35 @@ fn check_single_decl(
         false,
         Some(*t0),
     )?;
+    if target_is_sorry_stub {
+        let file_lean_args =
+            crate::module_builder::try_resolve_lean_args_for_path(canon_dir, Some(&active_file))?;
+        let shard_key = compute_shard_key_with_args(toolchain, shard, &file_lean_args);
+        let elapsed_ms = t0.elapsed().as_millis() as i64;
+        let out_json = serde_json::json!({
+            "status": "decl_sorry",
+            "decl": target_decl,
+            "shard_key": shard_key,
+            "certified": false,
+            "cached": false,
+            "interface_hash": split.interface_hash,
+            "prefix_env_hash": shard.prefix_env_hash,
+            "total_shards_in_file": split.shards.len(),
+            "compact_summary": format!("SORRY decl={} ms={} certified=false", target_decl, elapsed_ms),
+            "elapsed_ms": elapsed_ms
+        });
+        if emit_stdout {
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&out_json)?);
+            } else {
+                println!(
+                    "[turbo-lean] SHARD SORRY `{}` (statement elaborated, uncertified/uncached, {} ms)",
+                    target_decl, elapsed_ms
+                );
+            }
+        }
+        return Ok(out_json);
+    }
     let expected_type_pair = [(
         attested.decl_name.clone(),
         attested.kernel_type_hash.clone(),
@@ -4143,6 +4294,28 @@ fn check_single_decl(
                         }
                     }
                 }
+                let maybe_profile_err =
+                    |raw_err: &str, ev: &HashMap<String, String>, lb: &str| -> String {
+                        if let Some(reason) = should_auto_profile_shard(
+                            Some(raw_err),
+                            t0.elapsed().as_millis() as i64,
+                        ) {
+                            if let Some(rep) = run_lean_shard_auto_profiler(
+                                &store.root,
+                                Path::new(lb),
+                                ev,
+                                Some(canon_dir),
+                                &full_shard_src,
+                                &file_lean_args,
+                                &shard.proof_text,
+                                &[],
+                                reason,
+                            ) {
+                                return format_auto_profiler_summary(&rep);
+                            }
+                        }
+                        String::new()
+                    };
                 if !verified_via_zygote {
                     if let Some(daemon_err) = last_daemon_verify_err.take() {
                         let orig_display = file.display().to_string();
@@ -4151,14 +4324,16 @@ fn check_single_decl(
                             .replace("<zygote-shard>", &orig_display);
                         let m_diags = extract_mismatch_diagnostics(&raw_err);
                         let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
+                        let p_suffix = maybe_profile_err(&raw_err, &env_vars, &lean_bin);
                         anyhow::bail!(
-                            "lean check failed for `{}` in {} (lines {}..={}):\n{}{}",
+                            "lean check failed for `{}` in {} (lines {}..={}):\n{}{}{}",
                             target_decl,
                             file.display(),
                             shard.start_line,
                             shard.end_line,
                             raw_err,
-                            m_suffix
+                            m_suffix,
+                            p_suffix
                         );
                     }
                     if env_vars.len() <= 1 {
@@ -4169,7 +4344,7 @@ fn check_single_decl(
                     }
                     let mut stub_targets: Vec<String> = single_set.iter().cloned().collect();
                     stub_targets.sort();
-                    let reply = crate::zygote::eval_with_zygote_pool_for_targets(
+                    let reply = match crate::zygote::eval_with_zygote_pool_for_targets(
                         store,
                         toolchain,
                         &local_lean_path,
@@ -4179,16 +4354,22 @@ fn check_single_decl(
                         &stub_targets,
                         Some(crate::zygote::remaining_timeout_ms(None, *t0)),
                         &file_lean_args,
-                    )
-                    .with_context(|| {
-                        format!(
-                            "Zygote check failed for `{}` in {} (lines {}..={})",
-                            target_decl,
-                            file.display(),
-                            shard.start_line,
-                            shard.end_line
-                        )
-                    })?;
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let err_str = format!("{:#}", e);
+                            let p_suffix = maybe_profile_err(&err_str, &env_vars, &lean_bin);
+                            anyhow::bail!(
+                                "Zygote check failed for `{}` in {} (lines {}..={}):\n{}{}",
+                                target_decl,
+                                file.display(),
+                                shard.start_line,
+                                shard.end_line,
+                                err_str,
+                                p_suffix
+                            );
+                        }
+                    };
                     let c_abi_sound = unsafe {
                         crate::splitter::turbo_spec_is_sound_decl_summary(
                             0,
@@ -4217,14 +4398,32 @@ fn check_single_decl(
                             .replace("<zygote-shard>", &orig_display);
                         let m_diags = extract_mismatch_diagnostics(&raw_err);
                         let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
+                        let p_suffix = if reply.timed_out {
+                            run_lean_shard_auto_profiler(
+                                &store.root,
+                                Path::new(&lean_bin),
+                                &env_vars,
+                                Some(canon_dir),
+                                &full_shard_src,
+                                &file_lean_args,
+                                &shard.proof_text,
+                                &[],
+                                "timeout",
+                            )
+                            .map(|r| format_auto_profiler_summary(&r))
+                            .unwrap_or_default()
+                        } else {
+                            maybe_profile_err(&raw_err, &env_vars, &lean_bin)
+                        };
                         anyhow::bail!(
-                            "lean check failed for `{}` in {} (lines {}..={}):\n{}{}",
+                            "lean check failed for `{}` in {} (lines {}..={}):\n{}{}{}",
                             target_decl,
                             file.display(),
                             shard.start_line,
                             shard.end_line,
                             raw_err,
-                            m_suffix
+                            m_suffix,
+                            p_suffix
                         );
                     }
                 }
@@ -4236,7 +4435,7 @@ fn check_single_decl(
                         .unwrap_or_else(|| "262144".to_string());
                     let mut fallback_env = env_vars.clone();
                     fallback_env.insert("LEAN_STACK_SIZE_KB".to_string(), default_stack);
-                    let out = crate::zygote::run_audited_lean_shard_with_types(
+                    let out = match crate::zygote::run_audited_lean_shard_with_types(
                         store,
                         Path::new(&lean_bin),
                         &fallback_env,
@@ -4246,16 +4445,22 @@ fn check_single_decl(
                         &expected_type_pair,
                         &file_lean_args,
                         Some(crate::zygote::remaining_timeout_ms(None, *t0)),
-                    )
-                    .with_context(|| {
-                        format!(
-                            "Shard check failed for `{}` in {} (lines {}..={})",
-                            target_decl,
-                            file.display(),
-                            shard.start_line,
-                            shard.end_line
-                        )
-                    })?;
+                    ) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            let err_str = format!("{:#}", e);
+                            let p_suffix = maybe_profile_err(&err_str, &fallback_env, &lean_bin);
+                            anyhow::bail!(
+                                "Shard check failed for `{}` in {} (lines {}..={}):\n{}{}",
+                                target_decl,
+                                file.display(),
+                                shard.start_line,
+                                shard.end_line,
+                                err_str,
+                                p_suffix
+                            );
+                        }
+                    };
 
                     if !out.status.success() {
                         let orig_display = file.display().to_string();
@@ -4264,14 +4469,16 @@ fn check_single_decl(
                         let combined_err = format!("{}\n{}", stdout, stderr);
                         let m_diags = extract_mismatch_diagnostics(&combined_err);
                         let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
+                        let p_suffix = maybe_profile_err(&combined_err, &fallback_env, &lean_bin);
                         anyhow::bail!(
-                            "Shard check failed for `{}` in {} (lines {}..={}):\n{}{}",
+                            "Shard check failed for `{}` in {} (lines {}..={}):\n{}{}{}",
                             target_decl,
                             orig_display,
                             shard.start_line,
                             shard.end_line,
                             combined_err,
-                            m_suffix
+                            m_suffix,
+                            p_suffix
                         );
                     }
                 }
@@ -4396,6 +4603,56 @@ fn check_single_decl(
                     );
                 }
             }
+            let slow_profiler_suffix = if let Some(reason) = should_auto_profile_shard(None, dur_ms)
+            {
+                let prof_src_opt = if !shard.shard_source.is_empty() {
+                    Some(shard.shard_source.clone())
+                } else {
+                    splitter::reconstruct_single_shard_source(&active_src, &rooted_target)
+                        .ok()
+                        .flatten()
+                };
+                if let Some(prof_src) = prof_src_opt {
+                    let (prof_env, prof_lb) = if !env_vars.is_empty() {
+                        (env_vars.clone(), lean_bin.clone())
+                    } else if let Ok(((ev, _), lb)) = resolve_lake_env(store, canon_dir)
+                        .and_then(|e| Ok((e, resolve_lean_bin(canon_dir)?)))
+                    {
+                        (ev, lb)
+                    } else {
+                        (HashMap::new(), String::new())
+                    };
+                    if !prof_lb.is_empty() {
+                        if let Some(rep) = run_lean_shard_auto_profiler(
+                            &store.root,
+                            Path::new(&prof_lb),
+                            &prof_env,
+                            Some(canon_dir),
+                            &prof_src,
+                            &file_lean_args,
+                            &shard.proof_text,
+                            &emitted_used_constants,
+                            reason,
+                        ) {
+                            let s = format_auto_profiler_summary(&rep);
+                            if let Some(obj) = out_json.as_object_mut() {
+                                if let Ok(val) = serde_json::to_value(&rep) {
+                                    obj.insert("auto_profiler".to_string(), val);
+                                }
+                            }
+                            s
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
             if inflight_tx_open {
                 store.commit_inflight_publish_for_lease(&lease.action_key)?;
             } else {
@@ -4457,7 +4714,7 @@ fn check_single_decl(
                     println!("{}", serde_json::to_string_pretty(&out_json)?);
                 } else {
                     println!(
-                        "[turbo-lean] SHARD VERIFIED `{}` ({}/{} shards in file, env_cache_hit={}, fast_olean={}, zygote={}, interface_hash={}.., {} ms)",
+                        "[turbo-lean] SHARD VERIFIED `{}` ({}/{} shards in file, env_cache_hit={}, fast_olean={}, zygote={}, interface_hash={}.., {} ms){}",
                         target_decl,
                         1,
                         split.shards.len(),
@@ -4465,7 +4722,8 @@ fn check_single_decl(
                         verified_via_fast_olean,
                         verified_via_zygote,
                         &split.interface_hash[..12],
-                        dur_ms
+                        dur_ms,
+                        slow_profiler_suffix
                     );
                 }
             }
@@ -4492,6 +4750,639 @@ fn check_single_decl(
             Ok(out_json)
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PartialDeclVerdict {
+    decl: String,
+    kind: String,
+    status: String, // "verified" | "cached" | "sorry" | "error"
+    start_line: usize,
+    end_line: usize,
+    shard_key: String,
+    certified: bool,
+    elapsed_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_profiler: Option<AutoProfilerReport>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_single_file_allow_sorry(
+    store: &mut TurboStore,
+    db_warm_on_open: bool,
+    json_output: bool,
+    emit_stdout: bool,
+    t0: &Instant,
+    file: &Path,
+    resolved_file: &Path,
+    canon_resolved_initial: &Path,
+    canon_dir: &Path,
+    toolchain: &str,
+    src: &mut String,
+    _split: &splitter::SplitResult,
+    jobs: Option<usize>,
+) -> Result<serde_json::Value> {
+    *src = fs::read_to_string(resolved_file)
+        .with_context(|| format!("Failed to read {}", resolved_file.display()))?;
+    let actual_deps = compute_imported_olean_interface_hashes(src, canon_dir, None);
+    let fresh_split = split_lean_source(src, &actual_deps);
+    let fresh_non_sorry = fresh_split.hygiene.non_sorry_disallowed_items();
+    if !fresh_non_sorry.is_empty() {
+        anyhow::bail!(
+            "Soundness hygiene violation in {} (even under `--allow-sorry`): {}",
+            file.display(),
+            fresh_non_sorry.join(", ")
+        );
+    }
+    if !fresh_split.eligible_for_sharding {
+        anyhow::bail!(
+            "Cannot run partial `--allow-sorry` check on {}: {}",
+            file.display(),
+            fresh_split
+                .fallback_reason
+                .as_deref()
+                .unwrap_or("module is not eligible for per-declaration sharding")
+        );
+    }
+    let shard_lines: Vec<(usize, usize)> = fresh_split
+        .shards
+        .iter()
+        .map(|s| (s.start_line, s.end_line))
+        .collect();
+    let outside_sorry: Vec<String> = fresh_split
+        .hygiene
+        .disallowed_items()
+        .into_iter()
+        .filter(|item| {
+            let ln_opt = item
+                .strip_prefix('L')
+                .and_then(|r| r.split_once(": "))
+                .and_then(|(ln, _)| ln.parse::<usize>().ok());
+            match ln_opt {
+                Some(ln) => !shard_lines.iter().any(|(st, en)| *st <= ln && ln <= *en),
+                None => true,
+            }
+        })
+        .collect();
+    if !outside_sorry.is_empty() {
+        anyhow::bail!(
+            "Cannot run partial `--allow-sorry` check on {}: `sorry`/`admit` appears outside theorem shards ({}); definitions and non-theorem commands must be sorry-free",
+            file.display(),
+            outside_sorry.join(", ")
+        );
+    }
+
+    let file_lean_args = crate::module_builder::try_resolve_lean_args_for_path(
+        canon_dir,
+        Some(canon_resolved_initial),
+    )?;
+    let file_shard_keys: Vec<String> = fresh_split
+        .shards
+        .iter()
+        .map(|sh| compute_shard_key_with_args(toolchain, sh, &file_lean_args))
+        .collect();
+    let cached_map = if db_warm_on_open && !file_shard_keys.is_empty() {
+        store.batch_get_theorem_shards(&file_shard_keys, "trusted")?
+    } else {
+        HashMap::new()
+    };
+
+    let (mut env_vars, env_cache_hit) = resolve_lake_env(store, canon_dir)?;
+    let default_stack = env_vars
+        .get("LEAN_STACK_SIZE_KB")
+        .cloned()
+        .or_else(|| std::env::var("LEAN_STACK_SIZE_KB").ok())
+        .unwrap_or_else(|| "262144".to_string());
+    env_vars.insert("LEAN_STACK_SIZE_KB".to_string(), default_stack);
+    let lean_bin = resolve_lean_bin(canon_dir)?;
+    let local_lean_path = resolve_remote_lean_path(canon_dir, Some(&env_vars));
+
+    // Confirm declaration identities (statements elaborate in prefix context).
+    // If the batched identity probe succeeds, match each shard; otherwise probe per shard so a
+    // broken statement in one theorem reports an isolated per-declaration error instead of
+    // aborting the rest of the file's clean theorems.
+    let mut attested_kths: HashMap<String, String> = HashMap::new();
+    let mut identity_errors: HashMap<usize, String> = HashMap::new();
+    if !fresh_split.shards.is_empty() {
+        let shard_refs: Vec<&splitter::TheoremShard> = fresh_split.shards.iter().collect();
+        match confirm_file_decl_identities_with_budget(
+            src,
+            &shard_refs,
+            canon_dir,
+            resolved_file,
+            false,
+            Some(*t0),
+        ) {
+            Ok(atts) => {
+                for (idx, att) in atts.into_iter().enumerate() {
+                    attested_kths.insert(file_shard_keys[idx].clone(), att.kernel_type_hash);
+                }
+            }
+            Err(_) => {
+                for (idx, sh) in fresh_split.shards.iter().enumerate() {
+                    match confirm_decl_identity_with_budget(
+                        src,
+                        sh,
+                        canon_dir,
+                        resolved_file,
+                        false,
+                        Some(*t0),
+                    ) {
+                        Ok(att) => {
+                            attested_kths
+                                .insert(file_shard_keys[idx].clone(), att.kernel_type_hash);
+                        }
+                        Err(e) => {
+                            identity_errors.insert(idx, format!("{:#}", e));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // If the whole file has zero theorems (definitions/structures only, already confirmed sorry-free),
+    // verify the whole file via the standard path so broken definitions cannot slip through.
+    if fresh_split.shards.is_empty() {
+        let whole = check_single_file(
+            store,
+            db_warm_on_open,
+            false,
+            false,
+            t0,
+            file,
+            resolved_file,
+            canon_resolved_initial,
+            canon_dir,
+            toolchain,
+            src,
+            None,
+            &fresh_split,
+            0,
+            jobs,
+            true,
+            None,
+        )?;
+        let dur_ms = t0.elapsed().as_millis() as i64;
+        let out_json = serde_json::json!({
+            "status": "partial_file_clean",
+            "allow_sorry": true,
+            "certified_module": true,
+            "file": file.display().to_string(),
+            "verified_count": 0,
+            "cached_count": 0,
+            "sorry_count": 0,
+            "error_count": 0,
+            "declarations": [],
+            "lake_env_cache_hit": env_cache_hit,
+            "interface_hash": fresh_split.interface_hash,
+            "whole_file": whole,
+            "elapsed_ms": dur_ms,
+        });
+        if emit_stdout {
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&out_json)?);
+            } else {
+                println!(
+                    "[turbo-lean] PARTIAL CHECK CLEAN {} (0 theorem shards, definitions verified, {} ms)",
+                    file.display(),
+                    dur_ms
+                );
+            }
+        }
+        return Ok(out_json);
+    }
+
+    let mut verdicts: Vec<Option<PartialDeclVerdict>> = vec![None; fresh_split.shards.len()];
+    let mut work_items: Vec<(usize, String, &splitter::TheoremShard, String)> = Vec::new();
+    let mut cached_count = 0usize;
+    let mut sorry_count = 0usize;
+    let mut error_count = 0usize;
+
+    for (idx, sh) in fresh_split.shards.iter().enumerate() {
+        let skey = file_shard_keys[idx].clone();
+        if let Some(id_err) = identity_errors.remove(&idx) {
+            error_count += 1;
+            verdicts[idx] = Some(PartialDeclVerdict {
+                decl: sh.decl_name().to_string(),
+                kind: sh.kind.clone(),
+                status: "error".to_string(),
+                start_line: sh.start_line,
+                end_line: sh.end_line,
+                shard_key: skey,
+                certified: false,
+                elapsed_ms: 0,
+                error: Some(id_err),
+                auto_profiler: None,
+            });
+            continue;
+        }
+        let violations = target_hygiene_violations(&fresh_split, sh);
+        if !violations.is_empty() {
+            sorry_count += 1;
+            verdicts[idx] = Some(PartialDeclVerdict {
+                decl: sh.decl_name().to_string(),
+                kind: sh.kind.clone(),
+                status: "sorry".to_string(),
+                start_line: sh.start_line,
+                end_line: sh.end_line,
+                shard_key: skey,
+                certified: false,
+                elapsed_ms: 0,
+                error: None,
+                auto_profiler: None,
+            });
+            continue;
+        }
+        let kth = attested_kths.get(&skey).cloned().unwrap_or_default();
+        let is_hit = !kth.is_empty()
+            && cached_map.contains_key(&skey)
+            && store.has_attested_decl_receipt(&skey, "trusted", sh.decl_name(), &kth);
+        if is_hit {
+            cached_count += 1;
+            verdicts[idx] = Some(PartialDeclVerdict {
+                decl: sh.decl_name().to_string(),
+                kind: sh.kind.clone(),
+                status: "cached".to_string(),
+                start_line: sh.start_line,
+                end_line: sh.end_line,
+                shard_key: skey,
+                certified: true,
+                elapsed_ms: 0,
+                error: None,
+                auto_profiler: None,
+            });
+        } else {
+            if cached_map.contains_key(&skey) {
+                store.invalidate_action_for_reattestation(&skey)?;
+            }
+            work_items.push((idx, skey, sh, kth));
+        }
+    }
+
+    let mut verified_publish: Vec<(String, String, Vec<u8>, i64)> = Vec::new();
+    let mut verified_count = 0usize;
+
+    if !work_items.is_empty() {
+        let local_zygote_url = pack::ensure_local_zygote_daemon(store, &env_vars);
+        let requested_jobs = default_parallel_jobs(jobs);
+        let effective_jobs = if local_zygote_url.is_some() {
+            1usize
+        } else {
+            requested_jobs.min(work_items.len()).max(1)
+        };
+        let store_root = store.root.as_path();
+        let src_ref: &str = src.as_str();
+        let next_idx = std::sync::atomic::AtomicUsize::new(0);
+
+        type PartialWorkerRow = (usize, PartialDeclVerdict, Option<String>);
+        let worker_outputs: Vec<Result<Vec<PartialWorkerRow>>> = std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(effective_jobs);
+            for _w in 0..effective_jobs {
+                let next_ref = &next_idx;
+                let work_ref = &work_items;
+                let canon_ref = canon_dir;
+                let env_ref = &env_vars;
+                let lean_bin_ref = &lean_bin;
+                let file_display = file.display().to_string();
+                let z_url_ref = local_zygote_url.as_deref();
+                let tc_ref = toolchain;
+                let lp_ref = &local_lean_path;
+                let iface_ref = &fresh_split.interface_hash;
+                let args_ref = &file_lean_args;
+
+                handles.push(s.spawn(
+                    move || -> Result<Vec<(usize, PartialDeclVerdict, Option<String>)>> {
+                        let worker_store = TurboStore::open(Some(store_root))?;
+                        let mut out_vec = Vec::new();
+                        loop {
+                            let w_idx = next_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            if w_idx >= work_ref.len() {
+                                break;
+                            }
+                            let (orig_idx, ref skey, sh, ref kth) = work_ref[w_idx];
+                            let rooted_target = sh.rooted_name();
+                            let expected_pair = if kth.is_empty() {
+                                Vec::new()
+                            } else {
+                                vec![(sh.decl_name().to_string(), kth.clone())]
+                            };
+                            let shard_t0 = Instant::now();
+                            let shard_src_owned = if !sh.shard_source.is_empty() {
+                                sh.shard_source.clone()
+                            } else {
+                                splitter::reconstruct_single_shard_source(src_ref, &rooted_target)?
+                                    .unwrap_or_else(|| {
+                                        let single = HashSet::from([rooted_target.clone()]);
+                                        splitter::build_coalesced_shard_source(src_ref, &single)
+                                    })
+                            };
+
+                            let mut ok = false;
+                            let mut err_msg: Option<String> = None;
+                            if let Some(z_url) = z_url_ref {
+                                let zreq = pack::CheckShardHttpRequest {
+                                    decl: sh.decl_name().to_string(),
+                                    shard_key: skey.clone(),
+                                    shard_source: shard_src_owned.clone(),
+                                    interface_hash: iface_ref.clone(),
+                                    prefix_env_hash: sh.prefix_env_hash.clone(),
+                                    stmt_hash: sh.stmt_hash.clone(),
+                                    proof_hash: sh.proof_hash.clone(),
+                                    toolchain: tc_ref.to_string(),
+                                    lean_path: lp_ref.clone(),
+                                    skip_cas_lock: true,
+                                    allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
+                                    lean_args: args_ref.clone(),
+                                    targets: vec![rooted_target.clone()],
+                                    expected_kernel_type_hash: (!kth.is_empty())
+                                        .then(|| kth.clone()),
+                                };
+                                match pack::try_zygote_url_check_shard_inner_with_inflight_detailed(
+                                    z_url,
+                                    &zreq,
+                                    || {},
+                                ) {
+                                    Ok(Some(zjson)) => {
+                                        if !expected_pair.is_empty() {
+                                            let pairs: std::collections::BTreeMap<String, String> =
+                                                zjson
+                                                    .get("decl_types")
+                                                    .and_then(|v| v.as_object())
+                                                    .map(|dt| {
+                                                        dt.iter()
+                                                            .filter_map(|(k, v)| {
+                                                                Some((
+                                                                    k.clone(),
+                                                                    v.as_str()?.to_string(),
+                                                                ))
+                                                            })
+                                                            .collect()
+                                                    })
+                                                    .unwrap_or_default();
+                                            match crate::zygote::verify_attested_decl_types(
+                                                &pairs,
+                                                &expected_pair,
+                                            ) {
+                                                Ok(()) => ok = true,
+                                                Err(e) => err_msg = Some(format!("{:#}", e)),
+                                            }
+                                        } else {
+                                            ok = true;
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        err_msg = Some(
+                                            e.to_string()
+                                                .replace("<zygote-decl>", &file_display)
+                                                .replace("<zygote-shard>", &file_display),
+                                        );
+                                    }
+                                }
+                            }
+
+                            if !ok && err_msg.is_none() {
+                                let audit_one = HashSet::from([rooted_target]);
+                                match crate::zygote::run_audited_lean_shard_with_types(
+                                    &worker_store,
+                                    Path::new(lean_bin_ref),
+                                    env_ref,
+                                    Some(canon_ref),
+                                    &shard_src_owned,
+                                    &audit_one,
+                                    &expected_pair,
+                                    args_ref,
+                                    Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+                                ) {
+                                    Ok(o) if o.status.success() => {
+                                        ok = true;
+                                    }
+                                    Ok(o) => {
+                                        let stderr =
+                                            String::from_utf8_lossy(&o.stderr).into_owned();
+                                        let stdout =
+                                            String::from_utf8_lossy(&o.stdout).into_owned();
+                                        err_msg = Some(format!("{}\n{}", stdout, stderr));
+                                    }
+                                    Err(e) => {
+                                        err_msg = Some(format!("{:#}", e));
+                                    }
+                                }
+                            }
+
+                            let dur_ms = shard_t0.elapsed().as_millis() as i64;
+                            if ok {
+                                let prof_opt =
+                                    should_auto_profile_shard(None, dur_ms).and_then(|reason| {
+                                        run_lean_shard_auto_profiler(
+                                            store_root,
+                                            Path::new(lean_bin_ref),
+                                            env_ref,
+                                            Some(canon_ref),
+                                            &shard_src_owned,
+                                            args_ref,
+                                            &sh.proof_text,
+                                            &[],
+                                            reason,
+                                        )
+                                    });
+                                out_vec.push((
+                                    orig_idx,
+                                    PartialDeclVerdict {
+                                        decl: sh.decl_name().to_string(),
+                                        kind: sh.kind.clone(),
+                                        status: "verified".to_string(),
+                                        start_line: sh.start_line,
+                                        end_line: sh.end_line,
+                                        shard_key: skey.clone(),
+                                        certified: true,
+                                        elapsed_ms: dur_ms,
+                                        error: None,
+                                        auto_profiler: prof_opt,
+                                    },
+                                    (!kth.is_empty()).then(|| kth.clone()),
+                                ));
+                            } else {
+                                let raw_err = err_msg.unwrap_or_else(|| {
+                                    "unknown shard verification failure".to_string()
+                                });
+                                let m_diags = extract_mismatch_diagnostics(&raw_err);
+                                let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
+                                let prof_opt = should_auto_profile_shard(Some(&raw_err), dur_ms)
+                                    .and_then(|reason| {
+                                        run_lean_shard_auto_profiler(
+                                            store_root,
+                                            Path::new(lean_bin_ref),
+                                            env_ref,
+                                            Some(canon_ref),
+                                            &shard_src_owned,
+                                            args_ref,
+                                            &sh.proof_text,
+                                            &[],
+                                            reason,
+                                        )
+                                    });
+                                let p_suffix = prof_opt
+                                    .as_ref()
+                                    .map(format_auto_profiler_summary)
+                                    .unwrap_or_default();
+                                out_vec.push((
+                                    orig_idx,
+                                    PartialDeclVerdict {
+                                        decl: sh.decl_name().to_string(),
+                                        kind: sh.kind.clone(),
+                                        status: "error".to_string(),
+                                        start_line: sh.start_line,
+                                        end_line: sh.end_line,
+                                        shard_key: skey.clone(),
+                                        certified: false,
+                                        elapsed_ms: dur_ms,
+                                        error: Some(format!(
+                                            "{}{}{}",
+                                            raw_err.trim(),
+                                            m_suffix,
+                                            p_suffix
+                                        )),
+                                        auto_profiler: prof_opt,
+                                    },
+                                    None,
+                                ));
+                            }
+                        }
+                        Ok(out_vec)
+                    },
+                ));
+            }
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("Worker thread panicked")))
+                })
+                .collect()
+        });
+
+        let now = db::now_unix();
+        for wr in worker_outputs {
+            for (orig_idx, verdict, kth_opt) in wr? {
+                if verdict.status == "verified" {
+                    verified_count += 1;
+                    let sh = &fresh_split.shards[orig_idx];
+                    if let Some(ref kth) = kth_opt {
+                        let receipt = make_attested_shard_receipt_bytes(
+                            sh.decl_name(),
+                            &sh.prefix_env_hash,
+                            &sh.stmt_hash,
+                            &sh.proof_hash,
+                            now,
+                            Some(kth.as_str()),
+                        )?;
+                        verified_publish.push((
+                            verdict.shard_key.clone(),
+                            sh.decl_name().to_string(),
+                            receipt,
+                            verdict.elapsed_ms,
+                        ));
+                    }
+                } else if verdict.status == "error" {
+                    error_count += 1;
+                }
+                verdicts[orig_idx] = Some(verdict);
+            }
+        }
+    }
+
+    if !verified_publish.is_empty() {
+        store.batch_publish_theorem_shards(toolchain, "trusted", &verified_publish)?;
+    }
+
+    let decl_verdicts: Vec<PartialDeclVerdict> = verdicts.into_iter().flatten().collect();
+    let dur_ms = t0.elapsed().as_millis() as i64;
+    let certified_module = sorry_count == 0 && error_count == 0;
+    let status = if error_count > 0 {
+        "partial_file_failed"
+    } else if sorry_count > 0 {
+        "partial_file_verified"
+    } else {
+        "file_verified"
+    };
+
+    let out_json = serde_json::json!({
+        "status": status,
+        "allow_sorry": true,
+        "certified_module": certified_module,
+        "file": file.display().to_string(),
+        "verified_count": verified_count,
+        "cached_count": cached_count,
+        "sorry_count": sorry_count,
+        "error_count": error_count,
+        "total_shards": fresh_split.shards.len(),
+        "declarations": decl_verdicts,
+        "lake_env_cache_hit": env_cache_hit,
+        "interface_hash": fresh_split.interface_hash,
+        "elapsed_ms": dur_ms,
+    });
+
+    if emit_stdout {
+        if json_output {
+            println!("{}", serde_json::to_string_pretty(&out_json)?);
+        } else {
+            println!(
+                "[turbo-lean] PARTIAL CHECK {} ({} verified, {} cached, {} sorry, {} error, certified_module={}, {} ms)",
+                file.display(),
+                verified_count,
+                cached_count,
+                sorry_count,
+                error_count,
+                certified_module,
+                dur_ms
+            );
+            for dv in &decl_verdicts {
+                match dv.status.as_str() {
+                    "sorry" => println!(
+                        "  [SORRY] {} (L{}..={}) — uncertified stub",
+                        dv.decl, dv.start_line, dv.end_line
+                    ),
+                    "error" => println!(
+                        "  [ERROR] {} (L{}..={}):\n{}",
+                        dv.decl,
+                        dv.start_line,
+                        dv.end_line,
+                        dv.error.as_deref().unwrap_or("verification failed")
+                    ),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if error_count > 0 {
+        let mut err_lines = Vec::new();
+        for dv in &decl_verdicts {
+            if dv.status == "error" {
+                err_lines.push(format!(
+                    "`{}` (L{}..={}): {}",
+                    dv.decl,
+                    dv.start_line,
+                    dv.end_line,
+                    dv.error.as_deref().unwrap_or("verification failed")
+                ));
+            }
+        }
+        anyhow::bail!(
+            "Partial check failed for {} ({} broken declaration(s); {} clean verified/cached, {} sorry):\n{}",
+            file.display(),
+            error_count,
+            verified_count + cached_count,
+            sorry_count,
+            err_lines.join("\n---\n")
+        );
+    }
+
+    Ok(out_json)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4532,10 +5423,8 @@ fn check_single_file(
     let mut hits = 0usize;
     let mut uncached_shards = Vec::new();
     let mut attested_kths: HashMap<String, String> = HashMap::new();
-    if split.eligible_for_sharding
-        && split.hygiene.is_clean_for_certification()
-        && !split.shards.is_empty()
-    {
+    let file_is_clean = split.hygiene.is_clean_for_certification();
+    if split.eligible_for_sharding && file_is_clean && !split.shards.is_empty() {
         if src.is_empty() {
             *src = fs::read_to_string(resolved_file)
                 .with_context(|| format!("Failed to read {}", resolved_file.display()))?;
@@ -4562,7 +5451,7 @@ fn check_single_file(
         if is_attested_hit {
             hits += 1;
         } else {
-            if cached_map.contains_key(&shard_key) {
+            if file_is_clean && split.eligible_for_sharding && cached_map.contains_key(&shard_key) {
                 store.invalidate_action_for_reattestation(&shard_key)?;
             }
             uncached_shards.push((shard_key, shard));
@@ -5806,6 +6695,298 @@ pub fn format_mismatch_diagnostics_summary(diags: &[serde_json::Value]) -> Strin
         .unwrap_or(token_saver_line)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProfilerTacticSpan {
+    pub elapsed_ms: f64,
+    pub span: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProfilerLemmaFreq {
+    pub name: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AutoProfilerReport {
+    pub triggered_reason: String,
+    pub top_tactic_spans: Vec<ProfilerTacticSpan>,
+    pub top_unfolded_or_simp_lemmas: Vec<ProfilerLemmaFreq>,
+    pub top_proof_constants: Vec<ProfilerLemmaFreq>,
+}
+
+pub fn should_auto_profile_shard(err_text: Option<&str>, elapsed_ms: i64) -> Option<&'static str> {
+    let slow_threshold_ms = std::env::var("TURBO_LEAN_AUTO_PROFILE_SLOW_MS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(5_000);
+    if let Some(err) = err_text {
+        let lower = err.to_ascii_lowercase();
+        if lower.contains("deterministic timeout")
+            || lower.contains("maximum number of heartbeats")
+            || lower.contains("maxheartbeats")
+        {
+            return Some("maxHeartbeats_exceeded");
+        }
+        if lower.contains("timed out") || lower.contains("timeout") {
+            return Some("timeout");
+        }
+    }
+    if slow_threshold_ms > 0 && elapsed_ms >= slow_threshold_ms {
+        return Some("slow_shard");
+    }
+    None
+}
+
+pub fn parse_lean_profiler_trace(
+    trace_output: &str,
+    proof_text: &str,
+    used_constants: &[String],
+    reason: &str,
+) -> AutoProfilerReport {
+    let mut spans: Vec<ProfilerTacticSpan> = Vec::new();
+    let mut lemma_counts: HashMap<String, usize> = HashMap::new();
+
+    for raw_line in trace_output.lines() {
+        let line = raw_line.trim();
+        if let Some(rest) = line
+            .strip_prefix("[Elab.step]")
+            .or_else(|| line.strip_prefix("[Tactic]"))
+            .or_else(|| line.strip_prefix("[Meta.Tactic.simp]"))
+            .map(str::trim_start)
+        {
+            if let Some(inside) = rest.strip_prefix('[') {
+                if let Some((sec_str, desc)) = inside.split_once(']') {
+                    let sec_clean = sec_str.trim().trim_end_matches('s');
+                    if let Ok(secs) = sec_clean.parse::<f64>() {
+                        let span_desc = desc.trim();
+                        if !span_desc.is_empty() {
+                            spans.push(ProfilerTacticSpan {
+                                elapsed_ms: (secs * 1000.0 * 100.0).round() / 100.0,
+                                span: span_desc.chars().take(160).collect(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(pos) = line.find("[Meta.Tactic.simp.rewrite]") {
+            let after = line[pos + "[Meta.Tactic.simp.rewrite]".len()..].trim_start();
+            // Strip optional `[0.012345]` timing prefix when `trace.profiler=true` is also active.
+            let body = if let Some(b) = after.strip_prefix('[') {
+                b.split_once(']')
+                    .map(|(_, r)| r.trim_start())
+                    .unwrap_or(after)
+            } else {
+                after
+            };
+            let lemma_opt = if let Some(u) = body.strip_prefix("unfold ") {
+                u.split(|c: char| c.is_whitespace() || c == ',')
+                    .next()
+                    .filter(|s| !s.is_empty())
+            } else {
+                body.split_once(':').map(|(lhs, _)| lhs.trim()).filter(|s| {
+                    !s.is_empty()
+                        && !s.contains(' ')
+                        && s.chars()
+                            .next()
+                            .is_some_and(|c| c.is_alphabetic() || c == '_' || c == '«')
+                })
+            };
+            if let Some(lemma) = lemma_opt {
+                *lemma_counts.entry(lemma.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    spans.sort_by(|a, b| {
+        b.elapsed_ms
+            .partial_cmp(&a.elapsed_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.span.cmp(&b.span))
+    });
+    spans.dedup_by(|a, b| a.span == b.span && (a.elapsed_ms - b.elapsed_ms).abs() < 0.05);
+    spans.truncate(5);
+
+    let mut top_lemmas: Vec<ProfilerLemmaFreq> = lemma_counts
+        .into_iter()
+        .map(|(name, count)| ProfilerLemmaFreq { name, count })
+        .collect();
+    top_lemmas.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+    top_lemmas.truncate(5);
+
+    let mut const_counts: HashMap<String, usize> = HashMap::new();
+    for c in used_constants {
+        if !crate::accelerators::is_excluded_core_constant(c) {
+            *const_counts.entry(c.clone()).or_insert(0) += 1;
+        }
+    }
+    let clean_proof = splitter::strip_lean_comments(proof_text);
+    const KEYWORDS: &[&str] = &[
+        "by",
+        "have",
+        "let",
+        "show",
+        "from",
+        "fun",
+        "match",
+        "with",
+        "if",
+        "then",
+        "else",
+        "do",
+        "rw",
+        "simp",
+        "only",
+        "exact",
+        "apply",
+        "intro",
+        "intros",
+        "cases",
+        "rcases",
+        "obtain",
+        "induction",
+        "constructor",
+        "refine",
+        "omega",
+        "decide",
+        "rfl",
+        "trivial",
+        "sorry",
+        "admit",
+        "at",
+        "in",
+        "calc",
+    ];
+    for tok in clean_proof.split(|c: char| {
+        !(c.is_alphanumeric() || c == '_' || c == '.' || c == '\'' || c == '«' || c == '»')
+    }) {
+        let t = tok.trim_matches('.');
+        if t.len() >= 2
+            && t.chars()
+                .next()
+                .is_some_and(|c| c.is_alphabetic() || c == '_')
+            && !KEYWORDS.contains(&t)
+        {
+            *const_counts.entry(t.to_string()).or_insert(0) += 1;
+        }
+    }
+    let mut top_consts: Vec<ProfilerLemmaFreq> = const_counts
+        .into_iter()
+        .map(|(name, count)| ProfilerLemmaFreq { name, count })
+        .collect();
+    top_consts.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+    top_consts.truncate(5);
+
+    AutoProfilerReport {
+        triggered_reason: reason.to_string(),
+        top_tactic_spans: spans,
+        top_unfolded_or_simp_lemmas: top_lemmas,
+        top_proof_constants: top_consts,
+    }
+}
+
+pub fn format_auto_profiler_summary(rep: &AutoProfilerReport) -> String {
+    let spans_str = if rep.top_tactic_spans.is_empty() {
+        "none".to_string()
+    } else {
+        rep.top_tactic_spans
+            .iter()
+            .map(|s| format!("{:.1}ms `{}`", s.elapsed_ms, s.span))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    let lemmas_str = if rep.top_unfolded_or_simp_lemmas.is_empty() {
+        "none".to_string()
+    } else {
+        rep.top_unfolded_or_simp_lemmas
+            .iter()
+            .map(|l| format!("{} ({}x)", l.name, l.count))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let consts_str = if rep.top_proof_constants.is_empty() {
+        "none".to_string()
+    } else {
+        rep.top_proof_constants
+            .iter()
+            .map(|c| format!("{} ({}x)", c.name, c.count))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "\n[AUTO-PROFILER ({})]\n  top_tactic_spans: {}\n  top_unfolded_simp_lemmas: {}\n  top_proof_constants: {}",
+        rep.triggered_reason, spans_str, lemmas_str, consts_str
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_lean_shard_auto_profiler(
+    store_root: &Path,
+    lean_bin: &Path,
+    env_vars: &HashMap<String, String>,
+    cwd: Option<&Path>,
+    shard_source: &str,
+    lean_args: &[String],
+    proof_text: &str,
+    used_constants: &[String],
+    reason: &str,
+) -> Option<AutoProfilerReport> {
+    if std::env::var("TURBO_LEAN_DISABLE_AUTO_PROFILER").as_deref() == Ok("1") {
+        return None;
+    }
+    let staging = store_root.join("staging");
+    let _ = fs::create_dir_all(&staging);
+    let scratch = PrivateScratchDir::create(&staging, "turbo_autoprofile").ok()?;
+    let probe_file = scratch.path.join("AutoProfileShard.lean");
+    create_readonly_private_file(&probe_file, shard_source.as_bytes()).ok()?;
+    freeze_private_dir(&scratch.path).ok()?;
+
+    let mut cmd = crate::module_builder::verifier_command(lean_bin, env_vars).ok()?;
+    let default_stack = env_vars
+        .get("LEAN_STACK_SIZE_KB")
+        .cloned()
+        .or_else(|| std::env::var("LEAN_STACK_SIZE_KB").ok())
+        .unwrap_or_else(|| "262144".to_string());
+    cmd.env("LEAN_STACK_SIZE_KB", default_stack);
+    cmd.args(crate::module_builder::filter_allowed_lean_args(lean_args))
+        .arg("-Dwarn.sorry=true")
+        .arg("-Ddebug.skipKernelTC=false")
+        .arg("-Dweak.elab.async=false")
+        .arg("-Dtrace.profiler=true")
+        .arg("-Dtrace.profiler.threshold=10")
+        .arg("-Dtrace.Meta.Tactic.simp.rewrite=true")
+        .arg("-R")
+        .arg(&scratch.path)
+        .arg(&probe_file);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let budget_ms = std::env::var("TURBO_LEAN_AUTO_PROFILE_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(8_000);
+    let combined = match crate::module_builder::run_command_with_timeout(
+        &mut cmd,
+        std::time::Duration::from_millis(budget_ms),
+        false,
+    ) {
+        Ok(out) => format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+        Err(e) => e.to_string(),
+    };
+    let _ = scratch.remove();
+    Some(parse_lean_profiler_trace(
+        &combined,
+        proof_text,
+        used_constants,
+        reason,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6039,6 +7220,7 @@ but is expected to have type
             let res = check_single_decl(
                 st,
                 true,
+                false,
                 false,
                 false,
                 &t0,
@@ -7770,6 +8952,7 @@ theorem after_macro : ext_magic = 7 := rfl
             true,
             false,
             false,
+            false,
             &t0,
             &lean_file,
             &lean_file,
@@ -7796,6 +8979,7 @@ theorem after_macro : ext_magic = 7 := rfl
             true,
             false,
             false,
+            false,
             &t0_ok,
             &lean_file,
             &lean_file,
@@ -7818,6 +9002,221 @@ theorem after_macro : ext_magic = 7 := rfl
                 compute_fission_store_key(toolchain, &shard.prefix_env_hash, &sub.sub_shard_key);
             assert!(store_has_provenanced_subshard(&store, &v3_key));
         }
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_parse_lean_profiler_trace_and_triggers() {
+        let trace = "\
+[Elab.command] [0.420100] theorem slow_thm : True := by
+[Elab.step] [0.390000] simp [Nat.add_comm, Nat.add_assoc]
+[Meta.Tactic.simp.rewrite] Nat.add_comm:1000: a + b ==> b + a
+[Meta.Tactic.simp.rewrite] Nat.add_comm:1000: c + d ==> d + c
+[Meta.Tactic.simp.rewrite] Nat.add_assoc:1000: (a + b) + c ==> a + (b + c)
+[Elab.step] [0.025000] omega
+";
+        let rep = parse_lean_profiler_trace(
+            trace,
+            "by\n  simp [Nat.add_comm, Nat.add_assoc]\n  omega",
+            &["Nat.add_comm".to_string(), "Nat.add_assoc".to_string()],
+            "maxHeartbeats_exceeded",
+        );
+        assert_eq!(rep.triggered_reason, "maxHeartbeats_exceeded");
+        assert!(!rep.top_tactic_spans.is_empty());
+        assert_eq!(
+            rep.top_tactic_spans[0].span,
+            "simp [Nat.add_comm, Nat.add_assoc]"
+        );
+        assert!((rep.top_tactic_spans[0].elapsed_ms - 390.0).abs() < 1.0);
+        assert_eq!(rep.top_unfolded_or_simp_lemmas[0].name, "Nat.add_comm");
+        assert_eq!(rep.top_unfolded_or_simp_lemmas[0].count, 2);
+        let summary = format_auto_profiler_summary(&rep);
+        assert!(summary.contains("[AUTO-PROFILER (maxHeartbeats_exceeded)]"));
+        assert!(summary.contains("Nat.add_comm (2x)"));
+
+        assert_eq!(
+            should_auto_profile_shard(
+                Some("error: (deterministic) timeout at `whnf`, maximum number of heartbeats (200000) has been reached"),
+                50
+            ),
+            Some("maxHeartbeats_exceeded")
+        );
+        assert_eq!(
+            should_auto_profile_shard(Some("type mismatch\n  Nat\nexpected\n  Bool"), 50),
+            None
+        );
+    }
+
+    #[test]
+    fn test_check_allow_sorry_partial_file_caches_clean_shards_and_blocks_emit_olean() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "tl_allow_sorry_test_{}",
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let proj_dir = tmp_dir.join("proj");
+        let store_dir = tmp_dir.join("store");
+        fs::create_dir_all(&proj_dir).unwrap();
+        fs::create_dir_all(&store_dir).unwrap();
+
+        let toolchain = detect_toolchain(&proj_dir);
+        fs::write(proj_dir.join("lean-toolchain"), format!("{toolchain}\n")).unwrap();
+        fs::write(
+            proj_dir.join("lakefile.toml"),
+            "name = \"PartialTest\"\ndefaultTargets = [\"PartialMod\"]\n\n[[lean_lib]]\nname = \"PartialMod\"\n",
+        )
+        .unwrap();
+        let mut store = TurboStore::open(Some(&store_dir)).unwrap();
+        let (_env_vars, lean_bin) =
+            crate::pack::resolve_server_lean_env_and_bin(&store, &toolchain, "").unwrap();
+        if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return;
+        }
+
+        // `--emit-olean` + `--allow-sorry` must always fail closed.
+        let dummy_file = proj_dir.join("PartialMod.lean");
+        fs::write(&dummy_file, "theorem t0 : True := trivial\n").unwrap();
+        let emit_combo = run_check_command_inner(
+            &mut store,
+            true,
+            true,
+            false,
+            true,
+            true,
+            dummy_file.clone(),
+            None,
+            proj_dir.clone(),
+            Some(1),
+            true,
+            None,
+        );
+        assert!(emit_combo
+            .unwrap_err()
+            .to_string()
+            .contains("`--emit-olean` cannot be combined with `--allow-sorry`"));
+
+        // Phase 1: 1 valid theorem + 1 `sorry` theorem + 1 broken theorem.
+        // `--allow-sorry` must fail with `error_count == 1`, BUT cache `clean_thm` in CAS and NEVER cache `sorry_thm`.
+        let src_with_broken = "\
+def addOne (n : Nat) : Nat := n + 1
+
+theorem clean_thm (n : Nat) : addOne n = n + 1 := rfl
+
+theorem sorry_thm (n : Nat) : addOne (addOne n) = n + 2 := by
+  sorry
+
+theorem broken_thm (n : Nat) : addOne n = n + 2 := rfl
+";
+        fs::write(&dummy_file, src_with_broken).unwrap();
+        let err_res = evaluate_check_command_allow_sorry_value(
+            &mut store,
+            dummy_file.clone(),
+            None,
+            proj_dir.clone(),
+        );
+        let err_msg = err_res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("broken_thm"),
+            "expected broken_thm in error output, got: {err_msg}"
+        );
+
+        let split_p1 = split_lean_source(src_with_broken, &[]);
+        assert_eq!(split_p1.shards.len(), 3);
+        let clean_key = compute_shard_key_with_args(&toolchain, &split_p1.shards[0], &[]);
+        let sorry_key = compute_shard_key_with_args(&toolchain, &split_p1.shards[1], &[]);
+        let broken_key = compute_shard_key_with_args(&toolchain, &split_p1.shards[2], &[]);
+        assert!(
+            store.has_theorem_shard(&clean_key),
+            "clean_thm must be cached in CAS even when sibling theorem fails"
+        );
+        assert!(
+            !store.has_theorem_shard(&sorry_key),
+            "sorry_thm must NEVER be published into trusted CAS"
+        );
+        assert!(!store.has_theorem_shard(&broken_key));
+
+        // Phase 2: Fix `broken_thm`, keeping `sorry_thm` as `sorry`.
+        // Default `check` must STILL fail (file is not sorry-free), while `--allow-sorry` succeeds with
+        // `cached_count == 1`, `verified_count == 1`, `sorry_count == 1`, `certified_module == false`.
+        let src_partial_ok = "\
+def addOne (n : Nat) : Nat := n + 1
+
+theorem clean_thm (n : Nat) : addOne n = n + 1 := rfl
+
+theorem sorry_thm (n : Nat) : addOne (addOne n) = n + 2 := by
+  sorry
+
+theorem fixed_thm (n : Nat) : addOne n = 1 + n := by
+  simp [addOne, Nat.add_comm]
+";
+        fs::write(&dummy_file, src_partial_ok).unwrap();
+        assert!(
+            evaluate_check_command_value(&mut store, dummy_file.clone(), None, proj_dir.clone())
+                .is_err(),
+            "standard check without --allow-sorry must still reject sorry-containing files"
+        );
+
+        let partial_val = evaluate_check_command_allow_sorry_value(
+            &mut store,
+            dummy_file.clone(),
+            None,
+            proj_dir.clone(),
+        )
+        .unwrap();
+        assert_eq!(partial_val["status"], "partial_file_verified");
+        assert_eq!(partial_val["certified_module"], false);
+        assert_eq!(partial_val["cached_count"], 1);
+        assert_eq!(partial_val["verified_count"], 1);
+        assert_eq!(partial_val["sorry_count"], 1);
+        assert_eq!(partial_val["error_count"], 0);
+
+        // Single-decl `--allow-sorry` on `sorry_thm` elaborates its statement and returns `decl_sorry` without caching.
+        let single_sorry = evaluate_check_command_allow_sorry_value(
+            &mut store,
+            dummy_file.clone(),
+            Some("sorry_thm".to_string()),
+            proj_dir.clone(),
+        )
+        .unwrap();
+        assert_eq!(single_sorry["status"], "decl_sorry");
+        assert_eq!(single_sorry["certified"], false);
+        assert!(!store.has_theorem_shard(&sorry_key));
+
+        // Phase 3: Close `sorry_thm` and run standard `check` (without `--allow-sorry`):
+        // both `clean_thm` and `fixed_thm` hit the trusted CAS (`shard_hits == 2`, `shard_misses == 1`)!
+        let src_all_closed = "\
+def addOne (n : Nat) : Nat := n + 1
+
+theorem clean_thm (n : Nat) : addOne n = n + 1 := rfl
+
+theorem sorry_thm (n : Nat) : addOne (addOne n) = n + 2 := rfl
+
+theorem fixed_thm (n : Nat) : addOne n = 1 + n := by
+  simp [addOne, Nat.add_comm]
+";
+        fs::write(&dummy_file, src_all_closed).unwrap();
+        let full_val =
+            evaluate_check_command_value(&mut store, dummy_file.clone(), None, proj_dir.clone())
+                .unwrap();
+        assert_eq!(full_val["status"], "file_verified");
+        assert_eq!(full_val["shard_hits"], 2);
+        assert_eq!(full_val["shard_misses"], 1);
+
+        // Phase 4: Forbidden axiom is still rejected even under `--allow-sorry`.
+        let src_bad_axiom = "\
+axiom bad_ax : False
+theorem t_ax : False := bad_ax
+";
+        fs::write(&dummy_file, src_bad_axiom).unwrap();
+        assert!(evaluate_check_command_allow_sorry_value(
+            &mut store,
+            dummy_file.clone(),
+            None,
+            proj_dir.clone(),
+        )
+        .is_err());
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }

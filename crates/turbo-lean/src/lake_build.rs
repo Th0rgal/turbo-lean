@@ -854,8 +854,14 @@ fn compute_single_olean_digest_and_imports(olean_path: &Path) -> Option<(String,
         .map(|(imps, _)| imps.into_iter().map(|i| i.module).collect::<Vec<String>>())
         .unwrap_or_default();
     let mut h = blake3::Hasher::new();
-    h.update(b"olean-full:v3:");
-    h.update(blake3::hash(&bytes).as_bytes());
+    h.update(b"olean-iface:v4:");
+    if let Some(iface_dig) = crate::module_builder::compute_olean_theorem_interface_digest(&bytes) {
+        h.update(b"thm-iface:");
+        h.update(iface_dig.as_bytes());
+    } else {
+        h.update(b"raw:");
+        h.update(blake3::hash(&bytes).as_bytes());
+    }
     let companions = [
         (
             "srv",
@@ -865,7 +871,6 @@ fn compute_single_olean_digest_and_imports(olean_path: &Path) -> Option<(String,
             "priv",
             PathBuf::from(format!("{}.private", olean_path.display())),
         ),
-        ("ilean", olean_path.with_extension("ilean")),
         ("ir", olean_path.with_extension("ir")),
         (
             "ir_sig",
@@ -879,7 +884,18 @@ fn compute_single_olean_digest_and_imports(olean_path: &Path) -> Option<(String,
             Ok(cm) if cm.is_file() => {
                 let comp_bytes = fs::read(&comp_path).ok()?;
                 h.update(&[1u8]);
-                h.update(blake3::hash(&comp_bytes).as_bytes());
+                if (tag == "srv" || tag == "priv")
+                    && crate::module_builder::compute_olean_theorem_interface_digest(&comp_bytes)
+                        .map(|idig| {
+                            h.update(b"thm-iface:");
+                            h.update(idig.as_bytes());
+                        })
+                        .is_some()
+                {
+                } else {
+                    h.update(b"raw:");
+                    h.update(blake3::hash(&comp_bytes).as_bytes());
+                }
             }
             Ok(_) => return None,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1094,6 +1110,13 @@ pub(crate) fn compute_imported_olean_interface_hashes_with_tag(
     let search_refs: Vec<&Path> = search_dirs.iter().map(PathBuf::as_path).collect();
     let tc_ref = resolved_tc_lib.as_deref();
     let tc_gh_ref = resolved_tc.as_ref().map(|(_, gh)| gh.as_str());
+    let fresh_proj_cfg =
+        if !project_dir.as_os_str().is_empty() && !worktree_auto_link_disabled(project_dir) {
+            crate::module_builder::resolve_project_config_with_trust(project_dir, false).ok()
+        } else {
+            None
+        };
+    let mut fresh_closure_cache = crate::module_builder::LakeClosureCache::with_ignore_mtime_skew();
     let mut visited = std::collections::HashSet::new();
     let mut out = Vec::new();
 
@@ -1107,16 +1130,34 @@ pub(crate) fn compute_imported_olean_interface_hashes_with_tag(
             .as_deref()
             .and_then(compute_cached_source_blake3);
         let mut olean_digest_opt = None;
+        let mut olean_cand_opt = None;
         let mut olean_sub_mods = Vec::new();
         if let Some(cand) = crate::zygote::resolve_closure_module(&search_refs, &mod_name, tc_ref) {
             if let Some((digest, sub_deps)) = compute_single_olean_digest_and_imports(&cand) {
                 olean_digest_opt = Some(digest);
                 olean_sub_mods = sub_deps;
+                olean_cand_opt = Some(cand);
             }
         }
         match (olean_digest_opt, src_digest_opt) {
             (Some(od), Some(sd)) => {
-                out.push(format!("{}:{}:src={}", mod_name, od, sd));
+                let verified_fresh = match (&fresh_proj_cfg, &olean_cand_opt) {
+                    (Some(cfg), Some(cand)) => {
+                        crate::module_builder::is_project_olean_verified_fresh_for_source(
+                            cfg,
+                            &mod_name,
+                            cand,
+                            &sd,
+                            &mut fresh_closure_cache,
+                        )
+                    }
+                    _ => false,
+                };
+                if verified_fresh {
+                    out.push(format!("{}:{}", mod_name, od));
+                } else {
+                    out.push(format!("{}:{}:src={}", mod_name, od, sd));
+                }
             }
             (Some(od), None) => {
                 out.push(format!("{}:{}", mod_name, od));
