@@ -399,7 +399,7 @@ elab "#verify_lean_native_axioms" : command => do
 
 #verify_lean_native_axioms
 
-private abbrev escapeJsonStr := LeanNative.IR.jsonEscape
+abbrev escapeJsonStr := LeanNative.IR.jsonEscape
 
 def TheoremAxiomAudit.toJson (t : TheoremAxiomAudit) : String :=
   let q (xs : List String) := String.intercalate "," (xs.map (fun a => s!"\"{escapeJsonStr a}\""))

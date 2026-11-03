@@ -134,6 +134,11 @@ def verifiedTheoremRegistry : List String :=
   (proofs.map ("LeanNative.Proofs.PeepholeProofs." ++ ·)) ++
   (proofs.map ("LeanNative.Proofs.LoopOptProofs." ++ ·)) ++
   (proofs.map ("LeanNative.Proofs.SymbolicTV." ++ ·)) ++
+  (proofs.map ("LeanNative.Proofs.SymbolicTVUnarySoundness." ++ ·)) ++
+  (proofs.map ("LeanNative.Proofs.SymbolicTVBinOpSoundness." ++ ·)) ++
+  (proofs.map ("LeanNative.Proofs.SymbolicTVSoundness." ++ ·)) ++
+  (proofs.map ("LeanNative.Proofs.SuperoptHelpersSoundness." ++ ·)) ++
+  (proofs.map ("LeanNative.Proofs.SuperoptSoundness." ++ ·)) ++
   (xform.map ("LeanNative.Transform." ++ ·)) ++
   (sem.map ("LeanNative.Semantics." ++ ·)) ++
   (spec.map ("LeanNative.Spec." ++ ·)) ++
@@ -234,7 +239,7 @@ def verifyModuleCerts (moduleName : String) (certs : List OptimizationCert) : Mo
 
 /-! ## JSON Serialization -/
 
-private abbrev escapeJsonString := LeanNative.IR.jsonEscape
+abbrev escapeJsonString := LeanNative.IR.jsonEscape
 
 def OptimizationCert.toJson (c : OptimizationCert) : String :=
   "{" ++
