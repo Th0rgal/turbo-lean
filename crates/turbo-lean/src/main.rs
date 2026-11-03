@@ -288,6 +288,18 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         require_olean: bool,
     },
+    /// Adopt up-to-date on-disk .olean artifacts into per-module CAS after batched kernel audit/replay
+    SeedOleans {
+        /// Project root directory
+        #[arg(short = 'p', long, default_value = ".")]
+        project_dir: PathBuf,
+        /// Optional Lake library/module targets to scope seeding to (repeatable)
+        #[arg(long = "target")]
+        targets: Vec<String>,
+        /// Maximum parallel module workers (0 = auto)
+        #[arg(short = 'j', long, default_value_t = 0)]
+        jobs: usize,
+    },
     /// Verify a cryptographic CI verification receipt and detect any altered theorem statements in < 1 ms
     VerifyReceipt {
         /// Path to the verification receipt JSON file (positional)
@@ -529,6 +541,7 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Check { project_dir, .. }
         | Commands::Build { project_dir, .. }
         | Commands::SeedShards { project_dir, .. }
+        | Commands::SeedOleans { project_dir, .. }
         | Commands::WorktreeDedup { project_dir } => (Some(project_dir.as_path()), true),
         Commands::AgentStep {
             project_dir, file, ..
@@ -621,7 +634,8 @@ fn run(cli: Cli) -> Result<()> {
         Commands::CiVerify { base: None, .. } => (None, None),
         Commands::Check { project_dir, .. }
         | Commands::Build { project_dir, .. }
-        | Commands::SeedShards { project_dir, .. } => (Some(project_dir.as_path()), None),
+        | Commands::SeedShards { project_dir, .. }
+        | Commands::SeedOleans { project_dir, .. } => (Some(project_dir.as_path()), None),
         Commands::AgentStep { .. } | Commands::Eval { .. } => (eval_project_root.as_deref(), None),
         Commands::Mcp { project_dir } => (Some(project_dir.as_deref().unwrap_or(here)), None),
         _ => (None, None),
@@ -1469,6 +1483,18 @@ fn run(cli: Cli) -> Result<()> {
             project_dir,
             trust_domain,
             require_olean,
+        ),
+
+        Commands::SeedOleans {
+            project_dir,
+            targets,
+            jobs,
+        } => module_builder::run_seed_oleans_command(
+            &mut store,
+            cli.json,
+            project_dir,
+            targets,
+            jobs,
         ),
 
         Commands::VerifyReceipt {

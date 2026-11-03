@@ -5576,6 +5576,7 @@ pub fn run_build_command(
                         "materialized_files": linked,
                         "shards_seeded": seeded_shards,
                         "modules_total": build_report.modules_total,
+                        "modules_up_to_date_reused": build_report.modules_up_to_date_reused,
                         "modules_compiled": build_report.modules_compiled,
                         "modules_cached": build_report.modules_cached,
                         "config_digest": build_report.config_digest,
